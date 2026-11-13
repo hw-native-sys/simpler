@@ -8,21 +8,11 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-/**
- * WseHostRunner — shared base class for sim DeviceRunners (a2a3 + a5).
- *
- * Mirrors the onboard DeviceRunnerBase pattern: shared lifecycle / callable
- * registry / arena / tensor-copy methods live here once; per-arch DeviceRunner
- * subclasses (in src/{a2a3,a5}/platform/sim/host/) implement the arch-specific
- * enqueue/poll/drain / finalize / init_* / ensure_binaries_loaded path with
- * their own dlsym'd function-pointer table.
- *
- * Polymorphism keeps the c_api shared glue (c_api_shared.cpp) arch-agnostic —
- * it works through WseHostRunner* and dispatches the execution lifecycle,
- * finalize(), and set_dep_gen_enabled() through virtuals.
- */
+// WSE Host execution, callable ownership and retained storage.
+// The concrete DeviceRunner supplies SRAM policy and PE execution.
 
 #pragma once
+#include "wse_dso.h"
 #include "host/aligned_image_storage.h"
 
 #include <dlfcn.h>
@@ -78,28 +68,12 @@
 
 struct HostApi;  // common/host_api.h — fwd-declared to keep task_interface headers out
 
-// Width sim resolves the CallConfig "auto" sentinel to, deliberately below
-// PLATFORM_MAX_BLOCKDIM (24 on a2a3, 36 on a5). The simulator runs one OS
-// thread per AICore, so taking the whole modelled chip would be 72-108 threads
-// per case; under xdist that is several hundred threads for no added coverage.
-// CallConfig exposes no block_dim knob, so this is what a sim run takes.
-// Onboard is unaffected — it auto-resolves from the real per-stream core
-// limits.
-constexpr int SIM_AUTO_BLOCKDIM = 8;
-
 class WseHostRunner {
 public:
     WseHostRunner() { commit_run_resources(kDefaultRunResourceSets, build_run_resources(kDefaultRunResourceSets)); }
 
-    /**
-     * Size every per-run resource to the count of run-resource sets this
-     * context was granted.
-     *
-     * The grant is the worker's, not this module's: the module declares what it
-     * supports, and the worker decides how much of that this context uses. It
-     * arrives once, before any run can name a set. Refused once an arena bank
-     * is committed, because a run's lease names its set by index.
-     */
+    // The Worker grants resource-set count before use. Refused after any arena bank
+    // is committed or a native run owns the runner.
     bool set_run_resource_grant(size_t granted);
 
     /** How many run-resource sets this runner currently holds. */
@@ -154,29 +128,14 @@ public:
         NativeRunIdentity identity{};
         Runtime *runtime{nullptr};
         CallConfig config{};
-        /**
-         * This run's diagnostics configuration, resolved from its own config.
-         *
-         * Every phase of the run reads its DFX configuration from here rather
-         * than from the runner's members, so that one run answers for its whole
-         * lifetime from a single value. A simulated device context takes the
-         * execution claim in simpler_prepare_run and therefore never prepares a
-         * successor against a live predecessor, so unlike onboard this carries
-         * no correctness weight here — it keeps the two runner shapes the same.
-         */
+        // Per-run diagnostic selection, fixed through prepare, execution and retirement.
         DfxRunConfig dfx{};
         simpler::dfx::scope_stats_runs::CapacityMetadata scope_stats_capacity;
         uint32_t pipeline_slot{UINT32_MAX};
         int num_aicore{0};
         int launch_aicpu_num{0};
-        /**
-         * This run's whole published identity, copied from its descriptor.
-         *
-         * `identity` above is what later phase calls address the run by and has
-         * no field for `run_id`; a diagnostic artifact needs that plus the
-         * submitting Worker's provenance to be attributed to its submission. An
-         * all-zero `owner_instance_id` means the caller stated none.
-         */
+        // Artifact identity includes run_id and Worker provenance; NativeRunIdentity does not.
+        // An all-zero owner_instance_id denotes unspecified provenance.
         NativeRunArtifactIdentity artifact_identity{};
     };
 
@@ -224,37 +183,18 @@ public:
     virtual DrainOutcome drain_execution(ActiveExecution &active) = 0;
     virtual int finalize() = 0;
 
-    /**
-     * Cross-run retention for the DepGen collector, which lives on the arch
-     * `DeviceRunner` rather than on this base.
-     *
-     * The base owns the latch, the flush and the teardown, so it reaches that
-     * collector through these. Defaults are no-ops, so a runner without a
-     * DepGen collector inherits today's behaviour and a runtime that captures
-     * its graph on the host is unaffected.
-     */
+    // Device DepGen hooks default to no-ops. Host-built dependency graphs have
+    // a separate exporter owned by this runner.
     virtual void configure_dep_gen_retention(bool /*enabled*/, std::size_t /*budget_bytes*/) {}
     virtual bool dep_gen_retains_runs() const { return false; }
-    /**
-     * Admit this run before anything is submitted. Non-zero fails the launch.
-     *
-     * A refusal here has to give back what the other collectors already
-     * admitted, or their export slots stay occupied by a run that never
-     * reaches a boundary.
-     */
+    // Nonzero refuses launch; any already-admitted collectors must be withdrawn.
     virtual int admit_dep_gen_run(
         const DfxRunConfig & /*dfx*/, uint64_t /*run_epoch*/, simpler::dfx::runs::AdmissionRefusal * /*why*/ = nullptr
     ) {
         return 0;
     }
-    /**
-     * Whether this run could be admitted to dep_gen's joined path right now.
-     *
-     * The dep_gen collector lives on the arch runner, so its half of the
-     * all-or-nothing admission is asked through here. False where the runtime
-     * has no device producer at all, which is also the default for a runner
-     * that owns no dep_gen collector.
-     */
+    // A device DepGen producer must support joined admission. Host graph capture
+    // does not use this hook.
     virtual bool dep_gen_can_admit_joined_run(uint64_t /*run_epoch*/) const { return false; }
     /** Resolve this run's dep_gen terminal bank, 0 when it holds none. */
     virtual uint64_t dep_gen_run_terminal_bank(uint64_t /*run_epoch*/) const { return 0; }
@@ -263,35 +203,16 @@ public:
     virtual bool dep_gen_flush_retained(int /*timeout_ms*/, std::string * /*error*/) { return true; }
     virtual void dep_gen_finish_retained() {}
 
-    /**
-     * Hand this thread's finished host-built dependency graph to the exporter.
-     *
-     * Called from `prepare`, on the thread that ran the orchestration, at the
-     * point that thread used to serialize and write the file. With retention
-     * off, or for a runtime that captures its graph on the device, this is inert
-     * and the caller writes synchronously as before.
-     *
-     * Reports whether a graph that should have been published was. A failure is
-     * sticky until a flush reports it and never changes the run's result.
-     */
+    // Transfer this thread's completed dependency graph to retained export during prepare.
+    // False means the graph was dropped and diagnostics failed; never falls back to sync export.
     bool seal_host_dep_gen_graph(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept;
     bool host_graph_retains_runs() const { return host_graph_exporter_.retains_runs(); }
 
     /** Reserve the runner's single active native execution through finalize. */
     bool try_acquire_native_run(const void *owner, const NativeRunIdentity &identity, WseLaunchPermit *permit);
 
-    /**
-     * Re-issue the launch permit for a claim this owner already holds.
-     *
-     * Only for a launch that proved it submitted nothing and is being left
-     * retryable: `launch_execution` consumes the permit by value, and this
-     * runner keeps its execution claim from prepare through finalize, so
-     * `try_acquire_native_run` cannot mint a second one — its compare-exchange
-     * expects an unclaimed slot and this owner is the claimant.
-     *
-     * Refuses unless `owner` is the current claimant, so it cannot hand a
-     * permit to a caller that does not own the run.
-     */
+    // Reissue only for the same owner/identity after a proven NotStarted launch.
+    // The runner claim remains held; a changed owner is refused.
     bool reissue_launch_permit(const void *owner, const NativeRunIdentity &identity, WseLaunchPermit *permit);
     void release_native_run(const void *owner);
     bool native_run_active() const;
@@ -316,28 +237,10 @@ public:
     void *acquire_pooled_gm_heap(uint32_t arena_bank);
     void *acquire_pooled_gm_sm(uint32_t arena_bank);
     void *acquire_pooled_runtime_arena(uint32_t arena_bank);
-    bool lookup_prebuilt_runtime_arena_cache(
-        uint32_t arena_bank, uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
-        void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
-    ) const;
-    void mark_prebuilt_runtime_arena_cached(
-        uint32_t arena_bank, uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base,
-        void *runtime_arena_base, size_t runtime_off, const void *image_data, size_t image_size
-    );
 
-    /**
-     * Spawn a device-simulation thread bound to this runner's device.
-     *
-     * `name` is applied to the thread itself (Linux only, truncated to the
-     * kernel's 15-character limit); an empty name leaves the thread unnamed.
-     * A sim run holds one thread per simulated AICore plus one per AICPU, so
-     * over a hundred of them share this factory — without a name every one
-     * reports as the host process's own `comm` and a crash dump cannot say
-     * which tier faulted.
-     *
-     * Returns only after binding succeeds. Failure joins the child without
-     * invoking fn and throws std::system_error; an unattached runner is rejected.
-     */
+    // Bind the child to this runner before invoking fn; inherited device identity is not trusted.
+    // Returns after successful binding, or joins the failed child and throws std::system_error.
+    // Linux thread names are truncated to the kernel limit.
     std::thread create_thread(std::function<void()> fn, std::string name = {});
     int attach_current_thread(int device_id);
 
@@ -384,55 +287,25 @@ public:
 
     virtual int device_memset(void *dev_ptr, int value, size_t bytes);
 
-    /**
-     * This slot's run-result region, as the address a run's device side
-     * publishes into.
-     *
-     * Handed to the AICPU SO with the run's epoch: the two are only meaningful
-     * together, since the host decides what belongs to a run by comparing
-     * epochs. Zero for a slot outside the array, which the caller publishes as
-     * "no region" exactly as it did before one existed.
-     */
+    // Per-slot result storage. Zero denotes an invalid slot; epoch checks prevent
+    // a later run from consuming an earlier publication.
     uint64_t run_result_region_base(uint32_t pipeline_slot);
 
-    /**
-     * That run's published diagnostic payload, or null when it published none.
-     *
-     * Null covers every undecided case the channel defines — never published,
-     * published under another run's epoch, or self-inconsistent — and they are
-     * deliberately not distinguished here: a caller that receives no payload
-     * has no diagnostic scene to read either way.
-     */
+    // Returns null unless the result matches the requested slot and epoch and is published.
+    // On success bytes_out receives the complete result-region size.
     const uint8_t *device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out) const;
 
     void get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, size_t *size);
     void set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, size_t size);
     int acquire_graph_staging(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **staging_out);
-    /**
-     * Take this run's packed Definition section into its run-owned snapshot.
-     *
-     * Simulation has no launch package and no RTS to copy one: the device side
-     * is called in-process with the `Runtime`, so the section is delivered as a
-     * host snapshot this runner owns. It is copied out of the bind's staging
-     * rather than aliasing it, so a later bind growing that staging cannot move
-     * the bytes a run is still reading, and it stays pinned until this slot's
-     * next publication or the runner's release.
-     *
-     * Reports `GraphSectionSource::HostSnapshot` and the snapshot's address.
-     */
+    // Retain a packed Definition section for this slot. Source storage may be reused
+    // after return; release occurs with the slot's graph staging, not the prepare stack.
     int publish_graph_section(
         uint32_t pipeline_slot, const void *bytes, size_t length, uint32_t *source_out, uint64_t *base_out
     );
     void get_graph_definition_staging(uint32_t pipeline_slot, void **addr, size_t *size);
-    /**
-     * Hand one pipeline slot its retained scheduler-state storage, both sides.
-     *
-     * Same contract as the onboard runner's: grow-only per slot, host side
-     * prepared before the "device" one (host memory here too), the previous
-     * block kept when a replacement cannot be allocated, one failed-release
-     * record per slot that refuses further growth, and no clearing — the
-     * caller writes the whole range it uses before shipping it.
-     */
+    // Grow-only per-slot scheduler storage; the Host allocation is aligned and retained.
+    // Reuse never initializes bytes: the runtime owns initialization and publication.
     int acquire_scheduler_state_storage(
         uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
     );
@@ -443,14 +316,7 @@ public:
         if (slot < orchestration_scratch_.size()) orchestration_scratch_[slot] = std::move(scratch);
     }
     int acquire_sm_mirror(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out);
-    /**
-     * Retain the host buffer a run assembles its device execution image in.
-     *
-     * Same retention contract as the shared-memory mirror above, and for the
-     * same reason a run needs it: the publication that ships these bytes is a
-     * separate step, so the source has to outlive the preparation that wrote
-     * it rather than dying with the caller's frame.
-     */
+    // Per-slot, grow-only aligned execution-image storage, independent of the shared-memory mirror.
     int acquire_run_image_staging(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out);
     void clear_temporary_buffer();
 
@@ -463,21 +329,9 @@ public:
     }
     void unregister_device_memory_from_host(void *dev_ptr) { (void)dev_ptr; }
 
-    /**
-     * Host view of a child-memory address for a host-side orchestrator.
-     *
-     * Identity here, and holds nothing: `allocate_tensor` already returns host
-     * memory, so there is no mapping to establish, cache or release — the
-     * onboard counterpart's allocation-lifetime cache has no work to do. The
-     * containment check still runs, so a span outside every tracked allocation
-     * fails closed exactly as it does onboard.
-     */
+    // Host view of child storage. WSE overrides this to enforce fixed application SRAM bounds.
     virtual void *acquire_child_memory_host_view(void *dev_ptr, size_t bytes);
 
-    int record_device_orch_callable(
-        int32_t callable_id, uint64_t chip_buffer_hash, uint64_t chip_dev, const void *orch_so_data,
-        size_t orch_so_size, const char *func_name, const char *config_name, std::vector<ArgDirection> signature
-    );
     int record_host_orch_callable(
         int32_t callable_id, uint64_t chip_buffer_hash, void *host_dlopen_handle, void *host_orch_func_ptr,
         std::vector<ArgDirection> signature
@@ -504,20 +358,12 @@ public:
         const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
     );
 
-    // Publish this run's core geometry onto `Runtime` before the graph is
-    // built: resolves block_dim (SIM_AUTO_BLOCKDIM on auto), derives num_aicore,
-    // and publishes worker_count / aicpu_thread_num plus the AIC/AIV-typed
-    // handshake array. Callers run this before bind_callable_to_runtime so a
-    // host-side orchestrator sees the real core count while it submits, rather
-    // than the zeros a freshly constructed Runtime carries. Returns 0 on
-    // success, -1 on a bad block_dim / aicpu_thread_num.
-    virtual int prepare_launch_shape(Runtime &runtime, const CallConfig &config);
+    // Publish PE geometry from the fixed SRAM Core count and PEs per Core before
+    // bind_callable_to_runtime builds the graph. WSE requires aicpu_thread_num == 0
+    // and rejects legacy device diagnostics. Returns zero on success, an error on refusal.
+    virtual int prepare_launch_shape(Runtime &runtime, const CallConfig &config) = 0;
     uint64_t upload_chip_callable_buffer(const ChipCallable *callable);
     int release_chip_callable_buffer(uint64_t hash);
-    int launch_device_register(int32_t callable_id);
-    int commit_device_register(int32_t callable_id);
-
-    void print_handshake_results();
 
     void set_executors(std::vector<uint8_t> aicpu_so_binary, std::vector<uint8_t> aicore_kernel_binary) {
         aicpu_so_binary_ = std::move(aicpu_so_binary);
@@ -601,23 +447,8 @@ public:
      * overrides it; every other arch has nothing to add.
      */
     virtual void publish_chip_swimlane_runtime_extensions() {}
-    /**
-     * Open this run's collection window on the four shared diagnostics
-     * collectors it enables, and start their mgmt + poll threads. Each block is
-     * gated on `dfx`, this run's own configuration, not on the runner's members.
-     * Mirrors the onboard base, where opening the window at launch is what keeps
-     * a resident collector's per-run state off a live predecessor. Subclasses
-     * with arch-specific collectors (`dep_gen_collector_`) call this and then
-     * open and start their own.
-     *
-     * Returns non-zero when a collector that retains runs would not admit this
-     * one; see the onboard base for why that fails the run.
-     *
-     * `admission` receives which owner declined and whether re-attempting
-     * could change the answer, plus the credit generation read before the
-     * first owner was asked. All or nothing, including under an exception;
-     * see the onboard base.
-     */
+    // Diagnostic admission is all-or-nothing for the run's DfxRunConfig.
+    // Refusal rolls back every earlier admission and reports the observed credit generation.
     /** The outcome of one all-or-nothing admission attempt. */
     struct DiagnosticAdmission {
         simpler::dfx::runs::AdmissionRefusal refusal{simpler::dfx::runs::AdmissionRefusal::None};
@@ -630,40 +461,16 @@ public:
         DiagnosticAdmission *admission = nullptr
     );
 
-    /**
-     * Undo one refused admission attempt without waking its own retry.
-     *
-     * The withdrawal below, with this thread's own capacity returns suppressed
-     * and a genuine non-restoration — a quarantine, a fatal owner — published
-     * instead. Every path that declines an admission after an earlier owner
-     * took one goes through here rather than calling the withdrawal directly;
-     * the post-launch withdrawal of a run that submitted nothing deliberately
-     * does not, because that run held its admission while others observed it
-     * taken.
-     */
+    // Undo admission without publishing restored capacity as new progress.
+    // Quarantined or failed owners still notify waiters of genuine capacity loss.
     void undo_admission_attempt(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept;
 
-    /**
-     * Give back what the call above admitted for a run that submitted nothing.
-     * Only for a `LaunchProgress::NotStarted` transaction; see the onboard base
-     * for why a partial submission must keep its slot.
-     *
-     * Returns whether every owner's slot is back, which is what separates a
-     * restoration — the state every waiter already saw — from a quarantine,
-     * where the capacity they saw is gone for good and they must be told.
-     */
+    // Withdraw only after NotStarted, never after a partial launch.
+    // Returns true only when every admitted owner restored its capacity.
     bool withdraw_unlaunched_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept;
 
-    /**
-     * Close one run's PMU window: either today's drain and reconcile, or, when
-     * PMU retains runs, the claim-time snapshot that hands the epoch to its
-     * background writer.
-     *
-     * `device_producers_stopped` settles this run's terminal bank on the
-     * failure path and nothing else; see
-     * `simpler::dfx::runs::settle_failed_run_terminal_bank`. Only a caller that
-     * joined its producers may pass it.
-     */
+    // Close the PMU window by quiesce/reconcile or retained run_close.
+    // Only joined producers justify device_producers_stopped; completion is a separate proof.
     void close_pmu_run_boundary(
         const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
     );
@@ -671,18 +478,8 @@ public:
         const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
     );
 
-    /**
-     * Close one run's ArgsDump window: either today's quiesce, reconcile and
-     * export, or, when ArgsDump retains runs, the claim-time terminal read,
-     * processing proof and leftover decision that hand the run to its
-     * background writer.
-     *
-     * Returns non-zero only on the retained path, when that proof did not land
-     * inside the execution claim. Nothing unproved was read and no unprocessed
-     * payload was acknowledged, so the producer's own barrier still protects
-     * the arena — but the caller owes an error rather than a run that quietly
-     * publishes an incomplete file.
-     */
+    // Close ordinary or retained argument capture. An unproved ownership release
+    // returns an error; no unprocessed payload is acknowledged.
     int close_args_dump_run_boundary(
         const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
     );
@@ -708,30 +505,12 @@ public:
     }
     int flush_diagnostics(int timeout_ms, std::string *error);
     void finish_retained_runs();
-    /**
-     * Resolve and reserve this run's chip-swimlane terminal-snapshot bank, and
-     * return its device address for KernelArgs.
-     *
-     * The bank is the slice of the collector's retained region into which each
-     * producer copies its settled record totals at its last flush, so those
-     * totals survive the next run's counter reset. Indexed by the run's actual
-     * pipeline slot; returns 0 whenever no bank can be resolved (swimlane off,
-     * collector not initialized, slot out of range, or no run identity), which
-     * the device reads as "publish no snapshot". Diagnostic-only and never a
-     * prepare failure. Mirrors the onboard base.
-     */
+    // Resolve this epoch's retained terminal bank, or zero when none exists.
+    // A previous run's terminal totals must survive successor counter resets.
     uint64_t arm_chip_swimlane_run_terminal_bank(uint64_t run_epoch);
 
-    /**
-     * This context's diagnostic credit progress, for a blocked admission.
-     *
-     * `credit_generation()` is non-blocking and safe under a caller's own
-     * lane mutex. `wait_for_credit` must not be: the threads that advance the
-     * generation are the collectors' writers, and a waiter holding a lane or
-     * collector lock could stop the very release it waits for.
-     * `cancel_credit_waits` is non-blocking and proves nothing about a waiter
-     * having left.
-     */
+    // Credit reads and cancellation are nonblocking. wait_for_credit must not hold
+    // a lock needed by collector writers, which publish capacity progress.
     uint64_t credit_generation() const { return credit_signal_.generation(); }
     int wait_for_credit(uint64_t seen, int32_t timeout_ms) {
         return static_cast<int>(credit_signal_.wait_for(seen, timeout_ms));
@@ -741,52 +520,23 @@ public:
     /** Record that a diagnostic output slot or terminal bank came back. */
     void note_diagnostic_credit_released() { credit_signal_.advance(); }
 
-    /**
-     * Whether every owner this run enabled could admit it, all or nothing.
-     *
-     * Each owner contributes three terms: that it can tell two open runs apart
-     * at all — which is the presence of a mapped terminal bank, not a count of
-     * free ones — that it has a retained admission free, and that it has a bank
-     * this run could publish into. A single owner short declines the whole
-     * pair, because a run admitted to some owners and not others would publish
-     * a partial diagnostic nothing names as partial. Mirrors the onboard base.
-     */
+    // Joined admission requires each enabled owner to distinguish epochs and have
+    // both retained admission capacity and a free terminal bank.
     bool every_enabled_owner_can_admit(const DfxRunConfig &dfx, uint64_t run_epoch) const;
 
-    /**
-     * Fill this run's four queue-pair terminal bank addresses into its kernel
-     * arguments, from the banks its own admission reserved.
-     *
-     * Called once every owner has admitted the run and before anything is
-     * submitted. Every field is written on every run, including the ones that
-     * resolved nothing, so a successor cannot inherit a predecessor's address
-     * from reused argument storage. Mirrors the onboard base.
-     */
+    // Write every terminal-bank address, including zero for disabled owners,
+    // so reused KernelArgs cannot retain a predecessor's bank.
     void resolve_run_terminal_banks(const DfxRunConfig &dfx, uint64_t run_epoch, KernelArgs &kernel_args) const;
 
-    /**
-     * Initialize each enabled retained owner's terminal array, once per collector.
-     *
-     * Already-open owners and owners with retention disabled are skipped. A
-     * required array that cannot be initialized returns an error before launch;
-     * live counters cannot substitute for its per-run accounting.
-     */
+    // Open retained terminal arrays before admission. An enabled owner that cannot
+    // allocate them fails; live counters cannot substitute for per-run terminal state.
     int open_run_terminal_banks_for_enabled_owners(const DfxRunConfig &dfx);
 
     /** Wire every collector's capacity release to this context's signal. */
     void install_credit_release_notifiers();
 
-    /**
-     * Whether any collector still holds retained data a writer has not
-     * published.
-     *
-     * Asked before a stale-shape rebuild, which frees the pools those writers
-     * are reading. The joined gate already declines a pair whose shape would
-     * rebuild, but an ordinary front run takes the same rebuild and is not
-     * covered by that gate — and a retained predecessor's writer outlives its
-     * run's native retirement by design, so "no run is executing" is not the
-     * same question as "no writer is reading".
-     */
+    // True while an unpublished retained consumer may still read its pools.
+    // No active kernel does not imply that these pools can be freed.
     bool retained_consumers_outstanding() const;
 
     /** The dep_gen half, on the arch runner that owns that collector. */
@@ -799,28 +549,9 @@ public:
     virtual int open_dep_gen_run_terminal_banks(const DfxRunConfig & /*dfx*/) { return 0; }
     /** Write this pass's per-event host phase records, if it collected any. */
     void write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot);
-    /**
-     * Tear down the four shared diagnostics collectors after the launched
-     * kernels have synced, in the one order their couplings allow: the clock
-     * correlation session closes before the swimlane export reads it, and each
-     * collector drains before it reconciles before it exports. Each block is
-     * gated on `dfx`, this run's own configuration.
-     *
-     * Subclasses with arch-specific collectors (`dep_gen_collector_` + its
-     * `dep_gen_replay_emit_deps_json` export) inline their own teardown after
-     * calling this helper, as on onboard.
-     *
-     * `run_epoch` identifies the run whose retained terminal snapshot is read
-     * back, which happens only when `device_execution_complete` says the caller
-     * observed this run's completion.
-     *
-     * `device_producers_stopped` is the separate fact that no producer can
-     * still be writing into this run's terminal bank. A simulated device's
-     * producers are the AICPU and AICore threads of this process, so a caller
-     * that joined them knows it; pass it only from such a caller. It decides
-     * whether a *failed* run's bank is returned unread or withdrawn, and it
-     * never licenses reading a snapshot the run did not complete.
-     */
+    // After kernel synchronization, close clock correlation, then quiesce/reconcile/export
+    // collectors. Only observed completion allows reading terminal snapshots; joined
+    // producers independently allow failed-run backing to be withdrawn.
     /**
      * Returns non-zero when a collector's close reported an ownership failure
      * the caller must surface — today only retained ArgsDump. A caller folds it
@@ -832,21 +563,8 @@ public:
         bool device_producers_stopped
     );
 
-    /**
-     * Stop one run's device producers, and hold which run that was.
-     *
-     * A simulated device's producers are this process's own threads, so
-     * stopping them is joining them and `stop` is that join. The run's identity
-     * is recorded only after `stop` returns, so a stop that threw part-way
-     * leaves none.
-     *
-     * The proof is held *by identity* rather than as a flag, because runs
-     * overlap: a successor is prepared and admitted while its predecessor is
-     * still executing, so a flag would let the predecessor's stop answer for
-     * the successor — and clearing a flag at admission would let the successor
-     * erase a predecessor's proof before its boundary had read it. An epoch
-     * does neither: it answers for exactly one run and no other.
-     */
+    // Join the run's producers before recording its stopped epoch. An exception
+    // leaves no proof. Epoch identity prevents one run from settling another's banks.
     template <typename StopProducers>
     void stop_run_producers(uint64_t run_epoch, StopProducers &&stop) {
         producers_stopped_epoch_ = 0;
@@ -859,15 +577,8 @@ public:
         return run_epoch != 0 && producers_stopped_epoch_ == run_epoch;
     }
 
-    /**
-     * Settle this run's diagnostics on the stop this runner performed.
-     *
-     * The stop is read from `stop_run_producers` rather than supplied here, so
-     * a run that was never stopped settles as one: its bank is withdrawn.
-     * `device_execution_complete` stays the caller's — stopping the producers
-     * says nothing about whether the run reached its terminal publication, and
-     * only that decides whether a snapshot is read.
-     */
+    // Settle using the recorded stopped epoch. Producer stop does not imply
+    // successful completion or permit reading an unpublished terminal snapshot.
     int settle_run_after_producer_stop(
         const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete
     ) {
@@ -891,19 +602,11 @@ public:
     // Defined in the .cpp so this header does not need the full CallConfig.
     void apply_call_config(const CallConfig &config);
 
-    size_t aicpu_dlopen_count() const { return aicpu_dlopen_total_; }
+    size_t aicpu_dlopen_count() const { return 0; }
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
-    /**
-     * Which device-side scheduler the most recent bind selected, as a
-     * SCHEDULER_RUNTIME_MODE_* value, or 0 when no bind has published one.
-     *
-     * Latched rather than read back from the runtime: the launch descriptor's
-     * copy is cleared when a run releases its bindings, so by the time a caller
-     * could look it is already 0. Never cleared here — a later bind overwrites
-     * it, and `scheduler_mode_publish_count()` is what distinguishes "this bind
-     * chose again" from "nothing has changed since the last one".
-     */
+    // Last scheduler mode selected by bind, retained after release.
+    // The publication count distinguishes repeated selection of the same mode.
     uint32_t last_scheduler_runtime_mode() const {
         return last_scheduler_runtime_mode_.load(std::memory_order_relaxed);
     }
@@ -921,10 +624,6 @@ protected:
     // --- Helpers usable by subclass execution / finalize -----------------
     int ensure_device_initialized();
     virtual int ensure_binaries_loaded() = 0;
-    // Hand the orch-SO descriptor to the sim AICPU register entry. Built
-    // directly from CallableState by launch_device_register — no Runtime
-    // round-trip.
-    virtual int invoke_device_register(const RegisterCallableArgs &reg_args) = 0;
     // Registration owns orchestration code; validation leaves Runtime unchanged.
     int validate_active_callable(const Runtime &runtime) const;
 
@@ -955,7 +654,6 @@ protected:
     // int is sufficient.
     int device_id_{-1};
     int block_dim_{0};
-    int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};
 
     // This context's execution identity. Write-once: the first init entry to
@@ -978,12 +676,8 @@ protected:
     CallerDeviceBuffers caller_device_buffers_;
     RunResourceSlots<void *> retained_temp_addrs_;
     RunResourceSlots<size_t> retained_temp_sizes_;
-    // One pipeline slot's Graph Definition bytes: `staging` is what the
-    // recorders build their objects into, grow-only and content-preserving, and
-    // `snapshot` is the copy a published run reads. Two buffers rather than one
-    // because the device side reads the snapshot in this same process: a later
-    // bind growing the staging must not move bytes a run still names. No device
-    // member — simulation allocates no device Definition block either.
+    // Per-slot Definition staging is grow-only; the separate snapshot remains stable
+    // while a later bind grows staging and a previous run still reads the snapshot.
     struct RetainedGraphStaging {
         std::vector<std::byte> bytes;
         std::vector<std::byte> snapshot;
@@ -994,33 +688,13 @@ protected:
     // utils/retained_scheduler_storage.h, which holds the grow, alignment and
     // failure rules.
     RunResourceSlots<RetainedSchedulerStorage> scheduler_state_storage_;
-    // Host mirror of the runtime shared memory, one retained buffer per pipeline
-    // slot — see HostApi acquire_sm_mirror. A host-side orchestrator writes its
-    // whole shared-memory image here and the bind ships the live prefix, so the
-    // buffer is capacity-sized (tens of MB) and stays mapped across binds: one
-    // buffer per slot rather than one per bind, because two binds in different
-    // slots are in flight at once. `capacity` counts the raw block, which is over-allocated
-    // by the requested alignment so the aligned address handed out has the
-    // requested bytes behind it.
-    //
-    // The block is never value-initialized. The caller's layout is init-on-write
-    // and it ships only the prefixes it wrote, so the resident set is the pages a
-    // bind touches rather than the whole capacity — which is also why this is not a
-    // std::vector: `resize` would zero every page of a capacity the caller writes
-    // a fraction of, and would copy the old bytes on growth for a buffer whose
-    // contents mean nothing between binds.
+    // Per-slot CHIP_ALIGN_SIZE-aligned mirror, retained across binds.
+    // Only live segment prefixes are initialized and published; untouched capacity is not read.
     using RetainedSmMirror = AlignedImageStorage;
     RunResourceSlots<std::shared_ptr<void>> orchestration_scratch_;
     RunResourceSlots<RetainedSmMirror> sm_mirrors_;
 
-    // Host staging for the device execution image, one retained buffer per
-    // pipeline slot — see HostApi acquire_run_image_staging. Same block shape
-    // and the same grow-only retention as the mirror above; what differs is
-    // what it holds and how long it has to hold it. A bind assembles the
-    // bytes here and records where they go; the publication reads them
-    // afterwards, so this buffer is what makes the source outlive the
-    // preparation. Sized to the image a bind ships rather than to the
-    // mirror's capacity.
+    // Per-slot grow-only execution-image staging, retained beyond bind until publication.
     RunResourceSlots<RetainedSmMirror> run_image_stagings_;
 
     // Each arena bank backs the three pooled regions (GM heap / shared
@@ -1039,13 +713,8 @@ protected:
         return static_cast<WseHostRunner *>(ctx)->allocate_graph_storage(size);
     }
     static void graph_free_trampoline(void *ctx, void *p) { static_cast<WseHostRunner *>(ctx)->free_graph_storage(p); }
-    // One independently committed set of the three pooled regions per pipeline
-    // slot, so preparing one bank never mutates a region the active run is
-    // executing out of. `cached_*` back setup_static_arena's "fits" check —
-    // avoids re-allocating when a later worker init asks for an equal-or-
-    // smaller layout. Held by pointer because DeviceArena is neither copyable
-    // nor movable, so the array cannot be brace-initialised without naming
-    // every bank.
+    // Independent pooled regions per resource bank. Equal or smaller requests reuse backing;
+    // DeviceArena is nonmovable, so bank storage owns pointers.
     struct ArenaBank {
         ArenaBank(void *ctx) :
             gm_heap(&arena_alloc_trampoline, &arena_free_trampoline, ctx),
@@ -1084,14 +753,6 @@ protected:
     RunResourceStaging build_run_resources(size_t granted);
     /** Adopt a built grant by swapping every container. Never throws. */
     void commit_run_resources(size_t granted, RunResourceStaging &&staged) noexcept;
-    bool prebuilt_runtime_arena_cache_valid_{false};
-    uint64_t prebuilt_runtime_arena_cache_hash_{0};
-    std::vector<uint8_t> prebuilt_runtime_arena_cache_key_;
-    void *prebuilt_runtime_arena_cache_gm_heap_base_{nullptr};
-    void *prebuilt_runtime_arena_cache_sm_base_{nullptr};
-    void *prebuilt_runtime_arena_cache_runtime_arena_base_{nullptr};
-    size_t prebuilt_runtime_arena_cache_runtime_off_{0};
-    std::vector<uint8_t> prebuilt_runtime_arena_cache_image_;
 
     // Simulation state — written by enqueue/init and read by the AICPU /
     // AICore execute functions via the platform-regs setter functions.
@@ -1141,16 +802,8 @@ protected:
 
     // Per-callable_id prepared state. Mirrors onboard.
     struct CallableState {
-        // trb path
-        uint64_t hash{0};
         uint64_t chip_buffer_hash{0};
-        uint64_t dev_orch_so_addr{0};
-        size_t dev_orch_so_size{0};
-        std::string func_name;
-        std::string config_name;
-        // common
         std::vector<ArgDirection> signature;
-        // hbg path
         void *host_dlopen_handle{nullptr};
         void *host_orch_func_ptr{nullptr};
     };
@@ -1160,8 +813,6 @@ protected:
     // an explicit-ID claim of the same slot; runs, initialization and destroy
     // are serialized by their callers instead.
     std::mutex callable_registration_mu_;
-    std::unordered_set<int32_t> aicpu_seen_callable_ids_;
-    size_t aicpu_dlopen_total_{0};
     size_t host_dlopen_total_{0};
     // Written on the bind path, read by the caller's thread.
     std::atomic<uint32_t> last_scheduler_runtime_mode_{0};
@@ -1170,8 +821,6 @@ protected:
     // The aicpu_executor g_aicpu_executor static lives inside the dlopen'd DSO;
     // reloading it destroys orch_so_handle_ and breaks the orch-SO cache-hit path.
     bool aicpu_so_loaded_{false};
-
-    Runtime *last_runtime_{nullptr};
 
     std::atomic<const void *> active_native_run_{nullptr};
     std::atomic<bool> launch_poisoned_{false};
@@ -1185,52 +834,20 @@ protected:
     std::string aicore_so_path_;
 
     // Performance / diagnostics collectors shared across arches.
-    /**
-     * This context's diagnostic credit progress, and what a blocked admission
-     * waits on.
-     *
-     * Advanced by every path that frees an output slot or a terminal bank, so
-     * a run declined for capacity has something to block on instead of a busy
-     * loop. Reached from the extension only through the three C entries, which
-     * carry integers and the opaque handle and nothing else.
-     */
+    // Context-owned signal for blocked diagnostic admission; only integer tokens
+    // and opaque handles cross the runtime C ABI.
     simpler::dfx::credit::DiagnosticCreditSignal credit_signal_;
 
-    /**
-     * Whether the collectors' credit callbacks have been installed.
-     *
-     * One-shot. They are assigned before any collector thread starts and
-     * never reassigned, so a background writer calling one never races the
-     * assignment.
-     */
+    // Callbacks are installed once before any collector thread starts;
+    // concurrent replacement would race a writer invoking its callback.
     bool credit_notifiers_installed_{false};
 
     ChipSwimlaneCollector chip_swimlane_collector_;
-    // Not a collector: the pool the runtime's prepare path writes into, read by
-    // whichever per-event views the run enabled. Its two readers are gated
-    // independently, so it belongs to neither.
-    // One entry per pipeline slot, indexed by the run descriptor's slot. Only
-    // one is ever live here — sim prepares under the exclusive execution claim,
-    // so it stages no successor (see `supports_concurrent_native_prepare_ctx`
-    // in c_api_shared.cpp). The array keeps this storage the same shape as the
-    // onboard base's, which is what lets the shared host-phase code index by
-    // slot without a per-platform branch.
+    // Per-slot Host phase records are populated during prepare and shared by independent
+    // diagnostic readers. A WSE runner holds the exclusive claim throughout a run.
     RunResourceSlots<HostPhaseRunState> host_phase_runs_;
-    /**
-     * One run's device-side terminal result, per pipeline slot.
-     *
-     * The same obligation the onboard base carries (see
-     * common/device_run_result.h): a runtime folds what the host needs into
-     * this region and publishes it before its kernel returns, so a run's own
-     * status is readable without naming shared state a later run resets. Here
-     * the simulated device writes host memory directly, so the region is the
-     * storage itself rather than a cached copy of a device allocation, and no
-     * transfer stands between the publisher and the reader.
-     *
-     * Value-initialized once and never cleared per run: `published` carries the
-     * publishing run's epoch, so a slot still holding an earlier run's record
-     * fails the epoch comparison rather than being mistaken for this run's.
-     */
+    // Epoch-tagged per-slot result storage, initialized once and published by the device.
+    // Simulation reads the Host backing directly. Never clear a live earlier run's result.
     RunResourceSlots<NativeInvocationResultStorage> device_run_results_;
     mutable std::mutex retained_result_mu_;
     std::unordered_map<uint64_t, DeviceRunResultRegion> retained_run_results_;
@@ -1241,17 +858,8 @@ protected:
     // is written by the device, and no run boundary reads it.
     simpler::dfx::host_graph::HostGraphExporter host_graph_exporter_;
 
-    /**
-     * The core and AICPU-thread counts a resident collector's pools were built
-     * for.
-     *
-     * Collector pool topology is derived from those counts: buffer seeding
-     * covers pools [0, aicpu_thread_num), and a core's recycled lane is
-     * `(core / PLATFORM_CORES_PER_BLOCKDIM) % aicpu_thread_num`. A collector
-     * that stays initialized across runs therefore holds pools shaped for the
-     * run that built them, so a later run with different counts must rebuild
-     * them rather than reuse pools whose lanes it maps differently.
-     */
+    // Collector pools are shaped by core/thread counts. A changed topology requires
+    // rebuilding pools only after all retained readers have released them.
     struct CollectorShape {
         bool latched{false};
         int num_aicore{0};
@@ -1259,18 +867,8 @@ protected:
         int launch_aicpu_num{0};
     };
 
-    /**
-     * True once collectors are built and this run's counts differ from theirs,
-     * i.e. their pools must be released and rebuilt before this run seeds them.
-     *
-     * The release frees device memory the collectors are holding, so it is only
-     * safe while no other run is executing against them. Nothing here enforces
-     * that. What guarantees it is the caller: `arm_collectors_for_run()` is the
-     * sole user, and it runs from the launch arming, under the execution claim.
-     * A simulated context takes that claim at prepare and never overlaps two
-     * runs, so this holds here by construction; the call stays in the launch
-     * arming anyway, because the two runner shapes are kept identical.
-     */
+    // A changed shape requires rebuilding under the exclusive execution claim.
+    // No other run may execute against the pools during that rebuild.
     bool collector_shape_is_stale(int num_aicore, int aicpu_thread_num, int launch_aicpu_num) const {
         return collector_shape_.latched &&
                (collector_shape_.num_aicore != num_aicore || collector_shape_.aicpu_thread_num != aicpu_thread_num ||
@@ -1293,12 +891,3 @@ protected:
     bool pmu_enabled_{false};                                             // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                         // diagnostic artifact root directory
 };
-
-namespace simpler::common::sim_host {
-
-// Shared utility used by ensure_binaries_loaded() / upload_chip_callable_buffer()
-// to materialize an in-memory DSO into /tmp so dlopen can pick it up. mkstemp +
-// fchmod 0755 + write_all + close; on success out_path receives the path.
-bool create_temp_so_file(const std::string &path_template, const uint8_t *data, size_t size, std::string *out_path);
-
-}  // namespace simpler::common::sim_host

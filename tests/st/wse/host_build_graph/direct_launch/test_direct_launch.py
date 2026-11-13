@@ -15,11 +15,12 @@ from pathlib import Path
 import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, DataType, TaskArgs, TensorArgType
+from simpler.task_interface import CallConfig, ChipCallable, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
 from simpler_setup.kernel_compiler import KernelCompiler
 from tests.st.wse.host_build_graph.fixed_sram_layout import copy_from, copy_to, layout_view, release_view
+from tests.st.wse.host_build_graph.scene_helpers import build_callable
 
 pytestmark = [pytest.mark.platforms(["wsesim"]), pytest.mark.runtime("host_build_graph"), pytest.mark.device_count(1)]
 HERE = Path(__file__).parent
@@ -27,17 +28,12 @@ HERE = Path(__file__).parent
 
 @lru_cache
 def build_mixed(platform):
-    compiler = KernelCompiler(platform)
-    kernel = compiler.compile_incore(
-        str(HERE / "kernels/mixed.cpp"),
-        core_type="",
-        extra_include_dirs=compiler.get_orchestration_include_dirs("host_build_graph"),
-    )
-    return ChipCallable.build(
-        signature=[D.IN, D.IN, D.OUT, D.OUT, D.IN],
-        func_name="aicpu_orchestration_entry",
-        binary=compiler.compile_orchestration("host_build_graph", str(HERE / "kernels/mixed_orch.cpp")),
-        children=[(0, CoreCallable.build(signature=[D.IN, D.IN, D.OUT, D.OUT], binary=kernel))],
+    return build_callable(
+        platform,
+        HERE / "kernels",
+        "mixed_orch.cpp",
+        [D.IN, D.IN, D.OUT, D.OUT, D.IN],
+        [("mixed.cpp", [D.IN, D.IN, D.OUT, D.OUT])],
     )
 
 
@@ -106,18 +102,7 @@ def test_mixed_entry_and_independent_blocks(tmp_path, blocks, st_platform):
 
 @lru_cache
 def build_graph(platform):
-    compiler = KernelCompiler(platform)
-    kernel = compiler.compile_incore(
-        str(HERE / "kernels/stamp.cpp"),
-        core_type="",
-        extra_include_dirs=compiler.get_orchestration_include_dirs("host_build_graph"),
-    )
-    return ChipCallable.build(
-        signature=[D.INOUT] * 3,
-        func_name="aicpu_orchestration_entry",
-        binary=compiler.compile_orchestration("host_build_graph", str(HERE / "kernels/graph_orch.cpp")),
-        children=[(0, CoreCallable.build(signature=[D.INOUT], binary=kernel))],
-    )
+    return build_callable(platform, HERE / "kernels", "graph_orch.cpp", [D.INOUT] * 3, [("stamp.cpp", [D.INOUT])])
 
 
 @pytest.mark.parametrize("cores", [40])

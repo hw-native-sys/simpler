@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""WSE discovery and cache contracts stay independent of A5."""
+"""WSE discovery, provenance and distinct simulator cache identities."""
 
 import hashlib
 import json
@@ -58,9 +58,10 @@ def test_wse_orchestration_uses_own_headers_and_identity():
 
 def test_source_manifest_matches_copied_files():
     root = Path(__file__).resolve().parents[3]
-    manifest = json.loads((root / "src/wse/source-copy-manifest.json").read_text())
-    for entry in manifest["files"]:
-        assert hashlib.sha256((root / entry["destination"]).read_bytes()).hexdigest() == entry["sha256"]
+    for filename, entries in (("source-copy-manifest.json", "files"), ("host-source-provenance.json", "copies")):
+        manifest = json.loads((root / "src/wse" / filename).read_text())
+        for entry in manifest[entries]:
+            assert hashlib.sha256((root / entry["destination"]).read_bytes()).hexdigest() == entry["sha256"]
 
 
 def test_real_scene_cache_keeps_wse_and_a5_separate(tmp_path, monkeypatch):

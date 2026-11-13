@@ -42,14 +42,8 @@
 #include "host/raii_scope_guard.h"
 #include "host/run_boundary.h"
 #include "task_args.h"
-#include "utils/elf_build_id.h"
 
-// The host-orchestrating runtime's graph hand-off, and a weak fallback for a
-// runtime that captures on the device: its `dep_gen_host_graph_active()` is
-// false, so the runner never asks it for a graph. File scope, like the runner
-// method that takes its address and like the arch runners that define it:
-// `extern "C"` names the symbol, but lookup is still scoped, so a declaration
-// inside this file's own namespace is invisible to `WseHostRunner` below.
+// The HBG runtime transfers this thread's completed graph to the Host exporter.
 extern "C" int dep_gen_host_graph_take(simpler::dfx::host_graph::HostGraphExport *out);
 
 namespace simpler::common::sim_host {
@@ -227,22 +221,13 @@ int WseHostRunner::setup_static_arena(
 ) {
     if (arena_bank >= arena_banks_.size()) return PTO_RUNTIME_ERR_INTERNAL;
     ArenaBank &bank = this->arena_bank(arena_bank);
-    // Three independent device_malloc'd buffers: GM heap, shared memory, prebuilt
-    // runtime arena. Split out from a single large allocation because the
-    // combined size can exceed the device allocator's largest contiguous
-    // block. Each arena commits exactly one region, so its base() is the
-    // pooled pointer the caller wants.
-    //
-    // Idempotent for the production case (sizes do not change across a
-    // worker's lifetime). If a caller asks for a larger layout on any
-    // region, redo just that region.
-    bool arena_changed = false;
-    auto commit_region = [&arena_changed](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
+    // GM heap, shared memory and runtime arena own independent grow-only allocations.
+    // Only a region whose requested capacity grows is recommitted.
+    auto commit_region = [](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
         if (requested_size == 0) {
             if (arena.is_committed() && cached_size != 0) {
                 arena.release();
                 cached_size = 0;
-                arena_changed = true;
             }
             return 0;
         }
@@ -251,7 +236,6 @@ int WseHostRunner::setup_static_arena(
         }
         arena.release();
         cached_size = 0;
-        arena_changed = true;
         arena.reserve(requested_size, DeviceArena::kDefaultBaseAlign);
         if (arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
             arena.release();
@@ -274,69 +258,9 @@ int WseHostRunner::setup_static_arena(
         bank.cached_gm_heap_size = 0;
         bank.cached_gm_sm_size = 0;
         bank.cached_runtime_arena_size = 0;
-        prebuilt_runtime_arena_cache_valid_ = false;
-        prebuilt_runtime_arena_cache_key_.clear();
-        prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
-        prebuilt_runtime_arena_cache_sm_base_ = nullptr;
-        prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
-        prebuilt_runtime_arena_cache_image_.clear();
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    if (arena_changed) {
-        prebuilt_runtime_arena_cache_valid_ = false;
-        prebuilt_runtime_arena_cache_key_.clear();
-        prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;
-        prebuilt_runtime_arena_cache_sm_base_ = nullptr;
-        prebuilt_runtime_arena_cache_runtime_arena_base_ = nullptr;
-        prebuilt_runtime_arena_cache_image_.clear();
-    }
     return 0;
-}
-
-bool WseHostRunner::lookup_prebuilt_runtime_arena_cache(
-    uint32_t arena_bank, uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base, void **sm_base,
-    void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
-) const {
-    // The cache holds one entry and its bases point into bank 0, so any other
-    // bank must rebuild rather than be handed a region it does not own.
-    if (arena_bank != 0) return false;
-    if (!prebuilt_runtime_arena_cache_valid_ || prebuilt_runtime_arena_cache_hash_ != hash ||
-        prebuilt_runtime_arena_cache_key_.size() != key_size || key_data == nullptr || gm_heap_base == nullptr ||
-        sm_base == nullptr || runtime_arena_base == nullptr || runtime_off == nullptr || image_data == nullptr ||
-        image_size == nullptr) {
-        return false;
-    }
-    if (std::memcmp(prebuilt_runtime_arena_cache_key_.data(), key_data, key_size) != 0) {
-        return false;
-    }
-    *gm_heap_base = prebuilt_runtime_arena_cache_gm_heap_base_;
-    *sm_base = prebuilt_runtime_arena_cache_sm_base_;
-    *runtime_arena_base = prebuilt_runtime_arena_cache_runtime_arena_base_;
-    *runtime_off = prebuilt_runtime_arena_cache_runtime_off_;
-    *image_data = prebuilt_runtime_arena_cache_image_.data();
-    *image_size = prebuilt_runtime_arena_cache_image_.size();
-    return true;
-}
-
-void WseHostRunner::mark_prebuilt_runtime_arena_cached(
-    uint32_t arena_bank, uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base, void *sm_base,
-    void *runtime_arena_base, size_t runtime_off, const void *image_data, size_t image_size
-) {
-    // Single-entry cache owned by bank 0; see lookup_prebuilt_runtime_arena_cache.
-    if (arena_bank != 0) return;
-    prebuilt_runtime_arena_cache_valid_ = false;
-    prebuilt_runtime_arena_cache_hash_ = hash;
-    prebuilt_runtime_arena_cache_key_.assign(
-        static_cast<const uint8_t *>(key_data), static_cast<const uint8_t *>(key_data) + key_size
-    );
-    prebuilt_runtime_arena_cache_gm_heap_base_ = gm_heap_base;
-    prebuilt_runtime_arena_cache_sm_base_ = sm_base;
-    prebuilt_runtime_arena_cache_runtime_arena_base_ = runtime_arena_base;
-    prebuilt_runtime_arena_cache_runtime_off_ = runtime_off;
-    prebuilt_runtime_arena_cache_image_.assign(
-        static_cast<const uint8_t *>(image_data), static_cast<const uint8_t *>(image_data) + image_size
-    );
-    prebuilt_runtime_arena_cache_valid_ = true;
 }
 
 void *WseHostRunner::acquire_pooled_gm_heap(uint32_t arena_bank) {
@@ -469,53 +393,6 @@ int WseHostRunner::ensure_dma_workspace_provisioned() {
         }
         dma_workspace_handle_ = nullptr;
         return rc;
-    }
-    return 0;
-}
-
-int WseHostRunner::prepare_launch_shape(Runtime &runtime, const CallConfig &config) {
-    if (config.aicpu_thread_num == 1 || config.aicpu_thread_num < 0 ||
-        config.aicpu_thread_num > PLATFORM_MAX_AICPU_THREADS) {
-        LOG_ERROR(
-            "launch_aicpu_num (%d) must be 0 (auto) or in range [2, %d]", config.aicpu_thread_num,
-            PLATFORM_MAX_AICPU_THREADS
-        );
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    // A run always takes the whole simulated device; orchestration sizes its
-    // cohorts from rt_available_cluster_count() rather than a per-call width.
-    const int block_dim = SIM_AUTO_BLOCKDIM;
-    LOG_INFO("block_dim resolved to %d", block_dim);
-
-    int num_aicore = block_dim * cores_per_blockdim_;
-    if (num_aicore > RUNTIME_MAX_WORKER) {
-        LOG_ERROR("num_aicore (%d) exceeds RUNTIME_MAX_WORKER (%d)", num_aicore, RUNTIME_MAX_WORKER);
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-
-    block_dim_ = block_dim;
-    runtime.set_worker_count(num_aicore);
-    worker_count_ = num_aicore;
-    runtime.set_aicpu_thread_num(config.aicpu_thread_num);
-    runtime.dev.chip_swimlane_level = static_cast<uint32_t>(config.enable_chip_swimlane);
-    runtime.dev.dump_args_level = static_cast<uint32_t>(config.enable_dump_args);
-
-    // First `block_dim` cores are AIC; remaining ~2/3 are AIV. The rule is host
-    // state read by the sim's per-core thread start and by the DFX collector.
-    runtime.set_core_type_rule(num_aicore, block_dim);
-
-    // The sim has no upload: its threads read this host object in place, so
-    // `workers[]` here is the live handshake region and this loop is its
-    // per-run initialization, not a staged copy.
-    Handshake *workers = runtime.get_workers();
-    for (int i = 0; i < num_aicore; i++) {
-        workers[i].aicpu_ready = 0;
-        workers[i].aicore_done = 0;
-        workers[i].task = 0;
-        workers[i].core_type = (i < block_dim) ? CoreType::AIC : CoreType::AIV;
-        // Cleared with the rest of the report so a run's own epoch is the only
-        // value that can ever satisfy its sweep.
-        workers[i].report_epoch = 0;
     }
     return 0;
 }
@@ -842,109 +719,6 @@ int WseHostRunner::validate_active_callable(const Runtime &runtime) const {
     return 0;
 }
 
-int WseHostRunner::commit_device_register(int32_t cid) {
-    auto it = callables_.find(cid);
-    if (it == callables_.end()) {
-        LOG_ERROR("commit_device_register: callable_id=%d not registered", cid);
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    if (it->second.host_dlopen_handle != nullptr) {
-        return 0;
-    }
-    const bool inserted = aicpu_seen_callable_ids_.insert(cid).second;
-    if (inserted) {
-        ++aicpu_dlopen_total_;
-        LOG_INFO("AICPU callable load committed cid=%d (count=%zu)", cid, aicpu_dlopen_total_);
-    }
-    return 0;
-}
-
-int WseHostRunner::launch_device_register(int32_t callable_id) {
-    auto it = callables_.find(callable_id);
-    if (it == callables_.end()) {
-        LOG_ERROR("launch_device_register: callable_id=%d not registered", callable_id);
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    if (it->second.host_dlopen_handle != nullptr) {
-        return 0;
-    }
-
-    int rc = ensure_device_initialized();
-    if (rc != 0) {
-        LOG_ERROR("launch_device_register: ensure_device_initialized failed: %d", rc);
-        return rc;
-    }
-
-    // Build the orch-SO descriptor straight from CallableState — no throwaway
-    // Runtime + stamp round-trip. Mirrors the onboard launch_device_register.
-    const CallableState &state = it->second;
-    RegisterCallableArgs reg_args{};
-    reg_args.active_callable_id = callable_id;
-    reg_args.dev_orch_so_addr = state.dev_orch_so_addr;
-    reg_args.dev_orch_so_size = state.dev_orch_so_size;
-    snprintf(reg_args.device_orch_func_name, sizeof(reg_args.device_orch_func_name), "%s", state.func_name.c_str());
-    snprintf(
-        reg_args.device_orch_config_name, sizeof(reg_args.device_orch_config_name), "%s", state.config_name.c_str()
-    );
-
-    rc = invoke_device_register(reg_args);
-    if (rc != 0) {
-        LOG_ERROR("launch_device_register: invoke_device_register failed: %d", rc);
-        return rc;
-    }
-
-    return commit_device_register(callable_id);
-}
-
-int WseHostRunner::record_device_orch_callable(
-    int32_t callable_id, uint64_t chip_buffer_hash, uint64_t chip_dev, const void *orch_so_data, size_t orch_so_size,
-    const char *func_name, const char *config_name, std::vector<ArgDirection> signature
-) {
-    // The AICPU executor reserves `orch_so_table_[MAX_REGISTERED_CALLABLE_IDS]`
-    // (declared in src/common/task_interface/callable_protocol.h) and indexes
-    // it by callable_id; rejecting an out-of-range id here keeps the host and
-    // AICPU sides in sync and avoids an OOB access at run time.
-    if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) {
-        LOG_ERROR(
-            "record_device_orch_callable: callable_id=%d out of range [0, %d)", callable_id, MAX_REGISTERED_CALLABLE_IDS
-        );
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    if (orch_so_data == nullptr || orch_so_size == 0) {
-        LOG_ERROR("record_device_orch_callable: empty orch SO for callable_id=%d", callable_id);
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    if (chip_buffer_hash == 0 || chip_dev == 0) {
-        LOG_ERROR("record_device_orch_callable: missing chip buffer for callable_id=%d", callable_id);
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    if (callables_.count(callable_id) != 0) {
-        LOG_ERROR("record_device_orch_callable: callable_id=%d already registered", callable_id);
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-
-    const uint64_t hash = simpler::common::utils::elf_build_id_64(orch_so_data, orch_so_size);
-
-    CallableState state;
-    state.hash = hash;
-    state.chip_buffer_hash = chip_buffer_hash;
-    state.dev_orch_so_addr = chip_dev + offsetof(ChipCallable, storage_);
-    state.dev_orch_so_size = orch_so_size;
-    state.func_name = (func_name != nullptr) ? func_name : "";
-    state.config_name = (config_name != nullptr) ? config_name : "";
-    state.signature = std::move(signature);
-    const bool inserted = callables_.emplace(callable_id, std::move(state)).second;
-    if (!inserted) {
-        LOG_ERROR("record_device_orch_callable: callable_id=%d was claimed concurrently", callable_id);
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    LOG_INFO(
-        "record_device_orch_callable: cid=%d orch_hash=0x%lx chip_hash=0x%lx %zu bytes", callable_id, hash,
-        chip_buffer_hash, orch_so_size
-    );
-    return 0;
-}
-
 int WseHostRunner::record_host_orch_callable(
     int32_t callable_id, uint64_t chip_buffer_hash, void *host_dlopen_handle, void *host_orch_func_ptr,
     std::vector<ArgDirection> signature
@@ -990,7 +764,6 @@ int WseHostRunner::unregister_callable(int32_t callable_id) {
     }
     CallableState state = std::move(it->second);
     callables_.erase(it);
-    aicpu_seen_callable_ids_.erase(callable_id);
     release_chip_callable_buffer(state.chip_buffer_hash);
 
     if (state.host_dlopen_handle != nullptr) {
@@ -1003,11 +776,7 @@ int WseHostRunner::unregister_callable(int32_t callable_id) {
 
 bool WseHostRunner::has_callable(int32_t callable_id) const { return callables_.count(callable_id) != 0; }
 
-// Per-run binding half, defined in each runtime's runtime_maker.cpp and linked
-// into this same sim runtime .so. Declared here (rather than only in
-// c_api_shared.cpp) so bind_callable_to_runtime can call it directly, keeping
-// the CallableState-derived host_orch_func_ptr / signature internal to the
-// runner instead of returning them across the c_api boundary.
+// Runtime binding consumes the registration-owned entry pointer and signature.
 extern "C" int bind_callable_to_runtime_impl(
     Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
     const ArgDirection *signature, int sig_count, const uint64_t *ring_task_window, const uint64_t *ring_heap,
@@ -1042,8 +811,6 @@ int WseHostRunner::bind_callable_to_runtime(
         tables.object_table.empty() ? nullptr : tables.object_table.data(), tables.object_table_dev,
         tables.entry_table_dev, tables.table_len
     );
-    // The AICPU dispatches the orch SO via this callable_id; the SO descriptor
-    // was already delivered at launch_device_register time.
     runtime.set_active_callable_id(callable_id);
 
     // Per-run binding. host_orch_func_ptr + signature come from CallableState and
@@ -1055,11 +822,7 @@ int WseHostRunner::bind_callable_to_runtime(
     );
 }
 
-// Eager prebuilt-arena warm-up. A runtime with a prebuilt runtime arena
-// (tensormap_and_ringbuffer) provides a strong prewarm_config_impl in its
-// runtime_maker.cpp that overrides this weak no-op default; runtimes without one
-// link the weak default and treat prewarm as a no-op. simpler_init calls it
-// directly for the fork-constant ring sizing once the runner is attached.
+// WSE HBG sizes its arenas during bind; eager prewarm has no work.
 extern "C" __attribute__((weak)) int prewarm_config_impl(
     const HostApi * /*api*/, const uint64_t * /*ring_task_window*/, const uint64_t * /*ring_heap*/,
     const uint64_t * /*ring_dep_pool*/
@@ -1131,11 +894,8 @@ int WseHostRunner::start_shared_collectors_for_run(
             admission->owner = owner;
         }
     };
-    // All or nothing: an owner that declines after earlier ones admitted gives
-    // their admissions back, and so does an exception unwinding through here.
-    // Withdrawal is by run identity and is a no-op for an owner this run never
-    // reached, so sweeping every enabled owner is exact rather than merely
-    // convenient.
+    // Rollback withdraws all admitted owners on refusal or exception.
+    // Withdrawal is keyed by run identity and ignores owners that never admitted it.
     bool admitted_all = false;
     struct RollbackGuard {
         WseHostRunner *self;
@@ -1153,11 +913,8 @@ int WseHostRunner::start_shared_collectors_for_run(
         return create_thread(std::move(fn));
     };
     if (dfx.chip_swimlane_enabled()) {
-        // Same rule as the onboard base: configuration picks the path, and a
-        // run the retaining collector will not admit fails here rather than
-        // falling into the single-run reset, which would drop a predecessor's
-        // records. The reader shards start first because admission waits for
-        // their acknowledgement of the run table.
+        // A retained admission refusal cannot reset the collector and discard an earlier run.
+        // Reader threads start before admission waits for their run-table acknowledgement.
         if (chip_swimlane_collector_.retains_runs()) {
             chip_swimlane_collector_.start(thread_factory);
             if (!chip_swimlane_collector_.run_begin(
@@ -1225,11 +982,8 @@ int WseHostRunner::start_shared_collectors_for_run(
         }
     }
     if (dfx.scope_stats_enabled) {
-        // Configuration picks the path, as it does for the other retaining
-        // collectors: a run a retaining ScopeStats will not admit fails here,
-        // before any kernel is submitted. The refusal that matters is the
-        // quarantine one — `begin_run` would clear the very records a run
-        // whose completion could not be proved is still holding.
+        // Refuse before launch when retained scope statistics cannot admit the run.
+        // An ordinary reset would discard quarantined records.
         if (scope_stats_collector_.retains_runs()) {
             scope_stats_collector_.start(thread_factory);
             if (!scope_stats_collector_.run_begin(
@@ -1283,35 +1037,19 @@ uint64_t WseHostRunner::arm_chip_swimlane_run_terminal_bank(uint64_t run_epoch) 
 void WseHostRunner::undo_admission_attempt(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept {
     bool restored = false;
     {
-        // Giving an owner's slot back restores the state every waiter already
-        // saw before this attempt, so it is progress for nobody — and notifying
-        // there would wake this very thread onto its own bump, letting a
-        // repeated attempt manufacture its own wake every round while the
-        // blocking owner frees nothing. Thread-local, because the thread
-        // undoing an attempt is the thread that made it; a release on any other
-        // thread still advances past this attempt's snapshot.
+        // Restoring this attempt's capacity is not new progress: suppress its own wakeup.
+        // The suppression is thread-local, so concurrent genuine releases still notify.
         simpler::dfx::credit::DiagnosticCreditSignal::SuppressSelfNotify quiet;
         restored = withdraw_unlaunched_collectors_for_run(dfx, run_epoch);
     }
-    // An owner that could not give its slot back restored nothing: it
-    // quarantined this run or is fatal, and the capacity every waiter last
-    // observed is gone for good. That is a real event — the opposite of the
-    // absence of one — so it is published here, outside the suppression, and a
-    // waiter learns it by re-attempting rather than by spending its whole
-    // deadline on a wake nobody will raise.
+    // Quarantine or fatal refusal permanently removes capacity; publish that change
+    // outside suppression so waiters can re-evaluate admission.
     if (!restored) credit_signal_.advance();
 }
 
 bool WseHostRunner::withdraw_unlaunched_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept {
-    // Same rule as the onboard base: a launch that submitted nothing leaves an
-    // admitted, targetless slot that neither the writer nor a flush can see,
-    // and `kMaxOpenEpochs` of them exhaust the capacity the next admission
-    // waits on. Nothing may escape, for the reason the onboard base gives.
-    //
-    // The result is each owner's answer to "is this slot back", conjoined: an
-    // owner that never admitted this run answers yes, and one that quarantined
-    // it or is fatal answers no. The caller needs the distinction because only
-    // the first is a restoration of what every waiter already saw.
+    // NotStarted must withdraw targetless admissions or they exhaust the open-epoch limit.
+    // Return true only if all owners restored capacity; never throw during withdrawal.
     bool restored = true;
     if (dfx.pmu_enabled && pmu_collector_.retains_runs()) {
         // Nothing may escape a rollback path, for the reason given below. A
@@ -1339,11 +1077,7 @@ bool WseHostRunner::withdraw_unlaunched_collectors_for_run(const DfxRunConfig &d
             restored = false;
         }
     }
-    // DepGen's admission lives on the arch runner, so it is given back through
-    // the hook. This sits with the other per-collector withdrawals and ahead of
-    // the swimlane gates below: those return early, and a run with dep_gen on
-    // and swimlane off would otherwise keep an export slot no writer and no
-    // flush can see — two of them exhaust admission for the runner's life.
+    // Withdraw device DepGen before the swimlane early return, including when swimlane is disabled.
     if (dfx.dep_gen_enabled && dep_gen_retains_runs()) {
         withdraw_dep_gen_run(run_epoch);
     }
@@ -1352,12 +1086,8 @@ bool WseHostRunner::withdraw_unlaunched_collectors_for_run(const DfxRunConfig &d
         if (chip_swimlane_collector_.retains_runs()) {
             restored = chip_swimlane_collector_.abandon_run(run_epoch) && restored;
         } else {
-            // A terminal bank is taken per run whether or not this collector
-            // retains output, so its credit is owed back on the same terms.
-            // Retention decides only whether there is also a retained admission
-            // to withdraw; an ordinary-output run that stopped at NotStarted
-            // submitted nothing, so no producer can hold its bank and the
-            // release is proved rather than assumed.
+            // NotStarted proves no producer holds the terminal bank, even without retained output.
+            // Return its credit independently of the retained admission.
             chip_swimlane_collector_.release_run_terminal_bank(run_epoch);
         }
     } catch (...) {
@@ -1367,15 +1097,8 @@ bool WseHostRunner::withdraw_unlaunched_collectors_for_run(const DfxRunConfig &d
 }
 
 int WseHostRunner::flush_diagnostics(int timeout_ms, std::string *error) {
-    // Both retaining collectors, inside the one call and the one budget: each
-    // is serviced with the time left rather than re-acquiring the caller's
-    // whole timeout, so the bound never doubles. Both are always attempted —
-    // the first one's failure must not hide the second's — and the call fails
-    // if either does, naming each.
-    //
-    // Deliberately not gated on `retains_runs()`: PMU keeps a sticky error
-    // record for the runner's whole life, so a failure recorded before a
-    // collector rebuild turned retention off must still be reported here.
+    // Flush every owner within one shared deadline and collect all errors.
+    // Sticky PMU failures remain reportable after retention is disabled.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     auto remaining_ms = [&deadline]() -> int {
         const auto left =
@@ -1390,12 +1113,7 @@ int WseHostRunner::flush_diagnostics(int timeout_ms, std::string *error) {
     std::string dep_gen_error;
     std::string host_graph_error;
     bool ok = true;
-    // Gated on whether this collector has ever retained, not on whether it
-    // retains now — the same boundary the onboard runner uses, and the same
-    // reason PMU's arm below is ungated. A failure recorded under retention has
-    // to survive the rebuild or reconfiguration that turned retention off, and
-    // a collector that never retained has nothing here its own runs did not
-    // already report.
+    // A collector that ever retained must still report its sticky errors after reconfiguration.
     if (chip_swimlane_collector_.ever_retained() &&
         !chip_swimlane_collector_.flush_retained_runs(remaining_ms(), &swimlane_error)) {
         ok = false;
@@ -1413,11 +1131,7 @@ int WseHostRunner::flush_diagnostics(int timeout_ms, std::string *error) {
     if (!scope_stats_collector_.flush_retained_runs(remaining_ms(), &scope_stats_error)) {
         ok = false;
     }
-    // DepGen lives on the arch runner, so it is reached through the hook. The
-    // arm is deliberately ungated, for the same reason PMU's is: a failure
-    // recorded before a collector rebuild reconfigured retention off must
-    // still be reported here, and a collector that retains nothing has
-    // nothing to wait for and nothing to report.
+    // The device DepGen hook reports sticky errors even when retention is currently disabled.
     if (!dep_gen_flush_retained(remaining_ms(), &dep_gen_error)) {
         ok = false;
     }
@@ -1459,11 +1173,8 @@ bool WseHostRunner::seal_host_dep_gen_graph(const DfxRunConfig &dfx, uint64_t ru
 void WseHostRunner::write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot) {
     if (pipeline_slot >= host_phase_runs_.size()) return;
     simpler::dfx::HostPhaseRecordStore &records = host_phase_runs_[pipeline_slot].records;
-    // Every phase this records is produced on the host during bind and the store
-    // is finished before launch, so it touches no device state and is callable
-    // from any point after bind — including a path that never launched. The run's
-    // output prefix is non-empty exactly when it produces diagnostic artifacts,
-    // and the store writes a pass at most once.
+    // Host records are complete after bind and contain no device state.
+    // Each pass is written at most once, including runs that never launched.
     if (!output_prefix.empty() && records.finished()) {
         (void)records.write_records_jsonl(make_host_phase_records_path(output_prefix));
     }
@@ -1477,15 +1188,8 @@ void WseHostRunner::close_pmu_run_boundary(
         pmu_collector_.reconcile_counters();
         return;
     }
-    // A retained run keeps only the run boundary's device-side reads — the
-    // per-core counters and the buffers the cores still hold — and hands the
-    // rest to the writer. No quiesce: the pipeline is shared with the
-    // successor, and draining it here is what the per-queue cut replaces.
-    //
-    // `device_execution_complete` is what the caller observed of this run's
-    // fence, and it is the whole of PMU's "this run finished" proof: the
-    // recovery path clears it, and a producer may then never have reached its
-    // own close.
+    // Retained close reads the run boundary and delegates writing without quiescing successors.
+    // Only device_execution_complete proves the terminal publication can be read.
     (void)dfx;
     pmu_collector_.run_close(run_epoch, device_execution_complete);
     simpler::dfx::runs::settle_failed_run_terminal_bank(
@@ -1499,11 +1203,7 @@ int WseHostRunner::close_args_dump_run_boundary(
     if (!dump_collector_.retains_runs()) {
         return dump_collector_.close_ordinary_run(device_execution_complete || device_producers_stopped);
     }
-    // A retained run keeps only the run boundary's device-side reads — this
-    // run's terminal lane state and, for a lane whose handover its receipt
-    // ledger can decide, an unpublished buffer's records and payload — and
-    // hands the rest to the writer. No quiesce: the pipeline is shared with the
-    // successor, and draining it here is what the per-queue cut replaces.
+    // Retained close hands the proven run-boundary snapshot to the writer without quiescing successors.
     (void)dfx;
     // Non-zero when the close could not prove this run's published buffers were
     // processed into host-owned storage inside its execution claim. That is an
@@ -1524,11 +1224,8 @@ void WseHostRunner::close_scope_stats_run_boundary(
         );
         return;
     }
-    // A retained run keeps the boundary's ownership steps — the receive drain
-    // and the terminal read — and hands only the rendering and the file write
-    // to the writer. `device_execution_complete` is what the caller observed of
-    // this run's fence and is the whole of this collector's completion proof:
-    // without it nothing shared is read and the run produces no artifact.
+    // Retained scope close keeps ownership and terminal-read steps here; only rendering is deferred.
+    // An incomplete run permits no snapshot read or artifact.
     (void)dfx;
     scope_stats_collector_.run_close(run_epoch, device_execution_complete);
     simpler::dfx::runs::settle_failed_run_terminal_bank(
@@ -1540,29 +1237,12 @@ int WseHostRunner::teardown_shared_collectors_after_run(
     const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete,
     bool device_producers_stopped
 ) {
-    // The order is fixed by two couplings, not by preference: the host phase
-    // records reach the collector before the swimlane export serializes them,
-    // and each collector drains before it reconciles before it exports.
-    // Diagnostic exports use the per-task output prefix the user set on
-    // CallConfig (CallConfig::validate() enforces non-empty upstream).
-    //
-    // Only ArgsDump's close reports anything here: a retained run whose
-    // published buffers it could not prove processed inside the execution claim
-    // is an ownership failure the caller has to see, because releasing the
-    // claim past one would let the successor reuse an arena whose bytes nobody
-    // copied. Every other collector's close is void, as it was.
+    // Publish Host phases before swimlane export; drain each collector before reconcile/export.
+    // ArgsDump ownership failures must reach the caller before a successor can reuse backing.
     int args_dump_rc = 0;
     if (dfx.chip_swimlane_enabled() && chip_swimlane_collector_.retains_runs()) {
-        // Both publications precede the epoch's metadata snapshot, which is
-        // what copies them. The extensions belong here for the same reason the
-        // host phase records do: a5's host_build_graph supplies a real
-        // publisher for them at every enabled level, and the collector holds
-        // one copy of the sections for every run it serves.
-        // No bank index is passed: a bank is held by the epoch that acquired it,
-        // so the close resolves its own and settles it there. See the onboard
-        // base for the two proofs that let one be handed on, and
-        // `device_producers_stopped` for the third, which only a simulated
-        // device can supply.
+        // Publish phase records and extensions before the epoch snapshot.
+        // Terminal banks are addressed and settled by epoch, never by a guessed slot.
         simpler::dfx::runs::close_run_boundary(
             chip_swimlane_collector_, run_epoch, device_execution_complete, device_producers_stopped,
             [this, pipeline_slot] {
@@ -1587,12 +1267,8 @@ int WseHostRunner::teardown_shared_collectors_after_run(
         chip_swimlane_collector_.quiesce();
         chip_swimlane_collector_.read_phase_header_metadata();
         chip_swimlane_collector_.reconcile_counters();
-        // Only the completion path reads the bank; see the onboard base for why
-        // an incomplete run's snapshot says nothing about that run. Whether the
-        // bank itself comes back is a separate question, and on a simulated
-        // device it has an answer: the producers are this process's AICPU and
-        // AICore threads, and the drain joined every one of them before it got
-        // here.
+        // Only completion permits reading the terminal bank. Joined producers separately
+        // prove backing is reclaimable after failure.
         const int bank = chip_swimlane_collector_.run_terminal_bank_of(run_epoch);
         if (device_execution_complete) {
             if (bank >= 0) {
@@ -1632,11 +1308,7 @@ int WseHostRunner::teardown_shared_collectors_after_run(
     return args_dump_rc;
 }
 
-// Whether this runtime's device scheduler dispatches from resolved kernel-entry
-// addresses rather than resolving each entry out of the CoreCallable object it
-// is handed. Defined by every runtime's runtime_maker.cpp, so adding a runtime
-// cannot leave the answer implicit, and true only where a device consumer reads
-// the entry view.
+// The runtime declares whether dispatch consumes resolved kernel-entry addresses.
 extern "C" bool runtime_uses_callable_entry_table_impl();
 
 uint64_t WseHostRunner::upload_chip_callable_buffer(const ChipCallable *callable) {
@@ -1680,14 +1352,8 @@ uint64_t WseHostRunner::upload_chip_callable_buffer(const ChipCallable *callable
     // ChipCallableBuffer::host_scratch ownership symmetric with finalize().
     auto *scratch = new uint8_t[layout.total_size];
 
-    // The guard owns the scratch and every handle until the map entry does,
-    // and it takes that ownership on the statement after the allocation:
-    // `RAIIScopeGuard` stores the by-reference lambda in place, so nothing
-    // between the two can throw. It decides by `published` rather than by
-    // being dismissed, because the handles move into the published entry only
-    // after the insertion returns and a guard consulting a moved-from vector
-    // could not close them. Every early return and every throw before that
-    // point unwinds through here.
+    // Until map insertion succeeds, this guard owns the scratch and every loaded DSO.
+    // The published flag remains valid after noexcept moves transfer the handle vector.
     auto cleanup = RAIIScopeGuard([&]() {
         if (published) return;
         for (void *h : dlopen_handles)
@@ -1757,21 +1423,15 @@ uint64_t WseHostRunner::upload_chip_callable_buffer(const ChipCallable *callable
 
     const uint64_t chip_dev = reinterpret_cast<uint64_t>(scratch);
 
-    // The tables are filled from the same scratch the dlopen loop just patched,
-    // by the same helper the onboard path uses: sim's own host addresses stand
-    // in for the device base, so the object view addresses each CoreCallable
-    // inside the scratch and the entry view carries the host function pointer
-    // that child's resolved_addr_ now holds.
+    // Both tables describe the patched scratch: one contains CoreCallable objects,
+    // the other the resolved Host entry addresses.
     chip_callable_fill_tables(
         callable, layout, scratch, chip_dev, table_len, object_table.data(),
         want_entry_table ? entry_table.data() : nullptr
     );
 
-    // One publication point. The entry is built with no handles and inserted
-    // first: the insertion is the last thing that can fail, and until it
-    // returns the guard above is still the only owner of the scratch and the
-    // handles. The moves that follow are `std::vector`'s noexcept move
-    // assignment, so the entry cannot end up published and incomplete.
+    // Map insertion is the last fallible publication step. Subsequent vector moves
+    // are noexcept, so the retained entry cannot be published partially.
     ChipCallableBuffer retained{chip_dev, scratch, layout.total_size, 1, {}};
     retained.table_len = table_len;
     if (table_len != 0) {
@@ -1814,21 +1474,6 @@ int WseHostRunner::release_chip_callable_buffer(uint64_t hash) {
     return 0;
 }
 
-void WseHostRunner::print_handshake_results() {
-    if (worker_count_ == 0 || last_runtime_ == nullptr) {
-        return;
-    }
-
-    LOG_DEBUG("Handshake results for %d cores:", worker_count_);
-    Handshake *workers = last_runtime_->get_workers();
-    for (int i = 0; i < worker_count_; i++) {
-        LOG_DEBUG(
-            "  Core %d: aicore_done=%d aicpu_ready=%d task=%d", i, workers[i].aicore_done, workers[i].aicpu_ready,
-            workers[i].task
-        );
-    }
-}
-
 void WseHostRunner::release_callable_state() {
     // Release any chip callable buffers callers forgot to unregister.
     for (auto &kv : chip_callable_buffers_) {
@@ -1843,19 +1488,13 @@ void WseHostRunner::release_callable_state() {
     }
     chip_callable_buffers_.clear();
 
-    // hbg path: dlclose any host orch handles callers forgot to unregister.
-    // finalize() is the last chance; Worker.close() does not auto-unregister
-    // each callable_id, so without this loop the host process leaks one
-    // dlopen handle per (re)created Worker — observable in long-running
-    // pytest sessions.
+    // Worker.close does not unregister each callable; finalize closes remaining Host DSOs.
     for (auto &kv : callables_) {
         if (kv.second.host_dlopen_handle != nullptr) {
             dlclose(kv.second.host_dlopen_handle);
         }
     }
     callables_.clear();
-    aicpu_seen_callable_ids_.clear();
-    aicpu_dlopen_total_ = 0;
 }
 
 bool WseHostRunner::every_enabled_owner_can_admit(const DfxRunConfig &dfx, uint64_t run_epoch) const {
@@ -1903,14 +1542,8 @@ void WseHostRunner::resolve_run_terminal_banks(
 }
 
 void WseHostRunner::install_credit_release_notifiers() {
-    // Exactly once per runner, and before any collector thread exists: the
-    // first call runs during the first run's arming, which precedes every
-    // `collector.start(thread_factory)`. A second assignment would write a
-    // `std::function` a background writer may be calling at that moment —
-    // releases run outside the collector locks — and assigning the same
-    // lambda is no defence, because the race is on the object and not on its
-    // value. Installed once, the callbacks are immutable for the runner's
-    // life, which is what makes them safe to call from any writer.
+    // Install callbacks once before any collector thread starts. Concurrent replacement
+    // would race a writer executing its callback outside collector locks.
     if (credit_notifiers_installed_) return;
     credit_notifiers_installed_ = true;
     // Every collector, not only the ones this run enabled: a collector whose

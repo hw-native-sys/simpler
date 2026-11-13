@@ -8,19 +8,12 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#include "host/platform_compile_info.h"
-#include "host/runtime_compile_info.h"
-#include <string.h>
+#pragma once
+#include <cstddef>
+#include <cstdint>
+#include <string>
 
-extern "C" {
-
-ToolchainType get_incore_compiler(void) {
-    if (strcmp(get_platform(), "a2a3") == 0) return TOOLCHAIN_CCEC;
-    return TOOLCHAIN_HOST_GXX_15;
-}
-
-ToolchainType get_orchestration_compiler(void) {
-    // host_build_graph: always host g++ (orchestration runs on host)
-    return TOOLCHAIN_HOST_GXX;
-}
-}
+namespace simpler::common::sim_host {
+// Owns the temporary file until successful close; failure removes it.
+bool create_temp_so_file(const std::string &path_template, const uint8_t *data, size_t size, std::string *out_path);
+}  // namespace simpler::common::sim_host

@@ -5,43 +5,36 @@
     {
       "source": "src/common/platform/sim/host/device_runner_base.h",
       "destination": "src/wse/platform/sim/host/wse_host_runner.h",
-      "baseline_sha256": "6c7818d5922dacee63537c8c64936586f631993c3dbd054aea40701c5efaa655",
-      "sha256": "85b286abe152a8b16b280a3f5c525bdd33dfb6634f3231f54849e07d18c7c0db"
+      "sha256": "0f0b6d42e0016576a64f8a4ba04268ffbadc7f7355fb3e678b63175da9cbf334"
     },
     {
       "source": "src/common/platform/sim/host/device_runner_base.cpp",
       "destination": "src/wse/platform/sim/host/wse_host_runner.cpp",
-      "baseline_sha256": "0d3a537cc797be7fd5c52a8ed69c8bee63e2ba812f178ab5f88aeba0d7963633",
-      "sha256": "8c93043cf7ed671a8092d48b6da86dc9cb99ea25bf473fbd7112cc77df8d2e56"
+      "sha256": "ab2723c0f6a004fb7b35e620ccb8413fb646f4f3221b94a4234ec37a30f0c64c"
     },
     {
       "source": "src/common/platform/sim/host/c_api_shared.cpp",
       "destination": "src/wse/platform/sim/host/wse_runtime_api.cpp",
-      "baseline_sha256": "98b2638d29b0131cb4e20049b2deb1e065b46f1ffcd7f8f0e5910059d3b794d2",
-      "sha256": "fd28b31b8acd74eea9cd47749ae7936d961bb16f75e2128ae4f31c2de4a004c7"
+      "sha256": "e2afea60f4ac88258b8a6dc55faf0167042585f69cc47b34a6331154368da2fb"
     },
     {
       "source": "src/common/worker/native_run_execution.h",
       "destination": "src/wse/platform/sim/host/wse_launch_transaction.h",
-      "baseline_sha256": "b16aa71bed7ff5a61d9a58b8511a44b423a36965518002973042640a11fd7ead",
       "sha256": "171ceed6409bfe34df3c3023934705d84fe2051e85ac71723c64745ea146f1b5"
     },
     {
       "source": "src/common/host_build_graph/host/orchestrator.cpp",
       "destination": "src/wse/runtime/host_build_graph/host/wse_graph_orchestrator.cpp",
-      "baseline_sha256": "cca4a6c293a019e92725c3902cde107fbda468b6bb584703d5733ae4ac28cbd2",
-      "sha256": "342a14378f2e752f1657df139245c9583793ac53d48c4adaf94eb343254a25f0"
+      "sha256": "df7776aea4c5dbf667e6d71f38193e6a6564aae5bf3f51f8c2bc0d9fc5334646"
     },
     {
       "source": "src/common/host_build_graph/host/graph_submit.cpp",
       "destination": "src/wse/runtime/host_build_graph/host/wse_graph_submit.cpp",
-      "baseline_sha256": "4418c70b88eb39021e4e99bd3d1cb29f969add5ff5d79e9e57575e25c160e25c",
-      "sha256": "3dfbb80534983e5cb3f823ffbec3db822eb00f806b1b9a13916f9e447b8dc870"
+      "sha256": "64059eedb545b52e25fc925b6451076033ca986349e006b9ccd925230deefda6"
     },
     {
       "source": "src/common/worker/native_run_context.h",
       "destination": "src/wse/platform/sim/host/wse_native_run_context.h",
-      "baseline_sha256": "614ff62113f45dbcc8fc815fc0898626de246ac41914b3600854ad0b18124e39",
       "sha256": "2009b734b0da580b040abe4cce68ae5bf49cc04fe2a707e6c6b1cec35ef7b84a"
     }
   ],

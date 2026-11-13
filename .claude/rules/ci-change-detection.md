@@ -66,12 +66,12 @@ is wrong (see §1) — fix that instead of widening the gate.
 | Axis | Output | Answers |
 | ---- | ------ | ------- |
 | non-code | `non_code_only` | can this diff change what the code does at all? |
-| architecture | `a2a3_changed` / `a5_changed` | which silicon can it reach? |
+| architecture | `a2a3_changed` / `a5_changed` / `wse_changed` | which platform can it reach? |
 | test category | `st_affected` / `ut_affected` | which suite can it break? |
 | corpus | `examples_only` / `tests_only` | can it reach a job that builds the product and runs a fixed payload? |
 
 They are layered, not redundant. **Every arch and category flag subtracts
-`NON_CODE` before deciding**, so a non-code-only change already makes all four
+`NON_CODE` before deciding**, so a non-code-only change already makes every architecture and category flag
 false. An arch- or category-gated job therefore needs no separate non-code
 check, and adding one would be noise.
 
@@ -79,10 +79,14 @@ A job composes the axes it is actually subject to:
 
 | Job family | Gate |
 | ---------- | ---- |
-| `st-sim-*`, `st-onboard-*` | `<arch>_changed && st_affected` |
+| `st-sim-{a2a3,a5}`, `st-onboard-*` | `<arch>_changed && st_affected` |
+| `st-sim-wse` | `wse_changed && st_affected` |
 | `profiling-flags-smoke` | `(a2a3_changed \|\| a5_changed) && !examples_only && !tests_only` |
 | `ut`, `ut-a2a3`, `ut-a5` | `non_code_only != true && ut_affected` |
 | `packaging-matrix` | `non_code_only != true && !examples_only && !tests_only` |
+
+WSE has a simulation scene job and no onboard job. `profiling-flags-smoke`
+exercises A2/A3 and A5; WSE dependency capture runs in `_st-sim-wse.yml`.
 
 `packaging-matrix` and `profiling-flags-smoke` build and install the product and
 then exercise it with a **fixed, tiny payload** — packaging's entry-point smoke

@@ -17,12 +17,12 @@ from pathlib import Path
 import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, DataType, TaskArgs, TensorArgType
+from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
-from simpler_setup.kernel_compiler import KernelCompiler
 from tests.st.wse.host_build_graph.direct_launch.test_direct_launch import audit_events
 from tests.st.wse.host_build_graph.fixed_sram_layout import copy_from, copy_to, layout_view, release_view
+from tests.st.wse.host_build_graph.scene_helpers import build_callable
 
 pytestmark = [pytest.mark.platforms(["wsesim"]), pytest.mark.runtime("host_build_graph"), pytest.mark.device_count(1)]
 HERE = Path(__file__).parent
@@ -58,24 +58,13 @@ def load_gate(tmp_path, hook, mask, *, source_code=_GATE):
 
 @lru_cache
 def build_probe(platform, shared=False):
-    compiler = KernelCompiler(platform)
-    sources = ["shared_block"] if shared else ["probe"]
-    signatures = [[D.IN, D.OUT]] if shared else [[D.IN, D.OUT, D.OUT, D.IN]]
-    children = []
-    for index, (name, sig) in enumerate(zip(sources, signatures, strict=True)):
-        binary = compiler.compile_incore(
-            str(HERE / f"kernels/{name}.cpp"),
-            core_type="",
-            extra_include_dirs=compiler.get_orchestration_include_dirs("host_build_graph"),
-        )
-        children.append((index, CoreCallable.build(signature=sig, binary=binary)))
-    return ChipCallable.build(
-        signature=[D.IN, D.OUT] if shared else [D.IN, D.OUT, D.OUT, D.IN, D.IN],
-        func_name="aicpu_orchestration_entry",
-        binary=compiler.compile_orchestration(
-            "host_build_graph", str(HERE / ("kernels/shared_block_orch.cpp" if shared else "kernels/probe_orch.cpp"))
-        ),
-        children=children,
+    stem = "shared_block" if shared else "probe"
+    return build_callable(
+        platform,
+        HERE / "kernels",
+        f"{stem}_orch.cpp",
+        [D.IN, D.OUT] if shared else [D.IN, D.OUT, D.OUT, D.IN, D.IN],
+        [(f"{stem}.cpp", [D.IN, D.OUT] if shared else [D.IN, D.OUT, D.OUT, D.IN])],
     )
 
 

@@ -61,16 +61,8 @@ static constexpr int32_t normalized_fatal_code(int32_t error_code) {
     return error_code == SIMPLER_ERROR_NONE ? SIMPLER_ERROR_EXPLICIT_ORCH_FATAL : error_code;
 }
 
-// First-writer-wins, so the latched code names the failure that started the
-// cascade. The CAS is load-bearing rather than decorative: a recording worker and
-// the bind thread both reach here (see OrchestratorState::fatal_code).
-// TaskAllocator::report_capacity_exhausted writes the same field under the same rule.
-//
-// `latched_out` receives the code that owns the field after this call, whoever put it
-// there. The return value is whether *this* call put it there, and it is the only
-// answer to that question: a load before the exchange can be overtaken, and the
-// latched code cannot stand in for ownership because two reporters may carry the same
-// code. A caller that must know whether the run's failure is its own takes the bool.
+// Recording and bind threads race to latch the first fatal code. Return whether this
+// CAS won; latched_out receives the winner's code even if equal reporters competed.
 static bool orch_mark_fatal_owned(OrchestratorState *orch, int32_t error_code, int32_t *latched_out) {
     always_assert(orch != nullptr);
     const int32_t code = normalized_fatal_code(error_code);
@@ -224,27 +216,14 @@ static bool fanin_mark_seen(OrchestratorState &orch, TaskId producer_task_id) {
     return false;
 }
 
-// Polling: fanin is a flat array of position-independent producer local ids in the
-// payload's own fanin region (no dep-pool spill, no producer pointers), deduped
-// against the current fanin_seen epoch and hard-capped at CHIP_MAX_FANIN.
-// fanin_slots and fanin_count are that region and payload.fanin_count itself: the
-// region is named by a SelfRelativePtr delta, so the caller resolves it once, and
-// the count accumulates in place instead of being copied back at the end.
+// Fanin stores deduplicated GLOBAL producer IDs, capped at CHIP_MAX_FANIN.
+// The caller resolves the self-relative region once; count accumulates in the payload.
 namespace simpler::hbg {
 bool append_fanin_or_fail(
     OrchestratorState &orch, TaskId producer_task_id, int32_t *fanin_slots, int32_t &fanin_count
 ) {
-    // Only a GLOBAL producer has an entry in the task table. A SUB_TASK id's low
-    // bits are a packed (Graph task, task index) pair, so using them as a table
-    // index names an unrelated task — or, since get_slot_state_by_task_id does not
-    // bounds-check, no task at all. A recorded task's id is SUB_TASK and the
-    // recorder resolves it against its own body, never here, so a foreign space
-    // reaching this point is an id that escaped its Graph — a caller error, not a
-    // case to tolerate.
-    //
-    // The table lookup lives here, after this check, rather than at the three call
-    // sites: that keeps the id-space invariant in one place and makes it impossible
-    // for a caller to form the out-of-bounds slot reference before reaching it.
+    // Validate GLOBAL ID space before accessing the task table. SUB_TASK IDs encode
+    // Graph-local indices and must be resolved by the recorder, never as table indices.
     if (!producer_task_id.is_global()) {
         orch.report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
@@ -348,12 +327,8 @@ static bool prepare_task(
     out->task = &storage.task;
     out->payload = &storage.payload;
 
-    // Bind the three argument regions before prefetch() and init(), both of which
-    // dereference them. The scalar cursor advances in whole cache lines because init()
-    // rounds its scalar memcpy up to one; a packed advance would let that rounding
-    // write into the next task's region. A tensor region is aligned for any count,
-    // simpler::hbg::Tensor being two cache lines. The fanin cursor advances at publish, not
-    // here — see the comment where it does.
+    // Bind argument regions before prefetch/init. Scalars advance in cache-line units
+    // because init rounds its copy; Tensor size preserves alignment. Fanin advances at publish.
     const uint64_t max_tasks = static_cast<uint64_t>(orch->task_allocator.capacity());
     const int32_t scalar_span = CHIP_ALIGN_UP(args.scalar_count(), ARG_POOL_ALIGN / (int32_t)sizeof(uint64_t));
     debug_assert(static_cast<uint64_t>(orch->tensor_pool_cursor) + args.tensor_count() <= max_tasks * MAX_TENSOR_ARGS);
@@ -406,13 +381,8 @@ void OrchestratorState::begin_scope(ScopeMode mode) {
     if (orch->is_fatal()) {
         return;
     }
-    // A Graph replays as a flat DAG with no scope structure: scope boundaries only
-    // shape scheduling on the ordinary path, and the shadow-record path submits no
-    // ordinary tasks. So a scope inside a Graph body must not touch the real scope
-    // stack. Its manual/auto mode still matters, though — the recorder infers a recorded
-    // task's producers with the same compute_task_fanin the ordinary path uses, and
-    // that inference is suppressed inside a manual scope — so the depth is tracked on
-    // the recording instead.
+    // Graph bodies record a flat DAG and never modify the ordinary scope stack.
+    // Recording-local scope depth still controls whether dependency inference is suppressed.
     if (GraphRecording *recording = active_graph_recording(orch); recording != nullptr) {
         // Reject what the ordinary path rejects. An auto scope inside a manual one is a
         // fatal below; accepting it here would let a Graph record and replay a
@@ -474,14 +444,9 @@ void OrchestratorState::end_scope() {
 // Task Submission
 // =============================================================================
 
-// Ensure the tensormap entry pool has room for `needed` inserts before STEP 4
-// registers this task's outputs. Device completion never reclaims TensorMap
-// entries; only synchronous dependency computation can remove a covered
-// producer before this check. A pool that is still short here therefore cannot
-// become large enough while the host waits: latch
-// SIMPLER_ERROR_TENSORMAP_OVERFLOW and bail rather than letting new_entry()'s hard
-// assert fire mid-registration. Returns false when the pool is exhausted or a
-// fatal is already latched.
+// Check TensorMap capacity before output registration. Only synchronous dependency
+// computation reclaims entries; device completion cannot make a full pool fit.
+// Latch overflow instead of waiting or reaching new_entry's assertion.
 namespace simpler::hbg {
 bool ensure_tensormap_capacity(OrchestratorState *orch, int32_t needed) {
     ChipTensorMap &tm = orch->tensor_map;
@@ -705,31 +670,13 @@ static TaskOutputTensors submit_task_common(
     payload.predicate = resolved_predicate;
     ORCH_STEP_LAP(g_orch_args_ns);
 
-    // === STEP 6: close the fanin region (device boot classifies) ===
-    // Polling + host-orch: append_fanin_or_fail already wrote each producer's local
-    // id into the payload's fanin region and counted them in payload.fanin_count.
-    // There is NO fanout adjacency, NO dep_pool, and NO ready routing here — the
-    // initial device boot scan classifies
-    // each task once. A -1 result from classify_fanin_state routes the task through
-    // push_ready_routed; otherwise the returned index selects the producer passed
-    // to register_wake. Wake retargeting in register_wake may reclassify a task
-    // when the selected producer is already complete.
-    // The initial scan happens before the scheduler dispatch loop starts. Fanin is
-    // a flat array of position-independent integers, so it crosses to the device
-    // unchanged.
-    // The region's length is settled, so the cursor closes it at the real count. The
-    // equality holds only while nothing between the bind and here bound another fanin
-    // region, which is what makes the deferred advance safe.
+    // The fanin region contains position-independent producer IDs and closes at its final count.
+    // No intervening task may bind another fanin region before this cursor advances.
     debug_assert(orch->fanin_pool_cursor == static_cast<int32_t>(payload.fanin_data() - orch->fanin_pool));
     orch->fanin_pool_cursor += CHIP_ALIGN_UP(payload.fanin_count, ARG_POOL_ALIGN / (int32_t)sizeof(int32_t));
 
-    // Early-dispatch qualification, decided once here where the fanin region is
-    // final. The conjunction is order-independent, so it runs on the row as
-    // filled; only a CANDIDATE's row is then sorted by producer local id — ids
-    // come from the forward-only bump allocator, so ascending id order IS
-    // submission order and the sorted row's tail names the latest-submitted
-    // producer, the one the publish-list bet hangs on. Non-candidate rows keep
-    // their fill order: a flag-free graph schedules exactly as it always has.
+    // Qualify once after fanin is final. Sort candidate producer IDs into submission order;
+    // leave non-candidate rows in their original order.
     int32_t *const fanin_row = payload.fanin_data();
     SharedMemoryTaskHeader &sm_tasks = orch->sm_header->tasks;
     bool ed_candidate =
@@ -943,16 +890,8 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
         return TaskOutputTensors{};
     }
 
-    // A Graph body may allocate. The allocation records as a kernel-less sub-task
-    // — the same shape submit_dummy_task records — and replay reserves the
-    // intermediate heap for every sub-task anyway, so the outputs land at
-    // addresses the replayed Definition derives for itself.
-    //
-    // An allocation is transparent to early-dispatch qualification inside a body
-    // exactly as it is at top level: its output is ready at creation, so it must
-    // never be the unflagged producer that disqualifies a consumer. The top-level
-    // path marks the slot after prepare_task, which this branch returns before, so
-    // here the recorded attrs carry the mark instead.
+    // Graph allocation records a kernel-less sub-task whose storage is rebased at replay.
+    // Its output is ready at creation, so its attributes must not disqualify early dispatch.
     if (active_graph_recording(orch) != nullptr) {
         TaskAttrs alloc_attrs;
         alloc_attrs.set_early_resolve(true);
@@ -996,20 +935,9 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
     ORCH_STEP_LAP(g_orch_args_ns);
 
     if (prepared.slot_state != nullptr) {
-        // Hidden alloc tasks complete inline in the orchestrator before any
-        // consumer can exist, so they have no fanout to notify and no worker
-        // subtasks to retire. Running the full on_task_complete path
-        // would only pay unnecessary fanout_lock / traversal overhead here.
-        // The generic slot initialization done in prepare_task() is still
-        // required — a consumer reads this slot's task_attrs, set below — but
-        // worker dispatch fields are never observed for hidden alloc tasks.
-        //
-        // Flag the creator so it does NOT suppress its consumers' early-dispatch.
-        // Under the direct-only model an unflagged producer disqualifies its
-        // consumer. A buffer allocation is pure memory whose output is ready at
-        // creation — it should always be transparent, never a barrier. Unlike a
-        // codegen task there is no Arg-driven hint to honor here, so mark it
-        // unconditionally.
+        // Hidden allocations complete inline before consumers exist, without worker retirement
+        // or fanout notification. Initialize their slots and mark their outputs ready so they
+        // do not suppress consumers' early dispatch.
         prepared.slot_state->task_attrs.set_early_resolve(true);
         // Polling: pre-set the device-visible task_states byte in the H2D
         // image. That byte is the only completion a consumer polls, so a

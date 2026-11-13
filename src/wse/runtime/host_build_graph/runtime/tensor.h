@@ -8,27 +8,9 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-/**
- * Both tensor types this runtime deals in: the boundary `ChipTensor` an argument
- * arrives as, and `simpler::hbg::Tensor`, the form everything inside the runtime —
- * orchestration included — actually works with.
- *
- * This sits first on the runtime include path, so a `#include "tensor.h"` from
- * runtime, orchestration or kernel sources lands here.
- */
-
 #pragma once
-
 #include "task_interface/tensor.h"
 #include "host_build_graph/tensor.h"
 
-// The tensor type of whichever runtime this translation unit is being built for.
-// A kernel reads a payload element and does not care which orchestrator produced
-// it, so kernels and the orchestration sources shared between runtimes name this
-// rather than picking one — several are compiled under both.
-//
-// The name is unqualified because nothing on a kernel or orchestration include path
-// reaches task_interface/buffer.h, which declares a different `Tensor` — the L3+
-// wire form, at global scope. tests/lint/check_kernel_wire_isolation.py holds that
-// separation; an include that breaks it turns this line into a redeclaration.
+// Kernel/orchestration includes must not import the unrelated L3 Buffer/Tensor types.
 using Tensor = simpler::hbg::Tensor;

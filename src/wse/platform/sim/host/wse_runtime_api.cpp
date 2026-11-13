@@ -8,18 +8,8 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-/**
- * Shared sim c_api glue — TSD binding, static wrappers, and the bulk of the
- * public C ABI surface, all written against WseHostRunner * so the same
- * source file is linked into both arches' libhost_runtime.so (sim variant).
- *
- * Per-arch runtime_c_api.cpp keeps only `create_device_context` (the one
- * line that requires the concrete DeviceRunner type) plus the acl/comm
- * placeholders (sim has no ACL; comm_init/barrier/destroy come from
- * src/common/platform_comm/comm_sim.cpp).
- *
- * Mirrors the onboard pattern from PR #928.
- */
+// WSE implementation of the unchanged Host runtime C ABI.
+// DeviceRunner creation and ACL stubs live in runtime_c_api.cpp.
 
 #include "host/host_dependency_capture_scope.h"
 #include <optional>
@@ -44,6 +34,7 @@
 #include <mutex>
 #include <new>
 #include <utility>
+#include <type_traits>
 #include <vector>
 
 #include "common/device_phase.h"
@@ -115,6 +106,18 @@ emit_host_dep_gen_graph(WseHostRunner *runner, const CallConfig &config, uint64_
     }
 }
 
+// Keep exceptions inside the runtime C ABI; each entry supplies its existing failure value.
+template <auto Method, class... Args>
+auto guarded_runner_call(
+    void *context, std::invoke_result_t<decltype(Method), WseHostRunner &, Args...> failure, Args &&...args
+) noexcept {
+    try {
+        return (static_cast<WseHostRunner *>(context)->*Method)(std::forward<Args>(args)...);
+    } catch (...) {
+        return failure;
+    }
+}
+
 extern "C" {
 
 /* ===========================================================================
@@ -153,11 +156,7 @@ __attribute__((weak)) int args_dump_capture_supported_impl(void) { return 0; }
 
 static void *device_malloc(void *runner_ctx, size_t size) {
     if (runner_ctx == nullptr) return nullptr;
-    try {
-        return static_cast<WseHostRunner *>(runner_ctx)->allocate_tensor(size);
-    } catch (...) {
-        return nullptr;
-    }
+    return guarded_runner_call<&WseHostRunner::allocate_tensor>(runner_ctx, nullptr, size);
 }
 
 static void device_free(void *runner_ctx, void *dev_ptr) {
@@ -169,29 +168,21 @@ static void device_free(void *runner_ctx, void *dev_ptr) {
 
 static int copy_to_device(void *runner_ctx, void *dev_ptr, const void *host_ptr, size_t size) {
     if (runner_ctx == nullptr || dev_ptr == nullptr || host_ptr == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-    try {
-        return static_cast<WseHostRunner *>(runner_ctx)->copy_to_device(dev_ptr, host_ptr, size);
-    } catch (...) {
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
+    return guarded_runner_call<&WseHostRunner::copy_to_device>(
+        runner_ctx, PTO_RUNTIME_ERR_INTERNAL, dev_ptr, host_ptr, size
+    );
 }
 
 static int copy_from_device(void *runner_ctx, void *host_ptr, const void *dev_ptr, size_t size) {
     if (runner_ctx == nullptr || host_ptr == nullptr || dev_ptr == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-    try {
-        return static_cast<WseHostRunner *>(runner_ctx)->copy_from_device(host_ptr, dev_ptr, size);
-    } catch (...) {
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
+    return guarded_runner_call<&WseHostRunner::copy_from_device>(
+        runner_ctx, PTO_RUNTIME_ERR_INTERNAL, host_ptr, dev_ptr, size
+    );
 }
 
 static void *register_device_memory_to_host(void *runner_ctx, void *dev_ptr, size_t bytes) {
     if (runner_ctx == nullptr) return nullptr;
-    try {
-        return static_cast<WseHostRunner *>(runner_ctx)->register_device_memory_to_host(dev_ptr, bytes);
-    } catch (...) {
-        return nullptr;
-    }
+    return guarded_runner_call<&WseHostRunner::register_device_memory_to_host>(runner_ctx, nullptr, dev_ptr, bytes);
 }
 
 static void unregister_device_memory_from_host(void *runner_ctx, void *dev_ptr) {
@@ -203,20 +194,14 @@ static void unregister_device_memory_from_host(void *runner_ctx, void *dev_ptr) 
 
 static void *acquire_child_memory_host_view(void *runner_ctx, void *dev_ptr, size_t bytes) {
     if (runner_ctx == nullptr) return nullptr;
-    try {
-        return static_cast<WseHostRunner *>(runner_ctx)->acquire_child_memory_host_view(dev_ptr, bytes);
-    } catch (...) {
-        return nullptr;
-    }
+    return guarded_runner_call<&WseHostRunner::acquire_child_memory_host_view>(runner_ctx, nullptr, dev_ptr, bytes);
 }
 
 static int device_memset(void *runner_ctx, void *dev_ptr, int value, size_t size) {
     if (runner_ctx == nullptr || dev_ptr == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-    try {
-        return static_cast<WseHostRunner *>(runner_ctx)->device_memset(dev_ptr, value, size);
-    } catch (...) {
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
+    return guarded_runner_call<&WseHostRunner::device_memset>(
+        runner_ctx, PTO_RUNTIME_ERR_INTERNAL, dev_ptr, value, size
+    );
 }
 
 static void get_retained_temp_buffer(void *runner_ctx, uint32_t pipeline_slot, void **addr, size_t *size) {
@@ -270,12 +255,9 @@ static int acquire_scheduler_state_storage(
     void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
 ) {
     if (runner_ctx == nullptr) return -1;
-    try {
-        return static_cast<WseHostRunner *>(runner_ctx)
-            ->acquire_scheduler_state_storage(pipeline_slot, bytes, alignment, device_out, host_out);
-    } catch (...) {
-        return -1;
-    }
+    return guarded_runner_call<&WseHostRunner::acquire_scheduler_state_storage>(
+        runner_ctx, -1, pipeline_slot, bytes, alignment, device_out, host_out
+    );
 }
 
 static void record_scheduler_runtime_mode(void *runner_ctx, uint32_t pipeline_slot, uint32_t mode) {
@@ -289,24 +271,18 @@ static void record_scheduler_runtime_mode(void *runner_ctx, uint32_t pipeline_sl
 static int
 acquire_graph_staging(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **staging_out) {
     if (runner_ctx == nullptr) return -1;
-    try {
-        return static_cast<WseHostRunner *>(runner_ctx)
-            ->acquire_graph_staging(pipeline_slot, bytes, alignment, staging_out);
-    } catch (...) {
-        return -1;
-    }
+    return guarded_runner_call<&WseHostRunner::acquire_graph_staging>(
+        runner_ctx, -1, pipeline_slot, bytes, alignment, staging_out
+    );
 }
 
 static int publish_graph_section(
     void *runner_ctx, uint32_t pipeline_slot, const void *bytes, size_t length, uint32_t *source_out, uint64_t *base_out
 ) {
     if (runner_ctx == nullptr) return -1;
-    try {
-        return static_cast<WseHostRunner *>(runner_ctx)
-            ->publish_graph_section(pipeline_slot, bytes, length, source_out, base_out);
-    } catch (...) {
-        return -1;
-    }
+    return guarded_runner_call<&WseHostRunner::publish_graph_section>(
+        runner_ctx, -1, pipeline_slot, bytes, length, source_out, base_out
+    );
 }
 
 static void get_graph_definition_staging(void *runner_ctx, uint32_t pipeline_slot, void **addr, size_t *size) {
@@ -331,33 +307,25 @@ static int
 acquire_sm_mirror(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out) {
     if (addr_out != nullptr) *addr_out = nullptr;
     if (runner_ctx == nullptr) return -1;
-    try {
-        return static_cast<WseHostRunner *>(runner_ctx)->acquire_sm_mirror(pipeline_slot, bytes, alignment, addr_out);
-    } catch (...) {
-        return -1;
-    }
+    return guarded_runner_call<&WseHostRunner::acquire_sm_mirror>(
+        runner_ctx, -1, pipeline_slot, bytes, alignment, addr_out
+    );
 }
 
 static int
 acquire_run_image_staging(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out) {
     if (addr_out != nullptr) *addr_out = nullptr;
     if (runner_ctx == nullptr) return -1;
-    try {
-        return static_cast<WseHostRunner *>(runner_ctx)
-            ->acquire_run_image_staging(pipeline_slot, bytes, alignment, addr_out);
-    } catch (...) {
-        return -1;
-    }
+    return guarded_runner_call<&WseHostRunner::acquire_run_image_staging>(
+        runner_ctx, -1, pipeline_slot, bytes, alignment, addr_out
+    );
 }
 
 static uint64_t upload_chip_callable_buffer_wrapper(void *runner_ctx, const void *callable) {
     if (runner_ctx == nullptr) return 0;
-    try {
-        return static_cast<WseHostRunner *>(runner_ctx)
-            ->upload_chip_callable_buffer(static_cast<const ChipCallable *>(callable));
-    } catch (...) {
-        return 0;
-    }
+    return guarded_runner_call<&WseHostRunner::upload_chip_callable_buffer>(
+        runner_ctx, 0, static_cast<const ChipCallable *>(callable)
+    );
 }
 
 static const void *
@@ -406,77 +374,41 @@ static int setup_static_arena_wrapper(
     void *runner_ctx, uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
 ) {
     if (runner_ctx == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-    try {
-        return static_cast<WseHostRunner *>(runner_ctx)
-            ->setup_static_arena(arena_bank, gm_heap_size, gm_sm_size, runtime_arena_size);
-    } catch (...) {
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
+    return guarded_runner_call<&WseHostRunner::setup_static_arena>(
+        runner_ctx, PTO_RUNTIME_ERR_INTERNAL, arena_bank, gm_heap_size, gm_sm_size, runtime_arena_size
+    );
 }
 
 static void *acquire_pooled_gm_heap_wrapper(void *runner_ctx, uint32_t arena_bank) {
     if (runner_ctx == nullptr) return nullptr;
-    try {
-        return static_cast<WseHostRunner *>(runner_ctx)->acquire_pooled_gm_heap(arena_bank);
-    } catch (...) {
-        return nullptr;
-    }
+    return guarded_runner_call<&WseHostRunner::acquire_pooled_gm_heap>(runner_ctx, nullptr, arena_bank);
 }
 
 static void *acquire_pooled_gm_sm_wrapper(void *runner_ctx, uint32_t arena_bank) {
     if (runner_ctx == nullptr) return nullptr;
-    try {
-        return static_cast<WseHostRunner *>(runner_ctx)->acquire_pooled_gm_sm(arena_bank);
-    } catch (...) {
-        return nullptr;
-    }
+    return guarded_runner_call<&WseHostRunner::acquire_pooled_gm_sm>(runner_ctx, nullptr, arena_bank);
 }
 
 static void *acquire_pooled_runtime_arena_wrapper(void *runner_ctx, uint32_t arena_bank) {
     if (runner_ctx == nullptr) return nullptr;
-    try {
-        return static_cast<WseHostRunner *>(runner_ctx)->acquire_pooled_runtime_arena(arena_bank);
-    } catch (...) {
-        return nullptr;
-    }
+    return guarded_runner_call<&WseHostRunner::acquire_pooled_runtime_arena>(runner_ctx, nullptr, arena_bank);
 }
 
+// HBG materializes each run; the TMR prebuilt-image cache is not used by WSE.
 static bool lookup_prebuilt_runtime_arena_cache_wrapper(
-    void *runner_ctx, uint32_t arena_bank, uint64_t hash, const void *key_data, size_t key_size, void **gm_heap_base,
-    void **sm_base, void **runtime_arena_base, size_t *runtime_off, const void **image_data, size_t *image_size
+    void *, uint32_t, uint64_t, const void *, size_t, void **, void **, void **, size_t *, const void **, size_t *
 ) {
-    if (runner_ctx == nullptr) return false;
-    try {
-        return static_cast<WseHostRunner *>(runner_ctx)
-            ->lookup_prebuilt_runtime_arena_cache(
-                arena_bank, hash, key_data, key_size, gm_heap_base, sm_base, runtime_arena_base, runtime_off,
-                image_data, image_size
-            );
-    } catch (...) {
-        return false;
-    }
+    return false;
 }
 
 static void mark_prebuilt_runtime_arena_cached_wrapper(
-    void *runner_ctx, uint32_t arena_bank, uint64_t hash, const void *key_data, size_t key_size, void *gm_heap_base,
-    void *sm_base, void *runtime_arena_base, size_t runtime_off, const void *image_data, size_t image_size
-) {
-    if (runner_ctx == nullptr) return;
-    try {
-        static_cast<WseHostRunner *>(runner_ctx)
-            ->mark_prebuilt_runtime_arena_cached(
-                arena_bank, hash, key_data, key_size, gm_heap_base, sm_base, runtime_arena_base, runtime_off,
-                image_data, image_size
-            );
-    } catch (...) {}
-}
+    void *, uint32_t, uint64_t, const void *, size_t, void *, void *, void *, size_t, const void *, size_t
+) {}
 
 // One immutable function table is shared by all runners. Each HostApi value
 // binds it to a specific runner and immutable per-run slot/bank selection.
 
-// Weak no-op default lives in device_runner_base.cpp; tensormap_and_ringbuffer
-// links a strong override that builds + caches the prebuilt runtime-arena.
-// simpler_init calls it directly for the fork-constant ring sizing.
+// WSE HBG sizes arenas during bind, so prewarm is a no-op.
 extern "C" int prewarm_config_impl(
     const HostApi *api, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
 );
@@ -591,11 +523,7 @@ size_t get_runtime_alignment(void) { return alignof(SimNativeRunContext); }
 
 void *device_malloc_ctx(DeviceContextHandle ctx, size_t size) {
     if (ctx == NULL) return NULL;
-    try {
-        return static_cast<WseHostRunner *>(ctx)->allocate_caller_buffer(size);
-    } catch (...) {
-        return NULL;
-    }
+    return guarded_runner_call<&WseHostRunner::allocate_caller_buffer>(ctx, nullptr, size);
 }
 
 void device_free_ctx(DeviceContextHandle ctx, void *dev_ptr) {
@@ -613,11 +541,7 @@ void device_free_ctx(DeviceContextHandle ctx, void *dev_ptr) {
 int device_free_caller_buffer_ctx(DeviceContextHandle ctx, void *dev_ptr) {
     if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
     if (dev_ptr == NULL) return 0;
-    try {
-        return static_cast<WseHostRunner *>(ctx)->free_caller_buffer(dev_ptr);
-    } catch (...) {
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
+    return guarded_runner_call<&WseHostRunner::free_caller_buffer>(ctx, PTO_RUNTIME_ERR_INTERNAL, dev_ptr);
 }
 
 int device_borrow_caller_buffers_ctx(
@@ -646,21 +570,11 @@ void device_release_caller_buffers_ctx(DeviceContextHandle ctx, uint64_t borrow_
 }
 
 int copy_to_device_ctx(DeviceContextHandle ctx, void *dev_ptr, const void *host_ptr, size_t size) {
-    if (ctx == NULL || dev_ptr == NULL || host_ptr == NULL) return PTO_RUNTIME_ERR_INTERNAL;
-    try {
-        return static_cast<WseHostRunner *>(ctx)->copy_to_device(dev_ptr, host_ptr, size);
-    } catch (...) {
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
+    return copy_to_device(ctx, dev_ptr, host_ptr, size);
 }
 
 int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *dev_ptr, size_t size) {
-    if (ctx == NULL || host_ptr == NULL || dev_ptr == NULL) return PTO_RUNTIME_ERR_INTERNAL;
-    try {
-        return static_cast<WseHostRunner *>(ctx)->copy_from_device(host_ptr, dev_ptr, size);
-    } catch (...) {
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
+    return copy_from_device(ctx, host_ptr, dev_ptr, size);
 }
 
 int finalize_device(DeviceContextHandle ctx) {
@@ -822,32 +736,15 @@ register_callable_locked(DeviceContextHandle ctx, int32_t callable_id, const voi
             }
         });
 
-        bool needs_aicpu_register = false;
-        if (artifacts.host_dlopen_handle != nullptr) {
-            rc = runner->record_host_orch_callable(
-                callable_id, artifacts.chip_buffer_hash, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr,
-                std::move(artifacts.signature)
-            );
-            if (rc == 0) {
-                host_dlopen_guard.dismiss();
-                chip_buffer_guard.dismiss();
-            }
-        } else {
-            rc = runner->record_device_orch_callable(
-                callable_id, artifacts.chip_buffer_hash, artifacts.chip_buffer_dev, artifacts.orch_so_data,
-                artifacts.orch_so_size, artifacts.func_name.c_str(), artifacts.config_name.c_str(),
-                std::move(artifacts.signature)
-            );
-            if (rc == 0) {
-                chip_buffer_guard.dismiss();
-                needs_aicpu_register = true;
-            }
-        }
-        if (rc == 0 && needs_aicpu_register) {
-            rc = runner->launch_device_register(callable_id);
-            if (rc != 0) {
-                runner->unregister_callable(callable_id);
-            }
+        // WSE's host_build_graph registration always owns a Host orchestration DSO.
+        if (artifacts.host_dlopen_handle == nullptr) return PTO_RUNTIME_ERR_UNSUPPORTED;
+        rc = runner->record_host_orch_callable(
+            callable_id, artifacts.chip_buffer_hash, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr,
+            std::move(artifacts.signature)
+        );
+        if (rc == 0) {
+            host_dlopen_guard.dismiss();
+            chip_buffer_guard.dismiss();
         }
         return rc;
     } catch (...) {
@@ -1567,11 +1464,7 @@ uint64_t get_arena_bank_gm_heap_base_ctx(DeviceContextHandle ctx, uint32_t bank_
 
 uint64_t get_retained_temp_addr_ctx(DeviceContextHandle ctx, uint32_t slot_id) {
     if (ctx == NULL) return 0;
-    try {
-        return static_cast<WseHostRunner *>(ctx)->retained_temp_addr(slot_id);
-    } catch (...) {
-        return 0;
-    }
+    return guarded_runner_call<&WseHostRunner::retained_temp_addr>(ctx, 0, slot_id);
 }
 
 int simpler_unregister_callable(DeviceContextHandle ctx, int32_t callable_id) {
@@ -1593,38 +1486,22 @@ int simpler_unregister_callable(DeviceContextHandle ctx, int32_t callable_id) {
 
 size_t get_host_dlopen_count(DeviceContextHandle ctx) {
     if (ctx == NULL) return 0;
-    try {
-        return static_cast<WseHostRunner *>(ctx)->host_dlopen_count();
-    } catch (...) {
-        return 0;
-    }
+    return guarded_runner_call<&WseHostRunner::host_dlopen_count>(ctx, 0);
 }
 
 uint32_t get_last_scheduler_runtime_mode(DeviceContextHandle ctx) {
     if (ctx == NULL) return 0;
-    try {
-        return static_cast<WseHostRunner *>(ctx)->last_scheduler_runtime_mode();
-    } catch (...) {
-        return 0;
-    }
+    return guarded_runner_call<&WseHostRunner::last_scheduler_runtime_mode>(ctx, 0);
 }
 
 size_t get_scheduler_mode_publish_count(DeviceContextHandle ctx) {
     if (ctx == NULL) return 0;
-    try {
-        return static_cast<WseHostRunner *>(ctx)->scheduler_mode_publish_count();
-    } catch (...) {
-        return 0;
-    }
+    return guarded_runner_call<&WseHostRunner::scheduler_mode_publish_count>(ctx, 0);
 }
 
 size_t get_aicpu_dlopen_count(DeviceContextHandle ctx) {
     if (ctx == NULL) return 0;
-    try {
-        return static_cast<WseHostRunner *>(ctx)->aicpu_dlopen_count();
-    } catch (...) {
-        return 0;
-    }
+    return guarded_runner_call<&WseHostRunner::aicpu_dlopen_count>(ctx, 0);
 }
 
 size_t get_run_stream_set_create_count(DeviceContextHandle ctx) {
@@ -1635,11 +1512,7 @@ size_t get_run_stream_set_create_count(DeviceContextHandle ctx) {
 
 size_t committed_device_memory_ctx(DeviceContextHandle ctx) {
     if (ctx == NULL) return 0;
-    try {
-        return static_cast<WseHostRunner *>(ctx)->committed_device_memory();
-    } catch (...) {
-        return 0;
-    }
+    return guarded_runner_call<&WseHostRunner::committed_device_memory>(ctx, 0);
 }
 
 int simpler_set_retain_runs_ctx(DeviceContextHandle ctx, int32_t enabled) {

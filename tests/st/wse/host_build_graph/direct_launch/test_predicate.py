@@ -16,70 +16,29 @@ from pathlib import Path
 import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, DataType, TaskArgs, TensorArgType
+from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
-from simpler_setup.kernel_compiler import KernelCompiler
 from tests.st.wse.host_build_graph.fixed_sram_layout import copy_from, copy_to, layout_view, release_view
+from tests.st.wse.host_build_graph.scene_helpers import build_callable
 
 pytestmark = [pytest.mark.platforms(["wsesim"]), pytest.mark.runtime("host_build_graph"), pytest.mark.device_count(1)]
-CALLABLE = {
-    "orchestration": {
-        "source": "kernels/predicate/orchestration/predicated_dispatch_orch.cpp",
-        "function_name": "aicpu_orchestration_entry",
-        "signature": [D.INOUT, D.INOUT, D.INOUT],
-    },
-    "incores": [
-        {
-            "func_id": 0,
-            "name": "WRITE_CONST",
-            "source": "kernels/predicate/aic/kernel_write_const.cpp",
-            "core_type": "",
-            "signature": [D.INOUT],
-        },
-        {
-            "func_id": 1,
-            "name": "COPY_FIRST",
-            "source": "kernels/predicate/aic/kernel_copy_first.cpp",
-            "core_type": "",
-            "signature": [D.IN, D.INOUT],
-        },
-        {
-            "func_id": 2,
-            "name": "CLOBBER",
-            "source": "kernels/predicate/aic/kernel_clobber.cpp",
-            "core_type": "",
-            "signature": [D.INOUT],
-        },
-        {
-            "func_id": 3,
-            "name": "WRITE_GATE",
-            "source": "kernels/predicate/aic/kernel_write_gate.cpp",
-            "core_type": "",
-            "signature": [D.INOUT],
-        },
-    ],
-}
 
 
 @lru_cache
 def build_predicate(platform):
-    compiler = KernelCompiler(platform)
-    here = Path(__file__).parent
-    children = []
-    for spec in CALLABLE["incores"]:
-        code = compiler.compile_incore(
-            str(here / spec["source"]),
-            core_type=spec["core_type"],
-            extra_include_dirs=compiler.get_orchestration_include_dirs("host_build_graph"),
-        )
-        children.append((spec["func_id"], CoreCallable.build(signature=spec["signature"], binary=code)))
-    orch = CALLABLE["orchestration"]
-    return ChipCallable.build(
-        signature=orch["signature"],
-        func_name=orch["function_name"],
-        binary=compiler.compile_orchestration("host_build_graph", str(here / orch["source"])),
-        children=children,
+    here = Path(__file__).resolve().parents[3] / "a5/host_build_graph/predicated_dispatch"
+    return build_callable(
+        platform,
+        here,
+        "kernels/orchestration/predicated_dispatch_orch.cpp",
+        [D.INOUT] * 3,
+        [
+            ("kernels/aic/kernel_write_const.cpp", [D.INOUT]),
+            ("kernels/aic/kernel_copy_first.cpp", [D.IN, D.INOUT]),
+            ("kernels/aic/kernel_clobber.cpp", [D.INOUT]),
+            ("kernels/aic/kernel_write_gate.cpp", [D.INOUT]),
+        ],
     )
 
 

@@ -194,12 +194,8 @@ bool graph_require_boundary_match(
     return true;
 }
 
-// Every Graph key this bind has claimed, published and in-flight alike, as one log field.
-//
-// Sorted, because what the reader is looking for is a run of keys that differ only in their
-// low bits: a Config whose fields are genuinely fixed for the run folds into one key per
-// Graph, so near-identical keys mean a field that varies per submission is being carried as
-// a construction parameter. Unsorted, that pattern is invisible in a hash table's order.
+// Sort claimed Graph keys, including in-flight entries, so varying construction
+// parameters remain visible in diagnostic output.
 std::string graph_claimed_keys(const GraphHostState &state) {
     std::vector<std::pair<uint64_t, const char *>> claimed;
     claimed.reserve(state.definitions.size() + state.inflight.size());
@@ -260,13 +256,8 @@ bool graph_submit_outer(
         return false;
     }
 
-    // The argument pools hold MAX_TENSOR_ARGS ChipTensors and MAX_SCALAR_ARGS scalars
-    // per task slot, a budget no CoreTaskArgs task can exceed. A Graph boundary is
-    // GraphTaskArgs-wide, so a wide one draws more than the single slot it occupies is
-    // worth — GraphBoundaryPool.WidestBoundaryExceedsOneSlotBudget pins how much. The
-    // cursors bump through a fixed mirror whose last segment is the scalar pool, so an
-    // overdraw writes past that mirror rather than merely exhausting a quota. The test
-    // precedes the slot claim, so an overdraw is reported before anything is written.
+    // A Graph boundary can exceed one CoreTaskArgs slot's tensor/scalar budget.
+    // Check both fixed mirror pools before claiming a slot or writing any arguments.
     const uint64_t max_tasks = static_cast<uint64_t>(orch->task_allocator.capacity());
     const uint64_t tensor_pool_capacity = max_tasks * MAX_TENSOR_ARGS;
     const uint64_t scalar_pool_capacity = max_tasks * MAX_SCALAR_ARGS;
@@ -329,12 +320,8 @@ bool graph_submit_outer(
     slot.active_mask = LaneMask{};
     slot.task_attrs = TaskAttrs{};
     slot.total_required_subtasks = 0;
-    // A shell places no block, but this must stay positive: an early-released
-    // shell sits in EARLY_DISPATCH_STAGING, so its readiness runs through
-    // try_early_dispatch_release, which returns next_block_idx >= this. At zero
-    // that is true for a shell's never-advanced cursor, push_ready_routed
-    // returns before its TaskKind::GRAPH branch, and the Graph silently never
-    // activates — visible only as SIMPLER_ERROR_SCHEDULER_TIMEOUT.
+    // Graph shells require positive logical_block_num even without placement; zero
+    // would make early-dispatch readiness bypass Graph activation.
     slot.logical_block_num = 1;
     slot.task_kind = TaskKind::GRAPH;
     orch->ready_queue_populations.add_task(slot.active_mask, slot.task_attrs, slot.task_kind);
@@ -363,12 +350,8 @@ bool graph_submit_outer(
     auto emit = [&](TaskId producer_id) -> bool {
         return append_fanin_or_fail(*orch, producer_id, fanin_slots, payload.fanin_count);
     };
-    // An outer GRAPH task is an ordinary task, so the dependency graph
-    // has to carry it: without this the whole Graph — and every edge into it —
-    // is absent from deps.json, leaving a run of 40 replays described by only its
-    // handful of non-Graph tasks. It dispatches no kernel of its own and the
-    // sub-DAG it replays owns no task slots, so what is captured is its boundary:
-    // the args it consumes and the edges those produce.
+    // Capture the outer Graph boundary and its incoming dependencies in deps.json;
+    // replayed child nodes do not own ordinary task slots.
     const bool capture_dep_graph = dep_gen_host_graph_enabled();
     if (capture_dep_graph) {
         const std::array<int32_t, SUBTASK_SLOT_COUNT> kernel_ids_capture{
@@ -404,16 +387,8 @@ bool graph_submit_outer(
     debug_assert(orch->fanin_pool_cursor == static_cast<int32_t>(payload.fanin_data() - orch->fanin_pool));
     orch->fanin_pool_cursor += CHIP_ALIGN_UP(payload.fanin_count, ARG_POOL_ALIGN / (int32_t)sizeof(int32_t));
 
-    // Early-dispatch qualification for the shell. Its fanin is an ordinary
-    // inline row of GLOBAL producers, so the rule is the top-level one, minus
-    // the terms that describe dispatching a task to cores: a shell has no
-    // predicate, no resource shape, and never occupies a core itself. What its
-    // release does instead is admit the body's roots, which is why a shell
-    // qualifies on producers alone.
-    //
-    // A GRAPH producer still disqualifies, as it does at top level: a shell
-    // publishes no placement of its own, so there is nothing for a consumer to
-    // bet on. That is the graph-as-producer direction, deliberately left out.
+    // A shell qualifies on GLOBAL producers alone; it has no placement or predicate.
+    // A Graph producer disqualifies consumers because it publishes no placement to inherit.
     int32_t *const shell_fanin = payload.fanin_data();
     bool shell_candidate = payload.fanin_count > 0;
     for (int32_t i = 0; shell_candidate && i < payload.fanin_count; i++) {
@@ -650,18 +625,8 @@ TaskOutputTensors wse_graph_record_submit_with_dependencies(
             recording.unsupported = true;
         }
     }
-    // A dispatch predicate resolves to an absolute GM address at submit, which a
-    // Definition replayed against fresh buffers cannot carry. Record the operand
-    // the same way a tensor arg is recorded — classified source plus the element
-    // index within that tensor — and let materialize resolve the pair. The
-    // predicate creates no dependency here any more than it does on the ordinary
-    // path: the caller declares one, and the explicit-dep loop below records it.
-    //
-    // Gated on the recorded attribute, not on args: a kernel-less task never
-    // dispatches, so submit_dummy_task and alloc_tensors drop the predicate the
-    // caller set. Reading args here instead would record a predicate the task's
-    // own attribute denies, and materialize rejects a Definition whose two halves
-    // disagree.
+    // Record predicate operands as tensor source plus element index for rebinding.
+    // Dependencies remain explicit. Use recorded attributes: kernel-less tasks drop predicates.
     if (task.task_attrs.has_predicate()) {
         const CoreTaskPredicate &pred = args.predicate();
         GraphRecordedPredicate recorded;
@@ -710,17 +675,9 @@ TaskOutputTensors wse_graph_record_submit_with_dependencies(
         if (producer >= 0 && producer < task_index) add_fanin(producer);
     }
 
-    // Inferred hazards, on the same terms as the ordinary path. The loop above only
-    // names the sub-task that ALLOCATED each buffer; every write-then-read through a
-    // buffer someone else allocated — an alloc_tensors output written in place
-    // with add_inout, or a view of a boundary tensor — needs the last-writer
-    // lookup compute_task_fanin performs. Running the very same function against
-    // the recording's own map is what keeps a Definition's edge set equal to the
-    // one the body gets when the ordinary path submits its tasks one at a time.
-    //
-    // Producers outside the recording window are dropped: they are reached
-    // through boundary tensors, and the outer Graph shell already carries those
-    // args, so the shell's own fanin orders the whole body behind them.
+    // Use the ordinary hazard algorithm on the recording's TensorMap, including writes
+    // to boundary views and buffers allocated by other tasks. External producers are ordered
+    // by the outer shell's boundary fanin, not by edges inside the Definition.
     {
         DepInputs dep_inputs{
             tensor_count,
@@ -747,14 +704,8 @@ TaskOutputTensors wse_graph_record_submit_with_dependencies(
             recording.unsupported = true;
         } else {
             auto emit_inferred = [&add_fanin, task_index](TaskId producer) -> bool {
-                // Only a task of this body can be an edge in the Definition. A GLOBAL
-                // producer is a task submitted before the Graph, and a PARAM "producer" is
-                // a boundary parameter, which names no task at all -- the outer shell was
-                // submitted through the ordinary path against this same boundary, so its
-                // own fanin already orders the whole body behind whatever produced it, and
-                // the Definition carries no edge of its own. Reading either one's low bits
-                // as a task index would invent an edge onto whichever task happens to sit
-                // there.
+                // Only local SUB_TASK producers form Definition edges. GLOBAL and PARAM producers
+                // are ordered through the outer shell; their low bits are not local task indices.
                 if (producer.space() != TaskId::Space::SUB_TASK) return true;
                 const int32_t producer_index = producer.local_id();
                 if (producer_index < task_index) {
@@ -948,12 +899,8 @@ GraphScopeResult OrchestratorState::graph_begin_inner(uint64_t graph_key, const 
 #if SIMPLER_DFX
     entry->submit_idx = g_orch_submit_idx;
 #endif
-    // The boundary is built once, here, and only read afterwards -- by the recorder that
-    // picks this entry up, and by later same-key submissions comparing against it.
-    //
-    // Tensors are filled before any TensorRef is made to point at them: `tensors` is a
-    // fixed-size array precisely so those pointers cannot move, but a slot must still hold
-    // its value before args names it.
+    // Initialize stable tensor storage before creating TensorRefs. The published boundary
+    // is read-only for recorders and later same-key submissions.
     GraphBoundary &boundary = entry->boundary;
     for (int32_t i = 0; i < args.tensor_count(); ++i) {
         boundary.tensors[i] = args.tensor(i).ref();
@@ -990,13 +937,8 @@ GraphScopeResult OrchestratorState::graph_begin_inner(uint64_t graph_key, const 
     if (args.task_timing_slot() != TASK_TIMING_SLOT_NONE) {
         boundary.params.set_task_timing_slot(args.task_timing_slot());
     }
-    // Before anything reads these tensors: the parameters move into the recording's own
-    // address space here, so every reader downstream -- the body, the recorder, a later
-    // same-key submission -- sees one consistent set of addresses. `params` already names
-    // them, and by reference, so it carries the move across.
-    //
-    // The entry is dropped before it is published, so a boundary this runtime cannot
-    // represent leaves no partial recording behind.
+    // Move all boundary tensors into recording address space before any reader sees them.
+    // Unrepresentable boundaries are dropped before publication.
     if (!graph_boundary_relocate_params(boundary)) {
         orch->report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "%s",
@@ -1033,24 +975,15 @@ GraphScopeResult OrchestratorState::graph_begin_inner(uint64_t graph_key, const 
     return result;
 }
 
-// The parameter list is the entry's own -- graph_begin published it as
-// GraphScopeResult::params, and both the queued job and the synchronous fallback forward
-// that same object here, which is why it arrives unnamed: there is no second boundary for
-// it to agree with. A later same-key submission does arrive with the caller's own args,
-// and graph_begin_inner compares those against this entry before publishing a shell
-// against it.
+// Queued and synchronous recording use the exact boundary published by graph_begin.
+// Later same-key submissions validate their own arguments against that boundary.
 bool OrchestratorState::graph_prepare(void *recording_handle, const GraphTaskArgs &) {
     GraphHostState *state = graph_state_from(this);
     if (state == nullptr || recording_handle == nullptr || active_graph().recording != nullptr) return false;
     auto *entry = static_cast<GraphInflightRecording *>(recording_handle);
-    // graph_begin published this entry before the private job was enqueued, and
-    // the entry's address is stable for as long as the recording lives, so the
-    // recording thread reaches its own state without searching for it. Until this
-    // thread calls graph_end/graph_abort, later graph_begin calls only read the
-    // boundary under recording_mutex, and only this thread writes the
-    // fields it binds below. Taking that mutex here lets the main thread's
-    // same-key submit burst starve prepare and collapse the intended overlap, so
-    // the status read goes through the atomic instead.
+    // The entry is published before enqueue and stays stable through recording.
+    // Only the recording thread mutates its fields; later submissions read the boundary.
+    // Read status atomically without taking recording_mutex and starving background preparation.
     if (entry->status() != GraphRecordingStatus::RECORDING) {
         return false;
     }
@@ -1110,12 +1043,8 @@ void OrchestratorState::graph_abort(void *recording_handle) {
     state->recording_cv.notify_all();
 }
 
-// Finish the background recording and publish the Definition. The main
-// thread finalizes the already-submitted outer Graph tasks in graph_commit.
-//
-// Retires the entry it bound on every path below that has one, so a caller never has
-// to pair a `false` return with an abort. graph_commit may free a retired entry,
-// so the caller must stop using the handle once graph_end has returned.
+// graph_end retires its entry on success and failure. graph_commit publishes outer
+// Graph tasks and may free retired entries; callers must not reuse a finished handle.
 bool OrchestratorState::graph_end() {
     GraphHostState *state = graph_state_from(this);
     GraphRecording *recording = active_graph_recording(this);

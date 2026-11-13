@@ -15,12 +15,12 @@ from pathlib import Path
 import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import ChipCallable, CoreCallable, DataType, TaskArgs, TensorArgType
+from simpler.task_interface import DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
-from simpler_setup.kernel_compiler import KernelCompiler
 from tests.st.wse.host_build_graph.counter.test_counter import config_for
 from tests.st.wse.host_build_graph.fixed_sram_layout import copy_from, copy_to, layout_view, release_view
+from tests.st.wse.host_build_graph.scene_helpers import build_callable
 from tests.st.wse.host_build_graph.tile_operations.test_execution import _GATE, load_gate
 
 pytestmark = [pytest.mark.platforms(["wsesim"]), pytest.mark.runtime("host_build_graph"), pytest.mark.device_count(1)]
@@ -28,22 +28,13 @@ pytestmark = [pytest.mark.platforms(["wsesim"]), pytest.mark.runtime("host_build
 
 @lru_cache
 def build(platform, scope=False):
-    compiler = KernelCompiler(platform)
-    here = Path(__file__).parent / "kernels"
     stem = "block_scope" if scope else "block_contract"
-    child = CoreCallable.build(
-        signature=[D.INOUT] + ([] if scope else [D.IN] * 2),
-        binary=compiler.compile_incore(
-            str(here / f"{stem}.cpp"),
-            core_type="",
-            extra_include_dirs=compiler.get_orchestration_include_dirs("host_build_graph"),
-        ),
-    )
-    return ChipCallable.build(
-        signature=[D.INOUT] + ([] if scope else [D.IN] * 3),
-        func_name="aicpu_orchestration_entry",
-        binary=compiler.compile_orchestration("host_build_graph", str(here / f"{stem}_orch.cpp")),
-        children=[(0, child)],
+    return build_callable(
+        platform,
+        Path(__file__).parent / "kernels",
+        f"{stem}_orch.cpp",
+        [D.INOUT] + ([] if scope else [D.IN] * 3),
+        [(f"{stem}.cpp", [D.INOUT] + ([] if scope else [D.IN] * 2))],
     )
 
 

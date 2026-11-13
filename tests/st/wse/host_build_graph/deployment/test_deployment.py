@@ -15,34 +15,25 @@ from pathlib import Path
 import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import ChipCallable, CoreCallable, DataType, TaskArgs, TensorArgType
+from simpler.task_interface import DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
-from simpler_setup.kernel_compiler import KernelCompiler
 from tests.st.wse.host_build_graph.counter import test_counter as counter
 from tests.st.wse.host_build_graph.counter.test_counter import config_for
 from tests.st.wse.host_build_graph.fixed_sram_layout import copy_from, copy_to, layout_view, release_view
+from tests.st.wse.host_build_graph.scene_helpers import build_callable
 
 pytestmark = [pytest.mark.platforms(["wsesim"]), pytest.mark.runtime("host_build_graph"), pytest.mark.device_count(1)]
 
 
 @lru_cache
 def build_probe(platform, orchestration="probe_orch.cpp"):
-    compiler = KernelCompiler(platform)
-    here = Path(__file__).parent / "kernels"
-    child = CoreCallable.build(
-        signature=[D.INOUT] * 3 + [D.IN] * 2,
-        binary=compiler.compile_incore(
-            str(here / "probe.cpp"),
-            core_type="",
-            extra_include_dirs=compiler.get_orchestration_include_dirs("host_build_graph"),
-        ),
-    )
-    return ChipCallable.build(
-        signature=[D.INOUT] * 3 + [D.IN] * 4,
-        func_name="aicpu_orchestration_entry",
-        binary=compiler.compile_orchestration("host_build_graph", str(here / orchestration)),
-        children=[(0, child)],
+    return build_callable(
+        platform,
+        Path(__file__).parent / "kernels",
+        orchestration,
+        [D.INOUT] * 3 + [D.IN] * 4,
+        [("probe.cpp", [D.INOUT] * 3 + [D.IN] * 2)],
     )
 
 
@@ -230,22 +221,14 @@ def test_deployment_fixed_capacity_refuses_before_go(tmp_path, st_platform):
 
 @lru_cache
 def build_deployed_counter(platform):
-    compiler = KernelCompiler(platform)
     here = Path(__file__).parent / "kernels"
-    child = CoreCallable.build(
-        signature=[D.INOUT] * 3 + [D.IN] * 5,
-        binary=compiler.compile_incore(
-            str(here / "counter.cpp"),
-            core_type="",
-            extra_include_dirs=compiler.get_orchestration_include_dirs("host_build_graph")
-            + [str(here.parent.parent / "counter/kernels")],
-        ),
-    )
-    return ChipCallable.build(
-        signature=[D.INOUT] * 3 + [D.IN] * 6,
-        func_name="aicpu_orchestration_entry",
-        binary=compiler.compile_orchestration("host_build_graph", str(here / "counter_orch.cpp")),
-        children=[(0, child)],
+    return build_callable(
+        platform,
+        here,
+        "counter_orch.cpp",
+        [D.INOUT] * 3 + [D.IN] * 6,
+        [("counter.cpp", [D.INOUT] * 3 + [D.IN] * 5)],
+        extra_include_dirs=[str(here.parent.parent / "counter/kernels")],
     )
 
 

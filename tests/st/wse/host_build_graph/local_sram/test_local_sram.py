@@ -14,13 +14,13 @@ from pathlib import Path
 import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import ChipCallable, CoreCallable, DataType, TaskArgs, TensorArgType
+from simpler.task_interface import DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
-from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.scene_test import _bound_host_logs
 from tests.st.wse.host_build_graph.counter import test_counter as counter
 from tests.st.wse.host_build_graph.fixed_sram_layout import copy_from, copy_to, layout_view, release_view
+from tests.st.wse.host_build_graph.scene_helpers import build_callable
 from tests.st.wse.host_build_graph.test_fixed_sram import fixed_layout
 
 pytestmark = [pytest.mark.platforms(["wsesim"]), pytest.mark.runtime("host_build_graph"), pytest.mark.device_count(1)]
@@ -80,21 +80,13 @@ def test_sram_counter_replay_and_residency(tmp_path, st_platform):
 
 
 def build_memory_probe(platform):
-    compiler = KernelCompiler(platform)
-    here = Path(__file__).parent / "kernels"
-    child = CoreCallable.build(
-        signature=[D.INOUT] * 3 + [D.IN],
-        binary=compiler.compile_incore(
-            str(here / "probe.cpp"),
-            core_type="",
-            extra_include_dirs=compiler.get_orchestration_include_dirs("host_build_graph"),
-        ),
-    )
-    return ChipCallable.build(
-        signature=[D.INOUT] * 3 + [D.IN],
-        func_name="aicpu_orchestration_entry",
-        binary=compiler.compile_orchestration("host_build_graph", str(here / "orchestration.cpp")),
-        children=[(0, child)],
+    signature = [D.INOUT] * 3 + [D.IN]
+    return build_callable(
+        platform,
+        Path(__file__).parent / "kernels",
+        "orchestration.cpp",
+        signature,
+        [("probe.cpp", signature)],
     )
 
 
