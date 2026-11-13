@@ -43,8 +43,8 @@ kernel 怎么写**：
 percounter 发布完成就是两条原子加（`percounter_publish_completion`）：
 
 ```cpp
-scheduler_gm_fetch_add(cfg.counters[task.id].value, count);
-if (task.sink) scheduler_gm_fetch_add(cfg.counters[task.shell].value, count);
+percounter_gm_fetch_add(cfg.counters[task.id].value, count);
+if (task.sink) percounter_gm_fetch_add(cfg.counters[task.shell].value, count);
 ```
 
 消费者 `percounter_fanin_ready` 读的就是这个字。计数器本身已经是一个 N 路 join —— 每个
@@ -83,9 +83,12 @@ cohort block 尤其如此：`sync_queue->completed` 必须仍在 kernel 返回�
 
 ```cpp
 // host/region_plan.h，排在 counters 之后，与 mix / sync 的按需保留不同形
-!PERCOUNTER_RESERVE(SCHEDULER_WORKER_CAPACITY, pto2::resident::AsyncGroupData, async_groups_offset) ||
 !PERCOUNTER_RESERVE(
-    SCHEDULER_WORKER_CAPACITY * PERCOUNTER_ASYNC_CAPACITY, DeferredCompletionEntry, async_entries_offset
+    SCHEDULER_WORKER_CAPACITY * PERCOUNTER_ASYNC_SLOTS, pto2::resident::AsyncGroupData, async_groups_offset
+) ||
+!PERCOUNTER_RESERVE(
+    SCHEDULER_WORKER_CAPACITY * PERCOUNTER_ASYNC_SLOTS * PERCOUNTER_ASYNC_CAPACITY, DeferredCompletionEntry,
+    async_entries_offset
 )
 ```
 
@@ -94,20 +97,21 @@ kernel id，不知道函数体里有没有 `defer_wait`。记录正是"看出来
 都在。
 
 **排在 counters 之后**，于是整块落在 `upload_size` 之外：bind 不为它付任何 DMA，由每个
-lane 在进入自己的循环前写一次自己那条记录（`percounter_open_async_record`）。那次写必须
+lane 在进入自己的循环前写一次自己那条记录（`percounter_init_async_records`）。那次写必须
 带写回 —— 记录所在的存储是 pipeline slot 跨 run 复用的、`memset` 不覆盖的区域，而且一个
 在入口做整 cache 失效的 kernel 否则会读到上一次 bind 留下的字节。
 
 三条布局约束，由 `pto2::resident::detail::layout_valid` 强制：
 
 - entries 数组排在 groups 数组之后（`entries_offset >= group_offset + sizeof(AsyncGroupData)`）。
-- region 基址 128 对齐。`SCHEDULER_STATE_ALIGNMENT == 128 == ASYNC_RECORD_ALIGNMENT`，已成立。
-- 每条记录的 entry 跨距必须已经是 128 的倍数，否则按 `lane * 跨距` 寻址会落在非对齐处。
+- region 基址 64 对齐。`SCHEDULER_STATE_ALIGNMENT == 64 == ASYNC_RECORD_ALIGNMENT`，已成立。
+- 每条记录的 entry 跨距必须已经是 64 的倍数，否则按 `lane * 跨距` 寻址会落在非对齐处。
   `PERCOUNTER_ASYNC_CAPACITY = 4` 时 `4 × 32 B = 128 B`，一条 static_assert 顶着。
 
 容量取 4 而**不取 `MAX_COMPLETIONS_PER_TASK = 64`**：记录是按 lane 而非按 task 的，所以这
-个上限要乘 108 付一遍，无论有没有 kernel 登记。4 时每 lane 是 128 B 头部 + 128 B entries，
-全设备 27 KiB；64 时是 235 KiB，比旁边的 payload 数组还大四倍。
+个上限要乘 108 再乘 slot 数付一遍，无论有没有 kernel 登记。4 时每 lane 每 slot 是 128 B 头部加
+128 B entries，全设备记录 27 KiB、entries 27 KiB；64 时 entries 变成 432 KiB，是旁边那个
+54 KiB payload 数组的八倍。
 
 **每 lane 不止一条记录（`PERCOUNTER_ASYNC_SLOTS = 2`），否则这个特性什么也不做。** 一条
 记录从开启它的那次 dispatch 一直活到条件满足，而 lane 在这期间照常跑别的任务 —— 那个间
@@ -115,9 +119,10 @@ lane 在进入自己的循环前写一次自己那条记录（`percounter_open_a
 而运行时读回一条已结算但未释放的记录，会把一个什么都没登记的任务当成登记了而拒绝。换句
 话说，1 深不是"连续两个登记任务要排队"，是**任何下一个任务都撞车**。
 
-槽位满了的 lane 在下一次 dispatch 前等一个结算，这是槽数唯一被感觉到的地方；那个等待是
-checkpoint 自旋，不是阻塞 —— lane 在那儿照样服务 MIX 和 cohort、照样看得见 EXIT 和别人
-的错误。2 是 COUNTER 用例需要的；加大只多一条记录加它的 entries，不改协议。
+槽位满了的 lane 在下一次 dispatch 前等一个结算，这是槽数唯一被感觉到的地方。那个等待只轮询
+这个 lane 自己的条件：调用方已经提交了这次 dispatch，所以它不服务 MIX 也不服务 cohort（见
+4.3）。它看得见 EXIT 和别人的错误，并以看门狗收尾，所以是停顿不是挂死。2 是 COUNTER 用例
+需要的；加大只多一条记录加它的 entries，不改协议。
 
 ### 3.2 寻址不额外碰任何 cache line
 
@@ -125,15 +130,16 @@ checkpoint 自旋，不是阻塞 —— lane 在那儿照样服务 MIX 和 cohor
 `async_group_index` / `async_present` 都在 `GlobalContext` 里，而 `GlobalContext` 落在
 `DispatchPayload` 的第 7 条 cache line —— 也就是 `sub_block_id` 所在那条，
 `percounter_launch_kernel` 每次 dispatch 本就在写、本就在
-`scheduler_writeback_dispatch_payload` 里刷。**带 slot 维度、每次 dispatch 重写 group 地址，
+`percounter_writeback_dispatch_payload` 里刷。**带 slot 维度、每次 dispatch 重写 group 地址，
 不增加任何脏行，也不增加任何 dcci。**
 
 **这一条成立，但它不等于零成本。** 实测在一张 4096 任务、无人登记的图上，这套机制让
-device wall 从 256.5 µs 涨到 269.3 µs（+5.0%，两组分布不重叠，同构建漂移 1.7%）。其中约
+device wall 从 256.2 µs 涨到 274.0 µs（+5.6%，两组分布不重叠，同构建漂移 1.7%）。其中约
 三分之一来自 `percounter_async_seal` 读 `record->count` —— 每次 dispatch 开头的
-`scheduler_observe_data_cache` 是整缓存失效，所以那条线必然是冷的；去掉这次读只收回
-269.3 → 265.6 µs。**剩下约 9 µs 尚未归因**，aicore 目标文件增大 2.1% 是候选而非证据。
-完整数据与方法见 `KNOWN_ISSUES.md`。
+`percounter_observe_data_cache` 是整缓存失效，所以那条线必然是冷的。单独去掉这次读的对照是
+在它自己那一轮里测的，269.3 → 265.6 µs，和上面那对数不同轮，不能直接相减。**余下的部分
+尚未归因**，aicore 目标文件增大是候选而非证据。
+完整数据与方法见 `docs/investigations/2026-11-percounter-defer-wait-dispatch-overhead.md`。
 
 ### 3.3 `PercounterControl` 的新字段
 
@@ -142,7 +148,7 @@ device wall 从 256.5 µs 涨到 269.3 µs（+5.0%，两组分布不重叠，同
 | 字段 | 含义 |
 | ---- | ---- |
 | `async_run_epoch` | 非零；`AsyncWriter` 用它拒绝上一次 run 遗留的记录 |
-| `async_groups_offset` / `async_entries_offset` | 区域偏移，零表示本图无异步任务 |
+| `async_groups_offset` / `async_entries_offset` | 区域偏移，无条件保留，任何图上都非零 |
 | `async_capacity` | 每个 group 的条件上限 |
 
 两个跨核原子字**单独占一条 64 B 线**，不与 `completed_block_count` 共线，也不与只读字段
@@ -243,7 +249,7 @@ MIX 由掩码最低位的 lane 在 `percounter_mix_wait(finished)` 之后一次�
 哪几份该去掉。
 
 **`PercounterMixSignal` 恰好是满的 64 B，没有位置放一个 deferred 掩码**，所以不走"告诉
-发布者"这条路：延迟的 lane 在 `scheduler_ssbuf_store_release(&signal->finished[lane],
+发布者"这条路：延迟的 lane 在 `percounter_ssbuf_store_release(&signal->finished[lane],
 generation)` **之前**自己做一次 `fetch_add(counter, -1)`（sink 任务两个计数器都减），结算
 时再加回来。发布者照旧加 `popcount(mask)`，不需要知道任何事。
 
@@ -278,15 +284,28 @@ generation)` **之前**自己做一次 `fetch_add(counter, -1)`（sink 任务两
    与它是否延迟完成无关。
 5. 每个 block / subtask 对计数器的净贡献恰好为 1：lane 自己发布时要么在 kernel 返回处加、
    要么在结算处加；由他人代发布时（MIX）先减后加，净值不变。
-6. 持有未结算 group 的 lane 不退出。
+6. 存在未结算 group 时这次 run 不结束。这要**两处**同时成立：lane 不退出
+   （`percounter_lane_may_exit`），supervisor 也不收工（`percounter_supervise`）。
 7. 延迟完成不向 percounter 的 list-order 无环性论证增加任何边：它只延迟沿既有边的发布。
 
 ## 6. 退出、看门狗与错误
 
 `percounter_lane_may_exit` 的两处改动，**必须是两处而不是一处**：
 
-- `complete` 的合取加上 `scheduler_gm_query(cfg.control->async_outstanding) == 0`。
+- `complete` 的合取加上 `percounter_gm_read(cfg.control->async_outstanding) == 0`。
 - `*progress` 的和加上 `async_settled`。
+
+**同一个判据必须在 supervisor 上再写一遍，光守 lane 不够。** EXIT 是
+`AicpuExecutor::supervise` 返回之后才由 `signal_shutdown_partition` 拉起的，而一个 block
+无论是否延迟都照不变量 4 计入 `completed_block_count`。所以当一次 run 的终端任务登记了条件，
+`completed_block_count` 已经等于 `executable_block_count`，supervisor 若只看这一项就收工，
+EXIT 随即拉起；lane 在 `percounter_mix_drain` 里先读到 `percounter_should_stop` 就直接返回，
+永远到不了那次 `percounter_async_settle`。条件被丢下不管，host 却已经拿到成功。
+
+因此 `percounter_supervise` 用同样的两项拆分：`completed_block_count + async_settled`
+进单调的进展和，`async_outstanding == 0` 单独作为收工合取项。它读这两个字的**顺序**也是
+判据的一部分 —— 先读块计数再读 outstanding：lane 是先 seal 再计块的，所以一个已经包含该块的
+计数必然发布在 seal 之后，随后那次读不可能漏掉它开的 group。反过来读就有一个窗口。
 
 `async_outstanding` 有升有降，而 `progress` 的整个看门狗论证建立在被加数单调上。把它折进
 `progress`，一个 outstanding 震荡的设备会不断刷新看门狗，挂死最后由 STARS 的 45 秒
@@ -378,7 +397,7 @@ host 只给本步已经支持的任务形状打"可能登记"标记，其余形�
 | S2 ✅ | 把拒绝换成延迟：`percounter_async_tick`、结算、退出判据，只接 `percounter_lane_loop` 一个发布点 | 条件满足的用例通过（S1 下同一 kernel 报 error 13）；永不满足的报 error 10 TIMEOUT 而非挂到 op 超时；回归集 9 passed，两遍一致 |
 | S3 ✅ | cohort 路径：`percounter_sync_serve_block` 单 lane 分支 | 单核 `require_sync_start` 多 block 的登记用例通过，同一用例在 S2 构建上报 error 13（0 of 7 blocks resolved）；回归集 11 passed，失败仍只有那两个 swimlane 用例 |
 | S4 ✅ | MIX 路径：4.5 的先减后加，接 `percounter_serve_mix` | 两 AIV MIX 的登记用例通过，同一用例在 S3 构建上报 error 13（0 of 4 blocks resolved）；回归集 12 passed，连跑三遍一致 |
-| S5 ✅ | Graph body、溢出、非法对齐、上游用例对比、开销实测 | 见第 8 节与 `KNOWN_ISSUES.md`：溢出报 error 12、非法对齐报 error 11；上游 `defer_wait_progress` 五个 case 通过（含 `c_plus_one`）；开销在 4096 任务图上实测为 +5.0~6.7%，未全部归因 |
+| S5 ✅ | Graph body、溢出、非法对齐、上游用例对比、开销实测 | 见第 8 节与 `docs/investigations/2026-11-percounter-defer-wait-dispatch-overhead.md`：溢出报 error 12、非法对齐报 error 11；上游 `defer_wait_progress` 五个 case 通过（含 `c_plus_one`）；开销在 4096 任务图上实测为 +5.6%，未全部归因 |
 
 **S1 既是布局也是 1.1 的修复**，两者不可分：登记失败的 kernel 在设备上不留痕迹，所以只有
 先给它一个真正能写进去的 group，percounter 才看得见"这个任务登记了条件"。S1 之后登记机械

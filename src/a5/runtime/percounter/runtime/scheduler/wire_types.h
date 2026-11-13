@@ -248,10 +248,11 @@ inline constexpr uint64_t percounter_counter_preset(int64_t total_subtasks) {
  * Completion conditions one deferred-completion record holds.
  *
  * Four, not `MAX_COMPLETIONS_PER_TASK`: the record is per lane rather than per
- * task, so the cap is paid 108 times over whether or not a kernel registers
- * anything. At four, a record's entries are exactly one cache line and the
- * whole array is 27 KiB; at 64 it would be 235 KiB, four times the payload
- * array that sits beside it.
+ * task, so the cap is paid 108 lanes times `PERCOUNTER_ASYNC_SLOTS` over,
+ * whether or not a kernel registers anything. At four, a record's entries are
+ * two cache lines and the whole array is 27 KiB, beside 27 KiB of record
+ * headers; at 64 the entries would be 432 KiB, eight times the 54 KiB payload
+ * array that sits next to them.
  */
 inline constexpr uint32_t PERCOUNTER_ASYNC_CAPACITY = 4;
 

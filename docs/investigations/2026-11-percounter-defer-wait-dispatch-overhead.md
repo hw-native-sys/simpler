@@ -30,7 +30,7 @@ same branch binary is 1.7%, so the 5.6% mean gap is not drift.
 - Of the executed part, roughly a third of the *total* gap is the seal's read of
   `record->count` / `record->error_code`: a separate build that skips that read alone
   measured 265.6 us against the branch's 269.3 us in the same session. The read is a
-  cold GM load on every dispatch, because `scheduler_observe_data_cache` invalidates the
+  cold GM load on every dispatch, because `percounter_observe_data_cache` invalidates the
   whole data cache at the top of `percounter_run_task`, so the record's line is never
   resident when the seal reaches it.
 

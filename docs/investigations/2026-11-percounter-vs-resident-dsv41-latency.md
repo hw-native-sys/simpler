@@ -192,7 +192,7 @@ behind an `args_observed` latch. Giving percounter the same per-lane cache moved
 cases by -3.0% to +3.9%, one of them slower.
 
 **5. The whole-data-cache invalidate per dispatch.** Both runtimes do it — percounter in
-`scheduler_observe_data_cache`, the resident scheduler as
+`percounter_observe_data_cache`, the resident scheduler as
 `dcci(exec_payload, ENTIRE_DATA_CACHE)` — so it cannot be what separates them.
 
 **6. A resident-side utilisation threshold.** Core utilisation split the nine

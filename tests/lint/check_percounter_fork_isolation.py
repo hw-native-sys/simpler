@@ -51,7 +51,15 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 PERCOUNTER = REPO / "src/a5/runtime/percounter"
 
-# Mirrors BUILD_CONFIG["aicore"]["include_dirs"] in src/a5/runtime/percounter/build_config.py.
+# The AICore compile's search path, in order: BUILD_CONFIG["aicore"]["include_dirs"]
+# from src/a5/runtime/percounter/build_config.py, then the platform directories
+# src/a5/platform/onboard/aicore/CMakeLists.txt prepends to every AICore target.
+#
+# This is a hand-maintained mirror, and a mirror that silently loses a directory
+# would make this hook pass over a closure it cannot see. `unresolved_includes`
+# is what keeps it honest: a quoted include that resolves nowhere is reported
+# rather than dropped, so a missing directory here fails the hook instead of
+# shrinking what it checks.
 AICORE_INCLUDE_DIRS = (
     "src/a5/runtime/percounter/aicore",
     "src/a5/runtime/percounter/runtime",
@@ -59,6 +67,12 @@ AICORE_INCLUDE_DIRS = (
     "src/a5/runtime/host_build_graph/common",
     "src/a5/runtime",
     "src/common/host_build_graph",
+    "src/a5/platform/onboard/aicore",
+    "src/a5/platform/include",
+    "src/common/platform/include",
+    "src/common/task_interface",
+    "src/common/log/include",
+    "src/common",
 )
 
 # Each key is a header percounter's AICore program has its own version of.
@@ -75,7 +89,12 @@ FORKED = {
 }
 
 INCLUDE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.M)
-NAMES_PERCOUNTER = re.compile(r'^\s*#\s*include\s*"([^"]*percounter/[^"]*)"', re.M)
+# An include the source itself marks as optional. `scheduler_types.h` reaches
+# `spin_hint.h` this way: the header exists once per platform backend and the
+# AICore build adds neither, which is a resolution failure this hook must not
+# report and the compiler never sees.
+OPTIONAL = re.compile(r'^[^\S\n]*#[^\S\n]*if[^\S\n]+__has_include\s*\(\s*"([^"]+)"\s*\)', re.M)
+NAMES_PERCOUNTER = re.compile(r'^\s*#\s*include\s*["<]([^">]*percounter/[^">]*)[">]', re.M)
 SUFFIXES = frozenset({".h", ".hpp", ".cpp", ".cc", ".cxx"})
 # The roots that hold C++ anyone compiles; build output and 3rdparty are not searched.
 SOURCE_ROOTS = ("src", "tests", "examples", "python", "simpler_setup")
@@ -96,9 +115,16 @@ def resolve(including: Path, name: str, search: list[Path]) -> Path | None:
     return None
 
 
-def closure(roots: list[Path], search: list[Path]) -> dict[Path, Path | None]:
-    """Every file reachable from roots, mapped to the file that first included it."""
+def closure(roots: list[Path], search: list[Path]) -> tuple[dict[Path, Path | None], dict[str, str]]:
+    """Every file reachable from roots, mapped to the file that first included it.
+
+    The second return is the quoted includes that resolved nowhere, mapped to a
+    file that names them. Those are reported rather than dropped: each one is a
+    subtree this walk cannot see, so dropping them would shrink what the hook
+    checks without saying so.
+    """
     came_from: dict[Path, Path | None] = {root.resolve(): None for root in roots}
+    unresolved: dict[str, str] = {}
     pending = [root.resolve() for root in roots]
     while pending:
         current = pending.pop()
@@ -106,13 +132,18 @@ def closure(roots: list[Path], search: list[Path]) -> dict[Path, Path | None]:
             text = current.read_text(errors="replace")
         except OSError:
             continue
+        optional = set(OPTIONAL.findall(text))
         for name in INCLUDE.findall(text):
             target = resolve(current, name, search)
-            if target is None or target in came_from:
+            if target is None:
+                if name not in optional:
+                    unresolved.setdefault(name, rel(current))
+                continue
+            if target in came_from:
                 continue
             came_from[target] = current
             pending.append(target)
-    return came_from
+    return came_from, unresolved
 
 
 def chain(came_from: dict[Path, Path | None], leaf: Path) -> str:
@@ -124,26 +155,26 @@ def chain(came_from: dict[Path, Path | None], leaf: Path) -> str:
     return " -> ".join(reversed(steps))
 
 
-def check_forks() -> list[str]:
+def check_forks() -> tuple[list[str], list[str]]:
+    """Forked originals the closure reaches, and includes the closure could not follow."""
     roots = sorted(p for p in (PERCOUNTER / "aicore").rglob("*") if p.suffix in SUFFIXES)
     if not roots:
-        return ["src/a5/runtime/percounter/aicore holds no sources, so this hook is checking nothing"]
+        return [], ["src/a5/runtime/percounter/aicore holds no sources, so this hook is checking nothing"]
     search = [REPO / d for d in AICORE_INCLUDE_DIRS]
     absent = [rel(d) for d in search if not d.is_dir()]
     if absent:
-        return [f"an include dir named by this hook no longer exists: {d}" for d in absent]
+        return [], [f"an include dir named by this hook no longer exists: {d}" for d in absent]
 
-    came_from = closure(roots, search)
+    came_from, unresolved = closure(roots, search)
     reached = {rel(path): path for path in came_from}
-    failures = []
-    for original, replacement in FORKED.items():
-        if original not in reached:
-            continue
-        failures.append(
-            f"{original}\n      reached by: {chain(came_from, reached[original])}"
-            f"\n      percounter's own version is {replacement}"
-        )
-    return failures
+    forks = [
+        f"{original}\n      reached by: {chain(came_from, reached[original])}"
+        f"\n      percounter's own version is {replacement}"
+        for original, replacement in FORKED.items()
+        if original in reached
+    ]
+    blind = [f'"{name}", included by {includer}' for name, includer in sorted(unresolved.items())]
+    return forks, blind
 
 
 def check_reverse() -> list[str]:
@@ -161,14 +192,23 @@ def check_reverse() -> list[str]:
 
 
 def main() -> int:
-    forks, reverse = check_forks(), check_reverse()
-    if not forks and not reverse:
+    (forks, blind), reverse = check_forks(), check_reverse()
+    if not forks and not blind and not reverse:
         return 0
     if forks:
         print("percounter's AICore program reaches a header it has its own version of:\n")
         for failure in forks:
             print(f"  - {failure}\n")
         print("Include percounter's version. If the fork is being retired, retire it in this hook too.\n")
+    if blind:
+        print("This hook cannot follow every include, so it is not checking the whole closure:\n")
+        for failure in blind:
+            print(f"  - {failure}")
+        print(
+            "\nEach one stops the walk, leaving whatever it includes unchecked. Add the directory"
+            "\nthe AICore build finds it in to AICORE_INCLUDE_DIRS, or, if the source marks the"
+            "\ninclude optional with __has_include, nothing needs doing here.\n"
+        )
     if reverse:
         print("percounter is a private runtime; nothing outside it may include its headers:\n")
         for failure in reverse:

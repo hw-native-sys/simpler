@@ -185,19 +185,36 @@ percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_th
     cache_invalidate_range(control, sizeof(*control));
     if (aicpu_thread_count <= 1) percounter_prepare_graphs(runtime, control);
     const uint64_t expected = control->executable_block_count;
-    uint64_t last_resolved = ~uint64_t{0};
+    uint64_t last_progress = ~uint64_t{0};
     uint64_t last_progress_cycles = get_sys_cnt_aicpu();
     uint32_t error_poll_count = 0;
     uint64_t error = 0;
+    uint64_t outstanding = 0;
     while (true) {
         cache_invalidate_range(&control->completed_block_count, sizeof(control->completed_block_count));
         const uint64_t resolved = control->completed_block_count;
+        // Read after the block count, never before. A lane seals a deferred
+        // group before it counts the block that opened it, so a count that
+        // already includes that block was published after the seal and this
+        // read cannot miss the group. Reading the other order would let a run
+        // whose last task defers report success with its condition unmet.
+        cache_invalidate_range(
+            &control->async_outstanding, sizeof(control->async_outstanding) + sizeof(control->async_settled)
+        );
+        outstanding = control->async_outstanding;
+        const uint64_t settled = control->async_settled;
         const uint64_t now = get_sys_cnt_aicpu();
-        if (resolved != last_resolved) {
-            last_resolved = resolved;
+        // Both terms here only rise, so a device still publishing deferred
+        // completions keeps refreshing the watchdog. `async_outstanding` stays
+        // out of the sum and gates the exit alone, for the reason
+        // `PercounterControl` gives: a term that falls as well as rises would
+        // refresh the watchdog on a device going nowhere.
+        const uint64_t progress = resolved + settled;
+        if (progress != last_progress) {
+            last_progress = progress;
             last_progress_cycles = now;
         }
-        if (resolved >= expected) break;
+        if (resolved >= expected && outstanding == 0) break;
         if (++error_poll_count == 64) {
             error_poll_count = 0;
             chip_swimlane_aicpu_poll_self_scheduled_cores(thread_idx, aicpu_thread_count, runtime->get_worker_count());
@@ -215,7 +232,11 @@ percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_th
         }
         if (scheduler_watchdog_expired(last_progress_cycles, now, timeout_cycles)) {
             error = static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT);
-            LOG_ERROR("A5 percounter: no progress; %" PRIu64 " of %" PRIu64 " blocks resolved", resolved, expected);
+            LOG_ERROR(
+                "A5 percounter: no progress; %" PRIu64 " of %" PRIu64 " blocks resolved, %" PRIu64
+                " deferred completions outstanding",
+                resolved, expected, outstanding
+            );
             break;
         }
         SPIN_WAIT_HINT();

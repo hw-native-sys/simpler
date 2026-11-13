@@ -131,6 +131,12 @@ struct LaneConfig {
     uint64_t async_group_offset;
     uint32_t async_group_base_index;
 
+    // Where this lane's condition entries live, derived once at bind. The
+    // record carries the same offset for the AICPU and the dump tools, but a
+    // kernel can write that record, so nothing on this side reads it back.
+    uint64_t async_entries_offset;
+    uint64_t async_entry_bytes;
+
     // This lane's place in its cluster: lane 0 is the AIC, 1 and 2 the AIVs,
     // which is also the subtask slot it runs of a MIX task.
     int32_t cluster_index;
@@ -405,8 +411,9 @@ static_assert(
  * run's bytes there, and a kernel that invalidates its data cache on entry
  * would otherwise find whatever an earlier bind left.
  */
-inline __aicore__ __gm__ pto2::resident::AsyncGroupData *
-percounter_init_async_records(__gm__ PercounterControl *control, int block_idx) {
+inline __aicore__ __gm__ pto2::resident::AsyncGroupData *percounter_init_async_records(
+    __gm__ PercounterControl *control, int block_idx, uint64_t *entries_base_out, uint64_t *entry_bytes_out
+) {
     using pto2::resident::AsyncGroupData;
     const uint64_t lane = static_cast<uint64_t>(block_idx);
     const uint32_t capacity = static_cast<uint32_t>(percounter_gm_read(control->async_capacity));
@@ -441,6 +448,8 @@ percounter_init_async_records(__gm__ PercounterControl *control, int block_idx) 
         for (uint64_t offset = 0; offset < sizeof(AsyncGroupData); offset += 64)
             dcci((__gm__ uint8_t *)record + offset, SINGLE_CACHE_LINE, CACHELINE_OUT);
     }
+    *entries_base_out = entries_base;
+    *entry_bytes_out = entry_bytes;
     return records;
 }
 
@@ -469,6 +478,23 @@ inline __aicore__ void percounter_async_open(const LaneConfig &cfg, __gm__ Dispa
 }
 
 /**
+ * Where `slot`'s condition entries are, computed rather than followed.
+ *
+ * The record carries an `entries_offset` for the AICPU and the dump tools,
+ * and the kernel that registers into the record can write that field. A
+ * value a kernel can reach must not steer a GM read on this side: every term
+ * below comes from the control block the host published and this lane's own
+ * slot, so a scribbled record fails the seal's checks instead of sending a
+ * lane into unmapped memory, which on this hardware hangs the core rather
+ * than reporting anything.
+ */
+inline __aicore__ __gm__ DeferredCompletionEntry *percounter_async_entries(const LaneConfig &cfg, uint32_t slot) {
+    return scheduler_state_at<DeferredCompletionEntry>(
+        cfg.control, cfg.async_entries_offset + slot * cfg.async_entry_bytes
+    );
+}
+
+/**
  * Close `slot`'s record now that its kernel has returned, and say whether the
  * task's completion is deferred.
  *
@@ -492,7 +518,7 @@ inline __aicore__ bool percounter_async_seal(
     __gm__ pto2::resident::AsyncGroupData *record = &cfg.async_group[slot];
     const uint32_t count = record->count;
     const int32_t error = record->error_code;
-    if (error != SIMPLER_ERROR_NONE || count > record->capacity) {
+    if (error != SIMPLER_ERROR_NONE || count > record->capacity || record->reservation_limit != 0) {
         // The record carries why, and the kernel writes it there because no
         // public entry point can publish an arbitrary code. Carrying it across
         // is what tells a reader of the device log that five conditions went
@@ -509,6 +535,17 @@ inline __aicore__ bool percounter_async_seal(
     if (!may_defer) {
         percounter_fail(cfg, SchedulerGraphResult::ASYNC_REGISTRATION_FAILED);
         return false;
+    }
+    // The reserved word is the one field a registering kernel must leave
+    // alone, so a set one is a malformed entry rather than a condition. The
+    // scan is here and not in the tick: it runs once per deferral, against
+    // lines the kernel on this core has just written.
+    __gm__ DeferredCompletionEntry *entries = percounter_async_entries(cfg, slot);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (entries[i]._pad != 0) {
+            percounter_fail(cfg, SchedulerGraphResult::ASYNC_COMPLETION_INVALID);
+            return false;
+        }
     }
     // Sealed before the mask is armed: a group this lane will poll must stop
     // accepting registrations first, and the state is in the line the open
@@ -580,7 +617,7 @@ inline __aicore__ bool percounter_async_tick(const LaneConfig &cfg, PercounterLa
         uint64_t pending = state->async_slots[slot].pending_mask;
         if (pending == 0) continue;
         __gm__ pto2::resident::AsyncGroupData *record = &cfg.async_group[slot];
-        auto *entries = scheduler_state_at<DeferredCompletionEntry>(cfg.control, record->entries_offset);
+        auto *entries = percounter_async_entries(cfg, slot);
         while (pending != 0) {
             const uint32_t index = static_cast<uint32_t>(__builtin_ctzll(pending));
             const auto &entry = entries[index];
@@ -609,16 +646,17 @@ inline __aicore__ bool percounter_async_tick(const LaneConfig &cfg, PercounterLa
  * Take a record for the dispatch about to run, waiting for one if this lane
  * already owes every slot it has.
  *
- * The wait is the only place `PERCOUNTER_ASYNC_SLOTS` is felt. It is a
- * checkpoint spin, not a block: a lane here still serves MIX and cohort work
- * and still sees EXIT and another lane's error, because `percounter_async_tick`
- * runs beside the services the checkpoint already performs.
+ * The wait is the only place `PERCOUNTER_ASYNC_SLOTS` is felt, and it polls
+ * this lane's own conditions and nothing else. **The caller has already
+ * committed to this dispatch**, so a lane waiting here serves no MIX or
+ * cohort work, and one serving a cohort block still holds it. Serving from
+ * here is not an option rather than an omission: `percounter_checkpoint_serve`
+ * reaches `percounter_serve_mix`, which reaches `percounter_launch_kernel`,
+ * which reaches this function.
  *
- * **The caller has already committed to this dispatch**, so a lane waiting
- * here serves no MIX or cohort work, and one serving a cohort block still
- * holds it. That is a stall, not a hang: the wait polls the lane's own
- * conditions, tests the stop signals, and ends at the watchdog, while a MIX
- * arming reading the lane's hold correctly refuses to name it throughout.
+ * That is a stall, not a hang: the wait polls the lane's own conditions, tests
+ * the stop signals, and ends at the watchdog, while a MIX arming reading the
+ * lane's hold correctly refuses to name it throughout.
  *
  * Returns false on EXIT, on another lane's error, or when no slot has freed
  * within the watchdog -- which is a condition that never held, and is reported
@@ -2040,7 +2078,8 @@ inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, in
     );
     cfg.ticket_group = static_cast<uint32_t>(coordinate.cluster_index) % cfg.ticket_group_count;
     cfg.has_predicates = percounter_gm_read(control->has_predicates) != 0;
-    cfg.async_group = percounter_init_async_records(control, block_idx);
+    cfg.async_group =
+        percounter_init_async_records(control, block_idx, &cfg.async_entries_offset, &cfg.async_entry_bytes);
     cfg.async_group_offset =
         percounter_gm_read(control->async_groups_offset) +
         static_cast<uint64_t>(block_idx) * PERCOUNTER_ASYNC_SLOTS * sizeof(pto2::resident::AsyncGroupData);
