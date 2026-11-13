@@ -61,6 +61,7 @@ class TestMixSpareLane(SceneTestCase):
         {
             "name": f"{mode}_mask{mask}",
             "platforms": ["a5sim", "a5"],
+            "manual": ["a5"],
             "params": {"mask": mask, "sync": int(mode == "Sync")},
         }
         for mode in ("Residual", "Sync")

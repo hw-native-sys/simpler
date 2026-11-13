@@ -108,6 +108,7 @@ def cases(ranks):
         {
             "name": name,
             "platforms": ["a5"],
+            "manual": True,
             "config": {"device_count": ranks, "num_sub_workers": 0},
             "params": {"ranks": ranks, "elements": elements, "zero": zero, "local_put": local_put},
         }

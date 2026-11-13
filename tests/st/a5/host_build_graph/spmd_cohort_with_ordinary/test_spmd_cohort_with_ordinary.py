@@ -199,7 +199,7 @@ def _cohort_shape(cohort, aic_count, aiv_count):
 # mark is the closer one and can narrow a case to hardware. Each cohort count
 # holds a device for a process of its own, so a simulator run carries the
 # single-cohort case and the silicon keeps the rest.
-pytestmark = [pytest.mark.platforms(["a5sim", "a5"])]
+pytestmark = [pytest.mark.manual(["a5"]), pytest.mark.platforms(["a5sim", "a5"])]
 _SIM_COHORTS = (1,)
 
 

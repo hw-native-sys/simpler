@@ -109,6 +109,7 @@ class TestSpmdMultiblockAic(SceneTestCase):
         {
             "name": "aiv_block_num_128_waves",
             "platforms": ["a5sim", "a5"],
+            "manual": ["a5"],
             "params": {"blocks": 128, "aiv": 1},
         },
     ]

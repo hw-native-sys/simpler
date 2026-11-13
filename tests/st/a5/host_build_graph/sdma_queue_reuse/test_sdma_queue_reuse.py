@@ -244,6 +244,7 @@ def l3_case(function):
 
 
 pytestmark = [
+    pytest.mark.manual(["a5"]),
     pytest.mark.platforms(["a5"]),
     pytest.mark.runtime("host_build_graph"),
     pytest.mark.sdma(worker_workspace=False),

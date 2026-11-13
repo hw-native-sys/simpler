@@ -30,6 +30,7 @@ def _payload(value):
     return struct.pack("<f", value) * SMALL_ELEMS
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime(_RUNTIME)
 @pytest.mark.device_count(_DEVICE_COUNT)

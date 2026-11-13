@@ -110,6 +110,7 @@ class TestFanoutImbalance(SceneTestCase):
             "name": f"fanout_{count}",
             "platforms": ["a5sim", "a5"],
             "params": {"task_count": count},
+            **({} if count <= 256 else {"manual": ["a5"]}),
         }
         for count in (256, 1024)
     ]

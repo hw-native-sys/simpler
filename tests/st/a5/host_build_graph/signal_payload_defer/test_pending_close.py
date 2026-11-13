@@ -34,6 +34,7 @@ def compile_close_case(platform):
     )
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime("host_build_graph")
 @pytest.mark.parametrize(

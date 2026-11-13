@@ -114,6 +114,7 @@ def _find_swimlane_records(output_prefix: Path) -> Path:
     return matches[-1]
 
 
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a5sim", "a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)

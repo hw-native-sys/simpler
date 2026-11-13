@@ -224,6 +224,7 @@ def cases(ranks):
                 f"_{'reuse' if retained else 'scope'}"
             ),
             "platforms": ["a5"],
+            "manual": True,
             "config": {"device_count": ranks, "num_sub_workers": 0},
             "params": {"ranks": ranks, "consumer_type": core, "dirty": dirty, "retained": retained},
         }

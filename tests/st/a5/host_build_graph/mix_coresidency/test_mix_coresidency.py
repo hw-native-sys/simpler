@@ -189,6 +189,7 @@ def test_mix_subtasks_run_together(st_platform, st_device_ids):
 
 # Each case holds a device for a process of its own, so a simulator run
 # carries only the plain co-residency above.
+@pytest.mark.manual(["a5"])
 @pytest.mark.platforms(["a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)

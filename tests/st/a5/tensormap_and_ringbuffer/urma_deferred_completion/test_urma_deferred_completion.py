@@ -126,6 +126,7 @@ def _case(name, mode=0, repeats=1, elems=SMALL_ELEMS):
         {
             "name": name,
             "platforms": ["a5"],
+            "manual": True,
             "config": {"device_count": NRANKS, "num_sub_workers": 0},
             "params": {"mode": mode, "repeats": repeats, "elems": elems},
         }

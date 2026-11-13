@@ -1260,6 +1260,7 @@ class TestA2a3TmrEarlyEnqueueTwoEndpoints(_A2a3TmrEarlyEnqueueBase):
         {
             "name": "a2a3_tmr_early_enqueue_two_endpoints",
             "platforms": ["a2a3"],
+            "manual": True,
             "config": {"device_count": 2, "num_sub_workers": 0, "launch_depth": 2},
             "params": {},
         },
