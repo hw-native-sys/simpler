@@ -2,14 +2,14 @@
 
 Use [the suite README](../../../../tests/fdwic/dsv41_scheduler/README.md) and [results](../../../../tests/fdwic/dsv41_scheduler/RESULTS.md) from the same checkout. The production ChipWorker runs captured graph slices with vendored generated code and frozen zero-weight inputs. Local cases materialize their prefix inputs, with prefix time outside the case measurement. The suite runs with the checked-in fixtures and the A5 onboard HBG runtime.
 
-The default matrix has nine cases per flavor, `pypto_lib` and `pypto_lib_dsl`.
+The routine baseline selects 20 configurations in [baseline_matrix.json](../../../../tests/fdwic/dsv41_scheduler/baseline_matrix.json). The source corpus still provides nine cuts in each original flavor, `pypto_lib` and `pypto_lib_dsl`.
 
-| Cards | Cases |
-| ----- | ----- |
-| 1 | `swa`, `c2a_full`, `c2a_reuse`, `c1a_full`, `c1a_reindex`, `c1a_reuse`, `engram` |
-| 2 | `moe`, `layers_19_21` |
+| Cards | Retained configurations |
+| ----- | ----------------------- |
+| 1 | SWA: DSL original, bounded-sync, Flat x8, Graph x8; C2A full: original/sync; C1A reuse: Flat/Graph x8; C1A reindex: original/sync; Engram: original/sync |
+| 2 | MoE and layers_19_21: PyPTO-lib, DSL original/Flat x1, bounded-sync, Graph x1 |
 
-The optional forced sync-start DSL variant is a separate workload. Report it explicitly if requested.
+The sync variant adds sync_start only to compute tasks with 2–64 blocks. Do not count the two EP2 Flat x1 rows twice: they are the ordinary DSL controls. The current baseline uses same-run L1 metrics by explicit measurement contract; other runtime comparisons may still use the normal L0 performance workflow.
 
 ## Build and prepare
 
@@ -27,19 +27,19 @@ Prepare into a fresh path. Preparation captures the two-rank source forward and 
 
 ## Run and collect
 
-`run.sh` takes `BUNDLE RUNTIME OUTPUT LEVEL WARMUP ROUNDS`. The wrapper reserves the number of cards required by the bundle when `TASK_DEVICE` is unset. Use `DSV41_DEVICES` to request the same physical cards for matched arms or use an existing reservation with the exact topology. Give each arm a fresh output directory.
+`run.sh` takes `BUNDLE RUNTIME OUTPUT LEVEL WARMUP ROUNDS`. The wrapper reserves the number of cards required by the bundle when `TASK_DEVICE` is unset. Allocate through `task-submit --device auto --device-num N`, then run matched configurations inside that same reservation using the assigned `TASK_DEVICE`. Do not set a fixed device sequence. Give each arm a fresh output directory.
 
 ```bash
 export RUN_DIR="$DSV41/outputs/repro"
 flavor=pypto_lib
 case_name=swa
 bash "$DSV41/run.sh" "$PREPARED/cases/$flavor/$case_name" \
-  "$DSV41_RUNTIME" "$RUN_DIR/l0/$flavor/$case_name" 0 1 10
+  "$DSV41_RUNTIME" "$RUN_DIR/l1/$flavor/$case_name" 1 1 10
 bash "$DSV41/run.sh" "$PREPARED/cases/$flavor/$case_name" \
   "$DSV41_RUNTIME" "$RUN_DIR/trace/$flavor/$case_name" all 1 3
 ```
 
-Level `0` is for performance, `1` for kernel lanes, and `3` for scheduling phases. `all` collects a short L0 series plus L1 and L3 traces. The analyzer reads results for every bundle in its cases directory. For a single-case run, give it a temporary directory containing a symlink to that bundle. For a complete flavor run, pass the full prepared flavor directory.
+Level `0` is the unprofiled performance path, `1` records kernel lanes, and `3` records scheduling phases. The retained baseline deliberately uses L1 for both reported metrics, including L1 overhead. `all` collects a short L0 series plus L1 and L3 traces. The analyzer reads results for every bundle in its cases directory. For a single-case run, give it a temporary directory containing a symlink to that bundle. For a complete flavor run, pass the full prepared flavor directory.
 
 ```bash
 (
@@ -54,4 +54,8 @@ Level `0` is for performance, `1` for kernel lanes, and `3` for scheduling phase
 )
 ```
 
-Check rank results and replay validation. For the repository results protocol, use L0 device wall with one warmup and ten measured rounds, reporting the mean. For two-card cases use the maximum rank time in each round before taking the mean. If reproducing a separate fastest-rank experiment, report that statistic explicitly alongside the repository convention.
+Check rank results and replay validation. For the retained 20-configuration baseline, use one L1 warmup and ten measured L1 rounds. Report the arithmetic mean of device wall and the AICore kernel envelope, both from each same invocation. The envelope is max(kernel_end) minus min(kernel_start), including gaps between kernels. For two-card cases calculate each metric within each rank, take its maximum rank value per round, then average; never subtract absolute timestamps across devices. These means are not directly comparable to an L0 baseline.
+
+Use `production/baseline_report.py` and the full retained matrix for this report. For the single-device Graphs, collect L4 separately to export the actual native kernel DAG with `production/graph_topology.py`; only its structure is used. Model weights remain the measured L1 kernel durations. The model removes scheduler costs and applies dependency, per-task capacity and total AIC/AIV work lower bounds. It does not construct an attainable schedule. Communication/defer_wait cases remain N/A when their logical completion events are unavailable; do not equate kernel return with completion or silently assume zero communication latency.
+
+See the suite [RESULTS.md](../../../../tests/fdwic/dsv41_scheduler/RESULTS.md) for exact formulas, bundle identity checks and commands. Keep one current mean table, with raw samples and diagnostic captures on the experiment host.

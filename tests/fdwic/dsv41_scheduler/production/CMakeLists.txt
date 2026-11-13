@@ -19,13 +19,17 @@ add_executable(native-runner
     ${COMMON}/worker/runtime_module.cpp
     ${COMMON}/worker/chip_run_lane.cpp
     ${COMMON}/worker/device_fault_monitor_host.cpp
-    ${COMMON}/worker/native_submission_state.cpp
+    ${COMMON}/platform_comm/ccu/ccu_native_module.cpp
+    ${COMMON}/platform_comm/ccu/ccu_run_lifecycle.cpp
+    ${COMMON}/platform_comm/ccu/ccu_domain_owner.cpp
+    ${COMMON}/platform_comm/ccu/ccu_domain_registration.cpp
     ${COMMON}/log/host_log.cpp
     ${COMMON}/log/unified_log_host.cpp
     ${COMMON}/task_interface/assert_compat.cpp
 )
 target_compile_features(native-runner PRIVATE cxx_std_17)
 target_include_directories(native-runner PRIVATE
+    ${COMMON}
     ${COMMON}/task_interface
     ${COMMON}/worker
     ${COMMON}/hierarchical

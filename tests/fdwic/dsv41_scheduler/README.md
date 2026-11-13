@@ -12,10 +12,12 @@ experiment, not checkpoint accuracy validation. Isolated Attention and Engram
 cases run rank 0 on **one device**. Only `moe`, `layers_19_21`, and the original
 full forward run on **two devices** with real communication and deferred waits.
 
-The current L0 means for PyPTO-lib, DSL and the bounded-sync DSL variant,
-with their measurement contract, are maintained in [RESULTS.md](RESULTS.md).
+The retained baseline has 20 configurations selected in [baseline_matrix.json](baseline_matrix.json).
+[RESULTS.md](RESULTS.md) contains the single current table: device wall and the AICore
+kernel envelope from the same L1 runs, plus a trace-derived model lower bound where
+dependencies are observable. [GRAPH.md](GRAPH.md) describes repeated Flat/Graph preparation.
 
-## Cases
+## Available source cuts
 
 Layer indices are zero-based. The two task organizations are captured separately.
 The tables in `workloads/` identify the original cuts; they are not executable
@@ -100,7 +102,7 @@ The default `--max-blocks 64` preserves the oversized AIV tasks in MoE,
 Engram and layers 19–21. AIC/MIX tasks in these fixtures already fit within
 32 clusters. This block-count limit is an experiment policy, not automatic
 hardware-capacity discovery. See [RESULTS.md](RESULTS.md)
-for all nine outcomes.
+for the retained measurement matrix.
 
 ## Included sources and data
 
@@ -230,6 +232,12 @@ that production profiling level. Outputs are split by rank and run;
 `result.json` confirms completion and boundary validation, and
 `source-task-map.txt` maps replay task IDs to the original forward.
 
+The launcher uses the production `prepare_native_run` / `launch_native_run`
+lifecycle and synchronizes both ranks after Host preparation. Device timings
+therefore include actual execution and communication, while the peer's Host
+binding/upload time does not become an artificial communication wait. A
+single-level run uses that same profiling level for warmup and measurement.
+
 The local `plan-rank*.bin` records use current production C++ types. They are
 **derived build artifacts**, not portable runtime protocols. Regenerate them
 from the included original C++ after changing the runtime ABI, Host adapters,
@@ -280,8 +288,8 @@ done
 The report checks physical `(task, block, subtask)` invocation sets, tensor
 arguments, internal dependencies, and capture completeness. It includes
 per-kernel duration comparisons, L0 Device timing, and L3 phases. The Host launch barrier uses bounded busy polling so a timer sleep does not
-become device-side peer wait. Binding still occurs after that barrier; Host
-`chip.run.runner_run` timestamps expose any remaining rank launch skew. Device timing
+become device-side peer wait. Binding and image upload finish before that barrier;
+Host `chip.run.runner_run` timestamps expose any remaining rank launch skew. Device timing
 includes cross-rank waits and launch skew; it is not pure Scalar scheduling
 time. Recompiling with different CANN/PTO versions can change kernel durations;
 compare against the full-forward capture from that same build.
