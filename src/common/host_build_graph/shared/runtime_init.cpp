@@ -77,14 +77,19 @@ bool SchedulerState::TaskHeaderView::init_data_from_layout(void *sm_dev_base) {
 
 void SchedulerState::TaskHeaderView::destroy() { tasks = nullptr; }
 
-SchedulerLayout SchedulerState::reserve_layout(DeviceArena &arena) {
+SchedulerLayout SchedulerState::reserve_layout(DeviceArena &arena, uint64_t task_capacity) {
+    always_assert(task_capacity <= static_cast<uint64_t>(TaskId::GLOBAL_TASK_MAX_NUM));
+    uint64_t reservation = READY_QUEUE_CAPACITY_LIMIT;
+    while (reservation < task_capacity)
+        reservation <<= 1;
+
     SchedulerLayout layout{};
     for (int i = 0; i < NUM_RESOURCE_SHAPES; ++i) {
-        layout.capacities.ready[i] = READY_QUEUE_CAPACITY_LIMIT;
-        layout.capacities.ready_sync[i] = READY_QUEUE_CAPACITY_LIMIT;
+        layout.capacities.ready[i] = reservation;
+        layout.capacities.ready_sync[i] = reservation;
     }
-    layout.capacities.dummy = READY_QUEUE_CAPACITY_LIMIT;
-    layout.capacities.graph_prepare = GRAPH_PREPARE_QUEUE_CAPACITY_LIMIT;
+    layout.capacities.dummy = reservation;
+    layout.capacities.graph_prepare = 2 * reservation;
 
     // Fixed-capacity early-dispatch queues first, then the configurable queues.
     // The big eight are the arena's last reservations so that the bytes bind
@@ -95,13 +100,13 @@ SchedulerLayout SchedulerState::reserve_layout(DeviceArena &arena) {
     layout.off_early_sync_start_queue_slots = ready_queue_reserve_layout(arena, CHIP_EARLY_DISPATCH_QUEUE_SIZE);
     layout.off_ed_publish_drain_queue_slots = ready_queue_reserve_layout(arena, CHIP_EARLY_DISPATCH_QUEUE_SIZE);
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
-        layout.off_ready_queue_slots[i] = ready_queue_reserve_layout(arena, READY_QUEUE_CAPACITY_LIMIT);
+        layout.off_ready_queue_slots[i] = ready_queue_reserve_layout(arena, reservation);
     }
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
-        layout.off_ready_sync_queue_slots[i] = ready_queue_reserve_layout(arena, READY_QUEUE_CAPACITY_LIMIT);
+        layout.off_ready_sync_queue_slots[i] = ready_queue_reserve_layout(arena, reservation);
     }
-    layout.off_dummy_ready_queue_slots = ready_queue_reserve_layout(arena, READY_QUEUE_CAPACITY_LIMIT);
-    layout.off_graph_prepare_queue_slots = ready_queue_reserve_layout(arena, GRAPH_PREPARE_QUEUE_CAPACITY_LIMIT);
+    layout.off_dummy_ready_queue_slots = ready_queue_reserve_layout(arena, reservation);
+    layout.off_graph_prepare_queue_slots = ready_queue_reserve_layout(arena, 2 * reservation);
     // Polling: no dep_pool arena region — producer dependencies are inline ids on
     // the payload and readiness is via the task_states array.
     return layout;
@@ -222,7 +227,7 @@ RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_capa
     layout.off_sm_handle = arena.reserve(sizeof(SharedMemoryHandle), alignof(SharedMemoryHandle));
     layout.off_mailbox = arena.reserve(sizeof(AICoreCompletionMailbox), alignof(AICoreCompletionMailbox));
     layout.off_scheduler = arena.reserve(sizeof(SchedulerState), alignof(SchedulerState));
-    layout.sched = SchedulerState::reserve_layout(arena);
+    layout.sched = SchedulerState::reserve_layout(arena, task_capacity);
 
     layout.off_copied_begin = arena.total_size();
     // Padded to a CHIP_ALIGN_SIZE boundary: the shared-memory image starts at
