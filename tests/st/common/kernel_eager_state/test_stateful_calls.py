@@ -9,6 +9,7 @@
 """A scalar or HOST control selects empty/active calls over one persistent DEVICE view."""
 
 import ctypes
+import json
 import struct
 import subprocess
 import sys
@@ -258,8 +259,13 @@ def _check(st_platform, st_device_ids, runtime, borrowed, host_controls, workspa
     result = subprocess.run(
         [
             sys.executable,
-            "-m",
-            "tests.st.common.kernel_eager_state.test_stateful_calls",
+            "-c",
+            "import json, runpy, sys; "
+            "sys.path[:] = json.loads(sys.argv[1]); "
+            "sys.argv = sys.argv[2:]; "
+            "runpy.run_path(sys.argv[0], run_name='__main__')",
+            json.dumps(sys.path),
+            str(Path(__file__).resolve()),
             st_platform,
             runtime,
             str(st_device_ids[0]),

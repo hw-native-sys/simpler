@@ -69,7 +69,8 @@ static bool get_pg_mask(uint64_t &valid, int64_t device_id) {
     uint64_t aicore_bitmap[PLATFORM_AICORE_MAP_BUFF_LEN] = {0};
     int32_t size_n = static_cast<int32_t>(sizeof(uint64_t)) * PLATFORM_AICORE_MAP_BUFF_LEN;
 
-    auto halFuncDevInfo = reinterpret_cast<decltype(&halGetDeviceInfoByBuff)>(dlsym(nullptr, "halGetDeviceInfoByBuff"));
+    auto halFuncDevInfo =
+        reinterpret_cast<decltype(&halGetDeviceInfoByBuff)>(dlsym(RTLD_DEFAULT, "halGetDeviceInfoByBuff"));
 
     if (halFuncDevInfo == nullptr) {
         LOG_WARN("halGetDeviceInfoByBuff not found, assuming all cores valid");
@@ -111,7 +112,7 @@ get_aicore_reg_info(std::vector<int64_t> &aic, std::vector<int64_t> &aiv, Aicore
         return (valid & (1ULL << id)) != 0;
     };
 
-    auto halFunc = reinterpret_cast<decltype(&halMemCtl)>(dlsym(nullptr, "halMemCtl"));
+    auto halFunc = reinterpret_cast<decltype(&halMemCtl)>(dlsym(RTLD_DEFAULT, "halMemCtl"));
 
     if (halFunc == nullptr) {
         LOG_ERROR("halMemCtl not found in symbol table");

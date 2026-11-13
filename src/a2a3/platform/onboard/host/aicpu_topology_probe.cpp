@@ -32,7 +32,7 @@ using HalGetDeviceInfoFn = decltype(&halGetDeviceInfo);
 
 HalGetDeviceInfoFn load_hal_get_device_info() {
     static HalGetDeviceInfoFn cached_fn = []() -> HalGetDeviceInfoFn {
-        auto fn = reinterpret_cast<HalGetDeviceInfoFn>(dlsym(nullptr, "halGetDeviceInfo"));
+        auto fn = reinterpret_cast<HalGetDeviceInfoFn>(dlsym(RTLD_DEFAULT, "halGetDeviceInfo"));
         if (fn != nullptr) return fn;
         static const char *const kHalLibs[] = {
             "libascend_hal.so",
@@ -40,7 +40,7 @@ HalGetDeviceInfoFn load_hal_get_device_info() {
         };
         for (const char *path : kHalLibs) {
             if (dlopen(path, RTLD_LAZY | RTLD_GLOBAL) == nullptr) continue;
-            fn = reinterpret_cast<HalGetDeviceInfoFn>(dlsym(nullptr, "halGetDeviceInfo"));
+            fn = reinterpret_cast<HalGetDeviceInfoFn>(dlsym(RTLD_DEFAULT, "halGetDeviceInfo"));
             if (fn != nullptr) return fn;
         }
         LOG_WARN("a2a3_aicpu_topology_probe: halGetDeviceInfo not found after dlopen fallback");

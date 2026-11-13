@@ -32,7 +32,7 @@
  */
 static int get_aicore_reg_info(std::vector<int64_t> &regs, int64_t device_id) {
     // halResMap: Maps individual AICore resources (DAV_3510-specific)
-    auto halFunc = reinterpret_cast<decltype(&halResMap)>(dlsym(nullptr, "halResMap"));
+    auto halFunc = reinterpret_cast<decltype(&halResMap)>(dlsym(RTLD_DEFAULT, "halResMap"));
 
     if (halFunc == nullptr) {
         LOG_ERROR("halResMap not found in symbol table");
