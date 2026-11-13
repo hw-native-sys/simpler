@@ -89,6 +89,15 @@ inline __aicore__ uint64_t percounter_gm_read(__gm__ volatile uint64_t &value, i
 #endif
 }
 
+inline __aicore__ uint32_t percounter_gm_read(__gm__ volatile uint32_t &value, int order = __ATOMIC_ACQUIRE) {
+#if defined(__CCE_AICORE__)
+    (void)order;
+    return static_cast<uint32_t>(__builtin_cce_ld_dev(const_cast<__gm__ uint32_t *>(&value), 0));
+#else
+    return __atomic_load_n(&value, order);
+#endif
+}
+
 /** Two adjacent 32-bit fields as one word, so neither can tear from the other. */
 inline __aicore__ uint64_t percounter_gm_read_u32_pair(__gm__ volatile uint32_t *values, int order = __ATOMIC_ACQUIRE) {
 #if defined(__CCE_AICORE__)

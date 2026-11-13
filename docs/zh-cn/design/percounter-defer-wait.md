@@ -65,7 +65,8 @@ cohort block 尤其如此：`sync_queue->completed` 必须仍在 kernel 返回�
 
 | HBG | percounter |
 | --- | ---------- |
-| `async_completion_types.h`、`async_condition_writer.h`、`SchedulerAsyncCompletionObserver` | 原样复用，不复制 |
+| `async_completion_types.h`、`aicore_completion_mailbox_types.h` 等线格式与记录布局 | 原样复用，不复制：后端写、两个运行时读 |
+| `SchedulerAsyncCompletionObserver` | 改为 `scheduler/async_completion.h` 的 `percounter_poll_completion`：同一套判定，去掉调度器的阶段埋点 |
 | `SchedulerAsyncLease` 与 CAS 租约 | 不需要：一个 group 只有 owner 一个检查者 |
 | `check_directory` / `finish_directory` 位图、`activity` | 不需要：owner 知道自己的 index |
 | `SchedulerAsyncTaskJoin`、`close_computation`、FINISH owner 选举 | 不需要：计数器就是 join |
@@ -203,7 +204,7 @@ return percounter_mix_discover(cfg, state, timeout_cycles, served);
 tick 在 checkpoint 里，这个自环自动解开，三个阻塞点全部继承这一性质。
 
 `percounter_async_tick` 的内容：group 头部 `observe`，按 `pending_mask` 逐条取
-`DeferredCompletionEntry`，用 `SchedulerAsyncCompletionObserver` 判定，每次调用有条数预算；
+`DeferredCompletionEntry`，用 `percounter_poll_completion` 判定，每次调用有条数预算；
 `pending_mask` 清空则结算。COUNTER 的观察是一次对齐的 32-bit device load 加一次有符号比较，
 负值（含 `INT32_MIN`）为 PENDING，不清零通知。
 

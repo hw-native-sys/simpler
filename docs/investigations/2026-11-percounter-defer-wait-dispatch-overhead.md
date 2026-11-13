@@ -2,7 +2,7 @@
 
 The COUNTER `defer_wait` support on `feat/percounter-defer-wait` costs a percounter
 graph about 6% even when no kernel registers anything. This records what the cost was
-measured to be, which parts were attributed, and three attempts that did not reduce it,
+measured to be, which parts were attributed, and the attempts that did not reduce it,
 so the next person does not repeat them.
 
 ## Measurement
@@ -39,15 +39,32 @@ register, which is not visible at bind. Making it visible means a mandatory user
 declaration, which the design rules out. The other route is the whole-cache invalidate
 itself, which is a separate pre-existing cost and not specific to this feature.
 
-## Three things that did not work
+## The include this measured, and why it went anyway
 
-**Dropping `scheduler_async_control.h`.** The branch includes it for one predicate,
-`SchedulerAsyncCompletionObserver`, and the header carries the resident scheduler's
-leases, directory and resolver. Replacing the predicate with a fifteen-line local
-COUNTER poll and dropping the include took `aicore_kernel.o` from 1,718,824 to
-1,691,208 — 27 KiB of the 382 KiB the branch adds. The include is not where the size
-went. Reverted: a 27 KiB saving does not pay for duplicating semantics that must not
-drift from the resident scheduler's.
+**Dropping `scheduler_async_control.h`.** The branch reached for one predicate,
+`SchedulerAsyncCompletionObserver`, by including a header that also carries the
+resident scheduler's leases, directory and resolver. Measured as a size question
+it is not worth doing: replacing the predicate with a fifteen-line local COUNTER
+poll took `aicore_kernel.o` from 1,718,824 to 1,691,208 — 27 KiB of the 382 KiB
+the branch adds, so the include is not where the size went, and 27 KiB does not
+pay for a second copy of a predicate.
+
+Size was the wrong question to ask of it. What the include costs is a dependency:
+it was the only edge from the percounter AICore translation unit into the resident
+scheduler's *control* code, where every other edge that unit has reaches a layout
+or wire-format header. The poll now lives in `scheduler/async_completion.h`,
+beside the GM accesses `gm.h` already keeps for the same reason — a lane reaches
+it from every checkpoint, where the sibling reaches it from a scheduler lane that
+is already carrying phase instrumentation.
+
+What is **not** copied is the formats. `CompletionToken`, the `COMPLETION_TYPE_*`
+constants, `AsyncGroupData` and `DeferredCompletionEntry` are still included from
+host_build_graph, because a backend writes those records and both runtimes read
+them; a fork there would be a layout fork. The drift this does accept is narrower
+and worth naming: if the meaning of a COUNTER, an SDMA event record or a CCU event
+changes, two polls now have to follow it instead of one.
+
+## Two things that did not work
 
 **Marking the cold bodies `noinline`.** `percounter_async_seal`, `..._settle`,
 `..._tick_pending` and the slow half of `..._acquire` are reached from several sites,

@@ -29,11 +29,12 @@
 
 #include "aicore/aicore.h"
 #include "common/platform_config.h"
+#include "async_completion_types.h"
 #include "dispatch_payload.h"
 #include "host_build_graph/runtime_status.h"
 #include "runtime.h"
+#include "scheduler/async_completion.h"
 #include "scheduler/wire_types.h"
-#include "scheduler/scheduler_async_control.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_layout.h"
 #include "scheduler/image_read.h"
@@ -567,15 +568,14 @@ inline __aicore__ void percounter_async_settle(const LaneConfig &cfg, Percounter
  * this a lane whose next task consumes the one it just deferred would spin on
  * a counter only it can publish.
  *
- * A condition is read with the same observer the resident scheduler uses, so
- * COUNTER keeps its signed semantics: a negative sample, `INT32_MIN` included,
- * is below every supported threshold and reads as pending rather than as a
- * large unsigned value.
+ * A condition is read through `percounter_poll_completion`, which keeps the
+ * signed semantics COUNTER carries on the wire: a negative sample, `INT32_MIN`
+ * included, is below every supported threshold and reads as pending rather
+ * than as a large unsigned value.
  */
 inline __aicore__ bool percounter_async_tick(const LaneConfig &cfg, PercounterLaneState *state, bool *settled) {
     *settled = false;
     if (state->async_outstanding_hint == 0) return true;
-    const SchedulerAsyncCompletionObserver observe{};
     for (uint32_t slot = 0; slot < PERCOUNTER_ASYNC_SLOTS; ++slot) {
         uint64_t pending = state->async_slots[slot].pending_mask;
         if (pending == 0) continue;
@@ -587,7 +587,7 @@ inline __aicore__ bool percounter_async_tick(const LaneConfig &cfg, PercounterLa
             const CompletionToken token{
                 entry.addr, entry.expected_value, entry.engine, entry.completion_type, entry.backend_cookie
             };
-            const CompletionPollResult result = observe(token, uint32_t{1});
+            const CompletionPollResult result = percounter_poll_completion(token);
             if (result.state == CompletionPollState::FAILED || result.error_code != 0) {
                 percounter_fail(cfg, SchedulerGraphResult::ASYNC_COMPLETION_INVALID);
                 return false;
