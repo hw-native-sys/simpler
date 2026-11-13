@@ -127,7 +127,7 @@ def detect_buildable_platforms() -> list:
 
     # Sim platforms: only need gcc/g++
     if shutil.which("gcc") and shutil.which("g++"):
-        platforms.extend(["a2a3sim", "a5sim"])
+        platforms.extend(["a2a3sim", "a5sim", "wsesim"])
 
     # Onboard platforms: need ccec + cross-compiler from ASCEND_HOME_PATH.
     has_ccec = shutil.which("ccec") is not None

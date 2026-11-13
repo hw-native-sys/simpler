@@ -495,9 +495,12 @@ void ChipWorker::init(
         throw std::runtime_error("borrowed initialization requires native caller ordering and context validation");
     }
 
+    const auto requires_aicpu_executor = module->optional<int (*)()>("requires_aicpu_executor");
+    const bool requires_aicpu = !requires_aicpu_executor || requires_aicpu_executor() != 0;
+
     const PipelineContract *contract = get_pipeline_contract_fn();
     if (!is_valid_pipeline_contract(contract) || !has_serviceable_arena_topology(*contract) ||
-        !has_serviceable_stream_topology(*contract)) {
+        !has_serviceable_stream_topology(*contract, requires_aicpu)) {
         throw std::runtime_error("host runtime returned a PipelineContract this build cannot accept");
     }
     PipelineContract resolved_contract = *contract;
@@ -592,7 +595,12 @@ void ChipWorker::init(
     int init_rc = 0;
     std::string init_error_detail;
     try {
-        std::vector<uint8_t> aicpu_bytes = read_binary_file(aicpu_path);
+        std::vector<uint8_t> aicpu_bytes;
+        if (requires_aicpu) {
+            aicpu_bytes = read_binary_file(aicpu_path);
+        } else if (!aicpu_path.empty()) {
+            throw std::invalid_argument("runtime does not accept an AICPU binary");
+        }
         std::vector<uint8_t> aicore_bytes = read_binary_file(aicore_path);
         // dispatcher_path is empty on sim (no dispatcher) and on tests that
         // exercise _ChipWorker.init directly without a RuntimeBinaries.

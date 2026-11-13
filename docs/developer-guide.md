@@ -116,8 +116,11 @@ use `build_package_sim` for simulation only. Build availability does not imply
 that the host has both kinds of NPU.
 Toolchain detection (`build_runtimes.py`):
 
-- **sim** (a2a3sim, a5sim): requires `gcc` + `g++` in `PATH`
+- **sim** (a2a3sim, a5sim, wsesim): requires `gcc` + `g++` in `PATH`
 - **onboard** (a2a3, a5): requires `ccec` in `PATH` + cross-compiler under `ASCEND_HOME_PATH`
+
+Platform documentation: [A2/A3](../src/a2a3/docs/platform.md),
+[A5](../src/a5/docs/platform.md), [WSE](../src/wse/docs/README.md).
 
 ### User code (per-example)
 

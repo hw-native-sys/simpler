@@ -66,6 +66,15 @@ jobs:
       setup_variant: self-cpu
       include_dfx_smokes: true
 
+  st-sim-wse:
+    needs: [detect-changes, pre-commit]
+    if: needs.detect-changes.outputs.wse_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
+    uses: ./.github/workflows/_st-sim-wse.yml
+    with:
+      runs_on: '["self-hosted","cpu"]'
+      setup_variant: self-cpu
+      include_dfx_smokes: true
+
   profiling-flags-smoke:
     needs: [detect-changes, pre-commit]
     if: (needs.detect-changes.outputs.a2a3_changed == 'true' || needs.detect-changes.outputs.a5_changed == 'true') && needs.detect-changes.outputs.examples_only != 'true' && needs.detect-changes.outputs.tests_only != 'true'

@@ -171,6 +171,7 @@ def test_missing_remote_does_not_silently_skip_checks(tmp_path, fork_history, wo
             "non_code_only": "false",
             "a2a3_changed": "true",
             "a5_changed": "true",
+            "wse_changed": "true",
             "st_affected": "true",
             "ut_affected": "true",
             "examples_only": "false",
