@@ -12,7 +12,7 @@
  * host_build_graph runtime maker (host orchestration).
  *
  * The HOST runs the orchestrator to completion, populates shared memory + the
- * prebuilt arena, and H2Ds the image; the device boots scheduler-only.
+ * compact task image, and stages it for device publication.
  *
  * register_callable_impl:
  *   - dlopens the orchestration SO on the host and resolves its entry points,
@@ -1030,7 +1030,7 @@ struct DefinitionUploads {
 // replaces each task's graph_context with an execution constructed in its own heap.
 bool bind_graph_definitions(
     Runtime *runtime, const HostApi *api, GraphHostState &graph_state, DefinitionUploads *uploads,
-    ReadyQueuePopulations *ready_queue_populations, NativeGraphHostPlan *native_plan, int32_t total_tasks
+    NativeGraphHostPlan *native_plan, int32_t total_tasks
 ) {
     *uploads = DefinitionUploads{};
     *native_plan = NativeGraphHostPlan{};
@@ -1047,8 +1047,6 @@ bool bind_graph_definitions(
         size_t object_offset;   // of the object's header, from the block base
         size_t image_bytes;     // the Definition image alone
         const std::byte *copy;  // the image to copy in, or nullptr when built in place
-        ReadyQueuePopulations ready_queue_populations;
-        bool populations_ready{false};
     };
     std::unordered_map<uint64_t, PackedDefinition> packed;
     // Objects the recorders built already occupy the arena's used prefix at the
@@ -1058,12 +1056,12 @@ bool bind_graph_definitions(
     for (const GraphHostDefinition &entry : definitions.entries) {
         if (entry.bytes < sizeof(GraphDefinition)) continue;
         if (entry.spill == nullptr) {
-            packed.emplace(entry.graph_key, PackedDefinition{entry.object_offset, entry.bytes, nullptr, {}, false});
+            packed.emplace(entry.graph_key, PackedDefinition{entry.object_offset, entry.bytes, nullptr});
             continue;
         }
         const size_t object_offset = block_bytes;
         block_bytes += align_up(sizeof(GraphDefinitionHeader) + entry.bytes);
-        packed.emplace(entry.graph_key, PackedDefinition{object_offset, entry.bytes, entry.spill, {}, false});
+        packed.emplace(entry.graph_key, PackedDefinition{object_offset, entry.bytes, entry.spill});
         uploads->spilled++;
     }
 
@@ -1173,28 +1171,6 @@ bool bind_graph_definitions(
             LOG_ERROR("host-orch: Graph runtime storage address is misaligned");
             return false;
         }
-        PackedDefinition &packed_definition = object_it->second;
-        if (!packed_definition.populations_ready) {
-            const SubTaskDefinition *tasks = graph_definition_array<SubTaskDefinition>(
-                *definition, definition->off_sub_tasks, definition->task_count
-            );
-            if (tasks == nullptr) {
-                LOG_ERROR("host-orch: invalid Graph Definition sub-task array");
-                return false;
-            }
-            for (int32_t i = 0; i < definition->task_count; ++i) {
-                // Sizing takes the kind materialize will give this task. add_task
-                // singles out GRAPH and routes everything else by shape, and a Graph
-                // body member is never the shell, so the shape decides. Derived here
-                // the same way the device derives it, so the two cannot drift.
-                const LaneMask mask(tasks[i].active_mask);
-                packed_definition.ready_queue_populations.add_task(
-                    mask, TaskAttrs(tasks[i].task_attrs), mask.is_empty() ? TaskKind::DUMMY : TaskKind::KERNEL
-                );
-            }
-            packed_definition.populations_ready = true;
-        }
-        ready_queue_populations->add(packed_definition.ready_queue_populations);
         // Protocol source capture names the original Definition by its section
         // offset. The device uses the native node map and instance bindings.
         upload->outer_slot->to_descriptor().graph_definition_offset =
@@ -1918,24 +1894,24 @@ bool create_scheduler_state(
     return true;
 }
 
-struct HostPreparePlan : RetainedHostPreparePlan<RuntimeArenaLayout> {
+struct HostPreparePlan : RetainedHostPrepareState {
     NativeGraphHostPlan native_graph;
 };
 
 int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &plan) {
-    const auto &layout = plan.layout;
-    auto &host_arena = plan.host_arena;
     void *host_sm = plan.host_sm;
     const uint64_t task_capacity = plan.task_capacity;
     const uint64_t heap_bytes = plan.heap_bytes;
     const uint64_t image_bytes = plan.image_bytes;
     const int32_t total_tasks = plan.total_tasks;
     const auto &bind_usage = plan.bind_usage;
-    const uint64_t device_arena_bytes = layout.off_copied_end + image_bytes;
+    const uint64_t device_arena_bytes = image_bytes;
     const BindPhaseMark static_arena_phase = bind_phase_begin();
     runtime->dev.sm_image_bytes = image_bytes;
     SharedMemoryHandle host_sm_handle;
-    if (!host_sm_handle.init(host_sm, plan.sm_size, task_capacity)) return PTO_RUNTIME_ERR_INTERNAL;
+    // The populated host mirror retains its reservation pitch across commit retries.
+    if (!host_sm_handle.attach_populated(host_sm, plan.sm_size, task_capacity, task_capacity, plan.sm_size))
+        return PTO_RUNTIME_ERR_INTERNAL;
     if (const int rc = api->setup_static_arena(heap_bytes, /*gm_sm_size=*/0, device_arena_bytes); rc != 0) {
         return rc;
     }
@@ -1951,8 +1927,7 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
         LOG_ERROR("%s", "host-orch: failed to acquire the pooled runtime arena");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    char *arena_dev = static_cast<char *>(device_arena);
-    void *device_sm = arena_dev + layout.off_copied_end;
+    void *device_sm = device_arena;
     runtime->set_gm_sm_ptr(device_sm);
     {
         char attrs[kBindAttrsCapacity];
@@ -1989,21 +1964,8 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     always_assert(reinterpret_cast<uint64_t>(gm_heap) % DeviceArena::kDefaultBaseAlign == 0);
     const sm_layout::HeapRebase heap_rebase{reinterpret_cast<uint64_t>(gm_heap), heap_bytes};
 
-    // One host source for one copy: the copied zone and shared-memory image at
-    // exactly the offsets they occupy on the device.
-    // Over-allocated and rounded up because every segment offset is
-    // CHIP_ALIGN_SIZE-aligned and ChipTaskSlotState is alignas(64), which a byte
-    // vector's data() is not.
-    const uint64_t copied_bytes = layout.off_copied_end - layout.off_copied_begin;
-    const uint64_t upload_bytes = copied_bytes + image_bytes;
-    // Assembled in staging the runner retains rather than in a buffer that dies
-    // with this frame: publication is a separate step, so the bytes have to still
-    // be here when it reads them. Over-allocated by the alignment the layout
-    // needs, and handed over uninitialized: what this bind writes are the copied
-    // zone and the live segments `compact_live_image` emits, so the alignment gaps
-    // between segments carry whatever the block last held. No device code reads a
-    // gap — every reader indexes a segment through the layout — which is what makes
-    // clearing the whole block per bind unnecessary rather than merely expensive.
+    // Publication reads the slot's retained staging after this prepare returns.
+    const uint64_t upload_bytes = image_bytes;
     void *staging_addr = nullptr;
     if (api->acquire_run_image_staging(static_cast<size_t>(upload_bytes), CHIP_ALIGN_SIZE, &staging_addr) != 0 ||
         staging_addr == nullptr) {
@@ -2012,26 +1974,21 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     }
     char *upload_base = static_cast<char *>(staging_addr);
 
-    // The copied zone carries no host address by construction: the orchestrator and
-    // the ops table live on the host-side OrchContext, which never enters this image.
-    std::memcpy(upload_base, static_cast<const char *>(host_arena.base()) + layout.off_copied_begin, copied_bytes);
     const uint64_t compacted = sm_layout::compact_live_image(
-        static_cast<const char *>(host_sm), task_capacity, bind_usage, heap_rebase, upload_base + copied_bytes
+        static_cast<const char *>(host_sm), task_capacity, bind_usage, heap_rebase, upload_base
     );
     always_assert(compacted == image_bytes);
 
     const sm_layout::SegmentOffsets device_segments = sm_layout::segment_offsets(sm_layout::image_extents(bind_usage));
     for (auto &instance : plan.native_graph.instances) {
-        const auto *storage =
-            reinterpret_cast<const ChipTaskStorage *>(upload_base + copied_bytes + device_segments.storage) +
-            instance.original_shell_id;
+        const auto *storage = reinterpret_cast<const ChipTaskStorage *>(upload_base + device_segments.storage) +
+                              instance.original_shell_id;
         const auto &payload = storage->payload;
         const auto &definition = plan.native_graph.definitions[instance.definition_index].definition;
         instance.boundary_tensor_count = static_cast<uint32_t>(payload.tensor_count);
         instance.boundary_scalar_count = static_cast<uint32_t>(payload.scalar_count);
         const auto image_address = [&](const void *address) {
-            return reinterpret_cast<uint64_t>(device_sm) +
-                   (static_cast<const char *>(address) - (upload_base + copied_bytes));
+            return reinterpret_cast<uint64_t>(device_sm) + (static_cast<const char *>(address) - upload_base);
         };
         instance.boundary_tensors_address = payload.tensor_count == 0 ? 0 : image_address(payload.tensors.get());
         instance.boundary_scalars_address = payload.scalar_count == 0 ? 0 : image_address(payload.scalars.get());
@@ -2040,8 +1997,7 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
         instance.args_base = instance.heap_base + definition.required_heap;
     }
     if (!create_scheduler_state(
-            runtime, api, host_sm_handle, total_tasks, task_capacity, device_segments, plan.native_graph,
-            upload_base + copied_bytes
+            runtime, api, host_sm_handle, total_tasks, task_capacity, device_segments, plan.native_graph, upload_base
         )) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -2054,16 +2010,14 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     // with the record because only this bind knows them; the rest of that
     // segment's attributes the publication rebuilds from `dev` and the length.
     runtime->set_pending_publication(
-        arena_dev + layout.off_copied_begin, upload_base, upload_bytes, bind_usage.fanin_elems, bind_usage.tensor_elems,
-        bind_usage.scalar_elems
+        device_sm, upload_base, upload_bytes, bind_usage.fanin_elems, bind_usage.tensor_elems, bind_usage.scalar_elems
     );
     return total_tasks;
 }
 
 int32_t run_host_orchestration(
-    Runtime *runtime, const HostApi *api, HostTensorAccessor &tensor_access, RuntimeContext *rt,
-    DeviceArena &host_arena, const RuntimeArenaLayout &layout, uint64_t sm_size, uint64_t task_capacity,
-    void *host_orch_func_ptr, const ChipTaskArgs &orch_l2, HostPreparePlan &plan
+    Runtime *runtime, const HostApi *api, HostTensorAccessor &tensor_access, RuntimeContext *rt, uint64_t sm_size,
+    uint64_t task_capacity, void *host_orch_func_ptr, const ChipTaskArgs &orch_l2, HostPreparePlan &plan
 ) {
     // The dep_gen graph belongs to the orchestration that is about to run.
     dep_gen_host_graph_begin_capture();
@@ -2087,7 +2041,6 @@ int32_t run_host_orchestration(
     }
     std::memset(host_sm, 0, sm_segs.storage);
 
-    // Re-point the orchestrator half at the host SM (scheduler keeps device SM).
     // Storage is retained per slot; the orchestrator and its context belong to this bind.
     auto scratch = api->get_orchestration_scratch();
     if (!scratch) {
@@ -2258,33 +2211,11 @@ int32_t run_host_orchestration(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    // Submission already classified each slot while its fields were hot.
-    ReadyQueuePopulations ready_queue_populations = orchestrator.ready_queue_populations;
-
-    // Bind Graph tasks to retained Definition addresses. The slot holds the
-    // prepared source until synchronous publication consumes it.
     DefinitionUploads definition_uploads{};
-    if (!bind_graph_definitions(
-            runtime, api, *graph_state, &definition_uploads, &ready_queue_populations, &plan.native_graph, total_tasks
-        )) {
+    if (!bind_graph_definitions(runtime, api, *graph_state, &definition_uploads, &plan.native_graph, total_tasks)) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    ReadyQueueCapacities ready_queue_capacities{};
-    const int32_t ready_queue_status = derive_ready_queue_capacities(ready_queue_populations, &ready_queue_capacities);
-    if (ready_queue_status != 0) {
-        LOG_ERROR(
-            "host-orch: ready queue reachable population exceeds %" PRIu64 " (ready=%" PRIu64 "/%" PRIu64 "/%" PRIu64
-            ", sync=%" PRIu64 "/%" PRIu64 "/%" PRIu64 ", dummy=%" PRIu64 ", graph_prepare=%" PRIu64 ")",
-            READY_QUEUE_CAPACITY_LIMIT, ready_queue_populations.ready[0], ready_queue_populations.ready[1],
-            ready_queue_populations.ready[2], ready_queue_populations.ready_sync[0],
-            ready_queue_populations.ready_sync[1], ready_queue_populations.ready_sync[2], ready_queue_populations.dummy,
-            ready_queue_populations.graph_prepare
-        );
-        LOG_RUNTIME_FAILURE(SIMPLER_ERROR_NONE, SIMPLER_ERROR_READY_QUEUE_OVERFLOW, ready_queue_status);
-        return ready_queue_status;
-    }
-    rt->prebuilt_layout.sched.capacities = ready_queue_capacities;
     host_phase_trace_note_submitted(static_cast<uint64_t>(total_tasks));
 
     // The count travels inside the header the restack copies wholesale, which is
@@ -2318,13 +2249,13 @@ int32_t run_host_orchestration(
     runtime->dev.sm_image_bytes = image_bytes;
 
     // Only now are both sizes known, so this is where the two device regions are
-    // committed: the arena up to its shared-memory tail, and the graph heap to the
+    // committed: the compact task image arena, and the graph heap to the
     // bytes orchestration actually handed out. setup_static_arena commits per
     // region and short-circuits a request an existing one already covers, so a
     // repeated workload pays for neither twice and the heap is grow-only across a
     // Worker's binds.
-    // The compact shared-memory image is the only per-run tail in the device
-    // arena. GraphExecution is initialized later in each outer Graph heap.
+    // The runtime arena contains only the compact shared-memory image.
+    // GraphExecution is initialized later in each outer Graph heap.
     // A graph whose every output is caller-owned allocates nothing, but its tasks
     // still carry the window's base as their zero-length packed buffer, so the
     // region has to exist for that address to be rebasable. Asking for 0 would
@@ -2384,7 +2315,6 @@ int resume_host_plan(Runtime *runtime, const HostApi *api, const std::shared_ptr
     runtime->dev.host_total_tasks = result;
     void *device_arena = api->acquire_pooled_runtime_arena();
     if (device_arena == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-    runtime->set_prebuilt_arena(device_arena, plan->layout.off_runtime);
     plan->committed = true;
     if (api->get_prepare_plan() != plan) {
         dep_gen_host_graph_restore_for_export(&plan->diagnostic_graph, plan->diagnostic_outcome);
@@ -2738,71 +2668,21 @@ extern "C" int bind_callable_to_runtime_impl(
         record_bind_phase(HostPhaseKind::BindArgs, args_phase, attrs);
     }
 
-    // Lay out the per-Worker static device arena. The GM heap and the prebuilt
-    // runtime arena are two independent pooled device allocations, and neither is
-    // committed here: the arena's size is known only once orchestration has
-    // submitted its tasks, and the heap's only once orchestration has allocated
-    // its intermediate buffers. Both are committed by the single
-    // setup_static_arena in run_host_orchestration. Owned by DeviceRunner across
-    // runs — do NOT record in tensor_leases(); the free is deferred to
-    // DeviceRunner::finalize(). The runtime-arena size is determined by replaying
-    // the reserve sequence on a host-side arena.
-    uint64_t sm_size = SharedMemoryHandle::calculate_size(task_capacity);
-
-    const BindPhaseMark arena_build_phase = bind_phase_begin();
+    const uint64_t sm_size = SharedMemoryHandle::calculate_size(task_capacity);
     auto plan = std::make_shared<HostPreparePlan>();
     plan->staging_bytes = required_temp_bytes == 0 ? 0 : required_temp_bytes + RetainedTempBump::kAlignment - 1;
     size_t staging_capacity = 0;
     api->get_retained_temp_buffer(&plan->staging_backing, &staging_capacity);
-    DeviceArena &host_arena = plan->host_arena;
-    RuntimeArenaLayout &layout = plan->layout;
-    layout = runtime_reserve_layout(host_arena, task_capacity);
-    if (host_arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
-        LOG_ERROR("Failed to commit host arena for prebuilt runtime image");
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    {
-        char attrs[kBindAttrsCapacity];
-        snprintf(attrs, sizeof(attrs), "bytes=%" PRIu64, static_cast<uint64_t>(layout.arena_size));
-        record_bind_phase(HostPhaseKind::BindArenaBuild, arena_build_phase, attrs);
-    }
-
-    // Set up orchestration state (consumed by the host orchestrator below)
     runtime->set_orch_args(device_args);
 
-    // -------------------------------------------------------------------------
-    // Build the prebuilt runtime-arena image on host.
-    //
-    // We pre-compute every byte the AICPU's runtime arena would otherwise have
-    // to write at boot: layout offsets, sub-structure init data, and pointers
-    // back to the SM / GM heap. Then we rtMemcpy the image into the pooled
-    // runtime-arena region that DeviceRunner keeps alive across runs. AICPU
-    // boot becomes attach + wire (cheap pointer fixup) + sm_handle->init (SM
-    // reset) + a handful of device-only field fixups.
-    // -------------------------------------------------------------------------
-    const BindPhaseMark runtime_init_phase = bind_phase_begin();
-    // No SM base: the scheduler and sm_handle are device-written now, so nothing
-    // here stores one, and the region is not even committed yet.
-    RuntimeContext *rt =
-        runtime_init_data_from_layout(host_arena, layout, MODE_EXECUTE, /*sm_dev_base=*/nullptr, sm_size);
-    if (rt == nullptr) {
-        LOG_ERROR("runtime_init_data_from_layout failed");
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    runtime_wire_arena_pointers(host_arena, layout, rt);
-    // Stash the layout inside the RuntimeContext image so the AICPU can recover every
-    // arena-internal offset after the copy. It is written before orchestration
-    // because orchestration assembles the image this header is part of, and the
-    // publication uploads what it assembled. The runtime arena's device base does
-    // NOT travel — it is on the host Runtime (set_prebuilt_arena below), since the
-    // AICPU needs that pointer before it can dereference the image.
-    rt->prebuilt_layout = layout;
-    record_bind_phase(HostPhaseKind::BindRuntimeInit, runtime_init_phase);
+    // Only the host orchestration API reaches this context. The device consumes
+    // the compact task image and the independent scheduler bootstrap.
+    RuntimeContext rt{};
+    rt.mode = MODE_EXECUTE;
 
     // host_build_graph host-orch: run the orchestrator on the host now, against
-    // a host SM mirror, and ship the populated SM to the device. The arena
-    // (copied to the device below) carries the scheduler state; the orchestrator
-    // itself stays on the host, and the device boots scheduler-only.
+    // a host SM mirror. Commit stages the compact task image and resident state
+    // for the launch-owned publication.
     // register_callable_impl guarantees host_orch_func_ptr is non-null on success
     // (it fails the whole prepare otherwise), so this is an assertion-style
     // guard, not a fallback path.
@@ -2814,8 +2694,7 @@ extern "C" int bind_callable_to_runtime_impl(
         ChipTaskArgs orch_l2;
         orch_l2.create_from_entry_storage(runtime->get_orch_args());
         int32_t total_tasks = run_host_orchestration(
-            runtime, api, tensor_access, rt, host_arena, layout, sm_size, task_capacity, host_orch_func_ptr, orch_l2,
-            *plan
+            runtime, api, tensor_access, &rt, sm_size, task_capacity, host_orch_func_ptr, orch_l2, *plan
         );
         const BindPhaseMark view_close_phase = bind_phase_begin();
         tensor_access.close();
@@ -2872,11 +2751,7 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
         return metadata_rc;
     }
     {
-        // The image size and the task count are on the descriptor this bind
-        // filled, and the copied zone is what the length has left over, so only
-        // the pool counters had to travel.
         const uint64_t image_bytes = runtime->dev.sm_image_bytes;
-        const uint64_t copied_bytes = publication.bytes - image_bytes;
         // The widest attribute string a segment formats: eight uint64 fields plus
         // their labels. With the counters ahead of it in the recorded string, this
         // is the tail a truncation eats first. `dest` leads instead, because the
@@ -2885,10 +2760,9 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
         char attrs[kBindAttrsCapacity];
         snprintf(
             attrs, sizeof(attrs),
-            "dest=%p nt=%" PRIu64 " bytes=%" PRIu64 " copied=%" PRIu64 " sm=%" PRIu64 " args=%" PRIu64 "/%" PRIu64
-            "/%" PRIu64,
+            "dest=%p nt=%" PRIu64 " bytes=%" PRIu64 " copied=0 sm=%" PRIu64 " args=%" PRIu64 "/%" PRIu64 "/%" PRIu64,
             publication.device_target, static_cast<uint64_t>(runtime->dev.host_total_tasks), publication.bytes,
-            copied_bytes, image_bytes, publication.fanin_elems, publication.tensor_elems, publication.scalar_elems
+            image_bytes, publication.fanin_elems, publication.tensor_elems, publication.scalar_elems
         );
         record_bind_phase(HostPhaseKind::BindImageStage, staging_phase, attrs, publication.bytes);
     }

@@ -54,12 +54,12 @@ addresses populate the per-run dispatch table.
 For each run, the host:
 
 1. validates and stages external tensors into a run-owned host accessor;
-2. reserves one backing arena for runtime/shared-memory subregions;
+2. acquires a retained host shared-memory mirror and initializes a host-local orchestration context;
 3. binds the runtime to the orchestration DSO;
 4. calls the orchestration entry synchronously;
 5. finalizes task counts and records the prepared metadata sources in Runtime's host-only pending publication;
-6. returns from bind, then synchronously publishes Definitions, any resident
-   scheduler state, and finally the shared-memory image with the copied zone.
+6. returns from bind, then publishes resident scheduler metadata and the compact
+   shared-memory image through launch-owned staging.
 
 The exclusive pipeline slot retains only `OrchestrationScratch`: TensorMap
 arrays and the fan-in epoch array. Each bind owns a fresh `OrchestratorState`,
@@ -83,10 +83,11 @@ empties the map. With default capacities the arrays retain approximately
 8.72 MiB per used slot until finalization. Pool-size changes can temporarily
 hold old and replacement arrays. No new lock or device allocation is involved.
 
-Ready-queue populations are accumulated when a task slot receives its final
-classification. Ordinary tasks, hidden allocation tasks and outer Graph tasks
-participate; Graph definition populations are still combined at bind. Output
-layout entries are initialized and read only at `OUTPUT` argument positions.
+The shared orchestrator accumulates queue-population counters when a task slot
+receives its final classification. A5 does not aggregate Graph definition
+populations or use those counters to size resident queues. `create_scheduler_state`
+plans the resident ready pool from task metadata and launch topology. Output layout
+entries are initialized and read only at `OUTPUT` argument positions.
 
 `publish_run_image_impl` is the single metadata consumer. Definition and compact
 image sources are retained by the exclusive pipeline slot; A5 scheduler source
@@ -213,50 +214,40 @@ correct for the layout it was taken in, so `compact_live_image` re-takes every o
 of them against the shipped image; the copy to the device moves a field and its
 target together and leaves them all correct.
 
-### 3.1 What Ships: the Arena's Two Zones
+### 3.1 What Ships: Task Image and Resident State
 
-Three rules decide every byte of the runtime arena:
+A5's pooled runtime arena contains exactly the compact shared-memory task image.
+`gm_sm_ptr` names the allocation's base, and `sm_image_bytes` is both its requested
+size and its publication length. Every segment offset is relative to that base;
+there is no runtime header or device-only prefix before it.
 
-1. **Whoever generates a value writes it.** Content the host generates is written
-   on the host and copied down. Content that is a function of the *layout* rather
-   than of the *run* is written by the side that reads it.
-2. **A copy carries per-run content, never an initialization pattern.** Shipping
-   bytes the device could derive from the layout spends link bandwidth
-   transporting a constant.
-3. **Initialize once.** A region whose content does not differ between runs is
-   established once, not re-established per bind.
+| Storage | Contents | Ownership and publication |
+| ------- | -------- | ------------------------- |
+| compact task image | shared-memory header, live task storage and argument/dependency pools | exclusive pipeline slot; one retained staging source and one image publication |
+| resident scheduler backing | run control, worker contexts, ready queues, native graph image, dispatch payloads and optional async/diagnostic state | independent scheduler storage; published before the task image |
+| graph heap | per-run task buffers and Graph execution argument/storage tails | independent pooled allocation; task addresses rebased before publication |
+| Host orchestration context | `RuntimeContext`, `OrchContext`, `OrchestratorState` and borrowed scratch | Host only; never published |
 
-They partition the arena into two contiguous zones, and `runtime_reserve_layout`
-reserves them in this order:
+A5 does not reserve, wire or initialize the common arena's `SharedMemoryHandle`,
+`SchedulerState`, AICPU ready/early/sync/dummy/graph queues or completion mailbox.
+Its launch descriptor's prebuilt-arena base and runtime offset stay zero. AICPU
+starts from `scheduler_bootstrap` and the report/READY lifecycle; workers receive
+resident contexts through that bootstrap, independently of the task image base.
+A2A3 and WSE still use the common full arena lifecycle for their active executors.
 
-| Zone | Regions | Copied | Allocated on device | Written by |
-| ---- | ------- | ------ | ------------------- | ---------- |
-| device-only | shared arena regions: `sm_handle`, completion mailbox, `SchedulerState` and queue slot arrays | never | yes | retained shared layout; resident does not dispatch through these queues |
-| copied | `[off_copied_begin, off_copied_end)`: the runtime header | whole zone, one copy | yes | host |
+The host-local `RuntimeContext` lives until the orchestration callback and its
+recorders have joined. Its inline-completion scalar is bookkeeping for the common
+orchestration API; the A5 scheduler plan derives completed nodes from the host
+SM. A retained prepare plan stores callback results, leases and diagnostic sources,
+so a resource-wait retry needs neither this stack object nor a second callback.
+Commit attaches to the populated host mirror at its reservation pitch without
+resetting its task count or execution header. This also holds across resource-wait
+retries. The slot's staging remains alive until launch publication or failed-prepare cleanup.
 
-The copied zone comes last, so `bind` is a single contiguous `copy_to_device`
-starting at `off_copied_begin` — and the device's shared-memory tail begins
-exactly where that zone ends. Both bounds are layout fields, so no consumer infers
-a boundary from which region happens to be reserved first —
-`bind_callable_to_runtime_impl` asserts only that they are ordered and in range.
-
-**Why the orchestrator is not in the arena at all.** hbg has no device-side
-orchestrator, so nothing on the device reads its state: not the `fanin_seen_epoch`
-table, not the scope arrays, not the TensorMap (~9.3 MB between them). It is
-therefore a plain host object that owns those arrays — `OrchestratorState::init`
-allocates them — and the host-side `OrchContext` is what reaches it, through a
-pointer `RuntimeContext` does not carry, so no host address can cross the boundary
-in the first place. A `static_assert` keeps `RuntimeContext` trivially copyable,
-which is what forbids putting an owning member back inside it. The one orchestrator
-value the device-side scheduler reads, the count of tasks completed inline during
-orchestration, is a scalar `rt_orchestration_done` publishes into the runtime header.
-
-The shared arena producer still reserves and wires `SchedulerState`, mailbox
-and queue regions. These allocations do not select an execution path: resident
-uses the separately planned scheduler backing, its two business ready queues,
-control inboxes and async image. Removing the unused shared allocations requires
-a coordinated arena-layout change across its current producers and consumers.
-The presence of a reserved region does not permit running a second A5 scheduler.
+`BindStaticArena` reports the compact image request. `BindImageStage` reports
+`copied=0` and `bytes=sm=sm_image_bytes`; A5 emits no `BindArenaBuild` or
+`BindRuntimeInit` phase. Resident ready-pool sizing and shape/capacity validation
+apply to the actual execution plan, without an AICPU queue-population gate.
 
 ### 3.2 Bounded H2D Upload
 
