@@ -149,6 +149,12 @@ destroy_device_context(ctx);
 free(runtime);
 ```
 
+The `prepare -> launch -> wait -> finalize` split is the host head and tail
+around a CANN stream submission, not a second device queue. The stream orders
+the device operations; the run pipeline owns the host preparation and the
+per-run resources those operations read. See
+[Run Pipeline and the KernelLaunch Stream](run-pipeline.md) for the boundary.
+
 ### Layer 3: Python API (`python/bindings/task_interface.cpp` via nanobind)
 
 ```python

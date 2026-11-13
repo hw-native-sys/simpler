@@ -112,6 +112,7 @@ nav:
       - Chip-Level Architecture: chip-level-arch.md
       - Hierarchical Level Runtime: hierarchical-level-runtime.md
       - Task Flow: task-flow.md
+      - Run Pipeline and the KernelLaunch Stream: run-pipeline.md
       - Buffer Memory Model: buffer-abi.md
       - HBG host data access: hbg-host-data-access.md
       - Orchestrator: orchestrator.md
