@@ -21,7 +21,8 @@
 
 namespace pto::comm {
 enum class DmaEngine : uint8_t;
-}
+enum class AsyncSubmitMode : uint8_t { IMMEDIATE, DEFER, DEFER_AND_SUBMIT };
+}  // namespace pto::comm
 
 namespace {
 uint32_t total_wait_calls = 0;
@@ -31,6 +32,11 @@ struct TestSession {
     uint8_t *contextGm{};
     uint32_t destRankId{1};
     uint32_t qpIdxBase{2};
+    pto::comm::AsyncSubmitMode submitMode{pto::comm::AsyncSubmitMode::IMMEDIATE};
+    uint32_t batchSize{UINT32_MAX};
+    mutable uint32_t batchLogicalWqes{};
+    mutable uint32_t batchStagedOps{};
+    mutable std::array<uint32_t, 8> batchStagedWqes{};
     struct {
         struct {
             uint32_t qpCount{2};
@@ -76,6 +82,7 @@ using Stride = Shape<Dims...>;
 template <typename T>
 struct TestAddress {
     uint64_t bytes;
+    explicit operator const void *() const { return reinterpret_cast<const void *>(bytes); }
     TestAddress operator+(uint64_t elements) const { return {bytes + elements * sizeof(T)}; }
 };
 
@@ -119,6 +126,7 @@ uint32_t get_block_idx() = delete;
 
 #include "urma/urma_request.h"
 #include "backend/urma/urma_completion_kernel.h"
+#include "runtime_core.h"
 #include "scheduler/scheduler_context.h"
 #include <pto/comm/async/urma/urma_types.hpp>
 
@@ -129,12 +137,18 @@ struct Submission {
     uint64_t src;
     std::array<int64_t, 5> shape;
     std::array<int64_t, 5> stride;
+    pto::comm::AsyncSubmitMode mode;
 };
 struct PostScript {
     std::vector<TestEvent> events;
     std::vector<Submission> submissions;
     uint32_t activation_calls{};
     bool post_from_queue{};
+    uint32_t fail_batch_post{};
+    bool invalid_flush_event{};
+    const volatile uint32_t *batch_completion_count{};
+    std::vector<uint32_t> completion_counts_before_post;
+    std::vector<uint32_t> doorbells;
 };
 PostScript *active_script = nullptr;
 }  // namespace
@@ -149,12 +163,59 @@ void ActivateEngineState(AsyncSession &session) {
     session.cfg.urma.qpCount = 0;
 }
 }  // namespace detail
+AsyncEvent post_batch_for_test(const AsyncSession &session, uint32_t wqes) {
+    auto &script = *active_script;
+    script.completion_counts_before_post.push_back(static_cast<uint32_t>(*script.batch_completion_count));
+    const uint32_t jetties = session.cfg.urma.qpCount;
+    for (uint32_t n = 0; n < wqes; ++n) {
+        ++session.batchStagedWqes[session.batchLogicalWqes++ % jetties];
+    }
+    const bool flush =
+        ++session.batchStagedOps == session.batchSize || session.submitMode == AsyncSubmitMode::DEFER_AND_SUBMIT;
+    const bool fail = script.submissions.size() == script.fail_batch_post;
+    auto *info = reinterpret_cast<urma::UrmaInfo *>(session.contextGm);
+    auto *queues = reinterpret_cast<urma::UrmaWQCtx *>(info->sqPtr);
+    TestEvent event{};
+    event.urmaJettyBase = session.qpIdxBase;
+    event.urmaJettyCount = jetties;
+    for (uint32_t j = 0; j < jetties; ++j) {
+        uint32_t row = 0;
+        EXPECT_TRUE(simpler::urma::queue_row_for(session.contextGm, session.destRankId, session.qpIdxBase + j, row));
+        auto &queue = queues[row];
+        auto *head = reinterpret_cast<uint32_t *>(queue.headAddr);
+        const uint32_t staged = session.batchStagedWqes[j];
+        if (flush && staged != 0 && !fail) {
+            *head += staged;
+            queue.submittedWqeCount += staged;
+            *reinterpret_cast<uint32_t *>(queue.dbAddr) = *head;
+            script.doorbells.push_back(row);
+        }
+        event.urmaTargetBbPerJetty[j] = *head + (flush ? 0 : staged);
+        event.urmaTargetCqePerJetty[j] = queue.submittedWqeCount + (flush ? 0 : staged);
+    }
+    if (flush) {
+        session.batchStagedWqes = {};
+        session.batchStagedOps = 0;
+    }
+    if (flush && script.invalid_flush_event) event.urmaJettyCount = 0;
+    event.handle = fail ? 0 : (static_cast<uint64_t>(session.destRankId) << 32) | event.urmaTargetBbPerJetty[0];
+    event.postFailed = fail;
+    return event;
+}
+
 template <typename Dst, typename Src>
 AsyncEvent post_for_test(bool put, Dst dst, Src src, const AsyncSession &session) {
     auto &script = *active_script;
-    script.submissions.push_back({put, dst.data().bytes, src.data().bytes, dst.shape.values, dst.stride.values});
+    script.submissions.push_back(
+        {put, dst.data().bytes, src.data().bytes, dst.shape.values, dst.stride.values, session.submitMode}
+    );
     EXPECT_EQ(src.shape.values, dst.shape.values);
     EXPECT_EQ(src.stride.values, dst.stride.values);
+    if (session.submitMode != AsyncSubmitMode::IMMEDIATE) {
+        EXPECT_TRUE(put);
+        const uint64_t bytes = static_cast<uint64_t>(src.shape.values[4]) * sizeof(typename Src::RawDType);
+        return post_batch_for_test(session, simpler::urma::chunk_count(bytes));
+    }
     if (script.post_from_queue) {
         auto *info = reinterpret_cast<urma::UrmaInfo *>(session.contextGm);
         auto *queues = reinterpret_cast<urma::UrmaWQCtx *>(info->sqPtr);
@@ -201,19 +262,28 @@ AsyncEvent TPUT_ASYNC(Dst dst, Src src, const AsyncSession &session) {
 
 class SchedulerRetirementTestPeer {
 public:
-    static void finish_failed_submission(
+    static bool finish_failed_submission(
         SchedulerContext &context, SchedulerState &scheduler, const DeferredCompletionSlab &slab,
-        ChipTaskSlotState &producer, int32_t &completed, ChipTaskSlotState **release, int32_t &release_count
+        ChipTaskSlotState &producer, int32_t &completed, ChipTaskSlotState **release, int32_t &release_count,
+        RuntimeContext *runtime = nullptr, bool aborting = false
     ) {
         context.sched_ = &scheduler;
+        context.rt_ = runtime;
         context.deferred_slab_per_core_[0][0] = slab;
-        context.complete_slot_task(
+        context.deferred_slabs_initialized_[0] = true;
+        context.cores_total_num_ = 1;
+        context.completed_.store(aborting);
+        return context.complete_slot_task(
             producer, 0, SubtaskSlot::AIV0, 0, 0, nullptr, completed, release, release_count
 #if SIMPLER_DFX
             ,
             0, 0
 #endif
         );
+    }
+
+    static uint32_t preserved_count(const SchedulerContext &context) {
+        return context.deferred_slab_per_core_[0][0].count;
     }
 };
 
@@ -1287,3 +1357,367 @@ TEST_P(A5UrmaChunkedSubmission, PartialFailureFinishesReservationWithSubmittedPr
 }
 
 INSTANTIATE_TEST_SUITE_P(GetAndPut, A5UrmaChunkedSubmission, testing::Values(UrmaOp::TGET, UrmaOp::TPUT));
+
+class A5UrmaBatchSubmission : public testing::Test,
+                              public RegistrationFixture {
+protected:
+    using Shape = pto::Shape<1, 1, 1, 1, pto::DYNAMIC>;
+    using Stride = pto::Stride<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, 1>;
+    using Tensor = pto::GlobalTensor<float, Shape, Stride>;
+    using Request = UrmaRequestDescriptor<Tensor, Tensor>;
+    using Mode = pto::comm::AsyncSubmitMode;
+
+    static constexpr uint64_t kSrcBase = 0x200000000ULL;
+    static constexpr uint64_t kDstBase = 0x100000000ULL;
+    static constexpr uint64_t kPeerMappedBase = 0x300000000ULL;
+    CommContext domain{};
+    GlobalContext global{};
+    std::array<pto::comm::urma::UrmaMemInfo, 8> peer_mrs{};
+    PostScript script;
+
+    void SetUp() override {
+        domain.rankNum = 2;
+        domain.winSize = 512 * 1024 * 1024;
+        domain.windowsIn[0] = kSrcBase;
+        domain.windowsIn[1] = kPeerMappedBase;
+        ASSERT_TRUE(
+            set_comm_workspace(domain, CommWorkspaceKind::URMA, reinterpret_cast<uint64_t>(workspace()), sizeof(info))
+        );
+        info.memPtr = reinterpret_cast<uint64_t>(peer_mrs.data());
+        for (uint32_t row = info.rowsPerPeer; row < peer_mrs.size(); ++row) {
+            peer_mrs[row].addr = kDstBase;
+            peer_mrs[row].len = domain.winSize;
+        }
+        global.urma_batch_guard = URMA_BATCH_GUARD;
+        script.batch_completion_count = ctx.completion_count;
+        active_script = &script;
+    }
+    void TearDown() override { active_script = nullptr; }
+
+    Request put(uint64_t offset = 0, int64_t elems = 8) {
+        const Stride stride(elems, elems, elems, elems, 1);
+        const Shape shape(1, 1, 1, 1, elems);
+        return UrmaTput(
+            Tensor({kDstBase + offset}, shape, stride), Tensor({kSrcBase + offset}, shape, stride), workspace(), 1
+        );
+    }
+
+    bool submit_batch(const Request *requests, uint32_t count, uint32_t batch_size = UINT32_MAX) {
+        LocalContext local{};
+        local.async_ctx = ctx;
+        std::array<int64_t, PAYLOAD_GLOBAL_CONTEXT_INDEX + 1> args{};
+        args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<int64_t>(&local);
+        args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<int64_t>(&global);
+        return send_urma_put_batch(args.data(), domain, requests, count, batch_size);
+    }
+
+    void expect_accounted_error(int32_t code) { EXPECT_EQ(slab.error_code, code | DEFERRED_ERROR_DMA_ACCOUNTED); }
+
+    void expect_target(uint32_t slot, uint32_t row, uint32_t bb, uint32_t cqe) {
+        EXPECT_EQ(slab.entries[slot].addr, (static_cast<uint64_t>(row) << 32) | bb);
+        EXPECT_EQ(slab.entries[slot].expected_value, cqe);
+        EXPECT_EQ(slab.entries[slot].engine, COMPLETION_ENGINE_URMA);
+        EXPECT_EQ(slab.entries[slot].completion_type, COMPLETION_TYPE_URMA_EVENT_HANDLE);
+        EXPECT_EQ(slab.entries[slot].backend_cookie, reinterpret_cast<uint64_t>(workspace()));
+    }
+};
+
+TEST_F(A5UrmaBatchSubmission, ThresholdPublishesEveryJettyAndLastNonemptyRequestFlushesTail) {
+    const Request requests[]{put(0, 0), put(32), put(64), put(96, 0), put(128), put(160, 0)};
+    sq_head[6] = 14;
+    sq_tail[6] = 14;
+    sq[6].submittedWqeCount = 11;
+    cq_tail[6] = 11;
+    ASSERT_TRUE(submit_batch(requests, std::size(requests), 2));
+    EXPECT_EQ(script.activation_calls, 1u);
+    ASSERT_EQ(script.submissions.size(), 3u);
+    EXPECT_EQ(script.submissions[0].mode, Mode::DEFER);
+    EXPECT_EQ(script.submissions[1].mode, Mode::DEFER);
+    EXPECT_EQ(script.submissions[2].mode, Mode::DEFER_AND_SUBMIT);
+    EXPECT_EQ(script.submissions[2].src, requests[4].src.data().bytes);
+    EXPECT_EQ(script.completion_counts_before_post, (std::vector<uint32_t>{0, 0, 0}));
+    EXPECT_EQ(script.doorbells, (std::vector<uint32_t>{6, 7, 6}));
+    ASSERT_EQ(slab.count, 2u);
+    expect_target(0, 6, 16, 13);
+    expect_target(1, 7, 1, 1);
+}
+
+TEST_F(A5UrmaBatchSubmission, BatchSizeOneFlushesEachRequestAndPreservesRotation) {
+    const Request requests[]{put(0), put(32), put(64)};
+    ASSERT_TRUE(submit_batch(requests, std::size(requests), 1));
+    EXPECT_EQ(script.completion_counts_before_post, (std::vector<uint32_t>{0, 0, 0}));
+    EXPECT_EQ(script.doorbells, (std::vector<uint32_t>{6, 7, 6}));
+    ASSERT_EQ(slab.count, 2u);
+    expect_target(0, 6, 2, 2);
+    expect_target(1, 7, 1, 1);
+}
+
+TEST_F(A5UrmaBatchSubmission, FinalFlushIncludesFragmentedRequestAndCounterWrap) {
+    constexpr int64_t chunk_elems = pto::comm::urma::kUrmaMaxWqeTransferBytes / sizeof(float);
+    const Request requests[]{put(0, chunk_elems + 32), put((chunk_elems + 32) * sizeof(float))};
+    sq_head[6] = UINT32_MAX - 1;
+    sq_tail[6] = UINT32_MAX - 1;
+    sq[6].submittedWqeCount = UINT32_MAX;
+    cq_tail[6] = UINT32_MAX;
+    ASSERT_TRUE(submit_batch(requests, std::size(requests)));
+    ASSERT_EQ(script.submissions.size(), 2u);
+    EXPECT_EQ(script.submissions[0].shape.back(), chunk_elems + 32);
+    EXPECT_EQ(script.completion_counts_before_post, (std::vector<uint32_t>{0, 0}));
+    EXPECT_EQ(script.doorbells, (std::vector<uint32_t>{6, 7}));
+    ASSERT_EQ(slab.count, 2u);
+    expect_target(0, 6, 0, 1);
+    expect_target(1, 7, 1, 1);
+}
+
+TEST_F(A5UrmaBatchSubmission, RejectsPublicationWithoutHostReclamationGuard) {
+    global.urma_batch_guard = 0;
+    const Request requests[]{put()};
+    EXPECT_FALSE(submit_batch(requests, 1));
+    expect_accounted_error(SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    EXPECT_TRUE(script.submissions.empty());
+    EXPECT_EQ(slab.count, 0u);
+}
+
+TEST_F(A5UrmaBatchSubmission, QueueAndSlabCapacityRejectWholeListBeforeAnyPost) {
+    const Request requests[]{put(0), put(32), put(64)};
+    ctx.completion_capacity = 1;
+    ASSERT_FALSE(submit_batch(requests, std::size(requests), 1));
+    expect_accounted_error(SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
+    EXPECT_TRUE(script.submissions.empty());
+    EXPECT_EQ(slab.count, 0u);
+
+    slab.error_code = SIMPLER_ERROR_NONE;
+    ctx.completion_capacity = MAX_COMPLETIONS_PER_TASK;
+    sq_head[6] = 15;
+    ASSERT_FALSE(submit_batch(requests, std::size(requests), 1));
+    expect_accounted_error(SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    EXPECT_TRUE(script.submissions.empty());
+    EXPECT_EQ(slab.count, 0u);
+}
+
+TEST_F(A5UrmaBatchSubmission, PreexistingErrorKeepsItsOriginalDmaStatus) {
+    const Request request = put();
+    slab.error_code = SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW;
+    EXPECT_FALSE(submit_batch(&request, 1));
+    EXPECT_EQ(slab.error_code, SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
+    EXPECT_TRUE(script.submissions.empty());
+}
+
+TEST_F(A5UrmaBatchSubmission, RejectsPeerWorkspaceOrOperationChangeBeforeFirstPost) {
+    Request requests[]{put(0), put(32)};
+    requests[1].remote_rank = 0;
+    EXPECT_FALSE(submit_batch(requests, std::size(requests), 1));
+    slab.error_code = SIMPLER_ERROR_NONE;
+    requests[1] = put(32);
+    requests[1].workspace = nullptr;
+    EXPECT_FALSE(submit_batch(requests, std::size(requests), 1));
+    slab.error_code = SIMPLER_ERROR_NONE;
+    requests[1] = put(32);
+    requests[1].op = UrmaOp::TGET;
+    EXPECT_FALSE(submit_batch(requests, std::size(requests), 1));
+    expect_accounted_error(SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    EXPECT_TRUE(script.submissions.empty());
+}
+
+TEST_F(A5UrmaBatchSubmission, RejectsUnregisteredSourceOrDestinationBeforeAnyPost) {
+    Request requests[]{put(0), put(32)};
+    requests[1].src.address.bytes = kSrcBase + domain.winSize - 1;
+    EXPECT_FALSE(submit_batch(requests, std::size(requests), 1));
+    slab.error_code = SIMPLER_ERROR_NONE;
+    requests[1] = put(32);
+    requests[1].dst.address.bytes = kPeerMappedBase;
+    EXPECT_FALSE(submit_batch(requests, std::size(requests), 1));
+    slab.error_code = SIMPLER_ERROR_NONE;
+    requests[1] = put(32);
+    peer_mrs[info.rowsPerPeer].len = 63;
+    EXPECT_FALSE(submit_batch(requests, std::size(requests), 1));
+    expect_accounted_error(SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    EXPECT_TRUE(script.submissions.empty());
+    EXPECT_EQ(slab.count, 0u);
+}
+
+TEST_F(A5UrmaBatchSubmission, RejectsDomainsWithoutAnOrdinaryDevicePeerMapping) {
+    const Request request = put();
+    domain.windowsIn[1] = 0;
+    EXPECT_FALSE(submit_batch(&request, 1));
+    expect_accounted_error(SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    EXPECT_TRUE(script.submissions.empty());
+    EXPECT_EQ(slab.count, 0u);
+}
+
+TEST_F(A5UrmaBatchSubmission, InvalidIsaExtentInLaterRequestRejectsBeforeFirstPost) {
+    const Request requests[]{put(0), put(32, int64_t{INT32_MAX} + 1)};
+    EXPECT_FALSE(submit_batch(requests, std::size(requests), 1));
+    expect_accounted_error(SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    EXPECT_TRUE(script.submissions.empty());
+    EXPECT_EQ(slab.count, 0u);
+}
+
+TEST_F(A5UrmaBatchSubmission, EmptyAndZeroLengthListsDoNotBuildOrPublish) {
+    const Request requests[]{put(0, 0), put(32, 0)};
+    EXPECT_TRUE(submit_batch(static_cast<const Request *>(nullptr), 0));
+    EXPECT_TRUE(submit_batch(requests, std::size(requests)));
+    EXPECT_EQ(script.activation_calls, 0u);
+    EXPECT_TRUE(script.submissions.empty());
+    EXPECT_EQ(slab.count, 0u);
+}
+
+TEST_F(A5UrmaBatchSubmission, FailureAfterThresholdRetainsPublishedTargetsAndDropsStagedTail) {
+    const Request requests[]{put(0), put(32), put(64), put(96)};
+    script.fail_batch_post = 3;
+    ASSERT_FALSE(submit_batch(requests, std::size(requests), 2));
+    expect_accounted_error(SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    EXPECT_EQ(script.submissions.size(), 3u);
+    EXPECT_EQ(script.doorbells, (std::vector<uint32_t>{6, 7}));
+    ASSERT_EQ(slab.count, 2u);
+    expect_target(0, 6, 1, 1);
+    expect_target(1, 7, 1, 1);
+}
+
+TEST_F(A5UrmaBatchSubmission, RejectedTailFlushRetainsOnlyPreviouslyPublishedTargets) {
+    const Request requests[]{put(0), put(32), put(64)};
+    script.fail_batch_post = 3;
+    ASSERT_FALSE(submit_batch(requests, std::size(requests), 2));
+    expect_accounted_error(SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    EXPECT_EQ(script.doorbells, (std::vector<uint32_t>{6, 7}));
+    ASSERT_EQ(slab.count, 2u);
+    expect_target(0, 6, 1, 1);
+    expect_target(1, 7, 1, 1);
+}
+
+TEST_F(A5UrmaBatchSubmission, MalformedFlushEventCannotSupplyCompletionProof) {
+    const Request request = put();
+    script.invalid_flush_event = true;
+    ASSERT_FALSE(submit_batch(&request, 1));
+    EXPECT_EQ(slab.error_code, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
+    EXPECT_EQ(script.doorbells, (std::vector<uint32_t>{6}));
+    EXPECT_EQ(slab.count, 0u);
+}
+
+TEST_F(A5UrmaBatchSubmission, FailedBatchFinLeavesDmaForAbortDespitePendingNotification) {
+    const Request requests[]{put(0), put(32), put(64), put(96)};
+    script.fail_batch_post = 3;
+    ASSERT_FALSE(submit_batch(requests, std::size(requests), 2));
+    ASSERT_EQ(slab.count, 2u);
+    uint32_t notification = 0;
+    ASSERT_TRUE(register_completion_condition(
+        ctx, {reinterpret_cast<uint64_t>(&notification), 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0}
+    ));
+
+    auto context = std::make_unique<SchedulerContext>();
+    auto runtime = std::make_unique<RuntimeContext>();
+    auto header = std::make_unique<SharedMemoryHeader>();
+    auto mailbox = std::make_unique<AICoreCompletionMailbox>();
+    runtime->aicore_mailbox = mailbox.get();
+    runtime->scheduler.sm_header = header.get();
+    runtime->orchestrator.sm_header = header.get();
+    runtime_finalize_after_wire(runtime.get(), 1, 1);
+    header->sched_error_code.store(SIMPLER_ERROR_NONE);
+    ChipTaskSlotState producer{};
+    TaskPayload payload{};
+    TaskDescriptor task{};
+    TaskId::assign(task.task_id, ctx.task_token);
+    producer.task = &task;
+    producer.payload = &payload;
+    producer.total_required_subtasks = 1;
+    producer.task_state.store(CHIP_TASK_PENDING);
+    int32_t completed = 0, release_count = 0;
+    ChipTaskSlotState *release[1]{};
+    EXPECT_FALSE(
+        SchedulerRetirementTestPeer::finish_failed_submission(
+            *context, runtime->scheduler, slab, producer, completed, release, release_count, runtime.get()
+        )
+    );
+
+    EXPECT_TRUE(context->is_completed());
+    uint32_t bucket_epochs[2]{};
+    runtime->orchestrator.tensor_map.num_buckets = 2;
+    runtime->orchestrator.tensor_map.bucket_epochs = bucket_epochs;
+    uint32_t value = 42;
+    const uint32_t shape[]{1};
+    const uint32_t index[]{0};
+    const auto tensor = simpler::tmr::make_tensor_external(&value, shape, 1, DataType::INT32);
+    EXPECT_EQ(get_tensor_data(runtime.get(), tensor, 1, index), 0u);
+    EXPECT_TRUE(runtime->ops->is_fatal(runtime.get()));
+    EXPECT_EQ(header->orch_error_code.load(), SIMPLER_ERROR_NONE);
+    EXPECT_EQ(header->sched_error_code.load(), SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    EXPECT_EQ(context->accounted_urma_submit_error(), SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    EXPECT_EQ(SchedulerRetirementTestPeer::preserved_count(*context), slab.count);
+    EXPECT_EQ(producer.completed_subtasks.load(), 0);
+    EXPECT_EQ(completed, 0);
+    EXPECT_EQ(release_count, 0);
+    EXPECT_FALSE(mailbox->has_pending());
+
+    for (uint32_t row : {6u, 7u}) {
+        *reinterpret_cast<uint32_t *>(cq_storage[row].data()) = 1u << 2;
+    }
+    EXPECT_TRUE(context->settle_aborted_dma());
+    EXPECT_EQ(notification, 0u);
+    EXPECT_EQ(cq_tail[6], 1u);
+    EXPECT_EQ(cq_tail[7], 1u);
+}
+
+TEST_F(A5UrmaBatchSubmission, NoTokenFailureKeepsAccountedProvenanceOnlyWhenItsLatchWins) {
+    const Request request = put();
+    ASSERT_FALSE(submit_batch(&request, 1, 0));
+    ASSERT_EQ(slab.count, 0u);
+
+    for (bool earlier_same_code : {false, true}) {
+        auto context = std::make_unique<SchedulerContext>();
+        auto runtime = std::make_unique<RuntimeContext>();
+        auto header = std::make_unique<SharedMemoryHeader>();
+        runtime->scheduler.sm_header = header.get();
+        header->sched_error_code.store(earlier_same_code ? SIMPLER_ERROR_ASYNC_COMPLETION_INVALID : SIMPLER_ERROR_NONE);
+        header->sched_error_thread.store(earlier_same_code ? 1 : -1);
+        header->sched_error_bitmap.store(earlier_same_code ? 2u : 0u);
+        ChipTaskSlotState producer{};
+        TaskPayload payload{};
+        producer.payload = &payload;
+        int32_t completed = 0, release_count = 0;
+        ChipTaskSlotState *release[1]{};
+
+        EXPECT_FALSE(
+            SchedulerRetirementTestPeer::finish_failed_submission(
+                *context, runtime->scheduler, slab, producer, completed, release, release_count, runtime.get()
+            )
+        );
+        EXPECT_EQ(header->sched_error_code.load(), SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        EXPECT_EQ(header->sched_error_thread.load(), earlier_same_code ? 1 : 0);
+        EXPECT_EQ(header->sched_error_bitmap.load(), earlier_same_code ? 3u : 1u);
+        EXPECT_EQ(
+            context->accounted_urma_submit_error(),
+            earlier_same_code ? SIMPLER_ERROR_NONE : SIMPLER_ERROR_ASYNC_COMPLETION_INVALID
+        );
+    }
+}
+
+TEST_F(A5UrmaBatchSubmission, FullMailboxAtAbortPreservesUnharvestedSlab) {
+    const Request requests[]{put(0), put(32)};
+    ASSERT_TRUE(submit_batch(requests, std::size(requests)));
+    ASSERT_EQ(slab.count, 2u);
+
+    auto context = std::make_unique<SchedulerContext>();
+    auto runtime = std::make_unique<RuntimeContext>();
+    auto mailbox = std::make_unique<AICoreCompletionMailbox>();
+    mailbox->head.store(AICORE_COMPLETION_MAILBOX_CAPACITY);
+    runtime->aicore_mailbox = mailbox.get();
+    ChipTaskSlotState producer{};
+    TaskPayload payload{};
+    TaskDescriptor task{};
+    TaskId::assign(task.task_id, ctx.task_token);
+    producer.task = &task;
+    producer.payload = &payload;
+    producer.total_required_subtasks = 1;
+    int32_t completed = 0, release_count = 0;
+    ChipTaskSlotState *release[1]{};
+
+    EXPECT_FALSE(
+        SchedulerRetirementTestPeer::finish_failed_submission(
+            *context, runtime->scheduler, slab, producer, completed, release, release_count, runtime.get(), true
+        )
+    );
+    EXPECT_EQ(SchedulerRetirementTestPeer::preserved_count(*context), slab.count);
+    EXPECT_EQ(producer.completed_subtasks.load(), 0);
+    EXPECT_EQ(completed, 0);
+    EXPECT_EQ(release_count, 0);
+}

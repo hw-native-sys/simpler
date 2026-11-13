@@ -3691,7 +3691,8 @@ int DeviceRunnerBase::initialize_result_storage(PreparedSubmissionStorage &backi
 }
 
 int DeviceRunnerBase::ensure_device_run_result_region(
-    const NativeRunIdentity &identity, KernelArgsHelper &kernel_args, const DfxRunConfig &dfx
+    const NativeRunIdentity &identity, KernelArgsHelper &kernel_args, const DfxRunConfig &dfx,
+    bool requires_dma_quiescence
 ) {
     const uint32_t pipeline_slot = identity.pipeline_slot;
     const uint64_t run_epoch = identity.run_epoch;
@@ -3718,6 +3719,13 @@ int DeviceRunnerBase::ensure_device_run_result_region(
     const int rc = initialize_result_storage(backing);
     storage.device_ptr = backing.device_result;
     if (rc != 0) return rc;
+    if (requires_dma_quiescence && backing.host_result == nullptr) {
+        void *host_result = nullptr;
+        const int host_rc = rtMallocHost(&host_result, sizeof(DeviceRunResultRegion), 0);
+        if (host_rc != 0) return host_rc;
+        if (host_result == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+        backing.host_result = host_result;
+    }
     storage.initialized = backing.result_initialized;
     // A live call owns its allocation through the map. An unclaimed current
     // slot keeps its allocation as an idle cache; late observers use the map.
@@ -3757,6 +3765,8 @@ int DeviceRunnerBase::read_device_run_result(uint32_t pipeline_slot, uint64_t ru
     RunResultStorage &storage = it->second;
     if (!storage.initialized) return 0;
     if (storage.read != RunRecordRead::NotAttempted) return storage.transfer_rc;
+    // The queued copy is consumed by the completion path after the stream boundary.
+    if (storage.readback_queued) return 0;
     storage.transfer_rc = rtMemcpy(
         &storage.region, sizeof(storage.region), storage.device_ptr, sizeof(storage.region), RT_MEMCPY_DEVICE_TO_HOST
     );
@@ -4524,6 +4534,8 @@ int DeviceRunnerBase::release_submission_storage(PreparedSubmissionStorage &stor
         abandon_slot_persistent_args(storage.args);
         storage.device_wall = nullptr;
         storage.device_result = nullptr;
+        // As for the pinned upload source, abandonment cannot free an outstanding DMA target.
+        storage.host_result = nullptr;
         return 0;
     }
     // Event owners refuse outstanding waits. Do not drop their backing if that
@@ -4551,6 +4563,11 @@ int DeviceRunnerBase::release_submission_storage(PreparedSubmissionStorage &stor
         }
     }
     rc = release_slot_persistent_args(storage.args, mem_alloc_);
+    if (storage.host_result != nullptr) {
+        const int free_rc = rtFreeHost(storage.host_result);
+        if (free_rc == 0) storage.host_result = nullptr;
+        else if (rc == 0) rc = free_rc;
+    }
     for (void **ptr : {&storage.device_wall, &storage.device_result}) {
         if (*ptr == nullptr) continue;
         const int free_rc = mem_alloc_.free(*ptr);
@@ -4619,6 +4636,22 @@ int DeviceRunnerBase::record_run_boundary(const PreparedExecution &prepared, Run
     // has to be recorded before anything that can still fail — otherwise a
     // failing record below would leave the run looking unsubmitted.
     fence.note_kernel_submitted(prepared.identity, role);
+    if (prepared.requires_dma_quiescence && role == RunCompletionFence::StreamRole::Aicpu) {
+        // The event covers both the kernel's publication and its readback.
+        std::lock_guard<std::mutex> lock(run_result_mu_);
+        const auto it = run_result_storage_.find(prepared.identity.run_epoch);
+        if (it == run_result_storage_.end() || it->second.pipeline_slot != prepared.pipeline_slot)
+            return PTO_RUNTIME_ERR_INTERNAL;
+        auto &storage = it->second;
+        void *const host_result = storage.backing->host_result;
+        if (host_result == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+        const size_t bytes = sizeof(DeviceRunResultRegion);
+        std::memset(host_result, 0, bytes);
+        const int copy_rc =
+            rtMemcpyAsync(host_result, bytes, storage.device_ptr, bytes, RT_MEMCPY_DEVICE_TO_HOST, stream);
+        if (copy_rc != 0) return copy_rc;
+        storage.readback_queued = true;
+    }
     int rc = fence.record(prepared.identity, role, stream);
     if (rc != 0) {
         LOG_ERROR(
@@ -4628,6 +4661,26 @@ int DeviceRunnerBase::record_run_boundary(const PreparedExecution &prepared, Run
         );
     }
     return rc;
+}
+
+int DeviceRunnerBase::verify_dma_quiescence(const PreparedExecution &prepared) {
+    if (!prepared.requires_dma_quiescence) return 0;
+    const uint64_t epoch = prepared.identity.run_epoch;
+    std::lock_guard<std::mutex> lock(run_result_mu_);
+    const auto it = run_result_storage_.find(epoch);
+    if (it == run_result_storage_.end() || it->second.pipeline_slot != prepared.pipeline_slot ||
+        !it->second.readback_queued)
+        return PTO_RUNTIME_ERR_INTERNAL;
+    auto &storage = it->second;
+    if (storage.read == RunRecordRead::NotAttempted) {
+        std::memcpy(&storage.region, storage.backing->host_result, sizeof(storage.region));
+        storage.read = RunRecordRead::Ok;
+    }
+    const DeviceRunTerminal terminal = device_run_result_terminal(storage.region, epoch);
+    if (terminal.state == DeviceRunTerminalState::Succeeded ||
+        terminal.source == DeviceRunCodeSource::AccountedUrmaSubmit)
+        return 0;
+    return terminal.state == DeviceRunTerminalState::Failed ? terminal.code : PTO_RUNTIME_ERR_INTERNAL;
 }
 
 int DeviceRunnerBase::poll_run_fence(const PreparedExecution &prepared) {
@@ -4642,13 +4695,15 @@ int DeviceRunnerBase::poll_run_fence(const PreparedExecution &prepared) {
         poll_and_retain_run_boundaries(run_fence(prepared.pipeline_slot), run_boundaries_observed_, prepared.identity);
     switch (completion) {
     case RunCompletionFence::Completion::Complete:
-        // Own boundaries prove physical last use; explicit observation reads
-        // the stream verdict independently.
-        return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+        return verify_dma_quiescence(prepared) == 0 ? SIMPLER_NATIVE_RUN_POLL_COMPLETE : SIMPLER_NATIVE_RUN_POLL_ERROR;
     case RunCompletionFence::Completion::Pending:
         return SIMPLER_NATIVE_RUN_POLL_NOT_READY;
-    case RunCompletionFence::Completion::Unfenced:
-        return query_stream_pair_nonblocking(streams.aicpu, streams.aicore);
+    case RunCompletionFence::Completion::Unfenced: {
+        const int rc = query_stream_pair_nonblocking(streams.aicpu, streams.aicore);
+        if (rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE && verify_dma_quiescence(prepared) != 0)
+            return SIMPLER_NATIVE_RUN_POLL_ERROR;
+        return rc;
+    }
     case RunCompletionFence::Completion::Error:
         break;
     }
@@ -4665,6 +4720,7 @@ int DeviceRunnerBase::wait_execution_completion(ActiveExecution &active) {
         );
         if (observed.rc != 0) return observed.rc;
         if (observed.completion != RunCompletionFence::Completion::Complete) return PTO_RUNTIME_ERR_INTERNAL;
+        if (const int rc = verify_dma_quiescence(prepared); rc != 0) return rc;
         prepared.physical_complete = true;
     }
     const int caller_rc = submission_storage_[prepared.pipeline_slot]->caller_order->discharge(
@@ -4684,13 +4740,15 @@ int DeviceRunnerBase::wait_run_fence(PreparedExecution &prepared) {
     trace_observation_start(prepared.identity, prepared.streams.aicpu, prepared.streams.aicore);
     // These are the actual handles selected for this call, not today's runner
     // pair. A late explicit observer deliberately has stream-wide scope.
-    const int rc = sync_stream_pair(prepared.streams.aicpu, prepared.streams.aicore);
-    if (rc == 0) prepared.physical_complete = true;
+    int rc = sync_stream_pair(prepared.streams.aicpu, prepared.streams.aicore);
     // A nonzero stream result is not last-use proof. Preserve an independent
     // event proof already acquired by automatic progress, or query it now.
     bool polled = false;
     int poll_result = SIMPLER_NATIVE_RUN_POLL_NOT_READY;
-    if (!prepared.physical_complete && prepared.resources_owned) {
+    if (rc == 0 && !prepared.physical_complete) {
+        rc = verify_dma_quiescence(prepared);
+        prepared.physical_complete = rc == 0;
+    } else if (!prepared.physical_complete && prepared.resources_owned) {
         polled = true;
         poll_result = poll_run_fence(prepared);
         prepared.physical_complete = poll_result == SIMPLER_NATIVE_RUN_POLL_COMPLETE;
@@ -4709,7 +4767,8 @@ int DeviceRunnerBase::wait_run_fence(PreparedExecution &prepared) {
         slot_persistent_args(prepared.pipeline_slot)
             .entry_cache_qualification.observe_success(prepared.identity.run_epoch);
     }
-    if (rc != 0) (void)read_device_run_result(prepared.pipeline_slot, prepared.identity.run_epoch);
+    if (rc != 0 && !prepared.requires_dma_quiescence)
+        (void)read_device_run_result(prepared.pipeline_slot, prepared.identity.run_epoch);
     return rc;
 }
 

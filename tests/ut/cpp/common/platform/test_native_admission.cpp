@@ -218,6 +218,9 @@ public:
     using Runner::Runner;
     bool publish_success{true};
     int published_error{0};
+    DeviceRunCodeSource published_error_source{DeviceRunCodeSource::Header};
+    bool publish_stale_epoch{false};
+    bool requires_dma_quiescence{false};
     bool refuse_retirement_owner{false};
     enum class ProgressException { None, Allocation, Other };
     ProgressException progress_exception{ProgressException::None};
@@ -265,7 +268,8 @@ public:
         int rc = Runner::prepare_execution(runtime, config, slot, identity, out);
         if (rc != 0) return rc;
         (*out)->resources_owned = true;
-        rc = ensure_device_run_result_region(identity, (*out)->kernel_args, (*out)->dfx);
+        (*out)->requires_dma_quiescence = requires_dma_quiescence;
+        rc = ensure_device_run_result_region(identity, (*out)->kernel_args, (*out)->dfx, requires_dma_quiescence);
         if (rc != 0) return rc;
         return (*out)->kernel_args.prepare_runtime_args(runtime, mem_alloc_, slot_persistent_args(slot));
     }
@@ -273,7 +277,7 @@ public:
         prepared.streams = {&cpu_stream_, &core_stream_};
         const int rc = arm_run_fence(prepared);
         if (rc != 0) return {rc, LaunchProgress::NotStarted, {}};
-        auto result = exact_launch_transaction(
+        return exact_launch_transaction(
             prepared.identity, std::move(permit),
             [&](LaunchProgressSink &sink) {
                 const int entry_rc = queue_run_entry(prepared, sink);
@@ -283,23 +287,25 @@ public:
             },
             [&](LaunchProgressSink &sink) {
                 sink.mark_submitted();
+                publish_run_result(prepared);
                 return record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicpu);
             }
         );
+    }
+    void publish_run_result(const PreparedExecution &prepared) {
         DeviceRunResultRegion published{};
         if (publish_success) {
-            published.published = prepared.identity.run_epoch;
+            published.published = prepared.identity.run_epoch - (publish_stale_epoch ? 1 : 0);
             published.verdict =
                 static_cast<uint32_t>(published_error == 0 ? DeviceRunVerdict::Ok : DeviceRunVerdict::Error);
             published.completion_code = published_error;
             published.code_source =
-                static_cast<uint32_t>(published_error == 0 ? DeviceRunCodeSource::None : DeviceRunCodeSource::Header);
+                static_cast<uint32_t>(published_error == 0 ? DeviceRunCodeSource::None : published_error_source);
         }
         if (prepared.kernel_args.args.run_result_data_base != 0)
             std::memcpy(
                 reinterpret_cast<void *>(prepared.kernel_args.args.run_result_data_base), &published, sizeof(published)
             );
-        return result;
     }
     int poll_execution(const ActiveExecution &active) override { return poll_run_fence(*active.prepared); }
     int retire_completed_execution(ActiveExecution &active) override {
@@ -798,6 +804,183 @@ TEST_F(NativeAdmissionTest, SuccessfulExplicitObservationDoesNotReadThePrivateRe
     EXPECT_EQ(control().observed_streams.size(), 2u);
     EXPECT_EQ(control().d2h_calls, 0u);
     EXPECT_TRUE(active.empty());
+}
+
+TEST_F(NativeAdmissionTest, ManagedDmaRefusesMissingStaleAndUnquiescedResults) {
+    enum class Receipt { Error, Missing, Stale, CopyEnqueueFailure };
+    for (const auto receipt : {Receipt::Error, Receipt::Missing, Receipt::Stale, Receipt::CopyEnqueueFailure}) {
+        SCOPED_TRACE(static_cast<int>(receipt));
+        // Unproved last use leaves the run's device resources owned.
+        EXPECT_EXIT(
+            {
+                constexpr int kDeviceError = -731;
+                constexpr int kCopyError = -732;
+                FencedCompletionRunner runner;
+                runner.requires_dma_quiescence = true;
+                runner.publish_success = receipt != Receipt::Missing;
+                runner.publish_stale_epoch = receipt == Receipt::Stale;
+                runner.published_error = receipt == Receipt::Error ? kDeviceError : 0;
+                if (runner.execution_mode_latch().latch(SIMPLER_MODE_PROGRAM) != 0) std::_Exit(1);
+                Attempt active(runner, 0, 10);
+                if (active.prepare() != 0) std::_Exit(2);
+                const bool copy_failed = receipt == Receipt::CopyEnqueueFailure;
+                if (copy_failed) {
+                    control().copy_rc = kCopyError;
+                    control().copy_error_bytes = sizeof(DeviceRunResultRegion);
+                }
+                if (simpler_launch_run(&runner, active.storage) != (copy_failed ? kCopyError : 0)) std::_Exit(2);
+                control().copy_rc = 0;
+                const auto *state = static_cast<const NativeRunContext<DeviceRunnerBase> *>(active.storage);
+                const size_t owned_bytes = control().bytes;
+                if (simpler_poll_run(&runner, active.storage) != SIMPLER_NATIVE_RUN_POLL_ERROR) std::_Exit(3);
+                if (control().d2h_calls != 1 || !control().observed_streams.empty()) std::_Exit(4);
+                int expected = PTO_RUNTIME_ERR_INTERNAL;
+                if (receipt == Receipt::Error) expected = kDeviceError;
+                if (simpler_wait_run_completion(&runner, active.storage) != expected) std::_Exit(5);
+                if (copy_failed) expected = kCopyError;  // The original launch error wins.
+                if (simpler_wait_run(&runner, active.storage) != expected) std::_Exit(6);
+                if (simpler_finalize_run(&runner, active.storage) != expected || active.empty()) std::_Exit(7);
+                if (state->physical_complete || state->execution_retired ||
+                    state->active_execution->prepared->physical_complete ||
+                    !state->active_execution->prepared->resources_owned)
+                    std::_Exit(8);
+                if (!runner.holds_epoch(10) || runner.reservations() != 1 || control().bytes != owned_bytes)
+                    std::_Exit(9);
+                if (control().d2h_calls != 1 || control().d2h_bytes != sizeof(DeviceRunResultRegion)) std::_Exit(10);
+                std::_Exit(0);
+            },
+            ::testing::ExitedWithCode(0), ""
+        );
+    }
+}
+
+TEST_F(NativeAdmissionTest, ManagedDmaRetiresOnMatchingSuccessOrQuiescedError) {
+    enum class Observer { Poll, CompletionWait, ExplicitWait };
+    constexpr int kStreamError = -739;
+    constexpr int kDeviceError = -737;
+    for (const auto observer : {Observer::Poll, Observer::CompletionWait, Observer::ExplicitWait}) {
+        for (const int expected : {0, kDeviceError, kStreamError}) {
+            SCOPED_TRACE(static_cast<int>(observer));
+            SCOPED_TRACE(expected);
+            const bool failed = expected != 0;
+            control() = {};
+            FencedCompletionRunner runner;
+            runner.requires_dma_quiescence = true;
+            runner.published_error = failed ? kDeviceError : 0;
+            runner.published_error_source = DeviceRunCodeSource::AccountedUrmaSubmit;
+            runner.use_inout_argument();
+            ASSERT_EQ(runner.execution_mode_latch().latch(SIMPLER_MODE_PROGRAM), 0);
+            Attempt active(runner, 0, 10);
+            ASSERT_EQ(active.prepare(), 0);
+            const auto upload = std::find_if(control().uploads.begin(), control().uploads.end(), [&](const auto &row) {
+                return row.second == active.bytes.data();
+            });
+            ASSERT_NE(upload, control().uploads.end());
+            void *const output = upload->first;
+            ASSERT_EQ(simpler_launch_run(&runner, active.storage), 0);
+            auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(active.storage);
+            const auto *record = reinterpret_cast<const void *>(
+                state->active_execution->prepared->kernel_args.args.run_result_data_base
+            );
+            ASSERT_NE(record, nullptr);
+            EXPECT_EQ(control().downloads, (std::vector<const void *>{record}));
+            std::memset(output, 0x42, active.bytes.size());
+
+            control().events_complete = false;
+            EXPECT_EQ(simpler_poll_run(&runner, active.storage), SIMPLER_NATIVE_RUN_POLL_NOT_READY);
+            EXPECT_FALSE(state->active_execution->prepared->physical_complete);
+            EXPECT_EQ(control().downloads, (std::vector<const void *>{record}));
+            EXPECT_TRUE(control().observed_streams.empty());
+
+            control().events_complete = true;
+            control().stream_sync_rc = expected == kStreamError ? kStreamError : 0;
+            switch (observer) {
+            case Observer::Poll:
+                ASSERT_EQ(simpler_poll_run(&runner, active.storage), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
+                break;
+            case Observer::CompletionWait:
+                ASSERT_EQ(simpler_wait_run_completion(&runner, active.storage), 0);
+                break;
+            case Observer::ExplicitWait:
+                ASSERT_EQ(simpler_wait_run(&runner, active.storage), expected);
+                break;
+            }
+            EXPECT_TRUE(state->physical_complete);
+            ASSERT_EQ(simpler_poll_run(&runner, active.storage), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
+            EXPECT_TRUE(state->execution_retired);
+            EXPECT_FALSE(state->active_execution->prepared->resources_owned);
+            EXPECT_EQ(runner.reservations(), 0u);
+            EXPECT_EQ(control().downloads, (std::vector<const void *>{record}));
+            EXPECT_EQ(runner.device_run_terminal(0, 10).code, failed ? kDeviceError : 0);
+            EXPECT_EQ(active.bytes, std::vector<uint8_t>(active.bytes.size(), 0x71));
+            EXPECT_EQ(simpler_wait_run(&runner, active.storage), expected);
+            EXPECT_EQ(simpler_finalize_run(&runner, active.storage), expected);
+            EXPECT_EQ(
+                consume_released_task_failure(active.storage, sizeof(NativeRunContext<DeviceRunnerBase>), 10, expected),
+                expected == kDeviceError
+            );
+            EXPECT_TRUE(active.empty());
+            EXPECT_EQ(active.bytes, std::vector<uint8_t>(active.bytes.size(), failed ? 0x71 : 0x42));
+            if (failed) EXPECT_EQ(control().downloads, (std::vector<const void *>{record}));
+            else EXPECT_EQ(control().downloads, (std::vector<const void *>{record, output}));
+        }
+    }
+}
+
+TEST_F(NativeAdmissionTest, ManagedDmaFailedCompletionWaitDoesNotReadTheReceipt) {
+    EXPECT_EXIT(
+        {
+            constexpr int kEventError = -742;
+            FencedCompletionRunner runner;
+            runner.requires_dma_quiescence = true;
+            if (runner.execution_mode_latch().latch(SIMPLER_MODE_PROGRAM) != 0) std::_Exit(1);
+            Attempt active(runner, 0, 10);
+            if (active.prepare() != 0 || simpler_launch_run(&runner, active.storage) != 0) std::_Exit(2);
+            control().events_complete = false;
+            control().event_wait_rc = kEventError;
+            if (simpler_wait_run_completion(&runner, active.storage) != kEventError) std::_Exit(3);
+            const auto *state = static_cast<const NativeRunContext<DeviceRunnerBase> *>(active.storage);
+            if (state->physical_complete || state->execution_retired ||
+                state->active_execution->prepared->physical_complete ||
+                !state->active_execution->prepared->resources_owned || runner.reservations() != 1)
+                std::_Exit(4);
+            if (control().d2h_calls != 1 || !control().observed_streams.empty() ||
+                runner.device_run_result_read_status(0, 10) != RunRecordRead::NotAttempted)
+                std::_Exit(5);
+            std::_Exit(0);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
+}
+
+TEST_F(NativeAdmissionTest, ManagedDmaFailedStreamWaitDoesNotConsumeReceiptBeforeEvent) {
+    constexpr int kStreamError = -739;
+    FencedCompletionRunner runner;
+    runner.requires_dma_quiescence = true;
+    runner.published_error = -737;
+    runner.published_error_source = DeviceRunCodeSource::AccountedUrmaSubmit;
+    ASSERT_EQ(runner.execution_mode_latch().latch(SIMPLER_MODE_PROGRAM), 0);
+    Attempt active(runner, 0, 10);
+    ASSERT_EQ(active.prepare(), 0);
+    ASSERT_EQ(simpler_launch_run(&runner, active.storage), 0);
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(active.storage);
+
+    control().events_complete = false;
+    control().stream_sync_rc = kStreamError;
+    EXPECT_EQ(simpler_wait_run(&runner, active.storage), kStreamError);
+    EXPECT_FALSE(state->physical_complete);
+    EXPECT_EQ(runner.reservations(), 1u);
+    EXPECT_EQ(control().d2h_calls, 1u);
+    EXPECT_EQ(runner.device_run_result_read_status(0, 10), RunRecordRead::NotAttempted);
+    control().events_complete = true;
+    control().stream_sync_rc = 0;
+    EXPECT_EQ(simpler_wait_run_completion(&runner, active.storage), 0);
+    EXPECT_TRUE(state->physical_complete);
+    EXPECT_TRUE(state->execution_retired);
+    EXPECT_EQ(simpler_wait_run(&runner, active.storage), kStreamError);
+    EXPECT_EQ(simpler_finalize_run(&runner, active.storage), kStreamError);
+    EXPECT_TRUE(active.empty());
+    EXPECT_EQ(control().d2h_calls, 1u);
 }
 
 TEST_F(NativeAdmissionTest, BlockingPhysicalProgressDoesNotPerformTheStrongObserver) {

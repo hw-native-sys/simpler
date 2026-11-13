@@ -385,10 +385,10 @@ _OFF_CONFIG = 16
 # enable_pmu, enable_dep_gen, enable_scope_stats) + uint64
 # ring sizing overrides (3 per-ring arrays of RUNTIME_ENV_RING_COUNT:
 # ring_task_window, ring_heap, ring_dep_pool) + 1024-byte NUL-terminated
-# output_prefix. Log config travels separately via ChipWorker.init(log_level) —
+# output_prefix + 1-byte URMA batch opt-in. Log config travels separately via ChipWorker.init(log_level) —
 # not on per-task wire.
 _RUNTIME_ENV_UINT64_FIELD_COUNT = 3 * RUNTIME_ENV_RING_COUNT
-_CFG_FMT = struct.Struct("=iiiiii" + ("Q" * _RUNTIME_ENV_UINT64_FIELD_COUNT) + "1024s")
+_CFG_FMT = struct.Struct("=iiiiii" + ("Q" * _RUNTIME_ENV_UINT64_FIELD_COUNT) + "1024s?")
 # The generation-safe pipeline lease follows CONFIG. Args start after the
 # lease, rounded up to 8 bytes so the first
 # Tensor.data (uint64_t at OFF_ARGS+8) is 8-byte aligned, avoiding
@@ -409,7 +409,7 @@ _DISPOSITION_NONE = 0
 _VALIDATED_ONLY = 1
 _NATIVE_PREPARED = 2
 _TASK_ACCEPTED = 1
-_TASK_PROTOCOL_VERSION = 7
+_TASK_PROTOCOL_VERSION = 8
 
 # A request frame's own header: which run-state entry this payload belongs to,
 # that entry's generation, and this frame's generation — which the child echoes
@@ -4318,7 +4318,18 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                         if not staged.ended_published:
                             # An explicit wait must reach the native bounded wait even
                             # when a hung launch never reports physical END on its own.
-                            staged.chip_run.wait()
+                            try:
+                                staged.chip_run.wait()
+                            except Exception:
+                                # A terminal task error with proven cleanup belongs to this entry.
+                                run = staged.chip_run
+                                if (
+                                    run._owner_recovery_required
+                                    or run.lane_poisoned
+                                    or not run.done()
+                                    or run._execution_ended
+                                ):
+                                    raise
                         code, msg = publish_completed_run(staged)
                         if code != 0 and (staged.chip_run.lane_poisoned or staged.ccu_started):
                             shutdown_message = msg
@@ -4565,6 +4576,7 @@ def _read_config_from_mailbox(
         scope_stats,
         *ring_values,
         prefix_bytes,
+        enable_urma_batch,
     ) = _CFG_FMT.unpack_from(buf, _OFF_CONFIG)
     ring_task_window = list(ring_values[:RUNTIME_ENV_RING_COUNT])
     ring_heap = list(ring_values[RUNTIME_ENV_RING_COUNT : 2 * RUNTIME_ENV_RING_COUNT])
@@ -4576,6 +4588,7 @@ def _read_config_from_mailbox(
     cfg.enable_pmu = pmu
     cfg.enable_dep_gen = bool(dep_gen)
     cfg.enable_scope_stats = bool(scope_stats)
+    cfg.enable_urma_batch = enable_urma_batch
     cfg.runtime_env.ring_task_window = ring_task_window
     cfg.runtime_env.ring_heap = ring_heap
     cfg.runtime_env.ring_dep_pool = ring_dep_pool

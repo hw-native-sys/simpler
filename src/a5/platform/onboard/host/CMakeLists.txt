@@ -168,6 +168,10 @@ target_compile_definitions(host_runtime PRIVATE
     SIMPLER_RUNTIME_NAME="${SIMPLER_RUNTIME_NAME}"
 )
 
+if(SIMPLER_RUNTIME_NAME STREQUAL "tensormap_and_ringbuffer")
+    target_compile_definitions(host_runtime PRIVATE SIMPLER_A5_TMR)
+endif()
+
 target_compile_definitions(host_runtime PRIVATE PTO_URMA_SUPPORTED)
 if(SIMPLER_ENABLE_PTO_RDMA_WORKSPACE)
     target_compile_definitions(host_runtime PRIVATE

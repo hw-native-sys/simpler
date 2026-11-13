@@ -40,6 +40,7 @@ public:
         claimed_.store(0, std::memory_order_relaxed);
         finished_.store(0, std::memory_order_relaxed);
         entry_errors_.reset();
+        mixed_entry_errors_.store(false, std::memory_order_relaxed);
         runtime_terminal_ = {};
         payload_bytes_ = 0;
         handed_off_ = false;
@@ -83,6 +84,7 @@ public:
         const uint32_t bit = uint32_t{1} << callback_index;
         if ((claimed_.fetch_or(bit, std::memory_order_relaxed) & bit) != 0) return kInternalError;
         entry_errors_.record(rc, DeviceRunCodeSource::ThreadRc);
+        if (rc != 0 && entry_errors_.code() != rc) mixed_entry_errors_.store(true, std::memory_order_relaxed);
         // The claim precedes the contribution; only this separate release RMW
         // certifies its completion. The final acquire observes all contributors.
         if (finished_.fetch_add(1, std::memory_order_acq_rel) + 1 != expected_) return 0;
@@ -102,6 +104,11 @@ public:
             complete();
             return kInternalError;
         }
+        if (result.source == DeviceRunCodeSource::AccountedUrmaSubmit &&
+            (mixed_entry_errors_.load(std::memory_order_relaxed) ||
+             (entry_errors_.has_failure() && entry_errors_.code() != result.code))) {
+            result.source = DeviceRunCodeSource::Header;
+        }
         const void *payload = bytes != 0 ? payload_ : nullptr;
         const NativeTerminalPublication publication = publish(result, payload, bytes);
         if (evidence_ != nullptr)
@@ -110,6 +117,11 @@ public:
                 publication != NativeTerminalPublication::NotRequested
             );
         complete();
+        // The semantic error survives in the epoch-bound record when the transport returns success.
+        if (result.source == DeviceRunCodeSource::AccountedUrmaSubmit &&
+            publication == NativeTerminalPublication::Published) {
+            return 0;
+        }
         // Preserve a real execution error even if its private record is invalid.
         return publication != NativeTerminalPublication::InvalidState || result.code != 0 ? result.code :
                                                                                             kInternalError;
@@ -122,6 +134,7 @@ private:
     std::atomic<uint32_t> claimed_{0};
     std::atomic<int32_t> finished_{0};
     RunTerminalAccumulator entry_errors_;
+    std::atomic<bool> mixed_entry_errors_{false};
     RunTerminalSelection runtime_terminal_{};
     size_t payload_bytes_{0};
     uint8_t payload_[DEVICE_RUN_RESULT_PAYLOAD_BYTES]{};

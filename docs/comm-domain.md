@@ -636,6 +636,8 @@ not complete its network requests: dependencies and buffer lifetimes remain
 protected by the existing deferred-completion protocol. Requests that exceed
 the available queue or completion-slab capacity fail before posting.
 
+For batched Device URMA PUTs, see [A5 URMA batch PUT](zh-cn/a5-urma-put-batch.md).
+
 The legacy `device_ctx` field remains a raw address for synchronous consumers;
 it does not declare or validate an asynchronous engine requirement. No compiled
 capability query or `enable_urma` initialization switch is needed.

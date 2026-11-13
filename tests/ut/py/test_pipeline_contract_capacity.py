@@ -72,6 +72,7 @@ class _CallConfig(ctypes.Structure):
         ("enable_scope_stats", ctypes.c_int32),
         ("runtime_env", ctypes.c_uint64 * _RUNTIME_ENV_UINT64_FIELDS),
         ("output_prefix", ctypes.c_char * _OUTPUT_PREFIX_BYTES),
+        ("enable_urma_batch", ctypes.c_bool),
     ]
 
 

@@ -82,6 +82,7 @@
 
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "aicore_completion_mailbox_types.h"
@@ -115,17 +116,22 @@ static constexpr int32_t PAYLOAD_GLOBAL_CONTEXT_INDEX = SPMD_GLOBAL_CONTEXT_INDE
  * and the resident per-device async-DMA config. Stable for that scheduler
  * instance; unavailable workspace slots remain zero.
  */
+constexpr uint32_t URMA_BATCH_GUARD = 0x414d5255;
+
 struct GlobalContext {
     // AIV lane within cluster: 0=AIV0(left), 1=AIV1(right).
     // Used by AIV to select the correct intra-cluster hw instruction.
     // Not meaningful for AIC kernels or single-AIV tasks.
     int32_t sub_block_id;
+    // Occupies the original alignment padding without moving the workspaces.
+    uint32_t urma_batch_guard{0};
     // Per-engine async-DMA workspace device addresses (0 when unavailable),
     // indexed by DmaWorkspaceKind. The scheduler copies them from the resident
     // config into every core's context during cold start.
     // Read via get_dma_workspace(args, kind).
     uint64_t dma_workspace[DMA_WORKSPACE_KIND_COUNT];
 };
+static_assert(offsetof(GlobalContext, dma_workspace) == 8, "GlobalContext workspace ABI drift");
 
 struct AsyncCtx {
     volatile __gm__ uint32_t *completion_count;

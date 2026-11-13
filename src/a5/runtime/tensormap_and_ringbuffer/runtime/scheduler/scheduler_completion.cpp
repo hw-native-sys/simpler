@@ -34,6 +34,47 @@
 
 namespace {
 inline constexpr int32_t DEFERRED_RELEASE_CAP = 256;
+inline constexpr uint64_t ABORT_DMA_DRAIN_CYCLES = PLATFORM_PROF_SYS_CNT_FREQ / 10;
+}  // namespace
+
+// Only the first error owns the companion fields. The bitmap records every reporting thread.
+bool SchedulerContext::latch_scheduler_error(
+    SharedMemoryHeader *header, int32_t thread_idx, int32_t error_code, bool accounted
+) {
+    if (header == nullptr || error_code == SIMPLER_ERROR_NONE) {
+        return false;
+    }
+    int32_t expected = SIMPLER_ERROR_NONE;
+    const bool won = header->sched_error_code.compare_exchange_strong(expected, error_code, std::memory_order_acq_rel);
+    if (won) {
+        header->sched_error_thread.store(thread_idx, std::memory_order_release);
+        if (accounted) {
+            accounted_urma_submit_error_.store(error_code, std::memory_order_release);
+        }
+    }
+    if (thread_idx >= 0 && thread_idx < 32) {
+        header->sched_error_bitmap.fetch_or(1U << static_cast<uint32_t>(thread_idx), std::memory_order_acq_rel);
+    }
+    return won;
+}
+
+bool SchedulerContext::settle_aborted_dma() {
+    if (rt_ == nullptr || sched_ == nullptr) return true;
+    if (core_retirement_failed_.load(std::memory_order_acquire)) return false;
+    rmb();
+    const uint64_t start = get_sys_cnt_aicpu();
+    const auto retry = [start] {
+        SPIN_WAIT_HINT();
+        return get_sys_cnt_aicpu() - start < ABORT_DMA_DRAIN_CYCLES;
+    };
+    bool settled = sched_->async_wait_list.settle_aborted_dma(rt_->aicore_mailbox, retry);
+    for (int32_t core = 0; core < cores_total_num_; ++core) {
+        if (!deferred_slabs_initialized_[core]) continue;
+        for (const auto &slab : deferred_slab_per_core_[core]) {
+            settled &= AsyncWaitList::settle_aborted_slab(slab, retry);
+        }
+    }
+    return settled;
 }
 
 // Pure function: read register result -> SlotTransition (no side effects).
@@ -75,9 +116,9 @@ SlotTransition SchedulerContext::decide_slot_transition(
 }
 
 // Complete one slot's task: subtask counting, mixed completion, deferred release, profiling.
-void SchedulerContext::complete_slot_task(
+bool SchedulerContext::complete_slot_task(
     ChipTaskSlotState &slot_state, int32_t expected_reg_task_id, [[maybe_unused]] SubtaskSlot subslot,
-    [[maybe_unused]] int32_t thread_idx, int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
+    int32_t thread_idx, int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
     ChipTaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
 #if SIMPLER_DFX
     ,
@@ -100,24 +141,22 @@ void SchedulerContext::complete_slot_task(
         volatile DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][expected_reg_task_id & 1];
         // A5 AICPU reads are coherent with AICore-published slab writes.
         // The polling path's rmb already orders COND before these reads.
-        int32_t slab_err = deferred_slab->error_code;
+        const int32_t slab_err = deferred_slab->error_code;
+        const uint32_t cond_count = deferred_slab->count;
         if (slab_err != SIMPLER_ERROR_NONE) {
-            int32_t expected = SIMPLER_ERROR_NONE;
-            sched_->sm_header->sched_error_code.compare_exchange_strong(
-                expected, slab_err, std::memory_order_acq_rel, std::memory_order_acquire
+            // Leave registered targets in the slab for abort cleanup after core retirement.
+            latch_scheduler_error(
+                sched_->sm_header, thread_idx, deferred_submit_error_code(slab_err),
+                deferred_submit_error_dma_accounted(slab_err)
             );
             completed_.store(true, std::memory_order_release);
-            return;
+            return false;
         }
 
-        uint32_t cond_count = deferred_slab->count;
         if (cond_count > MAX_COMPLETIONS_PER_TASK) {
-            int32_t expected = SIMPLER_ERROR_NONE;
-            sched_->sm_header->sched_error_code.compare_exchange_strong(
-                expected, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED, std::memory_order_acq_rel, std::memory_order_acquire
-            );
+            latch_scheduler_error(sched_->sm_header, thread_idx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
             completed_.store(true, std::memory_order_release);
-            return;
+            return false;
         }
 
         if (cond_count > 0) {
@@ -129,14 +168,14 @@ void SchedulerContext::complete_slot_task(
                 while (!mailbox->try_push_condition(
                     token, e->addr, e->backend_cookie, e->expected_value, e->engine, e->completion_type
                 )) {
+                    // The consumer can exit on a different scheduler lane.
+                    // Keep the slab for abort cleanup if it can no longer drain.
+                    if (completed_.load(std::memory_order_acquire)) return false;
                     sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
                     SPIN_WAIT_HINT();
                 }
             }
-            // Re-clear for the next reuse of this (core, buf) slot. Done here — on
-            // the hot cache line we just read — instead of on every dispatch, since
-            // only a deferred task (count > 0) ever dirties it. error_code needs no
-            // reset: a non-NONE code aborted the run above.
+            // Only deferred tasks dirty the slab; clear it before its reuse.
             deferred_slab->count = 0;
         }
     }
@@ -154,6 +193,7 @@ void SchedulerContext::complete_slot_task(
 
     if (task_complete && slot_state.payload != nullptr && slot_state.has_any_subtask_deferred()) {
         while (!mailbox->try_push_normal_done(slot_state.task->task_id, reinterpret_cast<uint64_t>(&slot_state))) {
+            if (completed_.load(std::memory_order_acquire)) return false;
             sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
             SPIN_WAIT_HINT();
         }
@@ -253,6 +293,7 @@ void SchedulerContext::complete_slot_task(
         );
     }
 #endif
+    return true;
 }
 
 // Promote pending slot data to running slot. Clears pending fields.
@@ -273,7 +314,7 @@ void SchedulerContext::clear_running_slot(CoreExecState &core) {
     core.running_reg_task_id = AICPU_TASK_INVALID;
 }
 
-void SchedulerContext::check_running_cores_for_completion(
+bool SchedulerContext::check_running_cores_for_completion(
     int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
     bool &made_progress, ChipTaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
 ) {
@@ -368,28 +409,30 @@ void SchedulerContext::check_running_cores_for_completion(
             if (core.pending_slot_state->task_attrs.is_timed()) {
                 aicpu_task_timing_finish(core.pending_slot_state->task_attrs.timing_slot(), thread_idx);
             }
-            complete_slot_task(
-                *core.pending_slot_state, core.pending_reg_task_id, core.pending_subslot, thread_idx, core_id, hank,
-                completed_this_turn, deferred_release_slot_states, deferred_release_count
+            if (!complete_slot_task(
+                    *core.pending_slot_state, core.pending_reg_task_id, core.pending_subslot, thread_idx, core_id, hank,
+                    completed_this_turn, deferred_release_slot_states, deferred_release_count
 #if SIMPLER_DFX
-                ,
-                core.pending_dispatch_timestamp, finish_ts
+                    ,
+                    core.pending_dispatch_timestamp, finish_ts
 #endif
-            );
+                ))
+                return false;
             cur_thread_completed++;
         }
         if (t.running_done) {
             if (core.running_slot_state->task_attrs.is_timed()) {
                 aicpu_task_timing_finish(core.running_slot_state->task_attrs.timing_slot(), thread_idx);
             }
-            complete_slot_task(
-                *core.running_slot_state, core.running_reg_task_id, core.running_subslot, thread_idx, core_id, hank,
-                completed_this_turn, deferred_release_slot_states, deferred_release_count
+            if (!complete_slot_task(
+                    *core.running_slot_state, core.running_reg_task_id, core.running_subslot, thread_idx, core_id, hank,
+                    completed_this_turn, deferred_release_slot_states, deferred_release_count
 #if SIMPLER_DFX
-                ,
-                core.running_dispatch_timestamp, finish_ts
+                    ,
+                    core.running_dispatch_timestamp, finish_ts
 #endif
-            );
+                ))
+                return false;
             cur_thread_completed++;
         }
 
@@ -434,6 +477,7 @@ void SchedulerContext::check_running_cores_for_completion(
             made_progress = true;
         }
     }
+    return true;
 }
 
 // =============================================================================

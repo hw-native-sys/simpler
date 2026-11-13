@@ -308,6 +308,7 @@ HelloPayload decode_hello(const uint8_t *data, size_t size) {
 }
 
 std::vector<uint8_t> encode_call_config(const CallConfig &config) {
+    ensure(!config.enable_urma_batch, "remote_wire: URMA batching requires a local A5 TMR Program");
     std::vector<uint8_t> out;
     put_i32(out, config.aicpu_thread_num);
     put_i32(out, config.enable_chip_swimlane);

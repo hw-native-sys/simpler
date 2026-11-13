@@ -119,6 +119,7 @@ struct CallConfig {
     int32_t enable_scope_stats = 0;  // writes <output_prefix>/scope_stats/scope_stats.jsonl
     RuntimeEnv runtime_env;          // per-task ring sizing
     char output_prefix[1024] = {};
+    bool enable_urma_batch = false;  // A5 TMR Program on framework-owned streams
 
     bool diagnostics_any() const noexcept {
         return enable_chip_swimlane != 0 || enable_dump_args != 0 || enable_pmu != 0 || enable_dep_gen != 0 ||
@@ -145,6 +146,6 @@ struct CallConfig {
 #pragma pack(pop)
 static_assert(sizeof(RuntimeEnv) == RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t), "RuntimeEnv wire layout drift");
 static_assert(
-    sizeof(CallConfig) == 6 * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024,
+    sizeof(CallConfig) == 6 * sizeof(int32_t) + RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t) + 1024 + 1,
     "CallConfig wire layout drift"
 );

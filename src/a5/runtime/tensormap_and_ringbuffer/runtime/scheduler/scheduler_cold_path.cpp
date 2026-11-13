@@ -35,25 +35,6 @@
 // Cold-path helpers for the main dispatch loop (noinline to reduce hot-loop icache)
 // =============================================================================
 
-// Returns true iff this call won the first-writer CAS for sched_error_code — the
-// caller may then write companion fields (e.g. the stall detail) knowing they
-// describe the same observation that owns the latched code.
-static bool latch_scheduler_error(SharedMemoryHeader *header, int32_t thread_idx, int32_t error_code) {
-    if (header == nullptr || error_code == SIMPLER_ERROR_NONE) {
-        return false;
-    }
-    // The first error code/thread pair wins; the bitmap cumulatively records all reporting threads.
-    int32_t expected = SIMPLER_ERROR_NONE;
-    bool won = header->sched_error_code.compare_exchange_strong(expected, error_code, std::memory_order_acq_rel);
-    if (won) {
-        header->sched_error_thread.store(thread_idx, std::memory_order_release);
-    }
-    if (thread_idx >= 0 && thread_idx < 32) {
-        header->sched_error_bitmap.fetch_or(1U << static_cast<uint32_t>(thread_idx), std::memory_order_acq_rel);
-    }
-    return won;
-}
-
 static const char *orchestrator_fatal_reason(int32_t error_code) {
     return error_code == SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT ? "tensor_data_timeout" : "orchestrator_fatal";
 }
@@ -514,7 +495,7 @@ int32_t SchedulerContext::handle_timeout_exit(
     );
     // Only the thread that wins the code-100 latch publishes the detail/locators,
     // keeping the host-visible sub-class consistent with the latched code.
-    if (latch_scheduler_error(header, thread_idx, SIMPLER_ERROR_SCHEDULER_TIMEOUT) && header != nullptr) {
+    if (latch_scheduler_error(header, thread_idx, SIMPLER_ERROR_SCHEDULER_TIMEOUT)) {
         header->sched_stall_completed.store(cls.completed, std::memory_order_relaxed);
         header->sched_stall_total.store(cls.total, std::memory_order_relaxed);
         header->sched_stall_cnt_running.store(cls.cnt_running, std::memory_order_relaxed);
@@ -801,6 +782,7 @@ int32_t SchedulerContext::retire_claimed_cores(const int32_t *core_ids, int32_t 
     const uint64_t deadline = platform_aicore_exit_deadline();
     const int32_t rc = platform_retire_aicore_group(targets, count, deadline, released);
     if (rc != 0) {
+        core_retirement_failed_.store(true, std::memory_order_release);
         // Naming the cores is the only signal an unretired core leaves: the host
         // sees just a stream timeout.
         for (size_t i = 0; i < count; ++i) {
@@ -1126,6 +1108,7 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
                 ac.completion_error_code = &slab->error_code;
                 ac.completion_entries = &slab->entries[0];
                 ac.completion_capacity = MAX_COMPLETIONS_PER_TASK;
+                dp.global_context.urma_batch_guard = urma_batch_enabled_ ? URMA_BATCH_GUARD : 0;
                 ac.urma_sender_id = core_id >= aic_n ? static_cast<uint32_t>(core_id - aic_n) : UINT32_MAX;
                 slab->count = 0;
                 slab->error_code = SIMPLER_ERROR_NONE;
@@ -1135,6 +1118,7 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
                 dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
                 dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);
             }
+            deferred_slabs_initialized_[core_id] = true;
         }
     }
     publish_retirement_group(tidx);
@@ -1262,6 +1246,7 @@ int32_t SchedulerContext::pre_handshake_init(
     memset(retirement_state_, 0, sizeof(retirement_state_));
     retirement_blocked_layout_ = aicpu_thread_num > 1 && !runtime->dev.serial_orch_sched;
     retirement_unassigned_ = false;
+    urma_batch_enabled_ = runtime->dev.urma_batch_enabled;
 
     // Wire thread/transition configuration that handshake/assign need to read.
     aicpu_thread_num_ = aicpu_thread_num;
@@ -1463,6 +1448,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
             ac.completion_error_code = &slab->error_code;
             ac.completion_entries = &slab->entries[0];
             ac.completion_capacity = MAX_COMPLETIONS_PER_TASK;
+            dp.global_context.urma_batch_guard = urma_batch_enabled_ ? URMA_BATCH_GUARD : 0;
             ac.urma_sender_id = urma_sender;
             // Clear the slab once here; thereafter only the completion path re-clears
             // count (and only when a deferred task dirtied it), never per dispatch.
@@ -1474,6 +1460,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
             dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
             dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);
         }
+        deferred_slabs_initialized_[core_id] = true;
     }
 
     func_id_to_addr_ = reinterpret_cast<uint64_t *>(runtime->dev.callable_table_addr_);
@@ -1490,6 +1477,7 @@ void SchedulerContext::deinit() {
         core_exec_states_[i] = {};
         core_exec_states_[i].running_reg_task_id = AICPU_TASK_INVALID;
         core_exec_states_[i].pending_reg_task_id = AICPU_TASK_INVALID;
+        deferred_slabs_initialized_[i] = false;
     }
 
     // No per-core memset of payload_per_core_ / deferred_slab_per_core_ here
@@ -1521,6 +1509,8 @@ void SchedulerContext::deinit() {
     orchestrator_done_.store(false, std::memory_order_release);
     completed_.store(false, std::memory_order_release);
     fatal_shutdown_started_.store(false, std::memory_order_release);
+    core_retirement_failed_.store(false, std::memory_order_release);
+    accounted_urma_submit_error_.store(SIMPLER_ERROR_NONE, std::memory_order_release);
 
     // Reset core discovery and assignment state
     aic_count_ = 0;

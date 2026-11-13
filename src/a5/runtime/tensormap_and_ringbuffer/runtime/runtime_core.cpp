@@ -99,6 +99,13 @@ static bool wait_for_tensor_ready(
 ) {
     TaskId owner = tensor.owner_task_id;
     OrchestratorState &orch = rt->orchestrator;
+    const auto scheduler_failed = [&] {
+        if (orch.sm_header->sched_error_code.load(std::memory_order_acquire) == SIMPLER_ERROR_NONE) return false;
+        // Stop further orchestration without replacing the scheduler's error.
+        orch.fatal = true;
+        return true;
+    };
+    if (scheduler_failed()) return false;
 
     // Segmented wait: collect up to kSegmentCap producer slots, then flush by
     // spinning on each. When the segment fills, we wait for the accumulated
@@ -120,7 +127,8 @@ static bool wait_for_tensor_ready(
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0) {
                 // A fatal latched elsewhere breaks this wait; cold path only.
-                if (orch.sm_header->orch_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE) {
+                if (scheduler_failed() ||
+                    orch.sm_header->orch_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE) {
                     failed = true;
                     return;
                 }
@@ -153,7 +161,8 @@ static bool wait_for_tensor_ready(
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0) {
                 // A fatal latched elsewhere breaks this wait; cold path only.
-                if (orch.sm_header->orch_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE) {
+                if (scheduler_failed() ||
+                    orch.sm_header->orch_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE) {
                     failed = true;
                     return;
                 }
@@ -219,7 +228,7 @@ static bool wait_for_tensor_ready(
     };
 
     do_wait();
-    return !failed;
+    return !failed && !scheduler_failed();
 }
 MAYBE_UNINITIALIZED_END
 

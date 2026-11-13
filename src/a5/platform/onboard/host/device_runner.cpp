@@ -350,6 +350,7 @@ int DeviceRunner::prepare_execution(
 ) {
     if (prepared == nullptr || *prepared != nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     auto execution = std::make_unique<PreparedExecution>(identity, runtime, config, pipeline_slot);
+    execution->requires_dma_quiescence = config.enable_urma_batch;
     execution->scheduler_runtime_mode = last_scheduler_runtime_mode();
     execution->resources_owned = true;
     auto prepare_rollback = RAIIScopeGuard([this, &execution]() {
@@ -390,7 +391,9 @@ int DeviceRunner::prepare_execution(
 
     // Kernel execution keeps its invocation identity without requesting private
     // detail when diagnostics are off. Program retains its structured errors.
-    rc = ensure_device_run_result_region(identity, execution->kernel_args, execution->dfx);
+    rc = ensure_device_run_result_region(
+        identity, execution->kernel_args, execution->dfx, execution->requires_dma_quiescence
+    );
     if (rc != 0) return rc;
 
     if (block_dim < 1) {
@@ -499,6 +502,9 @@ int DeviceRunner::prepare_execution(
         return rc;
     }
     SlotPersistentArgs &slot_args = slot_persistent_args(execution->pipeline_slot);
+#if defined(SIMPLER_A5_TMR)
+    runtime.dev.urma_batch_enabled = execution->requires_dma_quiescence;
+#endif
     rc = init_runtime_args_with_metadata(runtime, execution->kernel_args, slot_args);
     if (rc != 0) return rc;
 
@@ -512,6 +518,14 @@ int DeviceRunner::prepare_execution(
 }
 
 LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) {
+    if (prepared.requires_dma_quiescence) {
+        // Host receipt verification must happen before a successor can use
+        // the predecessor's buffers, including through an external stream.
+        if (prepared.join.predecessor_owner != nullptr || prepared.caller_stream != nullptr || prepared.recording) {
+            return LaunchTransactionResult{PTO_RUNTIME_ERR_UNSUPPORTED, LaunchProgress::NotStarted, LaunchReceipt{}};
+        }
+        prepared.joinable_boundary = false;
+    }
     // Prepared is admitted as well as Published: publication happens below,
     // once this run holds the stream it will submit on. What a kernel
     // submission requires is Published, which the transaction's entry fork

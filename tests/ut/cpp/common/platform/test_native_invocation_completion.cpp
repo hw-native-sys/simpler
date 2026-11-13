@@ -87,6 +87,42 @@ TEST(NativeInvocationCompletion, LastContributorObservesAllPriorWrites) {
         EXPECT_EQ(rc, 0);
 }
 
+TEST(NativeInvocationCompletion, AccountedUrmaFailureRequiresPublishedRecord) {
+    NativeInvocationCompletion completion;
+    for (const auto publication :
+         {NativeTerminalPublication::Published, NativeTerminalPublication::NotRequested,
+          NativeTerminalPublication::InvalidState}) {
+        ASSERT_TRUE(completion.begin(1));
+        ASSERT_TRUE(completion.accept_runtime_terminal(
+            {DeviceRunVerdict::Error, -101, DeviceRunCodeSource::AccountedUrmaSubmit}, nullptr, 0
+        ));
+        EXPECT_EQ(
+            completion.finish(
+                0, -101,
+                [publication](RunTerminalSelection terminal, const void *, size_t) {
+                    EXPECT_EQ(terminal.code, -101);
+                    return publication;
+                }
+            ),
+            publication == NativeTerminalPublication::Published ? 0 : -101
+        );
+    }
+}
+
+TEST(NativeInvocationCompletion, AccountedUrmaFailureKeepsTransportErrorOnLaterCallbackDisagreement) {
+    NativeInvocationCompletion completion;
+    Publication publish;
+    ASSERT_TRUE(completion.begin(3));
+    ASSERT_TRUE(completion.accept_runtime_terminal(
+        {DeviceRunVerdict::Error, -101, DeviceRunCodeSource::AccountedUrmaSubmit}, nullptr, 0
+    ));
+    EXPECT_EQ(completion.finish(0, -101, publish), 0);
+    EXPECT_EQ(completion.finish(1, -52, publish), 0);
+    EXPECT_EQ(completion.finish(2, -101, publish), -101);
+    EXPECT_EQ(publish.result.verdict, DeviceRunVerdict::Error);
+    EXPECT_EQ(publish.result.source, DeviceRunCodeSource::Header);
+}
+
 TEST(NativeInvocationCompletion, RuntimeFailureOutranksEntryErrorAndOwnsPayload) {
     NativeInvocationCompletion completion;
     ASSERT_TRUE(completion.begin(2));

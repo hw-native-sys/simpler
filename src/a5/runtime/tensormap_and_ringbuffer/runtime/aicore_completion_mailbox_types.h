@@ -39,6 +39,18 @@ inline constexpr int32_t MAX_COMPLETIONS_PER_TASK = 64;
 #define COMPLETION_TYPE_RDMA_EVENT_HANDLE 3
 #define COMPLETION_TYPE_CCU 4
 
+// Internal to the deferred completion slab. An accounted error leaves no newly
+// published DMA without a completion target. Report only the code to callers.
+inline constexpr int32_t DEFERRED_ERROR_DMA_ACCOUNTED = 1 << 30;
+
+constexpr int32_t deferred_submit_error_code(int32_t error) {
+    return error > 0 ? error & ~DEFERRED_ERROR_DMA_ACCOUNTED : error;
+}
+
+constexpr bool deferred_submit_error_dma_accounted(int32_t error) {
+    return error > 0 && (error & DEFERRED_ERROR_DMA_ACCOUNTED) != 0 && deferred_submit_error_code(error) != 0;
+}
+
 // DeferredCompletionEntry / DeferredCompletionSlab back the per-task scratch
 // area that AICore writes into to record "this completion has to be observed
 // before the task can retire." The FIN-handling scheduler thread reads the

@@ -1027,11 +1027,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         int32_t completed_this_turn = 0;
 
         bool try_completed = tracker.has_any_running_cores();
-        if (try_completed) {
-            check_running_cores_for_completion(
-                thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress,
-                deferred_release_slot_states, deferred_release_count
-            );
+        if (try_completed && !check_running_cores_for_completion(
+                                 thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress,
+                                 deferred_release_slot_states, deferred_release_count
+                             )) {
+            break;
         }
         if (completed_this_turn > 0) {
 #if SIMPLER_SCHED_PROFILING
@@ -1092,10 +1092,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
             );
             if (poll_result.error_code != SIMPLER_ERROR_NONE) {
-                int32_t expected = SIMPLER_ERROR_NONE;
-                header->sched_error_code.compare_exchange_strong(
-                    expected, poll_result.error_code, std::memory_order_acq_rel, std::memory_order_acquire
-                );
+                latch_scheduler_error(header, thread_idx, poll_result.error_code);
                 completed_.store(true, std::memory_order_release);
                 break;
             }

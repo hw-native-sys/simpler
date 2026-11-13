@@ -1275,6 +1275,8 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
         std::lock_guard<std::mutex> lk(native_run_mu_);
         if (native_runs_closing_) throw RunPreparationRefused("native context is closing");
         if (!initialized_) throw RunPreparationRefused("ChipWorker not initialized; call init() first");
+        if (config.enable_urma_batch && !device_owner_reserved_)
+            throw RunPreparationRefused("URMA batching requires an onboard A5 TMR Program");
         if (slot_id >= runtime_bufs_.size())
             throw RunPreparationRefused("native-run slot is outside the runtime PipelineContract");
         for (const auto &candidate : native_runs_) {
@@ -2040,14 +2042,20 @@ void ChipWorker::wait_native_run(const ChipWorkerNativeRun &run) {
 void ChipWorker::finalize_native_run(const ChipWorkerNativeRun &run) { finalize_native_run_impl(run, nullptr); }
 
 void ChipWorker::finalize_native_run_impl(
-    const ChipWorkerNativeRun &run, bool *no_submission_released, bool deliver_outputs, bool *context_destroyed
+    const ChipWorkerNativeRun &run, bool *no_submission_released, bool deliver_outputs, bool *context_destroyed,
+    bool *task_failure_released
 ) {
+    if (task_failure_released != nullptr) *task_failure_released = false;
     if (no_submission_released != nullptr) *no_submission_released = false;
     if (context_destroyed != nullptr) *context_destroyed = false;
     validate_execution_process();
     const NativeRunFinalizeOutcome outcome =
         finalize_native_run_epoch(run.run_epoch, &run, FinalizeMode::Caller, deliver_outputs);
     if (context_destroyed != nullptr) *context_destroyed = outcome.context_destroyed;
+    if (task_failure_released != nullptr && outcome.captured == nullptr && outcome.context_destroyed &&
+        outcome.fault == FinalizeFault::Failed) {
+        *task_failure_released = outcome.task_failure_released;
+    }
     if (no_submission_released != nullptr && outcome.captured == nullptr &&
         (outcome.fault == FinalizeFault::None || outcome.fault == FinalizeFault::Failed)) {
         *no_submission_released = outcome.no_submission_released;
@@ -2234,6 +2242,10 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
     // reads as a live context — so that case is isolated rather than offered for a retry.
     if (entered_finalize && outcome.captured == nullptr) {
         outcome.no_submission_released = consume_released_preparation(storage, storage_bytes, run_epoch);
+        if (!transfer && (!persisted || persisted_rc == finalize_rc)) {
+            outcome.task_failure_released =
+                consume_released_task_failure(storage, storage_bytes, run_epoch, finalize_rc);
+        }
     }
     const RunStorageTag tag = entered_finalize ? read_run_storage_tag(storage) : RunStorageTag::Canonical;
     const bool threw = outcome.captured != nullptr;

@@ -66,6 +66,28 @@ TEST(NativeInvocationEntry, ActualBeginHandoffFinishRepeatWithSameBinding) {
         EXPECT_EQ(device_run_result_terminal(storage.result, 7).state, DeviceRunTerminalState::Succeeded);
     }
 }
+TEST(NativeInvocationEntry, AccountedUrmaFailurePublishesItsSemanticErrorWithSuccessfulTransport) {
+    NativeInvocationResultStorage storage;
+    ASSERT_EQ(initialize(&storage), 0);
+    RunTerminalPublisher publisher;
+    const uint8_t scene[] = {43};
+    publisher.take({DeviceRunVerdict::Error, -101, DeviceRunCodeSource::AccountedUrmaSubmit}, scene, sizeof(scene));
+    ASSERT_TRUE(publisher.handoff());
+    for (int i = 0; i < 5; ++i)
+        EXPECT_EQ(aicpu_finish_native_invocation(i, i == 2 ? -101 : 0), 0);
+    EXPECT_EQ(storage.result.published, 0u);
+    EXPECT_EQ(aicpu_finish_native_invocation(5, -101), 0);
+
+    const auto terminal = device_run_result_terminal(storage.result, 7);
+    EXPECT_EQ(terminal.state, DeviceRunTerminalState::Failed);
+    EXPECT_EQ(terminal.code, -101);
+    EXPECT_EQ(terminal.source, DeviceRunCodeSource::AccountedUrmaSubmit);
+    EXPECT_EQ(storage.result.payload[0], 43);
+    const auto saved = storage.evidence.read_after_exit();
+    EXPECT_EQ(saved.kind, NativeInvocationEvidence::Kind::Error);
+    EXPECT_EQ(saved.terminal.code, -101);
+}
+
 TEST(NativeInvocationEntry, ErrorSurvivesFollowingSuccessWithoutSkippingIt) {
     NativeInvocationResultStorage storage;
     run(storage, -77, true);
