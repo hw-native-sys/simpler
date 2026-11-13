@@ -136,6 +136,7 @@ public:
 
 private:
     friend class SchedulerContextTestPeer;
+    friend class DrainAdmissionTestPeer;
     // =========================================================================
     // State
     // =========================================================================
@@ -372,7 +373,7 @@ private:
     );
 
     enum class MixPriority : uint8_t { ReadySync, Ready, Early };
-    LaneMask unreserved_mix_lanes(MixPriority priority, LaneMask &observed) const;
+    LaneMask unreserved_mix_lanes(MixPriority priority, LaneMask &observed, int32_t thread_idx = 0) const;
 
     void dispatch_shape(
         int32_t thread_idx, ChipReadyQueue *disp_queues, ResourceShape shape, CoreTracker::DispatchPhase phase,
@@ -419,7 +420,9 @@ private:
     // Shared MIX/idle/pending order. Pure stages filter physical lanes in their
     // leaf queries; residual_mix() refreshes the prefix for peer-idle hints.
     template <typename StageFn, typename ResidualMixFn>
-    void run_staging_order(int32_t thread_idx, bool pmu_active, StageFn &&stage, ResidualMixFn &&residual_mix);
+    void run_staging_order(
+        int32_t thread_idx, bool pmu_active, StageFn &&stage, ResidualMixFn &&residual_mix, bool replay_retained = false
+    );
 
     // Returns true if any *other* scheduler thread currently has an idle core
     // matching `shape`. Used as a scheduling hint on the PENDING dispatch path
@@ -581,4 +584,24 @@ private:
         }
         return func_id_to_addr_[func_id];
     }
+    struct RetainedReadyRange {
+        ChipTaskSlotState *slot = nullptr;
+        int32_t start = 0;
+        int32_t count = 0;
+    };
+    // A rejected batch contributes at most one range per popped entry. Replay drains
+    // these ranges before this owner pops another regular batch.
+    struct RetainedReadyWork {
+        static constexpr int CAP = CoreTracker::MAX_CLUSTERS;
+        RetainedReadyRange ranges[CAP];
+        int32_t count = 0;
+        LaneMask lanes = LaneMask::none();
+    };
+    RetainedReadyWork retained_ready_[MAX_AICPU_THREADS];
+
+    void retain_ready_range(int32_t thread_idx, ChipTaskSlotState *slot, int32_t start, int32_t count);
+    void replay_ready_ranges(
+        int32_t thread_idx, CoreTracker::DispatchPhase phase, CoreTracker &tracker, bool &stop_dispatch,
+        bool &made_progress, bool &try_pushed
+    );
 };
