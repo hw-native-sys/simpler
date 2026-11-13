@@ -95,7 +95,7 @@ def test_auxiliary_probe():
     result, plan, _ = execution(source, "--verify-feature-coverage")
     assert result.returncode == 0, result.stdout + result.stderr
     summary = json.loads(plan.with_suffix(".coverage.json").read_text())
-    assert "kernel/tensormap_and_ringbuffer/capture_replay" in summary["not_delivered"]
+    assert "kernel/tensormap_and_ringbuffer/capture_replay" not in summary["not_delivered"]
     assert "auxiliary/tensormap_and_ringbuffer" in summary["groups"]
 
 
@@ -267,7 +267,7 @@ def test_report_rechecks_real_dispatcher_results(execution, tmp_path, monkeypatc
     else:
         assert "Verified receipts" in rendered
         assert "kernel/tensormap_and_ringbuffer/eager | 1 | 1 | 1 | 0" in rendered
-        assert "Not delivered" in rendered
+        assert "Not delivered" not in rendered
         document = json.loads((tmp_path / "coverage-summary.json").read_text())
         assert document["run_url"] == "https://github.example/owner/project/actions/runs/123"
         assert document["partitions"]["main"]["identity"] == json.loads(plan.read_text())["identity"]

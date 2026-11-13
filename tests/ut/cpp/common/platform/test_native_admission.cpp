@@ -384,6 +384,284 @@ void bind_program_lane(ChipWorker &worker, FencedCompletionRunner &runner) {
 }
 }  // namespace
 
+TEST_F(NativeAdmissionTest, ManualWorkspaceRefusalRollsBackAttemptClaimsBeforeReturning) {
+    class ManualRunner : public Runner {
+    public:
+        ManualRunner() :
+            Runner(false, AdmissionMode::FixedGrant) {}
+        bool claim(void *base, uint64_t epoch) {
+            if (!workspace_.reference(base, epoch)) return false;
+            const auto region = WorkspaceManager::staging_region(0);
+            AutoAdmissionState::record_claim({base, static_cast<uint32_t>(region.domain), region.index, epoch, true});
+            return true;
+        }
+        void drop(void *base, uint64_t epoch) { (void)workspace_.release_ref(base, epoch); }
+    } runner;
+    constexpr size_t budget = 64 * kUnit;
+    ASSERT_EQ(simpler_set_workspace_budget_ctx(&runner, budget), 0);
+    ASSERT_EQ(runner.install_staged_workspace(), 0);
+    ASSERT_EQ(staging(runner, 0, 10, kUnit), 0);
+    void *source = nullptr;
+    size_t extent = 0;
+    runner.get_retained_temp_buffer(0, &source, &extent);
+    ASSERT_NE(source, nullptr);
+    std::memset(source, 0x5a, extent);
+    const std::vector<uint8_t> snapshot(static_cast<uint8_t *>(source), static_cast<uint8_t *>(source) + extent);
+    for (bool arena : {false, true}) {
+        SCOPED_TRACE(arena);
+        DeviceRunnerBase::PrepareWorkspaceScope plan(1, 20);
+        // A real reference already acquired by this transaction must be returned
+        // at the endpoint refusal, before any outer prepare cleanup runs.
+        ASSERT_TRUE(runner.claim(source, 20));
+        ASSERT_TRUE(runner.holds_epoch(20));
+        void *candidate = nullptr;
+        size_t capacity = 0;
+        const int rc = arena ? runner.setup_static_arena(1, budget * 2, 0, 0) :
+                               runner.acquire_retained_temp(1, budget * 2, &candidate, &capacity);
+        EXPECT_EQ(rc, SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE);
+        EXPECT_TRUE(AutoAdmissionState::claims().empty());
+        EXPECT_FALSE(runner.holds_epoch(20));
+        EXPECT_TRUE(runner.holds_epoch(10));
+        EXPECT_EQ(std::memcmp(source, snapshot.data(), extent), 0);
+        // Leave a failing negative control safe without hiding the observations.
+        runner.drop(source, 20);
+        AutoAdmissionState::commit_claims();
+    }
+    runner.drop(source, 10);
+}
+
+namespace {
+class PartialQuotaProvisionRunner : public Runner {
+public:
+    PartialQuotaProvisionRunner() :
+        Runner(false, AdmissionMode::FixedGrant) {}
+    unsigned provision_calls = 0;
+    size_t allocations_before_provision = 0;
+    size_t allocations_after_provision = 0;
+    size_t bytes_before_provision = 0;
+    size_t bytes_after_provision = 0;
+
+    int provision_native_run_resources(uint32_t slot) override {
+        ++provision_calls;
+        allocations_before_provision = control().successful_allocations;
+        bytes_before_provision = charged();
+        const int rc = setup_static_arena(native_admission_test::arena_bank(slot), 4 * kUnit, 128 * kUnit, 0);
+        allocations_after_provision = control().successful_allocations;
+        bytes_after_provision = charged();
+        return rc;
+    }
+};
+}  // namespace
+
+TEST_F(NativeAdmissionTest, ManualPartialArenaRefusalReclaimsAfterConfirmedThreadAttachment) {
+    PartialQuotaProvisionRunner runner;
+    ASSERT_EQ(simpler_set_workspace_budget_ctx(&runner, 64 * kUnit), 0);
+    ASSERT_EQ(runner.install_staged_workspace(), 0);
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    EXPECT_FALSE(runner.automatic_admission_enabled());
+    Attempt attempt(runner, 0, 1);
+    use_capture_preparation(attempt);
+    volatile int32_t accepted = 73;
+    attempt.descriptor.accepted_state = &accepted;
+    attempt.descriptor.accepted_value = 1;
+    SimplerWorkspaceReport before{};
+    ASSERT_EQ(simpler_get_workspace_report_ctx(&runner, &before, sizeof(before)), 0);
+    const int rc = attempt.prepare();
+    EXPECT_EQ(rc, SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE);
+    EXPECT_EQ(runner.provision_calls, 1u);
+    EXPECT_EQ(runner.allocations_after_provision, runner.allocations_before_provision + 1);
+    EXPECT_GT(runner.bytes_after_provision, runner.bytes_before_provision);
+    EXPECT_EQ(runner.arena_bank_gm_heap_base(native_admission_test::arena_bank(0)), 0u);
+    EXPECT_EQ(accepted, 73);
+    EXPECT_EQ(runner.launch_calls, 0);
+    ASSERT_TRUE(attempt.consume_release());
+    ASSERT_EQ(simpler_abort_run_plan_ctx(&runner, 0, 1), 0);
+    SimplerWorkspaceReport after{};
+    ASSERT_EQ(simpler_get_workspace_report_ctx(&runner, &after, sizeof(after)), 0);
+    std::printf(
+        "manual-partial-refusal before=%llu after_abort=%llu allocations=%zu rc=%d\n",
+        static_cast<unsigned long long>(before.reserved_bytes), static_cast<unsigned long long>(after.reserved_bytes),
+        control().successful_allocations, rc
+    );
+    EXPECT_LE(after.reserved_bytes, before.reserved_bytes);
+    ASSERT_EQ(runner.reclaim_workspace_obsolete(), 0);
+    ASSERT_EQ(simpler_get_workspace_report_ctx(&runner, &after, sizeof(after)), 0);
+    std::printf(
+        "manual-partial-refusal after_attached_reclaim=%llu\n", static_cast<unsigned long long>(after.reserved_bytes)
+    );
+    EXPECT_LE(after.reserved_bytes, before.reserved_bytes);
+}
+
+TEST_F(NativeAdmissionTest, ManualPrepareAttachFailureKeepsDeferredBacking) {
+    Runner runner(false, AdmissionMode::FixedGrant);
+    ASSERT_EQ(simpler_set_workspace_budget_ctx(&runner, 64 * kUnit), 0);
+    ASSERT_EQ(runner.install_staged_workspace(), 0);
+    {
+        DeviceRunnerBase::PrepareWorkspaceScope plan(0, 10);
+        ASSERT_EQ(runner.setup_static_arena(0, 4 * kUnit, 128 * kUnit, 0), SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE);
+    }
+    runner.note_workspace_run_fact(NativeRunIdentity{10, 10, 10, 0}, WorkspaceManager::RunFact::NoDeviceSubmission);
+    runner.retire(0, 10);
+    const auto retained = runner.charged();
+    ASSERT_GT(retained, 0u);
+    Attempt attempt(runner, 0, 20);
+    control().attach_rc = -6261;
+    EXPECT_EQ(attempt.prepare(), -6261);
+    EXPECT_TRUE(attempt.consume_release());
+    EXPECT_EQ(runner.charged(), retained);
+    control().attach_rc = 0;
+    EXPECT_EQ(runner.reclaim_workspace_obsolete(), 0);
+    EXPECT_EQ(runner.charged(), 0u);
+}
+
+TEST_F(NativeAdmissionTest, ManualPartialRefusalKeepsFailedFreeOwnedAndOriginalError) {
+    PartialQuotaProvisionRunner runner;
+    ASSERT_EQ(simpler_set_workspace_budget_ctx(&runner, 64 * kUnit), 0);
+    ASSERT_EQ(runner.install_staged_workspace(), 0);
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    Attempt attempt(runner, 0, 1);
+    use_capture_preparation(attempt);
+    control().free_rc = -6262;
+    EXPECT_EQ(attempt.prepare(), SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE);
+    EXPECT_EQ(runner.provision_calls, 1u);
+    EXPECT_EQ(runner.allocations_after_provision, runner.allocations_before_provision + 1);
+    EXPECT_GT(runner.bytes_after_provision, runner.bytes_before_provision);
+    EXPECT_EQ(runner.arena_bank_gm_heap_base(native_admission_test::arena_bank(0)), 0u);
+    EXPECT_TRUE(attempt.consume_release());
+    SimplerWorkspaceReport after{};
+    ASSERT_EQ(simpler_get_workspace_report_ctx(&runner, &after, sizeof(after)), 0);
+    EXPECT_GT(after.reserved_bytes, 0u);
+    EXPECT_GT(after.release_unconfirmed_blocks, 0u);
+    EXPECT_EQ(after.proof_unavailable, 1u);
+    control().free_rc = 0;
+    EXPECT_EQ(finalize_device(&runner), 0);
+    EXPECT_EQ(runner.charged(), 0u);
+}
+
+TEST_F(NativeAdmissionTest, ManualWorkspaceRefusalKeepsRetainedSourceAndSameRequestRecovers) {
+    class ManualRunner : public FencedCompletionRunner {
+    public:
+        ManualRunner() :
+            FencedCompletionRunner(false, AdmissionMode::FixedGrant) {
+            static int binary;
+            aicore_bin_handle_ = &binary;
+            EXPECT_EQ(execution_mode_latch().latch(SIMPLER_MODE_PROGRAM), 0);
+        }
+    } runner;
+    constexpr uint64_t budget = 64 * 1024 * 1024;
+    ASSERT_EQ(simpler_set_workspace_budget_ctx(&runner, budget), 0);
+    ASSERT_EQ(runner.install_staged_workspace(), 0);
+    EXPECT_FALSE(runner.automatic_admission_enabled());
+    Attempt first(runner, 0, 1);
+    ASSERT_EQ(first.prepare(), 0);
+    int caller = 0;
+    RuntimeHandle reference = nullptr;
+    ASSERT_EQ(simpler_retain_run_resources(&runner, first.storage, &caller, &reference), 0);
+    auto cleanup = RAIIScopeGuard([&] {
+        if (reference != nullptr) (void)simpler_release_run_resources(&runner, reference);
+    });
+    void *backing = nullptr;
+    size_t extent = 0;
+    runner.get_retained_temp_buffer(0, &backing, &extent);
+    const auto *source = static_cast<const uint8_t *>(backing);
+    ASSERT_NE(source, nullptr);
+    ASSERT_GT(extent, 0u);
+    const std::vector<uint8_t> snapshot(source, source + extent);
+    ASSERT_EQ(simpler_finalize_run(&runner, first.storage), 0);
+    SimplerWorkspaceReport held{};
+    ASSERT_EQ(simpler_get_workspace_report_ctx(&runner, &held, sizeof(held)), 0);
+    ASSERT_GT(held.reserved_bytes, 4096u);
+    ASSERT_LT(held.reserved_bytes, budget / 2);
+    Attempt candidate(runner, 0, 2, budget - held.reserved_bytes - held.reserved_bytes / 2);
+    volatile int32_t accepted = 73;
+    candidate.descriptor.accepted_state = &accepted;
+    candidate.descriptor.accepted_value = 1;
+    const int rc = candidate.prepare();
+    EXPECT_EQ(rc, SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE);
+    EXPECT_EQ(accepted, 73);
+    EXPECT_EQ(runner.launch_calls, 0);
+    ASSERT_TRUE(candidate.consume_release());
+    EXPECT_EQ(runner.reservations(), 0u);
+    ASSERT_EQ(simpler_abort_run_plan_ctx(&runner, 0, 2), 0);
+    EXPECT_EQ(std::memcmp(source, snapshot.data(), extent), 0);
+    ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
+    reference = nullptr;
+    candidate.descriptor.run_epoch = candidate.descriptor.generation = candidate.descriptor.dispatch_id = 3;
+    const int retry = candidate.prepare();
+    if (retry != 0) EXPECT_TRUE(candidate.consume_release());
+    ASSERT_EQ(retry, 0);
+    ASSERT_EQ(simpler_finalize_run(&runner, candidate.storage), 0);
+    ASSERT_EQ(finalize_device(&runner), 0);
+    EXPECT_EQ(runner.charged(), 0u);
+}
+
+TEST_F(NativeAdmissionTest, ManualWorkspaceArenaQuotaReturnsUnavailableBeforeSubmission) {
+    Runner runner(false, AdmissionMode::FixedGrant);
+    ASSERT_EQ(simpler_set_workspace_budget_ctx(&runner, kUnit), 0);
+    ASSERT_EQ(runner.install_staged_workspace(), 0);
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    EXPECT_FALSE(runner.automatic_admission_enabled());
+    Attempt attempt(runner, 0, 1);
+    use_capture_preparation(attempt);
+    volatile int32_t accepted = 73;
+    attempt.descriptor.accepted_state = &accepted;
+    attempt.descriptor.accepted_value = 1;
+    EXPECT_EQ(attempt.prepare(), SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE);
+    EXPECT_EQ(accepted, 73);
+    EXPECT_EQ(runner.launch_calls, 0);
+    EXPECT_TRUE(attempt.consume_release());
+    EXPECT_EQ(runner.reservations(), 0u);
+    EXPECT_FALSE(runner.holds_epoch(1));
+    EXPECT_EQ(runner.plan(0).phase, AutoAdmissionState::Phase::None);
+    EXPECT_EQ(simpler_abort_run_plan_ctx(&runner, 0, 1), 0);
+    EXPECT_EQ(runner.reclaim_workspace_obsolete(), 0);
+    EXPECT_EQ(runner.charged(), 0u);
+}
+
+TEST_F(NativeAdmissionTest, ManualWorkspaceBackendFailureRemainsInternal) {
+    Runner runner(false, AdmissionMode::FixedGrant);
+    ASSERT_EQ(simpler_set_workspace_budget_ctx(&runner, 64 * kUnit), 0);
+    ASSERT_EQ(runner.install_staged_workspace(), 0);
+    EXPECT_FALSE(runner.automatic_admission_enabled());
+    Attempt attempt(runner, 0, 1, 4 * kUnit);
+    volatile int32_t accepted = 73;
+    attempt.descriptor.accepted_state = &accepted;
+    attempt.descriptor.accepted_value = 1;
+    const auto allocations = control().allocations;
+    control().fail_allocation = allocations + 1;
+    EXPECT_EQ(attempt.prepare(), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(control().allocations, allocations + 1);
+    EXPECT_EQ(accepted, 73);
+    EXPECT_EQ(runner.launch_calls, 0);
+    EXPECT_TRUE(attempt.consume_release());
+    EXPECT_EQ(runner.reservations(), 0u);
+    EXPECT_FALSE(runner.holds_epoch(1));
+    EXPECT_EQ(runner.plan(0).phase, AutoAdmissionState::Phase::None);
+    EXPECT_EQ(runner.charged(), 0u);
+}
+
+TEST_F(NativeAdmissionTest, ManualWorkspaceQuotaRefusalReturnsUnavailableBeforeSubmission) {
+    Runner runner(false, AdmissionMode::FixedGrant);
+    ASSERT_EQ(simpler_set_workspace_budget_ctx(&runner, kUnit), 0);
+    ASSERT_EQ(runner.install_staged_workspace(), 0);
+    EXPECT_FALSE(runner.automatic_admission_enabled());
+    Attempt attempt(runner, 0, 1, 4 * kUnit);
+    volatile int32_t accepted = 73;
+    attempt.descriptor.accepted_state = &accepted;
+    attempt.descriptor.accepted_value = 1;
+    const auto allocations = control().allocations;
+    EXPECT_EQ(attempt.prepare(), SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE);
+    EXPECT_EQ(accepted, 73);
+    EXPECT_EQ(runner.launch_calls, 0);
+    EXPECT_EQ(control().allocations, allocations) << "quota refusal precedes the SDK allocation leaf";
+    EXPECT_TRUE(attempt.consume_release());
+    EXPECT_EQ(runner.reservations(), 0u);
+    EXPECT_FALSE(runner.holds_epoch(1));
+    EXPECT_EQ(runner.plan(0).phase, AutoAdmissionState::Phase::None);
+    EXPECT_EQ(simpler_abort_run_plan_ctx(&runner, 0, 1), 0);
+    EXPECT_EQ(runner.charged(), 0u);
+}
+
 TEST_F(NativeAdmissionTest, ReusedSlotReleasesCallerBorrowOnlyAfterItsOwnBoundaryProof) {
     for (bool own_complete : {false, true}) {
         SCOPED_TRACE(own_complete);

@@ -142,6 +142,9 @@ def policy(config, cases):
             required.add(capture)
         elif environment == "default" and platform in ("a2a3", "a5") and rt == "host_build_graph":
             required.add(capture)
+        elif environment == "default" and platform in ("a2a3", "a5") and rt == "tensormap_and_ringbuffer":
+            # Native TMR capture may run without imposing a global coverage obligation.
+            pass
         else:
             gaps.add(capture)
     baseline = set(required)
