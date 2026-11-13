@@ -9,8 +9,8 @@ The research and hardware comparison baseline is
 The initial publication rebased onto `6c691bef8a1752aff34889b366204da36fe41701`,
 including upstream's scalar-trace ownership fix; HBG/percounter production builds
 and static checks passed at that base. Subsequent review updates rebase onto
-upstream/main. Hardware results below precede those updates; no new device run
-or production build at the latest base is claimed.
+upstream/main. Historical execution-removal results below precede those updates;
+follow-up builds and device checks are recorded separately.
 The [Chinese investigation and validation record](../zh-cn/investigations/2026-11-a5-hbg-legacy-removal.md)
 contains the layout proofs, startup pseudocode, source references, individual
 hardware task IDs and failure comparisons.
@@ -31,11 +31,43 @@ hardware task IDs and failure comparisons.
   do not prove retirement. Failed terminals preserve the first execution error
   and cleanup outcome. PMU settlement requires ownership established by this run.
 
-The shared arena allocation and 512-byte kernel dispatch/context ABI remain for
-separate cleanup. A2A3 HBG, A5 TMR and the active percounter extension remain
+The shared arena allocation is removed in the follow-up described below. The
+512-byte kernel dispatch/context ABI remains for separate cleanup. A2A3 HBG, A5 TMR and the active percounter extension remain
 supported.
 
-## Validation on 2026-11-13
+## Compact task-image arena follow-up
+
+After #3064 merged as `e37461139e7e58dc57f3b8914d278494c76bddd7`, the A5 maker
+stops reserving the common full arena. The task image occupies offset zero of the
+pooled runtime allocation: request size, `sm_image_bytes` and publication length
+are equal, and publication targets `gm_sm_ptr`. No SchedulerState, ready queue,
+completion mailbox, SM wrapper or copied RuntimeContext header precedes it.
+Host orchestration uses a local RuntimeContext; retained retries store their
+callback result independently. Commit attaches the populated host mirror without
+resetting its task count or execution header. Native boundary addresses, ordinary storage
+addresses and protocol source mapping all use the compact image base.
+
+The common full arena remains active for A2A3/WSE. Percounter compiles the A5 maker
+and receives the same image-only allocation. No kernel context/async ABI change
+or device execution/retirement change is part of this follow-up.
+
+Regression assertions cover both A5 image-only and A2A3 full-arena contracts,
+including ordinary and Graph prepares and publication. Local CPU/simulator tests
+are intentionally not run. Follow-up build/device validation is recorded in the
+Chinese investigation: both HBG/percounter production builds passed, A5 IR scanning
+completed 16/16 TUs with zero findings, and normal scene tests passed 12 with one
+simulator-only skip. Twenty distinct async/reuse nodes passed across two device
+submissions: the first hit its whole-session 600-second budget after 13 collected
+passes; the remaining seven passed in a separate submission, with assertions
+unchanged. These checks use the `e37461139` production source base; rebasing onto
+`60a2ba4cf` adds only CI/docs/test-environment changes. No benchmark or new fault
+acceptance result is claimed. After fixing populated-mirror attachment, both production builds passed again,
+with 12 normal tests passing (one simulator-only skip) and both cross-run epoch
+reuse nodes passing in a separate submission. The admission trimming test injects
+one explicit allocation refusal instead of depending on the arena's size.
+Historical results below apply only to #3064.
+
+## Execution-removal validation on 2026-11-13
 
 Compilation and workload preparation took place before device allocation. All
 hardware tests ran through `task-submit`, with an in-job architecture precheck:
@@ -62,6 +94,7 @@ user's request. No performance result is claimed.
   then passed when repeated.
 
 These are targeted device results, not a complete CI or failed-start fault
-injection verdict. Keep the PR in Draft while the unexplained healthy-run
-exceptions and full failure acceptance remain outstanding. Do not relax test
-assertions to turn these runs green.
+injection verdict. #3064 was subsequently merged by the maintainer. The unexplained healthy-run
+exceptions and full failure acceptance remain unresolved; these historical results
+do not validate the arena follow-up. Do not relax test assertions to turn these
+runs green.

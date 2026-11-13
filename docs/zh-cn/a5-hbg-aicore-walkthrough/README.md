@@ -107,7 +107,8 @@ sequenceDiagram
 - 未证明退休的核不能被视为已安全释放；错误计数、空 ready 和缺失 task trace 都不能替代退核证明。
 
 导航时读 `scheduler_dispatch.h`、`scheduler_completion.h` 和 `aicore_lifecycle.*`。
-共享 arena 仍预留的结构以及 kernel context 中仍存在的字段不构成额外执行路径。
+设备 runtime arena 只包含紧凑任务镜像，不再预留旧调度器队列或 completion mailbox；
+resident 调度区独立分配。kernel context 中仍存在的字段不构成额外执行路径。
 
 ## 三个不能混同的完成点
 

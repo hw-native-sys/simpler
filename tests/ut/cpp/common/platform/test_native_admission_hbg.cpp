@@ -136,6 +136,8 @@ TEST_F(NativeAdmissionTest, ReservedPrepareExcludesAWarmConsumerBeforeTrimmingIt
     Attempt outer(runner, 1, 20);
     Attempt warm_consumer(runner, 2, 30);
     bool entered = false;
+    size_t attempts_before_refusal = 0;
+    size_t successes_before_refusal = 0;
     callback_hook = [&] {
         entered = true;
         const auto allocations = control().allocations;
@@ -154,19 +156,21 @@ TEST_F(NativeAdmissionTest, ReservedPrepareExcludesAWarmConsumerBeforeTrimmingIt
         EXPECT_EQ(runner.arena_region_backing(2, 0), idle_heap);
         EXPECT_EQ(runner.arena_region_backing(2, 2), idle_image);
         if (rc == 0) EXPECT_EQ(simpler_finalize_run(&runner, warm_consumer.storage), 0);
-        // Scheduler storage is per pipeline slot and survives idle arena trim.
-        // Reserve one additional aligned backing while keeping arena growth capped.
-        const auto scheduler_bytes = runner.scheduler_capacity(2);
-        control().ceiling = control().bytes + (scheduler_bytes == 0 ? 0 : scheduler_bytes + 127);
+        attempts_before_refusal = control().allocations;
+        successes_before_refusal = control().successful_allocations;
+        control().fail_allocation = attempts_before_refusal + 1;
     };
     ASSERT_EQ(outer.prepare(), 0);
     EXPECT_TRUE(entered);
+    EXPECT_EQ(
+        control().allocations - attempts_before_refusal, control().successful_allocations - successes_before_refusal + 1
+    );
     EXPECT_EQ(runner.arena_region_backing(2, 0), nullptr);
     EXPECT_EQ(runner.arena_region_backing(2, 2), nullptr);
     EXPECT_EQ(runner.retained_temp_addr(2), 0u);
     EXPECT_TRUE(runner.arena_referenced(1, 2));
     ASSERT_EQ(simpler_finalize_run(&runner, outer.storage), 0);
-    control().ceiling = std::numeric_limits<size_t>::max();
+    control().fail_allocation = 0;
     const auto allocations = control().allocations;
     ASSERT_EQ(warm_consumer.prepare(), 0);
     EXPECT_GT(control().allocations, allocations);

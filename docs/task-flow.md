@@ -363,8 +363,10 @@ retry policy; invalid requests, bookkeeping failures and a degraded ledger fail
 without waiting for a consumer.
 
 For host-built graphs, the slot owns the completed host plan while parked:
-its host arena, Definition publication, tensor leases and captured dependency
-graph survive destruction of each preparation attempt. A retry references the
+its task-image sources, Definition publication, tensor leases and captured
+dependency graph survive destruction of each preparation attempt. Full-arena
+runtimes also retain their host arena; A5 HBG retains the compact task image
+and resident scheduler plan without a common arena header. A retry references the
 retained inputs and commits that plan without copying HOST inputs or invoking
 the callback again. Pending publication and leases move to exactly one Runtime;
 a successful bind cannot be rebound before publication. A backend without plan

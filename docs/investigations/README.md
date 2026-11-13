@@ -84,7 +84,7 @@ that ...".
 
 Newest first.
 
-- [2026-11 — A5 HBG legacy removal](2026-11-a5-hbg-legacy-removal.md) — implementation candidate: resident-only A5 HBG with canonical Graph arguments and failed-start retirement; shared arena and kernel context cleanup remain separate stages, with no CPU validation run.
+- [2026-11 — A5 HBG legacy removal](2026-11-a5-hbg-legacy-removal.md) — resident-only execution merged in #3064; follow-up removes the unused A5 shared-arena prefix while kernel context/async ABI cleanup remains separate. No local CPU validation run.
 
 - [2026-11 — A5 HBG synchronous completion](2026-11-a5-hbg-synchronous-completion.md) — select synchronous CSR by default; remove resumable completion and redundant per-task admission ownership, while retaining global commit ordering and recording the unmet full-completion target.
 
