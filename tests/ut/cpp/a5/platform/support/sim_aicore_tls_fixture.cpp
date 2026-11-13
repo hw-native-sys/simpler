@@ -17,14 +17,21 @@
 
 #include "aicore/aicore.h"
 #include "aicore/aicore_profiling_state.h"
+#include "aicore/sim_core_abi.h"
+#include "cpu_sim_context.h"
 #include "runtime.h"
 
 namespace {
 constexpr uint32_t kWorkers = 6;
 std::atomic<uint32_t> calls{0};
 std::atomic<uint32_t> errors{0};
+// Non-zero makes run_sim_tls_wrapper_probe install a setter that returns this
+// error, so a case can drive the admission gate's rejection path.
+std::atomic<int> reg_base_binding_error{0};
 uint64_t expected_epoch;
 uint64_t register_addresses[kWorkers];
+
+int faulting_set_reg_base(uint64_t) { return reg_base_binding_error.load(); }
 }  // namespace
 
 // The wrapper reads only worker_count; this fixture uses the real Runtime type
@@ -47,6 +54,12 @@ extern "C" int aicore_execute_wrapper_checked(
 );
 
 extern "C" uint64_t run_sim_tls_wrapper_probe(uint64_t epoch, pthread_key_t protected_key) {
+    // Resolve the register-base setter from the process-resident sim context
+    // (exported by the test binary) the same way the production DeviceRunner
+    // installs it after dlopen. A non-zero injected error swaps in the faulting
+    // setter so a case can verify admission rejection.
+    if (reg_base_binding_error.load() != 0) sim_install_reg_base_setter(faulting_set_reg_base);
+    else sim_install_reg_base_setter(sim_context_set_reg_base);
     Runtime runtime;
     runtime.dev.worker_count = kWorkers;
     expected_epoch = epoch;
@@ -73,4 +86,14 @@ extern "C" uint64_t run_sim_tls_wrapper_probe(uint64_t epoch, pthread_key_t prot
     for (auto &worker : workers)
         worker.join();
     return static_cast<uint64_t>(calls.load()) << 32 | errors.load();
+}
+
+// Arms the register-base setter failure for one probe run, then clears it. The
+// probe returns its usual (calls << 32 | errors) word; a rejected core never
+// reaches aicore_execute, so a full rejection reports 0 calls.
+extern "C" uint64_t run_sim_tls_wrapper_probe_with_error(uint64_t epoch, pthread_key_t protected_key, int error) {
+    reg_base_binding_error.store(error);
+    const uint64_t result = run_sim_tls_wrapper_probe(epoch, protected_key);
+    reg_base_binding_error.store(0);
+    return result;
 }

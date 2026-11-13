@@ -38,9 +38,12 @@ static inline __aicore__ void record_runtime_stall(__gm__ int64_t *args, int32_t
     if (block == 0 && lane == stalled_lane) {
         if (stall_ms < 0) {
             while (true) {}
+        } else if (stall_ms > 0) {
+            // A bounded fault waits for the scheduler watchdog's EXIT signal
+            // before returning, so the timeout-before-return ordering is a
+            // handshake rather than a fixed-duration time window.
+            wait_for_aicpu_exit_signal();
         }
-        const uint64_t duration = static_cast<uint64_t>(stall_ms) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
-        while (get_sys_cnt_aicore() - start < duration) {}
     }
     record.metadata_padding[1] = static_cast<int64_t>(get_sys_cnt_aicore());
     scheduler_publish_cache_line(&record.block_plus_one);

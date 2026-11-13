@@ -9,7 +9,6 @@
 # -----------------------------------------------------------------------------------------------------------
 """Two-rank URMA transfers whose successors consume deferred outputs."""
 
-import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import CommBufferSpec, DataType, TaskArgs, TensorArgType
@@ -153,11 +152,6 @@ class TestUrmaRepeatedPut(_UrmaRegression):
     CASES = _case("repeated_put", mode=1, repeats=16)
 
 
-@pytest.mark.skip(reason="A5 chunked URMA fetch hit a device scheduler timeout in CI run 41609948645")
-@pytest.mark.coverage_skip(
-    reason="A5 chunked URMA fetch hit a device scheduler timeout in CI run 41609948645",
-    platforms=["a2a3", "a5"],
-)
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
 class TestUrmaChunkedFetch(_UrmaRegression):
     CASES = _case("chunked_fetch", elems=CHUNKED_ELEMS)

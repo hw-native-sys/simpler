@@ -36,6 +36,9 @@ _RESIDENT_TIMEOUT_PROFILE = {
 }
 _RESIDENT_OBSERVERS = ["prepare", "launch", "peek", "caller_sync"]
 _RESIDENT_SHAPES = ((4, 2), (1, 0), (7, 0), (7, 2))
+# The success probe runs under the compile-time default budgets, whose caller-sync
+# fallback matches PLATFORM_STREAM_SYNC_TIMEOUT_MS and outlives the scheduler watchdog.
+_DEFAULT_STREAM_SYNC_TIMEOUT_MS = 50000
 
 
 def _resident_timeout_evidence(logs, shape=(4, 2)):
@@ -176,7 +179,10 @@ def _validate_resident_status(observed, failure, fixture, logs, shape=(4, 2)):
     assert observed["execution_stages"] == _RESIDENT_OBSERVERS, observed
     assert observed["scheduler_runtime_mode"] in (1, 2) and observed["scheduler_mode_publish_count"] > 0
     assert observed["peek_before"] == 0
-    assert observed["stream_sync_timeout_ms"] == int(fixture["timeout_profile"]["SIMPLER_STREAM_SYNC_TIMEOUT_MS"])
+    sync_budget = _DEFAULT_STREAM_SYNC_TIMEOUT_MS
+    if failure:
+        sync_budget = int(fixture["timeout_profile"]["SIMPLER_STREAM_SYNC_TIMEOUT_MS"])
+    assert observed["stream_sync_timeout_ms"] == sync_budget
     assert observed["caller_sync_rc"] == (507018 if failure else 0), observed
     if failure:
         assert observed["cleanup"] == "isolated_child_exit_unconfirmed"
@@ -322,16 +328,19 @@ def test_resident_timeout_rejects_foreign_logs(tmp_path):
         _resident_timeout_evidence(logs)
 
 
-def _resident_observation_fixture():
+def _resident_observation_fixture(failure=True):
+    sync_budget = _DEFAULT_STREAM_SYNC_TIMEOUT_MS
+    if failure:
+        sync_budget = int(_RESIDENT_TIMEOUT_PROFILE["SIMPLER_STREAM_SYNC_TIMEOUT_MS"])
     return {
-        "failure": True,
+        "failure": failure,
         "shape": [4, 2],
         "blocks": 1,
         "execution_stages": list(_RESIDENT_OBSERVERS),
         "scheduler_runtime_mode": 1,
         "scheduler_mode_publish_count": 1,
         "peek_before": 0,
-        "stream_sync_timeout_ms": 6000,
+        "stream_sync_timeout_ms": sync_budget,
         "caller_sync_rc": 507018,
         "cleanup": "isolated_child_exit_unconfirmed",
     }
@@ -748,6 +757,18 @@ def test_resident_timeout_reaches_the_first_caller_observer(st_device_ids, tmp_p
         output.mkdir()
         logs = output / "ascend"
         logs.mkdir()
+        child_env = {**os.environ, "ASCEND_PROCESS_LOG_PATH": str(logs), "ASCEND_GLOBAL_LOG_LEVEL": "3"}
+        if not failure:
+            # The success probe clears the resident timeout budgets so a slow cold
+            # start does not read as a scheduler timeout on the no-hang path. Its
+            # caller-sync fallback is the compile-time default (_DEFAULT_STREAM_SYNC_TIMEOUT_MS),
+            # which outlives the scheduler watchdog, not one of these cleared budgets.
+            for name in (
+                "SIMPLER_SCHEDULER_TIMEOUT_MS",
+                "SIMPLER_OP_EXECUTE_TIMEOUT_US",
+                "SIMPLER_STREAM_SYNC_TIMEOUT_MS",
+            ):
+                child_env.pop(name, None)
         result, stdout, stderr = _run_resident_child(
             [
                 sys.executable,
@@ -760,7 +781,7 @@ def test_resident_timeout_reaches_the_first_caller_observer(st_device_ids, tmp_p
                 str(shape[1]),
             ],
             output,
-            env={**os.environ, "ASCEND_PROCESS_LOG_PATH": str(logs), "ASCEND_GLOBAL_LOG_LEVEL": "3"},
+            env=child_env,
         )
         records = []
         try:
@@ -786,9 +807,9 @@ def test_resident_validation_failure_exposes_bounded_owned_context(tmp_path, mon
     monkeypatch.setattr(sys.modules[__name__], "_compile_resident_fixture", lambda _output: fixture)
 
     def child(_argv, output, *, env):
-        observed = _resident_observation_fixture()
         failure = output.name == "bounded-timeout"
-        observed.update(failure=failure, caller_sync_rc=507015 if failure else 0)
+        observed = _resident_observation_fixture(failure=failure)
+        observed.update(caller_sync_rc=507015 if failure else 0)
         if not failure:
             observed.update(output_verified=True, cleanup="released")
         logs = Path(env["ASCEND_PROCESS_LOG_PATH"])
@@ -826,8 +847,8 @@ def test_resident_matched_pair_selects_one_fixture_and_the_same_shape(tmp_path, 
         assert argv[-3] == str(tmp_path)
         failure = output.name == "bounded-timeout"
         children.append(failure)
-        observed = _resident_observation_fixture()
-        observed.update(shape=list(shape), failure=failure, caller_sync_rc=507018 if failure else 0)
+        observed = _resident_observation_fixture(failure=failure)
+        observed.update(shape=list(shape), caller_sync_rc=507018 if failure else 0)
         if not failure:
             observed.update(output_verified=True, cleanup="released")
         logs = Path(env["ASCEND_PROCESS_LOG_PATH"])
@@ -902,7 +923,8 @@ def _probe_resident_timeout(device, failure, output, shape=(4, 2)):  # noqa: PLR
 
     assert shape in _RESIDENT_SHAPES
     fixture = json.loads((output / "resident-fixture.json").read_text())
-    _resident_timeout_profile(os.environ)
+    if failure:
+        _resident_timeout_profile(os.environ)
     lib = _load("a5", "onboard", "host_build_graph")
     _bind_resident_sdk(lib)
     assert lib.aclInit(None) == 0
@@ -939,6 +961,9 @@ def _probe_resident_timeout(device, failure, output, shape=(4, 2)):  # noqa: PLR
     for scalar in (1, *shape, fixture["stall_ms"] if failure else 0):
         args.add_scalar(scalar)
     descriptor = NativeRunDescriptor(generation=1, dispatch_id=1, run_epoch=1)
+    sync_budget = _DEFAULT_STREAM_SYNC_TIMEOUT_MS
+    if failure:
+        sync_budget = int(fixture["timeout_profile"]["SIMPLER_STREAM_SYNC_TIMEOUT_MS"])
     observed = _observe_resident_entry(
         lib,
         ctx,
@@ -947,7 +972,7 @@ def _probe_resident_timeout(device, failure, output, shape=(4, 2)):  # noqa: PLR
         args,
         config,
         descriptor,
-        int(fixture["timeout_profile"]["SIMPLER_STREAM_SYNC_TIMEOUT_MS"]),
+        sync_budget,
     )
     observed.update(failure=failure, shape=list(shape), blocks=1, output_verified=False)
     if failure:

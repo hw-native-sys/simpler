@@ -69,6 +69,12 @@ public:
         EXPECT_NE(probe, nullptr);
         return probe != nullptr ? probe(epoch, protected_key) : UINT64_MAX;
     }
+    uint64_t run_with_error(uint64_t epoch, pthread_key_t protected_key, int error) const {
+        using Probe = uint64_t (*)(uint64_t, pthread_key_t, int);
+        auto probe = reinterpret_cast<Probe>(dlsym(handle_, "run_sim_tls_wrapper_probe_with_error"));
+        EXPECT_NE(probe, nullptr);
+        return probe != nullptr ? probe(epoch, protected_key, error) : UINT64_MAX;
+    }
     int initialize() const {
         using Initialize = int (*)();
         auto initialize = reinterpret_cast<Initialize>(dlsym(handle_, "initialize_aicore_sim_tls"));
@@ -103,14 +109,14 @@ TEST(SimAicoreTls, RealWrapperAllocatesOnceAndUnloadReturnsEveryKey) {
         EXPECT_EQ(settle.run(1, guard.first()), UINT64_C(6) << 32);
     }
     const size_t baseline = available_keys();
-    ASSERT_GT(baseline, 10u);
+    ASSERT_GT(baseline, 9u);
     {
         WrapperModule module;
         ASSERT_TRUE(module.valid()) << dlerror();
         EXPECT_EQ(module.run(101, guard.first()), UINT64_C(6) << 32);
-        EXPECT_EQ(available_keys(), baseline - 10);
+        EXPECT_EQ(available_keys(), baseline - 9);
         EXPECT_EQ(module.run(UINT64_MAX, guard.first()), UINT64_C(6) << 32);
-        EXPECT_EQ(available_keys(), baseline - 10);
+        EXPECT_EQ(available_keys(), baseline - 9);
     }
     EXPECT_EQ(available_keys(), baseline);
 }
@@ -118,6 +124,14 @@ TEST(SimAicoreTls, RealWrapperAllocatesOnceAndUnloadReturnsEveryKey) {
 TEST(SimAicoreTls, MoreThanOneHundredRealWrapperReloadsKeepTheirIdentityAndKeyBudget) {
     ReservedKeys guard;
     ASSERT_TRUE(guard.acquire(1));
+    // Settle once so the process-resident sim-context register-base key is
+    // created before the reloadable-key baseline: it outlives the wrapper
+    // module and is accounted to the process, not to a per-load budget.
+    {
+        WrapperModule settle;
+        ASSERT_TRUE(settle.valid()) << dlerror();
+        ASSERT_EQ(settle.run(1, guard.first()), UINT64_C(6) << 32);
+    }
     const size_t baseline = available_keys();
     for (uint64_t epoch = 1; epoch <= 128; ++epoch) {
         SCOPED_TRACE(epoch);
@@ -130,13 +144,36 @@ TEST(SimAicoreTls, MoreThanOneHundredRealWrapperReloadsKeepTheirIdentityAndKeyBu
     }
 }
 
+TEST(SimAicoreTls, RegBaseBindingFailureRejectsEveryCoreAndReturnsItsKeys) {
+    ReservedKeys guard;
+    ASSERT_TRUE(guard.acquire(1));
+    {
+        WrapperModule settle;
+        ASSERT_TRUE(settle.valid()) << dlerror();
+        ASSERT_EQ(settle.run(1, guard.first()), UINT64_C(6) << 32);
+    }
+    const size_t baseline = available_keys();
+    ASSERT_GT(baseline, 9u);
+    {
+        WrapperModule module;
+        ASSERT_TRUE(module.valid()) << dlerror();
+        // The register-base setter failure reaches the admission gate, so no
+        // core is admitted and aicore_execute never runs (0 calls).
+        EXPECT_EQ(module.run_with_error(101, guard.first(), ENOMEM), 0u);
+        EXPECT_EQ(available_keys(), baseline - 9);
+        // Once the fault is cleared the same module binds and executes normally.
+        EXPECT_EQ(module.run(102, guard.first()), UINT64_C(6) << 32);
+    }
+    EXPECT_EQ(available_keys(), baseline);
+}
+
 class SimAicoreTlsExhaustion : public ::testing::TestWithParam<size_t> {};
 
 TEST_P(SimAicoreTlsExhaustion, PartialCreationRollsBackWithoutCallingExecutorOrUsingOtherKeys) {
     ReservedKeys guard;
     ASSERT_TRUE(guard.acquire(1));
     const size_t baseline = available_keys();
-    ASSERT_GE(baseline, 10u);
+    ASSERT_GE(baseline, 9u);
     ReservedKeys held;
     ASSERT_TRUE(held.acquire(baseline - GetParam()));
     {
@@ -160,7 +197,7 @@ TEST_P(SimAicoreTlsExhaustion, LoaderPreflightReportsExhaustionBeforeAnyWrapperS
     ReservedKeys guard;
     ASSERT_TRUE(guard.acquire(1));
     const size_t baseline = available_keys();
-    ASSERT_GE(baseline, 10u);
+    ASSERT_GE(baseline, 9u);
     ReservedKeys held;
     ASSERT_TRUE(held.acquire(baseline - GetParam()));
     WrapperModule module;
@@ -170,6 +207,6 @@ TEST_P(SimAicoreTlsExhaustion, LoaderPreflightReportsExhaustionBeforeAnyWrapperS
     EXPECT_EQ(module.run(101, guard.first()), 0u);
 }
 
-INSTANTIATE_TEST_SUITE_P(EachPartialKeySet, SimAicoreTlsExhaustion, ::testing::Range<size_t>(0, 10));
+INSTANTIATE_TEST_SUITE_P(EachPartialKeySet, SimAicoreTlsExhaustion, ::testing::Range<size_t>(0, 9));
 
 }  // namespace

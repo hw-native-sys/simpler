@@ -910,6 +910,67 @@ TEST(SimInvocationContext, BindingIsThreadLocalAndFailedUpdatePreservesContext) 
     EXPECT_EQ(sim_context_get_invocation_context(), nullptr);
 }
 
+#if defined(__linux__)
+TEST(SimRegBaseDeathTest, KeyCreationFailureRollsBackAndRetriesWithoutLeakingKeys) {
+    ASSERT_EXIT(
+        {
+            auto budget = [] {
+                std::vector<pthread_key_t> keys;
+                pthread_key_t key;
+                while (pthread_key_create(&key, nullptr) == 0)
+                    keys.push_back(key);
+                for (auto k : keys)
+                    pthread_key_delete(k);
+                return keys.size();
+            };
+            pthread_key_t sentinel;
+            int value = 11;
+            if (pthread_key_create(&sentinel, nullptr) != 0 || pthread_setspecific(sentinel, &value) != 0) _exit(1);
+            const auto before = budget();
+            reject_device_key = true;
+            if (sim_context_set_reg_base(UINT64_C(0x5000)) != EAGAIN) _exit(2);
+            if (budget() != before || pthread_getspecific(sentinel) != &value) _exit(3);
+            if (sim_context_set_reg_base(UINT64_C(0x5000)) != 0) _exit(4);
+            if (sim_get_reg_base() != reinterpret_cast<volatile uint8_t *>(UINT64_C(0x5000))) _exit(5);
+            pthread_key_delete(sentinel);
+            _exit(0);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
+}
+#endif
+
+TEST(SimRegBase, ThreadsReadTheirOwnBase) {
+    std::atomic<int> ok{0};
+    std::thread t0([&] {
+        if (sim_context_set_reg_base(UINT64_C(0x1000)) != 0) return;
+        if (sim_get_reg_base() != reinterpret_cast<volatile uint8_t *>(UINT64_C(0x1000))) return;
+        ok.fetch_add(1);
+    });
+    std::thread t1([&] {
+        if (sim_context_set_reg_base(UINT64_C(0x2000)) != 0) return;
+        if (sim_get_reg_base() != reinterpret_cast<volatile uint8_t *>(UINT64_C(0x2000))) return;
+        ok.fetch_add(1);
+    });
+    t0.join();
+    t1.join();
+    EXPECT_EQ(ok.load(), 2);
+    // The main thread's binding is untouched by the workers' thread-local writes.
+    EXPECT_EQ(sim_get_reg_base(), nullptr);
+}
+
+#if defined(__linux__)
+TEST(SimRegBase, BindingFailurePreservesPreviousValueAndRetries) {
+    ASSERT_EQ(sim_context_set_reg_base(UINT64_C(0x3000)), 0);
+    EXPECT_EQ(sim_get_reg_base(), reinterpret_cast<volatile uint8_t *>(UINT64_C(0x3000)));
+    reject_device_bind = true;
+    EXPECT_EQ(sim_context_set_reg_base(UINT64_C(0x4000)), ENOMEM);
+    EXPECT_EQ(sim_get_reg_base(), reinterpret_cast<volatile uint8_t *>(UINT64_C(0x3000)));
+    EXPECT_EQ(sim_context_set_reg_base(UINT64_C(0x4000)), 0);
+    EXPECT_EQ(sim_get_reg_base(), reinterpret_cast<volatile uint8_t *>(UINT64_C(0x4000)));
+}
+#endif
+
 TEST(SimCancellation, BindingIsThreadLocalAndClearedBeforeReuse) {
     constexpr uint32_t stop = 0x7ffffff0;
     uint32_t running = 0;

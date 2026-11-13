@@ -11,7 +11,7 @@ checked against a host golden.
 | `TestUrmaPut` | TPUT to peer receive window, then dependent TGET readback | 1 |
 | `TestUrmaRepeatedFetch` | TGET from peer input | 16 |
 | `TestUrmaRepeatedPut` | TPUT plus dependent readback | 16 |
-| `TestUrmaChunkedFetch` (temporarily skipped) | Static-shape TGET of 256 MiB + 32 KiB | 1 logical request, split by the adapter |
+| `TestUrmaChunkedFetch` | Static-shape TGET of 256 MiB + 32 KiB | 1 logical request, split by the adapter |
 | `TestUrmaChunkedPut` | Dynamic-shape TPUT of 256 MiB + 32 KiB plus dependent readback | 1 logical request, split by the adapter |
 
 The lifecycle test requires three devices for two overlapping two-rank domains:
@@ -61,11 +61,10 @@ task-submit --device auto --device-num 3 --timeout 1800 --max-time 1800 \
   --run ".venv/bin/python -m pytest tests/st/a5/tensormap_and_ringbuffer/urma_deferred_completion --platform a5 --device \$TASK_DEVICE --require-pto-isa --pto-session-timeout 1200 -v"
 ```
 
-`TestUrmaChunkedFetch` is temporarily skipped after a device scheduler timeout in
-[CI run 41609948645](https://github.com/hw-native-sys/simpler/actions/runs/41609948645).
-Check the build's ISA revision against `pto_isa.pin` and retain the build log
-and pytest output, including each resource child result. Device logs remain
-under `outputs/urma/`.
+The run must report all six transfer tests and both lifecycle cases passed with
+no skips. Check the build's ISA revision against `pto_isa.pin` and retain the
+build log and pytest output, including each resource child result. Device logs
+remain under `outputs/urma/`.
 
 ## Validation scope
 

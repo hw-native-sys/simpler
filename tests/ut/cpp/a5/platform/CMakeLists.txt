@@ -80,15 +80,27 @@ foreach(runtime ${SIMPLER_RUNTIMES})
         support/sim_aicore_tls_fixture.cpp)
     target_include_directories(${tls_fixture} PRIVATE
         ${tls_contract}
-        ${SIMPLER_SRC}/a5/platform/sim/aicore)
+        ${SIMPLER_SRC}/a5/platform/sim/aicore
+        ${SIMPLER_SRC}/common/platform/sim/sim_context)
     target_link_libraries(${tls_fixture} PRIVATE pthread ${CMAKE_DL_LIBS})
+    # The fixture SO resolves sim_context_set_reg_base / sim_get_reg_base from
+    # the process-resident sim context, which the test binary links and exports
+    # so the keys stay process-resident rather than per-load (see the reloadable
+    # key accounting below).
     simpler_ut_add_target(NAME test_a5_${runtime_tag}_sim_aicore_tls
-        SOURCES test_sim_aicore_tls.cpp
+        SOURCES
+            test_sim_aicore_tls.cpp
+            ${SIMPLER_SRC}/common/platform/sim/sim_context/cpu_sim_context.cpp
+            ${HOST_LOG_TEST_SOURCES}
+        INCLUDES
+            ${SIMPLER_SRC}/common/platform/sim/sim_context
+            ${SIMPLER_LOG_DIR}/include
         DEFINES SIM_TLS_FIXTURE_PATH="$<TARGET_FILE:${tls_fixture}>"
         LINK ${CMAKE_DL_LIBS}
         DEPENDS ${tls_fixture}
         LABEL no_hardware
         TIMEOUT 30)
+    set_target_properties(test_a5_${runtime_tag}_sim_aicore_tls PROPERTIES ENABLE_EXPORTS ON)
 endforeach()
 
 simpler_ut_glob_cases(a5_platform_case)

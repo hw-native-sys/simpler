@@ -58,9 +58,11 @@ platform_case(test_aicore_tls_keys.cpp PER_ARCH PER_RUNTIME
 
 foreach(arch a2a3 a5)
     if(arch STREQUAL "a2a3")
-        set(key_count 6)
+        set(key_count 5)
+        set(tls_arch_define "")
     else()
-        set(key_count 10)
+        set(key_count 9)
+        set(tls_arch_define TEST_TLS_ARCH_A5)
     endif()
     foreach(runtime ${SIMPLER_RUNTIMES})
         simpler_runtime_tag("${runtime}" tag)
@@ -75,7 +77,8 @@ foreach(arch a2a3 a5)
         target_link_libraries(${fixture} PRIVATE pthread)
         set(test_target test_${arch}_${tag}_aicore_tls_keys)
         target_compile_definitions(${test_target} PRIVATE
-            TEST_TLS_MODULE_PATH="$<TARGET_FILE:${fixture}>" TEST_TLS_KEY_COUNT=${key_count})
+            TEST_TLS_MODULE_PATH="$<TARGET_FILE:${fixture}>" TEST_TLS_KEY_COUNT=${key_count}
+            ${tls_arch_define})
         target_link_libraries(${test_target} PRIVATE ${CMAKE_DL_LIBS})
         target_link_options(${test_target} PRIVATE -Wl,--wrap=pthread_setspecific)
         add_dependencies(${test_target} ${fixture})

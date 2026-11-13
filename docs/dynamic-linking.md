@@ -268,12 +268,12 @@ The declarations, function types and ownership contract are centralized in
 | `HostPhaseProducerLane` | `ModuleThreadValue` | producing host module | Buffer identity only; exclusive buffer owns the write cursor |
 | `RtSubmitPhaseState` | `ModuleThreadValue` | orchestration SO | Per-thread submission timing; no keys when the bound runtime lacks phase recording |
 | `SuppressSelfNotify` depth | `ModuleThreadValue` with stack-scope fallback | host module | Suppress this thread's rollback notifications |
-| `g_reg_base_key` | `pthread_key_t` | AICore SO | Per-core simulated register base address |
 | percounter Scalar recorder | `pthread_key_t` | profiled AICore simulation SO | Borrows a lane-stack recorder; binding clears before the stack expires, key deletes at module unload, no thread-exit callback; uninstrumented TUs allocate no key |
 | `g_core_id_key` | `pthread_key_t` | AICore SO | Per-core physical core ID |
 | `g_device_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread device binding (device_id) |
 | `g_subblock_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread subblock identity (for TPUSH/TPOP) |
 | `g_cluster_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread cluster identity (for TPUSH/TPOP) |
+| `g_reg_base_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-core simulated register base address |
 | affinity executor index | `AffinityTlsKey` | AICPU SO | Fixed module-owned record pool; each record points at a simulated thread stack cell or an onboard classification slot and is recycled on unbind |
 | recorder storage / active recording | `ModuleThreadValue` | host runtime SO | Borrowed worker scratch / recording identity |
 | dependency capture | `ModuleThreadValue` | host runtime SO | Borrowed prepare-owned session; enabled only by the current prepare |

@@ -212,6 +212,45 @@ TEST(ReturnGateWait, StartupFailureWaitsForExitBeforeAckAndPostCloseReturn) {
     EXPECT_TRUE(saw_closed_window.load(std::memory_order_acquire));
 }
 
+// The resident-fault interleaving the lifecycle check must accept: the AICPU
+// publishes EXIT to the target core, then pauses before signaling the rest of
+// the partition, and the target observes its own EXIT and returns in that
+// window. The per-core publish therefore precedes the target's return even
+// though the whole-partition publish end does not.
+TEST(ReturnGateWait, TargetCoreReturnsAfterItsOwnExitBeforeThePartitionFinishes) {
+    CoreRegs target;
+    CoreRegs other;
+    std::atomic<bool> returned{false};
+    std::atomic<uint64_t> return_cycles{0};
+
+    std::thread worker([&] {
+        sim_reg_base = target.base();
+        wait_for_aicpu_exit_signal();
+        return_cycles.store(get_sys_cnt_aicpu(), std::memory_order_release);
+        returned.store(true, std::memory_order_release);
+    });
+
+    // Signal only the target core, then pause: the rest of the partition is not
+    // yet signaled.
+    const uint64_t publish_cycles = get_sys_cnt_aicpu();
+    platform_signal_aicore_exit(target.addr());
+    EXPECT_TRUE(wait_until(
+        [&] {
+            return returned.load(std::memory_order_acquire);
+        },
+        std::chrono::seconds(2)
+    ));
+
+    // The sender resumes only after the target has already observed EXIT and
+    // returned. That ordering must be legal, not a fault.
+    const uint64_t partition_end_cycles = get_sys_cnt_aicpu();
+    platform_signal_aicore_exit(other.addr());
+
+    worker.join();
+    EXPECT_LE(publish_cycles, return_cycles.load(std::memory_order_acquire));
+    EXPECT_LE(return_cycles.load(std::memory_order_acquire), partition_end_cycles);
+}
+
 // The production retire path publishes the gate, and it must do so only after
 // the whole group has acknowledged and every window has closed. The real sim
 // wait is the consumer of that publication, so this pins the two halves
