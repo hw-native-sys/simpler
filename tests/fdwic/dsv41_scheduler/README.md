@@ -12,8 +12,9 @@ experiment, not checkpoint accuracy validation. Isolated Attention and Engram
 cases run rank 0 on **one device**. Only `moe`, `layers_19_21`, and the original
 full forward run on **two devices** with real communication and deferred waits.
 
-The current L0 means for PyPTO-lib, DSL and the bounded-sync DSL variant,
-with their measurement contract, are maintained in [RESULTS.md](RESULTS.md).
+The matrix contains 18 configurations: nine original PyPTO-lib cases and nine
+DSL cases with approximately half their SPMD tasks requiring sync-start.
+Measurement availability and the timing contract are maintained in [RESULTS.md](RESULTS.md).
 
 ## Cases
 
@@ -36,7 +37,8 @@ inputs and cannot replace tensor parameters or initialization data.
 An execution is one `(task, block, subtask)` invocation. Original scalar values,
 tensor shapes, strides, offsets, aliasing, argument directions, explicit
 dependencies, scope modes, block counts, and sync-start flags are recorded at
-the production Host submission interface. Device dispatch, ready queues,
+the production Host submission interface. DSL case export then applies the
+half-SPMD policy below; the full-forward capture remains original. Device dispatch, ready queues,
 completion, MIX admission, and `defer_wait` use the unchanged production code.
 
 ## Boundary preparation and validation
@@ -72,35 +74,77 @@ kernel durations: compare L1 intervals with the source forward before using a
 case to draw whole-network conclusions. Prefix timing is never included in a
 case's scalar scheduling measurements.
 
-## DSL bounded sync-start variant
+## DSL half-SPMD sync-start policy
 
-`production/force_sync_start.py` prepares a separate DSL bundle with
-`require_sync_start=true` on compute submissions whose `1 < block_num <= 64`
-inside the selected case. Tasks above the limit retain their original flags;
-existing sync-start requirements are never removed. It preserves task IDs, block counts, kernels, tensor
-arguments, dependencies and the prefix outside the cut. It does not clamp block
-counts or replace kernels. Both rank plans are updated for EP2 cases.
+`production/prepare.py` applies this policy automatically when exporting the
+nine `pypto_lib_dsl` cases. PyPTO-lib cases retain their original flags. There
+is no third group of DSL variants.
 
-Build `record-tool` with the production tools, then prepare and run a variant:
+For each case and rank, count compute submissions with `block_num > 1` as SPMD
+(one logical task, including MIX). The target is `ceil(SPMD / 2)`. Preserve all
+existing sync-start flags, then enable only enough unsynchronized tasks to reach
+the target. If existing flags already exceed half, retain them all. Candidates
+are sampled deterministically across submission order, rather than selected at
+random. Reapplying the policy does not change the plan.
+
+New flags are limited to 32 blocks for AIC/MIX and 64 blocks for pure AIV,
+matching this A5 fixture's 32 AIC / 64 AIV capacity. Oversized tasks remain
+unchanged, including MoE `dispatch_push`, Engram `engram_widen`, and the three
+`dispatch_push` tasks in layers 19–21. If insufficient tasks fit the capacity,
+the report records the actual count below the target.
+
+Export invokes `record-tool --half-sync-start INPUT FIRST_TASK LAST_TASK OUTPUT`.
+Only sync-start fields within the selected case change; the prefix, suffix,
+block counts, kernels, arguments and dependencies retain their original bytes.
+Both rank plans are processed. `case.json` records the policy, before/after
+counts, capacity exclusions and selected source task IDs per rank. The
+original files under `workloads/` remain source-capture references.
+
+Regenerate prepared bundles after updating the exporter. Existing bundles do
+not acquire this policy automatically. The standard preparation and run
+commands below produce exactly 18 configurations.
+
+## Conditional ideal lower bound
+
+Following [PR #3061](https://github.com/hw-native-sys/simpler/pull/3061), derive a
+zero-scheduler-cost model from measured kernel durations and the captured
+completion-dependency DAG. This model applies only to isolated single-device
+cases without deferred or early dependency completion. Communication cases
+are not calculated. Keep the L0 benchmark columns unchanged; the model uses
+a separate HBG L1 capture of the same bundle and runtime source.
+
+For each task, let `W_AIC` and `W_AIV` be the sums of its measured block/lane
+execution durations. Its optimistic duration is
+`d = max(longest block/lane duration, W_AIC / 32, W_AIV / 64)`.
+Use `d` as the node weight of the DAG and compute its longest path `CP`.
+The run's conditional lower bound is
+`max(CP, total W_AIC / 32, total W_AIV / 64)`.
+Verified Host allocation nodes have zero duration. Average the per-run bounds
+over the ten measured L1 runs, excluding warmup.
+
+This is a bound under **fixed measured durations**, not an achieved schedule
+or a hardware throughput limit. Scheduling, publication, start barriers and
+teardown have zero modeled cost; resource fragmentation and additional
+cross-task contention are relaxed. Existing waits inside a measured kernel
+remain in its duration. L1 instrumentation and cache/concurrency conditions
+can change those durations, so the result is not a strict lower bound on the
+separate L0 measurements and is not scaled by an L0/L1 ratio.
+
+From the suite directory, after building the matching runtime and preparing
+an isolated bundle:
 
 ```bash
-python3 production/force_sync_start.py \
-  build/prepared/cases/pypto_lib_dsl/swa build/all-sync-start/swa \
-  --record-tool build/portable/host/record-tool --max-blocks 64
-bash production/run.sh build/all-sync-start/swa "$DSV41_RUNTIME" \
-  outputs/all-sync-start/swa 0 1 10
+bash production/run.sh "$BUNDLE" "$DSV41_RUNTIME" "$CAPTURE" 1 1 10
+PYTHONPATH="$PWD/../../..:$PWD/../../../python" python3 production/ideal_bound.py \
+  "$BUNDLE" "$CAPTURE/rank0" "$CAPTURE/ideal-bound.json"
 ```
 
-Run from this directory. The output bundle must not already exist. The variant
-shares immutable input files with the source bundle; do not edit shared inputs.
-For a matched comparison, run the original and variant bundles with the same
-runtime, inputs, devices, warmup count and measured rounds.
-
-The default `--max-blocks 64` preserves the oversized AIV tasks in MoE,
-Engram and layers 19–21. AIC/MIX tasks in these fixtures already fit within
-32 clusters. This block-count limit is an experiment policy, not automatic
-hardware-capacity discovery. See [RESULTS.md](RESULTS.md)
-for all nine outcomes.
+The reducer verifies numerical success, L1 invocation identities, every
+block/lane execution, stable topology and dependency endpoint coverage.
+Missing or cyclic dependencies are errors; only mapped Host allocations can
+supply missing zero-cost nodes. The inferred bound must fit within the
+observed kernel envelope. Raw captures and per-round values remain local;
+[RESULTS.md](RESULTS.md) contains only the mean in the shared table.
 
 ## Included sources and data
 
@@ -214,9 +258,9 @@ done
 ```
 
 The wrapper uses `task-submit` to reserve the bundle's required number of devices,
-or validates `TASK_DEVICE` within an existing reservation. `DSV41_DEVICES=0`
-selects a device for a local case; `DSV41_DEVICES=0,1` selects the pair for MoE.
-Both explicit and automatic selection go through the reservation service.
+using `task-submit --device auto --device-num N`, or validates `TASK_DEVICE`
+within an existing reservation. Use the actual assigned IDs from `TASK_DEVICE`
+and record them with the results.
 Do not wrap all cases in a single EP2 reservation: that would hold an unused card
 while running Attention. Existing
 outputs are never overwritten. `DSV41_MAX_TIME` controls the queue's per-job
@@ -229,6 +273,22 @@ measurements, one L1 capture, and one L3 capture. `0`, `1`, and `3` select only
 that production profiling level. Outputs are split by rank and run;
 `result.json` confirms completion and boundary validation, and
 `source-task-map.txt` maps replay task IDs to the original forward.
+
+The launcher prepares each native run before the cross-rank launch barrier,
+then launches, waits and finalizes through the production native lifecycle.
+The peer's Host preparation is therefore outside the measured Device interval.
+For a single selected profiling level, warmup uses the same level.
+
+HBG and percounter use the same prepared bundles and original model kernels.
+Build both runtimes from one source revision and run each pair in the same
+automatic device allocation. Select percounter with `--runtime=percounter` after the round count; the default
+is `--runtime=host_build_graph`. The runner loads that runtime's subdirectory
+under the supplied library root. HBG reports modes 1/2; percounter uses bootstrap
+mode 5 but its Host mode observer currently returns 0 (unavailable). The result
+records the selected runtime separately from this observer. Do not mix runtime
+components across builds. Percounter multi-device communication is not yet
+supported: mark its MoE and layers_19_21 entries unavailable.
+[RESULTS.md](RESULTS.md) lists both L0 means.
 
 The local `plan-rank*.bin` records use current production C++ types. They are
 **derived build artifacts**, not portable runtime protocols. Regenerate them

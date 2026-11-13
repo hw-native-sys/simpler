@@ -16,25 +16,33 @@
 
 int main(int argc, char **argv) {
     try {
-        if (argc == 7 && std::string(argv[1]) == "--force-sync-start") {
+        if (argc == 6 && std::string(argv[1]) == "--half-sync-start") {
             std::ifstream input(argv[2], std::ios::binary);
             auto records = dsv41::read_records(input);
             const auto slice = dsv41::select_slice(records, std::stoull(argv[3]), std::stoull(argv[4]));
-            const int max_blocks = std::stoi(argv[6]);
-            if (max_blocks < 1) throw std::runtime_error("MAX_BLOCKS must be positive");
-            size_t spmd = 0, changed = 0, over_limit = 0, enabled = 0;
+            size_t spmd = 0, over_limit = 0, enabled = 0;
+            std::vector<size_t> candidates;
             for (size_t i = slice.begin; i < slice.end; ++i) {
-                auto &header = records[i].header;
+                const auto &header = records[i].header;
                 const bool has_kernel = header.kernels[0] >= 0 || header.kernels[1] >= 0 || header.kernels[2] >= 0;
-                if (header.operation == dsv41::Operation::SUBMIT && has_kernel && header.block_num > 1) {
-                    ++spmd;
-                    if (header.block_num > max_blocks) {
-                        ++over_limit;
-                    } else {
-                        changed += header.sync_start == 0;
-                        header.sync_start = 1;
-                    }
-                    enabled += header.sync_start != 0;
+                if (header.operation != dsv41::Operation::SUBMIT || !has_kernel || header.block_num <= 1) continue;
+                ++spmd;
+                enabled += header.sync_start != 0;
+                const int capacity = header.kernels[0] >= 0 ? 32 : 64;
+                if (header.block_num > capacity) {
+                    ++over_limit;
+                } else if (header.sync_start == 0) {
+                    candidates.push_back(i);
+                }
+            }
+            const size_t target = (spmd + 1) / 2;
+            const size_t changed = std::min(target > enabled ? target - enabled : 0, candidates.size());
+            std::vector<uint64_t> selected;
+            for (size_t j = 0; j < candidates.size(); ++j) {
+                if ((j + 1) * changed / candidates.size() > j * changed / candidates.size()) {
+                    auto &header = records[candidates[j]].header;
+                    header.sync_start = 1;
+                    selected.push_back(header.task_id);
                 }
             }
             std::ofstream output(argv[5], std::ios::binary);
@@ -50,7 +58,13 @@ int main(int argc, char **argv) {
                     dsv41::write(output, dependency);
             }
             std::cout << "{\"spmd\":" << spmd << ",\"changed\":" << changed << ",\"over_limit\":" << over_limit
-                      << ",\"sync_start_after\":" << enabled << "}\n";
+                      << ",\"sync_start_before\":" << enabled << ",\"target\":" << target
+                      << ",\"sync_start_after\":" << enabled + changed << ",\"selected_task_ids\":[";
+            for (size_t i = 0; i < selected.size(); ++i) {
+                if (i != 0) std::cout << ',';
+                std::cout << selected[i];
+            }
+            std::cout << "]}\n";
             return 0;
         }
         if (argc != 4) throw std::runtime_error("usage: record-tool CAPTURE FIRST_TASK LAST_TASK");
