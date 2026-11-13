@@ -74,7 +74,7 @@ def _require_completed_empty_capture(runner):
     assert len(captures) == 1, captures
     raw = json.loads(captures[0].read_text())
     protocol = raw["aicore_protocol"]
-    assert protocol["schema"] == "hbg-native-protocol-v12"
+    assert protocol["schema"] in ("hbg-native-protocol-v12", "hbg-native-protocol-v14")
     decoded = read_perf_data(captures[0])
     assert decoded["protocol_audit"]["protocol_verified"]
     assert protocol["scheduler_error"] == protocol["error_claimed"] == 0

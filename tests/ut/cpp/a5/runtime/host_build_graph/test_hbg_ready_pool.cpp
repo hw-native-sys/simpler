@@ -23,6 +23,7 @@
 #include "hbg_scheduler_test_support.h"
 #include "ready_pool_plan.h"
 #include "dependency_plan.h"
+#include "bootstrap_plan.h"
 #include "scheduler/scheduler_completion_resolver.h"
 #include "scheduler/scheduler_ready_publication.h"
 
@@ -875,6 +876,170 @@ TEST(SchedulerReadyPoolTest, RejectsInvalidTopologyAndOverflowWithoutChangingThe
     EXPECT_FALSE(scheduler_plan_ready_pool(tasks(1, 0), SCHEDULER_CLUSTER_CAPACITY + 1, 128, &plan));
     EXPECT_FALSE(scheduler_plan_ready_pool(tasks(1, 0), 1, UINT64_MAX - 64, &plan));
     EXPECT_EQ(plan.total_size, size);
+}
+
+TEST(A5HbgReadyPool, SeedsOnlyRootsAndKeepsAdmissionUnowned) {
+    constexpr uint64_t tasks = 6;
+    constexpr uint64_t epoch = 47;
+    scheduler_test::GraphBuffer graph(tasks);
+    graph.executable(1, 1, {0});
+    graph.mixed(2, LaneMask::all());
+    graph.payload(2).fanin_count = 1;
+    graph.payload(2).fanin_data()[0] = 1;
+    graph.executable(3, 0);
+    graph.executable(4, 0);
+    graph.executable(5, 1, {1, 2});
+
+    std::vector<SchedulerTaskMetadata> meta(tasks);
+    for (auto &task : meta)
+        task.timing_slot = -1;
+    meta[1].active_mask = LaneMask::aiv0();
+    meta[1].flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_HAS_FANIN;
+    meta[1].logical_block_num = 1;
+    meta[2].active_mask = LaneMask::all();
+    meta[2].flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD | SCHEDULER_TASK_MIX | SCHEDULER_TASK_HAS_FANIN;
+    meta[2].logical_block_num = 2;
+    for (uint32_t task : {3u, 4u}) {
+        meta[task].active_mask = LaneMask::aic();
+        meta[task].flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD;
+        meta[task].logical_block_num = 2;
+    }
+    meta[5] = meta[1];
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(tasks, 4, 2, &layout, false, 20, {9, 3, 3, 1}));
+    SchedulerReadyPoolPlan pool{};
+    ASSERT_TRUE(scheduler_plan_ready_pool(meta, 3, layout.total_size, &pool));
+    SchedulerDependencyPlan deps{};
+    ASSERT_TRUE(scheduler_plan_dependencies(tasks, 4, pool.total_size, &deps));
+    pool.header.dependencies_offset = deps.header_offset;
+    pool.header.storage_end_offset = deps.total_size;
+    layout.total_size = deps.total_size;
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    void *base = storage.base();
+    std::copy(meta.begin(), meta.end(), scheduler_state_at<SchedulerTaskMetadata>(base, layout.task_metadata_offset));
+    ASSERT_TRUE(scheduler_init_dependencies(base, deps, graph.graph(), {0}));
+    scheduler_init_ready_pool(base, pool);
+    ASSERT_TRUE(scheduler_init_spmd_task_records(base, layout, epoch));
+    SchedulerReadyPoolPlan without_csr = pool;
+    without_csr.header.dependencies_offset = 0;
+    ASSERT_TRUE(scheduler_seed_ordinary_bootstrap(base, layout, without_csr, epoch));
+    EXPECT_EQ(scheduler_state_at<SchedulerRunControl>(base, layout.run_control_offset)->bootstrap_scan_complete, 0u);
+    ASSERT_TRUE(scheduler_seed_ordinary_bootstrap(base, layout, pool, epoch));
+
+    auto *run = scheduler_state_at<SchedulerRunControl>(base, layout.run_control_offset);
+    EXPECT_EQ(run->bootstrap_scan_complete, SCHEDULER_BOOTSTRAP_HOST_SEEDED);
+    EXPECT_EQ(run->bootstrap_complete, 0u);
+    EXPECT_EQ(run->resolved_task_count, 0u);
+    auto *control = scheduler_state_at<SchedulerTaskControl>(base, layout.task_controls_offset);
+    const auto *remaining = scheduler_state_at<uint64_t>(base, deps.header.remaining_offset);
+    EXPECT_EQ(remaining[1], 0u);
+    EXPECT_EQ(remaining[2], 1u);
+    EXPECT_EQ(remaining[5], 2u);
+    auto queue = [&](uint64_t task) {
+        return scheduler_ready_pool_queue(
+            base, pool.header, scheduler_task_ready_queue(meta[task].flags, meta[task].active_mask)
+        );
+    };
+    EXPECT_EQ(queue(1).control->reserved_tail, 1u);
+    EXPECT_EQ(queue(1).entries[0].task_ref, 1);
+    EXPECT_EQ(queue(2).control, queue(3).control);
+    EXPECT_EQ(queue(3).control->reserved_tail, 2u);
+    EXPECT_EQ(queue(3).entries[0].task_ref, 3);
+    EXPECT_EQ(queue(3).entries[1].task_ref, 4);
+    for (uint32_t task : {2u, 3u, 4u}) {
+        EXPECT_EQ(control[task].admission_state, static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED));
+        EXPECT_EQ(control[task].claim_tickets, 0u);
+        auto *record = scheduler_state_at<SchedulerAdmissionRecord>(
+            base, layout.admission_records_offset + task * layout.admission_record_stride
+        );
+        EXPECT_EQ(record->run_epoch, epoch);
+        EXPECT_EQ(record->order_key, UINT64_MAX);
+        const uint64_t expected = task == 2 ? UINT64_C(0x7b) : task == 3 ? UINT64_C(3) : UINT64_C(5);
+        EXPECT_EQ(*scheduler_state_at<uint64_t>(base, record->member_words_offset), expected);
+    }
+}
+
+TEST(A5HbgReadyPool, ExecutableInlineRootPublishesItsSuccessor) {
+    auto metadata = tasks(3, 1);
+    metadata[0].flags = 0;
+    metadata[1].flags |= SCHEDULER_TASK_INLINE;
+    for (auto &kernel : metadata[1].kernel_ids)
+        kernel = UINT16_MAX;
+    metadata[2].flags |= SCHEDULER_TASK_HAS_FANIN;
+
+    PoolFixture fixture(metadata, 1, {{}, {}, {1}}, {0});
+    fixture.layout.spmd = {3, 1, 0, 0};
+    ASSERT_TRUE(scheduler_seed_ordinary_bootstrap(fixture.base(), fixture.layout, fixture.plan, 47));
+    auto *local = &fixture.locals[1];
+    const auto *remaining =
+        scheduler_state_at<uint64_t>(fixture.base(), fixture.dependency_plan.header.remaining_offset);
+    ASSERT_EQ(remaining[2], 1u);
+    SchedulerReadyClaim claim{};
+    ASSERT_TRUE(fixture.pop(1, 1, &claim));
+    ASSERT_EQ(claim.task_ref, 1);
+    ASSERT_TRUE(fixture.pop(1, 1, &claim));
+    EXPECT_EQ(claim.task_ref, SCHEDULER_TASK_REF_INVALID);
+    ASSERT_TRUE(scheduler_complete_inline_task(fixture.graph, fixture.base(), local, fixture.run, 1, 0));
+    EXPECT_EQ(remaining[2], 0u);
+    ASSERT_TRUE(fixture.pop(1, 1, &claim));
+    EXPECT_EQ(claim.task_ref, 2);
+    ASSERT_TRUE(fixture.pop(1, 1, &claim));
+    EXPECT_EQ(claim.task_ref, SCHEDULER_TASK_REF_INVALID);
+}
+
+TEST(A5HbgReadyPool, EvenAivWaveLeavesSixteenWholeClustersForMix) {
+    constexpr uint64_t tasks = 3;
+    constexpr uint64_t epoch = 47;
+    scheduler_test::GraphBuffer graph(tasks);
+    graph.executable(0, 1);
+    graph.executable(1, 1, {0});
+    graph.mixed(2, LaneMask::all());
+    graph.payload(2).fanin_count = 1;
+    graph.payload(2).fanin_data()[0] = 0;
+    std::vector<SchedulerTaskMetadata> meta(tasks);
+    for (auto &task : meta) {
+        task.timing_slot = -1;
+        task.flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD;
+        task.active_mask = LaneMask::aiv0();
+    }
+    meta[0].logical_block_num = 31;
+    meta[1].logical_block_num = 32;
+    meta[1].flags |= SCHEDULER_TASK_HAS_FANIN;
+    meta[2].logical_block_num = 16;
+    meta[2].flags |= SCHEDULER_TASK_HAS_FANIN | SCHEDULER_TASK_MIX;
+    meta[2].active_mask = LaneMask::all();
+
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(tasks, 1, 3, &layout, false, 48, {96, 32, 3, 1}));
+    SchedulerReadyPoolPlan pool{};
+    ASSERT_TRUE(scheduler_plan_ready_pool(meta, 32, layout.total_size, &pool));
+    SchedulerDependencyPlan deps{};
+    ASSERT_TRUE(scheduler_plan_dependencies(tasks, 2, pool.total_size, &deps));
+    pool.header.dependencies_offset = deps.header_offset;
+    pool.header.storage_end_offset = deps.total_size;
+    layout.total_size = deps.total_size;
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    void *base = storage.base();
+    std::copy(meta.begin(), meta.end(), scheduler_state_at<SchedulerTaskMetadata>(base, layout.task_metadata_offset));
+    ASSERT_TRUE(scheduler_init_dependencies(base, deps, graph.graph(), {}));
+    scheduler_init_ready_pool(base, pool);
+    ASSERT_TRUE(scheduler_init_spmd_task_records(base, layout, epoch));
+    auto record = [&](uint64_t task) {
+        return scheduler_state_at<SchedulerAdmissionRecord>(
+            base, layout.admission_records_offset + task * layout.admission_record_stride
+        );
+    };
+    ASSERT_EQ(record(1)->member_rank_offset, 31u);
+    ASSERT_TRUE(scheduler_seed_ordinary_bootstrap(base, layout, pool, epoch));
+    ASSERT_EQ(record(1)->member_rank_offset, 32u);
+    EXPECT_EQ(record(1)->member_count, 32u);
+    EXPECT_EQ(record(2)->member_count, 48u);
+    auto *aiv = scheduler_state_at<uint64_t>(base, record(1)->member_words_offset);
+    auto *mix = scheduler_state_at<uint64_t>(base, record(2)->member_words_offset);
+    EXPECT_EQ(aiv[0], 0u);
+    EXPECT_EQ(aiv[1], UINT64_C(0xffffffff));
+    EXPECT_EQ(aiv[0] & mix[0], 0u);
+    EXPECT_EQ(aiv[1] & mix[1], 0u);
 }
 
 }  // namespace

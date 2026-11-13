@@ -1182,6 +1182,10 @@ struct alignas(64) SchedulerErrorSignal {
 };
 static_assert(sizeof(SchedulerErrorSignal) == 64);
 
+// Bootstrap gate values distinguish the source of the completed scan.
+inline constexpr uint64_t SCHEDULER_BOOTSTRAP_DEVICE_SCANNED = 1;
+inline constexpr uint64_t SCHEDULER_BOOTSTRAP_HOST_SEEDED = 2;
+
 struct alignas(64) SchedulerRunControl {
     uint64_t aic_task_count;
     uint64_t aiv_task_count;

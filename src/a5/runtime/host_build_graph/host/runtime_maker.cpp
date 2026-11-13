@@ -69,6 +69,7 @@
 #include "native_graph_plan.h"
 #include "async_completion_plan.h"
 #include "ready_pool_plan.h"
+#include "bootstrap_plan.h"
 #include "dependency_plan.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_args_dump.h"
@@ -1814,6 +1815,11 @@ bool create_scheduler_state(
     std::copy(task_metadata.begin(), task_metadata.end(), metadata);
     if (!scheduler_init_spmd_task_records(host_base, layout, api->run_epoch())) {
         LOG_ERROR("A5 HBG AICore scheduler: invalid cooperative task metadata or run epoch");
+        return false;
+    }
+
+    if (!native_graph && !scheduler_seed_ordinary_bootstrap(host_base, layout, ready_pool_plan, api->run_epoch())) {
+        LOG_ERROR("A5 HBG: invalid ordinary bootstrap plan");
         return false;
     }
 

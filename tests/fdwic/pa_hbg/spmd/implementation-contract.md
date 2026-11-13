@@ -168,13 +168,13 @@ captures identity from the actual payload; Host export preserves independent
 `hbg-execution-identity-v1` records. Predicate skips use `executed=false`.
 Compact worker IDs in swimlanes are not physical core IDs in topology records.
 
-L4 additionally exports `hbg-native-protocol-v12` (or v13 for native graph identity): frozen graph/members, admission,
+L4 additionally exports `hbg-native-protocol-v12` (v14 for Host-seeded ordinary CSR, or v13 for native graph identity): frozen graph/members, admission,
 claims, entry permits, LocalDone, group publication/release, completion and terminal
 state. Readers in `simpler_setup/tools/hbg/` check per-worker sequences, exact
 execution joins, ownership and causal edges from observed values and atomic
 tickets. Cross-core timestamps are not a total-order proof.
 
-Only the current v12/v13 schemas are accepted. Producer and reader must use
+Only the current v12/v13/v14 schemas are accepted. Producer and reader must use
 matching contracts; historical and experimental formats are rejected. Admission
 records and close seals use 64-byte alignment; shared admission control separates
 its lock and tail into 128-byte regions. Ordinary multi-block tasks require
@@ -184,8 +184,9 @@ completion total and the closure evidence for the selected claim policy.
 MIX membership follows its resource mask and records per-lane predecessor sequences.
 
 Native Graph v13 includes `node_map` and `graph_source` for an independent topology
-audit. Both schemas validate member_rank_offset against a per-resource-type block
-prefix reconstructed from frozen task shapes. All tasks use the current cooperative
+audit. All schemas validate member_rank_offset against a per-resource-type block
+prefix reconstructed from frozen task shapes; v14 also applies cluster alignment
+to even partial AIV waves in mixed ordinary graphs. All tasks use the current cooperative
 admission rules. Execution identities use only the strict v1 format.
 The strict CSA gate additionally matches independent dep-gen, original kernels,
 block counts, all fan-in and the full task/block/slot set. Truncated/missing

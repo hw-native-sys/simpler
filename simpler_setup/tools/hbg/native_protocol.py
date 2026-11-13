@@ -13,7 +13,7 @@ Sequence integrity proves lossless local event streams, not scheduler causality,
 execution coverage, membership, dependency ordering or Mix resource correctness.
 """
 
-SCHEMAS = ("hbg-native-protocol-v12", "hbg-native-protocol-v13")
+SCHEMAS = ("hbg-native-protocol-v12", "hbg-native-protocol-v13", "hbg-native-protocol-v14")
 
 ROOT_NUMBERS = frozenset(
     """

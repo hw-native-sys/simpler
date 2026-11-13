@@ -285,83 +285,87 @@ __aicore__ bool bootstrap_ready_graph(
     SchedulerScalarScope scalar_bootstrap(scheduler, SchedPhaseKind::ScalarBootstrap);
     const uint64_t timeout_cycles = scheduler_gm_query(run_control->scheduler_timeout_cycles);
     if (phase_timing_enabled) stats->bootstrap_start_cycles = scheduler_cycles();
-    SchedulerReadyBatch batches[SCHEDULER_READY_QUEUE_COUNT]{};
-    uint64_t tasks_per_scheduler = graph.task_count / scheduler_count;
-    uint64_t remainder = graph.task_count % scheduler_count;
-    uint64_t task_begin =
-        scheduler->config.scheduler_index * tasks_per_scheduler +
-        (scheduler->config.scheduler_index < remainder ? scheduler->config.scheduler_index : remainder);
-    uint64_t task_end = task_begin + tasks_per_scheduler + (scheduler->config.scheduler_index < remainder ? 1 : 0);
-    for (uint64_t task_ref = task_begin; task_ref < task_end; ++task_ref) {
-        __gm__ SchedulerTaskMetadata *metadata =
-            scheduler_task_metadata_at(scheduler_state_base, scheduler, static_cast<int64_t>(task_ref));
-        scheduler_observe_cache_line(metadata);
-        bool control_node = false;
-        if (graph.native_header_offset != 0) {
-            SchedulerNodeKind kind{};
-            if (scheduler_node_kind(graph, static_cast<int64_t>(task_ref), &kind) != SchedulerGraphResult::OK)
-                return false;
-            if (kind == SchedulerNodeKind::HOST_DONE) continue;
-            control_node = scheduler_node_is_control(kind);
-            if (kind == SchedulerNodeKind::CHILD_KERNEL &&
-                !scheduler_bootstrap_bind_arguments(graph, static_cast<int64_t>(task_ref), scheduler, run_control))
-                return false;
-        }
-        if (!control_node && !scheduler_task_is_executable(metadata->flags)) continue;
-        if (!control_node && scheduler_task_requires_admission(metadata->flags) &&
-            !scheduler_bootstrap_prepare_admission(
-                graph, scheduler_state_base, scheduler, run_control, scheduler->admission,
-                static_cast<int64_t>(task_ref)
-            ))
-            return false;
-        const bool has_fanin = scheduler_task_has_fanin(metadata->flags);
-        SchedulerRouteResult route =
-            has_fanin ? scheduler_bootstrap_route_task(
-                            graph, scheduler_state_base, scheduler, run_control, static_cast<int64_t>(task_ref)
-                        ) :
-                        SchedulerRouteResult::READY_TO_ENQUEUE;
-        if (route == SchedulerRouteResult::ERROR) return false;
-        if (route == SchedulerRouteResult::READY_TO_ENQUEUE) {
-            if (control_node) {
-                if (!scheduler_control_enqueue(
-                        graph, scheduler_state_base, scheduler, run_control, static_cast<int64_t>(task_ref)
-                    ))
+    // A prebuilt CSR image publishes the graph work before any worker starts.
+    if (WithNativeGraph ||
+        scheduler_gm_query(run_control->bootstrap_scan_complete) != SCHEDULER_BOOTSTRAP_HOST_SEEDED) {
+        SchedulerReadyBatch batches[SCHEDULER_READY_QUEUE_COUNT]{};
+        uint64_t tasks_per_scheduler = graph.task_count / scheduler_count;
+        uint64_t remainder = graph.task_count % scheduler_count;
+        uint64_t task_begin =
+            scheduler->config.scheduler_index * tasks_per_scheduler +
+            (scheduler->config.scheduler_index < remainder ? scheduler->config.scheduler_index : remainder);
+        uint64_t task_end = task_begin + tasks_per_scheduler + (scheduler->config.scheduler_index < remainder ? 1 : 0);
+        for (uint64_t task_ref = task_begin; task_ref < task_end; ++task_ref) {
+            __gm__ SchedulerTaskMetadata *metadata =
+                scheduler_task_metadata_at(scheduler_state_base, scheduler, static_cast<int64_t>(task_ref));
+            scheduler_observe_cache_line(metadata);
+            bool control_node = false;
+            if (graph.native_header_offset != 0) {
+                SchedulerNodeKind kind{};
+                if (scheduler_node_kind(graph, static_cast<int64_t>(task_ref), &kind) != SchedulerGraphResult::OK)
                     return false;
-                continue;
+                if (kind == SchedulerNodeKind::HOST_DONE) continue;
+                control_node = scheduler_node_is_control(kind);
+                if (kind == SchedulerNodeKind::CHILD_KERNEL &&
+                    !scheduler_bootstrap_bind_arguments(graph, static_cast<int64_t>(task_ref), scheduler, run_control))
+                    return false;
             }
-            const uint32_t core_type = scheduler_task_ready_queue(metadata->flags, scheduler_task_lanes(*metadata));
-            if (!scheduler_ready_batch_append(
-                    scheduler_state_base, scheduler, static_cast<int64_t>(task_ref), &batches[core_type]
+            if (!control_node && !scheduler_task_is_executable(metadata->flags)) continue;
+            if (!control_node && scheduler_task_requires_admission(metadata->flags) &&
+                !scheduler_bootstrap_prepare_admission(
+                    graph, scheduler_state_base, scheduler, run_control, scheduler->admission,
+                    static_cast<int64_t>(task_ref)
                 ))
                 return false;
-        }
-        if (phase_timing_enabled) ++stats->bootstrap_task_count;
-    }
-    scheduler_cache_barrier();
-    // The scan barrier orders metadata and child arguments before consumption.
-    // A contended publication remains owned by this scheduler's persistent
-    // publisher and is serviced after the scan and in the dispatch loop.
-    for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type) {
-        if (!scheduler_ready_batch_push(scheduler_state_base, scheduler, type, &batches[type])) return false;
-    }
-
-    uint64_t arrived = scheduler_gm_fetch_add(run_control->bootstrap_scan_arrived_count, UINT64_C(1)) + 1;
-    if (arrived == scheduler_count) {
-        scheduler_gm_store(run_control->bootstrap_scan_complete, UINT64_C(1));
-    } else {
-        uint32_t barrier_backoff = kInitialBackoffIterations;
-        const uint64_t barrier_start = scheduler_cycles();
-        while (scheduler_gm_query(run_control->bootstrap_scan_complete) == 0) {
-            if (scheduler_read_worker_error(run_control, scheduler->worker_id()) != 0) return false;
-            if (scheduler_watchdog_expired(barrier_start, scheduler_cycles(), timeout_cycles)) {
-                scheduler_record_error(
-                    run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::TIMEOUT, &graph, scheduler,
-                    SchedulerErrorSite::BOOTSTRAP_SCAN_TIMEOUT
-                );
-                return false;
+            const bool has_fanin = scheduler_task_has_fanin(metadata->flags);
+            SchedulerRouteResult route =
+                has_fanin ? scheduler_bootstrap_route_task(
+                                graph, scheduler_state_base, scheduler, run_control, static_cast<int64_t>(task_ref)
+                            ) :
+                            SchedulerRouteResult::READY_TO_ENQUEUE;
+            if (route == SchedulerRouteResult::ERROR) return false;
+            if (route == SchedulerRouteResult::READY_TO_ENQUEUE) {
+                if (control_node) {
+                    if (!scheduler_control_enqueue(
+                            graph, scheduler_state_base, scheduler, run_control, static_cast<int64_t>(task_ref)
+                        ))
+                        return false;
+                    continue;
+                }
+                const uint32_t core_type = scheduler_task_ready_queue(metadata->flags, scheduler_task_lanes(*metadata));
+                if (!scheduler_ready_batch_append(
+                        scheduler_state_base, scheduler, static_cast<int64_t>(task_ref), &batches[core_type]
+                    ))
+                    return false;
             }
-            local_backoff(barrier_backoff);
-            if (barrier_backoff < kMaximumBackoffIterations) barrier_backoff <<= 1;
+            if (phase_timing_enabled) ++stats->bootstrap_task_count;
+        }
+        scheduler_cache_barrier();
+        // The scan barrier orders metadata and child arguments before consumption.
+        // A contended publication remains owned by this scheduler's persistent
+        // publisher and is serviced after the scan and in the dispatch loop.
+        for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type) {
+            if (!scheduler_ready_batch_push(scheduler_state_base, scheduler, type, &batches[type])) return false;
+        }
+
+        const uint64_t arrived = scheduler_gm_fetch_add(run_control->bootstrap_scan_arrived_count, UINT64_C(1)) + 1;
+        if (arrived == scheduler_count) {
+            scheduler_gm_store(run_control->bootstrap_scan_complete, SCHEDULER_BOOTSTRAP_DEVICE_SCANNED);
+        } else {
+            uint32_t barrier_backoff = kInitialBackoffIterations;
+            const uint64_t barrier_start = scheduler_cycles();
+            while (scheduler_gm_query(run_control->bootstrap_scan_complete) == 0) {
+                if (scheduler_read_worker_error(run_control, scheduler->worker_id()) != 0) return false;
+                if (scheduler_watchdog_expired(barrier_start, scheduler_cycles(), timeout_cycles)) {
+                    scheduler_record_error(
+                        run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::TIMEOUT, &graph, scheduler,
+                        SchedulerErrorSite::BOOTSTRAP_SCAN_TIMEOUT
+                    );
+                    return false;
+                }
+                local_backoff(barrier_backoff);
+                if (barrier_backoff < kMaximumBackoffIterations) barrier_backoff <<= 1;
+            }
         }
     }
     for (uint32_t slot_index = 0; slot_index < SCHEDULER_PENDING_SLOT_COUNT; ++slot_index) {
@@ -389,7 +393,7 @@ __aicore__ bool bootstrap_ready_graph(
     // exchange and reads its links with an atomic load. A ready batch is found
     // by a poll that repeats, so a queue head this core cannot see yet is read
     // again on the next pass.
-    arrived = scheduler_gm_fetch_add(run_control->bootstrap_arrived_count, UINT64_C(1)) + 1;
+    const uint64_t arrived = scheduler_gm_fetch_add(run_control->bootstrap_arrived_count, UINT64_C(1)) + 1;
     if (arrived == scheduler_count) scheduler_gm_store(run_control->bootstrap_complete, UINT64_C(1));
     return true;
 }
