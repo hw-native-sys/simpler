@@ -1068,6 +1068,57 @@ TEST(ChipRunLaneTest, PrepareFailureIsTerminalWithoutPoisoningTheLane) {
     worker.finalize();
 }
 
+TEST(ChipRunLaneTest, TerminalAbandonPreservesPreparationCleanupProof) {
+    for (const bool released : {false, true}) {
+        SCOPED_TRACE(released);
+        ChipWorker worker;
+        prime_worker(worker);
+        ChipRunLane lane(worker);
+        g_prepare_rc[0] = -5;
+        g_prepare_release_proven = released;
+        ChipRun failed = submit(lane, 101, 0);
+        ASSERT_EQ(g_prepare_count[0], 1u);
+        ASSERT_TRUE(failed.done());
+        EXPECT_EQ(failed.owner_recovery_required(), !released);
+        const auto events = g_events;
+        EXPECT_NO_THROW(failed.abandon());
+        EXPECT_EQ(g_events, events);
+        EXPECT_EQ(failed.owner_recovery_required(), !released);
+        if (released) {
+            EXPECT_NO_THROW(lane.close());
+        } else {
+            EXPECT_THROW(lane.close(), std::runtime_error);
+        }
+        worker.finalize();
+    }
+}
+
+TEST(ChipRunLaneTest, CleanAbandonPublishesContextAndLastUseProof) {
+    for (const bool prepared : {false, true}) {
+        SCOPED_TRACE(prepared);
+        ChipWorker worker;
+        prime_worker(worker);
+        g_supports_successor = prepared;
+        ChipRunLane lane(worker);
+        ChipRun first = submit(lane, 101, 0);
+        ChipRun pending = submit(lane, 102, 1, false);
+        ASSERT_FALSE(pending.launched());
+        ASSERT_EQ(g_prepare_count[1], prepared ? 1u : 0u);
+        EXPECT_TRUE(pending.owner_recovery_required());
+        pending.abandon();
+        EXPECT_TRUE(pending.done());
+        EXPECT_FALSE(pending.owner_recovery_required());
+        const auto events = g_events;
+        pending.abandon();
+        EXPECT_EQ(g_events, events);
+        EXPECT_FALSE(pending.owner_recovery_required());
+        g_complete[0] = true;
+        EXPECT_TRUE(first.done());
+        lane.close();
+        worker.finalize();
+    }
+}
+
 TEST(ChipRunLaneTest, ReclaimedLaunchFailureDoesNotPoisonTheLane) {
     ChipWorker worker;
     prime_worker(worker);
@@ -1311,6 +1362,97 @@ TEST(ChipRunLaneTest, UnknownPreparationCleanupPoisonsAndKeepsTheReleaseUnproven
     EXPECT_THROW(submit(lane, 102, 1), std::runtime_error);
     EXPECT_THROW(lane.close(), std::runtime_error);
     EXPECT_NO_THROW(worker.finalize());
+}
+
+TEST(ChipRunLaneTest, TerminalHostRecoveryDrainsBeforeUnregisterAndRetriesUnknownPreparation) {
+    ChipWorker worker;
+    prime_worker(worker);
+    int drain_rc = -7;
+    worker.device_ctx_ = &drain_rc;
+    worker.quiesce_host_uses_fn_ = [](void *ctx) {
+        g_events.push_back("host-drain");
+        return *static_cast<int *>(ctx);
+    };
+    worker.prepare_run_fn_ = [](void *ctx, void *storage, int32_t cid, const void *args, const CallConfig *cfg,
+                                const NativeRunDescriptor *descriptor) {
+        const int rc = prepare_run(ctx, storage, cid, args, cfg, descriptor);
+        const uint64_t tag = kNativeRunContextMagic;
+        std::memcpy(storage, &tag, sizeof(tag));
+        return rc;
+    };
+    worker.run_lane_ = std::make_unique<ChipRunLane>(worker);
+    g_prepare_rc[0] = -5;
+    g_prepare_release_proven = false;
+    ChipRun failed = submit(*worker.run_lane_, 101, 0);
+    ASSERT_TRUE(failed.owner_recovery_required());
+    ASSERT_EQ(worker.unproven_native_run_count(), 1u);
+    worker.host_ddr_mappings_.emplace(0x1000, ChipWorker::HostDdrMapping{64, 0x2000, 1});
+    EXPECT_THROW(worker.quiesce_host_uses(), std::runtime_error);
+    EXPECT_FALSE(worker.host_uses_quiesced_);
+    EXPECT_NE(worker.native_runs_.begin()->second->storage.data(), nullptr);
+    EXPECT_EQ(worker.host_ddr_mappings_.size(), 1u);
+    drain_rc = 0;
+    EXPECT_TRUE(worker.quiesce_host_uses());
+    EXPECT_TRUE(worker.host_uses_quiesced_);
+    EXPECT_EQ(worker.native_runs_.begin()->second->storage.data(), nullptr);
+    EXPECT_EQ(worker.host_ddr_mappings_.size(), 1u);
+    const auto events = g_events;
+    EXPECT_TRUE(worker.quiesce_host_uses());
+    EXPECT_EQ(g_events, events);
+    EXPECT_EQ(std::count(events.begin(), events.end(), "host-drain"), 2);
+    EXPECT_EQ(std::count(events.begin(), events.end(), "finalize0"), 0);
+    // The fake runtime has no owner-reset entry. Dispose only its test ledger;
+    // production keeps it until explicit unmap and successful owner teardown.
+    worker.native_runs_.clear();
+    worker.host_ddr_mappings_.clear();
+    worker.device_ctx_ = nullptr;
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, TerminalHostRecoveryDrainsAnUnobservedRunWithoutResettingMappings) {
+    ChipWorker worker;
+    prime_worker(worker);
+    worker.run_lane_ = std::make_unique<ChipRunLane>(worker);
+    ChipRun run = submit(*worker.run_lane_, 101, 0);
+    worker.host_ddr_mappings_.emplace(0x1000, ChipWorker::HostDdrMapping{64, 0x2000, 1});
+    EXPECT_FALSE(worker.quiesce_host_uses());
+    EXPECT_TRUE(run.done());
+    EXPECT_TRUE(worker.native_runs_.empty());
+    EXPECT_EQ(worker.host_ddr_mappings_.size(), 1u);
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    worker.host_ddr_mappings_.clear();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, TerminalHostRecoveryRefusesBorrowedContextsAndExternalReferences) {
+    ChipWorker worker;
+    prime_worker(worker);
+    worker.execution_environment_ = ChipWorker::ExecutionEnvironment{static_cast<uint64_t>(getpid()), 1, 1, 0, true};
+    EXPECT_THROW(worker.quiesce_host_uses(), std::runtime_error);
+    EXPECT_FALSE(worker.native_runs_closing_);
+    worker.execution_environment_.reset();
+    worker.native_resource_references_ = 1;
+    EXPECT_THROW(worker.quiesce_host_uses(), std::runtime_error);
+    EXPECT_FALSE(worker.host_uses_quiesced_);
+    worker.native_resource_references_ = 0;
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, TerminalHostRecoveryRetainsUnstoppedCcuResources) {
+    ChipWorker worker;
+    prime_worker(worker);
+    worker.unstopped_ccu_runs_.emplace(1, 2, 3);
+    EXPECT_THROW(worker.quiesce_host_uses(), std::runtime_error);
+    EXPECT_TRUE(worker.ccu_cleanup_unconfirmed_);
+    EXPECT_FALSE(worker.host_uses_quiesced_);
+    EXPECT_FALSE(worker.native_runs_closing_);
+    EXPECT_EQ(worker.unstopped_ccu_runs_.size(), 1u);
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    // The fake has no live CCU backend; clear only its retained test ledger.
+    worker.unstopped_ccu_runs_.clear();
+    worker.ccu_cleanup_unconfirmed_ = false;
+    worker.comm_cleanup_unconfirmed_ = false;
+    worker.finalize();
 }
 
 TEST(ChipRunLaneTest, ReleasedPrepareReceiptIsBoundToOneEpochAndConsumedOnce) {

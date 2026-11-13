@@ -1,4 +1,4 @@
-# A5 same-device Host DDR access
+# A5 local Host DDR access
 
 A direct L2 Worker can use `TensorTransfer.MAP` to let its A5 device access owned
 Host DDR through MTE. This supports large Host tables without a full Device
@@ -30,10 +30,9 @@ MAP supports IN, OUT and INOUT, with the usual INPUT, OUTPUT_EXISTING and INOUT
 argument tags. Buffer grants remain authoritative. Directions describe kernel use
 and dependencies; IN is not hardware write protection.
 
-This scope is this process's POSIX_SHM owned by a direct, initialized A5 L2 Worker.
-L3 distribution, other-device/remote access, Host compute leaves, borrowed L2
-contexts and capture paths without an owning mapping registry reject MAP. L3
-shared Host tables require their own per-device lifetime coordination.
+Direct L2 supports owned POSIX_SHM on A5 TMR and HBG. Same-machine L3 supports
+A5 TMR through the coordinated preparation below. Remote access, Host compute
+leaves, borrowed L2 contexts, L3 HBG, A3 and capture paths reject MAP.
 
 ## Usage
 
@@ -152,3 +151,77 @@ Export carriers pin the actual Host mapping even when NumPy outlives a temporary
 `host_view()`. Raw `buffer.shm.close()` and `unlink()` cannot bypass a registered
 Buffer's lifetime checks. Communication-domain mappings reuse export tracking but
 retain their own allocation and unlink ownership rules.
+
+## L3 shared tables
+
+An L3 Worker owns complete ordinary Host Buffers. Each local A5 TMR child imports
+that same backing and registers its own Device mapping when preparing a child
+call with `TensorTransfer.MAP`. This is the same parameter-preparation boundary
+at which H2D requests are handled. Outer arguments need no MAP declaration: they
+can carry HOST/NONE views, or the callback can construct child args from owned
+Buffers directly. Subviews keep their canonical descriptor, offsets and grants.
+
+```text
+L3 Host Buffer -> callback submits child args (MAP)
+                       |                  |
+                  L2-0 import        L2-1 import
+                  Device0 map        Device1 map
+                       |                  |
+                  local MTE          local MTE
+```
+
+Only children receiving the backing prepare it. Mapping sends no preparation
+control messages and creates no peer relationship, rank communication, MR, URMA
+channel or communication workspace. One child is supported; qualification uses
+at least two distinct A5 devices and processes. Multiple backings and views
+coexist. There is no table-sized HBM replica or payload copy in the control
+transport.
+
+Registrations are cached across calls. First use of a new backing does not
+require earlier calls to drain; each child establishes its mapping before its
+native task can use the address. Child submission resolves each MAP entry to
+that child's Device address; native NONE/H2D entries keep their original behavior.
+The same writable-alias restrictions as direct L2 apply to each chip callable.
+Sharing backing does not order conflicting writers on different devices. CPU
+updates require every Device user of that backing to have drained.
+
+Preparation failures follow ordinary child-call failure semantics, as for H2D.
+A child mapping failure does not roll back work already dispatched to other
+children or establish an all-device readiness barrier. Existing task/group
+activation and completion rules still apply. The call reports failure while
+accepted tasks and unresolved native cleanup retain their resources.
+
+Before dispatch, the parent retains backing and records every possibly submitted
+child, even if submission later fails. Children retain full dispatch identities
+for HOST/NONE, H2D and MAP, including uses preceding the first mapping.
+Completion or a native proof of safe failed cleanup retires only that invocation.
+Unknown completion retains the child use even if the parent receives a task error.
+Stale activation also requires the native cleanup proof before retiring Host uses:
+a terminal run can return from `abandon()` while cleanup remains unproven.
+Release first closes admission and checks all children, then unregisters each local
+mapping and closes its CPU import. Backing remains owned until every cleanup reply
+is confirmed. A lost reply or failed unmap retains the closed record for idempotent
+retry. Partial child mapping remains recorded for coordinated cleanup; unresolved
+cleanup retains backing and transport. A mailbox acknowledgement alone never proves device
+completion. Spontaneous child exit is not successful coordinated release.
+
+During terminal L3 `Worker.close()`, children with unresolved uses stop native
+admission and drain their native owner, including submissions that returned no
+Python run handle. If carrier destruction remains unknown, the owned A5 runtime
+stops background collectors and requires a successful bounded device synchronize
+before releasing Host uses. This does not prove device health, unregister memory,
+or reset the context. Failed synchronization keeps the uses, mappings and backing.
+Live communication resources or external native references block this recovery.
+
+A poisoned child keeps serving cleanup commands while refusing new tasks. Once
+every Host registration has been explicitly unregistered and every CPU import
+closed, recovered children finalize their native owner. Only that successful
+owner teardown permits later Device Buffer frees to be acknowledged without
+calling a dead context. Parent backing and cleanup records remain retained until
+all finalization replies arrive; retries do not repeat a completed owner teardown.
+Ordinary Buffer release does not initiate terminal owner recovery.
+
+Use the [shared-table examples](../../examples/a5/tensormap_and_ringbuffer/host_ddr_map/README.md)
+for BF16 gathers and MXFP8 payloads with Device scales and dependent consumers,
+in serial and staged L3 execution. Historical URMA qualification does not qualify
+this MAP path.

@@ -1029,6 +1029,23 @@ void DeviceRunner::mark_device_unusable(int runtime_rc) {
     if (execution_mode_latch_.is_kernel()) kernel_exec_state_.poison(runtime_rc);
 }
 
+int DeviceRunner::quiesce_host_uses() {
+    if (execution_mode_latch().latched_mode() != SIMPLER_MODE_PROGRAM) return PTO_RUNTIME_ERR_INVALID_STATE;
+    const int context_rc = validate_current_context();
+    if (context_rc != 0) return context_rc;
+    const int acl_rc = ensure_acl_ready(device_id_);
+    if (acl_rc != 0) return acl_rc;
+    mark_device_unusable(PTO_RUNTIME_ERR_INVALID_STATE);
+    begin_fatal_close();
+    stop_shared_collectors_for_device_failure();
+    dep_gen_collector_.stop_for_device_failure();
+    if (prepared_resources_block_fatal_reset()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    // Admission and native host operations are fenced by ChipWorker. A zero
+    // result proves last use, not device health or registration retirement.
+    // Keep ACL and all backing alive until explicit Host unregistration.
+    return aclrtSynchronizeDeviceWithTimeout(timeout_config_.stream_sync_timeout_ms);
+}
+
 void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {
     mark_device_unusable(aicore_rc);
     // A borrowed context cannot drain or reset the caller's entire device.

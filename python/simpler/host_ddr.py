@@ -13,7 +13,7 @@ from __future__ import annotations
 import ctypes
 import os
 import threading
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -54,6 +54,9 @@ class HostMappingRegistry:
     def _check_pid(self):
         if os.getpid() != self._pid:
             raise ValueError("Host mapping belongs to another process")
+
+    def release_admission(self):
+        return nullcontext()
 
     def _check_context(self):
         self._check_pid()

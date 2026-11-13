@@ -1358,6 +1358,8 @@ class _TwoFrameLoopHarness:
         *,
         supports_concurrent_native_prepare: bool = False,
         chip_runtime: str = "",
+        chip_platform: str = "a2a3",
+        owner_instance_id: Optional[bytes] = None,
     ) -> None:
         self.shm = SharedMemory(create=True, size=worker_mod.mailbox_size(2))
         self.buf = cast(memoryview, self.shm.buf)
@@ -1395,14 +1397,16 @@ class _TwoFrameLoopHarness:
                 self.registry,
                 self.identity_table,
                 self.identity_refs,
-                worker_mod.mint_owner_instance_id(),
+                worker_mod.mint_owner_instance_id() if owner_instance_id is None else owner_instance_id,
             ),
             kwargs={
-                "chip_platform": "a2a3",
+                "chip_platform": chip_platform,
                 "chip_runtime": chip_runtime,
+                "chip_rank": 0 if chip_platform == "a5" else None,
+                "chip_count": 1 if chip_platform == "a5" else 0,
                 "prepared": self.prepared,
                 "granted_sets": 2,
-                "provider_region_store": _chip_loop_provider_region_store(chip_platform="a2a3"),
+                "provider_region_store": _chip_loop_provider_region_store(chip_platform=chip_platform),
             },
         )
         self._mailbox_load_patch = patch.object(worker_mod, "_mailbox_load_i32", observed_mailbox_load)
@@ -2379,6 +2383,263 @@ def test_two_frame_launch_cleanup_failure_terminalizes_staged_successor():
         assert _mailbox_load_i32(harness.accepted_addr(1)) == 0
     finally:
         harness.close()
+
+
+@pytest.fixture(params=[0, 4096], ids=["exact", "page-rounded"])
+def control_payload_padding(request):
+    """SharedMemory capacity can exceed the protocol payload length."""
+    return request.param
+
+
+@pytest.mark.parametrize("operation", [1, 3, 4, 5, 6, 7])
+def test_poisoned_chip_accepts_only_ccu_cleanup_controls(monkeypatch, operation, control_payload_padding):
+    from unittest.mock import Mock
+
+    monkeypatch.setattr(worker_mod, "_require_base_communicator", lambda _handle: 17)
+    monkeypatch.setattr(_FakeChipRun, "_owner_recovery_required", False, raising=False)
+    harness = _TwoFrameLoopHarness(chip_platform="a5", chip_runtime="tensormap_and_ringbuffer")
+    harness.cw._validate_execution_context = Mock()
+    harness.cw.control_ccu_run = Mock(return_value=0)
+    harness.cw.finalize_errors[(0, 11)] = RuntimeError("native execution failed")
+    payload = worker_mod._CCU_DOMAIN_REQUEST.pack(8, 2, operation, bytes(32), 0)
+    staged = SharedMemory(create=True, size=len(payload) + control_payload_padding)
+    memory = staged.buf
+    assert memory is not None
+    tail = bytes([0xA5]) * (len(memory) - len(payload))
+    memory[len(payload) :] = tail
+    try:
+        harness.publish(0, 1)
+        harness.start()
+        assert harness.cw.launched[0].wait(5.0)
+        harness.cw.completed[0].set()
+        harness.wait_state(0, worker_mod._TASK_FAILED)
+        memory[: len(payload)] = payload
+        struct.pack_into("Q", harness.buf, worker_mod._OFF_CALLABLE, worker_mod._CTRL_CCU_DOMAIN)
+        struct.pack_into("Q", harness.buf, worker_mod._CTRL_OFF_ARG0, len(payload))
+        start = worker_mod._OFF_ARGS
+        harness.buf[start : start + worker_mod._CTRL_SHM_NAME_BYTES] = staged.name.encode().ljust(
+            worker_mod._CTRL_SHM_NAME_BYTES, b"\0"
+        )
+        _mailbox_store_i32(harness.mailbox_addr + _OFF_STATE, worker_mod._CONTROL_REQUEST)
+        harness.wait_control_state(worker_mod._CONTROL_DONE)
+        code = struct.unpack_from("i", harness.buf, worker_mod._OFF_ERROR)[0]
+        if operation in (3, 4, 7):
+            assert code == 0
+            harness.cw.control_ccu_run.assert_called_once_with(17, 8, operation, 2)
+        else:
+            assert code != 0
+            harness.cw.control_ccu_run.assert_not_called()
+        _mailbox_store_i32(harness.mailbox_addr + _OFF_STATE, worker_mod._IDLE)
+    finally:
+        harness.close()
+        tail_preserved = bytes(memory[len(payload) :]) == tail
+        memory.release()
+        staged.close()
+        staged.unlink()
+        assert tail_preserved
+
+
+@pytest.mark.parametrize("transfer", ["NONE", "H2D"])
+def test_poisoned_chip_acknowledges_retired_host_uses(monkeypatch, transfer, control_payload_padding):
+    from unittest.mock import Mock
+
+    from simpler.buffer import create_host_shared_buffer, mint_owner_instance_id
+    from simpler.host_ddr_l3 import _Action, _encode
+    from simpler.task_interface import ArgDirection, TensorTransfer
+
+    owner = mint_owner_instance_id()
+    table = create_host_shared_buffer(128, owner, 1)
+    args = TaskArgs()
+    args.add_tensor(table.tensor((4,), DataType.INT32), transfer=getattr(TensorTransfer, transfer))
+    monkeypatch.setattr(worker_mod, "read_args_from_blob", lambda *_args: args)
+    # The native use retired safely, but the execution failure poisons admission.
+    monkeypatch.setattr(_FakeChipRun, "_owner_recovery_required", False, raising=False)
+    harness = _TwoFrameLoopHarness(chip_platform="a5", chip_runtime="tensormap_and_ringbuffer", owner_instance_id=owner)
+    harness.registry[7] = SimpleNamespace(sig_count=1, sig=lambda _index: ArgDirection.IN)
+    harness.cw._validate_execution_context = Mock()
+    harness.cw._quiesce_host_uses = Mock(return_value=False)
+    harness.cw._map_host_ddr = Mock()
+    harness.cw._unmap_host_ddr = Mock()
+    harness.cw.finalize_errors[(0, 11)] = RuntimeError("execution failed after native retirement")
+
+    try:
+        harness.publish(0, 1)
+        harness.start()
+        assert harness.cw.launched[0].wait(5.0)
+        harness.cw.completed[0].set()
+        harness.wait_state(0, worker_mod._TASK_FAILED)
+        for action in (_Action.RECOVER, _Action.QUIESCE, _Action.RELEASE, _Action.FINALIZE_RECOVERY):
+            payload = _encode(action, 0, 1, table.to_descriptor())
+            staged = SharedMemory(create=True, size=len(payload) + control_payload_padding)
+            memory = staged.buf
+            assert memory is not None
+            tail = bytes([0xA5]) * (len(memory) - len(payload))
+            memory[len(payload) :] = tail
+            try:
+                memory[: len(payload)] = payload
+                struct.pack_into("Q", harness.buf, worker_mod._OFF_CALLABLE, worker_mod._CTRL_HOST_DDR)
+                struct.pack_into("Q", harness.buf, worker_mod._CTRL_OFF_ARG0, len(payload))
+                start = worker_mod._OFF_ARGS
+                harness.buf[start : start + worker_mod._CTRL_SHM_NAME_BYTES] = staged.name.encode().ljust(
+                    worker_mod._CTRL_SHM_NAME_BYTES, b"\0"
+                )
+                _mailbox_store_i32(harness.mailbox_addr + _OFF_STATE, worker_mod._CONTROL_REQUEST)
+                harness.wait_control_state(worker_mod._CONTROL_DONE)
+                assert struct.unpack_from("i", harness.buf, worker_mod._OFF_ERROR)[0] == 0
+                assert bytes(memory[: len(payload)]) == payload
+                _mailbox_store_i32(harness.mailbox_addr + _OFF_STATE, worker_mod._IDLE)
+            finally:
+                tail_preserved = bytes(memory[len(payload) :]) == tail
+                memory.release()
+                staged.close()
+                staged.unlink()
+                assert tail_preserved
+        harness.cw._quiesce_host_uses.assert_called_once()
+        harness.cw._map_host_ddr.assert_not_called()
+        harness.cw._unmap_host_ddr.assert_not_called()
+        assert harness.thread.is_alive()
+    finally:
+        harness.close()
+        table.close()
+
+
+def test_poisoned_chip_keeps_host_cleanup_endpoint_until_parent_shutdown(monkeypatch, control_payload_padding):  # noqa: PLR0915 -- one recovery protocol from poisoned dispatch through acknowledged cleanup and shutdown
+    from unittest.mock import Mock
+
+    from simpler.buffer import create_host_shared_buffer, mint_owner_instance_id
+    from simpler.host_ddr_l3 import ChildHostMappings, _Action, _encode
+    from simpler.task_interface import ArgDirection, TensorTransfer
+
+    owner = mint_owner_instance_id()
+    table = create_host_shared_buffer(128, owner, 1)
+    args = TaskArgs()
+    args.add_tensor(table.tensor((4,), DataType.INT32), transfer=TensorTransfer.MAP)
+    mappings = []
+
+    class ObservedMappings(ChildHostMappings):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            mappings.append(self)
+
+    monkeypatch.setattr(worker_mod, "ChildHostMappings", ObservedMappings)
+    monkeypatch.setattr(worker_mod, "read_args_from_blob", lambda *_args: args)
+    monkeypatch.setattr(
+        _FakeChipRun, "_owner_recovery_required", property(lambda run: run.lane_poisoned), raising=False
+    )
+    harness = _TwoFrameLoopHarness(chip_platform="a5", chip_runtime="tensormap_and_ringbuffer", owner_instance_id=owner)
+    harness.registry[7] = SimpleNamespace(sig_count=1, sig=lambda _index: ArgDirection.IN)
+    harness.cw._validate_execution_context = Mock()
+    harness.cw._host_ddr_mapping_supported = True
+    harness.cw._map_host_ddr = Mock(return_value=0x400000)
+    harness.cw._quiesce_host_uses = Mock(side_effect=[RuntimeError("last use unknown"), True])
+    harness.cw._unmap_host_ddr = Mock()
+    harness.cw.finalize = Mock()
+    harness.cw.free = Mock(side_effect=RuntimeError("device allocation still borrowed"))
+    harness.cw.finalize_errors[(0, 11)] = RuntimeError("native cleanup unknown")
+    terminal = [threading.Event(), threading.Event()]
+    control_done = threading.Event()
+    store_i32 = worker_mod._mailbox_store_i32
+
+    def observed_store(address, value):
+        store_i32(address, value)
+        for index, event in enumerate(terminal):
+            if address == harness.state_addr(index) and value == worker_mod._TASK_FAILED:
+                event.set()
+        if address == harness.mailbox_addr + _OFF_STATE and value == worker_mod._CONTROL_DONE:
+            control_done.set()
+
+    monkeypatch.setattr(worker_mod, "_mailbox_store_i32", observed_store)
+
+    def control(action):
+        payload = _encode(action, 0, 1, table.to_descriptor())
+        staged = SharedMemory(create=True, size=len(payload) + control_payload_padding)
+        memory = staged.buf
+        assert memory is not None
+        tail = bytes([0xA5]) * (len(memory) - len(payload))
+        memory[len(payload) :] = tail
+        try:
+            memory[: len(payload)] = payload
+            name = staged.name.encode()
+            struct.pack_into("Q", harness.buf, worker_mod._OFF_CALLABLE, worker_mod._CTRL_HOST_DDR)
+            struct.pack_into("Q", harness.buf, worker_mod._CTRL_OFF_ARG0, len(payload))
+            start = worker_mod._OFF_ARGS
+            harness.buf[start : start + worker_mod._CTRL_SHM_NAME_BYTES] = name.ljust(
+                worker_mod._CTRL_SHM_NAME_BYTES, b"\0"
+            )
+            control_done.clear()
+            _mailbox_store_i32(harness.mailbox_addr + _OFF_STATE, worker_mod._CONTROL_REQUEST)
+            assert control_done.wait(5.0), "poisoned child stopped serving cleanup"
+            code = struct.unpack_from("i", harness.buf, worker_mod._OFF_ERROR)[0]
+            if code == 0:
+                assert bytes(memory[: len(payload)]) == payload
+            _mailbox_store_i32(harness.mailbox_addr + _OFF_STATE, worker_mod._IDLE)
+            return code
+        finally:
+            tail_preserved = bytes(memory[len(payload) :]) == tail
+            memory.release()
+            staged.close()
+            staged.unlink()
+            assert tail_preserved
+
+    def free_device_buffer():
+        struct.pack_into("Q", harness.buf, worker_mod._OFF_CALLABLE, worker_mod._CTRL_FREE)
+        struct.pack_into("Q", harness.buf, worker_mod._CTRL_OFF_ARG0, 0x800000)
+        control_done.clear()
+        _mailbox_store_i32(harness.mailbox_addr + _OFF_STATE, worker_mod._CONTROL_REQUEST)
+        assert control_done.wait(5.0)
+        code = struct.unpack_from("i", harness.buf, worker_mod._OFF_ERROR)[0]
+        _mailbox_store_i32(harness.mailbox_addr + _OFF_STATE, worker_mod._IDLE)
+        return code
+
+    try:
+        harness.publish(0, 1)
+        harness.start()
+        assert harness.cw.launched[0].wait(5.0)
+        harness.cw.completed[0].set()
+        assert terminal[0].wait(5.0)
+        assert mappings[0]._uses
+        assert control(_Action.RECOVER) != 0
+        assert mappings[0]._uses
+        harness.cw._unmap_host_ddr.assert_not_called()
+        assert control(_Action.RECOVER) == 0
+        assert not mappings[0]._uses
+        assert free_device_buffer() != 0
+        harness.cw.free.assert_called_once_with(0x800000)
+        harness.cw.finalize.assert_not_called()
+        assert control(_Action.QUIESCE) == 0
+        assert control(_Action.RELEASE) == 0
+        harness.cw._unmap_host_ddr.assert_called_once()
+        assert not mappings[0].pending_cleanup
+        assert control(_Action.FINALIZE_RECOVERY) == 0
+        assert control(_Action.FINALIZE_RECOVERY) == 0
+        harness.cw.finalize.assert_called_once()
+        assert mappings[0].native_finalized
+        assert free_device_buffer() == 0
+        harness.cw.free.assert_called_once_with(0x800000)
+
+        # A successful release does not retire the endpoint: the parent still
+        # owns transport shutdown, and later task publications must be refused.
+        harness.publish(1, 2)
+        assert terminal[1].wait(5.0)
+        assert _mailbox_load_i32(harness.accepted_addr(1)) == 0
+        assert (
+            _mailbox_load_u64(
+                harness.mailbox_addr + harness._entry_offset(1) + worker_mod._OFF_ENTRY_FRAME_CONSUMED_GENERATION
+            )
+            == harness._frame_generation
+        )
+        assert not harness.cw.prepared[1].is_set()
+        assert not harness.cw.launched[1].is_set()
+        assert harness.thread.is_alive()
+        harness.stop()
+    finally:
+        harness.close()
+        # Keep a failed regression from leaving real shared-memory imports.
+        for child in mappings:
+            child._uses.clear()
+            child.handle(_encode(_Action.QUIESCE, 0, 1, table.to_descriptor()))
+            child.handle(_encode(_Action.RELEASE, 0, 1, table.to_descriptor()))
+        table.close()
 
 
 @pytest.mark.parametrize("failure_point", ["poll", "finalize"])
@@ -9056,3 +9317,33 @@ def test_the_cpp_pre_bind_level_word_is_the_ladder_word_for_l3():
     assert completed.stdout == WorkerLevel.node.name, (
         f"C++ pre-bind level word is {completed.stdout!r}, ladder says {WorkerLevel.node.name!r}"
     )
+
+
+@pytest.mark.parametrize("recovery_required", [False, True])
+def test_child_host_use_retirement_consumes_native_failure_proof(monkeypatch, recovery_required):
+    imports = worker_mod.ImportRegistry
+    uses = set()
+    mappings = SimpleNamespace(
+        acquire=lambda identity, _args: uses.add(identity),
+        release=uses.discard,
+        require_closed=lambda: None,
+    )
+
+    def with_host_mappings(context):
+        registry = imports(context)
+        registry.host_mappings = mappings
+        return registry
+
+    monkeypatch.setattr(worker_mod, "ImportRegistry", with_host_mappings)
+    monkeypatch.setattr(
+        _FakeChipRun, "_owner_recovery_required", property(lambda _self: recovery_required), raising=False
+    )
+    harness = _TwoFrameLoopHarness()
+    try:
+        harness.cw.launch_errors[(0, 11)] = RuntimeError("injected launch failure")
+        harness.publish(0, 1)
+        harness.start()
+        harness.wait_state(0, worker_mod._TASK_FAILED)
+        assert bool(uses) is recovery_required
+    finally:
+        harness.close()

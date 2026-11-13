@@ -929,6 +929,29 @@ TEST(ChipRunLaneJoinedLaunchTest, ALiveExportedDeviceRegionWithholdsEveryJoin) {
     worker.finalize();
 }
 
+TEST(ChipRunLaneJoinedLaunchTest, HostMappingCacheAndRegistrationDebtWithholdEveryJoin) {
+    for (bool closing : {false, true}) {
+        ChipWorker worker;
+        prime_worker(worker);
+        ChipRunLane lane(worker);
+        ChipRun first = submit(lane, 101, 0, true, host_args());
+        // Task-time registration can precede native submission without any
+        // control command publishing the Python resource-store flag.
+        worker.host_ddr_mappings_.emplace(0x1000, ChipWorker::HostDdrMapping{64, closing ? 0U : 0x2000U, 1, closing});
+        EXPECT_TRUE(worker.holds_live_comm_resources());
+        ChipRun second = submit(lane, 102, 1, false, host_args());
+        second.activate();
+        EXPECT_FALSE(second.launched());
+        g_complete[0] = true;
+        EXPECT_TRUE(first.done());
+        EXPECT_TRUE(second.launched());
+        lane.close();
+        worker.host_ddr_mappings_.clear();
+        EXPECT_FALSE(worker.holds_live_comm_resources());
+        worker.finalize();
+    }
+}
+
 TEST(ChipRunLaneJoinedLaunchTest, AJoinedSuccessorIsNotReportedFinishedAheadOfItsPredecessor) {
     ChipWorker worker;
     prime_worker(worker);

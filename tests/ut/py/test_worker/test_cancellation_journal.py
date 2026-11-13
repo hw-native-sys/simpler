@@ -326,6 +326,38 @@ class TestJournalInAbortHierarchical:
 
 
 class TestJournalRetryOnClose:
+    def test_domain_retirement_error_survives_failed_child_exit(self, monkeypatch):
+        worker = Worker(level=3, num_sub_workers=0)
+        domain = worker_mod.CommDomainHandle(
+            name="rejected", workers=(), contexts={}, allocation_id=7, _release_fn=lambda _handle: None
+        )
+        domain._released = True
+        worker._domain_free_results[7] = RuntimeError("backend reclamation failed")
+        worker._defer_domain_retirement(domain)
+        child_error = RuntimeError("child teardown: pid 123 exited with code 1")
+
+        def reap(_deadline):
+            raise child_error
+
+        monkeypatch.setattr(worker, "_reclaim_child_groups", reap)
+        try:
+            with pytest.raises(RuntimeError, match="window reclamation is unconfirmed") as failure:
+                worker._teardown_ready_tree()
+            assert failure.value.__cause__ is child_error
+            assert "child teardown: pid 123 exited with code 1" in str(failure.value)
+            assert not domain.freed
+            assert [(kind, identity) for kind, identity, _ in worker._cleanup_journal._entries] == [
+                ("domain-retirement", "True:7")
+            ]
+            monkeypatch.setattr(worker, "_reclaim_child_groups", lambda _deadline: None)
+            with pytest.raises(RuntimeError, match="window reclamation is unconfirmed"):
+                worker._teardown_ready_tree()
+            assert not domain.freed
+        finally:
+            monkeypatch.setattr(worker, "_reclaim_child_groups", lambda _deadline: None)
+            worker._domain_free_results[7] = None
+            worker.close()
+
     def test_child_journal_driven_after_shutdown_phase(self, monkeypatch):
         """A retained child cannot fence the SHUTDOWN that lets it converge."""
         w = Worker(level=3, num_sub_workers=1)

@@ -1502,9 +1502,11 @@ void ChipRun::abandon() {
             run_->error = std::current_exception();
             lane_->poison_with(run_, run_->error);
         }
+        run_->native_context_destroyed = finalized;
         lane_->release_device_spans(run_, finalized);
     } else {
         const bool plan_released = lane_->release_run_plan(run_);
+        run_->native_context_destroyed = plan_released;
         lane_->release_device_spans(run_, plan_released);
     }
     run_->phase = ChipRunState::Phase::TERMINAL;

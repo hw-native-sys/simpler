@@ -141,8 +141,14 @@ H2D/MAP arguments with a callable writer are rejected before preparation.
 Tensor remains 144 bytes and BufferDescriptor 88 bytes. Byte 141 is the per-call
 transfer carrier; bytes 142–143 remain padding. No mapping reference is stored in
 a Tensor or transmitted on the wire. Mapping ownership stays in the consumer's
-registry. MAP forwarding to L3+, remote workers, Host compute leaves, borrowed L2
-contexts and unresolved native ChipWorker execution is unsupported and rejected.
+registry. For a local A5 TMR L3 Worker, each consuming child establishes or reuses
+its mapping while preparing its MAP arguments, alongside native H2D handling.
+Outer arguments need no MAP declaration. Callback-created views of owned shared
+Host backing are supported; each child resolves its own Device address. Multiple
+backings and overlapping calls are supported, including first-time mappings,
+with parent-owned lifetime and coordinated cleanup. L3 HBG, L4+, remote workers, Host compute leaves, borrowed L2 contexts
+and unresolved native ChipWorker execution reject MAP. See the
+[L3 shared-table contract](design/a5-host-ddr.md#l3-shared-tables).
 
 MAP supports callable IN / OUT / INOUT and ordinary TensorArgType grant checks.
 Device writes go directly to Host backing without a D2H copy. Finish CPU writes
@@ -158,6 +164,13 @@ release refuses without revoking admission. Once unregister begins, failed clean
 retains backing/context and rejects new uses until cleanup succeeds. Unknown
 completion retains resources. Python memoryviews and derived NumPy arrays must
 also be released before closing backing. See the [example](../examples/a5/tensormap_and_ringbuffer/host_ddr_gather/README.md).
+
+L3 terminal close can request a native owner drain while retaining Host backing.
+Only proven last use permits child use retirement; mappings are then explicitly
+unregistered before recovered owners finalize. Failed drain, unregistration or
+owner finalization retains cleanup records for retry. Child task errors and child
+exit alone do not supply this proof. See the
+[L3 recovery ordering](design/a5-host-ddr.md#l3-shared-tables).
 
 ```python
 view = Tensor(buffer, shapes=(16,), dtype=DataType.FLOAT32)
