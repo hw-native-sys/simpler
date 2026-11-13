@@ -470,6 +470,7 @@ DeviceRunnerBase::RunResourceStaging DeviceRunnerBase::build_run_resources(size_
     staged.device_run_timing = RunResourceSlots<DeviceRunTiming>::build(granted);
     staged.device_timing_armed = RunResourceSlots<bool>::build(granted);
     staged.host_phase_runs = RunResourceSlots<HostPhaseRunState>::build(granted);
+    staged.run_resource_costs = RunResourceSlots<RunResourceCost>::build(granted);
     staged.run_boundaries_observed = RunBoundaryLedger::build(granted);
 
     // Arena banks carry constructor arguments. Built here rather than filled
@@ -511,6 +512,7 @@ void DeviceRunnerBase::commit_run_resources(size_t granted, RunResourceStaging &
     device_run_timing_.commit(std::move(staged.device_run_timing));
     device_timing_armed_.commit(std::move(staged.device_timing_armed));
     host_phase_runs_.commit(std::move(staged.host_phase_runs));
+    run_resource_costs_.commit(std::move(staged.run_resource_costs));
     run_boundaries_observed_.commit(std::move(staged.run_boundaries_observed));
     if (queued_waits_ != nullptr) queued_waits_->commit(std::move(staged.queued_waits));
     if (boundary_marks_ != nullptr) boundary_marks_->commit(std::move(staged.boundary_marks));
@@ -962,7 +964,10 @@ void DeviceRunnerBase::note_run_resources_proven(uint32_t pipeline_slot, std::ui
     if (!auto_admission_.enabled()) return;
     const AutoAdmissionState::SlotPlan plan = auto_admission_.plan(pipeline_slot);
     if (plan.epoch == run_epoch) auto_admission_.release_growth_token(pipeline_slot);
-    auto_admission_.note_proven(pipeline_slot);
+    RunResourceCost cost;
+    if (const RunResourceCost *recorded = run_resource_costs_.find(pipeline_slot); recorded != nullptr)
+        cost = *recorded;
+    auto_admission_.note_proven(pipeline_slot, cost);
     // The claims are the run's own references now; nothing is given back.
     commit_workspace_claims();
     prepare_plans_[pipeline_slot].reset();
@@ -1179,7 +1184,7 @@ bool DeviceRunnerBase::workspace_report(SimplerWorkspaceReport *out) const { ret
 int DeviceRunnerBase::detach_retained_temporary(uint32_t slot) {
     std::lock_guard<std::mutex> lock(prepared_storage_mutex_);
     auto &current = temporary_storage_[slot];
-    if (current.use_count() == 1) {
+    if (current->run_leases == 0) {
         current->backing.reset();
         return 0;
     }
@@ -1514,7 +1519,7 @@ void DeviceRunnerBase::release_graph_definition_staging() {
 int DeviceRunnerBase::clear_temporary_buffer() {
     int first = 0;
     for (auto &storage : temporary_storage_) {
-        if (storage.use_count() > 1) return PTO_RUNTIME_ERR_INVALID_STATE;
+        if (storage->run_leases != 0) return PTO_RUNTIME_ERR_INVALID_STATE;
         const int rc = storage->release(workspace_, [this](void *ptr) {
             const int unmap_rc = drop_child_memory_host_view(ptr);
             return unmap_rc != 0 ? unmap_rc : mem_alloc_.free(ptr);
@@ -3543,9 +3548,24 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     // Host observations retire independently of the retained device targets.
     // Their backing is released with submission storage below.
     device_timing_armed_.fill(false);
-    {
+    if (abandon_device_resources) {
         std::lock_guard<std::mutex> lock(run_result_mu_);
         run_result_storage_.clear();
+        reported_pool_.abandon();
+    } else {
+        int result_rc = 0;
+        {
+            std::lock_guard<std::mutex> lock(run_result_mu_);
+            for (auto &entry : run_result_storage_) {
+                result_rc = read_result_evidence(entry.second);
+                if (result_rc != 0) break;
+            }
+            // Keep every epoch until all evidence reads succeed, so retrying
+            // finalize can still reach an unobserved region.
+            if (result_rc == 0) run_result_storage_.clear();
+        }
+        capture(result_rc);
+        if (result_rc == 0) capture(reported_pool_.finalize());
     }
 
     // The AICore register-address tables are device constants committed once per
@@ -3808,32 +3828,6 @@ DeviceRunnerBase::device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, 
     return region.payload;
 }
 
-int DeviceRunnerBase::initialize_result_storage(PreparedSubmissionStorage &backing) {
-    if (backing.device_result != nullptr && backing.result_allocation_rc != 0) {
-        const int free_rc = mem_alloc_.free(backing.device_result);
-        if (free_rc != 0) return free_rc;
-        backing.device_result = nullptr;
-        backing.result_allocation_rc = 0;
-    }
-    if (backing.device_result == nullptr) {
-        backing.device_result = mem_alloc_.alloc(sizeof(NativeInvocationResultStorage), &backing.result_allocation_rc);
-        backing.result_initialized = false;
-        if (backing.result_allocation_rc != 0) {
-            return execution_mode_latch().is_kernel() ? backing.result_allocation_rc : PTO_RUNTIME_ERR_INTERNAL;
-        }
-    }
-    if (backing.device_result == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-    if (!backing.result_initialized) {
-        // Cold initialization includes the independent replay-evidence tail.
-        // Reused backing preserves that tail rather than replaying this clear.
-        const NativeInvocationResultStorage cold{};
-        const int rc = rtMemcpy(backing.device_result, sizeof(cold), &cold, sizeof(cold), RT_MEMCPY_HOST_TO_DEVICE);
-        if (rc != 0) return rc;
-        backing.result_initialized = true;
-    }
-    return 0;
-}
-
 int DeviceRunnerBase::ensure_device_run_result_region(
     const NativeRunIdentity &identity, KernelArgsHelper &kernel_args, const DfxRunConfig &dfx
 ) {
@@ -3855,17 +3849,36 @@ int DeviceRunnerBase::ensure_device_run_result_region(
     std::lock_guard<std::mutex> lock(run_result_mu_);
     auto [it, inserted] = run_result_storage_.try_emplace(run_epoch);
     RunResultStorage &storage = it->second;
-    if (inserted) storage.pipeline_slot = pipeline_slot;
-    if (storage.pipeline_slot != pipeline_slot) return PTO_RUNTIME_ERR_INTERNAL;
-    if (!storage.backing) storage.backing = submission_storage_[pipeline_slot];
-    auto &backing = *storage.backing;
-    const int rc = initialize_result_storage(backing);
-    storage.device_ptr = backing.device_result;
-    if (rc != 0) return rc;
-    storage.initialized = backing.result_initialized;
-    // A live call owns its allocation through the map. An unclaimed current
-    // slot keeps its allocation as an idle cache; late observers use the map.
-    kernel_args.args.run_result_data_base = reinterpret_cast<uint64_t>(storage.device_ptr);
+    if (inserted) {
+        storage.pipeline_slot = pipeline_slot;
+        bool free_failure = false;
+        const int acquire_rc = reported_pool_.acquire(
+            run_epoch, pipeline_slot, sizeof(NativeInvocationResultStorage), &storage.lease, &free_failure
+        );
+        if (acquire_rc != 0) {
+            // A nonnull output of a failed allocation stays owned by the pool
+            // and by this epoch, so the next prepare retries the checked free.
+            if (storage.lease.device_ptr == nullptr) run_result_storage_.erase(it);
+            // A failed free keeps its raw platform code in every mode; an
+            // allocation failure is the runtime's internal error in Program.
+            if (free_failure) return acquire_rc;
+            return execution_mode_latch().is_kernel() ? acquire_rc : PTO_RUNTIME_ERR_INTERNAL;
+        }
+        storage.initialized = storage.lease.initialized;
+    } else if (storage.pipeline_slot != pipeline_slot) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (!storage.initialized) {
+        // Cold initialization includes the independent replay-evidence tail.
+        // A reused idle region preserves that tail instead of clearing it.
+        const NativeInvocationResultStorage cold{};
+        const int rc = rtMemcpy(storage.lease.device_ptr, sizeof(cold), &cold, sizeof(cold), RT_MEMCPY_HOST_TO_DEVICE);
+        if (rc != 0) return rc;
+        reported_pool_.mark_initialized(storage.lease);
+        storage.lease.initialized = true;
+        storage.initialized = true;
+    }
+    kernel_args.args.run_result_data_base = reinterpret_cast<uint64_t>(storage.lease.device_ptr);
     kernel_args.args.run_result_epoch = run_epoch;
     return 0;
 }
@@ -3902,7 +3915,8 @@ int DeviceRunnerBase::read_device_run_result(uint32_t pipeline_slot, uint64_t ru
     if (!storage.initialized) return 0;
     if (storage.read != RunRecordRead::NotAttempted) return storage.transfer_rc;
     storage.transfer_rc = rtMemcpy(
-        &storage.region, sizeof(storage.region), storage.device_ptr, sizeof(storage.region), RT_MEMCPY_DEVICE_TO_HOST
+        &storage.region, sizeof(storage.region), storage.lease.device_ptr, sizeof(storage.region),
+        RT_MEMCPY_DEVICE_TO_HOST
     );
     storage.read = storage.transfer_rc == 0 ? RunRecordRead::Ok : RunRecordRead::Failed;
     if (storage.transfer_rc != 0) {
@@ -3913,16 +3927,103 @@ int DeviceRunnerBase::read_device_run_result(uint32_t pipeline_slot, uint64_t ru
     return storage.transfer_rc;
 }
 
-void DeviceRunnerBase::release_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, bool last_use_proved) {
+DeviceRunnerBase::ResultRegionSnapshot
+DeviceRunnerBase::result_region_snapshot(uint64_t run_epoch, uint32_t pipeline_slot) const {
+    std::lock_guard<std::mutex> lock(run_result_mu_);
+    ResultRegionSnapshot snapshot;
+    const auto it = run_result_storage_.find(run_epoch);
+    if (it == run_result_storage_.end() || it->second.pipeline_slot != pipeline_slot) return snapshot;
+    snapshot.found = true;
+    snapshot.device_ptr = it->second.lease.device_ptr;
+    snapshot.initialized = it->second.initialized;
+    snapshot.retain_evidence = it->second.retain_evidence;
+    snapshot.evidence_observed = it->second.evidence_observed;
+    snapshot.observed_evidence = it->second.observed_evidence;
+    return snapshot;
+}
+
+void DeviceRunnerBase::set_result_retain_evidence(uint64_t run_epoch, uint32_t pipeline_slot) {
+    std::lock_guard<std::mutex> lock(run_result_mu_);
+    auto result = run_result_storage_.find(run_epoch);
+    if (result != run_result_storage_.end() && result->second.pipeline_slot == pipeline_slot)
+        result->second.retain_evidence = true;
+}
+
+int DeviceRunnerBase::read_result_evidence(RunResultStorage &storage) {
+    if (!storage.initialized || !storage.retain_evidence || storage.evidence_observed) return 0;
+    NativeInvocationEvidence evidence;
+    const auto *address =
+        static_cast<const uint8_t *>(storage.lease.device_ptr) + offsetof(NativeInvocationResultStorage, evidence);
+    const int read_rc = rtMemcpy(&evidence, sizeof(evidence), address, sizeof(evidence), RT_MEMCPY_DEVICE_TO_HOST);
+    if (read_rc != 0) {
+        LOG_WARN("rtMemcpy(run_result evidence) D2H failed: %d", read_rc);
+        ACL_LOG_ERROR_DETAIL(read_rc);
+        return read_rc;
+    }
+    storage.observed_evidence = evidence.read_after_exit();
+    storage.evidence_observed = true;
+    last_observed_result_region_.found = true;
+    last_observed_result_region_.device_ptr = storage.lease.device_ptr;
+    last_observed_result_region_.initialized = storage.initialized;
+    last_observed_result_region_.retain_evidence = storage.retain_evidence;
+    last_observed_result_region_.evidence_observed = true;
+    last_observed_result_region_.observed_evidence = storage.observed_evidence;
+    if (storage.observed_evidence.kind != NativeInvocationEvidence::Kind::None) {
+        LOG_ERROR(
+            "native invocation evidence: kind=%u code=%d source=%u faults=%llu",
+            static_cast<unsigned>(storage.observed_evidence.kind), storage.observed_evidence.terminal.code,
+            static_cast<unsigned>(storage.observed_evidence.terminal.source),
+            static_cast<unsigned long long>(storage.observed_evidence.fault_count)
+        );
+    }
+    return 0;
+}
+
+int DeviceRunnerBase::finish_result_release(RunResultStorage &storage) {
+    if (storage.external_leases != 0) return 0;
+    // The replay-evidence tail lives in this epoch's region, so it must be read
+    // before the pool reuses or frees the allocation. A failed read keeps the
+    // epoch and its region for the caller's retry.
+    const int evidence_rc = read_result_evidence(storage);
+    if (evidence_rc != 0) return evidence_rc;
+    // A poisoned driver admits no per-resource free. The context retains the
+    // region until its verified reset or terminal quarantine path.
+    if (!can_accept_run()) return 0;
+    // A region an external reference owned is released outright; only an
+    // ordinary sequential result keeps the idle cache for its successor.
+    const int rc = reported_pool_.release(storage.lease, true, !storage.externally_retained);
+    if (rc != 0) return rc;
+    run_result_storage_.erase(storage.lease.run_epoch);
+    return 0;
+}
+
+void DeviceRunnerBase::note_result_external_lease_started(const NativeRunIdentity &identity) {
+    std::lock_guard<std::mutex> lock(run_result_mu_);
+    auto it = run_result_storage_.find(identity.run_epoch);
+    if (it != run_result_storage_.end() && it->second.pipeline_slot == identity.pipeline_slot) {
+        ++it->second.external_leases;
+        it->second.externally_retained = true;
+    }
+}
+
+int DeviceRunnerBase::note_result_external_lease_ended(const NativeRunIdentity &identity) {
+    std::lock_guard<std::mutex> lock(run_result_mu_);
+    auto it = run_result_storage_.find(identity.run_epoch);
+    if (it == run_result_storage_.end() || it->second.pipeline_slot != identity.pipeline_slot) return 0;
+    RunResultStorage &storage = it->second;
+    if (storage.external_leases != 0) --storage.external_leases;
+    if (!storage.internal_released || storage.external_leases != 0) return 0;
+    return finish_result_release(storage);
+}
+
+int DeviceRunnerBase::release_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, bool last_use_proved) {
     std::lock_guard<std::mutex> lock(run_result_mu_);
     const auto it = run_result_storage_.find(run_epoch);
-    if (!last_use_proved || it == run_result_storage_.end() || it->second.pipeline_slot != pipeline_slot) return;
-    // A poisoned driver admits no per-resource free. The context retains the
-    // allocation until its verified reset or terminal quarantine path.
-    if (!can_accept_run()) return;
-    // Drop this call's observation lease. The shared submission owner still
-    // protects model references and performs retryable device cleanup.
-    run_result_storage_.erase(it);
+    if (it == run_result_storage_.end() || it->second.pipeline_slot != pipeline_slot) return 0;
+    if (!last_use_proved) return 0;
+    RunResultStorage &storage = it->second;
+    storage.internal_released = true;
+    return finish_result_release(storage);
 }
 
 RunRecordRead DeviceRunnerBase::device_run_result_read_status(uint32_t pipeline_slot, uint64_t run_epoch) const {
@@ -4143,7 +4244,7 @@ int DeviceRunnerBase::admit_recording(PreparedExecution &prepared) {
         reference->recording = true;
         prepared.recording = true;
         if (prepared.kernel_args.args.run_result_data_base != 0)
-            submission_storage_[prepared.pipeline_slot]->retain_replay_evidence = true;
+            set_result_retain_evidence(prepared.identity.run_epoch, prepared.pipeline_slot);
         // A retained block must publish even if eager left an identical prefix.
         submission_storage_[prepared.pipeline_slot]->args.published_prefix_bytes = 0;
         return 0;
@@ -4217,6 +4318,23 @@ int DeviceRunnerBase::retain_prepared_run_resources(
             heap_leases_[slot] = {};
         }
     }
+    // The set's committed footprint, taken while every source is still named
+    // here: the heap lease moves into the published resources below.
+    RunResourceCost cost;
+    if (heap_lease.valid()) {
+        cost.heap_bytes = heap_lease.capacity;
+    } else if (arena_banks_[banks.heap]->gm_heap.is_committed()) {
+        cost.heap_bytes = arena_banks_[banks.heap]->gm_heap.total_size();
+    }
+    cost.image_bytes = arena_banks_[banks.image]->runtime_pool.total_size();
+    cost.shared_memory_bytes = arena_banks_[banks.sm]->gm_sm.total_size();
+    if (scheduler_state_storage_[slot]) cost.scheduler_bytes = scheduler_state_storage_[slot]->device_capacity();
+    {
+        std::lock_guard<std::mutex> result_lock(run_result_mu_);
+        const auto result = run_result_storage_.find(prepared.identity.run_epoch);
+        if (result != run_result_storage_.end() && result->second.pipeline_slot == slot)
+            cost.reported_bytes = result->second.lease.bytes;
+    }
     auto release_heap_on_fail = RAIIScopeGuard([&]() {
         if (heap_lease.valid() && heap_pool_) heap_pool_->release(heap_lease);
     });
@@ -4236,7 +4354,7 @@ int DeviceRunnerBase::retain_prepared_run_resources(
         if (!temporary->backing) return PTO_RUNTIME_ERR_INVALID_STATE;
     }
     resources->streams_ = std::move(streams);
-    resources->temporary_ = std::move(temporary);
+    resources->hold_temporary(std::move(temporary));
     resources->submission_ = submission_storage_[slot];
     resources->retain_initial_publication(prepared_initial_publication(*prepared.runtime, 0));
     auto published = PreparedRunResources::publish_owner(resources);
@@ -4253,6 +4371,7 @@ int DeviceRunnerBase::retain_prepared_run_resources(
     prepared_resource_owners_.push_back(published);
     prepared_uses_.push_back({prepared.identity, PreparedRunUse(std::move(resources))});
     prepared.prepared_resources = std::move(published);
+    run_resource_costs_[slot] = cost;
     return 0;
 }
 
@@ -4427,6 +4546,7 @@ int DeviceRunnerBase::retain_external_run_resources(
     prepared.caller_stream = caller_stream;
     *out_reference = key;
     published = true;
+    note_result_external_lease_started(prepared.identity);
     return 0;
 }
 
@@ -4440,6 +4560,7 @@ int DeviceRunnerBase::release_external_run_resources(void *key) {
         if (found == external_run_references_.end()) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
         reference = found->second.get();
     }
+    const NativeRunIdentity identity = reference->identity;
     int rc = validate_current_context();
     if (rc != 0) return rc;
     {
@@ -4511,15 +4632,21 @@ int DeviceRunnerBase::release_external_run_resources(void *key) {
         reference->closing = true;
         reference->resources.reset();
     }
+    // The result release is retryable through this reference: a failed free
+    // returns before the reference is erased.
+    rc = note_result_external_lease_ended(identity);
+    if (rc != 0) return rc;
     // Retired owners keep every failing address for retry. The closing token
     // and callable lease keep the context/code alive until this succeeds.
     rc = reclaim_prepared_storage();
     if (rc != 0) return rc;
     rc = workspace_.release_prepared_backing(reference->managed_backing);
     if (rc != 0) return rc;
-    std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-    caller_device_buffers_.release_reference(key, false);
-    external_run_references_.erase(key);
+    {
+        std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
+        caller_device_buffers_.release_reference(key, false);
+        external_run_references_.erase(key);
+    }
     return 0;
 }
 
@@ -4582,9 +4709,9 @@ int DeviceRunnerBase::reclaim_prepared_storage() {
     // A cache's publication still protects its address. Once no preparation
     // retains it, remove the additional lease so ordinary idle trimming works.
     for (auto &storage : temporary_storage_)
-        if (storage.use_count() == 1) storage->backing.reset();
+        if (storage->run_leases == 0) storage->backing.reset();
     for (auto it = retired_temporary_storage_.begin(); it != retired_temporary_storage_.end();) {
-        if (it->use_count() > 1) {
+        if ((*it)->run_leases != 0) {
             ++it;
             continue;
         }
@@ -4688,7 +4815,6 @@ int DeviceRunnerBase::release_submission_storage(PreparedSubmissionStorage &stor
         storage.fence->abandon();
         abandon_slot_persistent_args(storage.args);
         storage.device_wall = nullptr;
-        storage.device_result = nullptr;
         return 0;
     }
     // Event owners refuse outstanding waits. Do not drop their backing if that
@@ -4697,26 +4823,8 @@ int DeviceRunnerBase::release_submission_storage(PreparedSubmissionStorage &stor
     if (rc != 0) return rc;
     rc = storage.fence->release();
     if (rc != 0) return rc;
-    if (storage.retain_replay_evidence && storage.device_result != nullptr && storage.result_initialized &&
-        !storage.evidence_observed) {
-        NativeInvocationEvidence evidence;
-        const auto *address =
-            static_cast<const uint8_t *>(storage.device_result) + offsetof(NativeInvocationResultStorage, evidence);
-        const int read_rc = rtMemcpy(&evidence, sizeof(evidence), address, sizeof(evidence), RT_MEMCPY_DEVICE_TO_HOST);
-        if (read_rc != 0) return read_rc;
-        storage.observed_evidence = evidence.read_after_exit();
-        storage.evidence_observed = true;
-        if (storage.observed_evidence.kind != NativeInvocationEvidence::Kind::None) {
-            LOG_ERROR(
-                "native invocation evidence: kind=%u code=%d source=%u faults=%llu",
-                static_cast<unsigned>(storage.observed_evidence.kind), storage.observed_evidence.terminal.code,
-                static_cast<unsigned>(storage.observed_evidence.terminal.source),
-                static_cast<unsigned long long>(storage.observed_evidence.fault_count)
-            );
-        }
-    }
     rc = release_slot_persistent_args(storage.args, mem_alloc_);
-    for (void **ptr : {&storage.device_wall, &storage.device_result}) {
+    for (void **ptr : {&storage.device_wall}) {
         if (*ptr == nullptr) continue;
         const int free_rc = mem_alloc_.free(*ptr);
         if (free_rc == 0) *ptr = nullptr;

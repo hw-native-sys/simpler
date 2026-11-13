@@ -5,12 +5,14 @@ establish it, and what runs queued on the same streams may rely on.
 
 ## Initial publication of the run-result region
 
-Each live call retains its original result allocation through observation,
+Each live call retains its epoch's result region through observation,
 independently of its reusable execution slot. `RunResultStorage` keeps the call's
-read state and a lease on `PreparedSubmissionStorage`; late observers never
-read the successor's result address. Sequential finalized calls can reuse the
-idle backing, while overlapping observations or model references require a
-new submission allocation before preparation writes it.
+read state and a `ReportedPool` lease: the run's finalize ends its internal
+lease, an external retain adds one, and the pool releases the region only when
+both are gone. Late observers never read the successor's result address.
+Sequential finalized calls can reuse the idle region, while overlapping
+observations or model references keep their own pool allocation until the last
+lease ends.
 
 Program execution retains its structured result record. Kernel execution
 requests that record when any diagnostic in its own `CallConfig` is enabled;

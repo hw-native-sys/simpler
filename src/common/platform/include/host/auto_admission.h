@@ -19,6 +19,8 @@
 #include <mutex>
 #include <vector>
 
+#include "host/run_resource_cost.h"
+
 /**
  * Admission state for a device context that sizes its own concurrency.
  *
@@ -41,9 +43,16 @@
  * ever, and inferring it from an untouched slot's absent storage would admit
  * every slot before anything had been demonstrated.
  *
- * Capacity is a count of identities, never a byte budget. This class holds no
- * byte figure and makes no allocation decision; whether a request fits is the
- * allocator's answer, reported back here only as proof or as a refusal.
+ * Capacity is a count of identities, and stays one: the proven prefix is a
+ * set of facts, so no byte figure withdraws a slot that a run has already
+ * committed on. What a byte figure does decide is the **exploratory** set — the
+ * one offered beyond the proven prefix. When a finite budget is configured, the
+ * exploratory set is withheld unless the bytes the ledger already charges plus
+ * the cost of the largest proven set stay within the budget, so the probe is
+ * not offered into a shortfall that one more set of the known size would
+ * certainly create. Without a budget the probe is offered on proof alone,
+ * exactly as before; a context that configured no byte policy has none to
+ * measure against.
  */
 class AutoAdmissionState {
 public:
@@ -121,12 +130,18 @@ public:
      * Off until a context asks: an explicitly configured context, a borrowed
      * one and a simulated one all leave this holding nothing, and every query
      * below answers as it did before.
+     *
+     * `budget_bytes` is the byte policy the context's ledger enforces on its
+     * arena regions, or zero when it enforces none. It gates the exploratory
+     * set only; see the class comment.
      */
-    void configure(size_t granted) {
+    void configure(size_t granted, uint64_t budget_bytes = 0) {
         std::scoped_lock lk(mu_);
         if (enabled_ || granted == 0) return;
         plans_.resize(granted);
         proven_.assign(granted, false);
+        proven_cost_.assign(granted, RunResourceCost{});
+        budget_bytes_ = budget_bytes;
         enabled_ = true;
     }
 
@@ -147,10 +162,15 @@ public:
      *
      * The commit is the proof, so this is called on the success path whether or
      * not it allocated anything.
+     *
+     * `cost` is what the set's commit committed. It is recorded for the
+     * exploratory-set test and for reporting, and it never changes a proof.
      */
-    void note_proven(uint32_t slot) {
+    void note_proven(uint32_t slot, const RunResourceCost &cost = {}) {
         std::scoped_lock lk(mu_);
-        if (slot < proven_.size()) proven_[slot] = true;
+        if (slot >= proven_.size()) return;
+        proven_[slot] = true;
+        proven_cost_[slot] = cost;
     }
 
     /**
@@ -164,7 +184,9 @@ public:
      */
     void clear_proven(uint32_t slot) {
         std::scoped_lock lk(mu_);
-        if (slot < proven_.size()) proven_[slot] = false;
+        if (slot >= proven_.size()) return;
+        proven_[slot] = false;
+        proven_cost_[slot] = RunResourceCost{};
     }
 
     bool proven(uint32_t slot) const {
@@ -198,14 +220,53 @@ public:
      * replacement peak. For enabled contexts with a positive directory limit,
      * never zero and never above that limit. Disabled or empty directories
      * report the supplied limit unchanged.
+     *
+     * `committed_budgeted_bytes` is what the context's ledger charges right
+     * now. With a finite budget, the exploratory slot is additionally withheld
+     * when one more set of the largest proven size cannot fit beside that
+     * charge. The proven prefix is never withdrawn by the budget: those slots
+     * are already committed, and reporting fewer would not return a byte.
      */
-    uint32_t affordable_sets(uint32_t directory_limit) const {
+    uint32_t affordable_sets(uint32_t directory_limit, uint64_t committed_budgeted_bytes = 0) const {
         std::scoped_lock lk(mu_);
         if (!enabled_ || directory_limit == 0) return directory_limit;
         const uint32_t prefix = proven_prefix_locked();
-        const uint32_t probe = token_owner_ == kNoOwner ? 1u : 0u;
+        uint32_t probe = token_owner_ == kNoOwner ? 1u : 0u;
+        if (probe != 0 && budget_bytes_ != 0 && committed_budgeted_bytes + max_proven_budgeted_locked() > budget_bytes_)
+            probe = 0;
         const uint32_t offered = prefix > directory_limit - probe ? directory_limit : prefix + probe;
         return std::max<uint32_t>(1u, std::min(offered, directory_limit));
+    }
+
+    /** The byte policy the exploratory set is measured against; zero when none. */
+    uint64_t budget_bytes() const {
+        std::scoped_lock lk(mu_);
+        return budget_bytes_;
+    }
+
+    bool budget_enforced() const {
+        std::scoped_lock lk(mu_);
+        return enabled_ && budget_bytes_ != 0;
+    }
+
+    /** What the set on `slot` committed when it proved the slot. */
+    RunResourceCost proven_cost(uint32_t slot) const {
+        std::scoped_lock lk(mu_);
+        return slot < proven_.size() && proven_[slot] ? proven_cost_[slot] : RunResourceCost{};
+    }
+
+    /**
+     * The largest footprint among the proven sets.
+     *
+     * This is the exploratory set's reserve: a new set is estimated at the
+     * largest one this context has demonstrated, because a run smaller than
+     * that is the case the budget must not refuse and the caller has no
+     * declaration of the next run's size to consult. Only its budgeted part is
+     * compared with the budget.
+     */
+    RunResourceCost max_proven_cost() const {
+        std::scoped_lock lk(mu_);
+        return max_proven_cost_locked();
     }
 
     // ------------------------------------------------------------------- token
@@ -466,10 +527,31 @@ private:
         return prefix;
     }
 
+    RunResourceCost max_proven_cost_locked() const {
+        RunResourceCost largest{};
+        for (size_t slot = 0; slot < proven_.size(); ++slot) {
+            if (!proven_[slot]) continue;
+            const RunResourceCost &cost = proven_cost_[slot];
+            if (cost.total_bytes() > largest.total_bytes()) largest = cost;
+        }
+        return largest;
+    }
+
+    uint64_t max_proven_budgeted_locked() const {
+        uint64_t largest = 0;
+        for (size_t slot = 0; slot < proven_.size(); ++slot) {
+            if (!proven_[slot]) continue;
+            largest = std::max(largest, proven_cost_[slot].budgeted_bytes());
+        }
+        return largest;
+    }
+
     mutable std::mutex mu_;
     bool enabled_{false};
+    uint64_t budget_bytes_{0};
     uint32_t token_owner_{kNoOwner};
     uint64_t token_epoch_{0};
     std::vector<SlotPlan> plans_;
     std::vector<bool> proven_;
+    std::vector<RunResourceCost> proven_cost_;
 };

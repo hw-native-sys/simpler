@@ -2156,10 +2156,11 @@ class ChipWorker:
     def enable_automatic_admission(self) -> bool:
         """Let this worker's device context size its own run concurrency.
 
-        Asked once, after init, by a caller that specified no depth and no byte budget. Returns
-        False when the loaded module or the context cannot — a simulated backend, a borrowed
-        context, or a module without the entry — and the worker then admits exactly what it was
-        granted, as it did before.
+        Asked once, after init. A caller that specified no depth leaves the size to the context; a
+        configured workspace byte budget, when one is in force, becomes the budget the exploratory
+        set is measured against. Returns False when the loaded module or the context cannot — a
+        simulated backend, a borrowed context, or a module without the entry — and the worker then
+        admits exactly what it was granted, as it did before.
         """
         return bool(self._impl._enable_automatic_admission())  # noqa: SLF001 -- no public equivalent
 
@@ -2174,8 +2175,10 @@ class ChipWorker:
 
         A count of identities, never a byte figure: it is one until a run has completed its
         resource commit, grows with what this context has proved it can hold, and falls when those
-        resources are reclaimed or become unprovable. The granted count on a context that does not
-        size itself.
+        resources are reclaimed or become unprovable. When the context also enforces a workspace
+        byte budget, the exploratory slot is additionally withheld while one more set of the
+        largest proven size would not fit; a proven slot itself is never withdrawn. The granted
+        count on a context that does not size itself.
         """
         return int(self._impl.admissible_run_resource_sets)
 

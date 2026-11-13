@@ -11,6 +11,7 @@
 #pragma once
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <filesystem>
 #include <future>
@@ -45,13 +46,19 @@ extern thread_local bool refuse_next_host_allocation;
 
 class Runner : public DeviceRunnerBase {
 public:
-    explicit Runner(bool managed_workspace = true) {
+    explicit Runner(bool managed_workspace = true, uint64_t workspace_limit = 0, bool automatic_admission = true) {
         device_id_ = 0;
         timeout_configuration_rc_ = 0;
         max_block_dim_ = block_dim_ = 1;
-        if (managed_workspace) EXPECT_EQ(install_staged_workspace(), 0);
+        if (managed_workspace) {
+            // The limit is staged before installation, which is where the
+            // manager first sees it; installing first would leave the context
+            // permanently limit-free.
+            if (workspace_limit != 0) EXPECT_EQ(stage_workspace_management(workspace_limit), 0);
+            EXPECT_EQ(install_staged_workspace(), 0);
+        }
         EXPECT_TRUE(set_run_resource_grant(6));
-        enable_automatic_admission();
+        if (automatic_admission) enable_automatic_admission();
         CallableState callable;
         callable.hash = 1;
         callable.chip_buffer_hash = 1;
@@ -65,11 +72,13 @@ public:
     }
     int prepare_result(uint32_t slot = 0, uint64_t epoch = 1) {
         KernelArgsHelper args;
-        submission_storage_[slot]->retain_replay_evidence = true;
         // This low-level evidence fixture explicitly requests the native record.
         DfxRunConfig dfx;
         dfx.scope_stats_enabled = true;
-        return ensure_device_run_result_region(NativeRunIdentity{epoch, epoch, epoch, slot}, args, dfx);
+        last_result_epoch_[slot] = epoch;
+        const int rc = ensure_device_run_result_region(NativeRunIdentity{epoch, epoch, epoch, slot}, args, dfx);
+        if (rc == 0) set_result_retain_evidence(epoch, slot);
+        return rc;
     }
     int warm_capture_result_caches() {
         // Fake context initialization omits real Kernel init's optional warm-up.
@@ -86,7 +95,21 @@ public:
         return 0;
     }
     PreparedSubmissionStorage &result_storage(uint32_t slot = 0) { return *submission_storage_[slot]; }
-    int close_result(uint32_t slot = 0) { return release_submission_storage(*submission_storage_[slot], false); }
+    using ResultRegionSnapshot = DeviceRunnerBase::ResultRegionSnapshot;
+    ResultRegionSnapshot result_region(uint32_t slot = 0) const {
+        return result_region_snapshot(last_result_epoch_[slot], slot);
+    }
+    ResultRegionSnapshot result_region(uint32_t slot, uint64_t epoch) const {
+        return result_region_snapshot(epoch, slot);
+    }
+    void *idle_result_ptr() const { return DeviceRunnerBase::idle_result_device_ptr(); }
+    bool idle_result_initialized() const { return DeviceRunnerBase::idle_result_initialized(); }
+    void *pending_failed_result_ptr() const { return DeviceRunnerBase::pending_failed_result_device_ptr(); }
+    const ResultRegionSnapshot &last_observed_result_region() const {
+        return DeviceRunnerBase::last_observed_result_region();
+    }
+    void note_result_epoch(uint32_t slot, uint64_t epoch) { last_result_epoch_[slot] = epoch; }
+    int close_result(uint32_t slot = 0) { return release_device_run_result(slot, last_result_epoch_[slot], true); }
     void use_other_entry() { callables_[1].host_orch_func_ptr = alternate_entry_points(); }
     void allocate_callable() {
         void *allocation = mem_alloc_.alloc(64);
@@ -178,7 +201,20 @@ public:
     }
     int finalize_impl() override { return finalize_common(); }
     AutoAdmissionState::SlotPlan plan(uint32_t slot) const { return auto_admission_.plan(slot); }
+    RunResourceCost admission_proven_cost(uint32_t slot) const { return auto_admission_.proven_cost(slot); }
     size_t charged() const { return workspace_.reserved_bytes(); }
+    bool set_workspace_limit(uint64_t limit) { return workspace_.set_limit(limit); }
+    size_t bank_region_size(uint32_t bank, size_t region) const {
+        const auto &b = *arena_banks_[bank];
+        switch (region) {
+        case 0:
+            return b.gm_heap.total_size();
+        case 1:
+            return b.gm_sm.total_size();
+        default:
+            return b.runtime_pool.total_size();
+        }
+    }
     bool holds_epoch(uint64_t epoch) const { return workspace_.holds_references(epoch); }
     bool arena_referenced(uint32_t bank, size_t region) const {
         void *backing = arena_region_backing(bank, region);
@@ -199,6 +235,9 @@ public:
             note_workspace_run_fact(NativeRunIdentity{epoch, epoch, epoch, slot}, fact);
     }
     void stop_serving() { workspace_.enter_closed(); }
+
+private:
+    std::array<uint64_t, 16> last_result_epoch_{};
 };
 
 struct Attempt {
@@ -229,7 +268,10 @@ struct Attempt {
         if (magic) EXPECT_EQ(simpler_finalize_run(&runner, storage), 0);
         ::operator delete(storage, std::align_val_t(get_runtime_alignment()));
     }
-    int prepare() { return simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor); }
+    int prepare() {
+        runner.note_result_epoch(descriptor.pipeline_slot, descriptor.run_epoch);
+        return simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor);
+    }
     bool consume_release() { return consume_released_preparation(storage, get_runtime_size(), descriptor.run_epoch); }
     bool empty() const {
         uint64_t magic;

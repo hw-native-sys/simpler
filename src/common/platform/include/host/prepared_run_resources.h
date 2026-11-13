@@ -51,6 +51,10 @@ public:
         void *base{nullptr};
         size_t capacity{0};
         WorkspaceManager::BackingLease backing;
+        // Prepared runs that may still reach this block. The slot holds the
+        // storage object itself, not a lease; growth and retirement key on this
+        // explicit count rather than a shared_ptr count.
+        size_t run_leases{0};
 
         template <typename Free>
         int release(WorkspaceManager &workspace, Free free) {
@@ -195,6 +199,23 @@ public:
         initial_publication_ = std::move(publication);
     }
 
+    // The prepared-resources object's lease on the retained staging block. It
+    // is held for as long as any owner (the run use, a published owner, or an
+    // external reference) can reach this preparation; the block's owner uses
+    // this explicit count, not a shared_ptr count, to decide growth and
+    // retirement.
+    void hold_temporary(std::shared_ptr<TemporaryStorage> storage) {
+        temporary_ = std::move(storage);
+        if (temporary_) {
+            ++temporary_->run_leases;
+            temporary_lease_held_ = true;
+        }
+    }
+    void release_temporary_lease() const {
+        if (!temporary_lease_held_ || !temporary_) return;
+        if (temporary_->run_leases != 0) --temporary_->run_leases;
+        temporary_lease_held_ = false;
+    }
     // Transfer ownership of a pooled heap lease to these prepared resources.
     void take_heap_lease(std::shared_ptr<ScratchPool> pool, ScratchPool::Lease lease) {
         heap_pool_ = std::move(pool);
@@ -202,12 +223,17 @@ public:
     }
 
     ~PreparedRunResources() {
+        // The object is the lease holder; its destruction ends the last host
+        // reference to this preparation. The device blocks themselves are
+        // retired or freed by the runner's explicit reclaim paths.
+        release_temporary_lease();
         if (heap_pool_ != nullptr && heap_lease_.valid()) heap_pool_->release(heap_lease_);
     }
 
 private:
     std::shared_ptr<const void> streams_;
     std::shared_ptr<TemporaryStorage> temporary_;
+    mutable bool temporary_lease_held_{false};
     std::shared_ptr<const CallableUse> callable_;
     std::shared_ptr<PreparedSubmissionStorage> submission_;
     std::shared_ptr<const void> initial_publication_;

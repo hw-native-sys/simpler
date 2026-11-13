@@ -4027,8 +4027,10 @@ NB_MODULE(_task_interface, m) {
         .def_prop_ro(
             "admissible_run_resource_sets", &ChipWorker::admissible_run_resource_sets,
             "Run-resource sets this context reports it can hold right now: a count of identities, "
-            "never a byte figure. One until a run has completed its resource commit; the granted "
-            "count on a context that does not size itself."
+            "never a byte figure. One until a run has completed its resource commit; grows with "
+            "what the context has proved it can hold. A workspace byte budget withholds only the "
+            "exploratory slot, never a proven one. The granted count on a context that does not "
+            "size itself."
         )
         .def_prop_ro(
             "supports_concurrent_native_prepare", &ChipWorker::supports_concurrent_native_prepare,
