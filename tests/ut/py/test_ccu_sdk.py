@@ -13,6 +13,16 @@ import pytest
 from simpler.ccu import ccu_sdk_root, runtime_build_identity
 
 
+@pytest.mark.parametrize("home", [None, ""])
+def test_ccu_sdk_reports_missing_environment(monkeypatch, home):
+    if home is None:
+        monkeypatch.delenv("ASCEND_HOME_PATH", raising=False)
+    else:
+        monkeypatch.setenv("ASCEND_HOME_PATH", home)
+    with pytest.raises(FileNotFoundError, match="ASCEND_HOME_PATH"):
+        ccu_sdk_root()
+
+
 @pytest.mark.parametrize("machine", ["aarch64", "x86_64"])
 @pytest.mark.parametrize("layout", ["root", "arch", "symlink"])
 def test_runtime_build_identity_uses_host_sdk(tmp_path, monkeypatch, machine, layout):

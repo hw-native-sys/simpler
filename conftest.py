@@ -834,6 +834,10 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
         cls = getattr(item, "cls", None)
 
         item_level = _item_scene_level(item)
+        platforms_marker = item.get_closest_marker("platforms")
+        if platform and platforms_marker and platform not in platforms_marker.args[0]:
+            deselected.append(item)
+            continue
 
         if cls is not None and hasattr(cls, "CASES") and isinstance(cls.CASES, list):
             # SceneTestCase class item.
@@ -867,15 +871,10 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
             deselected.append(item)
             continue
 
-        platforms_marker = item.get_closest_marker("platforms")
-        if platforms_marker:
-            if not platform:
-                item.add_marker(pytest.mark.skip(reason="--platform required"))
-                keep.append(item)
-                continue
-            if platform not in platforms_marker.args[0]:
-                deselected.append(item)
-                continue
+        if platforms_marker and not platform:
+            item.add_marker(pytest.mark.skip(reason="--platform required"))
+            keep.append(item)
+            continue
 
         # runtime-isolation filter for non-@scene_test tests: if the item
         # declares ``@pytest.mark.runtime("X")`` and a runtime filter is

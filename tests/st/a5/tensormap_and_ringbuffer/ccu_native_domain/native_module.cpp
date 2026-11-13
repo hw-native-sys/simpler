@@ -13,12 +13,10 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "ccu_manifest_identity.h"
 #include "hcomm/ccu/ccu_primitives.hpp"
 #include "hcomm/ccu/ccu_res.h"
 #include "platform_comm/ccu/ccu_native_abi.h"
-
-extern const uint8_t ccu_test_sdk_identity[32];
-extern const uint8_t ccu_test_isa_identity[32];
 
 namespace {
 namespace ccu = AscendC::ccu;
@@ -90,8 +88,8 @@ Manifest make_manifest() {
     result.header.kernel_records_offset = offsetof(Manifest, kernels);
     result.header.string_table_offset = offsetof(Manifest, symbols);
     result.header.string_table_size = sizeof(result.symbols);
-    std::memcpy(result.header.sdk_build_id, ccu_test_sdk_identity, 32);
-    std::memcpy(result.header.pto_isa_build_id, ccu_test_isa_identity, 32);
+    std::memcpy(result.header.sdk_build_id, simpler::ccu::sdk_build_id, sizeof(simpler::ccu::sdk_build_id));
+    std::memcpy(result.header.pto_isa_build_id, simpler::ccu::pto_isa_build_id, sizeof(simpler::ccu::pto_isa_build_id));
     constexpr char names[] = "ccu_mission_accu_mission_b";
     static_assert(sizeof(names) - 1 == sizeof(result.symbols));
     std::memcpy(result.symbols, names, sizeof(result.symbols));

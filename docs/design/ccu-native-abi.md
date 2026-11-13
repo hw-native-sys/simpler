@@ -6,6 +6,84 @@ the runtime owns registration, per-execution parameters, Events and completion.
 The C/POD interface is in `src/common/platform_comm/ccu/ccu_native_abi.h`.
 Modules, bindings, runtime libraries and device kernels must be rebuilt together.
 
+## Building a Host module
+
+Set `ASCEND_HOME_PATH` to the CANN installation for the Linux Host that will
+load the module. Query the toolchain from the installed simpler package and
+write the generated header into your build directory. The query searches both
+the installation root and the current Host's architecture subdirectory for
+each required header and library. The first query may
+fetch the pinned PTO-ISA checkout if a usable local checkout is unavailable.
+
+```python
+from pathlib import Path
+import subprocess
+
+from simpler_setup.ccu_toolchain import get_ccu_toolchain
+
+toolchain = get_ccu_toolchain()
+build = Path("build/ccu")
+build.mkdir(parents=True, exist_ok=True)
+header = build / "ccu_manifest_identity.h"
+header.write_text(toolchain.manifest_identity_header(), encoding="ascii")
+module = build / "native_ccu.so"
+source = "native_ccu.cpp"
+compile_args = [
+    toolchain.cxx_path,
+    *toolchain.compile_flags,
+    f"-I{build}",
+    *(f"-I{path}" for path in toolchain.include_dirs),
+]
+# Run this before a cache lookup. Hash the contents of all prerequisites
+# listed in the generated Makefile dependency rule.
+subprocess.run(
+    [*compile_args, source, *toolchain.link_flags, "-M", "-MF", str(build / "native_ccu.d"), "-MT", "native_ccu"],
+    check=True,
+)
+subprocess.run(
+    [
+        *compile_args,
+        source,
+        *toolchain.link_flags,
+        *(str(path) for path in toolchain.library_paths),
+        "-o",
+        str(module),
+    ],
+    check=True,
+)
+# Pass ccu_modules=[module.read_bytes()] to ChipCallable.build().
+```
+
+In the manifest factory in `native_ccu.cpp`, include
+`ccu_manifest_identity.h` and copy the two arrays into the manifest.
+
+```cpp
+std::memcpy(manifest.sdk_build_id, simpler::ccu::sdk_build_id, sizeof(manifest.sdk_build_id));
+std::memcpy(manifest.pto_isa_build_id, simpler::ccu::pto_isa_build_id, sizeof(manifest.pto_isa_build_id));
+```
+
+The query returns ordered tuples for flags and paths. Pass `library_paths`
+directly to the linker to use the exact SDK libraries included in the build
+identity. For an instrumented build,
+pass the selected `GxxToolchain` and the sanitizer options through
+`extra_compile_flags` and `extra_link_flags`. CPU options such as
+`-march=native`, `-mcpu=native` and `-mtune=native` are rejected. Pass an
+explicit CPU target when needed.
+
+For a cached build, run a fresh dependency scan for each source before every
+cache lookup, using the same preprocessing flags, include paths and working
+directory as the build. Use `-M` so the scan includes system headers such as
+the C++ standard library. `-MM` and `-MMD` omit these headers. Combine
+`toolchain.build_identity` with the paths and content digests of all
+prerequisites from the dependency rules, plus other caller-owned build inputs.
+This makes system header updates and changes to header resolution invalidate
+cached modules. `toolchain.dependency_digests` lists the files fingerprinted
+by the toolchain query.
+
+Deploy the complete shared-library bytes in callable order. At load time the
+dynamic loader must be able to find the matching CANN/HCOMM libraries, for
+example through the CANN environment setup on the deployment Host.
+
 ## Packaging and validation
 
 A module exports one entry, which must not throw:
@@ -17,7 +95,8 @@ const SimplerCcuModuleManifest *simpler_ccu_module_manifest(void);
 The returned manifest is immutable and contiguous. Kernel and string tables
 use checked byte offsets from its base. The loader checks lengths, integer
 overflow, table overlap, entry symbols, parameter alignment, capabilities and
-SDK/PTO-ISA build identities. These identities are derived internally.
+SDK/PTO-ISA build identities. The generated header and runtime validation use
+the same SDK and pinned PTO-ISA header digests.
 The initial interface has no historical layout negotiation or compatibility
 branches. Structure and record sizes validate the single expected layout.
 
