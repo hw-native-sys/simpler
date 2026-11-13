@@ -12,8 +12,8 @@ experiment, not checkpoint accuracy validation. Isolated Attention and Engram
 cases run rank 0 on **one device**. Only `moe`, `layers_19_21`, and the original
 full forward run on **two devices** with real communication and deferred waits.
 
-The current L0 measurements, raw samples, runtime build times and refresh
-procedure are maintained in [RESULTS.md](RESULTS.md).
+The current L0 means for PyPTO-lib, DSL and the bounded-sync DSL variant,
+with their measurement contract, are maintained in [RESULTS.md](RESULTS.md).
 
 ## Cases
 
@@ -71,6 +71,36 @@ Original binaries and data geometry are necessary but do not prove identical
 kernel durations: compare L1 intervals with the source forward before using a
 case to draw whole-network conclusions. Prefix timing is never included in a
 case's scalar scheduling measurements.
+
+## DSL bounded sync-start variant
+
+`production/force_sync_start.py` prepares a separate DSL bundle with
+`require_sync_start=true` on compute submissions whose `1 < block_num <= 64`
+inside the selected case. Tasks above the limit retain their original flags;
+existing sync-start requirements are never removed. It preserves task IDs, block counts, kernels, tensor
+arguments, dependencies and the prefix outside the cut. It does not clamp block
+counts or replace kernels. Both rank plans are updated for EP2 cases.
+
+Build `record-tool` with the production tools, then prepare and run a variant:
+
+```bash
+python3 production/force_sync_start.py \
+  build/prepared/cases/pypto_lib_dsl/swa build/all-sync-start/swa \
+  --record-tool build/portable/host/record-tool --max-blocks 64
+bash production/run.sh build/all-sync-start/swa "$DSV41_RUNTIME" \
+  outputs/all-sync-start/swa 0 1 10
+```
+
+Run from this directory. The output bundle must not already exist. The variant
+shares immutable input files with the source bundle; do not edit shared inputs.
+For a matched comparison, run the original and variant bundles with the same
+runtime, inputs, devices, warmup count and measured rounds.
+
+The default `--max-blocks 64` preserves the oversized AIV tasks in MoE,
+Engram and layers 19–21. AIC/MIX tasks in these fixtures already fit within
+32 clusters. This block-count limit is an experiment policy, not automatic
+hardware-capacity discovery. See [RESULTS.md](RESULTS.md)
+for all nine outcomes.
 
 ## Included sources and data
 
