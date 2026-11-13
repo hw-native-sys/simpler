@@ -199,15 +199,9 @@ inline const char *get_dtype_name(DataType dtype) {
 #if defined(__DAV_VEC__) || defined(__DAV_CUBE__)
 // Ensure __aicore__ is available (CCE attribute for bisheng compiler).
 // Platform headers (inner_kernel.h) normally define this, but data_type.h
-// may be included before them. The CPU simulator also sets __DAV_VEC__ /
-// __DAV_CUBE__ to select the device code paths, but it compiles with g++,
-// which does not understand the [aicore] attribute — there it must be empty.
+// may be included before them.
 #ifndef __aicore__
-#if defined(__CPU_SIM)
-#define __aicore__
-#else
 #define __aicore__ [aicore]
-#endif
 #endif
 #define PTO_DEVICE_FUNC __aicore__
 #else
