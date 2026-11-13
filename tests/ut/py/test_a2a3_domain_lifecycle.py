@@ -72,7 +72,8 @@ def a2a3_lifecycle_binary(tmp_path_factory):
 
 @pytest.mark.parametrize("transport", ["fabric", "ipc"])
 @pytest.mark.parametrize(
-    "scenario", ["success", "late_import", "early_get_device", "peer_import", "peer_reserve", "peer_map"]
+    "scenario",
+    ["success", "late_import", "early_get_device", "peer_import", "peer_reserve", "peer_map", "release_then_abort"],
 )
 def test_a2a3_domain_lifecycle(a2a3_lifecycle_binary, transport, scenario):
     subprocess.run([str(a2a3_lifecycle_binary), transport, scenario], check=True, timeout=5)

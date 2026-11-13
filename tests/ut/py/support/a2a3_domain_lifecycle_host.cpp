@@ -246,7 +246,7 @@ static void prepare_peer(CommHandle h, uint64_t id, bool release_marker) {
     ipc.mapping_size = 4096;
     ipc.shareable_handle = token;
     assert(write_ipc_announce(domain_ipc_announce_path(h->rootinfo_path, id, 1, h->run_token), ipc));
-    for (const char *phase : {"fabric_ready", "ipc_p2p_ready", "release"}) {
+    for (const char *phase : {"fabric_ready", "ipc_p2p_ready", "release", "release_consumed"}) {
         if (!release_marker && std::strcmp(phase, "release") == 0) continue;
         std::ofstream marker(barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(id, phase), 1));
         marker << "1";
@@ -486,6 +486,29 @@ int main(int argc, char **argv) {
     h->nranks = 2;
     h->rootinfo_path = std::string(folder) + "/root";
     h->hccl_comm = reinterpret_cast<HcclComm>(1);
+    if (scenario == "release_then_abort") {
+        for (int allocation_id : {1, 2}) {
+            auto allocation = std::make_unique<DomainAllocation>();
+            allocation->rank = 0;
+            allocation->nranks = 1;
+            allocation->initialized = allocation_id == 1;
+            h->domain_allocations.emplace(allocation_id, std::move(allocation));
+        }
+        const auto blocked = file_marker_handshake::marker_path(h->rootinfo_path, 0, "alloc_1_ipc_announce", 0);
+        assert(std::filesystem::create_directory(blocked));
+        std::ofstream(blocked + "/entry") << "occupied";
+        assert(comm_release_domain_windows(h, 1, 1, 0) != 0);
+        assert(comm_abort_domain_windows(h, 2, 1, 0) == 0);
+        assert(h->domain_admission_stopped);
+        const uint32_t rank = 0;
+        uint64_t ctx = 0, base = 0;
+        size_t size = 0;
+        assert(comm_alloc_domain_windows(h, 3, &rank, 1, 0, 4096, 0, &ctx, &base, &size) != 0);
+        assert(h->domain_allocations.empty());
+        delete h;
+        std::filesystem::remove_all(folder);
+        return 0;
+    }
     const uint64_t id = 1;
     prepare_peer(h, id, scenario == "success");
     const uint32_t ranks[] = {0, 1};
