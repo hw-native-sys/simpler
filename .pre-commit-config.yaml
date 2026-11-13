@@ -55,6 +55,15 @@ repos:
           files: \.(h|hpp|cpp|cc|cxx)$
           exclude: ^3rdparty/
 
+        - id: check-percounter-fork-isolation
+          name: check-percounter-fork-isolation
+          entry: python tests/lint/check_percounter_fork_isolation.py
+          language: python
+          language_version: python3
+          pass_filenames: false
+          files: \.(h|hpp|cpp|cc|cxx)$
+          exclude: ^3rdparty/
+
         - id: check-reloadable-thread-local
           name: check reloadable TLS ownership
           entry: python tests/lint/check_reloadable_thread_local.py

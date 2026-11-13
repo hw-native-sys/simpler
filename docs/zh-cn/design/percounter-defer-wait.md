@@ -73,6 +73,8 @@ cohort block 尤其如此：`sync_queue->completed` 必须仍在 kernel 返回�
 | `finish_leases`、`finish_progress`、`scheduler_async_copy_resolver` | 不需要：没有 ready queue 要路由 |
 | `task_map` / `task_data` | 不需要：group index 即 lane |
 
+上表第一行「原样复用」与第二行「改为私有」这条边界由 `tests/lint/check_percounter_fork_isolation.py` 守着：它走一遍 AICore 目标的 include 闭包，被 fork 掉的那三个 host_build_graph 头只要重新可达就报错，反向也不允许 percounter 之外的文件 include 本运行时的头。
+
 ## 3. 数据布局
 
 ### 3.1 group 按 lane 索引
