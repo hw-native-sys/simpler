@@ -5,7 +5,9 @@ the original kernel binaries. percounter started this investigation between **2.
 faster and 37% slower** than the resident scheduler across its eighteen cases, and the
 spread is now attributed: a lane drew four order-list positions at a time and withheld
 the ones it had not reached. Taking one position per draw moves sixteen of the eighteen
-by 7% to 48% and puts percounter ahead on all of them.
+by 7% to 48% and puts percounter ahead on all of them. The margin over the resident
+scheduler has since narrowed, because that scheduler was itself made faster -- see
+"The margin on current main" below.
 
 Most of this entry is what the measurement cost. Seven mechanisms were killed before the
 right one, one of them because it was tested in the only direction that confirms it, and
@@ -59,6 +61,59 @@ most to withhold: `moe` 9766.9 -> 2113.4 us and `layers_19_21` 19042.3 -> 9821.0
 Against the resident scheduler the change moves the verdict, not the margin: `base` won
 three of nine on `pypto_lib` and six of nine on the DSL flavour; `one` wins **eighteen
 of eighteen**, by 1.22x to 1.98x. All seventy-two runs passed on both ranks.
+
+### The margin on current main
+
+Those ratios are against the resident scheduler as it stood at `616f42f04`. Upstream
+`a1adef412` ("Update: reduce A5 completion and admission overhead", #3039) has
+since rewritten that scheduler's completion and admission path, and it moved the
+baseline rather than the noise floor. Re-measured on `a41c2c1a3` with both arms built
+from one tree and run in one session, five measured rounds after one warmup at
+profiling level 0:
+
+| across the eighteen | resident, before -> after | percounter, same two sessions |
+| ------------------- | ------------------------- | ----------------------------- |
+| median | **-4.7%** | 1.0%, both directions |
+| worst | -24.7% (`pypto_lib/moe`) | 11.5% (`pypto_lib/moe`) |
+| direction | 15 of 18 faster | random |
+
+percounter's own arm is unchanged code across those two sessions, so its 1.0% median is
+what bounds the session term; the resident arm's 4.7% is larger than that and one-sided,
+which is what attributes it to `a1adef412` rather than to the box.
+
+The paired verdict on current main, `device_wall` case phase, p50 in us:
+
+| case | percounter | resident | ratio |
+| ---- | ---------- | -------- | ----- |
+| `pypto_lib/swa` | 604.7 | 824.0 | 1.36x |
+| `pypto_lib/c2a_full` | 1271.5 | 1350.8 | 1.06x |
+| `pypto_lib/c2a_reuse` | 1019.6 | 1156.4 | 1.13x |
+| `pypto_lib/c1a_full` | 1169.8 | 1381.4 | 1.18x |
+| `pypto_lib/c1a_reindex` | 1145.2 | 1371.4 | 1.20x |
+| `pypto_lib/c1a_reuse` | 985.6 | 1149.1 | 1.17x |
+| `pypto_lib/moe` | 2363.6 | 2446.3 | 1.03x |
+| `pypto_lib/engram` | 1103.5 | 1137.0 | 1.03x |
+| `pypto_lib/layers_19_21` | 8939.4 | 10999.2 | 1.23x |
+| `pypto_lib_dsl/swa` | 1055.1 | 1250.1 | 1.18x |
+| `pypto_lib_dsl/c2a_full` | 1573.3 | 1705.2 | 1.08x |
+| `pypto_lib_dsl/c2a_reuse` | 1502.7 | 1649.8 | 1.10x |
+| `pypto_lib_dsl/c1a_full` | 1568.9 | 1719.9 | 1.10x |
+| `pypto_lib_dsl/c1a_reindex` | 1536.2 | 1710.1 | 1.11x |
+| `pypto_lib_dsl/c1a_reuse` | 1464.3 | 1623.7 | 1.11x |
+| `pypto_lib_dsl/moe` | 1588.3 | 1577.8 | 0.99x |
+| `pypto_lib_dsl/engram` | 1128.1 | 1137.9 | 1.01x |
+| `pypto_lib_dsl/layers_19_21` | 8988.0 | 9189.2 | 1.02x |
+
+**Seventeen of eighteen, 0.99x to 1.36x, median 1.10x.** The one it loses is
+`pypto_lib_dsl/moe`, by 10 us. All thirty-six runs passed, percounter at
+`scheduler_mode=5` and the resident scheduler at 1.
+
+What the spread across cases is, is not established. Dispatch density does not explain
+it: blocks per millisecond correlates with the ratio at only +0.26 over the eighteen,
+and `moe` and `layers_19_21` carry nearly the same blocks per task (6.4 and 7.2) at
+1.03x and 1.23x. The one visible regularity is that the DSL flavour sits lower
+throughout (median 1.10x against 1.17x) and also runs longer blocks, which would leave
+dispatch a smaller share to win back.
 
 What a range costs is availability. A lane that draws four positions is committed to
 them: if none is ready it waits on one while the other three go unrun, and no idle lane
