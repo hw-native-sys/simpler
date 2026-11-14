@@ -12,7 +12,6 @@
 import os
 import select
 import struct
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -21,7 +20,6 @@ from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import ChipCallable, CoreCallable, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
-from simpler_setup.ccu_toolchain import get_ccu_toolchain
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
@@ -33,30 +31,13 @@ _RUNTIME = "tensormap_and_ringbuffer"
 def _build_callable(tmp_path, variant=0, source_root=_ROOT, runtime=_RUNTIME):
     tmp_path.mkdir(parents=True, exist_ok=True)
     compiler = KernelCompiler(platform="a5")
-    host = compiler.host_gxx
-    sanitizer_flags = compiler._sanitizer_flags(host)
-    toolchain = get_ccu_toolchain(host, extra_compile_flags=sanitizer_flags, extra_link_flags=sanitizer_flags)
     isa_root = Path(ensure_pto_isa_root())
-    (tmp_path / "ccu_manifest_identity.h").write_text(toolchain.manifest_identity_header(), encoding="ascii")
     variant_source = tmp_path / "variant.cpp"
     variant_source.write_text(
         f"#include <cstdint>\nextern const uint32_t ccu_test_variant = {variant};\n", encoding="ascii"
     )
-    module = tmp_path / "native_module.so"
-    subprocess.run(
-        [
-            toolchain.cxx_path,
-            *toolchain.compile_flags,
-            f"-I{tmp_path}",
-            *(f"-I{path}" for path in toolchain.include_dirs),
-            str(source_root / "native_module.cpp"),
-            str(variant_source),
-            *toolchain.link_flags,
-            *(str(path) for path in toolchain.library_paths),
-            "-o",
-            str(module),
-        ],
-        check=True,
+    module = compiler.compile_ccu(
+        str(source_root / "native_module.cpp"), extra_sources=[str(variant_source)], build_dir=str(tmp_path)
     )
     orch_source = source_root / "kernels/orchestration/ccu_orch.cpp"
     if not orch_source.exists():
@@ -78,7 +59,7 @@ def _build_callable(tmp_path, variant=0, source_root=_ROOT, runtime=_RUNTIME):
         config_name="ccu_orchestration_config",
         binary=orchestration,
         children=children,
-        ccu_modules=[module.read_bytes()],
+        ccu_modules=[module],
     )
 
 

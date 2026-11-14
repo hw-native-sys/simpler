@@ -8,78 +8,105 @@ Modules, bindings, runtime libraries and device kernels must be rebuilt together
 
 ## Building a Host module
 
+Use the same `KernelCompiler` instance for AICore kernels, orchestration and
+native CCU modules. `CCUToolchain` lives beside `CCECToolchain` in
+`simpler_setup.toolchain`; `KernelCompiler.ccu` shares the selected Host G++
+compiler with Host orchestration, including the sanitizer compiler selection.
+Native CCU builds require `platform="a5"`. Other platforms keep `ccu=None`
+and reject CCU queries/builds. Constructing an A5 compiler does not discover
+CCU dependencies until a CCU query or build needs them.
+
 Set `ASCEND_HOME_PATH` to the CANN installation for the Linux Host that will
-load the module. Query the toolchain from the installed simpler package and
-write the generated header into your build directory. The query searches both
-the installation root and the current Host's architecture subdirectory for
-each required header and library. The first query may
-fetch the pinned PTO-ISA checkout if a usable local checkout is unavailable.
+load the module. Discovery searches both the installation root and the current
+Host's architecture subdirectory for each required header and library. A build
+or cache-token query may fetch the pinned PTO-ISA checkout if a usable local
+checkout is unavailable.
 
 ```python
-from pathlib import Path
-import subprocess
+from simpler_setup.kernel_compiler import KernelCompiler
 
-from simpler_setup.ccu_toolchain import get_ccu_toolchain
-
-toolchain = get_ccu_toolchain()
-build = Path("build/ccu")
-build.mkdir(parents=True, exist_ok=True)
-header = build / "ccu_manifest_identity.h"
-header.write_text(toolchain.manifest_identity_header(), encoding="ascii")
-module = build / "native_ccu.so"
-source = "native_ccu.cpp"
-compile_args = [
-    toolchain.cxx_path,
-    *toolchain.compile_flags,
-    f"-I{build}",
-    *(f"-I{path}" for path in toolchain.include_dirs),
-]
-# Run this before a cache lookup. Hash the contents of all prerequisites
-# listed in the generated Makefile dependency rule.
-subprocess.run(
-    [*compile_args, source, *toolchain.link_flags, "-M", "-MF", str(build / "native_ccu.d"), "-MT", "native_ccu"],
-    check=True,
-)
-subprocess.run(
-    [
-        *compile_args,
-        source,
-        *toolchain.link_flags,
-        *(str(path) for path in toolchain.library_paths),
-        "-o",
-        str(module),
-    ],
-    check=True,
-)
-# Pass ccu_modules=[module.read_bytes()] to ChipCallable.build().
+compiler = KernelCompiler(platform="a5")
+module_bytes = compiler.compile_ccu("native_ccu.cpp")
+# Use compiler.compile_incore(...) and compiler.compile_orchestration(...)
+# for the other parts of this callable.
+# Pass ccu_modules=[module_bytes] to ChipCallable.build().
 ```
 
-In the manifest factory in `native_ccu.cpp`, include
-`ccu_manifest_identity.h` and copy the two arrays into the manifest.
+`compile_ccu()` generates `ccu_manifest_identity.h`, compiles and links the
+sources, and returns the complete Host shared-library bytes. Each invocation
+uses a private temporary directory, removed on success or failure. Optional
+`build_dir` selects its parent directory, which must already exist.
+`extra_sources`, `extra_include_dirs`, `extra_compile_flags` and
+`extra_link_flags` support modules with multiple translation units and custom
+build inputs. Queries and builds resolve relative paths and options from the
+caller's working directory. CCU modules retain their full `.so`; AICore kernels retain the
+existing ELF `.text` extraction into `CoreCallable` children.
+
+The sources still provide the native kernel entries and the manifest factory.
+Include `ccu_manifest_identity.h` and copy its two arrays into the manifest:
 
 ```cpp
 std::memcpy(manifest.sdk_build_id, simpler::ccu::sdk_build_id, sizeof(manifest.sdk_build_id));
 std::memcpy(manifest.pto_isa_build_id, simpler::ccu::pto_isa_build_id, sizeof(manifest.pto_isa_build_id));
 ```
 
-The query returns ordered tuples for flags and paths. Pass `library_paths`
-directly to the linker to use the exact SDK libraries included in the build
-identity. For an instrumented build,
-pass the selected `GxxToolchain` and the sanitizer options through
-`extra_compile_flags` and `extra_link_flags`. CPU options such as
-`-march=native`, `-mcpu=native` and `-mtune=native` are rejected. Pass an
-explicit CPU target when needed.
+### Caller-owned compilation and caching
 
-For a cached build, run a fresh dependency scan for each source before every
-cache lookup, using the same preprocessing flags, include paths and working
-directory as the build. Use `-M` so the scan includes system headers such as
-the C++ standard library. `-MM` and `-MMD` omit these headers. Combine
-`toolchain.build_identity` with the paths and content digests of all
-prerequisites from the dependency rules, plus other caller-owned build inputs.
-This makes system header updates and changes to header resolution invalidate
-cached modules. `toolchain.dependency_digests` lists the files fingerprinted
-by the toolchain query.
+Code generators such as PyPTO can keep their compiler invocation and cache.
+`compiler.get_ccu_include_dirs()` and `compiler.get_ccu_library_paths()` expose
+paths, while `compiler.ccu` exposes the base compiler and flags, corresponding
+to the AICore toolchain interface. `compiler.ccu_compile_cache_token()` returns
+the effective ordered inputs, including selected sanitizer flags, working
+directory, manifest identity header and content fingerprints. Pass the same extra flags and include
+directories to the token query and to `compile_ccu()` if using simpler to build.
 
+For an external build, use the effective inputs from that token:
+
+```python
+from pathlib import Path
+import subprocess
+
+from simpler_setup.kernel_compiler import KernelCompiler
+
+compiler = KernelCompiler(platform="a5")
+config = compiler.ccu_compile_cache_token()
+build = Path("build/ccu").resolve()
+build.mkdir(parents=True, exist_ok=True)
+(build / "ccu_manifest_identity.h").write_text(config["manifest_identity_header"], encoding="ascii")
+source = str(Path("native_ccu.cpp").resolve())
+compile_args = [
+    config["cxx_path"],
+    *config["compile_flags"],
+    f"-I{build}",
+    *(f"-I{path}" for path in (*config["include_dirs"], *config["extra_include_dirs"])),
+]
+# Before each cache lookup, scan every source, including system headers.
+subprocess.run(
+    [*compile_args, source, *config["link_flags"], "-M", "-MF", str(build / "native_ccu.d"), "-MT", "native_ccu"],
+    check=True,
+    cwd=config["working_directory"],
+)
+# On a cache miss:
+subprocess.run(
+    [*compile_args, source, *config["link_flags"], *config["library_paths"], "-o", str(build / "native_ccu.so")],
+    check=True,
+    cwd=config["working_directory"],
+)
+```
+
+The cache token is not a complete module cache key. Combine it with the paths
+and content digests of every source and prerequisite in the dependency rules,
+plus other caller-owned build inputs. Run a fresh scan using the same flags,
+include paths and working directory as the build. Use `-M`, since `-MM` and
+`-MMD` omit system headers such as the C++ standard library. This catches
+changes to header contents and header resolution. `dependency_digests` lists
+the files already fingerprinted by the query, including the compiler, SDK,
+ABI and selected runtime libraries. Individual UBSan checks such as
+`-fsanitize=signed-integer-overflow` also fingerprint their UBSan runtime.
+
+Pass `library_paths` directly to the linker to use the exact SDK libraries
+fingerprinted by the query. CPU options such as `-march=native`, `-mcpu=native`
+and `-mtune=native` are rejected; use an explicit CPU target when needed.
 Deploy the complete shared-library bytes in callable order. At load time the
 dynamic loader must be able to find the matching CANN/HCOMM libraries, for
 example through the CANN environment setup on the deployment Host.
