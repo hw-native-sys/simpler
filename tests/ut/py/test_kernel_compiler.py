@@ -96,9 +96,8 @@ def test_host_orchestration_is_a_self_contained_log_consumer(
 
     if target_runtime == "host_build_graph":
         # assert_impl is a C++ symbol, so the .so carries its own copy rather than
-        # leaving it for dlopen to resolve. build_config.py names that one file
-        # individually, because the directory holding it also holds the arena sources
-        # the .so does not need.
+        # leaving it for dlopen to resolve. The orchestration target needs only
+        # that shared helper; it does not compile the arena implementation.
         assert "assert_support.cpp" in source_names
         assert "runtime_init.cpp" not in source_names
 

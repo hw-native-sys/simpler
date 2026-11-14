@@ -29,19 +29,9 @@
 #define __aicore__
 #endif
 
-// A task's three records share one ChipTaskStorage, so AICore reaches both the
-// ones it reads from a single base: the array strides by the storage, and each
-// record sits at a fixed offset inside it. These are literals because the AICore
-// .o cannot include runtime_types.h; runtime_maker.cpp checks them against the types at
-// compile time, and the contract UT again at run time.
-inline constexpr uint32_t SCHEDULER_GRAPH_TASK_STORAGE_STRIDE = 320;
-inline constexpr uint32_t SCHEDULER_GRAPH_DESCRIPTOR_OFFSET = 0;
-// TaskPayload includes the early-dispatch cache line in this wire layout.
-inline constexpr uint32_t SCHEDULER_GRAPH_PAYLOAD_OFFSET = 128;
-inline constexpr uint32_t SCHEDULER_GRAPH_TASK_ID_OFFSET = 0;
-inline constexpr uint32_t SCHEDULER_GRAPH_KERNEL_IDS_OFFSET = 8;
-inline constexpr uint32_t SCHEDULER_GRAPH_FANIN_COUNT_OFFSET = 8;
-inline constexpr uint32_t SCHEDULER_GRAPH_PREDICATE_OFFSET = 128;
+#include "task_image_layout.h"
+#include "task_image_predicate.h"
+
 inline constexpr int32_t SCHEDULER_GRAPH_MAX_FANIN = 128;
 inline constexpr uint32_t SCHEDULER_CORE_CALLABLE_RESOLVED_ADDR_OFFSET = 136;
 inline constexpr int32_t SCHEDULER_GRAPH_INVALID_KERNEL_ID = -1;
@@ -106,7 +96,7 @@ inline constexpr bool scheduler_resident_worker_demand_checked(
 }
 
 struct SchedulerGraphView {
-    // Base of the ChipTaskStorage array. One address, because a task's descriptor
+    // Base of the runtime-owned task image. A task's descriptor
     // and payload are members of one entry rather than peers in two arrays.
     uint64_t storage_address;
     uint64_t task_count;
@@ -122,7 +112,7 @@ struct SchedulerGraphView {
     uint16_t view_bytes;
 };
 
-inline constexpr uint16_t SCHEDULER_GRAPH_VIEW_VERSION = 4;
+inline constexpr uint16_t SCHEDULER_GRAPH_VIEW_VERSION = 5;
 
 inline __aicore__ constexpr SchedulerGraphView
 scheduler_ordinary_graph_view(uint64_t storage_address, uint32_t task_count, uint64_t window_last_index) {
@@ -217,24 +207,10 @@ inline __aicore__ bool scheduler_task_ref_precedes(int64_t producer, int64_t con
 // negative sentinel, so this reads the absence rather than testing a sign.
 inline __aicore__ bool scheduler_task_ref_is_null(int64_t ref) { return ref < 0; }
 
-struct SchedulerTaskInfo {
-    int64_t task_ref;
-    int32_t kernel_id;
-    int32_t subtask_slot;
-    CoreType core_type;
-};
-
 struct SchedulerTaskShape {
     int64_t task_ref;
     int32_t kernel_ids[3];
     LaneMask active_mask;
-};
-
-struct SchedulerDispatchPredicate {
-    uint64_t addr;
-    int64_t target;
-    uint8_t elem_size;
-    uint8_t op;
 };
 
 static_assert(sizeof(SchedulerGraphView) == 56, "read-only graph view layout changed");
@@ -246,7 +222,6 @@ static_assert(offsetof(SchedulerGraphView, original_task_count) == 48);
 static_assert(offsetof(SchedulerGraphView, view_version) == 52);
 static_assert(offsetof(SchedulerGraphView, view_bytes) == 54);
 static_assert(std::is_trivially_copyable_v<SchedulerGraphView> && std::is_standard_layout_v<SchedulerGraphView>);
-static_assert(sizeof(SchedulerTaskInfo) == 24, "root classification result layout changed");
 static_assert(sizeof(SchedulerTaskShape) == 24, "task shape result layout changed");
 static_assert(offsetof(SchedulerTaskShape, active_mask) == 20);
 static_assert(std::is_trivially_copyable_v<SchedulerTaskShape> && std::is_standard_layout_v<SchedulerTaskShape>);
@@ -276,7 +251,7 @@ inline __aicore__ __gm__ uint8_t *scheduler_graph_payload(const SchedulerGraphVi
 inline __aicore__ int32_t
 scheduler_graph_fanin_id(const SchedulerGraphView &graph, int64_t task_ref, int32_t fanin_index) {
     __gm__ uint8_t *payload = scheduler_graph_payload(graph, task_ref);
-    __gm__ uint8_t *field = payload + TASKPAYLOAD_FANIN_DELTA_OFFSET;
+    __gm__ uint8_t *field = payload + TASK_IMAGE_FANIN_DELTA_OFFSET;
     int32_t delta = *reinterpret_cast<__gm__ int32_t *>(field);
     return reinterpret_cast<__gm__ int32_t *>(field + delta)[fanin_index];
 }
@@ -340,7 +315,7 @@ scheduler_native_child_plan_checked(const SchedulerGraphView &graph, const Sched
     if (child->tensor_count > MAX_TENSOR_ARGS || child->scalar_count > MAX_SCALAR_ARGS ||
         child->tensors_offset % 64 != 0 || child->scalars_offset % 64 != 0 ||
         child->tensors_offset > node.definition->args_bytes ||
-        child->tensor_count > (node.definition->args_bytes - child->tensors_offset) / TASKPAYLOAD_TENSOR_STRIDE ||
+        child->tensor_count > (node.definition->args_bytes - child->tensors_offset) / TASK_IMAGE_TENSOR_STRIDE ||
         child->scalars_offset > node.definition->args_bytes ||
         child->scalar_count > (node.definition->args_bytes - child->scalars_offset) / sizeof(uint64_t) ||
         (child->predicate_offset != SCHEDULER_NATIVE_NO_PREDICATE &&
@@ -470,7 +445,7 @@ scheduler_node_fanin_view(const SchedulerGraphAccess &graph, int64_t task_ref, S
     }
     const int32_t count = *reinterpret_cast<__gm__ int32_t *>(payload + SCHEDULER_GRAPH_FANIN_COUNT_OFFSET);
     if (count < 0 || count > SCHEDULER_GRAPH_MAX_FANIN) return SchedulerGraphResult::INVALID_FANIN_COUNT;
-    auto *field = payload + TASKPAYLOAD_FANIN_DELTA_OFFSET;
+    auto *field = payload + TASK_IMAGE_FANIN_DELTA_OFFSET;
     const int32_t delta = *reinterpret_cast<__gm__ int32_t *>(field);
     if (count > 0 && delta == 0) return SchedulerGraphResult::INVALID_FANIN_ID;
     view->global_refs = reinterpret_cast<__gm__ const int32_t *>(field + delta);
@@ -636,15 +611,15 @@ inline __aicore__ SchedulerGraphResult scheduler_parse_task_payload_arguments(
         storage_ref = node.binding->source_index;
     }
     __gm__ uint8_t *payload = scheduler_graph_payload(storage_view, storage_ref);
-    int32_t tensor_count = *reinterpret_cast<__gm__ int32_t *>(payload + TASKPAYLOAD_TENSOR_COUNT_OFFSET);
-    int32_t scalar_count = *reinterpret_cast<__gm__ int32_t *>(payload + TASKPAYLOAD_SCALAR_COUNT_OFFSET);
+    int32_t tensor_count = *reinterpret_cast<__gm__ int32_t *>(payload + TASK_IMAGE_TENSOR_COUNT_OFFSET);
+    int32_t scalar_count = *reinterpret_cast<__gm__ int32_t *>(payload + TASK_IMAGE_SCALAR_COUNT_OFFSET);
     if (tensor_count < 0 || tensor_count > MAX_TENSOR_ARGS || scalar_count < 0 || scalar_count > MAX_SCALAR_ARGS ||
         tensor_count + scalar_count > SPMD_LOCAL_CONTEXT_INDEX) {
         return SchedulerGraphResult::INVALID_ARGUMENTS;
     }
 
-    __gm__ uint8_t *tensors_field = payload + TASKPAYLOAD_TENSORS_DELTA_OFFSET;
-    __gm__ uint8_t *scalars_field = payload + TASKPAYLOAD_SCALARS_DELTA_OFFSET;
+    __gm__ uint8_t *tensors_field = payload + TASK_IMAGE_TENSORS_DELTA_OFFSET;
+    __gm__ uint8_t *scalars_field = payload + TASK_IMAGE_SCALARS_DELTA_OFFSET;
     int32_t tensors_delta = *reinterpret_cast<__gm__ int32_t *>(tensors_field);
     int32_t scalars_delta = *reinterpret_cast<__gm__ int32_t *>(scalars_field);
     if ((tensor_count > 0 && tensors_delta == 0) || (scalar_count > 0 && scalars_delta == 0)) {
@@ -654,36 +629,5 @@ inline __aicore__ SchedulerGraphResult scheduler_parse_task_payload_arguments(
     arguments->scalars = reinterpret_cast<__gm__ uint64_t *>(scalars_field + scalars_delta);
     arguments->tensor_count = tensor_count;
     arguments->scalar_count = scalar_count;
-    return SchedulerGraphResult::OK;
-}
-
-inline __aicore__ void
-scheduler_materialize_call_arguments(const SchedulerTaskPayloadArguments &arguments, __gm__ uint64_t *args) {
-    int32_t n = 0;
-    for (int32_t i = 0; i < arguments.tensor_count; ++i) {
-        args[n++] =
-            reinterpret_cast<uint64_t>(arguments.tensors + static_cast<uint64_t>(i) * TASKPAYLOAD_TENSOR_STRIDE);
-    }
-    for (int32_t i = 0; i < arguments.scalar_count; ++i)
-        args[n++] = arguments.scalars[i];
-}
-
-inline __aicore__ SchedulerGraphResult scheduler_materialize_task_payload_resolved(
-    const SchedulerGraphAccess &graph, const SchedulerTaskInfo &task, uint64_t function_bin_address,
-    __gm__ DispatchPayload *dispatch_payload, const SchedulerTaskPayloadArguments *shared_arguments = nullptr,
-    bool write_arguments = true
-) {
-    if (dispatch_payload == nullptr || function_bin_address == 0) {
-        return SchedulerGraphResult::INVALID_CALLABLE;
-    }
-    SchedulerTaskPayloadArguments parsed{};
-    if (shared_arguments == nullptr) {
-        const SchedulerGraphResult status = scheduler_parse_task_payload_arguments(graph, task.task_ref, &parsed);
-        if (status != SchedulerGraphResult::OK) return status;
-        shared_arguments = &parsed;
-    }
-    dispatch_payload->function_bin_addr = function_bin_address;
-    if (write_arguments) scheduler_materialize_call_arguments(*shared_arguments, dispatch_payload->args);
-
     return SchedulerGraphResult::OK;
 }

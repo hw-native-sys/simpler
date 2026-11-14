@@ -14,7 +14,7 @@
 #include "aicpu/cache_maintenance.h"
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "common/memory_barrier.h"
-#include "host_build_graph/runtime_types.h"
+#include "host_build_graph/tensor.h"
 
 namespace {
 template <typename T>

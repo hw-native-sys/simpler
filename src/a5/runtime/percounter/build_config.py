@@ -9,15 +9,11 @@
 # percounter Runtime build configuration
 # All paths are relative to this file's directory (src/a5/runtime/percounter/)
 #
-# percounter consumes the same device graph image host_build_graph does — the same
-# ChipTaskSlotState, the same task kinds, the same orchestration .so. What differs is
-# who dispatches: AICore lanes schedule themselves from host-built per-task counters
-# instead of taking work from an AICPU dispatcher or a resident scheduler core.
-#
-# So this runtime compiles host_build_graph's sources rather than carrying copies, and
-# overrides the entry points it replaces with strong symbols against host_build_graph's
-# weak ones. The directories below therefore name a sibling runtime's tree; nothing is
-# duplicated, and a fix landing in host_build_graph reaches this runtime unchanged.
+# Percounter shares host orchestration and the AICPU lifecycle with HBG. Its
+# independently selected image packer retains ChipTaskStorage for AICPU Graph
+# materialization; lane loops read that format through its own task_image_layout.h.
+# HBG's resident image and native Graph Host plans do not belong to this runtime.
+# Shared entry points use strong percounter definitions against weak HBG hooks.
 #
 # A runtime is whatever directory under src/{arch}/runtime/ holds a build_config.py
 # (platform_info.discover_runtimes), and each one builds its own aicore .o, aicpu .so
@@ -75,11 +71,21 @@ BUILD_CONFIG = {
             f"{HBG}/runtime",
             # Percounter materializes GraphExecution on AICPU.
             f"{SHARED}/device",
-            f"{SHARED}/shared",
+            f"{SHARED}/shared/assert",
         ],
     },
     "host": {
-        "include_dirs": ["host", "runtime", f"{HBG}/host", f"{HBG}/runtime", f"{HBG}/common", "..", SHARED],
+        "include_dirs": [
+            "host/image",
+            "host",
+            "runtime",
+            f"{HBG}/host/image",
+            f"{HBG}/host",
+            f"{HBG}/runtime",
+            f"{HBG}/common",
+            "..",
+            SHARED,
+        ],
         "source_dirs": [
             "host",
             f"{HBG}/host",
@@ -90,6 +96,6 @@ BUILD_CONFIG = {
     "orchestration": {
         "include_dirs": [f"{HBG}/runtime", f"{HBG}/common", "..", SHARED, f"{SHARED}/host/orchestration"],
         "source_dirs": [f"{SHARED}/host/orchestration"],
-        "source_files": [f"{SHARED}/shared/assert_support.cpp"],
+        "source_files": [f"{SHARED}/shared/assert/assert_support.cpp"],
     },
 }

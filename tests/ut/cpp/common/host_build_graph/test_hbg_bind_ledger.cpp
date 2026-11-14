@@ -220,6 +220,7 @@ struct FakeHostApi {
     std::vector<uint8_t> gm_heap;
     std::vector<uint8_t> runtime_arena;
     size_t requested_arena_bytes{0};
+    size_t requested_heap_bytes{0};
     std::vector<uint8_t> sm_mirror;
     std::vector<uint8_t> definition_staging;
     // The section the bind handed to the carrier, and how many times it did.
@@ -576,6 +577,7 @@ void fake_set_retained(void *, uint32_t, void *addr, size_t size) {
 int fake_setup_static_arena(void *, uint32_t, size_t heap, size_t, size_t arena) {
     if (g_fake->arena_status != 0) return g_fake->arena_status;
     g_fake->requested_arena_bytes = arena;
+    g_fake->requested_heap_bytes = heap;
     g_fake->gm_heap.assign(std::max<size_t>(heap, kAlign) + kAlign, 0);
     g_fake->runtime_arena.assign(std::max<size_t>(arena, kAlign) + kAlign, 0);
     return 0;
@@ -1137,8 +1139,10 @@ TEST_F(HbgBindLedgerTest, TaskImagePublicationMatchesTheDeviceArenaContract) {
             EXPECT_EQ(fake_.requested_arena_bytes, static_cast<size_t>(sm - arena) + runtime.dev.sm_image_bytes);
         }
         ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
-        const auto *header = static_cast<const SharedMemoryHeader *>(runtime.get_gm_sm_ptr());
-        EXPECT_EQ(header->tasks.total_tasks, runtime.dev.host_total_tasks);
+        if (!resident) {
+            const auto *header = static_cast<const SharedMemoryHeader *>(runtime.get_gm_sm_ptr());
+            EXPECT_EQ(header->tasks.total_tasks, runtime.dev.host_total_tasks);
+        }
     }
 }
 
@@ -2922,6 +2926,41 @@ TEST_F(HbgBindLedgerTest, LaunchStagingOwnsPrerequisitesAndImageWithoutPrepareDe
 }
 
 #if __has_include("scheduler/scheduler_args_dump.h")
+TEST_F(HbgResidentSchedulerStorageTest, GraphHeapReservationContainsArgumentsWithoutAicpuTaskStorage) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    install_callable_tables(runtime);
+    eps_ = {
+        [](const ChipTaskArgs &) {
+            auto &orch = *g_orch_runtime->orchestrator;
+            GraphTaskArgs boundary;
+            const auto graph = orch.graph_begin(0x529, boundary);
+            ASSERT_TRUE(graph.recording);
+            ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary));
+            MixedKernels kernels{};
+            kernels.aiv0_kernel_id = 0;
+            for (uint64_t i = 0; i < 16; ++i) {
+                CoreTaskArgs args;
+                args.add_scalar(i);
+                ASSERT_TRUE(orch.submit_task(kernels, args).task_id().is_valid());
+            }
+            ASSERT_TRUE(orch.graph_end());
+            orch.graph_commit();
+            const auto cached = orch.graph_begin(0x529, boundary);
+            EXPECT_FALSE(cached.recording);
+            EXPECT_FALSE(cached.has_error);
+            EXPECT_TRUE(cached.task_id.is_valid());
+        },
+        capture_orch_bind
+    };
+    ChipStorageTaskArgs args;
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    EXPECT_EQ(fake_.requested_heap_bytes, CHIP_ALIGN_UP(2 * 16 * 64, DeviceArena::kDefaultBaseAlign));
+    EXPECT_LT(fake_.requested_heap_bytes, 2 * 16 * sizeof(ChipTaskStorage));
+    ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+}
+
 TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpUsesCurrentAicoreNodesAndChargedSchedulerPublication) {
     api_ = HostApi(nullptr, 0, 0, 11, &fake_ops());
     for (TestOrchEntryFunc entry : {scalar_dump_orch_entry, native_scalar_dump_orch_entry}) {

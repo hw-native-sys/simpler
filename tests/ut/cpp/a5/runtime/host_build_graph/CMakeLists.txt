@@ -27,6 +27,9 @@ a5_hbg_case(test_hbg_args_dump_rendezvous.cpp)
 
 a5_hbg_case(test_hbg_graph_view.cpp)
 
+a5_hbg_case(test_hbg_task_image.cpp
+    SOURCES ${SIMPLER_SRC}/common/host_build_graph/shared/shared_memory.cpp)
+
 a5_hbg_case(test_hbg_scalar_trace.cpp NO_OBJS TIMEOUT 20
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/scalar_policy_plain.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/scalar_policy_profiled.cpp

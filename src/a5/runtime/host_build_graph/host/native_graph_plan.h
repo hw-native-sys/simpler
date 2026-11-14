@@ -37,6 +37,8 @@ bool native_graph_plan_definition(
     const void *image, size_t bytes, uint64_t graph_key, NativeGraphDefinitionPlan *out, std::string *error
 );
 
+bool native_graph_validate_definition(const void *image, size_t bytes, uint64_t graph_key, std::string *error);
+
 struct NativeGraphHostPlan {
     std::vector<std::byte> original_definition_section;
     std::vector<NativeGraphDefinitionPlan> definitions;

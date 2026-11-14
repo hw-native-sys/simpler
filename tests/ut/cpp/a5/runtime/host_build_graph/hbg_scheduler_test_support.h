@@ -28,6 +28,7 @@
 #include "task_catalog_plan.h"
 #include "prepared_execution_plan.h"
 #include "runtime_types.h"
+#include "task_image_types.h"
 
 namespace scheduler_test {
 
@@ -104,11 +105,11 @@ public:
         storage_[task].payload.predicate.addr = addr;
         storage_[task].payload.predicate.target = target;
         storage_[task].payload.predicate.elem_size = elem_size;
-        storage_[task].payload.predicate.op = static_cast<PredicateOp>(op);
+        storage_[task].payload.predicate.op = op;
     }
 
-    TaskPayload &payload(size_t task) { return storage_[task].payload; }
-    ChipTaskStorage *storage() { return storage_; }
+    TaskImagePayload &payload(size_t task) { return storage_[task].payload; }
+    TaskImageStorage *storage() { return storage_; }
 
     SchedulerGraphView graph() const {
         return scheduler_ordinary_graph_view(
@@ -120,14 +121,14 @@ private:
     static constexpr size_t kMaxTaskCount = MaxTaskCount;
     // Descriptor and payload share one entry, matching the production wire stride.
     struct alignas(64) GraphImage {
-        std::array<ChipTaskStorage, kMaxTaskCount> storage{};
+        std::array<TaskImageStorage, kMaxTaskCount> storage{};
         std::array<int32_t, kMaxTaskCount * SCHEDULER_GRAPH_MAX_FANIN> fanins{};
     };
 
     size_t task_count_;
     size_t capacity_{1};
     std::unique_ptr<GraphImage> image_;
-    ChipTaskStorage *storage_{nullptr};
+    TaskImageStorage *storage_{nullptr};
     int32_t *fanins_{nullptr};
 };
 

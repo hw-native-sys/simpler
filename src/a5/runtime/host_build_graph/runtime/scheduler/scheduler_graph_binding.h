@@ -41,7 +41,7 @@ static inline __aicore__ void scheduler_graph_arguments_cache(
     const __gm__ SchedulerGraphInstance &instance, const __gm__ SchedulerGraphChildPlan &child
 ) {
     scheduler_graph_argument_cache_lines(
-        instance.args_base + child.tensors_offset, static_cast<uint64_t>(child.tensor_count) * TASKPAYLOAD_TENSOR_STRIDE
+        instance.args_base + child.tensors_offset, static_cast<uint64_t>(child.tensor_count) * TASK_IMAGE_TENSOR_STRIDE
     );
     scheduler_graph_argument_cache_lines(
         instance.args_base + child.scalars_offset, static_cast<uint64_t>(child.scalar_count) * sizeof(uint64_t)

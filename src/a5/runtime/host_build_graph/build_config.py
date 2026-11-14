@@ -16,7 +16,7 @@
 # The orchestration .so is built from src/common/host_build_graph/host/orchestration:
 # orchestration runs on the host for this runtime, so its API headers and the
 # context binding it exports live under "host" like everything else host-only. The
-# .so also compiles shared/assert_support.cpp, named file-wise below: assert_impl is
+# .so also compiles shared/assert/assert_support.cpp, named file-wise below: assert_impl is
 # what every always_assert expands into, and being a C++ symbol it cannot be left
 # for dlopen to resolve the way extern "C" unified_log_error is.
 #
@@ -49,11 +49,11 @@ BUILD_CONFIG = {
         "source_dirs": [
             "aicpu",
             "runtime",
-            f"{SHARED}/shared",
+            f"{SHARED}/shared/assert",
         ],
     },
     "host": {
-        "include_dirs": ["runtime", "common", "..", SHARED],
+        "include_dirs": ["host/image", "runtime", "common", "..", SHARED],
         "source_dirs": [
             "host",
             f"{SHARED}/host",
@@ -65,8 +65,8 @@ BUILD_CONFIG = {
         "source_dirs": [f"{SHARED}/host/orchestration"],
         # assert_impl is a C++ symbol, so unlike the extern "C" unified_log_error it
         # cannot be left for dlopen to resolve against the loader: the .so has to
-        # carry its own copy. Named as a file because the directory holding it also
-        # holds the arena sources, which the .so does not need.
-        "source_files": [f"{SHARED}/shared/assert_support.cpp"],
+        # carry its own copy. The orchestration target needs only this assertion
+        # helper from the shared runtime implementation.
+        "source_files": [f"{SHARED}/shared/assert/assert_support.cpp"],
     },
 }

@@ -21,6 +21,7 @@
 
 #include "host_build_graph/graph_execution.h"
 #include "native_graph_plan.h"
+#include "host_build_graph/host/graph_argument_layout.h"
 #include "dependency_plan.h"
 #include "task_catalog_plan.h"
 #include "hbg_scheduler_test_support.h"
@@ -140,6 +141,30 @@ struct DefinitionFixture {
 };
 }  // namespace
 
+TEST(HbgNativeGraphPlan, ArgumentReservationAndValidationDoNotConstructAnExecutionImage) {
+    DefinitionFixture fixture({{}, {0}}, false, 1, 1);
+    NativeGraphDefinitionPlan plan;
+    std::string error;
+    ASSERT_TRUE(fixture.build(plan, error)) << error;
+    uint64_t bytes = 0;
+    const auto *definition = reinterpret_cast<const GraphDefinition *>(fixture.bytes.data());
+    ASSERT_TRUE(graph_native_argument_storage_bytes(*definition, &bytes));
+    EXPECT_EQ(bytes, plan.args_bytes);
+    EXPECT_LT(bytes, fixture.header.execution_storage_bytes);
+    EXPECT_TRUE(
+        native_graph_validate_definition(fixture.bytes.data(), fixture.bytes.size(), fixture.header.graph_key, &error)
+    ) << error;
+    fixture.header.execution_storage_bytes = 0;
+    fixture.sync();
+    EXPECT_TRUE(fixture.build(plan, error)) << error;
+    EXPECT_EQ(plan.args_bytes, bytes);
+    fixture.put<uint16_t>(fixture.header.off_fanin_indices, 0, 1);
+    EXPECT_FALSE(fixture.build(plan, error));
+    EXPECT_FALSE(
+        native_graph_validate_definition(fixture.bytes.data(), fixture.bytes.size(), fixture.header.graph_key, &error)
+    );
+}
+
 TEST(HbgNativeGraphPlan, FaninAndSinkCountsUseTheWholeDefinition) {
     for (int count : {1, 128, 129, 1023}) {
         std::vector<std::vector<uint16_t>> edges(static_cast<size_t>(count + 1));
@@ -159,7 +184,7 @@ TEST(HbgNativeGraphPlan, FaninAndSinkCountsUseTheWholeDefinition) {
     ASSERT_TRUE(roots.build(plan, error)) << error;
     EXPECT_EQ(plan.sinks.size(), 1024);
     EXPECT_EQ(plan.execution_count, 0);
-    EXPECT_LE(plan.args_bytes, plan.definition.execution_storage_bytes);
+    EXPECT_EQ(plan.args_bytes, 0);
 }
 
 TEST(HbgNativeGraphPlan, DenseRefsKeepOriginalShellIdentityAndShareDefinitions) {
@@ -199,7 +224,7 @@ TEST(HbgNativeGraphPlan, OwnsBytesAndKeepsScalarWritersOnSeparateCacheLines) {
     EXPECT_EQ(plan.image, saved);
 }
 
-TEST(HbgNativeGraphPlan, CanonicalMaximumArgumentPoolsFitReservedStorage) {
+TEST(HbgNativeGraphPlan, CanonicalMaximumArgumentPoolsUseExactParameterStorage) {
     DefinitionFixture fixture(
         std::vector<std::vector<uint16_t>>(SUB_TASK_MAX_NUM), false, MAX_SCALAR_ARGS, MAX_TENSOR_ARGS
     );
@@ -208,7 +233,6 @@ TEST(HbgNativeGraphPlan, CanonicalMaximumArgumentPoolsFitReservedStorage) {
     ASSERT_TRUE(fixture.build(plan, error)) << error;
     const uint64_t per_child = sizeof(simpler::hbg::Tensor) * MAX_TENSOR_ARGS + sizeof(uint64_t) * MAX_SCALAR_ARGS;
     EXPECT_EQ(plan.args_bytes, per_child * SUB_TASK_MAX_NUM);
-    EXPECT_LE(plan.args_bytes, plan.definition.execution_storage_bytes);
 }
 
 TEST(HbgNativeGraphPlan, RejectsOverlappingAndGappedChildArgumentSpans) {
@@ -304,7 +328,6 @@ TEST(HbgNativeGraphPlan, CooperativeShapeStillRejectsMalformedTopology) {
     NativeGraphDefinitionPlan plan;
     std::string error;
     ASSERT_TRUE(fixture.build(plan, error)) << error;
-    EXPECT_LE(plan.args_bytes, plan.definition.execution_storage_bytes);
     fixture.put<uint16_t>(fixture.header.off_fanin_indices, 0, 1);
     EXPECT_FALSE(fixture.build(plan, error));
 }

@@ -442,22 +442,21 @@ bool graph_submit_definition(
     OrchestratorState *orch, GraphHostState *state, const GraphDefinition *definition,
     const GraphDefinitionRecord &record, const GraphTaskArgs &args, TaskId *submitted_id
 ) {
-    // A published Definition is this process's own product: a null one, a zero-byte
-    // execution image, or a heap total that overflows cannot come from a recording this
-    // runtime completed.
+    // A published Definition is immutable and has a cached runtime-owned
+    // invocation budget. Native argument backing can legitimately be empty.
     always_assert(definition != nullptr && "a cached Definition record carries a Definition");
-    always_assert(definition->execution_storage_bytes != 0 && "a published Definition has an execution image");
-    always_assert(
-        definition->required_heap <= UINT64_MAX - definition->execution_storage_bytes &&
-        "a published Definition's heap total does not overflow"
-    );
+    const uint64_t execution_bytes = record.invocation_storage_bytes;
+    if (execution_bytes > UINT64_MAX - definition->required_heap) {
+        orch->report_fatal(SIMPLER_ERROR_INVALID_ARGS, __func__, "invalid Graph execution storage");
+        return false;
+    }
     if (!graph_require_boundary_match(
             orch, BoundaryExpectation::CachedDefinition, definition->boundary_tensor_count,
             definition->boundary_scalar_count, record.boundary_match_info.tensors.data(), args
         )) {
         return false;
     }
-    const uint64_t owned_heap = definition->required_heap + definition->execution_storage_bytes;
+    const uint64_t owned_heap = definition->required_heap + execution_bytes;
     if (owned_heap > static_cast<uint64_t>(INT32_MAX)) {
         orch->report_fatal(
             SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED, __FUNCTION__,
@@ -484,13 +483,14 @@ bool graph_finalize_pending_submissions(OrchestratorState *orch, GraphHostState 
         const GraphDefinition *definition = definition_it == state->definitions.end() ?
                                                 nullptr :
                                                 graph_record_definition(*state, definition_it->second);
-        if (definition == nullptr || definition->execution_storage_bytes == 0 ||
-            definition->required_heap > UINT64_MAX - definition->execution_storage_bytes ||
+        const uint64_t execution_bytes =
+            definition_it == state->definitions.end() ? 0 : definition_it->second.invocation_storage_bytes;
+        if (definition == nullptr || execution_bytes > UINT64_MAX - definition->required_heap ||
             pending.outer_slot == nullptr || pending.outer_slot->task_kind != TaskKind::GRAPH) {
             if (failed_key != nullptr) *failed_key = pending.graph_key;
             return false;
         }
-        const uint64_t owned_heap = definition->required_heap + definition->execution_storage_bytes;
+        const uint64_t owned_heap = definition->required_heap + execution_bytes;
         if (owned_heap > static_cast<uint64_t>(INT32_MAX)) {
             if (failed_key != nullptr) *failed_key = pending.graph_key;
             return false;
@@ -1149,7 +1149,7 @@ bool OrchestratorState::graph_end() {
         ORCH_PHASE_END_WITH_INDEX(HostPhaseKind::OrchBuildDefinition, recording->task_count, entry->submit_idx);
     }
     const GraphDefinition *header = built ? graph_record_definition(*state, record) : nullptr;
-    if (header == nullptr) {
+    if (header == nullptr || !state->execution_storage_bytes(*header, &record.invocation_storage_bytes)) {
         debug_assert(false && "The recorded Graph contains a construct that Graph Execution does not support");
         LOG_WARN("%s", "[GraphExecution] asynchronous recording produced an unsupported Graph");
         graph_abort(entry);

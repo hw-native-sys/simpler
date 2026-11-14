@@ -506,10 +506,10 @@ using GraphBuffer = scheduler_test::BasicGraphBuffer<16>;
 TEST(SchedulerState, PlansAndInitializesTaskCatalogAndCompletionState) {
     // The reverse lookup for the wire constants AICore addresses with. They are
     // literals there because the AICore .o cannot see these types; here it can.
-    EXPECT_EQ(sizeof(ChipTaskStorage), SCHEDULER_GRAPH_TASK_STORAGE_STRIDE);
-    EXPECT_EQ(offsetof(ChipTaskStorage, task), SCHEDULER_GRAPH_DESCRIPTOR_OFFSET);
-    EXPECT_EQ(offsetof(ChipTaskStorage, payload), SCHEDULER_GRAPH_PAYLOAD_OFFSET);
-    EXPECT_EQ(offsetof(TaskPayload, predicate), SCHEDULER_GRAPH_PREDICATE_OFFSET);
+    EXPECT_EQ(sizeof(TaskImageStorage), SCHEDULER_GRAPH_TASK_STORAGE_STRIDE);
+    EXPECT_EQ(offsetof(TaskImageStorage, task), SCHEDULER_GRAPH_DESCRIPTOR_OFFSET);
+    EXPECT_EQ(offsetof(TaskImageStorage, payload), SCHEDULER_GRAPH_PAYLOAD_OFFSET);
+    EXPECT_EQ(offsetof(TaskImagePayload, predicate), SCHEDULER_GRAPH_PREDICATE_OFFSET);
     AicoreSchedulerLayout layout{};
     ASSERT_TRUE(scheduler_plan_layout(5, 3, 2, &layout));
     EXPECT_EQ(layout.total_size % SCHEDULER_STATE_ALIGNMENT, 0u);
@@ -641,7 +641,7 @@ TEST(SchedulerMetadata, ProjectsExistingSubmitTypesWithoutChangingTheirSemantics
 TEST(SchedulerGraph, AddressesEveryTaskAtTheStorageStride) {
     constexpr size_t kTasks = 4;
     struct alignas(64) GraphImage {
-        std::array<ChipTaskStorage, kTasks> storage{};
+        std::array<TaskImageStorage, kTasks> storage{};
     } image;
     auto &storage = image.storage;
     const auto graph = scheduler_ordinary_graph_view(reinterpret_cast<uint64_t>(storage.data()), kTasks, kTasks - 1);
@@ -658,9 +658,8 @@ TEST(SchedulerGraph, AddressesEveryTaskAtTheStorageStride) {
         );
     }
 
-    // Consecutive tasks are one whole storage apart, not one record apart. The
-    // pre-merge strides (64 for a descriptor, 192 for a payload) satisfy the loop
-    // above at task 0 and fail it everywhere else; this states the step directly.
+    // Both record accessors advance by the runtime-owned storage stride,
+    // including when the view starts from a task beyond the first record.
     const auto *first = scheduler_graph_descriptor(graph, 0);
     const auto *second = scheduler_graph_descriptor(graph, 1);
     EXPECT_EQ(second - first, SCHEDULER_GRAPH_TASK_STORAGE_STRIDE);
@@ -669,7 +668,7 @@ TEST(SchedulerGraph, AddressesEveryTaskAtTheStorageStride) {
 
 TEST(SchedulerGraph, NonPowerOfTwoWindowKeepsDirectTaskIdIndexing) {
     struct alignas(64) GraphImage {
-        std::array<ChipTaskStorage, 3> storage{};
+        std::array<TaskImageStorage, 3> storage{};
         std::array<std::array<int32_t, SCHEDULER_GRAPH_MAX_FANIN>, 3> fanins{};
     } image;
     auto &storage = image.storage;
@@ -722,75 +721,36 @@ TEST(SchedulerGraph, RejectsAViewWithAnUnsupportedVersion) {
     SchedulerTaskShape shape{};
     EXPECT_EQ(scheduler_classify_task_shape(dirty, 0, &shape), SchedulerGraphResult::INVALID_ARGUMENTS);
 
-    DispatchPayload payload{};
-    SchedulerTaskInfo task{0, 1, 0, CoreType::AIC};
-    EXPECT_EQ(
-        scheduler_materialize_task_payload_resolved(dirty, task, 0x1000, &payload),
-        SchedulerGraphResult::INVALID_ARGUMENTS
-    );
+    SchedulerTaskPayloadArguments arguments{};
+    EXPECT_EQ(scheduler_parse_task_payload_arguments(dirty, 0, &arguments), SchedulerGraphResult::INVALID_ARGUMENTS);
 }
 
-TEST(SchedulerDispatchPayload, PreservesInitializedSlotContextDuringMaterialization) {
+TEST(SchedulerGraph, RejectsInvalidBoundsBeforeReadingArgumentPools) {
     GraphBuffer graph(1);
     graph.executable(0, 0);
-    DispatchPayload payload{};
-    payload.global_context.sub_block_id = 7;
-    payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&payload.local_context);
-    payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&payload.global_context);
-    SchedulerTaskInfo task{0, 1, 0, CoreType::AIC};
-
-    ASSERT_EQ(
-        scheduler_materialize_task_payload_resolved(graph.graph(), task, 0x1000, &payload), SchedulerGraphResult::OK
-    );
-    EXPECT_EQ(payload.global_context.sub_block_id, 7);
-    EXPECT_EQ(payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX], reinterpret_cast<uint64_t>(&payload.local_context));
-    EXPECT_EQ(payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX], reinterpret_cast<uint64_t>(&payload.global_context));
-
-    task.subtask_slot = 2;
-    task.core_type = CoreType::AIV;
-    ASSERT_EQ(
-        scheduler_materialize_task_payload_resolved(graph.graph(), task, 0x1000, &payload), SchedulerGraphResult::OK
-    );
-    EXPECT_EQ(payload.global_context.sub_block_id, 7);
-}
-
-TEST(SchedulerDispatchPayload, RejectsInvalidGraphBoundsBeforeReadingPayload) {
-    GraphBuffer graph(1);
-    graph.executable(0, 0);
-    DispatchPayload payload{};
-
-    SchedulerTaskInfo out_of_range{1, 1, 0, CoreType::AIC};
+    SchedulerTaskPayloadArguments arguments{};
     EXPECT_EQ(
-        scheduler_materialize_task_payload_resolved(graph.graph(), out_of_range, 0x1000, &payload),
-        SchedulerGraphResult::INVALID_TASK_COUNT
+        scheduler_parse_task_payload_arguments(graph.graph(), 1, &arguments), SchedulerGraphResult::INVALID_TASK_COUNT
     );
-
-    SchedulerGraphView missing_storage = graph.graph();
+    auto missing_storage = graph.graph();
     missing_storage.storage_address = 0;
-    SchedulerTaskInfo valid_task{0, 1, 0, CoreType::AIC};
     EXPECT_EQ(
-        scheduler_materialize_task_payload_resolved(missing_storage, valid_task, 0x1000, &payload),
-        SchedulerGraphResult::INVALID_TASK_COUNT
+        scheduler_parse_task_payload_arguments(missing_storage, 0, &arguments), SchedulerGraphResult::INVALID_TASK_COUNT
     );
 }
 
-TEST(SchedulerDispatchPayload, RejectsUnboundNonEmptyArgumentRegions) {
+TEST(SchedulerGraph, RejectsUnboundNonEmptyArgumentPools) {
     GraphBuffer graph(1);
     graph.executable(0, 0);
-    DispatchPayload payload{};
-    SchedulerTaskInfo task{0, 1, 0, CoreType::AIC};
-
+    SchedulerTaskPayloadArguments arguments{};
     graph.payload(0).tensor_count = 1;
     EXPECT_EQ(
-        scheduler_materialize_task_payload_resolved(graph.graph(), task, 0x1000, &payload),
-        SchedulerGraphResult::INVALID_ARGUMENTS
+        scheduler_parse_task_payload_arguments(graph.graph(), 0, &arguments), SchedulerGraphResult::INVALID_ARGUMENTS
     );
-
     graph.payload(0).tensor_count = 0;
     graph.payload(0).scalar_count = 1;
     EXPECT_EQ(
-        scheduler_materialize_task_payload_resolved(graph.graph(), task, 0x1000, &payload),
-        SchedulerGraphResult::INVALID_ARGUMENTS
+        scheduler_parse_task_payload_arguments(graph.graph(), 0, &arguments), SchedulerGraphResult::INVALID_ARGUMENTS
     );
 }
 

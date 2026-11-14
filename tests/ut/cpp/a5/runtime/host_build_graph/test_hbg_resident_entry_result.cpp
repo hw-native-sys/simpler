@@ -44,7 +44,7 @@ struct SchedulerImage {
 
 struct RegisterTransport {
     Runtime *runtime = nullptr;
-    SharedMemoryHeader *header = nullptr;
+    TaskImageStatus *header = nullptr;
     SchedulerImage *image = nullptr;
     DeviceRunResultRegion *result = nullptr;
     std::mutex mutex;
@@ -128,7 +128,7 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
         transport->saw_held_owner = true;
         if (transport->late_error) {
             EXPECT_EQ(g_aicpu_executor.run_status_.load(), 0);
-            EXPECT_EQ(transport->header->sched_error_code.load(), transport->header_before_late);
+            EXPECT_EQ(transport->header->error_code.load(), transport->header_before_late);
             EXPECT_EQ(transport->image->control.scheduler_error, 0u);
             EXPECT_TRUE(record_aicore_scheduler_runtime_error(
                 &transport->image->control, SchedulerGraphResult::TIMEOUT, SchedulerErrorSite::EXIT_WAIT_TIMEOUT
@@ -169,7 +169,7 @@ protected:
         runtime = std::make_unique<Runtime>();
         image = std::make_unique<SchedulerImage>();
         state = std::make_unique<RegisterTransport>();
-        header.sched_error_code.store(SIMPLER_ERROR_NONE);
+        header.error_code.store(SIMPLER_ERROR_NONE);
         result_storage = {};
         private_result = true;
         runtime->set_worker_count(kParticipants);
@@ -301,7 +301,7 @@ protected:
     std::unique_ptr<Runtime> runtime;
     std::unique_ptr<SchedulerImage> image;
     std::unique_ptr<RegisterTransport> state;
-    SharedMemoryHeader header{};
+    TaskImageStatus header{};
     NativeInvocationResultStorage result_storage{};
     DeviceRunResultRegion &result{result_storage.result};
     bool private_result{true};
@@ -336,7 +336,7 @@ TEST_F(ResidentEntryResult, TheActualLastEntryReturnsAnErrorClaimedAfterItsPeers
         EXPECT_TRUE(state->saw_held_owner);
         for (int32_t i = 0; i < kParticipants; ++i)
             EXPECT_EQ(statuses[i], i == last ? -SIMPLER_ERROR_SCHEDULER_TIMEOUT : 0);
-        EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+        EXPECT_EQ(header.error_code.load(), SIMPLER_ERROR_SCHEDULER_TIMEOUT);
         expect_normal_lifecycle();
         configure(SCHEDULER_RUNTIME_MODE_RESIDENT_READY);
         EXPECT_EQ(execute(), (std::array<int32_t, kParticipants>{0, 0, 0}));
@@ -348,13 +348,13 @@ TEST_F(ResidentEntryResult, AnEarlierHeaderErrorStillOwnsTheActualLateEntryStatu
     state->held_participant = 0;
     state->late_error = true;
     state->header_before_late = SIMPLER_ERROR_INVALID_ARGS;
-    header.sched_error_code.store(SIMPLER_ERROR_INVALID_ARGS);
+    header.error_code.store(SIMPLER_ERROR_INVALID_ARGS);
     EXPECT_EQ(
         execute(), (std::array<int32_t, kParticipants>{
                        -SIMPLER_ERROR_INVALID_ARGS, -SIMPLER_ERROR_INVALID_ARGS, -SIMPLER_ERROR_INVALID_ARGS
                    })
     );
-    EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_INVALID_ARGS);
+    EXPECT_EQ(header.error_code.load(), SIMPLER_ERROR_INVALID_ARGS);
     expect_normal_lifecycle();
 }
 
@@ -371,7 +371,7 @@ TEST_F(ResidentEntryResult, AShutdownFailureReachesItsEntryEvenWhenAnotherPartic
     state->held_participant = 1;
     state->failed_participant = 0;
     EXPECT_EQ(execute(), (std::array<int32_t, kParticipants>{-1, 0, 0}));
-    EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_NONE);
+    EXPECT_EQ(header.error_code.load(), SIMPLER_ERROR_NONE);
     expect_normal_lifecycle();
     const auto terminal = device_run_result_terminal(result, kEpoch);
     EXPECT_EQ(terminal.state, DeviceRunTerminalState::Failed);
@@ -381,7 +381,7 @@ TEST_F(ResidentEntryResult, AShutdownFailureReachesItsEntryEvenWhenAnotherPartic
 TEST_F(ResidentEntryResult, AnInvalidGraphAtRunEntryReturnsTheSupervisorsOwnFailure) {
     state->invalidate_graph_on_release = true;
     EXPECT_EQ(execute(), (std::array<int32_t, kParticipants>{-1, -1, -1}));
-    EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_NONE);
+    EXPECT_EQ(header.error_code.load(), SIMPLER_ERROR_NONE);
     expect_normal_lifecycle();
 }
 
@@ -401,7 +401,7 @@ TEST_F(ResidentEntryResult, InvalidModesRetireEveryReportedCoreAndPermitTheNextR
         const auto terminal = device_run_result_terminal(result, kEpoch);
         EXPECT_EQ(terminal.state, DeviceRunTerminalState::Failed);
         EXPECT_EQ(terminal.code, -SIMPLER_ERROR_INVALID_ARGS);
-        EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_INVALID_ARGS);
+        EXPECT_EQ(header.error_code.load(), SIMPLER_ERROR_INVALID_ARGS);
         EXPECT_EQ(aicpu_release_callables(), 0);
         configure(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING);
         EXPECT_EQ(execute(), (std::array<int32_t, kParticipants>{0, 0, 0}));
@@ -460,14 +460,14 @@ TEST_F(ResidentEntryResult, FailedStartupKeepsAnUnacknowledgedCoreOwnedAndCannot
 
 TEST_F(ResidentEntryResult, FailedStartupPreservesTheFirstHeaderError) {
     configure(UINT32_MAX);
-    header.sched_error_code.store(SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+    header.error_code.store(SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
     EXPECT_EQ(
         execute(), (std::array<int32_t, kParticipants>{
                        -SIMPLER_ERROR_READY_QUEUE_OVERFLOW, -SIMPLER_ERROR_READY_QUEUE_OVERFLOW,
                        -SIMPLER_ERROR_READY_QUEUE_OVERFLOW
                    })
     );
-    EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+    EXPECT_EQ(header.error_code.load(), SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
     EXPECT_EQ(device_run_result_terminal(result, kEpoch).code, -SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
 }
 
@@ -585,7 +585,7 @@ TEST_F(ResidentEntryResult, FailedInitializationPreservesAnAlreadyPublishedAsync
             -SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW, -SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW, -SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW
         })
     );
-    EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
+    EXPECT_EQ(header.error_code.load(), SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
     const auto terminal = device_run_result_terminal(result, kEpoch);
     EXPECT_EQ(terminal.state, DeviceRunTerminalState::Failed);
     EXPECT_EQ(terminal.code, -SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);

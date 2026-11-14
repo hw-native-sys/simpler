@@ -37,19 +37,7 @@ static_assert(
     "GLOBAL_CONTEXT_INDEX out of sync with intrinsic.h"
 );
 
-// Byte offsets into TaskPayload used by resident workers to materialize args[]. The AICore .o does not include
-// runtime_types.h, so it reads tensor_count / scalar_count / tensors[] /
-// scalars[] through these constants. The Host runtime maker
-// static_asserts them against offsetof where the full struct is visible, so any
-// TaskPayload layout drift fails the build rather than corrupting args[].
-constexpr uint32_t TASKPAYLOAD_TENSOR_COUNT_OFFSET = 0;
-constexpr uint32_t TASKPAYLOAD_SCALAR_COUNT_OFFSET = 4;
-// Offsets of the fields that NAME the argument regions, not of the regions themselves:
-// a region's address is (src + <field offset>) + <the int32 delta stored there>.
-constexpr uint32_t TASKPAYLOAD_TENSORS_DELTA_OFFSET = 12;
-constexpr uint32_t TASKPAYLOAD_SCALARS_DELTA_OFFSET = 16;
-constexpr uint32_t TASKPAYLOAD_FANIN_DELTA_OFFSET = 20;
-constexpr uint32_t TASKPAYLOAD_TENSOR_STRIDE = 128;  // sizeof(simpler::hbg::Tensor)
+constexpr uint32_t TASK_IMAGE_TENSOR_STRIDE = 128;  // sizeof(simpler::hbg::Tensor)
 
 struct alignas(64) DispatchPayload {
     uint64_t function_bin_addr;

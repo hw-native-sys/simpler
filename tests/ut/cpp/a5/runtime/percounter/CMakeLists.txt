@@ -11,6 +11,7 @@ simpler_ut_add_target(NAME test_a5_percounter_payload
     SOURCES test_payload.cpp
     ARCH a5 RUNTIME percounter
     INCLUDES
+        ${SIMPLER_SRC}/a5/runtime/percounter/runtime
         ${SIMPLER_SRC}/a5/runtime/percounter/aicore
         ${SIMPLER_SRC}/a5/runtime/host_build_graph/runtime
         ${SIMPLER_SRC}/a5/runtime/host_build_graph/common

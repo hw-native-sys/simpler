@@ -139,6 +139,27 @@ struct Fixture {
     }
 };
 
+TEST(PercounterPayload, PreparationBindsCurrentImageWithoutReplacingContextPointers) {
+    Fixture f;
+    auto task = f.resolve(0);
+    auto &payload = f.payloads[0][0];
+    const auto local = payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX];
+    const auto global = payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX];
+    ASSERT_TRUE(percounter_prepare_subtask(f.cfg[0], task, 0, 1, 3, 5, &payload));
+    EXPECT_EQ(payload.function_bin_addr, reinterpret_cast<uint64_t>(&kernel));
+    EXPECT_EQ(payload.args[0], f.scalars[0]);
+    EXPECT_EQ(payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX], local);
+    EXPECT_EQ(payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX], global);
+    EXPECT_EQ(payload.local_context.block_idx, 3);
+    EXPECT_EQ(payload.local_context.block_num, 5);
+    task.graph.view_version = 0;
+    EXPECT_FALSE(percounter_prepare_subtask(f.cfg[0], task, 0, 1, 0, 1, &payload));
+    task = f.resolve(0);
+    f.storage[0].payload.scalar_count = 1;
+    f.storage[0].payload.scalars.set(nullptr);
+    EXPECT_FALSE(percounter_prepare_subtask(f.cfg[0], task, 0, 1, 0, 1, &payload));
+}
+
 TEST(PercounterPayload, OrdinaryCandidatePreparedBeforeProducerCompletes) {
     Fixture f;
     f.cfg[0].order_count = 3;

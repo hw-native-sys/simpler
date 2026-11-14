@@ -31,6 +31,6 @@ BUILD_CONFIG = {
         # cannot be left for dlopen to resolve against the loader: the .so has to
         # carry its own copy. Named as a file because the directory holding it also
         # holds the arena sources, which the .so does not need.
-        "source_files": [f"{SHARED}/shared/assert_support.cpp"],
+        "source_files": [f"{SHARED}/shared/assert/assert_support.cpp"],
     },
 }
