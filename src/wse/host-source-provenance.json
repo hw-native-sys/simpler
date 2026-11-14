@@ -5,17 +5,17 @@
     {
       "source": "src/common/platform/sim/host/device_runner_base.h",
       "destination": "src/wse/platform/sim/host/wse_host_runner.h",
-      "sha256": "0f0b6d42e0016576a64f8a4ba04268ffbadc7f7355fb3e678b63175da9cbf334"
+      "sha256": "77d41997d74a21e1f55a7d3b0bf4d15601f030e2fae4a910454da78edf56c176"
     },
     {
       "source": "src/common/platform/sim/host/device_runner_base.cpp",
       "destination": "src/wse/platform/sim/host/wse_host_runner.cpp",
-      "sha256": "ab2723c0f6a004fb7b35e620ccb8413fb646f4f3221b94a4234ec37a30f0c64c"
+      "sha256": "4904544ad0aefe638d369b68ad30e72d6fbd8d204c4ff72f75e9b44cd868be7a"
     },
     {
       "source": "src/common/platform/sim/host/c_api_shared.cpp",
       "destination": "src/wse/platform/sim/host/wse_runtime_api.cpp",
-      "sha256": "e2afea60f4ac88258b8a6dc55faf0167042585f69cc47b34a6331154368da2fb"
+      "sha256": "15a6eba9cb443356b8c03ec9435b99dc1fa552904d6f6d7d8b0e282e5fe10166"
     },
     {
       "source": "src/common/worker/native_run_execution.h",
@@ -35,7 +35,7 @@
     {
       "source": "src/common/worker/native_run_context.h",
       "destination": "src/wse/platform/sim/host/wse_native_run_context.h",
-      "sha256": "2009b734b0da580b040abe4cce68ae5bf49cc04fe2a707e6c6b1cec35ef7b84a"
+      "sha256": "42d1dfea41c452469189c05f8c5756060b05d2a73976daa32f5e3474ad455e9e"
     }
   ],
   "maintenance": "WSE-owned implementations of the existing runtime C ABI and HBG declarations; shared headers are not shadowed."

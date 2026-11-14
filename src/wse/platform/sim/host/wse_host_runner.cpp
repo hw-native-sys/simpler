@@ -217,12 +217,14 @@ uint64_t WseHostRunner::retained_temp_addr(uint32_t slot_id) const {
 }
 
 int WseHostRunner::setup_static_arena(
-    uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
+    RegionBanks banks, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
 ) {
-    if (arena_bank >= arena_banks_.size()) return PTO_RUNTIME_ERR_INTERNAL;
-    ArenaBank &bank = this->arena_bank(arena_bank);
-    // GM heap, shared memory and runtime arena own independent grow-only allocations.
-    // Only a region whose requested capacity grows is recommitted.
+    if (banks.heap >= arena_banks_.size() || banks.sm >= arena_banks_.size() || banks.image >= arena_banks_.size())
+        return PTO_RUNTIME_ERR_INTERNAL;
+    ArenaBank &heap_bank = this->arena_bank(banks.heap);
+    ArenaBank &sm_bank = this->arena_bank(banks.sm);
+    ArenaBank &image_bank = this->arena_bank(banks.image);
+    // Each region grows independently in its selected bank.
     auto commit_region = [](DeviceArena &arena, size_t &cached_size, size_t requested_size) -> int {
         if (requested_size == 0) {
             if (arena.is_committed() && cached_size != 0) {
@@ -248,16 +250,16 @@ int WseHostRunner::setup_static_arena(
     // all on any failure" semantic (PR #922). Pooled pointers from a prior
     // successful call stay valid; a failed resize attempt does not leave a
     // partial layout behind.
-    bool ok = commit_region(bank.gm_heap, bank.cached_gm_heap_size, gm_heap_size) == 0;
-    ok = ok && commit_region(bank.gm_sm, bank.cached_gm_sm_size, gm_sm_size) == 0;
-    ok = ok && commit_region(bank.runtime_pool, bank.cached_runtime_arena_size, runtime_arena_size) == 0;
+    bool ok = commit_region(heap_bank.gm_heap, heap_bank.cached_gm_heap_size, gm_heap_size) == 0;
+    ok = ok && commit_region(sm_bank.gm_sm, sm_bank.cached_gm_sm_size, gm_sm_size) == 0;
+    ok = ok && commit_region(image_bank.runtime_pool, image_bank.cached_runtime_arena_size, runtime_arena_size) == 0;
     if (!ok) {
-        bank.gm_heap.release();
-        bank.gm_sm.release();
-        bank.runtime_pool.release();
-        bank.cached_gm_heap_size = 0;
-        bank.cached_gm_sm_size = 0;
-        bank.cached_runtime_arena_size = 0;
+        heap_bank.gm_heap.release();
+        sm_bank.gm_sm.release();
+        image_bank.runtime_pool.release();
+        heap_bank.cached_gm_heap_size = 0;
+        sm_bank.cached_gm_sm_size = 0;
+        image_bank.cached_runtime_arena_size = 0;
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     return 0;

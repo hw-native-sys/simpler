@@ -574,7 +574,7 @@ void fake_set_retained(void *, uint32_t, void *addr, size_t size) {
     g_fake->retained_addr = addr;
     g_fake->retained_size = size;
 }
-int fake_setup_static_arena(void *, uint32_t, size_t heap, size_t, size_t arena) {
+int fake_setup_static_arena(void *, RegionBanks, size_t heap, size_t, size_t arena) {
     if (g_fake->arena_status != 0) return g_fake->arena_status;
     g_fake->requested_arena_bytes = arena;
     g_fake->requested_heap_bytes = heap;
