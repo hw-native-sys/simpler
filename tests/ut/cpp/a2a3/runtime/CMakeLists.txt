@@ -29,6 +29,7 @@ a2a3_runtime_case(test_scheduler_retirement.cpp NO_OBJS
     COMPILE_OPTIONS -ffunction-sections -fdata-sections
     LINK_OPTIONS ${_retirement_gc_link_option}
     TIMEOUT 20)
+target_compile_definitions(test_a2a3_tmr_scheduler_retirement PRIVATE SIMPLER_TEST_EPOCH_RETIREMENT=1)
 target_sources(test_a2a3_tmr_scheduler_retirement PRIVATE
     ${A2A3_RUNTIME_DIR}/shared/runtime.cpp)
 target_sources(test_a2a3_hbg_scheduler_retirement PRIVATE
@@ -56,9 +57,16 @@ hbg_case(test_aicore_retirement.cpp ARCHS a2a3 NO_OBJS TIMEOUT 20
              ${RETIREMENT_SOURCES}
     INCLUDES ${RETIREMENT_INCLUDES})
 tmr_case(test_aicore_retirement.cpp ARCHS a2a3 NO_OBJS TIMEOUT 20
+    DEFINES SIMPLER_TEST_EPOCH_RETIREMENT=1
     SOURCES  ${SIMPLER_SRC}/a2a3/runtime/tensormap_and_ringbuffer/aicore/aicore_executor.cpp
              ${RETIREMENT_SOURCES}
     INCLUDES ${RETIREMENT_INCLUDES})
+
+# Observe the real executor's polling branch without adding product test hooks.
+# GNU ld wrapping is available on the Linux CPU-test runners.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(test_a2a3_tmr_aicore_retirement PRIVATE -Wl,--wrap=sched_yield)
+endif()
 
 simpler_ut_glob_cases(a2a3_runtime_case)
 

@@ -201,7 +201,7 @@ that code already assumes — it does not establish those preconditions:
   plain `Device-nGnRE` store carrying no release semantics of its own. No core can read
   its gate before its window opens.
 - **RELEASE after window-close.** The quiesce pass, then the CLOSE pass and its
-  readbacks, then `rmb()`, then the relaxed `post_close_release` stores
+  readbacks, then `rmb()`, then the relaxed release stores
   in `platform_retire_aicore_group`. The drain is what orders every store after
   the CLOSE it belongs to, so an open return gate is never paired with an open window.
 
@@ -211,11 +211,13 @@ releases the same gates is **not** established — the recovery path is untraced
 neither the premise nor the two edges above settle it. See
 [the exceptional-exit limit in the descriptor visibility investigation](../investigations/2026-09-runtime-descriptor-input-visibility-chain.md#exceptional-and-partial-exits-audited-separately).
 
-The AICore reads the release word with `acknowledge_aicore_cond_nonce_and_wait` in
+The AICore reads the release word with `acknowledge_aicore_cond_nonce_and_wait`
+or `publish_aicore_epoch_and_wait` in
 `src/a2a3/platform/onboard/aicore/inner_kernel.h`: bypass `ld_dev` loads followed
 by a final `dsb(DSB_DDR)`. The release word is permission-to-return. It shares an
 AICPU-owned 64-byte line with `exit_request`. AICore publishes its response in
-COND, so no GM ACK field or AICore writeback shares this line.
+COND for the nonce protocol, or in its separate report line for stamped TMR;
+no GM ACK field or AICore writeback shares the CPU-owned control line.
 `AicoreTeardownControl` has 64-byte size and alignment and requires matching
 host, AICPU and AICore builds.
 
@@ -225,11 +227,35 @@ host, AICPU and AICore builds.
 current core has observed EXIT, and failure can precede its first IDLE. Waiting
 for IDLE or using one fixed exit marker does not establish current retirement.
 
-#### Unified COND nonce
+#### Stamped A2/A3 TMR exit
 
-A2/A3 and A5 HBG/TMR use `platform_retire_aicore_group` for Native, legacy and
-unstamped launches. Native report epochs still commit the current physical-core
-report; the epoch neither selects an exit protocol nor acknowledges retirement.
+A2/A3 TMR launches with a nonzero report epoch acknowledge exit through
+`Handshake::retired_epoch`, a 64-bit field on the Core-owned report line.
+AICore clears that field before publishing its startup report. Captured Kernel
+replays retain their prepared epoch, so the per-execution reset is part of the
+freshness contract even when the epoch value repeats.
+
+The startup report and exclusive retirement claim precede the AICPU's EXIT.
+After observing EXIT and completing preceding accesses, Core publishes its
+epoch, writes back the report line and performs no further SPR/report writes.
+AICPU accepts only the full epoch match. It retains grouped deadlines and the
+IDLE, CLOSE, per-core readback and shared drain sequence, then stores that epoch
+to `AicoreTeardownControl::release_epoch`. Core bypass-polls this separate
+CPU-owned line before returning. Silent targets remain open and unreleased.
+
+The startup reset completes before the fresh `aicore_done` store, followed by
+the existing epoch publication barrier/writeback. The reset-before-done barrier
+also applies when the retained report epoch already matches a replay.
+AICPU does not reset `retired_epoch` during Core execution. Descriptor reuse
+still requires serialized execution or confirmed recovery. The retirement
+owner invalidates the startup report after acknowledgement, before a successor
+can reuse it. Host, AICPU and Core must be built with the same protocol.
+
+#### COND nonce fallback
+
+A2/A3 HBG, unstamped A2/A3 TMR and A5 HBG/TMR retain the COND nonce path
+through `platform_retire_aicore_group`. On these paths native report epochs
+commit the physical-core report independently of the exit nonce.
 
 | Order | AICPU | AICore |
 | ----- | ----- | ------ |

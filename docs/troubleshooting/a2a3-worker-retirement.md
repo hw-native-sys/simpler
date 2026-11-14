@@ -84,10 +84,11 @@ cost every core on the chip.
 Retirement uses a current-response predicate, described in the
 [freshness contract](../hardware/cache-coherency.md#exit-acknowledgement-freshness).
 Native and unstamped runs use `platform_retire_aicore_group` after report
-acceptance and exclusive claim. The claimant chooses a reserved nonce different
-from this physical core's observed COND; Core echoes it only after completing
-preceding writes, then performs no subsequent SPR writes. Native report epochs
-retain their startup checks. Both request and return gate are reset before
+acceptance and exclusive claim. Stamped TMR uses a Core-owned GM epoch ACK,
+reset before each startup report, including same-epoch captured replay. Other
+paths choose a reserved nonce different from this physical core's observed
+COND. Core acknowledges only after completing preceding accesses, then performs
+no subsequent SPR writes. Both request and return gate are reset before
 READY or EXIT; the control remains one AICPU-owned 64-byte line. Fixed EXITED
 alone is insufficient.
 
@@ -98,8 +99,11 @@ The helper retires one claimed set in passes:
    A core that never responds remains unclosed and unreleased for host recovery.
 3. Reset dispatch to IDLE and close every acknowledged window. Read back the
    MMIO windows, then drain those reads before publishing any GM return gate.
-4. Store `AICORE_POST_CLOSE_RELEASE` to each acknowledged core's gate.
-5. AICore observes that word, completes its final drain and only then returns.
+4. For stamped TMR, store the target's `expected_epoch` into `release_epoch`.
+   For the nonce path, store `AICORE_POST_CLOSE_RELEASE` into `post_close_release`.
+   Only acknowledged cores receive a release.
+5. AICore waits for its matching epoch or nonce-path release value, completes
+   its final drain and only then returns. A different nonzero epoch is not a release.
 
 The AICore wait is unbounded on purpose. A bounded wait cannot help: below the
 45 s op-execute timeout it would return while the AICPU may still be writing —
