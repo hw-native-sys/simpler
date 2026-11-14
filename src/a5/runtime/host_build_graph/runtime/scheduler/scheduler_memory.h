@@ -17,6 +17,26 @@
 #include "scheduler_types.h"
 #include "scheduler_scalar_record.h"
 
+// pto-isa 8fb67fa7e routes urma_gather_async.hpp into every TU that includes
+// <pto/pto-inst.hpp>; on A5 that pulls in <simt_api/device_functions.h> and its
+// SIMT atomicAdd template wins overload resolution for the classic 64-bit add.
+// The self-contained incore link (ld.lld over the kernel object only) has no
+// SIMT device library to resolve it, so perform the add with the classic 64-bit
+// CAS, which is still inlined. Remove once pto-isa keeps the SIMT header out of
+// the common pto-inst.hpp chain.
+#if defined(__CCE_AICORE__)
+static inline __aicore__ uint64_t scheduler_gm_atomic_fetch_add(__gm__ volatile uint64_t &value, uint64_t delta) {
+    auto *word = const_cast<__gm__ int64_t *>(reinterpret_cast<__gm__ volatile int64_t *>(&value));
+    int64_t observed = atomicCAS(word, 0, 0);
+    while (true) {
+        const int64_t desired = static_cast<int64_t>(static_cast<uint64_t>(observed) + delta);
+        const int64_t actual = atomicCAS(word, observed, desired);
+        if (actual == observed) return static_cast<uint64_t>(observed);
+        observed = actual;
+    }
+}
+#endif
+
 // Capture ordinary operands and address values by value at observer calls.
 // GM words retain reference captures so their accesses stay inside the timed
 // primitive, while caller temporaries do not escape through the callback.
@@ -129,7 +149,7 @@ static inline __aicore__ int64_t scheduler_gm_load(__gm__ volatile int64_t &valu
     return scheduler_scalar_memory_result(SchedPhaseKind::ScalarAtomicLoad, [&value]() __aicore__ {
 #if defined(__CCE_AICORE__)
         __gm__ uint64_t *address = reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&value));
-        return static_cast<int64_t>(atomicAdd(address, UINT64_C(0)));
+        return static_cast<int64_t>(scheduler_gm_atomic_fetch_add(*address, UINT64_C(0)));
 #else
     return __atomic_load_n(&value, __ATOMIC_ACQUIRE);
 #endif
@@ -277,7 +297,7 @@ scheduler_gm_fetch_add(__gm__ volatile uint64_t &value, uint64_t delta, int orde
     return scheduler_scalar_memory_result(SchedPhaseKind::ScalarAtomicFetchAdd, [&value, delta, order]() __aicore__ {
 #if defined(__CCE_AICORE__)
         (void)order;
-        return atomicAdd(const_cast<__gm__ uint64_t *>(&value), delta);
+        return scheduler_gm_atomic_fetch_add(value, delta);
 #else
     return __atomic_fetch_add(&value, delta, order);
 #endif
@@ -357,7 +377,7 @@ scheduler_gm_fetch_and(__gm__ volatile uint64_t &value, uint64_t bits, int order
 static inline __aicore__ void scheduler_gm_fetch_add_discard(__gm__ volatile uint64_t &value, uint64_t delta) {
     scheduler_scalar_memory_issue(SchedPhaseKind::ScalarAtomicFetchAddIssue, 1, [&value, delta]() __aicore__ {
 #if defined(__CCE_AICORE__)
-        (void)atomicAdd(const_cast<__gm__ uint64_t *>(&value), delta);
+        (void)scheduler_gm_atomic_fetch_add(value, delta);
 #else
     (void)__atomic_fetch_add(&value, delta, __ATOMIC_ACQ_REL);
 #endif
