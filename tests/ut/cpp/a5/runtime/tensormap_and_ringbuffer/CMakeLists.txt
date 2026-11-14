@@ -87,4 +87,14 @@ endif()
 # object library, nothing else to say. Dropping a new test_*.cpp into this
 # directory is all it takes — declaring one by hand above is what removes it
 # from this sweep, so there is no separate list to keep in step.
+# Replace only the clock boundary to drive scalar waits deterministically.
+get_target_property(_scalar_sources a5_tmr_objs SOURCES)
+list(FILTER _scalar_sources EXCLUDE REGEX "device_time_stub.cpp$")
+a5_tmr_case(test_scalar_access_deps.cpp NO_OBJS
+    SOURCES ${_scalar_sources} ${SIMPLER_SRC}/a5/runtime/tensormap_and_ringbuffer/runtime/runtime_core.cpp
+    LINK a5_ut_support
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK_OPTIONS ${_retirement_gc_link_option}
+    TIMEOUT 20)
+
 simpler_ut_glob_cases(a5_tmr_case)

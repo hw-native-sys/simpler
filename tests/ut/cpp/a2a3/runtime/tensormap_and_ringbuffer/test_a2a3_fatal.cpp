@@ -89,12 +89,17 @@ void fake_report_fatal(RuntimeContext *rt, int32_t error_code, const char *func,
 
 void fake_log(const char *, const char *, ...) {}
 
-uint64_t fake_get_tensor_data(RuntimeContext *rt, const simpler::tmr::Tensor &, uint32_t, const uint32_t[]) {
+uint64_t fake_get_tensor_data(
+    RuntimeContext *rt, const simpler::tmr::Tensor &, uint32_t, const uint32_t[], const simpler::tmr::TaskId *, uint32_t
+) {
     as_fake(rt)->get_calls++;
     return 0x1234ULL;
 }
 
-void fake_set_tensor_data(RuntimeContext *rt, const simpler::tmr::Tensor &, uint32_t, const uint32_t[], uint64_t) {
+void fake_set_tensor_data(
+    RuntimeContext *rt, const simpler::tmr::Tensor &, uint32_t, const uint32_t[], uint64_t,
+    const simpler::tmr::TaskId *, uint32_t
+) {
     as_fake(rt)->set_calls++;
 }
 
