@@ -131,6 +131,7 @@ struct OrchSoEntry {
 };
 
 enum class EntryArgsPreparation : uint8_t { NotPrepared, Ready, Rejected };
+enum class GateReset : uint8_t { Unclaimed, Claimed, Complete };
 
 struct AicpuExecutor {
     int32_t sched_thread_num_;
@@ -148,6 +149,7 @@ struct AicpuExecutor {
     // exposes no affinity idx (sim, where platform_aicpu_affinity_thread_idx()
     // is -1 during init) so the threads don't all collapse to leader 0.
     std::atomic<bool> hs_setup_done_{false};
+    std::atomic<GateReset> gate_reset_{GateReset::Unclaimed};
     std::atomic<int32_t> hs_arrived_{0};
     std::atomic<int32_t> hs_thread_seq_{0};
 
@@ -187,6 +189,8 @@ struct AicpuExecutor {
     SchedulerContext sched_ctx_;
 
     // ===== Methods =====
+    bool try_reset_teardown_gates(Runtime *runtime, int32_t worker_count);
+    bool finish_teardown_gate_reset(Runtime *runtime, int32_t worker_count);
     int32_t init(Runtime *runtime, EntryArgsPreparation &entry_args_preparation);
     // (Re)load a callable's orchestration SO into orch_so_table_[callable_id].
     // Register-only: the register_callable entry calls this to dlopen and
@@ -302,6 +306,35 @@ bool adopt_launch_entry_args(Runtime *runtime, int32_t thread_idx) {
 
 }  // namespace
 
+bool AicpuExecutor::try_reset_teardown_gates(Runtime *runtime, int32_t worker_count) {
+    GateReset expected = GateReset::Unclaimed;
+    if (!gate_reset_.compare_exchange_strong(expected, GateReset::Claimed, std::memory_order_relaxed)) return false;
+
+    SchedulerContext::reset_teardown_gates(runtime, worker_count);
+    gate_reset_.store(GateReset::Complete, std::memory_order_release);
+    return true;
+}
+
+bool AicpuExecutor::finish_teardown_gate_reset(Runtime *runtime, int32_t worker_count) {
+    const GateReset state = gate_reset_.load(std::memory_order_acquire);
+    if (state == GateReset::Complete) return true;
+    if (state == GateReset::Unclaimed && try_reset_teardown_gates(runtime, worker_count)) return true;
+
+    const int32_t timeout_ms = get_scheduler_timeout_ms();
+    const uint64_t timeout_cycles = timeout_ms > 0 ?
+                                        static_cast<uint64_t>(timeout_ms) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000) :
+                                        SCHEDULER_TIMEOUT_CYCLES;
+    const uint64_t start = get_sys_cnt_aicpu();
+    while (gate_reset_.load(std::memory_order_acquire) != GateReset::Complete) {
+        if (get_sys_cnt_aicpu() - start >= timeout_cycles) {
+            LOG_ERROR("Teardown gate reset timed out before opening AICore windows");
+            return false;
+        }
+        SPIN_WAIT_HINT();
+    }
+    return true;
+}
+
 int32_t AicpuExecutor::init(Runtime *runtime, EntryArgsPreparation &entry_args_preparation) {
     if (runtime == nullptr) {
         LOG_ERROR("runtime is nullptr");
@@ -343,6 +376,13 @@ int32_t AicpuExecutor::init(Runtime *runtime, EntryArgsPreparation &entry_args_p
         return -1;
     }
     const bool is_leader = (tidx == 0);
+    const bool parallel_gate_reset = affinity_exec_idx >= 0 && nthreads > 2 && !runtime->dev.serial_orch_sched;
+    if (parallel_gate_reset && tidx == 1) {
+        const int32_t workers = runtime->dev.worker_count;
+        if (workers > 0 && workers <= RUNTIME_MAX_WORKER && workers % PLATFORM_CORES_PER_BLOCKDIM == 0) {
+            try_reset_teardown_gates(runtime, workers);
+        }
+    }
 
     // Only this thread adopts the launch arguments. The leader's setup does
     // not access entry-argument storage.
@@ -370,7 +410,12 @@ int32_t AicpuExecutor::init(Runtime *runtime, EntryArgsPreparation &entry_args_p
         // fail. The completed predecessor owns no producer writes here.
         scope_stats_aicpu_begin_run();
 #endif
-        if (sched_ctx_.pre_handshake_init(runtime, aicpu_thread_num_, sched_thread_num_, get_platform_regs()) != 0) {
+        const int32_t setup_rc = sched_ctx_.pre_handshake_init(
+            runtime, aicpu_thread_num_, sched_thread_num_, get_platform_regs(), parallel_gate_reset
+        );
+        // Complete includes the owner's store barrier. A failed join leaves
+        // windows closed and ownership with the original writer until retirement.
+        if (setup_rc != 0 || (parallel_gate_reset && !finish_teardown_gate_reset(runtime, runtime->dev.worker_count))) {
             init_failed_.store(true, std::memory_order_release);
             hs_setup_done_.store(true, std::memory_order_release);
             return -1;
@@ -1192,6 +1237,7 @@ void AicpuExecutor::reset_entry_state() {
     serial_orch_sched_ = false;
     init_done_.store(false, std::memory_order_release);
     init_failed_.store(false, std::memory_order_release);
+    gate_reset_.store(GateReset::Unclaimed, std::memory_order_relaxed);
     hs_setup_done_.store(false, std::memory_order_release);
     hs_arrived_.store(0, std::memory_order_release);
     hs_thread_seq_.store(0, std::memory_order_release);

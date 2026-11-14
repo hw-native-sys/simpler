@@ -1362,8 +1362,15 @@ void SchedulerContext::emergency_shutdown(Runtime *runtime) {
 // =============================================================================
 // Lifecycle: init / deinit
 // =============================================================================
+void SchedulerContext::reset_teardown_gates(Runtime *runtime, int32_t worker_count) {
+    // Clear stale RELEASE before the leader admits handshakers. The
+    // Device-nGnRE window store has no release semantics.
+    memset(runtime->get_teardown_gates(), 0, sizeof(AicoreTeardownControl) * worker_count);
+    wmb();
+}
+
 int32_t SchedulerContext::pre_handshake_init(
-    Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base
+    Runtime *runtime, int32_t aicpu_thread_num, int32_t sched_thread_num, uint64_t regs_base, bool defer_gate_reset
 ) {
     always_assert(runtime != nullptr);
 
@@ -1410,22 +1417,20 @@ int32_t SchedulerContext::pre_handshake_init(
 
     // Core count is needed by every thread to compute its handshake slice.
     cores_total_num_ = runtime->dev.worker_count;
-    if (cores_total_num_ == 0 || cores_total_num_ > RUNTIME_MAX_WORKER) {
+    if (cores_total_num_ <= 0 || cores_total_num_ > RUNTIME_MAX_WORKER) {
         LOG_ERROR("Invalid cores_total_num %d (expected 1-%d)", cores_total_num_, RUNTIME_MAX_WORKER);
         return -1;
     }
-    // The prior launch may have left RELEASE=1. The wmb() is what orders these
-    // resets before hs_setup_done_ and before any register window opens: a
-    // window is a plain Device-nGnRE store, carrying no release semantics of
-    // its own.
-    memset(runtime->get_teardown_gates(), 0, sizeof(AicoreTeardownControl) * cores_total_num_);
-    wmb();
+    const bool valid_partition = cores_total_num_ % PLATFORM_CORES_PER_BLOCKDIM == 0;
+    if (!defer_gate_reset || !valid_partition) {
+        reset_teardown_gates(runtime, cores_total_num_);
+    }
     // The blocked 1 AIC : 2 AIV layout requires an exact multiple of 3: cluster ci
     // owns cores {ci, N/3+2ci, N/3+2ci+1}, so a non-zero remainder leaves the tail
     // AIV cores [3*(N/3), N) in no cluster — unhandshaked, their windows never open,
     // and the run hangs at the op-execute timeout. assign_cores_to_threads pairs
     // aiv_worker_ids_[2*ci]/[2*ci+1] on the serial path too, so this holds for both.
-    if (cores_total_num_ % PLATFORM_CORES_PER_BLOCKDIM != 0) {
+    if (!valid_partition) {
         LOG_ERROR(
             "cores_total_num %d is not a multiple of %d (blocked 1 AIC : 2 AIV layout)", cores_total_num_,
             PLATFORM_CORES_PER_BLOCKDIM
