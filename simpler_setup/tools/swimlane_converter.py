@@ -1624,6 +1624,7 @@ def _with_execution_identity(args, row):
             "pending_slot",
             "order_key",
             "group_seq",
+            "group_kind",
             "cluster_index",
             "cluster_lane",
             "executed",

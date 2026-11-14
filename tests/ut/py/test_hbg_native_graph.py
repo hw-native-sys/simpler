@@ -20,13 +20,13 @@ from simpler_setup.tools.hbg.native_protocol import read_native_protocol
 from simpler_setup.tools.sched_overhead_analysis import build_task_graph
 
 
-def native_capture(*, deferred_tasks=()):
+def native_capture(*, deferred_tasks=(), child_mask=2):
     # Outer kernel -> Graph(kernel -> dummy) -> outer consumer.
     raw, identities = ProtocolBuilder(
-        [(2, 1, ()), (0, 1, (0,)), (2, 1, (1,)), (0, 1, (2,)), (0, 1, (3,)), (2, 1, (4,))],
+        [(2, 1, ()), (0, 1, (0,)), (child_mask, 1, (1,)), (0, 1, (2,)), (0, 1, (3,)), (2, 1, (4,))],
         deferred_tasks=deferred_tasks,
     ).run()
-    raw["schema"] = "hbg-native-protocol-v11"
+    raw["schema"] = "hbg-native-protocol-v21"
     for control in raw["task_controls"]:
         control.update(claim_tickets=0)
     raw["graph_source"] = dict(
@@ -40,11 +40,11 @@ def native_capture(*, deferred_tasks=()):
                 graph_key=11,
                 children=[
                     dict(
-                        active_mask=2,
+                        active_mask=child_mask,
                         block_num=1,
                         task_attrs=0,
                         predicate_slot=0,
-                        kernel_ids=[-1, 0, -1],
+                        kernel_ids=[0 if child_mask & (1 << lane) else -1 for lane in range(3)],
                         dependencies=[],
                     ),
                     dict(
@@ -220,5 +220,19 @@ def test_current_native_graph_rejects_independent_flag():
     raw, identities = native_capture()
     assert audit_native_protocol(raw, identities)["protocol_verified"]
     raw["tasks"][2]["flags"] |= 128
+    next(event for event in raw["task_events"] if event["index"] == 2)["completion"]["flags"] |= 128
     with pytest.raises(ValueError, match="unknown task flags"):
         audit_native_protocol(raw, identities)
+
+
+@pytest.mark.parametrize("mask", (3, 5, 6, 7))
+def test_native_graph_mix_child_preserves_stage_claim_and_enter_exit_causality(mask):
+    raw, identities = native_capture(child_mask=mask)
+    owner = raw["blocks"][0]["owner"]
+    assert raw["schema"] == "hbg-native-protocol-v21"
+    assert owner["task_ref"] == 2
+    assert owner["staged"][0] < owner["claim_before"][0] < owner["claim_after"][0] < owner["publish_before"][0]
+    result = audit_native_protocol(raw, identities)
+    assert result["protocol_verified"] and result["device_logical_tasks"] == 6
+    assert audit_graph_expansion(raw)[2]["local_child_id"] == 0
+    assert result["executions"] == mask.bit_count() + 2

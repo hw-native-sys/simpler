@@ -11,9 +11,9 @@
 
 #pragma once
 
-// AICore-resident dispatch library; scheduler_dispatch.cpp is the independent AICPU scheduler implementation.
-
 #include "scheduler_completion.h"
+#include "scheduler_execution_tokens.h"
+#include "scheduler_cooperative_discovery.h"
 
 // Keep the default recording contract for existing diagnostic callers. Only
 // the resident loop's no-profiling instantiation opts out; ownership and all
@@ -83,32 +83,18 @@ static inline __aicore__ bool scheduler_service_gm_mix(
 // Stale observations may postpone work; every positive hint takes the normal
 // ownership validation path before doing that work.
 static inline __aicore__ bool scheduler_ordered_poll_may_progress(
-    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, bool *ready_probe_empty = nullptr,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local,
     SchedulerGmMixPhase *ack_prefilter_phase = nullptr
 ) {
     SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarOrderedPoll, -1);
     SchedulerScalarScope scalar_local(local, SchedPhaseKind::ScalarPollLocalState);
-    if (ready_probe_empty != nullptr) *ready_probe_empty = false;
     if (ack_prefilter_phase != nullptr) *ack_prefilter_phase = SchedulerGmMixPhase::IDLE;
     const auto &admission = *local->admission;
     if (admission.capacity == 0 || admission.scan_cursor > admission.capacity || local->local_ready_mask != 0 ||
         !scheduler_task_ref_is_null(admission.pending_task_ref))
         return true;
-    for (const auto &candidate : admission.candidates)
-        if (!scheduler_task_ref_is_null(candidate.ready.task_ref)) return true;
     scalar_local.close();
 
-    const uint32_t type = local->config.self_core_type;
-    {
-        SchedulerScalarScope scalar_queue(local, SchedPhaseKind::ScalarPollReadyQueue);
-        if (scheduler_scalar_result(local, SchedPhaseKind::ScalarPollReadyPool, [&]() __aicore__ {
-                return scheduler_ready_pool_may_have_work(base, local, type);
-            }))
-            return true;
-    }
-    // Reuse only this poll's completed negative Ready probes. Immutable
-    // scheduler configuration was validated before entering the loop.
-    if (ready_probe_empty != nullptr) *ready_probe_empty = true;
     if (scheduler_task_ref_is_null(admission.current_task_ref)) {
         auto *control = scheduler_state_at<SchedulerAdmissionControl>(base, admission.control_offset);
         return scheduler_scalar_result(local, SchedPhaseKind::ScalarPollAdmissionTail, [&]() __aicore__ {
@@ -123,12 +109,11 @@ static inline __aicore__ bool scheduler_ordered_poll_may_progress(
     auto *mailbox = scheduler_gm_mix_mailbox(base, local);
     if (!local->is_mix_coordinator() &&
         (group.phase == SchedulerGmMixPhase::IDLE || group.phase == SchedulerGmMixPhase::RELEASED)) {
-        const auto *record = scheduler_admission_record_at(base, &admission, admission.current_task_ref);
-        auto *seals = scheduler_state_at<SchedulerMixCloseSeal>(base, record->mix_close_seals_offset);
+        auto &seal = scheduler_state_at<SchedulerMixCloseSeal>(base, admission.current_mix_close_seal_offset)->value;
         return scheduler_scalar_result(
                    local, SchedPhaseKind::ScalarPollMixCloseSeal,
                    [&]() __aicore__ {
-                       return scheduler_gm_query(seals[group.cluster_index].value);
+                       return scheduler_gm_query(seal);
                    }
                ) != 0 ||
                scheduler_scalar_result(local, SchedPhaseKind::ScalarPollMixAssignment, [&]() __aicore__ {
@@ -138,7 +123,7 @@ static inline __aicore__ bool scheduler_ordered_poll_may_progress(
     const bool releases = group.phase == SchedulerGmMixPhase::RELEASED && local->is_mix_coordinator();
     if (group.phase == SchedulerGmMixPhase::ARRIVED || releases) {
         if (group.group_seq == 0 || group.group_seq == UINT64_MAX) return true;
-        const LaneMask resources = scheduler_mix_resource_mask(admission.current_active_mask);
+        const LaneMask resources = admission.current_resource_mask;
         for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
             if (!resources.has(static_cast<SubtaskSlot>(lane))) continue;
             auto &ack = releases ? mailbox->lanes[lane].released_seq : mailbox->lanes[lane].arrived_seq;
@@ -168,10 +153,8 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
         *failed = true;
         return false;
     }
-    bool ready_probe_empty = false;
     auto ack_prefilter_phase = SchedulerGmMixPhase::IDLE;
-    if (!scheduler_ordered_poll_may_progress(graph, base, local, &ready_probe_empty, &ack_prefilter_phase))
-        return false;
+    if (!scheduler_ordered_poll_may_progress(graph, base, local, &ack_prefilter_phase)) return false;
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) {
         *failed = true;
         return false;
@@ -183,72 +166,6 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
         return false;
     }
     bool progress = had_pending && published == SchedulerAdmissionResult::PROGRESS;
-    bool holds_ordinary = false;
-    for (const auto &candidate : admission->candidates) {
-        if (scheduler_task_ref_is_null(candidate.ready.task_ref)) continue;
-        const uint8_t flags = scheduler_task_metadata_at(base, local, candidate.ready.task_ref)->flags;
-        if (!scheduler_task_is_inline(flags) && !scheduler_task_requires_admission(flags)) {
-            holds_ordinary = true;
-            break;
-        }
-    }
-    // Discovery is bounded by candidate credits, not by physical slot capacity.
-    // A later cooperative task may be admitted while an earlier one is in flight.
-    // A concurrent Ready publication may wait for the next finite poll. The
-    // hint grants no ownership or entry permit and never survives this fill.
-    for (uint32_t index = 0;
-         !ready_probe_empty && index < SCHEDULER_PENDING_SLOT_COUNT && published != SchedulerAdmissionResult::RETRY;
-         ++index) {
-        auto &candidate = admission->candidates[index];
-        if (scheduler_task_ref_is_null(candidate.ready.task_ref)) {
-            // Existing cooperative candidates progress while ordinary work is held privately.
-            if (holds_ordinary) continue;
-            candidate = {};
-            const uint64_t probe_start = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
-            if (!scheduler_claim_ready_for_slot(
-                    graph, base, local, run, local->config.self_core_type, &candidate.ready
-                )) {
-                *failed = true;
-                return progress;
-            }
-            if (scheduler_task_ref_is_null(candidate.ready.task_ref)) continue;
-            candidate.ready.state_probe_start_cycles = probe_start;
-            candidate.ready.state_probe_end_cycles =
-                scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
-            progress = true;
-        }
-        const uint8_t flags = scheduler_task_metadata_at(base, local, candidate.ready.task_ref)->flags;
-        if (scheduler_task_is_inline(flags)) {
-            const int64_t task_ref = candidate.ready.task_ref;
-            candidate = {};
-            if (!scheduler_complete_inline_task(graph, base, local, run, task_ref, profiling_level)) {
-                *failed = true;
-                return progress;
-            }
-            progress = true;
-            continue;
-        }
-        if (!scheduler_task_requires_admission(flags)) {
-            holds_ordinary = true;
-            continue;
-        }
-        if (candidate.slot_index != UINT8_MAX ||
-            scheduler_try_claim_admission(graph, base, local, run, admission, candidate.ready) !=
-                SchedulerAdmissionResult::PROGRESS) {
-            scheduler_admission_fail(
-                graph, local, run, candidate.ready.task_ref, SchedulerErrorSite::ORDERED_CANDIDATE_INVALID
-            );
-            *failed = true;
-            return progress;
-        }
-        candidate = {};
-        published = scheduler_ordered_publish_pending<RecordProtocol>(graph, base, local, run);
-        if (published == SchedulerAdmissionResult::ERROR) {
-            *failed = true;
-            return progress;
-        }
-        progress = true;
-    }
     // Discovery and completion service regain control after at most two
     // closed obligations; no member waits for a peer inside this pass.
     for (uint32_t step = 0; step < SCHEDULER_PENDING_SLOT_COUNT; ++step) {
@@ -276,15 +193,21 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
             if (scheduler_task_ref_is_null(admission->current_task_ref)) continue;
             return progress;
         }
-        for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT && local->local_ready_mask == 0; ++index) {
-            if (local->slots[index].state != SchedulerDispatchSlotState::FREE) continue;
-            const auto claim_result = scheduler_claim_ordered_block<RecordProtocol>(graph, base, local, run, index);
-            if (claim_result == SchedulerBlockClaimResult::ERROR) {
-                *failed = true;
-                return progress;
-            }
-            if (claim_result != SchedulerBlockClaimResult::CLAIMED) break;
+        for (uint32_t index = 0;
+             index < SCHEDULER_PENDING_SLOT_COUNT && local->local_ready_mask == 0 && !scheduler_has_direct_slot(local);
+             ++index) {
             auto &slot = local->slots[index];
+            if (slot.state == SchedulerDispatchSlotState::FREE) {
+                const auto claim_result = scheduler_claim_ordered_block<RecordProtocol>(graph, base, local, run, index);
+                if (claim_result == SchedulerBlockClaimResult::ERROR) {
+                    *failed = true;
+                    return progress;
+                }
+                if (claim_result != SchedulerBlockClaimResult::CLAIMED) break;
+                progress = true;
+            } else if (slot.state != SchedulerDispatchSlotState::FILLING) {
+                continue;
+            }
             SchedulerReadyClaim ready{};
             ready.task_ref = slot.task_ref;
             ready.source = SchedulerReadySource::COOPERATIVE;
@@ -293,7 +216,9 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
                 *failed = true;
                 return progress;
             }
-            progress = true;
+            progress = progress || slot.state == SchedulerDispatchSlotState::READY;
+            if (scheduler_has_direct_slot(local)) return progress;
+            if (slot.state == SchedulerDispatchSlotState::FILLING) return progress;
         }
         bool closed = false;
         if (!scheduler_close_ordered_obligation<RecordProtocol>(graph, base, local, run, &closed)) {
@@ -302,43 +227,6 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
         }
         progress = progress || closed;
         if (!closed) return progress;
-    }
-    bool may_prepare = false;
-    for (uint32_t offset = 0; offset < SCHEDULER_PENDING_SLOT_COUNT; ++offset) {
-        const uint32_t candidate_index = (admission->next_candidate + offset) % SCHEDULER_PENDING_SLOT_COUNT;
-        auto &candidate = admission->candidates[candidate_index];
-        if (scheduler_task_ref_is_null(candidate.ready.task_ref) || candidate.slot_index != UINT8_MAX) continue;
-        // Completion can retain a direct successor after discovery. Inline
-        // services and cooperative successors still require that path.
-        const uint8_t flags = scheduler_task_metadata_at(base, local, candidate.ready.task_ref)->flags;
-        if (scheduler_task_is_inline(flags) || scheduler_task_requires_admission(flags)) continue;
-        for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
-            auto &slot = local->slots[index];
-            if (slot.state != SchedulerDispatchSlotState::FREE) continue;
-            // This decision covers preparation in this pass; each kernel entry rechecks admission.
-            if (!may_prepare) {
-                if (!scheduler_can_enter_ordinary(graph, base, local, run, admission, &may_prepare)) {
-                    *failed = true;
-                    return progress;
-                }
-                if (!may_prepare) return progress;
-            }
-            slot.candidate_index = static_cast<uint8_t>(candidate_index);
-            slot.args_observed = candidate.args_observed;
-            slot.predicate = candidate.predicate;
-            slot.state = SchedulerDispatchSlotState::FILLING;
-            candidate.ready.publication_mode = SchedulerPublicationMode::DISPATCH;
-            const SchedulerFreeSlotClaim claim{index};
-            if (!scheduler_fill_dispatch_slot(graph, base, local, run, claim, candidate.ready, profiling_level)) {
-                *failed = true;
-                return progress;
-            }
-            candidate.slot_index = static_cast<uint8_t>(index);
-            candidate.args_observed = slot.args_observed;
-            candidate.predicate = slot.predicate;
-            progress = true;
-            break;
-        }
     }
     return progress;
 }
@@ -351,21 +239,23 @@ static inline __aicore__ bool scheduler_drain_ordered_exit(
     if (done == nullptr) return false;
     *done = false;
     if (local == nullptr) return false;
+    bool cluster_done = false;
+    if (!scheduler_cluster_mix_drain(graph, base, local, run, &cluster_done)) return false;
+    if (!cluster_done) return true;
     auto *admission = local->admission;
     if (admission == nullptr) {
         *done = true;
         return true;
     }
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return false;
-    if (!scheduler_task_ref_is_null(admission->pending_task_ref))
-        return scheduler_admission_fail(
-            graph, local, run, admission->pending_task_ref, SchedulerErrorSite::ORDERED_EXIT_IN_FLIGHT
-        );
-    for (const auto &candidate : admission->candidates)
-        if (!scheduler_task_ref_is_null(candidate.ready.task_ref))
-            return scheduler_admission_fail(
-                graph, local, run, candidate.ready.task_ref, SchedulerErrorSite::ORDERED_EXIT_IN_FLIGHT
-            );
+    if (!scheduler_task_ref_is_null(admission->pending_task_ref)) {
+        const int64_t task = admission->pending_task_ref;
+        if (!scheduler_task_ref_valid(graph, task) ||
+            scheduler_gm_fetch_add(scheduler_task_control_at(base, local, task)->admission_state, UINT64_C(0)) !=
+                static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED))
+            return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ORDERED_EXIT_IN_FLIGHT);
+        admission->pending_task_ref = SCHEDULER_TASK_REF_INVALID;
+    }
     for (const auto &slot : local->slots)
         if (slot.state != SchedulerDispatchSlotState::FREE)
             return scheduler_admission_fail(
@@ -418,65 +308,94 @@ static inline __aicore__ bool scheduler_drain_ordered_exit(
     return true;
 }
 
-// A ready probe is useful only when the corresponding work can be claimed,
-// so this must admit every slot scheduler_fill_own_slots would fill: rejecting
-// a fillable slot suppresses discovery and starves its work.
-inline __aicore__ bool scheduler_has_usable_slot(const SchedulerLocalState *local, uint32_t core_type) {
-    if (local->config.self_core_type != core_type) return false;
-    for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
-        if (local->own_slots()[slot].state == SchedulerDispatchSlotState::FREE) return true;
+// Discovery is independent of physical slot capacity and formal group acknowledgements.
+template <bool RecordProtocol = true>
+static inline __aicore__ bool scheduler_fill_cooperative_slots(
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    uint64_t profiling_level, bool *failed, uint32_t *direct_slot = nullptr
+) {
+    SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarFillCooperativeSlots, -1);
+    if (failed != nullptr) *failed = false;
+    if (direct_slot != nullptr) *direct_slot = UINT32_MAX;
+    if (local == nullptr) return false;
+    SchedulerDirectSlotScope direct_scope(local, direct_slot);
+    bool progress = false;
+    bool advanced = false;
+    if (!scheduler_cluster_mix_service(graph, base, local, run, profiling_level, &progress) ||
+        !scheduler_discover_cooperative_task(graph, base, local, run, &advanced)) {
+        if (failed != nullptr) *failed = true;
+        return progress;
     }
-    return false;
+    progress = progress || advanced;
+    if (!scheduler_cluster_mix_discover_next(graph, base, local, run, &advanced) ||
+        !scheduler_prepare_cluster_lane(base, local)) {
+        if (failed != nullptr) *failed = true;
+        return progress;
+    }
+    progress = progress || advanced;
+    if (!scheduler_cluster_mix_progress_pending(graph, base, local, run, &advanced)) {
+        if (failed != nullptr) *failed = true;
+        return progress;
+    }
+    progress = progress || advanced;
+    if (advanced) {
+        if (!scheduler_cluster_mix_service(graph, base, local, run, profiling_level, &advanced)) {
+            if (failed != nullptr) *failed = true;
+            return progress;
+        }
+        progress = progress || advanced;
+    }
+    const auto phase = local->cluster_mix.phase;
+    if (phase == SchedulerGmMixPhase::ARRIVED || phase == SchedulerGmMixPhase::RUNNING ||
+        (phase == SchedulerGmMixPhase::RELEASED && local->is_mix_coordinator()))
+        return progress;
+    if (local->admission != nullptr)
+        return scheduler_fill_ordered_slots<RecordProtocol>(graph, base, local, run, profiling_level, failed) ||
+               progress;
+    return progress;
 }
 
-// Claim only the next ordinary execution. Reserving another ready task behind
-// a running kernel can hide work needed by that kernel from every idle core.
-// Cooperative admission retains its separate slot/participant protocol.
-//
-// The return value reports whether this pass made progress; `failed` separately
-// reports an aborted pass.
 template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_fill_own_slots(
-    const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
-    __gm__ SchedulerRunControl *run_control, uint64_t profiling_level, bool *failed
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    uint64_t profiling_level, bool *failed, uint32_t *direct_slot = nullptr
 ) {
-    SchedulerScalarScope scalar_scope(scheduler, SchedPhaseKind::ScalarFillSlots, -1);
-    if (failed != nullptr) *failed = false;
-    if (scheduler == nullptr) return false;
-    if (scheduler->admission != nullptr)
-        return scheduler_fill_ordered_slots<RecordProtocol>(
-            graph, scheduler_state_base, scheduler, run_control, profiling_level, failed
-        );
-    if (scheduler->local_ready_mask != 0) return false;
-    const uint32_t core_type = scheduler->config.self_core_type;
-    if (!scheduler_has_usable_slot(scheduler, core_type)) return false;
-    uint64_t state_probe_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
-    bool progress = false;
-
-    for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
-        SchedulerLocalSlotState *local_slot = &scheduler->own_slots()[slot];
-        if (local_slot->state != SchedulerDispatchSlotState::FREE) continue;
-
-        SchedulerReadyClaim ready{};
-        if (!scheduler_claim_ready_for_slot(graph, scheduler_state_base, scheduler, run_control, core_type, &ready)) {
-            if (failed != nullptr) *failed = true;
+    SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarFillOwnSlots);
+    bool local_failed = false;
+    if (failed == nullptr) failed = &local_failed;
+    bool progress =
+        scheduler_fill_cooperative_slots<RecordProtocol>(graph, base, local, run, profiling_level, failed, direct_slot);
+    if (*failed || local == nullptr || local->local_ready_mask != 0 ||
+        (direct_slot != nullptr && *direct_slot != UINT32_MAX))
+        return progress;
+    uint32_t selected = UINT32_MAX;
+    bool advanced = false;
+    if (scheduler_cluster_mix_needs_service(local)) {
+        SchedulerDirectSlotScope direct_scope(local, direct_slot);
+        if (!scheduler_cluster_mix_service(graph, base, local, run, profiling_level, &advanced)) *failed = true;
+        return progress || advanced;
+    }
+    if (!scheduler_progress_execution_tokens(graph, base, local, run, profiling_level, &selected, &advanced)) {
+        *failed = true;
+        return progress;
+    }
+    progress = progress || advanced;
+    if (selected == UINT32_MAX) {
+        if (!scheduler_try_execution_continuation(graph, base, local, run, profiling_level, &advanced) ||
+            (!advanced && !scheduler_refill_execution_tokens(graph, base, local, run, profiling_level, &advanced))) {
+            *failed = true;
             return progress;
         }
-        // An unpublished head ends this discovery pass; other scheduler duties still progress.
-        if (scheduler_task_ref_is_null(ready.task_ref)) break;
-
-        ready.state_probe_start_cycles = state_probe_start_cycles;
-        ready.state_probe_end_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
-        const SchedulerFreeSlotClaim claim{slot};
-        local_slot->state = SchedulerDispatchSlotState::FILLING;
-        if (!scheduler_fill_dispatch_slot(
-                graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level
-            )) {
-            if (failed != nullptr) *failed = true;
+        progress = progress || advanced;
+        if (!scheduler_progress_execution_tokens(graph, base, local, run, profiling_level, &selected, &advanced)) {
+            *failed = true;
             return progress;
         }
-        progress = true;
-        break;
+        progress = progress || advanced;
+    }
+    if (selected != UINT32_MAX) {
+        if (direct_slot != nullptr) *direct_slot = selected;
+        else scheduler_local_ready_publish(local, selected);
     }
     return progress;
 }

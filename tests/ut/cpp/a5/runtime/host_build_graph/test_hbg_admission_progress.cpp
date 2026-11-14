@@ -19,39 +19,46 @@ using namespace pto2::resident;
 using namespace scheduler_test::gm_mix;
 
 TEST(HbgAdmissionProgress, DeferredPredecessorLeavesIndependentCounterPublisherRunnable) {
-    {
+    constexpr uint32_t successor_count = SCHEDULER_EXECUTION_TOKEN_COUNT + 1;
+    constexpr uint32_t publisher = successor_count + 1;
+    constexpr uint32_t task_count = publisher + 1;
+    for (const bool sync_successors : {false, true}) {
+        SCOPED_TRACE(sync_successors ? "sync successors" : "ordinary successors");
+        std::vector<GmShape> shapes(task_count, {2, LaneMask::aiv0(), sync_successors});
+        shapes[0].sync_start = true;
+        shapes[publisher] = {1, LaneMask::aiv0()};
         AsyncCompletionHostPlan plan;
-        GmMixFixture fixture(
-            {{2, LaneMask::aiv0()}, {2, LaneMask::aiv0()}, {1, LaneMask::aiv0()}}, false, 1,
-            [&](AicoreSchedulerLayout &layout) {
-                AsyncTaskPlanInput input;
-                input.task_ref = 0;
-                input.block_count = 2;
-                input.active_mask = LaneMask::aiv0();
-                std::string error;
-                EXPECT_TRUE(plan_async_completion(layout.total_size, 47, 3, {input}, &plan, &error)) << error;
-                layout.total_size = plan.total_bytes;
-                layout.async_layout_offset = plan.layout_offset;
-            }
-        );
+        GmMixFixture fixture(shapes, false, 1, [&](AicoreSchedulerLayout &layout) {
+            AsyncTaskPlanInput input;
+            input.task_ref = 0;
+            input.block_count = 2;
+            input.active_mask = LaneMask::aiv0();
+            std::string error;
+            EXPECT_TRUE(plan_async_completion(layout.total_size, 47, task_count, {input}, &plan, &error)) << error;
+            layout.total_size = plan.total_bytes;
+            layout.async_layout_offset = plan.layout_offset;
+        });
         ASSERT_TRUE(initialize_async_completion(fixture.base(), fixture.storage.layout.total_size, plan));
+        scheduler_state_at<SchedulerAsyncLayout>(fixture.base(), plan.layout_offset)->image_bytes =
+            fixture.storage.layout.total_size;
         std::array<SchedulerAsyncLocalState, 3> async_workers{};
         for (uint32_t worker = 0; worker < async_workers.size(); ++worker) {
             ASSERT_TRUE(scheduler_initialize_async(
-                fixture.base(), plan.total_bytes, plan.layout_offset, 47, 3, async_workers[worker]
+                fixture.base(), fixture.storage.layout.total_size, plan.layout_offset, 47, task_count,
+                fixture.storage.layout.task_controls_offset, async_workers[worker]
             ));
             fixture.locals[worker]->async = &async_workers[worker];
         }
 
-        // A -> B is the only DAG edge. A's COUNTER is published by independent P.
-        fixture.graph.executable(1, 1, {0});
-        fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
+        // Every B depends on W; independent P publishes W's COUNTER and is
+        // beyond a full candidate window in the immutable AIV catalog.
+        for (uint32_t task = 1; task <= successor_count; ++task) {
+            fixture.graph.executable(task, 1, {0});
+            fixture.storage.metadata[task].flags |= SCHEDULER_TASK_HAS_FANIN;
+        }
         ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
         ASSERT_TRUE(fixture.bootstrap_admission());
-        ASSERT_EQ(
-            scheduler_route_task(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 1),
-            SchedulerRouteResult::WAITING
-        );
+        ASSERT_NE(fixture.locals[1]->admission, nullptr);
         ASSERT_TRUE(fixture.claim_pending(0, 1));
         ASSERT_EQ(
             scheduler_ordered_publish_pending(fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run()),
@@ -83,26 +90,93 @@ TEST(HbgAdmissionProgress, DeferredPredecessorLeavesIndependentCounterPublisherR
             );
             ASSERT_TRUE(fixture.complete(execution));
         }
-        ASSERT_NE(fixture.control(0)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
-        EXPECT_EQ(fixture.control(1)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED));
-        ASSERT_TRUE(fixture.enqueue(2, 1));
+        ASSERT_NE(
+            scheduler_completion_task_state(fixture.control(0)->completion_state),
+            static_cast<int64_t>(SchedulerTaskState::DONE)
+        );
+        // Ordinary consumers hold actual execution tickets while the independent
+        // publisher remains beyond their finite local token window.
+        for (uint32_t worker = 1; worker < 3; ++worker) {
+            auto *local = fixture.locals[worker];
+            local->execution_scan_cursor = 1;
+            for (uint32_t index = 0; index < SCHEDULER_EXECUTION_TOKEN_COUNT; ++index) {
+                const uint32_t task = index + 1;
+                if (sync_successors) continue;
+                auto &token = local->execution_tokens[index];
+                const uint64_t block = scheduler_gm_fetch_add(fixture.control(task)->next_block, UINT64_C(1));
+                ASSERT_LT(block, 2u);
+                token.task_ref = task;
+                token.block_idx = static_cast<uint32_t>(block);
+                token.subtask_slot = 1;
+                token.phase = SchedulerExecutionTokenPhase::TICKETED;
+                ASSERT_EQ(
+                    scheduler_node_fanin_view(fixture.graph.graph(), task, &token.fanin), SchedulerGraphResult::OK
+                );
+                ASSERT_TRUE(scheduler_execution_token_receive(
+                    fixture.graph.graph(), fixture.base(), local, fixture.run(), token, 0
+                ));
+            }
+            EXPECT_EQ(scheduler_execution_token_count(local), sync_successors ? 0u : SCHEDULER_EXECUTION_TOKEN_COUNT);
+            EXPECT_EQ(local->local_ready_mask, 0u);
+            for (const auto &slot : local->slots)
+                EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FREE);
+        }
+        for (uint32_t task = 1; task <= successor_count; ++task) {
+            EXPECT_FALSE(scheduler_completion_done(fixture.control(task)->completion_state));
+            if (sync_successors) {
+                EXPECT_EQ(fixture.control(task)->next_block, 0u);
+                EXPECT_EQ(
+                    fixture.control(task)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED)
+                );
+            }
+            for (uint32_t block = 0; block < 2; ++block) {
+                uint64_t index = UINT64_MAX;
+                ASSERT_TRUE(scheduler_prepared_execution_index(
+                    fixture.base(), fixture.locals[1]->config.prepared, task, block, 1, &index
+                ));
+                EXPECT_NE(
+                    scheduler_prepared_call_at(fixture.base(), fixture.locals[1]->config.prepared, index)
+                        ->function_bin_addr,
+                    0u
+                );
+            }
+        }
+        EXPECT_EQ(shared->commit_tail, 1u);
 
         uint32_t publishers = 0;
-        uint32_t successors = 0;
-        // B must not reserve either AIV while A is waiting for P's COUNTER.
-        for (uint32_t step = 0; step < 24; ++step) {
+        std::set<std::pair<int64_t, uint32_t>> successors;
+        // B must not reserve either AIV while W is waiting for P's COUNTER.
+        for (uint32_t step = 0; step < task_count * 16; ++step) {
             for (uint32_t worker = 0; worker < 3; ++worker) {
                 ASSERT_TRUE(fixture.fill(worker));
                 GmExecution execution{};
                 if (fixture.begin(worker, &execution)) {
-                    if (execution.task == 2) {
+                    if (execution.task == publisher) {
+                        for (uint32_t task = 1; task <= successor_count; ++task) {
+                            EXPECT_FALSE(scheduler_completion_done(fixture.control(task)->completion_state));
+                            if (sync_successors) {
+                                EXPECT_EQ(fixture.control(task)->next_block, 0u);
+                                EXPECT_EQ(
+                                    fixture.control(task)->admission_state,
+                                    static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED)
+                                );
+                            }
+                        }
+                        for (const auto *local : fixture.locals)
+                            for (const auto &slot : local->slots)
+                                if (slot.state != SchedulerDispatchSlotState::FREE) EXPECT_EQ(slot.task_ref, publisher);
                         ++publishers;
-                        signal = 1;
+                        __atomic_store_n(&signal, 1u, __ATOMIC_RELEASE);
                     } else {
-                        ASSERT_EQ(execution.task, 1);
-                        ++successors;
+                        ASSERT_GE(execution.task, 1);
+                        ASSERT_LE(execution.task, successor_count);
+                        EXPECT_LT(execution.block, 2u);
+                        EXPECT_TRUE(successors.emplace(execution.task, execution.block).second);
                         EXPECT_EQ(signal, 1u);
-                        EXPECT_EQ(fixture.control(0)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+                        EXPECT_EQ(
+                            scheduler_completion_task_state(fixture.control(0)->completion_state),
+                            static_cast<int64_t>(SchedulerTaskState::DONE)
+                        );
                     }
                     ASSERT_TRUE(fixture.complete(execution));
                 }
@@ -117,10 +191,13 @@ TEST(HbgAdmissionProgress, DeferredPredecessorLeavesIndependentCounterPublisherR
             }
         }
         EXPECT_EQ(publishers, 1u);
-        EXPECT_EQ(successors, 2u);
+        EXPECT_EQ(successors.size(), successor_count * 2);
         EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
-        for (uint64_t task = 0; task < 3; ++task)
-            EXPECT_EQ(fixture.control(task)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+        for (uint64_t task = 0; task < task_count; ++task)
+            EXPECT_EQ(
+                scheduler_completion_task_state(fixture.control(task)->completion_state),
+                static_cast<int64_t>(SchedulerTaskState::DONE)
+            );
         for (uint32_t worker = 0; worker < 3; ++worker) {
             bool done = false;
             ASSERT_TRUE(fixture.drain(worker, &done));

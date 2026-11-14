@@ -19,7 +19,7 @@
 #include "scheduler_types.h"
 
 inline constexpr uint32_t SCHEDULER_NATIVE_GRAPH_MAGIC = 0x35474248;
-inline constexpr uint32_t SCHEDULER_NATIVE_GRAPH_VERSION = 2;
+inline constexpr uint32_t SCHEDULER_NATIVE_GRAPH_VERSION = 3;
 inline constexpr uint32_t SCHEDULER_NATIVE_NO_INSTANCE = UINT32_MAX;
 inline constexpr uint64_t SCHEDULER_NATIVE_NO_PREDICATE = UINT64_MAX;
 
@@ -52,8 +52,6 @@ struct alignas(64) SchedulerNativeGraphHeader {
     uint64_t completion_refs_offset;
     uint64_t templates_offset;
     uint64_t instances_offset;
-    uint64_t control_inboxes_offset;
-    uint64_t control_inbox_count;
     uint64_t readonly_end_offset;
     uint64_t run_epoch;
     uint32_t header_bytes;
@@ -107,7 +105,7 @@ static_assert(std::is_standard_layout_v<SchedulerNodeBinding> && std::is_trivial
 static_assert(sizeof(SchedulerNativeGraphHeader) == 128);
 static_assert(offsetof(SchedulerNativeGraphHeader, image_bytes) == 8);
 static_assert(offsetof(SchedulerNativeGraphHeader, bindings_offset) == 48);
-static_assert(offsetof(SchedulerNativeGraphHeader, readonly_end_offset) == 96);
+static_assert(offsetof(SchedulerNativeGraphHeader, readonly_end_offset) == 80);
 static_assert(
     std::is_standard_layout_v<SchedulerNativeGraphHeader> && std::is_trivially_copyable_v<SchedulerNativeGraphHeader>
 );

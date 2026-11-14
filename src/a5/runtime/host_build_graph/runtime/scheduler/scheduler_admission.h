@@ -34,7 +34,9 @@ scheduler_initialize_admission(__gm__ void *base, const SchedulerLocalState *loc
     const uint64_t workers = local->config.runtime_worker_count;
     const uint64_t clusters = local->config.cluster_count;
     if (summary->cooperative_task_count > local->config.graph->task_count ||
-        summary->mix_task_count > summary->cooperative_task_count)
+        summary->mix_task_count > local->config.graph->task_count ||
+        summary->sync_mix_task_count > summary->cooperative_task_count ||
+        summary->sync_mix_task_count > summary->mix_task_count)
         return false;
     SchedulerAdmissionLocalState next{};
     next.epoch = summary->run_epoch;
@@ -43,10 +45,8 @@ scheduler_initialize_admission(__gm__ void *base, const SchedulerLocalState *loc
     next.record_stride = summary->admission_record_stride;
     next.log_offset = summary->admission_log_offset;
     next.capacity = summary->cooperative_task_count;
-    next.member_word_count = summary->admission_member_word_count;
     if (next.capacity == 0) {
-        if (next.control_offset != 0 || next.records_offset != 0 || next.record_stride != 0 || next.log_offset != 0 ||
-            next.member_word_count != 0)
+        if (next.control_offset != 0 || next.records_offset != 0 || next.record_stride != 0 || next.log_offset != 0)
             return false;
     } else {
         uint64_t control_end = 0;
@@ -55,11 +55,10 @@ scheduler_initialize_admission(__gm__ void *base, const SchedulerLocalState *loc
         if (workers == 0 || workers > SCHEDULER_WORKER_CAPACITY || clusters == 0 ||
             workers != clusters * PLATFORM_CORES_PER_BLOCKDIM || summary->worker_count != workers ||
             summary->cluster_count != clusters || local->config.graph->task_count > static_cast<uint64_t>(INT32_MAX) ||
-            next.member_word_count != (workers + 63) / 64 || next.control_offset == 0 || next.records_offset == 0 ||
-            next.log_offset == 0 ||
+            next.control_offset == 0 || next.records_offset == 0 || next.log_offset == 0 ||
             ((next.control_offset | next.records_offset | next.log_offset | next.record_stride) &
              (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
-            next.record_stride < sizeof(SchedulerAdmissionRecord) + next.member_word_count * sizeof(uint64_t) ||
+            next.record_stride != sizeof(SchedulerAdmissionRecord) ||
             !scheduler_admission_range_end(next.control_offset, 1, sizeof(SchedulerAdmissionControl), &control_end) ||
             !scheduler_admission_range_end(
                 next.records_offset, local->config.graph->task_count, next.record_stride, &records_end
@@ -69,13 +68,13 @@ scheduler_initialize_admission(__gm__ void *base, const SchedulerLocalState *loc
             log_end > UINT64_MAX - reinterpret_cast<uintptr_t>(base))
             return false;
     }
-    if (summary->mix_task_count != 0) {
+    if (summary->sync_mix_task_count != 0) {
         uint64_t mailbox_end = 0;
         uint64_t seals_end = 0;
         if (local->config.shared_context == nullptr) return false;
         const uint64_t cluster = local->config.shared_context->cluster_index;
         if (cluster >= clusters || summary->group_mailboxes_offset == 0 ||
-            (summary->group_mailboxes_offset & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
+            (summary->group_mailboxes_offset & (alignof(SchedulerGroupMailbox) - 1)) != 0 ||
             (summary->mix_close_seals_offset & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
             summary->group_mailboxes_offset < next.log_offset + next.capacity * sizeof(int64_t) ||
             !scheduler_admission_range_end(
@@ -83,7 +82,7 @@ scheduler_initialize_admission(__gm__ void *base, const SchedulerLocalState *loc
             ) ||
             mailbox_end > summary->mix_close_seals_offset ||
             !scheduler_admission_range_end(
-                summary->mix_close_seals_offset, summary->mix_task_count * clusters, sizeof(SchedulerMixCloseSeal),
+                summary->mix_close_seals_offset, summary->sync_mix_task_count * clusters, sizeof(SchedulerMixCloseSeal),
                 &seals_end
             ) ||
             seals_end > UINT64_MAX - reinterpret_cast<uintptr_t>(base))
@@ -104,13 +103,7 @@ scheduler_initialize_admission(__gm__ void *base, const SchedulerLocalState *loc
             local->config.worker_ids[0] != cluster || local->config.worker_ids[1] != clusters + 2 * cluster ||
             local->config.worker_ids[2] != clusters + 2 * cluster + 1)
             return false;
-        // Discovery proved the compact launch layout before READY. Populate
-        // this run's private cache here, without a peer scan in the hot loop.
-        for (uint64_t cube = 0; cube < clusters; ++cube) {
-            next.topology_cube_words[cube / 64] |= UINT64_C(1) << (cube % 64);
-            const uint64_t vector0 = clusters + 2 * cube;
-            next.topology_vector0_words[vector0 / 64] |= UINT64_C(1) << (vector0 % 64);
-        }
+        // Discovery validated this compact topology before READY.
         next.topology_worker_count = workers;
     }
     if (!scheduler_protocol_bind(base, local)) return false;
@@ -185,12 +178,7 @@ static inline __aicore__ bool scheduler_admission_static_record_valid(
         (scheduler_task_requires_sync_start(meta.flags) && meta.logical_block_num == 1) || meta.timing_slot < -1 ||
         meta.timing_slot >= SCHEDULER_TASK_TIMING_SLOT_COUNT || record->task_ref != task_ref ||
         record->logical_block_num != meta.logical_block_num ||
-        scheduler_lane_mask_load(record->active_mask) != meta.active_mask || record->flags != meta.flags ||
-        ((scheduler_task_is_mix(meta.flags) || scheduler_task_requires_sync_start(meta.flags)) &&
-         record->member_rank_offset != 0) ||
-        record->member_words_offset != admission->records_offset +
-                                           static_cast<uint64_t>(task_ref) * admission->record_stride +
-                                           sizeof(SchedulerAdmissionRecord))
+        scheduler_lane_mask_load(record->active_mask) != meta.active_mask || record->flags != meta.flags)
         return false;
     if (!scheduler_task_is_mix(meta.flags)) return record->mix_close_seals_offset == 0;
     const auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, local->config.graph_summary_offset);
@@ -199,123 +187,107 @@ static inline __aicore__ bool scheduler_admission_static_record_valid(
         record->mix_close_seals_offset < summary->mix_close_seals_offset)
         return false;
     const uint64_t delta = record->mix_close_seals_offset - summary->mix_close_seals_offset;
-    return delta % row_bytes == 0 && delta / row_bytes < summary->mix_task_count;
+    return delta % row_bytes == 0 && delta / row_bytes < summary->sync_mix_task_count;
 }
 
-// Contexts are the READY-published topology. A bitmap bit is a compact worker
-// index, never a physical core ID, a type rank, or an assumed interleaved lane.
-// Validate the frozen topology once per local run, not once per published task.
-static inline __aicore__ bool scheduler_admission_expected_members(
-    __gm__ void *base, SchedulerLocalState *local, SchedulerAdmissionLocalState *admission,
-    __gm__ const SchedulerAdmissionRecord *record, uint64_t *words, uint32_t *member_count
+// GENERAL worker IDs need not encode a role. Validate the complete frozen
+// topology once, then use the run-entry-validated local lane and core type.
+static inline __aicore__ bool scheduler_admission_validate_topology(
+    __gm__ void *base, SchedulerLocalState *local, SchedulerAdmissionLocalState *admission
 ) {
     const uint64_t workers = local->config.runtime_worker_count;
     const uint64_t cubes = local->config.cluster_count;
     if (workers == 0 || workers > SCHEDULER_WORKER_CAPACITY || cubes == 0 ||
-        workers != cubes * PLATFORM_CORES_PER_BLOCKDIM || admission->member_word_count != (workers + 63) / 64)
+        workers != cubes * PLATFORM_CORES_PER_BLOCKDIM)
         return false;
-    if (admission->topology_worker_count == 0) {
-        uint64_t cube_words[(SCHEDULER_WORKER_CAPACITY + 63) / 64]{};
-        uint64_t vector_words[2][(SCHEDULER_WORKER_CAPACITY + 63) / 64]{};
-        uint64_t observed_cubes = 0;
-        for (uint64_t worker = 0; worker < workers; ++worker) {
-            auto *context = scheduler_worker_context_at(base, local, worker);
-            scheduler_observe_cache_line(context);
-            const int32_t type = context->core_type;
-            if (context->worker_index != worker ||
-                (type != static_cast<int32_t>(CoreType::AIC) && type != static_cast<int32_t>(CoreType::AIV)))
-                return false;
-            if (type == static_cast<int32_t>(CoreType::AIC)) {
-                ++observed_cubes;
-                cube_words[worker / 64] |= UINT64_C(1) << (worker % 64);
-                scheduler_invalidate_cache_line(&context->cluster_worker_ids[0]);
-                scheduler_invalidate_cache_line(&context->cluster_worker_ids[2]);
+    if (admission->topology_worker_count != 0) return admission->topology_worker_count == workers;
+    uint64_t cube_words[(SCHEDULER_WORKER_CAPACITY + 63) / 64]{};
+    uint64_t vector_words[2][(SCHEDULER_WORKER_CAPACITY + 63) / 64]{};
+    uint64_t observed_cubes = 0;
+    for (uint64_t worker = 0; worker < workers; ++worker) {
+        auto *context = scheduler_worker_context_at(base, local, worker);
+        scheduler_observe_cache_line(context);
+        const int32_t type = context->core_type;
+        if (context->worker_index != worker ||
+            (type != static_cast<int32_t>(CoreType::AIC) && type != static_cast<int32_t>(CoreType::AIV)))
+            return false;
+        if (type == static_cast<int32_t>(CoreType::AIC)) {
+            ++observed_cubes;
+            cube_words[worker / 64] |= UINT64_C(1) << (worker % 64);
+            scheduler_invalidate_cache_line(&context->cluster_index);
+            scheduler_invalidate_cache_line(&context->cluster_worker_ids[0]);
+            scheduler_invalidate_cache_line(&context->cluster_worker_ids[2]);
+            scheduler_cache_barrier();
+            if (context->cluster_index >= cubes || context->cluster_worker_ids[0] != worker) return false;
+            for (uint32_t lane = 1; lane < 3; ++lane) {
+                const uint64_t peer = context->cluster_worker_ids[lane];
+                if (peer >= workers || peer == worker) return false;
+                auto *peer_context = scheduler_worker_context_at(base, local, peer);
+                scheduler_invalidate_cache_line(peer_context);
+                scheduler_invalidate_cache_line(&peer_context->cluster_index);
+                scheduler_invalidate_cache_line(&peer_context->cluster_worker_ids[0]);
+                scheduler_invalidate_cache_line(&peer_context->cluster_worker_ids[2]);
                 scheduler_cache_barrier();
-                if (context->cluster_worker_ids[0] != worker) return false;
-                for (uint32_t lane = 1; lane < 3; ++lane) {
-                    const uint64_t peer = context->cluster_worker_ids[lane];
-                    if (peer >= workers || peer == worker) return false;
-                    const uint64_t bit = UINT64_C(1) << (peer % 64);
-                    if (((vector_words[0][peer / 64] | vector_words[1][peer / 64]) & bit) != 0) return false;
-                    vector_words[lane - 1][peer / 64] |= bit;
-                }
+                if (peer_context->worker_index != peer ||
+                    peer_context->core_type != static_cast<int32_t>(CoreType::AIV) ||
+                    peer_context->cluster_index != context->cluster_index)
+                    return false;
+                for (uint32_t member_lane = 0; member_lane < PLATFORM_CORES_PER_BLOCKDIM; ++member_lane)
+                    if (peer_context->cluster_worker_ids[member_lane] != context->cluster_worker_ids[member_lane])
+                        return false;
+                const uint64_t bit = UINT64_C(1) << (peer % 64);
+                if (((vector_words[0][peer / 64] | vector_words[1][peer / 64]) & bit) != 0) return false;
+                vector_words[lane - 1][peer / 64] |= bit;
             }
         }
-        if (observed_cubes != cubes) return false;
-        for (uint64_t word = 0; word < admission->member_word_count; ++word) {
-            const uint64_t remaining = workers - word * 64;
-            const uint64_t valid = remaining >= 64 ? UINT64_MAX : (UINT64_C(1) << remaining) - 1;
-            const uint64_t vectors = vector_words[0][word] | vector_words[1][word];
-            if ((vectors & cube_words[word]) != 0 || (vectors | cube_words[word]) != valid) return false;
-        }
-        for (uint64_t word = 0; word < admission->member_word_count; ++word) {
-            admission->topology_cube_words[word] = cube_words[word];
-            admission->topology_vector0_words[word] = vector_words[0][word];
-        }
-        admission->topology_worker_count = workers;
-    } else if (admission->topology_worker_count != workers) {
-        return false;
     }
-    const bool mix = scheduler_task_is_mix(record->flags);
-    const bool cube_task = scheduler_lane_mask_load(record->active_mask).has_aic();
-    for (uint64_t word = 0; word < admission->member_word_count; ++word) {
+    if (observed_cubes != cubes) return false;
+    const uint64_t words = (workers + 63) / 64;
+    for (uint64_t word = 0; word < words; ++word) {
         const uint64_t remaining = workers - word * 64;
         const uint64_t valid = remaining >= 64 ? UINT64_MAX : (UINT64_C(1) << remaining) - 1;
-        const uint64_t cube_word = admission->topology_cube_words[word];
-        if (mix) {
-            const LaneMask resources = scheduler_mix_resource_mask(scheduler_lane_mask_load(record->active_mask));
-            words[word] |= cube_word;
-            if (resources.has_aiv0()) words[word] |= admission->topology_vector0_words[word];
-            if (resources.has_aiv1()) words[word] |= valid & ~(cube_word | admission->topology_vector0_words[word]);
-        } else {
-            words[word] |= cube_task ? cube_word : (valid & ~cube_word);
-        }
+        const uint64_t vectors = vector_words[0][word] | vector_words[1][word];
+        if ((vectors & cube_words[word]) != 0 || (vectors | cube_words[word]) != valid) return false;
     }
-    *member_count = static_cast<uint32_t>(
-        mix ? cubes * scheduler_mix_resource_mask(scheduler_lane_mask_load(record->active_mask)).count() :
-              (cube_task ? cubes : workers - cubes)
-    );
-    // Ordinary SPMD uses a cyclic interval of type ranks, at most one rank
-    // per block. Its Host-planned prefix counts only this resource type's
-    // ordinary SPMD blocks; Mix and sync-start do not consume that prefix.
-    if (!mix && scheduler_task_is_spmd(record->flags) && !scheduler_task_requires_sync_start(record->flags) &&
-        record->logical_block_num < *member_count) {
-        const uint32_t count = *member_count;
-        const uint32_t limit = record->logical_block_num;
-        const uint32_t begin = static_cast<uint32_t>(record->member_rank_offset % count);
-        const uint32_t end = begin + limit;
-        uint32_t rank = 0;
-        for (uint64_t word = 0; word < admission->member_word_count; ++word) {
-            uint64_t available = words[word];
-            words[word] = 0;
-            while (available != 0) {
-                const uint64_t bit = available & (UINT64_C(0) - available);
-                if ((rank >= begin && rank < end) || (end > count && rank < end - count)) words[word] |= bit;
-                available ^= bit;
-                ++rank;
-            }
-        }
-        *member_count = limit;
-    }
+    admission->topology_worker_count = workers;
+    return true;
+}
+
+static inline __aicore__ bool scheduler_admission_member_count(
+    const SchedulerLocalState *local, const __gm__ SchedulerAdmissionRecord *record, uint32_t *member_count
+) {
+    const uint32_t cubes = local->config.cluster_count;
+    const LaneMask lanes = scheduler_lane_mask_load(record->active_mask);
+    const bool mix = scheduler_task_is_mix(record->flags);
+    *member_count = mix ? cubes * scheduler_mix_resource_mask(lanes).count() :
+                          cubes * (lanes.has_aic() ? 1U : PLATFORM_AIV_CORES_PER_BLOCKDIM);
     const uint32_t positions = mix ? cubes : *member_count;
     return *member_count != 0 &&
            (!scheduler_task_requires_sync_start(record->flags) || record->logical_block_num <= positions);
 }
 
-// The caller uniquely owns the valid candidate through ready pop or direct
-// resolve and has classified its immutable flags as requiring admission.
-// The admission object is initialized with nonzero capacity by run entry.
-// Only PROGRESS transfers it into pending; RETRY leaves ownership with the caller.
-static inline __aicore__ SchedulerAdmissionResult scheduler_try_claim_admission(
+inline __aicore__ bool
+scheduler_admission_is_member(const SchedulerLocalState *local, const __gm__ SchedulerAdmissionRecord *record) {
+    const LaneMask lanes = scheduler_lane_mask_load(record->active_mask);
+    return scheduler_task_is_mix(record->flags) ?
+               scheduler_mix_resource_mask(lanes).has(static_cast<SubtaskSlot>(local->config.self_lane)) :
+               local->config.self_core_type == (lanes.has_aic() ? 0U : 1U);
+}
+
+// Pending names a local ready observation. Only commit_lock grants publication ownership.
+static inline __aicore__ SchedulerAdmissionResult scheduler_stage_admission_candidate(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    SchedulerAdmissionLocalState *admission, const SchedulerReadyClaim &candidate
+    SchedulerAdmissionLocalState *admission, int64_t task_ref
 ) {
-    SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarAdmissionClaim, candidate.task_ref);
+    SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarAdmissionClaim, task_ref);
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return SchedulerAdmissionResult::ERROR;
     if (admission->pending_task_ref != SCHEDULER_TASK_REF_INVALID) return SchedulerAdmissionResult::RETRY;
-    // Ready pop/direct resolve already transferred unique ownership. Bootstrap
-    // published the immutable admission record before this candidate was visible.
-    admission->pending_task_ref = candidate.task_ref;
+    if (admission->capacity == 0 || !scheduler_task_ref_valid(graph, task_ref) ||
+        !scheduler_task_requires_admission(scheduler_task_metadata_at(base, local, task_ref)->flags)) {
+        scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::ADMISSION_INVALID_STATE);
+        return SchedulerAdmissionResult::ERROR;
+    }
+    admission->pending_task_ref = task_ref;
     return SchedulerAdmissionResult::PROGRESS;
 }
 
@@ -336,38 +308,31 @@ static inline __aicore__ bool scheduler_bootstrap_prepare_admission(
         scheduler_gm_query(control->claim_seal) != 0 ||
         scheduler_gm_fetch_add(control->claim_tickets, UINT64_C(0)) != 0 ||
         scheduler_gm_fetch_add(control->next_block, UINT64_C(0)) != 0 ||
-        scheduler_completion_progress(scheduler_gm_fetch_add(control->completion_state, UINT64_C(0))) != 0)
+        scheduler_gm_fetch_add(control->completion_state, UINT64_C(0)) !=
+            scheduler_completion_initial_state(
+                scheduler_task_metadata_at(base, local, task)->logical_block_num *
+                scheduler_task_lanes(*scheduler_task_metadata_at(base, local, task)).count()
+            ))
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
     auto *record = scheduler_admission_record_at(base, admission, task);
     scheduler_observe_cache_line(record);
     if (!scheduler_admission_static_record_valid(base, local, admission, task, record) ||
         record->order_key != UINT64_MAX || record->member_count != 0 || record->run_epoch != 0)
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_RECORD);
-    auto *words = scheduler_state_at<uint64_t>(base, record->member_words_offset);
-    scheduler_observe_cache_line(words);
-    for (uint64_t word = 0; word < admission->member_word_count; ++word)
-        if (words[word] != 0)
-            return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_RECORD);
-    uint64_t expected[(SCHEDULER_WORKER_CAPACITY + 63) / 64]{};
     uint32_t members = 0;
-    if (!scheduler_admission_expected_members(base, local, admission, record, expected, &members))
+    if (!scheduler_admission_validate_topology(base, local, admission) ||
+        !scheduler_admission_member_count(local, record, &members))
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_TOPOLOGY);
-    // Child arguments were published before the bootstrap scan gate opened.
-    // Each member observes them on first adoption of this record.
     record->run_epoch = admission->epoch;
     record->member_count = members;
-    for (uint64_t word = 0; word < admission->member_word_count; ++word)
-        words[word] = expected[word];
     scheduler_writeback_cache_line(record);
-    scheduler_writeback_cache_line(words);
     scheduler_cache_barrier();
-    scheduler_publish_signal(control->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED));
+    scheduler_gm_store(control->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED));
     return true;
 }
 
-// Ready ownership remains private until commit. The global lock serializes
-// different tasks' order assignment and rejects a duplicate candidate before it
-// can publish another log entry. Only this owner releases an acquired lock.
+// The lock serializes order assignment. Multiple local observations may name
+// one task; an already committed observation retires without a second log entry.
 template <bool RecordProtocol = true>
 static inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
@@ -389,11 +354,16 @@ static inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission
             return SchedulerAdmissionResult::ERROR;
         return SchedulerAdmissionResult::RETRY;
     }
-    const uint64_t tail = scheduler_gm_query(shared->commit_tail);
     bool valid = scheduler_admission_context_valid(graph, base, local, run, admission);
-    if (valid &&
-        scheduler_gm_query(control->admission_state) != static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED))
+    const uint64_t state = scheduler_gm_fetch_add(control->admission_state, UINT64_C(0));
+    if (valid && state == static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED)) {
+        admission->pending_task_ref = SCHEDULER_TASK_REF_INVALID;
+        scheduler_gm_store(shared->commit_lock, UINT64_C(0));
+        return SchedulerAdmissionResult::PROGRESS;
+    }
+    if (valid && state != static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED))
         valid = scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
+    const uint64_t tail = valid ? scheduler_gm_fetch_add(shared->commit_tail, UINT64_C(0)) : 0;
     if (valid) {
         scheduler_observe_cache_line(record);
         if (record->run_epoch != admission->epoch)
@@ -409,7 +379,7 @@ static inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission
         scheduler_publish_cache_line(record);
         auto *log = scheduler_state_at<int64_t>(base, admission->log_offset);
         scheduler_publish_signal(log[tail], task);
-        scheduler_publish_signal(control->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED));
+        scheduler_gm_store(control->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED));
         scheduler_cache_barrier();
         scheduler_publish_signal(shared->commit_tail, tail + 1);
         scheduler_cache_barrier();
@@ -426,14 +396,26 @@ static inline __aicore__ bool scheduler_read_claim_cursor(
     uint64_t *cursor, bool *used_seal = nullptr
 );
 
-inline __aicore__ void scheduler_retire_local_obligation(SchedulerAdmissionLocalState &admission) {
-    ++admission.scan_cursor;
+inline __aicore__ void scheduler_reset_current_task_cache(SchedulerAdmissionLocalState &admission) {
     admission.current_task_ref = SCHEDULER_TASK_REF_INVALID;
     admission.current_block_num = 0;
     admission.current_active_mask = LaneMask::none();
     admission.current_flags = 0;
+    admission.current_claim_positions = 0;
+    admission.current_claim_limit = 0;
+    admission.current_uses_ticket_claim = false;
+    admission.current_single_subtask = UINT8_MAX;
+    admission.current_resource_mask = LaneMask::none();
+    admission.current_mix_close_seal_offset = 0;
     admission.sync_claimed = false;
     admission.ticket_exhausted = false;
+}
+
+inline __aicore__ void
+scheduler_retire_local_obligation(SchedulerLocalState *local, SchedulerAdmissionLocalState &admission) {
+    ++admission.scan_cursor;
+    scheduler_reset_current_task_cache(admission);
+    scheduler_cluster_advance_sync(local->cluster_signal, local->config.self_lane, admission.scan_cursor);
 }
 
 template <bool RecordProtocol = true>
@@ -474,22 +456,17 @@ static inline __aicore__ bool scheduler_refresh_local_obligation(
         if (!scheduler_task_ref_valid(graph, task))
             return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_RECORD);
         auto *record = scheduler_admission_record_at(base, admission, task);
-        // The validated run layout places the bitmap immediately after the
-        // header; an unvalidated record cannot redirect cache maintenance.
-        auto *words = reinterpret_cast<__gm__ uint64_t *>(record + 1);
         scheduler_invalidate_cache_line(record);
-        scheduler_invalidate_cache_line(words);
         scheduler_cache_barrier();
         if (record->run_epoch != admission->epoch)
             return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_EPOCH_MISMATCH);
         auto *control = scheduler_task_control_at(base, local, task);
-        // The closed bootstrap scan validates immutable record fields and the
-        // member bitmap once. Epoch, order and publication remain dynamic gates.
+        // Bootstrap validates immutable shape and topology; epoch, order and
+        // publication remain dynamic gates for every adoption.
         if (record->order_key != admission->scan_cursor ||
             scheduler_gm_query(control->admission_state) != static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED))
             return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_RECORD);
-        const uint64_t worker = local->worker_id();
-        if ((words[worker / 64] & (UINT64_C(1) << (worker % 64))) != 0) {
+        if (scheduler_admission_is_member(local, record)) {
             if (admission->current_task_ref != SCHEDULER_TASK_REF_INVALID && admission->current_task_ref != task)
                 return scheduler_admission_fail(
                     graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_FRONTIER
@@ -498,29 +475,30 @@ static inline __aicore__ bool scheduler_refresh_local_obligation(
             admission->current_block_num = record->logical_block_num;
             admission->current_active_mask = scheduler_lane_mask_load(record->active_mask);
             admission->current_flags = record->flags;
+            admission->current_claim_positions =
+                scheduler_block_claim_positions(admission->current_active_mask, local->config.cluster_count);
+            admission->current_claim_limit = admission->current_claim_positions;
+            admission->current_uses_ticket_claim = scheduler_task_uses_ticket_claim(
+                record->flags, admission->current_active_mask, record->logical_block_num, local->config.cluster_count
+            );
+            admission->current_single_subtask =
+                scheduler_task_is_mix(record->flags) ?
+                    (admission->current_active_mask.has(static_cast<SubtaskSlot>(local->config.self_lane)) ?
+                         local->config.self_lane :
+                         UINT8_MAX) :
+                    scheduler_metadata_single_subtask_slot(admission->current_active_mask);
+            admission->current_resource_mask = scheduler_task_is_mix(record->flags) ?
+                                                   scheduler_mix_resource_mask(admission->current_active_mask) :
+                                                   admission->current_active_mask;
+            admission->current_mix_close_seal_offset =
+                scheduler_task_is_mix(record->flags) ?
+                    record->mix_close_seals_offset +
+                        static_cast<uint64_t>(admission->gm_mix.cluster_index) * sizeof(SchedulerMixCloseSeal) :
+                    0;
             admission->sync_claimed = false;
             admission->ticket_exhausted = false;
-            // A late member owns no block from this newly adopted record. A
-            // strong exhaustion proof lets it close without materializing args
-            // or parking ordinary payloads. MIX and sync-start keep their gates.
-            bool owns_block = false;
-            for (const auto &slot : local->slots)
-                owns_block = owns_block || (slot.task_ref == task && slot.state != SchedulerDispatchSlotState::FREE);
-            if (!owns_block && !scheduler_task_is_mix(record->flags) &&
-                !scheduler_task_requires_sync_start(record->flags) &&
-                scheduler_gm_query(control->claim_seal) == record->logical_block_num) {
-                uint64_t cursor = 0;
-                bool used_seal = false;
-                if (!scheduler_read_claim_cursor(graph, base, local, run, &cursor, &used_seal)) return false;
-                if (used_seal && cursor == record->logical_block_num) {
-                    if constexpr (RecordProtocol) {
-                        scheduler_protocol_member_observed(base, local, admission, tail);
-                        scheduler_protocol_member_closed(base, local, admission, cursor, 0, 0, true);
-                    }
-                    scheduler_retire_local_obligation(*admission);
-                    continue;
-                }
-            }
+            if (scheduler_task_requires_sync_start(record->flags))
+                scheduler_cluster_hold_sync(local->cluster_signal, local->config.self_lane, admission->scan_cursor);
             const auto binding_error = scheduler_observe_graph_arguments(graph, task);
             if (binding_error != SchedulerGraphBindingError::NONE)
                 return scheduler_admission_fail(
@@ -532,6 +510,7 @@ static inline __aicore__ bool scheduler_refresh_local_obligation(
         if (admission->current_task_ref != SCHEDULER_TASK_REF_INVALID)
             return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_FRONTIER);
         ++admission->scan_cursor;
+        scheduler_cluster_advance_sync(local->cluster_signal, local->config.self_lane, admission->scan_cursor);
     }
     return true;
 }
@@ -569,35 +548,6 @@ static inline __aicore__ bool scheduler_can_enter_ordinary(
     // for that finite kernel, but cannot be ignored by its next invocation.
     *permit = tail == admission->scan_cursor;
     if (*permit && observed_tail != nullptr) *observed_tail = tail;
-    return true;
-}
-
-// Completion enters this path only when local->admission is present. The
-// resident installs that pointer after successful admission initialization;
-// retain_candidate has the same live-admission precondition. A null result
-// means that all candidate credits are occupied, not that admission is absent.
-inline __aicore__ SchedulerReadyClaim *scheduler_ordered_direct_sink(SchedulerAdmissionLocalState *admission) {
-    for (auto &candidate : admission->candidates) {
-        if (scheduler_task_ref_is_null(candidate.ready.task_ref)) {
-            candidate = {};
-            return &candidate.ready;
-        }
-    }
-    return nullptr;
-}
-
-// The caller holds the initialized admission object for this run. Candidate
-// identity and capacity remain dynamic and must still be checked.
-inline __aicore__ bool
-scheduler_ordered_retain_candidate(SchedulerAdmissionLocalState *admission, const SchedulerReadyClaim &ready) {
-    if (scheduler_task_ref_is_null(ready.task_ref) || ready.task_ref == admission->pending_task_ref ||
-        ready.task_ref == admission->current_task_ref)
-        return false;
-    for (const auto &candidate : admission->candidates)
-        if (candidate.ready.task_ref == ready.task_ref) return false;
-    auto *sink = scheduler_ordered_direct_sink(admission);
-    if (sink == nullptr) return false;
-    *sink = ready;
     return true;
 }
 
@@ -688,11 +638,13 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_curso
         return SchedulerBlockClaimResult::ERROR;
     }
     if (admission->sync_claimed) return SchedulerBlockClaimResult::RETRY;
+    // A named ordinary rendezvous goes first, before this obligation owns a
+    // ticket or physical slot that the rendezvous would need to reclaim.
+    if (scheduler_task_requires_sync_start(admission->current_flags) &&
+        scheduler_cluster_names_lane(local->cluster_signal, local->config.self_lane))
+        return SchedulerBlockClaimResult::RETRY;
     auto *control = scheduler_task_control_at(base, local, admission->current_task_ref);
-    if (scheduler_task_uses_ticket_claim(
-            admission->current_flags, admission->current_active_mask, admission->current_block_num,
-            local->config.cluster_count
-        )) {
+    if (admission->current_uses_ticket_claim) {
         if (admission->ticket_exhausted) return SchedulerBlockClaimResult::EXHAUSTED;
         const uint64_t count = admission->current_block_num;
         if (scheduler_gm_query(control->next_block) >= count) {
@@ -710,9 +662,8 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_curso
                 return SchedulerBlockClaimResult::EXHAUSTED;
             }
         }
-        const uint64_t positions =
-            scheduler_block_claim_positions(admission->current_active_mask, local->config.cluster_count);
-        const uint64_t limit = count + positions;
+        const uint64_t positions = admission->current_claim_positions;
+        const uint64_t limit = admission->current_claim_limit;
         if (scheduler_gm_query(control->claim_tickets) >= limit &&
             scheduler_gm_fetch_add(control->claim_tickets, UINT64_C(0)) >= limit) {
             scheduler_admission_fail(
@@ -734,6 +685,7 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_curso
         }
         // A ticket is irrevocable ownership of one block. The bounded valid
         // count reaches N only after every valid reservation is published.
+        admission->sync_claimed = scheduler_task_requires_sync_start(admission->current_flags);
         const uint64_t previous = scheduler_gm_fetch_add(control->next_block, UINT64_C(1));
         if (previous >= count || ticket > previous + positions - 1) {
             scheduler_admission_fail(
@@ -754,13 +706,12 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_curso
     // logical block: one AIC lane per cluster (the Mix coordinator when the
     // task is Mix), or the two AIV lanes of a cluster, as
     // `scheduler_block_claim_positions` counts them. The `sync_claimed` gate
-    // above allows each position one claim, so the bounded retry loop buys
-    // nothing here. One fetch-add on next_block hands out the dynamic index and
+    // above allows each position one claim. One fetch-add on next_block hands
+    // out the dynamic index and
     // publishes the claim; the actual last claim still publishes the seal, and
     // claim_tickets stays zero for this branch.
     if (scheduler_task_requires_sync_start(admission->current_flags) &&
-        admission->current_block_num ==
-            scheduler_block_claim_positions(admission->current_active_mask, local->config.cluster_count)) {
+        admission->current_block_num == admission->current_claim_positions) {
         const uint64_t count = admission->current_block_num;
         const uint64_t claim_start = RecordProtocol ? scheduler_protocol_cycles(local) : 0;
         const uint64_t block = scheduler_gm_fetch_add(control->next_block, UINT64_C(1));
@@ -784,38 +735,8 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_curso
             return SchedulerBlockClaimResult::ERROR;
         return SchedulerBlockClaimResult::CLAIMED;
     }
-    uint64_t observed = scheduler_gm_query(control->next_block);
-    bool critical = false;
-    for (uint32_t attempt = 0; attempt < 8; ++attempt) {
-        if (observed >= admission->current_block_num) {
-            if (!critical && !scheduler_read_claim_cursor(graph, base, local, run, &observed))
-                return SchedulerBlockClaimResult::ERROR;
-            if (observed == admission->current_block_num) return SchedulerBlockClaimResult::EXHAUSTED;
-            if (observed > admission->current_block_num) {
-                scheduler_admission_fail(
-                    graph, local, run, admission->current_task_ref, SchedulerErrorSite::BLOCK_CURSOR_INVALID
-                );
-                return SchedulerBlockClaimResult::ERROR;
-            }
-        }
-        const uint64_t claim_start = RecordProtocol ? scheduler_protocol_cycles(local) : 0;
-        const uint64_t previous = scheduler_gm_compare_exchange(control->next_block, observed, observed + 1);
-        if (previous == observed) {
-            *block_idx = static_cast<uint32_t>(observed);
-            admission->sync_claimed = scheduler_task_requires_sync_start(admission->current_flags);
-            if constexpr (RecordProtocol)
-                scheduler_protocol_block_claim(
-                    base, local, *block_idx, claim_start, scheduler_protocol_cycles(local), observed + 1
-                );
-            if (observed + 1 == admission->current_block_num &&
-                !scheduler_publish_claim_seal<RecordProtocol>(graph, base, local, run, *block_idx))
-                return SchedulerBlockClaimResult::ERROR;
-            return SchedulerBlockClaimResult::CLAIMED;
-        }
-        observed = previous;
-        critical = true;
-    }
-    return SchedulerBlockClaimResult::RETRY;
+    scheduler_admission_fail(graph, local, run, admission->current_task_ref, SchedulerErrorSite::BLOCK_CURSOR_INVALID);
+    return SchedulerBlockClaimResult::ERROR;
 }
 
 template <bool RecordProtocol = true>
@@ -830,9 +751,8 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_block
     const int64_t task = admission->current_task_ref;
     if (!scheduler_task_ref_valid(graph, task) || slot_index >= SCHEDULER_PENDING_SLOT_COUNT ||
         local->slots[slot_index].state != SchedulerDispatchSlotState::FREE || admission->current_block_num == 0 ||
-        scheduler_task_is_mix(admission->current_flags) ||
-        scheduler_metadata_single_subtask_slot(admission->current_active_mask) == UINT8_MAX ||
-        scheduler_task_ready_queue(admission->current_flags, admission->current_active_mask) !=
+        scheduler_task_is_mix(admission->current_flags) || admission->current_single_subtask == UINT8_MAX ||
+        scheduler_task_execution_engine(admission->current_flags, admission->current_active_mask) !=
             local->config.self_core_type) {
         scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::BLOCK_CURSOR_INVALID);
         return SchedulerBlockClaimResult::ERROR;
@@ -845,9 +765,8 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_block
     slot.block_idx = block;
     slot.args_observed = true;
     slot.gm_mix = false;
-    slot.candidate_index = UINT8_MAX;
     slot.predicate = SchedulerPredicateState::UNEVALUATED;
-    slot.subtask_slot = scheduler_metadata_single_subtask_slot(admission->current_active_mask);
+    slot.subtask_slot = admission->current_single_subtask;
     slot.state = SchedulerDispatchSlotState::FILLING;
     return SchedulerBlockClaimResult::CLAIMED;
 }
@@ -877,7 +796,7 @@ static inline __aicore__ bool scheduler_close_ordered_obligation(
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::BLOCK_CURSOR_INVALID);
     if constexpr (RecordProtocol)
         scheduler_protocol_member_closed(base, local, admission, cursor, 0, 0, used_claim_seal);
-    scheduler_retire_local_obligation(*admission);
+    scheduler_retire_local_obligation(local, *admission);
     *closed = true;
     return true;
 }
@@ -889,24 +808,13 @@ static inline __aicore__ bool scheduler_ordered_park_ordinary(
     auto *admission = local->admission;
     for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
         auto &slot = local->slots[index];
-        if (slot.state != SchedulerDispatchSlotState::READY || scheduler_slot_uses_admission(local, slot) ||
-            (local->local_ready_mask & (1U << index)) == 0)
+        if (slot.state != SchedulerDispatchSlotState::READY || slot.cluster_mix ||
+            scheduler_slot_uses_admission(local, slot) || (local->local_ready_mask & (1U << index)) == 0)
             continue;
-        if (slot.candidate_index >= SCHEDULER_PENDING_SLOT_COUNT)
+        if (!slot.execution_token || !scheduler_park_execution_slot(local, index))
             return scheduler_admission_fail(
                 graph, local, run, slot.task_ref, SchedulerErrorSite::ORDERED_CANDIDATE_INVALID
             );
-        auto &candidate = admission->candidates[slot.candidate_index];
-        if (candidate.ready.task_ref != slot.task_ref || candidate.slot_index != index)
-            return scheduler_admission_fail(
-                graph, local, run, slot.task_ref, SchedulerErrorSite::ORDERED_CANDIDATE_INVALID
-            );
-        candidate.args_observed = slot.args_observed;
-        candidate.predicate = slot.predicate;
-        candidate.slot_index = UINT8_MAX;
-        scheduler_local_ready_remove(local, index);
-        scheduler_initialize_free_slot(&slot);
-        local->set_timing_slot(index, -1);
     }
     return true;
 }
@@ -952,6 +860,9 @@ static inline __aicore__ bool scheduler_ordered_can_enter_slot(
         // Ordinary entry has its own strong gate below; cooperative entry
         // needs this one. Neither path reuses an earlier poll's permission.
         if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
+        if (scheduler_task_requires_sync_start(admission->current_flags) &&
+            scheduler_cluster_names_lane(local->cluster_signal, local->config.self_lane))
+            return true;
         *permit = true;
         if constexpr (RecordProtocol) scheduler_protocol_execution_permit(base, local, slot_index, UINT64_MAX, true);
         return true;
@@ -962,20 +873,11 @@ static inline __aicore__ bool scheduler_ordered_can_enter_slot(
     uint64_t observed_tail = UINT64_MAX;
     if (!scheduler_can_enter_ordinary(graph, base, local, run, admission, permit, &observed_tail)) return false;
     if (!*permit) return true;
-    if (slot.candidate_index >= SCHEDULER_PENDING_SLOT_COUNT)
-        return scheduler_admission_fail(
-            graph, local, run, slot.task_ref, SchedulerErrorSite::ORDERED_CANDIDATE_INVALID
-        );
-    auto &candidate = admission->candidates[slot.candidate_index];
-    if (candidate.ready.task_ref != slot.task_ref || candidate.slot_index != slot_index)
+    if (!slot.execution_token)
         return scheduler_admission_fail(
             graph, local, run, slot.task_ref, SchedulerErrorSite::ORDERED_CANDIDATE_INVALID
         );
     if constexpr (RecordProtocol)
         scheduler_protocol_execution_permit(base, local, slot_index, observed_tail, admission->capacity != 0);
-    admission->next_candidate = static_cast<uint8_t>((slot.candidate_index + 1) % SCHEDULER_PENDING_SLOT_COUNT);
-    candidate = {};
-    // The slot retains its ordinary origin through completion; the index no
-    // longer owns the candidate after entry permission consumes that candidate.
     return true;
 }

@@ -43,7 +43,7 @@ ScalarPolicyObservation observe_scalar_policy() {
                 &scheduler_async_pending::register_group
             );
         result.value = query(value, __ATOMIC_ACQUIRE);
-        (void)poll(graph, nullptr, &local, nullptr, nullptr);
+        (void)poll(graph, nullptr, &local, nullptr);
         (void)register_group(join);
     }
     result.join_word = join.word;

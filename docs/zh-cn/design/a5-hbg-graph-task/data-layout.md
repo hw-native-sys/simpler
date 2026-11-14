@@ -198,8 +198,8 @@ for child i:
 cursor 初始 64-byte 对齐。Tensor 使用现有 128-byte实体 ABI；96-byte Definition record 不能直接传给 kernel。
 每个 child 拥有完整的 scalar/predicate cache line，零长度区间不读写。
 所有加法、乘法和 align-up 都检查溢出，再验证总大小。
-bootstrap 的 node 分区 owner 并行写各自 child 参数，利用现有 scan barrier 统一发布；
-不同分区不得共享可写 cache line。普通 ready owner 和 cooperative 成员首次使用前均观察参数范围。
+Host 在独立镜像中写入每实例 child 参数，随 launch metadata 发布；
+Device 消费前观察参数范围。完整准备与消费合同见[统一开发参考](build-execute-separation.md)。
 每 run 重建本次实例地址与 scalar，不跨 epoch 复用参数内容；Tensor 数据和 predicate 值不在准备阶段读取。
 
 首版 args_base 指向 `heap_base + definition.required_heap`，复用当前 shell 已预留的 execution tail。

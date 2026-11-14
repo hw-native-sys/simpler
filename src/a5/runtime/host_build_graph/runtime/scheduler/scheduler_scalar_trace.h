@@ -21,6 +21,17 @@ class SchedulerScalarScopeImpl;
 template <>
 class SchedulerScalarScopeImpl<true> {
 public:
+    inline __aicore__ explicit SchedulerScalarScopeImpl(
+        SchedPhaseKind kind, int64_t task_ref = -1, uint64_t begin = 0
+    ) :
+        trace_(scheduler_scalar_current()),
+        kind_(kind),
+        task_ref_(task_ref) {
+        if (trace_ != nullptr && trace_->buffer != nullptr) {
+            depth_ = ++trace_->depth;
+            begin_ = begin == 0 ? scheduler_cycles() : begin;
+        } else trace_ = nullptr;
+    }
     template <typename Local>
     inline __aicore__
     SchedulerScalarScopeImpl(const Local *local, SchedPhaseKind kind, int64_t task_ref = -1, uint64_t begin = 0) :
@@ -33,6 +44,7 @@ public:
         } else trace_ = nullptr;
     }
     inline __aicore__ ~SchedulerScalarScopeImpl() { close(); }
+    inline __aicore__ void set_task_ref(int64_t task_ref) { task_ref_ = task_ref; }
     inline __aicore__ void close() {
         if (trace_ == nullptr) return;
         const uint64_t end = scheduler_cycles();
@@ -54,9 +66,11 @@ private:
 template <>
 class SchedulerScalarScopeImpl<false> {
 public:
+    inline __aicore__ explicit SchedulerScalarScopeImpl(SchedPhaseKind, int64_t = -1, uint64_t = 0) {}
     template <typename Local>
     inline __aicore__ SchedulerScalarScopeImpl(const Local *, SchedPhaseKind, int64_t = -1, uint64_t = 0) {}
     inline __aicore__ void close() {}
+    inline __aicore__ void set_task_ref(int64_t) {}
     SchedulerScalarScopeImpl(const SchedulerScalarScopeImpl &) = delete;
     SchedulerScalarScopeImpl &operator=(const SchedulerScalarScopeImpl &) = delete;
 };

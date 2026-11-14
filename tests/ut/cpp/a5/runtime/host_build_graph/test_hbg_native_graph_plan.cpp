@@ -22,12 +22,13 @@
 #include "host_build_graph/graph_execution.h"
 #include "native_graph_plan.h"
 #include "dependency_plan.h"
-#include "ready_pool_plan.h"
+#include "task_catalog_plan.h"
 #include "hbg_scheduler_test_support.h"
 #include "scheduler/scheduler_graph_control.h"
 #include "scheduler/scheduler_graph_binding.h"
 #include "scheduler/scheduler_admission.h"
 #include "scheduler/scheduler_dispatch.h"
+#include "scheduler/scheduler_completion.h"
 
 namespace {
 TEST(NativeGraphPlanTest, SyncStartRequiresDistinctExecutionPositions) {
@@ -316,7 +317,7 @@ struct NativeViewFixture {
     std::unique_ptr<void, decltype(&std::free)> backing{nullptr, &std::free};
     SchedulerGraphView graph{};
     AicoreSchedulerLayout layout{};
-    SchedulerReadyPoolPlan ready_pool{};
+    SchedulerTaskCatalogPlan catalog_plan{};
 
     NativeViewFixture(
         const DefinitionFixture &definition, std::vector<uint32_t> indices, bool runtime_state = false,
@@ -340,9 +341,7 @@ struct NativeViewFixture {
             throw std::runtime_error(error);
         SchedulerNativeGraphHeader header{};
         std::memcpy(&header, readonly_image.bytes.data() + readonly_image.header_offset, sizeof(header));
-        header.control_inbox_count = workers;
-        header.control_inboxes_offset = readonly_image.bytes.size();
-        header.image_bytes = readonly_image.bytes.size() + workers * sizeof(SchedulerReadyInbox);
+        header.image_bytes = readonly_image.bytes.size();
         header.run_epoch = 1;
         std::vector<SchedulerTaskMetadata> task_metadata(plan.bindings.size());
         if (runtime_state) {
@@ -352,6 +351,9 @@ struct NativeViewFixture {
                     const auto &instance = plan.instances[binding.instance_index];
                     task_metadata[ref] =
                         plan.definitions[instance.definition_index].children[binding.source_index].metadata;
+                } else if (scheduler_node_is_control(binding.kind)) {
+                    task_metadata[ref].logical_block_num = 1;
+                    task_metadata[ref].flags = SCHEDULER_TASK_HAS_FANIN;
                 }
             }
             SchedulerSpmdRequirements requirements{workers, workers / 3, 0, 0};
@@ -361,7 +363,11 @@ struct NativeViewFixture {
                 trace_count += definition_plan.execution_count;
                 for (const auto &child : definition_plan.children) {
                     if (scheduler_task_requires_admission(child.metadata)) ++requirements.cooperative_task_count;
-                    if (scheduler_task_is_mix(child.metadata.flags)) ++requirements.mix_task_count;
+                    if (scheduler_task_is_mix(child.metadata.flags)) {
+                        ++requirements.mix_task_count;
+                        if (scheduler_task_requires_sync_start(child.metadata.flags))
+                            ++requirements.sync_mix_task_count;
+                    }
                 }
             }
             if (!scheduler_plan_layout(
@@ -369,11 +375,10 @@ struct NativeViewFixture {
                     readonly_image.bytes.size()
                 ))
                 throw std::runtime_error("scheduler layout");
-            if (!scheduler_plan_ready_pool(task_metadata, workers / 3, layout.total_size, &ready_pool))
-                throw std::runtime_error("ready pool plan");
-            layout.total_size = ready_pool.total_size;
+            if (!scheduler_plan_task_catalog(task_metadata, workers / 3, layout.total_size, &catalog_plan))
+                throw std::runtime_error("task catalog plan");
+            layout.total_size = catalog_plan.total_size;
             header.image_bytes = layout.total_size;
-            header.control_inboxes_offset = layout.control_inboxes_offset;
         }
         backing.reset(
             std::aligned_alloc(
@@ -402,9 +407,9 @@ struct NativeViewFixture {
                 task_metadata.begin(), task_metadata.end(),
                 scheduler_state_at<SchedulerTaskMetadata>(backing.get(), layout.task_metadata_offset)
             );
-            scheduler_init_ready_pool(backing.get(), ready_pool);
-            scheduler_state_at<SchedulerGraphSummary>(backing.get(), layout.graph_summary_offset)->ready_pool_offset =
-                ready_pool.header_offset;
+            scheduler_init_task_catalog(backing.get(), catalog_plan);
+            scheduler_state_at<SchedulerGraphSummary>(backing.get(), layout.graph_summary_offset)->task_catalog_offset =
+                catalog_plan.header_offset;
             if (!scheduler_init_spmd_task_records(backing.get(), layout, 1)) throw std::runtime_error("SPMD init");
         }
     }
@@ -421,43 +426,37 @@ struct NativeViewFixture {
 };
 }  // namespace
 
-TEST(HbgNativeGraphPlan, DependencyCountersIncludeGraphEntryExitAndCrossInstanceEdges) {
+TEST(HbgNativeGraphPlan, CanonicalFaninConnectsGraphControlsAcrossInstances) {
     DefinitionFixture definition(std::vector<std::vector<uint16_t>>{{}, {}, {0, 1}});
     NativeViewFixture view(definition, {UINT32_MAX, 0, 0, UINT32_MAX});
     view.original.executable(0, 0);
     view.original.executable(1, 0, {0});
     view.original.executable(2, 0, {1});
     view.original.executable(3, 0, {2});
-    SchedulerDependencyPlan plan;
-    ASSERT_TRUE(scheduler_plan_dependencies(view.graph.task_count, 13, 128, &plan));
-    std::unique_ptr<void, decltype(&std::free)> storage(
-        std::aligned_alloc(SCHEDULER_STATE_ALIGNMENT, plan.total_size), &std::free
-    );
-    ASSERT_NE(storage, nullptr);
-    ASSERT_TRUE(scheduler_init_dependencies(storage.get(), plan, view.graph, {0}));
-    const auto *header = scheduler_state_at<SchedulerDependencyHeader>(storage.get(), plan.header_offset);
-    EXPECT_EQ(header->edge_count, 12);
+    std::vector<SchedulerTaskMetadata> metadata(view.graph.task_count);
+    for (uint64_t ref = 0; ref < view.plan.bindings.size(); ++ref) {
+        const auto kind = view.plan.bindings[ref].kind;
+        if (kind == SchedulerNodeKind::CHILD_KERNEL || kind == SchedulerNodeKind::TOP_KERNEL)
+            metadata[ref].flags = SCHEDULER_TASK_EXECUTABLE;
+    }
+    ASSERT_TRUE(scheduler_validate_dependencies(view.graph, metadata, {0}));
     std::vector<std::pair<int64_t, int64_t>> edges;
-    for (int64_t producer = 0; producer < view.graph.task_count; ++producer) {
-        for (uint32_t index = 0;; ++index) {
-            int64_t successor;
-            ASSERT_TRUE(scheduler_dependency_successor(storage.get(), *header, producer, index, &successor));
-            if (successor == SCHEDULER_WAKE_LIST_OPEN) break;
-            edges.emplace_back(producer, successor);
+    for (int64_t consumer = 0; consumer < view.graph.task_count; ++consumer) {
+        SchedulerFaninView fanin{};
+        ASSERT_EQ(scheduler_node_fanin_view(view.graph, consumer, &fanin), SchedulerGraphResult::OK);
+        for (uint32_t index = 0; index < fanin.count; ++index) {
+            int64_t producer = -1;
+            ASSERT_EQ(scheduler_fanin_ref(fanin, consumer, index, &producer), SchedulerGraphResult::OK);
+            edges.emplace_back(producer, consumer);
         }
     }
     EXPECT_EQ(
-        edges, (std::vector<std::pair<int64_t, int64_t>>{
-                   {1, 2}, {1, 3}, {2, 4}, {3, 4}, {4, 5}, {5, 6}, {6, 7}, {6, 8}, {7, 9}, {8, 9}, {9, 10}, {10, 11}
-               })
+        edges,
+        (std::vector<std::pair<int64_t, int64_t>>{
+            {0, 1}, {1, 2}, {1, 3}, {2, 4}, {3, 4}, {4, 5}, {5, 6}, {6, 7}, {6, 8}, {7, 9}, {8, 9}, {9, 10}, {10, 11}
+        })
     );
-    const auto *remaining = scheduler_state_at<uint64_t>(storage.get(), header->remaining_offset);
-    EXPECT_EQ(
-        std::vector<uint64_t>(remaining, remaining + view.graph.task_count),
-        (std::vector<uint64_t>{0, 0, 1, 1, 2, 1, 1, 1, 1, 2, 1, 1})
-    );
-    ASSERT_TRUE(scheduler_plan_dependencies(view.graph.task_count, 11, 128, &plan));
-    EXPECT_FALSE(scheduler_init_dependencies(storage.get(), plan, view.graph, {0}));
+    EXPECT_FALSE(scheduler_validate_dependencies(view.graph, metadata, {view.graph.task_count}));
 }
 
 TEST(HbgNativeGraphPlan, AccessConstructionDoesNotObserveNativeBacking) {
@@ -669,8 +668,11 @@ SchedulerLocalState ready_worker(NativeViewFixture &view, uint32_t type, uint64_
     auto &config = local.config;
     config.graph = &view.graph;
     config.task_controls_offset = view.layout.task_controls_offset;
+    config.worker_contexts_offset = view.layout.worker_contexts_offset;
     config.task_metadata_offset = view.layout.task_metadata_offset;
-    config.ready_pool_offset = view.ready_pool.header_offset;
+    config.task_catalog_offset = view.catalog_plan.header_offset;
+    config.prepared =
+        scheduler_state_at<SchedulerPreparedLayout>(view.backing.get(), view.layout.prepared_layout_offset);
     config.runtime_worker_count = config.scheduler_count = 30;
     config.cluster_count = 10;
     config.self_lane = type == 0 ? 0 : 1 + rank % 2;
@@ -680,62 +682,127 @@ SchedulerLocalState ready_worker(NativeViewFixture &view, uint32_t type, uint64_
         config.worker_ids[lane] = cluster * 3 + lane;
     }
     config.scheduler_index = local.worker_id();
+    config.shared_context =
+        scheduler_state_at<SchedulerWorkerContext>(view.backing.get(), view.layout.worker_contexts_offset) +
+        local.worker_id();
+    for (auto &slot : local.slots)
+        scheduler_initialize_free_slot(&slot);
     return local;
 }
 
-void seed_native_ready(NativeViewFixture &view, SchedulerLocalState &local, int64_t ref) {
-    SchedulerReadyPublication publication{};
-    ASSERT_EQ(
-        scheduler_ready_publication_append(view.graph, view.backing.get(), &local, ref, publication),
-        SchedulerReadyAppendResult::ADDED
-    );
-    ASSERT_EQ(
-        scheduler_ready_publication_step(view.graph, view.backing.get(), &local, publication),
-        SchedulerReadyPublishResult::DONE
-    );
+void complete_native_entry(NativeViewFixture &view) {
+    auto *controls = scheduler_state_at<SchedulerTaskControl>(view.backing.get(), view.layout.task_controls_offset);
+    for (const auto &instance : view.plan.instances) {
+        scheduler_gm_store(
+            controls[instance.enter_ref].completion_state,
+            scheduler_completion_completed_state(
+                scheduler_completion_total(controls[instance.enter_ref].completion_state)
+            )
+        );
+    }
+}
+
+void prepare_native_calls(NativeViewFixture &view) {
+    const uint64_t functions[3]{0x1000, 0x2000, 0x3000};
+    for (uint64_t ref = 0; ref < view.plan.bindings.size(); ++ref) {
+        if (view.plan.bindings[ref].kind != SchedulerNodeKind::CHILD_KERNEL) continue;
+        ASSERT_TRUE(scheduler_prepare_host_calls(
+            view.backing.get(), view.layout, reinterpret_cast<uint64_t>(view.backing.get()), ref, functions, 0, nullptr,
+            0, 0
+        ));
+    }
 }
 }  // namespace
 
-TEST(HbgNativeGraphPlan, AnyEligibleWorkerClaimsTheSharedQueue) {
+TEST(HbgNativeGraphPlan, ZeroFlagLiveControlRemainsACanonicalDependency) {
+    DefinitionFixture body({{}, {0}}, true);
+    SubTaskDefinition kernel{};
+    kernel.kernel_id[0] = 0;
+    kernel.kernel_id[1] = kernel.kernel_id[2] = -1;
+    kernel.active_mask = LaneMask::aic();
+    kernel.logical_block_num = kernel.total_required_subtasks = 1;
+    body.put<SubTaskDefinition>(body.header.off_sub_tasks, 1, kernel);
+    NativeViewFixture view(body, {0}, true, 30);
+    auto local = ready_worker(view, 0, 0);
+    auto *run = static_cast<SchedulerRunControl *>(view.backing.get());
+    auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(view.backing.get(), view.layout.task_metadata_offset);
+    auto *control = scheduler_task_control_at(view.backing.get(), &local, 1);
+    metadata[1].flags = 0;
+    metadata[1].active_mask = LaneMask::none();
+    metadata[1].logical_block_num = 1;
+    prepare_native_calls(view);
+    SchedulerFaninView fanin{};
+    ASSERT_EQ(scheduler_node_fanin_view(view.graph, 2, &fanin), SchedulerGraphResult::OK);
+    uint32_t next = 0;
+    bool ready = false;
+    ASSERT_TRUE(scheduler_observe_fanin_prefix(view.graph, view.backing.get(), &local, run, 2, fanin, next, &ready));
+    EXPECT_FALSE(ready);
+    EXPECT_EQ(next, 0u);
+    EXPECT_FALSE(scheduler_completion_done(control->completion_state));
+    // Zero-shape metadata does not make a native live CONTROL_DUMMY Host-done.
+    metadata[1].logical_block_num = 0;
+    ASSERT_TRUE(scheduler_observe_fanin_prefix(view.graph, view.backing.get(), &local, run, 2, fanin, next, &ready));
+    EXPECT_FALSE(ready);
+    EXPECT_EQ(next, 0u);
+    metadata[1].logical_block_num = 1;
+    scheduler_gm_store(control->completion_state, scheduler_completion_completed_state(1));
+    ASSERT_TRUE(scheduler_observe_fanin_prefix(view.graph, view.backing.get(), &local, run, 2, fanin, next, &ready));
+    EXPECT_TRUE(ready);
+    EXPECT_EQ(next, fanin.count);
+    EXPECT_EQ(scheduler_read_error(run), 0u);
+}
+
+TEST(HbgNativeGraphPlan, AnyEligibleWorkerAcquiresHostAvailableNativeTasks) {
     for (uint32_t type : {0u, 1u}) {
         for (uint32_t rank : {0u, 7u, 9u}) {
             NativeViewFixture view(ready_definition(type), {0}, true, 30);
             auto local = ready_worker(view, type, rank);
             auto *run = static_cast<SchedulerRunControl *>(view.backing.get());
-            seed_native_ready(view, local, 1);
-            SchedulerReadyClaim claim{};
-            ASSERT_TRUE(scheduler_claim_ready_for_slot(view.graph, view.backing.get(), &local, run, type, &claim));
-            EXPECT_EQ(claim.task_ref, 1);
-            EXPECT_EQ(claim.source, SchedulerReadySource::POOL);
+            prepare_native_calls(view);
+            complete_native_entry(view);
+            bool progress = false;
+            ASSERT_TRUE(scheduler_refill_execution_tokens(view.graph, view.backing.get(), &local, run, 0, &progress));
+            EXPECT_TRUE(progress);
+            ASSERT_TRUE(scheduler_execution_token_has_task(&local, 1));
+            EXPECT_EQ(local.execution_tokens[0].task_ref, 1);
+            EXPECT_EQ(scheduler_prepared_owner(local.execution_tokens[0].prepared.claimed_state), local.worker_id());
+            EXPECT_EQ(scheduler_task_control_at(view.backing.get(), &local, 1)->next_block, 1u);
             EXPECT_EQ(scheduler_read_error(run), 0u);
         }
     }
 }
 
-TEST(HbgNativeGraphPlan, NativeReadyClaimPreservesPublicationOrder) {
+TEST(HbgNativeGraphPlan, NativeCatalogOrderAllocatesEachSingleBlockOnce) {
     NativeViewFixture view(ready_definition(0), {0}, true, 30);
-    auto producer = ready_worker(view, 0, 9);
     auto consumer = ready_worker(view, 0, 0);
     auto *run = static_cast<SchedulerRunControl *>(view.backing.get());
-    for (int64_t ref : {1, 2, 3})
-        seed_native_ready(view, producer, ref);
+    prepare_native_calls(view);
+    complete_native_entry(view);
+    const auto catalog = scheduler_task_catalog(view.backing.get(), view.catalog_plan.header, 0);
+    ASSERT_EQ(catalog.count, 3u);
     for (int64_t expected : {1, 2, 3}) {
-        SchedulerReadyClaim claim{};
-        ASSERT_TRUE(scheduler_claim_ready_for_slot(view.graph, view.backing.get(), &consumer, run, 0, &claim));
-        EXPECT_EQ(claim.task_ref, expected);
+        EXPECT_EQ(catalog.refs[expected - 1], expected);
+        bool progress = false;
+        ASSERT_TRUE(scheduler_refill_execution_tokens(view.graph, view.backing.get(), &consumer, run, 0, &progress));
+        EXPECT_TRUE(progress);
+        EXPECT_EQ(consumer.execution_tokens[expected - 1].task_ref, expected);
+        EXPECT_EQ(scheduler_task_control_at(view.backing.get(), &consumer, expected)->next_block, 1u);
     }
+    auto competing = ready_worker(view, 0, 9);
+    bool progress = false;
+    ASSERT_TRUE(scheduler_refill_execution_tokens(view.graph, view.backing.get(), &competing, run, 0, &progress));
+    EXPECT_FALSE(progress);
+    EXPECT_EQ(scheduler_execution_token_count(&competing), 0u);
+    EXPECT_EQ(scheduler_read_error(run), 0u);
 }
 
-TEST(HbgNativeGraphPlan, ConcurrentConsumersClaimEachNativeTaskOnce) {
+TEST(HbgNativeGraphPlan, ConcurrentConsumersOwnAndCompleteEachNativeCallOnce) {
     constexpr uint32_t tasks = 64;
     NativeViewFixture view(ready_definition(0, tasks), {0}, true, 30);
-    auto publisher = ready_worker(view, 0, 9);
     auto *base = view.backing.get();
     auto *run = static_cast<SchedulerRunControl *>(base);
-    SchedulerReadyBatch batch{};
-    for (int64_t ref = 1; ref <= tasks; ++ref)
-        ASSERT_TRUE(scheduler_ready_batch_append(base, &publisher, ref, &batch));
-    ASSERT_TRUE(scheduler_ready_batch_push(base, &publisher, 0, &batch));
+    prepare_native_calls(view);
+    complete_native_entry(view);
     std::array<std::atomic<uint32_t>, tasks> claims{};
     std::atomic<bool> start{false};
     std::atomic<uint32_t> failures{0};
@@ -745,17 +812,26 @@ TEST(HbgNativeGraphPlan, ConcurrentConsumersClaimEachNativeTaskOnce) {
             auto local = ready_worker(view, 0, rank);
             while (!start.load(std::memory_order_acquire)) {}
             for (uint32_t attempt = 0; attempt < tasks * 2; ++attempt) {
-                SchedulerReadyClaim claim{};
-                if (!scheduler_claim_ready_for_slot(view.graph, base, &local, run, 0, &claim)) {
+                bool progress = false;
+                uint32_t slot_index = UINT32_MAX;
+                if (!scheduler_refill_execution_tokens(view.graph, base, &local, run, 0, &progress) ||
+                    !scheduler_progress_execution_tokens(view.graph, base, &local, run, 0, &slot_index, &progress)) {
                     ++failures;
                     break;
                 }
-                if (scheduler_task_ref_is_null(claim.task_ref)) continue;
-                if (claim.task_ref < 1 || claim.task_ref > tasks) {
+                if (slot_index == UINT32_MAX) continue;
+                auto &slot = local.slots[slot_index];
+                if (slot.task_ref < 1 || slot.task_ref > tasks || slot.block_idx != 0 ||
+                    scheduler_prepared_owner(slot.prepared.claimed_state) != local.worker_id()) {
                     ++failures;
                     break;
                 }
-                ++claims[claim.task_ref - 1];
+                ++claims[slot.task_ref - 1];
+                slot.state = SchedulerDispatchSlotState::EXECUTING;
+                if (!scheduler_complete_own_slot<false>(view.graph, base, &local, run, slot_index, 0)) {
+                    ++failures;
+                    break;
+                }
             }
         });
     }
@@ -763,31 +839,45 @@ TEST(HbgNativeGraphPlan, ConcurrentConsumersClaimEachNativeTaskOnce) {
     for (auto &thief : thieves)
         thief.join();
     EXPECT_EQ(failures.load(), 0u);
-    for (const auto &count : claims)
-        EXPECT_EQ(count.load(), 1u);
+    auto local = ready_worker(view, 0, 0);
+    for (uint32_t index = 0; index < tasks; ++index) {
+        EXPECT_EQ(claims[index].load(), 1u);
+        const auto *control = scheduler_task_control_at(base, &local, index + 1);
+        EXPECT_EQ(control->next_block, 1u);
+        EXPECT_TRUE(scheduler_completion_done(control->completion_state));
+    }
     EXPECT_EQ(scheduler_read_error(run), 0u);
 }
 
-TEST(HbgNativeGraphPlan, OrderedIdleHintFindsSharedReadyWithoutClaimingIt) {
+TEST(HbgNativeGraphPlan, AcquiredTokenDoesNotBypassNativeEntryDependency) {
     for (uint32_t type : {0u, 1u}) {
         NativeViewFixture view(ready_definition(type, 1, true), {0}, true, 30);
+        prepare_native_calls(view);
         auto local = ready_worker(view, type, 0);
-        SchedulerAdmissionLocalState admission{};
-        admission.capacity = 1;
-        admission.control_offset = view.layout.admission_control_offset;
-        local.admission = &admission;
-        bool empty = false;
-        EXPECT_FALSE(scheduler_ordered_poll_may_progress(view.graph, view.backing.get(), &local, &empty));
-        EXPECT_TRUE(empty);
-        seed_native_ready(view, local, 1);
-        EXPECT_TRUE(scheduler_ordered_poll_may_progress(view.graph, view.backing.get(), &local, &empty));
-        EXPECT_FALSE(empty);
-        const auto queue = scheduler_ready_pool_queue(view.backing.get(), view.ready_pool.header, type);
-        EXPECT_EQ(queue.control->head, 0u);
-        EXPECT_EQ(queue.control->reserved_tail, 1u);
-        EXPECT_EQ(queue.entries[0].task_ref, 1);
-        EXPECT_EQ(admission.scan_cursor, 0u);
-        EXPECT_EQ(admission.current_task_ref, SCHEDULER_TASK_REF_INVALID);
+        auto *base = view.backing.get();
+        auto *run = static_cast<SchedulerRunControl *>(base);
+        bool progress = false;
+        ASSERT_TRUE(scheduler_refill_execution_tokens(view.graph, base, &local, run, 0, &progress));
+        ASSERT_TRUE(scheduler_execution_token_has_task(&local, 1));
+        const auto owned = local.execution_tokens[0].prepared;
+        const auto *control = scheduler_task_control_at(base, &local, 1);
+        EXPECT_EQ(control->next_block, 1u);
+        uint32_t direct = UINT32_MAX;
+        ASSERT_TRUE(scheduler_progress_execution_tokens(view.graph, base, &local, run, 0, &direct, &progress));
+        EXPECT_EQ(direct, UINT32_MAX);
+        EXPECT_FALSE(progress);
+        for (const auto &slot : local.slots)
+            EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FREE);
+        EXPECT_FALSE(scheduler_completion_done(control->completion_state));
+        complete_native_entry(view);
+        ASSERT_TRUE(scheduler_progress_execution_tokens(view.graph, base, &local, run, 0, &direct, &progress));
+        ASSERT_NE(direct, UINT32_MAX);
+        EXPECT_TRUE(progress);
+        EXPECT_EQ(local.slots[direct].task_ref, 1);
+        EXPECT_EQ(local.slots[direct].prepared.execution_index, owned.execution_index);
+        EXPECT_EQ(local.slots[direct].prepared.claimed_state, owned.claimed_state);
+        EXPECT_EQ(control->next_block, 1u) << "dependency completion dispatches the existing reservation";
+        EXPECT_EQ(scheduler_read_error(run), 0u);
     }
 }
 
@@ -805,8 +895,7 @@ struct ControlFixture : NativeViewFixture {
             config.graph = &graph;
             config.task_controls_offset = layout.task_controls_offset;
             config.task_metadata_offset = static_cast<uint32_t>(layout.task_metadata_offset);
-            config.control_inboxes_offset = layout.control_inboxes_offset;
-            config.ready_pool_offset = ready_pool.header_offset;
+            config.task_catalog_offset = catalog_plan.header_offset;
             config.runtime_worker_count = 3;
             config.scheduler_count = 3;
             config.cluster_count = 1;
@@ -816,19 +905,10 @@ struct ControlFixture : NativeViewFixture {
             config.worker_ids[1] = 1;
             config.worker_ids[2] = 2;
 
-            local.control_peer_cursor = worker + 1;
+            local.control_peer_cursor = worker;
             // No free payload slots: control readiness must remain independent.
             for (auto &slot : local.slots)
                 slot.state = SchedulerDispatchSlotState::READY;
-        }
-        for (int64_t ref = 0; ref < static_cast<int64_t>(graph.task_count); ++ref) {
-            const auto route = scheduler_bootstrap_route_task(graph, backing.get(), &locals[0], run, ref);
-            if (route == SchedulerRouteResult::READY_TO_ENQUEUE) {
-                if (!scheduler_control_enqueue(graph, backing.get(), &locals[0], run, ref))
-                    throw std::runtime_error("enqueue");
-            } else if (route != SchedulerRouteResult::WAITING) {
-                throw std::runtime_error("bootstrap route");
-            }
         }
     }
     uint64_t completed() const {
@@ -846,6 +926,12 @@ TEST(HbgNativeGraphPlan, DummyChainProgressesWithFullKernelSlotsAfterBootstrapBa
         rows[i].push_back(i - 1);
     DefinitionFixture body(rows, true);
     ControlFixture view(body);
+    const auto *initial_controls =
+        scheduler_state_at<SchedulerTaskControl>(view.backing.get(), view.layout.task_controls_offset);
+    for (const auto &instance : view.plan.instances) {
+        EXPECT_EQ(initial_controls[instance.enter_ref].completion_state, scheduler_completion_initial_state(1));
+        EXPECT_EQ(initial_controls[instance.exit_ref].completion_state, scheduler_completion_initial_state(1));
+    }
     bool progress = true;
     ASSERT_TRUE(scheduler_service_controls(view.graph, view.backing.get(), &view.locals[0], view.run, 0, &progress));
     EXPECT_FALSE(progress);
@@ -855,18 +941,20 @@ TEST(HbgNativeGraphPlan, DummyChainProgressesWithFullKernelSlotsAfterBootstrapBa
         for (auto &local : view.locals) {
             const auto before = local.pending_completed;
             ASSERT_TRUE(scheduler_service_controls(view.graph, view.backing.get(), &local, view.run, 0, &progress));
-            EXPECT_LE(local.pending_completed - before, SCHEDULER_CONTROL_NODE_BUDGET + 1);
+            EXPECT_LE(local.pending_completed - before, SCHEDULER_CONTROL_NODE_BUDGET);
         }
     }
     ASSERT_EQ(view.completed(), view.graph.task_count);
     auto *controls = scheduler_state_at<SchedulerTaskControl>(view.backing.get(), view.layout.task_controls_offset);
     for (uint64_t i = 0; i < view.graph.task_count; ++i) {
-        EXPECT_EQ(scheduler_gm_query(controls[i].state), static_cast<int64_t>(SchedulerTaskState::DONE));
-        EXPECT_EQ(scheduler_gm_query(controls[i].wake_list_head), SCHEDULER_WAKE_LIST_CLOSED);
+        EXPECT_EQ(
+            scheduler_completion_task_state(scheduler_gm_query(controls[i].completion_state)),
+            static_cast<int64_t>(SchedulerTaskState::DONE)
+        );
     }
 }
 
-TEST(HbgNativeGraphPlan, SynchronousFanoutFinishesWithinOneNodeService) {
+TEST(HbgNativeGraphPlan, IndependentControlsRespectEachServiceBudget) {
     DefinitionFixture body(std::vector<std::vector<uint16_t>>(130), true);
     ControlFixture view(body);
     scheduler_gm_store(view.run->bootstrap_scan_complete, uint64_t{1});
@@ -876,7 +964,7 @@ TEST(HbgNativeGraphPlan, SynchronousFanoutFinishesWithinOneNodeService) {
     EXPECT_GT(view.locals[0].pending_completed, 0);
     EXPECT_LE(view.locals[0].pending_completed, SCHEDULER_CONTROL_NODE_BUDGET);
     auto *root = scheduler_task_control_at(view.backing.get(), &view.locals[0], 0);
-    EXPECT_EQ(root->wake_list_head, SCHEDULER_WAKE_LIST_CLOSED);
+    EXPECT_EQ(root->completion_state, scheduler_completion_completed_state(1));
     for (uint32_t step = 0; step < 128 && view.completed() < view.graph.task_count; ++step)
         for (auto &local : view.locals)
             ASSERT_TRUE(scheduler_service_controls(view.graph, view.backing.get(), &local, view.run, 0, &progress));
@@ -969,13 +1057,25 @@ struct BoundArgumentsFixture {
 };
 }  // namespace
 
+namespace {
+SchedulerGraphBindingError bind_host_arguments(const SchedulerGraphView &graph, int64_t ref) {
+    SchedulerNativeNode node{};
+    if (!scheduler_native_node_checked(graph, ref, &node)) return SchedulerGraphBindingError::NODE;
+    return native_graph_bind_arguments(
+        graph, ref, reinterpret_cast<const simpler::hbg::TensorData *>(node.instance->boundary_tensors_address),
+        reinterpret_cast<const uint64_t *>(node.instance->boundary_scalars_address),
+        reinterpret_cast<void *>(node.instance->args_base)
+    );
+}
+}  // namespace
+
 TEST(HbgNativeGraphPlan, BindingRelocatesAllFieldsAndKeepsInstancesIndependent) {
     auto body = argument_definition(true);
     NativeViewFixture view(body, {0, 0});
     BoundArgumentsFixture first(view, 0), second(view, 1);
     for (auto *bound : {&first, &second}) {
         const auto &instance = *bound->instance;
-        ASSERT_EQ(scheduler_bind_graph_arguments(view.graph, instance.child_begin), SchedulerGraphBindingError::NONE);
+        ASSERT_EQ(bind_host_arguments(view.graph, instance.child_begin), SchedulerGraphBindingError::NONE);
         const auto &plan = view.plan.definitions[0].children[0];
         auto *tensors = reinterpret_cast<simpler::hbg::Tensor *>(instance.args_base + plan.tensors_offset);
         EXPECT_EQ(tensors[0].buffer.addr, bound->boundary.buffer.addr);
@@ -1018,12 +1118,12 @@ TEST(HbgNativeGraphPlan, ParameterBindingRejectsViewsPastTheBoundaryBuffer) {
     BoundArgumentsFixture bound(view, 0);
     const auto ref = bound.instance->child_begin;
     bound.boundary.buffer.size = 80;
-    ASSERT_EQ(scheduler_bind_graph_arguments(view.graph, ref), SchedulerGraphBindingError::NONE);
+    ASSERT_EQ(bind_host_arguments(view.graph, ref), SchedulerGraphBindingError::NONE);
     bound.boundary.buffer.size = 79;
-    EXPECT_EQ(scheduler_bind_graph_arguments(view.graph, ref), SchedulerGraphBindingError::TENSOR);
+    EXPECT_EQ(bind_host_arguments(view.graph, ref), SchedulerGraphBindingError::TENSOR);
     bound.boundary.buffer.size = 80;
     bound.boundary.start_offset++;
-    EXPECT_EQ(scheduler_bind_graph_arguments(view.graph, ref), SchedulerGraphBindingError::TENSOR);
+    EXPECT_EQ(bind_host_arguments(view.graph, ref), SchedulerGraphBindingError::TENSOR);
 }
 
 TEST(HbgNativeGraphPlan, ParameterBindingRejectsInvalidElementSizeAndExtentOverflow) {
@@ -1036,9 +1136,7 @@ TEST(HbgNativeGraphPlan, ParameterBindingRejectsInvalidElementSizeAndExtentOverf
         body.put(body.header.off_tensors, 0, parameter);
         NativeViewFixture view(body, {0});
         BoundArgumentsFixture bound(view, 0);
-        EXPECT_EQ(
-            scheduler_bind_graph_arguments(view.graph, bound.instance->child_begin), SchedulerGraphBindingError::TENSOR
-        );
+        EXPECT_EQ(bind_host_arguments(view.graph, bound.instance->child_begin), SchedulerGraphBindingError::TENSOR);
     }
 }
 
@@ -1048,19 +1146,19 @@ TEST(HbgNativeGraphPlan, BindingRejectsOverflowAndInvalidBoundaryBeforePublicati
     BoundArgumentsFixture bound(view, 0);
     const auto ref = bound.instance->child_begin;
     bound.boundary.start_offset = UINT64_MAX;
-    EXPECT_EQ(scheduler_bind_graph_arguments(view.graph, ref), SchedulerGraphBindingError::TENSOR);
+    EXPECT_EQ(bind_host_arguments(view.graph, ref), SchedulerGraphBindingError::TENSOR);
     bound.boundary.start_offset = 7;
     bound.boundary.buffer.size = 32;
-    EXPECT_EQ(scheduler_bind_graph_arguments(view.graph, ref), SchedulerGraphBindingError::TENSOR);
+    EXPECT_EQ(bind_host_arguments(view.graph, ref), SchedulerGraphBindingError::TENSOR);
     bound.boundary.buffer.size = 4096;
     bound.instance->boundary_scalars_address = 0;
-    EXPECT_EQ(scheduler_bind_graph_arguments(view.graph, ref), SchedulerGraphBindingError::SCALAR);
+    EXPECT_EQ(bind_host_arguments(view.graph, ref), SchedulerGraphBindingError::SCALAR);
     bound.instance->boundary_scalars_address = reinterpret_cast<uint64_t>(&bound.scalar);
     bound.instance->args_base++;
-    EXPECT_EQ(scheduler_bind_graph_arguments(view.graph, ref), SchedulerGraphBindingError::INSTANCE);
+    EXPECT_EQ(bind_host_arguments(view.graph, ref), SchedulerGraphBindingError::INSTANCE);
 }
 
-TEST(HbgNativeGraphPlan, BootstrapBindsBlockedChildAndRefreshesReusedArgumentBacking) {
+TEST(HbgNativeGraphPlan, HostBindsBlockedChildAndRefreshesReusedArgumentBacking) {
     auto body = argument_definition(true);
     NativeViewFixture view(body, {0}, true);
     BoundArgumentsFixture bound(view, 0);
@@ -1082,13 +1180,16 @@ TEST(HbgNativeGraphPlan, BootstrapBindsBlockedChildAndRefreshesReusedArgumentBac
         bound.scalar = 70 + epoch;
         values[epoch + 5] = 0;
         const SchedulerGraphAccess access(view.graph);
-        ASSERT_TRUE(scheduler_bootstrap_bind_arguments(access, ref, &local, run));
+        ASSERT_EQ(bind_host_arguments(view.graph, ref), SchedulerGraphBindingError::NONE);
         EXPECT_EQ(run->bootstrap_scan_complete, 0u);
-        EXPECT_EQ(control->state, static_cast<int64_t>(SchedulerTaskState::BLOCKED));
+        EXPECT_EQ(
+            scheduler_completion_task_state(control->completion_state),
+            static_cast<int64_t>(SchedulerTaskState::BLOCKED)
+        );
         EXPECT_EQ(scalars[0], 70 + epoch);
         EXPECT_EQ(tensors[0].start_offset, epoch + 3);
         // A producer writes the operand after descriptor binding. Its value is
-        // observed by predicate evaluation, not frozen by bootstrap preparation.
+        // observed by predicate evaluation, not frozen by Host preparation.
         values[epoch + 5] = 17;
         ASSERT_EQ(scheduler_observe_graph_arguments(access, ref), SchedulerGraphBindingError::NONE);
         EXPECT_EQ(scheduler_evaluate_task_predicate(access, ref), SchedulerPredicateResult::PASS);
@@ -1101,6 +1202,9 @@ DefinitionFixture cooperative_argument_definition(bool mix, LaneMask mix_mask = 
     SubTaskDefinition task{};
     std::memcpy(&task, body.bytes.data() + body.header.off_sub_tasks, sizeof(task));
     task.logical_block_num = 2;
+    TaskAttrs attrs(task.task_attrs);
+    attrs.set_sync_start();
+    task.task_attrs = attrs.raw();
     task.total_required_subtasks = mix ? 6 : 2;
     if (mix) {
         task.active_mask = mix_mask;
@@ -1113,22 +1217,25 @@ DefinitionFixture cooperative_argument_definition(bool mix, LaneMask mix_mask = 
     return body;
 }
 struct NativeAdmissionFixture : NativeViewFixture {
-    std::array<SchedulerLocalState, 3> locals;
-    std::array<SchedulerAdmissionLocalState, 3> admissions;
+    static constexpr uint32_t worker_count = 6;
+    std::array<SchedulerLocalState, worker_count> locals;
+    std::array<SchedulerAdmissionLocalState, worker_count> admissions;
     BoundArgumentsFixture bound;
     SchedulerRunControl *run;
     explicit NativeAdmissionFixture(bool mix, LaneMask mix_mask = LaneMask::all()) :
-        NativeViewFixture(cooperative_argument_definition(mix, mix_mask), {0}, true),
+        NativeViewFixture(cooperative_argument_definition(mix, mix_mask), {0}, true, worker_count),
         bound(*this, 0) {
         run = static_cast<SchedulerRunControl *>(backing.get());
         run->expected_task_count = graph.task_count;
         auto *contexts = scheduler_state_at<SchedulerWorkerContext>(backing.get(), layout.worker_contexts_offset);
-        for (uint32_t worker = 0; worker < 3; ++worker) {
+        for (uint32_t worker = 0; worker < worker_count; ++worker) {
+            const uint32_t cluster = worker / 3;
+            const uint32_t self_lane = worker % 3;
             contexts[worker].worker_index = worker;
-            contexts[worker].core_type = static_cast<int32_t>(worker == 0 ? CoreType::AIC : CoreType::AIV);
-            contexts[worker].cluster_index = 0;
+            contexts[worker].core_type = static_cast<int32_t>(self_lane == 0 ? CoreType::AIC : CoreType::AIV);
+            contexts[worker].cluster_index = cluster;
             for (uint32_t lane = 0; lane < 3; ++lane)
-                contexts[worker].cluster_worker_ids[lane] = lane;
+                contexts[worker].cluster_worker_ids[lane] = cluster * 3 + lane;
             auto &config = locals[worker].config;
             config.graph = &graph;
             config.shared_context = contexts + worker;
@@ -1136,17 +1243,16 @@ struct NativeAdmissionFixture : NativeViewFixture {
             config.worker_contexts_offset = layout.worker_contexts_offset;
             config.task_controls_offset = layout.task_controls_offset;
             config.task_metadata_offset = layout.task_metadata_offset;
-            config.ready_pool_offset = ready_pool.header_offset;
-            config.runtime_worker_count = 3;
-            config.cluster_count = 1;
-            config.self_lane = worker;
-            config.self_core_type = worker == 0 ? 0 : 1;
-            config.worker_ids[0] = 0;
-            config.worker_ids[1] = 1;
-            config.worker_ids[2] = 2;
+            config.task_catalog_offset = catalog_plan.header_offset;
+            config.runtime_worker_count = worker_count;
+            config.cluster_count = worker_count / 3;
+            config.self_lane = self_lane;
+            config.self_core_type = self_lane == 0 ? 0 : 1;
+            for (uint32_t lane = 0; lane < 3; ++lane)
+                config.worker_ids[lane] = cluster * 3 + lane;
             locals[worker].admission = &admissions[worker];
         }
-        for (uint32_t worker = 0; worker < 3; ++worker)
+        for (uint32_t worker = 0; worker < worker_count; ++worker)
             if (!scheduler_initialize_admission(backing.get(), &locals[worker], &admissions[worker]))
                 throw std::runtime_error("admission init");
     }
@@ -1157,71 +1263,51 @@ struct NativeAdmissionFixture : NativeViewFixture {
 };
 }  // namespace
 
-TEST(HbgNativeGraphPlan, BootstrapArgumentsSurviveAdmissionRetriesForSpmdAndMix) {
-    for (bool mix : {false, true}) {
-        NativeAdmissionFixture view(mix);
-        auto *base = view.backing.get();
-        auto *local = &view.locals[0];
-        auto *admission = &view.admissions[0];
-        ASSERT_TRUE(scheduler_bootstrap_bind_arguments(view.graph, view.child(), local, view.run));
-        ASSERT_TRUE(scheduler_bootstrap_prepare_admission(view.graph, base, local, view.run, admission, view.child()));
-        view.run->bootstrap_scan_complete = 1;
-        view.bound.scalar = 999;
-        SchedulerReadyClaim candidate{};
-        candidate.task_ref = view.child();
-        ASSERT_EQ(
-            scheduler_try_claim_admission(view.graph, base, local, view.run, admission, candidate),
-            SchedulerAdmissionResult::PROGRESS
-        );
-        view.control()->commit_lock = 3;
-
-        const auto &plan = view.plan.definitions[0].children[0];
-        auto *scalars = reinterpret_cast<uint64_t *>(view.bound.instance->args_base + plan.scalars_offset);
-        EXPECT_EQ(scalars[0], 71);
-        EXPECT_EQ(
-            scheduler_try_commit_admission(view.graph, base, local, view.run, admission),
-            SchedulerAdmissionResult::RETRY
-        );
-
-        EXPECT_EQ(scalars[0], 71) << "admission does not rewrite bootstrap's immutable argument publication";
-        view.control()->commit_lock = 0;
-        ASSERT_EQ(
-            scheduler_try_commit_admission(view.graph, base, local, view.run, admission),
-            SchedulerAdmissionResult::PROGRESS
-        );
-        EXPECT_EQ(view.control()->commit_tail, 1);
-        for (uint32_t worker = 0; worker < 3; ++worker) {
-            ASSERT_TRUE(scheduler_refresh_local_obligation(
-                view.graph, base, &view.locals[worker], view.run, &view.admissions[worker]
-            ));
-            EXPECT_EQ(
-                view.admissions[worker].current_task_ref, mix || worker == 0 ? view.child() : SCHEDULER_TASK_REF_INVALID
-            );
-        }
-        EXPECT_EQ(scalars[0], 71);
-    }
-}
-
-TEST(HbgNativeGraphPlan, BootstrapBindingFailureCannotClaimOrPublishAdmission) {
+TEST(HbgNativeGraphPlan, HostArgumentsSurviveMixAdmissionRetries) {
     NativeAdmissionFixture view(true);
     auto *base = view.backing.get();
+    auto *local = &view.locals[0];
+    auto *admission = &view.admissions[0];
+    ASSERT_EQ(bind_host_arguments(view.graph, view.child()), SchedulerGraphBindingError::NONE);
+    ASSERT_TRUE(scheduler_bootstrap_prepare_admission(view.graph, base, local, view.run, admission, view.child()));
+    view.run->bootstrap_scan_complete = 1;
+    complete_native_entry(view);
+    view.bound.scalar = 999;
     SchedulerReadyClaim candidate{};
     candidate.task_ref = view.child();
+    ASSERT_EQ(
+        scheduler_stage_admission_candidate(view.graph, base, local, view.run, admission, candidate.task_ref),
+        SchedulerAdmissionResult::PROGRESS
+    );
+    view.control()->commit_lock = 3;
+    const auto &plan = view.plan.definitions[0].children[0];
+    auto *scalars = reinterpret_cast<uint64_t *>(view.bound.instance->args_base + plan.scalars_offset);
+    EXPECT_EQ(scalars[0], 71);
+    EXPECT_EQ(
+        scheduler_try_commit_admission(view.graph, base, local, view.run, admission), SchedulerAdmissionResult::RETRY
+    );
+    EXPECT_EQ(scalars[0], 71) << "admission does not rewrite Host's immutable argument publication";
+    view.control()->commit_lock = 0;
+    ASSERT_EQ(
+        scheduler_try_commit_admission(view.graph, base, local, view.run, admission), SchedulerAdmissionResult::PROGRESS
+    );
+    EXPECT_EQ(view.control()->commit_tail, 1);
+    for (uint32_t worker = 0; worker < NativeAdmissionFixture::worker_count; ++worker) {
+        ASSERT_TRUE(scheduler_refresh_local_obligation(
+            view.graph, base, &view.locals[worker], view.run, &view.admissions[worker]
+        ));
+        EXPECT_EQ(view.admissions[worker].current_task_ref, view.child());
+    }
+    EXPECT_EQ(scalars[0], 71);
+}
+
+TEST(HbgNativeGraphPlan, HostBindingRejectsInvalidArgumentsBeforeDevicePublication) {
+    NativeAdmissionFixture view(true);
     view.bound.instance->boundary_scalars_address = 0;
-    EXPECT_FALSE(scheduler_bootstrap_bind_arguments(view.graph, view.child(), &view.locals[0], view.run));
+    EXPECT_EQ(bind_host_arguments(view.graph, view.child()), SchedulerGraphBindingError::SCALAR);
     EXPECT_EQ(view.run->bootstrap_scan_complete, 0u);
     EXPECT_EQ(view.run->bootstrap_scan_arrived_count, 0u);
-    EXPECT_EQ(
-        scheduler_try_claim_admission(view.graph, base, &view.locals[0], view.run, &view.admissions[0], candidate),
-        SchedulerAdmissionResult::ERROR
-    );
-    EXPECT_EQ(
-        scheduler_try_commit_admission(view.graph, base, &view.locals[0], view.run, &view.admissions[0]),
-        SchedulerAdmissionResult::ERROR
-    );
-    EXPECT_NE(scheduler_read_error(view.run), 0);
-    EXPECT_EQ(view.run->error_site, static_cast<uint64_t>(SchedulerErrorSite::GRAPH_BIND_SCALAR));
-    auto *control = scheduler_task_control_at(base, &view.locals[0], view.child());
+    auto *control = scheduler_task_control_at(view.backing.get(), &view.locals[0], view.child());
     EXPECT_EQ(control->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::UNCLAIMED));
     EXPECT_EQ(view.control()->commit_tail, 0);
     EXPECT_EQ(view.control()->commit_lock, 0);
@@ -1233,13 +1319,14 @@ TEST(HbgNativeGraphPlan, NativeMixAdmissionIncludesOnlyActiveLanesAndCoordinator
         auto *base = view.backing.get();
         auto *local = &view.locals[0];
         auto *admission = &view.admissions[0];
-        ASSERT_TRUE(scheduler_bootstrap_bind_arguments(view.graph, view.child(), local, view.run));
+        ASSERT_EQ(bind_host_arguments(view.graph, view.child()), SchedulerGraphBindingError::NONE);
         ASSERT_TRUE(scheduler_bootstrap_prepare_admission(view.graph, base, local, view.run, admission, view.child()));
         view.run->bootstrap_scan_complete = 1;
+        complete_native_entry(view);
         SchedulerReadyClaim candidate{};
         candidate.task_ref = view.child();
         ASSERT_EQ(
-            scheduler_try_claim_admission(view.graph, base, local, view.run, admission, candidate),
+            scheduler_stage_admission_candidate(view.graph, base, local, view.run, admission, candidate.task_ref),
             SchedulerAdmissionResult::PROGRESS
         );
 
@@ -1248,15 +1335,39 @@ TEST(HbgNativeGraphPlan, NativeMixAdmissionIncludesOnlyActiveLanesAndCoordinator
             SchedulerAdmissionResult::PROGRESS
         );
         const auto *record = scheduler_admission_record_at(base, admission, view.child());
-        EXPECT_EQ(record->member_count, mask.has_aic() ? 2u : 3u);
-        for (uint32_t worker = 0; worker < 3; ++worker) {
+        EXPECT_EQ(record->member_count, (NativeAdmissionFixture::worker_count / 3) * (mask.has_aic() ? 2u : 3u));
+        for (uint32_t worker = 0; worker < NativeAdmissionFixture::worker_count; ++worker) {
             ASSERT_TRUE(scheduler_refresh_local_obligation(
                 view.graph, base, &view.locals[worker], view.run, &view.admissions[worker]
             ));
-            const bool participates = worker == 0 || mask.has(static_cast<SubtaskSlot>(worker));
+            const bool participates = worker % 3 == 0 || mask.has(static_cast<SubtaskSlot>(worker % 3));
             EXPECT_EQ(
                 view.admissions[worker].current_task_ref, participates ? view.child() : SCHEDULER_TASK_REF_INVALID
             );
         }
     }
+}
+
+TEST(HbgNativeGraphPlan, HostBindingUsesMirrorsAndRetainsDeviceAddresses) {
+    auto body = argument_definition(true);
+    NativeViewFixture view(body, {0});
+    BoundArgumentsFixture bound(view, 0);
+    const auto &plan = view.plan.definitions[0].children[0];
+    auto *arguments = bound.heap + CHIP_ALIGN_SIZE;
+    bound.instance->heap_base = UINT64_C(0x80000000);
+    bound.instance->args_base = bound.instance->heap_base + CHIP_ALIGN_SIZE;
+    bound.instance->boundary_tensors_address = UINT64_C(0x90000000);
+    bound.instance->boundary_scalars_address = UINT64_C(0x90010000);
+    ASSERT_EQ(
+        native_graph_bind_arguments(view.graph, bound.instance->child_begin, &bound.boundary, &bound.scalar, arguments),
+        SchedulerGraphBindingError::NONE
+    );
+    const auto *tensors = reinterpret_cast<const simpler::hbg::Tensor *>(arguments + plan.tensors_offset);
+    EXPECT_EQ(tensors[0].buffer.addr, bound.boundary.buffer.addr);
+    EXPECT_EQ(tensors[1].buffer.addr, bound.instance->heap_base);
+    const auto *scalars = reinterpret_cast<const uint64_t *>(arguments + plan.scalars_offset);
+    EXPECT_EQ(scalars[0], bound.scalar);
+    EXPECT_EQ(scalars[1], 23u);
+    const auto *predicate = reinterpret_cast<const SchedulerDispatchPredicate *>(arguments + plan.predicate_offset);
+    EXPECT_EQ(predicate->addr, bound.boundary.buffer.addr + (bound.boundary.start_offset + 5) * 4);
 }

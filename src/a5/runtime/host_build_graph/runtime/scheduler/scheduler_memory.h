@@ -76,6 +76,16 @@ static inline __aicore__ void scheduler_observe_cache_line(volatile __gm__ void 
     scheduler_observe_cache_line(const_cast<__gm__ void *>(address));
 }
 
+static inline __aicore__ void scheduler_invalidate_startup_cache() {
+#if defined(__CCE_AICORE__)
+    dsb((mem_dsb_t)0);
+    dci();
+    __asm__ volatile("" ::: "memory");
+#else
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+}
+
 static inline __aicore__ void scheduler_observe_data_cache(__gm__ void *address) {
 #if defined(__CCE_AICORE__)
     scheduler_scalar_memory_issue(SchedPhaseKind::ScalarDcciEntire, 1, [address]() __aicore__ {
@@ -86,36 +96,6 @@ static inline __aicore__ void scheduler_observe_data_cache(__gm__ void *address)
     (void)address;
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 #endif
-}
-
-static inline __aicore__ void scheduler_writeback_dispatch_payload(__gm__ DispatchPayload *payload) {
-    for (uint64_t offset = 0; offset < sizeof(DispatchPayload); offset += 64)
-        scheduler_writeback_cache_line(reinterpret_cast<__gm__ uint8_t *>(payload) + offset);
-}
-
-static inline __aicore__ void scheduler_observe_dispatch_payload_control(__gm__ DispatchPayload *payload) {
-    scheduler_scalar_memory_issue(SchedPhaseKind::ScalarDcciSingle, 1, [payload]() __aicore__ {
-#if defined(__CCE_AICORE__)
-        dcci(payload, SINGLE_CACHE_LINE);
-#else
-    (void)payload;
-#endif
-    });
-}
-
-static inline __aicore__ void scheduler_observe_dispatch_payload_arguments(__gm__ DispatchPayload *payload) {
-    for (uint64_t offset = 64; offset < sizeof(DispatchPayload); offset += 64)
-        scheduler_invalidate_cache_line(reinterpret_cast<__gm__ uint8_t *>(payload) + offset);
-}
-
-static inline __aicore__ void scheduler_observe_dispatch_payload_barrier() {
-    scheduler_scalar_memory_issue(SchedPhaseKind::ScalarDsbAll, 1, []() __aicore__ {
-#if defined(__CCE_AICORE__)
-        dsb((mem_dsb_t)0);
-#else
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-#endif
-    });
 }
 
 // A5 ld_dev bypasses the scalar DCache but does not observe a value an atomic
@@ -295,9 +275,9 @@ static inline __aicore__ int64_t scheduler_gm_compare_exchange(
             (void)failure_order;
             return atomicCAS(const_cast<__gm__ int64_t *>(&value), expected, desired);
 #else
-    int64_t observed = expected;
-    (void)__atomic_compare_exchange_n(&value, &observed, desired, false, success_order, failure_order);
-    return observed;
+            int64_t observed = expected;
+            (void)__atomic_compare_exchange_n(&value, &observed, desired, false, success_order, failure_order);
+            return observed;
 #endif
         }
     );
@@ -314,9 +294,9 @@ static inline __aicore__ uint64_t scheduler_gm_compare_exchange(
             (void)failure_order;
             return atomicCAS(const_cast<__gm__ uint64_t *>(&value), expected, desired);
 #else
-    uint64_t observed = expected;
-    (void)__atomic_compare_exchange_n(&value, &observed, desired, false, success_order, failure_order);
-    return observed;
+            uint64_t observed = expected;
+            (void)__atomic_compare_exchange_n(&value, &observed, desired, false, success_order, failure_order);
+            return observed;
 #endif
         }
     );

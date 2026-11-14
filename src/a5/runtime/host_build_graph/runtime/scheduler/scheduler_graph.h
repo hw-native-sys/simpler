@@ -122,7 +122,7 @@ struct SchedulerGraphView {
     uint16_t view_bytes;
 };
 
-inline constexpr uint16_t SCHEDULER_GRAPH_VIEW_VERSION = 3;
+inline constexpr uint16_t SCHEDULER_GRAPH_VIEW_VERSION = 4;
 
 inline __aicore__ constexpr SchedulerGraphView
 scheduler_ordinary_graph_view(uint64_t storage_address, uint32_t task_count, uint64_t window_last_index) {
@@ -657,6 +657,17 @@ inline __aicore__ SchedulerGraphResult scheduler_parse_task_payload_arguments(
     return SchedulerGraphResult::OK;
 }
 
+inline __aicore__ void
+scheduler_materialize_call_arguments(const SchedulerTaskPayloadArguments &arguments, __gm__ uint64_t *args) {
+    int32_t n = 0;
+    for (int32_t i = 0; i < arguments.tensor_count; ++i) {
+        args[n++] =
+            reinterpret_cast<uint64_t>(arguments.tensors + static_cast<uint64_t>(i) * TASKPAYLOAD_TENSOR_STRIDE);
+    }
+    for (int32_t i = 0; i < arguments.scalar_count; ++i)
+        args[n++] = arguments.scalars[i];
+}
+
 inline __aicore__ SchedulerGraphResult scheduler_materialize_task_payload_resolved(
     const SchedulerGraphAccess &graph, const SchedulerTaskInfo &task, uint64_t function_bin_address,
     __gm__ DispatchPayload *dispatch_payload, const SchedulerTaskPayloadArguments *shared_arguments = nullptr,
@@ -672,32 +683,7 @@ inline __aicore__ SchedulerGraphResult scheduler_materialize_task_payload_resolv
         shared_arguments = &parsed;
     }
     dispatch_payload->function_bin_addr = function_bin_address;
-    if (write_arguments) {
-        int32_t n = 0;
-        for (int32_t i = 0; i < shared_arguments->tensor_count; ++i) {
-            dispatch_payload->args[n++] = reinterpret_cast<uint64_t>(
-                shared_arguments->tensors + static_cast<uint64_t>(i) * TASKPAYLOAD_TENSOR_STRIDE
-            );
-        }
-        for (int32_t i = 0; i < shared_arguments->scalar_count; ++i)
-            dispatch_payload->args[n++] = shared_arguments->scalars[i];
-    }
+    if (write_arguments) scheduler_materialize_call_arguments(*shared_arguments, dispatch_payload->args);
 
     return SchedulerGraphResult::OK;
-}
-
-inline __aicore__ void scheduler_materialize_mix_arguments(
-    const SchedulerTaskPayloadArguments &arguments, __gm__ DispatchPayload *const *targets, uint8_t count
-) {
-    for (int32_t i = 0; i < arguments.tensor_count; ++i) {
-        const uint64_t value =
-            reinterpret_cast<uint64_t>(arguments.tensors + static_cast<uint64_t>(i) * TASKPAYLOAD_TENSOR_STRIDE);
-        for (uint8_t lane = 0; lane < count; ++lane)
-            targets[lane]->args[i] = value;
-    }
-    for (int32_t i = 0; i < arguments.scalar_count; ++i) {
-        const uint64_t value = arguments.scalars[i];
-        for (uint8_t lane = 0; lane < count; ++lane)
-            targets[lane]->args[arguments.tensor_count + i] = value;
-    }
 }

@@ -13,9 +13,11 @@
 
 #include <atomic>
 #include <cinttypes>
+#include <cstddef>
 #include <cstdint>
 
 #include "aicpu/cache_maintenance.h"
+#include "common/memory_barrier.h"
 #include "common/unified_log.h"
 #include "host_build_graph/runtime_status.h"
 #include "scheduler/scheduler_graph.h"
@@ -122,6 +124,124 @@ inline void log_aicore_scheduler_error_identity(SchedulerRunControl *run, const 
         run->error_block_idx, run->error_group_seq, run->error_worker_index, run->error_cluster_lane,
         run->error_identity_fields
     );
+}
+
+inline void log_aicore_prepared_cell(uint64_t base, const SchedulerPreparedLayout &layout, uint64_t index) {
+    const auto *control = reinterpret_cast<const SchedulerPreparedControl *>(base + layout.controls_offset) + index;
+    const auto *shared_call = reinterpret_cast<const SchedulerPreparedCall *>(base + layout.calls_offset) + index;
+    cache_invalidate_range(control, sizeof(*control));
+    const uint64_t state = __atomic_load_n(&control->state, __ATOMIC_ACQUIRE);
+    cache_invalidate_range(shared_call, sizeof(*shared_call));
+    rmb();
+    const auto call = *shared_call;
+    const uint32_t owner = scheduler_prepared_execute_owner(state);
+    const int64_t executor = owner == UINT32_MAX ? -1 : static_cast<int64_t>(owner);
+    const uint64_t binding = base + layout.bindings_offset + index * sizeof(SchedulerExecutionBinding);
+    LOG_ERROR(
+        "A5 HBG prepared cell: index=%" PRIu64 " state=0x%" PRIx64 " phase=%" PRIu64
+        " source=host execute_owner=%" PRId64 " call_epoch=%" PRIu64 " call_index=%" PRIu64 " call_task=%" PRId64
+        " call_block=%" PRIu32 " call_lane=%u num_args=%u function=0x%" PRIx64,
+        index, state, state & UINT64_C(255), executor, call.run_epoch, call.execution_index, call.task_ref,
+        call.block_idx, static_cast<unsigned>(call.subtask_slot), static_cast<unsigned>(call.num_args),
+        call.function_bin_addr
+    );
+    LOG_ERROR(
+        "A5 HBG prepared contexts: index=%" PRIu64 " local=0x%" PRIx64 " expected_local=0x%" PRIx64 " global=0x%" PRIx64
+        " expected_global=0x%" PRIx64,
+        index, call.args[SPMD_LOCAL_CONTEXT_INDEX], binding + offsetof(SchedulerExecutionBinding, local_context),
+        call.args[SPMD_GLOBAL_CONTEXT_INDEX], binding + offsetof(SchedulerExecutionBinding, global_context)
+    );
+    for (uint16_t arg = 0; arg < call.num_args && arg < 8; ++arg)
+        LOG_ERROR(
+            "A5 HBG prepared argument: index=%" PRIu64 " arg=%u value=0x%" PRIx64, index, static_cast<unsigned>(arg),
+            call.args[arg]
+        );
+}
+
+inline void log_aicore_prepared_error(const SchedulerWorkerContext *context, SchedulerRunControl *run) {
+    if (context == nullptr || run == nullptr) return;
+    const auto *error_begin = reinterpret_cast<const uint8_t *>(run) + offsetof(SchedulerRunControl, error_claimed);
+    cache_invalidate_range(
+        error_begin, offsetof(SchedulerRunControl, worker_errors) - offsetof(SchedulerRunControl, error_claimed)
+    );
+    if (__atomic_load_n(&run->scheduler_error, __ATOMIC_ACQUIRE) == 0) return;
+    const uint64_t base = context->scheduler_state_base_address;
+    const uint64_t bytes = context->scheduler_state_bytes;
+    const auto region_valid = [bytes](uint64_t offset, uint64_t count, uint64_t stride, uint64_t alignment) {
+        return offset != 0 && offset % alignment == 0 && offset <= bytes && count <= (bytes - offset) / stride;
+    };
+    if (base == 0 || bytes > UINT64_MAX - base ||
+        !region_valid(
+            context->prepared_layout_offset, 1, sizeof(SchedulerPreparedLayout), alignof(SchedulerPreparedLayout)
+        )) {
+        LOG_ERROR("A5 HBG prepared snapshot: invalid state or prepared layout range");
+        return;
+    }
+    const auto *shared_layout =
+        reinterpret_cast<const SchedulerPreparedLayout *>(base + context->prepared_layout_offset);
+    cache_invalidate_range(shared_layout, sizeof(*shared_layout));
+    rmb();
+    const auto layout = *shared_layout;
+    LOG_ERROR(
+        "A5 HBG prepared failure: layout_epoch=%" PRIu64 " error_epoch=%" PRIu64 " task=%" PRIu64 " block=%" PRIu64
+        " worker=%" PRIu64 " physical_lane=%" PRIu32,
+        layout.run_epoch, run->error_run_epoch, run->error_task_ref, run->error_block_idx, run->error_worker_index,
+        run->error_cluster_lane
+    );
+    if (!region_valid(
+            layout.plans_offset, layout.task_count, sizeof(SchedulerExecutionPlan), alignof(SchedulerExecutionPlan)
+        ) ||
+        !region_valid(
+            layout.controls_offset, layout.execution_count, sizeof(SchedulerPreparedControl),
+            alignof(SchedulerPreparedControl)
+        ) ||
+        !region_valid(
+            layout.calls_offset, layout.execution_count, sizeof(SchedulerPreparedCall), alignof(SchedulerPreparedCall)
+        ) ||
+        !region_valid(
+            layout.bindings_offset, layout.execution_count, sizeof(SchedulerExecutionBinding),
+            alignof(SchedulerExecutionBinding)
+        )) {
+        LOG_ERROR("A5 HBG prepared snapshot: invalid execution storage range");
+        return;
+    }
+    if (run->error_task_ref >= layout.task_count || (run->error_identity_fields & SCHEDULER_ERROR_HAS_BLOCK) == 0) {
+        // A trapped kernel cannot publish its error identity. Report a bounded
+        // set of owned immutable calls when the supervisor detects the stall.
+        uint32_t reported = 0;
+        const auto *controls = reinterpret_cast<const SchedulerPreparedControl *>(base + layout.controls_offset);
+        for (uint64_t index = 0; index < layout.execution_count && reported < 8; ++index) {
+            cache_invalidate_range(&controls[index], sizeof(controls[index]));
+            const uint64_t state = __atomic_load_n(&controls[index].state, __ATOMIC_ACQUIRE);
+            if ((state & UINT64_C(255)) != static_cast<uint64_t>(SchedulerPreparedPhase::CLAIMED)) continue;
+            log_aicore_prepared_cell(base, layout, index);
+            ++reported;
+        }
+        return;
+    }
+    const auto *shared_plan =
+        reinterpret_cast<const SchedulerExecutionPlan *>(base + layout.plans_offset) + run->error_task_ref;
+    cache_invalidate_range(shared_plan, sizeof(*shared_plan));
+    rmb();
+    const auto plan = *shared_plan;
+    LOG_ERROR(
+        "A5 HBG prepared task plan: begin=%" PRIu64 " count=%" PRIu32 " blocks=%u active_mask=0x%x active_lanes=%u",
+        plan.execution_begin, plan.execution_count, static_cast<unsigned>(plan.block_num),
+        static_cast<unsigned>(plan.active_mask_bits), static_cast<unsigned>(plan.active_lane_count)
+    );
+    if (run->error_block_idx >= plan.block_num) return;
+    // Physical AIV lanes need not match the task's logical subtask slot.
+    uint32_t lane_rank = 0;
+    for (uint32_t lane = 0; lane < SUBTASK_SLOT_COUNT; ++lane) {
+        if ((plan.active_mask_bits & (1U << lane)) == 0) continue;
+        const uint64_t relative = run->error_block_idx * plan.active_lane_count + lane_rank++;
+        if (relative >= plan.execution_count || plan.execution_begin >= layout.execution_count ||
+            relative >= layout.execution_count - plan.execution_begin) {
+            LOG_ERROR("A5 HBG prepared snapshot: invalid block execution range");
+            return;
+        }
+        log_aicore_prepared_cell(base, layout, plan.execution_begin + relative);
+    }
 }
 
 /**

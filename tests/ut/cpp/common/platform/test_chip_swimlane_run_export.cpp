@@ -291,7 +291,7 @@ TEST(ChipSwimlaneRunExportTest, ExecutionIdentitiesTravelWithTheSealedRunAndAreN
     fixture::PhaseBuffers buffers;
     fixture::populate(collector, buffers, first.path);
     const auto section = ChipSwimlaneExtensionSection::AicoreExecutionIdentities;
-    const std::string payload = R"({"schema":"hbg-execution-identity-v1","producer":"aicore","records":[]})";
+    const std::string payload = R"({"schema":"hbg-execution-identity-v2","producer":"aicore","records":[]})";
     EXPECT_FALSE(collector.set_json_extension(fixture::kEpoch, section, "[]", 2));
     ASSERT_TRUE(collector.set_json_extension(fixture::kEpoch, section, payload.c_str(), payload.size()));
     EXPECT_FALSE(collector.set_json_extension(fixture::kEpoch, section, "{}", 2));

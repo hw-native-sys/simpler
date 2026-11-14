@@ -15,13 +15,14 @@
 #include "scheduler_protocol_execution.h"
 
 static inline __aicore__ void scheduler_execute_protocol_task(
-    __gm__ void *base, SchedulerLocalState *local, uint32_t pending_slot, __gm__ DispatchPayload *payload
+    __gm__ void *base, SchedulerLocalState *local, uint32_t pending_slot, uint64_t function_address,
+    __gm__ uint64_t *args, const __gm__ LocalContext &local_context
 ) {
-    scheduler_protocol_execution_entry(base, local, pending_slot, payload);
-    if (payload == nullptr || payload->function_bin_addr == 0) return;
+    scheduler_protocol_execution_entry(base, local, pending_slot, function_address, local_context);
+    if (function_address == 0) return;
     using Kernel = void (*)(__gm__ int64_t *);
-    const auto kernel = reinterpret_cast<Kernel>(payload->function_bin_addr);
-    kernel(reinterpret_cast<__gm__ int64_t *>(payload->args));
+    const auto kernel = reinterpret_cast<Kernel>(function_address);
+    kernel(reinterpret_cast<__gm__ int64_t *>(args));
     const uint64_t returned = scheduler_cycles();
     scheduler_store_barrier();
     scheduler_protocol_execution_returned(base, local, pending_slot, returned, scheduler_cycles());

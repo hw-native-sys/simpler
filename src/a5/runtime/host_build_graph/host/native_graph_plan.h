@@ -18,6 +18,7 @@
 
 #include "host_build_graph/submit_types.h"
 #include "scheduler/scheduler_native_graph.h"
+#include "scheduler/scheduler_graph_binding.h"
 
 // Owns the immutable recording bytes. Nothing refers to GraphHostState or its
 // staging arena, so prepare retry and park/resume may retain this value safely.
@@ -63,4 +64,11 @@ struct NativeGraphReadonlyImage {
 // external addresses before publishing the entire scheduler backing.
 bool native_graph_plan_readonly_image(
     const NativeGraphHostPlan &plan, NativeGraphReadonlyImage *out, std::string *error
+);
+
+// Sources are Host mirrors; instance addresses remain device addresses. The
+// caller retains and publishes argument_image at the instance's args_base.
+SchedulerGraphBindingError native_graph_bind_arguments(
+    const SchedulerGraphView &graph, int64_t ref, const simpler::hbg::TensorData *boundary_tensors,
+    const uint64_t *boundary_scalars, void *argument_image
 );

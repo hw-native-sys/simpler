@@ -15,7 +15,9 @@
 #include <cstdint>
 #include <type_traits>
 
-inline constexpr uint64_t SCHEDULER_PROTOCOL_MAGIC = UINT64_C(0x53504d4454520001);
+inline constexpr uint64_t SCHEDULER_PROTOCOL_MAGIC = UINT64_C(0x53504d4454520002);
+// A physical synchronous completion aliases the actual last contribution stamps.
+inline constexpr uint32_t SCHEDULER_PROTOCOL_COMPLETION_FROM_CONTRIBUTION = UINT32_C(1) << 30;
 inline constexpr uint32_t SCHEDULER_PROTOCOL_DEFERRED_FINISH = UINT32_C(1) << 31;
 
 enum SchedulerProtocolError : uint64_t {
@@ -99,6 +101,10 @@ struct alignas(64) SchedulerProtocolBlockOwner {
     uint8_t flags;
     SchedulerProtocolStamp releases_observed;
     uint64_t released_seq[3];
+    SchedulerProtocolStamp staged;
+    uint64_t sync_tail;
+    uint32_t sync_frontier[3];
+    uint32_t sync_hold[3];
 };
 
 struct alignas(64) SchedulerProtocolLaneTrace {
@@ -182,6 +188,7 @@ enum SchedulerProtocolExecutionFlags : uint32_t {
     SCHEDULER_PROTOCOL_PERMIT_TAIL = 1U << 4,
     SCHEDULER_PROTOCOL_PERMIT_NO_LOG = 1U << 5,
     SCHEDULER_PROTOCOL_PAYLOAD_PUBLISHED = 1U << 6,
+    SCHEDULER_PROTOCOL_CLUSTER_GROUP = 1U << 7,
 };
 
 // One worker owns this record; no global event counter participates in scheduling.
@@ -199,12 +206,12 @@ static_assert(sizeof(SchedulerProtocolTaskActor) == 64);
 static_assert(sizeof(SchedulerProtocolTaskTrace) == 128);
 static_assert(offsetof(SchedulerProtocolTaskTrace, completion) == 64);
 static_assert(sizeof(SchedulerProtocolMemberTrace) == 128);
-static_assert(sizeof(SchedulerProtocolBlockOwner) == 192);
+static_assert(sizeof(SchedulerProtocolBlockOwner) == 256);
 static_assert(sizeof(SchedulerProtocolClaimTrace) == 64);
-static_assert(offsetof(SchedulerProtocolBlockTrace, claim) == 192);
+static_assert(offsetof(SchedulerProtocolBlockTrace, claim) == 256);
 static_assert(sizeof(SchedulerProtocolLaneTrace) == 256);
-static_assert(offsetof(SchedulerProtocolBlockTrace, lanes) == 256);
-static_assert(sizeof(SchedulerProtocolBlockTrace) == 1024);
+static_assert(offsetof(SchedulerProtocolBlockTrace, lanes) == 320);
+static_assert(sizeof(SchedulerProtocolBlockTrace) == 1088);
 static_assert(sizeof(SchedulerProtocolExecutionTrace) == 256);
 static_assert(sizeof(SchedulerProtocolWorkerTrace) == 64);
 static_assert(

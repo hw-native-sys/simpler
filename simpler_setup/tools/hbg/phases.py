@@ -11,8 +11,8 @@
 Stated in full, not layered over a table shared with tmr. A name both runtimes use
 is not a shared phase: it is two phases that happen to carry the same label, and
 each runtime's own entry is what describes it. ``resolve`` is the clearest case --
-here it is this runtime's AICore completion walk and its dedicated resolution
-thread's work; under tmr it is a bar nested inside whichever phase observed the FIN.
+the AICPU producer's dedicated resolution thread emits ``resolve_standalone``;
+under tmr, ``resolve`` is nested inside whichever phase observed the FIN.
 Because the two vocabularies are independent, so is the classification built on
 them: this module carries its own ``canonical_sched_phase`` /
 ``nested_resolve_record_ids`` / ``scheduler_thread_role`` rather than passing a
@@ -22,13 +22,17 @@ The Python mirror of ``simpler::hbg::SchedPhaseKind``
 (src/common/host_build_graph/sched_phase_kind.h). Both of this runtime's producers
 are covered, because both are this runtime:
 
-  AICPU scheduler -- ``graph_prepare`` (bounded Definition expansion) and
+  AICPU scheduler (a2a3/wse) -- ``graph_prepare`` (bounded Definition expansion) and
       ``resolve_standalone``, which canonicalizes to ``resolve``.
-  AICore scheduler -- ``bootstrap``, ``state_probe``, ``refill`` and
-      ``idle``, plus ``dispatch`` / ``complete`` / ``resolve``. Written by
+  AICore scheduler (a5) -- ``bootstrap``, ``state_probe`` and
+      ``idle``, plus ``dispatch`` / ``complete`` and detailed Scalar phases. Written by
       append_scheduler_record() in
       a5/runtime/host_build_graph/host/runtime_maker.cpp. tmr has no AICore
       scheduler at all.
+
+The vocabulary also recognizes AICore ``resolve`` / ``refill`` IDs, but the
+execution-token path does not emit them. Its StateProbe acquisition envelopes
+can overlap within one discovery batch; Scalar profiles account for exclusive work.
 """
 
 from __future__ import annotations
@@ -38,7 +42,7 @@ from __future__ import annotations
 # is the question a reader and a fixture both ask, and PHASES below is a consequence
 # of it rather than a second list to keep in step.
 #
-# ``resolve`` is the AICore scheduler's completion walk. The AICPU scheduler's
+# The plain ``resolve`` ID belongs to the AICore vocabulary. The AICPU scheduler's
 # resolution thread writes ``resolve_standalone`` instead, which PHASE_ALIASES folds
 # into ``resolve`` for a report -- so on the wire the plain name is AICore's alone.
 PHASES_BY_PRODUCER = {
@@ -86,6 +90,46 @@ SCALAR_PHASES = frozenset(
         "scalar_backoff",
         "scalar_ready_claim",
         "scalar_payload",
+        "scalar_early_prepare",
+        "scalar_cluster_prepare",
+        "scalar_execution_token_progress",
+        "scalar_execution_token_refill",
+        "scalar_execution_token_receive",
+        "scalar_execution_token_dispatch",
+        "scalar_fanin_observe",
+        "scalar_cooperative_discover",
+        "scalar_fill_own_slots",
+        "scalar_fill_cooperative_slots",
+        "scalar_cluster_mix_service",
+        "scalar_cluster_mix_discover_task",
+        "scalar_cluster_mix_discover_next",
+        "scalar_cluster_mix_pending",
+        "scalar_cluster_mix_arm",
+        "scalar_cluster_mix_observe",
+        "scalar_cluster_mix_retire",
+        "scalar_cluster_mix_enter",
+        "scalar_cluster_mix_release",
+        "scalar_cluster_mix_drain",
+        "scalar_cluster_mix_publish_preparation",
+        "scalar_cluster_mix_conflicts",
+        "scalar_cluster_mix_all",
+        "scalar_prepared_receive",
+        "scalar_prepared_acquire",
+        "scalar_prepared_park_begin",
+        "scalar_prepared_park_publish",
+        "scalar_prepared_resume",
+        "scalar_prepared_return",
+        "scalar_prepared_observe",
+        "scalar_prepared_index",
+        "scalar_prepared_validate",
+        "scalar_group_reserve",
+        "scalar_group_park",
+        "scalar_group_resume",
+        "scalar_group_arm",
+        "scalar_group_acquire",
+        "scalar_cluster_mix_needs_service",
+        "scalar_execution_continuation",
+        "scalar_execution_token_fanin",
         "scalar_resolve",
         "scalar_mix",
         "scalar_async_check",
@@ -102,7 +146,6 @@ SCALAR_PHASES = frozenset(
         "scalar_ordered_poll",
         "scalar_admission_claim",
         "scalar_admission_publish",
-        "scalar_admission_prepare",
         "scalar_admission_commit",
         "scalar_admission_refresh",
         "scalar_ordinary_park",

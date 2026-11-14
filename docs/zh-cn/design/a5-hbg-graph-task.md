@@ -34,6 +34,8 @@ A5 HBG 只使用 resident ordinary/native Graph 执行。Host 在发布前拒绝
 | ---- | ------------------------ |
 | [数据布局与 Host 绑定](a5-hbg-graph-task/data-layout.md) | node 编号、wire 类型、地址来源、容量、GM 载体、prepare 重试 |
 | [调度与发布协议](a5-hbg-graph-task/protocol.md) | 控制队列、参数唯一写者、cache 发布、SPMD/MIX、完成与退出 |
+| [Admission 静态计划与一次验证](a5-hbg-graph-task/admission-preparation.md) | 待实现方案：统一覆盖全部 cooperative 形状；只读计划、bootstrap 分核验证一次、热路径动态检查及 L0 收益估算 |
+| [HBG 调度优化开发参考](a5-hbg-graph-task/build-execute-separation.md) | 当前实现与拟修改的统一入口：Host 预构造、提前候选和逻辑依赖、MIX/sync_start/defer_wait/Graph、包所有权与 cache、分阶段提交及 L0 验收 |
 | [全局与分级 ready 队列设计](a5-hbg-graph-task/ready-queue-design.md) | 业界方案、A5 原子争用、候选实现与对比验证 |
 | [两个 ready 队列设计与开发参考](a5-hbg-graph-task/two-ready-queues.md) | 已实现：AIC/MIX 共用一队列、AIV 使用一队列，无分片；发布领取合同、改动位置与验收 |
 | [独立 block 调度待选方案](a5-hbg-graph-task/block-ready-scheduling.md) | 已撤回原型的设计、收益/成本、同步安全与重启条件 |
@@ -80,7 +82,7 @@ child 完成推进内部依赖并减少 remaining；最后一个 child 才释放
 
 | A2A3 机制 | 本方案对应机制 |
 | --------- | -------------- |
-| 每实例 execution 对象和物化切片 | 每 Definition 只读计划、每实例 binding、bootstrap 分区内每 child 一次参数准备 |
+| 每实例 execution 对象和物化切片 | 每 Definition 只读计划、每实例 binding、Host 每 child 一次参数准备 |
 | materialized/published 前缀与 external-ready | 全拓扑 bootstrap gate + ENTER 依赖，不再动态发布 child 拓扑 |
 | route_cursor 游标 | 统一依赖计数与唯一 ready 发布者；无依赖 header 时保留 wake-list 路由 |
 | 每 child 更新 Graph remaining | EXIT 的全 sink fanin join；保留 run 的批量 resolve 计数 |
@@ -111,13 +113,11 @@ flowchart LR
 - 外部消费者对 shell 的引用映射到 EXIT；boundary 的 RAW/WAR/WAW 顺序因此保留。
 - ENTER/EXIT 没有 kernel、block、lane 或 admission membership。
 - Host 预建拓扑、fanout CSR 和初始 remaining；bootstrap 屏障内完成初始路由。无依赖 header 时才建 wake-list；执行阶段不动态添加 Graph 节点。
-- 参数由 bootstrap 的唯一 node 分区 owner 绑定一次；scan gate 后普通 owner 和 cooperative 成员首次观察，SPMD/MIX 的所有 block/lane 复用。
+- 参数由 Host 在 launch 前绑定一次并随 metadata 发布；Device 在取得执行责任后观察，SPMD/MIX 的所有 block/lane 复用。
 
-`p2-bootstrap-bind` 候选把参数准备并入现有 scan gate，不增加新的 barrier；
-**它会等待本 run 所有 child 参数准备完成后才开始消费 ready，O(N) 节点注册扫描也仍存在**。
-这是以启动并行准备替代 ready 临界路径复制的取舍，收益必须经完整模型测量确认。
-它也不复制 AICPU 的 `published_tasks + external_ready` 双事件 root 发布机制。
-root 只是依赖 ENTER 的普通节点，参数准备不会使一个尚未 ready 的 task 提前执行。
+当前 Host 预构造、跨核包消费和后续依赖观察的完整合同统一见
+[HBG 调度优化开发参考](a5-hbg-graph-task/build-execute-separation.md)。
+参数准备不改变 ENTER 与逻辑完成的执行门禁。
 
 已实现基底中所有 Graph 共用原有 cooperative admission 顺序；上述 block 调度方案曾重审该约束，现已撤回为后续候选。
 `sync_start` 的范围仍是一个 child 的 blocks；
@@ -150,8 +150,8 @@ EXIT 通过其 sink 依赖的 remaining 归零成为 ready；无依赖 header �
 交付依赖和验收见[实施文档](a5-hbg-graph-task/implementation.md)。本设计不授权发布 PR 或变更公共 API。
 
 预期减少的是重复拓扑处理、重复参数绑定及 Graph 聚合争用，不宣称参数总写入量下降。
-bootstrap 并行绑定会增加首 kernel 前的工作量；虽然移出 ready→kernel 临界路径，
-仍不能预先断言比 AICPU 提前物化更快。
+Host 参数绑定及 metadata 上传在启动前完成，仍需单列成本；
+设备总收益由当前实现的完整 L0 对照判断。
 该候选仍待功能和性能验证，不引入跨调度轮持有的物化锁。
 
 当前复用公共 Graph 已预留的 execution tail 作为参数 backing。
