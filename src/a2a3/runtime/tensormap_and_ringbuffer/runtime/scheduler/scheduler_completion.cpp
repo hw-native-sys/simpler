@@ -163,6 +163,23 @@ void SchedulerContext::complete_slot_task(
                 while (!mailbox->try_push_condition(
                     token, e->addr, e->backend_cookie, e->expected_value, e->engine, e->completion_type
                 )) {
+                    if (completed_.load(std::memory_order_acquire)) {
+                        // The consumer may already have stopped. Keep only the
+                        // unforwarded suffix for error-path drain after every
+                        // producer joins; the prefix is now owned by the mailbox.
+                        for (uint32_t j = i; j < cond_count; ++j) {
+                            const volatile auto &source = deferred_slab->entries[j];
+                            volatile auto &target = deferred_slab->entries[j - i];
+                            target.addr = source.addr;
+                            target.backend_cookie = source.backend_cookie;
+                            target.expected_value = source.expected_value;
+                            target.engine = source.engine;
+                            target.completion_type = source.completion_type;
+                            target._pad = 0;
+                        }
+                        deferred_slab->count = cond_count - i;
+                        return;
+                    }
                     sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
                     SPIN_WAIT_HINT();
                 }
@@ -189,6 +206,7 @@ void SchedulerContext::complete_slot_task(
         // Some subtask of this task registered conditions; finish the
         // registration by handing the slot_state off to the consumer.
         while (!mailbox->try_push_normal_done(slot_state.task->task_id, reinterpret_cast<uint64_t>(&slot_state))) {
+            if (completed_.load(std::memory_order_acquire)) return;
             sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
             SPIN_WAIT_HINT();
         }

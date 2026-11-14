@@ -362,6 +362,12 @@ Sim Context subblock/cluster identity, and every AICPU affinity binding result.
 Failure cancels and joins created threads before releasing their module or run
 storage. AICore identity failure is a before-submission refusal; an AICPU startup
 failure conservatively retains the existing partial-launch/drain contract.
+The process-resident Sim Context also owns a cancellation-register key.
+The A2/A3 Host runner binds it before executor startup, reports binding failures
+to the same startup gate, and clears it on thread exit. Its value borrows the
+run-owned simulated register cell; it has no callback into an unloadable SO.
+Compute kernel SOs query the resident context, not runtime-private TLS.
+
 Sim Context's two identity keys are process-resident; their checked setters
 return pthread errors, roll back partial key creation and allow later retry.
 

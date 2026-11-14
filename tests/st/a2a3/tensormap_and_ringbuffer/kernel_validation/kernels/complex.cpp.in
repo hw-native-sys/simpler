@@ -1,0 +1,90 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+#include <pto/pto-inst.hpp>
+#include "tensor.h"
+#if defined(__CPU_SIM)
+#include <cstdio>
+#endif
+#include "kernel_error_api.h"
+#include "kernel_cancellation_api.h"
+#include "async_kernel_api.h"
+#if CASE_MODE == 4
+#include "backend/sdma/sdma_completion_kernel.h"
+#endif
+
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    auto ctx = get_async_ctx(args);
+    auto *tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    auto *data = reinterpret_cast<__gm__ float *>(tensor->buffer.addr) + tensor->start_offset;
+    const int code = static_cast<int>(args[CONSUMER ? 2 : 1]);
+    if (code == 108) {
+#if defined(__CPU_SIM)
+        // Independent entry evidence: primary-error selection cannot suppress it.
+        fprintf(stderr, "VALIDATION_DEPENDENT_ENTERED\n");
+        fflush(stderr);
+#endif
+        report_kernel_error(ctx, KernelErrorCode::INVALID_OUTPUT);
+        return;
+    }
+    if (code == 109) {
+        auto *input = reinterpret_cast<__gm__ Tensor *>(args[1]);
+        auto *source = reinterpret_cast<__gm__ float *>(input->buffer.addr) + input->start_offset;
+        for (int i = 0; i < 1024; ++i) {
+            if (source[1024 + i] != 1.0f) {
+                report_kernel_error(ctx, KernelErrorCode::INVALID_OUTPUT);
+                return;
+            }
+        }
+        *data = 1.0f;
+        pto2::detail::defer_flush_range(data, sizeof(float));
+        return;
+    }
+    if (code == 0) {
+        *data = 1.0f;
+        pto2::detail::defer_flush_range(data, sizeof(float));
+#if CASE_MODE < 3 || CONSUMER
+        return;
+#endif
+    }
+    if (WAIT_LANE && code != 0) {
+        while (!kernel_cancel_requested(ctx)) {}
+        return;
+    }
+    if (get_block_idx(args) != 0) return;
+#if CASE_MODE == 2
+    for (volatile int i = 0; i < 200000; ++i) {}
+#endif
+#if CASE_MODE == 3
+    auto *counter = reinterpret_cast<__gm__ uint32_t *>(data);
+    *counter = 1;
+    pto2::detail::defer_flush_range(counter, sizeof(*counter));
+    save_expected_notification_counter(ctx, counter, 1);
+#endif
+#if CASE_MODE == 4
+    for (int i = 0; i < 1024; ++i)
+        data[i] = 1.0f;
+    pto2::detail::defer_flush_range(data, 1024 * sizeof(float));
+    pipe_barrier(PIPE_ALL);
+    using Shape = pto::Shape<1, 1, 1, 1, 1024>;
+    using Stride = pto::Stride<1024, 1024, 1024, 1024, 1>;
+    using Data = pto::GlobalTensor<float, Shape, Stride>;
+    using Scratch = pto::Tile<pto::TileType::Vec, uint8_t, 1, SDMA_SCRATCH_ALIGNMENT>;
+    Scratch scratch;
+    pto::TASSIGN(scratch, 0);
+    if (!send_request_entry(
+            ctx, SdmaTget(Data(data + 1024), Data(data), scratch, get_dma_workspace(args, DMA_WORKSPACE_SDMA))
+        ))
+        return;
+#endif
+    if (code != 0) {
+        report_kernel_error(ctx, KernelErrorCode::INDEX_OUT_OF_RANGE);
+    }
+}

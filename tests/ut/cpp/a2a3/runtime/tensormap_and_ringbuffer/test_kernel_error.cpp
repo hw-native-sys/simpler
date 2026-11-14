@@ -55,6 +55,11 @@ uint64_t get_sys_cnt_aicpu() {
 
 class SchedulerContextTestPeer {
 public:
+    static void stop(SchedulerContext &context) { context.completed_.store(true, std::memory_order_release); }
+    static void bind_runtime(SchedulerContext &context, RuntimeContext &runtime) { context.rt_ = &runtime; }
+    static const DeferredCompletionSlab &slab(SchedulerContext &context) {
+        return context.deferred_slab_per_core_[0][0];
+    }
     static void bind(SchedulerContext &context, SchedulerState &scheduler) { context.sched_ = &scheduler; }
     static void finish(
         SchedulerContext &context, ChipTaskSlotState &producer, int core, int block, const DeferredCompletionSlab &slab
@@ -161,6 +166,45 @@ TEST(KernelError, ConcurrentBlocksPreserveFirstCode) {
         -header->orch_error_code.load()
     );
     EXPECT_EQ(producer.completed_subtasks.load(), 0);
+}
+TEST(KernelError, CancelledMailboxProducerPreservesUnforwardedConditions) {
+    auto context = std::make_unique<SchedulerContext>();
+    auto scheduler = std::make_unique<SchedulerState>();
+    auto mailbox = std::make_unique<AICoreCompletionMailbox>();
+    auto runtime = std::make_unique<RuntimeContext>();
+    runtime->aicore_mailbox = mailbox.get();
+    SchedulerContextTestPeer::bind_runtime(*context, *runtime);
+    SchedulerContextTestPeer::bind(*context, *scheduler);
+    const auto token = TaskId::make(0, 19);
+    for (uint32_t i = 0; i < AICORE_COMPLETION_MAILBOX_CAPACITY - 1; ++i) {
+        ASSERT_TRUE(mailbox->try_push_condition(token, 1, 0, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER));
+    }
+    TaskDescriptor task{};
+    task.task_id = token;
+    TaskPayload payload{};
+    ChipTaskSlotState producer{};
+    producer.task = &task;
+    producer.payload = &payload;
+    producer.total_required_subtasks = 2;
+    DeferredCompletionSlab slab{};
+    slab.count = 2;
+    slab.entries[0] = {100, 200, 3, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0};
+    slab.entries[1] = {101, 201, 4, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_SDMA_EVENT_RECORD, 0};
+    SchedulerContextTestPeer::stop(*context);
+    SchedulerContextTestPeer::finish(*context, producer, 0, 0, slab);
+    const auto &remaining = SchedulerContextTestPeer::slab(*context);
+    ASSERT_EQ(remaining.count, 1u);
+    EXPECT_EQ(remaining.entries[0].addr, 101u);
+    EXPECT_EQ(remaining.entries[0].backend_cookie, 201u);
+    EXPECT_EQ(remaining.entries[0].expected_value, 4u);
+    EXPECT_EQ(remaining.entries[0].completion_type, COMPLETION_TYPE_SDMA_EVENT_RECORD);
+    EXPECT_EQ(producer.completed_subtasks.load(), 0);
+    AICoreCompletionMsgView msg{};
+    for (uint32_t i = 0; i < AICORE_COMPLETION_MAILBOX_CAPACITY; ++i) {
+        ASSERT_TRUE(mailbox->try_pop(msg));
+    }
+    EXPECT_EQ(msg.addr, 100u);
+    EXPECT_FALSE(mailbox->try_pop(msg));
 }
 }  // namespace
 

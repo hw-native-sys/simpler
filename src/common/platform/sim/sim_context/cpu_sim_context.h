@@ -46,6 +46,11 @@ int pto_cpu_sim_bind_device_checked(int device_id);
 /** Legacy void ABI: aborts on failure rather than returning with a stale binding. */
 void pto_cpu_sim_bind_device(int device_id);
 
+// Bind the calling AICore thread's dispatch register for cooperative cancellation.
+// A null binding clears it; both operations return a pthread error on failure.
+int pto_cpu_sim_bind_cancel_register(volatile uint32_t *reg);
+bool pto_cpu_sim_cancel_requested(uint32_t exit_signal);
+
 /** Return the device ID bound to the calling thread, or -1 if unbound. */
 int pto_cpu_sim_get_bound_device(void);
 

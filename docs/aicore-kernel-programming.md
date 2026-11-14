@@ -82,11 +82,41 @@ path, which can surface as an AICPU exception. This API does not introduce a
 typed Python exception or certify worker reuse after failure. Diagnostics work
 with DFX disabled. Argument values and ranges are not transported by this API.
 
-This initial contract covers ordinary local AIC/AIV tasks on A2/A3 TMR.
-Kernels must have no outstanding asynchronous operation and no cooperating
-lane waiting for work they would skip by returning. MIX, deferred operations,
-communication cancellation, HBG, and A5 require their own exit protocols;
-this API does not provide those protocols. Checks belong before the unsafe
+Local A2/A3 TMR also supports partial SPMD failure, gated dispatch and
+cooperatively cancellable MIX lanes. A lane that can wait for a failed partner
+must poll at bounded work boundaries and return when cancellation is requested:
+
+```cpp
+#include "kernel_cancellation_api.h"
+// ctx is the current get_async_ctx(args) result.
+while (!partner_ready()) {
+    if (kernel_cancel_requested(ctx)) return;
+}
+```
+
+The query reads this core's dispatch register; on cancellation it publishes
+registered completion conditions before returning true. It cannot interrupt a
+hardware blocking wait or an arbitrary non-cooperative kernel. Never enter such
+a wait if a partner can report a validation failure instead of signalling it.
+The executor's existing gated wait already honors shutdown.
+
+Register asynchronous requests through the existing deferred-completion API
+before reporting failure. After all scheduler participants have joined and
+all cores have acknowledged the existing exit protocol, the finalizer polls
+the wait list, mailbox and remaining per-core slabs. It does not complete tasks
+or release their consumers. A mailbox producer stopped by cancellation retains
+its unforwarded suffix in its slab, so requests retain exactly one drain owner.
+A timeout or invalid request leaves drain incomplete and preserves the primary
+failure. This is error-path bookkeeping, not a new Host recovery protocol:
+existing failed-run isolation remains in force, and no worker reuse is enabled.
+The retirement diagnostic distinguishes core failure from async drain failure.
+On hardware, an SDMA-provisioned Worker can surface RTS 507018 and refuse
+safe result copy-back even after AICPU reports a completed drain. The original
+code and drain result remain in device logs; this contract does not promise
+Host code recovery or reuse through that platform failure path.
+
+SDMA and registered counters are covered locally; cross-rank cancellation,
+HBG and A5 require their own protocols. Checks belong before the unsafe
 operation and must respect the operator's valid shape, masking, and index
 semantics. The runtime does not insert checks into existing kernels.
 

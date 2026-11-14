@@ -143,11 +143,21 @@ def test_creation_fault_ignores_unrelated_parent(startup_faults, tmp_path):
 
 @pytest.mark.parametrize("arch", ["a2a3", "a5"])
 @pytest.mark.parametrize("runtime", ["host_build_graph", "tensormap_and_ringbuffer"])
-@pytest.mark.parametrize("binding", ["core_tls", "subblock", "cluster", "affinity"])
+@pytest.mark.parametrize("binding", ["core_tls", "subblock", "cluster", "affinity", "cancel_register"])
 def test_sim_core_identity_failure_is_drained(arch, runtime, binding, tmp_path):
+    if binding == "cancel_register" and arch != "a2a3":
+        pytest.skip("cancel-register binding is an A2/A3 runner operation")
     # Wrapper key count is checked indirectly by the exact identity-source assertion below.
     key_count = 6 if arch == "a2a3" else 10
-    skip = {"core_tls": 1, "subblock": key_count + 1, "cluster": key_count + 2, "affinity": 1}[binding]
+    # Device binding precedes the A2/A3 cancel register, core TLS and identities.
+    cancel_bindings = int(arch == "a2a3")
+    skip = {
+        "core_tls": 1 + cancel_bindings,
+        "subblock": key_count + 1 + cancel_bindings,
+        "cluster": key_count + 2 + cancel_bindings,
+        "affinity": 1,
+        "cancel_register": 1,
+    }[binding]
     thread = "sim-aicpu-1" if binding == "affinity" else "sim-aic-1"
     template = Path(__file__).with_name("support").joinpath("sim_startup_fault.cpp").read_text()
     source = tmp_path / "identity.cpp"
