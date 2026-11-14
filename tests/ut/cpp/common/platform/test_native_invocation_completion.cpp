@@ -297,3 +297,46 @@ TEST(NativeInvocationCompletion, UnrequestedPrivateRecordDoesNotGateSuccessOrLos
     EXPECT_EQ(evidence.read_after_exit().terminal.code, -73);
     EXPECT_FALSE(evidence.read_after_exit().publication_succeeded);
 }
+
+TEST(NativeInvocationCompletion, PublishedKernelFailureRemainsANonzeroEntryResult) {
+    for (int code : {-105, -106, -107}) {
+        for (auto publication :
+             {NativeTerminalPublication::Published, NativeTerminalPublication::NotRequested,
+              NativeTerminalPublication::InvalidState}) {
+            NativeInvocationCompletion completion;
+            NativeInvocationEvidence evidence;
+            ASSERT_TRUE(completion.begin(2, &evidence));
+            const uint64_t payload = 19;
+            ASSERT_TRUE(completion.accept_runtime_terminal(
+                {DeviceRunVerdict::Error, code, DeviceRunCodeSource::Header}, &payload, sizeof(payload)
+            ));
+            int completed = 0;
+            auto publish = [&](RunTerminalSelection result, const void *, size_t bytes) {
+                EXPECT_EQ(result.code, code);
+                EXPECT_EQ(bytes, sizeof(payload));
+                return publication;
+            };
+            EXPECT_EQ(
+                completion.finish(
+                    0, 0, publish,
+                    [&] {
+                        ++completed;
+                    }
+                ),
+                0
+            );
+            EXPECT_EQ(completed, 0);
+            EXPECT_EQ(
+                completion.finish(
+                    1, 0, publish,
+                    [&] {
+                        ++completed;
+                    }
+                ),
+                code
+            );
+            EXPECT_EQ(completed, 1);
+            EXPECT_EQ(evidence.read_after_exit().terminal.code, code);
+        }
+    }
+}

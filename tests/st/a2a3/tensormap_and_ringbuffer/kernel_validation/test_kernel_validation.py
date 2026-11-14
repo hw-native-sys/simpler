@@ -60,6 +60,16 @@ def test_kernel_validation(st_platform, st_device_ids, tmp_path, capfd, core_typ
     worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(st_device_ids[0]))
     try:
         handle = worker.register(callable_)
+        valid_orch = tmp_path / "valid_orchestration.cpp"
+        valid_orch.write_text(template.replace("CORE_TYPE", core_type).replace("ERROR_CODE", "0"))
+        valid_handle = worker.register(
+            ChipCallable.build(
+                signature=[D.OUT],
+                func_name="aicpu_orchestration_entry",
+                binary=compiler.compile_orchestration(RUNTIME, str(valid_orch)),
+                children=[(219, CoreCallable.build(signature=[D.OUT], binary=binary))],
+            )
+        )
         args = TaskArgsBuilder(TensorArg("output", torch.zeros(1, dtype=torch.int32)))
         task_args, _ = _build_l2_ref_args(args, [D.OUT], worker)
         worker.init()
@@ -68,8 +78,13 @@ def test_kernel_validation(st_platform, st_device_ids, tmp_path, capfd, core_typ
         config.enable_chip_swimlane = 0
         started = time.monotonic()
         if code:
+            args.output.fill_(77)
             with pytest.raises(RuntimeError) as failure:
                 worker.run(handle, task_args, config)
+            assert args.output[0].item() == 77
+            with pytest.raises(RuntimeError, match="poison"):
+                worker.run(valid_handle, task_args, config)
+            assert args.output[0].item() == 77
         else:
             for _ in range(2):
                 args.output.zero_()
