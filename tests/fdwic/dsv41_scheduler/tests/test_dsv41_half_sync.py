@@ -16,7 +16,9 @@ from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[3]
+pytestmark = pytest.mark.manual
+
+ROOT = Path(__file__).resolve().parents[4]
 HEADER = struct.Struct("<4IQ8i")
 
 

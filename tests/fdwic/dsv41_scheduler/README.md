@@ -18,6 +18,29 @@ DSL cases with approximately half their SPMD tasks requiring sync-start, and
 nine DSL cases with all capacity-eligible SPMD tasks requiring sync-start.
 Measurement availability and the timing contract are maintained in [RESULTS.md](RESULTS.md).
 
+## Manual-only execution
+
+This self-contained benchmark is maintained and run manually. Changes confined
+to `tests/fdwic/dsv41_scheduler/` do not trigger automatic runtime or scene-test
+CI. Pre-commit still checks the changed files. Changes to runtime code, shared
+infrastructure, CI configuration, or unclassified paths retain their normal
+checks. Documentation remains covered by the documentation workflow.
+
+The suite's policy and lower-bound checks live in its own `tests/` directory,
+outside the shared `tests/ut` corpus. They are marked manual for repository-wide
+pytest collection. Run them explicitly without runtime bootstrap:
+
+```bash
+source .venv/bin/activate
+export DSV41=tests/fdwic/dsv41_scheduler
+pip install pytest -r "$DSV41/production/requirements-bound.txt"
+PYTHONPATH=.:python python -m pytest --confcutdir="$DSV41/tests" "$DSV41/tests" -q
+```
+
+NPU benchmarks continue to use the automatically allocating launcher described
+below. A clean automatic CI run does not establish this manual suite's hardware
+correctness or update its performance results; run and record those explicitly.
+
 ## Cases
 
 Layer indices are zero-based. The two task organizations are captured separately.

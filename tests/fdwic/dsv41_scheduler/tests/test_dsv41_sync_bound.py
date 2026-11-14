@@ -13,8 +13,10 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.manual
+
 pytest.importorskip("ortools.sat.python.cp_model")
-PRODUCTION = Path(__file__).resolve().parents[3] / "tests/fdwic/dsv41_scheduler/production"
+PRODUCTION = Path(__file__).resolve().parents[4] / "tests/fdwic/dsv41_scheduler/production"
 SPEC = importlib.util.spec_from_file_location("sync_bound", PRODUCTION / "sync_bound.py")
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
