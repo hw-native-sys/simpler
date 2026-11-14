@@ -324,22 +324,6 @@ static inline __aicore__ PreparedAccessResult scheduler_resume_parked_execution(
     return scheduler_receive_execution_token(base, prepared, task_ref, block, lane, handle);
 }
 
-static inline __aicore__ bool scheduler_fail_prepared_execution(
-    __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, uint32_t worker_id,
-    SchedulerPreparedHandle *handle
-) {
-    if (!scheduler_execution_token_handle_valid(base, prepared, worker_id, handle, SchedulerPreparedPhase::CLAIMED) &&
-        !scheduler_execution_token_handle_valid(base, prepared, worker_id, handle, SchedulerPreparedPhase::PARKING))
-        return false;
-    auto *control = scheduler_prepared_control_at(base, prepared, handle->execution_index);
-    const uint64_t failed =
-        (handle->claimed_state & ~UINT64_C(255)) | static_cast<uint64_t>(SchedulerPreparedPhase::FAILED);
-    if (scheduler_gm_compare_exchange(control->state, handle->claimed_state, failed) != handle->claimed_state)
-        return false;
-    *handle = {};
-    return true;
-}
-
 inline __aicore__ bool scheduler_group_anchor_index(
     __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, int64_t task_ref, uint32_t block,
     uint64_t *index, uint8_t *anchor_lane

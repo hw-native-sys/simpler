@@ -176,8 +176,7 @@ struct FixtureStorage {
         scheduler_state = std::make_unique<SchedulerStateBuffer>(layout);
         run_control = scheduler_state_at<SchedulerRunControl>(scheduler_state->base(), layout.run_control_offset);
         contexts = scheduler_state_at<SchedulerWorkerContext>(scheduler_state->base(), layout.worker_contexts_offset);
-        run_control->aiv_active_worker_count = workers;
-        run_control->scheduler_count = workers;
+        run_control->active_worker_count = workers;
         for (uint64_t worker = 0; worker < workers; ++worker) {
             SchedulerWorkerContext &context = contexts[worker];
             context.core_type =
@@ -197,7 +196,6 @@ struct FixtureStorage {
             context.scheduler_state_bytes = layout.total_size;
             context.runtime_worker_count = workers;
             context.worker_index = worker;
-            context.scheduler_index = worker;
             // One cluster per three workers, each lane ranked within its own
             // type, matching what the AICPU assigns during core discovery.
             const uint64_t lane = worker % PLATFORM_CORES_PER_BLOCKDIM;
@@ -256,6 +254,15 @@ struct FixtureStorage {
         }
         calls_prepared = true;
         return true;
+    }
+
+    GlobalContext &prepared_global_context(int64_t task_ref, uint32_t block, uint32_t lane) {
+        auto *prepared =
+            scheduler_state_at<SchedulerPreparedLayout>(scheduler_state->base(), layout.prepared_layout_offset);
+        uint64_t index = UINT64_MAX;
+        if (!scheduler_prepared_execution_index(scheduler_state->base(), prepared, task_ref, block, lane, &index))
+            throw std::logic_error("invalid fixture execution binding");
+        return scheduler_execution_binding_at(scheduler_state->base(), prepared, index)->global_context;
     }
 
     uint32_t catalog_clusters() const {
@@ -332,10 +339,8 @@ struct FixtureStorage {
         config.callable_addresses_count = static_cast<uint32_t>(context->callable_addresses_count);
         config.graph_summary_offset = context->graph_summary_offset;
         config.runtime_worker_count = context->runtime_worker_count;
-        config.scheduler_index = context->scheduler_index;
-        config.scheduler_count = context->scheduler_count;
         config.self_lane = 0;
-        config.self_core_type = scheduler_core_type_index(context->core_type);
+        config.self_core_type = context->core_type == static_cast<int32_t>(CoreType::AIC) ? 0U : 1U;
         for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
             config.worker_ids[lane] = context->cluster_worker_ids[lane];
             if (context->cluster_worker_ids[lane] == context->worker_index) config.self_lane = lane;

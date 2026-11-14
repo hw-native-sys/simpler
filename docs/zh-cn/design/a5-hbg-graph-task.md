@@ -1,102 +1,39 @@
 # A5 HBG 原生 Graph task 设计
 
-依赖唤醒见[前向依赖计数](a5-hbg-graph-task/dependency-counters.md)，
-SPMD 使用既有 cooperative admission，每个逻辑任务只进入 ready 队列一次。
+默认 A5 `host_build_graph` 在 Host 完成 orchestration、Graph 展开和 Call 准备，
+由 resident AIC/AIV 执行；AICPU 负责启动、监督、诊断服务和清退。
+工作发现采用不可变 AIC/MIX、AIV 目录与 execution token，依赖以 canonical completion gate 证明。
+本页及数据布局、协议页描述当前实现；历史测量仅适用于各报告标注的提交。
 
-本文规定 `host_build_graph` 的 Graph task 如何接入 A5 AICore resident scheduler。
-**状态：native Graph 与两个共享 ready 队列已实现：纯 AIC 和所有 MIX 共用 AIC 队列，纯 AIV 使用 AIV 队列；开发基线同时包含 CSA/SWA 的普通调度优化。**
-双 lane MIX 按资源选择成员，并使用独立的 atomic 领取结束证明；原生 Graph 协议为 v11，普通任务协议为 v10。
-历史测量与证据见[实施记录](../../../tests/docs/a5-hbg-graph-task/README.zh-CN.md)。
-性能页的数据只对应各节标注的被测提交，不代表叠加普通调度优化后的开发基线性能。
-[历史逐 block 队列与 MIX lease 原型](a5-hbg-graph-task/block-ready-scheduling.md)曾因编译成本不可接受而撤回；详见[模型实测](a5-hbg-graph-task/qwen-performance.md)。
-纯 AIC/AIV、MIX 和 sync_start 共用 admission 与完成协议，不另设独立 block 领取路径。
-原始设计基线为 `main@8f42cef9b3f0ebbda800e239aab0949e95552f25`，核对日期为 2026-10-31。
-下文保留设计契约，实际实现与验证范围以当前代码和候选证据为准；阶段名称不对应独立 Git 提交。
+## 目标与支持范围
 
-## 目标与边界
+Graph 内外的 kernel 共用执行、MIX/sync_start、async 和退休合同。
+`rt_submit_graph`、boundary alias/shape、公共 TaskId 及业务 kernel 的 args ABI 不变。
+普通 AIC/AIV、多 block、多 wave、MIX、sync_start、单 block/lane predicate、DUMMY、
+多实例复用 Definition 和普通/Graph 交错都通过这套模型执行。
 
-复用 resident 的依赖 resolver（CSR/remaining 与无 dependency header 的 wake-list）、direct refill、SPMD admission、
-GM MIX 和退出握手，让 Graph 内外的 kernel 在同一套调度协议中执行。
-Host 负责拓扑和资源规划，AICore 只解释已验证的执行计划与绑定参数，AICPU 保持生命周期监督职责。
+非法形状、参数区间或容量在 Host 拒绝；设备损坏的 descriptor、mode、epoch 或 backing
+进入首错与失败启动清退，不能另选执行器或伪造完成。
+A2A3/WSE 和 percounter 的活跃 materializer 仍使用各自当前合同，默认 HBG 不读取它们的任务镜像。
 
-首版包含：普通 AIC/AIV、SPMD、MIX、`sync_start`、单 lane 单 block predicate、
-DUMMY、多实例复用 Definition、普通任务与 Graph 交错。
-`rt_submit_graph`、boundary alias/shape 契约、原始 `TaskId` 和 kernel 参数 ABI 不变。
-嵌套 Graph、动态 topology、Graph boundary 显式依赖、任意异步完成不扩展。
-A5 HBG 只使用 resident ordinary/native Graph 执行。Host 在发布前拒绝非法形状、
-非连续的 Definition 参数区间及容量不足，不为这些输入选择另一套执行器。
-设备发现无效 mode 或缺失 bootstrap 时进入失败启动清退，不能访问未发布的 scheduler backing。
-不引入新的行为环境变量或编译开关。
+| 文档 | 当前问题 |
+| ---- | -------- |
+| [数据布局与 Host 绑定](a5-hbg-graph-task/data-layout.md) | node/ref、80 B 顶层镜像、GM 所有权、256 B trace、实例参数与预算 |
+| [调度与发布协议](a5-hbg-graph-task/protocol.md) | 从设备入口、READY、bootstrap 到完成和清退 |
+| [Canonical completion gate](a5-hbg-graph-task/dependency-counters.md) | producer DONE、compute/async debt 和控制节点完成 |
+| [工作目录与 execution token](a5-hbg-graph-task/ready-queue-design.md) | 目录、四个 token、两个私有 slot、park/resume 与前进性 |
+| [Build/execute 合同](a5-hbg-graph-task/build-execute-separation.md) | Call/Claim、参数观察、MIX replacement、优化约束 |
+| [Resident 走读](../a5-hbg-aicore-walkthrough/README.md) | 跨 Host/AICPU/AICore 的执行说明 |
+| [实施与历史验证](a5-hbg-graph-task/implementation.md) | 分提交的验证证据，不替代当前提交验收 |
+| [历史性能与原型](a5-hbg-graph-task/qwen-performance.md) | 被测提交、反例和已撤回候选 |
 
-契约与后续重构设计分为以下几份：
+## 展开模型
 
-| 文档 | 实现者需要从中取得的答案 |
-| ---- | ------------------------ |
-| [数据布局与 Host 绑定](a5-hbg-graph-task/data-layout.md) | node 编号、wire 类型、地址来源、容量、GM 载体、prepare 重试 |
-| [调度与发布协议](a5-hbg-graph-task/protocol.md) | 控制队列、参数唯一写者、cache 发布、SPMD/MIX、完成与退出 |
-| [Admission 静态计划与一次验证](a5-hbg-graph-task/admission-preparation.md) | 待实现方案：统一覆盖全部 cooperative 形状；只读计划、bootstrap 分核验证一次、热路径动态检查及 L0 收益估算 |
-| [HBG 调度优化开发参考](a5-hbg-graph-task/build-execute-separation.md) | 当前实现与拟修改的统一入口：Host 预构造、提前候选和逻辑依赖、MIX/sync_start/defer_wait/Graph、包所有权与 cache、分阶段提交及 L0 验收 |
-| [全局与分级 ready 队列设计](a5-hbg-graph-task/ready-queue-design.md) | 业界方案、A5 原子争用、候选实现与对比验证 |
-| [两个 ready 队列设计与开发参考](a5-hbg-graph-task/two-ready-queues.md) | 已实现：AIC/MIX 共用一队列、AIV 使用一队列，无分片；发布领取合同、改动位置与验收 |
-| [独立 block 调度待选方案](a5-hbg-graph-task/block-ready-scheduling.md) | 已撤回原型的设计、收益/成本、同步安全与重启条件 |
-| [实施与功能验收](a5-hbg-graph-task/implementation.md) | 改动入口、分阶段自主实施、功能矩阵、DFX |
-| [性能与自主迭代流程](a5-hbg-graph-task/performance.md) | 主线基线、ST 筛选、无 Graph 门禁、现有 A5 Qwen 的验证与优化闭环 |
-| [设计复审](a5-hbg-graph-task/review.md) | 反例、修正、证明边界、并行 PR 与剩余风险 |
-
-## 设计基线事实与复用范围（2026-10-31）
-
-下表是 native Graph 开发前的历史基线，不表示当前 A5 仍提供旧执行路径。
-当前启动、执行与退核合同见[resident 走读](../a5-hbg-aicore-walkthrough/README.md)。
-
-| 位置 | 已核对行为 |
-| ---- | ---------- |
-| [A5 runtime_maker.cpp](../../../src/a5/runtime/host_build_graph/host/runtime_maker.cpp) 的 `create_scheduler_state` | 任意 `TaskKind::GRAPH` 使整个 run 选择 legacy AICPU |
-| [A5 resident_scheduler_impl.h](../../../src/a5/runtime/host_build_graph/aicore/resident_scheduler_impl.h) 的 `run_ready_dispatch_loop` | 每个 AIC/AIV 处理完成、准备自己的 payload 并执行 kernel |
-| [A5 SPMD 协议](../../../tests/fdwic/pa_hbg/spmd/implementation-contract.md) | 共享 admission 顺序、固定成员、block ownership、GM MIX 和 LocalDone |
-| [A2A3 scheduler.h](../../../src/a2a3/runtime/host_build_graph/runtime/scheduler/scheduler.h) | 4-task 物化切片、独立 external-ready、wake-list、root 游标、shell 完成 |
-| [公共 graph_execution.cpp](../../../src/common/host_build_graph/device/graph_execution.cpp) | 按实例重定位 Tensor/scalar/predicate，内部 CSR 位于 execution storage |
-| [graph_image_source.h](../../../src/common/host_build_graph/device/graph_image_source.h) | onboard Definition 来自每个 AICPU 线程自己的 launch package |
-
-A2A3 的 `remaining_tasks.fetch_sub` 每个 child 执行一次；它没有消除 Graph 聚合原子。
-它的两个独立发布事件还存在 portable C++ memory model 的握手审查项，见复审文档的 PR #2533。
-本方案继承其 boundary 和完成语义，不直接移植其 execution 对象与发布状态机。
-
-Definition cache 只属于一次 orchestration run。相同 `graph_key` 不是跨 run 的缓存有效性证明。
-首次 recording 与后续引用最终都以本次 bind 生成的完整 Definition 和 shell 为输入。
-
-### A2A3 的 Graph 执行链
-
-Host recording 生成 Definition，提交时为每个 shell 预留 graph heap 与 execution storage，并绑定 boundary。
-设备 classify 将 shell 的 Definition offset 解码为本线程可读的 image，创建该实例的 `GraphExecution`，
-包含 child storage、参数池、fanin、执行状态与内部原子控制；不能把它的 C++ 对象直接搬给 AICore。
-
-AICPU 的物化队列独立于 shell 外部依赖。`materialize_busy` 保证同一实例只有一个物化 owner，
-每次默认物化 4 个 child，重建 Tensor/scalar/predicate 和 `SUB_TASK(parent, local)` 身份。
-每个切片完成后将新 child 接入内部 wake-list，并发布 materialized/published 前缀；
-因此先物化的 child 可以在整个 body 物化完之前运行。
-
-root 的实际可执行需要两个条件：对应 child 已发布，以及 shell 外部依赖已满足。
-`route_cursor` 游标避免重复路由；early dispatch 可先暂存合格 root，但不消除外部依赖的执行 gate。
-child 完成推进内部依赖并减少 remaining；最后一个 child 才释放外部 shell。
-它的正确性关键是切片数据发布、external-ready 与 root 路由的握手，而不仅是 CSR 扫描。
-
-| A2A3 机制 | 本方案对应机制 |
-| --------- | -------------- |
-| 每实例 execution 对象和物化切片 | 每 Definition 只读计划、每实例 binding、Host 每 child 一次参数准备 |
-| materialized/published 前缀与 external-ready | 全拓扑 bootstrap gate + ENTER 依赖，不再动态发布 child 拓扑 |
-| route_cursor 游标 | 统一依赖计数与唯一 ready 发布者；无依赖 header 时保留 wake-list 路由 |
-| 每 child 更新 Graph remaining | EXIT 的全 sink fanin join；保留 run 的批量 resolve 计数 |
-| shell 完成与 execution 退休 | EXIT 逻辑完成，再由全 run resolve/LocalDone/fence 证明可回收 |
-
-因此保留的是 Graph API、boundary 重定位和依赖语义；参数准备时机与物化载体不同，性能须分别测量。
-
-## 调度模型
-
-每个 Graph shell 在 native 调度视图中替换为 `ENTER + children + EXIT`：
+每个 Graph shell 替换为 ENTER、所有 children 和 EXIT：
 
 ```mermaid
 flowchart LR
-    P[外部前驱] --> E[ENTER]
+    P[外部 producer] --> E[ENTER]
     E --> R1[root 1]
     E --> R2[root 2]
     R1 --> D[内部 DAG]
@@ -105,63 +42,41 @@ flowchart LR
     D --> S2[sink 2]
     S1 --> X[EXIT]
     S2 --> X
-    X --> C[外部消费者]
+    X --> C[外部 consumer]
 ```
 
-- ENTER 继承 shell 的外部 fanin；所有内部 root 增加对 ENTER 的依赖。
-- 内部边保持 Definition 的含义；EXIT 等待所有 sink，包含不连通分量的 sink。
-- 外部消费者对 shell 的引用映射到 EXIT；boundary 的 RAW/WAR/WAW 顺序因此保留。
-- ENTER/EXIT 没有 kernel、block、lane 或 admission membership。
-- Host 预建拓扑、fanout CSR 和初始 remaining；bootstrap 屏障内完成初始路由。无依赖 header 时才建 wake-list；执行阶段不动态添加 Graph 节点。
-- 参数由 Host 在 launch 前绑定一次并随 metadata 发布；Device 在取得执行责任后观察，SPMD/MIX 的所有 block/lane 复用。
+ENTER 继承外部 fanin，root 增加 ENTER 依赖，child 内部引用保持 Definition 的语义。
+外部 consumer 对 shell 的引用映射到 EXIT；EXIT 等待全部 sink，包括不连通分量。
+控制节点不占 kernel slot，不具有业务 execution identity，也不增加 admission membership。
+Host 在 launch 前发布完整拓扑，设备不动态添加节点或绑定 child 参数。
 
-当前 Host 预构造、跨核包消费和后续依赖观察的完整合同统一见
-[HBG 调度优化开发参考](a5-hbg-graph-task/build-execute-separation.md)。
-参数准备不改变 ENTER 与逻辑完成的执行门禁。
+每个实际 block/lane 的 immutable Call 引用稳定的 invocation Binding。
+普通 token 可以提前领取执行责任、等待 producer gate；依赖满足后才转入本核 slot 并通过最终执行许可。
+MIX 使用 cluster reservation，sync_start 使用全 run 的 cooperative admission 顺序。
+Graph 本身不建立新的资源顺序域，一个 cohort 也不扩大为整个 Graph。
 
-已实现基底中所有 Graph 共用原有 cooperative admission 顺序；上述 block 调度方案曾重审该约束，现已撤回为后续候选。
-`sync_start` 的范围仍是一个 child 的 blocks；
-不把整个 Graph 当成一个 cohort，不给每个 Graph 建立独立顺序域。
+## 不变量与资源成本
 
-## 必须保持的不变量
+| 不变量 | 证明方式 |
+| ------ | -------- |
+| ref 与公共身份分离 | expanded node 连续编号；统一访问器恢复 shell/local TaskId |
+| fanin 完整且无环 | Host 验证原始边、边界与 producer_ref < consumer_ref；设备确认 canonical gate |
+| 每个真实执行有唯一 owner | block ticket 与 Call control 的 phase/owner/generation CAS |
+| 控制进展不依赖 kernel 空槽 | bootstrap scan gate 后的独立有界控制扫描 |
+| 参数稳定至 execution 退休 | Host 唯一写者；Call/Binding 不随 slot 复用；consumer 独立观察业务输入 |
+| 逻辑 DONE 等待真实 compute 和 async | canonical total/remaining/debt 的合法零状态 |
+| 逻辑完成与资源退休分离 | trace、group release、EXIT/ACK 和 post-close release 各有 owner |
+| 首错不变成成功 | 禁止新成功执行；未完成 publication 和清退失败保留 backing 所有权 |
+| pipeline run 互不借用存储 | 每个 slot 独立持有 epoch、plan、参数、publication source 和 capture backing |
 
-| 编号 | 不变量 |
-| ---- | ------ |
-| I1 | `node_ref` 是当前 run 的连续索引；公共 `TaskId` 保留原始 shell/local 身份，两者不可互换 |
-| I2 | 每条实际调度边满足 `producer_ref < consumer_ref`，每个原始外部依赖经过映射后仍存在 |
-| I3 | 每条边只通知一次，remaining 的 1→0 转移产生唯一 ready 发布者；兼容路径节点最多属于一个 wake-list、ready inbox 或私有待处理位置 |
-| I4 | 所有控制节点在完整拓扑注册后可无资源槽地推进，不受 kernel admission 等待阻塞 |
-| I5 | 一份实例参数只有一个写者，发布后直到 run 退出都只读；不同写者不共享被写回的 cache line |
-| I6 | Graph child 完成沿用逻辑 TaskDone；MIX 必须先完成必要 lane release，SPMD 必须完成全部 blocks |
-| I7 | EXIT 证明 shell 的逻辑完成；所有节点的 resolve 尾部与 LocalDone/退出握手另外证明资源可释放 |
-| I8 | 观察到首错后禁止新成功发布，在途工作沿错误退出协议处理；部分参数、部分上传和退出失败都不能退化为成功 fallback |
-| I9 | 每个 pipeline slot 独立拥有 plan、GM backing、epoch 和 publication source，直到安全回收 |
+默认顶层 publication 为 64 B 首错头、80 B/task 和实用参数池，Host rich scratch 不上传。
+每实例 Graph heap 只包含 required_heap 加实际 tensor/scalar/predicate tail；
+Definition 完成时计算并缓存预算，提交和 bind 使用同一算法检查溢出与实例边界。
+公共 execution_storage_bytes 继续描述 A2A3/WSE/percounter 的活跃 GraphExecution，不能当作默认 native 参数预算。
 
-EXIT 通过其 sink 依赖的 remaining 归零成为 ready；无依赖 header 时保留 fanin/wake-list join。
-不额外增加每 child 一次的 Graph 全局计数器。
-它等待的 sink 集合由 Host 从已验证 CSR 推导，不使用“记录顺序最后一个 child”替代。
-所有 sink 完成等价于所有 child 完成的证明只适用于有限无环、完整保留依赖、无异步逃逸的任务图。
+resident backing 仍需计入 768 B/node control，以及按真实执行数放大的 512 B Call、
+128 B Claim、128 B Binding、256 B trace 和实际启用的诊断/async 区域。
+缩小结构或删去重复计划不等于已证明延迟下降；性能必须用同输入、同设备、同 DFX 配置的对照衡量。
 
-## 交付与收益口径
-
-按用户约定，方案确定后自主分阶段实现、分析问题、修复和复测，不为常规实现决策反复确认。
-先在修改前主线采集基线，再实现统一访问视图和端到端 native Graph 切片，随后接入完整 cooperative/DFX 契约。
-新旧功能验证后推进无 Graph 性能门禁和现有 A5 Qwen3 验证；按用户最新要求，Qwen 实测与反馈不等待无 Graph 性能达标。
-交付依赖和验收见[实施文档](a5-hbg-graph-task/implementation.md)。本设计不授权发布 PR 或变更公共 API。
-
-预期减少的是重复拓扑处理、重复参数绑定及 Graph 聚合争用，不宣称参数总写入量下降。
-Host 参数绑定及 metadata 上传在启动前完成，仍需单列成本；
-设备总收益由当前实现的完整 L0 对照判断。
-该候选仍待功能和性能验证，不引入跨调度轮持有的物化锁。
-
-当前默认 A5 HBG 的实例 tail 按实际参数计算：每个 child 的 tensor、scalar 区间分别向 64 B 对齐，
-存在 predicate 时额外预留 64 B。没有参数的 child 不增加 tail；不再为原本的 GraphExecution task、slot、
-fanin 或状态数组预留空间。Host 在 Definition 完成时计算一次并缓存 reservation；提交实例和 bind 校验
-使用同一算法。`required_heap` 仍是业务输出区，与参数 tail 相加并检查溢出及实例边界。
-公共 Definition 的 `execution_storage_bytes` 继续描述 A2A3/WSE/percounter 的 GraphExecution 布局；
-默认 HBG 不以它分配或校验 native 参数 backing。每个 runtime 在编译时选择自己的预算策略。
-Host 验证路径共用 Definition/CSR/参数合法性检查；percounter 不再构建不用的 native children、sink、
-ENTER/EXIT 映射和只读 resident 图副本。默认 HBG 任务镜像为 64 B 首错头、80 B/task 记录及实用参数池。
-Host 编排的完整 scratch 不上传；执行与 dump 消费者均读取当前格式。
-当前 resident 的 384-byte task control 和按 block/lane 放大的 trace 存储必须纳入预算。
-验收同时报告 Host bind、首任务延迟、设备总时间、尾延迟、初始化/H2D 字节和峰值内存。
+当前 Graph view/native image 版本为 6/4，因果诊断采用普通 v22、Graph v23。
+Host、AICPU、AICore 与诊断解析器一同迁移，只读取当前格式。

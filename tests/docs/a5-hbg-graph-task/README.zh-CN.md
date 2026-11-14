@@ -1,19 +1,21 @@
 # A5 HBG Graph task 验证与性能采集
 
 架构、协议和实施细节见[中文设计](../../../docs/zh-cn/design/a5-hbg-graph-task.md)。
-当前 task 粒度调度已实现两个固定业务 ready 队列：AIC（含所有 MIX）与 AIV，无分片。
-每个 worker 只查询本类业务队列；Graph control inbox、GM MIX 和异步 CHECK/FINISH 保留各自的进展协议。
+当前使用两个不可变 engine catalog：AIC（含 MIX）与 AIV，没有共享 head、入队或出队操作。
+每个 worker 扫描本类目录、领取 execution token，再检查 fanin；Graph 控制节点、GM MIX 和异步 CHECK/FINISH 保留各自的进展协议。
 独立 block 原型仅保留为
 [后续优化候选](../../../docs/zh-cn/design/a5-hbg-graph-task/block-ready-scheduling.md)。
 
-## 当前验证结果
+## 历史两队列验证记录
 
-两队列本轮 18 组模型功能通过，14 组单卡 L1 合计变化 −0.56%，按 ±5% 标准视为持平。
+以下数据属于已移除的两队列实现，不能作为当前目录调度的验收证据。
+
+两队列当时 18 组模型功能通过，14 组单卡 L1 合计变化 −0.56%，按 ±5% 标准视为持平。
 462 份完整原语 L3 零丢失、零截断；两队列各项 L3/L1 增幅最高 13.65%。
-三臂详细表、初次 +5.23% 边界项及 A/B/A 复测、CPU/硬件覆盖范围见[本轮报告](two-ready-queues/README.zh-CN.md)。
-本轮采用 [dsv41_scheduler](../../fdwic/dsv41_scheduler/README.md) 的原始模型 case，
-范围、正常 `-O3 -g` 构建、每级 1 次预热及 10 次计时、完整 AICPU L1 边界见[两队列验收要求](../../../docs/zh-cn/design/a5-hbg-graph-task/two-ready-queues.md#性能与-dfx-验收)。
-跨卡 MoE 相关四组功能通过，并已补测 L1/L3 参考数据和波动范围，不计入当前 14 组单卡性能考核。下述历史记录不能替代本次证据。
+三臂详细表、初次 +5.23% 边界项及 A/B/A 复测、CPU/硬件覆盖范围见[历史报告](two-ready-queues/README.zh-CN.md)。
+当时采用 [dsv41_scheduler](../../fdwic/dsv41_scheduler/README.md) 的原始模型 case，
+范围、正常 `-O3 -g` 构建、每级 1 次预热及 10 次计时、完整 AICPU L1 边界见[当时的验收报告](two-ready-queues/README.zh-CN.md)。
+跨卡 MoE 相关四组功能通过，并已补测 L1/L3 参考数据和波动范围，不计入当时 14 组单卡性能考核。
 
 ## 历史 Graph 验证记录
 
@@ -46,7 +48,7 @@ PR #2864 当时已重放主线 `313499d61`，并修复 PARAM 视图绑定的完�
 | [selected-st-cases.json](../../../tools/benchmarks/a5_hbg_graph_task/selected-st-cases.json) | 11 项具有调度性能价值的 ST 用例 |
 | [csa-cases.json](../../../tools/benchmarks/a5_hbg_graph_task/csa-cases.json) | CSA 补充用例 |
 
-以下清单和工具保留此前 Graph 评估的采集合同；本次两队列性能使用上文的 dsv41_scheduler 口径。
+以下清单和工具保留此前 Graph 评估的采集合同；历史两队列性能使用上文的 dsv41_scheduler 口径。
 清单仅包含场景选择、参数和筛选理由，不包含实测耗时。
 Qwen 单独测量；`spmd_paged_attention` 按本次范围约定排除。
 A2A3 的 Qwen 和 DeepSeek kernel 不适配 A5，不能作为本轮 A5 验证负载。

@@ -19,7 +19,6 @@
 #include "host_build_graph/host/prepared_execution_plan.h"
 
 static_assert(sizeof(LocalContext) == 8);
-static_assert(sizeof(DispatchPayload) == 512);
 
 namespace {
 

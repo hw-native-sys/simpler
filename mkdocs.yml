@@ -140,9 +140,8 @@ nav:
           - 调度与发布协议: zh-cn/design/a5-hbg-graph-task/protocol.md
           - Admission 静态计划与一次验证: zh-cn/design/a5-hbg-graph-task/admission-preparation.md
           - HBG 调度优化开发参考: zh-cn/design/a5-hbg-graph-task/build-execute-separation.md
-          - 静态 DAG 依赖计数: zh-cn/design/a5-hbg-graph-task/dependency-counters.md
-          - 全局与分级 ready 队列设计: zh-cn/design/a5-hbg-graph-task/ready-queue-design.md
-          - 两个共享 ready 队列: zh-cn/design/a5-hbg-graph-task/two-ready-queues.md
+          - Canonical completion gate: zh-cn/design/a5-hbg-graph-task/dependency-counters.md
+          - 工作目录与 execution token: zh-cn/design/a5-hbg-graph-task/ready-queue-design.md
           - Ready 队列算法与竞争控制: zh-cn/design/a5-hbg-graph-task/ready-queue-algorithms.md
           - 独立 block 调度待选方案: zh-cn/design/a5-hbg-graph-task/block-ready-scheduling.md
           - 实施与功能验收: zh-cn/design/a5-hbg-graph-task/implementation.md

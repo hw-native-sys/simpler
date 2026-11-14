@@ -18,7 +18,7 @@
 
 #include "common/core_type.h"
 #include "common/platform_config.h"
-#include "dispatch_payload.h"
+#include "kernel_args.h"
 #include "scheduler_native_graph_access.h"
 
 #ifndef __gm__
@@ -112,7 +112,7 @@ struct SchedulerGraphView {
     uint16_t view_bytes;
 };
 
-inline constexpr uint16_t SCHEDULER_GRAPH_VIEW_VERSION = 5;
+inline constexpr uint16_t SCHEDULER_GRAPH_VIEW_VERSION = 6;
 
 inline __aicore__ constexpr SchedulerGraphView
 scheduler_ordinary_graph_view(uint64_t storage_address, uint32_t task_count, uint64_t window_last_index) {

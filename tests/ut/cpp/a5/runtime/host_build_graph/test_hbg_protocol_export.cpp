@@ -54,7 +54,7 @@ struct ProtocolExportFixture : ::testing::Test {
 TEST_F(ProtocolExportFixture, PreservesFrozenGraphAndHostCompletedNodeWithoutFabricatingEvents) {
     at<SchedulerTaskMetadata>(layout.task_metadata_offset)[0].logical_block_num = 99;
     const auto json = dump();
-    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v20\""), std::string::npos);
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v22\""), std::string::npos);
     EXPECT_NE(json.find("\"close_seal_stride\":64"), std::string::npos);
     EXPECT_NE(json.find("\"claim_tickets\":0"), std::string::npos);
     EXPECT_EQ(json.find("\"admission_claim_lock\""), std::string::npos);
@@ -75,7 +75,7 @@ TEST_F(ProtocolExportFixture, NativeSchemaCarriesBothIdentitiesAndIndependentSou
     const auto json = scheduler_export_protocol(
         storage->base(), layout.total_size, layout, 0, tasks, "{\"tasks\":[],\"definitions\":[]}"
     );
-    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v21\""), std::string::npos);
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v23\""), std::string::npos);
     EXPECT_NE(json.find("\"original_task_id\":7,\"local_child_id\":3"), std::string::npos);
     EXPECT_NE(json.find("\"graph_source\":{\"tasks\":[],\"definitions\":[]}"), std::string::npos);
 }

@@ -1,8 +1,9 @@
-# A5 Graph task 实施与功能验收
+# A5 Graph task 实施与功能验收（历史实施记录）
 
-本页定义[设计总览](../a5-hbg-graph-task.md)的实施顺序。
+当前执行契约见[协议](protocol.md)、[数据布局](data-layout.md)和[工作目录](ready-queue-design.md)。下文保存旧提交的实施顺序与测量，不能据此推导当前仍有共享 ready 队列、CSR 通知或 wake-list。
+本页保存[设计总览](../a5-hbg-graph-task.md)早期方案的实施顺序。
 性能基线、用例筛选及模型优化另见[性能与自主迭代流程](performance.md)。
-已开始按本页实施，当前阶段与实测证据记录在[实施记录](../../../../tests/docs/a5-hbg-graph-task/README.zh-CN.md)。
+这些历史阶段与实测证据记录在[实施记录](../../../../tests/docs/a5-hbg-graph-task/README.zh-CN.md)。
 下列门禁以实际代码和测试结果为准，不能将方案描述视为已实现的能力。
 [独立 block 调度](block-ready-scheduling.md)现为已撤回的后续候选；
 其中无 `sync_start` 的 MIX SPMD 每个 block 独立协作的思路保留供以后评估。
@@ -11,7 +12,7 @@
 
 **历史决策（2026-11-03）：独立 block 原型因编译成本撤回，当时恢复到测得 38.454 ms 的 `queue-ordinary-credit-v1`。该数值只属于当时的版本。**
 
-当前使用全任务cooperative admission、按128B Sector隔离的共享热点、默认Host CSR/remaining、同步completion、ordinary小grid的循环成员集合及resident编译单元拆分。Scalar DCache仍按64B行处理。当前代码合同见[数据布局](data-layout.md)、[依赖计数](dependency-counters.md)与[调度协议](protocol.md)；历史阶段的验证不自动覆盖后续改动。
+该阶段使用全任务cooperative admission、按128B Sector隔离的共享热点、Host CSR/remaining、同步completion、ordinary小grid的循环成员集合及resident编译单元拆分。Scalar DCache仍按64B行处理。当前代码合同见[数据布局](data-layout.md)、[依赖计数](dependency-counters.md)与[调度协议](protocol.md)；历史阶段的验证不自动覆盖后续改动。
 
 **用户约定：方案确定后按阶段自主实现，遇到问题自行分析、修复、验证和迭代，不因常规实现选择反复询问用户。**
 每阶段保留代码差异、验证结果、未解决问题和下一步，不把上下文切换当作停止任务或重新确认的理由。
@@ -149,7 +150,8 @@ ENTER/EXIT 没有 kernel trace，用控制节点事件表达；同一 shell 的�
 
 native protocol JSON 的 schema 与明确的 node map 共同定义映射语义。
 `simpler_setup/tools/hbg/native_protocol.py`、export UT 和 Python oracle UT 与生产者使用同一当前格式。
-当前实现导出 `hbg-native-protocol-v13`，保留领取结束证明、独立关闭标记和按资源选取的 MIX 成员，
+当前唯一诊断格式见[调度协议](protocol.md)，生产者、严格读端与测试配套更新。
+协议保留领取结束证明、独立关闭标记和按资源选取的 MIX 成员，
 以及按资源类型累计 block 前缀的 ordinary 有界循环成员规则，
 并包含两部分原生 Graph 来源：
 
@@ -161,8 +163,7 @@ native protocol JSON 的 schema 与明确的 node map 共同定义映射语义�
 `native_graph.py` 从该源重建 ENTER、body、全部 sink→EXIT 及 outer completion 映射，
 再与运行视图导出的 `tasks`/`node_map` 比较；`native_causality.py` 继续验证发布、成员、block 和完成顺序。
 control 节点使用 protocol TaskDone actor，不伪造 kernel execution 或 legacy GraphPrepare。
-无 Graph capture 输出 v10，native Graph 输出 v11；读端仅接受这两个当前格式，生产者与工具必须配套。
-不维护历史或内部实验格式的兼容分支。execution identity 使用严格 v1，多 block 记录不得缺失 order_key。
+当前普通/native Graph 的具体版本以[调度协议](protocol.md)为准；不接受历史或内部实验格式。execution identity 使用严格 v1，多 block 记录不得缺失 order_key。
 执行身份是 run/task/block/subtask；slot 复用由本核事件序列与退休先于下一次 publication/permit 的关系审计，不导出 slot generation。
 当前 native audit 从冻结任务形状独立重建 member_rank_offset 并核对成员集合，不以导出的偏移值作为 oracle。
 所有受支持任务均遵守 cooperative admission。

@@ -24,18 +24,18 @@ namespace simpler::hbg::resident {
 
 #if defined(__DAV_CUBE__)
 template __aicore__ void run<true, false, CoreType::AIC>(
-    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, uint64_t
+    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t
 );
 #elif defined(__DAV_VEC__)
 template __aicore__ void run<true, false, CoreType::AIV>(
-    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, uint64_t
+    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t
 );
 #else
 template __aicore__ void run<true, false, CoreType::AIC>(
-    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, uint64_t
+    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t
 );
 template __aicore__ void run<true, false, CoreType::AIV>(
-    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, uint64_t
+    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t
 );
 #endif
 

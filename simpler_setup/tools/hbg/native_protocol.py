@@ -13,7 +13,7 @@ Sequence integrity proves lossless local event streams, not scheduler causality,
 execution coverage, membership, dependency ordering or Mix resource correctness.
 """
 
-SCHEMAS = ("hbg-native-protocol-v20", "hbg-native-protocol-v21")
+SCHEMAS = ("hbg-native-protocol-v22", "hbg-native-protocol-v23")
 COMPLETION_FROM_CONTRIBUTION = 1 << 30
 DEFERRED_FINISH = 1 << 31
 
@@ -21,7 +21,7 @@ ROOT_NUMBERS = frozenset(
     """
 run_epoch task_count worker_count trace_count member_count cooperative_task_count
 cluster_count mix_task_count sync_mix_task_count expected_task_count inline_completed_count resolved_task_count
-close_seal_stride active_worker_count scheduler_count scheduler_error error_claimed commit_tail commit_lock
+close_seal_stride active_worker_count scheduler_error error_claimed commit_tail commit_lock
 """.split()
 )
 ROOT_TABLES = frozenset(
@@ -61,7 +61,7 @@ NUMBERS = {
     "execution": (
         "index run_epoch task_ref order_key permit_tail worker_index block_idx "
         "pending_slot subtask_slot flags ready_source group_seq block_num cluster_index cluster_lane "
-        "publication_mode publication_before_cycles publication_after_cycles publication_count "
+        "publication_before_cycles publication_after_cycles publication_count "
         "contribution_ticket contribution_worker"
     ),
 }
@@ -95,7 +95,7 @@ def protocol_version(section):
 
 def has_native_graph(section):
     """The native Graph schema includes independent source and node maps."""
-    return isinstance(section, dict) and section.get("schema") == "hbg-native-protocol-v21"
+    return isinstance(section, dict) and section.get("schema") == "hbg-native-protocol-v23"
 
 
 def _error(message):

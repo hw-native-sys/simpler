@@ -103,7 +103,7 @@ class NativeAudit:
         count = self.raw["worker_count"]
         clusters = self.raw["cluster_count"]
         require(count > 0 and count == clusters * 3, "incomplete worker topology")
-        require(self.raw["active_worker_count"] == count == self.raw["scheduler_count"], "inactive scheduler topology")
+        require(self.raw["active_worker_count"] == count, "inactive scheduler topology")
         cores = set()
         for index, worker in self.workers.items():
             peers = worker["cluster_workers"]
@@ -377,10 +377,8 @@ class NativeAudit:
             self.causal.add(published_after, point(execution, "permit"))
             self.payload_points[index] = published_before, published_after
             require(
-                execution["ready_source"] in (0, 2, 3)
-                and execution["publication_mode"] in (0, 1)
-                and (execution["publication_mode"] == 0 or execution["ready_source"] == 2),
-                "invalid source/publication mode",
+                execution["ready_source"] in (0, 3),
+                "invalid ready source",
             )
             self.chain(execution, "permit", "entry", "completion_consumed", "trace_published")
             require(execution["contribution_worker"] == worker, "foreign subtask completion contributor")
@@ -413,8 +411,7 @@ class NativeAudit:
                 execution["order_key"] == self.orders[ref]
                 and execution["permit_tail"] == MAX
                 and execution["publication_count"] == 1
-                and execution["ready_source"] == 3
-                and execution["publication_mode"] == 0,
+                and execution["ready_source"] == 3,
                 "invalid cooperative permit or republished payload",
             )
             member = self.member(ref, worker)
@@ -427,7 +424,6 @@ class NativeAudit:
             require(
                 execution["order_key"] == MAX
                 and execution["ready_source"] == 3
-                and execution["publication_mode"] == 0
                 and execution["publication_count"] == 1,
                 "invalid cluster permit or republished payload",
             )

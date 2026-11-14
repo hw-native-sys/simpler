@@ -17,7 +17,7 @@
 #include <type_traits>
 
 #include "common/platform_config.h"
-#include "dispatch_payload.h"
+#include "kernel_args.h"
 #include "scheduler_layout.h"
 
 #ifndef __gm__
@@ -48,8 +48,7 @@ inline constexpr uint64_t SCHEDULER_SCALAR_DCACHE_LINE_BYTES = 64;
 inline constexpr uint64_t SCHEDULER_GM_ATOMIC_SECTOR_BYTES = 128;
 inline constexpr uint64_t SCHEDULER_WORKER_CAPACITY = 108;
 inline constexpr uint32_t SCHEDULER_PENDING_SLOT_COUNT = 2;
-inline constexpr uint32_t SCHEDULER_CORE_TYPE_COUNT = 2;
-enum class SchedulerReadyClass : uint32_t { AIC = 0, AIV = 1 };
+enum class SchedulerExecutionEngine : uint32_t { AIC = 0, AIV = 1 };
 inline constexpr uint32_t SCHEDULER_EXECUTION_ENGINE_COUNT = 2;
 inline constexpr uint32_t SCHEDULER_CLUSTER_CAPACITY = SCHEDULER_WORKER_CAPACITY / 3;
 inline constexpr uint32_t SCHEDULER_ACTIVITY_CAPACITY = 1024;
@@ -72,18 +71,8 @@ inline __aicore__ bool scheduler_phase_timing_enabled(uint64_t level) {
 inline constexpr bool scheduler_activity_record_count_valid(uint32_t committed) noexcept {
     return committed <= SCHEDULER_ACTIVITY_CAPACITY;
 }
-// A task ref names one task to the resident Scheduler. Its encoding today is a
-// GLOBAL task's index into the whole-graph-resident tables, which is why it is
-// compared against graph.task_count and used as a subscript directly.
-//
-// It is deliberately not called a task id: TaskId (src/common/host_build_graph/
-// task_id.h) is a 64-bit handle carrying a space and a parent, and a SUB_TASK --
-// a task inside a graph task's body -- has no table slot at all and is located
-// through its parent instead. TaskKind::GRAPH still sends the whole graph to the
-// legacy scheduler, so no sub-task reaches this path; supporting one means
-// widening this encoding to carry a parent. Every place that depends on the
-// encoding being an index goes through the accessors below, so that widening has
-// one set of call sites rather than a search for bare subscripts.
+// A task ref is the index of an expanded top-level, child or control node.
+// Public TaskId identity is recovered through the graph view.
 inline constexpr int64_t SCHEDULER_TASK_REF_INVALID = -1;
 
 enum class SchedulerTaskState : int64_t {
@@ -92,14 +81,8 @@ enum class SchedulerTaskState : int64_t {
 };
 
 enum class SchedulerReadySource : uint8_t {
-    POOL = 0,
-    DIRECT_RESOLVE = 2,
+    CATALOG = 0,
     COOPERATIVE = 3,
-};
-
-enum class SchedulerPublicationMode : uint8_t {
-    DISPATCH = 0,
-    REFILL = 1,
 };
 
 struct SchedulerIdleRecord {
@@ -282,7 +265,8 @@ inline __aicore__ uint32_t scheduler_task_trace_index(
 }
 inline __aicore__ uint32_t scheduler_task_execution_engine(uint8_t flags, LaneMask active_mask) {
     return static_cast<uint32_t>(
-        (flags & SCHEDULER_TASK_MIX) != 0 || active_mask.has_aic() ? SchedulerReadyClass::AIC : SchedulerReadyClass::AIV
+        (flags & SCHEDULER_TASK_MIX) != 0 || active_mask.has_aic() ? SchedulerExecutionEngine::AIC :
+                                                                     SchedulerExecutionEngine::AIV
     );
 }
 
@@ -394,14 +378,6 @@ struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerTaskControl {
     // [48,64) the immutable validated total N. Only C=D=0 is logically done.
     alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t completion_state;
 
-    // Resolve timing starts only after all computation contributions finish.
-    // It shares the quiescent counter's L2 region, but occupies another 64B
-    // scalar DCache line so its writeback cannot restore an atomic word.
-    alignas(SCHEDULER_SCALAR_DCACHE_LINE_BYTES) uint64_t completion_resolve_start_cycles;
-    uint64_t completion_resolve_end_cycles;
-    uint64_t scheduler_worker_id;
-    uint64_t completion_resolve_loop_iter;
-
     // Only the admission owner bypass-publishes this signal. No cached store
     // or atomic RMW may target its line.
     alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t admission_state;
@@ -486,10 +462,7 @@ struct alignas(64) SchedulerGraphSummary {
 struct SchedulerExecutorTaskTrace {
     uint64_t kernel_start_cycles;
     uint64_t kernel_end_cycles;
-    uint64_t ready_scan_start_cycles;
     uint64_t ready_observe_cycles;
-    uint64_t completion_id;
-    uint64_t completion_inbox_index;
 };
 
 // Stable device-side localization for the first scheduler failure. These values
@@ -580,13 +553,10 @@ struct alignas(64) SchedulerRunControl {
     uint64_t active_worker_count;
     uint64_t expected_task_count;
     uint64_t inline_completed_count;
-    uint64_t aic_active_worker_count;
-    uint64_t aiv_active_worker_count;
     uint64_t aic_worker_demand;
     uint64_t task_metadata_offset;
     uint64_t aiv_worker_demand;
     uint64_t graph_summary_offset;
-    uint64_t scheduler_count;
     volatile uint64_t scheduler_timeout_cycles;
     volatile uint64_t chip_swimlane_level;
     volatile uint64_t sampled_task_timing_enabled;
@@ -643,7 +613,6 @@ struct alignas(64) SchedulerWorkerContext {
     int32_t core_type;
     int32_t physical_core_id;
     int32_t type_rank;
-    uint32_t is_scheduler;
     uint64_t run_control_offset;
     uint64_t task_controls_offset;
     uint64_t scheduler_state_base_address;
@@ -668,8 +637,6 @@ struct alignas(64) SchedulerWorkerContext {
     uint64_t callable_addresses_count;
     uint64_t runtime_worker_count;
 
-    uint64_t scheduler_count;
-    uint64_t scheduler_index;
     uint64_t cluster_count;
     uint64_t cluster_index;
     uint64_t cluster_worker_ids[3];
@@ -680,15 +647,10 @@ struct alignas(64) SchedulerWorkerContext {
     uint64_t pmu_cells_offset;
     uint64_t args_dump_address;
 
-    // Only this worker writes the diagnostic line; peers read its startup
-    // timestamps when consolidating executed-task traces.
+    // Only this worker writes its bootstrap diagnostic line.
     alignas(64) uint64_t bootstrap_task_count;
     uint64_t bootstrap_start_cycles;
     uint64_t target_bootstrap_end_cycles;
-    uint64_t trace_aicore_entry_cycles;
-    uint64_t trace_handshake_publish_cycles;
-    uint64_t trace_register_release_cycles;
-    uint64_t trace_descriptor_cache_observed_cycles;
 };
 
 enum SchedulerExecutionIdentityFlags : uint32_t {
@@ -702,22 +664,17 @@ enum SchedulerExecutionIdentityFlags : uint32_t {
 struct alignas(64) SchedulerTaskTrace {
     // Dispatch publishes this line before READY; completion publishes valid.
     volatile uint64_t valid;
-    uint64_t ready_source;
     uint64_t worker_id;
     uint64_t task_ref;
     uint64_t state_probe_scheduler_worker_id;
     uint64_t state_probe_start_cycles;
     uint64_t state_probe_end_cycles;
-    uint64_t publication_mode;
 
-    uint64_t kernel_start_cycles;
+    // This core owns execution timing through slot retirement.
+    alignas(64) uint64_t kernel_start_cycles;
     uint64_t kernel_end_cycles;
-    uint64_t ready_scan_start_cycles;
     uint64_t ready_observe_cycles;
-    uint64_t completion_id;
-    uint64_t completion_inbox_index;
 
-    // The dispatching Scheduler owns this cache line through completion.
     alignas(64) uint64_t dispatch_start_cycles;
     uint64_t dispatch_end_cycles;
     uint64_t dispatch_scheduler_worker_id;
@@ -726,18 +683,8 @@ struct alignas(64) SchedulerTaskTrace {
     uint64_t complete_end_cycles;
     uint64_t complete_scheduler_worker_id;
     uint64_t complete_loop_iter;
-    uint64_t refill_scheduler_worker_id;
-    uint64_t refill_start_cycles;
-    uint64_t refill_end_cycles;
-    uint64_t refill_task_ref;
-    uint64_t refill_loop_iter;
-    uint64_t aicore_entry_cycles;
-    uint64_t handshake_publish_cycles;
-    uint64_t register_release_cycles;
 
-    // The completion Scheduler consolidates the Executor's staged timing here.
-    uint64_t descriptor_cache_observed_cycles;
-    uint64_t execution_run_epoch;
+    alignas(64) uint64_t execution_run_epoch;
     uint64_t execution_order_key;
     uint64_t execution_group_seq;
     uint32_t execution_block_idx;
@@ -752,11 +699,8 @@ struct alignas(64) SchedulerTaskTrace {
 /**
  * One executed subtask's PMU snapshot, staged by the AICore that ran it.
  *
- * The AICore-scheduler route dispatches on-core, so no AICPU thread observes a
- * task's completion while the run is live and the two-slot per-core staging
- * ring the legacy route drains on every FIN has no consumer here. This array is
- * the route's own staging: one cell per (task, subtask slot), written once by
- * the core that executed it and read once by the AICPU after every core has
+ * One cell per (task, subtask slot), written once by the core that executed it
+ * and read once by the AICPU after every core has
  * retired. `published` carries the task id plus one and is written last, so a
  * zero cell is a subtask this run never executed rather than one whose counters
  * read zero.
@@ -815,16 +759,13 @@ static_assert(sizeof(SchedulerGroupLaneAck) == 64, "lane acknowledgements requir
 static_assert(sizeof(SchedulerGroupMailbox) == 384, "group mailbox layout changed");
 static_assert(offsetof(SchedulerGroupMailbox, published_seq) == 128, "descriptor and publication must be separate");
 static_assert(offsetof(SchedulerGroupMailbox, lanes) == 192, "each lane must own its acknowledgement region");
-static_assert(
-    offsetof(SchedulerTaskControl, completion_resolve_start_cycles) == 320, "resolver timing needs its own line"
-);
 static_assert(sizeof(SchedulerGraphSummary) == 192, "graph summary layout changed");
 static_assert(offsetof(SchedulerGraphSummary, async_layout_offset) == 120);
 static_assert(offsetof(SchedulerGraphSummary, prepared_layout_offset) == 128);
 static_assert(alignof(SchedulerGraphSummary) == 64, "graph summary alignment changed");
-static_assert(sizeof(SchedulerExecutorTaskTrace) == 48, "executor trace payload layout changed");
+static_assert(sizeof(SchedulerExecutorTaskTrace) == 24, "executor trace payload layout changed");
 static_assert(alignof(SchedulerExecutorTaskTrace) == alignof(uint64_t), "executor trace must have natural alignment");
-static_assert(offsetof(SchedulerExecutorTaskTrace, completion_inbox_index) == 40, "executor trace layout changed");
+static_assert(offsetof(SchedulerExecutorTaskTrace, ready_observe_cycles) == 16, "executor trace layout changed");
 static_assert(sizeof(SchedulerRunControl) == 384 + SCHEDULER_WORKER_CAPACITY * 64, "run control layout changed");
 static_assert(alignof(SchedulerRunControl) == 64, "run control alignment changed");
 static_assert(offsetof(SchedulerRunControl, resolved_task_count) == 128, "lifecycle atomics need their own line");
@@ -846,18 +787,14 @@ static_assert(offsetof(SchedulerWorkerContext, worker_contexts_offset) == 56, "p
 static_assert(offsetof(SchedulerWorkerContext, graph_storage_address) == 64, "graph view must share one line");
 static_assert(offsetof(SchedulerWorkerContext, graph_summary_offset) == 120, "graph view exceeds its line");
 static_assert(offsetof(SchedulerWorkerContext, task_metadata_offset) == 128, "dispatch configuration line changed");
-static_assert(offsetof(SchedulerWorkerContext, scheduler_count) == 160, "topology configuration offset changed");
-static_assert(offsetof(SchedulerWorkerContext, trace_cells_offset) == 224, "diagnostic offsets changed");
-static_assert(offsetof(SchedulerWorkerContext, args_dump_address) == 248, "argument capture address changed");
+static_assert(offsetof(SchedulerWorkerContext, cluster_count) == 160, "topology configuration offset changed");
+static_assert(offsetof(SchedulerWorkerContext, trace_cells_offset) == 208, "diagnostic offsets changed");
+static_assert(offsetof(SchedulerWorkerContext, args_dump_address) == 232, "argument capture address changed");
 static_assert(offsetof(SchedulerWorkerContext, prepared_layout_offset) == 40, "prepared execution address changed");
 static_assert(offsetof(SchedulerWorkerContext, bootstrap_task_count) == 256, "worker diagnostics need an owned line");
-static_assert(
-    offsetof(SchedulerWorkerContext, trace_descriptor_cache_observed_cycles) == 304,
-    "worker timestamps must share their owner's line"
-);
-static_assert(sizeof(SchedulerTaskTrace) == 320, "task trace layout changed");
-static_assert(offsetof(SchedulerTaskTrace, execution_run_epoch) == 264, "execution identity offset changed");
-static_assert(offsetof(SchedulerTaskTrace, execution_cluster_lane) == 312, "execution identity exceeds trace tail");
+static_assert(sizeof(SchedulerTaskTrace) == 256, "task trace layout changed");
+static_assert(offsetof(SchedulerTaskTrace, execution_run_epoch) == 192, "execution identity offset changed");
+static_assert(offsetof(SchedulerTaskTrace, execution_cluster_lane) == 240, "execution identity exceeds trace tail");
 static_assert(
     offsetof(SchedulerTaskTrace, dispatch_start_cycles) % 64 == 0,
     "Scheduler-owned dispatch and completion fields must begin on a cache-line boundary"
@@ -865,14 +802,6 @@ static_assert(
 static_assert(
     offsetof(SchedulerTaskTrace, complete_loop_iter) / 64 == offsetof(SchedulerTaskTrace, dispatch_start_cycles) / 64,
     "dispatch and completion fields must share their Scheduler-owned cache line"
-);
-static_assert(
-    offsetof(SchedulerTaskTrace, refill_scheduler_worker_id) % 64 == 0,
-    "Scheduler-owned refill fields must begin on a cache-line boundary"
-);
-static_assert(
-    offsetof(SchedulerTaskTrace, descriptor_cache_observed_cycles) % 64 == 0,
-    "consolidated descriptor timing must begin on a cache-line boundary"
 );
 
 template <typename T>
@@ -1041,8 +970,7 @@ inline bool scheduler_plan_layout(
     bool enable_activity_profiling = false, uint64_t trace_count = 0, const SchedulerSpmdRequirements &spmd = {},
     bool enable_protocol_profiling = false, bool enable_pmu = false, uint64_t native_readonly_end_offset = 0
 ) {
-    // A ready inbox holds its endpoints as int32 task refs, so a graph whose
-    // refs would not fit that encoding cannot be scheduled at all.
+    // Expanded node references and scan cursors fit the validated task-count bound.
     if (layout == nullptr || aic_task_count > task_count || aiv_task_count > task_count ||
         task_count > static_cast<uint64_t>(INT32_MAX) || !scheduler_spmd_requirements_valid(spmd, task_count))
         return false;
@@ -1153,7 +1081,6 @@ inline bool scheduler_init_data_from_layout(
     for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
         contexts[worker].physical_core_id = -1;
         contexts[worker].cluster_index = UINT64_MAX;
-        contexts[worker].scheduler_index = UINT64_MAX;
         contexts[worker].activity_buffers_offset = layout.activity_buffers_offset;
         contexts[worker].prepared_layout_offset = layout.prepared_layout_offset;
         contexts[worker].cluster_worker_ids[0] = UINT64_MAX;
