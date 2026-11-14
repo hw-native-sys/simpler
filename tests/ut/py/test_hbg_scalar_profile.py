@@ -226,6 +226,7 @@ def test_predicated_skip_is_not_counted_as_kernel_execution():
         ("scalar_cluster_mix_needs_service", "scheduler_cluster_mix_needs_service"),
         ("scalar_execution_continuation", "scheduler_try_execution_continuation"),
         ("scalar_execution_token_fanin", "scheduler_execution_token_observe_fanin"),
+        ("scalar_cluster_mix_ready_replacement", "scheduler_cluster_mix_ready_replacement"),
         ("scalar_ordered_poll", "scheduler_ordered_poll_may_progress"),
         ("scalar_admission_claim", "scheduler_stage_admission_candidate"),
         ("scalar_admission_publish", "scheduler_ordered_publish_pending"),

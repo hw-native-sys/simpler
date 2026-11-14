@@ -194,6 +194,7 @@ enum class SchedPhaseKind : uint8_t {
     ScalarClusterMixNeedsService = 132,
     ScalarExecutionContinuation = 133,
     ScalarExecutionTokenFanin = 134,
+    ScalarClusterMixReadyReplacement = 135,
 };
 
 // This phase's name as a report spells it. Returns a string literal, so it is safe on
@@ -452,6 +453,8 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_execution_continuation";
     case SchedPhaseKind::ScalarExecutionTokenFanin:
         return "scalar_execution_token_fanin";
+    case SchedPhaseKind::ScalarClusterMixReadyReplacement:
+        return "scalar_cluster_mix_ready_replacement";
     }
     return "unknown";
 }

@@ -460,3 +460,56 @@ L2 的 Engram 同 task 间隙均值为 15.298 → 15.369 µs，其中完成记�
 合同审查、撤回补丁、CPU/IR/特性结果及 L2 分析，`immutable-call-cache-snapshot/`
 的冻结运行库，以及 `c2a-full-immutable-call-cache/`、
 `engram-immutable-call-cache/` 的原始记录和转换泳道图。
+
+## 完整 fanin 短路与布尔成员查询 {#completed-fanin-shortcut}
+
+2026-11-14，以 rebase 到上游 `c72f02fec` 的 `380702eb6` 为基线，
+候选在 `next_fanin == fanin.count` 时跳过同 task token 扫描，并让
+`has_task` 查询找到首个持有项后返回，不再借用最大 block 扫描。
+原依赖前缀已具有单调性；该候选没有放宽 predicate、Graph、async 或最终资源许可。
+
+三臂对照分别为基线、上述短路、短路叠加 MIX 八项有界发现。各臂完整 18 组
+数值全部通过；每组一次预热、十次 L0 计时，同 case 共用自动分配设备，
+轮换各臂顺序。14 组非通信均值之和依次为 **20.2169190、20.4309672、
+20.2853947 ms**。短路相对基线 **+1.0588%**，完整组合 **+0.3387%**；
+MIX 增量相对短路臂为 −0.7125%，不能据此证明 MIX 单独相对基线的收益。
+短路及组合的组内 bootstrap 区间分别为 [−0.187%, +2.344%] 与
+[−0.774%, +1.438%]，不包含设备、顺序或频率漂移。
+短路生产改动与对应 DFX 期望已撤回；MIX 发现单独验证，不按单张 L3 保留组合。
+
+C2A 同卡 L3 中，无业务 kernel 插入的 PARK→同 task 重访由 12 轮 cooperative
+降为 2 轮，中位 206.851→35.198 µs；t42 起跑跨度 304.768→165.189 µs。
+同时 PARK 事件由 106 增至 308，t41 最后计算在各自时间轴上推迟 130.901 µs，
+总 kernel 包络仅下降 1.10%。这些记录支持继续检查未 ready 组的重复领取成本，
+不能唯一归因 L0 或宣称首个依赖交接已改善。
+
+证据位于 `artifacts/execution-token-implementation/percounter-borrowing-18/`：
+完整逐轮数据、`comparison.json`、`report.md` 与撤回前 `tested-candidate.patch`；
+冻结构建在 `rebased-main-snapshot/`、`ready-prefix-snapshot/`、
+`mix-bounded-discovery-snapshot/`，原始诊断和重访分析在
+`c2a-full-bounded-discovery/` 与 `engram-bounded-discovery/`。
+
+## 正式 MIX 的逐项让路与提前服务 {#formal-mix-service-boundaries}
+
+2026-11-14，以 `9df1febea` 为基线，在普通 token 推进与目录补给的完整
+所有权边界增加正式 MIX 提示检查，并在 helper 返回后提前服务正式组。
+有效 FAA 到责任保存和完整接收之间不让路；已有 TICKETED/CLAIMED、PARK、
+async/control、cooperative discovery 和最终入口许可全部保留。
+负提示只决定是否提前服务，不构成执行许可。
+
+全部 18 组两臂数值校验与 17 项 A5 功能检查通过，另两项 sim-only 跳过。
+每臂一次预热、十次 L0 计时，按 case 交替顺序，使用同一自动分配设备。
+14 组非通信均值之和 **19.8173065 → 19.8489570 ms，+0.1597%**；
+lib +0.6097%，DSL −0.1985%。四组通信记录每轮较慢 rank 后求均值，
+不参与保留门槛。组内 bootstrap 区间为 [−1.009%, +1.346%]，不包含
+设备、顺序或频率漂移。未建立综合收益，撤回全部七个候选文件改动。
+
+六组相关 C++ 套件通过。候选冷构建耗时 949.49 秒；IR 扫描 15/16 个 TU
+零 findings，未解码 vendor wrapper 的分配段和重定位与已验证版本一致，
+不称为完整 clean scan。C2A full 另采同卡 L1/L2/L3，其中单次 L3 device wall
+为 2223.795 → 2391.545 µs；单张插桩图不能替代完整 L0 的保留判断。
+
+本地证据位于 `artifacts/execution-token-implementation/`：
+`formal-mix-latency-18/` 保存完整表格和逐轮数据，`formal-mix-latency/`
+保存撤回补丁、恢复证明及功能结果，`formal-mix-latency-snapshot/`
+保存冻结源码和运行库，`c2a-full-formal-mix-latency/` 保存原始诊断。

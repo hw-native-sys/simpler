@@ -44,6 +44,76 @@ namespace {
 
 using namespace scheduler_test::gm_mix;
 
+TEST(HbgClusterDiscovery, SkipsIneligibleAndExhaustedEntriesUntilOneReservation) {
+    GmMixFixture fixture(
+        {{1, LaneMask::aic()},
+         {2, LaneMask::all(), true},
+         {1, LaneMask::all()},
+         {1, LaneMask::all()},
+         {1, LaneMask::all()}}
+    );
+    ASSERT_TRUE(fixture.bootstrap_admission());
+    bool progress = false;
+    ASSERT_TRUE(scheduler_cluster_mix_discover_task(
+        fixture.graph.graph(), fixture.base(), fixture.locals[3], fixture.run(), 2, 0, &progress
+    ));
+    ASSERT_TRUE(progress);
+    const auto other_owner = fixture.locals[3]->cluster_pending.anchor;
+
+    auto *coordinator = fixture.locals[0];
+    ASSERT_TRUE(scheduler_cluster_mix_discover_next(
+        fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), &progress
+    ));
+    ASSERT_TRUE(progress);
+    EXPECT_EQ(coordinator->cluster_pending.task_ref, 3);
+    EXPECT_EQ(coordinator->cluster_scan_cursor, 4u);
+    EXPECT_EQ(coordinator->cluster_scan_round, 0u);
+    EXPECT_EQ(fixture.control(0)->next_block, 0u);
+    EXPECT_EQ(fixture.control(1)->next_block, 0u);
+    EXPECT_EQ(fixture.control(2)->next_block, 1u);
+    EXPECT_EQ(fixture.control(3)->next_block, 1u);
+    EXPECT_EQ(fixture.control(4)->next_block, 0u);
+    EXPECT_EQ(fixture.locals[3]->cluster_pending.anchor.claimed_state, other_owner.claimed_state);
+
+    const auto held = coordinator->cluster_pending.anchor;
+    ASSERT_TRUE(scheduler_cluster_mix_discover_next(
+        fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), &progress
+    ));
+    EXPECT_FALSE(progress);
+    EXPECT_EQ(coordinator->cluster_scan_cursor, 4u);
+    EXPECT_EQ(coordinator->cluster_pending.anchor.execution_index, held.execution_index);
+    EXPECT_EQ(coordinator->cluster_pending.anchor.claimed_state, held.claimed_state);
+    EXPECT_EQ(fixture.control(4)->next_block, 0u);
+}
+
+TEST(HbgClusterDiscovery, ExhaustedSearchYieldsAtBudgetOrOneCatalogPass) {
+    for (uint32_t entries : {2u, 9u}) {
+        SCOPED_TRACE(entries);
+        std::vector<GmShape> shapes(entries, {1, LaneMask::aic()});
+        shapes.back().mask = LaneMask::all();
+        GmMixFixture fixture(shapes);
+        ASSERT_TRUE(fixture.bootstrap_admission());
+        bool progress = false;
+        ASSERT_TRUE(scheduler_cluster_mix_discover_task(
+            fixture.graph.graph(), fixture.base(), fixture.locals[3], fixture.run(), entries - 1, 0, &progress
+        ));
+        ASSERT_TRUE(progress);
+        auto *coordinator = fixture.locals[0];
+        coordinator->cluster_scan_cursor = entries - 1;
+        coordinator->cluster_scan_round = 2;
+        ASSERT_TRUE(scheduler_cluster_mix_discover_next(
+            fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), &progress
+        ));
+        EXPECT_FALSE(progress);
+        EXPECT_EQ(coordinator->cluster_pending.task_ref, SCHEDULER_TASK_REF_INVALID);
+        EXPECT_EQ(coordinator->cluster_scan_cursor, entries == 2 ? 1u : 7u);
+        EXPECT_EQ(coordinator->cluster_scan_round, 3u);
+        EXPECT_EQ(fixture.control(entries - 1)->next_block, 1u);
+        EXPECT_EQ(fixture.signal(0)->prepare_generation, 0u);
+        EXPECT_EQ(fixture.signal(0)->armed_generation, 0u);
+    }
+}
+
 class HbgClusterEarlyPreparation : public ::testing::TestWithParam<LaneMask> {};
 
 TEST_P(HbgClusterEarlyPreparation, ProtocolClaimFollowsInterleavedProducerCompletion) {
@@ -107,13 +177,6 @@ TEST_P(HbgClusterEarlyPreparation, OneFutureGroupParksWithoutHidingIndependentMi
     const auto held = coordinator->cluster_pending.anchor;
     EXPECT_EQ(scheduler_prepared_phase(held.claimed_state), SchedulerPreparedPhase::GROUP_RESERVED);
     EXPECT_EQ(fixture.control(1)->next_block, 1u);
-    ASSERT_TRUE(scheduler_cluster_mix_discover_next(
-        fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), &progress
-    ));
-    EXPECT_FALSE(progress);
-    EXPECT_EQ(coordinator->cluster_pending.anchor.execution_index, held.execution_index);
-    EXPECT_EQ(fixture.control(1)->next_block, 1u);
-    EXPECT_EQ(fixture.control(2)->next_block, 0u);
     for (uint32_t worker : {3u, 4u, 5u}) {
         ASSERT_TRUE(scheduler_prepare_cluster_lane(fixture.base(), fixture.locals[worker]));
         EXPECT_EQ(fixture.locals[worker]->local_ready_mask, 0u);
@@ -129,7 +192,16 @@ TEST_P(HbgClusterEarlyPreparation, OneFutureGroupParksWithoutHidingIndependentMi
         ));
         EXPECT_EQ(fixture.signal(1)->armed_generation, 0u);
     }
-    EXPECT_EQ(coordinator->cluster_pending.task_ref, SCHEDULER_TASK_REF_INVALID);
+    ASSERT_EQ(coordinator->cluster_pending.task_ref, 1);
+    EXPECT_EQ(coordinator->cluster_pending.anchor.claimed_state, held.claimed_state);
+    EXPECT_EQ(fixture.control(1)->parked_count, 0u);
+    EXPECT_EQ(fixture.control(2)->next_block, 0u);
+    EXPECT_EQ(fixture.signal(1)->prepare_mask, mask.raw());
+    ASSERT_TRUE(scheduler_cluster_mix_discover_next(
+        fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), &progress
+    ));
+    ASSERT_TRUE(progress);
+    ASSERT_EQ(coordinator->cluster_pending.task_ref, 2);
     EXPECT_EQ(fixture.control(1)->parked_count, 1u);
     EXPECT_EQ(scheduler_completion_count(fixture.control(1)->completion_state), 0u);
     EXPECT_EQ(
@@ -138,11 +210,6 @@ TEST_P(HbgClusterEarlyPreparation, OneFutureGroupParksWithoutHidingIndependentMi
         ),
         SchedulerPreparedPhase::PARKED
     );
-    EXPECT_EQ(fixture.signal(1)->prepare_mask, 0u);
-    ASSERT_TRUE(scheduler_cluster_mix_discover_next(
-        fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), &progress
-    ));
-    ASSERT_EQ(coordinator->cluster_pending.task_ref, 2);
     ASSERT_TRUE(scheduler_cluster_mix_progress_pending(
         fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), &progress
     ));
@@ -176,6 +243,110 @@ TEST_P(HbgClusterEarlyPreparation, OneFutureGroupParksWithoutHidingIndependentMi
 }
 
 INSTANTIATE_TEST_SUITE_P(AllMixMasks, HbgClusterEarlyPreparation, ::testing::ValuesIn(kMixMasks));
+
+TEST(HbgClusterEarlyPreparation, ReplacementNeedsLogicalCompletionAndAnAvailableUnit) {
+    GmMixFixture fixture({{1, LaneMask::aic()}, {1, LaneMask::aic()}, {1, LaneMask::all()}, {1, LaneMask::all()}});
+    fixture.graph.executable(2, 0, {0});
+    fixture.graph.executable(3, 0, {1});
+    fixture.storage.metadata[2].flags |= SCHEDULER_TASK_HAS_FANIN;
+    fixture.storage.metadata[3].flags |= SCHEDULER_TASK_HAS_FANIN;
+    ASSERT_TRUE(fixture.bootstrap_admission());
+    fixture.control(1)->completion_state = scheduler_completion_encode(1, 0, 1);
+    auto *coordinator = fixture.locals[0];
+    bool progress = false;
+    ASSERT_TRUE(scheduler_cluster_mix_discover_task(
+        fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), 2, 0, &progress
+    ));
+    const auto held = coordinator->cluster_pending.anchor;
+    coordinator->cluster_scan_cursor = 3;
+    ASSERT_TRUE(scheduler_cluster_mix_discover_next(
+        fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), &progress
+    ));
+    EXPECT_FALSE(progress);
+    EXPECT_EQ(coordinator->cluster_pending.anchor.claimed_state, held.claimed_state);
+    EXPECT_EQ(coordinator->cluster_scan_cursor, 3u);
+    EXPECT_EQ(coordinator->cluster_scan_round, 1u);
+    EXPECT_EQ(fixture.control(2)->parked_count, 0u);
+    EXPECT_EQ(fixture.control(3)->next_block, 0u);
+
+    fixture.control(1)->completion_state = scheduler_completion_completed_state(1);
+    auto *other = fixture.locals[3];
+    ASSERT_TRUE(scheduler_cluster_mix_discover_task(
+        fixture.graph.graph(), fixture.base(), other, fixture.run(), 3, 0, &progress
+    ));
+    ASSERT_TRUE(progress);
+    ASSERT_TRUE(scheduler_cluster_mix_discover_next(
+        fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), &progress
+    ));
+    EXPECT_FALSE(progress);
+    EXPECT_EQ(coordinator->cluster_pending.anchor.claimed_state, held.claimed_state);
+    EXPECT_EQ(fixture.control(2)->parked_count, 0u);
+    EXPECT_EQ(fixture.control(3)->next_block, 1u);
+
+    fixture.signal(1)->sync_hold[0] = 1;
+    for (uint32_t step = 0; step < SCHEDULER_CLUSTER_PENDING_BUDGET; ++step)
+        ASSERT_TRUE(scheduler_cluster_mix_progress_pending(
+            fixture.graph.graph(), fixture.base(), other, fixture.run(), &progress
+        ));
+    ASSERT_EQ(other->cluster_pending.task_ref, SCHEDULER_TASK_REF_INVALID);
+    ASSERT_EQ(fixture.control(3)->parked_count, 1u);
+    fixture.signal(1)->sync_hold[0] = 0;
+    ASSERT_TRUE(scheduler_cluster_mix_discover_next(
+        fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), &progress
+    ));
+    ASSERT_TRUE(progress);
+    EXPECT_EQ(coordinator->cluster_pending.task_ref, 3);
+    EXPECT_EQ(scheduler_prepared_generation(coordinator->cluster_pending.anchor.claimed_state), 1u);
+    EXPECT_EQ(fixture.control(2)->parked_count, 1u);
+    EXPECT_EQ(fixture.control(3)->parked_count, 0u);
+}
+
+TEST(HbgClusterEarlyPreparation, ReplacingFutureGroupPreservesAnArmedCurrentGroup) {
+    GmMixFixture fixture(
+        {{1, LaneMask::aic()}, {1, LaneMask::aic()}, {2, LaneMask::all()}, {1, LaneMask::all()}, {1, LaneMask::all()}}
+    );
+    fixture.graph.executable(3, 0, {0});
+    fixture.graph.executable(4, 0, {1});
+    fixture.storage.metadata[3].flags |= SCHEDULER_TASK_HAS_FANIN;
+    fixture.storage.metadata[4].flags |= SCHEDULER_TASK_HAS_FANIN;
+    ASSERT_TRUE(fixture.bootstrap_admission());
+    bool armed = false;
+    ASSERT_TRUE(fixture.ordinary_arm(2, 0, &armed));
+    ASSERT_TRUE(armed);
+    const uint32_t generation = fixture.signal(0)->armed_generation;
+    const uint32_t staged = fixture.signal(0)->staged_mask;
+    auto *coordinator = fixture.locals[0];
+    bool progress = false;
+    ASSERT_TRUE(scheduler_cluster_mix_discover_task(
+        fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), 3, 0, &progress
+    ));
+    const auto held = coordinator->cluster_pending.anchor;
+    coordinator->cluster_scan_cursor = 2;
+    ASSERT_TRUE(scheduler_cluster_mix_discover_next(
+        fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), &progress
+    ));
+    EXPECT_FALSE(progress);
+    EXPECT_EQ(coordinator->cluster_pending.task_ref, 3);
+    EXPECT_EQ(coordinator->cluster_pending.anchor.claimed_state, held.claimed_state);
+    EXPECT_EQ(fixture.control(2)->next_block, 1u);
+    EXPECT_EQ(fixture.control(3)->parked_count, 0u);
+    EXPECT_EQ(fixture.control(4)->next_block, 0u);
+
+    fixture.control(1)->completion_state = scheduler_completion_completed_state(1);
+    ASSERT_TRUE(scheduler_cluster_mix_discover_next(
+        fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), &progress
+    ));
+    ASSERT_TRUE(progress);
+    EXPECT_EQ(coordinator->cluster_pending.task_ref, 4);
+    EXPECT_EQ(fixture.control(3)->parked_count, 1u);
+    EXPECT_EQ(fixture.signal(0)->armed_generation, generation);
+    EXPECT_EQ(fixture.signal(0)->staged_mask, staged);
+    EXPECT_EQ(fixture.signal(0)->task_ref, 2);
+    for (uint32_t lane = 0; lane < 3; ++lane) {
+        EXPECT_EQ(fixture.signal(0)->arrived[lane], 0u);
+        EXPECT_EQ(fixture.signal(0)->finished[lane], 0u);
+    }
+}
 
 class HbgClusterServicePriority : public ::testing::TestWithParam<LaneMask> {};
 
@@ -319,7 +490,7 @@ void service_cluster_members(GmMixFixture &fixture, uint32_t cluster = 0, uint64
 }
 
 TEST(HbgClusterGroupOwnership, ParkedVectorGroupTransfersToActualAivExecutor) {
-    GmMixFixture fixture({{1, LaneMask::aic()}, {1, LaneMask::both_aiv()}});
+    GmMixFixture fixture({{1, LaneMask::aic()}, {1, LaneMask::both_aiv()}, {1, LaneMask::both_aiv()}});
     fixture.graph.executable(1, 1, {0});
     fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
     ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
@@ -330,10 +501,11 @@ TEST(HbgClusterGroupOwnership, ParkedVectorGroupTransfersToActualAivExecutor) {
         fixture.graph.graph(), fixture.base(), first, fixture.run(), 1, 0, &progress
     ));
     auto stale = first->cluster_pending.anchor;
-    for (uint32_t step = 0; step < SCHEDULER_CLUSTER_PENDING_BUDGET; ++step)
-        ASSERT_TRUE(scheduler_cluster_mix_progress_pending(
-            fixture.graph.graph(), fixture.base(), first, fixture.run(), &progress
-        ));
+    first->cluster_scan_cursor = 2;
+    ASSERT_TRUE(
+        scheduler_cluster_mix_discover_next(fixture.graph.graph(), fixture.base(), first, fixture.run(), &progress)
+    );
+    ASSERT_EQ(first->cluster_pending.task_ref, 2);
     ASSERT_EQ(fixture.control(1)->parked_count, 1u);
     auto *second = fixture.locals[3];
     ASSERT_TRUE(scheduler_cluster_mix_discover_task(
