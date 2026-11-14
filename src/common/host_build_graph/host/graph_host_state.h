@@ -34,7 +34,7 @@ inline constexpr size_t GRAPH_MAX_DEFINITIONS = 16;
 // packed from the base by a bump cursor and padded to `object_align`. The
 // platform retains the block across binds, so a run whose Definitions fit
 // `capacity` acquires no host memory for them at all.
-struct GraphDefinitionArena {
+struct GraphImageArena {
     std::byte *base{nullptr};
     size_t capacity{0};
     size_t object_prefix_bytes{0};
@@ -57,15 +57,15 @@ struct GraphHostUpload {
 // so the arena may be reallocated — preserving its content — between publication
 // and upload. It is GRAPH_NO_OBJECT_OFFSET exactly when `spill` is set, which is
 // then the image the upload must copy into an object of its own choosing.
-struct GraphHostDefinition {
+struct GraphHostImage {
     uint64_t graph_key;
     size_t object_offset;
     const std::byte *spill;
     size_t bytes;
 };
 
-struct GraphHostDefinitionList {
-    std::vector<GraphHostDefinition> entries;
+struct GraphHostImageList {
+    std::vector<GraphHostImage> entries;
 };
 
 struct GraphPendingUpload {
@@ -104,7 +104,7 @@ struct GraphInflightRecording {
 // — an offset, not an address, so the arena can be reallocated between
 // publication and upload — unless the arena had no room, in which case `spill`
 // holds the image and `object_offset` is GRAPH_NO_OBJECT_OFFSET.
-struct GraphDefinitionRecord {
+struct GraphCacheRecord {
     uint64_t invocation_storage_bytes{0};
     size_t object_offset{GRAPH_NO_OBJECT_OFFSET};
     size_t bytes{0};
@@ -122,20 +122,19 @@ struct GraphDefinitionRecord {
 };
 
 struct GraphHostState {
-    bool (*execution_storage_bytes)(const GraphDefinition &, uint64_t *) = [](const GraphDefinition &definition,
-                                                                              uint64_t *bytes) {
+    bool (*execution_storage_bytes)(const Graph &, uint64_t *) = [](const Graph &definition, uint64_t *bytes) {
         *bytes = definition.execution_storage_bytes;
         return *bytes != 0;
     };
 
     // Synchronous callers lease independent scratch; retired entries return it here.
     std::array<std::unique_ptr<GraphRecording>, GRAPH_MAX_DEFINITIONS> fallback_scratch_cache;
-    explicit GraphHostState(const GraphDefinitionArena &arena) :
+    explicit GraphHostState(const GraphImageArena &arena) :
         arena(arena) {}
 
     // Definitions are keyed by graph_key in this run's cache. Separate runs own
     // independent caches, so orchestration callable identity is not part of the key.
-    std::unordered_map<uint64_t, GraphDefinitionRecord> definitions;
+    std::unordered_map<uint64_t, GraphCacheRecord> definitions;
     // Recordings in flight, at most one per Graph key. Several record at once,
     // each on its own thread; graph_commit drains and finalizes all of them.
     std::unordered_map<uint64_t, std::unique_ptr<GraphInflightRecording>> inflight;
@@ -147,7 +146,7 @@ struct GraphHostState {
     std::atomic<size_t> inflight_count{0};
     // Fixed for the run: recorder threads hold addresses inside it, so it must
     // not move while any of them is filling an image.
-    GraphDefinitionArena arena;
+    GraphImageArena arena;
     std::atomic<size_t> arena_cursor{0};
 
     // Claim room for one object of `image_bytes`, padded so the next object
@@ -199,15 +198,15 @@ struct GraphHostStateDeleter {
 
 using GraphHostStatePtr = std::unique_ptr<GraphHostState, GraphHostStateDeleter>;
 
-GraphHostStatePtr make_graph_host_state(const GraphDefinitionArena &arena);
+GraphHostStatePtr make_graph_host_state(const GraphImageArena &arena);
 
 // Where a published record's image is: in the arena at its object offset, or in
 // the buffer it spilled to.
-const GraphDefinition *graph_record_definition(const GraphHostState &state, const GraphDefinitionRecord &record);
+const Graph *graph_record_definition(const GraphHostState &state, const GraphCacheRecord &record);
 
 size_t graph_host_upload_count(const GraphHostState &state);
 // Arena bytes this run has claimed: the prefix its objects occupy, and so the
 // length of the region an upload must ship for the objects built in place.
 size_t graph_host_arena_used(const GraphHostState &state);
 std::optional<GraphHostUpload> graph_host_upload(GraphHostState &state, size_t index);
-GraphHostDefinitionList graph_host_definitions(GraphHostState &state);
+GraphHostImageList graph_host_definitions(GraphHostState &state);

@@ -29,7 +29,7 @@ atomic fetch-add(0) 再确认；过期的 bypass 值不能授权消费业务输�
 ## 依赖访问与有界观察
 
 顶层 fanin 从紧凑镜像读取。native Graph 的外部依赖经过 `completion_refs` 映射；
-child 的 Definition-local index 映射到 `child_begin + local`，root 依赖 ENTER，EXIT 依赖所有 sink。
+child 的 Graph-local index 映射到 `child_begin + local`，root 依赖 ENTER，EXIT 依赖所有 sink。
 引用必须合法并满足 producer_ref < consumer_ref；损坏的 ref/format 进入首错处理。
 
 普通 execution token 可以在取得 Call 责任后等待 fanin。token 保存已经确认 DONE 的正前缀，

@@ -5,7 +5,7 @@
 ## Graph 如何进入同一条执行链
 
 Host 对每个 shell 展开 ENTER、children、EXIT，并保存原始 TaskId 与 expanded ref 的映射。
-Definition 的 immutable blob/child plan 每 run 只保存一份，各 instance 独立绑定 boundary、业务 heap 和参数 tail。
+原始 Graph 只由 Host 持有；设备每个唯一 Graph 保存一份紧凑拓扑与 child plan，各 instance 独立绑定参数 tail。
 Host 预构造 child 的全部 block/lane Call，设备没有 GraphExecution materializer 或 child 参数补建路径。
 
 例如 A → G(c0 → c1) → B 展开为 A0 → ENTER1 → c0(2) → c1(3) → EXIT4 → B5，
@@ -16,8 +16,8 @@ EXIT 通过全部 sink gate 后完成，外部 B 才能运行。
 ENTER、EXIT 和 DUMMY 是无业务 slot 的控制节点。即使两个 kernel slot 都满，仍执行有限控制 scan。
 Graph 内有多个不连通分量时，EXIT 也必须等待每个 sink，不能把最后记录的 child 当作整个实例完成。
 
-原始 80 B 顶层镜像仍提供 shell boundary，native header/template/instance 给出 child-local 访问。
-Graph view v6 的可信 extent 先验证 header 范围，再读取 native image v4；
+80 B 顶层镜像的 Host 镜像提供本次 shell boundary；Host 完成重定位，设备通过 native header/template/instance 访问 child 拓扑与已绑定参数。
+Graph view v6 的可信 extent 先验证 header 范围，再读取 native image v5；
 offset/count、对齐、非重叠、节点数量和 epoch 损坏都会阻止合法执行。
 
 ## 参数区与稳定 Binding
@@ -25,7 +25,7 @@ offset/count、对齐、非重叠、节点数量和 epoch 损坏都会阻止合�
 每 child 的实际参数 tail 为 align64(tensor_count×128)+align64(scalar_count×8)，
 有 predicate 再加 64 B。实例 args_base=heap_base+required_heap；无参数 child 可以使用零 tail。
 公共 GraphExecution 的 execution_storage_bytes 不参与默认 HBG 的参数预算。
-Host 缓存每 Definition 的参数预算，提交与 bind 使用同一检查算法。
+Host 缓存每 Graph 的参数预算，提交与 bind 使用同一检查算法。
 
 PARAM 来自本次 boundary，SUB_TASK 来自本实例业务 heap；scalar 按值绑定，
 predicate operand 地址按来源重定位，值在执行时读。

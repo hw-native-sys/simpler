@@ -11,8 +11,8 @@
 | ---- | -------------- | -------------- |
 | TaskImageStatus | 每轮 64 B 首错头 | Host 初始化，AICPU 首错锁存和 Host 结算 |
 | TaskImageStorage | 每顶层任务 80 B，后接实用参数/fanin 池 | Host pack 后发布，设备只读参数与依赖 |
-| SchedulerNativeGraphHeader / templates | native Graph 每轮一份头、每唯一 Definition 一份计划 | Host 持有自有字节，发布后只读 |
-| SchedulerGraphInstance | 每个 shell invocation 一份 | Host 绑定本实例 boundary/heap/args 地址 |
+| SchedulerNativeGraphHeader / templates | native Graph 每轮一份 128 B 头、每唯一 Graph 一份 64 B 计划 | Host 持有自有字节，发布后只读 |
+| SchedulerGraphInstance | 每个 shell invocation 一份 | 只含实例 ref/Graph index 和 args_base，32 B |
 | SchedulerRunControl | 每轮一份 | AICPU 发布实际参与者和预算，核按字段协议更新 bootstrap/完成/错误 |
 | SchedulerGraphSummary | 每轮一份 | Host 图事实加 AICPU 验证后的拓扑，READY 后只读 |
 | SchedulerWorkerContext | 每物理 worker 一个 320 B 记录 | READY 发布前四行；本核写最后一行启动诊断 |

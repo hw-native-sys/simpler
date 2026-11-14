@@ -49,8 +49,8 @@ TEST(NativeGraphPlanTest, SyncStartRequiresDistinctExecutionPositions) {
 }
 
 struct DefinitionFixture {
-    GraphDefinition header{};
-    std::vector<std::byte> bytes{sizeof(GraphDefinition)};
+    Graph header{};
+    std::vector<std::byte> bytes{sizeof(Graph)};
 
     template <typename T>
     uint32_t append(const std::vector<T> &values) {
@@ -135,7 +135,7 @@ struct DefinitionFixture {
         sync();
     }
     void sync() { std::memcpy(bytes.data(), &header, sizeof(header)); }
-    bool build(NativeGraphDefinitionPlan &plan, std::string &error) const {
+    bool build(NativeGraphPlan &plan, std::string &error) const {
         return native_graph_plan_definition(bytes.data(), bytes.size(), header.graph_key, &plan, &error);
     }
 };
@@ -143,11 +143,11 @@ struct DefinitionFixture {
 
 TEST(HbgNativeGraphPlan, ArgumentReservationAndValidationDoNotConstructAnExecutionImage) {
     DefinitionFixture fixture({{}, {0}}, false, 1, 1);
-    NativeGraphDefinitionPlan plan;
+    NativeGraphPlan plan;
     std::string error;
     ASSERT_TRUE(fixture.build(plan, error)) << error;
     uint64_t bytes = 0;
-    const auto *definition = reinterpret_cast<const GraphDefinition *>(fixture.bytes.data());
+    const auto *definition = reinterpret_cast<const Graph *>(fixture.bytes.data());
     ASSERT_TRUE(graph_native_argument_storage_bytes(*definition, &bytes));
     EXPECT_EQ(bytes, plan.args_bytes);
     EXPECT_LT(bytes, fixture.header.execution_storage_bytes);
@@ -171,19 +171,17 @@ TEST(HbgNativeGraphPlan, FaninAndSinkCountsUseTheWholeDefinition) {
         edges.back().resize(count);
         std::iota(edges.back().begin(), edges.back().end(), 0);
         DefinitionFixture fixture(edges);
-        NativeGraphDefinitionPlan plan;
+        NativeGraphPlan plan;
         std::string error;
         ASSERT_TRUE(fixture.build(plan, error)) << error;
         ASSERT_EQ(plan.sinks, std::vector<uint16_t>({static_cast<uint16_t>(count)}));
-        EXPECT_EQ(plan.execution_count, count + 1);
         EXPECT_EQ(plan.definition.edge_count, count);
     }
     DefinitionFixture roots(std::vector<std::vector<uint16_t>>(1024), true);
-    NativeGraphDefinitionPlan plan;
+    NativeGraphPlan plan;
     std::string error;
     ASSERT_TRUE(roots.build(plan, error)) << error;
     EXPECT_EQ(plan.sinks.size(), 1024);
-    EXPECT_EQ(plan.execution_count, 0);
     EXPECT_EQ(plan.args_bytes, 0);
 }
 
@@ -210,14 +208,13 @@ TEST(HbgNativeGraphPlan, DenseRefsKeepOriginalShellIdentityAndShareDefinitions) 
 
 TEST(HbgNativeGraphPlan, OwnsBytesAndKeepsScalarWritersOnSeparateCacheLines) {
     DefinitionFixture fixture({{}, {0}, {1}}, false, true);
-    NativeGraphDefinitionPlan plan;
+    NativeGraphPlan plan;
     std::string error;
     ASSERT_TRUE(fixture.build(plan, error)) << error;
     EXPECT_EQ(plan.args_bytes, 192);
     for (size_t i = 0; i < plan.children.size(); ++i) {
         EXPECT_EQ(plan.children[i].scalars_offset, i * 64);
         EXPECT_EQ(plan.children[i].predicate_offset, UINT64_MAX);
-        EXPECT_EQ(plan.children[i].execution_prefix, i);
     }
     const auto saved = plan.image;
     fixture.bytes.assign(fixture.bytes.size(), std::byte{0});
@@ -228,7 +225,7 @@ TEST(HbgNativeGraphPlan, CanonicalMaximumArgumentPoolsUseExactParameterStorage) 
     DefinitionFixture fixture(
         std::vector<std::vector<uint16_t>>(SUB_TASK_MAX_NUM), false, MAX_SCALAR_ARGS, MAX_TENSOR_ARGS
     );
-    NativeGraphDefinitionPlan plan;
+    NativeGraphPlan plan;
     std::string error;
     ASSERT_TRUE(fixture.build(plan, error)) << error;
     const uint64_t per_child = sizeof(simpler::hbg::Tensor) * MAX_TENSOR_ARGS + sizeof(uint64_t) * MAX_SCALAR_ARGS;
@@ -236,7 +233,7 @@ TEST(HbgNativeGraphPlan, CanonicalMaximumArgumentPoolsUseExactParameterStorage) 
 }
 
 TEST(HbgNativeGraphPlan, RejectsOverlappingAndGappedChildArgumentSpans) {
-    NativeGraphDefinitionPlan plan;
+    NativeGraphPlan plan;
     std::string error;
     for (bool tensors : {false, true}) {
         DefinitionFixture fixture({{}, {}}, false, tensors ? 0 : 1, tensors ? 1 : 0);
@@ -266,7 +263,7 @@ TEST(HbgNativeGraphPlan, RejectsOverlappingAndGappedChildArgumentSpans) {
 
 TEST(HbgNativeGraphPlan, RejectsUnusedArgumentPoolTailAndOverflowingChildSpan) {
     DefinitionFixture fixture({{}, {}}, false, 1, 1);
-    NativeGraphDefinitionPlan plan;
+    NativeGraphPlan plan;
     std::string error;
     ASSERT_TRUE(fixture.build(plan, error)) << error;
     const auto saved = plan.image;
@@ -285,7 +282,7 @@ TEST(HbgNativeGraphPlan, RejectsUnusedArgumentPoolTailAndOverflowingChildSpan) {
 }
 
 TEST(HbgNativeGraphPlan, RejectsDuplicateEdgesRootsAndAsymmetricCsr) {
-    NativeGraphDefinitionPlan plan;
+    NativeGraphPlan plan;
     std::string error;
     DefinitionFixture duplicate({{}, {0}, {0, 1}});
     duplicate.put<uint16_t>(duplicate.header.off_fanin_indices, 2, 0);
@@ -303,11 +300,11 @@ TEST(HbgNativeGraphPlan, RejectsDuplicateEdgesRootsAndAsymmetricCsr) {
 
 TEST(HbgNativeGraphPlan, RejectsBadExtentsBeforeReadingAndLeavesOutputUnchanged) {
     DefinitionFixture fixture(std::vector<std::vector<uint16_t>>{{}});
-    NativeGraphDefinitionPlan plan;
+    NativeGraphPlan plan;
     std::string error;
     ASSERT_TRUE(fixture.build(plan, error)) << error;
     const auto saved = plan.image;
-    EXPECT_FALSE(native_graph_plan_definition(fixture.bytes.data(), sizeof(GraphDefinition) - 1, 77, &plan, &error));
+    EXPECT_FALSE(native_graph_plan_definition(fixture.bytes.data(), sizeof(Graph) - 1, 77, &plan, &error));
     fixture.header.off_sub_tasks = UINT32_MAX;
     fixture.sync();
     EXPECT_FALSE(fixture.build(plan, error));
@@ -325,7 +322,7 @@ TEST(HbgNativeGraphPlan, CooperativeShapeStillRejectsMalformedTopology) {
     child.logical_block_num = 2;
     child.total_required_subtasks = 2;
     fixture.put(fixture.header.off_sub_tasks, 0, child);
-    NativeGraphDefinitionPlan plan;
+    NativeGraphPlan plan;
     std::string error;
     ASSERT_TRUE(fixture.build(plan, error)) << error;
     fixture.put<uint16_t>(fixture.header.off_fanin_indices, 0, 1);
@@ -383,8 +380,9 @@ struct NativeViewFixture {
             uint64_t trace_count = 0;
             for (const auto &instance : plan.instances) {
                 const auto &definition_plan = plan.definitions[instance.definition_index];
-                trace_count += definition_plan.execution_count;
                 for (const auto &child : definition_plan.children) {
+                    trace_count +=
+                        static_cast<uint64_t>(child.metadata.logical_block_num) * child.metadata.active_mask.count();
                     if (scheduler_task_requires_admission(child.metadata)) ++requirements.cooperative_task_count;
                     if (scheduler_task_is_mix(child.metadata.flags)) {
                         ++requirements.mix_task_count;
@@ -503,7 +501,7 @@ TEST(HbgNativeGraphPlan, AccessRevalidatesReusedBackingForEachRun) {
         SchedulerNativeNode node{};
         ASSERT_TRUE(scheduler_native_node_checked(access, 1, &node));
         EXPECT_EQ(node.header->run_epoch, 1u);
-        EXPECT_EQ(node.definition->graph_key, body.header.graph_key);
+        EXPECT_EQ(node.definition->task_count, static_cast<uint64_t>(body.header.task_count));
         view.header().header_bytes = 0;
         const SchedulerGraphAccess next(access);
         EXPECT_FALSE(scheduler_graph_view_valid(next));
@@ -526,23 +524,19 @@ TEST(HbgNativeGraphPlan, AccessRevalidatesReusedBackingForEachRun) {
         EXPECT_FALSE(scheduler_native_node_checked(access, 1, &node));
     }
     view.definition().task_count = task_count;
-    auto *definition = reinterpret_cast<GraphDefinition *>(
-        static_cast<std::byte *>(view.backing.get()) + view.definition().definition_offset
-    );
-    ++definition->graph_key;
-    view.definition().graph_key = definition->graph_key;
+    view.definition().args_bytes += 64;
     {
         const SchedulerGraphAccess access(view.graph);
         SchedulerNativeNode node{};
         ASSERT_TRUE(scheduler_native_node_checked(access, 1, &node));
         EXPECT_EQ(node.header->run_epoch, 2u);
-        EXPECT_EQ(node.definition->graph_key, body.header.graph_key + 1);
+        EXPECT_EQ(node.definition->args_bytes, 64u);
     }
 }
 
 TEST(HbgNativeGraphPlan, AccessAlternatesDefinitionsWithoutSkippingNodeBounds) {
     DefinitionFixture first(std::vector<std::vector<uint16_t>>{{}});
-    DefinitionFixture second(std::vector<std::vector<uint16_t>>{{}});
+    DefinitionFixture second(std::vector<std::vector<uint16_t>>{{}}, false, true);
     second.header.graph_key = first.header.graph_key + 1;
     second.sync();
     NativeViewFixture view(std::vector<const DefinitionFixture *>{&first, &second}, {0, 1, 0});
@@ -550,7 +544,7 @@ TEST(HbgNativeGraphPlan, AccessAlternatesDefinitionsWithoutSkippingNodeBounds) {
     for (int64_t ref : {1, 4, 7, 4, 1}) {
         SchedulerNativeNode node{};
         ASSERT_TRUE(scheduler_native_node_checked(access, ref, &node));
-        EXPECT_EQ(node.definition->graph_key, ref == 4 ? second.header.graph_key : first.header.graph_key);
+        EXPECT_EQ(node.definition->args_bytes, ref == 4 ? 64u : 0u);
     }
     SchedulerNativeNode node{};
     EXPECT_EQ(access.native_template(view.header().definition_count), nullptr);
@@ -660,10 +654,11 @@ TEST(HbgNativeGraphPlan, ReadersRejectForgedHeaderRegionsAndInstanceBindings) {
     EXPECT_FALSE(scheduler_graph_view_valid(view.graph));
     header.bindings_offset = bindings_offset;
     auto &definition = view.definition();
+    const auto rows_offset = definition.fanin_offsets_offset;
     definition.fanin_offsets_offset = header.readonly_end_offset;
     uint32_t count = 0;
     EXPECT_NE(scheduler_node_fanin_count(view.graph, 1, &count), SchedulerGraphResult::OK);
-    definition.fanin_offsets_offset = definition.definition_offset + body.header.off_fanin_offsets;
+    definition.fanin_offsets_offset = rows_offset;
     auto *bindings =
         reinterpret_cast<SchedulerNodeBinding *>(static_cast<std::byte *>(view.backing.get()) + header.bindings_offset);
     bindings[1].instance_index = 99;
@@ -1058,6 +1053,7 @@ struct BoundArgumentsFixture {
     simpler::hbg::Tensor boundary{};
     uint64_t scalar{71};
     SchedulerGraphInstance *instance;
+    NativeGraphArguments arguments{};
     explicit BoundArgumentsFixture(NativeViewFixture &view, uint32_t index) {
         instance = reinterpret_cast<SchedulerGraphInstance *>(
                        static_cast<std::byte *>(view.backing.get()) + view.header().instances_offset
@@ -1068,24 +1064,25 @@ struct BoundArgumentsFixture {
         boundary.start_offset = 7 + index;
         boundary.address_space = AddressSpace::HOST;
         scalar += index;
-        instance->boundary_tensor_count = 1;
-        instance->boundary_scalar_count = 1;
-        instance->boundary_tensors_address = reinterpret_cast<uint64_t>(&boundary);
-        instance->boundary_scalars_address = reinterpret_cast<uint64_t>(&scalar);
-        instance->heap_base = reinterpret_cast<uint64_t>(heap);
-        instance->args_base = instance->heap_base + CHIP_ALIGN_SIZE;
+        arguments.tensors = &boundary;
+        arguments.scalars = &scalar;
+        arguments.tensor_count = 1;
+        arguments.scalar_count = 1;
+        arguments.heap_base = reinterpret_cast<uint64_t>(heap);
+        instance->args_base = arguments.heap_base + CHIP_ALIGN_SIZE;
     }
 };
 }  // namespace
 
 namespace {
-SchedulerGraphBindingError bind_host_arguments(const SchedulerGraphView &graph, int64_t ref) {
-    SchedulerNativeNode node{};
-    if (!scheduler_native_node_checked(graph, ref, &node)) return SchedulerGraphBindingError::NODE;
+NativeGraphBindingError
+bind_host_arguments(const NativeViewFixture &view, const BoundArgumentsFixture &bound, int64_t ref) {
+    const auto &binding = view.plan.bindings.at(ref);
+    auto arguments = bound.arguments;
+    arguments.args_base = bound.instance->args_base;
     return native_graph_bind_arguments(
-        graph, ref, reinterpret_cast<const simpler::hbg::TensorData *>(node.instance->boundary_tensors_address),
-        reinterpret_cast<const uint64_t *>(node.instance->boundary_scalars_address),
-        reinterpret_cast<void *>(node.instance->args_base)
+        view.plan.definitions.at(bound.instance->definition_index), binding.source_index, arguments,
+        reinterpret_cast<void *>(arguments.args_base)
     );
 }
 }  // namespace
@@ -1096,7 +1093,7 @@ TEST(HbgNativeGraphPlan, BindingRelocatesAllFieldsAndKeepsInstancesIndependent) 
     BoundArgumentsFixture first(view, 0), second(view, 1);
     for (auto *bound : {&first, &second}) {
         const auto &instance = *bound->instance;
-        ASSERT_EQ(bind_host_arguments(view.graph, instance.child_begin), SchedulerGraphBindingError::NONE);
+        ASSERT_EQ(bind_host_arguments(view, *bound, instance.child_begin), NativeGraphBindingError::NONE);
         const auto &plan = view.plan.definitions[0].children[0];
         auto *tensors = reinterpret_cast<simpler::hbg::Tensor *>(instance.args_base + plan.tensors_offset);
         EXPECT_EQ(tensors[0].buffer.addr, bound->boundary.buffer.addr);
@@ -1114,7 +1111,7 @@ TEST(HbgNativeGraphPlan, BindingRelocatesAllFieldsAndKeepsInstancesIndependent) 
         EXPECT_EQ(tensors[0].strides[0], 7);
         EXPECT_EQ(tensors[0].strides[1], 1);
         EXPECT_EQ(tensors[0].extent_elem_cache, 10);
-        EXPECT_EQ(tensors[1].buffer.addr, instance.heap_base);
+        EXPECT_EQ(tensors[1].buffer.addr, bound->arguments.heap_base);
         EXPECT_EQ(tensors[1].buffer.size, CHIP_ALIGN_SIZE);
         EXPECT_EQ(tensors[1].start_offset, 1);
         EXPECT_EQ(tensors[1].address_space, AddressSpace::DEVICE);
@@ -1139,12 +1136,12 @@ TEST(HbgNativeGraphPlan, ParameterBindingRejectsViewsPastTheBoundaryBuffer) {
     BoundArgumentsFixture bound(view, 0);
     const auto ref = bound.instance->child_begin;
     bound.boundary.buffer.size = 80;
-    ASSERT_EQ(bind_host_arguments(view.graph, ref), SchedulerGraphBindingError::NONE);
+    ASSERT_EQ(bind_host_arguments(view, bound, ref), NativeGraphBindingError::NONE);
     bound.boundary.buffer.size = 79;
-    EXPECT_EQ(bind_host_arguments(view.graph, ref), SchedulerGraphBindingError::TENSOR);
+    EXPECT_EQ(bind_host_arguments(view, bound, ref), NativeGraphBindingError::TENSOR);
     bound.boundary.buffer.size = 80;
     bound.boundary.start_offset++;
-    EXPECT_EQ(bind_host_arguments(view.graph, ref), SchedulerGraphBindingError::TENSOR);
+    EXPECT_EQ(bind_host_arguments(view, bound, ref), NativeGraphBindingError::TENSOR);
 }
 
 TEST(HbgNativeGraphPlan, ParameterBindingRejectsInvalidElementSizeAndExtentOverflow) {
@@ -1157,7 +1154,7 @@ TEST(HbgNativeGraphPlan, ParameterBindingRejectsInvalidElementSizeAndExtentOverf
         body.put(body.header.off_tensors, 0, parameter);
         NativeViewFixture view(body, {0});
         BoundArgumentsFixture bound(view, 0);
-        EXPECT_EQ(bind_host_arguments(view.graph, bound.instance->child_begin), SchedulerGraphBindingError::TENSOR);
+        EXPECT_EQ(bind_host_arguments(view, bound, bound.instance->child_begin), NativeGraphBindingError::TENSOR);
     }
 }
 
@@ -1167,16 +1164,16 @@ TEST(HbgNativeGraphPlan, BindingRejectsOverflowAndInvalidBoundaryBeforePublicati
     BoundArgumentsFixture bound(view, 0);
     const auto ref = bound.instance->child_begin;
     bound.boundary.start_offset = UINT64_MAX;
-    EXPECT_EQ(bind_host_arguments(view.graph, ref), SchedulerGraphBindingError::TENSOR);
+    EXPECT_EQ(bind_host_arguments(view, bound, ref), NativeGraphBindingError::TENSOR);
     bound.boundary.start_offset = 7;
     bound.boundary.buffer.size = 32;
-    EXPECT_EQ(bind_host_arguments(view.graph, ref), SchedulerGraphBindingError::TENSOR);
+    EXPECT_EQ(bind_host_arguments(view, bound, ref), NativeGraphBindingError::TENSOR);
     bound.boundary.buffer.size = 4096;
-    bound.instance->boundary_scalars_address = 0;
-    EXPECT_EQ(bind_host_arguments(view.graph, ref), SchedulerGraphBindingError::SCALAR);
-    bound.instance->boundary_scalars_address = reinterpret_cast<uint64_t>(&bound.scalar);
+    bound.arguments.scalars = nullptr;
+    EXPECT_EQ(bind_host_arguments(view, bound, ref), NativeGraphBindingError::SCALAR);
+    bound.arguments.scalars = &bound.scalar;
     bound.instance->args_base++;
-    EXPECT_EQ(bind_host_arguments(view.graph, ref), SchedulerGraphBindingError::INSTANCE);
+    EXPECT_EQ(bind_host_arguments(view, bound, ref), NativeGraphBindingError::INSTANCE);
 }
 
 TEST(HbgNativeGraphPlan, HostBindsBlockedChildAndRefreshesReusedArgumentBacking) {
@@ -1201,7 +1198,7 @@ TEST(HbgNativeGraphPlan, HostBindsBlockedChildAndRefreshesReusedArgumentBacking)
         bound.scalar = 70 + epoch;
         values[epoch + 5] = 0;
         const SchedulerGraphAccess access(view.graph);
-        ASSERT_EQ(bind_host_arguments(view.graph, ref), SchedulerGraphBindingError::NONE);
+        ASSERT_EQ(bind_host_arguments(view, bound, ref), NativeGraphBindingError::NONE);
         EXPECT_EQ(run->bootstrap_scan_complete, 0u);
         EXPECT_EQ(
             scheduler_completion_task_state(control->completion_state),
@@ -1289,7 +1286,7 @@ TEST(HbgNativeGraphPlan, HostArgumentsSurviveMixAdmissionRetries) {
     auto *base = view.backing.get();
     auto *local = &view.locals[0];
     auto *admission = &view.admissions[0];
-    ASSERT_EQ(bind_host_arguments(view.graph, view.child()), SchedulerGraphBindingError::NONE);
+    ASSERT_EQ(bind_host_arguments(view, view.bound, view.child()), NativeGraphBindingError::NONE);
     ASSERT_TRUE(scheduler_bootstrap_prepare_admission(view.graph, base, local, view.run, admission, view.child()));
     view.run->bootstrap_scan_complete = 1;
     complete_native_entry(view);
@@ -1324,8 +1321,8 @@ TEST(HbgNativeGraphPlan, HostArgumentsSurviveMixAdmissionRetries) {
 
 TEST(HbgNativeGraphPlan, HostBindingRejectsInvalidArgumentsBeforeDevicePublication) {
     NativeAdmissionFixture view(true);
-    view.bound.instance->boundary_scalars_address = 0;
-    EXPECT_EQ(bind_host_arguments(view.graph, view.child()), SchedulerGraphBindingError::SCALAR);
+    view.bound.arguments.scalars = nullptr;
+    EXPECT_EQ(bind_host_arguments(view, view.bound, view.child()), NativeGraphBindingError::SCALAR);
     EXPECT_EQ(view.run->bootstrap_scan_complete, 0u);
     EXPECT_EQ(view.run->bootstrap_scan_arrived_count, 0u);
     auto *control = scheduler_task_control_at(view.backing.get(), &view.locals[0], view.child());
@@ -1340,7 +1337,7 @@ TEST(HbgNativeGraphPlan, NativeMixAdmissionIncludesOnlyActiveLanesAndCoordinator
         auto *base = view.backing.get();
         auto *local = &view.locals[0];
         auto *admission = &view.admissions[0];
-        ASSERT_EQ(bind_host_arguments(view.graph, view.child()), SchedulerGraphBindingError::NONE);
+        ASSERT_EQ(bind_host_arguments(view, view.bound, view.child()), NativeGraphBindingError::NONE);
         ASSERT_TRUE(scheduler_bootstrap_prepare_admission(view.graph, base, local, view.run, admission, view.child()));
         view.run->bootstrap_scan_complete = 1;
         complete_native_entry(view);
@@ -1375,20 +1372,54 @@ TEST(HbgNativeGraphPlan, HostBindingUsesMirrorsAndRetainsDeviceAddresses) {
     BoundArgumentsFixture bound(view, 0);
     const auto &plan = view.plan.definitions[0].children[0];
     auto *arguments = bound.heap + CHIP_ALIGN_SIZE;
-    bound.instance->heap_base = UINT64_C(0x80000000);
-    bound.instance->args_base = bound.instance->heap_base + CHIP_ALIGN_SIZE;
-    bound.instance->boundary_tensors_address = UINT64_C(0x90000000);
-    bound.instance->boundary_scalars_address = UINT64_C(0x90010000);
+    bound.arguments.heap_base = UINT64_C(0x80000000);
+    bound.instance->args_base = bound.arguments.heap_base + CHIP_ALIGN_SIZE;
+    bound.arguments.args_base = bound.instance->args_base;
     ASSERT_EQ(
-        native_graph_bind_arguments(view.graph, bound.instance->child_begin, &bound.boundary, &bound.scalar, arguments),
-        SchedulerGraphBindingError::NONE
+        native_graph_bind_arguments(view.plan.definitions[0], 0, bound.arguments, arguments),
+        NativeGraphBindingError::NONE
     );
     const auto *tensors = reinterpret_cast<const simpler::hbg::Tensor *>(arguments + plan.tensors_offset);
     EXPECT_EQ(tensors[0].buffer.addr, bound.boundary.buffer.addr);
-    EXPECT_EQ(tensors[1].buffer.addr, bound.instance->heap_base);
+    EXPECT_EQ(tensors[1].buffer.addr, bound.arguments.heap_base);
     const auto *scalars = reinterpret_cast<const uint64_t *>(arguments + plan.scalars_offset);
     EXPECT_EQ(scalars[0], bound.scalar);
     EXPECT_EQ(scalars[1], 23u);
     const auto *predicate = reinterpret_cast<const SchedulerDispatchPredicate *>(arguments + plan.predicate_offset);
     EXPECT_EQ(predicate->addr, bound.boundary.buffer.addr + (bound.boundary.start_offset + 5) * 4);
+}
+
+TEST(HbgNativeGraphPlan, ReadonlyTopologySizeDoesNotDependOnRecordedArgumentPools) {
+    DefinitionFixture plain(std::vector<std::vector<uint16_t>>{{}});
+    auto with_arguments = argument_definition(true);
+    NativeViewFixture plain_view(plain, {0});
+    NativeViewFixture argument_view(with_arguments, {0});
+    ASSERT_GT(with_arguments.bytes.size(), plain.bytes.size());
+    EXPECT_EQ(argument_view.readonly_image.bytes.size(), plain_view.readonly_image.bytes.size());
+    EXPECT_GT(argument_view.definition().args_bytes, plain_view.definition().args_bytes);
+    argument_view.plan.definitions[0].image.clear();
+    uint32_t count = 0;
+    EXPECT_EQ(scheduler_node_fanin_count(argument_view.graph, 1, &count), SchedulerGraphResult::OK);
+    EXPECT_EQ(count, 1u);
+    EXPECT_TRUE(scheduler_graph_view_valid(argument_view.graph));
+    argument_view.header().version = 4;
+    EXPECT_FALSE(scheduler_graph_view_valid(argument_view.graph));
+}
+
+TEST(HbgNativeGraphPlan, HostBindingRejectsArgumentSpansBeforeWritingScratch) {
+    for (uint32_t invalid : {0u, 1u, 2u}) {
+        auto body = argument_definition(true);
+        NativeViewFixture view(body, {0});
+        BoundArgumentsFixture bound(view, 0);
+        std::memset(bound.heap, 0xa5, sizeof(bound.heap));
+        auto &plan = view.plan.definitions[0];
+        auto &child = plan.children[0];
+        if (invalid == 0) child.tensors_offset = plan.args_bytes;
+        if (invalid == 1) child.scalars_offset = plan.args_bytes;
+        if (invalid == 2) child.predicate_offset = plan.args_bytes;
+        EXPECT_EQ(bind_host_arguments(view, bound, bound.instance->child_begin), NativeGraphBindingError::GRAPH);
+        EXPECT_TRUE(std::all_of(std::begin(bound.heap), std::end(bound.heap), [](std::byte v) {
+            return v == std::byte{0xa5};
+        }));
+    }
 }

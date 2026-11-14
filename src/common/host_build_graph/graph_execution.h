@@ -22,7 +22,7 @@
 #include "host_build_graph/runtime_types.h"
 #include "tensor.h"
 
-#include "graph_definition.h"
+#include "graph.h"
 // A body's producers precede their consumers, so a fanin CSR row holds at most
 // task_count - 1 entries, and both of the slot's row cursors index one of them.
 // A sub-task's row has no cap of its own — unlike a GLOBAL task's inline row,

@@ -116,7 +116,7 @@ struct SubTaskDefinition {
 
 inline constexpr uint64_t GRAPH_DEFINITION_OBJECT_MAGIC = 0x4752415048455844ULL;
 
-// Every Definition object is [GraphDefinitionHeader][Definition image], aligned to
+// Every Definition object is [GraphImageHeader][Definition image], aligned to
 // this and padded to a multiple of it. A Definition section is reached as an offset
 // from the image base, and the widest one may ask for max_align_t, so this is what
 // an image base has to carry; the header in front preserves it because its own size
@@ -125,7 +125,7 @@ inline constexpr uint64_t GRAPH_DEFINITION_OBJECT_MAGIC = 0x4752415048455844ULL;
 inline constexpr size_t GRAPH_DEFINITION_OBJECT_ALIGN = alignof(std::max_align_t);
 
 // Header prefixing each device-resident Definition object. The definition buffer
-// uploaded by the host is [GraphDefinitionHeader][GraphDefinition image], and these
+// uploaded by the host is [GraphImageHeader][Graph image], and these
 // three fields are the framing the device checks before it reads a section offset
 // out of the image: the object is one of ours, it is the size the upload recorded,
 // and it holds the Graph the outer task was bound to.
@@ -133,17 +133,17 @@ inline constexpr size_t GRAPH_DEFINITION_OBJECT_ALIGN = alignof(std::max_align_t
 // alignas, not a pad field: the image starts immediately behind the header and its
 // sections are offsets from that base, so the header's own size has to be a multiple
 // of the object alignment.
-struct alignas(GRAPH_DEFINITION_OBJECT_ALIGN) GraphDefinitionHeader {
+struct alignas(GRAPH_DEFINITION_OBJECT_ALIGN) GraphImageHeader {
     uint64_t magic;
     uint64_t graph_key;
     uint32_t definition_bytes;
 };
 
-static_assert(std::is_trivially_copyable_v<GraphDefinitionHeader>);
-static_assert(std::is_standard_layout_v<GraphDefinitionHeader>);
-static_assert(sizeof(GraphDefinitionHeader) % GRAPH_DEFINITION_OBJECT_ALIGN == 0);
+static_assert(std::is_trivially_copyable_v<GraphImageHeader>);
+static_assert(std::is_standard_layout_v<GraphImageHeader>);
+static_assert(sizeof(GraphImageHeader) % GRAPH_DEFINITION_OBJECT_ALIGN == 0);
 
-struct GraphDefinition {
+struct Graph {
     uint64_t graph_key;
     uint64_t required_heap;
     // The header splits by range, not by name. Everything that counts *things* is
@@ -220,8 +220,8 @@ static_assert(sizeof(SubTaskDefinition) == 80, "a SubTaskDefinition field change
 static_assert(offsetof(SubTaskDefinition, active_mask) == 12);
 static_assert(std::is_trivially_copyable_v<GraphPredicate>);
 static_assert(std::is_standard_layout_v<GraphPredicate>);
-static_assert(std::is_trivially_copyable_v<GraphDefinition>);
-static_assert(std::is_standard_layout_v<GraphDefinition>);
+static_assert(std::is_trivially_copyable_v<Graph>);
+static_assert(std::is_standard_layout_v<Graph>);
 
 // Section starts are offsets from the image base, so a section is correctly
 // aligned only if the buffer holding the image is. The builder writes each
@@ -241,7 +241,7 @@ static_assert(
 // A negative one is rejected outright rather than left to wrap through the size_t
 // comparison, so a corrupt header cannot widen a section by either route.
 template <typename T>
-inline const T *graph_definition_array(const GraphDefinition &definition, uint32_t offset, int32_t count) {
+inline const T *graph_definition_array(const Graph &definition, uint32_t offset, int32_t count) {
     if (count < 0 || offset == 0 || offset > definition.total_bytes || offset % alignof(T) != 0) return nullptr;
     const size_t remaining = static_cast<size_t>(definition.total_bytes - offset);
     if (static_cast<size_t>(count) > remaining / sizeof(T)) return nullptr;
@@ -249,6 +249,6 @@ inline const T *graph_definition_array(const GraphDefinition &definition, uint32
 }
 
 template <typename T>
-inline const T *graph_definition_ptr(const GraphDefinition &definition, uint32_t offset) {
+inline const T *graph_definition_ptr(const Graph &definition, uint32_t offset) {
     return graph_definition_array<T>(definition, offset, 1);
 }

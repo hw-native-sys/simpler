@@ -103,7 +103,7 @@ inline TemplateResult gather_graph_inputs(
                 *failed_task_id = task_id;
                 return built;
             }
-            GraphDefinitionValue definition{};
+            GraphImageValue definition{};
             if (!graph_definition_decode_framed(view, definition_offset, &definition)) {
                 *failed_task_id = task_id;
                 return TemplateResult{TemplateStatus::MALFORMED, "the Definition framing is invalid", -1};

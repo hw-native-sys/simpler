@@ -1,7 +1,11 @@
 # Graph Execution
 
-Graph Execution is available only in the `host_build_graph` runtime. A Graph is
-a composite incore task: it occupies one task window slot and completes once,
+Graph recording and replay are shared by `host_build_graph` and A5 `percounter`.
+This page describes the common recording/cache contracts and the A2/A3 HBG
+`GraphExecution` materializer. Default A5 HBG uses Host-prepared Calls and compact
+native topology; WSE and percounter have their own execution contracts.
+
+A Graph is a composite incore task: it occupies one task window slot and completes once,
 like any other task of the run, but contains a recorded DAG of sub-tasks. It
 is a container in the same sense an SPMD task is — SPMD expands one slot into
 `logical_block_num` blocks, a Graph expands one slot into its recorded sub-tasks
@@ -15,12 +19,11 @@ recording's own address space instead of consuming task-window slots or heap.
 Later calls for the same in-flight identity submit more shells without waiting
 for recording, and a call for a *different* identity opens its own recording on
 its own thread rather than waiting. At orchestration completion, the caller joins
-every recording and fills each shell's heap range and the device address of the
-Definition object it replays.
+every recording, fills each shell's heap range and prepares the recorded Graph
+representation that its runtime consumes.
 Cached invocations submit the same one `GRAPH` task directly — a cache hit never
-waits on a recording. In both cases the device Scheduler expands the saved
-topology and dispatches the sub-tasks; the Host Orchestrator never submits
-them as tasks of the run itself.
+waits on a recording. Each runtime turns the saved topology into executable
+sub-tasks; the Host Orchestrator does not append them to the top-level task window.
 
 Boundary contracts are checked before an in-flight shell is accepted. Once a
 shell has entered the task/dependency sequence, an unsupported construct found
@@ -579,7 +582,7 @@ because only the host reads it: it is what a later invocation is matched against
 while materialize takes the boundary from the outer task's own payload.
 
 The header carries the object magic, the Graph key, and the image size. The
-framing check requires the magic, a size that admits a `GraphDefinition`, a
+framing check requires the magic, a size that admits a `Graph`, a
 `total_bytes` equal to the header's own, and a key equal to the header's before
 any section offset is read out of the image.
 
@@ -657,6 +660,22 @@ the end of orchestration, the Host copies one bind image containing the
 compacted shared-memory task window and argument pools, then launches the
 Scheduler. Slot task and payload references remain self-relative.
 
+### Default A5 HBG native execution
+
+The recorded `Graph` images and boundary binding inputs stay on Host. Host expands
+ENTER/child/EXIT refs, binds tensors, scalars and predicates, and constructs every
+block/lane Call before launch. The native scheduler image carries child plans,
+fanin rows/indices, sinks and per-instance argument bases; it contains no recorded
+Graph image, fanout/root tables, relocation records or scalar-inheritance table.
+Resident AIC/AIV workers claim prepared executions and observe completion gates;
+they do not localize `GraphExecution` or materialize child arguments.
+See the [A5 native layout and binding contract](../../../../docs/zh-cn/design/a5-hbg-graph-task/data-layout.md).
+WSE and percounter retain their supported executors; see
+[WSE Graph replay](../../../wse/docs/deployment.md#graph-recording-and-replay) and
+[percounter payload preparation](../../../a5/runtime/percounter/README.md).
+
+### A2/A3 HBG launch-package materialization
+
 The run's Definition objects are not uploaded separately and the runtime holds no
 device block for them: the bind packs every object of the run into one Definition
 **section** and appends it to the AICPU launch arguments, which RTS copies as
@@ -671,7 +690,7 @@ belongs to the thread that entered with it, and the completion gate is a
 last-one-out latch rather than a barrier, so no address in one thread's package
 may be shared with a peer. The one part of the image read on every dependency
 scan — the fanin CSR — is copied by value into the execution's own storage tail
-at localize, which is also why `GraphDefinition::execution_storage_bytes`
+at localize, which is also why `Graph::execution_storage_bytes`
 includes the CSR's rows and indices. In simulation there is no launch package:
 the runner publishes a run-owned host snapshot instead, and the source word on
 the run's descriptor says which carrier delivered the section.

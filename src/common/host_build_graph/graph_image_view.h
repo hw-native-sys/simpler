@@ -46,7 +46,7 @@ struct GraphImageView {
     const std::byte *section{nullptr};
     uint32_t bytes{0};
 
-    bool valid() const { return section != nullptr && bytes >= sizeof(GraphDefinitionHeader); }
+    bool valid() const { return section != nullptr && bytes >= sizeof(GraphImageHeader); }
 
     /** Copy `len` bytes from `offset`, or fail without touching `dst`. */
     bool read(uint32_t offset, void *dst, uint32_t len) const {
@@ -79,11 +79,11 @@ struct GraphImageView {
  * Graph task carries and what every section offset below is relative to. The
  * framing header sits immediately in front of it.
  */
-struct GraphDefinitionValue {
+struct GraphImageValue {
     uint32_t image_offset{0};
-    GraphDefinition definition{};
+    Graph definition{};
 
-    bool valid() const { return image_offset != 0 && definition.total_bytes >= sizeof(GraphDefinition); }
+    bool valid() const { return image_offset != 0 && definition.total_bytes >= sizeof(Graph); }
 
     /** Absolute section offset of `offset_in_image`, checked against this object and the section. */
     bool absolute(const GraphImageView &view, uint32_t offset_in_image, uint32_t len, uint32_t *out) const {
@@ -109,15 +109,14 @@ struct GraphDefinitionValue {
  * object is one of ours, it is the size the packing recorded, and it holds the
  * Graph the caller named.
  */
-inline bool
-graph_definition_decode_framed(const GraphImageView &view, uint32_t image_offset, GraphDefinitionValue *out) {
+inline bool graph_definition_decode_framed(const GraphImageView &view, uint32_t image_offset, GraphImageValue *out) {
     if (out == nullptr || !view.valid()) return false;
-    if (image_offset < sizeof(GraphDefinitionHeader)) return false;
-    GraphDefinitionHeader header{};
-    if (!view.load(image_offset - static_cast<uint32_t>(sizeof(GraphDefinitionHeader)), &header)) return false;
+    if (image_offset < sizeof(GraphImageHeader)) return false;
+    GraphImageHeader header{};
+    if (!view.load(image_offset - static_cast<uint32_t>(sizeof(GraphImageHeader)), &header)) return false;
     if (header.magic != GRAPH_DEFINITION_OBJECT_MAGIC) return false;
-    if (header.definition_bytes < sizeof(GraphDefinition)) return false;
-    GraphDefinition definition{};
+    if (header.definition_bytes < sizeof(Graph)) return false;
+    Graph definition{};
     if (!view.load(image_offset, &definition)) return false;
     if (definition.total_bytes != header.definition_bytes) return false;
     if (definition.graph_key != header.graph_key) return false;
@@ -138,8 +137,8 @@ graph_definition_decode_framed(const GraphImageView &view, uint32_t image_offset
  */
 template <typename T>
 inline bool graph_definition_load_element(
-    const GraphImageView &view, const GraphDefinitionValue &object, uint32_t offset_in_image, int32_t count,
-    int32_t index, T *out
+    const GraphImageView &view, const GraphImageValue &object, uint32_t offset_in_image, int32_t count, int32_t index,
+    T *out
 ) {
     static_assert(std::is_trivially_copyable_v<T>, "a Definition array element must be memcpy-able");
     if (out == nullptr || count <= 0 || index < 0 || index >= count) return false;
@@ -167,7 +166,7 @@ inline bool graph_definition_load_element(
  */
 template <typename T>
 inline bool graph_definition_copy_array(
-    const GraphImageView &view, const GraphDefinitionValue &object, uint32_t offset_in_image, int32_t count, T *dst
+    const GraphImageView &view, const GraphImageValue &object, uint32_t offset_in_image, int32_t count, T *dst
 ) {
     static_assert(std::is_trivially_copyable_v<T>, "a Definition array element must be memcpy-able");
     if (dst == nullptr || count < 0) return false;

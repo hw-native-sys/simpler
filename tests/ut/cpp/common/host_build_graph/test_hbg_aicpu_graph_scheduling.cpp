@@ -176,7 +176,7 @@ TEST(GraphExecutionProgress, SubTaskResolutionIsNotAHostCompletion) {
     GraphExecution execution{};
     // Any non-zero offset: the completion path only asks whether this execution
     // names a Definition, not what is at that offset.
-    execution.definition_offset = sizeof(GraphDefinitionHeader);
+    execution.definition_offset = sizeof(GraphImageHeader);
     execution.task_storage = &task;
     execution.task_states = states;
     execution.task_count = 1;

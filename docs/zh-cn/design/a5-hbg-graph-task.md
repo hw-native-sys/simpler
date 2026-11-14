@@ -10,7 +10,7 @@
 Graph 内外的 kernel 共用执行、MIX/sync_start、async 和退休合同。
 `rt_submit_graph`、boundary alias/shape、公共 TaskId 及业务 kernel 的 args ABI 不变。
 普通 AIC/AIV、多 block、多 wave、MIX、sync_start、单 block/lane predicate、DUMMY、
-多实例复用 Definition 和普通/Graph 交错都通过这套模型执行。
+多实例复用 Graph 和普通/Graph 交错都通过这套模型执行。
 
 非法形状、参数区间或容量在 Host 拒绝；设备损坏的 descriptor、mode、epoch 或 backing
 进入首错与失败启动清退，不能另选执行器或伪造完成。
@@ -45,10 +45,11 @@ flowchart LR
     X --> C[外部 consumer]
 ```
 
-ENTER 继承外部 fanin，root 增加 ENTER 依赖，child 内部引用保持 Definition 的语义。
+ENTER 继承外部 fanin，root 增加 ENTER 依赖，child 内部引用保持 Graph 的语义。
 外部 consumer 对 shell 的引用映射到 EXIT；EXIT 等待全部 sink，包括不连通分量。
 控制节点不占 kernel slot，不具有业务 execution identity，也不增加 admission membership。
-Host 在 launch 前发布完整拓扑，设备不动态添加节点或绑定 child 参数。
+Host 在 launch 前发布紧凑拓扑和已绑定参数；原始 `Graph`、边界绑定输入和重定位记录留在 Host。
+设备不动态添加节点或绑定 child 参数。
 
 每个实际 block/lane 的 immutable Call 引用稳定的 invocation Binding。
 普通 token 可以提前领取执行责任、等待 producer gate；依赖满足后才转入本核 slot 并通过最终执行许可。
@@ -71,12 +72,12 @@ Graph 本身不建立新的资源顺序域，一个 cohort 也不扩大为整个
 
 默认顶层 publication 为 64 B 首错头、80 B/task 和实用参数池，Host rich scratch 不上传。
 每实例 Graph heap 只包含 required_heap 加实际 tensor/scalar/predicate tail；
-Definition 完成时计算并缓存预算，提交和 bind 使用同一算法检查溢出与实例边界。
+Graph 完成时计算并缓存预算，提交和 bind 使用同一算法检查溢出与实例边界。
 公共 execution_storage_bytes 继续描述 A2A3/WSE/percounter 的活跃 GraphExecution，不能当作默认 native 参数预算。
 
 resident backing 仍需计入 768 B/node control，以及按真实执行数放大的 512 B Call、
 128 B Claim、128 B Binding、256 B trace 和实际启用的诊断/async 区域。
 缩小结构或删去重复计划不等于已证明延迟下降；性能必须用同输入、同设备、同 DFX 配置的对照衡量。
 
-当前 Graph view/native image 版本为 6/4，因果诊断采用普通 v22、Graph v23。
+当前 Graph view/native image 版本为 6/5，因果诊断采用普通 v22、Graph v23。
 Host、AICPU、AICore 与诊断解析器一同迁移，只读取当前格式。
