@@ -62,13 +62,13 @@ void aicore_execute(Runtime *, int, CoreType) {
     EXPECT_EQ(get_aicore_report_epoch(), 73u);
     EXPECT_EQ(pthread_writes.load(), before) << "running setters must not write pthread TLS";
 }
-#if TEST_TLS_KEY_COUNT == 6
+#ifndef TEST_TLS_ARCH_A5
 extern "C" std::remove_pointer_t<SimA2a3CoreEntryFn> aicore_execute_wrapper_checked;
 #else
 extern "C" std::remove_pointer_t<SimA5CoreEntryFn> aicore_execute_wrapper_checked;
 #endif
 static int invoke_wrapper(Runtime &runtime, bool (*ready)(void *, int), void *context) {
-#if TEST_TLS_KEY_COUNT == 6
+#ifndef TEST_TLS_ARCH_A5
     return aicore_execute_wrapper_checked(&runtime, 0, CoreType::AIC, 0, 0, 0, 0, 0, ready, context);
 #else
     return aicore_execute_wrapper_checked(&runtime, 0, CoreType::AIC, 0, 0, 0, 0, 0, 0, 0, ready, context);

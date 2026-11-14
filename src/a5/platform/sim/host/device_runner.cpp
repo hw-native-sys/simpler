@@ -375,6 +375,20 @@ int DeviceRunner::ensure_binaries_loaded() {
             return PTO_RUNTIME_ERR_INTERNAL;
         }
         set_identity_helpers(sim_context_set_subblock_id, sim_context_set_cluster_id);
+
+        auto set_reg_base =
+            reinterpret_cast<SimRegBaseSetterInstallFn>(dlsym(aicore_so_handle_, "sim_install_reg_base_setter"));
+        if (set_reg_base == nullptr) {
+            LOG_ERROR(
+                "dlsym failed for sim_install_reg_base_setter: %s; rebuild kernel SOs with the matching host build",
+                dlerror()
+            );
+            dlclose(aicore_so_handle_);
+            aicore_so_handle_ = nullptr;
+            aicore_execute_func_ = nullptr;
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        set_reg_base(sim_context_set_reg_base);
     }
 
     return 0;

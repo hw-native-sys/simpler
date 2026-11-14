@@ -234,6 +234,39 @@ int sim_context_set_cluster_id(uint32_t cluster_id) {
 }
 
 // ---------------------------------------------------------------------------
+// Per-thread simulated register base (set by the aicore kernel wrapper, read
+// by the kernel via sim_get_reg_base)
+// ---------------------------------------------------------------------------
+
+std::mutex g_reg_base_key_mutex;
+pthread_key_t g_reg_base_key{};
+std::atomic<bool> g_reg_base_key_initialized{false};
+
+static int ensure_reg_base_key() {
+    if (g_reg_base_key_initialized.load(std::memory_order_acquire)) return 0;
+    std::lock_guard<std::mutex> lock(g_reg_base_key_mutex);
+    if (!g_reg_base_key_initialized.load(std::memory_order_relaxed)) {
+        const int error = pthread_key_create(&g_reg_base_key, nullptr);
+        if (error != 0) return error;
+        g_reg_base_key_initialized.store(true, std::memory_order_release);
+    }
+    return 0;
+}
+
+volatile uint8_t *sim_get_reg_base() {
+    if (!g_reg_base_key_initialized.load(std::memory_order_acquire)) return nullptr;
+    return reinterpret_cast<volatile uint8_t *>(pthread_getspecific(g_reg_base_key));
+}
+
+void sim_context_set_reg_base(uint64_t reg_base) {
+    if (const int error = ensure_reg_base_key(); error != 0) {
+        LOG_ERROR("Sim register-base key creation failed: %d", error);
+        return;
+    }
+    pthread_setspecific(g_reg_base_key, reinterpret_cast<void *>(static_cast<uintptr_t>(reg_base)));
+}
+
+// ---------------------------------------------------------------------------
 // Hooks resolved by pto-isa via function pointer injection
 // ---------------------------------------------------------------------------
 
