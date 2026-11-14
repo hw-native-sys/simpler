@@ -112,8 +112,13 @@ runtime source stamp invalidate caches when shared inputs change.
 
 WSE predicate scenes read unchanged A5 fixture sources; all WSE execution and
 assertions remain in WSE tests. Existing A3/A5 tests and CI selection are unchanged.
-A5-only changes still do not automatically select the separate WSE scene job, so
-changes to reused sources need WSE regression validation.
+A5-only changes deliberately do not select the independent WSE scene job,
+including changes to reused sources. For changes to A5 product sources,
+`packaging-matrix` and `ut` build WSE through their default installation, covering
+compilation and interface coupling. These build checks cannot detect behavior-only
+changes in reused sources or validate WSE use of A5 predicate fixtures.
+Such changes still need targeted WSE scene validation; test-only fixture changes do
+not select those product-build jobs.
 
 The WSE backend exports `requires_aicpu_executor()` with a zero result. A backend
 without this optional query retains the existing mandatory AICPU path.
