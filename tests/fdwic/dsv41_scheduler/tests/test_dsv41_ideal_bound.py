@@ -14,7 +14,9 @@ from pathlib import Path
 
 import pytest
 
-PRODUCTION = Path(__file__).resolve().parents[3] / "tests/fdwic/dsv41_scheduler/production"
+pytestmark = pytest.mark.manual
+
+PRODUCTION = Path(__file__).resolve().parents[4] / "tests/fdwic/dsv41_scheduler/production"
 SPEC = importlib.util.spec_from_file_location("ideal_bound", PRODUCTION / "ideal_bound.py")
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)

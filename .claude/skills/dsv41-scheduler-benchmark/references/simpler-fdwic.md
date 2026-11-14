@@ -12,6 +12,22 @@ The default matrix has 27 cases: nine each of `pypto_lib`, `pypto_lib_dsl` (half
 The default DSL cases preserve original sync-start flags and add flags until approximately half of each case's SPMD tasks require sync-start. AIC/MIX additions are capped at 32 blocks and AIV at 64.
 The all-sync group includes 64-block AIV tasks and retains the 32-block AIC/MIX capacity. It enables 275/280 SPMD tasks; the five oversized tasks remain unchanged. Regenerate bundles with the current exporter and read the variant and policy from `case.json`. `prepare.py --sync-policy both` is the default.
 
+## Manual-only checks
+
+This suite and its local CPU checks are manual-only. Changes confined to its
+subtree retain pre-commit but do not select automatic ST/UT jobs. Runtime,
+shared-code and CI changes keep their normal gates. Do not treat skipped
+runtime CI as benchmark validation.
+
+Run the checks explicitly from the worktree environment, without runtime
+bootstrap (install the optional solver requirement to include model checks):
+
+```bash
+export DSV41=tests/fdwic/dsv41_scheduler
+pip install pytest -r "$DSV41/production/requirements-bound.txt"
+PYTHONPATH=.:python python -m pytest --confcutdir="$DSV41/tests" "$DSV41/tests" -q
+```
+
 ## Build and prepare
 
 From the Simpler root, activate the worktree environment and source the matching CANN environment. Build the suite and the A5 onboard runtime as described in the suite README. Use the repository rebuild workflow for runtime edits. Supply the runtime directory expected by the checked-out runner, with its HBG libraries and the dispatcher at the location required by the selected revision. The verified `prepare.py` checks `../dispatcher/libsimpler_aicpu_dispatcher.so` relative to the supplied runtime directory. Verify that the capture/replay adapters, prepared plans, and each runtime arm are ABI-compatible.

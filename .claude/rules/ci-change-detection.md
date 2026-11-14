@@ -135,6 +135,22 @@ rather than invent one:
   belong to no single partition, so they match no `SIBLING` and flip every flag
   true — which is what they should do, since both suites load them.
 
+### Explicit manual-only benchmark
+
+`tests/fdwic/dsv41_scheduler/` is a self-contained manual benchmark, including
+its local CPU checks. The canonical detector removes this exact subtree from
+`AUTO_TEST_FILES`, used only for architecture and ST/UT impact. It is **not**
+non-code: retain the original `FILES` for `NON_CODE`, packaging/corpus checks
+and the initial fail-open guard. Pre-commit remains unconditional.
+
+Do not extend this exception to all of `tests/fdwic/`, `tests/`, shared unit
+tests or imported runtime helpers. Mixed changes must still select the checks
+required by the remaining automatic files. Validate manual-only, mixed,
+similarly named sibling, workflow and unattributable diffs with the actual
+shell detector, and verify the resulting job gates rather than only flags.
+The manual benchmark's own checks stay under its directory and are explicitly
+invoked by its operator; they do not require a new automatic CI job.
+
 ## 5. Fail open once, at the top
 
 No usable file list means attribution is impossible — a PR with no files, or a
