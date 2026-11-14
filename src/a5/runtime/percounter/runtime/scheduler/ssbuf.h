@@ -37,6 +37,7 @@
 #include <cstdint>
 
 #include "scheduler/scheduler_types.h"
+#include "scheduler/profiling_memory.h"
 
 #if defined(__CCE_AICORE__)
 #define PERCOUNTER_SSBUF __ssbuf__
@@ -52,21 +53,29 @@ static_assert(PERCOUNTER_SSBUF_REGION_OFFSET + PERCOUNTER_SSBUF_REGION_SIZE == P
 // Acquiring a newer field also orders its opening generation before the
 // reader's closing generation check.
 template <typename T>
-inline __aicore__ T percounter_ssbuf_load_field(const PERCOUNTER_SSBUF volatile T *field) {
+static inline __aicore__ T percounter_ssbuf_load_field(const PERCOUNTER_SSBUF volatile T *field) {
+    return simpler::percounter::percounter_scalar_memory_result(
+        simpler::percounter::ProfilePhase::SsbufLoad, [field]() __aicore__ {
 #if defined(__CCE_AICORE__)
-    return *field;
+            return *field;
 #else
-    return __atomic_load_n(field, __ATOMIC_ACQUIRE);
+            return __atomic_load_n(field, __ATOMIC_ACQUIRE);
 #endif
+        }
+    );
 }
 
 template <typename T>
-inline __aicore__ void percounter_ssbuf_store_field(PERCOUNTER_SSBUF volatile T *field, T value) {
+static inline __aicore__ void percounter_ssbuf_store_field(PERCOUNTER_SSBUF volatile T *field, T value) {
+    simpler::percounter::percounter_scalar_memory_issue(
+        simpler::percounter::ProfilePhase::SsbufStore, 1, [field, value]() __aicore__ {
 #if defined(__CCE_AICORE__)
-    *field = value;
+            *field = value;
 #else
-    __atomic_store_n(field, value, __ATOMIC_RELEASE);
+            __atomic_store_n(field, value, __ATOMIC_RELEASE);
 #endif
+        }
+    );
 }
 
 /**
@@ -77,21 +86,22 @@ inline __aicore__ void percounter_ssbuf_store_field(PERCOUNTER_SSBUF volatile T 
  * loads therefore carry a barrier between them already -- the edge GM has to
  * ask for explicitly.
  */
-inline __aicore__ uint32_t percounter_ssbuf_load_acquire(const PERCOUNTER_SSBUF volatile uint32_t *token) {
+static inline __aicore__ uint32_t percounter_ssbuf_load_acquire(const PERCOUNTER_SSBUF volatile uint32_t *token) {
+    const uint32_t value = percounter_ssbuf_load_field(token);
 #if defined(__CCE_AICORE__)
-    const uint32_t value = *token;
-    dsb((mem_dsb_t)0);
-    return value;
-#else
-    return __atomic_load_n(token, __ATOMIC_ACQUIRE);
+    simpler::percounter::percounter_scalar_memory_issue(simpler::percounter::ProfilePhase::DsbAll, 1, []() __aicore__ {
+        dsb((mem_dsb_t)0);
+    });
 #endif
+    return value;
 }
 
-inline __aicore__ void percounter_ssbuf_store_release(PERCOUNTER_SSBUF volatile uint32_t *token, uint32_t value) {
+static inline __aicore__ void
+percounter_ssbuf_store_release(PERCOUNTER_SSBUF volatile uint32_t *token, uint32_t value) {
 #if defined(__CCE_AICORE__)
-    dsb((mem_dsb_t)0);
-    *token = value;
-#else
-    __atomic_store_n(token, value, __ATOMIC_RELEASE);
+    simpler::percounter::percounter_scalar_memory_issue(simpler::percounter::ProfilePhase::DsbAll, 1, []() __aicore__ {
+        dsb((mem_dsb_t)0);
+    });
 #endif
+    percounter_ssbuf_store_field(token, value);
 }

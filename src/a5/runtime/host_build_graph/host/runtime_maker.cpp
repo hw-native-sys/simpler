@@ -52,6 +52,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -462,6 +463,9 @@ __attribute__((weak)) SchedulerExtensionResult scheduler_extension_select(
 ) {
     return SchedulerExtensionResult::DECLINED;
 }
+
+__attribute__((weak)) bool scheduler_extension_publish_profiling(Runtime *) { return true; }
+__attribute__((weak)) void scheduler_extension_release(Runtime *) {}
 
 namespace {
 
@@ -917,6 +921,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
 extern "C" bool publish_runtime_chip_swimlane_extensions(Runtime *runtime) noexcept {
     try {
         if (runtime == nullptr) return true;
+        if (!scheduler_extension_publish_profiling(runtime)) return false;
         const HostApi *api = nullptr;
         {
             std::scoped_lock lock(scheduler_state_owners_mutex);
@@ -951,14 +956,14 @@ bool write_all_bytes(int fd, const uint8_t *data, size_t size) {
 // Materialize the orchestration .so bytes to a temp file so it can be dlopen'd
 // on the host (dlopen needs a real path + the exec bit).
 bool create_orch_so_tempfile(const uint8_t *data, size_t size, std::string *out_path) {
-    char tmpl[] = "/tmp/orch_so_XXXXXX";
-    int fd = mkstemp(tmpl);
+    std::string tmpl = (std::filesystem::temp_directory_path() / "orch_so_XXXXXX").string();
+    int fd = mkstemp(tmpl.data());
     if (fd < 0) {
         return false;
     }
     if (fchmod(fd, 0755) != 0) {
         close(fd);
-        unlink(tmpl);
+        unlink(tmpl.c_str());
         return false;
     }
     bool ok = write_all_bytes(fd, data, size);
@@ -966,7 +971,7 @@ bool create_orch_so_tempfile(const uint8_t *data, size_t size, std::string *out_
         ok = false;
     }
     if (!ok) {
-        unlink(tmpl);
+        unlink(tmpl.c_str());
         return false;
     }
     *out_path = tmpl;
@@ -1221,6 +1226,7 @@ struct GraphHostStateBinding {
 // before this run has released its bindings, which is where this runs from.
 void release_scheduler_state(Runtime *runtime) {
     if (runtime == nullptr) return;
+    scheduler_extension_release(runtime);
     {
         std::scoped_lock lock(scheduler_state_owners_mutex);
         scheduler_state_owners.erase(runtime);

@@ -59,3 +59,6 @@ __attribute__((visibility("hidden"))) SchedulerExtensionResult scheduler_extensi
     const std::vector<SchedulerTaskMetadata> &task_metadata, const std::vector<int64_t> &inline_completed_task_ids,
     const sm_layout::SegmentOffsets &device_segments
 );
+
+__attribute__((visibility("hidden"))) bool scheduler_extension_publish_profiling(Runtime *runtime);
+__attribute__((visibility("hidden"))) void scheduler_extension_release(Runtime *runtime);

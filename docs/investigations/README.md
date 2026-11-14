@@ -82,6 +82,8 @@ that ...".
 
 ## Index
 
+- [2026-11 — Percounter DFX recording cost](2026-11-percounter-dfx-recording-cost.md) — compares deferred publication and lossless encoding with rejected inlining and bypass-store trials; documents the remaining L3 overhead.
+
 - [2026-11 — A5 early immutable Call observation](../zh-cn/investigations/2026-11-a5-early-call-observation.md) — withdrawn: pre-ready observation is visible in the trace, but fourteen paired L0 means sum increases from 19.4512 to 19.5149 ms. Keeps cold Build/Execute provenance and records the remaining MIX and SPMD allocation delays.
 
 Newest first.

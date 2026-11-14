@@ -53,7 +53,8 @@ bool AicpuExecutor::schedules_on_aicore(const Runtime *runtime) const {
 }
 
 int32_t AicpuExecutor::post_handshake_init(Runtime *runtime) {
-    if (is_chip_swimlane_enabled()) chip_swimlane_aicpu_use_self_scheduled_cores();
+    if (is_chip_swimlane_enabled() && runtime->dev.chip_swimlane_level == 1)
+        chip_swimlane_aicpu_use_self_scheduled_cores();
     return simpler::percounter::percounter_post_handshake_init(runtime, aicore_lifecycle_, scheduler_timeout_cycles());
 }
 

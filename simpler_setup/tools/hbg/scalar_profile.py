@@ -163,7 +163,7 @@ def _nest_intervals(nodes, filtered):
     return positive
 
 
-def partition(records, kernels):
+def partition(records, kernels, *, nested_kernels=False):
     """Return a nested view and an exact, non-overlapping partition of its window."""
     roots = [r for r in records if r["kind"] == "scalar_window"]
     if len(roots) != 1 or roots[0].get("scalar_schema") != 2:
@@ -175,7 +175,17 @@ def partition(records, kernels):
     filtered = minimum > 0
     nodes = [dict(record) for record in records]
     for kernel in kernels:
-        nodes.append({"kind": "scalar_kernel", "scalar_depth": 1, "scalar_calls": 1, **kernel})
+        depth = 1
+        if nested_kernels:
+            depth += max(
+                (
+                    r["scalar_depth"]
+                    for r in records
+                    if r["start_cycles"] <= kernel["start_cycles"] and kernel["end_cycles"] <= r["end_cycles"]
+                ),
+                default=0,
+            )
+        nodes.append({"kind": "scalar_kernel", "scalar_depth": depth, "scalar_calls": 1, **kernel})
     for node in nodes:
         if node["end_cycles"] < node["start_cycles"]:
             raise ValueError("Negative Scalar interval")
@@ -217,7 +227,7 @@ def partition(records, kernels):
     }
 
 
-def analyze_streams(streams, metadata, task_rows, execution_identities=None):
+def analyze_streams(streams, metadata, task_rows, execution_identities=None, *, nested_kernels=False):
     """Join same-worker, same-run L1 kernel intervals to the detailed L3 records."""
     identities = {
         (r["core_id"], r["reg_task_id"], r["run_epoch"]): r["executed"]
@@ -264,13 +274,17 @@ def analyze_streams(streams, metadata, task_rows, execution_identities=None):
             )
             continue
         for epoch in sorted({r["run_epoch"] for r in detailed}):
-            result = partition([r for r in detailed if r["run_epoch"] == epoch], kernels[(stream["worker_id"], epoch)])
+            result = partition(
+                [r for r in detailed if r["run_epoch"] == epoch],
+                kernels[(stream["worker_id"], epoch)],
+                nested_kernels=nested_kernels,
+            )
             result.update(worker_id=stream["worker_id"], scheduler_id=stream["scheduler_id"], run_epoch=epoch)
             profiles.append(result)
     return profiles
 
 
-def trace_events(profiles, *, pid, tid_base, display, streams=None):
+def trace_events(profiles, *, pid, tid_base, display, streams=None, function_names=None):
     """Render one nested Scalar lane per core using the capture's core identity."""
     lanes = {
         stream.get("scheduler_id", index): (index, stream)
@@ -306,7 +320,9 @@ def trace_events(profiles, *, pid, tid_base, display, streams=None):
             kind = row["kind"]
             if kind == "scalar_window":
                 continue
-            name = SCALAR_FUNCTIONS.get(kind, kind.removeprefix("scalar_"))
+            name = (SCALAR_FUNCTIONS if function_names is None else function_names).get(
+                kind, kind.removeprefix("scalar_")
+            )
             if row.get("task_id") is not None:
                 name += f"({display(row['task_id'])})"
             args = {k: v for k, v in row.items() if k not in ("start_time_us", "end_time_us")}

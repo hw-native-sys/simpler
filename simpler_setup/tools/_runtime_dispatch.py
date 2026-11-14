@@ -99,13 +99,17 @@ def resolve_runtime(runtime_name, *, source="metadata.runtime"):
 
 
 def get(runtime_name):
-    """The ``hbg`` or ``tmr`` package implementing the per-runtime DFX contract for ``runtime_name``.
+    """The package implementing the per-runtime DFX contract for ``runtime_name``.
 
     Imported lazily so this module carries no import-time dependency on either
     runtime package, letting both runtime packages import back from here
     (``normalize_task_id_int``) without a cycle.
     """
-    if resolve_runtime(runtime_name) in (HBG_RUNTIME, PERCOUNTER_RUNTIME):
+    if resolve_runtime(runtime_name) == PERCOUNTER_RUNTIME:
+        from simpler_setup.tools import percounter  # noqa: PLC0415
+
+        return percounter
+    if runtime_name == HBG_RUNTIME:
         from simpler_setup.tools import hbg  # noqa: PLC0415
 
         return hbg

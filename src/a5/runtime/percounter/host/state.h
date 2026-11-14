@@ -44,6 +44,7 @@
 #include "graph_template.h"
 #include "region_plan.h"
 #include "scheduler/scheduler_layout.h"
+#include "profiling.h"
 #include "scheduler/scheduler_types.h"
 
 namespace simpler::percounter {
@@ -234,7 +235,7 @@ inline StateSelection select_percounter_state(
     PercounterLayout layout{};
     if (!plan_layout(
             task_count, block_total, edges.size(), order_count, &layout, mix_order_count, sync_cohort_count,
-            graph.layout, execution_count
+            graph.layout, execution_count, runtime->dev.chip_swimlane_level
         )) {
         LOG_ERROR("A5 percounter: state layout overflow");
         return StateSelection::FAILED;
@@ -300,6 +301,7 @@ inline StateSelection select_percounter_state(
         }
         runtime->publish_graph_section(static_cast<GraphSectionSource>(source), base, graph.section_bytes);
     }
+    retain_profile_state(runtime, api, device_state, layout);
     runtime->publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_PERCOUNTER, device_base + layout.control_offset);
     if (api != nullptr) api->record_scheduler_runtime_mode(SCHEDULER_RUNTIME_MODE_PERCOUNTER);
     runtime->add_pending_metadata(

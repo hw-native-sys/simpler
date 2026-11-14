@@ -269,6 +269,7 @@ The declarations, function types and ownership contract are centralized in
 | `RtSubmitPhaseState` | `ModuleThreadValue` | orchestration SO | Per-thread submission timing; no keys when the bound runtime lacks phase recording |
 | `SuppressSelfNotify` depth | `ModuleThreadValue` with stack-scope fallback | host module | Suppress this thread's rollback notifications |
 | `g_reg_base_key` | `pthread_key_t` | AICore SO | Per-core simulated register base address |
+| percounter Scalar recorder | `pthread_key_t` | profiled AICore simulation SO | Borrows a lane-stack recorder; binding clears before the stack expires, key deletes at module unload, no thread-exit callback; uninstrumented TUs allocate no key |
 | `g_core_id_key` | `pthread_key_t` | AICore SO | Per-core physical core ID |
 | `g_device_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread device binding (device_id) |
 | `g_subblock_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread subblock identity (for TPUSH/TPOP) |
