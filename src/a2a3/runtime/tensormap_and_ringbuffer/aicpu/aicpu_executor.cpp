@@ -1144,14 +1144,22 @@ void AicpuExecutor::snapshot_run_terminal(Runtime *runtime) {
     // finish with a zero return while the state it wrote — a scheduler timeout
     // latched beside a non-negative completed count — is the run's failure.
     terminal_.record_participant(0, sched_ctx_.retirement_error());
-    const int32_t header_status = read_runtime_status(runtime);
-    if (is_kernel_error(-header_status)) {
+    auto *header = runtime != nullptr ? static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr()) : nullptr;
+    const int32_t orch_error = header != nullptr ? header->orch_error_code.load(std::memory_order_acquire) : 0;
+    const int32_t sched_error = header != nullptr ? header->sched_error_code.load(std::memory_order_acquire) : 0;
+    const int32_t header_status = runtime_status_from_error_codes(orch_error, sched_error);
+    // An earlier orchestration failure can outrank a later async failure.
+    // Drain either channel's known records without changing the primary error.
+    if (is_kernel_error(orch_error) || is_async_tracking_error(orch_error) || is_kernel_error(sched_error) ||
+        is_async_tracking_error(sched_error)) {
         KernelErrorCleanup cleanup{};
         sched_ctx_.drain_cancelled_run(platform_aicore_exit_deadline(), cleanup);
         LOG_ERROR(
-            "kernel retirement: core_error=%d async_error=%d cores=%u/%u drained=%u complete=%u", cleanup.core_error,
-            cleanup.async_error, cleanup.released_cores, cleanup.expected_cores, cleanup.drained_conditions,
-            cleanup.complete
+            "kernel retirement: core_error=%d async_error=%d cores=%u/%u drained=%u complete=%u "
+            "primary_code=%d source=%u core=%d task=0x%llx",
+            cleanup.core_error, cleanup.async_error, cleanup.released_cores, cleanup.expected_cores,
+            cleanup.drained_conditions, cleanup.complete, -header_status, cleanup.source, cleanup.core,
+            static_cast<unsigned long long>(cleanup.task_token)
         );
     }
     const bool normal_path = normal_path_claims_.load(std::memory_order_acquire) == aicpu_thread_num_;

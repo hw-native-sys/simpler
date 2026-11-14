@@ -100,7 +100,7 @@ def build_probe(build, core_type, code):
     ],
 )
 @pytest.mark.parametrize("core_type", ["aic", "aiv"])
-@pytest.mark.parametrize("code", [0, 106])
+@pytest.mark.parametrize("code", [0, 101, 102, 106])
 def test_kernel_validation_fails_caller_stream(st_device_ids, tmp_path, capture, core_type, code):
     binaries = build_probe(tmp_path, core_type, code)
     run_probe(binaries, st_device_ids[0], tmp_path, capture, code)
