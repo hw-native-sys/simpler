@@ -73,6 +73,7 @@ BUILD_CONFIG = {
             "aicpu",
             f"{HBG}/aicpu",
             f"{HBG}/runtime",
+            # Percounter materializes GraphExecution on AICPU.
             f"{SHARED}/device",
             f"{SHARED}/shared",
         ],

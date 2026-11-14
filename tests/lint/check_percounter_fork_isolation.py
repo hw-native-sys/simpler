@@ -84,10 +84,7 @@ FORKED = {
 }
 
 INCLUDE = re.compile(r'^\s*#\s*include\s*(?:"([^"]+)"|<([^>]+)>)', re.M)
-# An include the source itself marks as optional. `scheduler_types.h` reaches
-# `spin_hint.h` this way: the header exists once per platform backend and the
-# AICore build adds neither, which is a resolution failure this hook must not
-# report and the compiler never sees.
+# Includes explicitly guarded by __has_include may be absent from this target.
 OPTIONAL = re.compile(r'^[^\S\n]*#[^\S\n]*if[^\S\n]+__has_include\s*\(\s*"([^"]+)"\s*\)', re.M)
 NAMES_PERCOUNTER = re.compile(r'^\s*#\s*include\s*["<]([^">]*percounter/[^">]*)[">]', re.M)
 SUFFIXES = frozenset({".h", ".hpp", ".cpp", ".cc", ".cxx"})

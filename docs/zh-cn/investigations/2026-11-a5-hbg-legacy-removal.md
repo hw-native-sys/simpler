@@ -167,6 +167,9 @@ Host、resident、SDMA 与 percounter 同步迁移；percounter 在发布 L1 rec
 kernel 登记仅使用 resident group，无 group 时拒绝登记且不访问 GM，保留 epoch/布局校验、首错、封口和输出抓取限制。
 旧 A5 SchedulerState、mailbox、wait-list 已删除；共享 Host 用例仍测两种架构，旧 AICPU 协议用例归 A2A3，独立 TMR mailbox 用例归 TMR。
 不为历史 `.o` 增加兼容读取，所有当前生产者与消费者按同一合同构建。
+A5 类型头也删除无调用的 CoreTracker/CoreExecState、slot event、drain、旧计数和 profiling 宏；watchdog 预算保留。
+CoreTracker 回归归 A2A3；A5 默认 AICPU 构建不再编入 GraphExecution 展开器，percounter 的 AICPU Graph 准备仍编入它。
+参数 dump 继续读取公共任务镜像，resident ready/control 队列、核内 slot、异步完成与退核合同不变。
 
 percounter 直接编译 HBG 的 host/aicpu/runtime，并通过 scheduler 步骤替换默认实现。
 它自己的 mode、context 与设备入口是活跃实现，不因 HBG 仅接受 resident 1/2 而失效。
