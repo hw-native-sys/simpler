@@ -41,6 +41,9 @@ class TestEnvironment:
     constraints: str | None = None
     cann_minimum: tuple[int, int] | None = None
     modules: tuple[tuple[str, str], ...] = ()
+    # Version-qualified profiles can qualify a suite that declares another
+    # environment name. The suite name must itself be a registered profile.
+    suite: str | None = None
 
 
 ENVIRONMENTS = {
@@ -51,6 +54,27 @@ ENVIRONMENTS = {
         (9, 0),
         (("torch", "torch"), ("torch_npu", "torch_npu")),
     ),
+    # Target vLLM-Ascend 0.20.2rc1 stack (issue #2715): the same declared
+    # framework eager suite on Torch-NPU 2.10.0 instead of the pinned 2.7.1.
+    "torch_npu_2_10": TestEnvironment(
+        "direct",
+        ".github/actions/setup-vllm-eager/constraints.txt",
+        (9, 0),
+        (("torch", "torch"), ("torch-npu", "torch_npu")),
+        suite="torch_npu",
+    ),
+    "vllm_torch_npu": TestEnvironment(
+        "direct",
+        ".github/actions/setup-vllm-eager/constraints.txt",
+        (9, 0),
+        (
+            ("torch", "torch"),
+            ("torch-npu", "torch_npu"),
+            ("numpy", "numpy"),
+            ("vllm", "vllm"),
+            ("vllm-ascend", "vllm_ascend"),
+        ),
+    ),
 }
 _PROPERTY_PREFIX = "simpler_"
 _ASCEND_ROOT = Path("/usr/local/Ascend")
@@ -59,7 +83,10 @@ _ASCEND_ROOT = Path("/usr/local/Ascend")
 def _environment(name: str) -> TestEnvironment:
     if name not in ENVIRONMENTS:
         raise ValueError(f"Unknown test environment {name!r}; choose from {', '.join(ENVIRONMENTS)}")
-    return ENVIRONMENTS[name]
+    profile = ENVIRONMENTS[name]
+    if profile.suite is not None and profile.suite not in ENVIRONMENTS:
+        raise ValueError(f"Test environment {name!r} declares unknown suite {profile.suite!r}")
+    return profile
 
 
 def environment_for_item(item) -> str:
@@ -75,11 +102,17 @@ def environment_for_item(item) -> str:
     return next(iter(declared), "default")
 
 
+def declared_suite(name: str) -> str:
+    """Return the suite name that items declare for this environment profile."""
+    profile = _environment(name)
+    return profile.suite or name
+
+
 def select_environment(items, name: str):
-    _environment(name)
+    declared = declared_suite(name)
     selected, deselected = [], []
     for item in items:
-        (selected if environment_for_item(item) == name else deselected).append(item)
+        (selected if environment_for_item(item) == declared else deselected).append(item)
     return selected, deselected
 
 
@@ -286,6 +319,7 @@ def prepare_session(session) -> None:  # noqa: PLR0912
     opted_in = config.getoption("--environment-receipts", default=False)
     if (_environment(name).execution != "direct" and not opted_in) or config.getoption("collectonly", default=False):
         return
+    declared = declared_suite(name)
     xmlpath = config.getoption("xmlpath", default=None)
     if not xmlpath:
         raise pytest.UsageError(f"{name} requires --junitxml to verify every selected test")
@@ -294,7 +328,7 @@ def prepare_session(session) -> None:  # noqa: PLR0912
     validate_execution(config)
     cases = []
     for item in session.items:
-        if environment_for_item(item) != name:
+        if environment_for_item(item) != declared:
             raise pytest.UsageError(f"Wrong environment in final collection: {item.nodeid}")
         if _environment(name).execution == "direct" and (
             item.get_closest_marker("device_count") or getattr(getattr(item, "cls", None), "_st_level", None)
@@ -340,6 +374,7 @@ def prepare_session(session) -> None:  # noqa: PLR0912
     plan = {
         "source": source,
         "environment": name,
+        "suite": declared,
         "platform": config.getoption("--platform", default=None),
         "identity": identity,
         "cases": cases,
@@ -513,6 +548,8 @@ def verify_result_files(  # noqa: PLR0912
         raise ValueError(f"Cannot identify the test source checkout: {error}") from error
     if profile.execution != ("dispatcher" if dispatcher else "direct") or plan["source"] != source:
         raise ValueError("Test plan source or execution environment does not match this checkout")
+    if plan.get("suite", plan["environment"]) != (profile.suite or plan["environment"]):
+        raise ValueError("Test plan suite does not match its environment profile")
     expected = {case["nodeid"]: case for case in plan["cases"]}
     if not expected or len(expected) != len(plan["cases"]):
         raise ValueError("Test plan must contain unique, nonempty nodeids")
