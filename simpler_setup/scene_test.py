@@ -2548,6 +2548,11 @@ class SceneTestCase:
             help="Manual case handling: exclude (default), include, only",
         )
         parser.add_argument("--rounds", type=int, default=1, help="Run each case N times (default: 1)")
+        parser.add_argument(
+            "--prepare-only",
+            action="store_true",
+            help="Compile selected callables to cache without creating a Worker or using a device",
+        )
         parser.add_argument("--skip-golden", action="store_true", help="Skip golden comparison (benchmark mode)")
         parser.add_argument(
             "--enable-chip-swimlane",
@@ -2620,6 +2625,11 @@ class SceneTestCase:
             help="Only run classes with this _st_level",
         )
         parser.add_argument("--resource-child", action="store_true", help=argparse.SUPPRESS)
+        parser.add_argument(
+            "--single-case",
+            action="store_true",
+            help="Require selectors to match exactly one case",
+        )
         parser.add_argument(
             "-x", "--exitfirst", action="store_true", help="Stop on first failing case (matches pytest -x)"
         )
@@ -2739,10 +2749,21 @@ class SceneTestCase:
         except ValueError as e:
             print(f"ERROR: {e}", file=sys.stderr)
             sys.exit(2)
+        if args.single_case and len(selected) != 1:
+            print(f"ERROR: expected exactly one selected case, got {len(selected)}", file=sys.stderr)
+            sys.exit(2)
 
         selected_by_cls: dict[type, list[dict]] = {}
         for cls, case in selected:
             selected_by_cls.setdefault(cls, []).append(case)
+
+        if args.prepare_only:
+            prepared = 0
+            for cls in selected_by_cls:
+                cls().build_callable(args.platform)
+                prepared += 1
+            print(f"Prepared callables for {len(selected)} case(s) across {prepared} class(es)")
+            sys.exit(0)
 
         # A dispatcher child runs inline without spawning further subprocesses.
         child_mode = args.resource_child

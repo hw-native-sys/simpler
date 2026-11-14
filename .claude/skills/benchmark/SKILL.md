@@ -34,15 +34,15 @@ The `-d` flag specifies NPU device IDs.
 
 **Hard rule: one benchmark process per device at any time.** Never run two benchmark processes on the same `-d` device concurrently — not two runtimes, not baseline + current, nothing. This prevents resource contention and ensures stable measurements.
 
-On a shared hardware host, the complete single or compare run must execute
-inside one `task-submit` allocation. Let that allocation own every device for
-the full sequence; do not submit one job per example or run the script bare.
+On a shared hardware host, submit every onboard case through the host's
+`task-submit` tool when available. The simpler benchmark harness does not
+depend on task-submit; never wrap its whole multi-case run in one allocation.
 
 | `-d` count | Compare mode behavior |
 | ---------- | --------------------- |
-| One device (`-d 4`) | **Sequential**: baseline first, then current, both on the same device. Multiple runtimes also run serially on that device. |
-| Two devices (`-d 4 -d 6`) | **Parallel per-runtime**: for each runtime, baseline on first device and current on second device can run in parallel (different devices). Multiple runtimes still run serially — finish one runtime on both devices before starting the next. |
-| Zero (not specified) | Let `task-submit --device auto` allocate one device (see Step 2) |
+| One device (`-d 4`) | **Sequential**: every case is its own task; baseline completes before current starts on the same device. |
+| Two devices (`-d 4 -d 6`) | Not supported by this harness; benchmark cases request one device each. Compare sequentially on one selected device. |
+| Zero (not specified) | Let each case task use `task-submit --device auto` (see Step 2) |
 
 **Defaults** (when not specified): use `benchmark_rounds.sh` defaults (device 0, 100 rounds, a2a3, tensormap_and_ringbuffer).
 
@@ -75,31 +75,15 @@ fi
 
 ## Step 2: Device Isolation
 
-When `task-submit` is available, allocate the requested device IDs or use
-`--device auto`; run the architecture gate as the first command inside that
-allocation, then pass `$TASK_DEVICE` to every benchmark command. Hold one
-allocation for the whole baseline/current sequence. When `task-submit` is
-unavailable, follow
-`.claude/lib/onboard-detection.md` and clearly report that the fallback run is
-unlocked.
-
-Before submitting, inspect the queue:
+If the host provides `task-submit`, check the queue and run the architecture
+precheck before submitting onboard cases. Submit the scene-test command for
+one selected case at a time from the host shell. Do not invoke the benchmark
+harness itself inside task-submit; it launches multiple cases and parses their
+results.
 
 ```bash
 task-submit --list
-```
-
-Remove each `-d` option from the forwarded `BENCH_ARGS` after collecting its
-value in `REQUESTED_DEVICES`. Build the allocation arguments once and reuse
-them for the single `task-submit` call:
-
-```bash
-case "${#REQUESTED_DEVICES[@]}" in
-  0) TASK_SUBMIT_DEVICE_ARGS=(--device auto --device-num 1) ;;
-  1) TASK_SUBMIT_DEVICE_ARGS=(--device "${REQUESTED_DEVICES[0]}") ;;
-  2) TASK_SUBMIT_DEVICE_ARGS=(--device "${REQUESTED_DEVICES[0]},${REQUESTED_DEVICES[1]}") ;;
-  *) echo "ERROR: benchmark accepts at most two -d devices"; exit 1 ;;
-esac
+.claude/skills/onboard-arch-precheck/check.sh "$PLATFORM"
 ```
 
 ## Step 3: Confirm PTO-ISA Pin
@@ -120,7 +104,6 @@ The Bash tool resets its working directory to the project root on every call. Re
 PROJECT_ROOT="$(pwd)"                    # e.g. /home/user/simpler
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 WORKTREE_ABS="${PROJECT_ROOT}/tmp/worktree_baseline_${TIMESTAMP}"
-PAYLOAD_SCRIPT="${PROJECT_ROOT}/tmp/benchmark_payload_${TIMESTAMP}.sh"
 mkdir -p "${PROJECT_ROOT}/tmp"
 ```
 
@@ -136,165 +119,59 @@ WORKTREE_ABS="/home/user/simpler/tmp/worktree_baseline_20260331_102302"
 
 ## Step 5: Run Benchmarks
 
+Compilation artifacts are content-addressed and stored in `build/cache/kernels`.
+Prepare the selected callables on CPU first; this does not create a Worker or
+touch an NPU. Then submit each scene-test case command separately through the
+host's task-submit tool. `--rounds` repetitions for that one case remain in its
+task. Parse and aggregate timing after the task exits.
+
 ### Single Mode
 
 ```bash
-task-submit --timeout 7200 --max-time 7200 "${TASK_SUBMIT_DEVICE_ARGS[@]}" \
-  --run "set -o pipefail && \
-    .claude/skills/onboard-arch-precheck/check.sh '$PLATFORM' && \
-    BENCH_DEVICE=\${TASK_DEVICE%%,*} && \
-    ./tools/benchmark_rounds.sh $BENCH_ARGS -d \$BENCH_DEVICE -r '$RUNTIME' \
-      2>&1 | tee 'tmp/benchmark_${TIMESTAMP}.txt'"
+./tools/benchmark_rounds.sh -p "$PLATFORM" -r "$RUNTIME" --prepare-only
+
+CASE_FILE="$PROJECT_ROOT/tests/st/a2a3/tensormap_and_ringbuffer/alternating_matmul_add/test_alternating_matmul_add.py"
+CASE_SELECTOR="TestAlternatingMatmulAdd::Case1"
+task-submit --timeout 7200 --max-time 7200 --device auto \
+  --run "python3 '$CASE_FILE' --platform '$PLATFORM' --case '$CASE_SELECTOR' --manual include --rounds 100 --skip-golden --single-case" \
+  > "tmp/benchmark_${TIMESTAMP}.txt" 2>&1
+python3 -m simpler_setup.tools.strace_timing "tmp/benchmark_${TIMESTAMP}.txt" --rounds-table
 ```
 
-Use `--serial-orch-sched` to run each case once in the default overlapped mode
-and once with `SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE=1`, then emit serial-vs-parallel
-Delta/Change tables.
+Repeat the task-submit command once per entry in the selected workload list.
+Use `--device N` instead of `--device auto` to pin a device. Submit the serial
+orch/sched measurement as another task with its mode environment set.
 
 ### Compare Mode
 
-Use a **git worktree** for the baseline so the current workspace is never disturbed.
-Prepare the worktree and venv before taking an NPU lock. Steps 5b and 5c below
-are the inner payload of one self-contained shell script; never execute either
-onboard command outside that script's single `task-submit` allocation. Embed
-the computed paths and selected platform/runtime as literal assignments at the
-top of the payload, then map the allocated devices and run the architecture
-check:
+Prepare the worktree, virtual environment, runtime binaries, and compiled
+callable cache **before** running onboard tasks. Use one device and run baseline
+then current serially so both measurements use the same card. For each selected
+case, submit one standalone scene-test invocation and process its timing log
+after task-submit returns:
 
 ```bash
-set -euo pipefail
-
-PROJECT_ROOT="/absolute/path/to/current"
-WORKTREE_ABS="/absolute/path/to/baseline"
-PLATFORM="a2a3"
-RUNTIME="tensormap_and_ringbuffer"
-TIMESTAMP="YYYYmmdd_HHMMSS"
-BENCH_ARGS=("-n" "100")  # all forwarded args except -d/--device and -r/--runtime
-IFS=',' read -r -a LOCKED_DEVICES <<< "$TASK_DEVICE"
-BASELINE_DEVICE="${LOCKED_DEVICES[0]}"
-CURRENT_DEVICE="${LOCKED_DEVICES[1]:-${LOCKED_DEVICES[0]}}"
-"$PROJECT_ROOT/.claude/skills/onboard-arch-precheck/check.sh" "$PLATFORM"
-```
-
-After composing the payload from the sequential or parallel block below,
-submit that script exactly once:
-
-```bash
-task-submit --timeout 7200 --max-time 7200 "${TASK_SUBMIT_DEVICE_ARGS[@]}" \
-  --run "bash '$PAYLOAD_SCRIPT'"
-```
-
-#### CRITICAL: Worktree needs its own build environment
-
-The worktree is a fresh checkout at merge-base — it has **no pre-built runtime binaries** and no compiled nanobind extension. Two things must be built:
-
-1. **Runtime `.so` binaries** (`build/lib/`) — loaded via ctypes by `bindings.py`
-2. **Nanobind `_task_interface` extension** — compiled C++ Python bindings
-
-Pure Python files under `simpler_setup/` (e.g. `scene_test.py`, `kernel_compiler.py`) are resolved via `sys.path` from the worktree when an editable install is active there, so they correctly come from the worktree. But `_task_interface.*.so` is installed into site-packages by `pip install -e .` and is **shared system-wide**. Without isolation, the worktree would use the main workspace's nanobind extension — which may have incompatible API changes.
-
-**Solution: always create a venv in the worktree** (~26s overhead). This builds both the nanobind extension AND runtime binaries, fully isolating the baseline.
-
-#### 5a. Create worktree, venv, and build
-
-Inline the **absolute** worktree path (copy-paste the value, do not rely on shell variables persisting):
-
-```bash
-# Create worktree
-git worktree add "$WORKTREE_ABS" "$MERGE_BASE" --quiet
-
-# Create venv with system site-packages (for torch, numpy, etc.)
-python3 -m venv "${WORKTREE_ABS}/.venv" --system-site-packages
-
-# Install into venv — builds nanobind extension + runtime binaries
-"${WORKTREE_ABS}/.venv/bin/pip" install -e "${WORKTREE_ABS}" -q 2>&1 | tail -3
-```
-
-This gives the worktree its own `_task_interface.*.so` in `.venv/lib/python3.*/site-packages/`, completely independent from the main workspace.
-
-#### 5b. Run baseline
-
-Activate the venv so `benchmark_rounds.sh` (which calls `python3`) picks up the worktree's nanobind extension and Python bindings:
-
-```bash
-# WORKTREE_ABS must be the literal absolute path.
 (
   cd "$WORKTREE_ABS"
   source .venv/bin/activate
-  pwd
-  ./tools/benchmark_rounds.sh "${BENCH_ARGS[@]}" -d "$BASELINE_DEVICE" -r "$RUNTIME" \
-    2>&1 | tee "${PROJECT_ROOT}/tmp/benchmark_baseline_${TIMESTAMP}_${RUNTIME}.txt"
+  .claude/skills/onboard-arch-precheck/check.sh "$PLATFORM"
+  ./tools/benchmark_rounds.sh -p "$PLATFORM" -r "$RUNTIME" --prepare-only
+  task-submit --timeout 7200 --max-time 7200 --device "$DEVICE" \
+    --run "python3 '$WORKTREE_ABS/tests/st/a2a3/tensormap_and_ringbuffer/alternating_matmul_add/test_alternating_matmul_add.py' --platform '$PLATFORM' --device '$DEVICE' --case TestAlternatingMatmulAdd::Case1 --manual include --rounds 100 --skip-golden --single-case" \
+    > "${PROJECT_ROOT}/tmp/benchmark_baseline_${TIMESTAMP}_${RUNTIME}.txt" 2>&1
+  python3 -m simpler_setup.tools.strace_timing "${PROJECT_ROOT}/tmp/benchmark_baseline_${TIMESTAMP}_${RUNTIME}.txt" --rounds-table
 )
-```
-
-**Always print `pwd` after `cd` to verify you are in the correct directory.** If it does not print the worktree path, something went wrong — do not proceed.
-
-#### 5c. Run current
-
-```bash
 cd "$PROJECT_ROOT"
-./tools/benchmark_rounds.sh "${BENCH_ARGS[@]}" -d "$CURRENT_DEVICE" -r "$RUNTIME" \
-  2>&1 | tee "tmp/benchmark_current_${TIMESTAMP}_${RUNTIME}.txt"
+.claude/skills/onboard-arch-precheck/check.sh "$PLATFORM"
+./tools/benchmark_rounds.sh -p "$PLATFORM" -r "$RUNTIME" --prepare-only
+task-submit --timeout 7200 --max-time 7200 --device "$DEVICE" \
+  --run "python3 '$PROJECT_ROOT/tests/st/a2a3/tensormap_and_ringbuffer/alternating_matmul_add/test_alternating_matmul_add.py' --platform '$PLATFORM' --device '$DEVICE' --case TestAlternatingMatmulAdd::Case1 --manual include --rounds 100 --skip-golden --single-case" \
+  > "tmp/benchmark_current_${TIMESTAMP}_${RUNTIME}.txt" 2>&1
+python3 -m simpler_setup.tools.strace_timing "tmp/benchmark_current_${TIMESTAMP}_${RUNTIME}.txt" --rounds-table
 ```
 
-#### 5d. Cleanup
-
-```bash
-git worktree remove "$WORKTREE_ABS" --force
-```
-
-If `git worktree remove` fails (e.g., cwd was inside the deleted worktree), use:
-
-```bash
-git -C "$PROJECT_ROOT" worktree remove "$WORKTREE_ABS" --force
-```
-
-#### Parallel execution (two devices)
-
-When two devices are available, run baseline and current **for the same runtime** in parallel on separate devices. The venv ensures the worktree has its own nanobind extension, so both workspaces are fully independent.
-
-```bash
-# For each runtime (serially):
-for RUNTIME in "${RUNTIMES_TO_BENCH[@]}"; do
-  # Baseline on device A (from worktree with venv), current on device B (from main) — parallel
-  (cd "$WORKTREE_ABS" && source .venv/bin/activate && pwd && ./tools/benchmark_rounds.sh "${BENCH_ARGS[@]}" -d "$BASELINE_DEVICE" -r "$RUNTIME") &
-  BASELINE_PID=$!
-  (cd "$PROJECT_ROOT" && ./tools/benchmark_rounds.sh "${BENCH_ARGS[@]}" -d "$CURRENT_DEVICE" -r "$RUNTIME") &
-  CURRENT_PID=$!
-  PARALLEL_RC=0
-  wait "$BASELINE_PID" || PARALLEL_RC=$?
-  wait "$CURRENT_PID" || PARALLEL_RC=$?
-  if [[ $PARALLEL_RC -ne 0 ]]; then
-    exit "$PARALLEL_RC"
-  fi
-done
-```
-
-**Never launch the next runtime until the current one finishes on all devices.**
-
-#### Sequential execution (one device)
-
-```bash
-# 1. Worktree + venv already created in step 5a
-
-# 2. For each runtime (serially — one device, one process at a time):
-#    Baseline first (from worktree with venv activated in a subshell)
-(
-  cd "$WORKTREE_ABS"
-  source .venv/bin/activate
-  pwd
-  ./tools/benchmark_rounds.sh "${BENCH_ARGS[@]}" -d "$BASELINE_DEVICE" -r "$RUNTIME" \
-    2>&1 | tee "${PROJECT_ROOT}/tmp/benchmark_baseline_${TIMESTAMP}_${RUNTIME}.txt"
-)
-
-#    Then current (from main workspace, no baseline venv)
-cd "$PROJECT_ROOT"
-./tools/benchmark_rounds.sh "${BENCH_ARGS[@]}" -d "$CURRENT_DEVICE" -r "$RUNTIME" \
-  2>&1 | tee "tmp/benchmark_current_${TIMESTAMP}_${RUNTIME}.txt"
-
-# 3. Cleanup
-git -C "$PROJECT_ROOT" worktree remove "$WORKTREE_ABS" --force
-```
+The per-case `task-submit` tasks use the explicit `-d` device above. Do not
+wrap either harness invocation in another task-submit command.
 
 ## Step 6: Report Results
 
@@ -403,7 +280,9 @@ If any example shows > 5% regression, highlight it explicitly.
 ## Checklist
 
 - [ ] Mode detected (single vs compare)
-- [ ] Architecture precheck passed and one `task-submit` allocation owns the run
+- [ ] Runtime binaries and selected callable artifacts prepared before device allocation
+- [ ] Architecture precheck passed; each case ran in its own `task-submit` task
+- [ ] Benchmark harness ran in preparation-only mode, outside device allocation
 - [ ] PTO-ISA pinned to CI commit
 - [ ] `PROJECT_ROOT` and `WORKTREE_ABS` absolute paths computed
 - [ ] (Compare mode) Worktree created, venv built with `pip install -e .`
