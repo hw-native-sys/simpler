@@ -13,8 +13,9 @@ experiment, not checkpoint accuracy validation. Isolated Attention and Engram
 cases run rank 0 on **one device**. Only `moe`, `layers_19_21`, and the original
 full forward run on **two devices** with real communication and deferred waits.
 
-The matrix contains 18 configurations: nine original PyPTO-lib cases and nine
-DSL cases with approximately half their SPMD tasks requiring sync-start.
+The matrix contains 27 configurations: nine original PyPTO-lib cases, nine
+DSL cases with approximately half their SPMD tasks requiring sync-start, and
+nine DSL cases with all capacity-eligible SPMD tasks requiring sync-start.
 Measurement availability and the timing contract are maintained in [RESULTS.md](RESULTS.md).
 
 ## Cases
@@ -39,7 +40,7 @@ An execution is one `(task, block, subtask)` invocation. Original scalar values,
 tensor shapes, strides, offsets, aliasing, argument directions, explicit
 dependencies, scope modes, block counts, and sync-start flags are recorded at
 the production Host submission interface. DSL case export then applies the
-half-SPMD policy below; the full-forward capture remains original. Device dispatch, ready queues,
+selected synchronization policy below; the full-forward capture remains original. Device dispatch, ready queues,
 completion, MIX admission, and `defer_wait` use the unchanged production code.
 
 ## Boundary preparation and validation
@@ -78,8 +79,9 @@ case's scalar scheduling measurements.
 ## DSL half-SPMD sync-start policy
 
 `production/prepare.py` applies this policy automatically when exporting the
-nine `pypto_lib_dsl` cases. PyPTO-lib cases retain their original flags. There
-is no third group of DSL variants.
+nine `pypto_lib_dsl` cases; it also exports the all-sync variant. PyPTO-lib cases retain their original flags. There
+are three groups: `pypto_lib`, `pypto_lib_dsl` (half), and
+`pypto_lib_dsl_all_sync64` (all up to 64).
 
 For each case and rank, count compute submissions with `block_num > 1` as SPMD
 (one logical task, including MIX). The target is `ceil(SPMD / 2)`. Preserve all
@@ -103,49 +105,47 @@ original files under `workloads/` remain source-capture references.
 
 Regenerate prepared bundles after updating the exporter. Existing bundles do
 not acquire this policy automatically. The standard preparation and run
-commands below produce exactly 18 configurations.
+commands below produce 27 configurations by default. Use `--sync-policy half`
+to prepare only the half-sync DSL variant, or `--sync-policy all-cap64` for
+only the all-sync DSL variant. PyPTO-lib remains unchanged.
+
+The all-sync variant uses `record-tool --all-sync-start-cap64` and enables
+every capacity-eligible multi-block compute task in the selected slice.
+The limit is inclusive: 64 for AIV, 32 for AIC/MIX. In this fixture that
+enables 275 of 280 SPMD tasks; the same five oversized tasks stay unchanged.
+Both variants retain the original flavor in `case.json` and identify the
+selected variant separately, so source workload tables and the lower-bound
+analyzers continue to use the same task identities.
 
 ## Conditional ideal lower bound
 
-Following [PR #3061](https://github.com/hw-native-sys/simpler/pull/3061), derive a
-zero-scheduler-cost model from measured kernel durations and the captured
-completion-dependency DAG. This model applies only to isolated single-device
-cases without deferred or early dependency completion. Communication cases
-are not calculated. Keep the L0 benchmark columns unchanged; the model uses
-a separate HBG L1 capture of the same bundle and runtime source.
+The performance table uses a resource-constrained model that preserves
+`sync_start` common admission as well as data dependencies. Half-sync and
+all-sync cases have separate L1 captures and separate bounds. The older
+critical-path/work-volume relaxation is only a preliminary lower bound;
+it does not describe their different common-start constraints.
 
-For each task, let `W_AIC` and `W_AIV` be the sums of its measured block/lane
-execution durations. Its optimistic duration is
-`d = max(longest block/lane duration, W_AIC / 32, W_AIV / 64)`.
-Use `d` as the node weight of the DAG and compute its longest path `CP`.
-The run's conditional lower bound is
-`max(CP, total W_AIC / 32, total W_AIV / 64)`.
-Verified Host allocation nodes have zero duration. Average the per-run bounds
-over the ten measured L1 runs, excluding warmup.
+See [BOUND.md](BOUND.md) for the model, optional solver installation,
+reproduction commands and how to distinguish a proven bound from a feasible
+schedule or a proved model optimum.
 
-This is a bound under **fixed measured durations**, not an achieved schedule
-or a hardware throughput limit. Scheduling, publication, start barriers and
-teardown have zero modeled cost; resource fragmentation and additional
-cross-task contention are relaxed. Existing waits inside a measured kernel
-remain in its duration. L1 instrumentation and cache/concurrency conditions
-can change those durations, so the result is not a strict lower bound on the
-separate L0 measurements and is not scaled by an L0/L1 ratio.
+## Performance presentation contract
 
-From the suite directory, after building the matching runtime and preparing
-an isolated bundle:
+Use one table, with each case followed by PyPTO-lib, half-sync DSL, then
+all-sync DSL. Keep only the current result set, average milliseconds with six
+decimal places, and the following fixed columns (see [RESULTS.md](RESULTS.md)):
 
-```bash
-bash production/run.sh "$BUNDLE" "$DSV41_RUNTIME" "$CAPTURE" 1 1 10
-PYTHONPATH="$PWD/../../..:$PWD/../../../python" python3 production/ideal_bound.py \
-  "$BUNDLE" "$CAPTURE/rank0" "$CAPTURE/ideal-bound.json"
-```
+Use the exact six-column header shown in [RESULTS.md](RESULTS.md).
 
-The reducer verifies numerical success, L1 invocation identities, every
-block/lane execution, stable topology and dependency endpoint coverage.
-Missing or cyclic dependencies are errors; only mapped Host allocations can
-supply missing zero-cost nodes. The inferred bound must fit within the
-observed kernel envelope. Raw captures and per-round values remain local;
-[RESULTS.md](RESULTS.md) contains only the mean in the shared table.
+The HBG column contains the selected HBG revision; always state its exact
+commit beside the table, independently of the fixed column label. The current
+published HBG values use `8e6aba9d484`, and percounter uses `21d2e9a103d5`.
+Do not add a duplicate candidate column or mix historical measurements into
+the table. The percentage is `(min(HBG, percounter) / bound - 1) * 100`,
+computed before rounding and displayed with two decimal places. Missing
+bounds and communication cases use an em dash. Mark unclosed solver bounds
+and their percentages with a dagger; never substitute an incumbent as an
+exact lower bound. Do not publish raw samples or P99 columns in this table.
 
 ## Included sources and data
 
@@ -246,10 +246,10 @@ bash "$DSV41/run.sh" \
 ```
 
 Add `--flavor pypto_lib` or `--flavor pypto_lib_dsl` to preparation when only
-one set was built. To run all 18 scenarios:
+one set was built. To run all 27 scenarios:
 
 ```bash
-for flavor in pypto_lib pypto_lib_dsl; do
+for flavor in pypto_lib pypto_lib_dsl pypto_lib_dsl_all_sync64; do
   for case in swa c2a_full c2a_reuse c1a_full c1a_reindex c1a_reuse moe engram layers_19_21; do
     bash "$DSV41/run.sh" \
       "$DSV41/build/prepared/cases/$flavor/$case" \
@@ -291,9 +291,10 @@ automatic device allocation. Select percounter with `--runtime=percounter` after
 is `--runtime=host_build_graph`. The runner loads that runtime's subdirectory
 under the supplied library root. HBG requires reported mode 1/2; percounter
 requires reported mode 5. The result also records the selected runtime. Do not
-mix runtime components across builds. Percounter multi-device communication is not yet
-supported: mark its MoE and layers_19_21 entries unavailable.
-[RESULTS.md](RESULTS.md) lists both L0 means.
+mix runtime components across builds. The revision recorded in [RESULTS.md](RESULTS.md)
+passed all six multi-device MoE/layers variants with percounter. Validate the
+selected revision rather than carrying an older unsupported label forward;
+failed or untested runs never supply successful timing values.
 
 Percounter L1 uses the standard shared task-buffer rotation and Host recycling
 paths; no diagnostic source copy or replacement recorder is needed. For example,

@@ -55,11 +55,9 @@ def capture(path, operand_size, tasks):
     return data
 
 
-def convert(tool, source, target, first, last):
+def convert(tool, source, target, first, last, option="--half-sync-start"):
     return json.loads(
-        subprocess.check_output(
-            [str(tool), "--half-sync-start", str(source), str(first), str(last), str(target)], text=True
-        )
+        subprocess.check_output([str(tool), option, str(source), str(first), str(last), str(target)], text=True)
     )
 
 
@@ -116,3 +114,36 @@ def test_half_sync_rounding_and_constraints(tool, tmp_path, flags, blocks, expec
     assert report["sync_start_after"] == expected
     if expected == sum(flags):
         assert source.read_bytes() == target.read_bytes()
+
+
+def test_all_sync_cap64_preserves_scope_data_and_physical_capacity(tool, tmp_path):
+    binary, size = tool
+    vector = (-1, 7, -1)
+    tasks = [
+        (8, 0, vector, 2),  # outside the selected slice
+        (63, 0, vector, 2),
+        (64, 0, vector, 2),
+        (65, 0, vector, 2),
+        (32, 0, (5, 6, 7), 2),
+        (33, 0, (5, 6, 7), 2),
+        (1, 0, vector, 2),
+        (8, 0, (-1, -1, -1), 3),
+        (8, 1, vector, 2),
+        (8, 0, vector, 2),  # outside the selected slice
+    ]
+    source, target = tmp_path / "source.bin", tmp_path / "all.bin"
+    original = capture(source, size, tasks)
+    option = "--all-sync-start-cap64"
+    report = convert(binary, source, target, 1, 8, option)
+    assert report["selected_task_ids"] == [1, 2, 4]
+    assert report["sync_start_before"] == 1
+    assert report["sync_start_after"] == report["target"] == 4
+    assert report["over_limit"] == 2
+    expected = bytearray(original)
+    for task in (1, 2, 4):
+        struct.pack_into("<i", expected, 16 + HEADER.size + task * (HEADER.size + 16) + 40, 1)
+    assert target.read_bytes() == expected
+    assert source.read_bytes() == original
+    again = tmp_path / "again.bin"
+    assert convert(binary, target, again, 1, 8, option)["changed"] == 0
+    assert again.read_bytes() == target.read_bytes()

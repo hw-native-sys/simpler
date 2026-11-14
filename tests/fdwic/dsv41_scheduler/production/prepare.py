@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Regenerate the nine case bundles by running the included original orchestration."""
+"""Prepare the 27-case matrix from the two included original orchestrations."""
 
 import argparse
 import json
@@ -29,6 +29,7 @@ def main():
         "--build-dir", type=Path, default=Path(os.environ.get("DSV41_BUILD_DIR", ROOT / "build/portable"))
     )
     parser.add_argument("--flavor", choices=["pypto_lib", "pypto_lib_dsl", "both"], default="both")
+    parser.add_argument("--sync-policy", choices=["half", "all-cap64", "both"], default="both")
     args = parser.parse_args()
     output, build, runtime = args.output.resolve(), args.build_dir.resolve(), args.runtime.resolve()
     runtime_files = (
@@ -52,10 +53,11 @@ def main():
             env=env,
             check=True,
         )
-        export(bundle, capture, flavor, output / "cases", build / "host")
-        for case in sorted((output / "cases" / flavor).iterdir()):
-            if json.loads((case / "case.json").read_text())["device_count"] == 1:
-                materialize(case, runtime, output / "preparation" / flavor / case.name, env)
+        variants = export(bundle, capture, flavor, output / "cases", build / "host", args.sync_policy)
+        for variant in variants:
+            for case in sorted((output / "cases" / variant).iterdir()):
+                if json.loads((case / "case.json").read_text())["device_count"] == 1:
+                    materialize(case, runtime, output / "preparation" / variant / case.name, env)
     print(f"Prepared cases: {output / 'cases'}")
 
 
