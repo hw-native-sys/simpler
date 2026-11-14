@@ -109,6 +109,10 @@ archives selected through custom `-L` directories and files referenced by
 linker scripts. Other linkers are rejected because their trace may omit archives
 from which the empty probe extracts no members. The probe does not execute the
 module; source and other caller-owned inputs still belong in the module key.
+The probe permits unresolved symbols and omits `--no-undefined-version`, since
+it has no user symbol definitions. Real module builds keep the original flags,
+including version-script export checks. Response files retain their original
+arguments in the returned configuration and real build command.
 
 Pass `library_paths` directly to the linker to use the exact SDK libraries
 fingerprinted by the query. CPU options such as `-march=native`, `-mcpu=native`

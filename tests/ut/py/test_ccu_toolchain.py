@@ -398,32 +398,38 @@ def test_compile_ccu_concurrent_modules_round_trip(native_toolchain_files, tmp_p
 
 
 @pytest.mark.parametrize("search_flag", ["driver", "split", "linker", "response"])
-def test_selected_runtime_archive_invalidates_cache(native_toolchain_files, tmp_path, search_flag):
+@pytest.mark.parametrize("cxx", ["g++", "g++-15"])
+def test_selected_runtime_archive_invalidates_cache(native_toolchain_files, tmp_path, search_flag, cxx):
+    if shutil.which(cxx) is None:
+        pytest.skip(f"requires {cxx}")
     runtime = tmp_path / "runtime with spaces"
     runtime.mkdir()
-    archive = runtime / "libstdc++.a"
+    # GCC may place its default search paths before directories passed via -Wl.
+    archive = runtime / ("libccu_test_runtime.a" if search_flag == "linker" else "libstdc++.a")
     runtime_source = runtime / "runtime.cpp"
     runtime_object = runtime / "runtime.o"
     source = tmp_path / "module.cpp"
     source.write_text(
         'extern "C" int runtime_value();\nextern "C" int selected_runtime() { return runtime_value(); }\n'
     )
-    flags = ["-static-libstdc++"]
+    flags = [] if search_flag == "linker" else ["-static-libstdc++"]
     if search_flag == "driver":
         flags += [f"-L{runtime}"]
     elif search_flag == "split":
         flags += ["-L", str(runtime)]
     elif search_flag == "linker":
-        flags += [f"-Wl,-L,{runtime}"]
+        flags += [f"-Wl,-L,{runtime},-l:{archive.name}"]
     else:
         response = tmp_path / "link.rsp"
         response.write_text(f'-L"{runtime}"\n')
         flags += [f"@{response}"]
     compiler = KernelCompiler("a5")
+    assert compiler.host_gxx is not None
+    compiler.host_gxx.cxx_path = cxx
     tokens, values = [], []
     for version in (11, 22):
         runtime_source.write_text(f'extern "C" int runtime_value() {{ return {version}; }}\n')
-        subprocess.run(["g++", "-fPIC", "-c", str(runtime_source), "-o", str(runtime_object)], check=True)
+        subprocess.run([cxx, "-fPIC", "-c", str(runtime_source), "-o", str(runtime_object)], check=True)
         subprocess.run(["ar", "rcs", str(archive), str(runtime_object)], check=True)
         tokens.append(compiler.ccu_compile_cache_token(extra_link_flags=flags))
         artifact = tmp_path / f"module{version}.so"
@@ -433,6 +439,45 @@ def test_selected_runtime_archive_invalidates_cache(native_toolchain_files, tmp_
     assert tokens[0] != tokens[1]
     assert str(archive) in dict(tokens[0]["dependency_digests"])
     assert tokens[1] == compiler.ccu_compile_cache_token(extra_link_flags=flags)
+
+
+@pytest.mark.parametrize("cxx", ["g++", "g++-15"])
+@pytest.mark.parametrize("export_manifest", [False, True])
+@pytest.mark.parametrize("forwarding", ["driver", "linker", "response", "linker_response"])
+def test_ccu_version_script_validates_real_source(native_toolchain_files, tmp_path, cxx, export_manifest, forwarding):
+    if shutil.which(cxx) is None:
+        pytest.skip(f"requires {cxx}")
+    compiler = KernelCompiler("a5")
+    assert compiler.host_gxx is not None
+    compiler.host_gxx.cxx_path = cxx
+    script = tmp_path / "exports map"
+    script.write_text("CCU_1 { global: simpler_ccu_module_manifest; local: *; };\n")
+    flags = [f"-Wl,--version-script={script},--no-undefined-version"]
+    if forwarding == "linker":
+        flags = [f"-Wl,--version-script={script}", "-Xlinker", "--no-undefined-version"]
+    elif forwarding == "response":
+        response = tmp_path / "link.rsp"
+        nested = tmp_path / "nested.rsp"
+        nested.write_text(f'"{flags[0]}"\n')
+        response.write_text(f'@"{nested}"\n')
+        flags = [f"@{response}"]
+    elif forwarding == "linker_response":
+        response = tmp_path / "link.rsp"
+        response.write_text(f'--version-script="{script}" --no-undefined-version\n')
+        flags = [f"-Wl,@{response}"]
+    source = tmp_path / "module.cpp"
+    symbol = "simpler_ccu_module_manifest" if export_manifest else "other_export"
+    source.write_text(f'extern "C" int {symbol}() {{ return 37; }}\n')
+
+    config = compiler.ccu_compile_cache_token(extra_link_flags=flags)
+    assert all(flag in config["link_flags"] for flag in flags)
+    if export_manifest:
+        artifact = tmp_path / "module.so"
+        artifact.write_bytes(compiler.compile_ccu(str(source), extra_link_flags=flags))
+        assert ctypes.CDLL(str(artifact)).simpler_ccu_module_manifest() == 37
+    else:
+        with pytest.raises(RuntimeError, match="undefined version"):
+            compiler.compile_ccu(str(source), extra_link_flags=flags)
 
 
 @pytest.mark.parametrize("use_extra_include_dir", [False, True])

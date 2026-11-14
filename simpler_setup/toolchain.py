@@ -469,13 +469,70 @@ def _ccu_compiler_dependencies(driver: list[str], flags: tuple[str, ...]) -> Ite
         yield path
 
 
+def _ccu_expand_response_files(arguments: Sequence[str], parents: tuple[Path, ...] = ()) -> Iterator[str]:
+    for argument in arguments:
+        if not argument.startswith("@") or not (path := Path(argument[1:])).is_file():
+            yield argument
+            continue
+        resolved = path.resolve()
+        if resolved in parents:
+            raise ValueError(f"Recursive CCU compiler response file: {path}")
+        # GCC response files allow backslash escapes inside either quote style.
+        words, word = [], []
+        quote = ""
+        escaped = started = False
+        for char in path.read_text():
+            if escaped:
+                word.append(char)
+                escaped = False
+            elif char == "\\":
+                escaped = started = True
+            elif quote:
+                if char == quote:
+                    quote = ""
+                else:
+                    word.append(char)
+            elif char in "\"'":
+                quote = char
+                started = True
+            elif char in " \t\r\n\f\v":
+                if started:
+                    words.append("".join(word))
+                    word = []
+                    started = False
+            else:
+                word.append(char)
+                started = True
+        if started:
+            words.append("".join(word))
+        yield from _ccu_expand_response_files(words, (*parents, resolved))
+
+
+def _ccu_probe_link_command(command: list[str]) -> list[str]:
+    result = []
+    arguments = iter(_ccu_expand_response_files(command))
+    for argument in arguments:
+        if argument == "-Xlinker":
+            forwarded = [next(arguments)]
+        elif argument.startswith("-Wl,"):
+            forwarded = argument[4:].split(",")
+        else:
+            result.append(argument)
+            continue
+        for flag in _ccu_expand_response_files(forwarded):
+            if flag != "--no-undefined-version":
+                result.extend(("-Xlinker", flag))
+    # Symbol definitions belong to the real sources, absent from this probe.
+    return [*result, "-Wl,--unresolved-symbols=ignore-all"]
+
+
 def _ccu_link_dependencies(command: list[str], output: Path) -> tuple[Path, ...]:
     # GNU ld traces opened archives even when the probe extracts no members.
     # Linkers that trace only extracted members cannot identify unused runtimes.
     version = _ccu_query([*command, "-Wl,--version"])
     if not any(line.startswith("GNU ld ") for line in version.splitlines()):
         raise ValueError("CCU Host builds require GNU ld (bfd) for a complete runtime-library fingerprint")
-    trace = _ccu_query([*command, "-Wl,--trace"])
+    trace = _ccu_query([*_ccu_probe_link_command(command), "-Wl,--trace"])
     paths = tuple(
         path
         for line in trace.splitlines()
