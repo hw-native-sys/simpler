@@ -27,4 +27,8 @@ task_interface_case(test_chip_callable_upload_immutable.cpp
 task_interface_case(test_callable_function_tables.cpp
     INCLUDES ${SIMPLER_SRC}/common)
 
+# Tensor factories call always_assert without linking a runtime's implementation.
+task_interface_case(test_tensor_contiguity.cpp
+    SOURCES ${SIMPLER_SRC}/common/task_interface/assert_compat.cpp)
+
 simpler_ut_glob_cases(task_interface_case)
