@@ -154,6 +154,47 @@ enum class SchedPhaseKind : uint8_t {
     ScalarTraceFinish = 92,
     ScalarTraceFinishClean = 93,
     ScalarTraceFinishBarrier = 94,
+    ScalarEarlyPrepare = 95,
+    ScalarClusterPrepare = 96,
+    ScalarExecutionTokenProgress = 97,
+    ScalarExecutionTokenRefill = 98,
+    ScalarExecutionTokenReceive = 99,
+    ScalarExecutionTokenDispatch = 100,
+    ScalarFaninObserve = 101,
+    ScalarCooperativeDiscover = 102,
+    ScalarFillOwnSlots = 103,
+    ScalarFillCooperativeSlots = 104,
+    ScalarClusterMixService = 105,
+    ScalarClusterMixDiscoverTask = 106,
+    ScalarClusterMixDiscoverNext = 107,
+    ScalarClusterMixPending = 108,
+    ScalarClusterMixArm = 109,
+    ScalarClusterMixObserve = 110,
+    ScalarClusterMixRetire = 111,
+    ScalarClusterMixEnter = 112,
+    ScalarClusterMixRelease = 113,
+    ScalarClusterMixDrain = 114,
+    ScalarClusterMixPublishPreparation = 115,
+    ScalarClusterMixConflicts = 116,
+    ScalarClusterMixAll = 117,
+    ScalarPreparedReceive = 118,
+    ScalarPreparedAcquire = 119,
+    ScalarPreparedParkBegin = 120,
+    ScalarPreparedParkPublish = 121,
+    ScalarPreparedResume = 122,
+    ScalarPreparedReturn = 123,
+    ScalarPreparedObserve = 124,
+    ScalarPreparedIndex = 125,
+    ScalarPreparedValidate = 126,
+    ScalarGroupReserve = 127,
+    ScalarGroupPark = 128,
+    ScalarGroupResume = 129,
+    ScalarGroupArm = 130,
+    ScalarGroupAcquire = 131,
+    ScalarClusterMixNeedsService = 132,
+    ScalarExecutionContinuation = 133,
+    ScalarExecutionTokenFanin = 134,
+    ScalarClusterMixReadyReplacement = 135,
 };
 
 // This phase's name as a report spells it. Returns a string literal, so it is safe on
@@ -332,6 +373,88 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_trace_finish_clean";
     case SchedPhaseKind::ScalarTraceFinishBarrier:
         return "scalar_trace_finish_barrier";
+    case SchedPhaseKind::ScalarEarlyPrepare:
+        return "scalar_early_prepare";
+    case SchedPhaseKind::ScalarClusterPrepare:
+        return "scalar_cluster_prepare";
+    case SchedPhaseKind::ScalarExecutionTokenProgress:
+        return "scalar_execution_token_progress";
+    case SchedPhaseKind::ScalarExecutionTokenRefill:
+        return "scalar_execution_token_refill";
+    case SchedPhaseKind::ScalarExecutionTokenReceive:
+        return "scalar_execution_token_receive";
+    case SchedPhaseKind::ScalarExecutionTokenDispatch:
+        return "scalar_execution_token_dispatch";
+    case SchedPhaseKind::ScalarFaninObserve:
+        return "scalar_fanin_observe";
+    case SchedPhaseKind::ScalarCooperativeDiscover:
+        return "scalar_cooperative_discover";
+    case SchedPhaseKind::ScalarFillOwnSlots:
+        return "scalar_fill_own_slots";
+    case SchedPhaseKind::ScalarFillCooperativeSlots:
+        return "scalar_fill_cooperative_slots";
+    case SchedPhaseKind::ScalarClusterMixService:
+        return "scalar_cluster_mix_service";
+    case SchedPhaseKind::ScalarClusterMixDiscoverTask:
+        return "scalar_cluster_mix_discover_task";
+    case SchedPhaseKind::ScalarClusterMixDiscoverNext:
+        return "scalar_cluster_mix_discover_next";
+    case SchedPhaseKind::ScalarClusterMixPending:
+        return "scalar_cluster_mix_pending";
+    case SchedPhaseKind::ScalarClusterMixArm:
+        return "scalar_cluster_mix_arm";
+    case SchedPhaseKind::ScalarClusterMixObserve:
+        return "scalar_cluster_mix_observe";
+    case SchedPhaseKind::ScalarClusterMixRetire:
+        return "scalar_cluster_mix_retire";
+    case SchedPhaseKind::ScalarClusterMixEnter:
+        return "scalar_cluster_mix_enter";
+    case SchedPhaseKind::ScalarClusterMixRelease:
+        return "scalar_cluster_mix_release";
+    case SchedPhaseKind::ScalarClusterMixDrain:
+        return "scalar_cluster_mix_drain";
+    case SchedPhaseKind::ScalarClusterMixPublishPreparation:
+        return "scalar_cluster_mix_publish_preparation";
+    case SchedPhaseKind::ScalarClusterMixConflicts:
+        return "scalar_cluster_mix_conflicts";
+    case SchedPhaseKind::ScalarClusterMixAll:
+        return "scalar_cluster_mix_all";
+    case SchedPhaseKind::ScalarPreparedReceive:
+        return "scalar_prepared_receive";
+    case SchedPhaseKind::ScalarPreparedAcquire:
+        return "scalar_prepared_acquire";
+    case SchedPhaseKind::ScalarPreparedParkBegin:
+        return "scalar_prepared_park_begin";
+    case SchedPhaseKind::ScalarPreparedParkPublish:
+        return "scalar_prepared_park_publish";
+    case SchedPhaseKind::ScalarPreparedResume:
+        return "scalar_prepared_resume";
+    case SchedPhaseKind::ScalarPreparedReturn:
+        return "scalar_prepared_return";
+    case SchedPhaseKind::ScalarPreparedObserve:
+        return "scalar_prepared_observe";
+    case SchedPhaseKind::ScalarPreparedIndex:
+        return "scalar_prepared_index";
+    case SchedPhaseKind::ScalarPreparedValidate:
+        return "scalar_prepared_validate";
+    case SchedPhaseKind::ScalarGroupReserve:
+        return "scalar_group_reserve";
+    case SchedPhaseKind::ScalarGroupPark:
+        return "scalar_group_park";
+    case SchedPhaseKind::ScalarGroupResume:
+        return "scalar_group_resume";
+    case SchedPhaseKind::ScalarGroupArm:
+        return "scalar_group_arm";
+    case SchedPhaseKind::ScalarGroupAcquire:
+        return "scalar_group_acquire";
+    case SchedPhaseKind::ScalarClusterMixNeedsService:
+        return "scalar_cluster_mix_needs_service";
+    case SchedPhaseKind::ScalarExecutionContinuation:
+        return "scalar_execution_continuation";
+    case SchedPhaseKind::ScalarExecutionTokenFanin:
+        return "scalar_execution_token_fanin";
+    case SchedPhaseKind::ScalarClusterMixReadyReplacement:
+        return "scalar_cluster_mix_ready_replacement";
     }
     return "unknown";
 }

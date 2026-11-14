@@ -79,15 +79,23 @@ static_assert(
     "AicpuPhaseRecord must remain a POD wire type"
 );
 
+// AICore's post-handshake work window, in AICore counter ticks. It is
+// independent of the AICPU phase clock; only its duration is compared to it.
+struct AicoreWorkWindow {
+    uint64_t start_cycle;
+    uint64_t end_cycle;
+};
+
 // One per-run header at the front of the device buffer. The last AICPU thread
 // sets task_timing_tail_used after all scheduler threads have stopped writing
 // task-timing records. Zero means the host may skip the tail D2H.
 struct DevicePhaseBufferHeader {
     uint64_t task_timing_tail_used;
     uint64_t reserved;
+    AicoreWorkWindow aicore_work;
 };
 
-static_assert(sizeof(DevicePhaseBufferHeader) == 16, "DevicePhaseBufferHeader layout must stay 16 bytes");
+static_assert(sizeof(DevicePhaseBufferHeader) == 32, "DevicePhaseBufferHeader layout must stay 32 bytes");
 static_assert(
     std::is_trivially_copyable_v<DevicePhaseBufferHeader> && std::is_standard_layout_v<DevicePhaseBufferHeader>,
     "DevicePhaseBufferHeader must remain a POD wire type"
@@ -248,7 +256,7 @@ inline const TaskTimingRecord *task_timing_tail_records(const void *buffer_base,
 inline void reset_device_phase_buffer(void *buffer_base, int max_threads) {
     if (buffer_base == nullptr) return;
 
-    *device_phase_buffer_header(buffer_base) = DevicePhaseBufferHeader{0, 0};
+    *device_phase_buffer_header(buffer_base) = DevicePhaseBufferHeader{};
 
     AicpuPhaseRecord *phases = device_phase_records(buffer_base);
     for (int i = 0; i < aicpu_phase_buffer_slots(max_threads); ++i) {

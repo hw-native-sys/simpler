@@ -19,7 +19,9 @@
 #include "aicpu/device_time.h"
 #endif
 
-static_assert(static_cast<uint32_t>(SchedPhaseKind::ScalarTraceFinishBarrier) < SCHEDULER_SCALAR_STORAGE_EXTENDED);
+static_assert(
+    static_cast<uint32_t>(SchedPhaseKind::ScalarClusterMixReadyReplacement) < SCHEDULER_SCALAR_STORAGE_EXTENDED
+);
 
 inline __aicore__ uint64_t scheduler_scalar_clock() {
 #if defined(__CCE_AICORE__)
@@ -135,7 +137,7 @@ struct SchedulerScalarTrace {
 
     // Only semantic function spans are duration-filtered. Primitive memory
     // operations, backoff and recorder intervals always use append directly.
-    inline __aicore__ void append_function(
+    inline __aicore__ __attribute__((noinline)) void append_function(
         SchedPhaseKind kind, uint64_t begin, uint64_t end, int64_t task_ref = -1, uint32_t record_depth = 0
     ) {
         if (buffer == nullptr) return;

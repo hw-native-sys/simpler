@@ -22,11 +22,121 @@ uint64_t get_aicore_report_epoch();
 #include <array>
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <thread>
 #include <vector>
 
 namespace {
 using namespace simpler::percounter;
+
+TEST(PercounterScalarStorage, PreservesMixedIntervalsWithoutLogicalCount) {
+    std::array<uint64_t, 8> slots{};
+    PercounterScalarTrace trace{};
+    trace.records = slots.data();
+    trace.depth = 2;
+    trace.append_memory(ProfilePhase::SsbufLoad, 100, 117);
+    trace.write({200, uint64_t{UINT32_MAX} + 300, 42, static_cast<uint32_t>(ProfilePhase::Prepare), 7});
+    trace.append_memory(ProfilePhase::DsbAll, 500, 500);
+
+    uint32_t cursor = 0;
+    SchedulerScalarRecord record{};
+    ASSERT_TRUE(
+        percounter_decode_scalar_storage(slots.data(), trace.storage_words, cursor, trace.window_start, record)
+    );
+    EXPECT_EQ(record.start_time, 100);
+    EXPECT_EQ(record.end_time, 117);
+    EXPECT_EQ(record.task_ref, -1);
+    EXPECT_EQ(record.count, 1);
+    EXPECT_EQ(record.kind, static_cast<uint32_t>(ProfilePhase::SsbufLoad) | (3U << 16));
+    ASSERT_TRUE(
+        percounter_decode_scalar_storage(slots.data(), trace.storage_words, cursor, trace.window_start, record)
+    );
+    EXPECT_EQ(record.start_time, 200);
+    EXPECT_EQ(record.end_time, uint64_t{UINT32_MAX} + 300);
+    EXPECT_EQ(record.task_ref, 42);
+    EXPECT_EQ(record.count, 7);
+    ASSERT_TRUE(
+        percounter_decode_scalar_storage(slots.data(), trace.storage_words, cursor, trace.window_start, record)
+    );
+    EXPECT_EQ(record.start_time, 500);
+    EXPECT_EQ(record.end_time, 500);
+    EXPECT_EQ(cursor, trace.storage_words);
+    EXPECT_EQ(trace.dropped, 0);
+}
+
+TEST(PercounterScalarStorage, RejectsWholeExtendedRecordAtCapacityBoundary) {
+    constexpr uint32_t capacity = PERCOUNTER_SCALAR_WORD_CAPACITY;
+    std::vector<uint64_t> slots(capacity + 1);
+    slots.back() = 0xfeed;
+    PercounterScalarTrace trace{};
+    trace.records = slots.data();
+    trace.storage_words = capacity - 1;
+    trace.write({100, 200, 42, static_cast<uint32_t>(ProfilePhase::Prepare), 1});
+    EXPECT_EQ(trace.storage_words, capacity - 1);
+    EXPECT_EQ(trace.dropped, 1);
+    EXPECT_EQ(static_cast<uint32_t>(slots[capacity - 1]), 0);
+    trace.append_memory(ProfilePhase::SsbufLoad, 300, 400);
+    EXPECT_EQ(trace.storage_words, capacity);
+    EXPECT_EQ(static_cast<uint32_t>(slots[capacity - 1]), 300);
+    trace.append_memory(ProfilePhase::SsbufLoad, 500, 600);
+    EXPECT_EQ(trace.storage_words, capacity);
+    EXPECT_EQ(trace.dropped, 2);
+    EXPECT_EQ(static_cast<uint32_t>(slots[capacity - 1]), 300);
+    EXPECT_EQ(slots.back(), 0xfeed);
+}
+
+TEST(PercounterScalarStorage, InvalidIntervalsNeverConsumeStorage) {
+    std::array<uint64_t, 4> slots{};
+    PercounterScalarTrace trace{};
+    trace.records = slots.data();
+    trace.append_memory(ProfilePhase::SsbufLoad, 200, 100);
+    EXPECT_EQ(trace.storage_words, 0);
+    EXPECT_EQ(trace.dropped, 1);
+    trace.dropped = UINT32_MAX;
+    trace.append_memory(ProfilePhase::SsbufLoad, 200, 100);
+    EXPECT_EQ(trace.dropped, UINT32_MAX);
+}
+
+TEST(PercounterScalarStorage, CompactWordsPreserveTicksAndUseFullWidthForLongIntervals) {
+    std::array<uint64_t, 24> words{};
+    PercounterScalarTrace trace{};
+    trace.records = words.data();
+    trace.window_start = 1000;
+    trace.depth = 2;
+    trace.append_memory(ProfilePhase::SsbufLoad, 1007, 1012);
+    EXPECT_EQ(words[0], UINT64_C(0x031c000500000007));
+    trace.append_memory(ProfilePhase::SsbufLoad, 2000, 2000 + uint64_t{UINT16_MAX} + 1);
+    trace.append_memory(ProfilePhase::SsbufLoad, uint64_t{UINT32_MAX} + 1001, uint64_t{UINT32_MAX} + 1002);
+    trace.depth = 127;
+    trace.append_memory(ProfilePhase::SsbufLoad, 3000, 3010);
+    EXPECT_EQ(trace.storage_words, 16);
+    uint32_t cursor = 0;
+    SchedulerScalarRecord record{};
+    ASSERT_TRUE(percounter_decode_scalar_storage(words.data(), trace.storage_words, cursor, 1000, record));
+    EXPECT_EQ(record.start_time, 1007);
+    EXPECT_EQ(record.end_time, 1012);
+    EXPECT_EQ(record.kind >> 16, 3);
+    ASSERT_TRUE(percounter_decode_scalar_storage(words.data(), trace.storage_words, cursor, 1000, record));
+    EXPECT_EQ(record.end_time, 2000 + uint64_t{UINT16_MAX} + 1);
+    ASSERT_TRUE(percounter_decode_scalar_storage(words.data(), trace.storage_words, cursor, 1000, record));
+    EXPECT_EQ(record.start_time, uint64_t{UINT32_MAX} + 1001);
+    ASSERT_TRUE(percounter_decode_scalar_storage(words.data(), trace.storage_words, cursor, 1000, record));
+    EXPECT_EQ(record.kind >> 16, 128);
+    EXPECT_EQ(cursor, trace.storage_words);
+}
+
+TEST(PercounterScalarStorage, RejectsPartialExtendedRowsAndOverflowingAbsoluteTime) {
+    const std::array<uint64_t, 4> partial{PERCOUNTER_SCALAR_EXTENDED, 1, 2, 3};
+    uint32_t cursor = 0;
+    SchedulerScalarRecord record{};
+    EXPECT_FALSE(percounter_decode_scalar_storage(partial.data(), partial.size(), cursor, 0, record));
+    const uint64_t offset = 1;
+    cursor = 0;
+    EXPECT_FALSE(percounter_decode_scalar_storage(&offset, 1, cursor, UINT64_MAX, record));
+    const uint64_t duration = UINT64_C(1) << 32;
+    cursor = 0;
+    EXPECT_FALSE(percounter_decode_scalar_storage(&duration, 1, cursor, UINT64_MAX, record));
+}
 
 alignas(64) std::array<uint8_t, 4096> registers{};
 std::function<void(int64_t *)> execute;
@@ -53,6 +163,10 @@ struct Fixture {
     PercounterSyncQueue queue{};
     std::array<LaneConfig, 6> cfg{};
     std::array<PercounterLaneState, 6> state{};
+    std::array<pto2::resident::AsyncGroupData, 6> async_groups{};
+    std::array<std::array<DeferredCompletionEntry, PERCOUNTER_ASYNC_CAPACITY>, 6> async_entries{};
+    std::array<PercounterAsyncCompletion, 16> async_completions{};
+    std::array<uint64_t, 3> parked_next{};
 
     Fixture() {
         registers.fill(0);
@@ -75,6 +189,12 @@ struct Fixture {
             c.callable_addresses = callable.data();
             c.callable_count = callable.size();
             c.payloads = payloads[i].data();
+            c.async_group = &async_groups[i];
+            c.async_entries = async_entries[i].data();
+            c.async_completions = async_completions.data();
+            c.async_completion_capacity = async_completions.size();
+            c.parked_next = parked_next.data();
+            c.async_group->capacity = PERCOUNTER_ASYNC_CAPACITY;
             for (auto &p : payloads[i]) {
                 p.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&p.local_context);
                 p.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&p.global_context);
@@ -94,6 +214,11 @@ struct Fixture {
             c.sync_queue = &queue;
             c.sync_pending = sync_pending.data();
         }
+    }
+
+    bool run(int lane, const PercounterTask &task, DispatchPayload *payload) {
+        bool deferred = false;
+        return percounter_run_prepared(cfg[lane], &state[lane], task, payload, &deferred);
     }
 
     void set_task(int task, uint32_t mask, int blocks) {
@@ -122,6 +247,27 @@ struct Fixture {
         return served;
     }
 };
+
+TEST(PercounterPayload, PreparationBindsCurrentImageWithoutReplacingContextPointers) {
+    Fixture f;
+    auto task = f.resolve(0);
+    auto &payload = f.payloads[0][0];
+    const auto local = payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX];
+    const auto global = payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX];
+    ASSERT_TRUE(percounter_prepare_subtask(f.cfg[0], task, 0, 1, 3, 5, &payload));
+    EXPECT_EQ(payload.function_bin_addr, reinterpret_cast<uint64_t>(&kernel));
+    EXPECT_EQ(payload.args[0], f.scalars[0]);
+    EXPECT_EQ(payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX], local);
+    EXPECT_EQ(payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX], global);
+    EXPECT_EQ(payload.local_context.block_idx, 3);
+    EXPECT_EQ(payload.local_context.block_num, 5);
+    task.graph.view_version = 0;
+    EXPECT_FALSE(percounter_prepare_subtask(f.cfg[0], task, 0, 1, 0, 1, &payload));
+    task = f.resolve(0);
+    f.storage[0].payload.scalar_count = 1;
+    f.storage[0].payload.scalars.set(nullptr);
+    EXPECT_FALSE(percounter_prepare_subtask(f.cfg[0], task, 0, 1, 0, 1, &payload));
+}
 
 TEST(PercounterPayload, OrdinaryCandidatePreparedBeforeProducerCompletes) {
     Fixture f;
@@ -160,7 +306,7 @@ TEST(PercounterPayload, MixNonCoordinatorsPrepareWhileDependencyIsBlocked) {
     // An ordinary task executes in another slot while MIX still waits.
     auto ordinary = f.resolve(1);
     ASSERT_TRUE(percounter_prepare_task(f.cfg[2], ordinary, 0, 1, &f.payloads[2][0]));
-    ASSERT_TRUE(percounter_run_prepared(f.cfg[2], ordinary, &f.payloads[2][0]));
+    ASSERT_TRUE(f.run(2, ordinary, &f.payloads[2][0]));
     EXPECT_EQ(f.payloads[2][PERCOUNTER_MIX_PAYLOAD_SLOT].args[0], 11U);
     EXPECT_EQ(f.producer, 0U);
     EXPECT_EQ(f.signals[0].active_mask, 0U);
@@ -323,10 +469,12 @@ TEST(PercounterPayload, PredicateIsEvaluatedAtExecution) {
     };
     value = 1;
     f.producer = 1;
-    ASSERT_TRUE(percounter_run_prepared(f.cfg[0], task, &f.payloads[0][0]));
+    ASSERT_TRUE(f.run(0, task, &f.payloads[0][0]));
+    percounter_commit_task_timing(f.cfg[0]);
     EXPECT_EQ(calls, 1);
     value = 0;
-    ASSERT_TRUE(percounter_run_prepared(f.cfg[0], task, &f.payloads[0][0]));
+    ASSERT_TRUE(f.run(0, task, &f.payloads[0][0]));
+    percounter_commit_task_timing(f.cfg[0]);
     EXPECT_EQ(calls, 1);
 }
 
@@ -339,6 +487,157 @@ TEST(PercounterPayload, LayoutReservesEveryLaneSlot) {
         SCHEDULER_WORKER_CAPACITY * PERCOUNTER_PAYLOAD_SLOT_COUNT * sizeof(DispatchPayload)
     );
 }
+
+TEST(PercounterPayload, TaskTimingRecordsIdentityAndBatchesCommittedCount) {
+    Fixture f;
+    auto buffer = std::make_unique<ChipSwimlaneAicoreTaskBuffer>();
+    ChipSwimlaneActiveHead head{};
+    head.current_buf_ptr = reinterpret_cast<uint64_t>(buffer.get());
+    ChipSwimlaneAicoreLocalState profile{};
+    f.cfg[0].profile_head = &head;
+    f.cfg[0].profile = &profile;
+    auto task = f.resolve(0);
+    ASSERT_TRUE(percounter_prepare_task(f.cfg[0], task, 0, 1, &f.payloads[0][0]));
+    int calls = 0;
+    execute = [&](int64_t *) {
+        ++calls;
+    };
+    for (uint32_t i = 0; i < 3; ++i) {
+        ASSERT_TRUE(f.run(0, task, &f.payloads[0][0]));
+        percounter_commit_task_timing(f.cfg[0]);
+    }
+    EXPECT_EQ(calls, 3);
+    EXPECT_EQ(buffer->count, 0U);
+    percounter_flush_stream_records(&profile);
+    EXPECT_EQ(buffer->count, 3U);
+    EXPECT_EQ(head.total_record_count, 0U);
+    for (uint32_t i = 0; i < 3; ++i) {
+        const auto &record = buffer->records[i];
+        EXPECT_EQ(TaskId::to_uint64(record.task_token), TaskId::to_uint64(TaskId::make_global(0)));
+        EXPECT_EQ(record.reg_task_id, i + 1);
+        EXPECT_GT(record.start_time, 0U);
+        EXPECT_GE(record.end_time, record.start_time);
+    }
+}
+
+TEST(PercounterPayload, TaskTimingUsesGraphBodyIdentityAndResetsEachRun) {
+    Fixture f;
+    auto buffer = std::make_unique<ChipSwimlaneAicoreTaskBuffer>();
+    ChipSwimlaneActiveHead head{};
+    head.current_buf_ptr = reinterpret_cast<uint64_t>(buffer.get());
+    auto task = f.resolve(0);
+    task.shell = 7;
+    task.local = 2;
+    for (int run = 0; run < 2; ++run) {
+        buffer->count = 0;
+        ChipSwimlaneAicoreLocalState profile{};
+        f.cfg[0].profile_head = &head;
+        f.cfg[0].profile = &profile;
+        ASSERT_TRUE(percounter_prepare_task(f.cfg[0], task, 0, 1, &f.payloads[0][0]));
+        ASSERT_TRUE(f.run(0, task, &f.payloads[0][0]));
+        percounter_commit_task_timing(f.cfg[0]);
+        percounter_flush_stream_records(&profile);
+        EXPECT_EQ(buffer->count, 1U);
+        EXPECT_EQ(buffer->records[0].reg_task_id, 1U);
+        EXPECT_EQ(TaskId::to_uint64(buffer->records[0].task_token), TaskId::to_uint64(TaskId::make_sub_task(7, 2)));
+    }
+}
+
+TEST(PercounterPayload, FullTimingBufferIsPublishedOnceAndReplacementKeepsIdentity) {
+    Fixture f;
+    auto first = std::make_unique<ChipSwimlaneAicoreTaskBuffer>();
+    auto second = std::make_unique<ChipSwimlaneAicoreTaskBuffer>();
+    ChipSwimlaneActiveHead head{};
+    head.current_buf_ptr = reinterpret_cast<uint64_t>(first.get());
+    ChipSwimlaneAicoreLocalState profile{};
+    f.cfg[0].profile_head = &head;
+    f.cfg[0].profile = &profile;
+    auto task = f.resolve(0);
+    ASSERT_TRUE(percounter_prepare_task(f.cfg[0], task, 0, 1, &f.payloads[0][0]));
+    for (int i = 0; i < PLATFORM_AICORE_BUFFER_SIZE; ++i) {
+        EXPECT_EQ(first->count, 0U);
+        ASSERT_TRUE(f.run(0, task, &f.payloads[0][0]));
+        percounter_commit_task_timing(f.cfg[0]);
+    }
+    EXPECT_EQ(first->count, PLATFORM_AICORE_BUFFER_SIZE);
+
+    // Model rotation and Host reuse of the published buffer. Lane exit must
+    // not write its stale cached pointer after ownership was transferred.
+    head.current_buf_ptr = reinterpret_cast<uint64_t>(second.get());
+    head.current_buf_seq = 1;
+    first->count = 17;
+    percounter_flush_stream_records(&profile);
+    EXPECT_EQ(first->count, 17U);
+
+    ASSERT_TRUE(f.run(0, task, &f.payloads[0][0]));
+    percounter_commit_task_timing(f.cfg[0]);
+    EXPECT_EQ(second->count, 0U);
+    EXPECT_EQ(second->records[0].reg_task_id, PLATFORM_AICORE_BUFFER_SIZE + 1U);
+    EXPECT_EQ(TaskId::to_uint64(second->records[0].task_token), TaskId::to_uint64(TaskId::make_global(0)));
+    percounter_flush_stream_records(&profile);
+    EXPECT_EQ(second->count, 1U);
+    EXPECT_EQ(first->count, 17U);
+}
+TEST(PercounterPayload, TerminalDeferralKeepsLaneLiveUntilConditionHolds) {
+    Fixture f;
+    int32_t signal = 0;
+    f.fanin[0].count = 0;
+    f.counters[0].value = percounter_counter_preset(1);
+    auto task = f.resolve(0);
+    ASSERT_TRUE(percounter_prepare_task(f.cfg[0], task, 0, 1, &f.payloads[0][0]));
+    execute = [&](int64_t *) {
+        f.async_entries[0][0] = {
+            reinterpret_cast<uint64_t>(&signal), 0, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0
+        };
+        f.async_groups[0].count = 1;
+    };
+    bool deferred = false;
+    ASSERT_TRUE(percounter_run_prepared(f.cfg[0], &f.state[0], task, &f.payloads[0][0], &deferred));
+    ASSERT_TRUE(deferred);
+    uint64_t progress = 0;
+    EXPECT_FALSE(percounter_lane_may_exit(f.cfg[0], &f.state[0], &progress));
+    bool settled = false;
+    ASSERT_TRUE(percounter_async_tick(f.cfg[0], &f.state[0], &settled));
+    EXPECT_FALSE(settled);
+    EXPECT_FALSE(percounter_counter_published(f.counters[0].value));
+    signal = 1;
+    ASSERT_TRUE(percounter_async_tick(f.cfg[0], &f.state[0], &settled));
+    EXPECT_TRUE(settled);
+    EXPECT_TRUE(percounter_counter_published(f.counters[0].value));
+    EXPECT_TRUE(percounter_lane_may_exit(f.cfg[0], &f.state[0], &progress));
+}
+
+TEST(PercounterPayload, IndependentConditionsSettleOutOfRegistrationOrder) {
+    Fixture f;
+    std::array<int32_t, 3> signals{};
+    int current = 0;
+    execute = [&](int64_t *) {
+        f.async_entries[0][0] = {
+            reinterpret_cast<uint64_t>(&signals[current]), 0, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0
+        };
+        f.async_groups[0].count = 1;
+    };
+    for (; current < 3; ++current) {
+        f.fanin[current].count = 0;
+        f.counters[current].value = percounter_counter_preset(1);
+        auto task = f.resolve(current);
+        ASSERT_TRUE(percounter_prepare_task(f.cfg[0], task, 0, 1, &f.payloads[0][0]));
+        ASSERT_TRUE(f.run(0, task, &f.payloads[0][0]));
+    }
+    signals[1] = 1;
+    bool settled = false;
+    ASSERT_TRUE(percounter_async_tick(f.cfg[0], &f.state[0], &settled));
+    ASSERT_TRUE(settled);
+    EXPECT_FALSE(percounter_counter_published(f.counters[0].value));
+    EXPECT_TRUE(percounter_counter_published(f.counters[1].value));
+    EXPECT_FALSE(percounter_counter_published(f.counters[2].value));
+    signals[0] = signals[2] = 1;
+    ASSERT_TRUE(percounter_async_tick(f.cfg[0], &f.state[0], &settled));
+    EXPECT_EQ(f.state[0].async_head, 0U);
+    EXPECT_EQ(f.control.async_registered, 3U);
+    EXPECT_EQ(f.control.async_settled, 3U);
+}
+
 }  // namespace
 
 volatile uint8_t *sim_get_reg_base() {
@@ -346,3 +645,124 @@ volatile uint8_t *sim_get_reg_base() {
     return registers.data();
 }
 uint32_t sim_get_physical_core_id() { return 0; }
+
+TEST(PercounterPayload, ProfilingLevelsReserveOnlyTheirRecordTails) {
+    const uint64_t counts[2]{16, 0};
+    std::array<PercounterLayout, 5> layouts{};
+    for (uint32_t level = 0; level < layouts.size(); ++level)
+        ASSERT_TRUE(plan_layout(1, 16, 0, counts, &layouts[level], 0, 0, {}, 0, level));
+    EXPECT_EQ(layouts[0].total_size, layouts[1].total_size);
+    EXPECT_EQ(layouts[1].profile_buffers_offset, 0);
+    EXPECT_NE(layouts[2].profile_buffers_offset, 0);
+    EXPECT_NE(layouts[2].task_records_offset, 0);
+    EXPECT_EQ(layouts[2].scalar_records_offset, 0);
+    EXPECT_EQ(layouts[3].upload_size, layouts[2].upload_size);
+    EXPECT_EQ(layouts[3].total_size, layouts[4].total_size);
+    EXPECT_GT(layouts[3].scalar_records_offset, layouts[3].upload_size);
+    EXPECT_EQ(
+        layouts[3].total_size - layouts[3].scalar_records_offset,
+        SCHEDULER_WORKER_CAPACITY * SCHEDULER_SCALAR_RECORD_CAPACITY * sizeof(SchedulerScalarRecord)
+    );
+}
+
+TEST(PercounterPayload, TaskTimingPartitionsOwnWholeCacheLines) {
+    PercounterLayout layout{};
+    const uint64_t counts[2]{3, 0};
+    ASSERT_TRUE(plan_layout(1, 3, 0, counts, &layout, 0, 0, {}, 0, 2));
+    std::vector<uint8_t> storage(layout.upload_size + 127);
+    const auto address = (reinterpret_cast<uintptr_t>(storage.data()) + 127) & ~uintptr_t{127};
+    auto *base = reinterpret_cast<void *>(address);
+    TaskInput task{};
+    task.block_num = 3;
+    task.subtask_count = 1;
+    ASSERT_TRUE(build_tables(&task, 1, layout, base, address, {}));
+    const auto *buffers = region_at<PercounterProfileBuffer>(base, layout.profile_buffers_offset);
+    for (uint32_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
+        EXPECT_EQ(buffers[worker].task_records_offset % 64, 0) << worker;
+        if (worker + 1 < SCHEDULER_WORKER_CAPACITY)
+            EXPECT_LE(
+                buffers[worker].task_records_offset + 3 * sizeof(PercounterTaskTiming),
+                buffers[worker + 1].task_records_offset
+            );
+    }
+}
+
+TEST(PercounterPayload, DeferredTimingDoesNotNeedStreamingBuffers) {
+    Fixture f;
+    f.cfg[0].order_count = 1;
+    f.fanin[0].count = 0;
+    PercounterProfileBuffer header{};
+    header.task_capacity = 1;
+    std::array<PercounterTaskTiming, 1> records{};
+    uint32_t count = 0, dropped = 0;
+    f.cfg[0].profile_buffer = &header;
+    f.cfg[0].task_records = records.data();
+    f.cfg[0].profile_task_count = &count;
+    f.cfg[0].task_dropped = &dropped;
+    int calls = 0;
+    execute = [&](int64_t *) {
+        ++calls;
+        EXPECT_EQ(count, 0U);
+    };
+    percounter_lane_loop(f.cfg[0], budget);
+    EXPECT_EQ(calls, 1);
+    EXPECT_TRUE(percounter_counter_published(f.counters[0].value));
+    EXPECT_EQ(f.control.lane_error, 0U);
+    EXPECT_EQ(count, 1U);
+    EXPECT_EQ(dropped, 0U);
+    EXPECT_GT(records[0].dispatch, 0U);
+    EXPECT_GE(records[0].finish, records[0].dispatch);
+}
+
+TEST(PercounterPayload, ExhaustedTimingStorageDoesNotBlockCompletion) {
+    Fixture f;
+    f.cfg[0].order_count = 1;
+    f.fanin[0].count = 0;
+    PercounterProfileBuffer header{};
+    uint32_t count = 0, dropped = 0;
+    f.cfg[0].profile_buffer = &header;
+    f.cfg[0].profile_task_count = &count;
+    f.cfg[0].task_dropped = &dropped;
+    int calls = 0;
+    execute = [&](int64_t *) {
+        ++calls;
+    };
+    percounter_lane_loop(f.cfg[0], budget);
+    EXPECT_EQ(calls, 1);
+    EXPECT_TRUE(percounter_counter_published(f.counters[0].value));
+    EXPECT_EQ(f.control.lane_error, 0U);
+    EXPECT_EQ(count, 0U);
+    EXPECT_EQ(dropped, 1U);
+}
+
+TEST(PercounterPayload, TimingCommitFollowsCompletionAndKeepsCapturedIdentity) {
+    Fixture f;
+    PercounterProfileBuffer header{};
+    header.task_capacity = 1;
+    std::array<PercounterTaskTiming, 1> records{};
+    uint32_t count = 0, dropped = 0;
+    f.cfg[0].profile_buffer = &header;
+    f.cfg[0].task_records = records.data();
+    f.cfg[0].profile_task_count = &count;
+    f.cfg[0].task_dropped = &dropped;
+    auto task = f.resolve(0);
+    task.shell = 7;
+    task.local = 2;
+    auto *payload = &f.payloads[0][0];
+    ASSERT_TRUE(percounter_prepare_task(f.cfg[0], task, 0, 1, payload));
+    ASSERT_TRUE(f.run(0, task, payload));
+    EXPECT_EQ(count, 0U);
+    EXPECT_EQ(records[0].dispatch, 0U);
+    percounter_publish_completion(f.cfg[0], task, 1);
+    EXPECT_TRUE(percounter_counter_published(f.counters[0].value));
+    EXPECT_EQ(count, 0U);
+    task.id = 99;
+    task.shell = -1;
+    percounter_commit_task_timing(f.cfg[0]);
+    EXPECT_EQ(count, 1U);
+    EXPECT_EQ(TaskId::to_uint64(records[0].task_token), TaskId::to_uint64(TaskId::make_sub_task(7, 2)));
+    EXPECT_LE(records[0].dispatch, records[0].start);
+    EXPECT_LE(records[0].start, records[0].finish);
+    percounter_commit_task_timing(f.cfg[0]);
+    EXPECT_EQ(count, 1U);
+}

@@ -658,6 +658,19 @@ def test_rounds_table_omits_tmr_only_columns_when_only_host_and_device_exist():
     assert "Avg Device: 22.0 us [2/2]" in rendered
 
 
+def test_rounds_table_reports_aicore_wall_separately_from_device_wall():
+    lines = [
+        _record(1, 1, "chip.run", dur=900_000)
+        + _record(1, 1, "chip.run.runner_run.device_wall", "clk=dev", depth=2, dur=750_000)
+        + _record(1, 1, "chip.run.runner_run.aicore_wall", "clk=dev", depth=2, dur=480_000)
+    ]
+    buckets = bucket_by_hid(group_invocations(parse_spans(lines)))
+    output = StringIO()
+    print_rounds_table(buckets, stream=output)
+    assert "Avg AICore: 480.0 us" in output.getvalue()
+    assert "Avg Device: 750.0 us [1/1]" in output.getvalue()
+
+
 def _run_records(*, run_epoch, prepare, device, release, run_id=0, dispatch_id=0, slot_id=0, pid=7, inv=None):
     """One phased native run's spans, as the `chip.run` tree carries them.
 

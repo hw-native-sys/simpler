@@ -370,7 +370,7 @@ TEST(BufferAbi, VmmShareableRejectsMalformedBody) {
     EXPECT_THROW(validate_buffer_descriptor(negative_device), std::invalid_argument);
 
     BufferDescriptor out_of_range = make_vmm_shareable_descriptor();
-    out_of_range.backend_kind = 7;
+    out_of_range.backend_kind = 8;
     EXPECT_THROW(validate_buffer_descriptor(out_of_range), std::invalid_argument);
 }
 
@@ -543,3 +543,30 @@ TEST(BufferAbi, DecodedIdentityIgnoresWirePadding) {
 }
 
 }  // namespace
+
+TEST(BufferAbi, SharedHeapSliceRejectsInvalidLocatorAndOverflow) {
+    auto descriptor = make_tensor().buffer;
+    descriptor.backend_kind = static_cast<uint8_t>(BackendKind::SHARED_FD_SLICE);
+    descriptor.body_len = 16;
+    std::memset(descriptor.body, 0, DESC_MAX_BYTES);
+    const uint32_t pid = 123;
+    const uint32_t fd = 7;
+    const uint64_t offset = 1024;
+    std::memcpy(descriptor.body, &pid, 4);
+    std::memcpy(descriptor.body + 4, &fd, 4);
+    std::memcpy(descriptor.body + 8, &offset, 8);
+    EXPECT_NO_THROW(validate_buffer_descriptor(descriptor));
+    auto invalid = descriptor;
+    invalid.body_len = 8;
+    EXPECT_THROW(validate_buffer_descriptor(invalid), std::invalid_argument);
+    invalid = descriptor;
+    std::memset(invalid.body, 0, 4);
+    EXPECT_THROW(validate_buffer_descriptor(invalid), std::invalid_argument);
+    invalid = descriptor;
+    std::memset(invalid.body + 4, 0, 4);
+    EXPECT_THROW(validate_buffer_descriptor(invalid), std::invalid_argument);
+    invalid = descriptor;
+    const uint64_t overflow = UINT64_MAX;
+    std::memcpy(invalid.body + 8, &overflow, 8);
+    EXPECT_THROW(validate_buffer_descriptor(invalid), std::invalid_argument);
+}

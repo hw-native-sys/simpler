@@ -37,6 +37,11 @@ foreach(arch a2a3 a5)
     )
     target_include_directories(${arch}_hbg_objs PUBLIC ${_hbg_includes})
     target_link_libraries(${arch}_hbg_objs PUBLIC ${arch}_ut_support)
+    if(arch STREQUAL "a2a3")
+        add_library(a2a3_hbg_full_arena STATIC ${SIMPLER_SRC}/common/host_build_graph/full_arena/runtime_init.cpp)
+        target_include_directories(a2a3_hbg_full_arena PRIVATE ${_hbg_includes})
+        target_link_libraries(${arch}_hbg_objs PUBLIC a2a3_hbg_full_arena)
+    endif()
 
     add_library(${arch}_hbg_orch_objs OBJECT
         ${HBG_ORCH_SHARED_SOURCES}
@@ -130,15 +135,10 @@ endforeach()
 # These drive the real orchestrator, so they link the orchestrator object
 # library. That is the whole of what they have beyond a plain case.
 hbg_cases(
-    test_hbg_async_wait_init.cpp
     test_hbg_graph_submit_failure.cpp
     test_hbg_graph_definition_arena.cpp
-    test_hbg_ed_qualification.cpp
     test_hbg_graph_ed_qualification.cpp
     test_hbg_graph_recording_bounds.cpp
-    # Calls the real ready_queue_init_data_from_layout. The sizing TU it needs
-    # comes with the orchestrator library, which globs host/.
-    test_hbg_ready_queue_seed.cpp
     # Calls the real calculate_output_layout, which comes with the orchestrator
     # library (globs host/).
     test_hbg_output_layout.cpp
@@ -242,6 +242,21 @@ hbg_case(test_hbg_tensor_access.cpp
     SOURCES ${HBG_HOST_DIR}/host_tensor_access.cpp)
 
 hbg_case(test_hbg_slot_claim.cpp ORCH
+    SOURCES ${SIMPLER_SRC}/common/host_build_graph/device/graph_execution.cpp)
+
+# These protocols belong to the active A2A3 AICPU executor.
+hbg_cases(
+    test_hbg_async_wait_init.cpp
+    test_hbg_ed_qualification.cpp
+    test_hbg_ready_queue_seed.cpp
+    test_hbg_mailbox_init.cpp
+    ARCHS a2a3 ORCH)
+
+hbg_cases(
+    test_hbg_aicpu_graph_activation.cpp
+    test_hbg_aicpu_graph_wake.cpp
+    test_hbg_aicpu_graph_scheduling.cpp
+    ARCHS a2a3 ORCH
     SOURCES ${SIMPLER_SRC}/common/host_build_graph/device/graph_execution.cpp)
 
 # Everything else here is a case of this runtime with nothing beyond the

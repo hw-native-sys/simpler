@@ -79,7 +79,7 @@ def test_complete_feature_matrix_and_parallel_dispatch(execution):
     assert len(content["coverage"]["required_nodeids"]) == 6
     report = json.loads(plan.with_suffix(".coverage.json").read_text())
     assert report["groups"]["kernel/host_build_graph/eager"]["passed"] == 2
-    assert report["not_delivered"] == ["kernel/tensormap_and_ringbuffer/capture_replay"]
+    assert not report["not_delivered"]
 
 
 def test_inherited_scene_declarations_and_explicit_method_override(execution):
@@ -265,7 +265,7 @@ def test_a5_requires_native_hbg_capture(execution):
     report = json.loads(plan.with_suffix(".coverage.json").read_text())
     assert "kernel/host_build_graph/capture_replay" in json.loads(plan.read_text())["coverage"]["required_groups"]
     assert report["groups"]["kernel/host_build_graph/capture_replay"]["passed"] == 1
-    assert report["not_delivered"] == ["kernel/tensormap_and_ringbuffer/capture_replay"]
+    assert not report["not_delivered"]
 
 
 def test_manual_only_does_not_demand_nonmanual_groups(execution):
@@ -366,7 +366,7 @@ def test_framework_cannot_declare_skip_exception(tmp_path):
     assert "framework skip exceptions are forbidden" in result.stderr
 
 
-@pytest.mark.parametrize("mutation", ["program_capture", "runtime_conflict", "unsupported_capture"])
+@pytest.mark.parametrize("mutation", ["program_capture", "runtime_conflict", "execution_mode_conflict"])
 def test_invalid_feature_combinations_fail_before_execution(execution, mutation):
     source = SOURCE
     if mutation == "program_capture":
@@ -381,8 +381,9 @@ def test_invalid_feature_combinations_fail_before_execution(execution, mutation)
         source += """
 @pytest.mark.runtime_product("kernel")
 @pytest.mark.runtime("tensormap_and_ringbuffer")
+@pytest.mark.execution_mode("eager")
 @pytest.mark.execution_mode("capture_replay")
-def test_undelivered():
+def test_conflicting_modes():
     raise AssertionError("must not execute")
 """
     result, _, _ = execution(source, "--verify-feature-coverage")
@@ -436,3 +437,32 @@ def test_optional_setup_skip_and_poison_retry_remain_distinct(execution):
         "passed": 2,
         "skipped": 0,
     }
+
+
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+@pytest.mark.parametrize("selection", ["absent", "selected", "deselected"])
+def test_native_tmr_capture_is_optional(execution, platform, selection):
+    source = SOURCE
+    options = ["--verify-feature-coverage", "--platform", platform]
+    if selection != "absent":
+        source += """
+@pytest.mark.runtime_product("kernel")
+@pytest.mark.runtime("tensormap_and_ringbuffer")
+@pytest.mark.execution_mode("capture_replay")
+def test_optional_tmr_capture():
+    pass
+"""
+    if selection == "deselected":
+        options += ["-k", "not optional_tmr_capture"]
+    result, plan, _ = execution(source, *options, require_capture=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    content = json.loads(plan.read_text())
+    capture = "kernel/tensormap_and_ringbuffer/capture_replay"
+    assert capture not in content["coverage"]["required_groups"]
+    assert "kernel/host_build_graph/capture_replay" in content["coverage"]["required_groups"]
+    report = json.loads(plan.with_suffix(".coverage.json").read_text())
+    assert capture not in report["not_delivered"]
+    if selection == "selected":
+        assert report["groups"][capture]["passed"] == 1
+    else:
+        assert capture not in report["groups"]

@@ -48,6 +48,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <thread>
 
 #include "callable.h"
 #include "chip_callable_layout.h"
@@ -855,3 +856,24 @@ TEST(SimIdentity, FailedUpdatesPreserveIdentityAndAllowRetry) {
     pto_cpu_sim_release_device(971);
 }
 #endif
+
+TEST(SimCancellation, BindingIsThreadLocalAndClearedBeforeReuse) {
+    constexpr uint32_t stop = 0x7ffffff0;
+    uint32_t running = 0;
+    uint32_t cancelled = stop;
+    ASSERT_EQ(pto_cpu_sim_bind_cancel_register(&running), 0);
+    EXPECT_FALSE(pto_cpu_sim_cancel_requested(stop));
+    bool other_ok = false;
+    std::thread other([&]() {
+        other_ok = !pto_cpu_sim_cancel_requested(stop) && pto_cpu_sim_bind_cancel_register(&cancelled) == 0 &&
+                   pto_cpu_sim_cancel_requested(stop) && pto_cpu_sim_bind_cancel_register(nullptr) == 0 &&
+                   !pto_cpu_sim_cancel_requested(stop);
+    });
+    other.join();
+    EXPECT_TRUE(other_ok);
+    EXPECT_FALSE(pto_cpu_sim_cancel_requested(stop));
+    ASSERT_EQ(pto_cpu_sim_bind_cancel_register(&cancelled), 0);
+    EXPECT_TRUE(pto_cpu_sim_cancel_requested(stop));
+    ASSERT_EQ(pto_cpu_sim_bind_cancel_register(nullptr), 0);
+    EXPECT_FALSE(pto_cpu_sim_cancel_requested(stop));
+}

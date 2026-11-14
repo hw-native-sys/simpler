@@ -82,7 +82,7 @@ Qwen 性能接近目标后再执行完整性能回归；已有局部退化如实
 | A5 `runtime/scheduler/scheduler_graph_binding.h`，新增 | AICore POD Tensor/scalar/predicate 重定位及精确范围发布 |
 | A5 `runtime/scheduler/scheduler_graph_control.h`，新增 | 无资源 control inbox、完整同步后继传播、DONE 与汇总 |
 | A5 `runtime/scheduler/scheduler_ready.h` | bootstrap/route/resolve 的 fanin 读取统一，控制与 kernel 分流，direct refill 保持 kernel 专用 |
-| A5 `runtime/scheduler/scheduler_admission.h` | Ready唯一owner保留本地pending，提交时发布ADMITTED；成员首次观察bootstrap已发布的参数 |
+| A5 `runtime/scheduler/scheduler_admission.h` | Ready唯一owner保留本地pending，提交时发布ADMITTED；成员首次观察Host已发布的参数 |
 | A5 `runtime/scheduler/scheduler_types.h`、layout 创建处 | node/instance/template/header wire、counts、inbox、CHECK 进度与 checked size |
 | A5 `aicore/aicore_executor.cpp`、`resident_scheduler.h` | 启动握手、变体选择与窄入口声明 |
 | A5 `aicore/resident_scheduler_impl.h` 及四个 `resident_*.cpp` | bootstrap、每轮调度/控制服务、完成 flush 与退出；普通/native × profile 开关显式实例化 |
@@ -149,7 +149,7 @@ ENTER/EXIT 没有 kernel trace，用控制节点事件表达；同一 shell 的�
 
 native protocol JSON 的 schema 与明确的 node map 共同定义映射语义。
 `simpler_setup/tools/hbg/native_protocol.py`、export UT 和 Python oracle UT 与生产者使用同一当前格式。
-当前实现导出 `hbg-native-protocol-v11`，保留领取结束证明、独立关闭标记和按资源选取的 MIX 成员，
+当前实现导出 `hbg-native-protocol-v13`，保留领取结束证明、独立关闭标记和按资源选取的 MIX 成员，
 以及按资源类型累计 block 前缀的 ordinary 有界循环成员规则，
 并包含两部分原生 Graph 来源：
 

@@ -19,12 +19,14 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <vector>
 
 #include "scheduler/wire_types.h"
+#include "scheduler/profiling_types.h"
 #include "scheduler/scheduler_layout.h"
 #include "scheduler/scheduler_types.h"
 
@@ -46,6 +48,16 @@ struct PercounterLayout {
     uint64_t fanin_addr_offset;
     uint64_t counters_offset;
     uint64_t dispatch_payloads_offset;
+    // One deferred-completion record per lane and its entry slots, indexed the
+    // way the payloads are. Reserved for every graph, because whether a kernel
+    // registers a condition is not visible at bind -- the record is what lets
+    // the runtime see that one did. Placed past `upload_size`, so the bytes
+    // cost no DMA and a lane writes its own record's header before its loop.
+    uint64_t async_groups_offset;
+    uint64_t async_entries_offset;
+    uint64_t async_completions_offset;
+    uint64_t async_completion_capacity;
+    uint64_t parked_next_offset[PERCOUNTER_CORE_TYPE_COUNT];
     // The MIX list, its tickets, and the per-cluster word saying the cluster's
     // SSBUF line has been cleared. MIX is not a third core type -- a lane is AIC
     // or AIV, never MIX -- so it keeps its own offsets. All four are zero on a
@@ -74,6 +86,12 @@ struct PercounterLayout {
     // last segment, and a body task's counter is written by the AICPU before
     // any lane can reach it, so the body counters are left out.
     uint64_t upload_size;
+    uint64_t profile_buffers_offset;
+    uint64_t task_records_offset;
+    uint64_t task_record_stride;
+    uint64_t scalar_records_offset;
+    uint32_t task_record_capacity;
+    uint32_t profiling_level;
 };
 
 /** The Graph part of the region, sized by the caller from its templates. */
@@ -155,7 +173,8 @@ struct ExternalAddresses {
 inline bool plan_layout(
     uint64_t task_count, uint64_t block_total, uint64_t edge_count,
     const uint64_t order_count[PERCOUNTER_CORE_TYPE_COUNT], PercounterLayout *layout, uint64_t mix_order_count = 0,
-    uint64_t sync_cohort_count = 0, const GraphLayoutInput &graph = {}
+    uint64_t sync_cohort_count = 0, const GraphLayoutInput &graph = {}, uint64_t execution_count = 0,
+    uint32_t profiling_level = 0
 ) {
     if (layout == nullptr || order_count == nullptr) return false;
     const uint64_t table_task_count = task_count;
@@ -175,6 +194,8 @@ inline bool plan_layout(
     if (placed > block_total) return false;
 
     PercounterLayout next{};
+    next.profiling_level = profiling_level;
+    next.task_record_capacity = static_cast<uint32_t>(std::min(block_total, uint64_t{65536}));
     next.task_count = task_count;
     next.edge_count = edge_count;
     for (uint32_t t = 0; t < PERCOUNTER_CORE_TYPE_COUNT; ++t)
@@ -185,6 +206,7 @@ inline bool plan_layout(
     next.graph_invocation_count = graph.invocation_count;
     next.graph_templates_bytes = graph.templates_bytes;
     next.entry_count = placed;
+    next.async_completion_capacity = execution_count;
 
     uint64_t cursor = 0;
     uint64_t bytes = 0;
@@ -219,7 +241,19 @@ inline bool plan_layout(
             static_cast<uint64_t>(SCHEDULER_WORKER_CAPACITY) * PERCOUNTER_PAYLOAD_SLOT_COUNT, DispatchPayload,
             dispatch_payloads_offset
         ) ||
+        (profiling_level >= 2 &&
+         !PERCOUNTER_RESERVE(SCHEDULER_WORKER_CAPACITY, PercounterProfileBuffer, profile_buffers_offset)) ||
         !PERCOUNTER_RESERVE(task_count, PercounterCounter, counters_offset) ||
+        // After the counters, so the records fall outside `upload_size` below.
+        // The entries follow the records for the reason `layout_valid` checks:
+        // a record's entry span has to start after the record itself.
+        !PERCOUNTER_RESERVE(SCHEDULER_WORKER_CAPACITY, pto2::resident::AsyncGroupData, async_groups_offset) ||
+        !PERCOUNTER_RESERVE(
+            SCHEDULER_WORKER_CAPACITY * PERCOUNTER_ASYNC_CAPACITY, DeferredCompletionEntry, async_entries_offset
+        ) ||
+        !PERCOUNTER_RESERVE(execution_count, PercounterAsyncCompletion, async_completions_offset) ||
+        !PERCOUNTER_RESERVE(order_count[0], uint64_t, parked_next_offset[0]) ||
+        !PERCOUNTER_RESERVE(order_count[1], uint64_t, parked_next_offset[1]) ||
         !scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) {
 #undef PERCOUNTER_RESERVE
         return false;
@@ -227,6 +261,21 @@ inline bool plan_layout(
 #undef PERCOUNTER_RESERVE
     next.upload_size = next.counters_offset + table_task_count * sizeof(PercounterCounter);
 
+    cursor = next.total_size;
+    if (profiling_level >= 2 &&
+        (!scheduler_layout_checked_align(
+             uint64_t{next.task_record_capacity} * sizeof(PercounterTaskTiming), 64, &next.task_record_stride
+         ) ||
+         !scheduler_layout_checked_mul(SCHEDULER_WORKER_CAPACITY, next.task_record_stride, &bytes) ||
+         !scheduler_layout_reserve(&cursor, bytes, 64, &next.task_records_offset)))
+        return false;
+    if (profiling_level >= 3 && (!scheduler_layout_checked_mul(
+                                     uint64_t{SCHEDULER_WORKER_CAPACITY} * SCHEDULER_SCALAR_RECORD_CAPACITY,
+                                     sizeof(SchedulerScalarRecord), &bytes
+                                 ) ||
+                                 !scheduler_layout_reserve(&cursor, bytes, 64, &next.scalar_records_offset)))
+        return false;
+    if (!scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) return false;
     *layout = next;
     return true;
 }
@@ -272,7 +321,7 @@ inline TaskPlacement task_placement_from_active_mask(uint8_t active_mask, uint8_
 
 /** The same mask as the lane bits upstream's shape checks take. */
 inline LaneMask lane_mask_from_active_mask(uint8_t active_mask) {
-    return LaneMask((active_mask & 1U) != 0, (active_mask & 2U) != 0, (active_mask & 4U) != 0);
+    return {(active_mask & 1U) != 0, (active_mask & 2U) != 0, (active_mask & 4U) != 0};
 }
 
 /** One task, as the table builder needs to see it. */
@@ -338,6 +387,19 @@ inline const char *build_status_name(BuildStatus status) {
         return "a fanin edge names no task";
     }
     return "?";
+}
+
+/**
+ * A value no two binds of this process share, and never zero.
+ *
+ * The deferred-completion records sit past `upload_size`, in storage a pipeline
+ * slot retains between runs, so a record can still hold the bytes an earlier
+ * bind left there. The epoch is what a kernel's writer compares before it
+ * treats a record as this run's, and zero is the writer's own "no record".
+ */
+inline uint64_t next_async_run_epoch() {
+    static std::atomic<uint64_t> counter{0};
+    return counter.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
 /** The task a failure is about, for the log line. -1 when it is not about one. */
@@ -648,6 +710,22 @@ inline bool build_tables(
             record.order_base[l] = order_base[k * PERCOUNTER_LIST_COUNT + l];
     }
 
+    control->profiling_level = layout.profiling_level;
+    control->profile_buffers_offset = layout.profile_buffers_offset;
+    if (layout.profile_buffers_offset != 0) {
+        auto *buffers = region_at<PercounterProfileBuffer>(base, layout.profile_buffers_offset);
+        for (uint32_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
+            buffers[worker].task_capacity = layout.task_record_capacity;
+            buffers[worker].task_records_offset =
+                layout.task_records_offset + uint64_t{worker} * layout.task_record_stride;
+            buffers[worker].scalar_records_offset =
+                layout.scalar_records_offset == 0 ?
+                    0 :
+                    layout.scalar_records_offset +
+                        uint64_t{worker} * SCHEDULER_SCALAR_RECORD_CAPACITY * sizeof(SchedulerScalarRecord);
+            buffers[worker].physical_core_id = -1;
+        }
+    }
     control->task_count = layout.task_count;
     control->table_task_count = task_count;
     control->executable_block_count = executable_blocks;
@@ -670,6 +748,14 @@ inline bool build_tables(
     control->fanin_addr_offset = layout.fanin_addr_offset;
     control->counters_offset = layout.counters_offset;
     control->dispatch_payloads_offset = layout.dispatch_payloads_offset;
+    control->async_groups_offset = layout.async_groups_offset;
+    control->async_entries_offset = layout.async_entries_offset;
+    control->async_capacity = PERCOUNTER_ASYNC_CAPACITY;
+    control->async_completions_offset = layout.async_completions_offset;
+    control->async_completion_capacity = layout.async_completion_capacity;
+    for (uint32_t type = 0; type < PERCOUNTER_CORE_TYPE_COUNT; ++type)
+        control->parked_next_offset[type] = layout.parked_next_offset[type];
+    control->async_run_epoch = next_async_run_epoch();
     // The memset leaves this at 0, which is a real task id. A cohort takes the
     // open slot by flipping its generation and publishes by writing this field
     // last, so a lane gates on a non-negative id to know the shape behind an

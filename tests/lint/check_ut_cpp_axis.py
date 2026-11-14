@@ -124,6 +124,11 @@ WAIVERS: dict[tuple[str, str], str] = {
         "its reservation-before-claim admission policy and different queue APIs, "
         "covered by test_mix_admission and test_mix_spare_lane"
     ),
+    ("common/platform/test_mix_lane_queue_profiling.cpp", "a5/host_build_graph"): (
+        "this case exercises the AICPU ChipReadyQueue profiling API, which a5 HBG "
+        "no longer implements; its resident dispatch and scalar traces are covered "
+        "by test_hbg_scheduler_dispatch and test_hbg_scalar_trace"
+    ),
     ("common/platform/test_mix_lane_queue_profiling.cpp", "a5/tensormap_and_ringbuffer"): (
         "this case exercises push_mix/pop_shaped_batch profiling APIs of the "
         "three priority-prefix backends; a5 TMR shares the counter types but "

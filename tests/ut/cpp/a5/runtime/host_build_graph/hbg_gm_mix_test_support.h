@@ -37,6 +37,7 @@ struct GmShape {
     uint16_t blocks;
     LaneMask mask;
     bool sync_start{false};
+    bool inline_task{false};
 };
 
 // Every lane set that makes a task a Mix: the two AIC+single-AIV pairs, both
@@ -65,8 +66,9 @@ inline SchedulerSpmdRequirements gm_requirements(const std::vector<GmShape> &sha
     SchedulerSpmdRequirements result{clusters * 3, clusters, 0, 0};
     for (const auto &shape : shapes) {
         const bool mix = shape.mask.is_mix();
-        if (mix || shape.blocks > 1) ++result.cooperative_task_count;
+        if (shape.sync_start) ++result.cooperative_task_count;
         if (mix) ++result.mix_task_count;
+        if (mix && shape.sync_start) ++result.sync_mix_task_count;
     }
     return result;
 }
@@ -92,7 +94,8 @@ struct GmMixFixture {
         ),
         graph(shapes.size()),
         admissions(clusters * 3),
-        locals(clusters * 3) {
+        locals(clusters * 3),
+        signals(clusters) {
         uint32_t trace = 0;
         for (uint64_t task = 0; task < shapes.size(); ++task) {
             const auto shape = shapes[task];
@@ -104,14 +107,23 @@ struct GmMixFixture {
             if (shape.blocks > 1) metadata.flags |= SCHEDULER_TASK_SPMD;
             if (shape.sync_start) metadata.flags |= SCHEDULER_TASK_SYNC_START;
             if (shape.mask.is_mix()) metadata.flags |= SCHEDULER_TASK_MIX;
+            if (shape.inline_task) {
+                EXPECT_EQ(shape.blocks, 1u);
+                EXPECT_FALSE(shape.sync_start);
+                EXPECT_EQ(shape.mask.count(), 1u);
+                metadata.flags |= SCHEDULER_TASK_INLINE;
+                for (auto &kernel : graph.storage()[task].task.kernel_id)
+                    kernel = INVALID_KERNEL_ID;
+            }
             metadata.trace_index_base = trace;
             trace += shape.blocks * static_cast<uint32_t>(shape.mask.count());
             metadata.timing_slot = -1;
             for (uint8_t subtask = 0; subtask < 3; ++subtask)
-                metadata.kernel_ids[subtask] = shape.mask.has(static_cast<SubtaskSlot>(subtask)) ? 1 : UINT16_MAX;
+                metadata.kernel_ids[subtask] =
+                    !shape.inline_task && shape.mask.has(static_cast<SubtaskSlot>(subtask)) ? 1 : UINT16_MAX;
         }
+        storage.prepare_catalog();
         EXPECT_TRUE(scheduler_init_spmd_task_records(base(), storage.layout, 47));
-        storage.prepare_ready_pool();
         storage.run_control->active_worker_count = clusters * 3;
         storage.run_control->aic_active_worker_count = clusters;
         storage.run_control->aiv_active_worker_count = clusters * 2;
@@ -124,10 +136,13 @@ struct GmMixFixture {
                 context.cluster_worker_ids[lane] = (worker / 3) * 3 + lane;
             storage.test_graphs[worker] = graph.graph();
         }
+        for (auto &signal : signals)
+            scheduler_cluster_signal_clear(&signal, 47);
         for (uint32_t worker = 0; worker < locals.size(); ++worker) {
             locals[worker] = storage.local_context(&storage.contexts[worker]);
+            if (storage.layout.spmd.mix_task_count != 0) locals[worker]->cluster_signal = &signals[worker / 3];
             EXPECT_TRUE(scheduler_initialize_admission(base(), locals[worker], &admissions[worker]));
-            locals[worker]->admission = &admissions[worker];
+            locals[worker]->admission = admissions[worker].capacity == 0 ? nullptr : &admissions[worker];
         }
     }
 
@@ -145,8 +160,56 @@ struct GmMixFixture {
         );
         return scheduler_state_at<SchedulerMixCloseSeal>(base(), record->mix_close_seals_offset)[cluster].value;
     }
+    SchedulerClusterSignal *signal(uint32_t cluster) { return &signals[cluster]; }
+    bool ordinary_arm(uint64_t task, uint32_t cluster, bool *armed) {
+        *armed = false;
+        auto *local = locals[cluster * 3];
+        const auto *pool = scheduler_state_at<SchedulerTaskCatalogHeader>(base(), local->config.task_catalog_offset);
+        const auto catalog = scheduler_task_catalog(base(), *pool, 0);
+        const auto *entry = std::find(catalog.refs, catalog.refs + catalog.count, static_cast<int64_t>(task));
+        if (entry == catalog.refs + catalog.count) return false;
+        const uint32_t previous = signal(cluster)->armed_generation;
+        local->cluster_scan_cursor = entry - catalog.refs;
+        bool progress = false;
+        if (!scheduler_cluster_mix_discover_next(graph.graph(), base(), local, run(), &progress) ||
+            !scheduler_cluster_mix_progress_pending(graph.graph(), base(), local, run(), &progress))
+            return false;
+        *armed = signal(cluster)->armed_generation != previous &&
+                 scheduler_cluster_mix_armed(signal(cluster)->armed_generation);
+        return true;
+    }
+    bool ordinary_service(uint32_t worker, bool *progress, uint64_t profiling = 0) {
+        return scheduler_cluster_mix_service(graph.graph(), base(), locals[worker], run(), profiling, progress);
+    }
+    bool prepare_calls() { return storage.prepare_calls(graph.graph()); }
+    bool claim_ordinary(uint64_t task, uint32_t worker) {
+        if (!prepare_calls()) return false;
+        auto *local = locals[worker];
+        const auto *pool = scheduler_state_at<SchedulerTaskCatalogHeader>(base(), local->config.task_catalog_offset);
+        const auto catalog = scheduler_task_catalog(base(), *pool, local->config.self_core_type);
+        const auto *entry = std::find(catalog.refs, catalog.refs + catalog.count, static_cast<int64_t>(task));
+        if (entry == catalog.refs + catalog.count) return false;
+        local->execution_scan_cursor = entry - catalog.refs;
+        bool progress = false;
+        if (!scheduler_refill_execution_tokens(graph.graph(), base(), local, run(), 0, &progress)) return false;
+        return std::any_of(
+            std::begin(local->execution_tokens), std::end(local->execution_tokens), [&](const auto &token) {
+                return token.task_ref == static_cast<int64_t>(task) &&
+                       token.phase == SchedulerExecutionTokenPhase::WAIT_FANIN && token.prepared.claimed_state != 0;
+            }
+        );
+    }
+    bool progress_ordinary(uint32_t worker) {
+        auto *local = locals[worker];
+        uint32_t direct = UINT32_MAX;
+        bool progress = false;
+        if (!scheduler_progress_execution_tokens(graph.graph(), base(), local, run(), 0, &direct, &progress))
+            return false;
+        if (direct != UINT32_MAX) scheduler_local_ready_publish(local, direct);
+        return true;
+    }
     bool bootstrap_admission() {
-        if (run()->bootstrap_scan_complete != 0) return false;
+        if (run()->bootstrap_scan_complete != 0 || !prepare_calls()) return false;
         for (uint64_t task = 0; task < graph.graph().task_count; ++task) {
             if (!scheduler_task_requires_admission(scheduler_load_dispatch_metadata(base(), locals[0], task, 0)))
                 continue;
@@ -158,27 +221,16 @@ struct GmMixFixture {
         scheduler_gm_store(run()->bootstrap_scan_complete, UINT64_C(1));
         return true;
     }
-    bool enqueue(uint64_t task, uint32_t worker = 0) {
-        auto *local = locals[worker];
-        if (scheduler_route_task(graph.graph(), base(), local, run(), task) != SchedulerRouteResult::READY_TO_ENQUEUE)
-            return false;
-        SchedulerReadyBatch batch{};
-        const auto &metadata = storage.metadata[task];
-        return scheduler_ready_batch_append(base(), local, task, &batch) &&
-               scheduler_ready_batch_push(
-                   base(), local, scheduler_task_ready_queue(metadata.flags, metadata.active_mask), &batch
-               );
-    }
     bool claim_pending(uint64_t task, uint32_t worker = 0) {
-        if (!enqueue(task, worker)) return false;
         auto *local = locals[worker];
-        const auto &metadata = storage.metadata[task];
-        const uint32_t queue = scheduler_task_ready_queue(metadata.flags, metadata.active_mask);
-        SchedulerReadyClaim ready{};
-        return scheduler_claim_ready_for_slot(graph.graph(), base(), local, run(), queue, &ready) &&
-               ready.task_ref == static_cast<int64_t>(task) &&
-               scheduler_try_claim_admission(graph.graph(), base(), local, run(), &admissions[worker], ready) ==
-                   SchedulerAdmissionResult::PROGRESS;
+        const auto *pool = scheduler_state_at<SchedulerTaskCatalogHeader>(base(), local->config.task_catalog_offset);
+        const auto catalog = scheduler_task_catalog(base(), *pool, local->config.self_core_type);
+        const auto *entry = std::find(catalog.refs, catalog.refs + catalog.count, static_cast<int64_t>(task));
+        if (entry == catalog.refs + catalog.count) return false;
+        local->cooperative_scan_cursor = entry - catalog.refs;
+        bool progress = false;
+        return scheduler_discover_cooperative_task(graph.graph(), base(), local, run(), &progress) &&
+               admissions[worker].pending_task_ref == static_cast<int64_t>(task);
     }
     bool admit(uint64_t task, uint32_t worker = 0) {
         return claim_pending(task, worker) &&
@@ -215,7 +267,7 @@ struct GmMixFixture {
     }
     bool rendezvous(uint32_t cluster, uint64_t profiling = 0) {
         bool progress = false;
-        const LaneMask resources = mailbox(cluster)->descriptor.resource_mask;
+        const LaneMask resources = admissions[cluster * 3].current_resource_mask;
         for (uint32_t lane = 1; lane < 3; ++lane)
             if (resources.has(static_cast<SubtaskSlot>(lane)) && !observe(cluster * 3 + lane, &progress)) return false;
         for (uint32_t lane = 0; lane < 3; ++lane)
@@ -229,7 +281,7 @@ struct GmMixFixture {
         return scheduler_gm_mix_retire(graph.graph(), base(), locals[cluster * 3], run());
     }
     bool task_done(uint64_t task) const {
-        return scheduler_gm_query(control(task)->state) == static_cast<int64_t>(SchedulerTaskState::DONE);
+        return scheduler_completion_done(scheduler_gm_query(control(task)->completion_state));
     }
     bool close(uint32_t worker, bool *closed) {
         return scheduler_gm_mix_close(graph.graph(), base(), locals[worker], run(), closed);
@@ -245,20 +297,24 @@ struct GmMixFixture {
         uint32_t slot = UINT32_MAX;
         if (!scheduler_local_ready_peek(local, &slot)) return false;
         bool permit = false;
-        if (!scheduler_ordered_can_enter_slot(graph.graph(), base(), local, run(), slot, &permit)) return false;
+        if (!scheduler_can_enter_dispatch_slot(graph.graph(), base(), local, run(), slot, &permit)) return false;
         if (!permit) return false;
         if (!scheduler_local_ready_execute(local, slot)) return false;
-        auto *payload =
-            scheduler_state_at<DispatchPayload>(base(), local->dispatch_payload_offset(local->config.self_lane, slot));
-        if (scheduler_protocol_enabled(local)) scheduler_execute_protocol_task(base(), local, slot, payload);
+        const auto index = local->slots[slot].prepared.execution_index;
+        auto *call = scheduler_prepared_call_at(base(), local->config.prepared, index);
+        auto *binding = scheduler_execution_binding_at(base(), local->config.prepared, index);
+        if (scheduler_protocol_enabled(local))
+            scheduler_execute_protocol_task(
+                base(), local, slot, call->function_bin_addr, call->args, binding->local_context
+            );
         *execution = {
             local->slots[slot].task_ref,
-            static_cast<uint32_t>(payload->local_context.block_idx),
-            static_cast<uint32_t>(payload->local_context.block_num),
+            static_cast<uint32_t>(binding->local_context.block_idx),
+            static_cast<uint32_t>(binding->local_context.block_num),
             worker,
             slot,
             local->slots[slot].subtask_slot,
-            static_cast<uint32_t>(payload->global_context.sub_block_id)
+            static_cast<uint32_t>(binding->global_context.sub_block_id)
         };
         return true;
     }
@@ -270,13 +326,14 @@ struct GmMixFixture {
         );
     }
     bool finish_lanes(uint32_t cluster) {
-        const auto descriptor = mailbox(cluster)->descriptor;
+        const auto active = admissions[cluster * 3].current_active_mask;
+        const auto resources = admissions[cluster * 3].current_resource_mask;
         for (uint32_t lane = 0; lane < 3; ++lane) {
-            if (!descriptor.resource_mask.has(static_cast<SubtaskSlot>(lane))) continue;
+            if (!resources.has(static_cast<SubtaskSlot>(lane))) continue;
             GmExecution execution{};
-            const bool active = descriptor.lane_subtasks[lane] != UINT8_MAX;
+            const bool executes = active.has(static_cast<SubtaskSlot>(lane));
             const bool entered = begin(cluster * 3 + lane, &execution);
-            if (active != entered || (entered && !complete(execution))) return false;
+            if (executes != entered || (entered && !complete(execution))) return false;
         }
         return true;
     }
@@ -288,6 +345,7 @@ struct GmMixFixture {
     scheduler_test::GraphBuffer graph;
     std::vector<SchedulerAdmissionLocalState> admissions;
     std::vector<SchedulerLocalState *> locals;
+    std::vector<SchedulerClusterSignal> signals;
 };
 
 }  // namespace scheduler_test::gm_mix

@@ -27,6 +27,9 @@ a5_hbg_case(test_hbg_args_dump_rendezvous.cpp)
 
 a5_hbg_case(test_hbg_graph_view.cpp)
 
+a5_hbg_case(test_hbg_task_image.cpp
+    SOURCES ${SIMPLER_SRC}/common/host_build_graph/shared/shared_memory.cpp)
+
 a5_hbg_case(test_hbg_scalar_trace.cpp NO_OBJS TIMEOUT 20
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/scalar_policy_plain.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/scalar_policy_profiled.cpp
@@ -48,7 +51,14 @@ a5_hbg_case(test_hbg_async_plan.cpp NO_OBJS TIMEOUT 20
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host
     SOURCES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_completion_plan.cpp)
 
-a5_hbg_case(test_hbg_ready_pool.cpp
+a5_hbg_case(test_hbg_execution_ownership.cpp NO_OBJS TIMEOUT 20
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host)
+
+a5_hbg_case(test_hbg_prepared_bindings.cpp NO_OBJS TIMEOUT 20
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host
+    SOURCES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_completion_plan.cpp)
+
+a5_hbg_case(test_hbg_task_catalog.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host)
 
 a5_hbg_case(test_hbg_native_graph_plan.cpp
@@ -100,6 +110,8 @@ a5_hbg_case(test_hbg_nonce_exit.cpp NO_OBJS TIMEOUT 20
         ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_native.cpp
         ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_ordinary_profiled.cpp
         ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_native_profiled.cpp
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_ordinary_timing.cpp
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_native_timing.cpp
         ${SIMPLER_SRC}/a5/platform/shared/aicpu/platform_regs.cpp
         ${SIMPLER_SRC}/a5/platform/sim/aicpu/inner_platform_regs.cpp
         ${SIMPLER_SRC}/common/platform/sim/aicpu/device_time.cpp
@@ -133,11 +145,6 @@ a5_hbg_case(test_hbg_gm_mix_startup.cpp
 
 # Drives the real orchestrator submit path.
 a5_hbg_case(test_hbg_submit_poison.cpp ORCH)
-
-# Incremental activation inits a real SchedulerState (ready queues), so it links
-# the scheduler and shared runtime out-of-line members.
-a5_hbg_case(test_graph_activation.cpp
-    SOURCES ${HBG_SHARED_RUNTIME_SOURCES})
 
 a5_hbg_case(test_hbg_report_epoch.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu

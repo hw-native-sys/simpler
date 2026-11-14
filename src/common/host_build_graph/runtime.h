@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "common/core_type.h"
+#include "common/device_phase.h"
 #include "common/host_phase_kind.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
@@ -123,6 +124,8 @@ struct Handshake {
     volatile CoreType core_type;    // Core type: CoreType::AIC or CoreType::AIV (reported by AICore with aicore_done)
     volatile uint32_t physical_core_id;  // Physical core ID (reported by AICore with aicore_done)
     volatile uint64_t report_epoch;      // Commit marker for a native program run's report; 0 = unstamped
+    volatile uint64_t work_start_cycle;  // After handshake release, before scheduler work
+    volatile uint64_t work_end_cycle;    // After scheduler work, before waiting for retirement
 } __attribute__((aligned(64)));
 
 // The AICore owns this line's writeback: it flushes the whole line with
@@ -142,6 +145,26 @@ static_assert(offsetof(Handshake, task) == 8);
 static_assert(offsetof(Handshake, core_type) == 16);
 static_assert(offsetof(Handshake, physical_core_id) == 20);
 static_assert(offsetof(Handshake, report_epoch) == 24);
+static_assert(offsetof(Handshake, work_start_cycle) == 32);
+static_assert(offsetof(Handshake, work_end_cycle) == 40);
+
+// Read only after every core has retired. Missing endpoints invalidate the
+// whole window, rather than silently reporting a subset of the chip.
+inline bool aicore_reduce_work_window(const Handshake *reports, int count, AicoreWorkWindow &out) {
+    out = {};
+    if (reports == nullptr || count <= 0) return false;
+    uint64_t first = UINT64_MAX;
+    uint64_t last = 0;
+    for (int i = 0; i < count; ++i) {
+        const uint64_t start = reports[i].work_start_cycle;
+        const uint64_t end = reports[i].work_end_cycle;
+        if (start == 0 || end <= start) return false;
+        if (start < first) first = start;
+        if (end > last) last = end;
+    }
+    out = {first, last};
+    return true;
+}
 
 /**
  * Whether `handshake` carries a report this run may act on.

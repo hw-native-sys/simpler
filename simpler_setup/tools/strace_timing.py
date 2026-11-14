@@ -561,6 +561,7 @@ def print_tpot_table(buckets, label_for_hid=None, stream=sys.stdout):
 _ROUNDS_TABLE_NAMES = {
     "run": "chip.run",
     "device": "chip.run.runner_run.device_wall",
+    "aicore": "chip.run.runner_run.aicore_wall",
     "orch": "chip.run.runner_run.device_wall.orch",
     "sched": "chip.run.runner_run.device_wall.sched",
 }
@@ -569,11 +570,11 @@ _ROUNDS_TABLE_NAMES = {
 # window (the old device-log "Total"), recomputed here purely from the orch/sched
 # markers' device-domain ts+dur — no device log needed. label is the column
 # header / "Avg <label>".
-_ROUNDS_TABLE_COLUMNS = ("Host", "Device", "Effective", "Orch", "Sched")
+_ROUNDS_TABLE_COLUMNS = ("Host", "Device", "Effective", "Orch", "Sched", "AICore")
 
 
 def _round_metrics(inv):
-    """Return one round's (Host, Device, Effective, Orch, Sched) in µs from spans.
+    """Return one round's Host/Device/Effective/Orch/Sched/AICore times in µs.
 
     Host/Device/Orch/Sched are span durations; Effective =
     ``max(orch_end, sched_end) - min(orch_start, sched_start)`` from the orch/sched
@@ -596,11 +597,11 @@ def _round_metrics(inv):
     else:
         effective = 0.0
 
-    return (_dur("run"), _dur("device"), effective, _dur("orch"), _dur("sched"))
+    return (_dur("run"), _dur("device"), effective, _dur("orch"), _dur("sched"), _dur("aicore"))
 
 
 def print_rounds_table(buckets, stream=sys.stdout):
-    """Print a per-round Host/Device/Effective/Orch/Sched table (µs) for the busiest hid.
+    """Print per-round Host/Device/Effective/Orch/Sched/AICore times for the busiest hid.
 
     This renders the per-round benchmark table that ``scene_test`` used to print
     inline. The most-invoked hid bucket is treated as the rounds (one row per

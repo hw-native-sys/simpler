@@ -170,22 +170,22 @@ static_assert(sizeof(ChipSwimlaneAicpuTaskRecord) == 32, "ChipSwimlaneAicpuTaskR
  * 32B (half a cache line). Two records pack into one cache line so AICore's
  * per-task store is at most a single line commit + dcci.
  *
- * receive_to_start_cycles isolates the AICore-side dcci+ack cost from the
- * AICPU→AICore NoC propagation. AICore captures receive_time right after
- * `read_reg(DATA_MAIN_BASE)` returns the new task_id (before dcci+ack), and
- * start_time after them. Host derives:
+ * receive_to_start_cycles measures local execution setup. Dispatch-driven
+ * cores capture receive_time after reading the task register; self-scheduling
+ * cores capture it on entry to prepared-payload execution. The interval can
+ * include cache acquisition, acknowledgment and profiling-buffer waits.
+ * Host derives:
  *   - receive_time  = start_time - receive_to_start_cycles
  *   - propagation   = receive_time - dispatch_ts (AICPU view)
- *   - local_setup   = receive_to_start_cycles    (dcci + ack)
- * Delta fits in 32 bits on all supported platforms (minimum wrap window
- * is approximately 4.3 s at the fastest 1 GHz counter).
+ *   - local_setup   = receive_to_start_cycles
+ * The 32-bit delta represents intervals below 2^32 ticks (about 4.3 s at 1 GHz).
  */
 struct ChipSwimlaneAicoreTaskRecord {
     uint64_t start_time;               // Post-dcci+ack timestamp (kernel begins next)
     uint64_t end_time;                 // Post-kernel timestamp
     TaskId task_token;                 // identity, in the minting runtime's layout (NOT join key)
     uint32_t reg_task_id;              // Per-core dispatch token — host join key vs AICPU stream
-    uint32_t receive_to_start_cycles;  // start_time - receive_time (AICore-local dcci + ack cost)
+    uint32_t receive_to_start_cycles;  // Local setup interval: start_time - receive_time
 } __attribute__((aligned(32)));
 
 static_assert(sizeof(ChipSwimlaneAicoreTaskRecord) == 32, "ChipSwimlaneAicoreTaskRecord must be 32B");
@@ -202,8 +202,8 @@ static_assert(sizeof(ChipSwimlaneAicoreTaskRecord) == 32, "ChipSwimlaneAicoreTas
  *
  * Concrete instantiations live below as `using` aliases.
  *   - ChipSwimlaneAicpuTaskBuffer        — AICPU-written, rotated, ready-queue tagged kind=AicpuTask
- *   - ChipSwimlaneAicoreTaskBuffer  — AICore-written, NOT rotated (sized for the whole
- *                           run), read by host at flush time
+ *   - ChipSwimlaneAicoreTaskBuffer — AICore-written, rotated by AICPU and
+ *                           handed to the Host through the shared ready queue
  */
 template <typename Record, size_t N>
 struct TypedBuffer {
@@ -306,10 +306,10 @@ static_assert(sizeof(ChipSwimlaneFreeQueue) == 128, "ChipSwimlaneFreeQueue must 
  *   - dropped_record_count : producer-maintained tally; counts records lost
  *                            (free_queue empty / overwrite / no buffer).
  *
- * Single-writer (AICPU) for every pool; readers are either AICore (via dcci
- * SINGLE_CACHE_LINE, AicoreTask pool only) or the host at drain time. Because
- * AICore only reads current_buf_ptr/current_buf_seq and invalidates the whole
- * line, the cohabiting counter fields are harmless — AICore never reads them.
+ * AICPU is the only writer of every head. Self-scheduling cores publish the
+ * active buffer's committed count, which the AICPU collector observes before
+ * updating this head and rotating through the same queues. AICore only reads
+ * current_buf_ptr/current_buf_seq; the Host reads settled counts at drain time.
  *
  * Race avoidance for AicoreTask pools: AICPU rotates strictly before
  * `write_reg(DATA_MAIN_BASE)` for the first task of a new BUFFER_SIZE batch.

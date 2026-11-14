@@ -269,6 +269,7 @@ The declarations, function types and ownership contract are centralized in
 | `RtSubmitPhaseState` | `ModuleThreadValue` | orchestration SO | Per-thread submission timing; no keys when the bound runtime lacks phase recording |
 | `SuppressSelfNotify` depth | `ModuleThreadValue` with stack-scope fallback | host module | Suppress this thread's rollback notifications |
 | `g_reg_base_key` | `pthread_key_t` | AICore SO | Per-core simulated register base address |
+| percounter Scalar recorder | `pthread_key_t` | profiled AICore simulation SO | Borrows a lane-stack recorder; binding clears before the stack expires, key deletes at module unload, no thread-exit callback; uninstrumented TUs allocate no key |
 | `g_core_id_key` | `pthread_key_t` | AICore SO | Per-core physical core ID |
 | `g_device_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread device binding (device_id) |
 | `g_subblock_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread subblock identity (for TPUSH/TPOP) |
@@ -362,6 +363,12 @@ Sim Context subblock/cluster identity, and every AICPU affinity binding result.
 Failure cancels and joins created threads before releasing their module or run
 storage. AICore identity failure is a before-submission refusal; an AICPU startup
 failure conservatively retains the existing partial-launch/drain contract.
+The process-resident Sim Context also owns a cancellation-register key.
+The A2/A3 Host runner binds it before executor startup, reports binding failures
+to the same startup gate, and clears it on thread exit. Its value borrows the
+run-owned simulated register cell; it has no callback into an unloadable SO.
+Compute kernel SOs query the resident context, not runtime-private TLS.
+
 Sim Context's two identity keys are process-resident; their checked setters
 return pthread errors, roll back partial key creation and allow later retry.
 

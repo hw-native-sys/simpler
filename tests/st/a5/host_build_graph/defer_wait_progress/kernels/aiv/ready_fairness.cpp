@@ -13,38 +13,39 @@
 
 #include "async_kernel_api.h"
 #include "scheduler/scheduler_async_layout.h"
-#include "scheduler/scheduler_ready_pool.h"
+#include "scheduler/scheduler_task_catalog.h"
 #include "tensor.h"
 
 namespace {
 constexpr uint32_t kLineWords = 32;
 
-// Bootstrap publishes every background task before dispatch begins. These
-// tickets are never republished. Atomic head reads confirm ownership; a
-// bypass-only read could still name a ticket already claimed. An unclaimed ticket after
-// CHECK therefore witnesses a ready backlog throughout that wait's completion.
+// Bootstrap publishes each background task once. A strong READY observation
+// after CHECK witnesses a backlog without depending on a shared queue head.
 inline __aicore__ bool background_is_ready(__gm__ void *base, uint32_t count) {
-    auto *run = reinterpret_cast<__gm__ SchedulerRunControl *>(base);
+    const auto *run = reinterpret_cast<__gm__ SchedulerRunControl *>(base);
     const auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, run->graph_summary_offset);
-    const auto *pool = scheduler_state_at<SchedulerReadyPoolHeader>(base, summary->ready_pool_offset);
-    if (pool->version != SCHEDULER_READY_POOL_VERSION) return false;
-    const auto queue = scheduler_ready_pool_queue(base, *pool, static_cast<uint32_t>(SchedulerReadyClass::AIV));
-    const uint64_t head = scheduler_gm_fetch_add(queue.control->head, UINT64_C(0));
-    if (head >= queue.capacity) return false;
-    const int64_t ref = scheduler_gm_load(queue.entries[head].task_ref);
-    return ref >= 1 && ref <= count && scheduler_gm_fetch_add(queue.control->head, UINT64_C(0)) == head;
+    const auto *pool = scheduler_state_at<SchedulerTaskCatalogHeader>(base, summary->task_catalog_offset);
+    if (pool->version != SCHEDULER_TASK_CATALOG_VERSION || count >= pool->task_count) return false;
+    auto *states = scheduler_state_at<SchedulerTaskAvailability>(base, pool->availability_offset);
+    for (uint32_t ref = 1; ref <= count; ++ref)
+        if (scheduler_gm_fetch_add(states[ref].phase, UINT64_C(0)) ==
+            static_cast<uint64_t>(SchedulerAvailabilityPhase::READY))
+            return true;
+    return false;
 }
 
-// The consumer is the only task absent from the bootstrap queues. Its ticket
-// can only be published by the waiter's FINISH, and entries survive consumption.
+// Only the waiter's FINISH can publish this consumer. Its monotonic phase
+// retains that fact after a worker has claimed it.
 inline __aicore__ bool consumer_was_published(__gm__ void *base, uint32_t count) {
     const auto *run = reinterpret_cast<__gm__ SchedulerRunControl *>(base);
     const auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, run->graph_summary_offset);
-    const auto *pool = scheduler_state_at<SchedulerReadyPoolHeader>(base, summary->ready_pool_offset);
-    if (pool->version != SCHEDULER_READY_POOL_VERSION) return false;
-    const auto queue = scheduler_ready_pool_queue(base, *pool, static_cast<uint32_t>(SchedulerReadyClass::AIV));
-    const uint64_t tail = scheduler_gm_fetch_add(queue.control->reserved_tail, UINT64_C(0));
-    return tail != 0 && tail <= queue.capacity && scheduler_gm_load(queue.entries[tail - 1].task_ref) == count + 1;
+    const auto *pool = scheduler_state_at<SchedulerTaskCatalogHeader>(base, summary->task_catalog_offset);
+    if (pool->version != SCHEDULER_TASK_CATALOG_VERSION || static_cast<uint64_t>(count) + 1 >= pool->task_count)
+        return false;
+    auto *states = scheduler_state_at<SchedulerTaskAvailability>(base, pool->availability_offset);
+    const uint64_t phase = scheduler_gm_fetch_add(states[count + 1].phase, UINT64_C(0));
+    return phase == static_cast<uint64_t>(SchedulerAvailabilityPhase::READY) ||
+           phase == static_cast<uint64_t>(SchedulerAvailabilityPhase::OWNED);
 }
 
 inline __aicore__ bool wait_was_checked(__gm__ void *base) {

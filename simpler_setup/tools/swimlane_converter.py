@@ -1345,8 +1345,10 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
     out["runtime"] = runtime_name
     if scheduler_task_producer is not None:
         out["scheduler_task_producer"] = scheduler_task_producer
-    if scheduler_records and runtime_name == "host_build_graph":
-        from simpler_setup.tools.hbg.scalar_profile import analyze_streams  # noqa: PLC0415
+    if scheduler_records and runtime_name in ("host_build_graph", "percounter"):
+        from importlib import import_module  # noqa: PLC0415
+
+        analyze_streams = import_module(f"{get(runtime_name).__name__}.scalar_profile").analyze_streams
 
         profiles = analyze_streams(
             sched_phases_raw,
@@ -1624,6 +1626,7 @@ def _with_execution_identity(args, row):
             "pending_slot",
             "order_key",
             "group_seq",
+            "group_kind",
             "cluster_index",
             "cluster_lane",
             "executed",
@@ -2541,7 +2544,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         task.get("dispatch_time_us", 0) >= 0 and task.get("finish_time_us", 0) > 0 for task in tasks
     )
     worker_scheduler_details = (
-        runtime_name == "host_build_graph" and scheduler_task_producer == "aicore" and chip_swimlane_level in (3, 4)
+        runtime_name in ("host_build_graph", "percounter")
+        and scheduler_task_producer == "aicore"
+        and chip_swimlane_level in (3, 4)
     )
     show_scheduler_view = has_scheduler_task_data and not worker_scheduler_details
 
@@ -3120,7 +3125,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             )
 
     if scalar_profiles:
-        from simpler_setup.tools.hbg.scalar_profile import trace_events  # noqa: PLC0415
+        from importlib import import_module  # noqa: PLC0415
+
+        trace_events = import_module(f"{runtime.__name__}.scalar_profile").trace_events
 
         events.extend(
             trace_events(scalar_profiles, pid=2, tid_base=30000, display=task_display, streams=scheduler_streams)
@@ -3862,7 +3869,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         if verbose:
             print(f"  Overhead Analysis: {sum(1 for e in oh if e.get('ph') == 'C')} counter points (8 tracks)")
 
-    if runtime_name == "host_build_graph":
+    if runtime_name in ("host_build_graph", "percounter"):
         _order_hbg_cluster_lanes(events, tasks, core_to_tid, scheduler_streams)
 
     trace: dict[str, object] = {"traceEvents": events}

@@ -85,6 +85,12 @@ ChipSwimlaneLevel get_chip_swimlane_level();
  */
 void chip_swimlane_aicpu_init(int worker_count, ChipSwimlaneLevel level);
 
+// Self-scheduling cores publish committed buffer counts instead of dispatch
+// notifications. Each AICPU thread services its retirement partition using the
+// same pools, rotation and Host handoff as dispatch-driven collection.
+void chip_swimlane_aicpu_use_self_scheduled_cores();
+void chip_swimlane_aicpu_poll_self_scheduled_cores(int thread_idx, int thread_count, int worker_count);
+
 /**
  * Pre-dispatch hook for AICore buffer rotation and per-pool stats.
  *
@@ -135,6 +141,12 @@ void chip_swimlane_aicpu_on_aicore_dispatch(int core_id, int thread_idx, uint32_
  * @param reg_task_id  Task token extracted from the observed COND value
  */
 void chip_swimlane_aicpu_on_aicore_ack(int core_id, int thread_idx, uint32_t reg_task_id);
+
+/** Append a retired core's actual staged task to the normal bounded transport. */
+bool chip_swimlane_aicpu_record_staged_task(
+    int core_id, int thread_idx, const ChipSwimlaneAicoreTaskRecord &record, uint64_t dispatch_time,
+    uint64_t finish_time
+);
 
 /**
  * Commit an AICPU-side timing record for one completed task.
@@ -298,3 +310,9 @@ void chip_swimlane_aicpu_flush_sched_phase_buffer(int thread_idx);
  *                   ready queue to enqueue into. The pool/lane tag is ordinal 0.
  */
 void chip_swimlane_aicpu_flush_orch_phase_buffer(int thread_idx);
+
+/** Publish a retired scheduler participant through the existing phase transport. */
+void chip_swimlane_aicpu_record_staged_phase(int transport_thread, const ChipSwimlaneAicpuSchedPhaseRecord &record);
+
+/** Single-pass completion-owner flush; unavailable transport is accounted loss. */
+void chip_swimlane_aicpu_flush_staged(int thread_idx, const int *core_ids, int core_count);

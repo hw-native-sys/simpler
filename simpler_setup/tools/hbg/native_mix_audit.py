@@ -7,15 +7,16 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""GM Mix resource handshakes and retained task seals, independent of TaskDone."""
+"""MIX resource handshakes and sync-only retained seals, independent of TaskDone."""
 
 from collections import defaultdict
 
-from .native_causality import MAX, MIX, point, require
+from .native_causality import MAX, MIX, SYNC, point, require
 
 
 def _group(audit, block):
     owner = block["owner"]
+    ordered = bool(audit.tasks[owner["task_ref"]]["flags"] & SYNC)
     ref, worker, group = owner["task_ref"], owner["worker_index"], owner["group_seq"]
     require(audit.positions[worker][1] == 0 and 0 < group < MAX, "invalid GM group coordinator/sequence")
     audit.chain(owner, "claim_after", "publish_before", "publish_after", "releases_observed", "completion_before")
@@ -61,8 +62,11 @@ def _group(audit, block):
             "release_before",
             "release_after",
         )
-        member = audit.member(ref, peer)
-        audit.before(point(member, "observed"), point(lane, "descriptor_ready"), "GM lane bypassed its local frontier")
+        member = audit.member(ref, peer) if ordered else None
+        if member is not None:
+            audit.before(
+                point(member, "observed"), point(lane, "descriptor_ready"), "GM lane bypassed its local frontier"
+            )
         audit.causal.add(publication, point(lane, "descriptor_ready"))
         if index == 0:
             audit.before(
@@ -73,7 +77,24 @@ def _group(audit, block):
         for arrival in arrivals.values():
             audit.causal.add(arrival, point(lane, "arrivals_observed"))
         audit.causal.add(releases[index], point(owner, "releases_observed"))
-        audit.before(point(lane, "release_after"), point(member, "closed"), "GM member closed before lane release")
+        if member is not None:
+            audit.before(point(lane, "release_after"), point(member, "closed"), "GM member closed before lane release")
+        else:
+            require(lane["previous_lane_seq"] == [0, 0, 0], "cluster group fabricated a GM predecessor")
+            frontier = owner["sync_frontier"][index]
+            for sync_block in audit.blocks.values():
+                sync_owner = sync_block["owner"]
+                sync_ref = sync_owner["task_ref"]
+                if (
+                    audit.tasks[sync_ref]["flags"] & SYNC
+                    and sync_owner["worker_index"] == peer
+                    and audit.orders[sync_ref] >= frontier
+                ):
+                    audit.before(
+                        point(lane, "release_after"),
+                        point(sync_owner, "claim_before"),
+                        "sync claimed a position before its ordinary cluster group released",
+                    )
         if mapping[index] != 255:
             trace = block["index"] + (owner["active_mask"] & ((1 << index) - 1)).bit_count()
             execution = audit.executions[trace]
@@ -112,29 +133,34 @@ def audit_mix(audit):
             continue
         _group(audit, block)
         block_by_owner[id(owner)] = block
-        clusters[owner["cluster_index"]].append(owner)
+        clusters[(owner["cluster_index"], bool(audit.tasks[owner["task_ref"]]["flags"] & SYNC))].append(owner)
         task_clusters[(owner["task_ref"], owner["cluster_index"])].append(owner)
-    for groups in clusters.values():
+    for (_, ordered), groups in clusters.items():
         groups.sort(key=lambda row: row["group_seq"])
         require(
-            [row["group_seq"] for row in groups] == list(range(1, len(groups) + 1)),
+            [row["group_seq"] for row in groups] == list(range(1, len(groups) + 1))
+            if ordered
+            else [row["group_seq"] for row in groups] == list(range(1, 2 * len(groups), 2)),
             "missing or duplicate cluster group sequence",
         )
         previous_lane_seq = [0, 0, 0]
         for owner in groups:
             block = block_by_owner[id(owner)]
             for lane in block["lanes"]:
-                require(lane["previous_lane_seq"] == previous_lane_seq, "wrong per-lane group predecessor")
+                require(
+                    lane["previous_lane_seq"] == (previous_lane_seq if ordered else [0, 0, 0]),
+                    "wrong per-lane group predecessor",
+                )
             for lane in block["lanes"]:
                 previous_lane_seq[lane["lane"]] = owner["group_seq"]
         for previous, current in zip(groups, groups[1:], strict=False):
             audit.before(
                 point(previous, "completion_after"),
-                point(current, "claim_before"),
-                "GM mailbox reused before prior group retired",
+                point(current, "claim_before" if ordered else "staged"),
+                "MIX record reused before prior group retired",
             )
     for ref, task in audit.tasks.items():
-        if not task["flags"] & MIX:
+        if not task["flags"] & MIX or not task["flags"] & SYNC:
             continue
         for worker in audit.task_members[ref]:
             member = audit.member(ref, worker)

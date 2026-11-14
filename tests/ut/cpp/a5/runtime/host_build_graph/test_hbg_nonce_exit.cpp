@@ -196,6 +196,7 @@ volatile uint8_t *sim_get_reg_base() {
     return registers.data();
 }
 uint32_t sim_get_physical_core_id() { return 0; }
+uint64_t platform_ssbuf_hardware_base_address() { return 0; }
 uint32_t get_aicore_profiling_flag() { return 0; }
 ChipSwimlaneActiveHead *get_chip_swimlane_aicore_head() { return nullptr; }
 PmuAicoreRing *get_aicore_pmu_ring() { return nullptr; }

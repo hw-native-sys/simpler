@@ -23,6 +23,7 @@ side table lives only in the owning process.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import operator
 import os
@@ -49,6 +50,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
 )
 
 from ._host_exports import HostSharedMemory
+from ._shared_memory import SharedMemoryAttachment
 from .comm_endpoints import (
     DEVICE_AICORE,
     DEVICE_AICPU,
@@ -444,11 +446,18 @@ class Buffer:
         """
         if self.backend_kind == BackendKind.VMM_WINDOW and self.shm is not None:
             raise ValueError("Host domain buffers borrow shared memory; use domain.release()")
-        if self._mapping_registration is not None:
-            self._mapping_registration[0]._check_pid()
+        registration = self._mapping_registration
+        admission = contextlib.nullcontext()
+        if registration is not None:
+            registration[0]._check_pid()
+            admission = registration[0].release_admission()
         if self.shm is not None and hasattr(self.shm, "_check_pid"):
             self.shm._check_pid()
-        with self._host_lock:
+        # Distributed admission precedes the Buffer lock: an active callback may
+        # need host_view() before it can leave the submission serializer.
+        with admission, self._host_lock:
+            if registration is not self._mapping_registration:
+                raise RuntimeError("Host registration changed during close; retry after submission")
             if self._mapping_registration is not None:
                 registry, identity = self._mapping_registration
                 registry.check_unused(identity)
@@ -541,6 +550,26 @@ def re_export(source: BufferDescriptor) -> Buffer:
         shm=None,
         base=0,
     )
+
+
+def _wrap_heap_allocation(
+    address: int, descriptor: BufferDescriptor | None, identity: CanonicalIdentity, owner_worker_path: str
+) -> Buffer:
+    if descriptor is None:
+        return wrap_fork_inherited(
+            0,
+            0,
+            bytes(identity.owner_instance_id),
+            int(identity.buffer_id),
+            owner_worker_path,
+            generation=int(identity.generation),
+            access=AccessMode.READWRITE,
+            backend_kind=BackendKind.FORK_SHM,
+        )
+    handle = re_export(descriptor)
+    handle.base = address
+    handle.owner_worker_path_id = intern_worker_path(owner_worker_path)
+    return handle
 
 
 def buffer_reference(
@@ -922,6 +951,8 @@ def select_adapter(
         # exact-worker check. Region planning sets this false for consumer attachments, which is
         # what distinguishes DEVICE_LOCAL from a same-node DEVICE_PEER over the same backend.
         same_endpoint=desc.address_space == AddressSpace.DEVICE and context.deployment in (DEVICE_AICORE, DEVICE_AICPU),
+        fork_inherited=context.fork_inherited,
+        host_file_attached=_host_file_attached(desc, context),
     )
     last_decision = None
     for candidate in buffer_adapter_candidates(query):
@@ -963,6 +994,29 @@ def _resolve_body_as_va(desc: BufferDescriptor) -> tuple[int, SharedMemory | Non
     return int.from_bytes(desc.body, "little"), None
 
 
+def _host_file_attached(desc: BufferDescriptor, context: ImportContext) -> bool:
+    if desc.backend_kind is not BackendKind.SHARED_FD_SLICE:
+        return False
+    body = bytes(desc.body)
+    pid = int.from_bytes(body[:4], "little")
+    fd = int.from_bytes(body[4:8], "little")
+    if pid == os.getpid():
+        return True
+    return any(
+        owner == bytes(desc.identity.owner_instance_id) and producer == pid and fd in fds
+        for owner, producer, fds in context.shared_heap_files
+    )
+
+
+def _shared_mapping_key(desc: BufferDescriptor) -> tuple[bytes, int, int]:
+    body = bytes(desc.body)
+    return (
+        bytes(desc.identity.owner_instance_id),
+        int.from_bytes(body[:4], "little"),
+        int.from_bytes(body[4:8], "little"),
+    )
+
+
 def _resolve_host_shm_map(desc: BufferDescriptor) -> tuple[int, SharedMemory | None]:
     """Map the named POSIX shm object into this process."""
     name = desc.body.decode("utf-8")
@@ -989,7 +1043,9 @@ def _resolve_host_shm_map(desc: BufferDescriptor) -> tuple[int, SharedMemory | N
 
 
 # One resolver per mechanism, so a mechanism shared by several backends is carried out once.
-_RESOLVERS: dict[AdapterProfile, Callable[[BufferDescriptor], tuple[int, SharedMemory | None]]] = {
+_RESOLVERS: dict[
+    AdapterProfile, Callable[[BufferDescriptor], tuple[int, SharedMemory | SharedMemoryAttachment | None]]
+] = {
     AdapterProfile.FORK_INHERITED_VA: _resolve_body_as_va,
     AdapterProfile.DEVICE_LOCAL: _resolve_body_as_va,
     AdapterProfile.HOST_SHM_MAP: _resolve_host_shm_map,
@@ -1010,7 +1066,7 @@ class ImportedBuffer:
     base: int
     nbytes: int
     address_space: AddressSpace = AddressSpace.HOST
-    shm: SharedMemory | None = None  # the consumer's own mapping for shm backends
+    shm: SharedMemory | SharedMemoryAttachment | None = None
     # The descriptor this mapping was created from. Identity alone does not pin a backing: it says
     # WHICH allocation, not how big it is or how to reach it, so a second descriptor carrying the
     # same identity and a different nbytes / access / backend / body describes something the first
@@ -1019,6 +1075,8 @@ class ImportedBuffer:
     descriptor: BufferDescriptor | None = None
     profile: AdapterProfile | None = None
     capabilities: frozenset[BufferCapability] = frozenset()
+    mapping_offset: int = 0
+    mapping_key: tuple[bytes, int, int] | None = None
 
 
 @dataclass
@@ -1045,6 +1103,8 @@ class MappedArg:
         if ib.shm is not None:
             base = ib.shm.buf
             assert base is not None
+            if ib.mapping_key is not None:
+                base = base[ib.mapping_offset : ib.mapping_offset + ib.nbytes]
         else:
             # FORK_SHM / FORK_COW: no shm object — the base is a host VA inherited across the
             # fork, so wrap that range directly.
@@ -1127,6 +1187,8 @@ class ImportContext:
 
     deployment: EndpointDeployment
     device_owner_instance_id: bytes | None = None
+    fork_inherited: bool = True
+    shared_heap_files: tuple[tuple[bytes, int, tuple[int, ...]], ...] = ()
 
 
 class ImportRegistry:
@@ -1147,6 +1209,8 @@ class ImportRegistry:
         self._by_identity: dict[CanonicalIdentity, ImportedBuffer] = {}
         self._context = context
         self.host_mappings: HostMappingRegistry | None = None
+        self._shared_backings: dict[tuple[bytes, int, int], SharedMemoryAttachment] = {}
+        self._mapping_uses: dict[tuple[bytes, int, int], int] = {}
 
     def materialize(self, desc: BufferDescriptor) -> ImportedBuffer:
         """Map ``desc``'s backing into this process on first sight of its identity; reuse the
@@ -1162,10 +1226,9 @@ class ImportRegistry:
         is computed against that number, so an unverified one makes them all vacuous.
 
         Selection is the capability judgment: ``select_adapter`` either names the mechanism that
-        reaches this backing from this endpoint or refuses, and the resolver below only carries the
-        named mechanism out. Nothing after selection looks at ``backend_kind`` again. A mechanism
-        that reaches the backing without producing an address is refused *here* rather than there --
-        this returns a mapping, and that is the only narrowing it applies to the judgment.
+        reaches this backing from this endpoint or refuses. A shared-file slice uses a cached
+        mapping of the whole backing and adds its offset. Other descriptors use the selected
+        resolver. Materialization requires a local address, so it refuses addressless mechanisms.
         """
         key = desc.identity
         cached = self._by_identity.get(key)
@@ -1192,7 +1255,28 @@ class ImportRegistry:
                 f"`select_adapter` what this endpoint may do and issue the operation through the "
                 f"backing's owner",
             )
-        base, shm = resolver(desc)
+        mapping_key = None
+        mapping_offset = 0
+        if desc.backend_kind is BackendKind.SHARED_FD_SLICE:
+            mapping_offset = int.from_bytes(bytes(desc.body)[8:16], "little")
+            mapping_key = _shared_mapping_key(desc)
+            fd = mapping_key[2]
+            shm = self._shared_backings.get(mapping_key)
+            created = shm is None
+            if shm is None:
+                shm = SharedMemoryAttachment(fd)
+            if mapping_offset > shm.size or desc.nbytes > shm.size - mapping_offset:
+                if created:
+                    shm.close()
+                raise ValueError(
+                    f"ImportRegistry: heap fd {fd} is {shm.size} bytes, short of the descriptor span "
+                    f"offset={mapping_offset}, nbytes={desc.nbytes}"
+                )
+            base = shm.address + mapping_offset
+            self._shared_backings[mapping_key] = shm
+            self._mapping_uses[mapping_key] = self._mapping_uses.get(mapping_key, 0) + 1
+        else:
+            base, shm = resolver(desc)
         imported = ImportedBuffer(
             desc.identity,
             base,
@@ -1202,6 +1286,8 @@ class ImportRegistry:
             desc,
             profile,
             capabilities_for_adapter(kind, desc.access),
+            mapping_offset,
+            mapping_key,
         )
         self._by_identity[key] = imported
         return imported
@@ -1214,7 +1300,7 @@ class ImportRegistry:
             transfer = args.transfer(i)
             if transfer == TensorTransfer.MAP:
                 if self.host_mappings is None:
-                    raise ValueError("MAP requires its owning direct L2 Worker")
+                    raise ValueError("MAP requires a prepared device endpoint")
                 base, space = self.host_mappings.resolve(tensor)
                 resolved.append((base, space, int(TensorTransfer.NONE)))
             else:
@@ -1287,11 +1373,21 @@ class ImportRegistry:
         before that point is a mapping nothing can reach to retry — so the raise leaves the entry
         in place for this registry's own ``close()`` to attempt again.
         """
+        if self.host_mappings is not None:
+            self.host_mappings.check_unregistered(identity)
         imported = self._by_identity.get(identity)
         if imported is None:
             return
         if imported.shm is not None:
-            imported.shm.close()
+            key = imported.mapping_key
+            if key is None:
+                imported.shm.close()
+            elif self._mapping_uses[key] == 1:
+                imported.shm.close()
+                del self._shared_backings[key]
+                del self._mapping_uses[key]
+            else:
+                self._mapping_uses[key] -= 1
         del self._by_identity[identity]
 
     def close(self) -> None:
@@ -1306,13 +1402,10 @@ class ImportRegistry:
         if self.host_mappings is not None:
             self.host_mappings.require_closed()
         errors: list[BaseException] = []
-        for identity, imported in list(self._by_identity.items()):
-            if imported.shm is not None:
-                try:
-                    imported.shm.close()
-                except BaseException as exc:  # noqa: BLE001
-                    errors.append(exc)
-                    continue
-            del self._by_identity[identity]
+        for identity in list(self._by_identity):
+            try:
+                self.unregister(identity)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
         if errors:
             raise errors[0]

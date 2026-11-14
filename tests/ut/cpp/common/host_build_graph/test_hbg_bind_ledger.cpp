@@ -219,6 +219,8 @@ struct FakeHostApi {
     std::unordered_set<void *> live;
     std::vector<uint8_t> gm_heap;
     std::vector<uint8_t> runtime_arena;
+    size_t requested_arena_bytes{0};
+    size_t requested_heap_bytes{0};
     std::vector<uint8_t> sm_mirror;
     std::vector<uint8_t> definition_staging;
     // The section the bind handed to the carrier, and how many times it did.
@@ -574,6 +576,8 @@ void fake_set_retained(void *, uint32_t, void *addr, size_t size) {
 }
 int fake_setup_static_arena(void *, uint32_t, size_t heap, size_t, size_t arena) {
     if (g_fake->arena_status != 0) return g_fake->arena_status;
+    g_fake->requested_arena_bytes = arena;
+    g_fake->requested_heap_bytes = heap;
     g_fake->gm_heap.assign(std::max<size_t>(heap, kAlign) + kAlign, 0);
     g_fake->runtime_arena.assign(std::max<size_t>(arena, kAlign) + kAlign, 0);
     return 0;
@@ -1093,6 +1097,55 @@ TEST_F(HbgBindLedgerTest, AnUnpublishedBindLeavesTheImageTargetUnwritten) {
     ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
 }
 
+TEST_F(HbgBindLedgerTest, TaskImagePublicationMatchesTheDeviceArenaContract) {
+    for (auto entry : {empty_orch_entry, ordinary_orch_entry, recording_orch_entry}) {
+        SCOPED_TRACE(entry == recording_orch_entry ? "Graph" : entry == empty_orch_entry ? "empty" : "ordinary");
+        eps_ = {entry, capture_orch_bind};
+        Runtime runtime;
+        init_runtime(runtime);
+        auto cleanup = cleanup_runtime(runtime);
+        auto callable = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0);
+        reinterpret_cast<CoreCallable *>(callable.data())->set_resolved_addr(0x1000);
+        const uint64_t objects[] = {reinterpret_cast<uint64_t>(callable.data())};
+        const uint64_t entries[] = {0x1000};
+        runtime.set_callable_tables(
+            objects, reinterpret_cast<uint64_t>(objects), reinterpret_cast<uint64_t>(entries), 1
+        );
+        ChipStorageTaskArgs args;
+        ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+        const auto &publication = runtime.pending_publication();
+        const auto *arena = static_cast<const char *>(fake_acquire_runtime_arena(nullptr, 0));
+        const auto *sm = static_cast<const char *>(runtime.get_gm_sm_ptr());
+        ASSERT_NE(publication.source, nullptr);
+        ASSERT_NE(sm, nullptr);
+        const bool resident = std::strcmp(get_platform(), "a5sim") == 0;
+        if (resident) {
+            EXPECT_EQ(sm, arena);
+            EXPECT_EQ(publication.device_target, arena);
+            EXPECT_EQ(publication.bytes, runtime.dev.sm_image_bytes);
+            EXPECT_EQ(fake_.requested_arena_bytes, runtime.dev.sm_image_bytes);
+            EXPECT_EQ(runtime.get_prebuilt_arena_base(), nullptr);
+            EXPECT_EQ(runtime.get_prebuilt_runtime_offset(), 0u);
+        } else {
+            ASSERT_EQ(runtime.get_prebuilt_arena_base(), arena);
+            EXPECT_GT(sm, arena);
+            EXPECT_LT(static_cast<const char *>(publication.device_target), sm);
+            const auto *rt = reinterpret_cast<const RuntimeContext *>(
+                static_cast<const char *>(publication.source) +
+                (runtime.get_prebuilt_runtime_offset() - (static_cast<const char *>(publication.device_target) - arena))
+            );
+            EXPECT_NE(rt->scheduler, nullptr);
+            EXPECT_NE(rt->aicore_mailbox, nullptr);
+            EXPECT_EQ(fake_.requested_arena_bytes, static_cast<size_t>(sm - arena) + runtime.dev.sm_image_bytes);
+        }
+        ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+        if (!resident) {
+            const auto *header = static_cast<const SharedMemoryHeader *>(runtime.get_gm_sm_ptr());
+            EXPECT_EQ(header->tasks.total_tasks, runtime.dev.host_total_tasks);
+        }
+    }
+}
+
 // What the device image is allowed to contain. The boundary is already a
 // grouped host-only tail; naming the other side makes it checkable by content:
 // the uploaded bytes are the descriptor and nothing behind it, so a value only
@@ -1160,7 +1213,7 @@ TEST_F(HbgBindLedgerTest, TheDeviceImageCarriesNoHostOnlyBytes) {
     EXPECT_EQ(uploaded.sm_image_bytes, runtime.dev.sm_image_bytes);
     EXPECT_EQ(uploaded.gm_sm_ptr_, runtime.get_gm_sm_ptr());
     EXPECT_EQ(uploaded.prebuilt_runtime_offset_, runtime.get_prebuilt_runtime_offset())
-        << "the last device-read field ahead of the handshake region must be inside the upload";
+        << "the retained prebuilt-arena ABI field must be inside the upload";
     EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
 }
 
@@ -2873,6 +2926,41 @@ TEST_F(HbgBindLedgerTest, LaunchStagingOwnsPrerequisitesAndImageWithoutPrepareDe
 }
 
 #if __has_include("scheduler/scheduler_args_dump.h")
+TEST_F(HbgResidentSchedulerStorageTest, GraphHeapReservationContainsArgumentsWithoutAicpuTaskStorage) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    install_callable_tables(runtime);
+    eps_ = {
+        [](const ChipTaskArgs &) {
+            auto &orch = *g_orch_runtime->orchestrator;
+            GraphTaskArgs boundary;
+            const auto graph = orch.graph_begin(0x529, boundary);
+            ASSERT_TRUE(graph.recording);
+            ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary));
+            MixedKernels kernels{};
+            kernels.aiv0_kernel_id = 0;
+            for (uint64_t i = 0; i < 16; ++i) {
+                CoreTaskArgs args;
+                args.add_scalar(i);
+                ASSERT_TRUE(orch.submit_task(kernels, args).task_id().is_valid());
+            }
+            ASSERT_TRUE(orch.graph_end());
+            orch.graph_commit();
+            const auto cached = orch.graph_begin(0x529, boundary);
+            EXPECT_FALSE(cached.recording);
+            EXPECT_FALSE(cached.has_error);
+            EXPECT_TRUE(cached.task_id.is_valid());
+        },
+        capture_orch_bind
+    };
+    ChipStorageTaskArgs args;
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    EXPECT_EQ(fake_.requested_heap_bytes, CHIP_ALIGN_UP(2 * 16 * 64, DeviceArena::kDefaultBaseAlign));
+    EXPECT_LT(fake_.requested_heap_bytes, 2 * 16 * sizeof(ChipTaskStorage));
+    ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+}
+
 TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpUsesCurrentAicoreNodesAndChargedSchedulerPublication) {
     api_ = HostApi(nullptr, 0, 0, 11, &fake_ops());
     for (TestOrchEntryFunc entry : {scalar_dump_orch_entry, native_scalar_dump_orch_entry}) {
@@ -2885,8 +2973,8 @@ TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpUsesCurrentAicoreNodesAndCharged
         runtime.dev.dump_args_level = static_cast<uint32_t>(DumpArgsLevel::FULL);
         ChipStorageTaskArgs args;
         ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
-        ASSERT_EQ(runtime.pending_publication().prerequisites.size(), 1u);
-        const auto &region = runtime.pending_publication().prerequisites.front();
+        ASSERT_EQ(runtime.pending_publication().prerequisites.size(), entry == native_scalar_dump_orch_entry ? 2u : 1u);
+        const auto &region = runtime.pending_publication().prerequisites.back();
         const auto context_offset =
             runtime.dev.scheduler_bootstrap.worker_context_base - reinterpret_cast<uint64_t>(region.device_target);
         const auto *context = reinterpret_cast<const SchedulerWorkerContext *>(
@@ -2957,7 +3045,7 @@ TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpUsesCurrentAicoreNodesAndCharged
         };
         SchedulerGraphAccess graph(view);
         if (entry != scalar_dump_orch_entry)
-            ASSERT_EQ(scheduler_bind_graph_arguments(graph, expected.task_ref), SchedulerGraphBindingError::NONE);
+            ASSERT_EQ(scheduler_observe_graph_arguments(graph, expected.task_ref), SchedulerGraphBindingError::NONE);
         SchedulerTaskPayloadArguments actual{};
         ASSERT_EQ(scheduler_parse_task_payload_arguments(graph, expected.task_ref, &actual), SchedulerGraphResult::OK);
         EXPECT_EQ(actual.scalar_count, expected.scalar_count);
@@ -2983,8 +3071,8 @@ TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpExcludesPendingInlineControlOper
         runtime.dev.dump_args_level = static_cast<uint32_t>(DumpArgsLevel::FULL);
         ChipStorageTaskArgs args;
         ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
-        ASSERT_EQ(runtime.pending_publication().prerequisites.size(), 1u);
-        const auto &region = runtime.pending_publication().prerequisites.front();
+        ASSERT_EQ(runtime.pending_publication().prerequisites.size(), native ? 2u : 1u);
+        const auto &region = runtime.pending_publication().prerequisites.back();
         const auto context_offset =
             runtime.dev.scheduler_bootstrap.worker_context_base - reinterpret_cast<uint64_t>(region.device_target);
         const auto *context = reinterpret_cast<const SchedulerWorkerContext *>(

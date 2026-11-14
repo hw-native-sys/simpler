@@ -22,6 +22,9 @@
 
 #include "runtime.h"
 #include "scheduler/scheduler_context.h"
+#ifdef PTO_ASYNC_WAIT_H
+#include "runtime_core.h"
+#endif
 
 namespace {
 constexpr int kCores = 6;
@@ -132,6 +135,16 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
 
 class SchedulerContextTestPeer {
 public:
+#ifdef PTO_ASYNC_WAIT_H
+    static void bind_async(SchedulerContext &context, RuntimeContext &runtime) {
+        context.rt_ = &runtime;
+        context.sched_ = &runtime.scheduler;
+    }
+    static DeferredCompletionSlab &slab(SchedulerContext &context, TaskId task) {
+        context.payload_per_core_[0][0].local_context.async_ctx.task_token = task;
+        return context.deferred_slab_per_core_[0][0];
+    }
+#endif
     static int32_t request_all(SchedulerContext &context, Runtime *runtime) {
         return context.retire_all_cores(runtime);
     }
@@ -387,6 +400,109 @@ TEST_F(SchedulerRetirement, EarlyRequestPreservesPartialTimeout) {
     EXPECT_EQ(request_all(), 0);
     expect_once();
 }
+
+#ifdef PTO_ASYNC_WAIT_H
+TEST_F(SchedulerRetirement, ShutdownPreservesEmergencyRetirementFailure) {
+    handshake();
+    silent_first_core = true;
+    emergency();
+    EXPECT_EQ(context->shutdown(0, runtime.get()), -1);
+    EXPECT_EQ(context->shutdown(1, runtime.get()), -1);
+    expect_once();
+    EXPECT_EQ(batches.load(), 1);
+}
+
+TEST_F(SchedulerRetirement, ShutdownPreservesPublisherRetirementFailure) {
+    silent_first_core = true;
+    EXPECT_EQ(request_all(), 0);
+    handshake();
+    EXPECT_EQ(context->shutdown(0, runtime.get()), -1);
+    EXPECT_EQ(context->shutdown(1, runtime.get()), -1);
+    expect_once();
+    EXPECT_EQ(batches.load(), 1);
+}
+
+TEST_F(SchedulerRetirement, NewRunClearsRetirementFailure) {
+    handshake();
+    silent_first_core = true;
+    emergency();
+    EXPECT_EQ(context->retirement_error(), -1);
+    ASSERT_EQ(initialize(*context, runtime.get(), reinterpret_cast<uint64_t>(regs.data()), 0), 0);
+    EXPECT_EQ(context->retirement_error(), 0);
+}
+
+TEST_F(SchedulerRetirement, CancelledDrainCoversAllOwnersWithoutCompletingTasks) {
+    handshake();
+    ASSERT_EQ(request_all(), 0);
+    auto rt = std::make_unique<RuntimeContext>();
+    auto mailbox = std::make_unique<AICoreCompletionMailbox>();
+    rt->aicore_mailbox = mailbox.get();
+    SchedulerContextTestPeer::bind_async(*context, *rt);
+    const TaskId task = TaskId::make(0, 19);
+    uint32_t counter = 3;
+    uint64_t sdma_record = 9;
+    auto &waits = rt->scheduler.async_wait_list;
+    waits.count.store(1);
+    waits.entries[0].task_token = task;
+    waits.entries[0].normal_done = true;
+    // Any accidental success callback would dereference this invalid slot.
+    waits.entries[0].slot_state = reinterpret_cast<ChipTaskSlotState *>(1);
+    int32_t error = 0;
+    ASSERT_TRUE(waits.append_condition_locked(
+        waits.entries[0], reinterpret_cast<uint64_t>(&counter), 0, 3, ASYNC_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, error
+    ));
+    ASSERT_TRUE(mailbox->try_push_condition(
+        task, reinterpret_cast<uint64_t>(&sdma_record), 9, 0, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_SDMA_EVENT_RECORD
+    ));
+    ASSERT_TRUE(mailbox->try_push_normal_done(task, 1));
+    auto &slab = SchedulerContextTestPeer::slab(*context, task);
+    slab.count = 1;
+    slab.entries[0] = {reinterpret_cast<uint64_t>(&counter), 0, 3, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0};
+    KernelErrorCleanup result{};
+    context->drain_cancelled_run(UINT64_MAX, result);
+    EXPECT_EQ(result.complete, 1u);
+    EXPECT_EQ(result.released_cores, kCores);
+    EXPECT_EQ(result.drained_conditions, 3u);
+    EXPECT_TRUE(waits.entries[0].conditions[0].retired);
+    EXPECT_EQ(waits.count.load(), 1);
+    EXPECT_EQ(sdma_record, 9u);
+}
+
+TEST_F(SchedulerRetirement, CancelledDrainRejectsPendingSlabAndPreservesIdentity) {
+    handshake();
+    ASSERT_EQ(request_all(), 0);
+    auto rt = std::make_unique<RuntimeContext>();
+    SchedulerContextTestPeer::bind_async(*context, *rt);
+    const TaskId task = TaskId::make(1, 20);
+    uint32_t counter = 0;
+    auto &slab = SchedulerContextTestPeer::slab(*context, task);
+    slab.count = 1;
+    slab.entries[0] = {reinterpret_cast<uint64_t>(&counter), 0, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0};
+    KernelErrorCleanup result{};
+    context->drain_cancelled_run(0, result);
+    EXPECT_EQ(result.complete, 0u);
+    EXPECT_EQ(result.async_error, SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    EXPECT_EQ(result.source, 4u);
+    EXPECT_EQ(result.task_token, TaskId::to_uint64(task));
+    EXPECT_EQ(slab.count, 1u);
+    counter = 1;
+    context->drain_cancelled_run(UINT64_MAX, result);
+    EXPECT_EQ(result.complete, 1u);
+}
+
+TEST_F(SchedulerRetirement, CancelledDrainRequiresEveryCoreRelease) {
+    handshake();
+    silent_first_core = true;
+    emergency();
+    KernelErrorCleanup result{};
+    context->drain_cancelled_run(UINT64_MAX, result);
+    EXPECT_EQ(result.complete, 0u);
+    EXPECT_EQ(result.core_error, -1);
+    EXPECT_EQ(result.source, 1u);
+    EXPECT_EQ(result.core, 0);
+    EXPECT_EQ(result.released_cores, kCores - 1);
+}
+#endif
 
 TEST_F(SchedulerRetirement, InvalidPhysicalCoreIsNotPublishedOrRetired) {
     runtime->dev.workers[0].physical_core_id = kCores;

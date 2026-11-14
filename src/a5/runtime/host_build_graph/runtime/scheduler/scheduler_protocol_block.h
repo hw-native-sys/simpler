@@ -159,12 +159,13 @@ static inline __aicore__ void scheduler_protocol_group_descriptor(
     lane->block_idx = descriptor->block_idx;
     lane->cluster_index = descriptor->cluster_index;
     lane->lane = local->config.self_lane;
-    scheduler_lane_mask_store(lane->active_mask, scheduler_lane_mask_load(descriptor->active_mask));
-    lane->flags = descriptor->flags;
-    lane->logical_block_num = descriptor->logical_block_num;
-    scheduler_lane_mask_store(lane->resource_mask, scheduler_lane_mask_load(descriptor->resource_mask));
+    scheduler_lane_mask_store(lane->active_mask, admission.current_active_mask);
+    lane->flags = admission.current_flags;
+    lane->logical_block_num = admission.current_block_num;
+    scheduler_lane_mask_store(lane->resource_mask, admission.current_resource_mask);
     for (uint32_t peer = 0; peer < 3; ++peer) {
-        lane->lane_subtasks[peer] = descriptor->lane_subtasks[peer];
+        lane->lane_subtasks[peer] =
+            admission.current_active_mask.has(static_cast<SubtaskSlot>(peer)) ? peer : UINT8_MAX;
         lane->previous_lane_seq[peer] = descriptor->previous_lane_seq[peer];
     }
     scheduler_protocol_publish_record(lane);
@@ -213,7 +214,7 @@ static inline __aicore__ void scheduler_protocol_group_acks(
     }
     auto *stamp = releases ? &record->owner.releases_observed : &lane->arrivals_observed;
     auto *values = releases ? record->owner.released_seq : lane->arrived_seq;
-    const LaneMask resources = scheduler_mix_resource_mask(local->admission->current_active_mask);
+    const LaneMask resources = local->admission->current_resource_mask;
     for (uint32_t peer = 0; peer < 3; ++peer) {
         const uint64_t expected = resources.has(static_cast<SubtaskSlot>(peer)) ? group.group_seq : 0;
         if (observed[peer] != expected || (stamp->sequence != 0 && values[peer] != observed[peer])) {

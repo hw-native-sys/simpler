@@ -2259,7 +2259,8 @@ NB_MODULE(_task_interface, m) {
         .value("REMOTE_SIDECAR", BackendKind::REMOTE_SIDECAR)
         .value("DEVICE_MALLOC", BackendKind::DEVICE_MALLOC)
         .value("FORK_COW", BackendKind::FORK_COW)
-        .value("VMM_SHAREABLE", BackendKind::VMM_SHAREABLE);
+        .value("VMM_SHAREABLE", BackendKind::VMM_SHAREABLE)
+        .value("SHARED_FD_SLICE", BackendKind::SHARED_FD_SLICE);
 
     // --- CanonicalIdentity ---
     // Equality and hashing fold exactly the three meaningful fields, so a decode with dirty wire
@@ -4037,6 +4038,7 @@ NB_MODULE(_task_interface, m) {
         .def_prop_ro("_host_ddr_mapping_supported", &ChipWorker::host_ddr_mapping_supported)
         .def("_map_host_ddr", &ChipWorker::map_host_ddr, nb::call_guard<nb::gil_scoped_release>())
         .def("_unmap_host_ddr", &ChipWorker::unmap_host_ddr, nb::call_guard<nb::gil_scoped_release>())
+        .def("_quiesce_host_uses", &ChipWorker::quiesce_host_uses, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro(
             "launch_depth", &ChipWorker::launch_depth,
             "How many runs this worker may have launched at once, after its request was resolved "

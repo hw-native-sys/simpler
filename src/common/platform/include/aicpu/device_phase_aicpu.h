@@ -91,6 +91,14 @@ inline void aicpu_phase_set_window(AicpuPhase phase, uint64_t start_cycle, uint6
     records[static_cast<int>(phase)].end_cycle = end_cycle;
 }
 
+// One terminal writer, after all AICores retired. Reuses the ordinary device
+// timing readback, independently of chip-swimlane collection.
+inline void device_phase_set_aicore_work_window(const AicoreWorkWindow &window) {
+    const uint64_t base = get_platform_phase_base();
+    if (base == 0) return;
+    device_phase_buffer_header(reinterpret_cast<void *>(base))->aicore_work = window;
+}
+
 // =============================================================================
 // Selective task-timing slots (fixed tail after the phase region)
 // =============================================================================

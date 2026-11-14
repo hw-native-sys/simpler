@@ -32,6 +32,20 @@ class Runtime;
 struct Handshake;
 struct RuntimeContext;
 
+// Error-path retirement evidence. It does not authorize Host or Worker reuse.
+struct KernelErrorCleanup {
+    uint64_t run_epoch;
+    uint64_t task_token;
+    int32_t core_error;
+    int32_t async_error;
+    uint32_t source;
+    int32_t core;
+    uint32_t expected_cores;
+    uint32_t released_cores;
+    uint32_t drained_conditions;
+    uint32_t complete;
+};
+
 /**
  * SchedulerContext: owns all scheduler-side state and methods.
  *
@@ -104,6 +118,12 @@ public:
     // Orchestrator threads own none and no-op. Runs before the completion
     // latch, so no run() exit path can leave a worker blocked on its gate.
     int32_t shutdown(int32_t thread_idx, Runtime *runtime);
+
+    // Final consumers read this after every participant has joined. A zero
+    // result alone does not prove that all cores or asynchronous work retired.
+    int32_t retirement_error() const { return retirement_error_.load(std::memory_order_acquire); }
+    // Only the last participant may call this, after all producers joined.
+    void drain_cancelled_run(uint64_t deadline, KernelErrorCleanup &result);
 
     // Run all post-orchestration scheduler bookkeeping:
     //  - publishes core assignments to the perf collector (SIMPLER_DFX)
@@ -198,7 +218,9 @@ private:
     // Indexed by core id and reset before handshake in each generation.
     static constexpr uint8_t RETIREMENT_READY = 1;
     static constexpr uint8_t RETIREMENT_REQUESTED = 2;
+    static constexpr uint8_t RETIREMENT_RELEASED = 4;
     uint8_t retirement_state_[PLATFORM_MAX_CORES]{};
+    std::atomic<int32_t> retirement_error_{0};
     // The active callable's registration-owned object-address table and the
     // number of entries it holds, both bound from the descriptor in the cold
     // path. The table is in the callable's registration block, not in the

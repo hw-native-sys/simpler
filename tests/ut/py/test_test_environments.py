@@ -199,6 +199,29 @@ def test_collect_only_does_not_probe_dependencies_or_freeze_a_plan(tmp_path):
     assert not (tmp_path / "preflight-called").exists()
 
 
+@pytest.mark.parametrize(
+    ("platform", "expected"),
+    [("a2a3", {"test_shared"}), ("a2a3sim", {"test_shared", "test_simulator_only"})],
+)
+def test_scene_method_platform_limits_the_class_cases(tmp_path, platform, expected):
+    source = """
+import pytest
+
+class TestScene:
+    CASES = [{"platforms": ["a2a3", "a2a3sim"]}]
+
+    def test_shared(self):
+        pass
+
+    @pytest.mark.platforms(["a2a3sim"])
+    def test_simulator_only(self):
+        pass
+"""
+    result, _, xml_path = _run_pytest(tmp_path, source, "--platform", platform, profile="default")
+    _success(result)
+    assert {case.get("name") for case in ET.parse(xml_path).getroot().iter("testcase")} == expected
+
+
 def test_selected_missing_capability_fails_before_test_execution(tmp_path):
     source = _DIRECT.format(count=1).replace("assert index >= 0", f'open({str(tmp_path / "body-ran")!r}, "w").close()')
     result, plan, _ = _run_pytest(tmp_path, source, capable=False)

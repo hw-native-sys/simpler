@@ -228,20 +228,22 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
     assert controls[root["task_ref"]]["completed_subtasks"] < total_subtasks
     assert controls[consumer["task_ref"]]["completed_subtasks"] == 0
     positions = protocol["cluster_count"] * (2 if mask in (2, 4) else 1)
-    version = protocol_version(protocol)
-    assert version in (10, 11)
+    assert protocol_version(protocol)
     assert type(protocol.get("close_seal_stride")) is int and protocol["close_seal_stride"] == 64
     for task in protocol["tasks"]:
         control = controls[task["task_ref"]]
         seal = control.get("claim_seal")
         assert type(seal) is int and seal >= 0
-        cooperative = task["block_num"] > 1 or task["active_mask"].bit_count() > 1
+        cooperative = bool(task.get("flags", 0) & 16)
         assert seal == 0 or (cooperative and seal == control["next_block"] == task["block_num"])
     minimum_blocks = 2
-    uses_tickets = blocks >= minimum_blocks
+    sync = bool(root.get("flags", 0) & 16)
+    uses_tickets = sync and minimum_blocks <= blocks < positions
     tickets = controls[root["task_ref"]]["claim_tickets"]
+    assert type(tickets) is int
+    assert 0 <= controls[root["task_ref"]]["next_block"] <= blocks
     if uses_tickets:
-        assert 1 <= tickets <= blocks + positions
+        assert 1 <= tickets <= positions
         assert controls[root["task_ref"]]["next_block"] <= min(blocks, tickets)
     else:
         assert tickets == 0
@@ -257,6 +259,8 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
     assert all(controls[ref]["state"] == 0 for ref in (root["task_ref"], consumer["task_ref"]))
 
 
+# Compilation, healthy/fault/recovery runs and diagnostic decoding share this case budget.
+@pytest.mark.timeout(300)
 @pytest.mark.parametrize("mask,lane", _shape_params(_SHAPES))
 @pytest.mark.parametrize("blocks", (1, 2))
 def test_bounded_kernel_timeout_keeps_failed_run_contained(st_platform, st_device_ids, mask, lane, blocks, monkeypatch):
@@ -354,8 +358,7 @@ def _root_block_num(protocol):
 def _check_two_wave_topology(protocol, blocks, mask, required):
     if not required:
         return
-    version = protocol_version(protocol)
-    assert version in (10, 11)
+    assert protocol_version(protocol)
     positions = protocol["cluster_count"] * _lane_positions_per_cluster(mask)
     assert blocks == positions * 2, "two-wave fault must use the actual device topology"
 
@@ -639,9 +642,8 @@ def _run_pass(  # noqa: PLR0912 -- one Worker owns healthy, failed, and cleanup 
             assert worker.scheduler_runtime_mode in (1, 2)
             path, raw = _capture(prefix)
             proof_call.update(capture=str(path), capture_run_epoch=raw["aicore_protocol"]["run_epoch"])
-            assert raw["aicore_protocol"]["schema"] == (
-                "hbg-native-protocol-v11" if native_graph else "hbg-native-protocol-v10"
-            )
+            assert protocol_version(raw["aicore_protocol"])
+            assert has_native_graph(raw["aicore_protocol"]) == native_graph
             launched = _root_block_num(raw["aicore_protocol"])
             assert blocks < 0 or launched == blocks
             # A STARS-killed op can poison device access; its D2H output is

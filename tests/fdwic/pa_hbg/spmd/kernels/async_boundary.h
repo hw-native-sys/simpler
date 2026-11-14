@@ -32,7 +32,7 @@ static inline __aicore__ void record_async_boundary(__gm__ int64_t *args, int32_
     auto *records = reinterpret_cast<__gm__ ExecutionRecord *>(tensor_data(args[0]));
     auto *record = &records[block * 3 + slot];
     AsyncCtx ctx = get_async_ctx(args);
-    // Bits 0..4: valid token, non-null count/error/entries, nonzero capacity.
+    // Bits 0..4: live async group, non-null count/error/entries, nonzero capacity.
     record->metadata_padding[0] = static_cast<int64_t>(async_ctx_is_deferred(ctx)) |
                                   (static_cast<int64_t>(ctx.completion_count != nullptr) << 1) |
                                   (static_cast<int64_t>(ctx.completion_error_code != nullptr) << 2) |

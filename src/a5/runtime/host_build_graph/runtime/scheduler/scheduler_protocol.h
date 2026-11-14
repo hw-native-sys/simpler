@@ -165,7 +165,8 @@ static inline __aicore__ void scheduler_protocol_observe_record(__gm__ T *record
 
 template <typename Local>
 static inline __aicore__ void scheduler_protocol_task_actor(
-    __gm__ void *base, const Local *local, int64_t task, uint64_t order, uint32_t flags, bool completion, bool before
+    __gm__ void *base, const Local *local, int64_t task, uint64_t order, uint32_t flags, bool completion, bool before,
+    uint64_t cycles = UINT64_MAX
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
@@ -178,7 +179,9 @@ static inline __aicore__ void scheduler_protocol_task_actor(
     auto *actor = completion ? &record->completion : &record->admission;
     if (before) {
         scheduler_observe_cache_line(actor);
-        if (!scheduler_protocol_stamp(base, local, layout, &actor->before)) return;
+        if (!(cycles == UINT64_MAX ? scheduler_protocol_stamp(base, local, layout, &actor->before) :
+                                     scheduler_protocol_stamp_at(base, local, layout, &actor->before, cycles)))
+            return;
         actor->run_epoch = layout->run_epoch;
         actor->task_ref = task;
         actor->order_key = order;
@@ -190,7 +193,9 @@ static inline __aicore__ void scheduler_protocol_task_actor(
             scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
             return;
         }
-        if (!scheduler_protocol_stamp(base, local, layout, &actor->after)) return;
+        if (!(cycles == UINT64_MAX ? scheduler_protocol_stamp(base, local, layout, &actor->after) :
+                                     scheduler_protocol_stamp_at(base, local, layout, &actor->after, cycles)))
+            return;
     }
     scheduler_publish_cache_line(actor);
 }
@@ -242,7 +247,7 @@ static inline __aicore__ void scheduler_protocol_payload_publication(
         if ((local->local_ready_mask & (1U << claim.slot_index)) != 0 || record->permit.sequence != 0 ||
             record->entry.sequence != 0 ||
             (record->publication_count != 0 &&
-             (scheduler_slot_uses_admission(local, slot) ||
+             (scheduler_slot_uses_admission(local, slot) || slot.cluster_mix ||
               (record->flags & SCHEDULER_PROTOCOL_PAYLOAD_PUBLISHED) == 0 ||
               record->worker_index != local->worker_id() || record->run_epoch != layout->run_epoch ||
               record->task_ref != slot.task_ref || record->block_idx != slot.block_idx ||

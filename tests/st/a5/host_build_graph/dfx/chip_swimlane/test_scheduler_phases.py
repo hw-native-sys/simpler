@@ -187,48 +187,54 @@ class TestSchedulerPhases(SceneTestCase):
                 assert all("runtime" not in stream for stream in streams)
                 assert all(stream["capture"]["dropped"] == 0 for stream in streams)
                 emitted_kinds = {record["kind"] for stream in streams for record in stream["records"]}
-                required_kinds = {"bootstrap", "state_probe", "dispatch", "complete", "resolve", "refill", "idle"}
+                required_kinds = {
+                    "bootstrap",
+                    "state_probe",
+                    "dispatch",
+                    "complete",
+                    "idle",
+                    "scalar_execution_token_refill",
+                    "scalar_execution_token_receive",
+                    "scalar_execution_token_fanin",
+                    "scalar_execution_token_dispatch",
+                }
                 assert required_kinds <= emitted_kinds, (
                     f"missing Scheduler kinds: {sorted(required_kinds - emitted_kinds)}"
                 )
-                assert not ({"fanin", "ready_claim", "ready_steal", "direct_refill", "worksteal"} & emitted_kinds)
+                assert not (
+                    {"fanin", "ready_claim", "ready_steal", "direct_refill", "worksteal", "resolve", "refill"}
+                    & emitted_kinds
+                )
                 records = [record for stream in streams for record in stream["records"]]
-                launch_kinds = {"dispatch", "refill"}
                 launches_by_task = Counter(
                     int(record["task_id"])
                     for record in records
-                    if record["kind"] in launch_kinds and record["task_id"] is not None
+                    if record["kind"] == "dispatch" and record["task_id"] is not None
                 )
                 assert set(launches_by_task) == {int(row[1]) for row in aicore_rows}
                 assert set(launches_by_task.values()) == {1}
-                profiled_task_ids = set(launches_by_task)
-                state_probe_task_ids = {
+                probes_by_task = Counter(
                     int(record["task_id"])
                     for record in records
                     if record["kind"] == "state_probe" and record["task_id"] is not None
-                }
-                assert state_probe_task_ids <= profiled_task_ids
-                pool_launch_task_ids = {
+                )
+                assert probes_by_task == launches_by_task, "each execution token needs one acquisition record"
+                completions_by_task = Counter(
                     int(record["task_id"])
                     for record in records
-                    if record["kind"] == "dispatch" and record["task_id"] is not None
-                }
-                assert pool_launch_task_ids <= state_probe_task_ids, (
-                    "Ready pool launches are missing state_probe records: "
-                    f"{sorted(pool_launch_task_ids - state_probe_task_ids)}"
+                    if record["kind"] == "complete" and record["task_id"] is not None
                 )
-                refill_task_ids = {
-                    int(record["task_id"])
-                    for record in records
-                    if record["kind"] == "refill" and record["task_id"] is not None
-                }
-                assert profiled_task_ids - state_probe_task_ids <= refill_task_ids, (
-                    "tasks without state_probe were not launched by refill: "
-                    f"{sorted(profiled_task_ids - state_probe_task_ids - refill_task_ids)}"
-                )
+                assert completions_by_task == launches_by_task, "each execution token needs one completion record"
                 for stream in streams:
+                    # Batched token acquisitions share a discovery start, so
+                    # StateProbe envelopes may overlap. Scalar profiles below
+                    # account for the actual work without double-counting it.
                     ordered = sorted(
-                        (record for record in stream["records"] if not record["kind"].startswith("scalar_")),
+                        (
+                            record
+                            for record in stream["records"]
+                            if not record["kind"].startswith("scalar_") and record["kind"] != "state_probe"
+                        ),
                         key=lambda record: (record["start_cycles"], record["end_cycles"]),
                     )
                     assert all(
@@ -244,7 +250,7 @@ class TestSchedulerPhases(SceneTestCase):
                 launch_by_task = {
                     int(record["task_id"]): record
                     for record in records
-                    if record["kind"] in launch_kinds and record["task_id"] is not None
+                    if record["kind"] == "dispatch" and record["task_id"] is not None
                 }
                 assert all(
                     probe["end_cycles"] <= launch_by_task[task_id]["start_cycles"]

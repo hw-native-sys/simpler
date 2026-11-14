@@ -208,6 +208,10 @@ inline void block_owner(JsonObject &parent, const SchedulerProtocolBlockOwner &r
     row.lane_mask("active_mask", record.active_mask);
     row.number("flags", record.flags);
     row.numbers("released_seq", record.released_seq, 3);
+    row.stamp("staged", record.staged);
+    row.number("sync_tail", record.sync_tail);
+    row.numbers("sync_frontier", record.sync_frontier, 3);
+    row.numbers("sync_hold", record.sync_hold, 3);
 }
 
 inline void claim_certificate(JsonObject &parent, const SchedulerProtocolClaimTrace &record) {
@@ -297,7 +301,7 @@ inline void validate_layout(const Image &image, const AicoreSchedulerLayout &lay
         summary.worker_count != layout.spmd.worker_count || summary.cluster_count != layout.spmd.cluster_count ||
         summary.cooperative_task_count != layout.spmd.cooperative_task_count ||
         summary.mix_task_count != layout.spmd.mix_task_count ||
-        summary.admission_member_word_count != layout.admission_member_word_count ||
+        summary.sync_mix_task_count != layout.spmd.sync_mix_task_count ||
         summary.admission_records_offset != layout.admission_records_offset ||
         summary.admission_record_stride != layout.admission_record_stride ||
         summary.admission_log_offset != layout.admission_log_offset ||
@@ -318,15 +322,13 @@ inline void admissions(JsonObject &root, const Image &image, const AicoreSchedul
     for (uint64_t task = 0; count != 0 && task < layout.task_count; ++task) {
         const uint64_t offset = layout.admission_records_offset + task * layout.admission_record_stride;
         const auto &record = *image.array<SchedulerAdmissionRecord>(offset, 1);
-        if (record.member_words_offset != offset + sizeof(SchedulerAdmissionRecord))
-            throw std::invalid_argument("protocol member bitmap outside its task record");
         std::vector<uint64_t> seals;
         if (record.mix_close_seals_offset != 0) {
             const uint64_t first = layout.mix_close_seals_offset;
             const uint64_t stride = layout.spmd.cluster_count * sizeof(SchedulerMixCloseSeal);
             if (stride == 0 || record.mix_close_seals_offset < first ||
                 (record.mix_close_seals_offset - first) % stride != 0 ||
-                (record.mix_close_seals_offset - first) / stride >= layout.spmd.mix_task_count)
+                (record.mix_close_seals_offset - first) / stride >= layout.spmd.sync_mix_task_count)
                 throw std::invalid_argument("protocol close seal outside Host planned region");
             const auto *cells =
                 image.array<SchedulerMixCloseSeal>(record.mix_close_seals_offset, layout.spmd.cluster_count);
@@ -342,15 +344,10 @@ inline void admissions(JsonObject &root, const Image &image, const AicoreSchedul
         row.number("order_key", record.order_key);
         row.number("block_num", record.logical_block_num);
         row.number("member_count", record.member_count);
-        row.number("member_rank_offset", record.member_rank_offset);
         row.lane_mask("active_mask", record.active_mask);
         row.number("flags", record.flags);
-        row.number("member_words_offset", record.member_words_offset);
+        row.number("record_offset", offset);
         row.number("close_seals_offset", record.mix_close_seals_offset);
-        row.numbers(
-            "member_words", image.array<uint64_t>(record.member_words_offset, layout.admission_member_word_count),
-            layout.admission_member_word_count
-        );
         row.numbers("close_seals", seals.data(), seals.size());
     }
     out << ']';
@@ -371,7 +368,7 @@ inline std::string scheduler_export_protocol(
     std::ostringstream out;
     {
         JsonObject root(out);
-        root.string("schema", graph_source.empty() ? "hbg-native-protocol-v10" : "hbg-native-protocol-v11");
+        root.string("schema", graph_source.empty() ? "hbg-native-protocol-v20" : "hbg-native-protocol-v21");
         root.number("close_seal_stride", sizeof(SchedulerMixCloseSeal));
         if (!graph_source.empty()) {
             root.field("graph_source") << graph_source;
@@ -397,6 +394,7 @@ inline std::string scheduler_export_protocol(
         root.number("cooperative_task_count", plan.cooperative_task_count);
         root.number("cluster_count", layout.spmd.cluster_count);
         root.number("mix_task_count", layout.spmd.mix_task_count);
+        root.number("sync_mix_task_count", layout.spmd.sync_mix_task_count);
         const auto &run = *image.array<SchedulerRunControl>(layout.run_control_offset, 1);
         root.number("expected_task_count", run.expected_task_count);
         root.number("inline_completed_count", run.inline_completed_count);
@@ -460,11 +458,18 @@ inline std::string scheduler_export_protocol(
         for (uint64_t task = 0; task < plan.task_count; ++task) {
             if (task != 0) out << ',';
             JsonObject row(out);
+            const uint64_t completion = controls[task].completion_state;
+            const uint8_t flags = tasks[task].metadata.flags;
+            const bool physical = scheduler_task_is_executable(flags) && !scheduler_task_is_inline(flags);
             row.number("task_ref", task);
-            row.number("state", controls[task].state);
+            row.number("state", scheduler_completion_task_state(completion));
+            row.number("canonical_total", scheduler_completion_total(completion));
+            row.number("pending_compute", scheduler_completion_remaining(completion));
+            row.number("completion_debt", scheduler_completion_debt(completion));
             row.number("next_block", controls[task].next_block);
+            row.number("parked_count", controls[task].parked_count);
             row.number("claim_tickets", controls[task].claim_tickets);
-            row.number("completed_subtasks", scheduler_completion_count(controls[task].completion_state));
+            row.number("completed_subtasks", physical ? scheduler_completion_count(completion) : 0);
             row.number("admission_state", controls[task].admission_state);
             row.number("claim_seal", controls[task].claim_seal);
         }

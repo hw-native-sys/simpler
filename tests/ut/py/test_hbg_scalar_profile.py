@@ -11,11 +11,14 @@
 import copy
 import gzip
 import json
+import re
+from pathlib import Path
 
 import pytest
 from _capture_builder import Capture
 
-from simpler_setup.tools.hbg.scalar_profile import analyze_streams, partition, trace_events
+from simpler_setup.tools.hbg.phases import SCALAR_PHASES
+from simpler_setup.tools.hbg.scalar_profile import SCALAR_FUNCTIONS, analyze_streams, partition, trace_events
 from simpler_setup.tools.swimlane_converter import _atomic_json, generate_chrome_trace_json, read_perf_data
 
 
@@ -34,6 +37,47 @@ def record(kind, begin, end, depth, **extra):
 
 def window():
     return record("scalar_window", 10, 100, 0, scalar_schema=2, function_min_cycles=0)
+
+
+def test_scalar_wire_vocabulary_matches_cpp_and_names_every_function():
+    header = Path(__file__).resolve().parents[3] / "src/common/host_build_graph/sched_phase_kind.h"
+    source = header.read_text()
+    kinds = dict(re.findall(r"\b(Scalar\w+)\s*=\s*(\d+)", source))
+    wire_names = dict(re.findall(r'case SchedPhaseKind::(Scalar\w+):\s*return "(scalar_\w+)";', source))
+    assert set(kinds) == set(wire_names)
+    assert len(set(kinds.values())) == len(kinds)
+    assert set(wire_names.values()) == SCALAR_PHASES
+    assert set(SCALAR_FUNCTIONS) == SCALAR_PHASES - {"scalar_window"}
+
+
+def test_long_function_names_and_primitives_survive_filtered_nesting():
+    rows = [
+        window() | {"start_cycles": 100, "end_cycles": 10_100, "function_min_cycles": 1000},
+        record("scalar_execution_token_refill", 200, 8200, 1, task_id=7),
+        record("scalar_execution_token_receive", 1000, 5000, 2, task_id=7),
+        record("scalar_prepared_acquire", 2000, 4000, 3, task_id=7),
+        record("scalar_dcci_out", 2500, 2600, 4),
+        record("scalar_admission", 6000, 8000, 2, task_id=7),
+    ]
+    profile = partition(rows, [])
+    profile.update(worker_id=0, scheduler_id=0, clock_freq_hz=1_000_000_000)
+    for row in profile["rows"]:
+        row["start_time_us"] = row["start_cycles"] / 1000
+        row["end_time_us"] = row["end_cycles"] / 1000
+    events = [
+        event
+        for event in trace_events([profile], pid=2, tid_base=30000, display=lambda t: f"t{t}")
+        if event["ph"] == "X"
+    ]
+    assert [(event["name"], event["dur"]) for event in events] == [
+        ("scheduler_refill_execution_tokens(t7)", 8.0),
+        ("scheduler_execution_token_receive(t7)", 4.0),
+        ("scheduler_acquire_execution_token(t7)", 2.0),
+        ("DCCI: SINGLE CACHELINE_OUT issue", 0.1),
+        ("scheduler_ordered_can_enter_slot(t7)", 2.0),
+    ]
+    assert [event["args"]["scalar_depth"] for event in events] == [1, 2, 3, 4, 2]
+    assert sum(profile["exclusive_cycles"].values()) == 10_000
 
 
 def test_nested_intervals_conserve_time_without_counting_parents_twice():
@@ -174,10 +218,19 @@ def test_predicated_skip_is_not_counted_as_kernel_execution():
 @pytest.mark.parametrize(
     ("phase", "function"),
     [
+        ("scalar_execution_token_refill", "scheduler_refill_execution_tokens"),
+        ("scalar_prepared_acquire", "scheduler_acquire_execution_token"),
+        ("scalar_cooperative_discover", "scheduler_discover_cooperative_task"),
+        ("scalar_cluster_mix_service", "scheduler_cluster_mix_service"),
+        ("scalar_group_acquire", "scheduler_acquire_group_lane"),
+        ("scalar_cluster_mix_needs_service", "scheduler_cluster_mix_needs_service"),
+        ("scalar_execution_continuation", "scheduler_try_execution_continuation"),
+        ("scalar_execution_token_fanin", "scheduler_execution_token_observe_fanin"),
+        ("scalar_cluster_mix_ready_replacement", "scheduler_cluster_mix_ready_replacement"),
         ("scalar_ordered_poll", "scheduler_ordered_poll_may_progress"),
-        ("scalar_admission_claim", "scheduler_try_claim_admission"),
+        ("scalar_admission_claim", "scheduler_stage_admission_candidate"),
         ("scalar_admission_publish", "scheduler_ordered_publish_pending"),
-        ("scalar_admission_commit", "scheduler_admission_detail::commit_validated_record"),
+        ("scalar_admission_commit", "scheduler_try_commit_admission"),
         ("scalar_admission_refresh", "scheduler_refresh_local_obligation"),
         ("scalar_ordinary_park", "scheduler_ordered_park_ordinary"),
         ("scalar_block_claim", "scheduler_claim_ordered_block"),

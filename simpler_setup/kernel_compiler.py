@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import warnings
+from collections.abc import Sequence
 from functools import cache
 from pathlib import Path
 from typing import Optional, Union
@@ -27,9 +28,11 @@ from .pto_isa import ensure_pto_isa_root, read_pto_isa_pin
 from .toolchain import (
     Aarch64GxxToolchain,
     CCECToolchain,
+    CCUToolchain,
     Gxx15Toolchain,
     GxxToolchain,
     ToolchainType,
+    _CcuCacheInputs,
 )
 
 logger = logging.getLogger(__name__)
@@ -147,12 +150,20 @@ def _ascend_incore_include_dirs(ascend_home: str) -> tuple[str, ...]:
     return tuple(include_dirs)
 
 
+class _CcuCompileCacheToken(_CcuCacheInputs):
+    schema: int
+    logic: str
+    extra_include_dirs: tuple[str, ...]
+    working_directory: str
+
+
 class KernelCompiler:
     """
     Compiler for PTO kernels and orchestration functions.
 
     Public entry points:
     - compile_incore(): Compile a kernel source file for AICore/AIVector
+    - compile_ccu(): Compile a native CCU Host module
     - compile_orchestration(): Compile an orchestration function for a given runtime
 
     Toolchain selection happens here, not in C++. `_orchestration_toolchain()`
@@ -170,11 +181,12 @@ class KernelCompiler:
     - HOST_GXX_15: g++-15 for simulation kernels (host execution)
     - HOST_GXX: g++ (g++-15 under sanitizers) for host orchestration .so
     - AARCH64_GXX: aarch64 cross-compiler for device orchestration
+    - CCU: shared Host G++ for native A5 CCU modules
     """
 
     # Comma-separated `-fsanitize` tokens, set once by conftest from the pytest
     # `--sanitizer` option (default "" = off). Only host toolchains (Gxx15 sim
-    # incore, Gxx host orchestration) honor it; ccec/aarch64 device builds never
+    # incore, Gxx host orchestration and CCU) honor it; ccec/aarch64 device builds never
     # do. Must match the runtime's install-time SIMPLER_SANITIZER.
     _sanitizers = ""
 
@@ -215,6 +227,7 @@ class KernelCompiler:
             self.host_gxx = GxxToolchain(prefer_g15=bool(self._sanitizers))
 
         self.gxx15 = Gxx15Toolchain()
+        self.ccu = CCUToolchain(self.host_gxx) if platform == "a5" else None
 
     def _sanitizer_flags(self, toolchain) -> list[str]:
         """Sanitizer flags for a host-compiled kernel / orchestration .so.
@@ -505,6 +518,7 @@ class KernelCompiler:
         label: str,
         error_hint: str = "Compiler not found",
         surface_diagnostics: bool = False,
+        cwd: Optional[str] = None,
     ) -> subprocess.CompletedProcess:
         """Run a subprocess command with standardized logging and error handling.
 
@@ -520,7 +534,9 @@ class KernelCompiler:
         """
         logger.debug(f"[{label}] Command: {' '.join(cmd)}")
         try:
-            result = subprocess.run(cmd, check=False, capture_output=True, text=True, cwd=self.project_root)
+            result = subprocess.run(
+                cmd, check=False, capture_output=True, text=True, cwd=cwd if cwd is not None else self.project_root
+            )
 
             if result.stdout and logger.isEnabledFor(10):  # DEBUG = 10
                 logger.debug(f"[{label}] stdout:\n{result.stdout}")
@@ -546,6 +562,7 @@ class KernelCompiler:
         error_hint: str = "Compiler not found",
         delete_output: bool = True,
         surface_diagnostics: bool = False,
+        cwd: Optional[str] = None,
     ) -> bytes:
         """Run compilation command, read output file, clean up, return bytes.
 
@@ -567,7 +584,7 @@ class KernelCompiler:
         # warnings.warn, which raises under an error-level warning filter -- a compile
         # that produced its output would otherwise leave the file behind.
         try:
-            self._run_subprocess(cmd, label, error_hint, surface_diagnostics=surface_diagnostics)
+            self._run_subprocess(cmd, label, error_hint, surface_diagnostics=surface_diagnostics, cwd=cwd)
 
             if not os.path.isfile(output_path):
                 raise RuntimeError(f"Compilation succeeded but output file not found: {output_path}")
@@ -603,10 +620,104 @@ class KernelCompiler:
         The file is created atomically to avoid races, then immediately
         closed so the caller can overwrite it with compiler output.
         """
-        directory = os.path.abspath(build_dir) if build_dir else "/tmp"
+        directory = os.path.abspath(build_dir) if build_dir else tempfile.gettempdir()
         fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=directory)
         os.close(fd)
         return path
+
+    def _ccu_toolchain(self) -> CCUToolchain:
+        if self.ccu is None:
+            raise ValueError(f"Native CCU modules require platform 'a5', got {self.platform!r}")
+        return self.ccu
+
+    def get_ccu_include_dirs(self) -> list[str]:
+        """Return the simpler ABI and CANN/HCOMM header search paths."""
+        return self._ccu_toolchain().get_include_dirs()
+
+    def get_ccu_library_paths(self) -> list[str]:
+        """Return the validated CCU/HCOMM shared libraries in link order."""
+        return self._ccu_toolchain().get_library_paths()
+
+    def _ccu_build_inputs(
+        self,
+        extra_compile_flags: Sequence[str] = (),
+        extra_link_flags: Sequence[str] = (),
+        extra_include_dirs: Optional[list[str]] = None,
+    ):
+        toolchain = self._ccu_toolchain()
+        sanitizers = self._sanitizer_flags(toolchain)
+        return toolchain._build_inputs(
+            extra_include_dirs=tuple(os.path.abspath(path) for path in extra_include_dirs or ()),
+            extra_compile_flags=(*sanitizers, *extra_compile_flags),
+            extra_link_flags=(*sanitizers, *extra_link_flags),
+        )
+
+    def ccu_compile_cache_token(
+        self,
+        *,
+        extra_include_dirs: Optional[list[str]] = None,
+        extra_compile_flags: Sequence[str] = (),
+        extra_link_flags: Sequence[str] = (),
+    ) -> _CcuCompileCacheToken:
+        """Describe CCU compiler, SDK, ABI and runtime-library inputs.
+
+        Source files and their transitive dependencies remain caller-owned.
+        Before each cache lookup, scan them with -M (including system headers).
+        The manifest_identity_header field contains the matching C++17 header.
+        """
+        inputs = self._ccu_build_inputs(extra_compile_flags, extra_link_flags, extra_include_dirs)
+        return {
+            "schema": _COMPILE_CACHE_SCHEMA,
+            "logic": _artifact_logic_token(),
+            **inputs.cache_token,
+            "extra_include_dirs": tuple(os.path.abspath(path) for path in extra_include_dirs or ()),
+            "working_directory": os.getcwd(),
+        }
+
+    def compile_ccu(
+        self,
+        source_path: str,
+        extra_include_dirs: Optional[list[str]] = None,
+        build_dir: Optional[str] = None,
+        *,
+        extra_sources: Sequence[str] = (),
+        extra_compile_flags: Sequence[str] = (),
+        extra_link_flags: Sequence[str] = (),
+    ) -> bytes:
+        """Build a complete native CCU shared library for ChipCallable.ccu_modules.
+
+        The sources provide the manifest export and native kernel entries.
+        Include ccu_manifest_identity.h for the SDK/PTO-ISA identity arrays.
+        Every call owns a private directory beneath build_dir (or the system
+        temporary directory), removed on both success and failure. Relative
+        paths and options are resolved from the caller's working directory.
+        """
+        self._ccu_toolchain()
+        cwd = os.getcwd()
+        sources = [Path(path).absolute() for path in (source_path, *extra_sources)]
+        for source in sources:
+            if not source.is_file():
+                raise FileNotFoundError(f"CCU source file not found: {source}")
+        inputs = self._ccu_build_inputs(extra_compile_flags, extra_link_flags, extra_include_dirs)
+        includes = [*inputs.include_dirs, *(Path(path).absolute() for path in extra_include_dirs or ())]
+        with tempfile.TemporaryDirectory(prefix="ccu-module-", dir=build_dir) as directory:
+            build = Path(directory).absolute()
+            (build / "ccu_manifest_identity.h").write_text(inputs.manifest_identity_header(), encoding="ascii")
+            output = str(build / "module.so")
+            cmd = [
+                inputs.cxx_path,
+                *inputs.compile_flags,
+                f"-I{build}",
+                *(f"-I{path}" for path in includes),
+                *(str(source) for source in sources),
+                *inputs.link_flags,
+                *(str(path) for path in inputs.library_paths),
+                "-o",
+                output,
+            ]
+            return self._compile_to_bytes(
+                cmd, output, "CCU", error_hint=f"CCU compiler not found: {inputs.cxx_path}", cwd=cwd
+            )
 
     def compile_incore(
         self,

@@ -39,6 +39,7 @@
 #include <fstream>
 #include <iomanip>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -2465,11 +2466,6 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
         return false;
     };
     const bool has_aicpu_orch_phases = any_phase_records(data.orch_phase_records);
-    const bool has_aicpu_scheduler_records = any_phase_records(data.sched_phase_records);
-    if (scheduler_extension != nullptr && has_aicpu_scheduler_records) {
-        LOG_ERROR("Both runtime and AICPU scheduler records are present; refusing ambiguous export");
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
     const bool has_aicore_tasks = any_phase_records(data.aicore_records);
     const bool has_platform_scheduler_tasks = any_phase_records(data.perf_records);
     if ((aicore_tasks_extension != nullptr && has_aicore_tasks) ||
@@ -2753,7 +2749,13 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
         if (scheduler_tasks_extension != nullptr) {
             outfile << *scheduler_tasks_extension;
         } else {
-            outfile << "{\n    \"producer\": \"aicpu\",\n    \"records\": [";
+            // The native A5 HBG owner publishes execution identities for this
+            // run. Its staged timing uses the AICPU pool only as transport;
+            // legacy scheduling and recorded windows retain their own contract.
+            const bool aicore_scheduler =
+                std::string_view(SIMPLER_RUNTIME_NAME) == "host_build_graph" && execution_identity_extension != nullptr;
+            outfile << "{\n    \"producer\": \"" << (aicore_scheduler ? "aicore" : "aicpu")
+                    << "\",\n    \"records\": [";
             bool first = true;
             size_t total = 0;
             for (size_t core_idx = 0; core_idx < data.perf_records.size(); core_idx++) {
@@ -2768,20 +2770,17 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
             }
             if (!first) outfile << "\n    ";
             outfile << "]\n  }";
-            LOG_INFO("  scheduler_tasks: %zu AICPU records", total);
+            LOG_INFO("  scheduler_tasks: %zu %s records", total, aicore_scheduler ? "AICore" : "AICPU");
         }
     }
 
     if (data.level >= ChipSwimlaneLevel::SCHED_PHASES) {
         outfile << ",\n  \"" << chip_swimlane_extension_section_name(ChipSwimlaneExtensionSection::SchedulerRecords)
                 << "\": ";
-        if (scheduler_extension != nullptr) {
-            outfile << *scheduler_extension;
-        } else {
-            chip_swimlane_write_scheduler_records(
-                outfile, data.sched_phase_records, data.sched_phase_dropped_records, data.recorded_window
-            );
-        }
+        chip_swimlane_write_scheduler_records(
+            outfile, data.sched_phase_records, data.sched_phase_dropped_records, data.recorded_window,
+            scheduler_extension
+        );
 
         if (has_aicpu_orch_phases) {
             size_t orch_lanes = static_cast<size_t>(data.num_orch_phase_threads);

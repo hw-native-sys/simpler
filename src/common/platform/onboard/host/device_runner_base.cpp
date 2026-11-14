@@ -1257,9 +1257,11 @@ int DeviceRunnerBase::acquire_retained_temp(
             "acquire_retained_temp: workspace refused %zu bytes for slot %u: %s; the slot keeps its previous block",
             bytes, pipeline_slot, workspace_refusal_text(attempt.why)
         );
+        const bool manual_quota = !auto_admission_.enabled() && outcome == GrowthAttempt::Refused &&
+                                  attempt.why == WorkspaceManager::AcquireRefusal::OverQuota;
         const int refusal = report_growth_refusal(pipeline_slot, AutoAdmissionState::Phase::Staging, bytes, outcome);
         if (refusal != 0) return refusal;
-        return PTO_RUNTIME_ERR_INTERNAL;
+        return manual_quota ? SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE : PTO_RUNTIME_ERR_INTERNAL;
     }
     auto_admission_.note_input_staging_held(pipeline_slot);
     // The previous block keeps its address and its contents: the slot stops
@@ -1703,10 +1705,13 @@ int DeviceRunnerBase::setup_static_arena(
             "and capacities",
             name, requested, arena_bank
         );
+        const bool manual_quota = !auto_admission_.enabled() && growth == GrowthAttempt::Refused &&
+                                  workspace_prepare_state().last_refusal == WorkspaceManager::AcquireRefusal::OverQuota;
         const int refusal = report_growth_refusal(
             workspace_prepare_state().pipeline_slot, AutoAdmissionState::Phase::Committing, requested, growth
         );
         if (refusal != 0) return refusal;
+        if (manual_quota) return SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE;
     }
     return outcome.rc;
 }
@@ -1868,7 +1873,7 @@ int DeviceRunnerBase::finalize() {
     std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
     // Fatal teardown stops host readers even while their backing remains held.
     if (can_accept_run() && prepared_storage_in_use()) return PTO_RUNTIME_ERR_INVALID_STATE;
-    if (device_id_ == -1) return 0;
+    if (device_id_ == -1) return finalize_unbound();
     const int rc = validate_current_context();
     if (rc != 0) return rc;
     return finalize_impl();
@@ -5132,6 +5137,11 @@ void DeviceRunnerBase::read_device_wall_ns(uint32_t pipeline_slot) {
     uint64_t start_cycles[NUM_AICPU_PHASES];
     uint64_t span_cycles[NUM_AICPU_PHASES];
     reduce_aicpu_phase_windows(buf.phases, kThreads, start_cycles, span_cycles);
+    const auto &aicore_work = buf.header.aicore_work;
+    if (aicore_work.start_cycle != 0 && aicore_work.end_cycle > aicore_work.start_cycle) {
+        out.aicore_wall_ns =
+            static_cast<uint64_t>(cycles_to_us(aicore_work.end_cycle - aicore_work.start_cycle) * 1000.0);
+    }
 
     // Origin = earliest sub-phase start (Preamble..SchedWindow share the device
     // clock; RunWall is the bracket at offset 0). Sub-phase start offsets from

@@ -32,6 +32,8 @@
 
 #pragma once
 
+#include "host_build_graph/shared_arena_layout.h"
+
 #include <atomic>
 #include <cstddef>
 
@@ -606,13 +608,6 @@ void ready_queue_init_data_from_layout(ChipReadyQueue *queue, uint64_t capacity)
 void ready_queue_wire_arena_pointers(ChipReadyQueue *queue, DeviceArena &arena, size_t slots_off);
 void ready_queue_destroy(ChipReadyQueue *queue);
 
-struct ReadyQueueCapacities {
-    uint64_t ready[NUM_RESOURCE_SHAPES]{};
-    uint64_t ready_sync[NUM_RESOURCE_SHAPES]{};
-    uint64_t dummy{0};
-    uint64_t graph_prepare{0};
-};
-
 /**
  * Statistics returned by mixed-task completion processing
  */
@@ -628,16 +623,6 @@ struct CompletionStats {
  * the arena offsets of every sub-region the scheduler needs plus the
  * capacities used at layout time (init_from_layout reuses them).
  */
-struct SchedulerLayout {
-    size_t off_ready_queue_slots[NUM_RESOURCE_SHAPES];
-    size_t off_ready_sync_queue_slots[NUM_RESOURCE_SHAPES];
-    size_t off_dummy_ready_queue_slots;
-    size_t off_graph_prepare_queue_slots;
-    size_t off_early_dispatch_queue_slots[NUM_RESOURCE_SHAPES];
-    size_t off_early_sync_start_queue_slots;
-    size_t off_ed_publish_drain_queue_slots;
-    ReadyQueueCapacities capacities;
-};
 
 /**
  * Scheduler state structure

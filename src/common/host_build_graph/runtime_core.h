@@ -38,8 +38,10 @@
 
 #include "utils/device_arena.h"
 #include "host_build_graph/shared_memory.h"
-#include "scheduler/scheduler.h"
-#include "aicore_completion_mailbox.h"
+#include "host_build_graph/shared_arena_layout.h"
+
+struct SchedulerState;
+struct AICoreCompletionMailbox;
 
 // =============================================================================
 // Runtime Context
@@ -114,8 +116,9 @@ struct RuntimeArenaLayout {
 /**
  * Runtime context
  *
- * Contains all state for orchestration and scheduling.
- * In simulated mode, runs in single process with shared address space.
+ * A2A3/WSE publish this context with their full runtime arena. A5 uses a
+ * host-local instance during orchestration; its device starts from the compact
+ * task image and the independent resident scheduler bootstrap.
  */
 struct RuntimeContext {
     // Components
@@ -146,7 +149,7 @@ struct RuntimeContext {
     RuntimeArenaLayout prebuilt_layout;
 };
 
-// bind copies this header to the device as one contiguous range, so every byte
+// Full-arena binds copy this header to the device as one range, so every byte
 // of it has to survive a memcpy with no fix-up. That rules out an owning or
 // otherwise non-trivial member — the orchestrator's scratch is reached through
 // a pointer for exactly this reason.

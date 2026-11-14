@@ -89,9 +89,6 @@ void rt_orchestration_done(OrchContext *ctx) {
     // outer shells even when no later non-Graph task forced an earlier commit.
     ctx->orchestrator->graph_commit();
     ctx->orchestrator->mark_done();
-    // The orchestrator itself never crosses to the device, so the count of tasks
-    // it completed inline is published into the header that does.
-    ctx->rt->inline_completed_tasks = ctx->orchestrator->inline_completed_tasks;
 }
 
 static bool is_fatal_impl(OrchContext *ctx) { return ctx->orchestrator->is_fatal(); }

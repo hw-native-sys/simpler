@@ -733,6 +733,7 @@ void ChipWorker::init(
     }
 
     runtime_module_ = module;
+    quiesce_host_uses_fn_ = module->optional<decltype(quiesce_host_uses_fn_)>("quiesce_host_uses_ctx");
     kernel_supported_fn_ = kernel_supported_fn;
     kernel_init_fn_ = kernel_init_fn;
     kernel_prepare_callable_fn_ = kernel_prepare_callable_fn;
@@ -790,10 +791,7 @@ bool ChipWorker::teardown_report(SimplerTeardownReport *out) const {
     return true;
 }
 
-void ChipWorker::finalize() {
-    validate_execution_process();
-    if (!unstopped_ccu_runs_.empty()) retain_unconfirmed_ccu_cleanup();
-    validate_execution_context();
+std::exception_ptr ChipWorker::stop_and_cleanup_native_runs() {
     {
         std::lock_guard<std::mutex> lock(native_run_mu_);
         if (native_resource_references_ != 0)
@@ -826,6 +824,52 @@ void ChipWorker::finalize() {
             throw std::runtime_error("ChipWorker::finalize: external run resources still require checked release");
     }
     cleanup_native_runs_noexcept();
+    return lane_error;
+}
+
+bool ChipWorker::quiesce_host_uses() {
+    validate_execution_process();
+    if (!unstopped_ccu_runs_.empty()) retain_unconfirmed_ccu_cleanup();
+    validate_execution_context();
+    if (execution_environment_ && execution_environment_->borrowed)
+        throw std::runtime_error("Host use recovery requires an owned execution context");
+    if (host_uses_quiesced_) return unproven_native_run_count() != 0;
+    const auto lane_error = stop_and_cleanup_native_runs();
+    const size_t unproven = unproven_native_run_count();
+    if (unproven != 0) {
+        // Live communication threads cannot be retired by a device drain.
+        comm_reclamation_unconfirmed_ = true;
+        if (!comm_sessions_.empty() || !global_domain_ids_.empty() || exported_device_regions_live_)
+            retain_unconfirmed_comm_cleanup();
+        require_comm_cleanup_confirmed();
+        if (device_ctx_ == nullptr || quiesce_host_uses_fn_ == nullptr)
+            throw std::runtime_error("Host use recovery has no terminal device drain entry");
+        const int rc = quiesce_host_uses_fn_(device_ctx_);
+        if (rc != 0)
+            throw std::runtime_error(
+                "Host use recovery: device last use remains unproven (" + std::to_string(rc) + ")"
+            );
+        // The device is quiescent, but the C++ carrier lifetime is unknown.
+        // Never re-enter it; the owner teardown retires its device resources.
+        (void)abandon_unproven_native_run_storage();
+    }
+    if (run_lane_ != nullptr) {
+        run_lane_->detach_after_failed_teardown(lane_error);
+        if (unproven != 0) {
+            (void)run_lane_.release();
+        } else {
+            run_lane_.reset();
+        }
+    }
+    host_uses_quiesced_ = true;
+    return unproven != 0;
+}
+
+void ChipWorker::finalize() {
+    validate_execution_process();
+    if (!unstopped_ccu_runs_.empty()) retain_unconfirmed_ccu_cleanup();
+    validate_execution_context();
+    auto lane_error = stop_and_cleanup_native_runs();
     const size_t unproven = unproven_native_run_count();
     if (unproven != 0) {
         // Raw storage and code remain live even if the C++ object lifetime is
@@ -905,6 +949,7 @@ void ChipWorker::finalize() {
 }
 
 void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
+    quiesce_host_uses_fn_ = nullptr;
     create_device_context_fn_ = nullptr;
     simpler_init_fn_ = nullptr;
     destroy_device_context_fn_ = nullptr;
@@ -1231,7 +1276,11 @@ bool ChipWorker::holds_live_comm_resources() const {
     // Unsynchronized: comm sessions, global domains and the exported-region
     // declaration are all written from the same thread that drives the run lane
     // — a child's control commands and its task frames arrive on one loop.
-    return !comm_sessions_.empty() || !global_domain_ids_.empty() || exported_device_regions_live_;
+    // Task preparation registers Host mappings outside control handling. Read
+    // the native cache, including failed registrations that still own backing.
+    std::lock_guard<std::mutex> lock(host_ddr_mutex_);
+    return !comm_sessions_.empty() || !global_domain_ids_.empty() || exported_device_regions_live_ ||
+           !host_ddr_mappings_.empty();
 }
 
 void ChipWorker::configure_launch_depth(unsigned depth) {

@@ -43,15 +43,17 @@ inline bool refuse_after_callback = false;
 inline std::function<void()> callback_hook;
 extern thread_local bool refuse_next_host_allocation;
 
+enum class AdmissionMode { Automatic, FixedGrant };
+
 class Runner : public DeviceRunnerBase {
 public:
-    explicit Runner(bool managed_workspace = true) {
+    explicit Runner(bool managed_workspace = true, AdmissionMode mode = AdmissionMode::Automatic) {
         device_id_ = 0;
         timeout_configuration_rc_ = 0;
         max_block_dim_ = block_dim_ = 1;
         if (managed_workspace) EXPECT_EQ(install_staged_workspace(), 0);
         EXPECT_TRUE(set_run_resource_grant(6));
-        enable_automatic_admission();
+        if (mode == AdmissionMode::Automatic) enable_automatic_admission();
         CallableState callable;
         callable.hash = 1;
         callable.chip_buffer_hash = 1;
@@ -59,9 +61,6 @@ public:
         callable.host_orch_func_ptr = primary_entry_points();
         callables_[1] = std::move(callable);
         chip_callable_buffers_[1] = ChipCallableBuffer{};
-    }
-    size_t scheduler_capacity(uint32_t slot) const {
-        return scheduler_state_storage_[slot] ? scheduler_state_storage_[slot]->device_capacity() : 0;
     }
     int prepare_result(uint32_t slot = 0, uint64_t epoch = 1) {
         KernelArgsHelper args;

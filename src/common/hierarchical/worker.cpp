@@ -11,13 +11,17 @@
 
 #include "worker.h"
 
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <stdexcept>
+#include <system_error>
 #include <utility>
 
 #include "remote_endpoint.h"
@@ -100,7 +104,30 @@ void fork_hygiene_once() { std::call_once(g_fork_hygiene_once, apply_env_default
 // Worker
 // ---------------------------------------------------------------------------
 
+struct Worker::MailboxMapping {
+    void *address;
+    size_t bytes;
+
+    MailboxMapping(int fd, size_t extent) :
+        address(MAP_FAILED),
+        bytes(extent) {
+        struct stat backing{};
+        if (fstat(fd, &backing) != 0) throw std::system_error(errno, std::generic_category(), "Worker mailbox fstat");
+        if (bytes == 0 || backing.st_size < 0 || bytes > static_cast<uint64_t>(backing.st_size))
+            throw std::invalid_argument("Worker mailbox extent exceeds its shared backing or is empty");
+        address = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (address == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "Worker mailbox mmap");
+    }
+
+    ~MailboxMapping() { munmap(address, bytes); }
+    MailboxMapping(const MailboxMapping &) = delete;
+    MailboxMapping &operator=(const MailboxMapping &) = delete;
+};
+
 Worker::Worker(int32_t level, uint64_t heap_ring_size) :
+    Worker(level, heap_ring_size, {}) {}
+
+Worker::Worker(int32_t level, uint64_t heap_ring_size, const std::vector<int> &heap_fds) :
     level_(level) {
     // Fork hygiene runs before the HeapRing mmap so the env-var defaults
     // apply to any thread-pool library that observes them at library init.
@@ -109,7 +136,15 @@ Worker::Worker(int32_t level, uint64_t heap_ring_size) :
     // mmap the HeapRing region here, in the ctor, so Python callers can
     // construct the Worker before fork()-ing children. The children
     // inherit the MAP_SHARED region at the same virtual address.
-    allocator_.init(heap_ring_size, ALLOC_TIMEOUT_MS);
+    allocator_.init_shared(heap_ring_size, heap_fds, ALLOC_TIMEOUT_MS);
+}
+
+void *Worker::map_mailbox(int fd, size_t bytes) {
+    if (initialized_) throw std::runtime_error("Worker: map_mailbox after init");
+    auto mapping = std::make_unique<MailboxMapping>(fd, bytes);
+    void *address = mapping->address;
+    mailbox_mappings_.push_back(std::move(mapping));
+    return address;
 }
 
 Worker::~Worker() {

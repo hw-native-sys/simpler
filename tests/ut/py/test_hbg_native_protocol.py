@@ -18,7 +18,7 @@ from simpler_setup.tools.hbg.native_protocol import audit_protocol_sequences, re
 
 def capture(epoch=0):
     return {
-        "schema": "hbg-native-protocol-v10",
+        "schema": "hbg-native-protocol-v20",
         "producer": "aicore",
         "run_epoch": epoch,
         "task_count": 1,
@@ -28,6 +28,7 @@ def capture(epoch=0):
         "cooperative_task_count": 0,
         "cluster_count": 1,
         "mix_task_count": 0,
+        "sync_mix_task_count": 0,
         "expected_task_count": 1,
         "inline_completed_count": 0,
         "resolved_task_count": 1,
@@ -71,12 +72,16 @@ def capture(epoch=0):
         "task_controls": [
             dict(
                 task_ref=0,
-                state=3,
+                state=2,
+                canonical_total=1,
+                pending_compute=0,
+                completion_debt=0,
                 next_block=0,
                 completed_subtasks=0,
                 admission_state=0,
                 claim_tickets=0,
                 claim_seal=0,
+                parked_count=0,
             )
         ],
         "task_events": [
@@ -114,7 +119,7 @@ def test_literal_epochs_and_cycle_zero_survive_without_claiming_causality(epoch)
 @pytest.mark.parametrize("stride", (None, 0, 8, 63, 65, 128, True, 64.0, "64", -1, 1 << 64))
 def test_compact_schema_requires_64_byte_seals_and_omits_unused_execution_counter(stride):
     raw = capture()
-    raw.update(schema="hbg-native-protocol-v10", close_seal_stride=64)
+    raw.update(schema="hbg-native-protocol-v20", close_seal_stride=64)
     raw["task_controls"][0].update(claim_tickets=0, claim_seal=0)
     assert read_native_protocol(raw) == raw
     raw["executed_task_count"] = 0
@@ -141,6 +146,8 @@ def test_every_root_field_is_required(field):
     "field,value",
     [
         ("schema", "future-v2"),
+        ("schema", "hbg-native-protocol-v12"),
+        ("schema", "hbg-native-protocol-v13"),
         ("producer", "aicpu"),
         ("worker_count", True),
         ("run_epoch", -1),
@@ -225,12 +232,13 @@ def test_parser_preserves_error_and_incomplete_evidence_for_diagnostics():
     raw = capture()
     raw["workers"][0]["error_flags"] = 1
     raw["task_events"][0]["completion"]["after"] = [0, 0]
+    raw["task_controls"][0].update(state=-1, canonical_total=0, pending_compute=65535, completion_debt=(1 << 32) - 1)
     assert read_native_protocol(raw) == raw
     with pytest.raises(ValueError, match="protocol"):
         audit_protocol_sequences(raw)
 
 
-@pytest.mark.parametrize("version", (*range(1, 10), 12, 13, 14, 15, 16, 17))
+@pytest.mark.parametrize("version", (*range(1, 20), 22, 23))
 def test_noncurrent_protocol_versions_are_rejected(version):
     raw = capture()
     raw["schema"] = f"hbg-native-protocol-v{version}"
@@ -238,7 +246,9 @@ def test_noncurrent_protocol_versions_are_rejected(version):
         read_native_protocol(raw)
 
 
-@pytest.mark.parametrize("field", ("claim_tickets", "claim_seal"))
+@pytest.mark.parametrize(
+    "field", ("claim_tickets", "claim_seal", "parked_count", "canonical_total", "pending_compute", "completion_debt")
+)
 @pytest.mark.parametrize("value", (None, True, -1, 1 << 64, "0"))
 def test_current_control_words_are_mandatory_uint64(field, value):
     raw = capture()

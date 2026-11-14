@@ -12,7 +12,7 @@
 #pragma once
 
 #include "scheduler_async_control.h"
-#include "scheduler_completion_resolver.h"
+#include "scheduler_ready.h"
 #include "scheduler_protocol_execution.h"
 
 static inline __aicore__ bool scheduler_async_finish_step(
@@ -41,15 +41,20 @@ static inline __aicore__ bool scheduler_async_finish_step(
     };
     if (!scheduler_task_ref_valid(graph, task_ref)) return failed();
     auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(base, async.layout->joins_offset);
-    if (!scheduler_async_pending::ready_to_finish(scheduler_gm_fetch_add(joins[index].word, UINT64_C(0))))
-        return failed();
+    const uint64_t joined = scheduler_gm_fetch_add(joins[index].word, UINT64_C(0));
+    if (!scheduler_async_pending::ready_to_finish(joined)) return failed();
     auto *control = scheduler_task_control_at(base, local, task_ref);
+    const uint64_t gate = scheduler_gm_fetch_add(control->completion_state, UINT64_C(0));
+    if (!scheduler_completion_valid(gate) || scheduler_completion_remaining(gate) != 0 ||
+        scheduler_completion_debt(gate) != scheduler_async_pending::registered(joined))
+        return failed();
     scheduler_protocol_task_done(base, local, task_ref, true, true);
     scheduler_cache_barrier();
-    scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
-    scheduler_protocol_task_done(base, local, task_ref, false, true);
-    if (!scheduler_resolve_completion(graph, base, local, run, task_ref, profiling_level, false, nullptr, UINT32_MAX))
+    if (scheduler_gm_compare_exchange(
+            control->completion_state, gate, scheduler_completion_completed_state(scheduler_completion_total(gate))
+        ) != gate)
         return failed();
+    scheduler_protocol_task_done(base, local, task_ref, false, true);
     auto *directory = scheduler_state_at<SchedulerAsyncDirectoryWord>(base, async.layout->finish_directory_offset);
     if (scheduler_async_lease_finish(leases[index], owned).result != SchedulerAsyncLeaseResult::SUCCESS ||
         scheduler_async_directory_clear(directory[index / 64].bits, index % 64) !=

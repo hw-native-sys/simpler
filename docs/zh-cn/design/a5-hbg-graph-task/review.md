@@ -14,8 +14,7 @@
 参数跨核可见性和退出证明必须同时落实。
 
 当前设计层已处理下面的阻断反例；仍需通过实现、并发测试和真实硬件证明其实现正确性。
-性能优势尚未证明；bootstrap 并行参数准备候选把复制移出 ready→kernel 临界路径，但增加启动工作量，
-仍为 O(N) 扫描，
+当前参数准备由 Host 完成，设备启动扫描仍存在，性能必须按当前代码重新验收；
 旧 execution tail 仍然预留，不能把预期写成实测收益。
 
 全局/分组 ready 池复审另外核对了真实 metadata 容量、offset 解引用前的可信边界、
@@ -51,9 +50,9 @@ L/G 已接入持久 pending 与 bootstrap/dispatch 服务。复审核对了正�
 | R2 | 正确性：只等待最后记录 child，另一不连通分支仍在写输出 | EXIT 等待所有 sink；验证完整 DAG，测试多 sink、慢 sink、DUMMY sink |
 | R3 | 死锁：ENTER/EXIT 借 kernel slot，slots 全被待协作任务占用 | 独立 control inbox，每轮有界服务，slot 全满/暂存 admission 压力用例 |
 | R4 | 丢唤醒：bootstrap 尚未链接 next 就完成 ENTER | scan_complete 前禁止 control pop；稳态使用 CLOSED-aware CAS，分别验证两个阶段 |
-| R5 | 数据破坏：多 block 同时绑定参数，或不同 child 写回同一 scalar line | 唯一 bootstrap 分区 owner；每 child 对齐 scalar/predicate；跨核同地址压力验证 |
+| R5 | 数据破坏：多 block 同时绑定参数，或不同 child 写回同一 scalar line | Host 唯一构造；每 child 对齐 scalar/predicate；消费者遵守共享只读观察合同 |
 | R6 | 提前执行：参数写回未完成就打开 gate，reader 看到半成品 | 参数 writeback+barrier 先于 scan arrival；gate 后普通 owner 和成员首次 invalidate |
-| R7 | 死锁/吞吐：持有全局 commit lock 绑定大量参数，或每 Graph 独立 admission 域 | bootstrap 在无 kernel 资源占用时准备参数；共用 runtime order 与 membership |
+| R7 | 死锁/吞吐：持有全局 commit lock 绑定大量参数，或每 Graph 独立 admission 域 | Host 在 launch 前准备参数；Device 共用 runtime order 与 membership |
 | R8 | 提前释放：EXIT DONE 时某 producer 仍在 resolve 其他 waiter，或 MIX lane 未 release | 节点计数位于 resolve 尾部，另外保留 LocalDone/ordered-exit/run fence |
 | R9 | 假完成：错误清理推进计数，被 supervisor 判成功 | count equality、error==0、完整退出证明同时满足；late error 回归 |
 | R10 | 悬空地址：plan 引用局部 GraphHostState；retry 沿用上次 GM base | 自有无地址 plan、commit 时实例化；park/resume/pipeline 隔离测试 |
@@ -101,8 +100,9 @@ EXIT 的逻辑完成可能早于某个 producer 的 resolve 尾部，所以还�
 
 ### 开销判断
 
-bootstrap 并行准备并未减少参数总写入量，而是改变其并行度和关键路径位置；
+Host 预构造并未减少参数总写入量，Host 准备和上传成本须单列；
 完整 control 初始化、bootstrap 扫描和每实例参数存储仍存在。
+当前合同集中在[HBG 调度优化开发参考](build-execute-separation.md)。
 每个实例仍有 n+2 个 metadata/control，两个控制队列往返也有成本；小 Graph 可能得不偿失。
 一次参数绑定的额外临界路径应以首 child 和短任务间隙验证，不能只比较总量级大的模型 Device 平均值。
 

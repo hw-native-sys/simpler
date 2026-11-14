@@ -10,14 +10,12 @@
 """Wide host-build-graph dispatch: AIV cohort plus sync-start and normal MIX placement.
 
 Sizes every cohort from ``rt_available_cluster_count`` / ``rt_available_aiv_count``, so
-coverage follows the device the case runs on. On the sim platforms this file is marked
-for, that is ``SIM_AUTO_BLOCKDIM`` (8) clusters — 24 core-state bits, entirely within the
-low 64 of ``CoreTracker::BitStates``. **This case therefore does not reach a cluster
-offset above bit 63**; the >63-bit MIX selection path is covered by the arch-parity unit
-test ``tests/ut/cpp/common/host_build_graph/test_hbg_core_tracker.cpp``, which drives ``CoreTracker``
-directly at ``MAX_CLUSTERS``. What this case does cover is that MIX placement, sync-start
-drain, and the AIV cohort agree on block-to-core mapping when a single scheduler thread
-(``aicpu_thread_num=2`` leaves one scheduler plus one resolution thread) owns every cluster.
+coverage follows the device. The simulator cohort has ``SIM_AUTO_BLOCKDIM`` (8)
+clusters and checks that MIX, sync-start and AIV work agree on block-to-core mapping.
+A2A3 uses one AICPU dispatch thread (``aicpu_thread_num=2`` also reserves one
+resolution thread); A5 uses resident AICore scheduling. The simulator cohort does
+not reach CoreTracker offsets above bit 63. A2A3's larger tracker is covered by
+``tests/ut/cpp/a2a3/runtime/host_build_graph/test_hbg_core_tracker.cpp`` at ``MAX_CLUSTERS``.
 """
 
 import torch

@@ -27,6 +27,47 @@ SCALAR_FUNCTIONS = {
     "scalar_backoff": "local_backoff",
     "scalar_ready_claim": "scheduler_claim_ready_for_slot",
     "scalar_payload": "scheduler_prepare_dispatch_slot",
+    "scalar_early_prepare": "scheduler_prepare_early_candidate",
+    "scalar_cluster_prepare": "scheduler_prepare_cluster_lane",
+    "scalar_execution_token_progress": "scheduler_progress_execution_tokens",
+    "scalar_execution_token_refill": "scheduler_refill_execution_tokens",
+    "scalar_execution_token_receive": "scheduler_execution_token_receive",
+    "scalar_execution_token_dispatch": "scheduler_progress_execution_tokens: transfer token to dispatch slot",
+    "scalar_fanin_observe": "scheduler_observe_fanin_prefix",
+    "scalar_cooperative_discover": "scheduler_discover_cooperative_task",
+    "scalar_fill_own_slots": "scheduler_fill_own_slots",
+    "scalar_fill_cooperative_slots": "scheduler_fill_cooperative_slots",
+    "scalar_cluster_mix_service": "scheduler_cluster_mix_service",
+    "scalar_cluster_mix_discover_task": "scheduler_cluster_mix_discover_task",
+    "scalar_cluster_mix_discover_next": "scheduler_cluster_mix_discover_next",
+    "scalar_cluster_mix_pending": "scheduler_cluster_mix_progress_pending",
+    "scalar_cluster_mix_arm": "scheduler_cluster_mix_try_arm",
+    "scalar_cluster_mix_observe": "scheduler_cluster_mix_observe",
+    "scalar_cluster_mix_retire": "scheduler_cluster_mix_retire",
+    "scalar_cluster_mix_enter": "scheduler_cluster_mix_can_enter",
+    "scalar_cluster_mix_release": "scheduler_cluster_mix_release",
+    "scalar_cluster_mix_drain": "scheduler_cluster_mix_drain",
+    "scalar_cluster_mix_publish_preparation": "scheduler_cluster_mix_publish_preparation",
+    "scalar_cluster_mix_conflicts": "scheduler_cluster_mix_conflicts",
+    "scalar_cluster_mix_all": "scheduler_cluster_mix_all",
+    "scalar_prepared_receive": "scheduler_receive_execution_token",
+    "scalar_prepared_acquire": "scheduler_acquire_execution_token",
+    "scalar_prepared_park_begin": "scheduler_begin_park_prepared_execution",
+    "scalar_prepared_park_publish": "scheduler_publish_parked_execution",
+    "scalar_prepared_resume": "scheduler_resume_parked_execution",
+    "scalar_prepared_return": "scheduler_return_prepared_execution",
+    "scalar_prepared_observe": "scheduler_observe_prepared_call",
+    "scalar_prepared_index": "scheduler_prepared_execution_index",
+    "scalar_prepared_validate": "scheduler_prepared_call_valid",
+    "scalar_group_reserve": "scheduler_reserve_group_execution",
+    "scalar_group_park": "scheduler_park_group_execution",
+    "scalar_group_resume": "scheduler_resume_group_execution",
+    "scalar_group_arm": "scheduler_arm_group_execution",
+    "scalar_group_acquire": "scheduler_acquire_group_lane",
+    "scalar_cluster_mix_needs_service": "scheduler_cluster_mix_needs_service",
+    "scalar_execution_continuation": "scheduler_try_execution_continuation",
+    "scalar_execution_token_fanin": "scheduler_execution_token_observe_fanin",
+    "scalar_cluster_mix_ready_replacement": "scheduler_cluster_mix_ready_replacement",
     "scalar_resolve": "scheduler_resolve_completion_step",
     "scalar_mix": "scheduler_service_gm_mix",
     "scalar_async_check": "scheduler_async_check_step",
@@ -40,9 +81,9 @@ SCALAR_FUNCTIONS = {
     "scalar_flush_completions": "scheduler_flush_completions",
     "scalar_loop_control": "run_ready_dispatch_loop: exit/error checks",
     "scalar_ordered_poll": "scheduler_ordered_poll_may_progress",
-    "scalar_admission_claim": "scheduler_try_claim_admission",
+    "scalar_admission_claim": "scheduler_stage_admission_candidate",
     "scalar_admission_publish": "scheduler_ordered_publish_pending",
-    "scalar_admission_commit": "scheduler_admission_detail::commit_validated_record",
+    "scalar_admission_commit": "scheduler_try_commit_admission",
     "scalar_admission_refresh": "scheduler_refresh_local_obligation",
     "scalar_ordinary_park": "scheduler_ordered_park_ordinary",
     "scalar_block_claim": "scheduler_claim_ordered_block",
@@ -122,7 +163,7 @@ def _nest_intervals(nodes, filtered):
     return positive
 
 
-def partition(records, kernels):
+def partition(records, kernels, *, nested_kernels=False):
     """Return a nested view and an exact, non-overlapping partition of its window."""
     roots = [r for r in records if r["kind"] == "scalar_window"]
     if len(roots) != 1 or roots[0].get("scalar_schema") != 2:
@@ -134,7 +175,17 @@ def partition(records, kernels):
     filtered = minimum > 0
     nodes = [dict(record) for record in records]
     for kernel in kernels:
-        nodes.append({"kind": "scalar_kernel", "scalar_depth": 1, "scalar_calls": 1, **kernel})
+        depth = 1
+        if nested_kernels:
+            depth += max(
+                (
+                    r["scalar_depth"]
+                    for r in records
+                    if r["start_cycles"] <= kernel["start_cycles"] and kernel["end_cycles"] <= r["end_cycles"]
+                ),
+                default=0,
+            )
+        nodes.append({"kind": "scalar_kernel", "scalar_depth": depth, "scalar_calls": 1, **kernel})
     for node in nodes:
         if node["end_cycles"] < node["start_cycles"]:
             raise ValueError("Negative Scalar interval")
@@ -176,7 +227,7 @@ def partition(records, kernels):
     }
 
 
-def analyze_streams(streams, metadata, task_rows, execution_identities=None):
+def analyze_streams(streams, metadata, task_rows, execution_identities=None, *, nested_kernels=False):
     """Join same-worker, same-run L1 kernel intervals to the detailed L3 records."""
     identities = {
         (r["core_id"], r["reg_task_id"], r["run_epoch"]): r["executed"]
@@ -223,13 +274,17 @@ def analyze_streams(streams, metadata, task_rows, execution_identities=None):
             )
             continue
         for epoch in sorted({r["run_epoch"] for r in detailed}):
-            result = partition([r for r in detailed if r["run_epoch"] == epoch], kernels[(stream["worker_id"], epoch)])
+            result = partition(
+                [r for r in detailed if r["run_epoch"] == epoch],
+                kernels[(stream["worker_id"], epoch)],
+                nested_kernels=nested_kernels,
+            )
             result.update(worker_id=stream["worker_id"], scheduler_id=stream["scheduler_id"], run_epoch=epoch)
             profiles.append(result)
     return profiles
 
 
-def trace_events(profiles, *, pid, tid_base, display, streams=None):
+def trace_events(profiles, *, pid, tid_base, display, streams=None, function_names=None):
     """Render one nested Scalar lane per core using the capture's core identity."""
     lanes = {
         stream.get("scheduler_id", index): (index, stream)
@@ -265,9 +320,9 @@ def trace_events(profiles, *, pid, tid_base, display, streams=None):
             kind = row["kind"]
             if kind == "scalar_window":
                 continue
-            name = SCALAR_FUNCTIONS.get(kind, kind.removeprefix("scalar_"))
-            if kind == "scalar_admission" and not profile.get("iterations_detailed"):
-                name = "admission"
+            name = (SCALAR_FUNCTIONS if function_names is None else function_names).get(
+                kind, kind.removeprefix("scalar_")
+            )
             if row.get("task_id") is not None:
                 name += f"({display(row['task_id'])})"
             args = {k: v for k, v in row.items() if k not in ("start_time_us", "end_time_us")}

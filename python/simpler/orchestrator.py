@@ -42,7 +42,7 @@ from typing import Any, cast
 
 from _task_interface import _Orchestrator as _COrchestrator  # pyright: ignore[reportMissingImports]
 
-from .buffer import AccessMode, AddressSpace, BackendKind, Buffer, wrap_fork_inherited
+from .buffer import AddressSpace, Buffer, _wrap_heap_allocation
 from .callable_identity import CallableHandle
 from .task_interface import (
     CallConfig,
@@ -57,11 +57,11 @@ from .task_interface import (
     RemoteAddressSpace,
     TaskArgs,
     TaskHandle,
+    TensorTransfer,
     _empty_remote_sidecar_for,
     _remote_sidecar_for,
     _RemoteTaskArgsSidecar,
     _validate_remote_sidecar_access,
-    get_element_size,
 )
 from .workspace_config import WorkspaceEngines
 
@@ -136,6 +136,8 @@ def _reject_device_args(args: object, *, kind: str) -> None:
 
     for i in range(args.tensor_count()):
         desc = args.tensor(i).buffer
+        if args.transfer(i) == TensorTransfer.MAP:
+            raise ValueError(f"{kind}: MAP requires its prepared device endpoint")
         if desc.address_space == AddressSpace.DEVICE:
             raise ValueError(
                 f"{kind}: argument {i} is a DEVICE-space tensor ({desc.backend_kind.name}); a Python "
@@ -364,6 +366,8 @@ class Orchestrator:
         worker = self._worker
         if worker is not None and target_namespace == "LOCAL_CHIP":
             worker._prepare_ccu_submission(callable_handle, [cpp_worker_id], [c_args])
+        if worker is not None:
+            worker._acquire_child_host_args(c_args, cpp_worker_id, device_target=target_namespace == "LOCAL_CHIP")
         # Provenance validation precedes run ownership publication. Once a remote
         # ref is published, only the run fence may release it because the native
         # submit can commit before an exception reaches Python.
@@ -478,6 +482,7 @@ class Orchestrator:
         member_checks: list[tuple[int, TaskArgs]] = []
         if worker is not None:
             for g, c_args in enumerate(c_args_list):
+                worker._acquire_child_host_args(c_args, worker_ids[g], device_target=target_namespace == "LOCAL_CHIP")
                 if worker._names_device_allocation(c_args):
                     member_checks.append((g, c_args))
         prov_guard: Any = (
@@ -968,24 +973,12 @@ class Orchestrator:
         _check_domain_initializer_context(self._worker, "Orchestrator.alloc")
         assert self._worker is not None, "orch.alloc requires an L3+ orchestration context"
         shape_t = tuple(int(s) for s in shape)
-        nbytes = get_element_size(dtype)
-        for s in shape_t:
-            nbytes *= s
         identity = self._worker._burn_buffer_identity()
         # alloc keys the synthetic producer slot by the ref's canonical identity (not a raw VA), so a
         # consumer named via handle.tensor(...) dependency-wires to it. Same managed backing as
         # worker.alloc_shared_tensor; additionally registered as an L3-L2 orch-comm host buffer.
-        va = int(self._o.alloc(list(shape_t), dtype, identity))
-        handle = wrap_fork_inherited(
-            va,
-            int(nbytes),
-            bytes(identity.owner_instance_id),
-            int(identity.buffer_id),
-            f"L{self._worker.level}",
-            generation=int(identity.generation),
-            access=AccessMode.READWRITE,
-            backend_kind=BackendKind.FORK_SHM,
-        )
+        va, descriptor = self._o._alloc_shared_buffer(list(shape_t), dtype, identity)
+        handle = _wrap_heap_allocation(int(va), descriptor, identity, f"L{self._worker.level}")
         self._worker._register_worker_chip_orch_comm_host_buffer(handle)
         return handle
 

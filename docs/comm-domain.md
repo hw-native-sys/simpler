@@ -830,8 +830,8 @@ with orch.allocate_domain(...) as handle:
 
 ## 6. Host tensor visibility for `worker.run`
 
-A host tensor named in a task arg is ultimately dereferenced from a forked local
-L3 child, not the parent, so its backing must reach that child. Under the
+A host tensor named in a task arg is dereferenced by the local L3 child, so its
+backing must reach that child. Under the
 Buffer ABI an arg is a `Tensor` carrying a self-describing descriptor; the
 child materializes it lazily on first receipt (map-once, keyed by canonical
 identity) — there is no eager broadcast and no host-pointer rewrite. Two sources
@@ -839,17 +839,17 @@ are legal:
 
 | Source | How | Why it works |
 | ------ | --- | ------------ |
-| **fork-inherited** | `tensor.share_memory_()` **before `Worker.init()`**, named with `worker.make_tensor_arg(t, shapes, dtype)` (FORK_SHM) | the child inherits the MAP_SHARED page at the fork; it resolves to that same VA |
-| **worker-allocated post-fork** | `worker.create_buffer(nbytes)` after the children exist, named with `handle.tensor(shapes, dtype)` (POSIX_SHM) | the child maps the shm by identity on first receipt, **zero-copy** |
+| **fork-inherited (fork children only)** | `tensor.share_memory_()` **before `Worker.init()`**, named with `worker.make_tensor_arg(t, shapes, dtype)` (FORK_SHM) | the child inherits the MAP_SHARED page at the fork; it resolves to that same VA |
+| **worker-allocated shared memory** | `worker.create_buffer(nbytes)` after the children exist, named with `handle.tensor(shapes, dtype)` (POSIX_SHM) | the child maps the shm by identity on first receipt, **zero-copy** |
 
-The local L3 children are forked eagerly in `Worker.init()`. A host tensor
-created after that — the natural dynamic-shape serving pattern — reaches the
-children by naming a `create_buffer` handle as a `Tensor`:
+After direct A5 L2 device initialization has been attempted, a top-level A5/TMR
+L3 Worker starts its chip children in new interpreters. Use `create_buffer` for
+inputs on this path and for host tensors created after `Worker.init()`:
 
 ```python
-worker = Worker(level=3, ...); worker.register(chip); worker.init()   # forks the chips
+worker = Worker(level=3, ...); worker.register(chip); worker.init()   # starts the chip workers
 
-buf_h = worker.create_buffer(tokens * hidden_size * 4)   # POSIX shm, post-fork
+buf_h = worker.create_buffer(tokens * hidden_size * 4)   # POSIX shm
 buf_o = worker.create_buffer(batch * vocab * 4)
 try:
     hidden = torch.frombuffer(buf_h.shm.buf, dtype=torch.float32, count=tokens * hidden_size)

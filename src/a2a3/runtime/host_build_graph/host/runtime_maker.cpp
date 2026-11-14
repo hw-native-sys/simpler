@@ -875,7 +875,6 @@ int32_t run_host_orchestration(
     storage.swap_storage(orchestrator);
     OrchContext orch_ctx{};
     orch_ctx.orchestrator = &orchestrator;
-    orch_ctx.rt = rt;
     RAIIScopeGuard retained_storage_return([&storage, &orchestrator]() {
         storage.swap_storage(orchestrator);
     });
@@ -973,6 +972,7 @@ int32_t run_host_orchestration(
         rt_scope_end(&orch_ctx);
     }
     rt_orchestration_done(&orch_ctx);
+    rt->inline_completed_tasks = orchestrator.inline_completed_tasks;
 #if SIMPLER_ORCH_PROFILING
     // Per-sub-step cumulatives across this bind's submits. The accumulators only
     // exist in a SIMPLER_ORCH_PROFILING build (build_runtimes.py --profiling-orch 1),

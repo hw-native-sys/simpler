@@ -38,6 +38,7 @@
 // without re-reading the device-shared header.
 static ChipSwimlaneDataHeader *s_chip_swimlane_header = nullptr;
 static bool s_phase_initialized = false;
+static bool s_self_scheduled_cores = false;
 
 // Per-core ChipSwimlaneAicpuTaskPool cache
 static ChipSwimlaneAicpuTaskPool *s_aicpu_task_pools[PLATFORM_MAX_CORES] = {};
@@ -351,11 +352,15 @@ static int enqueue_ready_buffer(
 static ChipSwimlaneAicpuTaskBuffer *
 try_pop_records_buffer(int core_id, ChipSwimlaneAicpuTaskPool *state, uint32_t next_seq) {
     return ChipSwimlaneTaskEngine::pop_free(
-        l2_task_context(/*thread_idx=*/0, static_cast<uint32_t>(core_id), ChipSwimlaneBufferKind::AicpuTask,
-                        &s_current_aicpu_task_buffers[core_id]),
+        l2_task_context(
+            /*thread_idx=*/0, static_cast<uint32_t>(core_id), ChipSwimlaneBufferKind::AicpuTask,
+            &s_current_aicpu_task_buffers[core_id]
+        ),
         state, next_seq
     );
 }
+
+void chip_swimlane_aicpu_use_self_scheduled_cores() { s_self_scheduled_cores = true; }
 
 void chip_swimlane_aicpu_init(int worker_count, ChipSwimlaneLevel level) {
     // Each profiled launch starts counting AICore dispatches from 0 so the rotation boundary check
@@ -429,6 +434,7 @@ void chip_swimlane_aicpu_init(int worker_count, ChipSwimlaneLevel level) {
     // The caller supplies this invocation's published descriptor value. The
     // shared collector header is not a per-run configuration carrier.
     g_chip_swimlane_level = level;
+    s_self_scheduled_cores = false;
 
     LOG_INFO(
         "Initializing performance profiling for %d cores (free queue), chip_swimlane_level=%u", worker_count,
@@ -734,6 +740,35 @@ static void aicore_rotate(int core_id, int thread_idx, uint32_t new_buf_first_re
     wmb();
 }
 
+static uint32_t observe_self_scheduled_count(ChipSwimlaneAicoreTaskPool *state) {
+    auto *buffer = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(state->head.current_buf_ptr);
+    if (buffer == nullptr) return 0;
+    cache_invalidate_range(const_cast<const uint32_t *>(&buffer->count), sizeof(buffer->count));
+    rmb();
+    const uint32_t committed = buffer->count;
+    const uint32_t live = state->head.live_record_count;
+    if (committed > live) {
+        chip_swimlane_add_saturating(state->head.total_record_count, committed - live);
+        state->head.live_record_count = committed;
+    }
+    return committed;
+}
+
+void chip_swimlane_aicpu_poll_self_scheduled_cores(int thread_idx, int thread_count, int worker_count) {
+    if (!g_enable_chip_swimlane || !s_self_scheduled_cores) return;
+    const int lo = static_cast<int>((static_cast<int64_t>(thread_idx) * worker_count) / thread_count);
+    const int hi = static_cast<int>((static_cast<int64_t>(thread_idx + 1) * worker_count) / thread_count);
+    for (int core = lo; core < hi; ++core) {
+        auto *state = s_aicore_task_pools[core];
+        if (state == nullptr || observe_self_scheduled_count(state) < PLATFORM_AICORE_BUFFER_SIZE) continue;
+        const uint32_t seq = state->head.current_buf_seq;
+        aicore_rotate(core, thread_idx, 0);
+        // The published count follows every record's writeback. Unlike FIN,
+        // it proves the full buffer can be handed off without a later ACK.
+        if (state->head.current_buf_seq != seq) publish_aicore_pending_buffer(core, thread_idx);
+    }
+}
+
 // Pre-dispatch hook. Called from the dispatch path (scheduler_dispatch in
 // tensormap_and_ringbuffer; aicpu_executor in host_build_graph) immediately
 // before `write_reg(DATA_MAIN_BASE)` for each AICore task. Maintains the
@@ -799,6 +834,162 @@ void chip_swimlane_aicpu_on_aicore_ack(int core_id, int thread_idx, uint32_t reg
         return;
     }
     publish_aicore_pending_buffer(core_id, thread_idx);
+}
+
+template <typename Buffer, typename Pool>
+static Buffer *reserve_staged_record(
+    Pool *pool, int thread_idx, uint32_t index, ChipSwimlaneBufferKind kind, uint32_t capacity, Buffer **cached
+) {
+    if (pool == nullptr || s_chip_swimlane_header == nullptr) return nullptr;
+    auto *buffer = reinterpret_cast<Buffer *>(pool->head.current_buf_ptr);
+    if (buffer != nullptr && buffer->count >= capacity) {
+        const uint32_t tail = s_chip_swimlane_header->queue_tails[thread_idx];
+        const uint32_t next = (tail + 1) % PLATFORM_PROF_READYQUEUE_SIZE;
+        if (next == s_chip_swimlane_header->queue_heads[thread_idx]) return nullptr;
+        rmb();
+        const uint32_t count = buffer->count;
+        auto context = l2_buffer_context<Buffer>(thread_idx, index, kind, cached);
+        ChipSwimlaneDeviceModule<Buffer>::write_ready_entry(
+            context, tail, pool->head.current_buf_ptr, pool->head.current_buf_seq, count
+        );
+        wmb();
+        s_chip_swimlane_header->queue_tails[thread_idx] = next;
+        chip_swimlane_add_saturating(pool->head.published_record_count, count);
+        chip_swimlane_add_saturating(pool->head.published_buffer_count, 1);
+        pool->head.current_buf_ptr = 0;
+        ++pool->head.current_buf_seq;
+        pool->head.live_record_count = 0;
+        if (cached != nullptr) *cached = nullptr;
+        buffer = nullptr;
+    }
+    if (buffer == nullptr) {
+        const uint32_t head = pool->free_queue.head;
+        if (head == pool->free_queue.tail) return nullptr;
+        rmb();
+        const uint64_t address = pool->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
+        pool->free_queue.head = head + 1;
+        if (address == 0) return nullptr;
+        buffer = reinterpret_cast<Buffer *>(address);
+        buffer->count = 0;
+        buffer->run_epoch = get_platform_run_result_epoch();
+        buffer->local_seq = pool->head.current_buf_seq;
+        wmb();
+        pool->head.current_buf_ptr = address;
+        if (cached != nullptr) *cached = buffer;
+    }
+    return buffer;
+}
+
+static void flush_staged_task_pair(int core_id, int thread_idx) {
+    auto *core = s_aicore_task_pools[core_id];
+    auto *timing = g_chip_swimlane_level >= ChipSwimlaneLevel::SCHEDULE_TIMING ? s_aicpu_task_pools[core_id] : nullptr;
+    if (core == nullptr) return;
+    auto *a = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(core->head.current_buf_ptr);
+    auto *b =
+        timing == nullptr ? nullptr : reinterpret_cast<ChipSwimlaneAicpuTaskBuffer *>(timing->head.current_buf_ptr);
+    const uint32_t ac = a == nullptr ? 0 : a->count;
+    const uint32_t bc = b == nullptr ? 0 : b->count;
+    if (ac == 0 && bc == 0) return;
+    const uint32_t tail = s_chip_swimlane_header->queue_tails[thread_idx];
+    const uint32_t head = s_chip_swimlane_header->queue_heads[thread_idx];
+    const uint32_t needed = timing == nullptr ? 1U : 2U;
+    const uint32_t free = (head + PLATFORM_PROF_READYQUEUE_SIZE - tail - 1) % PLATFORM_PROF_READYQUEUE_SIZE;
+    const bool publish = ac != 0 && (timing == nullptr || ac == bc) && free >= needed;
+    if (publish) {
+        auto context = l2_buffer_context<ChipSwimlaneAicoreTaskBuffer>(
+            thread_idx, static_cast<uint32_t>(core_id), ChipSwimlaneBufferKind::AicoreTask, nullptr
+        );
+        ChipSwimlaneDeviceModule<ChipSwimlaneAicoreTaskBuffer>::write_ready_entry(
+            context, tail, core->head.current_buf_ptr, core->head.current_buf_seq, ac
+        );
+        if (timing != nullptr) {
+            auto other = l2_task_context(
+                thread_idx, static_cast<uint32_t>(core_id), ChipSwimlaneBufferKind::AicpuTask,
+                &s_current_aicpu_task_buffers[core_id]
+            );
+            ChipSwimlaneTaskDeviceModule::write_ready_entry(
+                other, (tail + 1) % PLATFORM_PROF_READYQUEUE_SIZE, timing->head.current_buf_ptr,
+                timing->head.current_buf_seq, bc
+            );
+        }
+        // This queue has one settlement writer; a consumer can only add room.
+        wmb();
+        s_chip_swimlane_header->queue_tails[thread_idx] = (tail + needed) % PLATFORM_PROF_READYQUEUE_SIZE;
+        chip_swimlane_add_saturating(core->head.published_record_count, ac);
+        chip_swimlane_add_saturating(core->head.published_buffer_count, 1);
+        core->head.current_buf_ptr = 0;
+        ++core->head.current_buf_seq;
+        if (timing != nullptr) {
+            chip_swimlane_add_saturating(timing->head.published_record_count, bc);
+            chip_swimlane_add_saturating(timing->head.published_buffer_count, 1);
+            timing->head.current_buf_ptr = 0;
+            ++timing->head.current_buf_seq;
+            s_current_aicpu_task_buffers[core_id] = nullptr;
+        }
+    } else {
+        chip_swimlane_add_saturating(core->head.dropped_record_count, ac);
+        if (a != nullptr) a->count = 0;
+        if (timing != nullptr) {
+            chip_swimlane_add_saturating(timing->head.dropped_record_count, bc);
+            if (b != nullptr) b->count = 0;
+        }
+    }
+    core->head.live_record_count = 0;
+    wmb();
+}
+
+bool chip_swimlane_aicpu_record_staged_task(
+    int core_id, int thread_idx, const ChipSwimlaneAicoreTaskRecord &record, uint64_t dispatch_time,
+    uint64_t finish_time
+) {
+    if (!g_enable_chip_swimlane || core_id < 0 || core_id >= PLATFORM_MAX_CORES || thread_idx < 0 ||
+        thread_idx >= PLATFORM_MAX_AICPU_THREADS)
+        return false;
+    auto *pool = s_aicore_task_pools[core_id];
+    if (pool == nullptr) return false;
+    auto *active = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(pool->head.current_buf_ptr);
+    auto *timing_pool =
+        g_chip_swimlane_level >= ChipSwimlaneLevel::SCHEDULE_TIMING ? s_aicpu_task_pools[core_id] : nullptr;
+    auto *active_timing = timing_pool == nullptr ?
+                              nullptr :
+                              reinterpret_cast<ChipSwimlaneAicpuTaskBuffer *>(timing_pool->head.current_buf_ptr);
+    if ((active != nullptr && active->count >= PLATFORM_AICORE_BUFFER_SIZE) ||
+        (active_timing != nullptr && active_timing->count >= PLATFORM_PROF_BUFFER_SIZE))
+        flush_staged_task_pair(core_id, thread_idx);
+    chip_swimlane_add_saturating(pool->head.total_record_count, 1);
+    auto *buffer = reserve_staged_record<ChipSwimlaneAicoreTaskBuffer>(
+        pool, thread_idx, static_cast<uint32_t>(core_id), ChipSwimlaneBufferKind::AicoreTask,
+        PLATFORM_AICORE_BUFFER_SIZE, nullptr
+    );
+    if (buffer == nullptr) {
+        chip_swimlane_add_saturating(pool->head.dropped_record_count, 1);
+        return false;
+    }
+    if (g_chip_swimlane_level >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
+        auto *timing_pool = s_aicpu_task_pools[core_id];
+        if (timing_pool == nullptr) {
+            chip_swimlane_add_saturating(pool->head.dropped_record_count, 1);
+            return false;
+        }
+        chip_swimlane_add_saturating(timing_pool->head.total_record_count, 1);
+        auto *timing = reserve_staged_record<ChipSwimlaneAicpuTaskBuffer>(
+            timing_pool, thread_idx, static_cast<uint32_t>(core_id), ChipSwimlaneBufferKind::AicpuTask,
+            PLATFORM_PROF_BUFFER_SIZE, &s_current_aicpu_task_buffers[core_id]
+        );
+        if (timing == nullptr) {
+            chip_swimlane_add_saturating(timing_pool->head.dropped_record_count, 1);
+            chip_swimlane_add_saturating(pool->head.dropped_record_count, 1);
+            return false;
+        }
+        auto &row = timing->records[timing->count++];
+        row.reg_task_id = record.reg_task_id;
+        row.dispatch_time = dispatch_time;
+        row.finish_time = finish_time;
+    }
+    buffer->records[buffer->count++] = record;
+    pool->head.live_record_count = buffer->count;
+    wmb();
+    return true;
 }
 
 int chip_swimlane_aicpu_complete_task(
@@ -931,6 +1122,7 @@ void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int 
         // before the current buffer so ready-queue order follows buffer_seq.
         publish_aicore_pending_buffer(core_id, thread_idx);
 
+        if (s_self_scheduled_cores) observe_self_scheduled_count(ac_state);
         rmb();
         uint64_t ac_buf_ptr = ac_state->head.current_buf_ptr;
         if (ac_buf_ptr == 0) continue;
@@ -1205,6 +1397,10 @@ static inline void fill_sched_phase_record(
     record->end_time = end_time;
     record->loop_iter = loop_iter;
     record->kind = kind;
+    record->participant_kind = SchedPhaseParticipantKind::Aicpu;
+    record->participant_has_task = 0;
+    record->participant_worker_id = 0;
+    record->participant_physical_core_id = UINT32_MAX;
     record->tasks_processed = tasks_processed;
     auto copy_snapshot = [](int16_t dst[CHIP_SWIMLANE_NUM_QUEUE_SHAPES], const int16_t *src) {
         if (src == nullptr) {
@@ -1229,6 +1425,7 @@ void chip_swimlane_aicpu_record_sched_phase(
     fill_sched_phase_record(
         record, kind, start_time, end_time, loop_iter, tasks_processed, shared_at_start, shared_at_end
     );
+    record->participant_worker_id = static_cast<uint32_t>(thread_idx);
     record->phase_data.dispatch.pop_hit = pop_hit;
     record->phase_data.dispatch.pop_miss = pop_miss;
 }
@@ -1243,7 +1440,24 @@ void chip_swimlane_aicpu_record_task_phase(
         record, kind, start_time, end_time, loop_iter, tasks_processed, /*shared_at_start=*/nullptr,
         /*shared_at_end=*/nullptr
     );
+    record->participant_worker_id = static_cast<uint32_t>(thread_idx);
     record->phase_data.task_id = task_id;
+}
+
+void chip_swimlane_aicpu_record_staged_phase(int transport_thread, const ChipSwimlaneAicpuSchedPhaseRecord &source) {
+    if (!s_phase_initialized || transport_thread < 0 || transport_thread >= PLATFORM_MAX_AICPU_THREADS) return;
+    auto *pool = s_sched_phase_pools[transport_thread];
+    if (pool == nullptr) return;
+    chip_swimlane_add_saturating(pool->head.total_record_count, 1);
+    auto *buffer = reserve_staged_record<ChipSwimlaneAicpuSchedPhaseBuffer>(
+        pool, transport_thread, static_cast<uint32_t>(transport_thread), ChipSwimlaneBufferKind::AicpuSchedPhase,
+        PLATFORM_PHASE_RECORDS_PER_THREAD, &s_current_sched_phase_buffers[transport_thread]
+    );
+    if (buffer == nullptr) {
+        chip_swimlane_add_saturating(pool->head.dropped_record_count, 1);
+        return;
+    }
+    buffer->records[buffer->count++] = source;
 }
 
 void chip_swimlane_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx = thread_idx; }
@@ -1372,4 +1586,49 @@ void chip_swimlane_aicpu_write_core_assignments_for_thread(int thread_idx, const
         }
     }
     wmb();
+}
+
+void chip_swimlane_aicpu_flush_staged(int thread_idx, const int *core_ids, int core_count) {
+    if (!g_enable_chip_swimlane || s_chip_swimlane_header == nullptr || thread_idx < 0 ||
+        thread_idx >= PLATFORM_MAX_AICPU_THREADS)
+        return;
+    for (int i = 0; i < core_count; ++i) {
+        const int core = core_ids[i];
+        if (core < 0 || core >= PLATFORM_MAX_CORES) continue;
+        flush_staged_task_pair(core, thread_idx);
+        if (s_aicore_task_pools[core] != nullptr)
+            close_run_terminal(PLATFORM_RUN_TERMINAL_AICORE_TASK_BASE + core, &s_aicore_task_pools[core]->head);
+        if (s_aicpu_task_pools[core] != nullptr)
+            close_run_terminal(PLATFORM_RUN_TERMINAL_AICPU_TASK_BASE + core, &s_aicpu_task_pools[core]->head);
+    }
+    if (!s_phase_initialized || g_chip_swimlane_level < ChipSwimlaneLevel::SCHED_PHASES) return;
+    auto *pool = s_sched_phase_pools[thread_idx];
+    if (pool == nullptr) return;
+    auto *buffer = reinterpret_cast<ChipSwimlaneAicpuSchedPhaseBuffer *>(pool->head.current_buf_ptr);
+    if (buffer != nullptr && buffer->count != 0) {
+        const uint32_t count = buffer->count;
+        const uint32_t tail = s_chip_swimlane_header->queue_tails[thread_idx];
+        const uint32_t next = (tail + 1) % PLATFORM_PROF_READYQUEUE_SIZE;
+        if (next != s_chip_swimlane_header->queue_heads[thread_idx]) {
+            auto context = l2_buffer_context<ChipSwimlaneAicpuSchedPhaseBuffer>(
+                thread_idx, static_cast<uint32_t>(thread_idx), ChipSwimlaneBufferKind::AicpuSchedPhase,
+                &s_current_sched_phase_buffers[thread_idx]
+            );
+            ChipSwimlaneDeviceModule<ChipSwimlaneAicpuSchedPhaseBuffer>::write_ready_entry(
+                context, tail, pool->head.current_buf_ptr, pool->head.current_buf_seq, count
+            );
+            wmb();
+            s_chip_swimlane_header->queue_tails[thread_idx] = next;
+            chip_swimlane_add_saturating(pool->head.published_record_count, count);
+            chip_swimlane_add_saturating(pool->head.published_buffer_count, 1);
+            pool->head.current_buf_ptr = 0;
+            ++pool->head.current_buf_seq;
+            s_current_sched_phase_buffers[thread_idx] = nullptr;
+        } else {
+            chip_swimlane_add_saturating(pool->head.dropped_record_count, count);
+            buffer->count = 0;
+        }
+        wmb();
+    }
+    close_run_terminal(PLATFORM_RUN_TERMINAL_SCHED_PHASE_BASE + thread_idx, &pool->head);
 }

@@ -271,3 +271,27 @@ extern "C" void *pto_sim_get_pipe_shared_state(uint64_t pipe_key, size_t size) {
     dev->pipe_states.emplace(key, storage);
     return storage;
 }
+
+namespace {
+std::mutex g_cancel_key_mutex;
+pthread_key_t g_cancel_key{};
+std::atomic<bool> g_cancel_key_initialized{false};
+}  // namespace
+
+extern "C" int pto_cpu_sim_bind_cancel_register(volatile uint32_t *reg) {
+    if (!g_cancel_key_initialized.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(g_cancel_key_mutex);
+        if (!g_cancel_key_initialized.load(std::memory_order_relaxed)) {
+            const int error = pthread_key_create(&g_cancel_key, nullptr);
+            if (error != 0) return error;
+            g_cancel_key_initialized.store(true, std::memory_order_release);
+        }
+    }
+    return pthread_setspecific(g_cancel_key, const_cast<uint32_t *>(reg));
+}
+
+extern "C" bool pto_cpu_sim_cancel_requested(uint32_t exit_signal) {
+    if (!g_cancel_key_initialized.load(std::memory_order_acquire)) return false;
+    auto *reg = static_cast<uint32_t *>(pthread_getspecific(g_cancel_key));
+    return reg != nullptr && __atomic_load_n(reg, __ATOMIC_ACQUIRE) == exit_signal;
+}

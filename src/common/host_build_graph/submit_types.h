@@ -24,6 +24,11 @@
 
 inline constexpr int32_t INVALID_KERNEL_ID = -1;
 
+namespace simpler::hbg::recorded_dispatch {
+inline constexpr uint8_t candidate = 1u << 0;
+inline constexpr uint8_t tracked = 1u << 1;
+}  // namespace simpler::hbg::recorded_dispatch
+
 // Dispatch-predicate comparison operator. The scheduler evaluates the predicate
 // at the dispatch point — the task is ready (fanin satisfied), so the predicate
 // address' producer has completed and the value read is current, which is what

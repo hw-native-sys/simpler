@@ -74,7 +74,7 @@ int main(int argc, char **argv) {
     auto *data = scheduler_state_at<pto2::resident::AsyncGroupData>(image, plan.layout.groups_offset);
     DispatchPayload payload{};
     static_assert(sizeof(DispatchPayload) == 512 && offsetof(DispatchPayload, args) == 64);
-    static_assert(offsetof(DispatchPayload, global_context) == 464 && sizeof(LocalContext) == 48);
+    static_assert(offsetof(DispatchPayload, global_context) == 464 && sizeof(LocalContext) == 8);
     payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&payload.local_context);
     payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&payload.global_context);
     auto &global = payload.global_context;
@@ -92,7 +92,8 @@ int main(int argc, char **argv) {
         assert(register_completion_condition(ctx, token));
         auto second = get_async_ctx(args);
         save_expected_notification_counter(second, reinterpret_cast<void *>(token.addr), 2);
-        assert(data->count == 2);
+        pto2::detail::defer_flush(ctx);
+        assert(data->count == 2 && data->state == pto2::resident::AsyncPublicationState::OPEN);
         assert(pto2::resident::seal_conditions(ctx.resident));
     } else if (scenario == 1) {
         auto ctx = get_async_ctx(args);
@@ -120,13 +121,14 @@ int main(int argc, char **argv) {
         assert(!register_completion_condition(ctx, token));
         assert(data->count == 0 && data->error_code == 0);
     } else if (scenario == 5) {
-        DeferredCompletionSlab slab{};
         global.async_present = 0;
-        payload.local_context.async_ctx = LegacyAsyncCtx::make(TaskId::make_global(1), &slab);
+        // Absence of an async group never touches a LocalContext or a slab.
+        payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = 0;
         auto ctx = get_async_ctx(args);
-        assert(async_ctx_is_deferred(ctx));
-        assert(register_completion_condition(ctx, token));
-        assert(slab.count == 1 && slab.entries[0].expected_value == 1);
+        assert(!async_ctx_is_deferred(ctx));
+        assert(!register_completion_condition(ctx, token));
+        pto2::detail::defer_flush(ctx);
+        assert(ctx.completion_count == nullptr && ctx.completion_entries == nullptr);
         assert(data->count == 0 && data->error_code == 0);
     } else if (scenario == 6) {
         auto ctx = get_async_ctx(args);
@@ -180,7 +182,6 @@ int main(int argc, char **argv) {
     } else if (scenario == 24) {
         auto ctx = get_async_ctx(args);
         assert(async_ctx_is_deferred(ctx));
-        assert(!ctx.task_token.is_valid());
         assert(ctx.completion_count == &data->count);
         assert(ctx.completion_error_code == &data->error_code);
         assert(ctx.completion_capacity == data->capacity);
@@ -198,6 +199,7 @@ int main(int argc, char **argv) {
         }
         auto ctx = get_async_ctx(args);
         pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        pto2::detail::defer_flush(ctx);
         assert(data->count == 2);
         assert(data->error_code == SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
         assert(!pto2::resident::seal_conditions(ctx.resident));
@@ -210,15 +212,10 @@ int main(int argc, char **argv) {
         assert(data->count == 0);
         assert(data->error_code == SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
     } else if (scenario >= 28 && scenario <= 32) {
-        const bool legacy = scenario == 29;
-        DeferredCompletionSlab slab{};
-        if (legacy) {
-            global.async_present = 0;
-            payload.local_context.async_ctx = LegacyAsyncCtx::make(TaskId::make_global(1), &slab);
-        }
+        if (scenario == 29) global.async_present = 0;
         auto ctx = get_async_ctx(args);
         const auto reservation =
-            legacy ? pto2::resident::AsyncReservation{} : pto2::resident::reserve_conditions(ctx.resident, 2);
+            scenario == 29 ? pto2::resident::AsyncReservation{} : pto2::resident::reserve_conditions(ctx.resident, 2);
         Event event;
         event.handle = 0;
         event.count = UINT32_MAX;  // An already-completed event has no records to query.
@@ -227,22 +224,24 @@ int main(int argc, char **argv) {
         if (scenario == 32) pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
         const bool registered =
             pto2::detail::register_pto_async_event(ctx, event, Session{}, reservation, 2, SdmaOp::TPUT);
-        assert(registered == (scenario <= 29));
+        if (scenario == 29) {
+            assert(!registered);
+            assert(ctx.completion_count == nullptr && ctx.completion_error_code == nullptr);
+            assert(data->count == 0 && data->error_code == 0);
+            return 0;
+        }
+        assert(registered == (scenario == 28));
         assert(*ctx.completion_count == 0);
         if (scenario <= 29) {
             assert(*ctx.completion_error_code == 0);
-            if (!legacy) {
-                assert(data->reservation_limit == 0);
-                assert(pto2::resident::seal_conditions(ctx.resident));
-            }
+            assert(data->reservation_limit == 0);
+            assert(pto2::resident::seal_conditions(ctx.resident));
         } else {
             assert(*ctx.completion_error_code != 0);
             assert(!pto2::resident::seal_conditions(ctx.resident));
             if (scenario == 32) assert(data->error_code == SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
         }
     } else if (scenario >= 33 && scenario <= 36) {
-        DeferredCompletionSlab legacy{};
-        payload.local_context.async_ctx = LegacyAsyncCtx::make(TaskId::make_global(1), &legacy);
         SchedulerArgsDumpTask selected{};
         if (scenario == 33 || scenario == 36) selected.output_tensor_mask = 1;
         scheduler_args_dump_limit_async_output(scenario == 34 ? nullptr : &selected, global);
@@ -255,7 +254,6 @@ int main(int argc, char **argv) {
             assert(async_ctx_is_deferred(ctx) == (scenario != 33));
             assert(register_completion_condition(ctx, token) == (scenario != 33));
             assert(data->count == (scenario == 33 ? 0u : 1u));
-            assert(legacy.count == 0);
             assert(pto2::resident::seal_conditions(writer) == (scenario != 33));
             assert(data->error_code == (scenario == 33 ? SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED : 0));
         }

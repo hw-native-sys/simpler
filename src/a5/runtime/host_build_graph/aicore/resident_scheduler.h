@@ -26,4 +26,12 @@ __aicore__ void
 run(__gm__ SchedulerWorkerContext *context, __gm__ SchedulerRunControl *run_control, __gm__ void *scheduler_state_base,
     uint64_t profiling_level, uint64_t aicore_entry_cycles, uint64_t handshake_publish_cycles);
 
+// Task/schedule timing retains trace storage without compiling Scalar observers.
+// The dispatcher selects this entry only for L1/L2 or sampled timing at L0.
+template <bool WithNativeGraph, CoreType Architecture>
+__aicore__ void run_timing(
+    __gm__ SchedulerWorkerContext *context, __gm__ SchedulerRunControl *run_control, __gm__ void *scheduler_state_base,
+    uint64_t profiling_level, uint64_t aicore_entry_cycles, uint64_t handshake_publish_cycles
+);
+
 }  // namespace simpler::hbg::resident

@@ -12,11 +12,10 @@
 import os
 import select
 import struct
-import subprocess
 from pathlib import Path
 
 import pytest
-from simpler.ccu import ChipCcuBinding, ChipCcuRun, ccu_sdk_root, runtime_build_identity
+from simpler.ccu import ChipCcuBinding, ChipCcuRun
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import ChipCallable, CoreCallable, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
@@ -31,41 +30,15 @@ _RUNTIME = "tensormap_and_ringbuffer"
 
 def _build_callable(tmp_path, variant=0, source_root=_ROOT, runtime=_RUNTIME):
     tmp_path.mkdir(parents=True, exist_ok=True)
-    sdk = ccu_sdk_root()
-    common = Path(__file__).resolve().parents[5] / "src/common"
-    sdk_identity, isa_identity = runtime_build_identity()
-    isa_root = Path(ensure_pto_isa_root())
-    identities = tmp_path / "identities.cpp"
-    identities.write_text(
-        "#include <cstdint>\n"
-        f"extern const uint32_t ccu_test_variant = {variant};\n"
-        f"extern const uint8_t ccu_test_sdk_identity[32] = {{{','.join(map(str, sdk_identity))}}};\n"
-        f"extern const uint8_t ccu_test_isa_identity[32] = {{{','.join(map(str, isa_identity))}}};\n"
-    )
-    module = tmp_path / "native_module.so"
-    subprocess.run(
-        [
-            "g++",
-            "-std=c++17",
-            "-shared",
-            "-fPIC",
-            "-O2",
-            str(source_root / "native_module.cpp"),
-            str(identities),
-            f"-I{common}",
-            f"-I{sdk / 'include'}",
-            f"-I{sdk / 'include/hccl'}",
-            f"-I{sdk / 'pkg_inc/hcomm/ccu'}",
-            f"-I{sdk / 'include/hcomm/ccu'}",
-            f"-L{sdk / 'lib64'}",
-            "-lasccomm_ccu",
-            "-lhcomm",
-            "-o",
-            str(module),
-        ],
-        check=True,
-    )
     compiler = KernelCompiler(platform="a5")
+    isa_root = Path(ensure_pto_isa_root())
+    variant_source = tmp_path / "variant.cpp"
+    variant_source.write_text(
+        f"#include <cstdint>\nextern const uint32_t ccu_test_variant = {variant};\n", encoding="ascii"
+    )
+    module = compiler.compile_ccu(
+        str(source_root / "native_module.cpp"), extra_sources=[str(variant_source)], build_dir=str(tmp_path)
+    )
     orch_source = source_root / "kernels/orchestration/ccu_orch.cpp"
     if not orch_source.exists():
         orch_source = _ROOT / "kernels/orchestration/ccu_orch.cpp"
@@ -86,7 +59,7 @@ def _build_callable(tmp_path, variant=0, source_root=_ROOT, runtime=_RUNTIME):
         config_name="ccu_orchestration_config",
         binary=orchestration,
         children=children,
-        ccu_modules=[module.read_bytes()],
+        ccu_modules=[module],
     )
 
 
@@ -320,6 +293,28 @@ def test_interleaved_callable_association_during_active_run(st_platform, st_devi
             os.close(started_writer)
 
 
+def _assert_unconfirmed_ccu_cleanup(worker, retained, outputs, child_pids, close_error):
+    assert close_error is not None and "Host mapping RECOVER failed" in str(close_error)
+    causes = []
+    cause: BaseException | None = close_error
+    while cause is not None:
+        causes.append(str(cause))
+        cause = cause.__cause__
+    assert any("communication cleanup is unconfirmed" in message for message in causes)
+    assert retained and not retained[0].freed
+    assert all(not output.closed for rank_outputs in outputs for output in rank_outputs)
+    assert worker._host_group_mappings is not None and worker._host_group_mappings.holds_resources
+    assert set(worker._chip_pids) == child_pids and len(worker._chip_shms) == len(child_pids)
+    assert all(shm.buf is not None for shm in worker._chip_shms)
+    assert not worker.teardown_reports()
+    for pid in child_pids:
+        os.kill(pid, 0)
+    with pytest.raises(RuntimeError, match="Host mapping RECOVER failed"):
+        worker.close()
+    assert not retained[0].freed and set(worker._chip_pids) == child_pids
+    print("CCU unconfirmed cleanup retains backing and child transports; close retry refused", flush=True)
+
+
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime(_RUNTIME)
 @pytest.mark.device_count(2)
@@ -337,6 +332,7 @@ def test_mission_failure_closes_admission_and_retains_domain(st_platform, st_dev
         num_sub_workers=0,
     )
     retained = []
+    outputs = []
     child_pids = set()
     exit_reader, exit_writer = os.pipe()
     os.set_blocking(exit_reader, False)
@@ -417,11 +413,12 @@ def test_mission_failure_closes_admission_and_retains_domain(st_platform, st_dev
         print(f"CCU {fault} observed; admission closed and domain retained", flush=True)
     finally:
         exit_records = bytearray()
+        close_error = None
         try:
             try:
                 worker.close()
-            except RuntimeError:
-                # Whole-tree teardown may report the original unconfirmed run error.
+            except RuntimeError as error:
+                close_error = error
                 assert worker._ordered_cleanup_error is not None
             try:
                 while chunk := os.read(exit_reader, 4096):
@@ -434,7 +431,11 @@ def test_mission_failure_closes_admission_and_retains_domain(st_platform, st_dev
         child_exits = {
             int(pid): int(code) for record in exit_records.decode().splitlines() for pid, code in [record.split(":")]
         }
-        assert child_pids <= child_exits.keys(), "CCU chip child crashed or did not reach controlled exit"
-        for pid in child_pids:
-            assert child_exits[pid] in (0, 1), f"CCU chip child {pid} has unexpected exit code {child_exits[pid]}"
-        print(f"CCU chip children reached controlled exit: {child_exits}", flush=True)
+        if worker._worker is not None:
+            assert not child_exits
+            _assert_unconfirmed_ccu_cleanup(worker, retained, outputs, child_pids, close_error)
+        else:
+            assert child_pids <= child_exits.keys(), "CCU chip child crashed or did not reach controlled exit"
+            for pid in child_pids:
+                assert child_exits[pid] in (0, 1), f"CCU chip child {pid} has unexpected exit code {child_exits[pid]}"
+            print(f"CCU chip children reached controlled exit: {child_exits}", flush=True)

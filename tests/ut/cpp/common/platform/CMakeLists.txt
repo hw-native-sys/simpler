@@ -125,11 +125,10 @@ simpler_ut_add_target(NAME test_a2a3_tmr_mix_lane_priority ARCH a2a3 RUNTIME ten
 
 
 
-foreach(arch a2a3 a5)
-    simpler_ut_add_target(NAME test_${arch}_hbg_mix_lane_profiling ARCH ${arch} RUNTIME host_build_graph TIER aicpu
-        SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/test_mix_lane_queue_profiling.cpp
-        DEFINES SIMPLER_DFX=1 SIMPLER_ORCH_PROFILING=1 SIMPLER_SCHED_PROFILING=1 LINK ${arch}_ut_support TIMEOUT 30)
-endforeach()
+# ChipReadyQueue profiling belongs to the A2A3 AICPU scheduler.
+simpler_ut_add_target(NAME test_a2a3_hbg_mix_lane_profiling ARCH a2a3 RUNTIME host_build_graph TIER aicpu
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/test_mix_lane_queue_profiling.cpp
+    DEFINES SIMPLER_DFX=1 SIMPLER_ORCH_PROFILING=1 SIMPLER_SCHED_PROFILING=1 LINK a2a3_ut_support TIMEOUT 30)
 simpler_ut_add_target(NAME test_a2a3_tmr_mix_lane_profiling ARCH a2a3 RUNTIME tensormap_and_ringbuffer TIER aicpu
     SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/test_mix_lane_queue_profiling.cpp
     DEFINES SIMPLER_DFX=1 SIMPLER_ORCH_PROFILING=1 SIMPLER_SCHED_PROFILING=1 LINK a2a3_ut_support TIMEOUT 30)
@@ -1238,7 +1237,9 @@ target_sources(test_a5_hbg_abort_aicore_startup PRIVATE
     ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_ordinary.cpp
     ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_native.cpp
     ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_ordinary_profiled.cpp
-    ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_native_profiled.cpp)
+    ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_native_profiled.cpp
+    ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_ordinary_timing.cpp
+    ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_native_timing.cpp)
 target_compile_definitions(test_a5_hbg_abort_aicore_startup PRIVATE TEST_RESIDENT_STARTUP=1)
 foreach(arch a2a3 a5)
     foreach(tag hbg tmr)

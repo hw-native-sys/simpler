@@ -30,6 +30,9 @@ class _ReadyMailbox:
         self.closed = False
         self.terminal_messages: list[str] = []
 
+    def fileno(self):
+        return 73
+
     def manifest(self):
         return {
             "name": "pytest-mpi-mailbox",
@@ -92,6 +95,7 @@ def test_mpi_activation_attaches_only_mailbox_endpoint(monkeypatch):
     monkeypatch.setattr(worker_mod.threading, "Thread", _InertThread)
     try:
         worker._activate_mpirun_worker_groups(worker_mod.time.monotonic() + 10.0)
+        native_worker._map_mailbox.assert_called_once_with(73, MAILBOX_SIZE)
         native_worker.add_mpi_group_mailbox.assert_called_once()
         native_worker.add_remote_l3_socket.assert_not_called()
         group = worker._mpi_l3_groups[0]

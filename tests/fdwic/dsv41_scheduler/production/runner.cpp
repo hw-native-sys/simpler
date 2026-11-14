@@ -19,6 +19,7 @@
 #include <iterator>
 #include <memory>
 #include <stdexcept>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -385,8 +386,7 @@ int run(int argc, char **argv) {
         }
         worker.finalize_native_run(run);
         const auto mode = worker.last_scheduler_runtime_mode();
-        // Percounter publishes its device bootstrap but may omit the Host mode observer.
-        const bool supported = runtime_name == "percounter" ? (mode == 0 || mode == 5) : (mode == 1 || mode == 2);
+        const bool supported = runtime_name == "percounter" ? mode == 5 : (mode == 1 || mode == 2);
         if (!supported) throw std::runtime_error("Unexpected scheduler mode: " + std::to_string(mode));
         host_barrier(output, "complete-" + label, rank, ranks);
         return mode;

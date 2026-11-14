@@ -24,11 +24,8 @@
 // fresh Runtime and HostApi. No attempt pointer is retained here. Definition
 // sources and the SM mirror belong to the same exclusive slot; publication
 // storage and tensor leases move between this owner and the current attempt.
-template <class Layout>
-struct RetainedHostPreparePlan {
+struct RetainedHostPrepareState {
     bool committed{false};
-    DeviceArena host_arena;
-    Layout layout{};
     void *host_sm{nullptr};
     uint64_t sm_size{0};
     uint64_t task_capacity{0};
@@ -60,4 +57,11 @@ struct RetainedHostPreparePlan {
         publication = {};
         runtime.tensor_leases() = std::move(leases);
     }
+};
+
+// A2A3 and WSE publish an arena header alongside their task image.
+template <class Layout>
+struct RetainedHostPreparePlan : RetainedHostPrepareState {
+    DeviceArena host_arena;
+    Layout layout{};
 };

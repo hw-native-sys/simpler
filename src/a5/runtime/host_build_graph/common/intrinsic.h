@@ -14,8 +14,7 @@
  * @brief SPMD execution context for AICore user kernels
  *
  * GlobalContext exposes the final physical AIV lane and versioned resident
- * run/execution addressing. LocalContext carries logical block geometry and
- * the legacy asynchronous wire fields. Both contexts belong to the dispatch
+ * run/execution addressing. LocalContext carries logical block geometry. Both contexts belong to the dispatch
  * payload; their addresses remain stable for the kernel invocation.
  *
  * Both contexts are injected via two pointer slots appended at the tail
@@ -75,7 +74,7 @@
 #include <stdint.h>
 #include <type_traits>
 
-#include "aicore_completion_mailbox_types.h"
+#include "host_build_graph/completion_types.h"
 #include "host_build_graph/task_id.h"
 
 #ifndef __gm__
@@ -102,8 +101,7 @@ static constexpr int32_t PAYLOAD_GLOBAL_CONTEXT_INDEX = SPMD_GLOBAL_CONTEXT_INDE
 /**
  * Per-dispatch global context, stored in DispatchPayload. Resident graph
  * Mix dispatch sets sub_block_id from the final physical AIV placement; the
- * legacy scheduler seeds the equivalent per-core value during startup. The
- * resident writer fields name this invocation's stable completion publication.
+ * writer fields name this invocation's stable completion publication.
  */
 struct GlobalContext {
     // AIV lane within cluster: 0=AIV0(left), 1=AIV1(right).
@@ -119,46 +117,18 @@ struct GlobalContext {
     uint32_t async_output_capture_refused;
 };
 
-struct LegacyAsyncCtx {
-    volatile __gm__ uint32_t *completion_count;
-    volatile __gm__ int32_t *completion_error_code;
-    volatile __gm__ DeferredCompletionEntry *completion_entries;
-    uint32_t completion_capacity;
-    TaskId task_token;
-
-    static inline LegacyAsyncCtx make(TaskId task_token, volatile __gm__ DeferredCompletionSlab *buffer) {
-        LegacyAsyncCtx ctx{};
-        ctx.task_token = task_token;
-        if (buffer == nullptr) {
-            ctx.task_token = TaskId::invalid();
-            return ctx;
-        }
-        ctx.completion_count = &buffer->count;
-        ctx.completion_error_code = &buffer->error_code;
-        ctx.completion_entries = &buffer->entries[0];
-        ctx.completion_capacity = MAX_COMPLETIONS_PER_TASK;
-        return ctx;
-    }
-};
-
-/**
- * Per-dispatch local context, stored in DispatchPayload.
- * Written by build_payload() before each dispatch. Different blocks of the
- * same task receive different block_idx values but the same block_num.
- *
- */
-static_assert(sizeof(GlobalContext) == 48 && sizeof(LegacyAsyncCtx) == 40);
+static_assert(sizeof(GlobalContext) == 48);
 static_assert(offsetof(GlobalContext, async_present) == 4 && offsetof(GlobalContext, async_group_index) == 40);
 static_assert(std::is_standard_layout_v<GlobalContext> && std::is_trivially_copyable_v<GlobalContext>);
-static_assert(std::is_standard_layout_v<LegacyAsyncCtx> && std::is_trivially_copyable_v<LegacyAsyncCtx>);
 
+// Resident and percounter preparation assign the current logical block geometry.
 struct LocalContext {
     int32_t block_idx;  // Logical block index within the task [0, block_num)
     int32_t block_num;  // Original logical block count, including multi-wave execution.
                         // NOT the same as RUNTIME_CONFIG.block_dim in kernel_config.py,
                         // which controls how many physical cores the runtime launches.
-    LegacyAsyncCtx async_ctx;
 };
+static_assert(sizeof(LocalContext) == 8);
 
 /**
  * Return the AIV lane index within the cluster.

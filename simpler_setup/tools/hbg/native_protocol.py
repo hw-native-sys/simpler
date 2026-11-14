@@ -13,12 +13,14 @@ Sequence integrity proves lossless local event streams, not scheduler causality,
 execution coverage, membership, dependency ordering or Mix resource correctness.
 """
 
-SCHEMAS = ("hbg-native-protocol-v10", "hbg-native-protocol-v11")
+SCHEMAS = ("hbg-native-protocol-v20", "hbg-native-protocol-v21")
+COMPLETION_FROM_CONTRIBUTION = 1 << 30
+DEFERRED_FINISH = 1 << 31
 
 ROOT_NUMBERS = frozenset(
     """
 run_epoch task_count worker_count trace_count member_count cooperative_task_count
-cluster_count mix_task_count expected_task_count inline_completed_count resolved_task_count
+cluster_count mix_task_count sync_mix_task_count expected_task_count inline_completed_count resolved_task_count
 close_seal_stride active_worker_count scheduler_count scheduler_error error_claimed commit_tail commit_lock
 """.split()
 )
@@ -37,10 +39,11 @@ NUMBERS = {
         "error_flags finished core_id core_type cluster_index"
     ),
     "admission": (
-        "index run_epoch task_ref order_key block_num member_count "
-        "active_mask flags member_words_offset close_seals_offset"
+        "index run_epoch task_ref order_key block_num member_count active_mask flags record_offset close_seals_offset"
     ),
-    "control": "task_ref state next_block completed_subtasks admission_state",
+    "control": (
+        "task_ref state next_block completed_subtasks admission_state canonical_total pending_compute completion_debt"
+    ),
     "claim": "run_epoch worker_index block_idx confirmed_count seal_value",
     "actor": "run_epoch task_ref order_key worker_index flags",
     "member": (
@@ -49,7 +52,7 @@ NUMBERS = {
     ),
     "owner": (
         "run_epoch task_ref order_key group_seq completion_ticket worker_index "
-        "block_idx cluster_index block_num active_mask flags"
+        "block_idx cluster_index block_num active_mask flags sync_tail"
     ),
     "lane": (
         "index run_epoch task_ref order_key group_seq worker_index block_idx "
@@ -67,7 +70,8 @@ STAMPS = {
     "actor": "before after",
     "member": "observed closed",
     "owner": (
-        "claim_before claim_after publish_before publish_after completion_before completion_after releases_observed"
+        "staged claim_before claim_after publish_before publish_after "
+        "completion_before completion_after releases_observed"
     ),
     "lane": "descriptor_ready arrive_before arrive_after arrivals_observed release_before release_after",
     "execution": (
@@ -77,8 +81,8 @@ STAMPS = {
 ARRAYS = {
     "task": {"kernel_ids": 3, "dependencies": None},
     "worker": {"cluster_workers": 3},
-    "admission": {"member_words": None, "close_seals": None},
-    "owner": {"released_seq": 3},
+    "admission": {"close_seals": None},
+    "owner": {"released_seq": 3, "sync_frontier": 3, "sync_hold": 3},
     "lane": {"arrived_seq": 3, "lane_subtasks": 3},
 }
 SIGNED_FIELDS = frozenset(("task_ref", "core_id", "core_type", "state"))
@@ -91,7 +95,7 @@ def protocol_version(section):
 
 def has_native_graph(section):
     """The native Graph schema includes independent source and node maps."""
-    return isinstance(section, dict) and section.get("schema") == "hbg-native-protocol-v11"
+    return isinstance(section, dict) and section.get("schema") == "hbg-native-protocol-v21"
 
 
 def _error(message):
@@ -177,14 +181,9 @@ def read_native_protocol(section):
     ):
         _indices(section[table], count, table, key=key, dense=True)
         for row in section[table]:
-            extra = {
-                "control": ("claim_tickets", "claim_seal"),
-                "admission": ("member_rank_offset",),
-            }.get(kind, ())
+            extra = ("claim_tickets", "claim_seal", "parked_count") if kind == "control" else ()
             _record(row, kind, f"{table}[{row[key]}]", extra)
     for row in section["admissions"]:
-        if len(row["member_words"]) != (section["worker_count"] + 63) // 64:
-            _error("member bitmap length mismatch")
         if len(row["close_seals"]) not in (0, section["cluster_count"]):
             _error("close seal array length mismatch")
     for table, kind, count in (
@@ -241,11 +240,72 @@ def _event_records(section):
             yield row, kind, f"{table}[{row['index']}]"
 
 
+def _completion_aliases(section):
+    """Validate every shared completion interval before deduplicating its stamps."""
+    tasks = {row["task_ref"]: row for row in section["tasks"]}
+    controls = {row["task_ref"]: row for row in section["task_controls"]}
+    contributions = {}
+    for execution in section["executions"]:
+        key = execution["task_ref"], execution["contribution_ticket"]
+        contributions.setdefault(key, []).append(execution)
+    aliases = {}
+    for event in section["task_events"]:
+        admission, done = event["admission"], event["completion"]
+        if admission is not None and admission["flags"] & COMPLETION_FROM_CONTRIBUTION:
+            _error("completion alias on admission")
+        if done is None or not done["flags"] & COMPLETION_FROM_CONTRIBUTION:
+            continue
+        ref = event["index"]
+        task, control = tasks[ref], controls[ref]
+        total = task["block_num"] * task["active_mask"].bit_count()
+        if (
+            not task["flags"] & 1
+            or task["flags"] & 32
+            or not 0 < task["active_mask"] < 8
+            or not 0 < total <= 32767
+            or done["flags"] & DEFERRED_FINISH
+            or done["flags"] != task["flags"] | COMPLETION_FROM_CONTRIBUTION
+            or done["task_ref"] != ref
+            or done["run_epoch"] != section["run_epoch"]
+            or control["canonical_total"] != total
+            or control["pending_compute"] != 0
+            or control["completion_debt"] != 0
+            or control["state"] != 2
+        ):
+            _error(f"invalid physical TaskDone completion alias for task {ref}")
+        candidates = contributions.get((ref, total - 1), ())
+        if len(candidates) != 1:
+            _error(f"TaskDone completion alias lacks a unique last contribution for task {ref}")
+        source = candidates[0]
+        lane, block = source["subtask_slot"], source["block_idx"]
+        if (
+            lane >= 3
+            or not task["active_mask"] & (1 << lane)
+            or block >= task["block_num"]
+            or source["block_num"] != task["block_num"]
+            or source["index"]
+            != task["trace_base"]
+            + block * task["active_mask"].bit_count()
+            + (task["active_mask"] & ((1 << lane) - 1)).bit_count()
+            or source["run_epoch"] != done["run_epoch"]
+            or source["worker_index"] != done["worker_index"]
+            or source["contribution_worker"] != done["worker_index"]
+            or source["order_key"] != done["order_key"]
+            or done["before"] != source["contribution_before"]
+            or done["after"] != source["contribution_after"]
+            or not 0 < done["before"][1] < done["after"][1]
+        ):
+            _error(f"TaskDone completion alias does not identify its last contribution for task {ref}")
+        aliases[ref] = source
+    return aliases
+
+
 def audit_protocol_sequences(section):
     """Check producer terminal status and contiguous per-worker sequences, not full causality."""
     read_native_protocol(section)
     if section["scheduler_error"] != 0 or section["error_claimed"] != 0:
         _error("scheduler reported an error")
+    _completion_aliases(section)
     workers = {row["index"]: row for row in section["workers"]}
     streams = {index: {} for index in workers}
     epoch = section["run_epoch"]
@@ -262,6 +322,9 @@ def audit_protocol_sequences(section):
         worker = record["worker_index"]
         if worker not in workers or record["run_epoch"] != epoch:
             _error(f"foreign worker or epoch at {path}")
+        if kind == "actor" and record["flags"] & COMPLETION_FROM_CONTRIBUTION:
+            # The validated physical contribution contributes these events once.
+            continue
         stream = streams[worker]
         for name in STAMPS[kind].split():
             cycles, sequence = record[name]

@@ -13,7 +13,7 @@
 
 #include "async_completion_types.h"
 #include "scheduler_async_state.h"
-#include "scheduler_resolve_state.h"
+#include "scheduler_types.h"
 
 struct alignas(64) SchedulerAsyncLayout {
     uint64_t run_epoch;

@@ -141,8 +141,14 @@ H2D/MAP arguments with a callable writer are rejected before preparation.
 Tensor remains 144 bytes and BufferDescriptor 88 bytes. Byte 141 is the per-call
 transfer carrier; bytes 142–143 remain padding. No mapping reference is stored in
 a Tensor or transmitted on the wire. Mapping ownership stays in the consumer's
-registry. MAP forwarding to L3+, remote workers, Host compute leaves, borrowed L2
-contexts and unresolved native ChipWorker execution is unsupported and rejected.
+registry. For a local A5 TMR L3 Worker, each consuming child establishes or reuses
+its mapping while preparing its MAP arguments, alongside native H2D handling.
+Outer arguments need no MAP declaration. Callback-created views of owned shared
+Host backing are supported; each child resolves its own Device address. Multiple
+backings and overlapping calls are supported, including first-time mappings,
+with parent-owned lifetime and coordinated cleanup. L3 HBG, L4+, remote workers, Host compute leaves, borrowed L2 contexts
+and unresolved native ChipWorker execution reject MAP. See the
+[L3 shared-table contract](design/a5-host-ddr.md#l3-shared-tables).
 
 MAP supports callable IN / OUT / INOUT and ordinary TensorArgType grant checks.
 Device writes go directly to Host backing without a D2H copy. Finish CPU writes
@@ -158,6 +164,13 @@ release refuses without revoking admission. Once unregister begins, failed clean
 retains backing/context and rejects new uses until cleanup succeeds. Unknown
 completion retains resources. Python memoryviews and derived NumPy arrays must
 also be released before closing backing. See the [example](../examples/a5/tensormap_and_ringbuffer/host_ddr_gather/README.md).
+
+L3 terminal close can request a native owner drain while retaining Host backing.
+Only proven last use permits child use retirement; mappings are then explicitly
+unregistered before recovered owners finalize. Failed drain, unregistration or
+owner finalization retains cleanup records for retry. Child task errors and child
+exit alone do not supply this proof. See the
+[L3 recovery ordering](design/a5-host-ddr.md#l3-shared-tables).
 
 ```python
 view = Tensor(buffer, shapes=(16,), dtype=DataType.FLOAT32)
@@ -282,15 +295,19 @@ type change rather than a silently wrong address.
 
 ```python
 h  = worker.create_buffer(nbytes)                 # kind3: explicit shared host buffer (POSIX shm)
-h  = worker.alloc_shared_tensor((M, N), dtype)    # kind3: shape-sized create_buffer
-# inside an orch fn, for device (chip-private) memory:
-d  = orch.alloc_child_tensor(worker, (M, N), dtype)  # kind4: DEVICE_MALLOC on that chip
+
+def orch_fn(orch, args, config):
+    intermediate = worker.alloc_shared_tensor((M, N), dtype)  # managed HeapRing allocation
+    d = orch.alloc_child_tensor(worker_id, (M, N), dtype)      # kind4: DEVICE_MALLOC on that chip
 ```
 
 `create_buffer` returns a `Buffer` backed by a POSIX shm the consumer maps
 lazily on first receipt of a tensor over it (map-once, by identity);
-`alloc_shared_tensor` returns a runtime-managed intermediate over a FORK_SHM ring
-VA. `alloc_child_tensor` allocates device memory on a specific next-level worker
+`alloc_shared_tensor` returns a runtime-managed intermediate. After direct A5 L2 initialization, a top-level A5 `tensormap_and_ringbuffer` L3 Worker starts
+its chip children in new interpreters. These children require explicit shared inputs from
+`create_buffer`. Managed intermediates use `SHARED_FD_SLICE` to locate the backing and offset
+independently of the consumer address. Forked chip children retain `FORK_SHM` for managed intermediates.
+`alloc_child_tensor` allocates device memory on a specific next-level worker
 and wraps the pointer; its `.base` is the device pointer (the `orch.copy_to`
 destination), and a tensor over it must be dispatched only to that worker.
 
@@ -437,7 +454,8 @@ gates, or keys on it.
 
 | Backend | Materializes to | `body` must be | Used for |
 | ------- | --------------- | -------------- | -------- |
-| `POSIX_SHM` | a named shm mapped into the consumer | the shm name: 1–32 bytes of printable ASCII, no `/` | `create_buffer` / `alloc_shared_tensor` |
+| `POSIX_SHM` | a named shm mapped into the consumer | the shm name: 1–32 bytes of printable ASCII, no `/` | `create_buffer` |
+| `SHARED_FD_SLICE` | an allocation-bounded view of a shared heap mapping | producer PID (u32), inherited fd (u32), slab offset (u64), all LE | `Orchestrator.alloc` / `alloc_shared_tensor` in an L3 Worker with exec chip children |
 | `FORK_SHM` | the same VA, no map | exactly 8 bytes, a non-zero u64 LE base | a pre-fork `MAP_SHARED` host buffer (e.g. `share_memory_()`), writable from the child |
 | `FORK_COW` | the same VA, no map | exactly 8 bytes, a non-zero u64 LE base | a pre-fork plain host buffer: copy-on-write, so **READ only** |
 | `VMM_WINDOW` | the device VA of the window carved by `allocate_domain`, no map | exactly 8 bytes, a non-zero u64 LE base | communication-domain window / buffer |
@@ -488,11 +506,9 @@ completion token for a downstream task to depend on.
 
 This page describes the memory model end to end. **The dispatch wire is
 connected**: `TaskArgs` carries the `Tensor`, `Tensor(buffer, ...)` reaches a
-consumer, and the submit-time checks above run on every submit. Still absent are
-the other allocators (`alloc_shared_tensor`, `alloc_child_tensor`), and the
-endpoint x `address_space` check inside `materialize` — a device backing resolved
-there yields a pointer meaningful only on its owner chip, and today that is
-enforced where a task is submitted rather than where it is materialized.
+consumer, and the submit-time checks above run on every submit. A device backing
+resolved by `materialize` yields a pointer meaningful only on its owner chip.
+The submit path enforces this endpoint and `address_space` check.
 
 **There is no second blob format.** A `Tensor` travels in the TaskArgs mailbox
 blob that `write_blob` / `read_blob` implement in

@@ -8,6 +8,12 @@
 
 跳过 host 的分配、建图和上传，只接受这些输入：Runtime 启动描述、只读图/参数、scheduler state，以及每个核的 context 和 payload 存储。
 
+本轮 `gm_sm_ptr` 直接指向 pooled runtime arena 起点，`sm_image_bytes` 就是紧凑任务镜像长度。
+该 arena 没有旧 SchedulerState、AICPU ready/early/sync 队列、completion mailbox 或 RuntimeContext 前缀。
+Host 编排直接使用 OrchContext/OrchestratorState；设备通过独立的 `scheduler_bootstrap` 找到 resident backing，
+再按 worker context 的 offset 找到 run control、ready pool、payload 与 async 数据。
+launch descriptor 的 prebuilt arena 字段保持空/0；AICPU 不 attach/wire 旧 runtime arena。
+
 初值契约可核对 [scheduler_types.h](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h)：尚未完成任务的 `state=BLOCKED`，`wake_list_head=-1`，`next_waiter=-1`，`wake_cursor=pack(-1,0)`；领取/完成游标为 0；CSR 候选的依赖 remaining 由 Host 填入未完成且去重的前驱数；payload 的 `args[48]`、`args[49]` 已指向自身两个 context。已经 inline 完成的节点另作 DONE 处理。
 两个业务 ready 队列的 `head/reserved_tail` 初始为 0，所有 `SchedulerTicketEntry.task_ref` 初始为 -1，见 [ready pool 初始化](../../../src/a5/runtime/host_build_graph/host/ready_pool_plan.h)。native control inbox 的 head/tail 初始均为 -1。
 默认 Host 生成 CSR，bootstrap 对有依赖表的图使用 remaining 计数。通过 ready-pool header 的 `dependencies_offset` 定位 CSR/remaining；为 0 的有效图使用动态挂链。这只是输入契约，不沿 Host 构造流程展开。

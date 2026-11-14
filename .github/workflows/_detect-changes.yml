@@ -170,11 +170,17 @@ jobs:
             echo "non_code_only=false" >> "$GITHUB_OUTPUT"
           fi
 
+          # This self-contained benchmark and its local tests run manually.
+          # Keep FILES intact for fail-open attribution, code classification and
+          # packaging gates; only automatic ST/UT impact excludes this subtree.
+          MANUAL_ONLY='^tests/fdwic/dsv41_scheduler/'
+          AUTO_TEST_FILES=$(echo "$FILES" | grep -vE "$MANUAL_ONLY" || true)
+
           # Architecture axis: skip a partition only when every changed file is
           # in the sibling partition or non-code.
           WSE_ONLY='^(src/wse/|examples/wse/|tests/(st|ut/cpp)/wse/)'
           A5_ONLY='^(src/a5/|examples/a5/|tests/(st|ut/cpp)/a5/)'
-          A2A3_REMAINING=$(echo "$FILES" | grep -vE "$A5_ONLY|$WSE_ONLY" | grep -vE "$NON_CODE" || true)
+          A2A3_REMAINING=$(echo "$AUTO_TEST_FILES" | grep -vE "$A5_ONLY|$WSE_ONLY" | grep -vE "$NON_CODE" || true)
           if [ -n "$A2A3_REMAINING" ]; then
             echo "a2a3_changed=true" >> "$GITHUB_OUTPUT"
             echo "Files affecting a2a3:"
@@ -185,7 +191,7 @@ jobs:
           fi
 
           A2A3_ONLY='^(src/a2a3/|examples/a2a3/|tests/(st|ut/cpp)/a2a3/)'
-          A5_REMAINING=$(echo "$FILES" | grep -vE "$A2A3_ONLY|$WSE_ONLY" | grep -vE "$NON_CODE" || true)
+          A5_REMAINING=$(echo "$AUTO_TEST_FILES" | grep -vE "$A2A3_ONLY|$WSE_ONLY" | grep -vE "$NON_CODE" || true)
           if [ -n "$A5_REMAINING" ]; then
             echo "a5_changed=true" >> "$GITHUB_OUTPUT"
             echo "Files affecting a5:"
@@ -195,7 +201,7 @@ jobs:
             echo "All changes are confined to other architectures or non-code; skipping a5"
           fi
 
-          WSE_REMAINING=$(echo "$FILES" | grep -vE "$A2A3_ONLY|$A5_ONLY" | grep -vE "$NON_CODE" || true)
+          WSE_REMAINING=$(echo "$AUTO_TEST_FILES" | grep -vE "$A2A3_ONLY|$A5_ONLY" | grep -vE "$NON_CODE" || true)
           if [ -n "$WSE_REMAINING" ]; then
             echo "wse_changed=true" >> "$GITHUB_OUTPUT"
             echo "Files affecting wse:"
@@ -209,7 +215,7 @@ jobs:
           ST_ONLY='^(tests/st/|examples/)'
           UT_ONLY='^(tests/ut/|tools/)'
 
-          ST_REMAINING=$(echo "$FILES" | grep -vE "$UT_ONLY" | grep -vE "$NON_CODE" || true)
+          ST_REMAINING=$(echo "$AUTO_TEST_FILES" | grep -vE "$UT_ONLY" | grep -vE "$NON_CODE" || true)
           if [ -n "$ST_REMAINING" ]; then
             echo "st_affected=true" >> "$GITHUB_OUTPUT"
           else
@@ -217,7 +223,7 @@ jobs:
             echo "All changes are unit-test/tooling-only or non-code; skipping scene tests"
           fi
 
-          UT_REMAINING=$(echo "$FILES" | grep -vE "$ST_ONLY" | grep -vE "$NON_CODE" || true)
+          UT_REMAINING=$(echo "$AUTO_TEST_FILES" | grep -vE "$ST_ONLY" | grep -vE "$NON_CODE" || true)
           if [ -n "$UT_REMAINING" ]; then
             echo "ut_affected=true" >> "$GITHUB_OUTPUT"
           else

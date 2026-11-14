@@ -105,6 +105,7 @@ struct GraphInflightRecording {
 // publication and upload — unless the arena had no room, in which case `spill`
 // holds the image and `object_offset` is GRAPH_NO_OBJECT_OFFSET.
 struct GraphDefinitionRecord {
+    uint64_t invocation_storage_bytes{0};
     size_t object_offset{GRAPH_NO_OBJECT_OFFSET};
     size_t bytes{0};
     std::vector<std::byte> spill;
@@ -121,6 +122,12 @@ struct GraphDefinitionRecord {
 };
 
 struct GraphHostState {
+    bool (*execution_storage_bytes)(const GraphDefinition &, uint64_t *) = [](const GraphDefinition &definition,
+                                                                              uint64_t *bytes) {
+        *bytes = definition.execution_storage_bytes;
+        return *bytes != 0;
+    };
+
     // Synchronous callers lease independent scratch; retired entries return it here.
     std::array<std::unique_ptr<GraphRecording>, GRAPH_MAX_DEFINITIONS> fallback_scratch_cache;
     explicit GraphHostState(const GraphDefinitionArena &arena) :

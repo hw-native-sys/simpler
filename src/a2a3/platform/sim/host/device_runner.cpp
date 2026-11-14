@@ -737,7 +737,20 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
                 uint32_t physical_core_id = static_cast<uint32_t>(i);
                 run->aicore_threads.push_back(create_thread(
                     [this, run, i, core_type, physical_core_id]() {
-                        const int rc = aicore_execute_func_(
+                        auto *regs = reinterpret_cast<uint64_t *>(kernel_args_.regs);
+                        auto *dispatch = reinterpret_cast<volatile uint32_t *>(
+                            regs[physical_core_id] + reg_offset(RegId::DATA_MAIN_BASE)
+                        );
+                        int rc = pto_cpu_sim_bind_cancel_register(dispatch);
+                        if (rc != 0) {
+                            SimThreadStartGate::report_ready_and_wait(&run->startup, rc);
+                            run_completion_.task_finished(PTO_RUNTIME_ERR_INTERNAL);
+                            return;
+                        }
+                        auto unbind_cancel = RAIIScopeGuard([]() {
+                            pto_cpu_sim_bind_cancel_register(nullptr);
+                        });
+                        rc = aicore_execute_func_(
                             run->runtime, i, core_type, physical_core_id, kernel_args_.regs,
                             kernel_args_.enable_profiling_flag, kernel_args_.chip_swimlane_aicore_rotation_table,
                             kernel_args_.run_result_epoch, &SimThreadStartGate::report_ready_and_wait, &run->startup

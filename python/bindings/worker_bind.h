@@ -471,7 +471,21 @@ inline void bind_worker(nb::module_ &m) {
             "Managed HeapRing intermediate (MAP_SHARED, visible to forked children) registered under the "
             "identity's canonical hash; returns its heap VA. The caller wraps the VA as a FORK_SHM "
             "Buffer carrying `identity` so a ref dependency-wires to this slot (the alloc->Tensor "
-            "bridge). Backs Worker.alloc_shared_tensor / Orchestrator.alloc (Python)."
+            "bridge)."
+        )
+        .def(
+            "_alloc_shared_buffer",
+            [](Orchestrator &self, const std::vector<uint32_t> &shape, DataType dtype,
+               const CanonicalIdentity &identity) {
+                uint64_t bytes = get_element_size(dtype);
+                for (const auto dimension : shape)
+                    bytes = tensor_mul_sat(bytes, dimension);
+                if (bytes == UINT64_MAX) throw std::invalid_argument("shared buffer size overflows uint64");
+                const uint64_t address = self.alloc(shape, dtype, identity);
+                if (bytes == 0) return nb::make_tuple(address, nb::none());
+                return nb::make_tuple(address, self.describe_shared_buffer(address, bytes, identity));
+            },
+            nb::arg("shape"), nb::arg("dtype"), nb::arg("identity")
         )
         .def(
             "scope_begin", &Orchestrator::scope_begin, "Open a nested scope. Max nesting depth = MAX_SCOPE_DEPTH (64)."
@@ -522,6 +536,18 @@ inline void bind_worker(nb::module_ &m) {
     // (simpler.worker.Worker) wraps this C++ class.
     nb::class_<Worker>(m, "_Worker")
         .def(
+            nb::init<int32_t, uint64_t, const std::vector<int> &>(), nb::arg("level"), nb::arg("heap_ring_size"),
+            nb::arg("heap_fds")
+        )
+        .def("_shared_heap_fds", &Worker::shared_heap_fds)
+        .def(
+            "_map_mailbox",
+            [](Worker &self, int fd, size_t bytes) {
+                return reinterpret_cast<uint64_t>(self.map_mailbox(fd, bytes));
+            },
+            nb::arg("fd"), nb::arg("bytes"), "Own a shared mailbox mapping until native Worker destruction."
+        )
+        .def(
             nb::init<int32_t, uint64_t>(), nb::arg("level"), nb::arg("heap_ring_size") = DEFAULT_HEAP_RING_SIZE,
             "Create a Worker for the given hierarchy level (3=L3, 4=L4, …). "
             "`heap_ring_size` selects the per-ring MAP_SHARED heap mmap'd in the ctor "
@@ -540,7 +566,7 @@ inline void bind_worker(nb::module_ &m) {
             "Add a NEXT_LEVEL sub-worker. `mailbox_ptr` is the address of a MAP_SHARED region and "
             "`mailbox_bytes` is how much of it the caller mapped, which must cover "
             "`mailbox_size(granted_sets)`; the child process loop is "
-            "Python-managed (fork + _chip_process_loop). `child_pid` is that "
+            "Python-managed (child bootstrap + _chip_process_loop). `child_pid` is that "
             "forked child, used to detect an exit before mailbox completion."
         )
         .def(

@@ -419,6 +419,10 @@ public:
     bool host_ddr_mapping_supported() const noexcept;
     uint64_t map_host_ddr(uint64_t host, uint64_t bytes);
     void unmap_host_ddr(uint64_t host);
+    /// Terminally stop admission and prove Host last use without unregistering
+    /// mappings or resetting their device context. Failure retains all debt.
+    /// True means quarantined carriers still require terminal owner teardown.
+    bool quiesce_host_uses();
 
     /// One span of a caller device allocation a run names. The lane's
     /// vocabulary for the borrow it takes on a run's behalf; the wire form it
@@ -991,6 +995,7 @@ private:
     );
     void wait_native_run_completion(const ChipWorkerNativeRun &run);
     void cleanup_native_runs_noexcept() noexcept;
+    std::exception_ptr stop_and_cleanup_native_runs();
     void clear_runtime_binding(bool release_device_reservation = true);
     void abandon_after_failed_teardown(std::exception_ptr error) noexcept;
     /** How many runs remain tracked and not proved destroyed, including live runs. */
@@ -1202,8 +1207,10 @@ private:
         unsigned registered{0};
         bool closing{false};
     };
-    std::mutex host_ddr_mutex_;
+    mutable std::mutex host_ddr_mutex_;
     std::unordered_map<uint64_t, HostDdrMapping> host_ddr_mappings_;
+    int (*quiesce_host_uses_fn_)(void *) = nullptr;
+    bool host_uses_quiesced_ = false;
     int device_id_ = -1;
     bool initialized_ = false;
     bool finalized_ = false;

@@ -51,7 +51,7 @@ that loads directly in Perfetto. For the scheduler-overhead deep-dive, capture
   `src/common/{host_build_graph,tensormap_and_ringbuffer}/sched_phase_kind.h`.
   Within a runtime the vocabulary splits again by producer, because a stream is
   written by one: `host_build_graph`'s `bootstrap` / `state_probe` /
-  `refill` / `idle` and its plain `resolve` come only from its AICore scheduler,
+  `idle` come only from its AICore scheduler,
   `graph_prepare` / `resolve_standalone` / `dummy` / `early_dispatch` / `drain` /
   `async_poll` only from its AICPU one, and `complete` / `dispatch` from either.
   `tensormap_and_ringbuffer` has one producer, so every phase of its own is its
@@ -94,14 +94,14 @@ that loads directly in Perfetto. For the scheduler-overhead deep-dive, capture
   Fanout was renamed Resolve and now also filters out <1 µs walks;
   Prestage was renamed EarlyDispatch).
   A5 `host_build_graph` uses the AICore Scheduler as the producer and emits one
-  flat lane per Scheduler. Every executed task has exactly one publication
-  phase: `dispatch` or `refill`. Tasks acquired from the shared ready pool
-  first emit `state_probe`; an eligible non-MIX successor selected by
-  `DIRECT_RESOLVE` moves from `resolve` directly to `refill` and emits no
-  `state_probe`. The converter displays these phases as Completion, Resolve,
-  StateProbe, Dispatch, and Refill. Bootstrap ends before the initial
-  task dispatch, and its dependency initialization is not emitted again as a
-  nested `fanin` phase.
+  flat lane per Scheduler. Each executed unit has one `dispatch` publication
+  record. Ordinary execution tokens emit `state_probe` for discovery and
+  acquisition before dispatch; fanin checks happen after acquisition and are
+  recorded as `scalar_execution_token_fanin`. The token path emits neither an
+  outer `resolve` nor an outer `refill`; `scalar_execution_token_refill` measures
+  token discovery, not replacement publication. Batched StateProbe envelopes
+  may overlap, so use the Scalar profile for exclusive scheduler costs.
+  Bootstrap ends before the initial task dispatch, with no nested `fanin` phase.
 - **Orchestrator submit envelope** — one record per `submit_task()`
   / `alloc_tensors()` call covering the whole submit's
   `[start, end]` window (`orch_submit` phase). Per-sub-step
@@ -136,10 +136,17 @@ backward-compatible with the old boolean behavior).
 | 3 | + scheduler phases (`scheduler_records`) | Does not enable orchestrator collection; an independently enabled HBG Host pool can still export Host records |
 | 4 | + orchestrator phases (Host for HBG, AICPU for TMR) | Full collection |
 
+A5 `percounter` supports the same L1–L4 ladder. L2 timestamps describe local
+ready-payload execution entry and kernel return, and L3/L4 add percounter's own
+fanin, payload preparation, MIX, sync-start, completion and memory-operation
+intervals. Its Scalar lane includes nested kernel execution and uses the same
+exclusive-time accounting as HBG. See the [percounter profiling contract](../../src/a5/runtime/percounter/README.md#chip-swimlanes-l1l4)
+for timing boundaries, storage limits and truncation behavior.
+
 ### A5 HBG Scalar detail at Level 3
 
 Level 3 records the resident AICore scheduler's memory operations individually
-and ordinary function spans lasting at least 1 microsecond. Level 4 retains
+and ordinary function spans lasting at least 1 us. Level 4 retains
 all function spans as well. The converter draws one nested lane per worker in
 **AICore Scheduler**, labeled with its core type, worker ID and physical ID,
 for example `Cluster 00 / C / AIC_0 (physical 0)` or
@@ -158,28 +165,34 @@ The detail lane preserves the phase hierarchy and original L1 kernel intervals. 
 (including its `idle` bars) is omitted when Scalar detail is available.
 The outer `window` interval is used for accounting but is not drawn.
 
-`scheduler_fill_own_slots` expands into its actual callees. Its ordered path
-shows the progress probe, admission claim/publication/preparation/commit,
+`scheduler_fill_own_slots` expands into its actual callees. Ordinary work
+shows token discovery/refill, Claim and Call reception, incremental fanin
+observation, and direct token transfer to execution. Cooperative discovery and
+cluster MIX service have independent names; MIX preparation, arm, observation,
+retirement, and group ownership operations are nested beneath their callers.
+The ordered path shows its progress probe, admission staging/commit,
 local-obligation refresh, ordinary-task parking, block claim and cursor read,
-obligation close, and ordinary-entry permit. Both paths expose shared-ready-queue
-claiming, dispatch metadata loads, slot preparation/publication, and inline-task
-completion. Function spans below the level's threshold are omitted on device,
-including short empty polls. Atomic, bypass, DCCI and DSB leaves are retained
-regardless of duration; recorder and backoff intervals are also retained.
-The names identify real functions; parent intervals include their
-children and must not be added to child totals. Uninstrumented work remains
-in the parent's exclusive time.
+obligation close, and ordinary-entry permit. Functions without a worker argument
+use the same core-local trace binding and preserve the caller's nesting depth.
+L3 function spans shorter than 1 us are omitted on device; L4 retains every
+instrumented function span, including short empty polls. Atomic, bypass, DCCI
+and DSB leaves are retained regardless of duration; recorder intervals are also
+retained. The dispatch loop does not insert NOP backoff between discovery slices.
+Names identify real functions or explicitly named function sections; parent
+intervals include their children and must not be added to child totals.
+Uninstrumented work remains in the parent's exclusive time.
 
 `scheduler_read_claim_cursor` separates context validation, the claim-seal
 hint and atomic confirmation, and the next-block hint and atomic fallback.
-`scheduler_ordered_poll_may_progress` separates local state, ready-queue
+`scheduler_ordered_poll_may_progress` separates local state,
 probes, admission-tail checks, and MIX assignment/close/arrival/release checks.
-Each worker probes only its AIC or AIV business queue. AIC includes all MIX
-tasks, whose execution masks and coordinator rules remain unchanged. The fixed
-two-queue implementation is in place; complete hardware and performance acceptance
-is still in progress. An empty business queue does not suppress admission, MIX,
-Graph control-inbox, or async CHECK/FINISH service. DFX's own collection shards
-are independent of these business queues.
+Each worker traverses its immutable AIC or AIV task catalog. AIC discovery
+includes MIX tasks, whose active masks and coordinator rules remain unchanged.
+The catalogs contain task identities, not ready publications; task-local tickets
+and execution ownership decide who can execute a block. Missing one catalog
+entry does not establish idleness. Ordinary discovery yields after a bounded
+slice to admission, MIX, Graph controls, and async CHECK/FINISH service. DFX
+collection shards are independent of the task catalogs.
 Conditional probes retain their original short-circuit behavior: an unexecuted
 branch has no interval. Read-result endpoints use a return-dependent Scalar
 instruction before reading the counter; they measure local result availability,
@@ -731,18 +744,17 @@ field but render differently in Perfetto:
 
 | Phase | Role | Lane | `tasks_processed` semantic |
 | ----- | ---- | ---- | -------------------------- |
-| `bootstrap` | A5 HBG AICore outer | AICore Scheduler lane | initial executable tasks classified and published before normal scheduling |
-| `complete` | outer | sched (pid=2) | FIN'd subtasks + sub-block retires this iter; A5 HBG ends this phase before dependency resolution |
+| `bootstrap` | A5 HBG AICore outer | AICore Scheduler lane | executable and control nodes scanned, admission initialized before normal scheduling |
+| `complete` | outer | sched (pid=2) | FIN'd subtasks + sub-block retires this iter |
 | `async_poll` | outer | sched | async-wait completions resolved; zero means polling consumed CPU without completing work |
 | `dispatch` | outer | sched | subtasks published this iter |
-| `state_probe` | A5 HBG AICore outer | AICore Scheduler lane | local Dispatch Slot / Ready state checked and one logical task acquired from its shared AIC or AIV ready queue |
-| `refill` | A5 HBG AICore outer | AICore Scheduler lane | completed Slot reused for one replacement task; `DIRECT_RESOLVE` omits a preceding `state_probe` |
+| `state_probe` | A5 HBG acquisition envelope | AICore Scheduler lane | discovery through acquisition of one concrete execution token; batched envelopes may overlap |
 | `release` | outer | sched | deferred-release slots drained this iter |
 | `dummy` | outer | sched | `dummy_ready_queue` entries handled this iter (explicit dummies and false-predicate tasks) |
 | `early_dispatch` | outer | sched | blocks staged by speculative early-dispatch this pass |
 | `drain` | outer | sched | blocks staged by this thread's global sync-start drain pass |
 | `graph_prepare` | outer | sched | Graph Definition nodes expanded this pass |
-| `resolve` | inner (TMR); A5 HBG AICore outer | TMR sched sub-lane or AICore Scheduler lane | consumers visited after completion |
+| `resolve` | inner (TMR) | TMR sched sub-lane | consumers visited after completion |
 | `resolve_standalone` | P-thread outer (HBG); rendered as `resolve` | HBG P sched lane | completed SPSC slots |
 | `drain_prepare` | inner | sched, nested in `drain` | subtasks prepared for global sync-start publication |
 | `drain_publish` | inner | sched, nested in `drain` | subtasks published during global sync-start staging |
@@ -754,7 +766,8 @@ orchestrator submit path, so it has no swimlane lane. Read its cost
 from `g_orch_fanin_cycle` in the device-log orch breakdown (the
 `fanin` line) instead.
 
-Outer phases are mutually time-exclusive within an iter. In
+Outer work phases are mutually time-exclusive within an iter; the A5 HBG
+StateProbe acquisition envelope is not an exclusive work phase. In
 `tensormap_and_ringbuffer`, the converter renders `resolve` on a sibling
 `Sched_N` tid because it is time-contained by the outer `complete`/`dummy`
 lane. In `host_build_graph`, standalone `resolve` stays beside `async_poll` and
@@ -767,22 +780,28 @@ bars even when their timestamps fall inside an outer span.
 For the A5 HBG AICore producer, all phases render on the single
 `Scheduler_<worker_id>` lane, matching the worker ID used in Worker View.
 If `worker_id` is missing or null, the suffix falls back to `scheduler_id`.
-Completion, Resolve, StateProbe when present, and the selected publication phase
-are mutually time-exclusive.
-StateProbe includes the shared queue claim. A task may then wait for admission
-or a slot before its eventual Dispatch or Refill; that wait is outside the
-StateProbe interval. A completed Slot reused for a replacement task remains
-Refill regardless of its Ready source. A pool-acquired replacement retains its
-StateProbe, while a `DIRECT_RESOLVE` replacement proceeds directly from
-Resolve to Refill without one. MIX tasks enter the pool and cooperative protocol,
-not the ordinary direct-refill path.
+Bootstrap, Dispatch, Completion and Idle are mutually time-exclusive. For an
+ordinary token, StateProbe starts at its directory-search slice and ends when
+the worker acquires the prepared execution. Several acquisitions in one slice
+share that start, so their envelopes can overlap. Each envelope ends before its
+Dispatch; subsequent fanin, admission and physical-slot waits are outside it.
+Use `scalar_execution_token_refill`, `scalar_execution_token_receive`,
+`scalar_execution_token_fanin`, and `scalar_execution_token_dispatch` with the
+Scalar profile's exclusive-cycle accounting to measure the underlying work.
 
-The current [`SchedulerReadySource`](../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_types.h)
-values are `POOL=0`, `DIRECT_RESOLVE=2`, and `COOPERATIVE=3`. These identify the
-ownership path, not three queue types: there are only two business queues.
-Value 1 is not a current source. Entry ownership uses an atomic-confirmed ref
-and head CAS, so L3 can distinguish bypass-load hints from atomic confirmation
-and the completion barrier. See the [ready-pool publication contract](../zh-cn/design/a5-hbg-graph-task/protocol.md).
+Ownership uses task-local FAA tickets and a per-execution Claim CAS. Pending
+tokens can wait for fanin while retaining their prepared Call. MIX and
+`sync_start` retain their cooperative and admission protocols. See the
+[execution ownership contract](../zh-cn/design/a5-hbg-graph-task/build-execute-separation.md).
+The shared trace vocabulary still recognizes `resolve` and `refill`, but the
+current A5 token path does not emit these outer phases.
+
+For ordinary MIX, L4 block-owner Claim stamps surround the final
+`GROUP_RESERVED` to `GROUP_ARMED` CAS after staging and conflict checks. The
+earlier reservation can wait, be parked, and resume across other protocol
+events, so its old timestamps must not be attached to sequences allocated at
+publication. The recorded order is `staged`, `claim_before`, `claim_after`,
+`publish_before`, `publish_after`; sync-start ticket claims keep their own order.
 
 The `ready_claim`, `ready_steal` and `direct_refill` names were
 emitted by this scheduler between #2104 and #2178; no current scheduler emits
