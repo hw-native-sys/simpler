@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Freeze nine task-graph slices from a completed HBG capture; standard library only."""
+"""Refresh the selected task-graph slices from a completed HBG capture."""
 
 import argparse
 import gzip
@@ -34,12 +34,25 @@ def export(capture, flavor, output):
     def positions(name):
         return [i for i, label in enumerate(labels) if name in label]
 
-    start_name, attention_end, layer_end = (
-        ("hc_collapse_norm", "hc_post", "hc_post_2")
-        if flavor == "pypto_lib"
-        else ("collapse_norm_grid", "expand_grid__2", "expand_grid")
-    )
-    starts, ends, finishes = positions(start_name), positions(attention_end), positions(layer_end)
+    if flavor == "pypto_lib_latest":
+        collapses, posts = positions("_hc_collapse"), positions("_hc_post")
+        # Native attention and MoE share HC kernels. The final head adds one
+        # collapse after the 40 attention/MoE pairs, without a matching post.
+        if len(collapses) != 81 or len(posts) != 80 or collapses[-1] <= posts[-1]:
+            raise ValueError("latest capture must contain 40 native attention/MoE pairs and the final head")
+        starts, ends, finishes = collapses[:-1:2], posts[::2], posts[1::2]
+        if any(
+            not start < end < collapses[2 * i + 1] < finish
+            for i, (start, end, finish) in enumerate(zip(starts, ends, finishes, strict=True))
+        ):
+            raise ValueError("native attention/MoE boundaries are interleaved unexpectedly")
+    else:
+        start_name, attention_end, layer_end = (
+            ("hc_collapse_norm", "hc_post", "hc_post_2")
+            if flavor == "pypto_lib"
+            else ("collapse_norm_grid", "expand_grid__2", "expand_grid")
+        )
+        starts, ends, finishes = positions(start_name), positions(attention_end), positions(layer_end)
     if not len(starts) == len(ends) == len(finishes) == 40:
         raise ValueError("capture must contain all 40 recognizable layer boundaries")
     ranges = {
@@ -58,8 +71,15 @@ def export(capture, flavor, output):
         engram=(finishes[0] + 1, starts[1]),
         layers_19_21=(starts[19], finishes[21] + 1),
     )
+    # The checked-in manifests own the active matrix. Refreshing a full forward
+    # must not silently restore standalone cases removed from that matrix.
+    selection = read(Path(__file__).parent / "workloads" / flavor / "source.json")["cases"]
     summary = {}
-    for name, (begin, end) in ranges.items():
+    for name in selection:
+        if selection[name].get("execution") == "native_moe_host_control":
+            summary[name] = selection[name]
+            continue
+        begin, end = ranges[name]
         selected = tasks[begin:end]
         ids = {str(task["task_id"]): index for index, task in enumerate(selected)}
         internal = set()
@@ -127,7 +147,7 @@ def export(capture, flavor, output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("capture", type=Path)
-    parser.add_argument("--flavor", required=True, choices=["pypto_lib", "pypto_lib_dsl"])
+    parser.add_argument("--flavor", required=True, choices=["pypto_lib", "pypto_lib_dsl", "pypto_lib_latest"])
     parser.add_argument("--output", type=Path, default=Path(__file__).parent / "workloads")
     args = parser.parse_args()
     export(args.capture, args.flavor, args.output)

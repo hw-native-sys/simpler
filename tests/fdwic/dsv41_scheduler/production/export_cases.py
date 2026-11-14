@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -24,11 +25,31 @@ def link(source, target):
         shutil.copyfile(source, target)
 
 
-def _export_variant(bundle, capture, flavor, variant, policy, output, tools):
+def _export_native(destination, root, lib_root, native_moe_bundle):
+    if lib_root is None:
+        raise ValueError("Latest native MoE requires --pypto-lib-root pointing to dev/hbg")
+    command = [
+        sys.executable,
+        str(root / "production/moe.py"),
+        str(destination),
+        str(destination / "compile"),
+        "--compile-only",
+        "--lib-root",
+        str(lib_root),
+    ]
+    if native_moe_bundle is not None:
+        command += ["--reuse-bundle", str(native_moe_bundle)]
+    subprocess.run(command, check=True)
+
+
+def _export_variant(bundle, capture, flavor, variant, policy, output, tools, lib_root=None, native_moe_bundle=None):
     root = Path(__file__).resolve().parents[1]
     cases = json.loads((root / "workloads" / flavor / "source.json").read_text())["cases"]
     for name, case in cases.items():
         destination = output / variant / name
+        if case.get("execution") == "native_moe_host_control":
+            _export_native(destination, root, lib_root, native_moe_bundle)
+            continue
         destination.mkdir(parents=True, exist_ok=False)
         first, last = str(case["first_source_task"]), str(case["last_source_task"])
         metadata = []
@@ -141,17 +162,17 @@ def _export_variant(bundle, capture, flavor, variant, policy, output, tools):
         )
 
 
-def export(bundle, capture, flavor, output, tools, sync_policy="both"):
+def export(bundle, capture, flavor, output, tools, sync_policy="both", lib_root=None, native_moe_bundle=None):
     """Export selected variants from the same unmodified source capture."""
     if sync_policy not in ("half", "all-cap64", "both"):
         raise ValueError(f"Unknown sync policy: {sync_policy}")
     policies = ("half", "all-cap64") if sync_policy == "both" else (sync_policy,)
-    if flavor == "pypto_lib":
+    if flavor != "pypto_lib_dsl":
         policies = ("half",)
     variants = []
     for policy in policies:
         variant = "pypto_lib_dsl_all_sync64" if flavor == "pypto_lib_dsl" and policy == "all-cap64" else flavor
-        _export_variant(bundle, capture, flavor, variant, policy, output, tools)
+        _export_variant(bundle, capture, flavor, variant, policy, output, tools, lib_root, native_moe_bundle)
         variants.append(variant)
     return variants
 
@@ -161,9 +182,11 @@ if __name__ == "__main__":
     parser.add_argument("bundle", type=Path)
     parser.add_argument("capture", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--flavor", choices=["pypto_lib", "pypto_lib_dsl"], required=True)
+    parser.add_argument("--flavor", choices=["pypto_lib", "pypto_lib_dsl", "pypto_lib_latest"], required=True)
     parser.add_argument("--tools", type=Path, default=Path(__file__).resolve().parents[1] / "build/portable/host")
     parser.add_argument("--sync-policy", choices=["half", "all-cap64", "both"], default="both")
+    parser.add_argument("--pypto-lib-root", type=Path)
+    parser.add_argument("--native-moe-bundle", type=Path, help="Reuse an existing compatible native MoE bundle")
     args = parser.parse_args()
     export(
         args.bundle.resolve(),
@@ -172,4 +195,6 @@ if __name__ == "__main__":
         args.output.resolve(),
         args.tools.resolve(),
         args.sync_policy,
+        args.pypto_lib_root,
+        args.native_moe_bundle,
     )

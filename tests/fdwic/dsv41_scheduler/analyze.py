@@ -11,6 +11,7 @@
 
 import argparse
 import csv
+import importlib.util
 import json
 import math
 import statistics
@@ -123,11 +124,26 @@ def compare_kernel_durations(records, source_records, source_tasks, selected, ma
     }
 
 
+def native_moe_reports(root, case):
+    path = Path(__file__).resolve().parent / "production/moe.py"
+    spec = importlib.util.spec_from_file_location("dsv41_native_moe", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    reports = {level: load(root / case["case"] / f"L{level}" / "result.json") for level in (0, 1, 3)}
+    for level, report in reports.items():
+        module.validate_report(report, case, level)
+    return {"flavor": case["flavor"], "case": case["case"], "native_host_control": reports}
+
+
 def audit(root, cases, original, names, destination, convert):
     destination.mkdir(parents=True, exist_ok=True)
     rows, details = [], []
     for case_dir in sorted(cases.iterdir()):
         case = load(case_dir / "case.json")
+        if case.get("execution") == "native_moe_host_control":
+            details.append(native_moe_reports(root, case))
+            continue
         expected = case["source"]
         for rank in range(case.get("device_count", 2)):
             directory = root / case["case"] / f"rank{rank}"
@@ -267,9 +283,10 @@ def audit(root, cases, original, names, destination, convert):
         + "\n"
     )
     with (destination / "baseline.csv").open("w") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
+        if rows:
+            writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
     print(f"Production audit passed: {len(rows)} case/rank combinations, {len(rows) * 2} L1/L3 captures")
 
 

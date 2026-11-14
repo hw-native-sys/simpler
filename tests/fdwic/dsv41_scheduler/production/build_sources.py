@@ -27,7 +27,7 @@ from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.scene_test_cache import compile_incore_artifact_key, get_or_compile_incore
 
 ROOT = Path(__file__).resolve().parents[1]
-FLAVORS = ("pypto_lib", "pypto_lib_dsl")
+FLAVORS = ("pypto_lib", "pypto_lib_dsl", "pypto_lib_latest")
 
 
 def save(path, value):
@@ -185,7 +185,7 @@ def build(flavor, output, tools, pto, jobs):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--flavor", choices=[*FLAVORS, "both"], default="both")
+    parser.add_argument("--flavor", choices=[*FLAVORS, "both", "all"], default="all")
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build/portable")
     parser.add_argument("--pto-isa", type=Path, default=ROOT.parents[2] / "build/pto-isa")
     parser.add_argument("--jobs", type=int, default=4)
@@ -193,7 +193,8 @@ def main():
     if args.jobs < 1 or not (args.pto_isa / "include/pto").is_dir():
         parser.error("--jobs must be positive and --pto-isa must contain include/pto")
     logging.basicConfig(level=logging.DEBUG)
-    for flavor in FLAVORS if args.flavor == "both" else [args.flavor]:
+    flavors = FLAVORS if args.flavor == "all" else FLAVORS[:2] if args.flavor == "both" else [args.flavor]
+    for flavor in flavors:
         build(
             flavor,
             args.build_dir.resolve() / "forward" / flavor,

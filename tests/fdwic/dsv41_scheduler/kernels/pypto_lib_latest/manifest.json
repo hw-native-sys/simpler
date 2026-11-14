@@ -1,0 +1,1841 @@
+{
+  "schema": 1,
+  "origin": "hw-native-sys/pypto-lib dev/hbg@a6a9a2d49047ce67a85857c6b15f9604a7287714, unchanged full-forward kernels",
+  "platform": "a5",
+  "entry_signature": [
+    1,
+    1,
+    1,
+    1,
+    3,
+    3,
+    3,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    3,
+    3,
+    1,
+    1,
+    3,
+    3,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    3,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    2,
+    2,
+    1,
+    1,
+    1,
+    1
+  ],
+  "kernels": [
+    {
+      "func_id": 0,
+      "name": "v41_rope_rows",
+      "source": "vendor/aiv/v41_rope_rows.cpp",
+      "core_type": "aiv",
+      "code_name": "v41_rope_rows",
+      "signature": [
+        2,
+        2,
+        1,
+        1,
+        1
+      ],
+      "source_sha256": "1840f3bd55667fbe7765cbead054c8dd3f808a23706fad040498a25cbe44f7cc",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 1,
+      "name": "v41_rope_rows_1",
+      "source": "vendor/aiv/v41_rope_rows_1.cpp",
+      "core_type": "aiv",
+      "code_name": "v41_rope_rows_1",
+      "signature": [
+        2,
+        2,
+        1,
+        1,
+        1
+      ],
+      "source_sha256": "5d79a14b7acd61472d0a16daa003fb64ecca8a460b43e3b9f9f76aacdebbb8b5",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 2,
+      "name": "prepare_compressed_lens",
+      "source": "vendor/aiv/prepare_compressed_lens.cpp",
+      "core_type": "aiv",
+      "code_name": "prepare_compressed_lens",
+      "signature": [
+        1,
+        2
+      ],
+      "source_sha256": "d114fcbee6efb945b9639892482bd1a6428c90b4461aa08fc1b411e3055d5709",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 3,
+      "name": "engram_quant",
+      "source": "vendor/aiv/engram_quant.cpp",
+      "core_type": "aiv",
+      "code_name": "engram_quant",
+      "signature": [
+        1,
+        3,
+        3
+      ],
+      "source_sha256": "29b3a299d1968d24a9fa974f6cd1af40b4d38aa2a17f5bddf8b44029e31b1e41",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 4,
+      "name": "engram_projection_aic",
+      "source": "vendor/aic/engram_projection_aic.cpp",
+      "core_type": "aic",
+      "code_name": "engram_projection_aic",
+      "signature": [
+        1,
+        3,
+        1,
+        1,
+        1
+      ],
+      "source_sha256": "be99cc75207a4c87ee5792f3f2e69336527d102cbb1d9a85a50bac4c74b49616",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 5,
+      "name": "engram_projection_aiv",
+      "source": "vendor/aiv/engram_projection_aiv.cpp",
+      "core_type": "aiv",
+      "code_name": "engram_projection_aiv",
+      "signature": [
+        1,
+        3,
+        1,
+        1,
+        1
+      ],
+      "source_sha256": "e7cddaf237398d6a1d3202452e1f2212028c501ebe916e79e8eb2850bebc65dc",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 6,
+      "name": "engram_widen",
+      "source": "vendor/aiv/engram_widen.cpp",
+      "core_type": "aiv",
+      "code_name": "engram_widen",
+      "signature": [
+        1,
+        3
+      ],
+      "source_sha256": "0272c46b9938d3b17717d4505e6623020b7aa68071d246f096635e79cfe20e00",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 7,
+      "name": "engram_gate",
+      "source": "vendor/aiv/engram_gate.cpp",
+      "core_type": "aiv",
+      "code_name": "engram_gate",
+      "signature": [
+        1,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "a1cf3bfb73b1088810caecd042c8e0770f37157eaaf20bcd51173bd89eb2c37b",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 8,
+      "name": "_hc_collapse",
+      "source": "vendor/external/hc_collapse.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "source_sha256": "43861b58ecf6c6beaf1730d8a082d5326ee5af92cdb506e468befff76d35785e",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 9,
+      "name": "decode_sp_zero_padding",
+      "source": "vendor/aiv/decode_sp_zero_padding.cpp",
+      "core_type": "aiv",
+      "code_name": "decode_sp_zero_padding",
+      "signature": [
+        3
+      ],
+      "source_sha256": "2afe963c103ddae3ec0380fe720e75970dd6d2c64f4cf2ad4efe5ef6de315e05",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 10,
+      "name": "qkv_quant",
+      "source": "vendor/external/qkv_quant.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        3,
+        3
+      ],
+      "source_sha256": "8b9c3abd0861b1f26a0a20c7f24659d424715b6f13c06cdc2cd76fc164c22d58",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 11,
+      "name": "_proj_q_a",
+      "source": "vendor/external/proj_q_a.cpp",
+      "core_type": "aic",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "c0bcf142c82084e96e114a7670a4ebd63e717e5ed5621604f3fe097723b3fc0d",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 12,
+      "name": "q_norm_quant",
+      "source": "vendor/external/q_norm_quant.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        3,
+        3,
+        3
+      ],
+      "source_sha256": "b608aab4fce047342711ff7ffa51068d895f4bef176db6e99eb2113a75b6347e",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 13,
+      "name": "_proj_q_b_aic",
+      "source": "vendor/external/proj_q_b.cpp",
+      "core_type": "aic",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3,
+        1,
+        1
+      ],
+      "source_sha256": "c88b65b03b8c8f7d682db8b31dc192697fcc3b3d75133e0624bf9e45ca8f4c10",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 14,
+      "name": "_proj_q_b_aiv",
+      "source": "vendor/external/proj_q_b.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3,
+        1,
+        1
+      ],
+      "source_sha256": "c88b65b03b8c8f7d682db8b31dc192697fcc3b3d75133e0624bf9e45ca8f4c10",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 15,
+      "name": "_proj_kv",
+      "source": "vendor/external/proj_kv.cpp",
+      "core_type": "aic",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "46f80d86af1cd8a1de4b67df8ae78f45df9eaa914b4a3c7c86fb72910ccefce3",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 16,
+      "name": "norm_rope_publish",
+      "source": "vendor/external/norm_rope_publish.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "b335430b873f0345e4e9d5e6ebc9af203cd37ccd0933063518489fe01ecb62e6",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 17,
+      "name": "sparse_gather_reset",
+      "source": "vendor/aiv/sparse_gather_reset.cpp",
+      "core_type": "aiv",
+      "code_name": "sparse_gather_reset",
+      "signature": [
+        3
+      ],
+      "source_sha256": "bdc5c660219062a3a80ce3d9d7fd830d95eae55c76de1d41721c2dbaa04a6c4f",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 18,
+      "name": "_gather_sparse_vf_rows_aic",
+      "source": "vendor/external/sparse_gather_vf.cpp",
+      "core_type": "aic",
+      "external": true,
+      "signature": [
+        3,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "43002feee2b3ac9892ad42b64d73cfe54777d01171087b710249cea36d2e1b55",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 19,
+      "name": "_gather_sparse_vf_rows_aiv",
+      "source": "vendor/external/sparse_gather_vf.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        3,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "43002feee2b3ac9892ad42b64d73cfe54777d01171087b710249cea36d2e1b55",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 20,
+      "name": "_quant_o_vf",
+      "source": "vendor/external/o_quant_vf.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "source_sha256": "dc39917ea67b4482a7b42804779508d352eb78d9440854dc1c692579c5021db5",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 21,
+      "name": "_o_proj_a_aic",
+      "source": "vendor/external/o_proj_a.cpp",
+      "core_type": "aic",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "source_sha256": "fcb6958ddbc8886ca76b2e9d616b017c05c5c18527a337a7d114a711995f20b7",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 22,
+      "name": "_o_proj_a_aiv",
+      "source": "vendor/external/o_proj_a.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "source_sha256": "fcb6958ddbc8886ca76b2e9d616b017c05c5c18527a337a7d114a711995f20b7",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 23,
+      "name": "_o_proj_b",
+      "source": "vendor/external/o_proj_b.cpp",
+      "core_type": "aic",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "b90a87e4c7cc53a6357786f4b7c514b6c49bf0aa05a28823a8fafe9f49e7ec46",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 24,
+      "name": "hc_rms",
+      "source": "vendor/aiv/hc_rms.cpp",
+      "core_type": "aiv",
+      "code_name": "hc_rms",
+      "signature": [
+        3,
+        1
+      ],
+      "source_sha256": "88e4796cf6ba6642b0f970402f560462e4fef126f0522eb42e556b44d0a78b67",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 25,
+      "name": "_hc_linear",
+      "source": "vendor/external/hc_linear.cpp",
+      "core_type": "aic",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "37828a7401eb92c8665f47b193185271305b5b1c084298307b27b14daaecf568",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 26,
+      "name": "_hc_sinkhorn",
+      "source": "vendor/external/hc_sinkhorn.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3,
+        3,
+        3
+      ],
+      "source_sha256": "0a7c5186b87e5c9cf03b789b419a624705741cde8a67c5e4cd317516ce5f02f7",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 27,
+      "name": "_hc_post",
+      "source": "vendor/external/hc_post.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "7a411307ec9c7e0b40eabb0cb254c83f96a2f34586a2e60c8a1be75f4cc811ce",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 28,
+      "name": "proj_cmp",
+      "source": "vendor/aic/proj_cmp.cpp",
+      "core_type": "aic",
+      "code_name": "proj_cmp",
+      "signature": [
+        3,
+        3,
+        1,
+        1,
+        1
+      ],
+      "source_sha256": "b654f7c4c42692b85e36879127aea371857f679fcfba1473f28d238d89fdec99",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 29,
+      "name": "c2a_four_slot_requests",
+      "source": "vendor/aiv/c2a_four_slot_requests.cpp",
+      "core_type": "aiv",
+      "code_name": "c2a_four_slot_requests",
+      "signature": [
+        3,
+        3,
+        3,
+        1,
+        1,
+        1,
+        1
+      ],
+      "source_sha256": "ed028a68286bc6d5debc21f848d92d69855ae4afef65ab058aa76a2dd64720ad",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 30,
+      "name": "_c2a_compress",
+      "source": "vendor/external/compressor_pool.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        3,
+        1,
+        1,
+        3,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "d7c3565750072fa3eabf462b6828c129012c88c0b1a14bbefc827d5e3344c792",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 31,
+      "name": "proj_idx_k",
+      "source": "vendor/aic/proj_idx_k.cpp",
+      "core_type": "aic",
+      "code_name": "proj_idx_k",
+      "signature": [
+        3,
+        1,
+        1
+      ],
+      "source_sha256": "2c51efff401ad5370b2296b2165fc44810638978b791cffedf16a732c53dada4",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 32,
+      "name": "_idx_k_norm_rope_publish",
+      "source": "vendor/external/idx_k_norm_rope_publish.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "source_sha256": "7b8f6fd70f69032462f26267cc0bb9da9cfad564336a39c616f61ca6ea8c5a43",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 33,
+      "name": "_idx_q_aic",
+      "source": "vendor/external/idx_q.cpp",
+      "core_type": "aic",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "source_sha256": "6f81c1e205eb4106001d0bed6271fc8970860bef6c0b94879522bfa47f9e5259",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 34,
+      "name": "_idx_q_aiv",
+      "source": "vendor/external/idx_q.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "source_sha256": "6f81c1e205eb4106001d0bed6271fc8970860bef6c0b94879522bfa47f9e5259",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 35,
+      "name": "proj_idx_w",
+      "source": "vendor/aic/proj_idx_w.cpp",
+      "core_type": "aic",
+      "code_name": "proj_idx_w",
+      "signature": [
+        3,
+        1,
+        1
+      ],
+      "source_sha256": "8bcaeb7190be3e2361e7a2feba7a3174663378f8f7ae4a2ec878ecd4282e9ff6",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 36,
+      "name": "reduce_idx_w",
+      "source": "vendor/aiv/reduce_idx_w.cpp",
+      "core_type": "aiv",
+      "code_name": "reduce_idx_w",
+      "signature": [
+        3,
+        1
+      ],
+      "source_sha256": "1586b17d4b88eac1839a4d93f5b4896548cb923170e256d440ff696ce46b5955",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 37,
+      "name": "idx_plan_paged_runs",
+      "source": "vendor/aiv/idx_plan_paged_runs.cpp",
+      "core_type": "aiv",
+      "code_name": "idx_plan_paged_runs",
+      "signature": [
+        1,
+        3,
+        1
+      ],
+      "source_sha256": "bed9f229174497aa030874ea39300eadc09e1e93664869ed1e7d0e5de08dd062",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 38,
+      "name": "_idx_score_topk_aic",
+      "source": "vendor/external/index_score_topk.cpp",
+      "core_type": "aic",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        1,
+        3,
+        3,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "f79cc5bd0d2a67bfa2a538ed39e732ddf06480bf1af7d3989611ee4795922632",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 39,
+      "name": "_idx_score_topk_aiv",
+      "source": "vendor/external/index_score_topk.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        1,
+        3,
+        3,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "f79cc5bd0d2a67bfa2a538ed39e732ddf06480bf1af7d3989611ee4795922632",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 40,
+      "name": "_gather_sparse_vf_rows__2_aic",
+      "source": "vendor/external/sparse_gather_vf.cpp",
+      "core_type": "aic",
+      "external": true,
+      "signature": [
+        3,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "43002feee2b3ac9892ad42b64d73cfe54777d01171087b710249cea36d2e1b55",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 41,
+      "name": "_gather_sparse_vf_rows__2_aiv",
+      "source": "vendor/external/sparse_gather_vf.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        3,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "43002feee2b3ac9892ad42b64d73cfe54777d01171087b710249cea36d2e1b55",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 42,
+      "name": "_gate_quant_vf",
+      "source": "vendor/external/gate_quant_vf.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        3,
+        3
+      ],
+      "source_sha256": "6ae154d1d333e38960cd27d25c38f142a06999645dadb73f1e3b5c05077f509a",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 43,
+      "name": "gate_projection_input",
+      "source": "vendor/aiv/gate_projection_input.cpp",
+      "core_type": "aiv",
+      "code_name": "gate_projection_input",
+      "signature": [
+        3,
+        1
+      ],
+      "source_sha256": "eaadf9d1ab6a35add9fdd65b59d52c8157e71d4c01e65efc1b6a578e88bf0589",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 44,
+      "name": "gate_projection_weight",
+      "source": "vendor/aiv/gate_projection_weight.cpp",
+      "core_type": "aiv",
+      "code_name": "gate_projection_weight",
+      "signature": [
+        3,
+        1
+      ],
+      "source_sha256": "288617522a3ac0eb98cceb49ca5317e38b09128f145d65c960816431838cca39",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 45,
+      "name": "_gate_pre_route_vf",
+      "source": "vendor/external/gate_pre_route_vf.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        3,
+        3,
+        3
+      ],
+      "source_sha256": "2152658c289bff2220a5aa2d63c39bbef0e230f8a23219c81558611b598cf256",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 46,
+      "name": "_gate_scores_vf_aic",
+      "source": "vendor/external/gate_scores_vf.cpp",
+      "core_type": "aic",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "source_sha256": "31d303a5def2712c80f73908e1144fb448f1cad860ef8855c5be030732018bbf",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 47,
+      "name": "_gate_scores_vf_aiv",
+      "source": "vendor/external/gate_scores_vf.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "source_sha256": "31d303a5def2712c80f73908e1144fb448f1cad860ef8855c5be030732018bbf",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 48,
+      "name": "_gate_route_sort_vf",
+      "source": "vendor/external/gate_route_sort_vf.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        3,
+        3
+      ],
+      "source_sha256": "d84878226c10f99adc8bfbb7d6c13a90a2ca30b1cacb2a175e67191c92deb1b2",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 49,
+      "name": "_shared_w13_mm",
+      "source": "vendor/external/expert_shared_w13.cpp",
+      "core_type": "aic",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "5005ffe4b80bf22fda86f2e66d128cd2b823e2af5a7d4ddef5bc1d049f7f6509",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 50,
+      "name": "_shared_swiglu_vf",
+      "source": "vendor/external/expert_shared_swiglu.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        3,
+        3
+      ],
+      "source_sha256": "7e31b127c5e385b0faac941e03d4f19983237aab3bfa6144d78d99033b9df68d",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 51,
+      "name": "sh_w2_mm",
+      "source": "vendor/aic/sh_w2_mm.cpp",
+      "core_type": "aic",
+      "code_name": "sh_w2_mm",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "df129036319380b7235c993e054910989b24991a4233aa49d1811ea5b6b0bb1e",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 52,
+      "name": "dispatch_push",
+      "source": "vendor/aiv/dispatch_push.cpp",
+      "core_type": "aiv",
+      "code_name": "dispatch_push",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3,
+        3,
+        3,
+        3
+      ],
+      "source_sha256": "2b320019ec90c017e78598b5c7224443da92221796d4680aee651c24354b7ca6",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 53,
+      "name": "combine_notify",
+      "source": "vendor/aiv/combine_notify.cpp",
+      "core_type": "aiv",
+      "code_name": "combine_notify",
+      "signature": [
+        3
+      ],
+      "source_sha256": "01095efa7e36a17e7570e3550d4244b67acc57b3cab5b52f9fa0792a06b108fc",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 54,
+      "name": "combine_wait",
+      "source": "vendor/aiv/combine_wait.cpp",
+      "core_type": "aiv",
+      "code_name": "combine_wait",
+      "signature": [
+        3
+      ],
+      "source_sha256": "a98e112ffad773aef4ed9f457ae99c44b01098ea1dc44a43e54fc43c5015ed8f",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 55,
+      "name": "dispatch_gather",
+      "source": "vendor/aiv/dispatch_gather.cpp",
+      "core_type": "aiv",
+      "code_name": "dispatch_gather",
+      "signature": [
+        3,
+        3,
+        3,
+        1,
+        3,
+        3,
+        3,
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "source_sha256": "5677d5205ca7b40043666570f0b72c83e89f8afd4db4e29ca4ab371c31c7847f",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 56,
+      "name": "_routed_w13_aic",
+      "source": "vendor/external/expert_routed_w13.cpp",
+      "core_type": "aic",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        1,
+        3
+      ],
+      "source_sha256": "9643c47e88f8749ab185dd8373efa7657fbde891fb22b6c2c6410909b3800213",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 57,
+      "name": "_routed_w13_aiv",
+      "source": "vendor/external/expert_routed_w13.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        1,
+        3
+      ],
+      "source_sha256": "9643c47e88f8749ab185dd8373efa7657fbde891fb22b6c2c6410909b3800213",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 58,
+      "name": "_routed_swiglu_quant",
+      "source": "vendor/external/expert_routed_swiglu.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        3,
+        3
+      ],
+      "source_sha256": "01959e6e30a5d37e68d7492fffc36bf5e58282530140758fc59c60af50d8fb5a",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 59,
+      "name": "_routed_w2_aic",
+      "source": "vendor/external/expert_routed_w2.cpp",
+      "core_type": "aic",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "4a8bc037f68c82c0f049626525094dfe2e2c439272d0d932b8d559dcffd2ef1c",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 60,
+      "name": "_routed_w2_aiv",
+      "source": "vendor/external/expert_routed_w2.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "4a8bc037f68c82c0f049626525094dfe2e2c439272d0d932b8d559dcffd2ef1c",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 61,
+      "name": "ffn_scatter",
+      "source": "vendor/aiv/ffn_scatter.cpp",
+      "core_type": "aiv",
+      "code_name": "ffn_scatter",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "ad29c4df4ae955700b923f30a82d73ab5a8a3781f160074f3f60016fcd3fbf9d",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 62,
+      "name": "combine_reduce",
+      "source": "vendor/aiv/combine_reduce.cpp",
+      "core_type": "aiv",
+      "code_name": "combine_reduce",
+      "signature": [
+        3,
+        1,
+        1
+      ],
+      "source_sha256": "9aa7e0899ac557ce38b9032a784fc6e26c2f39ba59ad8e2d72453b688f4e555b",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 63,
+      "name": "prepare_compressed_lens_0",
+      "source": "vendor/aiv/prepare_compressed_lens_0.cpp",
+      "core_type": "aiv",
+      "code_name": "prepare_compressed_lens_0",
+      "signature": [
+        1,
+        2
+      ],
+      "source_sha256": "56804ee6145521cabb53674755c2e3fa8ab3e6f30626ebe11e3b0bd4ca6f68aa",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 64,
+      "name": "l2_decode_fwd_incore_35",
+      "source": "vendor/aic/l2_decode_fwd_incore_35.cpp",
+      "core_type": "aic",
+      "code_name": "l2_decode_fwd_incore_35",
+      "signature": [
+        3,
+        1,
+        1
+      ],
+      "source_sha256": "459c7803d426bd71bf27b69db45707cfd8ae6022d4e8c8c4d088bbda08d2d6cb",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 65,
+      "name": "_c1a_compress",
+      "source": "vendor/external/compressor_publish.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        3,
+        1,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "bad3d10db4d91b0d892b098abc992cbb4f97e4b287d35f6e24aee895472ae2dc",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 66,
+      "name": "idx_plan_paged_runs_0",
+      "source": "vendor/aiv/idx_plan_paged_runs_0.cpp",
+      "core_type": "aiv",
+      "code_name": "idx_plan_paged_runs_0",
+      "signature": [
+        1,
+        3,
+        1
+      ],
+      "source_sha256": "243a0d2ece024a3da54dd11c92394cb8dee05c5da890e2c158b1cfd00a918be6",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 67,
+      "name": "pool_all",
+      "source": "vendor/aiv/pool_all.cpp",
+      "core_type": "aiv",
+      "code_name": "pool_all",
+      "signature": [
+        1,
+        3,
+        3
+      ],
+      "source_sha256": "020ea2f0cd37d39b48b259d06ec1e8ac622e24d1bb8abba3f817dc066e091955",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 68,
+      "name": "pool_score",
+      "source": "vendor/aiv/pool_score.cpp",
+      "core_type": "aiv",
+      "code_name": "pool_score",
+      "signature": [
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "f6c1f3c895fe1c68e513405bd67d00860d76ff1f51a749c715de5098e24f09f4",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 69,
+      "name": "pool_select",
+      "source": "vendor/aiv/pool_select.cpp",
+      "core_type": "aiv",
+      "code_name": "pool_select",
+      "signature": [
+        1,
+        1,
+        3,
+        3
+      ],
+      "source_sha256": "309bc7fd7260467da74560bc856376a1642388dafefabaf1b9a2f30bb539b838",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 70,
+      "name": "pool_count",
+      "source": "vendor/aiv/pool_count.cpp",
+      "core_type": "aiv",
+      "code_name": "pool_count",
+      "signature": [
+        1,
+        3
+      ],
+      "source_sha256": "f12c2d5f814658f65ebd4dd2f3de1fc195d256356dbf29a177c6785b51a7ad20",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 71,
+      "name": "idx_gather_pool",
+      "source": "vendor/aiv/idx_gather_pool.cpp",
+      "core_type": "aiv",
+      "code_name": "idx_gather_pool",
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        3,
+        3,
+        3
+      ],
+      "source_sha256": "df962fb43611feac8d0c0c7baa122537beeb6473e4544e1db45791dd7f7dc06f",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 72,
+      "name": "idx_plan_pool_runs",
+      "source": "vendor/aiv/idx_plan_pool_runs.cpp",
+      "core_type": "aiv",
+      "code_name": "idx_plan_pool_runs",
+      "signature": [
+        1,
+        3
+      ],
+      "source_sha256": "bb914fe915bf4a36bbbe7060d67d6dc7977cf26cdf201d31cf27ced5948a2bcd",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 73,
+      "name": "_idx_pool_score_topk_aic",
+      "source": "vendor/external/index_score_topk.cpp",
+      "core_type": "aic",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        1,
+        3,
+        3,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "f79cc5bd0d2a67bfa2a538ed39e732ddf06480bf1af7d3989611ee4795922632",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 74,
+      "name": "_idx_pool_score_topk_aiv",
+      "source": "vendor/external/index_score_topk.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        3,
+        1,
+        3,
+        3,
+        1,
+        1,
+        3
+      ],
+      "source_sha256": "f79cc5bd0d2a67bfa2a538ed39e732ddf06480bf1af7d3989611ee4795922632",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 75,
+      "name": "decode_dspark_target_hidden",
+      "source": "vendor/aiv/decode_dspark_target_hidden.cpp",
+      "core_type": "aiv",
+      "code_name": "decode_dspark_target_hidden",
+      "signature": [
+        1,
+        3
+      ],
+      "source_sha256": "e95e09ee8427aa2fd0e8ad3d6a5782d3efc255be640701f4c847c15b88561e62",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 76,
+      "name": "moe_signal_clear",
+      "source": "vendor/aiv/moe_signal_clear.cpp",
+      "core_type": "aiv",
+      "code_name": "moe_signal_clear",
+      "signature": [
+        3,
+        3,
+        3
+      ],
+      "source_sha256": "88e30e699dd94e586fcd2b12cab54862307632ee793b2b2ade63f426b9bdd1ce",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 77,
+      "name": "_hc_collapse",
+      "source": "vendor/external/hc_collapse.cpp",
+      "core_type": "aiv",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        1,
+        2,
+        2
+      ],
+      "source_sha256": "43861b58ecf6c6beaf1730d8a082d5326ee5af92cdb506e468befff76d35785e",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 78,
+      "name": "final_rms_norm",
+      "source": "vendor/aiv/final_rms_norm.cpp",
+      "core_type": "aiv",
+      "code_name": "final_rms_norm",
+      "signature": [
+        1,
+        2,
+        1
+      ],
+      "source_sha256": "f5b3115180937fa70623b29bf36fed2cdbcc5fcf6d60d4b92e2c4b8128adf850",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 79,
+      "name": "lm_head_select_rows",
+      "source": "vendor/aiv/lm_head_select_rows.cpp",
+      "core_type": "aiv",
+      "code_name": "lm_head_select_rows",
+      "signature": [
+        1,
+        1,
+        2
+      ],
+      "source_sha256": "04ce3f5e79ac35081bb55534bdcafb2311e39faafaad382ea12552195ba86456",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 80,
+      "name": "_lm_head_projection",
+      "source": "vendor/external/lm_head_projection.cpp",
+      "core_type": "aic",
+      "external": true,
+      "signature": [
+        1,
+        1,
+        2
+      ],
+      "source_sha256": "d449db3ac9951c65699013d9e63db79aea433a5dae8e95117131a00eec8eed3a",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    },
+    {
+      "func_id": 81,
+      "name": "lm_head_greedy_sample",
+      "source": "vendor/aiv/lm_head_greedy_sample.cpp",
+      "core_type": "aiv",
+      "code_name": "lm_head_greedy_sample",
+      "signature": [
+        2,
+        1
+      ],
+      "source_sha256": "f9e8edf6fa810b9aec96f98790da1bd4f62a5562b8e0c7c8abb019c669545af5",
+      "include_dirs": [
+        "vendor",
+        "vendor/aic",
+        "vendor/aiv",
+        "vendor/external"
+      ]
+    }
+  ]
+}

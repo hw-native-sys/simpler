@@ -1,0 +1,13 @@
+# source_task_id kernel_names lane_mask block_num deferred
+68	engram_quant	2	24	0
+69	engram_projection_aic+engram_projection_aiv	3	32	0
+71	engram_quant	2	24	0
+72	engram_projection_aic+engram_projection_aiv	3	32	0
+74	engram_quant	2	24	0
+75	engram_projection_aic+engram_projection_aiv	3	32	0
+77	engram_quant	2	24	0
+78	engram_projection_aic+engram_projection_aiv	3	32	0
+80	engram_quant	2	24	0
+81	engram_projection_aic+engram_projection_aiv	3	32	0
+82	engram_widen	2	500	0
+83	engram_gate	2	20	0

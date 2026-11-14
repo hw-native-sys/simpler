@@ -14,10 +14,11 @@ if (($# < 6)); then
     exit 2
 fi
 preparation=""
+runtime_name=host_build_graph
 for option in "${@:7}"; do
     case "$option" in
         --materialize) preparation=--materialize ;;
-        --runtime=host_build_graph|--runtime=percounter) ;;
+        --runtime=host_build_graph|--runtime=percounter) runtime_name=${option#--runtime=} ;;
         *) echo "Unknown option: $option" >&2; exit 2 ;;
     esac
 done
@@ -47,6 +48,17 @@ for ((rank=0; rank<ranks; ++rank)); do
         [[ ${devices[$rank]} != "${devices[$peer]}" ]] || { echo 'Device IDs must be distinct' >&2; exit 2; }
     done
 done
+if [[ -f "$bundle/case.json" ]] && "${DSV41_PYTHON:-python3}" -c \
+    'import json,sys; sys.exit(json.load(open(sys.argv[1])).get("execution") != "native_moe_host_control")' "$bundle/case.json"; then
+    [[ -f "$bundle/native-callable.bin" ]] || { echo 'Prepare native MoE with production/moe.py first' >&2; exit 2; }
+    mkdir -p "$output/ascend"
+    export ASCEND_PROCESS_LOG_PATH="$output/ascend"
+    "${DSV41_PYTHON:-python3}" "$root/production/moe.py" "$bundle" "$output/L$4" \
+        --runtime-lib "$runtime" --runtime "$runtime_name" --level "$4" --warmup "$5" --rounds "$6" \
+        > "$output/L$4.log" 2>&1 || { tail -n 60 "$output/L$4.log"; exit 1; }
+    tail -n 12 "$output/L$4.log"
+    exit 0
+fi
 runner=${DSV41_RUNNER:-"${DSV41_BUILD_DIR:-$root/build/portable}/host/native-runner"}
 [[ -x "$runner" && -f "$bundle/callable.bin" ]] || { echo 'Build the native runner and bundle first' >&2; exit 2; }
 pids=()
