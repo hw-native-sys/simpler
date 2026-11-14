@@ -2592,6 +2592,11 @@ def _mailbox_extent(shm: SharedMemory) -> int:
     return buf.nbytes
 
 
+def _native_mailbox_addr(worker: _Worker, shm: SharedMemory) -> int:
+    """Give the native endpoint a mapping independent of Python finalization."""
+    return worker._map_mailbox(shm._fd, _mailbox_extent(shm))  # noqa: SLF001 -- POSIX SharedMemory backing
+
+
 def _require_matching_pids(shms: list[SharedMemory], pids: list[int], kind: str) -> None:
     """Guard the shm/pid pairing the C++ liveness check depends on.
 
@@ -7143,7 +7148,7 @@ class Worker:
             self._worker.add_mpi_group_mailbox(
                 [rank.worker_id for rank in group.ranks],
                 [rank.session_id for rank in group.ranks],
-                mailbox.address,
+                self._worker._map_mailbox(mailbox.fileno(), MPI_MAILBOX_SIZE),
                 MPI_MAILBOX_SIZE,
                 group.process.pid,
                 session_timeout,
@@ -10319,7 +10324,7 @@ class Worker:
         if device_ids:
             _require_matching_pids(self._chip_shms, self._chip_pids, "chip")
             for shm, pid, granted_sets in zip(self._chip_shms, self._chip_pids, self._chip_run_resource_set_counts):
-                dw.add_next_level_worker(_mailbox_addr(shm), _mailbox_extent(shm), pid, granted_sets)
+                dw.add_next_level_worker(_native_mailbox_addr(dw, shm), _mailbox_extent(shm), pid, granted_sets)
 
         # Register Worker children as NEXT_LEVEL (L4+)
         if self._next_level_shms and not hasattr(dw, "add_next_level_worker_at"):
@@ -10327,11 +10332,13 @@ class Worker:
         _require_matching_pids(self._next_level_shms, self._next_level_pids, "next_level")
         for idx, shm in enumerate(self._next_level_shms):
             worker_id = self._next_level_worker_ids[idx]
-            dw.add_next_level_worker_at(worker_id, _mailbox_addr(shm), _mailbox_extent(shm), self._next_level_pids[idx])
+            dw.add_next_level_worker_at(
+                worker_id, _native_mailbox_addr(dw, shm), _mailbox_extent(shm), self._next_level_pids[idx]
+            )
 
         _require_matching_pids(self._sub_shms, self._sub_pids, "sub")
         for shm, pid in zip(self._sub_shms, self._sub_pids):
-            dw.add_sub_worker(_mailbox_addr(shm), _mailbox_extent(shm), pid)
+            dw.add_sub_worker(_native_mailbox_addr(dw, shm), _mailbox_extent(shm), pid)
 
         # Start Scheduler + WorkerThreads (C++ threads start here, after fork)
         dw.init()

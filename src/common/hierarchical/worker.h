@@ -71,6 +71,10 @@ public:
     std::vector<int> shared_heap_fds() const { return allocator_.shared_fds(); }
     ~Worker();
 
+    // The native mapping remains valid through endpoint and scheduler teardown,
+    // independently of the caller's descriptor and Python mapping lifetime.
+    void *map_mailbox(int fd, size_t bytes);
+
     Worker(const Worker &) = delete;
     Worker &operator=(const Worker &) = delete;
 
@@ -256,6 +260,10 @@ public:
 private:
     int32_t level_;
     bool initialized_{false};
+
+    struct MailboxMapping;
+    // Destroyed after every component that can access a mailbox.
+    std::vector<std::unique_ptr<MailboxMapping>> mailbox_mappings_;
 
     // --- Scheduling engine components ---
     // Per-task slot state lives inside `allocator_` (Ring) — Orchestrator

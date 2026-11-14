@@ -221,6 +221,14 @@ calling a dead context. Parent backing and cleanup records remain retained until
 all finalization replies arrive; retries do not repeat a completed owner teardown.
 Ordinary Buffer release does not initiate terminal owner recovery.
 
+Unconfirmed CCU stop can refuse this recovery and leave `Worker.close()` with
+an error. Host backing, cleanup records and child transports remain owned for
+retry; this outcome does not promise that chip children have exited. Native
+Workers own independent mappings of their local and MPI mailboxes through
+scheduler and endpoint destruction, including Python interpreter shutdown.
+Closing a Python mailbox view does not invalidate the native endpoint's mapping
+or establish that any Device access to Host backing has stopped.
+
 Use the [shared-table examples](../../examples/a5/tensormap_and_ringbuffer/host_ddr_map/README.md)
 for BF16 gathers and MXFP8 payloads with Device scales and dependent consumers,
 in serial and staged L3 execution. Historical URMA qualification does not qualify

@@ -17,10 +17,18 @@ import time
 from pathlib import Path
 
 
+def ccu_sdk_roots() -> tuple[Path, Path]:
+    """Return the CANN installation and current Host architecture roots in lookup order."""
+    home = os.environ.get("ASCEND_HOME_PATH")
+    if not home:
+        raise FileNotFoundError("CANN CCU SDK requires ASCEND_HOME_PATH to point to the CANN installation")
+    sdk = Path(home).absolute()
+    return sdk, sdk / f"{platform.machine()}-linux"
+
+
 def ccu_sdk_root() -> Path:
     """Locate the host CANN SDK used by CCU modules and their build identity."""
-    sdk = Path(os.environ["ASCEND_HOME_PATH"])
-    roots = (sdk, sdk / f"{platform.machine()}-linux")
+    roots = ccu_sdk_roots()
     headers = ("include/hcomm/ccu/ccu_res.h", "include/acl/acl.h")
     for root in roots:
         if all((root / header).is_file() for header in headers):
@@ -29,9 +37,13 @@ def ccu_sdk_root() -> Path:
 
 
 def runtime_build_identity() -> tuple[bytes, bytes]:
+    """Return the SDK and pinned PTO-ISA SHA-256 bytes stored in a CCU manifest."""
     from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415 -- CCU-only toolchain discovery
 
-    sdk_header = ccu_sdk_root() / "include/hcomm/ccu/ccu_res.h"
+    candidates = tuple(root / "include/hcomm/ccu/ccu_res.h" for root in ccu_sdk_roots())
+    sdk_header = next((path for path in candidates if path.is_file()), None)
+    if sdk_header is None:
+        raise FileNotFoundError(f"CANN CCU SDK requires ccu_res.h; searched {', '.join(map(str, candidates))}")
     isa_header = Path(ensure_pto_isa_root()) / "include/pto/pto-inst.hpp"
     return hashlib.sha256(sdk_header.read_bytes()).digest(), hashlib.sha256(isa_header.read_bytes()).digest()
 
