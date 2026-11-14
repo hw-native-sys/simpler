@@ -1,8 +1,8 @@
 # Simpler's in-repo FDWIC suite
 
-Use [the suite README](../../../../tests/fdwic/dsv41_scheduler/README.md) and [results](../../../../tests/fdwic/dsv41_scheduler/RESULTS.md) from the same checkout. The production ChipWorker runs captured graph slices with vendored generated code and frozen zero-weight inputs. Local cases materialize their prefix inputs, with prefix time outside the case measurement. The suite runs with the checked-in fixtures and the A5 onboard HBG or percounter runtime. Percounter multi-device communication is not supported; mark its MoE and layers_19_21 entries unavailable.
+Use [the suite README](../../../../tests/fdwic/dsv41_scheduler/README.md) and [results](../../../../tests/fdwic/dsv41_scheduler/RESULTS.md) from the same checkout. The production ChipWorker runs captured graph slices with vendored generated code and frozen zero-weight inputs. Local cases materialize their prefix inputs, with prefix time outside the case measurement. The suite runs with the checked-in fixtures and the A5 onboard HBG or percounter runtime. Percounter multi-device support depends on the pinned revision. The published 21d2e9a103d5 results validate all six communication variants; record failures or missing runs explicitly instead of copying an older unsupported label.
 
-The default matrix has nine cases per flavor, `pypto_lib` and `pypto_lib_dsl`.
+The default matrix has 27 cases: nine each of `pypto_lib`, `pypto_lib_dsl` (half-sync), and `pypto_lib_dsl_all_sync64` (all capacity-eligible SPMD tasks).
 
 | Cards | Cases |
 | ----- | ----- |
@@ -10,7 +10,7 @@ The default matrix has nine cases per flavor, `pypto_lib` and `pypto_lib_dsl`.
 | 2 | `moe`, `layers_19_21` |
 
 The default DSL cases preserve original sync-start flags and add flags until approximately half of each case's SPMD tasks require sync-start. AIC/MIX additions are capped at 32 blocks and AIV at 64.
-This is one 18-configuration matrix, without a third all-sync DSL group. Regenerate bundles with the current exporter; identify the policy from `case.json`.
+The all-sync group includes 64-block AIV tasks and retains the 32-block AIC/MIX capacity. It enables 275/280 SPMD tasks; the five oversized tasks remain unchanged. Regenerate bundles with the current exporter and read the variant and policy from `case.json`. `prepare.py --sync-policy both` is the default.
 
 ## Build and prepare
 
@@ -56,3 +56,11 @@ Level `0` is for performance, `1` for kernel lanes, and `3` for scheduling phase
 ```
 
 Check rank results and replay validation. For the repository results protocol, use L0 device wall with one warmup and ten measured rounds, reporting the mean. For two-card cases use the maximum rank time in each round before taking the mean. If reproducing a separate fastest-rank experiment, report that statistic explicitly alongside the repository convention.
+
+## Required performance presentation
+
+Use one table with fixed columns `Case`, `实现`, `main HBG`, `main percounter`, `同步约束下界`, `最优实测距下界`. Each case has consecutive PyPTO-lib, half-sync DSL and all-sync DSL rows. Retain only the latest result set, average milliseconds to six decimals and percentage gap to two decimals; no P99 or raw-sample columns.
+
+`main HBG` holds the selected HBG revision's measurements (currently `8e6aba9d484`); state both exact runtime commits beside the table. Do not add a duplicate candidate column. Compute `(min(displayed HBG, displayed percounter) / bound - 1) * 100` before rounding. Missing bounds and communication rows use an em dash.
+
+Use the [synchronization-constrained model](../../../../tests/fdwic/dsv41_scheduler/BOUND.md). Half-sync and all-sync need their own durations and constraints. Mark unclosed lower bounds and percentages with a dagger; a feasible schedule is not a proven optimum. See the [suite presentation contract](../../../../tests/fdwic/dsv41_scheduler/README.md#performance-presentation-contract).

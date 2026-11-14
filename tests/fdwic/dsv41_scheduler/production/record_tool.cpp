@@ -16,7 +16,9 @@
 
 int main(int argc, char **argv) {
     try {
-        if (argc == 6 && std::string(argv[1]) == "--half-sync-start") {
+        if (argc == 6 &&
+            (std::string(argv[1]) == "--half-sync-start" || std::string(argv[1]) == "--all-sync-start-cap64")) {
+            const bool all_sync = std::string(argv[1]) == "--all-sync-start-cap64";
             std::ifstream input(argv[2], std::ios::binary);
             auto records = dsv41::read_records(input);
             const auto slice = dsv41::select_slice(records, std::stoull(argv[3]), std::stoull(argv[4]));
@@ -35,7 +37,7 @@ int main(int argc, char **argv) {
                     candidates.push_back(i);
                 }
             }
-            const size_t target = (spmd + 1) / 2;
+            const size_t target = all_sync ? enabled + candidates.size() : (spmd + 1) / 2;
             const size_t changed = std::min(target > enabled ? target - enabled : 0, candidates.size());
             std::vector<uint64_t> selected;
             for (size_t j = 0; j < candidates.size(); ++j) {
