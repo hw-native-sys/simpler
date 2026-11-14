@@ -147,15 +147,15 @@ class TestHbgSingleCoreDag(SceneTestCase):
             records = [record for stream in streams for record in stream["records"]]
             assert all(set(record) == record_fields for record in records)
             assert all(0 < record["start_cycles"] <= record["end_cycles"] for record in records)
-            required_kinds = {"bootstrap", "state_probe", "complete", "resolve", "idle"}
+            required_kinds = {"bootstrap", "state_probe", "dispatch", "complete", "idle"}
             emitted_kinds = {record["kind"] for record in records}
             assert required_kinds <= emitted_kinds, f"missing Scheduler kinds: {sorted(required_kinds - emitted_kinds)}"
+            assert not ({"resolve", "refill", "worksteal"} & emitted_kinds)
             profiled_task_ids = {int(row[1]) for row in raw["aicore_tasks"]}
-            launch_kinds = {"dispatch", "worksteal", "refill"}
             launches_by_task = Counter(
                 int(record["task_id"])
                 for record in records
-                if record["kind"] in launch_kinds and record["task_id"] is not None
+                if record["kind"] == "dispatch" and record["task_id"] is not None
             )
             assert set(launches_by_task) == profiled_task_ids, (
                 "launch records do not cover every profiled task: "
@@ -163,25 +163,15 @@ class TestHbgSingleCoreDag(SceneTestCase):
                 f"unexpected={sorted(set(launches_by_task) - profiled_task_ids)}"
             )
             assert set(launches_by_task.values()) == {1}
-            completed_task_ids = {int(record["task_id"]) for record in records if record["kind"] == "complete"}
-            assert completed_task_ids == profiled_task_ids, (
-                "complete records do not cover every profiled task: "
-                f"missing={sorted(profiled_task_ids - completed_task_ids)} "
-                f"unexpected={sorted(completed_task_ids - profiled_task_ids)}"
-            )
-            state_probe_task_ids = {int(record["task_id"]) for record in records if record["kind"] == "state_probe"}
-            assert state_probe_task_ids <= profiled_task_ids
-            inbox_launch_task_ids = {
-                int(record["task_id"]) for record in records if record["kind"] in {"dispatch", "worksteal"}
-            }
-            assert inbox_launch_task_ids <= state_probe_task_ids, (
-                "Ready Inbox launches are missing state_probe records: "
-                f"{sorted(inbox_launch_task_ids - state_probe_task_ids)}"
-            )
-            refill_task_ids = {int(record["task_id"]) for record in records if record["kind"] == "refill"}
-            assert profiled_task_ids - state_probe_task_ids <= refill_task_ids, (
-                "tasks without state_probe were not launched by refill: "
-                f"{sorted(profiled_task_ids - state_probe_task_ids - refill_task_ids)}"
+            completions_by_task = Counter(int(record["task_id"]) for record in records if record["kind"] == "complete")
+            assert completions_by_task == launches_by_task, "each execution token needs one completion record"
+            probes_by_task = Counter(int(record["task_id"]) for record in records if record["kind"] == "state_probe")
+            assert probes_by_task == launches_by_task, "each execution token needs one acquisition record"
+            probe_by_task = {int(record["task_id"]): record for record in records if record["kind"] == "state_probe"}
+            launch_by_task = {int(record["task_id"]): record for record in records if record["kind"] == "dispatch"}
+            assert all(
+                probe["end_cycles"] <= launch_by_task[task_id]["start_cycles"]
+                for task_id, probe in probe_by_task.items()
             )
 
 

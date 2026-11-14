@@ -35,13 +35,14 @@ def capture(level=2):
                 pending_slot=block,
                 order_key=0,
                 group_seq=None,
+                group_kind=0,
                 cluster_index=0,
                 cluster_lane=1,
                 executed=True,
             )
         )
     result = builder.build()
-    result["aicore_execution_identities"] = dict(schema="hbg-execution-identity-v1", producer="aicore", records=records)
+    result["aicore_execution_identities"] = dict(schema="hbg-execution-identity-v2", producer="aicore", records=records)
     return result
 
 
@@ -196,13 +197,14 @@ def test_each_mix_mask_keeps_fixed_lane_and_group_identity(tmp_path, mask):
                 pending_slot=0,
                 order_key=0,
                 group_seq=9,
+                group_kind=1,
                 cluster_index=0,
                 cluster_lane=slot,
                 executed=True,
             )
         )
     raw = builder.build()
-    raw["aicore_execution_identities"] = dict(schema="hbg-execution-identity-v1", producer="aicore", records=records)
+    raw["aicore_execution_identities"] = dict(schema="hbg-execution-identity-v2", producer="aicore", records=records)
     rows = read(tmp_path, raw)
     assert {r["subtask_slot"] for r in rows} == {slot for slot in range(3) if mask & (1 << slot)}
     assert all(r["group_seq"] == 9 for r in rows)
@@ -247,7 +249,9 @@ def test_same_mix_block_cannot_join_different_groups(tmp_path, mutation):
     raw = capture()
     records = raw["aicore_execution_identities"]["records"]
     for index, record in enumerate(records):
-        record.update(core_id=index, block_idx=0, block_num=1, subtask_slot=index, cluster_lane=index, group_seq=7)
+        record.update(
+            core_id=index, block_idx=0, block_num=1, subtask_slot=index, cluster_lane=index, group_seq=7, group_kind=1
+        )
         raw["aicore_tasks"][index][0] = index
         raw["scheduler_tasks"]["records"][index][0] = index
     read(tmp_path, raw)
@@ -264,9 +268,40 @@ def test_same_mix_block_cannot_join_different_groups(tmp_path, mutation):
         read(tmp_path, raw)
 
 
-def test_multiblock_identity_cannot_omit_its_admission_order(tmp_path):
+def test_multiblock_ordinary_identity_can_omit_admission_order(tmp_path):
     raw = capture()
     for record in raw["aicore_execution_identities"]["records"]:
         record["order_key"] = None
+    rows = read(tmp_path, raw)
+    assert all(row["order_key"] is None for row in rows)
+    assert {row["block_idx"] for row in rows} == {0, 1}
+
+
+@pytest.mark.parametrize("fault", (None, "source", "ordered", "generation"))
+def test_ordinary_cluster_identity_requires_its_explicit_source(tmp_path, fault):
+    raw = capture()
+    records = raw["aicore_execution_identities"]["records"]
+    for index, record in enumerate(records):
+        record.update(
+            core_id=index,
+            block_idx=0,
+            block_num=1,
+            subtask_slot=index,
+            cluster_lane=index,
+            order_key=None,
+            group_seq=7,
+            group_kind=2,
+        )
+        raw["aicore_tasks"][index][0] = index
+        raw["scheduler_tasks"]["records"][index][0] = index
+    if fault is None:
+        assert all(row["group_kind"] == 2 and row["order_key"] is None for row in read(tmp_path, raw))
+        return
+    if fault == "source":
+        records[0]["group_kind"] = 1
+    elif fault == "ordered":
+        records[0]["order_key"] = 0
+    else:
+        records[0]["group_seq"] = 8
     with pytest.raises(ValueError, match="identity"):
         read(tmp_path, raw)

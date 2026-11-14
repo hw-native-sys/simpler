@@ -17,6 +17,7 @@ import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup.scene_test import _pto_isa_compile_cache_token, compile_chip_callable_spec
+from simpler_setup.tools.hbg.native_protocol import has_native_graph, protocol_version
 from simpler_setup.tools.swimlane_converter import read_perf_data
 
 from . import helpers
@@ -74,7 +75,7 @@ def _require_completed_empty_capture(runner):
     assert len(captures) == 1, captures
     raw = json.loads(captures[0].read_text())
     protocol = raw["aicore_protocol"]
-    assert protocol["schema"] == "hbg-native-protocol-v10"
+    assert protocol_version(protocol) and not has_native_graph(protocol)
     decoded = read_perf_data(captures[0])
     assert decoded["protocol_audit"]["protocol_verified"]
     assert protocol["scheduler_error"] == protocol["error_claimed"] == 0

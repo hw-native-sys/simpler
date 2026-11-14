@@ -36,7 +36,6 @@ namespace {
 
 constexpr uint32_t kInitialBackoffIterations = 8;
 constexpr uint32_t kMaximumBackoffIterations = 256;
-constexpr uint32_t kMaximumIdleBackoffIterations = 128;
 constexpr uint32_t kSchedulerErrorPollInterval = 64;
 
 struct SchedulerWorkerStats {
@@ -45,7 +44,17 @@ struct SchedulerWorkerStats {
     uint64_t target_bootstrap_end_cycles{0};
     uint64_t completion_count{0};
     uint64_t exit_observed_cycles{0};
+    uint64_t deferred_idle_start{0};
+    uint64_t deferred_idle_end{0};
 };
+
+// The original idle timestamps survive the kernel in the existing worker state.
+__aicore__ __attribute__((noinline)) void
+publish_deferred_idle_activity(__gm__ void *base, SchedulerLocalState *local, SchedulerWorkerStats *stats) {
+    if (stats->deferred_idle_end == 0) return;
+    scheduler_append_idle_activity(base, local, stats->deferred_idle_start, stats->deferred_idle_end);
+    stats->deferred_idle_end = 0;
+}
 
 /**
  * Stage the PMU counters this core just froze for one executed subtask.
@@ -78,11 +87,10 @@ __aicore__ __attribute__((always_inline)) void stage_task_pmu(
     scheduler_publish_cache_line(cell);
 }
 
-__aicore__ __attribute__((always_inline)) void execute_task(__gm__ DispatchPayload *payload) {
-    // Dispatch binds a valid per-core payload before making its slot READY.
-    if (payload->function_bin_addr == 0) return;
-    UnifiedKernelFunc kernel = (UnifiedKernelFunc)payload->function_bin_addr;
-    kernel(reinterpret_cast<__gm__ int64_t *>(payload->args));
+__aicore__ __attribute__((always_inline)) void execute_task(uint64_t function_address, __gm__ uint64_t *args) {
+    if (function_address == 0) return;
+    UnifiedKernelFunc kernel = reinterpret_cast<UnifiedKernelFunc>(function_address);
+    kernel(reinterpret_cast<__gm__ int64_t *>(args));
     scheduler_store_barrier();
 }
 
@@ -272,6 +280,7 @@ __aicore__ bool bootstrap_ready_graph(
     uint64_t observed_profiling_level
 ) {
     const uint64_t profiling_level = WithProfiling ? observed_profiling_level : 0;
+    constexpr bool record_protocol = WithProfiling && kSchedulerScalarInstrumentation;
     // The caller has validated the published format and node count.
     const SchedulerGraphAccess graph =
         WithNativeGraph ? published_graph :
@@ -281,11 +290,13 @@ __aicore__ bool bootstrap_ready_graph(
                           );
     if (scheduler == nullptr || scheduler_count == 0 || scheduler->config.scheduler_index >= scheduler_count)
         return false;
-    const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
+    const bool phase_timing_enabled =
+        kSchedulerScalarInstrumentation && scheduler_phase_timing_enabled(profiling_level);
     SchedulerScalarScope scalar_bootstrap(scheduler, SchedPhaseKind::ScalarBootstrap);
     const uint64_t timeout_cycles = scheduler_gm_query(run_control->scheduler_timeout_cycles);
     if (phase_timing_enabled) stats->bootstrap_start_cycles = scheduler_cycles();
-    SchedulerReadyBatch batches[SCHEDULER_READY_QUEUE_COUNT]{};
+    if (scheduler->cluster_signal != nullptr && scheduler->is_mix_coordinator())
+        scheduler_cluster_signal_clear(scheduler->cluster_signal, scheduler->config.prepared->run_epoch);
     uint64_t tasks_per_scheduler = graph.task_count / scheduler_count;
     uint64_t remainder = graph.task_count % scheduler_count;
     uint64_t task_begin =
@@ -303,9 +314,6 @@ __aicore__ bool bootstrap_ready_graph(
                 return false;
             if (kind == SchedulerNodeKind::HOST_DONE) continue;
             control_node = scheduler_node_is_control(kind);
-            if (kind == SchedulerNodeKind::CHILD_KERNEL &&
-                !scheduler_bootstrap_bind_arguments(graph, static_cast<int64_t>(task_ref), scheduler, run_control))
-                return false;
         }
         if (!control_node && !scheduler_task_is_executable(metadata->flags)) continue;
         if (!control_node && scheduler_task_requires_admission(metadata->flags) &&
@@ -314,44 +322,17 @@ __aicore__ bool bootstrap_ready_graph(
                 static_cast<int64_t>(task_ref)
             ))
             return false;
-        const bool has_fanin = scheduler_task_has_fanin(metadata->flags);
-        SchedulerRouteResult route =
-            has_fanin ? scheduler_bootstrap_route_task(
-                            graph, scheduler_state_base, scheduler, run_control, static_cast<int64_t>(task_ref)
-                        ) :
-                        SchedulerRouteResult::READY_TO_ENQUEUE;
-        if (route == SchedulerRouteResult::ERROR) return false;
-        if (route == SchedulerRouteResult::READY_TO_ENQUEUE) {
-            if (control_node) {
-                if (!scheduler_control_enqueue(
-                        graph, scheduler_state_base, scheduler, run_control, static_cast<int64_t>(task_ref)
-                    ))
-                    return false;
-                continue;
-            }
-            const uint32_t core_type = scheduler_task_ready_queue(metadata->flags, scheduler_task_lanes(*metadata));
-            if (!scheduler_ready_batch_append(
-                    scheduler_state_base, scheduler, static_cast<int64_t>(task_ref), &batches[core_type]
-                ))
-                return false;
-        }
         if (phase_timing_enabled) ++stats->bootstrap_task_count;
     }
     scheduler_cache_barrier();
-    // The scan barrier orders metadata and child arguments before consumption.
-    // A contended publication remains owned by this scheduler's persistent
-    // publisher and is serviced after the scan and in the dispatch loop.
-    for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type) {
-        if (!scheduler_ready_batch_push(scheduler_state_base, scheduler, type, &batches[type])) return false;
-    }
-
     uint64_t arrived = scheduler_gm_fetch_add(run_control->bootstrap_scan_arrived_count, UINT64_C(1)) + 1;
     if (arrived == scheduler_count) {
         scheduler_gm_store(run_control->bootstrap_scan_complete, UINT64_C(1));
     } else {
         uint32_t barrier_backoff = kInitialBackoffIterations;
         const uint64_t barrier_start = scheduler_cycles();
-        while (scheduler_gm_query(run_control->bootstrap_scan_complete) == 0) {
+        while (scheduler_gm_query(run_control->bootstrap_scan_complete) == 0 ||
+               scheduler_gm_fetch_add(run_control->bootstrap_scan_complete, UINT64_C(0)) == 0) {
             if (scheduler_read_worker_error(run_control, scheduler->worker_id()) != 0) return false;
             if (scheduler_watchdog_expired(barrier_start, scheduler_cycles(), timeout_cycles)) {
                 scheduler_record_error(
@@ -364,6 +345,8 @@ __aicore__ bool bootstrap_ready_graph(
             if (barrier_backoff < kMaximumBackoffIterations) barrier_backoff <<= 1;
         }
     }
+    // Every coordinator clears its SSBUF before contributing to this barrier.
+    scheduler_cache_barrier();
     for (uint32_t slot_index = 0; slot_index < SCHEDULER_PENDING_SLOT_COUNT; ++slot_index) {
         scheduler_initialize_free_slot(&scheduler->slots[slot_index]);
     }
@@ -379,16 +362,12 @@ __aicore__ bool bootstrap_ready_graph(
             ))
             return false;
     }
-    (void)scheduler_fill_own_slots<WithProfiling>(
+    (void)scheduler_fill_own_slots<record_protocol>(
         graph, scheduler_state_base, scheduler, run_control, profiling_level, &fill_failed
     );
     if (fill_failed) return false;
 
-    // Nothing published above needs ordering against this announcement. A wake
-    // list travels by atomics on both sides: a resolver detaches it with an
-    // exchange and reads its links with an atomic load. A ready batch is found
-    // by a poll that repeats, so a queue head this core cannot see yet is read
-    // again on the next pass.
+    // Immutable admission records and per-cluster initialization precede the launch gate.
     arrived = scheduler_gm_fetch_add(run_control->bootstrap_arrived_count, UINT64_C(1)) + 1;
     if (arrived == scheduler_count) scheduler_gm_store(run_control->bootstrap_complete, UINT64_C(1));
     return true;
@@ -402,6 +381,7 @@ __aicore__ bool run_ready_dispatch_loop(
     SchedulerWorkerStats *__restrict__ stats, uint64_t observed_profiling_level
 ) {
     const uint64_t profiling_level = WithProfiling ? observed_profiling_level : 0;
+    constexpr bool record_protocol = WithProfiling && kSchedulerScalarInstrumentation;
     // The caller has validated the published format and node count.
     const SchedulerGraphAccess graph =
         WithNativeGraph ? published_graph :
@@ -416,12 +396,13 @@ __aicore__ bool run_ready_dispatch_loop(
     const uint64_t pmu_reg_base =
         SIMPLER_GET_DFX_FLAG(get_aicore_profiling_flag(), SIMPLER_DFX_FLAG_PMU) ? get_aicore_pmu_reg_base() : 0;
     const bool task_timing_enabled = scheduler_task_timing_enabled(profiling_level);
-    const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
+    const bool phase_timing_enabled =
+        kSchedulerScalarInstrumentation && scheduler_phase_timing_enabled(profiling_level);
     const uint64_t scheduler_count = context->config.scheduler_count;
     if (scheduler_count == 0) return false;
     if (cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM) return false;
-    uint32_t backoff_iterations = kInitialBackoffIterations;
     uint32_t scheduler_error_poll_count = 0;
+    uint32_t execution_service_rounds = 0;
     if (phase_timing_enabled) context->profiling->loop_iter = UINT32_MAX;
     uint64_t idle_start_cycles = 0;
     bool idle_active = false;
@@ -466,8 +447,29 @@ __aicore__ bool run_ready_dispatch_loop(
         SchedulerScalarIteration scalar_iteration(phase_timing_enabled ? &context->profiling->scalar : nullptr);
 
         bool scheduler_progress = false;
-        {
-            if (graph.native_header_offset != 0) {
+        uint32_t direct_slot = UINT32_MAX;
+        const bool service_due = ++execution_service_rounds >= 4;
+        if (!service_due &&
+            !scheduler_progress_execution_tokens(
+                graph, scheduler_state_base, context, run_control, profiling_level, &direct_slot, &scheduler_progress
+            ))
+            return false;
+        if (direct_slot == UINT32_MAX) {
+            execution_service_rounds = 0;
+            if (service_due) {
+                if (!service_async(scheduler_progress)) return false;
+                const bool retire_due =
+                    context->is_mix_coordinator() && context->cluster_mix.phase == SchedulerGmMixPhase::RELEASED;
+                if (!retire_due && !scheduler_cluster_mix_needs_service(context)) {
+                    bool discovered = false;
+                    if (!scheduler_refill_execution_tokens(
+                            graph, scheduler_state_base, context, run_control, profiling_level, &discovered
+                        ))
+                        return false;
+                    scheduler_progress = scheduler_progress || discovered;
+                }
+            }
+            {
                 SchedulerScalarScope scalar_control(context, SchedPhaseKind::ScalarGraphControl);
                 bool control_progress = false;
                 if (!scheduler_service_controls(
@@ -485,26 +487,36 @@ __aicore__ bool run_ready_dispatch_loop(
                 }
             }
             bool fill_failed = false;
-            const bool dispatch_progress = scheduler_fill_own_slots<WithProfiling>(
-                graph, scheduler_state_base, context, run_control, profiling_level, &fill_failed
+            const bool dispatch_progress = scheduler_fill_own_slots<record_protocol>(
+                graph, scheduler_state_base, context, run_control, profiling_level, &fill_failed, &direct_slot
             );
             scheduler_progress = dispatch_progress || scheduler_progress;
             if (fill_failed) return false;
         }
 
         if (phase_timing_enabled && scheduler_progress && idle_active) {
-            scheduler_append_idle_activity(scheduler_state_base, context, idle_start_cycles, idle_candidate_start);
+            stats->deferred_idle_start = idle_start_cycles;
+            stats->deferred_idle_end = idle_candidate_start;
             idle_active = false;
         }
 
         int32_t ready_slot = -1;
         uint64_t ready_scan_start = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
-        SchedulerScalarScope scalar_scan(context, SchedPhaseKind::ScalarExecutorScan, -1, ready_scan_start);
+        SchedulerScalarScope scalar_scan(
+            direct_slot == UINT32_MAX ? context : nullptr, SchedPhaseKind::ScalarExecutorScan, -1, ready_scan_start
+        );
         {
-            uint32_t local_slot = UINT32_MAX;
-            if (context->local_ready_mask != 0) {
-                if (!scheduler_local_ready_peek(context, &local_slot) ||
-                    context->slots[local_slot].state != SchedulerDispatchSlotState::READY) {
+            uint32_t local_slot = direct_slot;
+            if (direct_slot != UINT32_MAX || context->local_ready_mask != 0) {
+                const bool selected = direct_slot != UINT32_MAX || scheduler_local_ready_peek(context, &local_slot);
+                if (!selected || local_slot >= SCHEDULER_PENDING_SLOT_COUNT ||
+                    context->slots[local_slot].state != SchedulerDispatchSlotState::READY ||
+                    (direct_slot != UINT32_MAX &&
+                     ((context->local_ready_mask & (1U << local_slot)) != 0 ||
+                      scheduler_prepared_phase(context->slots[local_slot].prepared.claimed_state) !=
+                          SchedulerPreparedPhase::CLAIMED ||
+                      scheduler_prepared_execute_owner(context->slots[local_slot].prepared.claimed_state) !=
+                          context->worker_id()))) {
                     scheduler_record_error(
                         run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph,
                         context, SchedulerErrorSite::EXECUTOR_PREFERRED_SLOT_INVALID
@@ -515,13 +527,16 @@ __aicore__ bool run_ready_dispatch_loop(
                 if (context->async != nullptr && context->async->business_returns >= 4) {
                     if (!service_async(scheduler_progress)) return false;
                 }
-                if (context->admission != nullptr) {
+                {
                     bool permit = false;
-                    if (!scheduler_ordered_can_enter_slot<WithProfiling>(
+                    if (!scheduler_can_enter_dispatch_slot<record_protocol>(
                             graph, scheduler_state_base, context, run_control, local_slot, &permit
                         ))
                         return false;
-                    if (!permit) ready_slot = -1;
+                    if (!permit) {
+                        if (direct_slot != UINT32_MAX) scheduler_local_ready_publish(context, local_slot);
+                        ready_slot = -1;
+                    }
                 }
             }
         }
@@ -529,7 +544,9 @@ __aicore__ bool run_ready_dispatch_loop(
         if (ready_slot >= 0) {
             scalar_iteration.progress = true;
             uint32_t slot_index = static_cast<uint32_t>(ready_slot);
-            if (!scheduler_local_ready_execute(context, slot_index)) {
+            if (direct_slot != UINT32_MAX) {
+                context->slots[slot_index].state = SchedulerDispatchSlotState::EXECUTING;
+            } else if (!scheduler_local_ready_execute(context, slot_index)) {
                 scheduler_record_error(
                     run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
                     SchedulerErrorSite::EXECUTOR_INVALID_DISPATCH_SLOT
@@ -538,19 +555,24 @@ __aicore__ bool run_ready_dispatch_loop(
             }
             SchedulerLocalSlotState *local_slot = &context->slots[slot_index];
             const int32_t timing_slot = context->timing_slot(slot_index);
-            __gm__ DispatchPayload *payload = scheduler_state_at<DispatchPayload>(
-                scheduler_state_base, context->dispatch_payload_offset(context->config.self_lane, slot_index)
+            auto *call = scheduler_prepared_call_at(
+                scheduler_state_base, context->config.prepared, local_slot->prepared.execution_index
             );
+            auto *binding = scheduler_execution_binding_at(
+                scheduler_state_base, context->config.prepared, local_slot->prepared.execution_index
+            );
+            const uint64_t function_address =
+                local_slot->predicate == SchedulerPredicateState::FAIL ? 0 : call->function_bin_addr;
             const bool commit_scheduler_trace = task_timing_enabled;
             const bool commit_task_timing =
                 WithProfiling && timing_slot >= 0 && timing_slot < SCHEDULER_TASK_TIMING_SLOT_COUNT;
             const bool commit_executor_trace = commit_scheduler_trace || commit_task_timing;
             uint64_t ready_observe = commit_executor_trace || phase_timing_enabled ? get_sys_cnt_aicore() : 0;
-            // This core prepares every payload it executes, including Mix lanes.
             const int64_t task_ref = local_slot->task_ref;
             SchedulerScalarScope scalar_prepare(context, SchedPhaseKind::ScalarPrepare, task_ref, ready_observe);
             if (phase_timing_enabled && idle_active) {
-                scheduler_append_idle_activity(scheduler_state_base, context, idle_start_cycles, ready_observe);
+                stats->deferred_idle_start = idle_start_cycles;
+                stats->deferred_idle_end = ready_observe;
                 idle_active = false;
             }
             SchedulerExecutorTaskTrace execution_trace{};
@@ -563,37 +585,39 @@ __aicore__ bool run_ready_dispatch_loop(
                 );
             }
             if (commit_scheduler_trace)
-                scheduler_capture_execution_identity(scheduler_state_base, context, slot_index, payload);
-            // Dependencies and final admission are settled. Acquire payload on
-            // the actual consumer core before writing its fresh async context;
-            // another core's completion observation cannot invalidate this cache.
-            if (payload->function_bin_addr != 0 && scheduler_async_work_activated(context->async)) {
+                scheduler_capture_execution_identity(
+                    scheduler_state_base, context, slot_index, function_address, binding->local_context
+                );
+            // Async-protected business inputs require observation on the actual
+            // consumer after dependencies settle, independently of the call package.
+            if (function_address != 0 && scheduler_async_work_activated(context->async)) {
                 SchedulerScalarScope scalar_cache(context, SchedPhaseKind::ScalarCacheObserve, task_ref);
-                scheduler_observe_data_cache(payload);
+                scheduler_observe_data_cache(binding);
             }
             uint32_t execution_group_index = pto2::resident::ASYNC_INVALID_INDEX;
             {
                 pto2::resident::AsyncWriter writer{};
-                if (!scheduler_async_begin_execution(
-                        context->async, task_ref, local_slot->block_idx, local_slot->subtask_slot,
-                        payload->global_context, writer
+                if (!scheduler_async_begin_prebound_execution(
+                        context->async, task_ref, binding->global_context, writer
                     )) {
                     scheduler_record_error(
                         run_control, task_ref, scheduler_async_error_result(context->async), &graph, context,
                         SchedulerErrorSite::ASYNC_CONTEXT_INVALID, local_slot
                     );
+                    (void)scheduler_cancel_unstarted_slot<true>(scheduler_state_base, context, slot_index);
                     return false;
                 }
                 execution_group_index = writer.group_index;
             }
             if (context->config.shared_context->args_dump_address != 0 &&
                 !args_dump_boundary(
-                    graph, context, run_control, task_ref, ArgsDumpStage::BEFORE_DISPATCH, payload->global_context
+                    graph, context, run_control, task_ref, ArgsDumpStage::BEFORE_DISPATCH, binding->global_context
                 )) {
                 scheduler_record_error(
                     run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
                     SchedulerErrorSite::ARGS_DUMP_REFUSED
                 );
+                (void)scheduler_cancel_unstarted_slot<true>(scheduler_state_base, context, slot_index);
                 return false;
             }
             scheduler_store_barrier();
@@ -601,9 +625,11 @@ __aicore__ bool run_ready_dispatch_loop(
             uint64_t kernel_start = commit_executor_trace || phase_timing_enabled ? get_sys_cnt_aicore() : 0;
             if (phase_timing_enabled) ++context->profiling->scalar.depth;
             if (pmu_reg_base != 0) pmu_aicore_begin();
-            if (WithProfiling && scheduler_protocol_enabled(context))
-                scheduler_execute_protocol_task(scheduler_state_base, context, slot_index, payload);
-            else execute_task(payload);
+            if (record_protocol && scheduler_protocol_enabled(context))
+                scheduler_execute_protocol_task(
+                    scheduler_state_base, context, slot_index, function_address, call->args, binding->local_context
+                );
+            else execute_task(function_address, call->args);
             if (pmu_reg_base != 0) {
                 pmu_aicore_end();
                 // The subtask this lane ran, not the lane: a task's subtasks
@@ -620,7 +646,7 @@ __aicore__ bool run_ready_dispatch_loop(
             SchedulerScalarScope scalar_seal(context, SchedPhaseKind::ScalarSeal, task_ref, kernel_end);
             if (commit_executor_trace) stage_task_trace_before_completion(&execution_trace, kernel_start, kernel_end);
             if (commit_executor_trace) context->profiling->executor_traces[slot_index] = execution_trace;
-            // The kernel receives only payload->args and its GM contexts. No
+            // The kernel receives only call->args and its GM contexts. No
             // private slot/admission address escapes, and this core cannot run
             // its scheduler while inside the kernel. Dispatch's validated task
             // and group binding therefore remain owned through normal return.
@@ -633,28 +659,31 @@ __aicore__ bool run_ready_dispatch_loop(
                         run_control, task_ref, scheduler_async_error_result(context->async), &graph, context,
                         SchedulerErrorSite::ASYNC_SEAL_FAILED, local_slot
                     );
+                    (void)scheduler_complete_own_slot<record_protocol, true, false>(
+                        graph, scheduler_state_base, context, run_control, slot_index, profiling_level
+                    );
                     return false;
                 }
             }
             if (context->config.shared_context->args_dump_address != 0 &&
                 !args_dump_boundary(
-                    graph, context, run_control, task_ref, ArgsDumpStage::AFTER_COMPLETION, payload->global_context
+                    graph, context, run_control, task_ref, ArgsDumpStage::AFTER_COMPLETION, binding->global_context
                 )) {
                 scheduler_record_error(
                     run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
                     SchedulerErrorSite::ARGS_DUMP_REFUSED
+                );
+                (void)scheduler_complete_own_slot<record_protocol, true, false>(
+                    graph, scheduler_state_base, context, run_control, slot_index, profiling_level
                 );
                 return false;
             }
             scalar_seal.close();
             if (context->async != nullptr) ++context->async->business_returns;
             if (phase_timing_enabled) ++stats->completion_count;
-            backoff_iterations = kInitialBackoffIterations;
-            boundary = check_boundary();
-            if (boundary != Boundary::Proceed) break;
             SchedulerScalarScope scalar_completions(context, SchedPhaseKind::ScalarCompletions, task_ref);
             const bool completion_ok =
-                WithProfiling && scheduler_protocol_enabled(context) ?
+                record_protocol && scheduler_protocol_enabled(context) ?
                     scheduler_complete_own_slot<true, true>(
                         graph, scheduler_state_base, context, run_control, slot_index, profiling_level
                     ) :
@@ -662,13 +691,15 @@ __aicore__ bool run_ready_dispatch_loop(
                         graph, scheduler_state_base, context, run_control, slot_index, profiling_level
                     );
             if (!completion_ok) return false;
+            if (phase_timing_enabled) publish_deferred_idle_activity(scheduler_state_base, context, stats);
+            boundary = check_boundary();
             continue;
         }
 
         if (!service_async(scheduler_progress)) return false;
+        if (phase_timing_enabled) publish_deferred_idle_activity(scheduler_state_base, context, stats);
         if (scheduler_progress) {
             scalar_iteration.progress = true;
-            backoff_iterations = kInitialBackoffIterations;
             boundary = check_boundary();
             continue;
         }
@@ -676,17 +707,12 @@ __aicore__ bool run_ready_dispatch_loop(
             SchedulerScalarScope scalar_flush(context, SchedPhaseKind::ScalarFlushCompletions);
             scheduler_flush_completions(run_control, context);
         }
-        const uint64_t backoff_start = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
-        local_backoff(backoff_iterations);
-        if (phase_timing_enabled)
-            context->profiling->scalar.append(SchedPhaseKind::ScalarBackoff, backoff_start, get_sys_cnt_aicore());
         if (phase_timing_enabled) {
             if (!idle_active) {
                 idle_start_cycles = idle_candidate_start;
                 idle_active = true;
             }
         }
-        if (backoff_iterations < kMaximumIdleBackoffIterations) backoff_iterations <<= 1;
         boundary = check_boundary();
     }
     return boundary != Boundary::Error;
@@ -699,12 +725,15 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     __gm__ SchedulerWorkerContext *context, __gm__ SchedulerRunControl *run_control, __gm__ void *scheduler_state_base,
     uint64_t observed_profiling_level, uint64_t aicore_entry_cycles, uint64_t handshake_publish_cycles
 ) {
+    scheduler_invalidate_startup_cache();
     // Each resident translation unit owns its block-local observer slot. A prior
     // aborted launch may not have unwound the binding before this invocation.
-    static_assert(!WithProfiling || kSchedulerScalarInstrumentation);
+    static_assert(WithProfiling || !kSchedulerScalarInstrumentation);
     scheduler_scalar_bind(nullptr);
     const uint64_t profiling_level = WithProfiling ? observed_profiling_level : 0;
-    const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
+    constexpr bool record_protocol = WithProfiling && kSchedulerScalarInstrumentation;
+    const bool phase_timing_enabled =
+        kSchedulerScalarInstrumentation && scheduler_phase_timing_enabled(profiling_level);
     // READY publishes this run's timeout; no writer changes it during execution.
     const uint64_t timeout_cycles = scheduler_gm_query(run_control->scheduler_timeout_cycles);
     scheduler_observe_cache_line(&context->graph_task_count);
@@ -733,8 +762,6 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
         scheduler_native_header_extent_valid(
             graph.scheduler_state_address, graph.scheduler_state_bytes, graph.native_header_offset
         );
-    if (graph.native_header_offset != 0 && native_extent_valid)
-        scheduler_observe_data_cache(reinterpret_cast<__gm__ void *>(graph.scheduler_state_address));
     bool config_valid =
         native_extent_valid &&
         scheduler_initialize_local_config(scheduler_state_base, context, &graph, &scheduler_local_state);
@@ -746,7 +773,8 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
                     scheduler_state_base, scheduler_gm_query(profile.scalar.buffer->scalar_records_offset)
                 );
                 profile.scalar.window_start = aicore_entry_cycles;
-                profile.scalar.function_min_cycles = profiling_level >= 4 ? 0 : PLATFORM_PROF_SYS_CNT_FREQ / 1000000;
+                profile.scalar.function_min_cycles =
+                    profiling_level >= 4 ? 0 : PLATFORM_PROF_SYS_CNT_FREQ / UINT64_C(1000000);
                 scalar_binding.attach(&profile.scalar);
             }
         }
@@ -761,13 +789,15 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
         );
         config_valid = scheduler_initialize_async(
             scheduler_state_base, context->scheduler_state_bytes, summary->async_layout_offset, summary->run_epoch,
-            graph.task_count, async
+            graph.task_count, scheduler_local_state.config.task_controls_offset, async
         );
         if (config_valid && async.layout != nullptr) {
             async.check_cursor = static_cast<uint32_t>(context->worker_index % async.layout->group_count);
             async.finish_cursor = static_cast<uint32_t>(context->worker_index % async.layout->async_task_count);
             scheduler_local_state.async = &async;
         }
+        if (config_valid && summary->mix_task_count != 0)
+            scheduler_local_state.cluster_signal = scheduler_cluster_signal_at(platform_ssbuf_hardware_base_address());
     }
     if (!config_valid)
         scheduler_record_error(
@@ -777,8 +807,6 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     const uint32_t cluster_lane = scheduler_local_state.config.self_lane;
     uint64_t descriptor_cache_observed_cycles = 0;
     if (config_valid) {
-        if (graph.native_header_offset == 0)
-            scheduler_observe_data_cache(reinterpret_cast<__gm__ void *>(graph.storage_address));
         descriptor_cache_observed_cycles = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
         if (context->is_scheduler != 0 && !bootstrap_ready_graph<WithNativeGraph, WithProfiling>(
                                               graph, scheduler_state_base, &scheduler_local_state, run_control,
@@ -836,6 +864,7 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     }
 
     SchedulerScalarScope scalar_exit(&scheduler_local_state, SchedPhaseKind::ScalarExitDrain);
+    if (phase_timing_enabled) publish_deferred_idle_activity(scheduler_state_base, &scheduler_local_state, &stats);
     scheduler_flush_completions(run_control, &scheduler_local_state);
 
     const uint64_t exit_wait_start = get_sys_cnt_aicore();
@@ -858,11 +887,25 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     // interval. Both startup and dispatch-loop exits close their obligations
     // here, before the acknowledgement allows the AICPU to retire that core.
     wait_for_aicpu_exit_signal();
+    if (config_valid && scheduler_read_error(run_control) != 0) {
+        if (!scheduler_cancel_unstarted_work(scheduler_state_base, &scheduler_local_state))
+            scheduler_record_error(
+                run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph,
+                &scheduler_local_state, SchedulerErrorSite::ORDERED_EXIT_IN_FLIGHT
+            );
+    }
+    if (config_valid && scheduler_read_error(run_control) == 0 &&
+        scheduler_has_execution_tokens(&scheduler_local_state)) {
+        scheduler_record_error(
+            run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph,
+            &scheduler_local_state, SchedulerErrorSite::ORDERED_EXIT_IN_FLIGHT
+        );
+    }
     if (config_valid && scheduler_read_error(run_control) == 0) {
         const uint64_t drain_start = get_sys_cnt_aicore();
         while (true) {
             bool drained = false;
-            if (!scheduler_drain_ordered_exit<WithProfiling>(
+            if (!scheduler_drain_ordered_exit<record_protocol>(
                     graph, scheduler_state_base, &scheduler_local_state, run_control, &drained
                 ) ||
                 drained)
@@ -881,7 +924,7 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
         }
     }
     if (phase_timing_enabled) publish_worker_stats(context, stats);
-    if constexpr (WithProfiling) {
+    if constexpr (record_protocol) {
         if (profile.protocol_layout_offset != 0)
             scheduler_protocol_finish(
                 scheduler_state_base, &scheduler_local_state, config_valid && scheduler_read_error(run_control) == 0

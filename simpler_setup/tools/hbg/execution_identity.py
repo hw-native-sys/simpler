@@ -21,6 +21,7 @@ FIELDS = frozenset(
         "pending_slot",
         "order_key",
         "group_seq",
+        "group_kind",
         "cluster_index",
         "cluster_lane",
         "executed",
@@ -40,13 +41,20 @@ def _validate_record(record):
         minimum = 1 if field == "group_seq" else 0
         if value is not None and (type(value) is not int or not minimum <= value < 1 << 64):
             raise ValueError(f"invalid execution identity {field}")
+    group_kind = record["group_kind"]
+    if (
+        group_kind not in (0, 1, 2)
+        or (group_kind == 0) != (record["group_seq"] is None)
+        or (group_kind == 1 and record["order_key"] is None)
+        or (group_kind == 2 and (record["order_key"] is not None or record["group_seq"] % 2 != 1))
+    ):
+        raise ValueError("execution identity group source mismatch")
     if (
         type(record["executed"]) is not bool
         or not 0 <= record["block_idx"] < record["block_num"] <= 32767
         or record["subtask_slot"] > 2
         or record["pending_slot"] > 1
         or record["cluster_lane"] > 2
-        or (record["block_num"] > 1 and record["order_key"] is None)
     ):
         raise ValueError("invalid execution identity shape")
 
@@ -56,7 +64,7 @@ def attach_execution_identities(section, tasks, runtime):
         runtime != "host_build_graph"
         or not isinstance(section, dict)
         or set(section) != {"schema", "producer", "records"}
-        or section["schema"] != "hbg-execution-identity-v1"
+        or section["schema"] != "hbg-execution-identity-v2"
         or section["producer"] != "aicore"
         or not isinstance(section["records"], list)
     ):
@@ -75,9 +83,7 @@ def attach_execution_identities(section, tasks, runtime):
         is_cube = task["core_type"] == "aic"
         if (record["subtask_slot"] == 0) != is_cube or (record["cluster_lane"] == 0) != is_cube:
             raise ValueError("execution identity lane/type mismatch")
-        if record["group_seq"] is not None and (
-            record["order_key"] is None or record["subtask_slot"] != record["cluster_lane"]
-        ):
+        if record["group_seq"] is not None and record["subtask_slot"] != record["cluster_lane"]:
             raise ValueError("execution identity Mix placement mismatch")
         execution = (record["run_epoch"], record["task_id"], record["block_idx"], record["subtask_slot"])
         if execution in executions:
@@ -90,7 +96,11 @@ def attach_execution_identities(section, tasks, runtime):
         if orders.setdefault(order_key, record["order_key"]) != record["order_key"]:
             raise ValueError("execution identity task has inconsistent admission order")
         group_key = execution[:3]
-        group = (record["group_seq"], record["cluster_index"] if record["group_seq"] is not None else None)
+        group = (
+            record["group_seq"],
+            record["cluster_index"] if record["group_seq"] is not None else None,
+            record["group_kind"],
+        )
         if groups.setdefault(group_key, group) != group:
             raise ValueError("execution identity Mix block spans different groups")
         block_counts[group_key] = block_counts.get(group_key, 0) + 1

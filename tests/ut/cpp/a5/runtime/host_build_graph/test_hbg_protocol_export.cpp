@@ -27,12 +27,13 @@ struct ProtocolExportFixture : ::testing::Test {
     std::unique_ptr<scheduler_test::SchedulerStateBuffer> storage;
     std::vector<SchedulerProtocolTaskSpec> tasks;
     void SetUp() override {
-        ASSERT_TRUE(scheduler_plan_layout(2, 1, 0, &layout, false, 6, {3, 1, 1, 1}, true));
+        ASSERT_TRUE(scheduler_plan_layout(2, 1, 0, &layout, false, 6, {6, 2, 1, 1, 1}, true));
         storage = std::make_unique<scheduler_test::SchedulerStateBuffer>(layout);
         auto *meta = at<SchedulerTaskMetadata>(layout.task_metadata_offset);
         meta[0].active_mask = LaneMask::all();
         meta[0].logical_block_num = 2;
-        meta[0].flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_MIX | SCHEDULER_TASK_SPMD;
+        meta[0].flags =
+            SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_MIX | SCHEDULER_TASK_SPMD | SCHEDULER_TASK_SYNC_START;
         meta[0].timing_slot = -1;
         ASSERT_TRUE(scheduler_init_spmd_task_records(storage->base(), layout, 0));
         scheduler_test::BasicGraphBuffer<2> graph(2);
@@ -53,7 +54,7 @@ struct ProtocolExportFixture : ::testing::Test {
 TEST_F(ProtocolExportFixture, PreservesFrozenGraphAndHostCompletedNodeWithoutFabricatingEvents) {
     at<SchedulerTaskMetadata>(layout.task_metadata_offset)[0].logical_block_num = 99;
     const auto json = dump();
-    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v10\""), std::string::npos);
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v20\""), std::string::npos);
     EXPECT_NE(json.find("\"close_seal_stride\":64"), std::string::npos);
     EXPECT_NE(json.find("\"claim_tickets\":0"), std::string::npos);
     EXPECT_EQ(json.find("\"admission_claim_lock\""), std::string::npos);
@@ -74,16 +75,18 @@ TEST_F(ProtocolExportFixture, NativeSchemaCarriesBothIdentitiesAndIndependentSou
     const auto json = scheduler_export_protocol(
         storage->base(), layout.total_size, layout, 0, tasks, "{\"tasks\":[],\"definitions\":[]}"
     );
-    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v11\""), std::string::npos);
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v21\""), std::string::npos);
     EXPECT_NE(json.find("\"original_task_id\":7,\"local_child_id\":3"), std::string::npos);
     EXPECT_NE(json.find("\"graph_source\":{\"tasks\":[],\"definitions\":[]}"), std::string::npos);
 }
 
-TEST_F(ProtocolExportFixture, ExportsPhysicalCountWithoutAsyncVotes) {
-    at<SchedulerTaskControl>(layout.task_controls_offset)[0].completion_state =
-        scheduler_completion_initial_state(6) + 2 * SCHEDULER_COMPLETION_ASYNC_UNIT + 6;
+TEST_F(ProtocolExportFixture, ExportsPhysicalCountWithOutstandingGroupDebt) {
+    at<SchedulerTaskControl>(layout.task_controls_offset)[0].completion_state = scheduler_completion_encode(6, 0, 2);
     const auto json = dump();
     EXPECT_NE(json.find("\"completed_subtasks\":6"), std::string::npos);
+    EXPECT_NE(json.find("\"canonical_total\":6"), std::string::npos);
+    EXPECT_NE(json.find("\"pending_compute\":0"), std::string::npos);
+    EXPECT_NE(json.find("\"completion_debt\":2"), std::string::npos);
     EXPECT_EQ(json.find("\"completed_subtasks\":8589934598"), std::string::npos);
 }
 
@@ -168,8 +171,8 @@ TEST_F(ProtocolExportFixture, RejectsTruncatedOrMisalignedImageAndMissingFrozenT
     EXPECT_THROW(dump(), std::invalid_argument);
 }
 
-TEST_F(ProtocolExportFixture, RejectsRedirectedMemberBitmap) {
-    at<SchedulerAdmissionRecord>(layout.admission_records_offset)->member_words_offset = layout.run_control_offset;
+TEST_F(ProtocolExportFixture, RejectsRedirectedAdmissionRecords) {
+    at<SchedulerGraphSummary>(layout.graph_summary_offset)->admission_records_offset = layout.run_control_offset;
     EXPECT_THROW(dump(), std::invalid_argument);
 }
 
@@ -178,9 +181,9 @@ TEST_F(ProtocolExportFixture, RejectsOutOfRegionSeal) {
     EXPECT_THROW(dump(), std::invalid_argument);
 }
 
-TEST_F(ProtocolExportFixture, PreservesMemberWordsSealAndRawTopology) {
+TEST_F(ProtocolExportFixture, PreservesMemberCountRecordBindingSealAndRawTopology) {
     auto *record = at<SchedulerAdmissionRecord>(layout.admission_records_offset);
-    *at<uint64_t>(record->member_words_offset) = UINT64_C(0x8000000000000007);
+    record->member_count = 65;
     at<SchedulerMixCloseSeal>(record->mix_close_seals_offset)->value = 17;
     auto *contexts = at<SchedulerWorkerContext>(layout.worker_contexts_offset);
     contexts[1].physical_core_id = 65;
@@ -189,24 +192,28 @@ TEST_F(ProtocolExportFixture, PreservesMemberWordsSealAndRawTopology) {
     contexts[1].cluster_worker_ids[1] = 2;
     contexts[1].cluster_worker_ids[2] = 1;
     const auto json = dump();
-    EXPECT_NE(json.find("\"member_words\":[9223372036854775815]"), std::string::npos);
-    EXPECT_NE(json.find("\"close_seals\":[17]"), std::string::npos);
+    EXPECT_NE(json.find("\"member_count\":65"), std::string::npos);
+    EXPECT_NE(json.find("\"record_offset\":" + std::to_string(layout.admission_records_offset)), std::string::npos);
+    EXPECT_EQ(json.find("\"member_words\""), std::string::npos);
+    EXPECT_EQ(json.find("\"member_rank_offset\""), std::string::npos);
+    EXPECT_NE(json.find("\"close_seals\":[17,0]"), std::string::npos);
     EXPECT_NE(json.find("\"core_id\":65"), std::string::npos);
     EXPECT_NE(json.find("\"cluster_workers\":[0,2,1]"), std::string::npos);
 }
 
 TEST(ProtocolCloseSealExport, ReadsEveryClusterAndTaskValueWithoutInterpretingCellPadding) {
     AicoreSchedulerLayout layout{};
-    ASSERT_TRUE(scheduler_plan_layout(2, 2, 2, &layout, false, 4, {6, 2, 2, 2}, true));
+    ASSERT_TRUE(scheduler_plan_layout(2, 2, 2, &layout, false, 8, {6, 2, 2, 2, 2}, true));
     scheduler_test::SchedulerStateBuffer storage(layout);
     auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(storage.base(), layout.task_metadata_offset);
     scheduler_test::BasicGraphBuffer<2> graph(2);
     for (uint32_t task = 0; task < 2; ++task) {
         graph.mixed(task, LaneMask(true, true, false));
         metadata[task].active_mask = LaneMask(true, true, false);
-        metadata[task].logical_block_num = 1;
-        metadata[task].flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_MIX;
-        metadata[task].trace_index_base = task * 2;
+        metadata[task].logical_block_num = 2;
+        metadata[task].flags =
+            SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_MIX | SCHEDULER_TASK_SPMD | SCHEDULER_TASK_SYNC_START;
+        metadata[task].trace_index_base = task * 4;
         metadata[task].timing_slot = -1;
         metadata[task].kernel_ids[0] = metadata[task].kernel_ids[1] = 1;
         metadata[task].kernel_ids[2] = UINT16_MAX;

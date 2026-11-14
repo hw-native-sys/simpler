@@ -25,7 +25,8 @@
 #include <vector>
 
 #include "scheduler/scheduler_ready.h"
-#include "ready_pool_plan.h"
+#include "task_catalog_plan.h"
+#include "prepared_execution_plan.h"
 #include "runtime_types.h"
 
 namespace scheduler_test {
@@ -155,18 +156,21 @@ struct FixtureStorage {
         EXPECT_TRUE(scheduler_plan_layout(
             task_count, task_count, 0, &layout, false, task_count * traces_per_task, spmd, protocol_profiling
         ));
+        prepared_capacity = layout.prepared.execution_count;
         if (extend_layout) extend_layout(layout);
         // Reserve backing once. The final metadata later determines the two
-        // actual capacities; together they can never exceed task_count.
-        ready_pool_begin = layout.total_size;
+        // actual capacities; together they can never exceed task_count. A
+        // one-entry second catalog covers the largest split-alignment padding.
+        catalog_begin = layout.total_size;
         std::vector<SchedulerTaskMetadata> upper_bound(task_count);
         for (auto &task : upper_bound) {
             task.flags = SCHEDULER_TASK_EXECUTABLE;
             task.active_mask = LaneMask::aic();
         }
-        SchedulerReadyPoolPlan reserve{};
-        if (!scheduler_plan_ready_pool(upper_bound, ready_pool_clusters(), ready_pool_begin, &reserve))
-            throw std::logic_error("cannot reserve fixture ready pool");
+        if (task_count > 1) upper_bound.back().active_mask = LaneMask::aiv0();
+        SchedulerTaskCatalogPlan reserve{};
+        if (!scheduler_plan_task_catalog(upper_bound, catalog_clusters(), catalog_begin, &reserve))
+            throw std::logic_error("cannot reserve fixture task catalog");
         layout.total_size = reserve.total_size;
         scheduler_state = std::make_unique<SchedulerStateBuffer>(layout);
         run_control = scheduler_state_at<SchedulerRunControl>(scheduler_state->base(), layout.run_control_offset);
@@ -185,8 +189,6 @@ struct FixtureStorage {
             context.callable_addresses_address = reinterpret_cast<uint64_t>(callable_addresses);
             context.callable_addresses_count = kFixtureCallableCount;
             context.graph_summary_offset = layout.graph_summary_offset;
-            context.dispatch_payload_offset =
-                layout.dispatch_payloads_offset + worker * SCHEDULER_PENDING_SLOT_COUNT * sizeof(DispatchPayload);
             context.graph_task_count = task_count;
             context.original_task_count = task_count;
             context.graph_view_version = SCHEDULER_GRAPH_VIEW_VERSION;
@@ -219,9 +221,43 @@ struct FixtureStorage {
                 scheduler_state_at<SchedulerTaskControl>(scheduler_state->base(), layout.task_controls_offset);
             controls[task].completion_state = scheduler_completion_initial_state(1);
         }
+        if (layout.prepared_layout_offset != 0) {
+            auto initial_layout = layout;
+            initial_layout.prepared.execution_count = task_count;
+            scheduler_state_at<SchedulerPreparedLayout>(scheduler_state->base(), layout.prepared_layout_offset)
+                ->execution_count = task_count;
+            EXPECT_TRUE(scheduler_init_prepared_execution_records(scheduler_state->base(), initial_layout, 0));
+        }
     }
 
-    uint32_t ready_pool_clusters() const {
+    bool prepare_calls(const SchedulerGraphView &graph) {
+        for (auto &view : test_graphs)
+            view = graph;
+        if (calls_prepared || layout.prepared_layout_offset == 0) return true;
+        for (uint64_t ref = 0; ref < layout.task_count; ++ref) {
+            const auto &meta = metadata[ref];
+            if (!scheduler_task_is_executable(meta.flags) || scheduler_task_is_inline(meta.flags)) continue;
+            SchedulerTaskPayloadArguments arguments{};
+            if (scheduler_parse_task_payload_arguments(graph, ref, &arguments) != SchedulerGraphResult::OK)
+                return false;
+            uint64_t functions[SUBTASK_SLOT_COUNT]{};
+            for (uint8_t lane = 0; lane < SUBTASK_SLOT_COUNT; ++lane) {
+                if (!meta.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
+                if (meta.kernel_ids[lane] >= kFixtureCallableCount) return false;
+                functions[lane] = callable_addresses[meta.kernel_ids[lane]];
+            }
+            if (!scheduler_prepare_host_calls(
+                    scheduler_state->base(), layout, reinterpret_cast<uint64_t>(scheduler_state->base()), ref,
+                    functions, reinterpret_cast<uint64_t>(arguments.tensors), arguments.scalars, arguments.tensor_count,
+                    arguments.scalar_count
+                ))
+                return false;
+        }
+        calls_prepared = true;
+        return true;
+    }
+
+    uint32_t catalog_clusters() const {
         return std::max<uint32_t>(
             1, static_cast<uint32_t>(
                    (test_contexts.size() + PLATFORM_CORES_PER_BLOCKDIM - 1) / PLATFORM_CORES_PER_BLOCKDIM
@@ -229,49 +265,65 @@ struct FixtureStorage {
         );
     }
 
-    // Call after finalizing metadata and before publishing any task. Replanning
-    // during a run would erase queue ownership, so preparation is explicit and
-    // may happen only once for this allocation.
-    void prepare_ready_pool() {
-        ASSERT_EQ(ready_pool_offset, 0u);
+    // The catalog and execution identities are frozen after metadata is finalized.
+    // This initialization precedes every execution claim in the allocation.
+    void prepare_catalog() {
+        ASSERT_EQ(task_catalog_offset, 0u);
+        uint64_t execution_count = 0;
+        for (uint64_t task = 0; task < layout.task_count; ++task) {
+            const auto &meta = metadata[task];
+            if (scheduler_task_is_executable(meta.flags) && !scheduler_task_is_inline(meta.flags))
+                execution_count += meta.logical_block_num * meta.active_mask.count();
+        }
+        ASSERT_LE(execution_count, prepared_capacity);
+        layout.prepared.execution_count = execution_count;
+        if (layout.prepared_layout_offset != 0)
+            scheduler_state_at<SchedulerPreparedLayout>(scheduler_state->base(), layout.prepared_layout_offset)
+                ->execution_count = execution_count;
+        const auto epoch =
+            scheduler_state_at<SchedulerGraphSummary>(scheduler_state->base(), layout.graph_summary_offset)->run_epoch;
+        ASSERT_TRUE(scheduler_init_prepared_execution_records(scheduler_state->base(), layout, epoch));
         auto *controls = scheduler_state_at<SchedulerTaskControl>(scheduler_state->base(), layout.task_controls_offset);
         for (uint64_t task = 0; task < layout.task_count; ++task) {
             const auto &meta = metadata[task];
             const uint32_t total = scheduler_task_is_executable(meta.flags) && !scheduler_task_is_inline(meta.flags) ?
                                        meta.logical_block_num * meta.active_mask.count() :
-                                       0;
+                                       1;
             controls[task].completion_state = scheduler_completion_initial_state(total);
         }
         const std::vector<SchedulerTaskMetadata> tasks(metadata, metadata + layout.task_count);
-        SchedulerReadyPoolPlan plan{};
-        ASSERT_TRUE(scheduler_plan_ready_pool(tasks, ready_pool_clusters(), ready_pool_begin, &plan));
-        ASSERT_GE(plan.header_offset, ready_pool_begin);
+        SchedulerTaskCatalogPlan plan{};
+        ASSERT_TRUE(scheduler_plan_task_catalog(tasks, catalog_clusters(), catalog_begin, &plan));
+        ASSERT_GE(plan.header_offset, catalog_begin);
         ASSERT_LE(plan.total_size, layout.total_size);
-        scheduler_init_ready_pool(scheduler_state->base(), plan);
-        ready_pool_offset = plan.header_offset;
+        scheduler_init_task_catalog(scheduler_state->base(), plan);
+        task_catalog_offset = plan.header_offset;
         scheduler_state_at<SchedulerGraphSummary>(scheduler_state->base(), layout.graph_summary_offset)
-            ->ready_pool_offset = ready_pool_offset;
+            ->task_catalog_offset = task_catalog_offset;
         for (auto &local : test_contexts)
-            local.config.ready_pool_offset = ready_pool_offset;
+            local.config.task_catalog_offset = task_catalog_offset;
         for (auto &local : local_states)
-            local.config.ready_pool_offset = ready_pool_offset;
-        scheduler_local_state.config.ready_pool_offset = ready_pool_offset;
+            local.config.task_catalog_offset = task_catalog_offset;
+        scheduler_local_state.config.task_catalog_offset = task_catalog_offset;
     }
 
-    // Queue/dispatch tests configure synthetic wire contexts directly. Snapshot
+    // Dispatch tests configure synthetic wire contexts directly. Snapshot
     // their immutable fields into the local state used by the operation under test.
     SchedulerLocalState *local_context(const SchedulerWorkerContext *context, SchedulerLocalState *local = nullptr) {
         if (local == nullptr) local = &test_contexts[context - contexts];
         if (local->profiling == nullptr) local->profiling = &test_profiles[context - contexts];
         auto &config = local->config;
-        config.dispatch_payloads_offset = static_cast<uint32_t>(layout.dispatch_payloads_offset);
         config.shared_context = context;
+        config.prepared =
+            layout.prepared_layout_offset == 0 ?
+                nullptr :
+                scheduler_state_at<SchedulerPreparedLayout>(scheduler_state->base(), layout.prepared_layout_offset);
         auto &graph = test_graphs[context - contexts];
         if (graph.task_count != context->graph_task_count) graph.task_count = context->graph_task_count;
         config.graph = &graph;
         config.task_controls_offset = context->task_controls_offset;
         config.task_metadata_offset = context->task_metadata_offset;
-        config.ready_pool_offset = ready_pool_offset;
+        config.task_catalog_offset = task_catalog_offset;
         local->profiling->trace_cells_offset = context->trace_cells_offset;
         local->profiling->activity_buffers_offset = context->activity_buffers_offset;
         config.worker_contexts_offset = context->worker_contexts_offset;
@@ -296,8 +348,10 @@ struct FixtureStorage {
     std::vector<SchedulerGraphView> test_graphs;
 
     AicoreSchedulerLayout layout{};
-    uint64_t ready_pool_begin{0};
-    uint64_t ready_pool_offset{0};
+    uint64_t prepared_capacity{0};
+    bool calls_prepared{false};
+    uint64_t catalog_begin{0};
+    uint64_t task_catalog_offset{0};
     std::unique_ptr<SchedulerStateBuffer> scheduler_state;
     SchedulerRunControl *run_control{nullptr};
     SchedulerWorkerContext *contexts{nullptr};

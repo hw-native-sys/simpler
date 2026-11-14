@@ -2934,8 +2934,8 @@ TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpUsesCurrentAicoreNodesAndCharged
         runtime.dev.dump_args_level = static_cast<uint32_t>(DumpArgsLevel::FULL);
         ChipStorageTaskArgs args;
         ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
-        ASSERT_EQ(runtime.pending_publication().prerequisites.size(), 1u);
-        const auto &region = runtime.pending_publication().prerequisites.front();
+        ASSERT_EQ(runtime.pending_publication().prerequisites.size(), entry == native_scalar_dump_orch_entry ? 2u : 1u);
+        const auto &region = runtime.pending_publication().prerequisites.back();
         const auto context_offset =
             runtime.dev.scheduler_bootstrap.worker_context_base - reinterpret_cast<uint64_t>(region.device_target);
         const auto *context = reinterpret_cast<const SchedulerWorkerContext *>(
@@ -3006,7 +3006,7 @@ TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpUsesCurrentAicoreNodesAndCharged
         };
         SchedulerGraphAccess graph(view);
         if (entry != scalar_dump_orch_entry)
-            ASSERT_EQ(scheduler_bind_graph_arguments(graph, expected.task_ref), SchedulerGraphBindingError::NONE);
+            ASSERT_EQ(scheduler_observe_graph_arguments(graph, expected.task_ref), SchedulerGraphBindingError::NONE);
         SchedulerTaskPayloadArguments actual{};
         ASSERT_EQ(scheduler_parse_task_payload_arguments(graph, expected.task_ref, &actual), SchedulerGraphResult::OK);
         EXPECT_EQ(actual.scalar_count, expected.scalar_count);
@@ -3032,8 +3032,8 @@ TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpExcludesPendingInlineControlOper
         runtime.dev.dump_args_level = static_cast<uint32_t>(DumpArgsLevel::FULL);
         ChipStorageTaskArgs args;
         ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
-        ASSERT_EQ(runtime.pending_publication().prerequisites.size(), 1u);
-        const auto &region = runtime.pending_publication().prerequisites.front();
+        ASSERT_EQ(runtime.pending_publication().prerequisites.size(), native ? 2u : 1u);
+        const auto &region = runtime.pending_publication().prerequisites.back();
         const auto context_offset =
             runtime.dev.scheduler_bootstrap.worker_context_base - reinterpret_cast<uint64_t>(region.device_target);
         const auto *context = reinterpret_cast<const SchedulerWorkerContext *>(

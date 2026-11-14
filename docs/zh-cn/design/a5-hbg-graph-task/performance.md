@@ -131,7 +131,7 @@ B0 的 `.rodata` 构建失败及当时缺失的延迟数据仍按原始证据记
 | 观察 | 优先检查 | 可考虑的改动及约束 |
 | ---- | -------- | ------------------ |
 | bind 增长 | Definition validation、N-node 初始化、H2D、重复复制 | unique-definition 计划复用、减少重复扫描；保持完整拓扑验证 |
-| 首 child 晚 | bootstrap、ENTER 排队、首次参数绑定、cooperative admission | 优化只读访问与控制预算；不去掉 bootstrap 屏障 |
+| 首 child 晚 | bootstrap、ENTER 排队、Call 观察、cooperative admission | 优化只读访问与控制预算；不去掉 bootstrap 屏障 |
 | 短 child 间隙大 | fanin 扫描、ready steal、参数 bytes/flush | accessor 快路、按逻辑任务一次绑定；可测有界提前准备，先补所有权证明 |
 | MIX/SPMD 吞吐低 | claim/commit、membership、release、wave、order head blocking | 缩短锁内工作、提高服务公平性；不拆分全局 admission 域 |
 | EXIT/tail 长 | 全 sink join、control backlog、completion flush、LocalDone | 调整有界服务与真实完成批量发布；不提前释放或少等 sink |

@@ -1237,7 +1237,9 @@ target_sources(test_a5_hbg_abort_aicore_startup PRIVATE
     ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_ordinary.cpp
     ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_native.cpp
     ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_ordinary_profiled.cpp
-    ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_native_profiled.cpp)
+    ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_native_profiled.cpp
+    ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_ordinary_timing.cpp
+    ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_native_timing.cpp)
 target_compile_definitions(test_a5_hbg_abort_aicore_startup PRIVATE TEST_RESIDENT_STARTUP=1)
 foreach(arch a2a3 a5)
     foreach(tag hbg tmr)

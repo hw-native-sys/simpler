@@ -358,17 +358,26 @@ TensorMap maps tensor regions to producer task IDs. For every task:
 3. OUTPUT/INOUT regions register the new task as producer.
 4. Each producer tracks its highest consumer local ID for completion metadata.
 
-The public task payload stores fanins. For resident scheduling, Host converts
-these through the unified graph accessor into a deduplicated fanout CSR and
-initial remaining counters, excluding Host-completed edges, when selecting the CSR candidate. The immutable
-header/CSR and atomic-only counters occupy separate 64-byte-aligned regions.
+The public task payload stores fanins. Resident physical kernels observe their
+predecessors through the unified graph accessor. Host creates deduplicated fanout
+CSR rows and remaining counters only for control/inline consumers, excluding
+Host-completed edges. The immutable header/CSR and atomic-only counters occupy
+separate aligned regions.
 
 ## 6. Boot Classification and Dependencies
 
 The Host maker constructs deduplicated fanout CSR rows and remaining counters
-by default. Resident completion traverses them synchronously. Valid images
-without a dependency table use synchronous wake lists: bootstrap registers
-each blocked node on its first unfinished producer. Invalid storage is rejected,
+for control/inline consumers. Resident completion traverses them synchronously.
+Physical kernels never enter this producer notification path: Host initializes
+their per-task availability, and each worker rotates through its engine catalog
+with four nonexclusive observation candidates. A cached prefix advances only
+after atomic confirmation of logical DONE. Graph children include ENTER in this
+proof; async producers become DONE only after their condition join. Discovery
+continues with a full waiting window and owns no slot, block or admission credit.
+
+Valid images without a dependency table use synchronous wake lists for
+control/inline consumers only: bootstrap registers each blocked control/inline
+node on its first unfinished producer. Invalid storage is rejected,
 not routed through the other algorithm. Neither path exports a continuation.
 
 A wake-list resolver atomically closes its producer head and owns the detached
@@ -388,7 +397,7 @@ contract. Complete resolver timing includes traversal, routing and publication.
 
 Native control service handles at most eight nodes per invocation and fully
 resolves each node. Async FINISH holds its exclusive lease until TaskDone and
-all successor responsibilities are published, then terminates the lease and
+all control/inline successor responsibilities are published, then terminates the lease and
 clears its directory bit. Async condition CHECK retains its bounded polling;
 FINISH has no GM progress record and LocalState has no resolver continuation.
 
@@ -416,7 +425,8 @@ lanes therefore participate, and bootstrap partitions the task scan across their
 Schedulers. This scan parallelism is not an isolated performance measurement.
 
 The scan also validates and constructs each cooperative task's immutable
-admission record and member bitmap. INITIALIZED grants no Ready ownership,
+admission record and validates the actual topology once per worker. Membership
+is derived from immutable roles, without a per-task bitmap. INITIALIZED grants no Ready ownership,
 order key or block. The completed scan gate gives every Scheduler proof
 that these records belong to the current run. Dependency routing remains dynamic:
 the unique Ready owner retains the candidate in private pending storage and
@@ -429,7 +439,7 @@ The validation contract distinguishes initialization from publication:
 
 | Boundary | Checks |
 | -------- | ------ |
-| Bootstrap, before publishing INITIALIZED | Initial claim/next counters, completion progress and seal are zero; the packed completion total remains intact; record shape, flags and storage offsets match task metadata; member storage is empty; topology determines the frozen bitmap. |
+| Bootstrap, before publishing INITIALIZED | Initial claim/next counters, completion progress and seal are zero; the packed completion total remains intact; record shape, flags and storage offsets match task metadata; actual topology establishes the compatible role counts. |
 | Each ready claim | Ready pop or direct resolve already grants unique ownership; a live run/error/epoch check and an empty private pending slot permit the local transfer. No shared phase or per-task lock is published. |
 | Every commit attempt | A busy global lock returns RETRY after checking the active run. Under the acquired lock, active run/error, INITIALIZED, record epoch/order and log capacity are checked before publishing the record, ADMITTED and tail. Only its owner releases the lock. |
 | Member adoption | The log task, run epoch, order key and ADMITTED publication are checked before the frozen bitmap is consumed. |
@@ -452,55 +462,47 @@ assignment and predecessor sequences preserve descriptor ownership when the
 resource mask changes between groups. This task-level selection does not remove
 workers from bootstrap or shutdown.
 
-Ordinary single-type SPMD tasks admit at most one eligible worker per block.
-Their frozen membership is a cyclic interval in ascending worker-index order,
-starting at `member_rank_offset % eligible_count` when the block count is
-smaller than the eligible set. Host computes the prefix of ordinary non-sync
-SPMD blocks separately for AIC and AIV, in task-ref order, and stores it in
-the existing 64-byte admission header. Other resource types, single-block
-work, MIX and sync-start do not advance that prefix. This distributes independent small tasks across
-workers without changing block ownership or completion accounting. MIX and
-`sync_start` retain their full eligible membership. The ordinary and native Graph tags remain v10 and v11.
-Both carry the current subtask-completion fields, per-resource-type member
-prefix and cooperative admission. Historical field layouts are rejected.
-Each dispatch subtask contributes once; MIX resource retirement does not
-contribute again. Execution identities use the strict v1 contract:
-`(run_epoch, task_ref, block_idx, subtask_slot)` identifies an execution;
-worker and pending slot identify its placement. Worker event sequences prove
-that retirement precedes the next payload publication and permit on a reused slot.
+Ordinary single-type SPMD bypasses admission. A ready worker reserves a block
+through the task-local counter, then claims that execution's immutable Host Call.
+Ordinary single-block tasks arbitrate directly at the Call CAS. Discovery is
+nonexclusive and grants no block, slot or kernel-entry permit. MIX and sync-start
+retain their full compatible resource membership; partial sync-start winners are
+selected by dynamic tickets, not by a Host-planned rank interval.
 
-A completion resolver may retain one dependency-ready cooperative successor in a
-persistent admission candidate, independent of the completing core's type. It
-attempts the ordinary claim/prepare/commit sequence before returning; a busy
-commit lock retains pending ownership for the next finite scheduler pass.
-A full candidate set sends successors through the shared queues. This does not
-reserve an execution slot, bypass any fanin, or grant a kernel entry permit.
-Ordinary direct refill remains limited to the executing core type and excludes
-MIX. Queued tasks preserve their queue's FIFO order; already-ready independent
-tasks do not impose an ordering on this direct admission.
+The protocol export describes task roles and the actual admission record offset;
+it does not export a member bitmap or rank prefix. Execution identities use
+`(run_epoch, task_ref, block_idx, subtask_slot)`; worker and pending slot identify
+placement. Worker event sequences prove that retirement precedes the next
+payload publication and permit on a reused slot. Each dispatch subtask
+contributes once; MIX resource retirement does not contribute again.
 
-Kernel Ready work uses exactly two shared ticket queues: AIC and MIX tasks
-enter the AIC queue; ordinary AIV tasks enter the AIV queue. Each worker probes
-only its own core type. The host sizes capacity from logical task counts and
-publishes a version-11 header. Queue head, tail and entries use atomic-only
-publication words; entries remain immutable until the run fence. Native control
-nodes retain their separate control inboxes.
+Physical-kernel discovery uses exactly two immutable catalogs: AIC/MIX and AIV.
+Each worker rotates through its own architecture's complete catalog. Host-seeded
+AVAILABLE means discoverable, not dependency-ready. Four unowned observations
+cache the confirmed logical-DONE prefix; discovering new entries continues even
+when the window or execution slots are full. A positive dependency proof precedes
+the final Call, block or cooperative-publication ownership operation. Only
+control/inline consumers retain producer publication and native control inboxes.
+There is no shared business queue head or FIFO contract between independent tasks.
 
-A ticket reservation and publication complete in one call. Synchronous
-FINISH/control resolution uses a private eight-ref publication buffer;
-no ready-pool publication is held in a worker-local pending list. Historical
-alternative algorithms and the requirements for implementing them again are
-recorded in the [queue design](../../../../../docs/zh-cn/design/a5-hbg-graph-task/ready-queue-design.md).
+A ready cooperative owner commits its admission through the global ordered log;
+a busy lock retains only that ready publication responsibility. Members adopt the
+committed record in order and cache the static claim mode, resource mask, lane
+mapping and close-seal address. Dynamic epoch, order, block/group identity,
+arrival/release, cancellation and final-entry checks remain authoritative.
 
-Business-ready ticket positions are shared GM state; a successful head CAS
-transfers task ownership to one worker. Native control inboxes retain their
-separate atomic endpoints and task links.
-Run entry validates the immutable graph, worker topology and queue layout.
-Internal helpers require those live bindings instead of repeating pointer and
-configuration checks. Shared queue references and resumed cursor state are
-validated when consumed; dynamic head, count, epoch and ownership checks remain.
-Ticket claiming uses the shared queue directly and does not take a scheduler
-count parameter.
+The MIX group descriptor carries only dynamic epoch/task/order/group identity,
+block/cluster and each lane's predecessor sequence in one 64B DCache line. Its
+publication word starts in a separate 128B region. Writers and readers retain
+the required cache maintenance and tail DSB; atomic authorization does not itself
+observe payload data. Static shape and lane mapping come from the adopted record
+and are included in DFX from that source.
+
+Run entry validates the immutable graph, actual worker topology and catalog
+layout. Internal helpers reuse those live bindings; they still validate consumed
+references, mutable counters and ownership. EXIT may forget a completed ordinary
+hint only when it holds no reserved block, Call or slot. Owned work, admission
+responsibilities and async FINISH leases must all close before acknowledgement.
 
 Candidate classification reads the immutable metadata flags. Host construction
 and record validation establish that SPMD means more than one logical block;

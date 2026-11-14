@@ -76,19 +76,6 @@ def _capture():
             )
         },
     )
-    for index in range(34):
-        task_id = hbg_global(index)
-        start = 100 + index * 20
-        capture.task(task_id=task_id, start=start + 4, end=start + 5)
-        if index < 33:
-            capture.aicore_sched_phase(phase="state_probe", task_id=task_id, start=start, end=start + 1)
-            kind = "dispatch"
-        else:
-            kind = "refill"
-        capture.aicore_sched_phase(phase=kind, task_id=task_id, start=start + 2, end=start + 3)
-        capture.aicore_sched_phase(phase="complete", task_id=task_id, start=start + 6, end=start + 7)
-        capture.aicore_sched_phase(phase="resolve", task_id=task_id, start=start + 8, end=start + 9)
-    capture.aicore_sched_phase(phase="idle", start=800, end=801)
     capture.aicore_sched_phase(
         phase="scalar_window",
         start=1,
@@ -97,14 +84,35 @@ def _capture():
             "scalar_schema": 2,
             "scalar_depth": 0,
             "scalar_calls": 1,
-            "function_min_cycles": 50,
+            "function_min_cycles": 0,
             "iterations_detailed": True,
         },
     )
+    for index in range(34):
+        task_id = hbg_global(index)
+        start = 100 + index * 20
+        capture.task(task_id=task_id, start=start + 4, end=start + 5)
+        capture.aicore_sched_phase(phase="state_probe", task_id=task_id, start=start, end=start + 1)
+        capture.aicore_sched_phase(phase="dispatch", task_id=task_id, start=start + 2, end=start + 3)
+        capture.aicore_sched_phase(phase="complete", task_id=task_id, start=start + 6, end=start + 7)
+        for phase, begin, end, depth in (
+            ("scalar_execution_token_refill", 0, 1, 1),
+            ("scalar_execution_token_receive", 0, 1, 2),
+            ("scalar_execution_token_fanin", 1, 2, 1),
+            ("scalar_execution_token_dispatch", 2, 3, 1),
+        ):
+            capture.aicore_sched_phase(
+                phase=phase,
+                task_id=task_id,
+                start=start + begin,
+                end=start + end,
+                metrics={"scalar_depth": depth, "scalar_calls": 1},
+            )
+    capture.aicore_sched_phase(phase="idle", start=800, end=801)
     return capture.build()
 
 
-def test_smoke_accepts_pool_dispatch_and_direct_refill_launches(validate_capture):
+def test_smoke_accepts_execution_token_acquisition_and_dispatch(validate_capture):
     validate_capture(_capture())
 
 
@@ -121,6 +129,8 @@ def test_smoke_accepts_pool_dispatch_and_direct_refill_launches(validate_capture
         "missing_scalar_window",
         "scalar_schema",
         "removed_worksteal",
+        "removed_refill",
+        "removed_resolve",
     ),
 )
 def test_smoke_rejects_incomplete_or_inconsistent_launch_evidence(validate_capture, corruption):
@@ -148,8 +158,8 @@ def test_smoke_rejects_incomplete_or_inconsistent_launch_evidence(validate_captu
         stream["metrics"] = []
     elif corruption == "scalar_schema":
         stream["metrics"][0]["scalar_schema"] = 1
-    elif corruption == "removed_worksteal":
-        launch["kind"] = "worksteal"
+    elif corruption.startswith("removed_"):
+        launch["kind"] = corruption.removeprefix("removed_")
     else:
         launch["start_cycles"] -= 2
     error = ValueError if corruption == "scalar_schema" else AssertionError

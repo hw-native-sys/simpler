@@ -95,24 +95,13 @@ async FINISH在join满足后获得唯一lease，同步执行TaskDone与后继传
 
 ## 参数绑定与资源准入
 
-Host 只规划参数地址；AICore 使用 Definition record 和本次实例 boundary 生成 kernel ABI 参数。
-绑定过程不执行 kernel、不等待 producer 输出值、不发现依赖。它必须是有限的纯重定位/复制操作。
-bootstrap 按既有 node 分区并行绑定全部 CHILD_KERNEL，在 scan barrier 打开前完成；
-未取得 ready 的节点也可以准备描述符，但仍不能读取 predicate 值或执行 kernel。
-例如 PARAM Tensor 继承本次输入的地址和 origin，SUB_TASK Tensor 绑定本实例 heap；
-inherited scalar 取本次 boundary scalar，固定 scalar 取只读 Definition。
+Host 根据 Definition 与本次实例 boundary 生成参数镜像和完整 immutable Call，
+经 metadata publication 在 launch 前交付。Tensor 内容和 predicate 值不在准备阶段读取；
+资源准入、依赖与最终执行许可仍在 Device 上处理。
 
-| 路径 | 唯一参数写者 | 绑定位置 | 消费者 |
-| ---- | ------------ | -------- | ------ |
-| 单 lane、单 block | bootstrap node 分区 owner | scan arrival 前 | ready owner 首次观察参数后派发 |
-| SPMD、MIX、sync_start | bootstrap node 分区 owner | scan arrival 前 | 固定 membership 中需要尝试领取或执行 block 的 worker |
-| predicated 单 lane、单 block | bootstrap node 分区 owner | 只提前绑定地址；取值仍在 ready 后 | 跳过路径或本 worker |
-| ENTER/EXIT/DUMMY | 无 | 无参数绑定 | 无 |
-
-每个 bootstrap 分区互不相交，child 参数的唯一写者由 node_ref 确定。每次绑定执行完整边界检查、
-精确范围 writeback 和 DDR barrier；这些操作完成后才增加 scan arrival，最后到达者打开 scan gate。
-现有所有 ready 消费路径均在该 gate 后进入，因此无须逐 child 增加 ARG_PREPARING 锁或发布位。
-绑定失败锁存错误，该分区不报告成功到达；其他 worker 在等待 gate 时沿现有 error/watchdog 退出。
+参数唯一写者、Host 地址与设备地址的区分、包领取、park/resume 和 cache 合同统一见
+[HBG 调度优化开发参考](build-execute-separation.md)。Host 准备失败阻止启动；
+Device 不再进行 child 参数绑定或缺失 Call 的补建。
 
 普通 ready owner 可能不是参数写者，首次准备 payload 前必须 invalidate 参数范围并执行 barrier。
 私有 pending candidate 用 `args_observed` 保存已观察状态，随 task_ref park/restore，最终释放或 run 失败才清除。
@@ -189,10 +178,8 @@ legacy 每任务整 cache 刷新曾掩盖该输入约束；native 不以恢复�
 每次 run 的 args_backing 不同，复用物理 allocation 时启动和首次 adopt 都要按新 epoch 重新观察。
 模型测试只验证逻辑 interleaving；真实硬件的 dcci/barrier 顺序仍须 onboard 验证。
 
-bootstrap 并行绑定 `p2-bootstrap-bind` 已通过 93 个 C++ 目标、65 项 A5sim、6 个 Graph 真机目标及独立协议审计；
-完整 Qwen out/K/V 通过，单批 Device 为 56.663 ms，仍明显慢于历史主线 29.478 ms。
-它把 O(N) 参数准备移入启动阶段，L3 的单 worker bootstrap 中位数为 570.739 µs；
-详见[候选测量与限制](qwen-performance.md)。最终全量功能、故障和性能验收仍须完成。
+当前功能与性能验收要求见[统一开发参考](build-execute-separation.md)，
+不能用不同参数准备路径的测试结果代替当前实现的验证。
 
 ## ready 为空时的持续进展
 

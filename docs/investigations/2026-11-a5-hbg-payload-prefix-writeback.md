@@ -49,3 +49,43 @@ Only the AICore runtime binary changes; Host and AICPU hashes match the control.
 The AICore build takes 187.11 seconds with a concurrency ceiling of 16.
 Frozen libraries, source diff, per-round samples, audits and reports are retained
 locally under `outputs/a5-hbg-schedule-8ms/payload-prefix/`.
+
+## Shared PreparedCall producer and consumer experiment, 2026-11-13
+
+The Build/Execute implementation `aabab11ec` uses a separate 512-byte immutable
+PreparedCall. A second candidate maintained its header, populated argument
+prefix, and fixed context-pointer tail on both the builder and receiver. Bits
+40–47 of the atomic publication word carried the prefix extent; only a successful
+Claim authorized decoding that extent and refreshing the data. Both trailing
+DSBs and the existing Binding publication remained in place.
+
+The existing DSV4.1 suite used one warmup and ten measured runs per case, with
+full `chip.run.runner_run.device_wall` timing. The figures below are sums of
+fourteen non-communication case means, not one forward duration:
+
+| Version | Sum (ms) |
+| ------- | -------: |
+| Pre-change main `2f61d0c6c` | 19.9902648 |
+| Shared Call with full maintenance | 20.5123812 |
+| Shared Call with bounded maintenance | 20.6372252 |
+
+The candidate increased this aggregate by 0.6086% against the shared-Call control
+and by 3.2364% against pre-change main. The samples use different allocation
+times, and the control's SWA/lib row also used a different device; this does not
+prove a small regression mechanism. It supplies no evidence for retaining the
+added extent protocol. All eighteen numerical checks passed. The four
+communication cases remain reported but excluded from the performance gate.
+Six existing CPU targets passed 1681 GoogleTest cases;
+the A5 IR scan covered 14 translation units without findings.
+
+The candidate is withdrawn. Existing SWA/lib L3 evidence places most first-launch
+handoff time in admission publication and worker adoption, while Call receive
+maintenance occupies a much smaller part of those intervals. That evidence
+does not bound other blocks or predict an L0 percentage; it explains why an
+instruction-count reduction alone was insufficient grounds for this experiment.
+Further proposals must first identify the actual critical path in swimlanes.
+
+Evidence is under `artifacts/build-execute-separation/`: `valid-lines-rejected.patch`,
+`benchmark18-valid-lines/`, `runtime-valid-lines/`, `cpp-valid-lines-results.json`,
+`ir-valid-lines.log`, and `critical-gap-audit/`. The shared-Call control is retained
+in `runtime-targeted-dcci/` and `benchmark18/`.

@@ -14,6 +14,7 @@
 #include <cstdint>
 
 #include "scheduler_protocol_types.h"
+#include "scheduler_prepared_layout.h"
 
 constexpr uint32_t SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING = 1;
 constexpr uint32_t SCHEDULER_RUNTIME_MODE_RESIDENT_READY = 2;
@@ -23,6 +24,7 @@ struct SchedulerSpmdRequirements {
     uint64_t cluster_count{0};
     uint64_t cooperative_task_count{0};
     uint64_t mix_task_count{0};
+    uint64_t sync_mix_task_count{0};
 };
 
 struct AicoreSchedulerLayout {
@@ -32,10 +34,8 @@ struct AicoreSchedulerLayout {
     uint64_t aiv_task_count;
     uint64_t run_control_offset;
     uint64_t native_readonly_end_offset;
-    uint64_t control_inboxes_offset;
     uint64_t aicpu_lifecycle_traces_offset;
     uint64_t worker_contexts_offset;
-    uint64_t dispatch_payloads_offset;
     uint64_t task_metadata_offset;
     uint64_t task_controls_offset;
     uint64_t trace_cells_offset;
@@ -44,6 +44,8 @@ struct AicoreSchedulerLayout {
     uint64_t scalar_records_offset;
     uint64_t graph_summary_offset;
     uint64_t async_layout_offset;
+    uint64_t prepared_layout_offset;
+    SchedulerPreparedLayout prepared;
     uint64_t executable_task_count;
     uint64_t executable_subtask_count;
     uint64_t aic_worker_demand;
@@ -52,7 +54,6 @@ struct AicoreSchedulerLayout {
     uint64_t admission_control_offset;
     uint64_t admission_records_offset;
     uint64_t admission_record_stride;
-    uint64_t admission_member_word_count;
     uint64_t admission_log_offset;
     uint64_t group_mailboxes_offset;
     uint64_t mix_close_seals_offset;

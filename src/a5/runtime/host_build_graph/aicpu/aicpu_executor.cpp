@@ -34,7 +34,7 @@
 #include "host_build_graph/shared_memory.h"
 #include "runtime.h"
 #include "scheduler/scheduler_types.h"
-#include "scheduler/scheduler_ready_pool.h"
+#include "scheduler/scheduler_task_catalog.h"
 #include "scheduler/scheduler_watchdog.h"
 #include "spin_hint.h"
 
@@ -78,7 +78,7 @@ static bool wait_with_scheduler_timeout(Predicate predicate) {
     return true;
 }
 
-static void log_resident_ready_pool(void *base, const SchedulerWorkerContext &context) {
+static void log_resident_task_catalog(void *base, const SchedulerWorkerContext &context) {
     const uint64_t state_bytes = context.scheduler_state_bytes;
     const auto address = reinterpret_cast<uintptr_t>(base);
     auto range_valid = [&](uint64_t offset, uint64_t count, uint64_t stride, uint64_t alignment, uint64_t limit) {
@@ -88,92 +88,76 @@ static void log_resident_ready_pool(void *base, const SchedulerWorkerContext &co
         !range_valid(
             context.graph_summary_offset, 1, sizeof(SchedulerGraphSummary), alignof(SchedulerGraphSummary), state_bytes
         )) {
-        LOG_ERROR("A5 HBG ready pool snapshot: invalid state or graph summary range");
+        LOG_ERROR("A5 HBG task catalog snapshot: invalid state or graph summary range");
         return;
     }
     const auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, context.graph_summary_offset);
     cache_invalidate_range(summary, sizeof(*summary));
     rmb();
-    const uint64_t pool_offset = summary->ready_pool_offset;
+    const uint64_t pool_offset = summary->task_catalog_offset;
     if (!range_valid(
-            pool_offset, 1, sizeof(SchedulerReadyPoolHeader), alignof(SchedulerReadyPoolHeader), state_bytes
+            pool_offset, 1, sizeof(SchedulerTaskCatalogHeader), alignof(SchedulerTaskCatalogHeader), state_bytes
         )) {
-        LOG_ERROR("A5 HBG ready pool snapshot: invalid header offset=%" PRIu64, pool_offset);
+        LOG_ERROR("A5 HBG task catalog snapshot: invalid header offset=%" PRIu64, pool_offset);
         return;
     }
-    const auto *shared_pool = scheduler_state_at<SchedulerReadyPoolHeader>(base, pool_offset);
+    const auto *shared_pool = scheduler_state_at<SchedulerTaskCatalogHeader>(base, pool_offset);
     cache_invalidate_range(shared_pool, sizeof(*shared_pool));
     rmb();
     const auto pool = *shared_pool;
     const uint64_t limit = pool.storage_end_offset;
-    const uint64_t descriptor_bytes = SCHEDULER_READY_QUEUE_COUNT * sizeof(SchedulerReadyPoolDescriptor);
-    const uint64_t control_bytes = SCHEDULER_READY_QUEUE_COUNT * sizeof(SchedulerTicketQueue);
-    if (pool.version != SCHEDULER_READY_POOL_VERSION || pool.task_count != context.graph_task_count ||
-        pool.entry_count > pool.task_count || limit > state_bytes ||
-        pool.descriptors_offset < pool_offset + sizeof(pool) ||
+    const uint64_t descriptor_bytes = SCHEDULER_EXECUTION_ENGINE_COUNT * sizeof(SchedulerTaskCatalogDescriptor);
+    if (pool.version != SCHEDULER_TASK_CATALOG_VERSION || pool.task_count != context.graph_task_count ||
+        pool.entry_count > pool.task_count || pool.control_count > pool.task_count - pool.entry_count ||
+        limit > state_bytes || pool.descriptors_offset < pool_offset + sizeof(pool) ||
         !range_valid(
-            pool.descriptors_offset, SCHEDULER_READY_QUEUE_COUNT, sizeof(SchedulerReadyPoolDescriptor),
+            pool.descriptors_offset, SCHEDULER_EXECUTION_ENGINE_COUNT, sizeof(SchedulerTaskCatalogDescriptor),
             SCHEDULER_STATE_ALIGNMENT, limit
-        ) ||
-        pool.controls_offset < pool.descriptors_offset + descriptor_bytes ||
-        !range_valid(
-            pool.controls_offset, SCHEDULER_READY_QUEUE_COUNT, sizeof(SchedulerTicketQueue), SCHEDULER_STATE_ALIGNMENT,
-            limit
         )) {
-        LOG_ERROR("A5 HBG ready pool snapshot: invalid header or queue table");
+        LOG_ERROR("A5 HBG task catalog snapshot: invalid header or catalog table");
         return;
     }
-    const auto *shared_descriptors = scheduler_state_at<SchedulerReadyPoolDescriptor>(base, pool.descriptors_offset);
+    const auto *shared_descriptors = scheduler_state_at<SchedulerTaskCatalogDescriptor>(base, pool.descriptors_offset);
     cache_invalidate_range(shared_descriptors, descriptor_bytes);
     rmb();
-    SchedulerReadyPoolDescriptor descriptors[SCHEDULER_READY_QUEUE_COUNT]{};
-    uint64_t cursor = pool.controls_offset + control_bytes;
+    SchedulerTaskCatalogDescriptor descriptors[SCHEDULER_EXECUTION_ENGINE_COUNT]{};
+    uint64_t cursor = pool.descriptors_offset + descriptor_bytes;
     uint64_t entries = 0;
-    for (uint32_t queue = 0; queue < SCHEDULER_READY_QUEUE_COUNT; ++queue) {
+    for (uint32_t queue = 0; queue < SCHEDULER_EXECUTION_ENGINE_COUNT; ++queue) {
         descriptors[queue] = shared_descriptors[queue];
         const auto &descriptor = descriptors[queue];
         if (descriptor.capacity > pool.task_count - entries || descriptor.entries_offset < cursor ||
-            !range_valid(
-                descriptor.entries_offset, descriptor.capacity, sizeof(SchedulerTicketEntry),
-                alignof(SchedulerTicketEntry), limit
-            )) {
-            LOG_ERROR("A5 HBG ready pool snapshot: invalid queue=%u descriptor", queue);
+            !range_valid(descriptor.entries_offset, descriptor.capacity, sizeof(int64_t), alignof(int64_t), limit)) {
+            LOG_ERROR("A5 HBG task catalog snapshot: invalid engine=%u descriptor", queue);
             return;
         }
         entries += descriptor.capacity;
-        cursor = descriptor.entries_offset + descriptor.capacity * sizeof(SchedulerTicketEntry);
+        cursor = descriptor.entries_offset + descriptor.capacity * sizeof(int64_t);
     }
     if (entries != pool.entry_count) {
-        LOG_ERROR("A5 HBG ready pool snapshot: inconsistent entry count");
+        LOG_ERROR("A5 HBG task catalog snapshot: inconsistent entry count");
         return;
     }
-    const auto *controls = scheduler_state_at<SchedulerTicketQueue>(base, pool.controls_offset);
-    for (uint32_t queue = 0; queue < SCHEDULER_READY_QUEUE_COUNT; ++queue) {
-        const auto &descriptor = descriptors[queue];
-        cache_invalidate_range(&controls[queue], sizeof(controls[queue]));
+    for (uint32_t engine = 0; engine < SCHEDULER_EXECUTION_ENGINE_COUNT; ++engine) {
+        const auto &descriptor = descriptors[engine];
+        const auto *refs = scheduler_state_at<int64_t>(base, descriptor.entries_offset);
+        cache_invalidate_range(refs, descriptor.capacity * sizeof(int64_t));
         rmb();
-        const uint64_t head = controls[queue].head;
-        const uint64_t reserved_tail = controls[queue].reserved_tail;
-        int64_t head_ref = SCHEDULER_TASK_REF_INVALID;
-        if (head < descriptor.capacity) {
-            const auto *entry = scheduler_state_at<SchedulerTicketEntry>(base, descriptor.entries_offset) + head;
-            cache_invalidate_range(entry, sizeof(*entry));
-            rmb();
-            head_ref = entry->task_ref;
+        for (uint64_t index = 0; index < descriptor.capacity; ++index) {
+            const int64_t ref = refs[index];
+            if (ref < 0 || static_cast<uint64_t>(ref) >= pool.task_count) {
+                LOG_ERROR("A5 HBG task catalog: invalid engine=%u index=%" PRIu64, engine, index);
+                return;
+            }
         }
-        // This is a read-only snapshot while publishers and consumers can move.
-        // Invalidation never writes back the queues' atomic-only cache lines.
         LOG_ERROR(
-            "A5 HBG ready pool: queue=%u head=%" PRIu64 " reserved_tail=%" PRIu64 " capacity=%" PRIu64
-            " head_ref=%" PRId64,
-            queue, head, reserved_tail, descriptor.capacity, head_ref
+            "A5 HBG task catalog: engine=%u entries=%" PRIu64 " control_nodes=%" PRIu64, engine, descriptor.capacity,
+            pool.control_count
         );
     }
 }
 
-// A stalled run leaves its state still: the tasks that never finished keep the
-// fields that say what they were waiting for. Naming them is what separates a
-// waiter nobody woke from a task that was never routed at all.
+// The AICores may still advance while these non-owning snapshots are collected.
 static void log_unfinished_tasks(Runtime *runtime) {
     SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
     if (context == nullptr) return;
@@ -183,71 +167,52 @@ static void log_unfinished_tasks(Runtime *runtime) {
     auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(scheduler_state_base, context->task_metadata_offset);
     const uint64_t count = context->graph_task_count;
     const auto graph = aicore_scheduler_graph_view(*context);
-    uint64_t reported = 0;
     struct TaskSnapshot {
         uint64_t task;
-        int64_t state;
-        int64_t wake_head;
-        int64_t next_waiter;
+        uint64_t completion;
+        uint64_t next_block;
+        uint64_t parked;
     };
     TaskSnapshot snapshots[64];
     uint64_t snapshot_count = 0;
-    for (uint64_t task = 0; task < count; ++task) {
+    for (uint64_t task = 0; task < count && snapshot_count < 64; ++task) {
         if (graph.native_header_offset == 0 && !scheduler_task_is_executable(metadata[task].flags)) continue;
-        if (controls[task].state == static_cast<int64_t>(SchedulerTaskState::DONE)) continue;
-        if (reported++ >= 64) break;
+        cache_invalidate_range(&controls[task], sizeof(controls[task]));
+        rmb();
+        const uint64_t completion = controls[task].completion_state;
+        if (scheduler_completion_done(completion)) continue;
         if (graph.native_header_offset != 0) {
             const auto identity = aicore_scheduler_public_identity(graph, task);
             LOG_ERROR("A5 HBG native node=%" PRIu64 " public_id=%" PRIu64, task, TaskId::to_uint64(identity));
         }
-        if (snapshot_count < 64) {
-            snapshots[snapshot_count++] = {
-                task, controls[task].state, controls[task].wake_list_head, controls[task].next_waiter
-            };
-        }
-        for (uint64_t other = 0; other < count; ++other) {
-            if (scheduler_wake_cursor_next(controls[other].wake_cursor) != static_cast<int64_t>(task)) continue;
-            LOG_ERROR(
-                "A5 HBG AICore scheduler: task=%" PRIu64 " is linked from task=%" PRIu64 " (state=%" PRId64
-                " wake_head=%" PRId64 ")",
-                task, other, controls[other].state, controls[other].wake_list_head
-            );
-        }
-        // Ownership is represented by the producer head and its published wake cursors.
-        for (uint64_t owner = 0; owner < count; ++owner) {
-            if (controls[owner].wake_list_head != static_cast<int64_t>(task)) continue;
-            LOG_ERROR(
-                "A5 HBG AICore scheduler: task=%" PRIu64 " heads the wake list of task=%" PRIu64 " (state=%" PRId64
-                " flags=0x%x)",
-                task, owner, controls[owner].state, metadata[owner].flags
-            );
-        }
+        const TaskSnapshot snapshot{task, completion, controls[task].next_block, controls[task].parked_count};
+        snapshots[snapshot_count++] = snapshot;
         LOG_ERROR(
-            "A5 HBG AICore scheduler: unfinished task=%" PRIu64 " state=%" PRId64 " wake_head=%" PRId64
-            " next_waiter=%" PRId64 " wake_next=%" PRId64 " fanin_index=%" PRIu32 " active_mask=0x%x flags=0x%x",
-            task, controls[task].state, controls[task].wake_list_head, controls[task].next_waiter,
-            scheduler_wake_cursor_next(controls[task].wake_cursor),
-            scheduler_wake_cursor_fanin(controls[task].wake_cursor), metadata[task].active_mask.raw(),
-            metadata[task].flags
+            "A5 HBG AICore scheduler: unfinished task=%" PRIu64 " total=%" PRIu64 " remaining=%" PRIu64 " debt=%" PRIu64
+            " next_block=%" PRIu64 " parked=%" PRIu64 " active_mask=0x%x flags=0x%x",
+            task, scheduler_completion_total(completion), scheduler_completion_remaining(completion),
+            scheduler_completion_debt(completion), snapshot.next_block, snapshot.parked,
+            metadata[task].active_mask.raw(), metadata[task].flags
         );
     }
-    log_resident_ready_pool(scheduler_state_base, *context);
-    // The AICores are still running when this timeout fires, so one pass cannot
-    // tell a chain nobody will drain from one being walked at this instant. A
-    // second pass over the same tasks names whatever moved in between.
+    log_resident_task_catalog(scheduler_state_base, *context);
     uint64_t moved = 0;
-    for (uint64_t i = 0; i < snapshot_count; ++i) {
-        const TaskSnapshot &before = snapshots[i];
+    for (uint64_t index = 0; index < snapshot_count; ++index) {
+        const auto &before = snapshots[index];
         const uint64_t task = before.task;
-        if (controls[task].state == before.state && controls[task].wake_list_head == before.wake_head &&
-            controls[task].next_waiter == before.next_waiter)
+        cache_invalidate_range(&controls[task], sizeof(controls[task]));
+        rmb();
+        const TaskSnapshot after{
+            task, controls[task].completion_state, controls[task].next_block, controls[task].parked_count
+        };
+        if (after.completion == before.completion && after.next_block == before.next_block &&
+            after.parked == before.parked)
             continue;
         ++moved;
         LOG_ERROR(
-            "A5 HBG AICore scheduler: task=%" PRIu64 " moved: state %" PRId64 "->%" PRId64 " wake_head %" PRId64
-            "->%" PRId64 " next_waiter %" PRId64 "->%" PRId64,
-            task, before.state, controls[task].state, before.wake_head, controls[task].wake_list_head,
-            before.next_waiter, controls[task].next_waiter
+            "A5 HBG AICore scheduler: task=%" PRIu64 " moved: completion %" PRIu64 "->%" PRIu64 " next_block %" PRIu64
+            "->%" PRIu64 " parked %" PRIu64 "->%" PRIu64,
+            task, before.completion, after.completion, before.next_block, after.next_block, before.parked, after.parked
         );
     }
     LOG_ERROR(
@@ -301,7 +266,10 @@ static int32_t publish_aicore_scheduler_runtime_error(Runtime *runtime, const ch
     if (context != nullptr) {
         run_control = aicore_scheduler_run_control(context);
     }
-    if (phase != nullptr) log_aicore_scheduler_error_identity(run_control, phase);
+    if (phase != nullptr) {
+        log_aicore_scheduler_error_identity(run_control, phase);
+        if (std::strcmp(phase, "execution") == 0) log_aicore_prepared_error(context, run_control);
+    }
     return settle_aicore_runtime_status(run_control, &header->sched_error_code);
 }
 

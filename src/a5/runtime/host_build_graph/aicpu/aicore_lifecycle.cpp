@@ -387,6 +387,7 @@ int32_t AicoreLifecycle::wait_bootstrap_complete(Runtime *runtime) {
                 // Error details are published before the error marker.
                 rmb();
                 log_aicore_scheduler_error_identity(run_control, "bootstrap");
+                log_aicore_prepared_error(context, run_control);
                 LOG_ERROR(
                     "A5 HBG AICore scheduler: bootstrap failed at task=%" PRIu64 " status=%" PRIu64 " core=%" PRIu64
                     " type=%" PRIu64 " site=%" PRIu64 " workers=%" PRIu64 " schedulers=%" PRIu64

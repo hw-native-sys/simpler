@@ -27,6 +27,7 @@ from simpler.worker import Worker
 
 from simpler_setup.scene_test import _pto_isa_compile_cache_token, compile_chip_callable_spec
 from simpler_setup.tools.hbg.native_causality import audit_native_protocol
+from simpler_setup.tools.hbg.native_protocol import protocol_version
 
 HERE = Path(__file__).resolve().parent
 MAX_ROWS = 256
@@ -254,11 +255,11 @@ class PeerCounterRunner:
         raw = json.loads(paths[0].read_text())
         protocol = raw.get("aicore_protocol", {})
         assert protocol.get("producer") == "aicore", paths[0]
-        assert protocol.get("schema") in ("hbg-native-protocol-v10", "hbg-native-protocol-v11"), (
+        assert protocol_version(protocol), (
             "resident diagnostic qualification requires resource-scoped native evidence",
             paths[0],
         )
-        assert raw["aicore_execution_identities"]["schema"] == "hbg-execution-identity-v1"
+        assert raw["aicore_execution_identities"]["schema"] == "hbg-execution-identity-v2"
         identities = raw["aicore_execution_identities"]["records"]
         audit = audit_native_protocol(protocol, identities)
         assert audit["protocol_verified"]

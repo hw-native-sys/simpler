@@ -264,3 +264,199 @@ kernel 结束到 resolver 返回为 7.255、6.766、6.994 µs；保留的 `seal-
 按用户要求撤回该组合，运行时源码逐文件恢复为冻结的 `seal-fence` 版本。
 后续分析暂缓；原始数据、二进制及回退哈希核对保存在本地
 `outputs/swa-current-20261111/`，不随仓库分发。
+
+## Disabled Scalar observer branches
+
+2026-11-13，针对 L1 没有启用 Scalar 记录、却仍进入 `noinline` 记录包装函数的问题，
+候选在 `scheduler_scalar_memory_issue/result()` 和 `scheduler_scalar_result()`
+外层判断 trace/buffer；关闭时直接执行 operation，开启时沿用原记录函数。
+没有修改业务原子、DCCI/DSB、SSBUF 或 kernel。该候选已撤回，未提交生产修改。
+
+同一 A5 自动分配中的 SWA PyPTO-lib 对照，L0/L1 各预热 1 次、测量 10 次：
+
+| 指标 | 修改前 | 候选 | 结果 |
+| ---- | -----: | ---: | ---- |
+| 完整 device L0 均值 / ms | 0.7986280 | 0.7961422 | 不归为业务收益：四个非 profiling 执行器的代码、只读数据与重定位相同 |
+| L1 device 均值 / ms | 1.0048495 | 1.0325257 | 增加 2.75% |
+| L3 单次 device / ms | 1.317421 | 1.373917 | 单次增加 4.29%，不用于稳定收益判断 |
+| A5 HBG 完整构建 / s | 284.43 | 742.66 | 增加至 2.61 倍 |
+
+18 项既有记录器检查、14 个 A5 IR 编译单元检查和上述实机数值检查通过。
+四个不带 profiling 的 AIC/AIV ordinary/native 对象，其所有分配节及按符号解析的
+重定位逐项一致；IR 仅有调试位置元数据差异。原始提交记录的所有 task timing slot
+均为 -1，确认本用例 L0 选择非 profiling 入口。这不保证不同链接布局或测量噪声为零，
+但没有可归因于本候选的 L0 调度指令收益。
+
+例如 ordinary-profiled AIC 的优化 IR，静态指令行数由 177,027 增至 238,766，
+基本块标签由 30,887 增至 54,560。运行时分支同时保留原操作与记录路径，确实扩大了
+编译器处理的控制流；不能据此宣称已经定位 CCEC 编译耗时或运行延迟的完整根因。
+本轮使用 CCEC clang 15.0.5（2026-09-22 构建），按当前 A5 onboard 参数编译。
+
+撤回理由是没有降低测量扰动且显著增加编译时间。后续应在编译单元层面区分
+任务计时与 Scalar 细节采集，避免每个访存原语都加入一条动态选择分支；该替代方案
+仍须独立验证，不能沿用本候选的通过结果。
+
+可复现证据位于 `artifacts/five-us-swa-20261113/`：
+`observer-fast/rejected-wrapper-bypass.patch`、`build.log`、`ir/`、
+`plain-object-comparison.json`、`plain-ir-comparison.json`、`profiled-ir-size.json`，
+以及 `perf-observer-fast/results.json` 和 `comparison-summary.json`。
+两臂复用冻结的 callable、输入和 runner，实际分配为 device 4。
+
+## Oldest-ready local pending order
+
+2026-11-14，以 `c1d0f3f8668` 为基线，尝试让普通 pending 按本核持有先后扫描，
+跳过未就绪项，优先执行已就绪的旧项。四个 token 的物理索引存于一个 32-bit
+排列，替换原轮转 cursor；fresh/PARKED 接手排末尾，READY slot 回收排优先位置。
+没有模型名、task 编号、形状或 kernel 时长特判，没有新增共享原子或改动业务 kernel。
+候选已撤回，生产代码仍保留原选序。
+
+动机来自 C2A reuse/lib 的 L3：AIV34 早于 t20 取得 t8；t8 的共同计算前驱完成后，
+该核仍先进入约 469 µs 的 t20，再执行 t8。最小回归确认原轮转会作出这种选择，
+候选能改变它。它是合法执行之间的性能策略，并非数值错误；单个尾部被改善不保证整图更快。
+
+完整 18 组使用相同 callable、输入、HBG AICore 运行方式，分别预热 1 次、测量 10 次 L0。
+14 个非通信用例在同一自动分配的单卡上按 case 交替两臂顺序；4 个通信 case 使用
+同一自动分配的双卡，每轮取 rank 最大值，仅报告、不参与性能门槛。
+
+| 非通信 L0 均值总和 / ms | 基线 | 候选 | 变化 |
+| ----------------------- | ---: | ---: | ---: |
+| PyPTO-lib，7 组 | 9.7079507 | 9.7698664 | +0.638% |
+| DSL，7 组 | 11.0015004 | 10.9602499 | -0.375% |
+| 全部，14 组 | 20.7094511 | 20.7301163 | +0.100% |
+
+各 case 比值的几何均值变化为 -0.014%，也未给出实质改善证据。
+SWA 两种实现分别改善约 1.51%/1.04%，但 C1A full/lib、C1A full/DSL
+分别回退约 2.80%/3.13%；不能依据 SWA 选择性保留。所有 18 组数值校验通过。
+另外 4 个 C++ 套件和 17 项 A5 Graph/MIX/sync_start/defer_wait/prepared-call
+实机回归通过，2 项只支持模拟器的检查跳过。
+
+独立 C2A reuse/lib 对照的 L0 为 1281.711 → 1285.558 µs，L3 单次却为
+1547.288 → 1410.629 µs。L3 改善不能替代 L0 收益；候选改变分支的执行重叠，
+并不能解决下一个任务 ready 时全部相关核已经执行长 kernel 的等待。
+
+另采 L1，将下一项所有可追溯计算前驱均已在前一 kernel 返回前结束的同核相邻
+执行单独列出：基线 55 个窗口的最小值/中位数为 5.770/7.715 µs；候选 52 个窗口
+为 5.798/7.882 µs。这不证明已经预持有 token 或满足全部资源/异步许可，不能作为
+完整快入口验收；也没有证实小于 5 µs 的目标。后续应继续审查已有 pending 的
+固定完成、转交和实际入口开销，而非只更改合法候选的优先顺序。
+
+本地可复现材料位于 `artifacts/execution-token-implementation/`：
+`pending-order/experiment.patch`、`pending-order-snapshot/`、
+`pending-order-18/{configuration,matrix,comparison}.json` 和 `report.md`，
+以及 `c2a-reuse-mix-priority/`、`c2a-reuse-pending-order/`、`c2a-reuse-handoff-l1/`。
+配置保存 bundle、runner 和 runtime SHA256，运行日志保存实际 `TASK_DEVICE`。
+A5 构建耗时 290.87 秒；IR 扫描 15/16 个 TU 零 findings，未解码的 vendor SIMT
+wrapper 已逐项核对分配段与 canonical relocations，不能称为完整 clean scan。
+
+## Completed catalog prefix retirement
+
+2026-11-14，以 `c1d0f3f8668` 为基线，尝试让普通、MIX、cooperative 发现共用
+每 worker 私有的已完成目录前缀，跳过终态任务的新票确认和 PARKED 探测。
+只有 canonical completion gate 的计算剩余量和异步债务均归零且格式有效，
+并经原子确认后才推进前缀；取票耗尽不是退休依据。目录在运行中不可变，
+前缀每次运行重新初始化，不替代 token、SSBUF、admission 或 async 退休。
+这是通用状态策略，没有模型、task 编号或形状特判；候选仍因收益证据不足撤回。
+
+完整 18 组保持原 kernel、输入、HBG AICore 方式，各臂 1 次预热、10 次 L0 计时。
+非通信两臂使用同一自动分配的单卡，按 case 交替先后；通信使用同一自动分配的
+双卡，每轮取 rank 最大值，只报告、不参与保留门槛。全部数值校验通过。
+
+| 非通信 L0 均值总和 / ms | 基线 | 候选 | 变化 |
+| ----------------------- | ---: | ---: | ---: |
+| PyPTO-lib，7 组 | 9.7442054 | 9.6351154 | -1.120% |
+| DSL，7 组 | 11.0266336 | 11.1173801 | +0.823% |
+| 全部，14 组 | 20.7708390 | 20.7524955 | -0.088% |
+
+各 case 比值的几何均值变化为 -0.071%。保留这些带符号结果，不使用 ±5%
+忽略区间，但本轮尚不能确认综合收益。对现有十轮样本按组、按臂独立重采样，
+总和比值变化的 95% bootstrap 区间为 [-1.239%, +1.081%]；这还未覆盖运行顺序
+漂移或跨轮相关性。C1A full/lib 改善 9.00%，同时 C1A reindex/lib 回退 4.07%，
+C1A reuse/DSL 回退 2.64%，不能只选择受益项留下实现。
+
+独立 C2A reuse/lib 的 L0 为 1317.305 → 1269.680 µs，L3 却为
+1423.400 → 1564.787 µs。L3 的全核 atomicAdd 次数 22,778 → 11,505，
+refill 的累计 inclusive worker-time 下降 26.77%，但 ld_dev 次数增加，
+新的完成确认仍形成同址查询热点。例如一次 28.231 µs 的 probe 中，
+ld_dev 占 23.947 µs、atomicAdd 占 3.500 µs；不能把父子 scope 相加成墙钟时间。
+这一现象与 `atomic_probe/ATOMIC_USAGE_GUIDE.md` §4.6 的同址竞争风险相符，
+但不是将其受控微基准延迟直接套入业务的证明。
+
+L1 中筛选两侧均为普通任务、下一任务的计算前驱已在前一 kernel 返回前结束的
+跨任务窗口：基线 47 个，最小/中位 6.147/7.306 µs；候选 45 个，6.033/7.385 µs。
+这些样本不证明预持有 token 或全部异步/资源许可，不能作为完整快入口验收，
+也没有小于 5 µs 的交接证据。重开此方向需要减少完成确认热点或固定交接成本的
+新机制，以及完整矩阵收益；只减少扫描次数不足以推断成功。
+
+4 个 C++ 调度套件、61 项 Python DFX 检查及 17 项选定 A5 特性检查通过；
+2 项 sim-only 检查跳过。构建 328.90 秒；IR 扫描 15/16 TU 零 findings，
+未解码 wrapper 的分配段和重定位与前版相同，不是完整 clean scan。
+本地证据位于 `artifacts/execution-token-implementation/` 下的
+`catalog-retirement/`、`catalog-retirement-snapshot/`、`catalog-retirement-18/`
+与 `c2a-reuse-catalog-retirement/`。保存了补丁、构建来源、逐轮数据、18 组表格、
+不确定性计算脚本、L1/L3 及恢复证明；生产源码恢复为基线。
+
+## 普通续领前移到快速 token 推进 {#fast-ordinary-continuation}
+
+2026-11-14，以 `fc53cc96be4` 为基线，把已有普通 SPMD fresh block 续领从
+完整 fill 路径移入 `scheduler_progress_execution_tokens`。已有 ready token
+优先、三次续领后访问目录、resident 每四轮服务边界和正式 MIX 责任均保留；
+不按模型、task ID 或 shape 区分。
+
+全部 18 组两臂数值通过，14 组非通信 L0 均值之和为
+**20.4091776 → 20.4196695 ms，+0.0514%**；lib −0.6299%，DSL +0.6475%。
+每臂预热一次、计时十次，各 case 同卡对照、交替先后顺序，自动分配设备。
+通信按每轮较慢 rank 再求均值，四组结果均记录但不参与保留门槛。
+已有十轮数据的组内 bootstrap 区间为 [−1.072%, +1.196%]，不包含顺序漂移。
+没有使用百分比免考核区间；未建立综合收益，因此撤回。
+
+Engram/lib 的同 task 普通 block 间隙 L3 中位数 24.974 → 19.390 µs，
+500 block 执行窗口 207.390 → 175.133 µs，参与核数均为 64、每核最多 8 次。
+现有 task-timing 低插桩采样中，间隙中位数 14.013 → 12.473 µs；
+这不是无插桩间隙，也未达到 5 µs。局部收益不能替代完整 L0 的验收。
+
+四组 C++ 套件、17 项 A5 特性用例通过，另有两项 sim-only 跳过。
+候选构建 322.13 秒；IR 15/16 个 TU 零 findings，未解码 vendor wrapper
+按分配段及重定位与已验证版本对照，不称为完整 clean scan。
+首次单例候选在设备初始化报 507033，未执行调度；原始失败记录保留，
+后续通过不表示原初始化问题已归因。
+
+本地证据：`artifacts/execution-token-implementation/fast-continuation-18/`
+的 `report.md`、`comparison.json`、逐轮日志，`fast-continuation/` 的撤回补丁，
+`fast-continuation-snapshot/` 的冻结运行库，以及 `engram-fast-continuation/`
+和 `handoff-audit/fast-host-timing-export/engram/` 的诊断数据。
+只在新的服务边界或代码生成证据解释了整体成本后重开，不通过单例反复试参保留。
+
+## 不可变 Call 接收缓存复用 {#immutable-call-cache-reuse}
+
+2026-11-14，以 `fc53cc96be4` 为基线，候选仅删除
+`scheduler_receive_execution_token` 对 512B Call 的八次定向 DCCI。
+可变 Binding 的两次 DCCI、尾 DSB、compiler barrier、Claim、run/单元身份
+校验、最终入口许可和 async 业务数据观察全部保留，没有模型或形状特判。
+
+当前 Call 在 Host 发布后才启动 resident；每次启动的 DCI 先于 Call 读取，
+run 内没有 Device Build 或地址复用。旧 `aabab11ec` 的失败发生在启动后
+Device builder 写 Call 的不同发布顺序，不能直接套用，也不因此撤销旧结论。
+另见[静态 Binding 实验的合同说明](../../investigations/2026-11-a5-prepared-binding-publication.md)。
+
+全部 18 组配对数值通过。每臂一次预热、十次 L0 计时，按 case 交替顺序；
+单卡 lib/DSL 分别自动分配设备 4/5，通信自动分配设备 0、3，按每轮较慢 rank
+再求均值。14 组非通信均值之和 **20.4800550 → 20.5771805 ms，+0.4742%**；
+lib −0.0588%，DSL +0.9413%，几何平均时间比 +0.4885%。
+组内 bootstrap 区间 [−0.826%, +1.803%] 不包含顺序及系统状态漂移。
+本次未建立综合收益，生产代码与统一设计恢复原定向接收合同。
+
+四组 C++ 套件与 17 项 A5 Graph/MIX/sync_start/defer_wait/prepared-call
+检查通过，另两项 sim-only 跳过；构建 354.76 秒，IR 15/16 个 TU 零 findings，
+vendor wrapper 保留已审查的解码例外。不能由 CPU 或 IR 结果替代缓存可见性实测。
+
+C2A full 与 Engram 同卡另采 L1/L2/L3。L3 中被记录的 Call 接收区间缩短，
+但候选大量区间已落到 1 µs 过滤阈值以下，不能把剩余样本的中位数当作全体。
+L2 的 Engram 同 task 间隙均值为 15.298 → 15.369 µs，其中完成记录到下一项
+发布仍约 11.2 µs；少量 cache 指令并未消除这段补给链路。L2 本身有记录开销，
+不是无插桩延迟；不同运行的所有权不能与这些时间拼成同一次执行的证据。
+
+本地证据位于 `artifacts/execution-token-implementation/`：
+`immutable-call-cache-18/` 的完整配对数据，`immutable-call-cache/` 的缓存
+合同审查、撤回补丁、CPU/IR/特性结果及 L2 分析，`immutable-call-cache-snapshot/`
+的冻结运行库，以及 `c2a-full-immutable-call-cache/`、
+`engram-immutable-call-cache/` 的原始记录和转换泳道图。

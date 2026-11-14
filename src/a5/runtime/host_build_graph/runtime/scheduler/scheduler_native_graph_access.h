@@ -40,8 +40,7 @@ inline __aicore__ __gm__ const SchedulerNativeGraphHeader *scheduler_native_head
         original_tasks > TaskId::GLOBAL_TASK_MAX_NUM || header->instance_count == 0 ||
         header->instance_count > original_tasks || header->definition_count == 0 ||
         header->definition_count > header->instance_count || header->run_epoch == 0 ||
-        header->readonly_end_offset > bytes || header->readonly_end_offset % SCHEDULER_STATE_ALIGNMENT != 0 ||
-        header->control_inbox_count == 0 || header->control_inbox_count > SCHEDULER_WORKER_CAPACITY)
+        header->readonly_end_offset > bytes || header->readonly_end_offset % SCHEDULER_STATE_ALIGNMENT != 0)
         return nullptr;
     const uint64_t end = header->readonly_end_offset;
     if (!scheduler_native_region_valid(
@@ -57,18 +56,12 @@ inline __aicore__ __gm__ const SchedulerNativeGraphHeader *scheduler_native_head
         !scheduler_native_region_valid(
             end, header->instances_offset, header->instance_count, sizeof(SchedulerGraphInstance),
             alignof(SchedulerGraphInstance)
-        ) ||
-        !scheduler_native_region_valid(
-            bytes, header->control_inboxes_offset, header->control_inbox_count, sizeof(SchedulerReadyInbox),
-            alignof(SchedulerReadyInbox)
         ))
         return nullptr;
     if (header->bindings_offset < offset + sizeof(SchedulerNativeGraphHeader) ||
         header->completion_refs_offset < header->bindings_offset + nodes * sizeof(SchedulerNodeBinding) ||
         header->templates_offset < header->completion_refs_offset + original_tasks * sizeof(int64_t) ||
-        header->instances_offset <
-            header->templates_offset + header->definition_count * sizeof(SchedulerGraphTemplate) ||
-        header->control_inboxes_offset < end)
+        header->instances_offset < header->templates_offset + header->definition_count * sizeof(SchedulerGraphTemplate))
         return nullptr;
     return header;
 }
