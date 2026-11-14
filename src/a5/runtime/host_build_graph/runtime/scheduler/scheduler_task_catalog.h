@@ -20,7 +20,13 @@ struct alignas(64) SchedulerTaskCatalogHeader {
     uint64_t control_count{0};
     uint64_t storage_end_offset{0};
     uint64_t entry_count{0};
+    uint64_t issue_cursors_offset{0};
 };
+
+struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerIssueCursor {
+    volatile uint64_t next_task{0};
+};
+static_assert(sizeof(SchedulerIssueCursor) == SCHEDULER_GM_ATOMIC_SECTOR_BYTES);
 
 struct SchedulerTaskCatalogDescriptor {
     uint64_t entries_offset{0};
@@ -41,6 +47,7 @@ struct SchedulerTaskCatalog {
     __gm__ const int64_t *refs{nullptr};
     uint64_t count{0};
     uint64_t task_count{0};
+    __gm__ SchedulerIssueCursor *issue{nullptr};
 };
 
 inline __aicore__ SchedulerTaskCatalog
@@ -48,11 +55,14 @@ scheduler_task_catalog(__gm__ void *base, const __gm__ SchedulerTaskCatalogHeade
     if (engine >= SCHEDULER_EXECUTION_ENGINE_COUNT) return {};
     const auto *descriptors = scheduler_state_at<SchedulerTaskCatalogDescriptor>(base, pool.descriptors_offset);
     const auto &descriptor = descriptors[engine];
-    return {scheduler_state_at<int64_t>(base, descriptor.entries_offset), descriptor.capacity, pool.task_count};
+    return {
+        scheduler_state_at<int64_t>(base, descriptor.entries_offset), descriptor.capacity, pool.task_count,
+        scheduler_state_at<SchedulerIssueCursor>(base, pool.issue_cursors_offset) + engine
+    };
 }
 
 inline __aicore__ bool scheduler_task_catalog_valid(const SchedulerTaskCatalog &catalog) {
-    return catalog.count <= catalog.task_count && catalog.task_count <= INT32_MAX &&
+    return catalog.issue != nullptr && catalog.count <= catalog.task_count && catalog.task_count <= INT32_MAX &&
            (catalog.count == 0 || catalog.refs != nullptr);
 }
 
@@ -81,6 +91,12 @@ static inline __aicore__ bool scheduler_task_catalog_validate(
     auto *descriptors = scheduler_state_at<SchedulerTaskCatalogDescriptor>(base, pool->descriptors_offset);
     for (uint64_t offset = 0; offset < descriptor_bytes; offset += 64)
         scheduler_observe_cache_line(reinterpret_cast<__gm__ uint8_t *>(descriptors) + offset);
+    const uint64_t issue_bytes = SCHEDULER_EXECUTION_ENGINE_COUNT * sizeof(SchedulerIssueCursor);
+    if (pool->issue_cursors_offset < cursor || pool->issue_cursors_offset % SCHEDULER_GM_ATOMIC_SECTOR_BYTES != 0 ||
+        pool->issue_cursors_offset > pool->storage_end_offset ||
+        issue_bytes > pool->storage_end_offset - pool->issue_cursors_offset)
+        return false;
+    cursor = pool->issue_cursors_offset + issue_bytes;
     uint64_t entries = 0;
     for (uint32_t queue = 0; queue < SCHEDULER_EXECUTION_ENGINE_COUNT; ++queue) {
         const auto &descriptor = descriptors[queue];

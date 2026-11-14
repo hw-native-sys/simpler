@@ -165,7 +165,6 @@ struct GmMixFixture {
         const auto *entry = std::find(catalog.refs, catalog.refs + catalog.count, static_cast<int64_t>(task));
         if (entry == catalog.refs + catalog.count) return false;
         const uint32_t previous = signal(cluster)->armed_generation;
-        local->cluster_scan_cursor = entry - catalog.refs;
         bool progress = false;
         if (!scheduler_cluster_mix_discover_next(graph.graph(), base(), local, run(), &progress) ||
             !scheduler_cluster_mix_progress_pending(graph.graph(), base(), local, run(), &progress))
@@ -185,7 +184,6 @@ struct GmMixFixture {
         const auto catalog = scheduler_task_catalog(base(), *pool, local->config.self_core_type);
         const auto *entry = std::find(catalog.refs, catalog.refs + catalog.count, static_cast<int64_t>(task));
         if (entry == catalog.refs + catalog.count) return false;
-        local->execution_scan_cursor = entry - catalog.refs;
         bool progress = false;
         if (!scheduler_refill_execution_tokens(graph.graph(), base(), local, run(), 0, &progress)) return false;
         return std::any_of(
@@ -223,7 +221,6 @@ struct GmMixFixture {
         const auto catalog = scheduler_task_catalog(base(), *pool, local->config.self_core_type);
         const auto *entry = std::find(catalog.refs, catalog.refs + catalog.count, static_cast<int64_t>(task));
         if (entry == catalog.refs + catalog.count) return false;
-        local->cooperative_scan_cursor = entry - catalog.refs;
         bool progress = false;
         return scheduler_discover_cooperative_task(graph.graph(), base(), local, run(), &progress) &&
                admissions[worker].pending_task_ref == static_cast<int64_t>(task);

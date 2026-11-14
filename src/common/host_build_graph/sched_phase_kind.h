@@ -115,7 +115,7 @@ enum class SchedPhaseKind : uint8_t {
     ScalarAdmissionPublish = 47,
     ScalarAdmissionCommit = 49,
     ScalarAdmissionRefresh = 50,
-    ScalarOrdinaryPark = 51,
+    ScalarOrdinaryRestore = 51,
     ScalarBlockClaim = 52,
     ScalarBlockCursorRead = 53,
     ScalarAdmissionClose = 54,
@@ -179,22 +179,19 @@ enum class SchedPhaseKind : uint8_t {
     ScalarClusterMixAll = 117,
     ScalarPreparedReceive = 118,
     ScalarPreparedAcquire = 119,
-    ScalarPreparedParkBegin = 120,
-    ScalarPreparedParkPublish = 121,
-    ScalarPreparedResume = 122,
     ScalarPreparedReturn = 123,
     ScalarPreparedObserve = 124,
     ScalarPreparedIndex = 125,
     ScalarPreparedValidate = 126,
     ScalarGroupReserve = 127,
-    ScalarGroupPark = 128,
-    ScalarGroupResume = 129,
     ScalarGroupArm = 130,
     ScalarGroupAcquire = 131,
     ScalarClusterMixNeedsService = 132,
     ScalarExecutionContinuation = 133,
     ScalarExecutionTokenFanin = 134,
-    ScalarClusterMixReadyReplacement = 135,
+    ScalarTaskIssueHead = 135,
+    ScalarTaskIssueFanin = 136,
+    ScalarTaskSupplyClosed = 137,
 };
 
 // This phase's name as a report spells it. Returns a string literal, so it is safe on
@@ -295,8 +292,8 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_admission_commit";
     case SchedPhaseKind::ScalarAdmissionRefresh:
         return "scalar_admission_refresh";
-    case SchedPhaseKind::ScalarOrdinaryPark:
-        return "scalar_ordinary_park";
+    case SchedPhaseKind::ScalarOrdinaryRestore:
+        return "scalar_ordinary_restore";
     case SchedPhaseKind::ScalarBlockClaim:
         return "scalar_block_claim";
     case SchedPhaseKind::ScalarBlockCursorRead:
@@ -423,12 +420,6 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_prepared_receive";
     case SchedPhaseKind::ScalarPreparedAcquire:
         return "scalar_prepared_acquire";
-    case SchedPhaseKind::ScalarPreparedParkBegin:
-        return "scalar_prepared_park_begin";
-    case SchedPhaseKind::ScalarPreparedParkPublish:
-        return "scalar_prepared_park_publish";
-    case SchedPhaseKind::ScalarPreparedResume:
-        return "scalar_prepared_resume";
     case SchedPhaseKind::ScalarPreparedReturn:
         return "scalar_prepared_return";
     case SchedPhaseKind::ScalarPreparedObserve:
@@ -439,10 +430,6 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_prepared_validate";
     case SchedPhaseKind::ScalarGroupReserve:
         return "scalar_group_reserve";
-    case SchedPhaseKind::ScalarGroupPark:
-        return "scalar_group_park";
-    case SchedPhaseKind::ScalarGroupResume:
-        return "scalar_group_resume";
     case SchedPhaseKind::ScalarGroupArm:
         return "scalar_group_arm";
     case SchedPhaseKind::ScalarGroupAcquire:
@@ -453,8 +440,12 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_execution_continuation";
     case SchedPhaseKind::ScalarExecutionTokenFanin:
         return "scalar_execution_token_fanin";
-    case SchedPhaseKind::ScalarClusterMixReadyReplacement:
-        return "scalar_cluster_mix_ready_replacement";
+    case SchedPhaseKind::ScalarTaskIssueHead:
+        return "scalar_task_issue_head";
+    case SchedPhaseKind::ScalarTaskIssueFanin:
+        return "scalar_task_issue_fanin";
+    case SchedPhaseKind::ScalarTaskSupplyClosed:
+        return "scalar_task_supply_closed";
     }
     return "unknown";
 }

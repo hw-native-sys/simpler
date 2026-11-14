@@ -801,17 +801,17 @@ static inline __aicore__ bool scheduler_close_ordered_obligation(
     return true;
 }
 
-static inline __aicore__ bool scheduler_ordered_park_ordinary(
+static inline __aicore__ bool scheduler_ordered_restore_ordinary(
     const SchedulerGraphAccess &graph, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
 ) {
-    SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarOrdinaryPark, -1);
+    SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarOrdinaryRestore, -1);
     auto *admission = local->admission;
     for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
         auto &slot = local->slots[index];
         if (slot.state != SchedulerDispatchSlotState::READY || slot.cluster_mix ||
             scheduler_slot_uses_admission(local, slot) || (local->local_ready_mask & (1U << index)) == 0)
             continue;
-        if (!slot.execution_token || !scheduler_park_execution_slot(local, index))
+        if (!slot.execution_token || !scheduler_restore_execution_token(local, index))
             return scheduler_admission_fail(
                 graph, local, run, slot.task_ref, SchedulerErrorSite::ORDERED_CANDIDATE_INVALID
             );

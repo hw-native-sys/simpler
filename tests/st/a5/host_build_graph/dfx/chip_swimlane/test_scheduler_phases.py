@@ -193,11 +193,21 @@ class TestSchedulerPhases(SceneTestCase):
                     "dispatch",
                     "complete",
                     "idle",
-                    "scalar_execution_token_refill",
-                    "scalar_execution_token_receive",
-                    "scalar_execution_token_fanin",
-                    "scalar_execution_token_dispatch",
                 }
+                # L3 omits function spans below the recorded threshold; the
+                # unfiltered task acquisition/dispatch/completion records remain mandatory.
+                filtered = any(
+                    metric.get("function_min_cycles", 0) > 0
+                    for stream in streams
+                    for metric in stream.get("metrics", [])
+                )
+                if not filtered:
+                    required_kinds |= {
+                        "scalar_execution_token_refill",
+                        "scalar_execution_token_receive",
+                        "scalar_execution_token_fanin",
+                        "scalar_execution_token_dispatch",
+                    }
                 assert required_kinds <= emitted_kinds, (
                     f"missing Scheduler kinds: {sorted(required_kinds - emitted_kinds)}"
                 )

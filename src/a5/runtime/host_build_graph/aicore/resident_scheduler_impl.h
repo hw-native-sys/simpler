@@ -708,6 +708,12 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     uint64_t observed_profiling_level, uint64_t aicore_entry_cycles
 ) {
     scheduler_invalidate_startup_cache();
+#if defined(__CCE_AICORE__)
+    // Each resident launch starts with ordinary stores, independent of work
+    // previously dispatched on this physical core. Kernels select their own
+    // atomic mode when their stores require it.
+    set_atomic_none();
+#endif
     // Each resident translation unit owns its block-local observer slot. A prior
     // aborted launch may not have unwound the binding before this invocation.
     static_assert(WithProfiling || !kSchedulerScalarInstrumentation);

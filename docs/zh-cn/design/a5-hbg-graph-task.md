@@ -75,7 +75,7 @@ Graph 本身不建立新的资源顺序域，一个 cohort 也不扩大为整个
 Graph 完成时计算并缓存预算，提交和 bind 使用同一算法检查溢出与实例边界。
 公共 execution_storage_bytes 继续描述 A2A3/WSE/percounter 的活跃 GraphExecution，不能当作默认 native 参数预算。
 
-resident backing 仍需计入 768 B/node control，以及按真实执行数放大的 512 B Call、
+resident backing 仍需计入 640 B/node control，以及按真实执行数放大的 512 B Call、
 128 B Claim、128 B Binding、256 B trace 和实际启用的诊断/async 区域。
 缩小结构或删去重复计划不等于已证明延迟下降；性能必须用同输入、同设备、同 DFX 配置的对照衡量。
 

@@ -51,7 +51,7 @@ uint32_t original_task_count。GraphView、native header、task catalog 和 prep
 | 类型 | 大小 | 所有权与用途 |
 | ---- | ---- | ------------ |
 | SchedulerTaskMetadata | 16 B | Host 只读形状、kernel、block 和 trace prefix |
-| SchedulerTaskControl | 768 B | 六个独立 128 B 原子区域：claim_tickets、next_block、completion_state、admission_state、claim_seal、parked_count |
+| SchedulerTaskControl | 640 B | 五个独立 128 B 原子区域：claim_tickets、next_block、completion_state、admission_state、claim_seal |
 | SchedulerWorkerContext | 320 B | 前四个 64 B 行由 READY 发布；最后一行归本核诊断 |
 | SchedulerRunControl | 7296 B | 384 B 配置/生命周期/首错前缀及 108 个独占行的 worker 错误信号 |
 | SchedulerGraphSummary | 192 B | 本轮只读拓扑和各子区 offset |
@@ -66,7 +66,7 @@ Mailbox 的 descriptor 从 0 开始，lane ack 数组从 128 开始，二者位�
 coordinator 写回 descriptor 并 barrier 后，通过参与 AIV 的 assigned_seq 发布；接收者不读取另一份全局发布计数。
 Call.args 与 dump task 的只读参数行以 alignas(64) 对齐；没有显式 reserved 数据字段。
 
-TaskControl 的 atomic offset 依次为 0、128、256、384、512、640。
+TaskControl 的 atomic offset 依次为 0、128、256、384、512。
 completion_state 编码 total/remaining_compute/debt；具体有效性和 DONE 判据见
 [canonical completion gate](dependency-counters.md)。它不包含 wake-list、remaining fanin 或 resolver timing。
 

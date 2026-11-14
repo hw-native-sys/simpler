@@ -26,7 +26,7 @@ Graph child 也不另占一个顶层任务镜像条目。
 | 数据 | 作用范围 | 写者与读者 |
 | ---- | -------- | ---------- |
 | SchedulerTaskMetadata，16 B | 每 expanded node | Host 只读形状、kernel IDs、trace prefix |
-| SchedulerTaskControl，768 B | 每 expanded node | 核以 atomic 管 ticket、gate、park、admission；无后继通知链 |
+| SchedulerTaskControl，640 B | 每 expanded node | 核以 atomic 管 ticket、gate、claim seal、admission；无后继通知链 |
 | SchedulerExecutionPlan，16 B | 每 node | Host 声明该 node 的真实执行区间 |
 | SchedulerPreparedCall，512 B | 每 block×active-lane 执行 | Host 唯一写者，设备读取完整函数和 args |
 | SchedulerPreparedControl，128 B | 每真实执行 | 单原子 phase/owner/generation；控制 Call 责任 |
@@ -40,13 +40,13 @@ run 汇总和退出证明分别处理这些剩余责任。
 ## 核内状态与共享协作
 
 每核一个自然对齐的 SchedulerLocalState：四个普通 execution token、两个 40 B slot、
-本地扫描游标、ready mask/head、pending completion 和 cooperative/async 状态引用。
+共享发行前沿的本核观察值、ready mask/head、pending completion 和 cooperative/async 状态引用。
 只有本核准备和执行自己的 slot；一个 slot 只保存临近执行状态，不复制整份 Call args。
 24 B SchedulerExecutorTaskTrace 暂存 kernel start/end 与 ready-observe，退休时合并到 GM trace。
 
-目录 refs 在整个 run 不变。MIX 的 cluster signal、group reservation/mailbox、lane ack，
+目录 refs 在整个 run 不变；AIC/MIX 和 AIV 各有一个共享发行前沿，当前任务全体有效票发完或合法终结后才推进。MIX 的 cluster signal、group reservation/mailbox、lane ack，
 sync_start 的 admission log/record、member closure，以及 async condition/group/join/lease
 是共享状态，各自有唯一 owner 和 publication 合同；它们不是另一个 ready queue。
 
 Call、Binding、参数、capture backing 和控制表都必须保持至本轮清退被证明完成。
-FAILED 或 PARKED 不授权 Host 提前回收；后续 epoch 也不能覆盖仍有 owner 的旧 run。
+等待依赖或 FAILED 不授权 Host 提前回收；后续 epoch 也不能覆盖仍有 owner 的旧 run。

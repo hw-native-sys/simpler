@@ -50,11 +50,21 @@ TEST(HbgAdmissionProgress, DeferredPredecessorLeavesIndependentCounterPublisherR
             fixture.locals[worker]->async = &async_workers[worker];
         }
 
-        // Every B depends on W; independent P publishes W's COUNTER and is
-        // beyond a full candidate window in the immutable AIV catalog.
+        // Every B depends on W. Independent P is submitted after the full
+        // waiting window; Host generations place it before those consumers.
         for (uint32_t task = 1; task <= successor_count; ++task) {
             fixture.graph.executable(task, 1, {0});
         }
+        const std::vector<SchedulerTaskMetadata> metadata(
+            fixture.storage.metadata, fixture.storage.metadata + task_count
+        );
+        SchedulerTaskCatalogPlan catalog;
+        ASSERT_TRUE(scheduler_plan_task_catalog(
+            metadata, fixture.storage.catalog_clusters(), fixture.storage.catalog_begin, &catalog
+        ));
+        ASSERT_TRUE(scheduler_order_task_catalog(fixture.graph.graph(), metadata, {}, &catalog));
+        ASSERT_LT(catalog.task_ranks[publisher], catalog.task_ranks[1]);
+        scheduler_init_task_catalog(fixture.base(), catalog);
         ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
         ASSERT_TRUE(fixture.bootstrap_admission());
         ASSERT_NE(fixture.locals[1]->admission, nullptr);
@@ -91,28 +101,18 @@ TEST(HbgAdmissionProgress, DeferredPredecessorLeavesIndependentCounterPublisherR
             scheduler_completion_task_state(fixture.control(0)->completion_state),
             static_cast<int64_t>(SchedulerTaskState::DONE)
         );
-        // Ordinary consumers hold actual execution tickets while the independent
-        // publisher remains beyond their finite local token window.
+        // Real ordered refill reaches the full waiting window without any
+        // caller assigning tokens or skipping an issuance head.
+        if (!sync_successors)
+            for (uint32_t slice = 0; slice < SCHEDULER_EXECUTION_TOKEN_COUNT; ++slice)
+                for (uint32_t worker = 1; worker < 3; ++worker) {
+                    bool progress = false;
+                    ASSERT_TRUE(scheduler_refill_execution_tokens(
+                        fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), 0, &progress
+                    ));
+                }
         for (uint32_t worker = 1; worker < 3; ++worker) {
             auto *local = fixture.locals[worker];
-            local->execution_scan_cursor = 1;
-            for (uint32_t index = 0; index < SCHEDULER_EXECUTION_TOKEN_COUNT; ++index) {
-                const uint32_t task = index + 1;
-                if (sync_successors) continue;
-                auto &token = local->execution_tokens[index];
-                const uint64_t block = scheduler_gm_fetch_add(fixture.control(task)->next_block, UINT64_C(1));
-                ASSERT_LT(block, 2u);
-                token.task_ref = task;
-                token.block_idx = static_cast<uint32_t>(block);
-                token.subtask_slot = 1;
-                token.phase = SchedulerExecutionTokenPhase::TICKETED;
-                ASSERT_EQ(
-                    scheduler_node_fanin_view(fixture.graph.graph(), task, &token.fanin), SchedulerGraphResult::OK
-                );
-                ASSERT_TRUE(scheduler_execution_token_receive(
-                    fixture.graph.graph(), fixture.base(), local, fixture.run(), token, 0
-                ));
-            }
             EXPECT_EQ(scheduler_execution_token_count(local), sync_successors ? 0u : SCHEDULER_EXECUTION_TOKEN_COUNT);
             EXPECT_EQ(local->local_ready_mask, 0u);
             for (const auto &slot : local->slots)
