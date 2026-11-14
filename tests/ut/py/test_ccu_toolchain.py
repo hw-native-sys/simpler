@@ -16,6 +16,7 @@ import platform
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 from simpler import env_manager
@@ -81,6 +82,11 @@ def toolchain_files(sdk_files, tmp_path, monkeypatch):
     def query(command, *, stderr=False):
         if stderr:
             return ""
+        if command[-1] == "-Wl,--version":
+            return "GNU ld (GNU Binutils) 2.37"
+        if command[-1] == "-Wl,--trace":
+            Path(command[command.index("-o") + 1]).touch()
+            return "\n".join(str(path) for path in (tmp_path / "ld", *tmp_path.glob("lib*")))
         if command[-1] == "-dumpmachine":
             return "aarch64-linux-gnu"
         if "-dM" in command:
@@ -175,6 +181,19 @@ def test_toolchain_reports_missing_sdk_inputs(toolchain_files, missing):
 def test_toolchain_reports_missing_compiler(toolchain_files, monkeypatch):
     monkeypatch.setattr(toolchain.shutil, "which", lambda _: None)
     with pytest.raises(FileNotFoundError, match="g\\+\\+.*searched"):
+        KernelCompiler("a5").ccu_compile_cache_token()
+
+
+def test_toolchain_rejects_linker_without_complete_archive_trace(toolchain_files, monkeypatch):
+    original_query = toolchain._ccu_query
+
+    def query(command, *, stderr=False):
+        if command[-1] == "-Wl,--version":
+            return "LLD 19.1.0 (compatible with GNU linkers)"
+        return original_query(command, stderr=stderr)
+
+    monkeypatch.setattr(toolchain, "_ccu_query", query)
+    with pytest.raises(ValueError, match="GNU ld.*runtime-library fingerprint"):
         KernelCompiler("a5").ccu_compile_cache_token()
 
 
@@ -290,6 +309,7 @@ def native_toolchain_files(sdk_files, tmp_path):
     compiler = shutil.which("g++")
     if compiler is None:
         pytest.skip("requires a native g++")
+    assert compiler is not None
     sdk, _, _ = sdk_files
     source = tmp_path / "empty.cpp"
     source.write_text('extern "C" void sdk_placeholder() {}\n')
@@ -375,6 +395,44 @@ def test_compile_ccu_concurrent_modules_round_trip(native_toolchain_files, tmp_p
         check=True,
     )
     assert any(dependency.endswith("/array") for dependency in depfile.read_text().split())
+
+
+@pytest.mark.parametrize("search_flag", ["driver", "split", "linker", "response"])
+def test_selected_runtime_archive_invalidates_cache(native_toolchain_files, tmp_path, search_flag):
+    runtime = tmp_path / "runtime with spaces"
+    runtime.mkdir()
+    archive = runtime / "libstdc++.a"
+    runtime_source = runtime / "runtime.cpp"
+    runtime_object = runtime / "runtime.o"
+    source = tmp_path / "module.cpp"
+    source.write_text(
+        'extern "C" int runtime_value();\nextern "C" int selected_runtime() { return runtime_value(); }\n'
+    )
+    flags = ["-static-libstdc++"]
+    if search_flag == "driver":
+        flags += [f"-L{runtime}"]
+    elif search_flag == "split":
+        flags += ["-L", str(runtime)]
+    elif search_flag == "linker":
+        flags += [f"-Wl,-L,{runtime}"]
+    else:
+        response = tmp_path / "link.rsp"
+        response.write_text(f'-L"{runtime}"\n')
+        flags += [f"@{response}"]
+    compiler = KernelCompiler("a5")
+    tokens, values = [], []
+    for version in (11, 22):
+        runtime_source.write_text(f'extern "C" int runtime_value() {{ return {version}; }}\n')
+        subprocess.run(["g++", "-fPIC", "-c", str(runtime_source), "-o", str(runtime_object)], check=True)
+        subprocess.run(["ar", "rcs", str(archive), str(runtime_object)], check=True)
+        tokens.append(compiler.ccu_compile_cache_token(extra_link_flags=flags))
+        artifact = tmp_path / f"module{version}.so"
+        artifact.write_bytes(compiler.compile_ccu(str(source), extra_link_flags=flags))
+        values.append(ctypes.CDLL(str(artifact)).selected_runtime())
+    assert values == [11, 22]
+    assert tokens[0] != tokens[1]
+    assert str(archive) in dict(tokens[0]["dependency_digests"])
+    assert tokens[1] == compiler.ccu_compile_cache_token(extra_link_flags=flags)
 
 
 @pytest.mark.parametrize("use_extra_include_dir", [False, True])

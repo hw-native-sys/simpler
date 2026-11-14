@@ -103,6 +103,12 @@ changes to header contents and header resolution. `dependency_digests` lists
 the files already fingerprinted by the query, including the compiler, SDK,
 ABI and selected runtime libraries. Individual UBSan checks such as
 `-fsanitize=signed-integer-overflow` also fingerprint their UBSan runtime.
+The query links an empty shared module with the build's ordered flags and SDK
+libraries, then fingerprints the inputs reported by GNU ld (bfd), including
+archives selected through custom `-L` directories and files referenced by
+linker scripts. Other linkers are rejected because their trace may omit archives
+from which the empty probe extracts no members. The probe does not execute the
+module; source and other caller-owned inputs still belong in the module key.
 
 Pass `library_paths` directly to the linker to use the exact SDK libraries
 fingerprinted by the query. CPU options such as `-march=native`, `-mcpu=native`

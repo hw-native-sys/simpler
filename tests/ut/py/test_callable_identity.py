@@ -597,6 +597,11 @@ def test_remote_worker_id_stays_stable_when_local_worker_is_added_later(monkeypa
 
         # Eager init() forks the local L3 child and starts the C++ scheduler, so
         # the mock must satisfy the register/init/orchestrator surface.
+        def _map_mailbox(self, fd, extent):
+            shm = next(shm for shm in worker._next_level_shms if shm._fd == fd)
+            assert worker_mod._mailbox_extent(shm) == extent
+            return worker_mod._mailbox_addr(shm)
+
         def add_sub_worker(self, *args):
             pass
 

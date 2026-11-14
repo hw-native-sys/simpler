@@ -355,12 +355,6 @@ _CCU_SDK_HEADERS = (
 _CCU_LIBRARIES = ("asccomm_ccu", "hcomm")
 _CCU_SDK_INCLUDE_DIRS = ("include", "include/hccl", "pkg_inc/hcomm/ccu", "include/hcomm/ccu")
 _CCU_ELF_MACHINES = {"x86_64": 62, "aarch64": 183}
-_CCU_SANITIZER_LIBRARIES = {"address": "asan", "undefined": "ubsan", "thread": "tsan", "leak": "lsan"}
-_CCU_UBSAN_CHECKS = frozenset(
-    "alignment bool bounds bounds-strict builtin enum float-cast-overflow float-divide-by-zero "
-    "integer-divide-by-zero nonnull-attribute null object-size pointer-overflow return returns-nonnull-attribute "
-    "shift shift-base shift-exponent signed-integer-overflow unreachable vla-bound vptr".split()
-)
 
 
 class _CcuCacheInputs(TypedDict):
@@ -458,44 +452,38 @@ def _ccu_compiler_dependencies(driver: list[str], flags: tuple[str, ...]) -> Ite
                 yield actual
 
     linker = "ld"
-    runtimes = []
     for flag in flags:
         if flag.startswith("-fuse-ld="):
             choice = flag.split("=", 1)[1]
             linker = choice if "/" in choice else f"ld.{choice}"
         elif flag.startswith("--ld-path="):
             linker = flag.split("=", 1)[1]
-        elif flag.startswith("-fsanitize="):
-            for name in flag.split("=", 1)[1].split(","):
-                if name in _CCU_SANITIZER_LIBRARIES or name in _CCU_UBSAN_CHECKS:
-                    runtime = "ubsan" if name in _CCU_UBSAN_CHECKS else _CCU_SANITIZER_LIBRARIES[name]
-                    extension = "a" if f"-static-lib{runtime}" in flags else "so"
-                    runtimes.append(f"lib{runtime}.{extension}")
     for name in dict.fromkeys((linker, "cc1plus", "collect2", "as", "lto-wrapper")):
         program = _ccu_query([*driver, f"-print-prog-name={name}"])
         path = _ccu_executable(program, required=name == linker)
         if path is not None:
             yield path
 
-    libstdcxx = "libstdc++.a" if "-static-libstdc++" in flags else "libstdc++.so"
-    # GCC can use libgcc.a even when the shared runtime is linked.
-    for name in dict.fromkeys(
-        (
-            "liblto_plugin.so",
-            libstdcxx,
-            "libgcc_s.so",
-            "libgcc.a",
-            "libgcc_eh.a",
-            "crtbeginS.o",
-            "crtendS.o",
-            "crti.o",
-            "crtn.o",
-            *runtimes,
-        )
-    ):
-        path = Path(_ccu_query([*driver, f"-print-file-name={name}"]))
-        if path.is_file() and path != Path(name):
-            yield path
+    path = Path(_ccu_query([*driver, "-print-file-name=liblto_plugin.so"]))
+    if path.is_file() and path != Path("liblto_plugin.so"):
+        yield path
+
+
+def _ccu_link_dependencies(command: list[str], output: Path) -> tuple[Path, ...]:
+    # GNU ld traces opened archives even when the probe extracts no members.
+    # Linkers that trace only extracted members cannot identify unused runtimes.
+    version = _ccu_query([*command, "-Wl,--version"])
+    if not any(line.startswith("GNU ld ") for line in version.splitlines()):
+        raise ValueError("CCU Host builds require GNU ld (bfd) for a complete runtime-library fingerprint")
+    trace = _ccu_query([*command, "-Wl,--trace"])
+    paths = tuple(
+        path
+        for line in trace.splitlines()
+        if (path := Path(line.strip())).is_file() and not path.resolve().is_relative_to(output.parent)
+    )
+    if not output.is_file() or not paths:
+        raise RuntimeError("CCU Host linker probe did not produce an artifact and dependency trace")
+    return paths
 
 
 def _ccu_sdk_file(roots: tuple[Path, Path], relative: str, machine: str) -> Path:
@@ -577,6 +565,25 @@ def _discover_ccu_build_inputs(
         if not {f"#define __{machine}__ 1", "#define __LP64__ 1", "#define __linux__ 1"}.issubset(macros):
             raise ValueError(f"CCU Host compiler {compiler} flags must select 64-bit {machine} Linux for the SDK")
         compiler_files = tuple(_ccu_compiler_dependencies(probe_driver, flags))
+        output = Path(directory) / "probe.so"
+        link_files = _ccu_link_dependencies(
+            [
+                str(compiler),
+                *compile_flags,
+                f"-I{directory}",
+                *(f"-I{path}" for path in (*include_dirs, *extra_include_dirs)),
+                "-x",
+                "c++",
+                os.devnull,
+                "-x",
+                "none",
+                *link_flags,
+                *(str(path) for path in library_paths),
+                "-o",
+                str(output),
+            ],
+            output,
+        )
     # The hccl and public ccu include directories are already under include/.
     header_dirs = (
         root / relative
@@ -588,6 +595,7 @@ def _discover_ccu_build_inputs(
         (
             compiler,
             *compiler_files,
+            *link_files,
             *library_paths,
             abi_header,
             *(header for directory in header_dirs for header in _ccu_sdk_headers(directory)),
