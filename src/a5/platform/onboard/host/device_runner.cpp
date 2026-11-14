@@ -16,6 +16,7 @@
  */
 
 #include "device_runner.h"
+#include "notification_context.h"
 
 #include "run_retention_probe.h"
 
@@ -49,6 +50,10 @@
 #include "host/raii_scope_guard.h"
 #include "host/run_boundary.h"
 #include "utils/fatal_shutdown_latch.h"
+
+std::shared_ptr<const HostNotificationContext> DeviceRunner::acquire_notification_context(uint64_t address) {
+    return comm_acquire_notification_context(device_id(), address);
+}
 
 // dep_gen has two shapes, one per orchestration site, and each runtime provides
 // the strong symbols for the one it uses:

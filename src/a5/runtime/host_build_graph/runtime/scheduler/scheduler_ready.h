@@ -91,7 +91,6 @@ struct SchedulerClusterMixPending {
     int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
     uint32_t block_idx{0};
     uint32_t next_fanin{0};
-    uint32_t blocked_rounds{0};
 };
 static_assert(alignof(SchedulerClusterMixPending) <= 8);
 
@@ -225,20 +224,16 @@ struct SchedulerLocalState {
     uint64_t pending_completed{0};
     uint64_t last_completion_flush_cycles{0};
     uint32_t control_peer_cursor{0};
-    uint64_t cooperative_scan_cursor{0};
     uint32_t cluster_prepare_seen{0};
     SchedulerClusterMixLocalState cluster_mix{};
     SchedulerClusterMixPending cluster_pending{};
-    uint64_t cluster_scan_cursor{0};
-    uint64_t cluster_scan_round{0};
-    uint64_t cooperative_scan_round{0};
     SchedulerExecutionToken execution_tokens[SCHEDULER_EXECUTION_TOKEN_COUNT]{};
-    uint64_t execution_scan_cursor{0};
-    uint64_t execution_directory_round{0};
+    uint64_t issue_observed_head{0};
+    int64_t issue_task_ref{SCHEDULER_TASK_REF_INVALID};
+    uint32_t issue_next_fanin{0};
+    uint8_t issue_observe_attempts{0};
     uint32_t execution_check_cursor{0};
-    uint32_t execution_park_cursor{0};
     int64_t continuation_task_ref{SCHEDULER_TASK_REF_INVALID};
-    uint32_t continuation_streak{0};
 
     inline __aicore__ explicit SchedulerLocalState(SchedulerLocalProfilingState *profile = nullptr) :
         profiling(profile) {}
@@ -396,8 +391,6 @@ static inline __aicore__ bool scheduler_initialize_local_config(
     // The loop above checked that lane 0 is the AIC and the rest are AIVs, so
     // the lane fixes the type and its immutable execution directory.
     config.self_core_type = config.self_lane == 0 ? 0U : 1U;
-    local->cooperative_scan_cursor = context->worker_index;
-    local->execution_scan_cursor = context->worker_index;
     return true;
 }
 
@@ -795,26 +788,16 @@ inline __aicore__ bool scheduler_has_execution_tokens(const SchedulerLocalState 
     return scheduler_execution_token_count(local) != 0;
 }
 
-inline __aicore__ int64_t
-scheduler_execution_token_last_owned_block(const SchedulerLocalState *local, int64_t task_ref) {
-    int64_t last = -1;
-    for (const auto &token : local->execution_tokens)
-        if (token.phase != SchedulerExecutionTokenPhase::EMPTY && token.task_ref == task_ref &&
-            static_cast<int64_t>(token.block_idx) > last)
-            last = token.block_idx;
-    for (const auto &slot : local->slots)
-        if (slot.state != SchedulerDispatchSlotState::FREE && slot.task_ref == task_ref &&
-            static_cast<int64_t>(slot.block_idx) > last)
-            last = slot.block_idx;
-    return last;
-}
-
 inline __aicore__ bool scheduler_execution_token_has_task(const SchedulerLocalState *local, int64_t task_ref) {
-    return scheduler_execution_token_last_owned_block(local, task_ref) >= 0;
+    for (const auto &token : local->execution_tokens)
+        if (token.phase != SchedulerExecutionTokenPhase::EMPTY && token.task_ref == task_ref) return true;
+    for (const auto &slot : local->slots)
+        if (slot.state != SchedulerDispatchSlotState::FREE && slot.task_ref == task_ref) return true;
+    return false;
 }
 
 // The physical slot gives its sole execution handle back to its owner's window.
-inline __aicore__ bool scheduler_park_execution_slot(SchedulerLocalState *local, uint32_t index) {
+inline __aicore__ bool scheduler_restore_execution_token(SchedulerLocalState *local, uint32_t index) {
     if (local == nullptr || local->config.graph == nullptr || index >= SCHEDULER_PENDING_SLOT_COUNT) return false;
     auto &slot = local->slots[index];
     if (!slot.execution_token || slot.state != SchedulerDispatchSlotState::READY || slot.prepared.claimed_state == 0)
@@ -860,7 +843,7 @@ static inline __aicore__ SchedulerTaskMetadata scheduler_load_dispatch_metadata(
 }
 
 // A task-local ticket reserves one canonical execution index. Its owner keeps
-// that reservation across slot parking without reserving another block.
+// that reservation across owner-local slot restoration without reserving another block.
 static inline __aicore__ PreparedAccessResult scheduler_prepare_dispatch_slot(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
     __gm__ SchedulerRunControl *run_control, const SchedulerFreeSlotClaim &slot_claim,
@@ -1030,11 +1013,6 @@ static inline __aicore__ bool scheduler_fill_dispatch_slot(
         subtask_slot, &prepare_start_cycles
     );
     if (prepared == PreparedAccessResult::ERROR) return false;
-    if (prepared == PreparedAccessResult::WAIT) return true;
-    if (prepared == PreparedAccessResult::EXHAUSTED) {
-        scheduler_initialize_free_slot(&slot);
-        return true;
-    }
     scheduler_publish_dispatch_slot(
         scheduler_state_base, scheduler, slot_claim, ready_claim, metadata, profiling_level, subtask_slot,
         prepare_start_cycles

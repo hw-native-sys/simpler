@@ -23,7 +23,9 @@ pytestmark = [
 @l3_case
 def test_close_drains_an_accepted_async_run(st_platform, st_device_ids, tmp_path):
     case = Case(delay_ms=200)
-    with CounterRunner(st_platform, st_device_ids, tmp_path, case) as runner:
+    # Close drains a live run; L1 retains resident execution identity without
+    # making the fence wait for every scalar poll in the delayed notification.
+    with CounterRunner(st_platform, st_device_ids, tmp_path, case, profiling_level=1) as runner:
         runner.require_support()
         handle = runner.submit()
         assert not handle.done, "run already completed: pending-close boundary was not exercised"

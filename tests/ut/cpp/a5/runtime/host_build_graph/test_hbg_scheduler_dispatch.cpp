@@ -231,7 +231,6 @@ TEST(SchedulerTokenDispatch, HostDoneAndConfirmedFaninPrefixDoNotReleaseTheRemai
     );
     ASSERT_EQ(scheduler_prepared_owner(predecessor.claimed_state), 1u);
     ASSERT_FALSE(scheduler_completion_done(f.control(1)->completion_state));
-    f.local()->execution_scan_cursor = 1;
     f.control(0)->completion_state = 0;
     bool progress = false;
     ASSERT_TRUE(
@@ -263,17 +262,24 @@ TEST(SchedulerTokenDispatch, InvalidFaninCannotGrantExecutionPermission) {
     DispatchFixture f(2);
     f.graph.executable(1, 0, {1});
     ASSERT_TRUE(f.prepare());
-    f.local()->execution_scan_cursor = 1;
+    // Ordered issue validates task 1 only after the valid task 0 has an owner.
+    uint32_t slot = UINT32_MAX;
+    ASSERT_TRUE(f.take(slot));
+    ASSERT_EQ(f.local()->slots[slot].task_ref, 0);
+    ASSERT_TRUE(f.complete(slot));
+    ASSERT_EQ(f.local()->pending_completed, 1u);
     bool progress = false;
     EXPECT_FALSE(
         scheduler_refill_execution_tokens(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, &progress)
     );
-    uint32_t slot = UINT32_MAX;
+    slot = UINT32_MAX;
     EXPECT_FALSE(scheduler_progress_execution_tokens(
         f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, &slot, &progress
     ));
     EXPECT_EQ(slot, UINT32_MAX);
-    EXPECT_EQ(f.local()->pending_completed, 0u);
+    EXPECT_EQ(f.local()->pending_completed, 1u);
+    EXPECT_EQ(f.control(1)->next_block, 0u);
+    EXPECT_FALSE(scheduler_completion_done(f.control(1)->completion_state));
     EXPECT_NE(f.storage.run_control->scheduler_error, 0u);
 }
 

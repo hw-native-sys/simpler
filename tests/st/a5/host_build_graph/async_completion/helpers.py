@@ -169,8 +169,9 @@ def assert_resident_capture(path: Path) -> None:
     assert captures, f"missing invocation evidence under {path}"
     for capture in captures:
         raw = json.loads(capture.read_text())
-        protocol = raw.get("aicore_protocol", {})
-        assert protocol.get("producer") == "aicore", f"not an AICore resident invocation: {capture}"
+        identity_key = "aicore_execution_identities" if raw.get("chip_swimlane_level") == 1 else "aicore_protocol"
+        identity = raw.get(identity_key, {})
+        assert identity.get("producer") == "aicore", f"not an AICore resident invocation: {capture}"
         assert raw.get("aicore_tasks"), f"no kernel executions in {capture}"
 
 
@@ -210,8 +211,9 @@ def compile_counter(platform: str):
 class CounterRunner:
     """Own an L3 worker so close tests cannot terminate another case's pooled worker."""
 
-    def __init__(self, platform: str, devices: list[int], directory: Path, case: Case):
+    def __init__(self, platform: str, devices: list[int], directory: Path, case: Case, *, profiling_level: int = 4):
         self.case = case
+        self.profiling_level = profiling_level
         self.directory = directory
         self.directory.mkdir(parents=True, exist_ok=True)
         self.compiled = compile_counter(platform)
@@ -289,7 +291,7 @@ class CounterRunner:
         self.capture = self.directory / f"run_{self.iteration}"
         self.capture.mkdir()
         config = CallConfig()
-        config.enable_chip_swimlane = 4
+        config.enable_chip_swimlane = self.profiling_level
         config.output_prefix = str(self.capture)
 
         def orchestrate(orch, _args, _config):

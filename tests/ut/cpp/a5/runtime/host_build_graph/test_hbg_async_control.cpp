@@ -115,8 +115,6 @@ struct AsyncFixture {
             state->async = &workers[worker];
             // Async producer execution is driven explicitly by this fixture;
             // start consumer discovery at the first successor's catalog entry.
-            state->cooperative_scan_cursor = tasks > 1 ? 1 : 0;
-            state->execution_scan_cursor = tasks > 1 ? 1 : 0;
         }
     }
 

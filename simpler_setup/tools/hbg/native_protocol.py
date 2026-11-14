@@ -122,6 +122,9 @@ def _array(value, path, count=None, *, signed=False):
 
 def _record(record, kind, path, extra_numbers=(), extra_arrays=None):
     numbers = NUMBERS[kind].split() + list(extra_numbers)
+    order_fields = ("schedule_rank", "topological_level", "bottom_level")
+    if kind == "task" and isinstance(record, dict) and any(name in record for name in order_fields):
+        numbers += list(order_fields)
     stamps = STAMPS.get(kind, "").split()
     arrays = ARRAYS.get(kind, {}) | (extra_arrays or {})
     _object(record, {*numbers, *stamps, *arrays}, path)
@@ -181,7 +184,7 @@ def read_native_protocol(section):
     ):
         _indices(section[table], count, table, key=key, dense=True)
         for row in section[table]:
-            extra = ("claim_tickets", "claim_seal", "parked_count") if kind == "control" else ()
+            extra = ("claim_tickets", "claim_seal") if kind == "control" else ()
             _record(row, kind, f"{table}[{row[key]}]", extra)
     for row in section["admissions"]:
         if len(row["close_seals"]) not in (0, section["cluster_count"]):

@@ -87,6 +87,7 @@ public:
 
     DeviceRunner() = default;
     ~DeviceRunner();
+    std::shared_ptr<const HostNotificationContext> acquire_notification_context(uint64_t address) override;
     std::thread create_thread(std::function<void()> fn) override;
 
     // `setup_static_arena`, `allocate_tensor`, `free_tensor`,

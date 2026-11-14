@@ -433,7 +433,6 @@ static inline __aicore__ bool scheduler_gm_mix_prepare_lane(
             graph, base, local, run, claim, ready, metadata, profiling_level, group.subtask_slot,
             &group.prepare_start_cycles
         );
-        if (prepared == PreparedAccessResult::WAIT) return true;
         if (prepared != PreparedAccessResult::READY)
             return scheduler_admission_fail(
                 graph, local, run, ready.task_ref, SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED

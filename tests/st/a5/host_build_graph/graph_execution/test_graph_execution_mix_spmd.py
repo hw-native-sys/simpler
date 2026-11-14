@@ -9,11 +9,14 @@
 # -----------------------------------------------------------------------------------------------------------
 """Graph Execution preserves MIX active slots and multi-block SPMD metadata."""
 
+import json
+from pathlib import Path
+
 import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
+from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
 FLOATS_PER_CACHE_LINE = 16
 SLOTS_PER_BLOCK = 3
@@ -31,7 +34,7 @@ class TestGraphExecutionMixSpmdHostBuildGraphA5(SceneTestCase):
         "orchestration": {
             "source": "kernels/orchestration/graph_execution_mix_spmd_orch.cpp",
             "function_name": "aicpu_orchestration_entry",
-            "signature": [D.INOUT, D.INOUT, D.INOUT],
+            "signature": [D.INOUT, D.INOUT, D.INOUT, D.SCALAR],
         },
         "incores": [
             {
@@ -61,6 +64,11 @@ class TestGraphExecutionMixSpmdHostBuildGraphA5(SceneTestCase):
             "platforms": ["a5sim", "a5"],
             "params": {},
         },
+        {
+            "name": "partial_sync_2",
+            "platforms": ["a5sim", "a5"],
+            "params": {"blocks": 2},
+        },
     ]
 
     def generate_args(self, params):
@@ -68,6 +76,7 @@ class TestGraphExecutionMixSpmdHostBuildGraphA5(SceneTestCase):
             TensorArg("blocks_1", torch.zeros(TOTAL_FLOATS, dtype=torch.float32)),
             TensorArg("blocks_2", torch.zeros(TOTAL_FLOATS, dtype=torch.float32)),
             TensorArg("blocks_3", torch.zeros(TOTAL_FLOATS, dtype=torch.float32)),
+            Scalar("blocks", params.get("blocks", 0)),
         )
 
     def compute_golden(self, args, params):
@@ -85,12 +94,36 @@ class TestGraphExecutionMixSpmdHostBuildGraphA5(SceneTestCase):
         assert nonzero.numel() > 0, "SPMD Graph did not execute any non-zero block"
         cluster_count = int(cache_line_heads.max().item()) + 1
         assert 1 < cluster_count <= MAX_CLUSTERS
+        if params.get("blocks"):
+            assert cluster_count == params["blocks"], "partial cohort did not execute its requested block count"
 
         expected = torch.zeros_like(cache_line_heads)
         for block_idx in range(cluster_count):
             begin = block_idx * SLOTS_PER_BLOCK
             expected[begin : begin + SLOTS_PER_BLOCK] = float(block_idx)
         assert torch.equal(cache_line_heads, expected)
+
+    def _run_and_validate_l2(self, worker, callable_obj, case, **kwargs):
+        """Check Graph instance membership and execution coverage in L4 captures."""
+        super()._run_and_validate_l2(worker, callable_obj, case, **kwargs)
+        if kwargs.get("enable_chip_swimlane", 0) < 4:
+            return
+        captures = list(Path(kwargs["output_prefix"]).rglob("chip_swimlane_records.json"))
+        assert len(captures) == 1, captures
+        protocol = json.loads(captures[0].read_text())["aicore_protocol"]
+        assert protocol["schema"] == "hbg-native-protocol-v23"
+        cohorts = [task for task in protocol["tasks"] if task["active_mask"] == 7 and task["flags"] & 16]
+        assert len(cohorts) == 3, "every Graph instance must contain its own MIX sync cohort"
+        requested = case["params"].get("blocks", 0)
+        expected = requested or protocol["cluster_count"]
+        assert all(task["block_num"] == expected for task in cohorts)
+        expected_executions = {(block, lane) for block in range(expected) for lane in range(SLOTS_PER_BLOCK)}
+        for task in cohorts:
+            executions = [row for row in protocol["executions"] if row["task_ref"] == task["task_ref"]]
+            assert len(executions) == len(expected_executions)
+            assert {(row["block_idx"], row["subtask_slot"]) for row in executions} == expected_executions
+        if requested:
+            assert 1 < requested < protocol["cluster_count"], "the selected cohort was not partial"
 
 
 if __name__ == "__main__":

@@ -655,9 +655,8 @@ class NativeAudit:
         task = self.tasks[ref]
         count = task["block_num"]
         if not task["flags"] & SYNC:
-            # Ordinary records identify the final group owner, including a
-            # possible PARKED reacquisition. They carry no fresh-ticket order
-            # certificate or sync close seal.
+            # Ordinary records identify the fixed group owner. They carry
+            # no fresh-ticket order certificate or sync close seal.
             require(
                 all(block["claim"] is None for block in blocks), "ordinary cluster fabricated a sync claim certificate"
             )
