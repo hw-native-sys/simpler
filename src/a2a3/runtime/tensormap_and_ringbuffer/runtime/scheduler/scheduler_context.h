@@ -103,7 +103,7 @@ public:
     // cores, init profiling subsystems, read task counts, init payloads.
     int32_t post_handshake_init(Runtime *runtime);
 
-    // Reset all SchedulerContext-owned state to its post-construction defaults.
+    // Reset run coordination and bindings. Per-core state is initialized on entry.
     // Called by AicpuExecutor::deinit() during per-run teardown.
     void deinit();
 

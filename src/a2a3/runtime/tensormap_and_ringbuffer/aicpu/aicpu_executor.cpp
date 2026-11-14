@@ -615,9 +615,8 @@ int32_t AicpuExecutor::load_orch_so(
  * submitted task count to the scheduler.
  *
  * Returns 0, or -1 after publishing `runtime_init_ready_` so the scheduler
- * peers stop spinning. `rt` is null on every failure path — deinit() leaves it
- * so between runs, and the paths that had already set it clear it again — which
- * is how those peers know to skip dispatch.
+ * peers stop spinning. `rt` is null on every failure path, which is how those
+ * peers know to skip dispatch.
  *
  * A failure returns to run() rather than out of it. The caller's teardown tail
  * is what retires this thread's cores and arrives at the completion gate, and
@@ -1208,7 +1207,6 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     const PlatformEntryArgs view = get_platform_entry_args(platform_aicpu_affinity_thread_idx());
     simpler::tmr::clean_entry_runtime(*runtime, view, terminal_publisher_.snapshot_is_ok(), cache_invalidate_range);
 
-    // Reset all SchedulerContext-owned state in one place.
     sched_ctx_.deinit();
 
     orch_args_cached_.reset();
@@ -1216,9 +1214,6 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     // orch_so_table_ entries are intentionally preserved across deinit: they
     // are loaded once by register_callable and consumed by every subsequent
     // run. The destructor releases them at process teardown.
-
-    // Clear file-scope RuntimeContext pointer (freed by orchestrator thread before deinit)
-    rt = nullptr;
 
     // Clear dep_gen file-local bookkeeping. No-op when dep_gen is disabled.
     dep_gen_aicpu_finalize();

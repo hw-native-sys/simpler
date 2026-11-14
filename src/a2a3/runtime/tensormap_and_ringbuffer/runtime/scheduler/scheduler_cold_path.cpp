@@ -1590,12 +1590,9 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
 }
 
 void SchedulerContext::deinit() {
-    // Reset all per-core execution state
-    for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
-        core_exec_states_[i] = {};
-        core_exec_states_[i].running_reg_task_id = AICPU_TASK_INVALID;
-        core_exec_states_[i].pending_reg_task_id = AICPU_TASK_INVALID;
-    }
+    // Per-core state is initialized by pre_handshake_init before any next-run
+    // consumer is released. All scheduler participants have retired before
+    // this cleanup; no per-core state is consumed until that initialization.
 
     // No per-core memset of payload_per_core_ / deferred_slab_per_core_ here
     // (~300 KB across all cores). They are re-initialized before they can be read:
@@ -1606,9 +1603,9 @@ void SchedulerContext::deinit() {
     // error_code = NONE) are all cleared once per run in init() — the slab is
     // thereafter re-cleared only by the completion path after a deferred task.
     // The consumer side cannot reach a stale slot either: the
-    // drain only services a core's running_reg_task_id, and the loop above
-    // already reset every core_exec_states_[].running/pending_reg_task_id to
-    // AICPU_TASK_INVALID — so no FIN for an undispatched slot is processed, and
+    // drain only services initialized cores: pre_handshake_init clears all
+    // states and handshake publishes INVALID running/pending IDs before dispatch.
+    // Thus no FIN for an undispatched slot is processed, and
     // the count-gated consumer never reads entries[] past the fresh count.
 
     // Reset sync-start drain coordination — a previous run that aborted mid-drain
