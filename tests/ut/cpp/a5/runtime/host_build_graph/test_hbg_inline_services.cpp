@@ -76,13 +76,9 @@ struct InlineFixture {
         EXPECT_TRUE(scheduler_init_spmd_task_records(base(), storage.layout, 61));
         EXPECT_TRUE(storage.prepare_calls(graph.graph()));
         run()->active_worker_count = workers;
-        run()->aic_active_worker_count = workers / 3;
-        run()->aiv_active_worker_count = 2 * workers / 3;
         run()->expected_task_count = 3;
         for (uint32_t worker = 0; worker < workers; ++worker) {
             auto &context = storage.contexts[worker];
-            context.is_scheduler = 1;
-            context.scheduler_count = workers;
             for (uint32_t lane = 0; lane < 3; ++lane)
                 context.cluster_worker_ids[lane] = worker / 3 * 3 + lane;
             storage.test_graphs[worker] = graph.graph();
@@ -260,7 +256,6 @@ TEST(HbgInlineService, ConsumerPollingServicesDummyWithoutReportingKernelRefill)
     );
     EXPECT_EQ(fixture.locals[1]->pending_completed, 2u);
     EXPECT_EQ(fixture.trace(2).valid, 0u);
-    EXPECT_EQ(fixture.trace(0).refill_start_cycles, 0u);
 }
 
 TEST(HbgInlineService, TwoBlocksThenDummyReleaseTheSuccessorExactlyOnce) {

@@ -189,8 +189,6 @@ TEST(HbgScalarTrace, UnboundPrimitivesPreserveOperandsAndPerformOneUpdate) {
     EXPECT_EQ(signed_word, 13);
     EXPECT_EQ(scheduler_gm_compare_exchange(signed_word, -7, 99), 13);
     EXPECT_EQ(signed_word, 13);
-    EXPECT_EQ(scheduler_gm_exchange(signed_word, -11), 13);
-    EXPECT_EQ(signed_word, -11);
     EXPECT_EQ(scheduler_gm_fetch_add(unsigned_word, UINT64_C(3)), UINT64_C(0xfedcba9876543210));
     EXPECT_EQ(unsigned_word, UINT64_C(0xfedcba9876543213));
     scheduler_gm_fetch_add_discard(unsigned_word, UINT64_C(2));
@@ -212,9 +210,7 @@ TEST(HbgScalarTrace, MemoryObservationPreservesResultsAndRecordsDistinctPrimitiv
         binding.attach(&trace);
         int64_t signed_word = 7;
         uint64_t unsigned_word = 10;
-        EXPECT_EQ(scheduler_gm_load(signed_word), 7);
         EXPECT_EQ(scheduler_gm_compare_exchange(signed_word, 7, 8), 7);
-        EXPECT_EQ(scheduler_gm_exchange(signed_word, 9), 8);
         EXPECT_EQ(scheduler_gm_fetch_add(unsigned_word, UINT64_C(2)), 10u);
         scheduler_gm_fetch_add_discard(unsigned_word, UINT64_C(3));
         scheduler_gm_store(signed_word, 12);
@@ -224,15 +220,13 @@ TEST(HbgScalarTrace, MemoryObservationPreservesResultsAndRecordsDistinctPrimitiv
         scheduler_invalidate_cache_line(&signed_word);
         scheduler_cache_barrier();
         scheduler_ddr_barrier();
-        EXPECT_EQ(trace.committed, 11u);
+        EXPECT_EQ(trace.committed, 9u);
         EXPECT_EQ(trace.depth, 0u);
     }
     EXPECT_EQ(scheduler_scalar_current(), nullptr);
     trace.finish(scheduler_cycles());
     const SchedPhaseKind expected[] = {
-        SchedPhaseKind::ScalarAtomicLoad,
         SchedPhaseKind::ScalarAtomicCas,
-        SchedPhaseKind::ScalarAtomicExchange,
         SchedPhaseKind::ScalarAtomicFetchAdd,
         SchedPhaseKind::ScalarAtomicFetchAddIssue,
         SchedPhaseKind::ScalarAtomicStoreIssue,
@@ -243,7 +237,7 @@ TEST(HbgScalarTrace, MemoryObservationPreservesResultsAndRecordsDistinctPrimitiv
         SchedPhaseKind::ScalarDsbDdr,
     };
     const auto decoded = decode(trace);
-    for (uint32_t i = 0; i < 11; ++i) {
+    for (uint32_t i = 0; i < std::size(expected); ++i) {
         EXPECT_EQ(kind(decoded[i]), static_cast<uint32_t>(expected[i]));
         EXPECT_EQ(decoded[i].count, 1u);
         EXPECT_EQ(decoded[i].kind >> 16, 1u);
@@ -565,14 +559,12 @@ TEST(SchedulerActivityBuffer, IsAllocatedOnlyWhenRequestedAndNeverWraps) {
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(storage.base(), enabled.worker_contexts_offset);
     auto *buffers = scheduler_state_at<SchedulerActivityBuffer>(storage.base(), enabled.activity_buffers_offset);
     contexts[0].worker_index = SCHEDULER_WORKER_CAPACITY - 1;
-    contexts[0].is_scheduler = 1;
-    contexts[0].scheduler_index = SCHEDULER_WORKER_CAPACITY - 1;
     SchedulerLocalState local{};
     SchedulerLocalProfilingState profile{};
     local.profiling = &profile;
     local.profiling->activity_buffers_offset = contexts[0].activity_buffers_offset;
-    local.config.scheduler_index = contexts[0].scheduler_index;
     local.config.self_lane = 0;
+    local.config.worker_ids[0] = SCHEDULER_WORKER_CAPACITY - 1;
     local.profiling->loop_iter = 17;
     SchedulerActivityBuffer &buffer = buffers[SCHEDULER_WORKER_CAPACITY - 1];
     buffer.committed = SCHEDULER_ACTIVITY_CAPACITY - 1;

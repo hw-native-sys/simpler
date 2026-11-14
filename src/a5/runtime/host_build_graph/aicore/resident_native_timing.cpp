@@ -18,28 +18,28 @@ namespace simpler::hbg::resident {
 template <bool WithNativeGraph, CoreType Architecture>
 __aicore__ void run_timing(
     __gm__ SchedulerWorkerContext *context, __gm__ SchedulerRunControl *run_control, __gm__ void *scheduler_state_base,
-    uint64_t profiling_level, uint64_t aicore_entry_cycles, uint64_t handshake_publish_cycles
+    uint64_t profiling_level, uint64_t aicore_entry_cycles
 ) {
     static_assert(!kSchedulerScalarInstrumentation);
     run_resident_scheduler<true, WithNativeGraph>(
-        context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles, handshake_publish_cycles
+        context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles
     );
 }
 
 #if defined(__DAV_CUBE__)
 template __aicore__ void run_timing<true, CoreType::AIC>(
-    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, uint64_t
+    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t
 );
 #elif defined(__DAV_VEC__)
 template __aicore__ void run_timing<true, CoreType::AIV>(
-    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, uint64_t
+    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t
 );
 #else
 template __aicore__ void run_timing<true, CoreType::AIC>(
-    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, uint64_t
+    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t
 );
 template __aicore__ void run_timing<true, CoreType::AIV>(
-    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, uint64_t
+    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t
 );
 #endif
 

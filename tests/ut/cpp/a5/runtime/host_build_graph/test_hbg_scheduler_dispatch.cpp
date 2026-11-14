@@ -35,7 +35,6 @@ struct DispatchFixture {
         storage(count, 3),
         graph(count) {
         for (uint32_t worker = 0; worker < 3; ++worker) {
-            storage.contexts[worker].is_scheduler = 1;
             for (uint32_t lane = 0; lane < 3; ++lane)
                 storage.contexts[worker].cluster_worker_ids[lane] = lane;
         }
@@ -131,9 +130,6 @@ TEST(SchedulerTokenDispatch, ReusingTheSlotKeepsEachTraceBoundToItsExecution) {
     f.graph.executable(1, 0, {0});
     ASSERT_TRUE(f.prepare());
     auto *traces = scheduler_state_at<SchedulerTaskTrace>(f.base(), f.storage.layout.trace_cells_offset);
-    auto &context = f.storage.contexts[0];
-    context.trace_aicore_entry_cycles = 17;
-    context.trace_descriptor_cache_observed_cycles = 19;
     uint32_t reused_slot = UINT32_MAX;
     for (uint32_t task = 0; task < 2; ++task) {
         uint32_t slot;
@@ -149,11 +145,7 @@ TEST(SchedulerTokenDispatch, ReusingTheSlotKeepsEachTraceBoundToItsExecution) {
         ASSERT_TRUE(f.complete(slot, 3));
         EXPECT_EQ(traces[task].kernel_start_cycles, 100 + task);
         EXPECT_EQ(traces[task].kernel_end_cycles, 200 + task);
-        EXPECT_EQ(traces[task].aicore_entry_cycles, 17u);
-        EXPECT_EQ(traces[task].descriptor_cache_observed_cycles, 19u);
         EXPECT_EQ(traces[task].valid, 1u);
-        context.trace_aicore_entry_cycles = 123;
-        context.trace_descriptor_cache_observed_cycles = 456;
     }
     EXPECT_EQ(traces[0].kernel_start_cycles, 100u);
     EXPECT_EQ(traces[0].kernel_end_cycles, 200u);
@@ -359,9 +351,6 @@ void configure_cached_cluster(FixtureStorage &storage) {
     for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
         auto &context = storage.contexts[lane];
         context.core_type = static_cast<int32_t>(lane == 0 ? CoreType::AIC : CoreType::AIV);
-        context.scheduler_count = 1;
-        context.scheduler_index = 0;
-        context.is_scheduler = 1;
         for (uint32_t peer = 0; peer < PLATFORM_CORES_PER_BLOCKDIM; ++peer)
             context.cluster_worker_ids[peer] = peer;
     }
@@ -379,15 +368,15 @@ TEST(SchedulerLocalConfig, SnapshotsImmutableConfigurationAndReloadsOnNextRun) {
         ASSERT_TRUE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
         EXPECT_EQ(local.config.self_lane, self_lane);
         EXPECT_EQ(local.config.worker_ids[0], 0u);
-        EXPECT_EQ(scheduler_completion_id(&local, 7), 7 * 3 + self_lane);
-        context.scheduler_count = 2;
-        context.scheduler_index = 1;
-        EXPECT_EQ(local.config.scheduler_count, 1u);
-        EXPECT_EQ(local.config.scheduler_index, 0u);
+        EXPECT_EQ(local.worker_id(), self_lane);
+        EXPECT_EQ(local.config.runtime_worker_count, 3u);
+        const uint64_t callable_count = context.callable_addresses_count;
+        context.callable_addresses_count = callable_count + 1;
+        EXPECT_EQ(local.config.callable_addresses_count, callable_count);
         SchedulerLocalState next_run{};
         ASSERT_TRUE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &next_run));
-        EXPECT_EQ(next_run.config.scheduler_count, 2u);
-        EXPECT_EQ(next_run.config.scheduler_index, 1u);
+        EXPECT_EQ(next_run.config.callable_addresses_count, callable_count + 1);
+        EXPECT_EQ(next_run.worker_id(), self_lane);
         EXPECT_EQ(next_run.profiling, nullptr);
         EXPECT_EQ(next_run.pending_completed, 0u);
     }
@@ -425,16 +414,16 @@ TEST(SchedulerLocalConfig, RejectsTruncatedOffsetsAndInvalidCoreTypes) {
     pool->version = SCHEDULER_TASK_CATALOG_VERSION;
     summary->prepared_layout_offset = prepared_offset;
     context.prepared_layout_offset = prepared_offset;
-    const uint64_t scheduler_count = context.scheduler_count;
+    const uint64_t runtime_worker_count = context.runtime_worker_count;
     for (uint64_t invalid_count : {UINT64_C(0), uint64_t{SCHEDULER_WORKER_CAPACITY + 1}}) {
-        context.scheduler_count = invalid_count;
+        context.runtime_worker_count = invalid_count;
         EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
     }
-    context.scheduler_count = scheduler_count;
-    const uint64_t scheduler_index = context.scheduler_index;
-    context.scheduler_index = scheduler_count;
+    context.runtime_worker_count = runtime_worker_count;
+    const uint64_t worker_index = context.worker_index;
+    context.worker_index = runtime_worker_count;
     EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
-    context.scheduler_index = scheduler_index;
+    context.worker_index = worker_index;
     for (auto field :
          {&SchedulerWorkerContext::worker_contexts_offset, &SchedulerWorkerContext::callable_addresses_count,
           &SchedulerWorkerContext::task_metadata_offset}) {
@@ -463,14 +452,10 @@ TEST(SchedulerLocalConfig, RejectsInvalidTopologyBeforeMailboxAccess) {
     context.cluster_worker_ids[1] = 0;
     EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
     context.cluster_worker_ids[1] = 1;
-    context.is_scheduler = 0;
+    context.worker_index = 3;
     EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
-    context.is_scheduler = 1;
-    context.scheduler_count = SCHEDULER_WORKER_CAPACITY;
-    context.scheduler_index = SCHEDULER_WORKER_CAPACITY - 1;
+    context.worker_index = 2;
     EXPECT_TRUE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
-    context.scheduler_index = SCHEDULER_WORKER_CAPACITY;
-    EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
 }
 
 TEST(SchedulerPredicate, DistinguishesFailedAndMalformedPredicates) {

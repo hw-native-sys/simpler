@@ -25,23 +25,24 @@ from simpler_setup.tools.swimlane_converter import generate_chrome_trace_json, r
 
 
 @pytest.mark.parametrize(
-    "mask,blocks,source,publication",
-    ((1, 1, 0, 0), (2, 1, 0, 0), (1, 1, 2, 0), (1, 1, 2, 1), (1, 2, 0, 0), (7, 1, 3, 0)),
-    ids=("aic_pool", "aiv_pool", "direct", "direct_refill", "spmd_distributed", "mix_cooperative"),
+    "mask,blocks,source",
+    ((1, 1, 0), (2, 1, 0), (1, 2, 0), (7, 1, 3)),
+    ids=("aic_catalog", "aiv_catalog", "spmd_distributed", "mix_cooperative"),
 )
-def test_current_ready_sources_preserve_ordinary_and_cooperative_causality(mask, blocks, source, publication):
+def test_current_ready_sources_preserve_ordinary_and_cooperative_causality(mask, blocks, source):
     raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
     for execution in raw["executions"]:
-        execution.update(ready_source=source, publication_mode=publication)
+        execution["ready_source"] = source
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
 
 
+@pytest.mark.parametrize("source", (1, 2))
 @pytest.mark.parametrize("mask,blocks", ((1, 1), (2, 1), (1, 2), (7, 1)))
-def test_current_ready_sources_reject_removed_stolen_source(mask, blocks):
+def test_current_ready_sources_reject_unproduced_sources(mask, blocks, source):
     raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
-    raw["executions"][0]["ready_source"] = 1
-    with pytest.raises(ValueError, match="invalid source/publication mode"):
+    raw["executions"][0]["ready_source"] = source
+    with pytest.raises(ValueError, match="invalid ready source"):
         audit_native_protocol(raw, identities)
 
 
@@ -63,7 +64,7 @@ def _set_claim_seal_observation(raw, identities, *, sealed=True):
 def _resource_scoped_capture(masks=(3, 5, 3, 7, 6), clusters=2, blocks=3):
     raw, identities = ProtocolBuilder([(mask, blocks, ()) for mask in masks], clusters=clusters).run()
     _set_claim_seal_observation(raw, identities)
-    raw["schema"] = "hbg-native-protocol-v20"
+    raw["schema"] = "hbg-native-protocol-v22"
     return raw, identities
 
 
@@ -236,7 +237,7 @@ def test_partial_sync_terminal_tickets_accept_bounded_tail(mask, blocks, tail):
 def test_current_full_sync_start_remains_ticket_free(mask):
     blocks = 4 if mask in (2, 4) else 2
     raw, identities = ProtocolBuilder([(mask, blocks, ())], sync_tasks=(0,)).run()
-    raw["schema"] = "hbg-native-protocol-v20"
+    raw["schema"] = "hbg-native-protocol-v22"
     raw["task_controls"][0].update(claim_tickets=0)
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
     raw["task_controls"][0]["claim_tickets"] = 1
@@ -249,7 +250,7 @@ def test_current_full_sync_start_remains_ticket_free(mask):
 @pytest.mark.parametrize("tail", (False, True))
 def test_ordinary_work_has_no_sync_claim_tickets(mask, blocks, tail):
     raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v20"
+    raw["schema"] = "hbg-native-protocol-v22"
     raw["task_controls"][0]["claim_tickets"] = int(tail)
     if tail:
         with pytest.raises(ValueError, match="ticket"):
@@ -263,7 +264,7 @@ def test_current_partial_sync_start_bounds_tickets_by_eligible_positions(mask):
     blocks = 2
     positions = 8 if mask in (2, 4) else 4
     raw, identities = ProtocolBuilder([(mask, blocks, ())], clusters=4, sync_tasks=(0,)).run()
-    raw["schema"] = "hbg-native-protocol-v20"
+    raw["schema"] = "hbg-native-protocol-v22"
     raw["task_controls"][0]["claim_tickets"] = positions
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
     for invalid in (blocks - 1, positions + 1):
@@ -277,7 +278,7 @@ def test_current_partial_sync_start_bounds_tickets_by_eligible_positions(mask):
 def test_current_small_claims_reject_invalid_raw_ticket_values(mask, fault):
     positions = 4 if mask in (2, 4) else 2
     raw, identities = ProtocolBuilder([(mask, 2, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v20"
+    raw["schema"] = "hbg-native-protocol-v22"
     if fault == "missing":
         del raw["task_controls"][0]["claim_tickets"]
     else:
@@ -297,7 +298,7 @@ def test_current_small_claims_reject_invalid_raw_ticket_values(mask, fault):
 @pytest.mark.parametrize("counter", ("next_block", "completed_subtasks"))
 def test_current_valid_raw_tickets_do_not_excuse_wrong_valid_or_completion_counts(mask, delta, counter):
     raw, identities = ProtocolBuilder([(mask, 2, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v20"
+    raw["schema"] = "hbg-native-protocol-v22"
     raw["task_controls"][0]["claim_tickets"] = 0
     raw["task_controls"][0][counter] += delta
     with pytest.raises(ValueError, match="terminal .*counter"):
@@ -525,21 +526,6 @@ def test_ordinary_blocks_reuse_two_slots_after_retirement():
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
 
 
-def test_direct_refill_payload_follows_previous_trace_and_task_done():
-    raw, identities = ProtocolBuilder([(1, 1, ()), (1, 1, (0,))]).run()
-    next_execution = raw["executions"][1]
-    previous_done = raw["task_events"][0]["completion"]["after"][0]
-    previous_trace = raw["executions"][0]["trace_published"][0]
-    next_execution.update(
-        ready_source=2,
-        publication_mode=1,
-        publication_before_cycles=previous_trace + 1,
-        publication_after_cycles=previous_trace + 2,
-    )
-    assert previous_done < previous_trace < next_execution["publication_before_cycles"]
-    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
-
-
 def test_cross_core_successor_can_enter_before_producer_trace_publication():
     raw, identities = ProtocolBuilder([(1, 1, ()), (2, 1, (0,))]).run()
     producer, consumer = raw["executions"]
@@ -553,7 +539,7 @@ def test_cross_core_successor_can_enter_before_producer_trace_publication():
 
 def test_synchronous_done_is_the_last_contribution_without_extra_sequence_events():
     raw, identities = ProtocolBuilder([(1, 1, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v20"
+    raw["schema"] = "hbg-native-protocol-v22"
     execution = raw["executions"][0]
     done = raw["task_events"][0]["completion"]
     assert done["flags"] & (1 << 30)
@@ -672,7 +658,7 @@ def test_real_converter_preserves_native_audit_in_perfetto_metadata(tmp_path):
     path.write_text(json.dumps(wire_capture()))
     parsed = read_perf_data(path)
     assert parsed["protocol_audit"]["protocol_verified"] is True
-    assert parsed["native_protocol"]["schema"] == "hbg-native-protocol-v20"
+    assert parsed["native_protocol"]["schema"] == "hbg-native-protocol-v22"
     trace = generate_chrome_trace_json(
         parsed["tasks"], None, runtime_name="host_build_graph", timeline_metadata=parsed["timeline_metadata"]
     )
@@ -793,7 +779,7 @@ def test_ordinary_variable_grids_have_no_admission_membership(blocks):
     builder = ProtocolBuilder(shapes, clusters=6)
     raw, identities = builder.run()
     _set_claim_seal_observation(raw, identities)
-    raw.update(schema="hbg-native-protocol-v20", close_seal_stride=64)
+    raw.update(schema="hbg-native-protocol-v22", close_seal_stride=64)
     assert audit_native_protocol(raw, identities)["protocol_verified"]
     assert raw["cooperative_task_count"] == 0
     assert raw["admissions"] == raw["members"] == raw["blocks"] == []
@@ -808,7 +794,7 @@ def test_ordinary_variable_grids_have_no_admission_membership(blocks):
 def test_compact_admission_and_seals_accept_64_only_alignment_and_reject_bad_regions(mutation):
     raw, identities = ProtocolBuilder([(7, 2, ()), (7, 2, (0,))], clusters=2, sync_tasks=(0, 1)).run()
     _set_claim_seal_observation(raw, identities)
-    raw.update(schema="hbg-native-protocol-v20", close_seal_stride=64)
+    raw.update(schema="hbg-native-protocol-v22", close_seal_stride=64)
     for index, row in enumerate(raw["admissions"]):
         row["record_offset"] += 64
         row["close_seals_offset"] = 8192 + 64 + index * raw["cluster_count"] * 64
@@ -833,7 +819,7 @@ def test_compact_admission_and_seals_accept_64_only_alignment_and_reject_bad_reg
 def test_current_cooperative_capture_rejects_independent_flag():
     raw, identities = ProtocolBuilder([(1, 2, ())]).run()
     _set_claim_seal_observation(raw, identities)
-    raw.update(schema="hbg-native-protocol-v20", close_seal_stride=64)
+    raw.update(schema="hbg-native-protocol-v22", close_seal_stride=64)
     assert audit_native_protocol(raw, identities)["protocol_verified"]
     raw["tasks"][0]["flags"] |= 128
     raw["task_events"][0]["completion"]["flags"] |= 128
@@ -848,7 +834,7 @@ def _subtask_capture(shapes=((3, 2, ()), (2, 1, (0,))), *, deferred=()):
         deferred_tasks=deferred,
     ).run()
     _set_claim_seal_observation(raw, identities)
-    raw["schema"] = "hbg-native-protocol-v20"
+    raw["schema"] = "hbg-native-protocol-v22"
     return raw, identities
 
 
@@ -1012,3 +998,10 @@ def test_early_claim_timestamps_cannot_be_attached_to_later_protocol_sequences()
         owner[claim][0] = predecessor[execution][0]
     with pytest.raises(ValueError, match="backwards clock"):
         audit_native_protocol(builder.raw, builder.identities)
+
+
+def test_current_protocol_rejects_removed_refill_publication_field():
+    raw, identities = ProtocolBuilder([(1, 1, ())]).run()
+    raw["executions"][0]["publication_mode"] = 0
+    with pytest.raises(ValueError, match="unknown fields"):
+        audit_native_protocol(raw, identities)

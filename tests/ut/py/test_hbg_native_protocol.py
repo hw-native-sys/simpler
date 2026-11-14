@@ -18,7 +18,7 @@ from simpler_setup.tools.hbg.native_protocol import audit_protocol_sequences, re
 
 def capture(epoch=0):
     return {
-        "schema": "hbg-native-protocol-v20",
+        "schema": "hbg-native-protocol-v22",
         "producer": "aicore",
         "run_epoch": epoch,
         "task_count": 1,
@@ -34,7 +34,6 @@ def capture(epoch=0):
         "resolved_task_count": 1,
         "close_seal_stride": 64,
         "active_worker_count": 3,
-        "scheduler_count": 3,
         "scheduler_error": 0,
         "error_claimed": 0,
         "commit_tail": 0,
@@ -119,7 +118,7 @@ def test_literal_epochs_and_cycle_zero_survive_without_claiming_causality(epoch)
 @pytest.mark.parametrize("stride", (None, 0, 8, 63, 65, 128, True, 64.0, "64", -1, 1 << 64))
 def test_compact_schema_requires_64_byte_seals_and_omits_unused_execution_counter(stride):
     raw = capture()
-    raw.update(schema="hbg-native-protocol-v20", close_seal_stride=64)
+    raw.update(schema="hbg-native-protocol-v22", close_seal_stride=64)
     raw["task_controls"][0].update(claim_tickets=0, claim_seal=0)
     assert read_native_protocol(raw) == raw
     raw["executed_task_count"] = 0
@@ -238,7 +237,7 @@ def test_parser_preserves_error_and_incomplete_evidence_for_diagnostics():
         audit_protocol_sequences(raw)
 
 
-@pytest.mark.parametrize("version", (*range(1, 20), 22, 23))
+@pytest.mark.parametrize("version", (*range(1, 22), 24, 25))
 def test_noncurrent_protocol_versions_are_rejected(version):
     raw = capture()
     raw["schema"] = f"hbg-native-protocol-v{version}"
@@ -257,4 +256,19 @@ def test_current_control_words_are_mandatory_uint64(field, value):
     else:
         raw["task_controls"][0][field] = value
     with pytest.raises(ValueError, match="fields|integer"):
+        read_native_protocol(raw)
+
+
+@pytest.mark.parametrize("version", (20, 21))
+def test_removed_protocol_layouts_are_rejected(version):
+    raw = capture()
+    raw["schema"] = f"hbg-native-protocol-v{version}"
+    with pytest.raises(ValueError, match="unsupported schema"):
+        read_native_protocol(raw)
+
+
+def test_current_protocol_does_not_accept_duplicate_scheduler_topology():
+    raw = capture()
+    raw["scheduler_count"] = raw["active_worker_count"]
+    with pytest.raises(ValueError, match="unknown fields"):
         read_native_protocol(raw)

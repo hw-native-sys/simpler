@@ -148,7 +148,6 @@ TEST(HbgSpmdLayout, PreservesCompactMetadataAndAtomicLineBoundaries) {
     EXPECT_EQ(offsetof(SchedulerTaskControl, completion_state), 256u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, admission_state), 384u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, claim_seal), 512u);
-    EXPECT_EQ(offsetof(SchedulerTaskControl, completion_resolve_start_cycles), 320u);
     EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskControl::next_block), volatile uint64_t>));
     EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskControl::completion_state), volatile uint64_t>));
     EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskControl::admission_state), volatile uint64_t>));
@@ -178,8 +177,6 @@ TEST(HbgSpmdLayout, ConcurrentBlockCountersUseSeparateCacheLines) {
     EXPECT_NE(completed / 128, cursor / 128);
     EXPECT_NE(cursor / 128, offsetof(SchedulerTaskControl, claim_seal) / 128);
     EXPECT_NE(completed / 128, offsetof(SchedulerTaskControl, claim_seal) / 128);
-    EXPECT_EQ(completed / 128, offsetof(SchedulerTaskControl, completion_resolve_start_cycles) / 128);
-    EXPECT_NE(completed / 64, offsetof(SchedulerTaskControl, completion_resolve_start_cycles) / 64);
     EXPECT_NE(completed / 128, offsetof(SchedulerTaskControl, admission_state) / 128);
     EXPECT_EQ(sizeof(SchedulerTaskControl) % 128, 0u);
 }
@@ -1018,7 +1015,7 @@ INSTANTIATE_TEST_SUITE_P(ActualWorkers, HbgProtocolTraceLayout, ::testing::Value
 TEST(HbgProtocolTrace, CompactRunAndTraceLayoutSeparatesConcurrentWriters) {
     EXPECT_EQ(sizeof(SchedulerGraphSummary), 192u);
     EXPECT_EQ(sizeof(SchedulerRunControl), 384u + SCHEDULER_WORKER_CAPACITY * 64);
-    EXPECT_EQ(sizeof(SchedulerTaskTrace), 320u);
+    EXPECT_EQ(sizeof(SchedulerTaskTrace), 256u);
     EXPECT_EQ(offsetof(SchedulerGraphSummary, protocol_layout_offset), 96u);
     EXPECT_EQ(offsetof(SchedulerProtocolTaskTrace, completion), 64u);
     EXPECT_EQ(offsetof(SchedulerProtocolBlockTrace, lanes), 320u);

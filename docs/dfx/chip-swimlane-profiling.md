@@ -795,6 +795,11 @@ tokens can wait for fanin while retaining their prepared Call. MIX and
 [execution ownership contract](../zh-cn/design/a5-hbg-graph-task/build-execute-separation.md).
 The shared trace vocabulary still recognizes `resolve` and `refill`, but the
 current A5 token path does not emit these outer phases.
+The A5 wire trace contains only current timing and execution identity fields: a
+256-byte per-execution trace and a 24-byte local staging record. Native protocol
+schemas v22 (ordinary) and v23 (Graph) omit the duplicate scheduler count and
+unproduced refill publication mode. Ready sources are catalog discovery (0) and
+cooperative/group preparation (3); older protocol schemas are rejected.
 
 For ordinary MIX, L4 block-owner Claim stamps surround the final
 `GROUP_RESERVED` to `GROUP_ARMED` CAS after staging and conflict checks. The

@@ -4,7 +4,7 @@
 十八种模型功能检查通过；十四种单卡场景 L1 中位数之和从 28.4497 ms
 变为 28.2899 ms（-0.56%），按 ±5% 规则属于无明显变化。
 本轮确认的是队列结构简化，**不能记作 Device 性能优化收益，也不能据此声称达到 50 µs→5 µs 的 SPMD 切换目标**。
-设计及范围见[两个 ready 队列](../../../../docs/zh-cn/design/a5-hbg-graph-task/two-ready-queues.md)。
+本页记录被测提交的两队列设计与范围；当前执行机制见[目录与 execution token](../../../../docs/zh-cn/design/a5-hbg-graph-task/ready-queue-design.md)。
 
 ## 1 实现、对照与环境
 

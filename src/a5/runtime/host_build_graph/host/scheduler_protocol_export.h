@@ -279,7 +279,6 @@ inline void execution(JsonObject &row, const SchedulerProtocolExecutionTrace &re
     row.number("block_num", record.logical_block_num);
     row.number("cluster_index", record.cluster_index);
     row.number("cluster_lane", record.cluster_lane);
-    row.number("publication_mode", record.publication_mode);
     row.number("publication_before_cycles", record.publication_before_cycles);
     row.number("publication_after_cycles", record.publication_after_cycles);
     row.number("publication_count", record.publication_count);
@@ -368,7 +367,7 @@ inline std::string scheduler_export_protocol(
     std::ostringstream out;
     {
         JsonObject root(out);
-        root.string("schema", graph_source.empty() ? "hbg-native-protocol-v20" : "hbg-native-protocol-v21");
+        root.string("schema", graph_source.empty() ? "hbg-native-protocol-v22" : "hbg-native-protocol-v23");
         root.number("close_seal_stride", sizeof(SchedulerMixCloseSeal));
         if (!graph_source.empty()) {
             root.field("graph_source") << graph_source;
@@ -400,7 +399,6 @@ inline std::string scheduler_export_protocol(
         root.number("inline_completed_count", run.inline_completed_count);
         root.number("resolved_task_count", run.resolved_task_count);
         root.number("active_worker_count", run.active_worker_count);
-        root.number("scheduler_count", run.scheduler_count);
         root.number("scheduler_error", run.scheduler_error);
         root.number("error_claimed", run.error_claimed);
         {

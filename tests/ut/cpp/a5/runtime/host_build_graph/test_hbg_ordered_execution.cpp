@@ -96,12 +96,8 @@ struct OrderedFixture {
         storage.prepare_catalog();
         EXPECT_TRUE(scheduler_init_spmd_task_records(base(), storage.layout, 37));
         storage.run_control->active_worker_count = 6;
-        storage.run_control->aic_active_worker_count = 2;
-        storage.run_control->aiv_active_worker_count = 4;
         for (uint32_t worker = 0; worker < 6; ++worker) {
             auto &context = storage.contexts[worker];
-            context.is_scheduler = 1;
-            context.scheduler_count = 6;
             for (uint32_t lane = 0; lane < 3; ++lane)
                 context.cluster_worker_ids[lane] = (worker / 3) * 3 + lane;
             storage.test_graphs[worker] = graph.graph();
@@ -1716,7 +1712,6 @@ TEST_P(HbgOrdinaryTokenProbe, OrdinaryTokenRecordsDiscoveryAndAcquireBeforeDispa
     const auto &trace = traces[fixture.storage.metadata[1].trace_index_base];
     EXPECT_EQ(trace.task_ref, 1u);
     EXPECT_EQ(trace.worker_id, worker);
-    EXPECT_EQ(trace.ready_source, static_cast<uint64_t>(SchedulerReadySource::POOL));
     EXPECT_EQ(trace.state_probe_scheduler_worker_id, worker);
     EXPECT_GT(trace.state_probe_start_cycles, 0u);
     EXPECT_GE(trace.state_probe_end_cycles, trace.state_probe_start_cycles);
@@ -1750,7 +1745,6 @@ TEST_P(HbgOrderedCooperativeProbe, CooperativeBlockDispatchDoesNotInventOrdinary
         const auto &trace = traces[fixture.storage.metadata[0].trace_index_base + block];
         EXPECT_EQ(trace.task_ref, 0u);
         EXPECT_EQ(trace.worker_id, executor);
-        EXPECT_EQ(trace.ready_source, static_cast<uint64_t>(SchedulerReadySource::COOPERATIVE));
         EXPECT_EQ(trace.state_probe_scheduler_worker_id, UINT64_MAX);
         EXPECT_EQ(trace.state_probe_start_cycles, 0u);
         EXPECT_EQ(trace.state_probe_end_cycles, 0u);
@@ -1862,8 +1856,6 @@ TEST_P(HbgOrderedDeferredPublication, DiscoveredSuccessorUsesDispatchAfterProduc
     const auto &trace = traces[fixture.storage.metadata[1].trace_index_base];
     EXPECT_EQ(trace.task_ref, 1u);
     EXPECT_EQ(trace.worker_id, resolver);
-    EXPECT_EQ(trace.ready_source, static_cast<uint64_t>(SchedulerReadySource::POOL));
-    EXPECT_EQ(trace.publication_mode, static_cast<uint64_t>(SchedulerPublicationMode::DISPATCH));
     EXPECT_GT(trace.dispatch_start_cycles, 0u);
     EXPECT_GE(trace.dispatch_end_cycles, trace.dispatch_start_cycles);
     EXPECT_EQ(trace.state_probe_scheduler_worker_id, resolver);

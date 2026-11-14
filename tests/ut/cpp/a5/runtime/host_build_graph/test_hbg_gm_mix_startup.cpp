@@ -97,13 +97,9 @@ struct StartupFixture {
         auto *run = storage.run_control;
         run->active_worker_count = 9;
         run->expected_task_count = 2;
-        run->aic_active_worker_count = 3;
-        run->aiv_active_worker_count = 6;
         run->scheduler_timeout_cycles = PLATFORM_PROF_SYS_CNT_FREQ;
         for (uint32_t worker = 0; worker < 9; ++worker) {
             auto &context = storage.contexts[worker];
-            context.is_scheduler = 1;
-            context.scheduler_count = 9;
             context.physical_core_id = static_cast<int32_t>(worker);
             context.graph_storage_address = graph_view.storage_address;
             context.graph_task_count = graph_view.task_count;
@@ -244,8 +240,8 @@ struct StartupFixture {
         write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
         write_reg(RegId::COND, 0);
         if (storage.layout.protocol_layout_offset != 0)
-            run_resident_scheduler<true, false>(&storage.contexts[worker], storage.run_control, base(), 4, 0, 0);
-        else run_resident_scheduler<true, false>(&storage.contexts[worker], storage.run_control, base(), 0, 0, 0);
+            run_resident_scheduler<true, false>(&storage.contexts[worker], storage.run_control, base(), 4, 0);
+        else run_resident_scheduler<true, false>(&storage.contexts[worker], storage.run_control, base(), 0, 0);
     }
 
     scheduler_test::FixtureStorage storage;
@@ -430,7 +426,6 @@ TEST(HbgScalarObserverLifetime, BootstrapPreservesTheResidentBinding) {
     ASSERT_TRUE(scheduler_init_spmd_task_records(base, storage.layout, 59));
     ASSERT_TRUE(storage.prepare_calls(graph.graph()));
     auto *local = storage.local_context(&storage.contexts[0]);
-    local->config.scheduler_count = 1;
     storage.run_control->expected_task_count = 1;
     storage.test_graphs[0] = graph.graph();
     auto buffer = std::make_unique<SchedulerActivityBuffer>();
@@ -466,7 +461,6 @@ TEST(HbgScalarObserverLifetime, DispatchLoopRecordsMemoryPrimitives) {
     for (uint32_t lane = 0; lane < 3; ++lane)
         storage.contexts[0].cluster_worker_ids[lane] = lane;
     auto *local = storage.local_context(&storage.contexts[0]);
-    local->config.scheduler_count = 3;
     auto *run = storage.run_control;
     run->expected_task_count = 1;
 
@@ -521,7 +515,6 @@ TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCa
     const bool with_profiling = level != 0 || sampled;
     if (!with_profiling) local->profiling = nullptr;
     ASSERT_TRUE(scheduler_protocol_bind(base, local));
-    local->config.scheduler_count = 3;
     auto *run = storage.run_control;
     run->expected_task_count = 1;
 
@@ -654,7 +647,6 @@ TEST_P(HbgIdleDispatchArrival, EmptyPollsObserveNewWorkAndTerminationWithoutSpur
         for (uint32_t lane = 0; lane < 3; ++lane)
             storage.contexts[member].cluster_worker_ids[lane] = lane;
     auto *local = storage.local_context(&storage.contexts[worker]);
-    local->config.scheduler_count = 3;
     if (level == 0) local->profiling = nullptr;
     ASSERT_TRUE(scheduler_protocol_bind(base, local));
     SchedulerAdmissionLocalState admission{};
@@ -738,7 +730,6 @@ TEST(HbgProtocolExecution, ConsumerDiscoveryKeepsTheCompletedGenerationSeparateF
     for (uint32_t lane = 0; lane < 3; ++lane)
         storage.contexts[0].cluster_worker_ids[lane] = lane;
     auto *local = storage.local_context(&storage.contexts[0]);
-    local->config.scheduler_count = 3;
     ASSERT_TRUE(scheduler_protocol_bind(base, local));
     auto *run = storage.run_control;
     run->expected_task_count = 2;
@@ -767,8 +758,7 @@ TEST(HbgProtocolExecution, ConsumerDiscoveryKeepsTheCompletedGenerationSeparateF
     EXPECT_NE(events[0].trace_published.sequence, 0u);
     EXPECT_GT(events[1].entry.sequence, events[0].trace_published.sequence);
     EXPECT_GT(events[1].trace_published.sequence, events[1].completion_consumed.sequence);
-    EXPECT_EQ(events[1].ready_source, static_cast<uint32_t>(SchedulerReadySource::POOL));
-    EXPECT_EQ(events[1].publication_mode, static_cast<uint32_t>(SchedulerPublicationMode::DISPATCH));
+    EXPECT_EQ(events[1].ready_source, static_cast<uint32_t>(SchedulerReadySource::CATALOG));
     const auto *worker = scheduler_state_at<SchedulerProtocolWorkerTrace>(base, storage.layout.protocol.workers_offset);
     EXPECT_EQ(worker->error_flags, 0u);
     startup_reg_base = nullptr;

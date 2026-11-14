@@ -580,10 +580,12 @@ TEST(SchedulerState, RejectsA64ByteOnlyAllocationBeforeWritingState) {
 TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
     EXPECT_EQ(alignof(SchedulerTaskControl), 128u);
     EXPECT_EQ(alignof(SchedulerExecutorTaskTrace), alignof(uint64_t));
-    EXPECT_EQ(sizeof(SchedulerExecutorTaskTrace), 48u);
+    EXPECT_EQ(sizeof(SchedulerExecutorTaskTrace), 24u);
     EXPECT_EQ(alignof(SchedulerRunControl), 64u);
     EXPECT_EQ(alignof(SchedulerWorkerContext), 64u);
     EXPECT_EQ(alignof(SchedulerTaskTrace), 64u);
+    EXPECT_EQ(sizeof(SchedulerTaskTrace), 256u);
+    EXPECT_EQ(offsetof(SchedulerTaskTrace, execution_run_epoch), 192u);
 
     std::array<SchedulerTaskControl, 2> controls{};
     std::array<SchedulerWorkerContext, 2> contexts{};
@@ -592,21 +594,12 @@ TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
     EXPECT_NE(offsetof(SchedulerTaskControl, next_block) / 128, offsetof(SchedulerTaskControl, claim_tickets) / 128);
     EXPECT_NE(offsetof(SchedulerTaskControl, next_block) / 128, offsetof(SchedulerTaskControl, completion_state) / 128);
     EXPECT_NE(offsetof(SchedulerTaskControl, next_block) / 128, offsetof(SchedulerTaskControl, parked_count) / 128);
-    EXPECT_NE(
-        offsetof(SchedulerTaskControl, completion_state) / 64,
-        offsetof(SchedulerTaskControl, completion_resolve_start_cycles) / 64
-    );
 
     EXPECT_EQ(
         offsetof(SchedulerTaskTrace, dispatch_start_cycles) / 64, offsetof(SchedulerTaskTrace, complete_loop_iter) / 64
     );
     EXPECT_NE(
-        offsetof(SchedulerTaskTrace, dispatch_start_cycles) / 64,
-        offsetof(SchedulerTaskTrace, descriptor_cache_observed_cycles) / 64
-    );
-    EXPECT_NE(
-        offsetof(SchedulerTaskTrace, refill_scheduler_worker_id) / 64,
-        offsetof(SchedulerTaskTrace, descriptor_cache_observed_cycles) / 64
+        offsetof(SchedulerTaskTrace, execution_run_epoch) / 64, offsetof(SchedulerTaskTrace, kernel_start_cycles) / 64
     );
 }
 

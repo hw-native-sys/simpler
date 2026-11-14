@@ -137,8 +137,3 @@ static inline __aicore__ __attribute__((always_inline)) auto scheduler_scalar_re
     if constexpr (kSchedulerScalarInstrumentation) return scheduler_scalar_result_runtime(local, kind, operation);
     else return operation();
 }
-
-template <typename Local, typename Operation>
-static inline __aicore__ auto scheduler_scalar_atomic_result(const Local *local, Operation operation) {
-    return scheduler_scalar_result(local, SchedPhaseKind::ScalarAtomicClaim, operation);
-}

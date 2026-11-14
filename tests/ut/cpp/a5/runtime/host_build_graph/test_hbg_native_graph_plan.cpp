@@ -696,7 +696,7 @@ SchedulerLocalState ready_worker(NativeViewFixture &view, uint32_t type, uint64_
     config.task_catalog_offset = view.catalog_plan.header_offset;
     config.prepared =
         scheduler_state_at<SchedulerPreparedLayout>(view.backing.get(), view.layout.prepared_layout_offset);
-    config.runtime_worker_count = config.scheduler_count = 30;
+    config.runtime_worker_count = 30;
     config.cluster_count = 10;
     config.self_lane = type == 0 ? 0 : 1 + rank % 2;
     config.self_core_type = type;
@@ -704,7 +704,6 @@ SchedulerLocalState ready_worker(NativeViewFixture &view, uint32_t type, uint64_
     for (uint32_t lane = 0; lane < 3; ++lane) {
         config.worker_ids[lane] = cluster * 3 + lane;
     }
-    config.scheduler_index = local.worker_id();
     config.shared_context =
         scheduler_state_at<SchedulerWorkerContext>(view.backing.get(), view.layout.worker_contexts_offset) +
         local.worker_id();
@@ -920,7 +919,6 @@ struct ControlFixture : NativeViewFixture {
             config.task_metadata_offset = static_cast<uint32_t>(layout.task_metadata_offset);
             config.task_catalog_offset = catalog_plan.header_offset;
             config.runtime_worker_count = 3;
-            config.scheduler_count = 3;
             config.cluster_count = 1;
             config.self_lane = static_cast<uint8_t>(worker);
             config.self_core_type = worker == 0 ? 0 : 1;

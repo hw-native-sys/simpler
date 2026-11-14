@@ -25,6 +25,7 @@
 #include <cstring>
 #include <vector>
 
+#include "dispatch_payload.h"
 #include "scheduler/wire_types.h"
 #include "scheduler/profiling_types.h"
 #include "scheduler/scheduler_layout.h"

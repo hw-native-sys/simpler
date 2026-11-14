@@ -570,7 +570,9 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         return ref < public_ids.size() ? public_ids[ref] : UINT64_MAX;
     };
     const auto *traces = scheduler_state_at<SchedulerTaskTrace>(host_base, owner.layout.trace_cells_offset);
-    const auto *controls = scheduler_state_at<SchedulerTaskControl>(host_base, owner.layout.task_controls_offset);
+    const auto *run_control = scheduler_state_at<SchedulerRunControl>(host_base, owner.layout.run_control_offset);
+    const uint64_t active_workers = run_control->active_worker_count;
+    if (active_workers > SCHEDULER_WORKER_CAPACITY) return false;
 
     const bool need_scheduler_timing = level >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHEDULE_TIMING);
 
@@ -589,7 +591,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         const SchedulerTaskTrace &trace = traces[trace_index];
         const uint64_t task_ref = trace.task_ref;
         if (trace.valid == 0 || trace.kernel_start_cycles == 0 || trace.kernel_end_cycles < trace.kernel_start_cycles ||
-            trace.worker_id >= SCHEDULER_WORKER_CAPACITY)
+            trace.worker_id >= active_workers)
             continue;
         if (need_scheduler_timing &&
             (trace.dispatch_end_cycles == 0 || trace.complete_start_cycles < trace.kernel_end_cycles)) {
@@ -686,10 +688,10 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
 
     if (level < static_cast<uint32_t>(ChipSwimlaneLevel::SCHED_PHASES)) return true;
 
-    std::vector<std::vector<SchedulerJsonRecord>> records(SCHEDULER_WORKER_CAPACITY);
-    for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
+    std::vector<std::vector<SchedulerJsonRecord>> records(active_workers);
+    for (uint64_t worker = 0; worker < active_workers; ++worker) {
         const SchedulerWorkerContext &context = contexts[worker];
-        if (context.is_scheduler == 0 || context.worker_index >= SCHEDULER_WORKER_CAPACITY) continue;
+        if (context.worker_index != worker) return false;
         append_scheduler_record(
             &records[context.worker_index], context.bootstrap_start_cycles, context.target_bootstrap_end_cycles, 0,
             SchedPhaseKind::Bootstrap, context.bootstrap_task_count, 0, false
@@ -698,59 +700,32 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
     for (uint64_t trace_index = 0; trace_index < owner.layout.executable_subtask_count; ++trace_index) {
         const SchedulerTaskTrace &trace = traces[trace_index];
         const uint64_t task_ref = trace.task_ref;
-        if (trace.state_probe_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
+        if (trace.state_probe_scheduler_worker_id < active_workers) {
             append_scheduler_record(
                 &records[trace.state_probe_scheduler_worker_id], trace.state_probe_start_cycles,
                 trace.state_probe_end_cycles, trace.dispatch_loop_iter, SchedPhaseKind::StateProbe, 1, task_ref
             );
         }
-        const auto publication_mode = static_cast<SchedulerPublicationMode>(trace.publication_mode);
-        const bool refill = publication_mode == SchedulerPublicationMode::REFILL;
-        if (trace.dispatch_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY && !refill) {
+        if (trace.dispatch_scheduler_worker_id < active_workers) {
             append_scheduler_record(
                 &records[trace.dispatch_scheduler_worker_id], trace.dispatch_start_cycles, trace.dispatch_end_cycles,
                 trace.dispatch_loop_iter, SchedPhaseKind::Dispatch, 1, task_ref
             );
         }
-        if (trace.complete_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
+        if (trace.complete_scheduler_worker_id < active_workers) {
             append_scheduler_record(
                 &records[trace.complete_scheduler_worker_id], trace.complete_start_cycles, trace.complete_end_cycles,
                 trace.complete_loop_iter, SchedPhaseKind::Complete, 1, task_ref
             );
         }
-        if (trace.refill_scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
-            append_scheduler_record(
-                &records[trace.refill_scheduler_worker_id], trace.refill_start_cycles, trace.refill_end_cycles,
-                trace.refill_loop_iter, SchedPhaseKind::Refill, 1, trace.refill_task_ref
-            );
-        }
-    }
-    for (uint64_t task_ref = 0; task_ref < owner.layout.task_count; ++task_ref) {
-        const SchedulerTaskControl &control = controls[task_ref];
-        if (control.scheduler_worker_id < SCHEDULER_WORKER_CAPACITY) {
-            append_scheduler_record(
-                &records[control.scheduler_worker_id], control.completion_resolve_start_cycles,
-                control.completion_resolve_end_cycles, control.completion_resolve_loop_iter, SchedPhaseKind::Resolve, 1,
-                task_ref
-            );
-        }
     }
 
-    std::vector<uint32_t> dropped_by_worker(SCHEDULER_WORKER_CAPACITY);
+    std::vector<uint32_t> dropped_by_worker(active_workers);
     if (owner.layout.activity_buffers_offset != 0) {
         const auto *activity =
             scheduler_state_at<SchedulerActivityBuffer>(host_base, owner.layout.activity_buffers_offset);
-        for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
-            const SchedulerWorkerContext &context = contexts[worker];
-            if (context.is_scheduler == 0) continue;
-            if (context.scheduler_index >= SCHEDULER_WORKER_CAPACITY) {
-                LOG_WARN(
-                    "A5 HBG: invalid Scheduler activity index for worker=%" PRIu64 ": %" PRIu64, worker,
-                    context.scheduler_index
-                );
-                return false;
-            }
-            const SchedulerActivityBuffer &buffer = activity[context.scheduler_index];
+        for (uint64_t worker = 0; worker < active_workers; ++worker) {
+            const SchedulerActivityBuffer &buffer = activity[worker];
             const uint32_t committed = buffer.committed;
             if (!scheduler_activity_record_count_valid(committed)) {
                 LOG_WARN("A5 HBG: invalid Scheduler activity count for worker=%" PRIu64 ": %u", worker, committed);
@@ -763,9 +738,8 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
                     false
                 );
             }
-            const uint64_t scalar_offset = owner.layout.scalar_records_offset + context.scheduler_index *
-                                                                                    SCHEDULER_SCALAR_RECORD_CAPACITY *
-                                                                                    sizeof(SchedulerScalarRecord);
+            const uint64_t scalar_offset = owner.layout.scalar_records_offset +
+                                           worker * SCHEDULER_SCALAR_RECORD_CAPACITY * sizeof(SchedulerScalarRecord);
             if (buffer.scalar_committed > SCHEDULER_SCALAR_RECORD_CAPACITY ||
                 buffer.scalar_records_offset != scalar_offset || buffer.scalar_storage_format != 1 ||
                 buffer.scalar_storage_slots < buffer.scalar_committed ||
@@ -808,10 +782,10 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
     std::ostringstream scheduler_json;
     scheduler_json << "{\n    \"streams\": [";
     bool first_stream = true;
-    for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
+    for (uint64_t worker = 0; worker < active_workers; ++worker) {
         const SchedulerWorkerContext &context = contexts[worker];
         const uint32_t dropped = dropped_by_worker[worker];
-        if (context.is_scheduler == 0 || (records[worker].empty() && dropped == 0)) continue;
+        if (records[worker].empty() && dropped == 0) continue;
         std::sort(records[worker].begin(), records[worker].end(), [](const auto &lhs, const auto &rhs) {
             if (lhs.start_cycles != rhs.start_cycles) return lhs.start_cycles < rhs.start_cycles;
             if (lhs.end_cycles != rhs.end_cycles) return lhs.end_cycles < rhs.end_cycles;
@@ -828,7 +802,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
             context.cluster_index < context.cluster_count && cluster_lane < PLATFORM_CORES_PER_BLOCKDIM;
         scheduler_json << "\n      {\"platform\": \"a5\", \"producer\": \"aicore\", "
                           "\"scheduler_id\": "
-                       << context.scheduler_index << ", \"worker_id\": " << worker << ", \"core_type\": \""
+                       << worker << ", \"worker_id\": " << worker << ", \"core_type\": \""
                        << scheduler_core_type_name(context.core_type)
                        << "\", \"physical_core_id\": " << context.physical_core_id << ", \"cluster_index\": ";
         if (cluster_valid) scheduler_json << context.cluster_index;
@@ -862,7 +836,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
             if (record.kind == SchedPhaseKind::ScalarWindow) {
                 const auto &buffer = scheduler_state_at<SchedulerActivityBuffer>(
                     host_base, owner.layout.activity_buffers_offset
-                )[context.scheduler_index];
+                )[worker];
                 scheduler_json << ",\"scalar_schema\":2,\"batch_write_cycles\":" << buffer.scalar_write_cycles
                                << ",\"no_progress_loops\":" << buffer.scalar_poll_loops
                                << ",\"short_function_intervals_omitted\":" << buffer.scalar_short_intervals

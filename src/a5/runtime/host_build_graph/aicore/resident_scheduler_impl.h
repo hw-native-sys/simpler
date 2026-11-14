@@ -22,7 +22,7 @@
 #include "scheduler/scheduler_args_dump.h"
 #include "scheduler/scheduler_args_dump_tensor.h"
 #include "common/platform_config.h"
-#include "dispatch_payload.h"
+#include "kernel_args.h"
 #include "runtime.h"
 #include "scheduler/scheduler_memory.h"
 #include "scheduler/scheduler_ready.h"
@@ -42,7 +42,6 @@ struct SchedulerWorkerStats {
     uint64_t bootstrap_task_count{0};
     uint64_t bootstrap_start_cycles{0};
     uint64_t target_bootstrap_end_cycles{0};
-    uint64_t completion_count{0};
     uint64_t exit_observed_cycles{0};
     uint64_t deferred_idle_start{0};
     uint64_t deferred_idle_end{0};
@@ -253,20 +252,11 @@ publish_worker_stats(__gm__ SchedulerWorkerContext *context, const SchedulerWork
 
 // Keep the pre-kernel timestamps out of the indirect kernel call's live set.
 // Inlining this path makes the resident loop spill enough state to fault on A5.
-__aicore__ __attribute__((noinline)) void stage_task_trace_before_execution(
-    SchedulerExecutorTaskTrace *trace, uint64_t ready_scan_start, uint64_t ready_observe, uint64_t completion_id,
-    uint64_t completion_inbox_index, bool phase_timing_enabled
-) {
+__aicore__ __attribute__((noinline)) void
+stage_task_trace_before_execution(SchedulerExecutorTaskTrace *trace, uint64_t ready_observe) {
     trace->ready_observe_cycles = ready_observe;
-    if (phase_timing_enabled) {
-        trace->ready_scan_start_cycles = ready_scan_start;
-        trace->completion_id = completion_id;
-        trace->completion_inbox_index = completion_inbox_index;
-    }
 }
 
-// The Completion Inbox token follows this call, so the Scheduler cannot
-// observe a partial Executor trace.
 __aicore__ __attribute__((noinline)) void
 stage_task_trace_before_completion(SchedulerExecutorTaskTrace *trace, uint64_t kernel_start, uint64_t kernel_end) {
     trace->kernel_start_cycles = kernel_start;
@@ -276,7 +266,7 @@ stage_task_trace_before_completion(SchedulerExecutorTaskTrace *trace, uint64_t k
 template <bool WithNativeGraph, bool WithProfiling>
 __aicore__ bool bootstrap_ready_graph(
     const SchedulerGraphView &published_graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
-    __gm__ SchedulerRunControl *run_control, uint64_t scheduler_count, SchedulerWorkerStats *stats,
+    __gm__ SchedulerRunControl *run_control, uint64_t worker_count, SchedulerWorkerStats *stats,
     uint64_t observed_profiling_level
 ) {
     const uint64_t profiling_level = WithProfiling ? observed_profiling_level : 0;
@@ -288,8 +278,7 @@ __aicore__ bool bootstrap_ready_graph(
                               published_graph.storage_address, static_cast<uint32_t>(published_graph.task_count),
                               published_graph.task_window_last_index
                           );
-    if (scheduler == nullptr || scheduler_count == 0 || scheduler->config.scheduler_index >= scheduler_count)
-        return false;
+    if (scheduler == nullptr || worker_count == 0 || scheduler->worker_id() >= worker_count) return false;
     const bool phase_timing_enabled =
         kSchedulerScalarInstrumentation && scheduler_phase_timing_enabled(profiling_level);
     SchedulerScalarScope scalar_bootstrap(scheduler, SchedPhaseKind::ScalarBootstrap);
@@ -297,12 +286,11 @@ __aicore__ bool bootstrap_ready_graph(
     if (phase_timing_enabled) stats->bootstrap_start_cycles = scheduler_cycles();
     if (scheduler->cluster_signal != nullptr && scheduler->is_mix_coordinator())
         scheduler_cluster_signal_clear(scheduler->cluster_signal, scheduler->config.prepared->run_epoch);
-    uint64_t tasks_per_scheduler = graph.task_count / scheduler_count;
-    uint64_t remainder = graph.task_count % scheduler_count;
-    uint64_t task_begin =
-        scheduler->config.scheduler_index * tasks_per_scheduler +
-        (scheduler->config.scheduler_index < remainder ? scheduler->config.scheduler_index : remainder);
-    uint64_t task_end = task_begin + tasks_per_scheduler + (scheduler->config.scheduler_index < remainder ? 1 : 0);
+    uint64_t tasks_per_worker = graph.task_count / worker_count;
+    uint64_t remainder = graph.task_count % worker_count;
+    uint64_t task_begin = scheduler->worker_id() * tasks_per_worker +
+                          (scheduler->worker_id() < remainder ? scheduler->worker_id() : remainder);
+    uint64_t task_end = task_begin + tasks_per_worker + (scheduler->worker_id() < remainder ? 1 : 0);
     for (uint64_t task_ref = task_begin; task_ref < task_end; ++task_ref) {
         __gm__ SchedulerTaskMetadata *metadata =
             scheduler_task_metadata_at(scheduler_state_base, scheduler, static_cast<int64_t>(task_ref));
@@ -326,7 +314,7 @@ __aicore__ bool bootstrap_ready_graph(
     }
     scheduler_cache_barrier();
     uint64_t arrived = scheduler_gm_fetch_add(run_control->bootstrap_scan_arrived_count, UINT64_C(1)) + 1;
-    if (arrived == scheduler_count) {
+    if (arrived == worker_count) {
         scheduler_gm_store(run_control->bootstrap_scan_complete, UINT64_C(1));
     } else {
         uint32_t barrier_backoff = kInitialBackoffIterations;
@@ -369,7 +357,7 @@ __aicore__ bool bootstrap_ready_graph(
 
     // Immutable admission records and per-cluster initialization precede the launch gate.
     arrived = scheduler_gm_fetch_add(run_control->bootstrap_arrived_count, UINT64_C(1)) + 1;
-    if (arrived == scheduler_count) scheduler_gm_store(run_control->bootstrap_complete, UINT64_C(1));
+    if (arrived == worker_count) scheduler_gm_store(run_control->bootstrap_complete, UINT64_C(1));
     return true;
 }
 
@@ -398,8 +386,8 @@ __aicore__ bool run_ready_dispatch_loop(
     const bool task_timing_enabled = scheduler_task_timing_enabled(profiling_level);
     const bool phase_timing_enabled =
         kSchedulerScalarInstrumentation && scheduler_phase_timing_enabled(profiling_level);
-    const uint64_t scheduler_count = context->config.scheduler_count;
-    if (scheduler_count == 0) return false;
+    const uint64_t worker_count = context->config.runtime_worker_count;
+    if (worker_count == 0) return false;
     if (cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM) return false;
     uint32_t scheduler_error_poll_count = 0;
     uint32_t execution_service_rounds = 0;
@@ -577,12 +565,7 @@ __aicore__ bool run_ready_dispatch_loop(
             }
             SchedulerExecutorTaskTrace execution_trace{};
             if (commit_scheduler_trace || commit_task_timing) {
-                uint64_t local_completion_index = stats->completion_count;
-                stage_task_trace_before_execution(
-                    &execution_trace, ready_scan_start, ready_observe,
-                    scheduler_completion_id(context, local_completion_index), context->config.scheduler_index,
-                    phase_timing_enabled
-                );
+                stage_task_trace_before_execution(&execution_trace, ready_observe);
             }
             if (commit_scheduler_trace)
                 scheduler_capture_execution_identity(
@@ -680,7 +663,6 @@ __aicore__ bool run_ready_dispatch_loop(
             }
             scalar_seal.close();
             if (context->async != nullptr) ++context->async->business_returns;
-            if (phase_timing_enabled) ++stats->completion_count;
             SchedulerScalarScope scalar_completions(context, SchedPhaseKind::ScalarCompletions, task_ref);
             const bool completion_ok =
                 record_protocol && scheduler_protocol_enabled(context) ?
@@ -723,7 +705,7 @@ struct SchedulerNoProfilingState {};
 template <bool WithProfiling, bool WithNativeGraph>
 __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     __gm__ SchedulerWorkerContext *context, __gm__ SchedulerRunControl *run_control, __gm__ void *scheduler_state_base,
-    uint64_t observed_profiling_level, uint64_t aicore_entry_cycles, uint64_t handshake_publish_cycles
+    uint64_t observed_profiling_level, uint64_t aicore_entry_cycles
 ) {
     scheduler_invalidate_startup_cache();
     // Each resident translation unit owns its block-local observer slot. A prior
@@ -805,13 +787,11 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
             SchedulerErrorSite::BOOTSTRAP_FAILED
         );
     const uint32_t cluster_lane = scheduler_local_state.config.self_lane;
-    uint64_t descriptor_cache_observed_cycles = 0;
     if (config_valid) {
-        descriptor_cache_observed_cycles = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
-        if (context->is_scheduler != 0 && !bootstrap_ready_graph<WithNativeGraph, WithProfiling>(
-                                              graph, scheduler_state_base, &scheduler_local_state, run_control,
-                                              scheduler_local_state.config.scheduler_count, &stats, profiling_level
-                                          )) {
+        if (!bootstrap_ready_graph<WithNativeGraph, WithProfiling>(
+                graph, scheduler_state_base, &scheduler_local_state, run_control,
+                scheduler_local_state.config.runtime_worker_count, &stats, profiling_level
+            )) {
             scheduler_record_error(
                 run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
                 SchedulerErrorSite::BOOTSTRAP_FAILED
@@ -840,14 +820,6 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     if (startup_signal == AICORE_EXIT_SIGNAL || register_release_timed_out) {
         if (phase_timing_enabled) stats.exit_observed_cycles = get_sys_cnt_aicore();
     } else {
-        uint64_t register_release_cycles = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
-        if (phase_timing_enabled) {
-            context->trace_aicore_entry_cycles = aicore_entry_cycles;
-            context->trace_handshake_publish_cycles = handshake_publish_cycles;
-            context->trace_register_release_cycles = register_release_cycles;
-            context->trace_descriptor_cache_observed_cycles = descriptor_cache_observed_cycles;
-            scheduler_publish_cache_line(&context->trace_aicore_entry_cycles);
-        }
         write_reg(RegId::COND, AICORE_IDLE_VALUE);
         if (config_valid) {
             if (cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM) {
@@ -946,9 +918,9 @@ namespace simpler::hbg::resident {
 template <bool WithProfiling, bool WithNativeGraph, CoreType Architecture>
 __aicore__ void
 run(__gm__ SchedulerWorkerContext *context, __gm__ SchedulerRunControl *run_control, __gm__ void *scheduler_state_base,
-    uint64_t profiling_level, uint64_t aicore_entry_cycles, uint64_t handshake_publish_cycles) {
+    uint64_t profiling_level, uint64_t aicore_entry_cycles) {
     run_resident_scheduler<WithProfiling, WithNativeGraph>(
-        context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles, handshake_publish_cycles
+        context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles
     );
 }
 

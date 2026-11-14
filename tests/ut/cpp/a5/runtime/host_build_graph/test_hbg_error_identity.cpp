@@ -100,8 +100,6 @@ struct ErrorFixture {
         EXPECT_TRUE(scheduler_init_spmd_task_records(base(), storage.layout, 61));
         for (uint32_t worker = 0; worker < 3; ++worker) {
             auto &context = storage.contexts[worker];
-            context.is_scheduler = 1;
-            context.scheduler_count = 3;
             context.physical_core_id = static_cast<int32_t>(100 + worker);
             for (uint32_t lane = 0; lane < 3; ++lane)
                 context.cluster_worker_ids[lane] = lane;

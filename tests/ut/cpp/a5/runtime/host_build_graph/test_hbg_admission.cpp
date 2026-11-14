@@ -111,8 +111,6 @@ struct AdmissionFixture {
         }
         EXPECT_EQ(permutation.size(), workers);
         storage.run_control->active_worker_count = workers;
-        storage.run_control->aic_active_worker_count = workers / 3;
-        storage.run_control->aiv_active_worker_count = workers / 3 * 2;
         for (uint64_t position = 0; position < workers; ++position) {
             const uint64_t worker = permutation[position];
             const uint64_t cluster = position / 3;
@@ -124,9 +122,6 @@ struct AdmissionFixture {
             context.cluster_count = workers / 3;
             context.type_rank = static_cast<int32_t>(lane == 0 ? cluster : cluster * 2 + lane - 1);
             context.worker_index = worker;
-            context.scheduler_index = worker;
-            context.scheduler_count = workers;
-            context.is_scheduler = 1;
             for (uint64_t peer = 0; peer < 3; ++peer)
                 context.cluster_worker_ids[peer] = permutation[cluster * 3 + peer];
             storage.test_graphs[worker] = graph.graph();
@@ -485,7 +480,7 @@ TEST(HbgAdmission, PendingOwnershipDoesNotPublishTailOrLogAndCommitTransfersIt) 
     );
 
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.control()->commit_tail, UINT64_C(0)), 0u);
-    EXPECT_EQ(scheduler_gm_load(fixture.log()[0]), SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(__atomic_load_n(&fixture.log()[0], __ATOMIC_ACQUIRE), SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(fixture.record(0)->order_key, UINT64_MAX);
     EXPECT_EQ(fixture.record(0)->run_epoch, 17u);
     EXPECT_EQ(fixture.record(0)->member_count, 5u);
@@ -501,7 +496,7 @@ TEST(HbgAdmission, PendingOwnershipDoesNotPublishTailOrLogAndCommitTransfersIt) 
     ASSERT_EQ(fixture.commit(0), SchedulerAdmissionResult::PROGRESS);
     EXPECT_EQ(fixture.admissions[0].pending_task_ref, SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.control()->commit_tail, UINT64_C(0)), 1u);
-    EXPECT_EQ(scheduler_gm_load(fixture.log()[0]), 0);
+    EXPECT_EQ(__atomic_load_n(&fixture.log()[0], __ATOMIC_ACQUIRE), 0);
     EXPECT_EQ(fixture.record(0)->order_key, 0u);
     EXPECT_EQ(
         scheduler_gm_query(fixture.task_control(0)->admission_state),
@@ -526,14 +521,14 @@ TEST(HbgAdmission, ContendedCommitRetainsPreparedCandidateWithoutCreatingALogHol
         EXPECT_EQ(fixture.admissions[0].pending_task_ref, 0);
         EXPECT_EQ(fixture.record(0)->order_key, UINT64_MAX);
         EXPECT_EQ(scheduler_gm_fetch_add(fixture.control()->commit_tail, UINT64_C(0)), 0u);
-        EXPECT_EQ(scheduler_gm_load(fixture.log()[0]), SCHEDULER_TASK_REF_INVALID);
+        EXPECT_EQ(__atomic_load_n(&fixture.log()[0], __ATOMIC_ACQUIRE), SCHEDULER_TASK_REF_INVALID);
     }
     scheduler_gm_store(fixture.control()->commit_lock, UINT64_C(0));
     ASSERT_EQ(fixture.commit(3), SchedulerAdmissionResult::PROGRESS);
     ASSERT_EQ(fixture.commit(0), SchedulerAdmissionResult::PROGRESS);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.control()->commit_tail, UINT64_C(0)), 2u);
-    EXPECT_EQ(scheduler_gm_load(fixture.log()[0]), 1);
-    EXPECT_EQ(scheduler_gm_load(fixture.log()[1]), 0);
+    EXPECT_EQ(__atomic_load_n(&fixture.log()[0], __ATOMIC_ACQUIRE), 1);
+    EXPECT_EQ(__atomic_load_n(&fixture.log()[1], __ATOMIC_ACQUIRE), 0);
     EXPECT_EQ(fixture.record(1)->order_key, 0u);
     EXPECT_EQ(fixture.record(0)->order_key, 1u);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.control()->commit_lock, UINT64_C(0)), 0u);
@@ -713,7 +708,7 @@ TEST(HbgAdmission, ReadyTaskBMayCommitBeforeTaskAWhoseDependencyIsNotReady) {
     SchedulerReadyClaim blocked{};
     ASSERT_FALSE(fixture.observe_ready(1, 0, &blocked));
     ASSERT_TRUE(fixture.publish(2));
-    EXPECT_EQ(scheduler_gm_load(fixture.log()[0]), 2);
+    EXPECT_EQ(__atomic_load_n(&fixture.log()[0], __ATOMIC_ACQUIRE), 2);
     EXPECT_EQ(fixture.record(2)->order_key, 0u);
     EXPECT_EQ(fixture.record(1)->order_key, UINT64_MAX);
     EXPECT_EQ(
@@ -989,7 +984,7 @@ TEST_P(HbgAdmissionSyncCapacity, PreparationCountsDistinctExecutionPositionsNotP
     EXPECT_EQ(fixture.bootstrap(), parameters.accepted);
     EXPECT_EQ(fixture.run()->bootstrap_scan_complete, parameters.accepted ? 1u : 0u);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.control()->commit_tail, UINT64_C(0)), 0u);
-    EXPECT_EQ(scheduler_gm_load(fixture.log()[0]), SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(__atomic_load_n(&fixture.log()[0], __ATOMIC_ACQUIRE), SCHEDULER_TASK_REF_INVALID);
 }
 
 INSTANTIATE_TEST_SUITE_P(
@@ -1155,7 +1150,7 @@ TEST(HbgAdmission, FullCommitLogIsAnErrorAndNeverWrapsOrDropsPendingCandidate) {
         EXPECT_EQ(fixture.admissions[0].pending_task_ref, 0);
         EXPECT_EQ(scheduler_gm_fetch_add(fixture.control()->commit_tail, UINT64_C(0)), tail);
         EXPECT_EQ(scheduler_gm_fetch_add(fixture.control()->commit_lock, UINT64_C(0)), 0u);
-        EXPECT_EQ(scheduler_gm_load(fixture.log()[0]), SCHEDULER_TASK_REF_INVALID);
+        EXPECT_EQ(__atomic_load_n(&fixture.log()[0], __ATOMIC_ACQUIRE), SCHEDULER_TASK_REF_INVALID);
     }
 }
 
@@ -1170,7 +1165,7 @@ TEST(HbgAdmission, EpochMismatchBeforeCommitDoesNotPublishARecord) {
         fixture.record(0)->run_epoch = epoch == 0 ? UINT64_MAX : 0;
         EXPECT_EQ(fixture.commit(0), SchedulerAdmissionResult::ERROR);
         EXPECT_EQ(scheduler_gm_fetch_add(fixture.control()->commit_tail, UINT64_C(0)), 0u);
-        EXPECT_EQ(scheduler_gm_load(fixture.log()[0]), SCHEDULER_TASK_REF_INVALID);
+        EXPECT_EQ(__atomic_load_n(&fixture.log()[0], __ATOMIC_ACQUIRE), SCHEDULER_TASK_REF_INVALID);
     }
 }
 
@@ -1604,7 +1599,7 @@ TEST(HbgAdmission, ConcurrentRealCommitsPublishUniqueCompleteContiguousLogEntrie
     std::vector<bool> seen(task_count, false);
     for (uint64_t order = 0; order < task_count; ++order) {
         SCOPED_TRACE(order);
-        const int64_t task = scheduler_gm_load(fixture.log()[order]);
+        const int64_t task = __atomic_load_n(&fixture.log()[order], __ATOMIC_ACQUIRE);
         ASSERT_GE(task, 0);
         ASSERT_LT(static_cast<uint64_t>(task), task_count);
         EXPECT_FALSE(seen[task]);

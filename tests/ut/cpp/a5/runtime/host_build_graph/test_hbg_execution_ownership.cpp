@@ -168,26 +168,6 @@ TEST(HbgExecutionOwnership, InvalidCallFailsClosedAfterClaim) {
     EXPECT_EQ(fixture.parked_count, 0u);
 }
 
-TEST(HbgExecutionOwnership, OwnerCancellationDoesNotReturnOrPublishTheExecution) {
-    for (bool parking : {false, true}) {
-        OwnershipFixture fixture;
-        SchedulerPreparedHandle owner{};
-        ASSERT_EQ(fixture.claim(0, &owner), PreparedAccessResult::READY);
-        if (parking) ASSERT_TRUE(scheduler_begin_park_prepared_execution(fixture.base(), fixture.prepared, 0, &owner));
-        SchedulerPreparedHandle stale = owner;
-        EXPECT_FALSE(scheduler_fail_prepared_execution(fixture.base(), fixture.prepared, 1, &owner));
-        ASSERT_TRUE(scheduler_fail_prepared_execution(fixture.base(), fixture.prepared, 0, &owner));
-        EXPECT_EQ(owner.claimed_state, 0u);
-        EXPECT_EQ(scheduler_prepared_phase(fixture.control()->state), SchedulerPreparedPhase::FAILED);
-        EXPECT_FALSE(scheduler_return_prepared_execution(fixture.base(), fixture.prepared, &stale));
-        if (parking)
-            EXPECT_FALSE(
-                scheduler_publish_parked_execution(fixture.base(), fixture.prepared, 0, &stale, fixture.parked_count)
-            );
-        EXPECT_EQ(fixture.parked_count, 0u);
-    }
-}
-
 struct RefillFixture {
     scheduler_test::FixtureStorage storage;
     scheduler_test::BasicGraphBuffer<16> graph;

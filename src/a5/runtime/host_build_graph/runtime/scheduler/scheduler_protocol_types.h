@@ -168,7 +168,6 @@ struct alignas(64) SchedulerProtocolExecutionTrace {
     uint32_t logical_block_num;
     uint32_t cluster_index;
     uint32_t cluster_lane;
-    uint32_t publication_mode;
     // Ordinary payloads can be rebuilt before their one entry permit. Only the final
     // publication is retained; these snapshot times consume no event sequence.
     uint64_t publication_before_cycles;

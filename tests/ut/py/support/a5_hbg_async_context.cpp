@@ -20,7 +20,7 @@
 #include "async_completion_plan.h"
 #include "async_kernel_api.h"
 #include "backend/sdma/sdma_completion_registration.h"
-#include "dispatch_payload.h"
+#include "scheduler/scheduler_prepared_layout.h"
 #include "scheduler/scheduler_args_dump.h"
 
 namespace {
@@ -72,19 +72,20 @@ int main(int argc, char **argv) {
     auto *image = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(backing.data()) + 127) & ~uintptr_t(127));
     assert(initialize_async_completion(image, plan.total_bytes, plan));
     auto *data = scheduler_state_at<pto2::resident::AsyncGroupData>(image, plan.layout.groups_offset);
-    DispatchPayload payload{};
-    static_assert(sizeof(DispatchPayload) == 512 && offsetof(DispatchPayload, args) == 64);
-    static_assert(offsetof(DispatchPayload, global_context) == 464 && sizeof(LocalContext) == 8);
-    payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&payload.local_context);
-    payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&payload.global_context);
-    auto &global = payload.global_context;
+    SchedulerPreparedCall call{};
+    SchedulerExecutionBinding binding{};
+    static_assert(sizeof(SchedulerPreparedCall) == 512 && offsetof(SchedulerPreparedCall, args) == 64);
+    static_assert(offsetof(SchedulerExecutionBinding, global_context) == 64 && sizeof(LocalContext) == 8);
+    call.args[SPMD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&binding.local_context);
+    call.args[SPMD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&binding.global_context);
+    auto &global = binding.global_context;
     global.async_present = 1;
     global.async_image_address = reinterpret_cast<uint64_t>(image);
     global.async_image_bytes = plan.total_bytes;
     global.async_run_epoch = 9;
     global.async_group_offset = plan.layout.groups_offset;
     global.async_group_index = 0;
-    auto *args = reinterpret_cast<int64_t *>(payload.args);
+    auto *args = reinterpret_cast<int64_t *>(call.args);
     const CompletionToken token{0x10000, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0};
     if (scenario == 0) {
         auto ctx = get_async_ctx(args);
@@ -123,7 +124,7 @@ int main(int argc, char **argv) {
     } else if (scenario == 5) {
         global.async_present = 0;
         // Absence of an async group never touches a LocalContext or a slab.
-        payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = 0;
+        call.args[SPMD_LOCAL_CONTEXT_INDEX] = 0;
         auto ctx = get_async_ctx(args);
         assert(!async_ctx_is_deferred(ctx));
         assert(!register_completion_condition(ctx, token));

@@ -11,7 +11,7 @@
 
 #pragma once
 
-// AICore-resident completion library; scheduler_completion.cpp is the independent AICPU scheduler implementation.
+// AICore-resident completion and cancellation.
 
 #include "scheduler_gm_mix.h"
 #include "scheduler_cluster_mix.h"
@@ -162,10 +162,8 @@ static inline __aicore__ bool scheduler_complete_own_slot(
             scheduler->config.self_lane >= PLATFORM_CORES_PER_BLOCKDIM)
             return false;
     }
-    const uint64_t worker_id = scheduler->worker_id();
     if constexpr (!FromExecutor)
-        if (worker_id >= scheduler->config.runtime_worker_count) return false;
-    auto *target = scheduler_worker_context_at(scheduler_state_base, scheduler, worker_id);
+        if (scheduler->worker_id() >= scheduler->config.runtime_worker_count) return false;
     auto *local_slot = &scheduler->slots[pending_slot];
     const int64_t task_ref = local_slot->task_ref;
     if constexpr (!FromExecutor) {
@@ -275,29 +273,11 @@ static inline __aicore__ bool scheduler_complete_own_slot(
     if (chip_task_timing_enabled) {
         // An own slot's dispatch, execution identity and completion trace have
         // the same sole writer.
-        if (phase_timing_enabled && !scheduler->profiling->worker_trace_valid) {
-            scheduler_observe_cache_line(&target->trace_aicore_entry_cycles);
-        }
         completed_trace->kernel_start_cycles = executor_trace->kernel_start_cycles;
         completed_trace->kernel_end_cycles = executor_trace->kernel_end_cycles;
         completed_trace->ready_observe_cycles = executor_trace->ready_observe_cycles;
         if (schedule_timing_enabled) completed_trace->complete_start_cycles = completion_observe;
         if (phase_timing_enabled) {
-            completed_trace->ready_scan_start_cycles = executor_trace->ready_scan_start_cycles;
-            completed_trace->completion_id = executor_trace->completion_id;
-            completed_trace->completion_inbox_index = executor_trace->completion_inbox_index;
-            SchedulerWorkerTraceCache *worker_trace = &scheduler->profiling->worker_trace;
-            if (!scheduler->profiling->worker_trace_valid) {
-                worker_trace->descriptor_cache_observed_cycles = target->trace_descriptor_cache_observed_cycles;
-                worker_trace->aicore_entry_cycles = target->trace_aicore_entry_cycles;
-                worker_trace->handshake_publish_cycles = target->trace_handshake_publish_cycles;
-                worker_trace->register_release_cycles = target->trace_register_release_cycles;
-                scheduler->profiling->worker_trace_valid = true;
-            }
-            completed_trace->descriptor_cache_observed_cycles = worker_trace->descriptor_cache_observed_cycles;
-            completed_trace->aicore_entry_cycles = worker_trace->aicore_entry_cycles;
-            completed_trace->handshake_publish_cycles = worker_trace->handshake_publish_cycles;
-            completed_trace->register_release_cycles = worker_trace->register_release_cycles;
             completed_trace->complete_scheduler_worker_id = scheduler->worker_id();
             completed_trace->complete_loop_iter = scheduler->profiling->loop_iter;
         }
@@ -313,8 +293,6 @@ static inline __aicore__ bool scheduler_complete_own_slot(
         // its valid word through the atomic wrapper below.
         scheduler_writeback_cache_line(&completed_trace->kernel_start_cycles);
         if (schedule_timing_enabled) scheduler_writeback_cache_line(&completed_trace->dispatch_start_cycles);
-        if (phase_timing_enabled) scheduler_writeback_cache_line(&completed_trace->refill_scheduler_worker_id);
-        if (phase_timing_enabled) scheduler_writeback_cache_line(&completed_trace->descriptor_cache_observed_cycles);
         scheduler_cache_barrier();
         scheduler_gm_store(completed_trace->valid, UINT64_C(1));
         if constexpr (RecordProtocol)

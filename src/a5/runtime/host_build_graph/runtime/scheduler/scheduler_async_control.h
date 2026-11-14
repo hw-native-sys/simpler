@@ -270,48 +270,6 @@ scheduler_async_writer_for_group(const SchedulerAsyncLocalState &local, uint32_t
     return {local.base, local.bytes, local.layout->run_epoch, offset, group_index};
 }
 
-inline __aicore__ bool scheduler_async_map_execution(
-    SchedulerAsyncLocalState &local, int64_t task_ref, uint32_t block, uint32_t lane,
-    pto2::resident::AsyncWriter &writer
-) {
-    using namespace scheduler_async_detail;
-    writer = AsyncWriter{};
-    uint32_t index = ASYNC_INVALID_INDEX;
-    if (!task_index(local, task_ref, index)) return false;
-    if (index == ASYNC_INVALID_INDEX) return true;
-    auto *tasks = scheduler_state_at<SchedulerAsyncTaskData>(local.base, local.layout->task_data_offset);
-    const auto &task = tasks[index];
-    const uint8_t mask = *reinterpret_cast<__gm__ const uint8_t *>(&task.async_mask);
-    if (lane >= 3 || mask == 0 || (mask & ~UINT8_C(7)) != 0 || block >= task.block_count) return fail(local, task_ref);
-    if ((mask & (1U << lane)) == 0) return true;
-    const uint64_t wide_group_index = static_cast<uint64_t>(task.group_base) +
-                                      block * static_cast<uint32_t>(__builtin_popcount(mask)) +
-                                      static_cast<uint32_t>(__builtin_popcount(mask & ((1U << lane) - 1)));
-    if (wide_group_index >= local.layout->group_count) return fail(local, task_ref);
-    const uint32_t group_index = static_cast<uint32_t>(wide_group_index);
-    // Bootstrap bounds the contiguous, Host-initialized header array. No
-    // header is read until the kernel requests AsyncCtx or returns to seal it.
-    writer = scheduler_async_writer_for_group(local, group_index);
-    return true;
-}
-
-// The caller has observed the existing computation join's TASK_LAST result.
-// A pre-join zero observation cannot exclude another execution's registration.
-static inline __aicore__ bool
-scheduler_async_has_registered_groups(SchedulerAsyncLocalState *local, int64_t task_ref, bool &registered) {
-    using namespace scheduler_async_detail;
-    registered = false;
-    if (local == nullptr) return true;
-    uint32_t index = ASYNC_INVALID_INDEX;
-    if (!task_index(*local, task_ref, index)) return false;
-    if (index == ASYNC_INVALID_INDEX) return true;
-    auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(local->base, local->layout->joins_offset);
-    const uint64_t word = scheduler_gm_fetch_add(joins[index].word, UINT64_C(0));
-    if (!scheduler_async_pending::valid(word) || scheduler_async_pending::closed(word)) return fail(*local, task_ref);
-    registered = scheduler_async_pending::registered(word) != 0;
-    return true;
-}
-
 inline __aicore__ bool scheduler_async_begin_prebound_execution(
     SchedulerAsyncLocalState *local, int64_t task_ref, __gm__ GlobalContext &global, pto2::resident::AsyncWriter &writer
 ) {
@@ -326,26 +284,6 @@ inline __aicore__ bool scheduler_async_begin_prebound_execution(
         global.async_group_offset != local->layout->groups_offset + uint64_t{index} * sizeof(AsyncGroupData))
         return fail(*local, task_ref);
     writer = scheduler_async_writer_for_group(*local, index);
-    global.async_output_capture_refused = 0;
-    global.async_present = 1;
-    return true;
-}
-
-inline __aicore__ bool scheduler_async_begin_execution(
-    SchedulerAsyncLocalState *local, int64_t task_ref, uint32_t block, uint32_t lane, __gm__ GlobalContext &global,
-    pto2::resident::AsyncWriter &writer
-) {
-    using namespace scheduler_async_detail;
-    writer = AsyncWriter{};
-    if (local == nullptr) return true;
-    global.async_present = 0;
-    if (!scheduler_async_map_execution(*local, task_ref, block, lane, writer)) return false;
-    if (writer.image == nullptr) return true;
-    global.async_image_address = reinterpret_cast<uint64_t>(writer.image);
-    global.async_image_bytes = writer.image_bytes;
-    global.async_run_epoch = writer.run_epoch;
-    global.async_group_offset = writer.group_offset;
-    global.async_group_index = writer.group_index;
     global.async_output_capture_refused = 0;
     global.async_present = 1;
     return true;

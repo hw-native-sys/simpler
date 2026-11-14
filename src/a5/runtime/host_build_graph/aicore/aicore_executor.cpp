@@ -18,7 +18,7 @@
 #include "scheduler/scheduler_graph_control.h"
 #include "scheduler/scheduler_protocol_execute.h"
 #include "common/platform_config.h"
-#include "dispatch_payload.h"
+#include "kernel_args.h"
 #include "runtime.h"
 #include "scheduler/scheduler_memory.h"
 #include "scheduler/scheduler_ready.h"
@@ -31,16 +31,15 @@ namespace {
 template <bool WithProfiling, bool WithNativeGraph>
 __aicore__ void dispatch_resident_scheduler(
     CoreType core_type, __gm__ SchedulerWorkerContext *context, __gm__ SchedulerRunControl *run_control,
-    __gm__ void *scheduler_state_base, uint64_t profiling_level, uint64_t aicore_entry_cycles,
-    uint64_t handshake_publish_cycles
+    __gm__ void *scheduler_state_base, uint64_t profiling_level, uint64_t aicore_entry_cycles
 ) {
     if (core_type == CoreType::AIC) {
         simpler::hbg::resident::run<WithProfiling, WithNativeGraph, CoreType::AIC>(
-            context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles, handshake_publish_cycles
+            context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles
         );
     } else {
         simpler::hbg::resident::run<WithProfiling, WithNativeGraph, CoreType::AIV>(
-            context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles, handshake_publish_cycles
+            context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles
         );
     }
 }
@@ -48,16 +47,15 @@ __aicore__ void dispatch_resident_scheduler(
 template <bool WithNativeGraph>
 __aicore__ void dispatch_resident_timing(
     CoreType core_type, __gm__ SchedulerWorkerContext *context, __gm__ SchedulerRunControl *run_control,
-    __gm__ void *scheduler_state_base, uint64_t profiling_level, uint64_t aicore_entry_cycles,
-    uint64_t handshake_publish_cycles
+    __gm__ void *scheduler_state_base, uint64_t profiling_level, uint64_t aicore_entry_cycles
 ) {
     if (core_type == CoreType::AIC) {
         simpler::hbg::resident::run_timing<WithNativeGraph, CoreType::AIC>(
-            context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles, handshake_publish_cycles
+            context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles
         );
     } else {
         simpler::hbg::resident::run_timing<WithNativeGraph, CoreType::AIV>(
-            context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles, handshake_publish_cycles
+            context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles
         );
     }
 }
@@ -109,7 +107,6 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     }
     dcci(handshake, SINGLE_CACHE_LINE, CACHELINE_OUT);
     dsb((mem_dsb_t)0);
-    uint64_t handshake_publish_cycles = chip_swimlane_enabled ? get_sys_cnt_aicore() : 0;
 
     const uint64_t context_base = bootstrap->worker_context_base;
     const int32_t worker_count = runtime->dev.worker_count;
@@ -175,38 +172,32 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         if (scheduler_phase_timing_enabled(profiling_level)) {
             if (native_graph) {
                 dispatch_resident_scheduler<true, true>(
-                    core_type, context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles,
-                    handshake_publish_cycles
+                    core_type, context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles
                 );
             } else {
                 dispatch_resident_scheduler<true, false>(
-                    core_type, context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles,
-                    handshake_publish_cycles
+                    core_type, context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles
                 );
             }
         } else {
             if (native_graph) {
                 dispatch_resident_timing<true>(
-                    core_type, context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles,
-                    handshake_publish_cycles
+                    core_type, context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles
                 );
             } else {
                 dispatch_resident_timing<false>(
-                    core_type, context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles,
-                    handshake_publish_cycles
+                    core_type, context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles
                 );
             }
         }
     } else {
         if (native_graph) {
             dispatch_resident_scheduler<false, true>(
-                core_type, context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles,
-                handshake_publish_cycles
+                core_type, context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles
             );
         } else {
             dispatch_resident_scheduler<false, false>(
-                core_type, context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles,
-                handshake_publish_cycles
+                core_type, context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles
             );
         }
     }

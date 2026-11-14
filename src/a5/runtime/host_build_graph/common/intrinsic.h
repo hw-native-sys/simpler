@@ -14,8 +14,8 @@
  * @brief SPMD execution context for AICore user kernels
  *
  * GlobalContext exposes the final physical AIV lane and versioned resident
- * run/execution addressing. LocalContext carries logical block geometry. Both contexts belong to the dispatch
- * payload; their addresses remain stable for the kernel invocation.
+ * run/execution addressing. LocalContext carries logical block geometry. Both contexts belong to the
+ * invocation Binding; their addresses remain stable for the kernel invocation.
  *
  * Both contexts are injected via two pointer slots appended at the tail
  * of the kernel args[] array:
@@ -99,7 +99,7 @@ static constexpr int32_t PAYLOAD_LOCAL_CONTEXT_INDEX = SPMD_LOCAL_CONTEXT_INDEX;
 static constexpr int32_t PAYLOAD_GLOBAL_CONTEXT_INDEX = SPMD_GLOBAL_CONTEXT_INDEX;
 
 /**
- * Per-dispatch global context, stored in DispatchPayload. Resident graph
+ * Per-invocation global context. Resident graph
  * Mix dispatch sets sub_block_id from the final physical AIV placement; the
  * writer fields name this invocation's stable completion publication.
  */

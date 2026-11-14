@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <type_traits>
 
-#include "dispatch_payload.h"
+#include "kernel_args.h"
 
 inline constexpr uint64_t SCHEDULER_PREPARED_ALIGNMENT = 128;
 

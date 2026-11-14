@@ -76,11 +76,9 @@ TEST(HbgAdmissionProgress, DeferredPredecessorLeavesIndependentCounterPublisherR
             GmExecution execution{};
             ASSERT_TRUE(fixture.begin(worker, &execution));
             ASSERT_EQ(execution.task, 0);
-            GlobalContext context{};
+            auto &context = fixture.storage.prepared_global_context(0, execution.block, execution.subtask);
             AsyncWriter writer;
-            ASSERT_TRUE(scheduler_async_begin_execution(
-                &async_workers[worker], 0, execution.block, execution.subtask, context, writer
-            ));
+            ASSERT_TRUE(scheduler_async_begin_prebound_execution(&async_workers[worker], 0, context, writer));
             CompletionToken token{
                 reinterpret_cast<uint64_t>(&signal), 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0
             };

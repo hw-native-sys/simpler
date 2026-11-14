@@ -98,24 +98,6 @@ static inline __aicore__ void scheduler_observe_data_cache(__gm__ void *address)
 #endif
 }
 
-// A5 ld_dev bypasses the scalar DCache but does not observe a value an atomic
-// wrote until that write has drained -- the writer's own core included -- so a
-// word any core publishes by atomic must be read by an atomic too. This is a
-// read: adding zero returns the current value and stores it back unchanged.
-// Reserve it for words whose staleness breaks a protocol -- it is a
-// read-modify-write, so a hot poll shared by every core stays on
-// scheduler_gm_query.
-static inline __aicore__ int64_t scheduler_gm_load(__gm__ volatile int64_t &value) {
-    return scheduler_scalar_memory_result(SchedPhaseKind::ScalarAtomicLoad, [&value]() __aicore__ {
-#if defined(__CCE_AICORE__)
-        __gm__ uint64_t *address = reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&value));
-        return static_cast<int64_t>(atomicAdd(address, UINT64_C(0)));
-#else
-    return __atomic_load_n(&value, __ATOMIC_ACQUIRE);
-#endif
-    });
-}
-
 // A5 ld_dev bypasses the scalar DCache. Atomic-published words require
 // atomic confirmation; bypass-published signals use this read directly.
 // Ownership changes use the CAS/exchange/fetch wrappers below.
@@ -240,18 +222,6 @@ scheduler_gm_store(__gm__ volatile uint32_t &value, uint32_t desired, int order 
     });
 }
 
-static inline __aicore__ int64_t
-scheduler_gm_exchange(__gm__ volatile int64_t &value, int64_t desired, int order = __ATOMIC_ACQ_REL) {
-    return scheduler_scalar_memory_result(SchedPhaseKind::ScalarAtomicExchange, [&value, desired, order]() __aicore__ {
-#if defined(__CCE_AICORE__)
-        (void)order;
-        return atomicExch(const_cast<__gm__ int64_t *>(&value), desired);
-#else
-    return __atomic_exchange_n(&value, desired, order);
-#endif
-    });
-}
-
 static inline __aicore__ uint64_t
 scheduler_gm_fetch_add(__gm__ volatile uint64_t &value, uint64_t delta, int order = __ATOMIC_ACQ_REL) {
     return scheduler_scalar_memory_result(SchedPhaseKind::ScalarAtomicFetchAdd, [&value, delta, order]() __aicore__ {
@@ -300,38 +270,6 @@ static inline __aicore__ uint64_t scheduler_gm_compare_exchange(
 #endif
         }
     );
-}
-
-static inline __aicore__ uint64_t
-scheduler_gm_fetch_or(__gm__ volatile uint64_t &value, uint64_t bits, int order = __ATOMIC_ACQ_REL) {
-#if defined(__CCE_AICORE__)
-    (void)order;
-    uint64_t observed = scheduler_gm_query(value);
-    while ((observed & bits) != bits) {
-        uint64_t actual = scheduler_gm_compare_exchange(value, observed, observed | bits);
-        if (actual == observed) break;
-        observed = actual;
-    }
-    return observed;
-#else
-    return __atomic_fetch_or(&value, bits, order);
-#endif
-}
-
-static inline __aicore__ uint64_t
-scheduler_gm_fetch_and(__gm__ volatile uint64_t &value, uint64_t bits, int order = __ATOMIC_ACQ_REL) {
-#if defined(__CCE_AICORE__)
-    (void)order;
-    uint64_t observed = scheduler_gm_query(value);
-    while ((observed & bits) != observed) {
-        uint64_t actual = scheduler_gm_compare_exchange(value, observed, observed & bits);
-        if (actual == observed) break;
-        observed = actual;
-    }
-    return observed;
-#else
-    return __atomic_fetch_and(&value, bits, order);
-#endif
 }
 
 static inline __aicore__ void scheduler_gm_fetch_add_discard(__gm__ volatile uint64_t &value, uint64_t delta) {

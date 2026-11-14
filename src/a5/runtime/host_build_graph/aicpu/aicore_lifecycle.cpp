@@ -47,9 +47,7 @@ uint64_t resident_scheduler_timeout_cycles() {
 
 bool lifecycle_timing_enabled() { return get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHEDULE_TIMING; }
 
-// The AICPU thread index this route's diagnostic settlement runs under. One
-// thread performs it for the whole run, so it selects one ready queue for every
-// core's records.
+// One AICPU thread consolidates diagnostics for all cores after retirement.
 constexpr int32_t kDiagnosticDumpLane = 0;
 
 #if SIMPLER_DFX
@@ -297,21 +295,11 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
             const int32_t worker = cluster_workers[cluster][lane];
             contexts[worker].cluster_count = static_cast<uint64_t>(aic_count);
             contexts[worker].cluster_index = static_cast<uint64_t>(cluster);
-            // Every core schedules itself, so a Scheduler is identified by the
-            // worker it runs on and there are as many Schedulers as workers. The
-            // core that coordinates a cluster's Mix tasks is its AIC, which the
-            // lane ordering below already fixes as lane 0.
-            contexts[worker].scheduler_index = static_cast<uint64_t>(worker);
-            contexts[worker].is_scheduler = 1;
-            contexts[worker].scheduler_count = static_cast<uint64_t>(core_count_);
             for (int32_t member = 0; member < PLATFORM_CORES_PER_BLOCKDIM; ++member)
                 contexts[worker].cluster_worker_ids[member] = static_cast<uint64_t>(cluster_workers[cluster][member]);
         }
     }
     run_control->active_worker_count = static_cast<uint64_t>(core_count_);
-    run_control->aic_active_worker_count = static_cast<uint64_t>(aic_count);
-    run_control->aiv_active_worker_count = static_cast<uint64_t>(aiv_count);
-    run_control->scheduler_count = static_cast<uint64_t>(core_count_);
     run_control->scheduler_timeout_cycles = resident_scheduler_timeout_cycles();
 
     // Discovery checked each compact launch ID, core type and complete cluster
@@ -390,26 +378,23 @@ int32_t AicoreLifecycle::wait_bootstrap_complete(Runtime *runtime) {
                 log_aicore_prepared_error(context, run_control);
                 LOG_ERROR(
                     "A5 HBG AICore scheduler: bootstrap failed at task=%" PRIu64 " status=%" PRIu64 " core=%" PRIu64
-                    " type=%" PRIu64 " site=%" PRIu64 " workers=%" PRIu64 " schedulers=%" PRIu64
-                    " scan_arrived=%" PRIu64 " scan_complete=%" PRIu64 " dispatch_arrived=%" PRIu64
-                    " bootstrap_complete=%" PRIu64,
+                    " type=%" PRIu64 " site=%" PRIu64 " workers=%" PRIu64 " scan_arrived=%" PRIu64
+                    " scan_complete=%" PRIu64 " dispatch_arrived=%" PRIu64 " bootstrap_complete=%" PRIu64,
                     run_control->error_task_ref, run_control->scheduler_error, run_control->error_core_id,
                     run_control->error_core_type, run_control->error_site, run_control->active_worker_count,
-                    run_control->scheduler_count, run_control->bootstrap_scan_arrived_count,
-                    run_control->bootstrap_scan_complete, run_control->bootstrap_arrived_count,
-                    run_control->bootstrap_complete
+                    run_control->bootstrap_scan_arrived_count, run_control->bootstrap_scan_complete,
+                    run_control->bootstrap_arrived_count, run_control->bootstrap_complete
                 );
                 return -1;
             }
         }
         if (scheduler_watchdog_expired(watchdog_start, get_sys_cnt_aicpu(), timeout_cycles)) {
             LOG_ERROR(
-                "A5 HBG AICore Scheduler bootstrap timeout: workers=%" PRIu64 " schedulers=%" PRIu64
-                " scan_arrived=%" PRIu64 " scan_complete=%" PRIu64 " dispatch_arrived=%" PRIu64
-                " bootstrap_complete=%" PRIu64,
-                run_control->active_worker_count, run_control->scheduler_count,
-                run_control->bootstrap_scan_arrived_count, run_control->bootstrap_scan_complete,
-                run_control->bootstrap_arrived_count, run_control->bootstrap_complete
+                "A5 HBG AICore Scheduler bootstrap timeout: workers=%" PRIu64 " scan_arrived=%" PRIu64
+                " scan_complete=%" PRIu64 " dispatch_arrived=%" PRIu64 " bootstrap_complete=%" PRIu64,
+                run_control->active_worker_count, run_control->bootstrap_scan_arrived_count,
+                run_control->bootstrap_scan_complete, run_control->bootstrap_arrived_count,
+                run_control->bootstrap_complete
             );
             record_lifecycle_timeout(runtime, SchedulerErrorSite::BOOTSTRAP_COMPLETE_TIMEOUT);
             return -1;
@@ -568,23 +553,14 @@ void AicoreLifecycle::collect_run_swimlane_records(Runtime *runtime) {
                     trace.state_probe_scheduler_worker_id, SchedPhaseKind::StateProbe, trace.state_probe_start_cycles,
                     trace.state_probe_end_cycles, trace.dispatch_loop_iter, identity
                 );
-                if (static_cast<SchedulerPublicationMode>(trace.publication_mode) != SchedulerPublicationMode::REFILL)
-                    phase(
-                        trace.dispatch_scheduler_worker_id, SchedPhaseKind::Dispatch, trace.dispatch_start_cycles,
-                        trace.dispatch_end_cycles, trace.dispatch_loop_iter, identity
-                    );
+                phase(
+                    trace.dispatch_scheduler_worker_id, SchedPhaseKind::Dispatch, trace.dispatch_start_cycles,
+                    trace.dispatch_end_cycles, trace.dispatch_loop_iter, identity
+                );
                 phase(
                     trace.complete_scheduler_worker_id, SchedPhaseKind::Complete, trace.complete_start_cycles,
                     trace.complete_end_cycles, trace.complete_loop_iter, identity
                 );
-                if (trace.refill_task_ref < context->graph_task_count) {
-                    const auto refill = aicore_scheduler_public_identity(graph, trace.refill_task_ref);
-                    if (refill.is_valid())
-                        phase(
-                            trace.refill_scheduler_worker_id, SchedPhaseKind::Refill, trace.refill_start_cycles,
-                            trace.refill_end_cycles, trace.refill_loop_iter, refill
-                        );
-                }
             }
         }
     }

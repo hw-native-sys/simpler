@@ -164,10 +164,8 @@ struct AsyncFixture {
     }
 
     AsyncWriter start(int64_t task_ref = 0, uint32_t block = 0, uint32_t lane = 0, uint32_t worker = 0) {
-        GlobalContext context{};
-        EXPECT_TRUE(
-            scheduler_async_begin_execution(&workers[worker], task_ref, block, lane, context, executions[worker])
-        );
+        auto &context = storage.prepared_global_context(task_ref, block, lane);
+        EXPECT_TRUE(scheduler_async_begin_prebound_execution(&workers[worker], task_ref, context, executions[worker]));
         EXPECT_EQ(context.async_present, 1u);
         return {
             reinterpret_cast<uint8_t *>(context.async_image_address), context.async_image_bytes,
@@ -491,23 +489,23 @@ TEST(HbgAsyncControl, UnmappedExecutionClearsThePreviousGroupHandle) {
     AsyncFixture f;
     auto writer = f.start();
     ASSERT_NE(writer.group_index, ASYNC_INVALID_INDEX);
-    GlobalContext context{};
+    auto &context = f.storage.prepared_global_context(1, 0, 0);
     context.async_present = 1;
-    ASSERT_TRUE(scheduler_async_begin_execution(&f.workers[0], 1, 0, 0, context, writer));
+    ASSERT_TRUE(scheduler_async_begin_prebound_execution(&f.workers[0], 1, context, writer));
     EXPECT_EQ(writer.group_index, ASYNC_INVALID_INDEX);
     EXPECT_EQ(writer.image, nullptr);
     EXPECT_EQ(context.async_present, 0u);
-    ASSERT_TRUE(scheduler_async_begin_execution(nullptr, 0, 0, 0, context, writer));
+    ASSERT_TRUE(scheduler_async_begin_prebound_execution(nullptr, 0, context, writer));
     EXPECT_EQ(writer.group_index, ASYNC_INVALID_INDEX);
 }
 
 TEST(HbgAsyncControl, BoundGroupRebuildUsesPrivateIndexInsteadOfKernelContext) {
     AsyncFixture f(1, {async_task(0, 2)});
-    GlobalContext context{};
+    auto &context = f.storage.prepared_global_context(0, 1, 0);
     uint32_t index = ASYNC_INVALID_INDEX;
     {
         AsyncWriter writer{};
-        ASSERT_TRUE(scheduler_async_begin_execution(&f.workers[0], 0, 1, 0, context, writer));
+        ASSERT_TRUE(scheduler_async_begin_prebound_execution(&f.workers[0], 0, context, writer));
         index = writer.group_index;
         ASSERT_NE(index, 0u);
         f.register_counter(writer);
@@ -679,12 +677,16 @@ TEST(HbgAsyncControl, UnusedRecordsRemainUntouchedByInitializationAndZeroWaitExe
         f.base(), f.storage.layout, reinterpret_cast<uint64_t>(f.base()), f.plan.initialized_bytes
     ));
     ASSERT_TRUE(initialize_async_completion(f.base(), f.plan.total_bytes, f.plan));
+    scheduler_state_at<SchedulerAsyncLayout>(f.base(), f.plan.layout_offset)->image_bytes = f.storage.layout.total_size;
     f.storage.metadata[0] = metadata;
     std::copy(contexts.begin(), contexts.end(), f.storage.contexts);
-    // This fixture initializes only the async arena; restore its physical gate
-    // after the generic initializer installs virtual one-contribution gates.
-    f.task_control(0)->completion_state =
-        scheduler_completion_initial_state(metadata.logical_block_num * metadata.active_mask.count());
+    // Republish the Host-prepared bindings erased by generic initialization.
+    scheduler_state_at<SchedulerGraphSummary>(f.base(), f.storage.layout.graph_summary_offset)->run_epoch =
+        f.plan.layout.run_epoch;
+    f.storage.task_catalog_offset = 0;
+    f.storage.calls_prepared = false;
+    f.storage.prepare_catalog();
+    ASSERT_TRUE(f.storage.prepare_calls(f.graph.graph()));
     EXPECT_TRUE(std::all_of(suffix, end, [](uint8_t byte) {
         return byte == 0xa5;
     }));
@@ -868,9 +870,9 @@ TEST(HbgAsyncControl, MoreWaitersThanWorkerSlotsLeavePublisherRunnableAndTermina
     ASSERT_EQ(f.local()->slots[slot_index].task_ref, publisher);
     ASSERT_EQ(f.local()->slots[slot_index].state, SchedulerDispatchSlotState::READY);
     f.local()->slots[slot_index].state = SchedulerDispatchSlotState::EXECUTING;
-    GlobalContext context{};
+    auto &context = f.storage.prepared_global_context(publisher, 0, 0);
     AsyncWriter writer;
-    ASSERT_TRUE(scheduler_async_begin_execution(&f.workers[0], publisher, 0, 0, context, writer));
+    ASSERT_TRUE(scheduler_async_begin_prebound_execution(&f.workers[0], publisher, context, writer));
     EXPECT_EQ(context.async_present, 0u);
     for (uint32_t task = 0; task + 1 < waiter_count; ++task)
         __atomic_store_n(&f.signal[task], 1u, __ATOMIC_RELEASE);

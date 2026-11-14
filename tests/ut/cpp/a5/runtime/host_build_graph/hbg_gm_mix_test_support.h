@@ -125,13 +125,9 @@ struct GmMixFixture {
         storage.prepare_catalog();
         EXPECT_TRUE(scheduler_init_spmd_task_records(base(), storage.layout, 47));
         storage.run_control->active_worker_count = clusters * 3;
-        storage.run_control->aic_active_worker_count = clusters;
-        storage.run_control->aiv_active_worker_count = clusters * 2;
         storage.run_control->expected_task_count = shapes.size();
         for (uint32_t worker = 0; worker < locals.size(); ++worker) {
             auto &context = storage.contexts[worker];
-            context.is_scheduler = 1;
-            context.scheduler_count = clusters * 3;
             for (uint32_t lane = 0; lane < 3; ++lane)
                 context.cluster_worker_ids[lane] = (worker / 3) * 3 + lane;
             storage.test_graphs[worker] = graph.graph();
