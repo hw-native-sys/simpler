@@ -56,8 +56,8 @@ barrier. Local setup therefore includes execution-time cache acquisition and
 record reservation, but excludes earlier payload preparation and fanin waits.
 Predicated-off and dependency-only tasks do not emit kernel records.
 
-Task identity is written during payload preparation and shares its existing
-writeback. A self-scheduling core reserves from its cached buffer without
+Task identity is derived from the selected task when committing its L1 record;
+no async token is stored in the payload. A self-scheduling core reserves from its cached buffer without
 observing the shared head while space remains; only the first reservation and
 full-buffer replacement need to observe it. This rule belongs to the
 self-scheduled path, whose core alone publishes the full count.

@@ -1194,7 +1194,6 @@ static inline __aicore__ bool scheduler_prepare_dispatch_slot(
     SchedulerGraphResult status = SchedulerGraphResult::OK;
     if (inline_task) {
         payload->function_bin_addr = 0;
-        payload->src_payload = 0;
     } else {
         if (graph.native_header_offset != 0 && !reserved.args_observed) {
             const auto error = scheduler_observe_graph_arguments(graph, ready_claim.task_ref);

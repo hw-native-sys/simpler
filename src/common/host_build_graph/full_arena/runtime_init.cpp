@@ -8,15 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-/**
- * Host/AICPU shared runtime-arena layout, init_data and wire implementations.
- *
- * Lives under host_build_graph/shared/ so it is included in both the
- * host_runtime.so build (host pre-populates the prebuilt arena image) and the
- * aicpu_runtime build (AICPU runs wire_arena_pointers + destroy after attach).
- * The scheduler's own dispatch logic stays in scheduler.cpp and the aicpu build;
- * the ops table and the orchestrator are host-only and live under host/.
- */
+// A2A3 Host/AICPU and WSE Host build this module; A5 HBG has independent backing.
 
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +19,7 @@
 #include "host_build_graph/runtime_core.h"
 #include "host_build_graph/shared_memory.h"
 #include "scheduler/scheduler.h"
+#include "aicore_completion_mailbox.h"
 
 // =============================================================================
 // Ready queue

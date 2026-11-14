@@ -60,7 +60,7 @@
     {
       "source": "src/a5/runtime/host_build_graph/build_config.py",
       "destination": "src/wse/runtime/host_build_graph/build_config.py",
-      "sha256": "203dd70451657e530632edd56f2068771bb46e4c79a657c7acd4489a68ea7293"
+      "sha256": "673e34ad6cbf67ace1878cd987a5755c4f70272d763baf65108604387e2cae92"
     },
     {
       "source": "src/a5/runtime/host_build_graph/common/intrinsic.h",
@@ -80,17 +80,17 @@
     {
       "source": "src/a5/runtime/host_build_graph/host/runtime_maker.cpp",
       "destination": "src/wse/runtime/host_build_graph/host/runtime_maker.cpp",
-      "sha256": "d0b0a430c4ab9c3fa415627e48adc85403ca44c03c907e781674525f6f311e76"
+      "sha256": "196a117669d22e179d32cb36bf76f9fba26a961edf8570db54ae0aa60ca6253c"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/aicore_completion_mailbox.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/aicore_completion_mailbox.h",
-      "sha256": "afc27eb5a6407b6a3ddc324a7007ea4928d2b33241640019f5eaa9776b8ae568"
+      "sha256": "c2eb077a58fd7355a91262ee76efc799b551c4fd4a16e1503742011ab0297daa"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/aicore_completion_mailbox_types.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/aicore_completion_mailbox_types.h",
-      "sha256": "e0bbc7c8706f1a76a3df053bfe84235da57b904fc1aa19849ddaa1489dcf754e"
+      "sha256": "bda026c32b15f66ea5e59ade4a2d3871315c7f9d6a6836a77c58789bb86f3964"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/async_wait.h",
@@ -105,7 +105,7 @@
     {
       "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler.h",
       "destination": "src/wse/runtime/host_build_graph/runtime/scheduler/scheduler.h",
-      "sha256": "caa845669f43c21412768c29b7cc43172209370437c0dfe19a82c7b10d4d0dc0"
+      "sha256": "8a80320454f0ad2d1dec4d4ca1ea7dbd500e47c5144ba498980faded38d32281"
     },
     {
       "source": "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph.h",
@@ -203,7 +203,7 @@
       "sha256": "80e119aee2ebf4b628ce662d0d1bd9a3df3639b7acdc930d6ca4f100356ba45a"
     },
     {
-      "source": "src/a5/runtime/host_build_graph/runtime/aicore_completion_mailbox.h",
+      "source": "src/common/host_build_graph/full_arena/aicore_completion_mailbox.h",
       "sha256": "ef6ed6ef50c43adcbc46318bda2604ccf4e9a813370d1b9d838e86e05efae151"
     },
     {
@@ -231,8 +231,8 @@
       "sha256": "f7e3c8fd711f38fd6c528525444095ec484713aab7cba14e4ec00c0376184ed4"
     },
     {
-      "source": "src/a5/runtime/host_build_graph/runtime/aicore_completion_mailbox_types.h",
-      "sha256": "5306aa2c152255661d465204d5bf090bf00feae74aec07a23ff60fb3bc693bb0"
+      "source": "src/common/host_build_graph/completion_types.h",
+      "sha256": "0cf7e63801ff5c5d9467a3057351ee74e4d2f12f7173336752a9c7af2467f155"
     }
   ]
 }

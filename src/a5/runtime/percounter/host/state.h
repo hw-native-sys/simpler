@@ -279,8 +279,6 @@ inline StateSelection select_percounter_state(
         payload->args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = device_payload + offsetof(DispatchPayload, global_context);
         payload->local_context.block_idx = 0;
         payload->local_context.block_num = 1;
-        payload->local_context.async_ctx.task_token = TaskId::invalid();
-        payload->src_payload = 0;
         // Every prepared payload on a lane names that lane's registration scratch.
         const uint64_t first_record = slot / PERCOUNTER_PAYLOAD_SLOT_COUNT;
         payload->global_context.async_present = 1;

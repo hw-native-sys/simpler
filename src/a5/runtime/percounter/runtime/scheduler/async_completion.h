@@ -37,7 +37,7 @@
 
 #include <cstdint>
 
-#include "aicore_completion_mailbox_types.h"
+#include "host_build_graph/completion_types.h"
 #include "host_build_graph/completion_token.h"
 #include "platform_comm/ccu/ccu_native_abi.h"
 #include "scheduler/gm.h"

@@ -356,7 +356,7 @@ TEST(PercounterPayload, LayoutReservesEveryLaneSlot) {
     );
 }
 
-TEST(PercounterPayload, TaskTimingPreparesIdentityAndBatchesCommittedCount) {
+TEST(PercounterPayload, TaskTimingRecordsIdentityAndBatchesCommittedCount) {
     Fixture f;
     auto buffer = std::make_unique<ChipSwimlaneAicoreTaskBuffer>();
     ChipSwimlaneActiveHead head{};
@@ -366,10 +366,6 @@ TEST(PercounterPayload, TaskTimingPreparesIdentityAndBatchesCommittedCount) {
     f.cfg[0].profile = &profile;
     auto task = f.resolve(0);
     ASSERT_TRUE(percounter_prepare_task(f.cfg[0], task, 0, 1, &f.payloads[0][0]));
-    EXPECT_EQ(
-        TaskId::to_uint64(f.payloads[0][0].local_context.async_ctx.task_token),
-        TaskId::to_uint64(TaskId::make_global(0))
-    );
     int calls = 0;
     execute = [&](int64_t *) {
         ++calls;
@@ -405,10 +401,6 @@ TEST(PercounterPayload, TaskTimingUsesGraphBodyIdentityAndResetsEachRun) {
         f.cfg[0].profile_head = &head;
         f.cfg[0].profile = &profile;
         ASSERT_TRUE(percounter_prepare_task(f.cfg[0], task, 0, 1, &f.payloads[0][0]));
-        EXPECT_EQ(
-            TaskId::to_uint64(f.payloads[0][0].local_context.async_ctx.task_token),
-            TaskId::to_uint64(TaskId::make_sub_task(7, 2))
-        );
         ASSERT_TRUE(f.run(0, task, &f.payloads[0][0]));
         chip_swimlane_aicore_flush_task_count(&profile);
         EXPECT_EQ(buffer->count, 1U);

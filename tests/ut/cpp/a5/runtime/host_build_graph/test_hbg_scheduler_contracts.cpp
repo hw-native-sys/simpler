@@ -732,7 +732,6 @@ TEST(SchedulerDispatchPayload, PreservesInitializedSlotContextDuringMaterializat
     GraphBuffer graph(1);
     graph.executable(0, 0);
     DispatchPayload payload{};
-    payload.local_context.async_ctx.task_token = TaskId::invalid();
     payload.global_context.sub_block_id = 7;
     payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&payload.local_context);
     payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&payload.global_context);
@@ -741,7 +740,6 @@ TEST(SchedulerDispatchPayload, PreservesInitializedSlotContextDuringMaterializat
     ASSERT_EQ(
         scheduler_materialize_task_payload_resolved(graph.graph(), task, 0x1000, &payload), SchedulerGraphResult::OK
     );
-    EXPECT_FALSE(payload.local_context.async_ctx.task_token.is_valid());
     EXPECT_EQ(payload.global_context.sub_block_id, 7);
     EXPECT_EQ(payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX], reinterpret_cast<uint64_t>(&payload.local_context));
     EXPECT_EQ(payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX], reinterpret_cast<uint64_t>(&payload.global_context));

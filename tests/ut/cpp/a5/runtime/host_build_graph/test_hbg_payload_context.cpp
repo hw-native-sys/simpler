@@ -15,6 +15,9 @@
 
 #include "hbg_scheduler_test_support.h"
 
+static_assert(sizeof(LocalContext) == 8);
+static_assert(sizeof(DispatchPayload) == 512);
+
 namespace {
 
 void check_payload_range(void *base, uint64_t device_base, uint64_t offset, uint64_t count) {
@@ -32,14 +35,8 @@ void check_payload_range(void *base, uint64_t device_base, uint64_t offset, uint
         );
         EXPECT_EQ(payload->local_context.block_idx, 0);
         EXPECT_EQ(payload->local_context.block_num, 1);
-        EXPECT_EQ(payload->local_context.async_ctx.task_token, TaskId::invalid());
-        EXPECT_EQ(payload->local_context.async_ctx.completion_count, nullptr);
-        EXPECT_EQ(payload->local_context.async_ctx.completion_error_code, nullptr);
-        EXPECT_EQ(payload->local_context.async_ctx.completion_entries, nullptr);
-        EXPECT_EQ(payload->local_context.async_ctx.completion_capacity, 0u);
         EXPECT_EQ(payload->global_context.sub_block_id, 0);
         EXPECT_EQ(payload->function_bin_addr, 0u);
-        EXPECT_EQ(payload->src_payload, 0u);
         for (int32_t arg = 0; arg < PAYLOAD_LOCAL_CONTEXT_INDEX; ++arg)
             EXPECT_EQ(payload->args[arg], 0u);
     }

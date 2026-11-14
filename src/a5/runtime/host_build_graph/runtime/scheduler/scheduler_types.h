@@ -1758,7 +1758,6 @@ inline bool scheduler_init_data_from_layout(
             payload->args[PAYLOAD_LOCAL_CONTEXT_INDEX] = device_payload + offsetof(DispatchPayload, local_context);
             payload->args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = device_payload + offsetof(DispatchPayload, global_context);
             payload->local_context.block_num = 1;
-            payload->local_context.async_ctx.task_token = TaskId::invalid();
         }
     };
     initialize_payloads(layout.dispatch_payloads_offset, SCHEDULER_WORKER_CAPACITY * SCHEDULER_PENDING_SLOT_COUNT);

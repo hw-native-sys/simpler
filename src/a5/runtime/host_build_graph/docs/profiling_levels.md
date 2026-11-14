@@ -58,8 +58,8 @@ kernel execution record. The producer must not fabricate an AICore interval for
 one of these nodes.
 
 Resident scheduling captures identity explicitly from the selected node and
-physical execution. `LocalContext.async_ctx.task_token` is not the source of
-resident task identity. Argument slots 48/49 still address the current local and
+physical execution. Percounter derives the public task token from the selected
+task at record publication; neither runtime stores an async token in LocalContext. Argument slots 48/49 still address the current local and
 global kernel contexts; their presence does not imply AICPU task dispatch.
 
 `dispatch_time` marks dispatch publication completion; `finish_time` marks the

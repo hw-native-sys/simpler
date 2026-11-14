@@ -27,7 +27,6 @@
 #include <vector>
 
 #include "utils/device_arena.h"
-#include "scheduler/scheduler.h"
 #include "host_build_graph/host/orchestrator.h"
 #include "host_build_graph/host/orchestrator_internal.h"
 #include "host_build_graph/shared_memory.h"
@@ -36,11 +35,8 @@
 class HbgScratchRetentionTest : public ::testing::Test {
 protected:
     DeviceArena sm_arena;
-    DeviceArena runtime_arena;
     SharedMemoryHandle *sm_handle = nullptr;
     OrchestratorState orch{};
-    SchedulerState sched{};
-    SchedulerLayout sched_layout{};
     std::vector<char> gm_heap;
 
     void SetUp() override {
@@ -48,22 +44,10 @@ protected:
         ASSERT_NE(sm_handle, nullptr);
         gm_heap.resize(4096);
 
-        sched_layout = SchedulerState::reserve_layout(runtime_arena);
-        ASSERT_NE(runtime_arena.commit(), nullptr);
-
-        ASSERT_TRUE(sched.init_data_from_layout(sched_layout, runtime_arena, sm_handle->sm_base));
-        sched.wire_arena_pointers(sched_layout, runtime_arena);
-        // Same order the AICPU boots in: the slot arrays are not part of the
-        // uploaded image, so nothing can push until they carry their ramp.
-        sched.seed_queue_slots();
         ASSERT_TRUE(orch.init(sm_handle->sm_base, gm_heap.data(), 4096, CHIP_DEFAULT_GRAPH_TASKS));
     }
 
-    void TearDown() override {
-        sched.destroy();
-        runtime_arena.release();
-        sm_arena.release();
-    }
+    void TearDown() override { sm_arena.release(); }
 };
 
 TEST_F(HbgScratchRetentionTest, ReinitializationRetainsStorageButDropsRunState) {

@@ -106,9 +106,8 @@ struct OrchestratorState final {
 
     // Hidden alloc tasks complete synchronously inside the orchestrator and
     // therefore bypass the executor's normal worker-completion counter path.
-    // rt_orchestration_done publishes this into RuntimeContext, which is the copy
-    // the device-side executor adds into its completed_tasks_ progress counter
-    // so shutdown/profiling totals remain closed.
+    // Full-arena makers copy this into their device RuntimeContext so the
+    // AICPU executor can include it in shutdown/profiling progress totals.
     int64_t inline_completed_tasks{0};
 
     // Host-only, like everything else here.
@@ -218,7 +217,6 @@ static_assert(
 
 struct OrchOps;
 class HostTensorAccessor;
-struct RuntimeContext;
 
 /**
  * What one orchestration call runs against.
@@ -244,10 +242,6 @@ struct OrchContext {
     // caller registered none, which makes get_tensor_data / set_tensor_data fail
     // closed rather than dereference one.
     HostTensorAccessor *tensor_access;
-
-    // The device-side state this call feeds. Reached only where an op genuinely
-    // has to publish into the uploaded image.
-    RuntimeContext *rt;
 };
 
 // The .so compiles against the ops-pointer partial definition in orchestration_api.h

@@ -14,7 +14,7 @@
 #include <cstddef>
 #include <new>
 #include "async_condition_writer.h"
-#include "async_wait.h"
+#include "platform_comm/ccu/ccu_completion.h"
 #include "runtime.h"
 namespace {
 TEST(HbgCcuCompletion, OrdinaryRuntimeDoesNotInheritWorkspaceFromReusedStorage) {
@@ -25,33 +25,28 @@ TEST(HbgCcuCompletion, OrdinaryRuntimeDoesNotInheritWorkspaceFromReusedStorage) 
     runtime->~Runtime();
 }
 
-CompletionCondition condition(uint64_t &event) {
-    CompletionCondition cond;
-    cond.engine = ASYNC_ENGINE_CCU;
-    cond.completion_type = COMPLETION_TYPE_CCU;
-    cond.addr = reinterpret_cast<uint64_t>(&event);
-    cond.backend_cookie = 1;
-    return cond;
-}
-TEST(HbgCcuCompletion, WaitsForIndependentEventsAndConfirmsClearBeforeRetirement) {
+TEST(HbgCcuCompletion, PollsIndependentEventsAndClearsReadyEvents) {
     uint64_t a{}, b{1};
-    auto first = condition(a);
-    auto second = condition(b);
-    EXPECT_EQ(first.test().state, CompletionPollState::PENDING);
-    EXPECT_EQ(second.test().state, CompletionPollState::READY);
+    EXPECT_EQ(
+        simpler::ccu::poll_completion(reinterpret_cast<uint64_t>(&a), 1).state,
+        simpler::ccu::CompletionPollState::pending
+    );
+    EXPECT_EQ(
+        simpler::ccu::poll_completion(reinterpret_cast<uint64_t>(&b), 1).state, simpler::ccu::CompletionPollState::ready
+    );
     EXPECT_EQ(b, 0U);
     a = 1;
-    EXPECT_EQ(first.test().state, CompletionPollState::READY);
+    EXPECT_EQ(
+        simpler::ccu::poll_completion(reinterpret_cast<uint64_t>(&a), 1).state, simpler::ccu::CompletionPollState::ready
+    );
     EXPECT_EQ(a, 0U);
-    second.retire();
-    EXPECT_TRUE(second.retired);
-    EXPECT_FALSE(first.retired);
 }
 TEST(HbgCcuCompletion, RejectsInvalidEventMask) {
     uint64_t event{1};
-    auto cond = condition(event);
-    cond.backend_cookie = 2;
-    EXPECT_EQ(cond.test().state, CompletionPollState::FAILED);
+    EXPECT_EQ(
+        simpler::ccu::poll_completion(reinterpret_cast<uint64_t>(&event), 2).state,
+        simpler::ccu::CompletionPollState::protocol_error
+    );
 }
 TEST(HbgCcuCompletion, ResidentWriterAcceptsCanonicalEventToken) {
     uint64_t event{};

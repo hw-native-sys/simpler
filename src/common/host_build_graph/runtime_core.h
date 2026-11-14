@@ -38,8 +38,10 @@
 
 #include "utils/device_arena.h"
 #include "host_build_graph/shared_memory.h"
-#include "scheduler/scheduler.h"
-#include "aicore_completion_mailbox.h"
+#include "host_build_graph/shared_arena_layout.h"
+
+struct SchedulerState;
+struct AICoreCompletionMailbox;
 
 // =============================================================================
 // Runtime Context

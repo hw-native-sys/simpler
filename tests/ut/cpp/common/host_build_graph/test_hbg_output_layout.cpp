@@ -23,7 +23,6 @@
 
 #include "host_build_graph/host/orchestrator_internal.h"
 #include "host_build_graph/shared_memory.h"
-#include "scheduler/scheduler.h"
 #include "utils/device_arena.h"
 
 namespace {
@@ -64,10 +63,8 @@ class HbgLargeOutputSubmission : public ::testing::TestWithParam<uint32_t> {
 protected:
     static constexpr uint64_t HEAP_BYTES = 6ull << 30;
     DeviceArena sm_arena;
-    DeviceArena runtime_arena;
     SharedMemoryHandle *sm_handle = nullptr;
     OrchestratorState orch{};
-    SchedulerState sched{};
     void *heap = MAP_FAILED;
 
     void SetUp() override {
@@ -76,18 +73,11 @@ protected:
         ASSERT_NE(heap, MAP_FAILED);
         sm_handle = SharedMemoryHandle::create_and_init_default(sm_arena);
         ASSERT_NE(sm_handle, nullptr);
-        const auto layout = SchedulerState::reserve_layout(runtime_arena);
-        ASSERT_NE(runtime_arena.commit(), nullptr);
-        ASSERT_TRUE(sched.init_data_from_layout(layout, runtime_arena, sm_handle->sm_base));
-        sched.wire_arena_pointers(layout, runtime_arena);
-        sched.seed_queue_slots();
         ASSERT_TRUE(orch.init(sm_handle->sm_base, heap, HEAP_BYTES, CHIP_DEFAULT_GRAPH_TASKS));
         orch.begin_scope();
     }
 
     void TearDown() override {
-        sched.destroy();
-        runtime_arena.release();
         sm_arena.release();
         if (heap != MAP_FAILED) munmap(heap, HEAP_BYTES);
     }

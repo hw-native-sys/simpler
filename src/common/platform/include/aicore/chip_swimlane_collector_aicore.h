@@ -117,8 +117,10 @@ chip_swimlane_aicore_flush_task_count(ChipSwimlaneAicoreLocalState *local) {
  * `end_time` is captured immediately after execute_task and before FIN. The
  * commit itself runs after FIN and never reads the possibly-rotated head.
  */
+// Token deduction accepts both a freshly derived local identity and a GM handle.
+template <typename TaskToken>
 __aicore__ __attribute__((always_inline)) static inline void chip_swimlane_aicore_commit_task_record(
-    __gm__ ChipSwimlaneAicoreTaskRecord *record, const __gm__ TaskId &task_token, uint32_t reg_task_id,
+    __gm__ ChipSwimlaneAicoreTaskRecord *record, const TaskToken &task_token, uint32_t reg_task_id,
     uint64_t receive_time, uint64_t start_time, uint64_t end_time
 ) {
     if (record == nullptr) {

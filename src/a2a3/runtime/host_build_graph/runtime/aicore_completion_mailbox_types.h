@@ -11,55 +11,5 @@
 
 #pragma once
 
-#include <stdint.h>
-
-#include "host_build_graph/constants.h"
-
-// Types shared across the AICore↔AICPU boundary.
-//
-// This header is reachable from AICore-side translation units (via
-// async_kernel_api.h / completion_token.h / sdma_completion_kernel.h)
-// and must stay parseable by every AICore toolchain configuration: no
-// <atomic>, no __atomic_* intrinsics, no MPSC ring buffer struct.
-//
-// The MPSC ring (AICoreCompletionMailbox) and its push/drain helpers live in
-// aicore_completion_mailbox.h, which is AICPU-only.
-
-inline constexpr int32_t MAX_COMPLETIONS_PER_TASK = 64;
-
-#define COMPLETION_ENGINE_SDMA 0u
-#define COMPLETION_ENGINE_ROCE 1u
-#define COMPLETION_ENGINE_URMA 2u
-#define COMPLETION_ENGINE_CCU 3u
-
-#define COMPLETION_TYPE_COUNTER 0
-#define COMPLETION_TYPE_SDMA_EVENT_RECORD 1
-
-// DeferredCompletionEntry / DeferredCompletionSlab back the per-task scratch
-// area that AICore writes into to record "this completion has to be observed
-// before the task can retire." The FIN-handling scheduler thread reads the
-// slab, flattens entries into AICoreCompletionMailbox messages, and forwards
-// them to the dispatch thread. `volatile` here is load-bearing: writers live
-// on AICore and readers on AICPU, so the qualifier is the correct way to
-// pin the compiler against caching / reordering on either side.
-struct DeferredCompletionEntry {
-    uint64_t addr;
-    uint64_t backend_cookie;
-    uint32_t expected_value;
-    uint32_t engine;
-    int32_t completion_type;
-    uint32_t _pad;
-};
-
-static_assert(sizeof(DeferredCompletionEntry) == 32, "DeferredCompletionEntry layout drift");
-
-struct alignas(CHIP_ALIGN_SIZE) DeferredCompletionSlab {
-    volatile uint32_t count;
-    volatile int32_t error_code;
-    DeferredCompletionEntry entries[MAX_COMPLETIONS_PER_TASK];
-};
-
-static_assert(
-    sizeof(DeferredCompletionSlab) % CHIP_ALIGN_SIZE == 0,
-    "DeferredCompletionSlab size must preserve array element cache-line boundaries"
-);
+#include "host_build_graph/completion_types.h"
+#include "host_build_graph/full_arena/deferred_completion_slab.h"
