@@ -16,7 +16,7 @@ host_only=0
 [[ ${1:-} != a5 ]] || shift
 if [[ ${1:-} == --host-only ]]; then host_only=1; shift; fi
 if [[ ${1:-} == --help ]]; then
-    echo 'usage: build.sh [a5] [--host-only] [--flavor pypto_lib|pypto_lib_dsl|both] [--pto-isa PATH]'
+    echo 'usage: build.sh [a5] [--host-only] [--flavor pypto_lib|pypto_lib_dsl|pypto_lib_latest|both|all] [--pto-isa PATH]'
     echo 'DSV41_BUILD_DIR, DSV41_BUILD_JOBS and DSV41_PYTHON select the build directory, concurrency and Python.'
     exit 0
 fi

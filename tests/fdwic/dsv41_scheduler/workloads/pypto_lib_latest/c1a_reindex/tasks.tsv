@@ -1,0 +1,23 @@
+# source_task_id kernel_names lane_mask block_num deferred
+1551	_hc_collapse	2	10	0
+1554	qkv_quant	2	32	0
+1558	_proj_q_a	1	20	0
+1559	q_norm_quant	2	5	0
+1560	_proj_q_b_aic+_proj_q_b_aiv	3	32	0
+1561	_proj_kv	1	8	0
+1562	norm_rope_publish	2	12	0
+1563	_idx_q_aic+_idx_q_aiv+_idx_q_aiv	7	16	0
+1564	proj_idx_w	1	4	0
+1565	reduce_idx_w	2	5	0
+1571	idx_gather_pool	2	32	0
+1572	idx_plan_pool_runs	2	1	0
+1575	_idx_pool_score_topk_aic+_idx_pool_score_topk_aiv+_idx_pool_score_topk_aiv	7	32	0
+1577	sparse_gather_reset	2	1	0
+1578	_gather_sparse_vf_rows__2_aic+_gather_sparse_vf_rows__2_aiv+_gather_sparse_vf_rows__2_aiv	7	32	0
+1581	_quant_o_vf	2	64	0
+1584	_o_proj_a_aic+_o_proj_a_aiv+_o_proj_a_aiv	7	32	0
+1585	_o_proj_b	1	32	0
+1587	hc_rms	2	10	0
+1589	_hc_linear	1	4	0
+1590	_hc_sinkhorn	2	5	0
+1591	_hc_post	2	64	0

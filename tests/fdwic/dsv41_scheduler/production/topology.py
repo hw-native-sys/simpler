@@ -15,14 +15,22 @@ from pathlib import Path
 
 
 def device_count(bundle, materialize=False):
+    case_path = bundle / "case.json"
+    case = json.loads(case_path.read_text()) if case_path.exists() else {}
+    if case.get("execution") == "native_moe_host_control":
+        if case.get("case") != "moe" or case.get("device_count") != 2:
+            raise ValueError("Native MoE requires a two-device case descriptor")
+        if materialize:
+            raise ValueError("Native MoE executes original Host controls without cut-input materialization")
+        return 2
+    if case.get("flavor") == "pypto_lib_latest" and case.get("case") == "moe":
+        raise ValueError("Latest PyPTO-lib frozen MoE plans are unsupported; prepare the native Host-control case")
     lines = (bundle / "rank0.txt").read_text().splitlines()
     if lines[0] != "DSV41_NATIVE_V1":
         raise ValueError("Invalid input manifest")
     ranks, window = map(int, lines[1].split())
     if ranks not in (1, 2) or window < 0:
         raise ValueError("Expected a local single-device case or a two-device EP2 case")
-    case_path = bundle / "case.json"
-    case = json.loads(case_path.read_text()) if case_path.exists() else {}
     expected = case.get("device_count", 2)
     if materialize:
         if expected != 1 or (bundle / "snapshot.txt").exists() or not (bundle / "slice.txt").is_file():
