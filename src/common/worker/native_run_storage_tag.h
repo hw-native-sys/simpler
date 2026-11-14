@@ -34,13 +34,32 @@ inline void publish_released_preparation(void *storage, uint64_t run_epoch) noex
     std::memcpy(storage, receipt.data(), sizeof(receipt));
 }
 
+template <size_t N>
+inline bool consume_run_release_receipt(void *storage, size_t bytes, const uint64_t (&expected)[N]) noexcept {
+    if (storage == nullptr || bytes < sizeof(expected) || std::memcmp(storage, expected, sizeof(expected)) != 0)
+        return false;
+    std::memset(storage, 0, sizeof(expected));
+    return true;
+}
+
 // Only this prepare attempt's result can release its inputs. An old epoch,
 // an ordinary destruction tag, or short storage supplies no such proof.
 inline bool consume_released_preparation(void *storage, size_t bytes, uint64_t run_epoch) noexcept {
-    if (storage == nullptr || bytes < kNativeRunPrepareReleaseBytes) return false;
-    std::array<uint64_t, 2> receipt{};
-    std::memcpy(receipt.data(), storage, sizeof(receipt));
-    if (receipt[0] != kNativeRunPrepareReleasedMagic || receipt[1] != run_epoch) return false;
-    std::memset(storage, 0, sizeof(receipt));
-    return true;
+    return consume_run_release_receipt(storage, bytes, {kNativeRunPrepareReleasedMagic, run_epoch});
+}
+
+// A submitted task failed, and its native cleanup completed. Distinct from
+// destruction alone and from a preparation that never submitted work.
+inline constexpr uint64_t kNativeRunTaskFailureReleasedMagic = UINT64_C(0x534d504c54465245);  // "SMPLTFRE"
+inline constexpr size_t kNativeRunTaskFailureReleaseBytes = 3 * sizeof(uint64_t);
+
+inline void publish_released_task_failure(void *storage, uint64_t run_epoch, int32_t code) noexcept {
+    const std::array<uint64_t, 3> receipt{kNativeRunTaskFailureReleasedMagic, run_epoch, static_cast<uint64_t>(code)};
+    std::memcpy(storage, receipt.data(), sizeof(receipt));
+}
+
+inline bool consume_released_task_failure(void *storage, size_t bytes, uint64_t run_epoch, int32_t code) noexcept {
+    return code != 0 && consume_run_release_receipt(
+                            storage, bytes, {kNativeRunTaskFailureReleasedMagic, run_epoch, static_cast<uint64_t>(code)}
+                        );
 }

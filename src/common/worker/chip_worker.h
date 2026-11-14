@@ -1160,13 +1160,14 @@ private:
         FinalizeFault fault{FinalizeFault::None};
         int rc{0};
         bool no_submission_released{false};
+        bool task_failure_released{false};
         bool context_destroyed{false};
         std::exception_ptr captured;
     };
     // Cleanup facts survive a persisted run error; its code establishes neither.
     void finalize_native_run_impl(
         const ChipWorkerNativeRun &run, bool *no_submission_released, bool deliver_outputs = true,
-        bool *context_destroyed = nullptr
+        bool *context_destroyed = nullptr, bool *task_failure_released = nullptr
     );
     /**
      * Finalize one run and report what it established.

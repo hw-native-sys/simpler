@@ -1771,6 +1771,9 @@ int simpler_prepare_run(
     });
     if (ctx == nullptr || runtime == nullptr || config == nullptr || descriptor == nullptr)
         return PTO_RUNTIME_ERR_INTERNAL;
+#if !defined(SIMPLER_A5_TMR)
+    if (config->enable_urma_batch) return PTO_RUNTIME_ERR_UNSUPPORTED;
+#endif
     // Against the grant this context was given, not a compile-time width: a set
     // exists because this context was granted it, so a slot past the grant names
     // no resource here rather than one that happens to be laid out.
@@ -1787,6 +1790,10 @@ int simpler_prepare_run(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+    if (config->enable_urma_batch &&
+        (runner->execution_mode_latch().is_kernel() || descriptor->prepare_purpose != SIMPLER_PREPARE_EAGER)) {
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
     const int context_rc = runner->validate_current_context();
     if (context_rc != 0) return context_rc;
     if (runner->execution_mode_latch().is_kernel()) {
@@ -2530,6 +2537,17 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     try {
         if (state->active_execution != nullptr) {
             drain = state->runner->drain_execution(*state->active_execution);
+            if (drain.device_rc == 0 && drain.physical_complete &&
+                state->active_execution->prepared->requires_dma_quiescence) {
+                // The streams can retire successfully even when the device reported a task failure.
+                const DeviceRunTerminal terminal =
+                    state->runner->device_run_terminal(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
+                if (terminal.state == DeviceRunTerminalState::Failed) {
+                    state->accounted_urma_task_error = state->completion_rc == 0 && drain.diagnostics_rc == 0 &&
+                                                       terminal.source == DeviceRunCodeSource::AccountedUrmaSubmit;
+                    drain.device_rc = terminal.code;
+                }
+            }
         } else if (state->launch_not_started_proven) {
             drain = DrainOutcome::device_complete(0);
         } else {
@@ -2762,6 +2780,12 @@ static int finalize_native_run(
         // Keep the carrier, IO, actual streams and all unresolved cleanup debt.
         return execution_rc != 0 ? execution_rc : PTO_RUNTIME_ERR_INTERNAL;
     }
+    const bool accounted_error = state->accounted_urma_task_error;
+    const auto cleanup_error = [&](int rc) {
+        if (!accounted_error || rc == 0) return rc;
+        LOG_ERROR("Batch PUT cleanup failed: %d (execution rc=%d, %s)", rc, execution_rc, trace_attrs);
+        return execution_rc;
+    };
     // Cleanup has begun, including for an unlaunched preparation. A failed
     // cleanup may be retried, but must never make the carrier launchable again.
     state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
@@ -2838,7 +2862,7 @@ static int finalize_native_run(
                     const int release_rc = state->runtime != nullptr ?
                                                release_run_bindings_impl(state->runtime.get(), &state->host_api) :
                                                0;
-                    if (release_rc != 0) return validation_rc != 0 ? validation_rc : release_rc;
+                    if (release_rc != 0) return cleanup_error(validation_rc != 0 ? validation_rc : release_rc);
                     state->bindings_released = true;
                     note_workspace_fact(state, WorkspaceManager::RunFact::BindingsReleased);
                 }
@@ -2856,7 +2880,7 @@ static int finalize_native_run(
         validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    if (state->copyback_returned && !state->bindings_released) return validation_rc;
+    if (state->copyback_returned && !state->bindings_released) return cleanup_error(validation_rc);
     // Unconditional: this run is over, so its slot's device-timing storage is
     // reusable whether or not the result was emitted above. A run that never
     // launched, failed, lost its attach, or threw has no result to read — but it
@@ -2888,7 +2912,7 @@ static int finalize_native_run(
         }
         if (resources_rc == 0) state->runner_resources_owned = false;
     }
-    if (resources_rc != 0) return validation_rc != 0 ? validation_rc : resources_rc;
+    if (resources_rc != 0) return cleanup_error(validation_rc != 0 ? validation_rc : resources_rc);
 
     const bool export_clock_log =
         launched && execution_rc == 0 && validation_rc == 0 &&
@@ -2935,15 +2959,23 @@ static int finalize_native_run(
         state->runner->free_tensor(state->retired_host_staging);
         state->retired_host_staging = nullptr;
     }
+    // The caller keeps the task error even if later cleanup fails. Only the
+    // independently proven clean path lets the lane release its owners.
+    const bool task_failure_released = accounted_error && state->physical_complete && state->bindings_released &&
+                                       execution_rc != 0 && validation_rc == 0 && reclaim_rc == 0 &&
+                                       state->runner->accepts_new_run();
     state->runner->release_native_run_observation(state);
     destroy_native_run_context(state);
     emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns, trace_attrs);
     if (export_clock_log && !export_host_clock_alignment_log(output_prefix, trace_inv, clock_log_offset)) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    if (validation_rc != 0) return validation_rc;
+    if (validation_rc != 0) return cleanup_error(validation_rc);
     if (resources_rc != 0) return resources_rc;
-    if ((launched || recorded) && execution_rc != 0) return execution_rc;
+    if ((launched || recorded) && execution_rc != 0) {
+        if (task_failure_released) publish_released_task_failure(runtime, run_epoch, execution_rc);
+        return execution_rc;
+    }
     // Last: a standalone workspace-reclamation failure is still a failure, and
     // with nothing above it to report this is where the caller learns of it.
     if (reclaim_rc != 0) return reclaim_rc;

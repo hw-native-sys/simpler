@@ -3493,6 +3493,7 @@ NB_MODULE(_task_interface, m) {
             }
         )
         .def_rw("enable_pmu", &CallConfig::enable_pmu)
+        .def_rw("enable_urma_batch", &CallConfig::enable_urma_batch)
         .def("validate", &CallConfig::validate)
         .def_prop_rw(
             "enable_dep_gen",
@@ -3535,6 +3536,9 @@ NB_MODULE(_task_interface, m) {
                << ", enable_dump_args=" << self.enable_dump_args << ", enable_pmu=" << self.enable_pmu
                << ", enable_dep_gen=" << (self.enable_dep_gen ? "True" : "False")
                << ", enable_scope_stats=" << (self.enable_scope_stats ? "True" : "False");
+            if (self.enable_urma_batch) {
+                os << ", enable_urma_batch=True";
+            }
             if (self.runtime_env.any()) {
                 append_ring_values(os, "runtime_env.ring_task_window", true, self.runtime_env.ring_task_window);
                 append_ring_values(os, "runtime_env.ring_heap", true, self.runtime_env.ring_heap);

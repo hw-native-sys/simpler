@@ -494,6 +494,7 @@ def kernel_symbol_runtime(tmp_path_factory):
                     #include <unistd.h>
                     #include <new>
                     #include <thread>
+                    #include "native_run_storage_tag.h"
                     // Shared lock-free words survive the real Worker's fork on both
                     // supported host OSes, without a process-shared pthread extension.
                     struct SharedProgress { int values[40]; };
@@ -597,6 +598,12 @@ def kernel_symbol_runtime(tmp_path_factory):
                         // Model call-owned Program result delivery at this C ABI leaf.
                         // These are CPU outputs, not a claim about device DMA.
                         const auto *run = static_cast<const ProgressRun *>(storage);
+                        const int observed_rc = run->observed_rc;
+                        if (observed_rc != 0 && test_progress_get(38)) {
+                            publish_released_task_failure(storage, run->descriptor.run_epoch, observed_rc);
+                            --live_progress_runs;
+                            return observed_rc;
+                        }
                         if (deliver_outputs && run->observed_rc == 0)
                             test_progress_set(20 + run->ordinal, 1000 + run->ordinal);
                         *static_cast<uint64_t *>(storage) = 0;
@@ -1279,6 +1286,45 @@ class TestWorkerNativeChip:
         assert result == ["delivered"]
         assert control.test_progress_get(2) == 1
         assert control.test_progress_get(4) == 1
+
+    def test_l3_explicit_wait_publishes_clean_failure_before_end_without_stopping_child(self, l3_progress_owner):
+        worker, control, handle = l3_progress_owner
+        control.test_progress_set(12, 1)  # Only the first strong observer reports an error.
+        control.test_progress_set(18, -735)
+        control.test_progress_set(38, 1)  # Publish the matching cleanup receipt with that error.
+        first = _submit_progress_call(worker, handle)
+        assert control.test_progress_wait(1, 1, 5000)
+        child_pid = worker._chip_pids[0]
+        assert control.test_progress_get(5) == child_pid != os.getpid()
+        result = []
+
+        def wait():
+            try:
+                first.wait(timeout=10)
+            except BaseException as error:
+                result.append(error)
+
+        waiter = threading.Thread(target=wait)
+        waiter.start()
+        try:
+            assert control.test_progress_wait(6, 1, 5000), "explicit OBSERVE must reach the native bounded wait"
+            assert control.test_progress_get(37) == 0, "the run must have no physical END before OBSERVE"
+            assert not first.done and not result
+        finally:
+            control.test_progress_set(3, 1)
+            waiter.join(10)
+        assert not waiter.is_alive()
+        assert len(result) == 1 and isinstance(result[0], RuntimeError)
+        assert "finalize_native_run failed with code -735" in str(result[0])
+        assert first.done
+        assert control.test_progress_get(2) == control.test_progress_get(4) == 1
+        assert control.test_progress_get(21) == 0, "the failed run must withhold Program output"
+
+        second = _submit_progress_call(worker, handle)
+        second.wait(timeout=5)
+        assert control.test_progress_get(5) == child_pid
+        assert control.test_progress_get(1) == control.test_progress_get(2) == control.test_progress_get(4) == 2
+        assert control.test_progress_get(22) == 1002
 
     @pytest.mark.parametrize("semantic_terminal_owner", [2], indirect=True, ids=["staged-grant2"])
     def test_refill_launches_before_a_predecessor_strong_observer(self, semantic_terminal_owner):
@@ -3226,6 +3272,7 @@ class TestMailboxConfigRoundtrip:
         cfg.enable_pmu = 5
         cfg.enable_dep_gen = True
         cfg.enable_scope_stats = True
+        cfg.enable_urma_batch = True
         cfg.runtime_env.ring_task_window = [16, 32, 128, 256]
         cfg.runtime_env.ring_heap = [1024, 2048, 4096, 8192]
         cfg.runtime_env.ring_dep_pool = [64, 128, 256, 512]
@@ -3245,6 +3292,7 @@ class TestMailboxConfigRoundtrip:
             *cfg.runtime_env.ring_heap,
             *cfg.runtime_env.ring_dep_pool,
             cfg.output_prefix.encode(),
+            cfg.enable_urma_batch,
         )
 
         decoded = _read_config_from_mailbox(memoryview(buf))
@@ -3254,6 +3302,7 @@ class TestMailboxConfigRoundtrip:
         assert decoded.enable_pmu == 5
         assert decoded.enable_dep_gen is True
         assert decoded.enable_scope_stats is True
+        assert decoded.enable_urma_batch is True
         assert decoded.runtime_env.ring_task_window == [16, 32, 128, 256]
         assert decoded.runtime_env.ring_heap == [1024, 2048, 4096, 8192]
         assert decoded.runtime_env.ring_dep_pool == [64, 128, 256, 512]
@@ -3310,6 +3359,7 @@ class TestMailboxConfigRoundtrip:
                 *cfg.runtime_env.ring_heap,
                 *cfg.runtime_env.ring_dep_pool,
                 cfg.output_prefix.encode(),
+                cfg.enable_urma_batch,
             )
             return _read_config_from_mailbox(memoryview(buf), chip_rank=1, capture_index=0)
 

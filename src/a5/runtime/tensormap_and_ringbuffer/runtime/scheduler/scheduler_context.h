@@ -115,6 +115,11 @@ public:
     // Orchestrator threads (core_trackers_[thread_idx].core_num() == 0) are a no-op.
     int32_t shutdown(int32_t thread_idx);
 
+    // Final abort cleanup, after every scheduler participant has retired its cores.
+    bool settle_aborted_dma();
+
+    int32_t accounted_urma_submit_error() const { return accounted_urma_submit_error_.load(std::memory_order_acquire); }
+
     // Claim each core independently; requests for unpublished cores stay pending.
     int32_t retire_cores(const int32_t *core_ids, int32_t core_num);
 
@@ -183,6 +188,7 @@ private:
     // dispatch payload so normal task dispatch layout and cache footprint stay
     // unchanged.
     DeferredCompletionSlab deferred_slab_per_core_[RUNTIME_MAX_WORKER][2];
+    bool deferred_slabs_initialized_[RUNTIME_MAX_WORKER]{};
 
     // sync_start drain coordination
     SyncStartDrainState drain_state_;
@@ -205,6 +211,9 @@ private:
     // Published before completed_, so a thread that observes completion also
     // observes this and cannot enter the healthy shutdown path for a fatal run.
     std::atomic<bool> fatal_shutdown_started_{false};
+    std::atomic<bool> core_retirement_failed_{false};
+    // Carries provenance only for the error that won the shared scheduler latch.
+    std::atomic<int32_t> accounted_urma_submit_error_{SIMPLER_ERROR_NONE};
     // Both participants modify each core's atomic byte: the operation that sees
     // the other bit alone owns retirement. READY publishes initialization;
     // REQUESTED can arrive before initialization without consuming an empty set.
@@ -227,6 +236,7 @@ private:
     int32_t sched_thread_num_{0};
     int32_t aicpu_thread_num_{0};
     int32_t cores_total_num_{0};
+    bool urma_batch_enabled_{false};
 
     // Cluster-ordered worker_id lists, populated by post_handshake_init().
     int32_t aic_worker_ids_[RUNTIME_MAX_WORKER]{};
@@ -417,7 +427,10 @@ private:
         int32_t reg_task_id, int32_t reg_state, int32_t running_id, int32_t pending_id, bool pending_gated = false
     );
 
-    void complete_slot_task(
+    bool
+    latch_scheduler_error(SharedMemoryHeader *header, int32_t thread_idx, int32_t error_code, bool accounted = false);
+
+    bool complete_slot_task(
         ChipTaskSlotState &slot_state, int32_t expected_reg_task_id, SubtaskSlot subslot, int32_t thread_idx,
         int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
         ChipTaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
@@ -430,7 +443,7 @@ private:
     static void promote_pending_to_running(CoreExecState &core);
     static void clear_running_slot(CoreExecState &core);
 
-    void check_running_cores_for_completion(
+    bool check_running_cores_for_completion(
         int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
         bool &made_progress, ChipTaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
     );

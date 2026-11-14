@@ -153,6 +153,15 @@ inline __aicore__ bool is_flat_contiguous_1d(TensorT &tensor) {
     return packed_layout && one_dim_logical;
 }
 
+template <typename DstTensor, typename SrcTensor>
+inline __aicore__ bool validate_urma_transfer(UrmaRequestDescriptor<DstTensor, SrcTensor> &desc, uint64_t &elems) {
+    using RawDType = typename DstTensor::RawDType;
+    static_assert(std::is_same_v<RawDType, typename SrcTensor::RawDType>, "URMA transfer requires matching dtypes");
+    if (!is_flat_contiguous_1d(desc.dst) || !is_flat_contiguous_1d(desc.src)) return false;
+    elems = tensor_element_count(desc.src);
+    return elems == tensor_element_count(desc.dst) && elems <= UINT64_MAX / sizeof(RawDType);
+}
+
 #if defined(PTO_URMA_SUPPORTED)
 inline __aicore__ bool
 build_urma_session(uint32_t sender_id, __gm__ uint8_t *workspace, uint32_t peer, pto::comm::AsyncSession &session) {
@@ -224,11 +233,20 @@ inline __aicore__ uint32_t load_urma_counter(uint64_t addr) {
 #endif
 }
 
+struct QueueProducer {
+    uint32_t bb;
+    uint32_t cqe;
+};
+
 template <typename Runtime, typename Session>
-inline __aicore__ bool preflight_urma_request(Runtime &runtime, const Session &session, uint64_t chunks) {
+inline __aicore__ bool preflight_urma_request(
+    Runtime &runtime, const Session &session, uint64_t chunks, QueueProducer *batch_producers = nullptr
+) {
     const uint32_t jetties = session.cfg.urma.qpCount;
+    // A batch registers one cumulative target per participating queue.
+    const uint64_t completions = batch_producers != nullptr && chunks > jetties ? jetties : chunks;
     if (jetties == 0 || jetties > pto::comm::urma::kUrmaMaxJettiesPerCore || chunks > UINT32_MAX ||
-        !runtime.capacity_available(chunks)) {
+        !runtime.capacity_available(completions)) {
         runtime.set_error(RequestError::REGISTRATION_FAILED);
         return false;
     }
@@ -243,7 +261,7 @@ inline __aicore__ bool preflight_urma_request(Runtime &runtime, const Session &s
         runtime.set_error(RequestError::REGISTRATION_FAILED);
         return false;
     }
-    if (per_peer && info->railCycleLen != 0) {
+    if (per_peer ? info->railCycleLen != 0 : batch_producers != nullptr) {
         runtime.set_error(RequestError::INVALID);
         return false;
     }
@@ -265,14 +283,15 @@ inline __aicore__ bool preflight_urma_request(Runtime &runtime, const Session &s
             runtime.set_error(RequestError::INVALID);
             return false;
         }
-        const uint32_t head = load_urma_counter(wq->headAddr);
+        const QueueProducer producer{load_urma_counter(wq->headAddr), wq->submittedWqeCount};
         const uint32_t bb_tail = load_urma_counter(wq->tailAddr);
         const uint32_t cqe_tail = load_urma_counter(cq->tailAddr);
-        if (static_cast<uint64_t>(head - bb_tail) + required > wq->depth ||
-            static_cast<uint64_t>(wq->submittedWqeCount - cqe_tail) + required > cq->depth) {
+        if (static_cast<uint64_t>(producer.bb - bb_tail) + required > wq->depth ||
+            static_cast<uint64_t>(producer.cqe - cqe_tail) + required > cq->depth) {
             runtime.set_error(RequestError::INVALID);
             return false;
         }
+        if (batch_producers != nullptr) batch_producers[j] = producer;
     }
     return true;
 }
@@ -303,18 +322,12 @@ submit_urma_request_once(Runtime &runtime, UrmaRequestDescriptor<DstTensor, SrcT
 template <typename Runtime, typename DstTensor, typename SrcTensor>
 inline __aicore__ bool submit_chunked_urma_request(Runtime &runtime, UrmaRequestDescriptor<DstTensor, SrcTensor> desc) {
     using RawDType = typename DstTensor::RawDType;
-    static_assert(std::is_same_v<RawDType, typename SrcTensor::RawDType>, "URMA transfer requires matching dtypes");
-    if (!is_flat_contiguous_1d(desc.dst) || !is_flat_contiguous_1d(desc.src) ||
-        tensor_element_count(desc.dst) != tensor_element_count(desc.src)) {
+    uint64_t elem_count = 0;
+    if (!validate_urma_transfer(desc, elem_count)) {
         runtime.set_error(RequestError::INVALID);
         return false;
     }
-    const uint64_t elem_count = tensor_element_count(desc.dst);
     if (elem_count == 0) return true;
-    if (elem_count > UINT64_MAX / sizeof(RawDType)) {
-        runtime.set_error(RequestError::INVALID);
-        return false;
-    }
 #if defined(PTO_URMA_SUPPORTED)
     pto::comm::AsyncSession session;
     if (!build_urma_session(runtime.sender_id(), desc.workspace, desc.remote_rank, session)) {

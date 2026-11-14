@@ -140,6 +140,7 @@ std::vector<int> g_poll_rc;
 std::vector<int> g_wait_rc;
 std::vector<int> g_finalize_rc;
 std::vector<bool> g_finalize_no_submission;
+std::vector<bool> g_finalize_task_failure;
 std::vector<uint64_t> g_epochs;
 std::vector<size_t> g_prepare_count;
 std::vector<uint32_t> g_prepare_purpose;
@@ -298,6 +299,7 @@ int finalize_run(void *, void *runtime, int) {
     if (g_finalize_no_submission[slot] && g_finalize_rc[slot] == 0) {
         publish_released_preparation(runtime, g_epochs[slot]);
     }
+    if (g_finalize_task_failure[slot]) publish_released_task_failure(runtime, g_epochs[slot], g_finalize_rc[slot]);
     if (g_finalize_rc[slot] == 0 && g_prepare_purpose[slot] == SIMPLER_PREPARE_CAPTURE) {
         const uint64_t epoch = g_epochs[slot];
         const bool retained = std::any_of(g_resource_epochs.begin(), g_resource_epochs.end(), [epoch](const auto &one) {
@@ -328,6 +330,7 @@ void prime_worker(ChipWorker &worker, size_t depth = 2) {
     g_wait_rc.assign(depth, {});
     g_finalize_rc.assign(depth, {});
     g_finalize_no_submission.assign(depth, {});
+    g_finalize_task_failure.assign(depth, {});
     g_epochs.assign(depth, {});
     g_prepare_count.assign(depth, {});
     g_prepare_purpose.assign(depth, {});
@@ -1250,6 +1253,35 @@ TEST(ChipRunLaneTest, FinalizeFailurePoisonsAdmissionAndCloseReportsIt) {
     worker.finalize();
 }
 
+TEST(ChipRunLaneTest, ProvenTaskFailureReportsErrorAndAllowsAnotherRun) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    ChipRun first = submit(lane, 101, 0);
+    g_complete[0] = true;
+    g_wait_rc[0] = -101;
+    g_finalize_rc[0] = -101;
+    g_finalize_task_failure[0] = true;
+    EXPECT_TRUE(first.done());
+    try {
+        (void)first.wait_until(ChipRunLane::Clock::time_point::max());
+        FAIL() << "expected the task error";
+    } catch (const std::runtime_error &e) {
+        EXPECT_NE(std::string(e.what()).find("finalize_native_run failed with code -101"), std::string::npos);
+    }
+    EXPECT_FALSE(first.owner_recovery_required());
+    EXPECT_FALSE(lane.poisoned());
+
+    g_wait_rc[0] = 0;
+    g_finalize_rc[0] = 0;
+    g_finalize_task_failure[0] = false;
+    ChipRun next = submit(lane, 102, 0);
+    g_complete[0] = true;
+    EXPECT_TRUE(next.wait_until(ChipRunLane::Clock::time_point::max()));
+    lane.close();
+    worker.finalize();
+}
+
 TEST(ChipRunLaneTest, LaunchFailureWhoseFinalizeFailsReportsThePoisonedLane) {
     ChipWorker worker;
     prime_worker(worker);
@@ -1465,6 +1497,18 @@ TEST(ChipRunLaneTest, ReleasedPrepareReceiptIsBoundToOneEpochAndConsumedOnce) {
     EXPECT_EQ(storage[0], 0u);
     EXPECT_EQ(storage[1], 0u);
     EXPECT_FALSE(consume_released_preparation(nullptr, sizeof(storage), 7));
+}
+
+TEST(ChipRunLaneTest, TaskFailureReceiptIsBoundToEpochAndErrorAndConsumedOnce) {
+    uint64_t storage[3]{};
+    publish_released_task_failure(storage, 7, -101);
+    EXPECT_FALSE(consume_released_preparation(storage, sizeof(storage), 7));
+    EXPECT_FALSE(consume_released_task_failure(storage, sizeof(storage), 8, -101));
+    EXPECT_FALSE(consume_released_task_failure(storage, sizeof(storage), 7, 507018));
+    EXPECT_FALSE(consume_released_task_failure(storage, sizeof(storage) - 1, 7, -101));
+    EXPECT_TRUE(consume_released_task_failure(storage, sizeof(storage), 7, -101));
+    EXPECT_FALSE(consume_released_task_failure(storage, sizeof(storage), 7, -101));
+    EXPECT_EQ(storage[0], 0u);
 }
 
 namespace {

@@ -565,14 +565,15 @@ struct ChipRunLaneState {
         if (prior_poison != nullptr && run->poison_error == nullptr) run->poison_error = prior_poison;
         bool finalized = true;
         bool no_submission_released = false;
+        bool task_failure_released = false;
         try {
             worker->finalize_native_run_impl(
                 run->native_run, &no_submission_released,
                 run->error == nullptr && prior_poison == nullptr && joined_failure == nullptr,
-                &run->native_context_destroyed
+                &run->native_context_destroyed, &task_failure_released
             );
         } catch (...) {
-            finalized = no_submission_released;
+            finalized = no_submission_released || task_failure_released;
             const std::exception_ptr finalize_error = std::current_exception();
             if (run->error == nullptr) run->error = finalize_error;
             if (!finalized) poison_with(run, joined_failure != nullptr ? joined_failure : finalize_error);
@@ -822,6 +823,7 @@ struct ChipRunLaneState {
      * Known allocations remain borrowed even when coverage is incomplete.
      */
     static bool joinable_shape(const ChipRunState &run) {
+        if (run.config.enable_urma_batch) return false;
         for (int32_t i = 0; i < run.args.tensor_count(); ++i) {
             if (!run.args.tensor(i).is_device_memory()) continue;
             if (!run.device_spans_borrowed) return false;

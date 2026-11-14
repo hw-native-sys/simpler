@@ -73,6 +73,7 @@ endif()
 # Exercise the failed submission slab through the real FIN completion path.
 a5_tmr_case(test_urma_completion_kernel.cpp
     SOURCES
+        ${A5_RUNTIME_DIR}/runtime_core.cpp
         ${A5_RUNTIME_DIR}/scheduler/scheduler_completion.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
         ${SIMPLER_SRC}/a5/platform/shared/aicpu/pmu_collector_aicpu.cpp

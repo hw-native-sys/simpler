@@ -77,3 +77,5 @@ These cases request `workspace_engines=("urma",)` and obtain a checked context
 with `handle.device_context(rank, workspace_engines=("urma",))`. Kernels read
 `comm_workspace<CommWorkspaceKind::URMA>(*ctx)`; the SDMA demo uses its independent
 descriptor. RDMA defaults to OFF when its build environment variable is unset.
+
+See the [URMA PUT benchmark](../../../../../docs/zh-cn/a5-urma-put-batch.md) for the manual performance comparison.

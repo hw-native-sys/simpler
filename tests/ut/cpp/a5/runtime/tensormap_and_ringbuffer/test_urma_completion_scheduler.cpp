@@ -295,6 +295,80 @@ TEST(A5UrmaCompletionScheduler, TargetOutsideOutstandingWindowFails) {
 
 static_assert(sizeof(TestCqe) == 64);
 
+TEST(A5UrmaCompletionScheduler, AbortedRunDrainsWaitListMailboxAndUnharvestedSlab) {
+    WorkspaceFixture urma;
+    auto waits = std::make_unique<AsyncWaitList>();
+    auto mailbox = std::make_unique<AICoreCompletionMailbox>();
+    auto &failed = waits->entries[0];
+    waits->count = 1;
+    int32_t error = SIMPLER_ERROR_NONE;
+    ASSERT_TRUE(waits->append_condition_locked(
+        failed, 1, urma.addr(), 1, ASYNC_ENGINE_URMA, COMPLETION_TYPE_URMA_EVENT_HANDLE, error
+    ));
+    alignas(64) uint64_t sdma_record = 0;
+    const auto independent = TaskId::make(0, 1);
+    ASSERT_TRUE(mailbox->try_push_condition(
+        independent, reinterpret_cast<uint64_t>(&sdma_record), 1, 0, COMPLETION_ENGINE_SDMA,
+        COMPLETION_TYPE_SDMA_EVENT_RECORD
+    ));
+    // This counter's producer may have been canceled. It is not DMA evidence.
+    ASSERT_TRUE(mailbox->try_push_condition(independent, 0, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER));
+    DeferredCompletionSlab unharvested{};
+    unharvested.count = 1;
+    unharvested.entries[0] = {
+        (uint64_t{1} << 32) | 1, urma.addr(), 1, COMPLETION_ENGINE_URMA, COMPLETION_TYPE_URMA_EVENT_HANDLE, 0
+    };
+
+    urma.set_cqe(0, 0, true);
+    int mailbox_retries = 0;
+    EXPECT_TRUE(waits->settle_aborted_dma(mailbox.get(), [&] {
+        EXPECT_EQ(urma.cq_tail[0], 1u);
+        EXPECT_EQ(urma.cq_tail[1], 0u);
+        sdma_record = 1;
+        return ++mailbox_retries == 1;
+    }));
+    EXPECT_EQ(mailbox_retries, 1);
+    EXPECT_FALSE(mailbox->has_pending());
+    int slab_retries = 0;
+    EXPECT_TRUE(AsyncWaitList::settle_aborted_slab(unharvested, [&] {
+        EXPECT_EQ(urma.cq_tail[1], 0u);
+        urma.set_cqe(1, 0, true);
+        return ++slab_retries == 1;
+    }));
+    EXPECT_EQ(slab_retries, 1);
+    EXPECT_EQ(urma.cq_tail[1], 1u);
+}
+
+TEST(A5UrmaCompletionScheduler, AbortedDrainLeavesMissingOrPendingDmaUnconfirmed) {
+    WorkspaceFixture urma;
+    auto waits = std::make_unique<AsyncWaitList>();
+    auto mailbox = std::make_unique<AICoreCompletionMailbox>();
+    const auto no_retry = [] {
+        return false;
+    };
+    DeferredCompletionSlab slab{};
+    slab.count = 1;
+    slab.entries[0] = {1, urma.addr(), 1, COMPLETION_ENGINE_URMA, COMPLETION_TYPE_URMA_EVENT_HANDLE, 0};
+    EXPECT_FALSE(AsyncWaitList::settle_aborted_slab(slab, no_retry));
+    EXPECT_EQ(urma.cq_tail[0], 0u);
+    slab.error_code = SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED;
+    urma.set_cqe(0, 0, true);
+    EXPECT_FALSE(AsyncWaitList::settle_aborted_slab(slab, no_retry));
+    EXPECT_EQ(urma.cq_tail[0], 1u);
+
+    waits->count = MAX_ASYNC_WAITS;
+    ASSERT_TRUE(mailbox->try_push_condition(
+        TaskId::make(0, 1), 1, urma.addr(), 1, COMPLETION_ENGINE_URMA, COMPLETION_TYPE_URMA_EVENT_HANDLE
+    ));
+    AsyncWaitList::DrainCompletionSink sink;
+    int32_t error = SIMPLER_ERROR_NONE;
+    EXPECT_EQ(waits->drain_aicore_completion_mailbox_locked(mailbox.get(), sink, error), 1);
+    EXPECT_EQ(error, SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW);
+    EXPECT_FALSE(waits->settle_aborted_dma(mailbox.get(), no_retry));
+    waits->reset_for_reuse();
+    EXPECT_TRUE(waits->settle_aborted_dma(mailbox.get(), no_retry));
+}
+
 class A5MixedCompletionTest : public ::testing::TestWithParam<bool> {
 protected:
     WorkspaceFixture urma;
@@ -356,8 +430,8 @@ protected:
         sm_arena.release();
     }
 
-    AsyncPollResult poll() {
-        return sched->async_wait_list.poll_and_complete<false>(nullptr, sched.get(), releases, release_count, 1);
+    AsyncPollResult poll(AICoreCompletionMailbox *mailbox = nullptr) {
+        return sched->async_wait_list.poll_and_complete<false>(mailbox, sched.get(), releases, release_count, 1);
     }
 
     void complete_first() {

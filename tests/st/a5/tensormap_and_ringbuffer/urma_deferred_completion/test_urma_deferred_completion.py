@@ -9,8 +9,11 @@
 # -----------------------------------------------------------------------------------------------------------
 """Two-rank URMA transfers whose successors consume deferred outputs."""
 
+from contextlib import nullcontext
+
 import pytest
 import torch
+from simpler import UrmaConfig
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import CommBufferSpec, DataType, TaskArgs, TensorArgType
 
@@ -23,25 +26,64 @@ CONSUMER_TILE_ELEMS = 64 * 128
 SMALL_ELEMS = 128 * 128
 CHUNKED_ELEMS = 256 * 1024 * 1024 // DTYPE_NBYTES + 8192
 URMA_DATA_OFFSET_NBYTES = 256
+DISJOINT_PUT_MODE = 2
+BENCHMARK_PUT_MODE = 3
+TWO_JETTY_PUT_MODE = 4
+BATCH_PAYLOAD_ELEMS = 1024
+BATCH_GUARD_ELEMS = 512
+BATCH_REQUEST_COUNT = 5
+BENCHMARK_REQUEST_COUNT = 33
+BENCHMARK_WINDOW_SLOTS = 64
+BENCHMARK_PAYLOAD_BYTES = (4096, 32768)
+BENCHMARK_BATCH_SIZES = (0, 1, 4, 8, 16, 32)
+
+
+def _batch_payload_ranges(elem_count, mode):
+    if mode == BENCHMARK_PUT_MODE:
+        count = elem_count // BENCHMARK_WINDOW_SLOTS
+        for i in range(BENCHMARK_REQUEST_COUNT):
+            offset = BATCH_GUARD_ELEMS + i * (count + BATCH_GUARD_ELEMS)
+            yield slice(offset, offset + count)
+        return
+    tail_elems = (BATCH_REQUEST_COUNT - 1) * BATCH_PAYLOAD_ELEMS + (BATCH_REQUEST_COUNT + 1) * BATCH_GUARD_ELEMS
+    offset = BATCH_GUARD_ELEMS
+    count = elem_count - tail_elems if elem_count == CHUNKED_ELEMS else BATCH_PAYLOAD_ELEMS
+    for _ in range(BATCH_REQUEST_COUNT):
+        yield slice(offset, offset + count)
+        offset += count + BATCH_GUARD_ELEMS
+        count = BATCH_PAYLOAD_ELEMS
 
 
 def urma_deferred_completion_orch_fn(orch, callables, task_args, config):
     elem_count = task_args.in_0.numel()
     input_nbytes = elem_count * DTYPE_NBYTES
-    with orch.allocate_domain(
-        workspace_engines=("urma",),
+    benchmark = task_args.mode == BENCHMARK_PUT_MODE
+    disjoint_put = task_args.mode in (DISJOINT_PUT_MODE, BENCHMARK_PUT_MODE, TWO_JETTY_PUT_MODE)
+    config.enable_urma_batch = disjoint_put and bool(task_args.repeats_or_batch_size)
+    allocate = orch.get_or_allocate_domain if benchmark else orch.allocate_domain
+    handle = allocate(
+        workspace_engines={"urma": UrmaConfig(jetties_per_aiv=2)}
+        if task_args.mode == TWO_JETTY_PUT_MODE
+        else ("urma",),
         name="urma_deferred_completion",
-        workers=list(range(NRANKS)),
+        members=list(range(NRANKS)),
+        retain_after_run=benchmark,
         window_size=max(URMA_DATA_OFFSET_NBYTES + 2 * input_nbytes, 4 * 1024 * 1024),
         buffers=[
             CommBufferSpec(name="urma_reserved", dtype="int32", count=64, nbytes=URMA_DATA_OFFSET_NBYTES),
             CommBufferSpec(name="input_window", dtype="float32", count=elem_count, nbytes=input_nbytes),
             CommBufferSpec(name="receive_window", dtype="float32", count=elem_count, nbytes=input_nbytes),
         ],
-    ) as handle:
+    )
+    # Reuse the measured queues across rounds and release them at Worker.close().
+    with nullcontext() if benchmark else handle:
         for rank in range(NRANKS):
             source = getattr(task_args, f"in_{rank}")
-            orch.copy_to(handle[rank].buffers["input_window"], _rehosted_buffer_for(task_args, source))
+            host_source = _rehosted_buffer_for(task_args, source)
+            orch.copy_to(handle[rank].buffers["input_window"], host_source)
+            if disjoint_put:
+                # The peer's distinct seed remains visible in the guard regions.
+                orch.copy_to(handle[rank].buffers["receive_window"], host_source)
         for rank in range(NRANKS):
             domain = handle[rank]
             args = TaskArgs()
@@ -56,7 +98,7 @@ def urma_deferred_completion_orch_fn(orch, callables, task_args, config):
             args.add_scalar(handle.device_context(rank, workspace_engines=("urma",)))
             args.add_scalar(elem_count)
             args.add_scalar(task_args.mode)
-            args.add_scalar(task_args.repeats)
+            args.add_scalar(task_args.repeats_or_batch_size)
             orch.submit_next_level(callables.urma_deferred_completion, args, config, worker=rank)
 
 
@@ -108,18 +150,24 @@ class _UrmaRegression(SceneTestCase):
                     TensorArg(f"result_{rank}", torch.zeros(elem_count, dtype=torch.float32)),
                 ]
             )
-        specs.extend([Scalar("mode", params["mode"]), Scalar("repeats", params["repeats"])])
+        specs.extend([Scalar("mode", params["mode"]), Scalar("repeats_or_batch_size", params["repeats_or_batch_size"])])
         return TaskArgsBuilder(*specs)
 
     def compute_golden(self, args, params):
         for rank in range(NRANKS):
-            source_rank = rank if params["mode"] else 1 - rank
-            expected = getattr(args, f"in_{source_rank}")
-            getattr(args, f"out_{rank}").copy_(expected)
-            getattr(args, f"result_{rank}").copy_(expected + 1.0)
+            out = getattr(args, f"out_{rank}")
+            if params["mode"] in (DISJOINT_PUT_MODE, BENCHMARK_PUT_MODE, TWO_JETTY_PUT_MODE):
+                out.copy_(getattr(args, f"in_{1 - rank}"))
+                source = getattr(args, f"in_{rank}")
+                for region in _batch_payload_ranges(out.numel(), params["mode"]):
+                    out[region].copy_(source[region])
+            else:
+                source_rank = rank if params["mode"] else 1 - rank
+                out.copy_(getattr(args, f"in_{source_rank}"))
+            torch.add(out, 1.0, out=getattr(args, f"result_{rank}"))
 
 
-def _case(name, mode=0, repeats=1, elems=SMALL_ELEMS):
+def _case(name, mode=0, repeats=1, elems=SMALL_ELEMS, *, batch_size=None, manual=False):
     if elems <= 0 or elems % CONSUMER_TILE_ELEMS:
         raise ValueError("URMA regression consumer requires a positive multiple of 8192 elements")
     return [
@@ -128,7 +176,12 @@ def _case(name, mode=0, repeats=1, elems=SMALL_ELEMS):
             "platforms": ["a5"],
             "manual": True,
             "config": {"device_count": NRANKS, "num_sub_workers": 0},
-            "params": {"mode": mode, "repeats": repeats, "elems": elems},
+            "params": {
+                "mode": mode,
+                "repeats_or_batch_size": repeats if batch_size is None else batch_size,
+                "elems": elems,
+            },
+            "manual": manual,
         }
     ]
 
@@ -166,6 +219,35 @@ class TestUrmaChunkedFetch(_UrmaRegression):
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
 class TestUrmaChunkedPut(_UrmaRegression):
     CASES = _case("chunked_put", mode=1, elems=CHUNKED_ELEMS)
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestUrmaDisjointPut(_UrmaRegression):
+    CASES = (
+        _case("immediate", mode=DISJOINT_PUT_MODE, batch_size=0)
+        + _case("batch_one", mode=DISJOINT_PUT_MODE, batch_size=1)
+        + _case("batch_two_with_tail", mode=DISJOINT_PUT_MODE, batch_size=2)
+        + _case("two_jetties_with_tail", mode=TWO_JETTY_PUT_MODE, batch_size=2)
+        + _case("batch_three_with_tail", mode=DISJOINT_PUT_MODE, batch_size=3)
+        + _case("explicit_end", mode=DISJOINT_PUT_MODE, batch_size=2**32 - 1)
+        + _case("chunked_batch", mode=DISJOINT_PUT_MODE, batch_size=2, elems=CHUNKED_ELEMS, manual=True)
+    )
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestUrmaPutBenchmark(_UrmaRegression):
+    CASES = [
+        case
+        for nbytes in BENCHMARK_PAYLOAD_BYTES
+        for batch_size in BENCHMARK_BATCH_SIZES
+        for case in _case(
+            f"put_{nbytes // 1024}k_{f'batch{batch_size}' if batch_size else 'immediate'}",
+            mode=BENCHMARK_PUT_MODE,
+            batch_size=batch_size,
+            elems=BENCHMARK_WINDOW_SLOTS * (nbytes // DTYPE_NBYTES),
+            manual=True,
+        )
+    ]
 
 
 if __name__ == "__main__":

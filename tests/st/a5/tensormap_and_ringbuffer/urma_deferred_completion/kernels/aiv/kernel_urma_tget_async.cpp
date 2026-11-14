@@ -37,6 +37,15 @@ using Shape = pto::Shape<1, 1, 1, 1, pto::DYNAMIC>;
 using Stride = pto::Stride<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, 1>;
 using GlobalData = pto::GlobalTensor<float, Shape, Stride>;
 constexpr uint32_t kChunkedElems = 256 * 1024 * 1024 / sizeof(float) + 8192;
+constexpr uint32_t kDisjointPutMode = 2;
+constexpr uint32_t kBenchmarkPutMode = 3;
+constexpr uint32_t kTwoJettyPutMode = 4;
+constexpr uint32_t kBatchPayloadElems = 1024;
+constexpr uint32_t kBatchGuardElems = 512;
+constexpr uint32_t kBatchRequestCount = 5;
+constexpr uint32_t kBenchmarkRequestCount = 33;
+constexpr uint32_t kBenchmarkWindowSlots = 64;
+using PutRequest = UrmaRequestDescriptor<GlobalData, GlobalData>;
 
 inline __aicore__ GlobalData global_data(__gm__ float *ptr, uint32_t elems) {
     return GlobalData(ptr, Shape(1, 1, 1, 1, elems), Stride(elems, elems, elems, elems, 1));
@@ -65,6 +74,76 @@ inline __aicore__ void submit_repeated(
     }
 }
 
+inline __aicore__ PutRequest disjoint_put(
+    __gm__ float *local, __gm__ float *remote, uint32_t offset, uint32_t elems, __gm__ uint8_t *workspace, uint32_t peer
+) {
+    return UrmaTput(global_data(remote + offset, elems), global_data(local + offset, elems), workspace, peer);
+}
+
+inline __aicore__ bool submit_puts(
+    __gm__ int64_t *args, AsyncCtx &ctx, const __gm__ CommContext &comm, const PutRequest *requests, uint32_t count,
+    uint32_t batch_size
+) {
+    if (batch_size != 0) return send_urma_put_batch(args, comm, requests, count, batch_size);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!send_request_entry(ctx, requests[i])) return false;
+    }
+    return true;
+}
+
+inline __aicore__ bool submit_disjoint(
+    __gm__ int64_t *args, AsyncCtx &ctx, const __gm__ CommContext &comm, __gm__ float *local, __gm__ float *remote,
+    uint32_t elems, __gm__ uint8_t *workspace, uint32_t peer, uint32_t batch_size, bool require_two_jetties
+) {
+    constexpr uint32_t kTailElems =
+        (kBatchRequestCount - 1) * kBatchPayloadElems + (kBatchRequestCount + 1) * kBatchGuardElems;
+    constexpr uint32_t kStep = kBatchPayloadElems + kBatchGuardElems;
+    const uint32_t first_elems = elems == kChunkedElems ? elems - kTailElems : kBatchPayloadElems;
+    if (ctx.completion_count == nullptr || first_elems + kTailElems > elems) return false;
+    const uint32_t second_offset = first_elems + 2 * kBatchGuardElems;
+    const auto empty = disjoint_put(local, remote, 0, 0, workspace, peer);
+    const PutRequest requests[] = {
+        empty,
+        disjoint_put(local, remote, kBatchGuardElems, first_elems, workspace, peer),
+        disjoint_put(local, remote, second_offset, kBatchPayloadElems, workspace, peer),
+        empty,
+        disjoint_put(local, remote, second_offset + kStep, kBatchPayloadElems, workspace, peer),
+        disjoint_put(local, remote, second_offset + 2 * kStep, kBatchPayloadElems, workspace, peer),
+        disjoint_put(local, remote, second_offset + 3 * kStep, kBatchPayloadElems, workspace, peer),
+        empty,
+    };
+    const uint32_t before = *ctx.completion_count;
+    if (!submit_puts(args, ctx, comm, requests, sizeof(requests) / sizeof(requests[0]), batch_size)) return false;
+    const uint32_t added = *ctx.completion_count - before;
+    return require_two_jetties ? added == 2 : added > 0;
+}
+
+inline __aicore__ bool submit_benchmark(
+    __gm__ int64_t *args, AsyncCtx &ctx, const __gm__ CommContext &comm, __gm__ float *local, __gm__ float *remote,
+    uint32_t elems, __gm__ uint8_t *workspace, uint32_t peer, uint32_t batch_size
+) {
+    const uint32_t payload = elems / kBenchmarkWindowSlots;
+    const uint32_t step = payload + kBatchGuardElems;
+    auto *info = reinterpret_cast<__gm__ pto::comm::urma::UrmaInfo *>(workspace);
+    uint32_t row = 0;
+    if (payload == 0 || kBenchmarkRequestCount * step + kBatchGuardElems > elems ||
+        info->layout != pto::comm::urma::UrmaLayout::PER_PEER || info->jettiesPerCore != 1 ||
+        !simpler::urma::queue_row_for(workspace, peer, ctx.urma_sender_id, row)) {
+        return false;
+    }
+    auto *sq = reinterpret_cast<__gm__ pto::comm::urma::UrmaWQCtx *>(info->sqPtr) + row;
+    if (sq->headAddr == 0) return false;
+    PutRequest requests[kBenchmarkRequestCount];
+    for (uint32_t i = 0; i < kBenchmarkRequestCount; ++i) {
+        requests[i] = disjoint_put(local, remote, kBatchGuardElems + i * step, payload, workspace, peer);
+    }
+    const uint32_t head_before = pto2::urma_backend::load_urma_counter(sq->headAddr);
+    const uint32_t wqes_before = sq->submittedWqeCount;
+    if (!submit_puts(args, ctx, comm, requests, kBenchmarkRequestCount, batch_size)) return false;
+    return pto2::urma_backend::load_urma_counter(sq->headAddr) - head_before == kBenchmarkRequestCount &&
+           sq->submittedWqeCount - wqes_before == kBenchmarkRequestCount;
+}
+
 }  // namespace
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
@@ -73,12 +152,13 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     auto *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[2]);
     auto *comm = reinterpret_cast<__gm__ CommContext *>(args[4]);
     const uint32_t elems = static_cast<uint32_t>(args[5]);
-    const bool put = args[6] == 1;
-    const uint32_t repeats = static_cast<uint32_t>(args[7]);
+    const uint32_t mode = static_cast<uint32_t>(args[6]);
+    const bool put = mode != 0;
+    const uint32_t repeats_or_batch_size = static_cast<uint32_t>(args[7]);
     AsyncCtx ctx = get_async_ctx(args);
     if (comm == nullptr || comm->rankNum != 2 || comm->rankId >= 2 ||
         comm_workspace<CommWorkspaceKind::URMA>(*comm).addr == 0 || comm->windowsIn[comm->rankId] == 0 || elems == 0 ||
-        repeats == 0) {
+        (mode < kDisjointPutMode && repeats_or_batch_size == 0)) {
         pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         pto2::detail::defer_flush(ctx);
         return;
@@ -89,6 +169,21 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     const uint64_t remote_offset =
         reinterpret_cast<uint64_t>(tensor_data(remote_window_tensor)) - comm->windowsIn[comm->rankId];
     auto *remote = pto2::urma_backend::peer_mr_ptr<float>(workspace, peer, remote_offset);
+    if (mode == kDisjointPutMode || mode == kBenchmarkPutMode || mode == kTwoJettyPutMode) {
+        const bool submitted =
+            mode == kBenchmarkPutMode ?
+                submit_benchmark(args, ctx, *comm, local, remote, elems, workspace, peer, repeats_or_batch_size) :
+                submit_disjoint(
+                    args, ctx, *comm, local, remote, elems, workspace, peer, repeats_or_batch_size,
+                    mode == kTwoJettyPutMode
+                );
+        if (!submitted) {
+            pto2::detail::set_urma_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+            pto2::detail::defer_flush(ctx);
+        }
+        return;
+    }
+    const uint32_t repeats = repeats_or_batch_size;
     if (!put && elems == kChunkedElems) {
         using StaticShape = pto::Shape<1, 1, 1, 1, kChunkedElems>;
         using StaticStride = pto::Stride<kChunkedElems, kChunkedElems, kChunkedElems, kChunkedElems, 1>;

@@ -120,6 +120,7 @@ struct PreparedSubmissionStorage {
     std::unique_ptr<RunCallerOrder> caller_order;
     void *device_wall{nullptr};
     void *device_result{nullptr};
+    void *host_result{nullptr};  // Pinned destination for stream-ordered readback.
     // A failed allocation's nonnull output is owned, but cannot be initialized
     // until checked release succeeds. Copy failures keep a valid allocation.
     int result_allocation_rc{0};
@@ -1619,6 +1620,7 @@ public:
             aicore_retirement_attempted(std::exchange(other.aicore_retirement_attempted, false)),
             joinable_boundary(other.joinable_boundary),
             join(other.join),
+            requires_dma_quiescence(other.requires_dma_quiescence),
             physical_complete(other.physical_complete),
             retirement_diagnostics_rc(other.retirement_diagnostics_rc),
             scheduler_runtime_mode(other.scheduler_runtime_mode) {}
@@ -1683,6 +1685,7 @@ public:
          * decided at prepare would by then name a run that is gone.
          */
         NativeRunJoin join{};
+        bool requires_dma_quiescence{false};
         bool physical_complete{false};
         int retirement_diagnostics_rc{0};
         uint32_t scheduler_runtime_mode{0};
@@ -2371,7 +2374,8 @@ protected:
      * backing before recording. Reuse preserves any existing replay evidence.
      */
     int ensure_device_run_result_region(
-        const NativeRunIdentity &identity, KernelArgsHelper &kernel_args, const DfxRunConfig &dfx
+        const NativeRunIdentity &identity, KernelArgsHelper &kernel_args, const DfxRunConfig &dfx,
+        bool requires_dma_quiescence = false
     );
 
     /**
@@ -2459,16 +2463,20 @@ protected:
      * queues are the only remaining evidence, and a partial launch is not a
      * path that has a successor queued behind it.
      *
-     * Event completion is only a physical fact. It never caches a semantic
-     * result or reads a private terminal record.
+     * Batch PUT also checks its stream-ordered host receipt before reporting
+     * physical completion. The query itself submits no result transfer.
      */
     int poll_run_fence(const PreparedExecution &prepared);
+
+    // The stream boundary and this run's terminal receipt prove different
+    // things. Read the latter only after observing the former.
+    int verify_dma_quiescence(const PreparedExecution &prepared);
 
     /**
      * Observe this call's original stream pair under the resolved timeout.
      * A zero return proves stream quiescence and success of that observation;
-     * a nonzero return alone proves neither. Private result data supplies only
-     * optional error detail after a failed stream observation.
+     * a nonzero return alone proves neither. Batch PUT also requires a host
+     * receipt proving that its DMA has stopped.
      */
     int wait_run_fence(PreparedExecution &prepared);
 
@@ -3395,6 +3403,7 @@ protected:
         RunRecordRead read{RunRecordRead::NotAttempted};
         int transfer_rc{0};
         bool initialized{false};
+        bool readback_queued{false};
     };
     // Owned by the live call, independently of its reusable execution slot.
     std::unordered_map<uint64_t, RunResultStorage> run_result_storage_;

@@ -79,6 +79,7 @@ struct NativeRunContext {
     uint64_t clock_log_offset{0};
     int completion_rc{-1};
     bool result_observed{false};
+    bool accounted_urma_task_error{false};
     bool physical_complete{false};
     bool execution_retired{false};
     // Captured while the actual arguments exist, before physical retirement
@@ -145,6 +146,7 @@ struct NativeRunContext {
 template <typename Runner>
 void destroy_native_run_context(NativeRunContext<Runner> *context) {
     static_assert(sizeof(NativeRunContext<Runner>) >= kNativeRunPrepareReleaseBytes);
+    static_assert(sizeof(NativeRunContext<Runner>) >= kNativeRunTaskFailureReleaseBytes);
     void *storage = context;
     context->~NativeRunContext<Runner>();
     constexpr uint64_t kEmpty = 0;

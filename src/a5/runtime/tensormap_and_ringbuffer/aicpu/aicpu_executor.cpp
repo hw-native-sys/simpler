@@ -86,17 +86,12 @@ extern "C" void framework_bind_runtime(RuntimeContext *rt);
 constexpr const char *DEFAULT_ORCH_ENTRY_SYMBOL = "aicpu_orchestration_entry";
 constexpr const char *DEFAULT_ORCH_CONFIG_SYMBOL = "aicpu_orchestration_config";
 
-static int32_t read_runtime_status(Runtime *runtime) {
-    if (runtime == nullptr) {
-        return 0;
-    }
+static SharedMemoryHeader *runtime_shared_header(Runtime *runtime) {
+    return runtime != nullptr ? static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr()) : nullptr;
+}
 
-    void *sm = runtime->get_gm_sm_ptr();
-    if (sm == nullptr) {
-        return 0;
-    }
-
-    auto *header = static_cast<SharedMemoryHeader *>(sm);
+static int32_t read_runtime_status(const SharedMemoryHeader *header) {
+    if (header == nullptr) return 0;
     int32_t orch_error_code = header->orch_error_code.load(std::memory_order_acquire);
     int32_t sched_error_code = header->sched_error_code.load(std::memory_order_acquire);
     return runtime_status_from_error_codes(orch_error_code, sched_error_code);
@@ -1133,18 +1128,28 @@ void AicpuExecutor::snapshot_run_terminal(Runtime *runtime) {
     // The shared header outranks a participant's own return: a thread can
     // finish with a zero return while the state it wrote — a scheduler timeout
     // latched beside a non-negative completed count — is the run's failure.
-    const int32_t header_status = read_runtime_status(runtime);
+    const auto *header = runtime_shared_header(runtime);
+    const int32_t header_status = read_runtime_status(header);
     const bool normal_path = normal_path_claims_.load(std::memory_order_acquire) == aicpu_thread_num_;
-    const RunTerminalSelection selection = run_terminal_select(normal_path, header_status, terminal_);
-
+    RunTerminalSelection selection = run_terminal_select(normal_path, header_status, terminal_);
     const uint8_t *payload = nullptr;
     size_t payload_bytes = 0;
-    if (selection.verdict == DeviceRunVerdict::Error && runtime != nullptr) {
-        void *sm = runtime->get_gm_sm_ptr();
-        if (sm != nullptr) {
+    if (selection.verdict == DeviceRunVerdict::Error) {
+        if (runtime->dev.urma_batch_enabled && sched_ctx_.settle_aborted_dma()) {
+            const int32_t accounted = sched_ctx_.accounted_urma_submit_error();
+            // The scheduler reports accounted submit errors through the shared header.
+            if (header != nullptr && normal_path && !terminal_.has_failure() && accounted != SIMPLER_ERROR_NONE &&
+                header->orch_error_code.load(std::memory_order_acquire) == SIMPLER_ERROR_NONE &&
+                header->sched_error_code.load(std::memory_order_acquire) == accounted) {
+                selection.source = DeviceRunCodeSource::AccountedUrmaSubmit;
+            }
+        } else if (runtime->dev.urma_batch_enabled) {
+            LOG_ERROR("%s", "Aborted A5 TMR run has unconfirmed DMA completion");
+        }
+        if (header != nullptr) {
             // The header is reset by whichever run occupies the arena next, so
             // the scene is copied out of it here rather than read in place.
-            payload = reinterpret_cast<const uint8_t *>(sm) + SHARED_MEMORY_ERROR_TAIL_OFFSET;
+            payload = reinterpret_cast<const uint8_t *>(header) + SHARED_MEMORY_ERROR_TAIL_OFFSET;
             payload_bytes = SHARED_MEMORY_ERROR_TAIL_BYTES;
         }
     }
@@ -1283,7 +1288,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     // sched overlap into post_orch — inflating it well past the actual teardown.
     // read_runtime_status is two atomic loads every thread needs, so it stays
     // outside the scope.
-    int32_t runtime_rc = read_runtime_status(runtime);
+    int32_t runtime_rc = read_runtime_status(runtime_shared_header(runtime));
     // The finalizer publishes cleanup eligibility only after runtime
     // destruction, so exactly one thread reaches teardown and it observes
     // everything the finalizer wrote — including the terminal record it then

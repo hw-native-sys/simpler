@@ -38,10 +38,12 @@ __attribute__((visibility("default"))) void urma_deferred_completion_orchestrati
     const uint64_t comm_ctx = orch_args.scalar<uint64_t>(0);
     const uint32_t elems = orch_args.scalar<uint32_t>(1);
     const uint32_t mode = orch_args.scalar<uint32_t>(2);
-    const uint32_t repeats = orch_args.scalar<uint32_t>(3);
+    const uint32_t repeats_or_batch_size = orch_args.scalar<uint32_t>(3);
+    const bool is_put = mode != 0;
+    constexpr uint32_t kBenchmarkPutMode = 3;
 
     simpler::tmr::Tensor gate = input;
-    if (mode == 1) {
+    if (is_put) {
         uint32_t marker_shape[1] = {1};
         TensorCreateInfo marker(marker_shape, 1, DataType::INT32);
         CoreTaskArgs put;
@@ -51,28 +53,30 @@ __attribute__((visibility("default"))) void urma_deferred_completion_orchestrati
         put.add_input(input);
         put.add_scalar(comm_ctx);
         put.add_scalar(elems);
-        put.add_scalar(1);
-        put.add_scalar(repeats);
+        put.add_scalar(mode);
+        put.add_scalar(repeats_or_batch_size);
+        if (mode == kBenchmarkPutMode) put.set_task_timing_slot(0);
         TaskOutputTensors put_outputs = rt_submit_aiv_task(0, put);
         gate = put_outputs.get_ref(0);
     }
 
     // A PUT successor reads the region written on the peer only after PUT completion.
     CoreTaskArgs get;
-    get.add_input(mode == 1 ? receive : input);
-    get.add_input(mode == 1 ? receive : input);
+    get.add_input(is_put ? receive : input);
+    get.add_input(is_put ? receive : input);
     get.add_output(out);
     get.add_input(gate);
     get.add_scalar(comm_ctx);
     get.add_scalar(elems);
     get.add_scalar(0);
-    get.add_scalar(mode == 1 ? 1 : repeats);
+    get.add_scalar(is_put ? 1 : repeats_or_batch_size);
     rt_submit_aiv_task(0, get);
 
     CoreTaskArgs consumer;
     consumer.add_input(out);
     consumer.add_output(result);
     consumer.add_scalar(elems);
+    if (mode == kBenchmarkPutMode) consumer.set_task_timing_slot(0);
     rt_submit_aiv_task(1, consumer);
 }
 

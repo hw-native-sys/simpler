@@ -183,6 +183,7 @@ struct AsyncWaitList {
     // The dispatch loop reads count as a polling hint. Entry access and
     // count updates during scheduling are serialized by busy.
     std::atomic<int32_t> count{0};
+    bool unconfirmed_publication{false};
     // Diagnostic: counts every FIN-side try_push that hit a full mailbox.
     // Expected to stay zero on real workloads (ring is 4096 entries); a
     // non-zero value means consumers are too slow or the ring is undersized.
@@ -192,6 +193,7 @@ struct AsyncWaitList {
     void reset_for_reuse() {
         busy.store(0, std::memory_order_relaxed);
         count.store(0, std::memory_order_relaxed);
+        unconfirmed_publication = false;
         mpsc_skipped_count.store(0, std::memory_order_relaxed);
     }
 
@@ -258,6 +260,7 @@ struct AsyncWaitList {
                     // slot_state stays null until the matching TASK_NORMAL_DONE
                     // sentinel arrives.
                     if (entry_count >= MAX_ASYNC_WAITS) {
+                        unconfirmed_publication = true;
                         error_code = SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW;
                         return drained;
                     }
@@ -273,6 +276,7 @@ struct AsyncWaitList {
                         *entry, msg.addr, msg.backend_cookie, msg.expected_value, static_cast<AsyncEngine>(msg.engine),
                         msg.completion_type, error_code
                     )) {
+                    unconfirmed_publication = true;
                     return drained;
                 }
             } else if (msg.kind == MSG_KIND_TASK_NORMAL_DONE) {
@@ -308,6 +312,7 @@ struct AsyncWaitList {
                     entry->normal_done = true;
                 }
             } else {
+                unconfirmed_publication = true;
                 error_code = SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED;
                 return drained;
             }
@@ -336,6 +341,66 @@ struct AsyncWaitList {
         cond.expected_value = expected_value;
         entry.waiting_completion_count++;
         return true;
+    }
+
+    // Called after FIN producers and the normal consumer have stopped. Wait
+    // for actual DMA only. A counter may name a producer canceled by the abort.
+    template <typename Retry>
+    static bool settle_dma(int32_t type, uint64_t addr, uint64_t cookie, uint32_t expected, const Retry &retry) {
+        if (type == COMPLETION_TYPE_COUNTER) return true;
+        CompletionCondition condition;
+        condition.completion_type = type;
+        condition.addr = addr;
+        condition.backend_cookie = cookie;
+        condition.expected_value = expected;
+        while (true) {
+            const auto poll = condition.test();
+            if (poll.state == CompletionPollState::READY) {
+                condition.retire();
+                return true;
+            }
+            if (poll.state == CompletionPollState::FAILED || !retry()) return false;
+        }
+    }
+
+    template <typename Retry>
+    bool settle_aborted_dma(AICoreCompletionMailbox *mailbox, const Retry &retry) {
+        bool settled = !unconfirmed_publication;
+        const int32_t entry_count = count.load(std::memory_order_relaxed);
+        for (int32_t i = 0; i < entry_count; ++i) {
+            const auto &entry = entries[i];
+            for (int32_t j = 0; j < entry.condition_count; ++j) {
+                const auto &condition = entry.conditions[j];
+                if (!condition.retired) {
+                    settled &= settle_dma(
+                        condition.completion_type, condition.addr, condition.backend_cookie, condition.expected_value,
+                        retry
+                    );
+                }
+            }
+        }
+        AICoreCompletionMsgView msg;
+        while (mailbox != nullptr && mailbox->try_pop(msg)) {
+            if (msg.kind == MSG_KIND_CONDITION) {
+                settled &= settle_dma(msg.completion_type, msg.addr, msg.backend_cookie, msg.expected_value, retry);
+            } else {
+                settled &= msg.kind == MSG_KIND_TASK_NORMAL_DONE;
+            }
+        }
+        return settled && (mailbox == nullptr || !mailbox->has_pending());
+    }
+
+    template <typename Retry>
+    static bool settle_aborted_slab(const volatile DeferredCompletionSlab &slab, const Retry &retry) {
+        const uint32_t count = slab.count;
+        const int32_t error = slab.error_code;
+        bool settled = count <= MAX_COMPLETIONS_PER_TASK &&
+                       (error == SIMPLER_ERROR_NONE || deferred_submit_error_dma_accounted(error));
+        for (uint32_t i = 0; i < count && i < MAX_COMPLETIONS_PER_TASK; ++i) {
+            const auto &entry = slab.entries[i];
+            settled &= settle_dma(entry.completion_type, entry.addr, entry.backend_cookie, entry.expected_value, retry);
+        }
+        return settled;
     }
 
     template <bool Profiling>

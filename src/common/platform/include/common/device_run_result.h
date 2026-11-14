@@ -70,9 +70,9 @@
  * **What a verdict does not settle.** A terminal record answers what this run's
  * execution did. It does not say the device is healthy, and it does not say the
  * run's resources are retirable — a device can publish a failure and keep
- * tearing down, so quiescence is proven by the run's completion boundaries and
- * its outstanding wait references, never by this record. The host keeps those
- * axes apart.
+ * tearing down. The DMA proof concerns asynchronous transfers only. The host
+ * still needs the run's completion boundaries and retirement of its outstanding
+ * wait references.
  */
 
 #pragma once
@@ -98,9 +98,10 @@ enum class DeviceRunVerdict : uint32_t {
 /** Which device-side state selected a failure's code. Wire values. */
 enum class DeviceRunCodeSource : uint32_t {
     None = 0,
-    Header = 1,      // the runtime's shared error state (orch / scheduler codes)
-    ThreadRc = 2,    // a participant's own execution return
-    ShutdownRc = 3,  // a participant's teardown return, with no earlier error
+    Header = 1,               // the runtime's shared error state (orch / scheduler codes)
+    ThreadRc = 2,             // a participant's own execution return
+    ShutdownRc = 3,           // a participant's teardown return, with no earlier error
+    AccountedUrmaSubmit = 4,  // scheduler submission error with proven DMA retirement
 };
 
 /**
@@ -114,7 +115,7 @@ enum class DeviceRunCodeSource : uint32_t {
  */
 constexpr bool device_run_code_source_is_failure(DeviceRunCodeSource source) {
     return source == DeviceRunCodeSource::Header || source == DeviceRunCodeSource::ThreadRc ||
-           source == DeviceRunCodeSource::ShutdownRc;
+           source == DeviceRunCodeSource::ShutdownRc || source == DeviceRunCodeSource::AccountedUrmaSubmit;
 }
 
 /**

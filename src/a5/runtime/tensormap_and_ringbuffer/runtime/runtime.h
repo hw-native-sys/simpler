@@ -213,6 +213,8 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // task graph before entering resolve_and_dispatch().
     // Controlled via SIMPLER_TMR_SERIAL_ORCH_SCHED_ENABLE environment variable.
     bool serial_orch_sched;
+    // Host-managed Program runs can prove DMA quiescence before reclamation.
+    bool urma_batch_enabled{false};
 
     void *gm_sm_ptr_;  // GM pointer to shared memory (device)
 

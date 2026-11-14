@@ -1239,15 +1239,17 @@ int simpler_launch_run_joined(DeviceContextHandle ctx, RuntimeHandle runtime, Ru
 
 /**
  * Nonblocking own-execution completion query after launch. Returns POLL_*.
- * COMPLETE proves owned physical retirement, without reading semantic status
- * or copying Program outputs. The live call still requires wait/finalize.
+ * COMPLETE proves owned physical retirement. Batch PUT checks a receipt
+ * copied before the completion event. The live call still requires
+ * wait/finalize for its result and Program outputs.
  */
 int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 
 /**
  * Internal blocking physical progress under the runtime's existing timeout.
  * Zero proves own boundaries and queued-wait consumption, and retires execution
- * resources. Never synchronizes whole streams or reads the private result.
+ * resources. Never synchronizes whole streams. Batch PUT also checks the
+ * receipt covered by those boundaries.
  * An error retains unresolved debt and does not prove device stop.
  */
 int simpler_wait_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime);
