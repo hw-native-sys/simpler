@@ -2772,7 +2772,7 @@ bool DeviceRunnerBase::has_callable(int32_t callable_id) const { return callable
 
 int DeviceRunnerBase::ensure_dma_workspace_provisioned() {
     if (dma_workspace_handle_ != nullptr) {
-        return 0;
+        return dma_workspace_failed_ ? COMM_RECLAMATION_UNCONFIRMED : 0;
     }
     const uint32_t supported = dma_workspace_supported_mask();
     constexpr uint32_t kSdmaBit = uint32_t{1} << DMA_WORKSPACE_SDMA;
@@ -2793,12 +2793,8 @@ int DeviceRunnerBase::ensure_dma_workspace_provisioned() {
     if (required_mask == 0) {
         return 0;
     }
-    // Dormant while one engine is supported, since required_mask is a subset of
-    // supported. It arms itself on the day dma_workspace_supported_mask() widens,
-    // which is the day the single-handle contract breaks — dma_workspace_release()
-    // casts the opaque handle back to the one provider type it can be, so a second
-    // engine would be released as the type of the first. A rejection here beats
-    // that silent type confusion.
+    // Each backend's opaque owner supports one provider. Reject multiple engines
+    // until the provision/release interface can represent their separate owners.
     if ((required_mask & (required_mask - 1)) != 0) {
         LOG_ERROR(
             "dma workspace: mask=0x%x names %d engines; one handle owns one provider", required_mask,
@@ -2817,7 +2813,7 @@ int DeviceRunnerBase::ensure_dma_workspace_provisioned() {
         LOG_ERROR("dma workspace: mask=0x%x failed: %d", required_mask, rc);
         for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind)
             dma_workspace_addr_[kind] = 0;
-        dma_workspace_handle_ = nullptr;
+        dma_workspace_failed_ = dma_workspace_handle_ != nullptr;
         return rc;
     }
     return 0;
@@ -3288,9 +3284,14 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     // group, so running its per-stream destructor afterwards is unsafe.
     if (dma_workspace_handle_ != nullptr) {
         if (!abandon_device_resources) {
-            dma_workspace_release(dma_workspace_handle_);
+            const int release_rc = dma_workspace_release(dma_workspace_handle_);
+            if (release_rc != 0) {
+                dma_workspace_failed_ = true;
+                return release_rc;
+            }
         }
         dma_workspace_handle_ = nullptr;
+        dma_workspace_failed_ = false;
     }
     for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind)
         dma_workspace_addr_[kind] = 0;

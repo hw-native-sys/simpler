@@ -29,6 +29,7 @@ inline int zero_size_engine = -1;
 inline int throw_engine = -1;
 inline int invalid_addr_engine = -1;
 inline int invalid_size_engine = -1;
+inline void *last_workspace[3]{};
 inline uint32_t device_aiv_count = 2;
 inline uint32_t sized_jetties = 0, initialized_jetties = 0, initialized_sq_depth = 0;
 inline uint32_t sized_aivs = 0, initialized_aivs = 0;
@@ -43,6 +44,7 @@ public:
         }
     }
     bool create(void *addr, uint64_t size) {
+        last_workspace[engine_] = addr;
         ++started[engine_];
         if (!addr || size < GetWorkspaceSize()) return false;
         addr_ = addr;

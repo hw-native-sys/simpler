@@ -180,6 +180,13 @@ def test_rdma_workspace_free_failure_retains_owner(host_resource_binary):
     subprocess.run([str(host_resource_binary), "rdma_release"], check=True, timeout=20)
 
 
+@pytest.mark.parametrize("host_resource_binary", [True], indirect=True)
+@pytest.mark.parametrize("engine", ["sdma", "urma", "rdma"])
+@pytest.mark.parametrize("failure", ["return", "throw"])
+def test_init_rollback_free_failure_retains_owner(host_resource_binary, engine, failure):
+    subprocess.run([str(host_resource_binary), f"init_{engine}_{failure}"], check=True, timeout=20)
+
+
 @pytest.mark.parametrize("kind", ["CommWorkspaceKind::COUNT", "static_cast<CommWorkspaceKind>(UINT32_MAX)"])
 def test_invalid_static_workspace_kind_is_rejected_by_compiler(tmp_path, kind):
     source = tmp_path / "invalid_workspace.cpp"

@@ -138,11 +138,10 @@ uint32_t dma_workspace_channel_count(void);
  * dma_workspace_release(). Bits outside dma_workspace_supported_mask() are
  * rejected, so provisioning fails fast on a platform/runtime without SDMA.
  *
- * At most one bit may be set. A single opaque handle cannot own two providers,
- * and dma_workspace_release() recovers the concrete type by casting it, so a
- * second engine would be released as the type of the first. Provisioning more
- * than one engine per call needs a per-kind handle on both sides of this seam;
- * until then callers get a rejection rather than that silent type confusion.
+ * At most one bit may be set: each backend's opaque owner supports one provider.
+ * A failed provision may return a non-null handle when reclamation cannot be
+ * confirmed. Retain that handle, keep the device addresses unpublished, and
+ * stop using this owner; a non-null handle alone does not imply successful Init.
  *
  * @return 0 on success, non-zero on invalid/unsupported input or provisioning
  *         failure.
@@ -150,11 +149,14 @@ uint32_t dma_workspace_channel_count(void);
 int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_out, int count, void **handle_out);
 
 /**
- * Release the resources returned by a successful dma_workspace_provision().
- * Ordinary teardown: destroys the provider's streams and workspace. A null
- * handle is a no-op.
+ * Release an owner returned by dma_workspace_provision(). Ordinary teardown
+ * destroys provider resources before freeing the caller-owned device allocation.
+ * Returns 0 and consumes the handle on success (including a null handle).
+ * COMM_RECLAMATION_UNCONFIRMED retains the handle and allocation identity;
+ * the caller must preserve them and stop using the owner. Repeated release of
+ * an unconfirmed owner returns the same error without retrying device teardown.
  */
-void dma_workspace_release(void *handle);
+int dma_workspace_release(void *handle);
 
 /**
  * Initialize a communicator for the given rank.

@@ -441,6 +441,21 @@ SDMA streams and its kernels read a zero workspace address. The platform calls
 Worker finalize destroys the manager's streams before freeing the allocation;
 fatal device teardown retains both with the abandoned provider.
 
+The ISA manager still owns engine resources such as streams and queue bindings;
+it borrows the device workspace allocated by simpler. These are separate
+lifetimes. On A2/A3, the opaque Worker owner records both the manager and the
+original allocation, including when `Init` fails before binding the address.
+On A5, SDMA's manager/allocation belong to the communication handle; URMA and
+RDMA's belong to each domain allocation.
+
+Initialization rollback and normal teardown check the external `aclrtFree`
+result. When reclamation is unconfirmed, the owner and allocation identity stay
+retained, device addresses are not newly published, and later cleanup reports
+the same failure without retrying device teardown. A2/A3 retains the SDMA manager
+after any failed `Init`: ISA creates streams before binding the workspace, and
+destroying those streams on a faulted device can stall even when the workspace
+address is null. A retained owner is not a usable workspace.
+
 **`enable_sdma` is a defect quarantine, not a capability switch, and it has an
 exit condition.** Selecting an engine already belongs to the kernel, which reads
 whichever addresses were injected; the runtime would otherwise provision every
