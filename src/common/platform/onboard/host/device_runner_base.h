@@ -984,21 +984,10 @@ public:
     );
 
     /**
-     * Create a thread bound to this device. The thread calls
-     * rtSetDevice(device_id) on entry.
+     * Create a thread bound to this device. The default uses rtSetDevice on
+     * entry. An A5 owned runner binds its retained context instead.
      */
-    std::thread create_thread(std::function<void()> fn);
-
-    /**
-     * Bind the calling thread to a device, taking nothing else from it.
-     *
-     * Idempotent for the same id; errors if called with a different id after
-     * a prior adopt. Creates no streams and records no identity.
-     *
-     * @param device_id  Device ID (0-15)
-     * @return 0 on success, error code on failure.
-     */
-    int bind_current_thread(int device_id);
+    virtual std::thread create_thread(std::function<void()> fn);
 
     /**
      * Bind the current host thread and adopt the device for a program
@@ -2143,6 +2132,9 @@ public:
     const std::string &output_prefix() const { return output_prefix_; }
 
 protected:
+    // Architecture-specific bind used by attach_current_thread and teardown.
+    virtual int bind_current_thread(int device_id);
+
     // Context-fixed architecture resources use the real hidden control stream.
     // Per-call thread selection and Program's lazy initialization stay separate.
     virtual int prepare_kernel_arch_context(rtStream_t /*control_stream*/) { return 0; }
@@ -2172,6 +2164,8 @@ protected:
     DeviceRunnerBase();
 
     virtual int finalize_impl() = 0;
+    // A failed device bind can still leave a process-level SDK reference.
+    virtual int finalize_unbound() { return 0; }
     void begin_fatal_close() {
         if (!terminal_close_generation_.has_value()) terminal_close_generation_ = device_health_.generation();
     }

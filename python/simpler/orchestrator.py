@@ -42,7 +42,7 @@ from typing import Any, cast
 
 from _task_interface import _Orchestrator as _COrchestrator  # pyright: ignore[reportMissingImports]
 
-from .buffer import AccessMode, AddressSpace, BackendKind, Buffer, wrap_fork_inherited
+from .buffer import AddressSpace, Buffer, _wrap_heap_allocation
 from .callable_identity import CallableHandle
 from .task_interface import (
     CallConfig,
@@ -62,7 +62,6 @@ from .task_interface import (
     _remote_sidecar_for,
     _RemoteTaskArgsSidecar,
     _validate_remote_sidecar_access,
-    get_element_size,
 )
 from .workspace_config import WorkspaceEngines
 
@@ -974,24 +973,12 @@ class Orchestrator:
         _check_domain_initializer_context(self._worker, "Orchestrator.alloc")
         assert self._worker is not None, "orch.alloc requires an L3+ orchestration context"
         shape_t = tuple(int(s) for s in shape)
-        nbytes = get_element_size(dtype)
-        for s in shape_t:
-            nbytes *= s
         identity = self._worker._burn_buffer_identity()
         # alloc keys the synthetic producer slot by the ref's canonical identity (not a raw VA), so a
         # consumer named via handle.tensor(...) dependency-wires to it. Same managed backing as
         # worker.alloc_shared_tensor; additionally registered as an L3-L2 orch-comm host buffer.
-        va = int(self._o.alloc(list(shape_t), dtype, identity))
-        handle = wrap_fork_inherited(
-            va,
-            int(nbytes),
-            bytes(identity.owner_instance_id),
-            int(identity.buffer_id),
-            f"L{self._worker.level}",
-            generation=int(identity.generation),
-            access=AccessMode.READWRITE,
-            backend_kind=BackendKind.FORK_SHM,
-        )
+        va, descriptor = self._o._alloc_shared_buffer(list(shape_t), dtype, identity)
+        handle = _wrap_heap_allocation(int(va), descriptor, identity, f"L{self._worker.level}")
         self._worker._register_worker_chip_orch_comm_host_buffer(handle)
         return handle
 

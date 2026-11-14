@@ -709,6 +709,8 @@ class BufferAccessQuery:
     same_endpoint: bool = False
     platform: str | None = None
     runtime: str | None = None
+    fork_inherited: bool = True
+    host_file_attached: bool = False
 
 
 @dataclass(frozen=True)
@@ -1061,6 +1063,12 @@ def buffer_adapter_candidates(query: BufferAccessQuery) -> tuple[_AdapterCandida
     the exclusion is structural rather than merely unimplemented it stays here instead, so that an
     injected service cannot override it.
     """
+    if query.backend_kind in (BackendKind.FORK_SHM, BackendKind.FORK_COW) and not query.fork_inherited:
+        return _explicit_transfer_candidates(
+            "fork-inherited VA is unavailable in a new interpreter; use a shared Buffer"
+        )
+    if query.backend_kind is BackendKind.SHARED_FD_SLICE and not query.host_file_attached:
+        return _explicit_transfer_candidates("shared heap fd was not attached to this endpoint")
     if query.backend_kind is BackendKind.REMOTE_SIDECAR:
         return _explicit_transfer_candidates(
             "REMOTE_SIDECAR is resolved by its remote session, never by a local materializer"
@@ -1082,7 +1090,7 @@ def _host_consumer_candidates(backend_kind: BackendKind, same_node: bool) -> tup
         return _remote_copy_candidates()
     if backend_kind in (BackendKind.FORK_SHM, BackendKind.FORK_COW):
         return (_AdapterCandidate(AdapterKind.DIRECT_MAP, AdapterProfile.FORK_INHERITED_VA),)
-    if backend_kind is BackendKind.POSIX_SHM:
+    if backend_kind in (BackendKind.POSIX_SHM, BackendKind.SHARED_FD_SLICE):
         return (_AdapterCandidate(AdapterKind.DIRECT_MAP, AdapterProfile.HOST_SHM_MAP),)
     if backend_kind is BackendKind.DEVICE_MALLOC:
         return (_AdapterCandidate(AdapterKind.OWNER_DELEGATED_COPY, AdapterProfile.OWNER_DEVICE_COPY),)
@@ -1127,7 +1135,7 @@ def _device_consumer_candidates(
         return _explicit_transfer_candidates("DEVICE_MALLOC cannot be imported by a peer endpoint")
     if backend_kind in (BackendKind.FORK_SHM, BackendKind.FORK_COW):
         return _explicit_transfer_candidates("fork-inherited VA is unavailable at this endpoint")
-    if backend_kind is BackendKind.POSIX_SHM:
+    if backend_kind in (BackendKind.POSIX_SHM, BackendKind.SHARED_FD_SLICE):
         return _explicit_transfer_candidates("explicit transfer materializer is not implemented yet")
     return _explicit_transfer_candidates(f"unsupported backend {backend_kind!r}")
 
