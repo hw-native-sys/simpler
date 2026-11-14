@@ -11,6 +11,8 @@ description: Run and compare DeepSeek V4.1 Flash decode scheduler benchmarks on 
 - Use [Simpler FDWIC](references/simpler-fdwic.md) for vendored scheduler cases, the 18-case matrix, or reproducible scheduler traces with captured inputs. Use the suite README in the chosen Simpler checkout.
 - Use both when checking whether a runtime change generalizes. Report each suite with its own case inputs, timed region, and rank aggregation.
 
+- For [percounter L1 and Perfetto](references/percounter-l1.md), capture the matching dependency graph and check that the timing records cover the executable tasks.
+
 ## Run a matched comparison
 
 1. Pin the workload and each runtime arm. Record the resolved commits and any local diff for the relevant repos, CANN and toolchain versions, the loaded runtime build and scheduler variant, device IDs, graph mode, input shape and routing, warmup, rounds, and the metric and its aggregation. Verify the loaded artifacts for each arm. For a runtime-only comparison, hold the generated business kernels, inputs, graph mode, and build flags fixed.

@@ -45,3 +45,6 @@ Use a two-device reservation for the EP2 case. Use the same explicit card or pai
 
 - Daily `effective_us` sums dispatch values within each rank and round, takes the median across rounds for each rank, and reports the fastest rank's median for MoE. Save rank results so the selected rank is auditable. The daily reducer validates sample counts against the manifest. For shorter experiments, report the actual sampling and reduce the per-round data with the same aggregation.
 - For device wall time, use the pinned checkout's raw benchmark or strace capture and verify it contains `chip.run.runner_run.device_wall` per measured dispatch. The daily `case` JSON in the verified dev checkout serializes effective samples. Where supported, enable `PYPTO_BENCH_RAW=1` and `SIMPLER_DEVICE_STRACE_ENABLE=1` for a separate wall-time capture and extract the field from the raw per-dispatch records. Keep those settings identical across arms. When wall time is required, confirm the raw capture fields on a smoke run. For the fastest-rank MoE convention, take the minimum of the fixed-rank medians across rounds and label it in the table.
+
+For a live lib percounter L1 capture with Perfetto export, see
+[Capture percounter L1](percounter-l1.md).
