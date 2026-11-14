@@ -473,6 +473,11 @@ void ChipWorker::init(
             module->optional<CommAllocHostDomainWindowsFn>("comm_alloc_host_domain_windows");
         comm_release_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_release_domain_windows");
         comm_abort_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_abort_domain_windows");
+        comm_register_domain_ccu_fn_ = module->optional<CommRegisterDomainCcuFn>("comm_register_domain_ccu");
+        comm_prepare_ccu_run_set_fn_ = module->optional<CommPrepareCcuRunSetFn>("comm_prepare_ccu_run_set");
+        comm_control_ccu_run_set_fn_ = module->optional<CommControlCcuRunSetFn>("comm_control_ccu_run_set");
+        comm_release_ccu_registration_fn_ =
+            module->optional<CommReleaseCcuRegistrationFn>("comm_release_ccu_registration");
         comm_register_ccu_callable_fn_ = module->optional<CommRegisterCcuCallableFn>("comm_register_ccu_callable");
         comm_prepare_ccu_run_fn_ = module->optional<CommPrepareCcuRunFn>("comm_prepare_ccu_run");
         comm_control_ccu_run_fn_ = module->optional<CommControlCcuRunFn>("comm_control_ccu_run");
@@ -1027,6 +1032,11 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     comm_alloc_host_domain_windows_fn_ = nullptr;
     comm_release_domain_windows_fn_ = nullptr;
     comm_abort_domain_windows_fn_ = nullptr;
+    comm_register_domain_ccu_fn_ = nullptr;
+    comm_prepare_ccu_run_set_fn_ = nullptr;
+    comm_control_ccu_run_set_fn_ = nullptr;
+    comm_release_ccu_registration_fn_ = nullptr;
+    ccu_run_set_dispatches_.clear();
     comm_register_ccu_callable_fn_ = nullptr;
     comm_prepare_ccu_run_fn_ = nullptr;
     comm_control_ccu_run_fn_ = nullptr;
@@ -2990,7 +3000,8 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
 
 uint64_t ChipWorker::register_ccu_callable(
     uint64_t comm_handle, uint64_t collective_id, int32_t callable_id, const std::vector<uint32_t> &rank_ids,
-    uint32_t domain_rank, const simpler::ccu::ExpectedBuildIdentity &expected_identity, uint32_t workspace_mask
+    uint32_t domain_rank, const simpler::ccu::ExpectedBuildIdentity &expected_identity, uint32_t workspace_mask,
+    uint64_t allocation_id, uint32_t ccu_id
 ) {
     require_comm_cleanup_confirmed();
     validate_execution_context();
@@ -3001,15 +3012,72 @@ uint64_t ChipWorker::register_ccu_callable(
     if (found->second.ccu_modules.empty()) throw std::runtime_error("callable has no native CCU modules");
     const auto package = pack_ccu_modules(found->second.ccu_modules);
     uint64_t registration_id = 0;
-    const int rc = comm_register_ccu_callable_fn_(
-        reinterpret_cast<void *>(comm_handle), workspace_mask, collective_id, rank_ids.data(), rank_ids.size(),
-        domain_rank, package.data(), package.size(), expected_identity.sdk.data(), expected_identity.pto_isa.data(),
-        &registration_id
-    );
+    if (ccu_id != UINT32_MAX && !comm_register_domain_ccu_fn_)
+        throw std::runtime_error("runtime has no domain CCU registration backend");
+    const int rc =
+        ccu_id != UINT32_MAX ?
+            comm_register_domain_ccu_fn_(
+                reinterpret_cast<void *>(comm_handle), allocation_id, collective_id, ccu_id, package.data(),
+                package.size(), expected_identity.sdk.data(), expected_identity.pto_isa.data(), &registration_id
+            ) :
+            comm_register_ccu_callable_fn_(
+                reinterpret_cast<void *>(comm_handle), workspace_mask, collective_id, rank_ids.data(), rank_ids.size(),
+                domain_rank, package.data(), package.size(), expected_identity.sdk.data(),
+                expected_identity.pto_isa.data(), &registration_id
+            );
     if (rc == COMM_RECLAMATION_UNCONFIRMED) retain_unconfirmed_ccu_cleanup();
     if (rc != 0 || registration_id == 0)
         throw std::runtime_error("native CCU registration failed with code " + std::to_string(rc));
     return registration_id;
+}
+
+uint64_t ChipWorker::prepare_ccu_run_set(
+    uint64_t comm_handle, const std::vector<uint64_t> &registrations, uint64_t generation, uint64_t dispatch_id
+) {
+    require_comm_cleanup_confirmed();
+    validate_execution_context();
+    if (!comm_prepare_ccu_run_set_fn_) throw std::runtime_error("runtime has no CCU run-set backend");
+    uint64_t id{}, workspace{};
+    const int rc = comm_prepare_ccu_run_set_fn_(
+        reinterpret_cast<void *>(comm_handle), registrations.data(), registrations.size(), generation, &id, &workspace
+    );
+    if (rc == COMM_RECLAMATION_UNCONFIRMED) retain_unconfirmed_ccu_cleanup();
+    if (rc != 0 || id == 0 || workspace == 0)
+        throw std::runtime_error("CCU run-set preparation failed: " + std::to_string(rc));
+    std::lock_guard<std::mutex> guard(ccu_preparation_mu_);
+    prepared_ccu_workspaces_[dispatch_id] = workspace;
+    ccu_run_set_dispatches_[{comm_handle, id}] = dispatch_id;
+    return id;
+}
+
+int ChipWorker::control_ccu_run_set(uint64_t comm_handle, uint64_t id, uint32_t operation) {
+    validate_execution_context();
+    if (!comm_control_ccu_run_set_fn_) throw std::runtime_error("runtime has no CCU run-set backend");
+    if (operation == 1) require_comm_cleanup_confirmed();
+    const auto identity = std::make_tuple(comm_handle, id, UINT64_MAX);
+    const int rc = comm_control_ccu_run_set_fn_(reinterpret_cast<void *>(comm_handle), id, operation);
+    if (operation == 1 && (rc == 0 || rc == COMM_RECLAMATION_UNCONFIRMED)) unstopped_ccu_runs_.insert(identity);
+    if ((operation == 3 || operation == 9) && rc == 0) unstopped_ccu_runs_.erase(identity);
+    if (operation == 7 && rc == 0) {
+        std::lock_guard<std::mutex> guard(ccu_preparation_mu_);
+        const auto found = ccu_run_set_dispatches_.find({comm_handle, id});
+        if (found != ccu_run_set_dispatches_.end()) {
+            prepared_ccu_workspaces_.erase(found->second);
+            ccu_run_set_dispatches_.erase(found);
+        }
+    }
+    if (rc == COMM_RECLAMATION_UNCONFIRMED) retain_unconfirmed_ccu_cleanup();
+    if (rc < 0) throw std::runtime_error("CCU run-set control failed: " + std::to_string(rc));
+    return rc;
+}
+
+void ChipWorker::release_ccu_registration(uint64_t comm_handle, uint64_t id) {
+    require_comm_cleanup_confirmed();
+    validate_execution_context();
+    if (!comm_release_ccu_registration_fn_) throw std::runtime_error("runtime has no CCU release backend");
+    const int rc = comm_release_ccu_registration_fn_(reinterpret_cast<void *>(comm_handle), id);
+    if (rc == COMM_RECLAMATION_UNCONFIRMED) retain_unconfirmed_ccu_cleanup();
+    if (rc != 0) throw std::runtime_error("CCU registration release failed: " + std::to_string(rc));
 }
 
 uint64_t ChipWorker::prepare_ccu_run(
@@ -3044,7 +3112,7 @@ int ChipWorker::control_ccu_run(uint64_t comm_handle, uint64_t allocation_id, ui
     const int result =
         comm_control_ccu_run_fn_(reinterpret_cast<void *>(comm_handle), allocation_id, operation, generation);
     if (operation == 1 && (result == 0 || result == COMM_RECLAMATION_UNCONFIRMED)) unstopped_ccu_runs_.insert(identity);
-    if (operation == 3 && result == 0) unstopped_ccu_runs_.erase(identity);
+    if ((operation == 3 || operation == 9) && result == 0) unstopped_ccu_runs_.erase(identity);
     if (operation == 7 && result == 0) {
         std::lock_guard<std::mutex> guard(ccu_preparation_mu_);
         const auto found = ccu_preparation_keys_.find(identity);

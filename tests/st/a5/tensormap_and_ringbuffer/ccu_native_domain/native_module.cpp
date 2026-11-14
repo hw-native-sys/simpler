@@ -83,6 +83,7 @@ Manifest make_manifest() {
     Manifest result{};
     result.header.struct_size = sizeof(result.header);
     result.header.manifest_size = sizeof(result);
+    result.header.abi_version = SIMPLER_CCU_ABI_VERSION;
     result.header.kernel_record_size = sizeof(result.kernels[0]);
     result.header.kernel_count = 2;
     result.header.kernel_records_offset = offsetof(Manifest, kernels);

@@ -217,3 +217,36 @@ TEST(ChildMemory, MapAndNativeTransfersSurviveMailboxWithoutChangingIdentity) {
         std::invalid_argument
     );
 }
+
+TEST(ChildMemory, CcuBindingsRoundTripWithoutScalarInjection) {
+    TaskArgs args;
+    args.add_scalar(42);
+    args.set_ccu_bindings({{0, 21, 0}, {12, 22, 0}, {12, 23, 7}});
+    std::vector<uint8_t> blob(task_args_blob_size(args));
+    write_blob(blob.data(), args);
+    const auto view = read_blob(blob.data(), blob.size());
+    ASSERT_EQ(view.scalar_count, 1);
+    EXPECT_EQ(view.scalars[0], 42);
+    ASSERT_EQ(view.ccu_binding_count, 3u);
+    EXPECT_EQ(view.ccu_binding(0).allocation_id, 0u);
+    EXPECT_EQ(view.ccu_binding(1).registration_id, 22u);
+    EXPECT_EQ(view.ccu_binding(2).ccu_id, 7u);
+    EXPECT_THROW(view.ccu_binding(3), std::out_of_range);
+    EXPECT_THROW(read_blob(blob.data(), blob.size() - 1), std::runtime_error);
+    blob[4] = 2;
+    EXPECT_THROW(read_blob(blob.data(), blob.size()), std::runtime_error);
+}
+
+TEST(ChildMemory, CcuBindingsCopyAndClearAreIndependent) {
+    TaskArgs original;
+    original.add_scalar(19);
+    original.add_dep(TaskHandle{7, 3});
+    TaskArgs bound = original;
+    bound.set_ccu_bindings({{1, 2, 0}});
+    EXPECT_TRUE(original.ccu_bindings().empty());
+    EXPECT_EQ(bound.explicit_dep_count(), 1);
+    bound.clear();
+    EXPECT_TRUE(bound.ccu_bindings().empty());
+    EXPECT_EQ(original.scalar(0), 19u);
+    EXPECT_THROW(bound.set_ccu_bindings({{1, 0, 0}}), std::invalid_argument);
+}

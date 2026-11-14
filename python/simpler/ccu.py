@@ -14,6 +14,7 @@ import hashlib
 import os
 import platform
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -89,15 +90,14 @@ class ChipCcuRun:
             deadline = time.monotonic() + self.binding.timeout
             while self._control(3):
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        f"CCU exit protocol timed out for registration {self.binding.registration}, "
-                        f"generation {self.generation}. Check the user kernel trigger and exit logic."
-                    )
+                    if self._control(9):
+                        raise RuntimeError("CCU mission stop is unconfirmed")
+                    break
+            self._control(7)
         except BaseException:
             self.abort()
             raise
         self.binding.active = False
-        self._control(7)
 
     def discard(self):
         self._control(7)
@@ -107,4 +107,72 @@ class ChipCcuRun:
         try:
             self._control(4)
         except Exception:
+            pass
+
+
+@dataclass(frozen=True)
+class CcuRegistrationHandle:
+    """A domain-scoped kernel registration on one target chip worker."""
+
+    domain: object
+    owner: object
+    callable_handle: object
+    ccu_id: int
+    worker: int
+    registration_id: int
+    allocation_id: int
+    generation: int
+
+    def require_live(self, owner):
+        self.domain._require_ready()
+        if owner is not self.owner:
+            raise ValueError("CCU registration belongs to a different Worker")
+        if self.domain._ccu_registration_failed:
+            raise RuntimeError("CCU domain registration cleanup is unconfirmed")
+        if (self.domain.allocation_id, self.domain.generation) != (self.allocation_id, self.generation):
+            raise RuntimeError("CCU registration domain generation is stale")
+
+
+class ChipCcuRunSet:
+    """One native execution collection, completed before the FIFO successor."""
+
+    def __init__(self, worker, communicator, registrations, generation, dispatch_id, natural_exit_wait=0.1):
+        self.worker = worker
+        self.communicator = communicator
+        self.natural_exit_wait = natural_exit_wait
+        self.run_set = worker.prepare_ccu_run_set(communicator, registrations, generation, dispatch_id)
+        self.started = False
+
+    def _control(self, operation):
+        return self.worker.control_ccu_run_set(self.communicator, self.run_set, operation)
+
+    def begin(self):
+        self.started = True
+        try:
+            self._control(1)
+        except BaseException as launch_error:
+            try:
+                self.abort()
+            except BaseException as cleanup_error:
+                raise launch_error from cleanup_error
+            raise
+
+    def finish(self):
+        deadline = time.monotonic() + self.natural_exit_wait
+        while self._control(3):
+            if time.monotonic() >= deadline:
+                if self._control(9):
+                    raise RuntimeError("CCU run-set stop is unconfirmed")
+                break
+        self._control(7)
+        self.started = False
+
+    def discard(self):
+        self._control(7)
+
+    def abort(self):
+        try:
+            self._control(4)
+        except Exception:
+            # Native ownership retains unconfirmed resources and closes admission.
             pass

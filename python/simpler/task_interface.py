@@ -1184,6 +1184,10 @@ class CommDomainHandle:
         "memory_source",
         "_host_mappings",
         "_ccu_run_generation",
+        "_ccu_register_fn",
+        "_ccu_registrations",
+        "_ccu_registration_lock",
+        "_ccu_registration_failed",
     )
 
     def __init__(  # noqa: PLR0913 -- preserve the L3 and legacy L4 constructor keywords
@@ -1213,6 +1217,10 @@ class CommDomainHandle:
         self.memory_source = memory_source
         self._host_mappings = []
         self._ccu_run_generation = 0
+        self._ccu_register_fn = None
+        self._ccu_registrations = {}
+        self._ccu_registration_lock = threading.RLock()
+        self._ccu_registration_failed = False
         self.workers = tuple(workers)
         self.contexts: dict[int, ChipDomainContext] = dict(contexts or {})
         self.allocation_id = int(allocation_id)
@@ -1238,6 +1246,17 @@ class CommDomainHandle:
         self._freed = False
         self._ref = ref
         self.requested_window_size = self.mapping_size if requested_window_size is None else int(requested_window_size)
+
+    def get_or_register_ccu(self, callable_handle: CallableHandle, *, ccu_id: int, worker: int):
+        """Register a kernel on a domain member without launching it.
+
+        ``worker`` is the L2 Worker ID used for submission, not a logical domain
+        rank. Repeating the same registration returns the cached handle.
+        """
+        self._require_ready()
+        if self._ccu_register_fn is None:
+            raise RuntimeError("CCU registration requires an owned L3 domain")
+        return self._ccu_register_fn(self, callable_handle, ccu_id=ccu_id, worker=worker)
 
     def __getitem__(self, chip_idx: int) -> ChipDomainContext:
         self._require_live()

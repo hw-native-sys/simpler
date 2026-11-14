@@ -1,7 +1,7 @@
 # Native CCU module and three-Event contract
 
 A `ChipCallable` packages native HCOMM CCU definitions alongside its AIV
-functions. The module owns the communication algorithm and finite control flow;
+functions. The module owns the communication algorithm and request control flow;
 the runtime owns registration, per-execution parameters, Events and completion.
 The C/POD interface is in `src/common/platform_comm/ccu/ccu_native_abi.h`.
 Modules, bindings, runtime libraries and device kernels must be rebuilt together.
@@ -134,8 +134,9 @@ use checked byte offsets from its base. The loader checks lengths, integer
 overflow, table overlap, entry symbols, parameter alignment, capabilities and
 SDK/PTO-ISA build identities. The generated header and runtime validation use
 the same SDK and pinned PTO-ISA header digests.
-The initial interface has no historical layout negotiation or compatibility
-branches. Structure and record sizes validate the single expected layout.
+The manifest declares ABI version 2, with domain-logical channel indexing.
+The loader rejects older versions and incompatible structure sizes. Each kernel
+record declares `required_rank_count`; zero permits a dynamic domain size.
 
 The package preserves exact opaque module bytes. The native loader opens them
 using an executable anonymous Linux memfd (or a private unlinked file in
@@ -152,36 +153,46 @@ mission-index translation or separate instance table.
 
 ## Registration topology
 
-Hardware registration and domain allocation have separate explicit APIs:
 `Worker.register(ChipCallable)` stores definitions without acquiring CCU hardware
-resources. `Worker.register_ccu_callable(handle)` is the explicit hardware
-registration step; it uses the established L3/L2 communication context and does
-not require a communication window. A domain declaring
-`workspace_engines=("ccu",)` only enables W and its access descriptors.
-Registration identity and ownership belong to the callable and the complete
-L3/L2 communication context, independently of W. All L3 chip workers must have
-the definition installed.
-No mission is launched by domain creation or registration.
+resources. Allocate a domain with `workspace_engines=("ccu",)`, then explicitly
+register selected definitions through `domain.get_or_register_ccu(handle, ccu_id=..., worker=...)`.
+Each registration belongs to one target L2 Worker, which must be a domain member.
+Only that Worker needs the callable definition and receives the registration request.
+`worker` is the L2 Worker ID used for submission, not the domain-logical rank.
+The domain caches registrations by target Worker, selected module content, entry and build ABI identity,
+plus the registration configuration. Unrelated modules elsewhere in a callable
+do not change this key. The callable-local `ccu_id` remains registration configuration
+because the native build binding exposes it; the same definition at different
+callable-local IDs therefore has separate registrations until explicit alias routing
+is supported. Repeated calls reuse that domain instance's registration; releasing and recreating the
+domain invalidates the old handles even when its name and members are unchanged.
+Domain creation does not register kernels, and registration does not launch them.
+Complete all cache-miss registrations before the first task submission in an
+orchestration run, following the existing direct-control ordering rule.
 
-Every L3 chip worker prepares channels to all other workers in that context.
-Changing W's members, allocation or lifetime does not create a new registration.
-For example, the same callable serves A={0,1} and B={0,2} with one registration
-at rank 0; releasing A leaves B's registration intact. Each domain still must
-explicitly enable the CCU workspace. An unenabled domain is rejected before
-run preparation or launch. The first version
-supports one selected CCU domain per orchestration run. Its context must appear
-exactly once in each submitted task's scalar arguments. Tensor domain references
-are enrolled before selecting that context. General multi-domain execution in a
-single run is rejected.
+```python
+ag_a = domain_a.get_or_register_ccu(chip, ccu_id=0, worker=rank)
+ag_b = domain_b.get_or_register_ccu(chip, ccu_id=0, worker=rank)
+reduce_b = domain_b.get_or_register_ccu(chip, ccu_id=1, worker=rank)
+orch.submit_next_level(chip, args, config, worker=rank,
+                       ccu_bindings=(ag_a, ag_b, reduce_b))
+```
 
-This whole-context topology implements the author's requested decoupling and
-[YunjiQin's proposal](https://github.com/hw-native-sys/simpler/pull/2986#issuecomment-6769250443).
-It extends the domain-scoped topology accepted by
-[Chao's clarification](https://github.com/hw-native-sys/simpler/pull/2986#issuecomment-6790302878),
-which gates backend initialization on domain enablement. Independent explicit
-registration can initialize the backend before W exists, so that comment does not
-constitute approval of this extension. Issue #2971 still describes domain-scoped
-registration.
+For a group, provide a dictionary from submitted Worker ID to that Worker's
+registration sequence. Every submitted Worker must have an entry; an empty
+sequence means no local CCU missions. Each binding must belong to a live domain
+and must have been registered on the submitted Worker. Algorithms,
+not the runtime, determine whether all domain members need to issue requests.
+The runtime does not infer bindings from scalar arguments. Multiple domain
+contexts and repeated occurrences of the same context are allowed.
+
+Bindings select `(domain, ccu_id)` directly, with no separate device slot space.
+Conflicting definitions at the same domain and ID are rejected. A registration
+referenced more than once in a submission produces one mission execution.
+An explicitly acknowledged, clean registration failure permits retry. An unknown
+registration outcome poisons the domain to prevent unsafe reuse. The backend uses
+a single-member registration communicator for local program resources while
+retaining the full domain channel table and logical rank in the kernel binding.
 
 The native definition must not throw and has this signature:
 
@@ -190,13 +201,13 @@ int32_t entry(const SimplerCcuRegistrationBinding *binding);
 ```
 
 Query and registration receive the same one-element array `{&binding}`.
-The Host binding contains communication-context rank and size, callable-local `ccu_id`,
-a channel table indexed by L2 rank, and three distinct opaque Event handles:
+The Host binding contains domain-logical rank and size, callable-local `ccu_id`,
+a channel table indexed by domain-logical rank, and three distinct opaque Event handles:
 ready, trigger and done. Self and unused channel entries are zero. Each Event
 uses bit 0. SDK handles are not device addresses.
 
-The base communicator uses the ordered L2 ranks 0..N-1; registration validates
-that complete order. A domain may use a reordered subset of those ranks.
+Domain member order determines logical rank: `[0, 2]` and `[2, 0]` have
+different channel orders. The base communicator mapping remains internal.
 The current backend supports at most 64 ranks and one common IO die per
 registration. Missing links, unsupported die placement or insufficient HCOMM
 resources fail explicitly; the backend must not silently substitute a ring.
@@ -229,9 +240,9 @@ AIV resolves `comm_ctx -> workspaces[CCU] -> controls[ccu_id]` with size,
 alignment, bounds and generation checks. The typed
 `submit_ccu_mission(async_ctx, comm_ctx, ccu_id, call_args)` takes positional
 `CcuCallArg` values. A window reference expands to two words: owner address
-plus byte offset, and the W token. A scalar expands to one word; a peer-rank
-reference resolves the domain rank through the W descriptor's actual L2 rank,
-which indexes the complete channel table. References are checked before
+plus byte offset, and the W token. A scalar expands to one word. Peer indices
+are ordinary scalar domain-logical ranks; the kernel or generated code must
+ensure they are within the channel table bounds. References are checked before
 completion admission or parameter publication. The native module declares
 the expanded parameter size and consumes these words in the same order.
 
@@ -255,8 +266,9 @@ lifetimes and are not interchangeable.
 
 The existing L2 transaction admits activation only after the predecessor's
 ordinary work, asynchronous completion records and CCU streams have retired.
-Activation resets and confirms local Events, launches the callable's missions,
-and publishes that run's controls to the selected CCU domain workspace. The
+Activation resets and confirms local Events, launches the locally selected
+missions, and publishes each domain's sparse `ccu_id` control table. Missing
+entries fail device lookup. All selected missions belong to one execution collection. The
 prepared run's workspace is also passed directly into its AICPU runtime image.
 Preparing a successor does not change that pointer.
 
@@ -281,21 +293,37 @@ Modules declare the THREE_EVENTS capability and the two launch words above.
    done with output visibility. It can then wait for another request or return.
 3. AICPU waits for ordinary task completion and done, clears and confirms done,
    and retires the asynchronous condition before releasing dependent tasks.
-4. Users arrange normal termination through an ordinary submission, including
-   for a mission with no business work. Its user-defined exit request publishes
-   the same done Event before returning.
-5. At L2 END, Host confirms all mission streams have terminated before releasing
-   execution credit and P. Domain roots no longer reference the retired controls.
+4. At L2 END, Host finishes the execution collection only after all asynchronous
+   requests have completed and every associated mission has confirmed termination.
+5. Host allows a bounded natural-exit wait after L2 completion. If a mission
+   remains resident, `stop_completed_stream` calls `aclrtStreamAbort`, then
+   requires a successful `aclrtStreamQuery` reporting `COMPLETE`. Only confirmed
+   termination permits releasing this run's parameters and controls. Expected
+   shutdown does not turn successful request execution into an error.
 
-A pending stream after done can complete normally within the Host wait budget.
-If the stream stays active, Host reports an exit-protocol timeout and aborts
-the run. A missing trigger or done instead expires the L2 execution timeout
-and reaches the same abort path through execution failure. Stream query errors
-retain their device error in platform diagnostics. Unconfirmed termination
-closes admission and retains modules, Events, P, W and streams. A prepared
-successor cannot activate or reset its predecessor's Events.
+Each L2 communication owner keeps a pool of ordinary CCU mission streams.
+Registration creates the kernel program and Events; activation borrows one stream
+per unique mission, creating more only when the idle pool is exhausted. Streams
+return to the pool after confirmed termination, retain their identities between
+runs, and are destroyed during L2 finalization after the registration
+communicators and their HCOMM threads are released. Each registration caches its
+HCOMM thread binding for each pool slot it uses. A new launch checks the borrowed
+stream is complete; it does not register the kernel again.
+
+`aclrtStreamAbort` does not destroy a stream. The Ascend 950 runtime
+[implementation](https://github.com/hicann/runtime/blob/8f16f26e162fd995ceb36c7c51d4c65414cc3063/src/runtime/core/src/stream/stream.cc#L1291)
+waits for device abort completion, clears task resources and queues, then restores
+normal stream state. The HCOMM backend additionally checks the returned stream
+state. No common cross-rank mission-stop barrier is introduced; the algorithm
+must make its request completion safe before the local L2 execution ends.
+
+A missing trigger or done is an execution failure, not an expected shutdown.
+Stream query errors retain their device error in platform diagnostics.
+Unconfirmed termination closes admission and retains modules, Events, P, W and
+streams. A prepared successor cannot activate or reset its predecessor's Events.
 
 Users serialize requests to a single mission through full asynchronous task
-completion before publishing new parameters. Independent missions can execute
+completion before publishing new parameters. The runtime does not automatically queue competing requests to one mission and
+does not currently promise to detect violations. Independent missions can execute
 concurrently. The first version uses three Events and one parameter slot per
 mission.

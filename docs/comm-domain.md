@@ -661,39 +661,43 @@ Scalars expand to one word. The native kernel declares the resulting byte size i
 its manifest. Runtime publishes those words to P; the user never supplies W
 tokens. P's launch token remains independent. Native kernels consume the ordered
 words and issue their own CCU instructions. Channel selection remains separate
-from window resolution. A peer-rank argument starts with a domain rank and
-resolves it through the window table to the actual L2 rank. The native binding
-supplies channels to every L3 peer, indexed by that L2 rank.
+from window resolution. Peer ranks are ordinary scalars in domain-logical order.
+The kernel must validate or guarantee their range before indexing channels.
 
-There are no CCU-specific top-level context fields. Domain creation only allocates communication
-resources. A `ChipCallable` carries its CCU modules alongside its AIV children;
-`Worker.register` saves their definitions. `Worker.register_ccu_callable(handle)`
-explicitly registers the callable with HCOMM before any W allocation, using the
-established L3/L2 communication context. `allocate_domain` with
-`workspace_engines=("ccu",)` prepares W and its token descriptors without selecting,
-registering or launching a callable.
-HCOMM registration belongs to the callable and the full L3/L2 communication
-context, without launching work. Changing a window domain's members or releasing
-its storage does not recreate or destroy that registration;
-every allocation must still explicitly enable CCU. An unenabled domain rejects
-CCU submissions before preparation or launch. SDK and ISA build identities are checked internally. Each L2 execution
-launches CCU; its AICPU initializer consumes local READY before admitting AIV work.
-The runtime adds no cross-rank READY barrier.
-Device submission selects `controls[ccu_id]`, where `ccu_id` is the position in
-the L2 callable's kernel list, without an extra instance table or ID scan.
-The AICPU observes and clears each done Event before releasing
-dependent tasks. Finite programs return normally; completed mission streams are
-required before publishing execution completion. After ordinary tasks and their
-async completions retire, runtime sends an explicit EXIT command to unsubmitted
-kernels; the runtime gate skips their business instructions. Submitted kernels
-are never triggered again during stop. Unconfirmed stop
-closes admission and retains domain resources. Borrowing a retained domain alone
-does not launch CCU. The first version permits one selected CCU domain in each
-orchestration run. Prepare B may overlap run A with separate P
-and descriptors; Event reset, domain-root publication and launch B wait for A's
-ordinary work, asynchronous completions and CCU streams to retire. See
-[the native CCU contract](design/ccu-native-abi.md) for the three-Event interface
-and the explicit domain enablement and registration boundaries.
+A `ChipCallable` stores CCU definitions alongside its AIV children. Domain creation
+prepares communication resources without registering or launching a kernel.
+`domain.get_or_register_ccu(handle, ccu_id=..., worker=...)` registers a selected
+definition only on the target domain member and caches it for that Worker and
+domain allocation. Repeating the same request returns the same registration.
+Other domain members need not register or launch that kernel; all domain channels
+remain available in logical rank order. Recreating the same
+named domain produces new registrations. Definition changes cannot reuse a stale
+registration.
+
+Submit explicitly supplies `ccu_bindings`, either a sequence of registration
+handles or, for a group, a worker-to-sequence dictionary. Bindings describe each
+rank's actual missions; the algorithm determines which ranks must issue requests.
+Repeated scalar contexts and multiple domains are permitted. The device API stays
+`submit_ccu_mission(async_ctx, comm_ctx, ccu_id, args)` and resolves the selected
+mission through the domain workspace. No independent execution or slot argument
+is added. Duplicate references to one registration launch one mission.
+
+Prepare creates private per-run parameters and controls. Existing L3 group dispatch,
+run FIFO and L2 activation ordering govern publication and launch; a successor
+cannot overwrite active controls. Every associated mission must finish cleanup
+before execution completion is published. The runtime adds no cross-rank stop
+barrier. Users/PyPTO serialize requests to one mission through asynchronous task
+completion; runtime does not queue conflicting requests or guarantee to detect them.
+
+CCU mission streams are created lazily at L2 activation and retained in a pool.
+After AICPU/AICore and tracked requests complete, Host waits briefly for mission
+exit, then aborts remaining missions and confirms their streams are complete.
+Confirmed cleanup preserves successful execution and returns streams to the pool;
+failed confirmation retains resources and reports failure. L2 finalization
+releases the pool after HCOMM registration resources.
+
+See [the native CCU contract](design/ccu-native-abi.md) for ABI versioning,
+registration ownership and stream-stop confirmation.
 
 All runtime libraries, bindings, communication-context producers and compiled
 kernels must come from the same simpler build and be updated together. This

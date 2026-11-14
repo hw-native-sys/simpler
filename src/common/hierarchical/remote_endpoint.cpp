@@ -1260,6 +1260,8 @@ remote_l3::TaskPayloadWire RemoteL3Endpoint::build_task_payload(const TaskSlotSt
     payload.config = slot.config;
 
     const TaskArgs &a = slot.args(group_index);
+    if (!a.ccu_bindings().empty())
+        throw std::invalid_argument("CCU bindings are local L3-to-CHIP metadata, not remote L3 arguments");
     const RemoteTaskArgsSidecar &sidecar = slot.remote_sidecar_for(group_index);
     if (!sidecar.tensors.empty() && sidecar.tensors.size() != static_cast<size_t>(a.tensor_count())) {
         throw std::runtime_error(

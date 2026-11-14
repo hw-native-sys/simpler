@@ -162,6 +162,8 @@ NativeModule::load(std::vector<uint8_t> module_bytes, const ExpectedBuildIdentit
     if (manifest->struct_size != sizeof(SimplerCcuModuleManifest) ||
         manifest->kernel_record_size != sizeof(SimplerCcuKernelRecord))
         fail("invalid manifest or kernel record size");
+    if (manifest->abi_version != SIMPLER_CCU_ABI_VERSION || manifest->reserved != 0)
+        fail("unsupported domain-rank ABI version");
     if (manifest->manifest_size < sizeof(SimplerCcuModuleManifest) || manifest->manifest_size > kMaxManifestSize ||
         manifest->kernel_count == 0 || manifest->kernel_count > kMaxKernelCount || manifest->capability_flags != 0)
         fail("invalid manifest fields");
@@ -201,7 +203,8 @@ NativeModule::load(std::vector<uint8_t> module_bytes, const ExpectedBuildIdentit
             record.capability_flags != SIMPLER_CCU_KERNEL_CAP_MASK ||
             record.registration_binding_size != sizeof(SimplerCcuRegistrationBinding) ||
             record.registration_argument_count != SIMPLER_CCU_REGISTRATION_ARGUMENT_COUNT ||
-            record.task_argument_count != SIMPLER_CCU_TASK_ARGUMENT_COUNT)
+            record.task_argument_count != SIMPLER_CCU_TASK_ARGUMENT_COUNT ||
+            record.required_rank_count > SIMPLER_CCU_MAX_RANKS || record.reserved != 0)
             fail("invalid kernel ID, parameter, capability, or argument size");
         const uint64_t entry_end = static_cast<uint64_t>(record.entry_symbol_offset) + record.entry_symbol_size;
         if (record.entry_symbol_size == 0 || record.entry_symbol_size > kMaxEntrySymbolSize ||
@@ -250,6 +253,29 @@ void NativeModuleCache::prune_expired() {
         if (it->second.expired()) it = modules_.erase(it);
         else ++it;
     }
+}
+
+NativeModuleCache &native_module_cache() {
+    static NativeModuleCache cache;
+    return cache;
+}
+
+NativeKernelSelection select_native_kernel(
+    const std::vector<std::vector<uint8_t>> &modules, uint32_t ccu_id, const ExpectedBuildIdentity &expected_identity,
+    NativeModuleCache &cache
+) {
+    size_t remaining = ccu_id;
+    for (const auto &bytes : modules) {
+        auto module = cache.load(bytes, expected_identity);
+        if (remaining >= module->kernels().size()) {
+            remaining -= module->kernels().size();
+            continue;
+        }
+        NativeKernelSelection selected{module, static_cast<uint32_t>(remaining), module->cache_identity()};
+        append_bytes(selected.cache_identity, &selected.kernel_index, sizeof(selected.kernel_index));
+        return selected;
+    }
+    throw std::invalid_argument("CCU definition ID is out of range");
 }
 
 }  // namespace simpler::ccu

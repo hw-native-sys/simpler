@@ -326,13 +326,15 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def submit_next_level(
-        self, callable_handle: Any, args: TaskArgs, config: CallConfig | None = None, *, worker: int
+        self, callable_handle: Any, args: TaskArgs, config: CallConfig | None = None, *, worker: int, ccu_bindings=None
     ) -> TaskHandle:
         """Submit a NEXT_LEVEL task by registered callable handle.
 
         ``callable_handle`` must be returned by ``Worker.register``. Tags inside ``args`` drive deps.
         ``worker`` is the exact stable NEXT_LEVEL worker id that runs the
         task. For L3 chip dispatch, these are the existing chip worker ids.
+        ``ccu_bindings`` is a sequence of domain registration handles used by this rank.
+        Bindings are explicit; scalar arguments do not select a communication domain.
         Returns an opaque ``TaskHandle`` accepted by ``TaskArgs.add_dep`` or
         ``TaskArgs.add_dep_wait`` during the same orchestration run.
         """
@@ -351,6 +353,8 @@ class Orchestrator:
             worker=self._worker,
             expected_namespace=expected_namespace,
         )
+        if ccu_bindings is not None and target_namespace != "LOCAL_CHIP":
+            raise ValueError("ccu_bindings require a local CHIP submission")
         if target_namespace != "REMOTE_TASK_DISPATCHER" and self._worker is not None:
             self._worker._require_local_next_level_target(cpp_worker_id, api="submit_next_level")
         c_args, explicit_remote_sidecar = _split_next_level_args(args)
@@ -365,7 +369,9 @@ class Orchestrator:
         _validate_remote_sidecar_access(c_args, remote_sidecar)
         worker = self._worker
         if worker is not None and target_namespace == "LOCAL_CHIP":
-            worker._prepare_ccu_submission(callable_handle, [cpp_worker_id], [c_args])
+            c_args = worker._prepare_ccu_submission(
+                callable_handle, [cpp_worker_id], [c_args], ccu_bindings=ccu_bindings
+            )[0]
         if worker is not None:
             worker._acquire_child_host_args(c_args, cpp_worker_id, device_target=target_namespace == "LOCAL_CHIP")
         # Provenance validation precedes run ownership publication. Once a remote
@@ -395,6 +401,7 @@ class Orchestrator:
         config: CallConfig | None = None,
         *,
         workers: list,
+        ccu_bindings=None,
     ) -> TaskHandle:
         """Submit a group of NEXT_LEVEL tasks (N TaskArgs → N worker selections, 1 DAG node).
 
@@ -404,6 +411,9 @@ class Orchestrator:
         ``args_list`` becomes one per-rank mailbox request: MPI rank
         ``workers[i]`` executes only ``args_list[i]``. A single worker id remains
         directed and is never silently widened to the whole group.
+        ``ccu_bindings`` is either a common sequence of domain registration handles or
+        a mapping from every submitted worker id to its own sequence (possibly empty).
+        Only listed missions launch; algorithm participation is the caller's responsibility.
         Returns one opaque ``TaskHandle`` for the group DAG node.
         """
         _check_domain_initializer_context(self._worker, "Orchestrator.submit_next_level_group")
@@ -440,6 +450,8 @@ class Orchestrator:
             worker=self._worker,
             expected_namespace=expected_namespace,
         )
+        if ccu_bindings is not None and target_namespace != "LOCAL_CHIP":
+            raise ValueError("ccu_bindings require a local CHIP submission")
         if target_namespace != "REMOTE_TASK_DISPATCHER" and self._worker is not None:
             for worker_id in worker_ids:
                 self._worker._require_local_next_level_target(worker_id, api="submit_next_level_group")
@@ -478,7 +490,9 @@ class Orchestrator:
         # Run this fallible analysis before publishing remote-ref ownership.
         worker = self._worker
         if worker is not None and target_namespace == "LOCAL_CHIP":
-            worker._prepare_ccu_submission(callable_handle, worker_ids, c_args_list)
+            c_args_list = worker._prepare_ccu_submission(
+                callable_handle, worker_ids, c_args_list, ccu_bindings=ccu_bindings
+            )
         member_checks: list[tuple[int, TaskArgs]] = []
         if worker is not None:
             for g, c_args in enumerate(c_args_list):

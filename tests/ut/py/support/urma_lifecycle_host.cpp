@@ -20,6 +20,21 @@
 #include "comm_hccl.cpp"
 
 namespace simpler::ccu {
+// URMA owns no CCU resources; retained host teardown paths still reference these APIs.
+bool HcommMissionStreamPool::close() {
+    assert(entries_.empty());
+    closed_ = true;
+    return true;
+}
+bool HcommDomainChannels::close() {
+    assert(communicator == nullptr);
+    return true;
+}
+void create_hcomm_domain_channels(
+    HcclComm, uint64_t, const std::vector<uint32_t> &, uint32_t, std::shared_ptr<HcommDomainChannels> &
+) {
+    assert(false && "URMA-only fixture must not create CCU channels");
+}
 bool query_window_token(uint64_t, uint64_t, uint64_t &) {
     assert(false && "URMA-only fixture must not query CCU tokens");
     return false;

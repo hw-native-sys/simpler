@@ -96,7 +96,7 @@ TEST(CcuNativeModuleTest, DistinctLiveModulesExecuteTheirOwnExactBytes) {
 }
 
 TEST(CcuNativeModuleTest, RejectsSizeKernelAndEntryViolations) {
-    for (int variant = 1; variant <= 15; ++variant) {
+    for (int variant = 1; variant <= 18; ++variant) {
         simpler_ccu_test_manifest_variant = variant;
         EXPECT_THROW(simpler::ccu::NativeModule::load(module_bytes(), expected_identity()), std::invalid_argument)
             << "variant=" << variant;
@@ -136,4 +136,33 @@ TEST(CcuNativeAbiTest, PinsRegistrationAndLaunchWordContracts) {
     ASSERT_EQ(sizeof(arguments) / sizeof(words[0]), SIMPLER_CCU_TASK_ARGUMENT_COUNT);
     EXPECT_EQ(words[0], 20U);
     EXPECT_EQ(words[1], 30U);
+}
+
+TEST(CcuNativeModuleTest, SelectedDefinitionIdentityIgnoresUnrelatedModules) {
+    simpler_ccu_test_manifest_variant = 0;
+    const auto bytes = module_bytes();
+    std::ifstream input(CCU_TEST_OTHER_MODULE_PATH, std::ios::binary);
+    const std::vector<uint8_t> other{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    ASSERT_FALSE(other.empty());
+    simpler::ccu::NativeModuleCache cache;
+    const auto first = simpler::ccu::select_native_kernel({bytes, bytes}, 1, expected_identity(), cache);
+    const auto changed = simpler::ccu::select_native_kernel({bytes, other}, 1, expected_identity(), cache);
+    EXPECT_EQ(first.cache_identity, changed.cache_identity);
+    EXPECT_EQ(first.module, changed.module);
+    EXPECT_EQ(first.kernel_index, 1U);
+    const auto different_entry = simpler::ccu::select_native_kernel({bytes}, 0, expected_identity(), cache);
+    EXPECT_NE(first.cache_identity, different_entry.cache_identity);
+    const auto different_bytes = simpler::ccu::select_native_kernel({other}, 1, expected_identity(), cache);
+    EXPECT_NE(first.cache_identity, different_bytes.cache_identity);
+}
+
+TEST(CcuNativeModuleTest, DefinitionIdentityIsIndependentOfCallablePosition) {
+    simpler_ccu_test_manifest_variant = 0;
+    const auto bytes = module_bytes();
+    simpler::ccu::NativeModuleCache cache;
+    const auto first = simpler::ccu::select_native_kernel({bytes}, 0, expected_identity(), cache);
+    const auto shifted = simpler::ccu::select_native_kernel({bytes, bytes}, 2, expected_identity(), cache);
+    EXPECT_EQ(first.cache_identity, shifted.cache_identity);
+    EXPECT_EQ(first.module, shifted.module);
+    EXPECT_THROW(simpler::ccu::select_native_kernel({bytes}, 2, expected_identity(), cache), std::invalid_argument);
 }

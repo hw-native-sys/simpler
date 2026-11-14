@@ -48,6 +48,7 @@ struct ReadyFixture {
         workspace.controls_addr = reinterpret_cast<uint64_t>(controls);
         workspace.control_size = sizeof(controls[0]);
         for (uint32_t i = 0; i < 2; ++i) {
+            controls[i].struct_size = sizeof(controls[i]);
             controls[i].ccu_id = i;
             controls[i].run_generation = 7;
             controls[i].ready = {reinterpret_cast<uint64_t>(&events[i]), 1};
