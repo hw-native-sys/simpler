@@ -32,7 +32,7 @@
 // A task's three records share one ChipTaskStorage, so AICore reaches both the
 // ones it reads from a single base: the array strides by the storage, and each
 // record sits at a fixed offset inside it. These are literals because the AICore
-// .o cannot include runtime_types.h; scheduler.h checks them against the types at
+// .o cannot include runtime_types.h; runtime_maker.cpp checks them against the types at
 // compile time, and the contract UT again at run time.
 inline constexpr uint32_t SCHEDULER_GRAPH_TASK_STORAGE_STRIDE = 320;
 inline constexpr uint32_t SCHEDULER_GRAPH_DESCRIPTOR_OFFSET = 0;

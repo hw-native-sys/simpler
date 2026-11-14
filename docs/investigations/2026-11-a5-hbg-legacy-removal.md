@@ -111,6 +111,21 @@ No local CPU/simulator functional tests were run. Workload compilation was warme
 outside allocations; plain probes also invoke the compiler cache from their test
 entry points. No size or latency gain is inferred from source deletion.
 
+## AICPU dispatch scaffolding and build dependencies
+
+After #3076, A5's scheduler types contain only the resident wire contracts and
+shared watchdog budget. The unused AICPU CoreTracker/CoreExecState, slot events,
+sync-start drain state, dispatch counters and profiling macros are removed.
+The CoreTracker regression belongs to A2A3's active AICPU dispatcher; current A5
+MIX/admission tests continue to cover resident placement.
+
+The default A5 AICPU build excludes the common GraphExecution materializer:
+Host builds the native Graph plan, and AICore workers bind its instance arguments.
+Percounter still compiles that materializer for its AICPU Graph preparation;
+A2A3/WSE retain their existing selection. Argument dumping still reads the common
+task image. This cleanup does not change the 320-byte task storage, resident
+ready/control queues, worker slots, async completion or shutdown contracts.
+
 ## Execution-removal validation on 2026-11-13
 
 Compilation and workload preparation took place before device allocation. All

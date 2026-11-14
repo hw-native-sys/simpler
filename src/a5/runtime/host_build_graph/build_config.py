@@ -49,7 +49,6 @@ BUILD_CONFIG = {
         "source_dirs": [
             "aicpu",
             "runtime",
-            f"{SHARED}/device",
             f"{SHARED}/shared",
         ],
     },

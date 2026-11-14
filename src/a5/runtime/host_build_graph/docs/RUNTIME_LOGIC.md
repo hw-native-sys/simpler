@@ -18,6 +18,8 @@ host: collect outputs and destroy/reset per-run state
 
 The device has no orchestration thread. The resident scheduler runs on the discovered
 AIC/AIV workers; AICPU initializes, monitors, and tears down the workers.
+The AICPU build contains no AICPU dispatch state or GraphExecution materializer.
+Percounter selects the common materializer separately for its Graph preparation.
 
 Supported Graph tasks use the resident scheduler. The host builds a separate
 native scheduler image containing ENTER, child, and EXIT nodes, shared immutable
