@@ -808,6 +808,11 @@ def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkey
             self.configured_pending_depths.append(int(pending_depth))
             self.configured_launch_depths.append(int(launch_depth))
 
+        def _map_mailbox(self, fd: int, extent: int) -> int:
+            shm = next(shm for shm in worker._chip_shms if shm._fd == fd)
+            assert _mailbox_extent(shm) == extent
+            return _mailbox_addr(shm)
+
         def add_next_level_worker(self, mailbox_addr: int, mailbox_bytes: int, pid: int, granted_sets: int) -> None:
             self.next_level_calls.append((int(mailbox_addr), int(mailbox_bytes), int(pid), int(granted_sets)))
 
@@ -919,6 +924,11 @@ def test_start_hierarchical_seeds_the_logger_when_the_process_owns_no_chips(monk
             self, depth: int, pending_depth: int = 0, launch_depth: int = 1, initial_admission_depth: int = 0
         ) -> None:
             self.configured = (depth, pending_depth, launch_depth, initial_admission_depth)
+
+        def _map_mailbox(self, fd: int, extent: int) -> int:
+            shm = next(shm for shm in worker._sub_shms if shm._fd == fd)
+            assert _mailbox_extent(shm) == extent
+            return _mailbox_addr(shm)
 
         def add_sub_worker(self, _mailbox_addr: int, _mailbox_bytes: int, pid: int) -> None:
             self.sub_workers.append(pid)

@@ -541,6 +541,13 @@ inline void bind_worker(nb::module_ &m) {
         )
         .def("_shared_heap_fds", &Worker::shared_heap_fds)
         .def(
+            "_map_mailbox",
+            [](Worker &self, int fd, size_t bytes) {
+                return reinterpret_cast<uint64_t>(self.map_mailbox(fd, bytes));
+            },
+            nb::arg("fd"), nb::arg("bytes"), "Own a shared mailbox mapping until native Worker destruction."
+        )
+        .def(
             nb::init<int32_t, uint64_t>(), nb::arg("level"), nb::arg("heap_ring_size") = DEFAULT_HEAP_RING_SIZE,
             "Create a Worker for the given hierarchy level (3=L3, 4=L4, …). "
             "`heap_ring_size` selects the per-ring MAP_SHARED heap mmap'd in the ctor "
