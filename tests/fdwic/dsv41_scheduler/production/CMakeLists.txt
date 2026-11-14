@@ -58,7 +58,7 @@ set(ORCH_INCLUDES
     ${SIMPLER_ROOT}/src/a5/platform/include
 )
 add_library(orch-support OBJECT
-    ${COMMON}/host_build_graph/shared/assert_support.cpp
+    ${COMMON}/host_build_graph/shared/assert/assert_support.cpp
     ${COMMON}/log/host_log.cpp
     ${COMMON}/log/unified_log_host.cpp
 )

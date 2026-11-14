@@ -154,7 +154,14 @@ Host 参数绑定及 metadata 上传在启动前完成，仍需单列成本；
 设备总收益由当前实现的完整 L0 对照判断。
 该候选仍待功能和性能验证，不引入跨调度轮持有的物化锁。
 
-当前复用公共 Graph 已预留的 execution tail 作为参数 backing。
-**不写 `ChipTaskStorage` 不等于不预留这段 heap**；实际内存节省必须在后续 allocator 改造后单独证明。
+当前默认 A5 HBG 的实例 tail 按实际参数计算：每个 child 的 tensor、scalar 区间分别向 64 B 对齐，
+存在 predicate 时额外预留 64 B。没有参数的 child 不增加 tail；不再为原本的 GraphExecution task、slot、
+fanin 或状态数组预留空间。Host 在 Definition 完成时计算一次并缓存 reservation；提交实例和 bind 校验
+使用同一算法。`required_heap` 仍是业务输出区，与参数 tail 相加并检查溢出及实例边界。
+公共 Definition 的 `execution_storage_bytes` 继续描述 A2A3/WSE/percounter 的 GraphExecution 布局；
+默认 HBG 不以它分配或校验 native 参数 backing。每个 runtime 在编译时选择自己的预算策略。
+Host 验证路径共用 Definition/CSR/参数合法性检查；percounter 不再构建不用的 native children、sink、
+ENTER/EXIT 映射和只读 resident 图副本。默认 HBG 任务镜像为 64 B 首错头、80 B/task 记录及实用参数池。
+Host 编排的完整 scratch 不上传；执行与 dump 消费者均读取当前格式。
 当前 resident 的 384-byte task control 和按 block/lane 放大的 trace 存储必须纳入预算。
 验收同时报告 Host bind、首任务延迟、设备总时间、尾延迟、初始化/H2D 字节和峰值内存。

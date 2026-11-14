@@ -20,7 +20,8 @@
 
 #include "args_dump_service.h"
 #include "aicpu/device_run_result_base_aicpu.h"
-#include "runtime_types.h"
+#include "task_image_types.h"
+#include "host_build_graph/tensor.h"
 
 namespace {
 std::function<void(const void *, size_t)> observe_invalidation;
@@ -137,11 +138,11 @@ protected:
     std::array<std::unique_ptr<DumpMetaBuffer>, 2> metadata;
     std::array<std::vector<uint8_t>, 2> arenas;
     struct GraphImage {
-        std::array<ChipTaskStorage, 2> storage{};
+        std::array<TaskImageStorage, 2> storage{};
         std::array<std::array<simpler::hbg::Tensor, 2>, 2> tensors{};
         std::array<std::array<uint64_t, 1>, 2> scalars{};
     } graph_image;
-    std::array<ChipTaskStorage, 2> &storage = graph_image.storage;
+    std::array<TaskImageStorage, 2> &storage = graph_image.storage;
     std::array<std::array<simpler::hbg::Tensor, 2>, 2> &tensors = graph_image.tensors;
     std::vector<uint32_t> input, output;
     std::vector<uint8_t> callable_storage;

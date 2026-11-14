@@ -31,7 +31,7 @@
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/device_time.h"
 #include "host_build_graph/runtime_status.h"
-#include "host_build_graph/shared_memory.h"
+#include "task_image_status.h"
 #include "runtime.h"
 #include "scheduler/scheduler_types.h"
 #include "scheduler/scheduler_task_catalog.h"
@@ -232,10 +232,8 @@ static void record_resident_timeout(Runtime *runtime, SchedulerErrorSite error_s
         }
     }
     if (runtime != nullptr && runtime->get_gm_sm_ptr() != nullptr) {
-        auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
-        (void)latch_aicore_scheduler_runtime_error(
-            &header->sched_error_code, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT)
-        );
+        auto *error_code = task_image_error_code(runtime->get_gm_sm_ptr());
+        (void)latch_aicore_scheduler_runtime_error(error_code, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT));
     }
     LOG_ERROR("A5 HBG AICore Scheduler timeout site=%" PRIu64, static_cast<uint64_t>(error_site));
 }
@@ -253,14 +251,14 @@ static void join_initialization_phase(Runtime *runtime, Predicate predicate, std
 
 static int32_t read_runtime_status(Runtime *runtime) {
     if (runtime == nullptr || runtime->get_gm_sm_ptr() == nullptr) return 0;
-    auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
-    int32_t sched_error_code = header->sched_error_code.load(std::memory_order_acquire);
+    auto *error_code = task_image_error_code(runtime->get_gm_sm_ptr());
+    int32_t sched_error_code = error_code->load(std::memory_order_acquire);
     return runtime_status_from_error_code(sched_error_code);
 }
 
 static int32_t publish_aicore_scheduler_runtime_error(Runtime *runtime, const char *phase = nullptr) {
     if (runtime == nullptr || runtime->get_gm_sm_ptr() == nullptr) return 0;
-    auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
+    auto *error_code = task_image_error_code(runtime->get_gm_sm_ptr());
     SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
     SchedulerRunControl *run_control = nullptr;
     if (context != nullptr) {
@@ -270,7 +268,7 @@ static int32_t publish_aicore_scheduler_runtime_error(Runtime *runtime, const ch
         log_aicore_scheduler_error_identity(run_control, phase);
         if (std::strcmp(phase, "execution") == 0) log_aicore_prepared_error(context, run_control);
     }
-    return settle_aicore_runtime_status(run_control, &header->sched_error_code);
+    return settle_aicore_runtime_status(run_control, error_code);
 }
 
 static void publish_aicore_task_timing(Runtime *runtime) {
@@ -328,9 +326,9 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         if (callback < 0) callback = hs_thread_seq_.fetch_add(1, std::memory_order_acq_rel);
         if (callback == 0) {
             if (runtime->get_gm_sm_ptr() != nullptr) {
-                auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
+                auto *error_code = task_image_error_code(runtime->get_gm_sm_ptr());
                 (void)latch_aicore_scheduler_runtime_error(
-                    &header->sched_error_code, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS)
+                    error_code, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS)
                 );
             }
             const int32_t shutdown_rc =
@@ -421,9 +419,9 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         if (aicore_lifecycle_.validate_discovery() != 0 || !schedules_on_aicore(runtime)) {
             LOG_ERROR("A5 HBG: invalid scheduler bootstrap");
             if (runtime->get_gm_sm_ptr() != nullptr) {
-                auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
+                auto *error_code = task_image_error_code(runtime->get_gm_sm_ptr());
                 (void)latch_aicore_scheduler_runtime_error(
-                    &header->sched_error_code, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS)
+                    error_code, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS)
                 );
             }
             init_failed_.store(true, std::memory_order_release);
@@ -527,9 +525,9 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
 int32_t AicpuExecutor::finish_failed_init(Runtime *runtime, int32_t shutdown_rc) {
     if (schedules_on_aicore(runtime)) (void)settle_run_error(runtime);
     if (runtime->get_gm_sm_ptr() != nullptr) {
-        auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
+        auto *error_code = task_image_error_code(runtime->get_gm_sm_ptr());
         (void)latch_aicore_scheduler_runtime_error(
-            &header->sched_error_code, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS)
+            error_code, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS)
         );
     }
     const int32_t header_status = read_runtime_status(runtime);

@@ -19,7 +19,7 @@
 #include "scheduler_types.h"
 
 inline constexpr uint32_t SCHEDULER_NATIVE_GRAPH_MAGIC = 0x35474248;
-inline constexpr uint32_t SCHEDULER_NATIVE_GRAPH_VERSION = 3;
+inline constexpr uint32_t SCHEDULER_NATIVE_GRAPH_VERSION = 4;
 inline constexpr uint32_t SCHEDULER_NATIVE_NO_INSTANCE = UINT32_MAX;
 inline constexpr uint64_t SCHEDULER_NATIVE_NO_PREDICATE = UINT64_MAX;
 
@@ -70,7 +70,6 @@ struct alignas(64) SchedulerGraphTemplate {
     uint64_t args_bytes;
     uint64_t execution_count;
     uint64_t required_heap;
-    uint64_t reserved_execution_storage_bytes;
     uint64_t graph_key;
 };
 

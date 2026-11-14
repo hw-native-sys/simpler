@@ -126,7 +126,7 @@ AICore 读端使用 address-space-aware 的 POD 访问辅助函数，不复制 C
 
 每个唯一 Definition 生成一份 128-byte A5 template：`definition_offset/definition_bytes/child_plans_offset/`
 `fanin_offsets_offset/fanin_indices_offset/sinks_offset/task_count/edge_count/sink_count/args_bytes/`
-`execution_count/required_heap/reserved_execution_storage_bytes/graph_key` 十四个 `uint64_t`。
+`execution_count/required_heap/graph_key` 十三个 `uint64_t`。
 fanin offset/indices 指向 blob 内既有 CSR，不另复制一份 CSR；sink 为额外的 `uint16_t[]`。
 所有偏移以 native scheduler image 起点为基准，使用 `uint64_t`；数量在转换为 unsigned wire 前先拒绝负值。
 Definition 内原始 32-bit section offsets 保持原布局，解析时做 checked widening/addition。
@@ -260,16 +260,21 @@ Host 展开 binding/metadata、初始化 control 和设备 bootstrap 仍是 O(N)
 ```text
 native_scheduler_bytes = header + Definition blobs + templates + child plans + sinks
                        + 8*T completion refs + 64*G instances
-                       + 12*N node bindings + 16*N metadata + 640*N controls
-                       + control inboxes + actual cooperative records/log/seals
-                       + ready pool descriptors/controls + actual kernel ready entries
-                       + existing worker/run/ready regions + alignment padding
+                       + 12*N node bindings + 16*N metadata + actual TaskControls
+                       + actual cooperative records/log/seals
+                       + immutable engine catalogs
+                       + E*(512-byte Call + 128-byte atomic control + 128-byte binding)
+                       + existing worker/run regions + alignment padding
                        + actual enabled diagnostics
-reserved_graph_heap = sum(required_heap + reserved_execution_storage_bytes)
+reserved_graph_heap = sum(required_heap + args_bytes)
 ```
 
 native_scheduler_bytes 是 scheduler backing 总量，不是相对于旧 scheduler 的增量；公共原始 SM 和其他 runtime backing 另计。
+公式中的 E 是实际 block×active-lane 执行数。args_bytes 按 child 的 tensor/scalar 各自 64 B
+对齐、predicate 额外 64 B 计算，不再跟随公共 GraphExecution 的空间预算。
+默认 HBG 紧凑顶层镜像另计 64 B 状态头、80 B/task 和实用参数池；不含旧 slot/task-state 表。
 公式中的 reserved_graph_heap 已包含 native 参数 backing，禁止再把同一参数区算成额外 allocation。
+当前 graph view 版本为 5、native 图版本为 4；只接受各自编译产物定义的现行格式。
 cooperative metadata 只计合法 kernel，ENTER/EXIT/DUMMY 不增加 admission log capacity。
 首版可保留现有按 N 索引的 admission records；必须如实计算这种稀疏分配成本。
 

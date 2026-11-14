@@ -508,13 +508,16 @@ inline __aicore__ bool percounter_prepare_subtask(
         )) {
         return false;
     }
-    const SchedulerTaskInfo info{
-        task.local, kernel_id, subtask_slot, subtask_slot == 0 ? CoreType::AIC : CoreType::AIV
-    };
-    if (scheduler_materialize_task_payload_resolved(task.graph, info, function_address, payload) !=
-        SchedulerGraphResult::OK) {
+    SchedulerTaskPayloadArguments arguments{};
+    if (scheduler_parse_task_payload_arguments(task.graph, task.local, &arguments) != SchedulerGraphResult::OK)
         return false;
-    }
+    payload->function_bin_addr = function_address;
+    int32_t argument = 0;
+    for (int32_t i = 0; i < arguments.tensor_count; ++i)
+        payload->args[argument++] =
+            reinterpret_cast<uint64_t>(arguments.tensors + static_cast<uint64_t>(i) * TASK_IMAGE_TENSOR_STRIDE);
+    for (int32_t i = 0; i < arguments.scalar_count; ++i)
+        payload->args[argument++] = arguments.scalars[i];
     payload->local_context.block_idx = block_idx;
     payload->local_context.block_num = block_num;
     payload->global_context.sub_block_id = subtask_slot == 2 ? 1 : 0;

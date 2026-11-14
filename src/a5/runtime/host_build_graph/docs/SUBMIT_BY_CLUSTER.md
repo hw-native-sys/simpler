@@ -24,19 +24,19 @@ same mixed-task contract.
 
 ## Task Representation
 
-The shared graph image separates stable task identity from scheduling state:
+Host orchestration initializes common `ChipTaskStorage` scratch records. Default
+A5 HBG publishes an 80-byte `TaskImageStorage` per top-level task: its descriptor
+contains the task ID and kernel IDs, and its payload contains argument counts,
+field-relative pool deltas and a predicate. It publishes no `ChipTaskSlotState`
+or task-state array. Resident metadata holds shape and block counts; resident
+control records hold progress and completion. A separate 64-byte image header
+holds the first-error atomic.
 
-- `TaskDescriptor` contains the task ID, kernel IDs, and packed-buffer
-  addresses.
-- `TaskPayload` contains the argument counts, predicate, and a delta naming
-  each of its tensor, scalar and position-independent fanin-id regions. The
-  arguments live in the pool segments, not in the payload.
-- `ChipTaskSlotState` contains the active mask, task attributes, logical block
-  count, subtask counters, completion state, and descriptor/payload bindings.
-
-This image is built on the host and copied to the device verbatim. It contains
-no fanout adjacency or dependency-pool pointers, and its descriptor/payload
-bindings are deltas from the slot state's own address rather than pointers.
+Host planning constructs Calls and Graph child arguments before launch. Device
+execution tokens select prepared Calls and block/lane geometry. The argument
+pools remain available to dependency/predicate access and output diagnostics.
+Percounter selects its own current image representation for AICPU Graph
+materialization; the default HBG reader only accepts its compact format.
 
 ## Resource Shapes
 
@@ -86,25 +86,36 @@ describes the rendezvous itself and what the cohort is scoped to.
 2. TensorMap and explicit dependencies append producer local IDs to the payload's
    fanin region.
 3. Submit publishes only the finished graph data; it does not push ready tasks.
-4. Host prepares resident fanout CSR and remaining counters through the unified
-   graph view; device bootstrap scans the resulting nodes after H2D.
-5. A resident node with zero remaining dependencies enters its ready queue.
-6. Each resolved producer notifies its CSR successors; the unique remaining
-   transition 1→0 publishes ready. Helpers without a dependency header retain
-   the synchronous intrusive wake-list variant.
+4. Host prepares immutable AIC/MIX and AIV catalogs, Calls, execution controls
+   and canonical completion gates. The unified graph view maps top-level fanins
+   through completion references and Graph child fanins through Definition-local
+   indices; roots depend on ENTER and EXIT depends on every sink.
+5. After bootstrap, workers scan their engine catalogs in bounded slices to
+   claim execution tokens. A token may wait for dependencies before occupying a
+   dispatch slot; it advances its fanin prefix only after observing each
+   producer's canonical DONE gate. Readiness requires both remaining computation
+   and async debt to be zero for every producer.
+6. Workers scan ENTER, EXIT and inline control nodes separately. After all fanins
+   are DONE, a unique completion CAS settles the node. Consumers observe this
+   gate directly; dependency resolution uses no dynamic ready inbox, fanout
+   decrement or per-successor notification.
 
 ## Dispatch and Completion
 
 Resident workers prepare their own two slots and participate in cooperative
-admission when the task shape requires it. Pure AIC and MIX tasks share the AIC
-ready queue; pure AIV tasks use the AIV queue. The
+admission when the task shape requires it. Pure AIC and MIX tasks share the
+immutable AIC catalog; pure AIV tasks use the AIV catalog. These catalogs have no
+enqueue operation or shared queue head. Ready execution tokens transfer into a
+worker's private slots; its local ready mask/head orders those slots. The
 [resident walkthrough](../../../../../docs/zh-cn/a5-hbg-aicore-walkthrough/README.md)
 describes membership, physical placement and the completion resolver.
 
-Every executed block/lane contributes once to the packed physical completion
-counter. The last contribution owns TaskDone or the async join. MIX cluster
-release retires resources; it is not another completion contribution. TaskDone
-propagates dependencies synchronously before the node joins the resolved count.
+Every executed block/lane contributes once to the packed completion gate,
+decrementing remaining computation and compute debt together. Async groups keep
+additional debt until their unique FINISH. A valid gate with zero computation
+and debt proves DONE to dependent tokens and control scans. The unique last
+return or async join records logical completion. MIX cluster release retires
+resources; it is not another completion contribution.
 
 ## Executor Model
 

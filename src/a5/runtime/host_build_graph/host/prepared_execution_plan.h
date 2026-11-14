@@ -37,7 +37,7 @@ inline bool scheduler_prepare_host_calls(
         device_base == 0 || layout.total_size > UINT64_MAX - device_base || tensor_count > MAX_TENSOR_ARGS ||
         scalar_count > MAX_SCALAR_ARGS || tensor_count + scalar_count > SPMD_LOCAL_CONTEXT_INDEX ||
         (tensor_count != 0 &&
-         (tensors_address == 0 || tensor_count > (UINT64_MAX - tensors_address) / TASKPAYLOAD_TENSOR_STRIDE)) ||
+         (tensors_address == 0 || tensor_count > (UINT64_MAX - tensors_address) / TASK_IMAGE_TENSOR_STRIDE)) ||
         (scalar_count != 0 && scalars == nullptr))
         return false;
     const auto &prepared = *scheduler_state_at<SchedulerPreparedLayout>(base, layout.prepared_layout_offset);
@@ -99,7 +99,7 @@ inline bool scheduler_prepare_host_calls(
             call.num_args = static_cast<uint16_t>(tensor_count + scalar_count);
             call.subtask_slot = lane;
             for (uint32_t tensor = 0; tensor < tensor_count; ++tensor)
-                call.args[tensor] = tensors_address + uint64_t{tensor} * TASKPAYLOAD_TENSOR_STRIDE;
+                call.args[tensor] = tensors_address + uint64_t{tensor} * TASK_IMAGE_TENSOR_STRIDE;
             for (uint32_t scalar = 0; scalar < scalar_count; ++scalar)
                 call.args[tensor_count + scalar] = scalars[scalar];
             const uint64_t binding = device_base + prepared.bindings_offset + index * sizeof(SchedulerExecutionBinding);

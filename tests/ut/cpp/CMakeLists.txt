@@ -64,7 +64,7 @@ set(HBG_HOST_DIR ${SIMPLER_SRC}/common/host_build_graph/host)
 # test does not call costs nothing, whereas naming files individually means the
 # next one added to those directories is silently absent from every test that
 # should have had it.
-file(GLOB HBG_SHARED_RUNTIME_SOURCES CONFIGURE_DEPENDS ${HBG_COMMON_SHARED_DIR}/*.cpp)
+file(GLOB_RECURSE HBG_SHARED_RUNTIME_SOURCES CONFIGURE_DEPENDS ${HBG_COMMON_SHARED_DIR}/*.cpp)
 list(APPEND HBG_SHARED_RUNTIME_SOURCES ${HBG_HOST_DIR}/tensormap.cpp)
 
 file(GLOB _hbg_orch_host_sources CONFIGURE_DEPENDS ${HBG_HOST_DIR}/*.cpp)

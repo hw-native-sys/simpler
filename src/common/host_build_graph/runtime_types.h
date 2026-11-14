@@ -313,9 +313,8 @@ static_assert(offsetof(TaskDescriptor, packed_buffer_base) == 24, "packed_buffer
  * by bulk tensor and scalar data. Fanin is always inline: it is hard-capped at
  * CHIP_MAX_FANIN and there is no spill pool.
  */
-// Host early-dispatch verdicts for ChipTaskSlotState::ed_flags (bitmask).
-inline constexpr uint8_t ED_FLAG_CANDIDATE = 1u << 0;
-inline constexpr uint8_t ED_FLAG_TRACKED = 1u << 1;
+inline constexpr uint8_t ED_FLAG_CANDIDATE = simpler::hbg::recorded_dispatch::candidate;
+inline constexpr uint8_t ED_FLAG_TRACKED = simpler::hbg::recorded_dispatch::tracked;
 
 // Publish-list drain batch bound: waiters one Phase 4b pass rescans before
 // the remainder goes back to the pending-drain queue, so one huge-fanout

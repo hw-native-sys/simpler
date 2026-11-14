@@ -10,6 +10,7 @@
  */
 
 #include "aicore_lifecycle.h"
+#include "profiling_config.h"
 #include "aicore_scheduler_error.h"
 #include "aicore_scheduler_state.h"
 #include "args_dump_service.h"
@@ -32,7 +33,8 @@
 #include "common/memory_barrier.h"
 #include "common/unified_log.h"
 #include "runtime.h"
-#include "host_build_graph/shared_memory.h"
+#include "host_build_graph/runtime_status.h"
+#include "task_image_status.h"
 #include "spin_hint.h"
 
 namespace {
@@ -61,11 +63,9 @@ void record_lifecycle_timeout(Runtime *runtime, SchedulerErrorSite error_site) {
         record_aicore_scheduler_runtime_error(run_control, SchedulerGraphResult::TIMEOUT, error_site))
         wmb();
     if (runtime != nullptr && runtime->get_gm_sm_ptr() != nullptr) {
-        auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
-        (void)settle_aicore_runtime_status(run_control, &header->sched_error_code);
-        (void)latch_aicore_scheduler_runtime_error(
-            &header->sched_error_code, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT)
-        );
+        auto *error_code = task_image_error_code(runtime->get_gm_sm_ptr());
+        (void)settle_aicore_runtime_status(run_control, error_code);
+        (void)latch_aicore_scheduler_runtime_error(error_code, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT));
     }
 }
 

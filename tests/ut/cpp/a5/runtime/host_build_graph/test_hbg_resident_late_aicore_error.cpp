@@ -58,7 +58,7 @@ protected:
         ASSERT_EQ(aicpu_begin_native_invocation(1, reinterpret_cast<uint64_t>(&result_storage), kEpoch), 0);
     }
 
-    std::atomic<int32_t> &header() { return header_storage.sched_error_code; }
+    std::atomic<int32_t> &header() { return header_storage.error_code; }
 
     /** What the AICore's exit-wait watchdog does after the supervisor stopped looking. */
     bool exit_wait_watchdog_fires() {
@@ -75,7 +75,7 @@ protected:
         return device_run_result_terminal(region, kEpoch);
     }
 
-    SharedMemoryHeader header_storage{};
+    TaskImageStatus header_storage{};
     SchedulerWorkerContext context{};
     SchedulerRunControl run_control{};
     NativeInvocationResultStorage result_storage{};

@@ -32,6 +32,7 @@
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "runtime.h"
+#include "task_image_status.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
 
@@ -260,7 +261,7 @@ TEST_F(HbgRetirementWiring, OnlyAcknowledgedReportsAreInvalidatedOnEveryExitRout
 TEST_F(HbgRetirementWiring, PartialHandshakeTimeoutRetiresEveryAcceptedReport) {
     scheduler_timeout_ms = 1;
     auto runtime = std::make_unique<Runtime>();
-    SharedMemoryHeader header{};
+    TaskImageStatus header{};
     runtime->set_gm_sm_ptr(&header);
     AicoreLifecycle lifecycle;
     AicoreLifecycleTestPeer::prepare_handshake(lifecycle, kAddrs.data());
@@ -274,7 +275,7 @@ TEST_F(HbgRetirementWiring, PartialHandshakeTimeoutRetiresEveryAcceptedReport) {
     EXPECT_EQ(lifecycle.release_partition(runtime.get(), 0, false), -SIMPLER_ERROR_SCHEDULER_TIMEOUT);
     EXPECT_EQ(AicoreLifecycleTestPeer::retired_cores(lifecycle), 2);
     EXPECT_FALSE(lifecycle.cores_retired());
-    EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    EXPECT_EQ(header.error_code.load(), SIMPLER_ERROR_SCHEDULER_TIMEOUT);
     ASSERT_EQ(retire_calls.size(), 1u);
     EXPECT_EQ(retire_calls[0].addrs, (std::vector<uint64_t>{kAddrs[0], kAddrs[2]}));
     EXPECT_EQ(retire_calls[0].gates[0], &runtime->dev.teardown_gates[0]);
@@ -283,7 +284,7 @@ TEST_F(HbgRetirementWiring, PartialHandshakeTimeoutRetiresEveryAcceptedReport) {
 
 TEST_F(HbgRetirementWiring, MissingReportsLeaveRetirementUnknownWithoutOpeningAWindow) {
     auto runtime = std::make_unique<Runtime>();
-    SharedMemoryHeader header{};
+    TaskImageStatus header{};
     runtime->set_gm_sm_ptr(&header);
     AicoreLifecycle lifecycle;
     AicoreLifecycleTestPeer::prepare_handshake(lifecycle, kAddrs.data());
@@ -292,12 +293,12 @@ TEST_F(HbgRetirementWiring, MissingReportsLeaveRetirementUnknownWithoutOpeningAW
     EXPECT_EQ(AicoreLifecycleTestPeer::retired_cores(lifecycle), 0);
     EXPECT_FALSE(lifecycle.cores_retired());
     EXPECT_FALSE(lifecycle.settle_run_diagnostics(runtime.get(), false));
-    EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    EXPECT_EQ(header.error_code.load(), SIMPLER_ERROR_SCHEDULER_TIMEOUT);
 }
 
 TEST_F(HbgRetirementWiring, DuplicateReportsKeepOneWindowOwnerAndLeaveRetirementUnproved) {
     auto runtime = std::make_unique<Runtime>();
-    SharedMemoryHeader header{};
+    TaskImageStatus header{};
     runtime->set_gm_sm_ptr(&header);
     AicoreLifecycle lifecycle;
     AicoreLifecycleTestPeer::prepare_handshake(lifecycle, kAddrs.data());
@@ -327,7 +328,7 @@ TEST_F(HbgRetirementWiring, DuplicateReportsKeepOneWindowOwnerAndLeaveRetirement
 
 TEST_F(HbgRetirementWiring, AReportedCoreWithoutARegisterWindowCannotProveDiscoveryOrRetirement) {
     auto runtime = std::make_unique<Runtime>();
-    SharedMemoryHeader header{};
+    TaskImageStatus header{};
     runtime->set_gm_sm_ptr(&header);
     AicoreLifecycle lifecycle;
     const std::array<uint64_t, 3> registers{kAddrs[0], 0, kAddrs[2]};

@@ -88,6 +88,10 @@ function(simpler_ut_includes arch runtime tier out_var)
         endif()
         list(APPEND _dirs "${_pto_root}/include")
     endif()
+    # Host image packing is selected by the runtime's own include directory.
+    if(IS_DIRECTORY "${_rt}/host/image")
+        list(APPEND _dirs "${_rt}/host/image")
+    endif()
     # Only host_build_graph splits out a host/ directory.
     if(IS_DIRECTORY "${_rt}/host")
         list(APPEND _dirs "${_rt}/host")
