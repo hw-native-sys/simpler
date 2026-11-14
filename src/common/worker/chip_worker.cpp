@@ -913,6 +913,16 @@ void ChipWorker::finalize() {
             throw std::runtime_error("ChipWorker::finalize: Host DDR mappings still retained");
     }
 
+    {
+        std::lock_guard<std::mutex> lock(pending_storage_mu_);
+        for (auto it = pending_storage_.begin(); it != pending_storage_.end();) {
+            if (it->second(it->first, nullptr) != 0) {
+                throw std::runtime_error("ChipWorker::finalize: pending storage cleanup failed; retry close");
+            }
+            it = pending_storage_.erase(it);
+        }
+    }
+
     int device_finalize_rc = 0;
     if (device_ctx_ != nullptr && finalize_device_fn_ != nullptr && runtime_module_ != nullptr) {
         device_finalize_rc = finalize_device_fn_(device_ctx_);
@@ -2760,6 +2770,39 @@ uint64_t ChipWorker::malloc(size_t size) {
         throw std::runtime_error("malloc failed");
     }
     return reinterpret_cast<uint64_t>(ptr);
+}
+
+void ChipWorker::adopt_shared_buffer(
+    uint64_t base, size_t logical_bytes, size_t physical_bytes, CallerStorageReleaseFn release_storage, void *storage
+) {
+    if (!supports_shareable_storage()) {
+        throw std::runtime_error("shared allocation adoption requires an initialized onboard program owner");
+    }
+    validate_execution_context();
+    std::lock_guard<std::mutex> lock(pending_storage_mu_);
+    auto adopt = runtime_module_->required<decltype(&device_adopt_caller_buffer_ctx)>("device_adopt_caller_buffer_ctx");
+    const int status =
+        adopt(device_ctx_, reinterpret_cast<void *>(base), logical_bytes, physical_bytes, release_storage, storage);
+    if (status != 0) {
+        throw std::runtime_error("shared allocation adoption failed with status " + std::to_string(status));
+    }
+    pending_storage_.erase(storage);
+}
+
+void ChipWorker::retain_pending_storage(CallerStorageReleaseFn release_storage, void *storage) {
+    std::lock_guard<std::mutex> lock(pending_storage_mu_);
+    pending_storage_.emplace(storage, release_storage);
+}
+
+void ChipWorker::release_pending_storage(void *storage) {
+    std::lock_guard<std::mutex> lock(pending_storage_mu_);
+    auto found = pending_storage_.find(storage);
+    if (found == pending_storage_.end()) return;
+    const int rc = found->second(storage, nullptr);
+    if (rc != 0) {
+        throw std::runtime_error("pending storage cleanup failed with status " + std::to_string(rc));
+    }
+    pending_storage_.erase(found);
 }
 
 void ChipWorker::free(uint64_t ptr) {

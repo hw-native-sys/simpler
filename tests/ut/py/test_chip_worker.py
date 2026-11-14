@@ -237,6 +237,7 @@ def kernel_symbol_runtime(tmp_path_factory):
         unproven_cleanup=False,
         init_error=None,
         progress=False,
+        shared_storage=False,
     ):
         nonlocal next_library_id
         key = (
@@ -253,6 +254,7 @@ def kernel_symbol_runtime(tmp_path_factory):
             unproven_cleanup,
             init_error,
             progress,
+            shared_storage,
         )
         # Fault scripts retain their consumed failure budget in the loaded DSO.
         if finalize_failures == 0 and not init_gate and key in cache:
@@ -623,6 +625,13 @@ def kernel_symbol_runtime(tmp_path_factory):
                     size_t get_aicpu_dlopen_count(DeviceContextHandle) { return 0; }
                     size_t get_host_dlopen_count(DeviceContextHandle) { return 0; }
                     """)
+                )
+
+        if shared_storage:
+            with source.open("a", encoding="utf-8") as output:
+                output.write(
+                    "int device_adopt_caller_buffer_ctx(DeviceContextHandle, void *, size_t, size_t, "
+                    "CallerStorageReleaseFn, void *) { return -79; }\n"
                 )
 
         # These symbols are only resolved during init; any invocation is a test failure.
@@ -3357,3 +3366,96 @@ class TestMailboxConfigRoundtrip:
             # because the nonce is urandom output and JSON carries no bytes.
             "owner_instance_id": "0f1e2d3c4b5a6978",
         }
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires ELF interposition")
+@pytest.mark.parametrize(
+    ("acquire", "release"),
+    [
+        ("physical_alloc", "physical_free"),
+        ("va_reserve", "va_release"),
+        ("map", "unmap"),
+        ("export", "unmap"),
+        ("adopt", "unmap"),
+        ("adopt", "va_release"),
+        ("adopt", "physical_free"),
+    ],
+)
+def test_source_allocation_rollback_is_owned_until_close(tmp_path, kernel_symbol_runtime, acquire, release):
+    """Run the real native allocation helper and Worker finalizer, with fake VMM driver calls."""
+    source = tmp_path / "acl.c"
+    source.write_text(
+        "#include <stdlib.h>\n"
+        "int aclInit(const char *s) { return 0; }\n"
+        "int aclrtGetDevice(int *d) { *d = 4; return 0; }\n"
+        "int aclrtGetCurrentContext(void **c) { *c = (void *)1; return 0; }\n"
+        "int aclrtSetCurrentContext(void *c) { return 0; }\n"
+        + "\n".join(
+            f"int {name}(void) {{ abort(); }}"
+            for name in (
+                "aclrtSetDevice",
+                "aclrtMemcpy",
+                "aclrtMemGetAllocationGranularity",
+                "aclrtMallocPhysical",
+                "aclrtReserveMemAddress",
+                "aclrtMapMem",
+                "aclrtMemSetAccess",
+                "aclrtMemExportToShareableHandle",
+                "aclrtMemImportFromShareableHandle",
+                "aclrtUnmapMem",
+                "aclrtReleaseMemAddress",
+                "aclrtFreePhysical",
+            )
+        )
+    )
+    library = tmp_path / "libascendcl.so"
+    subprocess.run(["cc", "-shared", "-fPIC", str(source), "-o", str(library)], check=True)
+    runtime = kernel_symbol_runtime(shared_storage=True)
+    program = r"""
+import os, sys
+import _task_interface as native
+runtime, acquire, release = sys.argv[1:]
+native._region_vmm_test_use_fake_driver()
+baseline = set(native._region_vmm_test_live_handles())
+worker = native._ChipWorker()
+worker.init(runtime, os.devnull, os.devnull, "", device_id=4)
+try:
+    if acquire != "adopt":
+        native._region_vmm_test_fail_stage(acquire, "after")
+    native._region_vmm_test_fail_stage(release, "before")
+    try:
+        worker._malloc_shareable(4096)
+    except RuntimeError as error:
+        assert ("adoption" if acquire == "adopt" else acquire) in str(error), str(error)
+        assert "rollback retained by Worker" in str(error), str(error)
+        assert release in str(error), str(error)
+    else:
+        raise AssertionError("injected allocation failure was not reported")
+    assert set(native._region_vmm_test_live_handles()) != baseline
+    if acquire == "adopt" and release == "unmap":
+        native._region_vmm_test_fail_stage(release, "before")
+        try:
+            worker.finalize()
+        except RuntimeError as error:
+            assert "pending storage cleanup" in str(error), str(error)
+        else:
+            raise AssertionError("failed close silently discarded pending storage")
+        assert set(native._region_vmm_test_live_handles()) != baseline
+    # Recovery uses only public owner finalization, not a private ledger handle.
+    worker.finalize()
+    assert set(native._region_vmm_test_live_handles()) == baseline
+    operations = native._region_vmm_test_issued_ops()
+    for stage in ("unmap", "va_release", "physical_free"):
+        assert operations.count(stage) <= 1, operations
+finally:
+    worker.finalize()
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", program, str(runtime), acquire, release],
+        env=dict(os.environ, LD_PRELOAD=str(library)),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

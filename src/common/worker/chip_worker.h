@@ -412,6 +412,15 @@ public:
     size_t unobserved_completed_run_high_water() const noexcept;
 
     uint64_t malloc(size_t size);
+    /** Transfer fresh VMM storage into this initialized owner; a refusal transfers no ownership. */
+    void adopt_shared_buffer(
+        uint64_t base, size_t logical_bytes, size_t physical_bytes, CallerStorageReleaseFn release_storage,
+        void *storage
+    );
+    bool supports_shareable_storage() const noexcept { return initialized_ && device_owner_reserved_; }
+    // Own rollback debt before acquiring storage; adoption transfers it to the allocator.
+    void retain_pending_storage(CallerStorageReleaseFn release_storage, void *storage);
+    void release_pending_storage(void *storage);
     void free(uint64_t ptr);
     void copy_to(uint64_t dst, uint64_t src, size_t size);
     void copy_from(uint64_t dst, uint64_t src, size_t size);
@@ -1213,5 +1222,7 @@ private:
     bool host_uses_quiesced_ = false;
     int device_id_ = -1;
     bool initialized_ = false;
+    std::mutex pending_storage_mu_;
+    std::unordered_map<void *, CallerStorageReleaseFn> pending_storage_;
     bool finalized_ = false;
 };

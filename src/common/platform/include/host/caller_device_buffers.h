@@ -84,7 +84,8 @@
  * successful reset that ends the generation, a failed release it records, a quarantine — is
  * decided where those outcomes are known, not here.
  *
- * Its own mutex, and a leaf: nothing called while it is held takes another lock.
+ * Release holds this table's mutex before the allocator lock; release callbacks
+ * must not reenter this table. Other operations call no external code under the lock.
  */
 class CallerDeviceBuffers {
     struct Identity {
@@ -114,6 +115,9 @@ class CallerDeviceBuffers {
     };
 
 public:
+    // Compute borrows use pipeline-slot IDs; external buffer leases use the high-bit namespace.
+    static constexpr uint64_t EXTERNAL_BORROW_MIN_ID = uint64_t{1} << 63;
+
     /** One span of a caller allocation a run names. */
     struct Span {
         uint64_t addr{0};
@@ -344,18 +348,25 @@ public:
     /**
      * Forget `base` so the caller's release may proceed, or refuse.
      *
-     * Check and forget are one step under this lock, so a borrow taken between a caller's question
-     * and its free cannot be missed. Forgetting is deliberately separate from the platform free the
-     * caller then performs: this class holds no platform vocabulary, and the entry has to be gone
-     * before those pages can be handed back.
+     * Check and forget are one step under this lock. The release overload runs
+     * its callback under the same lock and forgets only a successful release.
      *
      * @return true when nothing holds it and the entry is now gone.
      */
     bool forget_if_unborrowed(void *base) {
+        return forget_if_unborrowed(base, [] {
+            return true;
+        });
+    }
+
+    /** Keep the record until release succeeds, excluding new borrows throughout. */
+    template <typename Release>
+    bool forget_if_unborrowed(void *base, Release release) {
         if (base == nullptr) return false;
         const uint64_t key = reinterpret_cast<uint64_t>(base);
         std::scoped_lock lk(mu_);
         if (borrowed_locked(key)) return false;
+        if (!release()) return false;
         allocations_.erase(key);
         return true;
     }
@@ -369,12 +380,13 @@ public:
         return count;
     }
 
-    /** How many runs hold a borrow. */
-    std::size_t borrow_count() const {
+    /** Count original borrows at or above minimum_identity; zero includes retained references. */
+    std::size_t borrow_count(uint64_t minimum_identity = 0) const {
         std::scoped_lock lk(mu_);
         std::size_t count = 0;
-        for (const auto &[key, records] : borrows_)
-            if (!records.bases.empty() && records.active_alias == 0) ++count;
+        for (const auto &[key, records] : borrows_) {
+            if (key.active >= minimum_identity && !records.bases.empty() && records.active_alias == 0) ++count;
+        }
         return count;
     }
 

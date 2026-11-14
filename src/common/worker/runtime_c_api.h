@@ -611,6 +611,17 @@ size_t get_runtime_alignment(void);
  * context allocates for itself does not come through here and is not nameable by a run.
  */
 void *device_malloc_ctx(DeviceContextHandle ctx, size_t size);
+/** Return zero after releasing storage and its metadata; nonzero leaves the allocation retained. */
+typedef int (*CallerStorageReleaseFn)(void *storage, void *base);
+
+/**
+ * Adopt a fresh allocation. Ownership of storage transfers only on success.
+ * logical_bytes bounds views; physical_bytes includes padding and controls HBM accounting.
+ */
+int device_adopt_caller_buffer_ctx(
+    DeviceContextHandle ctx, void *base, size_t logical_bytes, size_t physical_bytes,
+    CallerStorageReleaseFn release_storage, void *storage
+);
 
 /** Free device memory previously allocated in the given device context. */
 void device_free_ctx(DeviceContextHandle ctx, void *dev_ptr);
@@ -623,9 +634,7 @@ void device_free_ctx(DeviceContextHandle ctx, void *dev_ptr);
  * question and its release cannot be missed.
  *
  * @return 0 when the allocation is gone, PTO_RUNTIME_ERR_INVALID_STATE when a borrow still holds
- *         it — in which case nothing changed. Nothing else: the platform free underneath reports
- *         no status, so 0 means this path did not refuse rather than that the pages are provably
- *         returned.
+ *         it — in which case nothing changed — or the allocator error when storage release fails.
  */
 int device_free_caller_buffer_ctx(DeviceContextHandle ctx, void *dev_ptr);
 

@@ -836,6 +836,7 @@ def _check_fault_buffer_policy(
             if owner.poisoned and damage == "missing":
                 raise FileNotFoundError("controlled missing owned capture")
             raw = _large_ticket_capture(7, 0, 1)
+            raw["aicore_execution_identities"] = {"records": []}
             protocol = raw["aicore_protocol"]
             protocol.update(
                 schema="hbg-native-protocol-v22", close_seal_stride=64, run_epoch=owner.scheduler_mode_publish_count
@@ -854,12 +855,13 @@ def _check_fault_buffer_policy(
                     protocol["executions"][0]["returned"] = [0, 0]
             return prefix / "capture.bin", raw
         return prefix / "capture.bin", {
+            "aicore_execution_identities": {"records": []},
             "aicore_protocol": {
                 "schema": "hbg-native-protocol-v22",
                 "run_epoch": owner.scheduler_mode_publish_count,
                 "scheduler_error": 100 if owner.poisoned else 0,
                 "first_error": {"site": 95 if owner.poisoned else 0},
-            }
+            },
         }
 
     if owned_wait_case is not None:
@@ -898,7 +900,7 @@ def _check_fault_buffer_policy(
     monkeypatch.setattr(native, "_root_block_num", lambda protocol: 1)
     monkeypatch.setattr(native, "_check_output", check_output)
     monkeypatch.setattr(native, "_check_failed_capture", failed_capture)
-    monkeypatch.setattr(native, "read_perf_data", lambda path: {"protocol_audit": {"protocol_verified": True}})
+    monkeypatch.setattr(native, "audit_native_protocol", lambda section, identities: {"protocol_verified": True})
     if fail_second_free:
         with pytest.raises(RuntimeError, match="controlled free refused"):
             native._run_pass(

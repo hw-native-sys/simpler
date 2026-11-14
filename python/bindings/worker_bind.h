@@ -1000,22 +1000,27 @@ inline void bind_worker(nb::module_ &m) {
             "into the mailbox. Returns per-child ControlResult entries."
         )
         .def(
+            "check_control_payloads_retired", &Worker::check_control_payloads_retired,
+            nb::call_guard<nb::gil_scoped_release>()
+        )
+        .def(
             "control_payload",
             [](Worker &self, WorkerType worker_type, int worker_id, uint64_t sub_cmd, nb::object payload,
-               nb::object timeout_s) {
+               nb::object timeout_s, bool retiring) {
                 std::string payload_bytes = buffer_to_string(payload, "payload");
                 double timeout_val = timeout_s.is_none() ? -1.0 : nb::cast<double>(timeout_s);
                 std::vector<uint8_t> result;
                 {
                     nb::gil_scoped_release release;
                     result = self.control_payload(
-                        worker_type, worker_id, sub_cmd, payload_bytes.data(), payload_bytes.size(), timeout_val
+                        worker_type, worker_id, sub_cmd, payload_bytes.data(), payload_bytes.size(), timeout_val,
+                        retiring
                     );
                 }
                 return nb::bytes(reinterpret_cast<const char *>(result.data()), result.size());
             },
             nb::arg("worker_type"), nb::arg("worker_id"), nb::arg("sub_cmd"), nb::arg("payload"),
-            nb::arg("timeout_s") = nb::none(),
+            nb::arg("timeout_s") = nb::none(), nb::arg("retiring") = false,
             "Drive one local worker control with a mutable staged payload and return its final bytes."
         )
         .def(

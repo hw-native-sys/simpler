@@ -29,8 +29,8 @@ from simpler.worker import Worker
 
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.scene_test import _pto_isa_compile_cache_token, compile_chip_callable_spec
+from simpler_setup.tools.hbg.native_causality import audit_native_protocol
 from simpler_setup.tools.hbg.native_protocol import has_native_graph, protocol_version
-from simpler_setup.tools.swimlane_converter import read_perf_data
 
 _ROOT = Path(__file__).resolve().parents[5]
 _KERNELS = _ROOT / "tests/fdwic/pa_hbg/spmd/kernels"
@@ -686,7 +686,10 @@ def _run_pass(  # noqa: PLR0912 -- one Worker owns healthy, failed, and cleanup 
                 else:
                     pytest.fail("owned RTS last-use evidence unavailable; buffers retained until close")
             else:
-                assert read_perf_data(str(path))["protocol_audit"]["protocol_verified"]
+                # Audit the captured protocol and explicit identities without building a plotting timeline.
+                assert audit_native_protocol(raw["aicore_protocol"], raw["aicore_execution_identities"]["records"])[
+                    "protocol_verified"
+                ]
             evidence.append(
                 {
                     "capture": str(path.relative_to(artifacts)),

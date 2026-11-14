@@ -37,7 +37,16 @@ inline __aicore__ uint64_t atomic_add(__gm__ uint64_t *address, uint64_t value) 
 #ifdef PTO_CPUSTUB_HPP
     return __atomic_fetch_add(address, value, __ATOMIC_ACQ_REL);
 #else
-    return atomicAdd(address, value);
+    // pto-isa 8fb67fa7e's SIMT atomicAdd template is undefined at the
+    // self-contained incore link; the classic 64-bit CAS still links.
+    auto *word = const_cast<__gm__ int64_t *>(reinterpret_cast<__gm__ volatile int64_t *>(address));
+    int64_t observed = atomicCAS(word, 0, 0);
+    while (true) {
+        const int64_t desired = static_cast<int64_t>(static_cast<uint64_t>(observed) + value);
+        const int64_t actual = atomicCAS(word, observed, desired);
+        if (actual == observed) return static_cast<uint64_t>(observed);
+        observed = actual;
+    }
 #endif
 }
 inline __aicore__ uint64_t observe(__gm__ uint64_t *address) { return atomic_add(address, 0); }

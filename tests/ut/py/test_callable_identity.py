@@ -622,6 +622,9 @@ def test_remote_worker_id_stays_stable_when_local_worker_is_added_later(monkeypa
         def get_orchestrator(self):
             return None
 
+        def check_control_payloads_retired(self):
+            pass
+
         def close(self):
             self.closed = True
 
@@ -2489,6 +2492,9 @@ def test_partial_init_failure_cleans_open_remote_session(monkeypatch):
         def add_remote_l3_socket(self, *args):
             self.added.append(args)
 
+        def check_control_payloads_retired(self):
+            pass
+
         def close(self):
             self.closed = True
 
@@ -2537,6 +2543,9 @@ def test_partial_init_failure_closes_unregistered_open_remote_session(monkeypatc
 
         def add_remote_l3_socket(self, *args):
             raise RuntimeError("remote socket register failed")
+
+        def check_control_payloads_retired(self):
+            pass
 
         def close(self):
             self.closed = True
@@ -2802,6 +2811,9 @@ def test_worker_remote_memory_api_returns_opaque_handle_and_routes_controls():
 
         def remote_free(self, worker_id, buffer_id, generation):
             self.calls.append(("free", worker_id, buffer_id, generation))
+
+        def check_control_payloads_retired(self):
+            pass
 
         def close(self):
             self.calls.append(("close",))
