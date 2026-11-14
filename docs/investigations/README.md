@@ -86,9 +86,11 @@ that ...".
 
 Newest first.
 
+- [2026-11 — Completed fanin shortcut](../zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md#completed-fanin-shortcut) — withdrawn: all 18 A5 cases pass, but the fourteen noncommunication L0 means sum rises 1.059%; adding faster MIX discovery still leaves a 0.339% regression and increases unready PARK churn.
 - [2026-11 — Immutable Call cache reuse](../zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md#immutable-call-cache-reuse) — withdrawn: the Host-before-startup publication contract passes all 18 A5 cases, but removing receive-side Call DCCI increases the fourteen noncommunication L0 means sum by 0.474%; mutable Binding observation remained intact.
 - [2026-11 — Fast ordinary continuation](../zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md#fast-ordinary-continuation) — withdrawn: all 18 A5 cases pass, and Engram's same-task handoff shortens, but the fourteen noncommunication L0 means sum increases 0.051%; local handoff improvement does not establish aggregate benefit.
 - [2026-11 — Completed catalog prefix retirement](../zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md#completed-catalog-prefix-retirement) — withdrawn: all 18 A5 cases pass, but the noncommunication L0 sum improves only 0.088% with a sampling interval spanning zero and a 0.823% DSL regression; fewer atomic reads do not eliminate completion-observation contention or the fixed handoff cost.
+- [2026-11 — Formal MIX service at ordinary ownership boundaries](../zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md#formal-mix-service-boundaries) — withdrawn: all 18 paired cases and 17 A5 feature checks pass, but the fourteen noncommunication L0 means sum increases 0.16%; no aggregate benefit is established.
 - [2026-11 — Oldest-ready local pending order](../zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md#oldest-ready-local-pending-order) — withdrawn: all 18 A5 cases pass numerical validation, but the fourteen noncommunication L0 means sum increases 0.10%; local selection order changes do not remove the fixed handoff path.
 
 - [2026-11 — A5 HBG legacy removal](2026-11-a5-hbg-legacy-removal.md) — resident-only execution merged in #3064; follow-up removes the unused A5 shared-arena prefix while kernel context/async ABI cleanup remains separate. No local CPU validation run.

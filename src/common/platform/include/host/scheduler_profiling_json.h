@@ -122,11 +122,45 @@ inline void chip_swimlane_write_scheduler_records(
     const std::string filtered = ring.str();
     const size_t ring_begin = filtered.find('[') + 1;
     const size_t ring_end = filtered.rfind(']');
-    const size_t snapshot_begin = snapshot->find('[') + 1;
-    const size_t snapshot_end = snapshot->rfind(']');
     const auto ring_body = filtered.substr(ring_begin, ring_end - ring_begin);
     if (ring_body.find_first_not_of(" \t\r\n") == std::string::npos) {
         out << *snapshot;
+        return;
+    }
+    // The runtime snapshot may contain arrays outside its top-level streams.
+    size_t snapshot_begin = std::string::npos, snapshot_end = std::string::npos;
+    size_t depth = 0, string_begin = 0;
+    bool in_string = false;
+    for (size_t i = 0; i < snapshot->size(); ++i) {
+        const char c = (*snapshot)[i];
+        if (in_string) {
+            if (c == '\\') {
+                ++i;
+                continue;
+            }
+            if (c != '"') continue;
+            in_string = false;
+            if (depth != 1 || snapshot->compare(string_begin, i - string_begin + 1, "\"streams\"") != 0) continue;
+            const auto colon = snapshot->find_first_not_of(" \t\r\n", i + 1);
+            if (colon == std::string::npos || (*snapshot)[colon] != ':') continue;
+            const auto array = snapshot->find_first_not_of(" \t\r\n", colon + 1);
+            if (array != std::string::npos && (*snapshot)[array] == '[') snapshot_begin = array + 1;
+        } else if (c == '"') {
+            in_string = true;
+            string_begin = i;
+        } else if (c == '{' || c == '[') {
+            ++depth;
+        } else if (c == '}' || c == ']') {
+            if (depth == 0) break;
+            --depth;
+            if (c == ']' && depth == 1 && snapshot_begin != std::string::npos) {
+                snapshot_end = i;
+                break;
+            }
+        }
+    }
+    if (snapshot_end == std::string::npos) {
+        out.setstate(std::ios::failbit);
         return;
     }
     out << snapshot->substr(0, snapshot_end);

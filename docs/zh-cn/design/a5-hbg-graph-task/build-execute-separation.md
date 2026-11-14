@@ -242,7 +242,7 @@ PARKING 在发布/取消完成之前一直保留责任。错误退出不得遗�
 | 类别 | 提前持有的内容 | 正式执行前不能提前占用 | 等待时的进展方式 |
 | ---- | -------------- | ---------------------- | ---------------- |
 | 普通纯 AIC/AIV | 本核窗口内的具体 execution token | 执行流水线、协作成员或伙伴 slot | 查看其他 token；必要时 owner 主动 PARK |
-| 普通 MIX | coordinator 的一份未来组 token；可选只读准备公告 | stage/armed/arrived、伙伴 slot、cohort hold | 独立服务当前组；未来组阻塞时有界撤销并 PARK |
+| 普通 MIX | coordinator 的一份未来组 token；可选只读准备公告 | stage/armed/arrived、伙伴 slot、cohort hold | 独立服务当前组；持续发现可执行替代项，必要时撤销公告并 PARK |
 | sync_start | 独立有序 continuation 和静态准备信息 | 未获许可的成员票、seal、hold | 按顺序服务真实 admission；已认领成员不能随意让出 |
 | defer_wait | 共享等待记录和独立 async 服务进度 | 返回 kernel 的执行 token、通知者所需的业务资源 | 有界 CHECK/FINISH；普通发现和 PARK 保证通知者有执行机会 |
 
@@ -254,7 +254,11 @@ MIX 以 `(run, node_ref, block, group_generation)` 为组级 pending；AIC coord
 
 每簇最多一份未来 group pending，独立于正在服务的正式 group；同 task 的 current/pending 组仍最多一份。MIX 的初次组票也可在逻辑依赖 ready 前取得，但只是一份可挂起记录，不设置 stage/armed、arrived、cohort hold 或业务 slot。保留单独 preparation announcement，伙伴有空时可以观察不可变 Call；该公告不授予执行权，不允许两个准备者并发写动态 Binding。
 
-已有未来组因依赖或资源未满足而阻止组补给时，最多四个服务轮次内必须撤销准备公告、PARK 组票并推进 AIC 目录；不能依赖普通四 token 的“全 WAIT”规则间接释放组候选位置。fresh 和 PARKED 组都按逻辑 block 发现及计数，不按 active lane Call 数计数；隐藏的通知者 MIX P 必须能在这条路径被领取。
+已有未来组的依赖未满足时保留 GROUP_RESERVED 和已完成的准备，同时持续推进 AIC 目录。发现另一个普通 MIX 的完整逻辑 fanin 已满足，且权威观察到可尝试领取的 fresh 或 PARKED 单元后，才撤销旧准备公告、PARK 旧组并领取替代项。候选观察不增加第二份所有权；旧组停放后若竞争失败，保持空 pending 继续发现，不能恢复已失效的旧 handle。没有可执行替代项时不为轮询而定期 PARK。fanin 已满足但资源许可仍受阻的未来组保留四轮让路边界；正式 staged、ARMED、arrived 或 RUNNING 责任不参与这种替换。
+
+future pending 不能禁止目录推进：所有簇持有等待 W 的 B 时，目录后方独立的 MIX notifier P 仍必须得到观察机会；P 真正 ready 且有可领取单元时使 B 让位。该进展依赖持续有界发现和独立 async/control 服务，不能只凭任务拓扑顺序证明。fresh 和 PARKED 组都按逻辑 block 发现及计数，不按 active lane Call 数计数。候选的正向依赖证明仅用于同 run、同 node_ref，包含 Graph ENTER 与 deferred debt；负向观察不跨轮缓存。
+
+一次 MIX 发现最多检查八个目录项，且不超过一遍目录；跳过纯 AIC、sync_start 和本次无可领取单元的项。空 pending 仍可提前领取未 ready 的 fresh 组；已有 unready pending 时只观察替代候选，成功取得第一份新 reservation 后立即返回。每个条目独立推进 cursor 与 round，保持 PARKED 强制扫查覆盖。该预算限制一次发现工作，不增加 pending 容量，不取消资源等待组的四轮让路或其他控制服务机会。
 
 正式路径保留 `scheduler_cluster_mix_try_arm/service/retire` 的资源裁决，但 `try_arm` 必须改为消费已持有的 block/owner/generation，移除它当前内部再次执行的 `next_block` FAA。fresh 和 PARKED 接手先汇入同一份组责任，再执行：确认逻辑依赖 → 检查 hold/frontier → stage → 再检查 → 发布 armed generation → 必需 lane 到达 → 执行 → 全部返回后退休。只协调实际 active lanes 和 coordinator，不扩大为无关成员。
 
@@ -344,7 +348,7 @@ predicate 仍在合法执行边界读取；false 分支按既有整任务/组语
 | 已有 pending 接续 | 后续 token 在前一 kernel 返回前已完成 Claim/acquire；返回后不再取新票或 Claim，同入口执行 |
 | SPMD 与跨 task 分布 | 同 task 的 current+pending 去重；无有效票退款；快核可继续取剩余工作；不因前视制造多余尾波 |
 | 全窗口 WAIT、隐藏通知者 | 所有 worker 窗口占满 B，P 位于后续目录且分别覆盖纯核/MIX；PARK 后能发现和执行 P |
-| MIX 未来组阻塞补给 | 每簇未来位置被未 ready 的 MIX B 占据时，有界 PARK 后能领取目录后面的通知者 MIX P；组票不在 arming 时二次分配 |
+| MIX 未来组阻塞补给 | 每簇持有未 ready 的 MIX B 时目录仍前进；发现 ready 且有可领取单元的通知者 P 后让出 B；无替代项时保留原准备，竞争失败不恢复旧 handle；组票不在 arming 时二次分配 |
 | PARK 的发布/领取竞态 | PARKING 期间不执行；PARKED 唯一 winner；旧 owner 不再写或完成；新票耗尽后仍能发现停放票 |
 | 快路径持续命中 | CHECK/FINISH、Graph control 和窗口外发现仍得到有界服务，不能饿死终端 waiter |
 | MIX/cohort 交错 | 双 lane/三 lane/双 AIV、late lane、stage 与 hold 两种顺序、相邻 cohort 均无错误配对或循环等待 |
@@ -373,6 +377,7 @@ predicate 仍在合法执行边界读取；false 分支按既有整任务/组语
 
 ### 性能与保留规则
 
+- 整体性能目标仍是相对本次重构前的冻结基线提升 40% 以上；分阶段对已验证父版本的收益不能相加替代这项最终对照。5 µs 交接与整体 L0 收益分别验证，任何一项的局部样本不代表目标完成。
 - 最终性能以完整 device L0 `chip.run.runner_run.device_wall` 为准，覆盖 AICPU 设备入口到退出；每组 1 次预热、10 次计时。L1/L3 用于定位，不用首末业务 kernel 包络代替 L0。
 - 性能验收使用 `dsv41_scheduler` 完整 18 组配对对照，保持各组原 kernel、输入、图、sync_start 配置一致。18 组均须通过数值验证；14 组非通信场景的 L0 综合收益决定是否保留，同时披露逐项回退。四组通信场景记录性能，但不作为性能保留门槛；Graph、MIX、sync_start、defer_wait 的通用功能另按上述合同验证。单个 SWA 或其他模型的收益不能替代全套结果。
 - 所有硬件任务使用 `task-submit --device auto --device-num N`，在任务内使用并记录实际 `TASK_DEVICE`；attention 单卡，同一分配内做配对对照，记录先后顺序。

@@ -130,6 +130,7 @@ SCALAR_PHASES = frozenset(
         "scalar_cluster_mix_needs_service",
         "scalar_execution_continuation",
         "scalar_execution_token_fanin",
+        "scalar_cluster_mix_ready_replacement",
         "scalar_resolve",
         "scalar_mix",
         "scalar_async_check",

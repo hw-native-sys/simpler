@@ -888,6 +888,22 @@ TEST_F(HbgRetirementWiring, ResidentSwimlaneAccumulatesInterleavedEpochsAndKeeps
     EXPECT_EQ(merged.find("\"producer\": \"aicore\"", first + 1), std::string::npos);
     const auto body_start = json.find('[') + 1;
     EXPECT_NE(merged.find(json.substr(body_start, json.rfind(']') - body_start)), std::string::npos);
+    const std::string empty_snapshot = R"({"streams": []})";
+    const auto ordinary = phase_json(*a, &empty_snapshot, false);
+    const auto ordinary_start = ordinary.find('[') + 1;
+    const auto ordinary_body = ordinary.substr(ordinary_start, ordinary.rfind(']') - ordinary_start);
+    const std::string prefix = R"({"nested":{"streams":[]},"streams": [)";
+    const std::string suffix =
+        R"(],"prepared_calls":{"schema":"hbg-prepared-calls-v4","run_epoch":41,"source":"host",)"
+        R"("columns":["execution_index","node_ref","task_id","block_idx","subtask_slot","owner","phase","generation"],)"
+        R"("records":[[0,0,0,0,0,2,3,1]]}})";
+    for (const bool populated : {false, true}) {
+        SCOPED_TRACE(populated);
+        auto body = populated ? json.substr(body_start, json.rfind(']') - body_start) : " \n ";
+        if (populated) body.insert(body.find('{') + 1, R"("note":"escaped \" ] [ \\","nested":[[],[1,2]],)");
+        const auto snapshot = prefix + body + suffix;
+        EXPECT_EQ(phase_json(*a, &snapshot, false), prefix + body + (populated ? "," : "") + ordinary_body + suffix);
+    }
     for (size_t i = 0; i < 2; ++i)
         EXPECT_EQ(a->core[1][i].run_epoch, 41u);
     for (size_t i = 0; i < 4; ++i)

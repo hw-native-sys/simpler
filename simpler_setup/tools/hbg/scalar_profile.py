@@ -67,6 +67,7 @@ SCALAR_FUNCTIONS = {
     "scalar_cluster_mix_needs_service": "scheduler_cluster_mix_needs_service",
     "scalar_execution_continuation": "scheduler_try_execution_continuation",
     "scalar_execution_token_fanin": "scheduler_execution_token_observe_fanin",
+    "scalar_cluster_mix_ready_replacement": "scheduler_cluster_mix_ready_replacement",
     "scalar_resolve": "scheduler_resolve_completion_step",
     "scalar_mix": "scheduler_service_gm_mix",
     "scalar_async_check": "scheduler_async_check_step",
