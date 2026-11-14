@@ -66,6 +66,18 @@ inline __aicore__ __gm__ const SchedulerNativeGraphHeader *scheduler_native_head
     return header;
 }
 
+inline __aicore__ bool
+scheduler_native_child_arguments_valid(__gm__ const SchedulerGraphChildPlan &child, uint64_t args_bytes) {
+    return child.tensor_count <= MAX_TENSOR_ARGS && child.scalar_count <= MAX_SCALAR_ARGS &&
+           child.tensors_offset % 64 == 0 && child.scalars_offset % 64 == 0 && child.tensors_offset <= args_bytes &&
+           child.tensor_count <= (args_bytes - child.tensors_offset) / TASK_IMAGE_TENSOR_STRIDE &&
+           child.scalars_offset <= args_bytes &&
+           child.scalar_count <= (args_bytes - child.scalars_offset) / sizeof(uint64_t) &&
+           (child.predicate_offset == SCHEDULER_NATIVE_NO_PREDICATE ||
+            (child.predicate_offset % 64 == 0 && child.predicate_offset <= args_bytes &&
+             args_bytes - child.predicate_offset >= 64));
+}
+
 inline __aicore__ __gm__ const SchedulerGraphTemplate *
 scheduler_native_template_checked(uint64_t base, __gm__ const SchedulerNativeGraphHeader &header, uint32_t index) {
     if (index >= header.definition_count) return nullptr;
@@ -73,39 +85,30 @@ scheduler_native_template_checked(uint64_t base, __gm__ const SchedulerNativeGra
     const uint64_t end = header.readonly_end_offset;
     if (entry->task_count == 0 || entry->task_count > SUB_TASK_MAX_NUM ||
         entry->edge_count > entry->task_count * (entry->task_count - 1) / 2 || entry->sink_count == 0 ||
-        entry->sink_count > entry->task_count || entry->definition_bytes < sizeof(GraphDefinition) ||
-        entry->definition_bytes > UINT32_MAX || entry->args_bytes % 64 != 0 ||
-        entry->definition_offset < header.instances_offset + header.instance_count * sizeof(SchedulerGraphInstance) ||
-        !scheduler_native_region_valid(
-            end, entry->definition_offset, entry->definition_bytes, 1, GRAPH_DEFINITION_OBJECT_ALIGN
-        ) ||
+        entry->sink_count > entry->task_count || entry->args_bytes % 64 != 0 ||
+        entry->child_plans_offset < header.instances_offset + header.instance_count * sizeof(SchedulerGraphInstance) ||
         !scheduler_native_region_valid(
             end, entry->child_plans_offset, entry->task_count, sizeof(SchedulerGraphChildPlan),
             alignof(SchedulerGraphChildPlan)
         ) ||
         !scheduler_native_region_valid(
+            end, entry->fanin_offsets_offset, entry->task_count + 1, sizeof(int32_t), alignof(int32_t)
+        ) ||
+        !scheduler_native_region_valid(
             end, entry->sinks_offset, entry->sink_count, sizeof(uint16_t), alignof(uint16_t)
         ) ||
-        entry->child_plans_offset < entry->definition_offset + entry->definition_bytes ||
-        entry->sinks_offset < entry->child_plans_offset + entry->task_count * sizeof(SchedulerGraphChildPlan))
+        entry->fanin_offsets_offset < entry->child_plans_offset + entry->task_count * sizeof(SchedulerGraphChildPlan))
         return nullptr;
-    auto *def = reinterpret_cast<__gm__ const GraphDefinition *>(base + entry->definition_offset);
-    if (def->total_bytes != entry->definition_bytes || def->task_count <= 0 || def->edge_count < 0 ||
-        static_cast<uint64_t>(def->task_count) != entry->task_count ||
-        static_cast<uint64_t>(def->edge_count) != entry->edge_count || def->graph_key != entry->graph_key ||
-        def->required_heap != entry->required_heap || def->off_fanin_offsets < sizeof(GraphDefinition) ||
-        (entry->edge_count != 0 && def->off_fanin_indices < sizeof(GraphDefinition)) ||
-        entry->fanin_offsets_offset != entry->definition_offset + def->off_fanin_offsets ||
-        !scheduler_native_region_valid(
-            entry->definition_bytes, def->off_fanin_offsets, entry->task_count + 1, sizeof(int32_t), alignof(int32_t)
-        ) ||
-        (entry->edge_count == 0 ? (entry->fanin_indices_offset != 0 || def->off_fanin_indices != 0) :
-                                  (entry->fanin_indices_offset != entry->definition_offset + def->off_fanin_indices ||
-                                   !scheduler_native_region_valid(
-                                       entry->definition_bytes, def->off_fanin_indices, entry->edge_count,
-                                       sizeof(uint16_t), alignof(uint16_t)
-                                   ))))
+    const uint64_t rows_end = entry->fanin_offsets_offset + (entry->task_count + 1) * sizeof(int32_t);
+    if (entry->edge_count == 0) {
+        if (entry->fanin_indices_offset != 0 || entry->sinks_offset < rows_end) return nullptr;
+    } else if (!scheduler_native_region_valid(
+                   end, entry->fanin_indices_offset, entry->edge_count, sizeof(uint16_t), alignof(uint16_t)
+               ) ||
+               entry->fanin_indices_offset < rows_end ||
+               entry->sinks_offset < entry->fanin_indices_offset + entry->edge_count * sizeof(uint16_t)) {
         return nullptr;
+    }
     return entry;
 }
 

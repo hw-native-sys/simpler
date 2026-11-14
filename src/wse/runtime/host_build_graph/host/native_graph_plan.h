@@ -21,8 +21,8 @@
 
 // Owns the immutable recording bytes. Nothing refers to GraphHostState or its
 // staging arena, so prepare retry and park/resume may retain this value safely.
-struct NativeGraphDefinitionPlan {
-    GraphDefinition definition{};
+struct NativeGraphPlan {
+    Graph definition{};
     std::vector<std::byte> image;
     std::vector<SchedulerGraphChildPlan> children;
     std::vector<uint16_t> sinks;
@@ -34,12 +34,12 @@ struct NativeGraphDefinitionPlan {
 // Invalid input leaves out unchanged. Legal shapes not currently supported by
 // the resident executor still receive full validation before fallback is chosen.
 bool native_graph_plan_definition(
-    const void *image, size_t bytes, uint64_t graph_key, NativeGraphDefinitionPlan *out, std::string *error
+    const void *image, size_t bytes, uint64_t graph_key, NativeGraphPlan *out, std::string *error
 );
 
 struct NativeGraphHostPlan {
     std::vector<std::byte> legacy_section;
-    std::vector<NativeGraphDefinitionPlan> definitions;
+    std::vector<NativeGraphPlan> definitions;
     std::vector<SchedulerNodeBinding> bindings;
     std::vector<int64_t> completion_refs;
     std::vector<SchedulerGraphInstance> instances;

@@ -55,10 +55,10 @@ protected:
         ASSERT_TRUE(orch.init(sm_handle->sm_base, gm_heap.data(), HEAP_BYTES, CHIP_DEFAULT_GRAPH_TASKS));
 
         definition_staging.assign(STAGING_BYTES, std::byte{0});
-        GraphDefinitionArena arena{};
+        GraphImageArena arena{};
         arena.base = definition_staging.data();
         arena.capacity = definition_staging.size();
-        arena.object_prefix_bytes = sizeof(GraphDefinitionHeader);
+        arena.object_prefix_bytes = sizeof(GraphImageHeader);
         arena.object_align = GRAPH_DEFINITION_OBJECT_ALIGN;
         graph_state = make_graph_host_state(arena);
         ASSERT_NE(graph_state, nullptr);
@@ -150,13 +150,12 @@ TEST_F(HbgGraphRecordingBoundsTest, PreGraphProducerOfABoundaryTensorContributes
     ASSERT_TRUE(orch.submit_dummy_task(task_args).task_id().is_valid());
     ASSERT_TRUE(orch.graph_end());
 
-    const GraphHostDefinitionList published = graph_host_definitions(*graph_state);
+    const GraphHostImageList published = graph_host_definitions(*graph_state);
     ASSERT_EQ(published.entries.size(), 1u);
-    const GraphHostDefinition &entry = published.entries.front();
+    const GraphHostImage &entry = published.entries.front();
     ASSERT_NE(entry.object_offset, GRAPH_NO_OBJECT_OFFSET) << "the staging arena is sized to hold this image";
-    const auto *definition = reinterpret_cast<const GraphDefinition *>(
-        definition_staging.data() + entry.object_offset + sizeof(GraphDefinitionHeader)
-    );
+    const auto *definition =
+        reinterpret_cast<const Graph *>(definition_staging.data() + entry.object_offset + sizeof(GraphImageHeader));
     EXPECT_EQ(definition->task_count, 1u);
     EXPECT_EQ(definition->edge_count, 0u) << "the pre-Graph producer is reached through the shell, not through an "
                                              "edge the Definition carries";
@@ -197,13 +196,12 @@ TEST_F(HbgGraphRecordingBoundsTest, TwoViewsOfOneBufferShareAWindowAndKeepTheEdg
     ASSERT_TRUE(orch.submit_dummy_task(reader_args).task_id().is_valid());
     ASSERT_TRUE(orch.graph_end());
 
-    const GraphHostDefinitionList published = graph_host_definitions(*graph_state);
+    const GraphHostImageList published = graph_host_definitions(*graph_state);
     ASSERT_EQ(published.entries.size(), 1u);
-    const GraphHostDefinition &entry = published.entries.front();
+    const GraphHostImage &entry = published.entries.front();
     ASSERT_NE(entry.object_offset, GRAPH_NO_OBJECT_OFFSET);
-    const auto *definition = reinterpret_cast<const GraphDefinition *>(
-        definition_staging.data() + entry.object_offset + sizeof(GraphDefinitionHeader)
-    );
+    const auto *definition =
+        reinterpret_cast<const Graph *>(definition_staging.data() + entry.object_offset + sizeof(GraphImageHeader));
     EXPECT_EQ(definition->task_count, 2u);
     EXPECT_EQ(definition->edge_count, 1u) << "the reader depends on the writer through the buffer they share";
 }
@@ -242,13 +240,12 @@ TEST_F(HbgGraphRecordingBoundsTest, ABoundaryOfNoTensorsRecordsAndPublishes) {
 
     ASSERT_TRUE(orch.graph_end()) << "the recording end must publish what the submission end admitted";
 
-    const GraphHostDefinitionList published = graph_host_definitions(*graph_state);
+    const GraphHostImageList published = graph_host_definitions(*graph_state);
     ASSERT_EQ(published.entries.size(), 1u) << "a zero-tensor boundary yields a Definition like any other";
-    const GraphHostDefinition &entry = published.entries.front();
+    const GraphHostImage &entry = published.entries.front();
     ASSERT_NE(entry.object_offset, GRAPH_NO_OBJECT_OFFSET);
-    const auto *definition = reinterpret_cast<const GraphDefinition *>(
-        definition_staging.data() + entry.object_offset + sizeof(GraphDefinitionHeader)
-    );
+    const auto *definition =
+        reinterpret_cast<const Graph *>(definition_staging.data() + entry.object_offset + sizeof(GraphImageHeader));
     EXPECT_EQ(definition->boundary_tensor_count, 0);
     EXPECT_EQ(definition->boundary_scalar_count, 1);
     EXPECT_EQ(definition->task_count, 1u);
@@ -320,9 +317,8 @@ TEST_F(HbgGraphRecordingBoundsTest, ExplicitPredecessorsBelongToEachOuterShell) 
     const auto published = graph_host_definitions(*graph_state);
     ASSERT_EQ(published.entries.size(), 1U);
     const auto &entry = published.entries.front();
-    const auto *definition = reinterpret_cast<const GraphDefinition *>(
-        definition_staging.data() + entry.object_offset + sizeof(GraphDefinitionHeader)
-    );
+    const auto *definition =
+        reinterpret_cast<const Graph *>(definition_staging.data() + entry.object_offset + sizeof(GraphImageHeader));
     EXPECT_EQ(definition->task_count, 1U);
     EXPECT_EQ(definition->edge_count, 0U);
 }

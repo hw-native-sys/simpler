@@ -41,7 +41,7 @@ protected:
     // vector<std::byte>::data() is aligned for any fundamental type, which is what
     // an object base has to carry.
     std::vector<std::byte> definition_staging;
-    GraphDefinitionArena arena{};
+    GraphImageArena arena{};
 
     // A Graph task's heap allocation covers its tasks' packed outputs *and* the
     // execution storage the device materializes into, so the pool has to hold a
@@ -53,10 +53,10 @@ protected:
 
     // Where an entry's image is: in the arena at the offset it claimed, or in the
     // buffer it spilled to.
-    const GraphDefinition *definition_image(const GraphHostDefinition &entry) const {
+    const Graph *definition_image(const GraphHostImage &entry) const {
         const std::byte *image =
             entry.spill != nullptr ? entry.spill : arena.base + entry.object_offset + arena.object_prefix_bytes;
-        return reinterpret_cast<const GraphDefinition *>(image);
+        return reinterpret_cast<const Graph *>(image);
     }
 
     void SetUp() override {
@@ -69,7 +69,7 @@ protected:
         definition_staging.assign(STAGING_BYTES, std::byte{0});
         arena.base = definition_staging.data();
         arena.capacity = definition_staging.size();
-        arena.object_prefix_bytes = sizeof(GraphDefinitionHeader);
+        arena.object_prefix_bytes = sizeof(GraphImageHeader);
         arena.object_align = GRAPH_DEFINITION_OBJECT_ALIGN;
         graph_state = make_graph_host_state(arena);
         ASSERT_NE(graph_state, nullptr);
@@ -135,10 +135,10 @@ TEST_F(HbgGraphSubmitFailureTest, InFlightGraphInvocationsReserveHeapOnlyAtCommi
     const auto *first_end = static_cast<const char *>(first_upload->outer_slot->to_descriptor().packed_buffer_end);
     const auto *second_base = static_cast<const char *>(second_upload->outer_slot->to_descriptor().packed_buffer_base);
     const auto *second_end = static_cast<const char *>(second_upload->outer_slot->to_descriptor().packed_buffer_end);
-    const GraphHostDefinitionList definitions = graph_host_definitions(*graph_state);
+    const GraphHostImageList definitions = graph_host_definitions(*graph_state);
     ASSERT_EQ(definitions.entries.size(), 1u);
     ASSERT_EQ(definitions.entries[0].graph_key, first_upload->graph_key);
-    const GraphDefinition *definition = definition_image(definitions.entries[0]);
+    const Graph *definition = definition_image(definitions.entries[0]);
     const uint64_t expected_extent =
         CHIP_ALIGN_UP(definition->required_heap + definition->execution_storage_bytes, CHIP_ALIGN_SIZE);
     EXPECT_EQ(static_cast<uint64_t>(first_end - first_base), expected_extent);
@@ -245,9 +245,9 @@ TEST_F(HbgGraphSubmitFailureTest, WorkerRecordsWhileMainThreadSubmitsSameHashShe
     ASSERT_FALSE(orch.is_fatal());
     ASSERT_EQ(graph_host_upload_count(*graph_state), 3u);
 
-    const GraphHostDefinitionList definitions = graph_host_definitions(*graph_state);
+    const GraphHostImageList definitions = graph_host_definitions(*graph_state);
     ASSERT_EQ(definitions.entries.size(), 1u);
-    const GraphDefinition *definition = definition_image(definitions.entries[0]);
+    const Graph *definition = definition_image(definitions.entries[0]);
     const uint64_t expected_extent =
         CHIP_ALIGN_UP(definition->required_heap + definition->execution_storage_bytes, CHIP_ALIGN_SIZE);
 
@@ -1073,7 +1073,7 @@ TEST_F(HbgGraphSubmitFailureTest, RecordsAGraphWhoseBoundaryLivesInTheHeapWindow
         // and appends exactly one upload. That upload names this call's graph_key,
         // which is how the Definition is selected: graph_host_definitions walks an
         // unordered_map, so the order of `entries` says nothing about which call published which.
-        const GraphHostDefinitionList definitions = graph_host_definitions(*graph_state);
+        const GraphHostImageList definitions = graph_host_definitions(*graph_state);
         if (definitions.entries.size() != definitions_before + 1) {
             ADD_FAILURE() << "graph_key " << graph_key << " published "
                           << (definitions.entries.size() - definitions_before) << " Definitions, expected 1";
@@ -1089,8 +1089,8 @@ TEST_F(HbgGraphSubmitFailureTest, RecordsAGraphWhoseBoundaryLivesInTheHeapWindow
             ADD_FAILURE() << "graph_key " << graph_key << " has no upload at index " << uploads_before;
             return std::nullopt;
         }
-        const GraphHostDefinition *published = nullptr;
-        for (const GraphHostDefinition &entry : definitions.entries) {
+        const GraphHostImage *published = nullptr;
+        for (const GraphHostImage &entry : definitions.entries) {
             if (entry.graph_key == upload->graph_key) {
                 published = &entry;
                 break;
@@ -1100,7 +1100,7 @@ TEST_F(HbgGraphSubmitFailureTest, RecordsAGraphWhoseBoundaryLivesInTheHeapWindow
             ADD_FAILURE() << "graph_key " << graph_key << " published no Definition under its own graph_key";
             return std::nullopt;
         }
-        const GraphDefinition *def = definition_image(*published);
+        const Graph *def = definition_image(*published);
         if (def->boundary_tensor_count != 1 || def->tensor_arg_count != 2) {
             ADD_FAILURE() << "graph_key " << graph_key << " recorded " << def->boundary_tensor_count
                           << " boundaries and " << def->tensor_arg_count << " tensor args, expected 1 and 2";
@@ -1195,7 +1195,7 @@ TEST_F(HbgGraphSubmitFailureTest, AHiddenAllocTaskLeavesItsDispatchPredicateDefi
 }
 
 TEST(HbgGraphDefinitionClaims, PublishedAndRetainedInflightKeyClaimsOneDefinition) {
-    GraphHostState state(GraphDefinitionArena{});
+    GraphHostState state(GraphImageArena{});
     state.inflight.emplace(17, std::make_unique<GraphInflightRecording>());
     EXPECT_EQ(state.claimed_definitions(), 1u);
     state.definitions.try_emplace(17);
@@ -1205,7 +1205,7 @@ TEST(HbgGraphDefinitionClaims, PublishedAndRetainedInflightKeyClaimsOneDefinitio
 }
 
 TEST(HbgGraphDefinitionClaims, MixedPublishedAndUnpublishedKeysPreserveSixteenDefinitionLimit) {
-    GraphHostState state(GraphDefinitionArena{});
+    GraphHostState state(GraphImageArena{});
     for (uint64_t key = 0; key < 11; ++key) {
         state.definitions.try_emplace(key);
         state.inflight.emplace(key, std::make_unique<GraphInflightRecording>());

@@ -72,8 +72,8 @@ void reset_graph_payload(TaskPayload &payload) {
 // carry no alignment guarantee. The fanin rows and indices are validated from the
 // execution's copy rather than from the section, because that copy is what every
 // later scan reads — a check against the source would leave the copy unproven.
-bool bind_graph_topology(GraphExecution &execution, const GraphImageView &image, const GraphDefinitionValue &object) {
-    const GraphDefinition &definition = object.definition;
+bool bind_graph_topology(GraphExecution &execution, const GraphImageView &image, const GraphImageValue &object) {
+    const Graph &definition = object.definition;
     // Re-checked rather than inherited from graph_execution_localize: every section
     // below is fetched with task_count or task_count + 1, so a wire value outside this
     // range overflows the increment before any bound check can see it.
@@ -312,11 +312,11 @@ GraphExecution *graph_execution_localize(ChipTaskSlotState &outer_slot, const Gr
     // The descriptor names the Definition by its offset inside this run's
     // section; the bytes are reached through the caller's own view of that
     // section and never through an address any other thread could hold.
-    GraphDefinitionValue object{};
+    GraphImageValue object{};
     if (!graph_definition_decode_framed(image, outer_slot.to_descriptor().graph_definition_offset, &object)) {
         return nullptr;
     }
-    const GraphDefinition &definition = object.definition;
+    const Graph &definition = object.definition;
     TaskPayload &payload = outer_slot.to_payload();
     if (definition.total_bytes == 0 || definition.task_count <= 0 || definition.task_count > SUB_TASK_MAX_NUM ||
         payload.tensor_count != definition.boundary_tensor_count ||
@@ -369,7 +369,7 @@ GraphMaterializeResult graph_execution_materialize_slice(
     // Decoded again here, from this thread's own view: a slice may run on a
     // thread that did not localize this Graph, and the framing is what makes the
     // offset shared state carries usable against a section this thread holds.
-    GraphDefinitionValue object{};
+    GraphImageValue object{};
     if (!graph_definition_decode_framed(image, execution.definition_offset, &object)) {
         return GraphMaterializeResult::INVALID;
     }
@@ -392,7 +392,7 @@ GraphMaterializeResult graph_execution_materialize_slice(
     // Every section below is read one element at a time out of `image`, each read
     // bounded against its array, this Definition and the whole section, so no
     // array pointer into the package exists to outlive this call.
-    const GraphDefinition &definition = object.definition;
+    const Graph &definition = object.definition;
     if (definition.task_count != execution.task_count) {
         execution.materialize_busy.store(0, std::memory_order_release);
         return GraphMaterializeResult::INVALID;

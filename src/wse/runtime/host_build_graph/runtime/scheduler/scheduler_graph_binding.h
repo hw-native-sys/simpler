@@ -26,7 +26,7 @@ enum class SchedulerGraphBindingError : uint32_t {
 template <typename T>
 inline __aicore__ __gm__ const T *
 scheduler_definition_element(uint64_t base, uint64_t bytes, uint32_t offset, int32_t count, int32_t index) {
-    if (count <= 0 || index < 0 || index >= count || offset < sizeof(GraphDefinition) ||
+    if (count <= 0 || index < 0 || index >= count || offset < sizeof(Graph) ||
         !scheduler_native_region_valid(bytes, offset, static_cast<uint64_t>(count), sizeof(T), alignof(T)))
         return nullptr;
     return reinterpret_cast<__gm__ const T *>(base + offset) + index;
@@ -131,7 +131,7 @@ scheduler_bind_graph_arguments(const SchedulerGraphAccess &graph, int64_t ref) {
     if (child == nullptr) return SchedulerGraphBindingError::DEFINITION;
     const auto &instance = *node.instance;
     const uint64_t definition_base = graph.scheduler_state_address + node.definition->definition_offset;
-    auto *definition = reinterpret_cast<__gm__ const GraphDefinition *>(definition_base);
+    auto *definition = reinterpret_cast<__gm__ const Graph *>(definition_base);
     if (instance.boundary_tensor_count != static_cast<uint32_t>(definition->boundary_tensor_count) ||
         instance.boundary_scalar_count != static_cast<uint32_t>(definition->boundary_scalar_count) ||
         node.definition->required_heap > UINT64_MAX - instance.heap_base ||

@@ -89,7 +89,7 @@ std::vector<std::byte> make_test_definition(
     TestRoot root_variant = TestRoot::ORDINARY, TestEdDefect ed_defect = TestEdDefect::NONE,
     TestBoundary boundary_variant = TestBoundary::WITH_TENSOR
 ) {
-    std::vector<std::byte> image(sizeof(GraphDefinition));
+    std::vector<std::byte> image(sizeof(Graph));
 
     std::vector<int32_t> fanin_offsets{0, 0, 1};
     std::vector<uint16_t> fanin_indices{0};
@@ -179,7 +179,7 @@ std::vector<std::byte> make_test_definition(
         GraphScalarInheritance::self_value(),
     };
 
-    GraphDefinition definition{};
+    Graph definition{};
     definition.graph_key = graph_key;
     definition.required_heap = 128;
     definition.task_count = 2;
@@ -215,26 +215,24 @@ std::vector<std::byte> make_test_definition(
 }
 
 // A Definition device object exactly as bind_graph_definitions builds it:
-// [GraphDefinitionHeader][Definition image].
+// [GraphImageHeader][Definition image].
 class TestDefinitionObject {
 public:
     explicit TestDefinitionObject(const std::vector<std::byte> &definition, uint32_t retained_definition_bytes = 0) {
-        const size_t object_bytes = sizeof(GraphDefinitionHeader) + definition.size();
-        data_ = ::operator new(object_bytes, std::align_val_t(alignof(GraphDefinitionHeader)));
+        const size_t object_bytes = sizeof(GraphImageHeader) + definition.size();
+        data_ = ::operator new(object_bytes, std::align_val_t(alignof(GraphImageHeader)));
         std::memset(data_, 0, object_bytes);
-        auto *header = static_cast<GraphDefinitionHeader *>(data_);
-        const auto *def = reinterpret_cast<const GraphDefinition *>(definition.data());
+        auto *header = static_cast<GraphImageHeader *>(data_);
+        const auto *def = reinterpret_cast<const Graph *>(definition.data());
         header->magic = GRAPH_DEFINITION_OBJECT_MAGIC;
         header->definition_bytes =
             retained_definition_bytes == 0 ? static_cast<uint32_t>(definition.size()) : retained_definition_bytes;
         header->graph_key = def->graph_key;
-        std::memcpy(
-            static_cast<uint8_t *>(data_) + sizeof(GraphDefinitionHeader), definition.data(), definition.size()
-        );
+        std::memcpy(static_cast<uint8_t *>(data_) + sizeof(GraphImageHeader), definition.data(), definition.size());
         object_bytes_ = object_bytes;
     }
 
-    ~TestDefinitionObject() { ::operator delete(data_, std::align_val_t(alignof(GraphDefinitionHeader))); }
+    ~TestDefinitionObject() { ::operator delete(data_, std::align_val_t(alignof(GraphImageHeader))); }
 
     uint64_t address() const { return reinterpret_cast<uint64_t>(data_); }
     // The object as a one-object Definition section, which is what a reader
@@ -246,19 +244,17 @@ public:
         v.bytes = static_cast<uint32_t>(object_bytes_);
         return v;
     }
-    static uint32_t image_offset() { return static_cast<uint32_t>(sizeof(GraphDefinitionHeader)); }
+    static uint32_t image_offset() { return static_cast<uint32_t>(sizeof(GraphImageHeader)); }
     // The object's bytes, writable, so a case can poison the source while it is
     // still alive rather than inferring anything from a freed allocation.
     std::byte *mutable_section() { return static_cast<std::byte *>(data_); }
     size_t section_bytes() const { return object_bytes_; }
-    const GraphDefinition *definition() const {
-        return reinterpret_cast<const GraphDefinition *>(
-            static_cast<const uint8_t *>(data_) + sizeof(GraphDefinitionHeader)
-        );
+    const Graph *definition() const {
+        return reinterpret_cast<const Graph *>(static_cast<const uint8_t *>(data_) + sizeof(GraphImageHeader));
     }
     // Frames the object around a Graph other than the one its image holds, which is
     // the shape a mis-packed shared block produces.
-    void reframe_graph_key(uint64_t graph_key) { static_cast<GraphDefinitionHeader *>(data_)->graph_key = graph_key; }
+    void reframe_graph_key(uint64_t graph_key) { static_cast<GraphImageHeader *>(data_)->graph_key = graph_key; }
 
 private:
     void *data_{nullptr};
@@ -301,7 +297,7 @@ public:
         CHIP_ALIGN_UP(static_cast<size_t>(GRAPH_MAX_SCALAR_ARGS), ARG_POOL_ALIGN / sizeof(uint64_t));
 
     OuterHeap(const std::vector<std::byte> &definition_image, uint8_t fill = 0) {
-        const auto *definition = reinterpret_cast<const GraphDefinition *>(definition_image.data());
+        const auto *definition = reinterpret_cast<const Graph *>(definition_image.data());
         heap_bytes_ = static_cast<size_t>(definition->required_heap);
         storage_ = std::make_unique<AlignedStorage>(heap_bytes_ + definition->execution_storage_bytes, fill);
         storage_entry_.task.packed_buffer_base = base();
@@ -327,7 +323,7 @@ public:
     GraphExecution *initialize_execution(
         const TestDefinitionObject &definition_object, uint64_t boundary_address, uint64_t boundary_scalar
     ) {
-        const GraphDefinition *definition = definition_object.definition();
+        const Graph *definition = definition_object.definition();
         if (static_cast<size_t>(definition->boundary_tensor_count) > TENSOR_SLOTS ||
             definition->boundary_scalar_count > SCALAR_SPAN) {
             return nullptr;

@@ -291,7 +291,7 @@ bool graph_classify_tensor(const GraphRecording &recording, int32_t task_index, 
 // settled without writing any of it so the destination can be claimed at the
 // exact size. required_heap comes from the fill, which is the pass that walks the
 // tasks in order.
-std::optional<GraphDefinition> graph_layout_definition(const GraphRecording &recording) {
+std::optional<Graph> graph_layout_definition(const GraphRecording &recording) {
     // The boundary's tensor count is bounded above by the fixed boundary and not at all below.
     // GRAPH_MAX_TENSOR_ARGS is the cap `GraphTaskArgs` is sized to, so this states the same
     // contract `rt_graph_args_cacheable` admits a submission under; the two have to agree,
@@ -343,7 +343,7 @@ std::optional<GraphDefinition> graph_layout_definition(const GraphRecording &rec
     }
     if (predicate_count > UINT16_MAX) return std::nullopt;
 
-    GraphDefinition definition{};
+    Graph definition{};
     definition.graph_key = recording.graph_key;
     definition.task_count = recording.task_count;
     definition.edge_count = total_fanins;
@@ -367,7 +367,7 @@ std::optional<GraphDefinition> graph_layout_definition(const GraphRecording &rec
     }
     definition.execution_storage_bytes = static_cast<uint32_t>(execution_storage_bytes);
 
-    size_t image_bytes = sizeof(GraphDefinition);
+    size_t image_bytes = sizeof(Graph);
     if (!graph_layout_section<int32_t>(recording.task_count + 1, &image_bytes, &definition.off_fanout_offsets) ||
         !graph_layout_section<uint16_t>(total_fanins, &image_bytes, &definition.off_fanout_indices) ||
         !graph_layout_section<int32_t>(recording.task_count + 1, &image_bytes, &definition.off_fanin_offsets) ||
@@ -398,7 +398,7 @@ std::optional<GraphDefinition> graph_layout_definition(const GraphRecording &rec
 // between sections, and `SubTaskDefinition`'s interior padding, which the
 // per-field assignment below cannot reach and a static_assert on that struct's
 // size pins against further growth.
-bool graph_fill_definition(const GraphRecording &recording, GraphDefinition definition, std::byte *image) {
+bool graph_fill_definition(const GraphRecording &recording, Graph definition, std::byte *image) {
     if (image == nullptr) return false;
     always_assert(
         reinterpret_cast<uintptr_t>(image) % GRAPH_DEFINITION_OBJECT_ALIGN == 0 &&
@@ -561,9 +561,9 @@ bool graph_fill_definition(const GraphRecording &recording, GraphDefinition defi
 // The image at `data`, once it is a Definition of exactly `bytes`. Rejects a
 // region whose own total_bytes disagrees, which is what makes a record's
 // bookkeeping and the bytes it points at one fact rather than two.
-const GraphDefinition *graph_definition(const std::byte *data, size_t bytes) {
-    if (data == nullptr || bytes < sizeof(GraphDefinition)) return nullptr;
-    const auto *definition = reinterpret_cast<const GraphDefinition *>(data);
+const Graph *graph_definition(const std::byte *data, size_t bytes) {
+    if (data == nullptr || bytes < sizeof(Graph)) return nullptr;
+    const auto *definition = reinterpret_cast<const Graph *>(data);
     return definition->total_bytes == bytes ? definition : nullptr;
 }
 

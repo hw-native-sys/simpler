@@ -312,16 +312,7 @@ scheduler_native_child_plan_checked(const SchedulerGraphView &graph, const Sched
                       graph.scheduler_state_address + node.definition->child_plans_offset
                   ) +
                   node.binding->source_index;
-    if (child->tensor_count > MAX_TENSOR_ARGS || child->scalar_count > MAX_SCALAR_ARGS ||
-        child->tensors_offset % 64 != 0 || child->scalars_offset % 64 != 0 ||
-        child->tensors_offset > node.definition->args_bytes ||
-        child->tensor_count > (node.definition->args_bytes - child->tensors_offset) / TASK_IMAGE_TENSOR_STRIDE ||
-        child->scalars_offset > node.definition->args_bytes ||
-        child->scalar_count > (node.definition->args_bytes - child->scalars_offset) / sizeof(uint64_t) ||
-        (child->predicate_offset != SCHEDULER_NATIVE_NO_PREDICATE &&
-         (child->predicate_offset % 64 != 0 || child->predicate_offset > node.definition->args_bytes ||
-          node.definition->args_bytes - child->predicate_offset < 64)))
-        return nullptr;
+    if (!scheduler_native_child_arguments_valid(*child, node.definition->args_bytes)) return nullptr;
     return child;
 }
 
