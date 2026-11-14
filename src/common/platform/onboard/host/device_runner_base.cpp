@@ -1257,9 +1257,11 @@ int DeviceRunnerBase::acquire_retained_temp(
             "acquire_retained_temp: workspace refused %zu bytes for slot %u: %s; the slot keeps its previous block",
             bytes, pipeline_slot, workspace_refusal_text(attempt.why)
         );
+        const bool manual_quota = !auto_admission_.enabled() && outcome == GrowthAttempt::Refused &&
+                                  attempt.why == WorkspaceManager::AcquireRefusal::OverQuota;
         const int refusal = report_growth_refusal(pipeline_slot, AutoAdmissionState::Phase::Staging, bytes, outcome);
         if (refusal != 0) return refusal;
-        return PTO_RUNTIME_ERR_INTERNAL;
+        return manual_quota ? SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE : PTO_RUNTIME_ERR_INTERNAL;
     }
     auto_admission_.note_input_staging_held(pipeline_slot);
     // The previous block keeps its address and its contents: the slot stops
@@ -1703,10 +1705,13 @@ int DeviceRunnerBase::setup_static_arena(
             "and capacities",
             name, requested, arena_bank
         );
+        const bool manual_quota = !auto_admission_.enabled() && growth == GrowthAttempt::Refused &&
+                                  workspace_prepare_state().last_refusal == WorkspaceManager::AcquireRefusal::OverQuota;
         const int refusal = report_growth_refusal(
             workspace_prepare_state().pipeline_slot, AutoAdmissionState::Phase::Committing, requested, growth
         );
         if (refusal != 0) return refusal;
+        if (manual_quota) return SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE;
     }
     return outcome.rc;
 }

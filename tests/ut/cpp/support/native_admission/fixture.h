@@ -43,15 +43,17 @@ inline bool refuse_after_callback = false;
 inline std::function<void()> callback_hook;
 extern thread_local bool refuse_next_host_allocation;
 
+enum class AdmissionMode { Automatic, FixedGrant };
+
 class Runner : public DeviceRunnerBase {
 public:
-    explicit Runner(bool managed_workspace = true) {
+    explicit Runner(bool managed_workspace = true, AdmissionMode mode = AdmissionMode::Automatic) {
         device_id_ = 0;
         timeout_configuration_rc_ = 0;
         max_block_dim_ = block_dim_ = 1;
         if (managed_workspace) EXPECT_EQ(install_staged_workspace(), 0);
         EXPECT_TRUE(set_run_resource_grant(6));
-        enable_automatic_admission();
+        if (mode == AdmissionMode::Automatic) enable_automatic_admission();
         CallableState callable;
         callable.hash = 1;
         callable.chip_buffer_hash = 1;

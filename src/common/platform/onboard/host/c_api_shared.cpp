@@ -1659,7 +1659,8 @@ static int park_prepare(OnboardNativeRunContext *state, int wait_rc) {
 /** Whether this code asks the caller to keep the run and try again later. */
 static bool is_resource_wait(int rc) { return rc == SIMPLER_RUNTIME_ERR_RESOURCE_WAIT; }
 
-static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_rc) {
+static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_rc, bool thread_attached) {
+    DeviceRunnerBase *const runner = state->runner;
     const uint64_t run_epoch = state->descriptor.run_epoch;
     const uint64_t trace_inv = state->trace_inv;
     const uint64_t trace_hid = state->trace_hid;
@@ -1702,9 +1703,10 @@ static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_
     // Before the slot becomes reusable, for the same reason as in
     // simpler_finalize_run: a successor claiming this slot records against it,
     // and this run's terminal fact must land while the slot is still its own.
-    // This path frees nothing — whatever it leaves unreferenced is released at
-    // the next boundary that can prove the calling thread is attached, which
-    // this one cannot (it is reached from the attach failure itself).
+    // Failed attachment leaves unreferenced backing for a later attached
+    // boundary. Only this call's successful thread attachment and checked
+    // cleanup permit reclamation below; unconfirmed frees remain owned and
+    // are not retried by ordinary reclamation.
     //
     // A prepare that failed ends its run, so it ends that run's plan too: the
     // wait set it captured and the growth permission it holds belong to this
@@ -1730,11 +1732,19 @@ static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_
     state->runner->release_device_run_result(state->descriptor.pipeline_slot, state->descriptor.run_epoch, true);
     state->runner->release_native_run_observation(state);
     destroy_native_run_context(state);
+    int reclaim_rc = 0;
+    if (thread_attached && validation_rc == 0 && resources_rc == 0) {
+        try {
+            reclaim_rc = runner->reclaim_workspace_obsolete();
+        } catch (...) {
+            reclaim_rc = PTO_RUNTIME_ERR_INTERNAL;
+        }
+    }
     emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns, trace_attrs);
     if (validation_rc != 0) return validation_rc;
     if (resources_rc != 0) return resources_rc;
     publish_released_preparation(state, run_epoch);
-    return execution_rc;
+    return execution_rc != 0 ? execution_rc : reclaim_rc;
 }
 
 int simpler_prepare_run(
@@ -1823,6 +1833,7 @@ int simpler_prepare_run(
     std::optional<DeviceRunnerBase::PrepareWorkspaceScope> workspace_scope;
     std::optional<HostDependencyCaptureScope> capture_scope;
     OnboardNativeRunContext *state = nullptr;
+    bool thread_attached = false;
     const uint64_t trace_hid = runner->callable_hash(callable_id);
     const uint64_t trace_inv = STRACE_ALLOC_INV();
     const long long trace_start_ns = STRACE_NOW_NS();
@@ -1897,11 +1908,12 @@ int simpler_prepare_run(
                 "(enable_dump_args=%d) is unavailable rather than empty; nothing was prepared",
                 config->enable_dump_args
             );
-            return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_UNSUPPORTED);
+            return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_UNSUPPORTED, thread_attached);
         }
 
         int rc = runner->enter_run_thread();
-        if (rc != 0) return cleanup_failed_prepare(state, rc);
+        if (rc != 0) return cleanup_failed_prepare(state, rc, thread_attached);
+        thread_attached = true;
         // This thread is now proven attached, which is what a device release
         // needs. Obsolete generations left by earlier runs — including a
         // staging a failed prepare abandoned — are released here rather than
@@ -1914,14 +1926,14 @@ int simpler_prepare_run(
         // with no indication of it at all unless a later growth happened to
         // refuse. The cleanup path releases whatever this prepare had taken.
         const int reclaim_rc = runner->reclaim_workspace_obsolete();
-        if (reclaim_rc != 0) return cleanup_failed_prepare(state, reclaim_rc);
+        if (reclaim_rc != 0) return cleanup_failed_prepare(state, reclaim_rc, thread_attached);
         // Existing diagnostic capture prepares before Begin. A diagnostic-free
         // capture prepare may run during framework recording and need a relaxed
         // thread capture mode for private worker initialization.
         const bool cold_capture = state->descriptor.prepare_purpose == SIMPLER_PREPARE_CAPTURE &&
                                   !DfxRunConfig::from(*config).diagnostics_any();
         const int storage_rc = runner->prepare_run_storage(state->descriptor.pipeline_slot, cold_capture);
-        if (storage_rc != 0) return cleanup_failed_prepare(state, storage_rc);
+        if (storage_rc != 0) return cleanup_failed_prepare(state, storage_rc, thread_attached);
 
         if (overlaps_active_run) {
             // The probe exists to protect a *shared* arena bank, so require it
@@ -1951,7 +1963,7 @@ int simpler_prepare_run(
                     "runtime declares its arena per run; preparing at depth one after that run's fence (%s)",
                     state->descriptor.pipeline_slot, state->descriptor.arena_bank, state->trace_attrs
                 );
-                return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE);
+                return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE, thread_attached);
             }
             int compatibility_rc = shares_arena_bank ? 0 : 1;
             if (shares_arena_bank) {
@@ -1982,16 +1994,16 @@ int simpler_prepare_run(
                         state->trace_attrs
                     );
                 }
-                return cleanup_failed_prepare(state, compatibility_rc);
+                return cleanup_failed_prepare(state, compatibility_rc, thread_attached);
             }
         }
 
         state->runner_resources_owned = true;
         rc = runner->provision_native_run_resources(state->descriptor.pipeline_slot);
-        if (rc != 0) return cleanup_failed_prepare(state, rc);
+        if (rc != 0) return cleanup_failed_prepare(state, rc, thread_attached);
 
         rc = runner->prepare_launch_shape(*state->runtime, state->config);
-        if (rc != 0) return cleanup_failed_prepare(state, rc);
+        if (rc != 0) return cleanup_failed_prepare(state, rc, thread_attached);
 
         // Latches what a device-context query answers from. Skipped for a
         // successor prepared against an active predecessor, whose configuration
@@ -2014,13 +2026,13 @@ int simpler_prepare_run(
             // its pooled regions — so it is the one step that can ask to be
             // stood down rather than ended.
             if (is_resource_wait(rc)) return park_prepare(state, rc);
-            return cleanup_failed_prepare(state, rc);
+            return cleanup_failed_prepare(state, rc, thread_attached);
         }
         if (set_run_ccu_workspace_impl != nullptr) {
             rc = set_run_ccu_workspace_impl(state->runtime.get(), state->descriptor.ccu_workspace_addr);
-            if (rc != 0) return cleanup_failed_prepare(state, rc);
+            if (rc != 0) return cleanup_failed_prepare(state, rc, thread_attached);
         } else if (state->descriptor.ccu_workspace_addr != 0) {
-            return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+            return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_INVALID_ARGUMENT, thread_attached);
         }
         // Bind owns the source image. Snapshot it into this run's launch
         // metadata. Launch publishes those pinned bytes before the descriptor
@@ -2031,7 +2043,7 @@ int simpler_prepare_run(
         }
         if (rc != 0) {
             LOG_ERROR("simpler_prepare_run: publishing this run's image failed: %d (%s)", rc, state->trace_attrs);
-            return cleanup_failed_prepare(state, rc);
+            return cleanup_failed_prepare(state, rc, thread_attached);
         }
         emit_host_dep_gen_graph(runner, state->config, state->descriptor.run_epoch, state->trace_attrs);
         // This run's own input bytes, into the buffers its bind just named.
@@ -2041,7 +2053,7 @@ int simpler_prepare_run(
         }
         if (rc != 0) {
             LOG_ERROR("simpler_prepare_run: staging this run's inputs failed: %d (%s)", rc, state->trace_attrs);
-            return cleanup_failed_prepare(state, rc);
+            return cleanup_failed_prepare(state, rc, thread_attached);
         }
         {
             STRACE("chip.run.prepare_execution");
@@ -2050,11 +2062,11 @@ int simpler_prepare_run(
                 &state->prepared_execution
             );
         }
-        if (rc != 0) return cleanup_failed_prepare(state, rc);
+        if (rc != 0) return cleanup_failed_prepare(state, rc, thread_attached);
         rc = runner->retain_prepared_run_resources(
             *state->prepared_execution, state->descriptor.arena_bank, callable_id
         );
-        if (rc != 0) return cleanup_failed_prepare(state, rc);
+        if (rc != 0) return cleanup_failed_prepare(state, rc, thread_attached);
         // A launch-time property of the run, carried from the descriptor the
         // caller filled: whether it builds the boundary that makes it joinable.
         // Only honoured where the runtime supports being joined at all, so no
@@ -2077,7 +2089,7 @@ int simpler_prepare_run(
         runner->mark_native_run_prepared(state);
         return 0;
     } catch (...) {
-        if (state != nullptr) return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_INTERNAL);
+        if (state != nullptr) return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_INTERNAL, thread_attached);
         publish_released_preparation(runtime, descriptor->run_epoch);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
