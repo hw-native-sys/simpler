@@ -141,7 +141,7 @@ TEST(HbgSpmdLayout, PreservesCompactMetadataAndAtomicLineBoundaries) {
     EXPECT_EQ(offsetof(SchedulerTaskMetadata, logical_block_num), 14u);
     EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskMetadata::timing_slot), int16_t>));
     EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskMetadata::logical_block_num), uint16_t>));
-    EXPECT_EQ(sizeof(SchedulerTaskControl), 768u);
+    EXPECT_EQ(sizeof(SchedulerTaskControl), 640u);
     EXPECT_EQ(alignof(SchedulerTaskControl), 128u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, claim_tickets), 0u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, next_block), 128u);
@@ -173,7 +173,6 @@ TEST(HbgSpmdLayout, CloseSealRowsReserveOne64ByteCellForEveryEligibleCluster) {
 TEST(HbgSpmdLayout, ConcurrentBlockCountersUseSeparateCacheLines) {
     constexpr size_t cursor = offsetof(SchedulerTaskControl, next_block);
     constexpr size_t completed = offsetof(SchedulerTaskControl, completion_state);
-    EXPECT_NE(cursor / 128, offsetof(SchedulerTaskControl, parked_count) / 128);
     EXPECT_NE(completed / 128, cursor / 128);
     EXPECT_NE(cursor / 128, offsetof(SchedulerTaskControl, claim_seal) / 128);
     EXPECT_NE(completed / 128, offsetof(SchedulerTaskControl, claim_seal) / 128);
@@ -199,9 +198,8 @@ TEST(HbgSpmdLayout, AdmissionPhaseOwnsAnIsolatedBypassPublicationRegion) {
     constexpr size_t phase = offsetof(SchedulerTaskControl, admission_state);
     EXPECT_EQ(phase % 64, 0u);
     for (size_t atomic :
-         {offsetof(SchedulerTaskControl, parked_count), offsetof(SchedulerTaskControl, claim_tickets),
-          offsetof(SchedulerTaskControl, next_block), offsetof(SchedulerTaskControl, completion_state),
-          offsetof(SchedulerTaskControl, claim_seal)})
+         {offsetof(SchedulerTaskControl, claim_tickets), offsetof(SchedulerTaskControl, next_block),
+          offsetof(SchedulerTaskControl, completion_state), offsetof(SchedulerTaskControl, claim_seal)})
         EXPECT_NE(phase / 64, atomic / 64);
     EXPECT_LE(phase + 64, sizeof(SchedulerTaskControl));
 }

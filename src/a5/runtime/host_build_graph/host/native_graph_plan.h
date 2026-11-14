@@ -21,7 +21,7 @@
 #include "scheduler/scheduler_graph_binding.h"
 
 // Owns the immutable recording bytes. Nothing refers to GraphHostState or its
-// staging arena, so prepare retry and park/resume may retain this value safely.
+// staging arena; preparation retries retain this independent value.
 struct NativeGraphDefinitionPlan {
     GraphDefinition definition{};
     std::vector<std::byte> image;

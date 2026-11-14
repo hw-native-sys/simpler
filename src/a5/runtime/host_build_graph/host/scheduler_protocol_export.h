@@ -32,6 +32,9 @@ struct SchedulerProtocolTaskSpec {
     uint64_t public_task_id{0};
     uint32_t original_task_id{0};
     uint32_t local_child_id{UINT32_MAX};
+    uint32_t schedule_rank{UINT32_MAX};
+    uint32_t topological_level{UINT32_MAX};
+    uint32_t bottom_level{UINT32_MAX};
 };
 
 inline std::vector<SchedulerProtocolTaskSpec>
@@ -425,6 +428,11 @@ inline std::string scheduler_export_protocol(
             row.lane_mask("active_mask", task.metadata.active_mask);
             row.number("block_num", task.metadata.logical_block_num);
             row.number("trace_base", task.metadata.trace_index_base);
+            if (task.schedule_rank != UINT32_MAX) {
+                row.number("schedule_rank", task.schedule_rank);
+                row.number("topological_level", task.topological_level);
+                row.number("bottom_level", task.bottom_level);
+            }
             row.numbers("kernel_ids", task.metadata.kernel_ids, 3);
             row.numbers("dependencies", task.dependencies.data(), task.dependencies.size());
         }
@@ -465,7 +473,6 @@ inline std::string scheduler_export_protocol(
             row.number("pending_compute", scheduler_completion_remaining(completion));
             row.number("completion_debt", scheduler_completion_debt(completion));
             row.number("next_block", controls[task].next_block);
-            row.number("parked_count", controls[task].parked_count);
             row.number("claim_tickets", controls[task].claim_tickets);
             row.number("completed_subtasks", physical ? scheduler_completion_count(completion) : 0);
             row.number("admission_state", controls[task].admission_state);
@@ -474,14 +481,16 @@ inline std::string scheduler_export_protocol(
         out << ']';
         sparse(
             root, "task_events", image.array<SchedulerProtocolTaskTrace>(plan.tasks_offset, plan.task_count),
-            plan.task_count, [](JsonObject &row, const auto &record) {
+            plan.task_count,
+            [](JsonObject &row, const auto &record) {
                 actor(row, "admission", record.admission);
                 actor(row, "completion", record.completion);
             }
         );
         sparse(
             root, "members", image.array<SchedulerProtocolMemberTrace>(plan.members_offset, plan.member_count),
-            plan.member_count, [](JsonObject &row, const auto &record) {
+            plan.member_count,
+            [](JsonObject &row, const auto &record) {
                 row.stamp("observed", record.observed);
                 row.stamp("closed", record.closed);
                 row.number("run_epoch", record.run_epoch);
@@ -500,7 +509,8 @@ inline std::string scheduler_export_protocol(
         );
         sparse(
             root, "blocks", image.array<SchedulerProtocolBlockTrace>(plan.blocks_offset, plan.trace_count),
-            plan.trace_count, [](JsonObject &row, const auto &record) {
+            plan.trace_count,
+            [](JsonObject &row, const auto &record) {
                 block_owner(row, record.owner);
                 claim_certificate(row, record.claim);
                 sparse(row, "lanes", record.lanes, 3, lane);

@@ -17,6 +17,7 @@
 #include <utility>
 
 #include "common/chip_swimlane_extension.h"
+#include "common/notification_context.h"
 
 // Borrowed source views, valid through stage_launch_metadata; the platform
 // captures values and never takes ownership of the source containers.
@@ -292,6 +293,10 @@ struct HostApiOps {
     int (*stage_launch_metadata)(
         void *runner_ctx, uint32_t pipeline_slot, const HostMetadataRegion *regions, size_t count
     );
+    // An immutable Host snapshot does not extend the device allocation lifetime.
+    std::shared_ptr<const HostNotificationContext> (*acquire_notification_context)(void *runner_ctx, uint64_t address){
+        nullptr
+    };
 };
 
 /**
@@ -567,6 +572,12 @@ public:
     bool caller_device_span_written_by_other_run(uint64_t addr, uint64_t bytes) const noexcept {
         if (ops_->caller_device_span_written_by_other_run == nullptr) return false;
         return ops_->caller_device_span_written_by_other_run(runner_ctx_, run_identity(), addr, bytes) != 0;
+    }
+
+    std::shared_ptr<const HostNotificationContext> acquire_notification_context(uint64_t address) const {
+        return ops_ == nullptr || ops_->acquire_notification_context == nullptr ?
+                   nullptr :
+                   ops_->acquire_notification_context(runner_ctx_, address);
     }
 
 private:

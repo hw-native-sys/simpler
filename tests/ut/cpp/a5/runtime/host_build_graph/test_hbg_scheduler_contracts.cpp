@@ -546,7 +546,6 @@ TEST(SchedulerState, PlansAndInitializesTaskCatalogAndCompletionState) {
         EXPECT_TRUE(scheduler_completion_valid(controls[task].completion_state));
         EXPECT_FALSE(scheduler_completion_done(controls[task].completion_state));
         EXPECT_EQ(controls[task].next_block, 0u);
-        EXPECT_EQ(controls[task].parked_count, 0u);
     }
     const auto &pool = *scheduler_state_at<SchedulerTaskCatalogHeader>(storage.base(), ready_plan.header_offset);
     EXPECT_EQ(pool.version, SCHEDULER_TASK_CATALOG_VERSION);
@@ -589,11 +588,10 @@ TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
 
     std::array<SchedulerTaskControl, 2> controls{};
     std::array<SchedulerWorkerContext, 2> contexts{};
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 768u);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 640u);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(&contexts[1]) - reinterpret_cast<uintptr_t>(&contexts[0]), 320u);
     EXPECT_NE(offsetof(SchedulerTaskControl, next_block) / 128, offsetof(SchedulerTaskControl, claim_tickets) / 128);
     EXPECT_NE(offsetof(SchedulerTaskControl, next_block) / 128, offsetof(SchedulerTaskControl, completion_state) / 128);
-    EXPECT_NE(offsetof(SchedulerTaskControl, next_block) / 128, offsetof(SchedulerTaskControl, parked_count) / 128);
 
     EXPECT_EQ(
         offsetof(SchedulerTaskTrace, dispatch_start_cycles) / 64, offsetof(SchedulerTaskTrace, complete_loop_iter) / 64

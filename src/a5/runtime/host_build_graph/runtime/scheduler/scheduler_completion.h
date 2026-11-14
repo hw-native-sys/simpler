@@ -29,9 +29,8 @@ scheduler_flush_completions(__gm__ SchedulerRunControl *run_control, SchedulerLo
 
 enum class SchedulerSubtaskFinishResult : uint8_t { PARTIAL, TASK_LAST, TASK_LAST_DEFERRED, ERROR };
 
-// Cancellation owns only an unstarted local handle. Armed groups and shared
-// PARKED units have no such owner; the failed run's all-core retirement fence
-// revokes them before the next epoch initializes or reuses their storage.
+// Cancellation owns only an unstarted local handle. Armed groups retire at
+// the failed run's all-core fence before their storage can be reused.
 static inline __aicore__ bool
 scheduler_cancel_unstarted_handle(__gm__ void *base, SchedulerLocalState *local, SchedulerPreparedHandle *handle) {
     const auto *prepared = local->config.prepared;
@@ -39,8 +38,8 @@ scheduler_cancel_unstarted_handle(__gm__ void *base, SchedulerLocalState *local,
         scheduler_prepared_owner(handle->claimed_state) != local->worker_id())
         return false;
     const auto phase = scheduler_prepared_phase(handle->claimed_state);
-    if (phase != SchedulerPreparedPhase::CLAIMED && phase != SchedulerPreparedPhase::PARKING &&
-        phase != SchedulerPreparedPhase::GROUP_RESERVED && phase != SchedulerPreparedPhase::FAILED)
+    if (phase != SchedulerPreparedPhase::CLAIMED && phase != SchedulerPreparedPhase::GROUP_RESERVED &&
+        phase != SchedulerPreparedPhase::FAILED)
         return false;
     if (phase != SchedulerPreparedPhase::FAILED) {
         auto *control = scheduler_prepared_control_at(base, prepared, handle->execution_index);

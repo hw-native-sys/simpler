@@ -27,11 +27,13 @@
 #include "platform_comm/comm_domain_onboard.h"
 #include "platform_comm/ccu/ccu_domain_owner.h"
 #include "ccu_domain_backend_hcomm.h"
+#include "notification_context.h"
 #include "task_interface/ccu_module_package.h"
 
 #include "common/unified_log.h"
 #include "host/file_marker_handshake.h"
 #include "host/raii_scope_guard.h"
+#include "host/notification_context_registry.h"
 
 #include <algorithm>
 #include <array>
@@ -143,6 +145,8 @@ struct DomainAllocation {
     SimplerCcuWorkspace ccu_workspace{};
     void *ccu_workspace_addr = nullptr;
     size_t mapping_size = 0;
+    CommContext notification_host_context{};
+    NotificationContextRegistry::Key notification_key{-1, 0};
 };
 
 struct CommHandle_ {
@@ -167,6 +171,12 @@ struct CommHandle_ {
     std::unique_ptr<pto::comm::sdma::SdmaWorkspaceManager> sdma_workspace;
     void *sdma_workspace_addr = nullptr;
 };
+
+static NotificationContextRegistry notification_contexts;
+
+std::shared_ptr<const HostNotificationContext> comm_acquire_notification_context(int32_t device, uint64_t address) {
+    return notification_contexts.acquire(device, address);
+}
 
 // ============================================================================
 // Helpers
@@ -1041,6 +1051,10 @@ static bool close_domain_resources(DomainAllocation &alloc) {
     } else if (!release_domain_window(alloc.local_buf, alloc.own_handle, alloc.local_mapped)) {
         return false;
     }
+    if (alloc.notification_key.second != 0) {
+        notification_contexts.erase(alloc.notification_key);
+        alloc.notification_key = {-1, 0};
+    }
     alloc.cleanup_failed = false;
     return true;
 }
@@ -1842,6 +1856,7 @@ static int domain_alloc_via_ipc(
         }
     }
 
+    out->notification_host_context = ctx;
     if (comm_domain_onboard::upload_context(ctx, out->device_ctx, h->rank, "alloc_domain") != ACL_SUCCESS) return -1;
     out->mapping_size = aligned_size;
     return 0;
@@ -2079,6 +2094,7 @@ static int domain_alloc_host(
             alloc.urma_workspace->GetWorkspaceSize()
         );
     }
+    alloc.notification_host_context = ctx;
     return comm_domain_onboard::upload_context(ctx, alloc.device_ctx, h->rank, "Host domain") == ACL_SUCCESS ? 0 : -1;
 }
 
@@ -2190,6 +2206,20 @@ static int allocate_domain_windows(
         return COMM_INITIALIZATION_ABORT_REQUIRED;
     }
     alloc->initialized = true;
+    int32_t device = -1;
+    if (aclrtGetDevice(&device) != ACL_SUCCESS) return COMM_INITIALIZATION_ABORT_REQUIRED;
+    HostNotificationContext notification;
+    notification.bootstrap_token = h->run_token;
+    notification.allocation_id = allocation_id;
+    notification.context_address = reinterpret_cast<uint64_t>(alloc->device_ctx);
+    notification.window_bytes = alloc->mapping_size;
+    notification.local_rank = domain_rank;
+    notification.rank_count = static_cast<uint32_t>(rank_count);
+    std::copy(alloc->rank_ids.begin(), alloc->rank_ids.end(), notification.rank_ids.begin());
+    std::copy_n(alloc->notification_host_context.windowsIn, rank_count, notification.windows_in.begin());
+    std::copy_n(alloc->notification_host_context.windowsOut, rank_count, notification.windows_out.begin());
+    if (!notification_contexts.publish(device, std::move(notification))) return COMM_INITIALIZATION_ABORT_REQUIRED;
+    alloc->notification_key = {device, reinterpret_cast<uint64_t>(alloc->device_ctx)};
     *device_ctx_out = reinterpret_cast<uint64_t>(alloc->device_ctx);
     *local_window_base_out = reinterpret_cast<uint64_t>(alloc->local_buf);
     *actual_window_size_out = alloc->mapping_size;

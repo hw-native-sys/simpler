@@ -636,6 +636,11 @@ stage_launch_metadata(void *runner_ctx, uint32_t pipeline_slot, const HostMetada
     }
 }
 
+static std::shared_ptr<const HostNotificationContext> acquire_notification_context(void *runner_ctx, uint64_t address) {
+    if (runner_ctx == nullptr) return {};
+    return static_cast<DeviceRunnerBase *>(runner_ctx)->acquire_notification_context(address);
+}
+
 static const HostApiOps g_host_api_ops = {
     .device_malloc = device_malloc,
     .device_free = device_free,
@@ -675,6 +680,7 @@ static const HostApiOps g_host_api_ops = {
     .get_prepare_plan = get_prepare_plan,
     .set_prepare_plan = set_prepare_plan,
     .stage_launch_metadata = stage_launch_metadata,
+    .acquire_notification_context = acquire_notification_context,
 };
 
 /* ===========================================================================

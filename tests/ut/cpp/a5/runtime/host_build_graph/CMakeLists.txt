@@ -61,6 +61,11 @@ a5_hbg_case(test_hbg_prepared_bindings.cpp NO_OBJS TIMEOUT 20
 a5_hbg_case(test_hbg_task_catalog.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host)
 
+a5_hbg_case(test_hbg_notification_metadata.cpp NO_OBJS
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host)
+a5_hbg_case(test_hbg_notification_order_plan.cpp NO_OBJS
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host)
+
 a5_hbg_case(test_hbg_native_graph_plan.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host
     SOURCES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/native_graph_plan.cpp)

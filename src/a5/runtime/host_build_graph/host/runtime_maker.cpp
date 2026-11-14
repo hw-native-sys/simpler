@@ -71,6 +71,8 @@
 #include "prepared_execution_plan.h"
 #include "async_completion_plan.h"
 #include "task_catalog_plan.h"
+#include "notification_metadata_plan.h"
+#include "notification_context_plan.h"
 #include "dependency_plan.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_args_dump.h"
@@ -457,10 +459,8 @@ static void release_run_tensor_leases(Runtime *runtime, const HostApi *api) {
 // Declined unless a runtime that schedules AICore differently links its own.
 // Outside the anonymous namespace below: an internal-linkage symbol cannot be
 // the weak half of an override.
-__attribute__((weak)) SchedulerExtensionResult scheduler_extension_select(
-    Runtime *, const HostApi *, SharedMemoryHandle &, int32_t, const std::vector<SchedulerTaskMetadata> &,
-    const std::vector<int64_t> &, const sm_layout::SegmentOffsets &
-) {
+__attribute__((weak)) SchedulerExtensionResult
+scheduler_extension_select(Runtime *, const HostApi *, SharedMemoryHandle &, int32_t, const std::vector<SchedulerTaskMetadata> &, const std::vector<int64_t> &, const sm_layout::SegmentOffsets &) {
     return SchedulerExtensionResult::DECLINED;
 }
 
@@ -757,7 +757,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
                 }
                 const uint32_t kind = record.kind & UINT32_C(0xffff);
                 if (kind < static_cast<uint32_t>(SchedPhaseKind::ScalarWindow) ||
-                    kind > static_cast<uint32_t>(SchedPhaseKind::ScalarClusterMixReadyReplacement) ||
+                    kind > static_cast<uint32_t>(SchedPhaseKind::ScalarTaskSupplyClosed) ||
                     std::strcmp(sched_phase_kind_name(static_cast<SchedPhaseKind>(kind)), "unknown") == 0 ||
                     record.start_time == 0 || record.end_time < record.start_time) {
                     LOG_WARN("A5 HBG: invalid Scalar interval for worker=%" PRIu64, worker);
@@ -968,6 +968,8 @@ struct HostOrchEntryPoints {
     // Lets the .so release what it holds for a bind, once that bind's entry has returned.
     // Optional: a .so built before this entry point existed holds nothing per bind.
     OrchestrationFinishFunc finish{nullptr};
+    simpler::hbg::NotificationPlanFunction notification_query{nullptr};
+    simpler::hbg::NotificationKernelFlagsFunction notification_flags{nullptr};
 };
 
 // host_build_graph host-orch: the orchestrator builds the task graph in a host
@@ -1276,31 +1278,12 @@ bool plan_scheduler_args_dump(
     return true;
 }
 
-bool prepare_scheduler_calls(
-    Runtime *runtime, void *host_base, const AicoreSchedulerLayout &layout, uint64_t device_base,
-    SchedulerGraphView graph, const void *uploaded_sm, const sm_layout::SegmentOffsets &segments,
-    const NativeGraphHostPlan &native_plan
+bool bind_scheduler_instance_arguments(
+    Runtime *runtime, const SchedulerGraphView &graph, const void *uploaded_sm,
+    const sm_layout::SegmentOffsets &segments, const NativeGraphHostPlan &native_plan,
+    std::vector<uint8_t *> &instance_arguments
 ) {
-    if (layout.prepared_layout_offset == 0) return true;
-    const char *platform = get_platform();
-    if (std::strcmp(platform, "a5") != 0 && std::strcmp(platform, "a5sim") != 0) return false;
-    const auto address_space = std::strcmp(platform, "a5sim") == 0 ? SchedulerCallableAddressSpace::HOST :
-                                                                     SchedulerCallableAddressSpace::DEVICE;
-    graph.storage_address = reinterpret_cast<uint64_t>(static_cast<const uint8_t *>(uploaded_sm) + segments.storage);
-    const uint64_t host_image = reinterpret_cast<uint64_t>(uploaded_sm);
-    const uint64_t device_image = reinterpret_cast<uint64_t>(runtime->dev.gm_sm_ptr_);
-    const auto image_address = [&](const void *address, uint64_t bytes, uint64_t &device_address) {
-        device_address = 0;
-        if (bytes == 0) return true;
-        const uint64_t source = reinterpret_cast<uint64_t>(address);
-        if (source < host_image || source - host_image > runtime->dev.sm_image_bytes ||
-            bytes > runtime->dev.sm_image_bytes - (source - host_image) ||
-            source - host_image > UINT64_MAX - device_image)
-            return false;
-        device_address = device_image + (source - host_image);
-        return true;
-    };
-    std::vector<uint8_t *> instance_arguments(native_plan.instances.size(), nullptr);
+    instance_arguments.assign(native_plan.instances.size(), nullptr);
     for (size_t i = 0; i < native_plan.instances.size(); ++i) {
         const auto &instance = native_plan.instances[i];
         const auto &definition = native_plan.definitions[instance.definition_index];
@@ -1329,6 +1312,145 @@ bool prepare_scheduler_calls(
             );
         }
     }
+    return true;
+}
+
+struct SchedulerNotificationContextQuery {
+    const HostApi *api;
+    SchedulerNotificationContexts contexts;
+
+    std::shared_ptr<const HostNotificationContext> acquire(uint64_t address) {
+        const auto found = contexts.find(address);
+        if (found != contexts.end()) return found->second;
+        auto context = api->acquire_notification_context(address);
+        if (context) contexts.emplace(address, context);
+        return context;
+    }
+
+    static bool query(void *opaque, uint64_t address, int32_t *rank, uint32_t *count) {
+        auto *self = static_cast<SchedulerNotificationContextQuery *>(opaque);
+        if (self == nullptr || rank == nullptr || count == nullptr) return false;
+        const auto context = self->acquire(address);
+        if (!context) return false;
+        *rank = static_cast<int32_t>(context->local_rank);
+        *count = context->rank_count;
+        return true;
+    }
+};
+
+bool collect_scheduler_notifications(
+    simpler::hbg::NotificationPlanFunction query, simpler::hbg::NotificationKernelFlagsFunction flags,
+    const std::vector<SchedulerTaskMetadata> &metadata, const void *uploaded_sm,
+    const sm_layout::SegmentOffsets &segments, const NativeGraphHostPlan &native_plan,
+    const std::vector<uint8_t *> &instance_arguments, SchedulerNotificationContextQuery &context_query,
+    SchedulerNotificationMetadataPlan &plan, std::string &error
+) {
+    using namespace simpler::hbg;
+    plan = {};
+    error.clear();
+    if (query == nullptr && flags == nullptr) return true;
+    if (query == nullptr || flags == nullptr) {
+        error = "incomplete notification metadata exports";
+        return false;
+    }
+    for (size_t ref = 0; ref < metadata.size(); ++ref) {
+        const auto &task = metadata[ref];
+        if (!scheduler_task_is_executable(task.flags) || scheduler_task_is_inline(task.flags)) continue;
+        uint32_t kernel_flags[SUBTASK_SLOT_COUNT]{};
+        bool relevant = false;
+        for (uint32_t lane = 0; lane < SUBTASK_SLOT_COUNT; ++lane) {
+            if (!task.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
+            kernel_flags[lane] = flags(task.kernel_ids[lane]);
+            relevant |= kernel_flags[lane] != UINT32_MAX &&
+                        (kernel_flags[lane] & (NOTIFICATION_KERNEL_NOTIFY | NOTIFICATION_KERNEL_WAIT)) != 0;
+        }
+        if (!relevant) continue;
+        const std::byte *tensor_data = nullptr;
+        const uint64_t *scalars = nullptr;
+        uint32_t tensor_count = 0, scalar_count = 0;
+        const auto *binding = native_plan.instances.empty() ? nullptr : &native_plan.bindings[ref];
+        if (binding != nullptr && binding->kind == SchedulerNodeKind::CHILD_KERNEL) {
+            const auto &instance = native_plan.instances[binding->instance_index];
+            const auto &child = native_plan.definitions[instance.definition_index].children[binding->source_index];
+            tensor_count = child.tensor_count;
+            scalar_count = child.scalar_count;
+            const uint8_t *arguments = instance_arguments[binding->instance_index];
+            if ((tensor_count != 0 || scalar_count != 0) && arguments == nullptr) {
+                error = "unbound notification Graph arguments at task " + std::to_string(ref);
+                return false;
+            }
+            if (tensor_count != 0) tensor_data = reinterpret_cast<const std::byte *>(arguments + child.tensors_offset);
+            if (scalar_count != 0) scalars = reinterpret_cast<const uint64_t *>(arguments + child.scalars_offset);
+        } else {
+            if (binding != nullptr && binding->kind != SchedulerNodeKind::TOP_KERNEL) {
+                error = "invalid notification task binding at task " + std::to_string(ref);
+                return false;
+            }
+            const auto &payload =
+                task_image::payload(uploaded_sm, segments, binding == nullptr ? ref : binding->source_index);
+            if (payload.tensor_count < 0 || payload.scalar_count < 0) {
+                error = "invalid notification argument count at task " + std::to_string(ref);
+                return false;
+            }
+            tensor_count = static_cast<uint32_t>(payload.tensor_count);
+            scalar_count = static_cast<uint32_t>(payload.scalar_count);
+            tensor_data = reinterpret_cast<const std::byte *>(payload.tensor_data());
+            scalars = payload.scalar_data();
+        }
+        std::vector<TensorData> tensors(tensor_count);
+        for (uint32_t index = 0; index < tensor_count; ++index)
+            std::memcpy(&tensors[index], tensor_data + index * TASK_IMAGE_TENSOR_STRIDE, sizeof(TensorData));
+        NotificationPlanInput input{};
+        input.query_context = SchedulerNotificationContextQuery::query;
+        input.context_user = &context_query;
+        input.tensor_count = tensor_count;
+        input.scalar_count = scalar_count;
+        input.tensors = tensors.empty() ? nullptr : tensors.data();
+        input.scalars = scalars;
+        input.block_count = task.logical_block_num;
+        for (uint32_t lane = 0; lane < SUBTASK_SLOT_COUNT; ++lane) {
+            if (!task.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
+            if (kernel_flags[lane] == UINT32_MAX ||
+                (kernel_flags[lane] & (NOTIFICATION_KERNEL_NOTIFY | NOTIFICATION_KERNEL_WAIT)) == 0)
+                continue;
+            input.lane = lane;
+            for (uint32_t block = 0; block < input.block_count; ++block) {
+                input.block_index = block;
+                const size_t unavailable = plan.unavailable.size();
+                if (!scheduler_collect_notification_invocation(
+                        query, kernel_flags[lane], task.kernel_ids[lane], ref, input, &plan, &error
+                    ))
+                    return false;
+                if (plan.unavailable.size() != unavailable) break;
+            }
+        }
+    }
+    return true;
+}
+
+bool prepare_scheduler_calls(
+    Runtime *runtime, void *host_base, const AicoreSchedulerLayout &layout, uint64_t device_base,
+    const void *uploaded_sm, const sm_layout::SegmentOffsets &segments, const NativeGraphHostPlan &native_plan,
+    const std::vector<uint8_t *> &instance_arguments
+) {
+    if (layout.prepared_layout_offset == 0) return true;
+    const char *platform = get_platform();
+    if (std::strcmp(platform, "a5") != 0 && std::strcmp(platform, "a5sim") != 0) return false;
+    const auto address_space = std::strcmp(platform, "a5sim") == 0 ? SchedulerCallableAddressSpace::HOST :
+                                                                     SchedulerCallableAddressSpace::DEVICE;
+    const uint64_t host_image = reinterpret_cast<uint64_t>(uploaded_sm);
+    const uint64_t device_image = reinterpret_cast<uint64_t>(runtime->dev.gm_sm_ptr_);
+    const auto image_address = [&](const void *address, uint64_t bytes, uint64_t &device_address) {
+        device_address = 0;
+        if (bytes == 0) return true;
+        const uint64_t source = reinterpret_cast<uint64_t>(address);
+        if (source < host_image || source - host_image > runtime->dev.sm_image_bytes ||
+            bytes > runtime->dev.sm_image_bytes - (source - host_image) ||
+            source - host_image > UINT64_MAX - device_image)
+            return false;
+        device_address = device_image + (source - host_image);
+        return true;
+    };
     const auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(host_base, layout.task_metadata_offset);
     uint64_t prepared_count = 0;
     for (uint64_t ref = 0; ref < layout.task_count; ++ref) {
@@ -1384,7 +1506,9 @@ bool prepare_scheduler_calls(
 bool create_scheduler_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
     uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments, NativeGraphHostPlan &native_plan,
-    const void *uploaded_sm
+    const void *uploaded_sm, simpler::hbg::NotificationPlanFunction notification_query,
+    simpler::hbg::NotificationKernelFlagsFunction notification_flags,
+    SchedulerNotificationMetadataPlan &notification_metadata
 ) {
     release_scheduler_state(runtime);
     if (total_tasks < 0 || task_window_size == 0 || static_cast<uint64_t>(total_tasks) > task_window_size) {
@@ -1696,6 +1820,51 @@ bool create_scheduler_state(
             return false;
         }
     }
+    SchedulerGraphView planning_graph = host_graph;
+    std::vector<uint8_t> planning_storage;
+    if (native_graph) {
+        if (native_image.bytes.size() > SIZE_MAX - (SCHEDULER_STATE_BASE_ALIGNMENT - 1)) {
+            LOG_ERROR("A5 HBG: notification planning image size overflow");
+            return false;
+        }
+        planning_storage.resize(native_image.bytes.size() + SCHEDULER_STATE_BASE_ALIGNMENT - 1);
+        auto *planning_base = reinterpret_cast<uint8_t *>(
+            (reinterpret_cast<uintptr_t>(planning_storage.data()) + SCHEDULER_STATE_BASE_ALIGNMENT - 1) &
+            ~(uintptr_t{SCHEDULER_STATE_BASE_ALIGNMENT} - 1)
+        );
+        std::memcpy(planning_base, native_image.bytes.data(), native_image.bytes.size());
+        auto *header = scheduler_state_at<SchedulerNativeGraphHeader>(planning_base, native_image.header_offset);
+        header->image_bytes = native_image.bytes.size();
+        header->run_epoch = api->run_epoch();
+        planning_graph.task_count = node_count;
+        planning_graph.scheduler_state_address = reinterpret_cast<uint64_t>(planning_base);
+        planning_graph.scheduler_state_bytes = native_image.bytes.size();
+        planning_graph.native_header_offset = native_image.header_offset;
+    }
+    std::vector<uint8_t *> instance_arguments;
+    if (!bind_scheduler_instance_arguments(
+            runtime, planning_graph, uploaded_sm, device_segments, native_plan, instance_arguments
+        ))
+        return false;
+    std::string notification_error;
+    SchedulerNotificationContextQuery context_query{api, {}};
+    if (!collect_scheduler_notifications(
+            notification_query, notification_flags, task_metadata, uploaded_sm, device_segments, native_plan,
+            instance_arguments, context_query, notification_metadata, notification_error
+        )) {
+        LOG_ERROR("A5 HBG: notification metadata failed: %s", notification_error.c_str());
+        return false;
+    }
+    for (const auto &event : notification_metadata.events)
+        if (event.effect.comm_context != 0) context_query.acquire(event.effect.comm_context);
+    std::vector<SchedulerTaskOrderEdge> notification_edges;
+    if (!scheduler_resolve_notification_order(
+            notification_metadata, context_query.contexts, api->run_epoch(), planning_graph, inline_completed_task_refs,
+            &notification_edges, &notification_error
+        )) {
+        LOG_ERROR("A5 HBG: notification source ordering failed: %s", notification_error.c_str());
+        return false;
+    }
     std::vector<SchedulerProtocolTaskSpec> protocol_tasks;
     std::string protocol_source;
     AicoreSchedulerLayout layout{};
@@ -1711,7 +1880,8 @@ bool create_scheduler_state(
     // Each executable task appears once in its immutable engine catalog.
     SchedulerTaskCatalogPlan task_catalog_plan;
     if (!scheduler_plan_task_catalog(
-            task_metadata, static_cast<uint32_t>(spmd.cluster_count), layout.total_size, &task_catalog_plan
+            task_metadata, static_cast<uint32_t>(spmd.cluster_count), layout.total_size, &task_catalog_plan,
+            notification_edges
         )) {
         LOG_ERROR("A5 HBG: task catalog layout overflow or invalid topology");
         return false;
@@ -1731,9 +1901,8 @@ bool create_scheduler_state(
          (!scheduler_layout_reserve(
               &layout.total_size, dump_layout.total_size, alignof(SchedulerArgsDumpHeader), &dump_offset
           ) ||
-          !scheduler_layout_checked_align(
-              layout.total_size, pto2::resident::ASYNC_RECORD_ALIGNMENT, &layout.total_size
-          )))) {
+          !scheduler_layout_checked_align(layout.total_size, pto2::resident::ASYNC_RECORD_ALIGNMENT, &layout.total_size)
+         ))) {
         LOG_ERROR("A5 HBG: task argument diagnostic image overflow");
         return false;
     }
@@ -1834,8 +2003,11 @@ bool create_scheduler_state(
         dependency_graph.scheduler_state_bytes = layout.total_size;
         dependency_graph.native_header_offset = native_image.header_offset;
     }
-    if (!scheduler_validate_dependencies(dependency_graph, task_metadata, inline_completed_task_refs)) {
-        LOG_ERROR("A5 HBG: invalid dependency graph");
+    std::string task_order_error;
+    if (!scheduler_order_task_catalog(
+            dependency_graph, task_metadata, inline_completed_task_refs, &task_catalog_plan, &task_order_error
+        )) {
+        LOG_ERROR("A5 HBG: task ordering failed: %s", task_order_error.c_str());
         return false;
     }
     if (protocol_profiling) {
@@ -1860,6 +2032,11 @@ bool create_scheduler_state(
                     scheduler_protocol_freeze_source(host_graph, sources, native_plan.original_definition_section);
             }
             protocol_tasks = scheduler_protocol_freeze_graph(snapshot, task_metadata);
+            for (size_t ref = 0; ref < protocol_tasks.size(); ++ref) {
+                protocol_tasks[ref].schedule_rank = task_catalog_plan.task_ranks[ref];
+                protocol_tasks[ref].topological_level = task_catalog_plan.task_levels[ref];
+                protocol_tasks[ref].bottom_level = task_catalog_plan.task_bottom_levels[ref];
+            }
         } catch (const std::exception &error) {
             LOG_ERROR("A5 HBG: failed to freeze protocol graph: %s", error.what());
             return false;
@@ -1881,7 +2058,7 @@ bool create_scheduler_state(
         task_controls[task_ref].completion_state = scheduler_completion_completed_state(1);
     }
     if (!prepare_scheduler_calls(
-            runtime, host_base, layout, aligned_address, dependency_graph, uploaded_sm, device_segments, native_plan
+            runtime, host_base, layout, aligned_address, uploaded_sm, device_segments, native_plan, instance_arguments
         ))
         return false;
 
@@ -1945,10 +2122,11 @@ bool create_scheduler_state(
     {
         std::scoped_lock lock(scheduler_state_owners_mutex);
         scheduler_state_owners.emplace(
-            runtime, SchedulerStateOwner{
-                         reinterpret_cast<void *>(aligned_address), layout, api, std::move(protocol_tasks),
-                         std::move(protocol_source)
-                     }
+            runtime,
+            SchedulerStateOwner{
+                reinterpret_cast<void *>(aligned_address), layout, api, std::move(protocol_tasks),
+                std::move(protocol_source)
+            }
         );
     }
     runtime->add_pending_metadata(
@@ -1961,6 +2139,9 @@ bool create_scheduler_state(
 
 struct HostPreparePlan : RetainedHostPrepareState {
     NativeGraphHostPlan native_graph;
+    simpler::hbg::NotificationPlanFunction notification_query{nullptr};
+    simpler::hbg::NotificationKernelFlagsFunction notification_flags{nullptr};
+    SchedulerNotificationMetadataPlan notification_metadata;
 };
 
 int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &plan) {
@@ -2061,7 +2242,8 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
         instance.args_base = instance.heap_base + definition.required_heap;
     }
     if (!create_scheduler_state(
-            runtime, api, host_sm_handle, total_tasks, task_capacity, device_segments, plan.native_graph, upload_base
+            runtime, api, host_sm_handle, total_tasks, task_capacity, device_segments, plan.native_graph, upload_base,
+            plan.notification_query, plan.notification_flags, plan.notification_metadata
         )) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -2182,6 +2364,8 @@ int32_t run_host_orchestration(
     // Host get/set operates only on explicit HOST/NONE arguments. Uploaded
     // arguments and runtime outputs are DEVICE tensors and cannot be read here.
     const auto *entry_points = reinterpret_cast<const HostOrchEntryPoints *>(host_orch_func_ptr);
+    plan.notification_query = entry_points->notification_query;
+    plan.notification_flags = entry_points->notification_flags;
     if (entry_points->bind == nullptr) {
         LOG_ERROR("host-orch: orch .so framework_bind_orch_context was not resolved");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -2505,6 +2689,19 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
         // caller does not read this miss as its own failure.
         eps->finish = reinterpret_cast<OrchestrationFinishFunc>(dlsym(handle, "framework_finish_orch"));
         (void)dlerror();
+        eps->notification_query =
+            reinterpret_cast<simpler::hbg::NotificationPlanFunction>(dlsym(handle, "simpler_hbg_notification_plan_v1"));
+        (void)dlerror();
+        eps->notification_flags = reinterpret_cast<simpler::hbg::NotificationKernelFlagsFunction>(
+            dlsym(handle, "simpler_hbg_notification_kernel_flags_v1")
+        );
+        (void)dlerror();
+        if ((eps->notification_query == nullptr) != (eps->notification_flags == nullptr)) {
+            LOG_ERROR("host-orch: incomplete notification metadata exports");
+            delete eps;
+            dlclose(handle);
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
         out->host_dlopen_handle = handle;
         out->host_orch_func_ptr = eps;
         LOG_INFO("host-orch: loaded orchestration entry '%s' on host", orch_func_name);

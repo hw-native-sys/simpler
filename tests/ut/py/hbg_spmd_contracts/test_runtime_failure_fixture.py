@@ -197,7 +197,6 @@ def _capture():
                     "next_block": 2,
                     "claim_tickets": 0,
                     "claim_seal": 0,
-                    "parked_count": 0,
                 },
                 {
                     "task_ref": 1,
@@ -209,7 +208,6 @@ def _capture():
                     "next_block": 0,
                     "claim_tickets": 0,
                     "claim_seal": 0,
-                    "parked_count": 0,
                 },
             ],
             "resolved_task_count": 0,

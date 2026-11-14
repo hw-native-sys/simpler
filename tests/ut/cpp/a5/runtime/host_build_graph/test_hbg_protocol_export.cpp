@@ -53,6 +53,9 @@ struct ProtocolExportFixture : ::testing::Test {
 
 TEST_F(ProtocolExportFixture, PreservesFrozenGraphAndHostCompletedNodeWithoutFabricatingEvents) {
     at<SchedulerTaskMetadata>(layout.task_metadata_offset)[0].logical_block_num = 99;
+    tasks[0].schedule_rank = 1;
+    tasks[0].topological_level = 0;
+    tasks[0].bottom_level = 2;
     const auto json = dump();
     EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v22\""), std::string::npos);
     EXPECT_NE(json.find("\"close_seal_stride\":64"), std::string::npos);
@@ -65,6 +68,7 @@ TEST_F(ProtocolExportFixture, PreservesFrozenGraphAndHostCompletedNodeWithoutFab
     EXPECT_NE(json.find("\"executions\":[]"), std::string::npos);
     EXPECT_NE(json.find("\"admission_log\":[-1]"), std::string::npos);
     EXPECT_EQ(json.find("protocol_verified"), std::string::npos);
+    EXPECT_NE(json.find("\"schedule_rank\":1,\"topological_level\":0,\"bottom_level\":2"), std::string::npos);
 }
 
 TEST_F(ProtocolExportFixture, NativeSchemaCarriesBothIdentitiesAndIndependentSource) {

@@ -384,7 +384,6 @@ struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerTaskControl {
 
     // The final block claimer publishes this immutable claim certificate.
     alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t claim_seal;
-    alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t parked_count;
 };
 
 // Each task owns one cache-line record; membership follows its frozen resource role.
@@ -724,7 +723,7 @@ static_assert(offsetof(SchedulerTaskMetadata, logical_block_num) == 14, "block c
 inline constexpr uint64_t SCHEDULER_STATE_BASE_ALIGNMENT = alignof(SchedulerTaskControl);
 static_assert(alignof(SchedulerAdmissionControl) <= SCHEDULER_STATE_BASE_ALIGNMENT);
 
-static_assert(sizeof(SchedulerTaskControl) == 768, "task control layout changed");
+static_assert(sizeof(SchedulerTaskControl) == 640, "task control layout changed");
 static_assert(alignof(SchedulerTaskControl) == SCHEDULER_GM_ATOMIC_SECTOR_BYTES, "task control alignment changed");
 static_assert(offsetof(SchedulerTaskControl, claim_tickets) == 0, "ticket cursor must use the atomic region");
 static_assert(offsetof(SchedulerTaskControl, next_block) == 128, "block cursor requires an isolated atomic line");
@@ -735,7 +734,6 @@ static_assert(
     offsetof(SchedulerTaskControl, admission_state) == 384, "admission state requires an isolated signal region"
 );
 static_assert(offsetof(SchedulerTaskControl, claim_seal) == 512, "claim seal requires an isolated atomic line");
-static_assert(offsetof(SchedulerTaskControl, parked_count) == 640, "parked count requires an isolated atomic line");
 static_assert(sizeof(SchedulerAdmissionRecord) == 64, "admission header must occupy one cache line");
 static_assert(sizeof(SchedulerMixCloseSeal) == 64, "close seals require independent atomic regions");
 static_assert(alignof(SchedulerMixCloseSeal) == 64, "close seals require isolated alignment");
@@ -1075,7 +1073,6 @@ inline bool scheduler_init_data_from_layout(
     auto *controls = scheduler_state_at<SchedulerTaskControl>(base, layout.task_controls_offset);
     for (uint64_t i = 0; i < layout.task_count; ++i) {
         controls[i].completion_state = scheduler_completion_initial_state(1);
-        controls[i].parked_count = 0;
     }
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(base, layout.worker_contexts_offset);
     for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {

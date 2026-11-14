@@ -8,6 +8,8 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+import json
+
 import pytest
 
 from .helpers import CONDITION_LIMIT, Case, CounterRunner, Scenario, error_log_cursor, failure_evidence, l3_case
@@ -37,9 +39,10 @@ def test_last_condition_controls_completion(run_case):
     run_case(Case(scenario=Scenario.TWO_CONDITIONS, conditions=2, delay_ms=20))
 
 
+@pytest.mark.parametrize("scenario,instances", [(Scenario.BASIC, 1), (Scenario.GRAPH, 2)], ids=["ordinary", "graph_2"])
 @l3_case
-def test_capacity_overflow_is_not_success(st_platform, st_device_ids, tmp_path, capfd):
-    case = Case(conditions=CONDITION_LIMIT + 1)
+def test_capacity_overflow_is_not_success(st_platform, st_device_ids, tmp_path, capfd, scenario, instances):
+    case = Case(scenario=scenario, instances=instances, conditions=CONDITION_LIMIT + 1)
     with CounterRunner(st_platform, st_device_ids, tmp_path, case) as runner:
         runner.require_support()
         capfd.readouterr()
@@ -50,6 +53,22 @@ def test_capacity_overflow_is_not_success(st_platform, st_device_ids, tmp_path, 
         evidence = failure_evidence(failure.value, captured, cursor)
         (tmp_path / "overflow.log").write_text(evidence)
         assert "ASYNC_WAIT_OVERFLOW" in evidence, evidence
+        if scenario == Scenario.GRAPH:
+            captures = list(runner.capture.rglob("chip_swimlane_records.json"))
+            assert len(captures) == 1, captures
+            protocol = json.loads(captures[0].read_text())["aicore_protocol"]
+            assert protocol["schema"] == "hbg-native-protocol-v23"
+            assert protocol["producer"] == "aicore" and protocol["scheduler_error"] != 0
+            controls = {row["task_ref"]: row for row in protocol["task_controls"]}
+            exits = [row["node_ref"] for row in protocol["node_map"] if row["kind"] == 4]
+            assert len(exits) == instances
+            assert all(controls[ref]["state"] == 0 for ref in exits), "overflow released a Graph EXIT"
+            consumers = [task["task_ref"] for task in protocol["tasks"] if task["kernel_ids"] == [65535, 5, 65535]]
+            assert len(consumers) == 2 * instances, "missing inner or post-EXIT consumer"
+            assert all(controls[ref]["state"] == controls[ref]["completed_subtasks"] == 0 for ref in consumers)
+            assert not any(row["task_ref"] in consumers for row in protocol["executions"]), (
+                "overflow executed a consumer"
+            )
         runner.close_after_expected_error()
 
 

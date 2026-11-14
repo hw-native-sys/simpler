@@ -459,8 +459,11 @@ TEST(HbgNativeGraphPlan, CanonicalFaninConnectsGraphControlsAcrossInstances) {
     std::vector<SchedulerTaskMetadata> metadata(view.graph.task_count);
     for (uint64_t ref = 0; ref < view.plan.bindings.size(); ++ref) {
         const auto kind = view.plan.bindings[ref].kind;
-        if (kind == SchedulerNodeKind::CHILD_KERNEL || kind == SchedulerNodeKind::TOP_KERNEL)
+        if (kind == SchedulerNodeKind::CHILD_KERNEL || kind == SchedulerNodeKind::TOP_KERNEL) {
             metadata[ref].flags = SCHEDULER_TASK_EXECUTABLE;
+            metadata[ref].active_mask = LaneMask::aiv0();
+            metadata[ref].logical_block_num = 1;
+        }
     }
     ASSERT_TRUE(scheduler_validate_dependencies(view.graph, metadata, {0}));
     std::vector<std::pair<int64_t, int64_t>> edges;
@@ -479,6 +482,13 @@ TEST(HbgNativeGraphPlan, CanonicalFaninConnectsGraphControlsAcrossInstances) {
             {0, 1}, {1, 2}, {1, 3}, {2, 4}, {3, 4}, {4, 5}, {5, 6}, {6, 7}, {6, 8}, {7, 9}, {8, 9}, {9, 10}, {10, 11}
         })
     );
+    SchedulerTaskCatalogPlan ordered;
+    ASSERT_TRUE(scheduler_plan_task_catalog(metadata, 1, 64, &ordered));
+    std::string order_error;
+    ASSERT_TRUE(scheduler_order_task_catalog(view.graph, metadata, {0}, &ordered, &order_error)) << order_error;
+    EXPECT_EQ(ordered.catalogs[1], (std::vector<int64_t>{0, 2, 3, 4, 7, 8, 9, 11}));
+    for (const auto &[producer, consumer] : edges)
+        EXPECT_LT(ordered.task_ranks[producer], ordered.task_ranks[consumer]);
     EXPECT_FALSE(scheduler_validate_dependencies(view.graph, metadata, {view.graph.task_count}));
 }
 
@@ -813,6 +823,9 @@ TEST(HbgNativeGraphPlan, NativeCatalogOrderAllocatesEachSingleBlockOnce) {
     auto competing = ready_worker(view, 0, 9);
     bool progress = false;
     ASSERT_TRUE(scheduler_refill_execution_tokens(view.graph, view.backing.get(), &competing, run, 0, &progress));
+    EXPECT_TRUE(progress);
+    EXPECT_EQ(catalog.issue->next_task, catalog.count);
+    ASSERT_TRUE(scheduler_refill_execution_tokens(view.graph, view.backing.get(), &competing, run, 0, &progress));
     EXPECT_FALSE(progress);
     EXPECT_EQ(scheduler_execution_token_count(&competing), 0u);
     EXPECT_EQ(scheduler_read_error(run), 0u);
@@ -871,7 +884,7 @@ TEST(HbgNativeGraphPlan, ConcurrentConsumersOwnAndCompleteEachNativeCallOnce) {
     EXPECT_EQ(scheduler_read_error(run), 0u);
 }
 
-TEST(HbgNativeGraphPlan, AcquiredTokenDoesNotBypassNativeEntryDependency) {
+TEST(HbgNativeGraphPlan, NativeEntryDependencyPrecedesChildTicketIssuance) {
     for (uint32_t type : {0u, 1u}) {
         NativeViewFixture view(ready_definition(type, 1, true), {0}, true, 30);
         prepare_native_calls(view);
@@ -880,10 +893,9 @@ TEST(HbgNativeGraphPlan, AcquiredTokenDoesNotBypassNativeEntryDependency) {
         auto *run = static_cast<SchedulerRunControl *>(base);
         bool progress = false;
         ASSERT_TRUE(scheduler_refill_execution_tokens(view.graph, base, &local, run, 0, &progress));
-        ASSERT_TRUE(scheduler_execution_token_has_task(&local, 1));
-        const auto owned = local.execution_tokens[0].prepared;
+        EXPECT_FALSE(scheduler_execution_token_has_task(&local, 1));
         const auto *control = scheduler_task_control_at(base, &local, 1);
-        EXPECT_EQ(control->next_block, 1u);
+        EXPECT_EQ(control->next_block, 0u);
         uint32_t direct = UINT32_MAX;
         ASSERT_TRUE(scheduler_progress_execution_tokens(view.graph, base, &local, run, 0, &direct, &progress));
         EXPECT_EQ(direct, UINT32_MAX);
@@ -892,6 +904,9 @@ TEST(HbgNativeGraphPlan, AcquiredTokenDoesNotBypassNativeEntryDependency) {
             EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FREE);
         EXPECT_FALSE(scheduler_completion_done(control->completion_state));
         complete_native_entry(view);
+        ASSERT_TRUE(scheduler_refill_execution_tokens(view.graph, base, &local, run, 0, &progress));
+        ASSERT_TRUE(scheduler_execution_token_has_task(&local, 1));
+        const auto owned = local.execution_tokens[0].prepared;
         ASSERT_TRUE(scheduler_progress_execution_tokens(view.graph, base, &local, run, 0, &direct, &progress));
         ASSERT_NE(direct, UINT32_MAX);
         EXPECT_TRUE(progress);

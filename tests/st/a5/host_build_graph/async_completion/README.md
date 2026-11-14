@@ -21,7 +21,7 @@ there is no synchronous fallback or expected-failure marker.
 | File | Boundary and observable verdict |
 | ---- | ------------------------------- |
 | `test_sdma_completion.py` | Two real peers; empty, one 32-byte tile, and 4 MiB SDMA. Check transferred data, dependent computation, guards, and an independent task observing a real event still pending after the submit kernel returned. |
-| `test_condition_boundaries.py` | 0/1/63/64 conditions; 65 must fail; `Ge` below/equal/above threshold, zero and signed-int32 maximum; the second condition arrives later; predicate skip must release the successor. |
+| `test_condition_boundaries.py` | 0/1/63/64 conditions; 65 must fail for ordinary work and two Graph instances without releasing EXIT or running inner/post-EXIT consumers; `Ge` below/equal/above threshold, zero and signed-int32 maximum; the second condition arrives later; predicate skip must release the successor. |
 | `test_dependency_completion.py` | Ordinary fanin in both completion orders; two-block AIC, AIV and MIX masks 3/5/6/7; last computation versus last condition; a two-block sync-start MIX task. |
 | `test_waiter_progress.py` | C-1/C/C+1 independent waiters, with the publisher submitted later. C comes from `rt_available_aiv_count()`. A bounded AIC rescue makes a blocking implementation fail without leaving an unbounded kernel spin. |
 | `test_consumer_visibility.py` | Every candidate AIC first reads the old payload; AIV publishes new data; a synchronous AIC consumer must read the new value without test-side payload invalidation. |
@@ -33,7 +33,11 @@ Every planned physical execution and consumer must occur exactly once; inactive
 lanes and guard regions must stay unchanged. Test-owned observations record
 early entry, missing context and bounded-producer failures. Each successful run
 also requires fresh swimlane evidence identifying the AICore resident producer.
-No assertion reads a scheduler directory, lease, check queue or join counter.
+Successful numerical checks do not inspect scheduler directories, leases, check
+queues or join counters. The Graph overflow check additionally inspects the
+retired L4 protocol export: both EXIT nodes remain incomplete, and no inner or
+post-EXIT consumer has completed or executed. It does not read live scheduler
+memory or infer failure from elapsed time.
 
 The SDMA probe uses the PTO-ISA event's public completion-record API. It neither
 derives private queue addresses nor atomically modifies an external completion

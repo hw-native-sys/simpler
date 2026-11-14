@@ -80,7 +80,6 @@ def capture(epoch=0):
                 admission_state=0,
                 claim_tickets=0,
                 claim_seal=0,
-                parked_count=0,
             )
         ],
         "task_events": [
@@ -113,6 +112,33 @@ def test_literal_epochs_and_cycle_zero_survive_without_claiming_causality(epoch)
     assert result == {"sequence_integrity_verified": True, "event_count": 2, "worker_count": 3}
     assert "protocol_verified" not in result
     assert raw == before
+
+
+def test_task_order_metadata_survives_without_claiming_dependency_order():
+    raw = capture()
+    raw["tasks"][0].update(schedule_rank=7, topological_level=2, bottom_level=3)
+    before = copy.deepcopy(raw)
+    assert read_native_protocol(raw) == before
+    assert audit_protocol_sequences(raw)["sequence_integrity_verified"] is True
+    assert raw == before
+
+
+@pytest.mark.parametrize(
+    "fields",
+    (
+        ("schedule_rank",),
+        ("topological_level",),
+        ("bottom_level",),
+        ("schedule_rank", "topological_level"),
+        ("schedule_rank", "bottom_level"),
+        ("topological_level", "bottom_level"),
+    ),
+)
+def test_partial_task_order_metadata_is_rejected(fields):
+    raw = capture()
+    raw["tasks"][0].update(dict.fromkeys(fields, 0))
+    with pytest.raises(ValueError, match=r"tasks\[0\].*missing or unknown fields"):
+        read_native_protocol(raw)
 
 
 @pytest.mark.parametrize("stride", (None, 0, 8, 63, 65, 128, True, 64.0, "64", -1, 1 << 64))
@@ -246,7 +272,7 @@ def test_noncurrent_protocol_versions_are_rejected(version):
 
 
 @pytest.mark.parametrize(
-    "field", ("claim_tickets", "claim_seal", "parked_count", "canonical_total", "pending_compute", "completion_debt")
+    "field", ("claim_tickets", "claim_seal", "canonical_total", "pending_compute", "completion_debt")
 )
 @pytest.mark.parametrize("value", (None, True, -1, 1 << 64, "0"))
 def test_current_control_words_are_mandatory_uint64(field, value):

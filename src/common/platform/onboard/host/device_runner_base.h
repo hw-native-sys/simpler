@@ -38,6 +38,7 @@
 
 #pragma once
 #include "host/aligned_image_storage.h"
+#include "common/notification_context.h"
 
 #include <runtime/rt.h>
 
@@ -152,6 +153,7 @@ public:
     // `DeviceRunnerBase *` (the `destroy_device_context` entrypoint). Each
     // arch's `DeviceRunner` defaults this through the compiler-generated dtor.
     virtual ~DeviceRunnerBase() = default;
+    virtual std::shared_ptr<const HostNotificationContext> acquire_notification_context(uint64_t) { return {}; }
     DeviceRunnerBase(const DeviceRunnerBase &) = delete;
     DeviceRunnerBase &operator=(const DeviceRunnerBase &) = delete;
     DeviceRunnerBase(DeviceRunnerBase &&) = delete;
