@@ -77,11 +77,11 @@ def _rank(rank, device, directory):
         native.register_ccu_callable(comm, 1, slot, [0, 1], rank, sdk, isa)
     with pytest.raises(RuntimeError, match="registration failed"):
         native.register_ccu_callable(comm, 1, slot, [0, 1], rank, bytes(32), isa, 8)
-    registration = native.register_ccu_callable(comm, 1, slot, [0, 1], rank, sdk, isa, 8)
-    assert native.control_ccu_run(comm, registration, 8, 0) == 1
     committed = ctypes.c_uint64()
-    native.comm_alloc_domain_windows(comm, 0, [0, 1], rank, 4 * 1024 * 1024, ctypes.addressof(committed), 8)
+    native.comm_alloc_domain_windows(comm, 17, [0, 1], rank, 4 * 1024 * 1024, ctypes.addressof(committed), 8)
     assert committed.value == 1
+    registration = native.register_ccu_callable(comm, 10 + rank, slot, [0, 1], rank, sdk, isa, 8, 17, 0)
+    assert native.control_ccu_run(comm, registration, 8, 0) == 1
     helper = ctypes.CDLL(str(root / "event_access.so"))
     access = helper.ccu_test_event_access
     access.argtypes = [ctypes.c_char_p, ctypes.c_uint64, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint64)]
@@ -100,11 +100,11 @@ def _rank(rank, device, directory):
 
     def controls(address):
         workspace = read(address, _Workspace)
-        assert workspace.size == 48 and workspace.count == 2 and workspace.stride == ctypes.sizeof(_Control) == 96
-        return [read(workspace.controls + i * workspace.stride, _Control) for i in range(2)]
+        assert workspace.size == 48 and workspace.count == 1 and workspace.stride == ctypes.sizeof(_Control) == 96
+        return [read(workspace.controls + i * workspace.stride, _Control) for i in range(1)]
 
     output = chip.malloc(16)
-    first = native.prepare_ccu_run(comm, registration, 1, 101, 0)
+    first = native.prepare_ccu_run(comm, registration, 1, 101, 17)
     a = controls(first)
     sentinels = []
     for i, control in enumerate(a):
@@ -115,7 +115,7 @@ def _rank(rank, device, directory):
     for control in a:
         _until(lambda c=control: event(c.ready) == 1, "CCU A did not reach READY/trigger gate")
     before = [(event(c.ready), event(c.trigger), event(c.done)) for c in a]
-    second = native.prepare_ccu_run(comm, registration, 2, 102, 0)
+    second = native.prepare_ccu_run(comm, registration, 2, 102, 17)
     b = controls(second)
     assert first != second and all(x.parameter != y.parameter for x, y in zip(a, b))
     with pytest.raises(RuntimeError, match="control failed"):
@@ -131,19 +131,22 @@ def _rank(rank, device, directory):
         for i, control in enumerate(records):
             _until(lambda c=control: event(c.ready) == 1, "local READY not observed")
             assert event(control.ready, 0) == 0
-            words = (ctypes.c_uint64 * 3)(output + 8 * i, generation * 1000 + rank * 100 + i, 0)
+            words = (ctypes.c_uint64 * 3)(output + 8 * i, generation * 1000 + rank * 100 + i, int(generation == 2))
             chip.copy_to(control.parameter, ctypes.addressof(words), ctypes.sizeof(words))
             event(control.trigger, (1 << 63) | 1)
         for control in records:
             _until(lambda c=control: event(c.done) == 1, "CCU operation did not complete")
             assert event(control.done, 0) == 0
-        _until(lambda g=generation: native.control_ccu_run(comm, registration, 3, g) == 0, "CCU stop unconfirmed")
-        values = read(output, ctypes.c_uint64 * 2)
-        assert list(values) == [generation * 1000 + rank * 100 + i for i in range(2)]
+        if generation == 2:
+            assert native.control_ccu_run(comm, registration, 9, generation) == 0
+        else:
+            _until(lambda g=generation: native.control_ccu_run(comm, registration, 3, g) == 0, "CCU stop unconfirmed")
+        values = read(output, ctypes.c_uint64 * 1)
+        assert list(values) == [generation * 1000 + rank * 100 + i for i in range(1)]
         native.control_ccu_run(comm, registration, 7, generation)
     assert helper.ccu_test_event_close() == 0
     chip.free(output)
-    native.comm_release_domain_windows(comm, 0, 2, rank)
+    native.comm_release_domain_windows(comm, 17, 2, rank)
     chip.comm_destroy(comm)
     chip.finalize()
 

@@ -487,10 +487,17 @@ public:
         size_t window_size, uint32_t workspace_mask = 0, uint64_t *ownership_flag = nullptr,
         const std::string &host_shm_name = {}, const CommWorkspaceConfig *workspace_config = nullptr
     );
+    bool communication_cleanup_confirmed() const noexcept { return !comm_cleanup_unconfirmed_; }
     uint64_t register_ccu_callable(
         uint64_t comm_handle, uint64_t collective_id, int32_t callable_id, const std::vector<uint32_t> &rank_ids,
-        uint32_t domain_rank, const simpler::ccu::ExpectedBuildIdentity &expected_identity, uint32_t workspace_mask
+        uint32_t domain_rank, const simpler::ccu::ExpectedBuildIdentity &expected_identity, uint32_t workspace_mask,
+        uint64_t allocation_id = 0, uint32_t ccu_id = UINT32_MAX
     );
+    uint64_t prepare_ccu_run_set(
+        uint64_t comm_handle, const std::vector<uint64_t> &registrations, uint64_t generation, uint64_t dispatch_id
+    );
+    int control_ccu_run_set(uint64_t comm_handle, uint64_t run_set_id, uint32_t operation);
+    void release_ccu_registration(uint64_t comm_handle, uint64_t registration_id);
     uint64_t prepare_ccu_run(
         uint64_t comm_handle, uint64_t registration_id, uint64_t generation, uint64_t dispatch_id,
         uint64_t allocation_id
@@ -859,6 +866,17 @@ private:
     CommAllocHostDomainWindowsFn comm_alloc_host_domain_windows_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_release_domain_windows_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_abort_domain_windows_fn_ = nullptr;
+    using CommRegisterDomainCcuFn = int (*)(
+        void *, uint64_t, uint64_t, uint32_t, const void *, size_t, const uint8_t *, const uint8_t *, uint64_t *
+    );
+    using CommPrepareCcuRunSetFn = int (*)(void *, const uint64_t *, size_t, uint64_t, uint64_t *, uint64_t *);
+    using CommControlCcuRunSetFn = int (*)(void *, uint64_t, uint32_t);
+    using CommReleaseCcuRegistrationFn = int (*)(void *, uint64_t);
+    CommRegisterDomainCcuFn comm_register_domain_ccu_fn_ = nullptr;
+    CommPrepareCcuRunSetFn comm_prepare_ccu_run_set_fn_ = nullptr;
+    CommControlCcuRunSetFn comm_control_ccu_run_set_fn_ = nullptr;
+    CommReleaseCcuRegistrationFn comm_release_ccu_registration_fn_ = nullptr;
+    std::map<std::pair<uint64_t, uint64_t>, uint64_t> ccu_run_set_dispatches_;
     CommRegisterCcuCallableFn comm_register_ccu_callable_fn_ = nullptr;
     CommPrepareCcuRunFn comm_prepare_ccu_run_fn_ = nullptr;
     using CommControlCcuRunFn = int (*)(void *, uint64_t, uint32_t, uint64_t);

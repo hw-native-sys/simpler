@@ -22,8 +22,11 @@ from tests.st.a5.tensormap_and_ringbuffer.ccu_native_domain.test_ccu_native_doma
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)
-def test_ccu_real_window_transfer(st_platform, st_device_ids, tmp_path, request):
-    _exercise_window_transfer(st_platform, st_device_ids[:2], tmp_path, request, (0, 1))
+@pytest.mark.parametrize("workspace_engines", [("ccu",), ("ccu", "urma")])
+def test_ccu_real_window_transfer(st_platform, st_device_ids, tmp_path, request, workspace_engines):
+    _exercise_window_transfer(
+        st_platform, st_device_ids[:2], tmp_path, request, (0, 1), workspace_engines=workspace_engines
+    )
 
 
 @pytest.mark.platforms(["a5"])
@@ -49,7 +52,15 @@ def test_ccu_partial_and_exit_only_requests_preserve_window(st_platform, st_devi
 
 
 def _exercise_window_transfer(
-    st_platform, devices, tmp_path, request, members, runtime="tensormap_and_ringbuffer", member_sets=None, masks=(3,)
+    st_platform,
+    devices,
+    tmp_path,
+    request,
+    members,
+    runtime="tensormap_and_ringbuffer",
+    member_sets=None,
+    masks=(3,),
+    workspace_engines=("ccu",),
 ):
     rounds = request.config.getoption("--rounds")
     assert rounds > 0
@@ -69,7 +80,6 @@ def _exercise_window_transfer(
     try:
         chip = worker.register(target)
         worker.init()
-        worker.register_ccu_callable(chip)
         outputs = [[worker.create_buffer(64), worker.create_buffer(64), worker.create_buffer(32768)] for _ in members]
         for generation in range(1, rounds + 1):
             selection = (generation - 1) % len(member_sets)
@@ -87,7 +97,7 @@ def _exercise_window_transfer(
                     members=list(members),
                     window_size=4 * 1024 * 1024,
                     buffers=[CommBufferSpec("data", "uint64", 4096, 32768)],
-                    workspace_engines=("ccu",),
+                    workspace_engines=workspace_engines,
                     retain_after_run=True,
                 )
                 if name in retained:
@@ -97,6 +107,10 @@ def _exercise_window_transfer(
                     allocations.append(domain.allocation_id)
                 for rank in range(len(members)):
                     orch.copy_to_domain(domain, rank, payloads[rank], buffer="data")
+                bindings = {
+                    chip_id: tuple(domain.get_or_register_ccu(chip, ccu_id=i, worker=chip_id) for i in range(2))
+                    for chip_id in members
+                }
                 for rank, chip_id in enumerate(members):
                     args = TaskArgs()
                     for index, output in enumerate(outputs[rank]):
@@ -105,16 +119,18 @@ def _exercise_window_transfer(
                         )
                     args.add_scalar(domain.device_context(chip_id, workspace_engines=("ccu",)))
                     args.add_scalar(generation | ((mask + 1) << 32))
-                    orch.submit_next_level(chip, args, config, worker=chip_id)
+                    orch.submit_next_level(chip, args, config, worker=chip_id, ccu_bindings=bindings[chip_id])
 
             worker.run(run)
             domain = retained[name]
-            ids = worker._ccu_run_registrations[(domain.allocation_id, chip.digest)]
-            for rank, chip_id in enumerate(members):
-                if chip_id in registrations:
-                    assert registrations[chip_id] == ids[rank]
-                registrations[chip_id] = ids[rank]
-            assert worker._ccu_domain_collective(domain, 8, chip.digest) == [1] * len(members)
+            bindings = {
+                chip_id: tuple(domain.get_or_register_ccu(chip, ccu_id=i, worker=chip_id) for i in range(2))
+                for chip_id in members
+            }
+            key = domain.allocation_id
+            if key in registrations:
+                assert registrations[key] == bindings
+            registrations[key] = bindings
             displacement = (generation % 8) * 64
             length = ((generation % 16) + 1) * 64
             for rank in range(len(members)):
@@ -124,8 +140,8 @@ def _exercise_window_transfer(
                     audit = struct.unpack("8Q", bytes(outputs[rank][index].shm.buf))
                     assert audit[4:] == (
                         length,
-                        members[(rank - 1) % len(members)],
-                        members[(rank + 1) % len(members)],
+                        (rank - 1) % len(members),
+                        (rank + 1) % len(members),
                         1,
                     )
                 expected = bytearray(payloads[rank])
@@ -147,9 +163,7 @@ def _exercise_window_transfer(
             domain.release()
             assert domain.freed
         assert len(allocations) == len(member_sets) + 1 and len(set(allocations)) == len(allocations)
-        assert len(worker._ccu_context_registrations) == 1
-        print(
-            "CCU W retained reuse, release and reallocation passed; one native registration per L2 context", flush=True
-        )
+        assert len(registrations) == len(allocations)
+        print("CCU W retained reuse, release and reallocation passed; domain-owned native registrations", flush=True)
     finally:
         worker.close()

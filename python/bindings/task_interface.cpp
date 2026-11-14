@@ -2792,6 +2792,31 @@ NB_MODULE(_task_interface, m) {
     // --- TaskArgs (unified vector-backed builder with per-tensor TensorArgType tags) ---
     nb::class_<TaskArgs>(m, "TaskArgs", nb::is_weak_referenceable())
         .def(nb::init<>())
+        .def(
+            "with_ccu_bindings",
+            [](const TaskArgs &self, nb::list entries) {
+                TaskArgs result = self;
+                std::vector<CcuTaskBinding> bindings;
+                for (auto entry : entries) {
+                    const auto tuple = nb::cast<nb::tuple>(entry);
+                    if (tuple.size() != 3) throw std::invalid_argument("CCU binding requires three fields");
+                    bindings.push_back(
+                        {nb::cast<uint64_t>(tuple[0]), nb::cast<uint64_t>(tuple[1]), nb::cast<uint32_t>(tuple[2]), 0}
+                    );
+                }
+                result.set_ccu_bindings(std::move(bindings));
+                return result;
+            }
+        )
+        .def(
+            "ccu_bindings",
+            [](const TaskArgs &self) {
+                nb::list result;
+                for (const auto &entry : self.ccu_bindings())
+                    result.append(nb::make_tuple(entry.allocation_id, entry.registration_id, entry.ccu_id));
+                return result;
+            }
+        )
 
         .def(
             "add_tensor",
@@ -4202,11 +4227,12 @@ NB_MODULE(_task_interface, m) {
             "(device_ctx, local_window_base, actual_window_size) for this rank. The commit flag records cleanup "
             "responsibility before result conversion or an allocation error; it does not imply a usable context."
         )
+        .def("communication_cleanup_confirmed", &ChipWorker::communication_cleanup_confirmed)
         .def(
             "register_ccu_callable",
             [](ChipWorker &self, uint64_t comm_handle, uint64_t collective_id, int32_t callable_id,
                const std::vector<uint32_t> &rank_ids, uint32_t domain_rank, const nb::bytes &sdk_build_id,
-               const nb::bytes &pto_isa_build_id, uint32_t workspace_mask) {
+               const nb::bytes &pto_isa_build_id, uint32_t workspace_mask, uint64_t allocation_id, uint32_t ccu_id) {
                 if (sdk_build_id.size() != SIMPLER_CCU_BUILD_ID_SIZE ||
                     pto_isa_build_id.size() != SIMPLER_CCU_BUILD_ID_SIZE) {
                     throw std::invalid_argument("CCU build identities must each contain exactly 32 bytes");
@@ -4215,11 +4241,25 @@ NB_MODULE(_task_interface, m) {
                 std::memcpy(identity.sdk.data(), sdk_build_id.c_str(), identity.sdk.size());
                 std::memcpy(identity.pto_isa.data(), pto_isa_build_id.c_str(), identity.pto_isa.size());
                 return self.register_ccu_callable(
-                    comm_handle, collective_id, callable_id, rank_ids, domain_rank, identity, workspace_mask
+                    comm_handle, collective_id, callable_id, rank_ids, domain_rank, identity, workspace_mask,
+                    allocation_id, ccu_id
                 );
             },
             nb::arg("comm_handle"), nb::arg("collective_id"), nb::arg("callable_id"), nb::arg("rank_ids"),
-            nb::arg("domain_rank"), nb::arg("sdk_build_id"), nb::arg("pto_isa_build_id"), nb::arg("workspace_mask") = 0
+            nb::arg("domain_rank"), nb::arg("sdk_build_id"), nb::arg("pto_isa_build_id"), nb::arg("workspace_mask") = 0,
+            nb::arg("allocation_id") = 0, nb::arg("ccu_id") = UINT32_MAX
+        )
+        .def(
+            "prepare_ccu_run_set", &ChipWorker::prepare_ccu_run_set, nb::arg("comm_handle"), nb::arg("registrations"),
+            nb::arg("generation"), nb::arg("dispatch_id")
+        )
+        .def(
+            "control_ccu_run_set", &ChipWorker::control_ccu_run_set, nb::arg("comm_handle"), nb::arg("run_set_id"),
+            nb::arg("operation")
+        )
+        .def(
+            "release_ccu_registration", &ChipWorker::release_ccu_registration, nb::arg("comm_handle"),
+            nb::arg("registration_id")
         )
         .def(
             "prepare_ccu_run", &ChipWorker::prepare_ccu_run, nb::arg("comm_handle"), nb::arg("registration_id"),
@@ -4326,6 +4366,10 @@ NB_MODULE(_task_interface, m) {
             for (int32_t i = 0; i < view.scalar_count; i++) {
                 args.add_scalar(view.scalars[i]);
             }
+            std::vector<CcuTaskBinding> bindings;
+            for (uint32_t i = 0; i < view.ccu_binding_count; ++i)
+                bindings.push_back(view.ccu_binding(i));
+            args.set_ccu_bindings(std::move(bindings));
             return args;
         },
         nb::arg("blob_ptr"), nb::arg("capacity"),

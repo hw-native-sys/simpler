@@ -27,6 +27,27 @@ struct HcommMissionStream {
     aclrtStream stream{};
 };
 
+class HcommMissionStreamPool final {
+public:
+    HcommMissionStreamPool() = default;
+    HcommMissionStreamPool(const HcommMissionStreamPool &) = delete;
+    HcommMissionStreamPool &operator=(const HcommMissionStreamPool &) = delete;
+    HcommMissionStreamPool(HcommMissionStreamPool &&) = delete;
+    HcommMissionStreamPool &operator=(HcommMissionStreamPool &&) = delete;
+    HcommMissionStream acquire();
+    bool release(uint64_t handle);
+    bool close();
+
+private:
+    struct Entry {
+        aclrtStream stream{};
+        bool leased{};
+        uint64_t uses{};
+    };
+    std::vector<Entry> entries_;
+    bool closed_{};
+};
+
 class HcommRunLifecycleSdk final : public RunLifecycleSdk {
 public:
     using ReadyEventPoller = std::function<int(uint64_t, uint64_t, bool *)>;
@@ -39,6 +60,7 @@ public:
     int poll_ready_event(uint64_t address, uint64_t mask, bool *ready) override;
     int query_stream(uint64_t stream_handle, StreamState *state) override;
     int abort_stream(uint64_t stream_handle) override;
+    int stop_completed_stream(uint64_t stream_handle) override;
 
 private:
     const HcommMissionStream *find_stream(uint64_t handle) const;

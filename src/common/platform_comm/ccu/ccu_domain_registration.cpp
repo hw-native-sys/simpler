@@ -12,6 +12,7 @@
 #include "ccu_domain_registration.h"
 
 #include <map>
+#include <set>
 #include <algorithm>
 #include <sstream>
 #include <utility>
@@ -52,7 +53,7 @@ std::vector<RegisteredKernel> register_domain_kernels(
     DomainRegistrationSdk &sdk
 ) {
     if (request.rank_count < 2 || request.rank_count > SIMPLER_CCU_MAX_RANKS || request.rank_id >= request.rank_count)
-        fail_protocol("CCU L2 rank");
+        fail_protocol("CCU domain logical rank");
     for (uint32_t peer = 0; peer < SIMPLER_CCU_MAX_RANKS; ++peer) {
         const bool required = peer < request.rank_count && peer != request.rank_id;
         if ((request.channels[peer] != 0) != required) fail_protocol("CCU all-peer channel binding");
@@ -60,6 +61,10 @@ std::vector<RegisteredKernel> register_domain_kernels(
     if (request.program_namespace.empty()) fail_protocol("CCU program namespace");
 
     if (kernels.empty() || request.missions.size() != kernels.size()) fail_protocol("CCU control count");
+    if (!request.ccu_ids.empty() && request.ccu_ids.size() != kernels.size()) fail_protocol("CCU ID count");
+    std::set<uint32_t> ids;
+    for (uint32_t id : request.ccu_ids)
+        if (id == UINT32_MAX || !ids.insert(id).second) fail_protocol("CCU duplicate or invalid ID");
     std::vector<const NativeKernelDefinition *> selected;
     std::vector<SimplerCcuRegistrationBinding> bindings;
     for (const auto &mission : request.missions) {
@@ -74,10 +79,12 @@ std::vector<RegisteredKernel> register_domain_kernels(
             kernel.record.registration_argument_count != SIMPLER_CCU_REGISTRATION_ARGUMENT_COUNT ||
             kernel.record.task_argument_count != SIMPLER_CCU_TASK_ARGUMENT_COUNT)
             fail_protocol("CCU kernel ABI");
+        if (kernel.record.required_rank_count != 0 && kernel.record.required_rank_count != request.rank_count)
+            fail_protocol("CCU kernel domain rank specialization");
         selected.push_back(&kernel);
         bindings.push_back(
             {sizeof(SimplerCcuRegistrationBinding),
-             static_cast<uint32_t>(bindings.size()),
+             request.ccu_ids.empty() ? static_cast<uint32_t>(bindings.size()) : request.ccu_ids[bindings.size()],
              request.rank_id,
              request.rank_count,
              {},

@@ -23,10 +23,28 @@
 
 namespace simpler::ccu {
 bool fail_window_token = false;
+#ifndef SIMPLER_TEST_CCU_BACKEND
+// This fixture exercises workspace ownership without allocating CCU missions or peer channels.
+bool HcommMissionStreamPool::close() {
+    assert(entries_.empty());
+    closed_ = true;
+    return true;
+}
+bool HcommDomainChannels::close() {
+    assert(communicator == nullptr);
+    return true;
+}
+void create_hcomm_domain_channels(
+    HcclComm, uint64_t, const std::vector<uint32_t> &ranks, uint32_t rank, std::shared_ptr<HcommDomainChannels> &result
+) {
+    assert(ranks.size() == 1 && rank == 0 && !result);
+    result = std::make_shared<HcommDomainChannels>();
+}
 bool query_window_token(uint64_t, uint64_t, uint64_t &token) {
     token = 123;
     return !fail_window_token;
 }
+#endif
 }  // namespace simpler::ccu
 
 namespace {
@@ -38,6 +56,11 @@ bool fail_context_upload = false;
 bool fail_host_register = false;
 bool unsupported_host_udma = false;
 int subcomm_creates = 0;
+#ifdef SIMPLER_TEST_CCU_BACKEND
+bool fail_ccu_destroy = false;
+std::unordered_set<HcclComm> live_ccu_communicators;
+std::string ccu_communicator_name;
+#endif
 bool fail_host_pointer = false;
 bool fail_host_unregister = false;
 std::unordered_map<void *, int> registered_hosts;
@@ -185,13 +208,26 @@ extern "C" aclError aclrtDevicePeerAccessStatus(int32_t, int32_t, int32_t *statu
     *status = 1;
     return ACL_SUCCESS;
 }
-extern "C" HcclResult
-HcclCreateSubCommConfig(HcclComm *, uint32_t, uint32_t *, uint64_t id, uint32_t, HcclCommConfig *, HcclComm *out) {
+extern "C" HcclResult HcclCreateSubCommConfig(
+    HcclComm *, uint32_t, uint32_t *, uint64_t id, uint32_t, HcclCommConfig *config, HcclComm *out
+) {
     ++subcomm_creates;
     *out = reinterpret_cast<HcclComm>(static_cast<uintptr_t>(id + 2));
+#ifdef SIMPLER_TEST_CCU_BACKEND
+    assert(live_ccu_communicators.insert(*out).second);
+    ccu_communicator_name = config->hcclCommName;
+#else
+    (void)config;
+#endif
     return HCCL_SUCCESS;
 }
-extern "C" HcclResult HcclCommDestroy(HcclComm) {
+extern "C" HcclResult HcclCommDestroy(HcclComm comm) {
+#ifdef SIMPLER_TEST_CCU_BACKEND
+    if (fail_ccu_destroy) return HCCL_E_INTERNAL;
+    assert(live_ccu_communicators.erase(comm) == 1);
+#else
+    (void)comm;
+#endif
     if (throw_hccl_destroy) throw std::runtime_error("injected HCCL destroy failure");
     return HCCL_SUCCESS;
 }
@@ -571,7 +607,16 @@ static void test_basic_window() {
     std::filesystem::remove_all(folder);
 }
 
+#ifdef SIMPLER_TEST_CCU_BACKEND
+#include "comm_ccu_failure.h"
+#endif
+
 int main(int argc, char **argv) {
+#ifdef SIMPLER_TEST_CCU_BACKEND
+    assert(argc == 3);
+    test_ccu_channel_rollback(argv[1], std::string(argv[2]) == "destroy_failure");
+    return 0;
+#endif
     if (argc == 2) {
         if (std::string(argv[1]) == "basic_window") {
             test_basic_window();

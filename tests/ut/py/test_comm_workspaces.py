@@ -86,7 +86,22 @@ def test_a5_host_options_select_rdma(tmp_path, rdma):
 
 @pytest.fixture(scope="module", params=[False, True])
 def host_resource_binary(request, tmp_path_factory):
-    build = tmp_path_factory.mktemp("comm_workspace_host")
+    return build_host_resource_binary(tmp_path_factory.mktemp("comm_workspace_host"), request.param)
+
+
+def _ccu_sdk_environment(cann):
+    # Host fault injection needs SDK symbols, not an installed device driver.
+    if not (cann / "devlib/libascend_hal.so").is_file():
+        pytest.skip("HCOMM failure injection requires the CANN devlib driver stub")
+    env = os.environ.copy()
+    paths = [str(cann / "lib64"), str(cann / "devlib")]
+    if env.get("LD_LIBRARY_PATH"):
+        paths.append(env["LD_LIBRARY_PATH"])
+    env["LD_LIBRARY_PATH"] = os.pathsep.join(paths)
+    return env
+
+
+def build_host_resource_binary(build, rdma, *, ccu_backend=False):
     cann = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/cann"))
     if not (cann / "include/hccl/hccl_comm.h").exists():
         pytest.skip("production host ownership fixture requires CANN headers, no device")
@@ -100,13 +115,47 @@ def host_resource_binary(request, tmp_path_factory):
         "#pragma once\n"
         + "".join(f"#define LOG_{level}(...) ((void)0)\n" for level in ("ERROR", "WARN", "INFO", "DEBUG"))
     )
-    rdma = request.param
     defines = []
+    backend_sources = []
+    backend_libraries = []
+    backend_env = None
+    if ccu_backend:
+        if not (cann / "include/hccl/hccl_ccu_res.h").exists():
+            pytest.skip("HCOMM failure injection requires the CCU SDK, no device")
+        backend_env = _ccu_sdk_environment(cann)
+        defines += [
+            "-DSIMPLER_TEST_CCU_BACKEND=1",
+            "-Wl,--export-dynamic-symbol=simpler_ccu_test_manifest_variant",
+            f"-I{cann}/include/hccl",
+            f"-I{cann}/include/hcomm/ccu",
+            f"-I{cann}/pkg_inc/hcomm/ccu",
+            f"-I{cann}/pkg_inc",
+        ]
+        host = ROOT / "src/a5/platform/onboard/host"
+        common = ROOT / "src/common/platform_comm/ccu"
+        backend_sources = [
+            str(host / name)
+            for name in (
+                "ccu_domain_backend_hcomm.cpp",
+                "ccu_domain_registration_hcomm.cpp",
+                "ccu_run_lifecycle_hcomm.cpp",
+            )
+        ] + [str(common / name) for name in ("ccu_native_module.cpp", "ccu_domain_registration.cpp")]
+        backend_libraries = [
+            f"-L{cann}/lib64",
+            f"-Wl,-rpath,{cann}/lib64",
+            f"-Wl,-rpath-link,{cann}/lib64:{cann}/devlib",
+            "-lasccomm_ccu",
+            "-lhcomm",
+            "-lascendcl",
+            "-lruntime",
+            "-lc_sec",
+        ]
     if rdma:
         defines.append("-DSIMPLER_ENABLE_PTO_RDMA_WORKSPACE=1")
     isa = Path(ensure_pto_isa_root())
     binary = build / "host_resources"
-    subprocess.run(
+    result = subprocess.run(
         [
             "c++",
             "-std=c++17",
@@ -128,16 +177,39 @@ def host_resource_binary(request, tmp_path_factory):
             str(ROOT / "tests/ut/py/support/comm_workspaces_host.cpp"),
             str(ROOT / "src/common/platform_comm/ccu/ccu_domain_owner.cpp"),
             str(ROOT / "src/common/platform_comm/ccu/ccu_run_lifecycle.cpp"),
+            *backend_sources,
+            *backend_libraries,
             "-ldl",
             "-lrt",
             "-o",
             str(binary),
         ],
-        check=True,
+        env=backend_env,
+        check=False,
         capture_output=True,
         text=True,
     )
+    if result.returncode != 0:
+        pytest.fail(f"Host resource fixture compilation failed:\n{result.stdout}\n{result.stderr}", pytrace=False)
     return binary
+
+
+def test_host_fixture_reports_compiler_diagnostics(tmp_path, monkeypatch):
+    compiler_dir = tmp_path / "bin"
+    compiler_dir.mkdir()
+    compiler = compiler_dir / "c++"
+    compiler.write_text("#!/bin/sh\nprintf 'fixture compiler diagnostic\\n' >&2\nexit 7\n")
+    compiler.chmod(0o755)
+    header = tmp_path / "include/hccl/hccl_comm.h"
+    header.parent.mkdir(parents=True)
+    header.touch()
+    build = tmp_path / "build"
+    build.mkdir()
+    monkeypatch.setenv("ASCEND_HOME_PATH", str(tmp_path))
+    monkeypatch.setenv("PATH", str(compiler_dir) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setattr(sys.modules[__name__], "ensure_pto_isa_root", lambda: str(tmp_path))
+    with pytest.raises(pytest.fail.Exception, match="fixture compiler diagnostic"):
+        build_host_resource_binary(build, False)
 
 
 def test_workspace_domains_keep_resources_isolated_and_rollback_failures(host_resource_binary):
@@ -332,3 +404,33 @@ def test_engine_configs_are_available_when_native_bindings_are_missing():
         ],
         check=True,
     )
+
+
+@pytest.fixture(scope="module")
+def ccu_failure_binary(tmp_path_factory):
+    build = tmp_path_factory.mktemp("comm_ccu_failure")
+    binary = build_host_resource_binary(build, False, ccu_backend=True)
+    module = build / "native_module.so"
+    subprocess.run(
+        [
+            "c++",
+            "-std=c++17",
+            "-shared",
+            "-fPIC",
+            f"-I{ROOT}/src/common",
+            str(ROOT / "tests/ut/cpp/common/platform/support/ccu_native_test_module.cpp"),
+            "-o",
+            str(module),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    cann = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/cann"))
+    return binary, module, _ccu_sdk_environment(cann)
+
+
+@pytest.mark.parametrize("failure", ["channels_only", "destroy_failure"])
+def test_legacy_ccu_channel_rollback_retains_unconfirmed_resources(ccu_failure_binary, failure):
+    binary, module, env = ccu_failure_binary
+    subprocess.run([str(binary), str(module), failure], env=env, check=True, timeout=20)

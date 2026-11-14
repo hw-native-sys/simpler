@@ -44,6 +44,9 @@ public:
     virtual int poll_ready_event(uint64_t address, uint64_t mask, bool *ready) = 0;
     virtual int query_stream(uint64_t stream_handle, StreamState *state) = 0;
     virtual int abort_stream(uint64_t stream_handle) = 0;
+    // Success proves this run has no remaining device accesses.
+    // The backend separately prepares or replaces execution resources before reuse.
+    virtual int stop_completed_stream(uint64_t) { return -1; }
 };
 
 class DomainRun;
@@ -78,6 +81,8 @@ public:
     bool poll_ready();
     bool poll_terminal();
     bool stop();
+    // The caller has retired every request and guarantees no further triggers.
+    bool finish_completed_requests();
     void abort();
 
     bool launched() const noexcept { return launched_; }

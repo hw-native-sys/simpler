@@ -265,66 +265,6 @@ def test_abort_attempts_every_callable_and_preserves_first_failure(first_error, 
         Worker._require_no_ordered_cleanup_failure(worker, "submit")
 
 
-def test_prepare_registers_selected_domain_and_reuses_without_launch():
-    domain = _domain()
-    resources = worker_mod._RunResources(live_domains={domain.name: domain})
-    state = SimpleNamespace(target=SimpleNamespace(ccu_module_count=1), eligible_worker_ids=(0, 1))
-    observed = []
-    worker: Any = SimpleNamespace(
-        level=3,
-        _config={"platform": "a5", "device_ids": [4, 5]},
-        _next_level_worker_ids=[],
-        _ccu_run_registrations={},
-        _ccu_context_registrations={},
-        _worker=object(),
-        _building_run_resources=resources,
-        _record_touched_identities=lambda _: None,
-        _enroll_domain_uses=lambda _: None,
-        _resolve_handle=lambda *_args, **_kwargs: state,
-        _control_admission=lambda _: nullcontext(),
-        _ccu_domain_collective=lambda handle, operation, digest: observed.append((handle.workers, operation, digest))
-        or [1, 2],
-    )
-    callable_handle = SimpleNamespace(digest=b"c" * 32)
-    worker._ccu_context_registrations[(worker._worker, callable_handle.digest)] = [1, 2]
-
-    def args(chip):
-        return SimpleNamespace(scalar_count=lambda: 1, scalar=lambda _: 100 + chip)
-
-    Worker._prepare_ccu_submission(worker, callable_handle, [0], [args(0)])
-    Worker._prepare_ccu_submission(worker, callable_handle, [1], [args(1)])
-    assert observed == [((0, 1), 6, callable_handle.digest)]
-    assert resources.ccu_domains[9] is domain
-    with pytest.raises(ValueError, match="explicitly registered"):
-        Worker._prepare_ccu_submission(worker, SimpleNamespace(digest=b"d" * 32), [0], [args(0)])
-    assert len(observed) == 1
-
-
-@pytest.mark.parametrize("domain_count", [0, 2])
-def test_ccu_submission_rejects_missing_or_ambiguous_context(domain_count):
-    domains = {str(i): _domain() for i in range(domain_count)}
-    worker: Any = SimpleNamespace(
-        level=3,
-        _config={"platform": "a5", "device_ids": [4, 5]},
-        _next_level_worker_ids=[],
-        _ccu_run_registrations={},
-        _ccu_context_registrations={},
-        _worker=object(),
-        _control_admission=lambda _: nullcontext(),
-        _record_touched_identities=lambda _: None,
-        _enroll_domain_uses=lambda _: None,
-        _ccu_domain_collective=lambda *_: [1, 1],
-        _building_run_resources=worker_mod._RunResources(live_domains=domains),
-        _resolve_handle=lambda *_args, **_kwargs: SimpleNamespace(
-            target=SimpleNamespace(ccu_module_count=1), eligible_worker_ids=(0, 1)
-        ),
-    )
-    worker._ccu_context_registrations[(worker._worker, b"c" * 32)] = [1, 2]
-    args = SimpleNamespace(scalar_count=lambda: 1, scalar=lambda _: 100)
-    with pytest.raises(ValueError, match="CCU-enabled|context"):
-        Worker._prepare_ccu_submission(worker, SimpleNamespace(digest=b"c" * 32), [0], [args])
-
-
 def test_l2_launches_only_on_begin_and_confirms_stop_before_reuse():
     operations = []
     worker = SimpleNamespace(
@@ -343,7 +283,7 @@ def test_l2_launches_only_on_begin_and_confirms_stop_before_reuse():
     assert not binding.active
 
 
-@pytest.mark.parametrize("failed_operation", [1, 3])
+@pytest.mark.parametrize("failed_operation", [1, 3, 7])
 def test_l2_failure_aborts_and_keeps_binding_active(failed_operation):
     operations = []
 

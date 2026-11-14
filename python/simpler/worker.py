@@ -3579,6 +3579,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
     base_comm_handle = 0
     diagnostic_capture_index = 0
     ccu_bindings = {}
+    ccu_binding_acquisitions = {}
     ccu_callables = {}
     ccu_contexts = {}
 
@@ -3748,7 +3749,47 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                         raise RuntimeError("CCU admission is closed; only cleanup controls are accepted")
                     comm = _require_base_communicator(base_comm_handle)
                     result = 0
-                    if operation == 5:
+                    if operation == 9:
+                        try:
+                            tail = _CCU_DOMAIN_REQUEST.size
+                            collective_id, rank_count, domain_rank, ccu_id = struct.unpack_from("<QIII", payload, tail)
+                            if size != tail + 20 + rank_count * 4 or rank_count < 1 or domain_rank >= rank_count:
+                                raise ValueError("invalid domain CCU registration topology")
+                            rank_ids = list(struct.unpack_from(f"<{rank_count}I", payload, tail + 20))
+                            cid = identity_table.get(digest)
+                            if cid is None:
+                                raise RuntimeError("CCU callable is not registered on this chip")
+                            from .ccu import runtime_build_identity  # noqa: PLC0415
+
+                            sdk_id, isa_id = runtime_build_identity()
+                            result = cw.register_ccu_callable(
+                                comm,
+                                collective_id,
+                                int(cid),
+                                rank_ids,
+                                domain_rank,
+                                sdk_id,
+                                isa_id,
+                                8,
+                                allocation,
+                                ccu_id,
+                            )
+                        except Exception:
+                            if not cw.communication_cleanup_confirmed():
+                                raise
+                            result = -1
+                        else:
+                            ccu_bindings[result] = (allocation, ccu_id)
+                            ccu_binding_acquisitions[result] = ccu_binding_acquisitions.get(result, 0) + 1
+                    elif operation == 10:
+                        cw.release_ccu_registration(comm, allocation)
+                        remaining = ccu_binding_acquisitions.get(allocation, 1) - 1
+                        if remaining:
+                            ccu_binding_acquisitions[allocation] = remaining
+                        else:
+                            ccu_binding_acquisitions.pop(allocation, None)
+                            ccu_bindings.pop(allocation, None)
+                    elif operation == 5:
                         tail = _CCU_DOMAIN_REQUEST.size
                         collective_id, rank_count, domain_rank = struct.unpack_from("<QII", payload, tail)
                         if size != tail + 16 + rank_count * 4 or rank_count < 2 or domain_rank >= rank_count:
@@ -3782,6 +3823,10 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                     staged.close()
             elif sub_cmd == _CTRL_RELEASE_DOMAIN:
                 released = _handle_ctrl_release_domain(cw, buf, base_comm_handle=base_comm_handle)
+                for registration, binding in tuple(ccu_bindings.items()):
+                    if isinstance(binding, tuple) and binding[0] == released:
+                        del ccu_bindings[registration]
+                        ccu_binding_acquisitions.pop(registration, None)
                 for key, (_, allocation) in tuple(ccu_contexts.items()):
                     if allocation == released:
                         del ccu_contexts[key]
@@ -4066,16 +4111,17 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
             # at those bases, as the non-pipelined task path does. The lane copies the args into
             # its own storage, so this POD need not outlive the call.
             args = staged.pending_args  # type: ignore[attr-defined]
-            if getattr(registry[staged.cid], "ccu_module_count", 0):
-                matches = [
-                    ccu_contexts[(staged.digest, args.scalar(i))]
-                    for i in range(args.scalar_count())
-                    if (staged.digest, args.scalar(i)) in ccu_contexts
-                ]
-                if len(matches) != 1:
-                    raise ValueError("CCU task requires exactly one enabled domain context")
-                binding, allocation = matches[0]
-                staged.ccu_binding = binding.prepare(dispatch_id, allocation)
+            plan = args.ccu_bindings()
+            if plan:
+                from .ccu import ChipCcuRunSet  # noqa: PLC0415
+
+                registrations = []
+                for allocation, registration, ccu_id in plan:
+                    if ccu_bindings.get(registration) != (allocation, ccu_id):
+                        raise ValueError("invalid or expired domain CCU binding")
+                    if registration not in registrations:
+                        registrations.append(registration)
+                staged.ccu_binding = ChipCcuRunSet(cw, base_comm_handle, registrations, dispatch_id, dispatch_id)
             _validate_host_control_access(registry.get(staged.cid), args)
             Worker._validate_map_aliases(registry.get(staged.cid), args)
             if staged.config.output_prefix:
@@ -11220,6 +11266,7 @@ class Worker:
                         buffers=config.specs(),
                         retain_after_run=config.retain_after_run,
                     )
+                handle._ccu_register_fn = self._get_or_register_domain_ccu
                 handle._use_fn = self._use_domain
                 self._use_domain(handle, config=config)
                 self._initialize_domain(handle, initializer)
@@ -11280,55 +11327,122 @@ class Worker:
             self._ensure_comm_base()
             self._ccu_context_registrations[context_key] = self._ccu_registration_collective(digest)
 
-    def _prepare_ccu_submission(self, callable_handle, worker_ids, args_list) -> None:
+    def _get_or_register_domain_ccu(self, domain, callable_handle, *, ccu_id, worker):
+        from .ccu import CcuRegistrationHandle  # noqa: PLC0415
+
+        with self._operation_lease("get_or_register_ccu", allow_continuation=True):
+            if isinstance(ccu_id, bool) or not isinstance(ccu_id, int) or not 0 <= ccu_id < 2**32 - 1:
+                raise ValueError("ccu_id must be a uint32 definition id below UINT32_MAX")
+            state = self._resolve_handle(callable_handle, expected_namespace="LOCAL_CHIP")
+            if self.level != 3 or self._config.get("platform") != "a5":
+                raise ValueError("CCU registration requires an L3 A5 Worker")
+            if not getattr(state.target, "ccu_module_count", 0):
+                raise ValueError("callable has no native CCU kernels")
+            domain._require_ready()
+            if domain._config is None or "ccu" not in domain._config.workspace_engines:
+                raise ValueError("domain must declare workspace_engines=('ccu',)")
+            if isinstance(worker, bool) or not isinstance(worker, int) or worker not in domain.workers:
+                raise ValueError("CCU registration worker must be a domain member Worker id")
+            if state.eligible_worker_ids and worker not in state.eligible_worker_ids:
+                raise ValueError("CCU callable must be available on the target worker")
+            key = (worker, callable_handle.digest, ccu_id)
+            with domain._ccu_registration_lock:
+                if key in domain._ccu_registrations:
+                    binding = domain._ccu_registrations[key]
+                    binding.require_live(self)
+                    self._use_domain(domain)
+                    return binding
+            with self._control_admission("get_or_register_ccu"), domain._ccu_registration_lock:
+                domain._require_ready()
+                if domain._ccu_registration_failed:
+                    raise RuntimeError("CCU registration cleanup is unconfirmed; domain cannot be reused")
+                if key not in domain._ccu_registrations:
+                    registration = self._register_domain_ccu(domain, callable_handle.digest, ccu_id, worker)
+                    domain._ccu_registrations[key] = CcuRegistrationHandle(
+                        domain,
+                        self,
+                        callable_handle,
+                        ccu_id,
+                        worker,
+                        registration,
+                        domain.allocation_id,
+                        domain.generation,
+                    )
+                self._use_domain(domain)
+                return domain._ccu_registrations[key]
+
+    def _register_domain_ccu(self, domain, digest, ccu_id, worker):
+        native = self._worker
+        if native is None:
+            raise RuntimeError("CCU registration requires an initialized Worker")
+        self._ensure_comm_base()
+        with self._alloc_id_lock:
+            registration_context_id = self._next_alloc_id
+            self._next_alloc_id += 1
+        workers = domain.workers
+        payload = _CCU_DOMAIN_REQUEST.pack(domain.allocation_id, domain.generation, 9, digest, 0)
+        payload += struct.pack("<QIII", registration_context_id, len(workers), workers.index(worker), ccu_id)
+        payload += struct.pack(f"<{len(workers)}I", *workers)
+        try:
+            reply = native.control_payload(
+                WorkerType.NEXT_LEVEL, worker, _CTRL_CCU_DOMAIN, payload, self._py_control_timeout_s
+            )
+            result = _CCU_DOMAIN_REQUEST.unpack_from(reply)[-1]
+            if result != -1 and result <= 0:
+                raise RuntimeError("CCU registration returned an invalid handle")
+        except BaseException:
+            # An unknown RPC outcome may leave a registration on the target.
+            domain._ccu_registration_failed = True
+            raise
+        if result == -1:
+            raise RuntimeError(f"CCU registration rejected on worker {worker}; cleanup confirmed")
+        return result
+
+    def _prepare_ccu_submission(self, callable_handle, worker_ids, args_list, *, ccu_bindings=None):
+        from .ccu import CcuRegistrationHandle  # noqa: PLC0415
+
         state = self._resolve_handle(callable_handle, expected_namespace="LOCAL_CHIP")
-        if not getattr(state.target, "ccu_module_count", 0):
-            return
+        if ccu_bindings is None:
+            if getattr(state.target, "ccu_module_count", 0):
+                raise ValueError("CCU task requires explicit ccu_bindings")
+            return args_list
         if self.level != 3 or self._config.get("platform") != "a5":
             raise ValueError("CCU submissions require an L3 A5 Worker")
         resources = self._building_run_resources
         if resources is None:
             raise RuntimeError("CCU submission requires an orchestration callback")
+        if isinstance(ccu_bindings, dict):
+            if set(ccu_bindings) != set(worker_ids):
+                raise ValueError("ccu_bindings must describe exactly the submitted workers")
+            plans = [tuple(ccu_bindings[chip]) for chip in worker_ids]
+        else:
+            common = tuple(ccu_bindings)
+            plans = [common] * len(worker_ids)
+        encoded_plans = []
+        used_domains = {}
+        for chip, plan in zip(worker_ids, plans):
+            encoded = {}
+            for binding in plan:
+                if not isinstance(binding, CcuRegistrationHandle):
+                    raise TypeError("ccu_bindings entries must be CcuRegistrationHandle objects")
+                binding.require_live(self)
+                if chip != binding.worker:
+                    raise ValueError("CCU binding used on a different worker from its registration")
+                key = (binding.allocation_id, binding.ccu_id)
+                value = (binding.allocation_id, binding.registration_id, binding.ccu_id)
+                if key in encoded and encoded[key] != value:
+                    raise ValueError("conflicting CCU definitions for one domain and ccu_id")
+                encoded[key] = value
+                used_domains[binding.allocation_id] = binding.domain
+            encoded_plans.append(list(encoded.values()))
+        result = [args.with_ccu_bindings(plan) for args, plan in zip(args_list, encoded_plans)]
+        for domain in used_domains.values():
+            self._use_domain(domain)
+            resources.ccu_domains[domain.allocation_id] = domain
         for args in args_list:
             self._record_touched_identities(args)
         self._enroll_domain_uses(resources)
-        domains = [
-            handle
-            for handle in resources.live_domains.values()
-            if not handle.released
-            and handle._config is not None
-            and "ccu" in handle._config.workspace_engines
-            and set(worker_ids) <= set(handle.workers)
-        ]
-        if not domains:
-            raise ValueError("CCU task requires a CCU-enabled domain; allocate with workspace_engines=('ccu',)")
-        selected = [
-            handle
-            for handle in domains
-            if all(
-                sum(args.scalar(i) == handle.contexts[chip].device_ctx for i in range(args.scalar_count())) == 1
-                for chip, args in zip(worker_ids, args_list)
-            )
-        ]
-        if len(selected) != 1:
-            raise ValueError("CCU task requires exactly one selected domain context in its scalar arguments")
-        handle = selected[0]
-        if resources.ccu_domains and handle.allocation_id not in resources.ccu_domains:
-            raise ValueError("only one CCU domain is supported per orchestration run")
-        if state.eligible_worker_ids and not set(range(len(self._config.get("device_ids", ())))) <= set(
-            state.eligible_worker_ids
-        ):
-            raise ValueError("CCU callable must be registered on every L3 chip worker")
-        digest = callable_handle.digest
-        if (self._worker, digest) not in self._ccu_context_registrations:
-            raise ValueError("CCU callable must be explicitly registered before submit")
-        key = (handle.allocation_id, digest)
-        if key in resources.ccu_bindings:
-            return
-        registrations = self._ccu_domain_collective(handle, 6, digest)
-        self._ccu_run_registrations[key] = registrations
-        resources.ccu_domains[handle.allocation_id] = handle
-        resources.ccu_bindings[key] = digest
+        return result
 
     def _ccu_registration_collective(self, digest) -> list[int]:
         """Register a callable once across the full L3/L2 communication context."""

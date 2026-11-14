@@ -33,8 +33,8 @@ inline __aicore__ void trigger_window(__gm__ int64_t *args, uint32_t offset, uin
         {Arg::Kind::Window, comm->rankId, ccu_id * 8192 + displacement, length},
         {Arg::Kind::Window, target, 16384 + ccu_id * 8192 + displacement, length},
         {Arg::Kind::Scalar, 0, length, 0},
-        {Arg::Kind::PeerRank, target, 0, 0},
-        {Arg::Kind::PeerRank, source, 0, 0}
+        {Arg::Kind::Scalar, 0, target, 0},
+        {Arg::Kind::Scalar, 0, source, 0}
     };
     uint64_t words[10]{};
     uint64_t bytes = 0;
