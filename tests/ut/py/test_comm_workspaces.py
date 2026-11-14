@@ -144,6 +144,10 @@ def test_workspace_domains_keep_resources_isolated_and_rollback_failures(host_re
     subprocess.run([str(host_resource_binary)], check=True, timeout=20)
 
 
+def test_basic_window_issues_no_explicit_access(host_resource_binary):
+    subprocess.run([str(host_resource_binary), "basic_window"], check=True, timeout=20)
+
+
 @pytest.mark.parametrize(
     "scenario",
     [

@@ -539,8 +539,44 @@ static void test_host_domain(const std::string &scenario) {
     std::filesystem::remove_all(folder);
 }
 
+static void test_basic_window() {
+    char folder[] = "/tmp/simpler-basic-window-XXXXXX";
+    assert(mkdtemp(folder));
+    auto *h = new CommHandle_{};
+    h->rank = 0;
+    h->nranks = 2;
+    h->rootinfo_path = std::string(folder) + "/root";
+    h->run_token = 3;
+    h->hccl_comm = reinterpret_cast<HcclComm>(1);
+
+    // One in-process rank stands in for the peer: its announce file and its
+    // half of the P2P barrier are enough for rank 0 to run the local and the
+    // imported mapping in comm_alloc_windows.
+    assert(ipc_write_announce(h->rootinfo_path, 1, h->run_token, 1, 1, 42));
+    assert(
+        file_marker_handshake::publish_marker(barrier_marker_path(h->rootinfo_path, h->run_token, "ipc_p2p_ready", 1))
+    );
+
+    uint64_t device_ctx = 0;
+    assert(comm_alloc_windows(h, 4096, &device_ctx) == 0);
+    assert(device_ctx != 0);
+    assert(h->host_ctx.rankId == 0 && h->host_ctx.rankNum == 2);
+    assert(h->host_ctx.winSize >= 4096);
+    assert(h->host_ctx.windowsIn[0] != 0 && h->host_ctx.windowsIn[1] != 0);
+    assert(explicit_access_calls == 0);
+
+    // No peer process exists to join comm_destroy's teardown handshake.
+    h->nranks = 1;
+    assert(comm_destroy(h) == 0);
+    std::filesystem::remove_all(folder);
+}
+
 int main(int argc, char **argv) {
     if (argc == 2) {
+        if (std::string(argv[1]) == "basic_window") {
+            test_basic_window();
+            return 0;
+        }
         if (std::string(argv[1]).find("host_") == 0) {
             test_host_domain(argv[1]);
             return 0;
