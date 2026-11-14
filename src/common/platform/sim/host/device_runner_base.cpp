@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+#include <filesystem>
 #include "device_runner_base.h"
 
 #include <sys/stat.h>
@@ -1714,7 +1715,9 @@ uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *ca
 
         std::string tmpfile;
         if (!simpler::common::sim_host::create_temp_so_file(
-                "/tmp/kernel_" + std::to_string(callable->child_func_id(i)) + "_XXXXXX",
+                (std::filesystem::temp_directory_path() /
+                 ("kernel_" + std::to_string(callable->child_func_id(i)) + "_XXXXXX"))
+                    .string(),
                 reinterpret_cast<const uint8_t *>(kernel_binary), kernel_size, &tmpfile
             )) {
             LOG_ERROR("Failed to create temp file for child kernel #%d", i);

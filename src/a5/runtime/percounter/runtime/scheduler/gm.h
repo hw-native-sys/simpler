@@ -18,9 +18,9 @@
  * one instruction for one of them and a traced call for the other is not the
  * same primitive, and sharing the declaration hides that.
  *
- * **Each of these is a plain access, and an AICore caller depends on it being
- * one.** They are small enough to inline into the loops that call them, and
- * the loops are tight enough that it matters.
+ * The uninstrumented lane compiles these to plain accesses in its loop.
+ * The profiled translation unit uses percounter's own per-core binding;
+ * no HBG observer state participates in either path.
  *
  * What the barriers are for is measured, not assumed:
  *
@@ -41,147 +41,221 @@
 
 #include "dispatch_payload.h"
 #include "scheduler/scheduler_types.h"
+#include "scheduler/profiling_memory.h"
 
 /** Invalidate one line, then wait for it, so the next read sees publication. */
-inline __aicore__ void percounter_observe_cache_line(__gm__ void *address) {
+static inline __aicore__ void percounter_observe_cache_line(__gm__ void *address) {
+    simpler::percounter::percounter_scalar_memory_issue(
+        simpler::percounter::ProfilePhase::DcciSingle, 1, [=]() __aicore__ {
 #if defined(__CCE_AICORE__)
-    dcci(address, SINGLE_CACHE_LINE);
-    dsb((mem_dsb_t)0);
+            dcci(address, SINGLE_CACHE_LINE);
 #else
-    (void)address;
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            (void)address;
 #endif
+        }
+    );
+    simpler::percounter::percounter_scalar_memory_issue(simpler::percounter::ProfilePhase::DsbAll, 1, []() __aicore__ {
+#if defined(__CCE_AICORE__)
+        dsb((mem_dsb_t)0);
+#else
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+    });
 }
 
-inline __aicore__ void percounter_observe_cache_line(volatile __gm__ void *address) {
+static inline __aicore__ void percounter_observe_cache_line(volatile __gm__ void *address) {
     percounter_observe_cache_line(const_cast<__gm__ void *>(address));
 }
 
 /** The same for the whole data cache, before reading a producer's output. */
-inline __aicore__ void percounter_observe_data_cache(__gm__ void *address) {
+static inline __aicore__ void percounter_observe_data_cache(__gm__ void *address) {
+    simpler::percounter::percounter_scalar_memory_issue(
+        simpler::percounter::ProfilePhase::DcciEntire, 1, [=]() __aicore__ {
 #if defined(__CCE_AICORE__)
-    dcci(address, ENTIRE_DATA_CACHE);
-    dsb((mem_dsb_t)0);
+            dcci(address, ENTIRE_DATA_CACHE);
 #else
-    (void)address;
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            (void)address;
 #endif
+        }
+    );
+    simpler::percounter::percounter_scalar_memory_issue(simpler::percounter::ProfilePhase::DsbAll, 1, []() __aicore__ {
+#if defined(__CCE_AICORE__)
+        dsb((mem_dsb_t)0);
+#else
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+    });
 }
 
 /** A bypass load: cheap, and behind by at most one publication. */
-inline __aicore__ int64_t percounter_gm_read(__gm__ volatile int64_t &value, int order = __ATOMIC_ACQUIRE) {
+static inline __aicore__ int64_t percounter_gm_read(__gm__ volatile int64_t &value, int order = __ATOMIC_ACQUIRE) {
+    return simpler::percounter::percounter_scalar_memory_result(
+        simpler::percounter::ProfilePhase::BypassLoad, [=, &value]() __aicore__ {
 #if defined(__CCE_AICORE__)
-    (void)order;
-    __gm__ int64_t *signed_address = const_cast<__gm__ int64_t *>(&value);
-    __gm__ uint64_t *address = reinterpret_cast<__gm__ uint64_t *>(signed_address);
-    return static_cast<int64_t>(static_cast<uint64_t>(__builtin_cce_ld_dev(address, 0)));
+            (void)order;
+            __gm__ int64_t *signed_address = const_cast<__gm__ int64_t *>(&value);
+            __gm__ uint64_t *address = reinterpret_cast<__gm__ uint64_t *>(signed_address);
+            return static_cast<int64_t>(static_cast<uint64_t>(__builtin_cce_ld_dev(address, 0)));
 #else
-    return __atomic_load_n(&value, order);
+            return __atomic_load_n(&value, order);
 #endif
+        }
+    );
 }
 
-inline __aicore__ uint64_t percounter_gm_read(__gm__ volatile uint64_t &value, int order = __ATOMIC_ACQUIRE) {
+static inline __aicore__ uint64_t percounter_gm_read(__gm__ volatile uint64_t &value, int order = __ATOMIC_ACQUIRE) {
+    return simpler::percounter::percounter_scalar_memory_result(
+        simpler::percounter::ProfilePhase::BypassLoad, [=, &value]() __aicore__ {
 #if defined(__CCE_AICORE__)
-    (void)order;
-    return static_cast<uint64_t>(__builtin_cce_ld_dev(const_cast<__gm__ uint64_t *>(&value), 0));
+            (void)order;
+            return static_cast<uint64_t>(__builtin_cce_ld_dev(const_cast<__gm__ uint64_t *>(&value), 0));
 #else
-    return __atomic_load_n(&value, order);
+            return __atomic_load_n(&value, order);
 #endif
+        }
+    );
 }
 
-inline __aicore__ uint32_t percounter_gm_read(__gm__ volatile uint32_t &value, int order = __ATOMIC_ACQUIRE) {
+static inline __aicore__ uint32_t percounter_gm_read(__gm__ volatile uint32_t &value, int order = __ATOMIC_ACQUIRE) {
+    return simpler::percounter::percounter_scalar_memory_result(
+        simpler::percounter::ProfilePhase::BypassLoad, [=, &value]() __aicore__ {
 #if defined(__CCE_AICORE__)
-    (void)order;
-    return static_cast<uint32_t>(__builtin_cce_ld_dev(const_cast<__gm__ uint32_t *>(&value), 0));
+            (void)order;
+            return static_cast<uint32_t>(__builtin_cce_ld_dev(const_cast<__gm__ uint32_t *>(&value), 0));
 #else
-    return __atomic_load_n(&value, order);
+            return __atomic_load_n(&value, order);
 #endif
+        }
+    );
 }
 
 /** Two adjacent 32-bit fields as one word, so neither can tear from the other. */
-inline __aicore__ uint64_t percounter_gm_read_u32_pair(__gm__ volatile uint32_t *values, int order = __ATOMIC_ACQUIRE) {
+static inline __aicore__ uint64_t
+percounter_gm_read_u32_pair(__gm__ volatile uint32_t *values, int order = __ATOMIC_ACQUIRE) {
+    return simpler::percounter::percounter_scalar_memory_result(
+        simpler::percounter::ProfilePhase::BypassLoad, [=]() __aicore__ {
 #if defined(__CCE_AICORE__)
-    (void)order;
-    __gm__ uint32_t *first = const_cast<__gm__ uint32_t *>(values);
-    __gm__ uint64_t *address = reinterpret_cast<__gm__ uint64_t *>(first);
-    return static_cast<uint64_t>(__builtin_cce_ld_dev(address, 0));
+            (void)order;
+            __gm__ uint32_t *first = const_cast<__gm__ uint32_t *>(values);
+            __gm__ uint64_t *address = reinterpret_cast<__gm__ uint64_t *>(first);
+            return static_cast<uint64_t>(__builtin_cce_ld_dev(address, 0));
 #else
-    const uint64_t low = __atomic_load_n(&values[0], order);
-    const uint64_t high = __atomic_load_n(&values[1], order);
-    return low | (high << 32);
+            const uint64_t low = __atomic_load_n(&values[0], order);
+            const uint64_t high = __atomic_load_n(&values[1], order);
+            return low | (high << 32);
 #endif
+        }
+    );
 }
 
 /** An exchange, which is how every shared word here is published. */
-inline __aicore__ void
+static inline __aicore__ void
 percounter_gm_store(__gm__ volatile int64_t &value, int64_t desired, int order = __ATOMIC_RELEASE) {
+    simpler::percounter::percounter_scalar_memory_issue(
+        simpler::percounter::ProfilePhase::AtomicStoreIssue, 1, [=, &value]() __aicore__ {
 #if defined(__CCE_AICORE__)
-    (void)order;
-    (void)atomicExch(const_cast<__gm__ int64_t *>(&value), desired);
+            (void)order;
+            (void)atomicExch(const_cast<__gm__ int64_t *>(&value), desired);
 #else
-    __atomic_store_n(&value, desired, order);
+            __atomic_store_n(&value, desired, order);
 #endif
+        }
+    );
 }
 
-inline __aicore__ void
+static inline __aicore__ void
 percounter_gm_store(__gm__ volatile uint64_t &value, uint64_t desired, int order = __ATOMIC_RELEASE) {
+    simpler::percounter::percounter_scalar_memory_issue(
+        simpler::percounter::ProfilePhase::AtomicStoreIssue, 1, [=, &value]() __aicore__ {
 #if defined(__CCE_AICORE__)
-    (void)order;
-    (void)atomicExch(const_cast<__gm__ uint64_t *>(&value), desired);
+            (void)order;
+            (void)atomicExch(const_cast<__gm__ uint64_t *>(&value), desired);
 #else
-    __atomic_store_n(&value, desired, order);
+            __atomic_store_n(&value, desired, order);
 #endif
+        }
+    );
 }
 
-inline __aicore__ void
+static inline __aicore__ void
 percounter_gm_store(__gm__ volatile uint32_t &value, uint32_t desired, int order = __ATOMIC_RELEASE) {
+    simpler::percounter::percounter_scalar_memory_issue(
+        simpler::percounter::ProfilePhase::AtomicStoreIssue, 1, [=, &value]() __aicore__ {
 #if defined(__CCE_AICORE__)
-    (void)order;
-    (void)atomicExch(const_cast<__gm__ uint32_t *>(&value), desired);
+            (void)order;
+            (void)atomicExch(const_cast<__gm__ uint32_t *>(&value), desired);
 #else
-    __atomic_store_n(&value, desired, order);
+            __atomic_store_n(&value, desired, order);
 #endif
+        }
+    );
 }
 
 /** Adding zero reads a word without leaving it changed, and does not lag. */
-inline __aicore__ uint64_t
+static inline __aicore__ uint64_t
 percounter_gm_fetch_add(__gm__ volatile uint64_t &value, uint64_t delta, int order = __ATOMIC_ACQ_REL) {
+    return simpler::percounter::percounter_scalar_memory_result(
+        simpler::percounter::ProfilePhase::AtomicFetchAdd, [=, &value]() __aicore__ {
 #if defined(__CCE_AICORE__)
-    (void)order;
-    return atomicAdd(const_cast<__gm__ uint64_t *>(&value), delta);
+            (void)order;
+            return atomicAdd(const_cast<__gm__ uint64_t *>(&value), delta);
 #else
-    return __atomic_fetch_add(&value, delta, order);
+            return __atomic_fetch_add(&value, delta, order);
 #endif
+        }
+    );
 }
 
-inline __aicore__ int64_t percounter_gm_compare_exchange(
+static inline __aicore__ void
+percounter_gm_fetch_add_issue(__gm__ volatile uint64_t &value, uint64_t delta, int order = __ATOMIC_ACQ_REL) {
+    simpler::percounter::percounter_scalar_memory_issue(
+        simpler::percounter::ProfilePhase::AtomicFetchAddIssue, 1, [=, &value]() __aicore__ {
+#if defined(__CCE_AICORE__)
+            (void)order;
+            (void)atomicAdd(const_cast<__gm__ uint64_t *>(&value), delta);
+#else
+            (void)__atomic_fetch_add(&value, delta, order);
+#endif
+        }
+    );
+}
+
+static inline __aicore__ int64_t percounter_gm_compare_exchange(
     __gm__ volatile int64_t &value, int64_t expected, int64_t desired, int success_order = __ATOMIC_ACQ_REL,
     int failure_order = __ATOMIC_ACQUIRE
 ) {
+    return simpler::percounter::percounter_scalar_memory_result(
+        simpler::percounter::ProfilePhase::AtomicCas, [=, &value]() __aicore__ {
 #if defined(__CCE_AICORE__)
-    (void)success_order;
-    (void)failure_order;
-    return atomicCAS(const_cast<__gm__ int64_t *>(&value), expected, desired);
+            (void)success_order;
+            (void)failure_order;
+            return atomicCAS(const_cast<__gm__ int64_t *>(&value), expected, desired);
 #else
-    int64_t observed = expected;
-    (void)__atomic_compare_exchange_n(&value, &observed, desired, false, success_order, failure_order);
-    return observed;
+            int64_t observed = expected;
+            (void)__atomic_compare_exchange_n(&value, &observed, desired, false, success_order, failure_order);
+            return observed;
 #endif
+        }
+    );
 }
 
-inline __aicore__ uint64_t percounter_gm_compare_exchange(
+static inline __aicore__ uint64_t percounter_gm_compare_exchange(
     __gm__ volatile uint64_t &value, uint64_t expected, uint64_t desired, int success_order = __ATOMIC_ACQ_REL,
     int failure_order = __ATOMIC_ACQUIRE
 ) {
+    return simpler::percounter::percounter_scalar_memory_result(
+        simpler::percounter::ProfilePhase::AtomicCas, [=, &value]() __aicore__ {
 #if defined(__CCE_AICORE__)
-    (void)success_order;
-    (void)failure_order;
-    return atomicCAS(const_cast<__gm__ uint64_t *>(&value), expected, desired);
+            (void)success_order;
+            (void)failure_order;
+            return atomicCAS(const_cast<__gm__ uint64_t *>(&value), expected, desired);
 #else
-    uint64_t observed = expected;
-    (void)__atomic_compare_exchange_n(&value, &observed, desired, false, success_order, failure_order);
-    return observed;
+            uint64_t observed = expected;
+            (void)__atomic_compare_exchange_n(&value, &observed, desired, false, success_order, failure_order);
+            return observed;
 #endif
+        }
+    );
 }
 
 /**
@@ -191,15 +265,22 @@ inline __aicore__ uint64_t percounter_gm_compare_exchange(
  * from GM with ordinary loads, so what this lane wrote has to leave the
  * core's cache first. The payload spans several lines, hence the loop.
  */
-inline __aicore__ void percounter_writeback_dispatch_payload(__gm__ DispatchPayload *payload) {
-#if defined(__CCE_AICORE__)
+static inline __aicore__ void percounter_writeback_dispatch_payload(__gm__ DispatchPayload *payload) {
     for (uint64_t offset = 0; offset < sizeof(DispatchPayload); offset += 64) {
-        dcci(reinterpret_cast<__gm__ uint8_t *>(payload) + offset, SINGLE_CACHE_LINE, CACHELINE_OUT);
-    }
-    // Preparation can yield to another task, whose input acquisition drops
-    // this cache. Finish every slot writeback before that invalidation.
-    dsb((mem_dsb_t)0);
+        simpler::percounter::percounter_scalar_memory_issue(
+            simpler::percounter::ProfilePhase::DcciOut, 1, [payload, offset]() __aicore__ {
+#if defined(__CCE_AICORE__)
+                dcci(reinterpret_cast<__gm__ uint8_t *>(payload) + offset, SINGLE_CACHE_LINE, CACHELINE_OUT);
 #else
-    (void)payload;
+                (void)payload;
+                (void)offset;
 #endif
+            }
+        );
+    }
+    simpler::percounter::percounter_scalar_memory_issue(simpler::percounter::ProfilePhase::DsbAll, 1, []() __aicore__ {
+#if defined(__CCE_AICORE__)
+        dsb((mem_dsb_t)0);
+#endif
+    });
 }

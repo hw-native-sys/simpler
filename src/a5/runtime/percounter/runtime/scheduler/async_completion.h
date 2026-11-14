@@ -43,23 +43,31 @@
 #include "scheduler/gm.h"
 
 /** A CCU event sample, ordered against the clear that may follow it. */
-inline __aicore__ uint64_t percounter_ccu_event_read(__gm__ uint64_t *event) {
+static inline __aicore__ uint64_t percounter_ccu_event_read(__gm__ uint64_t *event) {
+    const auto value = percounter_gm_read(*event);
 #if defined(__CCE_AICORE__)
-    const auto value = static_cast<uint64_t>(__builtin_cce_ld_dev(event, 0));
-    dsb(DSB_DDR);
-    return value;
-#else
-    return __atomic_load_n(event, __ATOMIC_ACQUIRE);
+    simpler::percounter::percounter_scalar_memory_issue(simpler::percounter::ProfilePhase::DsbDdr, 1, []() __aicore__ {
+        dsb(DSB_DDR);
+    });
 #endif
+    return value;
 }
 
 /** Consume the event, ordered against the read that confirms the clear. */
-inline __aicore__ void percounter_ccu_event_clear(__gm__ uint64_t *event) {
+static inline __aicore__ void percounter_ccu_event_clear(__gm__ uint64_t *event) {
+    simpler::percounter::percounter_scalar_memory_issue(
+        simpler::percounter::ProfilePhase::BypassStoreIssue, 1, [event]() __aicore__ {
 #if defined(__CCE_AICORE__)
-    st_dev(UINT64_C(0), event, 0);
-    dsb(DSB_DDR);
+            st_dev(UINT64_C(0), event, 0);
 #else
-    __atomic_store_n(event, UINT64_C(0), __ATOMIC_RELEASE);
+            __atomic_store_n(event, UINT64_C(0), __ATOMIC_RELEASE);
+#endif
+        }
+    );
+#if defined(__CCE_AICORE__)
+    simpler::percounter::percounter_scalar_memory_issue(simpler::percounter::ProfilePhase::DsbDdr, 1, []() __aicore__ {
+        dsb(DSB_DDR);
+    });
 #endif
 }
 
@@ -78,7 +86,7 @@ inline __aicore__ bool percounter_completion_token_valid(const CompletionToken &
 }
 
 /** One sample of one condition; the caller re-reads a pending one later. */
-inline __aicore__ CompletionPollResult percounter_poll_valid_completion(const CompletionToken &token) {
+static inline __aicore__ CompletionPollResult percounter_poll_valid_completion(const CompletionToken &token) {
     if (token.completion_type == COMPLETION_TYPE_CCU) {
         auto *event = reinterpret_cast<__gm__ uint64_t *>(token.addr);
         if ((percounter_ccu_event_read(event) & token.backend_cookie) != token.backend_cookie)

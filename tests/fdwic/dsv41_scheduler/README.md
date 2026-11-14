@@ -298,7 +298,7 @@ The default runtime build does not include percounter.
 
 The three arguments after the output directory are profiling level, warmup
 count, and measured round count. `all 1 3` performs one warmup, three L0
-measurements, one L1 capture, and one L3 capture. `0`, `1`, and `3` select only
+measurements, one L1 capture, and one L3 capture. `0`, `1`, `2`, `3`, and `4` select only
 that production profiling level. Outputs are split by rank and run;
 `result.json` confirms completion and boundary validation, and
 `source-task-map.txt` maps replay task IDs to the original forward.
@@ -328,9 +328,13 @@ bash "$DSV41/run.sh" "$PREPARED/cases/pypto_lib/swa" \
   "$DSV41_RUNTIME" "$RUN_DIR/pypto_lib/swa" 1 2 1 --runtime=percounter
 ```
 
-Its L1 records include kernel execution and final input acquisition, not earlier
-payload preparation or dependency waits. This selection does not make unsupported
-task kinds runnable.
+Its L1 records include kernel execution and final input acquisition. Use level 2
+for local execution dispatch/return timing, level 3 for percounter scheduling and
+Scalar memory operations, and level 4 for all instrumented function intervals plus Host
+orchestration. Earlier payload preparation, dependency waits, MIX rendezvous and
+sync-start work appear in L3/L4. The standard converter produces a nested AICore
+Scheduler lane without changing the Worker kernel intervals. This selection does
+not make unsupported task kinds runnable.
 
 The local `plan-rank*.bin` records use current production C++ types. They are
 **derived build artifacts**, not portable runtime protocols. Regenerate them

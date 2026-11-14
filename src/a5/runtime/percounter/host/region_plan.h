@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "scheduler/wire_types.h"
+#include "scheduler/profiling_types.h"
 #include "scheduler/scheduler_layout.h"
 #include "scheduler/scheduler_types.h"
 
@@ -85,6 +86,12 @@ struct PercounterLayout {
     // last segment, and a body task's counter is written by the AICPU before
     // any lane can reach it, so the body counters are left out.
     uint64_t upload_size;
+    uint64_t profile_buffers_offset;
+    uint64_t task_records_offset;
+    uint64_t task_record_stride;
+    uint64_t scalar_records_offset;
+    uint32_t task_record_capacity;
+    uint32_t profiling_level;
 };
 
 /** The Graph part of the region, sized by the caller from its templates. */
@@ -166,7 +173,8 @@ struct ExternalAddresses {
 inline bool plan_layout(
     uint64_t task_count, uint64_t block_total, uint64_t edge_count,
     const uint64_t order_count[PERCOUNTER_CORE_TYPE_COUNT], PercounterLayout *layout, uint64_t mix_order_count = 0,
-    uint64_t sync_cohort_count = 0, const GraphLayoutInput &graph = {}, uint64_t execution_count = 0
+    uint64_t sync_cohort_count = 0, const GraphLayoutInput &graph = {}, uint64_t execution_count = 0,
+    uint32_t profiling_level = 0
 ) {
     if (layout == nullptr || order_count == nullptr) return false;
     const uint64_t table_task_count = task_count;
@@ -186,6 +194,8 @@ inline bool plan_layout(
     if (placed > block_total) return false;
 
     PercounterLayout next{};
+    next.profiling_level = profiling_level;
+    next.task_record_capacity = static_cast<uint32_t>(std::min(block_total, uint64_t{65536}));
     next.task_count = task_count;
     next.edge_count = edge_count;
     for (uint32_t t = 0; t < PERCOUNTER_CORE_TYPE_COUNT; ++t)
@@ -231,6 +241,8 @@ inline bool plan_layout(
             static_cast<uint64_t>(SCHEDULER_WORKER_CAPACITY) * PERCOUNTER_PAYLOAD_SLOT_COUNT, DispatchPayload,
             dispatch_payloads_offset
         ) ||
+        (profiling_level >= 2 &&
+         !PERCOUNTER_RESERVE(SCHEDULER_WORKER_CAPACITY, PercounterProfileBuffer, profile_buffers_offset)) ||
         !PERCOUNTER_RESERVE(task_count, PercounterCounter, counters_offset) ||
         // After the counters, so the records fall outside `upload_size` below.
         // The entries follow the records for the reason `layout_valid` checks:
@@ -249,6 +261,21 @@ inline bool plan_layout(
 #undef PERCOUNTER_RESERVE
     next.upload_size = next.counters_offset + table_task_count * sizeof(PercounterCounter);
 
+    cursor = next.total_size;
+    if (profiling_level >= 2 &&
+        (!scheduler_layout_checked_align(
+             uint64_t{next.task_record_capacity} * sizeof(PercounterTaskTiming), 64, &next.task_record_stride
+         ) ||
+         !scheduler_layout_checked_mul(SCHEDULER_WORKER_CAPACITY, next.task_record_stride, &bytes) ||
+         !scheduler_layout_reserve(&cursor, bytes, 64, &next.task_records_offset)))
+        return false;
+    if (profiling_level >= 3 && (!scheduler_layout_checked_mul(
+                                     uint64_t{SCHEDULER_WORKER_CAPACITY} * SCHEDULER_SCALAR_RECORD_CAPACITY,
+                                     sizeof(SchedulerScalarRecord), &bytes
+                                 ) ||
+                                 !scheduler_layout_reserve(&cursor, bytes, 64, &next.scalar_records_offset)))
+        return false;
+    if (!scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) return false;
     *layout = next;
     return true;
 }
@@ -683,6 +710,22 @@ inline bool build_tables(
             record.order_base[l] = order_base[k * PERCOUNTER_LIST_COUNT + l];
     }
 
+    control->profiling_level = layout.profiling_level;
+    control->profile_buffers_offset = layout.profile_buffers_offset;
+    if (layout.profile_buffers_offset != 0) {
+        auto *buffers = region_at<PercounterProfileBuffer>(base, layout.profile_buffers_offset);
+        for (uint32_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
+            buffers[worker].task_capacity = layout.task_record_capacity;
+            buffers[worker].task_records_offset =
+                layout.task_records_offset + uint64_t{worker} * layout.task_record_stride;
+            buffers[worker].scalar_records_offset =
+                layout.scalar_records_offset == 0 ?
+                    0 :
+                    layout.scalar_records_offset +
+                        uint64_t{worker} * SCHEDULER_SCALAR_RECORD_CAPACITY * sizeof(SchedulerScalarRecord);
+            buffers[worker].physical_core_id = -1;
+        }
+    }
     control->task_count = layout.task_count;
     control->table_task_count = task_count;
     control->executable_block_count = executable_blocks;

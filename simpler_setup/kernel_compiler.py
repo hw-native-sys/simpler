@@ -603,7 +603,7 @@ class KernelCompiler:
         The file is created atomically to avoid races, then immediately
         closed so the caller can overwrite it with compiler output.
         """
-        directory = os.path.abspath(build_dir) if build_dir else "/tmp"
+        directory = os.path.abspath(build_dir) if build_dir else tempfile.gettempdir()
         fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=directory)
         os.close(fd)
         return path

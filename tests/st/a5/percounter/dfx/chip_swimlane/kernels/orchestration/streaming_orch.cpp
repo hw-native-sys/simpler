@@ -12,11 +12,11 @@
 #include "orchestration_api.h"
 
 extern "C" __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &) {
-    return OrchestrationConfig{.expected_arg_count = 1};
+    return OrchestrationConfig{.expected_arg_count = 2};
 }
 
 extern "C" __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {
-    constexpr int32_t blocks = 16385;
+    const auto blocks = static_cast<uint32_t>(args.scalar<int64_t>(0));
     const uint32_t shape[1] = {blocks * 16};
     for (uint32_t task = 0; task < 3; ++task) {
         const uint32_t offset[1] = {task * blocks * 16};

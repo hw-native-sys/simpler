@@ -19,3 +19,16 @@ simpler_ut_add_target(NAME test_a5_percounter_payload
         ${SIMPLER_SRC}/a5/platform/sim/aicore
     DEFINES __CPU_SIM SIMPLER_PLATFORM_NAME="a5sim"
     LABEL no_hardware TIMEOUT 20 PRIVATE_WORKDIR)
+
+simpler_ut_add_target(NAME test_a5_percounter_scalar_memory
+    SOURCES scalar_memory_unprofiled.cpp test_scalar_memory.cpp
+    ARCH a5 RUNTIME percounter
+    INCLUDES
+        ${SIMPLER_SRC}/a5/runtime/percounter/runtime
+        ${SIMPLER_SRC}/a5/runtime/percounter/aicore
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/runtime
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/common
+        ${SIMPLER_SRC}/common/host_build_graph
+        ${SIMPLER_SRC}/a5/platform/sim/aicore
+    DEFINES __CPU_SIM SIMPLER_PLATFORM_NAME="a5sim"
+    LABEL no_hardware TIMEOUT 20 PRIVATE_WORKDIR)

@@ -136,6 +136,13 @@ backward-compatible with the old boolean behavior).
 | 3 | + scheduler phases (`scheduler_records`) | Does not enable orchestrator collection; an independently enabled HBG Host pool can still export Host records |
 | 4 | + orchestrator phases (Host for HBG, AICPU for TMR) | Full collection |
 
+A5 `percounter` supports the same L1–L4 ladder. L2 timestamps describe local
+ready-payload execution entry and kernel return, and L3/L4 add percounter's own
+fanin, payload preparation, MIX, sync-start, completion and memory-operation
+intervals. Its Scalar lane includes nested kernel execution and uses the same
+exclusive-time accounting as HBG. See the [percounter profiling contract](../../src/a5/runtime/percounter/README.md#chip-swimlanes-l1l4)
+for timing boundaries, storage limits and truncation behavior.
+
 ### A5 HBG Scalar detail at Level 3
 
 Level 3 records the resident AICore scheduler's memory operations individually

@@ -69,6 +69,7 @@ KEY_SITES = {
     "src/a2a3/platform/sim/aicore/kernel.cpp": 1,  # Module-owned keys, stack-owned values.
     "src/a5/platform/sim/aicore/kernel.cpp": 1,  # Module-owned keys, stack-owned values.
     "src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_scalar_record.h": 1,  # Module-owned scalar binding.
+    "src/a5/runtime/percounter/runtime/scheduler/profiling_memory.h": 1,  # Module-owned, stack-borrowing lane trace.
 }
 
 

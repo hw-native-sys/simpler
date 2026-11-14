@@ -680,8 +680,10 @@ struct alignas(128) PercounterControl {
     // Prefilled by the host so a lane can bound its startup wait; the AICPU
     // overwrites it with any override when it publishes the topology.
     uint64_t scheduler_timeout_cycles;
+    uint64_t profiling_level;
+    uint64_t profile_buffers_offset;
     // Pads the progress counter below onto its own 64 B line.
-    uint8_t reserved[384 - 42 * sizeof(uint64_t)];
+    uint8_t reserved[384 - 44 * sizeof(uint64_t)];
 
     // **Alone on the last line.** Lanes batch their completions into this, and
     // the AICPU supervisor polls it against `executable_block_count`. It is the
