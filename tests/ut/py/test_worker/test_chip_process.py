@@ -15,7 +15,7 @@ import sys
 from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 from time import monotonic
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 from simpler import chip_process
@@ -217,7 +217,7 @@ def test_exec_chip_loop_keeps_bootstrap_parent_identity(monkeypatch):
     get_parent = Mock(side_effect=[actual_parent])
     monkeypatch.setattr(module.os, "getppid", get_parent)
     monkeypatch.setattr(module, "_PARENT_LIVENESS_POLL_INTERVAL", 1)
-    chip = Mock(spec_set=["_close_chip_run_lane"])
+    chip = Mock(spec_set=["_stop_chip_run_lane_admission", "_close_chip_run_lane"])
     regions = Mock()
     regions.sweep.return_value = ()
     with memoryview(bytearray(module.mailbox_size(1))) as view:
@@ -237,7 +237,9 @@ def test_exec_chip_loop_keeps_bootstrap_parent_identity(monkeypatch):
             expected_parent_pid=actual_parent + 1,
         )
     get_parent.assert_called_once_with()
+    chip._stop_chip_run_lane_admission.assert_called_once_with()
     chip._close_chip_run_lane.assert_called_once_with()
+    chip.assert_has_calls([call._stop_chip_run_lane_admission(), call._close_chip_run_lane()])
     regions.sweep.assert_called_once_with()
 
 
