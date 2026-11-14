@@ -257,6 +257,8 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
     assert all(controls[ref]["state"] == 0 for ref in (root["task_ref"], consumer["task_ref"]))
 
 
+# Compilation, healthy/fault/recovery runs and diagnostic decoding share this case budget.
+@pytest.mark.timeout(300)
 @pytest.mark.parametrize("mask,lane", _shape_params(_SHAPES))
 @pytest.mark.parametrize("blocks", (1, 2))
 def test_bounded_kernel_timeout_keeps_failed_run_contained(st_platform, st_device_ids, mask, lane, blocks, monkeypatch):

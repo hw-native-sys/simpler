@@ -160,7 +160,7 @@ def test_hbg_retained_models_keep_persistent_inout(tmp_path, request):
     assert "stage=same-carrier-and-slot rc=0" in result.stdout
 
 
-def _run_capture_probe(command, run, env):
+def _run_capture_probe(command, run, env, *, timeout=180):
     # Streams reach disk before subprocess.run returns or raises TimeoutExpired.
     try:
         with (run / "stdout.log").open("w") as stdout, (run / "stderr.log").open("w") as stderr:
@@ -170,7 +170,7 @@ def _run_capture_probe(command, run, env):
                 stdout=stdout,
                 stderr=stderr,
                 text=True,
-                timeout=180,
+                timeout=timeout,
                 check=False,
             )
     finally:
@@ -298,29 +298,29 @@ if __name__ == "__main__":
 
 
 @pytest.mark.parametrize("replay", [0, 1], ids=["zero", "interleaved-models"])
+@pytest.mark.platforms(["a2a3", "a5"])
 def test_hbg_retained_models_publish_pmu_samples(tmp_path, request, replay):
     from collections import Counter  # noqa: PLC0415
 
     from simpler_setup.tools.pmu_samples import read_pmu_samples  # noqa: PLC0415
 
-    binaries = build_probe(tmp_path, retained_models=True)
+    binaries = build_probe(tmp_path, retained_models=True, platform=request.config.getoption("--platform"))
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     logs = tmp_path / "ascend-pmu"
     logs.mkdir()
     output = tmp_path / "pmu"
-    result = subprocess.run(
+    result = _run_capture_probe(
         [binaries[0], device, *binaries[1:], str(output), str(replay)],
-        env=dict(os.environ, ASCEND_PROCESS_LOG_PATH=str(logs)),
-        capture_output=True,
-        text=True,
+        tmp_path,
+        dict(os.environ, ASCEND_PROCESS_LOG_PATH=str(logs)),
         timeout=240,
-        check=False,
     )
     (tmp_path / "pmu-native.log").write_text(result.stdout + result.stderr)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "stage=pmu-flush rc=0" in result.stdout
     ordinary = read_pmu_samples(output / "eager/pmu.csv")
     assert ordinary["records"] and all(int(row["pmu_total_cycles"]) > 0 for row in ordinary["records"])
+    assert all(int(row["event_type"]) == 7 for row in ordinary["records"])
     for leaf, event, rounds in (("a", 2, 2), ("b", 4, 4)):
         captured = read_pmu_samples(output / leaf / "pmu.csv", recorded=True)
         assert captured["collection"]["event_type"] == event
@@ -331,22 +331,21 @@ def test_hbg_retained_models_publish_pmu_samples(tmp_path, request, replay):
 
 
 @pytest.mark.parametrize("replay", [0, 1], ids=["zero", "interleaved-models"])
+@pytest.mark.platforms(["a2a3", "a5"])
 def test_hbg_retained_models_publish_swimlane_observations(tmp_path, request, replay):
     import sys  # noqa: PLC0415
     from collections import Counter  # noqa: PLC0415
 
-    binaries = build_probe(tmp_path, retained_models=True)
+    binaries = build_probe(tmp_path, retained_models=True, platform=request.config.getoption("--platform"))
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     logs = tmp_path / "ascend-swimlane"
     logs.mkdir()
     output = tmp_path / "swimlane"
-    result = subprocess.run(
+    result = _run_capture_probe(
         [binaries[0], device, *binaries[1:], str(output), str(replay), "swimlane"],
-        env=dict(os.environ, ASCEND_PROCESS_LOG_PATH=str(logs)),
-        capture_output=True,
-        text=True,
+        tmp_path,
+        dict(os.environ, ASCEND_PROCESS_LOG_PATH=str(logs)),
         timeout=240,
-        check=False,
     )
     (tmp_path / "swimlane-native.log").write_text(result.stdout + result.stderr)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -483,13 +482,11 @@ def check_args_dump_output(output: Path, replays: int):
 def run_args_dump_probe(binaries, device, output: Path, replays: int):
     logs = output.parent / "ascend-argsdump"
     logs.mkdir()
-    result = subprocess.run(
+    result = _run_capture_probe(
         [binaries[0], str(device), *binaries[1:], str(output), str(replays), "argsdump"],
-        env=dict(os.environ, ASCEND_PROCESS_LOG_PATH=str(logs)),
-        capture_output=True,
-        text=True,
+        output.parent,
+        dict(os.environ, ASCEND_PROCESS_LOG_PATH=str(logs)),
         timeout=240,
-        check=False,
     )
     (output.parent / "argsdump-native.log").write_text(result.stdout + result.stderr)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -499,11 +496,17 @@ def run_args_dump_probe(binaries, device, output: Path, replays: int):
 
 
 @pytest.fixture(scope="module")
-def hbg_args_dump_probe(tmp_path_factory):
-    return build_probe(tmp_path_factory.mktemp("hbg-argsdump-capture"), retained_models=True, args_dump=True)
+def hbg_args_dump_probe(tmp_path_factory, request):
+    return build_probe(
+        tmp_path_factory.mktemp("hbg-argsdump-capture"),
+        retained_models=True,
+        args_dump=True,
+        platform=request.config.getoption("--platform"),
+    )
 
 
 @pytest.mark.parametrize("replays", [0, 3])
+@pytest.mark.platforms(["a2a3", "a5"])
 def test_hbg_args_dump_capture_exports_task_time_values(hbg_args_dump_probe, tmp_path, request, replays):
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     run_args_dump_probe(hbg_args_dump_probe, device, tmp_path / "dump", replays)
