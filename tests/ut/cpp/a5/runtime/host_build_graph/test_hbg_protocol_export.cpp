@@ -53,7 +53,7 @@ struct ProtocolExportFixture : ::testing::Test {
 TEST_F(ProtocolExportFixture, PreservesFrozenGraphAndHostCompletedNodeWithoutFabricatingEvents) {
     at<SchedulerTaskMetadata>(layout.task_metadata_offset)[0].logical_block_num = 99;
     const auto json = dump();
-    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v10\""), std::string::npos);
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v12\""), std::string::npos);
     EXPECT_NE(json.find("\"close_seal_stride\":64"), std::string::npos);
     EXPECT_NE(json.find("\"claim_tickets\":0"), std::string::npos);
     EXPECT_EQ(json.find("\"admission_claim_lock\""), std::string::npos);
@@ -66,6 +66,19 @@ TEST_F(ProtocolExportFixture, PreservesFrozenGraphAndHostCompletedNodeWithoutFab
     EXPECT_EQ(json.find("protocol_verified"), std::string::npos);
 }
 
+TEST_F(ProtocolExportFixture, LocalClaimProofDoesNotFabricateSharedCursorObservation) {
+    auto *member = at<SchedulerProtocolMemberTrace>(layout.protocol.members_offset);
+    member[0].observed = {0, 1};
+    member[0].closed = {2, 2};
+    member[0].closed_cursor = UINT64_MAX;
+    member[0].local_claim_confirmed = 1;
+    const auto json = dump();
+    EXPECT_NE(json.find("\"local_claim_confirmed\":1"), std::string::npos);
+    EXPECT_NE(json.find("\"closed_cursor\":18446744073709551615"), std::string::npos);
+    EXPECT_NE(json.find("\"claim_seal_seen\":0"), std::string::npos);
+    EXPECT_NE(json.find("\"claim_cursor_seen\":0"), std::string::npos);
+}
+
 TEST_F(ProtocolExportFixture, NativeSchemaCarriesBothIdentitiesAndIndependentSource) {
     tasks[0].kind = SchedulerNodeKind::CHILD_KERNEL;
     tasks[0].original_task_id = 7;
@@ -74,7 +87,7 @@ TEST_F(ProtocolExportFixture, NativeSchemaCarriesBothIdentitiesAndIndependentSou
     const auto json = scheduler_export_protocol(
         storage->base(), layout.total_size, layout, 0, tasks, "{\"tasks\":[],\"definitions\":[]}"
     );
-    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v11\""), std::string::npos);
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v13\""), std::string::npos);
     EXPECT_NE(json.find("\"original_task_id\":7,\"local_child_id\":3"), std::string::npos);
     EXPECT_NE(json.find("\"graph_source\":{\"tasks\":[],\"definitions\":[]}"), std::string::npos);
 }

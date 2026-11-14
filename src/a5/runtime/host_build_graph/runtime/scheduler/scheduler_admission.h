@@ -16,6 +16,31 @@
 
 enum class SchedulerAdmissionResult : uint8_t { PROGRESS, RETRY, ERROR };
 
+// Returns an identity, never permission to execute or ownership of a slot.
+// The caller supplies the immutable, bootstrap-validated membership bitmap.
+// MIX assigns one block per cluster; pure tasks rank compact worker IDs so
+// physical-ID permutations and sparse membership cannot duplicate block IDs.
+inline __aicore__ bool scheduler_single_wave_assignment(
+    uint8_t flags, LaneMask active_mask, uint32_t blocks, uint64_t clusters, const __gm__ uint64_t *members,
+    uint64_t workers, uint64_t worker, uint32_t cluster, uint32_t *block
+) {
+    if (block == nullptr || members == nullptr || workers == 0 || workers > SCHEDULER_WORKER_CAPACITY ||
+        worker >= workers || !scheduler_task_uses_single_wave_claim(flags, active_mask, blocks, clusters))
+        return false;
+    const uint64_t bit = UINT64_C(1) << (worker % 64);
+    if ((members[worker / 64] & bit) == 0) return false;
+    uint32_t assignment = cluster;
+    if (!scheduler_task_is_mix(flags)) {
+        assignment = 0;
+        for (uint64_t word = 0; word < worker / 64; ++word)
+            assignment += static_cast<uint32_t>(__builtin_popcountll(members[word]));
+        assignment += static_cast<uint32_t>(__builtin_popcountll(members[worker / 64] & (bit - 1)));
+    }
+    if (assignment >= blocks) return false;
+    *block = assignment;
+    return true;
+}
+
 inline __aicore__ bool scheduler_admission_range_end(uint64_t offset, uint64_t count, uint64_t stride, uint64_t *end) {
     if (stride == 0 || count > (UINT64_MAX - offset) / stride) return false;
     *end = offset + count * stride;
@@ -297,6 +322,28 @@ static inline __aicore__ bool scheduler_admission_expected_members(
         }
         *member_count = limit;
     }
+    if (mix &&
+        scheduler_task_uses_single_wave_claim(
+            record->flags, scheduler_lane_mask_load(record->active_mask), record->logical_block_num, cubes
+        ) &&
+        record->logical_block_num < cubes) {
+        // Nonparticipants skip the admission record; every retained cluster
+        // owns one block and uses the existing physical-lane close protocol.
+        uint32_t retained = 0;
+        for (uint64_t worker = 0; worker < workers; ++worker) {
+            const uint64_t bit = UINT64_C(1) << (worker % 64);
+            if ((words[worker / 64] & bit) == 0) continue;
+            const auto *context = scheduler_worker_context_at(base, local, worker);
+            const uint64_t cluster = context->cluster_index;
+            if (cluster >= cubes) return false;
+            if (cluster >= record->logical_block_num) words[worker / 64] &= ~bit;
+            else ++retained;
+        }
+        const uint32_t expected = record->logical_block_num *
+                                  scheduler_mix_resource_mask(scheduler_lane_mask_load(record->active_mask)).count();
+        if (retained != expected) return false;
+        *member_count = retained;
+    }
     const uint32_t positions = mix ? cubes : *member_count;
     return *member_count != 0 &&
            (!scheduler_task_requires_sync_start(record->flags) || record->logical_block_num <= positions);
@@ -317,6 +364,33 @@ static inline __aicore__ SchedulerAdmissionResult scheduler_try_claim_admission(
     // published the immutable admission record before this candidate was visible.
     admission->pending_task_ref = candidate.task_ref;
     return SchedulerAdmissionResult::PROGRESS;
+}
+
+// Read-only preparation after bootstrap. Neither membership nor block identity
+// grants an obligation: refresh must still observe the committed order and state.
+static inline __aicore__ void
+scheduler_prepare_advance_membership(__gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run) {
+    auto *a = local->admission;
+    if (a == nullptr || a->advance_task < 0 || a->advance_epoch != a->epoch || a->advance_member_valid ||
+        scheduler_gm_query(run->bootstrap_scan_complete) == 0)
+        return;
+    auto *record = scheduler_admission_record_at(base, a, a->advance_task);
+    auto *words = reinterpret_cast<__gm__ uint64_t *>(record + 1);
+    scheduler_invalidate_cache_line(record);
+    scheduler_invalidate_cache_line(words);
+    scheduler_cache_barrier();
+    if (record->run_epoch != a->epoch) return;
+    const uint64_t worker = local->worker_id();
+    if (worker >= local->config.runtime_worker_count) return;
+    a->advance_is_member = (words[worker / 64] & (UINT64_C(1) << (worker % 64))) != 0;
+    a->advance_block = UINT32_MAX;
+    if (a->advance_is_member)
+        scheduler_single_wave_assignment(
+            record->flags, scheduler_lane_mask_load(record->active_mask), record->logical_block_num,
+            local->config.cluster_count, words, local->config.runtime_worker_count, worker, a->gm_mix.cluster_index,
+            &a->advance_block
+        );
+    a->advance_member_valid = true;
 }
 
 // Bootstrap is the sole immutable-record writer before the scan gate.
@@ -433,6 +507,8 @@ inline __aicore__ void scheduler_retire_local_obligation(SchedulerAdmissionLocal
     admission.current_active_mask = LaneMask::none();
     admission.current_flags = 0;
     admission.sync_claimed = false;
+    admission.single_wave_claim_confirmed = 0;
+    admission.single_wave_retired = false;
     admission.ticket_exhausted = false;
 }
 
@@ -477,8 +553,10 @@ static inline __aicore__ bool scheduler_refresh_local_obligation(
         // The validated run layout places the bitmap immediately after the
         // header; an unvalidated record cannot redirect cache maintenance.
         auto *words = reinterpret_cast<__gm__ uint64_t *>(record + 1);
+        const bool prepared_member = admission->advance_member_valid && admission->advance_task == task &&
+                                     admission->advance_epoch == admission->epoch;
         scheduler_invalidate_cache_line(record);
-        scheduler_invalidate_cache_line(words);
+        if (!prepared_member) scheduler_invalidate_cache_line(words);
         scheduler_cache_barrier();
         if (record->run_epoch != admission->epoch)
             return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_EPOCH_MISMATCH);
@@ -489,7 +567,9 @@ static inline __aicore__ bool scheduler_refresh_local_obligation(
             scheduler_gm_query(control->admission_state) != static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED))
             return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_RECORD);
         const uint64_t worker = local->worker_id();
-        if ((words[worker / 64] & (UINT64_C(1) << (worker % 64))) != 0) {
+        const bool is_member =
+            prepared_member ? admission->advance_is_member : (words[worker / 64] & (UINT64_C(1) << (worker % 64))) != 0;
+        if (is_member) {
             if (admission->current_task_ref != SCHEDULER_TASK_REF_INVALID && admission->current_task_ref != task)
                 return scheduler_admission_fail(
                     graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_FRONTIER
@@ -499,6 +579,8 @@ static inline __aicore__ bool scheduler_refresh_local_obligation(
             admission->current_active_mask = scheduler_lane_mask_load(record->active_mask);
             admission->current_flags = record->flags;
             admission->sync_claimed = false;
+            admission->single_wave_claim_confirmed = 0;
+            admission->single_wave_retired = false;
             admission->ticket_exhausted = false;
             // A late member owns no block from this newly adopted record. A
             // strong exhaustion proof lets it close without materializing args
@@ -508,6 +590,10 @@ static inline __aicore__ bool scheduler_refresh_local_obligation(
                 owns_block = owns_block || (slot.task_ref == task && slot.state != SchedulerDispatchSlotState::FREE);
             if (!owns_block && !scheduler_task_is_mix(record->flags) &&
                 !scheduler_task_requires_sync_start(record->flags) &&
+                !scheduler_task_uses_single_wave_claim(
+                    record->flags, scheduler_lane_mask_load(record->active_mask), record->logical_block_num,
+                    local->config.cluster_count
+                ) &&
                 scheduler_gm_query(control->claim_seal) == record->logical_block_num) {
                 uint64_t cursor = 0;
                 bool used_seal = false;
@@ -531,6 +617,12 @@ static inline __aicore__ bool scheduler_refresh_local_obligation(
         }
         if (admission->current_task_ref != SCHEDULER_TASK_REF_INVALID)
             return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_FRONTIER);
+        // Non-members can prepare a successor while this admitted task runs.
+        // This local hint grants neither membership nor execution permission.
+        if (admission->advance_task < 0) {
+            admission->advance_producer = task;
+            admission->advance_index = 0;
+        }
         ++admission->scan_cursor;
     }
     return true;
@@ -687,8 +779,44 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_curso
         );
         return SchedulerBlockClaimResult::ERROR;
     }
-    if (admission->sync_claimed) return SchedulerBlockClaimResult::RETRY;
+    if (admission->sync_claimed || admission->single_wave_claim_confirmed != 0) return SchedulerBlockClaimResult::RETRY;
     auto *control = scheduler_task_control_at(base, local, admission->current_task_ref);
+    if (scheduler_task_uses_single_wave_claim(
+            admission->current_flags, admission->current_active_mask, admission->current_block_num,
+            local->config.cluster_count
+        )) {
+        // Identity is derived from immutable topology only after the local
+        // obligation has observed ADMITTED. No shared allocation cursor exists
+        // for this path; readiness and resource acquisition remain unchanged.
+        const uint64_t claim_start = RecordProtocol ? scheduler_protocol_cycles(local) : 0;
+        auto *record = scheduler_admission_record_at(base, admission, admission->current_task_ref);
+        const auto *members = reinterpret_cast<__gm__ const uint64_t *>(record + 1);
+        const bool prepared_block = admission->advance_member_valid && admission->advance_is_member &&
+                                    admission->advance_task == admission->current_task_ref &&
+                                    admission->advance_epoch == admission->epoch &&
+                                    admission->advance_block != UINT32_MAX;
+        uint32_t assigned = prepared_block ? admission->advance_block : UINT32_MAX;
+        if ((!prepared_block &&
+             !scheduler_single_wave_assignment(
+                 admission->current_flags, admission->current_active_mask, admission->current_block_num,
+                 local->config.cluster_count, members, local->config.runtime_worker_count, local->worker_id(),
+                 admission->gm_mix.cluster_index, &assigned
+             )) ||
+            (scheduler_task_is_mix(admission->current_flags) && !local->is_mix_coordinator())) {
+            scheduler_admission_fail(
+                graph, local, run, admission->current_task_ref, SchedulerErrorSite::BLOCK_CURSOR_INVALID
+            );
+            return SchedulerBlockClaimResult::ERROR;
+        }
+        admission->single_wave_claim_confirmed = assigned + 1;
+        admission->single_wave_retired = false;
+        *block_idx = assigned;
+        if constexpr (RecordProtocol)
+            scheduler_protocol_block_claim(
+                base, local, assigned, claim_start, scheduler_protocol_cycles(local), UINT64_MAX
+            );
+        return SchedulerBlockClaimResult::CLAIMED;
+    }
     if (scheduler_task_uses_ticket_claim(
             admission->current_flags, admission->current_active_mask, admission->current_block_num,
             local->config.cluster_count
@@ -868,15 +996,29 @@ static inline __aicore__ bool scheduler_close_ordered_obligation(
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_FRONTIER);
     for (const auto &slot : local->slots)
         if (slot.task_ref == task && slot.state != SchedulerDispatchSlotState::FREE) return true;
-    uint64_t cursor = 0;
+    uint64_t cursor = UINT64_MAX;
+    uint64_t local_claim_confirmed = 0;
     bool used_claim_seal = false;
-    if (!scheduler_read_claim_cursor(graph, base, local, run, &cursor, &used_claim_seal)) return false;
-    if (cursor < admission->current_block_num && !admission->sync_claimed) return true;
-    if (cursor > admission->current_block_num || (admission->sync_claimed && cursor == 0) ||
-        admission->scan_cursor >= admission->capacity)
+    if (scheduler_task_uses_single_wave_claim(
+            admission->current_flags, admission->current_active_mask, admission->current_block_num,
+            local->config.cluster_count
+        )) {
+        local_claim_confirmed = admission->single_wave_claim_confirmed;
+        if (local_claim_confirmed > admission->current_block_num ||
+            (local_claim_confirmed == 0 && admission->single_wave_retired))
+            return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::BLOCK_CURSOR_INVALID);
+        // A free slot alone does not prove that a claimed block contributed.
+        if (local_claim_confirmed == 0 || !admission->single_wave_retired) return true;
+    } else {
+        if (!scheduler_read_claim_cursor(graph, base, local, run, &cursor, &used_claim_seal)) return false;
+        if (cursor < admission->current_block_num && !admission->sync_claimed) return true;
+        if (cursor > admission->current_block_num || (admission->sync_claimed && cursor == 0))
+            return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::BLOCK_CURSOR_INVALID);
+    }
+    if (admission->scan_cursor >= admission->capacity)
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::BLOCK_CURSOR_INVALID);
     if constexpr (RecordProtocol)
-        scheduler_protocol_member_closed(base, local, admission, cursor, 0, 0, used_claim_seal);
+        scheduler_protocol_member_closed(base, local, admission, cursor, 0, 0, used_claim_seal, local_claim_confirmed);
     scheduler_retire_local_obligation(*admission);
     *closed = true;
     return true;

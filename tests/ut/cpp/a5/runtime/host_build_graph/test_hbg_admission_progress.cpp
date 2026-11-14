@@ -81,7 +81,19 @@ TEST(HbgAdmissionProgress, DeferredPredecessorLeavesIndependentCounterPublisherR
             ASSERT_TRUE(
                 scheduler_async_seal_execution(&async_workers[worker], 0, execution.block, execution.subtask, writer)
             );
+            EXPECT_EQ(fixture.admissions[worker].single_wave_claim_confirmed, execution.block + 1);
+            EXPECT_FALSE(fixture.admissions[worker].single_wave_retired);
             ASSERT_TRUE(fixture.complete(execution));
+            EXPECT_TRUE(fixture.admissions[worker].single_wave_retired);
+            bool closed = false;
+            ASSERT_TRUE(scheduler_close_ordered_obligation(
+                fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), &closed
+            ));
+            EXPECT_TRUE(closed);
+            EXPECT_EQ(fixture.admissions[worker].single_wave_claim_confirmed, 0u);
+            EXPECT_FALSE(fixture.admissions[worker].single_wave_retired);
+            EXPECT_NE(fixture.control(0)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+            EXPECT_EQ(shared->commit_tail, 1u);
         }
         ASSERT_NE(fixture.control(0)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
         EXPECT_EQ(fixture.control(1)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED));

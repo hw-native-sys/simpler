@@ -65,6 +65,7 @@ class NativeAudit:
         self.confirm_points = {}
         self.claim_seals = {}
         self.close_reads = {}
+        self.local_close_proofs = {}
         self.payload_points = {}
 
     def chain(self, record, *fields):
@@ -225,6 +226,8 @@ class NativeAudit:
                 offset = rank_offsets[ref]
                 begin = offset % len(eligible)
                 members = {eligible[(begin + offset) % len(eligible)] for offset in range(width)}
+            if task["flags"] & MIX and self.single_wave(ref):
+                members = {worker for worker in members if self.positions[worker][0] < task["block_num"]}
             words = [0] * ((len(self.workers) + 63) // 64)
             for member in members:
                 words[member // 64] |= 1 << (member % 64)
@@ -570,7 +573,11 @@ class NativeAudit:
             )
         for ref, blocks in self.task_blocks.items():
             by_claim = sorted(blocks, key=lambda block: block["owner"]["block_idx"])
-            self.ordered_intervals([b["owner"] for b in by_claim], "claim_before", "claim_after")
+            if self.fixed_assignment(ref):
+                for block in by_claim:
+                    self.ordered_intervals([block["owner"]], "claim_before", "claim_after")
+            else:
+                self.ordered_intervals([b["owner"] for b in by_claim], "claim_before", "claim_after")
             if self.tasks[ref]["flags"] & MIX:
                 require(all(b["owner"]["completion_ticket"] == MAX for b in blocks), "Mix retirement has a task ticket")
             else:
@@ -584,22 +591,44 @@ class NativeAudit:
             owned = defaultdict(list)
             for block in blocks:
                 owned[block["owner"]["worker_index"]].append(block["owner"]["block_idx"])
-            if self.tasks[ref]["flags"] & SYNC:
-                require(all(len(indices) == 1 for indices in owned.values()), "sync_start reused an execution position")
+            if self.tasks[ref]["flags"] & SYNC or self.single_wave(ref):
+                policy = "sync_start" if self.tasks[ref]["flags"] & SYNC else "single-wave"
+                require(all(len(indices) == 1 for indices in owned.values()), f"{policy} reused an execution position")
             for worker in self.task_members[ref]:
                 if self.tasks[ref]["flags"] & MIX and self.positions[worker][1]:
                     member = self.member(ref, worker)
                     require(
-                        member["claim_seal_seen"] == member["claim_cursor_seen"] == 0,
+                        member["claim_seal_seen"]
+                        == member["claim_cursor_seen"]
+                        == member["local_claim_confirmed"]
+                        == 0,
                         "vector Mix member fabricated a cursor read",
                     )
                     continue
                 self.close_cursor(ref, worker, owned[worker])
 
+    def single_wave(self, ref):
+        task = self.tasks[ref]
+        positions = self.raw["cluster_count"] * (2 if task["active_mask"] in (2, 4) else 1)
+        return bool(
+            task["flags"] & SPMD
+            and not task["flags"] & SYNC
+            and task["block_num"] > 1
+            and task["block_num"] <= positions
+        )
+
+    def fixed_assignment(self, ref):
+        blocks = self.task_blocks[ref]
+        return (
+            bool(blocks)
+            and self.single_wave(ref)
+            and all(block["claim"] is not None and block["claim"]["confirmed_count"] == MAX for block in blocks)
+        )
+
     def claim_certificates(self, ref, blocks):
         task = self.tasks[ref]
         count = task["block_num"]
-        uses_tickets = count > 1 and not task["flags"] & SYNC
+        uses_tickets = count > 1 and not task["flags"] & SYNC and not self.single_wave(ref)
         for block in blocks:
             certificate, owner = block["claim"], block["owner"]
             require(certificate is not None, "missing claim certificate")
@@ -609,6 +638,23 @@ class NativeAudit:
                 and certificate["block_idx"] == owner["block_idx"],
                 "claim certificate identity mismatch",
             )
+        if self.fixed_assignment(ref):
+            members = sorted(self.task_members[ref])
+            for block in blocks:
+                certificate, owner = block["claim"], block["owner"]
+                worker = owner["worker_index"]
+                assigned = self.positions[worker][0] if task["flags"] & MIX else members.index(worker)
+                require(owner["block_idx"] == assigned, "fixed assignment disagrees with immutable membership")
+                require(
+                    certificate["seal_value"] == 0
+                    and certificate["published_before"] == [0, 0]
+                    and certificate["published_after"] == [0, 0],
+                    "fixed assignment fabricated a claim seal",
+                )
+                # Each identity has its own local claim point. There is no
+                # ordering edge between assignments on different workers.
+                self.confirm_points[(ref, assigned + 1)] = self.claim_points[(ref, assigned)]
+            return
         ordered = sorted(blocks, key=lambda block: block["claim"]["confirmed_count"])
         require(
             [block["claim"]["confirmed_count"] for block in ordered] == list(range(1, count + 1)),
@@ -625,7 +671,7 @@ class NativeAudit:
                 )
                 self.causal.add(ticket, current)
             else:
-                require(confirmed == owner["block_idx"] + 1, "CAS confirmation disagrees with its block")
+                require(confirmed == owner["block_idx"] + 1, "single-atomic confirmation disagrees with its block")
                 current = ticket
             if prior is not None:
                 self.causal.add(prior, current)
@@ -663,11 +709,34 @@ class NativeAudit:
     def close_cursor(self, ref, worker, owned):
         task, member = self.tasks[ref], self.member(ref, worker)
         cursor, blocks = member["closed_cursor"], task["block_num"]
+        receipt = member["local_claim_confirmed"]
+        if receipt:
+            require(self.single_wave(ref) and len(owned) == 1, "local claim proof without a unique single-wave owner")
+            require(
+                cursor == MAX and member["claim_seal_seen"] == member["claim_cursor_seen"] == 0,
+                "local claim proof fabricated a shared cursor observation",
+            )
+            block = next(item for item in self.task_blocks[ref] if item["owner"]["worker_index"] == worker)
+            owner, certificate = block["owner"], block["claim"]
+            require(
+                receipt == owned[0] + 1 and (self.fixed_assignment(ref) or receipt == certificate["confirmed_count"]),
+                "local claim proof does not match its actual claim",
+            )
+            closed = point(member, "closed")
+            self.before(point(owner, "completion_after"), closed, "local claim proof before block retirement")
+            proof = ("local_close_proof", ref, worker)
+            self.local_close_proofs[(ref, worker)] = proof
+            self.causal.add(("event", worker, closed[2] - 1), proof)
+            self.causal.add(self.confirm_points[(ref, receipt)], proof)
+            self.causal.add(point(owner, "completion_after"), proof)
+            self.causal.add(proof, closed)
+            return
+        require(not self.single_wave(ref) or not owned, "single-wave owner missing local claim proof")
         require(
             0 < cursor <= blocks
             and all(block < cursor for block in owned)
-            and (cursor == blocks or (task["flags"] & SYNC and owned)),
-            "invalid close cursor: unclaimed work without a retired sync_start position",
+            and (cursor == blocks or ((task["flags"] & SYNC or self.single_wave(ref)) and owned)),
+            "invalid close cursor: unclaimed work without a retired single-claim position",
         )
         closed = point(member, "closed")
         read = ("close_cursor_read", ref, worker)
@@ -691,7 +760,8 @@ class NativeAudit:
                 "invalid terminal task state",
             )
             require(
-                control["next_block"] == (task["block_num"] if cooperative else 0), "terminal block counters mismatch"
+                control["next_block"] == (task["block_num"] if cooperative and not self.fixed_assignment(ref) else 0),
+                "terminal block counters mismatch",
             )
             total = (
                 task["block_num"] * task["active_mask"].bit_count()
@@ -699,10 +769,18 @@ class NativeAudit:
                 else 0
             )
             require(control["completed_subtasks"] == total, "terminal subtask counter mismatch")
-            require(control["claim_seal"] == (task["block_num"] if cooperative else 0), "invalid terminal claim seal")
+            require(
+                control["claim_seal"] == (task["block_num"] if cooperative and not self.fixed_assignment(ref) else 0),
+                "invalid terminal claim seal",
+            )
             positions = self.raw["cluster_count"] * (2 if task["active_mask"] in (2, 4) else 1)
             minimum_blocks = 2
-            uses_tickets = cooperative and not task["flags"] & SYNC and task["block_num"] >= minimum_blocks
+            uses_tickets = (
+                cooperative
+                and not task["flags"] & SYNC
+                and task["block_num"] >= minimum_blocks
+                and not self.single_wave(ref)
+            )
             tickets = control["claim_tickets"]
             require(
                 task["block_num"] <= tickets <= task["block_num"] + positions if uses_tickets else tickets == 0,

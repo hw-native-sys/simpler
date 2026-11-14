@@ -230,3 +230,88 @@ TEST(HbgDirectAdmissionRetry, CsrAndWakeListRetainCrossTypeSuccessorsBehindAnExi
     }
 }
 }  // namespace
+
+TEST(HbgDirectMixHandoff, AdvanceHintFindsWaitingSuccessorWithoutReleasingDependency) {
+    using namespace scheduler_test::gm_mix;
+    SchedulerDependencyPlan dependencies{};
+    GmMixFixture fixture({{2, LaneMask::all()}, {2, LaneMask::all()}}, false, 2, [&](AicoreSchedulerLayout &layout) {
+        EXPECT_TRUE(scheduler_plan_dependencies(2, 1, layout.total_size, &dependencies));
+        layout.total_size = dependencies.total_size;
+    });
+    fixture.graph.executable(1, 1, {0});
+    fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
+    auto *pool = scheduler_state_at<SchedulerReadyPoolHeader>(fixture.base(), fixture.storage.ready_pool_offset);
+    pool->dependencies_offset = dependencies.header_offset;
+    pool->storage_end_offset = dependencies.total_size;
+    ASSERT_TRUE(scheduler_init_dependencies(fixture.base(), dependencies, fixture.graph.graph(), {}));
+    ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
+    ASSERT_TRUE(fixture.bootstrap_admission());
+    auto *local = fixture.locals[0];
+    ASSERT_EQ(
+        scheduler_route_task(fixture.graph.graph(), fixture.base(), local, fixture.run(), 1),
+        SchedulerRouteResult::WAITING
+    );
+    const auto completion_before = fixture.control(0)->completion_state;
+    const auto ready_before = local->local_ready_mask;
+    local->admission->advance_producer = 0;
+    ASSERT_TRUE(scheduler_prepare_advance_hint(fixture.graph.graph(), fixture.base(), local));
+    EXPECT_EQ(local->admission->advance_task, 1);
+    scheduler_prepare_advance_membership(fixture.base(), local, fixture.run());
+    EXPECT_TRUE(local->admission->advance_member_valid);
+    EXPECT_TRUE(local->admission->advance_is_member);
+    EXPECT_EQ(local->admission->pending_task_ref, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(local->admission->single_wave_claim_confirmed, 0u);
+
+    EXPECT_FALSE(fixture.task_done(0));
+    EXPECT_EQ(fixture.control(0)->completion_state, completion_before);
+    EXPECT_EQ(local->local_ready_mask, ready_before);
+    EXPECT_EQ(scheduler_gm_load(fixture.control(0)->wake_list_head), 1);
+    for (const auto &slot : local->slots)
+        EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FREE);
+    EXPECT_FALSE(scheduler_prepare_advance_hint(fixture.graph.graph(), fixture.base(), local));
+}
+
+TEST(HbgDirectMixHandoff, NonmemberAivPreparesSuccessorOfRunningAic) {
+    using namespace scheduler_test::gm_mix;
+    SchedulerDependencyPlan dependencies{};
+    GmMixFixture fixture(
+        {{2, LaneMask::aic()}, {2, LaneMask::both_aiv()}}, false, 2, [&](AicoreSchedulerLayout &layout) {
+            EXPECT_TRUE(scheduler_plan_dependencies(2, 1, layout.total_size, &dependencies));
+            layout.total_size = dependencies.total_size;
+        }
+    );
+    fixture.graph.executable(1, 1, {0});
+    fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
+    auto *pool = scheduler_state_at<SchedulerReadyPoolHeader>(fixture.base(), fixture.storage.ready_pool_offset);
+    pool->dependencies_offset = dependencies.header_offset;
+    pool->storage_end_offset = dependencies.total_size;
+    ASSERT_TRUE(scheduler_init_dependencies(fixture.base(), dependencies, fixture.graph.graph(), {}));
+    ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
+    ASSERT_TRUE(fixture.bootstrap_admission());
+    auto *local = fixture.locals[1];
+    ASSERT_EQ(
+        scheduler_route_task(fixture.graph.graph(), fixture.base(), local, fixture.run(), 1),
+        SchedulerRouteResult::WAITING
+    );
+    const auto completion_before = fixture.control(0)->completion_state;
+    const auto ready_before = local->local_ready_mask;
+    ASSERT_TRUE(fixture.admit(0));
+    ASSERT_TRUE(fixture.refresh_all());
+    EXPECT_EQ(local->admission->current_task_ref, SCHEDULER_TASK_REF_INVALID);
+    ASSERT_EQ(local->admission->advance_producer, 0);
+    ASSERT_TRUE(scheduler_prepare_advance_hint(fixture.graph.graph(), fixture.base(), local));
+    EXPECT_EQ(local->admission->advance_task, 1);
+    scheduler_prepare_advance_membership(fixture.base(), local, fixture.run());
+    EXPECT_TRUE(local->admission->advance_member_valid);
+    EXPECT_TRUE(local->admission->advance_is_member);
+    EXPECT_EQ(local->admission->pending_task_ref, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(local->admission->single_wave_claim_confirmed, 0u);
+
+    EXPECT_FALSE(fixture.task_done(0));
+    EXPECT_EQ(fixture.control(0)->completion_state, completion_before);
+    EXPECT_EQ(local->local_ready_mask, ready_before);
+    EXPECT_EQ(scheduler_gm_load(fixture.control(0)->wake_list_head), 1);
+    for (const auto &slot : local->slots)
+        EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FREE);
+    EXPECT_FALSE(scheduler_prepare_advance_hint(fixture.graph.graph(), fixture.base(), local));
+}

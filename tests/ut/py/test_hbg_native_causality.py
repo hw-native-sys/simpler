@@ -63,7 +63,7 @@ def _set_claim_seal_observation(raw, identities, *, sealed=True):
 def _resource_scoped_capture(masks=(3, 5, 3, 7, 6), clusters=2, blocks=3):
     raw, identities = ProtocolBuilder([(mask, blocks, ()) for mask in masks], clusters=clusters).run()
     _set_claim_seal_observation(raw, identities)
-    raw["schema"] = "hbg-native-protocol-v10"
+    raw["schema"] = "hbg-native-protocol-v12"
     return raw, identities
 
 
@@ -158,7 +158,7 @@ def test_current_close_seal_rows_and_claim_seal_evidence_are_both_mandatory(faul
 
 
 @pytest.mark.parametrize("mask", (1, 2, 3, 5, 6, 7))
-@pytest.mark.parametrize("blocks", (1, 2, 3, 16))
+@pytest.mark.parametrize("blocks", (1, 2, 3, 4, 16))
 @pytest.mark.parametrize("sealed", (False, True))
 def test_current_claim_seal_and_strong_fallback_keep_the_complete_causal_chain(mask, blocks, sealed):
     raw, identities = _claim_seal_capture(mask, blocks, sealed=sealed)
@@ -177,8 +177,8 @@ def test_current_sync_start_partial_cursor_closure_remains_valid(mask, sealed):
     "fault", ("missing", "duplicate", "publisher", "value", "early", "epoch", "witness", "terminal")
 )
 def test_current_rejects_invalid_claim_seal_proof(mask, fault):
-    raw, identities = _claim_seal_capture(mask, 3)
-    last = next(block for block in raw["blocks"] if block["claim"]["confirmed_count"] == 3)
+    raw, identities = _claim_seal_capture(mask, 5)
+    last = next(block for block in raw["blocks"] if block["claim"]["confirmed_count"] == 5)
     certificate = last["claim"]
     if fault == "missing":
         last["claim"] = None
@@ -221,14 +221,16 @@ def test_pure_trace_retirement_follows_completion_contribution(mask, partial_ret
 
 
 @pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
-@pytest.mark.parametrize("blocks", (1, 2, 3, 16))
+@pytest.mark.parametrize("blocks", (1, 2, 3, 4, 16))
 @pytest.mark.parametrize("tail", (False, True))
 def test_current_terminal_ticket_policy_accepts_bounded_tail(mask, blocks, tail):
     positions = 4 if mask in (2, 4) else 2
     raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v10"
+    raw["schema"] = "hbg-native-protocol-v12"
     control = raw["task_controls"][0]
-    control.update(claim_tickets=blocks + (positions if tail else 0) if blocks > 1 else 0)
+    control.update(
+        claim_tickets=blocks + (positions if tail else 0) if blocks > positions else 0,
+    )
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
 
 
@@ -236,7 +238,7 @@ def test_current_terminal_ticket_policy_accepts_bounded_tail(mask, blocks, tail)
 def test_current_sync_start_remains_ticket_free(mask):
     blocks = 4 if mask in (2, 4) else 2
     raw, identities = ProtocolBuilder([(mask, blocks, ())], sync_tasks=(0,)).run()
-    raw["schema"] = "hbg-native-protocol-v10"
+    raw["schema"] = "hbg-native-protocol-v12"
     raw["task_controls"][0].update(claim_tickets=0)
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
     raw["task_controls"][0]["claim_tickets"] = 1
@@ -245,13 +247,13 @@ def test_current_sync_start_remains_ticket_free(mask):
 
 
 @pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
-@pytest.mark.parametrize("blocks", (1, 2, 3, 7, 9, 16))
+@pytest.mark.parametrize("blocks", (1, 2, 3, 4, 7, 9, 16))
 @pytest.mark.parametrize("tail", (False, True))
-def test_current_ordinary_multiblock_counts_require_tickets_but_single_block_does_not(mask, blocks, tail):
+def test_current_ticket_policy_distinguishes_single_wave_and_dynamic_claims(mask, blocks, tail):
     positions = 4 if mask in (2, 4) else 2
     raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v10"
-    raw["task_controls"][0]["claim_tickets"] = blocks + (positions if tail else 0) if blocks > 1 else 0
+    raw["schema"] = "hbg-native-protocol-v12"
+    raw["task_controls"][0]["claim_tickets"] = blocks + (positions if tail else 0) if blocks > positions else 0
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
 
 
@@ -259,7 +261,7 @@ def test_current_ordinary_multiblock_counts_require_tickets_but_single_block_doe
 def test_current_sync_start_must_keep_zero_tickets(mask):
     blocks = 4 if mask in (2, 4) else 2
     raw, identities = ProtocolBuilder([(mask, blocks, ())], sync_tasks=(0,)).run()
-    raw["schema"] = "hbg-native-protocol-v10"
+    raw["schema"] = "hbg-native-protocol-v12"
     raw["task_controls"][0]["claim_tickets"] = 0
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
     raw["task_controls"][0]["claim_tickets"] = 1
@@ -272,7 +274,7 @@ def test_current_sync_start_must_keep_zero_tickets(mask):
 def test_current_small_claims_reject_invalid_raw_ticket_values(mask, fault):
     positions = 4 if mask in (2, 4) else 2
     raw, identities = ProtocolBuilder([(mask, 2, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v10"
+    raw["schema"] = "hbg-native-protocol-v12"
     if fault == "missing":
         del raw["task_controls"][0]["claim_tickets"]
     else:
@@ -292,8 +294,7 @@ def test_current_small_claims_reject_invalid_raw_ticket_values(mask, fault):
 @pytest.mark.parametrize("counter", ("next_block", "completed_subtasks"))
 def test_current_valid_raw_tickets_do_not_excuse_wrong_valid_or_completion_counts(mask, delta, counter):
     raw, identities = ProtocolBuilder([(mask, 2, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v10"
-    raw["task_controls"][0]["claim_tickets"] = 2
+    raw["schema"] = "hbg-native-protocol-v12"
     raw["task_controls"][0][counter] += delta
     with pytest.raises(ValueError, match="terminal .*counter"):
         audit_native_protocol(raw, identities)
@@ -603,7 +604,7 @@ def test_real_converter_preserves_native_audit_in_perfetto_metadata(tmp_path):
     path.write_text(json.dumps(wire_capture()))
     parsed = read_perf_data(path)
     assert parsed["protocol_audit"]["protocol_verified"] is True
-    assert parsed["native_protocol"]["schema"] == "hbg-native-protocol-v10"
+    assert parsed["native_protocol"]["schema"] == "hbg-native-protocol-v12"
     trace = generate_chrome_trace_json(
         parsed["tasks"], None, runtime_name="host_build_graph", timeline_metadata=parsed["timeline_metadata"]
     )
@@ -727,7 +728,7 @@ def test_resource_type_rotation_covers_interleaved_and_variable_grids(blocks):
     builder = ProtocolBuilder(shapes, clusters=6)
     raw, identities = builder.run()
     _set_claim_seal_observation(raw, identities)
-    raw.update(schema="hbg-native-protocol-v10", close_seal_stride=64)
+    raw.update(schema="hbg-native-protocol-v12", close_seal_stride=64)
     assert audit_native_protocol(raw, identities)["protocol_verified"]
     counts = [0] * 18
     for record in raw["admissions"]:
@@ -743,7 +744,7 @@ def test_resource_type_rotation_covers_interleaved_and_variable_grids(blocks):
 def test_compact_admission_and_seals_accept_64_only_alignment_and_reject_bad_regions(mutation):
     raw, identities = ProtocolBuilder([(7, 2, ()), (7, 2, (0,))], clusters=2).run()
     _set_claim_seal_observation(raw, identities)
-    raw.update(schema="hbg-native-protocol-v10", close_seal_stride=64)
+    raw.update(schema="hbg-native-protocol-v12", close_seal_stride=64)
     for index, row in enumerate(raw["admissions"]):
         row["member_words_offset"] += 64
         row["close_seals_offset"] = 8192 + 64 + index * raw["cluster_count"] * 64
@@ -768,7 +769,7 @@ def test_compact_admission_and_seals_accept_64_only_alignment_and_reject_bad_reg
 def test_current_cooperative_capture_rejects_independent_flag():
     raw, identities = ProtocolBuilder([(1, 2, ())]).run()
     _set_claim_seal_observation(raw, identities)
-    raw.update(schema="hbg-native-protocol-v10", close_seal_stride=64)
+    raw.update(schema="hbg-native-protocol-v12", close_seal_stride=64)
     assert audit_native_protocol(raw, identities)["protocol_verified"]
     raw["tasks"][0]["flags"] |= 128
     with pytest.raises(ValueError, match="unknown task flags"):
@@ -782,7 +783,7 @@ def _subtask_capture(shapes=((3, 2, ()), (2, 1, (0,))), *, deferred=()):
         deferred_tasks=deferred,
     ).run()
     _set_claim_seal_observation(raw, identities)
-    raw["schema"] = "hbg-native-protocol-v10"
+    raw["schema"] = "hbg-native-protocol-v12"
     return raw, identities
 
 
@@ -840,5 +841,241 @@ def test_current_rejects_broken_subtask_completion_proof(mutation):
     else:
         control = raw["task_controls"][0]
         control["completed_blocks"] = control.pop("completed_subtasks")
+    with pytest.raises(ValueError):
+        audit_native_protocol(raw, identities)
+
+
+@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
+def test_single_wave_requires_zero_reservation_tickets(mask):
+    blocks = 4 if mask in (2, 4) else 2
+    raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
+    assert raw["task_controls"][0]["claim_tickets"] == 0
+    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+    raw["task_controls"][0]["claim_tickets"] = blocks
+    with pytest.raises(ValueError, match="ticket"):
+        audit_native_protocol(raw, identities)
+
+
+@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
+def test_single_wave_rejects_reused_position_even_after_completion(mask):
+    blocks = 4 if mask in (2, 4) else 2
+    builder = ProtocolBuilder([(mask, blocks, ())])
+    builder.admit(0)
+    worker = 0 if mask & 1 or mask == 6 else 1
+    for block in range(blocks):
+        if mask.bit_count() > 1:
+            builder.mix_block(0, block, 0)
+        else:
+            owner = builder.claim(0, block, worker)
+            builder.execute(0, block, mask.bit_length() - 1, worker, owner=owner)
+    builder.close(0)
+    assert audit_protocol_sequences(builder.raw)["sequence_integrity_verified"] is True
+    with pytest.raises(ValueError, match="single-wave.*position"):
+        audit_native_protocol(builder.raw, builder.identities)
+
+
+def _single_wave_interleaved_capture(mask):
+    blocks = 4 if mask in (2, 4) else 2
+    builder = ProtocolBuilder([(mask, blocks, ()), (mask, blocks, ())])
+    builder.admit(0)
+    builder.admit(1, observe_members=False)
+    mixed = mask.bit_count() > 1
+    claimants = [0, 3] if mixed else builder.members(0)
+    for block, owner in enumerate(claimants):
+        workers = [worker for worker in builder.members(0) if worker // 3 == owner // 3] if mixed else [owner]
+        for task in (0, 1):
+            if task == 1:
+                for member in builder.raw["members"]:
+                    if member["task_ref"] == task and member["worker_index"] in workers:
+                        builder.stamp(member, "observed")
+            if mixed:
+                builder.mix_block(task, block, owner // 3)
+            else:
+                claim = builder.claim(task, block, owner)
+                builder.execute(task, block, mask.bit_length() - 1, owner, owner=claim)
+            for worker in workers:
+                builder.close(task, worker)
+    return builder.raw, builder.identities
+
+
+@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
+def test_single_wave_local_close_and_next_task_precede_remote_claim(mask):
+    raw, identities = _single_wave_interleaved_capture(mask)
+    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+    first = next(block["owner"] for block in raw["blocks"] if block["owner"]["task_ref"] == 0)
+    member = next(
+        row for row in raw["members"] if row["task_ref"] == 0 and row["worker_index"] == first["worker_index"]
+    )
+    next_claim = next(
+        block["owner"]
+        for block in raw["blocks"]
+        if block["owner"]["task_ref"] == 1 and block["owner"]["worker_index"] == first["worker_index"]
+    )
+    remote_claim = next(
+        block["owner"]
+        for block in raw["blocks"]
+        if block["owner"]["task_ref"] == 0 and block["owner"]["block_idx"] == 1
+    )
+    assert member["closed_cursor"] == (1 << 64) - 1
+    assert member["local_claim_confirmed"] == 1
+    assert member["claim_seal_seen"] == member["claim_cursor_seen"] == 0
+    assert member["closed"][0] < next_claim["claim_before"][0] < remote_claim["claim_before"][0]
+    for control in raw["task_controls"]:
+        assert control["next_block"] == control["claim_seal"] == first["block_num"]
+        assert control["completed_subtasks"] == first["block_num"] * mask.bit_count()
+        assert control["claim_tickets"] == 0
+
+
+@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
+@pytest.mark.parametrize("fault", ("unfinished", "unowned_at_close", "receipt_excludes_owned_block"))
+def test_single_wave_early_close_requires_a_retired_owned_block(mask, fault):
+    raw, identities = _single_wave_interleaved_capture(mask)
+    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+    owners = [block["owner"] for block in raw["blocks"] if block["owner"]["task_ref"] == 0]
+    owner = owners[0] if fault == "unfinished" else owners[-1]
+    member = next(
+        row for row in raw["members"] if row["task_ref"] == 0 and row["worker_index"] == owner["worker_index"]
+    )
+    if fault == "unfinished":
+        # Retain every event, but close before the local completion contribution.
+        member["closed"], owner["completion_after"] = owner["completion_after"], member["closed"]
+        message = "execution after member closure|owner closed with an unretired block"
+    elif fault == "unowned_at_close":
+        # The worker eventually claims its block; its earlier close owned nothing.
+        first_sequence, last_sequence = owner["claim_before"][1], member["closed"][1]
+        events = [
+            (record, field)
+            for record, kind, _ in _event_records(raw)
+            if record["worker_index"] == owner["worker_index"]
+            for field in STAMPS[kind].split()
+            if first_sequence <= record[field][1] <= last_sequence
+        ]
+        events.sort(key=lambda event: event[0][event[1]][1])
+        stamps = [record[field] for record, field in events]
+        assert events[-1][0] is member and events[-1][1] == "closed"
+        member["closed"] = stamps[0]
+        for (record, field), stamp in zip(events[:-1], stamps[1:], strict=True):
+            record[field] = stamp
+        member.update(closed_cursor=(1 << 64) - 1, claim_seal_seen=0, claim_cursor_seen=0)
+        message = "execution after member closure|owner closed with an unretired block"
+    else:
+        member["local_claim_confirmed"] = owner["block_idx"]
+        message = "local claim proof does not match its actual claim"
+    assert audit_protocol_sequences(raw)["sequence_integrity_verified"] is True
+    with pytest.raises(ValueError, match=message):
+        audit_native_protocol(raw, identities)
+
+
+@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
+def test_single_wave_final_seal_cannot_precede_the_actual_last_claim(mask):
+    blocks = 4 if mask in (2, 4) else 2
+    raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
+    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+    last = next(block for block in raw["blocks"] if block["claim"]["confirmed_count"] == blocks)
+    owner, certificate = last["owner"], last["claim"]
+    owner["claim_after"], certificate["published_before"] = certificate["published_before"], owner["claim_after"]
+    assert audit_protocol_sequences(raw)["sequence_integrity_verified"] is True
+    with pytest.raises(ValueError, match="claim seal published before final confirmation"):
+        audit_native_protocol(raw, identities)
+
+
+@pytest.mark.parametrize("mask", (2, 4))
+@pytest.mark.parametrize("fault", ("block_release", "execution_release"))
+def test_single_wave_aiv_deferred_finish_requires_all_physical_contributions(mask, fault):
+    raw, identities = ProtocolBuilder([(mask, 4, ())], deferred_tasks=(0,)).run()
+    assert raw["task_controls"][0]["claim_tickets"] == 0
+    done = raw["task_events"][0]["completion"]
+    assert done["flags"] & (1 << 31)
+    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+    if fault == "block_release":
+        raw["executions"][-1]["contribution_ticket"] = 0
+        message = "duplicate or missing subtask completion ticket"
+    else:
+        raw["task_controls"][0]["completed_subtasks"] -= 1
+        message = "terminal .*counter"
+    assert audit_protocol_sequences(raw)["sequence_integrity_verified"] is True
+    with pytest.raises(ValueError, match=message):
+        audit_native_protocol(raw, identities)
+
+
+@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
+@pytest.mark.parametrize("fault", ("missing", "wrong_receipt", "shared_cursor", "claim_seal"))
+def test_single_wave_local_close_requires_its_actual_claim_receipt(mask, fault):
+    blocks = 4 if mask in (2, 4) else 2
+    raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
+    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+    member = next(row for row in raw["members"] if row["local_claim_confirmed"])
+    if fault == "missing":
+        member["local_claim_confirmed"] = 0
+        message = "missing local claim proof"
+    elif fault == "wrong_receipt":
+        member["local_claim_confirmed"] = blocks + 1
+        message = "does not match its actual claim"
+    elif fault == "shared_cursor":
+        member["closed_cursor"] = blocks
+        message = "fabricated a shared cursor observation"
+    else:
+        member["claim_seal_seen"] = member["claim_cursor_seen"] = blocks
+        message = "fabricated a shared cursor observation"
+    with pytest.raises(ValueError, match=message):
+        audit_native_protocol(raw, identities)
+
+
+@pytest.mark.parametrize("mask", (3, 5, 6, 7))
+def test_mix_follower_cannot_fabricate_coordinator_local_claim_receipt(mask):
+    raw, identities = ProtocolBuilder([(mask, 2, ())]).run()
+    member = next(row for row in raw["members"] if row["worker_index"] % 3)
+    member["local_claim_confirmed"] = 1
+    with pytest.raises(ValueError, match="vector Mix member fabricated"):
+        audit_native_protocol(raw, identities)
+
+
+@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
+def test_local_claim_receipt_does_not_order_later_global_claims_after_close(mask):
+    blocks = 4 if mask in (2, 4) else 2
+    raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
+    first = next(row for row in raw["members"] if row["local_claim_confirmed"] == 1)
+    last_claim = next(block["owner"] for block in raw["blocks"] if block["owner"]["block_idx"] + 1 == blocks)
+    assert last_claim["claim_after"][0] < first["closed"][0]
+    assert first["closed_cursor"] == (1 << 64) - 1
+    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+
+
+def test_multi_wave_task_cannot_use_a_local_single_wave_close_proof():
+    raw, identities = ProtocolBuilder([(1, 3, ())]).run()
+    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+    raw["members"][0]["local_claim_confirmed"] = 1
+    with pytest.raises(ValueError, match="without a unique single-wave owner"):
+        audit_native_protocol(raw, identities)
+
+
+@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
+@pytest.mark.parametrize("deferred", (False, True))
+def test_fixed_assignment_requires_no_global_cursor_or_claim_seal(mask, deferred):
+    blocks = 4 if mask in (2, 4) else 2
+    raw, identities = ProtocolBuilder(
+        [(mask, blocks, ())], fixed_assignment=True, deferred_tasks=(0,) if deferred else ()
+    ).run()
+    assert raw["task_controls"][0]["next_block"] == 0
+    assert raw["task_controls"][0]["claim_seal"] == 0
+    assert all(block["claim"]["confirmed_count"] == (1 << 64) - 1 for block in raw["blocks"])
+    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+
+
+@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
+@pytest.mark.parametrize("fault", ("cursor", "seal", "claim", "receipt"))
+def test_fixed_assignment_rejects_fabricated_shared_proofs(mask, fault):
+    blocks = 4 if mask in (2, 4) else 2
+    raw, identities = ProtocolBuilder([(mask, blocks, ())], fixed_assignment=True).run()
+    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+    if fault == "cursor":
+        raw["task_controls"][0]["next_block"] = blocks
+    elif fault == "seal":
+        raw["task_controls"][0]["claim_seal"] = blocks
+    elif fault == "claim":
+        raw["blocks"][0]["claim"]["confirmed_count"] = 1
+    else:
+        member = next(row for row in raw["members"] if row["local_claim_confirmed"])
+        member["local_claim_confirmed"] = 0
     with pytest.raises(ValueError):
         audit_native_protocol(raw, identities)

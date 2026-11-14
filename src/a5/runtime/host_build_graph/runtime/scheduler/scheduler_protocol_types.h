@@ -77,6 +77,7 @@ struct alignas(64) SchedulerProtocolMemberTrace {
     uint64_t pending_mask;
     uint64_t claim_seal_seen;
     uint64_t claim_cursor_seen;
+    uint64_t local_claim_confirmed;
 };
 
 struct alignas(64) SchedulerProtocolBlockOwner {

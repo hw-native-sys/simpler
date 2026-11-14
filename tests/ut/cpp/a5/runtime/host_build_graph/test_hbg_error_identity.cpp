@@ -331,12 +331,15 @@ TEST(HbgErrorIdentity, AdmissionFailureKeepsLocalIdentityRatherThanOnlyTheShared
 TEST(HbgErrorIdentity, ActualMixPreparationFailureRetainsTheClaimedBlock) {
     ErrorFixture fixture;
     auto &admission = fixture.admissions[1];
-    admission.gm_mix.phase = SchedulerGmMixPhase::ARRIVED;
-    auto *mailbox = scheduler_state_at<SchedulerGroupMailbox>(fixture.base(), admission.gm_mix.mailbox_offset);
-    for (auto &lane : mailbox->lanes)
-        scheduler_gm_store(lane.arrived_seq, UINT64_C(7));
-    fixture.storage.callable_addresses[1] = 0;
+    admission.gm_mix.phase = SchedulerGmMixPhase::PUBLISHED;
     bool progress = false;
+    ASSERT_TRUE(
+        scheduler_gm_mix_arrive(fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), &progress)
+    );
+    ASSERT_TRUE(progress);
+    auto *mailbox = scheduler_state_at<SchedulerGroupMailbox>(fixture.base(), admission.gm_mix.mailbox_offset);
+    scheduler_gm_store(mailbox->lanes[0].arrived_seq, admission.gm_mix.group_seq);
+    fixture.storage.callable_addresses[1] = 0;
     EXPECT_FALSE(scheduler_gm_mix_prepare_lane(
         fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), 0, &progress
     ));

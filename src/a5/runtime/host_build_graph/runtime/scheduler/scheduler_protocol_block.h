@@ -70,6 +70,7 @@ static inline __aicore__ void scheduler_protocol_block_claim(
     scheduler_protocol_publish_record(owner);
     auto *claim = &record->claim;
     scheduler_protocol_observe_record(claim);
+    // UINT64_MAX denotes immutable single-wave assignment, not a global claim order.
     claim->confirmed_count = confirmed_count;
     claim->worker_index = owner->worker_index;
     claim->block_idx = block;

@@ -18,7 +18,7 @@ from simpler_setup.tools.hbg.native_protocol import audit_protocol_sequences, re
 
 def capture(epoch=0):
     return {
-        "schema": "hbg-native-protocol-v10",
+        "schema": "hbg-native-protocol-v12",
         "producer": "aicore",
         "run_epoch": epoch,
         "task_count": 1,
@@ -114,7 +114,7 @@ def test_literal_epochs_and_cycle_zero_survive_without_claiming_causality(epoch)
 @pytest.mark.parametrize("stride", (None, 0, 8, 63, 65, 128, True, 64.0, "64", -1, 1 << 64))
 def test_compact_schema_requires_64_byte_seals_and_omits_unused_execution_counter(stride):
     raw = capture()
-    raw.update(schema="hbg-native-protocol-v10", close_seal_stride=64)
+    raw.update(schema="hbg-native-protocol-v12", close_seal_stride=64)
     raw["task_controls"][0].update(claim_tickets=0, claim_seal=0)
     assert read_native_protocol(raw) == raw
     raw["executed_task_count"] = 0
@@ -230,7 +230,7 @@ def test_parser_preserves_error_and_incomplete_evidence_for_diagnostics():
         audit_protocol_sequences(raw)
 
 
-@pytest.mark.parametrize("version", (*range(1, 10), 12, 13, 14, 15, 16, 17))
+@pytest.mark.parametrize("version", (*range(1, 12), 14, 15, 16, 17))
 def test_noncurrent_protocol_versions_are_rejected(version):
     raw = capture()
     raw["schema"] = f"hbg-native-protocol-v{version}"

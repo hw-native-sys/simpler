@@ -676,6 +676,11 @@ __aicore__ bool run_ready_dispatch_loop(
             SchedulerScalarScope scalar_flush(context, SchedPhaseKind::ScalarFlushCompletions);
             scheduler_flush_completions(run_control, context);
         }
+        if (scheduler_prepare_advance_hint(graph, scheduler_state_base, context)) {
+            scheduler_prepare_advance_membership(scheduler_state_base, context, run_control);
+            boundary = check_boundary();
+            continue;
+        }
         const uint64_t backoff_start = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
         local_backoff(backoff_iterations);
         if (phase_timing_enabled)

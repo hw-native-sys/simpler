@@ -22,6 +22,7 @@
 
 #include "hbg_scheduler_test_support.h"
 #include "scheduler/scheduler_admission.h"
+#include "scheduler/scheduler_completion.h"
 
 namespace {
 
@@ -61,9 +62,9 @@ struct AdmissionFixture {
     explicit AdmissionFixture(
         const std::vector<AdmissionShape> &shapes, uint64_t workers = 6, uint64_t epoch = 17,
         std::vector<uint64_t> permutation = {}, bool protocol_profiling = false,
-        SchedulerTopologyLayout topology_layout = SchedulerTopologyLayout::GENERAL
+        SchedulerTopologyLayout topology_layout = SchedulerTopologyLayout::GENERAL, uint64_t trace_width = 3
     ) :
-        storage(shapes.size(), workers, 3, admission_requirements(shapes, workers), protocol_profiling),
+        storage(shapes.size(), workers, trace_width, admission_requirements(shapes, workers), protocol_profiling),
         graph(shapes.size()),
         admissions(workers),
         locals(workers) {
@@ -76,7 +77,7 @@ struct AdmissionFixture {
             metadata.flags = SCHEDULER_TASK_EXECUTABLE | shape.extra_flags;
             if (shape.blocks > 1) metadata.flags |= SCHEDULER_TASK_SPMD;
             if (shape.mask.is_mix()) metadata.flags |= SCHEDULER_TASK_MIX;
-            metadata.trace_index_base = task * 3;
+            metadata.trace_index_base = task * trace_width;
             metadata.timing_slot = -1;
             for (uint8_t lane = 0; lane < 3; ++lane)
                 metadata.kernel_ids[lane] = shape.mask.has(static_cast<SubtaskSlot>(lane)) ? 1 : UINT16_MAX;
@@ -222,7 +223,7 @@ void exhaust_pure_admission(AdmissionFixture &fixture, uint64_t task) {
 }
 
 TEST(HbgAdmissionFastForward, LateMemberRetiresAtMostEightExhaustedRecordsPerScan) {
-    AdmissionFixture fixture(std::vector<AdmissionShape>(10, {2, LaneMask::aic()}));
+    AdmissionFixture fixture(std::vector<AdmissionShape>(10, {3, LaneMask::aic()}));
     ASSERT_TRUE(fixture.bootstrap());
     for (uint64_t task = 0; task < 10; ++task)
         exhaust_pure_admission(fixture, task);
@@ -241,7 +242,7 @@ TEST(HbgAdmissionFastForward, LateMemberRetiresAtMostEightExhaustedRecordsPerSca
 }
 
 TEST(HbgAdmissionFastForward, RetainsObservedAndClosedProtocolWithoutClaimOrLogicalCompletion) {
-    AdmissionFixture fixture({{2, LaneMask::aic()}}, 6, 17, {}, true);
+    AdmissionFixture fixture({{3, LaneMask::aic()}}, 6, 17, {}, true);
     ASSERT_TRUE(fixture.bootstrap());
     exhaust_pure_admission(fixture, 0);
     fixture.locals[3]->admission = &fixture.admissions[3];
@@ -251,8 +252,8 @@ TEST(HbgAdmissionFastForward, RetainsObservedAndClosedProtocolWithoutClaimOrLogi
     );
     EXPECT_NE(members[3].observed.sequence, 0u);
     EXPECT_GT(members[3].closed.sequence, members[3].observed.sequence);
-    EXPECT_EQ(members[3].closed_cursor, 2u);
-    EXPECT_EQ(members[3].claim_seal_seen, 2u);
+    EXPECT_EQ(members[3].closed_cursor, 3u);
+    EXPECT_EQ(members[3].claim_seal_seen, 3u);
     EXPECT_EQ(members[3].pending_mask, 0u);
     EXPECT_EQ(fixture.admissions[3].scan_cursor, 1u);
     EXPECT_EQ(scheduler_completion_progress(fixture.task_control(0)->completion_state), 0u);
@@ -260,7 +261,7 @@ TEST(HbgAdmissionFastForward, RetainsObservedAndClosedProtocolWithoutClaimOrLogi
 }
 
 TEST(HbgAdmissionFastForward, StopsAtMixInsteadOfPassingItsResourceObligation) {
-    AdmissionFixture fixture({{2, LaneMask::aic()}, {1, LaneMask::all()}, {2, LaneMask::aic()}});
+    AdmissionFixture fixture({{3, LaneMask::aic()}, {1, LaneMask::all()}, {3, LaneMask::aic()}});
     ASSERT_TRUE(fixture.bootstrap());
     exhaust_pure_admission(fixture, 0);
     ASSERT_TRUE(fixture.publish(1));
@@ -285,10 +286,10 @@ TEST(HbgAdmissionFastForward, UnconfirmedTicketsDoNotAllowLateMemberToPass) {
 }
 
 TEST(HbgAdmissionFastForward, EarlySealIsRejectedBeforeRetiringTheRecord) {
-    AdmissionFixture fixture({{2, LaneMask::aic()}});
+    AdmissionFixture fixture({{3, LaneMask::aic()}});
     ASSERT_TRUE(fixture.bootstrap());
     ASSERT_TRUE(fixture.publish(0));
-    fixture.task_control(0)->claim_seal = 2;
+    fixture.task_control(0)->claim_seal = 3;
     fixture.task_control(0)->next_block = 1;
     fixture.locals[3]->admission = &fixture.admissions[3];
     EXPECT_FALSE(fixture.refresh(3));
@@ -318,7 +319,7 @@ TEST(HbgAdmissionFastForward, SyncStartKeepsTheExistingMemberClosurePath) {
 }
 
 TEST(HbgAdmissionFastForward, PendingOwnExecutionPreventsImmediateRetirement) {
-    AdmissionFixture fixture({{2, LaneMask::aic()}});
+    AdmissionFixture fixture({{3, LaneMask::aic()}});
     ASSERT_TRUE(fixture.bootstrap());
     exhaust_pure_admission(fixture, 0);
     auto *local = fixture.locals[3];
@@ -679,7 +680,7 @@ TEST(HbgAdmission, TypePrefixesExcludeMixAndSyncStartAndResetForEveryRun) {
     ASSERT_TRUE(fixture.bootstrap());
     const uint64_t expected[] = {0, 0, 0, 0, 2, 3};
     ASSERT_TRUE(fixture.publish(2));
-    EXPECT_EQ(fixture.record(2)->member_count, 18u);
+    EXPECT_EQ(fixture.record(2)->member_count, 6u);
     ASSERT_TRUE(fixture.publish(3));
     EXPECT_EQ(fixture.record(3)->member_count, 6u);
     for (uint64_t epoch : {17u, 18u}) {
@@ -997,16 +998,17 @@ TEST(HbgAdmission, PublishedSecondBitmapWordDistinguishesMembersAndNonmembers) {
     for (LaneMask mask :
          {LaneMask::aic(), LaneMask::aiv0(), kAicAiv0, kAicAiv1, LaneMask::both_aiv(), LaneMask::all()}) {
         SCOPED_TRACE(lane_names(mask));
-        const uint16_t blocks = mask.count() > 1 ? 3 : (mask.has_aic() ? 23 : 46);
+        const uint16_t blocks = mask.count() > 1 ? 22 : (mask.has_aic() ? 23 : 46);
         AdmissionFixture fixture({{blocks, mask}}, 69);
         ASSERT_TRUE(fixture.bootstrap());
         ASSERT_TRUE(fixture.publish(0));
         ASSERT_EQ(fixture.admissions[0].member_word_count, 2u);
         for (uint64_t worker : {63u, 64u, 65u, 66u, 67u, 68u}) {
             SCOPED_TRACE(worker);
-            const bool member = mask.count() > 1 ?
-                                    mask.merged_with(LaneMask::aic()).has(static_cast<SubtaskSlot>(worker % 3)) :
-                                    (mask == LaneMask::aic() ? worker % 3 == 0 : worker % 3 != 0);
+            const bool member =
+                mask.count() > 1 ?
+                    worker / 3 < blocks && mask.merged_with(LaneMask::aic()).has(static_cast<SubtaskSlot>(worker % 3)) :
+                    (mask == LaneMask::aic() ? worker % 3 == 0 : worker % 3 != 0);
             ASSERT_TRUE(fixture.refresh(worker));
             const auto &admission = fixture.admissions[worker];
             EXPECT_EQ(admission.current_task_ref, member ? 0 : SCHEDULER_TASK_REF_INVALID);
@@ -1271,8 +1273,8 @@ TEST(HbgAdmission, OrdinaryBlocksCanMoveBetweenHighRankWorkers) {
     for (bool cross_worker : {false, true}) {
         SCOPED_TRACE(cross_worker);
         AdmissionFixture fixture(
-            {{static_cast<uint16_t>(rank), LaneMask::aiv0()}, {1, LaneMask::aic()}, {3, LaneMask::aiv0()}}, workers, 17,
-            {}, true
+            {{static_cast<uint16_t>(rank), LaneMask::aiv0()}, {1, LaneMask::aic()}, {65, LaneMask::aiv0()}}, workers,
+            17, {}, true, SchedulerTopologyLayout::GENERAL, 65
         );
         ASSERT_TRUE(fixture.bootstrap());
         uint64_t remote = workers;
@@ -1293,7 +1295,8 @@ TEST(HbgAdmission, OrdinaryBlocksCanMoveBetweenHighRankWorkers) {
             ASSERT_EQ(fixture.admissions[worker].current_task_ref, task);
         }
 
-        const std::array<uint64_t, 3> owners{first, cross_worker ? remote : first, first};
+        std::vector<uint64_t> owners(65, first);
+        if (cross_worker) owners[1] = remote;
         const auto *blocks = scheduler_state_at<SchedulerProtocolBlockTrace>(
                                  fixture.base(), fixture.storage.layout.protocol.blocks_offset
                              ) +
@@ -2105,7 +2108,7 @@ TEST(HbgAdmissionProtocol, ExplicitNoRecordPathPreservesAdmissionAndEntryErrorGa
             )
         );
         EXPECT_FALSE(permit);
-        EXPECT_EQ(fixture.task_control(0)->next_block, 1u);
+        EXPECT_EQ(fixture.task_control(0)->next_block, 0u);
     }
 }
 
@@ -2160,7 +2163,7 @@ TEST(HbgAdmissionProtocol, MemberObservationIsUniqueAndNonMembersProduceNoObliga
 }
 
 TEST(HbgAdmissionProtocol, ZeroWorkMemberClosesAtCursorExhaustionBeforeTaskDone) {
-    AdmissionFixture fixture({{2, LaneMask::aic()}}, 6, 17, {}, true);
+    AdmissionFixture fixture({{3, LaneMask::aic()}}, 6, 17, {}, true);
     ASSERT_TRUE(fixture.bootstrap());
     ASSERT_TRUE(fixture.publish(0));
     for (uint64_t worker : {UINT64_C(0), UINT64_C(3)}) {
@@ -2176,7 +2179,7 @@ TEST(HbgAdmissionProtocol, ZeroWorkMemberClosesAtCursorExhaustionBeforeTaskDone)
     ));
     EXPECT_FALSE(closed);
     EXPECT_EQ(members[3].closed.sequence, 0u);
-    for (uint32_t index = 0; index < 2; ++index) {
+    for (uint32_t index = 0; index < 3; ++index) {
         uint32_t block = UINT32_MAX;
         ASSERT_EQ(
             scheduler_claim_ordered_cursor(
@@ -2191,7 +2194,7 @@ TEST(HbgAdmissionProtocol, ZeroWorkMemberClosesAtCursorExhaustionBeforeTaskDone)
     ));
     EXPECT_TRUE(closed);
     EXPECT_EQ(members[3].closed.sequence, 2u);
-    EXPECT_EQ(members[3].closed_cursor, 2u);
+    EXPECT_EQ(members[3].closed_cursor, 3u);
     EXPECT_EQ(members[3].pending_mask, 0u);
     EXPECT_EQ(members[3].close_seal, 0u);
     EXPECT_EQ(
@@ -2424,6 +2427,7 @@ TEST_P(HbgClaimSeal, OnlyFinalValidClaimPublishesAndDoesNotCompleteTheTask) {
         if (shape.mask == LaneMask::aiv0() || worker % 3 == 0) claimants.push_back(worker);
     }
     ASSERT_FALSE(claimants.empty());
+    const bool fixed = scheduler_task_uses_single_wave_claim(fixture.record(0)->flags, shape.mask, shape.blocks, 4);
     std::vector<bool> seen(shape.blocks, false);
     for (uint32_t index = 0; index < shape.blocks; ++index) {
         const uint32_t worker = claimants[index % claimants.size()];
@@ -2437,14 +2441,14 @@ TEST_P(HbgClaimSeal, OnlyFinalValidClaimPublishesAndDoesNotCompleteTheTask) {
         ASSERT_LT(block, shape.blocks);
         EXPECT_FALSE(seen[block]);
         seen[block] = true;
-        EXPECT_EQ(fixture.task_control(0)->claim_seal, index + 1 == shape.blocks ? shape.blocks : 0u);
+        EXPECT_EQ(fixture.task_control(0)->claim_seal, !fixed && index + 1 == shape.blocks ? shape.blocks : 0u);
         uint64_t cursor = UINT64_MAX;
         bool sealed = false;
         ASSERT_TRUE(scheduler_read_claim_cursor(
             fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), &cursor, &sealed
         ));
-        EXPECT_EQ(cursor, index + 1u);
-        EXPECT_EQ(sealed, index + 1 == shape.blocks);
+        EXPECT_EQ(cursor, fixed ? 0u : index + 1u);
+        EXPECT_EQ(sealed, !fixed && index + 1 == shape.blocks);
         EXPECT_EQ(scheduler_completion_progress(fixture.task_control(0)->completion_state), 0u);
         EXPECT_NE(fixture.task_control(0)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
     }
@@ -2455,7 +2459,7 @@ TEST_P(HbgClaimSeal, OnlyFinalValidClaimPublishesAndDoesNotCompleteTheTask) {
         );
         EXPECT_TRUE(result == SchedulerBlockClaimResult::EXHAUSTED || result == SchedulerBlockClaimResult::RETRY);
         EXPECT_EQ(block, UINT32_MAX);
-        EXPECT_EQ(fixture.task_control(0)->claim_seal, shape.blocks);
+        EXPECT_EQ(fixture.task_control(0)->claim_seal, fixed ? 0u : shape.blocks);
     }
     EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
 }
@@ -2676,7 +2680,7 @@ TEST(HbgFullSyncClaim, PartialSyncCohortKeepsTheBoundedRetryAllocator) {
     EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
 }
 
-TEST(HbgFullSyncClaim, OrdinaryFullWidthCohortKeepsTheTicketAllocator) {
+TEST(HbgFullSyncClaim, OrdinaryFullWidthCohortUsesIndependentFixedAssignment) {
     AdmissionFixture fixture({{4, LaneMask::aic()}}, 12);
     ASSERT_TRUE(fixture.bootstrap());
     ASSERT_TRUE(fixture.publish(0));
@@ -2699,12 +2703,12 @@ TEST(HbgFullSyncClaim, OrdinaryFullWidthCohortKeepsTheTicketAllocator) {
     EXPECT_TRUE(std::all_of(seen.begin(), seen.end(), [](bool value) {
         return value;
     }));
-    EXPECT_EQ(fixture.task_control(0)->claim_seal, 4u);
-    EXPECT_EQ(scheduler_gm_fetch_add(fixture.task_control(0)->next_block, UINT64_C(0)), 4u);
+    EXPECT_EQ(fixture.task_control(0)->claim_seal, 0u);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.task_control(0)->next_block, UINT64_C(0)), 0u);
     uint32_t block = UINT32_MAX;
     EXPECT_EQ(
         scheduler_claim_ordered_cursor(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), &block),
-        SchedulerBlockClaimResult::EXHAUSTED
+        SchedulerBlockClaimResult::RETRY
     );
     EXPECT_EQ(block, UINT32_MAX);
     EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
@@ -2746,9 +2750,431 @@ TEST(HbgFullSyncClaim, IndependentOrdinaryTaskStillClaimsWhileTheSyncCohortSealI
     }
     EXPECT_EQ(fixture.task_control(0)->next_block, 4u);
     EXPECT_EQ(fixture.task_control(0)->claim_seal, 4u);
-    EXPECT_EQ(fixture.task_control(1)->next_block, 2u);
-    EXPECT_EQ(fixture.task_control(1)->claim_seal, 2u);
+    EXPECT_EQ(fixture.task_control(1)->next_block, 0u);
+    EXPECT_EQ(fixture.task_control(1)->claim_seal, 0u);
+    EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
+}
+
+// Exercise the physical-contribution boundary without publishing logical DONE.
+// Full execution/async retirement is covered by ordered_execution/admission_progress.
+SchedulerSubtaskFinishResult contribute_single_wave_slot(
+    const SchedulerGraphAccess &graph, void *base, SchedulerLocalState *local, SchedulerRunControl *run, uint32_t slot
+) {
+    const auto completed = local->slots[slot];
+    const auto result = scheduler_contribute_subtask(graph, base, local, run, completed, slot);
+    if (result != SchedulerSubtaskFinishResult::ERROR) scheduler_initialize_free_slot(&local->slots[slot]);
+    return result;
+}
+
+TEST(HbgAdmissionSingleWave, EveryParticipantClaimsOnceWithoutReservationTickets) {
+    for (LaneMask mask : kAllMasks) {
+        SCOPED_TRACE(lane_names(mask));
+        const uint16_t blocks = mask.to_shape() == ResourceShape::AIV ? 4 : 2;
+        AdmissionFixture fixture({{blocks, mask}}, 6);
+        ASSERT_TRUE(fixture.bootstrap());
+        ASSERT_TRUE(fixture.publish(0));
+        std::vector<uint32_t> claimants;
+        for (uint32_t worker = 0; worker < 6; ++worker) {
+            auto *local = fixture.locals[worker];
+            local->admission = &fixture.admissions[worker];
+            ASSERT_TRUE(fixture.refresh(worker));
+            if (fixture.admissions[worker].current_task_ref != 0) continue;
+            if (!mask.is_mix() || local->is_mix_coordinator()) claimants.push_back(worker);
+        }
+        ASSERT_EQ(claimants.size(), blocks);
+        std::reverse(claimants.begin(), claimants.end());
+        for (uint32_t index = 0; index < blocks; ++index) {
+            auto *local = fixture.locals[claimants[index]];
+            uint32_t block = UINT32_MAX;
+            ASSERT_EQ(
+                scheduler_claim_ordered_cursor(fixture.graph.graph(), fixture.base(), local, fixture.run(), &block),
+                SchedulerBlockClaimResult::CLAIMED
+            );
+            EXPECT_EQ(block, blocks - index - 1);
+            EXPECT_EQ(local->admission->single_wave_claim_confirmed, blocks - index);
+            EXPECT_FALSE(local->admission->single_wave_retired);
+            EXPECT_EQ(fixture.task_control(0)->next_block, 0u);
+            EXPECT_EQ(fixture.task_control(0)->claim_tickets, 0u);
+            EXPECT_EQ(fixture.task_control(0)->claim_seal, 0u);
+            block = UINT32_MAX;
+            EXPECT_EQ(
+                scheduler_claim_ordered_cursor(fixture.graph.graph(), fixture.base(), local, fixture.run(), &block),
+                SchedulerBlockClaimResult::RETRY
+            );
+            EXPECT_EQ(block, UINT32_MAX);
+            EXPECT_EQ(fixture.task_control(0)->next_block, 0u);
+        }
+        EXPECT_EQ(scheduler_completion_progress(fixture.task_control(0)->completion_state), 0u);
+        EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
+    }
+}
+
+TEST(HbgAdmissionSingleWave, RetiredParticipantDoesNotWaitForLateMemberToClaim) {
+    AdmissionFixture fixture({{2, LaneMask::aic()}}, 6, 17, {}, true);
+    ASSERT_TRUE(fixture.bootstrap());
+    ASSERT_TRUE(fixture.publish(0));
+    for (uint32_t worker : {0u, 3u})
+        fixture.locals[worker]->admission = &fixture.admissions[worker];
+    ASSERT_TRUE(fixture.refresh(0));
+    auto *local = fixture.locals[0];
+    ASSERT_EQ(
+        scheduler_claim_ordered_block(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0),
+        SchedulerBlockClaimResult::CLAIMED
+    );
+    local->slots[0].state = SchedulerDispatchSlotState::EXECUTING;
+    ASSERT_EQ(
+        contribute_single_wave_slot(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0),
+        SchedulerSubtaskFinishResult::PARTIAL
+    );
+    bool closed = false;
+    ASSERT_TRUE(
+        scheduler_close_ordered_obligation(fixture.graph.graph(), fixture.base(), local, fixture.run(), &closed)
+    );
+    EXPECT_TRUE(closed);
+    const auto *members = scheduler_state_at<SchedulerProtocolMemberTrace>(
+        fixture.base(), fixture.storage.layout.protocol.members_offset
+    );
+    EXPECT_EQ(members[0].closed_cursor, UINT64_MAX);
+    EXPECT_EQ(members[0].local_claim_confirmed, 1u);
+    EXPECT_EQ(members[0].claim_seal_seen, 0u);
+    EXPECT_EQ(members[0].claim_cursor_seen, 0u);
+    EXPECT_EQ(fixture.admissions[0].single_wave_claim_confirmed, 0u);
+    EXPECT_FALSE(fixture.admissions[0].single_wave_retired);
+    bool permit = false;
+    ASSERT_TRUE(fixture.ordinary_permit(0, &permit));
+    EXPECT_TRUE(permit);
+    EXPECT_EQ(fixture.task_control(0)->next_block, 0u);
+    EXPECT_EQ(fixture.task_control(0)->claim_seal, 0u);
+    EXPECT_EQ(scheduler_completion_progress(fixture.task_control(0)->completion_state), 1u);
+
+    ASSERT_TRUE(fixture.refresh(3));
+    EXPECT_EQ(fixture.admissions[3].current_task_ref, 0);
+    local = fixture.locals[3];
+    ASSERT_EQ(
+        scheduler_claim_ordered_block(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0),
+        SchedulerBlockClaimResult::CLAIMED
+    );
+    EXPECT_EQ(local->slots[0].block_idx, 1u);
+    EXPECT_EQ(fixture.task_control(0)->claim_seal, 0u);
+    local->slots[0].state = SchedulerDispatchSlotState::EXECUTING;
+    EXPECT_EQ(
+        contribute_single_wave_slot(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0),
+        SchedulerSubtaskFinishResult::TASK_LAST
+    );
+}
+
+TEST(HbgAdmissionSingleWave, CompletedMemberCanClaimIndependentWaveBeforePeerClaimsOldWave) {
+    AdmissionFixture fixture({{2, LaneMask::aic()}, {2, LaneMask::aic()}}, 6);
+    ASSERT_TRUE(fixture.bootstrap());
+    ASSERT_TRUE(fixture.publish(0));
+    ASSERT_TRUE(fixture.publish(1));
+    auto execute = [&](uint32_t worker, int64_t task, uint32_t block, SchedulerSubtaskFinishResult finish) {
+        auto *local = fixture.locals[worker];
+        local->admission = &fixture.admissions[worker];
+        ASSERT_TRUE(fixture.refresh(worker));
+        ASSERT_EQ(fixture.admissions[worker].current_task_ref, task);
+        EXPECT_EQ(fixture.admissions[worker].single_wave_claim_confirmed, 0u);
+        EXPECT_FALSE(fixture.admissions[worker].single_wave_retired);
+        ASSERT_EQ(
+            scheduler_claim_ordered_block(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0),
+            SchedulerBlockClaimResult::CLAIMED
+        );
+        EXPECT_EQ(local->slots[0].block_idx, block);
+        local->slots[0].state = SchedulerDispatchSlotState::EXECUTING;
+        ASSERT_EQ(contribute_single_wave_slot(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0), finish);
+        bool closed = false;
+        ASSERT_TRUE(
+            scheduler_close_ordered_obligation(fixture.graph.graph(), fixture.base(), local, fixture.run(), &closed)
+        );
+        EXPECT_TRUE(closed);
+        EXPECT_EQ(fixture.admissions[worker].single_wave_claim_confirmed, 0u);
+        EXPECT_FALSE(fixture.admissions[worker].single_wave_retired);
+    };
+    ASSERT_NO_FATAL_FAILURE(execute(0, 0, 0, SchedulerSubtaskFinishResult::PARTIAL));
+    ASSERT_NO_FATAL_FAILURE(execute(0, 1, 0, SchedulerSubtaskFinishResult::PARTIAL));
+    EXPECT_EQ(fixture.task_control(0)->next_block, 0u);
+    EXPECT_EQ(fixture.task_control(0)->claim_seal, 0u);
+    ASSERT_NO_FATAL_FAILURE(execute(3, 0, 1, SchedulerSubtaskFinishResult::TASK_LAST));
+    ASSERT_NO_FATAL_FAILURE(execute(3, 1, 1, SchedulerSubtaskFinishResult::TASK_LAST));
+    EXPECT_EQ(scheduler_completion_progress(fixture.task_control(0)->completion_state), 2u);
+    EXPECT_EQ(scheduler_completion_progress(fixture.task_control(1)->completion_state), 2u);
+    EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
+}
+
+TEST(HbgAdmissionSingleWave, ClaimedReceiptCannotCloseBeforeItsPhysicalContribution) {
+    AdmissionFixture fixture({{2, LaneMask::aic()}}, 6);
+    ASSERT_TRUE(fixture.bootstrap());
+    ASSERT_TRUE(fixture.publish(0));
+    auto *local = fixture.locals[0];
+    local->admission = &fixture.admissions[0];
+    ASSERT_TRUE(fixture.refresh(0));
+    bool closed = true;
+    ASSERT_TRUE(
+        scheduler_close_ordered_obligation(fixture.graph.graph(), fixture.base(), local, fixture.run(), &closed)
+    );
+    EXPECT_FALSE(closed);
+    uint32_t block = UINT32_MAX;
+    ASSERT_EQ(
+        scheduler_claim_ordered_cursor(fixture.graph.graph(), fixture.base(), local, fixture.run(), &block),
+        SchedulerBlockClaimResult::CLAIMED
+    );
+    EXPECT_EQ(local->admission->single_wave_claim_confirmed, 1u);
+    EXPECT_FALSE(local->admission->single_wave_retired);
+    for (const auto &slot : local->slots)
+        EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FREE);
+    ASSERT_TRUE(
+        scheduler_close_ordered_obligation(fixture.graph.graph(), fixture.base(), local, fixture.run(), &closed)
+    );
+    EXPECT_FALSE(closed);
+    EXPECT_EQ(local->admission->current_task_ref, 0);
+    EXPECT_EQ(scheduler_completion_progress(fixture.task_control(0)->completion_state), 0u);
+    EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
+}
+
+TEST(HbgAdmissionSingleWave, ContributionRejectsMissingWrongAndRetiredReceiptsBeforeCounting) {
+    for (uint32_t fault = 0; fault < 4; ++fault) {
+        SCOPED_TRACE(fault);
+        AdmissionFixture fixture({{2, LaneMask::aic()}}, 6);
+        ASSERT_TRUE(fixture.bootstrap());
+        ASSERT_TRUE(fixture.publish(0));
+        auto *local = fixture.locals[0];
+        local->admission = &fixture.admissions[0];
+        ASSERT_TRUE(fixture.refresh(0));
+        ASSERT_EQ(
+            scheduler_claim_ordered_block(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0),
+            SchedulerBlockClaimResult::CLAIMED
+        );
+        local->slots[0].state = SchedulerDispatchSlotState::EXECUTING;
+        if (fault == 0) local->admission->single_wave_claim_confirmed = 0;
+        if (fault == 1) local->admission->single_wave_claim_confirmed = 2;
+        if (fault == 2) local->admission->single_wave_claim_confirmed = 3;
+        if (fault == 3) local->admission->single_wave_retired = true;
+        EXPECT_EQ(
+            contribute_single_wave_slot(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0),
+            SchedulerSubtaskFinishResult::ERROR
+        );
+        EXPECT_EQ(scheduler_completion_progress(fixture.task_control(0)->completion_state), 0u);
+        EXPECT_NE(scheduler_read_error(fixture.run()), 0u);
+    }
+}
+
+TEST(HbgAdmissionSingleWave, DuplicateContributionCannotCountTheRetiredReceiptAgain) {
+    AdmissionFixture fixture({{2, LaneMask::aic()}}, 6);
+    ASSERT_TRUE(fixture.bootstrap());
+    ASSERT_TRUE(fixture.publish(0));
+    auto *local = fixture.locals[0];
+    local->admission = &fixture.admissions[0];
+    ASSERT_TRUE(fixture.refresh(0));
+    ASSERT_EQ(
+        scheduler_claim_ordered_block(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0),
+        SchedulerBlockClaimResult::CLAIMED
+    );
+    local->slots[0].state = SchedulerDispatchSlotState::EXECUTING;
+    const auto completed = local->slots[0];
+    ASSERT_EQ(
+        contribute_single_wave_slot(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0),
+        SchedulerSubtaskFinishResult::PARTIAL
+    );
+    EXPECT_TRUE(local->admission->single_wave_retired);
+    EXPECT_EQ(
+        scheduler_contribute_subtask(fixture.graph.graph(), fixture.base(), local, fixture.run(), completed, 0),
+        SchedulerSubtaskFinishResult::ERROR
+    );
+    EXPECT_EQ(scheduler_completion_progress(fixture.task_control(0)->completion_state), 1u);
+}
+
+TEST(HbgAdmissionSingleWave, LastRealContributionRejectsWrongAssignmentBeforeCounting) {
+    for (uint32_t fault = 0; fault < 4; ++fault) {
+        SCOPED_TRACE(fault);
+        AdmissionFixture fixture({{2, LaneMask::aic()}}, 6);
+        ASSERT_TRUE(fixture.bootstrap());
+        ASSERT_TRUE(fixture.publish(0));
+        for (uint32_t worker : {0u, 3u}) {
+            auto *local = fixture.locals[worker];
+            local->admission = &fixture.admissions[worker];
+            ASSERT_TRUE(fixture.refresh(worker));
+            ASSERT_EQ(
+                scheduler_claim_ordered_block(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0),
+                SchedulerBlockClaimResult::CLAIMED
+            );
+            local->slots[0].state = SchedulerDispatchSlotState::EXECUTING;
+            if (worker == 0) {
+                ASSERT_EQ(
+                    contribute_single_wave_slot(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0),
+                    SchedulerSubtaskFinishResult::PARTIAL
+                );
+                continue;
+            }
+            auto *control = fixture.task_control(0);
+            if (fault == 0) {
+                local->slots[0].block_idx = 0;
+                local->admission->single_wave_claim_confirmed = 1;
+            }
+            if (fault == 1) {
+                local->slots[0].block_idx = 2;
+                local->admission->single_wave_claim_confirmed = 3;
+            }
+            if (fault == 2) local->admission->single_wave_claim_confirmed = 0;
+            if (fault == 3) local->admission->single_wave_retired = true;
+            EXPECT_EQ(
+                contribute_single_wave_slot(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0),
+                SchedulerSubtaskFinishResult::ERROR
+            );
+            EXPECT_EQ(local->admission->single_wave_retired, fault == 3);
+            EXPECT_EQ(scheduler_completion_progress(control->completion_state), 1u);
+            EXPECT_NE(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+            EXPECT_NE(scheduler_read_error(fixture.run()), 0u);
+        }
+    }
+}
+
+TEST(HbgAdmissionSingleWave, ReceiptCloseKeepsEpochErrorAndReceiptBoundsGates) {
+    for (uint32_t fault = 0; fault < 3; ++fault) {
+        SCOPED_TRACE(fault);
+        AdmissionFixture fixture({{2, LaneMask::aic()}}, 6);
+        ASSERT_TRUE(fixture.bootstrap());
+        ASSERT_TRUE(fixture.publish(0));
+        auto *local = fixture.locals[0];
+        local->admission = &fixture.admissions[0];
+        ASSERT_TRUE(fixture.refresh(0));
+        ASSERT_EQ(
+            scheduler_claim_ordered_block(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0),
+            SchedulerBlockClaimResult::CLAIMED
+        );
+        local->slots[0].state = SchedulerDispatchSlotState::EXECUTING;
+        ASSERT_EQ(
+            contribute_single_wave_slot(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0),
+            SchedulerSubtaskFinishResult::PARTIAL
+        );
+        if (fault == 0) ++local->admission->epoch;
+        if (fault == 1) scheduler_publish_error(fixture.run(), static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT));
+        if (fault == 2) local->admission->single_wave_claim_confirmed = 3;
+        bool closed = true;
+        EXPECT_FALSE(
+            scheduler_close_ordered_obligation(fixture.graph.graph(), fixture.base(), local, fixture.run(), &closed)
+        );
+        EXPECT_FALSE(closed);
+        EXPECT_EQ(local->admission->current_task_ref, 0);
+        EXPECT_NE(scheduler_read_error(fixture.run()), 0u);
+    }
+}
+
+TEST(HbgAdmissionSingleWave, RunInitializationClearsAReceiptAndItsRetirementEvidence) {
+    AdmissionFixture fixture({{2, LaneMask::aic()}}, 6);
+    ASSERT_TRUE(fixture.bootstrap());
+    auto &admission = fixture.admissions[0];
+    admission.current_task_ref = 0;
+    admission.single_wave_claim_confirmed = 1;
+    admission.single_wave_retired = true;
+    ASSERT_TRUE(scheduler_initialize_admission(fixture.base(), fixture.locals[0], &admission));
+    EXPECT_EQ(admission.current_task_ref, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(admission.single_wave_claim_confirmed, 0u);
+    EXPECT_FALSE(admission.single_wave_retired);
+}
+
+TEST(HbgAdmissionSingleWave, FullAivWaveRetiresEachActualClaimReceipt) {
+    // The host normalizes single-AIV kernels to logical AIV0. Both physical
+    // vector lanes still participate; worker order below exercises each lane.
+    AdmissionFixture fixture({{4, LaneMask::aiv0()}}, 6);
+    ASSERT_TRUE(fixture.bootstrap());
+    ASSERT_TRUE(fixture.publish(0));
+    const std::array<uint32_t, 4> workers{5, 1, 4, 2};
+    for (uint32_t index = 0; index < workers.size(); ++index) {
+        const uint32_t worker = workers[index];
+        auto *local = fixture.locals[worker];
+        local->admission = &fixture.admissions[worker];
+        ASSERT_TRUE(fixture.refresh(worker));
+        ASSERT_EQ(
+            scheduler_claim_ordered_block(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0),
+            SchedulerBlockClaimResult::CLAIMED
+        );
+        const uint32_t expected_block = worker - worker / 3 - 1;
+        EXPECT_EQ(local->slots[0].block_idx, expected_block);
+        EXPECT_EQ(local->slots[0].subtask_slot, static_cast<uint8_t>(SubtaskSlot::AIV0));
+        EXPECT_EQ(local->admission->single_wave_claim_confirmed, expected_block + 1);
+        local->slots[0].state = SchedulerDispatchSlotState::EXECUTING;
+        ASSERT_EQ(
+            contribute_single_wave_slot(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0),
+            index + 1 == workers.size() ? SchedulerSubtaskFinishResult::TASK_LAST :
+                                          SchedulerSubtaskFinishResult::PARTIAL
+        );
+        EXPECT_TRUE(local->admission->single_wave_retired);
+        bool closed = false;
+        ASSERT_TRUE(
+            scheduler_close_ordered_obligation(fixture.graph.graph(), fixture.base(), local, fixture.run(), &closed)
+        );
+        EXPECT_TRUE(closed);
+        EXPECT_EQ(local->admission->single_wave_claim_confirmed, 0u);
+        EXPECT_FALSE(local->admission->single_wave_retired);
+    }
+    EXPECT_EQ(scheduler_completion_progress(fixture.task_control(0)->completion_state), 4u);
+    EXPECT_EQ(fixture.task_control(0)->next_block, 0u);
+    EXPECT_EQ(fixture.task_control(0)->claim_seal, 0u);
+    EXPECT_EQ(fixture.task_control(0)->claim_tickets, 0u);
     EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
 }
 
 }  // namespace
+
+TEST(HbgAdmissionSingleWaveAssignment, ImmutableMembershipProvidesEveryBlockExactlyOnce) {
+    for (LaneMask mask : kAllMasks) {
+        SCOPED_TRACE(lane_names(mask));
+        const uint16_t blocks = mask.to_shape() == ResourceShape::AIV ? 4 : 2;
+        AdmissionFixture fixture({{blocks, mask}}, 6);
+        ASSERT_TRUE(fixture.bootstrap());
+        ASSERT_TRUE(fixture.publish(0));
+        std::vector<uint32_t> assigned;
+        for (uint32_t worker = 0; worker < 6; ++worker) {
+            auto *local = fixture.locals[worker];
+            local->admission = &fixture.admissions[worker];
+            ASSERT_TRUE(fixture.refresh(worker));
+            if (local->admission->current_task_ref != 0) continue;
+            auto *record = fixture.record(0);
+            auto *members = reinterpret_cast<uint64_t *>(record + 1);
+            uint32_t block = UINT32_MAX;
+            ASSERT_TRUE(scheduler_single_wave_assignment(
+                record->flags, mask, blocks, 2, members, 6, worker, local->admission->gm_mix.cluster_index, &block
+            ));
+            if (!mask.is_mix() || local->is_mix_coordinator()) assigned.push_back(block);
+            EXPECT_EQ(fixture.task_control(0)->next_block, 0u);
+            EXPECT_EQ(fixture.task_control(0)->claim_seal, 0u);
+            EXPECT_EQ(local->admission->single_wave_claim_confirmed, 0u);
+        }
+        std::sort(assigned.begin(), assigned.end());
+        ASSERT_EQ(assigned.size(), blocks);
+        for (uint32_t block = 0; block < blocks; ++block)
+            EXPECT_EQ(assigned[block], block);
+    }
+}
+
+TEST(HbgAdmissionSingleWaveAssignment, SparseMembersAcrossBitmapWordsHaveDenseRanks) {
+    uint64_t members[2] = {(UINT64_C(1) << 1) | (UINT64_C(1) << 63), UINT64_C(3)};
+    const uint8_t flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD;
+    const uint32_t workers[] = {1, 63, 64, 65};
+    for (uint32_t rank = 0; rank < 4; ++rank) {
+        uint32_t block = UINT32_MAX;
+        ASSERT_TRUE(scheduler_single_wave_assignment(
+            flags, LaneMask::aic(), 4, 4, members, 66, workers[rank], UINT32_MAX, &block
+        ));
+        EXPECT_EQ(block, rank);
+    }
+    for (uint32_t worker : {0u, 2u, 62u, 66u}) {
+        uint32_t block = UINT32_MAX;
+        EXPECT_FALSE(
+            scheduler_single_wave_assignment(flags, LaneMask::aic(), 4, 4, members, 66, worker, UINT32_MAX, &block)
+        );
+        EXPECT_EQ(block, UINT32_MAX);
+    }
+    for (uint32_t blocks : {0u, 1u, 5u}) {
+        uint32_t block = UINT32_MAX;
+        EXPECT_FALSE(
+            scheduler_single_wave_assignment(flags, LaneMask::aic(), blocks, 4, members, 66, 1, UINT32_MAX, &block)
+        );
+        EXPECT_EQ(block, UINT32_MAX);
+    }
+    uint32_t block = UINT32_MAX;
+    EXPECT_FALSE(scheduler_single_wave_assignment(
+        flags | SCHEDULER_TASK_SYNC_START, LaneMask::aic(), 4, 4, members, 66, 1, UINT32_MAX, &block
+    ));
+    EXPECT_EQ(block, UINT32_MAX);
+}
