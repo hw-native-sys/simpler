@@ -225,7 +225,6 @@ struct SchedulerLocalState {
     SchedulerClusterMixPending cluster_pending{};
     uint64_t cluster_scan_cursor{0};
     uint64_t cluster_scan_round{0};
-    uint64_t cooperative_scan_round{0};
     SchedulerExecutionToken execution_tokens[SCHEDULER_EXECUTION_TOKEN_COUNT]{};
     uint64_t execution_scan_cursor{0};
     uint64_t execution_directory_round{0};

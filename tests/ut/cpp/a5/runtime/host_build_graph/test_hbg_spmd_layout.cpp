@@ -123,7 +123,6 @@ void expect_empty_protocol(void *base, const AicoreSchedulerLayout &layout) {
         EXPECT_EQ(mailbox.descriptor.group_seq, 0u);
         EXPECT_EQ(mailbox.descriptor.block_idx, UINT32_MAX);
         EXPECT_EQ(mailbox.descriptor.cluster_index, UINT32_MAX);
-        EXPECT_EQ(mailbox.published_seq, 0u);
         for (uint64_t lane = 0; lane < 3; ++lane) {
             EXPECT_EQ(mailbox.lanes[lane].arrived_seq, 0u);
             EXPECT_EQ(mailbox.lanes[lane].released_seq, 0u);
@@ -260,8 +259,7 @@ TEST(HbgSpmdLayout, IsolatesAdmissionAndMailboxAtomicOwners) {
     EXPECT_EQ(sizeof(SchedulerGroupMailbox), 384u);
     EXPECT_EQ(alignof(SchedulerGroupMailbox), 128u);
     EXPECT_EQ(offsetof(SchedulerGroupMailbox, descriptor), 0u);
-    EXPECT_EQ(offsetof(SchedulerGroupMailbox, published_seq), 128u);
-    EXPECT_EQ(offsetof(SchedulerGroupMailbox, lanes), 192u);
+    EXPECT_EQ(offsetof(SchedulerGroupMailbox, lanes), 128u);
     EXPECT_EQ(sizeof(SchedulerGraphSummary), 192u);
     EXPECT_TRUE((std::is_standard_layout_v<SchedulerAdmissionRecord>));
     EXPECT_TRUE((std::is_trivially_copyable_v<SchedulerAdmissionRecord>));
@@ -459,7 +457,7 @@ TEST(HbgSpmdLayout, RetainedAllocationRebindsLargeSmallLargeWithoutTouchingInact
     ASSERT_TRUE(scheduler_init_spmd_task_records(retained.base(), first_large, 117));
     auto *old_mailboxes = scheduler_state_at<SchedulerGroupMailbox>(retained.base(), large.group_mailboxes_offset);
     for (uint64_t cluster = 0; cluster < large.spmd.cluster_count; ++cluster) {
-        old_mailboxes[cluster].published_seq = cluster + 400;
+        old_mailboxes[cluster].descriptor.group_seq = cluster + 400;
         old_mailboxes[cluster].descriptor.run_epoch = 117;
         for (uint64_t lane = 0; lane < 3; ++lane) {
             old_mailboxes[cluster].lanes[lane].arrived_seq = cluster + lane + 200;

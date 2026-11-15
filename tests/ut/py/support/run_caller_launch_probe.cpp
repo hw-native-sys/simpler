@@ -1042,7 +1042,7 @@ public:
             void (*bind)(OrchContext *);
             void (*finish)();
         };
-        static EntryPoints empty_orchestration{[](const ChipTaskArgs &) {}, [](OrchContext *) {}, nullptr};
+        static EntryPoints empty_orchestration{[](const ChipTaskArgs &) {}, [](OrchContext *) {}, []() {}};
         CallableState callable;
         callable.hash = callable.chip_buffer_hash = 1;
         callable.signature = {ArgDirection::INOUT};
@@ -2057,7 +2057,7 @@ public:
             void (*bind)(OrchContext *);
             void (*finish)();
         };
-        static EntryPoints empty_orchestration{[](const ChipTaskArgs &) {}, [](OrchContext *) {}, nullptr};
+        static EntryPoints empty_orchestration{[](const ChipTaskArgs &) {}, [](OrchContext *) {}, []() {}};
         CallableState callable;
         callable.hash = callable.chip_buffer_hash = 1;
         callable.signature = {ArgDirection::INOUT};
@@ -2078,7 +2078,7 @@ public:
                 ++host_effect_calls;
                 ++*host_effect_target;
             },
-            [](OrchContext *) {}, nullptr
+            [](OrchContext *) {}, []() {}
         };
         callables_[1].signature = {direction};
         callables_[1].host_orch_func_ptr = &effect;

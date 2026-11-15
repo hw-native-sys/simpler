@@ -88,7 +88,7 @@ using TestOrchFinishFunc = void (*)();
 struct TestHostOrchEntryPoints {
     TestOrchEntryFunc entry{nullptr};
     TestOrchBindFunc bind{nullptr};
-    TestOrchFinishFunc finish{nullptr};
+    TestOrchFinishFunc finish{+[]() {}};
 };
 
 // An orchestration that submits nothing: this suite is about the ledger, and a
@@ -905,6 +905,7 @@ protected:
 // hbg used to reject it: the staging loop handed it to HostTensorAccessor::add,
 // which refuses an empty region, and the bind failed with "no host view". TRB
 // has always passed it through, and hbg now matches.
+
 TEST_F(HbgBindLedgerTest, AnEmptyTensorIsPassedThroughAndTakesNoSlice) {
     Runtime runtime;
     init_runtime(runtime);
@@ -2921,6 +2922,20 @@ TEST_F(HbgBindLedgerTest, LaunchStagingOwnsPrerequisitesAndImageWithoutPrepareDe
 }
 
 #if __has_include("scheduler/scheduler_args_dump.h")
+
+TEST_F(HbgBindLedgerTest, MissingFinishCallbackRejectsBeforeOrchestration) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    eps_.entry = +[](const ChipTaskArgs &) {
+        FAIL() << "invalid callbacks reached orchestration";
+    };
+    eps_.finish = nullptr;
+    ChipStorageTaskArgs args{};
+    EXPECT_EQ(bind(runtime, args, nullptr, 0), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(runtime.pending_publication().bytes, 0u);
+}
+
 TEST_F(HbgResidentSchedulerStorageTest, GraphHeapReservationContainsArgumentsWithoutAicpuTaskStorage) {
     Runtime runtime;
     init_runtime(runtime);

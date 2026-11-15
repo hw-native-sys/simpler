@@ -81,9 +81,7 @@ struct alignas(64) SchedulerPreparedCall {
     uint32_t block_idx;
     uint16_t num_args;
     uint8_t subtask_slot;
-    uint8_t reserved;
-    uint64_t reserved_header[3];
-    uint64_t args[DISPATCH_MAX_ARGS];
+    alignas(64) uint64_t args[DISPATCH_MAX_ARGS];
 };
 
 struct alignas(64) SchedulerExecutionBinding {

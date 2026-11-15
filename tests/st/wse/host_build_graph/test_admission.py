@@ -75,7 +75,7 @@ def admission_artifacts(tmp_path_factory):
             compiler.compile_incore(str(source), core_type="" if arch == "wse" else "aiv", pto_isa_root=isa_root)
         )
         orch = path / "orch.cpp"
-        orch.write_text('extern "C" void admission_orchestration() {}\n')
+        orch.write_text('#include "orchestration_api.h"\nextern "C" void admission_orchestration() {}\n')
         (path / f"orch-{arch}.so").write_bytes(compiler.compile_orchestration("host_build_graph", str(orch)))
     # A legacy artifact is valid ELF with a kernel entry but has no family declaration.
     subprocess.run(["c++", "-shared", "-fPIC", str(source), "-o", str(path / "legacy.so")], check=True)

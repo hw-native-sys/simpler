@@ -59,8 +59,12 @@ uint32_t original_task_count。GraphView、native header、task catalog 和 prep
 | SchedulerExecutorTaskTrace | 24 B | 核内 start/end/ready-observe 三个时间戳 |
 | SchedulerAdmissionRecord | 64 B | sync_start 任务的冻结 admission 事实 |
 | SchedulerAdmissionControl | 256 B | commit_lock 和 bypass commit_tail 分占 128 B 区域 |
-| SchedulerGroupMailbox | 384 B | group descriptor、发布字及三个独立 lane ack |
+| SchedulerGroupMailbox | 384 B | group descriptor 及三个独立 lane ack |
 | SchedulerMixCloseSeal | 64 B | 单个保留的原子 close seal |
+
+Mailbox 的 descriptor 从 0 开始，lane ack 数组从 128 开始，二者位于独立原子 sector。
+coordinator 写回 descriptor 并 barrier 后，通过参与 AIV 的 assigned_seq 发布；接收者不读取另一份全局发布计数。
+Call.args 与 dump task 的只读参数行以 alignas(64) 对齐；没有显式 reserved 数据字段。
 
 TaskControl 的 atomic offset 依次为 0、128、256、384、512、640。
 completion_state 编码 total/remaining_compute/debt；具体有效性和 DONE 判据见

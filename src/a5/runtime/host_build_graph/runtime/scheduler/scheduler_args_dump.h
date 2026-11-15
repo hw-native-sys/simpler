@@ -32,7 +32,6 @@ struct alignas(64) SchedulerArgsDumpHeader {
     uint64_t total_size;
     uint64_t dump_level;
     uint64_t initialized_count;
-    uint64_t reserved[3];
 };
 
 // The mutable cache line is accessed only by GM atomics after publication.
@@ -46,9 +45,8 @@ struct alignas(64) SchedulerArgsDumpTask {
     volatile uint64_t aborted;
     volatile uint64_t after_sealed;
     uint64_t task_ref;
-    uint64_t state_reserved;
 
-    TaskId task_id;
+    alignas(64) TaskId task_id;
     uint64_t tensors_address;
     uint64_t scalars_address;
     uint64_t argument_region_base;
@@ -60,7 +58,6 @@ struct alignas(64) SchedulerArgsDumpTask {
     ArgsDumpTaskMetadata dump_metadata;
     uint64_t active_mask;
     uint64_t expected_participants;
-    uint64_t reserved[2];
 };
 
 // A selected output snapshot cannot precede deferred completion. The existing
@@ -81,7 +78,6 @@ struct alignas(64) SchedulerArgsDumpRequest {
     uint64_t tick;
     uint64_t arg_index;
     uint64_t byte_cursor;
-    uint64_t reserved;
 };
 
 struct alignas(64) SchedulerArgsDumpAck {

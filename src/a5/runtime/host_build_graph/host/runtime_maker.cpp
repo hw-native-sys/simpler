@@ -964,8 +964,7 @@ typedef void (*OrchestrationFinishFunc)();
 struct HostOrchEntryPoints {
     OrchestrationEntryFunc entry{nullptr};
     OrchestrationBindFunc bind{nullptr};
-    // Lets the .so release what it holds for a bind, once that bind's entry has returned.
-    // Optional: a .so built before this entry point existed holds nothing per bind.
+    // Releases the per-bind registry before its orchestration context is unbound.
     OrchestrationFinishFunc finish{nullptr};
 };
 
@@ -974,29 +973,16 @@ struct HostOrchEntryPoints {
 // an index from its own block. The bytes the host wrote are therefore the bytes
 // the device schedules, with no on-device or pre-copy pointer fixup.
 
-// What the Definition pass copied to the device: the distinct objects, the bytes
-// of the one block holding them (inter-object alignment padding included), and how
-// many of them the recorders could not build in the block, so that this pass had to
-// copy them in. The object count is smaller than the run's Graph task count, which exceeds it
-// by the replay factor — one Definition serves every task with its key.
-struct DefinitionUploads {
-    size_t count;
-    uint64_t bytes;
-    size_t spilled;
-};
-
 // Prepare the run's Definition objects and bind every outer Graph task to the one
 // with its key. The recorders built most or all of them in place in the block's
 // host staging, each as [GraphImageHeader][Definition image] at the offset it
 // claimed, so this pass writes the headers, copies in whatever did not fit, and
 // records the used prefix for synchronous publication.
 bool bind_graph_definitions(
-    Runtime *runtime, const HostApi *api, GraphHostState &graph_state, DefinitionUploads *uploads,
-    NativeGraphHostPlan *native_plan, int32_t total_tasks
+    Runtime *runtime, const HostApi *api, GraphHostState &graph_state, NativeGraphHostPlan *native_plan,
+    int32_t total_tasks
 ) {
-    *uploads = DefinitionUploads{};
     *native_plan = NativeGraphHostPlan{};
-    std::unordered_map<uint64_t, uint32_t> native_definition_indices;
     std::vector<uint32_t> invocation_definitions;
     if (graph_host_upload_count(graph_state) != 0)
         invocation_definitions.resize(static_cast<size_t>(total_tasks), SCHEDULER_NATIVE_NO_INSTANCE);
@@ -1010,12 +996,14 @@ bool bind_graph_definitions(
         size_t image_bytes;     // the Definition image alone
         const std::byte *copy;  // the image to copy in, or nullptr when built in place
         uint64_t execution_bytes{0};
+        uint32_t native_index{SCHEDULER_NATIVE_NO_INSTANCE};
     };
     std::unordered_map<uint64_t, PackedDefinition> packed;
     // Objects the recorders built already occupy the arena's used prefix at the
     // offsets they claimed, so the block starts out that long and the rest are
     // appended past them.
     size_t block_bytes = graph_host_arena_used(graph_state);
+    size_t spilled = 0;
     for (const GraphHostImage &entry : definitions.entries) {
         if (entry.bytes < sizeof(Graph)) continue;
         if (entry.spill == nullptr) {
@@ -1025,7 +1013,7 @@ bool bind_graph_definitions(
         const size_t object_offset = block_bytes;
         block_bytes += align_up(sizeof(GraphImageHeader) + entry.bytes);
         packed.emplace(entry.graph_key, PackedDefinition{object_offset, entry.bytes, entry.spill});
-        uploads->spilled++;
+        ++spilled;
     }
 
     // Named before anything is packed, so a run with no Graph task leaves the
@@ -1064,12 +1052,10 @@ bool bind_graph_definitions(
             const size_t padded = align_up(object_bytes);
             std::memset(base + object_bytes, 0, padded - object_bytes);
         }
-        uploads->count = packed.size();
-        uploads->bytes = block_bytes;
         char attrs[kBindAttrsCapacity];
         snprintf(
-            attrs, sizeof(attrs), "defs=%zu bytes=%zu submissions=%zu spilled=%zu", uploads->count, block_bytes, count,
-            uploads->spilled
+            attrs, sizeof(attrs), "defs=%zu bytes=%zu submissions=%zu spilled=%zu", packed.size(), block_bytes, count,
+            spilled
         );
         // The host section is the original Definition source for protocol
         // validation; commit copies native plans into scheduler GM.
@@ -1085,7 +1071,7 @@ bool bind_graph_definitions(
                 LOG_ERROR("host-orch: invalid native Graph Definition: %s", error.c_str());
                 return false;
             }
-            native_definition_indices.emplace(key, static_cast<uint32_t>(native_plan->definitions.size()));
+            object.native_index = static_cast<uint32_t>(native_plan->definitions.size());
             native_plan->definitions.push_back(std::move(definition));
         } else if (!native_graph_validate_definition(image, object.image_bytes, key, &error)) {
             LOG_ERROR("host-orch: invalid Graph Definition: %s", error.c_str());
@@ -1160,8 +1146,7 @@ bool bind_graph_definitions(
             return false;
         }
         if constexpr (task_image::native_graph_plan)
-            invocation_definitions[static_cast<size_t>(shell_id.local_id())] =
-                native_definition_indices.at(upload->graph_key);
+            invocation_definitions[static_cast<size_t>(shell_id.local_id())] = object_it->second.native_index;
         else invocation_definitions[static_cast<size_t>(shell_id.local_id())] = 0;
     }
     if (task_image::native_graph_plan && !invocation_definitions.empty()) {
@@ -2154,8 +2139,8 @@ int32_t run_host_orchestration(
     // Host get/set operates only on explicit HOST/NONE arguments. Uploaded
     // arguments and runtime outputs are DEVICE tensors and cannot be read here.
     const auto *entry_points = reinterpret_cast<const HostOrchEntryPoints *>(host_orch_func_ptr);
-    if (entry_points->bind == nullptr) {
-        LOG_ERROR("host-orch: orch .so framework_bind_orch_context was not resolved");
+    if (entry_points->bind == nullptr || entry_points->finish == nullptr) {
+        LOG_ERROR("host-orch: orch .so bind/finish callbacks were not resolved");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     orch_ctx.tensor_access = &tensor_access;
@@ -2173,7 +2158,7 @@ int32_t run_host_orchestration(
     // global may not outlive it. Unbinding after finish() keeps the context reachable
     // for whatever the .so still does there.
     RAIIScopeGuard orch_finish([entry_points]() {
-        if (entry_points->finish != nullptr) entry_points->finish();
+        entry_points->finish();
         entry_points->bind(nullptr);
     });
 
@@ -2246,8 +2231,7 @@ int32_t run_host_orchestration(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    DefinitionUploads definition_uploads{};
-    if (!bind_graph_definitions(runtime, api, *graph_state, &definition_uploads, &plan.native_graph, total_tasks)) {
+    if (!bind_graph_definitions(runtime, api, *graph_state, &plan.native_graph, total_tasks)) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
@@ -2454,8 +2438,9 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
         // pointer it sets (orchestration/common.cpp is compiled into it); resolve it
         // now so the per-run bind can set it before the .so's inline rt_submit_* run.
         void *bind_sym = dlsym(handle, "framework_bind_orch_context");
-        if (bind_sym == nullptr) {
-            LOG_ERROR("host-orch: orch .so does not export framework_bind_orch_context: %s", dlerror());
+        void *finish_sym = dlsym(handle, "framework_finish_orch");
+        if (bind_sym == nullptr || finish_sym == nullptr) {
+            LOG_ERROR("host-orch: orch .so must export framework_bind_orch_context and framework_finish_orch");
             dlclose(handle);
             return PTO_RUNTIME_ERR_INTERNAL;
         }
@@ -2472,11 +2457,7 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
         auto *eps = new HostOrchEntryPoints{};
         eps->entry = reinterpret_cast<OrchestrationEntryFunc>(entry);
         eps->bind = reinterpret_cast<OrchestrationBindFunc>(bind_sym);
-        // Optional, and looked up without failing the registration: a .so built before this
-        // entry point existed holds nothing per bind. dlerror() is drained here so the next
-        // caller does not read this miss as its own failure.
-        eps->finish = reinterpret_cast<OrchestrationFinishFunc>(dlsym(handle, "framework_finish_orch"));
-        (void)dlerror();
+        eps->finish = reinterpret_cast<OrchestrationFinishFunc>(finish_sym);
         out->host_dlopen_handle = handle;
         out->host_orch_func_ptr = eps;
         LOG_INFO("host-orch: loaded orchestration entry '%s' on host", orch_func_name);
