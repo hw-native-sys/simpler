@@ -72,6 +72,18 @@ static inline __aicore__ bool scheduler_task_supply_closed(
     return true;
 }
 
+// Private ownership only: this chooses a recheck boundary, never grants entry.
+inline __aicore__ bool scheduler_issue_needs_execution_recheck(const SchedulerLocalState *local) {
+    if (local->local_ready_mask != 0 || local->cluster_mix.phase != SchedulerGmMixPhase::IDLE ||
+        !scheduler_task_ref_is_null(local->cluster_pending.task_ref) ||
+        (local->admission != nullptr && (!scheduler_task_ref_is_null(local->admission->current_task_ref) ||
+                                         !scheduler_task_ref_is_null(local->admission->pending_task_ref))))
+        return true;
+    for (const auto &token : local->execution_tokens)
+        if (token.phase != SchedulerExecutionTokenPhase::EMPTY) return true;
+    return false;
+}
+
 // Both engine catalogs are projections of the same validated topological order.
 // Cross-engine predecessors must also have owners before a consumer takes space.
 static inline __aicore__ bool scheduler_issue_fanin_ready(
@@ -83,6 +95,13 @@ static inline __aicore__ bool scheduler_issue_fanin_ready(
     if (local->issue_task_ref != ref) {
         local->issue_task_ref = ref;
         local->issue_next_fanin = 0;
+        local->issue_fanin_confirmed = false;
+    }
+    // Topology is immutable for this run, and a predecessor's issued supply
+    // cannot reopen. This certificate grants issuance, never kernel entry.
+    if (local->issue_fanin_confirmed) {
+        *ready = true;
+        return true;
     }
     SchedulerFaninView fanin{};
     const auto view_status = scheduler_node_fanin_view(graph, ref, &fanin);
@@ -92,6 +111,11 @@ static inline __aicore__ bool scheduler_issue_fanin_ready(
         return scheduler_issue_fail(
             graph, local, run, ref, SchedulerGraphResult::INVALID_FANIN_COUNT, SchedulerErrorSite::ROUTE_INVALID_STATE
         );
+    if (local->issue_next_fanin > fanin.count)
+        return scheduler_issue_fail(
+            graph, local, run, ref, SchedulerGraphResult::INVALID_FANIN_COUNT, SchedulerErrorSite::ROUTE_INVALID_STATE
+        );
+    const bool recheck_execution = scheduler_issue_needs_execution_recheck(local);
     while (local->issue_next_fanin < fanin.count) {
         int64_t predecessor = SCHEDULER_TASK_REF_INVALID;
         const auto status = scheduler_fanin_ref(fanin, ref, local->issue_next_fanin, &predecessor);
@@ -112,7 +136,9 @@ static inline __aicore__ bool scheduler_issue_fanin_ready(
         ++local->issue_next_fanin;
         if (local->issue_next_fanin % 32 == 0 && scheduler_read_worker_error(run, local->worker_id()) != 0)
             return false;
+        if (recheck_execution && local->issue_next_fanin < fanin.count) return true;
     }
+    local->issue_fanin_confirmed = true;
     *ready = true;
     return true;
 }
@@ -163,10 +189,16 @@ static inline __aicore__ bool scheduler_query_issue_head(
             } else head = observed;
             local->issue_observed_head = head;
             local->issue_observe_attempts = 0;
+            *progress = true;
+            if (scheduler_issue_needs_execution_recheck(local)) return true;
             continue;
         }
+        const int64_t previous_task = local->issue_task_ref;
+        const uint32_t previous_fanin = local->issue_next_fanin;
         bool ready = false;
         if (!scheduler_issue_fanin_ready(graph, base, local, run, task_ref, &ready)) return false;
+        const uint32_t confirmed_before = local->issue_task_ref == previous_task ? previous_fanin : 0;
+        *progress = *progress || local->issue_next_fanin > confirmed_before;
         if (ready) *ref = task_ref;
         return true;
     }

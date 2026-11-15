@@ -20,6 +20,7 @@
 #include "../../aicpu/task_image_status.h"
 
 namespace task_image {
+using Storage = TaskImageStorage;
 inline constexpr bool native_graph_plan = true;
 
 inline sm_layout::SegmentOffsets segments(const sm_layout::BindUsage &used) {

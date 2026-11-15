@@ -84,7 +84,7 @@ Identity read_identity(const SchedulerRunControl &run) {
 
 struct ErrorFixture {
     ErrorFixture() :
-        storage(2, 3, 8, SchedulerSpmdRequirements{3, 1, 2, 2, 2}) {
+        storage(2, 12, 8, SchedulerSpmdRequirements{12, 4, 2, 2, 2}) {
         for (uint32_t task = 0; task < 2; ++task) {
             graph.mixed(task, LaneMask(/*aic=*/true, /*aiv0=*/true, /*aiv1=*/false));
             auto &metadata = storage.metadata[task];
@@ -98,12 +98,15 @@ struct ErrorFixture {
         }
         storage.prepare_catalog();
         EXPECT_TRUE(scheduler_init_spmd_task_records(base(), storage.layout, 61));
-        for (uint32_t worker = 0; worker < 3; ++worker) {
+        for (uint32_t worker = 0; worker < 12; ++worker) {
             auto &context = storage.contexts[worker];
             context.physical_core_id = static_cast<int32_t>(100 + worker);
             for (uint32_t lane = 0; lane < 3; ++lane)
-                context.cluster_worker_ids[lane] = lane;
+                context.cluster_worker_ids[lane] = worker / 3 * 3 + lane;
             storage.test_graphs[worker] = graph.graph();
+        }
+        for (uint32_t worker = 0; worker < 3; ++worker) {
+            auto &context = storage.contexts[worker];
             locals[worker] = storage.local_context(&context);
             EXPECT_TRUE(scheduler_initialize_admission(base(), locals[worker], &admissions[worker]));
             locals[worker]->admission = &admissions[worker];

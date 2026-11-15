@@ -124,8 +124,8 @@ struct Handshake {
     volatile CoreType core_type;    // Core type: CoreType::AIC or CoreType::AIV (reported by AICore with aicore_done)
     volatile uint32_t physical_core_id;  // Physical core ID (reported by AICore with aicore_done)
     volatile uint64_t report_epoch;      // Commit marker for a native program run's report; 0 = unstamped
-    volatile uint64_t work_start_cycle;  // After handshake release, before scheduler work
-    volatile uint64_t work_end_cycle;    // After scheduler work, before waiting for retirement
+    volatile uint64_t work_start_cycle;  // First business kernel on this core; zero when no kernel executed
+    volatile uint64_t work_end_cycle;    // Last business kernel on this core, after its output store barrier
 } __attribute__((aligned(64)));
 
 // The AICore owns this line's writeback: it flushes the whole line with
@@ -149,21 +149,17 @@ static_assert(offsetof(Handshake, work_start_cycle) == 32);
 static_assert(offsetof(Handshake, work_end_cycle) == 40);
 
 // Read only after every core has retired. Missing endpoints invalidate the
-// whole window, rather than silently reporting a subset of the chip.
-inline bool aicore_reduce_work_window(const Handshake *reports, int count, AicoreWorkWindow &out) {
+// whole window. A business-kernel window may explicitly exclude idle cores
+// with two zero endpoints; a half-written pair remains invalid.
+inline bool
+aicore_reduce_work_window(const Handshake *reports, int count, AicoreWorkWindow &out, bool allow_idle = false) {
     out = {};
     if (reports == nullptr || count <= 0) return false;
-    uint64_t first = UINT64_MAX;
-    uint64_t last = 0;
+    AicoreWorkWindowAccumulator summary;
     for (int i = 0; i < count; ++i) {
-        const uint64_t start = reports[i].work_start_cycle;
-        const uint64_t end = reports[i].work_end_cycle;
-        if (start == 0 || end <= start) return false;
-        if (start < first) first = start;
-        if (end > last) last = end;
+        summary.add(reports[i].work_start_cycle, reports[i].work_end_cycle);
     }
-    out = {first, last};
-    return true;
+    return summary.finish(out, allow_idle);
 }
 
 /**

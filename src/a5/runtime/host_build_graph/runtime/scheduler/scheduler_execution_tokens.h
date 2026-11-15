@@ -57,16 +57,23 @@ static inline __aicore__ bool scheduler_execution_token_observe_fanin(
 
 static inline __aicore__ bool scheduler_progress_execution_tokens(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    uint64_t profiling_level, uint32_t *direct_slot, bool *progress
+    uint64_t profiling_level, uint32_t *direct_slot, bool *progress, uint8_t *preclaim_mask = nullptr
 ) {
     SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarExecutionTokenProgress);
     if (local == nullptr || direct_slot == nullptr || progress == nullptr) return false;
     *progress = false;
     *direct_slot = UINT32_MAX;
     if (local->config.prepared == nullptr || local->local_ready_mask != 0) return true;
+    if (preclaim_mask != nullptr && !scheduler_can_delay_cohort_claim(local->admission)) return true;
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
     for (uint32_t checked = 0; checked < SCHEDULER_EXECUTION_TOKEN_COUNT; ++checked) {
-        auto &token = local->execution_tokens[local->execution_check_cursor++ % SCHEDULER_EXECUTION_TOKEN_COUNT];
+        const uint32_t token_index = local->execution_check_cursor++ % SCHEDULER_EXECUTION_TOKEN_COUNT;
+        if (preclaim_mask != nullptr) {
+            const uint8_t bit = static_cast<uint8_t>(1U << token_index);
+            if ((*preclaim_mask & bit) == 0) continue;
+            *preclaim_mask &= static_cast<uint8_t>(~bit);
+        }
+        auto &token = local->execution_tokens[token_index];
         if (token.phase == SchedulerExecutionTokenPhase::EMPTY) continue;
         if (token.phase == SchedulerExecutionTokenPhase::TICKETED) {
             if (!scheduler_execution_token_receive(graph, base, local, run, token, profiling_level)) return false;
@@ -79,8 +86,9 @@ static inline __aicore__ bool scheduler_progress_execution_tokens(
         // Local obligations can reject preparation, but never grant entry past
         // the final shared admission and MIX checks.
         const auto *admission = local->admission;
-        if (admission != nullptr && (!scheduler_task_ref_is_null(admission->pending_task_ref) ||
-                                     !scheduler_task_ref_is_null(admission->current_task_ref)))
+        if (preclaim_mask == nullptr && admission != nullptr &&
+            (!scheduler_task_ref_is_null(admission->pending_task_ref) ||
+             !scheduler_task_ref_is_null(admission->current_task_ref)))
             return true;
         if (scheduler_cluster_names_lane(local->cluster_signal, local->config.self_lane)) return true;
         uint32_t index = 0;
@@ -107,6 +115,7 @@ static inline __aicore__ bool scheduler_progress_execution_tokens(
         slot.block_idx = token.block_idx;
         slot.predicate = predicate;
         slot.execution_token = true;
+        slot.preclaim_order = preclaim_mask == nullptr ? UINT64_MAX : admission->scan_cursor;
         slot.state = SchedulerDispatchSlotState::FILLING;
         auto *binding = scheduler_execution_binding_at(base, local->config.prepared, slot.prepared.execution_index);
         binding->global_context.sub_block_id = token.subtask_slot == 2 ? 1 : 0;
@@ -190,7 +199,7 @@ static inline __aicore__ bool scheduler_try_execution_continuation(
     return true;
 }
 
-static inline __aicore__ bool scheduler_refill_execution_tokens(
+static inline __aicore__ __attribute__((noinline)) bool scheduler_refill_execution_tokens(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint64_t profiling_level, bool *progress, SchedulerIssueSnapshot *snapshot = nullptr
 ) {
@@ -242,9 +251,9 @@ static inline __aicore__ bool scheduler_refill_execution_tokens(
         token.phase = SchedulerExecutionTokenPhase::TICKETED;
         if (!scheduler_execution_token_receive(graph, base, local, run, token, profiling_level)) return false;
         *progress = true;
-        ++count;
         if (!scheduler_execution_token_observe_fanin(graph, base, local, run, token, progress)) return false;
-        if (token.next_fanin == token.fanin.count) return true;
+        // Reconsider owned executions before taking another task's ticket.
+        return true;
     }
     return true;
 }

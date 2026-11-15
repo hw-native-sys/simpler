@@ -757,7 +757,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
                 }
                 const uint32_t kind = record.kind & UINT32_C(0xffff);
                 if (kind < static_cast<uint32_t>(SchedPhaseKind::ScalarWindow) ||
-                    kind > static_cast<uint32_t>(SchedPhaseKind::ScalarTaskSupplyClosed) ||
+                    kind > static_cast<uint32_t>(SchedPhaseKind::ScalarBootstrapTopology) ||
                     std::strcmp(sched_phase_kind_name(static_cast<SchedPhaseKind>(kind)), "unknown") == 0 ||
                     record.start_time == 0 || record.end_time < record.start_time) {
                     LOG_WARN("A5 HBG: invalid Scalar interval for worker=%" PRIu64, worker);
@@ -1375,7 +1375,7 @@ bool prepare_scheduler_calls(
 bool create_scheduler_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
     uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments, NativeGraphHostPlan &native_plan,
-    const void *uploaded_sm
+    void *uploaded_sm
 ) {
     release_scheduler_state(runtime);
     if (total_tasks < 0 || task_window_size == 0 || static_cast<uint64_t>(total_tasks) > task_window_size) {
@@ -1814,6 +1814,14 @@ bool create_scheduler_state(
             dependency_graph, task_metadata, inline_completed_task_refs, &task_catalog_plan, &task_order_error
         )) {
         LOG_ERROR("A5 HBG: task ordering failed: %s", task_order_error.c_str());
+        return false;
+    }
+    if (!native_graph &&
+        !scheduler_order_ordinary_fanin(
+            reinterpret_cast<task_image::Storage *>(static_cast<char *>(uploaded_sm) + device_segments.storage),
+            task_catalog_plan.task_ranks, inline_completed_task_refs, &task_order_error
+        )) {
+        LOG_ERROR("A5 HBG: ordinary fanin ordering failed: %s", task_order_error.c_str());
         return false;
     }
     if (protocol_profiling) {

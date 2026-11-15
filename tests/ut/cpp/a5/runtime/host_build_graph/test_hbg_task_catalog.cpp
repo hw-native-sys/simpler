@@ -122,6 +122,38 @@ TEST(HbgTaskCatalog, TopologicalGenerationsExposeIndependentBranchesBeforeDeeper
     EXPECT_EQ(image.plan.task_levels, (std::vector<uint32_t>{0, 0, 1, 2, 3, 1, 2, 0}));
 }
 
+TEST(HbgTaskCatalog, OrdinaryFaninConfirmsEarlierBranchWithoutChangingDependenciesOrIssueOrder) {
+    scheduler_test::BasicGraphBuffer<8> graph(5);
+    graph.executable(0, 0);
+    graph.executable(1, 0, {0});
+    graph.executable(2, 0, {1});
+    graph.executable(3, 0);
+    graph.executable(4, 0, {2, 3, 3});
+    const std::vector<SchedulerTaskMetadata> metadata(5, physical(LaneMask::aic()));
+    CatalogImage image(metadata);
+    std::string error;
+    ASSERT_TRUE(scheduler_order_task_catalog(graph.graph(), metadata, {}, &image.plan, &error)) << error;
+    ASSERT_LT(image.plan.task_ranks[3], image.plan.task_ranks[2]);
+    const auto task_order = image.plan.task_order;
+    const auto catalogs = image.plan.catalogs;
+    auto &payload = graph.payload(4);
+    auto *const fanin_address = payload.fanin_data();
+    std::vector<int32_t> original(fanin_address, fanin_address + payload.fanin_count);
+
+    ASSERT_TRUE(scheduler_order_ordinary_fanin(graph.storage(), image.plan.task_ranks, {}, &error)) << error;
+    ASSERT_EQ(payload.fanin_count, 3);
+    EXPECT_EQ(payload.fanin_data(), fanin_address);
+    std::vector<int32_t> reordered(fanin_address, fanin_address + payload.fanin_count);
+    EXPECT_EQ(reordered, (std::vector<int32_t>{3, 3, 2}));
+    std::sort(original.begin(), original.end());
+    std::sort(reordered.begin(), reordered.end());
+    EXPECT_EQ(reordered, original);
+    // The same dependency graph still yields the same task issuance order.
+    ASSERT_TRUE(scheduler_order_task_catalog(graph.graph(), metadata, {}, &image.plan, &error)) << error;
+    EXPECT_EQ(image.plan.task_order, task_order);
+    EXPECT_EQ(image.plan.catalogs, catalogs);
+}
+
 TEST(HbgTaskCatalog, CompletedNodesDoNotReadStaleIncomingDependenciesDuringOrdering) {
     scheduler_test::BasicGraphBuffer<8> graph(3);
     graph.executable(0, 0, {INT32_MAX});
@@ -133,18 +165,29 @@ TEST(HbgTaskCatalog, CompletedNodesDoNotReadStaleIncomingDependenciesDuringOrder
     EXPECT_FALSE(scheduler_order_task_catalog(graph.graph(), metadata, {}, &image.plan, &error));
     ASSERT_TRUE(scheduler_order_task_catalog(graph.graph(), metadata, {0}, &image.plan, &error)) << error;
     EXPECT_EQ(image.plan.catalogs[0], (std::vector<int64_t>{0, 2, 1}));
+    ASSERT_TRUE(scheduler_order_ordinary_fanin(graph.storage(), image.plan.task_ranks, {0}, &error)) << error;
+    EXPECT_EQ(graph.payload(0).fanin_data()[0], INT32_MAX);
+    EXPECT_EQ(graph.payload(1).fanin_count, 2);
 }
 
 TEST(HbgTaskCatalog, CrossEnginePredecessorRequiresIssuedSupplyRatherThanLogicalCompletion) {
     for (const bool sync_start : {false, true}) {
         SCOPED_TRACE(sync_start);
-        scheduler_test::BasicGraphBuffer<4> graph(2);
+        scheduler_test::BasicGraphBuffer<4> graph(4);
         graph.executable(0, 0);
         graph.executable(1, 0, {0});
-        std::vector<SchedulerTaskMetadata> metadata{physical(LaneMask::aic(), 2), physical(LaneMask::aiv0())};
-        if (sync_start) metadata[0].flags |= SCHEDULER_TASK_SYNC_START | SCHEDULER_TASK_SPMD;
+        graph.executable(2, 0);
+        graph.executable(3, 0, {2});
+        std::vector<SchedulerTaskMetadata> metadata{
+            physical(LaneMask::aic(), 2), physical(LaneMask::aiv0()), physical(LaneMask::aic(), 2),
+            physical(LaneMask::aiv0())
+        };
+        if (sync_start) {
+            metadata[0].flags |= SCHEDULER_TASK_SYNC_START | SCHEDULER_TASK_SPMD;
+            metadata[2].flags |= SCHEDULER_TASK_SYNC_START | SCHEDULER_TASK_SPMD;
+        }
         SchedulerTaskCatalogPlan plan;
-        scheduler_test::FixtureStorage storage(2, 3, 1, {}, false, [&](AicoreSchedulerLayout &layout) {
+        scheduler_test::FixtureStorage storage(4, 3, 1, {}, false, [&](AicoreSchedulerLayout &layout) {
             ASSERT_TRUE(scheduler_plan_task_catalog(metadata, 1, layout.total_size, &plan));
             layout.total_size = plan.total_size;
         });
@@ -170,7 +213,19 @@ TEST(HbgTaskCatalog, CrossEnginePredecessorRequiresIssuedSupplyRatherThanLogical
             producer->claim_seal = 2;
         }
         EXPECT_EQ(query(), 1);
+        EXPECT_EQ(query(), 1);
         EXPECT_FALSE(scheduler_completion_done(producer->completion_state));
+        scheduler_task_control_at(base, worker, 1)->next_block = 1;
+        auto *next_producer = scheduler_task_control_at(base, worker, 2);
+        next_producer->completion_state = scheduler_completion_initial_state(2);
+        EXPECT_EQ(query(), SCHEDULER_TASK_REF_INVALID);
+        next_producer->next_block = 2;
+        if (sync_start) {
+            EXPECT_EQ(query(), SCHEDULER_TASK_REF_INVALID);
+            next_producer->claim_seal = 2;
+        }
+        EXPECT_EQ(query(), 3);
+        EXPECT_FALSE(scheduler_completion_done(next_producer->completion_state));
         EXPECT_EQ(scheduler_read_error(storage.run_control), 0u);
     }
 }

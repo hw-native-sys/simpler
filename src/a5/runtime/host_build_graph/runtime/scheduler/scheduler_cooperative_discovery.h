@@ -57,9 +57,15 @@ static inline __aicore__ bool scheduler_discover_cooperative_task(
     SchedulerFaninView fanin{};
     if (scheduler_node_fanin_view(graph, task_ref, &fanin) != SchedulerGraphResult::OK)
         return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::ADMISSION_INVALID_RECORD);
-    uint32_t next_fanin = 0;
+    if (local->cooperative_fanin_task_ref != task_ref) {
+        local->cooperative_fanin_task_ref = task_ref;
+        local->cooperative_next_fanin = 0;
+    }
     bool ready = false;
-    if (!scheduler_observe_fanin_prefix(graph, base, local, run, task_ref, fanin, next_fanin, &ready)) return false;
+    if (!scheduler_observe_fanin_prefix(
+            graph, base, local, run, task_ref, fanin, local->cooperative_next_fanin, &ready
+        ))
+        return false;
     if (!ready) return true;
     const auto staged = scheduler_stage_admission_candidate(graph, base, local, run, admission, task_ref);
     if (staged == SchedulerAdmissionResult::ERROR) return false;

@@ -82,6 +82,9 @@ struct InlineFixture {
             for (uint32_t lane = 0; lane < 3; ++lane)
                 context.cluster_worker_ids[lane] = worker / 3 * 3 + lane;
             storage.test_graphs[worker] = graph.graph();
+        }
+        for (uint32_t worker = 0; worker < workers; ++worker) {
+            auto &context = storage.contexts[worker];
             locals[worker] = storage.local_context(&context);
 
             if (protocol) EXPECT_TRUE(scheduler_protocol_bind(base(), locals[worker]));
@@ -90,7 +93,6 @@ struct InlineFixture {
                 locals[worker]->admission = &admissions[worker];
             }
         }
-        EXPECT_TRUE(bootstrap_admission());
     }
 
     void *base() const { return storage.scheduler_state->base(); }
@@ -104,16 +106,6 @@ struct InlineFixture {
     void dependency(uint32_t consumer, uint32_t producer) {
         graph.payload(consumer).fanin_count = 1;
         graph.payload(consumer).fanin_data()[0] = static_cast<int32_t>(producer);
-    }
-    bool bootstrap_admission() {
-        if (run()->bootstrap_scan_complete != 0) return true;
-        for (int64_t task = 0; task < 3; ++task) {
-            if (!scheduler_task_requires_admission(storage.metadata[task])) continue;
-            if (!scheduler_bootstrap_prepare_admission(graph.graph(), base(), locals[0], run(), &admissions[0], task))
-                return false;
-        }
-        run()->bootstrap_scan_complete = 1;
-        return true;
     }
     bool service(uint32_t worker = 1) {
         bool progress = false;
@@ -200,7 +192,6 @@ TEST(HbgInlineService, CancellationIsObservedBeforePublishingTaskDone) {
 
 TEST(HbgInlineService, ProgressesWhileAnUnrelatedMixWaitsForAnotherLane) {
     InlineFixture fixture(true, true, false, LaneMask::all(), false, 0, 6);
-    ASSERT_TRUE(fixture.bootstrap_admission());
     ASSERT_TRUE(fixture.fill(0));
     ASSERT_TRUE(fixture.fill(1));
     EXPECT_EQ(
@@ -261,7 +252,6 @@ TEST(HbgInlineService, TwoBlocksThenDummyReleaseTheSuccessorExactlyOnce) {
     InlineFixture fixture(false, false, false, LaneMask::aiv0(), false, 2);
     fixture.dependency(1, 0);
     fixture.dependency(2, 1);
-    ASSERT_TRUE(fixture.bootstrap_admission());
     ASSERT_TRUE(fixture.fill());
     ASSERT_EQ(fixture.locals[1]->slots[0].task_ref, 0);
     ASSERT_EQ(fixture.locals[1]->slots[0].block_idx, 0u);

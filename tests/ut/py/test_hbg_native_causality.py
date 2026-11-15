@@ -14,7 +14,7 @@ import pytest
 from _capture_builder import Capture
 from _native_protocol_builder import ProtocolBuilder
 
-from simpler_setup.tools.hbg.native_causality import MIX, audit_native_protocol
+from simpler_setup.tools.hbg.native_causality import MIX, PRECLAIM, audit_native_protocol
 from simpler_setup.tools.hbg.native_protocol import (
     STAMPS,
     _event_records,
@@ -22,6 +22,61 @@ from simpler_setup.tools.hbg.native_protocol import (
     read_native_protocol,
 )
 from simpler_setup.tools.swimlane_converter import generate_chrome_trace_json, read_perf_data
+
+
+def _preclaim_capture(*, claim_first=False, mixed=False):
+    builder = ProtocolBuilder([(1, 1, ()), (3 if mixed else 1, 2, ())], sync_tasks=(1,))
+    builder.admit(1)
+    reserved = builder.claim(1, 0, 0) if claim_first else None
+    ordinary = builder.execute(0, 0, 0, 0)
+    ordinary["flags"] = (ordinary["flags"] & ~16) | PRECLAIM
+    for block in range(2):
+        if mixed:
+            builder.mix_block(1, block, block, reserved=reserved if block == 0 else None)
+        else:
+            owner = reserved if block == 0 and reserved is not None else builder.claim(1, block, block * 3)
+            builder.execute(1, block, 0, block * 3, owner=owner)
+    builder.close(1)
+    return builder.raw, builder.identities
+
+
+@pytest.mark.parametrize("mixed", (False, True), ids=("pure", "gm_mix"))
+def test_preclaim_permit_requires_an_observed_cohort_and_no_owned_block(mixed):
+    raw, identities = _preclaim_capture(mixed=mixed)
+    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+    raw["executions"][0]["permit_tail"] = 0
+    with pytest.raises(ValueError, match="preclaim permit"):
+        audit_native_protocol(raw, identities)
+    raw, identities = _preclaim_capture(claim_first=True, mixed=mixed)
+    with pytest.raises(ValueError, match="preclaim execution crossed block ownership"):
+        audit_native_protocol(raw, identities)
+
+
+def test_mix_preclaim_vector_waits_for_its_descriptor_not_the_coordinators_claim():
+    builder = ProtocolBuilder([(2, 1, ()), (3, 2, ())], sync_tasks=(1,))
+    builder.admit(1)
+    builder.mix_block(1, 0, 0)
+    reserved = builder.claim(1, 1, 3)
+    ordinary = builder.execute(0, 0, 1, 4)
+    ordinary["flags"] = (ordinary["flags"] & ~16) | PRECLAIM
+    block = builder.mix_block(1, 1, 1, reserved=reserved)
+    builder.close(1)
+    # The second GM block is already published, but this vector lane has not
+    # observed its descriptor. Publication on the remote AIC is not a local claim.
+    owner = block["owner"]
+    owner["publish_before"][0] = ordinary["publication_before_cycles"] - 3
+    owner["publish_after"][0] = ordinary["publication_before_cycles"] - 2
+    resequence(builder.raw)
+    assert audit_native_protocol(builder.raw, builder.identities)["protocol_verified"] is True
+
+    # The active-lane stride places this block beyond the first two trace IDs.
+    # A complete event stream must still reject ordinary entry after its own observe.
+    lane = next(row for row in block["lanes"] if row["worker_index"] == 4)
+    lane["descriptor_ready"][0] = ordinary["publication_before_cycles"] - 1
+    resequence(builder.raw)
+    assert audit_protocol_sequences(builder.raw)["sequence_integrity_verified"] is True
+    with pytest.raises(ValueError, match="preclaim execution crossed GM descriptor ownership"):
+        audit_native_protocol(builder.raw, builder.identities)
 
 
 @pytest.mark.parametrize(

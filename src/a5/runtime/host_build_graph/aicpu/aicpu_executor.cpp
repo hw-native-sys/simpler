@@ -581,6 +581,8 @@ __attribute__((weak)) bool AicpuExecutor::schedules_on_aicore(const Runtime *run
 
 __attribute__((weak)) bool AicpuExecutor::awaits_bootstrap() const { return true; }
 
+__attribute__((weak)) bool AicpuExecutor::uses_kernel_work_window() const { return true; }
+
 __attribute__((weak)) int32_t AicpuExecutor::post_handshake_init(Runtime *runtime) {
     return aicore_lifecycle_.post_handshake_init(runtime);
 }
@@ -763,11 +765,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         snapshot_run_terminal(runtime, cores_retired);
         if (cores_retired) {
             AicoreWorkWindow work_window{};
-            for (int i = 0; i < runtime->get_worker_count(); ++i) {
-                cache_invalidate_range(&runtime->dev.workers[i], sizeof(Handshake));
-            }
-            rmb();
-            if (aicore_reduce_work_window(runtime->dev.workers, runtime->get_worker_count(), work_window)) {
+            if (aicore_lifecycle_.retired_work_window(work_window, uses_kernel_work_window())) {
                 device_phase_set_aicore_work_window(work_window);
             }
             publish_aicore_task_timing(runtime);

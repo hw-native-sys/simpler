@@ -41,6 +41,7 @@ struct AicoreSchedulerLayout {
     uint64_t activity_buffers_offset;
     uint64_t scalar_records_offset;
     uint64_t graph_summary_offset;
+    uint64_t bootstrap_clusters_offset;
     uint64_t async_layout_offset;
     uint64_t prepared_layout_offset;
     SchedulerPreparedLayout prepared;

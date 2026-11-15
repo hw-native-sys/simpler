@@ -26,19 +26,18 @@ done
 bundle=$(realpath "$1")
 runtime=$(realpath "$2")
 ranks=$("${DSV41_PYTHON:-python3}" "$root/production/topology.py" "$bundle" "$preparation")
+if [[ "$ranks" == 2 ]]; then
+    "${DSV41_PYTHON:-python3}" "$root/production/device_start_gate.py" validate "$runtime" "$runtime_name"
+fi
 mkdir -p "$3"
 output=$(realpath "$3")
 [[ ! -e "$output/rank0" && ! -e "$output/rank1" ]] || { echo 'Refusing to overwrite a run' >&2; exit 2; }
 if [[ -z "${TASK_DEVICE:-}" ]]; then
-    if [[ -n "${DSV41_DEVICES:-}" && "$DSV41_DEVICES" != auto ]]; then
-        IFS=',' read -r -a requested <<< "$DSV41_DEVICES"
-        [[ ${#requested[@]} == "$ranks" ]] || { echo "Requested devices do not match case topology" >&2; exit 2; }
-    fi
     bash "$root/../../../.claude/skills/onboard-arch-precheck/check.sh" a5
     printf -v command 'TASK_DEVICE="$TASK_DEVICE" bash %q' "$root/production/run.sh"
     for argument in "$@"; do printf -v command '%s %q' "$command" "$argument"; done
     command -v task-submit >/dev/null || { echo 'task-submit is required to reserve devices' >&2; exit 2; }
-    exec task-submit --device "${DSV41_DEVICES:-auto}" --device-num "$ranks" --max-time "${DSV41_MAX_TIME:-300}" --run "$command"
+    exec task-submit --device auto --device-num "$ranks" --max-time "${DSV41_MAX_TIME:-300}" --run "$command"
 fi
 IFS=',' read -r -a devices <<< "$TASK_DEVICE"
 [[ ${#devices[@]} == "$ranks" ]] || { echo "Case requires $ranks devices; reservation contains ${#devices[@]}" >&2; exit 2; }
@@ -72,4 +71,7 @@ done
 status=0
 for pid in "${pids[@]}"; do wait "$pid" || status=1; done
 for ((rank=0; rank<ranks; ++rank)); do tail -n 12 "$output/rank$rank/console.log"; done
+if [[ "$status" == 0 && ( "$4" == 0 || "$4" == all ) && -z "$preparation" ]]; then
+    "${DSV41_PYTHON:-python3}" "$root/production/timing.py" "$output"
+fi
 exit "$status"

@@ -464,6 +464,31 @@ TEST(HbgScalarTrace, CompactStoragePreservesWideClocksTasksCountsAndDepth) {
     }
 }
 
+TEST(HbgScalarTrace, CompactStoragePreservesEveryBootstrapPhase) {
+    auto buffer = std::make_unique<SchedulerActivityBuffer>();
+    auto slots = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+    SchedulerScalarTrace trace;
+    trace.buffer = buffer.get();
+    trace.records = slots.get();
+    const SchedPhaseKind phases[] = {
+        SchedPhaseKind::ScalarBootstrapInitWait,
+        SchedPhaseKind::ScalarBootstrapPeerWait,
+        SchedPhaseKind::ScalarBootstrapTopology,
+    };
+    const char *names[] = {"scalar_bootstrap_init_wait", "scalar_bootstrap_peer_wait", "scalar_bootstrap_topology"};
+    for (auto phase : phases)
+        trace.append(phase, 10, 20, -1, 2);
+    const auto rows = decode(trace);
+    ASSERT_EQ(rows.size(), 3u);
+    for (uint32_t i = 0; i < rows.size(); ++i) {
+        EXPECT_EQ(kind(rows[i]), 139u + i);
+        EXPECT_STREQ(sched_phase_kind_name(static_cast<SchedPhaseKind>(kind(rows[i]))), names[i]);
+        EXPECT_EQ(rows[i].start_time, 10u);
+        EXPECT_EQ(rows[i].end_time, 20u);
+        EXPECT_EQ(rows[i].kind >> 16, 2u);
+    }
+}
+
 TEST(HbgScalarTrace, CompactDecoderRejectsTruncatedAndOverflowingIntervals) {
     SchedulerScalarStorageSlot rows[] = {{1, SCHEDULER_SCALAR_STORAGE_EXTENDED | 90, 1}, {2, 0, 0}};
     SchedulerScalarRecord row{};

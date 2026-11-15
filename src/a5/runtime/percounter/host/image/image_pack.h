@@ -21,6 +21,7 @@ static_assert(offsetof(TaskPayload, predicate) == SCHEDULER_GRAPH_PREDICATE_OFFS
 static_assert(offsetof(SharedMemoryHeader, sched_error_code) == TASK_IMAGE_ERROR_CODE_OFFSET);
 
 namespace task_image {
+using Storage = ChipTaskStorage;
 inline constexpr bool native_graph_plan = false;
 inline sm_layout::SegmentOffsets segments(const sm_layout::BindUsage &used) {
     return sm_layout::segment_offsets(sm_layout::image_extents(used));

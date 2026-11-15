@@ -210,15 +210,17 @@ device-log lines. A phase that was never stamped
 (0 ns) is skipped — e.g. `so_load` is ~0 on a cached-callable run. See
 [device-phases.md](device-phases.md) for the device-side mechanism.
 
-The A5 percounter runtime also emits `chip.run.runner_run.aicore_wall`, shown
+The A5 HBG and percounter runtimes also emit `chip.run.runner_run.aicore_wall`, shown
 as `AICore` by `strace_timing --rounds-table`, independently of L1 collection.
-Each core reads its clock after the handshake's register release, before lane
-setup, and again when its scheduling/execution loop returns, before waiting for
-retirement. The chip window is `max(end) - min(start)` across all launched
-cores, including scheduler work and dependency waits. It is neither a sum of
-core durations nor the first-to-last business-kernel window from L1.
+Each core records its first actual business-kernel begin and its latest
+business-kernel end, after the output store barrier. The chip window is
+`max(end) - min(start)` across participating cores. It includes scheduling gaps
+and dependency waits between those endpoints, and excludes startup before the
+first kernel and retirement after the last kernel. Skipped predicates and
+tasks without a callable do not contribute endpoints.
 The endpoints are written back once per core and reduced only after all cores
-retire; a missing endpoint suppresses the entire metric. This fixed-size result
+retire. Two zero endpoints identify an idle core and are excluded; an incomplete
+or reversed pair, or a wholly idle run, suppresses the metric. This fixed-size result
 uses the common device-timing readback, with no per-task records or rotation.
 Its marker has `clock_source=aicore` and a zero-relative origin: do not align
 that origin with the AICPU phases or subtract their start timestamps.

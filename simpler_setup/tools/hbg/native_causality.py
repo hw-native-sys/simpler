@@ -26,6 +26,7 @@ MAX = (1 << 64) - 1
 EXECUTABLE, MIX, SPMD, SYNC, INLINE, PREDICATE = (1, 4, 8, 16, 32, 64)
 ENTRY, EXECUTED, COOPERATIVE, GM_GROUP, PERMIT_TAIL, PERMIT_NO_LOG, PUBLISHED = (1, 2, 4, 8, 16, 32, 64)
 CLUSTER_GROUP = 1 << 7
+PRECLAIM = 1 << 8
 
 
 def require(condition, message):
@@ -431,6 +432,13 @@ class NativeAudit:
             require(
                 owner is not None and execution["permit_tail"] == owner["sync_tail"], "cluster permit lost sync prefix"
             )
+        elif execution["flags"] & PRECLAIM:
+            flags |= PRECLAIM
+            require(
+                execution["order_key"] == MAX and execution["ready_source"] != 3,
+                "preclaim execution used a cooperative identity",
+            )
+            self.preclaim_permit(execution)
         else:
             flags |= PERMIT_TAIL if self.orders else PERMIT_NO_LOG
             require(
@@ -465,6 +473,46 @@ class NativeAudit:
             (0 < execution["group_seq"] < MAX) if mixed else execution["group_seq"] == 0,
             "invalid execution group identity",
         )
+
+    def preclaim_permit(self, execution):
+        prefix = execution["permit_tail"]
+        require(0 < prefix <= len(self.orders), "preclaim permit names an invalid cohort")
+        ref = self.raw["admission_log"][prefix - 1]
+        cohort = self.tasks[ref]
+        require(cohort["flags"] & SYNC, "preclaim permit requires a sync cohort")
+        worker = execution["worker_index"]
+        key = (prefix - 1) * len(self.workers) + worker
+        require(key in self.members, "preclaim execution is not a cohort position")
+        member = self.members[key]
+        permit = point(execution, "permit")
+        finished = point(execution, "trace_published")
+        self.causal.add(self.payload_points[execution["index"]][1], permit)
+        self.before(point(member, "observed"), permit, "preclaim execution preceded cohort observation")
+        self.before(finished, point(member, "closed"), "preclaim execution crossed member closure")
+        stride = cohort["active_mask"].bit_count()
+        for block_index in range(cohort["block_num"]):
+            block = self.blocks[cohort["trace_base"] + block_index * stride]
+            owner = block["owner"]
+            if owner is not None and owner["task_ref"] == ref and owner["worker_index"] == worker:
+                self.before(finished, point(owner, "claim_before"), "preclaim execution crossed block ownership")
+            if cohort["flags"] & MIX:
+                # The remote coordinator may have published the group before
+                # this vector observes it; only this lane's acceptance ends its window.
+                for lane in block["lanes"]:
+                    if lane["worker_index"] == worker:
+                        self.before(
+                            finished,
+                            point(lane, "descriptor_ready"),
+                            "preclaim execution crossed GM descriptor ownership",
+                        )
+        for order in range(len(self.orders)):
+            other = self.members.get(order * len(self.workers) + worker)
+            if other is None:
+                continue
+            if other["order_key"] < prefix - 1:
+                self.before(point(other, "closed"), permit, "preclaim execution bypassed an earlier obligation")
+            elif other["order_key"] >= prefix:
+                require(other["observed"][1] > execution["permit"][1], "preclaim permit names a stale cohort")
 
     def slot_lifetimes(self, slots, cores):
         for executions in slots.values():

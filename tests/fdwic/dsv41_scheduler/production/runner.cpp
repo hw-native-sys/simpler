@@ -16,7 +16,6 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <iterator>
 #include <memory>
 #include <stdexcept>
 #include <cstdlib>
@@ -32,9 +31,15 @@ namespace fs = std::filesystem;
 
 namespace {
 std::vector<uint8_t> read_binary(const fs::path &path) {
-    std::ifstream stream(path, std::ios::binary);
+    std::ifstream stream(path, std::ios::binary | std::ios::ate);
     if (!stream) throw std::runtime_error("Cannot read " + path.string());
-    return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+    const auto length = stream.tellg();
+    if (length < 0) throw std::runtime_error("Cannot size " + path.string());
+    std::vector<uint8_t> bytes(static_cast<size_t>(length));
+    stream.seekg(0);
+    if (!bytes.empty() && !stream.read(reinterpret_cast<char *>(bytes.data()), bytes.size()))
+        throw std::runtime_error("Incomplete read " + path.string());
+    return bytes;
 }
 
 template <class T>
@@ -74,8 +79,12 @@ void initialize(ChipWorker &worker, uint64_t address, size_t bytes, const std::v
     }
     std::vector<uint8_t> chunk(std::min(bytes, size_t{64} << 20));
     if (repeat) {
-        for (size_t i = 0; i < chunk.size(); ++i)
-            chunk[i] = value[i % value.size()];
+        if (value.size() == 1) {
+            std::fill(chunk.begin(), chunk.end(), value.front());
+        } else {
+            for (size_t i = 0; i < chunk.size(); ++i)
+                chunk[i] = value[i % value.size()];
+        }
     }
     for (size_t offset = 0; offset < bytes; offset += chunk.size()) {
         const size_t count = std::min(chunk.size(), bytes - offset);

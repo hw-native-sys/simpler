@@ -258,6 +258,53 @@ TEST_F(HbgRetirementWiring, OnlyAcknowledgedReportsAreInvalidatedOnEveryExitRout
     }
 }
 
+TEST_F(HbgRetirementWiring, WorkWindowIsCapturedByRetiringPartitionsAndNotReadAgain) {
+    auto runtime = std::make_unique<Runtime>();
+    runtime->set_worker_count(3);
+    runtime->dev.workers[0].work_start_cycle = 100;
+    runtime->dev.workers[0].work_end_cycle = 200;
+    runtime->dev.workers[2].work_start_cycle = 150;
+    runtime->dev.workers[2].work_end_cycle = 300;
+    AicoreLifecycle lifecycle;
+    AicoreLifecycleTestPeer::seed(lifecycle, kAddrs, 2);
+    AicoreWorkWindow result{};
+    ASSERT_EQ(lifecycle.finish_shutdown_partition(0, runtime.get()), 0);
+    EXPECT_FALSE(lifecycle.retired_work_window(result, true));
+    ASSERT_EQ(lifecycle.finish_shutdown_partition(1, runtime.get()), 0);
+    // Final aggregation consumes the retired snapshots, not the report lines.
+    for (int i = 0; i < 3; ++i) {
+        runtime->dev.workers[i].work_start_cycle = 0;
+        runtime->dev.workers[i].work_end_cycle = 0;
+    }
+    ASSERT_TRUE(lifecycle.retired_work_window(result, true));
+    EXPECT_EQ(result.start_cycle, 100u);
+    EXPECT_EQ(result.end_cycle, 300u);
+    EXPECT_FALSE(lifecycle.retired_work_window(result, false));
+    EXPECT_EQ(result.start_cycle, 0u);
+    EXPECT_EQ(result.end_cycle, 0u);
+    ASSERT_EQ(lifecycle.pre_handshake_init(runtime.get(), 2, 0), 0);
+    EXPECT_FALSE(lifecycle.retired_work_window(result, true));
+}
+
+TEST_F(HbgRetirementWiring, WorkWindowRejectsIncompleteEndpointsAndEntirelyIdleRuns) {
+    for (bool incomplete : {false, true}) {
+        auto runtime = std::make_unique<Runtime>();
+        if (incomplete) {
+            runtime->dev.workers[0].work_start_cycle = 100;
+            runtime->dev.workers[0].work_end_cycle = 200;
+            runtime->dev.workers[2].work_end_cycle = 300;
+        }
+        AicoreLifecycle lifecycle;
+        AicoreLifecycleTestPeer::seed(lifecycle, kAddrs, 2);
+        ASSERT_EQ(lifecycle.finish_shutdown_partition(0, runtime.get()), 0);
+        ASSERT_EQ(lifecycle.finish_shutdown_partition(1, runtime.get()), 0);
+        AicoreWorkWindow result{1, 2};
+        EXPECT_FALSE(lifecycle.retired_work_window(result, true));
+        EXPECT_EQ(result.start_cycle, 0u);
+        EXPECT_EQ(result.end_cycle, 0u);
+    }
+}
+
 TEST_F(HbgRetirementWiring, PartialHandshakeTimeoutRetiresEveryAcceptedReport) {
     scheduler_timeout_ms = 1;
     auto runtime = std::make_unique<Runtime>();

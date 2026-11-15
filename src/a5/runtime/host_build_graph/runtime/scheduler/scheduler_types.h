@@ -425,6 +425,21 @@ struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerGroupMailbox {
     alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerGroupLaneAck lanes[3];
 };
 
+inline constexpr uint64_t SCHEDULER_BOOTSTRAP_CLUSTER_INIT = 1;
+inline constexpr uint64_t SCHEDULER_BOOTSTRAP_AIV0_DONE = 2;
+inline constexpr uint64_t SCHEDULER_BOOTSTRAP_AIV1_DONE = 4;
+inline constexpr uint64_t SCHEDULER_BOOTSTRAP_CLUSTER_DONE = 7;
+
+// Host initializes this line before launch; workers access it only atomically.
+struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerBootstrapCluster {
+    volatile uint64_t state;
+};
+static_assert(sizeof(SchedulerBootstrapCluster) == SCHEDULER_GM_ATOMIC_SECTOR_BYTES);
+static_assert(alignof(SchedulerBootstrapCluster) == SCHEDULER_GM_ATOMIC_SECTOR_BYTES);
+static_assert(
+    std::is_standard_layout_v<SchedulerBootstrapCluster> && std::is_trivially_copyable_v<SchedulerBootstrapCluster>
+);
+
 enum class SchedulerTopologyLayout : uint64_t { GENERAL = 0, COMPACT_LAUNCH = 1 };
 
 // Facts frozen by READY: the host supplies graph facts, and AICPU discovery
@@ -447,6 +462,7 @@ struct alignas(64) SchedulerGraphSummary {
     uint64_t task_catalog_offset;
     uint64_t async_layout_offset;
     uint64_t prepared_layout_offset;
+    uint64_t bootstrap_clusters_offset;
 };
 
 // The executing core stages one own-slot trace and consolidates it into the
@@ -472,7 +488,6 @@ enum class SchedulerErrorSite : uint64_t {
     EXECUTOR_PREFERRED_SLOT_INVALID = 79,
     BOOTSTRAP_FAILED = 90,
     CONTEXT_READY_TIMEOUT = 91,
-    BOOTSTRAP_SCAN_TIMEOUT = 92,
     BOOTSTRAP_COMPLETE_TIMEOUT = 93,
     REGISTER_RELEASE_TIMEOUT = 94,
     EXECUTION_PROGRESS_TIMEOUT = 95,
@@ -506,6 +521,9 @@ enum class SchedulerErrorSite : uint64_t {
     ARGS_DUMP_BOUNDARY_TIMEOUT = 150,
     ARGS_DUMP_REFUSED = 151,
     ARGS_DUMP_ABORT_TIMEOUT = 152,
+    BOOTSTRAP_CLUSTER_INIT_TIMEOUT = 153,
+    BOOTSTRAP_CLUSTER_PEER_TIMEOUT = 154,
+    BOOTSTRAP_CLUSTER_INVALID_STATE = 155,
 };
 
 enum SchedulerErrorIdentityField : uint32_t {
@@ -537,8 +555,6 @@ struct alignas(64) SchedulerRunControl {
     alignas(64) volatile uint64_t resolved_task_count;
     volatile uint64_t bootstrap_arrived_count;
     volatile uint64_t bootstrap_complete;
-    volatile uint64_t bootstrap_scan_arrived_count;
-    volatile uint64_t bootstrap_scan_complete;
 
     alignas(64) volatile uint64_t error_claimed;
     volatile uint64_t error_task_ref;
@@ -728,6 +744,7 @@ static_assert(offsetof(SchedulerGroupMailbox, lanes) == 128, "descriptor and ack
 static_assert(sizeof(SchedulerGraphSummary) == 192, "graph summary layout changed");
 static_assert(offsetof(SchedulerGraphSummary, async_layout_offset) == 120);
 static_assert(offsetof(SchedulerGraphSummary, prepared_layout_offset) == 128);
+static_assert(offsetof(SchedulerGraphSummary, bootstrap_clusters_offset) == 136);
 static_assert(alignof(SchedulerGraphSummary) == 64, "graph summary alignment changed");
 static_assert(sizeof(SchedulerExecutorTaskTrace) == 24, "executor trace payload layout changed");
 static_assert(alignof(SchedulerExecutorTaskTrace) == alignof(uint64_t), "executor trace must have natural alignment");
@@ -961,6 +978,7 @@ inline bool scheduler_plan_layout(
         !scheduler_layout_reserve(
             &cursor, sizeof(SchedulerGraphSummary), alignof(SchedulerGraphSummary), &next.graph_summary_offset
         ) ||
+        !SCHEDULER_RESERVE_ARRAY(spmd.cluster_count, SchedulerBootstrapCluster, bootstrap_clusters_offset) ||
         !SCHEDULER_RESERVE_ARRAY(trace_count == 0 ? task_count : trace_count, SchedulerTaskTrace, trace_cells_offset) ||
         (enable_pmu && !SCHEDULER_RESERVE_ARRAY(
                            trace_count == 0 ? task_count : trace_count, SchedulerTaskPmuCell, pmu_cells_offset
@@ -1052,6 +1070,10 @@ inline bool scheduler_init_data_from_layout(
     summary->admission_log_offset = layout.admission_log_offset;
     summary->admission_control_offset = layout.admission_control_offset;
     summary->group_mailboxes_offset = layout.group_mailboxes_offset;
+    summary->bootstrap_clusters_offset = layout.bootstrap_clusters_offset;
+    auto *bootstrap = scheduler_state_at<SchedulerBootstrapCluster>(base, layout.bootstrap_clusters_offset);
+    for (uint64_t cluster = 0; cluster < layout.spmd.cluster_count; ++cluster)
+        bootstrap[cluster].state = layout.spmd.mix_task_count == 0 ? SCHEDULER_BOOTSTRAP_CLUSTER_INIT : 0;
     summary->mix_close_seals_offset = layout.mix_close_seals_offset;
     summary->protocol_layout_offset = layout.protocol_layout_offset;
     summary->async_layout_offset = layout.async_layout_offset;
@@ -1123,7 +1145,8 @@ scheduler_init_prepared_execution_records(void *base, const AicoreSchedulerLayou
 }
 
 inline bool scheduler_init_spmd_task_records(void *base, const AicoreSchedulerLayout &layout, uint64_t run_epoch) {
-    if (base == nullptr || (reinterpret_cast<uintptr_t>(base) & (SCHEDULER_STATE_BASE_ALIGNMENT - 1)) != 0)
+    if (base == nullptr || (reinterpret_cast<uintptr_t>(base) & (SCHEDULER_STATE_BASE_ALIGNMENT - 1)) != 0 ||
+        !scheduler_spmd_requirements_valid(layout.spmd, layout.task_count))
         return false;
     auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(base, layout.task_metadata_offset);
     auto *controls = scheduler_state_at<SchedulerTaskControl>(base, layout.task_controls_offset);
@@ -1143,7 +1166,37 @@ inline bool scheduler_init_spmd_task_records(void *base, const AicoreSchedulerLa
             (scheduler_task_has_predicate(meta.flags) && (meta.logical_block_num != 1 || active_subtasks != 1)) ||
             meta.timing_slot < -1 || meta.timing_slot >= SCHEDULER_TASK_TIMING_SLOT_COUNT)
             return false;
-        if (scheduler_task_requires_admission(meta)) ++cooperative_count;
+        if (scheduler_task_requires_admission(meta)) {
+            const uint64_t positions = scheduler_block_claim_positions(meta.active_mask, layout.spmd.cluster_count);
+            if ((meta.flags & UINT8_C(128)) != 0 || scheduler_task_has_predicate(meta.flags) || positions == 0 ||
+                meta.logical_block_num > positions ||
+                layout.admission_record_stride != sizeof(SchedulerAdmissionRecord) ||
+                layout.admission_records_offset == 0 ||
+                layout.admission_records_offset % alignof(SchedulerAdmissionRecord) != 0 ||
+                layout.admission_records_offset > layout.total_size ||
+                layout.task_count >
+                    (layout.total_size - layout.admission_records_offset) / sizeof(SchedulerAdmissionRecord))
+                return false;
+            const auto *record = scheduler_state_at<SchedulerAdmissionRecord>(
+                base, layout.admission_records_offset + task * layout.admission_record_stride
+            );
+            if (record->task_ref != SCHEDULER_TASK_REF_INVALID || record->order_key != UINT64_MAX ||
+                record->run_epoch != 0 || record->member_count != 0 ||
+                controls[task].admission_state != static_cast<uint64_t>(SchedulerAdmissionState::UNCLAIMED) ||
+                controls[task].next_block != 0 || controls[task].claim_tickets != 0 || controls[task].claim_seal != 0 ||
+                controls[task].completion_state != scheduler_completion_initial_state(1))
+                return false;
+            if (scheduler_task_is_mix(meta.flags)) {
+                uint64_t seals = 0;
+                if (layout.mix_close_seals_offset == 0 ||
+                    layout.mix_close_seals_offset % alignof(SchedulerMixCloseSeal) != 0 ||
+                    !scheduler_layout_checked_mul(layout.spmd.sync_mix_task_count, layout.spmd.cluster_count, &seals) ||
+                    layout.mix_close_seals_offset > layout.total_size ||
+                    seals > (layout.total_size - layout.mix_close_seals_offset) / sizeof(SchedulerMixCloseSeal))
+                    return false;
+            }
+            ++cooperative_count;
+        }
         if (scheduler_task_is_mix(meta.flags)) {
             ++mix_count;
             if (scheduler_task_requires_sync_start(meta.flags)) ++sync_mix_count;
@@ -1175,7 +1228,14 @@ inline bool scheduler_init_spmd_task_records(void *base, const AicoreSchedulerLa
         auto *record = scheduler_state_at<SchedulerAdmissionRecord>(
             base, layout.admission_records_offset + task * layout.admission_record_stride
         );
+        record->run_epoch = run_epoch;
         record->task_ref = static_cast<int64_t>(task);
+        record->member_count = static_cast<uint32_t>(
+            layout.spmd.cluster_count * (scheduler_task_is_mix(meta.flags) ?
+                                             scheduler_mix_resource_mask(meta.active_mask).count() :
+                                         meta.active_mask.has_aic() ? 1U :
+                                                                      PLATFORM_AIV_CORES_PER_BLOCKDIM)
+        );
         record->logical_block_num = meta.logical_block_num;
         record->active_mask = meta.active_mask;
         record->flags = meta.flags;
@@ -1184,6 +1244,7 @@ inline bool scheduler_init_spmd_task_records(void *base, const AicoreSchedulerLa
                 layout.mix_close_seals_offset + mix_index * layout.spmd.cluster_count * sizeof(SchedulerMixCloseSeal);
             ++mix_index;
         }
+        controls[task].admission_state = static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED);
     }
     return true;
 }

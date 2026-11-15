@@ -370,9 +370,9 @@ static inline __aicore__ bool scheduler_gm_mix_prepare_lane(
     auto &group = admission.gm_mix;
     if (group.phase != SchedulerGmMixPhase::ARRIVED) return true;
     bool all = false;
-    if (!scheduler_gm_mix_check_acks<RecordProtocol>(graph, base, local, run, false, &all, query_prefiltered))
-        return false;
     if (group.subtask_slot == UINT8_MAX) {
+        if (!scheduler_gm_mix_check_acks<RecordProtocol>(graph, base, local, run, false, &all, query_prefiltered))
+            return false;
         if (!all) return true;
         scheduler_gm_mix_publish_release<RecordProtocol>(base, local);
         *progress = true;
@@ -440,6 +440,8 @@ static inline __aicore__ bool scheduler_gm_mix_prepare_lane(
     }
     // This group owns the FILLING slot while peers arrive. A later service
     // resumes the handle; it never repeats Call acquire or Binding writes.
+    if (!scheduler_gm_mix_check_acks<RecordProtocol>(graph, base, local, run, false, &all, query_prefiltered))
+        return false;
     if (!all) return true;
     if (!scheduler_gm_mix_context_valid<StaticContextValidated>(graph, base, local, run)) return false;
     // The lane has not released its group, so the observed descriptor remains

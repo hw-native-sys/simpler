@@ -14,13 +14,12 @@ import csv
 import importlib.util
 import json
 import math
+import runpy
 import statistics
 import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
-
-from simpler_setup.tools.strace_timing import parse_spans
 
 
 def load(path):
@@ -61,27 +60,6 @@ def scheduler_phases(records, run):
         for event in stream["records"]:
             phases[event["kind"]].append((event["end_cycles"] - event["start_cycles"]) * 1e6 / frequency)
     return phases
-
-
-def device_wall_samples(directory, result):
-    spans = []
-    for path in directory.glob("host/host.*.log"):
-        spans.extend(
-            span
-            for span in parse_spans(path.read_text().splitlines())
-            if span.name == "chip.run.runner_run.device_wall" and span.is_device
-        )
-    spans.sort(key=lambda span: (span.pid, span.inv))
-    warmup, rounds = result["warmup"], result["rounds"]
-    if result.get("snapshot_inputs"):
-        if len(spans) != warmup + rounds + 2:
-            raise ValueError(f"Missing single-device timing spans: {directory}")
-        return [span.dur / 1e6 for span in spans[warmup : warmup + rounds]]
-    # The driver performs fused-reference, then prefix/case pairs. Require
-    # every actual device span before selecting the measured case calls.
-    if len(spans) != 1 + 2 * (warmup + rounds + 2):
-        raise ValueError(f"Missing device timing spans: {directory}")
-    return [spans[2 + 2 * iteration].dur / 1e6 for iteration in range(warmup, warmup + rounds)]
 
 
 def execution_durations(records, selected, mapping=None):
@@ -145,12 +123,14 @@ def audit(root, cases, original, names, destination, convert):
             details.append(native_moe_reports(root, case))
             continue
         expected = case["source"]
+        timing = runpy.run_path(str(Path(__file__).with_name("production") / "timing.py"))
+        case_timing = timing["summarize_replay"](root / case["case"])
         for rank in range(case.get("device_count", 2)):
             directory = root / case["case"] / f"rank{rank}"
             result = load(directory / "result.json")
             if not result["passed"] or not result["validated_against_fused_prefix"]:
                 raise ValueError(f"Case has not passed boundary validation: {directory}")
-            wall_samples = device_wall_samples(directory, result)
+            wall_samples = case_timing["per_rank_samples_ms"][rank]
             source_dir = original / f"rank{rank}/run0"
             source_deps = load(source_dir / "deps.json")
             source_tasks = {int(task["task_id"]): task for task in source_deps["tasks"]}
@@ -248,7 +228,8 @@ def audit(root, cases, original, names, destination, convert):
                     "rank": rank,
                     "tasks": expected["tasks"],
                     "executions": expected["executions"],
-                    "L0_device_wall_median_ms": statistics.median(wall_samples),
+                    "L0_aicore_wall_mean_ms": case_timing["mean_ms"],
+                    "L0_rank_aicore_wall_mean_ms": statistics.mean(wall_samples),
                     "L1_kernel_window_ms": l1["kernel_window_ms"],
                     "L1_kernel_median_us": l1["kernel"]["median_us"],
                     "original_kernel_median_us": l1["original_kernel"]["median_us"],
@@ -261,7 +242,7 @@ def audit(root, cases, original, names, destination, convert):
                     "flavor": case["flavor"],
                     "case": case["case"],
                     "rank": rank,
-                    "L0_device_wall_samples_ms": wall_samples,
+                    "L0_aicore_wall_samples_ms": wall_samples,
                     "levels": levels,
                 }
             )
@@ -271,7 +252,7 @@ def audit(root, cases, original, names, destination, convert):
                 "passed": True,
                 "cases": details,
                 "limits": [
-                    "Kernel window is not whole Device wall time.",
+                    "L0 uses actual AICore kernel endpoints, excluding AICPU startup and teardown.",
                     "L3 phases are producer-defined spans; idle is reported separately, "
                     "not reclassified as dependency wait.",
                     "Original forward and isolated launches can have different cache warmth and worker placement.",

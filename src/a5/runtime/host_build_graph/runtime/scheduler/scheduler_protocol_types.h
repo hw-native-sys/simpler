@@ -188,6 +188,7 @@ enum SchedulerProtocolExecutionFlags : uint32_t {
     SCHEDULER_PROTOCOL_PERMIT_NO_LOG = 1U << 5,
     SCHEDULER_PROTOCOL_PAYLOAD_PUBLISHED = 1U << 6,
     SCHEDULER_PROTOCOL_CLUSTER_GROUP = 1U << 7,
+    SCHEDULER_PROTOCOL_PERMIT_PRECLAIM = 1U << 8,
 };
 
 // One worker owns this record; no global event counter participates in scheduling.

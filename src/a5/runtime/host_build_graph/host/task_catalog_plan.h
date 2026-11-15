@@ -169,6 +169,52 @@ inline bool scheduler_order_task_catalog(
     return scheduler_apply_task_order(std::move(ordered), metadata, plan, error);
 }
 
+// The caller owns an unpublished ordinary image. Preserve every dependency,
+// but let a consumer confirm earlier-ranked predecessors before waiting on later ones.
+template <typename Storage>
+inline bool scheduler_order_ordinary_fanin(
+    Storage *storage, const std::vector<uint32_t> &task_ranks, const std::vector<int64_t> &completed,
+    std::string *error = nullptr
+) {
+    const auto fail = [&](const std::string &message) {
+        if (error != nullptr) *error = message;
+        return false;
+    };
+    const size_t count = task_ranks.size();
+    if (count > INT32_MAX || (count != 0 && storage == nullptr)) return fail("invalid ordinary fanin image");
+    std::vector<bool> active(count, true);
+    for (const int64_t ref : completed) {
+        if (ref < 0 || static_cast<uint64_t>(ref) >= count) return fail("invalid completed fanin task");
+        active[ref] = false;
+    }
+    // Validate all live rows before changing any of them. Completed nodes may
+    // retain stale incoming references, as in task-catalog ordering.
+    for (size_t consumer = 0; consumer < count; ++consumer) {
+        if (!active[consumer]) continue;
+        const auto &payload = storage[consumer].payload;
+        const int32_t edges = payload.fanin_count;
+        const auto *refs = payload.fanin_data();
+        if (task_ranks[consumer] >= count || edges < 0 || edges > SCHEDULER_GRAPH_MAX_FANIN ||
+            (edges != 0 && refs == nullptr))
+            return fail("invalid ordinary fanin row at task " + std::to_string(consumer));
+        for (int32_t edge = 0; edge < edges; ++edge) {
+            const int32_t producer = refs[edge];
+            if (producer < 0 || static_cast<uint64_t>(producer) >= consumer || task_ranks[producer] >= count)
+                return fail("invalid ordinary predecessor at task " + std::to_string(consumer));
+        }
+    }
+    for (size_t consumer = 0; consumer < count; ++consumer) {
+        if (!active[consumer] || storage[consumer].payload.fanin_count < 2) continue;
+        auto &payload = storage[consumer].payload;
+        auto *refs = payload.fanin_data();
+        std::stable_sort(refs, refs + payload.fanin_count, [&](int32_t left, int32_t right) {
+            return task_ranks[left] < task_ranks[right];
+        });
+    }
+    if (error != nullptr) error->clear();
+    return true;
+}
+
 inline bool scheduler_plan_task_catalog(
     const std::vector<SchedulerTaskMetadata> &metadata, uint32_t clusters, uint64_t start_offset,
     SchedulerTaskCatalogPlan *plan

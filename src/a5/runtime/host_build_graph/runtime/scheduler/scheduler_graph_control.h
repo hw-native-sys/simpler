@@ -28,7 +28,6 @@ static inline __aicore__ bool scheduler_service_controls(
     const auto *catalog = scheduler_state_at<SchedulerTaskCatalogHeader>(base, local->config.task_catalog_offset);
     if (catalog->control_count == 0) return true;
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
-    if (scheduler_gm_query(run->bootstrap_scan_complete) == 0) return true;
     for (uint32_t scanned = 0; scanned < SCHEDULER_CONTROL_NODE_BUDGET; ++scanned) {
         const int64_t ref = local->control_peer_cursor++ % graph.task_count;
         const auto &metadata = *scheduler_task_metadata_at(base, local, ref);

@@ -418,14 +418,10 @@ static inline __aicore__ bool scheduler_cluster_mix_try_arm(
     return true;
 }
 
-static inline __aicore__ bool scheduler_cluster_mix_progress_pending(
+static inline __aicore__ __attribute__((noinline)) bool scheduler_cluster_mix_progress_pending_active(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     bool *progress
 ) {
-    SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarClusterMixPending);
-    if (local == nullptr || progress == nullptr) return false;
-    *progress = false;
-    if (!local->is_mix_coordinator() || scheduler_task_ref_is_null(local->cluster_pending.task_ref)) return true;
     auto &pending = local->cluster_pending;
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
     if (!scheduler_group_handle_valid(
@@ -449,6 +445,17 @@ static inline __aicore__ bool scheduler_cluster_mix_progress_pending(
         }
     }
     return true;
+}
+
+static inline __aicore__ bool scheduler_cluster_mix_progress_pending(
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    bool *progress
+) {
+    SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarClusterMixPending);
+    if (local == nullptr || progress == nullptr) return false;
+    *progress = false;
+    if (!local->is_mix_coordinator() || scheduler_task_ref_is_null(local->cluster_pending.task_ref)) return true;
+    return scheduler_cluster_mix_progress_pending_active(graph, base, local, run, progress);
 }
 
 static inline __aicore__ bool scheduler_cluster_mix_retire(
@@ -534,17 +541,10 @@ static inline __aicore__ bool scheduler_cluster_mix_observe(
     return true;
 }
 
-static inline __aicore__ bool scheduler_cluster_mix_service(
+static inline __aicore__ __attribute__((noinline)) bool scheduler_cluster_mix_service_active(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint64_t profiling_level, bool *progress
 ) {
-    SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarClusterMixService);
-    *progress = false;
-    if (local->cluster_signal == nullptr) return true;
-    if (local->cluster_mix.phase == SchedulerGmMixPhase::IDLE &&
-        (!scheduler_cluster_mix_armed(scheduler_cluster_load_acquire(&local->cluster_signal->armed_generation)) ||
-         !scheduler_cluster_names_lane(local->cluster_signal, local->config.self_lane)))
-        return true;
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
     bool advanced = false;
     if (!scheduler_cluster_mix_retire(graph, base, local, run, &advanced)) return false;
@@ -624,6 +624,20 @@ static inline __aicore__ bool scheduler_cluster_mix_service(
     group.phase = SchedulerGmMixPhase::RUNNING;
     *progress = true;
     return true;
+}
+
+static inline __aicore__ bool scheduler_cluster_mix_service(
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    uint64_t profiling_level, bool *progress
+) {
+    SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarClusterMixService);
+    *progress = false;
+    if (local->cluster_signal == nullptr) return true;
+    if (local->cluster_mix.phase == SchedulerGmMixPhase::IDLE &&
+        (!scheduler_cluster_mix_armed(scheduler_cluster_load_acquire(&local->cluster_signal->armed_generation)) ||
+         !scheduler_cluster_names_lane(local->cluster_signal, local->config.self_lane)))
+        return true;
+    return scheduler_cluster_mix_service_active(graph, base, local, run, profiling_level, progress);
 }
 
 static inline __aicore__ bool scheduler_cluster_mix_can_enter(
