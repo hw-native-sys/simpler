@@ -26,7 +26,7 @@ def native_capture(*, deferred_tasks=(), child_mask=2):
         [(2, 1, ()), (0, 1, (0,)), (child_mask, 1, (1,)), (0, 1, (2,)), (0, 1, (3,)), (2, 1, (4,))],
         deferred_tasks=deferred_tasks,
     ).run()
-    raw["schema"] = "hbg-native-protocol-v23"
+    raw["schema"] = "hbg-native-protocol"
     for control in raw["task_controls"]:
         control.update(claim_tickets=0)
     raw["graph_source"] = dict(
@@ -79,8 +79,8 @@ def native_capture(*, deferred_tasks=(), child_mask=2):
             )
         )
         if kind in (2, 3, 4):
-            raw["tasks"][ref].update(flags=2, active_mask=0)
-            next(event for event in raw["task_events"] if event["index"] == ref)["completion"]["flags"] = 2
+            raw["tasks"][ref].update(flags=0, active_mask=0)
+            next(event for event in raw["task_events"] if event["index"] == ref)["completion"]["flags"] = 0
     for identity in identities:
         identity["task_id"] = raw["node_map"][identity["task_id"]]["public_task_id"]
     return raw, identities
@@ -216,11 +216,12 @@ def test_kernel_dependencies_preserve_all_graph_roots_and_sinks():
     }
 
 
-def test_current_native_graph_rejects_independent_flag():
+@pytest.mark.parametrize("flag", (2, 128))
+def test_current_native_graph_rejects_independent_flag(flag):
     raw, identities = native_capture()
     assert audit_native_protocol(raw, identities)["protocol_verified"]
-    raw["tasks"][2]["flags"] |= 128
-    next(event for event in raw["task_events"] if event["index"] == 2)["completion"]["flags"] |= 128
+    raw["tasks"][2]["flags"] |= flag
+    next(event for event in raw["task_events"] if event["index"] == 2)["completion"]["flags"] |= flag
     with pytest.raises(ValueError, match="unknown task flags"):
         audit_native_protocol(raw, identities)
 
@@ -229,7 +230,7 @@ def test_current_native_graph_rejects_independent_flag():
 def test_native_graph_mix_child_preserves_stage_claim_and_enter_exit_causality(mask):
     raw, identities = native_capture(child_mask=mask)
     owner = raw["blocks"][0]["owner"]
-    assert raw["schema"] == "hbg-native-protocol-v23"
+    assert raw["schema"] == "hbg-native-protocol"
     assert owner["task_ref"] == 2
     assert owner["staged"][0] < owner["claim_before"][0] < owner["claim_after"][0] < owner["publish_before"][0]
     result = audit_native_protocol(raw, identities)

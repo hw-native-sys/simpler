@@ -174,5 +174,5 @@ def export_kernel_dependencies(section: dict[str, Any], executed_task_ids: Itera
         tasks=output,
         tensors=[],
         edges=edges,
-        projection=dict(schema="hbg-native-kernel-deps-v1", run_epoch=section["run_epoch"]),
+        projection=dict(schema="hbg-native-kernel-deps", run_epoch=section["run_epoch"]),
     )

@@ -69,8 +69,8 @@ inline __aicore__ bool scheduler_prepared_layout_valid(
         ))
         return false;
     const auto *layout = reinterpret_cast<__gm__ const SchedulerPreparedLayout *>(address + layout_offset);
-    if (layout->version != SCHEDULER_PREPARED_VERSION || layout->task_count != task_count || task_count == 0 ||
-        layout->run_epoch != run_epoch || layout->execution_count == 0 || layout->plans_offset < end ||
+    if (layout->task_count != task_count || task_count == 0 || layout->run_epoch != run_epoch ||
+        layout->execution_count == 0 || layout->plans_offset < end ||
         !scheduler_prepared_region_end(
             bytes, layout->plans_offset, task_count, sizeof(SchedulerExecutionPlan), alignof(SchedulerExecutionPlan),
             &end

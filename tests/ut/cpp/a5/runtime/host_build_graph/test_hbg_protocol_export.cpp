@@ -27,7 +27,7 @@ struct ProtocolExportFixture : ::testing::Test {
     std::unique_ptr<scheduler_test::SchedulerStateBuffer> storage;
     std::vector<SchedulerProtocolTaskSpec> tasks;
     void SetUp() override {
-        ASSERT_TRUE(scheduler_plan_layout(2, 1, 0, &layout, false, 6, {6, 2, 1, 1, 1}, true));
+        ASSERT_TRUE(scheduler_plan_layout(2, &layout, false, 6, {6, 2, 1, 1, 1}, true));
         storage = std::make_unique<scheduler_test::SchedulerStateBuffer>(layout);
         auto *meta = at<SchedulerTaskMetadata>(layout.task_metadata_offset);
         meta[0].active_mask = LaneMask::all();
@@ -54,7 +54,7 @@ struct ProtocolExportFixture : ::testing::Test {
 TEST_F(ProtocolExportFixture, PreservesFrozenGraphAndHostCompletedNodeWithoutFabricatingEvents) {
     at<SchedulerTaskMetadata>(layout.task_metadata_offset)[0].logical_block_num = 99;
     const auto json = dump();
-    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v22\""), std::string::npos);
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol\""), std::string::npos);
     EXPECT_NE(json.find("\"close_seal_stride\":64"), std::string::npos);
     EXPECT_NE(json.find("\"claim_tickets\":0"), std::string::npos);
     EXPECT_EQ(json.find("\"admission_claim_lock\""), std::string::npos);
@@ -75,7 +75,7 @@ TEST_F(ProtocolExportFixture, NativeSchemaCarriesBothIdentitiesAndIndependentSou
     const auto json = scheduler_export_protocol(
         storage->base(), layout.total_size, layout, 0, tasks, "{\"tasks\":[],\"definitions\":[]}"
     );
-    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v23\""), std::string::npos);
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol\""), std::string::npos);
     EXPECT_NE(json.find("\"original_task_id\":7,\"local_child_id\":3"), std::string::npos);
     EXPECT_NE(json.find("\"graph_source\":{\"tasks\":[],\"definitions\":[]}"), std::string::npos);
 }
@@ -203,7 +203,7 @@ TEST_F(ProtocolExportFixture, PreservesMemberCountRecordBindingSealAndRawTopolog
 
 TEST(ProtocolCloseSealExport, ReadsEveryClusterAndTaskValueWithoutInterpretingCellPadding) {
     AicoreSchedulerLayout layout{};
-    ASSERT_TRUE(scheduler_plan_layout(2, 2, 2, &layout, false, 8, {6, 2, 2, 2, 2}, true));
+    ASSERT_TRUE(scheduler_plan_layout(2, &layout, false, 8, {6, 2, 2, 2, 2}, true));
     scheduler_test::SchedulerStateBuffer storage(layout);
     auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(storage.base(), layout.task_metadata_offset);
     scheduler_test::BasicGraphBuffer<2> graph(2);
@@ -287,7 +287,7 @@ TEST(ProtocolGraphSnapshot, DependencyOnlyServiceRetainsRoutingWithoutRequiringA
     graph.payload(1).fanin_count = 1;
     graph.payload(1).fanin_data()[0] = 0;
     std::vector<SchedulerTaskMetadata> metadata(2);
-    metadata[1].flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_INLINE | SCHEDULER_TASK_HAS_FANIN;
+    metadata[1].flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_INLINE;
     metadata[1].active_mask = LaneMask::aiv0();
     metadata[1].logical_block_num = 1;
     for (auto &kernel : metadata[1].kernel_ids)

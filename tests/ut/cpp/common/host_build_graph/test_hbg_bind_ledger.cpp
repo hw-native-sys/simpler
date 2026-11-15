@@ -1438,11 +1438,6 @@ TEST_F(HbgBindLedgerTest, SchedulerModeChangesPublishOnlyThisRunsSources) {
             snapshots.emplace_back(source, source + region.bytes);
         }
         if (a5) {
-            // The bootstrap inputs are host-authored and per run, not per worker:
-            // workers[i].aicpu_ready and .task now carry the AICPU's handshake alone.
-            // Worker i derives its own context from the base, which the AICore does
-            // through scheduler_worker_context_address; that derivation is covered by
-            // test_a5_hbg_scheduler_bootstrap and not re-asserted here.
             const uint32_t mode = runtime.dev.scheduler_bootstrap.runtime_mode;
             const uint64_t base = runtime.dev.scheduler_bootstrap.worker_context_base;
             EXPECT_NE(mode, 0u);
@@ -3040,8 +3035,6 @@ TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpUsesCurrentAicoreNodesAndCharged
             device_context->native_header_offset,
             device_context->scheduler_state_bytes,
             static_cast<uint32_t>(device_context->original_task_count),
-            static_cast<uint16_t>(device_context->graph_view_version),
-            static_cast<uint16_t>(device_context->graph_view_bytes)
         };
         SchedulerGraphAccess graph(view);
         if (entry != scalar_dump_orch_entry)

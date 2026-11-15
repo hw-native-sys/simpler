@@ -104,8 +104,6 @@ struct StartupFixture {
             context.graph_storage_address = graph_view.storage_address;
             context.graph_task_count = graph_view.task_count;
             context.original_task_count = graph_view.original_task_count;
-            context.graph_view_version = graph_view.view_version;
-            context.graph_view_bytes = graph_view.view_bytes;
             context.scheduler_state_bytes = storage.layout.total_size;
             context.task_window_last_index = graph_view.task_window_last_index;
             context.scheduler_state_base_address = reinterpret_cast<uint64_t>(base());
@@ -254,20 +252,14 @@ struct StartupFixture {
 class HbgGmMixStartupExit : public ::testing::TestWithParam<std::array<LaneMask, 2>> {};
 
 TEST(HbgGmMixStartupExit, RejectsMalformedPublishedGraphBeforeBootstrap) {
-    for (uint32_t field = 0; field < 3; ++field) {
-        SCOPED_TRACE(field);
-        StartupFixture fixture({LaneMask::both_aiv(), LaneMask::both_aiv()});
-        auto &context = fixture.storage.contexts[3];
-        if (field == 0) context.graph_view_version = 0;
-        else if (field == 1) context.graph_view_bytes = 32;
-        else context.original_task_count = 0;
-        fixture.run_late_worker();
-        EXPECT_EQ(startup_kernel_calls, 0u);
-        EXPECT_EQ(fixture.storage.run_control->bootstrap_scan_arrived_count, 8u);
-        EXPECT_EQ(
-            fixture.storage.run_control->scheduler_error, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS)
-        );
-    }
+    StartupFixture fixture({LaneMask::both_aiv(), LaneMask::both_aiv()});
+    fixture.storage.contexts[3].original_task_count = 0;
+    fixture.run_late_worker();
+    EXPECT_EQ(startup_kernel_calls, 0u);
+    EXPECT_EQ(fixture.storage.run_control->bootstrap_scan_arrived_count, 8u);
+    EXPECT_EQ(
+        fixture.storage.run_control->scheduler_error, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS)
+    );
 }
 
 TEST_P(HbgGmMixStartupExit, LateZeroWorkCoordinatorClosesEveryAdmittedMixBeforeExitAck) {
@@ -619,7 +611,6 @@ TEST_P(HbgIdleDispatchArrival, EmptyPollsObserveNewWorkAndTerminationWithoutSpur
     storage.metadata[1].flags = 0;
     graph.executable(2, worker == 0 ? 0 : 1, {0});
     auto &metadata = storage.metadata[2];
-    metadata.flags |= SCHEDULER_TASK_HAS_FANIN;
     metadata.active_mask = worker == 0 ? LaneMask::aic() : LaneMask::aiv0();
     metadata.kernel_ids[0] = worker == 0 ? 1 : UINT16_MAX;
     metadata.kernel_ids[1] = worker == 0 ? UINT16_MAX : 1;
@@ -629,13 +620,11 @@ TEST_P(HbgIdleDispatchArrival, EmptyPollsObserveNewWorkAndTerminationWithoutSpur
         graph.executable(3, 1, {1});
         storage.metadata[3].active_mask = LaneMask::aiv0();
         storage.metadata[3].logical_block_num = 2;
-        storage.metadata[3].flags =
-            SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD | SCHEDULER_TASK_SYNC_START | SCHEDULER_TASK_HAS_FANIN;
+        storage.metadata[3].flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD | SCHEDULER_TASK_SYNC_START;
         storage.metadata[3].kernel_ids[0] = storage.metadata[3].kernel_ids[2] = UINT16_MAX;
         storage.metadata[3].kernel_ids[1] = 1;
     } else {
         graph.executable(3, 0, {1});
-        storage.metadata[3].flags |= SCHEDULER_TASK_HAS_FANIN;
     }
     storage.prepare_catalog();
     auto *base = storage.scheduler_state->base();
@@ -720,7 +709,6 @@ TEST(HbgProtocolExecution, ConsumerDiscoveryKeepsTheCompletedGenerationSeparateF
     scheduler_test::BasicGraphBuffer<2> graph(2);
     graph.executable(0, 0);
     graph.executable(1, 0, {0});
-    storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
     storage.prepare_catalog();
     auto *base = storage.scheduler_state->base();
     ASSERT_TRUE(scheduler_init_spmd_task_records(base, storage.layout, 73));

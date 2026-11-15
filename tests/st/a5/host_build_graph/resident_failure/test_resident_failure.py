@@ -29,7 +29,7 @@ from simpler.worker import Worker
 
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.scene_test import _pto_isa_compile_cache_token, compile_chip_callable_spec
-from simpler_setup.tools.hbg.native_protocol import has_native_graph, protocol_version
+from simpler_setup.tools.hbg.native_protocol import has_native_graph
 from simpler_setup.tools.swimlane_converter import read_perf_data
 
 _ROOT = Path(__file__).resolve().parents[5]
@@ -228,7 +228,7 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
     assert controls[root["task_ref"]]["completed_subtasks"] < total_subtasks
     assert controls[consumer["task_ref"]]["completed_subtasks"] == 0
     positions = protocol["cluster_count"] * (2 if mask in (2, 4) else 1)
-    assert protocol_version(protocol)
+    assert protocol.get("schema") == "hbg-native-protocol"
     assert type(protocol.get("close_seal_stride")) is int and protocol["close_seal_stride"] == 64
     for task in protocol["tasks"]:
         control = controls[task["task_ref"]]
@@ -358,7 +358,7 @@ def _root_block_num(protocol):
 def _check_two_wave_topology(protocol, blocks, mask, required):
     if not required:
         return
-    assert protocol_version(protocol)
+    assert protocol.get("schema") == "hbg-native-protocol"
     positions = protocol["cluster_count"] * _lane_positions_per_cluster(mask)
     assert blocks == positions * 2, "two-wave fault must use the actual device topology"
 
@@ -642,7 +642,7 @@ def _run_pass(  # noqa: PLR0912 -- one Worker owns healthy, failed, and cleanup 
             assert worker.scheduler_runtime_mode in (1, 2)
             path, raw = _capture(prefix)
             proof_call.update(capture=str(path), capture_run_epoch=raw["aicore_protocol"]["run_epoch"])
-            assert protocol_version(raw["aicore_protocol"])
+            assert raw["aicore_protocol"].get("schema") == "hbg-native-protocol"
             assert has_native_graph(raw["aicore_protocol"]) == native_graph
             launched = _root_block_num(raw["aicore_protocol"])
             assert blocks < 0 or launched == blocks

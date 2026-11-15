@@ -261,7 +261,7 @@ TEST(PercounterPayload, PreparationBindsCurrentImageWithoutReplacingContextPoint
     EXPECT_EQ(payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX], global);
     EXPECT_EQ(payload.local_context.block_idx, 3);
     EXPECT_EQ(payload.local_context.block_num, 5);
-    task.graph.view_version = 0;
+    task.graph.storage_address = 0;
     EXPECT_FALSE(percounter_prepare_subtask(f.cfg[0], task, 0, 1, 0, 1, &payload));
     task = f.resolve(0);
     f.storage[0].payload.scalar_count = 1;

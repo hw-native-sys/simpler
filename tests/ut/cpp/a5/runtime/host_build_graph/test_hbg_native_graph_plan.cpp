@@ -373,7 +373,7 @@ struct NativeViewFixture {
                         plan.definitions[instance.definition_index].children[binding.source_index].metadata;
                 } else if (scheduler_node_is_control(binding.kind)) {
                     task_metadata[ref].logical_block_num = 1;
-                    task_metadata[ref].flags = SCHEDULER_TASK_HAS_FANIN;
+                    task_metadata[ref].flags = 0;
                 }
             }
             SchedulerSpmdRequirements requirements{workers, workers / 3, 0, 0};
@@ -392,7 +392,7 @@ struct NativeViewFixture {
                 }
             }
             if (!scheduler_plan_layout(
-                    plan.bindings.size(), 0, 0, &layout, false, trace_count, requirements, false, false,
+                    plan.bindings.size(), &layout, false, trace_count, requirements, false, false,
                     readonly_image.bytes.size()
                 ))
                 throw std::runtime_error("scheduler layout");
@@ -1402,8 +1402,6 @@ TEST(HbgNativeGraphPlan, ReadonlyTopologySizeDoesNotDependOnRecordedArgumentPool
     EXPECT_EQ(scheduler_node_fanin_count(argument_view.graph, 1, &count), SchedulerGraphResult::OK);
     EXPECT_EQ(count, 1u);
     EXPECT_TRUE(scheduler_graph_view_valid(argument_view.graph));
-    argument_view.header().version = 4;
-    EXPECT_FALSE(scheduler_graph_view_valid(argument_view.graph));
 }
 
 TEST(HbgNativeGraphPlan, HostBindingRejectsArgumentSpansBeforeWritingScratch) {

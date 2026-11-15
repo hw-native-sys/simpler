@@ -170,7 +170,6 @@ struct SchedulerScalarTrace {
         buffer->scalar_poll_loops = poll_loops;
         buffer->scalar_short_intervals = short_intervals;
         buffer->scalar_function_min_cycles = function_min_cycles;
-        buffer->scalar_storage_format = 1;
         buffer->scalar_storage_slots = storage_slots;
         auto *header = reinterpret_cast<__gm__ uint8_t *>(&buffer->scalar_committed);
         const uint64_t bytes = sizeof(SchedulerActivityBuffer) - offsetof(SchedulerActivityBuffer, scalar_committed);

@@ -37,7 +37,7 @@ struct OwnershipFixture {
         layout.task_count = 1;
         layout.prepared_layout_offset = 64;
         prepared = scheduler_state_at<SchedulerPreparedLayout>(base(), layout.prepared_layout_offset);
-        *prepared = {17, 1, 1, 128, 256, 512, 384, SCHEDULER_PREPARED_VERSION};
+        *prepared = {17, 1, 1, 128, 256, 512, 384};
         *scheduler_state_at<SchedulerExecutionPlan>(base(), prepared->plans_offset) = {0, 1, 1, 1, 1};
         const uint64_t functions[3]{1, 0, 0};
         EXPECT_TRUE(scheduler_prepare_host_calls(

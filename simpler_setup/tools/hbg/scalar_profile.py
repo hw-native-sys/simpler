@@ -166,7 +166,7 @@ def _nest_intervals(nodes, filtered):
 def partition(records, kernels, *, nested_kernels=False):
     """Return a nested view and an exact, non-overlapping partition of its window."""
     roots = [r for r in records if r["kind"] == "scalar_window"]
-    if len(roots) != 1 or roots[0].get("scalar_schema") != 2:
+    if len(roots) != 1:
         raise ValueError("Expected one supported Scalar window per worker/run")
     root = roots[0]
     minimum = root.get("function_min_cycles", 0)

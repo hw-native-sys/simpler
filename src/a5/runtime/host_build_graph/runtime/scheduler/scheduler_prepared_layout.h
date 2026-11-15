@@ -19,8 +19,6 @@
 
 inline constexpr uint64_t SCHEDULER_PREPARED_ALIGNMENT = 128;
 
-inline constexpr uint64_t SCHEDULER_PREPARED_VERSION = 4;
-
 enum class SchedulerPreparedPhase : uint8_t {
     INVALID,
     BUILT,
@@ -101,7 +99,6 @@ struct alignas(64) SchedulerPreparedLayout {
     uint64_t controls_offset;
     uint64_t calls_offset;
     uint64_t bindings_offset;
-    uint64_t version{SCHEDULER_PREPARED_VERSION};
 };
 
 static_assert(sizeof(SchedulerExecutionPlan) == 16);

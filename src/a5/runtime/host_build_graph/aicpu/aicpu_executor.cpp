@@ -107,9 +107,9 @@ static void log_resident_task_catalog(void *base, const SchedulerWorkerContext &
     const auto pool = *shared_pool;
     const uint64_t limit = pool.storage_end_offset;
     const uint64_t descriptor_bytes = SCHEDULER_EXECUTION_ENGINE_COUNT * sizeof(SchedulerTaskCatalogDescriptor);
-    if (pool.version != SCHEDULER_TASK_CATALOG_VERSION || pool.task_count != context.graph_task_count ||
-        pool.entry_count > pool.task_count || pool.control_count > pool.task_count - pool.entry_count ||
-        limit > state_bytes || pool.descriptors_offset < pool_offset + sizeof(pool) ||
+    if (pool.task_count != context.graph_task_count || pool.entry_count > pool.task_count ||
+        pool.control_count > pool.task_count - pool.entry_count || limit > state_bytes ||
+        pool.descriptors_offset < pool_offset + sizeof(pool) ||
         !range_valid(
             pool.descriptors_offset, SCHEDULER_EXECUTION_ENGINE_COUNT, sizeof(SchedulerTaskCatalogDescriptor),
             SCHEDULER_STATE_ALIGNMENT, limit

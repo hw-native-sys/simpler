@@ -13,7 +13,6 @@ Sequence integrity proves lossless local event streams, not scheduler causality,
 execution coverage, membership, dependency ordering or Mix resource correctness.
 """
 
-SCHEMAS = ("hbg-native-protocol-v22", "hbg-native-protocol-v23")
 COMPLETION_FROM_CONTRIBUTION = 1 << 30
 DEFERRED_FINISH = 1 << 31
 
@@ -88,14 +87,9 @@ ARRAYS = {
 SIGNED_FIELDS = frozenset(("task_ref", "core_id", "core_type", "state"))
 
 
-def protocol_version(section):
-    schema = section.get("schema") if isinstance(section, dict) else None
-    return int(schema.rsplit("v", 1)[-1]) if schema in SCHEMAS else 0
-
-
 def has_native_graph(section):
-    """The native Graph schema includes independent source and node maps."""
-    return isinstance(section, dict) and section.get("schema") == "hbg-native-protocol-v23"
+    """Native Graph evidence includes independent source and node maps."""
+    return isinstance(section, dict) and ("graph_source" in section or "node_map" in section)
 
 
 def _error(message):
@@ -154,7 +148,7 @@ def _indices(rows, count, path, *, key="index", dense=False):
 
 def read_native_protocol(section):
     """Validate the wire schema; preserve incomplete/error records for diagnosis."""
-    if not protocol_version(section):
+    if not isinstance(section, dict) or section.get("schema") != "hbg-native-protocol":
         _error("unsupported schema")
     native = has_native_graph(section)
     root_numbers = ROOT_NUMBERS
@@ -165,7 +159,7 @@ def read_native_protocol(section):
     for field in root_numbers:
         _number(section[field], field)
     if section["close_seal_stride"] != 64:
-        _error("close_seal_stride disagrees with the schema version")
+        _error("close_seal_stride disagrees with the close-seal layout")
     error_numbers = ERROR_NUMBERS
     _object(section["first_error"], error_numbers, "first_error")
     for field in error_numbers:

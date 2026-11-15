@@ -307,7 +307,6 @@ TEST(HbgAdmissionBootstrap, ReadyOwnerCanCommitInitializedRecordAfterScanGate) {
 TEST(HbgAdmissionBootstrap, InitializedConsumerStillWaitsForItsProducer) {
     AdmissionFixture fixture({{1, LaneMask::aic()}, {2, LaneMask::aic()}});
     fixture.graph.executable(1, 0, {0});
-    fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
     fixture.record(1)->flags = fixture.storage.metadata[1].flags;
     ASSERT_TRUE(scheduler_bootstrap_prepare_admission(
         fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), &fixture.admissions[0], 1
@@ -702,7 +701,6 @@ TEST(HbgAdmission, PublishedTailCannotHideAnInvalidPhaseForMembersOrNonmembers) 
 TEST(HbgAdmission, ReadyTaskBMayCommitBeforeTaskAWhoseDependencyIsNotReady) {
     AdmissionFixture fixture({{1, LaneMask::aic()}, {3, LaneMask::aic()}, {2, LaneMask::aic()}}, 9);
     fixture.graph.executable(1, 0, {0});
-    fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
     ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 17));
     ASSERT_TRUE(fixture.bootstrap());
     SchedulerReadyClaim blocked{};

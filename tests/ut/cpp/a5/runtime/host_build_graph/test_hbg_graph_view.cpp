@@ -17,14 +17,6 @@
 
 namespace {
 
-SchedulerGraphView current_view(const scheduler_test::BasicGraphBuffer<8> &buffer) {
-    auto view = buffer.graph();
-    view.original_task_count = static_cast<uint32_t>(view.task_count);
-    view.view_version = SCHEDULER_GRAPH_VIEW_VERSION;
-    view.view_bytes = sizeof(SchedulerGraphView);
-    return view;
-}
-
 TEST(AicoreGraphView, OrdinaryNodesKeepTheirOriginalDependencyReferences) {
     scheduler_test::BasicGraphBuffer<8> buffer(5);
     buffer.executable(0, 0);
@@ -32,7 +24,7 @@ TEST(AicoreGraphView, OrdinaryNodesKeepTheirOriginalDependencyReferences) {
     buffer.executable(2, 0, {0, 1});
     buffer.executable(3, 1, {2});
     buffer.executable(4, 0, {0, 2, 3});
-    auto graph = current_view(buffer);
+    auto graph = buffer.graph();
     ASSERT_TRUE(scheduler_graph_view_valid(graph));
     EXPECT_EQ(graph.native_header_offset, 0u);
     uint32_t count = UINT32_MAX;
@@ -54,18 +46,10 @@ TEST(AicoreGraphView, OrdinaryNodesKeepTheirOriginalDependencyReferences) {
     EXPECT_EQ(count, 0u);
 }
 
-TEST(AicoreGraphView, RejectsAnUnversionedOrMalformedViewBeforeReadingStorage) {
+TEST(AicoreGraphView, RejectsMalformedViewBeforeReadingStorage) {
     scheduler_test::BasicGraphBuffer<8> buffer(2);
-    auto graph = current_view(buffer);
+    auto graph = buffer.graph();
     ASSERT_TRUE(scheduler_graph_view_valid(graph));
-    graph.view_version = 0;
-    EXPECT_FALSE(scheduler_graph_view_valid(graph));
-    uint32_t count = 0;
-    EXPECT_EQ(scheduler_node_fanin_count(graph, 0, &count), SchedulerGraphResult::INVALID_ARGUMENTS);
-    graph.view_version = SCHEDULER_GRAPH_VIEW_VERSION;
-    graph.view_bytes = 32;
-    EXPECT_FALSE(scheduler_graph_view_valid(graph));
-    graph.view_bytes = sizeof(SchedulerGraphView);
     graph.original_task_count = 1;
     EXPECT_FALSE(scheduler_graph_view_valid(graph));
     graph.original_task_count = 2;
@@ -77,7 +61,7 @@ TEST(AicoreGraphView, RejectsReferencesAndRowsOutsideTheOrdinaryGraph) {
     scheduler_test::BasicGraphBuffer<8> buffer(2);
     buffer.executable(0, 0);
     buffer.executable(1, 1, {0});
-    const auto graph = current_view(buffer);
+    const auto graph = buffer.graph();
     uint32_t count = 0;
     int64_t producer = -1;
     EXPECT_EQ(scheduler_node_fanin_count(graph, -1, &count), SchedulerGraphResult::INVALID_TASK_COUNT);
@@ -99,7 +83,7 @@ TEST(AicoreGraphView, RejectsReferencesAndRowsOutsideTheOrdinaryGraph) {
 
 TEST(AicoreGraphView, HeaderOffsetCannotAuthorizeItsOwnRead) {
     scheduler_test::BasicGraphBuffer<8> buffer(2);
-    auto graph = current_view(buffer);
+    auto graph = buffer.graph();
     graph.scheduler_state_address = 1;
     graph.scheduler_state_bytes = 128;
     graph.native_header_offset = UINT64_MAX - 63;

@@ -81,7 +81,6 @@ def _capture():
         start=1,
         end=802,
         metrics={
-            "scalar_schema": 2,
             "scalar_depth": 0,
             "scalar_calls": 1,
             "function_min_cycles": 0,
@@ -127,7 +126,6 @@ def test_smoke_accepts_execution_token_acquisition_and_dispatch(validate_capture
         "producer",
         "timing",
         "missing_scalar_window",
-        "scalar_schema",
         "removed_worksteal",
         "removed_refill",
         "removed_resolve",
@@ -156,12 +154,9 @@ def test_smoke_rejects_incomplete_or_inconsistent_launch_evidence(validate_captu
     elif corruption == "missing_scalar_window":
         records[:] = [record for record in records if record["kind"] != "scalar_window"]
         stream["metrics"] = []
-    elif corruption == "scalar_schema":
-        stream["metrics"][0]["scalar_schema"] = 1
     elif corruption.startswith("removed_"):
         launch["kind"] = corruption.removeprefix("removed_")
     else:
         launch["start_cycles"] -= 2
-    error = ValueError if corruption == "scalar_schema" else AssertionError
-    with pytest.raises(error):
+    with pytest.raises(AssertionError):
         validate_capture(raw)

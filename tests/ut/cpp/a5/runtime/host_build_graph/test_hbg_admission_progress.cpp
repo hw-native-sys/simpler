@@ -54,7 +54,6 @@ TEST(HbgAdmissionProgress, DeferredPredecessorLeavesIndependentCounterPublisherR
         // beyond a full candidate window in the immutable AIV catalog.
         for (uint32_t task = 1; task <= successor_count; ++task) {
             fixture.graph.executable(task, 1, {0});
-            fixture.storage.metadata[task].flags |= SCHEDULER_TASK_HAS_FANIN;
         }
         ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
         ASSERT_TRUE(fixture.bootstrap_admission());

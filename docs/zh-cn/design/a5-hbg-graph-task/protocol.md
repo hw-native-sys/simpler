@@ -71,7 +71,7 @@ trace 和 MIX/group retirement 仍由拥有者完成后，slot 才可复用。
 核内 staged trace 为三个时间戳、共 24 B。没有 completion inbox ID、旧 refill 或未写入的 resolver timing 行。
 有效计时行写回并完成 barrier 后才原子发布 valid；atomic valid 所在行不能被后续 cached 整行回写。
 
-L4 因果诊断采用普通图 v22、native Graph v23。两者仅在独立的 graph source/node map 上有区别；
+L4 因果诊断统一采用 `hbg-native-protocol`，不按版本号分流。native Graph 额外携带独立的 graph source/node map；
 共同记录 worker 身份、真实贡献、Call publication、最终 permit 和 trace retirement。
 ready_source 只接受目录发现 0 和 cooperative/group 3，不接受已无生产者的 direct-resolve/refill 事实。
 解析器只接受当前格式；历史 JSON 不能用默认值伪装成一份当前协议证明。

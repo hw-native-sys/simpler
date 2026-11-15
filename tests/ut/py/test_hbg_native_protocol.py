@@ -18,7 +18,7 @@ from simpler_setup.tools.hbg.native_protocol import audit_protocol_sequences, re
 
 def capture(epoch=0):
     return {
-        "schema": "hbg-native-protocol-v22",
+        "schema": "hbg-native-protocol",
         "producer": "aicore",
         "run_epoch": epoch,
         "task_count": 1,
@@ -118,7 +118,7 @@ def test_literal_epochs_and_cycle_zero_survive_without_claiming_causality(epoch)
 @pytest.mark.parametrize("stride", (None, 0, 8, 63, 65, 128, True, 64.0, "64", -1, 1 << 64))
 def test_compact_schema_requires_64_byte_seals_and_omits_unused_execution_counter(stride):
     raw = capture()
-    raw.update(schema="hbg-native-protocol-v22", close_seal_stride=64)
+    raw.update(schema="hbg-native-protocol", close_seal_stride=64)
     raw["task_controls"][0].update(claim_tickets=0, claim_seal=0)
     assert read_native_protocol(raw) == raw
     raw["executed_task_count"] = 0
@@ -145,8 +145,6 @@ def test_every_root_field_is_required(field):
     "field,value",
     [
         ("schema", "future-v2"),
-        ("schema", "hbg-native-protocol-v12"),
-        ("schema", "hbg-native-protocol-v13"),
         ("producer", "aicpu"),
         ("worker_count", True),
         ("run_epoch", -1),
@@ -237,14 +235,6 @@ def test_parser_preserves_error_and_incomplete_evidence_for_diagnostics():
         audit_protocol_sequences(raw)
 
 
-@pytest.mark.parametrize("version", (*range(1, 22), 24, 25))
-def test_noncurrent_protocol_versions_are_rejected(version):
-    raw = capture()
-    raw["schema"] = f"hbg-native-protocol-v{version}"
-    with pytest.raises(ValueError, match="unsupported schema"):
-        read_native_protocol(raw)
-
-
 @pytest.mark.parametrize(
     "field", ("claim_tickets", "claim_seal", "parked_count", "canonical_total", "pending_compute", "completion_debt")
 )
@@ -256,14 +246,6 @@ def test_current_control_words_are_mandatory_uint64(field, value):
     else:
         raw["task_controls"][0][field] = value
     with pytest.raises(ValueError, match="fields|integer"):
-        read_native_protocol(raw)
-
-
-@pytest.mark.parametrize("version", (20, 21))
-def test_removed_protocol_layouts_are_rejected(version):
-    raw = capture()
-    raw["schema"] = f"hbg-native-protocol-v{version}"
-    with pytest.raises(ValueError, match="unsupported schema"):
         read_native_protocol(raw)
 
 

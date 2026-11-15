@@ -34,10 +34,8 @@ protected:
         GmMixFixture fixture(shapes, protocol, 1);
         const uint8_t first = mask.has_aic() ? 0 : 1;
         fixture.graph.executable(1, first, {0});
-        fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
         if (scenario == HandoffScenario::TWO_SUCCESSORS) {
             fixture.graph.executable(2, first, {0});
-            fixture.storage.metadata[2].flags |= SCHEDULER_TASK_HAS_FANIN;
         }
         ASSERT_TRUE(fixture.bootstrap_admission());
         ASSERT_TRUE(fixture.claim_ordinary(0, producer_lane));
@@ -144,7 +142,6 @@ TEST(HbgDirectAdmissionRetry, SyncSuccessorsRemainDiscoverableBehindAnExistingPe
         SCOPED_TRACE(lane_names(child_mask));
         GmMixFixture fixture({{2, LaneMask::aic(), true}, {2, child_mask, true}, {2, LaneMask::aic(), true}}, false, 2);
         fixture.graph.executable(1, 1, {0});
-        fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
         const std::vector<SchedulerTaskMetadata> metadata(
             fixture.storage.metadata, fixture.storage.metadata + fixture.storage.layout.task_count
         );

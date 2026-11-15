@@ -253,7 +253,6 @@ TEST(HbgErrorIdentity, PurePreparationFailureNamesTheExactFillingBlockAmongTwoOw
     auto &metadata = fixture.storage.metadata[0];
     metadata.active_mask = LaneMask::aiv0();
     metadata.flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD;
-    metadata.kernel_ids[0] = UINT16_MAX;
     admission.current_active_mask = metadata.active_mask;
     admission.current_flags = metadata.flags;
     for (uint32_t slot = 0; slot < 2; ++slot) {
@@ -262,7 +261,6 @@ TEST(HbgErrorIdentity, PurePreparationFailureNamesTheExactFillingBlockAmongTwoOw
         local->slots[slot].block_idx = slot + 1;
         local->slots[slot].state = slot == 0 ? SchedulerDispatchSlotState::READY : SchedulerDispatchSlotState::FILLING;
     }
-    fixture.storage.callable_addresses[1] = 0;
     SchedulerReadyClaim ready{};
     ready.task_ref = 0;
     EXPECT_EQ(
@@ -271,7 +269,7 @@ TEST(HbgErrorIdentity, PurePreparationFailureNamesTheExactFillingBlockAmongTwoOw
         ),
         PreparedAccessResult::ERROR
     );
-    EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_CALLABLE));
+    EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED));
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, 0, 2, UINT64_MAX, 1, 1}));
 }
 
@@ -405,8 +403,6 @@ TEST(HbgErrorIdentity, OrdinarySingleBlockPreparationHasKnownBlockWithoutClaimin
     metadata.active_mask = LaneMask::aiv0();
     metadata.logical_block_num = 1;
     metadata.flags = SCHEDULER_TASK_EXECUTABLE;
-    metadata.kernel_ids[0] = UINT16_MAX;
-    fixture.storage.callable_addresses[1] = 0;
     SchedulerReadyClaim ready{};
     ready.task_ref = 0;
     EXPECT_EQ(

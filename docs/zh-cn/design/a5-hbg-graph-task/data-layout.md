@@ -41,8 +41,10 @@ Percounter 的活跃 Graph materializer 由其 runtime include 路径选择自�
 
 ## Resident backing 与缓存所有权
 
-`SchedulerGraphView` 为 56 B，version 6；字段为六个 uint64_t 地址/数量/extent、
-uint32_t original_task_count 和两个 uint16_t view_version/view_bytes。
+`SchedulerGraphView` 为 56 B；字段为六个 uint64_t 地址/数量/extent 和
+uint32_t original_task_count。GraphView、native header、task catalog 和 prepared layout
+均不带内部版本字段；Host、AICPU 和 AICore 使用同一份结构定义。入口按实际数量、
+区段边界、对齐和 run epoch 校验，不按内部版本号分流。
 无 Graph 时 native_header_offset 为零；有 Graph 时所有 expanded node 都经 binding 访问。
 原始数量还受 TaskId parent 编码容量限制，不能仅检查 uint32_t 是否容纳。
 
@@ -66,8 +68,8 @@ completion_state 编码 total/remaining_compute/debt；具体有效性和 DONE �
 
 WorkerContext 首行是 core_type/physical_core_id/type_rank、run_control/task_controls/state base/
 prepared layout、worker_index/worker_contexts_offset；第二行保存完整 graph view 和 summary offset。
-第三行从 128 开始保存 metadata、callable 表、runtime_worker_count，以及从 160 开始的 cluster 信息。
-trace/activity/PMU offsets 分别位于 208/216/224，args_dump_address 位于 232。
+metadata offset 位于 120，runtime_worker_count 位于 128，cluster 信息从 136 开始。
+trace/activity/PMU offsets 分别位于 184/192/200，args_dump_address 位于 208。
 最后一行从 256 开始，保存 bootstrap 统计。
 所有核都自行调度，结构中没有另一个 scheduler 角色、索引或数量。
 
@@ -80,7 +82,7 @@ backing 基址满足 128 B 对齐。标量缓存维护仍按 64 B 行，不能�
 
 ## Native Graph 与实例参数
 
-`SchedulerNativeGraphHeader` 为 128 B、version 5。magic/version 为两个 uint32_t，
+`SchedulerNativeGraphHeader` 为 128 B，以 uint32_t magic 标识结构种类，
 随后依次是 image_bytes、node_count、original_task_count、definition_count、instance_count、
 bindings_offset、completion_refs_offset、templates_offset、instances_offset、readonly_end_offset、run_epoch，
 最后是 uint32_t header_bytes。没有 control inbox 区。
@@ -102,7 +104,7 @@ boundary 参数、heap_base 和完整 Graph 由 Host 绑定器持有；设备不
 
 共享录制结构的类型名是 `Graph`，头文件为 `host_build_graph/graph.h`；
 外层 framing 为 `GraphImageHeader`，按值解码结果为 `GraphImageValue`，没有旧类型 alias 或转发头。
-共享录制格式的字段与布局保持；A5 native 镜像只接受 v5，旧 native 布局直接拒绝。
+共享录制格式的字段与布局保持；native 镜像的结构种类、大小和实际区段边界在入口统一校验。
 
 | 节点 | fanin 视图 |
 | ---- | ---------- |
