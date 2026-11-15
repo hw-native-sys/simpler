@@ -408,25 +408,28 @@ Tensor arguments are GM descriptor addresses; scalar arguments are value bits.
 LocalContext and GlobalContext on separate cache lines. Calls and bindings have
 execution lifetime, independently of the worker's two private dispatch slots.
 
-Each execution has a 128-byte atomic-control sector. Phase, owner and transfer
+Each execution has a 128-byte atomic-control sector. Phase, owner and claim
 generation share one atomic state word. Fresh Calls start BUILT. A successful
 block ticket and BUILT-to-CLAIMED CAS grant one worker the execution token;
 Call acquisition observes and validates the immutable Call and binding. The
 claim alone grants no permission to consume business input data.
 
-Each worker rotates through its immutable engine catalog. The two catalogs
-classify AIC/MIX and AIV tasks; neither has a dynamic enqueue, shared head or
-FIFO contract between independent tasks. Cooperative discovery and obligations
-share the loop with ordinary token discovery.
+The Host orders tasks by Kahn generation, descending bottom level, then stable
+node identity. The AIC/MIX and AIV catalogs project that order into two shared
+issuance heads. A head advances after every block has an owner; cooperative
+work also requires its member claim seal. Cross-engine issuance predecessors
+must have supplied their blocks before the consumer can claim space. Data
+completion dependencies still gate execution independently of issuance order.
 
 A core has four execution-token positions and two 40-byte dispatch slots.
 A token may remain WAIT_FANIN while caching a confirmed positive producer prefix.
-It owns a concrete execution but occupies no business slot. When the token
-window is full, discovery can find a runnable replacement and publish a blocked
-token through PARKING to PARKED before releasing its local position. Other
-workers recover PARKED executions through bounded probes and periodic sweeps.
-The parked-count hint cannot suppress the authoritative sweep. Owner and
-generation changes always use atomic compare/exchange.
+It owns a concrete execution but occupies no business slot. Each core owns at
+most one ordinary block of the same task. A full token window retains all four
+responsibilities and revisits their dependencies; no other core can reclaim a
+blocked execution. Ownership remains fixed through return or explicit failure.
+An unmet deferred completion condition is separate from these tokens: the
+kernel returns and frees its dispatch slot while CHECK revisits the condition
+in the shared async directory.
 
 After fanin completes, a token transfers into a FREE slot as READY. Graph
 argument descriptors are observed, and predicates are evaluated under their
@@ -473,7 +476,7 @@ have their own ownership requirements.
 
 On an error, a worker cancels only its provably owned unstarted handles to FAILED;
 it cannot invent a RETURNED Call, computation contribution or group-finished ACK.
-PARKED/shared armed work is revoked by the failed run's all-core retirement fence
+Shared armed work is revoked by the failed run's all-core retirement fence
 before a later epoch initializes reused storage. AICPU sends EXIT, requires the
 current ACK nonce, closes/readbacks register windows, and publishes
 `post_close_release`. Only then may worker entry points return. Logical DONE or

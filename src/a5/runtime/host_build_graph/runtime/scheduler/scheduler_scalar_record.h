@@ -19,9 +19,7 @@
 #include "aicpu/device_time.h"
 #endif
 
-static_assert(
-    static_cast<uint32_t>(SchedPhaseKind::ScalarClusterMixReadyReplacement) < SCHEDULER_SCALAR_STORAGE_EXTENDED
-);
+static_assert(static_cast<uint32_t>(SchedPhaseKind::ScalarTaskSupplyClosed) < SCHEDULER_SCALAR_STORAGE_EXTENDED);
 
 inline __aicore__ uint64_t scheduler_scalar_clock() {
 #if defined(__CCE_AICORE__)

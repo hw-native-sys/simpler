@@ -85,7 +85,6 @@ class ProtocolBuilder:
                     admission_state=0,
                     claim_tickets=0,
                     claim_seal=0,
-                    parked_count=0,
                 )
             )
             raw["inline_completed_count" if mask is None else "resolved_task_count"] += 1

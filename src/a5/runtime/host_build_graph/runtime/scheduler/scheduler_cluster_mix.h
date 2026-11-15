@@ -12,6 +12,7 @@
 #pragma once
 
 #include "scheduler_admission.h"
+#include "scheduler_issue.h"
 
 inline __aicore__ bool scheduler_cluster_mix_armed(uint32_t generation) { return (generation & 1U) != 0; }
 
@@ -201,8 +202,6 @@ inline __aicore__ bool scheduler_cluster_mix_conflicts(
     return false;
 }
 
-inline constexpr uint32_t SCHEDULER_CLUSTER_PENDING_BUDGET = 4;
-
 static inline __aicore__ bool scheduler_cluster_mix_publish_preparation(SchedulerLocalState *local, LaneMask mask) {
     SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarClusterMixPublishPreparation);
     auto *signal = local->cluster_signal;
@@ -219,9 +218,11 @@ static inline __aicore__ bool scheduler_cluster_mix_publish_preparation(Schedule
     return true;
 }
 
-static inline __aicore__ bool scheduler_cluster_mix_discover_task(
+// The caller supplies a validated issuance head. A concurrent head advance
+// exhausts this task's tickets; the block claim still bounds every reservation.
+static inline __aicore__ bool scheduler_cluster_mix_claim_head(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    int64_t task_ref, uint64_t directory_round, bool *progress
+    int64_t task_ref, bool *progress, SchedulerIssueSnapshot *snapshot = nullptr
 ) {
     SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarClusterMixDiscoverTask, task_ref);
     if (local == nullptr || progress == nullptr) return false;
@@ -249,102 +250,52 @@ static inline __aicore__ bool scheduler_cluster_mix_discover_task(
         return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
     const uint32_t blocks = metadata.logical_block_num;
     auto *control = scheduler_task_control_at(base, local, task_ref);
-    const auto probes = scheduler_parked_probe_plan(
-        local->worker_id(), directory_round, blocks, scheduler_gm_query(control->parked_count) != 0
-    );
-    for (uint32_t probe = 0; probe < probes.count; ++probe) {
-        const uint32_t block = probes.blocks[probe];
-        uint64_t index = UINT64_MAX;
-        uint8_t anchor_lane = UINT8_MAX;
-        if (!scheduler_group_anchor_index(base, local->config.prepared, task_ref, block, &index, &anchor_lane))
-            return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
-        const uint64_t observed = scheduler_gm_fetch_add(
-            scheduler_prepared_control_at(base, local->config.prepared, index)->state, UINT64_C(0)
-        );
-        if (scheduler_prepared_phase(observed) == SchedulerPreparedPhase::PARKED) {
-            const auto result = scheduler_resume_group_execution(
-                base, local->config.prepared, local->worker_id(), task_ref, block, observed, &pending.anchor,
-                control->parked_count
-            );
-            if (result == PreparedAccessResult::ERROR)
-                return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
-            if (result == PreparedAccessResult::EXHAUSTED) continue;
-            pending.task_ref = task_ref;
-            pending.block_idx = block;
-            break;
-        }
+    if (scheduler_gm_query(control->next_block) >= blocks &&
+        scheduler_gm_fetch_add(control->next_block, UINT64_C(0)) >= blocks)
+        return true;
+    const uint64_t block = scheduler_gm_fetch_add(control->next_block, UINT64_C(1));
+    scheduler_invalidate_issue_snapshot(snapshot);
+    if (block >= blocks) {
+        if (scheduler_gm_fetch_add(control->next_block, UINT64_MAX) <= blocks)
+            return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::BLOCK_CURSOR_INVALID);
+        return true;
     }
-    if (scheduler_task_ref_is_null(pending.task_ref)) {
-        if (scheduler_gm_query(control->next_block) >= blocks &&
-            scheduler_gm_fetch_add(control->next_block, UINT64_C(0)) >= blocks)
-            return true;
-        const uint64_t block = scheduler_gm_fetch_add(control->next_block, UINT64_C(1));
-        if (block >= blocks) {
-            if (scheduler_gm_fetch_add(control->next_block, UINT64_MAX) <= blocks)
-                return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::BLOCK_CURSOR_INVALID);
-            return true;
-        }
-        pending.task_ref = task_ref;
-        pending.block_idx = static_cast<uint32_t>(block);
-        if (scheduler_reserve_group_execution(
-                base, local->config.prepared, local->worker_id(), task_ref, pending.block_idx, &pending.anchor
-            ) != PreparedAccessResult::READY)
-            return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
-    }
+    pending.task_ref = task_ref;
+    pending.block_idx = static_cast<uint32_t>(block);
+    if (scheduler_reserve_group_execution(
+            base, local->config.prepared, local->worker_id(), task_ref, pending.block_idx, &pending.anchor
+        ) != PreparedAccessResult::READY)
+        return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
     pending.fanin = fanin;
     pending.next_fanin = 0;
-    pending.blocked_rounds = 0;
     if (!scheduler_cluster_mix_publish_preparation(local, active))
         return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
     *progress = true;
     return true;
 }
 
-// Availability is an observation; only the later reservation CAS owns a group.
-static inline __aicore__ bool scheduler_cluster_mix_ready_replacement(
+static inline __aicore__ bool scheduler_cluster_mix_discover_task(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    int64_t task_ref, uint64_t directory_round, bool *ready
+    int64_t task_ref, bool *progress, SchedulerIssueSnapshot *snapshot = nullptr
 ) {
-    SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarClusterMixReadyReplacement, task_ref);
-    *ready = false;
-    const auto &metadata = *scheduler_task_metadata_at(base, local, task_ref);
-    const uint32_t blocks = metadata.logical_block_num;
-    auto *control = scheduler_task_control_at(base, local, task_ref);
-    bool available = scheduler_gm_fetch_add(control->next_block, UINT64_C(0)) < blocks;
-    if (!available) {
-        const auto probes = scheduler_parked_probe_plan(
-            local->worker_id(), directory_round, blocks, scheduler_gm_query(control->parked_count) != 0
-        );
-        for (uint32_t probe = 0; probe < probes.count; ++probe) {
-            uint64_t index = UINT64_MAX;
-            uint8_t lane = UINT8_MAX;
-            if (!scheduler_group_anchor_index(
-                    base, local->config.prepared, task_ref, probes.blocks[probe], &index, &lane
-                ))
-                return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
-            const uint64_t observed = scheduler_gm_fetch_add(
-                scheduler_prepared_control_at(base, local->config.prepared, index)->state, UINT64_C(0)
-            );
-            if (scheduler_prepared_phase(observed) != SchedulerPreparedPhase::PARKED) continue;
-            const uint32_t generation = scheduler_prepared_generation(observed);
-            if (generation == UINT32_MAX ||
-                observed != scheduler_prepared_state(SchedulerPreparedPhase::PARKED, UINT32_MAX, generation))
-                return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
-            available = true;
-            break;
-        }
-    }
-    if (!available) return true;
-    SchedulerFaninView fanin{};
-    if (scheduler_node_fanin_view(graph, task_ref, &fanin) != SchedulerGraphResult::OK)
+    if (local == nullptr || progress == nullptr) return false;
+    *progress = false;
+    if (!local->is_mix_coordinator() || local->cluster_signal == nullptr) return true;
+    if (base == nullptr || local->config.prepared == nullptr)
         return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
-    uint32_t next_fanin = 0;
-    return scheduler_observe_fanin_prefix(graph, base, local, run, task_ref, fanin, next_fanin, ready);
+    if (!scheduler_task_ref_is_null(local->cluster_pending.task_ref)) return true;
+    int64_t head = SCHEDULER_TASK_REF_INVALID;
+    if (!scheduler_issue_head(graph, base, local, run, &head, progress, snapshot)) return false;
+    if (head != task_ref) return true;
+    bool acquired = false;
+    if (!scheduler_cluster_mix_claim_head(graph, base, local, run, head, &acquired, snapshot)) return false;
+    *progress = *progress || acquired;
+    return true;
 }
 
 static inline __aicore__ bool scheduler_cluster_mix_discover_next(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    bool *progress
+    bool *progress, SchedulerIssueSnapshot *snapshot = nullptr
 ) {
     SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarClusterMixDiscoverNext);
     if (local == nullptr || progress == nullptr) return false;
@@ -361,7 +312,7 @@ static inline __aicore__ bool scheduler_cluster_mix_discover_next(
             graph, local, run, SCHEDULER_TASK_REF_INVALID, SchedulerErrorSite::GROUP_INVALID_STATE
         );
     if (catalog.count == 0) return true;
-    auto &pending = local->cluster_pending;
+    const auto &pending = local->cluster_pending;
     if (!scheduler_task_ref_is_null(pending.task_ref)) {
         if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
         if (!scheduler_group_handle_valid(
@@ -371,58 +322,16 @@ static inline __aicore__ bool scheduler_cluster_mix_discover_next(
             return scheduler_admission_fail(
                 graph, local, run, pending.task_ref, SchedulerErrorSite::GROUP_INVALID_STATE
             );
-        if (pending.next_fanin == pending.fanin.count) return true;
+        return true;
     }
-    // Discovery yields after one reservation or a bounded slice of the catalog.
-    constexpr uint32_t discovery_budget = 8;
-    const uint64_t limit = catalog.count < discovery_budget ? catalog.count : discovery_budget;
-    int64_t just_parked = SCHEDULER_TASK_REF_INVALID;
-    for (uint64_t checked = 0; checked < limit; ++checked) {
-        if (local->cluster_scan_cursor >= catalog.count) local->cluster_scan_cursor %= catalog.count;
-        const int64_t ref = catalog.refs[local->cluster_scan_cursor];
-        const uint64_t round = local->cluster_scan_round;
-        if (++local->cluster_scan_cursor == catalog.count) {
-            local->cluster_scan_cursor = 0;
-            ++local->cluster_scan_round;
-        }
-        if (!scheduler_task_ref_valid(graph, ref))
-            return scheduler_admission_fail(graph, local, run, ref, SchedulerErrorSite::GROUP_INVALID_STATE);
-        if (ref == just_parked || ref == pending.task_ref) continue;
-        const auto flags = scheduler_task_metadata_at(base, local, ref)->flags;
-        if (!scheduler_task_is_mix(flags) || scheduler_task_requires_sync_start(flags)) continue;
-        if (!scheduler_task_ref_is_null(pending.task_ref)) {
-            if (local->cluster_mix.phase != SchedulerGmMixPhase::IDLE && local->cluster_mix.task_ref == ref) continue;
-            if (scheduler_cluster_mix_armed(scheduler_cluster_load_acquire(&local->cluster_signal->armed_generation)) &&
-                scheduler_cluster_load_field(&local->cluster_signal->task_ref) == ref)
-                continue;
-            bool ready = false;
-            if (!scheduler_cluster_mix_ready_replacement(graph, base, local, run, ref, round, &ready)) return false;
-            if (!ready) continue;
-            const uint32_t previous = pending.next_fanin;
-            if (!scheduler_observe_fanin_prefix(
-                    graph, base, local, run, pending.task_ref, pending.fanin, pending.next_fanin, &ready
-                ))
-                return false;
-            *progress = *progress || pending.next_fanin != previous;
-            if (ready) return true;
-            if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
-            const int64_t old_task = pending.task_ref;
-            if (!scheduler_cluster_mix_publish_preparation(local, LaneMask::none()))
-                return scheduler_admission_fail(graph, local, run, old_task, SchedulerErrorSite::GROUP_INVALID_STATE);
-            auto *control = scheduler_task_control_at(base, local, old_task);
-            if (!scheduler_park_group_execution(
-                    base, local->config.prepared, local->worker_id(), &pending.anchor, control->parked_count
-                ))
-                return scheduler_admission_fail(graph, local, run, old_task, SchedulerErrorSite::GROUP_INVALID_STATE);
-            just_parked = old_task;
-            pending = {};
-            *progress = true;
-        }
-        bool acquired = false;
-        if (!scheduler_cluster_mix_discover_task(graph, base, local, run, ref, round, &acquired)) return false;
-        *progress = *progress || acquired;
-        if (acquired) return true;
-    }
+    int64_t ref = SCHEDULER_TASK_REF_INVALID;
+    if (!scheduler_issue_head(graph, base, local, run, &ref, progress, snapshot)) return false;
+    if (scheduler_task_ref_is_null(ref)) return true;
+    const auto flags = scheduler_task_metadata_at(base, local, ref)->flags;
+    if (!scheduler_task_is_mix(flags) || scheduler_task_requires_sync_start(flags)) return true;
+    bool acquired = false;
+    if (!scheduler_cluster_mix_claim_head(graph, base, local, run, ref, &acquired, snapshot)) return false;
+    *progress = *progress || acquired;
     return true;
 }
 
@@ -484,7 +393,7 @@ static inline __aicore__ bool scheduler_cluster_mix_try_arm(
     }
     auto &pending = local->cluster_pending;
     // The final ARM claim is recorded in this uninterrupted publication slice.
-    // A reservation may span other protocol events or be parked and resumed.
+    // The same cluster retains its reservation across intervening protocol events.
     const uint64_t claim_before = record ? scheduler_protocol_cycles(local) : 0;
     if (!scheduler_arm_group_execution(base, local->config.prepared, local->worker_id(), &pending.anchor)) {
         scheduler_cluster_store_release(&signal->staged_mask, UINT32_C(0));
@@ -539,17 +448,6 @@ static inline __aicore__ bool scheduler_cluster_mix_progress_pending(
             return true;
         }
     }
-    if (++pending.blocked_rounds < SCHEDULER_CLUSTER_PENDING_BUDGET) return true;
-    const int64_t task_ref = pending.task_ref;
-    if (!scheduler_cluster_mix_publish_preparation(local, LaneMask::none()))
-        return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
-    auto *control = scheduler_task_control_at(base, local, task_ref);
-    if (!scheduler_park_group_execution(
-            base, local->config.prepared, local->worker_id(), &pending.anchor, control->parked_count
-        ))
-        return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
-    pending = {};
-    *progress = true;
     return true;
 }
 
@@ -711,7 +609,6 @@ static inline __aicore__ bool scheduler_cluster_mix_service(
         const auto result = scheduler_prepare_dispatch_slot(
             graph, base, local, run, claim, ready, metadata, profiling_level, group.subtask_slot, nullptr
         );
-        if (result == PreparedAccessResult::WAIT) return true;
         if (result != PreparedAccessResult::READY)
             return scheduler_admission_fail(
                 graph, local, run, group.task_ref, SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED

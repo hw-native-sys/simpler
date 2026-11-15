@@ -1,4 +1,4 @@
-# 2. 依赖、目录发现与 kernel 执行
+# 2. 依赖、有序供给与 kernel 执行
 
 [总索引](README.md) · [上一段：初始化](01-initialization.md) · [下一段：协作与完成](03-cooperative-completion.md)
 
@@ -9,10 +9,10 @@
 native child 从 template/instance 获取形状和参数地址。
 16 B SchedulerTaskMetadata 为每 expanded node 保存 flags、active mask、kernel IDs、block 数和 trace prefix。
 
-Host 将纯 AIC 和所有 MIX 分入 AIC catalog，纯 AIV 分入 AIV catalog。
-每个 logical kernel node 出现一次，目录运行中只读；各核只推进自己的发现游标。
-没有 shared head、动态 enqueue 或跨独立任务的 FIFO 保证。
-每次最多扫描八项，随后继续其他责任，即使这次目录观察未找到可执行项。
+Host 按现有数据和 Graph 控制依赖，以 `(level, -b_level, node_ref)` 排序，再投影为 AIC/MIX 与 AIV 两个目录。
+每个 logical kernel node 出现一次，目录运行中只读；每类共享发行前沿只在当前任务全体有效票发完或合法终结后推进。
+跨引擎后继领票前确认前驱供给已关闭；领票不等于依赖完成，执行仍等待真实 DONE。
+一次查询最多推进八项；本核已持有头部任务时不领该任务第二块，也不越过尚未关闭的头部。
 
 ## 从具体 Call 到 fanin 证明
 
@@ -21,7 +21,7 @@ Host 将纯 AIC 和所有 MIX 分入 AIC catalog，纯 AIV 分入 AIV catalog。
 每核可持有四个 token；取得 Call 责任不等于取得 kernel 执行许可。
 
 ```text
-发现 ref
+查询共享发行头部并确认前驱供给
     -> 取得一个具体 execution 的 Claim
     -> 接收 immutable Call 和稳定 Binding
     -> WAIT_FANIN：按 producer 顺序确认 canonical DONE
@@ -34,9 +34,9 @@ completion_state 的 total/remaining_compute/debt 必须合法。
 Graph 外部 fanin 经过 completion_refs，child-local index 加实例 child_begin；root 依赖 ENTER。
 不存在每条边 remaining decrement、wake-list 或 per-successor 通知。
 
-token 窗口被等待依赖的项占满时，只有发现 ready replacement 才能将旧项经 PARKING→PARKED 发布。
-其他核用有界 probe 和周期 sweep 重领，所有权变更都通过 owner/generation CAS。
-parked-count 只是提示，不能禁止权威扫描或用来证明图已结束。
+token 窗口被等待依赖的项占满时，保留四份责任及准备状态；原核在依赖满足后继续执行。
+执行责任从首次有效领取到退休不转移，不再发布 PARKING/PARKED 或让其他核重领。
+等待期间继续服务独立 async/control 和已有协作责任，不增加第五份普通执行责任。
 
 ## 本核 slot 与最终门禁
 
@@ -55,7 +55,7 @@ LocalContext 给逻辑 block_idx/block_num，GlobalContext 给物理 AIV lane �
 
 ## 主循环与计时
 
-主循环交错服务控制 scan、token 依赖、目录发现、cooperative obligations、MIX replacement、async service 和本地 slot。
+主循环交错服务控制 scan、token 依赖、有序供给、cooperative obligations、固定 MIX 组、async service 和本地 slot。
 一个候选被阻塞，不能让已有责任失去服务机会；目录空提示也不能代替 run 完成证明。
 
 进入 kernel 前暂存 ready-observe；返回后暂存 kernel start/end。
@@ -64,4 +64,4 @@ GM trace 四行分别保存 publication、kernel timing、dispatch/completion、
 首错、trace 有效位与业务执行状态分开；核返回函数不自动授权复用 slot 或清退整个 run。
 
 具体布局见[数据布局](../design/a5-hbg-graph-task/data-layout.md)，
-可执行的发现/转移合同见[execution token](../design/a5-hbg-graph-task/ready-queue-design.md)。
+有序供给与固定归属合同见[execution token](../design/a5-hbg-graph-task/ready-queue-design.md)。

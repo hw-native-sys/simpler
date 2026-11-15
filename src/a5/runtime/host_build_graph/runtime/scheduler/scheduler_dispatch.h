@@ -177,7 +177,7 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
         // A bounded scan can retire obligations without retaining a current task.
         progress = progress || admission->scan_cursor != scan_cursor_before;
         if (scheduler_task_ref_is_null(admission->current_task_ref)) break;
-        if (!scheduler_ordered_park_ordinary(graph, local, run)) {
+        if (!scheduler_ordered_restore_ordinary(graph, local, run)) {
             *failed = true;
             return progress;
         }
@@ -312,28 +312,52 @@ static inline __aicore__ bool scheduler_drain_ordered_exit(
 template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_fill_cooperative_slots(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    uint64_t profiling_level, bool *failed, uint32_t *direct_slot = nullptr
+    uint64_t profiling_level, bool *failed, uint32_t *direct_slot = nullptr, SchedulerIssueSnapshot *snapshot = nullptr
 ) {
     SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarFillCooperativeSlots, -1);
     if (failed != nullptr) *failed = false;
     if (direct_slot != nullptr) *direct_slot = UINT32_MAX;
     if (local == nullptr) return false;
+    SchedulerIssueSnapshot local_snapshot{};
+    if (snapshot == nullptr) snapshot = &local_snapshot;
     SchedulerDirectSlotScope direct_scope(local, direct_slot);
     bool progress = false;
     bool advanced = false;
-    if (!scheduler_cluster_mix_service(graph, base, local, run, profiling_level, &progress) ||
-        !scheduler_discover_cooperative_task(graph, base, local, run, &advanced)) {
+    if (!scheduler_cluster_mix_service(graph, base, local, run, profiling_level, &progress)) {
+        if (failed != nullptr) *failed = true;
+        return progress;
+    }
+    const int64_t pending_before = local->cluster_pending.task_ref;
+    if (!scheduler_cluster_mix_progress_pending(graph, base, local, run, &advanced)) {
         if (failed != nullptr) *failed = true;
         return progress;
     }
     progress = progress || advanced;
-    if (!scheduler_cluster_mix_discover_next(graph, base, local, run, &advanced) ||
+    if (advanced) {
+        if (!scheduler_cluster_mix_service(graph, base, local, run, profiling_level, &advanced)) {
+            if (failed != nullptr) *failed = true;
+            return progress;
+        }
+        progress = progress || advanced;
+    }
+    const auto existing_phase = local->cluster_mix.phase;
+    if (existing_phase == SchedulerGmMixPhase::ARRIVED || existing_phase == SchedulerGmMixPhase::RUNNING ||
+        (existing_phase == SchedulerGmMixPhase::RELEASED && local->is_mix_coordinator()))
+        return progress;
+    if (!scheduler_discover_cooperative_task(graph, base, local, run, &advanced, snapshot)) {
+        if (failed != nullptr) *failed = true;
+        return progress;
+    }
+    progress = progress || advanced;
+    if (!scheduler_cluster_mix_discover_next(graph, base, local, run, &advanced, snapshot) ||
         !scheduler_prepare_cluster_lane(base, local)) {
         if (failed != nullptr) *failed = true;
         return progress;
     }
     progress = progress || advanced;
-    if (!scheduler_cluster_mix_progress_pending(graph, base, local, run, &advanced)) {
+    advanced = false;
+    if (local->cluster_pending.task_ref != pending_before &&
+        !scheduler_cluster_mix_progress_pending(graph, base, local, run, &advanced)) {
         if (failed != nullptr) *failed = true;
         return progress;
     }
@@ -349,9 +373,26 @@ static inline __aicore__ bool scheduler_fill_cooperative_slots(
     if (phase == SchedulerGmMixPhase::ARRIVED || phase == SchedulerGmMixPhase::RUNNING ||
         (phase == SchedulerGmMixPhase::RELEASED && local->is_mix_coordinator()))
         return progress;
-    if (local->admission != nullptr)
-        return scheduler_fill_ordered_slots<RecordProtocol>(graph, base, local, run, profiling_level, failed) ||
-               progress;
+    if (local->admission != nullptr) {
+        advanced = scheduler_fill_ordered_slots<RecordProtocol>(graph, base, local, run, profiling_level, failed);
+        progress = progress || advanced;
+        if (advanced) {
+            scheduler_invalidate_issue_snapshot(snapshot);
+            if (failed != nullptr && *failed) return progress;
+            if (!scheduler_cluster_mix_progress_pending(graph, base, local, run, &advanced)) {
+                if (failed != nullptr) *failed = true;
+                return progress;
+            }
+            progress = progress || advanced;
+            if (advanced) {
+                if (!scheduler_cluster_mix_service(graph, base, local, run, profiling_level, &advanced)) {
+                    if (failed != nullptr) *failed = true;
+                    return progress;
+                }
+                progress = progress || advanced;
+            }
+        }
+    }
     return progress;
 }
 
@@ -363,8 +404,10 @@ static inline __aicore__ bool scheduler_fill_own_slots(
     SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarFillOwnSlots);
     bool local_failed = false;
     if (failed == nullptr) failed = &local_failed;
-    bool progress =
-        scheduler_fill_cooperative_slots<RecordProtocol>(graph, base, local, run, profiling_level, failed, direct_slot);
+    SchedulerIssueSnapshot snapshot{};
+    bool progress = scheduler_fill_cooperative_slots<RecordProtocol>(
+        graph, base, local, run, profiling_level, failed, direct_slot, &snapshot
+    );
     if (*failed || local == nullptr || local->local_ready_mask != 0 ||
         (direct_slot != nullptr && *direct_slot != UINT32_MAX))
         return progress;
@@ -381,8 +424,9 @@ static inline __aicore__ bool scheduler_fill_own_slots(
     }
     progress = progress || advanced;
     if (selected == UINT32_MAX) {
-        if (!scheduler_try_execution_continuation(graph, base, local, run, profiling_level, &advanced) ||
-            (!advanced && !scheduler_refill_execution_tokens(graph, base, local, run, profiling_level, &advanced))) {
+        if (!scheduler_try_execution_continuation(graph, base, local, run, profiling_level, &advanced, &snapshot) ||
+            (!advanced &&
+             !scheduler_refill_execution_tokens(graph, base, local, run, profiling_level, &advanced, &snapshot))) {
             *failed = true;
             return progress;
         }

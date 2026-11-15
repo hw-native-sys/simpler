@@ -757,7 +757,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
                 }
                 const uint32_t kind = record.kind & UINT32_C(0xffff);
                 if (kind < static_cast<uint32_t>(SchedPhaseKind::ScalarWindow) ||
-                    kind > static_cast<uint32_t>(SchedPhaseKind::ScalarClusterMixReadyReplacement) ||
+                    kind > static_cast<uint32_t>(SchedPhaseKind::ScalarTaskSupplyClosed) ||
                     std::strcmp(sched_phase_kind_name(static_cast<SchedPhaseKind>(kind)), "unknown") == 0 ||
                     record.start_time == 0 || record.end_time < record.start_time) {
                     LOG_WARN("A5 HBG: invalid Scalar interval for worker=%" PRIu64, worker);
@@ -1809,8 +1809,11 @@ bool create_scheduler_state(
         dependency_graph.scheduler_state_bytes = layout.total_size;
         dependency_graph.native_header_offset = native_image.header_offset;
     }
-    if (!scheduler_validate_dependencies(dependency_graph, task_metadata, inline_completed_task_refs)) {
-        LOG_ERROR("A5 HBG: invalid dependency graph");
+    std::string task_order_error;
+    if (!scheduler_order_task_catalog(
+            dependency_graph, task_metadata, inline_completed_task_refs, &task_catalog_plan, &task_order_error
+        )) {
+        LOG_ERROR("A5 HBG: task ordering failed: %s", task_order_error.c_str());
         return false;
     }
     if (protocol_profiling) {
@@ -1835,6 +1838,11 @@ bool create_scheduler_state(
                     scheduler_protocol_freeze_source(host_graph, sources, native_plan.original_definition_section);
             }
             protocol_tasks = scheduler_protocol_freeze_graph(snapshot, task_metadata);
+            for (size_t ref = 0; ref < protocol_tasks.size(); ++ref) {
+                protocol_tasks[ref].schedule_rank = task_catalog_plan.task_ranks[ref];
+                protocol_tasks[ref].topological_level = task_catalog_plan.task_levels[ref];
+                protocol_tasks[ref].bottom_level = task_catalog_plan.task_bottom_levels[ref];
+            }
         } catch (const std::exception &error) {
             LOG_ERROR("A5 HBG: failed to freeze protocol graph: %s", error.what());
             return false;
