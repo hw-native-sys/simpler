@@ -45,6 +45,7 @@ def _export_native(destination, root, lib_root, native_moe_bundle):
 def _export_variant(bundle, capture, flavor, variant, policy, output, tools, lib_root=None, native_moe_bundle=None):
     root = Path(__file__).resolve().parents[1]
     cases = json.loads((root / "workloads" / flavor / "source.json").read_text())["cases"]
+    cases = {name: case for name, case in cases.items() if variant in case.get("variants", [variant])}
     for name, case in cases.items():
         destination = output / variant / name
         if case.get("execution") == "native_moe_host_control":

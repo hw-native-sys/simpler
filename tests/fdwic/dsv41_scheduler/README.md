@@ -13,11 +13,17 @@ experiment, not checkpoint accuracy validation. Isolated Attention and Engram
 cases run rank 0 on **one device**. Only `moe`, `layers_19_21`, and the original
 full forward run on **two devices** with real communication and deferred waits.
 
-The matrix contains 16 configurations: three initial PyPTO-lib cases, three
-half-sync DSL cases, three capacity-bounded all-sync DSL cases, and seven latest
+The matrix contains 12 configurations: one initial PyPTO-lib case, three
+half-sync DSL cases, one capacity-bounded all-sync DSL case, and seven latest
 PyPTO-lib cases. The checked-in `workloads/<flavor>/source.json` manifests own
 this selection; both exporters and the run list use them.
 Measurement availability and the timing contract are maintained in [RESULTS.md](RESULTS.md).
+
+Retain scheduler optimizations only when the sum of all 12 case means improves,
+using AICore L0 wall with one warmup and ten measured rounds per case. Include
+the four communicating cases; each two-device round starts after a Device
+rendezvous and contributes the maximum of the ranks' local durations. L1/L3
+are diagnostic and do not replace this acceptance metric.
 
 ## Manual-only execution
 
@@ -54,12 +60,13 @@ inputs and cannot replace tensor parameters or initialization data.
 | c2a_full | yes | yes | yes | yes | 4 |
 | c1a_reindex | - | - | - | yes | 1 |
 | c1a_reuse | - | - | - | yes | 1 |
-| moe | yes | yes | yes | yes | 4 |
+| moe | - | yes | - | yes | 2 |
 | engram | - | - | - | yes | 1 |
-| layers_19_21 | yes | yes | yes | yes | 4 |
+| layers_19_21 | - | yes | - | yes | 2 |
 
-The initial and DSL groups retain their complex-DAG, MoE and multi-layer stress
-cases. Latest SWA, reindex, reuse and Engram supply the remaining short-path,
+Initial PyPTO-lib and all-sync DSL retain C2A full. Half-sync DSL retains
+C2A full, MoE and layers 19–21; latest PyPTO-lib retains all seven selected cases.
+Latest SWA, reindex, reuse and Engram supply the remaining short-path,
 index-refresh, cache-consumer and oversized-block coverage. Standalone c2a_reuse
 and c1a_full are removed; layer20 remains inside layers_19_21. Full-forward
 sources and kernels remain necessary for real prefixes and the multi-layer case.
@@ -142,7 +149,7 @@ comparisons reuse it without compiling business kernels. See
 Native MoE uses the model's original numerical-golden inputs, including nonzero
 weights and count-dependent forced routing. Its refreshed performance row is a
 new workload baseline and must not be interpreted as a speedup or regression
-against the former frozen zero-weight slice. The other15 rows retain their data.
+against the former frozen zero-weight slice. The other 11 active rows retain their data.
 Host controls execute during graph construction, outside Device wall time.
 The other replay cases preserve device execution for their captured controls;
 they do not test dynamic Host `get_tensor_data` reads.
@@ -220,14 +227,16 @@ original files under `workloads/` remain source-capture references.
 
 Regenerate prepared bundles after updating the exporter. Existing bundles do
 not acquire this policy automatically. The standard preparation and run
-commands below produce 16 configurations by default. Use `--sync-policy half`
+commands below produce 12 configurations by default. All-sync exports only C2A full;
+its MoE and layers 19–21 variants are outside the active matrix. Use `--sync-policy half`
 to prepare only the half-sync DSL variant, or `--sync-policy all-cap64` for
 only the all-sync DSL variant. Both PyPTO-lib groups retain their native flags.
 
 The all-sync variant uses `record-tool --all-sync-start-cap64` and enables
 every capacity-eligible multi-block compute task in the selected slice.
 The limit is inclusive: 64 for AIV, 32 for AIC/MIX. In this fixture that
-enables 167 of 171 SPMD tasks; four oversized dispatch tasks remain unchanged. The half-sync group enables 87 of 171 tasks.
+enables all 27 SPMD tasks in its C2A full case, compared with 14 in the half-sync
+C2A full case. Across its three cases, the half-sync group enables 87 of 171 tasks.
 Both variants retain the original flavor in `case.json` and identify the
 selected variant separately, so source workload tables and the lower-bound
 analyzers continue to use the same task identities.
@@ -434,7 +443,7 @@ launcher never compiles while holding devices. Native MoE `--compile-only`
 remains available with an unwrapped runtime. Single-device Attention replay
 needs no gate.
 
-To run exactly the selected 16 scenarios, including when an older prepared directory contains extra cases:
+To run exactly the selected 12 scenarios, including when an older prepared directory contains extra cases:
 
 ```bash
 while IFS= read -r selected; do

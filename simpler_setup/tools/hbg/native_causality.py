@@ -14,7 +14,9 @@ from collections import defaultdict
 from .execution_identity import FIELDS, _validate_record
 from .native_order import CausalOrder
 from .native_protocol import (
+    COMPLETION_ALIAS_FLAGS,
     COMPLETION_FROM_CONTRIBUTION,
+    COMPLETION_FROM_GROUP,
     DEFERRED_FINISH,
     _completion_aliases,
     _error,
@@ -189,9 +191,11 @@ class NativeAudit:
             require(done is not None, "missing TaskDone publication")
             source = self.completion_aliases.get(ref)
             name = (
-                ("contribution_before", ref, source["block_idx"], source["subtask_slot"])
-                if source is not None
-                else ("TaskDone", ref)
+                ("TaskDone", ref)
+                if source is None
+                else ("completion_before", ref, source["block_idx"])
+                if done["flags"] & COMPLETION_FROM_GROUP
+                else ("contribution_before", ref, source["block_idx"], source["subtask_slot"])
             )
             self.done_points[ref] = self.causal.bounded(name, point(done, "before"), point(done, "after"))
         require(
@@ -287,7 +291,7 @@ class NativeAudit:
     def record_identity(self, record, ref, *, completion=False):
         flags = self.tasks[ref]["flags"]
         if completion:
-            flags |= record["flags"] & (DEFERRED_FINISH | COMPLETION_FROM_CONTRIBUTION)
+            flags |= record["flags"] & (DEFERRED_FINISH | COMPLETION_ALIAS_FLAGS)
         require(
             record["task_ref"] == ref
             and record["run_epoch"] == self.raw["run_epoch"]
@@ -382,8 +386,17 @@ class NativeAudit:
                 "invalid ready source",
             )
             self.chain(execution, "permit", "entry", "completion_consumed", "trace_published")
-            require(execution["contribution_worker"] == worker, "foreign subtask completion contributor")
-            self.chain(execution, "completion_consumed", "contribution_before", "contribution_after", "trace_published")
+            if task["flags"] & MIX:
+                require(
+                    execution["contribution_before"] == execution["contribution_after"] == [0, 0]
+                    and execution["contribution_ticket"] == execution["contribution_worker"] == 0,
+                    "Mix lane fabricated an individual completion contribution",
+                )
+            else:
+                require(execution["contribution_worker"] == worker, "foreign subtask completion contributor")
+                self.chain(
+                    execution, "completion_consumed", "contribution_before", "contribution_after", "trace_published"
+                )
             if execution["flags"] & EXECUTED:
                 self.chain(execution, "entry", "returned", "visible", "completion_consumed")
                 require(
@@ -672,15 +685,14 @@ class NativeAudit:
             if self.tasks[ref]["flags"] & SYNC:
                 by_claim = sorted(blocks, key=lambda block: block["owner"]["block_idx"])
                 self.ordered_intervals([b["owner"] for b in by_claim], "claim_before", "claim_after")
-            if self.tasks[ref]["flags"] & MIX:
-                require(all(b["owner"]["completion_ticket"] == MAX for b in blocks), "Mix retirement has a task ticket")
-            else:
-                by_ticket = sorted(blocks, key=lambda block: block["owner"]["completion_ticket"])
-                require(
-                    [b["owner"]["completion_ticket"] for b in by_ticket] == list(range(self.tasks[ref]["block_num"])),
-                    "duplicate or missing block completion ticket",
-                )
-                self.ordered_intervals([b["owner"] for b in by_ticket], "completion_before", "completion_after")
+            width = self.tasks[ref]["active_mask"].bit_count()
+            by_ticket = sorted(blocks, key=lambda block: block["owner"]["completion_ticket"])
+            require(
+                [b["owner"]["completion_ticket"] for b in by_ticket]
+                == list(range(0, self.tasks[ref]["block_num"] * width, width)),
+                "duplicate or missing block completion ticket",
+            )
+            self.ordered_intervals([b["owner"] for b in by_ticket], "completion_before", "completion_after")
             self.claim_certificates(ref, blocks)
             if not self.tasks[ref]["flags"] & SYNC:
                 continue
@@ -817,7 +829,7 @@ class NativeAudit:
                 and control["completion_debt"] == 0,
                 "invalid terminal canonical completion gate",
             )
-            require(control["claim_seal"] == (task["block_num"] if cooperative else 0), "invalid terminal claim seal")
+            require(control["claim_seal"] == (task["block_num"] if total else 0), "invalid terminal claim seal")
             ticket_limit = _claim_ticket_limit(task, self.raw["cluster_count"]) if cooperative else 0
             tickets = control["claim_tickets"]
             require(
@@ -833,13 +845,24 @@ class NativeAudit:
                 self.subtask_completion(task, done)
             else:
                 require(
-                    not done["flags"] & (DEFERRED_FINISH | COMPLETION_FROM_CONTRIBUTION),
+                    not done["flags"] & (DEFERRED_FINISH | COMPLETION_ALIAS_FLAGS),
                     "deferred or contribution completion on an inline/control task",
                 )
                 require(self.actors[ref]["admission"] is None, "ordinary/service task has an admission event")
             self.dependencies(task, done)
 
     def subtask_completion(self, task, done):
+        if task["flags"] & MIX:
+            last = max(self.task_blocks[task["task_ref"]], key=lambda block: block["owner"]["completion_ticket"])[
+                "owner"
+            ]
+            if done["flags"] & DEFERRED_FINISH:
+                self.before(
+                    point(last, "completion_after"), point(done, "before"), "TaskDone before last group contribution"
+                )
+            else:
+                require(done["flags"] & COMPLETION_FROM_GROUP, "TaskDone must alias its last group contribution")
+            return
         count = task["block_num"] * task["active_mask"].bit_count()
         executions = [self.executions[index] for index in range(task["trace_base"], task["trace_base"] + count)]
         by_ticket = sorted(executions, key=lambda execution: execution["contribution_ticket"])

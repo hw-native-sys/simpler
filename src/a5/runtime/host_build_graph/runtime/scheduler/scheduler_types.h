@@ -363,6 +363,25 @@ inline __aicore__ constexpr int64_t scheduler_completion_task_state(uint64_t sta
                                                 static_cast<int64_t>(SchedulerTaskState::BLOCKED);
 }
 
+// A zero compute count proves physical returns independently of async debt.
+// Raw execution state remains available to distinguish this proof from a store.
+inline __aicore__ bool scheduler_prepared_retirement_inferred(
+    uint64_t state, const __gm__ SchedulerPreparedLayout &prepared, uint64_t index,
+    const __gm__ SchedulerPreparedCall &call, const __gm__ SchedulerExecutionPlan &plan, uint64_t completion
+) {
+    return scheduler_prepared_phase(state) == SchedulerPreparedPhase::CLAIMED &&
+           (state & SCHEDULER_PREPARED_BINDING_READY) != 0 &&
+           scheduler_prepared_owner(state) < SCHEDULER_WORKER_CAPACITY && index < prepared.execution_count &&
+           call.run_epoch == prepared.run_epoch && call.execution_index == index && call.task_ref >= 0 &&
+           static_cast<uint64_t>(call.task_ref) < prepared.task_count && plan.active_lane_count == 1 &&
+           __builtin_popcount(plan.active_mask_bits) == 1 && call.subtask_slot < 3 &&
+           (plan.active_mask_bits & (1U << call.subtask_slot)) != 0 && plan.execution_count == plan.block_num &&
+           plan.execution_begin <= index && index - plan.execution_begin == call.block_idx &&
+           call.block_idx < plan.block_num && scheduler_completion_valid(completion) &&
+           scheduler_completion_total(completion) == plan.execution_count &&
+           scheduler_completion_remaining(completion) == 0;
+}
+
 struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerTaskControl {
     volatile uint64_t claim_tickets;
 
@@ -376,7 +395,8 @@ struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerTaskControl {
     // or atomic RMW may target its line.
     alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t admission_state;
 
-    // The final block claimer publishes this immutable claim certificate.
+    // The final valid block claimer publishes this immutable supply certificate.
+    // Admission claimers also certify the required member registrations.
     alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t claim_seal;
 };
 
@@ -926,6 +946,7 @@ inline bool scheduler_plan_prepared_storage(uint64_t *cursor, AicoreSchedulerLay
     auto &prepared = layout->prepared;
     prepared.task_count = layout->task_count;
     prepared.execution_count = execution_count;
+    prepared.task_controls_offset = layout->task_controls_offset;
     uint64_t bytes = 0;
 #define SCHEDULER_PREPARED_RESERVE(count, type, field)              \
     (scheduler_layout_checked_mul((count), sizeof(type), &bytes) && \

@@ -29,6 +29,8 @@ struct SchedulerAsyncLocalState {
     bool finish_first{false};
     bool work_activated{false};
     uint8_t idle_probe_countdown{0};
+    bool check_strong_pass{false};
+    bool finish_strong_pass{false};
 };
 
 static_assert(sizeof(SchedulerAsyncLocalState) == 64);
@@ -153,11 +155,26 @@ static inline __aicore__ bool settle_group(SchedulerAsyncLocalState &local, int6
     return settled.result == scheduler_async_pending::Result::PENDING || fail(local, task_ref);
 }
 
+// A weak hint grants no responsibility. The returned CAS is the acquisition
+// proof; an old runnable generation can reuse its returned current state.
+static inline __aicore__ SchedulerAsyncLeaseOutcome
+claim_observed(__gm__ SchedulerAsyncLease &lease, uint64_t observed, bool strong_pass) {
+    if (!scheduler_async_lease_word_valid(observed) ||
+        (strong_pass && scheduler_async_lease_phase(observed) != SchedulerAsyncPhase::RUNNABLE))
+        observed = scheduler_async_lease_load(lease);
+    auto result = scheduler_async_lease_try_claim(lease, observed);
+    if (result.result == SchedulerAsyncLeaseResult::CONTENDED &&
+        scheduler_async_lease_phase(result.word) == SchedulerAsyncPhase::RUNNABLE)
+        result = scheduler_async_lease_try_claim(lease, result.word);
+    return result;
+}
+
 // A directory scan visits one word. Cursors advance past a claimed record so
-// a low pending bit cannot starve a later condition in the same word.
+// a low pending bit cannot starve a later condition in the same word. Every
+// other complete pass confirms non-runnable hints, bounding stale-hint delay.
 static inline __aicore__ bool claim(
     SchedulerAsyncLocalState &local, uint64_t directory_offset, uint64_t lease_offset, uint32_t count, uint32_t &cursor,
-    uint32_t &index, uint64_t &owned
+    bool &strong_pass, uint32_t &index, uint64_t &owned
 ) {
     index = ASYNC_INVALID_INDEX;
     owned = 0;
@@ -168,12 +185,17 @@ static inline __aicore__ bool claim(
     const uint64_t mask = scheduler_gm_query(words[word].bits) & (UINT64_MAX << bit);
     const uint64_t next_word = static_cast<uint64_t>(word + 1) * 64;
     cursor = next_word < count ? static_cast<uint32_t>(next_word) : 0;
-    if (mask == 0) return true;
+    const bool confirm_pending = strong_pass;
+    if (mask == 0) {
+        if (cursor == 0) strong_pass = !strong_pass;
+        return true;
+    }
     const uint32_t found = word * 64 + static_cast<uint32_t>(__builtin_ctzll(mask));
     if (found >= count) return fail(local, -1);
     cursor = found + 1 == count ? 0 : found + 1;
+    if (cursor == 0) strong_pass = !strong_pass;
     auto *leases = scheduler_state_at<SchedulerAsyncLease>(local.base, lease_offset);
-    const auto result = scheduler_async_lease_try_claim(leases[found], scheduler_async_lease_load(leases[found]));
+    const auto result = claim_observed(leases[found], scheduler_gm_query(leases[found].word), confirm_pending);
     if (result.result == SchedulerAsyncLeaseResult::NOT_RUNNABLE ||
         result.result == SchedulerAsyncLeaseResult::CONTENDED)
         return true;
@@ -485,7 +507,7 @@ static inline __aicore__ bool scheduler_async_check_step(
     uint64_t owned = 0;
     if (!claim(
             local, local.layout->check_directory_offset, local.layout->group_leases_offset, local.layout->group_count,
-            local.check_cursor, index, owned
+            local.check_cursor, local.check_strong_pass, index, owned
         ))
         return false;
     if (index == ASYNC_INVALID_INDEX) return true;

@@ -27,7 +27,7 @@ static inline __aicore__ bool scheduler_async_finish_step(
     uint64_t owned = 0;
     if (!claim(
             async, async.layout->finish_directory_offset, async.layout->finish_leases_offset,
-            async.layout->async_task_count, async.finish_cursor, index, owned
+            async.layout->async_task_count, async.finish_cursor, async.finish_strong_pass, index, owned
         ))
         return false;
     if (index == ASYNC_INVALID_INDEX) return true;

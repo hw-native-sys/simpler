@@ -69,6 +69,7 @@ struct SchedulerGmMixLocalState {
     uint8_t slot_index{UINT8_MAX};
     uint8_t subtask_slot{UINT8_MAX};
     SchedulerGmMixPhase phase{SchedulerGmMixPhase::IDLE};
+    bool completion_submitted{false};
 };
 
 struct SchedulerClusterMixLocalState {
@@ -82,6 +83,7 @@ struct SchedulerClusterMixLocalState {
     uint8_t slot_index{UINT8_MAX};
     uint8_t subtask_slot{UINT8_MAX};
     SchedulerGmMixPhase phase{SchedulerGmMixPhase::IDLE};
+    bool completion_submitted{false};
 };
 static_assert(sizeof(SchedulerClusterMixLocalState) == 48 && alignof(SchedulerClusterMixLocalState) <= 8);
 
@@ -190,6 +192,8 @@ struct SchedulerLocalProfilingState {
 struct SchedulerAsyncLocalState;
 
 inline constexpr uint32_t SCHEDULER_EXECUTION_TOKEN_COUNT = 4;
+inline constexpr uint32_t SCHEDULER_TASK_PROOF_CACHE_COUNT = 16;
+enum class SchedulerTaskProof : uint8_t { NONE, SUPPLY_CLOSED, DONE };
 enum class SchedulerExecutionTokenPhase : uint8_t { EMPTY, TICKETED, ACQUIRING, WAIT_FANIN };
 
 struct SchedulerExecutionToken {
@@ -233,15 +237,16 @@ struct SchedulerLocalState {
     SchedulerClusterMixLocalState cluster_mix{};
     SchedulerClusterMixPending cluster_pending{};
     SchedulerExecutionToken execution_tokens[SCHEDULER_EXECUTION_TOKEN_COUNT]{};
-    uint64_t issue_observed_head{0};
+    uint64_t issue_cursor{0};
     int64_t issue_task_ref{SCHEDULER_TASK_REF_INVALID};
     uint32_t issue_next_fanin{0};
-    uint8_t issue_observe_attempts{0};
     bool issue_fanin_confirmed{false};
     uint32_t execution_check_cursor{0};
     int64_t continuation_task_ref{SCHEDULER_TASK_REF_INVALID};
     int64_t cooperative_fanin_task_ref{SCHEDULER_TASK_REF_INVALID};
     uint32_t cooperative_next_fanin{0};
+    // Private, run-local task identity and monotone proof; zero is an empty tag.
+    uint64_t task_proof_tags[SCHEDULER_TASK_PROOF_CACHE_COUNT]{};
 
     inline __aicore__ explicit SchedulerLocalState(SchedulerLocalProfilingState *profile = nullptr) :
         profiling(profile) {}
@@ -349,6 +354,7 @@ static inline __aicore__ bool scheduler_initialize_local_config(
             ))
             return false;
         config.prepared = scheduler_state_at<SchedulerPreparedLayout>(base, context->prepared_layout_offset);
+        if (config.prepared->task_controls_offset != config.task_controls_offset) return false;
     }
     if (graph->native_header_offset != 0) {
         const auto *header = scheduler_native_header_checked(
@@ -509,6 +515,34 @@ scheduler_task_metadata_at(__gm__ void *scheduler_state_base, const SchedulerLoc
         scheduler_state_base,
         context->config.task_metadata_offset + static_cast<uint64_t>(task_ref) * sizeof(SchedulerTaskMetadata)
     );
+}
+
+// Graph validation bounds task refs by INT32_MAX, leaving low bits for the proof.
+static inline __aicore__ SchedulerTaskProof
+scheduler_cached_task_proof(const SchedulerLocalState *local, int64_t task_ref) {
+    const uint64_t tag = static_cast<uint64_t>(task_ref) + 1;
+    const uint64_t entry = local->task_proof_tags[static_cast<uint64_t>(task_ref) % SCHEDULER_TASK_PROOF_CACHE_COUNT];
+    return entry >> 2 == tag ? static_cast<SchedulerTaskProof>(entry & UINT64_C(3)) : SchedulerTaskProof::NONE;
+}
+
+static inline __aicore__ void
+scheduler_remember_task_proof(SchedulerLocalState *local, int64_t task_ref, SchedulerTaskProof proof) {
+    const uint64_t tag = static_cast<uint64_t>(task_ref) + 1;
+    auto &entry = local->task_proof_tags[static_cast<uint64_t>(task_ref) % SCHEDULER_TASK_PROOF_CACHE_COUNT];
+    const uint64_t level = static_cast<uint64_t>(proof);
+    if (entry >> 2 != tag || (entry & UINT64_C(3)) < level) entry = (tag << 2) | level;
+}
+
+static inline __aicore__ SchedulerCompletionObservation
+scheduler_observe_cached_completion(__gm__ void *base, SchedulerLocalState *local, int64_t task_ref) {
+    if (scheduler_cached_task_proof(local, task_ref) == SchedulerTaskProof::DONE)
+        return SchedulerCompletionObservation::DONE;
+    const auto observed = scheduler_observe_task_completion(scheduler_task_control_at(base, local, task_ref));
+    // DONE is irreversible within this immutable run image, including async debt.
+    // Supply closure never grants DONE. Collisions forget proofs; errors grant none.
+    if (observed == SchedulerCompletionObservation::DONE)
+        scheduler_remember_task_proof(local, task_ref, SchedulerTaskProof::DONE);
+    return observed;
 }
 
 inline __aicore__ __gm__ SchedulerWorkerContext *
@@ -745,8 +779,7 @@ static inline __aicore__ bool scheduler_observe_fanin_prefix(
         }
         const auto &metadata = *scheduler_task_metadata_at(base, local, predecessor);
         if (!scheduler_predecessor_is_host_done(graph, predecessor, metadata)) {
-            const auto observed =
-                scheduler_observe_task_completion(scheduler_task_control_at(base, local, predecessor));
+            const auto observed = scheduler_observe_cached_completion(base, local, predecessor);
             if (observed == SchedulerCompletionObservation::INVALID) {
                 scheduler_record_error(
                     run, predecessor, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local,

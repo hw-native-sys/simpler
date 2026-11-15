@@ -855,15 +855,21 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
     scheduler_json << "],\n    \"prepared_calls\":{\"schema\":\"hbg-prepared-calls\",\"run_epoch\":"
                    << swimlane_run_epoch
                    << ",\"source\":\"host\",\"columns\":[\"execution_index\",\"node_ref\",\"task_id\","
-                      "\"block_idx\",\"subtask_slot\",\"owner\",\"phase\",\"generation\"],\"records\":[";
-    const auto &prepared = owner.layout.prepared;
+                      "\"block_idx\",\"subtask_slot\",\"owner\",\"phase\",\"generation\","
+                      "\"raw_phase\",\"return_inferred\",\"completion_state\"],\"records\":[";
+    const auto &prepared =
+        owner.layout.prepared_layout_offset == 0 ?
+            owner.layout.prepared :
+            *scheduler_state_at<SchedulerPreparedLayout>(host_base, owner.layout.prepared_layout_offset);
     const auto *prepared_controls = scheduler_state_at<SchedulerPreparedControl>(host_base, prepared.controls_offset);
     const auto *calls = scheduler_state_at<SchedulerPreparedCall>(host_base, prepared.calls_offset);
+    const auto *execution_plans = scheduler_state_at<SchedulerExecutionPlan>(host_base, prepared.plans_offset);
+    const auto *task_controls = scheduler_state_at<SchedulerTaskControl>(host_base, prepared.task_controls_offset);
     bool first_call = true;
     for (uint64_t index = 0; index < prepared.execution_count; ++index) {
         const uint64_t state = prepared_controls[index].state;
-        const auto phase = scheduler_prepared_phase(state);
-        if (phase < SchedulerPreparedPhase::BUILT || phase > SchedulerPreparedPhase::GROUP_ARMED) continue;
+        const auto raw_phase = scheduler_prepared_phase(state);
+        if (raw_phase < SchedulerPreparedPhase::BUILT || raw_phase > SchedulerPreparedPhase::GROUP_ARMED) continue;
         const auto &call = calls[index];
         const uint32_t executor = scheduler_prepared_owner(state);
         if (call.execution_index != index || call.run_epoch != swimlane_run_epoch || call.task_ref < 0 ||
@@ -872,12 +878,19 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
             LOG_WARN("A5 HBG: invalid prepared call identity at index=%" PRIu64, index);
             return false;
         }
+        const uint64_t completion = task_controls[call.task_ref].completion_state;
+        const bool inferred = scheduler_prepared_retirement_inferred(
+            state, prepared, index, call, execution_plans[call.task_ref], completion
+        );
+        const auto phase = inferred ? SchedulerPreparedPhase::RETURNED : raw_phase;
         if (!first_call) scheduler_json << ',';
         scheduler_json << '[' << index << ',' << call.task_ref << ',' << public_id(call.task_ref) << ','
                        << call.block_idx << ',' << static_cast<unsigned>(call.subtask_slot) << ',';
         if (executor == UINT32_MAX) scheduler_json << "null";
         else scheduler_json << executor;
-        scheduler_json << ',' << static_cast<unsigned>(phase) << ',' << scheduler_prepared_generation(state) << ']';
+        scheduler_json << ',' << static_cast<unsigned>(phase) << ',' << scheduler_prepared_generation(state) << ','
+                       << static_cast<unsigned>(raw_phase) << ',' << (inferred ? "true" : "false") << ',' << completion
+                       << ']';
         first_call = false;
     }
     scheduler_json << "]}\n  }";

@@ -234,8 +234,8 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
         control = controls[task["task_ref"]]
         seal = control.get("claim_seal")
         assert type(seal) is int and seal >= 0
-        cooperative = bool(task.get("flags", 0) & 16)
-        assert seal == 0 or (cooperative and seal == control["next_block"] == task["block_num"])
+        # Supply closure covers ordinary tasks too; it does not prove execution completion.
+        assert seal == 0 or seal == control["next_block"] == task["block_num"]
     minimum_blocks = 2
     sync = bool(root.get("flags", 0) & 16)
     uses_tickets = sync and minimum_blocks <= blocks < positions

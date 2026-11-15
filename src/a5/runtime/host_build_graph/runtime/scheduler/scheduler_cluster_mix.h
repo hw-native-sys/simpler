@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "scheduler_admission.h"
+#include "scheduler_completion_credit.h"
 #include "scheduler_issue.h"
 
 inline __aicore__ bool scheduler_cluster_mix_armed(uint32_t generation) { return (generation & 1U) != 0; }
@@ -173,19 +173,6 @@ scheduler_protocol_cluster_all(__gm__ void *base, const SchedulerLocalState *loc
     else scheduler_protocol_publish_record(lane);
 }
 
-static inline __aicore__ void
-scheduler_protocol_cluster_retire(__gm__ void *base, const SchedulerLocalState *local, bool before) {
-    auto *layout = scheduler_protocol_layout_at(base, local);
-    if (layout == nullptr) return;
-    const auto &group = local->cluster_mix;
-    auto *record = scheduler_protocol_cluster_block_at(base, local, group.task_ref, group.block_idx);
-    if (record == nullptr) return;
-    scheduler_protocol_stamp(
-        base, local, layout, before ? &record->owner.completion_before : &record->owner.completion_after
-    );
-    scheduler_protocol_publish_record(&record->owner);
-}
-
 inline __aicore__ bool scheduler_cluster_mix_conflicts(
     const SCHEDULER_CLUSTER_SSBUF SchedulerClusterSignal *signal, LaneMask resources, uint64_t tail,
     uint32_t *frontiers = nullptr, uint32_t *holds = nullptr
@@ -270,6 +257,7 @@ static inline __aicore__ bool scheduler_cluster_mix_claim_head(
     pending.next_fanin = 0;
     if (!scheduler_cluster_mix_publish_preparation(local, active))
         return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
+    if (!scheduler_close_ordinary_supply(graph, base, local, run, task_ref, pending.block_idx, blocks)) return false;
     *progress = true;
     return true;
 }
@@ -470,13 +458,23 @@ static inline __aicore__ bool scheduler_cluster_mix_retire(
     if (signal == nullptr || !scheduler_cluster_mix_armed(group.generation) ||
         scheduler_cluster_load_acquire(&signal->armed_generation) != group.generation)
         return scheduler_admission_fail(graph, local, run, group.task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
-    if (!scheduler_cluster_mix_all(signal->finished, scheduler_mix_resource_mask(group.active_mask), group.generation))
-        return true;
+    const LaneMask resources = scheduler_mix_resource_mask(group.active_mask);
+    bool successful = true;
+    for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+        if (!resources.has(static_cast<SubtaskSlot>(lane))) continue;
+        const uint32_t returned = scheduler_cluster_load_field(&signal->finished[lane]);
+        if (returned != group.generation && returned != group.generation + 1) return true;
+        if (group.active_mask.has(static_cast<SubtaskSlot>(lane)) && returned != group.generation) successful = false;
+    }
+    scheduler_cluster_barrier();
     scheduler_protocol_cluster_all(base, local, true);
-    scheduler_protocol_cluster_retire(base, local, true);
+    if (!successful || group.completion_submitted)
+        return scheduler_admission_fail(graph, local, run, group.task_ref, SchedulerErrorSite::GROUP_ACK_INVALID);
+    group.completion_submitted = true;
+    if (!scheduler_contribute_mix_group(graph, base, local, run, group.task_ref, group.block_idx, group.active_mask))
+        return false;
     scheduler_cluster_store_release(&signal->armed_generation, group.generation + 1);
     scheduler_cluster_store_release(&signal->staged_mask, UINT32_C(0));
-    scheduler_protocol_cluster_retire(base, local, false);
     group.phase = SchedulerGmMixPhase::IDLE;
     group.task_ref = SCHEDULER_TASK_REF_INVALID;
     group.slot_index = UINT8_MAX;
@@ -531,6 +529,7 @@ static inline __aicore__ bool scheduler_cluster_mix_observe(
     group.block_idx = block;
     group.active_mask = active;
     group.generation = generation;
+    group.completion_submitted = false;
     group.slot_index = UINT8_MAX;
     group.subtask_slot =
         active.has(static_cast<SubtaskSlot>(local->config.self_lane)) ? local->config.self_lane : UINT8_MAX;
@@ -562,11 +561,11 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_cluster_mix_se
         *progress = true;
     }
     if (group.phase != SchedulerGmMixPhase::ARRIVED) return true;
-    const bool all =
-        scheduler_cluster_mix_all(signal->arrived, scheduler_mix_resource_mask(group.active_mask), group.generation);
-    if (all) scheduler_protocol_cluster_all(base, local, false);
     if (group.subtask_slot == UINT8_MAX) {
-        if (all) {
+        if (scheduler_cluster_mix_all(
+                signal->arrived, scheduler_mix_resource_mask(group.active_mask), group.generation
+            )) {
+            scheduler_protocol_cluster_all(base, local, false);
             scheduler_protocol_cluster_ack(base, local, true, true);
             scheduler_cluster_store_release(&signal->finished[local->config.self_lane], group.generation);
             scheduler_protocol_cluster_ack(base, local, true, false);
@@ -617,7 +616,9 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_cluster_mix_se
         binding->global_context.sub_block_id = local->config.self_lane == 2 ? 1 : 0;
         *progress = true;
     }
-    if (!all) return true;
+    if (!scheduler_cluster_mix_all(signal->arrived, scheduler_mix_resource_mask(group.active_mask), group.generation))
+        return true;
+    scheduler_protocol_cluster_all(base, local, false);
     scheduler_publish_dispatch_slot(
         base, local, claim, ready, metadata, profiling_level, group.subtask_slot, group.prepare_start_cycles
     );
@@ -663,7 +664,7 @@ static inline __aicore__ bool scheduler_cluster_mix_can_enter(
 
 static inline __aicore__ bool scheduler_cluster_mix_release(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    const SchedulerLocalSlotState &completed, uint32_t slot_index
+    const SchedulerLocalSlotState &completed, uint32_t slot_index, bool successful = true
 ) {
     SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarClusterMixRelease, completed.task_ref);
     auto &group = local->cluster_mix;
@@ -673,7 +674,9 @@ static inline __aicore__ bool scheduler_cluster_mix_release(
         local->slots[slot_index].state != SchedulerDispatchSlotState::FREE)
         return scheduler_admission_fail(graph, local, run, group.task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
     scheduler_protocol_cluster_ack(base, local, true, true);
-    scheduler_cluster_store_release(&local->cluster_signal->finished[local->config.self_lane], group.generation);
+    scheduler_cluster_store_release(
+        &local->cluster_signal->finished[local->config.self_lane], group.generation + (successful ? 0 : 1)
+    );
     scheduler_protocol_cluster_ack(base, local, true, false);
     group.phase = SchedulerGmMixPhase::RELEASED;
     group.slot_index = UINT8_MAX;
@@ -718,8 +721,9 @@ static inline __aicore__ bool scheduler_cluster_mix_drain(
     if (local->is_mix_coordinator()) {
         *done = !named;
     } else {
-        *done = !named || !scheduler_cluster_mix_armed(generation) ||
-                scheduler_cluster_load_acquire(&signal->finished[local->config.self_lane]) == generation;
+        const uint32_t returned = scheduler_cluster_load_acquire(&signal->finished[local->config.self_lane]);
+        *done =
+            !named || !scheduler_cluster_mix_armed(generation) || returned == generation || returned == generation + 1;
     }
     return true;
 }
