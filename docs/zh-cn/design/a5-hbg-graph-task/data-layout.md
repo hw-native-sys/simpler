@@ -80,28 +80,34 @@ backing 基址满足 128 B 对齐。标量缓存维护仍按 64 B 行，不能�
 
 ## Native Graph 与实例参数
 
-`SchedulerNativeGraphHeader` 为 128 B、version 4。magic/version 为两个 uint32_t，
+`SchedulerNativeGraphHeader` 为 128 B、version 5。magic/version 为两个 uint32_t，
 随后依次是 image_bytes、node_count、original_task_count、definition_count、instance_count、
 bindings_offset、completion_refs_offset、templates_offset、instances_offset、readonly_end_offset、run_epoch，
 最后是 uint32_t header_bytes。没有 control inbox 区。
 
-只读区域按 header、binding、completion refs、template、instance、Definition blob、child plan、sink 排列。
+只读区域按 header、binding、completion refs、template、instance、child plan、fanin CSR、sink 排列。
 读取 header 前先以可信 scheduler_state_bytes 检查地址和长度，再核对 header.image_bytes；
 不能只相信尚未验证 header 自报的大小。offset/count、对齐、非重叠、epoch 与展开数量均校验。
+原始录制 Graph 及其 fanout、root、参数重定位记录、scalar inheritance 不复制进 native GM 镜像。
 
-每个唯一 Definition 对应一份 128 B `SchedulerGraphTemplate`：
-Definition 范围、child plans、fanin CSR、sinks、task/edge/sink 数、args_bytes、execution_count、required_heap、graph_key。
-fanin CSR 直接引用 blob 内的原始边，sink 由验证后的拓扑推导。
-这份 CSR 表达 child fanin，不是运行时后继通知表。
+每个唯一 Graph 对应一份 64 B `SchedulerGraphTemplate`：
+child plans、fanin rows/indices、sinks 的四个 offset，以及 task/edge/sink 数和 args_bytes。
+fanin CSR 只拷贝实际运行使用的前驱边，sink 由 Host 验证后的拓扑推导。
+它表达 child fanin，不是运行时后继通知表。
 
-每 child 有一份 64 B plan：16 B metadata、三个参数 offset、tensor/scalar 数和 execution prefix。
-每 instance 有一份 64 B 记录：Definition index、原始 shell ID、ENTER/child/EXIT ref、boundary 数量和地址、heap_base、args_base。
-同一 Definition 的 plan 可共享；每个 instance 的参数和控制责任独立。
+每 child 有一份 48 B plan：16 B metadata、三个参数 offset、tensor/scalar 数。
+每 instance 有一份 32 B 记录：Graph index、原始 shell ID、ENTER/child/EXIT ref 和 args_base。
+boundary 参数、heap_base 和完整 Graph 由 Host 绑定器持有；设备不读取它们。
+同一 Graph 的拓扑和 child plan 可共享；每个 instance 的参数和控制责任独立。
+
+共享录制结构的类型名是 `Graph`，头文件为 `host_build_graph/graph.h`；
+外层 framing 为 `GraphImageHeader`，按值解码结果为 `GraphImageValue`，没有旧类型 alias 或转发头。
+共享录制格式的字段与布局保持；A5 native 镜像只接受 v5，旧 native 布局直接拒绝。
 
 | 节点 | fanin 视图 |
 | ---- | ---------- |
 | TOP_KERNEL / ENTER | 顶层 fanin 经 completion_refs 映射 |
-| CHILD，有内部 producer | Definition-local indices 加 child_begin |
+| CHILD，有内部 producer | Graph-local indices 加 child_begin |
 | CHILD root | ENTER |
 | EXIT | 实例的全部 sink |
 | HOST_DONE | 已完成 gate，消费者仍正常检查 |
@@ -109,7 +115,7 @@ fanin CSR 直接引用 blob 内的原始边，sink 由验证后的拓扑推导�
 Graph row 可以有 1023 个 producer，EXIT 可以有 1024 个 sink，计数和游标使用至少 32 bit。
 普通顶层的 fanin 上限仍是 128；不能把这个限制套在 Graph 内部。
 
-Host 验证 Definition 的 tensor/scalar 区间连续、覆盖完整参数池；重叠、留洞或未使用尾部均拒绝。
+Host 验证 Graph 的 tensor/scalar 区间连续、覆盖完整参数池；重叠、留洞或未使用尾部均拒绝。
 每个 child 的参数 tail 为：
 
 ```text
@@ -119,13 +125,13 @@ align64(tensor_count * 128)
 ```
 
 空参数 child 的 tail 可以为零。Graph 总预算为 required_heap + args_bytes，
-args_base=heap_base+required_heap；tensor 描述符仍为现行 128 B，不能直接传 96 B Definition record 给 kernel。
+Host 计算 args_base=heap_base+required_heap；tensor 描述符仍为现行 128 B，不能直接传 96 B Graph record 给 kernel。
 所有乘法、加法、align-up、实例区间及 INT32_MAX 限制在发布前检查。
-Definition 预算计算一次并缓存，Graph 提交和 Host bind 使用同一算法验证。
+Graph 预算计算一次并缓存，Graph 提交和 Host bind 使用同一算法验证。
 
 PARAM 引用本次 boundary，SUB_TASK 引用本实例业务 heap；固定 scalar 按值复制，inherited scalar 来自 boundary。
 predicate 地址采用对应重定位规则，值在实际执行时按依赖顺序读取。
-Host 在 orchestration 返回前取得自有 Definition 字节与索引，不能保留 recording 临时容器的指针。
+Host 在 orchestration 返回前取得自有 Graph 字节与索引，不能保留 recording 临时容器的指针。
 
 ## Prepared execution、预算与生命周期
 
@@ -147,5 +153,5 @@ admission/group、async、args dump、trace/PMU/activity/Scalar 区及对齐空�
 
 prepare retry 重新用本轮 backing 生成全部地址；publication source 和目标由同一 pipeline slot 持有。
 异步上传失败按既有 drain/quarantine 路径保留所有权，不启动不完整的 run。
-后继 run 不能借用仍在执行或清退失败 run 的 Definition、参数、控制或 capture backing。
+后继 run 不能借用仍在执行或清退失败 run 的 Graph、参数、控制或 capture backing。
 首错、EXIT/ACK 与 post-close release 共同决定是否可回收；DONE 或缺失 ACK 都不足以证明安全退休。

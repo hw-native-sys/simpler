@@ -101,7 +101,7 @@ probe 先把一批 ordinal 绑定为 `WaitingBuilt`，再逐槽 Claim、acquire�
 
 ### 不可变 Call 与可写运行态分开
 
-一个纯核执行单元的身份为 `(run_epoch, node_ref, block_idx, subtask_slot, execution_index)`。`node_ref` 区分 native Graph 实例，不能用原始 source TaskId 或 Definition ID 替代。MIX 的分配单位是整个逻辑 block，其 active lanes 各有独立 Call。
+一个纯核执行单元的身份为 `(run_epoch, node_ref, block_idx, subtask_slot, execution_index)`。`node_ref` 区分 native Graph 实例，不能用原始 source TaskId 或 Graph ID 替代。MIX 的分配单位是整个逻辑 block，其 active lanes 各有独立 Call。
 
 | 信息 | 构造位置与使用时机 |
 | ---- | ------------------ |

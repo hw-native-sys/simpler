@@ -16,12 +16,8 @@
 
 enum class SchedulerGraphBindingError : uint32_t {
     NONE = 0,
-    NODE,
-    DEFINITION,
-    INSTANCE,
-    TENSOR,
-    SCALAR,
-    PREDICATE,
+    NODE = 1,
+    INSTANCE = 3,
 };
 
 inline __aicore__ SchedulerErrorSite scheduler_graph_binding_error_site(SchedulerGraphBindingError error) {

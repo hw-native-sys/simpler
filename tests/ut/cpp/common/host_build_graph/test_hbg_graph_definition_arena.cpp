@@ -45,7 +45,7 @@ protected:
     GraphHostStatePtr graph_state;
     std::vector<char> gm_heap;
     std::vector<std::byte> staging;
-    GraphDefinitionArena arena{};
+    GraphImageArena arena{};
 
     static constexpr size_t HEAP_BYTES = 64 * 1024;
 
@@ -67,20 +67,20 @@ protected:
     // process, where the platform has nothing retained yet.
     void bind_arena(size_t capacity) {
         staging.assign(capacity, std::byte{0});
-        arena = GraphDefinitionArena{};
+        arena = GraphImageArena{};
         arena.base = capacity == 0 ? nullptr : staging.data();
         arena.capacity = capacity;
-        arena.object_prefix_bytes = sizeof(GraphDefinitionHeader);
+        arena.object_prefix_bytes = sizeof(GraphImageHeader);
         arena.object_align = GRAPH_DEFINITION_OBJECT_ALIGN;
         graph_state = make_graph_host_state(arena);
         ASSERT_NE(graph_state, nullptr);
         orch.graph_host_state = graph_state.get();
     }
 
-    const GraphDefinition *definition_image(const GraphHostDefinition &entry) const {
+    const Graph *definition_image(const GraphHostImage &entry) const {
         const std::byte *image =
             entry.spill != nullptr ? entry.spill : arena.base + entry.object_offset + arena.object_prefix_bytes;
-        return reinterpret_cast<const GraphDefinition *>(image);
+        return reinterpret_cast<const Graph *>(image);
     }
 
     // Record one Graph of `task_count` chained tasks under `graph_key`. The chain
@@ -123,13 +123,13 @@ TEST_F(HbgGraphDefinitionArenaTest, ObjectsAreBuiltInTheArenaAtAlignedDisjointOf
     orch.graph_commit();
     ASSERT_FALSE(orch.is_fatal());
 
-    const GraphHostDefinitionList definitions = graph_host_definitions(*graph_state);
+    const GraphHostImageList definitions = graph_host_definitions(*graph_state);
     ASSERT_EQ(definitions.entries.size(), 2u);
 
     const size_t used = graph_host_arena_used(*graph_state);
     EXPECT_LE(used, arena.capacity);
     size_t claimed_total = 0;
-    for (const GraphHostDefinition &entry : definitions.entries) {
+    for (const GraphHostImage &entry : definitions.entries) {
         EXPECT_EQ(entry.spill, nullptr) << "an arena this size has room for every object";
         ASSERT_NE(entry.object_offset, GRAPH_NO_OBJECT_OFFSET);
         EXPECT_EQ(entry.object_offset % GRAPH_DEFINITION_OBJECT_ALIGN, 0u);
@@ -138,7 +138,7 @@ TEST_F(HbgGraphDefinitionArenaTest, ObjectsAreBuiltInTheArenaAtAlignedDisjointOf
             (object_bytes + GRAPH_DEFINITION_OBJECT_ALIGN - 1) & ~(GRAPH_DEFINITION_OBJECT_ALIGN - 1);
         claimed_total += claimed;
         EXPECT_LE(entry.object_offset + claimed, used) << "the claimed prefix must cover every object in it";
-        const GraphDefinition *image = definition_image(entry);
+        const Graph *image = definition_image(entry);
         EXPECT_EQ(image->graph_key, entry.graph_key);
         EXPECT_EQ(image->total_bytes, entry.bytes);
         EXPECT_GT(image->task_count, 0u) << "the object holds a filled image, not just claimed bytes";
@@ -149,8 +149,8 @@ TEST_F(HbgGraphDefinitionArenaTest, ObjectsAreBuiltInTheArenaAtAlignedDisjointOf
 
     // Distinct offsets alone would pass if two objects overlapped, so pin the
     // disjointness the shared block depends on.
-    const GraphHostDefinition &first = definitions.entries[0];
-    const GraphHostDefinition &second = definitions.entries[1];
+    const GraphHostImage &first = definitions.entries[0];
+    const GraphHostImage &second = definitions.entries[1];
     const size_t first_end = first.object_offset + arena.object_prefix_bytes + first.bytes;
     const size_t second_end = second.object_offset + arena.object_prefix_bytes + second.bytes;
     EXPECT_TRUE(first_end <= second.object_offset || second_end <= first.object_offset)
@@ -163,7 +163,7 @@ TEST_F(HbgGraphDefinitionArenaTest, ObjectsAreBuiltInTheArenaAtAlignedDisjointOf
         const std::optional<GraphHostUpload> upload = graph_host_upload(*graph_state, i);
         ASSERT_TRUE(upload.has_value());
         size_t matches = 0;
-        for (const GraphHostDefinition &entry : definitions.entries) {
+        for (const GraphHostImage &entry : definitions.entries) {
             if (entry.graph_key != upload->graph_key) continue;
             EXPECT_EQ(definition_image(entry)->total_bytes, entry.bytes) << "shell " << i;
             matches++;
@@ -185,14 +185,14 @@ TEST_F(HbgGraphDefinitionArenaTest, AnArenaWithNoRoomSpillsAndStillPublishesTheI
     orch.graph_commit();
     ASSERT_FALSE(orch.is_fatal()) << "outgrowing the arena must cost a copy, not the run";
 
-    const GraphHostDefinitionList definitions = graph_host_definitions(*graph_state);
+    const GraphHostImageList definitions = graph_host_definitions(*graph_state);
     ASSERT_EQ(definitions.entries.size(), 1u);
-    const GraphHostDefinition &entry = definitions.entries[0];
+    const GraphHostImage &entry = definitions.entries[0];
     ASSERT_NE(entry.spill, nullptr);
     EXPECT_EQ(entry.object_offset, GRAPH_NO_OBJECT_OFFSET);
     EXPECT_EQ(graph_host_arena_used(*graph_state), 0u) << "nothing was claimed, so the upload ships no prefix";
 
-    const GraphDefinition *image = definition_image(entry);
+    const Graph *image = definition_image(entry);
     EXPECT_EQ(image->graph_key, entry.graph_key);
     EXPECT_EQ(image->total_bytes, entry.bytes);
     EXPECT_GT(image->task_count, 0u) << "the spill holds a filled image, not just sized bytes";
@@ -205,7 +205,7 @@ TEST_F(HbgGraphDefinitionArenaTest, AnArenaWithNoRoomSpillsAndStillPublishesTheI
 TEST_F(HbgGraphDefinitionArenaTest, AnArenaTooSmallForAnObjectSpillsIt) {
     // Big enough to be a real region and far too small for any image: a Definition
     // carries its sections past the header, so no recording fits in this.
-    bind_arena(sizeof(GraphDefinition));
+    bind_arena(sizeof(Graph));
 
     std::array<uint32_t, 16> storage{};
     uint32_t shape[] = {static_cast<uint32_t>(storage.size())};
@@ -216,7 +216,7 @@ TEST_F(HbgGraphDefinitionArenaTest, AnArenaTooSmallForAnObjectSpillsIt) {
     orch.graph_commit();
     ASSERT_FALSE(orch.is_fatal());
 
-    const GraphHostDefinitionList definitions = graph_host_definitions(*graph_state);
+    const GraphHostImageList definitions = graph_host_definitions(*graph_state);
     ASSERT_EQ(definitions.entries.size(), 1u);
     EXPECT_NE(definitions.entries[0].spill, nullptr);
     EXPECT_EQ(definitions.entries[0].object_offset, GRAPH_NO_OBJECT_OFFSET);

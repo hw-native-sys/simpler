@@ -35,7 +35,7 @@ inline const TaskPayload &payload(const void *image, const sm_layout::SegmentOff
     return (reinterpret_cast<const ChipTaskStorage *>(static_cast<const char *>(image) + layout.storage) + task)
         ->payload;
 }
-inline bool graph_storage_bytes(const GraphDefinition &definition, uint64_t *bytes) {
+inline bool graph_storage_bytes(const Graph &definition, uint64_t *bytes) {
     GraphExecutionStorageLayout layout{};
     if (!graph_execution_storage_layout(
             definition.task_count, definition.tensor_arg_count, definition.scalar_arg_count, definition.edge_count,

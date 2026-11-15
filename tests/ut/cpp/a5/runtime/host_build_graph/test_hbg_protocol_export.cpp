@@ -94,7 +94,7 @@ TEST(ProtocolGraphSourceTest, CopiesOriginalCsrAndDeduplicatesDefinitionsByKey) 
     scheduler_test::BasicGraphBuffer<2> original(2);
     original.payload(1).fanin_count = 1;
     original.payload(1).fanin_data()[0] = 0;
-    GraphDefinition def{};
+    Graph def{};
     def.graph_key = 31;
     def.task_count = 2;
     def.edge_count = 1;
@@ -114,7 +114,7 @@ TEST(ProtocolGraphSourceTest, CopiesOriginalCsrAndDeduplicatesDefinitionsByKey) 
     ASSERT_NE(first_key, std::string::npos);
     EXPECT_EQ(json.find("\"graph_key\":31", first_key + 1), std::string::npos);
     EXPECT_EQ(json.find("\"node_map\""), std::string::npos);
-    bytes.resize(sizeof(GraphDefinition) - 1);
+    bytes.resize(sizeof(Graph) - 1);
     EXPECT_THROW(scheduler_protocol_freeze_source(original.graph(), {{1, 0}, {1, 0}}, bytes), std::invalid_argument);
 }
 

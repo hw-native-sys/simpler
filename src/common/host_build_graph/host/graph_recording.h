@@ -339,8 +339,8 @@ size_t graph_recorder_storage_failures();
 
 bool graph_classify_tensor(const GraphRecording &recording, int32_t task_index, const simpler::hbg::Tensor &tensor);
 
-std::optional<GraphDefinition> graph_layout_definition(const GraphRecording &recording);
+std::optional<Graph> graph_layout_definition(const GraphRecording &recording);
 
-bool graph_fill_definition(const GraphRecording &recording, GraphDefinition definition, std::byte *image);
+bool graph_fill_definition(const GraphRecording &recording, Graph definition, std::byte *image);
 
-const GraphDefinition *graph_definition(const std::byte *data, size_t bytes);
+const Graph *graph_definition(const std::byte *data, size_t bytes);

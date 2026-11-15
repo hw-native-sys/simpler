@@ -204,10 +204,10 @@ inline TemplateResult build_graph_template(
  */
 inline TemplateResult
 read_graph_template(const GraphImageView &view, uint32_t image_offset, uint64_t worker_count, HostGraphTemplate *out) {
-    GraphDefinitionValue object{};
+    GraphImageValue object{};
     if (!graph_definition_decode_framed(view, image_offset, &object))
         return TemplateResult{TemplateStatus::MALFORMED, "the Definition does not decode", -1};
-    const GraphDefinition &definition = object.definition;
+    const Graph &definition = object.definition;
     if (definition.task_count <= 0 || definition.task_count > SUB_TASK_MAX_NUM || definition.edge_count < 0)
         return TemplateResult{TemplateStatus::MALFORMED, "the Definition's counts are out of range", -1};
 

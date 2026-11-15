@@ -415,8 +415,8 @@ bool graph_submit_outer(
 }
 
 bool graph_submit_definition(
-    OrchestratorState *orch, GraphHostState *state, const GraphDefinition *definition,
-    const GraphDefinitionRecord &record, const GraphTaskArgs &args, TaskId *submitted_id
+    OrchestratorState *orch, GraphHostState *state, const Graph *definition, const GraphCacheRecord &record,
+    const GraphTaskArgs &args, TaskId *submitted_id
 ) {
     // A published Definition is this process's own product: a null one, a zero-byte
     // execution image, or a heap total that overflows cannot come from a recording this
@@ -457,9 +457,9 @@ bool graph_finalize_pending_submissions(OrchestratorState *orch, GraphHostState 
     for (GraphPendingUpload &pending : state->pending_uploads) {
         if (!pending.deferred_heap) continue;
         auto definition_it = state->definitions.find(pending.graph_key);
-        const GraphDefinition *definition = definition_it == state->definitions.end() ?
-                                                nullptr :
-                                                graph_record_definition(*state, definition_it->second);
+        const Graph *definition = definition_it == state->definitions.end() ?
+                                      nullptr :
+                                      graph_record_definition(*state, definition_it->second);
         if (definition == nullptr || definition->execution_storage_bytes == 0 ||
             definition->required_heap > UINT64_MAX - definition->execution_storage_bytes ||
             pending.outer_slot == nullptr || pending.outer_slot->task_kind != TaskKind::GRAPH) {
@@ -1062,12 +1062,12 @@ bool OrchestratorState::graph_end() {
     }
 
     ORCH_PHASE_START();
-    std::optional<GraphDefinition> layout = graph_layout_definition(*recording);
+    std::optional<Graph> layout = graph_layout_definition(*recording);
     // The claim is what decides where this thread writes, so it precedes the fill
     // and never moves the arena: a Definition the retained capacity cannot hold is
     // built in a buffer of its own and copied at upload instead, which keeps the
     // run correct while the next one's arena is sized for it.
-    GraphDefinitionRecord record;
+    GraphCacheRecord record;
     std::byte *image = nullptr;
     if (layout.has_value()) {
         record.bytes = layout->total_bytes;
@@ -1088,7 +1088,7 @@ bool OrchestratorState::graph_end() {
         record.boundary_match_info = recording->bound_boundary().match_info;
         ORCH_PHASE_END_WITH_INDEX(HostPhaseKind::OrchBuildDefinition, recording->task_count, entry->submit_idx);
     }
-    const GraphDefinition *header = built ? graph_record_definition(*state, record) : nullptr;
+    const Graph *header = built ? graph_record_definition(*state, record) : nullptr;
     if (header == nullptr) {
         debug_assert(false && "The recorded Graph contains a construct that Graph Execution does not support");
         LOG_WARN("%s", "[GraphExecution] asynchronous recording produced an unsupported Graph");

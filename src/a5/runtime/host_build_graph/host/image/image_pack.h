@@ -119,7 +119,7 @@ inline const TaskImagePayload &payload(const void *image, const sm_layout::Segme
         ->payload;
 }
 
-inline bool graph_storage_bytes(const GraphDefinition &definition, uint64_t *bytes) {
+inline bool graph_storage_bytes(const Graph &definition, uint64_t *bytes) {
     return graph_native_argument_storage_bytes(definition, bytes);
 }
 }  // namespace task_image

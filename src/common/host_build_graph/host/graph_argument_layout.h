@@ -14,7 +14,7 @@
 #include <cstdint>
 #include <cstring>
 
-#include "host_build_graph/graph_definition.h"
+#include "host_build_graph/graph.h"
 #include "host_build_graph/tensor.h"
 
 inline bool graph_argument_layout_child(
@@ -37,7 +37,7 @@ inline bool graph_argument_layout_child(
            (!predicate || reserve(64, predicate_offset));
 }
 
-inline bool graph_native_argument_storage_bytes(const GraphDefinition &definition, uint64_t *bytes) {
+inline bool graph_native_argument_storage_bytes(const Graph &definition, uint64_t *bytes) {
     if (bytes == nullptr || definition.task_count <= 0 || definition.task_count > SUB_TASK_MAX_NUM ||
         definition.off_sub_tasks > definition.total_bytes ||
         static_cast<uint64_t>(definition.task_count) >

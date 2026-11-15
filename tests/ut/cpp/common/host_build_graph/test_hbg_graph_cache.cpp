@@ -872,13 +872,13 @@ TEST(GraphExecutionReplay, RejectsBoundaryScalarPoolBeyondContract) {
     EXPECT_EQ(heap.initialize_execution(definition_object, reinterpret_cast<uint64_t>(boundary.data()), 21), nullptr);
 }
 
-TEST(GraphDefinitionObject, RejectsDefinitionBeyondRetainedBytes) {
+TEST(GraphImageObject, RejectsDefinitionBeyondRetainedBytes) {
     constexpr uint64_t GRAPH_KEY_VALUE = 0x4567;
     std::array<uint8_t, 64> boundary{};
     const std::vector<std::byte> definition =
         make_test_definition(GRAPH_KEY_VALUE, reinterpret_cast<uint64_t>(boundary.data()));
-    ASSERT_GT(definition.size(), sizeof(GraphDefinition));
-    const TestDefinitionObject definition_object(definition, sizeof(GraphDefinition));
+    ASSERT_GT(definition.size(), sizeof(Graph));
+    const TestDefinitionObject definition_object(definition, sizeof(Graph));
     OuterHeap heap(definition);
     EXPECT_EQ(heap.initialize_execution(definition_object, reinterpret_cast<uint64_t>(boundary.data()), 17), nullptr);
 }
@@ -887,7 +887,7 @@ TEST(GraphDefinitionObject, RejectsDefinitionBeyondRetainedBytes) {
 // separately written things. The header's Graph key is what says they belong
 // together, and an object that fails that agreement must be refused rather than
 // replayed — that mismatch is the whole failure mode of packing objects by offset.
-TEST(GraphDefinitionObject, RejectsHeaderFramingAnotherGraph) {
+TEST(GraphImageObject, RejectsHeaderFramingAnotherGraph) {
     constexpr uint64_t GRAPH_KEY_VALUE = 0x4567;
     std::array<uint8_t, 64> boundary{};
     const std::vector<std::byte> definition =
@@ -908,13 +908,13 @@ TEST(GraphDefinitionObject, RejectsHeaderFramingAnotherGraph) {
 // localize. It matters because every CSR section is fetched with `task_count + 1`, so a
 // -1 that reached bind_graph_topology would ask for zero elements, get a live pointer,
 // and read fanin_offsets one slot before the array.
-TEST(GraphDefinitionObject, RejectsNonPositiveSubTaskCount) {
+TEST(GraphImageObject, RejectsNonPositiveSubTaskCount) {
     constexpr uint64_t GRAPH_KEY_VALUE = 0x4567;
     std::array<uint8_t, 64> boundary{};
     for (const int32_t task_count : {-1, 0}) {
         std::vector<std::byte> definition =
             make_test_definition(GRAPH_KEY_VALUE, reinterpret_cast<uint64_t>(boundary.data()));
-        reinterpret_cast<GraphDefinition *>(definition.data())->task_count = task_count;
+        reinterpret_cast<Graph *>(definition.data())->task_count = task_count;
         const TestDefinitionObject definition_object(definition);
         OuterHeap heap(definition);
         EXPECT_EQ(
@@ -930,7 +930,7 @@ TEST(GraphDefinitionObject, RejectsNonPositiveSubTaskCount) {
 // remaining span, so both `offset > count` and `count > total - offset` pass. Only the
 // explicit negative test in bind_graph_topology rejects it, and it belongs there rather
 // than in the per-slice materialize path, which runs after the pointer is bound.
-TEST(GraphDefinitionObject, RejectsNegativeSubTaskArgOffset) {
+TEST(GraphImageObject, RejectsNegativeSubTaskArgOffset) {
     constexpr uint64_t GRAPH_KEY_VALUE = 0x4567;
     std::array<uint8_t, 64> boundary{};
     std::vector<std::byte> definition =
@@ -943,7 +943,7 @@ TEST(GraphDefinitionObject, RejectsNegativeSubTaskArgOffset) {
         ) << "the unmodified Definition localizes";
     }
 
-    auto *header = reinterpret_cast<GraphDefinition *>(definition.data());
+    auto *header = reinterpret_cast<Graph *>(definition.data());
     auto *tasks = reinterpret_cast<SubTaskDefinition *>(definition.data() + header->off_sub_tasks);
     tasks[1].tensor_offset = -1;
     const TestDefinitionObject definition_object(definition);
@@ -951,12 +951,12 @@ TEST(GraphDefinitionObject, RejectsNegativeSubTaskArgOffset) {
     EXPECT_EQ(heap.initialize_execution(definition_object, reinterpret_cast<uint64_t>(boundary.data()), 17), nullptr);
 }
 
-TEST(GraphDefinitionObject, RejectsHighLaneBitsInWireImage) {
+TEST(GraphImageObject, RejectsHighLaneBitsInWireImage) {
     constexpr uint64_t GRAPH_KEY_VALUE = 0x4567;
     std::array<uint8_t, 64> boundary{};
     std::vector<std::byte> definition =
         make_test_definition(GRAPH_KEY_VALUE, reinterpret_cast<uint64_t>(boundary.data()));
-    auto *header = reinterpret_cast<GraphDefinition *>(definition.data());
+    auto *header = reinterpret_cast<Graph *>(definition.data());
     auto *tasks = reinterpret_cast<SubTaskDefinition *>(definition.data() + header->off_sub_tasks);
     const uint8_t invalid_lanes = 0x80;
     // A serialized image can carry bytes that no LaneMask constructor produces.
@@ -1081,17 +1081,17 @@ namespace {
 class SectionBuffer {
 public:
     SectionBuffer(const std::vector<std::byte> &definition, size_t lead_bytes, size_t misalign = 0) {
-        const size_t object_bytes = sizeof(GraphDefinitionHeader) + definition.size();
+        const size_t object_bytes = sizeof(GraphImageHeader) + definition.size();
         bytes_.assign(misalign + lead_bytes + object_bytes, std::byte{0});
-        image_offset_ = lead_bytes + sizeof(GraphDefinitionHeader);
+        image_offset_ = lead_bytes + sizeof(GraphImageHeader);
         std::byte *object = bytes_.data() + misalign + lead_bytes;
-        GraphDefinitionHeader header{};
-        const auto *def = reinterpret_cast<const GraphDefinition *>(definition.data());
+        GraphImageHeader header{};
+        const auto *def = reinterpret_cast<const Graph *>(definition.data());
         header.magic = GRAPH_DEFINITION_OBJECT_MAGIC;
         header.definition_bytes = static_cast<uint32_t>(definition.size());
         header.graph_key = def->graph_key;
         std::memcpy(object, &header, sizeof(header));
-        std::memcpy(object + sizeof(GraphDefinitionHeader), definition.data(), definition.size());
+        std::memcpy(object + sizeof(GraphImageHeader), definition.data(), definition.size());
         section_ = bytes_.data() + misalign;
         section_bytes_ = lead_bytes + object_bytes;
     }
@@ -1129,11 +1129,11 @@ TEST(GraphImageSection, DecodesAtAnUnalignedBase) {
 
     SectionBuffer aligned(definition, /*lead_bytes=*/0);
     SectionBuffer misaligned(definition, /*lead_bytes=*/0, /*misalign=*/1);
-    ASSERT_NE(reinterpret_cast<uintptr_t>(misaligned.view().section) % alignof(GraphDefinitionHeader), 0U)
+    ASSERT_NE(reinterpret_cast<uintptr_t>(misaligned.view().section) % alignof(GraphImageHeader), 0U)
         << "this case is only meaningful against a base no type's alignment covers";
 
-    GraphDefinitionValue from_aligned{};
-    GraphDefinitionValue from_misaligned{};
+    GraphImageValue from_aligned{};
+    GraphImageValue from_misaligned{};
     ASSERT_TRUE(graph_definition_decode_framed(aligned.view(), aligned.image_offset(), &from_aligned));
     ASSERT_TRUE(graph_definition_decode_framed(misaligned.view(), misaligned.image_offset(), &from_misaligned));
     EXPECT_EQ(from_misaligned.definition.graph_key, from_aligned.definition.graph_key);
@@ -1157,8 +1157,8 @@ TEST(GraphImageSection, DecodesAtAnUnalignedBase) {
 TEST(GraphImageSection, RefusesReadsOutsideTheObjectOrTheSection) {
     std::array<uint8_t, 64> boundary{};
     const std::vector<std::byte> definition = make_test_definition(0x5252, reinterpret_cast<uint64_t>(boundary.data()));
-    SectionBuffer section(definition, /*lead_bytes=*/sizeof(GraphDefinitionHeader) * 2);
-    GraphDefinitionValue object{};
+    SectionBuffer section(definition, /*lead_bytes=*/sizeof(GraphImageHeader) * 2);
+    GraphImageValue object{};
     ASSERT_TRUE(graph_definition_decode_framed(section.view(), section.image_offset(), &object));
 
     // An offset of zero is "absent", and one past the image is corrupt.
@@ -1184,17 +1184,17 @@ TEST(GraphImageSection, RefusesReadsOutsideTheObjectOrTheSection) {
 
     // A section that no longer contains the object it frames is refused before
     // any offset inside it is used.
-    GraphDefinitionValue truncated{};
+    GraphImageValue truncated{};
     EXPECT_FALSE(graph_definition_decode_framed(section.truncated_view(), section.image_offset(), &truncated));
 
     // Framing the object around another Graph, and claiming a size the image
     // does not have, are both rejected by value.
-    auto *header = reinterpret_cast<GraphDefinitionHeader *>(
-        section.mutable_section() + section.image_offset() - sizeof(GraphDefinitionHeader)
+    auto *header = reinterpret_cast<GraphImageHeader *>(
+        section.mutable_section() + section.image_offset() - sizeof(GraphImageHeader)
     );
     const uint64_t good_key = header->graph_key;
     header->graph_key = good_key ^ 0xFFULL;
-    GraphDefinitionValue reframed{};
+    GraphImageValue reframed{};
     EXPECT_FALSE(graph_definition_decode_framed(section.view(), section.image_offset(), &reframed));
     header->graph_key = good_key;
     header->magic = 0;
@@ -1209,7 +1209,7 @@ TEST(GraphImageSection, ExecutionSurvivesTheLocalizersPackage) {
     std::array<uint8_t, 64> boundary{};
     const std::vector<std::byte> definition =
         make_test_definition(GRAPH_KEY_VALUE, reinterpret_cast<uint64_t>(boundary.data()));
-    const auto *source_definition = reinterpret_cast<const GraphDefinition *>(definition.data());
+    const auto *source_definition = reinterpret_cast<const Graph *>(definition.data());
 
     OuterHeap heap(definition, 0xAA);
     TestDefinitionObject localizer_package(definition);
