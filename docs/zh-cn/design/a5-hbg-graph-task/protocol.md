@@ -52,6 +52,7 @@ predicate 在支持的单 block/lane 形状下按依赖顺序求值；false 跳�
 
 普通 MIX 使用每 cluster 的资源协议。active mask 决定真实 kernel lane，resource mask 还包含 AIC coordinator。
 AIC 发现 MIX 并保留对应 block 的 group reservation；AIV 按已经发布的具体 group 参加，不能自由执行其他 cluster 的 slot。
+coordinator 写回 descriptor 并 barrier 后发布对应 lane 的 assigned_seq；arrived_seq/released_seq 记录各 lane 的进出责任。
 GROUP_RESERVED 可以等待 fanin；只有发现 ready replacement 才能 park 并转移该准备责任。
 任一替代发现都保留 owner/generation、fanin 重查和资源等待的让出界限。
 

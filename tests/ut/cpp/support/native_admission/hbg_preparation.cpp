@@ -45,7 +45,7 @@ struct EntryPoints {
     void (*entry)(const ChipTaskArgs &);
     void (*bind)(OrchContext *);
     void (*finish)();
-} entry_points{entry, bind, nullptr}, other_entry_points{other_entry, other_bind, nullptr};
+} entry_points{entry, bind, []() {}}, other_entry_points{other_entry, other_bind, []() {}};
 }  // namespace
 
 void *primary_entry_points() { return &entry_points; }

@@ -21,9 +21,9 @@ enum class SchedulerGraphBindingError : uint32_t {
 };
 
 inline __aicore__ SchedulerErrorSite scheduler_graph_binding_error_site(SchedulerGraphBindingError error) {
-    return static_cast<SchedulerErrorSite>(
-        static_cast<uint64_t>(SchedulerErrorSite::GRAPH_BIND_NODE) + static_cast<uint32_t>(error) - 1
-    );
+    if (error == SchedulerGraphBindingError::NODE) return SchedulerErrorSite::GRAPH_BIND_NODE;
+    if (error == SchedulerGraphBindingError::INSTANCE) return SchedulerErrorSite::GRAPH_BIND_INSTANCE;
+    return SchedulerErrorSite::UNKNOWN;
 }
 
 static inline __aicore__ void scheduler_graph_argument_cache_lines(uint64_t address, uint64_t bytes) {

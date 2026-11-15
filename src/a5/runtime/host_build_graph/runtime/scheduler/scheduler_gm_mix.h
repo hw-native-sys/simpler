@@ -225,7 +225,6 @@ static inline __aicore__ bool scheduler_gm_mix_publish(
     for (uint32_t offset = 0; offset < sizeof(*descriptor); offset += 64)
         scheduler_writeback_cache_line(reinterpret_cast<__gm__ uint8_t *>(descriptor) + offset);
     scheduler_cache_barrier();
-    scheduler_gm_store(mailbox->published_seq, group.group_seq);
     for (uint8_t lane = 1; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
         if (admission.current_resource_mask.has(static_cast<SubtaskSlot>(lane))) {
             scheduler_gm_store(mailbox->lanes[lane].assigned_seq, group.group_seq);

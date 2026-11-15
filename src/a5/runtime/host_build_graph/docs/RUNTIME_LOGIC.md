@@ -43,8 +43,12 @@ whole graph before any device task can complete.
 shared object, opens it with `dlopen(RTLD_LOCAL)`, and resolves:
 
 - `aicpu_orchestration_config`;
-- `aicpu_orchestration_entry`; and
-- `framework_bind_orch_context`.
+- `aicpu_orchestration_entry`;
+- `framework_bind_orch_context`; and
+- `framework_finish_orch`.
+
+Both bind and finish callbacks are mandatory. Finish releases the per-bind registry
+before the orchestration context is unbound, including failed binds.
 
 The resolved handle and entry points belong to the registered callable and stay
 alive across prepared runs. Unregister/context teardown closes the handle and

@@ -33,7 +33,6 @@ static inline __aicore__ bool scheduler_discover_cooperative_task(
     const int64_t task_ref = catalog.refs[local->cooperative_scan_cursor];
     if (++local->cooperative_scan_cursor == catalog.count) {
         local->cooperative_scan_cursor = 0;
-        ++local->cooperative_scan_round;
     }
     if (!scheduler_task_ref_valid(graph, task_ref))
         return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::ADMISSION_INVALID_RECORD);

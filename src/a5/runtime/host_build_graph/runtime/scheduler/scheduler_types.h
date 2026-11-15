@@ -423,8 +423,7 @@ struct alignas(64) SchedulerGroupLaneAck {
 
 struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerGroupMailbox {
     SchedulerGroupDescriptor descriptor;
-    alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t published_seq;
-    SchedulerGroupLaneAck lanes[3];
+    alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerGroupLaneAck lanes[3];
 };
 
 enum class SchedulerTopologyLayout : uint64_t { GENERAL = 0, COMPACT_LAUNCH = 1 };
@@ -464,26 +463,14 @@ struct SchedulerExecutorTaskTrace {
 enum class SchedulerErrorSite : uint64_t {
     UNKNOWN = 0,
     ROUTE_INVALID_STATE = 2,
-    READY_POP_INVALID_HEAD = 40,
-    READY_POP_INVALID_LINK = 41,
     DISPATCH_INVALID_SHAPE = 44,
     DISPATCH_INVALID_CALLABLE = 45,
     DISPATCH_MATERIALIZE_FAILED = 46,
     DISPATCH_INVALID_PREDICATE = 47,
     EXECUTOR_INVALID_DISPATCH_SLOT = 50,
-    BOOTSTRAP_WAKE_INVALID_HEAD = 60,
     COMPLETION_TASK_NOT_DONE = 61,
-    COMPLETION_WAKE_ALREADY_CLOSED = 62,
-    COMPLETION_INVALID_WAITER = 63,
-    COMPLETION_WAITER_NOT_EXECUTABLE = 64,
-    COMPLETION_READY_APPEND_FAILED = 65,
-    COMPLETION_READY_PUBLISH_FAILED = 66,
-    COMPLETION_INVALID_SHAPE = 67,
-    COMPLETION_RESOLVE_FAILED = 68,
-    COMPLETION_REFILL_DISPATCH_FAILED = 70,
     COMPLETION_SLOT_BINDING_INVALID = 74,
     EXECUTOR_PREFERRED_SLOT_INVALID = 79,
-    READY_INBOX_REFRESH_FAILED = 80,
     BOOTSTRAP_FAILED = 90,
     CONTEXT_READY_TIMEOUT = 91,
     BOOTSTRAP_SCAN_TIMEOUT = 92,
@@ -512,16 +499,11 @@ enum class SchedulerErrorSite : uint64_t {
     ORDERED_EXIT_IN_FLIGHT = 125,
     ORDERED_EXIT_TIMEOUT = 126,
     GRAPH_BIND_NODE = 130,
-    GRAPH_BIND_DEFINITION = 131,
     GRAPH_BIND_INSTANCE = 132,
-    GRAPH_BIND_TENSOR = 133,
-    GRAPH_BIND_SCALAR = 134,
-    GRAPH_BIND_PREDICATE = 135,
     ASYNC_CONTEXT_INVALID = 140,
     ASYNC_SEAL_FAILED = 141,
     ASYNC_CHECK_FAILED = 142,
     ASYNC_FINISH_FAILED = 143,
-    ASYNC_BLOCK_RELEASE_FAILED = 144,
     ARGS_DUMP_BOUNDARY_TIMEOUT = 150,
     ARGS_DUMP_REFUSED = 151,
     ARGS_DUMP_ABORT_TIMEOUT = 152,
@@ -744,8 +726,7 @@ static_assert(offsetof(SchedulerGroupDescriptor, cluster_index) == 36);
 static_assert(offsetof(SchedulerGroupDescriptor, previous_lane_seq) == 40);
 static_assert(sizeof(SchedulerGroupLaneAck) == 64, "lane acknowledgements require separate atomic regions");
 static_assert(sizeof(SchedulerGroupMailbox) == 384, "group mailbox layout changed");
-static_assert(offsetof(SchedulerGroupMailbox, published_seq) == 128, "descriptor and publication must be separate");
-static_assert(offsetof(SchedulerGroupMailbox, lanes) == 192, "each lane must own its acknowledgement region");
+static_assert(offsetof(SchedulerGroupMailbox, lanes) == 128, "descriptor and acknowledgements must be separate");
 static_assert(sizeof(SchedulerGraphSummary) == 192, "graph summary layout changed");
 static_assert(offsetof(SchedulerGraphSummary, async_layout_offset) == 120);
 static_assert(offsetof(SchedulerGraphSummary, prepared_layout_offset) == 128);

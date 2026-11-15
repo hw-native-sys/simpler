@@ -226,7 +226,7 @@ TEST(ResidentArgsDumpBoundary, AckObservationRejectsSameCommitWithANewTickAndInc
     }
 }
 TEST(ResidentArgsDumpBoundary, RequestAdvancePreservesWaitingParticipantsPhaseProgress) {
-    SchedulerArgsDumpRequest request{11, 3, 0, 7, 1, 2, 0, 0};
+    SchedulerArgsDumpRequest request{11, 3, 0, 7, 1, 2, 0};
     const uint64_t previous_bytes = request.byte_cursor;
     SchedulerArgsDumpAck ack{11, 3, 0, 7, 1, 2, 65536, 0};
     ack.status = scheduler_args_dump_ack_commit(3, 0, SchedulerArgsDumpStatus::InProgress);
