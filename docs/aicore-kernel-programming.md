@@ -82,6 +82,15 @@ path, which can surface as an AICPU exception. This API does not introduce a
 typed Python exception or certify worker reuse after failure. Diagnostics work
 with DFX disabled. Argument values and ranges are not transported by this API.
 
+The final AICPU entry must return a nonzero status for a failed computation,
+even after all cores and asynchronous requests have retired. Publishing a
+private run result does not replace the stream failure. This applies to both
+Program and Kernel execution: an eager caller stream or captured model must
+observe the failure without depending on a Program Host observer. A failed
+stream is not a physical-completion or device-health proof; its resources and
+Worker remain isolated until the platform can establish safe retirement and
+recovery. Failed Program outputs are not delivered to the caller.
+
 Local A2/A3 TMR also supports partial SPMD failure, gated dispatch and
 cooperatively cancellable MIX lanes. A lane that can wait for a failed partner
 must poll at bounded work boundaries and return when cancellation is requested:

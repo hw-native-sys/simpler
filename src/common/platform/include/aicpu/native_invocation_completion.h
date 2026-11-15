@@ -110,7 +110,8 @@ public:
                 publication != NativeTerminalPublication::NotRequested
             );
         complete();
-        // Preserve a real execution error even if its private record is invalid.
+        // A published result and completed cleanup do not turn a computation
+        // failure into a successful stream result, including without a Host observer.
         return publication != NativeTerminalPublication::InvalidState || result.code != 0 ? result.code :
                                                                                             kInternalError;
     }
