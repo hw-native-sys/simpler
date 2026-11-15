@@ -211,6 +211,9 @@ class _FakeDirectCWorker:
         self.owner_nonce = owner_nonce
         self.allocate_specs: list[Any] = []
 
+    def check_control_payloads_retired(self) -> None:
+        return None
+
     def close(self) -> None:
         return None
 

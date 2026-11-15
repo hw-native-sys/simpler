@@ -85,7 +85,7 @@ TEST(MemoryAllocatorTest, FinalizeReleasesAllAndZeroesCounter) {
     ASSERT_NE(a.alloc(512), nullptr);
     EXPECT_EQ(a.committed_bytes(), 128u + 512u);
 
-    EXPECT_EQ(a.finalize(), 0);  // sim finalize is infallible
+    EXPECT_EQ(a.finalize(), 0);  // Finalization of ordinary allocations is infallible.
     EXPECT_EQ(a.committed_bytes(), 0u);
     EXPECT_EQ(a.get_allocation_count(), 0u);
 

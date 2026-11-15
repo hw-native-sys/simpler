@@ -35,6 +35,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -50,6 +51,7 @@
 
 class Ring;  // forward decl — owns the slot state pool
 class WorkerManager;
+class PosixShmHolder;
 
 // =============================================================================
 // Unified mailbox layout (PROCESS mode)
@@ -630,6 +632,9 @@ public:
     virtual std::vector<uint8_t> control_remote_domain(
         remote_l3::ControlName control_name, const std::vector<uint8_t> &command_bytes, bool group_target = false
     );
+    virtual void check_control_payload_retired() {}
+    virtual std::vector<uint8_t>
+    control_payload(uint64_t sub_cmd, const void *payload, size_t payload_size, double timeout_s, bool retiring);
     virtual void control_generic(
         uint64_t sub_cmd, const char *shm_name, size_t payload_size, double timeout_s, const uint8_t *digest
     );
@@ -707,6 +712,10 @@ public:
         int32_t importer_worker_id, const RemoteBufferExport &export_desc, uint32_t requested_access_flags
     ) override;
     void control_remote_release_import(const RemoteBufferHandle &handle) override;
+    std::vector<uint8_t> control_payload(
+        uint64_t sub_cmd, const void *payload, size_t payload_size, double timeout_s, bool retiring
+    ) override;
+    void check_control_payload_retired() override;
     void control_generic(
         uint64_t sub_cmd, const char *shm_name, size_t payload_size, double timeout_s, const uint8_t *digest
     ) override;
@@ -731,6 +740,15 @@ private:
     size_t poll_cursor_{0};
     std::chrono::steady_clock::time_point next_liveness_check_{};
     std::atomic<bool> mailbox_control_timed_out_{false};
+    struct PendingPayload {
+        uint64_t sub_cmd;
+        std::vector<uint8_t> request;
+        std::shared_ptr<PosixShmHolder> staging;
+    };
+    std::optional<PendingPayload> pending_payload_;
+    void require_control_admission(bool retiring = false) const;
+    void wait_control_done(const char *op_name, double timeout_s);
+
     int child_pid_{-1};
     // Set once the child has been reaped or observed unwaitable; the exit
     // status is only available from the reaping waitpid(), so it is retained
@@ -745,7 +763,7 @@ private:
     char *task_frame(size_t index) const;
     /** Run-state entry `index`. The table follows the request frames. */
     MailboxRunEntry *run_entry(size_t index) const;
-    void run_control_command(const char *op_name, double timeout_s = -1.0);
+    void run_control_command(const char *op_name, double timeout_s = -1.0, bool retiring = false);
 
     /** One run's state as this endpoint reads it, in one coherent pass. */
     struct EntrySnapshot {
@@ -978,6 +996,9 @@ public:
     std::vector<uint8_t> control_remote_domain(
         remote_l3::ControlName control_name, const std::vector<uint8_t> &command_bytes, bool group_target = false
     );
+    std::vector<uint8_t>
+    control_payload(uint64_t sub_cmd, const void *payload, size_t payload_size, double timeout_s, bool retiring);
+    void check_control_payload_retired();
     void control_generic(
         uint64_t sub_cmd, const char *shm_name, size_t payload_size, double timeout_s, const uint8_t *digest
     );
@@ -1178,8 +1199,10 @@ public:
     ControlResult
     control_digest_only(WorkerType type, int worker_id, uint64_t sub_cmd, const uint8_t *digest, double timeout_s);
     std::vector<uint8_t> control_payload(
-        WorkerType type, int worker_id, uint64_t sub_cmd, const void *payload, size_t payload_size, double timeout_s
+        WorkerType type, int worker_id, uint64_t sub_cmd, const void *payload, size_t payload_size, double timeout_s,
+        bool retiring = false
     );
+    void check_control_payloads_retired();
     ControlResult control_remote_prepare_register(
         int worker_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const void *payload,
         size_t payload_size, const uint8_t *digest

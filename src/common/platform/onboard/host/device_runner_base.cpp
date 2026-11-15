@@ -593,21 +593,35 @@ void *DeviceRunnerBase::allocate_caller_buffer(std::size_t bytes) {
     return ptr;
 }
 
+int DeviceRunnerBase::adopt_caller_buffer(
+    void *base, size_t logical_bytes, size_t physical_bytes, MemoryAllocator::StorageReleaseFn release_storage,
+    void *storage
+) {
+    if (caller_device_buffers_.recorded(base)) return PTO_RUNTIME_ERR_INVALID_STATE;
+    caller_device_buffers_.record(base, logical_bytes);
+    try {
+        if (mem_alloc_.adopt(base, logical_bytes, physical_bytes, release_storage, storage)) return 0;
+    } catch (...) {
+        caller_device_buffers_.forget_if_unborrowed(base);
+        throw;
+    }
+    caller_device_buffers_.forget_if_unborrowed(base);
+    return PTO_RUNTIME_ERR_INVALID_STATE;
+}
+
 int DeviceRunnerBase::free_caller_buffer(void *dev_ptr) {
     if (dev_ptr == nullptr) return 0;
-    // Check and forget are one step inside the table, so a borrow taken between a caller's
-    // question and its release cannot be missed, and the address leaves the table before its pages
-    // can go. An address the table never recorded is held by nothing and passes straight through,
-    // which is what keeps this from changing anything for an allocation no caller minted.
-    if (!caller_device_buffers_.forget_if_unborrowed(dev_ptr)) {
+    int status = PTO_RUNTIME_ERR_INVALID_STATE;
+    if (!caller_device_buffers_.forget_if_unborrowed(dev_ptr, [&] {
+            status = free_tensor(dev_ptr);
+            return status == 0;
+        })) {
         LOG_ERROR(
-            "free_caller_buffer: %p is still held by %zu borrowing run(s) and %zu retained "
-            "reference(s); the caller's release is refused rather than performed",
-            dev_ptr, caller_device_buffers_.borrow_count(), caller_device_buffers_.retained_count()
+            "free_caller_buffer: %p release refused or failed with status %d (%zu borrows, %zu retained references)",
+            dev_ptr, status, caller_device_buffers_.borrow_count(), caller_device_buffers_.retained_count()
         );
-        return PTO_RUNTIME_ERR_INVALID_STATE;
+        return status;
     }
-    free_tensor(dev_ptr);
     return 0;
 }
 
@@ -637,15 +651,16 @@ bool DeviceRunnerBase::retire_caller_buffer_carrier(const void *owner, const Nat
     return true;
 }
 
-void DeviceRunnerBase::free_tensor(void *dev_ptr) {
+int DeviceRunnerBase::free_tensor(void *dev_ptr) {
     if (dev_ptr != nullptr) {
         // Before the pages go: a mapping outliving them would hand a live host
         // VA to whatever the driver puts there next.
         if (child_memory_host_views_.take(dev_ptr)) {
             unregister_device_memory_from_host(dev_ptr);
         }
-        mem_alloc_.free(dev_ptr);
+        return mem_alloc_.free(dev_ptr);
     }
+    return 0;
 }
 
 void *DeviceRunnerBase::acquire_child_memory_host_view(void *dev_ptr, std::size_t bytes) {
@@ -1869,6 +1884,9 @@ int DeviceRunnerBase::recover_failed_close(int rc) {
 }
 
 int DeviceRunnerBase::finalize() {
+    if (external_buffer_borrows_live()) {
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
     // External release may be synchronizing a stream; reset must not overlap it.
     std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
     // Fatal teardown stops host readers even while their backing remains held.
