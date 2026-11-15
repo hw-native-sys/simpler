@@ -63,6 +63,8 @@
 #include "callable_protocol.h"
 #include "chip_run_lane.h"
 #include "chip_worker.h"
+#include "host/caller_device_buffers.h"
+#include "host/raii_scope_guard.h"
 #include "native_submission_bind.h"
 #include "common/host_span_names.h"
 #include "common/host_span_scope.h"
@@ -143,6 +145,8 @@ public:
     int (*aclInit)(const char *){nullptr};
     int (*aclrtSetDevice)(int){nullptr};
     int (*aclrtGetDevice)(int *){nullptr};
+    int (*aclrtGetCurrentContext)(void **){nullptr};
+    int (*aclrtSetCurrentContext)(void *){nullptr};
     int (*aclrtMemcpy)(void *, size_t, const void *, size_t, int){nullptr};
     int (*aclrtMemGetAllocationGranularity)(LocalAclPhysicalMemProp *, int, size_t *){nullptr};
     int (*aclrtMallocPhysical)(void **, size_t, const LocalAclPhysicalMemProp *, uint64_t){nullptr};
@@ -166,6 +170,8 @@ public:
         aclInit = reinterpret_cast<int (*)(const char *)>(resolve_symbol("aclInit"));
         aclrtSetDevice = reinterpret_cast<int (*)(int)>(resolve_symbol("aclrtSetDevice"));
         aclrtGetDevice = reinterpret_cast<int (*)(int *)>(resolve_symbol("aclrtGetDevice"));
+        aclrtGetCurrentContext = reinterpret_cast<int (*)(void **)>(resolve_symbol("aclrtGetCurrentContext"));
+        aclrtSetCurrentContext = reinterpret_cast<int (*)(void *)>(resolve_symbol("aclrtSetCurrentContext"));
         aclrtMemcpy =
             reinterpret_cast<int (*)(void *, size_t, const void *, size_t, int)>(resolve_symbol("aclrtMemcpy"));
         aclrtMemGetAllocationGranularity = reinterpret_cast<int (*)(LocalAclPhysicalMemProp *, int, size_t *)>(
@@ -198,13 +204,31 @@ public:
             return;
         }
         int rc = aclInit(nullptr);
-        if (rc != kAclSuccess) {
+        if (rc != kAclSuccess && rc != kAclRepeatInitialize) {
             throw std::runtime_error("aclInit failed with code " + std::to_string(rc));
         }
         initialized_ = true;
     }
 
     void bind_device_with_check(int device_id) const { acl_check(aclrtSetDevice(device_id), "aclrtSetDevice"); }
+
+    void *current_context_with_check(int device_id) const {
+        const int current_device = current_device_with_check();
+        if (current_device != device_id) {
+            throw std::invalid_argument(
+                "buffer import device mismatch: expected " + std::to_string(device_id) + ", got " +
+                std::to_string(current_device)
+            );
+        }
+        void *context = nullptr;
+        acl_check(aclrtGetCurrentContext(&context), "aclrtGetCurrentContext");
+        if (context == nullptr) throw std::invalid_argument("buffer requires a current ACL context");
+        return context;
+    }
+
+    void set_context_with_check(void *context) const {
+        acl_check(aclrtSetCurrentContext(context), "aclrtSetCurrentContext");
+    }
 
     int current_device_with_check() const {
         int device_id = -1;
@@ -290,10 +314,15 @@ public:
     }
 
     int vmm_unmap(void *va) const { return aclrtUnmapMem(va); }
+    void vmm_unmap_with_check(void *va) const { acl_check(vmm_unmap(va), "aclrtUnmapMem"); }
 
     int vmm_release_address(void *va) const { return aclrtReleaseMemAddress(va); }
+    void vmm_release_address_with_check(void *va) const {
+        acl_check(vmm_release_address(va), "aclrtReleaseMemAddress");
+    }
 
     int vmm_free_physical(void *handle) const { return aclrtFreePhysical(handle); }
+    void vmm_free_physical_with_check(void *handle) const { acl_check(vmm_free_physical(handle), "aclrtFreePhysical"); }
 
     void vmm_zero_bytes(void *va, uint64_t offset, uint64_t nbytes) const {
         std::vector<uint8_t> zeros(static_cast<size_t>(nbytes), 0);
@@ -322,6 +351,7 @@ public:
 
 private:
     static constexpr int kAclSuccess = 0;
+    static constexpr int kAclRepeatInitialize = 100002;
     static constexpr int kAclMemcpyHostToDevice = 1;
     static constexpr int kAclMemcpyDeviceToHost = 2;
     static constexpr int kAclMemHandleTypeNone = 0;
@@ -477,6 +507,8 @@ public:
     uint64_t shareable_handle{0};
     void *vmm_handle{nullptr};
     uint64_t mapping_bytes{0};
+    void *borrowed_context{nullptr};
+    bool vmm_mapped{false};
 
     void close() {
         std::string cleanup_error;
@@ -486,7 +518,29 @@ public:
         }
     }
 
+    void close_buffer_mapping() {
+        if (device_addr == 0 && vmm_handle == nullptr) return;
+        bind_acl_device();
+        auto &api = acl_api();
+        if (vmm_mapped) {
+            api.vmm_unmap_with_check(reinterpret_cast<void *>(device_addr));
+            vmm_mapped = false;
+        }
+        if (device_addr != 0) {
+            api.vmm_release_address_with_check(reinterpret_cast<void *>(device_addr));
+            device_addr = 0;
+        }
+        if (vmm_handle != nullptr) {
+            api.vmm_free_physical_with_check(vmm_handle);
+            vmm_handle = nullptr;
+        }
+    }
+
     void bind_acl_device() const {
+        if (borrowed_context != nullptr) {
+            acl_api().set_context_with_check(borrowed_context);
+            return;
+        }
         if (device_id < 0) {
             throw std::runtime_error("onboard mapped-region handle has no device id");
         }
@@ -581,6 +635,26 @@ public:
 
 private:
     void close_collecting(std::string &cleanup_error) {
+        if (borrowed_context != nullptr) {
+            try {
+                auto &api = acl_api();
+                void *previous = nullptr;
+                if (api.aclrtGetCurrentContext(&previous) != 0 || previous == nullptr) {
+                    throw std::runtime_error("buffer cleanup requires a current ACL context");
+                }
+                auto restore = RAIIScopeGuard([&] {
+                    try {
+                        api.set_context_with_check(previous);
+                    } catch (const std::exception &error) {
+                        append_cleanup_error(cleanup_error, error.what());
+                    }
+                });
+                close_buffer_mapping();
+            } catch (const std::exception &error) {
+                append_cleanup_error(cleanup_error, error.what());
+            }
+            return;
+        }
         uint64_t mapped_addr = std::exchange(device_addr, 0);
         uint64_t mapped_bytes = std::exchange(mapping_bytes, 0);
         void *physical_handle = std::exchange(vmm_handle, nullptr);
@@ -896,7 +970,7 @@ RegionHandle import_sim_region(
 
 RegionHandle import_onboard_region(
     int device_id, uint64_t shareable_handle, uint64_t mapping_bytes, const std::string &owner_token,
-    const char *device_error, const char *size_error, const char *owner_error
+    const char *device_error, const char *size_error, const char *owner_error, void *borrowed_context = nullptr
 ) {
     if (device_id < 0) {
         throw std::invalid_argument(device_error);
@@ -911,18 +985,44 @@ RegionHandle import_onboard_region(
     auto mapping = std::make_unique<RegionMapping>();
     mapping->owner_token = owner_token;
     mapping->profile = RegionMappingProfile::OnboardVmm;
+    mapping->borrowed_context = borrowed_context;
     mapping->device_id = device_id;
     mapping->mapping_bytes = mapping_bytes;
-    mapping->bind_acl_device();
-    AclRuntimeApi &api = acl_api();
-    mapping->shareable_handle = shareable_handle;
-    mapping->vmm_handle = api.vmm_import_shareable_with_check(shareable_handle, device_id);
-    void *mapped_addr = api.vmm_reserve_with_check(mapping_bytes);
-    mapping->device_addr = reinterpret_cast<uint64_t>(mapped_addr);
-    api.vmm_map_with_check(mapped_addr, mapping_bytes, mapping->vmm_handle);
-    // aclrtMapMem grants read/write access to the device that imported the
-    // handle; this mapping relies on that owner grant and issues no explicit
-    // access grant.
+    auto map_region = [&](RegionMapping &region) {
+        region.bind_acl_device();
+        auto &api = acl_api();
+        region.shareable_handle = shareable_handle;
+        region.vmm_handle = api.vmm_import_shareable_with_check(shareable_handle, device_id);
+        void *mapped_addr = api.vmm_reserve_with_check(mapping_bytes);
+        region.device_addr = reinterpret_cast<uint64_t>(mapped_addr);
+        api.vmm_map_with_check(mapped_addr, mapping_bytes, region.vmm_handle);
+        // MapMem grants access to the importing device.
+        region.vmm_mapped = true;
+    };
+    if (borrowed_context != nullptr) {
+        // Register before acquiring native resources so failed imports have a retry owner.
+        auto *pending = mapping.get();
+        uint64_t handle = region_registry().emplace(std::move(mapping));
+        RegionHandle owner(handle, std::move(handle_owner_token));
+        try {
+            map_region(*pending);
+        } catch (const std::exception &error) {
+            try {
+                pending->close_buffer_mapping();
+            } catch (const std::exception &cleanup) {
+                nb::object failure =
+                    nb::module_::import_("builtins")
+                        .attr("RuntimeError")(std::string(error.what()) + "; import cleanup: " + cleanup.what());
+                failure.attr("_buffer_mapping_handle") = nb::cast(std::move(owner));
+                PyErr_SetObject(PyExc_RuntimeError, failure.ptr());
+                throw nb::python_error();
+            }
+            region_registry().close(handle);
+            throw;
+        }
+        return owner;
+    }
+    map_region(*mapping);
     uint64_t handle = region_registry().emplace(std::move(mapping));
     return RegionHandle(handle, std::move(handle_owner_token));
 }
@@ -999,6 +1099,7 @@ struct RegionVmmInspect {
 };
 
 struct RegionVmmAllocation {
+    void *borrowed_context{nullptr};
     int device_id{-1};
     void *physical_handle{nullptr};
     void *va{nullptr};
@@ -1021,8 +1122,7 @@ struct RegionVmmAllocation {
 
 struct RegionVmmTestHooks {
     bool use_fake{false};
-    std::optional<RegionVmmStage> fail_stage;
-    RegionVmmFailWhen fail_when{RegionVmmFailWhen::Before};
+    std::vector<std::pair<RegionVmmStage, RegionVmmFailWhen>> failures;
     bool unmap_already_gone{false};
     std::vector<std::string> issued_ops;
     uint64_t fake_granularity{64};
@@ -1112,10 +1212,9 @@ void region_vmm_record_issued(const char *op) { region_vmm_test_hooks().issued_o
 
 bool region_vmm_consume_fail(RegionVmmStage stage, RegionVmmFailWhen when) {
     RegionVmmTestHooks &hooks = region_vmm_test_hooks();
-    if (!hooks.fail_stage.has_value() || *hooks.fail_stage != stage || hooks.fail_when != when) {
-        return false;
-    }
-    hooks.fail_stage.reset();
+    auto found = std::find(hooks.failures.begin(), hooks.failures.end(), std::make_pair(stage, when));
+    if (found == hooks.failures.end()) return false;
+    hooks.failures.erase(found);
     return true;
 }
 
@@ -1351,7 +1450,11 @@ RegionVmmExport region_vmm_allocate_export(uint64_t handle, uint64_t logical_byt
     if (record.physical_allocated || record.va_reserved || record.mapped || record.exported) {
         throw std::runtime_error("region VMM allocate_export already has partial or complete state");
     }
-    region_vmm_bind_device(record.device_id);
+    if (record.borrowed_context != nullptr) {
+        acl_api().set_context_with_check(record.borrowed_context);
+    } else {
+        region_vmm_bind_device(record.device_id);
+    }
     uint64_t mapping_bytes = align_vmm_bytes(logical_bytes, region_vmm_granularity_under_lock(record.device_id));
     record.mapping_bytes = mapping_bytes;
 
@@ -1454,15 +1557,14 @@ void region_vmm_release(uint64_t handle) {
         return;
     }
     RegionVmmAllocation &record = it->second;
-    if (record.release_once_done) {
-        if (!record.first_cleanup_failure.empty()) {
-            throw std::runtime_error(record.first_cleanup_failure);
-        }
-        return;
-    }
+    record.first_cleanup_failure.clear();
     record.release_once_done = true;
     try {
-        region_vmm_bind_device(record.device_id);
+        if (record.borrowed_context != nullptr) {
+            acl_api().set_context_with_check(record.borrowed_context);
+        } else {
+            region_vmm_bind_device(record.device_id);
+        }
     } catch (const std::exception &exc) {
         region_vmm_note_cleanup_failure(record, std::string("bind_device failed: ") + exc.what());
         throw std::runtime_error(record.first_cleanup_failure);
@@ -1485,7 +1587,7 @@ void region_vmm_release(uint64_t handle) {
         throw std::runtime_error(record.first_cleanup_failure);
     }
 
-    if (record.va_reserved && !record.va_release_attempted) {
+    if (record.va_reserved) {
         region_vmm_run_cleanup_stage(
             record, RegionVmmStage::VaRelease, record.va_release_attempted, record.va_release_complete,
             [&]() {
@@ -1497,7 +1599,7 @@ void region_vmm_release(uint64_t handle) {
             }
         );
     }
-    if (record.physical_allocated && !record.physical_free_attempted) {
+    if (record.physical_allocated) {
         region_vmm_run_cleanup_stage(
             record, RegionVmmStage::PhysicalFree, record.physical_free_attempted, record.physical_free_complete,
             [&]() {
@@ -1520,6 +1622,51 @@ void region_vmm_release(uint64_t handle) {
     );
 }
 
+int release_shared_vmm(void *storage, void *) noexcept {
+    auto *handle = static_cast<uint64_t *>(storage);
+    try {
+        if (*handle != 0) region_vmm_release(*handle);
+        delete handle;
+        return 0;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+RegionVmmExport allocate_shared_buffer(ChipWorker &worker, uint64_t nbytes) {
+    if (!worker.supports_shareable_storage()) {
+        throw std::invalid_argument("VMM storage requires an initialized onboard ChipWorker in program mode");
+    }
+    worker.validate_execution_context();
+    void *context = acl_api().current_context_with_check(worker.device_id());
+    auto storage = std::make_unique<uint64_t>(0);
+    worker.retain_pending_storage(release_shared_vmm, storage.get());
+    auto *owned = storage.release();
+    try {
+        const auto handle = *owned = region_vmm_begin(worker.device_id());
+        {
+            std::lock_guard<std::mutex> lock(region_vmm_mu());
+            g_region_vmm_allocations().at(handle).borrowed_context = context;
+        }
+        auto result = region_vmm_allocate_export(handle, nbytes);
+        worker.adopt_shared_buffer(result.device_addr, nbytes, result.mapping_bytes, release_shared_vmm, owned);
+        return result;
+    } catch (const std::exception &error) {
+        try {
+            worker.release_pending_storage(owned);
+        } catch (const std::exception &cleanup) {
+            std::string detail = cleanup.what();
+            {
+                std::lock_guard<std::mutex> lock(region_vmm_mu());
+                auto found = g_region_vmm_allocations().find(*owned);
+                if (found != g_region_vmm_allocations().end()) detail += ": " + found->second.first_cleanup_failure;
+            }
+            throw std::runtime_error(std::string(error.what()) + "; rollback retained by Worker: " + detail);
+        }
+        throw;
+    }
+}
+
 void region_vmm_zero_range(uint64_t handle, uint64_t offset, uint64_t nbytes) {
     std::lock_guard<std::mutex> lk(region_vmm_mu());
     auto it = g_region_vmm_allocations().find(handle);
@@ -1534,7 +1681,11 @@ void region_vmm_zero_range(uint64_t handle, uint64_t offset, uint64_t nbytes) {
     if (end < offset || end > record.mapping_bytes) {
         throw std::invalid_argument("region VMM zero_bytes range exceeds mapping_bytes");
     }
-    region_vmm_bind_device(record.device_id);
+    if (record.borrowed_context != nullptr) {
+        acl_api().set_context_with_check(record.borrowed_context);
+    } else {
+        region_vmm_bind_device(record.device_id);
+    }
     if (region_vmm_consume_fail(RegionVmmStage::ZeroBytes, RegionVmmFailWhen::Before)) {
         region_vmm_throw_stage_failure(RegionVmmStage::ZeroBytes, "before");
     }
@@ -1592,8 +1743,7 @@ void region_vmm_test_use_fake_driver() {
 void region_vmm_test_reset_hooks() {
     std::lock_guard<std::mutex> lk(region_vmm_mu());
     RegionVmmTestHooks &hooks = region_vmm_test_hooks();
-    hooks.fail_stage.reset();
-    hooks.fail_when = RegionVmmFailWhen::Before;
+    hooks.failures.clear();
     hooks.unmap_already_gone = false;
     hooks.issued_ops.clear();
 }
@@ -1601,11 +1751,11 @@ void region_vmm_test_reset_hooks() {
 void region_vmm_test_fail_stage(const std::string &stage, const std::string &when) {
     std::lock_guard<std::mutex> lk(region_vmm_mu());
     RegionVmmTestHooks &hooks = region_vmm_test_hooks();
-    hooks.fail_stage = region_vmm_parse_stage(stage);
+    const auto failure_stage = region_vmm_parse_stage(stage);
     if (when == "before") {
-        hooks.fail_when = RegionVmmFailWhen::Before;
+        hooks.failures.emplace_back(failure_stage, RegionVmmFailWhen::Before);
     } else if (when == "after") {
-        hooks.fail_when = RegionVmmFailWhen::After;
+        hooks.failures.emplace_back(failure_stage, RegionVmmFailWhen::After);
     } else {
         throw std::invalid_argument("region VMM fail when must be before or after");
     }
@@ -4153,6 +4303,23 @@ NB_MODULE(_task_interface, m) {
             },
             "Return the ACL_HBM_MEM free/total byte snapshot for this worker's device."
         )
+        .def("_malloc_shareable", &allocate_shared_buffer, nb::arg("nbytes"))
+        .def(
+            "_vmm_borrow",
+            [](ChipWorker &worker, uint64_t base, uint64_t bytes, uint64_t token, bool retain) {
+                if (token < CallerDeviceBuffers::EXTERNAL_BORROW_MIN_ID) {
+                    throw std::invalid_argument("external buffer borrow token must have its high bit set");
+                }
+                if (retain) {
+                    const ChipWorker::CallerDeviceSpan span{base, bytes};
+                    if (!worker.borrow_caller_device_spans(token, &span, 1)) {
+                        throw std::runtime_error("buffer is not a live owner allocation");
+                    }
+                } else {
+                    worker.release_caller_device_borrow(token, false);
+                }
+            }
+        )
         .def("malloc", &ChipWorker::malloc, nb::arg("size"))
         .def("free", &ChipWorker::free, nb::arg("ptr"))
         .def("copy_to", &ChipWorker::copy_to, nb::arg("dst"), nb::arg("src"), nb::arg("size"))
@@ -4363,6 +4530,39 @@ NB_MODULE(_task_interface, m) {
         .def_ro("local_cleanup_details", &RegionVmmInspect::local_cleanup_details);
 
     nb::class_<RegionHandle>(m, "_RegionHandle").def("__int__", &RegionHandle::value);
+
+    m.def("_buffer_import_vmm", [](int device, uint64_t shareable, uint64_t size, const std::string &token) {
+        void *context = acl_api().current_context_with_check(device);
+        return import_onboard_region(
+            device, shareable, size, token, "invalid buffer device", "invalid mapping size",
+            "missing buffer export identity", context
+        );
+    });
+    m.def("_buffer_mapped_base", [](uint64_t handle) {
+        auto lease = region_registry().lease(handle);
+        if (acl_api().current_context_with_check(lease->device_id) != lease->borrowed_context) {
+            throw std::invalid_argument("buffer mapping belongs to another ACL context");
+        }
+        if (!lease->vmm_mapped) {
+            throw std::runtime_error("buffer mapping is partially closed; finish cleanup before releasing the lease");
+        }
+        return lease->device_addr;
+    });
+    m.def(
+        "_buffer_close_vmm",
+        [](uint64_t handle) {
+            {
+                auto lease = region_registry().lease(handle);
+                if (acl_api().current_context_with_check(lease->device_id) != lease->borrowed_context) {
+                    throw std::invalid_argument("buffer mapping belongs to another ACL context");
+                }
+                // Failed stages leave the registry entry and remaining handles available for explicit cleanup.
+                lease->close_buffer_mapping();
+            }
+            region_registry().close(handle);
+        },
+        nb::arg("handle"), "Close an imported buffer without discarding unfinished cleanup."
+    );
 
     m.def(
         "_region_import_sim",

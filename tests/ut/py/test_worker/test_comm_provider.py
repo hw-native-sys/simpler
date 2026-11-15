@@ -1394,10 +1394,9 @@ def test_region_vmm_failed_unmap_skips_va_and_physical(fake_vmm):
     assert "va_release" not in issued
     assert "physical_free" not in issued
     _region_vmm_test_reset_hooks()
-    with pytest.raises(RuntimeError, match="before unmap"):
-        _region_vmm_release(handle)
-    assert _region_vmm_test_issued_ops() == []
-    assert _region_vmm_inspect(handle).mapped is True
+    _region_vmm_release(handle)
+    assert _region_vmm_test_issued_ops().count("unmap") == 1
+    assert _region_vmm_inspect(handle).present is False
 
 
 def test_region_vmm_successful_unmap_attempts_va_and_physical_independently(fake_vmm):
@@ -1431,9 +1430,9 @@ def test_region_vmm_successful_unmap_attempts_va_and_physical_independently(fake
     assert "va_release" not in issued
     assert issued.count("physical_free") == 1
     _region_vmm_test_reset_hooks()
-    with pytest.raises(RuntimeError, match="before va_release"):
-        _region_vmm_release(handle)
-    assert _region_vmm_test_issued_ops() == []
+    _region_vmm_release(handle)
+    assert _region_vmm_test_issued_ops().count("physical_free") == 0
+    assert _region_vmm_inspect(handle).present is False
 
 
 def test_region_vmm_already_gone_unmap_still_releases_va_and_physical(fake_vmm):
@@ -1529,12 +1528,13 @@ def test_region_vmm_later_independent_errors_stay_local(fake_vmm):
     assert issued.count("va_release") == 1
     assert issued.count("physical_free") == 1
     _region_vmm_test_reset_hooks()
-    with pytest.raises(RuntimeError, match="after va_release"):
-        _region_vmm_release(handle)
-    assert _region_vmm_test_issued_ops() == []
+    _region_vmm_release(handle)
+    assert _region_vmm_test_issued_ops().count("unmap") == 0
+    assert _region_vmm_test_issued_ops().count("physical_free") == 0
+    assert _region_vmm_inspect(handle).present is False
 
 
-def test_region_vmm_physical_free_failure_retains_record_without_reissue(fake_vmm):
+def test_region_vmm_physical_free_retry_preserves_completed_stages(fake_vmm):
     from _task_interface import (  # pyright: ignore[reportMissingImports]
         _region_vmm_allocate_export,
         _region_vmm_begin,
@@ -1563,13 +1563,13 @@ def test_region_vmm_physical_free_failure_retains_record_without_reissue(fake_vm
     assert issued.count("unmap") == 1
     assert issued.count("va_release") == 1
     _region_vmm_test_reset_hooks()
-    with pytest.raises(RuntimeError, match="before physical_free"):
-        _region_vmm_release(handle)
-    assert _region_vmm_test_issued_ops() == []
-    assert _region_vmm_inspect(handle).physical_allocated is True
+    _region_vmm_release(handle)
+    assert _region_vmm_test_issued_ops().count("unmap") == 0
+    assert _region_vmm_test_issued_ops().count("physical_free") == 1
+    assert _region_vmm_inspect(handle).present is False
 
 
-def test_region_vmm_release_bind_failure_keeps_ledger_and_does_not_retry(fake_vmm):
+def test_region_vmm_release_retries_after_bind_failure(fake_vmm):
     from _task_interface import (  # pyright: ignore[reportMissingImports]
         _region_vmm_allocate_export,
         _region_vmm_begin,
@@ -1601,15 +1601,9 @@ def test_region_vmm_release_bind_failure_keeps_ledger_and_does_not_retry(fake_vm
     assert inspect.local_cleanup_details == [inspect.first_cleanup_failure]
     assert issued == ["bind_device"]
     _region_vmm_test_reset_hooks()
-    with pytest.raises(RuntimeError, match="bind_device failed:") as second:
-        _region_vmm_release(handle)
-    assert str(second.value) == str(first.value)
-    assert _region_vmm_test_issued_ops() == []
-    later = _region_vmm_inspect(handle)
-    assert later.mapped is True
-    assert later.va_reserved is True
-    assert later.physical_allocated is True
-    assert later.first_cleanup_failure == inspect.first_cleanup_failure
+    _region_vmm_release(handle)
+    assert _region_vmm_test_issued_ops().count("unmap") == 1
+    assert _region_vmm_inspect(handle).present is False
 
 
 def test_region_vmm_zero_binds_record_device_before_zero(fake_vmm):

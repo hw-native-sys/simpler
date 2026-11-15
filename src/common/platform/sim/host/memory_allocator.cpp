@@ -38,6 +38,7 @@ int MemoryAllocator::free(void *ptr) {
         return 0;
     }
 
+    if (adopted_.count(ptr)) return release_adopted_locked(ptr);
     committed_bytes_ -= it->second;
     std::free(ptr);
     ptr_size_map_.erase(it);
@@ -46,6 +47,7 @@ int MemoryAllocator::free(void *ptr) {
 
 int MemoryAllocator::finalize() {
     std::scoped_lock<std::mutex> lk(mu_);
+    if (int rc = sweep_adopted_locked()) return rc;
     for (const auto &kv : ptr_size_map_) {
         std::free(kv.first);
     }
@@ -77,6 +79,7 @@ void *MemoryAllocator::Reservation::commit_alloc(size_t size, int *status) {
 
 int MemoryAllocator::finalize_except(SweepClassifyFn classify, SweepRecordFn record, void *ctx) {
     std::scoped_lock<std::mutex> lk(mu_);
+    if (int rc = sweep_adopted_locked(classify, record, ctx)) return rc;
     for (const auto &kv : ptr_size_map_) {
         const SweepAction acted = classify == nullptr ? SweepAction::FreeIt : classify(kv.first, kv.second, ctx);
         if (acted == SweepAction::KeepIt) {
