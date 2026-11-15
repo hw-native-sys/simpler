@@ -294,16 +294,16 @@ and does not produce a complete accounting result. The reserved tail still fits
 262,144 extended rows, so compact encoding does not lower record capacity.
 This reserves 8 MiB per worker at L3/L4; unused payload is not initialized
 or written by the recorder. L1 does not allocate this Scalar record tail.
-The header records the physical format and slot count in existing padding.
-Host decoding requires the compact storage format and rejects malformed,
+The header records the slot count in existing padding.
+Host decoding uses the compact storage format and rejects malformed,
 truncated or trailing slots. Raw JSON keeps the logical fields. The A5 AICore
 exporter writes one scheduler record per line without indentation or spaces
 around field separators; this changes neither the schema nor the values.
 Scalar-window
-metrics expose `scalar_storage_format`, `scalar_storage_bytes` and
+metrics expose `scalar_storage_bytes` and
 `scalar_logical_records` for inspecting the actual write volume.
 Existing `metrics` entries
-carry `scalar_schema=2`, the function threshold in cycles, the number of
+carry the function threshold in cycles, the number of
 omitted short function intervals, nesting depth and the no-progress iteration
 count. Omissions are distinct from dropped records. `iterations_detailed=true`
 identifies per-iteration capture without polling aggregation.

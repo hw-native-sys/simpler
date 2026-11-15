@@ -727,8 +727,6 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
         WithNativeGraph ? context->native_header_offset : 0,
         context->scheduler_state_bytes,
         static_cast<uint32_t>(context->original_task_count),
-        static_cast<uint16_t>(context->graph_view_version),
-        static_cast<uint16_t>(context->graph_view_bytes),
     };
     SchedulerWorkerStats stats{};
     std::conditional_t<WithProfiling, SchedulerLocalProfilingState, SchedulerNoProfilingState> profile{};

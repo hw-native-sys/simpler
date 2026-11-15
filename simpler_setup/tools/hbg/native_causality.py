@@ -23,7 +23,7 @@ from .native_protocol import (
 )
 
 MAX = (1 << 64) - 1
-EXECUTABLE, FANIN, MIX, SPMD, SYNC, INLINE, PREDICATE = (1, 2, 4, 8, 16, 32, 64)
+EXECUTABLE, MIX, SPMD, SYNC, INLINE, PREDICATE = (1, 4, 8, 16, 32, 64)
 ENTRY, EXECUTED, COOPERATIVE, GM_GROUP, PERMIT_TAIL, PERMIT_NO_LOG, PUBLISHED = (1, 2, 4, 8, 16, 32, 64)
 CLUSTER_GROUP = 1 << 7
 
@@ -133,9 +133,9 @@ class NativeAudit:
             flags, mask, blocks = task["flags"], task["active_mask"], task["block_num"]
             deps = task["dependencies"]
             require(len(set(deps)) == len(deps) and all(0 <= dep < ref for dep in deps), "invalid frozen dependencies")
-            require(flags < 128, "unknown task flags")
+            require(flags & ~(EXECUTABLE | MIX | SPMD | SYNC | INLINE | PREDICATE) == 0, "unknown task flags")
             if ref in self.control_nodes:
-                require(mask == 0 and blocks == 1 and flags in (0, FANIN), "invalid native control metadata")
+                require(mask == 0 and blocks == 1 and flags == 0, "invalid native control metadata")
                 continue
             if flags == 0:
                 require(
@@ -143,7 +143,7 @@ class NativeAudit:
                     "bad Host-completed task",
                 )
                 continue
-            require(flags & EXECUTABLE and bool(flags & FANIN) == bool(deps), "invalid executable task metadata")
+            require(flags & EXECUTABLE, "invalid executable task metadata")
             if self.node_map:
                 prefix = task["trace_base"]
             require(task["trace_base"] == prefix <= (1 << 32) - 1, "noncontiguous frozen trace prefix")

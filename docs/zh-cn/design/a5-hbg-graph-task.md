@@ -79,5 +79,6 @@ resident backing 仍需计入 768 B/node control，以及按真实执行数放�
 128 B Claim、128 B Binding、256 B trace 和实际启用的诊断/async 区域。
 缩小结构或删去重复计划不等于已证明延迟下降；性能必须用同输入、同设备、同 DFX 配置的对照衡量。
 
-当前 Graph view/native image 版本为 6/5，因果诊断采用普通 v22、Graph v23。
+Graph view、native image、task catalog 与 prepared layout 不携带内部版本号。
+因果诊断统一使用 `hbg-native-protocol`，Graph 的独立 source/node map 按实际内容提供。
 Host、AICPU、AICore 与诊断解析器一同迁移，只读取当前格式。

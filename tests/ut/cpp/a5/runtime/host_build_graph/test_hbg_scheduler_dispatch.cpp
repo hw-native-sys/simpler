@@ -156,7 +156,6 @@ TEST(SchedulerTokenDispatch, HostBoundCallsDoNotConsultTheMutableCallableTable) 
     f.storage.metadata[1].kernel_ids[0] = scheduler_test::kFixtureCallableCount - 1;
     f.storage.callable_addresses[scheduler_test::kFixtureCallableCount - 1] = 0x3000;
     ASSERT_TRUE(f.prepare());
-    f.storage.contexts[0].callable_addresses_count = 0;
     f.storage.callable_addresses[1] = f.storage.callable_addresses[scheduler_test::kFixtureCallableCount - 1] = 0;
     const uint64_t expected[]{0x1000, 0x3000};
     for (uint32_t task = 0; task < 2; ++task) {
@@ -370,12 +369,12 @@ TEST(SchedulerLocalConfig, SnapshotsImmutableConfigurationAndReloadsOnNextRun) {
         EXPECT_EQ(local.config.worker_ids[0], 0u);
         EXPECT_EQ(local.worker_id(), self_lane);
         EXPECT_EQ(local.config.runtime_worker_count, 3u);
-        const uint64_t callable_count = context.callable_addresses_count;
-        context.callable_addresses_count = callable_count + 1;
-        EXPECT_EQ(local.config.callable_addresses_count, callable_count);
+        const uint64_t pmu_offset = context.pmu_cells_offset;
+        context.pmu_cells_offset = pmu_offset + 64;
+        EXPECT_EQ(local.config.pmu_cells_offset, pmu_offset);
         SchedulerLocalState next_run{};
         ASSERT_TRUE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &next_run));
-        EXPECT_EQ(next_run.config.callable_addresses_count, callable_count + 1);
+        EXPECT_EQ(next_run.config.pmu_cells_offset, pmu_offset + 64);
         EXPECT_EQ(next_run.worker_id(), self_lane);
         EXPECT_EQ(next_run.profiling, nullptr);
         EXPECT_EQ(next_run.pending_completed, 0u);
@@ -406,12 +405,11 @@ TEST(SchedulerLocalConfig, RejectsTruncatedOffsetsAndInvalidCoreTypes) {
     for (const uint64_t offset : {prepared_offset, UINT64_C(0)}) {
         summary->prepared_layout_offset = offset;
         context.prepared_layout_offset = offset;
-        pool->version = SCHEDULER_TASK_CATALOG_VERSION;
         ASSERT_TRUE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
-        pool->version = 13;
+        pool->task_count = graph.task_count + 1;
         EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
+        pool->task_count = graph.task_count;
     }
-    pool->version = SCHEDULER_TASK_CATALOG_VERSION;
     summary->prepared_layout_offset = prepared_offset;
     context.prepared_layout_offset = prepared_offset;
     const uint64_t runtime_worker_count = context.runtime_worker_count;
@@ -425,8 +423,7 @@ TEST(SchedulerLocalConfig, RejectsTruncatedOffsetsAndInvalidCoreTypes) {
     EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
     context.worker_index = worker_index;
     for (auto field :
-         {&SchedulerWorkerContext::worker_contexts_offset, &SchedulerWorkerContext::callable_addresses_count,
-          &SchedulerWorkerContext::task_metadata_offset}) {
+         {&SchedulerWorkerContext::worker_contexts_offset, &SchedulerWorkerContext::task_metadata_offset}) {
         const uint64_t original = context.*field;
         context.*field = UINT64_C(1) << 32;
         EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));

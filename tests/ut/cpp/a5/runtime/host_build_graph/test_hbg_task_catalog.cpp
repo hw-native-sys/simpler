@@ -92,9 +92,6 @@ TEST(HbgTaskCatalog, MalformedImageCannotAuthorizeDescriptorAccess) {
     auto *header = scheduler_state_at<SchedulerTaskCatalogHeader>(image.base, image.plan.header_offset);
     auto *descriptors = scheduler_state_at<SchedulerTaskCatalogDescriptor>(image.base, header->descriptors_offset);
     ASSERT_TRUE(image.valid());
-    header->version = 0;
-    EXPECT_FALSE(image.valid());
-    *header = image.plan.header;
     header->control_count = header->task_count;
     EXPECT_FALSE(image.valid());
     *header = image.plan.header;

@@ -131,7 +131,7 @@ TEST(HbgScalarTrace, FullPartitionReportsTruncationWithoutOverwriting) {
 
 TEST(HbgScalarTrace, InitializationPublishesHeadersWithoutTouchingRecordPayload) {
     AicoreSchedulerLayout layout{};
-    ASSERT_TRUE(scheduler_plan_layout(1, 1, 0, &layout, true));
+    ASSERT_TRUE(scheduler_plan_layout(1, &layout, true));
     const uint64_t initialized_bytes = layout.total_size;
     ASSERT_TRUE(scheduler_plan_scalar_storage(&layout));
     std::vector<uint8_t> storage(layout.total_size + SCHEDULER_STATE_BASE_ALIGNMENT - 1, 0xa5);
@@ -521,7 +521,6 @@ TEST(HbgScalarTrace, FinishCoversAllDirectWritesAndReportsTerminalPublication) {
     EXPECT_EQ(rows[rows.size() - 3].count, (stored_slots + 3) / 4);
     EXPECT_EQ(kind(rows.back()), static_cast<uint32_t>(SchedPhaseKind::ScalarWindow));
     EXPECT_EQ(rows.back().end_time, parent.end_time);
-    EXPECT_EQ(buffer->scalar_storage_format, 1u);
     EXPECT_EQ(buffer->scalar_storage_slots, trace.storage_slots);
     EXPECT_EQ(buffer->scalar_committed, trace.committed);
     EXPECT_EQ(buffer->scalar_dropped, 0u);
@@ -545,11 +544,11 @@ TEST(HbgScalarTrace, LinkedTranslationUnitsRetainTheirInstrumentationPolicy) {
 
 TEST(SchedulerActivityBuffer, IsAllocatedOnlyWhenRequestedAndNeverWraps) {
     AicoreSchedulerLayout disabled{};
-    ASSERT_TRUE(scheduler_plan_layout(1, 1, 0, &disabled));
+    ASSERT_TRUE(scheduler_plan_layout(1, &disabled));
     EXPECT_EQ(disabled.activity_buffers_offset, 0u);
 
     AicoreSchedulerLayout enabled{};
-    ASSERT_TRUE(scheduler_plan_layout(1, 1, 0, &enabled, true));
+    ASSERT_TRUE(scheduler_plan_layout(1, &enabled, true));
     ASSERT_NE(enabled.activity_buffers_offset, 0u);
     EXPECT_EQ(
         enabled.total_size - disabled.total_size,

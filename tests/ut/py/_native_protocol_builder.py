@@ -53,7 +53,7 @@ class ProtocolBuilder:
         )
         prefix = 0
         for ref, (mask, blocks, deps) in enumerate(shapes):
-            flags = 0 if mask is None else 1 | (2 if deps else 0)
+            flags = 0 if mask is None else 1
             if mask == 0:
                 flags |= 32
             elif mask is not None:

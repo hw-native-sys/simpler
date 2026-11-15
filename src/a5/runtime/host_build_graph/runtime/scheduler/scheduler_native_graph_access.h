@@ -33,9 +33,8 @@ inline __aicore__ __gm__ const SchedulerNativeGraphHeader *scheduler_native_head
 ) {
     if (!scheduler_native_header_extent_valid(base, bytes, offset)) return nullptr;
     auto *header = reinterpret_cast<__gm__ const SchedulerNativeGraphHeader *>(base + offset);
-    if (header->magic != SCHEDULER_NATIVE_GRAPH_MAGIC || header->version != SCHEDULER_NATIVE_GRAPH_VERSION ||
-        header->header_bytes != sizeof(SchedulerNativeGraphHeader) || header->image_bytes != bytes ||
-        header->node_count != nodes || nodes == 0 || nodes > INT32_MAX ||
+    if (header->magic != SCHEDULER_NATIVE_GRAPH_MAGIC || header->header_bytes != sizeof(SchedulerNativeGraphHeader) ||
+        header->image_bytes != bytes || header->node_count != nodes || nodes == 0 || nodes > INT32_MAX ||
         header->original_task_count != original_tasks || original_tasks == 0 ||
         original_tasks > TaskId::GLOBAL_TASK_MAX_NUM || header->instance_count == 0 ||
         header->instance_count > original_tasks || header->definition_count == 0 ||

@@ -1,7 +1,7 @@
 # A5 HBG resident：按执行顺序走读
 
 本文从设备入口开始，描述当前 Host 预构造 Call、AIC/AIV 自行调度的 resident 实现。
-Graph view/native image 为 v6/v5，因果诊断普通/native Graph 格式为 v22/v23。
+Graph view/native image 不携带内部版本号；普通与 native Graph 共用 `hbg-native-protocol`，后者额外提供 source/node map。
 工作发现使用不可变目录和 execution token，依赖使用 canonical completion gate。
 
 ## 阅读顺序

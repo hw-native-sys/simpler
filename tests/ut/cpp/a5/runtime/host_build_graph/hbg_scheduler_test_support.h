@@ -154,9 +154,9 @@ struct FixtureStorage {
                 scheduler_initialize_free_slot(&slot);
         for (auto &slot : scheduler_local_state.slots)
             scheduler_initialize_free_slot(&slot);
-        EXPECT_TRUE(scheduler_plan_layout(
-            task_count, task_count, 0, &layout, false, task_count * traces_per_task, spmd, protocol_profiling
-        ));
+        EXPECT_TRUE(
+            scheduler_plan_layout(task_count, &layout, false, task_count * traces_per_task, spmd, protocol_profiling)
+        );
         prepared_capacity = layout.prepared.execution_count;
         if (extend_layout) extend_layout(layout);
         // Reserve backing once. The final metadata later determines the two
@@ -186,13 +186,9 @@ struct FixtureStorage {
 
             context.trace_cells_offset = layout.trace_cells_offset;
             context.worker_contexts_offset = layout.worker_contexts_offset;
-            context.callable_addresses_address = reinterpret_cast<uint64_t>(callable_addresses);
-            context.callable_addresses_count = kFixtureCallableCount;
             context.graph_summary_offset = layout.graph_summary_offset;
             context.graph_task_count = task_count;
             context.original_task_count = task_count;
-            context.graph_view_version = SCHEDULER_GRAPH_VIEW_VERSION;
-            context.graph_view_bytes = sizeof(SchedulerGraphView);
             context.scheduler_state_bytes = layout.total_size;
             context.runtime_worker_count = workers;
             context.worker_index = worker;
@@ -335,8 +331,6 @@ struct FixtureStorage {
         local->profiling->trace_cells_offset = context->trace_cells_offset;
         local->profiling->activity_buffers_offset = context->activity_buffers_offset;
         config.worker_contexts_offset = context->worker_contexts_offset;
-        config.callable_addresses_address = context->callable_addresses_address;
-        config.callable_addresses_count = static_cast<uint32_t>(context->callable_addresses_count);
         config.graph_summary_offset = context->graph_summary_offset;
         config.runtime_worker_count = context->runtime_worker_count;
         config.self_lane = 0;

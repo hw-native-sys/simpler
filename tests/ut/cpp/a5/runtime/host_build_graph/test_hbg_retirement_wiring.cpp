@@ -895,7 +895,7 @@ TEST_F(HbgRetirementWiring, ResidentSwimlaneAccumulatesInterleavedEpochsAndKeeps
     const auto ordinary_body = ordinary.substr(ordinary_start, ordinary.rfind(']') - ordinary_start);
     const std::string prefix = R"({"nested":{"streams":[]},"streams": [)";
     const std::string suffix =
-        R"(],"prepared_calls":{"schema":"hbg-prepared-calls-v4","run_epoch":41,"source":"host",)"
+        R"(],"prepared_calls":{"schema":"hbg-prepared-calls","run_epoch":41,"source":"host",)"
         R"("columns":["execution_index","node_ref","task_id","block_idx","subtask_slot","owner","phase","generation"],)"
         R"("records":[[0,0,0,0,0,2,3,1]]}})";
     for (const bool populated : {false, true}) {

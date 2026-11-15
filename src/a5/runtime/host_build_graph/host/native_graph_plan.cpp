@@ -193,9 +193,8 @@ static bool native_graph_definition_impl(
         child.predicate_offset = SCHEDULER_NATIVE_NO_PREDICATE;
         child.metadata.active_mask = mask;
         child.metadata.flags =
-            active == 0 ?
-                SCHEDULER_TASK_HAS_FANIN :
-                scheduler_task_metadata_flags_from_submit_state(mask, attrs, task.logical_block_num, true, false);
+            active == 0 ? 0 :
+                          scheduler_task_metadata_flags_from_submit_state(mask, attrs, task.logical_block_num, false);
         child.metadata.logical_block_num = static_cast<uint16_t>(task.logical_block_num);
         child.metadata.timing_slot = static_cast<int16_t>(attrs.timing_slot());
         for (int32_t slot = 0; slot < SUBTASK_SLOT_COUNT; ++slot) {
@@ -324,7 +323,6 @@ bool native_graph_plan_readonly_image(
     NativeGraphReadonlyImage next;
     SchedulerNativeGraphHeader header{};
     header.magic = SCHEDULER_NATIVE_GRAPH_MAGIC;
-    header.version = SCHEDULER_NATIVE_GRAPH_VERSION;
     header.header_bytes = sizeof(header);
     header.node_count = plan.bindings.size();
     header.original_task_count = plan.completion_refs.size();

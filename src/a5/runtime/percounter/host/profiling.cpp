@@ -128,7 +128,7 @@ bool export_profile(const ProfileOwner &owner) {
             streams << "{\"record_index\":" << index << ",\"scalar_calls\":" << record.count
                     << ",\"scalar_depth\":" << (record.kind >> 16);
             if ((record.kind & 0xffffU) == static_cast<uint32_t>(ProfilePhase::Window))
-                streams << ",\"scalar_schema\":2,\"batch_write_cycles\":" << header.scalar_write_cycles
+                streams << ",\"batch_write_cycles\":" << header.scalar_write_cycles
                         << ",\"no_progress_loops\":" << header.scalar_poll_loops
                         << ",\"short_function_intervals_omitted\":" << header.scalar_short_intervals
                         << ",\"function_min_cycles\":" << header.scalar_function_min_cycles

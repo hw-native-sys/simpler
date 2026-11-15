@@ -13,9 +13,6 @@
 
 #include "scheduler_memory.h"
 
-// This mandatory run-entry ABI also covers TaskControl and its canonical completion gate.
-inline constexpr uint32_t SCHEDULER_TASK_CATALOG_VERSION = 16;
-
 // Immutable engine catalogs name physical tasks; control nodes are scanned separately.
 struct alignas(64) SchedulerTaskCatalogHeader {
     uint64_t task_count{0};
@@ -23,7 +20,6 @@ struct alignas(64) SchedulerTaskCatalogHeader {
     uint64_t control_count{0};
     uint64_t storage_end_offset{0};
     uint64_t entry_count{0};
-    uint32_t version{SCHEDULER_TASK_CATALOG_VERSION};
 };
 
 struct SchedulerTaskCatalogDescriptor {
@@ -73,9 +69,9 @@ static inline __aicore__ bool scheduler_task_catalog_validate(
     auto *pool = scheduler_state_at<SchedulerTaskCatalogHeader>(base, pool_offset);
     for (uint64_t offset = 0; offset < sizeof(*pool); offset += 64)
         scheduler_observe_cache_line(reinterpret_cast<__gm__ uint8_t *>(pool) + offset);
-    if (pool->version != SCHEDULER_TASK_CATALOG_VERSION || pool->task_count != task_count ||
-        pool->entry_count > task_count || pool->control_count > task_count - pool->entry_count ||
-        pool->storage_end_offset > state_bytes || pool->descriptors_offset < pool_offset + sizeof(*pool) ||
+    if (pool->task_count != task_count || pool->entry_count > task_count ||
+        pool->control_count > task_count - pool->entry_count || pool->storage_end_offset > state_bytes ||
+        pool->descriptors_offset < pool_offset + sizeof(*pool) ||
         pool->descriptors_offset % SCHEDULER_STATE_ALIGNMENT != 0)
         return false;
     uint64_t cursor = pool->descriptors_offset;

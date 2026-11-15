@@ -13,49 +13,40 @@
 
 #include "async_kernel_api.h"
 #include "scheduler/scheduler_async_layout.h"
-#include "scheduler/scheduler_task_catalog.h"
+#include "scheduler/scheduler_prepared_layout.h"
 #include "tensor.h"
 
 namespace {
 constexpr uint32_t kLineWords = 32;
 
-// Bootstrap publishes each background task once. A strong READY observation
-// after CHECK witnesses a backlog without depending on a shared queue head.
+// Independent single-block background tasks are ready while their Host-built
+// execution remains unclaimed. This observes the current immutable catalog.
 inline __aicore__ bool background_is_ready(__gm__ void *base, uint32_t count) {
     const auto *run = reinterpret_cast<__gm__ SchedulerRunControl *>(base);
     const auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, run->graph_summary_offset);
-    const auto *pool = scheduler_state_at<SchedulerTaskCatalogHeader>(base, summary->task_catalog_offset);
-    if (pool->version != SCHEDULER_TASK_CATALOG_VERSION || count >= pool->task_count) return false;
-    auto *states = scheduler_state_at<SchedulerTaskAvailability>(base, pool->availability_offset);
+    const auto *prepared = scheduler_state_at<SchedulerPreparedLayout>(base, summary->prepared_layout_offset);
+    if (count >= prepared->task_count) return false;
+    const auto *plans = scheduler_state_at<SchedulerExecutionPlan>(base, prepared->plans_offset);
+    auto *controls = scheduler_state_at<SchedulerPreparedControl>(base, prepared->controls_offset);
     for (uint32_t ref = 1; ref <= count; ++ref)
-        if (scheduler_gm_fetch_add(states[ref].phase, UINT64_C(0)) ==
-            static_cast<uint64_t>(SchedulerAvailabilityPhase::READY))
+        if (scheduler_prepared_phase(scheduler_gm_fetch_add(controls[plans[ref].execution_begin].state, UINT64_C(0))) ==
+            SchedulerPreparedPhase::BUILT)
             return true;
     return false;
 }
 
-// Only the waiter's FINISH can publish this consumer. Its monotonic phase
-// retains that fact after a worker has claimed it.
-inline __aicore__ bool consumer_was_published(__gm__ void *base, uint32_t count) {
-    const auto *run = reinterpret_cast<__gm__ SchedulerRunControl *>(base);
-    const auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, run->graph_summary_offset);
-    const auto *pool = scheduler_state_at<SchedulerTaskCatalogHeader>(base, summary->task_catalog_offset);
-    if (pool->version != SCHEDULER_TASK_CATALOG_VERSION || static_cast<uint64_t>(count) + 1 >= pool->task_count)
-        return false;
-    auto *states = scheduler_state_at<SchedulerTaskAvailability>(base, pool->availability_offset);
-    const uint64_t phase = scheduler_gm_fetch_add(states[count + 1].phase, UINT64_C(0));
-    return phase == static_cast<uint64_t>(SchedulerAvailabilityPhase::READY) ||
-           phase == static_cast<uint64_t>(SchedulerAvailabilityPhase::OWNED);
-}
-
-inline __aicore__ bool wait_was_checked(__gm__ void *base) {
+// A terminal FINISH lease proves the waiter published its canonical DONE gate.
+inline __aicore__ bool wait_was_finished(__gm__ void *base) {
     const auto *run = reinterpret_cast<__gm__ SchedulerRunControl *>(base);
     const auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, run->graph_summary_offset);
     const auto *layout = scheduler_state_at<SchedulerAsyncLayout>(base, summary->async_layout_offset);
     const auto *map = scheduler_state_at<uint32_t>(base, layout->task_map_offset);
     if (map[0] == pto2::resident::ASYNC_INVALID_INDEX || map[0] >= layout->async_task_count) return false;
     auto *join = scheduler_state_at<SchedulerAsyncTaskJoin>(base, layout->joins_offset) + map[0];
-    return scheduler_async_pending::ready_to_finish(scheduler_gm_fetch_add(join->word, UINT64_C(0)));
+    auto *lease = scheduler_state_at<SchedulerAsyncLease>(base, layout->finish_leases_offset) + map[0];
+    return scheduler_async_pending::ready_to_finish(scheduler_gm_fetch_add(join->word, UINT64_C(0))) &&
+           scheduler_async_lease_phase(scheduler_gm_fetch_add(lease->word, UINT64_C(0))) ==
+               SchedulerAsyncPhase::TERMINAL;
 }
 }  // namespace
 
@@ -73,8 +64,8 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
         // Every invocation does bounded work and returns. Publishing from any
         // background task avoids blocking on which core executes the waiter.
         if (scheduler_gm_query_u32_pair(out + kLineWords) == 1) scheduler_gm_store(out[0], UINT32_C(1));
-        if (ctx.resident_enabled == 1 && wait_was_checked(ctx.resident.image) &&
-            consumer_was_published(ctx.resident.image, count) && background_is_ready(ctx.resident.image, count))
+        if (ctx.resident_enabled == 1 && wait_was_finished(ctx.resident.image) &&
+            background_is_ready(ctx.resident.image, count))
             scheduler_gm_store(out[2 * kLineWords], UINT32_C(1));
         scheduler_gm_store(out[(index + 4) * kLineWords], index + 1);
     } else if (role == 2) {

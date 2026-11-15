@@ -17,7 +17,7 @@ ENTER、EXIT 和 DUMMY 是无业务 slot 的控制节点。即使两个 kernel s
 Graph 内有多个不连通分量时，EXIT 也必须等待每个 sink，不能把最后记录的 child 当作整个实例完成。
 
 80 B 顶层镜像的 Host 镜像提供本次 shell boundary；Host 完成重定位，设备通过 native header/template/instance 访问 child 拓扑与已绑定参数。
-Graph view v6 的可信 extent 先验证 header 范围，再读取 native image v5；
+Graph view 的可信 extent 先验证 header 范围，再读取 native image；
 offset/count、对齐、非重叠、节点数量和 epoch 损坏都会阻止合法执行。
 
 ## 参数区与稳定 Binding

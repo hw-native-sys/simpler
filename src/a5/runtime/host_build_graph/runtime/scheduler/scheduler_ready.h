@@ -153,17 +153,11 @@ struct SchedulerLocalConfig {
     uint64_t task_controls_offset{0};
     uint64_t task_catalog_offset{0};
     uint64_t graph_summary_offset{0};
-    // The callable's registration-owned entry table, named by absolute address
-    // because it is not part of the scheduler state these offsets index. The
-    // address cannot be narrowed the way the offsets are; the length can, and
-    // is validated below.
-    uint64_t callable_addresses_address{0};
     // This run's per-subtask PMU staging array. Here rather than in the
     // profiling state because PMU is its own owner: a run can enable it with
     // every swimlane level off, and that state is then absent.
     uint64_t pmu_cells_offset{0};
     uint32_t worker_contexts_offset{0};
-    uint32_t callable_addresses_count{0};
     uint32_t task_metadata_offset{0};
     uint16_t worker_ids[PLATFORM_CORES_PER_BLOCKDIM]{};
     uint16_t runtime_worker_count{0};
@@ -279,7 +273,7 @@ static_assert(PLATFORM_CORES_PER_BLOCKDIM <= 8, "worker trace mask must fit one 
 static_assert(SCHEDULER_PENDING_SLOT_COUNT == 2, "local ready head requires two slots");
 static_assert(alignof(SchedulerLocalSlotState) == alignof(uint64_t));
 static_assert(alignof(SchedulerLocalState) == alignof(uint64_t));
-static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 96, "64-bit local config size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 80, "64-bit local config size changed");
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalSlotState) == 40, "64-bit local slot size changed");
 static_assert(
     sizeof(void *) != 8 || sizeof(SchedulerLocalProfilingState) == 88 + sizeof(SchedulerScalarTrace),
@@ -317,13 +311,11 @@ static inline __aicore__ bool scheduler_initialize_local_config(
     for (uint64_t offset = 0; offset < offsetof(SchedulerWorkerContext, bootstrap_task_count); offset += 64)
         scheduler_observe_cache_line(reinterpret_cast<__gm__ uint8_t *>(context) + offset);
     if (!scheduler_graph_view_valid(*graph) || context->original_task_count != graph->original_task_count ||
-        context->graph_view_version != graph->view_version || context->graph_view_bytes != graph->view_bytes ||
         context->native_header_offset != graph->native_header_offset)
         return false;
     SchedulerLocalConfig &config = local->config;
-    if (context->worker_contexts_offset > UINT32_MAX || context->callable_addresses_count > UINT32_MAX ||
-        context->task_metadata_offset > UINT32_MAX || context->runtime_worker_count == 0 ||
-        context->runtime_worker_count > SCHEDULER_WORKER_CAPACITY ||
+    if (context->worker_contexts_offset > UINT32_MAX || context->task_metadata_offset > UINT32_MAX ||
+        context->runtime_worker_count == 0 || context->runtime_worker_count > SCHEDULER_WORKER_CAPACITY ||
         context->worker_index >= context->runtime_worker_count)
         return false;
     config.shared_context = context;
@@ -336,8 +328,6 @@ static inline __aicore__ bool scheduler_initialize_local_config(
         local->profiling->activity_buffers_offset = context->activity_buffers_offset;
     }
     config.worker_contexts_offset = static_cast<uint32_t>(context->worker_contexts_offset);
-    config.callable_addresses_address = context->callable_addresses_address;
-    config.callable_addresses_count = static_cast<uint32_t>(context->callable_addresses_count);
     config.graph_summary_offset = context->graph_summary_offset;
     auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, config.graph_summary_offset);
     for (uint64_t offset = 0; offset < sizeof(*summary); offset += 64)
@@ -486,19 +476,6 @@ scheduler_evaluate_task_predicate(const SchedulerGraphAccess &graph, int64_t tas
     default:
         return SchedulerPredicateResult::MALFORMED;
     }
-}
-
-// `callable_count` is the table's own published length, not a capacity the
-// scheduler state reserves: the table belongs to the callable's registration
-// block, so an index past the length addresses memory no table occupies. The
-// read needs no cache maintenance of its own — the AICore invalidates its
-// whole data cache once at bootstrap, before any dispatch can reach here.
-inline __aicore__ bool scheduler_lookup_callable_address(
-    __gm__ uint64_t *callable_addresses, uint32_t callable_count, uint16_t kernel_id, uint64_t *callable_address
-) {
-    if (callable_addresses == nullptr || callable_address == nullptr || kernel_id >= callable_count) return false;
-    *callable_address = callable_addresses[kernel_id];
-    return *callable_address != 0;
 }
 
 inline __aicore__ __gm__ SchedulerTaskControl *
@@ -848,9 +825,6 @@ static inline __aicore__ SchedulerTaskMetadata scheduler_load_dispatch_metadata(
     SchedulerScalarScope scalar_detail(scheduler, SchedPhaseKind::ScalarDispatchMetadata, task_ref);
     const auto *source = scheduler_task_metadata_at(base, scheduler, task_ref);
     SchedulerTaskMetadata metadata{};
-    metadata.kernel_ids[0] = source->kernel_ids[0];
-    metadata.kernel_ids[1] = source->kernel_ids[1];
-    metadata.kernel_ids[2] = source->kernel_ids[2];
     metadata.active_mask = scheduler_task_lanes(*source);
     metadata.flags = source->flags;
     metadata.timing_slot = source->timing_slot;
@@ -898,17 +872,9 @@ static inline __aicore__ PreparedAccessResult scheduler_prepare_dispatch_slot(
         subtask_slot, &slot.prepared
     );
     if (result == PreparedAccessResult::ERROR) {
-        uint64_t function_address = 0;
-        const bool callable_valid = scheduler_lookup_callable_address(
-            reinterpret_cast<__gm__ uint64_t *>(scheduler->config.callable_addresses_address),
-            scheduler->config.callable_addresses_count, metadata.kernel_ids[subtask_slot], &function_address
-        );
         scheduler_record_dispatch_error(
-            run_control, ready_claim.task_ref,
-            callable_valid ? SchedulerGraphResult::INVALID_ARGUMENTS : SchedulerGraphResult::INVALID_CALLABLE, &graph,
-            scheduler, &slot, metadata,
-            callable_valid ? SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED :
-                             SchedulerErrorSite::DISPATCH_INVALID_CALLABLE
+            run_control, ready_claim.task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler, &slot,
+            metadata, SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED
         );
     }
     if (result != PreparedAccessResult::READY) return result;

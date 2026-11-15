@@ -607,7 +607,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
 
     const uint64_t swimlane_run_epoch = api->run_epoch();
     std::ostringstream identities_json;
-    identities_json << "{\"schema\":\"hbg-execution-identity-v2\",\"producer\":\"aicore\",\"records\":[";
+    identities_json << "{\"schema\":\"hbg-execution-identity\",\"producer\":\"aicore\",\"records\":[";
     bool first_identity = true;
     for (uint64_t trace_index : emitted_traces) {
         const SchedulerTaskTrace &trace = traces[trace_index];
@@ -741,7 +741,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
             const uint64_t scalar_offset = owner.layout.scalar_records_offset +
                                            worker * SCHEDULER_SCALAR_RECORD_CAPACITY * sizeof(SchedulerScalarRecord);
             if (buffer.scalar_committed > SCHEDULER_SCALAR_RECORD_CAPACITY ||
-                buffer.scalar_records_offset != scalar_offset || buffer.scalar_storage_format != 1 ||
+                buffer.scalar_records_offset != scalar_offset ||
                 buffer.scalar_storage_slots < buffer.scalar_committed ||
                 buffer.scalar_storage_slots > 2 * buffer.scalar_committed) {
                 LOG_WARN("A5 HBG: invalid Scalar record count for worker=%" PRIu64, worker);
@@ -837,11 +837,10 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
                 const auto &buffer = scheduler_state_at<SchedulerActivityBuffer>(
                     host_base, owner.layout.activity_buffers_offset
                 )[worker];
-                scheduler_json << ",\"scalar_schema\":2,\"batch_write_cycles\":" << buffer.scalar_write_cycles
+                scheduler_json << ",\"batch_write_cycles\":" << buffer.scalar_write_cycles
                                << ",\"no_progress_loops\":" << buffer.scalar_poll_loops
                                << ",\"short_function_intervals_omitted\":" << buffer.scalar_short_intervals
                                << ",\"function_min_cycles\":" << buffer.scalar_function_min_cycles
-                               << ",\"scalar_storage_format\":" << buffer.scalar_storage_format
                                << ",\"scalar_storage_bytes\":"
                                << uint64_t{buffer.scalar_storage_slots} * sizeof(SchedulerScalarStorageSlot)
                                << ",\"scalar_logical_records\":" << buffer.scalar_committed
@@ -853,7 +852,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         first_stream = false;
     }
     if (!first_stream) scheduler_json << "\n    ";
-    scheduler_json << "],\n    \"prepared_calls\":{\"schema\":\"hbg-prepared-calls-v4\",\"run_epoch\":"
+    scheduler_json << "],\n    \"prepared_calls\":{\"schema\":\"hbg-prepared-calls\",\"run_epoch\":"
                    << swimlane_run_epoch
                    << ",\"source\":\"host\",\"columns\":[\"execution_index\",\"node_ref\",\"task_id\","
                       "\"block_idx\",\"subtask_slot\",\"owner\",\"phase\",\"generation\"],\"records\":[";
@@ -1423,9 +1422,7 @@ bool create_scheduler_state(
     std::vector<SchedulerTaskMetadata> task_metadata(static_cast<size_t>(total_tasks));
     uint64_t control_task_count = 0;
     uint64_t graph_shell_count = 0;
-    uint64_t aic_task_count = 0;
     bool sampled_task_timing_enabled = false;
-    uint64_t aiv_task_count = 0;
     uint64_t executable_task_count = 0;
     uint64_t executable_subtask_count = 0;
     uint64_t cooperative_task_count = 0;
@@ -1555,7 +1552,7 @@ bool create_scheduler_state(
         }
         metadata.active_mask = active_mask;
         metadata.flags = scheduler_task_metadata_flags_from_submit_state(
-            metadata_active_mask, slot.task_attrs, slot.logical_block_num, fanin_count != 0, inline_dispatch_task
+            metadata_active_mask, slot.task_attrs, slot.logical_block_num, inline_dispatch_task
         );
         metadata.trace_index_base =
             executable_subtask_count <= UINT32_MAX ? static_cast<uint32_t>(executable_subtask_count) : 0;
@@ -1564,13 +1561,6 @@ bool create_scheduler_state(
         sampled_task_timing_enabled =
             sampled_task_timing_enabled ||
             (metadata.timing_slot >= 0 && metadata.timing_slot < SCHEDULER_TASK_TIMING_SLOT_COUNT);
-        if (active_mask.has_aic()) {
-            ++aic_task_count;
-        }
-        const uint32_t active_aiv_subtasks = active_subtasks - (active_mask.has_aic() ? 1U : 0U);
-        if (active_aiv_subtasks != 0) {
-            ++aiv_task_count;
-        }
         auto demand = scheduler_minimum_worker_demand(active_mask);
         if (slot.task_attrs.requires_sync_start() &&
             !scheduler_resident_worker_demand_checked(active_mask, logical_block_num, true, worker_count, &demand)) {
@@ -1620,9 +1610,8 @@ bool create_scheduler_state(
                 } else if (scheduler_task_is_inline(metadata.flags)) {
                     binding.kind = SchedulerNodeKind::CONTROL_DUMMY;
                     metadata.active_mask = LaneMask::none();
-                    metadata.flags &= SCHEDULER_TASK_HAS_FANIN;
+                    metadata.flags = 0;
                     --executable_task_count;
-                    --aiv_task_count;
                     ++control_task_count;
                 }
                 continue;
@@ -1632,7 +1621,7 @@ bool create_scheduler_state(
             if (binding.kind != SchedulerNodeKind::CHILD_KERNEL) {
                 metadata.active_mask = LaneMask::none();
                 metadata.logical_block_num = 1;
-                metadata.flags = SCHEDULER_TASK_HAS_FANIN;
+                metadata.flags = 0;
                 metadata.timing_slot = -1;
                 for (auto &kernel : metadata.kernel_ids)
                     kernel = UINT16_MAX;
@@ -1640,7 +1629,6 @@ bool create_scheduler_state(
                 continue;
             }
             metadata = definition.children[binding.source_index].metadata;
-            metadata.flags |= SCHEDULER_TASK_HAS_FANIN;
             metadata.trace_index_base = static_cast<uint32_t>(executable_subtask_count);
             const uint32_t lanes = static_cast<uint32_t>(metadata.active_mask.count());
             uint32_t executions = 0;
@@ -1652,8 +1640,6 @@ bool create_scheduler_state(
             }
             executable_subtask_count = next_count;
             sampled_task_timing_enabled = sampled_task_timing_enabled || metadata.timing_slot >= 0;
-            if (metadata.active_mask.has_aic()) ++aic_task_count;
-            if (metadata.active_mask.has_aiv0() || metadata.active_mask.has_aiv1()) ++aiv_task_count;
             auto demand = scheduler_minimum_worker_demand(metadata.active_mask);
             if (scheduler_task_requires_sync_start(metadata.flags) &&
                 !scheduler_resident_worker_demand_checked(
@@ -1707,7 +1693,7 @@ bool create_scheduler_state(
     std::string protocol_source;
     AicoreSchedulerLayout layout{};
     if (!scheduler_plan_layout(
-            node_count, aic_task_count, aiv_task_count, &layout,
+            node_count, &layout,
             runtime->dev.chip_swimlane_level >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHED_PHASES),
             executable_subtask_count, spmd, protocol_profiling, api->pmu_enabled(), native_image.bytes.size()
         ) ||
@@ -1766,10 +1752,7 @@ bool create_scheduler_state(
     }
     layout.total_size = async_plan.total_bytes;
     layout.async_layout_offset = async_plan.layout_offset;
-    layout.executable_task_count = executable_task_count;
     layout.executable_subtask_count = executable_subtask_count;
-    layout.aic_worker_demand = aic_worker_demand;
-    layout.aiv_worker_demand = aiv_worker_demand;
 
     if (!scheduler_plan_scalar_storage(&layout)) {
         LOG_ERROR("A5 HBG: Scalar record storage overflow");
@@ -1896,8 +1879,6 @@ bool create_scheduler_state(
     auto *run_control = scheduler_state_at<SchedulerRunControl>(host_base, layout.run_control_offset);
     run_control->expected_task_count = node_count;
     run_control->inline_completed_count = inline_completed_task_refs.size();
-    run_control->aic_task_count = aic_task_count;
-    run_control->aiv_task_count = aiv_task_count;
     run_control->aic_worker_demand = aic_worker_demand;
     run_control->aiv_worker_demand = aiv_worker_demand;
     run_control->chip_swimlane_level = runtime->dev.chip_swimlane_level;
@@ -1921,12 +1902,6 @@ bool create_scheduler_state(
         context.task_metadata_offset = layout.task_metadata_offset;
         context.aicpu_lifecycle_traces_offset = layout.aicpu_lifecycle_traces_offset;
         context.worker_contexts_offset = layout.worker_contexts_offset;
-        // The absolute address of the callable's registration-owned entry
-        // table, with its own length: nothing in this per-bind allocation holds
-        // that table, so it is named by address rather than by offset from the
-        // base above.
-        context.callable_addresses_address = runtime->callable_entry_table_addr();
-        context.callable_addresses_count = runtime->callable_table_len();
         context.runtime_worker_count = static_cast<uint64_t>(runtime->get_worker_count());
         context.graph_summary_offset = layout.graph_summary_offset;
         context.graph_storage_address = device_sm_address + device_segments.storage;
@@ -1939,8 +1914,6 @@ bool create_scheduler_state(
         context.graph_task_count = node_count;
         context.native_header_offset = native_image.header_offset;
         context.original_task_count = static_cast<uint64_t>(total_tasks);
-        context.graph_view_version = SCHEDULER_GRAPH_VIEW_VERSION;
-        context.graph_view_bytes = sizeof(SchedulerGraphView);
         context.scheduler_state_bytes = layout.total_size;
         context.worker_index = static_cast<uint64_t>(i);
     }

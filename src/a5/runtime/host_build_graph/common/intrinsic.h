@@ -13,7 +13,7 @@
  * @file intrinsic.h
  * @brief SPMD execution context for AICore user kernels
  *
- * GlobalContext exposes the final physical AIV lane and versioned resident
+ * GlobalContext exposes the final physical AIV lane and resident
  * run/execution addressing. LocalContext carries logical block geometry. Both contexts belong to the
  * invocation Binding; their addresses remain stable for the kernel invocation.
  *

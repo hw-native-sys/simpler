@@ -120,7 +120,6 @@ TEST_P(HbgClusterEarlyPreparation, ProtocolClaimFollowsInterleavedProducerComple
     const auto mask = GetParam();
     GmMixFixture fixture({{1, LaneMask::aic()}, {1, mask}}, true, 1);
     fixture.graph.executable(1, mask.has_aic() ? 0 : 1, {0});
-    fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
     ASSERT_TRUE(fixture.bootstrap_admission());
     ASSERT_TRUE(fixture.claim_ordinary(0, 0));
     ASSERT_TRUE(fixture.progress_ordinary(0));
@@ -158,7 +157,6 @@ TEST_P(HbgClusterEarlyPreparation, OneFutureGroupParksWithoutHidingIndependentMi
     const auto mask = GetParam();
     GmMixFixture fixture({{1, LaneMask::aic()}, {2, mask}, {1, mask}});
     fixture.graph.executable(1, mask.has_aic() ? 0 : 1, {0});
-    fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
     ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
     ASSERT_TRUE(fixture.bootstrap_admission());
     ASSERT_TRUE(fixture.claim_ordinary(0, 0));
@@ -248,8 +246,6 @@ TEST(HbgClusterEarlyPreparation, ReplacementNeedsLogicalCompletionAndAnAvailable
     GmMixFixture fixture({{1, LaneMask::aic()}, {1, LaneMask::aic()}, {1, LaneMask::all()}, {1, LaneMask::all()}});
     fixture.graph.executable(2, 0, {0});
     fixture.graph.executable(3, 0, {1});
-    fixture.storage.metadata[2].flags |= SCHEDULER_TASK_HAS_FANIN;
-    fixture.storage.metadata[3].flags |= SCHEDULER_TASK_HAS_FANIN;
     ASSERT_TRUE(fixture.bootstrap_admission());
     fixture.control(1)->completion_state = scheduler_completion_encode(1, 0, 1);
     auto *coordinator = fixture.locals[0];
@@ -307,8 +303,6 @@ TEST(HbgClusterEarlyPreparation, ReplacingFutureGroupPreservesAnArmedCurrentGrou
     );
     fixture.graph.executable(3, 0, {0});
     fixture.graph.executable(4, 0, {1});
-    fixture.storage.metadata[3].flags |= SCHEDULER_TASK_HAS_FANIN;
-    fixture.storage.metadata[4].flags |= SCHEDULER_TASK_HAS_FANIN;
     ASSERT_TRUE(fixture.bootstrap_admission());
     bool armed = false;
     ASSERT_TRUE(fixture.ordinary_arm(2, 0, &armed));
@@ -492,7 +486,6 @@ void service_cluster_members(GmMixFixture &fixture, uint32_t cluster = 0, uint64
 TEST(HbgClusterGroupOwnership, ParkedVectorGroupTransfersToActualAivExecutor) {
     GmMixFixture fixture({{1, LaneMask::aic()}, {1, LaneMask::both_aiv()}, {1, LaneMask::both_aiv()}});
     fixture.graph.executable(1, 1, {0});
-    fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
     ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
     ASSERT_TRUE(fixture.bootstrap_admission());
     auto *first = fixture.locals[0];
@@ -548,7 +541,6 @@ TEST(HbgClusterGroupOwnership, ParkedVectorGroupTransfersToActualAivExecutor) {
 TEST(HbgClusterMixArgsDump, LastSnapshotHoldsExistingCompletionAcrossThreeWaves) {
     GmMixFixture fixture({{3, LaneMask::all()}, {1, LaneMask::aiv0()}}, false, 1);
     fixture.graph.executable(1, 1, {0});
-    fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
     auto *local = fixture.locals[0];
     EXPECT_FALSE(fixture.task_done(1));
     ASSERT_TRUE(fixture.bootstrap_admission());
@@ -813,7 +805,6 @@ TEST(HbgClusterMix, SkippedLanesRejoinLaterGenerationsAcrossChangingMasks) {
     GmMixFixture fixture(shapes, false, 1);
     for (uint32_t task = 1; task < shapes.size(); ++task) {
         fixture.graph.executable(task, shapes[task].mask.has_aic() ? 0 : 1, {static_cast<int32_t>(task - 1)});
-        fixture.storage.metadata[task].flags |= SCHEDULER_TASK_HAS_FANIN;
     }
     ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
     ASSERT_TRUE(fixture.bootstrap_admission());
@@ -938,7 +929,6 @@ TEST_P(HbgClusterMixMultiWave, EveryReturnPrecedesExactlyOneSuccessor) {
     const auto [mask, blocks] = GetParam();
     GmMixFixture fixture({{blocks, mask}, {1, LaneMask::aiv0()}}, false, 2);
     fixture.graph.executable(1, 1, {0});
-    fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
     ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
     ASSERT_TRUE(fixture.bootstrap_admission());
 
@@ -1086,7 +1076,6 @@ void depend_on_inline_gate(GmMixFixture &fixture, uint32_t task, uint32_t gate =
     const auto &metadata = fixture.storage.metadata[task];
     uint8_t lane = metadata.active_mask.has_aic() ? 0 : metadata.active_mask.has_aiv0() ? 1 : 2;
     fixture.graph.executable(task, lane, {static_cast<int32_t>(gate)});
-    fixture.storage.metadata[task].flags |= SCHEDULER_TASK_HAS_FANIN;
     ASSERT_EQ(fixture.run()->bootstrap_scan_complete, 0u);
     ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
 }
@@ -1561,7 +1550,6 @@ TEST(HbgGmMix, InvalidDiscoveredFaninRejectsNewAdmissionAndPreviouslyPermittedKe
     );
     for (uint32_t task = 2; task <= 4; ++task) {
         fixture.graph.executable(task, 0, {1});
-        fixture.storage.metadata[task].flags |= SCHEDULER_TASK_HAS_FANIN;
     }
     ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
     ASSERT_TRUE(fixture.bootstrap_admission());
@@ -2759,7 +2747,6 @@ TEST(HbgGmMix, ExitDrainWaitsForLateReleaseThenClosesTheObligation) {
 TEST(HbgGmMix, MixFaninWaitsForLastSubtaskAndCoordinatorDiscoversSuccessorOnce) {
     GmMixFixture fixture({{2, LaneMask::both_aiv(), true}, {2, kAicAiv0, true}});
     fixture.graph.executable(1, 0, {0});
-    fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
     ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
     EXPECT_FALSE(fixture.task_done(1));
     ASSERT_TRUE(fixture.bootstrap_admission());
@@ -3132,7 +3119,6 @@ TEST(HbgConsumerAdmission, ReadyCooperativeSuccessorIsDiscoveredAfterCompletion)
                 SCOPED_TRACE(owner);
                 GmMixFixture fixture({{2, LaneMask::aic(), true}, {2, mask, true}});
                 fixture.graph.executable(1, 0, {0});
-                fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
                 ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
                 ASSERT_TRUE(fixture.bootstrap_admission());
                 EXPECT_FALSE(fixture.task_done(1));
@@ -3181,7 +3167,6 @@ TEST(HbgConsumerAdmission, ContendedCommitRetainsCandidatesButPublishesOnce) {
     {
         GmMixFixture fixture({{2, LaneMask::aic(), true}, {2, LaneMask::all(), true}});
         fixture.graph.executable(1, 0, {0});
-        fixture.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
         ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
         {
             ASSERT_TRUE(fixture.bootstrap_admission());
@@ -3237,7 +3222,6 @@ TEST(HbgConsumerAdmission, UnfinishedSecondFaninCannotBeAdmitted) {
     {
         GmMixFixture fixture({{2, LaneMask::aic(), true}, {2, LaneMask::aiv0(), true}, {2, LaneMask::all(), true}});
         fixture.graph.executable(2, 0, {0, 1});
-        fixture.storage.metadata[2].flags |= SCHEDULER_TASK_HAS_FANIN;
         ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
         ASSERT_TRUE(fixture.bootstrap_admission());
         EXPECT_FALSE(fixture.task_done(2));
@@ -3278,7 +3262,6 @@ TEST(HbgConsumerAdmission, IndependentSuccessorsRemainDiscoverableExactlyOnce) {
         GmMixFixture fixture({{2, LaneMask::aic(), true}, {2, LaneMask::all(), true}, {2, LaneMask::all(), true}});
         for (uint32_t task : {1u, 2u}) {
             fixture.graph.executable(task, 0, {0});
-            fixture.storage.metadata[task].flags |= SCHEDULER_TASK_HAS_FANIN;
         }
         ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
         ASSERT_TRUE(fixture.bootstrap_admission());

@@ -88,7 +88,7 @@ Qwen 性能接近目标后再执行完整性能回归；已有局部退化如实
 | A5 `aicore/aicore_executor.cpp`、`resident_scheduler.h` | 启动握手、变体选择与窄入口声明 |
 | A5 `aicore/resident_scheduler_impl.h` 及四个 `resident_*.cpp` | bootstrap、每轮调度/控制服务、完成 flush 与退出；普通/native × profile 开关显式实例化 |
 | A5 `aicpu/aicpu_executor.cpp` | N-node supervision、mapped error identity、保持原 run fence |
-| A5 `host/scheduler_protocol_export.h` 及 DFX reader | 双身份、控制事件、独立 expected graph、schema version |
+| A5 `host/scheduler_protocol_export.h` 及 DFX reader | 双身份、控制事件、独立 expected graph、当前字段校验 |
 
 必须搜全并迁移 `scheduler_graph_payload/descriptor/fanin_id`、`SCHEDULER_GRAPH_FANIN_COUNT_OFFSET`、
 `graph_task_count`、`TaskId` 转换和 `trace_index` 使用点，不能只改 steady-state route。

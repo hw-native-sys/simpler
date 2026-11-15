@@ -55,7 +55,7 @@ struct InlineFixture {
                 graph.mixed(task, metadata.active_mask);
             }
             if (task == 2 && producer_blocks > 1) {
-                metadata.flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_HAS_FANIN;
+                metadata.flags = SCHEDULER_TASK_EXECUTABLE;
                 graph.executable(task, 1, {1});
             }
             if (!service_chain &&
@@ -104,7 +104,6 @@ struct InlineFixture {
     void dependency(uint32_t consumer, uint32_t producer) {
         graph.payload(consumer).fanin_count = 1;
         graph.payload(consumer).fanin_data()[0] = static_cast<int32_t>(producer);
-        storage.metadata[consumer].flags |= SCHEDULER_TASK_HAS_FANIN;
     }
     bool bootstrap_admission() {
         if (run()->bootstrap_scan_complete != 0) return true;

@@ -26,7 +26,7 @@ struct CapturedResidentState {
     char *metadata_source = nullptr;
     size_t worker_contexts_offset = 0;
     int32_t worker_count = 0;
-    uint32_t graph_view_version = 0;
+    uint64_t original_task_count = 0;
 };
 
 thread_local CapturedResidentState resident_state;
@@ -80,17 +80,19 @@ capture_resident_state(const CapturedLaunch &launch, const std::vector<CapturedP
     const size_t contexts_offset = bootstrap.worker_context_base - metadata_base;
     auto *metadata_source = static_cast<char *>(const_cast<void *>(metadata->source));
     uint64_t run_control_offset = 0;
+    uint64_t original_task_count = 0;
     for (int32_t worker = 0; worker < worker_count; ++worker) {
         SchedulerWorkerContext context{};
         std::memcpy(&context, metadata_source + contexts_offset + worker * sizeof(context), sizeof(context));
-        if (worker == 0) run_control_offset = context.run_control_offset;
+        if (worker == 0) {
+            run_control_offset = context.run_control_offset;
+            original_task_count = context.original_task_count;
+        }
         if (context.worker_index != static_cast<uint64_t>(worker) ||
             context.runtime_worker_count != static_cast<uint64_t>(worker_count) ||
             context.scheduler_state_base_address != metadata_base ||
             context.worker_contexts_offset != contexts_offset || context.scheduler_state_bytes < metadata->bytes ||
-            context.run_control_offset != run_control_offset ||
-            context.graph_view_version != SCHEDULER_GRAPH_VIEW_VERSION ||
-            context.graph_view_bytes != sizeof(SchedulerGraphView)) {
+            context.run_control_offset != run_control_offset || context.original_task_count != original_task_count) {
             return {};
         }
     }
@@ -107,15 +109,15 @@ capture_resident_state(const CapturedLaunch &launch, const std::vector<CapturedP
         metadata_source,
         contexts_offset,
         worker_count,
-        SCHEDULER_GRAPH_VIEW_VERSION,
+        original_task_count,
     };
 }
 
-void set_captured_graph_view_version(const CapturedResidentState &state, uint32_t version) {
+void set_captured_original_task_count(const CapturedResidentState &state, uint64_t count) {
     for (int32_t worker = 0; worker < state.worker_count; ++worker) {
         auto *field = state.metadata_source + state.worker_contexts_offset + worker * sizeof(SchedulerWorkerContext) +
-                      offsetof(SchedulerWorkerContext, graph_view_version);
-        std::memcpy(field, &version, sizeof(version));
+                      offsetof(SchedulerWorkerContext, original_task_count);
+        std::memcpy(field, &count, sizeof(count));
     }
 }
 static SchedulerRunControl read_resident_control(const CapturedResidentState &state) {
@@ -171,10 +173,10 @@ void check_publications(int scenario, const CapturedSubmission &submission) {
     require(resident_state.run_control != nullptr, "observed-resident-publication");
 }
 
-void inject_boot_failure() { set_captured_graph_view_version(resident_state, 0); }
+void inject_boot_failure() { set_captured_original_task_count(resident_state, 0); }
 
 void restore_boot_failure() {
-    set_captured_graph_view_version(resident_state, resident_state.graph_view_version);
+    set_captured_original_task_count(resident_state, resident_state.original_task_count);
     check(0, "restore-injected-graph-view");
 }
 

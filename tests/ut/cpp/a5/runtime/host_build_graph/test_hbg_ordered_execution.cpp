@@ -120,7 +120,6 @@ struct OrderedFixture {
             consumer, storage.metadata[consumer].active_mask == LaneMask::aic() ? 0 : 1,
             {static_cast<int32_t>(producer)}
         );
-        storage.metadata[consumer].flags |= SCHEDULER_TASK_HAS_FANIN;
         EXPECT_TRUE(scheduler_init_spmd_task_records(base(), storage.layout, 37));
     }
     bool bootstrap_admission() {

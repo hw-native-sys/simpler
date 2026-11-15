@@ -44,7 +44,7 @@ inline bool scheduler_prepare_host_calls(
     const auto &plan = scheduler_state_at<SchedulerExecutionPlan>(base, prepared.plans_offset)[task_ref];
     auto *calls = scheduler_state_at<SchedulerPreparedCall>(base, prepared.calls_offset);
     auto *controls = scheduler_state_at<SchedulerPreparedControl>(base, prepared.controls_offset);
-    if (prepared.version != SCHEDULER_PREPARED_VERSION || plan.execution_begin > prepared.execution_count ||
+    if (plan.execution_begin > prepared.execution_count ||
         plan.execution_count > prepared.execution_count - plan.execution_begin)
         return false;
     const SchedulerAsyncLayout *async = nullptr;
