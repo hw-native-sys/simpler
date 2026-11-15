@@ -290,6 +290,7 @@ struct FixtureStorage {
         auto *controls = scheduler_state_at<SchedulerTaskControl>(scheduler_state->base(), layout.task_controls_offset);
         for (uint64_t task = 0; task < layout.task_count; ++task) {
             const auto &meta = metadata[task];
+            if (scheduler_task_requires_admission(meta)) continue;
             const uint32_t total = scheduler_task_is_executable(meta.flags) && !scheduler_task_is_inline(meta.flags) ?
                                        meta.logical_block_num * meta.active_mask.count() :
                                        1;

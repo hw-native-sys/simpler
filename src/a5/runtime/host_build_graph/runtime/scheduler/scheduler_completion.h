@@ -214,7 +214,9 @@ static inline __aicore__ bool scheduler_complete_own_slot(
         }
     }
     const SchedulerLocalSlotState completed_slot = *local_slot;
-    if (!scheduler_return_prepared_execution(scheduler_state_base, scheduler->config.prepared, &local_slot->prepared)) {
+    if (!scheduler_return_prepared_execution<FromExecutor>(
+            scheduler_state_base, scheduler->config.prepared, &local_slot->prepared
+        )) {
         scheduler_record_error(
             run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
             SchedulerErrorSite::COMPLETION_SLOT_BINDING_INVALID, local_slot

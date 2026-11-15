@@ -134,9 +134,10 @@ static inline __aicore__ void scheduler_protocol_execution_permit(
                         slot.gm_mix      ? local->admission->gm_mix.group_seq :
                                            0;
     record->flags = SCHEDULER_PROTOCOL_PAYLOAD_PUBLISHED |
-                    (ordered ? SCHEDULER_PROTOCOL_COOPERATIVE :
-                     has_log ? SCHEDULER_PROTOCOL_PERMIT_TAIL :
-                               SCHEDULER_PROTOCOL_PERMIT_NO_LOG) |
+                    (ordered                           ? SCHEDULER_PROTOCOL_COOPERATIVE :
+                     slot.preclaim_order != UINT64_MAX ? SCHEDULER_PROTOCOL_PERMIT_PRECLAIM :
+                     has_log                           ? SCHEDULER_PROTOCOL_PERMIT_TAIL :
+                                                         SCHEDULER_PROTOCOL_PERMIT_NO_LOG) |
                     (slot.gm_mix ? SCHEDULER_PROTOCOL_GM_GROUP : 0) |
                     (slot.cluster_mix ? SCHEDULER_PROTOCOL_CLUSTER_GROUP : 0);
     record->permit_tail = ordered ? UINT64_MAX : tail;

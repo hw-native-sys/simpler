@@ -80,15 +80,16 @@ def test_native_audit_rejects_compile_only_and_missing_count_case(tmp_path):
             "source_commit": "source",
             "control_reads": [{"file": "orchestration.cpp", "line": 1}],
             "performance": {"rounds": 10},
-            "checks": [{"counts": counts, "passed": True} for counts in ([0, 6], [6, 0], [72, 72])],
+            "checks": [{"counts": [72, 72], "passed": True}],
+            "numerical_validation": False,
         }
         (directory / "result.json").write_text(json.dumps(report))
-    with pytest.raises(ValueError, match="all Host-control goldens"):
+    with pytest.raises(ValueError, match="performance-only run"):
         audit.native_moe_reports(tmp_path, case)
     path = tmp_path / "moe/L0/result.json"
     report = json.loads(path.read_text())
     report["compile_only"] = False
     report["checks"].pop()
     path.write_text(json.dumps(report))
-    with pytest.raises(ValueError, match="all Host-control goldens"):
+    with pytest.raises(ValueError, match="performance-only run"):
         audit.native_moe_reports(tmp_path, case)

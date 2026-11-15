@@ -123,6 +123,12 @@ TEST(ProtocolGraphSourceTest, CopiesOriginalCsrAndDeduplicatesDefinitionsByKey) 
 }
 
 TEST_F(ProtocolExportFixture, ZeroCycleAndMaximumEpochRemainLiteralValues) {
+    const std::vector<SchedulerTaskMetadata> metadata(
+        at<SchedulerTaskMetadata>(layout.task_metadata_offset),
+        at<SchedulerTaskMetadata>(layout.task_metadata_offset) + layout.task_count
+    );
+    ASSERT_TRUE(scheduler_init_data_from_layout(storage->base(), layout, reinterpret_cast<uint64_t>(storage->base())));
+    std::copy(metadata.begin(), metadata.end(), at<SchedulerTaskMetadata>(layout.task_metadata_offset));
     ASSERT_TRUE(scheduler_init_spmd_task_records(storage->base(), layout, UINT64_MAX));
     auto *events = at<SchedulerProtocolTaskTrace>(layout.protocol.tasks_offset);
     events[0].admission.before = {0, 1};

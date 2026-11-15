@@ -192,6 +192,10 @@ enum class SchedPhaseKind : uint8_t {
     ScalarTaskIssueHead = 135,
     ScalarTaskIssueFanin = 136,
     ScalarTaskSupplyClosed = 137,
+    ScalarServiceCooperativeSlots = 138,
+    ScalarBootstrapInitWait = 139,
+    ScalarBootstrapPeerWait = 140,
+    ScalarBootstrapTopology = 141,
 };
 
 // This phase's name as a report spells it. Returns a string literal, so it is safe on
@@ -266,6 +270,12 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_async_finish";
     case SchedPhaseKind::ScalarBootstrap:
         return "scalar_bootstrap";
+    case SchedPhaseKind::ScalarBootstrapInitWait:
+        return "scalar_bootstrap_init_wait";
+    case SchedPhaseKind::ScalarBootstrapPeerWait:
+        return "scalar_bootstrap_peer_wait";
+    case SchedPhaseKind::ScalarBootstrapTopology:
+        return "scalar_bootstrap_topology";
     case SchedPhaseKind::ScalarLaunchWait:
         return "scalar_launch_wait";
     case SchedPhaseKind::ScalarExitDrain:
@@ -446,6 +456,8 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_task_issue_fanin";
     case SchedPhaseKind::ScalarTaskSupplyClosed:
         return "scalar_task_supply_closed";
+    case SchedPhaseKind::ScalarServiceCooperativeSlots:
+        return "scalar_service_cooperative_slots";
     }
     return "unknown";
 }

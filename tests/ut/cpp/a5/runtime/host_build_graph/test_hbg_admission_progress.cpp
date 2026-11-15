@@ -18,6 +18,158 @@ namespace {
 using namespace pto2::resident;
 using namespace scheduler_test::gm_mix;
 
+TEST(HbgAdmissionProgress, ExistingReadyWindowRunsBeforeTheFirstCohortClaim) {
+    for (const bool mixed : {false, true}) {
+        SCOPED_TRACE(mixed);
+        std::vector<GmShape> shapes(SCHEDULER_EXECUTION_TOKEN_COUNT, {1, LaneMask::aic()});
+        const uint32_t cohort = shapes.size();
+        shapes.push_back({2, mixed ? LaneMask::all() : LaneMask::aic(), true});
+        GmMixFixture fixture(shapes, true, 4);
+        ASSERT_TRUE(fixture.prepare_calls());
+        for (uint32_t task = 0; task < cohort; ++task) {
+            auto *local = fixture.locals[0];
+            for (uint32_t slice = 0; slice <= cohort && !scheduler_execution_token_has_task(local, task); ++slice) {
+                const uint64_t head = local->issue_observed_head;
+                const uint32_t count = scheduler_execution_token_count(local);
+                bool progress = false;
+                ASSERT_TRUE(scheduler_refill_execution_tokens(
+                    fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &progress
+                ));
+                ASSERT_TRUE(progress);
+                ASSERT_TRUE(local->issue_observed_head > head || scheduler_execution_token_count(local) > count);
+            }
+            ASSERT_TRUE(scheduler_execution_token_has_task(local, task));
+            EXPECT_EQ(fixture.control(task)->next_block, 1u);
+            EXPECT_EQ(scheduler_execution_token_count(local), task + 1);
+        }
+        ASSERT_TRUE(fixture.admit(cohort, 3));
+        for (uint32_t task = 0; task < cohort; ++task) {
+            ASSERT_TRUE(fixture.fill(0));
+            GmExecution execution{};
+            ASSERT_TRUE(fixture.begin(0, &execution));
+            ASSERT_EQ(execution.task, task);
+            EXPECT_FALSE(fixture.admissions[0].sync_claimed);
+            EXPECT_EQ(fixture.control(cohort)->next_block, 0u);
+            const auto *layout = scheduler_protocol_layout_at(fixture.base(), fixture.locals[0]);
+            ASSERT_NE(layout, nullptr);
+            const auto *record = scheduler_protocol_execution_at(fixture.base(), fixture.locals[0], layout, task, 0, 0);
+            ASSERT_NE(record, nullptr);
+            EXPECT_NE(record->flags & SCHEDULER_PROTOCOL_PERMIT_PRECLAIM, 0u);
+            EXPECT_EQ(record->permit_tail, 1u);
+            ASSERT_TRUE(fixture.complete(execution));
+        }
+        ASSERT_TRUE(fixture.fill(0));
+        if (mixed) {
+            EXPECT_TRUE(fixture.admissions[0].sync_claimed);
+            EXPECT_EQ(fixture.control(cohort)->next_block, 1u);
+            EXPECT_NE(fixture.admissions[0].gm_mix.phase, SchedulerGmMixPhase::IDLE);
+            EXPECT_EQ(scheduler_execution_token_count(fixture.locals[0]), 0u);
+            EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
+            continue;
+        }
+        GmExecution execution{};
+        ASSERT_TRUE(fixture.begin(0, &execution));
+        EXPECT_EQ(execution.task, cohort);
+        EXPECT_TRUE(fixture.admissions[0].sync_claimed);
+        EXPECT_EQ(fixture.control(cohort)->next_block, 1u);
+        EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
+    }
+}
+
+TEST(HbgAdmissionProgress, ReadyOrdinarySlotMayRunBeforeButNotAfterItsGmGroupIsOwned) {
+    for (const uint32_t worker : {0u, 1u}) {
+        for (const bool own_before_entry : {false, true}) {
+            SCOPED_TRACE(worker);
+            SCOPED_TRACE(own_before_entry);
+            GmMixFixture fixture(
+                {{1, worker == 0 ? LaneMask::aic() : LaneMask::aiv0()}, {2, LaneMask::all(), true}}, true, 2
+            );
+            ASSERT_TRUE(fixture.prepare_calls());
+            ASSERT_TRUE(fixture.claim_ordinary(0, worker));
+            ASSERT_TRUE(fixture.progress_ordinary(worker));
+            auto *local = fixture.locals[worker];
+            uint32_t slot = UINT32_MAX;
+            ASSERT_TRUE(scheduler_local_ready_peek(local, &slot));
+            const auto prepared = local->slots[slot].prepared;
+            ASSERT_TRUE(fixture.admit(1));
+            if (worker != 0) {
+                ASSERT_TRUE(fixture.refresh(0));
+                ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+                ASSERT_TRUE(fixture.publish(0));
+                ASSERT_GT(fixture.mailbox(0)->lanes[worker].assigned_seq, 0u);
+            }
+            GmExecution execution{};
+            EXPECT_FALSE(fixture.begin(worker, &execution));
+            ASSERT_TRUE(fixture.service_cooperative(worker));
+            ASSERT_TRUE(scheduler_local_ready_peek(local, &slot));
+            EXPECT_EQ(local->slots[slot].prepared.execution_index, prepared.execution_index);
+            EXPECT_EQ(local->slots[slot].prepared.claimed_state, prepared.claimed_state);
+            EXPECT_EQ(local->slots[slot].preclaim_order, 0u);
+            EXPECT_EQ(fixture.admissions[worker].gm_mix.phase, SchedulerGmMixPhase::IDLE);
+            EXPECT_TRUE(fixture.admissions[worker].preclaim_initialized);
+            EXPECT_EQ(fixture.admissions[worker].preclaim_mask, 0u);
+            if (own_before_entry) {
+                if (worker == 0) {
+                    ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+                } else {
+                    bool observed = false;
+                    ASSERT_TRUE(fixture.observe(worker, &observed));
+                    ASSERT_TRUE(observed);
+                }
+                EXPECT_FALSE(fixture.begin(worker, &execution));
+                ASSERT_TRUE(fixture.service_cooperative(worker));
+                EXPECT_TRUE(scheduler_execution_token_has_task(local, 0));
+                EXPECT_TRUE(fixture.admissions[worker].preclaim_initialized);
+                EXPECT_EQ(fixture.admissions[worker].preclaim_mask, 0u);
+                EXPECT_NE(fixture.admissions[worker].gm_mix.phase, SchedulerGmMixPhase::IDLE);
+            } else {
+                ASSERT_TRUE(fixture.begin(worker, &execution));
+                EXPECT_EQ(execution.task, 0);
+                EXPECT_EQ(execution.worker, worker);
+                ASSERT_TRUE(fixture.complete(execution));
+                EXPECT_TRUE(fixture.task_done(0));
+                ASSERT_TRUE(fixture.service_cooperative(worker));
+                EXPECT_NE(fixture.admissions[worker].gm_mix.phase, SchedulerGmMixPhase::IDLE);
+            }
+            EXPECT_EQ(fixture.control(0)->next_block, 1u);
+            EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
+        }
+    }
+}
+
+TEST(HbgAdmissionProgress, GmPreclaimWindowDoesNotWaitForAsyncDebtOrRefillVacatedTokens) {
+    GmMixFixture fixture(
+        {{1, LaneMask::aiv0()},
+         {1, LaneMask::aic()},
+         {1, LaneMask::aic()},
+         {2, LaneMask::all(), true},
+         {1, LaneMask::aic()}},
+        false, 2
+    );
+    fixture.graph.executable(1, 0, {0});
+    ASSERT_TRUE(fixture.prepare_calls());
+    ASSERT_TRUE(fixture.claim_ordinary(0, 1));
+    // Physical work is finished, but its registered completion condition is not.
+    fixture.control(0)->completion_state = scheduler_completion_encode(1, 0, 1);
+    ASSERT_TRUE(fixture.claim_ordinary(1, 0));
+    ASSERT_TRUE(fixture.claim_ordinary(2, 0));
+    ASSERT_TRUE(fixture.admit(3));
+    ASSERT_TRUE(fixture.service_cooperative(0));
+    GmExecution execution{};
+    ASSERT_TRUE(fixture.begin(0, &execution));
+    EXPECT_EQ(execution.task, 2);
+    ASSERT_TRUE(fixture.complete(execution));
+    EXPECT_TRUE(scheduler_execution_token_has_task(fixture.locals[0], 1));
+    EXPECT_FALSE(fixture.task_done(0));
+    ASSERT_TRUE(fixture.service_cooperative(0));
+    EXPECT_TRUE(fixture.admissions[0].sync_claimed);
+    EXPECT_NE(fixture.admissions[0].gm_mix.phase, SchedulerGmMixPhase::IDLE);
+    EXPECT_EQ(fixture.admissions[0].preclaim_mask, 0u);
+    EXPECT_EQ(fixture.control(4)->next_block, 0u);
+    EXPECT_TRUE(scheduler_execution_token_has_task(fixture.locals[0], 1));
+    EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
+}
+
 TEST(HbgAdmissionProgress, DeferredPredecessorLeavesIndependentCounterPublisherRunnable) {
     constexpr uint32_t successor_count = SCHEDULER_EXECUTION_TOKEN_COUNT + 1;
     constexpr uint32_t publisher = successor_count + 1;
@@ -65,8 +217,7 @@ TEST(HbgAdmissionProgress, DeferredPredecessorLeavesIndependentCounterPublisherR
         ASSERT_TRUE(scheduler_order_task_catalog(fixture.graph.graph(), metadata, {}, &catalog));
         ASSERT_LT(catalog.task_ranks[publisher], catalog.task_ranks[1]);
         scheduler_init_task_catalog(fixture.base(), catalog);
-        ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
-        ASSERT_TRUE(fixture.bootstrap_admission());
+        ASSERT_TRUE(fixture.prepare_calls());
         ASSERT_NE(fixture.locals[1]->admission, nullptr);
         ASSERT_TRUE(fixture.claim_pending(0, 1));
         ASSERT_EQ(
@@ -103,14 +254,22 @@ TEST(HbgAdmissionProgress, DeferredPredecessorLeavesIndependentCounterPublisherR
         );
         // Real ordered refill reaches the full waiting window without any
         // caller assigning tokens or skipping an issuance head.
-        if (!sync_successors)
-            for (uint32_t slice = 0; slice < SCHEDULER_EXECUTION_TOKEN_COUNT; ++slice)
+        if (!sync_successors) {
+            for (uint32_t slice = 0; slice < task_count * SCHEDULER_EXECUTION_TOKEN_COUNT; ++slice) {
+                if (scheduler_execution_token_count(fixture.locals[1]) == SCHEDULER_EXECUTION_TOKEN_COUNT &&
+                    scheduler_execution_token_count(fixture.locals[2]) == SCHEDULER_EXECUTION_TOKEN_COUNT)
+                    break;
+                bool advanced = false;
                 for (uint32_t worker = 1; worker < 3; ++worker) {
                     bool progress = false;
                     ASSERT_TRUE(scheduler_refill_execution_tokens(
                         fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), 0, &progress
                     ));
+                    advanced = advanced || progress;
                 }
+                ASSERT_TRUE(advanced);
+            }
+        }
         for (uint32_t worker = 1; worker < 3; ++worker) {
             auto *local = fixture.locals[worker];
             EXPECT_EQ(scheduler_execution_token_count(local), sync_successors ? 0u : SCHEDULER_EXECUTION_TOKEN_COUNT);

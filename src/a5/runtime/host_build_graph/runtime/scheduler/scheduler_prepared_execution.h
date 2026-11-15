@@ -139,6 +139,9 @@ static inline __aicore__ bool scheduler_prepared_call_valid(
            call->args[SPMD_GLOBAL_CONTEXT_INDEX] == reinterpret_cast<uint64_t>(&binding->global_context);
 }
 
+// FromExecutor owns a Call that has physically returned. Its CLAIMED state
+// has no remote writer; the completion/failed-return fence drains publication.
+template <bool FromExecutor = false>
 inline __aicore__ bool scheduler_return_prepared_execution(
     __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, SchedulerPreparedHandle *handle
 ) {
@@ -149,8 +152,12 @@ inline __aicore__ bool scheduler_return_prepared_execution(
     auto *control = scheduler_prepared_control_at(base, prepared, handle->execution_index);
     const uint64_t returned =
         (handle->claimed_state & ~UINT64_C(255)) | static_cast<uint64_t>(SchedulerPreparedPhase::RETURNED);
-    if (scheduler_gm_compare_exchange(control->state, handle->claimed_state, returned) != handle->claimed_state)
-        return false;
+    if constexpr (FromExecutor) {
+        scheduler_gm_store(control->state, returned);
+    } else {
+        if (scheduler_gm_compare_exchange(control->state, handle->claimed_state, returned) != handle->claimed_state)
+            return false;
+    }
     *handle = {};
     return true;
 }

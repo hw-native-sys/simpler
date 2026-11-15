@@ -15,6 +15,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from device_start_gate import validate_runtime_gate
 from export_cases import export
 from materialize import materialize
 
@@ -47,6 +48,10 @@ def main():
     for name in runtime_files:
         if not (runtime / name).is_file():
             parser.error(f"Required production runtime file is missing: {runtime / name}")
+    try:
+        validate_runtime_gate(runtime, "host_build_graph")
+    except ValueError as exc:
+        parser.error(str(exc))
     output.mkdir(parents=True, exist_ok=False)
     env = {**os.environ, "DSV41_RUNNER": str(build / "host/native-runner")}
     (output / "runtime.json").write_text(json.dumps({"path": str(runtime)}, indent=2) + "\n")

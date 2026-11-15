@@ -77,7 +77,10 @@ TEST(SchedulerTokenDispatch, ReturnReleasesItsSlotAndFlushCountsCompletionOnce) 
     ASSERT_TRUE(f.take(slot));
     EXPECT_EQ(f.local()->local_ready_mask, 0u);
     const auto handle = f.local()->slots[slot].prepared;
-    ASSERT_TRUE(f.complete(slot));
+    f.local()->slots[slot].state = SchedulerDispatchSlotState::EXECUTING;
+    ASSERT_TRUE(
+        (scheduler_complete_own_slot<true, true>(f.graph.graph(), f.base(), f.local(), f.storage.run_control, slot, 0))
+    );
     EXPECT_EQ(f.local()->slots[slot].state, SchedulerDispatchSlotState::FREE);
     EXPECT_TRUE(scheduler_completion_done(f.control(0)->completion_state));
     EXPECT_EQ(
@@ -362,7 +365,7 @@ void configure_cached_cluster(FixtureStorage &storage) {
 }
 
 TEST(SchedulerLocalConfig, SnapshotsImmutableConfigurationAndReloadsOnNextRun) {
-    FixtureStorage storage(2, 3);
+    FixtureStorage storage(2, 3, 1, SchedulerSpmdRequirements{3, 1, 0, 0});
     GraphBuffer graph_buffer(2);
     storage.prepare_catalog();
     const SchedulerGraphView graph = graph_buffer.graph();
@@ -388,7 +391,7 @@ TEST(SchedulerLocalConfig, SnapshotsImmutableConfigurationAndReloadsOnNextRun) {
 }
 
 TEST(SchedulerLocalConfig, RejectsTruncatedOffsetsAndInvalidCoreTypes) {
-    FixtureStorage storage(1, 3);
+    FixtureStorage storage(1, 3, 1, SchedulerSpmdRequirements{3, 1, 0, 0});
     GraphBuffer graph_buffer(1);
     storage.prepare_catalog();
     const auto graph = graph_buffer.graph();
@@ -442,7 +445,7 @@ TEST(SchedulerLocalConfig, RejectsTruncatedOffsetsAndInvalidCoreTypes) {
 }
 
 TEST(SchedulerLocalConfig, RejectsInvalidTopologyBeforeMailboxAccess) {
-    FixtureStorage storage(1, 3);
+    FixtureStorage storage(1, 3, 1, SchedulerSpmdRequirements{3, 1, 0, 0});
     GraphBuffer graph_buffer(1);
     storage.prepare_catalog();
     const SchedulerGraphView graph = graph_buffer.graph();
@@ -525,7 +528,7 @@ void arm_ordinary_mix(GmMixFixture &fixture, uint64_t profiling = 0) {
 TEST_P(SchedulerMix, PayloadAndCompletionTraceFollowEachLogicalSubtask) {
     const auto mask = GetParam();
     GmMixFixture fixture({{1, mask}}, true, 1);
-    ASSERT_TRUE(fixture.bootstrap_admission());
+    ASSERT_TRUE(fixture.prepare_calls());
     ASSERT_NO_FATAL_FAILURE(arm_ordinary_mix(fixture, 3));
     std::set<uint64_t> execution_indices;
     std::set<uint32_t> subtasks;
@@ -564,7 +567,7 @@ TEST_P(SchedulerMix, PayloadAndCompletionTraceFollowEachLogicalSubtask) {
 
 TEST_P(SchedulerMix, InvalidPreparedCallPublishesNoPayloadOrCompletion) {
     GmMixFixture fixture({{1, GetParam()}}, true, 1);
-    ASSERT_TRUE(fixture.bootstrap_admission());
+    ASSERT_TRUE(fixture.prepare_calls());
     bool armed = false;
     ASSERT_TRUE(fixture.ordinary_arm(0, 0, &armed));
     ASSERT_TRUE(armed);

@@ -80,6 +80,7 @@ void expect_summary_configuration(void *base, const AicoreSchedulerLayout &layou
     EXPECT_EQ(summary->mix_close_seals_offset, layout.mix_close_seals_offset);
     EXPECT_EQ(summary->run_epoch, epoch);
     EXPECT_EQ(summary->prepared_layout_offset, layout.prepared_layout_offset);
+    EXPECT_EQ(summary->bootstrap_clusters_offset, layout.bootstrap_clusters_offset);
 }
 
 void expect_empty_protocol(void *base, const AicoreSchedulerLayout &layout) {
@@ -248,6 +249,8 @@ TEST(HbgSpmdLayout, AdmissionPublicationLeavesAllOtherTaskBytesUntouched) {
 
 TEST(HbgSpmdLayout, IsolatesAdmissionAndMailboxAtomicOwners) {
     EXPECT_EQ(sizeof(SchedulerAdmissionRecord), 64u);
+    EXPECT_EQ(sizeof(SchedulerBootstrapCluster), 128u);
+    EXPECT_EQ(alignof(SchedulerBootstrapCluster), 128u);
     EXPECT_EQ(sizeof(SchedulerAdmissionControl), 256u);
     EXPECT_EQ(alignof(SchedulerAdmissionControl), 128u);
     EXPECT_EQ(offsetof(SchedulerAdmissionControl, commit_lock), 0u);
@@ -290,7 +293,7 @@ TEST_P(HbgSpmdWorkerLayout, OrdinaryGraphHasNoProtocolAllocation) {
     ASSERT_TRUE(scheduler_plan_layout(5, &ordinary, false, 0, requirements(GetParam(), 0, 0)));
     ASSERT_TRUE(scheduler_plan_layout(5, &default_layout));
     expect_no_protocol_storage(ordinary);
-    EXPECT_EQ(ordinary.total_size, default_layout.total_size);
+    EXPECT_EQ(ordinary.total_size - default_layout.total_size, (GetParam() / 3) * sizeof(SchedulerBootstrapCluster));
     scheduler_test::SchedulerStateBuffer storage(ordinary);
     ASSERT_NE(storage.base(), nullptr);
     expect_empty_protocol(storage.base(), ordinary);
@@ -337,6 +340,7 @@ TEST_P(HbgSpmdWorkerLayout, MixRegionsAreAlignedDisjointAndSizedToActualTopology
         {layout.group_mailboxes_offset, layout.spmd.cluster_count * sizeof(SchedulerGroupMailbox)},
         {layout.mix_close_seals_offset, layout.mix_close_seal_count * sizeof(SchedulerMixCloseSeal)},
         {layout.graph_summary_offset, sizeof(SchedulerGraphSummary)},
+        {layout.bootstrap_clusters_offset, layout.spmd.cluster_count * sizeof(SchedulerBootstrapCluster)},
         {layout.task_metadata_offset, layout.task_count * sizeof(SchedulerTaskMetadata)},
         {layout.task_controls_offset, layout.task_count * sizeof(SchedulerTaskControl)},
     };
@@ -499,7 +503,7 @@ TEST(HbgSpmdLayout, RetainedAllocationRebindsLargeSmallLargeWithoutTouchingInact
     EXPECT_EQ(record_at(retained.base(), large, 0)->task_ref, SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(record_at(retained.base(), large, 1)->logical_block_num, 7u);
     EXPECT_EQ(record_at(retained.base(), large, 1)->active_mask, LaneMask::aiv1());
-    EXPECT_EQ(record_at(retained.base(), large, 1)->run_epoch, 0u);
+    EXPECT_EQ(record_at(retained.base(), large, 1)->run_epoch, 349u);
     EXPECT_EQ(
         record_at(retained.base(), large, 8)->mix_close_seals_offset,
         large.mix_close_seals_offset + large.spmd.cluster_count * sizeof(SchedulerMixCloseSeal)
@@ -616,9 +620,9 @@ TEST(HbgSpmdTaskRecords, InitializesOnlyCooperativeTasksAndPacksOneSealRowPerMix
         EXPECT_EQ(record->logical_block_num, metadata[task].logical_block_num);
         EXPECT_EQ(record->active_mask, metadata[task].active_mask);
         EXPECT_EQ(record->flags, metadata[task].flags);
-        EXPECT_EQ(record->run_epoch, 0u);
+        EXPECT_EQ(record->run_epoch, epoch);
         EXPECT_EQ(record->order_key, UINT64_MAX);
-        EXPECT_EQ(record->member_count, 0u);
+        EXPECT_EQ(record->member_count, task == 3 ? 64u : 96u);
     }
     for (uint64_t task : {0u, 1u, 2u, 5u, 6u, 7u})
         EXPECT_EQ(record_at(storage.base(), layout, task)->task_ref, SCHEDULER_TASK_REF_INVALID);
@@ -635,7 +639,7 @@ TEST(HbgSpmdTaskRecords, InitializesOnlyCooperativeTasksAndPacksOneSealRowPerMix
         EXPECT_EQ(log[index], SCHEDULER_TASK_REF_INVALID);
 }
 
-TEST(HbgSpmdTaskRecords, EpochIsSuppliedExactlyWithoutHostPublicationOrIncrement) {
+TEST(HbgSpmdTaskRecords, EpochIsSuppliedExactlyToHostRecordsWithoutIncrement) {
     AicoreSchedulerLayout layout{};
     ASSERT_TRUE(scheduler_plan_layout(1, &layout, false, 2, requirements(6, 1, 0)));
     scheduler_test::SchedulerStateBuffer storage(layout);
@@ -648,7 +652,7 @@ TEST(HbgSpmdTaskRecords, EpochIsSuppliedExactlyWithoutHostPublicationOrIncrement
         set_metadata(storage.base(), layout, 0, 2, LaneMask::aic(), SCHEDULER_TASK_SYNC_START);
         ASSERT_TRUE(scheduler_init_spmd_task_records(storage.base(), layout, epoch));
         expect_summary_configuration(storage.base(), layout, epoch);
-        EXPECT_EQ(record_at(storage.base(), layout, 0)->run_epoch, 0u);
+        EXPECT_EQ(record_at(storage.base(), layout, 0)->run_epoch, epoch);
         EXPECT_EQ(record_at(storage.base(), layout, 0)->order_key, UINT64_MAX);
     }
 }

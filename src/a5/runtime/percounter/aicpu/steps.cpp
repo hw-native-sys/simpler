@@ -66,6 +66,8 @@ void AicpuExecutor::publish_partition(Runtime *runtime, int32_t tidx, int32_t nt
 // launch, so there is no bootstrap acknowledgement to wait for.
 bool AicpuExecutor::awaits_bootstrap() const { return false; }
 
+bool AicpuExecutor::uses_kernel_work_window() const { return true; }
+
 int32_t AicpuExecutor::supervise(Runtime *runtime, int32_t thread_idx) {
     return simpler::percounter::percounter_supervise(
         runtime, scheduler_timeout_cycles(), aicpu_thread_num_, thread_idx

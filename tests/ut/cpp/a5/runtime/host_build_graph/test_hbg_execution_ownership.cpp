@@ -142,6 +142,24 @@ struct RefillFixture {
     bool refill(bool *progress) {
         return scheduler_refill_execution_tokens(graph.graph(), base(), local, storage.run_control, 0, progress);
     }
+    void fill_window(uint32_t count) {
+        for (uint32_t slice = 0; slice < graph.graph().task_count * SCHEDULER_EXECUTION_TOKEN_COUNT &&
+                                 scheduler_execution_token_count(local) < count;
+             ++slice) {
+            const auto before = pending_tasks();
+            const auto head = local->issue_observed_head;
+            const auto task = local->issue_task_ref;
+            const auto fanin = local->issue_next_fanin;
+            bool advanced = false;
+            ASSERT_TRUE(refill(&advanced));
+            ASSERT_TRUE(advanced);
+            ASSERT_TRUE(
+                pending_tasks() != before || local->issue_observed_head > head || local->issue_task_ref != task ||
+                local->issue_next_fanin > fanin
+            );
+        }
+        ASSERT_EQ(scheduler_execution_token_count(local), count);
+    }
     bool progress(uint32_t *slot) {
         bool advanced = false;
         return scheduler_progress_execution_tokens(
@@ -178,8 +196,7 @@ TEST(HbgExecutionRefill, AWorkerCannotSkipTheUnissuedRemainderOfItsCurrentTask) 
     EXPECT_EQ(fixture.control(1)->next_block, 0u);
     SchedulerPreparedHandle peer{};
     ASSERT_NO_FATAL_FAILURE(fixture.reserve(0, 3, &peer));
-    ASSERT_TRUE(fixture.refill(&progress));
-    EXPECT_TRUE(progress);
+    ASSERT_NO_FATAL_FAILURE(fixture.fill_window(SCHEDULER_EXECUTION_TOKEN_COUNT));
     EXPECT_EQ(fixture.pending_tasks(), (std::set<int64_t>{0, 1, 2, 3}));
     EXPECT_EQ(fixture.control(0)->next_block, 2u);
     EXPECT_FALSE(scheduler_completion_done(fixture.control(0)->completion_state));
@@ -194,7 +211,7 @@ TEST(HbgExecutionRefill, FullWaitingWindowKeepsEveryOwnerUntilTheProducerComplet
     SchedulerPreparedHandle producer{};
     ASSERT_NO_FATAL_FAILURE(fixture.reserve(0, 3, &producer));
     bool advanced = false;
-    ASSERT_TRUE(fixture.refill(&advanced));
+    ASSERT_NO_FATAL_FAILURE(fixture.fill_window(SCHEDULER_EXECUTION_TOKEN_COUNT));
     ASSERT_EQ(fixture.pending_tasks(), (std::set<int64_t>{1, 2, 3, 4}));
     std::array<SchedulerPreparedHandle, 4> held{};
     for (uint32_t index = 0; index < 4; ++index)
@@ -239,7 +256,7 @@ TEST(HbgExecutionRefill, UnissuedProducerIsClaimedBeforeAnyOfItsConsumers) {
     EXPECT_EQ(fixture.pending_tasks(), (std::set<int64_t>{0}));
     for (uint32_t task = 1; task < 6; ++task)
         EXPECT_EQ(fixture.control(task)->next_block, 0u);
-    ASSERT_TRUE(fixture.refill(&progress));
+    ASSERT_NO_FATAL_FAILURE(fixture.fill_window(SCHEDULER_EXECUTION_TOKEN_COUNT));
     EXPECT_EQ(fixture.pending_tasks(), (std::set<int64_t>{0, 1, 2, 3}));
     uint32_t slot = UINT32_MAX;
     ASSERT_TRUE(fixture.progress(&slot));

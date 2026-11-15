@@ -41,7 +41,7 @@ protected:
         if (scenario == HandoffScenario::TWO_SUCCESSORS) {
             fixture.graph.executable(2, first, {0});
         }
-        ASSERT_TRUE(fixture.bootstrap_admission());
+        ASSERT_TRUE(fixture.prepare_calls());
         ASSERT_TRUE(fixture.claim_ordinary(0, producer_lane));
         ASSERT_TRUE(fixture.progress_ordinary(producer_lane));
         GmExecution producer{};
@@ -167,8 +167,7 @@ TEST(HbgDirectAdmissionRetry, SyncSuccessorsRemainDiscoverableBehindAnExistingPe
             fixture.storage.metadata, fixture.storage.metadata + fixture.storage.layout.task_count
         );
         ASSERT_TRUE(scheduler_validate_dependencies(fixture.graph.graph(), metadata, {}));
-        ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
-        ASSERT_TRUE(fixture.bootstrap_admission());
+        ASSERT_TRUE(fixture.prepare_calls());
         ASSERT_TRUE(fixture.admit(0));
         ASSERT_TRUE(fixture.refresh_all());
         std::array<GmExecution, 2> producers{};

@@ -15,6 +15,7 @@
 #include <cstdint>
 
 #include "common/core_type.h"
+#include "common/device_phase.h"
 #include "common/platform_config.h"
 
 class Runtime;
@@ -60,6 +61,8 @@ public:
     bool cores_retired() const {
         return core_count_ > 0 && retired_core_count_.load(std::memory_order_acquire) == core_count_;
     }
+    // Called after all shutdown partitions arrive; consumes their saved reports.
+    bool retired_work_window(AicoreWorkWindow &out, bool allow_idle) const;
     // This run's discovered cores, for a scheduler mode that configures them
     // itself. Valid once every thread has finished handshake_partition.
     int32_t core_count() const { return core_count_; }
@@ -84,6 +87,10 @@ private:
         uint64_t end_cycles;
     };
 
+    struct alignas(64) ThreadWorkWindow {
+        AicoreWorkWindowAccumulator summary;
+    };
+
     AicpuThreadLifecycleTrace *thread_lifecycle_trace(int32_t thread_idx);
     void collect_run_swimlane_records(Runtime *runtime);
     bool collect_run_pmu_records(Runtime *runtime, uint64_t *missing_out);
@@ -91,6 +98,7 @@ private:
     CoreState cores_[kMaxWorkers]{};
     uint32_t physical_core_ids_[kMaxWorkers]{};
     ThreadHandshakeTiming thread_handshake_timing_[PLATFORM_MAX_AICPU_THREADS]{};
+    ThreadWorkWindow thread_work_windows_[PLATFORM_MAX_AICPU_THREADS]{};
     std::atomic<bool> handshake_failed_{false};
     // Cores this run proved are no longer executing, counted only after their
     // acknowledged release. A missing startup report supplies no such proof.

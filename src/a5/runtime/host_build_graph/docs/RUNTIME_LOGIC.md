@@ -378,16 +378,21 @@ completion gate is the readiness proof for executable and control consumers.
 
 ## 6. Bootstrap and Dependencies
 
-After READY acquire, each worker validates its context, graph view, epoch,
-prepared layout and immutable engine catalog. Workers partition node ranges and
-prepare required cooperative admission records. Cluster coordinators clear their
-own signal before the bootstrap scan barrier. No Graph child argument binding
-runs on the device: Host has already published those arguments and Calls.
+Host validates cooperative task shapes and residency limits before publishing
+their epoch, member count and INITIALIZED admission state. After READY acquire,
+each worker validates its context, graph view, epoch, prepared layout, immutable
+engine catalog and topology. No Graph child argument binding runs on the device:
+Host has already published those arguments and Calls.
 
-After `bootstrap_scan_complete`, workers initialize two FREE local slots,
-service bounded control-node scans and prepare their first executions. The last
-worker publishes `bootstrap_complete`; AICPU then opens the DMB launch gate.
-No kernel may enter while this gate remains closed.
+Each cluster has a run-initialized 128-byte atomic-only GM gate. When the graph
+uses MIX, its AIC clears the local signal and publishes INIT; AIV lanes confirm
+INIT before touching that signal. Without MIX, Host seeds INIT and the AIC does
+not overwrite it. Workers initialize two FREE local slots, service bounded
+control-node scans and prepare their first executions. Each AIV publishes its
+DONE bit once; after its own successful first fill, the AIC confirms both bits
+and contributes three workers to the global bootstrap count. The final cluster
+publishes `bootstrap_complete`; AICPU then opens the DMB launch gate. A failed
+lane contributes no success, and no kernel may enter before this gate opens.
 
 ENTER, EXIT and inline control nodes use bounded scans rather than a ready inbox.
 A worker reads each producer's canonical gate and advances only a positive fanin

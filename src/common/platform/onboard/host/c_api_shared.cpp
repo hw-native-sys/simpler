@@ -1285,9 +1285,15 @@ static void emit_device_phase_markers(DeviceRunnerBase *runner, uint32_t pipelin
     // that owned `pipeline_slot`, not to whatever the runner is doing now.
     const DeviceRunnerBase::DeviceRunTiming &timing = runner->device_run_timing(pipeline_slot);
     if (timing.aicore_wall_ns != 0) {
+        char attrs[192];
+        std::snprintf(
+            attrs, sizeof(attrs),
+            "clk=dev clock_source=aicore aicore_start_cycle=%llu aicore_end_cycle=%llu aicore_cnt_hz=%llu",
+            static_cast<unsigned long long>(timing.aicore_start_cycle),
+            static_cast<unsigned long long>(timing.aicore_end_cycle), static_cast<unsigned long long>(timing.sys_cnt_hz)
+        );
         STRACE_DEV_SPAN_AT_A(
-            "chip.run.runner_run.aicore_wall", 0, static_cast<long long>(timing.aicore_wall_ns), 2,
-            "clk=dev clock_source=aicore"
+            "chip.run.runner_run.aicore_wall", 0, static_cast<long long>(timing.aicore_wall_ns), 2, attrs
         );
     }
     const uint64_t run_wall_ns = timing.phase_ns[static_cast<int>(AicpuPhase::RunWall)];

@@ -15,13 +15,15 @@
 #include "scheduler_scalar_record.h"
 #include "host_build_graph/sched_phase_kind.h"
 
+namespace {
+
 template <bool Enabled>
 class SchedulerScalarScopeImpl;
 
 template <>
 class SchedulerScalarScopeImpl<true> {
 public:
-    inline __aicore__ explicit SchedulerScalarScopeImpl(
+    inline __aicore__ __attribute__((always_inline)) explicit SchedulerScalarScopeImpl(
         SchedPhaseKind kind, int64_t task_ref = -1, uint64_t begin = 0
     ) :
         trace_(scheduler_scalar_current()),
@@ -33,7 +35,7 @@ public:
         } else trace_ = nullptr;
     }
     template <typename Local>
-    inline __aicore__
+    inline __aicore__ __attribute__((always_inline))
     SchedulerScalarScopeImpl(const Local *local, SchedPhaseKind kind, int64_t task_ref = -1, uint64_t begin = 0) :
         trace_(local != nullptr && local->profiling != nullptr ? &local->profiling->scalar : nullptr),
         kind_(kind),
@@ -45,7 +47,7 @@ public:
     }
     inline __aicore__ ~SchedulerScalarScopeImpl() { close(); }
     inline __aicore__ void set_task_ref(int64_t task_ref) { task_ref_ = task_ref; }
-    inline __aicore__ void close() {
+    inline __aicore__ __attribute__((always_inline)) void close() {
         if (trace_ == nullptr) return;
         const uint64_t end = scheduler_cycles();
         --trace_->depth;
@@ -106,6 +108,8 @@ public:
 };
 
 using SchedulerScalarIteration = SchedulerScalarIterationImpl<kSchedulerScalarInstrumentation>;
+
+}  // namespace
 
 // The shared result wrapper keeps its depth/clock bookkeeping outside the
 // surrounding scheduler loop. End when the returned value is consumable by

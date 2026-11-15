@@ -1102,6 +1102,8 @@ public:
     struct DeviceRunTiming {
         uint64_t wall_ns{0};
         uint64_t aicore_wall_ns{0};
+        uint64_t aicore_start_cycle{0};
+        uint64_t aicore_end_cycle{0};
         uint64_t phase_ns[NUM_AICPU_PHASES]{};
         uint64_t phase_start_ns[NUM_AICPU_PHASES]{};
         uint64_t task_slot_dispatch_ns[NUM_TASK_TIMING_SLOTS]{};

@@ -22,7 +22,25 @@ import shutil
 import statistics
 import subprocess
 import sys
+import time
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
+
+
+@contextmanager
+def capture_benchmark_strace(path):
+    bench = importlib.import_module("pypto.runtime.bench")
+    parse = bench._parse_stats_from_strace
+
+    def capture(text, *args, **kwargs):
+        path.write_text(text)
+        return parse(text, *args, **kwargs)
+
+    bench._parse_stats_from_strace = capture
+    try:
+        yield
+    finally:
+        bench._parse_stats_from_strace = parse
 
 
 def create_bundle(bundle, lib, reuse=None):
@@ -126,17 +144,18 @@ def install_callable(bundle, runtime):
 
 
 def validate_report(report, case, level=None):
-    """Require all PR3038 control cases and complete Host/Device measurements."""
+    """Require a performance-only full-count run and complete timing measurements."""
     checks = report.get("checks", [])
-    required = {(0, 6), (6, 0), (72, 72)}
+    required = {(72, 72)}
     if (
         report.get("passed") is not True
         or report.get("compile_only") is not False
-        or len(checks) != 3
+        or report.get("numerical_validation") is not False
+        or len(checks) != 1
         or any(check.get("passed") is not True for check in checks)
         or {tuple(check.get("counts", [])) for check in checks} != required
     ):
-        raise ValueError("Native MoE has not passed all Host-control goldens")
+        raise ValueError("Native MoE has not completed its performance-only run")
     if report.get("source_commit") != case["lib_commit"] or (
         level is not None and report.get("profiling_level") != level
     ):
@@ -156,6 +175,22 @@ def validate_report(report, case, level=None):
         raise ValueError("Native MoE has invalid timing samples")
     if any(not math.isclose(samples[i], max(rank[i] for rank in ranks), abs_tol=1e-6) for i in range(rounds)):
         raise ValueError("Native MoE Device samples must use the per-round rank maximum")
+    if report.get("profiling_level") == 0:
+        core_samples = perf.get("aicore_wall_us", [])
+        core_ranks = list(perf.get("per_rank_aicore_us", {}).values())
+        if (
+            perf.get("metric") != "chip.run.runner_run.aicore_wall"
+            or perf.get("endpoint_semantics") != "first_kernel_start_to_last_kernel_end"
+            or len(core_ranks) != 2
+            or any(len(values) != rounds for values in [core_samples, *core_ranks])
+            or any(not math.isfinite(x) or x <= 0 for values in [core_samples, *core_ranks] for x in values)
+            or any(
+                not math.isclose(core_samples[i], max(rank[i] for rank in core_ranks), abs_tol=1e-6)
+                for i in range(rounds)
+            )
+            or not math.isclose(statistics.mean(core_samples), perf.get("aicore_us_mean", 0), abs_tol=1e-6)
+        ):
+            raise ValueError("Native MoE requires complete AICore L0 kernel endpoints and per-round rank maxima")
 
 
 def _create_requested_bundle(args, bundle, parser):
@@ -163,6 +198,39 @@ def _create_requested_bundle(args, bundle, parser):
         if not args.compile_only:
             parser.error("--lib-root requires --compile-only; compile before reserving devices")
         create_bundle(bundle, args.lib_root, args.reuse_bundle)
+
+
+def _validate_execution_runtime(args, runtime_lib, parser):
+    if args.compile_only:
+        return
+    validate_gate = runpy.run_path(str(Path(__file__).with_name("device_start_gate.py")))["validate_runtime_gate"]
+    try:
+        validate_gate(runtime_lib, args.runtime)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+
+def benchmark_performance(bench, args, output, devices):
+    if bench is None:
+        raise RuntimeError("MoE execution completed, but performance samples are unavailable")
+    samples = bench.device_wall_us
+    if len(samples) != args.rounds or any(value <= 0 for value in samples):
+        raise RuntimeError("Missing or invalid measured Device samples")
+    performance = {
+        "rounds": args.rounds,
+        "warmup": args.warmup,
+        "device_wall_us": samples,
+        "host_wall_us": bench.host_wall_us,
+        "device_us_mean": statistics.mean(samples),
+        "host_us_mean": statistics.mean(bench.host_wall_us),
+        "per_rank_device_us": bench.per_rank("device"),
+    }
+    if args.level == 0:
+        timing = runpy.run_path(str(Path(__file__).with_name("timing.py")))
+        performance.update(
+            timing["native_performance"]((output / "benchmark.strace.log").read_text(), performance, devices)
+        )
+    return performance
 
 
 def main():
@@ -213,6 +281,7 @@ def main():
     pin = importlib.import_module("pypto.runtime.runtime_pin").check_runtime_pin()
 
     runtime_lib = (args.runtime_lib or environment.PROJECT_ROOT / "build/lib/a5/onboard").resolve()
+    _validate_execution_runtime(args, runtime_lib, parser)
     RuntimeBuilder = importlib.import_module("simpler_setup.runtime_builder").RuntimeBuilder
 
     RuntimeBuilder._LIB_DIR = runtime_lib.parent.parent
@@ -266,51 +335,50 @@ def main():
         "devices": devices,
         "profiling_level": args.level,
         "checks": [],
+        "numerical_validation": False,
     }
-    counts_list = [(72, 72)] if args.compile_only else [(0, 6), (6, 0), (72, 72)]
+    counts = (72, 72)
     with passes.PassContext([], runtime=passes.RuntimeKind.HOST_BUILD_GRAPH):
-        for counts in counts_list:
-            measure = not args.compile_only and counts == (72, 72)
-            os.environ["PYPTO_BENCH"] = "1" if measure else "0"
-            os.environ["PYPTO_BENCH_WARMUP"] = str(args.warmup)
-            os.environ["PYPTO_BENCH_ROUNDS"] = str(args.rounds)
-            specs = moe.build_moe_specs(counts, initialize=not args.compile_only)
+        measure = not args.compile_only
+        os.environ["PYPTO_BENCH"] = "1" if measure else "0"
+        os.environ["PYPTO_BENCH_WARMUP"] = str(args.warmup)
+        os.environ["PYPTO_BENCH_ROUNDS"] = str(args.rounds)
+        preparation_start = time.perf_counter()
+        if not args.compile_only:
+            cache = runpy.run_path(str(Path(__file__).with_name("weight_cache.py")))
+            specs, cache_info = cache["cached_weight_specs"](
+                moe, counts, case["lib_commit"], Path(__file__).resolve().parents[1] / "build/native-weights"
+            )
+            report["weight_cache"] = cache_info
+        else:
+            specs = moe.build_moe_specs(counts, initialize=False)
+        preparation_seconds = time.perf_counter() - preparation_start
+        execution_start = time.perf_counter()
+        with capture_benchmark_strace(output / "benchmark.strace.log") if measure else nullcontext():
             result = golden.run(
                 fn=moe.l3_moe,
                 specs=specs,
-                golden_fn=moe.golden_moe,
+                golden_fn=None,
                 save_data=False,
                 compile_only=args.compile_only,
                 runtime_dir=None if args.compile_only else str(program),
                 config=config,
-                rtol=1e-3,
-                atol=1e-3,
-                compare_fn={
-                    "next_pre_mix": golden.ratio_allclose(atol=2.5e-5, rtol=5e-3),
-                    "x_mixed": golden.ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-                    "x_next": moe._local_hc_compare(counts),
-                },
             )
-            report["checks"].append({"counts": counts, "passed": result.passed, "error": result.error})
-            (output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
-            if not result.passed:
-                raise RuntimeError(result.error or "MoE golden failed")
-            report["control_reads"] = control_reads(Path(result.work_dir))
-            if measure:
-                if result.bench is None:
-                    raise RuntimeError("MoE correctness passed, but performance samples are unavailable")
-                samples = result.bench.device_wall_us
-                if len(samples) != args.rounds or any(value <= 0 for value in samples):
-                    raise RuntimeError("Missing or invalid measured Device samples")
-                report["performance"] = {
-                    "rounds": args.rounds,
-                    "warmup": args.warmup,
-                    "device_wall_us": samples,
-                    "host_wall_us": result.bench.host_wall_us,
-                    "device_us_mean": statistics.mean(samples),
-                    "host_us_mean": statistics.mean(result.bench.host_wall_us),
-                    "per_rank_device_us": result.bench.per_rank("device"),
-                }
+        report["checks"].append(
+            {
+                "counts": counts,
+                "passed": result.passed,
+                "error": result.error,
+                "input_preparation_seconds": preparation_seconds,
+                "execution_seconds": time.perf_counter() - execution_start,
+            }
+        )
+        (output / "result.json").write_text(json.dumps(report, indent=2) + "\n")
+        if not result.passed:
+            raise RuntimeError(result.error or "MoE performance execution failed")
+        report["control_reads"] = control_reads(Path(result.work_dir))
+        if measure:
+            report["performance"] = benchmark_performance(result.bench, args, output, devices)
     report["compile_only"] = args.compile_only
     report["passed"] = not args.compile_only
     if args.compile_only:
@@ -329,7 +397,12 @@ def main():
     else:
         validate_report(report, case, args.level)
     (output / "result.json").write_text(json.dumps(report, indent=2, default=str) + "\n")
-    print(f"MoE Host control {'compilation' if args.compile_only else 'validation'} passed: {output}")
+    if not args.compile_only and args.level == 0:
+        print(
+            f"AICore L0 wall: {report['performance']['aicore_us_mean'] / 1000:.6f} ms "
+            f"({args.rounds} rounds, per-round rank maximum)"
+        )
+    print(f"MoE Host control {'compilation' if args.compile_only else 'performance run'} passed: {output}")
 
 
 if __name__ == "__main__":

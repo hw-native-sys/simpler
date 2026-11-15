@@ -133,6 +133,7 @@ struct AicpuExecutor {
     SIMPLER_SCHEDULER_STEP bool schedules_on_aicore(const Runtime *runtime) const;
     // Whether the leader waits for the cores to acknowledge the bootstrap.
     SIMPLER_SCHEDULER_STEP bool awaits_bootstrap() const;
+    SIMPLER_SCHEDULER_STEP bool uses_kernel_work_window() const;
     // Watch the run to completion. Runs on the last thread, and its return
     // value is this run's status.
     SIMPLER_SCHEDULER_STEP int32_t supervise(Runtime *runtime, int32_t thread_idx);
