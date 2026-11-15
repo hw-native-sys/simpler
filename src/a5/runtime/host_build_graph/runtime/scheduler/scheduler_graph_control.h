@@ -65,6 +65,10 @@ static inline __aicore__ bool scheduler_service_controls(
             );
             return false;
         }
+        if (!scheduler_publish_completion_notices(base, local, ref)) {
+            scheduler_record_error(run, ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local);
+            return false;
+        }
         if (record) {
             scheduler_protocol_task_actor(base, local, ref, UINT64_MAX, metadata.flags, true, true, before);
             scheduler_protocol_task_actor(base, local, ref, UINT64_MAX, metadata.flags, true, false, after);

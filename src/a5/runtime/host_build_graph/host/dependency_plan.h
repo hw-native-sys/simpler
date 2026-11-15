@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <vector>
 
 #include "scheduler/scheduler_graph.h"
@@ -33,6 +34,44 @@ inline bool scheduler_validate_dependencies(
             int64_t producer;
             if (scheduler_fanin_ref(view, consumer, edge, &producer) != SchedulerGraphResult::OK) return false;
         }
+    }
+    return true;
+}
+
+// A wide consumer makes every potential executor observe the same producer.
+// Four independent notices bound that fanout without changing ownership.
+inline bool scheduler_plan_completion_notifications(
+    const SchedulerGraphAccess &graph, std::vector<SchedulerTaskMetadata> &metadata,
+    const std::vector<int64_t> &completed
+) {
+    constexpr uint32_t wide_readers = 16;
+    if (metadata.size() != static_cast<uint64_t>(graph.task_count)) return false;
+    std::vector<uint8_t> host_done(metadata.size(), 0);
+    std::vector<uint32_t> readers(metadata.size(), 0);
+    for (int64_t ref : completed) {
+        if (!scheduler_task_ref_valid(graph, ref)) return false;
+        host_done[ref] = 1;
+    }
+    for (int64_t ref = 0; ref < graph.task_count; ++ref) {
+        if (host_done[ref]) continue;
+        const auto &consumer = metadata[ref];
+        const uint32_t width =
+            scheduler_task_is_executable(consumer.flags) && !scheduler_task_is_inline(consumer.flags) ?
+                consumer.logical_block_num * consumer.active_mask.count() :
+                1;
+        SchedulerFaninView view;
+        if (scheduler_node_fanin_view(graph, ref, &view) != SchedulerGraphResult::OK) return false;
+        for (uint32_t edge = 0; edge < view.count; ++edge) {
+            int64_t producer = -1;
+            if (scheduler_fanin_ref(view, ref, edge, &producer) != SchedulerGraphResult::OK ||
+                !scheduler_task_ref_valid(graph, producer))
+                return false;
+            readers[producer] = std::min(wide_readers, readers[producer] + std::min(wide_readers, width));
+        }
+    }
+    for (size_t ref = 0; ref < metadata.size(); ++ref) {
+        metadata[ref].flags &= ~SCHEDULER_TASK_DISTRIBUTED_DONE;
+        if (!host_done[ref] && readers[ref] >= wide_readers) metadata[ref].flags |= SCHEDULER_TASK_DISTRIBUTED_DONE;
     }
     return true;
 }

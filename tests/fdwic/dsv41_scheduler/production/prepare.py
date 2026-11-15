@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Prepare the selected 16-case matrix from the three original orchestrations."""
+"""Prepare the selected 12-case matrix from the three original orchestrations."""
 
 import argparse
 import json

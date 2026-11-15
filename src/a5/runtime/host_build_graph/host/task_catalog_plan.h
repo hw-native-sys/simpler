@@ -252,10 +252,6 @@ inline bool scheduler_plan_task_catalog(
         !scheduler_layout_reserve(
             &cursor, next.descriptors.size() * sizeof(SchedulerTaskCatalogDescriptor), SCHEDULER_STATE_ALIGNMENT,
             &header.descriptors_offset
-        ) ||
-        !scheduler_layout_reserve(
-            &cursor, SCHEDULER_EXECUTION_ENGINE_COUNT * sizeof(SchedulerIssueCursor), SCHEDULER_GM_ATOMIC_SECTOR_BYTES,
-            &header.issue_cursors_offset
         ))
         return false;
     for (auto &descriptor : next.descriptors)
@@ -274,9 +270,7 @@ inline void scheduler_init_task_catalog(void *base, const SchedulerTaskCatalogPl
     *scheduler_state_at<SchedulerTaskCatalogHeader>(base, plan.header_offset) = plan.header;
     auto *descriptors = scheduler_state_at<SchedulerTaskCatalogDescriptor>(base, plan.header.descriptors_offset);
     std::copy(plan.descriptors.begin(), plan.descriptors.end(), descriptors);
-    auto *issues = scheduler_state_at<SchedulerIssueCursor>(base, plan.header.issue_cursors_offset);
     for (uint32_t type = 0; type < plan.descriptors.size(); ++type) {
-        issues[type].next_task = 0;
         auto *entries = scheduler_state_at<int64_t>(base, plan.descriptors[type].entries_offset);
         std::copy(plan.catalogs[type].begin(), plan.catalogs[type].end(), entries);
     }

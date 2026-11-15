@@ -74,6 +74,7 @@ TEST(HbgTaskCatalog, PhysicalTasksUseTwoEngineListsAndControlsRemainSeparate) {
     const auto vectors = scheduler_task_catalog(image.base, image.plan.header, 1);
     EXPECT_EQ(std::vector<int64_t>(cubes.refs, cubes.refs + cubes.count), (std::vector<int64_t>{0, 2, 3}));
     EXPECT_EQ(std::vector<int64_t>(vectors.refs, vectors.refs + vectors.count), (std::vector<int64_t>{1}));
+    EXPECT_FALSE(scheduler_task_catalog_valid(scheduler_task_catalog(image.base, image.plan.header, 2)));
     EXPECT_EQ(metadata[2].active_mask.raw(), 3u);
     EXPECT_EQ(metadata[3].active_mask.raw(), 6u);
 }
@@ -208,22 +209,19 @@ TEST(HbgTaskCatalog, CrossEnginePredecessorRequiresIssuedSupplyRatherThanLogical
         };
         EXPECT_EQ(query(), SCHEDULER_TASK_REF_INVALID);
         producer->next_block = 2;
-        if (sync_start) {
-            EXPECT_EQ(query(), SCHEDULER_TASK_REF_INVALID);
-            producer->claim_seal = 2;
-        }
+        EXPECT_EQ(query(), SCHEDULER_TASK_REF_INVALID);
+        producer->claim_seal = 2;
         EXPECT_EQ(query(), 1);
         EXPECT_EQ(query(), 1);
         EXPECT_FALSE(scheduler_completion_done(producer->completion_state));
         scheduler_task_control_at(base, worker, 1)->next_block = 1;
+        scheduler_task_control_at(base, worker, 1)->claim_seal = 1;
         auto *next_producer = scheduler_task_control_at(base, worker, 2);
         next_producer->completion_state = scheduler_completion_initial_state(2);
         EXPECT_EQ(query(), SCHEDULER_TASK_REF_INVALID);
         next_producer->next_block = 2;
-        if (sync_start) {
-            EXPECT_EQ(query(), SCHEDULER_TASK_REF_INVALID);
-            next_producer->claim_seal = 2;
-        }
+        EXPECT_EQ(query(), SCHEDULER_TASK_REF_INVALID);
+        next_producer->claim_seal = 2;
         EXPECT_EQ(query(), 3);
         EXPECT_FALSE(scheduler_completion_done(next_producer->completion_state));
         EXPECT_EQ(scheduler_read_error(storage.run_control), 0u);
@@ -262,6 +260,23 @@ TEST(HbgTaskCatalog, InvalidTopologyOrOverflowLeavesThePreviousPlanIntact) {
     EXPECT_FALSE(scheduler_plan_task_catalog(metadata, 1, UINT64_MAX - 64, &plan));
     EXPECT_EQ(plan.total_size, size);
     EXPECT_EQ(plan.catalogs, catalogs);
+}
+
+TEST(HbgHostDependencies, WideConsumersUseDistributedNoticesOnlyForLiveProducers) {
+    scheduler_test::BasicGraphBuffer<4> graph(3);
+    graph.executable(0, 0);
+    graph.executable(1, 0);
+    graph.executable(2, 0, {0, 1});
+    std::vector<SchedulerTaskMetadata> metadata{
+        physical(LaneMask::aic()), physical(LaneMask::aic()), physical(LaneMask::aiv0(), 64)
+    };
+    ASSERT_TRUE(scheduler_plan_completion_notifications(graph.graph(), metadata, {0}));
+    EXPECT_EQ(metadata[0].flags & SCHEDULER_TASK_DISTRIBUTED_DONE, 0);
+    EXPECT_NE(metadata[1].flags & SCHEDULER_TASK_DISTRIBUTED_DONE, 0);
+    EXPECT_EQ(metadata[2].flags & SCHEDULER_TASK_DISTRIBUTED_DONE, 0);
+    metadata[2].logical_block_num = 1;
+    ASSERT_TRUE(scheduler_plan_completion_notifications(graph.graph(), metadata, {0}));
+    EXPECT_EQ(metadata[1].flags & SCHEDULER_TASK_DISTRIBUTED_DONE, 0);
 }
 
 TEST(HbgHostDependencies, ValidatesEveryLiveFaninWithoutAllocatingProducerCredits) {

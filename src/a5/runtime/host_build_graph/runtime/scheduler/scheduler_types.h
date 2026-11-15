@@ -164,6 +164,7 @@ enum class SchedulerDispatchSlotState : uint8_t {
 
 enum SchedulerTaskMetadataFlags : uint8_t {
     SCHEDULER_TASK_EXECUTABLE = 1U << 0,
+    SCHEDULER_TASK_DISTRIBUTED_DONE = 1U << 1,
     SCHEDULER_TASK_MIX = 1U << 2,
     SCHEDULER_TASK_SPMD = 1U << 3,
     SCHEDULER_TASK_SYNC_START = 1U << 4,
@@ -363,6 +364,13 @@ inline __aicore__ constexpr int64_t scheduler_completion_task_state(uint64_t sta
                                                 static_cast<int64_t>(SchedulerTaskState::BLOCKED);
 }
 
+inline constexpr uint32_t SCHEDULER_COMPLETION_NOTICE_COUNT = 4;
+
+struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerCompletionNotice {
+    volatile uint64_t run_epoch{0};
+};
+static_assert(sizeof(SchedulerCompletionNotice) == SCHEDULER_GM_ATOMIC_SECTOR_BYTES);
+
 struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerTaskControl {
     volatile uint64_t claim_tickets;
 
@@ -376,8 +384,10 @@ struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerTaskControl {
     // or atomic RMW may target its line.
     alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t admission_state;
 
-    // The final block claimer publishes this immutable claim certificate.
+    // The final valid block claimer publishes this immutable supply certificate.
+    // Admission claimers also certify the required member registrations.
     alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t claim_seal;
+    SchedulerCompletionNotice completion_notices[SCHEDULER_COMPLETION_NOTICE_COUNT];
 };
 
 // Each task owns one cache-line record; membership follows its frozen resource role.
@@ -708,7 +718,7 @@ static_assert(offsetof(SchedulerTaskMetadata, logical_block_num) == 14, "block c
 inline constexpr uint64_t SCHEDULER_STATE_BASE_ALIGNMENT = alignof(SchedulerTaskControl);
 static_assert(alignof(SchedulerAdmissionControl) <= SCHEDULER_STATE_BASE_ALIGNMENT);
 
-static_assert(sizeof(SchedulerTaskControl) == 640, "task control layout changed");
+static_assert(sizeof(SchedulerTaskControl) == 1152, "task control layout changed");
 static_assert(alignof(SchedulerTaskControl) == SCHEDULER_GM_ATOMIC_SECTOR_BYTES, "task control alignment changed");
 static_assert(offsetof(SchedulerTaskControl, claim_tickets) == 0, "ticket cursor must use the atomic region");
 static_assert(offsetof(SchedulerTaskControl, next_block) == 128, "block cursor requires an isolated atomic line");
@@ -1224,6 +1234,8 @@ inline bool scheduler_init_spmd_task_records(void *base, const AicoreSchedulerLa
                 meta.logical_block_num * meta.active_mask.count() :
                 1;
         controls[task].completion_state = scheduler_completion_initial_state(contributions);
+        for (auto &notice : controls[task].completion_notices)
+            notice.run_epoch = 0;
         if (!scheduler_task_requires_admission(meta)) continue;
         auto *record = scheduler_state_at<SchedulerAdmissionRecord>(
             base, layout.admission_records_offset + task * layout.admission_record_stride

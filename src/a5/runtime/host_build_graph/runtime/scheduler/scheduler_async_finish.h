@@ -54,6 +54,7 @@ static inline __aicore__ bool scheduler_async_finish_step(
             control->completion_state, gate, scheduler_completion_completed_state(scheduler_completion_total(gate))
         ) != gate)
         return failed();
+    if (!scheduler_publish_completion_notices(base, local, task_ref)) return failed();
     scheduler_protocol_task_done(base, local, task_ref, false, true);
     auto *directory = scheduler_state_at<SchedulerAsyncDirectoryWord>(base, async.layout->finish_directory_offset);
     if (scheduler_async_lease_finish(leases[index], owned).result != SchedulerAsyncLeaseResult::SUCCESS ||

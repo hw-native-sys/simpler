@@ -17,6 +17,7 @@
 
 inline constexpr uint64_t SCHEDULER_PROTOCOL_MAGIC = UINT64_C(0x53504d4454520002);
 // A physical synchronous completion aliases the actual last contribution stamps.
+inline constexpr uint32_t SCHEDULER_PROTOCOL_COMPLETION_FROM_GROUP = UINT32_C(1) << 29;
 inline constexpr uint32_t SCHEDULER_PROTOCOL_COMPLETION_FROM_CONTRIBUTION = UINT32_C(1) << 30;
 inline constexpr uint32_t SCHEDULER_PROTOCOL_DEFERRED_FINISH = UINT32_C(1) << 31;
 

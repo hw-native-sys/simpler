@@ -171,3 +171,5 @@ Newest first.
 - [2026-06 — a5 AICPU filter gate: Scenario B fail-fast guard not added](2026-06-a5-aicpu-filter-gate-scenario-b-validation.md)
 - [2026-06 — Sanitizer rollout scope: macOS, TSAN gating, LSan](2026-06-sanitizer-scope.md)
 - [2026-06 — chip swimlane: defer per-task wmb to rotation](2026-06-chip-swimlane-defer-wmb.md)
+
+- [A5 HBG GM MIX arrival permission and ACK reuse](2026-11-a5-hbg-gm-mix-arrival-permit.md): fewer FAA observations did not improve the twelve-case AICore L0 sum.

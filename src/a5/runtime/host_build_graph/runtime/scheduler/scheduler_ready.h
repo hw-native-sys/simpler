@@ -69,6 +69,7 @@ struct SchedulerGmMixLocalState {
     uint8_t slot_index{UINT8_MAX};
     uint8_t subtask_slot{UINT8_MAX};
     SchedulerGmMixPhase phase{SchedulerGmMixPhase::IDLE};
+    bool completion_submitted{false};
 };
 
 struct SchedulerClusterMixLocalState {
@@ -82,6 +83,7 @@ struct SchedulerClusterMixLocalState {
     uint8_t slot_index{UINT8_MAX};
     uint8_t subtask_slot{UINT8_MAX};
     SchedulerGmMixPhase phase{SchedulerGmMixPhase::IDLE};
+    bool completion_submitted{false};
 };
 static_assert(sizeof(SchedulerClusterMixLocalState) == 48 && alignof(SchedulerClusterMixLocalState) <= 8);
 
@@ -190,6 +192,7 @@ struct SchedulerLocalProfilingState {
 struct SchedulerAsyncLocalState;
 
 inline constexpr uint32_t SCHEDULER_EXECUTION_TOKEN_COUNT = 4;
+inline constexpr uint32_t SCHEDULER_COMPLETION_CACHE_COUNT = 16;
 enum class SchedulerExecutionTokenPhase : uint8_t { EMPTY, TICKETED, ACQUIRING, WAIT_FANIN };
 
 struct SchedulerExecutionToken {
@@ -233,15 +236,16 @@ struct SchedulerLocalState {
     SchedulerClusterMixLocalState cluster_mix{};
     SchedulerClusterMixPending cluster_pending{};
     SchedulerExecutionToken execution_tokens[SCHEDULER_EXECUTION_TOKEN_COUNT]{};
-    uint64_t issue_observed_head{0};
+    uint64_t issue_cursor{0};
     int64_t issue_task_ref{SCHEDULER_TASK_REF_INVALID};
     uint32_t issue_next_fanin{0};
-    uint8_t issue_observe_attempts{0};
     bool issue_fanin_confirmed{false};
     uint32_t execution_check_cursor{0};
     int64_t continuation_task_ref{SCHEDULER_TASK_REF_INVALID};
     int64_t cooperative_fanin_task_ref{SCHEDULER_TASK_REF_INVALID};
     uint32_t cooperative_next_fanin{0};
+    // Private, run-local proofs of terminal completion; zero is an empty tag.
+    uint64_t completed_task_tags[SCHEDULER_COMPLETION_CACHE_COUNT]{};
 
     inline __aicore__ explicit SchedulerLocalState(SchedulerLocalProfilingState *profile = nullptr) :
         profiling(profile) {}
@@ -511,6 +515,56 @@ scheduler_task_metadata_at(__gm__ void *scheduler_state_base, const SchedulerLoc
     );
 }
 
+static inline __aicore__ uint64_t
+scheduler_completion_notice_epoch(__gm__ void *base, const SchedulerLocalState *local) {
+    if (local->config.prepared != nullptr) return local->config.prepared->run_epoch;
+    // A graph containing only control nodes has no prepared execution image.
+    if (local->config.graph_summary_offset == 0) return 0;
+    return scheduler_state_at<SchedulerGraphSummary>(base, local->config.graph_summary_offset)->run_epoch;
+}
+
+// Only the unique canonical transition to C=D=0 publishes this run's notices.
+// The tail fence precedes reporting completion to the run supervisor.
+static inline __aicore__ bool
+scheduler_publish_completion_notices(__gm__ void *base, SchedulerLocalState *local, int64_t task_ref) {
+    if ((scheduler_task_metadata_at(base, local, task_ref)->flags & SCHEDULER_TASK_DISTRIBUTED_DONE) == 0) return true;
+    const uint64_t epoch = scheduler_completion_notice_epoch(base, local);
+    if (epoch == 0) return false;
+    auto *control = scheduler_task_control_at(base, local, task_ref);
+    scheduler_cache_barrier();
+    for (uint32_t group = 0; group < SCHEDULER_COMPLETION_NOTICE_COUNT; ++group)
+        scheduler_gm_store(control->completion_notices[group].run_epoch, epoch);
+    scheduler_cache_barrier();
+    return true;
+}
+
+static inline __aicore__ SchedulerCompletionObservation
+scheduler_observe_completion_notice(__gm__ void *base, SchedulerLocalState *local, int64_t task_ref) {
+    const uint64_t epoch = scheduler_completion_notice_epoch(base, local);
+    if (epoch == 0) return SchedulerCompletionObservation::INVALID;
+    auto &notice = scheduler_task_control_at(base, local, task_ref)
+                       ->completion_notices[local->worker_id() % SCHEDULER_COMPLETION_NOTICE_COUNT]
+                       .run_epoch;
+    if (scheduler_gm_query(notice) != epoch) return SchedulerCompletionObservation::PENDING;
+    return scheduler_gm_fetch_add(notice, UINT64_C(0)) == epoch ? SchedulerCompletionObservation::DONE :
+                                                                  SchedulerCompletionObservation::PENDING;
+}
+
+static inline __aicore__ SchedulerCompletionObservation
+scheduler_observe_cached_completion(__gm__ void *base, SchedulerLocalState *local, int64_t task_ref) {
+    const uint64_t tag = static_cast<uint64_t>(task_ref) + 1;
+    auto &confirmed = local->completed_task_tags[static_cast<uint64_t>(task_ref) % SCHEDULER_COMPLETION_CACHE_COUNT];
+    if (confirmed == tag) return SchedulerCompletionObservation::DONE;
+    const auto observed =
+        (scheduler_task_metadata_at(base, local, task_ref)->flags & SCHEDULER_TASK_DISTRIBUTED_DONE) != 0 ?
+            scheduler_observe_completion_notice(base, local, task_ref) :
+            scheduler_observe_task_completion(scheduler_task_control_at(base, local, task_ref));
+    // DONE is irreversible within this immutable run image, including async debt.
+    // A collision only forgets a proof; pending and invalid observations never grant one.
+    if (observed == SchedulerCompletionObservation::DONE) confirmed = tag;
+    return observed;
+}
+
 inline __aicore__ __gm__ SchedulerWorkerContext *
 scheduler_worker_context_at(__gm__ void *scheduler_state_base, const SchedulerLocalState *context, uint64_t worker_id) {
     return scheduler_state_at<SchedulerWorkerContext>(
@@ -745,8 +799,7 @@ static inline __aicore__ bool scheduler_observe_fanin_prefix(
         }
         const auto &metadata = *scheduler_task_metadata_at(base, local, predecessor);
         if (!scheduler_predecessor_is_host_done(graph, predecessor, metadata)) {
-            const auto observed =
-                scheduler_observe_task_completion(scheduler_task_control_at(base, local, predecessor));
+            const auto observed = scheduler_observe_cached_completion(base, local, predecessor);
             if (observed == SchedulerCompletionObservation::INVALID) {
                 scheduler_record_error(
                     run, predecessor, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local,

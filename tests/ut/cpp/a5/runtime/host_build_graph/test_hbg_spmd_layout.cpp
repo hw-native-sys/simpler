@@ -141,13 +141,15 @@ TEST(HbgSpmdLayout, PreservesCompactMetadataAndAtomicLineBoundaries) {
     EXPECT_EQ(offsetof(SchedulerTaskMetadata, logical_block_num), 14u);
     EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskMetadata::timing_slot), int16_t>));
     EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskMetadata::logical_block_num), uint16_t>));
-    EXPECT_EQ(sizeof(SchedulerTaskControl), 640u);
+    EXPECT_EQ(sizeof(SchedulerTaskControl), 1152u);
     EXPECT_EQ(alignof(SchedulerTaskControl), 128u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, claim_tickets), 0u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, next_block), 128u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, completion_state), 256u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, admission_state), 384u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, claim_seal), 512u);
+    EXPECT_EQ(offsetof(SchedulerTaskControl, completion_notices), 640u);
+    EXPECT_EQ(sizeof(SchedulerCompletionNotice), 128u);
     EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskControl::next_block), volatile uint64_t>));
     EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskControl::completion_state), volatile uint64_t>));
     EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskControl::admission_state), volatile uint64_t>));

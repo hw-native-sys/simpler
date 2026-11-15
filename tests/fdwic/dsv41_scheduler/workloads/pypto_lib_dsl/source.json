@@ -22,7 +22,10 @@
       "last_source_task": "71",
       "task_table_sha256": "ae86255b9f10b97e54f409623d8dcf88b53cd02fcf755851be7e439c56a019e8",
       "edge_table_sha256": "32412e133fea7fb8c6ed561f04e3de7b9325c411990013a0231f94d5d63627be",
-      "incoming_edges": 43
+      "incoming_edges": 43,
+      "variants": [
+        "pypto_lib_dsl"
+      ]
     },
     "layers_19_21": {
       "tasks": 159,
@@ -32,7 +35,10 @@
       "last_source_task": "1520",
       "task_table_sha256": "e31a55d1fd0a12834ec4f980cc0b5ed0f58e6414df454d7dbfc04b993fab5d12",
       "edge_table_sha256": "e880ef810ea2c9deb23317529a84ff88a11fbb4d1c8b8394c8c312204753f856",
-      "incoming_edges": 285
+      "incoming_edges": 285,
+      "variants": [
+        "pypto_lib_dsl"
+      ]
     }
   },
   "boundary": "Incoming values are produced by executing the real original prefix before measuring the case.",

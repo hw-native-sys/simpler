@@ -1816,6 +1816,10 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG: task ordering failed: %s", task_order_error.c_str());
         return false;
     }
+    if (!scheduler_plan_completion_notifications(dependency_graph, task_metadata, inline_completed_task_refs)) {
+        LOG_ERROR("A5 HBG: invalid completion notification dependencies");
+        return false;
+    }
     if (!native_graph &&
         !scheduler_order_ordinary_fanin(
             reinterpret_cast<task_image::Storage *>(static_cast<char *>(uploaded_sm) + device_segments.storage),

@@ -1866,6 +1866,8 @@ TEST(HbgExecutionTokens, ClaimUnreadyBlocksOnceAndExecuteAfterTheDependencyGate)
     EXPECT_FALSE(fixture.prefetch(1, 1));
     EXPECT_EQ(fixture.control(1)->next_block, 0u);
     ASSERT_TRUE(fixture.prefetch(0, 0));
+    EXPECT_EQ(fixture.control(0)->claim_seal, 1u);
+    EXPECT_EQ(fixture.locals[0]->issue_cursor, 1u);
     const std::array<uint32_t, 3> workers{1, 2, 4};
     for (auto worker : workers) {
         auto *local = fixture.locals[worker];
@@ -1874,6 +1876,8 @@ TEST(HbgExecutionTokens, ClaimUnreadyBlocksOnceAndExecuteAfterTheDependencyGate)
             scheduler_refill_execution_tokens(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &progress)
         );
         ASSERT_TRUE(progress);
+        EXPECT_EQ(fixture.control(1)->claim_seal, worker == workers.back() ? 3u : 0u);
+        EXPECT_EQ(local->issue_cursor, worker == workers.back() ? 1u : 0u);
         EXPECT_EQ(scheduler_execution_token_count(local), 1u);
         uint32_t direct = UINT32_MAX;
         ASSERT_TRUE(scheduler_progress_execution_tokens(

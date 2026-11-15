@@ -29,14 +29,14 @@ TEST(HbgAdmissionProgress, ExistingReadyWindowRunsBeforeTheFirstCohortClaim) {
         for (uint32_t task = 0; task < cohort; ++task) {
             auto *local = fixture.locals[0];
             for (uint32_t slice = 0; slice <= cohort && !scheduler_execution_token_has_task(local, task); ++slice) {
-                const uint64_t head = local->issue_observed_head;
+                const uint64_t head = local->issue_cursor;
                 const uint32_t count = scheduler_execution_token_count(local);
                 bool progress = false;
                 ASSERT_TRUE(scheduler_refill_execution_tokens(
                     fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &progress
                 ));
                 ASSERT_TRUE(progress);
-                ASSERT_TRUE(local->issue_observed_head > head || scheduler_execution_token_count(local) > count);
+                ASSERT_TRUE(local->issue_cursor > head || scheduler_execution_token_count(local) > count);
             }
             ASSERT_TRUE(scheduler_execution_token_has_task(local, task));
             EXPECT_EQ(fixture.control(task)->next_block, 1u);

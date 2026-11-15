@@ -130,6 +130,10 @@ struct AsyncFixture {
             ),
             PreparedAccessResult::READY
         );
+        ASSERT_TRUE(scheduler_close_ordinary_supply(
+            graph.graph(), base(), state, storage.run_control, slot.task_ref, slot.block_idx,
+            storage.metadata[slot.task_ref].logical_block_num
+        ));
     }
     bool next_execution(uint32_t *slot) {
         if (!storage.prepare_calls(graph.graph())) return false;
@@ -312,6 +316,7 @@ TEST(HbgAsyncControl, ReturnedExecutionReleasesSlotButCannotReleaseConsumerBefor
     AsyncFixture f;
     f.graph.executable(1, 0, {0});
     ASSERT_TRUE(f.storage.prepare_calls(f.graph.graph()));
+    f.storage.metadata[0].flags |= SCHEDULER_TASK_DISTRIBUTED_DONE;
     const auto writer = f.start();
     f.register_counter(writer);
     ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
@@ -332,6 +337,8 @@ TEST(HbgAsyncControl, ReturnedExecutionReleasesSlotButCannotReleaseConsumerBefor
     EXPECT_FALSE(f.check(1));
     EXPECT_FALSE(f.finish(2));
     EXPECT_EQ(f.local()->pending_completed, 0u);
+    for (const auto &notice : f.task_control(0)->completion_notices)
+        EXPECT_EQ(notice.run_epoch, 0u);
     uint32_t blocked_slot = UINT32_MAX;
     ASSERT_TRUE(f.next_execution(&blocked_slot));
     EXPECT_EQ(blocked_slot, UINT32_MAX);
@@ -348,6 +355,8 @@ TEST(HbgAsyncControl, ReturnedExecutionReleasesSlotButCannotReleaseConsumerBefor
         scheduler_completion_task_state(f.task_control(0)->completion_state),
         static_cast<int64_t>(SchedulerTaskState::DONE)
     );
+    for (const auto &notice : f.task_control(0)->completion_notices)
+        EXPECT_EQ(notice.run_epoch, f.local()->config.prepared->run_epoch);
     int64_t ready = -1;
     EXPECT_TRUE(f.select_execution(&ready));
     EXPECT_EQ(ready, 1);
@@ -828,6 +837,7 @@ TEST(HbgAsyncControl, TwoWaitersReleaseDispatchSlotsWhileTheirProducersRetainBlo
     for (uint32_t producer = 2; producer < 4; ++producer) {
         f.graph.executable(producer, 0, {static_cast<int32_t>(producer - 2)});
         f.task_control(producer - 2)->next_block = 1;
+        f.task_control(producer - 2)->claim_seal = 1;
     }
     for (uint32_t waiter = 4; waiter < 6; ++waiter) {
         int64_t task = -1;

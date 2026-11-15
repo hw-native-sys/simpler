@@ -544,7 +544,7 @@ def test_publisher_after_stamp_need_not_precede_remote_observation():
 def resequence(raw):
     streams = {worker["index"]: [] for worker in raw["workers"]}
     for record, kind, _ in _event_records(raw):
-        if kind == "actor" and record["flags"] & (1 << 30):
+        if kind == "actor" and record["flags"] & ((1 << 29) | (1 << 30)):
             continue
         for field in STAMPS[kind].split():
             if record[field][1]:
@@ -556,7 +556,14 @@ def resequence(raw):
         raw["workers"][worker]["next_sequence"] = len(stamps)
     for event in raw["task_events"]:
         done = event["completion"]
-        if done is not None and done["flags"] & (1 << 30):
+        if done is not None and done["flags"] & (1 << 29):
+            last = max(
+                (row["owner"] for row in raw["blocks"] if row["owner"]["task_ref"] == event["index"]),
+                key=lambda row: row["completion_ticket"],
+            )
+            done["before"] = last["completion_before"].copy()
+            done["after"] = last["completion_after"].copy()
+        elif done is not None and done["flags"] & (1 << 30):
             last = max(
                 (row for row in raw["executions"] if row["task_ref"] == event["index"]),
                 key=lambda row: row["contribution_ticket"],
@@ -871,7 +878,7 @@ def test_compact_admission_and_seals_accept_64_only_alignment_and_reject_bad_reg
         audit_native_protocol(raw, identities)
 
 
-@pytest.mark.parametrize("flag", (2, 128))
+@pytest.mark.parametrize("flag", (128,))
 def test_current_cooperative_capture_rejects_independent_flag(flag):
     raw, identities = ProtocolBuilder([(1, 2, ())]).run()
     _set_claim_seal_observation(raw, identities)
@@ -881,6 +888,15 @@ def test_current_cooperative_capture_rejects_independent_flag(flag):
     raw["task_events"][0]["completion"]["flags"] |= flag
     with pytest.raises(ValueError, match="unknown task flags"):
         audit_native_protocol(raw, identities)
+
+
+def test_distributed_done_policy_preserves_canonical_completion_evidence():
+    raw, identities = ProtocolBuilder([(1, 2, ())]).run()
+    _set_claim_seal_observation(raw, identities)
+    raw.update(schema="hbg-native-protocol", close_seal_stride=64)
+    raw["tasks"][0]["flags"] |= 2
+    raw["task_events"][0]["completion"]["flags"] |= 2
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
 
 
 def _subtask_capture(shapes=((3, 2, ()), (2, 1, (0,))), *, deferred=()):
@@ -897,16 +913,23 @@ def _subtask_capture(shapes=((3, 2, ()), (2, 1, (0,))), *, deferred=()):
 @pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
 @pytest.mark.parametrize("blocks", (1, 2, 5))
 @pytest.mark.parametrize("deferred", ((), (0,)))
-def test_current_counts_actual_subtasks_and_accepts_last_lane_done_before_mix_retirement(mask, blocks, deferred):
+def test_current_counts_actual_subtasks_and_aliases_mix_group_contribution(mask, blocks, deferred):
     raw, identities = _subtask_capture(((mask, blocks, ()), (2, 1, (0,))), deferred=deferred)
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
     assert raw["task_controls"][0]["completed_subtasks"] == blocks * mask.bit_count()
     if mask.bit_count() > 1:
-        last = max((e for e in raw["executions"] if e["task_ref"] == 0), key=lambda e: e["contribution_ticket"])
+        last = max(
+            (b["owner"] for b in raw["blocks"] if b["owner"]["task_ref"] == 0),
+            key=lambda owner: owner["completion_ticket"],
+        )
         done = raw["task_events"][0]["completion"]
         if not deferred:
             assert done["worker_index"] == last["worker_index"]
-        assert done["after"][0] < raw["blocks"][-1]["owner"]["completion_before"][0]
+            assert done["flags"] & (1 << 29)
+            assert done["before"] == last["completion_before"]
+            assert done["after"] == last["completion_after"]
+        else:
+            assert done["before"][0] > last["completion_after"][0]
 
 
 @pytest.mark.parametrize(
@@ -924,7 +947,7 @@ def test_current_counts_actual_subtasks_and_accepts_last_lane_done_before_mix_re
     ),
 )
 def test_current_rejects_broken_subtask_completion_proof(mutation):
-    raw, identities = _subtask_capture()
+    raw, identities = _subtask_capture(((1, 2, ()), (2, 1, (0,))))
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
     executions = [e for e in raw["executions"] if e["task_ref"] == 0]
     last = max(executions, key=lambda e: e["contribution_ticket"])
@@ -936,13 +959,13 @@ def test_current_rejects_broken_subtask_completion_proof(mutation):
     elif mutation == "foreign_contributor":
         last["contribution_worker"] = 0
     elif mutation == "block_count":
-        raw["task_controls"][0]["completed_subtasks"] = 2
+        raw["task_controls"][0]["completed_subtasks"] = 1
     elif mutation == "wrong_done_owner":
         done["worker_index"] = 0
     elif mutation == "done_before_last":
         last["contribution_after"], done["before"] = done["before"], last["contribution_after"]
     elif mutation == "retirement_ticket":
-        raw["blocks"][0]["owner"]["completion_ticket"] = 0
+        last["contribution_ticket"] = (1 << 64) - 1
     elif mutation == "missing_stamp":
         del last["contribution_before"]
     else:
@@ -1060,4 +1083,23 @@ def test_current_protocol_rejects_removed_refill_publication_field():
     raw, identities = ProtocolBuilder([(1, 1, ())]).run()
     raw["executions"][0]["publication_mode"] = 0
     with pytest.raises(ValueError, match="unknown fields"):
+        audit_native_protocol(raw, identities)
+
+
+@pytest.mark.parametrize("fault", ("duplicate_ticket", "wrong_owner", "lane_contribution", "before_release"))
+def test_mix_group_completion_preserves_unique_credit_and_physical_retirement(fault):
+    raw, identities = ProtocolBuilder([(6, 2, ()), (2, 1, (0,))]).run()
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+    first, last = [b["owner"] for b in raw["blocks"]]
+    done = raw["task_events"][0]["completion"]
+    if fault == "duplicate_ticket":
+        last["completion_ticket"] = first["completion_ticket"]
+    elif fault == "wrong_owner":
+        done["worker_index"] += 1
+    elif fault == "lane_contribution":
+        raw["executions"][0]["contribution_worker"] = 1
+    else:
+        last["completion_before"], last["releases_observed"] = (last["releases_observed"], last["completion_before"])
+        done["before"] = last["completion_before"].copy()
+    with pytest.raises(ValueError):
         audit_native_protocol(raw, identities)

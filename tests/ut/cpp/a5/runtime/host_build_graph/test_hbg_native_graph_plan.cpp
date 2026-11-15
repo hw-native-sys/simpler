@@ -811,7 +811,7 @@ TEST(HbgNativeGraphPlan, NativeCatalogOrderAllocatesEachSingleBlockOnce) {
         EXPECT_EQ(catalog.refs[expected - 1], expected);
         for (uint32_t slice = 0; slice <= catalog.count && !scheduler_execution_token_has_task(&consumer, expected);
              ++slice) {
-            const uint64_t head = consumer.issue_observed_head;
+            const uint64_t head = consumer.issue_cursor;
             const uint32_t count = scheduler_execution_token_count(&consumer);
             const int64_t task = consumer.issue_task_ref;
             const uint32_t fanin = consumer.issue_next_fanin;
@@ -821,7 +821,7 @@ TEST(HbgNativeGraphPlan, NativeCatalogOrderAllocatesEachSingleBlockOnce) {
             );
             ASSERT_TRUE(progress);
             ASSERT_TRUE(
-                consumer.issue_observed_head > head || scheduler_execution_token_count(&consumer) > count ||
+                consumer.issue_cursor > head || scheduler_execution_token_count(&consumer) > count ||
                 consumer.issue_task_ref != task || consumer.issue_next_fanin > fanin
             );
         }
@@ -833,7 +833,7 @@ TEST(HbgNativeGraphPlan, NativeCatalogOrderAllocatesEachSingleBlockOnce) {
     bool progress = false;
     ASSERT_TRUE(scheduler_refill_execution_tokens(view.graph, view.backing.get(), &competing, run, 0, &progress));
     EXPECT_TRUE(progress);
-    EXPECT_EQ(catalog.issue->next_task, catalog.count);
+    EXPECT_EQ(consumer.issue_cursor, catalog.count);
     ASSERT_TRUE(scheduler_refill_execution_tokens(view.graph, view.backing.get(), &competing, run, 0, &progress));
     EXPECT_FALSE(progress);
     EXPECT_EQ(scheduler_execution_token_count(&competing), 0u);
@@ -942,6 +942,11 @@ struct ControlFixture : NativeViewFixture {
             config.task_controls_offset = layout.task_controls_offset;
             config.task_metadata_offset = static_cast<uint32_t>(layout.task_metadata_offset);
             config.task_catalog_offset = catalog_plan.header_offset;
+            config.graph_summary_offset = layout.graph_summary_offset;
+            config.prepared =
+                layout.prepared_layout_offset == 0 ?
+                    nullptr :
+                    scheduler_state_at<SchedulerPreparedLayout>(backing.get(), layout.prepared_layout_offset);
             config.runtime_worker_count = 3;
             config.cluster_count = 1;
             config.self_lane = static_cast<uint8_t>(worker);
@@ -971,6 +976,9 @@ TEST(HbgNativeGraphPlan, HostInitializedDummyChainProgressesWithFullKernelSlots)
         rows[i].push_back(i - 1);
     DefinitionFixture body(rows, true);
     ControlFixture view(body);
+    auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(view.backing.get(), view.layout.task_metadata_offset);
+    for (uint64_t ref = 0; ref < view.graph.task_count; ++ref)
+        metadata[ref].flags |= SCHEDULER_TASK_DISTRIBUTED_DONE;
     const auto *initial_controls =
         scheduler_state_at<SchedulerTaskControl>(view.backing.get(), view.layout.task_controls_offset);
     for (const auto &instance : view.plan.instances) {
@@ -997,6 +1005,8 @@ TEST(HbgNativeGraphPlan, HostInitializedDummyChainProgressesWithFullKernelSlots)
             scheduler_completion_task_state(scheduler_gm_query(controls[i].completion_state)),
             static_cast<int64_t>(SchedulerTaskState::DONE)
         );
+        for (const auto &notice : controls[i].completion_notices)
+            EXPECT_EQ(notice.run_epoch, view.header().run_epoch);
     }
 }
 
