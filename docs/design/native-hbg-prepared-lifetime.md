@@ -16,7 +16,8 @@ A completed execution is not authorization to destroy a model's backing.
 | Callable code and registration | Simpler retains the actual callable lease; referenced code cannot be unregistered. Unrelated callables remain independent. |
 | Runtime/graph image and publication description | Preparation retains the actual image backing and immutable publication description. |
 | Pinned launch/copy sources and argument packets | Submission storage holds the bytes read by recorded copies and launches. |
-| Arena, shared memory, heap and scheduler storage | Preparation retains each backing version and workspace lease until its last use ends. |
+| Arena, shared memory and scheduler storage | Preparation retains each backing version and workspace lease until its last use ends. |
+| HBG GM heap | Preparation retains a fixed heap lease through its last use, including external model uses. |
 | Internal streams, fences and caller-order events | Actual stream generation and event storage survive their recording/execution/wait references. |
 | Program input staging | Retained as real backing for ordinary Program resource retention; this does not enable Program capture. |
 
@@ -30,6 +31,15 @@ Equal-capacity writes can require new storage. Image, scheduler, arena, temporar
 and submission storage detach from retained predecessors before reuse. Retired
 owners keep their raw addresses and failed-release records reachable; workspace
 accounting cannot recycle an address still held by a prepared owner.
+
+HBG heap leases protect allocation lifetime, not historical scratch contents.
+Same-context ordered preparations share one fixed-capacity allocation even while
+models remain retained. Capacity and base remain fixed from the first successful
+prepare allocation until context teardown. Oversized graphs fail before device
+submission. Neither normal retirement nor workspace pressure trims the heap.
+Failed external release preserves the preparation and its heap lease for retry.
+Heap sharing does not apply to
+caller-owned persistent tensors, immutable images or retained diagnostic evidence.
 
 ## Retaining a preparation
 

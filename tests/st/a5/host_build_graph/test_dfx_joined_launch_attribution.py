@@ -404,20 +404,21 @@ class _ChildTrace:
         except OSError:
             return 0
 
+    def _iter_spans(self):
+        """Whole-line spans in the opened window, streamed without retaining log history."""
+        for pid, path in self._paths.items():
+            with contextlib.suppress(OSError), path.open("rb") as handle:
+                handle.seek(self._offsets[pid])
+                for line in handle:
+                    if not line.endswith(b"\n"):
+                        break
+                    for span in parse_spans([line.decode("utf-8", errors="replace")]):
+                        if span.pid == pid:
+                            yield span
+
     def spans(self) -> list:
         """Every whole-line span this worker's own children appended since the window opened."""
-        collected = []
-        for pid, path in self._paths.items():
-            blob = b""
-            with contextlib.suppress(OSError):
-                blob = path.read_bytes()
-            window = blob[self._offsets[pid] :]
-            consumed = window.rfind(b"\n") + 1
-            if consumed <= 0:
-                continue
-            lines = window[:consumed].decode("utf-8", errors="replace").splitlines()
-            collected.extend(span for span in parse_spans(lines) if span.pid == pid)
-        return collected
+        return list(self._iter_spans())
 
     def window_text(self, *, budget: int = 16384) -> str:
         """The bytes each child appended since this window opened, for a failure to carry.
@@ -468,7 +469,28 @@ class _ChildTrace:
     def safe_window_text(self) -> str:
         """`window_text` that never raises, so it cannot replace the failure it is reporting."""
         try:
-            return self.window_text()
+            initial = {}
+            lines = []
+            names = {
+                "chip.run",
+                "chip.run.bind",
+                "chip.run.prepare_execution",
+                "chip.run.runner_run",
+                "chip.run.runner_run.device_wall",
+                "chip.run.runner_run.device_boundaries",
+                "chip.run.joined_launch",
+            }
+            for span in self._iter_spans():
+                if span.inv <= 0:
+                    continue
+                invocations = initial.setdefault(span.pid, [])
+                if span.inv not in invocations and len(invocations) < 2:
+                    invocations.append(span.inv)
+                if span.inv in invocations and span.name in names:
+                    lines.append(
+                        f"pid={span.pid} inv={span.inv} name={span.name} ts={span.ts} dur={span.dur} {span.attrs}"
+                    )
+            return "--- initial invocation timing ---\n" + "\n".join(lines) + "\n" + self.window_text()
         except BaseException as error:  # noqa: BLE001 -- reported in place of the window it could not read
             return f"--- the child log window could not be read: {error!r} ---"
 
@@ -666,6 +688,7 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
         what = "six continuously refilled diagnostic runs"
         root.mkdir(parents=True, exist_ok=True)
         prepared = []
+        tensors = []
         handles = []
         try:
             # Allocation and tensor initialization must not consume the overlap window between
@@ -696,6 +719,10 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
                 self._drain(handles)
             raise
         finally:
+            # Tracebacks retain loop locals; empty the view lists themselves.
+            for entry in prepared:
+                entry[1].clear()
+            tensors.clear()
             prepared.clear()
 
         # This is the first flush in the sequence. It observes background publication rather

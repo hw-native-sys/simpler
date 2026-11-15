@@ -11,6 +11,7 @@
 #pragma once
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <filesystem>
 #include <future>
@@ -23,6 +24,7 @@
 #include "device_runner_base.h"
 #include "native_run_context.h"
 #include "runtime_c_api.h"
+#include "pipeline_contract.h"
 #include "task_args.h"
 #include "transport.h"
 #include "utils/retained_temp_bump.h"
@@ -38,6 +40,10 @@ uint32_t arena_bank(uint32_t slot);
 using native_admission_transport::control;
 using Fact = WorkspaceManager::RunFact;
 constexpr size_t kUnit = 1024;
+inline uint64_t test_heap_capacity() {
+    const auto *heap = find_pipeline_resource(*get_pipeline_contract(), PTO_PIPELINE_GM_HEAP);
+    return heap->resource_class == PTO_PIPELINE_POOLED_SCRATCH ? 4096 : 1024;
+}
 inline int callbacks = 0;
 inline bool refuse_after_callback = false;
 inline std::function<void()> callback_hook;
@@ -62,13 +68,18 @@ public:
         callables_[1] = std::move(callable);
         chip_callable_buffers_[1] = ChipCallableBuffer{};
     }
+    size_t scheduler_capacity(uint32_t slot) const {
+        return scheduler_state_storage_[slot] ? scheduler_state_storage_[slot]->device_capacity() : 0;
+    }
     int prepare_result(uint32_t slot = 0, uint64_t epoch = 1) {
         KernelArgsHelper args;
-        submission_storage_[slot]->retain_replay_evidence = true;
         // This low-level evidence fixture explicitly requests the native record.
         DfxRunConfig dfx;
         dfx.scope_stats_enabled = true;
-        return ensure_device_run_result_region(NativeRunIdentity{epoch, epoch, epoch, slot}, args, dfx);
+        last_result_epoch_[slot] = epoch;
+        const int rc = ensure_device_run_result_region(NativeRunIdentity{epoch, epoch, epoch, slot}, args, dfx);
+        if (rc == 0) set_result_retain_evidence(epoch, slot);
+        return rc;
     }
     int warm_capture_result_caches() {
         // Fake context initialization omits real Kernel init's optional warm-up.
@@ -85,7 +96,21 @@ public:
         return 0;
     }
     PreparedSubmissionStorage &result_storage(uint32_t slot = 0) { return *submission_storage_[slot]; }
-    int close_result(uint32_t slot = 0) { return release_submission_storage(*submission_storage_[slot], false); }
+    using ResultRegionSnapshot = DeviceRunnerBase::ResultRegionSnapshot;
+    ResultRegionSnapshot result_region(uint32_t slot = 0) const {
+        return result_region_snapshot(last_result_epoch_[slot], slot);
+    }
+    ResultRegionSnapshot result_region(uint32_t slot, uint64_t epoch) const {
+        return result_region_snapshot(epoch, slot);
+    }
+    void *idle_result_ptr() const { return DeviceRunnerBase::idle_result_device_ptr(); }
+    bool idle_result_initialized() const { return DeviceRunnerBase::idle_result_initialized(); }
+    void *pending_failed_result_ptr() const { return DeviceRunnerBase::pending_failed_result_device_ptr(); }
+    const ResultRegionSnapshot &last_observed_result_region() const {
+        return DeviceRunnerBase::last_observed_result_region();
+    }
+    void note_result_epoch(uint32_t slot, uint64_t epoch) { last_result_epoch_[slot] = epoch; }
+    int close_result(uint32_t slot = 0) { return release_device_run_result(slot, last_result_epoch_[slot], true); }
     void use_other_entry() { callables_[1].host_orch_func_ptr = alternate_entry_points(); }
     void allocate_callable() {
         void *allocation = mem_alloc_.alloc(64);
@@ -177,12 +202,26 @@ public:
     }
     int finalize_impl() override { return finalize_common(); }
     AutoAdmissionState::SlotPlan plan(uint32_t slot) const { return auto_admission_.plan(slot); }
+    RunResourceCost admission_proven_cost(uint32_t slot) const { return auto_admission_.proven_cost(slot); }
     size_t charged() const { return workspace_.reserved_bytes(); }
+    bool set_workspace_limit(uint64_t limit) { return workspace_.set_limit(limit); }
+    size_t bank_region_size(uint32_t bank, size_t region) const {
+        const auto &b = *arena_banks_[bank];
+        switch (region) {
+        case 0:
+            return b.gm_heap->arena.total_size();
+        case 1:
+            return b.gm_sm->arena.total_size();
+        default:
+            return b.runtime_pool->arena.total_size();
+        }
+    }
     bool holds_epoch(uint64_t epoch) const { return workspace_.holds_references(epoch); }
     bool arena_referenced(uint32_t bank, size_t region) const {
         void *backing = arena_region_backing(bank, region);
         return backing != nullptr && workspace_.block_state(backing) == WorkspaceManager::BlockState::Referenced;
     }
+    void *pooled_heap(uint32_t /*pipeline_slot*/) { return pooled_heap_base(); }
     const simpler::dfx::HostPhaseRecordStore &phases(uint32_t slot) const { return host_phase_runs_[slot].records; }
     size_t reservations() const {
         size_t n = 0;
@@ -197,6 +236,9 @@ public:
             note_workspace_run_fact(NativeRunIdentity{epoch, epoch, epoch, slot}, fact);
     }
     void stop_serving() { workspace_.enter_closed(); }
+
+private:
+    std::array<uint64_t, 16> last_result_epoch_{};
 };
 
 struct Attempt {
@@ -213,7 +255,7 @@ struct Attempt {
         config.aicpu_thread_num = 2;
         for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
             config.runtime_env.ring_task_window[i] = 4;
-            config.runtime_env.ring_heap[i] = 1024;
+            config.runtime_env.ring_heap[i] = test_heap_capacity();
             config.runtime_env.ring_dep_pool[i] = 4;
         }
         ChipTensor tensor;
@@ -227,7 +269,10 @@ struct Attempt {
         if (magic) EXPECT_EQ(simpler_finalize_run(&runner, storage), 0);
         ::operator delete(storage, std::align_val_t(get_runtime_alignment()));
     }
-    int prepare() { return simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor); }
+    int prepare() {
+        runner.note_result_epoch(descriptor.pipeline_slot, descriptor.run_epoch);
+        return simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor);
+    }
     bool consume_release() { return consume_released_preparation(storage, get_runtime_size(), descriptor.run_epoch); }
     bool empty() const {
         uint64_t magic;

@@ -101,7 +101,7 @@ that its runs reuse. This is always on for TRB — an internal allocation
 optimization, not user-facing configuration.
 
 The buffer is owned per pipeline slot, not per runner: TRB's task args are
-`HOST_PER_RUN`, so two runs holding different slot leases stage through
+`DELIVERED`, so two runs holding different slot leases stage through
 different buffers even though they share arena bank 0 for device scratch.
 
 The platform side is deliberately thin: `DeviceRunnerBase` only remembers a

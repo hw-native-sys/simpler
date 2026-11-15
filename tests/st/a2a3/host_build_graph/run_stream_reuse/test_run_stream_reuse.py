@@ -392,10 +392,9 @@ class TestRunStreamReuseHbg(SceneTestCase):
                     )
                 expected_increment = 1 if st_platform == "a2a3" else 0
                 assert st_worker.run_stream_set_create_count == stream_sets + expected_increment
-            bank0 = chip_worker.arena_bank_gm_heap_base(0)
-            bank1 = chip_worker.arena_bank_gm_heap_base(1)
-            assert bank0 != 0 and bank1 != 0, f"a served bank is uncommitted: {bank0:#x}, {bank1:#x}"
-            assert bank0 != bank1, f"both arena banks resolve to one GM heap: {bank0:#x}"
+            # host_build_graph serves every bank's graph heap from the Worker's
+            # shared ScratchPool, so the per-slot runtime and staging addresses
+            # above are the ownership evidence; a per-bank heap base is not.
             # Both same-slot successors are admitted before any strong observation.
             while records:
                 record = records[-1]

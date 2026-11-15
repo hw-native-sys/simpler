@@ -45,6 +45,7 @@ def build_probe(
     build: Path,
     *,
     retained_models: bool = False,
+    shared_heap: bool = False,
     args_dump: bool = False,
     runtime_name: str = "host_build_graph",
     platform: str = "a2a3",
@@ -52,7 +53,7 @@ def build_probe(
     build.mkdir(parents=True, exist_ok=True)
     compiler = KernelCompiler(platform)
     kernel = compiler.compile_incore(
-        str(_NATIVE / ("hbg_inout_step.cpp" if retained_models else "hbg_step.cpp")),
+        str(_NATIVE / ("hbg_inout_step.cpp" if retained_models and not shared_heap else "hbg_step.cpp")),
         core_type="aiv",
         pto_isa_root=ensure_pto_isa_root(),
         extra_include_dirs=compiler.get_orchestration_include_dirs(runtime_name),
@@ -64,7 +65,7 @@ def build_probe(
         build_dir=str(build),
     )
     child = CoreCallable.build(
-        signature=[D.INOUT, D.SCALAR] if retained_models else [D.IN, D.OUT, D.SCALAR],
+        signature=[D.INOUT, D.SCALAR] if retained_models and not shared_heap else [D.IN, D.OUT, D.SCALAR],
         binary=extract_text_section(kernel),
     )
     chip = ChipCallable.build(
@@ -72,6 +73,8 @@ def build_probe(
         func_name=(
             "args_dump_capture_orchestration"
             if args_dump
+            else "hbg_shared_heap_orchestration"
+            if shared_heap
             else "hbg_inout_orchestration"
             if retained_models
             else "hbg_capture_orchestration"
@@ -158,6 +161,31 @@ def test_hbg_retained_models_keep_persistent_inout(tmp_path, request):
     for stage in ("a-retains-callable", "a-retains-context", "b-retains-callable", "b-retains-context"):
         assert f"stage={stage} rc=0" in result.stdout
     assert "stage=same-carrier-and-slot rc=0" in result.stdout
+
+
+@pytest.mark.platforms(["a2a3", "a5"])
+def test_hbg_retained_models_replay_fixed_heap_after_oversize_refusal(tmp_path, request):
+    binaries = build_probe(
+        tmp_path, retained_models=True, shared_heap=True, platform=request.config.getoption("--platform")
+    )
+    device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    logs = tmp_path / "ascend-shared-heap"
+    logs.mkdir()
+    result = subprocess.run(
+        [binaries[0], device, *binaries[1:], "heap"],
+        env=dict(os.environ, ASCEND_PROCESS_LOG_PATH=str(logs)),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    (tmp_path / "shared-heap.log").write_text(result.stdout + result.stderr)
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}\nDevice logs: {logs}"
+    assert "hbg_retained_models PASS models=2 references=2 replays=6 eager=1 elements=16" in result.stdout
+    for stage in ("a-recorded", "b-prepared", "b-recorded", "b1", "a1", "b2", "a2", "b3", "eager", "b-after-a-release"):
+        assert f"state={stage} verified=48" in result.stdout
+    assert "state=heap-capacity-refused verified=48" in result.stdout
+    assert result.stdout.index("state=eager verified=48") < result.stdout.index("state=b-after-a-release verified=48")
 
 
 def _run_capture_probe(command, run, env, *, timeout=180):
@@ -351,9 +379,8 @@ def test_hbg_retained_models_publish_swimlane_observations(tmp_path, request, re
     assert result.returncode == 0, result.stdout + result.stderr
     assert "stage=swimlane-flush rc=0" in result.stdout
     if replay:
-        assert result.stdout.index("state=eager verified=48") < result.stdout.index(
-            "state=b-after-a-release verified=48"
-        )
+        assert "state=heap-capacity-refused verified=48" in result.stdout
+    assert result.stdout.index("state=eager verified=48") < result.stdout.index("state=b-after-a-release verified=48")
     ordinary = json.loads((output / "eager/chip_swimlane_records.json").read_text())
     assert ordinary["aicore_tasks"] and not ordinary["metadata"].get("collection", {}).get("recorded_window")
     assert not (output / "unused").exists()
