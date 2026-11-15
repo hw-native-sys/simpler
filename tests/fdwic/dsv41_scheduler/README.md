@@ -243,8 +243,10 @@ decimal places, and the following fixed columns (see [RESULTS.md](RESULTS.md)):
 Use the exact six-column header shown in [RESULTS.md](RESULTS.md).
 
 The HBG column contains the selected HBG revision; always state its exact
-commit beside the table, independently of the fixed column label. The current
-published HBG values use `534c5656a`, and percounter uses `21d2e9a103d5`.
+commit beside the table, independently of the fixed column label. Both measured
+columns use L0 AICore wall, from the first actual kernel begin to the last kernel
+end. Keep the selected revisions, sampling counts and device-side start
+synchronization boundary in [RESULTS.md](RESULTS.md).
 Do not add a duplicate candidate column. When preserving an existing group while
 adding another, state which measurements were reused and which were refreshed. The percentage is `(min(HBG, percounter) / bound - 1) * 100`,
 computed before rounding and displayed with two decimal places. Missing

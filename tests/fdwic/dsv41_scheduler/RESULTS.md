@@ -1,41 +1,66 @@
-# DSV4.1 16 组 L0 性能与同步约束下界
+# DSV4.1 16 组 L0 AICore 性能与同步约束下界
 
-**单位：ms，平均值。** 保留初版 PyPTO-lib 3 组、DSL 半同步 3 组、DSL 全同步≤64 3 组、新版 PyPTO-lib 7 组。新版 MoE 已改为原始 Host 编排并重测，其余15行数值原样保留。
+**单位：ms，平均值。** 16 组 HBG/percounter 实测值全部刷新为 **L0 AICore wall**，
+即每卡第一个实际 kernel begin 到最后一个实际 kernel end；包含中间的调度、等待和通信空洞。
+两列采用下述固定运行库版本。保留初版 PyPTO-lib 3 组、DSL 半同步 3 组、
+DSL 全同步≤64 3 组、新版 PyPTO-lib 7 组；8 个非通信配置的下界沿用原值。
 
 | Case | 实现 | main HBG | main percounter | 同步约束下界 | 最优实测距下界 |
 | ---- | ---- | -------: | --------------: | -----------: | -------------: |
-| swa | 新版 PyPTO-lib | 0.517646 | 0.345087 | 0.134880 | 155.85% |
-| c2a_full | 初版 PyPTO-lib | 1.542043 | 1.196598 | 0.843450 | 41.87% |
-| c2a_full | DSL 半同步 | 1.823954 | 1.771803 | 1.341990 | 32.03% |
-| c2a_full | DSL 全同步≤64 | 1.723550 | 2.210183 | 1.354400 | 27.26% |
-| c2a_full | 新版 PyPTO-lib | 0.696364 | 0.415687 | 0.198030 | 109.91% |
-| c1a_reindex | 新版 PyPTO-lib | 0.666053 | 0.406814 | 0.189260 | 114.95% |
-| c1a_reuse | 新版 PyPTO-lib | 0.510652 | 0.345089 | 0.149950 | 130.14% |
-| moe | 初版 PyPTO-lib | 7.635917 | 3.207300 | — | — |
-| moe | DSL 半同步 | 2.189010 | 1.999205 | — | — |
-| moe | DSL 全同步≤64 | 1.680310 | 2.007643 | — | — |
-| moe | 新版 PyPTO-lib | 3.134032 | 1.754210 | — | — |
-| engram | 新版 PyPTO-lib | 1.142827 | 1.032040 | 0.732110† | 40.97%† |
-| layers_19_21 | 初版 PyPTO-lib | 116.065531 | 15.601330 | — | — |
-| layers_19_21 | DSL 半同步 | 17.297568 | 10.843851 | — | — |
-| layers_19_21 | DSL 全同步≤64 | 10.592131 | 12.271256 | — | — |
-| layers_19_21 | 新版 PyPTO-lib | 13.902196 | 4.603234 | — | — |
+| swa | 新版 PyPTO-lib | 0.321653 | 0.235504 | 0.134880 | 74.60% |
+| c2a_full | 初版 PyPTO-lib | 1.187823 | 1.089796 | 0.843450 | 29.21% |
+| c2a_full | DSL 半同步 | 1.570328 | 1.717217 | 1.341990 | 17.01% |
+| c2a_full | DSL 全同步≤64 | 1.602462 | 2.148534 | 1.354400 | 18.32% |
+| c2a_full | 新版 PyPTO-lib | 0.408528 | 0.303815 | 0.198030 | 53.42% |
+| c1a_reindex | 新版 PyPTO-lib | 0.401922 | 0.293938 | 0.189260 | 55.31% |
+| c1a_reuse | 新版 PyPTO-lib | 0.306594 | 0.234839 | 0.149950 | 56.61% |
+| moe | 初版 PyPTO-lib | 3.442943 | 2.977887 | — | — |
+| moe | DSL 半同步 | 1.523743 | 1.846731 | — | — |
+| moe | DSL 全同步≤64 | 1.559213 | 1.896224 | — | — |
+| moe | 新版 PyPTO-lib | 0.834525 | 0.878857 | — | — |
+| engram | 新版 PyPTO-lib | 1.008130 | 0.952684 | 0.732110† | 30.13%† |
+| layers_19_21 | 初版 PyPTO-lib | 14.332172 | 15.422858 | — | — |
+| layers_19_21 | DSL 半同步 | 9.263651 | 10.759697 | — | — |
+| layers_19_21 | DSL 全同步≤64 | 9.534265 | 12.042482 | — | — |
+| layers_19_21 | 新版 PyPTO-lib | 3.769646 | 4.573585 | — | — |
 
 ## 版本与测试方式
 
-- `main HBG` 对应 `534c5656aede204d270d214656182cb1e3e2f81e`；`main percounter` 对应 `21d2e9a103d5b7372dda4823fb37eab470544d0c`。运行库与已编译业务 kernel 均复用；新版 MoE 复用了27个 kernel 二进制，并按匹配的 Host ABI 重新打包原始编排。
-- 新版模型固定为 [dev/hbg@a6a9a2d49047](https://github.com/hw-native-sys/pypto-lib/tree/a6a9a2d49047ce67a85857c6b15f9604a7287714/models/deepseek_v4_1_flash)。新版 MoE 继承 [PR3038](https://github.com/hw-native-sys/simpler/pull/3038)：执行真实 `get_tensor_data<int32_t>(num_tokens)`，同一编译产物在 HBG、percounter 上均通过 `0/6`、`6/0`、`72/72` 三组 token 数和三个输出的原生 numerical golden 校验。
-- 纯 L0：1次预热、10次正式测量，指标为包含 AICPU/AICore 的 Device wall；双卡逐轮取两个 rank 的较大值再平均。新版 MoE 另保存 Host 时间及每 rank 样本；Host 控制读取发生于构图，不计入 Device wall。正式性能列不含 L1 插桩。
-- 新版 MoE 使用原模型的非零权重及随 token 数变化的强制路由 golden 输入。因此这行是业务输入更新后的基线，不能将它与原冻结零权重 MoE 的差值解释为调度退化。其他15行仍使用原来的固定零权重输入与测量数据。
-- 新版 MoE 本轮通过自动分配的两组双卡并发验证：HBG 的 `TASK_DEVICE=0,1`，percounter 为 `2,5`；不是同卡对 A/B。所有用卡均经 `task-submit --device auto --device-num N`。测量日期2026-11-14，A5 Ascend950DT_9581（32 AIC / 64 AIV），CANN 9.3.0 环境。
-- 其他保留项沿用先前数据：新版非 MoE 的 HBG/percounter 为同卡配对测量；初版和 DSL 的两列并非同轮配对。跨实现组的变化同时包含算子、融合和缓存布局差异。
-- 其余回放用例保留的是捕获控制值下的设备任务与同步通信行为，不覆盖动态 Host tensor 读取。`recv_count_local` 和 route 在新版 MoE 中仍由 AICore task 读取。
+- `main HBG`：`2481bd9431437b665b2ea81c786eef800ea33ab8`；`main percounter`：`fd4d4863a6dfc9386d43dbcc75067948aae34bc7`。
+  两者均采用实际 kernel 首尾窗口。HBG 复用与目标提交的 903 个构建相关文件一致的运行库；
+  percounter 仅重编运行库，所有业务 kernel 与输入均复用。
+- 全部为 L0。HBG 每组 5 次预热、10 次正式测量；percounter 采用已完成的采集开关对照中
+  4 个开启批次的全部 40 次正式测量，每批预热 5 次。两列不是同轮、同卡的配对 A/B。
+  正式表不含 AICPU 头尾耗时或 L1/L3 插桩耗时。
+- 所有双卡运行先在同一 Device stream 上完成双方 epoch rendezvous，再启动被测运行；
+  起跑同步不计入窗口。每轮分别计算两卡时长，取较大值后再平均，不跨卡相减原始计数器。
+- 使用 `task-submit --device auto --device-num N` 自动分配。HBG 单卡使用设备 2–7、双卡使用
+  0/1、2/3、4/5、6/7，最大并发 8 卡；percounter 单卡使用 0/1，双卡使用 0/1、2/3，最大并发 4 卡。
+  逐例实际 `TASK_DEVICE` 与原始计数器记录在本地测量结果中。
+- 测量日期为 2026-11-15，A5 Ascend950DT（32 AIC / 64 AIV），CANN 9.3.0。
+  两列各 16 组全部通过 numerical golden、时间戳及双卡同步检查。
+  初始化失败和未完成的对照单独保存，不混入均值。
+- percounter 的采集开关对照中，15/16 组 Device wall 平均膨胀低于 1%；
+  **新版原生 MoE 的均值差异为 +3.365%，尚未满足 1% 门槛**。该行保留实际测量值，
+  不能宣称 percounter 的全量低开销验收已经通过。
+- 新版模型固定为 [dev/hbg@a6a9a2d49047](https://github.com/hw-native-sys/pypto-lib/tree/a6a9a2d49047ce67a85857c6b15f9604a7287714/models/deepseek_v4_1_flash)。
+  新版 MoE 继承 [PR3038](https://github.com/hw-native-sys/simpler/pull/3038)，执行原生 Host
+  `get_tensor_data<int32_t>(num_tokens)` 路径；两种运行库均通过 `0/6`、`6/0`、`72/72`
+  三组 token 数和三个输出的原生 golden 校验，性能采用 `72/72`。
+  该用例使用非零权重与强制路由输入，其余用例沿用冻结输入。
+  `recv_count_local` 与 route 的设备侧读取仍在 AICore task 内。
 
 ## 同步约束下界
 
-- 当前8个非通信配置各自保留已计算的下界：新版采用其 HBG 534c L1 时长，初版/DSL 采用对应的历史21d2 L1时长；不同同步配置不共用模型或耗时。
-- 模型保留任务完成依赖、32 AIC / 64 AIV 容量、不可抢占 block、MIX 同 block 共同启动、sync_start 全 block 共同启动；调度成本为零，放宽 cluster 放置。时长向下量化为100ns，取10轮已证明下界的平均值。
-- 下界依赖 L1 kernel 时长，不是硬件绝对极限，也不保证是另一轮 L0 的严格下界。通信场景不计算。
-- 最优实测距下界 = `(min(main HBG, main percounter) / 同步约束下界 - 1) × 100%`，按未舍入值计算，不截断负值。
-- **†**：新版 Engram 的10轮未证明最优；平均已证明下界0.732110ms、可行排程0.735090ms，表中采用前者。其他7个保留配置均已证明全部轮次最优。
-- 用例选择、原生 MoE 契约和复现方式见 [README](README.md)，模型见 [BOUND.md](BOUND.md)。
+- 8 个非通信配置沿用各自已计算的下界，本轮未重新测算：新版来自 HBG 534c 的 L1 kernel 时长，
+  初版和 DSL 来自历史 21d2 的对应 L1 时长。半同步与全同步配置分别建模，不共用时长或下界。
+- 模型保留任务完成依赖、32 AIC / 64 AIV 容量、不可抢占 block、MIX 同 block 共同启动，
+  以及 `sync_start` 全 block 共同启动；调度成本为零，放宽 cluster 放置。
+  时长向下量化为 100ns，采用 10 轮已证明下界的平均值。通信场景不计算。
+- 下界依赖历史 L1 kernel 时长，不是硬件绝对极限，也不保证是本轮 L0 的严格下界。
+  表中差距仅反映当前实测值与该模型下界的比例。
+- 最优实测距下界 = `(min(main HBG, main percounter) / 同步约束下界 - 1) × 100%`，
+  使用未舍入的实测均值计算，保留两位小数，不截断负值。
+- **†**：新版 Engram 的 10 轮未证明最优；平均已证明下界为 0.732110ms，可行排程为 0.735090ms，
+  表中使用前者。其他 7 个非通信配置均已证明全部轮次最优。
+- 用例与复现方式见 [README](README.md)，模型见 [BOUND.md](BOUND.md)。
