@@ -11,22 +11,10 @@
 
 #pragma once
 
-#include "callable.h"
+#include "callable_entry.h"
 #include "scheduler/scheduler_async_layout.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
-
-enum class SchedulerCallableAddressSpace { DEVICE, HOST };
-
-inline uint64_t scheduler_resolve_callable_entry(uint64_t object, SchedulerCallableAddressSpace address_space) {
-    if (object == 0 || object % alignof(CoreCallable) != 0) return 0;
-    if (address_space == SchedulerCallableAddressSpace::HOST)
-        return reinterpret_cast<const CoreCallable *>(object)->resolved_addr();
-    // Onboard registration patches resolved_addr to this binary address;
-    // the device object itself is not readable through a Host pointer.
-    constexpr uint64_t offset = CoreCallable::binary_data_offset();
-    return object > UINT64_MAX - offset ? 0 : object + offset;
-}
 
 inline bool scheduler_prepare_host_calls(
     void *base, const AicoreSchedulerLayout &layout, uint64_t device_base, int64_t task_ref, const uint64_t *functions,

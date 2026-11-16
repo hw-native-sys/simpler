@@ -29,10 +29,11 @@
 SchedulerExtensionResult scheduler_extension_select(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
     const std::vector<SchedulerTaskMetadata> &task_metadata, const std::vector<int64_t> &inline_completed_task_ids,
-    const sm_layout::SegmentOffsets &device_segments
+    const sm_layout::SegmentOffsets &device_segments, const void *uploaded_sm
 ) {
     const auto selection = simpler::percounter::select_percounter_state(
-        runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_ids, device_segments
+        runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_ids, device_segments,
+        uploaded_sm
     );
     return selection == simpler::percounter::StateSelection::PERCOUNTER ? SchedulerExtensionResult::TAKEN :
                                                                           SchedulerExtensionResult::FAILED;

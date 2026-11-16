@@ -1294,7 +1294,7 @@ protected:
 namespace simpler::common::sim_host {
 
 // Shared utility used by ensure_binaries_loaded() / upload_chip_callable_buffer()
-// to materialize an in-memory DSO into /tmp so dlopen can pick it up. mkstemp +
+// to materialize an in-memory DSO into a temporary file for dlopen. mkstemp +
 // fchmod 0755 + write_all + close; on success out_path receives the path.
 bool create_temp_so_file(const std::string &path_template, const uint8_t *data, size_t size, std::string *out_path);
 

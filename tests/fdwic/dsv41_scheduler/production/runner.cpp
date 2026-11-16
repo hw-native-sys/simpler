@@ -330,10 +330,11 @@ int run(int argc, char **argv) {
         worker.copy_from(reinterpret_cast<uint64_t>(value.data()), buffer.address, value.size());
         return value;
     };
-    auto save_value = [&](const fs::path &path, const std::vector<uint8_t> &value) {
-        const bool repeat = !value.empty() && std::all_of(value.begin(), value.end(), [&](uint8_t byte) {
-            return byte == value.front();
-        });
+    auto save_value = [&](const fs::path &path, const std::vector<uint8_t> &value, bool allow_repeat = true) {
+        const bool repeat =
+            allow_repeat && !value.empty() && std::all_of(value.begin(), value.end(), [&](uint8_t byte) {
+                return byte == value.front();
+            });
         std::ofstream stream(path, std::ios::binary);
         stream.write(reinterpret_cast<const char *>(value.data()), repeat ? 1 : value.size());
         if (!stream) throw std::runtime_error("Cannot save boundary data");
@@ -359,10 +360,14 @@ int run(int argc, char **argv) {
                                                           }
                                                       ) :
                                                       actual == expected;
-            if (!equal)
+            if (!equal) {
+                const auto mismatch = output / ("validation-failure-buffer-" + std::to_string(i) + ".bin");
+                save_value(mismatch, actual, false);
                 throw std::runtime_error(
-                    "Isolated case differs from original prefix + case at buffer " + std::to_string(i)
+                    "Isolated case differs from original prefix + case at buffer " + std::to_string(i) +
+                    "; actual bytes saved to " + mismatch.string()
                 );
+            }
         }
     };
     auto save_inputs = [&] {

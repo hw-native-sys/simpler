@@ -92,6 +92,10 @@ percounter_post_handshake_init(Runtime *runtime, const AicoreLifecycle &lifecycl
     }
 
     cache_invalidate_range(control, sizeof(*control));
+    if (!percounter_sync_widths_fit(control->max_sync_blocks, aic_count, PLATFORM_AIV_CORES_PER_BLOCKDIM)) {
+        LOG_ERROR("A5 percounter: sync_start width exceeds the reported topology");
+        return -1;
+    }
     control->cluster_count = static_cast<uint64_t>(aic_count);
     control->aiv_per_cluster = static_cast<uint64_t>(PLATFORM_AIV_CORES_PER_BLOCKDIM);
     // The host prefilled the compile-time default; this carries any override,
@@ -193,7 +197,7 @@ percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_th
     uint64_t settled = 0;
     while (true) {
         cache_invalidate_range(&control->completed_block_count, sizeof(control->completed_block_count));
-        const uint64_t resolved = control->completed_block_count;
+        const uint64_t resolved = __atomic_load_n(&control->completed_block_count, __ATOMIC_ACQUIRE);
         // The final block publication follows every registration allocation.
         if (resolved >= expected || error_poll_count == 63) {
             cache_invalidate_range(&control->async_registered, 2 * sizeof(uint64_t));
@@ -214,9 +218,13 @@ percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_th
             cache_invalidate_range(&control->lane_error, sizeof(control->lane_error));
             if (control->lane_error != 0) {
                 error = control->lane_error;
+                cache_invalidate_range(&control->lane_error_claim, 3 * sizeof(uint64_t));
+                const int64_t task =
+                    control->lane_error_claim == 2 ? static_cast<int64_t>(control->lane_error_task) - 1 : -1;
                 LOG_ERROR(
-                    "A5 percounter: lane reported error %" PRIu64 "; %" PRIu64 " of %" PRIu64 " blocks resolved", error,
-                    resolved, expected
+                    "A5 percounter: lane reported error %" PRIu64 "; task=%" PRId64 " detail=%" PRIu64 "; %" PRIu64
+                    " of %" PRIu64 " blocks resolved",
+                    error, task, control->lane_error_detail, resolved, expected
                 );
                 break;
             }

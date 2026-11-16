@@ -28,18 +28,9 @@
 #
 # HBG's own build_config explains why "runtime" must precede SHARED and why the
 # orchestration .so names assert_support.cpp file-wise; both apply here unchanged.
-# Out of the default build set: a build that names no runtime leaves this one
-# alone, and `--runtime percounter` (or SIMPLER_BUILD_RUNTIMES=percounter)
-# builds it. Discovery is unaffected -- the runtime is still here and still
-# selectable; what this controls is only whether an unqualified build compiles
-# a third a5 runtime, which is what every a5 CI job does.
-#
-# The cost it keeps off those jobs is a whole runtime's compile: this tree
-# shares host_build_graph's sources but not its include paths, so its objects
-# are its own. The price is that nothing then proves this runtime still builds
-# after a change to the sibling it compiles; whatever job turns it back on is
-# what keeps it honest.
-BUILD_BY_DEFAULT = False
+# Default A5 packages include the runtime required by automatically collected
+# percounter scene tests. Explicit runtime selections can still narrow a build.
+BUILD_BY_DEFAULT = True
 
 # Present under a5 and not under a2a3, and meant to be.
 #
