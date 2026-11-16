@@ -16,16 +16,22 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def selected_cases():
+def selected_cases(runtime="host_build_graph"):
     for flavor in ("pypto_lib", "pypto_lib_dsl", "pypto_lib_latest"):
         cases = json.loads((ROOT / "workloads" / flavor / "source.json").read_text())["cases"]
         variants = (flavor, "pypto_lib_dsl_all_sync64") if flavor == "pypto_lib_dsl" else (flavor,)
         for variant in variants:
             for case, spec in cases.items():
+                if runtime == "tensormap_and_ringbuffer" and spec.get("execution") == "native_moe_host_control":
+                    continue
                 if variant in spec.get("variants", variants):
                     yield f"{variant}/{case}"
 
 
 if __name__ == "__main__":
-    argparse.ArgumentParser(description=__doc__).parse_args()
-    print("\n".join(selected_cases()))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--runtime", choices=("host_build_graph", "percounter", "tensormap_and_ringbuffer"), default="host_build_graph"
+    )
+    args = parser.parse_args()
+    print("\n".join(selected_cases(args.runtime)))

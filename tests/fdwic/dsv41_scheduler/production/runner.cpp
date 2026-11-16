@@ -96,6 +96,29 @@ void initialize(ChipWorker &worker, uint64_t address, size_t bytes, const std::v
 }
 
 int run(int argc, char **argv) {
+    if (argc == 3 && std::string(argv[1]) == "--describe-callable") {
+        const auto binary = read_binary(argv[2]);
+        if (binary.size() < sizeof(ChipCallable)) throw std::runtime_error("Truncated callable");
+        const auto *source = reinterpret_cast<const ChipCallable *>(binary.data());
+        std::cout << "{\"signature\":[";
+        for (int i = 0; i < source->sig_count(); ++i) {
+            if (i) std::cout << ',';
+            std::cout << static_cast<int>(source->sig(i));
+        }
+        std::cout << "],\"kernels\":[";
+        for (int i = 0; i < source->child_count(); ++i) {
+            if (i) std::cout << ',';
+            const auto &child = source->child(i);
+            std::cout << "{\"id\":" << source->child_func_ids_[i] << ",\"signature\":[";
+            for (int j = 0; j < child.sig_count(); ++j) {
+                if (j) std::cout << ',';
+                std::cout << static_cast<int>(child.sig(j));
+            }
+            std::cout << "]}";
+        }
+        std::cout << "]}\n";
+        return 0;
+    }
     if (argc == 5 && std::string(argv[1]) == "--assemble-orchestration") {
         std::ifstream manifest(argv[2]);
         auto signature = [&] {
@@ -137,10 +160,9 @@ int run(int argc, char **argv) {
         // The host ELF shares this image with the model's machine code. A
         // smaller test entry must not move every kernel to new I-cache sets.
         if (orchestration.size() > source->binary_size()) {
-            throw std::runtime_error(
-                "Host adapter exceeds original orchestration slot; "
-                "build it without debug symbols"
-            );
+            constexpr const char *message =
+                "Host adapter exceeds original orchestration slot; build it without debug symbols";
+            throw std::runtime_error(message);
         }
         orchestration.resize(source->binary_size(), 0);
         std::vector<std::vector<uint8_t>> children;
@@ -175,7 +197,7 @@ int run(int argc, char **argv) {
     std::string runtime_name = "host_build_graph";
     if (argc < 10) {
         std::cerr << "usage: native-runner BUNDLE RUNTIME_LIB DEVICE RANK ROOTINFO OUTPUT LEVEL WARMUP ROUNDS "
-                     "[--materialize] [--runtime=host_build_graph|percounter]\n";
+                     "[--materialize] [--runtime=host_build_graph|percounter|tensormap_and_ringbuffer]\n";
         return 2;
     }
     for (int i = 10; i < argc; ++i) {
@@ -183,6 +205,7 @@ int run(int argc, char **argv) {
         if (option == "--materialize") materialize = true;
         else if (option == "--runtime=host_build_graph") runtime_name = "host_build_graph";
         else if (option == "--runtime=percounter") runtime_name = "percounter";
+        else if (option == "--runtime=tensormap_and_ringbuffer") runtime_name = "tensormap_and_ringbuffer";
         else throw std::runtime_error("Unknown runner option: " + option);
     }
     const fs::path bundle = argv[1], libraries = argv[2], output = argv[6];
@@ -191,6 +214,8 @@ int run(int argc, char **argv) {
     const int level = all_levels ? 0 : std::stoi(argv[7]), warmup = std::stoi(argv[8]), rounds = std::stoi(argv[9]);
     const bool sliced = fs::exists(bundle / "slice.txt");
     const bool snapshot = fs::exists(bundle / "snapshot.txt");
+    if (runtime_name == "tensormap_and_ringbuffer" && !fs::exists(bundle / "tmr.json"))
+        throw std::runtime_error("Prepare a TMR bundle before selecting AICPU scheduling");
     if ((snapshot && (!sliced || materialize)) || (materialize && !sliced))
         throw std::runtime_error("Invalid snapshot preparation mode");
     if (sliced) {
@@ -407,7 +432,9 @@ int run(int argc, char **argv) {
         }
         worker.finalize_native_run(run);
         const auto mode = worker.last_scheduler_runtime_mode();
-        const bool supported = runtime_name == "percounter" ? mode == 5 : (mode == 1 || mode == 2);
+        const bool supported = runtime_name == "tensormap_and_ringbuffer" ? mode == 0 :
+                               runtime_name == "percounter"               ? mode == 5 :
+                                                                            (mode == 1 || mode == 2);
         if (!supported) throw std::runtime_error("Unexpected scheduler mode: " + std::to_string(mode));
         host_barrier(output, "complete-" + label, rank, ranks);
         return mode;

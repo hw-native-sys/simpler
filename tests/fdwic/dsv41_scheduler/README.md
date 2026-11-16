@@ -172,6 +172,70 @@ The original 33 tensor arguments and 10 scalars are preserved. Each rank
 submits one native call per round; the former outer Python `l3_moe` ordering
 token is unnecessary with these serial per-rank submissions.
 
+## AICPU scheduling with TMR
+
+The 11 frozen replay cases also support `--runtime=tensormap_and_ringbuffer`:
+eight single-device cases and three two-device cases. Native latest MoE is
+excluded; its live Host control reads are not part of this adapter.
+
+Use `production/list_cases.py --runtime=tensormap_and_ringbuffer` to list
+exactly these 11 case paths. Prepare a separate TMR bundle from each existing replay bundle. The adapter
+resolves captured buffer aliases and opaque task identities into a dense plan,
+then submits the same views, dependencies, scopes, SPMD flags and scalar values
+on AICPU. This is a fixed-task replay, not a new capture of model Python control
+flow. Fixed Host boundary fixtures are copied to device memory for AICPU access.
+
+HBG and TMR have different Tensor layouts. Selected business kernels are
+compiled for the TMR ABI through the existing compiler cache; DSL entry glue
+uses the TMR Tensor type while its numerical body remains unchanged. Input
+files are linked locally when possible. No PyPTO/PyPTO-lib environment, Torch,
+model generation or weight regeneration is required.
+
+```bash
+# Build Host tools and a separate benchmark runtime before reserving devices.
+bash "$DSV41/build.sh" --host-only
+python3 "$DSV41/production/tmr_runtime.py" \
+  --output-dir "$DSV41/build/tmr-runtime" --pto-isa "$PWD/build/pto-isa"
+
+PYTHONPATH="$PWD/python:$PWD" python3 "$DSV41/production/tmr_prepare.py" \
+  "$DSV41/build/prepared/cases/pypto_lib_latest/swa" \
+  "$DSV41/build/tmr-cases/pypto_lib_latest/swa" \
+  --pto-isa "$DSV41/build/tmr-runtime/source/build/pto-isa"
+
+python3 "$DSV41/production/device_start_gate.py" \
+  --runtime-dir "$DSV41/build/tmr-runtime/runtime/a5/onboard" \
+  --output-dir "$DSV41/build/tmr-gate" \
+  --pto-isa "$DSV41/build/tmr-runtime/source/build/pto-isa"
+bash "$DSV41/run.sh" "$DSV41/build/tmr-cases/pypto_lib_latest/swa" \
+  "$DSV41/build/tmr-runtime/runtime/a5/onboard" "$DSV41/outputs/tmr/swa" \
+  0 1 10 --runtime=tensormap_and_ringbuffer
+```
+
+The normal runner allocates devices automatically when `TASK_DEVICE` is absent.
+For parallel execution, submit jobs with `task-submit --device auto --device-num N`
+and retain its returned IDs. Two-device cases require the same Device start gate
+as HBG/percounter: pass `build/tmr-gate/runtime/a5/onboard` for those cases.
+Single-device cases use the unwrapped `build/tmr-runtime/runtime/a5/onboard`.
+Replay numerical checks, one warmup and ten measured rounds remain enabled.
+
+The timing instrumentation exists only in the benchmark build. `tmr_runtime.py`
+copies the source tree into its new output directory, applies `tmr_timing.patch`
+there, and builds into that directory's `runtime/`. It checks out the pinned
+PTO-ISA revision in a separate local clone. Production `src/`, normal build
+outputs and the supplied PTO-ISA checkout are not modified. No production
+feature flag or timing branch is added. L0 tests verify the marker and component
+hashes before requesting devices; the Device-gate snapshot preserves that marker.
+
+This test-only TMR runtime records the first business-kernel entry and last return per Core, then
+publishes the reduced window after successful Core retirement and cache
+invalidation. Idle Cores contribute no timestamps; failed retirement publishes
+no valid window. The native measurement excludes AICPU startup/teardown but
+includes gaps from AICPU replay, graph construction, scheduling and communication.
+It is not a measurement of scheduling alone. This new endpoint collection's
+incremental overhead has not separately been certified below 1%; it is paid only
+by this explicitly built benchmark runtime. Ordinary TMR builds retain their
+original executor and have none of these added timing operations.
+
 ## Boundary preparation and validation
 
 Local cases (`swa`, `c2a_full`, `c1a_reindex`,

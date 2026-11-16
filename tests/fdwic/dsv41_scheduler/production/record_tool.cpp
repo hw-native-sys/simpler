@@ -16,6 +16,57 @@
 
 int main(int argc, char **argv) {
     try {
+        if (argc == 3 && std::string(argv[1]) == "--records-json") {
+            std::ifstream input(argv[2], std::ios::binary);
+            const auto records = dsv41::read_records(input);
+            auto array = [](const auto &values) {
+                std::cout << '[';
+                bool comma = false;
+                for (const auto value : values) {
+                    if (comma) std::cout << ',';
+                    comma = true;
+                    std::cout << value;
+                }
+                std::cout << ']';
+            };
+            std::cout << '[';
+            bool comma = false;
+            for (const auto &record : records) {
+                if (comma) std::cout << ',';
+                comma = true;
+                const auto &h = record.header;
+                std::cout << "{\"op\":" << static_cast<uint32_t>(h.operation) << ",\"id\":" << h.task_id
+                          << ",\"kernels\":";
+                array(h.kernels);
+                std::cout << ",\"blocks\":" << h.block_num << ",\"sync\":" << h.sync_start
+                          << ",\"early\":" << h.early_resolve << ",\"timing\":" << h.timing_slot
+                          << ",\"scope\":" << h.scope_mode << ",\"scalars\":";
+                array(record.scalars);
+                std::cout << ",\"dependencies\":";
+                array(record.dependencies);
+                std::cout << ",\"tensors\":[";
+                bool tensor_comma = false;
+                for (const auto &operand : record.tensors) {
+                    if (tensor_comma) std::cout << ',';
+                    tensor_comma = true;
+                    const auto &t = operand.tensor;
+                    std::cout << "{\"buffer\":" << t.buffer.addr << ",\"bytes\":" << t.buffer.size
+                              << ",\"owner\":" << TaskId::to_uint64(t.owner_task_id) << ",\"offset\":" << t.start_offset
+                              << ",\"version\":" << t.version << ",\"ndims\":" << static_cast<int>(t.ndims)
+                              << ",\"dtype\":" << static_cast<int>(t.dtype) << ",\"manual\":" << t.manual_dep
+                              << ",\"contiguous\":" << t.is_contiguous
+                              << ",\"space\":" << static_cast<int>(t.address_space)
+                              << ",\"extent\":" << t.extent_elem_cache << ",\"tag\":" << operand.tag << ",\"shapes\":";
+                    array(t.shapes);
+                    std::cout << ",\"strides\":";
+                    array(t.strides);
+                    std::cout << '}';
+                }
+                std::cout << "]}";
+            }
+            std::cout << "]\n";
+            return 0;
+        }
         if (argc == 6 &&
             (std::string(argv[1]) == "--half-sync-start" || std::string(argv[1]) == "--all-sync-start-cap64")) {
             const bool all_sync = std::string(argv[1]) == "--all-sync-start-cap64";

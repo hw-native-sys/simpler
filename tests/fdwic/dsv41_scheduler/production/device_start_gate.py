@@ -44,7 +44,7 @@ def validate_runtime_gate(runtime_dir, variant):
         "then pass NEW_WRAPPER_DIR/runtime/a5/onboard as the runtime."
     )
     try:
-        if variant not in ("host_build_graph", "percounter"):
+        if variant not in ("host_build_graph", "percounter", "tensormap_and_ringbuffer"):
             raise ValueError(f"Unsupported runtime variant: {variant}")
         if runtime.name != "onboard" or runtime.parent.name != "a5":
             raise ValueError("Expected a wrapper runtime/a5/onboard directory")
@@ -153,7 +153,9 @@ def build(args):
     gate_source = SOURCE / "device_start_gate_kernel.cpp"
     source_stamps = {str(path): file_stamp(path) for path in (Path(__file__).resolve(), shim_source, gate_source)}
     variants = [
-        name for name in ("host_build_graph", "percounter") if (original / name / "libhost_runtime.so").is_file()
+        name
+        for name in ("host_build_graph", "percounter", "tensormap_and_ringbuffer")
+        if (original / name / "libhost_runtime.so").is_file()
     ]
     if (
         not variants
@@ -166,7 +168,7 @@ def build(args):
         or not runtime_pin.is_file()
     ):
         raise ValueError(
-            "--runtime-dir must name an A5 onboard build with HBG/percounter, its sibling dispatcher, "
+            "--runtime-dir must name an A5 onboard build with HBG/percounter/TMR, its sibling dispatcher, "
             "and runtime-root pto_isa_build.json for pin validation"
         )
     if output.is_relative_to(original) or original.is_relative_to(output):
@@ -346,7 +348,7 @@ def main():
     if sys.argv[1:2] == ["validate"]:
         parser = argparse.ArgumentParser(description="Validate a prebuilt device-start-gate wrapper; no compilation")
         parser.add_argument("runtime_dir", type=Path)
-        parser.add_argument("variant", choices=("host_build_graph", "percounter"))
+        parser.add_argument("variant", choices=("host_build_graph", "percounter", "tensormap_and_ringbuffer"))
         args = parser.parse_args(sys.argv[2:])
         try:
             validate_runtime_gate(args.runtime_dir, args.variant)

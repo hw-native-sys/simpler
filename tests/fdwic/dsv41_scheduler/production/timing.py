@@ -125,11 +125,11 @@ def replay_rank_samples(directory, result):
         )
     ]
     warmup, rounds = result["warmup"], result["rounds"]
-    mode = {"host_build_graph": 1, "percounter": 5}[result["runtime"]]
+    mode = {"host_build_graph": 1, "percounter": 5, "tensormap_and_ringbuffer": 0}[result["runtime"]]
     require(len(runs) in (warmup + rounds, warmup + rounds + 2), "Incomplete replay run sequence")
     require(
         runs[: warmup + rounds] == [(index, mode, 0, int(index < warmup)) for index in range(warmup + rounds)],
-        "Performance samples must be L0 in the selected AICore scheduler mode",
+        "Performance samples must be L0 in the selected scheduler mode",
     )
     if len(runs) > warmup + rounds:
         require(
