@@ -50,6 +50,12 @@
 #define SIMPLER_ERROR_KERNEL_INDEX_OUT_OF_RANGE 106
 #define SIMPLER_ERROR_KERNEL_NON_FINITE_VALUE 107
 
+// These failures can leave a valid registered prefix and an untracked request.
+// Draining that prefix does not prove complete retirement of the failed run.
+static inline bool is_async_tracking_error(int32_t code) {
+    return code == SIMPLER_ERROR_ASYNC_COMPLETION_INVALID || code == SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW;
+}
+
 // Sub-classification of a SIMPLER_ERROR_SCHEDULER_TIMEOUT (code 100). The top-level
 // sched_error_code stays 100 for backward compatibility; this detail value tells
 // the host which device error TYPE the AICPU no-progress watchdog observed, so a

@@ -816,9 +816,21 @@ void SchedulerContext::drain_cancelled_run(uint64_t deadline, KernelErrorCleanup
         result.async_error = SIMPLER_ERROR_ASYNC_COMPLETION_INVALID;
         return;
     }
+    const bool incomplete_tracking =
+        sched_->sm_header != nullptr && (is_async_tracking_error(sched_->sm_header->orch_error_code.load()) ||
+                                         is_async_tracking_error(sched_->sm_header->sched_error_code.load()));
     // No completion or release callback is allowed here. The failed graph's
     // dependencies stay unsatisfied while outstanding hardware readers finish.
     auto retire = [&](CompletionCondition &condition, TaskId task, uint32_t source, int32_t core) {
+        const size_t alignment =
+            condition.completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD ? alignof(uint64_t) : alignof(uint32_t);
+        if (condition.engine != ASYNC_ENGINE_SDMA || condition.addr % alignment != 0) {
+            result.async_error = SIMPLER_ERROR_ASYNC_COMPLETION_INVALID;
+            result.task_token = TaskId::to_uint64(task);
+            result.source = source;
+            result.core = core;
+            return false;
+        }
         while (true) {
             if (condition.completion_type == COMPLETION_TYPE_COUNTER && condition.counter_addr != nullptr) {
                 cache_invalidate_range(const_cast<const uint32_t *>(condition.counter_addr), sizeof(uint32_t));
@@ -886,7 +898,8 @@ void SchedulerContext::drain_cancelled_run(uint64_t deadline, KernelErrorCleanup
             const uint32_t count = slab.count;
             const TaskId task = payload_per_core_[core][buffer].local_context.async_ctx.task_token;
             if (count > MAX_COMPLETIONS_PER_TASK || (count != 0 && !task.is_valid()) ||
-                (slab.error_code != 0 && !is_kernel_error(slab.error_code))) {
+                (slab.error_code != 0 && !is_kernel_error(slab.error_code) &&
+                 !is_async_tracking_error(slab.error_code))) {
                 result.async_error = slab.error_code != 0 && !is_kernel_error(slab.error_code) ?
                                          slab.error_code :
                                          SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED;
@@ -894,6 +907,15 @@ void SchedulerContext::drain_cancelled_run(uint64_t deadline, KernelErrorCleanup
                 result.core = core;
                 result.task_token = TaskId::to_uint64(task);
                 return;
+            }
+            if (is_async_tracking_error(slab.error_code) && result.async_error == 0) {
+                // The recorded prefix is still drainable. A failed registration
+                // or malformed SDK event may have omitted other identities, so
+                // retaining their owners remains mandatory after this prefix.
+                result.async_error = SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED;
+                result.source = 4;
+                result.core = core;
+                result.task_token = TaskId::to_uint64(task);
             }
             for (uint32_t i = 0; i < count; ++i) {
                 const auto &entry = slab.entries[i];
@@ -905,7 +927,9 @@ void SchedulerContext::drain_cancelled_run(uint64_t deadline, KernelErrorCleanup
             }
         }
     }
-    result.complete = 1;
+    // A wait-list registration failure can lose an identity outside any slab.
+    if (incomplete_tracking && result.async_error == 0) result.async_error = SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED;
+    result.complete = result.async_error == 0 ? 1u : 0u;
 }
 
 // =============================================================================

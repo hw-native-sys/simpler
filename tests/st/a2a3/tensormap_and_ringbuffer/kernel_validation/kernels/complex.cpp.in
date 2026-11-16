@@ -79,12 +79,58 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     using Scratch = pto::Tile<pto::TileType::Vec, uint8_t, 1, SDMA_SCRATCH_ALIGNMENT>;
     Scratch scratch;
     pto::TASSIGN(scratch, 0);
+    auto *witness = reinterpret_cast<__gm__ uint32_t *>(data + 3072);
+    witness[0] = 0;
+    witness[1] = 0;
+    pto2::detail::defer_flush_range(witness, 2 * sizeof(uint32_t));
+    // Negative control: reject A before the SDK submit boundary.
+    if (code == 111) ctx.completion_capacity = 0;
     if (!send_request_entry(
             ctx, SdmaTget(Data(data + 1024), Data(data), scratch, get_dma_workspace(args, DMA_WORKSPACE_SDMA))
         ))
         return;
-#endif
-    if (code != 0) {
+    witness[0] = 1;
+    if (code == 102) {
+        const uint32_t capacity = ctx.completion_capacity;
+        ctx.completion_capacity = *ctx.completion_count;
+        send_request_entry(
+            ctx, SdmaTget(Data(data + 2048), Data(data), scratch, get_dma_workspace(args, DMA_WORKSPACE_SDMA))
+        );
+        // Restore space for the test witnesses, preserving the latched error.
+        ctx.completion_capacity = capacity;
+    } else if (code == 101 || code == 110) {
+        pto::comm::AsyncSession session;
+        if (!pto::comm::BuildAsyncSession(scratch, get_dma_workspace(args, DMA_WORKSPACE_SDMA), session, 0)) {
+            report_kernel_error(ctx, KernelErrorCode::INVALID_OUTPUT);
+            return;
+        }
+        // Inject the SDK's zero-handle rejection or failed event with valid
+        // records after a real SDMA request has been submitted and registered.
+        pto::comm::AsyncEvent event{};
+        event.engine = pto::comm::DmaEngine::SDMA;
+        if (code == 110) {
+            pto::comm::sdma::detail::EncodeSdmaEventHandle(
+                ctx.completion_entries[0].backend_cookie, *ctx.completion_count, event.handle
+            );
+            event.postFailed = true;
+        }
+        pto2::detail::register_pto_async_event(ctx, event, session);
+        pto2::detail::defer_flush(ctx);
+    } else if (code == 112) {
+        // Negative control: A succeeded, but the primary error is not 101.
+        report_kernel_error(ctx, KernelErrorCode::INVALID_OUTPUT);
+    } else if (code != 0) {
         report_kernel_error(ctx, KernelErrorCode::INDEX_OUT_OF_RANGE);
     }
+    if (code != 0) {
+        witness[1] = code;
+        pto2::detail::defer_flush_range(witness, 2 * sizeof(uint32_t));
+        // These records are appended after injection so they cannot change the
+        // SDK event's queue count. Drain counts them only after polling their values.
+        save_expected_notification_counter(ctx, witness, 1);
+        save_expected_notification_counter(ctx, witness + 1, code);
+    }
+#else
+    if (code != 0) report_kernel_error(ctx, KernelErrorCode::INDEX_OUT_OF_RANGE);
+#endif
 }

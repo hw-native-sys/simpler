@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Cooperative MIX, gated, SPMD and deferred failure retirement, without reuse."""
 
+import re
 import time
 from pathlib import Path
 
@@ -43,12 +44,17 @@ pytestmark = [
             marks=pytest.mark.platforms(["a2a3"] if mode == 4 else ["a2a3sim"] if code == 108 else ["a2a3", "a2a3sim"]),
             id=f"{code}-{name}",
         )
-        for code in (0, 106, 108)
+        for code in (0, 101, 102, 106, 108, 110, 111, 112)
         for mode, name in enumerate(("spmd", "mix", "gated", "deferred", "sdma"))
         if code != 108 or mode != 4
+        if code not in (101, 102, 110, 111, 112) or mode == 4
     ],
 )
-def test_complex_validation(st_platform, st_device_ids, tmp_path, capfd, mode, code):
+def test_complex_validation(st_platform, st_device_ids, tmp_path, capfd, monkeypatch, mode, code):
+    device_logs = tmp_path / "ascend"
+    if mode == 4:
+        device_logs.mkdir()
+        monkeypatch.setenv("ASCEND_PROCESS_LOG_PATH", str(device_logs))
     configure_logging("error")
     compiler = KernelCompiler(st_platform)
     children = []
@@ -90,8 +96,8 @@ def test_complex_validation(st_platform, st_device_ids, tmp_path, capfd, mode, c
     try:
         handle = worker.register(callable_)
         args = TaskArgsBuilder(TensorArg("output", torch.zeros(4096, dtype=torch.float32)))
-        task_args, _ = _build_l2_ref_args(args, [D.OUT], worker)
         worker.init()
+        task_args, _ = _build_l2_ref_args(args, [D.OUT], worker)
         config = CallConfig()
         config.aicpu_thread_num = 3
         config.enable_chip_swimlane = 0
@@ -119,10 +125,19 @@ def test_complex_validation(st_platform, st_device_ids, tmp_path, capfd, mode, c
         return
     if code:
         if mode == 4 and not st_platform.endswith("sim"):
-            # Existing SDMA/RTS recovery can refuse safe copy-back after the
-            # AICPU error. Device logs carry the primary code and drain result;
-            # this PR preserves failed-run isolation rather than enabling reuse.
             assert "507018" in out + err, out + err
+            # Drain must observe both task-owned GM counter witnesses; neither
+            # the failed output copy-back nor host-mapped AICore stores are used.
+            log = read_retirement_log(device_logs)
+            if code in (111, 112):
+                # Real negative controls: failure before A is accepted, and a
+                # different error after A. Neither may satisfy SDMA acceptance.
+                reason = "submission/injection witnesses" if code == 111 else "primary code"
+                with pytest.raises(AssertionError, match=reason):
+                    assert_sdma_failure(code, log)
+            else:
+                assert_sdma_failure(code, log)
+            print("SDMA retirement witness", log)
         else:
             assert "runtime_status=-106" in out + err, out + err
         if st_platform.endswith("sim"):
@@ -133,3 +148,26 @@ def test_complex_validation(st_platform, st_device_ids, tmp_path, capfd, mode, c
 
 def assert_consumer_not_entered(log):
     assert "VALIDATION_DEPENDENT_ENTERED" not in log, "consumer executed after failed producer"
+
+
+def read_retirement_log(directory):
+    # CANN flushes device logs asynchronously; wait only for the terminal line.
+    deadline = time.monotonic() + 5
+    while True:
+        log = "\n".join(path.read_text(errors="replace") for path in directory.glob("debug/device-*/*.log"))
+        if "kernel retirement:" in log:
+            return log
+        assert time.monotonic() < deadline, f"missing retirement log under {directory}: {log}"
+        time.sleep(0.05)
+
+
+def assert_sdma_failure(code, log):
+    actual = re.findall(r"kernel retirement: [^\n]*drained=(\d+)[^\n]*primary_code=(\d+)\b", log)
+    assert len(actual) == 1, f"missing unique retirement result: {actual}\n{log}"
+    drained, primary = map(int, actual[0])
+    # One real SDMA record (two for the failed event with valid records), plus
+    # two counters written only after first-submit success and target injection.
+    expected_records = 4 if code == 110 else 3
+    assert drained == expected_records, f"missing SDMA submission/injection witnesses: {actual}\n{log}"
+    expected_primary = 101 if code in (110, 111, 112) else code
+    assert primary == expected_primary, f"unexpected primary code: {primary}, expected {expected_primary}\n{log}"
