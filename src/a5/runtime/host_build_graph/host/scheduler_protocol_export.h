@@ -305,7 +305,6 @@ inline void validate_layout(const Image &image, const AicoreSchedulerLayout &lay
         summary.mix_task_count != layout.spmd.mix_task_count ||
         summary.sync_mix_task_count != layout.spmd.sync_mix_task_count ||
         summary.admission_records_offset != layout.admission_records_offset ||
-        summary.admission_record_stride != layout.admission_record_stride ||
         summary.admission_log_offset != layout.admission_log_offset ||
         summary.admission_control_offset != layout.admission_control_offset ||
         summary.group_mailboxes_offset != layout.group_mailboxes_offset ||
@@ -322,7 +321,7 @@ inline void admissions(JsonObject &root, const Image &image, const AicoreSchedul
     auto &out = root.field("admissions");
     out << '[';
     for (uint64_t task = 0; count != 0 && task < layout.task_count; ++task) {
-        const uint64_t offset = layout.admission_records_offset + task * layout.admission_record_stride;
+        const uint64_t offset = layout.admission_records_offset + task * sizeof(SchedulerAdmissionRecord);
         const auto &record = *image.array<SchedulerAdmissionRecord>(offset, 1);
         std::vector<uint64_t> seals;
         if (record.mix_close_seals_offset != 0) {
@@ -371,7 +370,6 @@ inline std::string scheduler_export_protocol(
     {
         JsonObject root(out);
         root.string("schema", "hbg-native-protocol");
-        root.number("close_seal_stride", sizeof(SchedulerMixCloseSeal));
         if (!graph_source.empty()) {
             root.field("graph_source") << graph_source;
             root.field("node_map") << '[';

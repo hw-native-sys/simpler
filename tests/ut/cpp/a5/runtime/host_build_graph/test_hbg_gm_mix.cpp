@@ -39,15 +39,15 @@ namespace {
 
 thread_local std::function<void(SchedulerLocalState *)> gm_prepare_observer;
 
-PreparedAccessResult observe_gm_prepare(
+bool observe_gm_prepare(
     const SchedulerGraphAccess &graph, void *base, SchedulerLocalState *local, SchedulerRunControl *run,
-    const SchedulerFreeSlotClaim &claim, const SchedulerReadyClaim &ready, const SchedulerTaskMetadata &metadata,
-    uint64_t profiling, uint8_t subtask, uint64_t *prepare_start
+    uint32_t slot_index, const SchedulerReadyClaim &ready, const SchedulerTaskMetadata &metadata, uint64_t profiling,
+    uint8_t subtask, uint64_t *prepare_start
 ) {
     const auto result = scheduler_prepare_dispatch_slot(
-        graph, base, local, run, claim, ready, metadata, profiling, subtask, prepare_start
+        graph, base, local, run, slot_index, ready, metadata, profiling, subtask, prepare_start
     );
-    if (result == PreparedAccessResult::READY && gm_prepare_observer) gm_prepare_observer(local);
+    if (result && gm_prepare_observer) gm_prepare_observer(local);
     return result;
 }
 
@@ -1932,9 +1932,8 @@ TEST(HbgGmMix, CancelUnstartedTicketsAndOwnedCallsNeverContributesOrReturnsThem)
         if (phase == SchedulerPreparedPhase::FAILED) {
             auto *call = scheduler_prepared_call_at(fixture.base(), local->config.prepared, index);
             ++call->run_epoch;
-            ASSERT_EQ(
-                scheduler_receive_execution_token(fixture.base(), local->config.prepared, 0, 0, 0, &token.prepared),
-                PreparedAccessResult::ERROR
+            ASSERT_FALSE(
+                scheduler_receive_execution_token(fixture.base(), local->config.prepared, 0, 0, 0, &token.prepared)
             );
         }
         scheduler_record_error(
@@ -3053,13 +3052,10 @@ TEST_P(HbgGmMixOwnPrepare, HasMixDoesNotRequireSsbufForAnOwnPayloadPreparation) 
         local->slots[0].state = SchedulerDispatchSlotState::FILLING;
         SchedulerReadyClaim ready{};
         ready.task_ref = 0;
-        ASSERT_EQ(
-            scheduler_prepare_dispatch_slot(
-                fixture.graph.graph(), fixture.base(), local, fixture.run(), {0}, ready, fixture.storage.metadata[0], 0,
-                subtask
-            ),
-            PreparedAccessResult::READY
-        );
+        ASSERT_TRUE(scheduler_prepare_dispatch_slot(
+            fixture.graph.graph(), fixture.base(), local, fixture.run(), {0}, ready, fixture.storage.metadata[0], 0,
+            subtask
+        ));
         const auto index = local->slots[0].prepared.execution_index;
         const auto *call = scheduler_prepared_call_at(fixture.base(), local->config.prepared, index);
         const auto *binding = scheduler_execution_binding_at(fixture.base(), local->config.prepared, index);
@@ -3278,9 +3274,8 @@ TEST(HbgGmMixProtocol, ReplayedPublicationCannotOverwriteItsFirstInterval) {
         SchedulerReadyClaim ready{};
         ready.task_ref = 0;
         ready.source = SchedulerReadySource::COOPERATIVE;
-        const SchedulerFreeSlotClaim claim{direct_slot};
-        scheduler_protocol_payload_publication(fixture.base(), local, claim, ready, true);
-        scheduler_protocol_payload_publication(fixture.base(), local, claim, ready, false);
+        scheduler_protocol_payload_publication(fixture.base(), local, direct_slot, ready, true);
+        scheduler_protocol_payload_publication(fixture.base(), local, direct_slot, ready, false);
         EXPECT_EQ(execution->publication_count, first_execution.publication_count);
         EXPECT_EQ(execution->publication_before_cycles, first_execution.publication_before_cycles);
         EXPECT_EQ(execution->publication_after_cycles, first_execution.publication_after_cycles);

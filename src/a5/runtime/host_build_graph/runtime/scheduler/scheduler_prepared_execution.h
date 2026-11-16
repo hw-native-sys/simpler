@@ -15,8 +15,6 @@
 #include "scheduler_prepared_layout.h"
 #include "scheduler_scalar_trace.h"
 
-enum class PreparedAccessResult : uint8_t { READY, ERROR };
-
 struct SchedulerPreparedHandle {
     uint64_t execution_index{UINT64_MAX};
     uint64_t claimed_state{0};
@@ -197,13 +195,11 @@ static inline __aicore__ bool scheduler_execution_token_handle_valid(
     if (base == nullptr || prepared == nullptr || handle == nullptr || worker_id >= PLATFORM_MAX_CORES ||
         handle->execution_index >= prepared->execution_count)
         return false;
-    const uint64_t expected =
-        scheduler_prepared_state(phase, worker_id, scheduler_prepared_generation(handle->claimed_state)) |
-        SCHEDULER_PREPARED_BINDING_READY;
+    const uint64_t expected = scheduler_prepared_state(phase, worker_id);
     return handle->claimed_state == expected;
 }
 
-static inline __aicore__ PreparedAccessResult scheduler_receive_execution_token(
+static inline __aicore__ bool scheduler_receive_execution_token(
     __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, int64_t task_ref, uint32_t block, uint8_t lane,
     SchedulerPreparedHandle *handle
 ) {
@@ -222,13 +218,13 @@ static inline __aicore__ PreparedAccessResult scheduler_receive_execution_token(
             (handle->claimed_state & ~UINT64_C(255)) | static_cast<uint64_t>(SchedulerPreparedPhase::FAILED);
         if (scheduler_gm_compare_exchange(control->state, handle->claimed_state, failed) == handle->claimed_state)
             handle->claimed_state = failed;
-        return PreparedAccessResult::ERROR;
+        return false;
     }
-    return PreparedAccessResult::READY;
+    return true;
 }
 
 // Fresh tickets identify one immutable Call; no peer may consume the same ticket.
-static inline __aicore__ PreparedAccessResult scheduler_acquire_execution_token(
+static inline __aicore__ bool scheduler_acquire_execution_token(
     __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, uint32_t worker_id, int64_t task_ref,
     uint32_t block, uint8_t lane, SchedulerPreparedHandle *handle
 ) {
@@ -237,19 +233,16 @@ static inline __aicore__ PreparedAccessResult scheduler_acquire_execution_token(
     if (base == nullptr || handle == nullptr || worker_id >= PLATFORM_MAX_CORES ||
         !scheduler_prepared_execution_index(base, prepared, task_ref, block, lane, &index) ||
         (handle->execution_index != UINT64_MAX && handle->execution_index != index))
-        return PreparedAccessResult::ERROR;
+        return false;
     if (handle->claimed_state != 0)
         return scheduler_execution_token_handle_valid(
-                   base, prepared, worker_id, handle, SchedulerPreparedPhase::CLAIMED
-               ) ?
-                   PreparedAccessResult::READY :
-                   PreparedAccessResult::ERROR;
+            base, prepared, worker_id, handle, SchedulerPreparedPhase::CLAIMED
+        );
     handle->execution_index = index;
     auto *control = scheduler_prepared_control_at(base, prepared, index);
     const uint64_t initial = scheduler_prepared_state(SchedulerPreparedPhase::BUILT);
-    const uint64_t claimed =
-        scheduler_prepared_state(SchedulerPreparedPhase::CLAIMED, worker_id) | SCHEDULER_PREPARED_BINDING_READY;
-    if (scheduler_gm_compare_exchange(control->state, initial, claimed) != initial) return PreparedAccessResult::ERROR;
+    const uint64_t claimed = scheduler_prepared_state(SchedulerPreparedPhase::CLAIMED, worker_id);
+    if (scheduler_gm_compare_exchange(control->state, initial, claimed) != initial) return false;
     handle->claimed_state = claimed;
     return scheduler_receive_execution_token(base, prepared, task_ref, block, lane, handle);
 }
@@ -289,12 +282,11 @@ inline __aicore__ bool scheduler_group_handle_valid(
 ) {
     return base != nullptr && prepared != nullptr && handle != nullptr && coordinator < PLATFORM_MAX_CORES &&
            handle->execution_index < prepared->execution_count &&
-           handle->claimed_state ==
-               scheduler_prepared_state(phase, coordinator, scheduler_prepared_generation(handle->claimed_state));
+           handle->claimed_state == scheduler_prepared_state(phase, coordinator);
 }
 
 // Only the first active Call is a group anchor. Reservation never executes that lane.
-static inline __aicore__ PreparedAccessResult scheduler_reserve_group_execution(
+static inline __aicore__ bool scheduler_reserve_group_execution(
     __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, uint32_t coordinator, int64_t task_ref,
     uint32_t block, SchedulerPreparedHandle *handle
 ) {
@@ -304,14 +296,14 @@ static inline __aicore__ PreparedAccessResult scheduler_reserve_group_execution(
     if (handle == nullptr || coordinator >= PLATFORM_MAX_CORES || handle->claimed_state != 0 ||
         !scheduler_group_anchor_index(base, prepared, task_ref, block, &index, &lane) ||
         (handle->execution_index != UINT64_MAX && handle->execution_index != index))
-        return PreparedAccessResult::ERROR;
+        return false;
     handle->execution_index = index;
     const uint64_t initial = scheduler_prepared_state(SchedulerPreparedPhase::BUILT);
     const uint64_t reserved = scheduler_prepared_state(SchedulerPreparedPhase::GROUP_RESERVED, coordinator);
     auto *control = scheduler_prepared_control_at(base, prepared, index);
-    if (scheduler_gm_compare_exchange(control->state, initial, reserved) != initial) return PreparedAccessResult::ERROR;
+    if (scheduler_gm_compare_exchange(control->state, initial, reserved) != initial) return false;
     handle->claimed_state = reserved;
-    return PreparedAccessResult::READY;
+    return true;
 }
 
 static inline __aicore__ bool scheduler_arm_group_execution(
@@ -321,9 +313,7 @@ static inline __aicore__ bool scheduler_arm_group_execution(
     SchedulerScalarScope scalar_scope(SchedPhaseKind::ScalarGroupArm);
     if (!scheduler_group_handle_valid(base, prepared, coordinator, handle, SchedulerPreparedPhase::GROUP_RESERVED))
         return false;
-    const uint64_t armed = scheduler_prepared_state(
-        SchedulerPreparedPhase::GROUP_ARMED, coordinator, scheduler_prepared_generation(handle->claimed_state)
-    );
+    const uint64_t armed = scheduler_prepared_state(SchedulerPreparedPhase::GROUP_ARMED, coordinator);
     auto *control = scheduler_prepared_control_at(base, prepared, handle->execution_index);
     if (scheduler_gm_compare_exchange(control->state, handle->claimed_state, armed) != handle->claimed_state)
         return false;
@@ -332,7 +322,7 @@ static inline __aicore__ bool scheduler_arm_group_execution(
 }
 
 // SSBUF arming authorizes the actual anchor lane; its coordinator is not an executor surrogate.
-static inline __aicore__ PreparedAccessResult scheduler_acquire_group_lane(
+static inline __aicore__ bool scheduler_acquire_group_lane(
     __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, uint32_t worker, uint32_t coordinator,
     int64_t task_ref, uint32_t block, uint8_t lane, uint64_t armed_state, SchedulerPreparedHandle *handle
 ) {
@@ -341,23 +331,17 @@ static inline __aicore__ PreparedAccessResult scheduler_acquire_group_lane(
     uint8_t anchor_lane = UINT8_MAX;
     if (handle == nullptr || worker >= PLATFORM_MAX_CORES || coordinator >= PLATFORM_MAX_CORES ||
         !scheduler_group_anchor_index(base, prepared, task_ref, block, &anchor, &anchor_lane))
-        return PreparedAccessResult::ERROR;
+        return false;
     if (lane != anchor_lane)
         return scheduler_acquire_execution_token(base, prepared, worker, task_ref, block, lane, handle);
-    if (handle->execution_index != UINT64_MAX && handle->execution_index != anchor) return PreparedAccessResult::ERROR;
+    if (handle->execution_index != UINT64_MAX && handle->execution_index != anchor) return false;
     if (handle->claimed_state != 0)
-        return scheduler_execution_token_handle_valid(base, prepared, worker, handle, SchedulerPreparedPhase::CLAIMED) ?
-                   PreparedAccessResult::READY :
-                   PreparedAccessResult::ERROR;
+        return scheduler_execution_token_handle_valid(base, prepared, worker, handle, SchedulerPreparedPhase::CLAIMED);
     auto *control = scheduler_prepared_control_at(base, prepared, anchor);
     const uint64_t observed = armed_state;
-    const uint32_t generation = scheduler_prepared_generation(observed);
-    if (observed != scheduler_prepared_state(SchedulerPreparedPhase::GROUP_ARMED, coordinator, generation))
-        return PreparedAccessResult::ERROR;
-    const uint64_t claimed = scheduler_prepared_state(SchedulerPreparedPhase::CLAIMED, worker, generation) |
-                             SCHEDULER_PREPARED_BINDING_READY;
-    if (scheduler_gm_compare_exchange(control->state, observed, claimed) != observed)
-        return PreparedAccessResult::ERROR;
+    if (observed != scheduler_prepared_state(SchedulerPreparedPhase::GROUP_ARMED, coordinator)) return false;
+    const uint64_t claimed = scheduler_prepared_state(SchedulerPreparedPhase::CLAIMED, worker);
+    if (scheduler_gm_compare_exchange(control->state, observed, claimed) != observed) return false;
     handle->execution_index = anchor;
     handle->claimed_state = claimed;
     return scheduler_receive_execution_token(base, prepared, task_ref, block, lane, handle);

@@ -171,10 +171,10 @@ protected:
     }
 
     const Graph *published_definition() {
-        const GraphHostImageList published = graph_host_definitions(*graph_state);
-        EXPECT_EQ(published.entries.size(), 1u);
-        if (published.entries.empty()) return nullptr;
-        const GraphHostImage &entry = published.entries.front();
+        const std::vector<GraphHostImage> published = graph_host_definitions(*graph_state);
+        EXPECT_EQ(published.size(), 1u);
+        if (published.empty()) return nullptr;
+        const GraphHostImage &entry = published.front();
         EXPECT_NE(entry.object_offset, GRAPH_NO_OBJECT_OFFSET) << "the staging arena is sized to hold this image";
         return reinterpret_cast<const Graph *>(
             definition_staging.data() + entry.object_offset + sizeof(GraphImageHeader)

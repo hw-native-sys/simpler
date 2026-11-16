@@ -266,12 +266,9 @@ TEST(HbgErrorIdentity, PurePreparationFailureNamesTheExactFillingBlockAmongTwoOw
     }
     SchedulerReadyClaim ready{};
     ready.task_ref = 0;
-    EXPECT_EQ(
-        scheduler_prepare_dispatch_slot(
-            fixture.graph.graph(), fixture.base(), local, fixture.run(), {1}, ready, metadata, 0, 1
-        ),
-        PreparedAccessResult::ERROR
-    );
+    EXPECT_FALSE(scheduler_prepare_dispatch_slot(
+        fixture.graph.graph(), fixture.base(), local, fixture.run(), {1}, ready, metadata, 0, 1
+    ));
     EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED));
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, 0, 2, UINT64_MAX, 1, 1}));
 }
@@ -397,25 +394,32 @@ TEST(HbgErrorIdentity, AicpuFirstWriterPublishesUnknownRatherThanStaleAicoreIden
         );
 }
 
-TEST(HbgErrorIdentity, OrdinarySingleBlockPreparationHasKnownBlockWithoutClaimingAnAdmissionOrder) {
-    ErrorFixture fixture;
-    auto *local = fixture.locals[1];
-    local->admission = nullptr;
-    local->slots[0].state = SchedulerDispatchSlotState::FILLING;
-    auto &metadata = fixture.storage.metadata[0];
-    metadata.active_mask = LaneMask::aiv0();
-    metadata.logical_block_num = 1;
-    metadata.flags = SCHEDULER_TASK_EXECUTABLE;
-    SchedulerReadyClaim ready{};
-    ready.task_ref = 0;
-    EXPECT_EQ(
-        scheduler_prepare_dispatch_slot(
-            fixture.graph.graph(), fixture.base(), local, fixture.run(), {0}, ready, metadata, 0, 1
-        ),
-        PreparedAccessResult::ERROR
-    );
-    EXPECT_EQ(read_identity(*fixture.run()), (Identity{UINT64_MAX, UINT64_MAX, 0, UINT64_MAX, 1, 1}));
-    EXPECT_EQ(read_valid_fields(*fixture.run()), 52u);
+TEST(HbgErrorIdentity, PreparationFailureKeepsKnownBlockWithoutClaimingAnAdmissionOrder) {
+    for (uint32_t corruption : {0u, 1u, 2u}) {
+        ErrorFixture fixture;
+        auto *local = fixture.locals[1];
+        local->admission = nullptr;
+        local->slots[0].state = SchedulerDispatchSlotState::FILLING;
+        auto &metadata = fixture.storage.metadata[0];
+        metadata.active_mask = LaneMask::aiv0();
+        metadata.logical_block_num = 1;
+        metadata.flags = SCHEDULER_TASK_EXECUTABLE;
+        if (corruption == 1) metadata.flags |= SCHEDULER_TASK_HAS_PREDICATE;
+        const uint8_t subtask = corruption == 2 ? UINT8_MAX : 1;
+        SchedulerReadyClaim ready{};
+        ready.task_ref = 0;
+        EXPECT_FALSE(scheduler_prepare_dispatch_slot(
+            fixture.graph.graph(), fixture.base(), local, fixture.run(), {0}, ready, metadata, 0, subtask
+        ));
+        EXPECT_EQ(read_identity(*fixture.run()), (Identity{UINT64_MAX, UINT64_MAX, 0, UINT64_MAX, 1, 1}));
+        EXPECT_EQ(read_valid_fields(*fixture.run()), 52u);
+        EXPECT_EQ(
+            fixture.run()->error_site, static_cast<uint64_t>(
+                                           corruption == 0 ? SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED :
+                                                             SchedulerErrorSite::DISPATCH_INVALID_SHAPE
+                                       )
+        );
+    }
 }
 
 TEST(HbgErrorIdentity, NonExecutingCompletionNamesTheSlotWithoutGuessingFromTheOtherSlot) {

@@ -900,7 +900,7 @@ TEST_F(HbgRetirementWiring, ResidentSwimlaneAccumulatesInterleavedEpochsAndKeeps
     for (bool first : {false, true, false, true, false, false}) {
         const uint64_t epoch = first ? 41 : 42;
         state.bind(*runtime, epoch);
-        state.trace.dispatch_scheduler_worker_id = state.trace.complete_scheduler_worker_id = 2;
+        state.trace.worker_id = 2;
         auto &transport = first ? *a : *b;
         transport.arm(epoch);
         ASSERT_TRUE(lifecycle.settle_run_diagnostics(runtime.get(), true));
@@ -943,8 +943,8 @@ TEST_F(HbgRetirementWiring, ResidentSwimlaneAccumulatesInterleavedEpochsAndKeeps
     const std::string prefix = R"({"nested":{"streams":[]},"streams": [)";
     const std::string suffix =
         R"(],"prepared_calls":{"schema":"hbg-prepared-calls","run_epoch":41,"source":"host",)"
-        R"("columns":["execution_index","node_ref","task_id","block_idx","subtask_slot","owner","phase","generation"],)"
-        R"("records":[[0,0,0,0,0,2,3,1]]}})";
+        R"("columns":["execution_index","node_ref","task_id","block_idx","subtask_slot","owner","phase"],)"
+        R"("records":[[0,0,0,0,0,2,3]]}})";
     for (const bool populated : {false, true}) {
         SCOPED_TRACE(populated);
         auto body = populated ? json.substr(body_start, json.rfind(']') - body_start) : " \n ";
@@ -953,9 +953,9 @@ TEST_F(HbgRetirementWiring, ResidentSwimlaneAccumulatesInterleavedEpochsAndKeeps
         EXPECT_EQ(phase_json(*a, &snapshot, false), prefix + body + (populated ? "," : "") + ordinary_body + suffix);
     }
     for (size_t i = 0; i < 2; ++i)
-        EXPECT_EQ(a->core[1][i].run_epoch, 41u);
+        EXPECT_EQ(a->core[2][i].run_epoch, 41u);
     for (size_t i = 0; i < 4; ++i)
-        EXPECT_EQ(b->core[1][i].run_epoch, 42u);
+        EXPECT_EQ(b->core[2][i].run_epoch, 42u);
 }
 
 TEST_F(HbgRetirementWiring, ResidentSwimlaneDoesNotReadUnretiredOrStaleTraceAndZeroReplayStaysEmpty) {
@@ -1008,7 +1008,7 @@ TEST_F(HbgRetirementWiring, CanonicalSnapshotCannotAttributeAnEntirelyDroppedPar
     auto snapshot_transport = std::make_unique<SwimlaneTransport>();
     ResidentSwimlaneState state;
     state.bind(*runtime, 41);
-    state.trace.dispatch_scheduler_worker_id = state.trace.complete_scheduler_worker_id = 2;
+    state.trace.worker_id = 2;
     runtime->dev.workers[2].core_type = CoreType::AIV;
     runtime->dev.workers[2].physical_core_id = 37;
     snapshot_transport->arm(41);
@@ -1038,7 +1038,6 @@ TEST_F(HbgRetirementWiring, ResidentSwimlaneFinalFlushNeverWaitsOrPublishesAnUnp
     auto transport = std::make_unique<SwimlaneTransport>();
     ResidentSwimlaneState state;
     state.bind(*runtime, 41);
-    state.trace.dispatch_scheduler_worker_id = state.trace.complete_scheduler_worker_id = 2;
     transport->arm(41);
     AicoreLifecycle lifecycle;
     AicoreLifecycleTestPeer::seed(lifecycle, kAddrs);

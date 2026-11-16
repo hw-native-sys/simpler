@@ -52,7 +52,6 @@ struct alignas(64) SchedulerNativeGraphHeader {
     uint64_t instances_offset;
     uint64_t readonly_end_offset;
     uint64_t run_epoch;
-    uint32_t header_bytes;
 };
 
 struct alignas(64) SchedulerGraphTemplate {

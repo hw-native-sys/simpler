@@ -100,7 +100,6 @@ struct SchedulerAdmissionLocalState {
     uint64_t epoch{0};
     uint64_t control_offset{0};
     uint64_t records_offset{0};
-    uint64_t record_stride{0};
     uint64_t log_offset{0};
     uint64_t capacity{0};
     int64_t pending_task_ref{SCHEDULER_TASK_REF_INVALID};
@@ -127,11 +126,7 @@ struct SchedulerAdmissionLocalState {
 };
 
 static_assert(sizeof(SchedulerGmMixLocalState) == 64, "GM group-local state size changed");
-static_assert(sizeof(SchedulerAdmissionLocalState) == 184, "admission-local state size changed");
-
-struct SchedulerFreeSlotClaim {
-    uint32_t slot_index{UINT32_MAX};
-};
+static_assert(sizeof(SchedulerAdmissionLocalState) == 176, "admission-local state size changed");
 
 struct SchedulerLocalSlotState {
     SchedulerPreparedHandle prepared{};
@@ -140,7 +135,6 @@ struct SchedulerLocalSlotState {
     uint8_t subtask_slot{UINT8_MAX};
     uint32_t block_idx{0};
     SchedulerPredicateState predicate{SchedulerPredicateState::UNEVALUATED};
-    bool args_observed{false};
     bool gm_mix{false};
     bool cluster_mix{false};
     bool execution_token{false};
@@ -194,7 +188,7 @@ struct SchedulerAsyncLocalState;
 inline constexpr uint32_t SCHEDULER_EXECUTION_TOKEN_COUNT = 4;
 inline constexpr uint32_t SCHEDULER_TASK_PROOF_CACHE_COUNT = 16;
 enum class SchedulerTaskProof : uint8_t { NONE, SUPPLY_CLOSED, DONE };
-enum class SchedulerExecutionTokenPhase : uint8_t { EMPTY, TICKETED, ACQUIRING, WAIT_FANIN };
+enum class SchedulerExecutionTokenPhase : uint8_t { EMPTY, TICKETED, WAIT_FANIN };
 
 struct SchedulerExecutionToken {
     SchedulerPreparedHandle prepared{};
@@ -257,9 +251,6 @@ struct SchedulerLocalState {
     inline __aicore__ const SchedulerLocalSlotState *own_slots() const { return slots; }
     inline __aicore__ uint64_t worker_id() const {
         return config.self_lane < PLATFORM_CORES_PER_BLOCKDIM ? config.worker_ids[config.self_lane] : UINT64_MAX;
-    }
-    inline __aicore__ SchedulerLocalSlotState *slot_state(const SchedulerFreeSlotClaim &claim) {
-        return &slots[claim.slot_index];
     }
     inline __aicore__ int32_t timing_slot(uint32_t slot) const {
         return profiling != nullptr ? profiling->timing_slots[slot] : -1;
@@ -806,7 +797,6 @@ inline __aicore__ void scheduler_initialize_free_slot(SchedulerLocalSlotState *l
     local_slot->execution_token = false;
     local_slot->preclaim_order = UINT64_MAX;
     local_slot->block_idx = 0;
-    local_slot->args_observed = false;
     local_slot->predicate = SchedulerPredicateState::UNEVALUATED;
 }
 
@@ -876,35 +866,33 @@ static inline __aicore__ SchedulerTaskMetadata scheduler_load_dispatch_metadata(
 
 // A task-local ticket reserves one canonical execution index. Its owner keeps
 // that reservation across owner-local slot restoration without reserving another block.
-static inline __aicore__ __attribute__((noinline)) PreparedAccessResult scheduler_prepare_dispatch_slot(
+static inline __aicore__ __attribute__((noinline)) bool scheduler_prepare_dispatch_slot(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
-    __gm__ SchedulerRunControl *run_control, const SchedulerFreeSlotClaim &slot_claim,
-    const SchedulerReadyClaim &ready_claim, const SchedulerTaskMetadata &metadata, uint64_t profiling_level,
-    uint8_t subtask_slot, uint64_t *prepare_start_cycles = nullptr
+    __gm__ SchedulerRunControl *run_control, uint32_t slot_index, const SchedulerReadyClaim &ready_claim,
+    const SchedulerTaskMetadata &metadata, uint64_t profiling_level, uint8_t subtask_slot,
+    uint64_t *prepare_start_cycles = nullptr
 ) {
     SchedulerScalarScope scalar_payload(scheduler, SchedPhaseKind::ScalarPayload, ready_claim.task_ref);
     if (scheduler == nullptr || !scheduler_task_ref_valid(graph, ready_claim.task_ref) ||
         scheduler->worker_id() >= scheduler->config.runtime_worker_count ||
-        slot_claim.slot_index >= SCHEDULER_PENDING_SLOT_COUNT ||
-        scheduler->config.self_lane >= PLATFORM_CORES_PER_BLOCKDIM)
-        return PreparedAccessResult::ERROR;
+        slot_index >= SCHEDULER_PENDING_SLOT_COUNT || scheduler->config.self_lane >= PLATFORM_CORES_PER_BLOCKDIM)
+        return false;
     if (prepare_start_cycles != nullptr)
         *prepare_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
     const LaneMask lanes = scheduler_task_lanes(metadata);
-    if (subtask_slot == UINT8_MAX) subtask_slot = scheduler_metadata_single_subtask_slot(lanes);
-    auto &slot = *scheduler->slot_state(slot_claim);
-    if (slot.state != SchedulerDispatchSlotState::FILLING) return PreparedAccessResult::ERROR;
+    auto &slot = scheduler->slots[slot_index];
+    if (slot.state != SchedulerDispatchSlotState::FILLING) return false;
     const auto *target = scheduler_worker_context_at(scheduler_state_base, scheduler, scheduler->worker_id());
     if (subtask_slot >= PLATFORM_CORES_PER_BLOCKDIM || !lanes.has(static_cast<SubtaskSlot>(subtask_slot)) ||
         (target->core_type != static_cast<int32_t>(CoreType::AIC) &&
          target->core_type != static_cast<int32_t>(CoreType::AIV)) ||
-        !scheduler_task_is_executable(metadata.flags) ||
+        !scheduler_task_is_executable(metadata.flags) || scheduler_task_has_predicate(metadata.flags) ||
         scheduler_metadata_core_type_index(subtask_slot) != scheduler->config.self_core_type) {
         scheduler_record_dispatch_error(
             run_control, ready_claim.task_ref, SchedulerGraphResult::UNSUPPORTED_SHAPE, &graph, scheduler, &slot,
             metadata, SchedulerErrorSite::DISPATCH_INVALID_SHAPE
         );
-        return PreparedAccessResult::ERROR;
+        return false;
     }
     slot.task_ref = ready_claim.task_ref;
     slot.subtask_slot = subtask_slot;
@@ -912,43 +900,31 @@ static inline __aicore__ __attribute__((noinline)) PreparedAccessResult schedule
         scheduler_state_base, scheduler->config.prepared, scheduler->worker_id(), ready_claim.task_ref, slot.block_idx,
         subtask_slot, &slot.prepared
     );
-    if (result == PreparedAccessResult::ERROR) {
+    if (!result) {
         scheduler_record_dispatch_error(
             run_control, ready_claim.task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler, &slot,
             metadata, SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED
         );
-    }
-    if (result != PreparedAccessResult::READY) return result;
-    if (scheduler_task_has_predicate(metadata.flags) && slot.predicate == SchedulerPredicateState::UNEVALUATED) {
-        const auto predicate = scheduler_evaluate_task_predicate(graph, ready_claim.task_ref);
-        if (predicate == SchedulerPredicateResult::MALFORMED) {
-            scheduler_record_dispatch_error(
-                run_control, ready_claim.task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler, &slot,
-                metadata, SchedulerErrorSite::DISPATCH_INVALID_PREDICATE
-            );
-            return PreparedAccessResult::ERROR;
-        }
-        slot.predicate =
-            predicate == SchedulerPredicateResult::PASS ? SchedulerPredicateState::PASS : SchedulerPredicateState::FAIL;
+        return false;
     }
     auto *binding =
         scheduler_execution_binding_at(scheduler_state_base, scheduler->config.prepared, slot.prepared.execution_index);
     binding->global_context.sub_block_id = scheduler_task_is_mix(metadata.flags) ?
                                                (scheduler->config.self_lane == 2 ? 1 : 0) :
                                                (subtask_slot == 2 ? 1 : 0);
-    return PreparedAccessResult::READY;
+    return true;
 }
 
 static inline __aicore__ void scheduler_stage_dispatch_slot(
-    __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler, const SchedulerFreeSlotClaim &slot_claim,
+    __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler, uint32_t slot_index,
     const SchedulerReadyClaim &ready_claim, const SchedulerTaskMetadata &metadata, uint8_t subtask_slot
 ) {
-    SchedulerLocalSlotState *local_slot = scheduler->slot_state(slot_claim);
+    SchedulerLocalSlotState *local_slot = &scheduler->slots[slot_index];
     auto *binding = scheduler_execution_binding_at(
         scheduler_state_base, scheduler->config.prepared, local_slot->prepared.execution_index
     );
     local_slot->task_ref = ready_claim.task_ref;
-    scheduler->set_timing_slot(slot_claim.slot_index, metadata.timing_slot);
+    scheduler->set_timing_slot(slot_index, metadata.timing_slot);
     local_slot->state = SchedulerDispatchSlotState::READY;
     local_slot->subtask_slot = subtask_slot;
     SchedulerScalarScope scalar_cache(scheduler, SchedPhaseKind::ScalarCachePublish, ready_claim.task_ref);
@@ -957,7 +933,7 @@ static inline __aicore__ void scheduler_stage_dispatch_slot(
 }
 
 static inline __aicore__ void scheduler_commit_dispatch_slot(
-    __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler, const SchedulerFreeSlotClaim &slot_claim,
+    __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler, uint32_t slot_index,
     const SchedulerReadyClaim &ready_claim, const SchedulerTaskMetadata &metadata, uint64_t profiling_level,
     uint8_t subtask_slot, uint64_t prepare_start_cycles
 ) {
@@ -966,34 +942,31 @@ static inline __aicore__ void scheduler_commit_dispatch_slot(
     const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
     const uint64_t dispatch_start_cycles = prepare_start_cycles;
     const uint64_t ready_publish_cycles = schedule_timing_enabled ? scheduler_cycles() : 0;
-    scheduler_protocol_payload_publication(scheduler_state_base, scheduler, slot_claim, ready_claim, true);
+    scheduler_protocol_payload_publication(scheduler_state_base, scheduler, slot_index, ready_claim, true);
     if (scheduler->direct_slot != nullptr && !scheduler_has_direct_slot(scheduler) && scheduler->local_ready_mask == 0)
-        *scheduler->direct_slot = slot_claim.slot_index;
-    else scheduler_local_ready_publish(scheduler, slot_claim.slot_index);
-    scheduler_protocol_payload_publication(scheduler_state_base, scheduler, slot_claim, ready_claim, false);
+        *scheduler->direct_slot = slot_index;
+    else scheduler_local_ready_publish(scheduler, slot_index);
+    scheduler_protocol_payload_publication(scheduler_state_base, scheduler, slot_index, ready_claim, false);
     if (task_timing_enabled) {
         __gm__ SchedulerTaskTrace *traces =
             scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, scheduler->profiling->trace_cells_offset);
         __gm__ SchedulerTaskTrace *trace = &traces[scheduler_task_trace_index(
             metadata.trace_index_base, scheduler_task_lanes(metadata), static_cast<SubtaskSlot>(subtask_slot),
-            scheduler->slot_state(slot_claim)->block_idx
+            scheduler->slots[slot_index].block_idx
         )];
         trace->worker_id = scheduler->worker_id();
         trace->task_ref = static_cast<uint64_t>(ready_claim.task_ref);
         if (phase_timing_enabled) {
             if (ready_claim.source == SchedulerReadySource::COOPERATIVE) {
-                trace->state_probe_scheduler_worker_id = UINT64_MAX;
                 trace->state_probe_start_cycles = 0;
                 trace->state_probe_end_cycles = 0;
             } else {
-                trace->state_probe_scheduler_worker_id = scheduler->worker_id();
                 trace->state_probe_start_cycles = ready_claim.state_probe_start_cycles;
                 trace->state_probe_end_cycles = ready_claim.state_probe_end_cycles == 0 ?
                                                     dispatch_start_cycles :
                                                     ready_claim.state_probe_end_cycles;
             }
             trace->dispatch_start_cycles = dispatch_start_cycles;
-            trace->dispatch_scheduler_worker_id = scheduler->worker_id();
             trace->dispatch_loop_iter = scheduler->profiling->loop_iter;
         }
         scheduler_publish_cache_line(trace);
@@ -1003,42 +976,42 @@ static inline __aicore__ void scheduler_commit_dispatch_slot(
 }
 
 static inline __aicore__ __attribute__((noinline)) void scheduler_publish_dispatch_slot(
-    __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler, const SchedulerFreeSlotClaim &slot_claim,
+    __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler, uint32_t slot_index,
     const SchedulerReadyClaim &ready_claim, const SchedulerTaskMetadata &metadata, uint64_t profiling_level,
     uint8_t subtask_slot, uint64_t prepare_start_cycles = 0
 ) {
     SchedulerScalarScope scalar_detail(scheduler, SchedPhaseKind::ScalarDispatchPublish, ready_claim.task_ref);
-    scheduler_stage_dispatch_slot(scheduler_state_base, scheduler, slot_claim, ready_claim, metadata, subtask_slot);
+    scheduler_stage_dispatch_slot(scheduler_state_base, scheduler, slot_index, ready_claim, metadata, subtask_slot);
     scheduler_cache_barrier();
     scheduler_commit_dispatch_slot(
-        scheduler_state_base, scheduler, slot_claim, ready_claim, metadata, profiling_level, subtask_slot,
+        scheduler_state_base, scheduler, slot_index, ready_claim, metadata, profiling_level, subtask_slot,
         prepare_start_cycles
     );
 }
 
 static inline __aicore__ bool scheduler_fill_dispatch_slot(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
-    __gm__ SchedulerRunControl *run_control, const SchedulerFreeSlotClaim &slot_claim,
-    const SchedulerReadyClaim &ready_claim, uint64_t profiling_level
+    __gm__ SchedulerRunControl *run_control, uint32_t slot_index, const SchedulerReadyClaim &ready_claim,
+    uint64_t profiling_level
 ) {
     SchedulerScalarScope scalar_detail(scheduler, SchedPhaseKind::ScalarDispatchFill, ready_claim.task_ref);
     if (scheduler == nullptr || scheduler->config.self_lane >= PLATFORM_CORES_PER_BLOCKDIM ||
-        slot_claim.slot_index >= SCHEDULER_PENDING_SLOT_COUNT)
+        slot_index >= SCHEDULER_PENDING_SLOT_COUNT)
         return false;
-    auto &slot = *scheduler->slot_state(slot_claim);
+    auto &slot = scheduler->slots[slot_index];
     if (slot.state == SchedulerDispatchSlotState::FREE) slot.state = SchedulerDispatchSlotState::FILLING;
     const SchedulerTaskMetadata metadata =
         scheduler_load_dispatch_metadata(scheduler_state_base, scheduler, ready_claim.task_ref, profiling_level);
     if (scheduler_task_is_inline(metadata.flags)) return false;
     const uint8_t subtask_slot = scheduler_metadata_single_subtask_slot(scheduler_task_lanes(metadata));
     uint64_t prepare_start_cycles = 0;
-    const auto prepared = scheduler_prepare_dispatch_slot(
-        graph, scheduler_state_base, scheduler, run_control, slot_claim, ready_claim, metadata, profiling_level,
-        subtask_slot, &prepare_start_cycles
-    );
-    if (prepared == PreparedAccessResult::ERROR) return false;
+    if (!scheduler_prepare_dispatch_slot(
+            graph, scheduler_state_base, scheduler, run_control, slot_index, ready_claim, metadata, profiling_level,
+            subtask_slot, &prepare_start_cycles
+        ))
+        return false;
     scheduler_publish_dispatch_slot(
-        scheduler_state_base, scheduler, slot_claim, ready_claim, metadata, profiling_level, subtask_slot,
+        scheduler_state_base, scheduler, slot_index, ready_claim, metadata, profiling_level, subtask_slot,
         prepare_start_cycles
     );
     return true;

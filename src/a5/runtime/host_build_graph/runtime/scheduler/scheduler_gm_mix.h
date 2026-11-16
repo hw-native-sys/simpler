@@ -31,7 +31,7 @@ static inline __aicore__ bool scheduler_gm_mix_context_valid(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
 ) {
     if constexpr (StaticContextValidated && !ReturningLane)
-        return scheduler_admission_detail::active_run_valid(graph, base, local, run, local->admission);
+        return scheduler_admission_context_valid(graph, base, local, run, local->admission);
     auto *admission = local->admission;
     if constexpr (ReturningLane) {
         // A real return still releases its resource after a run error. Epoch
@@ -421,12 +421,10 @@ static inline __aicore__ bool scheduler_gm_mix_prepare_lane(
     SchedulerReadyClaim ready{};
     ready.task_ref = admission.current_task_ref;
     ready.source = SchedulerReadySource::COOPERATIVE;
-    const SchedulerFreeSlotClaim claim{group.slot_index};
     SchedulerTaskMetadata metadata{};
     if (!retained) {
         slot.task_ref = admission.current_task_ref;
         slot.block_idx = group.block_idx;
-        slot.args_observed = true;
         slot.gm_mix = true;
         slot.subtask_slot = group.subtask_slot;
         slot.state = SchedulerDispatchSlotState::FILLING;
@@ -449,11 +447,10 @@ static inline __aicore__ bool scheduler_gm_mix_prepare_lane(
     }
     if (slot.prepared.claimed_state == 0) {
         metadata = scheduler_load_dispatch_metadata(base, local, ready.task_ref, profiling_level);
-        const auto prepared = scheduler_prepare_dispatch_slot(
-            graph, base, local, run, claim, ready, metadata, profiling_level, group.subtask_slot,
-            &group.prepare_start_cycles
-        );
-        if (prepared != PreparedAccessResult::READY)
+        if (!scheduler_prepare_dispatch_slot(
+                graph, base, local, run, group.slot_index, ready, metadata, profiling_level, group.subtask_slot,
+                &group.prepare_start_cycles
+            ))
             return scheduler_admission_fail(
                 graph, local, run, ready.task_ref, SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED
             );
@@ -475,7 +472,7 @@ static inline __aicore__ bool scheduler_gm_mix_prepare_lane(
         );
     if (retained) metadata = scheduler_load_dispatch_metadata(base, local, ready.task_ref, profiling_level);
     scheduler_publish_dispatch_slot(
-        base, local, claim, ready, metadata, profiling_level, group.subtask_slot, group.prepare_start_cycles
+        base, local, group.slot_index, ready, metadata, profiling_level, group.subtask_slot, group.prepare_start_cycles
     );
     group.phase = SchedulerGmMixPhase::RUNNING;
     *progress = true;

@@ -64,9 +64,10 @@ global kernel contexts; their presence does not imply AICPU task dispatch.
 
 `dispatch_time` marks dispatch publication completion; `finish_time` marks the
 scheduler's processing of the returned execution. Phase records distinguish
-Completion, Resolve, StateProbe, Dispatch and Refill. A directly retained
-successor does not invent a ready-pool probe. A ready-pool replacement retains
-its actual probe even when it reuses a completed local slot.
+Bootstrap, StateProbe, Dispatch, Complete and measured Idle. Detailed Scalar
+phases identify the functions and primitives that produce records. Execution-token
+StateProbe acquisition envelopes may overlap within a discovery batch; Scalar
+intervals provide the exclusive-work accounting.
 
 At level 3, consecutive taskless iterations may coalesce into `idle` intervals.
 Fixed-capacity trace buffers do not wrap silently: dropped/truncated indicators

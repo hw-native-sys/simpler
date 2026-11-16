@@ -219,12 +219,12 @@ TEST(SchedulerAsyncStateTest, FailureWriterCannotTakeOverAnotherOwner) {
 
 TEST(SchedulerAsyncStateTest, FailedGroupRetainsItsPendingObligation) {
     SchedulerAsyncTaskJoin join{};
-    ASSERT_EQ(scheduler_async_pending::register_group(join).result, scheduler_async_pending::Result::PENDING);
+    ASSERT_EQ(scheduler_async_pending::register_group(join), scheduler_async_pending::Result::PENDING);
     SchedulerAsyncLease group{};
     const auto published = scheduler_async_lease_publish(group);
     const auto owner = scheduler_async_lease_try_claim(group, published.word);
     ASSERT_EQ(owner.result, LeaseResult::SUCCESS);
-    ASSERT_EQ(scheduler_async_pending::close_computation(join).result, scheduler_async_pending::Result::PENDING);
+    ASSERT_EQ(scheduler_async_pending::close_computation(join), scheduler_async_pending::Result::PENDING);
     ASSERT_EQ(scheduler_async_lease_fail(group, owner.word).result, LeaseResult::SUCCESS);
     EXPECT_TRUE(scheduler_async_pending::closed(join.word));
     EXPECT_EQ(scheduler_async_pending::pending(join.word), 1u);

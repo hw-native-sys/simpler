@@ -1816,7 +1816,6 @@ TEST_P(HbgOrdinaryTokenProbe, OrdinaryTokenRecordsDiscoveryAndAcquireBeforeDispa
     const auto &trace = traces[fixture.storage.metadata[0].trace_index_base];
     EXPECT_EQ(trace.task_ref, 0u);
     EXPECT_EQ(trace.worker_id, worker);
-    EXPECT_EQ(trace.state_probe_scheduler_worker_id, worker);
     EXPECT_GT(trace.state_probe_start_cycles, 0u);
     EXPECT_GE(trace.state_probe_end_cycles, trace.state_probe_start_cycles);
     EXPECT_GT(trace.dispatch_start_cycles, 0u);
@@ -1849,7 +1848,6 @@ TEST_P(HbgOrderedCooperativeProbe, CooperativeBlockDispatchDoesNotInventOrdinary
         const auto &trace = traces[fixture.storage.metadata[0].trace_index_base + block];
         EXPECT_EQ(trace.task_ref, 0u);
         EXPECT_EQ(trace.worker_id, executor);
-        EXPECT_EQ(trace.state_probe_scheduler_worker_id, UINT64_MAX);
         EXPECT_EQ(trace.state_probe_start_cycles, 0u);
         EXPECT_EQ(trace.state_probe_end_cycles, 0u);
         EXPECT_GT(trace.dispatch_start_cycles, 0u);
@@ -1969,7 +1967,6 @@ TEST_P(HbgOrderedDeferredPublication, DiscoveredSuccessorUsesDispatchAfterProduc
     EXPECT_EQ(trace.worker_id, resolver);
     EXPECT_GT(trace.dispatch_start_cycles, 0u);
     EXPECT_GE(trace.dispatch_end_cycles, trace.dispatch_start_cycles);
-    EXPECT_EQ(trace.state_probe_scheduler_worker_id, resolver);
     EXPECT_GT(trace.state_probe_start_cycles, 0u);
     EXPECT_GE(trace.state_probe_end_cycles, trace.state_probe_start_cycles);
     OrderedExecution successor{};
@@ -2383,8 +2380,7 @@ TEST(HbgOrderedProtocol, ConsumedPermitPreventsPayloadSnapshotFromBeingReplaced)
     const auto first = events[0];
     SchedulerReadyClaim ready{};
     ready.task_ref = 0;
-    SchedulerFreeSlotClaim claim{execution.slot};
-    scheduler_protocol_payload_publication(fixture.base(), fixture.locals[0], claim, ready, true);
+    scheduler_protocol_payload_publication(fixture.base(), fixture.locals[0], execution.slot, ready, true);
     EXPECT_EQ(events[0].publication_count, first.publication_count);
     EXPECT_EQ(events[0].publication_before_cycles, first.publication_before_cycles);
     EXPECT_EQ(events[0].publication_after_cycles, first.publication_after_cycles);
@@ -2401,8 +2397,7 @@ TEST(HbgOrderedProtocol, FinishedWorkerCannotPublishEvenAnUnsequencedPayloadSnap
     scheduler_protocol_finish(fixture.base(), local, true);
     SchedulerReadyClaim ready{};
     ready.task_ref = 0;
-    SchedulerFreeSlotClaim claim{0};
-    scheduler_protocol_payload_publication(fixture.base(), local, claim, ready, true);
+    scheduler_protocol_payload_publication(fixture.base(), local, 0, ready, true);
     const auto *events = scheduler_state_at<SchedulerProtocolExecutionTrace>(
         fixture.base(), fixture.storage.layout.protocol.executions_offset
     );
@@ -2426,8 +2421,7 @@ TEST(HbgOrderedProtocol, CooperativePayloadCannotBeRepublishedBeforeItsFirstPerm
     const auto first = events[0];
     SchedulerReadyClaim ready{};
     ready.task_ref = 0;
-    SchedulerFreeSlotClaim claim{0};
-    scheduler_protocol_payload_publication(fixture.base(), fixture.locals[0], claim, ready, true);
+    scheduler_protocol_payload_publication(fixture.base(), fixture.locals[0], 0, ready, true);
     EXPECT_EQ(events[0].publication_count, first.publication_count);
     EXPECT_EQ(events[0].pending_slot, first.pending_slot);
     const auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(

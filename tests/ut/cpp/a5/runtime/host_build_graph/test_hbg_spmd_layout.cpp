@@ -32,7 +32,7 @@ requirements(uint64_t workers, uint64_t cooperative, uint64_t mix, uint64_t sync
 
 SchedulerAdmissionRecord *record_at(void *base, const AicoreSchedulerLayout &layout, uint64_t task) {
     return scheduler_state_at<SchedulerAdmissionRecord>(
-        base, layout.admission_records_offset + task * layout.admission_record_stride
+        base, layout.admission_records_offset + task * sizeof(SchedulerAdmissionRecord)
     );
 }
 
@@ -58,7 +58,6 @@ void set_metadata(
 void expect_no_protocol_storage(const AicoreSchedulerLayout &layout) {
     EXPECT_EQ(layout.admission_control_offset, 0u);
     EXPECT_EQ(layout.admission_records_offset, 0u);
-    EXPECT_EQ(layout.admission_record_stride, 0u);
     EXPECT_EQ(layout.admission_log_offset, 0u);
     EXPECT_EQ(layout.group_mailboxes_offset, 0u);
     EXPECT_EQ(layout.mix_close_seals_offset, 0u);
@@ -73,7 +72,6 @@ void expect_summary_configuration(void *base, const AicoreSchedulerLayout &layou
     EXPECT_EQ(summary->worker_count, layout.spmd.worker_count);
     EXPECT_EQ(summary->cluster_count, layout.spmd.cluster_count);
     EXPECT_EQ(summary->admission_records_offset, layout.admission_records_offset);
-    EXPECT_EQ(summary->admission_record_stride, layout.admission_record_stride);
     EXPECT_EQ(summary->admission_log_offset, layout.admission_log_offset);
     EXPECT_EQ(summary->admission_control_offset, layout.admission_control_offset);
     EXPECT_EQ(summary->group_mailboxes_offset, layout.group_mailboxes_offset);
@@ -306,7 +304,6 @@ TEST_P(HbgSpmdWorkerLayout, OrdinaryGraphHasNoProtocolAllocation) {
 TEST_P(HbgSpmdWorkerLayout, PureSyncUsesOneRecordCacheLineWithoutMixStorage) {
     AicoreSchedulerLayout layout{};
     ASSERT_TRUE(scheduler_plan_layout(9, &layout, false, 0, requirements(GetParam(), 3, 0)));
-    EXPECT_EQ(layout.admission_record_stride, 64u);
     EXPECT_EQ(layout.admission_records_offset % 64, 0u);
     EXPECT_EQ(layout.admission_control_offset % 64, 0u);
     EXPECT_NE(layout.admission_log_offset, 0u);
@@ -318,10 +315,10 @@ TEST_P(HbgSpmdWorkerLayout, PureSyncUsesOneRecordCacheLineWithoutMixStorage) {
     expect_empty_protocol(storage.base(), layout);
     for (uint64_t task = 0; task < layout.task_count; ++task) {
         const auto *record = record_at(storage.base(), layout, task);
-        const uint64_t row = layout.admission_records_offset + task * layout.admission_record_stride;
+        const uint64_t row = layout.admission_records_offset + task * sizeof(SchedulerAdmissionRecord);
         EXPECT_EQ(row % 64, 0u);
         EXPECT_EQ(reinterpret_cast<const std::byte *>(record) - static_cast<const std::byte *>(storage.base()), row);
-        EXPECT_EQ(sizeof(*record), layout.admission_record_stride);
+        EXPECT_EQ(sizeof(*record), 64u);
     }
 }
 
@@ -335,7 +332,7 @@ TEST_P(HbgSpmdWorkerLayout, MixRegionsAreAlignedDisjointAndSizedToActualTopology
     EXPECT_EQ(layout.mix_close_seals_offset % alignof(SchedulerMixCloseSeal), 0u);
     std::vector<std::pair<uint64_t, uint64_t>> regions{
         {layout.admission_control_offset, sizeof(SchedulerAdmissionControl)},
-        {layout.admission_records_offset, layout.task_count * layout.admission_record_stride},
+        {layout.admission_records_offset, layout.task_count * sizeof(SchedulerAdmissionRecord)},
         {layout.admission_log_offset, layout.spmd.cooperative_task_count * sizeof(int64_t)},
         {layout.group_mailboxes_offset, layout.spmd.cluster_count * sizeof(SchedulerGroupMailbox)},
         {layout.mix_close_seals_offset, layout.mix_close_seal_count * sizeof(SchedulerMixCloseSeal)},
@@ -570,12 +567,11 @@ TEST(HbgSpmdLayout, AdmissionLogScalesWithCooperativeTasksNotAllTasksOrWorkerCap
     ASSERT_TRUE(scheduler_plan_layout(65, &one_cooperative, false, 0, requirements(108, 1, 0)));
     ASSERT_TRUE(scheduler_plan_layout(65, &seventeen_cooperative, false, 0, requirements(108, 17, 0)));
     EXPECT_EQ(one_cooperative.admission_records_offset, seventeen_cooperative.admission_records_offset);
-    EXPECT_EQ(one_cooperative.admission_record_stride, seventeen_cooperative.admission_record_stride);
     EXPECT_EQ(one_cooperative.admission_log_offset, seventeen_cooperative.admission_log_offset);
     EXPECT_EQ(seventeen_cooperative.total_size - one_cooperative.total_size, 128u);
     EXPECT_EQ(
         one_cooperative.admission_log_offset - one_cooperative.admission_records_offset,
-        65 * one_cooperative.admission_record_stride
+        65 * sizeof(SchedulerAdmissionRecord)
     );
 }
 
@@ -1008,7 +1004,7 @@ TEST(HbgProtocolTrace, CompactRunAndTraceLayoutSeparatesConcurrentWriters) {
     EXPECT_EQ(sizeof(SchedulerGraphSummary), 192u);
     EXPECT_EQ(sizeof(SchedulerRunControl), 384u + SCHEDULER_WORKER_CAPACITY * 64);
     EXPECT_EQ(sizeof(SchedulerTaskTrace), 256u);
-    EXPECT_EQ(offsetof(SchedulerGraphSummary, protocol_layout_offset), 96u);
+    EXPECT_EQ(offsetof(SchedulerGraphSummary, protocol_layout_offset), 88u);
     EXPECT_EQ(offsetof(SchedulerProtocolTaskTrace, completion), 64u);
     EXPECT_EQ(offsetof(SchedulerProtocolBlockTrace, lanes), 320u);
     EXPECT_EQ(sizeof(SchedulerProtocolLaneTrace), 256u);

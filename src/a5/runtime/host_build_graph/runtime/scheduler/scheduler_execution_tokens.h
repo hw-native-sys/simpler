@@ -31,12 +31,11 @@ static inline __aicore__ bool scheduler_execution_token_receive(
     SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarExecutionTokenReceive, token.task_ref);
     if (token.phase != SchedulerExecutionTokenPhase::TICKETED)
         return token.phase == SchedulerExecutionTokenPhase::WAIT_FANIN;
-    token.phase = SchedulerExecutionTokenPhase::ACQUIRING;
     const auto result = scheduler_acquire_execution_token(
         base, local->config.prepared, local->worker_id(), token.task_ref, token.block_idx, token.subtask_slot,
         &token.prepared
     );
-    if (result != PreparedAccessResult::READY) return scheduler_execution_token_fail(graph, local, run, token.task_ref);
+    if (!result) return scheduler_execution_token_fail(graph, local, run, token.task_ref);
     token.acquired_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
     token.phase = SchedulerExecutionTokenPhase::WAIT_FANIN;
     return true;

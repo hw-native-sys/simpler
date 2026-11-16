@@ -30,9 +30,8 @@ are covered, because both are this runtime:
       a5/runtime/host_build_graph/host/runtime_maker.cpp. tmr has no AICore
       scheduler at all.
 
-The vocabulary also recognizes AICore ``resolve`` / ``refill`` IDs, but the
-execution-token path does not emit them. Its StateProbe acquisition envelopes
-can overlap within one discovery batch; Scalar profiles account for exclusive work.
+StateProbe acquisition envelopes can overlap within one discovery batch;
+Scalar profiles account for exclusive work.
 """
 
 from __future__ import annotations
@@ -42,9 +41,8 @@ from __future__ import annotations
 # is the question a reader and a fixture both ask, and PHASES below is a consequence
 # of it rather than a second list to keep in step.
 #
-# The plain ``resolve`` ID belongs to the AICore vocabulary. The AICPU scheduler's
-# resolution thread writes ``resolve_standalone`` instead, which PHASE_ALIASES folds
-# into ``resolve`` for a report -- so on the wire the plain name is AICore's alone.
+# The AICPU resolution thread writes ``resolve_standalone``, which PHASE_ALIASES
+# folds into ``resolve`` for a report.
 PHASES_BY_PRODUCER = {
     "aicpu": frozenset(
         {
@@ -64,10 +62,8 @@ PHASES_BY_PRODUCER = {
         {
             "complete",
             "dispatch",
-            "resolve",
             "bootstrap",
             "state_probe",
-            "refill",
             "idle",
         }
     ),
@@ -80,17 +76,12 @@ SCALAR_PHASES = frozenset(
         "scalar_window",
         "scalar_completions",
         "scalar_graph_control",
-        "scalar_fill_slots",
         "scalar_admission",
         "scalar_executor_scan",
         "scalar_prepare",
         "scalar_seal",
-        "scalar_publish_completion",
         "scalar_async_service",
-        "scalar_backoff",
-        "scalar_ready_claim",
         "scalar_payload",
-        "scalar_early_prepare",
         "scalar_cluster_prepare",
         "scalar_execution_token_progress",
         "scalar_execution_token_refill",
@@ -129,7 +120,6 @@ SCALAR_PHASES = frozenset(
         "scalar_task_issue_fanin",
         "scalar_task_supply_closed",
         "scalar_service_cooperative_slots",
-        "scalar_resolve",
         "scalar_mix",
         "scalar_async_check",
         "scalar_async_finish",
@@ -139,7 +129,6 @@ SCALAR_PHASES = frozenset(
         "scalar_bootstrap_topology",
         "scalar_launch_wait",
         "scalar_exit_drain",
-        "scalar_atomic_claim",
         "scalar_cache_observe",
         "scalar_cache_publish",
         "scalar_ordered_fill",
@@ -158,15 +147,12 @@ SCALAR_PHASES = frozenset(
         "scalar_dispatch_metadata",
         "scalar_dispatch_fill",
         "scalar_dispatch_publish",
-        "scalar_inline_complete",
         "scalar_cursor_validate",
         "scalar_claim_seal_probe",
         "scalar_claim_seal_confirm",
         "scalar_next_block_probe",
         "scalar_next_block_confirm",
         "scalar_poll_local_state",
-        "scalar_poll_ready_queue",
-        "scalar_poll_ready_pool",
         "scalar_poll_admission_tail",
         "scalar_poll_mix_state",
         "scalar_poll_mix_close_seal",
@@ -176,9 +162,7 @@ SCALAR_PHASES = frozenset(
         "scalar_trace_finish",
         "scalar_trace_finish_clean",
         "scalar_trace_finish_barrier",
-        "scalar_atomic_load",
         "scalar_atomic_cas",
-        "scalar_atomic_exchange",
         "scalar_atomic_store_issue",
         "scalar_atomic_fetch_add",
         "scalar_atomic_fetch_add_issue",
@@ -222,7 +206,6 @@ PHASE_COLORS = {
     # AICore scheduler's own loop.
     "bootstrap": "rail_animation",
     "state_probe": "cq_build_running",
-    "refill": "cq_build_attempt_passed",
     "idle": "grey",  # AICore scheduler spin with no progress
 }
 
@@ -253,7 +236,6 @@ PHASE_REPORT_LABELS = {
     "early_dispatch": "EarlyDispatch (speculative staging)",
     "drain": "Drain (sync-start staging)",
     "state_probe": "StateProbe (Scheduler-local Dispatch Slot / Ready state)",
-    "refill": "Refill (completed Slot reuse)",
     "graph_prepare": "GraphPrepare (Definition expansion)",
     "resolve": "Resolve (completion/dependency resolution)",
 }
@@ -265,11 +247,10 @@ PHASE_DISPLAY_NAMES = {
     "resolve": "Resolve",
     "state_probe": "StateProbe",
     "dispatch": "Dispatch",
-    "refill": "Refill",
 }
 
 # Every outer phase this runtime can emit, in the order a report lists them. The
-# order carries meaning -- state_probe / dispatch / refill is the
+# order carries meaning -- state_probe / dispatch is the
 # AICore scheduler's own loop -- which is one reason this is each runtime's own to
 # state rather than an interleaving of both.
 OUTER_PHASES = (
@@ -277,7 +258,6 @@ OUTER_PHASES = (
     "async_poll",
     "state_probe",
     "dispatch",
-    "refill",
     "dummy",
     "early_dispatch",
     "drain",
@@ -293,7 +273,6 @@ WORK_PHASES = frozenset(
         "complete",
         "state_probe",
         "dispatch",
-        "refill",
         "early_dispatch",
         "drain",
         "graph_prepare",

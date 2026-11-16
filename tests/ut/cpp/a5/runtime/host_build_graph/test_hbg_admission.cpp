@@ -141,7 +141,7 @@ struct AdmissionFixture {
     }
     SchedulerAdmissionRecord *record(uint64_t task) const {
         return scheduler_state_at<SchedulerAdmissionRecord>(
-            base(), storage.layout.admission_records_offset + task * storage.layout.admission_record_stride
+            base(), storage.layout.admission_records_offset + task * sizeof(SchedulerAdmissionRecord)
         );
     }
     SchedulerTaskControl *task_control(uint64_t task) const {
@@ -1399,7 +1399,7 @@ TEST(HbgAdmission, InitializationRejectsInvalidLayoutWithoutChangingOutput) {
             ++summary->admission_control_offset;
             break;
         case 6:
-            summary->admission_record_stride = 128;
+            ++summary->admission_records_offset;
             break;
         case 7:
             summary->admission_records_offset = summary->admission_control_offset;
@@ -1408,7 +1408,7 @@ TEST(HbgAdmission, InitializationRejectsInvalidLayoutWithoutChangingOutput) {
             summary->admission_log_offset = summary->admission_records_offset;
             break;
         case 9:
-            summary->admission_record_stride = UINT64_MAX - 127;
+            summary->admission_records_offset = UINT64_MAX - 63;
             break;
         }
         SchedulerAdmissionLocalState output{};

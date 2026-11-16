@@ -565,16 +565,16 @@ void AicoreLifecycle::collect_run_swimlane_records(Runtime *runtime) {
                     trace.complete_start_cycles
                 );
                 phase(
-                    trace.state_probe_scheduler_worker_id, SchedPhaseKind::StateProbe, trace.state_probe_start_cycles,
+                    trace.worker_id, SchedPhaseKind::StateProbe, trace.state_probe_start_cycles,
                     trace.state_probe_end_cycles, trace.dispatch_loop_iter, identity
                 );
                 phase(
-                    trace.dispatch_scheduler_worker_id, SchedPhaseKind::Dispatch, trace.dispatch_start_cycles,
-                    trace.dispatch_end_cycles, trace.dispatch_loop_iter, identity
+                    trace.worker_id, SchedPhaseKind::Dispatch, trace.dispatch_start_cycles, trace.dispatch_end_cycles,
+                    trace.dispatch_loop_iter, identity
                 );
                 phase(
-                    trace.complete_scheduler_worker_id, SchedPhaseKind::Complete, trace.complete_start_cycles,
-                    trace.complete_end_cycles, trace.complete_loop_iter, identity
+                    trace.worker_id, SchedPhaseKind::Complete, trace.complete_start_cycles, trace.complete_end_cycles,
+                    trace.complete_loop_iter, identity
                 );
             }
         }

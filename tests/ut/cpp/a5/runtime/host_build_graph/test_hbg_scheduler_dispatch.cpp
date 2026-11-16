@@ -284,10 +284,7 @@ TEST(SchedulerTokenDispatch, HostDoneAndConfirmedFaninPrefixDoNotReleaseTheRemai
     SchedulerPreparedHandle predecessor{};
     const uint64_t block = scheduler_gm_fetch_add(f.control(1)->next_block, UINT64_C(1));
     ASSERT_EQ(block, 0u);
-    ASSERT_EQ(
-        scheduler_acquire_execution_token(f.base(), f.local()->config.prepared, 1, 1, block, 0, &predecessor),
-        PreparedAccessResult::READY
-    );
+    ASSERT_TRUE(scheduler_acquire_execution_token(f.base(), f.local()->config.prepared, 1, 1, block, 0, &predecessor));
     ASSERT_EQ(scheduler_prepared_owner(predecessor.claimed_state), 1u);
     ASSERT_TRUE(scheduler_close_ordinary_supply(
         f.graph.graph(), f.base(), f.storage.local_context(&f.storage.contexts[1]), f.storage.run_control, 1,

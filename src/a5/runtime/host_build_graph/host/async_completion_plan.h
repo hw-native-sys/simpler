@@ -28,7 +28,6 @@ struct AsyncTaskPlanInput {
 struct AsyncTaskHostPlan {
     SchedulerAsyncTaskData data;
     uint64_t entries_offset{0};
-    uint32_t block_entry_bytes{0};
     std::array<uint16_t, 3> capacities{};
 };
 

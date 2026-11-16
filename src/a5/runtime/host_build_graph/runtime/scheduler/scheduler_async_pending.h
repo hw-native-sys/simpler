@@ -36,11 +36,6 @@ enum class Result : uint8_t {
     COUNT_UNDERFLOW,
 };
 
-struct Outcome {
-    Result result;
-    uint64_t previous;
-};
-
 constexpr inline __aicore__ uint32_t pending(uint64_t word) { return static_cast<uint32_t>(word & UINT64_C(0xffff)); }
 constexpr inline __aicore__ uint32_t registered(uint64_t word) {
     return static_cast<uint32_t>((word >> 16) & UINT64_C(0xffff));
@@ -70,44 +65,44 @@ struct GmAtomics {
 // existing block/lane join authorizes exactly one close after every release.
 // Error results can follow an invalid RMW and require failing the run.
 template <typename Atomics>
-static inline __aicore__ Outcome register_group(Atomics &atomics) {
+static inline __aicore__ Result register_group(Atomics &atomics) {
     const uint64_t previous = atomics.fetch_add(REGISTERED_UNIT + 1);
-    if (!valid(previous)) return {Result::INVALID_WORD, previous};
-    if (closed(previous)) return {Result::INVALID_TRANSITION, previous};
-    if (registered(previous) == COUNT_MAX) return {Result::COUNT_OVERFLOW, previous};
-    return {Result::PENDING, previous};
+    if (!valid(previous)) return Result::INVALID_WORD;
+    if (closed(previous)) return Result::INVALID_TRANSITION;
+    if (registered(previous) == COUNT_MAX) return Result::COUNT_OVERFLOW;
+    return Result::PENDING;
 }
 
 template <typename Atomics>
-static inline __aicore__ Outcome close_computation(Atomics &atomics) {
+static inline __aicore__ Result close_computation(Atomics &atomics) {
     const uint64_t previous = atomics.fetch_add(COMPUTATION_CLOSED);
-    if (!valid(previous)) return {Result::INVALID_WORD, previous};
-    if (closed(previous)) return {Result::INVALID_TRANSITION, previous};
-    if (pending(previous) != 0) return {Result::PENDING, previous};
-    return {registered(previous) == 0 ? Result::SYNCHRONOUS : Result::FINISH_OWNER, previous};
+    if (!valid(previous)) return Result::INVALID_WORD;
+    if (closed(previous)) return Result::INVALID_TRANSITION;
+    if (pending(previous) != 0) return Result::PENDING;
+    return registered(previous) == 0 ? Result::SYNCHRONOUS : Result::FINISH_OWNER;
 }
 
 template <typename Atomics>
-static inline __aicore__ Outcome complete_group(Atomics &atomics) {
+static inline __aicore__ Result complete_group(Atomics &atomics) {
     const uint64_t previous = atomics.fetch_add(UINT64_MAX);
-    if (!valid(previous)) return {Result::INVALID_WORD, previous};
-    if (pending(previous) == 0) return {Result::COUNT_UNDERFLOW, previous};
-    return {closed(previous) && pending(previous) == 1 ? Result::FINISH_OWNER : Result::PENDING, previous};
+    if (!valid(previous)) return Result::INVALID_WORD;
+    if (pending(previous) == 0) return Result::COUNT_UNDERFLOW;
+    return closed(previous) && pending(previous) == 1 ? Result::FINISH_OWNER : Result::PENDING;
 }
 
 }  // namespace detail
 
-static inline __aicore__ Outcome register_group(__gm__ Join &join) {
+static inline __aicore__ Result register_group(__gm__ Join &join) {
     detail::GmAtomics atomics{join.word};
     return detail::register_group(atomics);
 }
 
-static inline __aicore__ Outcome close_computation(__gm__ Join &join) {
+static inline __aicore__ Result close_computation(__gm__ Join &join) {
     detail::GmAtomics atomics{join.word};
     return detail::close_computation(atomics);
 }
 
-static inline __aicore__ Outcome complete_group(__gm__ Join &join) {
+static inline __aicore__ Result complete_group(__gm__ Join &join) {
     detail::GmAtomics atomics{join.word};
     return detail::complete_group(atomics);
 }

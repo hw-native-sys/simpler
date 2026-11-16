@@ -841,7 +841,7 @@ def test_ordinary_variable_grids_have_no_admission_membership(blocks):
     builder = ProtocolBuilder(shapes, clusters=6)
     raw, identities = builder.run()
     _set_claim_seal_observation(raw, identities)
-    raw.update(schema="hbg-native-protocol", close_seal_stride=64)
+    raw.update(schema="hbg-native-protocol")
     assert audit_native_protocol(raw, identities)["protocol_verified"]
     assert raw["cooperative_task_count"] == 0
     assert raw["admissions"] == raw["members"] == raw["blocks"] == []
@@ -856,7 +856,7 @@ def test_ordinary_variable_grids_have_no_admission_membership(blocks):
 def test_compact_admission_and_seals_accept_64_only_alignment_and_reject_bad_regions(mutation):
     raw, identities = ProtocolBuilder([(7, 2, ()), (7, 2, (0,))], clusters=2, sync_tasks=(0, 1)).run()
     _set_claim_seal_observation(raw, identities)
-    raw.update(schema="hbg-native-protocol", close_seal_stride=64)
+    raw.update(schema="hbg-native-protocol")
     for index, row in enumerate(raw["admissions"]):
         row["record_offset"] += 64
         row["close_seals_offset"] = 8192 + 64 + index * raw["cluster_count"] * 64
@@ -882,7 +882,7 @@ def test_compact_admission_and_seals_accept_64_only_alignment_and_reject_bad_reg
 def test_current_cooperative_capture_rejects_independent_flag(flag):
     raw, identities = ProtocolBuilder([(1, 2, ())]).run()
     _set_claim_seal_observation(raw, identities)
-    raw.update(schema="hbg-native-protocol", close_seal_stride=64)
+    raw.update(schema="hbg-native-protocol")
     assert audit_native_protocol(raw, identities)["protocol_verified"]
     raw["tasks"][0]["flags"] |= flag
     raw["task_events"][0]["completion"]["flags"] |= flag

@@ -282,7 +282,7 @@ class NativeAudit:
                 )
         if seals:
             require(seals[0] > 0 and seals[0] % alignment == 0, "invalid close seal base")
-            seal_stride = self.raw["close_seal_stride"]
+            seal_stride = 64
             require(
                 seals == [seals[0] + index * self.raw["cluster_count"] * seal_stride for index in range(len(seals))],
                 "aliased or wrong task close seals",

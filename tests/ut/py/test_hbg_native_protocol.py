@@ -32,7 +32,6 @@ def capture(epoch=0):
         "expected_task_count": 1,
         "inline_completed_count": 0,
         "resolved_task_count": 1,
-        "close_seal_stride": 64,
         "active_worker_count": 3,
         "scheduler_error": 0,
         "error_claimed": 0,
@@ -141,21 +140,13 @@ def test_partial_task_order_metadata_is_rejected(fields):
         read_native_protocol(raw)
 
 
-@pytest.mark.parametrize("stride", (None, 0, 8, 63, 65, 128, True, 64.0, "64", -1, 1 << 64))
-def test_compact_schema_requires_64_byte_seals_and_omits_unused_execution_counter(stride):
+@pytest.mark.parametrize("field,value", (("executed_task_count", 0), ("close_seal_stride", 64)))
+def test_current_schema_rejects_retired_fields(field, value):
     raw = capture()
-    raw.update(schema="hbg-native-protocol", close_seal_stride=64)
     raw["task_controls"][0].update(claim_tickets=0, claim_seal=0)
     assert read_native_protocol(raw) == raw
-    raw["executed_task_count"] = 0
+    raw[field] = value
     with pytest.raises(ValueError, match="unknown fields"):
-        read_native_protocol(raw)
-    del raw["executed_task_count"]
-    if stride is None:
-        del raw["close_seal_stride"]
-    else:
-        raw["close_seal_stride"] = stride
-    with pytest.raises(ValueError, match="close_seal_stride|missing or unknown fields"):
         read_native_protocol(raw)
 
 

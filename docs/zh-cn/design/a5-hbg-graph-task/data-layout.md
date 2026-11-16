@@ -63,6 +63,10 @@ uint32_t original_task_count。GraphView、native header、task catalog 和 prep
 | SchedulerMixCloseSeal | 64 B | 单个保留的原子 close seal |
 
 Mailbox 的 descriptor 从 0 开始，lane ack 数组从 128 开始，二者位于独立原子 sector。
+AdmissionRecord 数组直接按当前类型的 64 B 大小寻址；layout、summary 和核内 admission
+状态不再各存一份行宽。summary 的 protocol/async/prepared layout offset 字段分别位于
+88/112/120；核内 `SchedulerAdmissionLocalState` 为 176 B。
+DFX close-seal 数组也按当前 64 B 类型解释，JSON 不携带固定行宽字段。
 coordinator 写回 descriptor 并 barrier 后，通过参与 AIV 的 assigned_seq 发布；接收者不读取另一份全局发布计数。
 Call.args 与 dump task 的只读参数行以 alignas(64) 对齐；没有显式 reserved 数据字段。
 
@@ -76,10 +80,13 @@ metadata offset 位于 120，runtime_worker_count 位于 128，cluster 信息从
 trace/activity/PMU offsets 分别位于 184/192/200，args_dump_address 位于 208。
 最后一行从 256 开始，保存 bootstrap 统计。
 所有核都自行调度，结构中没有另一个 scheduler 角色、索引或数量。
+metadata offset 由 WorkerContext 携带；RunControl 不保存第二份副本。
 
 TaskTrace 首行的 valid 由 atomic 发布；kernel timing 行从 64 开始，dispatch/completion 行从 128 开始，
 execution identity 从 192 开始。退休时先写回有效计时行并 barrier，再发布 valid。
 后续 cached writeback 不能覆盖 valid 所在行；核内 staged trace 保持自然对齐。
+探测、dispatch、completion 都归 trace.worker_id，不再分别保存调度核 ID；
+无探测事件的任务保留零起止时间，两个 DFX 读者都据此省略该事件。
 
 backing 基址满足 128 B 对齐。标量缓存维护仍按 64 B 行，不能从原子区域尺寸推导缓存指令粒度。
 业务 kernel 不接收调度私有 slot 或 admission 对象的地址。
@@ -88,8 +95,8 @@ backing 基址满足 128 B 对齐。标量缓存维护仍按 64 B 行，不能�
 
 `SchedulerNativeGraphHeader` 为 128 B，以 uint32_t magic 标识结构种类，
 随后依次是 image_bytes、node_count、original_task_count、definition_count、instance_count、
-bindings_offset、completion_refs_offset、templates_offset、instances_offset、readonly_end_offset、run_epoch，
-最后是 uint32_t header_bytes。没有 control inbox 区。
+bindings_offset、completion_refs_offset、templates_offset、instances_offset、readonly_end_offset、run_epoch。
+Header 的大小由当前类型定义，不另存大小字段；没有 control inbox 区。
 
 只读区域按 header、binding、completion refs、template、instance、child plan、fanin CSR、sink 排列。
 读取 header 前先以可信 scheduler_state_bytes 检查地址和长度，再核对 header.image_bytes；
@@ -105,6 +112,8 @@ fanin CSR 只拷贝实际运行使用的前驱边，sink 由 Host 验证后的�
 每 instance 有一份 32 B 记录：Graph index、原始 shell ID、ENTER/child/EXIT ref 和 args_base。
 boundary 参数、heap_base 和完整 Graph 由 Host 绑定器持有；设备不读取它们。
 同一 Graph 的拓扑和 child plan 可共享；每个 instance 的参数和控制责任独立。
+Host 在展开后的 metadata 遍历中检查实际 child 的 sync-start 核容量，并汇总 AIC/AIV demand；
+不再先按录制定义做一遍相同容量检查。检查仍发生在 scheduler backing 分配和发布之前。
 
 共享录制结构的类型名是 `Graph`，头文件为 `host_build_graph/graph.h`；
 外层 framing 为 `GraphImageHeader`，按值解码结果为 `GraphImageValue`，没有旧类型 alias 或转发头。
@@ -146,7 +155,7 @@ Host 在 orchestration 返回前取得自有 Graph 字节与索引，不能保�
 | 对象 | 大小 | 内容 |
 | ---- | ---- | ---- |
 | SchedulerPreparedCall | 512 B | immutable function、epoch、node/block/lane、完整 args |
-| SchedulerPreparedControl | 128 B | phase、owner、generation 的单原子字 |
+| SchedulerPreparedControl | 128 B | phase、固定 owner 的单原子字 |
 | SchedulerExecutionBinding | 128 B | 各占一行的 LocalContext/GlobalContext |
 
 args[48]/args[49] 指向本次 execution 的 Binding，两核内 slot 复用不覆盖这些参数。
