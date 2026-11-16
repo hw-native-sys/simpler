@@ -521,7 +521,7 @@ def _fake_handle(monkeypatch):
         return (b"d" * 32, "NEXT_LEVEL", "LOCAL_CHIP", state["eligible"])
 
     monkeypatch.setattr(orch_mod, "_require_handle", _fake)
-    monkeypatch.setattr(Worker, "_prepare_ccu_submission", lambda *_: None)
+    monkeypatch.setattr(Worker, "_prepare_ccu_submission", lambda _self, _handle, _workers, args, **_kwargs: args)
     return state
 
 

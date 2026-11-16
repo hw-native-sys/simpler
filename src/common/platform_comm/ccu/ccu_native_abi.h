@@ -21,6 +21,7 @@ extern "C" {
 
 #define SIMPLER_CCU_MODULE_MANIFEST_SYMBOL "simpler_ccu_module_manifest"
 #define SIMPLER_CCU_BUILD_ID_SIZE 32U
+#define SIMPLER_CCU_ABI_VERSION 2U
 #define SIMPLER_CCU_EVENT_MASK 1ULL
 #define SIMPLER_CCU_REGISTRATION_ARGUMENT_COUNT 1U
 #define SIMPLER_CCU_TASK_ARGUMENT_COUNT 2U
@@ -40,6 +41,8 @@ typedef struct SimplerCcuModuleManifest {
     uint32_t capability_flags;
     uint8_t sdk_build_id[SIMPLER_CCU_BUILD_ID_SIZE];
     uint8_t pto_isa_build_id[SIMPLER_CCU_BUILD_ID_SIZE];
+    uint32_t abi_version;
+    uint32_t reserved;
 } SimplerCcuModuleManifest;
 
 typedef struct SimplerCcuKernelRecord {
@@ -53,6 +56,8 @@ typedef struct SimplerCcuKernelRecord {
     uint32_t registration_binding_size;
     uint32_t registration_argument_count;
     uint32_t task_argument_count;
+    uint32_t required_rank_count;  // Zero accepts any supported domain size.
+    uint32_t reserved;
 } SimplerCcuKernelRecord;
 
 typedef struct SimplerCcuRegistrationBinding {
@@ -122,8 +127,8 @@ SIMPLER_CCU_ASSERT_POD(SimplerCcuEventDescriptor);
 SIMPLER_CCU_ASSERT_POD(SimplerCcuControl);
 SIMPLER_CCU_ASSERT_POD(SimplerCcuWorkspace);
 
-static_assert(sizeof(SimplerCcuModuleManifest) == 96, "CCU manifest ABI size changed");
-static_assert(sizeof(SimplerCcuKernelRecord) == 48, "CCU kernel record ABI size changed");
+static_assert(sizeof(SimplerCcuModuleManifest) == 104, "CCU manifest ABI size changed");
+static_assert(sizeof(SimplerCcuKernelRecord) == 56, "CCU kernel record ABI size changed");
 static_assert(sizeof(SimplerCcuRegistrationBinding) == 552, "CCU registration binding ABI size changed");
 static_assert(sizeof(SimplerCcuLaunchArguments) == 16, "CCU launch arguments ABI size changed");
 static_assert(sizeof(SimplerCcuEventDescriptor) == 16, "CCU Event descriptor ABI size changed");

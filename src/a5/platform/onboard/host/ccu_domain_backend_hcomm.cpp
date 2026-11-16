@@ -14,6 +14,7 @@
 #include <array>
 #include <algorithm>
 #include <dlfcn.h>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <set>
@@ -30,6 +31,7 @@
 
 #include "ccu_domain_registration_hcomm.h"
 #include "ccu_run_lifecycle_hcomm.h"
+#include "common/unified_log.h"
 
 extern "C" CcuResult CcuNotifyWait(ChannelHandle channel, uint32_t local_notify_index, uint16_t mask);
 
@@ -130,12 +132,17 @@ SimplerCcuRegistrationBinding binding_for(
 class HcommDomainResourceBackend final : public HcommDomainSession {
 public:
     HcclComm communicator{};
+    std::shared_ptr<HcommDomainChannels> shared_channels;
+    bool owns_channels = false;
+    bool owns_registration_communicator = true;
     uint64_t domain_id{};
     CcuInsHandle unassigned_instance{};
     CcuInsHandle staging_instance{};
     bool instance_assigned{false};
     std::array<uint64_t, SIMPLER_CCU_MAX_RANKS> channels{};
     std::vector<HcommMissionStream> streams;
+    HcommMissionStreamPool *stream_pool{};
+    std::map<uint64_t, ThreadHandle> thread_bindings;
     aclrtBinHandle trigger_binary{};
     aclrtFuncHandle trigger_function{};
     aclrtStream trigger_stream{};
@@ -173,7 +180,8 @@ public:
                 descriptor.ready = {mission.ready_gate_address, SIMPLER_CCU_EVENT_MASK};
                 descriptor.trigger = {mission.trigger_gate_address, SIMPLER_CCU_EVENT_MASK};
                 descriptor.done = {mission.done_gate_address, SIMPLER_CCU_EVENT_MASK};
-                descriptors.push_back(descriptor);
+                if (descriptors.size() <= mission.ccu_id) descriptors.resize(mission.ccu_id + 1);
+                descriptors[mission.ccu_id] = descriptor;
             }
             const uint64_t table = allocate(descriptors.size() * sizeof(descriptors.front()), 64);
             copy_to_device(table, descriptors.data(), descriptors.size() * sizeof(descriptors.front()));
@@ -211,7 +219,7 @@ public:
         sdk_.reset();
         if (active_generation_ != 0) discard(active_generation_);
         active_generation_ = generation;
-        const auto &prepared = found->second;
+        auto &prepared = found->second;
         auto event_action = [this,
                              event_result = prepared.event_result](uint64_t address, uint64_t value, uint64_t *result) {
             uint64_t arguments[]{address, value, event_result};
@@ -238,11 +246,30 @@ public:
                 if (value != 0) throw std::runtime_error("CCU Event reset is unconfirmed");
             }
         }
-        sdk_ = std::make_unique<HcommRunLifecycleSdk>(streams, [](uint64_t, uint64_t, bool *) {
-            return -1;
-        });
-        run_ = owner.begin_run(generation, prepared.resources, *sdk_);
-        run_->launch_all();
+        try {
+            streams.reserve(missions.size());
+            for (size_t i = 0; i < missions.size(); ++i) {
+                auto stream = stream_pool->acquire();
+                streams.push_back(stream);
+                auto &thread = thread_bindings[stream.handle];
+                if (!thread) {
+                    check(
+                        HcclThreadAcquireWithStream(communicator, COMM_ENGINE_CCU, stream.stream, 1, &thread),
+                        "HcclThreadAcquireWithStream(CCU pooled mission)"
+                    );
+                }
+                streams.back().thread = thread;
+                prepared.resources[i].stream_handle = stream.handle;
+            }
+            sdk_ = std::make_unique<HcommRunLifecycleSdk>(streams, [](uint64_t, uint64_t, bool *) {
+                return -1;
+            });
+            run_ = owner.begin_run(generation, prepared.resources, *sdk_);
+            run_->launch_all();
+        } catch (...) {
+            if (!run_) release_streams();
+            throw;
+        }
         return prepared.workspace;
     }
 
@@ -251,6 +278,16 @@ public:
         const bool complete = run_->poll_terminal();
         if (const auto *failure = run_->primary_failure())
             throw std::runtime_error(failure->operation + ": " + std::to_string(failure->native_error));
+        if (complete) release_streams();
+        return complete;
+    }
+
+    bool finish_completed_requests() override {
+        if (!run_) return true;
+        const bool complete = run_->finish_completed_requests();
+        if (const auto *failure = run_->primary_failure())
+            throw std::runtime_error(failure->operation + ": " + std::to_string(failure->native_error));
+        if (complete) release_streams();
         return complete;
     }
 
@@ -292,29 +329,38 @@ public:
             unassigned_instance = 0;
         }
         // The communicator owns an assigned instance, the channel and acquired CCU threads.
-        if (communicator != nullptr) {
+        if (communicator != nullptr && owns_registration_communicator) {
             if (HcclCommDestroy(communicator) != HCCL_SUCCESS) return false;
             communicator = nullptr;
             instance_assigned = false;
             unassigned_instance = 0;
             channels.fill(0);
         }
-        for (auto it = streams.rbegin(); it != streams.rend(); ++it) {
-            if (it->stream != nullptr && aclrtDestroyStream(it->stream) != ACL_SUCCESS) return false;
-            it->stream = nullptr;
-            it->thread = 0;
-        }
-        streams.clear();
+        release_streams();
+        thread_bindings.clear();
         if (trigger_stream != nullptr && aclrtDestroyStream(trigger_stream) != ACL_SUCCESS) return false;
         trigger_stream = nullptr;
         trigger_function = nullptr;
         if (trigger_binary != nullptr && aclrtBinaryUnLoad(trigger_binary) != ACL_SUCCESS) return false;
         trigger_binary = nullptr;
+        communicator = nullptr;
+        if (owns_channels && shared_channels && !shared_channels->close()) return false;
+        shared_channels.reset();
         closed_ = true;
         return true;
     }
 
 private:
+    void release_streams() {
+        for (auto &stream : streams) {
+            if (stream.handle == 0) continue;
+            if (!stream_pool->release(stream.handle))
+                throw std::runtime_error("CCU mission pool return is unconfirmed");
+            stream.handle = 0;
+        }
+        streams.clear();
+    }
+
     static void copy_to_device(uint64_t address, const void *source, size_t bytes) {
         check(
             aclrtMemcpy(reinterpret_cast<void *>(address), bytes, source, bytes, ACL_MEMCPY_HOST_TO_DEVICE),
@@ -364,17 +410,71 @@ private:
 
 }  // namespace
 
+bool HcommDomainChannels::close() {
+    if (communicator && HcclCommDestroy(communicator) != HCCL_SUCCESS) return false;
+    communicator = nullptr;
+    channels.fill(0);
+    return true;
+}
+
+void create_hcomm_domain_channels(
+    HcclComm base, uint64_t allocation_id, const std::vector<uint32_t> &ranks, uint32_t rank,
+    std::shared_ptr<HcommDomainChannels> &result
+) {
+    if (!base || ranks.size() < 2 || ranks.size() > SIMPLER_CCU_MAX_RANKS || rank >= ranks.size())
+        throw std::invalid_argument("invalid CCU domain channels");
+    if (result) throw std::invalid_argument("CCU domain channels already exist");
+    result = std::make_shared<HcommDomainChannels>();
+    HcclCommConfig config{};
+    HcclCommConfigInit(&config);
+    config.hcclOpExpansionMode = 5;
+    // URMA uses the default child name for the same allocation ID. Keep CCU's
+    // topology distinct, including across different parent communicators.
+    char parent_name[COMM_NAME_MAX_LENGTH]{};
+    check(HcclGetCommName(base, parent_name), "HcclGetCommName(CCU parent)");
+    const size_t parent_length = strnlen(parent_name, sizeof(parent_name));
+    const std::string name = "ccu_" + std::string(parent_name, parent_length) + "_" + std::to_string(allocation_id);
+    if (parent_length == sizeof(parent_name) || name.size() >= sizeof(config.hcclCommName))
+        throw std::invalid_argument("CCU communicator name exceeds HCOMM capacity");
+    std::copy(name.begin(), name.end(), config.hcclCommName);
+    config.hcclCommName[name.size()] = '\0';
+    auto members = ranks;
+    check(
+        HcclCreateSubCommConfig(
+            &base, members.size(), members.data(), allocation_id, rank, &config, &result->communicator
+        ),
+        "HcclCreateSubCommConfig(CCU)"
+    );
+    try {
+        result->channels = acquire_peer_channels(result->communicator, rank, ranks.size());
+        uint32_t die = UINT32_MAX;
+        for (const auto channel : result->channels) {
+            if (channel == 0) continue;
+            const auto peer_die = find_channel_die(channel);
+            if (die != UINT32_MAX && die != peer_die) throw std::runtime_error("CCU domain channels span IO dies");
+            die = peer_die;
+        }
+        result->die = die;
+        return;
+    } catch (...) {
+        // The caller must retain a failed domain when communicator destruction fails.
+        if (!result->close()) throw std::runtime_error("CCU channel rollback is unconfirmed");
+        throw;
+    }
+}
+
 std::vector<HcommPreparedMission> prepare_hcomm_ccu_callable(
     HcclComm base_communicator, uint64_t domain_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
     const ExpectedBuildIdentity &expected_identity, const std::vector<std::vector<uint8_t>> &module_bytes,
-    const std::string &program_namespace, std::unique_ptr<DomainCcuOwner> &owner, HcommDomainSession *&session
+    const std::string &program_namespace, std::unique_ptr<DomainCcuOwner> &owner, HcommDomainSession *&session,
+    std::shared_ptr<HcommDomainChannels> domain_channels, uint32_t selected_ccu_id, HcommMissionStreamPool &stream_pool
 ) {
     if (owner) throw std::invalid_argument("CCU domain already has an owner");
     if (base_communicator == nullptr || rank_ids.size() < 2 || domain_rank >= rank_ids.size() || module_bytes.empty() ||
         program_namespace.empty())
         throw std::invalid_argument("invalid A5 CCU domain preparation request");
 
-    static NativeModuleCache module_cache;
+    auto &module_cache = native_module_cache();
     std::vector<std::shared_ptr<NativeModule>> modules;
     std::vector<NativeKernelDefinition> kernels;
     std::vector<uint32_t> kernel_modules;
@@ -389,38 +489,53 @@ std::vector<HcommPreparedMission> prepare_hcomm_ccu_callable(
     if (kernels.size() > 1024) throw std::invalid_argument("too many CCU kernels");
     if (kernels.empty()) throw std::invalid_argument("the callable has no CCU kernels");
 
+    if (selected_ccu_id != UINT32_MAX) {
+        if (selected_ccu_id >= kernels.size()) throw std::invalid_argument("CCU definition ID is out of range");
+        const auto kernel = kernels[selected_ccu_id];
+        const auto module_index = kernel_modules[selected_ccu_id];
+        kernels = {kernel};
+        kernel_modules = {module_index};
+    }
+    for (const auto &kernel : kernels)
+        if (kernel.record.required_rank_count != 0 && kernel.record.required_rank_count != rank_ids.size())
+            throw std::invalid_argument("CCU rank specialization does not match the domain");
     auto owned_backend = std::make_unique<HcommDomainResourceBackend>();
     auto *backend = owned_backend.get();
     backend->domain_id = domain_id;
+    backend->stream_pool = &stream_pool;
     owner = std::make_unique<DomainCcuOwner>(std::move(owned_backend));
     session = backend;
     for (auto &module : modules)
         owner->retain_module(std::move(module));
     try {
-        HcclCommConfig config{};
-        HcclCommConfigInit(&config);
-        // HcclCommConfig uses HcclAccelerator values, not HcclOpExpansionMode enum values.
-        constexpr uint32_t ccu_ms_config_mode = 5;
-        config.hcclOpExpansionMode = ccu_ms_config_mode;
-        auto mutable_rank_ids = rank_ids;
-        check(
-            HcclCreateSubCommConfig(
-                &base_communicator, static_cast<uint32_t>(mutable_rank_ids.size()), mutable_rank_ids.data(), domain_id,
-                domain_rank, &config, &backend->communicator
-            ),
-            "HcclCreateSubCommConfig(CCU)"
-        );
-        backend->channels = acquire_peer_channels(backend->communicator, domain_rank, rank_ids.size());
-        uint32_t die = UINT32_MAX;
-        for (const auto channel : backend->channels) {
-            if (channel == 0) continue;
-            const uint32_t peer_die = find_channel_die(channel);
-            if (die != UINT32_MAX && die != peer_die)
-                throw std::runtime_error(
-                    "CCU callable peer channels span IO dies; a single-die program cannot bind them"
-                );
-            die = peer_die;
+        backend->shared_channels = std::move(domain_channels);
+        if (!backend->shared_channels) {
+            // Creation can retain a communicator whose rollback failed. Publish
+            // ownership before that call so the registration keeps it reachable.
+            backend->owns_channels = true;
+            backend->owns_registration_communicator = false;
+            create_hcomm_domain_channels(base_communicator, domain_id, rank_ids, domain_rank, backend->shared_channels);
         }
+        const auto &channels = backend->shared_channels;
+        if (backend->owns_registration_communicator) {
+            HcclCommConfig config{};
+            HcclCommConfigInit(&config);
+            config.hcclOpExpansionMode = 5;
+            // Program resources are local; channels retain the full ordered domain topology.
+            uint32_t member = rank_ids[domain_rank];
+            check(
+                HcclCreateSubCommConfig(&base_communicator, 1, &member, domain_id, 0, &config, &backend->communicator),
+                "HcclCreateSubCommConfig(local CCU registration)"
+            );
+            LOG_INFO(
+                "[ccu] local registration context=%llu base_rank=%u domain_rank=%u domain_size=%zu",
+                static_cast<unsigned long long>(domain_id), member, domain_rank, rank_ids.size()
+            );
+        } else {
+            backend->communicator = channels->communicator;
+        }
+        backend->channels = channels->channels;
+        const uint32_t die = channels->die;
 
         auto &staging = backend->staging_instance;
         HcommCcuResDescHandle staging_descriptor{};
@@ -444,8 +559,10 @@ std::vector<HcommPreparedMission> prepare_hcomm_ccu_callable(
                 std::array<CcuEventHandle, 3> events{};
                 for (auto &event : events)
                     check(HcommCcuEventAlloc(staging, die, 1, &event), "allocate sizing Event");
-                const auto binding =
-                    binding_for(domain_rank, static_cast<uint32_t>(rank_ids.size()), backend->channels, i, events);
+                const auto binding = binding_for(
+                    domain_rank, static_cast<uint32_t>(rank_ids.size()), backend->channels,
+                    selected_ccu_id == UINT32_MAX ? i : selected_ccu_id, events
+                );
                 const void *arguments[] = {&binding};
                 check(
                     sizing.query_resources(kernels[i].entry, arguments, SIMPLER_CCU_REGISTRATION_ARGUMENT_COUNT),
@@ -487,6 +604,7 @@ std::vector<HcommPreparedMission> prepare_hcomm_ccu_callable(
         request.rank_count = static_cast<uint32_t>(rank_ids.size());
         request.channels = backend->channels;
         request.program_namespace = program_namespace;
+        if (selected_ccu_id != UINT32_MAX) request.ccu_ids = {selected_ccu_id};
         std::vector<HcommPreparedMission> missions;
         missions.reserve(kernels.size());
         for (uint32_t i = 0; i < kernels.size(); ++i) {
@@ -499,7 +617,7 @@ std::vector<HcommPreparedMission> prepare_hcomm_ccu_callable(
             const auto &kernel = kernels[i];
             request.missions.push_back({events[0], events[1], events[2]});
             HcommPreparedMission mission{};
-            mission.ccu_id = i;
+            mission.ccu_id = selected_ccu_id == UINT32_MAX ? i : selected_ccu_id;
             mission.kernel_id = kernel.record.kernel_id;
             mission.module_index = kernel_modules[i];
             mission.ready_event_handle = events[0];
@@ -515,22 +633,13 @@ std::vector<HcommPreparedMission> prepare_hcomm_ccu_callable(
 
         HcommDomainRegistrationSdk registration(backend->unassigned_instance, die);
         const auto registered = register_domain_kernels(kernels, request, registration);
-        backend->streams.reserve(missions.size());
         for (auto &mission : missions) {
-            mission.program_handle = registered.at(mission.ccu_id).program_handle;
+            mission.program_handle = registered.at(&mission - missions.data()).program_handle;
             if (mission.program_handle == 0) throw std::runtime_error("missing registered CCU mission program");
-            HcommMissionStream stream{};
-            stream.handle = static_cast<uint64_t>(backend->streams.size() + 1);
-            check(aclrtCreateStream(&stream.stream), "aclrtCreateStream(CCU mission)");
-            backend->streams.push_back(stream);
-            check(
-                HcclThreadAcquireWithStream(
-                    backend->communicator, COMM_ENGINE_CCU, backend->streams.back().stream, 1,
-                    &backend->streams.back().thread
-                ),
-                "HcclThreadAcquireWithStream(CCU mission)"
+            LOG_INFO(
+                "[ccu] HCOMM register domain=%llu ccu_id=%u program=%llu", static_cast<unsigned long long>(domain_id),
+                mission.ccu_id, static_cast<unsigned long long>(mission.program_handle)
             );
-            mission.stream_handle = stream.handle;
         }
 
         check(aclrtCreateStream(&backend->trigger_stream), "aclrtCreateStream(CCU trigger)");
@@ -545,15 +654,6 @@ std::vector<HcommPreparedMission> prepare_hcomm_ccu_callable(
         );
         check(HcclCommAssignCcuIns(backend->communicator, backend->unassigned_instance), "HcclCommAssignCcuIns");
         backend->instance_assigned = true;
-        CcuInsHandle assigned{};
-        uint32_t assigned_count{};
-        check(
-            HcclCommQueryAssignedCcuIns(backend->communicator, &assigned, &assigned_count),
-            "HcclCommQueryAssignedCcuIns"
-        );
-        if (assigned_count != 1 || assigned != backend->unassigned_instance)
-            throw std::runtime_error("assigned CCU instance does not match the prepared instance");
-
         owner->set_registered_kernels(registered);
         return missions;
     } catch (...) {

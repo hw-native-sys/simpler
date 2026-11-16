@@ -1238,7 +1238,7 @@ TEST(NativeRunOperationLeaseTest, ConfirmedCcuStopAllowsDeviceFinalizeAndReuse) 
     };
     for (uint64_t generation : {3u, 4u}) {
         ASSERT_EQ(worker.control_ccu_run(1, 2, 1, generation), 0);
-        ASSERT_EQ(worker.control_ccu_run(1, 2, 3, generation), 0);
+        ASSERT_EQ(worker.control_ccu_run(1, 2, generation == 3 ? 3 : 9, generation), 0);
     }
     EXPECT_NO_THROW(worker.finalize());
     EXPECT_EQ(g_device_finalize_calls, 1);

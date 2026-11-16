@@ -34,6 +34,7 @@ struct DomainRegistrationRequest {
     std::array<uint64_t, SIMPLER_CCU_MAX_RANKS> channels{};
     std::string program_namespace;
     std::vector<MissionRegistrationResources> missions;
+    std::vector<uint32_t> ccu_ids;
 };
 
 struct RegisteredKernel {

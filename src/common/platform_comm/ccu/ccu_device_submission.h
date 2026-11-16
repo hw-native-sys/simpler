@@ -24,7 +24,7 @@
 
 namespace simpler::ccu {
 struct CcuCallArg {
-    enum class Kind : uint32_t { Scalar, Window, PeerRank };
+    enum class Kind : uint32_t { Scalar, Window };
     Kind kind;
     uint32_t rank;
     uint64_t value;  // Scalar value or byte offset in W.
@@ -56,7 +56,7 @@ SIMPLER_CCU_SUBMIT_DEVICE bool resolve_call_args(
         const auto &arg = args[i];
         if (arg.kind == CcuCallArg::Kind::Scalar) {
             words[count++] = arg.value;
-        } else if (arg.kind == CcuCallArg::Kind::Window || arg.kind == CcuCallArg::Kind::PeerRank) {
+        } else if (arg.kind == CcuCallArg::Kind::Window) {
             if (workspace == nullptr || arg.rank >= domain->rankNum || workspace->windows_addr == 0 ||
                 workspace->windows_addr % alignof(CommCcuWindow) != 0 || workspace->window_count != domain->rankNum ||
                 workspace->window_size != sizeof(CommCcuWindow))
@@ -65,10 +65,6 @@ SIMPLER_CCU_SUBMIT_DEVICE bool resolve_call_args(
                 reinterpret_cast<const SIMPLER_CCU_SUBMIT_GM CommCcuWindow *>(workspace->windows_addr);
             const auto &window = windows[arg.rank];
             if (window.reserved != 0 || window.l2_rank >= COMM_MAX_RANK_NUM) return false;
-            if (arg.kind == CcuCallArg::Kind::PeerRank) {
-                words[count++] = window.l2_rank;
-                continue;
-            }
             if (window.address == 0 || arg.size == 0 || arg.value > window.size || arg.size > window.size - arg.value ||
                 window.address > UINT64_MAX - arg.value || arg.size - 1 > UINT64_MAX - (window.address + arg.value))
                 return false;
@@ -91,7 +87,9 @@ ccu_control(const volatile SIMPLER_CCU_SUBMIT_GM SimplerCcuWorkspace *workspace,
     const auto *controls =
         reinterpret_cast<const volatile SIMPLER_CCU_SUBMIT_GM SimplerCcuControl *>(workspace->controls_addr);
     const auto *control = &controls[ccu_id];
-    if (control->ccu_id != ccu_id || control->run_generation != workspace->run_generation) return nullptr;
+    if (control->struct_size != sizeof(*control) || control->ccu_id != ccu_id ||
+        control->run_generation != workspace->run_generation)
+        return nullptr;
     return control;
 }
 

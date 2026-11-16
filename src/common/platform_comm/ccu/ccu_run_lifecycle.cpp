@@ -147,6 +147,31 @@ bool DomainRun::stop() {
     return poll_terminal();
 }
 
+bool DomainRun::finish_completed_requests() {
+    if (!launched_) throw std::runtime_error("CCU run has not launched");
+    if (confirmed_stopped_) return true;
+    if (failed() || abort_attempted_) return false;
+    bool stopped = true;
+    for (const auto &mission : missions_) {
+        StreamState state = StreamState::UNKNOWN;
+        int rc = sdk_.query_stream(mission.stream_handle, &state);
+        if (rc == 0 && state == StreamState::COMPLETE) continue;
+        if (rc != 0 || state == StreamState::ERROR || state == StreamState::UNKNOWN) {
+            record_failure("query completed CCU stream", rc != 0 ? rc : kProtocolError);
+            stopped = false;
+            continue;
+        }
+        rc = sdk_.stop_completed_stream(mission.stream_handle);
+        if (rc != 0) {
+            record_failure("stop and confirm completed CCU stream", rc);
+            stopped = false;
+        }
+    }
+    if (stopped) finish_confirmed();
+    else abort();
+    return stopped;
+}
+
 void DomainRun::abort() {
     if (abort_attempted_) return;
     abort_attempted_ = true;

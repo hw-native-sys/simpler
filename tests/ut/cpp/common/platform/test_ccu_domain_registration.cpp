@@ -263,4 +263,35 @@ TEST(CcuDomainRegistration, ListPositionDefinesIdEvenWhenModuleKernelIdsMatch) {
     EXPECT_EQ(sdk.observations[1].entry, reinterpret_cast<const void *>(0x104));
 }
 
+TEST(CcuDomainRegistration, SelectedKernelKeepsCallableIdAndLogicalChannelOrder) {
+    auto topology = request();
+    topology.missions.resize(1);
+    topology.ccu_ids = {7};
+    FakeSdk sdk;
+    const auto registered = simpler::ccu::register_domain_kernels({kernel(99, 0, 0x103)}, topology, sdk);
+    ASSERT_EQ(registered.size(), 1U);
+    EXPECT_EQ(registered[0].ccu_id, 7U);
+    EXPECT_EQ(sdk.observations.front().binding.ccu_id, 7U);
+    EXPECT_EQ(sdk.observations.front().binding.rank_id, 1U);
+    EXPECT_EQ(sdk.observations.front().binding.channels[0], 0xabcU);
+}
+TEST(CcuDomainRegistration, RankSpecializationMismatchFailsBeforeSdkCalls) {
+    auto definition = kernel(99, 0, 0x103);
+    definition.record.required_rank_count = 4;
+    auto topology = request();
+    topology.missions.resize(1);
+    FakeSdk sdk;
+    EXPECT_THROW(simpler::ccu::register_domain_kernels({definition}, topology, sdk), DomainRegistrationError);
+    EXPECT_TRUE(sdk.observations.empty());
+}
+TEST(CcuDomainRegistration, DuplicateSelectedIdsFailBeforeSdkCalls) {
+    auto topology = request();
+    topology.ccu_ids = {7, 7};
+    FakeSdk sdk;
+    EXPECT_THROW(
+        simpler::ccu::register_domain_kernels({kernel(1, 0, 0x103), kernel(2, 0, 0x104)}, topology, sdk),
+        DomainRegistrationError
+    );
+    EXPECT_TRUE(sdk.observations.empty());
+}
 }  // namespace

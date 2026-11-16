@@ -337,6 +337,19 @@ int comm_register_ccu_callable(
     uint32_t domain_rank, const void *module_package, size_t module_package_size, const uint8_t sdk_build_id[32],
     const uint8_t pto_isa_build_id[32], uint64_t *registration_id
 );
+/* Domain registration and execution-set APIs are optional backend symbols. */
+int comm_register_domain_ccu(
+    CommHandle h, uint64_t allocation_id, uint64_t collective_id, uint32_t ccu_id, const void *module_package,
+    size_t module_package_size, const uint8_t sdk_build_id[32], const uint8_t pto_isa_build_id[32],
+    uint64_t *registration_id
+);
+int comm_release_ccu_registration(CommHandle h, uint64_t registration_id);
+int comm_prepare_ccu_run_set(
+    CommHandle h, const uint64_t *registrations, size_t count, uint64_t generation, uint64_t *set_id,
+    uint64_t *workspace
+);
+int comm_control_ccu_run_set(CommHandle h, uint64_t set_id, uint32_t operation);
+
 /* Prepare independent run storage; valid while a previous execution is active. */
 int comm_prepare_ccu_run(
     CommHandle h, uint64_t registration_id, uint64_t generation, uint64_t allocation_id, uint64_t *workspace

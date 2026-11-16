@@ -18,6 +18,8 @@ using namespace simpler::ccu;
 
 class FakeSdk final : public RunLifecycleSdk {
 public:
+    int stops{};
+    int stop_error{};
     int launches{};
     int aborts{};
     int ready_error{};
@@ -38,6 +40,12 @@ public:
     int query_stream(uint64_t stream, StreamState *state) override {
         *state = streams[stream];
         return stream_error;
+    }
+    int stop_completed_stream(uint64_t stream) override {
+        ++stops;
+        if (stop_error) return stop_error;
+        streams[stream] = StreamState::COMPLETE;
+        return 0;
     }
     int abort_stream(uint64_t) override {
         ++aborts;
@@ -108,6 +116,46 @@ TEST(CcuRunLifecycle, RejectsOverlapAndPreservesStreamFailure) {
     sdk.stream_error = 81;
     EXPECT_FALSE(run->poll_terminal());
     EXPECT_EQ(run->primary_failure()->native_error, 81);
+    EXPECT_TRUE(owner.resources_retained());
+}
+TEST(CcuRunLifecycle, ResidentCompletionConfirmsEveryStreamAndAllowsReuse) {
+    FakeSdk sdk;
+    DomainRunLifecycle owner;
+    auto run = owner.begin_run(12, programs(), {mission(0), mission(1)}, sdk);
+    run->launch_all();
+    sdk.streams[11] = StreamState::COMPLETE;
+    sdk.streams[12] = StreamState::RUNNING;
+    ASSERT_TRUE(run->finish_completed_requests());
+    EXPECT_EQ(sdk.stops, 1);
+    EXPECT_EQ(sdk.aborts, 0);
+    EXPECT_TRUE(run->confirmed_stopped());
+    EXPECT_FALSE(run->failed());
+    EXPECT_TRUE(owner.admission_open());
+    EXPECT_FALSE(owner.resources_retained());
+    EXPECT_NO_THROW(owner.begin_run(13, programs(), {mission(0)}, sdk));
+}
+TEST(CcuRunLifecycle, ResidentStopFailureCannotReleaseOrReopenAdmission) {
+    FakeSdk sdk;
+    DomainRunLifecycle owner;
+    auto run = owner.begin_run(14, programs(), {mission(0), mission(1)}, sdk);
+    run->launch_all();
+    sdk.stop_error = 91;
+    EXPECT_FALSE(run->finish_completed_requests());
+    EXPECT_EQ(sdk.stops, 2);
+    EXPECT_EQ(run->primary_failure()->native_error, 91);
+    EXPECT_FALSE(run->confirmed_stopped());
+    EXPECT_TRUE(owner.resources_retained());
+    EXPECT_FALSE(owner.admission_open());
+    EXPECT_THROW(owner.begin_run(15, programs(), {mission(0)}, sdk), std::runtime_error);
+}
+TEST(CcuRunLifecycle, UnknownStreamStateCannotBeReclassifiedAsExpectedStop) {
+    FakeSdk sdk;
+    DomainRunLifecycle owner;
+    auto run = owner.begin_run(16, programs(), {mission(0)}, sdk);
+    run->launch_all();
+    sdk.streams[11] = StreamState::UNKNOWN;
+    EXPECT_FALSE(run->finish_completed_requests());
+    EXPECT_EQ(sdk.stops, 0);
     EXPECT_TRUE(owner.resources_retained());
 }
 }  // namespace

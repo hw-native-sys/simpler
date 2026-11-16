@@ -76,4 +76,16 @@ private:
     std::map<std::vector<uint8_t>, std::weak_ptr<NativeModule>> modules_;
 };
 
+struct NativeKernelSelection {
+    std::shared_ptr<NativeModule> module;
+    uint32_t kernel_index{};
+    std::vector<uint8_t> cache_identity;
+};
+
+NativeModuleCache &native_module_cache();
+NativeKernelSelection select_native_kernel(
+    const std::vector<std::vector<uint8_t>> &modules, uint32_t ccu_id, const ExpectedBuildIdentity &expected_identity,
+    NativeModuleCache &cache
+);
+
 }  // namespace simpler::ccu

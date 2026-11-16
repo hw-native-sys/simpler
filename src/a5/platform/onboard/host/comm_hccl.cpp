@@ -51,6 +51,7 @@
 #include <fstream>
 #include <memory>
 #include <map>
+#include <set>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -105,9 +106,13 @@ struct CcuCallableRegistration {
     simpler::ccu::HcommDomainSession *session = nullptr;
     std::vector<simpler::ccu::HcommPreparedMission> controls;
     std::vector<uint8_t> package;
+    std::vector<uint8_t> definition_identity;
     simpler::ccu::ExpectedBuildIdentity identity{};
     std::vector<uint32_t> rank_ids;
     uint64_t collective_id = 0;
+    uint64_t allocation_id = 0;
+    uint32_t ccu_id = UINT32_MAX;
+    uint64_t acquisition_count = 1;
     std::map<uint64_t, uint64_t> prepared_allocations;
 };
 
@@ -130,6 +135,9 @@ struct DomainAllocation {
     CommWorkspaceConfig workspace_config{1, 0};
     uint32_t urma_aiv_count = pto::comm::urma::kUrmaAutoAivCount;
     CcuCallableRegistration *ccu = nullptr;
+    std::shared_ptr<simpler::ccu::HcommDomainChannels> ccu_channels;
+    std::map<uint64_t, CcuCallableRegistration *> registrations;
+    uint64_t active_ccu_run = 0;
     std::vector<uint32_t> rank_ids;
     HcclComm urma_comm = nullptr;
     std::unique_ptr<pto::comm::urma::UrmaWorkspaceManager> urma_workspace;
@@ -143,6 +151,16 @@ struct DomainAllocation {
     SimplerCcuWorkspace ccu_workspace{};
     void *ccu_workspace_addr = nullptr;
     size_t mapping_size = 0;
+};
+
+struct CcuRunSet {
+    uint64_t generation{};
+    std::vector<uint64_t> registrations;
+    std::map<uint64_t, void *> domain_controls;
+    std::map<uint64_t, uint32_t> domain_counts;
+    void *ready_controls{};
+    void *workspace{};
+    bool activated{};
 };
 
 struct CommHandle_ {
@@ -163,6 +181,9 @@ struct CommHandle_ {
     std::unordered_set<uint64_t> used_domain_ids;
     std::map<uint64_t, std::unique_ptr<CcuCallableRegistration>> ccu_registrations;
     uint64_t next_ccu_registration = 1;
+    std::map<uint64_t, CcuRunSet> ccu_run_sets;
+    uint64_t next_ccu_run_set = 1;
+    simpler::ccu::HcommMissionStreamPool ccu_stream_pool;
     bool cleanup_failed = false;
     std::unique_ptr<pto::comm::sdma::SdmaWorkspaceManager> sdma_workspace;
     void *sdma_workspace_addr = nullptr;
@@ -982,7 +1003,9 @@ static bool urma_domain_drained(const DomainAllocation &alloc) {
 static bool domain_drained(const DomainAllocation &alloc) {
     if (alloc.cleanup_failed) return false;
     if (!alloc.initialized) return true;  // Failed initialization never publishes device users.
-    return (!alloc.ccu || alloc.ccu->owner->drained()) && urma_domain_drained(alloc);
+    for (const auto &[id, registration] : alloc.registrations)
+        if (!registration->prepared_allocations.empty() || !registration->owner->drained()) return false;
+    return alloc.active_ccu_run == 0 && (!alloc.ccu || alloc.ccu->owner->drained()) && urma_domain_drained(alloc);
 }
 
 // Callers establish local/peer quiescence before closing a published domain.
@@ -994,6 +1017,13 @@ static bool close_domain_resources(DomainAllocation &alloc) {
         if (!alloc.ccu->owner || !alloc.ccu->owner->drained()) return false;
         alloc.ccu = nullptr;
     }
+    for (auto &[id, registration] : alloc.registrations) {
+        if (!registration->prepared_allocations.empty() || !registration->owner->close()) return false;
+        registration->session = nullptr;
+    }
+    alloc.registrations.clear();
+    if (alloc.ccu_channels && !alloc.ccu_channels->close()) return false;
+    alloc.ccu_channels.reset();
     if (alloc.urma_comm != nullptr) {
         if (hccl_comm_destroy(alloc.urma_comm) != HCCL_SUCCESS) return false;
         alloc.urma_comm = nullptr;
@@ -1742,6 +1772,10 @@ static int domain_alloc_via_ipc(
     ctx.rankNum = static_cast<uint32_t>(subset_n);
     ctx.winSize = aligned_size;
     if (ccu_requested) {
+        simpler::ccu::create_hcomm_domain_channels(
+            h->hccl_comm, allocation_id, std::vector<uint32_t>(rank_ids, rank_ids + rank_count), domain_rank,
+            out->ccu_channels
+        );
         std::vector<CommCcuWindow> windows;
         for (size_t i = 0; i < peers.size(); ++i) {
             if (peers[i].ccu_window.l2_rank != rank_ids[i] || peers[i].ccu_window.reserved != 0) return -1;
@@ -2272,7 +2306,7 @@ extern "C" int comm_register_ccu_callable(
         slot->collective_id = collective_id;
         slot->controls = simpler::ccu::prepare_hcomm_ccu_callable(
             h->hccl_comm, collective_id, ranks, domain_rank, identity, modules, "simpler_callable", slot->owner,
-            slot->session
+            slot->session, {}, UINT32_MAX, h->ccu_stream_pool
         );
         if (!slot->owner || slot->controls.empty()) throw std::runtime_error("CCU registration produced no controls");
         *registration_id = id;
@@ -2299,6 +2333,285 @@ extern "C" int comm_register_ccu_callable(
         }
     }
     return -1;
+}
+
+extern "C" int comm_register_domain_ccu(
+    CommHandle h, uint64_t allocation_id, uint64_t collective_id, uint32_t ccu_id, const void *module_package,
+    size_t module_package_size, const uint8_t sdk_build_id[32], const uint8_t pto_isa_build_id[32],
+    uint64_t *registration_id
+) {
+    uint64_t pending = 0;
+    try {
+        if (h && h->cleanup_failed) return COMM_RECLAMATION_UNCONFIRMED;
+        if (!h || !module_package || !module_package_size || !sdk_build_id || !pto_isa_build_id || !registration_id ||
+            ccu_id == UINT32_MAX)
+            return -1;
+        const auto domain = h->domain_allocations.find(allocation_id);
+        if (domain == h->domain_allocations.end() || !domain->second->initialized || !domain->second->ccu_channels)
+            return -1;
+        if (domain->second->cleanup_failed) return COMM_RECLAMATION_UNCONFIRMED;
+        auto &allocation = *domain->second;
+        const auto modules = unpack_ccu_modules(module_package, module_package_size);
+        simpler::ccu::ExpectedBuildIdentity identity{};
+        std::copy_n(sdk_build_id, identity.sdk.size(), identity.sdk.begin());
+        std::copy_n(pto_isa_build_id, identity.pto_isa.size(), identity.pto_isa.begin());
+        const auto selected =
+            simpler::ccu::select_native_kernel(modules, ccu_id, identity, simpler::ccu::native_module_cache());
+        const auto required_ranks = selected.module->kernels()[selected.kernel_index].record.required_rank_count;
+        if (required_ranks != 0 && required_ranks != allocation.rank_ids.size()) return -1;
+        for (const auto &[id, cached] : allocation.registrations) {
+            if (cached->ccu_id == ccu_id && cached->definition_identity == selected.cache_identity &&
+                cached->identity.sdk == identity.sdk && cached->identity.pto_isa == identity.pto_isa &&
+                !cached->owner->closed()) {
+                if (cached->acquisition_count == UINT64_MAX) return -1;
+                ++cached->acquisition_count;
+                *registration_id = id;
+                return 0;
+            }
+        }
+        const auto id = h->next_ccu_registration++;
+        auto slot = std::make_unique<CcuCallableRegistration>();
+        slot->allocation_id = allocation_id;
+        slot->ccu_id = ccu_id;
+        slot->definition_identity = selected.cache_identity;
+        slot->identity = identity;
+        slot->rank_ids = allocation.rank_ids;
+        auto &registration = *h->ccu_registrations.emplace(id, std::move(slot)).first->second;
+        pending = id;
+        allocation.registrations.emplace(id, &registration);
+        registration.controls = simpler::ccu::prepare_hcomm_ccu_callable(
+            h->hccl_comm, collective_id, allocation.rank_ids, allocation.rank, identity, modules,
+            "simpler_domain_" + std::to_string(id), registration.owner, registration.session, allocation.ccu_channels,
+            ccu_id, h->ccu_stream_pool
+        );
+        *registration_id = id;
+        return 0;
+    } catch (const std::exception &error) {
+        LOG_ERROR("[comm] domain CCU registration failed: %s", error.what());
+    } catch (...) {
+        LOG_ERROR("[comm] domain CCU registration failed with an unknown exception");
+    }
+    try {
+        if (h && pending != 0) {
+            auto &registration = *h->ccu_registrations.at(pending);
+            if (registration.owner && !registration.owner->close()) {
+                h->cleanup_failed = true;
+                return COMM_RECLAMATION_UNCONFIRMED;
+            }
+            h->domain_allocations.at(allocation_id)->registrations.erase(pending);
+            h->ccu_registrations.erase(pending);
+        }
+    } catch (...) {
+        if (h) h->cleanup_failed = true;
+        return COMM_RECLAMATION_UNCONFIRMED;
+    }
+    return -1;
+}
+
+extern "C" int comm_release_ccu_registration(CommHandle h, uint64_t id) try {
+    if (!h || h->cleanup_failed) return -1;
+    auto found = h->ccu_registrations.find(id);
+    if (found == h->ccu_registrations.end()) return -1;
+    auto &registration = *found->second;
+    if (registration.acquisition_count > 1) {
+        --registration.acquisition_count;
+        return 0;
+    }
+    if (!registration.prepared_allocations.empty()) return -1;
+    if (registration.owner && !registration.owner->close()) {
+        h->cleanup_failed = true;
+        return COMM_RECLAMATION_UNCONFIRMED;
+    }
+    const auto domain = h->domain_allocations.find(registration.allocation_id);
+    if (domain != h->domain_allocations.end()) domain->second->registrations.erase(id);
+    h->ccu_registrations.erase(found);
+    return 0;
+} catch (...) {
+    return COMM_RECLAMATION_UNCONFIRMED;
+}
+
+static void ccu_copy_to_device(void *target, const void *source, size_t bytes) {
+    if (aclrtMemcpy(target, bytes, source, bytes, ACL_MEMCPY_HOST_TO_DEVICE) != ACL_SUCCESS)
+        throw std::runtime_error("CCU control publication failed");
+}
+static void ccu_allocate_copy(void *&target, const void *source, size_t bytes) {
+    if (aclrtMalloc(&target, bytes, ACL_MEM_MALLOC_HUGE_FIRST) != ACL_SUCCESS)
+        throw std::runtime_error("CCU control allocation failed");
+    ccu_copy_to_device(target, source, bytes);
+}
+static bool release_ccu_set_storage(CcuRunSet &run) {
+    for (auto &[id, table] : run.domain_controls) {
+        if (table && aclrtFree(table) != ACL_SUCCESS) return false;
+        table = nullptr;
+    }
+    if (run.workspace && aclrtFree(run.workspace) != ACL_SUCCESS) return false;
+    run.workspace = nullptr;
+    if (run.ready_controls && aclrtFree(run.ready_controls) != ACL_SUCCESS) return false;
+    run.ready_controls = nullptr;
+    return true;
+}
+
+extern "C" int comm_prepare_ccu_run_set(
+    CommHandle h, const uint64_t *ids, size_t count, uint64_t generation, uint64_t *set_id, uint64_t *workspace
+) {
+    uint64_t pending = 0;
+    try {
+        if (!h || h->cleanup_failed || !ids || !count || !generation || !set_id || !workspace) return -1;
+        std::set<uint64_t> unique(ids, ids + count);
+        std::set<std::pair<uint64_t, uint32_t>> locations;
+        for (auto id : unique) {
+            auto found = h->ccu_registrations.find(id);
+            if (found == h->ccu_registrations.end()) return -1;
+            auto &registration = *found->second;
+            if (!registration.owner || registration.owner->closed() || registration.ccu_id == UINT32_MAX ||
+                !h->domain_allocations.count(registration.allocation_id) ||
+                !locations.emplace(registration.allocation_id, registration.ccu_id).second)
+                return -1;
+        }
+        const auto id = h->next_ccu_run_set++;
+        auto &run = h->ccu_run_sets[id];
+        pending = id;
+        run.generation = generation;
+        std::map<uint64_t, std::vector<SimplerCcuControl>> tables;
+        std::vector<SimplerCcuControl> ready;
+        for (auto registration_id : unique) {
+            auto &registration = *h->ccu_registrations.at(registration_id);
+            if (!registration.prepared_allocations.emplace(generation, registration.allocation_id).second)
+                throw std::runtime_error("duplicate CCU run generation");
+            run.registrations.push_back(registration_id);
+            const auto address = registration.session->prepare(registration.controls, generation);
+            SimplerCcuWorkspace prepared{};
+            if (aclrtMemcpy(
+                    &prepared, sizeof(prepared), reinterpret_cast<void *>(address), sizeof(prepared),
+                    ACL_MEMCPY_DEVICE_TO_HOST
+                ) != ACL_SUCCESS)
+                throw std::runtime_error("cannot read CCU preparation");
+            SimplerCcuControl control{};
+            const auto source = prepared.controls_addr + registration.ccu_id * sizeof(control);
+            if (aclrtMemcpy(
+                    &control, sizeof(control), reinterpret_cast<void *>(source), sizeof(control),
+                    ACL_MEMCPY_DEVICE_TO_HOST
+                ) != ACL_SUCCESS)
+                throw std::runtime_error("cannot read CCU control");
+            auto &table = tables[registration.allocation_id];
+            if (table.size() <= registration.ccu_id) table.resize(registration.ccu_id + 1);
+            table[registration.ccu_id] = control;
+            control.ccu_id = ready.size();
+            ready.push_back(control);
+        }
+        for (const auto &[allocation, table] : tables) {
+            ccu_allocate_copy(run.domain_controls[allocation], table.data(), table.size() * sizeof(table.front()));
+            run.domain_counts[allocation] = table.size();
+        }
+        ccu_allocate_copy(run.ready_controls, ready.data(), ready.size() * sizeof(ready.front()));
+        SimplerCcuWorkspace combined{};
+        combined.struct_size = sizeof(combined);
+        combined.ccu_count = ready.size();
+        combined.run_generation = generation;
+        combined.controls_addr = reinterpret_cast<uint64_t>(run.ready_controls);
+        combined.control_size = sizeof(SimplerCcuControl);
+        ccu_allocate_copy(run.workspace, &combined, sizeof(combined));
+        *set_id = id;
+        *workspace = reinterpret_cast<uint64_t>(run.workspace);
+        return 0;
+    } catch (const std::exception &error) {
+        LOG_ERROR("[comm] prepare CCU set failed: %s", error.what());
+    }
+    if (h && pending) {
+        auto &run = h->ccu_run_sets.at(pending);
+        try {
+            for (auto id : run.registrations) {
+                auto &registration = *h->ccu_registrations.at(id);
+                registration.session->discard(generation);
+                registration.prepared_allocations.erase(generation);
+            }
+            if (!release_ccu_set_storage(run)) return COMM_RECLAMATION_UNCONFIRMED;
+            h->ccu_run_sets.erase(pending);
+        } catch (...) {
+            return COMM_RECLAMATION_UNCONFIRMED;
+        }
+    }
+    return -1;
+}
+
+extern "C" int comm_control_ccu_run_set(CommHandle h, uint64_t id, uint32_t operation) try {
+    if (!h) return -1;
+    const auto found = h->ccu_run_sets.find(id);
+    if (found == h->ccu_run_sets.end()) return -1;
+    auto &run = found->second;
+    if (operation == 1) {
+        if (h->cleanup_failed || run.activated) return -1;
+        for (const auto &[other_id, other] : h->ccu_run_sets)
+            if (other_id != id && other.activated) return -1;
+        for (auto registration_id : run.registrations)
+            if (!h->ccu_registrations.at(registration_id)->owner->drained()) return -1;
+        run.activated = true;
+        for (auto registration_id : run.registrations) {
+            auto &registration = *h->ccu_registrations.at(registration_id);
+            registration.session->begin(
+                *registration.owner, registration.controls, run.generation, registration.allocation_id
+            );
+        }
+        for (const auto &[allocation_id, table] : run.domain_controls) {
+            auto &allocation = *h->domain_allocations.at(allocation_id);
+            auto &published = allocation.ccu_workspace;
+            published.ccu_count = run.domain_counts.at(allocation_id);
+            published.controls_addr = reinterpret_cast<uint64_t>(table);
+            published.control_size = sizeof(SimplerCcuControl);
+            published.run_generation = run.generation;
+            allocation.active_ccu_run = id;
+            ccu_copy_to_device(allocation.ccu_workspace_addr, &published, sizeof(published));
+        }
+        return 0;
+    }
+    if (operation == 3 || operation == 9) {
+        bool complete = true;
+        for (auto registration_id : run.registrations) {
+            auto &registration = *h->ccu_registrations.at(registration_id);
+            const bool stopped =
+                operation == 9 ? registration.session->finish_completed_requests() : registration.session->stop();
+            complete = stopped && complete;
+        }
+        return complete ? 0 : 1;
+    }
+    if (operation == 4) {
+        h->cleanup_failed = true;
+        for (auto registration_id : run.registrations) {
+            try {
+                h->ccu_registrations.at(registration_id)->session->abort();
+            } catch (...) {}
+        }
+        return COMM_RECLAMATION_UNCONFIRMED;
+    }
+    if (operation == 7) {
+        for (auto registration_id : run.registrations) {
+            auto &registration = *h->ccu_registrations.at(registration_id);
+            if (run.activated && !registration.owner->drained()) return COMM_RECLAMATION_UNCONFIRMED;
+        }
+        for (auto &[allocation_id, table] : run.domain_controls) {
+            auto &allocation = *h->domain_allocations.at(allocation_id);
+            if (allocation.active_ccu_run != id) continue;
+            auto &published = allocation.ccu_workspace;
+            published.ccu_count = 0;
+            published.controls_addr = 0;
+            published.control_size = 0;
+            published.run_generation = 0;
+            ccu_copy_to_device(allocation.ccu_workspace_addr, &published, sizeof(published));
+            allocation.active_ccu_run = 0;
+        }
+        for (auto registration_id : run.registrations) {
+            auto &registration = *h->ccu_registrations.at(registration_id);
+            registration.session->discard(run.generation);
+            registration.prepared_allocations.erase(run.generation);
+        }
+        if (!release_ccu_set_storage(run)) return COMM_RECLAMATION_UNCONFIRMED;
+        h->ccu_run_sets.erase(found);
+        return 0;
+    }
+    return -1;
+} catch (const std::exception &error) {
+    LOG_ERROR("[comm] CCU set control failed: %s", error.what());
+    return COMM_RECLAMATION_UNCONFIRMED;
 }
 
 extern "C" int comm_prepare_ccu_run(
@@ -2370,6 +2683,8 @@ comm_control_ccu_run(CommHandle h, uint64_t registration_id, uint32_t operation,
     }
     case 3:
         return registration.session->stop() ? 0 : 1;
+    case 9:
+        return registration.session->finish_completed_requests() ? 0 : 1;
     case 4:
         registration.session->abort();
         return COMM_RECLAMATION_UNCONFIRMED;
@@ -2439,6 +2754,11 @@ static int release_domain_windows(
         LOG_ERROR("[comm rank %d] release_domain: reclamation unconfirmed; retaining owner", h->rank);
         return COMM_RECLAMATION_UNCONFIRMED;
     }
+    for (auto entry = h->ccu_registrations.begin(); entry != h->ccu_registrations.end();) {
+        if (entry->second->allocation_id == allocation_id && entry->second->ccu_id != UINT32_MAX)
+            entry = h->ccu_registrations.erase(entry);
+        else ++entry;
+    }
     h->domain_allocations.erase(it);
     return 0;
 } catch (const std::exception &e) {
@@ -2498,7 +2818,8 @@ extern "C" int comm_destroy(CommHandle h) try {
         if (!domain_drained(*entry.second)) return unconfirmed();
     }
     for (const auto &[id, registration] : h->ccu_registrations)
-        if (registration->owner && !registration->owner->drained()) return COMM_RECLAMATION_UNCONFIRMED;
+        if (registration->owner && !registration->owner->closed() && !registration->owner->drained())
+            return COMM_RECLAMATION_UNCONFIRMED;
     const auto destroy_handshake =
         file_marker_handshake::destroy_barrier(h->rootinfo_path, h->rank, h->nranks, h->run_token, options);
     if (!destroy_handshake.ok()) return unconfirmed();
@@ -2512,6 +2833,7 @@ extern "C" int comm_destroy(CommHandle h) try {
     for (auto &[id, registration] : h->ccu_registrations)
         if (registration->owner && !registration->owner->close()) return COMM_RECLAMATION_UNCONFIRMED;
     h->ccu_registrations.clear();
+    if (!h->ccu_stream_pool.close()) return unconfirmed();
     if (h->hccl_comm != nullptr) {
         if (hccl_comm_destroy(h->hccl_comm) != HCCL_SUCCESS) return unconfirmed();
         h->hccl_comm = nullptr;
