@@ -21,8 +21,9 @@ def selected_cases():
         cases = json.loads((ROOT / "workloads" / flavor / "source.json").read_text())["cases"]
         variants = (flavor, "pypto_lib_dsl_all_sync64") if flavor == "pypto_lib_dsl" else (flavor,)
         for variant in variants:
-            for case in cases:
-                yield f"{variant}/{case}"
+            for case, spec in cases.items():
+                if variant in spec.get("variants", variants):
+                    yield f"{variant}/{case}"
 
 
 if __name__ == "__main__":

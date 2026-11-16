@@ -64,7 +64,7 @@ def attach_execution_identities(section, tasks, runtime):
         runtime != "host_build_graph"
         or not isinstance(section, dict)
         or set(section) != {"schema", "producer", "records"}
-        or section["schema"] != "hbg-execution-identity-v2"
+        or section["schema"] != "hbg-execution-identity"
         or section["producer"] != "aicore"
         or not isinstance(section["records"], list)
     ):

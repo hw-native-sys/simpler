@@ -75,9 +75,9 @@ scheduler_native_template_checked(uint64_t base, __gm__ const SchedulerNativeGra
     const uint64_t end = header.readonly_end_offset;
     if (entry->reserved[0] != 0 || entry->reserved[1] != 0 || entry->task_count == 0 ||
         entry->task_count > SUB_TASK_MAX_NUM || entry->edge_count > entry->task_count * (entry->task_count - 1) / 2 ||
-        entry->sink_count == 0 || entry->sink_count > entry->task_count ||
-        entry->definition_bytes < sizeof(GraphDefinition) || entry->definition_bytes > UINT32_MAX ||
-        entry->args_bytes % 64 != 0 || entry->args_bytes > entry->legacy_execution_storage_bytes ||
+        entry->sink_count == 0 || entry->sink_count > entry->task_count || entry->definition_bytes < sizeof(Graph) ||
+        entry->definition_bytes > UINT32_MAX || entry->args_bytes % 64 != 0 ||
+        entry->args_bytes > entry->legacy_execution_storage_bytes ||
         entry->definition_offset < header.instances_offset + header.instance_count * sizeof(SchedulerGraphInstance) ||
         !scheduler_native_region_valid(
             end, entry->definition_offset, entry->definition_bytes, 1, GRAPH_DEFINITION_OBJECT_ALIGN
@@ -92,14 +92,13 @@ scheduler_native_template_checked(uint64_t base, __gm__ const SchedulerNativeGra
         entry->child_plans_offset < entry->definition_offset + entry->definition_bytes ||
         entry->sinks_offset < entry->child_plans_offset + entry->task_count * sizeof(SchedulerGraphChildPlan))
         return nullptr;
-    auto *def = reinterpret_cast<__gm__ const GraphDefinition *>(base + entry->definition_offset);
+    auto *def = reinterpret_cast<__gm__ const Graph *>(base + entry->definition_offset);
     if (def->total_bytes != entry->definition_bytes || def->task_count <= 0 || def->edge_count < 0 ||
         static_cast<uint64_t>(def->task_count) != entry->task_count ||
         static_cast<uint64_t>(def->edge_count) != entry->edge_count || def->graph_key != entry->graph_key ||
         def->required_heap != entry->required_heap ||
         def->execution_storage_bytes != entry->legacy_execution_storage_bytes ||
-        def->off_fanin_offsets < sizeof(GraphDefinition) ||
-        (entry->edge_count != 0 && def->off_fanin_indices < sizeof(GraphDefinition)) ||
+        def->off_fanin_offsets < sizeof(Graph) || (entry->edge_count != 0 && def->off_fanin_indices < sizeof(Graph)) ||
         entry->fanin_offsets_offset != entry->definition_offset + def->off_fanin_offsets ||
         !scheduler_native_region_valid(
             entry->definition_bytes, def->off_fanin_offsets, entry->task_count + 1, sizeof(int32_t), alignof(int32_t)

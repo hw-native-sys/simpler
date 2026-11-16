@@ -1373,7 +1373,9 @@ class TestLevel2Lifecycle:
         clock = _ManualClock()
         monkeypatch.setattr(worker_mod, "_monotonic", clock.monotonic)
         w = Worker(level=3, num_sub_workers=0)
-        w._worker = types.SimpleNamespace(close=lambda: None)  # look "started" for the L3 branch
+        w._worker = types.SimpleNamespace(
+            close=lambda: None, check_control_payloads_retired=lambda: None
+        )  # look "started" for the L3 branch
 
         def consume_pre_child_budget(_self):
             clock.now += 0.6

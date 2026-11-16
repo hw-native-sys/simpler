@@ -44,6 +44,17 @@ def _make_l2_worker():
 
 
 class TestCommittedDeviceMemory:
+    def test_simulator_refuses_vmm_storage_before_any_acl_access(self):
+        worker = _make_l2_worker()
+        try:
+            worker.init()
+            with pytest.raises(ValueError, match="onboard ChipWorker"):
+                worker.malloc(256, exportable=True)
+            ordinary = worker.malloc(256)
+            worker.free(ordinary)
+        finally:
+            worker.close()
+
     def test_rises_on_malloc_and_falls_on_free(self):
         worker = _make_l2_worker()
         worker.init()

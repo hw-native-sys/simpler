@@ -303,3 +303,20 @@ TEST(HandshakeReportEpoch, RetirementInvalidatesUnstampedReportsWithoutErasingHi
 }
 
 }  // namespace
+
+TEST(HandshakeReportEpoch, KernelWindowExcludesIdleCoresButRejectsIncompleteEndpoints) {
+    Handshake reports[3]{};
+    reports[0].work_start_cycle = 100;
+    reports[0].work_end_cycle = 200;
+    reports[2].work_start_cycle = 150;
+    reports[2].work_end_cycle = 300;
+    AicoreWorkWindow window{};
+    ASSERT_TRUE(aicore_reduce_work_window(reports, 3, window, true));
+    EXPECT_EQ(window.start_cycle, 100u);
+    EXPECT_EQ(window.end_cycle, 300u);
+    EXPECT_FALSE(aicore_reduce_work_window(reports, 3, window));
+    reports[1].work_end_cycle = 250;
+    EXPECT_FALSE(aicore_reduce_work_window(reports, 3, window, true));
+    Handshake idle[2]{};
+    EXPECT_FALSE(aicore_reduce_work_window(idle, 2, window, true));
+}

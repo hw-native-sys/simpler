@@ -88,7 +88,7 @@ using TestOrchFinishFunc = void (*)();
 struct TestHostOrchEntryPoints {
     TestOrchEntryFunc entry{nullptr};
     TestOrchBindFunc bind{nullptr};
-    TestOrchFinishFunc finish{nullptr};
+    TestOrchFinishFunc finish{+[]() {}};
 };
 
 // An orchestration that submits nothing: this suite is about the ledger, and a
@@ -905,6 +905,7 @@ protected:
 // hbg used to reject it: the staging loop handed it to HostTensorAccessor::add,
 // which refuses an empty region, and the bind failed with "no host view". TRB
 // has always passed it through, and hbg now matches.
+
 TEST_F(HbgBindLedgerTest, AnEmptyTensorIsPassedThroughAndTakesNoSlice) {
     Runtime runtime;
     init_runtime(runtime);
@@ -1438,11 +1439,6 @@ TEST_F(HbgBindLedgerTest, SchedulerModeChangesPublishOnlyThisRunsSources) {
             snapshots.emplace_back(source, source + region.bytes);
         }
         if (a5) {
-            // The bootstrap inputs are host-authored and per run, not per worker:
-            // workers[i].aicpu_ready and .task now carry the AICPU's handshake alone.
-            // Worker i derives its own context from the base, which the AICore does
-            // through scheduler_worker_context_address; that derivation is covered by
-            // test_a5_hbg_scheduler_bootstrap and not re-asserted here.
             const uint32_t mode = runtime.dev.scheduler_bootstrap.runtime_mode;
             const uint64_t base = runtime.dev.scheduler_bootstrap.worker_context_base;
             EXPECT_NE(mode, 0u);
@@ -2926,6 +2922,20 @@ TEST_F(HbgBindLedgerTest, LaunchStagingOwnsPrerequisitesAndImageWithoutPrepareDe
 }
 
 #if __has_include("scheduler/scheduler_args_dump.h")
+
+TEST_F(HbgBindLedgerTest, MissingFinishCallbackRejectsBeforeOrchestration) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    eps_.entry = +[](const ChipTaskArgs &) {
+        FAIL() << "invalid callbacks reached orchestration";
+    };
+    eps_.finish = nullptr;
+    ChipStorageTaskArgs args{};
+    EXPECT_EQ(bind(runtime, args, nullptr, 0), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(runtime.pending_publication().bytes, 0u);
+}
+
 TEST_F(HbgResidentSchedulerStorageTest, GraphHeapReservationContainsArgumentsWithoutAicpuTaskStorage) {
     Runtime runtime;
     init_runtime(runtime);
@@ -3040,8 +3050,6 @@ TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpUsesCurrentAicoreNodesAndCharged
             device_context->native_header_offset,
             device_context->scheduler_state_bytes,
             static_cast<uint32_t>(device_context->original_task_count),
-            static_cast<uint16_t>(device_context->graph_view_version),
-            static_cast<uint16_t>(device_context->graph_view_bytes)
         };
         SchedulerGraphAccess graph(view);
         if (entry != scalar_dump_orch_entry)

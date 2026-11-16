@@ -42,7 +42,7 @@ def capture(level=2):
             )
         )
     result = builder.build()
-    result["aicore_execution_identities"] = dict(schema="hbg-execution-identity-v2", producer="aicore", records=records)
+    result["aicore_execution_identities"] = dict(schema="hbg-execution-identity", producer="aicore", records=records)
     return result
 
 
@@ -204,7 +204,7 @@ def test_each_mix_mask_keeps_fixed_lane_and_group_identity(tmp_path, mask):
             )
         )
     raw = builder.build()
-    raw["aicore_execution_identities"] = dict(schema="hbg-execution-identity-v2", producer="aicore", records=records)
+    raw["aicore_execution_identities"] = dict(schema="hbg-execution-identity", producer="aicore", records=records)
     rows = read(tmp_path, raw)
     assert {r["subtask_slot"] for r in rows} == {slot for slot in range(3) if mask & (1 << slot)}
     assert all(r["group_seq"] == 9 for r in rows)

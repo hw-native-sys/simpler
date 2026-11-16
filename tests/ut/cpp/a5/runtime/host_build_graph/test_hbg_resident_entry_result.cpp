@@ -292,8 +292,6 @@ protected:
         EXPECT_EQ(state->signaled, (std::array<int, kParticipants>{1, 1, 1}));
         EXPECT_EQ(state->retired, (std::array<int, kParticipants>{1, 1, 1}));
         EXPECT_EQ(image->control.active_worker_count, kParticipants);
-        EXPECT_EQ(image->control.aic_active_worker_count, 1u);
-        EXPECT_EQ(image->control.aiv_active_worker_count, 2u);
         EXPECT_FALSE(g_aicpu_executor.init_done_.load());
         EXPECT_EQ(aicpu_release_callables(), 0);
     }

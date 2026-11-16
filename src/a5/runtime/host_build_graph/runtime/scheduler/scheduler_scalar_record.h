@@ -19,9 +19,7 @@
 #include "aicpu/device_time.h"
 #endif
 
-static_assert(
-    static_cast<uint32_t>(SchedPhaseKind::ScalarClusterMixReadyReplacement) < SCHEDULER_SCALAR_STORAGE_EXTENDED
-);
+static_assert(static_cast<uint32_t>(SchedPhaseKind::ScalarBootstrapTopology) < SCHEDULER_SCALAR_STORAGE_EXTENDED);
 
 inline __aicore__ uint64_t scheduler_scalar_clock() {
 #if defined(__CCE_AICORE__)
@@ -170,7 +168,6 @@ struct SchedulerScalarTrace {
         buffer->scalar_poll_loops = poll_loops;
         buffer->scalar_short_intervals = short_intervals;
         buffer->scalar_function_min_cycles = function_min_cycles;
-        buffer->scalar_storage_format = 1;
         buffer->scalar_storage_slots = storage_slots;
         auto *header = reinterpret_cast<__gm__ uint8_t *>(&buffer->scalar_committed);
         const uint64_t bytes = sizeof(SchedulerActivityBuffer) - offsetof(SchedulerActivityBuffer, scalar_committed);

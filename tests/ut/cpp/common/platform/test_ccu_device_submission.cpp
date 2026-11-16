@@ -131,7 +131,7 @@ TEST(CcuDeviceSubmission, RejectsAliasedEventsBeforeRegisteringCompletion) {
     }));
     EXPECT_EQ(f.trigger, 0U);
 }
-TEST(CcuDeviceSubmission, MapsSubsetRankToCommunicationRankForChannelTable) {
+TEST(CcuDeviceSubmission, PreservesLogicalPeerScalarRegardlessOfPhysicalRankMapping) {
     CommCcuWindow windows[]{{0x1000, 1024, 17, 4, 0}, {0x8000, 1024, 29, 2, 0}};
     SimplerCcuWorkspace workspace{};
     workspace.struct_size = sizeof(workspace);
@@ -142,10 +142,10 @@ TEST(CcuDeviceSubmission, MapsSubsetRankToCommunicationRankForChannelTable) {
     domain.rankNum = 2;
     set_comm_workspace(domain, CommWorkspaceKind::CCU, reinterpret_cast<uint64_t>(&workspace), sizeof(workspace));
     using Arg = simpler::ccu::CcuCallArg;
-    const Arg args[]{{Arg::Kind::PeerRank, 1, 0, 0}};
+    const Arg args[]{{Arg::Kind::Scalar, 0, 1, 0}};
     uint64_t words[2]{}, bytes{};
     ASSERT_TRUE(simpler::ccu::resolve_call_args(&domain, args, words, bytes));
-    EXPECT_EQ(words[0], 2u);
+    EXPECT_EQ(words[0], 1u);
     EXPECT_EQ(bytes, 8u);
 }
 TEST(CcuDeviceSubmission, AicpuConsumesEachLocalReadyBeforeAdmission) {

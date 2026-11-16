@@ -21,7 +21,7 @@ import torch
 from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
-from simpler_setup.tools.hbg.native_protocol import has_native_graph, protocol_version
+from simpler_setup.tools.hbg.native_protocol import has_native_graph
 from simpler_setup.tools.swimlane_converter import read_perf_data
 
 pytestmark = [
@@ -82,7 +82,7 @@ def _check_normalized_capture(path, mask):
     raw = json.loads(path.read_text())
     protocol = raw["aicore_protocol"]
     assert protocol["producer"] == "aicore"
-    assert protocol_version(protocol) and not has_native_graph(protocol)
+    assert protocol.get("schema") == "hbg-native-protocol" and not has_native_graph(protocol)
     tasks = [
         task
         for task in protocol["tasks"]

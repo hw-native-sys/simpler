@@ -119,6 +119,8 @@ def export(capture, flavor, output):
             "task_table_sha256": hashlib.sha256((directory / "tasks.tsv").read_bytes()).hexdigest(),
             "edge_table_sha256": hashlib.sha256((directory / "edges.tsv").read_bytes()).hexdigest(),
         }
+        if "variants" in selection[name]:
+            summary[name]["variants"] = selection[name]["variants"]
     manifest = {
         "source_deps_sha256": hashlib.sha256(deps_path.read_bytes()).hexdigest(),
         "source_names_sha256": hashlib.sha256(names_path.read_bytes()).hexdigest(),

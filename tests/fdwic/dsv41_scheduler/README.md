@@ -13,11 +13,17 @@ experiment, not checkpoint accuracy validation. Isolated Attention and Engram
 cases run rank 0 on **one device**. Only `moe`, `layers_19_21`, and the original
 full forward run on **two devices** with real communication and deferred waits.
 
-The matrix contains 16 configurations: three initial PyPTO-lib cases, three
-half-sync DSL cases, three capacity-bounded all-sync DSL cases, and seven latest
+The matrix contains 12 configurations: one initial PyPTO-lib case, three
+half-sync DSL cases, one capacity-bounded all-sync DSL case, and seven latest
 PyPTO-lib cases. The checked-in `workloads/<flavor>/source.json` manifests own
 this selection; both exporters and the run list use them.
 Measurement availability and the timing contract are maintained in [RESULTS.md](RESULTS.md).
+
+Retain scheduler optimizations only when the sum of all 12 case means improves,
+using AICore L0 wall with one warmup and ten measured rounds per case. Include
+the four communicating cases; each two-device round starts after a Device
+rendezvous and contributes the maximum of the ranks' local durations. L1/L3
+are diagnostic and do not replace this acceptance metric.
 
 ## Manual-only execution
 
@@ -54,12 +60,13 @@ inputs and cannot replace tensor parameters or initialization data.
 | c2a_full | yes | yes | yes | yes | 4 |
 | c1a_reindex | - | - | - | yes | 1 |
 | c1a_reuse | - | - | - | yes | 1 |
-| moe | yes | yes | yes | yes | 4 |
+| moe | - | yes | - | yes | 2 |
 | engram | - | - | - | yes | 1 |
-| layers_19_21 | yes | yes | yes | yes | 4 |
+| layers_19_21 | - | yes | - | yes | 2 |
 
-The initial and DSL groups retain their complex-DAG, MoE and multi-layer stress
-cases. Latest SWA, reindex, reuse and Engram supply the remaining short-path,
+Initial PyPTO-lib and all-sync DSL retain C2A full. Half-sync DSL retains
+C2A full, MoE and layers 19–21; latest PyPTO-lib retains all seven selected cases.
+Latest SWA, reindex, reuse and Engram supply the remaining short-path,
 index-refresh, cache-consumer and oversized-block coverage. Standalone c2a_reuse
 and c1a_full are removed; layer20 remains inside layers_19_21. Full-forward
 sources and kernels remain necessary for real prefixes and the multi-layer case.
@@ -122,17 +129,27 @@ original `dev/hbg` `l3_moe`/`l2_moe` orchestration, including the actual
 communication remain device-side reads in AICore tasks. Frozen latest-MoE plans
 are rejected. Initial PyPTO-lib and DSL MoE remain fixed-input replay stress cases.
 
-One compiled native program must pass the original numerical goldens for
-per-rank token counts `0/6`, `6/0` and `72/72`, including all three outputs.
-The full-count case records one warmup and ten measured rounds, Host timing,
-per-rank Device timing and the per-round maximum across ranks. Compile-only
-results never count as a hardware pass; the auditor rejects missing count cases,
-control-read evidence, Host/Device samples or rank data.
+The native MoE case measures `72/72` tokens with one warmup and ten measured
+rounds. This suite is for scheduler performance: native MoE skips numerical
+golden computation, output comparison and the `0/6`/`6/0` functional checks.
+Its result explicitly records `numerical_validation: false`. It still requires
+successful execution, the original Host control-read evidence, complete L0
+AICore endpoints and per-round rank maxima after the Device start rendezvous.
+The replay cases retain their inexpensive reference and output checks.
+
+Native MoE's fixed weights and scales occupy about 2.48 GB (2.31 GiB) across
+both ranks. They are cached under `build/native-weights/`, keyed by model
+revision, Torch version and tensor layout. Cache publication is atomic and
+locked; every load checks model identity, file size and tensor layouts.
+Each initializer returns a fresh tensor. Counts, routing and outputs are not
+cached. The first cache creation includes weight generation; later runtime
+comparisons reuse it without compiling business kernels. See
+[whole-test execution timings](TEST_TIME.md) for cold and warm results.
 
 Native MoE uses the model's original numerical-golden inputs, including nonzero
 weights and count-dependent forced routing. Its refreshed performance row is a
 new workload baseline and must not be interpreted as a speedup or regression
-against the former frozen zero-weight slice. The other15 rows retain their data.
+against the former frozen zero-weight slice. The other 11 active rows retain their data.
 Host controls execute during graph construction, outside Device wall time.
 The other replay cases preserve device execution for their captured controls;
 they do not test dynamic Host `get_tensor_data` reads.
@@ -145,7 +162,7 @@ to copy a compatible existing program. Runtime execution reuses the packed
 native callable, checks its source and binding identity, and loads the supplied
 `RUNTIME_LIB` with `--runtime=host_build_graph` or `--runtime=percounter`.
 Runtime hashes and binding provenance are recorded separately. The original
-model checkout is needed for numerical validation; standalone replay cases
+model checkout is needed to construct the native performance inputs; standalone replay cases
 continue to use only the included sources and inputs.
 
 ## Boundary preparation and validation
@@ -210,14 +227,16 @@ original files under `workloads/` remain source-capture references.
 
 Regenerate prepared bundles after updating the exporter. Existing bundles do
 not acquire this policy automatically. The standard preparation and run
-commands below produce 16 configurations by default. Use `--sync-policy half`
+commands below produce 12 configurations by default. All-sync exports only C2A full;
+its MoE and layers 19–21 variants are outside the active matrix. Use `--sync-policy half`
 to prepare only the half-sync DSL variant, or `--sync-policy all-cap64` for
 only the all-sync DSL variant. Both PyPTO-lib groups retain their native flags.
 
 The all-sync variant uses `record-tool --all-sync-start-cap64` and enables
 every capacity-eligible multi-block compute task in the selected slice.
 The limit is inclusive: 64 for AIV, 32 for AIC/MIX. In this fixture that
-enables 167 of 171 SPMD tasks; four oversized dispatch tasks remain unchanged. The half-sync group enables 87 of 171 tasks.
+enables all 27 SPMD tasks in its C2A full case, compared with 14 in the half-sync
+C2A full case. Across its three cases, the half-sync group enables 87 of 171 tasks.
 Both variants retain the original flavor in `case.json` and identify the
 selected variant separately, so source workload tables and the lower-bound
 analyzers continue to use the same task identities.
@@ -234,7 +253,43 @@ See [BOUND.md](BOUND.md) for the model, optional solver installation,
 reproduction commands and how to distinguish a proven bound from a feasible
 schedule or a proved model optimum.
 
+## Two-device timing boundary
+
+Every two-device performance round must rendezvous on Device before the
+AICPU `RunWall` timer starts. Both ranks must have enqueued the actual run
+before releasing that rendezvous; a Host file barrier alone, or a separate
+`HcclBarrier` followed by independent Host launches, does not establish this
+boundary. Single-device cases keep their existing timing path.
+
+Retain the AICPU entry-to-exit Device interval after the start gate as a
+diagnostic, including scheduling, computation, workload communication and
+shutdown. The primary comparison uses the AICore kernel window defined below.
+Do not subtract estimated Host launch skew or compare counters across devices.
+Run both comparison arms with the same start gate. Historical unsynchronized
+two-device values remain separately labelled and cannot serve as a synchronized
+baseline.
+
 ## Performance presentation contract
+
+Performance comparisons use **L0 AICore wall** for both HBG and percounter:
+the last actual kernel end minus the first actual kernel begin across active
+AIC/AIV cores. Include internal scheduling and dependency gaps; exclude
+AICPU startup and teardown. Use one warmup and ten measured rounds. For two
+devices, rendezvous on Device before every launch, compute each device's own
+duration, then take the maximum rank duration in each round before averaging.
+Never subtract raw counters across devices or across AICore/AICPU clocks.
+
+The replay launcher writes `l0-timing.json` for level `0` and `all`; its `mean_ms`
+is the primary result. Native MoE writes `performance.aicore_wall_us` and
+`performance.aicore_us_mean` in its L0 `result.json`, and retains the raw
+`benchmark.strace.log`. Both require complete kernel endpoint fields from
+`chip.run.runner_run.aicore_wall`; missing, duplicate or invalid endpoints fail
+the run instead of falling back to Device wall or the old percounter loop
+window. Host and Device wall fields remain auxiliary diagnostics.
+
+Historical Device-wall measurements in existing reports retain their original
+labels and cannot be reused as AICore-wall reference values. A refreshed table
+must identify the runtime revision and measurement boundary for each column.
 
 Use one table, with each case followed by initial PyPTO-lib, half-sync DSL,
 all-sync DSL, then latest PyPTO-lib. Keep only the current result set, average milliseconds with six
@@ -334,16 +389,32 @@ flags and kernel registrations, plus `name_map.json` for the production trace co
 Capture console output if exact compiler commands are needed:
 
 ```bash
-bash "$DSV41/build.sh" --pto-isa "$PWD/build/pto-isa" > /tmp/dsv41-build.log 2>&1
+mkdir -p "$DSV41/build"
+bash "$DSV41/build.sh" --pto-isa "$PWD/build/pto-isa" > "$DSV41/build/dsv41-build.log" 2>&1
 ```
 
 ## Prepare and run
 
 Preparation executes each included original full forward once on two A5 devices
-and captures its Host submissions. It generates the selected replay bundles, materializes their local inputs, and prepares native MoE outside the device reservation. Start with a new output directory:
+and captures its Host submissions. It generates the selected replay bundles,
+materializes their local inputs, and prepares native MoE outside the device
+reservation. Build the test-only device-start wrapper **before preparation**,
+including when the selected replay case will later run on one device.
+
+The wrapper compiles only its Host shim and small standalone gate. It copies
+the original Host implementation, AICPU/AICore binaries, dispatcher and pin
+metadata into an independent snapshot; rebuilding the original runtime cannot
+change that snapshot. The renamed Host implementation retains identical
+executable sections. Use new output directories and build a separate wrapper
+for each runtime build being compared:
 
 ```bash
-export DSV41_RUNTIME="$PWD/build/lib/a5/onboard"
+export DSV41_ORIGINAL_RUNTIME="$PWD/build/lib/a5/onboard"
+python3 "$DSV41/production/device_start_gate.py" \
+  --runtime-dir "$DSV41_ORIGINAL_RUNTIME" --output-dir "$DSV41/build/device-start-gate"
+export DSV41_RUNTIME="$PWD/$DSV41/build/device-start-gate/runtime/a5/onboard"
+python3 "$DSV41/production/device_start_gate.py" validate "$DSV41_RUNTIME" host_build_graph
+
 python3 "$DSV41/production/prepare.py" "$DSV41_RUNTIME" "$DSV41/build/prepared" \
   --pypto-lib-root /path/to/pypto-lib-dev-hbg
 
@@ -353,7 +424,26 @@ bash "$DSV41/run.sh" \
 ```
 
 Pass the same `--flavor` selection to preparation when building only a subset.
-To run exactly the selected 16 scenarios, including when an older prepared directory contains extra cases:
+`--cann` and `--pto-isa` select the installed SDK and PTO headers. The builder
+uses that SDK's compiler to emit and decode the device bitcode. It also retains
+the runtime root's `pto_isa_build.json`, so normal runtime pin validation still
+applies. To reuse the same gate for another runtime build, pass `--gate-kernel`
+pointing to the first wrapper's `build/device_start_gate.o`. The manifest records
+source file metadata, copied component sizes and single-TU IR locations; it is
+build evidence, not a hardware-validation result. It performs no file-content
+hash verification. Treat the snapshot as immutable; rebuild old symlink-based
+wrappers with this builder.
+
+All two-device runs require this wrapper. Preparation validates it before
+creating its output directory or launching captures. The launcher and direct
+native MoE execution check the completed manifest and require regular snapshot
+files with the recorded sizes for the selected runtime, dispatcher and pin.
+Missing, linked or size-changed components fail with rebuild instructions; the
+launcher never compiles while holding devices. Native MoE `--compile-only`
+remains available with an unwrapped runtime. Single-device Attention replay
+needs no gate.
+
+To run exactly the selected 12 scenarios, including when an older prepared directory contains extra cases:
 
 ```bash
 while IFS= read -r selected; do
@@ -385,9 +475,13 @@ that production profiling level. Outputs are split by rank and run;
 `result.json` confirms completion and boundary validation, and
 `source-task-map.txt` maps replay task IDs to the original forward.
 
-The launcher prepares each native run before the cross-rank launch barrier,
-then launches, waits and finalizes through the production native lifecycle.
-The peer's Host preparation is therefore outside the measured Device interval.
+The launcher prepares each native run before the cross-rank Host launch barrier.
+For two-device cases, the wrapper additionally queues a device-side rendezvous
+before the unchanged production launch. AICPU Device timing starts after this
+gate completes, excluding peer Host preparation and launch skew. A Host barrier
+alone does not establish this timing boundary. The wrapper logs per-rank gate
+epochs and cycle counts as evidence. Launch, wait and finalization retain the
+production native lifecycle; model kernels and task scheduling are unchanged.
 For a single selected profiling level, warmup uses the same level.
 
 HBG and percounter use the same prepared bundles and original model kernels.

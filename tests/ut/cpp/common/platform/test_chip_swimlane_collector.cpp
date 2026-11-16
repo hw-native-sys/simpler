@@ -1269,7 +1269,7 @@ TEST_F(ChipSwimlaneExportIdentityTest, EveryAicoreRowIsSevenColumnsEndingInItsEp
 TEST_F(ChipSwimlaneExportIdentityTest, NativeSnapshotSelectsSchedulerProducerOnlyForItsRuntime) {
     collector_.begin_run(dir_, ChipSwimlaneLevel::SCHEDULE_TIMING);
     device_run(/*epoch=*/7, /*dispatches=*/2, /*time_base=*/1000);
-    const std::string identity = R"({"schema":"hbg-execution-identity-v1","producer":"aicore","records":[]})";
+    const std::string identity = R"({"schema":"hbg-execution-identity","producer":"aicore","records":[]})";
     ASSERT_TRUE(collector_.set_json_extension(
         7, ChipSwimlaneExtensionSection::AicoreExecutionIdentities, identity.c_str(), identity.size()
     ));
@@ -1286,7 +1286,7 @@ TEST_F(ChipSwimlaneExportIdentityTest, NativeSnapshotSelectsSchedulerProducerOnl
 TEST_F(ChipSwimlaneExportIdentityTest, NativeIdentityDoesNotAuthorizeAmbiguousTaskSources) {
     collector_.begin_run(dir_, ChipSwimlaneLevel::SCHEDULE_TIMING);
     device_run(/*epoch=*/7, /*dispatches=*/2, /*time_base=*/1000);
-    const std::string identity = R"({"schema":"hbg-execution-identity-v1","producer":"aicore","records":[]})";
+    const std::string identity = R"({"schema":"hbg-execution-identity","producer":"aicore","records":[]})";
     ASSERT_TRUE(collector_.set_json_extension(
         7, ChipSwimlaneExtensionSection::AicoreExecutionIdentities, identity.c_str(), identity.size()
     ));

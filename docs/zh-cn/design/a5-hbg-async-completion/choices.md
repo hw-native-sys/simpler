@@ -4,11 +4,10 @@
 
 ## 普通 ready 队列的实现范围 {#ready-queue-implementation-scope}
 
-当前[两队列实现](../a5-hbg-graph-task/two-ready-queues.md)已落地：纯 AIC 与所有 MIX 共用 AIC 业务队列，纯 AIV 使用 AIV 业务队列，固定两条、无分片。每个 worker 只探测自身核类型对应的队列；MIX 的 flags、active/resource mask 和 coordinator 资格仍按原执行协议校验。SPMD/MIX 每个逻辑任务只入队一次。
+当前[目录发现](../a5-hbg-graph-task/ready-queue-design.md)将纯 AIC/所有 MIX 与纯 AIV 分入两份不可变 catalog；每核只扫描其 engine 目录。执行责任由 block ticket、Call Claim 和 group reservation 持有，依赖通过 canonical gate 确认；目录没有 ready enqueue 或共享队头。
 
-ready pool wire 为 version 11，Header 为 64 B，固定两个 descriptor 和两个 queue control；每个 entry 的原子发布字独占 64 B。消费者先用 `ld_dev` 作提示，再原子确认 ref 并 CAS head。具体布局与交权见[当前发布协议](../a5-hbg-graph-task/protocol.md#two-business-ready-queues)。
-
-Graph control inbox、GM MIX mailbox 和异步 CHECK/FINISH 继续独立服务，业务队列为空不能停止这些责任。完整硬件、故障与性能验收仍在进行中，尚不能宣称 18 组模型功能或 14 组单卡性能已全部通过。T/G、T/H4、T/H8、L/G、C/W1/W4 的历史结果保留原被测版本身份，不代表当前代码仍提供对应选项，也不能替代本次验收。
+Graph control scan、GM MIX/group 协议和异步 CHECK/FINISH 独立服务，目录没有 ready 项不能停止这些责任。
+诊断、完整故障与性能证据必须对应具体被测提交；历史队列实验不替代当前验收。
 
 以后重新比较全局队列与分级队列时，需要基于当前代码重新实现候选，并重新证明：有界发布及交权期间的唯一所有权、异步 FINISH 可跨核续接、业务与 CHECK/FINISH 的进展、MIX 实际资源参与、错误退出后的 backing 生命周期。候选先通过相同功能、故障与 2/4 rank 验收，再使用相同基线和计算产物比较性能；不能直接恢复旧代码作为可运行选型。
 

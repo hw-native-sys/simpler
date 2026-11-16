@@ -33,10 +33,10 @@ struct Region {
 };
 
 template <typename T>
-bool section(const GraphDefinition &def, uint32_t offset, int32_t count, std::vector<Region> &regions) {
+bool section(const Graph &def, uint32_t offset, int32_t count, std::vector<Region> &regions) {
     if (count < 0) return false;
     if (count == 0) return offset == 0;
-    if (offset < sizeof(GraphDefinition) || offset % alignof(T) != 0 || offset > def.total_bytes ||
+    if (offset < sizeof(Graph) || offset % alignof(T) != 0 || offset > def.total_bytes ||
         static_cast<uint64_t>(count) > (def.total_bytes - offset) / sizeof(T))
         return false;
     regions.push_back({offset, offset + static_cast<uint64_t>(count) * sizeof(T)});
@@ -50,7 +50,7 @@ T element(const std::vector<std::byte> &image, uint32_t offset, uint32_t index) 
     return value;
 }
 
-bool tensor_record_valid(const simpler::hbg::TensorData &tensor, const GraphDefinition &def, int32_t consumer) {
+bool tensor_record_valid(const simpler::hbg::TensorData &tensor, const Graph &def, int32_t consumer) {
     const TaskId owner = tensor.owner_task_id;
     if (tensor.ndims == 0 || tensor.ndims > MAX_TENSOR_DIMS ||
         (tensor.address_space != AddressSpace::HOST && tensor.address_space != AddressSpace::DEVICE))
@@ -65,12 +65,12 @@ bool tensor_record_valid(const simpler::hbg::TensorData &tensor, const GraphDefi
 }  // namespace
 
 bool native_graph_plan_definition(
-    const void *image, size_t bytes, uint64_t graph_key, NativeGraphDefinitionPlan *out, std::string *error
+    const void *image, size_t bytes, uint64_t graph_key, NativeGraphPlan *out, std::string *error
 ) {
-    if (out == nullptr || image == nullptr || bytes < sizeof(GraphDefinition) || bytes > UINT32_MAX)
+    if (out == nullptr || image == nullptr || bytes < sizeof(Graph) || bytes > UINT32_MAX)
         return fail(error, "invalid Definition extent");
-    NativeGraphDefinitionPlan next;
-    std::memcpy(&next.definition, image, sizeof(GraphDefinition));
+    NativeGraphPlan next;
+    std::memcpy(&next.definition, image, sizeof(Graph));
     const auto &def = next.definition;
     if (def.total_bytes != bytes || def.graph_key != graph_key || def.task_count <= 0 ||
         def.task_count > SUB_TASK_MAX_NUM || def.edge_count < 0 ||

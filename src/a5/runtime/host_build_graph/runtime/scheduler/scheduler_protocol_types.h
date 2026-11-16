@@ -17,6 +17,7 @@
 
 inline constexpr uint64_t SCHEDULER_PROTOCOL_MAGIC = UINT64_C(0x53504d4454520002);
 // A physical synchronous completion aliases the actual last contribution stamps.
+inline constexpr uint32_t SCHEDULER_PROTOCOL_COMPLETION_FROM_GROUP = UINT32_C(1) << 29;
 inline constexpr uint32_t SCHEDULER_PROTOCOL_COMPLETION_FROM_CONTRIBUTION = UINT32_C(1) << 30;
 inline constexpr uint32_t SCHEDULER_PROTOCOL_DEFERRED_FINISH = UINT32_C(1) << 31;
 
@@ -168,7 +169,6 @@ struct alignas(64) SchedulerProtocolExecutionTrace {
     uint32_t logical_block_num;
     uint32_t cluster_index;
     uint32_t cluster_lane;
-    uint32_t publication_mode;
     // Ordinary payloads can be rebuilt before their one entry permit. Only the final
     // publication is retained; these snapshot times consume no event sequence.
     uint64_t publication_before_cycles;
@@ -189,6 +189,7 @@ enum SchedulerProtocolExecutionFlags : uint32_t {
     SCHEDULER_PROTOCOL_PERMIT_NO_LOG = 1U << 5,
     SCHEDULER_PROTOCOL_PAYLOAD_PUBLISHED = 1U << 6,
     SCHEDULER_PROTOCOL_CLUSTER_GROUP = 1U << 7,
+    SCHEDULER_PROTOCOL_PERMIT_PRECLAIM = 1U << 8,
 };
 
 // One worker owns this record; no global event counter participates in scheduling.

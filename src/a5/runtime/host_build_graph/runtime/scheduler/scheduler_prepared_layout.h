@@ -15,23 +15,11 @@
 #include <cstdint>
 #include <type_traits>
 
-#include "dispatch_payload.h"
+#include "kernel_args.h"
 
 inline constexpr uint64_t SCHEDULER_PREPARED_ALIGNMENT = 128;
 
-inline constexpr uint64_t SCHEDULER_PREPARED_VERSION = 4;
-
-enum class SchedulerPreparedPhase : uint8_t {
-    INVALID,
-    BUILT,
-    CLAIMED,
-    RETURNED,
-    FAILED,
-    PARKING,
-    PARKED,
-    GROUP_RESERVED,
-    GROUP_ARMED
-};
+enum class SchedulerPreparedPhase : uint8_t { INVALID, BUILT, CLAIMED, RETURNED, FAILED, GROUP_RESERVED, GROUP_ARMED };
 
 inline constexpr uint64_t SCHEDULER_PREPARED_BINDING_READY = UINT64_C(1) << 24;
 
@@ -69,7 +57,7 @@ struct SchedulerExecutionPlan {
     uint8_t active_lane_count;
 };
 
-// Phase, owner and transfer generation share one atomic word.
+// Phase, fixed owner and identity generation share one atomic word.
 // Cached stores never touch this line during a run.
 struct alignas(128) SchedulerPreparedControl {
     volatile uint64_t state;
@@ -83,9 +71,7 @@ struct alignas(64) SchedulerPreparedCall {
     uint32_t block_idx;
     uint16_t num_args;
     uint8_t subtask_slot;
-    uint8_t reserved;
-    uint64_t reserved_header[3];
-    uint64_t args[DISPATCH_MAX_ARGS];
+    alignas(64) uint64_t args[DISPATCH_MAX_ARGS];
 };
 
 struct alignas(64) SchedulerExecutionBinding {
@@ -101,7 +87,7 @@ struct alignas(64) SchedulerPreparedLayout {
     uint64_t controls_offset;
     uint64_t calls_offset;
     uint64_t bindings_offset;
-    uint64_t version{SCHEDULER_PREPARED_VERSION};
+    uint64_t task_controls_offset;
 };
 
 static_assert(sizeof(SchedulerExecutionPlan) == 16);
@@ -109,6 +95,7 @@ static_assert(sizeof(SchedulerPreparedControl) == 128 && alignof(SchedulerPrepar
 static_assert(sizeof(SchedulerPreparedCall) == 512 && offsetof(SchedulerPreparedCall, args) == 64);
 static_assert(sizeof(SchedulerExecutionBinding) == 128 && offsetof(SchedulerExecutionBinding, global_context) == 64);
 static_assert(sizeof(SchedulerPreparedLayout) == 64);
+static_assert(offsetof(SchedulerPreparedLayout, task_controls_offset) == 56);
 static_assert(
     std::is_trivially_copyable_v<SchedulerExecutionPlan> && std::is_standard_layout_v<SchedulerExecutionPlan>
 );

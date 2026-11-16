@@ -84,7 +84,7 @@ Identity read_identity(const SchedulerRunControl &run) {
 
 struct ErrorFixture {
     ErrorFixture() :
-        storage(2, 3, 8, SchedulerSpmdRequirements{3, 1, 2, 2, 2}) {
+        storage(2, 12, 8, SchedulerSpmdRequirements{12, 4, 2, 2, 2}) {
         for (uint32_t task = 0; task < 2; ++task) {
             graph.mixed(task, LaneMask(/*aic=*/true, /*aiv0=*/true, /*aiv1=*/false));
             auto &metadata = storage.metadata[task];
@@ -98,14 +98,15 @@ struct ErrorFixture {
         }
         storage.prepare_catalog();
         EXPECT_TRUE(scheduler_init_spmd_task_records(base(), storage.layout, 61));
-        for (uint32_t worker = 0; worker < 3; ++worker) {
+        for (uint32_t worker = 0; worker < 12; ++worker) {
             auto &context = storage.contexts[worker];
-            context.is_scheduler = 1;
-            context.scheduler_count = 3;
             context.physical_core_id = static_cast<int32_t>(100 + worker);
             for (uint32_t lane = 0; lane < 3; ++lane)
-                context.cluster_worker_ids[lane] = lane;
+                context.cluster_worker_ids[lane] = worker / 3 * 3 + lane;
             storage.test_graphs[worker] = graph.graph();
+        }
+        for (uint32_t worker = 0; worker < 3; ++worker) {
+            auto &context = storage.contexts[worker];
             locals[worker] = storage.local_context(&context);
             EXPECT_TRUE(scheduler_initialize_admission(base(), locals[worker], &admissions[worker]));
             locals[worker]->admission = &admissions[worker];
@@ -255,7 +256,6 @@ TEST(HbgErrorIdentity, PurePreparationFailureNamesTheExactFillingBlockAmongTwoOw
     auto &metadata = fixture.storage.metadata[0];
     metadata.active_mask = LaneMask::aiv0();
     metadata.flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD;
-    metadata.kernel_ids[0] = UINT16_MAX;
     admission.current_active_mask = metadata.active_mask;
     admission.current_flags = metadata.flags;
     for (uint32_t slot = 0; slot < 2; ++slot) {
@@ -264,7 +264,6 @@ TEST(HbgErrorIdentity, PurePreparationFailureNamesTheExactFillingBlockAmongTwoOw
         local->slots[slot].block_idx = slot + 1;
         local->slots[slot].state = slot == 0 ? SchedulerDispatchSlotState::READY : SchedulerDispatchSlotState::FILLING;
     }
-    fixture.storage.callable_addresses[1] = 0;
     SchedulerReadyClaim ready{};
     ready.task_ref = 0;
     EXPECT_EQ(
@@ -273,7 +272,7 @@ TEST(HbgErrorIdentity, PurePreparationFailureNamesTheExactFillingBlockAmongTwoOw
         ),
         PreparedAccessResult::ERROR
     );
-    EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_CALLABLE));
+    EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED));
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, 0, 2, UINT64_MAX, 1, 1}));
 }
 
@@ -407,8 +406,6 @@ TEST(HbgErrorIdentity, OrdinarySingleBlockPreparationHasKnownBlockWithoutClaimin
     metadata.active_mask = LaneMask::aiv0();
     metadata.logical_block_num = 1;
     metadata.flags = SCHEDULER_TASK_EXECUTABLE;
-    metadata.kernel_ids[0] = UINT16_MAX;
-    fixture.storage.callable_addresses[1] = 0;
     SchedulerReadyClaim ready{};
     ready.task_ref = 0;
     EXPECT_EQ(

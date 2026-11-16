@@ -30,8 +30,6 @@ struct SchedulerSpmdRequirements {
 struct AicoreSchedulerLayout {
     uint64_t total_size;
     uint64_t task_count;
-    uint64_t aic_task_count;
-    uint64_t aiv_task_count;
     uint64_t run_control_offset;
     uint64_t native_readonly_end_offset;
     uint64_t aicpu_lifecycle_traces_offset;
@@ -43,13 +41,11 @@ struct AicoreSchedulerLayout {
     uint64_t activity_buffers_offset;
     uint64_t scalar_records_offset;
     uint64_t graph_summary_offset;
+    uint64_t bootstrap_clusters_offset;
     uint64_t async_layout_offset;
     uint64_t prepared_layout_offset;
     SchedulerPreparedLayout prepared;
-    uint64_t executable_task_count;
     uint64_t executable_subtask_count;
-    uint64_t aic_worker_demand;
-    uint64_t aiv_worker_demand;
     SchedulerSpmdRequirements spmd;
     uint64_t admission_control_offset;
     uint64_t admission_records_offset;

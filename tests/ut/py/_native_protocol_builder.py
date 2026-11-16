@@ -39,7 +39,6 @@ class ProtocolBuilder:
             worker_count=clusters * 3,
             cluster_count=clusters,
             active_worker_count=clusters * 3,
-            scheduler_count=clusters * 3,
             task_events=[],
             tasks=[],
             workers=[],
@@ -54,7 +53,7 @@ class ProtocolBuilder:
         )
         prefix = 0
         for ref, (mask, blocks, deps) in enumerate(shapes):
-            flags = 0 if mask is None else 1 | (2 if deps else 0)
+            flags = 0 if mask is None else 1
             if mask == 0:
                 flags |= 32
             elif mask is not None:
@@ -86,7 +85,6 @@ class ProtocolBuilder:
                     admission_state=0,
                     claim_tickets=0,
                     claim_seal=0,
-                    parked_count=0,
                 )
             )
             raw["inline_completed_count" if mask is None else "resolved_task_count"] += 1
@@ -163,9 +161,11 @@ class ProtocolBuilder:
             self.stamp(record, "before")
             self.stamp(record, "after")
         else:
-            record["flags"] |= 1 << 30
-            record["before"] = contribution["contribution_before"].copy()
-            record["after"] = contribution["contribution_after"].copy()
+            group = "completion_before" in contribution
+            record["flags"] |= 1 << (29 if group else 30)
+            prefix = "completion" if group else "contribution"
+            record["before"] = contribution[f"{prefix}_before"].copy()
+            record["after"] = contribution[f"{prefix}_after"].copy()
         return record
 
     def members(self, task):
@@ -271,19 +271,32 @@ class ProtocolBuilder:
             certificate["seal_value"] = spec["block_num"]
             self.stamp(certificate, "published_before")
             self.stamp(certificate, "published_after")
+        if control["next_block"] == spec["block_num"]:
             control["claim_seal"] = spec["block_num"]
         return result
 
     def complete_block(self, block):
         owner = block["owner"]
+        task = owner["task_ref"]
+        control = self.raw["task_controls"][task]
+        width = owner["active_mask"].bit_count()
         self.stamp(owner, "completion_before")
+        owner["completion_ticket"] = control["completed_subtasks"]
+        control["completed_subtasks"] += width
+        control["pending_compute"] -= width
+        control["completion_debt"] -= width
         self.stamp(owner, "completion_after")
+        if control["pending_compute"] == 0:
+            self.complete_task(task, owner["worker_index"], contribution=owner)
 
     def execute(self, task, block, slot, worker, *, owner=None, group=0, skip=False) -> dict[str, Any]:
         spec = self.raw["tasks"][task]
         mixed, cooperative = bool(spec["flags"] & 4), bool(spec["flags"] & 16)
         if not mixed and not cooperative:
-            self.raw["task_controls"][task]["next_block"] += 1
+            control = self.raw["task_controls"][task]
+            control["next_block"] += 1
+            if control["next_block"] == spec["block_num"]:
+                control["claim_seal"] = spec["block_num"]
         pending = block % 2
         index = (
             spec["trace_base"]
@@ -301,7 +314,6 @@ class ProtocolBuilder:
             block_num=spec["block_num"],
             cluster_index=worker // 3,
             cluster_lane=worker % 3,
-            publication_mode=0,
             publication_count=1,
             publication_before_cycles=self.tick(),
             publication_after_cycles=self.tick(),
@@ -323,7 +335,12 @@ class ProtocolBuilder:
             self.stamp(row, "returned")
             self.stamp(row, "visible")
         self.stamp(row, "completion_consumed")
-        self.contribute(row, None if mixed else owner)
+        if mixed:
+            row.update(
+                contribution_before=[0, 0], contribution_after=[0, 0], contribution_ticket=0, contribution_worker=0
+            )
+        else:
+            self.contribute(row, owner)
         self.stamp(row, "trace_published")
         self.identities.append(
             dict(

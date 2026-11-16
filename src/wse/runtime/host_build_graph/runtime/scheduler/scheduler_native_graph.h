@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <type_traits>
 
-#include "host_build_graph/graph_definition.h"
+#include "host_build_graph/graph.h"
 #include "scheduler_types.h"
 
 inline constexpr uint32_t SCHEDULER_NATIVE_GRAPH_MAGIC = 0x35474248;

@@ -530,7 +530,7 @@ struct DefinitionUploads {
 
 // Prepare the run's Definition objects and bind every outer Graph task to the one
 // with its key. The recorders built most or all of them in place in the block's
-// host staging, each as [GraphDefinitionHeader][Definition image] at the offset it
+// host staging, each as [GraphImageHeader][Definition image] at the offset it
 // claimed, so this pass writes the headers, copies in whatever did not fit, and
 // records the used prefix for synchronous publication. Device initial classify
 // replaces each task's graph_context with an execution constructed in its own heap.
@@ -540,7 +540,7 @@ bool bind_graph_definitions(
 ) {
     *uploads = DefinitionUploads{};
     const size_t count = graph_host_upload_count(graph_state);
-    GraphHostDefinitionList definitions = graph_host_definitions(graph_state);
+    GraphHostImageList definitions = graph_host_definitions(graph_state);
     const auto align_up = [](size_t value) {
         return (value + GRAPH_DEFINITION_OBJECT_ALIGN - 1) & ~(GRAPH_DEFINITION_OBJECT_ALIGN - 1);
     };
@@ -556,14 +556,14 @@ bool bind_graph_definitions(
     // offsets they claimed, so the block starts out that long and the rest are
     // appended past them.
     size_t block_bytes = graph_host_arena_used(graph_state);
-    for (const GraphHostDefinition &entry : definitions.entries) {
-        if (entry.bytes < sizeof(GraphDefinition)) continue;
+    for (const GraphHostImage &entry : definitions.entries) {
+        if (entry.bytes < sizeof(Graph)) continue;
         if (entry.spill == nullptr) {
             packed.emplace(entry.graph_key, PackedDefinition{entry.object_offset, entry.bytes, nullptr, {}, false});
             continue;
         }
         const size_t object_offset = block_bytes;
-        block_bytes += align_up(sizeof(GraphDefinitionHeader) + entry.bytes);
+        block_bytes += align_up(sizeof(GraphImageHeader) + entry.bytes);
         packed.emplace(entry.graph_key, PackedDefinition{object_offset, entry.bytes, entry.spill, {}, false});
         uploads->spilled++;
     }
@@ -589,18 +589,18 @@ bool bind_graph_definitions(
         staging = static_cast<std::byte *>(staging_addr);
         for (const auto &[key, object] : packed) {
             std::byte *base = staging + object.object_offset;
-            std::byte *image = base + sizeof(GraphDefinitionHeader);
+            std::byte *image = base + sizeof(GraphImageHeader);
             if (object.copy != nullptr) std::memcpy(image, object.copy, object.image_bytes);
             // Built value-initialized and copied over the whole header, so every byte
             // of the object's framing — padding included — is defined by this write
             // rather than by what the retained staging held before it.
-            const auto *definition = reinterpret_cast<const GraphDefinition *>(image);
-            GraphDefinitionHeader framing{};
+            const auto *definition = reinterpret_cast<const Graph *>(image);
+            GraphImageHeader framing{};
             framing.magic = GRAPH_DEFINITION_OBJECT_MAGIC;
             framing.graph_key = definition->graph_key;
             framing.definition_bytes = definition->total_bytes;
             std::memcpy(base, &framing, sizeof(framing));
-            const size_t object_bytes = sizeof(GraphDefinitionHeader) + object.image_bytes;
+            const size_t object_bytes = sizeof(GraphImageHeader) + object.image_bytes;
             const size_t padded = align_up(object_bytes);
             std::memset(base + object_bytes, 0, padded - object_bytes);
         }
@@ -645,9 +645,8 @@ bool bind_graph_definitions(
             return false;
         }
         // Validate the prepared bytes that publication will copy to the device.
-        const auto *definition = reinterpret_cast<const GraphDefinition *>(
-            staging + object_it->second.object_offset + sizeof(GraphDefinitionHeader)
-        );
+        const auto *definition =
+            reinterpret_cast<const Graph *>(staging + object_it->second.object_offset + sizeof(GraphImageHeader));
         if (definition->total_bytes != object_it->second.image_bytes) {
             LOG_ERROR("host-orch: Graph task has no matching prepared Definition object");
             return false;
@@ -706,7 +705,7 @@ bool bind_graph_definitions(
         // own launch arguments, so no address in them is shared. graph_context
         // stays null until the device installs this task's execution.
         upload->outer_slot->to_descriptor().graph_definition_offset =
-            static_cast<uint32_t>(object_it->second.object_offset + sizeof(GraphDefinitionHeader));
+            static_cast<uint32_t>(object_it->second.object_offset + sizeof(GraphImageHeader));
         upload->outer_slot->graph_context = nullptr;
     }
     return true;
@@ -900,8 +899,8 @@ int32_t run_host_orchestration(
     // until every recording has ended. What does not fit is built in its own
     // buffer and copied by the upload, which then grows the block, so the arena
     // reaches a run's high-water mark within one bind of needing it.
-    GraphDefinitionArena definition_arena{};
-    definition_arena.object_prefix_bytes = sizeof(GraphDefinitionHeader);
+    GraphImageArena definition_arena{};
+    definition_arena.object_prefix_bytes = sizeof(GraphImageHeader);
     definition_arena.object_align = GRAPH_DEFINITION_OBJECT_ALIGN;
     {
         void *staging = nullptr;

@@ -18,7 +18,7 @@ from simpler_setup.tools.hbg.native_protocol import audit_protocol_sequences, re
 
 def capture(epoch=0):
     return {
-        "schema": "hbg-native-protocol-v20",
+        "schema": "hbg-native-protocol",
         "producer": "aicore",
         "run_epoch": epoch,
         "task_count": 1,
@@ -34,7 +34,6 @@ def capture(epoch=0):
         "resolved_task_count": 1,
         "close_seal_stride": 64,
         "active_worker_count": 3,
-        "scheduler_count": 3,
         "scheduler_error": 0,
         "error_claimed": 0,
         "commit_tail": 0,
@@ -81,7 +80,6 @@ def capture(epoch=0):
                 admission_state=0,
                 claim_tickets=0,
                 claim_seal=0,
-                parked_count=0,
             )
         ],
         "task_events": [
@@ -116,10 +114,37 @@ def test_literal_epochs_and_cycle_zero_survive_without_claiming_causality(epoch)
     assert raw == before
 
 
+def test_task_order_metadata_survives_without_claiming_dependency_order():
+    raw = capture()
+    raw["tasks"][0].update(schedule_rank=7, topological_level=2, bottom_level=3)
+    before = copy.deepcopy(raw)
+    assert read_native_protocol(raw) == before
+    assert audit_protocol_sequences(raw)["sequence_integrity_verified"] is True
+    assert raw == before
+
+
+@pytest.mark.parametrize(
+    "fields",
+    (
+        ("schedule_rank",),
+        ("topological_level",),
+        ("bottom_level",),
+        ("schedule_rank", "topological_level"),
+        ("schedule_rank", "bottom_level"),
+        ("topological_level", "bottom_level"),
+    ),
+)
+def test_partial_task_order_metadata_is_rejected(fields):
+    raw = capture()
+    raw["tasks"][0].update(dict.fromkeys(fields, 0))
+    with pytest.raises(ValueError, match=r"tasks\[0\].*missing or unknown fields"):
+        read_native_protocol(raw)
+
+
 @pytest.mark.parametrize("stride", (None, 0, 8, 63, 65, 128, True, 64.0, "64", -1, 1 << 64))
 def test_compact_schema_requires_64_byte_seals_and_omits_unused_execution_counter(stride):
     raw = capture()
-    raw.update(schema="hbg-native-protocol-v20", close_seal_stride=64)
+    raw.update(schema="hbg-native-protocol", close_seal_stride=64)
     raw["task_controls"][0].update(claim_tickets=0, claim_seal=0)
     assert read_native_protocol(raw) == raw
     raw["executed_task_count"] = 0
@@ -146,8 +171,6 @@ def test_every_root_field_is_required(field):
     "field,value",
     [
         ("schema", "future-v2"),
-        ("schema", "hbg-native-protocol-v12"),
-        ("schema", "hbg-native-protocol-v13"),
         ("producer", "aicpu"),
         ("worker_count", True),
         ("run_epoch", -1),
@@ -238,16 +261,8 @@ def test_parser_preserves_error_and_incomplete_evidence_for_diagnostics():
         audit_protocol_sequences(raw)
 
 
-@pytest.mark.parametrize("version", (*range(1, 20), 22, 23))
-def test_noncurrent_protocol_versions_are_rejected(version):
-    raw = capture()
-    raw["schema"] = f"hbg-native-protocol-v{version}"
-    with pytest.raises(ValueError, match="unsupported schema"):
-        read_native_protocol(raw)
-
-
 @pytest.mark.parametrize(
-    "field", ("claim_tickets", "claim_seal", "parked_count", "canonical_total", "pending_compute", "completion_debt")
+    "field", ("claim_tickets", "claim_seal", "canonical_total", "pending_compute", "completion_debt")
 )
 @pytest.mark.parametrize("value", (None, True, -1, 1 << 64, "0"))
 def test_current_control_words_are_mandatory_uint64(field, value):
@@ -257,4 +272,11 @@ def test_current_control_words_are_mandatory_uint64(field, value):
     else:
         raw["task_controls"][0][field] = value
     with pytest.raises(ValueError, match="fields|integer"):
+        read_native_protocol(raw)
+
+
+def test_current_protocol_does_not_accept_duplicate_scheduler_topology():
+    raw = capture()
+    raw["scheduler_count"] = raw["active_worker_count"]
+    with pytest.raises(ValueError, match="unknown fields"):
         read_native_protocol(raw)

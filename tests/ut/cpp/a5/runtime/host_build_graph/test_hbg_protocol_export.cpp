@@ -27,7 +27,7 @@ struct ProtocolExportFixture : ::testing::Test {
     std::unique_ptr<scheduler_test::SchedulerStateBuffer> storage;
     std::vector<SchedulerProtocolTaskSpec> tasks;
     void SetUp() override {
-        ASSERT_TRUE(scheduler_plan_layout(2, 1, 0, &layout, false, 6, {6, 2, 1, 1, 1}, true));
+        ASSERT_TRUE(scheduler_plan_layout(2, &layout, false, 6, {6, 2, 1, 1, 1}, true));
         storage = std::make_unique<scheduler_test::SchedulerStateBuffer>(layout);
         auto *meta = at<SchedulerTaskMetadata>(layout.task_metadata_offset);
         meta[0].active_mask = LaneMask::all();
@@ -53,8 +53,11 @@ struct ProtocolExportFixture : ::testing::Test {
 
 TEST_F(ProtocolExportFixture, PreservesFrozenGraphAndHostCompletedNodeWithoutFabricatingEvents) {
     at<SchedulerTaskMetadata>(layout.task_metadata_offset)[0].logical_block_num = 99;
+    tasks[0].schedule_rank = 1;
+    tasks[0].topological_level = 0;
+    tasks[0].bottom_level = 2;
     const auto json = dump();
-    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v20\""), std::string::npos);
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol\""), std::string::npos);
     EXPECT_NE(json.find("\"close_seal_stride\":64"), std::string::npos);
     EXPECT_NE(json.find("\"claim_tickets\":0"), std::string::npos);
     EXPECT_EQ(json.find("\"admission_claim_lock\""), std::string::npos);
@@ -65,6 +68,7 @@ TEST_F(ProtocolExportFixture, PreservesFrozenGraphAndHostCompletedNodeWithoutFab
     EXPECT_NE(json.find("\"executions\":[]"), std::string::npos);
     EXPECT_NE(json.find("\"admission_log\":[-1]"), std::string::npos);
     EXPECT_EQ(json.find("protocol_verified"), std::string::npos);
+    EXPECT_NE(json.find("\"schedule_rank\":1,\"topological_level\":0,\"bottom_level\":2"), std::string::npos);
 }
 
 TEST_F(ProtocolExportFixture, NativeSchemaCarriesBothIdentitiesAndIndependentSource) {
@@ -75,7 +79,7 @@ TEST_F(ProtocolExportFixture, NativeSchemaCarriesBothIdentitiesAndIndependentSou
     const auto json = scheduler_export_protocol(
         storage->base(), layout.total_size, layout, 0, tasks, "{\"tasks\":[],\"definitions\":[]}"
     );
-    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v21\""), std::string::npos);
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol\""), std::string::npos);
     EXPECT_NE(json.find("\"original_task_id\":7,\"local_child_id\":3"), std::string::npos);
     EXPECT_NE(json.find("\"graph_source\":{\"tasks\":[],\"definitions\":[]}"), std::string::npos);
 }
@@ -94,7 +98,7 @@ TEST(ProtocolGraphSourceTest, CopiesOriginalCsrAndDeduplicatesDefinitionsByKey) 
     scheduler_test::BasicGraphBuffer<2> original(2);
     original.payload(1).fanin_count = 1;
     original.payload(1).fanin_data()[0] = 0;
-    GraphDefinition def{};
+    Graph def{};
     def.graph_key = 31;
     def.task_count = 2;
     def.edge_count = 1;
@@ -114,11 +118,17 @@ TEST(ProtocolGraphSourceTest, CopiesOriginalCsrAndDeduplicatesDefinitionsByKey) 
     ASSERT_NE(first_key, std::string::npos);
     EXPECT_EQ(json.find("\"graph_key\":31", first_key + 1), std::string::npos);
     EXPECT_EQ(json.find("\"node_map\""), std::string::npos);
-    bytes.resize(sizeof(GraphDefinition) - 1);
+    bytes.resize(sizeof(Graph) - 1);
     EXPECT_THROW(scheduler_protocol_freeze_source(original.graph(), {{1, 0}, {1, 0}}, bytes), std::invalid_argument);
 }
 
 TEST_F(ProtocolExportFixture, ZeroCycleAndMaximumEpochRemainLiteralValues) {
+    const std::vector<SchedulerTaskMetadata> metadata(
+        at<SchedulerTaskMetadata>(layout.task_metadata_offset),
+        at<SchedulerTaskMetadata>(layout.task_metadata_offset) + layout.task_count
+    );
+    ASSERT_TRUE(scheduler_init_data_from_layout(storage->base(), layout, reinterpret_cast<uint64_t>(storage->base())));
+    std::copy(metadata.begin(), metadata.end(), at<SchedulerTaskMetadata>(layout.task_metadata_offset));
     ASSERT_TRUE(scheduler_init_spmd_task_records(storage->base(), layout, UINT64_MAX));
     auto *events = at<SchedulerProtocolTaskTrace>(layout.protocol.tasks_offset);
     events[0].admission.before = {0, 1};
@@ -203,7 +213,7 @@ TEST_F(ProtocolExportFixture, PreservesMemberCountRecordBindingSealAndRawTopolog
 
 TEST(ProtocolCloseSealExport, ReadsEveryClusterAndTaskValueWithoutInterpretingCellPadding) {
     AicoreSchedulerLayout layout{};
-    ASSERT_TRUE(scheduler_plan_layout(2, 2, 2, &layout, false, 8, {6, 2, 2, 2, 2}, true));
+    ASSERT_TRUE(scheduler_plan_layout(2, &layout, false, 8, {6, 2, 2, 2, 2}, true));
     scheduler_test::SchedulerStateBuffer storage(layout);
     auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(storage.base(), layout.task_metadata_offset);
     scheduler_test::BasicGraphBuffer<2> graph(2);
@@ -287,7 +297,7 @@ TEST(ProtocolGraphSnapshot, DependencyOnlyServiceRetainsRoutingWithoutRequiringA
     graph.payload(1).fanin_count = 1;
     graph.payload(1).fanin_data()[0] = 0;
     std::vector<SchedulerTaskMetadata> metadata(2);
-    metadata[1].flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_INLINE | SCHEDULER_TASK_HAS_FANIN;
+    metadata[1].flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_INLINE;
     metadata[1].active_mask = LaneMask::aiv0();
     metadata[1].logical_block_num = 1;
     for (auto &kernel : metadata[1].kernel_ids)

@@ -126,6 +126,27 @@ inline void log_aicore_scheduler_error_identity(SchedulerRunControl *run, const 
     );
 }
 
+// The enclosing error snapshot validates all image regions before this lookup.
+inline bool aicore_prepared_retirement_inferred(
+    uint64_t base, const SchedulerPreparedLayout &layout, uint64_t index, uint64_t state,
+    const SchedulerPreparedCall &call, uint64_t *completion = nullptr
+) {
+    if (scheduler_prepared_phase(state) != SchedulerPreparedPhase::CLAIMED || call.task_ref < 0 ||
+        static_cast<uint64_t>(call.task_ref) >= layout.task_count || index >= layout.execution_count)
+        return false;
+    const auto *plan = reinterpret_cast<const SchedulerExecutionPlan *>(base + layout.plans_offset) + call.task_ref;
+    const auto *task =
+        reinterpret_cast<const SchedulerTaskControl *>(base + layout.task_controls_offset) + call.task_ref;
+    cache_invalidate_range(plan, sizeof(*plan));
+    cache_invalidate_range(
+        reinterpret_cast<const uint8_t *>(task) + offsetof(SchedulerTaskControl, completion_state),
+        sizeof(task->completion_state)
+    );
+    const uint64_t gate = __atomic_load_n(&task->completion_state, __ATOMIC_ACQUIRE);
+    if (completion != nullptr) *completion = gate;
+    return scheduler_prepared_retirement_inferred(state, layout, index, call, *plan, gate);
+}
+
 inline void log_aicore_prepared_cell(uint64_t base, const SchedulerPreparedLayout &layout, uint64_t index) {
     const auto *control = reinterpret_cast<const SchedulerPreparedControl *>(base + layout.controls_offset) + index;
     const auto *shared_call = reinterpret_cast<const SchedulerPreparedCall *>(base + layout.calls_offset) + index;
@@ -134,16 +155,20 @@ inline void log_aicore_prepared_cell(uint64_t base, const SchedulerPreparedLayou
     cache_invalidate_range(shared_call, sizeof(*shared_call));
     rmb();
     const auto call = *shared_call;
+    uint64_t completion = 0;
+    const bool inferred = aicore_prepared_retirement_inferred(base, layout, index, state, call, &completion);
+    const auto phase = inferred ? SchedulerPreparedPhase::RETURNED : scheduler_prepared_phase(state);
     const uint32_t owner = scheduler_prepared_execute_owner(state);
     const int64_t executor = owner == UINT32_MAX ? -1 : static_cast<int64_t>(owner);
     const uint64_t binding = base + layout.bindings_offset + index * sizeof(SchedulerExecutionBinding);
     LOG_ERROR(
-        "A5 HBG prepared cell: index=%" PRIu64 " state=0x%" PRIx64 " phase=%" PRIu64
-        " source=host execute_owner=%" PRId64 " call_epoch=%" PRIu64 " call_index=%" PRIu64 " call_task=%" PRId64
-        " call_block=%" PRIu32 " call_lane=%u num_args=%u function=0x%" PRIx64,
-        index, state, state & UINT64_C(255), executor, call.run_epoch, call.execution_index, call.task_ref,
-        call.block_idx, static_cast<unsigned>(call.subtask_slot), static_cast<unsigned>(call.num_args),
-        call.function_bin_addr
+        "A5 HBG prepared cell: index=%" PRIu64 " state=0x%" PRIx64 " phase=%" PRIu64 " raw_phase=%" PRIu64
+        " return_inferred=%u completion=0x%" PRIx64 " source=host execute_owner=%" PRId64 " call_epoch=%" PRIu64
+        " call_index=%" PRIu64 " call_task=%" PRId64 " call_block=%" PRIu32
+        " call_lane=%u num_args=%u function=0x%" PRIx64,
+        index, state, static_cast<uint64_t>(phase), state & UINT64_C(255), static_cast<unsigned>(inferred), completion,
+        executor, call.run_epoch, call.execution_index, call.task_ref, call.block_idx,
+        static_cast<unsigned>(call.subtask_slot), static_cast<unsigned>(call.num_args), call.function_bin_addr
     );
     LOG_ERROR(
         "A5 HBG prepared contexts: index=%" PRIu64 " local=0x%" PRIx64 " expected_local=0x%" PRIx64 " global=0x%" PRIx64
@@ -188,7 +213,11 @@ inline void log_aicore_prepared_error(const SchedulerWorkerContext *context, Sch
         layout.run_epoch, run->error_run_epoch, run->error_task_ref, run->error_block_idx, run->error_worker_index,
         run->error_cluster_lane
     );
-    if (!region_valid(
+    if (layout.task_controls_offset != context->task_controls_offset ||
+        !region_valid(
+            layout.task_controls_offset, layout.task_count, sizeof(SchedulerTaskControl), alignof(SchedulerTaskControl)
+        ) ||
+        !region_valid(
             layout.plans_offset, layout.task_count, sizeof(SchedulerExecutionPlan), alignof(SchedulerExecutionPlan)
         ) ||
         !region_valid(
@@ -214,6 +243,10 @@ inline void log_aicore_prepared_error(const SchedulerWorkerContext *context, Sch
             cache_invalidate_range(&controls[index], sizeof(controls[index]));
             const uint64_t state = __atomic_load_n(&controls[index].state, __ATOMIC_ACQUIRE);
             if ((state & UINT64_C(255)) != static_cast<uint64_t>(SchedulerPreparedPhase::CLAIMED)) continue;
+            const auto *call = reinterpret_cast<const SchedulerPreparedCall *>(base + layout.calls_offset) + index;
+            cache_invalidate_range(call, sizeof(*call));
+            rmb();
+            if (aicore_prepared_retirement_inferred(base, layout, index, state, *call)) continue;
             log_aicore_prepared_cell(base, layout, index);
             ++reported;
         }

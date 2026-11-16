@@ -291,7 +291,7 @@ TEST(ChipSwimlaneRunExportTest, ExecutionIdentitiesTravelWithTheSealedRunAndAreN
     fixture::PhaseBuffers buffers;
     fixture::populate(collector, buffers, first.path);
     const auto section = ChipSwimlaneExtensionSection::AicoreExecutionIdentities;
-    const std::string payload = R"({"schema":"hbg-execution-identity-v2","producer":"aicore","records":[]})";
+    const std::string payload = R"({"schema":"hbg-execution-identity","producer":"aicore","records":[]})";
     EXPECT_FALSE(collector.set_json_extension(fixture::kEpoch, section, "[]", 2));
     ASSERT_TRUE(collector.set_json_extension(fixture::kEpoch, section, payload.c_str(), payload.size()));
     EXPECT_FALSE(collector.set_json_extension(fixture::kEpoch, section, "{}", 2));
@@ -313,7 +313,7 @@ TEST(ChipSwimlaneRunExportTest, NativeProtocolIsAnOwnedObjectAndDoesNotLeakIntoT
     fixture::PhaseBuffers buffers;
     fixture::populate(collector, buffers, first.path);
     const auto section = ChipSwimlaneExtensionSection::AicoreProtocol;
-    const std::string payload = R"({"schema":"hbg-native-protocol-v1","producer":"aicore","run_epoch":0})";
+    const std::string payload = R"({"schema":"hbg-native-protocol","producer":"aicore","run_epoch":0})";
     EXPECT_FALSE(collector.set_json_extension(fixture::kEpoch, section, "[]", 2));
     ASSERT_TRUE(collector.set_json_extension(fixture::kEpoch, section, payload.c_str(), payload.size()));
     EXPECT_FALSE(collector.set_json_extension(fixture::kEpoch, section, "{}", 2));

@@ -28,13 +28,13 @@
 // Nothing here records or submits. The Graph submit path in host/graph_submit.cpp is a
 // caller of these, which is what keeps the container readable without it.
 
-GraphHostStatePtr make_graph_host_state(const GraphDefinitionArena &arena) {
+GraphHostStatePtr make_graph_host_state(const GraphImageArena &arena) {
     return GraphHostStatePtr{new (std::nothrow) GraphHostState{arena}};
 }
 
 void GraphHostStateDeleter::operator()(GraphHostState *state) const noexcept { delete state; }
 
-const GraphDefinition *graph_record_definition(const GraphHostState &state, const GraphDefinitionRecord &record) {
+const Graph *graph_record_definition(const GraphHostState &state, const GraphCacheRecord &record) {
     if (record.object_offset == GRAPH_NO_OBJECT_OFFSET) {
         return graph_definition(record.spill.data(), record.spill.size());
     }
@@ -53,14 +53,14 @@ std::optional<GraphHostUpload> graph_host_upload(GraphHostState &state, size_t i
 
 size_t graph_host_arena_used(const GraphHostState &state) { return state.arena_cursor.load(std::memory_order_acquire); }
 
-GraphHostDefinitionList graph_host_definitions(GraphHostState &state) {
-    GraphHostDefinitionList list;
+GraphHostImageList graph_host_definitions(GraphHostState &state) {
+    GraphHostImageList list;
     list.entries.reserve(state.definitions.size());
     for (const auto &[key, record] : state.definitions) {
         if (graph_record_definition(state, record) == nullptr) continue;
         const bool spilled = record.object_offset == GRAPH_NO_OBJECT_OFFSET;
         list.entries.push_back(
-            GraphHostDefinition{
+            GraphHostImage{
                 key, record.object_offset, spilled ? record.spill.data() : nullptr,
                 spilled ? record.spill.size() : record.bytes
             }

@@ -511,7 +511,7 @@ TEST(SchedulerState, PlansAndInitializesTaskCatalogAndCompletionState) {
     EXPECT_EQ(offsetof(TaskImageStorage, payload), SCHEDULER_GRAPH_PAYLOAD_OFFSET);
     EXPECT_EQ(offsetof(TaskImagePayload, predicate), SCHEDULER_GRAPH_PREDICATE_OFFSET);
     AicoreSchedulerLayout layout{};
-    ASSERT_TRUE(scheduler_plan_layout(5, 3, 2, &layout));
+    ASSERT_TRUE(scheduler_plan_layout(5, &layout));
     EXPECT_EQ(layout.total_size % SCHEDULER_STATE_ALIGNMENT, 0u);
     EXPECT_EQ(layout.task_metadata_offset % alignof(SchedulerTaskMetadata), 0u);
     EXPECT_EQ(
@@ -546,10 +546,8 @@ TEST(SchedulerState, PlansAndInitializesTaskCatalogAndCompletionState) {
         EXPECT_TRUE(scheduler_completion_valid(controls[task].completion_state));
         EXPECT_FALSE(scheduler_completion_done(controls[task].completion_state));
         EXPECT_EQ(controls[task].next_block, 0u);
-        EXPECT_EQ(controls[task].parked_count, 0u);
     }
     const auto &pool = *scheduler_state_at<SchedulerTaskCatalogHeader>(storage.base(), ready_plan.header_offset);
-    EXPECT_EQ(pool.version, SCHEDULER_TASK_CATALOG_VERSION);
     EXPECT_EQ(pool.entry_count, layout.task_count);
     EXPECT_TRUE(scheduler_task_catalog_validate(storage.base(), layout.total_size, ready_plan.header_offset, 5, 1));
     for (uint32_t type = 0; type < SCHEDULER_EXECUTION_ENGINE_COUNT; ++type) {
@@ -566,7 +564,7 @@ TEST(SchedulerState, PlansAndInitializesTaskCatalogAndCompletionState) {
 
 TEST(SchedulerState, RejectsA64ByteOnlyAllocationBeforeWritingState) {
     AicoreSchedulerLayout layout{};
-    ASSERT_TRUE(scheduler_plan_layout(1, 1, 0, &layout));
+    ASSERT_TRUE(scheduler_plan_layout(1, &layout));
     scheduler_test::SchedulerStateBuffer storage(layout);
     auto *controls = scheduler_state_at<SchedulerTaskControl>(storage.base(), layout.task_controls_offset);
     controls[0].completion_state = 123;
@@ -580,33 +578,25 @@ TEST(SchedulerState, RejectsA64ByteOnlyAllocationBeforeWritingState) {
 TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
     EXPECT_EQ(alignof(SchedulerTaskControl), 128u);
     EXPECT_EQ(alignof(SchedulerExecutorTaskTrace), alignof(uint64_t));
-    EXPECT_EQ(sizeof(SchedulerExecutorTaskTrace), 48u);
+    EXPECT_EQ(sizeof(SchedulerExecutorTaskTrace), 24u);
     EXPECT_EQ(alignof(SchedulerRunControl), 64u);
     EXPECT_EQ(alignof(SchedulerWorkerContext), 64u);
     EXPECT_EQ(alignof(SchedulerTaskTrace), 64u);
+    EXPECT_EQ(sizeof(SchedulerTaskTrace), 256u);
+    EXPECT_EQ(offsetof(SchedulerTaskTrace, execution_run_epoch), 192u);
 
     std::array<SchedulerTaskControl, 2> controls{};
     std::array<SchedulerWorkerContext, 2> contexts{};
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 768u);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 640u);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(&contexts[1]) - reinterpret_cast<uintptr_t>(&contexts[0]), 320u);
     EXPECT_NE(offsetof(SchedulerTaskControl, next_block) / 128, offsetof(SchedulerTaskControl, claim_tickets) / 128);
     EXPECT_NE(offsetof(SchedulerTaskControl, next_block) / 128, offsetof(SchedulerTaskControl, completion_state) / 128);
-    EXPECT_NE(offsetof(SchedulerTaskControl, next_block) / 128, offsetof(SchedulerTaskControl, parked_count) / 128);
-    EXPECT_NE(
-        offsetof(SchedulerTaskControl, completion_state) / 64,
-        offsetof(SchedulerTaskControl, completion_resolve_start_cycles) / 64
-    );
 
     EXPECT_EQ(
         offsetof(SchedulerTaskTrace, dispatch_start_cycles) / 64, offsetof(SchedulerTaskTrace, complete_loop_iter) / 64
     );
     EXPECT_NE(
-        offsetof(SchedulerTaskTrace, dispatch_start_cycles) / 64,
-        offsetof(SchedulerTaskTrace, descriptor_cache_observed_cycles) / 64
-    );
-    EXPECT_NE(
-        offsetof(SchedulerTaskTrace, refill_scheduler_worker_id) / 64,
-        offsetof(SchedulerTaskTrace, descriptor_cache_observed_cycles) / 64
+        offsetof(SchedulerTaskTrace, execution_run_epoch) / 64, offsetof(SchedulerTaskTrace, kernel_start_cycles) / 64
     );
 }
 
@@ -616,10 +606,9 @@ TEST(SchedulerMetadata, ProjectsExistingSubmitTypesWithoutChangingTheirSemantics
     attrs.set_predicate();
     attrs.set_timing_slot(7);
     const uint8_t flags = scheduler_task_metadata_flags_from_submit_state(
-        LaneMask(/*aic=*/true, /*aiv0=*/true, /*aiv1=*/false), attrs, 2, true, false
+        LaneMask(/*aic=*/true, /*aiv0=*/true, /*aiv1=*/false), attrs, 2, false
     );
     EXPECT_TRUE(scheduler_task_is_executable(flags));
-    EXPECT_TRUE(scheduler_task_has_fanin(flags));
     EXPECT_TRUE(scheduler_task_is_mix(flags));
     EXPECT_TRUE(scheduler_task_is_spmd(flags));
     EXPECT_TRUE(scheduler_task_requires_sync_start(flags));
@@ -628,7 +617,7 @@ TEST(SchedulerMetadata, ProjectsExistingSubmitTypesWithoutChangingTheirSemantics
     EXPECT_EQ(attrs.timing_slot(), 7);
 
     const uint8_t inline_flags =
-        scheduler_task_metadata_flags_from_submit_state(LaneMask::aiv0(), TaskAttrs{}, 1, false, true);
+        scheduler_task_metadata_flags_from_submit_state(LaneMask::aiv0(), TaskAttrs{}, 1, true);
     EXPECT_EQ(inline_flags, SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_INLINE);
 }
 
@@ -709,20 +698,6 @@ TEST(SchedulerGraph, RejectsUnboundNonEmptyFaninRegion) {
 
     SchedulerTaskShape shape{};
     EXPECT_EQ(scheduler_classify_task_shape(graph.graph(), 1, &shape), SchedulerGraphResult::INVALID_FANIN_ID);
-}
-
-TEST(SchedulerGraph, RejectsAViewWithAnUnsupportedVersion) {
-    GraphBuffer graph(1);
-    graph.executable(0, 0);
-
-    SchedulerGraphView dirty = graph.graph();
-    dirty.view_version = SCHEDULER_GRAPH_VIEW_VERSION + 1;
-
-    SchedulerTaskShape shape{};
-    EXPECT_EQ(scheduler_classify_task_shape(dirty, 0, &shape), SchedulerGraphResult::INVALID_ARGUMENTS);
-
-    SchedulerTaskPayloadArguments arguments{};
-    EXPECT_EQ(scheduler_parse_task_payload_arguments(dirty, 0, &arguments), SchedulerGraphResult::INVALID_ARGUMENTS);
 }
 
 TEST(SchedulerGraph, RejectsInvalidBoundsBeforeReadingArgumentPools) {

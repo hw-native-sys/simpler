@@ -79,11 +79,46 @@ static_assert(
     "AicpuPhaseRecord must remain a POD wire type"
 );
 
-// AICore's post-handshake work window, in AICore counter ticks. It is
-// independent of the AICPU phase clock; only its duration is compared to it.
+// AICore work window in its own counter ticks: HBG and percounter measure from
+// the first business-kernel start through the last business-kernel end. This
+// clock is independent of AICPU; lane setup and final scheduler work are excluded.
 struct AicoreWorkWindow {
     uint64_t start_cycle;
     uint64_t end_cycle;
+};
+
+// Partition summaries preserve invalid and idle reports when merged. They are
+// local bookkeeping, not part of the device-phase wire buffer.
+struct AicoreWorkWindowAccumulator {
+    uint64_t first{UINT64_MAX};
+    uint64_t last{0};
+    bool invalid{false};
+    bool idle{false};
+
+    void add(uint64_t start, uint64_t end) {
+        if (start == 0 && end == 0) {
+            idle = true;
+        } else if (start == 0 || end <= start) {
+            invalid = true;
+        } else {
+            if (start < first) first = start;
+            if (end > last) last = end;
+        }
+    }
+
+    void merge(const AicoreWorkWindowAccumulator &other) {
+        invalid = invalid || other.invalid;
+        idle = idle || other.idle;
+        if (other.first < first) first = other.first;
+        if (other.last > last) last = other.last;
+    }
+
+    bool finish(AicoreWorkWindow &out, bool allow_idle) const {
+        out = {};
+        if (invalid || (!allow_idle && idle) || first == UINT64_MAX) return false;
+        out = {first, last};
+        return true;
+    }
 };
 
 // One per-run header at the front of the device buffer. The last AICPU thread

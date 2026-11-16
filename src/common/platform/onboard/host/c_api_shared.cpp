@@ -34,6 +34,7 @@
 #include "host/dep_gen_collector.h"  // make_deps_json_path
 #include "host/kernel_entry_validation.h"
 #include "host/kernel_pipeline_contract.h"
+#include "host/platform_compile_info.h"
 #include "worker/pipeline_contract.h"
 #include "prepare_callable_common.h"
 #include "run_retention_probe.h"
@@ -687,6 +688,10 @@ static const HostApiOps g_host_api_ops = {
 
 void destroy_device_context(DeviceContextHandle ctx) {
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+    if (runner != nullptr && runner->external_buffer_borrows_live()) {
+        LOG_ERROR("destroy_device_context: external buffer consumers still hold this context");
+        return;
+    }
     if (runner != nullptr && runner->prepared_storage_in_use()) {
         LOG_ERROR("destroy_device_context: prepared resources still reference this context");
         return;
@@ -722,6 +727,21 @@ void *device_malloc_ctx(DeviceContextHandle ctx, size_t size) {
         return static_cast<DeviceRunnerBase *>(ctx)->allocate_caller_buffer(size);
     } catch (...) {
         return NULL;
+    }
+}
+
+int device_adopt_caller_buffer_ctx(
+    DeviceContextHandle ctx, void *base, size_t logical_bytes, size_t physical_bytes,
+    CallerStorageReleaseFn release_storage, void *storage
+) {
+    if (std::strcmp(get_platform(), "a2a3") != 0) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    if (ctx == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->adopt_caller_buffer(
+            base, logical_bytes, physical_bytes, release_storage, storage
+        );
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 }
 
@@ -1265,9 +1285,15 @@ static void emit_device_phase_markers(DeviceRunnerBase *runner, uint32_t pipelin
     // that owned `pipeline_slot`, not to whatever the runner is doing now.
     const DeviceRunnerBase::DeviceRunTiming &timing = runner->device_run_timing(pipeline_slot);
     if (timing.aicore_wall_ns != 0) {
+        char attrs[192];
+        std::snprintf(
+            attrs, sizeof(attrs),
+            "clk=dev clock_source=aicore aicore_start_cycle=%llu aicore_end_cycle=%llu aicore_cnt_hz=%llu",
+            static_cast<unsigned long long>(timing.aicore_start_cycle),
+            static_cast<unsigned long long>(timing.aicore_end_cycle), static_cast<unsigned long long>(timing.sys_cnt_hz)
+        );
         STRACE_DEV_SPAN_AT_A(
-            "chip.run.runner_run.aicore_wall", 0, static_cast<long long>(timing.aicore_wall_ns), 2,
-            "clk=dev clock_source=aicore"
+            "chip.run.runner_run.aicore_wall", 0, static_cast<long long>(timing.aicore_wall_ns), 2, attrs
         );
     }
     const uint64_t run_wall_ns = timing.phase_ns[static_cast<int>(AicpuPhase::RunWall)];
@@ -2113,6 +2139,13 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         // measure, so they are written here as well as in the device-run
         // teardown. Skipping the device must not skip the artifact.
         state->runner->write_host_phase_records_artifact(state->config.output_prefix, state->descriptor.pipeline_slot);
+        state->launch_not_started_proven = true;
+        // This timing-only run produces no device outputs. End the copy-back
+        // obligation without reading them; finalization still releases bindings
+        // and abandons the owned preparation through the ordinary cleanup path.
+        state->copyback_rc = 0;
+        state->copyback_returned = true;
+        note_workspace_fact(state, WorkspaceManager::RunFact::CopybackReturned);
         state->completion_rc = 0;
         state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
         return 0;

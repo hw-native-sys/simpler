@@ -13,4 +13,5 @@
 extern "C" void framework_observation_orch(const void *) {}
 extern "C" void framework_observation_orch_b(const void *) {}
 extern "C" void framework_bind_orch_context(void *) {}
+extern "C" void framework_finish_orch() {}
 extern "C" int simpler_host_log_bind_state(void *) { return 0; }

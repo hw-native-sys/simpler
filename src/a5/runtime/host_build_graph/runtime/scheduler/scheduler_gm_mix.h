@@ -12,7 +12,13 @@
 #pragma once
 
 #include "scheduler_admission.h"
-#include "scheduler_async_control.h"
+#include "scheduler_completion_credit.h"
+
+inline constexpr uint64_t SCHEDULER_GROUP_SEQUENCE_LIMIT = UINT64_C(1) << 63;
+
+inline __aicore__ uint64_t scheduler_group_release_sequence(uint64_t value) {
+    return value & ~SCHEDULER_GROUP_SEQUENCE_LIMIT;
+}
 
 enum class SchedulerGmMixResult : uint8_t { WAIT, PROGRESS, ERROR };
 
@@ -59,7 +65,8 @@ scheduler_gm_mix_mailbox(__gm__ void *base, const SchedulerLocalState *local) {
 // reusable mailbox carries only this group's dynamic identity and lane history.
 inline __aicore__ bool
 scheduler_gm_mix_descriptor_sequence_valid(__gm__ const SchedulerGroupDescriptor *descriptor, uint64_t seq) {
-    if (seq == 0 || seq == UINT64_MAX || descriptor->group_seq != seq || descriptor->previous_lane_seq[0] != seq - 1)
+    if (seq == 0 || seq >= SCHEDULER_GROUP_SEQUENCE_LIMIT || descriptor->group_seq != seq ||
+        descriptor->previous_lane_seq[0] != seq - 1)
         return false;
     for (uint8_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane)
         if (descriptor->previous_lane_seq[lane] >= seq) return false;
@@ -102,7 +109,7 @@ static inline __aicore__ bool scheduler_gm_mix_close(
         if (!scheduler_read_claim_cursor(graph, base, local, run, &cursor, &used_claim_seal)) return false;
         if (cursor < admission.current_block_num && !admission.sync_claimed) return true;
         if (cursor > admission.current_block_num || (admission.sync_claimed && cursor == 0) ||
-            group.task_last_seq == UINT64_MAX)
+            group.task_last_seq >= SCHEDULER_GROUP_SEQUENCE_LIMIT)
             return scheduler_admission_fail(
                 graph, local, run, admission.current_task_ref, SchedulerErrorSite::GROUP_CLOSE_INVALID
             );
@@ -122,7 +129,7 @@ static inline __aicore__ bool scheduler_gm_mix_close(
         const uint64_t published = scheduler_gm_fetch_add(seal, UINT64_C(0));
         if (published == 0) return true;
         if ((group.phase != SchedulerGmMixPhase::IDLE && group.phase != SchedulerGmMixPhase::RELEASED) ||
-            group.task_last_seq == UINT64_MAX || published != group.task_last_seq + 1)
+            group.task_last_seq >= SCHEDULER_GROUP_SEQUENCE_LIMIT || published != group.task_last_seq + 1)
             return scheduler_admission_fail(
                 graph, local, run, admission.current_task_ref, SchedulerErrorSite::GROUP_CLOSE_INVALID
             );
@@ -168,7 +175,7 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_gm_mix_claim(
     }
     if (group.phase != SchedulerGmMixPhase::IDLE) return SchedulerBlockClaimResult::RETRY;
     if (admission.sync_claimed) return SchedulerBlockClaimResult::RETRY;
-    if (group.group_seq >= UINT64_MAX - 1) {
+    if (group.group_seq >= SCHEDULER_GROUP_SEQUENCE_LIMIT - 1) {
         const uint64_t cursor = scheduler_gm_fetch_add(
             scheduler_task_control_at(base, local, admission.current_task_ref)->next_block, UINT64_C(0)
         );
@@ -183,6 +190,7 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_gm_mix_claim(
     if (result != SchedulerBlockClaimResult::CLAIMED) return result;
     group.block_idx = block;
     ++group.group_seq;
+    group.completion_submitted = false;
     group.phase = SchedulerGmMixPhase::CLAIMED;
     group.slot_index = UINT8_MAX;
     group.prepare_start_cycles = 0;
@@ -198,7 +206,7 @@ static inline __aicore__ bool scheduler_gm_mix_publish(
     auto &admission = *local->admission;
     auto &group = admission.gm_mix;
     if (!local->is_mix_coordinator() || group.phase != SchedulerGmMixPhase::CLAIMED || group.group_seq == 0 ||
-        group.group_seq == UINT64_MAX || group.block_idx >= admission.current_block_num)
+        group.group_seq >= SCHEDULER_GROUP_SEQUENCE_LIMIT || group.block_idx >= admission.current_block_num)
         return scheduler_admission_fail(
             graph, local, run, admission.current_task_ref, SchedulerErrorSite::GROUP_INVALID_STATE
         );
@@ -225,7 +233,6 @@ static inline __aicore__ bool scheduler_gm_mix_publish(
     for (uint32_t offset = 0; offset < sizeof(*descriptor); offset += 64)
         scheduler_writeback_cache_line(reinterpret_cast<__gm__ uint8_t *>(descriptor) + offset);
     scheduler_cache_barrier();
-    scheduler_gm_store(mailbox->published_seq, group.group_seq);
     for (uint8_t lane = 1; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
         if (admission.current_resource_mask.has(static_cast<SubtaskSlot>(lane))) {
             scheduler_gm_store(mailbox->lanes[lane].assigned_seq, group.group_seq);
@@ -278,12 +285,14 @@ static inline __aicore__ bool scheduler_gm_mix_observe(
             }
         }
     }
-    if (seq == UINT64_MAX || descriptor->previous_lane_seq[local->config.self_lane] != group.group_seq ||
+    if (seq >= SCHEDULER_GROUP_SEQUENCE_LIMIT ||
+        descriptor->previous_lane_seq[local->config.self_lane] != group.group_seq ||
         !scheduler_gm_mix_descriptor_valid(local, descriptor, seq))
         return scheduler_admission_fail(
             graph, local, run, admission.current_task_ref, SchedulerErrorSite::GROUP_INVALID_DESCRIPTOR
         );
     group.group_seq = seq;
+    group.completion_submitted = false;
     group.task_last_seq = seq;
     group.block_idx = descriptor->block_idx;
     group.subtask_slot = admission.current_single_subtask;
@@ -320,9 +329,10 @@ static inline __aicore__ bool scheduler_gm_mix_arrive(
 template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_gm_mix_check_acks(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    bool releases, bool *all, bool query_prefiltered = false
+    bool releases, bool *all, bool query_prefiltered = false, bool *successful = nullptr
 ) {
     *all = false;
+    if (successful != nullptr) *successful = true;
     auto *mailbox = scheduler_gm_mix_mailbox(base, local);
     const uint64_t seq = local->admission->gm_mix.group_seq;
     const bool record = RecordProtocol && scheduler_protocol_enabled(local);
@@ -333,8 +343,15 @@ static inline __aicore__ bool scheduler_gm_mix_check_acks(
         auto &value = releases ? mailbox->lanes[lane].released_seq : mailbox->lanes[lane].arrived_seq;
         // A reused positive poll skips only duplicate weak reads. Even a stale
         // hint still reaches every authoritative atomic check in lane order.
-        if (!query_prefiltered && scheduler_gm_query(value) < seq) return true;
-        const uint64_t observed = scheduler_gm_fetch_add(value, UINT64_C(0));
+        if (!query_prefiltered) {
+            const uint64_t hint = scheduler_gm_query(value);
+            if ((releases ? scheduler_group_release_sequence(hint) : hint) < seq) return true;
+        }
+        const uint64_t raw = scheduler_gm_fetch_add(value, UINT64_C(0));
+        const uint64_t observed = releases ? scheduler_group_release_sequence(raw) : raw;
+        if (releases && successful != nullptr && (raw & SCHEDULER_GROUP_SEQUENCE_LIMIT) != 0 &&
+            local->admission->current_active_mask.has(static_cast<SubtaskSlot>(lane)))
+            *successful = false;
         if (record) observations[lane] = observed;
         if (observed < seq) return true;
         if (observed != seq)
@@ -348,12 +365,14 @@ static inline __aicore__ bool scheduler_gm_mix_check_acks(
 }
 
 template <bool RecordProtocol = true>
-static inline __aicore__ void scheduler_gm_mix_publish_release(__gm__ void *base, SchedulerLocalState *local) {
+static inline __aicore__ void
+scheduler_gm_mix_publish_release(__gm__ void *base, SchedulerLocalState *local, bool successful = true) {
     auto &group = local->admission->gm_mix;
     if constexpr (RecordProtocol) scheduler_protocol_lane_publication(base, local, true, true);
     scheduler_cache_barrier();
     scheduler_gm_store(
-        scheduler_gm_mix_mailbox(base, local)->lanes[local->config.self_lane].released_seq, group.group_seq
+        scheduler_gm_mix_mailbox(base, local)->lanes[local->config.self_lane].released_seq,
+        group.group_seq | (successful ? 0 : SCHEDULER_GROUP_SEQUENCE_LIMIT)
     );
     if constexpr (RecordProtocol) scheduler_protocol_lane_publication(base, local, true, false);
     group.phase = SchedulerGmMixPhase::RELEASED;
@@ -371,16 +390,17 @@ static inline __aicore__ bool scheduler_gm_mix_prepare_lane(
     auto &group = admission.gm_mix;
     if (group.phase != SchedulerGmMixPhase::ARRIVED) return true;
     bool all = false;
-    if (!scheduler_gm_mix_check_acks<RecordProtocol>(graph, base, local, run, false, &all, query_prefiltered))
-        return false;
     if (group.subtask_slot == UINT8_MAX) {
+        if (!scheduler_gm_mix_check_acks<RecordProtocol>(graph, base, local, run, false, &all, query_prefiltered))
+            return false;
         if (!all) return true;
         scheduler_gm_mix_publish_release<RecordProtocol>(base, local);
         *progress = true;
         return true;
     }
-    if (group.group_seq == 0 || group.group_seq == UINT64_MAX || group.task_last_seq != group.group_seq ||
-        group.block_idx >= admission.current_block_num || group.subtask_slot != admission.current_single_subtask)
+    if (group.group_seq == 0 || group.group_seq >= SCHEDULER_GROUP_SEQUENCE_LIMIT ||
+        group.task_last_seq != group.group_seq || group.block_idx >= admission.current_block_num ||
+        group.subtask_slot != admission.current_single_subtask)
         return scheduler_admission_fail(
             graph, local, run, admission.current_task_ref, SchedulerErrorSite::GROUP_INVALID_STATE
         );
@@ -433,7 +453,6 @@ static inline __aicore__ bool scheduler_gm_mix_prepare_lane(
             graph, base, local, run, claim, ready, metadata, profiling_level, group.subtask_slot,
             &group.prepare_start_cycles
         );
-        if (prepared == PreparedAccessResult::WAIT) return true;
         if (prepared != PreparedAccessResult::READY)
             return scheduler_admission_fail(
                 graph, local, run, ready.task_ref, SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED
@@ -442,6 +461,8 @@ static inline __aicore__ bool scheduler_gm_mix_prepare_lane(
     }
     // This group owns the FILLING slot while peers arrive. A later service
     // resumes the handle; it never repeats Call acquire or Binding writes.
+    if (!scheduler_gm_mix_check_acks<RecordProtocol>(graph, base, local, run, false, &all, query_prefiltered))
+        return false;
     if (!all) return true;
     if (!scheduler_gm_mix_context_valid<StaticContextValidated>(graph, base, local, run)) return false;
     // The lane has not released its group, so the observed descriptor remains
@@ -466,7 +487,7 @@ static inline __aicore__ bool scheduler_gm_mix_prepare_lane(
 template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_gm_mix_release_lane(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    const SchedulerLocalSlotState &completed, uint32_t slot_index
+    const SchedulerLocalSlotState &completed, uint32_t slot_index, bool successful = true
 ) {
     if (!scheduler_gm_mix_context_valid<false, true>(graph, base, local, run)) return false;
     auto &admission = *local->admission;
@@ -478,7 +499,7 @@ static inline __aicore__ bool scheduler_gm_mix_release_lane(
         !completed.gm_mix || group.block_idx != completed.block_idx || group.subtask_slot != completed.subtask_slot ||
         group.group_seq == 0 || local->slots[slot_index].state != SchedulerDispatchSlotState::FREE)
         return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
-    scheduler_gm_mix_publish_release<RecordProtocol>(base, local);
+    scheduler_gm_mix_publish_release<RecordProtocol>(base, local, successful);
     return true;
 }
 
@@ -487,21 +508,28 @@ static inline __aicore__ SchedulerGmMixResult scheduler_gm_mix_retire(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     bool query_prefiltered = false
 ) {
-    // Lane completion owns the task counter. Retirement releases only the
-    // retained group descriptor after every resource lane has returned it.
+    // Returned resources carry separate success evidence for computing lanes.
     if (!scheduler_gm_mix_context_valid<StaticContextValidated>(graph, base, local, run))
         return SchedulerGmMixResult::ERROR;
     auto &admission = *local->admission;
     auto &group = admission.gm_mix;
     if (!local->is_mix_coordinator() || group.phase != SchedulerGmMixPhase::RELEASED) return SchedulerGmMixResult::WAIT;
     bool all = false;
-    if (!scheduler_gm_mix_check_acks<RecordProtocol>(graph, base, local, run, true, &all, query_prefiltered))
+    bool successful = true;
+    if (!scheduler_gm_mix_check_acks<RecordProtocol>(
+            graph, base, local, run, true, &all, query_prefiltered, &successful
+        ))
         return SchedulerGmMixResult::ERROR;
     if (!all) return SchedulerGmMixResult::WAIT;
-    if constexpr (RecordProtocol) {
-        scheduler_protocol_block_complete(base, local, group.block_idx, true, UINT64_MAX);
-        scheduler_protocol_block_complete(base, local, group.block_idx, false, UINT64_MAX);
+    if (!successful || group.completion_submitted) {
+        scheduler_admission_fail(graph, local, run, admission.current_task_ref, SchedulerErrorSite::GROUP_ACK_INVALID);
+        return SchedulerGmMixResult::ERROR;
     }
+    group.completion_submitted = true;
+    if (!scheduler_contribute_mix_group<RecordProtocol>(
+            graph, base, local, run, admission.current_task_ref, group.block_idx, admission.current_active_mask
+        ))
+        return SchedulerGmMixResult::ERROR;
     group.phase = SchedulerGmMixPhase::IDLE;
     group.slot_index = UINT8_MAX;
     group.prepare_start_cycles = 0;

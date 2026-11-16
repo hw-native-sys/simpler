@@ -47,9 +47,7 @@ uint64_t resident_scheduler_timeout_cycles() {
 
 bool lifecycle_timing_enabled() { return get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHEDULE_TIMING; }
 
-// The AICPU thread index this route's diagnostic settlement runs under. One
-// thread performs it for the whole run, so it selects one ready queue for every
-// core's records.
+// One AICPU thread consolidates diagnostics for all cores after retirement.
 constexpr int32_t kDiagnosticDumpLane = 0;
 
 #if SIMPLER_DFX
@@ -87,6 +85,8 @@ int32_t AicoreLifecycle::pre_handshake_init(Runtime *runtime, int32_t aicpu_thre
     std::memset(cores_, 0, sizeof(cores_));
     std::memset(physical_core_ids_, 0, sizeof(physical_core_ids_));
     std::memset(thread_handshake_timing_, 0, sizeof(thread_handshake_timing_));
+    for (auto &window : thread_work_windows_)
+        window = {};
     core_count_ = runtime->dev.worker_count;
     // The descriptor's gate tail is device-owned and is not copied from the host.
     // Clear prior-run releases before any partition can open a register window.
@@ -297,21 +297,11 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
             const int32_t worker = cluster_workers[cluster][lane];
             contexts[worker].cluster_count = static_cast<uint64_t>(aic_count);
             contexts[worker].cluster_index = static_cast<uint64_t>(cluster);
-            // Every core schedules itself, so a Scheduler is identified by the
-            // worker it runs on and there are as many Schedulers as workers. The
-            // core that coordinates a cluster's Mix tasks is its AIC, which the
-            // lane ordering below already fixes as lane 0.
-            contexts[worker].scheduler_index = static_cast<uint64_t>(worker);
-            contexts[worker].is_scheduler = 1;
-            contexts[worker].scheduler_count = static_cast<uint64_t>(core_count_);
             for (int32_t member = 0; member < PLATFORM_CORES_PER_BLOCKDIM; ++member)
                 contexts[worker].cluster_worker_ids[member] = static_cast<uint64_t>(cluster_workers[cluster][member]);
         }
     }
     run_control->active_worker_count = static_cast<uint64_t>(core_count_);
-    run_control->aic_active_worker_count = static_cast<uint64_t>(aic_count);
-    run_control->aiv_active_worker_count = static_cast<uint64_t>(aiv_count);
-    run_control->scheduler_count = static_cast<uint64_t>(core_count_);
     run_control->scheduler_timeout_cycles = resident_scheduler_timeout_cycles();
 
     // Discovery checked each compact launch ID, core type and complete cluster
@@ -390,26 +380,20 @@ int32_t AicoreLifecycle::wait_bootstrap_complete(Runtime *runtime) {
                 log_aicore_prepared_error(context, run_control);
                 LOG_ERROR(
                     "A5 HBG AICore scheduler: bootstrap failed at task=%" PRIu64 " status=%" PRIu64 " core=%" PRIu64
-                    " type=%" PRIu64 " site=%" PRIu64 " workers=%" PRIu64 " schedulers=%" PRIu64
-                    " scan_arrived=%" PRIu64 " scan_complete=%" PRIu64 " dispatch_arrived=%" PRIu64
+                    " type=%" PRIu64 " site=%" PRIu64 " workers=%" PRIu64 " dispatch_arrived=%" PRIu64
                     " bootstrap_complete=%" PRIu64,
                     run_control->error_task_ref, run_control->scheduler_error, run_control->error_core_id,
                     run_control->error_core_type, run_control->error_site, run_control->active_worker_count,
-                    run_control->scheduler_count, run_control->bootstrap_scan_arrived_count,
-                    run_control->bootstrap_scan_complete, run_control->bootstrap_arrived_count,
-                    run_control->bootstrap_complete
+                    run_control->bootstrap_arrived_count, run_control->bootstrap_complete
                 );
                 return -1;
             }
         }
         if (scheduler_watchdog_expired(watchdog_start, get_sys_cnt_aicpu(), timeout_cycles)) {
             LOG_ERROR(
-                "A5 HBG AICore Scheduler bootstrap timeout: workers=%" PRIu64 " schedulers=%" PRIu64
-                " scan_arrived=%" PRIu64 " scan_complete=%" PRIu64 " dispatch_arrived=%" PRIu64
+                "A5 HBG AICore Scheduler bootstrap timeout: workers=%" PRIu64 " dispatch_arrived=%" PRIu64
                 " bootstrap_complete=%" PRIu64,
-                run_control->active_worker_count, run_control->scheduler_count,
-                run_control->bootstrap_scan_arrived_count, run_control->bootstrap_scan_complete,
-                run_control->bootstrap_arrived_count, run_control->bootstrap_complete
+                run_control->active_worker_count, run_control->bootstrap_arrived_count, run_control->bootstrap_complete
             );
             record_lifecycle_timeout(runtime, SchedulerErrorSite::BOOTSTRAP_COMPLETE_TIMEOUT);
             return -1;
@@ -448,7 +432,9 @@ void AicoreLifecycle::signal_shutdown_partition(int32_t thread_idx) {
 }
 
 int32_t AicoreLifecycle::finish_shutdown_partition(int32_t thread_idx, Runtime *runtime) {
-    if (core_count_ <= 0 || aicpu_thread_num_ <= 0) return -SIMPLER_ERROR_INVALID_ARGS;
+    if (core_count_ <= 0 || aicpu_thread_num_ <= 0 || thread_idx < 0 || thread_idx >= aicpu_thread_num_ ||
+        thread_idx >= PLATFORM_MAX_AICPU_THREADS)
+        return -SIMPLER_ERROR_INVALID_ARGS;
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(thread_idx) * core_count_) / aicpu_thread_num_);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(thread_idx + 1) * core_count_) / aicpu_thread_num_);
     AicoreExitTarget targets[kMaxWorkers];
@@ -468,6 +454,7 @@ int32_t AicoreLifecycle::finish_shutdown_partition(int32_t thread_idx, Runtime *
     // A missing report cannot prove that its launched core stopped polling GM.
     // Each core contributes retirement only after its own acknowledged release.
     int32_t proved = 0;
+    AicoreWorkWindowAccumulator work_window;
     if (count != static_cast<size_t>(hi - lo) && rc == 0) {
         record_lifecycle_timeout(runtime, SchedulerErrorSite::AICPU_HANDSHAKE_TIMEOUT);
         rc = -SIMPLER_ERROR_SCHEDULER_TIMEOUT;
@@ -477,6 +464,9 @@ int32_t AicoreLifecycle::finish_shutdown_partition(int32_t thread_idx, Runtime *
             Handshake *report = &runtime->dev.workers[core_ids[i]];
             cache_invalidate_range(report, sizeof(*report));
             rmb();
+            // This line is already needed for retirement. Save its endpoints
+            // here so the finalizer does not fetch every report a second time.
+            work_window.add(report->work_start_cycle, report->work_end_cycle);
             aicore_invalidate_retired_report(report);
             cache_flush_range(report, sizeof(*report));
             ++proved;
@@ -485,6 +475,7 @@ int32_t AicoreLifecycle::finish_shutdown_partition(int32_t thread_idx, Runtime *
             if (rc == 0) rc = -SIMPLER_ERROR_SCHEDULER_TIMEOUT;
         }
     }
+    thread_work_windows_[thread_idx].summary = work_window;
     wmb();
     retired_core_count_.fetch_add(proved, std::memory_order_acq_rel);
     if (trace != nullptr && lifecycle_timing_enabled()) {
@@ -497,6 +488,15 @@ int32_t AicoreLifecycle::finish_shutdown_partition(int32_t thread_idx, Runtime *
         partition_core_ids[partition_count++] = i;
     if (is_chip_swimlane_enabled()) chip_swimlane_aicpu_flush(thread_idx, partition_core_ids, partition_count);
     return rc;
+}
+
+bool AicoreLifecycle::retired_work_window(AicoreWorkWindow &out, bool allow_idle) const {
+    out = {};
+    if (!cores_retired() || aicpu_thread_num_ <= 0 || aicpu_thread_num_ > PLATFORM_MAX_AICPU_THREADS) return false;
+    AicoreWorkWindowAccumulator summary;
+    for (int32_t thread = 0; thread < aicpu_thread_num_; ++thread)
+        summary.merge(thread_work_windows_[thread].summary);
+    return summary.finish(out, allow_idle);
 }
 
 #if SIMPLER_DFX
@@ -568,23 +568,14 @@ void AicoreLifecycle::collect_run_swimlane_records(Runtime *runtime) {
                     trace.state_probe_scheduler_worker_id, SchedPhaseKind::StateProbe, trace.state_probe_start_cycles,
                     trace.state_probe_end_cycles, trace.dispatch_loop_iter, identity
                 );
-                if (static_cast<SchedulerPublicationMode>(trace.publication_mode) != SchedulerPublicationMode::REFILL)
-                    phase(
-                        trace.dispatch_scheduler_worker_id, SchedPhaseKind::Dispatch, trace.dispatch_start_cycles,
-                        trace.dispatch_end_cycles, trace.dispatch_loop_iter, identity
-                    );
+                phase(
+                    trace.dispatch_scheduler_worker_id, SchedPhaseKind::Dispatch, trace.dispatch_start_cycles,
+                    trace.dispatch_end_cycles, trace.dispatch_loop_iter, identity
+                );
                 phase(
                     trace.complete_scheduler_worker_id, SchedPhaseKind::Complete, trace.complete_start_cycles,
                     trace.complete_end_cycles, trace.complete_loop_iter, identity
                 );
-                if (trace.refill_task_ref < context->graph_task_count) {
-                    const auto refill = aicore_scheduler_public_identity(graph, trace.refill_task_ref);
-                    if (refill.is_valid())
-                        phase(
-                            trace.refill_scheduler_worker_id, SchedPhaseKind::Refill, trace.refill_start_cycles,
-                            trace.refill_end_cycles, trace.refill_loop_iter, refill
-                        );
-                }
             }
         }
     }

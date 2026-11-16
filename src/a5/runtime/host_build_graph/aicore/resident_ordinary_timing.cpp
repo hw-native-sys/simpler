@@ -18,28 +18,28 @@ namespace simpler::hbg::resident {
 template <bool WithNativeGraph, CoreType Architecture>
 __aicore__ void run_timing(
     __gm__ SchedulerWorkerContext *context, __gm__ SchedulerRunControl *run_control, __gm__ void *scheduler_state_base,
-    uint64_t profiling_level, uint64_t aicore_entry_cycles, uint64_t handshake_publish_cycles
+    uint64_t profiling_level, uint64_t aicore_entry_cycles, AicoreWorkWindow *work_window
 ) {
     static_assert(!kSchedulerScalarInstrumentation);
     run_resident_scheduler<true, WithNativeGraph>(
-        context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles, handshake_publish_cycles
+        context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles, work_window
     );
 }
 
 #if defined(__DAV_CUBE__)
 template __aicore__ void run_timing<false, CoreType::AIC>(
-    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, uint64_t
+    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, AicoreWorkWindow *
 );
 #elif defined(__DAV_VEC__)
 template __aicore__ void run_timing<false, CoreType::AIV>(
-    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, uint64_t
+    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, AicoreWorkWindow *
 );
 #else
 template __aicore__ void run_timing<false, CoreType::AIC>(
-    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, uint64_t
+    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, AicoreWorkWindow *
 );
 template __aicore__ void run_timing<false, CoreType::AIV>(
-    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, uint64_t
+    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, AicoreWorkWindow *
 );
 #endif
 

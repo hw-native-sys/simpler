@@ -38,6 +38,8 @@
 
 namespace {
 
+std::string make_shm_name();
+
 // Read the child-written error message from the mailbox, guaranteeing
 // NUL-termination even if the child wrote exactly MAILBOX_ERROR_MSG_SIZE
 // bytes without a terminator.
@@ -205,6 +207,60 @@ void WorkerEndpoint::control_remote_release_import(const RemoteBufferHandle &) {
 std::vector<uint8_t> WorkerEndpoint::control_remote_domain(remote_l3::ControlName, const std::vector<uint8_t> &, bool) {
     throw_unsupported_control("control_remote_domain");
 }
+// RAII guard for a POSIX shm segment: create on construction, unlink on
+// destruction. mmaps the region so the staged blob can be memcpy'd in
+// place; the mmap is released in the destructor as well. The shm is only
+// unlinked once — children open by name *before* this guard is destroyed.
+class PosixShmHolder {
+public:
+    PosixShmHolder(const std::string &name, size_t size) :
+        name_(name),
+        size_(size) {
+        std::string full_name = "/" + name_;
+        fd_ = shm_open(full_name.c_str(), O_CREAT | O_RDWR | O_EXCL, 0600);
+        if (fd_ < 0) {
+            throw std::runtime_error(
+                std::string("broadcast_register: shm_open(") + full_name + ") failed: " + std::strerror(errno)
+            );
+        }
+        if (ftruncate(fd_, static_cast<off_t>(size)) != 0) {
+            int err = errno;
+            ::close(fd_);
+            shm_unlink(full_name.c_str());
+            throw std::runtime_error(std::string("broadcast_register: ftruncate failed: ") + std::strerror(err));
+        }
+        addr_ = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+        if (addr_ == MAP_FAILED) {
+            int err = errno;
+            ::close(fd_);
+            shm_unlink(full_name.c_str());
+            addr_ = nullptr;
+            throw std::runtime_error(std::string("broadcast_register: mmap failed: ") + std::strerror(err));
+        }
+    }
+    ~PosixShmHolder() {
+        if (addr_ != nullptr) munmap(addr_, size_);
+        if (fd_ >= 0) ::close(fd_);
+        std::string full_name = "/" + name_;
+        shm_unlink(full_name.c_str());
+    }
+    PosixShmHolder(const PosixShmHolder &) = delete;
+    PosixShmHolder &operator=(const PosixShmHolder &) = delete;
+
+    void *addr() { return addr_; }
+    const std::string &name() const { return name_; }
+
+private:
+    std::string name_;
+    size_t size_{0};
+    int fd_{-1};
+    void *addr_{nullptr};
+};
+
+std::vector<uint8_t> WorkerEndpoint::control_payload(uint64_t, const void *, size_t, double, bool) {
+    throw_unsupported_control("control_payload");
+}
+
 void WorkerEndpoint::control_generic(uint64_t, const char *, size_t, double, const uint8_t *) {
     throw_unsupported_control("control_generic");
 }
@@ -1777,14 +1833,23 @@ static void write_control_digest(char *mbox, const uint8_t *digest) {
 // from the child, throws and leaves the mailbox in IDLE before unwinding (so
 // the next claim starts from a clean state). The `op_name` is used only for the
 // exception message.
-void LocalMailboxEndpoint::run_control_command(const char *op_name, double timeout_s) {
-    if (mailbox_control_timed_out_) {
-        throw std::runtime_error(std::string(op_name) + " failed: mailbox has an unresolved timed-out control command");
+void LocalMailboxEndpoint::require_control_admission(bool retiring) const {
+    if (mailbox_control_timed_out_.load(std::memory_order_acquire) &&
+        (!retiring || read_mailbox_state() != MailboxState::IDLE || pending_payload_)) {
+        throw std::runtime_error("mailbox has a timed-out control command; only reconciled cleanup is admitted");
     }
+}
+
+void LocalMailboxEndpoint::run_control_command(const char *op_name, double timeout_s, bool retiring) {
+    require_control_admission(retiring);
     int32_t zero_err = 0;
     std::memcpy(mbox() + MAILBOX_OFF_ERROR, &zero_err, sizeof(int32_t));
     std::memset(mbox() + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
     write_mailbox_state(MailboxState::CONTROL_REQUEST);
+    wait_control_done(op_name, timeout_s);
+}
+
+void LocalMailboxEndpoint::wait_control_done(const char *op_name, double timeout_s) {
     auto deadline = std::chrono::steady_clock::time_point::max();
     if (timeout_s >= 0.0) {
         deadline =
@@ -1830,6 +1895,7 @@ void LocalMailboxEndpoint::run_control_command(const char *op_name, double timeo
 
 uint64_t LocalMailboxEndpoint::control_malloc(size_t size) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_control_admission();
     write_control_args(mbox(), CTRL_MALLOC, static_cast<uint64_t>(size));
     run_control_command("control_malloc");
     return read_control_result(mbox());
@@ -1837,6 +1903,7 @@ uint64_t LocalMailboxEndpoint::control_malloc(size_t size) {
 
 uint64_t LocalMailboxEndpoint::control_committed_device_memory() {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_control_admission();
     write_control_args(mbox(), CTRL_COMMITTED_DEVICE_MEMORY);
     run_control_command("control_committed_device_memory");
     return read_control_result(mbox());
@@ -1844,6 +1911,7 @@ uint64_t LocalMailboxEndpoint::control_committed_device_memory() {
 
 DeviceMemoryInfo LocalMailboxEndpoint::control_device_memory_info() {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_control_admission();
     write_control_args(mbox(), CTRL_DEVICE_MEMORY_INFO);
     run_control_command("control_device_memory_info");
     DeviceMemoryInfo info{};
@@ -1853,13 +1921,7 @@ DeviceMemoryInfo LocalMailboxEndpoint::control_device_memory_info() {
 
 DfxFlushReport LocalMailboxEndpoint::control_dfx_flush(double timeout_s) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
-    // Checked under the mutex and before any frame byte is written. The other
-    // control methods write their args first and let run_control_command throw,
-    // which leaves a poisoned endpoint's frame mutated; a flush must not, since
-    // the whole point of the poison is that this mailbox is never reused.
-    if (mailbox_control_timed_out_.load(std::memory_order_acquire)) {
-        throw std::runtime_error("control_dfx_flush failed: mailbox has an unresolved timed-out control command");
-    }
+    require_control_admission();
     if (std::isnan(timeout_s)) {
         throw std::runtime_error("control_dfx_flush: timeout is not a number");
     }
@@ -1905,6 +1967,7 @@ DfxFlushReport LocalMailboxEndpoint::control_dfx_flush(double timeout_s) {
 
 void LocalMailboxEndpoint::control_prepare(const uint8_t *digest) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_control_admission();
     write_control_args(mbox(), CTRL_PREPARE);
     write_control_digest(mbox(), digest);
     run_control_command("control_prepare");
@@ -1912,6 +1975,7 @@ void LocalMailboxEndpoint::control_prepare(const uint8_t *digest) {
 
 void LocalMailboxEndpoint::control_register(const char *shm_name, size_t blob_size, const uint8_t *digest) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_control_admission();
     // OFF_ERROR / OFF_ERROR_MSG are cleared by run_control_command — no
     // prelude memset needed (matches the other control_* methods).
     uint64_t sub_cmd = CTRL_REGISTER;
@@ -1932,9 +1996,10 @@ void LocalMailboxEndpoint::control_register(const char *shm_name, size_t blob_si
 
 void LocalMailboxEndpoint::control_unregister(const uint8_t *digest) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_control_admission(true);
     write_control_args(mbox(), CTRL_UNREGISTER);
     write_control_digest(mbox(), digest);
-    run_control_command("control_unregister");
+    run_control_command("control_unregister", -1.0, true);
 }
 
 void LocalMailboxEndpoint::control_remote_prepare_register(
@@ -1993,6 +2058,7 @@ void LocalMailboxEndpoint::control_generic(
     uint64_t sub_cmd, const char *shm_name, size_t staged_payload_size, double timeout_s, const uint8_t *digest
 ) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_control_admission();
     std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
     uint64_t payload_size = static_cast<uint64_t>(staged_payload_size);
     std::memcpy(mbox() + CTRL_OFF_ARG0, &payload_size, sizeof(uint64_t));
@@ -2007,16 +2073,79 @@ void LocalMailboxEndpoint::control_generic(
     run_control_command("control_generic", timeout_s);
 }
 
+std::vector<uint8_t> LocalMailboxEndpoint::control_payload(
+    uint64_t sub_cmd, const void *payload, size_t payload_size, double timeout_s, bool retiring
+) {
+    std::lock_guard<std::mutex> lock(mailbox_mu_);
+    const auto *begin = static_cast<const uint8_t *>(payload);
+    if (pending_payload_) {
+        const auto &pending = *pending_payload_;
+        if (!retiring || pending.sub_cmd != sub_cmd || pending.request.size() != payload_size ||
+            !std::equal(pending.request.begin(), pending.request.end(), begin)) {
+            throw std::runtime_error("control_payload: reconcile the original timed-out command before cleanup");
+        }
+    } else {
+        require_control_admission(retiring);
+        auto staging = std::make_shared<PosixShmHolder>(make_shm_name(), payload_size);
+        std::memcpy(staging->addr(), payload, payload_size);
+        // Build the record before publication. It owns both the request identity and shm name.
+        pending_payload_.emplace(PendingPayload{sub_cmd, {begin, begin + payload_size}, staging});
+        std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(sub_cmd));
+        const uint64_t bytes = payload_size;
+        std::memcpy(mbox() + CTRL_OFF_ARG0, &bytes, sizeof(bytes));
+        write_control_digest(mbox(), nullptr);
+        const auto &name = staging->name();
+        std::memset(mbox() + MAILBOX_OFF_ARGS, 0, CTRL_SHM_NAME_BYTES);
+        std::memcpy(mbox() + MAILBOX_OFF_ARGS, name.c_str(), name.size());
+        const int32_t zero = 0;
+        std::memcpy(mbox() + MAILBOX_OFF_ERROR, &zero, sizeof(zero));
+        std::memset(mbox() + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
+        write_mailbox_state(MailboxState::CONTROL_REQUEST);
+    }
+    try {
+        wait_control_done("control_payload", timeout_s);
+    } catch (...) {
+        if (read_mailbox_state() == MailboxState::IDLE) pending_payload_.reset();
+        throw;
+    }
+    const auto *result = static_cast<const uint8_t *>(pending_payload_->staging->addr());
+    std::vector<uint8_t> reply(result, result + payload_size);
+    pending_payload_.reset();
+    return reply;
+}
+
+void LocalMailboxEndpoint::check_control_payload_retired() {
+    std::lock_guard<std::mutex> lock(mailbox_mu_);
+    if (!pending_payload_) return;
+    if (!check_child_death().empty()) {
+        pending_payload_.reset();  // Proven exit ends payload access, not command uncertainty.
+        return;
+    }
+    // Closing may discard a completed ALLOCATE reply: its storage still belongs to the child.
+    if (read_mailbox_state() != MailboxState::CONTROL_DONE) {
+        throw std::runtime_error("control_payload is unresolved; retry close after its original reply arrives");
+    }
+    try {
+        wait_control_done("control_payload retirement", 0.0);
+    } catch (...) {
+        pending_payload_.reset();
+        throw;
+    }
+    pending_payload_.reset();
+}
+
 void LocalMailboxEndpoint::control_free(uint64_t ptr) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_control_admission(true);
     write_control_args(mbox(), CTRL_FREE, ptr);
-    run_control_command("control_free");
+    run_control_command("control_free", -1.0, true);
 }
 
 void LocalMailboxEndpoint::control_copy_to(
     const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span
 ) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_control_admission();
     write_control_copy_request(mbox(), CTRL_COPY_TO, dst, src, span);
     run_control_command("control_copy_to");
 }
@@ -2025,6 +2154,7 @@ void LocalMailboxEndpoint::control_copy_from(
     const BufferDescriptor &dst, const BufferDescriptor &src, const CopySpan &span
 ) {
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_control_admission();
     write_control_copy_request(mbox(), CTRL_COPY_FROM, dst, src, span);
     run_control_command("control_copy_from");
 }
@@ -2051,6 +2181,7 @@ void LocalMailboxEndpoint::control_alloc_domain(const char *request_shm_name, co
         throw std::runtime_error("control_alloc_domain: request and reply shm names must be non-empty");
     }
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_control_admission();
     uint64_t sub_cmd = CTRL_ALLOC_DOMAIN;
     std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
     write_shm_name_pair(mbox(), request_shm_name, reply_shm_name);
@@ -2062,6 +2193,7 @@ void LocalMailboxEndpoint::control_release_domain(const char *request_shm_name) 
         throw std::runtime_error("control_release_domain: request shm name must be non-empty");
     }
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_control_admission();
     uint64_t sub_cmd = CTRL_RELEASE_DOMAIN;
     std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
     write_shm_name_pair(mbox(), request_shm_name, "");
@@ -2073,6 +2205,7 @@ void LocalMailboxEndpoint::control_comm_init(const char *request_shm_name) {
         throw std::runtime_error("control_comm_init: request shm name must be non-empty");
     }
     std::lock_guard<std::mutex> lk(mailbox_mu_);
+    require_control_admission();
     uint64_t sub_cmd = CTRL_COMM_INIT;
     std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
     write_shm_name_pair(mbox(), request_shm_name, "");
@@ -2192,6 +2325,17 @@ std::vector<uint8_t> WorkerThread::control_remote_domain(
     return endpoint_->control_remote_domain(control_name, command_bytes, group_target);
 }
 
+std::vector<uint8_t> WorkerThread::control_payload(
+    uint64_t sub_cmd, const void *payload, size_t payload_size, double timeout_s, bool retiring
+) {
+    if (!endpoint_) throw std::runtime_error("control_payload: null endpoint");
+    return endpoint_->control_payload(sub_cmd, payload, payload_size, timeout_s, retiring);
+}
+
+void WorkerThread::check_control_payload_retired() {
+    if (endpoint_) endpoint_->check_control_payload_retired();
+}
+
 void WorkerThread::control_generic(
     uint64_t sub_cmd, const char *shm_name, size_t payload_size, double timeout_s, const uint8_t *digest
 ) {
@@ -2294,56 +2438,6 @@ std::string strip_control_prefix(const std::string &msg, const std::string &op_n
     return msg;
 }
 
-// RAII guard for a POSIX shm segment: create on construction, unlink on
-// destruction. mmaps the region so the staged blob can be memcpy'd in
-// place; the mmap is released in the destructor as well. The shm is only
-// unlinked once — children open by name *before* this guard is destroyed.
-class PosixShmHolder {
-public:
-    PosixShmHolder(const std::string &name, size_t size) :
-        name_(name),
-        size_(size) {
-        std::string full_name = "/" + name_;
-        fd_ = shm_open(full_name.c_str(), O_CREAT | O_RDWR | O_EXCL, 0600);
-        if (fd_ < 0) {
-            throw std::runtime_error(
-                std::string("broadcast_register: shm_open(") + full_name + ") failed: " + std::strerror(errno)
-            );
-        }
-        if (ftruncate(fd_, static_cast<off_t>(size)) != 0) {
-            int err = errno;
-            ::close(fd_);
-            shm_unlink(full_name.c_str());
-            throw std::runtime_error(std::string("broadcast_register: ftruncate failed: ") + std::strerror(err));
-        }
-        addr_ = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
-        if (addr_ == MAP_FAILED) {
-            int err = errno;
-            ::close(fd_);
-            shm_unlink(full_name.c_str());
-            addr_ = nullptr;
-            throw std::runtime_error(std::string("broadcast_register: mmap failed: ") + std::strerror(err));
-        }
-    }
-    ~PosixShmHolder() {
-        if (addr_ != nullptr) munmap(addr_, size_);
-        if (fd_ >= 0) ::close(fd_);
-        std::string full_name = "/" + name_;
-        shm_unlink(full_name.c_str());
-    }
-    PosixShmHolder(const PosixShmHolder &) = delete;
-    PosixShmHolder &operator=(const PosixShmHolder &) = delete;
-
-    void *addr() { return addr_; }
-    const std::string &name() const { return name_; }
-
-private:
-    std::string name_;
-    size_t size_{0};
-    int fd_{-1};
-    void *addr_{nullptr};
-};
-
 }  // namespace
 
 void WorkerManager::control_prepare(int worker_id, const uint8_t *digest) {
@@ -2398,21 +2492,22 @@ ControlResult WorkerManager::control_digest_only(
 }
 
 std::vector<uint8_t> WorkerManager::control_payload(
-    WorkerType type, int worker_id, uint64_t sub_cmd, const void *payload, size_t payload_size, double timeout_s
+    WorkerType type, int worker_id, uint64_t sub_cmd, const void *payload, size_t payload_size, double timeout_s,
+    bool retiring
 ) {
     if (payload == nullptr || payload_size == 0) {
         throw std::runtime_error("control_payload: payload must be non-empty");
     }
-    WorkerThread *wt = get_worker_by_id(type, worker_id);
-    if (wt == nullptr) {
-        throw std::runtime_error("control_payload: invalid worker_id " + std::to_string(worker_id));
-    }
-    std::string shm_name = make_shm_name();
-    PosixShmHolder shm(shm_name, payload_size);
-    std::memcpy(shm.addr(), payload, payload_size);
-    wt->control_generic(sub_cmd, shm_name.c_str(), payload_size, timeout_s, nullptr);
-    auto *begin = static_cast<const uint8_t *>(shm.addr());
-    return {begin, begin + payload_size};
+    WorkerThread *worker = get_worker_by_id(type, worker_id);
+    if (worker == nullptr) throw std::runtime_error("control_payload: invalid worker_id " + std::to_string(worker_id));
+    return worker->control_payload(sub_cmd, payload, payload_size, timeout_s, retiring);
+}
+
+void WorkerManager::check_control_payloads_retired() {
+    for (auto &worker : next_level_threads_)
+        worker->check_control_payload_retired();
+    for (auto &worker : sub_threads_)
+        worker->check_control_payload_retired();
 }
 
 ControlResult WorkerManager::control_remote_prepare_register(

@@ -96,7 +96,9 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     RUNTIME_ENV_RING_COUNT,
     WorkerType,
     _CallArgumentSnapshot,
+    _decode_buffer_descriptor_wire,
     _emit_host_span,
+    _encode_buffer_descriptor_wire,
     _mailbox_load_i32,
     _mailbox_load_u64,
     _mailbox_store_i32,
@@ -118,6 +120,7 @@ from _task_interface import (
 )
 
 from . import _log as _simpler_log
+from . import buffer_export as _buffer_export
 from ._shared_memory import SharedMemoryAttachment
 from .buffer import (
     OWNER_INSTANCE_ID_BYTES,
@@ -145,6 +148,7 @@ from .buffer import (
     wrap_fork_inherited,
     wrap_vmm_window,
 )
+from .buffer_export import BufferExport
 from .callable_identity import (
     CALLABLE_HASH_DIGEST_BYTES,
     CallableHandle,
@@ -918,6 +922,7 @@ _CTRL_OP_NAMES[_CTRL_HOST_DDR] = "host_ddr"
 _CTRL_DFX_FLUSH = 27
 _CTRL_CCU_DOMAIN = 28
 _CCU_DOMAIN_REQUEST = struct.Struct("<QQI32si")
+_CTRL_BUFFER_EXPORT = 30
 _CTRL_OP_NAMES[_CTRL_DFX_FLUSH] = "flush_diagnostics"
 # The native flush wait takes a millisecond count in a C `int`. The wire field
 # is 64-bit, so a malformed frame is clamped here rather than left to fail
@@ -3579,6 +3584,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
     base_comm_handle = 0
     diagnostic_capture_index = 0
     ccu_bindings = {}
+    ccu_binding_acquisitions = {}
     ccu_callables = {}
     ccu_contexts = {}
 
@@ -3637,7 +3643,14 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
         code = 0
         msg = ""
         try:
-            if sub_cmd == _CTRL_MALLOC:
+            if sub_cmd == _CTRL_BUFFER_EXPORT:
+                staged, payload, size = _open_ctrl_payload(buf, what="VMM buffer")
+                view = payload[:size]
+                try:
+                    view[:] = _buffer_export._handle_command(cw, view)
+                finally:
+                    _release_ctrl_payload(staged, payload, view)
+            elif sub_cmd == _CTRL_MALLOC:
                 size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
                 ptr = cw.malloc(size)
                 struct.pack_into("Q", buf, _CTRL_OFF_RESULT, ptr)
@@ -3748,7 +3761,47 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                         raise RuntimeError("CCU admission is closed; only cleanup controls are accepted")
                     comm = _require_base_communicator(base_comm_handle)
                     result = 0
-                    if operation == 5:
+                    if operation == 9:
+                        try:
+                            tail = _CCU_DOMAIN_REQUEST.size
+                            collective_id, rank_count, domain_rank, ccu_id = struct.unpack_from("<QIII", payload, tail)
+                            if size != tail + 20 + rank_count * 4 or rank_count < 1 or domain_rank >= rank_count:
+                                raise ValueError("invalid domain CCU registration topology")
+                            rank_ids = list(struct.unpack_from(f"<{rank_count}I", payload, tail + 20))
+                            cid = identity_table.get(digest)
+                            if cid is None:
+                                raise RuntimeError("CCU callable is not registered on this chip")
+                            from .ccu import runtime_build_identity  # noqa: PLC0415
+
+                            sdk_id, isa_id = runtime_build_identity()
+                            result = cw.register_ccu_callable(
+                                comm,
+                                collective_id,
+                                int(cid),
+                                rank_ids,
+                                domain_rank,
+                                sdk_id,
+                                isa_id,
+                                8,
+                                allocation,
+                                ccu_id,
+                            )
+                        except Exception:
+                            if not cw.communication_cleanup_confirmed():
+                                raise
+                            result = -1
+                        else:
+                            ccu_bindings[result] = (allocation, ccu_id)
+                            ccu_binding_acquisitions[result] = ccu_binding_acquisitions.get(result, 0) + 1
+                    elif operation == 10:
+                        cw.release_ccu_registration(comm, allocation)
+                        remaining = ccu_binding_acquisitions.get(allocation, 1) - 1
+                        if remaining:
+                            ccu_binding_acquisitions[allocation] = remaining
+                        else:
+                            ccu_binding_acquisitions.pop(allocation, None)
+                            ccu_bindings.pop(allocation, None)
+                    elif operation == 5:
                         tail = _CCU_DOMAIN_REQUEST.size
                         collective_id, rank_count, domain_rank = struct.unpack_from("<QII", payload, tail)
                         if size != tail + 16 + rank_count * 4 or rank_count < 2 or domain_rank >= rank_count:
@@ -3782,6 +3835,10 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                     staged.close()
             elif sub_cmd == _CTRL_RELEASE_DOMAIN:
                 released = _handle_ctrl_release_domain(cw, buf, base_comm_handle=base_comm_handle)
+                for registration, binding in tuple(ccu_bindings.items()):
+                    if isinstance(binding, tuple) and binding[0] == released:
+                        del ccu_bindings[registration]
+                        ccu_binding_acquisitions.pop(registration, None)
                 for key, (_, allocation) in tuple(ccu_contexts.items()):
                     if allocation == released:
                         del ccu_contexts[key]
@@ -4066,16 +4123,17 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
             # at those bases, as the non-pipelined task path does. The lane copies the args into
             # its own storage, so this POD need not outlive the call.
             args = staged.pending_args  # type: ignore[attr-defined]
-            if getattr(registry[staged.cid], "ccu_module_count", 0):
-                matches = [
-                    ccu_contexts[(staged.digest, args.scalar(i))]
-                    for i in range(args.scalar_count())
-                    if (staged.digest, args.scalar(i)) in ccu_contexts
-                ]
-                if len(matches) != 1:
-                    raise ValueError("CCU task requires exactly one enabled domain context")
-                binding, allocation = matches[0]
-                staged.ccu_binding = binding.prepare(dispatch_id, allocation)
+            plan = args.ccu_bindings()
+            if plan:
+                from .ccu import ChipCcuRunSet  # noqa: PLC0415
+
+                registrations = []
+                for allocation, registration, ccu_id in plan:
+                    if ccu_bindings.get(registration) != (allocation, ccu_id):
+                        raise ValueError("invalid or expired domain CCU binding")
+                    if registration not in registrations:
+                        registrations.append(registration)
+                staged.ccu_binding = ChipCcuRunSet(cw, base_comm_handle, registrations, dispatch_id, dispatch_id)
             _validate_host_control_access(registry.get(staged.cid), args)
             Worker._validate_map_aliases(registry.get(staged.cid), args)
             if staged.config.output_prefix:
@@ -11220,6 +11278,7 @@ class Worker:
                         buffers=config.specs(),
                         retain_after_run=config.retain_after_run,
                     )
+                handle._ccu_register_fn = self._get_or_register_domain_ccu
                 handle._use_fn = self._use_domain
                 self._use_domain(handle, config=config)
                 self._initialize_domain(handle, initializer)
@@ -11280,55 +11339,122 @@ class Worker:
             self._ensure_comm_base()
             self._ccu_context_registrations[context_key] = self._ccu_registration_collective(digest)
 
-    def _prepare_ccu_submission(self, callable_handle, worker_ids, args_list) -> None:
+    def _get_or_register_domain_ccu(self, domain, callable_handle, *, ccu_id, worker):
+        from .ccu import CcuRegistrationHandle  # noqa: PLC0415
+
+        with self._operation_lease("get_or_register_ccu", allow_continuation=True):
+            if isinstance(ccu_id, bool) or not isinstance(ccu_id, int) or not 0 <= ccu_id < 2**32 - 1:
+                raise ValueError("ccu_id must be a uint32 definition id below UINT32_MAX")
+            state = self._resolve_handle(callable_handle, expected_namespace="LOCAL_CHIP")
+            if self.level != 3 or self._config.get("platform") != "a5":
+                raise ValueError("CCU registration requires an L3 A5 Worker")
+            if not getattr(state.target, "ccu_module_count", 0):
+                raise ValueError("callable has no native CCU kernels")
+            domain._require_ready()
+            if domain._config is None or "ccu" not in domain._config.workspace_engines:
+                raise ValueError("domain must declare workspace_engines=('ccu',)")
+            if isinstance(worker, bool) or not isinstance(worker, int) or worker not in domain.workers:
+                raise ValueError("CCU registration worker must be a domain member Worker id")
+            if state.eligible_worker_ids and worker not in state.eligible_worker_ids:
+                raise ValueError("CCU callable must be available on the target worker")
+            key = (worker, callable_handle.digest, ccu_id)
+            with domain._ccu_registration_lock:
+                if key in domain._ccu_registrations:
+                    binding = domain._ccu_registrations[key]
+                    binding.require_live(self)
+                    self._use_domain(domain)
+                    return binding
+            with self._control_admission("get_or_register_ccu"), domain._ccu_registration_lock:
+                domain._require_ready()
+                if domain._ccu_registration_failed:
+                    raise RuntimeError("CCU registration cleanup is unconfirmed; domain cannot be reused")
+                if key not in domain._ccu_registrations:
+                    registration = self._register_domain_ccu(domain, callable_handle.digest, ccu_id, worker)
+                    domain._ccu_registrations[key] = CcuRegistrationHandle(
+                        domain,
+                        self,
+                        callable_handle,
+                        ccu_id,
+                        worker,
+                        registration,
+                        domain.allocation_id,
+                        domain.generation,
+                    )
+                self._use_domain(domain)
+                return domain._ccu_registrations[key]
+
+    def _register_domain_ccu(self, domain, digest, ccu_id, worker):
+        native = self._worker
+        if native is None:
+            raise RuntimeError("CCU registration requires an initialized Worker")
+        self._ensure_comm_base()
+        with self._alloc_id_lock:
+            registration_context_id = self._next_alloc_id
+            self._next_alloc_id += 1
+        workers = domain.workers
+        payload = _CCU_DOMAIN_REQUEST.pack(domain.allocation_id, domain.generation, 9, digest, 0)
+        payload += struct.pack("<QIII", registration_context_id, len(workers), workers.index(worker), ccu_id)
+        payload += struct.pack(f"<{len(workers)}I", *workers)
+        try:
+            reply = native.control_payload(
+                WorkerType.NEXT_LEVEL, worker, _CTRL_CCU_DOMAIN, payload, self._py_control_timeout_s
+            )
+            result = _CCU_DOMAIN_REQUEST.unpack_from(reply)[-1]
+            if result != -1 and result <= 0:
+                raise RuntimeError("CCU registration returned an invalid handle")
+        except BaseException:
+            # An unknown RPC outcome may leave a registration on the target.
+            domain._ccu_registration_failed = True
+            raise
+        if result == -1:
+            raise RuntimeError(f"CCU registration rejected on worker {worker}; cleanup confirmed")
+        return result
+
+    def _prepare_ccu_submission(self, callable_handle, worker_ids, args_list, *, ccu_bindings=None):
+        from .ccu import CcuRegistrationHandle  # noqa: PLC0415
+
         state = self._resolve_handle(callable_handle, expected_namespace="LOCAL_CHIP")
-        if not getattr(state.target, "ccu_module_count", 0):
-            return
+        if ccu_bindings is None:
+            if getattr(state.target, "ccu_module_count", 0):
+                raise ValueError("CCU task requires explicit ccu_bindings")
+            return args_list
         if self.level != 3 or self._config.get("platform") != "a5":
             raise ValueError("CCU submissions require an L3 A5 Worker")
         resources = self._building_run_resources
         if resources is None:
             raise RuntimeError("CCU submission requires an orchestration callback")
+        if isinstance(ccu_bindings, dict):
+            if set(ccu_bindings) != set(worker_ids):
+                raise ValueError("ccu_bindings must describe exactly the submitted workers")
+            plans = [tuple(ccu_bindings[chip]) for chip in worker_ids]
+        else:
+            common = tuple(ccu_bindings)
+            plans = [common] * len(worker_ids)
+        encoded_plans = []
+        used_domains = {}
+        for chip, plan in zip(worker_ids, plans):
+            encoded = {}
+            for binding in plan:
+                if not isinstance(binding, CcuRegistrationHandle):
+                    raise TypeError("ccu_bindings entries must be CcuRegistrationHandle objects")
+                binding.require_live(self)
+                if chip != binding.worker:
+                    raise ValueError("CCU binding used on a different worker from its registration")
+                key = (binding.allocation_id, binding.ccu_id)
+                value = (binding.allocation_id, binding.registration_id, binding.ccu_id)
+                if key in encoded and encoded[key] != value:
+                    raise ValueError("conflicting CCU definitions for one domain and ccu_id")
+                encoded[key] = value
+                used_domains[binding.allocation_id] = binding.domain
+            encoded_plans.append(list(encoded.values()))
+        result = [args.with_ccu_bindings(plan) for args, plan in zip(args_list, encoded_plans)]
+        for domain in used_domains.values():
+            self._use_domain(domain)
+            resources.ccu_domains[domain.allocation_id] = domain
         for args in args_list:
             self._record_touched_identities(args)
         self._enroll_domain_uses(resources)
-        domains = [
-            handle
-            for handle in resources.live_domains.values()
-            if not handle.released
-            and handle._config is not None
-            and "ccu" in handle._config.workspace_engines
-            and set(worker_ids) <= set(handle.workers)
-        ]
-        if not domains:
-            raise ValueError("CCU task requires a CCU-enabled domain; allocate with workspace_engines=('ccu',)")
-        selected = [
-            handle
-            for handle in domains
-            if all(
-                sum(args.scalar(i) == handle.contexts[chip].device_ctx for i in range(args.scalar_count())) == 1
-                for chip, args in zip(worker_ids, args_list)
-            )
-        ]
-        if len(selected) != 1:
-            raise ValueError("CCU task requires exactly one selected domain context in its scalar arguments")
-        handle = selected[0]
-        if resources.ccu_domains and handle.allocation_id not in resources.ccu_domains:
-            raise ValueError("only one CCU domain is supported per orchestration run")
-        if state.eligible_worker_ids and not set(range(len(self._config.get("device_ids", ())))) <= set(
-            state.eligible_worker_ids
-        ):
-            raise ValueError("CCU callable must be registered on every L3 chip worker")
-        digest = callable_handle.digest
-        if (self._worker, digest) not in self._ccu_context_registrations:
-            raise ValueError("CCU callable must be explicitly registered before submit")
-        key = (handle.allocation_id, digest)
-        if key in resources.ccu_bindings:
-            return
-        registrations = self._ccu_domain_collective(handle, 6, digest)
-        self._ccu_run_registrations[key] = registrations
-        resources.ccu_domains[handle.allocation_id] = handle
-        resources.ccu_bindings[key] = digest
+        return result
 
     def _ccu_registration_collective(self, digest) -> list[int]:
         """Register a callable once across the full L3/L2 communication context."""
@@ -13095,6 +13221,9 @@ class Worker:
         # revoked BEFORE the native free (and before a domain's backend release), so an interrupted
         # op never leaves an identity resolving to memory that is already gone. Cleared on close().
         self._child_alloc = _DeviceAllocations()
+        self._vmm_buffers: dict[CanonicalIdentity, _buffer_export._AllocationInfo] = {}
+        self._buffer_exports: dict[int, _buffer_export._ExportLease] = {}
+        self._export_sequence = _buffer_export._EXTERNAL_BORROW_TOKEN_BASE
         self._device_buffer_source: _DeviceBufferSource | None = None
         self._source_context_failed = False
         self._source_attachments: set[CanonicalIdentity] = set()
@@ -13547,12 +13676,15 @@ class Worker:
         if worker_id < 0 or worker_id >= len(self._chip_shms):
             raise IndexError(f"worker_id {worker_id} out of range (have {len(self._chip_shms)} chips)")
 
-    def malloc(self, size: int) -> Buffer:
+    def malloc(self, size: int, *, exportable: bool = False) -> Buffer:
         """Allocate device memory on this L2 worker's own chip; returns a DEVICE_MALLOC ``Buffer``.
 
         Name a task arg with ``handle.tensor(shapes, dtype)`` and release with ``worker.free(handle)``. L3+
         allocates child device memory with ``alloc_child_tensor(worker_id, ...)`` instead — a Worker is
         the only allocator, the Orchestrator never allocates.
+
+        exportable=True opts into onboard VMM storage. Its source allocation remains owned here;
+        every external consumer lease must retire before free() or close().
         """
         if self.level != 2:
             raise TypeError("worker.malloc is L2-only; at L3+ use worker.alloc_child_tensor(worker_id, ...)")
@@ -13563,7 +13695,11 @@ class Worker:
             # L2 is a single chip; worker_id is meaningless there, so the provenance is keyed
             # on the canonical worker 0.
             with self._child_prov_lock:
-                ptr = int(self._chip_worker.malloc(int(size)))
+                ptr = (
+                    self._allocate_exportable(identity, int(size), 0)
+                    if exportable
+                    else int(self._chip_worker.malloc(int(size)))
+                )
                 handle = wrap_device_malloc(
                     ptr,
                     int(size),
@@ -13576,13 +13712,16 @@ class Worker:
                 self._record_device_alloc(handle)
         return handle
 
-    def alloc_child_tensor(self, worker_id: int, shapes: tuple[int, ...], dtype) -> Buffer:
+    def alloc_child_tensor(self, worker_id: int, shapes: tuple[int, ...], dtype, *, exportable: bool = False) -> Buffer:
         """Allocate device memory on next-level ``worker_id`` sized for ``shapes`` × ``dtype``; returns a
         DEVICE_MALLOC ``Buffer`` (successor of ``orch.malloc`` + ``child_memory``).
 
         Called from within an orchestration fn (capture the Worker in the closure). The pointer is
         private to ``worker_id``; name the arg with ``handle.tensor(shapes, dtype)``, dispatch it only to
         that worker, and load host data with ``copy_to``. Not auto-freed at end-of-task.
+
+        exportable=True opts into onboard VMM storage for a same-host external consumer. The
+        controller retains this Worker until all consumer mappings and export leases retire.
         """
         nbytes = get_element_size(dtype)
         for s in shapes:
@@ -13598,7 +13737,11 @@ class Worker:
         ):
             identity = self._burn_buffer_identity()
             with self._child_prov_worker_lock(int(worker_id)):
-                ptr = int(self._worker.malloc(int(worker_id), int(nbytes)))
+                ptr = (
+                    self._allocate_exportable(identity, int(nbytes), int(worker_id))
+                    if exportable
+                    else int(self._worker.malloc(int(worker_id), int(nbytes)))
+                )
                 handle = wrap_device_malloc(
                     ptr,
                     int(nbytes),
@@ -13611,6 +13754,129 @@ class Worker:
                 with self._child_prov_lock:
                     self._record_device_alloc(handle)
         return handle
+
+    def _vmm_request(
+        self,
+        worker_id: int,
+        operation: _buffer_export._ControlOp,
+        base: int,
+        size: int = 0,
+        token: int = 0,
+        *,
+        retiring: bool = False,
+    ) -> tuple[int, int, int, int, int]:
+        payload = _buffer_export._CONTROL_FRAME.pack(operation, base, size, token, 0)
+        with self._device_control_admission("VMM buffer"):
+            if self.level == 2:
+                assert self._chip_worker is not None
+                reply = _buffer_export._handle_command(self._chip_worker, payload)
+            else:
+                assert self._worker is not None
+                reply = self._worker.control_payload(
+                    WorkerType.NEXT_LEVEL,
+                    worker_id,
+                    _CTRL_BUFFER_EXPORT,
+                    payload,
+                    self._py_control_timeout_s,
+                    retiring=retiring,
+                )
+        return _buffer_export._CONTROL_FRAME.unpack(reply)
+
+    def _allocate_exportable(self, identity: CanonicalIdentity, nbytes: int, worker_id: int) -> int:
+        if str(self._config.get("platform", "")).startswith("a5"):
+            raise ValueError("exportable VMM buffers are supported on A2/A3 only")
+        base, shareable_handle, mapping_bytes, device_id, _reserved = self._vmm_request(
+            worker_id, _buffer_export._ControlOp.ALLOCATE, nbytes
+        )
+        allocation = _buffer_export._AllocationInfo(base, shareable_handle, mapping_bytes, device_id)
+        self._vmm_buffers[identity] = allocation
+        return allocation.base
+
+    def export_buffer(self, buffer: Buffer) -> BufferExport:
+        """Retain one consumer lease over a live, exportable allocation.
+
+        The controller holds this Worker alive and arranges computation/consumer ordering.
+        A missing control confirmation retains the pending lease and prevents free/close.
+
+        Args:
+            buffer: A complete live Buffer allocated by this Worker with exportable=True.
+
+        Returns:
+            Same-host VMM metadata; the consumer maps its own device VA from the shareable handle.
+        """
+        worker_id = self._device_worker_for(buffer.identity, api="export_buffer")
+        with self._operation_lease("export_buffer"), self._child_prov_worker_lock(worker_id):
+            with self._child_prov_lock:
+                registered = self._require_freeable(buffer, api="export_buffer")
+                if _encode_buffer_descriptor_wire(buffer.to_descriptor()) != _encode_buffer_descriptor_wire(
+                    registered.to_descriptor()
+                ):
+                    raise ValueError(f"export_buffer: descriptor differs from live allocation {buffer.identity}")
+            if buffer.identity not in self._vmm_buffers:
+                raise ValueError(f"export_buffer: buffer {buffer.identity} was not allocated with exportable=True")
+            allocation = self._vmm_buffers[buffer.identity]
+            with self._hierarchical_start_cv:
+                if self._lifecycle is not _Lifecycle.READY:
+                    raise RuntimeError(f"export_buffer requires a ready Worker, got {self._lifecycle.name}")
+                self._export_sequence += 1
+                exported = BufferExport(
+                    _encode_buffer_descriptor_wire(registered.to_descriptor()),
+                    self._export_sequence,
+                    allocation.device_id,
+                    allocation.shareable_handle,
+                    allocation.mapping_bytes,
+                )
+                # A lost retain reply does not prove that the consumer lease was never established.
+                lease = _buffer_export._ExportLease(exported)
+                self._buffer_exports[exported.token] = lease
+            try:
+                self._vmm_request(
+                    worker_id, _buffer_export._ControlOp.RETAIN, registered.base, registered.nbytes, exported.token
+                )
+            except Exception as error:
+                raise _buffer_export.BufferExportError(exported) from error
+            lease.retain_confirmed = True
+            return exported
+
+    def release_export(self, exported: BufferExport) -> None:
+        """Confirm consumer retirement and release its source lease.
+
+        Call only after external accesses finish, registrations are removed and consumer
+        unmapping succeeds. If the control reply is lost, the lease remains outstanding.
+        For BufferExportError.exported, first confirm the idempotent RETAIN before RELEASE.
+        A timed-out mailbox retains its original payload until the matching reply arrives.
+        Retirement reconciles that reply without replay; computation stays poisoned and the
+        Worker must be closed before replacing it. A still-unresolved command keeps refusing.
+        """
+        descriptor = _decode_buffer_descriptor_wire(exported.descriptor)
+        worker_id = self._device_worker_for(descriptor.identity, api="release_export")
+        with self._operation_lease("release_export"), self._child_prov_worker_lock(worker_id):
+            lease = self._buffer_exports.get(exported.token)
+            if lease is None or lease.exported != exported:
+                raise ValueError(f"release_export: token {exported.token} does not name a matching live export")
+            if not lease.retain_confirmed:
+                allocation = self._vmm_buffers[descriptor.identity]
+                self._vmm_request(
+                    worker_id,
+                    _buffer_export._ControlOp.RETAIN,
+                    allocation.base,
+                    descriptor.nbytes,
+                    exported.token,
+                    retiring=True,
+                )
+                lease.retain_confirmed = True
+            self._vmm_request(worker_id, _buffer_export._ControlOp.RELEASE, 0, token=exported.token, retiring=True)
+            with self._hierarchical_start_cv:
+                del self._buffer_exports[exported.token]
+
+    def check_exports_retired(self, buffer: Buffer | None = None) -> None:
+        """Reject release while any export, or an export of the selected buffer, remains live."""
+        descriptor = None if buffer is None else _encode_buffer_descriptor_wire(buffer.to_descriptor())
+        with self._hierarchical_start_cv:
+            if any(
+                descriptor is None or item.exported.descriptor == descriptor for item in self._buffer_exports.values()
+            ):
+                raise RuntimeError("external buffer exports must retire before free/close")
 
     def _refuse_free_while_in_flight(self, handle: Buffer) -> None:
         """Raise when an in-flight run still names ``handle``'s allocation.
@@ -13681,6 +13947,8 @@ class Worker:
         of one rule, not the whole of it.
 
         The operation lease is re-entrant, so an in-run ``orch.free`` that delegates here nests safely.
+        Failed VMM cleanup revokes use but retains a private cleanup target. Retry free with
+        the same Buffer identity, or close the Worker; do not submit/copy/export it again.
         """
         if handle._source_registration is not None:
             raise ValueError("Worker.free: borrowed storage is released by its allocator, never Worker.free")
@@ -13689,7 +13957,9 @@ class Worker:
             self._check_chip_worker_id(0)
         # Lock selection comes from the private registration snapshot. A caller may mutate the
         # public handle, but cannot redirect a free to another chip.
-        wid = self._device_worker_for(handle.identity, api="free")
+        allocation = self._vmm_buffers.get(handle.identity)
+        cleanup = allocation.cleanup if allocation is not None else None
+        wid = cleanup.owner_worker_id if cleanup is not None else self._device_worker_for(handle.identity, api="free")
         if self.level != 2:
             self._check_chip_worker_id(wid)
         with self._operation_lease("free"), self._device_control_admission("free"):
@@ -13703,15 +13973,26 @@ class Worker:
                 # ``_child_prov_lock``; the native call runs under this worker's lock only, so a free on
                 # one chip no longer blocks provenance or device ops on another.
                 with self._child_prov_lock:
-                    registered = self._require_freeable(handle, api="free")
+                    allocation = self._vmm_buffers.get(handle.identity)
+                    cleanup = allocation.cleanup if allocation is not None else None
+                    if cleanup is not None:
+                        if handle.to_descriptor() != cleanup.to_descriptor():
+                            raise ValueError("free: descriptor differs from retired allocation")
+                        registered = cleanup
+                    else:
+                        registered = self._require_freeable(handle, api="free")
+                        self.check_exports_retired(registered)
+                        if allocation is not None:
+                            self._vmm_buffers[handle.identity] = replace(allocation, cleanup=registered)
+                        self._drop_device_alloc(handle.identity)
                     ptr = int(registered.base)
-                    self._drop_device_alloc(handle.identity)
                 if self.level == 2:
                     assert self._chip_worker is not None
                     self._chip_worker.free(ptr)
                 else:
                     assert self._worker is not None
                     self._worker.free(wid, ptr)
+                self._vmm_buffers.pop(handle.identity, None)
 
     def committed_device_memory(self, worker_id: int = 0) -> int:
         """Total device HBM (bytes) committed by chip worker *worker_id*'s
@@ -15729,6 +16010,8 @@ class Worker:
         handles_to_drain: tuple[RunHandle, ...] = ()
         try:
             with self._hierarchical_start_cv:
+                if self._buffer_exports:
+                    raise RuntimeError("external buffer exports must retire before close")
                 if threading.get_ident() in self._lease_depth:
                     raise RuntimeError(
                         "Worker.close(): cannot be called from within a run() / submit() / create_buffer() / "
@@ -16339,6 +16622,13 @@ class Worker:
             except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
 
+        if self.level != 2 and self._worker is not None:
+            key = ("native", "pending control payloads")
+            self._cleanup_journal.add_once(*key, self._worker.check_control_payloads_retired)
+            control_error = self._cleanup_journal.drive({key})
+            if control_error is not None:
+                raise control_error
+
         if self.level == 2:
             close_drained_chip_runs = self._close_completion is not None and self._close_completion.draining_chip_runs
             recovering_abandoned_runs = bool(self._abandoned_run_handles or self._ordered_cleanup_error is not None)
@@ -16536,6 +16826,8 @@ class Worker:
             raise retirement_error
         if errors:
             raise errors[0]
+
+        self._vmm_buffers.clear()
 
     def _teardown_ready_tree(self) -> None:
         self._teardown_worker_tree(startup_abort=False)

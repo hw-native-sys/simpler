@@ -513,3 +513,42 @@ lib +0.6097%，DSL −0.1985%。四组通信记录每轮较慢 rank 后求均值
 `formal-mix-latency-18/` 保存完整表格和逐轮数据，`formal-mix-latency/`
 保存撤回补丁、恢复证明及功能结果，`formal-mix-latency-snapshot/`
 保存冻结源码和运行库，`c2a-full-formal-mix-latency/` 保存原始诊断。
+
+<!-- markdownlint-disable-next-line MD033 -->
+<a id="refill-ready-first"></a>
+
+## Refill 后优先尝试新接收 token
+
+2026-11-15，以执行优先版 `9d221f38e` 为基线，叠加 `de89c2c2c` 的
+双卡 Device 启动门。候选只调整 `scheduler_fill_own_slots`：普通 refill
+或续领返回后先尝试已有 token，未选出执行才服务 cooperative 并再检查。
+最终许可、固定 owner、MIX/sync_start 与 async/control 有界服务不变。
+
+动机来自当前 Reindex L3 的 t26：receive/fanin 之后仍有 6.543 µs
+cooperative 服务；新 SWA L3 的相应区间为 1.281 µs。L1 已表明 L3 的
+间隙会被插桩放大，因此这些区间仅支持候选方向，不是 L0 收益承诺。
+
+同一冻结输入、同一自动分配设备对比 retained/candidate/percounter 三臂，
+每个 case 轮换顺序，各一次预热、十次 L0。双卡均先完成 Device 会合，
+再测原 AICPU RunWall；每轮取两 rank 较大值。48/48 臂的数值、样本及
+双卡逐 epoch 起点/收尾证据审计通过。五个 C++ 套件通过；A5 HBG
+构建 66.02 秒，实际 IR 扫描 16/16 TU、零 findings。
+
+| Group | Retained / ms | Candidate / ms | Change |
+| ----- | ------------: | -------------: | -----: |
+| All 16, including communication | 55.3442932 | 55.6804634 | +0.6074% |
+
+SWA 改善 0.43%、Reindex 改善 2.86%，但 C1A reuse 回退 4.47%、
+初版 layers 19–21 回退 2.18%。总和不满足保留规则，生产代码和统一设计
+已恢复。未就绪时多一次 token 检查是源码中的成本，但本次没有足够证据
+把所有回退唯一归因于该检查、编译布局或设备状态。
+
+percounter 本轮总和为 59.4348634 ms；保留版只在 7/16 项逐项更快，
+总和胜出不代表逐项目标完成。旧的未同步双卡数据未混入本次判断。
+后续分开处理晚领取与已持有后的确认热点：SWA t27 的 64 个 token
+均已提前接收，但完成后仍集中观察同一前驱的 completion_state。
+
+本地证据：`artifacts/hbg-goal-resume-20261115/three-arm16/` 的
+`audit.json`、`summary.json`、逐臂结果及原始记录；`refill-ready-first/`
+保存冻结源码/二进制、完整 IR 和 `rejected.patch`；`trace-audit.md/json`
+保存 L1/L3/L4 的时间轴归属与非重叠分解。不通过选择性删除样本保留候选。

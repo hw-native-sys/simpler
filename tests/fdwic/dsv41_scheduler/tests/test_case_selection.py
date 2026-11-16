@@ -20,10 +20,11 @@ import pytest
 pytestmark = pytest.mark.manual
 SUITE = Path(__file__).resolve().parents[1]
 SELECTED = {
-    "pypto_lib": {"c2a_full", "moe", "layers_19_21"},
+    "pypto_lib": {"c2a_full"},
     "pypto_lib_dsl": {"c2a_full", "moe", "layers_19_21"},
     "pypto_lib_latest": {"swa", "c2a_full", "c1a_reindex", "c1a_reuse", "moe", "engram", "layers_19_21"},
 }
+VARIANTS = {**SELECTED, "pypto_lib_dsl_all_sync64": {"c2a_full"}}
 SPEC = importlib.util.spec_from_file_location("selected_workloads", SUITE / "export_workloads.py")
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -38,8 +39,12 @@ def test_manifests_and_tables_contain_only_selected_cases():
         assert set(cases) == selected
         replay = {name for name, case in cases.items() if case.get("execution") != "native_moe_host_control"}
         assert {p.parent.name for p in folder.glob("*/tasks.tsv")} == replay
-        total += len(cases) * (2 if flavor == "pypto_lib_dsl" else 1)
-    assert total == 16
+        variants = (flavor, "pypto_lib_dsl_all_sync64") if flavor == "pypto_lib_dsl" else (flavor,)
+        for variant in variants:
+            selected_variant = {name for name, spec in cases.items() if variant in spec.get("variants", variants)}
+            assert selected_variant == VARIANTS[variant]
+            total += len(selected_variant)
+    assert total == 12
 
 
 def test_performance_table_matches_selected_variants():
@@ -50,10 +55,10 @@ def test_performance_table_matches_selected_variants():
             actual.append((cells[0], cells[1]))
     labels = [label for case, label in actual if case == "c2a_full"]
     assert len(set(labels)) == 4
-    sources = ("pypto_lib", "pypto_lib_dsl", "pypto_lib_dsl", "pypto_lib_latest")
-    expected = {(case, label) for label, flavor in zip(labels, sources, strict=True) for case in SELECTED[flavor]}
+    sources = ("pypto_lib", "pypto_lib_dsl", "pypto_lib_dsl_all_sync64", "pypto_lib_latest")
+    expected = {(case, label) for label, flavor in zip(labels, sources, strict=True) for case in VARIANTS[flavor]}
     assert set(actual) == expected
-    assert len(actual) == 16
+    assert len(actual) == 12
 
 
 @pytest.mark.parametrize("flavor", SELECTED)
@@ -94,11 +99,13 @@ def test_topology_refresh_cannot_restore_removed_cases(tmp_path, flavor):
     assert set(produced) == SELECTED[flavor]
     replay = {name for name, case in produced.items() if case.get("execution") != "native_moe_host_control"}
     assert {p.name for p in (output / flavor).iterdir() if p.is_dir()} == replay
+    if flavor == "pypto_lib_dsl":
+        assert produced["moe"]["variants"] == ["pypto_lib_dsl"]
+        assert produced["layers_19_21"]["variants"] == ["pypto_lib_dsl"]
 
 
 def test_run_list_excludes_removed_cached_bundles():
     listed = subprocess.check_output([sys.executable, str(SUITE / "production/list_cases.py")], text=True).splitlines()
-    expected = {f"{flavor}/{case}" for flavor, cases in SELECTED.items() for case in cases}
-    expected |= {f"pypto_lib_dsl_all_sync64/{case}" for case in SELECTED["pypto_lib_dsl"]}
+    expected = {f"{variant}/{case}" for variant, cases in VARIANTS.items() for case in cases}
     assert set(listed) == expected
-    assert len(listed) == 16
+    assert len(listed) == 12

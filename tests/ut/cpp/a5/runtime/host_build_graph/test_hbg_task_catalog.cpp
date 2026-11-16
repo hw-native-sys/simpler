@@ -12,9 +12,11 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #include "dependency_plan.h"
+#include "scheduler/scheduler_issue.h"
 #include "hbg_scheduler_test_support.h"
 #include "task_catalog_plan.h"
 
@@ -72,6 +74,7 @@ TEST(HbgTaskCatalog, PhysicalTasksUseTwoEngineListsAndControlsRemainSeparate) {
     const auto vectors = scheduler_task_catalog(image.base, image.plan.header, 1);
     EXPECT_EQ(std::vector<int64_t>(cubes.refs, cubes.refs + cubes.count), (std::vector<int64_t>{0, 2, 3}));
     EXPECT_EQ(std::vector<int64_t>(vectors.refs, vectors.refs + vectors.count), (std::vector<int64_t>{1}));
+    EXPECT_FALSE(scheduler_task_catalog_valid(scheduler_task_catalog(image.base, image.plan.header, 2)));
     EXPECT_EQ(metadata[2].active_mask.raw(), 3u);
     EXPECT_EQ(metadata[3].active_mask.raw(), 6u);
 }
@@ -87,14 +90,149 @@ TEST(HbgTaskCatalog, EmptyAndSingleEngineRunsKeepBothDirectories) {
     }
 }
 
+TEST(HbgTaskCatalog, TopologicalGenerationsExposeIndependentBranchesBeforeDeeperTasks) {
+    scheduler_test::BasicGraphBuffer<16> graph(8);
+    graph.executable(0, 0);
+    graph.executable(1, 0);
+    graph.executable(2, 0, {0});
+    graph.executable(3, 0, {2});
+    graph.executable(4, 0, {3});
+    graph.executable(5, 0, {0});
+    graph.executable(6, 0, {5});
+    graph.executable(7, 0);
+    const std::vector<SchedulerTaskMetadata> metadata{
+        physical(LaneMask::aiv0()),
+        physical(LaneMask::aiv0()),
+        physical(LaneMask::aic()),
+        physical(LaneMask::aiv0()),
+        physical(LaneMask(true, true, false)),
+        physical(LaneMask::aic()),
+        physical(LaneMask::aiv0()),
+        physical(LaneMask::aic())
+    };
+    CatalogImage image(metadata);
+    std::string error;
+    ASSERT_TRUE(scheduler_order_task_catalog(graph.graph(), metadata, {}, &image.plan, &error)) << error;
+    scheduler_init_task_catalog(image.base, image.plan);
+    ASSERT_TRUE(image.valid());
+    const auto cubes = scheduler_task_catalog(image.base, image.plan.header, 0);
+    const auto vectors = scheduler_task_catalog(image.base, image.plan.header, 1);
+    EXPECT_EQ(std::vector<int64_t>(cubes.refs, cubes.refs + cubes.count), (std::vector<int64_t>{7, 2, 5, 4}));
+    EXPECT_EQ(std::vector<int64_t>(vectors.refs, vectors.refs + vectors.count), (std::vector<int64_t>{0, 1, 3, 6}));
+    EXPECT_EQ(image.plan.task_order, (std::vector<int64_t>{0, 1, 7, 2, 5, 3, 6, 4}));
+    EXPECT_EQ(image.plan.task_levels, (std::vector<uint32_t>{0, 0, 1, 2, 3, 1, 2, 0}));
+}
+
+TEST(HbgTaskCatalog, OrdinaryFaninConfirmsEarlierBranchWithoutChangingDependenciesOrIssueOrder) {
+    scheduler_test::BasicGraphBuffer<8> graph(5);
+    graph.executable(0, 0);
+    graph.executable(1, 0, {0});
+    graph.executable(2, 0, {1});
+    graph.executable(3, 0);
+    graph.executable(4, 0, {2, 3, 3});
+    const std::vector<SchedulerTaskMetadata> metadata(5, physical(LaneMask::aic()));
+    CatalogImage image(metadata);
+    std::string error;
+    ASSERT_TRUE(scheduler_order_task_catalog(graph.graph(), metadata, {}, &image.plan, &error)) << error;
+    ASSERT_LT(image.plan.task_ranks[3], image.plan.task_ranks[2]);
+    const auto task_order = image.plan.task_order;
+    const auto catalogs = image.plan.catalogs;
+    auto &payload = graph.payload(4);
+    auto *const fanin_address = payload.fanin_data();
+    std::vector<int32_t> original(fanin_address, fanin_address + payload.fanin_count);
+
+    ASSERT_TRUE(scheduler_order_ordinary_fanin(graph.storage(), image.plan.task_ranks, {}, &error)) << error;
+    ASSERT_EQ(payload.fanin_count, 3);
+    EXPECT_EQ(payload.fanin_data(), fanin_address);
+    std::vector<int32_t> reordered(fanin_address, fanin_address + payload.fanin_count);
+    EXPECT_EQ(reordered, (std::vector<int32_t>{3, 3, 2}));
+    std::sort(original.begin(), original.end());
+    std::sort(reordered.begin(), reordered.end());
+    EXPECT_EQ(reordered, original);
+    // The same dependency graph still yields the same task issuance order.
+    ASSERT_TRUE(scheduler_order_task_catalog(graph.graph(), metadata, {}, &image.plan, &error)) << error;
+    EXPECT_EQ(image.plan.task_order, task_order);
+    EXPECT_EQ(image.plan.catalogs, catalogs);
+}
+
+TEST(HbgTaskCatalog, CompletedNodesDoNotReadStaleIncomingDependenciesDuringOrdering) {
+    scheduler_test::BasicGraphBuffer<8> graph(3);
+    graph.executable(0, 0, {INT32_MAX});
+    graph.executable(1, 0, {0, 0});
+    graph.executable(2, 0);
+    const std::vector<SchedulerTaskMetadata> metadata(3, physical(LaneMask::aic()));
+    CatalogImage image(metadata);
+    std::string error;
+    EXPECT_FALSE(scheduler_order_task_catalog(graph.graph(), metadata, {}, &image.plan, &error));
+    ASSERT_TRUE(scheduler_order_task_catalog(graph.graph(), metadata, {0}, &image.plan, &error)) << error;
+    EXPECT_EQ(image.plan.catalogs[0], (std::vector<int64_t>{0, 2, 1}));
+    ASSERT_TRUE(scheduler_order_ordinary_fanin(graph.storage(), image.plan.task_ranks, {0}, &error)) << error;
+    EXPECT_EQ(graph.payload(0).fanin_data()[0], INT32_MAX);
+    EXPECT_EQ(graph.payload(1).fanin_count, 2);
+}
+
+TEST(HbgTaskCatalog, CrossEnginePredecessorRequiresIssuedSupplyRatherThanLogicalCompletion) {
+    for (const bool sync_start : {false, true}) {
+        SCOPED_TRACE(sync_start);
+        scheduler_test::BasicGraphBuffer<4> graph(4);
+        graph.executable(0, 0);
+        graph.executable(1, 0, {0});
+        graph.executable(2, 0);
+        graph.executable(3, 0, {2});
+        std::vector<SchedulerTaskMetadata> metadata{
+            physical(LaneMask::aic(), 2), physical(LaneMask::aiv0()), physical(LaneMask::aic(), 2),
+            physical(LaneMask::aiv0())
+        };
+        if (sync_start) {
+            metadata[0].flags |= SCHEDULER_TASK_SYNC_START | SCHEDULER_TASK_SPMD;
+            metadata[2].flags |= SCHEDULER_TASK_SYNC_START | SCHEDULER_TASK_SPMD;
+        }
+        SchedulerTaskCatalogPlan plan;
+        scheduler_test::FixtureStorage storage(4, 3, 1, {}, false, [&](AicoreSchedulerLayout &layout) {
+            ASSERT_TRUE(scheduler_plan_task_catalog(metadata, 1, layout.total_size, &plan));
+            layout.total_size = plan.total_size;
+        });
+        std::string error;
+        ASSERT_TRUE(scheduler_order_task_catalog(graph.graph(), metadata, {}, &plan, &error)) << error;
+        void *base = storage.scheduler_state->base();
+        std::copy(metadata.begin(), metadata.end(), storage.metadata);
+        scheduler_init_task_catalog(base, plan);
+        storage.task_catalog_offset = plan.header_offset;
+        auto *worker = storage.local_context(&storage.contexts[1]);
+        auto *producer = scheduler_task_control_at(base, worker, 0);
+        producer->completion_state = scheduler_completion_initial_state(2);
+        const auto query = [&]() {
+            int64_t ref = -1;
+            bool progress = false;
+            EXPECT_TRUE(scheduler_query_issue_head(graph.graph(), base, worker, storage.run_control, &ref, &progress));
+            return ref;
+        };
+        EXPECT_EQ(query(), SCHEDULER_TASK_REF_INVALID);
+        producer->next_block = 2;
+        EXPECT_EQ(query(), SCHEDULER_TASK_REF_INVALID);
+        producer->claim_seal = 2;
+        EXPECT_EQ(query(), 1);
+        EXPECT_EQ(query(), 1);
+        EXPECT_FALSE(scheduler_completion_done(producer->completion_state));
+        scheduler_task_control_at(base, worker, 1)->next_block = 1;
+        scheduler_task_control_at(base, worker, 1)->claim_seal = 1;
+        auto *next_producer = scheduler_task_control_at(base, worker, 2);
+        next_producer->completion_state = scheduler_completion_initial_state(2);
+        EXPECT_EQ(query(), SCHEDULER_TASK_REF_INVALID);
+        next_producer->next_block = 2;
+        EXPECT_EQ(query(), SCHEDULER_TASK_REF_INVALID);
+        next_producer->claim_seal = 2;
+        EXPECT_EQ(query(), 3);
+        EXPECT_FALSE(scheduler_completion_done(next_producer->completion_state));
+        EXPECT_EQ(scheduler_read_error(storage.run_control), 0u);
+    }
+}
+
 TEST(HbgTaskCatalog, MalformedImageCannotAuthorizeDescriptorAccess) {
     CatalogImage image({physical(LaneMask::aic()), physical(LaneMask::aiv0())});
     auto *header = scheduler_state_at<SchedulerTaskCatalogHeader>(image.base, image.plan.header_offset);
     auto *descriptors = scheduler_state_at<SchedulerTaskCatalogDescriptor>(image.base, header->descriptors_offset);
     ASSERT_TRUE(image.valid());
-    header->version = 0;
-    EXPECT_FALSE(image.valid());
-    *header = image.plan.header;
     header->control_count = header->task_count;
     EXPECT_FALSE(image.valid());
     *header = image.plan.header;

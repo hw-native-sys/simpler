@@ -15,37 +15,12 @@
 #include "scheduler_prepared_layout.h"
 #include "scheduler_scalar_trace.h"
 
-enum class PreparedAccessResult : uint8_t { READY, EXHAUSTED, ERROR, WAIT };
+enum class PreparedAccessResult : uint8_t { READY, ERROR };
 
 struct SchedulerPreparedHandle {
     uint64_t execution_index{UINT64_MAX};
     uint64_t claimed_state{0};
 };
-
-struct SchedulerParkedProbePlan {
-    uint32_t blocks[2]{};
-    uint32_t count{0};
-};
-
-inline constexpr uint32_t SCHEDULER_PARKED_SWEEP_INTERVAL = 4;
-
-inline __aicore__ SchedulerParkedProbePlan
-scheduler_parked_probe_plan(uint32_t worker_id, uint64_t directory_round, uint32_t block_count, bool positive_hint) {
-    SchedulerParkedProbePlan plan{};
-    if (block_count == 0) return plan;
-    const uint64_t seed = worker_id % block_count;
-    // The authoritative sweep cannot be suppressed by either a stale count or
-    // a successful fast probe. Run it first and cover every cell with stride one.
-    if (directory_round % SCHEDULER_PARKED_SWEEP_INTERVAL == SCHEDULER_PARKED_SWEEP_INTERVAL - 1) {
-        plan.blocks[plan.count++] =
-            (seed + (directory_round / SCHEDULER_PARKED_SWEEP_INTERVAL) % block_count) % block_count;
-    }
-    if (positive_hint) {
-        const uint32_t fast = (seed + directory_round % block_count) % block_count;
-        if (plan.count == 0 || plan.blocks[0] != fast) plan.blocks[plan.count++] = fast;
-    }
-    return plan;
-}
 
 inline __aicore__ bool scheduler_prepared_region_end(
     uint64_t bytes, uint64_t offset, uint64_t count, uint64_t stride, uint64_t alignment, uint64_t *end
@@ -69,8 +44,16 @@ inline __aicore__ bool scheduler_prepared_layout_valid(
         ))
         return false;
     const auto *layout = reinterpret_cast<__gm__ const SchedulerPreparedLayout *>(address + layout_offset);
-    if (layout->version != SCHEDULER_PREPARED_VERSION || layout->task_count != task_count || task_count == 0 ||
-        layout->run_epoch != run_epoch || layout->execution_count == 0 || layout->plans_offset < end ||
+    uint64_t controls_end = 0;
+    if (layout->task_controls_offset == 0 ||
+        !scheduler_prepared_region_end(
+            bytes, layout->task_controls_offset, task_count, sizeof(SchedulerTaskControl),
+            alignof(SchedulerTaskControl), &controls_end
+        ) ||
+        controls_end > layout_offset)
+        return false;
+    if (layout->task_count != task_count || task_count == 0 || layout->run_epoch != run_epoch ||
+        layout->execution_count == 0 || layout->plans_offset < end ||
         !scheduler_prepared_region_end(
             bytes, layout->plans_offset, task_count, sizeof(SchedulerExecutionPlan), alignof(SchedulerExecutionPlan),
             &end
@@ -164,6 +147,27 @@ static inline __aicore__ bool scheduler_prepared_call_valid(
            call->args[SPMD_GLOBAL_CONTEXT_INDEX] == reinterpret_cast<uint64_t>(&binding->global_context);
 }
 
+static inline __aicore__ bool scheduler_prepared_already_returned(
+    __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, const SchedulerPreparedHandle &handle
+) {
+    if (prepared == nullptr || prepared->task_controls_offset == 0 ||
+        handle.execution_index >= prepared->execution_count)
+        return false;
+    const auto *call = scheduler_prepared_call_at(base, prepared, handle.execution_index);
+    if (call->task_ref < 0 || static_cast<uint64_t>(call->task_ref) >= prepared->task_count) return false;
+    const auto &plan = scheduler_state_at<SchedulerExecutionPlan>(base, prepared->plans_offset)[call->task_ref];
+    if (plan.active_lane_count != 1) return false;
+    auto &completion =
+        scheduler_state_at<SchedulerTaskControl>(base, prepared->task_controls_offset)[call->task_ref].completion_state;
+    return scheduler_prepared_retirement_inferred(
+        handle.claimed_state, *prepared, handle.execution_index, *call, plan,
+        scheduler_gm_fetch_add(completion, UINT64_C(0))
+    );
+}
+
+// FromExecutor owns a Call that has physically returned. Its CLAIMED state
+// has no remote writer; the completion/failed-return fence drains publication.
+template <bool FromExecutor = false>
 inline __aicore__ bool scheduler_return_prepared_execution(
     __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, SchedulerPreparedHandle *handle
 ) {
@@ -171,11 +175,17 @@ inline __aicore__ bool scheduler_return_prepared_execution(
     if (prepared == nullptr || handle == nullptr || handle->execution_index >= prepared->execution_count ||
         scheduler_prepared_phase(handle->claimed_state) != SchedulerPreparedPhase::CLAIMED)
         return false;
+    if constexpr (!FromExecutor)
+        if (scheduler_prepared_already_returned(base, prepared, *handle)) return false;
     auto *control = scheduler_prepared_control_at(base, prepared, handle->execution_index);
     const uint64_t returned =
         (handle->claimed_state & ~UINT64_C(255)) | static_cast<uint64_t>(SchedulerPreparedPhase::RETURNED);
-    if (scheduler_gm_compare_exchange(control->state, handle->claimed_state, returned) != handle->claimed_state)
-        return false;
+    if constexpr (FromExecutor) {
+        scheduler_gm_store(control->state, returned);
+    } else {
+        if (scheduler_gm_compare_exchange(control->state, handle->claimed_state, returned) != handle->claimed_state)
+            return false;
+    }
     *handle = {};
     return true;
 }
@@ -244,93 +254,13 @@ static inline __aicore__ PreparedAccessResult scheduler_acquire_execution_token(
     return scheduler_receive_execution_token(base, prepared, task_ref, block, lane, handle);
 }
 
-// Only an unstarted owner with no mutable Binding writes may park its execution.
-static inline __aicore__ bool scheduler_begin_park_prepared_execution(
-    __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, uint32_t worker_id,
-    SchedulerPreparedHandle *handle
-) {
-    SchedulerScalarScope scalar_scope(SchedPhaseKind::ScalarPreparedParkBegin);
-    if (!scheduler_execution_token_handle_valid(base, prepared, worker_id, handle, SchedulerPreparedPhase::CLAIMED))
-        return false;
-    const uint64_t parking =
-        (handle->claimed_state & ~UINT64_C(255)) | static_cast<uint64_t>(SchedulerPreparedPhase::PARKING);
-    auto *control = scheduler_prepared_control_at(base, prepared, handle->execution_index);
-    if (scheduler_gm_compare_exchange(control->state, handle->claimed_state, parking) != handle->claimed_state)
-        return false;
-    handle->claimed_state = parking;
-    return true;
-}
-
-static inline __aicore__ bool scheduler_publish_parked_execution(
-    __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, uint32_t worker_id,
-    SchedulerPreparedHandle *handle, __gm__ volatile uint64_t &parked_count
-) {
-    SchedulerScalarScope scalar_scope(SchedPhaseKind::ScalarPreparedParkPublish);
-    if (!scheduler_execution_token_handle_valid(base, prepared, worker_id, handle, SchedulerPreparedPhase::PARKING))
-        return false;
-    auto *control = scheduler_prepared_control_at(base, prepared, handle->execution_index);
-    const uint64_t parked = scheduler_prepared_state(
-        SchedulerPreparedPhase::PARKED, UINT32_MAX, scheduler_prepared_generation(handle->claimed_state)
-    );
-    scheduler_cache_barrier();
-    (void)scheduler_gm_fetch_add(parked_count, UINT64_C(1));
-    if (scheduler_gm_compare_exchange(control->state, handle->claimed_state, parked) != handle->claimed_state) {
-        (void)scheduler_gm_fetch_add(parked_count, UINT64_MAX);
-        return false;
-    }
-    *handle = {};
-    return true;
-}
-
-static inline __aicore__ bool scheduler_park_prepared_execution(
-    __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, uint32_t worker_id,
-    SchedulerPreparedHandle *handle, __gm__ volatile uint64_t &parked_count
-) {
-    return scheduler_begin_park_prepared_execution(base, prepared, worker_id, handle) &&
-           scheduler_publish_parked_execution(base, prepared, worker_id, handle, parked_count);
-}
-
-static inline __aicore__ PreparedAccessResult scheduler_resume_parked_execution(
-    __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, uint32_t worker_id, int64_t task_ref,
-    uint32_t block, uint8_t lane, uint64_t observed_state, SchedulerPreparedHandle *handle,
-    __gm__ volatile uint64_t &parked_count
-) {
-    SchedulerScalarScope scalar_scope(SchedPhaseKind::ScalarPreparedResume, task_ref);
-    uint64_t index = 0;
-    if (base == nullptr || handle == nullptr || worker_id >= PLATFORM_MAX_CORES || handle->claimed_state != 0 ||
-        !scheduler_prepared_execution_index(base, prepared, task_ref, block, lane, &index) ||
-        (handle->execution_index != UINT64_MAX && handle->execution_index != index))
-        return PreparedAccessResult::ERROR;
-    if (scheduler_prepared_phase(observed_state) != SchedulerPreparedPhase::PARKED)
-        return PreparedAccessResult::EXHAUSTED;
-    const uint32_t generation = scheduler_prepared_generation(observed_state);
-    if (generation == UINT32_MAX ||
-        observed_state != scheduler_prepared_state(SchedulerPreparedPhase::PARKED, UINT32_MAX, generation))
-        return PreparedAccessResult::ERROR;
-    const uint64_t claimed = scheduler_prepared_state(SchedulerPreparedPhase::CLAIMED, worker_id, generation + 1) |
-                             SCHEDULER_PREPARED_BINDING_READY;
-    auto *control = scheduler_prepared_control_at(base, prepared, index);
-    if (scheduler_gm_compare_exchange(control->state, observed_state, claimed) != observed_state)
-        return PreparedAccessResult::EXHAUSTED;
-    handle->execution_index = index;
-    handle->claimed_state = claimed;
-    const uint64_t previous_count = scheduler_gm_fetch_add(parked_count, UINT64_MAX);
-    if (previous_count == 0) {
-        (void)scheduler_gm_fetch_add(parked_count, UINT64_C(1));
-        const uint64_t failed = (claimed & ~UINT64_C(255)) | static_cast<uint64_t>(SchedulerPreparedPhase::FAILED);
-        if (scheduler_gm_compare_exchange(control->state, claimed, failed) == claimed) handle->claimed_state = failed;
-        return PreparedAccessResult::ERROR;
-    }
-    return scheduler_receive_execution_token(base, prepared, task_ref, block, lane, handle);
-}
-
 static inline __aicore__ bool scheduler_fail_prepared_execution(
     __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, uint32_t worker_id,
     SchedulerPreparedHandle *handle
 ) {
-    if (!scheduler_execution_token_handle_valid(base, prepared, worker_id, handle, SchedulerPreparedPhase::CLAIMED) &&
-        !scheduler_execution_token_handle_valid(base, prepared, worker_id, handle, SchedulerPreparedPhase::PARKING))
+    if (!scheduler_execution_token_handle_valid(base, prepared, worker_id, handle, SchedulerPreparedPhase::CLAIMED))
         return false;
+    if (scheduler_prepared_already_returned(base, prepared, *handle)) return false;
     auto *control = scheduler_prepared_control_at(base, prepared, handle->execution_index);
     const uint64_t failed =
         (handle->claimed_state & ~UINT64_C(255)) | static_cast<uint64_t>(SchedulerPreparedPhase::FAILED);
@@ -381,62 +311,6 @@ static inline __aicore__ PreparedAccessResult scheduler_reserve_group_execution(
     auto *control = scheduler_prepared_control_at(base, prepared, index);
     if (scheduler_gm_compare_exchange(control->state, initial, reserved) != initial) return PreparedAccessResult::ERROR;
     handle->claimed_state = reserved;
-    return PreparedAccessResult::READY;
-}
-
-static inline __aicore__ bool scheduler_park_group_execution(
-    __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, uint32_t coordinator,
-    SchedulerPreparedHandle *handle, __gm__ volatile uint64_t &parked_count
-) {
-    SchedulerScalarScope scalar_scope(SchedPhaseKind::ScalarGroupPark);
-    if (!scheduler_group_handle_valid(base, prepared, coordinator, handle, SchedulerPreparedPhase::GROUP_RESERVED))
-        return false;
-    auto *control = scheduler_prepared_control_at(base, prepared, handle->execution_index);
-    const uint32_t generation = scheduler_prepared_generation(handle->claimed_state);
-    const uint64_t parking = scheduler_prepared_state(SchedulerPreparedPhase::PARKING, coordinator, generation);
-    if (scheduler_gm_compare_exchange(control->state, handle->claimed_state, parking) != handle->claimed_state)
-        return false;
-    handle->claimed_state = parking;
-    scheduler_cache_barrier();
-    (void)scheduler_gm_fetch_add(parked_count, UINT64_C(1));
-    const uint64_t parked = scheduler_prepared_state(SchedulerPreparedPhase::PARKED, UINT32_MAX, generation);
-    if (scheduler_gm_compare_exchange(control->state, parking, parked) != parking) {
-        (void)scheduler_gm_fetch_add(parked_count, UINT64_MAX);
-        return false;
-    }
-    *handle = {};
-    return true;
-}
-
-static inline __aicore__ PreparedAccessResult scheduler_resume_group_execution(
-    __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, uint32_t coordinator, int64_t task_ref,
-    uint32_t block, uint64_t observed, SchedulerPreparedHandle *handle, __gm__ volatile uint64_t &parked_count
-) {
-    SchedulerScalarScope scalar_scope(SchedPhaseKind::ScalarGroupResume, task_ref);
-    uint64_t index = UINT64_MAX;
-    uint8_t lane = UINT8_MAX;
-    if (handle == nullptr || coordinator >= PLATFORM_MAX_CORES || handle->claimed_state != 0 ||
-        !scheduler_group_anchor_index(base, prepared, task_ref, block, &index, &lane) ||
-        (handle->execution_index != UINT64_MAX && handle->execution_index != index))
-        return PreparedAccessResult::ERROR;
-    if (scheduler_prepared_phase(observed) != SchedulerPreparedPhase::PARKED) return PreparedAccessResult::EXHAUSTED;
-    const uint32_t generation = scheduler_prepared_generation(observed);
-    if (generation == UINT32_MAX ||
-        observed != scheduler_prepared_state(SchedulerPreparedPhase::PARKED, UINT32_MAX, generation))
-        return PreparedAccessResult::ERROR;
-    const uint64_t reserved =
-        scheduler_prepared_state(SchedulerPreparedPhase::GROUP_RESERVED, coordinator, generation + 1);
-    auto *control = scheduler_prepared_control_at(base, prepared, index);
-    if (scheduler_gm_compare_exchange(control->state, observed, reserved) != observed)
-        return PreparedAccessResult::EXHAUSTED;
-    handle->execution_index = index;
-    handle->claimed_state = reserved;
-    if (scheduler_gm_fetch_add(parked_count, UINT64_MAX) == 0) {
-        (void)scheduler_gm_fetch_add(parked_count, UINT64_C(1));
-        const uint64_t failed = scheduler_prepared_state(SchedulerPreparedPhase::FAILED, coordinator, generation + 1);
-        if (scheduler_gm_compare_exchange(control->state, reserved, failed) == reserved) handle->claimed_state = failed;
-        return PreparedAccessResult::ERROR;
-    }
     return PreparedAccessResult::READY;
 }
 

@@ -28,6 +28,7 @@ struct TestManifest {
 TestManifest make_manifest() {
     TestManifest result{};
     result.manifest.struct_size = sizeof(SimplerCcuModuleManifest);
+    result.manifest.abi_version = SIMPLER_CCU_ABI_VERSION;
     result.manifest.manifest_size = sizeof(TestManifest);
     result.manifest.kernel_record_size = sizeof(SimplerCcuKernelRecord);
     result.manifest.kernel_count = 2;
@@ -127,6 +128,15 @@ extern "C" const SimplerCcuModuleManifest *simpler_ccu_module_manifest() noexcep
         break;
     case 15:
         manifest.records[0].registration_binding_size = 1;
+        break;
+    case 16:
+        manifest.manifest.abi_version = 1;
+        break;
+    case 17:
+        manifest.manifest.reserved = 1;
+        break;
+    case 18:
+        manifest.records[0].required_rank_count = SIMPLER_CCU_MAX_RANKS + 1;
         break;
     default:
         break;

@@ -54,9 +54,18 @@
 // time and are stripped before the args cross the dispatch boundary. The element
 // is Tensor (self-describing view; L3+ holds no C++ ChipTensor) — the L3→L2 wire
 // carries views plus requests, materialized to ChipStorageTaskArgs on the L2 child.
+struct CcuTaskBinding {
+    uint64_t allocation_id;
+    uint64_t registration_id;
+    uint32_t ccu_id;
+    uint32_t reserved{0};
+};
+static_assert(sizeof(CcuTaskBinding) == 24 && std::is_trivially_copyable_v<CcuTaskBinding>);
+
 class TaskArgs : private TaskArgsTpl<Tensor, uint64_t, 0, 0, TensorArgType> {
     using Base = TaskArgsTpl<Tensor, uint64_t, 0, 0, TensorArgType>;
     std::vector<TensorTransfer> transfers_;
+    std::vector<CcuTaskBinding> ccu_bindings_;
 
 public:
     using Base::add_dep;
@@ -105,7 +114,18 @@ public:
         return request;
     }
 
+    const std::vector<CcuTaskBinding> &ccu_bindings() const { return ccu_bindings_; }
+    void set_ccu_bindings(std::vector<CcuTaskBinding> bindings) {
+        if (bindings.size() > UINT32_MAX) throw std::invalid_argument("too many CCU bindings");
+        for (const auto &binding : bindings) {
+            if (!binding.registration_id || binding.reserved)
+                throw std::invalid_argument("invalid CCU binding identity");
+        }
+        ccu_bindings_ = std::move(bindings);
+    }
+
     void clear() {
+        ccu_bindings_.clear();
         Base::clear();
         transfers_.clear();
     }
@@ -130,6 +150,17 @@ struct TaskArgsView {
     // not promise. Copy a tensor out with tensors(i).
     const uint8_t *tensor_bytes;
     const uint64_t *scalars;  // 8-byte aligned by blob construction; safe to address as uint64_t*
+
+    uint32_t ccu_binding_count{0};
+    const uint8_t *ccu_binding_bytes{nullptr};
+
+    CcuTaskBinding ccu_binding(uint32_t index) const {
+        if (index >= ccu_binding_count) throw std::out_of_range("CCU binding index");
+        CcuTaskBinding result{};
+        std::memcpy(&result, ccu_binding_bytes + index * sizeof(result), sizeof(result));
+        if (!result.registration_id || result.reserved) throw std::runtime_error("invalid wire CCU binding");
+        return result;
+    }
 
     // Copy the i-th tensor into a properly-aligned local and gate it. Bounds-checked: a negative
     // index would otherwise wrap to a huge offset once cast to size_t. This is the ONLY validation
@@ -175,31 +206,50 @@ struct TaskArgsView {
 
 inline constexpr size_t TASK_ARGS_BLOB_HEADER_SIZE = 8;
 
+// CCU submissions carry a versioned envelope; ordinary submissions retain the 8-byte header.
+inline constexpr int32_t TASK_ARGS_CCU_MAGIC = INT32_MIN;
+inline constexpr uint32_t TASK_ARGS_CCU_VERSION = 1;
+inline constexpr size_t TASK_ARGS_CCU_HEADER_SIZE = 24;
+
 inline size_t task_args_blob_size(const TaskArgs &a) {
-    return TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(a.tensor_count()) * sizeof(Tensor) +
-           static_cast<size_t>(a.scalar_count()) * sizeof(uint64_t);
+    return (a.ccu_bindings().empty() ? TASK_ARGS_BLOB_HEADER_SIZE : TASK_ARGS_CCU_HEADER_SIZE) +
+           static_cast<size_t>(a.tensor_count()) * sizeof(Tensor) +
+           static_cast<size_t>(a.scalar_count()) * sizeof(uint64_t) + a.ccu_bindings().size() * sizeof(CcuTaskBinding);
 }
 
 // Serialize a TaskArgs into `dst`. Caller must ensure `dst` has room for
 // task_args_blob_size(a) bytes. Tags are not written.
 inline void write_blob(uint8_t *dst, const TaskArgs &a) {
-    int32_t T = a.tensor_count();
-    int32_t S = a.scalar_count();
-    std::memcpy(dst + 0, &T, sizeof(T));
-    std::memcpy(dst + 4, &S, sizeof(S));
+    const int32_t T = a.tensor_count();
+    const int32_t S = a.scalar_count();
+    const bool ccu = !a.ccu_bindings().empty();
+    const size_t header = ccu ? TASK_ARGS_CCU_HEADER_SIZE : TASK_ARGS_BLOB_HEADER_SIZE;
+    if (ccu) {
+        const uint32_t count = static_cast<uint32_t>(a.ccu_bindings().size());
+        const uint32_t reserved = 0;
+        std::memcpy(dst, &TASK_ARGS_CCU_MAGIC, 4);
+        std::memcpy(dst + 4, &TASK_ARGS_CCU_VERSION, 4);
+        std::memcpy(dst + 8, &T, 4);
+        std::memcpy(dst + 12, &S, 4);
+        std::memcpy(dst + 16, &count, 4);
+        std::memcpy(dst + 20, &reserved, 4);
+    } else {
+        std::memcpy(dst, &T, 4);
+        std::memcpy(dst + 4, &S, 4);
+    }
     if (T > 0) {
-        std::memcpy(dst + TASK_ARGS_BLOB_HEADER_SIZE, a.tensor_data(), static_cast<size_t>(T) * sizeof(Tensor));
-        for (int32_t i = 0; i < T; ++i) {
-            dst[TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(i) * sizeof(Tensor) + TASK_ARG_TRANSFER_OFFSET] =
+        std::memcpy(dst + header, a.tensor_data(), static_cast<size_t>(T) * sizeof(Tensor));
+        for (int32_t i = 0; i < T; ++i)
+            dst[header + static_cast<size_t>(i) * sizeof(Tensor) + TASK_ARG_TRANSFER_OFFSET] =
                 static_cast<uint8_t>(a.transfer(i));
-        }
     }
-    if (S > 0) {
+    const size_t scalar_offset = header + static_cast<size_t>(T) * sizeof(Tensor);
+    if (S > 0) std::memcpy(dst + scalar_offset, a.scalar_data(), static_cast<size_t>(S) * sizeof(uint64_t));
+    if (ccu)
         std::memcpy(
-            dst + TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(T) * sizeof(Tensor), a.scalar_data(),
-            static_cast<size_t>(S) * sizeof(uint64_t)
+            dst + scalar_offset + static_cast<size_t>(S) * sizeof(uint64_t), a.ccu_bindings().data(),
+            a.ccu_bindings().size() * sizeof(CcuTaskBinding)
         );
-    }
 }
 
 // Zero-copy view into a blob written by write_blob. The returned view is only
@@ -222,13 +272,26 @@ inline TaskArgsView read_blob(const uint8_t *src, size_t capacity) {
     int32_t S;
     std::memcpy(&T, src + 0, sizeof(T));
     std::memcpy(&S, src + 4, sizeof(S));
+    size_t header = TASK_ARGS_BLOB_HEADER_SIZE;
+    uint32_t bindings = 0;
+    if (T == TASK_ARGS_CCU_MAGIC) {
+        if (capacity < TASK_ARGS_CCU_HEADER_SIZE || static_cast<uint32_t>(S) != TASK_ARGS_CCU_VERSION)
+            throw std::runtime_error("invalid CCU argument envelope version or size");
+        uint32_t reserved = 0;
+        std::memcpy(&T, src + 8, 4);
+        std::memcpy(&S, src + 12, 4);
+        std::memcpy(&bindings, src + 16, 4);
+        std::memcpy(&reserved, src + 20, 4);
+        if (reserved || !bindings) throw std::runtime_error("invalid CCU argument envelope");
+        header = TASK_ARGS_CCU_HEADER_SIZE;
+    }
     if (T < 0 || S < 0) {
         throw std::runtime_error(
             "read_blob: negative counts — tensors=" + std::to_string(T) + ", scalars=" + std::to_string(S)
         );
     }
-    const size_t needed = TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(T) * sizeof(Tensor) +
-                          static_cast<size_t>(S) * sizeof(uint64_t);
+    const size_t needed = header + static_cast<size_t>(T) * sizeof(Tensor) + static_cast<size_t>(S) * sizeof(uint64_t) +
+                          static_cast<size_t>(bindings) * sizeof(CcuTaskBinding);
     if (needed > capacity) {
         throw std::runtime_error(
             "read_blob: header reports " + std::to_string(needed) + " bytes (T=" + std::to_string(T) +
@@ -239,8 +302,10 @@ inline TaskArgsView read_blob(const uint8_t *src, size_t capacity) {
     return TaskArgsView{
         T,
         S,
-        src + TASK_ARGS_BLOB_HEADER_SIZE,
-        reinterpret_cast<const uint64_t *>(src + TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(T) * sizeof(Tensor)),
+        src + header,
+        reinterpret_cast<const uint64_t *>(src + header + static_cast<size_t>(T) * sizeof(Tensor)),
+        bindings,
+        src + header + static_cast<size_t>(T) * sizeof(Tensor) + static_cast<size_t>(S) * sizeof(uint64_t),
     };
 }
 

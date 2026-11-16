@@ -36,7 +36,7 @@ def record(kind, begin, end, depth, **extra):
 
 
 def window():
-    return record("scalar_window", 10, 100, 0, scalar_schema=2, function_min_cycles=0)
+    return record("scalar_window", 10, 100, 0, function_min_cycles=0)
 
 
 def test_scalar_wire_vocabulary_matches_cpp_and_names_every_function():
@@ -139,12 +139,6 @@ def test_kernel_join_is_scoped_to_worker_and_run():
     assert "exclusive_cycles" not in partial
 
 
-@pytest.mark.parametrize("schema", [None, 1, 3])
-def test_unsupported_scalar_schema_is_rejected(schema):
-    with pytest.raises(ValueError, match="supported Scalar window"):
-        partition([window() | {"scalar_schema": schema}], [])
-
-
 @pytest.mark.parametrize("level", [3, 4])
 def test_common_converter_draws_one_typed_scalar_hierarchy(tmp_path, level):
     capture = Capture(runtime="host_build_graph", level=level, clock_freq_hz=1_000_000).task(
@@ -158,7 +152,7 @@ def test_common_converter_draws_one_typed_scalar_hierarchy(tmp_path, level):
     ]:
         metrics = {"scalar_depth": depth, "scalar_calls": 1}
         if depth == 0:
-            metrics.update(scalar_schema=2, function_min_cycles=0)
+            metrics.update(function_min_cycles=0)
         capture.aicore_sched_phase(
             phase=kind, start=begin, end=end, scheduler_id=0, worker_id=0, physical_core_id=9, metrics=metrics
         )
@@ -226,13 +220,12 @@ def test_predicated_skip_is_not_counted_as_kernel_execution():
         ("scalar_cluster_mix_needs_service", "scheduler_cluster_mix_needs_service"),
         ("scalar_execution_continuation", "scheduler_try_execution_continuation"),
         ("scalar_execution_token_fanin", "scheduler_execution_token_observe_fanin"),
-        ("scalar_cluster_mix_ready_replacement", "scheduler_cluster_mix_ready_replacement"),
         ("scalar_ordered_poll", "scheduler_ordered_poll_may_progress"),
         ("scalar_admission_claim", "scheduler_stage_admission_candidate"),
         ("scalar_admission_publish", "scheduler_ordered_publish_pending"),
         ("scalar_admission_commit", "scheduler_try_commit_admission"),
         ("scalar_admission_refresh", "scheduler_refresh_local_obligation"),
-        ("scalar_ordinary_park", "scheduler_ordered_park_ordinary"),
+        ("scalar_ordinary_restore", "scheduler_ordered_restore_ordinary"),
         ("scalar_block_claim", "scheduler_claim_ordered_block"),
         ("scalar_block_cursor_read", "scheduler_read_claim_cursor"),
         ("scalar_admission_close", "scheduler_close_ordered_obligation"),
@@ -272,7 +265,7 @@ def test_fill_detail_roundtrips_nested_function_names_and_task_identity(tmp_path
     ]:
         metrics = {"scalar_depth": depth, "scalar_calls": 1, "iterations_detailed": True}
         if depth == 0:
-            metrics.update(scalar_schema=2, function_min_cycles=0)
+            metrics.update(function_min_cycles=0)
         capture.aicore_sched_phase(
             phase=kind,
             start=begin,
@@ -374,7 +367,7 @@ def test_compact_trace_retains_per_event_identity_when_runs_share_a_lane(tmp_pat
 
 
 def test_filtered_function_scopes_keep_memory_children_and_exact_time():
-    root = window() | {"scalar_schema": 2, "function_min_cycles": 10, "short_function_intervals_omitted": 2}
+    root = window() | {"function_min_cycles": 10, "short_function_intervals_omitted": 2}
     rows = [
         root,
         record("scalar_ordered_fill", 20, 80, 1),
@@ -405,7 +398,7 @@ def test_filtered_function_scopes_keep_memory_children_and_exact_time():
     ],
 )
 def test_filtered_capture_still_rejects_sibling_overlap_and_escaped_bounds(children):
-    root = window() | {"scalar_schema": 2, "function_min_cycles": 10}
+    root = window() | {"function_min_cycles": 10}
     with pytest.raises(ValueError):
         partition([root, *children], [])
 

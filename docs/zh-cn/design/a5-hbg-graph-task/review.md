@@ -1,5 +1,6 @@
 # A5 Graph task 设计复审
 
+本页保存初始设计的复审与反例；当前契约以[协议](protocol.md)、[数据布局](data-layout.md)和[canonical gate](dependency-counters.md)为准。旧控制 inbox、共享 ready 队列与依赖通知不属于当前实现。
 本文历史测量所引用的 JSON 仅保存在本地 `outputs/a5-hbg-graph-task/evidence-summary/`，不随仓库分发；下文保留文件名用于追溯。
 
 本页记录[方案](../a5-hbg-graph-task.md)在 `main@8f42cef9b3f0ebbda800e239aab0949e95552f25`

@@ -125,13 +125,9 @@ struct GmMixFixture {
         storage.prepare_catalog();
         EXPECT_TRUE(scheduler_init_spmd_task_records(base(), storage.layout, 47));
         storage.run_control->active_worker_count = clusters * 3;
-        storage.run_control->aic_active_worker_count = clusters;
-        storage.run_control->aiv_active_worker_count = clusters * 2;
         storage.run_control->expected_task_count = shapes.size();
         for (uint32_t worker = 0; worker < locals.size(); ++worker) {
             auto &context = storage.contexts[worker];
-            context.is_scheduler = 1;
-            context.scheduler_count = clusters * 3;
             for (uint32_t lane = 0; lane < 3; ++lane)
                 context.cluster_worker_ids[lane] = (worker / 3) * 3 + lane;
             storage.test_graphs[worker] = graph.graph();
@@ -169,7 +165,6 @@ struct GmMixFixture {
         const auto *entry = std::find(catalog.refs, catalog.refs + catalog.count, static_cast<int64_t>(task));
         if (entry == catalog.refs + catalog.count) return false;
         const uint32_t previous = signal(cluster)->armed_generation;
-        local->cluster_scan_cursor = entry - catalog.refs;
         bool progress = false;
         if (!scheduler_cluster_mix_discover_next(graph.graph(), base(), local, run(), &progress) ||
             !scheduler_cluster_mix_progress_pending(graph.graph(), base(), local, run(), &progress))
@@ -189,15 +184,27 @@ struct GmMixFixture {
         const auto catalog = scheduler_task_catalog(base(), *pool, local->config.self_core_type);
         const auto *entry = std::find(catalog.refs, catalog.refs + catalog.count, static_cast<int64_t>(task));
         if (entry == catalog.refs + catalog.count) return false;
-        local->execution_scan_cursor = entry - catalog.refs;
-        bool progress = false;
-        if (!scheduler_refill_execution_tokens(graph.graph(), base(), local, run(), 0, &progress)) return false;
-        return std::any_of(
-            std::begin(local->execution_tokens), std::end(local->execution_tokens), [&](const auto &token) {
-                return token.task_ref == static_cast<int64_t>(task) &&
-                       token.phase == SchedulerExecutionTokenPhase::WAIT_FANIN && token.prepared.claimed_state != 0;
-            }
-        );
+        for (uint64_t slice = 0; slice <= catalog.count + 2 * graph.graph().task_count; ++slice) {
+            const uint64_t head = local->issue_cursor;
+            const int64_t issue_task = local->issue_task_ref;
+            const uint32_t fanin = local->issue_next_fanin;
+            const uint32_t tokens = scheduler_execution_token_count(local);
+            bool progress = false;
+            if (!scheduler_refill_execution_tokens(graph.graph(), base(), local, run(), 0, &progress)) return false;
+            if (std::any_of(
+                    std::begin(local->execution_tokens), std::end(local->execution_tokens), [&](const auto &token) {
+                        return token.task_ref == static_cast<int64_t>(task) &&
+                               token.phase == SchedulerExecutionTokenPhase::WAIT_FANIN &&
+                               token.prepared.claimed_state != 0;
+                    }
+                ))
+                return true;
+            if (scheduler_execution_token_count(local) != tokens) return false;
+            if (local->issue_cursor == head && !(local->issue_next_fanin != 0 && (local->issue_task_ref != issue_task ||
+                                                                                  local->issue_next_fanin > fanin)))
+                return false;
+        }
+        return false;
     }
     bool progress_ordinary(uint32_t worker) {
         auto *local = locals[worker];
@@ -208,29 +215,25 @@ struct GmMixFixture {
         if (direct != UINT32_MAX) scheduler_local_ready_publish(local, direct);
         return true;
     }
-    bool bootstrap_admission() {
-        if (run()->bootstrap_scan_complete != 0 || !prepare_calls()) return false;
-        for (uint64_t task = 0; task < graph.graph().task_count; ++task) {
-            if (!scheduler_task_requires_admission(scheduler_load_dispatch_metadata(base(), locals[0], task, 0)))
-                continue;
-            if (!scheduler_bootstrap_prepare_admission(
-                    graph.graph(), base(), locals[0], run(), &admissions[0], static_cast<int64_t>(task)
-                ))
-                return false;
-        }
-        scheduler_gm_store(run()->bootstrap_scan_complete, UINT64_C(1));
-        return true;
-    }
     bool claim_pending(uint64_t task, uint32_t worker = 0) {
         auto *local = locals[worker];
         const auto *pool = scheduler_state_at<SchedulerTaskCatalogHeader>(base(), local->config.task_catalog_offset);
         const auto catalog = scheduler_task_catalog(base(), *pool, local->config.self_core_type);
         const auto *entry = std::find(catalog.refs, catalog.refs + catalog.count, static_cast<int64_t>(task));
         if (entry == catalog.refs + catalog.count) return false;
-        local->cooperative_scan_cursor = entry - catalog.refs;
-        bool progress = false;
-        return scheduler_discover_cooperative_task(graph.graph(), base(), local, run(), &progress) &&
-               admissions[worker].pending_task_ref == static_cast<int64_t>(task);
+        for (uint64_t slice = 0; slice <= catalog.count + 2 * graph.graph().task_count; ++slice) {
+            const uint64_t head = local->issue_cursor;
+            const int64_t issue_task = local->issue_task_ref;
+            const uint32_t fanin = local->issue_next_fanin;
+            bool progress = false;
+            if (!scheduler_discover_cooperative_task(graph.graph(), base(), local, run(), &progress)) return false;
+            if (!scheduler_task_ref_is_null(admissions[worker].pending_task_ref))
+                return admissions[worker].pending_task_ref == static_cast<int64_t>(task);
+            if (local->issue_cursor == head && !(local->issue_next_fanin != 0 && (local->issue_task_ref != issue_task ||
+                                                                                  local->issue_next_fanin > fanin)))
+                return false;
+        }
+        return false;
     }
     bool admit(uint64_t task, uint32_t worker = 0) {
         return claim_pending(task, worker) &&
@@ -290,6 +293,11 @@ struct GmMixFixture {
     bool fill(uint32_t worker) {
         bool failed = false;
         scheduler_fill_own_slots<RecordProtocol>(graph.graph(), base(), locals[worker], run(), 0, &failed);
+        return !failed;
+    }
+    bool service_cooperative(uint32_t worker) {
+        bool failed = false;
+        scheduler_service_cooperative_slots(graph.graph(), base(), locals[worker], run(), 0, &failed);
         return !failed;
     }
     bool begin(uint32_t worker, GmExecution *execution) {

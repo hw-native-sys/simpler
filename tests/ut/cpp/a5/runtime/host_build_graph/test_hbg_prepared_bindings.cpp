@@ -19,7 +19,6 @@
 #include "host_build_graph/host/prepared_execution_plan.h"
 
 static_assert(sizeof(LocalContext) == 8);
-static_assert(sizeof(DispatchPayload) == 512);
 
 namespace {
 
@@ -33,7 +32,7 @@ protected:
     void *base{nullptr};
 
     void SetUp() override {
-        ASSERT_TRUE(scheduler_plan_layout(2, 2, 1, &layout, false, 7));
+        ASSERT_TRUE(scheduler_plan_layout(2, &layout, false, 7));
         AsyncTaskPlanInput first{0, 3, LaneMask::aic(), {1, 0, 0}};
         AsyncTaskPlanInput second{1, 2, LaneMask(true, false, true), {0, 0, 2}};
         std::string error;

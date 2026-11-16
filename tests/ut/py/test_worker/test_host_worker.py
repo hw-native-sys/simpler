@@ -2024,7 +2024,9 @@ def ccu_control_loop(monkeypatch):
         registration += struct.pack("<QII2I", 7, 2, 0, 0, 1)
         harness.publish_ccu_control(registration)
         harness.wait_control_state(worker_mod._CONTROL_DONE)
-        assert struct.unpack_from("i", harness.buf, worker_mod._OFF_ERROR)[0] == 0
+        assert struct.unpack_from("i", harness.buf, worker_mod._OFF_ERROR)[0] == 0, bytes(
+            harness.buf[worker_mod.MAILBOX_OFF_ERROR_MSG : worker_mod.MAILBOX_OFF_ERROR_MSG + 256]
+        ).split(b"\0")[0]
         _mailbox_store_i32(harness.mailbox_addr + _OFF_STATE, worker_mod._IDLE)
         harness.publish(0, 1)
         assert cw.launched[0].wait(5.0)
@@ -2039,7 +2041,9 @@ def test_two_frame_ccu_association_completes_while_run_is_active(ccu_control_loo
     for _ in range(2):
         reply = harness.publish_ccu_control(payload)
         harness.wait_control_state(worker_mod._CONTROL_DONE)
-        assert struct.unpack_from("i", harness.buf, worker_mod._OFF_ERROR)[0] == 0
+        assert struct.unpack_from("i", harness.buf, worker_mod._OFF_ERROR)[0] == 0, bytes(
+            harness.buf[worker_mod.MAILBOX_OFF_ERROR_MSG : worker_mod.MAILBOX_OFF_ERROR_MSG + 256]
+        ).split(b"\0")[0]
         assert worker_mod._CCU_DOMAIN_REQUEST.unpack_from(reply.buf)[-1] == 17
         assert not harness.cw.completed[0].is_set()
         assert not harness.cw.finalized[0].is_set()
@@ -2063,7 +2067,9 @@ def test_two_frame_ccu_hardware_control_waits_for_run_retirement(ccu_control_loo
     harness.cw.completed[0].set()
     assert harness.cw.finalized[0].wait(5.0)
     harness.wait_control_state(worker_mod._CONTROL_DONE)
-    assert struct.unpack_from("i", harness.buf, worker_mod._OFF_ERROR)[0] == 0
+    assert struct.unpack_from("i", harness.buf, worker_mod._OFF_ERROR)[0] == 0, bytes(
+        harness.buf[worker_mod.MAILBOX_OFF_ERROR_MSG : worker_mod.MAILBOX_OFF_ERROR_MSG + 256]
+    ).split(b"\0")[0]
     if operation == 5:
         assert len(harness.cw.ccu_registrations) == 2
     else:
@@ -2495,7 +2501,9 @@ def test_poisoned_chip_acknowledges_retired_host_uses(monkeypatch, transfer, con
                 )
                 _mailbox_store_i32(harness.mailbox_addr + _OFF_STATE, worker_mod._CONTROL_REQUEST)
                 harness.wait_control_state(worker_mod._CONTROL_DONE)
-                assert struct.unpack_from("i", harness.buf, worker_mod._OFF_ERROR)[0] == 0
+                assert struct.unpack_from("i", harness.buf, worker_mod._OFF_ERROR)[0] == 0, bytes(
+                    harness.buf[worker_mod.MAILBOX_OFF_ERROR_MSG : worker_mod.MAILBOX_OFF_ERROR_MSG + 256]
+                ).split(b"\0")[0]
                 assert bytes(memory[: len(payload)]) == payload
                 _mailbox_store_i32(harness.mailbox_addr + _OFF_STATE, worker_mod._IDLE)
             finally:
@@ -2611,7 +2619,9 @@ def test_poisoned_chip_keeps_host_cleanup_endpoint_until_parent_shutdown(monkeyp
         assert control(_Action.RECOVER) != 0
         assert mappings[0]._uses
         harness.cw._unmap_host_ddr.assert_not_called()
-        assert control(_Action.RECOVER) == 0
+        assert control(_Action.RECOVER) == 0, bytes(
+            harness.buf[worker_mod.MAILBOX_OFF_ERROR_MSG : worker_mod.MAILBOX_OFF_ERROR_MSG + 256]
+        ).split(b"\0")[0]
         assert not mappings[0]._uses
         assert free_device_buffer() != 0
         harness.cw.free.assert_called_once_with(0x800000)
@@ -3916,6 +3926,9 @@ class TestRunHandle:
         events: list[str] = []
 
         class NativeWorker:
+            def check_control_payloads_retired(self):
+                return None
+
             def close(self):
                 events.append("close")
 
@@ -4090,6 +4103,9 @@ class TestRunHandle:
                 self.cv.notify_all()
 
         class NativeWorker:
+            def check_control_payloads_retired(self):
+                return None
+
             def close(self):
                 return None
 
@@ -4360,6 +4376,9 @@ class TestRunHandle:
         native_closes: list[str] = []
 
         class NativeWorker:
+            def check_control_payloads_retired(self):
+                return None
+
             def close(self):
                 native_closes.append("close")
 
@@ -5005,6 +5024,9 @@ class TestRunHandle:
         recoveries: list[str] = []
 
         class NativeWorker:
+            def check_control_payloads_retired(self):
+                return None
+
             def close(self):
                 return None
 

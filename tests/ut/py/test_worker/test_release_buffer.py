@@ -60,7 +60,7 @@ def _fake_orchestrator(w: Worker, monkeypatch: pytest.MonkeyPatch) -> Orchestrat
         return (b"d" * 32, "NEXT_LEVEL", "LOCAL_CHIP", (0,))
 
     monkeypatch.setattr(orch_mod, "_require_handle", _fake_require_handle)
-    monkeypatch.setattr(Worker, "_prepare_ccu_submission", lambda *_: None)
+    monkeypatch.setattr(Worker, "_prepare_ccu_submission", lambda _self, _handle, _workers, args, **_kwargs: args)
     return Orchestrator(MagicMock(), w)
 
 

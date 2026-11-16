@@ -11,15 +11,28 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "hccl/hccl_comm.h"
+#include "ccu_run_lifecycle_hcomm.h"
 #include "platform_comm/ccu/ccu_domain_owner.h"
 
 namespace simpler::ccu {
+
+struct HcommDomainChannels {
+    HcclComm communicator{};
+    uint32_t die{};
+    std::array<uint64_t, SIMPLER_CCU_MAX_RANKS> channels{};
+    bool close();
+};
+void create_hcomm_domain_channels(
+    HcclComm base, uint64_t allocation_id, const std::vector<uint32_t> &ranks, uint32_t rank,
+    std::shared_ptr<HcommDomainChannels> &result
+);
 
 bool query_window_token(uint64_t address, uint64_t size, uint64_t &token);
 
@@ -48,13 +61,15 @@ public:
         uint64_t domain_id
     ) = 0;
     virtual bool stop() = 0;
+    virtual bool finish_completed_requests() = 0;
     virtual void abort() = 0;
 };
 
 std::vector<HcommPreparedMission> prepare_hcomm_ccu_callable(
     HcclComm base_communicator, uint64_t domain_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
     const ExpectedBuildIdentity &expected_identity, const std::vector<std::vector<uint8_t>> &module_bytes,
-    const std::string &program_namespace, std::unique_ptr<DomainCcuOwner> &owner, HcommDomainSession *&session
+    const std::string &program_namespace, std::unique_ptr<DomainCcuOwner> &owner, HcommDomainSession *&session,
+    std::shared_ptr<HcommDomainChannels> domain_channels, uint32_t selected_ccu_id, HcommMissionStreamPool &stream_pool
 );
 
 }  // namespace simpler::ccu

@@ -13,26 +13,6 @@
       "task_table_sha256": "d2917eccf4d9ab9b40dc012f21ca1d80848535e833c07458b5d34c4236b49aee",
       "edge_table_sha256": "5a9046e6001b48c23b047ba00bcdf0ca5a5ddbf0657f2ccbc0a0c8f80d49b45a",
       "incoming_edges": 111
-    },
-    "moe": {
-      "tasks": 479,
-      "executions": 3069,
-      "edges": 1496,
-      "first_source_task": "43",
-      "last_source_task": "659",
-      "task_table_sha256": "f66a18d977277fbd2439a0c5744a47e98e8cb200d39187c1ce1ad0cee024046c",
-      "edge_table_sha256": "6752e6bfb49bbd17d238c5b5a9c874d2267615631462e97d25d839a04b96c0de",
-      "incoming_edges": 1389
-    },
-    "layers_19_21": {
-      "tasks": 1527,
-      "executions": 11218,
-      "edges": 4649,
-      "first_source_task": "12519",
-      "last_source_task": "14495",
-      "task_table_sha256": "5babf6cbfccb49b679b8d38c0775dc745c8265e6a070673bb2ae02516e80581b",
-      "edge_table_sha256": "9e4f2764c94039e4e38e0e70ccea2c93885ad91833aebdaf748765835d1f17ea",
-      "incoming_edges": 4386
     }
   },
   "boundary": "Incoming values are produced by executing the real original prefix before measuring the case.",

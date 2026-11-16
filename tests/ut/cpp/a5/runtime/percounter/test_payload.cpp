@@ -261,7 +261,7 @@ TEST(PercounterPayload, PreparationBindsCurrentImageWithoutReplacingContextPoint
     EXPECT_EQ(payload.args[PAYLOAD_GLOBAL_CONTEXT_INDEX], global);
     EXPECT_EQ(payload.local_context.block_idx, 3);
     EXPECT_EQ(payload.local_context.block_num, 5);
-    task.graph.view_version = 0;
+    task.graph.storage_address = 0;
     EXPECT_FALSE(percounter_prepare_subtask(f.cfg[0], task, 0, 1, 0, 1, &payload));
     task = f.resolve(0);
     f.storage[0].payload.scalar_count = 1;
@@ -476,6 +476,64 @@ TEST(PercounterPayload, PredicateIsEvaluatedAtExecution) {
     ASSERT_TRUE(f.run(0, task, &f.payloads[0][0]));
     percounter_commit_task_timing(f.cfg[0]);
     EXPECT_EQ(calls, 1);
+}
+
+TEST(PercounterPayload, KernelWindowExcludesSkippedWorkAndSharesProfileEndpoints) {
+    Fixture f;
+    int64_t value = 0;
+    auto &predicate = f.storage[0].payload.predicate;
+    predicate.addr = reinterpret_cast<uint64_t>(&value);
+    predicate.target = 1;
+    predicate.elem_size = sizeof(value);
+    predicate.op = static_cast<PredicateOp>(1);
+    auto &cfg = f.cfg[0];
+    cfg.has_predicates = true;
+    auto task = f.resolve(0);
+    auto *payload = &f.payloads[0][0];
+    ASSERT_TRUE(percounter_prepare_task(cfg, task, 0, 1, payload));
+    int calls = 0;
+    uint64_t inside_kernel = 0;
+    execute = [&](int64_t *) {
+        ++calls;
+        inside_kernel = get_sys_cnt_aicore();
+    };
+
+    ASSERT_TRUE(f.run(0, task, payload));
+    EXPECT_EQ(cfg.work_window.start_cycle, 0U);
+    EXPECT_EQ(cfg.work_window.end_cycle, 0U);
+    value = 1;
+    const uint64_t callable = payload->function_bin_addr;
+    payload->function_bin_addr = 0;
+    ASSERT_TRUE(f.run(0, task, payload));
+    EXPECT_EQ(calls, 0);
+    EXPECT_EQ(cfg.work_window.start_cycle, 0U);
+    EXPECT_EQ(cfg.work_window.end_cycle, 0U);
+
+    payload->function_bin_addr = callable;
+    ASSERT_TRUE(f.run(0, task, payload));
+    const AicoreWorkWindow first = cfg.work_window;
+    EXPECT_EQ(calls, 1);
+    EXPECT_GT(first.start_cycle, 0U);
+    EXPECT_LE(first.start_cycle, inside_kernel);
+    EXPECT_GE(first.end_cycle, inside_kernel);
+    EXPECT_FALSE(cfg.pending_task_valid);
+
+    value = 0;
+    ASSERT_TRUE(f.run(0, task, payload));
+    EXPECT_EQ(cfg.work_window.start_cycle, first.start_cycle);
+    EXPECT_EQ(cfg.work_window.end_cycle, first.end_cycle);
+
+    PercounterProfileBuffer profile{};
+    cfg.profile_buffer = &profile;
+    value = 1;
+    ASSERT_TRUE(f.run(0, task, payload));
+    EXPECT_EQ(calls, 2);
+    EXPECT_EQ(cfg.work_window.start_cycle, first.start_cycle);
+    EXPECT_GE(cfg.pending_task.start, first.end_cycle);
+    EXPECT_LE(cfg.pending_task.start, inside_kernel);
+    EXPECT_GE(cfg.work_window.end_cycle, inside_kernel);
+    EXPECT_EQ(cfg.work_window.end_cycle, cfg.pending_task.finish);
+    EXPECT_TRUE(cfg.pending_task_valid);
 }
 
 TEST(PercounterPayload, LayoutReservesEveryLaneSlot) {

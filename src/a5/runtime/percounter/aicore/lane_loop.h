@@ -28,6 +28,7 @@
 #pragma once
 
 #include "aicore/aicore.h"
+#include "common/device_phase.h"
 #include "common/platform_config.h"
 #include "async_completion_types.h"
 #include "dispatch_payload.h"
@@ -108,6 +109,7 @@ struct LaneConfig {
     uint32_t *task_dropped{nullptr};
     mutable PercounterTaskTiming pending_task{};
     mutable bool pending_task_valid{false};
+    mutable AicoreWorkWindow work_window{};
     mutable __gm__ ChipSwimlaneAicoreTaskRecord *pending_stream_record{nullptr};
     __gm__ PercounterControl *control;
     SchedulerGraphView graph;
@@ -613,7 +615,9 @@ inline __aicore__ bool percounter_run_prepared(
     // The barrier is the publication fence a consumer's spin depends on: the
     // kernel's outputs are in memory before the atomic that announces them.
     PercounterKernelFunc kernel = reinterpret_cast<PercounterKernelFunc>(payload->function_bin_addr);
-    const uint64_t start_time = timing_enabled ? get_sys_cnt_aicore() : 0;
+    const bool first_kernel = cfg.work_window.start_cycle == 0;
+    const uint64_t start_time = timing_enabled || first_kernel ? get_sys_cnt_aicore() : 0;
+    if (first_kernel) cfg.work_window.start_cycle = start_time;
     if constexpr (profile_compiled) {
         if (cfg.scalar != nullptr) ++cfg.scalar->depth;
     }
@@ -622,8 +626,10 @@ inline __aicore__ bool percounter_run_prepared(
     if constexpr (profile_compiled) {
         if (cfg.scalar != nullptr) --cfg.scalar->depth;
     }
+    const uint64_t end_time = get_sys_cnt_aicore();
+    cfg.work_window.end_cycle = end_time;
     if (timing_enabled) {
-        cfg.pending_task.finish = get_sys_cnt_aicore();
+        cfg.pending_task.finish = end_time;
         cfg.pending_task.dispatch = receive_time;
         cfg.pending_task.start = start_time;
         const TaskId token = task.shell < 0 ? TaskId::make_global(static_cast<int32_t>(task.id)) :
@@ -1953,7 +1959,8 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
  * that once read `dispatch_payloads_offset` as 0 placed its payload inside the
  * ticket array.
  */
-inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, int block_idx, CoreType core_type) {
+inline __aicore__ AicoreWorkWindow
+run_percounter_lane(__gm__ PercounterControl *control, int block_idx, CoreType core_type) {
     const bool is_aic = core_type == CoreType::AIC;
     const uint32_t type_index = is_aic ? 0U : 1U;
     SchedulerClusterCoordinate coordinate{-1, -1};
@@ -1966,7 +1973,7 @@ inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, in
         percounter_gm_compare_exchange(
             control->lane_error, uint64_t{0}, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS)
         );
-        return;
+        return {};
     }
 
     LaneConfig cfg{};
@@ -2082,6 +2089,7 @@ inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, in
         dcci(reinterpret_cast<__gm__ uint8_t *>(cfg.profile_buffer) + 64, SINGLE_CACHE_LINE, CACHELINE_OUT);
         dsb((mem_dsb_t)0);
     }
+    return cfg.work_window;
 }
 
 /**
@@ -2151,12 +2159,10 @@ inline __aicore__ void percounter_aicore_execute(__gm__ Runtime *runtime, int bl
         released = signal == AICPU_IDLE_TASK_ID;
     }
     if (released) {
-        const uint64_t work_start = get_sys_cnt_aicore();
         write_reg(RegId::COND, AICORE_IDLE_VALUE);
-        run_percounter_lane(control, block_idx, core_type);
-        const uint64_t work_end = get_sys_cnt_aicore();
-        handshake->work_start_cycle = work_start;
-        handshake->work_end_cycle = work_end;
+        const auto work_window = run_percounter_lane(control, block_idx, core_type);
+        handshake->work_start_cycle = work_window.start_cycle;
+        handshake->work_end_cycle = work_window.end_cycle;
         dcci(handshake, SINGLE_CACHE_LINE, CACHELINE_OUT);
         dsb((mem_dsb_t)0);
     }

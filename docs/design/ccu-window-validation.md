@@ -3,6 +3,100 @@
 A5 validation uses Linux aarch64, CANN 9.3.0 and the pinned PTO-ISA checkout.
 Each section identifies the source snapshot it covers.
 
+## Domain registration and multi-domain execution candidate
+
+The implementation candidate is based on `d1cdbb0d1`; these results are not a
+claim that the feature is merged or that the entire design is complete. Tests
+used an isolated A5 checkout and venv, CANN 9.3.0, pinned PTO-ISA
+`90a3796597a5fabc2ce5066e73f785c2e85822f7`, and queue-allocated devices after the
+onboard architecture precheck.
+
+| Case | Queue task | Result |
+| ---- | ---------- | ------ |
+| Finite window transfer | `task_20261114_163142_413358929967` | Passed on devices 0,2 |
+| Three-rank all-peer channels and reordered subset | `task_20261114_163259_418801016282` | Both cases passed on devices 0,1,2 |
+| 1,000 finite window-transfer runs | `task_20261114_163313_62261407` | Passed on devices 3,4 |
+| One CHIP, reversed domains, D0/K0 + D1/K0 + D1/K1, four runs | `task_20261114_163647_1735588911` | Passed on devices 0,1 |
+| Resident stop/reuse, finite exit, and alternating 2/3-mission pool reuse | `task_20261114_174858_353335827259` | All three passed on devices 0,1 |
+| Same three cases with actual registration/stream-count assertions | `task_20261114_175934_404955528306` | All three passed |
+| Missing done and missing trigger | `task_20261114_175939_405306919180` | Both failure-containment cases passed |
+| 1,000 resident multi-domain runs with exact resource counts | `task_20261114_180236_418125932442` | Passed on devices 1,3; 510.7 s |
+| Prepared-successor isolation, finite then forced-stop legacy retirement | `task_20261114_181321_58149031133` | Passed on devices 1,2; 14.5 s |
+
+The finite multi-domain test uses ordinary algorithm exit requests to validate
+binding, launch and retirement independently of resident shutdown. The earlier
+1,000-run finite case checks varying data, retained-domain reuse and domain recreation; it does
+not replace instrumentation of actual HCOMM registration calls and live resources.
+Local validation passed 75 focused Python tests and 48 focused C++ tests across
+module loading, registration, lifecycle, device submission and TaskArgs transport.
+
+The resident test first reproduced the unsupported stop hook on task
+`task_20261114_174234_324139011316`. The HCOMM backend now calls stream abort,
+requires a successful complete-state query, returns confirmed streams to the L2
+pool, and retains the registration. The follow-up task above passed the same
+resident workload and alternate finite/resident runs. Streams are destroyed at
+L2 finalization after registration communicators are released.
+
+Resource-count assertions check six actual HCOMM registrations and six mission
+stream creations/destructions across two ranks. Four resident runs yield 24
+confirmed mission aborts and four uses of each stream; finite runs yield no
+aborts. Alternating two finite and three resident missions uses the same three
+streams per rank, with use counts 4,4,2. The evidence comes from runtime logs,
+not Python cache hits. The 1,000-run resident test checks changing output data on
+every run and confirms exactly six HCOMM registrations, six pool stream
+creations/destructions, 1,000 uses of each stream, and 6,000 confirmed aborts.
+
+The updated compatibility-path tests passed 77 focused Python tests and all 46
+native Worker operation/lease tests, including confirmed-abort finalization. The A5
+compiler escape scan reported no findings for five of six device translation
+units; `kernel.cpp` could not be disassembled because `llvm-dis` crashed, a
+[documented scanner limitation](../../tools/a5-ir-check/README.md). That scan is
+incomplete, not a clean result. Acceptance is scoped to the simpler tests listed
+here; cross-project PyPTO integration is not a completion requirement.
+
+### Target-Worker registration follow-up
+
+The registration API now requires `worker=`, and only that domain member receives
+kernel registration. HCOMM program resources use a single-member communicator;
+the kernel still receives the complete domain channel table and logical rank.
+The follow-up rebuilt the A5 package and passed 84 focused Python tests.
+
+| Case | Queue task | Result |
+| ---- | ---------- | ------ |
+| Multi-domain finite/resident and alternating mission stream reuse | `task_20261114_191359_35171772225` | All three cases passed; the subsequent target-only fixture rejected an unsupported `ChipCallable` registration keyword before execution |
+| Corrected target-only registration/launch and live-domain isolation | `task_20261114_191729_363795622675` | Both passed on devices 0,1 |
+| Prepare overlap, finite completion and confirmed resident stop | `task_20261114_191729_363775612067` | Passed on devices 5,6 |
+| Three-rank all-peer channels, reordered subset and shared context across distinct members | `task_20261114_192332_388433815212` | All three passed on devices 0,1,2 |
+| Serialized requests, callable replacement, missing done and missing trigger | `task_20261114_192333_388414827012` | All four passed on devices 3,4 |
+
+The first three-rank follow-up (`task_20261114_191729_363807528607`) exposed
+a test migration error: a cache-miss registration followed the first submission.
+The existing direct-control guard rejected it; the already submitted rank then
+waited for missing peers during cleanup. The fixture now registers every target
+before any submission, preserving the existing ordering contract.
+
+The target-only test creates domain `[1, 0]`, registers kernel 0 only on Worker 0
+(logical rank 1), and submits only that Worker. Repeated get-or-register calls and
+duplicate references in the binding sequence produce one HCOMM registration and
+one mission stream across three runs. Each run checks changed output and confirmed
+resident shutdown; the stream is reused three times and destroyed once. Worker 1
+participates in domain creation and release but does not register or launch a CCU
+mission. Callable definition distribution retains the existing `ChipCallable` API.
+
+### Publication validation after rebasing
+
+The candidate was rebased onto `170d04044`, preserving the mainline CCU compiler,
+Host argument ownership and unconfirmed-cleanup behavior. The rebuilt A5 package
+passed task `task_20261114_195440_881633974` on devices 1,2: HBG window transfer,
+TMR multi-domain finite and resident execution, target-only registration and
+missing-trigger failure containment (five cases, four rounds for normal runs).
+
+Local validation covered 1,868 passing Python cases and 27 skips, including
+focused reruns after adapting two test doubles and using a writable compiler
+cache. All five focused C++ CTest targets and the full pre-commit checks passed.
+The rebuilt TMR AICore escape scan found no issues in five translation units;
+`kernel.cpp` remained unscanned because of the documented `llvm-dis` failure.
+
 ## User-Owned Mission Lifecycle
 
 The update starts from PR head `85b8c095d50604622ab15d50d0ef92779b9bd8e3`.

@@ -53,10 +53,10 @@ protected:
         ASSERT_TRUE(orch.init(sm_handle->sm_base, heap, HEAP_BYTES, CHIP_DEFAULT_GRAPH_TASKS));
 
         definition_staging.assign(STAGING_BYTES, std::byte{0});
-        GraphDefinitionArena arena{};
+        GraphImageArena arena{};
         arena.base = definition_staging.data();
         arena.capacity = definition_staging.size();
-        arena.object_prefix_bytes = sizeof(GraphDefinitionHeader);
+        arena.object_prefix_bytes = sizeof(GraphImageHeader);
         arena.object_align = GRAPH_DEFINITION_OBJECT_ALIGN;
         graph_state = make_graph_host_state(arena);
         ASSERT_NE(graph_state, nullptr);
@@ -152,7 +152,7 @@ TEST_F(HbgSlotClaimTest, GraphOuterTaskClaimsAPoisonedSlot) {
     const auto &record = graph_state->definitions.at(0x51ADC1A1);
     const auto *definition = graph_record_definition(*graph_state, record);
     ASSERT_NE(definition, nullptr);
-    GraphDefinitionHeader framing{};
+    GraphImageHeader framing{};
     framing.magic = GRAPH_DEFINITION_OBJECT_MAGIC;
     framing.graph_key = definition->graph_key;
     framing.definition_bytes = definition->total_bytes;

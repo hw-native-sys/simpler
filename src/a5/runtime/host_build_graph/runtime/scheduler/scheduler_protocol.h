@@ -270,7 +270,6 @@ static inline __aicore__ void scheduler_protocol_payload_publication(
         record->pending_slot = static_cast<uint16_t>(claim.slot_index);
         record->subtask_slot = slot.subtask_slot;
         record->ready_source = static_cast<uint32_t>(ready.source);
-        record->publication_mode = static_cast<uint32_t>(ready.publication_mode);
     } else {
         if (record->publication_count == 0 || record->worker_index != local->worker_id() ||
             record->task_ref != slot.task_ref || record->pending_slot != claim.slot_index ||

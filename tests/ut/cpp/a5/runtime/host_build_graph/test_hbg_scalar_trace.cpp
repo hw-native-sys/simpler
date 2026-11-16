@@ -131,7 +131,7 @@ TEST(HbgScalarTrace, FullPartitionReportsTruncationWithoutOverwriting) {
 
 TEST(HbgScalarTrace, InitializationPublishesHeadersWithoutTouchingRecordPayload) {
     AicoreSchedulerLayout layout{};
-    ASSERT_TRUE(scheduler_plan_layout(1, 1, 0, &layout, true));
+    ASSERT_TRUE(scheduler_plan_layout(1, &layout, true));
     const uint64_t initialized_bytes = layout.total_size;
     ASSERT_TRUE(scheduler_plan_scalar_storage(&layout));
     std::vector<uint8_t> storage(layout.total_size + SCHEDULER_STATE_BASE_ALIGNMENT - 1, 0xa5);
@@ -189,8 +189,6 @@ TEST(HbgScalarTrace, UnboundPrimitivesPreserveOperandsAndPerformOneUpdate) {
     EXPECT_EQ(signed_word, 13);
     EXPECT_EQ(scheduler_gm_compare_exchange(signed_word, -7, 99), 13);
     EXPECT_EQ(signed_word, 13);
-    EXPECT_EQ(scheduler_gm_exchange(signed_word, -11), 13);
-    EXPECT_EQ(signed_word, -11);
     EXPECT_EQ(scheduler_gm_fetch_add(unsigned_word, UINT64_C(3)), UINT64_C(0xfedcba9876543210));
     EXPECT_EQ(unsigned_word, UINT64_C(0xfedcba9876543213));
     scheduler_gm_fetch_add_discard(unsigned_word, UINT64_C(2));
@@ -212,9 +210,7 @@ TEST(HbgScalarTrace, MemoryObservationPreservesResultsAndRecordsDistinctPrimitiv
         binding.attach(&trace);
         int64_t signed_word = 7;
         uint64_t unsigned_word = 10;
-        EXPECT_EQ(scheduler_gm_load(signed_word), 7);
         EXPECT_EQ(scheduler_gm_compare_exchange(signed_word, 7, 8), 7);
-        EXPECT_EQ(scheduler_gm_exchange(signed_word, 9), 8);
         EXPECT_EQ(scheduler_gm_fetch_add(unsigned_word, UINT64_C(2)), 10u);
         scheduler_gm_fetch_add_discard(unsigned_word, UINT64_C(3));
         scheduler_gm_store(signed_word, 12);
@@ -224,15 +220,13 @@ TEST(HbgScalarTrace, MemoryObservationPreservesResultsAndRecordsDistinctPrimitiv
         scheduler_invalidate_cache_line(&signed_word);
         scheduler_cache_barrier();
         scheduler_ddr_barrier();
-        EXPECT_EQ(trace.committed, 11u);
+        EXPECT_EQ(trace.committed, 9u);
         EXPECT_EQ(trace.depth, 0u);
     }
     EXPECT_EQ(scheduler_scalar_current(), nullptr);
     trace.finish(scheduler_cycles());
     const SchedPhaseKind expected[] = {
-        SchedPhaseKind::ScalarAtomicLoad,
         SchedPhaseKind::ScalarAtomicCas,
-        SchedPhaseKind::ScalarAtomicExchange,
         SchedPhaseKind::ScalarAtomicFetchAdd,
         SchedPhaseKind::ScalarAtomicFetchAddIssue,
         SchedPhaseKind::ScalarAtomicStoreIssue,
@@ -243,7 +237,7 @@ TEST(HbgScalarTrace, MemoryObservationPreservesResultsAndRecordsDistinctPrimitiv
         SchedPhaseKind::ScalarDsbDdr,
     };
     const auto decoded = decode(trace);
-    for (uint32_t i = 0; i < 11; ++i) {
+    for (uint32_t i = 0; i < std::size(expected); ++i) {
         EXPECT_EQ(kind(decoded[i]), static_cast<uint32_t>(expected[i]));
         EXPECT_EQ(decoded[i].count, 1u);
         EXPECT_EQ(decoded[i].kind >> 16, 1u);
@@ -470,6 +464,31 @@ TEST(HbgScalarTrace, CompactStoragePreservesWideClocksTasksCountsAndDepth) {
     }
 }
 
+TEST(HbgScalarTrace, CompactStoragePreservesEveryBootstrapPhase) {
+    auto buffer = std::make_unique<SchedulerActivityBuffer>();
+    auto slots = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+    SchedulerScalarTrace trace;
+    trace.buffer = buffer.get();
+    trace.records = slots.get();
+    const SchedPhaseKind phases[] = {
+        SchedPhaseKind::ScalarBootstrapInitWait,
+        SchedPhaseKind::ScalarBootstrapPeerWait,
+        SchedPhaseKind::ScalarBootstrapTopology,
+    };
+    const char *names[] = {"scalar_bootstrap_init_wait", "scalar_bootstrap_peer_wait", "scalar_bootstrap_topology"};
+    for (auto phase : phases)
+        trace.append(phase, 10, 20, -1, 2);
+    const auto rows = decode(trace);
+    ASSERT_EQ(rows.size(), 3u);
+    for (uint32_t i = 0; i < rows.size(); ++i) {
+        EXPECT_EQ(kind(rows[i]), 139u + i);
+        EXPECT_STREQ(sched_phase_kind_name(static_cast<SchedPhaseKind>(kind(rows[i]))), names[i]);
+        EXPECT_EQ(rows[i].start_time, 10u);
+        EXPECT_EQ(rows[i].end_time, 20u);
+        EXPECT_EQ(rows[i].kind >> 16, 2u);
+    }
+}
+
 TEST(HbgScalarTrace, CompactDecoderRejectsTruncatedAndOverflowingIntervals) {
     SchedulerScalarStorageSlot rows[] = {{1, SCHEDULER_SCALAR_STORAGE_EXTENDED | 90, 1}, {2, 0, 0}};
     SchedulerScalarRecord row{};
@@ -527,7 +546,6 @@ TEST(HbgScalarTrace, FinishCoversAllDirectWritesAndReportsTerminalPublication) {
     EXPECT_EQ(rows[rows.size() - 3].count, (stored_slots + 3) / 4);
     EXPECT_EQ(kind(rows.back()), static_cast<uint32_t>(SchedPhaseKind::ScalarWindow));
     EXPECT_EQ(rows.back().end_time, parent.end_time);
-    EXPECT_EQ(buffer->scalar_storage_format, 1u);
     EXPECT_EQ(buffer->scalar_storage_slots, trace.storage_slots);
     EXPECT_EQ(buffer->scalar_committed, trace.committed);
     EXPECT_EQ(buffer->scalar_dropped, 0u);
@@ -551,11 +569,11 @@ TEST(HbgScalarTrace, LinkedTranslationUnitsRetainTheirInstrumentationPolicy) {
 
 TEST(SchedulerActivityBuffer, IsAllocatedOnlyWhenRequestedAndNeverWraps) {
     AicoreSchedulerLayout disabled{};
-    ASSERT_TRUE(scheduler_plan_layout(1, 1, 0, &disabled));
+    ASSERT_TRUE(scheduler_plan_layout(1, &disabled));
     EXPECT_EQ(disabled.activity_buffers_offset, 0u);
 
     AicoreSchedulerLayout enabled{};
-    ASSERT_TRUE(scheduler_plan_layout(1, 1, 0, &enabled, true));
+    ASSERT_TRUE(scheduler_plan_layout(1, &enabled, true));
     ASSERT_NE(enabled.activity_buffers_offset, 0u);
     EXPECT_EQ(
         enabled.total_size - disabled.total_size,
@@ -565,14 +583,12 @@ TEST(SchedulerActivityBuffer, IsAllocatedOnlyWhenRequestedAndNeverWraps) {
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(storage.base(), enabled.worker_contexts_offset);
     auto *buffers = scheduler_state_at<SchedulerActivityBuffer>(storage.base(), enabled.activity_buffers_offset);
     contexts[0].worker_index = SCHEDULER_WORKER_CAPACITY - 1;
-    contexts[0].is_scheduler = 1;
-    contexts[0].scheduler_index = SCHEDULER_WORKER_CAPACITY - 1;
     SchedulerLocalState local{};
     SchedulerLocalProfilingState profile{};
     local.profiling = &profile;
     local.profiling->activity_buffers_offset = contexts[0].activity_buffers_offset;
-    local.config.scheduler_index = contexts[0].scheduler_index;
     local.config.self_lane = 0;
+    local.config.worker_ids[0] = SCHEDULER_WORKER_CAPACITY - 1;
     local.profiling->loop_iter = 17;
     SchedulerActivityBuffer &buffer = buffers[SCHEDULER_WORKER_CAPACITY - 1];
     buffer.committed = SCHEDULER_ACTIVITY_CAPACITY - 1;

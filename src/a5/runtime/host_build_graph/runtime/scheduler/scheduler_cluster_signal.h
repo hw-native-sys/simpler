@@ -102,7 +102,7 @@ scheduler_cluster_store_release(SCHEDULER_CLUSTER_SSBUF volatile uint32_t *field
     scheduler_cluster_store_field(field, value);
 }
 
-// Called only by the AIC before the all-worker bootstrap publication barrier.
+// Called only by the AIC before publishing this cluster's GM INIT bit.
 inline __aicore__ void
 scheduler_cluster_signal_clear(SCHEDULER_CLUSTER_SSBUF SchedulerClusterSignal *signal, uint64_t run_epoch) {
     scheduler_cluster_store_field(&signal->run_epoch, run_epoch);

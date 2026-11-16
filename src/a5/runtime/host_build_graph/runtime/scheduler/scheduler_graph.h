@@ -18,7 +18,7 @@
 
 #include "common/core_type.h"
 #include "common/platform_config.h"
-#include "dispatch_payload.h"
+#include "kernel_args.h"
 #include "scheduler_native_graph_access.h"
 
 #ifndef __gm__
@@ -33,7 +33,6 @@
 #include "task_image_predicate.h"
 
 inline constexpr int32_t SCHEDULER_GRAPH_MAX_FANIN = 128;
-inline constexpr uint32_t SCHEDULER_CORE_CALLABLE_RESOLVED_ADDR_OFFSET = 136;
 inline constexpr int32_t SCHEDULER_GRAPH_INVALID_KERNEL_ID = -1;
 
 enum class SchedulerGraphResult : uint64_t {
@@ -108,24 +107,15 @@ struct SchedulerGraphView {
     uint64_t native_header_offset;
     uint64_t scheduler_state_bytes;
     uint32_t original_task_count;
-    uint16_t view_version;
-    uint16_t view_bytes;
 };
-
-inline constexpr uint16_t SCHEDULER_GRAPH_VIEW_VERSION = 5;
 
 inline __aicore__ constexpr SchedulerGraphView
 scheduler_ordinary_graph_view(uint64_t storage_address, uint32_t task_count, uint64_t window_last_index) {
-    return {storage_address,           task_count, window_last_index, 0, 0, 0, task_count, SCHEDULER_GRAPH_VIEW_VERSION,
-            sizeof(SchedulerGraphView)};
-}
-
-inline __aicore__ bool scheduler_graph_view_format_valid(const SchedulerGraphView &graph) {
-    return graph.view_version == SCHEDULER_GRAPH_VIEW_VERSION && graph.view_bytes == sizeof(SchedulerGraphView);
+    return {storage_address, task_count, window_last_index, 0, 0, 0, task_count};
 }
 
 inline __aicore__ bool scheduler_graph_storage_extent_valid(const SchedulerGraphView &graph) {
-    if (!scheduler_graph_view_format_valid(graph) || graph.task_count > INT32_MAX) return false;
+    if (graph.task_count > INT32_MAX) return false;
     const uint64_t storage_count = graph.original_task_count;
     if (storage_count != 0 &&
         (graph.storage_address == 0 || storage_count - 1 > graph.task_window_last_index ||
@@ -156,7 +146,7 @@ public:
     SchedulerGraphAccess &operator=(const SchedulerGraphAccess &) = delete;
 
     inline __aicore__ __gm__ const SchedulerNativeGraphHeader *native_header() const {
-        if (header_ == nullptr && scheduler_graph_view_format_valid(*this)) {
+        if (header_ == nullptr) {
             header_ = scheduler_native_header_checked(
                 scheduler_state_address, scheduler_state_bytes, native_header_offset, task_count, original_task_count
             );
@@ -219,8 +209,6 @@ static_assert(offsetof(SchedulerGraphView, scheduler_state_address) == 24);
 static_assert(offsetof(SchedulerGraphView, native_header_offset) == 32);
 static_assert(offsetof(SchedulerGraphView, scheduler_state_bytes) == 40);
 static_assert(offsetof(SchedulerGraphView, original_task_count) == 48);
-static_assert(offsetof(SchedulerGraphView, view_version) == 52);
-static_assert(offsetof(SchedulerGraphView, view_bytes) == 54);
 static_assert(std::is_trivially_copyable_v<SchedulerGraphView> && std::is_standard_layout_v<SchedulerGraphView>);
 static_assert(sizeof(SchedulerTaskShape) == 24, "task shape result layout changed");
 static_assert(offsetof(SchedulerTaskShape, active_mask) == 20);
@@ -248,14 +236,6 @@ inline __aicore__ __gm__ uint8_t *scheduler_graph_payload(const SchedulerGraphVi
     return storage == nullptr ? nullptr : storage + SCHEDULER_GRAPH_PAYLOAD_OFFSET;
 }
 
-inline __aicore__ int32_t
-scheduler_graph_fanin_id(const SchedulerGraphView &graph, int64_t task_ref, int32_t fanin_index) {
-    __gm__ uint8_t *payload = scheduler_graph_payload(graph, task_ref);
-    __gm__ uint8_t *field = payload + TASK_IMAGE_FANIN_DELTA_OFFSET;
-    int32_t delta = *reinterpret_cast<__gm__ int32_t *>(field);
-    return reinterpret_cast<__gm__ int32_t *>(field + delta)[fanin_index];
-}
-
 struct SchedulerNativeNode {
     __gm__ const SchedulerNativeGraphHeader *header{nullptr};
     __gm__ const SchedulerNodeBinding *binding{nullptr};
@@ -265,7 +245,7 @@ struct SchedulerNativeNode {
 
 inline __aicore__ bool
 scheduler_native_node_checked(const SchedulerGraphAccess &graph, int64_t ref, SchedulerNativeNode *out) {
-    if (out == nullptr || !scheduler_graph_view_format_valid(graph)) return false;
+    if (out == nullptr) return false;
     const uint64_t base = graph.scheduler_state_address;
     auto *header = graph.native_header();
     if (header == nullptr) return false;
@@ -312,16 +292,7 @@ scheduler_native_child_plan_checked(const SchedulerGraphView &graph, const Sched
                       graph.scheduler_state_address + node.definition->child_plans_offset
                   ) +
                   node.binding->source_index;
-    if (child->tensor_count > MAX_TENSOR_ARGS || child->scalar_count > MAX_SCALAR_ARGS ||
-        child->tensors_offset % 64 != 0 || child->scalars_offset % 64 != 0 ||
-        child->tensors_offset > node.definition->args_bytes ||
-        child->tensor_count > (node.definition->args_bytes - child->tensors_offset) / TASK_IMAGE_TENSOR_STRIDE ||
-        child->scalars_offset > node.definition->args_bytes ||
-        child->scalar_count > (node.definition->args_bytes - child->scalars_offset) / sizeof(uint64_t) ||
-        (child->predicate_offset != SCHEDULER_NATIVE_NO_PREDICATE &&
-         (child->predicate_offset % 64 != 0 || child->predicate_offset > node.definition->args_bytes ||
-          node.definition->args_bytes - child->predicate_offset < 64)))
-        return nullptr;
+    if (!scheduler_native_child_arguments_valid(*child, node.definition->args_bytes)) return nullptr;
     return child;
 }
 
@@ -401,7 +372,7 @@ struct SchedulerFaninView {
 
 inline __aicore__ SchedulerGraphResult
 scheduler_node_fanin_view(const SchedulerGraphAccess &graph, int64_t task_ref, SchedulerFaninView *view) {
-    if (view == nullptr || !scheduler_graph_view_format_valid(graph)) return SchedulerGraphResult::INVALID_ARGUMENTS;
+    if (view == nullptr) return SchedulerGraphResult::INVALID_ARGUMENTS;
     if (graph.storage_address == 0 || !scheduler_task_ref_valid(graph, task_ref))
         return SchedulerGraphResult::INVALID_TASK_COUNT;
     *view = {};
@@ -494,7 +465,6 @@ scheduler_classify_task_shape(const SchedulerGraphAccess &graph, int64_t task_re
         {SCHEDULER_GRAPH_INVALID_KERNEL_ID, SCHEDULER_GRAPH_INVALID_KERNEL_ID, SCHEDULER_GRAPH_INVALID_KERNEL_ID},
         LaneMask::none()
     };
-    if (!scheduler_graph_view_format_valid(graph)) return SchedulerGraphResult::INVALID_ARGUMENTS;
     if (graph.task_count == 0) return SchedulerGraphResult::EMPTY;
     if (graph.storage_address == 0 || !scheduler_task_ref_valid(graph, task_ref)) {
         return SchedulerGraphResult::INVALID_TASK_COUNT;
@@ -577,8 +547,7 @@ struct SchedulerTaskPayloadArguments {
 inline __aicore__ SchedulerGraphResult scheduler_parse_task_payload_arguments(
     const SchedulerGraphAccess &graph, int64_t task_ref, SchedulerTaskPayloadArguments *arguments
 ) {
-    if (arguments == nullptr || !scheduler_graph_view_format_valid(graph))
-        return SchedulerGraphResult::INVALID_ARGUMENTS;
+    if (arguments == nullptr) return SchedulerGraphResult::INVALID_ARGUMENTS;
     if (graph.storage_address == 0 || !scheduler_task_ref_valid(graph, task_ref)) {
         return SchedulerGraphResult::INVALID_TASK_COUNT;
     }

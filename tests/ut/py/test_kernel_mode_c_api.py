@@ -1813,3 +1813,41 @@ if __name__ == "__main__":
         _run_loader_unload_retry(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4][len("loader_") :])
     else:
         _run_lifecycle_retry(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4])
+
+
+def test_adopted_buffer_failed_release_keeps_borrow_guard():
+    lib = _load("a2a3", "onboard", "tensormap_and_ringbuffer")
+    release_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+    lib.device_adopt_caller_buffer_ctx.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        release_type,
+        ctypes.c_void_p,
+    ]
+    lib.device_borrow_caller_buffers_ctx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint64]
+    lib.device_release_caller_buffers_ctx.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int]
+    lib.device_free_caller_buffer_ctx.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    failed = [True]
+
+    @release_type
+    def release(storage, base):
+        return -1000 if failed[0] else 0
+
+    ctx = lib.create_device_context()
+    span = (ctypes.c_uint64 * 2)(0x10000, 64)
+    token = (1 << 63) + 1
+    try:
+        before = lib.committed_device_memory_ctx(ctx)
+        assert lib.device_adopt_caller_buffer_ctx(ctx, span[0], 64, 4096, release, None) == 0
+        assert lib.committed_device_memory_ctx(ctx) == before + 4096
+        assert lib.device_free_caller_buffer_ctx(ctx, span[0]) != 0
+        assert lib.device_borrow_caller_buffers_ctx(ctx, span, 1, token) == 0
+        assert lib.finalize_device(ctx) != 0
+        lib.destroy_device_context(ctx)
+    finally:
+        failed[0] = False
+        lib.device_release_caller_buffers_ctx(ctx, token, 0)
+        assert lib.finalize_device(ctx) == 0
+        lib.destroy_device_context(ctx)

@@ -412,6 +412,15 @@ public:
     size_t unobserved_completed_run_high_water() const noexcept;
 
     uint64_t malloc(size_t size);
+    /** Transfer fresh VMM storage into this initialized owner; a refusal transfers no ownership. */
+    void adopt_shared_buffer(
+        uint64_t base, size_t logical_bytes, size_t physical_bytes, CallerStorageReleaseFn release_storage,
+        void *storage
+    );
+    bool supports_shareable_storage() const noexcept { return initialized_ && device_owner_reserved_; }
+    // Own rollback debt before acquiring storage; adoption transfers it to the allocator.
+    void retain_pending_storage(CallerStorageReleaseFn release_storage, void *storage);
+    void release_pending_storage(void *storage);
     void free(uint64_t ptr);
     void copy_to(uint64_t dst, uint64_t src, size_t size);
     void copy_from(uint64_t dst, uint64_t src, size_t size);
@@ -487,10 +496,17 @@ public:
         size_t window_size, uint32_t workspace_mask = 0, uint64_t *ownership_flag = nullptr,
         const std::string &host_shm_name = {}, const CommWorkspaceConfig *workspace_config = nullptr
     );
+    bool communication_cleanup_confirmed() const noexcept { return !comm_cleanup_unconfirmed_; }
     uint64_t register_ccu_callable(
         uint64_t comm_handle, uint64_t collective_id, int32_t callable_id, const std::vector<uint32_t> &rank_ids,
-        uint32_t domain_rank, const simpler::ccu::ExpectedBuildIdentity &expected_identity, uint32_t workspace_mask
+        uint32_t domain_rank, const simpler::ccu::ExpectedBuildIdentity &expected_identity, uint32_t workspace_mask,
+        uint64_t allocation_id = 0, uint32_t ccu_id = UINT32_MAX
     );
+    uint64_t prepare_ccu_run_set(
+        uint64_t comm_handle, const std::vector<uint64_t> &registrations, uint64_t generation, uint64_t dispatch_id
+    );
+    int control_ccu_run_set(uint64_t comm_handle, uint64_t run_set_id, uint32_t operation);
+    void release_ccu_registration(uint64_t comm_handle, uint64_t registration_id);
     uint64_t prepare_ccu_run(
         uint64_t comm_handle, uint64_t registration_id, uint64_t generation, uint64_t dispatch_id,
         uint64_t allocation_id
@@ -859,6 +875,17 @@ private:
     CommAllocHostDomainWindowsFn comm_alloc_host_domain_windows_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_release_domain_windows_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_abort_domain_windows_fn_ = nullptr;
+    using CommRegisterDomainCcuFn = int (*)(
+        void *, uint64_t, uint64_t, uint32_t, const void *, size_t, const uint8_t *, const uint8_t *, uint64_t *
+    );
+    using CommPrepareCcuRunSetFn = int (*)(void *, const uint64_t *, size_t, uint64_t, uint64_t *, uint64_t *);
+    using CommControlCcuRunSetFn = int (*)(void *, uint64_t, uint32_t);
+    using CommReleaseCcuRegistrationFn = int (*)(void *, uint64_t);
+    CommRegisterDomainCcuFn comm_register_domain_ccu_fn_ = nullptr;
+    CommPrepareCcuRunSetFn comm_prepare_ccu_run_set_fn_ = nullptr;
+    CommControlCcuRunSetFn comm_control_ccu_run_set_fn_ = nullptr;
+    CommReleaseCcuRegistrationFn comm_release_ccu_registration_fn_ = nullptr;
+    std::map<std::pair<uint64_t, uint64_t>, uint64_t> ccu_run_set_dispatches_;
     CommRegisterCcuCallableFn comm_register_ccu_callable_fn_ = nullptr;
     CommPrepareCcuRunFn comm_prepare_ccu_run_fn_ = nullptr;
     using CommControlCcuRunFn = int (*)(void *, uint64_t, uint32_t, uint64_t);
@@ -1213,5 +1240,7 @@ private:
     bool host_uses_quiesced_ = false;
     int device_id_ = -1;
     bool initialized_ = false;
+    std::mutex pending_storage_mu_;
+    std::unordered_map<void *, CallerStorageReleaseFn> pending_storage_;
     bool finalized_ = false;
 };

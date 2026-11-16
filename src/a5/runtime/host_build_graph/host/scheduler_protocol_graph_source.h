@@ -40,7 +40,7 @@ inline std::string scheduler_protocol_freeze_source(
     using namespace scheduler_protocol_export;
     if (original.native_header_offset != 0 || original.task_count != tasks.size())
         throw std::invalid_argument("protocol source must be the original graph");
-    std::map<uint64_t, std::pair<uint64_t, GraphDefinition>> unique;
+    std::map<uint64_t, std::pair<uint64_t, Graph>> unique;
     std::ostringstream out;
     {
         JsonObject root(out);
@@ -53,7 +53,7 @@ inline std::string scheduler_protocol_freeze_source(
             uint64_t key = 0;
             if (tasks[task].kind == 1) {
                 const auto offset = tasks[task].definition_offset;
-                const auto def = scheduler_protocol_source_value<GraphDefinition>(definitions, offset);
+                const auto def = scheduler_protocol_source_value<Graph>(definitions, offset);
                 if (def.task_count <= 0 || def.task_count > SUB_TASK_MAX_NUM || offset > definitions.size() ||
                     def.total_bytes > definitions.size() - offset)
                     throw std::invalid_argument("invalid original Definition extent");

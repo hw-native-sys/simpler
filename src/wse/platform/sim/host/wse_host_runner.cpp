@@ -62,6 +62,7 @@ bool write_all_bytes(int fd, const uint8_t *data, size_t size) {
 
 }  // namespace
 
+// WSE does not link the common device_runner_base.cpp translation unit that also defines this helper.
 bool create_temp_so_file(const std::string &path_template, const uint8_t *data, size_t size, std::string *out_path) {
     std::vector<char> path_buf(path_template.begin(), path_template.end());
     path_buf.push_back('\0');

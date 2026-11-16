@@ -107,9 +107,9 @@ static void log_resident_task_catalog(void *base, const SchedulerWorkerContext &
     const auto pool = *shared_pool;
     const uint64_t limit = pool.storage_end_offset;
     const uint64_t descriptor_bytes = SCHEDULER_EXECUTION_ENGINE_COUNT * sizeof(SchedulerTaskCatalogDescriptor);
-    if (pool.version != SCHEDULER_TASK_CATALOG_VERSION || pool.task_count != context.graph_task_count ||
-        pool.entry_count > pool.task_count || pool.control_count > pool.task_count - pool.entry_count ||
-        limit > state_bytes || pool.descriptors_offset < pool_offset + sizeof(pool) ||
+    if (pool.task_count != context.graph_task_count || pool.entry_count > pool.task_count ||
+        pool.control_count > pool.task_count - pool.entry_count || limit > state_bytes ||
+        pool.descriptors_offset < pool_offset + sizeof(pool) ||
         !range_valid(
             pool.descriptors_offset, SCHEDULER_EXECUTION_ENGINE_COUNT, sizeof(SchedulerTaskCatalogDescriptor),
             SCHEDULER_STATE_ALIGNMENT, limit
@@ -171,7 +171,6 @@ static void log_unfinished_tasks(Runtime *runtime) {
         uint64_t task;
         uint64_t completion;
         uint64_t next_block;
-        uint64_t parked;
     };
     TaskSnapshot snapshots[64];
     uint64_t snapshot_count = 0;
@@ -185,14 +184,14 @@ static void log_unfinished_tasks(Runtime *runtime) {
             const auto identity = aicore_scheduler_public_identity(graph, task);
             LOG_ERROR("A5 HBG native node=%" PRIu64 " public_id=%" PRIu64, task, TaskId::to_uint64(identity));
         }
-        const TaskSnapshot snapshot{task, completion, controls[task].next_block, controls[task].parked_count};
+        const TaskSnapshot snapshot{task, completion, controls[task].next_block};
         snapshots[snapshot_count++] = snapshot;
         LOG_ERROR(
             "A5 HBG AICore scheduler: unfinished task=%" PRIu64 " total=%" PRIu64 " remaining=%" PRIu64 " debt=%" PRIu64
-            " next_block=%" PRIu64 " parked=%" PRIu64 " active_mask=0x%x flags=0x%x",
+            " next_block=%" PRIu64 " active_mask=0x%x flags=0x%x",
             task, scheduler_completion_total(completion), scheduler_completion_remaining(completion),
-            scheduler_completion_debt(completion), snapshot.next_block, snapshot.parked,
-            metadata[task].active_mask.raw(), metadata[task].flags
+            scheduler_completion_debt(completion), snapshot.next_block, metadata[task].active_mask.raw(),
+            metadata[task].flags
         );
     }
     log_resident_task_catalog(scheduler_state_base, *context);
@@ -202,17 +201,13 @@ static void log_unfinished_tasks(Runtime *runtime) {
         const uint64_t task = before.task;
         cache_invalidate_range(&controls[task], sizeof(controls[task]));
         rmb();
-        const TaskSnapshot after{
-            task, controls[task].completion_state, controls[task].next_block, controls[task].parked_count
-        };
-        if (after.completion == before.completion && after.next_block == before.next_block &&
-            after.parked == before.parked)
-            continue;
+        const TaskSnapshot after{task, controls[task].completion_state, controls[task].next_block};
+        if (after.completion == before.completion && after.next_block == before.next_block) continue;
         ++moved;
         LOG_ERROR(
             "A5 HBG AICore scheduler: task=%" PRIu64 " moved: completion %" PRIu64 "->%" PRIu64 " next_block %" PRIu64
-            "->%" PRIu64 " parked %" PRIu64 "->%" PRIu64,
-            task, before.completion, after.completion, before.next_block, after.next_block, before.parked, after.parked
+            "->%" PRIu64,
+            task, before.completion, after.completion, before.next_block, after.next_block
         );
     }
     LOG_ERROR(
@@ -586,6 +581,8 @@ __attribute__((weak)) bool AicpuExecutor::schedules_on_aicore(const Runtime *run
 
 __attribute__((weak)) bool AicpuExecutor::awaits_bootstrap() const { return true; }
 
+__attribute__((weak)) bool AicpuExecutor::uses_kernel_work_window() const { return true; }
+
 __attribute__((weak)) int32_t AicpuExecutor::post_handshake_init(Runtime *runtime) {
     return aicore_lifecycle_.post_handshake_init(runtime);
 }
@@ -768,11 +765,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         snapshot_run_terminal(runtime, cores_retired);
         if (cores_retired) {
             AicoreWorkWindow work_window{};
-            for (int i = 0; i < runtime->get_worker_count(); ++i) {
-                cache_invalidate_range(&runtime->dev.workers[i], sizeof(Handshake));
-            }
-            rmb();
-            if (aicore_reduce_work_window(runtime->dev.workers, runtime->get_worker_count(), work_window)) {
+            if (aicore_lifecycle_.retired_work_window(work_window, uses_kernel_work_window())) {
                 device_phase_set_aicore_work_window(work_window);
             }
             publish_aicore_task_timing(runtime);

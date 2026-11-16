@@ -115,11 +115,9 @@ static_assert(
 // GraphTaskArgs is not the same as owning its tensor data. The array is fixed-size so
 // those pointers cannot be invalidated by a reallocation.
 struct GraphBoundary {
-    // Deliberately user-provided rather than `= default`: a defaulted constructor here is
-    // trivial, so make_unique<GraphInflightRecording>()'s value-initialization would zero
-    // all 13.3 KB of `tensors` on the submitting thread. A user-provided one leaves the
-    // array default-initialized -- Tensor is trivially default constructible, so those
-    // pages cost nothing until a Graph writes the tensors it actually has.
+    // A user-provided constructor skips the value-initialization zero-fill of
+    // `tensors`. Default construction still writes each Tensor's TaskId invalid
+    // sentinel, touching the array throughout its allocation.
     // NOLINTNEXTLINE(modernize-use-equals-default)
     GraphBoundary() {}
 
@@ -173,8 +171,8 @@ struct GraphRecording {
     // (a per-task buffer at the cap is 32 x 128 B = exactly one page, so dsv4's 1679 tasks
     // touched 1679 pages to hold ~210 KB). Allocated once per thread at the cap and never
     // grown, which is what keeps a task's borrowed element addresses valid for the rest of
-    // the recording. `new[]` default-initializes a trivially-default-constructible Tensor,
-    // so the region costs no page until a body writes one; each element a task uses is
+    // the recording. `new[]` default construction writes each Tensor's TaskId invalid
+    // sentinel, touching the pool during stand-up. Each element a task uses is
     // value-initialized before it is filled.
     std::unique_ptr<simpler::hbg::Tensor[]> task_tensor_pool;
     int32_t task_tensor_cursor{0};
@@ -339,8 +337,8 @@ size_t graph_recorder_storage_failures();
 
 bool graph_classify_tensor(const GraphRecording &recording, int32_t task_index, const simpler::hbg::Tensor &tensor);
 
-std::optional<GraphDefinition> graph_layout_definition(const GraphRecording &recording);
+std::optional<Graph> graph_layout_definition(const GraphRecording &recording);
 
-bool graph_fill_definition(const GraphRecording &recording, GraphDefinition definition, std::byte *image);
+bool graph_fill_definition(const GraphRecording &recording, Graph definition, std::byte *image);
 
-const GraphDefinition *graph_definition(const std::byte *data, size_t bytes);
+const Graph *graph_definition(const std::byte *data, size_t bytes);

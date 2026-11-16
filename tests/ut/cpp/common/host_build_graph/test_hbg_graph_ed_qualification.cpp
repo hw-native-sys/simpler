@@ -62,10 +62,10 @@ protected:
         ASSERT_TRUE(orch.init(sm_handle->sm_base, gm_heap.data(), HEAP_BYTES, CHIP_DEFAULT_GRAPH_TASKS));
 
         definition_staging.assign(STAGING_BYTES, std::byte{0});
-        GraphDefinitionArena arena{};
+        GraphImageArena arena{};
         arena.base = definition_staging.data();
         arena.capacity = definition_staging.size();
-        arena.object_prefix_bytes = sizeof(GraphDefinitionHeader);
+        arena.object_prefix_bytes = sizeof(GraphImageHeader);
         arena.object_align = GRAPH_DEFINITION_OBJECT_ALIGN;
         graph_state = make_graph_host_state(arena);
         ASSERT_NE(graph_state, nullptr);
@@ -170,14 +170,14 @@ protected:
         return orch.sm_header->tasks.get_slot_state_by_task_id(id.local_id());
     }
 
-    const GraphDefinition *published_definition() {
-        const GraphHostDefinitionList published = graph_host_definitions(*graph_state);
+    const Graph *published_definition() {
+        const GraphHostImageList published = graph_host_definitions(*graph_state);
         EXPECT_EQ(published.entries.size(), 1u);
         if (published.entries.empty()) return nullptr;
-        const GraphHostDefinition &entry = published.entries.front();
+        const GraphHostImage &entry = published.entries.front();
         EXPECT_NE(entry.object_offset, GRAPH_NO_OBJECT_OFFSET) << "the staging arena is sized to hold this image";
-        return reinterpret_cast<const GraphDefinition *>(
-            definition_staging.data() + entry.object_offset + sizeof(GraphDefinitionHeader)
+        return reinterpret_cast<const Graph *>(
+            definition_staging.data() + entry.object_offset + sizeof(GraphImageHeader)
         );
     }
 };
@@ -194,7 +194,7 @@ TEST_F(HbgGraphEdQualificationTest, AllFlaggedProducersMakeCandidateAndSortItsRo
     ASSERT_TRUE(record_consumer(t1, t0).is_valid());
     ASSERT_TRUE(orch.graph_end());
 
-    const GraphDefinition *definition = published_definition();
+    const Graph *definition = published_definition();
     ASSERT_NE(definition, nullptr);
     ASSERT_EQ(definition->task_count, 3);
     const auto *tasks = graph_definition_array<SubTaskDefinition>(*definition, definition->off_sub_tasks, 3);
@@ -229,7 +229,7 @@ TEST_F(HbgGraphEdQualificationTest, OneUnflaggedProducerDisqualifiesAndLeavesIts
     ASSERT_TRUE(record_consumer(t1, t0).is_valid());
     ASSERT_TRUE(orch.graph_end());
 
-    const GraphDefinition *definition = published_definition();
+    const Graph *definition = published_definition();
     ASSERT_NE(definition, nullptr);
     ASSERT_EQ(definition->task_count, 3);
     const auto *tasks = graph_definition_array<SubTaskDefinition>(*definition, definition->off_sub_tasks, 3);
@@ -266,7 +266,7 @@ TEST_F(HbgGraphEdQualificationTest, HiddenAllocProducerDoesNotDisqualifyItsConsu
     ASSERT_TRUE(record_consumer(flagged, allocated).is_valid());
     ASSERT_TRUE(orch.graph_end());
 
-    const GraphDefinition *definition = published_definition();
+    const Graph *definition = published_definition();
     ASSERT_NE(definition, nullptr);
     ASSERT_EQ(definition->task_count, 3);
     const auto *tasks = graph_definition_array<SubTaskDefinition>(*definition, definition->off_sub_tasks, 3);

@@ -24,18 +24,18 @@ namespace simpler::hbg::resident {
 
 #if defined(__DAV_CUBE__)
 template __aicore__ void run<true, false, CoreType::AIC>(
-    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, uint64_t
+    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, AicoreWorkWindow *
 );
 #elif defined(__DAV_VEC__)
 template __aicore__ void run<true, false, CoreType::AIV>(
-    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, uint64_t
+    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, AicoreWorkWindow *
 );
 #else
 template __aicore__ void run<true, false, CoreType::AIC>(
-    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, uint64_t
+    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, AicoreWorkWindow *
 );
 template __aicore__ void run<true, false, CoreType::AIV>(
-    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, uint64_t
+    __gm__ SchedulerWorkerContext *, __gm__ SchedulerRunControl *, __gm__ void *, uint64_t, uint64_t, AicoreWorkWindow *
 );
 #endif
 

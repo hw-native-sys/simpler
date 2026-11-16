@@ -13,15 +13,16 @@ Sequence integrity proves lossless local event streams, not scheduler causality,
 execution coverage, membership, dependency ordering or Mix resource correctness.
 """
 
-SCHEMAS = ("hbg-native-protocol-v20", "hbg-native-protocol-v21")
+COMPLETION_FROM_GROUP = 1 << 29
 COMPLETION_FROM_CONTRIBUTION = 1 << 30
+COMPLETION_ALIAS_FLAGS = COMPLETION_FROM_GROUP | COMPLETION_FROM_CONTRIBUTION
 DEFERRED_FINISH = 1 << 31
 
 ROOT_NUMBERS = frozenset(
     """
 run_epoch task_count worker_count trace_count member_count cooperative_task_count
 cluster_count mix_task_count sync_mix_task_count expected_task_count inline_completed_count resolved_task_count
-close_seal_stride active_worker_count scheduler_count scheduler_error error_claimed commit_tail commit_lock
+close_seal_stride active_worker_count scheduler_error error_claimed commit_tail commit_lock
 """.split()
 )
 ROOT_TABLES = frozenset(
@@ -61,7 +62,7 @@ NUMBERS = {
     "execution": (
         "index run_epoch task_ref order_key permit_tail worker_index block_idx "
         "pending_slot subtask_slot flags ready_source group_seq block_num cluster_index cluster_lane "
-        "publication_mode publication_before_cycles publication_after_cycles publication_count "
+        "publication_before_cycles publication_after_cycles publication_count "
         "contribution_ticket contribution_worker"
     ),
 }
@@ -88,14 +89,9 @@ ARRAYS = {
 SIGNED_FIELDS = frozenset(("task_ref", "core_id", "core_type", "state"))
 
 
-def protocol_version(section):
-    schema = section.get("schema") if isinstance(section, dict) else None
-    return int(schema.rsplit("v", 1)[-1]) if schema in SCHEMAS else 0
-
-
 def has_native_graph(section):
-    """The native Graph schema includes independent source and node maps."""
-    return isinstance(section, dict) and section.get("schema") == "hbg-native-protocol-v21"
+    """Native Graph evidence includes independent source and node maps."""
+    return isinstance(section, dict) and ("graph_source" in section or "node_map" in section)
 
 
 def _error(message):
@@ -122,6 +118,9 @@ def _array(value, path, count=None, *, signed=False):
 
 def _record(record, kind, path, extra_numbers=(), extra_arrays=None):
     numbers = NUMBERS[kind].split() + list(extra_numbers)
+    order_fields = ("schedule_rank", "topological_level", "bottom_level")
+    if kind == "task" and isinstance(record, dict) and any(name in record for name in order_fields):
+        numbers += list(order_fields)
     stamps = STAMPS.get(kind, "").split()
     arrays = ARRAYS.get(kind, {}) | (extra_arrays or {})
     _object(record, {*numbers, *stamps, *arrays}, path)
@@ -154,7 +153,7 @@ def _indices(rows, count, path, *, key="index", dense=False):
 
 def read_native_protocol(section):
     """Validate the wire schema; preserve incomplete/error records for diagnosis."""
-    if not protocol_version(section):
+    if not isinstance(section, dict) or section.get("schema") != "hbg-native-protocol":
         _error("unsupported schema")
     native = has_native_graph(section)
     root_numbers = ROOT_NUMBERS
@@ -165,7 +164,7 @@ def read_native_protocol(section):
     for field in root_numbers:
         _number(section[field], field)
     if section["close_seal_stride"] != 64:
-        _error("close_seal_stride disagrees with the schema version")
+        _error("close_seal_stride disagrees with the close-seal layout")
     error_numbers = ERROR_NUMBERS
     _object(section["first_error"], error_numbers, "first_error")
     for field in error_numbers:
@@ -181,7 +180,7 @@ def read_native_protocol(section):
     ):
         _indices(section[table], count, table, key=key, dense=True)
         for row in section[table]:
-            extra = ("claim_tickets", "claim_seal", "parked_count") if kind == "control" else ()
+            extra = ("claim_tickets", "claim_seal") if kind == "control" else ()
             _record(row, kind, f"{table}[{row[key]}]", extra)
     for row in section["admissions"]:
         if len(row["close_seals"]) not in (0, section["cluster_count"]):
@@ -248,23 +247,32 @@ def _completion_aliases(section):
     for execution in section["executions"]:
         key = execution["task_ref"], execution["contribution_ticket"]
         contributions.setdefault(key, []).append(execution)
+    groups = {}
+    for block in section["blocks"]:
+        owner = block["owner"]
+        if owner is not None:
+            groups.setdefault((owner["task_ref"], owner["completion_ticket"]), []).append(block)
     aliases = {}
     for event in section["task_events"]:
         admission, done = event["admission"], event["completion"]
-        if admission is not None and admission["flags"] & COMPLETION_FROM_CONTRIBUTION:
+        if admission is not None and admission["flags"] & COMPLETION_ALIAS_FLAGS:
             _error("completion alias on admission")
-        if done is None or not done["flags"] & COMPLETION_FROM_CONTRIBUTION:
+        if done is None or not done["flags"] & COMPLETION_ALIAS_FLAGS:
             continue
         ref = event["index"]
         task, control = tasks[ref], controls[ref]
-        total = task["block_num"] * task["active_mask"].bit_count()
+        width = task["active_mask"].bit_count()
+        total = task["block_num"] * width
+        group_alias = bool(done["flags"] & COMPLETION_FROM_GROUP)
+        alias_flag = COMPLETION_FROM_GROUP if group_alias else COMPLETION_FROM_CONTRIBUTION
         if (
             not task["flags"] & 1
             or task["flags"] & 32
             or not 0 < task["active_mask"] < 8
             or not 0 < total <= 32767
             or done["flags"] & DEFERRED_FINISH
-            or done["flags"] != task["flags"] | COMPLETION_FROM_CONTRIBUTION
+            or done["flags"] != task["flags"] | alias_flag
+            or group_alias != bool(task["flags"] & 4)
             or done["task_ref"] != ref
             or done["run_epoch"] != section["run_epoch"]
             or control["canonical_total"] != total
@@ -273,6 +281,28 @@ def _completion_aliases(section):
             or control["state"] != 2
         ):
             _error(f"invalid physical TaskDone completion alias for task {ref}")
+        if group_alias:
+            candidates = groups.get((ref, total - width), ())
+            if len(candidates) != 1:
+                _error(f"TaskDone completion alias lacks a unique last group contribution for task {ref}")
+            block = candidates[0]
+            source = block["owner"]
+            if (
+                source["block_idx"] >= task["block_num"]
+                or source["block_num"] != task["block_num"]
+                or source["active_mask"] != task["active_mask"]
+                or source["flags"] != task["flags"]
+                or block["index"] != task["trace_base"] + source["block_idx"] * width
+                or source["run_epoch"] != done["run_epoch"]
+                or source["worker_index"] != done["worker_index"]
+                or source["order_key"] != done["order_key"]
+                or done["before"] != source["completion_before"]
+                or done["after"] != source["completion_after"]
+                or not 0 < done["before"][1] < done["after"][1]
+            ):
+                _error(f"TaskDone completion alias does not identify its last group contribution for task {ref}")
+            aliases[ref] = source
+            continue
         candidates = contributions.get((ref, total - 1), ())
         if len(candidates) != 1:
             _error(f"TaskDone completion alias lacks a unique last contribution for task {ref}")
@@ -322,8 +352,8 @@ def audit_protocol_sequences(section):
         worker = record["worker_index"]
         if worker not in workers or record["run_epoch"] != epoch:
             _error(f"foreign worker or epoch at {path}")
-        if kind == "actor" and record["flags"] & COMPLETION_FROM_CONTRIBUTION:
-            # The validated physical contribution contributes these events once.
+        if kind == "actor" and record["flags"] & COMPLETION_ALIAS_FLAGS:
+            # The validated physical or group contribution supplies these events once.
             continue
         stream = streams[worker]
         for name in STAMPS[kind].split():

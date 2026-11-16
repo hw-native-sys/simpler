@@ -42,7 +42,7 @@ struct AsyncCompletionHostPlan {
 };
 
 // Inputs already refer to the expanded resident task namespace. The run epoch
-// belongs to the final commit, not an earlier parked prepare attempt.
+// belongs to the final commit, not an earlier preparation attempt.
 // Failure leaves out untouched. Without nonzero-capacity groups, no bytes are appended.
 bool plan_async_completion(
     uint64_t begin_offset, uint64_t run_epoch, uint32_t task_count, const std::vector<AsyncTaskPlanInput> &tasks,

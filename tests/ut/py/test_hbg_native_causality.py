@@ -14,7 +14,7 @@ import pytest
 from _capture_builder import Capture
 from _native_protocol_builder import ProtocolBuilder
 
-from simpler_setup.tools.hbg.native_causality import MIX, audit_native_protocol
+from simpler_setup.tools.hbg.native_causality import MIX, PRECLAIM, audit_native_protocol
 from simpler_setup.tools.hbg.native_protocol import (
     STAMPS,
     _event_records,
@@ -24,24 +24,80 @@ from simpler_setup.tools.hbg.native_protocol import (
 from simpler_setup.tools.swimlane_converter import generate_chrome_trace_json, read_perf_data
 
 
+def _preclaim_capture(*, claim_first=False, mixed=False):
+    builder = ProtocolBuilder([(1, 1, ()), (3 if mixed else 1, 2, ())], sync_tasks=(1,))
+    builder.admit(1)
+    reserved = builder.claim(1, 0, 0) if claim_first else None
+    ordinary = builder.execute(0, 0, 0, 0)
+    ordinary["flags"] = (ordinary["flags"] & ~16) | PRECLAIM
+    for block in range(2):
+        if mixed:
+            builder.mix_block(1, block, block, reserved=reserved if block == 0 else None)
+        else:
+            owner = reserved if block == 0 and reserved is not None else builder.claim(1, block, block * 3)
+            builder.execute(1, block, 0, block * 3, owner=owner)
+    builder.close(1)
+    return builder.raw, builder.identities
+
+
+@pytest.mark.parametrize("mixed", (False, True), ids=("pure", "gm_mix"))
+def test_preclaim_permit_requires_an_observed_cohort_and_no_owned_block(mixed):
+    raw, identities = _preclaim_capture(mixed=mixed)
+    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+    raw["executions"][0]["permit_tail"] = 0
+    with pytest.raises(ValueError, match="preclaim permit"):
+        audit_native_protocol(raw, identities)
+    raw, identities = _preclaim_capture(claim_first=True, mixed=mixed)
+    with pytest.raises(ValueError, match="preclaim execution crossed block ownership"):
+        audit_native_protocol(raw, identities)
+
+
+def test_mix_preclaim_vector_waits_for_its_descriptor_not_the_coordinators_claim():
+    builder = ProtocolBuilder([(2, 1, ()), (3, 2, ())], sync_tasks=(1,))
+    builder.admit(1)
+    builder.mix_block(1, 0, 0)
+    reserved = builder.claim(1, 1, 3)
+    ordinary = builder.execute(0, 0, 1, 4)
+    ordinary["flags"] = (ordinary["flags"] & ~16) | PRECLAIM
+    block = builder.mix_block(1, 1, 1, reserved=reserved)
+    builder.close(1)
+    # The second GM block is already published, but this vector lane has not
+    # observed its descriptor. Publication on the remote AIC is not a local claim.
+    owner = block["owner"]
+    owner["publish_before"][0] = ordinary["publication_before_cycles"] - 3
+    owner["publish_after"][0] = ordinary["publication_before_cycles"] - 2
+    resequence(builder.raw)
+    assert audit_native_protocol(builder.raw, builder.identities)["protocol_verified"] is True
+
+    # The active-lane stride places this block beyond the first two trace IDs.
+    # A complete event stream must still reject ordinary entry after its own observe.
+    lane = next(row for row in block["lanes"] if row["worker_index"] == 4)
+    lane["descriptor_ready"][0] = ordinary["publication_before_cycles"] - 1
+    resequence(builder.raw)
+    assert audit_protocol_sequences(builder.raw)["sequence_integrity_verified"] is True
+    with pytest.raises(ValueError, match="preclaim execution crossed GM descriptor ownership"):
+        audit_native_protocol(builder.raw, builder.identities)
+
+
 @pytest.mark.parametrize(
-    "mask,blocks,source,publication",
-    ((1, 1, 0, 0), (2, 1, 0, 0), (1, 1, 2, 0), (1, 1, 2, 1), (1, 2, 0, 0), (7, 1, 3, 0)),
-    ids=("aic_pool", "aiv_pool", "direct", "direct_refill", "spmd_distributed", "mix_cooperative"),
+    "mask,blocks,source",
+    ((1, 1, 0), (2, 1, 0), (1, 2, 0), (7, 1, 3)),
+    ids=("aic_catalog", "aiv_catalog", "spmd_distributed", "mix_cooperative"),
 )
-def test_current_ready_sources_preserve_ordinary_and_cooperative_causality(mask, blocks, source, publication):
+def test_current_ready_sources_preserve_ordinary_and_cooperative_causality(mask, blocks, source):
     raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
     for execution in raw["executions"]:
-        execution.update(ready_source=source, publication_mode=publication)
+        execution["ready_source"] = source
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
 
 
+@pytest.mark.parametrize("source", (1, 2))
 @pytest.mark.parametrize("mask,blocks", ((1, 1), (2, 1), (1, 2), (7, 1)))
-def test_current_ready_sources_reject_removed_stolen_source(mask, blocks):
+def test_current_ready_sources_reject_unproduced_sources(mask, blocks, source):
     raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
-    raw["executions"][0]["ready_source"] = 1
-    with pytest.raises(ValueError, match="invalid source/publication mode"):
+    raw["executions"][0]["ready_source"] = source
+    with pytest.raises(ValueError, match="invalid ready source"):
         audit_native_protocol(raw, identities)
 
 
@@ -63,7 +119,7 @@ def _set_claim_seal_observation(raw, identities, *, sealed=True):
 def _resource_scoped_capture(masks=(3, 5, 3, 7, 6), clusters=2, blocks=3):
     raw, identities = ProtocolBuilder([(mask, blocks, ()) for mask in masks], clusters=clusters).run()
     _set_claim_seal_observation(raw, identities)
-    raw["schema"] = "hbg-native-protocol-v20"
+    raw["schema"] = "hbg-native-protocol"
     return raw, identities
 
 
@@ -236,7 +292,7 @@ def test_partial_sync_terminal_tickets_accept_bounded_tail(mask, blocks, tail):
 def test_current_full_sync_start_remains_ticket_free(mask):
     blocks = 4 if mask in (2, 4) else 2
     raw, identities = ProtocolBuilder([(mask, blocks, ())], sync_tasks=(0,)).run()
-    raw["schema"] = "hbg-native-protocol-v20"
+    raw["schema"] = "hbg-native-protocol"
     raw["task_controls"][0].update(claim_tickets=0)
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
     raw["task_controls"][0]["claim_tickets"] = 1
@@ -249,7 +305,7 @@ def test_current_full_sync_start_remains_ticket_free(mask):
 @pytest.mark.parametrize("tail", (False, True))
 def test_ordinary_work_has_no_sync_claim_tickets(mask, blocks, tail):
     raw, identities = ProtocolBuilder([(mask, blocks, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v20"
+    raw["schema"] = "hbg-native-protocol"
     raw["task_controls"][0]["claim_tickets"] = int(tail)
     if tail:
         with pytest.raises(ValueError, match="ticket"):
@@ -263,7 +319,7 @@ def test_current_partial_sync_start_bounds_tickets_by_eligible_positions(mask):
     blocks = 2
     positions = 8 if mask in (2, 4) else 4
     raw, identities = ProtocolBuilder([(mask, blocks, ())], clusters=4, sync_tasks=(0,)).run()
-    raw["schema"] = "hbg-native-protocol-v20"
+    raw["schema"] = "hbg-native-protocol"
     raw["task_controls"][0]["claim_tickets"] = positions
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
     for invalid in (blocks - 1, positions + 1):
@@ -277,7 +333,7 @@ def test_current_partial_sync_start_bounds_tickets_by_eligible_positions(mask):
 def test_current_small_claims_reject_invalid_raw_ticket_values(mask, fault):
     positions = 4 if mask in (2, 4) else 2
     raw, identities = ProtocolBuilder([(mask, 2, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v20"
+    raw["schema"] = "hbg-native-protocol"
     if fault == "missing":
         del raw["task_controls"][0]["claim_tickets"]
     else:
@@ -297,7 +353,7 @@ def test_current_small_claims_reject_invalid_raw_ticket_values(mask, fault):
 @pytest.mark.parametrize("counter", ("next_block", "completed_subtasks"))
 def test_current_valid_raw_tickets_do_not_excuse_wrong_valid_or_completion_counts(mask, delta, counter):
     raw, identities = ProtocolBuilder([(mask, 2, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v20"
+    raw["schema"] = "hbg-native-protocol"
     raw["task_controls"][0]["claim_tickets"] = 0
     raw["task_controls"][0][counter] += delta
     with pytest.raises(ValueError, match="terminal .*counter"):
@@ -488,7 +544,7 @@ def test_publisher_after_stamp_need_not_precede_remote_observation():
 def resequence(raw):
     streams = {worker["index"]: [] for worker in raw["workers"]}
     for record, kind, _ in _event_records(raw):
-        if kind == "actor" and record["flags"] & (1 << 30):
+        if kind == "actor" and record["flags"] & ((1 << 29) | (1 << 30)):
             continue
         for field in STAMPS[kind].split():
             if record[field][1]:
@@ -500,7 +556,14 @@ def resequence(raw):
         raw["workers"][worker]["next_sequence"] = len(stamps)
     for event in raw["task_events"]:
         done = event["completion"]
-        if done is not None and done["flags"] & (1 << 30):
+        if done is not None and done["flags"] & (1 << 29):
+            last = max(
+                (row["owner"] for row in raw["blocks"] if row["owner"]["task_ref"] == event["index"]),
+                key=lambda row: row["completion_ticket"],
+            )
+            done["before"] = last["completion_before"].copy()
+            done["after"] = last["completion_after"].copy()
+        elif done is not None and done["flags"] & (1 << 30):
             last = max(
                 (row for row in raw["executions"] if row["task_ref"] == event["index"]),
                 key=lambda row: row["contribution_ticket"],
@@ -525,21 +588,6 @@ def test_ordinary_blocks_reuse_two_slots_after_retirement():
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
 
 
-def test_direct_refill_payload_follows_previous_trace_and_task_done():
-    raw, identities = ProtocolBuilder([(1, 1, ()), (1, 1, (0,))]).run()
-    next_execution = raw["executions"][1]
-    previous_done = raw["task_events"][0]["completion"]["after"][0]
-    previous_trace = raw["executions"][0]["trace_published"][0]
-    next_execution.update(
-        ready_source=2,
-        publication_mode=1,
-        publication_before_cycles=previous_trace + 1,
-        publication_after_cycles=previous_trace + 2,
-    )
-    assert previous_done < previous_trace < next_execution["publication_before_cycles"]
-    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
-
-
 def test_cross_core_successor_can_enter_before_producer_trace_publication():
     raw, identities = ProtocolBuilder([(1, 1, ()), (2, 1, (0,))]).run()
     producer, consumer = raw["executions"]
@@ -553,7 +601,7 @@ def test_cross_core_successor_can_enter_before_producer_trace_publication():
 
 def test_synchronous_done_is_the_last_contribution_without_extra_sequence_events():
     raw, identities = ProtocolBuilder([(1, 1, ())]).run()
-    raw["schema"] = "hbg-native-protocol-v20"
+    raw["schema"] = "hbg-native-protocol"
     execution = raw["executions"][0]
     done = raw["task_events"][0]["completion"]
     assert done["flags"] & (1 << 30)
@@ -663,7 +711,7 @@ def wire_capture():
         )
     raw = capture.build()
     raw["aicore_protocol"] = protocol
-    raw["aicore_execution_identities"] = dict(schema="hbg-execution-identity-v2", producer="aicore", records=identities)
+    raw["aicore_execution_identities"] = dict(schema="hbg-execution-identity", producer="aicore", records=identities)
     return raw
 
 
@@ -672,7 +720,7 @@ def test_real_converter_preserves_native_audit_in_perfetto_metadata(tmp_path):
     path.write_text(json.dumps(wire_capture()))
     parsed = read_perf_data(path)
     assert parsed["protocol_audit"]["protocol_verified"] is True
-    assert parsed["native_protocol"]["schema"] == "hbg-native-protocol-v20"
+    assert parsed["native_protocol"]["schema"] == "hbg-native-protocol"
     trace = generate_chrome_trace_json(
         parsed["tasks"], None, runtime_name="host_build_graph", timeline_metadata=parsed["timeline_metadata"]
     )
@@ -793,7 +841,7 @@ def test_ordinary_variable_grids_have_no_admission_membership(blocks):
     builder = ProtocolBuilder(shapes, clusters=6)
     raw, identities = builder.run()
     _set_claim_seal_observation(raw, identities)
-    raw.update(schema="hbg-native-protocol-v20", close_seal_stride=64)
+    raw.update(schema="hbg-native-protocol", close_seal_stride=64)
     assert audit_native_protocol(raw, identities)["protocol_verified"]
     assert raw["cooperative_task_count"] == 0
     assert raw["admissions"] == raw["members"] == raw["blocks"] == []
@@ -808,7 +856,7 @@ def test_ordinary_variable_grids_have_no_admission_membership(blocks):
 def test_compact_admission_and_seals_accept_64_only_alignment_and_reject_bad_regions(mutation):
     raw, identities = ProtocolBuilder([(7, 2, ()), (7, 2, (0,))], clusters=2, sync_tasks=(0, 1)).run()
     _set_claim_seal_observation(raw, identities)
-    raw.update(schema="hbg-native-protocol-v20", close_seal_stride=64)
+    raw.update(schema="hbg-native-protocol", close_seal_stride=64)
     for index, row in enumerate(raw["admissions"]):
         row["record_offset"] += 64
         row["close_seals_offset"] = 8192 + 64 + index * raw["cluster_count"] * 64
@@ -830,13 +878,14 @@ def test_compact_admission_and_seals_accept_64_only_alignment_and_reject_bad_reg
         audit_native_protocol(raw, identities)
 
 
-def test_current_cooperative_capture_rejects_independent_flag():
+@pytest.mark.parametrize("flag", (2, 128))
+def test_current_cooperative_capture_rejects_independent_flag(flag):
     raw, identities = ProtocolBuilder([(1, 2, ())]).run()
     _set_claim_seal_observation(raw, identities)
-    raw.update(schema="hbg-native-protocol-v20", close_seal_stride=64)
+    raw.update(schema="hbg-native-protocol", close_seal_stride=64)
     assert audit_native_protocol(raw, identities)["protocol_verified"]
-    raw["tasks"][0]["flags"] |= 128
-    raw["task_events"][0]["completion"]["flags"] |= 128
+    raw["tasks"][0]["flags"] |= flag
+    raw["task_events"][0]["completion"]["flags"] |= flag
     with pytest.raises(ValueError, match="unknown task flags"):
         audit_native_protocol(raw, identities)
 
@@ -848,23 +897,30 @@ def _subtask_capture(shapes=((3, 2, ()), (2, 1, (0,))), *, deferred=()):
         deferred_tasks=deferred,
     ).run()
     _set_claim_seal_observation(raw, identities)
-    raw["schema"] = "hbg-native-protocol-v20"
+    raw["schema"] = "hbg-native-protocol"
     return raw, identities
 
 
 @pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
 @pytest.mark.parametrize("blocks", (1, 2, 5))
 @pytest.mark.parametrize("deferred", ((), (0,)))
-def test_current_counts_actual_subtasks_and_accepts_last_lane_done_before_mix_retirement(mask, blocks, deferred):
+def test_current_counts_actual_subtasks_and_aliases_mix_group_contribution(mask, blocks, deferred):
     raw, identities = _subtask_capture(((mask, blocks, ()), (2, 1, (0,))), deferred=deferred)
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
     assert raw["task_controls"][0]["completed_subtasks"] == blocks * mask.bit_count()
     if mask.bit_count() > 1:
-        last = max((e for e in raw["executions"] if e["task_ref"] == 0), key=lambda e: e["contribution_ticket"])
+        last = max(
+            (b["owner"] for b in raw["blocks"] if b["owner"]["task_ref"] == 0),
+            key=lambda owner: owner["completion_ticket"],
+        )
         done = raw["task_events"][0]["completion"]
         if not deferred:
             assert done["worker_index"] == last["worker_index"]
-        assert done["after"][0] < raw["blocks"][-1]["owner"]["completion_before"][0]
+            assert done["flags"] & (1 << 29)
+            assert done["before"] == last["completion_before"]
+            assert done["after"] == last["completion_after"]
+        else:
+            assert done["before"][0] > last["completion_after"][0]
 
 
 @pytest.mark.parametrize(
@@ -882,7 +938,7 @@ def test_current_counts_actual_subtasks_and_accepts_last_lane_done_before_mix_re
     ),
 )
 def test_current_rejects_broken_subtask_completion_proof(mutation):
-    raw, identities = _subtask_capture()
+    raw, identities = _subtask_capture(((1, 2, ()), (2, 1, (0,))))
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
     executions = [e for e in raw["executions"] if e["task_ref"] == 0]
     last = max(executions, key=lambda e: e["contribution_ticket"])
@@ -894,13 +950,13 @@ def test_current_rejects_broken_subtask_completion_proof(mutation):
     elif mutation == "foreign_contributor":
         last["contribution_worker"] = 0
     elif mutation == "block_count":
-        raw["task_controls"][0]["completed_subtasks"] = 2
+        raw["task_controls"][0]["completed_subtasks"] = 1
     elif mutation == "wrong_done_owner":
         done["worker_index"] = 0
     elif mutation == "done_before_last":
         last["contribution_after"], done["before"] = done["before"], last["contribution_after"]
     elif mutation == "retirement_ticket":
-        raw["blocks"][0]["owner"]["completion_ticket"] = 0
+        last["contribution_ticket"] = (1 << 64) - 1
     elif mutation == "missing_stamp":
         del last["contribution_before"]
     else:
@@ -1012,3 +1068,29 @@ def test_early_claim_timestamps_cannot_be_attached_to_later_protocol_sequences()
         owner[claim][0] = predecessor[execution][0]
     with pytest.raises(ValueError, match="backwards clock"):
         audit_native_protocol(builder.raw, builder.identities)
+
+
+def test_current_protocol_rejects_removed_refill_publication_field():
+    raw, identities = ProtocolBuilder([(1, 1, ())]).run()
+    raw["executions"][0]["publication_mode"] = 0
+    with pytest.raises(ValueError, match="unknown fields"):
+        audit_native_protocol(raw, identities)
+
+
+@pytest.mark.parametrize("fault", ("duplicate_ticket", "wrong_owner", "lane_contribution", "before_release"))
+def test_mix_group_completion_preserves_unique_credit_and_physical_retirement(fault):
+    raw, identities = ProtocolBuilder([(6, 2, ()), (2, 1, (0,))]).run()
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+    first, last = [b["owner"] for b in raw["blocks"]]
+    done = raw["task_events"][0]["completion"]
+    if fault == "duplicate_ticket":
+        last["completion_ticket"] = first["completion_ticket"]
+    elif fault == "wrong_owner":
+        done["worker_index"] += 1
+    elif fault == "lane_contribution":
+        raw["executions"][0]["contribution_worker"] = 1
+    else:
+        last["completion_before"], last["releases_observed"] = (last["releases_observed"], last["completion_before"])
+        done["before"] = last["completion_before"].copy()
+    with pytest.raises(ValueError):
+        audit_native_protocol(raw, identities)
