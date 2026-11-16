@@ -687,6 +687,70 @@ TEST(HbgOrderedScalarDetail, CompletionWriterReusesItsOwnDoneProofForDependencie
     }
 }
 
+TEST(HbgOrderedScalarDetail, TerminalSupplySealAvoidsRmwWithoutGrantingCompletion) {
+    for (const auto mask : kPureCAndV) {
+        for (const uint64_t seal : {UINT64_C(0), UINT64_C(1), UINT64_C(2)}) {
+            SCOPED_TRACE(seal);
+            OrderedFixture fixture({{2, mask, false}, {1, mask, false}});
+            fixture.dependency(1, 0);
+            ASSERT_TRUE(fixture.prepare());
+            auto *local = fixture.locals[fixture.publisher(0)];
+            fixture.control(0)->claim_seal = seal;
+            const uint64_t completion = fixture.control(0)->completion_state;
+            auto buffer = std::make_unique<SchedulerActivityBuffer>();
+            auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+            auto &trace = local->profiling->scalar;
+            trace.buffer = buffer.get();
+            trace.records = records.get();
+            trace.window_start = scheduler_cycles();
+            bool closed = false;
+            {
+                SchedulerScalarBinding binding;
+                binding.attach(&trace);
+                EXPECT_EQ(
+                    scheduler_task_supply_closed(
+                        fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &closed
+                    ),
+                    seal != 1
+                );
+            }
+            trace.finish(scheduler_cycles());
+            const auto rows = scalar_rows(trace);
+            EXPECT_EQ(
+                std::count_if(
+                    rows.begin(), rows.end(),
+                    [](const auto &row) {
+                        return static_cast<SchedPhaseKind>(row.kind & 0xffffU) == SchedPhaseKind::ScalarAtomicFetchAdd;
+                    }
+                ),
+                0
+            );
+            EXPECT_EQ(buffer->scalar_dropped, 0u);
+            trace.buffer = nullptr;
+            EXPECT_EQ(closed, seal == 2);
+            EXPECT_EQ(fixture.control(0)->completion_state, completion);
+            EXPECT_EQ(
+                scheduler_cached_task_proof(local, 0),
+                seal == 2 ? SchedulerTaskProof::SUPPLY_CLOSED : SchedulerTaskProof::NONE
+            );
+            if (seal == 1) {
+                EXPECT_NE(fixture.run()->scheduler_error, 0u);
+                continue;
+            }
+            SchedulerFaninView fanin{};
+            ASSERT_EQ(scheduler_node_fanin_view(fixture.graph.graph(), 1, &fanin), SchedulerGraphResult::OK);
+            uint32_t prefix = 0;
+            bool ready = false;
+            ASSERT_TRUE(scheduler_observe_fanin_prefix(
+                fixture.graph.graph(), fixture.base(), local, fixture.run(), 1, fanin, prefix, &ready
+            ));
+            EXPECT_FALSE(ready);
+            EXPECT_EQ(prefix, 0u);
+            EXPECT_EQ(fixture.run()->scheduler_error, 0u);
+        }
+    }
+}
+
 TEST(HbgOrderedScalarDetail, ClaimCursorDetailPreservesSealAndFallbackPaths) {
     for (const auto &[seal, next, valid, used_seal] :
          {std::tuple<uint64_t, uint64_t, bool, bool>{0, 1, true, false}, {2, 2, true, true}, {2, 1, false, false}}) {

@@ -113,6 +113,7 @@ Newest first.
 - [2026-11 — A5 HBG Publish ordinary supply after Claim, before payload receipt](2026-11-a5-hbg-task-state/supply-before-receipt.md)
 - [2026-11 — A5 HBG Confirm async FINISH with the canonical CAS](2026-11-a5-hbg-task-state/async-finish-cas.md)
 - [2026-11 — A5 HBG Reuse the completion writer's own DONE proof](2026-11-a5-hbg-task-state/completion-writer-proof.md)
+- [2026-11 — A5 HBG terminal supply-seal observation](../zh-cn/investigations/2026-11-a5-hbg-supply-seal-observation.md) — remove redundant FAA(0) after #3116; the twelve-case L0 mean sum decreases 1.24% in one paired batch.
 - [2026-11 — A5 HBG Fold single-consumer ordinary control nodes](2026-11-a5-hbg-task-state/ordinary-control-folding.md)
 - [2026-11 — A5 HBG synchronous completion](2026-11-a5-hbg-synchronous-completion.md) — select synchronous CSR by default; remove resumable completion and redundant per-task admission ownership, while retaining global commit ordering and recording the unmet full-completion target.
 

@@ -63,8 +63,9 @@ static inline __aicore__ bool scheduler_task_supply_closed(
         return true;
     }
     if (executable) {
-        const uint64_t seal =
-            scheduler_gm_query(control->claim_seal) == 0 ? 0 : scheduler_gm_fetch_add(control->claim_seal, UINT64_C(0));
+        // The final owner publishes this task's seal once, from zero to blocks.
+        // A reliable terminal snapshot closes supply, never execution fanin.
+        const uint64_t seal = scheduler_gm_query(control->claim_seal);
         if (seal != 0 && seal != blocks) return scheduler_issue_fail(graph, local, run, ref);
         if (seal == blocks) {
             scheduler_remember_task_proof(local, ref, SchedulerTaskProof::SUPPLY_CLOSED);
@@ -183,8 +184,8 @@ static inline __aicore__ bool scheduler_query_issue_head(
     if (!scheduler_task_catalog_valid(catalog))
         return scheduler_issue_fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
     if (catalog.count == 0) return true;
-    // The private cursor only crosses atomically confirmed supply seals or
-    // canonical terminal states. Every earlier catalog entry is closed.
+    // The private cursor only crosses confirmed terminal supply seals or
+    // canonical DONE states. Every earlier catalog entry is closed.
     uint64_t head = local->issue_cursor;
     if (head > catalog.count) return scheduler_issue_fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
     if (head == catalog.count) return true;
