@@ -641,6 +641,7 @@ struct alignas(64) SchedulerWorkerContext {
     uint64_t activity_buffers_offset;
     uint64_t pmu_cells_offset;
     uint64_t args_dump_address;
+    uint64_t done_notifications_offset;
 
     // Only this worker writes its bootstrap diagnostic line.
     alignas(64) uint64_t bootstrap_task_count;
@@ -973,6 +974,7 @@ inline bool scheduler_plan_layout(
         ) ||
         !SCHEDULER_RESERVE_ARRAY(SCHEDULER_WORKER_CAPACITY, SchedulerWorkerContext, worker_contexts_offset) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskMetadata, task_metadata_offset) ||
+        !SCHEDULER_RESERVE_ARRAY(task_count, uint64_t, done_notifications_offset) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskControl, task_controls_offset) ||
         !scheduler_layout_reserve(
             &cursor, sizeof(SchedulerGraphSummary), alignof(SchedulerGraphSummary), &next.graph_summary_offset

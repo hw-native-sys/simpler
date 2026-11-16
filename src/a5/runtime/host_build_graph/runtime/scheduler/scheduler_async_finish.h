@@ -56,6 +56,7 @@ static inline __aicore__ bool scheduler_async_complete_task(
         return failed();
     scheduler_protocol_task_done(base, local, task_ref, false, true);
     scheduler_cache_barrier();
+    scheduler_publish_task_done(base, local, task_ref);
     scheduler_remember_task_proof(local, task_ref, SchedulerTaskProof::DONE);
     ++local->pending_completed;
     return true;

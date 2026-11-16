@@ -134,6 +134,7 @@ static inline __aicore__ SchedulerSubtaskFinishResult scheduler_contribute_subta
         return result;
     }
     if (result != SchedulerSubtaskFinishResult::TASK_LAST) return result;
+    scheduler_publish_task_done(base, local, completed.task_ref);
     if constexpr (RecordProtocol)
         scheduler_protocol_task_done_from_contribution(base, local, completed, pending_slot, previous);
     return SchedulerSubtaskFinishResult::TASK_LAST;

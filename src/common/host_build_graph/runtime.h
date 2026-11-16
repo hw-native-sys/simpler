@@ -523,6 +523,7 @@ private:
             uint64_t tensor_elems;
             uint64_t scalar_elems;
             std::vector<MetadataRegion> prerequisites;
+            std::vector<std::shared_ptr<const void>> resources;
         };
         RunImagePublication pending_publication_;
         std::shared_ptr<const RunImagePublication> prepared_publication_;
@@ -591,6 +592,9 @@ public:
         host_.pending_publication_.prerequisites.push_back(
             {target, source, bytes, phase, std::move(attributes), std::move(storage)}
         );
+    }
+    void retain_pending_resource(std::shared_ptr<const void> resource) {
+        host_.pending_publication_.resources.push_back(std::move(resource));
     }
     using RunImagePublication = HostOnlyState::RunImagePublication;
     void restore_pending_publication(RunImagePublication publication) {

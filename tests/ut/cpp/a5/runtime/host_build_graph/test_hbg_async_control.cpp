@@ -1252,16 +1252,21 @@ TEST(HbgAsyncControl, OrdersFinalContributionBeforeClosureSnapshots) {
 
 TEST(HbgAsyncControl, JoinRmwOwnerCannotCompleteTwice) {
     AsyncFixture f(1);
+    uint32_t notification = 0;
+    scheduler_state_at<uint64_t>(f.base(), f.storage.layout.done_notifications_offset)[0] =
+        reinterpret_cast<uint64_t>(&notification);
     f.register_counter(f.start(), 0);
     ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
     ASSERT_TRUE(f.check(1));
     ASSERT_TRUE(f.return_remaining(0, f.local(2)));
     const auto completion = scheduler_async_close_computation(&f.workers[2], 0);
     ASSERT_EQ(completion.result, SchedulerAsyncCompletionResult::FINISH_OWNER);
+    EXPECT_EQ(notification, 0u);
     ASSERT_TRUE(
         scheduler_async_complete_task(f.graph.graph(), f.base(), f.local(2), f.storage.run_control, completion)
     );
     EXPECT_TRUE(f.done());
+    EXPECT_EQ(notification, 1u);
     EXPECT_EQ(scheduler_cached_task_proof(f.local(2), 0), SchedulerTaskProof::DONE);
     EXPECT_EQ(f.local(2)->pending_completed, 1u);
     EXPECT_FALSE(

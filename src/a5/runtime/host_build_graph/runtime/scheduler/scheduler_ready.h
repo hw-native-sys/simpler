@@ -23,9 +23,14 @@
 
 enum class SchedulerCompletionObservation : uint8_t { PENDING, DONE, INVALID };
 
+struct SchedulerCompletionSource {
+    __gm__ SchedulerTaskControl *control{nullptr};
+    __gm__ volatile uint32_t *notification{nullptr};
+};
+
 // Static edge identity survives repeated polls; completion never does.
 struct SchedulerFaninWait {
-    __gm__ SchedulerTaskControl *control{nullptr};
+    SchedulerCompletionSource source{};
     int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
     int64_t predecessor{SCHEDULER_TASK_REF_INVALID};
     uint32_t index{0};
@@ -34,8 +39,14 @@ struct SchedulerFaninWait {
 // The completion word has one task identity per run, and DONE is terminal.
 // A reliable bypass snapshot establishes completion without changing ownership.
 static inline __aicore__ SchedulerCompletionObservation
-scheduler_observe_task_completion(__gm__ SchedulerTaskControl *control) {
-    const uint64_t state = scheduler_gm_query(control->completion_state);
+scheduler_observe_task_completion(const SchedulerCompletionSource &source) {
+    if (source.notification != nullptr) {
+        const uint32_t state = scheduler_notify_query(*source.notification);
+        return state == 1 ? SchedulerCompletionObservation::DONE :
+               state == 0 ? SchedulerCompletionObservation::PENDING :
+                            SchedulerCompletionObservation::INVALID;
+    }
+    const uint64_t state = scheduler_gm_query(source.control->completion_state);
     if (!scheduler_completion_valid(state)) return SchedulerCompletionObservation::INVALID;
     return scheduler_completion_done(state) ? SchedulerCompletionObservation::DONE :
                                               SchedulerCompletionObservation::PENDING;
@@ -154,6 +165,7 @@ struct SchedulerLocalConfig {
     __gm__ const SchedulerWorkerContext *shared_context{nullptr};
     const SchedulerGraphView *graph{nullptr};
     uint64_t task_controls_offset{0};
+    uint64_t done_notifications_offset{0};
     uint64_t task_catalog_offset{0};
     uint64_t graph_summary_offset{0};
     // This run's per-subtask PMU staging array. Here rather than in the
@@ -301,7 +313,7 @@ static_assert(PLATFORM_CORES_PER_BLOCKDIM <= 8, "worker trace mask must fit one 
 static_assert(SCHEDULER_PENDING_SLOT_COUNT == 2, "local ready head requires two slots");
 static_assert(alignof(SchedulerLocalSlotState) == alignof(uint64_t));
 static_assert(alignof(SchedulerLocalState) == alignof(uint64_t));
-static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 80, "64-bit local config size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 88, "64-bit local config size changed");
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalSlotState) == 48, "64-bit local slot size changed");
 static_assert(
     sizeof(void *) != 8 || sizeof(SchedulerLocalProfilingState) == 88 + sizeof(SchedulerScalarTrace),
@@ -349,6 +361,7 @@ static inline __aicore__ bool scheduler_initialize_local_config(
     config.shared_context = context;
     config.graph = graph;
     config.task_controls_offset = context->task_controls_offset;
+    config.done_notifications_offset = context->done_notifications_offset;
     config.task_metadata_offset = static_cast<uint32_t>(context->task_metadata_offset);
     config.pmu_cells_offset = context->pmu_cells_offset;
     if (local->profiling != nullptr) {
@@ -547,19 +560,44 @@ scheduler_remember_task_proof(SchedulerLocalState *local, int64_t task_ref, Sche
     if (entry >> 2 != tag || (entry & UINT64_C(3)) < level) entry = (tag << 2) | level;
 }
 
+static inline __aicore__ __gm__ volatile uint32_t *
+scheduler_done_notification_at(__gm__ void *base, const SchedulerLocalState *local, int64_t task_ref) {
+    if (local->config.done_notifications_offset == 0) return nullptr;
+    const uint64_t address = scheduler_state_at<uint64_t>(base, local->config.done_notifications_offset)[task_ref];
+    return reinterpret_cast<__gm__ volatile uint32_t *>(address);
+}
+
+static inline __aicore__ SchedulerCompletionSource
+scheduler_completion_source(__gm__ void *base, const SchedulerLocalState *local, int64_t task_ref) {
+    return {scheduler_task_control_at(base, local, task_ref), scheduler_done_notification_at(base, local, task_ref)};
+}
+
+// Only a canonical logical-DONE owner publishes. The notification has no
+// claim or completion-count authority and is never consumed by a reader.
+static inline __aicore__ void
+scheduler_publish_task_done(__gm__ void *base, const SchedulerLocalState *local, int64_t task_ref) {
+    auto *notification = scheduler_done_notification_at(base, local, task_ref);
+    if (notification != nullptr) scheduler_notify_done(*notification);
+}
+
 static inline __aicore__ SchedulerCompletionObservation scheduler_observe_cached_completion(
-    __gm__ void *base, SchedulerLocalState *local, int64_t task_ref, __gm__ SchedulerTaskControl *control = nullptr
+    SchedulerLocalState *local, int64_t task_ref, const SchedulerCompletionSource &source
 ) {
     if (scheduler_cached_task_proof(local, task_ref) == SchedulerTaskProof::DONE)
         return SchedulerCompletionObservation::DONE;
-    const auto observed = scheduler_observe_task_completion(
-        control != nullptr ? control : scheduler_task_control_at(base, local, task_ref)
-    );
+    const auto observed = scheduler_observe_task_completion(source);
     // DONE is irreversible within this immutable run image, including async debt.
     // Supply closure never grants DONE. Collisions forget proofs; errors grant none.
     if (observed == SchedulerCompletionObservation::DONE)
         scheduler_remember_task_proof(local, task_ref, SchedulerTaskProof::DONE);
     return observed;
+}
+
+static inline __aicore__ SchedulerCompletionObservation
+scheduler_observe_cached_completion(__gm__ void *base, SchedulerLocalState *local, int64_t task_ref) {
+    if (scheduler_cached_task_proof(local, task_ref) == SchedulerTaskProof::DONE)
+        return SchedulerCompletionObservation::DONE;
+    return scheduler_observe_cached_completion(local, task_ref, scheduler_completion_source(base, local, task_ref));
 }
 
 inline __aicore__ __gm__ SchedulerWorkerContext *
@@ -789,10 +827,10 @@ static inline __aicore__ bool scheduler_observe_fanin_prefix(
     *ready = false;
     while (next_fanin < fanin.count) {
         int64_t predecessor = SCHEDULER_TASK_REF_INVALID;
-        __gm__ SchedulerTaskControl *control = nullptr;
+        SchedulerCompletionSource source{};
         if (wait != nullptr && wait->task_ref == task_ref && wait->index == next_fanin) {
             predecessor = wait->predecessor;
-            control = wait->control;
+            source = wait->source;
         } else {
             const auto status = scheduler_fanin_ref(fanin, task_ref, next_fanin, &predecessor);
             if (status != SchedulerGraphResult::OK) {
@@ -801,10 +839,10 @@ static inline __aicore__ bool scheduler_observe_fanin_prefix(
             }
             const auto &metadata = *scheduler_task_metadata_at(base, local, predecessor);
             if (!scheduler_predecessor_is_host_done(graph, predecessor, metadata))
-                control = scheduler_task_control_at(base, local, predecessor);
+                source = scheduler_completion_source(base, local, predecessor);
         }
-        if (control != nullptr) {
-            const auto observed = scheduler_observe_cached_completion(base, local, predecessor, control);
+        if (source.control != nullptr) {
+            const auto observed = scheduler_observe_cached_completion(local, predecessor, source);
             if (observed == SchedulerCompletionObservation::INVALID) {
                 scheduler_record_error(
                     run, predecessor, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local,
@@ -814,7 +852,7 @@ static inline __aicore__ bool scheduler_observe_fanin_prefix(
             }
             if (observed != SchedulerCompletionObservation::DONE) {
                 if (wait != nullptr && (wait->task_ref != task_ref || wait->index != next_fanin))
-                    *wait = {control, task_ref, predecessor, next_fanin};
+                    *wait = {source, task_ref, predecessor, next_fanin};
                 return true;
             }
         }

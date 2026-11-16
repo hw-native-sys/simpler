@@ -54,6 +54,7 @@ uint32_t original_task_count。GraphView、native header、task catalog 和 prep
 | ---- | ---- | ------------ |
 | SchedulerTaskMetadata | 16 B | Host 只读形状、kernel、block 和 trace prefix |
 | SchedulerTaskControl | 640 B | 五个独立 128 B 原子区域：claim_tickets、next_block、completion_state、admission_state、claim_seal |
+| DONE 地址表 | 8 B/node | Host 不可变映射；非零为 CntNotify 32-bit SET/read 地址，零为 GM 回退 |
 | SchedulerWorkerContext | 320 B | 前四个 64 B 行由 READY 发布；最后一行归本核诊断 |
 | SchedulerRunControl | 7296 B | 384 B 配置/生命周期/首错前缀及 108 个独占行的 worker 错误信号 |
 | SchedulerGraphSummary | 128 B | 本轮只读拓扑和各子区 offset |
@@ -78,7 +79,8 @@ completion_state 编码 total/remaining_compute/debt；具体有效性和 DONE �
 WorkerContext 首行是 core_type/physical_core_id/type_rank、run_control/task_controls/state base/
 prepared layout、worker_index/worker_contexts_offset；第二行保存完整 graph view 和 summary offset。
 metadata offset 位于 120，runtime_worker_count 位于 128，cluster 信息从 136 开始。
-trace/activity/PMU offsets 分别位于 184/192/200，args_dump_address 位于 208。
+trace/activity/PMU offsets 分别位于 184/192/200，args_dump_address 位于 208，done_notifications_offset 位于 216。
+核内 SchedulerLocalConfig 为 88 B；每份 SchedulerFaninWait 保存 canonical control 与通知地址，共 40 B。
 最后一行从 256 开始，保存 bootstrap 统计。
 所有核都自行调度，结构中没有另一个 scheduler 角色、索引或数量。
 metadata offset 由 WorkerContext 携带；RunControl 不保存第二份副本。

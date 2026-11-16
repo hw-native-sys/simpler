@@ -70,6 +70,57 @@ struct DispatchFixture {
     SchedulerTaskControl *control(uint32_t task) { return scheduler_task_control_at(base(), local(), task); }
 };
 
+TEST(SchedulerTokenDispatch, CntNotifyCompletionReleasesAllReadersWithoutConsumingTheSignal) {
+    DispatchFixture f(2);
+    f.graph.executable(1, 0, {0});
+    ASSERT_TRUE(f.prepare());
+    uint32_t notification = 0;
+    auto *addresses = scheduler_state_at<uint64_t>(f.base(), f.storage.layout.done_notifications_offset);
+    addresses[0] = reinterpret_cast<uint64_t>(&notification);
+    const auto source = scheduler_completion_source(f.base(), f.local(), 0);
+    ASSERT_EQ(scheduler_observe_task_completion(source), SchedulerCompletionObservation::PENDING);
+    uint32_t slot = UINT32_MAX;
+    ASSERT_TRUE(f.take(slot));
+    ASSERT_EQ(f.local()->slots[slot].task_ref, 0);
+    ASSERT_TRUE(f.complete(slot));
+    ASSERT_EQ(notification, 1u);
+    EXPECT_EQ(scheduler_observe_task_completion(source), SchedulerCompletionObservation::DONE);
+    EXPECT_EQ(scheduler_observe_task_completion(source), SchedulerCompletionObservation::DONE);
+    EXPECT_EQ(notification, 1u);
+    ASSERT_TRUE(f.take(slot));
+    EXPECT_EQ(f.local()->slots[slot].task_ref, 1);
+}
+
+TEST(SchedulerTokenDispatch, CntNotifyWaitKeepsItsAddressAndDoesNotConfirmCanonicalGmState) {
+    DispatchFixture f(2);
+    f.graph.executable(1, 0, {0});
+    ASSERT_TRUE(f.prepare());
+    uint32_t notification = 0;
+    auto *addresses = scheduler_state_at<uint64_t>(f.base(), f.storage.layout.done_notifications_offset);
+    addresses[0] = reinterpret_cast<uint64_t>(&notification);
+    SchedulerFaninView fanin{};
+    ASSERT_EQ(scheduler_node_fanin_view(f.graph.graph(), 1, &fanin), SchedulerGraphResult::OK);
+    SchedulerFaninWait wait{};
+    uint32_t next = 0;
+    bool ready = false;
+    ASSERT_TRUE(scheduler_observe_fanin_prefix(
+        f.graph.graph(), f.base(), f.local(), f.storage.run_control, 1, fanin, next, &ready, &wait
+    ));
+    EXPECT_FALSE(ready);
+    EXPECT_EQ(wait.source.notification, &notification);
+    // Poison unrelated proof storage after binding: the saved SRAM source
+    // alone authorizes this wait, and the address table is not read twice.
+    addresses[0] = 0;
+    f.control(0)->completion_state = 0;
+    scheduler_notify_done(notification);
+    ASSERT_TRUE(scheduler_observe_fanin_prefix(
+        f.graph.graph(), f.base(), f.local(), f.storage.run_control, 1, fanin, next, &ready, &wait
+    ));
+    EXPECT_TRUE(ready);
+    EXPECT_EQ(next, 1u);
+    EXPECT_EQ(f.storage.run_control->scheduler_error, 0u);
+}
+
 TEST(SchedulerTokenDispatch, FreshReadyRefillSelectsOneExecutionWithoutAnotherScan) {
     DispatchFixture f;
     ASSERT_TRUE(f.prepare());

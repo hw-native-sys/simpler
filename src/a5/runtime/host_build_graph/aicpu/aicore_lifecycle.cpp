@@ -195,6 +195,20 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
 
     auto *run_control = aicore_scheduler_run_control(bootstrap_context);
     if (scheduler_state_base == nullptr || run_control == nullptr) return -1;
+    // No AICore can observe READY yet. Replay resets the same owned registers
+    // before any publisher or waiter from this invocation can access them.
+    if (bootstrap_context->done_notifications_offset != 0) {
+        const auto *addresses =
+            scheduler_state_at<uint64_t>(scheduler_state_base, bootstrap_context->done_notifications_offset);
+        const auto *controls =
+            scheduler_state_at<SchedulerTaskControl>(scheduler_state_base, bootstrap_context->task_controls_offset);
+        for (uint64_t task = 0; task < bootstrap_context->graph_task_count; ++task) {
+            if (addresses[task] != 0)
+                *reinterpret_cast<volatile uint32_t *>(addresses[task]) =
+                    scheduler_completion_done(controls[task].completion_state) ? 1U : 0U;
+        }
+        wmb();
+    }
     if (!initialize_resident_args_dump_outputs(
             reinterpret_cast<void *>(bootstrap_context->args_dump_address), runtime->dev.callable_table_addr_,
             runtime->dev.callable_table_len_

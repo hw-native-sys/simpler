@@ -183,6 +183,7 @@ struct FixtureStorage {
                 static_cast<int32_t>(worker % PLATFORM_CORES_PER_BLOCKDIM == 0 ? CoreType::AIC : CoreType::AIV);
             context.task_controls_offset = layout.task_controls_offset;
             context.task_metadata_offset = layout.task_metadata_offset;
+            context.done_notifications_offset = layout.done_notifications_offset;
 
             context.trace_cells_offset = layout.trace_cells_offset;
             context.worker_contexts_offset = layout.worker_contexts_offset;
@@ -328,6 +329,7 @@ struct FixtureStorage {
         config.graph = &graph;
         config.task_controls_offset = context->task_controls_offset;
         config.task_metadata_offset = context->task_metadata_offset;
+        config.done_notifications_offset = context->done_notifications_offset;
         config.task_catalog_offset = task_catalog_offset;
         local->profiling->trace_cells_offset = context->trace_cells_offset;
         local->profiling->activity_buffers_offset = context->activity_buffers_offset;

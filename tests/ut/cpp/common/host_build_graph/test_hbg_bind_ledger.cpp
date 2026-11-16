@@ -989,6 +989,24 @@ TEST_F(HbgBindLedgerTest, PreparingTheRunImageDoesNotPublishIt) {
     EXPECT_EQ(initial->bytes, bytes);
 }
 
+TEST_F(HbgBindLedgerTest, CapturedPublicationKeepsNotificationResourcesAfterBindingsRelease) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto resource = std::make_shared<uint32_t>(0);
+    std::weak_ptr<uint32_t> lifetime = resource;
+    runtime.retain_pending_resource(resource);
+    resource.reset();
+    runtime.retain_prepared_publication(runtime.take_pending_publication());
+    auto captured = runtime.prepared_publication();
+    ASSERT_NE(captured, nullptr);
+    ASSERT_EQ(captured->resources.size(), 1u);
+    runtime.clear_pending_publication();
+    runtime.clear_prepared_publication();
+    EXPECT_FALSE(lifetime.expired());
+    captured.reset();
+    EXPECT_TRUE(lifetime.expired());
+}
+
 // Preparation and metadata staging share one trace. The staging segment names
 // the host work even on a synchronous fallback backend; it is not a device
 // upload anchor. The actual launch-owned enqueue is outside the bind interval.

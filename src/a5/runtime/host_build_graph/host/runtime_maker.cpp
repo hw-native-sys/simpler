@@ -34,6 +34,8 @@
  *     outlives the run and is freed once at Worker finalization.
  */
 
+#include "host/scheduler_done_notifications.h"
+
 #include <dlfcn.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -1777,6 +1779,16 @@ bool create_scheduler_state(
         return false;
     }
 
+    SchedulerDoneNotifications notifications;
+    try {
+        notifications = create_scheduler_done_notifications(static_cast<size_t>(node_count));
+    } catch (const std::exception &error) {
+        LOG_ERROR("A5 HBG: cannot prepare DONE notifications: %s", error.what());
+        return false;
+    }
+    auto *notification_addresses = scheduler_state_at<uint64_t>(host_base, layout.done_notifications_offset);
+    std::copy(notifications.addresses.begin(), notifications.addresses.end(), notification_addresses);
+
     if (layout.async_layout_offset != 0 && !initialize_async_completion(host_base, layout.total_size, async_plan)) {
         LOG_ERROR("A5 HBG: failed to initialize async completion storage");
         return false;
@@ -1917,6 +1929,7 @@ bool create_scheduler_state(
         context.run_control_offset = layout.run_control_offset;
         context.task_controls_offset = layout.task_controls_offset;
         context.task_metadata_offset = layout.task_metadata_offset;
+        context.done_notifications_offset = layout.done_notifications_offset;
         context.aicpu_lifecycle_traces_offset = layout.aicpu_lifecycle_traces_offset;
         context.worker_contexts_offset = layout.worker_contexts_offset;
         context.runtime_worker_count = static_cast<uint64_t>(runtime->get_worker_count());
@@ -1952,6 +1965,7 @@ bool create_scheduler_state(
         reinterpret_cast<void *>(aligned_address), host_base, static_cast<size_t>(initialized_bytes),
         HostPhaseKind::Count, {}
     );
+    if (notifications.owner != nullptr) runtime->retain_pending_resource(std::move(notifications.owner));
     LOG_INFO("A5 HBG: selected AICore Scheduler for %d tasks", total_tasks);
     return true;
 }

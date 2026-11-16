@@ -74,6 +74,7 @@ static inline __aicore__ bool scheduler_contribute_mix_group(
         return false;
     }
     if (result == SchedulerSubtaskFinishResult::TASK_LAST) {
+        scheduler_publish_task_done(base, local, task_ref);
         scheduler_remember_task_proof(local, task_ref, SchedulerTaskProof::DONE);
         ++local->pending_completed;
         if (owner != nullptr) {

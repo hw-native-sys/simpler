@@ -23,7 +23,7 @@
 | ---- | -------- | ---------------- |
 | 1 | `ld_dev/st_dev` 绕过 Scalar DCache、进入 L2 cache；atomic 不进入 cache，走 HBM 原子路径，单次并发增加 100 ns+ 量级开销 | Wait 用可靠 `ld_dev` 观察；单写者通知可用 `st_dev`；不能用 FAA(0)给同一读值再做一次确认。atomic 留给真正需要的竞争裁定与多写者合并 |
 | 2 | SoC 总线对 `ld/st_dev` 和 atomic 均不保序 | 同核操作间有时序依赖，就在相应依赖边界显式加 DSB；成功 CAS/FAA、源码先后和 C++ `memory_order` 名字都不能代替硬件屏障 |
-| 3 | STARS 有 event/notify SRAM 资源，不受 GM 同址读写的并发串行瓶颈限制 | 将 STARS 作为后续 Wait 的优先目标后端；它解决条件通知与观察，不自动授予 task 的唯一执行权 |
+| 3 | STARS 有 event/notify SRAM 资源，不受 GM 同址读写的并发串行瓶颈限制 | 逻辑 DONE 已采用 CntNotify SET/load；其他 Wait 后端按资源合同推进，它不自动授予 task 的唯一执行权 |
 | 4 | A5 上基于 GM 的同地址读取、写入都有并发串行代价 | 既要减少同址 atomic，也要控制同址 `ld_dev/st_dev` 的扇入和请求密度；不能把 atomic 改成多核无限紧轮询后就宣称争用消失 |
 | 5 | 动态领取 task 仍须由 atomic claim 裁定；对保留下来的竞争性 claim，分地址 atomic 是消除同址争用的方案 | 优先降低同地址 atomic 并发，再减少总次数。独立竞争单元按 **128B L2 侧隔离粒度**布局，不能仅相隔 64B DCache 行；不改成固定核预分配或非原子的读后写抢票 |
 | 6 | STARS SRAM 并发排队约四拍，可近似忽略，但入口带宽有限 | STARS 等待循环须以 `nop` 限制空轮询请求速率，避免无限紧循环耗尽入口；同时保留有界控制服务和实际唤醒延迟观测 |
@@ -35,13 +35,13 @@
 
 - **Build：尽可能并发、尽可能提前。** owner 无关的地址、参数与静态校验提前完成，owner 相关准备在归属确定后推进；批量数据写入和缓存维护在其发布边界完成 DSB，再发布可观察通知。不可变 Call 的准备不包含尚未生成的业务 Tensor 数据。
 - **领取：atomic 只裁定一次必要的唯一责任。** 同一有效票已授予的普通执行权不再二次 CAS；仍须竞争的 claim 按 task/独立票区间分地址并以 128B 隔离。STARS event、可靠 `ld_dev` 和目录 hint 都不能取代该 atomic 裁决。
-- **Wait：观察已定位条件，不重新 Build 或 Claim。** GM 路径用 `ld_dev`，单写者通知根据协议用 `st_dev`；观察值携带 task/epoch/sequence 身份传给下层复用。满足条件后按消费者获取合同执行 DSB 与必要缓存观察，最终 admission/MIX/sync_start/退出许可仍独立检查。后续把条件通知映射到 STARS，原有语义不变。
+- **Wait：观察已定位条件，不重新 Build 或 Claim。** GM 路径用 `ld_dev`，单写者通知根据协议用 `st_dev`；观察值携带 task/epoch/sequence 身份传给下层复用。满足条件后按消费者获取合同执行 DSB 与必要缓存观察，最终 admission/MIX/sync_start/退出许可仍独立检查。逻辑 DONE 已映射到 CntNotify SRAM，其他条件通知继续按各自协议处理。
 
 DSB 只针对同核前后操作的实际顺序依赖；跨核通知本身不要求发送后追加 DSB，也不等待接收方何时看到。单写者也不自动等于可以用 st_dev：需要 RMW、原子交权或不可分割联合状态发布的字段仍保留 atomic。DSB 不是跨核会合，也不使另一个核的 DCache 自动更新。发布数据→发布状态、读到状态→使用数据、依赖前次返回值的后续 atomic，都须写清排序边界；可以合并同一批无相互依赖操作后的屏障，不能把它移到已有中途消费者的最后一次运行结束。普通 cached 数据与 atomic-only 控制区继续隔离，避免 DCCI 把旧脏数据覆盖到控制字。
 
 ### STARS 与 SPR 的演进边界
 
-当前 HBG 的通用 Wait 仍基于 GM 条件、canonical completion 及既有 SSBUF 协作信号，尚未以 STARS SRAM 承载通用 task event。STARS 接入需绑定已有 task/epoch/sequence，明确 event 申请、初始化、先通知后等待的处理、完成后清理、复用及异常清退；不能漏通知、把上一轮通知认作本轮完成，或在旧观察者仍访问时复用资源。通知与 payload 可见性仍按各后端合同排序，SRAM 低排队代价不免除这些责任。
+当前逻辑 DONE 使用每节点独占的 CntNotify SRAM，资源不足的节点及其他 GM 条件保留原观察路径；MIX 协作仍使用既有 SSBUF 信号。CntNotify 随运行镜像持有并在每次 READY 之前复位；其他 STARS 接入仍需绑定已有 task/epoch/sequence，明确 event 申请、初始化、先通知后等待的处理、完成后清理、复用及异常清退；不能漏通知、把上一轮通知认作本轮完成，或在旧观察者仍访问时复用资源。通知与 payload 可见性仍按各后端合同排序，SRAM 低排队代价不免除这些责任。
 
 STARS 的 `nop` 是入口限流，不是让有工作可做的 Scalar 无条件停顿：空轮询受控，已有可执行任务、合法 Build、defer_wait 服务和 EXIT 检查继续获得进展。具体间隔由入口请求率与发现延迟决定，不预置模型专用常数。SPR 在具备上述资源管理机制以前不作为该方案的替代品；A3 上的寄存器可达性实验也不能直接作为 A5 映射可用性的证明。
 
@@ -52,7 +52,7 @@ STARS 的 `nop` 是入口限流，不是让有工作可做的 Scalar 无条件�
 | 地址隔离与动态领取 | `SchedulerTaskControl` 各控制字、`SchedulerPreparedControl` 已按 128B 隔离；普通有效 FAA 票直接授予 owner | 同一 SPMD 的 `next_block` 仍是共享地址；跨 task 已分散不等于宽 SPMD 内已无争用。分地址 claim 是后续方案，不能写成已实现 |
 | 观察与发布 | fanin 使用可靠 `ld_dev`；claim_seal/admission_state 使用无隐式 DSB 的 st_dev，日志/尾及错误信号保留既有发布屏障 | 继续按字段删除重复读与纯读取 FAA(0)，评估单写者通知；多写者计数与 CAS 仍保留 RMW |
 | 同核顺序 | 现有 payload、Binding 和完成发布有显式屏障 | 逐条核对状态→数据、数据→通知、claim→后续依赖操作；不能以某 helper 使用 atomic 或形参带 `memory_order` 宣称整条协议已保序。本次未完成全量屏障充分性证明 |
-| 等待争用 | 私有 fanin 前缀、地址绑定、MIX 观察值复用与有界服务已减少部分查询 | 多消费者仍可集中观察同一前驱；当前没有 STARS 通用 Wait，也没有可通用分配/释放的 SPR event 池 |
+| 等待争用 | 私有 fanin 前缀、地址绑定、MIX 观察值复用与有界服务已减少部分查询 | 逻辑 DONE 已迁移到 CntNotify；其他共享条件及 GM 回退仍可能同址争用，尚无通用 SPR event 池 |
 
 ## 1. 目标执行循环与当前差距
 
@@ -64,7 +64,7 @@ STARS 的 `nop` 是入口限流，不是让有工作可做的 Scalar 无条件�
 | ---- | ------------ | ------------------ |
 | Build：并发、提前 | 将地址解析、参数组织、metadata、固定 context、所需接收及发布，放到各自最早合法时机；owner 无关部分由 Host 或合法准备者提前完成，owner 相关部分在固定归属后、依赖等待期间完成 | 准备结果真正早于前驱完成的覆盖率、还留在启动入口的工作、准备但未使用的包、Host/H2D/GM/本核存储成本 |
 | 领取：慎用 atomic | 动态唯一 owner 由 atomic claim 裁定；必要 claim 按 128B 分地址降低同址竞争，多写者合并保留 RMW，普通有效 FAA 票已经授予的责任不再竞争第二次 | 同地址并发请求优先于总次数；有效票、超额票/退款、协作准入、完成贡献分别计数；提前固定 owner 可能造成的等待 |
-| Wait：已定位条件的轻量观察 | 当前用可靠 ld_dev/既有 SSBUF，单写者通知可用 st_dev；复用正向证明，不重做静态 Build 或 FAA(0)确认。后续优先接入带 nop 限流的 STARS event/notify | 失败轮询次数和请求密度、条件满足后的发现延迟、发布者进展，以及夹在等待循环中的必要控制工作 |
+| Wait：已定位条件的轻量观察 | DONE 使用 CntNotify st_dev.b32/ld_dev.b32，GM 回退与其他条件保留各自协议；复用正向证明，不重做静态 Build 或 FAA(0)确认。每次未就绪返回推进循环，不新增空转循环 | 失败轮询次数和请求密度、条件满足后的发现延迟、发布者进展，以及夹在等待循环中的必要控制工作 |
 
 三者可以交错，不能强制排成三个互不重叠的流水段：
 
@@ -83,7 +83,7 @@ Device：有序供给 → 唯一票/成员责任 → 本核接收与固定准备
 
 固定 owner 不允许转移，但准备时机和领取时机仍是两个独立选择。四 token 是有界容量，不是“越早占满越好”的证明。若已领取 B 的核正在执行较长的独立 A，B 可能在依赖满足后继续等该 owner；这项延迟必须保留在结果里，不能只统计 Claim 指令或 Wait 函数。现有有序供给、四槽和单核同 SPMD 一份未退休责任仍是约束；调整领取时机属于后续独立候选，不隐式改变这些规则。
 
-Wait 中“地址已知”也不等于所有 task 共享一个全局地址：当前每个前驱有 canonical completion，多个消费者才会竞争读取同一前驱。可靠读取不代表免费并行；更短的单轮检查可能增加单位时间的请求量。负向观察不能作为永久证明，降低查询频率也不能连带降低实际 kernel 入口的 EXIT/错误检查。
+Wait 中“地址已知”也不等于所有 task 共享一个全局地址：当前每个前驱有 canonical completion 和可用时的 CntNotify 通知。GM 回退或其他共享条件的多个消费者仍可能竞争同址；SRAM 也有入口带宽限制。可靠读取不代表无限带宽；更短的单轮检查可能增加单位时间的请求量。负向观察不能作为永久证明，降低查询频率也不能连带降低实际 kernel 入口的 EXIT/错误检查。
 
 完成发布是三条原则的闭环。执行资格要求已有 owner、固定准备完成、依赖逻辑完成、本核可执行、协作许可有效且无终止条件同时成立；之后还有不可提前的入口操作。前驱已返回但完成贡献尚未发布，或 defer_wait 债务尚未结清时，后继仍不可执行。因此不能仅凭这三个局部阶段变短就宣称达到整图最优或 5 µs 目标。
 
@@ -216,7 +216,7 @@ probe 先把一批 ordinal 绑定为 `WaitingBuilt`，再逐槽 Claim、acquire�
 | Build／最终入口：`scheduler_dispatch_execution_token`、`resident_scheduler_impl.h` | 普通派发复用 metadata 和固定 Binding，不再重复写回；动态入口操作仍保留 | token 转 slot、predicate、资源许可、实际输入观察、async context、args dump 与调用入口仍在就绪后的路径上；先区分语义必需项与还能提前的准备 |
 | 领取／普通票：`scheduler_refill_execution_tokens`、`scheduler_claim_execution_token<true>` | 一次有效 next_block FAA 固定 owner；执行记录以单 owner 诊断方式发布，不再二次 Claim CAS | 同一宽 SPMD 的 next_block 仍是共享热点；预过滤、越界退款、诊断 DCCI/DSB 和 supply seal 仍有成本；冷取消及退休推导必须一致识别合法 TICKET_OWNED 状态 |
 | 领取／目录：`scheduler_bind_issue_entry`、`scheduler_issue_fanin_ready` | 私有游标、固定 entry metadata/fanin 和已确认前缀已缓存 | 头部未发完会挡后项，跨引擎供给与动态 seal 仍需观察；不得为增加提前领取率破坏拓扑供给和同核单 block 约束 |
-| Wait／普通依赖：`scheduler_observe_fanin_prefix` | 当前前驱地址已绑定，已完成前缀及 DONE 证明可复用；未完成时继续可靠读取 | 同地址读竞争仍在；`scheduler_fill_own_slots` 的不同推进点最多三次调用 token 扫描，多个 token 也可能等待同一前驱。需看整体请求密度，不能只看一次 Wait helper |
+| Wait／普通依赖：`scheduler_observe_fanin_prefix` | 当前前驱地址已绑定，已完成前缀及 DONE 证明可复用；未完成时继续可靠读取 | DONE 的 GM 同址轮询已迁到 SRAM，GM 回退和其他条件仍有读竞争；`scheduler_fill_own_slots` 的不同推进点最多三次调用 token 扫描，多个 token 也可能等待同一前驱。需看整体请求密度，不能只看一次 Wait helper |
 | Wait／协作：`scheduler_observe_ordered_progress`、`scheduler_gm_mix_check_acks` | ACK 正向掩码和本次 assignment 观察已复用；SSBUF 保留专用访问合同 | 组身份校验、admission 状态、未到达伙伴和最终许可仍需推进；不能把普通完成观察直接当成 MIX/sync_start 放行 |
 | Wait／控制服务：`scheduler_service_async_slice`、Graph control | 必要控制按预算服务，defer_wait 物理返回与逻辑债务分离 | 不是 percounter 旧分析中的“每轮从头扫完整条链”；仍需量化实际服务占比、目录检查、到期时机与 ready 任务被延迟的程度 |
 | 发布／完成：`scheduler_contribute_returns`、async join/FINISH | C/D/N 和唯一 FINISH 责任仍由真正的多写者原子协议决定 | kernel 返回到逻辑 DONE 的必要发布仍在依赖关键路径；不能将所有写侧改成普通 store 或 st_dev |
@@ -711,7 +711,7 @@ predicate 仍在合法执行边界读取；false 分支按既有整任务/组语
 | 不可变 Call、固定图 metadata | Host 在启动前构造及发布，run 内无 Device writer | 启动观察后只读；稳定地址不保证业务 Tensor 内容已可用 |
 | 普通 TICKET_OWNED 执行诊断 | 有效票的固定 owner 使用普通 store + DCCI + DSB | 同 owner 生命周期检查；AICPU/Host 诊断观察；不用于另一核取得执行许可 |
 | `next_block`、部分 sync 的 `claim_tickets` | 多核 FAA 分配或合并，必要时处理超额票 | 读快照可以减少无效尝试，实际分配仍由 RMW 裁定 |
-| `completion_state`、async join／lease／FINISH | 多核完成贡献与信用更新，CAS/FAA 裁定唯一责任或终态 | 等待者可靠 ld_dev，已成立的 DONE 私有复用；不能改成多核读值后分别 st_dev 覆盖 |
+| `completion_state`、async join／lease／FINISH | 多核完成贡献与信用更新，CAS/FAA 裁定唯一责任或终态 | 唯一逻辑完成者发布 CntNotify DONE；后继读取 SRAM，资源不足时读取 canonical GM gate；不能改成多核读值后分别 st_dev 覆盖 |
 | `claim_seal`、`admission_state` | 最后有效领取者、提交锁持有者分别使用 scheduler_store_signal 的 st_dev；各字段独占128B，run 内无其他 RMW writer | FAA/登记→seal 的前置 DSB、状态→commit_tail 的已有 DSB 保留；不因跨核通知本身添加写后 DSB，供给关闭不等于计算 DONE |
 | GM MIX assigned/arrived/released 序号 | 当前保留 atomic store/Exch | ACK 行混有多个 writer 的字段，released_seq 还联合编码序号与失败位；本轮不机械混入 st_dev，后续须单独论证原子发布需求和整行访问合同 |
 | admission `log[tail]`、`commit_tail`、错误 status | `scheduler_publish_signal` 已使用 st_dev + DSB；提交锁或错误认领决定活跃 writer | 按统一硬件原则和逐字段发布合同审查；不能将这些单写者路径外推为可替换所有多写者 RMW |
@@ -800,6 +800,35 @@ Build 同时展示准备工作量和它与前驱计算的重叠；领取同时�
 延续任务计时与 Scalar observer 的编译分离；必要事件的原始时间戳保留，导出/编码尽量不干扰中间计算调度。记录丢失、截断或不完整因果关系必须显式失败，不能用缺失事件表示零耗时。
 
 `G_worker/G_dep` 使用真实 kernel 起止时间戳，不能用包含 setup/receive 的显示条边界代替。按任务对列出各次采集的间隙、低于 5 µs 的比例和最坏值，并同时列出有 pending 的覆盖率；中位数低于 5 µs 不代表所有交接达标。协作等待、真实依赖等待和调度开销分别归因，但原始间隙必须完整保留。
+
+<!-- markdownlint-disable-next-line MD033 -->
+<a id="cntnotify-done"></a>
+
+### CntNotify：逻辑完成通知与后继等待
+
+本轮仅把逻辑 DONE 的发布与后继观察迁到 STARS CntNotify SRAM。CntNotify
+的 store 可选择 SET 或硬件 ADD，但 ADD 不返回旧值，不能据此领取唯一执行票。
+本轮使用 SET 区域，保留 GM 上的 block 领取、完成贡献、异步债务及唯一完成者裁定。
+
+- Host 为运行镜像中的节点申请独占 CntNotify，通过 SDK 获取映射地址，不猜测寄存器地址。
+  地址表不可变，独立于 GM atomic-only 控制行。资源跟随 prepared publication 保留，
+  覆盖普通执行、重复执行、capture/replay 和失败后的既有资源隔离；所有使用者退出后才释放。
+- 每次 Device 启动，由 AICPU 初始化阶段在任何 READY 发布之前复位通知，尾部屏障保证
+  复位先于 READY。已由 Host 完成的节点初始化为 DONE；运行中的节点初始化为 PENDING。
+  不依赖 Host 再次 bind，因此 captured replay 也不会读到上轮 DONE。
+- 普通 SPMD/MIX 的最后有效完成贡献者、Graph 控制节点 CAS 胜者，以及 defer_wait
+  的最终 FINISH owner，分别在原有逻辑完成点发布一次 `st_dev.b32(DONE)`。
+  物理 kernel 返回或计算计数归零而异步债务未清，均不得发布 DONE。
+- 后继用 `ld_dev.b32` 非消费式读取，多个后继可观察同一通知。首次绑定前驱时保存通知地址，
+  同次等待不重复读取地址表；正向 DONE 证明仍可私有缓存。通知不转移执行所有权，
+  也不替代执行入口、Tensor 数据可见性或 MIX/sync_start 的检查。
+- SRAM 访问不做 DCCI。已有输出发布及异步完成的必要 DSB 保留；不因为跨核通知本身
+  给每次 SET 添加 DSB。读取一次不就绪即返回原推进循环，不新增无界空转轮询。
+- CntNotify 是有限硬件资源。分配耗尽的节点继续读取原 canonical GM completion，
+  Host 明确记录 SRAM 覆盖数；其他 SDK 错误使准备失败，不能伪装成 SRAM 成功。
+  CPU/sim 使用同一 GM 完成语义。资源回退不改变图大小、前端或异步语义。
+- 验证实际 AIC/AIV 双向读写、重复复位、逻辑完成与异步债务区分，再按下面的12组
+  AICore L0 标准比较；启动复位成本和 Host 资源数量单列，不计作消失的工作。
 
 <!-- markdownlint-disable-next-line MD033 -->
 <a id="performance-retention-policy"></a>

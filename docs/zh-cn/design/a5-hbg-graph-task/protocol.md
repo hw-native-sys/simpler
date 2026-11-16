@@ -1,6 +1,6 @@
 # A5 Graph task 调度与发布协议
 
-**共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前实现、拟修改布局和未来 STARS 后端分别标明。
+**共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前 DONE 使用 CntNotify SRAM，其他拟修改后端分别标明。
 
 本文描述当前 resident 执行合同。节点、布局和 Host 地址来源见[数据布局](data-layout.md)；
 [目录与 token](ready-queue-design.md)说明工作发现，[canonical gate](dependency-counters.md)说明依赖完成。
@@ -17,7 +17,7 @@
 唯一 owner 的通知可按字段合同采用 `st_dev`；多写者 claim、完成汇合和交权仍由 atomic 裁定。
 独立竞争单元按 128B 隔离，64B 仅描述 Scalar DCache 维护。
 GM 同址读取也有争用，故同一次推进中的合法观察值应带身份传递，不在下层重复读或 FAA(0)确认。
-后续 STARS Wait 仍须保持本页的 epoch、MIX/sync_start、defer_wait 与退休语义，
+CntNotify DONE 与后续其他 STARS Wait 均须保持本页的 epoch、MIX/sync_start、defer_wait 与退休语义，
 加 `nop` 限制空轮询入口带宽；当前 SPR 握手不构成通用 event 分配机制。
 
 ## 从设备入口到 launch gate

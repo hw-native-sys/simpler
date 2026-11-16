@@ -1,9 +1,9 @@
 # A5 HBG canonical completion gate
 
-**共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前实现、拟修改布局和未来 STARS 后端分别标明。
+**共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前 DONE 使用 CntNotify SRAM，其他拟修改后端分别标明。
 
-默认 resident 使用 producer 的 canonical gate 证明依赖完成。
-Host 发布完整 fanin 视图；设备不会为每条边维护 remaining，也不会挂接 wake-list 或通知后继。
+默认 resident 使用 producer 的 canonical gate 裁定逻辑完成，由唯一完成者发布 CntNotify SRAM 通知。
+Host 发布完整 fanin 视图；设备不会为每条边维护 remaining 或挂接 wake-list，多个后继共享一份非消费式 DONE 通知。
 本页描述当前实现，配套的工作发现见[目录与 execution token](ready-queue-design.md)。
 
 ## 一个完成事实
@@ -24,17 +24,18 @@ T 为非零且不超过 INT16_MAX。每个真实 kernel 返回或合法 predicat
 异步条件以额外 debt 阻止提前 DONE；最后一次真实返回可以只关闭 computation join，
 由唯一 async FINISH 在条件满足后结清剩余 debt。
 
-当前用可靠 `ld_dev` 读取并校验完成字，DONE 或非法值不再经 atomic fetch-add(0) 重复确认。
+后继用可靠 `ld_dev.b32` 读取 CntNotify SET 区域，0 为 PENDING、1 为 DONE。SDK 资源不足的节点保留 canonical GM gate 读取，CPU/sim 也采用 GM；两者均不经 atomic fetch-add(0) 重复确认。
 单调 DONE 可以按本轮 task 身份私有复用；未完成值只说明这次观察未就绪，不能永久缓存。
 完成贡献仍需 RMW 合并多核更新，不能改为各核读后 `st_dev` 覆盖。
 生产者结果发布到完成贡献、消费者观察 DONE 到读取业务输入的顺序均须显式 DSB；
 atomic 本身不提供这些跨操作顺序，DSB 也不代替实际消费者的缓存获取。
 原子完成字按 128B L2 侧粒度隔离，所在区域没有 cached 整行写回。
 
-多个后继核同时观察一个 producer，仍会在其 GM 地址产生并发串行开销；
-删除 FAA(0) 只减少一次请求，并未消除同址轮询。复用已确认前缀、观察值和身份，
-控制无效请求密度；后续优先以带 `nop` 入口限流的 STARS event/notify 承载 Wait。
-STARS 不替代多写者完成计数或 task claim，也不表示当前已实现该后端。
+多个后继核观察同一 producer 的 SRAM 通知，不再与该 producer 的 GM 完成贡献争用同一地址。
+每次未就绪即返回有界推进循环，不新增紧密死循环；第一次绑定前驱时保存通知地址，
+正向证明仍可私有复用。STARS 不替代多写者完成计数或 task claim；本轮也不使用无返回值的硬件 ADD。
+每轮 AICPU 在 READY 之前复位，资源随 retained publication 持有。详见
+[CntNotify 生命周期与回退](build-execute-separation.md#cntnotify-done)。
 
 ## 依赖访问与有界观察
 
@@ -48,7 +49,7 @@ fanin 完成后，token 才转入私有 READY slot。最终 admission、epoch �
 
 ENTER、EXIT 和 inline 控制节点不占 kernel slot。每次控制切片最多检查八个节点，
 逐个观察 producer gate。全部 DONE 后，唯一 CAS 将该控制节点从初态改成完成态，
-只有胜者累计一份本地 logical completion。其他核及消费者直接观察同一个 gate。
+只有胜者发布 DONE 通知并累计一份本地 logical completion。其他核及消费者观察同一份非消费式通知；GM 回退节点观察 gate。
 控制节点之间不递归传播；下一轮 scan 提供后继进展。
 
 ## Graph 完成与资源退休

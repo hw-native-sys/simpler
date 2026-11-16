@@ -129,6 +129,28 @@ static inline __aicore__ uint64_t scheduler_gm_query(__gm__ volatile uint64_t &v
     });
 }
 
+// CntNotify exposes one 32-bit SET/read register. Never widen this access
+// into its neighbouring register, or run a cache maintenance instruction on it.
+static inline __aicore__ uint32_t scheduler_notify_query(__gm__ volatile uint32_t &value) {
+    return scheduler_scalar_memory_result(SchedPhaseKind::ScalarBypassLoad, [&value]() __aicore__ {
+#if defined(__CCE_AICORE__)
+        return static_cast<uint32_t>(__builtin_cce_ld_dev(const_cast<__gm__ uint32_t *>(&value), 0));
+#else
+        return __atomic_load_n(&value, __ATOMIC_ACQUIRE);
+#endif
+    });
+}
+
+static inline __aicore__ void scheduler_notify_done(__gm__ volatile uint32_t &value) {
+    scheduler_scalar_memory_issue(SchedPhaseKind::ScalarBypassStore, 1, [&value]() __aicore__ {
+#if defined(__CCE_AICORE__)
+        __builtin_cce_st_dev(UINT32_C(1), const_cast<__gm__ uint32_t *>(&value), 0);
+#else
+        __atomic_store_n(&value, UINT32_C(1), __ATOMIC_RELEASE);
+#endif
+    });
+}
+
 static inline __aicore__ uint64_t
 scheduler_gm_query_u32_pair(__gm__ volatile uint32_t *values, int order = __ATOMIC_ACQUIRE) {
     return scheduler_scalar_memory_result(SchedPhaseKind::ScalarBypassLoad, [values, order]() __aicore__ {
