@@ -464,7 +464,7 @@ TEST(HbgScalarTrace, CompactStoragePreservesWideClocksTasksCountsAndDepth) {
     }
 }
 
-TEST(HbgScalarTrace, CompactStoragePreservesEveryBootstrapPhase) {
+TEST(HbgScalarTrace, CompactStoragePreservesBootstrapAndClaimPhases) {
     auto buffer = std::make_unique<SchedulerActivityBuffer>();
     auto slots = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
     SchedulerScalarTrace trace;
@@ -474,12 +474,15 @@ TEST(HbgScalarTrace, CompactStoragePreservesEveryBootstrapPhase) {
         SchedPhaseKind::ScalarBootstrapInitWait,
         SchedPhaseKind::ScalarBootstrapPeerWait,
         SchedPhaseKind::ScalarBootstrapTopology,
+        SchedPhaseKind::ScalarPreparedClaim,
     };
-    const char *names[] = {"scalar_bootstrap_init_wait", "scalar_bootstrap_peer_wait", "scalar_bootstrap_topology"};
+    const char *names[] = {
+        "scalar_bootstrap_init_wait", "scalar_bootstrap_peer_wait", "scalar_bootstrap_topology", "scalar_prepared_claim"
+    };
     for (auto phase : phases)
         trace.append(phase, 10, 20, -1, 2);
     const auto rows = decode(trace);
-    ASSERT_EQ(rows.size(), 3u);
+    ASSERT_EQ(rows.size(), 4u);
     for (uint32_t i = 0; i < rows.size(); ++i) {
         EXPECT_EQ(kind(rows[i]), 139u + i);
         EXPECT_STREQ(sched_phase_kind_name(static_cast<SchedPhaseKind>(kind(rows[i]))), names[i]);

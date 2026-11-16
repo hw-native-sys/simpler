@@ -51,9 +51,18 @@ static inline __aicore__ bool scheduler_task_supply_closed(
         return true;
     }
     auto *control = scheduler_task_control_at(base, local, ref);
-    if (scheduler_task_is_executable(metadata.flags) && !scheduler_task_is_inline(metadata.flags)) {
-        const uint64_t blocks = metadata.logical_block_num;
-        if (blocks == 0) return scheduler_issue_fail(graph, local, run, ref);
+    const bool executable = scheduler_task_is_executable(metadata.flags) && !scheduler_task_is_inline(metadata.flags);
+    const uint64_t blocks = metadata.logical_block_num;
+    if (executable && blocks == 0) return scheduler_issue_fail(graph, local, run, ref);
+    // Canonical DONE proves both closed supply and completed dependencies.
+    // Pending compute or async debt still requires the independent supply seal.
+    const auto completion = scheduler_observe_cached_completion(base, local, ref);
+    if (completion == SchedulerCompletionObservation::INVALID) return scheduler_issue_fail(graph, local, run, ref);
+    if (completion == SchedulerCompletionObservation::DONE) {
+        *closed = true;
+        return true;
+    }
+    if (executable) {
         const uint64_t seal =
             scheduler_gm_query(control->claim_seal) == 0 ? 0 : scheduler_gm_fetch_add(control->claim_seal, UINT64_C(0));
         if (seal != 0 && seal != blocks) return scheduler_issue_fail(graph, local, run, ref);
@@ -63,9 +72,6 @@ static inline __aicore__ bool scheduler_task_supply_closed(
             return true;
         }
     }
-    const auto completion = scheduler_observe_cached_completion(base, local, ref);
-    if (completion == SchedulerCompletionObservation::INVALID) return scheduler_issue_fail(graph, local, run, ref);
-    *closed = completion == SchedulerCompletionObservation::DONE;
     return true;
 }
 
@@ -114,6 +120,7 @@ static inline __aicore__ bool scheduler_issue_fanin_ready(
         local->issue_task_ref = ref;
         local->issue_next_fanin = 0;
         local->issue_fanin_confirmed = false;
+        local->issue_ticket_exhausted = false;
     }
     // Topology is immutable for this run, and a predecessor's issued supply
     // cannot reopen. This certificate grants issuance, never kernel entry.

@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""MIX resource handshakes and sync-only retained seals, independent of TaskDone."""
+"""MIX resource handshakes and sync retirement frontiers, independent of TaskDone."""
 
 from collections import defaultdict
 
@@ -159,25 +159,38 @@ def audit_mix(audit):
                 point(current, "claim_before" if ordered else "staged"),
                 "MIX record reused before prior group retired",
             )
+    coordinators = {cluster: worker for worker, (cluster, lane) in audit.positions.items() if lane == 0}
+    coordinator_members = defaultdict(list)
+    for member in audit.members.values():
+        if audit.positions[member["worker_index"]][1] == 0:
+            coordinator_members[member["worker_index"]].append(member)
+    for members in coordinator_members.values():
+        members.sort(key=lambda row: row["order_key"])
     for ref, task in audit.tasks.items():
         if not task["flags"] & MIX or not task["flags"] & SYNC:
             continue
+        order = audit.orders[ref]
         for worker in audit.task_members[ref]:
             member = audit.member(ref, worker)
             cluster, lane = audit.positions[worker]
             groups = task_clusters[(ref, cluster)]
             last = max((row["group_seq"] for row in groups), default=0)
-            require(
-                member["last_group_seq"] == last
-                and member["close_seal"] == last + 1
-                and audit.admissions[ref]["close_seals"][cluster] == last + 1,
-                "missing or stale retained Mix close seal",
-            )
-            if lane:
-                require(member["closed_cursor"] == MAX, "Mix AIV close cursor is not an actual observation")
-            seal = ("seal", ref, cluster)
-            audit.causal.add(seal, point(member, "closed"))
+            frontier = member["close_frontier"]
+            require(member["last_group_seq"] == last, "stale Mix group at retirement")
+            require(order < frontier <= len(audit.orders), "invalid Mix close frontier")
             if lane == 0:
-                audit.causal.add(audit.close_reads[(ref, worker)], seal)
-            for group in groups:
-                audit.causal.add(point(group, "completion_after"), seal)
+                require(frontier == order + 1, "coordinator skipped its current close frontier")
+                for group in groups:
+                    audit.causal.add(point(group, "completion_after"), point(member, "closed"))
+                continue
+            require(member["closed_cursor"] == MAX, "Mix AIV close cursor is not an actual observation")
+            observed = audit.causal.bounded(
+                ("mix_close_frontier", ref, worker),
+                ("event", worker, member["closed"][1] - 1),
+                point(member, "closed"),
+            )
+            coordinator = coordinators[cluster]
+            prior = [row for row in coordinator_members[coordinator] if row["order_key"] < frontier]
+            require(prior and prior[-1]["order_key"] >= order, "frontier lacks coordinator retirement")
+            audit.causal.add(point(prior[-1], "closed"), observed)
+            audit.causal.add(audit.admission_points[audit.raw["admission_log"][frontier - 1]], observed)

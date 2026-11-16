@@ -29,8 +29,8 @@ from simpler.worker import Worker
 
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.scene_test import _pto_isa_compile_cache_token, compile_chip_callable_spec
-from simpler_setup.tools.hbg.native_protocol import has_native_graph
-from simpler_setup.tools.swimlane_converter import read_perf_data
+from simpler_setup.tools.hbg.native_causality import audit_native_protocol
+from simpler_setup.tools.hbg.native_protocol import has_native_graph, read_native_protocol
 
 _ROOT = Path(__file__).resolve().parents[5]
 _KERNELS = _ROOT / "tests/fdwic/pa_hbg/spmd/kernels"
@@ -137,6 +137,15 @@ def _capture(prefix):
     paths = list(prefix.rglob("chip_swimlane_records.json"))
     assert len(paths) == 1, paths
     return paths[0], json.loads(paths[0].read_text())
+
+
+def _check_successful_capture(raw):
+    # The timeout fixture needs completion/ownership evidence, not a rendered
+    # Scalar partition. Audit the retained wire capture without decoding it twice.
+    protocol = read_native_protocol(raw["aicore_protocol"])
+    identities = raw["aicore_execution_identities"]
+    assert identities["schema"] == "hbg-execution-identity" and identities["producer"] == "aicore"
+    assert audit_native_protocol(protocol, identities["records"])["protocol_verified"]
 
 
 def _check_output(values, capacity, blocks, mask, *, failed):
@@ -685,7 +694,7 @@ def _run_pass(  # noqa: PLR0912 -- one Worker owns healthy, failed, and cleanup 
                 else:
                     pytest.fail("owned RTS last-use evidence unavailable; buffers retained until close")
             else:
-                assert read_perf_data(str(path))["protocol_audit"]["protocol_verified"]
+                _check_successful_capture(raw)
             evidence.append(
                 {
                     "capture": str(path.relative_to(artifacts)),

@@ -271,10 +271,14 @@ static inline __aicore__ bool scheduler_complete_own_slot(
             if (completed_slot.execution_token && contribution == SchedulerSubtaskFinishResult::PARTIAL)
                 scheduler->continuation_task_ref = task_ref;
             if (contribution == SchedulerSubtaskFinishResult::TASK_LAST) {
+                scheduler_remember_task_proof(scheduler, task_ref, SchedulerTaskProof::DONE);
                 ++scheduler->pending_completed;
             } else if (contribution == SchedulerSubtaskFinishResult::TASK_LAST_DEFERRED) {
-                bool deferred = false;
-                completion_ok = scheduler_async_close_computation(scheduler->async, task_ref, deferred) && deferred;
+                const auto completion = scheduler_async_close_computation(scheduler->async, task_ref);
+                completion_ok =
+                    completion.result == SchedulerAsyncCompletionResult::FINISH_OWNER ?
+                        scheduler_async_complete_task(graph, scheduler_state_base, scheduler, run_control, completion) :
+                        completion.result == SchedulerAsyncCompletionResult::WAITING;
                 if (!completion_ok)
                     scheduler_record_error(
                         run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,

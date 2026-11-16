@@ -12,7 +12,8 @@
 #include <pto/pto-inst.hpp>
 
 #include "async_kernel_api.h"
-#include "scheduler/scheduler_async_layout.h"
+#include "scheduler/scheduler_types.h"
+#include "scheduler/scheduler_memory.h"
 #include "scheduler/scheduler_prepared_layout.h"
 #include "tensor.h"
 
@@ -35,19 +36,15 @@ inline __aicore__ bool background_is_ready(__gm__ void *base, uint32_t count) {
     return false;
 }
 
-// A terminal FINISH lease proves the waiter published its canonical DONE gate.
+// The canonical task gate is published only after all registered conditions settle.
 inline __aicore__ bool wait_was_finished(__gm__ void *base) {
     const auto *run = reinterpret_cast<__gm__ SchedulerRunControl *>(base);
     const auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, run->graph_summary_offset);
-    const auto *layout = scheduler_state_at<SchedulerAsyncLayout>(base, summary->async_layout_offset);
-    const auto *map = scheduler_state_at<uint32_t>(base, layout->task_map_offset);
-    if (map[0] == pto2::resident::ASYNC_INVALID_INDEX || map[0] >= layout->async_task_count) return false;
-    auto *join = scheduler_state_at<SchedulerAsyncTaskJoin>(base, layout->joins_offset) + map[0];
-    auto *lease = scheduler_state_at<SchedulerAsyncLease>(base, layout->finish_leases_offset) + map[0];
-    return scheduler_async_pending::ready_to_finish(scheduler_gm_fetch_add(join->word, UINT64_C(0))) &&
-           scheduler_async_lease_phase(scheduler_gm_fetch_add(lease->word, UINT64_C(0))) ==
-               SchedulerAsyncPhase::TERMINAL;
+    const auto *prepared = scheduler_state_at<SchedulerPreparedLayout>(base, summary->prepared_layout_offset);
+    auto *control = scheduler_state_at<SchedulerTaskControl>(base, prepared->task_controls_offset);
+    return scheduler_completion_done(scheduler_gm_fetch_add(control[0].completion_state, UINT64_C(0)));
 }
+
 }  // namespace
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {

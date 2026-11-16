@@ -307,8 +307,7 @@ inline void validate_layout(const Image &image, const AicoreSchedulerLayout &lay
         summary.admission_records_offset != layout.admission_records_offset ||
         summary.admission_log_offset != layout.admission_log_offset ||
         summary.admission_control_offset != layout.admission_control_offset ||
-        summary.group_mailboxes_offset != layout.group_mailboxes_offset ||
-        summary.mix_close_seals_offset != layout.mix_close_seals_offset)
+        summary.group_mailboxes_offset != layout.group_mailboxes_offset)
         throw std::invalid_argument("protocol graph summary disagrees with Host plan");
 }
 
@@ -323,20 +322,6 @@ inline void admissions(JsonObject &root, const Image &image, const AicoreSchedul
     for (uint64_t task = 0; count != 0 && task < layout.task_count; ++task) {
         const uint64_t offset = layout.admission_records_offset + task * sizeof(SchedulerAdmissionRecord);
         const auto &record = *image.array<SchedulerAdmissionRecord>(offset, 1);
-        std::vector<uint64_t> seals;
-        if (record.mix_close_seals_offset != 0) {
-            const uint64_t first = layout.mix_close_seals_offset;
-            const uint64_t stride = layout.spmd.cluster_count * sizeof(SchedulerMixCloseSeal);
-            if (stride == 0 || record.mix_close_seals_offset < first ||
-                (record.mix_close_seals_offset - first) % stride != 0 ||
-                (record.mix_close_seals_offset - first) / stride >= layout.spmd.sync_mix_task_count)
-                throw std::invalid_argument("protocol close seal outside Host planned region");
-            const auto *cells =
-                image.array<SchedulerMixCloseSeal>(record.mix_close_seals_offset, layout.spmd.cluster_count);
-            seals.reserve(static_cast<size_t>(layout.spmd.cluster_count));
-            for (uint64_t cluster = 0; cluster < layout.spmd.cluster_count; ++cluster)
-                seals.push_back(static_cast<uint64_t>(cells[cluster].value));
-        }
         if (task != 0) out << ',';
         JsonObject row(out);
         row.number("index", task);
@@ -348,8 +333,6 @@ inline void admissions(JsonObject &root, const Image &image, const AicoreSchedul
         row.lane_mask("active_mask", record.active_mask);
         row.number("flags", record.flags);
         row.number("record_offset", offset);
-        row.number("close_seals_offset", record.mix_close_seals_offset);
-        row.numbers("close_seals", seals.data(), seals.size());
     }
     out << ']';
 }
@@ -494,7 +477,7 @@ inline std::string scheduler_export_protocol(
                 row.number("order_key", record.order_key);
                 row.number("observed_tail", record.observed_tail);
                 row.number("closed_cursor", record.closed_cursor);
-                row.number("close_seal", record.close_seal);
+                row.number("close_frontier", record.close_frontier);
                 row.number("last_group_seq", record.last_group_seq);
                 row.number("worker_index", record.worker_index);
                 row.number("flags", record.flags);

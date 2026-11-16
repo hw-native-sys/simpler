@@ -46,9 +46,14 @@ static inline __aicore__ bool scheduler_service_controls(
         if (scheduler_gm_query(control->completion_state) == scheduler_completion_completed_state(1)) continue;
         SchedulerFaninView fanin{};
         if (scheduler_node_fanin_view(graph, ref, &fanin) != SchedulerGraphResult::OK) return false;
+        const uint64_t tag = static_cast<uint64_t>(ref) + 1;
+        auto &cached = local->control_fanin_tags[static_cast<uint64_t>(ref) % SCHEDULER_TASK_PROOF_CACHE_COUNT];
+        const uint32_t cached_prefix = cached >> 32 == tag ? static_cast<uint32_t>(cached) : 0;
+        uint32_t next_fanin = cached_prefix;
         bool ready = false;
-        uint32_t next_fanin = 0;
         if (!scheduler_observe_fanin_prefix(graph, base, local, run, ref, fanin, next_fanin, &ready)) return false;
+        // A zero-progress visitor cannot displace another control's positive proof.
+        if (next_fanin != cached_prefix) cached = (tag << 32) | next_fanin;
         if (!ready) continue;
         const bool record = scheduler_protocol_enabled(local);
         scheduler_cache_barrier();
@@ -69,6 +74,7 @@ static inline __aicore__ bool scheduler_service_controls(
             scheduler_protocol_task_actor(base, local, ref, UINT64_MAX, metadata.flags, true, true, before);
             scheduler_protocol_task_actor(base, local, ref, UINT64_MAX, metadata.flags, true, false, after);
         }
+        scheduler_remember_task_proof(local, ref, SchedulerTaskProof::DONE);
         ++local->pending_completed;
         *progress = true;
     }

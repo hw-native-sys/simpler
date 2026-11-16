@@ -405,16 +405,10 @@ struct alignas(64) SchedulerAdmissionRecord {
     uint64_t run_epoch;
     int64_t task_ref;
     uint64_t order_key;
-    uint64_t mix_close_seals_offset;
     uint32_t logical_block_num;
     uint32_t member_count;
     LaneMask active_mask;
     uint8_t flags;
-};
-
-// Each cluster's retained close seal occupies an independent atomic region.
-struct alignas(64) SchedulerMixCloseSeal {
-    volatile uint64_t value;
 };
 
 struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerAdmissionControl {
@@ -474,7 +468,6 @@ struct alignas(64) SchedulerGraphSummary {
     uint64_t admission_log_offset;
     uint64_t admission_control_offset;
     uint64_t group_mailboxes_offset;
-    uint64_t mix_close_seals_offset;
     uint64_t run_epoch;
     uint64_t protocol_layout_offset;
     SchedulerTopologyLayout topology_layout;
@@ -733,10 +726,6 @@ static_assert(
 );
 static_assert(offsetof(SchedulerTaskControl, claim_seal) == 512, "claim seal requires an isolated atomic line");
 static_assert(sizeof(SchedulerAdmissionRecord) == 64, "admission header must occupy one cache line");
-static_assert(sizeof(SchedulerMixCloseSeal) == 64, "close seals require independent atomic regions");
-static_assert(alignof(SchedulerMixCloseSeal) == 64, "close seals require isolated alignment");
-static_assert(offsetof(SchedulerMixCloseSeal, value) == 0, "close seal value must lead its region");
-static_assert(std::is_standard_layout_v<SchedulerMixCloseSeal> && std::is_trivially_copyable_v<SchedulerMixCloseSeal>);
 static_assert(sizeof(SchedulerAdmissionControl) == 256, "admission control layout changed");
 static_assert(
     alignof(SchedulerAdmissionControl) == SCHEDULER_GM_ATOMIC_SECTOR_BYTES,
@@ -754,10 +743,10 @@ static_assert(offsetof(SchedulerGroupDescriptor, previous_lane_seq) == 40);
 static_assert(sizeof(SchedulerGroupLaneAck) == 64, "lane acknowledgements require separate atomic regions");
 static_assert(sizeof(SchedulerGroupMailbox) == 384, "group mailbox layout changed");
 static_assert(offsetof(SchedulerGroupMailbox, lanes) == 128, "descriptor and acknowledgements must be separate");
-static_assert(sizeof(SchedulerGraphSummary) == 192, "graph summary layout changed");
-static_assert(offsetof(SchedulerGraphSummary, async_layout_offset) == 112);
-static_assert(offsetof(SchedulerGraphSummary, prepared_layout_offset) == 120);
-static_assert(offsetof(SchedulerGraphSummary, bootstrap_clusters_offset) == 128);
+static_assert(sizeof(SchedulerGraphSummary) == 128, "graph summary layout changed");
+static_assert(offsetof(SchedulerGraphSummary, async_layout_offset) == 104);
+static_assert(offsetof(SchedulerGraphSummary, prepared_layout_offset) == 112);
+static_assert(offsetof(SchedulerGraphSummary, bootstrap_clusters_offset) == 120);
 static_assert(alignof(SchedulerGraphSummary) == 64, "graph summary alignment changed");
 static_assert(sizeof(SchedulerExecutorTaskTrace) == 24, "executor trace payload layout changed");
 static_assert(alignof(SchedulerExecutorTaskTrace) == alignof(uint64_t), "executor trace must have natural alignment");
@@ -895,12 +884,7 @@ inline bool scheduler_plan_spmd_storage(uint64_t *cursor, AicoreSchedulerLayout 
         return false;
     if (layout->spmd.sync_mix_task_count == 0) return true;
     if (!scheduler_layout_checked_mul(layout->spmd.cluster_count, sizeof(SchedulerGroupMailbox), &bytes) ||
-        !scheduler_layout_reserve(cursor, bytes, alignof(SchedulerGroupMailbox), &layout->group_mailboxes_offset) ||
-        !scheduler_layout_checked_mul(
-            layout->spmd.sync_mix_task_count, layout->spmd.cluster_count, &layout->mix_close_seal_count
-        ) ||
-        !scheduler_layout_checked_mul(layout->mix_close_seal_count, sizeof(SchedulerMixCloseSeal), &bytes) ||
-        !scheduler_layout_reserve(cursor, bytes, SCHEDULER_STATE_ALIGNMENT, &layout->mix_close_seals_offset))
+        !scheduler_layout_reserve(cursor, bytes, alignof(SchedulerGroupMailbox), &layout->group_mailboxes_offset))
         return false;
     return true;
 }
@@ -1086,7 +1070,6 @@ inline bool scheduler_init_data_from_layout(
     auto *bootstrap = scheduler_state_at<SchedulerBootstrapCluster>(base, layout.bootstrap_clusters_offset);
     for (uint64_t cluster = 0; cluster < layout.spmd.cluster_count; ++cluster)
         bootstrap[cluster].state = layout.spmd.mix_task_count == 0 ? SCHEDULER_BOOTSTRAP_CLUSTER_INIT : 0;
-    summary->mix_close_seals_offset = layout.mix_close_seals_offset;
     summary->protocol_layout_offset = layout.protocol_layout_offset;
     summary->async_layout_offset = layout.async_layout_offset;
     summary->prepared_layout_offset = layout.prepared_layout_offset;
@@ -1099,8 +1082,8 @@ inline bool scheduler_init_data_from_layout(
             record->task_ref = SCHEDULER_TASK_REF_INVALID;
             record->order_key = UINT64_MAX;
         }
-        // Log elements use bypass stores; isolated close seals use atomics.
-        // Neither region permits device cached stores or dirty writeback.
+        // Device log writes bypass DCache; cached stores and dirty writeback
+        // must not overwrite entries published by another worker.
         auto *log = scheduler_state_at<int64_t>(base, layout.admission_log_offset);
         for (uint64_t index = 0; index < layout.spmd.cooperative_task_count; ++index)
             log[index] = SCHEDULER_TASK_REF_INVALID;
@@ -1196,15 +1179,13 @@ inline bool scheduler_init_spmd_task_records(void *base, const AicoreSchedulerLa
                 controls[task].next_block != 0 || controls[task].claim_tickets != 0 || controls[task].claim_seal != 0 ||
                 controls[task].completion_state != scheduler_completion_initial_state(1))
                 return false;
-            if (scheduler_task_is_mix(meta.flags)) {
-                uint64_t seals = 0;
-                if (layout.mix_close_seals_offset == 0 ||
-                    layout.mix_close_seals_offset % alignof(SchedulerMixCloseSeal) != 0 ||
-                    !scheduler_layout_checked_mul(layout.spmd.sync_mix_task_count, layout.spmd.cluster_count, &seals) ||
-                    layout.mix_close_seals_offset > layout.total_size ||
-                    seals > (layout.total_size - layout.mix_close_seals_offset) / sizeof(SchedulerMixCloseSeal))
-                    return false;
-            }
+            if (scheduler_task_is_mix(meta.flags) &&
+                (layout.group_mailboxes_offset == 0 ||
+                 layout.group_mailboxes_offset % alignof(SchedulerGroupMailbox) != 0 ||
+                 layout.group_mailboxes_offset > layout.total_size ||
+                 layout.spmd.cluster_count >
+                     (layout.total_size - layout.group_mailboxes_offset) / sizeof(SchedulerGroupMailbox)))
+                return false;
             ++cooperative_count;
         }
         if (scheduler_task_is_mix(meta.flags)) {
@@ -1226,7 +1207,6 @@ inline bool scheduler_init_spmd_task_records(void *base, const AicoreSchedulerLa
         for (uint64_t worker = 0; worker < protocol->worker_count; ++worker)
             workers[worker].run_epoch = run_epoch;
     }
-    uint64_t mix_index = 0;
     for (uint64_t task = 0; task < layout.task_count; ++task) {
         const auto &meta = metadata[task];
         const uint32_t contributions =
@@ -1249,11 +1229,6 @@ inline bool scheduler_init_spmd_task_records(void *base, const AicoreSchedulerLa
         record->logical_block_num = meta.logical_block_num;
         record->active_mask = meta.active_mask;
         record->flags = meta.flags;
-        if (scheduler_task_is_mix(meta.flags)) {
-            record->mix_close_seals_offset =
-                layout.mix_close_seals_offset + mix_index * layout.spmd.cluster_count * sizeof(SchedulerMixCloseSeal);
-            ++mix_index;
-        }
         controls[task].admission_state = static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED);
     }
     return true;

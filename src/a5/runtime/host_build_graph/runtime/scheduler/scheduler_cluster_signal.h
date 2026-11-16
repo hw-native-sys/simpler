@@ -47,9 +47,10 @@ struct SchedulerClusterSignal {
     volatile uint32_t active_mask;
     volatile uint32_t arrived[PLATFORM_CORES_PER_BLOCKDIM];
     volatile uint32_t finished[PLATFORM_CORES_PER_BLOCKDIM];
+    volatile uint64_t gm_arrival_seq;
 };
 static_assert(sizeof(SchedulerClusterSignal) <= SCHEDULER_CLUSTER_REGION_BYTES);
-static_assert(sizeof(SchedulerClusterSignal) == 128 && offsetof(SchedulerClusterSignal, anchor_state) == 80);
+static_assert(sizeof(SchedulerClusterSignal) == 136 && offsetof(SchedulerClusterSignal, anchor_state) == 80);
 static_assert(alignof(SchedulerClusterSignal) <= 8);
 static_assert(std::is_standard_layout_v<SchedulerClusterSignal>);
 
@@ -106,6 +107,7 @@ scheduler_cluster_store_release(SCHEDULER_CLUSTER_SSBUF volatile uint32_t *field
 inline __aicore__ void
 scheduler_cluster_signal_clear(SCHEDULER_CLUSTER_SSBUF SchedulerClusterSignal *signal, uint64_t run_epoch) {
     scheduler_cluster_store_field(&signal->run_epoch, run_epoch);
+    scheduler_cluster_store_field(&signal->gm_arrival_seq, UINT64_C(0));
     scheduler_cluster_store_field(&signal->prepare_task_ref, INT64_C(-1));
     scheduler_cluster_store_field(&signal->prepare_block, UINT32_C(0));
     scheduler_cluster_store_field(&signal->prepare_mask, UINT32_C(0));

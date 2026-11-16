@@ -39,7 +39,7 @@ struct Word {
 TEST(HbgAsyncPending, NoRegistrationUsesSynchronousCompletion) {
     pending::Join join{};
     EXPECT_FALSE(pending::ready_to_finish(join.word));
-    EXPECT_EQ(pending::close_computation(join), Result::SYNCHRONOUS);
+    EXPECT_EQ(pending::close_computation(join).result, Result::SYNCHRONOUS);
     EXPECT_TRUE(pending::closed(join.word));
     EXPECT_FALSE(pending::ready_to_finish(join.word));
 }
@@ -48,8 +48,8 @@ TEST(HbgAsyncPending, AnEarlyZeroObservationCannotAuthorizeCompletion) {
     pending::Join join{};
     ASSERT_EQ(join.word, 0u);
     ASSERT_EQ(pending::register_group(join), Result::PENDING);
-    EXPECT_EQ(pending::close_computation(join), Result::PENDING);
-    EXPECT_EQ(pending::complete_group(join), Result::FINISH_OWNER);
+    EXPECT_EQ(pending::close_computation(join).result, Result::PENDING);
+    EXPECT_EQ(pending::complete_group(join).result, Result::FINISH_OWNER);
 }
 
 TEST(HbgAsyncPending, EnumeratesPublicationReleaseCheckAndCloseInterleavings) {
@@ -132,7 +132,7 @@ TEST(HbgAsyncPending, EnumeratesPublicationReleaseCheckAndCloseInterleavings) {
                         if (!(s.completed & bit)) {
                             auto next = s;
                             next.completed |= bit;
-                            const auto result = pending::detail::complete_group(next.word);
+                            const auto result = pending::detail::complete_group(next.word).result;
                             apply(next, result);
                         }
                     }
@@ -140,7 +140,7 @@ TEST(HbgAsyncPending, EnumeratesPublicationReleaseCheckAndCloseInterleavings) {
                 if (s.released == all && !s.closed) {
                     auto next = s;
                     next.closed = true;
-                    const auto result = pending::detail::close_computation(next.word);
+                    const auto result = pending::detail::close_computation(next.word).result;
                     apply(next, result);
                 }
             };
@@ -154,13 +154,13 @@ TEST(HbgAsyncPending, InvalidAndDuplicateTransitionsNeverGrantCompletion) {
     for (uint64_t word : {UINT64_C(1), UINT64_C(2) | pending::REGISTERED_UNIT, UINT64_C(1) << 63}) {
         Word registration{word}, completion{word}, close{word};
         EXPECT_EQ(pending::detail::register_group(registration), Result::INVALID_WORD);
-        EXPECT_EQ(pending::detail::complete_group(completion), Result::INVALID_WORD);
-        EXPECT_EQ(pending::detail::close_computation(close), Result::INVALID_WORD);
+        EXPECT_EQ(pending::detail::complete_group(completion).result, Result::INVALID_WORD);
+        EXPECT_EQ(pending::detail::close_computation(close).result, Result::INVALID_WORD);
     }
     Word late{pending::COMPUTATION_CLOSED}, duplicate{pending::COMPUTATION_CLOSED}, empty{};
     EXPECT_EQ(pending::detail::register_group(late), Result::INVALID_TRANSITION);
-    EXPECT_EQ(pending::detail::close_computation(duplicate), Result::INVALID_TRANSITION);
-    EXPECT_EQ(pending::detail::complete_group(empty), Result::COUNT_UNDERFLOW);
+    EXPECT_EQ(pending::detail::close_computation(duplicate).result, Result::INVALID_TRANSITION);
+    EXPECT_EQ(pending::detail::complete_group(empty).result, Result::COUNT_UNDERFLOW);
     Word full{pending::COUNT_MAX * pending::REGISTERED_UNIT + pending::COUNT_MAX};
     EXPECT_EQ(pending::detail::register_group(full), Result::COUNT_OVERFLOW);
 }
@@ -171,7 +171,7 @@ TEST(HbgAsyncPending, RealThreadsRaceTheLastCheckAgainstComputationClose) {
         std::atomic<uint32_t> released{0}, owners{0}, errors{0};
         std::vector<std::thread> threads;
         auto finish = [&]() {
-            const auto result = pending::complete_group(join);
+            const auto result = pending::complete_group(join).result;
             if (result == Result::FINISH_OWNER) ++owners;
             else if (result != Result::PENDING) ++errors;
         };
@@ -184,7 +184,7 @@ TEST(HbgAsyncPending, RealThreadsRaceTheLastCheckAgainstComputationClose) {
             });
         }
         while (released.load(std::memory_order_acquire) != 8) {}
-        const auto result = pending::close_computation(join);
+        const auto result = pending::close_computation(join).result;
         if (result == Result::FINISH_OWNER) ++owners;
         else if (result != Result::PENDING) ++errors;
         for (auto &thread : threads)

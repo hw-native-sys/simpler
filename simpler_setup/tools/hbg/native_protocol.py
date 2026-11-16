@@ -13,6 +13,7 @@ Sequence integrity proves lossless local event streams, not scheduler causality,
 execution coverage, membership, dependency ordering or Mix resource correctness.
 """
 
+MEMBER_FROM_CLAIM = 1 << 28
 COMPLETION_FROM_GROUP = 1 << 29
 COMPLETION_FROM_CONTRIBUTION = 1 << 30
 COMPLETION_ALIAS_FLAGS = COMPLETION_FROM_GROUP | COMPLETION_FROM_CONTRIBUTION
@@ -39,9 +40,7 @@ NUMBERS = {
         "index worker_index context_worker_index run_epoch next_sequence "
         "error_flags finished core_id core_type cluster_index"
     ),
-    "admission": (
-        "index run_epoch task_ref order_key block_num member_count active_mask flags record_offset close_seals_offset"
-    ),
+    "admission": ("index run_epoch task_ref order_key block_num member_count active_mask flags record_offset"),
     "control": (
         "task_ref state next_block completed_subtasks admission_state canonical_total pending_compute completion_debt"
     ),
@@ -49,7 +48,7 @@ NUMBERS = {
     "actor": "run_epoch task_ref order_key worker_index flags",
     "member": (
         "index run_epoch task_ref order_key observed_tail closed_cursor "
-        "close_seal last_group_seq worker_index flags pending_mask"
+        "close_frontier last_group_seq worker_index flags pending_mask"
     ),
     "owner": (
         "run_epoch task_ref order_key group_seq completion_ticket worker_index "
@@ -82,7 +81,6 @@ STAMPS = {
 ARRAYS = {
     "task": {"kernel_ids": 3, "dependencies": None},
     "worker": {"cluster_workers": 3},
-    "admission": {"close_seals": None},
     "owner": {"released_seq": 3, "sync_frontier": 3, "sync_hold": 3},
     "lane": {"arrived_seq": 3, "lane_subtasks": 3},
 }
@@ -180,9 +178,6 @@ def read_native_protocol(section):
         for row in section[table]:
             extra = ("claim_tickets", "claim_seal") if kind == "control" else ()
             _record(row, kind, f"{table}[{row[key]}]", extra)
-    for row in section["admissions"]:
-        if len(row["close_seals"]) not in (0, section["cluster_count"]):
-            _error("close seal array length mismatch")
     for table, kind, count in (
         ("members", "member", section["member_count"]),
         ("executions", "execution", section["trace_count"]),

@@ -109,13 +109,14 @@ static inline __aicore__ bool scheduler_ordered_poll_may_progress(
     auto *mailbox = scheduler_gm_mix_mailbox(base, local);
     if (!local->is_mix_coordinator() &&
         (group.phase == SchedulerGmMixPhase::IDLE || group.phase == SchedulerGmMixPhase::RELEASED)) {
-        auto &seal = scheduler_state_at<SchedulerMixCloseSeal>(base, admission.current_mix_close_seal_offset)->value;
+        const auto *signal = local->cluster_signal;
+        if (signal == nullptr || scheduler_cluster_load_field(&signal->run_epoch) != admission.epoch) return true;
         return scheduler_scalar_result(
-                   local, SchedPhaseKind::ScalarPollMixCloseSeal,
+                   local, SchedPhaseKind::ScalarPollMixClose,
                    [&]() __aicore__ {
-                       return scheduler_gm_query(seal);
+                       return scheduler_cluster_load_field(&signal->sync_frontier[0]);
                    }
-               ) != 0 ||
+               ) > admission.scan_cursor ||
                scheduler_scalar_result(local, SchedPhaseKind::ScalarPollMixAssignment, [&]() __aicore__ {
                    return scheduler_gm_query(mailbox->lanes[local->config.self_lane].assigned_seq);
                }) > group.group_seq;
@@ -123,9 +124,19 @@ static inline __aicore__ bool scheduler_ordered_poll_may_progress(
     const bool releases = group.phase == SchedulerGmMixPhase::RELEASED && local->is_mix_coordinator();
     if (group.phase == SchedulerGmMixPhase::ARRIVED || releases) {
         if (group.group_seq == 0 || group.group_seq == UINT64_MAX) return true;
+        if (!releases && !local->is_mix_coordinator()) {
+            if (local->cluster_signal == nullptr) return true;
+            if (scheduler_scalar_result(local, SchedPhaseKind::ScalarPollMixArrived, [&]() __aicore__ {
+                    return scheduler_cluster_load_field(&local->cluster_signal->gm_arrival_seq);
+                }) < group.group_seq)
+                return false;
+            if (ack_prefilter_phase != nullptr) *ack_prefilter_phase = group.phase;
+            return true;
+        }
         const LaneMask resources = admission.current_resource_mask;
+        const uint8_t confirmed = releases ? group.releases_confirmed : group.arrivals_confirmed;
         for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-            if (!resources.has(static_cast<SubtaskSlot>(lane))) continue;
+            if (!resources.has(static_cast<SubtaskSlot>(lane)) || (confirmed & (1U << lane)) != 0) continue;
             auto &ack = releases ? mailbox->lanes[lane].released_seq : mailbox->lanes[lane].arrived_seq;
             const uint64_t observed = scheduler_scalar_result(
                 local, releases ? SchedPhaseKind::ScalarPollMixReleased : SchedPhaseKind::ScalarPollMixArrived,
@@ -294,7 +305,7 @@ static inline __aicore__ bool scheduler_drain_ordered_exit(
                 !admission->current_active_mask.has_aic() && admission->gm_mix.subtask_slot == UINT8_MAX) {
                 if (!scheduler_gm_mix_context_valid(graph, base, local, run)) return false;
                 bool arrived = false;
-                if (!scheduler_gm_mix_check_acks<RecordProtocol>(graph, base, local, run, false, &arrived))
+                if (!scheduler_gm_mix_arrivals_ready<RecordProtocol>(graph, base, local, run, &arrived, false))
                     return false;
                 if (!arrived) return true;
                 scheduler_gm_mix_publish_release<RecordProtocol>(base, local);

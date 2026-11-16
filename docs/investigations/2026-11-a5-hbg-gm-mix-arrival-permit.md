@@ -2,7 +2,7 @@
 
 ## Decision
 
-Do not retain this implementation: the twelve-case AICore L0 sum did not improve. The measured increase is 0.0731%; this small difference is not evidence of a stable regression, but it does not meet the retention criterion.
+The initial trial was removed because its twelve-case AICore L0 sum did not improve (+0.0731%). Under the revised criterion, proven reductions in redundant same-address atomic traffic may be retained despite a temporary latency regression. Re-adopt coordinator-only confirmation with current startup and exit-path adaptation; the historical measurements below are not measurements of the new revision.
 
 ## Protocol and validation
 
@@ -34,4 +34,29 @@ Five focused C++ suites pass, including all 652 MIX checks after updating the ex
 
 The paired C2A full L3 captures on automatically allocated device 1 record 5,415 -> 4,728 returned FAA spans inside the business kernel window, while that window changes 607.188 -> 614.561 microseconds. The t26-to-t29 kernel gap decreases 40.310 -> 34.942 microseconds. Reduced primitive counts and this shorter local gap do not establish an unprofiled whole-graph gain. Profiling perturbation and changed execution interleaving are not isolated by this pair; no cause for the aggregate result is claimed.
 
-Reproduction evidence is local under `artifacts/c2a-handoff-20261115/`: `private-cursor-final/`, `gm-ack-go/`, their gate wrappers, `gm-ack-go-l0/`, `gm-ack-go-comm-l0/`, and `trace-gm-ack/`. `artifacts/atomic-reduction-20261115/gm-ack-go12.json` contains all timed samples; `gm-ack-go-rejected.patch` preserves the complete candidate. Production code and its test migrations are removed.
+Reproduction evidence is local under `artifacts/c2a-handoff-20261115/`: `private-cursor-final/`, `gm-ack-go/`, their gate wrappers, `gm-ack-go-l0/`, `gm-ack-go-comm-l0/`, and `trace-gm-ack/`. `artifacts/atomic-reduction-20261115/gm-ack-go12.json` contains all timed samples; `gm-ack-go-rejected.patch` preserves the complete candidate. That initial implementation was removed; the current adaptation restores the mechanism with the additional startup and exit checks described below.
+
+## Current coordinator confirmation
+
+The same rendezvous, execution-return and retirement calls measure ACK-specific
+FAA operations for all four MIX lane masks. Two resource members change from
+4 arrival + 2 release reads to 1 + 1; three change from 9 + 3 to 2 + 2. The
+checks include an inactive AIC coordinator for a pure-AIV MIX. Existing GM MIX,
+startup and admission-progress suites pass. Synthetic startup workers bind the
+same SSBUF state as real bootstrap; missing SSBUF is an error rather than a
+second acknowledgement protocol.
+
+The inactive-coordinator exit drain uses the same arrival-permission helper.
+Protocol records describe the logically confirmed arrival set; only actual
+atomic primitives produce FAA spans. SSBUF permission polls reuse the existing
+arrival-readiness profiling phase. Current validation artifacts are under
+`artifacts/atomic-ownership-20261116/`.
+
+The current adaptation builds in 70.01 seconds with a clean 16/16 A5 device IR
+scan. Twelve paired AICore L0 mean durations sum to 21.4235579 ms before and
+21.5307014 ms after (+0.500120%). Keep the proven ACK-demand reduction under
+the revised criterion; this run does not establish a latency benefit. Each arm
+uses one warmup and ten samples, automatic paired devices and a pre-timing
+device rendezvous for two-rank cases. Eleven replay cases pass numerical
+validation; native MoE remains timing-only. Full evidence is
+`artifacts/atomic-reduction-20261115/gm-ack-owner12.json`.

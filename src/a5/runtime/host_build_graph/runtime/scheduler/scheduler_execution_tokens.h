@@ -31,11 +31,21 @@ static inline __aicore__ bool scheduler_execution_token_receive(
     SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarExecutionTokenReceive, token.task_ref);
     if (token.phase != SchedulerExecutionTokenPhase::TICKETED)
         return token.phase == SchedulerExecutionTokenPhase::WAIT_FANIN;
-    const auto result = scheduler_acquire_execution_token(
+    const auto result = scheduler_claim_execution_token(
         base, local->config.prepared, local->worker_id(), token.task_ref, token.block_idx, token.subtask_slot,
         &token.prepared
     );
     if (!result) return scheduler_execution_token_fail(graph, local, run, token.task_ref);
+    const uint32_t blocks = scheduler_task_metadata_at(base, local, token.task_ref)->logical_block_num;
+    const bool supplied =
+        scheduler_close_ordinary_supply(graph, base, local, run, token.task_ref, token.block_idx, blocks);
+    // Cancellation of a claimed handle inspects its Call, so payload receipt
+    // completes even when supply publication reports an error.
+    const auto received = scheduler_receive_execution_token(
+        base, local->config.prepared, token.task_ref, token.block_idx, token.subtask_slot, &token.prepared
+    );
+    if (!supplied) return false;
+    if (!received) return scheduler_execution_token_fail(graph, local, run, token.task_ref);
     token.acquired_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
     token.phase = SchedulerExecutionTokenPhase::WAIT_FANIN;
     return true;
@@ -162,6 +172,7 @@ static inline __aicore__ bool scheduler_try_execution_continuation(
     int64_t head = SCHEDULER_TASK_REF_INVALID;
     if (!scheduler_issue_head(graph, base, local, run, &head, progress, snapshot)) return false;
     if (head != task_ref) return true;
+    if (local->issue_task_ref == task_ref && local->issue_ticket_exhausted) return true;
     if (scheduler_execution_token_count(local) >= SCHEDULER_EXECUTION_TOKEN_COUNT ||
         scheduler_execution_token_has_task(local, task_ref))
         return true;
@@ -195,6 +206,7 @@ static inline __aicore__ bool scheduler_try_execution_continuation(
     if (block >= blocks) {
         if (scheduler_gm_fetch_add(control->next_block, UINT64_MAX) <= blocks)
             return scheduler_execution_token_fail(graph, local, run, task_ref);
+        if (local->issue_task_ref == task_ref) local->issue_ticket_exhausted = true;
         return true;
     }
     auto &token = local->execution_tokens[empty];
@@ -206,7 +218,6 @@ static inline __aicore__ bool scheduler_try_execution_continuation(
     token.discovery_cycles = discovery_start;
     token.phase = SchedulerExecutionTokenPhase::TICKETED;
     if (!scheduler_execution_token_receive(graph, base, local, run, token, profiling_level)) return false;
-    if (!scheduler_close_ordinary_supply(graph, base, local, run, task_ref, token.block_idx, blocks)) return false;
     *progress = true;
     if (direct_slot != nullptr) {
         if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
@@ -235,6 +246,7 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_refill_executi
         int64_t task_ref = SCHEDULER_TASK_REF_INVALID;
         if (!scheduler_issue_head(graph, base, local, run, &task_ref, progress, snapshot)) return false;
         if (scheduler_task_ref_is_null(task_ref)) return true;
+        if (local->issue_task_ref == task_ref && local->issue_ticket_exhausted) return true;
         const auto &metadata = *scheduler_task_metadata_at(base, local, task_ref);
         if (!scheduler_task_uses_execution_tokens(metadata.flags) ||
             scheduler_execution_token_has_task(local, task_ref))
@@ -254,12 +266,21 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_refill_executi
         if (empty == SCHEDULER_EXECUTION_TOKEN_COUNT)
             return scheduler_execution_token_fail(graph, local, run, task_ref);
         auto *control = scheduler_task_control_at(base, local, task_ref);
+        // Valid tickets are irrevocable; excess rollbacks cannot reopen supply.
+        // Exhaustion suppresses local claims but does not publish the supply seal.
+        if (scheduler_gm_query(control->next_block) >= blocks &&
+            scheduler_gm_fetch_add(control->next_block, UINT64_C(0)) >= blocks) {
+            scheduler_invalidate_issue_snapshot(snapshot);
+            if (local->issue_task_ref == task_ref) local->issue_ticket_exhausted = true;
+            return true;
+        }
         const uint64_t block = scheduler_gm_fetch_add(control->next_block, UINT64_C(1));
         scheduler_invalidate_issue_snapshot(snapshot);
         if (block >= blocks) {
             if (scheduler_gm_fetch_add(control->next_block, UINT64_MAX) <= blocks)
                 return scheduler_execution_token_fail(graph, local, run, task_ref);
-            continue;
+            if (local->issue_task_ref == task_ref) local->issue_ticket_exhausted = true;
+            return true;
         }
         auto &token = local->execution_tokens[empty];
         token.task_ref = task_ref;
@@ -270,7 +291,6 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_refill_executi
         token.next_fanin = 0;
         token.phase = SchedulerExecutionTokenPhase::TICKETED;
         if (!scheduler_execution_token_receive(graph, base, local, run, token, profiling_level)) return false;
-        if (!scheduler_close_ordinary_supply(graph, base, local, run, task_ref, token.block_idx, blocks)) return false;
         *progress = true;
         if (!scheduler_execution_token_observe_fanin(graph, base, local, run, token, progress)) return false;
         if (direct_slot != nullptr && token.next_fanin == token.fanin.count) {

@@ -18,6 +18,7 @@ from .native_protocol import (
     COMPLETION_FROM_CONTRIBUTION,
     COMPLETION_FROM_GROUP,
     DEFERRED_FINISH,
+    MEMBER_FROM_CLAIM,
     _completion_aliases,
     _error,
     audit_protocol_sequences,
@@ -81,7 +82,7 @@ class NativeAudit:
         self.claim_points = {}
         self.confirm_points = {}
         self.claim_seals = {}
-        self.close_reads = {}
+        self.close_proofs = {}
         self.payload_points = {}
 
     def chain(self, record, *fields):
@@ -262,7 +263,6 @@ class NativeAudit:
         stride = 64
         first = self.admissions[0]["record_offset"]
         require(first >= 64 and first % alignment == 0, "misaligned admission record")
-        seals = []
         for ref, record in sorted(self.admissions.items()):
             require(record["record_offset"] == first + ref * stride, "wrong task admission record binding")
             if ref not in cooperative:
@@ -273,25 +273,13 @@ class NativeAudit:
                     and record["block_num"] == record["member_count"] == record["active_mask"] == record["flags"] == 0,
                     "ordinary task has a cooperative admission",
                 )
-            if self.tasks[ref]["flags"] & MIX and ref in cooperative:
-                require(len(record["close_seals"]) == self.raw["cluster_count"], "missing cluster close seals")
-                seals.append(record["close_seals_offset"])
-            else:
-                require(
-                    record["close_seals_offset"] == 0 and record["close_seals"] == [], "non-Mix task has close seals"
-                )
-        if seals:
-            require(seals[0] > 0 and seals[0] % alignment == 0, "invalid close seal base")
-            seal_stride = 64
-            require(
-                seals == [seals[0] + index * self.raw["cluster_count"] * seal_stride for index in range(len(seals))],
-                "aliased or wrong task close seals",
-            )
 
-    def record_identity(self, record, ref, *, completion=False):
+    def record_identity(self, record, ref, *, completion=False, member=False):
         flags = self.tasks[ref]["flags"]
         if completion:
             flags |= record["flags"] & (DEFERRED_FINISH | COMPLETION_ALIAS_FLAGS)
+        if member:
+            flags |= record["flags"] & MEMBER_FROM_CLAIM
         require(
             record["task_ref"] == ref
             and record["run_epoch"] == self.raw["run_epoch"]
@@ -315,7 +303,7 @@ class NativeAudit:
         for index, member in self.members.items():
             order, worker = divmod(index, count)
             ref = self.raw["admission_log"][order]
-            self.record_identity(member, ref)
+            self.record_identity(member, ref, member=True)
             require(
                 member["worker_index"] == worker and member["pending_mask"] == 0,
                 "member closed with pending work or wrong owner",
@@ -326,8 +314,8 @@ class NativeAudit:
             self.causal.add(publication, point(member, "observed"))
             if not self.tasks[ref]["flags"] & MIX:
                 require(
-                    member["close_seal"] == member["last_group_seq"] == 0,
-                    "pure member closed with a Mix seal",
+                    member["close_frontier"] == member["last_group_seq"] == 0,
+                    "pure member closed with a Mix frontier",
                 )
             frontiers[worker].append(member)
         for members in frontiers.values():
@@ -708,6 +696,7 @@ class NativeAudit:
                         member["claim_seal_seen"] == member["claim_cursor_seen"] == 0,
                         "vector Mix member fabricated a cursor read",
                     )
+                    require(not member["flags"] & MEMBER_FROM_CLAIM, "vector Mix member fabricated a claim")
                     continue
                 self.close_cursor(ref, worker, owned[worker])
 
@@ -716,7 +705,7 @@ class NativeAudit:
         count = task["block_num"]
         if not task["flags"] & SYNC:
             # Ordinary records identify the fixed group owner. They carry
-            # no fresh-ticket order certificate or sync close seal.
+            # no fresh-ticket order certificate or sync retirement frontier.
             require(
                 all(block["claim"] is None for block in blocks), "ordinary cluster fabricated a sync claim certificate"
             )
@@ -785,6 +774,20 @@ class NativeAudit:
     def close_cursor(self, ref, worker, owned):
         task, member = self.tasks[ref], self.member(ref, worker)
         cursor, blocks = member["closed_cursor"], task["block_num"]
+        if member["flags"] & MEMBER_FROM_CLAIM:
+            require(
+                task["flags"] & SYNC
+                and len(owned) == 1
+                and cursor == MAX
+                and member["claim_seal_seen"] == member["claim_cursor_seen"] == 0,
+                "invalid owned-claim close proof",
+            )
+            # This event consumes the member's existing claim, not a fresh
+            # global cursor read between this and the next member's claim.
+            proof = self.claim_points[(ref, owned[0])]
+            self.close_proofs[(ref, worker)] = proof
+            self.causal.add(proof, point(member, "closed"))
+            return
         require(
             0 < cursor <= blocks
             and all(block < cursor for block in owned)
@@ -793,7 +796,7 @@ class NativeAudit:
         )
         closed = point(member, "closed")
         read = ("close_cursor_read", ref, worker)
-        self.close_reads[(ref, worker)] = read
+        self.close_proofs[(ref, worker)] = read
         self.causal.add(("event", worker, closed[2] - 1), read)
         self.causal.add(read, closed)
         self.causal.add(self.confirm_points[(ref, cursor)], read)

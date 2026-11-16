@@ -343,13 +343,10 @@ TEST(HbgAsyncPlan, DirectoriesHideUninitializedLeasesAcrossWordBoundaries) {
     ASSERT_TRUE(initialize_async_completion(image.base, plan.total_bytes, plan));
     const auto *checks =
         scheduler_state_at<SchedulerAsyncDirectoryWord>(image.base, plan.layout.check_directory_offset);
-    const auto *finishes =
-        scheduler_state_at<SchedulerAsyncDirectoryWord>(image.base, plan.layout.finish_directory_offset);
     for (uint32_t word = 0; word < 2; ++word) {
         EXPECT_EQ(checks[word].bits, 0u);
-        EXPECT_EQ(finishes[word].bits, 0u);
     }
-    auto *leases = scheduler_state_at<SchedulerAsyncLease>(image.base, plan.layout.finish_leases_offset);
+    auto *leases = scheduler_state_at<SchedulerAsyncLease>(image.base, plan.layout.group_leases_offset);
     for (uint32_t index = 0; index < 65; ++index)
         EXPECT_EQ(leases[index].word, UINT64_C(0xa5a5a5a5a5a5a5a5));
     EXPECT_EQ(scheduler_async_condition_mask(0), 0u);

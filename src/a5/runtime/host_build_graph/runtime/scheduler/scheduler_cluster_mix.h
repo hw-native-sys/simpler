@@ -232,19 +232,23 @@ static inline __aicore__ bool scheduler_cluster_mix_claim_head(
         scheduler_cluster_load_field(&signal->task_ref) == task_ref)
         return true;
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
+    if (local->issue_task_ref == task_ref && local->issue_ticket_exhausted) return true;
     SchedulerFaninView fanin{};
     if (scheduler_node_fanin_view(graph, task_ref, &fanin) != SchedulerGraphResult::OK)
         return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
     const uint32_t blocks = metadata.logical_block_num;
     auto *control = scheduler_task_control_at(base, local, task_ref);
     if (scheduler_gm_query(control->next_block) >= blocks &&
-        scheduler_gm_fetch_add(control->next_block, UINT64_C(0)) >= blocks)
+        scheduler_gm_fetch_add(control->next_block, UINT64_C(0)) >= blocks) {
+        if (local->issue_task_ref == task_ref) local->issue_ticket_exhausted = true;
         return true;
+    }
     const uint64_t block = scheduler_gm_fetch_add(control->next_block, UINT64_C(1));
     scheduler_invalidate_issue_snapshot(snapshot);
     if (block >= blocks) {
         if (scheduler_gm_fetch_add(control->next_block, UINT64_MAX) <= blocks)
             return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::BLOCK_CURSOR_INVALID);
+        if (local->issue_task_ref == task_ref) local->issue_ticket_exhausted = true;
         return true;
     }
     pending.task_ref = task_ref;

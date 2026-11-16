@@ -12,7 +12,36 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <functional>
 #include <set>
+#include <utility>
+
+#include "scheduler/scheduler_memory.h"
+
+namespace {
+thread_local std::function<void(void *)> receive_observer;
+
+void observe_receive_cache_line(void *address) {
+    if (receive_observer) {
+        auto observer = std::exchange(receive_observer, {});
+        observer(address);
+        receive_observer = std::move(observer);
+    }
+    scheduler_invalidate_cache_line(address);
+}
+
+void observe_receive_cache_line(volatile void *address) { observe_receive_cache_line(const_cast<void *>(address)); }
+
+class ScopedReceiveObserver {
+public:
+    explicit ScopedReceiveObserver(std::function<void(void *)> observer) { receive_observer = std::move(observer); }
+    ~ScopedReceiveObserver() { receive_observer = {}; }
+};
+}  // namespace
+
+#define scheduler_invalidate_cache_line observe_receive_cache_line
+#include "scheduler/scheduler_prepared_execution.h"
+#undef scheduler_invalidate_cache_line
 
 #include "hbg_scheduler_test_support.h"
 #include "prepared_execution_plan.h"
@@ -196,6 +225,67 @@ struct RefillFixture {
         ASSERT_TRUE(scheduler_complete_own_slot<false>(graph.graph(), base(), executor, storage.run_control, index, 0));
     }
 };
+
+TEST(HbgExecutionRefill, LastClaimOpensSuccessorPreparationBeforeReceivingItsPayload) {
+    for (bool invalid_call : {false, true}) {
+        SCOPED_TRACE(invalid_call);
+        RefillFixture fixture(2);
+        fixture.graph.executable(1, 0, {0});
+        ASSERT_NO_FATAL_FAILURE(fixture.initialize());
+        auto *peer = fixture.storage.local_context(&fixture.storage.contexts[3]);
+        uint64_t index = UINT64_MAX;
+        ASSERT_TRUE(
+            scheduler_prepared_execution_index(fixture.base(), fixture.local->config.prepared, 0, 0, 0, &index)
+        );
+        auto *call = scheduler_prepared_call_at(fixture.base(), fixture.local->config.prepared, index);
+        if (invalid_call) call->function_bin_addr = 0;
+        uint32_t observations = 0;
+        ScopedReceiveObserver observer([&](void *address) {
+            if (address != call || observations != 0) return;
+            ++observations;
+            EXPECT_EQ(fixture.control(0)->claim_seal, 1u);
+            EXPECT_EQ(fixture.local->execution_tokens[0].phase, SchedulerExecutionTokenPhase::TICKETED);
+            EXPECT_EQ(
+                scheduler_prepared_phase(fixture.local->execution_tokens[0].prepared.claimed_state),
+                SchedulerPreparedPhase::CLAIMED
+            );
+            bool progress = false;
+            ASSERT_TRUE(scheduler_refill_execution_tokens(
+                fixture.graph.graph(), fixture.base(), peer, fixture.storage.run_control, 0, &progress
+            ));
+            EXPECT_TRUE(progress);
+            EXPECT_EQ(fixture.control(1)->next_block, 1u);
+            EXPECT_EQ(peer->execution_tokens[0].task_ref, 1);
+            EXPECT_EQ(peer->execution_tokens[0].phase, SchedulerExecutionTokenPhase::WAIT_FANIN);
+            EXPECT_EQ(peer->execution_tokens[0].next_fanin, 0u);
+            EXPECT_EQ(peer->local_ready_mask, 0u);
+            EXPECT_FALSE(scheduler_completion_done(fixture.control(0)->completion_state));
+        });
+        bool progress = false;
+        EXPECT_EQ(fixture.refill(&progress), !invalid_call);
+        ASSERT_EQ(observations, 1u);
+        if (invalid_call) {
+            EXPECT_NE(fixture.storage.run_control->scheduler_error, 0u);
+            EXPECT_FALSE(scheduler_completion_done(fixture.control(0)->completion_state));
+            EXPECT_FALSE(scheduler_completion_done(fixture.control(1)->completion_state));
+            EXPECT_TRUE(scheduler_cancel_unstarted_work(fixture.base(), fixture.local));
+            EXPECT_TRUE(scheduler_cancel_unstarted_work(fixture.base(), peer));
+            EXPECT_EQ(scheduler_execution_token_count(fixture.local), 0u);
+            EXPECT_EQ(scheduler_execution_token_count(peer), 0u);
+        } else {
+            uint32_t slot = UINT32_MAX;
+            ASSERT_TRUE(fixture.progress(&slot));
+            ASSERT_LT(slot, SCHEDULER_PENDING_SLOT_COUNT);
+            ASSERT_NO_FATAL_FAILURE(fixture.execute(slot));
+            ASSERT_TRUE(scheduler_progress_execution_tokens(
+                fixture.graph.graph(), fixture.base(), peer, fixture.storage.run_control, 0, &slot, &progress
+            ));
+            ASSERT_LT(slot, SCHEDULER_PENDING_SLOT_COUNT);
+            EXPECT_EQ(peer->slots[slot].task_ref, 1);
+            EXPECT_EQ(fixture.storage.run_control->scheduler_error, 0u);
+        }
+    }
+}
 
 TEST(HbgExecutionRefill, AWorkerCannotSkipTheUnissuedRemainderOfItsCurrentTask) {
     RefillFixture fixture(4);

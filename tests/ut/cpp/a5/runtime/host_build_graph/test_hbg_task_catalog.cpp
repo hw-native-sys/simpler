@@ -141,7 +141,7 @@ TEST(HbgTaskCatalog, OrdinaryFaninConfirmsEarlierBranchWithoutChangingDependenci
     auto *const fanin_address = payload.fanin_data();
     std::vector<int32_t> original(fanin_address, fanin_address + payload.fanin_count);
 
-    ASSERT_TRUE(scheduler_order_ordinary_fanin(graph.storage(), image.plan.task_ranks, {}, &error)) << error;
+    ASSERT_TRUE(scheduler_prepare_ordinary_fanin(graph.storage(), image.plan.task_ranks, {}, &error)) << error;
     ASSERT_EQ(payload.fanin_count, 3);
     EXPECT_EQ(payload.fanin_data(), fanin_address);
     std::vector<int32_t> reordered(fanin_address, fanin_address + payload.fanin_count);
@@ -155,6 +155,111 @@ TEST(HbgTaskCatalog, OrdinaryFaninConfirmsEarlierBranchWithoutChangingDependenci
     EXPECT_EQ(image.plan.catalogs, catalogs);
 }
 
+TEST(HbgTaskCatalog, FoldingSingleConsumerControlsPreservesRealCompletionDebt) {
+    scheduler_test::BasicGraphBuffer<8> graph(8);
+    std::vector<SchedulerTaskMetadata> metadata(8, physical(LaneMask::aic()));
+    for (uint32_t ref = 0; ref < metadata.size(); ++ref) {
+        graph.executable(ref, 0);
+        metadata[ref].kernel_ids[0] = 1;
+        metadata[ref].kernel_ids[1] = metadata[ref].kernel_ids[2] = UINT16_MAX;
+    }
+    graph.executable(2, 0, {0, 1});
+    graph.executable(3, 0, {2});
+    graph.executable(4, 0, {3, 0});
+    graph.executable(5, 0, {4});
+    graph.executable(6, 0, {-1});
+    std::vector<int64_t> completed{6};
+    metadata[6] = {};
+    for (const uint32_t ref : {2u, 3u, 5u}) {
+        metadata[ref].flags |= SCHEDULER_TASK_INLINE;
+        for (uint32_t lane = 0; lane < 3; ++lane) {
+            metadata[ref].kernel_ids[lane] = UINT16_MAX;
+            graph.storage()[ref].task.kernel_id[lane] = -1;
+        }
+    }
+    auto *pool = graph.payload(0).fanin_data();
+    CatalogImage image(metadata);
+    ASSERT_TRUE(scheduler_order_task_catalog(graph.graph(), metadata, completed, &image.plan));
+    std::string error;
+    ASSERT_TRUE(scheduler_fold_ordinary_controls(
+        graph.storage(), pool, 8 * SCHEDULER_GRAPH_MAX_FANIN, &metadata, &completed, &error
+    )) << error;
+    EXPECT_EQ(completed, (std::vector<int64_t>{2, 3, 5, 6}));
+    ASSERT_EQ(graph.payload(4).fanin_count, 2);
+    EXPECT_EQ(
+        std::vector<int32_t>(graph.payload(4).fanin_data(), graph.payload(4).fanin_data() + 2),
+        (std::vector<int32_t>{0, 1})
+    );
+    for (const uint32_t ref : {2u, 3u, 5u}) {
+        EXPECT_EQ(metadata[ref].flags, 0);
+        EXPECT_EQ(metadata[ref].logical_block_num, 0);
+        EXPECT_EQ(graph.payload(ref).fanin_count, 0);
+    }
+    scheduler_test::FixtureStorage storage(8, 3, 1);
+    std::copy(metadata.begin(), metadata.end(), storage.metadata);
+    storage.prepare_catalog();
+    ASSERT_TRUE(storage.prepare_calls(graph.graph()));
+    auto *local = storage.local_context(&storage.contexts[0]);
+    auto *base = storage.scheduler_state->base();
+    for (const int64_t ref : completed)
+        scheduler_task_control_at(base, local, ref)->completion_state = scheduler_completion_completed_state(1);
+    scheduler_task_control_at(base, local, 0)->completion_state = scheduler_completion_encode(1, 0, 1);
+    scheduler_task_control_at(base, local, 1)->completion_state = scheduler_completion_completed_state(1);
+    SchedulerFaninView fanin{};
+    ASSERT_EQ(scheduler_node_fanin_view(graph.graph(), 4, &fanin), SchedulerGraphResult::OK);
+    uint32_t prefix = 0;
+    bool ready = false;
+    ASSERT_TRUE(
+        scheduler_observe_fanin_prefix(graph.graph(), base, local, storage.run_control, 4, fanin, prefix, &ready)
+    );
+    EXPECT_FALSE(ready);
+    EXPECT_EQ(prefix, 0u);
+    scheduler_task_control_at(base, local, 0)->completion_state = scheduler_completion_completed_state(1);
+    ASSERT_TRUE(
+        scheduler_observe_fanin_prefix(graph.graph(), base, local, storage.run_control, 4, fanin, prefix, &ready)
+    );
+    EXPECT_TRUE(ready);
+    EXPECT_EQ(prefix, 2u);
+}
+
+TEST(HbgTaskCatalog, SharedAndOversizedControlJoinsRemainLive) {
+    for (const bool shared : {true, false}) {
+        const uint32_t count = shared ? 5 : 131;
+        scheduler_test::BasicGraphBuffer<256> graph(count);
+        std::vector<SchedulerTaskMetadata> metadata(count, physical(LaneMask::aic()));
+        for (uint32_t ref = 0; ref < count; ++ref)
+            graph.executable(ref, 0);
+        const uint32_t join = shared ? 2 : 64;
+        std::vector<int32_t> parents;
+        for (uint32_t ref = 0; ref < join; ++ref)
+            parents.push_back(ref);
+        graph.executable(join, 0, parents);
+        metadata[join].flags |= SCHEDULER_TASK_INLINE;
+        for (uint32_t lane = 0; lane < 3; ++lane) {
+            metadata[join].kernel_ids[lane] = UINT16_MAX;
+            graph.storage()[join].task.kernel_id[lane] = -1;
+        }
+        if (shared) {
+            graph.executable(3, 0, {2});
+            graph.executable(4, 0, {2});
+        } else {
+            std::vector<int32_t> dependencies;
+            for (uint32_t ref = join; ref < count - 1; ++ref)
+                dependencies.push_back(ref);
+            graph.executable(count - 1, 0, dependencies);
+        }
+        std::vector<int64_t> completed;
+        auto *const consumer_fanin = graph.payload(count - 1).fanin_data();
+        ASSERT_TRUE(scheduler_fold_ordinary_controls(
+            graph.storage(), graph.payload(0).fanin_data(), count * SCHEDULER_GRAPH_MAX_FANIN, &metadata, &completed
+        ));
+        EXPECT_TRUE(completed.empty());
+        EXPECT_TRUE(scheduler_task_is_inline(metadata[join].flags));
+        EXPECT_EQ(graph.payload(join).fanin_count, static_cast<int32_t>(parents.size()));
+        EXPECT_EQ(graph.payload(count - 1).fanin_data(), consumer_fanin);
+    }
+}
+
 TEST(HbgTaskCatalog, CompletedNodesDoNotReadStaleIncomingDependenciesDuringOrdering) {
     scheduler_test::BasicGraphBuffer<8> graph(3);
     graph.executable(0, 0, {INT32_MAX});
@@ -166,9 +271,83 @@ TEST(HbgTaskCatalog, CompletedNodesDoNotReadStaleIncomingDependenciesDuringOrder
     EXPECT_FALSE(scheduler_order_task_catalog(graph.graph(), metadata, {}, &image.plan, &error));
     ASSERT_TRUE(scheduler_order_task_catalog(graph.graph(), metadata, {0}, &image.plan, &error)) << error;
     EXPECT_EQ(image.plan.catalogs[0], (std::vector<int64_t>{0, 2, 1}));
-    ASSERT_TRUE(scheduler_order_ordinary_fanin(graph.storage(), image.plan.task_ranks, {0}, &error)) << error;
+    ASSERT_TRUE(scheduler_prepare_ordinary_fanin(graph.storage(), image.plan.task_ranks, {0}, &error)) << error;
     EXPECT_EQ(graph.payload(0).fanin_data()[0], INT32_MAX);
     EXPECT_EQ(graph.payload(1).fanin_count, 2);
+}
+
+TEST(HbgTaskCatalog, ResidentFaninDropsOnlyPredecessorsProvenByAnotherLiveDependency) {
+    scheduler_test::BasicGraphBuffer<8> graph(5);
+    graph.executable(0, 0);
+    graph.executable(1, 0);
+    graph.executable(2, 0, {0});
+    graph.executable(3, 0, {0, 2});
+    graph.executable(4, 0, {0, 1, 2, 3});
+    const std::vector<SchedulerTaskMetadata> metadata(5, physical(LaneMask::aic()));
+    CatalogImage image(metadata);
+    ASSERT_TRUE(scheduler_order_task_catalog(graph.graph(), metadata, {}, &image.plan));
+    const auto catalogs = image.plan.catalogs;
+    const auto order = image.plan.task_order;
+    ASSERT_TRUE(scheduler_prepare_ordinary_fanin(graph.storage(), image.plan.task_ranks, {}));
+    ASSERT_EQ(graph.payload(3).fanin_count, 1);
+    EXPECT_EQ(graph.payload(3).fanin_data()[0], 2);
+    ASSERT_EQ(graph.payload(4).fanin_count, 2);
+    EXPECT_EQ(graph.payload(4).fanin_data()[0], 1);
+    EXPECT_EQ(graph.payload(4).fanin_data()[1], 3);
+    EXPECT_EQ(image.plan.catalogs, catalogs);
+    EXPECT_EQ(image.plan.task_order, order);
+}
+
+TEST(HbgTaskCatalog, HostCompletedNodeCannotProveItsHistoricalPredecessorDone) {
+    scheduler_test::BasicGraphBuffer<4> graph(3);
+    graph.executable(0, 0);
+    graph.executable(1, 0, {0});
+    graph.executable(2, 0, {0, 1});
+    ASSERT_TRUE(scheduler_prepare_ordinary_fanin(graph.storage(), {0, 1, 2}, {1}));
+    EXPECT_EQ(graph.payload(2).fanin_count, 2);
+}
+
+TEST(HbgTaskCatalog, AliasedFaninRowsKeepEveryOriginalDependency) {
+    for (const bool transitive : {false, true}) {
+        SCOPED_TRACE(transitive);
+        scheduler_test::BasicGraphBuffer<8> graph(5);
+        graph.executable(0, 0);
+        graph.executable(1, 0, transitive ? std::vector<int32_t>{0} : std::vector<int32_t>{});
+        graph.executable(2, 0);
+        graph.executable(3, 0, {0, 1, 2});
+        graph.executable(4, 0, {1});
+        auto *const row = graph.payload(3).fanin_data();
+        graph.payload(4).fanin.set(row + 1);
+        const std::vector<uint32_t> ranks =
+            transitive ? std::vector<uint32_t>{0, 1, 2, 3, 4} : std::vector<uint32_t>{0, 2, 1, 3, 4};
+
+        ASSERT_TRUE(scheduler_prepare_ordinary_fanin(graph.storage(), ranks, {}));
+        ASSERT_EQ(graph.payload(4).fanin_count, 1);
+        EXPECT_EQ(graph.payload(4).fanin_data()[0], 1);
+        EXPECT_EQ(graph.payload(3).fanin_count, 3);
+        EXPECT_EQ(std::vector<int32_t>(row, row + 3), (std::vector<int32_t>{0, 1, 2}));
+    }
+}
+
+TEST(HbgTaskCatalog, BoundedAncestryRetainsDistantEdgesAndValidatesBeforeMutation) {
+    scheduler_test::BasicGraphBuffer<128> graph(66);
+    std::vector<uint32_t> ranks(66);
+    for (int32_t ref = 0; ref < 66; ++ref) {
+        graph.executable(ref, 0);
+        ranks[ref] = ref;
+    }
+    graph.executable(1, 0, {0});
+    graph.executable(64, 0, {0, 1});
+    graph.executable(65, 0, {0, 1, 64, 65});
+    EXPECT_FALSE(scheduler_prepare_ordinary_fanin(graph.storage(), ranks, {}));
+    EXPECT_EQ(graph.payload(64).fanin_count, 2);
+    graph.executable(65, 0, {0, 1, 64});
+    ASSERT_TRUE(scheduler_prepare_ordinary_fanin(graph.storage(), ranks, {}));
+    ASSERT_EQ(graph.payload(64).fanin_count, 1);
+    EXPECT_EQ(graph.payload(64).fanin_data()[0], 1);
+    ASSERT_EQ(graph.payload(65).fanin_count, 2);
+    EXPECT_EQ(graph.payload(65).fanin_data()[0], 0);
+    EXPECT_EQ(graph.payload(65).fanin_data()[1], 64);
 }
 
 TEST(HbgTaskCatalog, CrossEnginePredecessorRequiresIssuedSupplyRatherThanLogicalCompletion) {

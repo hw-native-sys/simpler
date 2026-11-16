@@ -141,12 +141,13 @@ static inline __aicore__ uint64_t scheduler_async_lease_load(__gm__ SchedulerAsy
     return scheduler_gm_fetch_add(lease.word, UINT64_C(0));
 }
 
-static inline __aicore__ SchedulerAsyncLeaseOutcome scheduler_async_lease_publish(__gm__ SchedulerAsyncLease &lease) {
-    scheduler_async_state_detail::GmAtomics atomics{lease.word};
-    return scheduler_async_state_detail::transition(
-        atomics, scheduler_async_lease_encode(1, SchedulerAsyncPhase::DORMANT),
-        scheduler_async_lease_encode(1, SchedulerAsyncPhase::RUNNABLE)
-    );
+// Only the first successful seal may initialize an unpublished lease. Its old
+// storage is unspecified; the directory cannot expose it until the Exch completes.
+static inline __aicore__ uint64_t scheduler_async_lease_initialize(__gm__ SchedulerAsyncLease &lease) {
+    const uint64_t word = scheduler_async_lease_encode(1, SchedulerAsyncPhase::RUNNABLE);
+    scheduler_gm_store(lease.word, word);
+    scheduler_cache_barrier();
+    return word;
 }
 
 static inline __aicore__ SchedulerAsyncLeaseOutcome

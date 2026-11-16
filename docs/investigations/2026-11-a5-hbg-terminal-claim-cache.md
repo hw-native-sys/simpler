@@ -5,8 +5,8 @@
 Reject the terminal claim-count cache. It reduced repeated cursor observations
 in SWA L3 but increased the sum of sixteen L0 means by 3.17%.
 
-The retained runtime re-reads the admission claim cursor. Neither a valid ticket
-nor a local reservation substitutes for confirmed member claims and the seal.
+The retained baseline for that trial re-read the admission claim cursor.
+A local reservation does not substitute for global claim exhaustion or its seal.
 
 ## Candidate and evidence
 
@@ -96,3 +96,18 @@ Production code and the added tests were reverted. Local evidence is under
 `artifacts/hbg-sixteen-optimization-20261115/`: `monotone-tail-ticket/`,
 `tail-ticket-eval/summary.json`, `tail-ticket-cpp-tests.log`,
 `tail-ticket-py-tests.log`, and `tail-ticket-rejected.patch`.
+
+## Follow-up experiments
+
+Each report retains its own decision, measurements and evidence locations.
+The measurements are incremental comparisons and must not be added together.
+
+- [Local excess-ticket suppression with rollback retained](2026-11-a5-hbg-task-state/excess-ticket-suppression.md)
+- [Local closure from an owned sync_start block](2026-11-a5-hbg-task-state/owned-sync-start-closure.md)
+- [Sync MIX closure through the existing SSBUF frontier](2026-11-a5-hbg-task-state/mix-ssbuf-frontier.md)
+- [Prefer canonical DONE when observing closed supply](2026-11-a5-hbg-task-state/canonical-done-observation.md)
+- [Confirm exhausted ordinary supply before reserving another ticket](2026-11-a5-hbg-task-state/ordinary-supply-exhaustion.md)
+- [Publish ordinary supply after Claim, before payload receipt](2026-11-a5-hbg-task-state/supply-before-receipt.md)
+- [Confirm async FINISH with the canonical CAS](2026-11-a5-hbg-task-state/async-finish-cas.md)
+- [Reuse the completion writer's own DONE proof](2026-11-a5-hbg-task-state/completion-writer-proof.md)
+- [Fold single-consumer ordinary control nodes](2026-11-a5-hbg-task-state/ordinary-control-folding.md)

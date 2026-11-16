@@ -18,6 +18,35 @@ namespace {
 using namespace pto2::resident;
 using namespace scheduler_test::gm_mix;
 
+TEST(HbgAdmissionProgress, CompletedPureSyncMemberClosesFromItsOwnClaim) {
+    GmMixFixture fixture({{2, LaneMask::aic(), true}}, true, 2);
+    ASSERT_TRUE(fixture.prepare_calls());
+    ASSERT_TRUE(fixture.admit(0));
+    ASSERT_TRUE(fixture.fill(0));
+    GmExecution execution{};
+    ASSERT_TRUE(fixture.begin(0, &execution));
+    ASSERT_TRUE(fixture.complete(execution));
+    bool closed = false;
+    ASSERT_TRUE(scheduler_close_ordered_obligation(
+        fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), &closed
+    ));
+    EXPECT_TRUE(closed);
+    EXPECT_EQ(fixture.control(0)->next_block, 1u);
+    EXPECT_EQ(fixture.control(0)->claim_seal, 0u);
+    EXPECT_FALSE(fixture.task_done(0));
+    auto *members = scheduler_state_at<SchedulerProtocolMemberTrace>(
+        fixture.base(), fixture.storage.layout.protocol.members_offset
+    );
+    EXPECT_NE(members[0].flags & SCHEDULER_PROTOCOL_MEMBER_FROM_CLAIM, 0u);
+    EXPECT_EQ(members[0].closed_cursor, UINT64_MAX);
+    EXPECT_EQ(members[0].claim_cursor_seen, 0u);
+    ASSERT_TRUE(fixture.refresh(3));
+    ASSERT_TRUE(scheduler_close_ordered_obligation(
+        fixture.graph.graph(), fixture.base(), fixture.locals[3], fixture.run(), &closed
+    ));
+    EXPECT_FALSE(closed);
+}
+
 TEST(HbgAdmissionProgress, ExistingReadyWindowRunsBeforeTheFirstCohortClaim) {
     for (const bool mixed : {false, true}) {
         SCOPED_TRACE(mixed);
@@ -337,13 +366,15 @@ TEST(HbgAdmissionProgress, DeferredPredecessorLeavesIndependentCounterPublisherR
                     ASSERT_TRUE(fixture.complete(execution));
                 }
                 bool progress = false;
+                SchedulerAsyncCompletion completion{};
                 ASSERT_TRUE(scheduler_async_check_step(
-                    async_workers[worker], worker == 0 ? 1 : 2, 8, SchedulerAsyncCompletionObserver{}, progress
+                    async_workers[worker], worker == 0 ? 1 : 2, 8, SchedulerAsyncCompletionObserver{}, progress,
+                    completion
                 ));
-                ASSERT_TRUE(scheduler_async_finish_step(
-                    fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), async_workers[worker],
-                    progress
-                ));
+                if (completion.result == SchedulerAsyncCompletionResult::FINISH_OWNER)
+                    ASSERT_TRUE(scheduler_async_complete_task(
+                        fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), completion
+                    ));
             }
         }
         EXPECT_EQ(publishers, 1u);

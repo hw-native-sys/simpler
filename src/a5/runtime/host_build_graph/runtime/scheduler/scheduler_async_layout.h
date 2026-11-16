@@ -24,9 +24,7 @@ struct alignas(64) SchedulerAsyncLayout {
     uint64_t group_leases_offset;
     uint64_t group_progress_offset;
     uint64_t joins_offset;
-    uint64_t finish_leases_offset;
     uint64_t check_directory_offset;
-    uint64_t finish_directory_offset;
     uint32_t task_count;
     uint32_t async_task_count;
     uint32_t group_count;
@@ -57,8 +55,8 @@ struct alignas(64) SchedulerAsyncActivity {
 };
 
 static_assert(sizeof(SchedulerAsyncLayout) == 128 && alignof(SchedulerAsyncLayout) == 64);
-static_assert(offsetof(SchedulerAsyncLayout, task_count) == 88);
-static_assert(offsetof(SchedulerAsyncLayout, activity_offset) == 112);
+static_assert(offsetof(SchedulerAsyncLayout, task_count) == 72);
+static_assert(offsetof(SchedulerAsyncLayout, activity_offset) == 96);
 static_assert(sizeof(SchedulerAsyncActivity) == 64 && alignof(SchedulerAsyncActivity) == 64);
 static_assert(
     std::is_standard_layout_v<SchedulerAsyncActivity> && std::is_trivially_copyable_v<SchedulerAsyncActivity>
