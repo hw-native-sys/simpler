@@ -1099,7 +1099,7 @@ inline __aicore__ int32_t percounter_sync_take_block(const LaneConfig &cfg, uint
 }
 
 /**
- * Run the block this lane holds, now that its cohort is released.
+ * Run a released single-lane block or arm a MIX block's local preparation.
  *
  * A MIX cohort block arms this lane's own cluster instead, with `cohort_block`
  * set so the rendezvous reports to the queue rather than to the MIX list. A
@@ -1173,13 +1173,12 @@ percounter_sync_serve_block(const LaneConfig &cfg, PercounterLaneState *state, u
 }
 
 /**
- * Serve the block this lane holds if its cohort has been released; `served`
- * reports whether a block was run or armed. Checked at every checkpoint, ahead
- * of MIX discovery, and costs one load only while a block is held.
+ * Serve a released single-lane block or arm a MIX block during gathering;
+ * `served` reports whether a block was run or armed. MIX participants prepare
+ * and arrive locally, then wait for global release before entering kernels.
  *
- * **This is the only way a held block enters its kernel, and the order a lane
- * owing two gatherings serves them in is enforced here rather than in the
- * callers.** Entering the block's kernel puts this lane where no checkpoint
+ * The order a lane owing two gatherings serves them in is enforced here.
+ * Entering the block's kernel puts this lane where no checkpoint
  * reaches it until its co-holders arrive, so it is the step that cannot be
  * taken back, and every reason to wait is checked before it.
  *
@@ -1194,8 +1193,8 @@ percounter_sync_serve_block(const LaneConfig &cfg, PercounterLaneState *state, u
  * cannot cover: an arming reads them clear, and a lane takes a block and
  * reaches here before the store that would have told it so.
  *
- * Returns false on an error, including a cohort that has not filled within the
- * watchdog since this lane took its block.
+ * A held single-lane block uses the watchdog since its claim. An armed MIX
+ * block's global-release wait uses a watchdog from entry to that wait.
  */
 inline __aicore__ bool percounter_sync_serve_released(
     const LaneConfig &cfg, PercounterLaneState *state, uint64_t timeout_cycles, bool *served
@@ -1208,9 +1207,10 @@ inline __aicore__ bool percounter_sync_serve_released(
     // block's budget bounds.
     if (percounter_line_precedes_block(cfg, state)) return true;
     if (percounter_line_staging_for(cfg)) return true;
-    // Cohorts are promoted in sequence order, so this one is fully claimed
-    // exactly when the counter passes it.
-    if (percounter_gm_read(cfg.sync_queue->released) > sync->my_seq) {
+    // Local MIX preparation is safe during gathering; its kernel remains
+    // gated by the exact sequence in percounter_serve_mix.
+    const bool mix = (sync->active_mask & (sync->active_mask - 1U)) != 0;
+    if (mix || percounter_gm_read(cfg.sync_queue->released) > sync->my_seq) {
         const bool ok = percounter_sync_serve_block(cfg, state, timeout_cycles);
         *served = sync->my_block < 0;
         return ok;
@@ -1534,9 +1534,10 @@ inline __aicore__ bool percounter_mix_wait(
  * This lane's part in one rendezvous: arrive, wait for the others, run its own
  * subtask, report finished.
  *
- * **Writing `arrived` is irrevocable.** Once it completes the mask a peer may
- * enter its kernel, and a lane that then withdrew would leave that peer waiting
- * on an end that never comes. Nothing can make a participant want to withdraw:
+ * **Writing `arrived` is irrevocable.** It permits a peer to finish the local
+ * rendezvous; cohort participants must also observe global release before
+ * entering kernels. A lane withdrawing would leave that peer waiting on an
+ * end that never comes. Nothing can make a participant want to withdraw:
  * the claimer announced the task only once it was ready, and readiness is
  * monotone. The readiness check below is therefore an assertion.
  *
@@ -1547,11 +1548,12 @@ inline __aicore__ bool percounter_mix_wait(
  */
 inline __aicore__ bool percounter_serve_mix(
     const LaneConfig &cfg, uint32_t generation, int64_t task_id, uint32_t mask, int32_t block_idx, int32_t block_num,
-    bool cohort_block, PercounterLaneState *state, uint64_t timeout_cycles
+    uint32_t cohort_sequence, PercounterLaneState *state, uint64_t timeout_cycles
 ) {
     ProfileScope profile_scope(cfg.scalar, ProfilePhase::MixServe);
     PERCOUNTER_SSBUF PercounterMixSignal *signal = cfg.mix_signal;
     const uint32_t lane = static_cast<uint32_t>(cfg.cluster_lane);
+    const bool cohort_block = cohort_sequence != 0;
     PercounterTask task{};
     if (!percounter_resolve(cfg, task_id, &task)) return false;
     if (!percounter_fanin_ready(cfg, task)) {
@@ -1574,6 +1576,23 @@ inline __aicore__ bool percounter_serve_mix(
 
     percounter_ssbuf_store_release(&signal->arrived[lane], generation);
     if (!percounter_mix_wait(cfg, signal->arrived, mask, generation, timeout_cycles)) return false;
+    if (cohort_block) {
+        const uint64_t start = get_sys_cnt_aicore();
+        uint32_t checks = 0;
+        while (percounter_gm_read(cfg.sync_queue->released) < cohort_sequence) {
+            bool settled = false;
+            if (!percounter_async_tick(cfg, state, &settled)) return false;
+            if (++checks == PERCOUNTER_SPIN_CHECK_INTERVAL) {
+                checks = 0;
+                if (percounter_should_stop(cfg)) return false;
+                if (scheduler_watchdog_expired(start, get_sys_cnt_aicore(), timeout_cycles)) {
+                    percounter_fail(cfg, SchedulerGraphResult::TIMEOUT);
+                    return false;
+                }
+            }
+            SPIN_WAIT_HINT();
+        }
+    }
     // Inside the kernel this lane polls nothing. Every participant has arrived,
     // so a cross-core channel wait in it has a peer to meet.
     bool deferred = false;
@@ -1642,14 +1661,14 @@ percounter_mix_discover(const LaneConfig &cfg, PercounterLaneState *state, uint6
     const uint32_t mask = signal->active_mask;
     const int32_t block_idx = signal->block_idx;
     const int32_t block_num = signal->block_num;
-    const bool cohort_block = signal->cohort_block != 0;
+    const uint32_t cohort_sequence = signal->cohort_block;
     if (percounter_ssbuf_load_acquire(&signal->armed_generation) != generation) return true;
 
     state->last_served = generation;
     if ((mask & (uint32_t{1} << cfg.cluster_lane)) == 0) return true;
     *served = true;
     return percounter_serve_mix(
-        cfg, generation, task_id, mask, block_idx, block_num, cohort_block, state, timeout_cycles
+        cfg, generation, task_id, mask, block_idx, block_num, cohort_sequence, state, timeout_cycles
     );
 }
 
@@ -1867,6 +1886,13 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
                     const uint32_t group = (cfg.ticket_group + spent_groups) % cfg.ticket_group_count;
                     const uint64_t size = percounter_group_size(cfg.order_count, group, cfg.ticket_group_count);
                     if (size != 0) {
+                        // Tickets only advance during a run. An exhausted remote
+                        // group cannot offer work, so do not serialize another
+                        // returning atomic on its counter.
+                        if (spent_groups != 0 && percounter_gm_read(cfg.tickets[group].next) >= size) {
+                            ++spent_groups;
+                            continue;
+                        }
                         const uint64_t index = percounter_gm_fetch_add(cfg.tickets[group].next, uint64_t{1});
                         if (index < size) {
                             pending[pending_count].position =

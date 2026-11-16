@@ -21,6 +21,7 @@ uint64_t get_aicore_report_epoch();
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <thread>
@@ -823,4 +824,283 @@ TEST(PercounterPayload, TimingCommitFollowsCompletionAndKeepsCapturedIdentity) {
     EXPECT_LE(records[0].start, records[0].finish);
     percounter_commit_task_timing(f.cfg[0]);
     EXPECT_EQ(count, 1U);
+}
+
+TEST(PercounterPayload, MixCohortArmsLocalPreparationBeforeFinalClaim) {
+    Fixture f;
+    f.fanin[0].count = 0;
+    f.set_task(0, 7, 2);
+    for (auto &cfg : f.cfg) {
+        cfg.mix_order_count = 1;
+        cfg.sync_cohort_count = 2;
+        cfg.sync_block_total = 2;
+    }
+    percounter_sync_enqueue(f.cfg[1], f.resolve(0), 2);
+    bool served = false;
+    ASSERT_TRUE(percounter_sync_take(f.cfg[1], &f.state[1], budget, &served));
+    ASSERT_EQ(f.state[1].sync.my_block, 0);
+    ASSERT_EQ(f.queue.released, 0U);
+    ASSERT_TRUE(percounter_sync_serve_released(f.cfg[1], &f.state[1], budget, &served));
+    EXPECT_TRUE(served);
+    EXPECT_EQ(f.state[1].sync.my_block, -1);
+    EXPECT_TRUE(percounter_mix_armed(f.signals[0].armed_generation));
+    EXPECT_EQ(f.signals[0].cohort_block, 1U);
+    EXPECT_EQ(f.queue.released, 0U);
+    EXPECT_EQ(*percounter_sync_claims(f.sync_pending.data(), 2, 0), 1U);
+    EXPECT_FALSE(percounter_counter_published(f.counters[0].value));
+}
+
+namespace {
+template <typename Event>
+bool await_protocol_event(Event event) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!event()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+void configure_mix_cohorts(Fixture &f, uint32_t mask) {
+    f.fanin[0].count = 0;
+    f.set_task(0, mask, 2);
+    f.set_task(1, mask, 2);
+    for (auto &cfg : f.cfg) {
+        cfg.mix_order_count = 1;
+        cfg.mix_rendezvous_count = 0;
+        cfg.sync_cohort_count = 2;
+        cfg.sync_block_total = 4;
+    }
+}
+
+bool local_arrived(Fixture &f, uint32_t mask) {
+    const uint32_t generation = percounter_ssbuf_load_acquire(&f.signals[0].armed_generation);
+    for (uint32_t lane = 0; lane < 3; ++lane)
+        if ((mask & (1U << lane)) && percounter_ssbuf_load_acquire(&f.signals[0].arrived[lane]) < generation)
+            return false;
+    return true;
+}
+
+void execute_early_sequence(Fixture &f, uint32_t mask, uint64_t sequence) {
+    SCOPED_TRACE(::testing::Message() << "mask=" << mask << " seq=" << sequence);
+    std::atomic<int> entered{0}, premature{0};
+    std::atomic<bool> finish{false};
+    const int expected = 2 * __builtin_popcount(mask);
+    execute = [&](int64_t *args) {
+        EXPECT_EQ(args[0], f.scalars[sequence]);
+        if (percounter_gm_read(f.queue.released) < sequence + 1) ++premature;
+        ++entered;
+        EXPECT_TRUE(await_protocol_event([&] {
+            return finish.load(std::memory_order_acquire);
+        }));
+    };
+    bool served = false;
+    ASSERT_TRUE(percounter_sync_take(f.cfg[1], &f.state[1], budget, &served));
+    ASSERT_EQ(f.state[1].sync.my_block, 0);
+    ASSERT_TRUE(percounter_sync_serve_released(f.cfg[1], &f.state[1], budget, &served));
+    ASSERT_TRUE(served);
+    ASSERT_EQ(f.signals[0].cohort_block, sequence + 1);
+    std::vector<std::thread> peers;
+    for (uint32_t lane = 0; lane < 3; ++lane)
+        if (mask & (1U << lane))
+            peers.emplace_back([&, lane] {
+                EXPECT_TRUE(f.checkpoint(lane));
+            });
+    const bool arrived_before_last_claim = await_protocol_event([&] {
+        return local_arrived(f, mask);
+    });
+    const int entered_before_last_claim = entered.load();
+    const uint64_t released_before_last_claim = percounter_gm_read(f.queue.released);
+    const uint64_t claims_before_last_claim =
+        percounter_gm_read(*percounter_sync_claims(f.sync_pending.data(), 2, sequence));
+    EXPECT_TRUE(percounter_sync_take(f.cfg[4], &f.state[4], budget, &served));
+    EXPECT_EQ(f.signals[1].cohort_block, sequence + 1);
+    for (uint32_t lane = 0; lane < 3; ++lane)
+        if (mask & (1U << lane))
+            peers.emplace_back([&, lane] {
+                EXPECT_TRUE(f.checkpoint(3 + lane));
+            });
+    const bool all_kernels_entered = await_protocol_event([&] {
+        return entered.load() == expected;
+    });
+    const uint64_t completed_while_kernels_held = percounter_gm_read(f.queue.completed);
+    percounter_sync_promote(f.cfg[1]);
+    const uint64_t generation_while_kernels_held = percounter_gm_read(f.queue.open_generation);
+    const int64_t next_task_while_kernels_held = percounter_gm_read(f.queue.open_task_id);
+    finish.store(true, std::memory_order_release);
+    for (auto &peer : peers)
+        peer.join();
+    EXPECT_TRUE(arrived_before_last_claim);
+    EXPECT_EQ(entered_before_last_claim, 0);
+    EXPECT_EQ(released_before_last_claim, sequence);
+    EXPECT_EQ(claims_before_last_claim, 1U);
+    EXPECT_TRUE(all_kernels_entered);
+    EXPECT_EQ(premature.load(), 0);
+    EXPECT_EQ(entered.load(), expected);
+    EXPECT_EQ(completed_while_kernels_held, sequence * 2);
+    EXPECT_EQ(generation_while_kernels_held, (sequence + 1) * 2);
+    EXPECT_EQ(next_task_while_kernels_held, -1);
+    EXPECT_EQ(percounter_gm_read(f.queue.completed), (sequence + 1) * 2);
+    EXPECT_TRUE(percounter_counter_published(f.counters[sequence].value));
+    EXPECT_EQ(f.control.lane_error, 0U);
+    percounter_mix_release(f.cfg[1]);
+    percounter_mix_release(f.cfg[4]);
+}
+}  // namespace
+
+TEST(PercounterPayload, EarlyMixArrivalWaitsForRealFinalClaimAcrossMasksAndSequences) {
+    for (uint32_t mask : {3U, 5U, 6U, 7U}) {
+        Fixture f;
+        configure_mix_cohorts(f, mask);
+        // Two actual admitted cohorts; task1 must not promote while task0 kernels are held.
+        percounter_sync_enqueue(f.cfg[1], f.resolve(0), 2);
+        percounter_sync_enqueue(f.cfg[1], f.resolve(1), 2);
+        execute_early_sequence(f, mask, 0);
+        ASSERT_EQ(percounter_gm_read(f.queue.open_task_id), 1);
+        execute_early_sequence(f, mask, 1);
+    }
+}
+
+TEST(PercounterPayload, PureAivCohortDoesNotArmOrRunBeforeRelease) {
+    Fixture f;
+    f.fanin[0].count = 0;
+    f.set_task(0, 2, 2);
+    for (auto &cfg : f.cfg) {
+        cfg.sync_cohort_count = 2;
+        cfg.sync_block_total = 2;
+    }
+    int calls = 0;
+    execute = [&](int64_t *) {
+        ++calls;
+    };
+    percounter_sync_enqueue(f.cfg[1], f.resolve(0), 2);
+    bool served = false;
+    ASSERT_TRUE(percounter_sync_take(f.cfg[1], &f.state[1], budget, &served));
+    ASSERT_TRUE(percounter_sync_serve_released(f.cfg[1], &f.state[1], budget, &served));
+    EXPECT_FALSE(served);
+    EXPECT_EQ(f.state[1].sync.my_block, 0);
+    EXPECT_EQ(f.signals[0].armed_generation, 0U);
+    EXPECT_EQ(calls, 0);
+    ASSERT_TRUE(percounter_sync_take(f.cfg[2], &f.state[2], budget, &served));
+    ASSERT_TRUE(f.checkpoint(1));
+    EXPECT_EQ(calls, 2);
+    EXPECT_EQ(f.queue.completed, 2U);
+}
+
+TEST(PercounterPayload, EarlyMixPreparationPreservesEarlierAndStagedLine) {
+    Fixture f;
+    configure_mix_cohorts(f, 7);
+    percounter_sync_enqueue(f.cfg[1], f.resolve(0), 2);
+    bool served = false;
+    ASSERT_TRUE(percounter_sync_take(f.cfg[1], &f.state[1], budget, &served));
+    // Seed the documented draw/claim-race state. This checks priority, not a hardware race.
+    auto &signal = f.signals[0];
+    signal.task_id = 2;
+    signal.active_mask = 7;
+    signal.cohort_block = 0;
+    percounter_ssbuf_store_release(&signal.armed_generation, 1);
+    ASSERT_TRUE(percounter_sync_serve_released(f.cfg[1], &f.state[1], budget, &served));
+    EXPECT_FALSE(served);
+    EXPECT_EQ(f.state[1].sync.my_block, 0);
+    EXPECT_EQ(signal.task_id, 2);
+    EXPECT_EQ(signal.armed_generation, 1U);
+    percounter_ssbuf_store_release(&signal.armed_generation, 2);
+    ASSERT_TRUE(percounter_sync_serve_released(f.cfg[1], &f.state[1], budget, &served));
+    EXPECT_FALSE(served);
+    EXPECT_EQ(f.state[1].sync.my_block, 0);
+    EXPECT_EQ(signal.task_id, 2);
+    EXPECT_EQ(signal.armed_generation, 2U);
+}
+
+TEST(PercounterPayload, EarlyGlobalReleaseWaitObservesStopWithoutEnteringKernels) {
+    Fixture f;
+    configure_mix_cohorts(f, 7);
+    percounter_sync_enqueue(f.cfg[1], f.resolve(0), 2);
+    bool served = false;
+    ASSERT_TRUE(percounter_sync_take(f.cfg[1], &f.state[1], budget, &served));
+    ASSERT_TRUE(percounter_sync_serve_released(f.cfg[1], &f.state[1], budget, &served));
+    ASSERT_TRUE(served);
+    std::atomic<int> entered{0}, returned{0};
+    std::array<bool, 3> results{};
+    execute = [&](int64_t *) {
+        ++entered;
+    };
+    std::array<std::thread, 3> peers;
+    for (int lane = 0; lane < 3; ++lane)
+        peers[lane] = std::thread([&, lane] {
+            bool did_serve = false;
+            results[lane] = percounter_checkpoint_serve(f.cfg[lane], &f.state[lane], UINT64_MAX, &did_serve);
+            ++returned;
+        });
+    const bool arrived = await_protocol_event([&] {
+        return local_arrived(f, 7);
+    });
+    percounter_fail(f.cfg[1], SchedulerGraphResult::INVALID_ARGUMENTS);
+    const bool stopped = await_protocol_event([&] {
+        return returned.load() == 3;
+    });
+    if (!stopped) percounter_gm_store(f.queue.released, uint64_t{1});  // Failure cleanup only.
+    for (auto &peer : peers)
+        peer.join();
+    EXPECT_TRUE(arrived);
+    EXPECT_TRUE(stopped);
+    EXPECT_EQ(results, (std::array<bool, 3>{false, false, false}));
+    EXPECT_EQ(entered.load(), 0);
+    EXPECT_EQ(f.queue.completed, 0U);
+}
+
+TEST(PercounterPayload, EarlyGlobalReleaseWaitSettlesAsyncBeforeFinalClaim) {
+    Fixture f;
+    configure_mix_cohorts(f, 7);
+    int32_t ready = 0;
+    f.set_task(2, 2, 1);
+    auto task = f.resolve(2);
+    ASSERT_TRUE(percounter_prepare_task(f.cfg[2], task, 0, 1, &f.payloads[2][0]));
+    execute = [&](int64_t *) {
+        f.async_entries[2][0] = {
+            reinterpret_cast<uint64_t>(&ready), 0, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0
+        };
+        f.async_groups[2].count = 1;
+    };
+    bool deferred = false;
+    ASSERT_TRUE(percounter_run_prepared(f.cfg[2], &f.state[2], task, &f.payloads[2][0], &deferred));
+    ASSERT_TRUE(deferred);
+    percounter_sync_enqueue(f.cfg[1], f.resolve(0), 2);
+    bool served = false;
+    ASSERT_TRUE(percounter_sync_take(f.cfg[1], &f.state[1], budget, &served));
+    ASSERT_TRUE(percounter_sync_serve_released(f.cfg[1], &f.state[1], budget, &served));
+    ASSERT_TRUE(served);
+    std::atomic<int> entered{0};
+    execute = [&](int64_t *) {
+        ++entered;
+    };
+    std::vector<std::thread> peers;
+    for (int lane = 0; lane < 3; ++lane)
+        peers.emplace_back([&, lane] {
+            EXPECT_TRUE(f.checkpoint(lane));
+        });
+    const bool arrived = await_protocol_event([&] {
+        return local_arrived(f, 7);
+    });
+    __atomic_store_n(&ready, 1, __ATOMIC_RELEASE);
+    const bool settled = await_protocol_event([&] {
+        return percounter_gm_read(f.control.async_settled) == 1;
+    });
+    const int before_release = entered.load();
+    const uint64_t released = percounter_gm_read(f.queue.released);
+    EXPECT_TRUE(percounter_sync_take(f.cfg[4], &f.state[4], budget, &served));
+    for (int lane = 3; lane < 6; ++lane)
+        peers.emplace_back([&, lane] {
+            EXPECT_TRUE(f.checkpoint(lane));
+        });
+    for (auto &peer : peers)
+        peer.join();
+    EXPECT_TRUE(arrived);
+    EXPECT_TRUE(settled);
+    EXPECT_EQ(before_release, 0);
+    EXPECT_EQ(released, 0U);
+    EXPECT_EQ(entered.load(), 6);
+    EXPECT_TRUE(percounter_counter_published(f.counters[2].value));
+    EXPECT_EQ(f.queue.completed, 2U);
+    EXPECT_EQ(f.control.lane_error, 0U);
 }

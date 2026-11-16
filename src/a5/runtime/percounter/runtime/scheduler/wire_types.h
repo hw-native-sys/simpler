@@ -92,10 +92,9 @@ struct alignas(64) PercounterMixSignal {
     // Zero when this arming is a draw from the MIX list, non-zero when it is a
     // cohort's own block. The rendezvous is identical either way; what differs
     // is where its end is reported, to the cohort record rather than to the MIX
-    // done ticket. It carries the cohort's sequence plus one rather than a one
-    // so that the value names the cohort in a dump, but nothing compares it:
-    // the queue keeps one cohort outstanding, so a cohort rendezvous on this
-    // line is always the one whose block the reader holds.
+    // done ticket. It carries the cohort's sequence plus one so participants
+    // can prepare during gathering and gate kernel entry on that exact
+    // sequence's release. The queue keeps one cohort outstanding.
     volatile uint32_t cohort_block;
     // Entry `i` carries the sequence plus one of the cohort whose block cluster
     // lane `i` holds and has not finished, and zero while it holds none; lane
