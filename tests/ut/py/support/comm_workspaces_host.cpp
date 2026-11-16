@@ -35,10 +35,12 @@ bool HcommDomainChannels::close() {
     return true;
 }
 void create_hcomm_domain_channels(
-    HcclComm, uint64_t, const std::vector<uint32_t> &ranks, uint32_t rank, std::shared_ptr<HcommDomainChannels> &result
+    HcclComm, uint64_t, const std::vector<uint32_t> &ranks, uint32_t rank, std::shared_ptr<HcommDomainChannels> &result,
+    CommCcuMode mode
 ) {
     assert(ranks.size() == 1 && rank == 0 && !result);
     result = std::make_shared<HcommDomainChannels>();
+    result->mode = mode;
 }
 bool query_window_token(uint64_t, uint64_t, uint64_t &token) {
     token = 123;
@@ -62,6 +64,8 @@ int subcomm_creates = 0;
 bool fail_ccu_destroy = false;
 std::unordered_set<HcclComm> live_ccu_communicators;
 std::string ccu_communicator_name;
+std::vector<std::pair<uint32_t, uint32_t>> ccu_communicator_modes;
+bool fail_ccu_create = false;
 #endif
 bool fail_host_pointer = false;
 bool fail_host_unregister = false;
@@ -217,9 +221,15 @@ extern "C" aclError aclrtDevicePeerAccessStatus(int32_t, int32_t, int32_t *statu
     return ACL_SUCCESS;
 }
 extern "C" HcclResult HcclCreateSubCommConfig(
-    HcclComm *, uint32_t, uint32_t *, uint64_t id, uint32_t, HcclCommConfig *config, HcclComm *out
+    HcclComm *, uint32_t rank_count, uint32_t *, uint64_t id, uint32_t, HcclCommConfig *config, HcclComm *out
 ) {
     ++subcomm_creates;
+#ifdef SIMPLER_TEST_CCU_BACKEND
+    ccu_communicator_modes.emplace_back(rank_count, config->hcclOpExpansionMode);
+    if (fail_ccu_create) return HCCL_E_PARA;
+#else
+    (void)rank_count;
+#endif
     *out = reinterpret_cast<HcclComm>(static_cast<uintptr_t>(id + 2));
 #ifdef SIMPLER_TEST_CCU_BACKEND
     assert(live_ccu_communicators.insert(*out).second);
@@ -665,6 +675,10 @@ static void test_basic_window() {
 int main(int argc, char **argv) {
 #ifdef SIMPLER_TEST_CCU_BACKEND
     assert(argc == 3);
+    if (std::string(argv[2]) == "modes") {
+        test_ccu_communicator_modes(argv[1]);
+        return 0;
+    }
     test_ccu_channel_rollback(argv[1], std::string(argv[2]) == "destroy_failure");
     return 0;
 #endif
@@ -742,6 +756,7 @@ int main(int argc, char **argv) {
     assert(started[0] == 0 && started[1] == 0 && started[2] == 0);
     release(first);
     assert(allocate(8, first, first_ctx) == 0);
+    assert(h->domain_allocations.at(first)->workspace_config.ccu_mode == COMM_CCU_MODE_SCHED);
     {
         const auto *ctx = reinterpret_cast<const CommContext *>(first_ctx);
         const auto &workspace = comm_workspace<CommWorkspaceKind::CCU>(*ctx);

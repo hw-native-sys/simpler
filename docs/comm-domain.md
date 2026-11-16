@@ -668,6 +668,40 @@ owner addresses differ from the imported AIV peer mappings in `windowsIn`.
 The table and credentials share the window lifetime; allocation does not launch
 CCU work. Host windows and RDMA combinations are not supported for CCU.
 
+Import `CcuConfig` from `simpler` and pass it through
+`workspace_engines={"ccu": CcuConfig(mode="sched")}`. The accepted modes are:
+
+| `mode` | Native CCU mode | Selection guidance |
+| ------ | --------------- | ------------------ |
+| `"sched"` (default) | CCU_SCHED, scheduling mode | Use on Ascend 950PR and 950DT; avoids the unsupported MS initialization path on PR boards. |
+| `"ms"` | CCU_MS, Memory Slice mode | Explicit opt-in for hardware and SDKs that support MS, including the tested 950DT setup. Ascend 950PR does not support it. |
+
+`CcuConfig()` and the name sequence `("ccu",)` both select `"sched"`.
+The default prioritizes PR/DT compatibility; it is not a claim that SCHED is
+the fastest mode for every workload.
+
+This option configures native CCU communicators. It does not select the
+execution engine for general HCCL collective operators: `AI_CPU`, `AICPU_TS`,
+`AIV`, and the `AICPU_CacheDisable` cache policy are not accepted here.
+The SDK's `CCU_MS_ONLY` and `CCU_SCHED_ONLY` variants are also not exposed by
+this API. Native CCU kernels and their event/resource protocol require the
+CCU engine; selecting another HCCL engine would not translate those kernels.
+
+The immutable mode participates in same-name domain reuse checks
+and reaches every rank, the domain channel communicator, and each local kernel
+registration communicator. Releasing and recreating a domain permits a new mode.
+Select a mode supported by the board and SDK. The runtime does not select a mode
+by host name or CPU architecture, or retry initialization with another mode.
+HCCL's fallback policies for collective operators do not provide an alternative
+execution path for native CCU missions. Communicator initialization errors
+identify the selected mode and retain the SDK error code in the native diagnostic.
+
+The A5 CCU scene tests exercise default and explicit `sched` configuration.
+Explicit `ms` execution requires a board supporting CCU_MS. Selecting SCHED
+does not by itself resolve execution stalls or teardown failures.
+Mixed-mode domains and mixed submissions require
+separate hardware validation; selecting a mode alone does not establish that support.
+
 The typed `submit_ccu_mission(async_ctx, comm_ctx, ccu_id, call_args)` overload
 accepts positional `CcuCallArg` scalars and window references (rank, byte offset,
 byte size). It validates all references before admitting completion or triggering,

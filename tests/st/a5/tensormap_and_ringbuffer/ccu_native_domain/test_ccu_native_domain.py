@@ -17,6 +17,7 @@ import struct
 from pathlib import Path
 
 import pytest
+from simpler import CcuConfig
 from simpler.ccu import ChipCcuRunSet
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import (
@@ -104,6 +105,14 @@ def test_registration_isolated_across_two_live_domains(st_platform, st_device_id
                         retain_after_run=True,
                     )
                 )
+            with pytest.raises(ValueError, match="workspace_configs"):
+                orch.get_or_allocate_domain(
+                    name="first",
+                    members=[0, 1],
+                    window_size=4 * 1024 * 1024,
+                    workspace_engines={"ccu": CcuConfig(mode="ms")},
+                    retain_after_run=True,
+                )
 
         worker.run(allocate)
         first, second = domains
@@ -119,6 +128,13 @@ def test_registration_isolated_across_two_live_domains(st_platform, st_device_id
         assert second.get_or_register_ccu(callable_handle, ccu_id=0, worker=0) is other
         second.release()
         assert second.freed
+        domains.clear()
+        worker.run(allocate)
+        rebuilt = domains[0].get_or_register_ccu(callable_handle, ccu_id=0, worker=0)
+        assert rebuilt.registration_id not in (initial.registration_id, other.registration_id)
+        assert domains[0].allocation_id != first.allocation_id
+        for domain in domains:
+            domain.release()
     finally:
         worker.close()
 

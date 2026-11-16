@@ -28,6 +28,30 @@ def test_ccu_workspace_mapping_uses_same_configuration_as_name_sequence():
     mapped = DomainConfig.capture([0, 1], 4096, [], True, (), {"ccu": CcuConfig()})
     assert named == mapped
     assert mapped.workspace_mask() == 8
+    assert mapped.ccu_config().mode == "sched"
+
+
+def test_ccu_mode_is_immutable_and_part_of_domain_reuse_identity():
+    engines = {"ccu": CcuConfig(mode="ms")}
+    saved = DomainConfig.capture([0, 1], 4096, [], True, (), engines)
+    engines["ccu"] = CcuConfig()
+    replacement = DomainConfig.capture([0, 1], 4096, [], True, (), engines)
+    assert saved.ccu_config().mode == "ms"
+    assert saved.difference(replacement).startswith("workspace_configs:")
+    with pytest.raises(AttributeError):
+        saved.ccu_config().mode = "sched"
+
+
+@pytest.mark.parametrize("mode", ["", "MS", "CCU_SCHED", "auto"])
+def test_invalid_ccu_mode_is_rejected_before_allocation(mode):
+    with pytest.raises(ValueError, match="CCU mode"):
+        CcuConfig(mode=mode)
+
+
+@pytest.mark.parametrize("mode", [None, 5, 6, True, []])
+def test_ccu_mode_requires_a_string(mode):
+    with pytest.raises(TypeError, match="CCU mode"):
+        CcuConfig(mode=mode)
 
 
 @pytest.mark.parametrize(
@@ -441,3 +465,8 @@ def ccu_failure_binary(tmp_path_factory):
 def test_legacy_ccu_channel_rollback_retains_unconfirmed_resources(ccu_failure_binary, failure):
     binary, module, env = ccu_failure_binary
     subprocess.run([str(binary), str(module), failure], env=env, check=True, timeout=20)
+
+
+def test_domain_and_registration_communicators_use_domain_mode(ccu_failure_binary):
+    binary, module, env = ccu_failure_binary
+    subprocess.run([str(binary), str(module), "modes"], env=env, check=True, timeout=20)
