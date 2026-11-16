@@ -133,6 +133,17 @@ safe result copy-back even after AICPU reports a completed drain. The original
 code and drain result remain in device logs; this contract does not promise
 Host code recovery or reuse through that platform failure path.
 
+For a registered peer-notification counter, failure cleanup waits for the
+actual expected value; it never sets the counter to bypass a missing peer.
+A notification that arrives after local failure can finish this drain without
+releasing the failed task's consumers or changing its original error. If the
+notification never arrives, the drain deadline leaves `complete=0` and the
+failed run remains isolated. Even `complete=1` only covers the registered local
+conditions: it does not certify that every peer has stopped accessing the
+communication window. Cleanup cannot interrupt a kernel blocked inside `TWAIT`;
+the kernel must return before the finalizer can drain its records. Use
+cooperative polling or deferred completion for waits that require cancellation.
+
 SDMA and registered counters are covered locally; cross-rank cancellation,
 HBG and A5 require their own protocols. Checks belong before the unsafe
 operation and must respect the operator's valid shape, masking, and index

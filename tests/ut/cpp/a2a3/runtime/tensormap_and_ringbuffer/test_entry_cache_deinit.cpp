@@ -27,7 +27,7 @@ thread_local std::promise<void> *pending_poll = nullptr;
 thread_local std::shared_future<void> release_pending;
 NativeInvocationCompletion *native_completion = nullptr;
 }  // namespace
-// A clock read in drain follows a real PENDING poll of the SDMA record.
+// A clock read in drain follows a real PENDING poll of a completion condition.
 uint64_t get_sys_cnt_aicpu() {
     if (pending_poll != nullptr) {
         auto *signal = pending_poll;
@@ -53,6 +53,25 @@ public:
         context.completed_.store(true);
         context.payload_per_core_[0][0].local_context.async_ctx.task_token = task;
         return context.deferred_slab_per_core_[0][0];
+    }
+
+    static void dirty(SchedulerContext &context, ChipTaskSlotState &running, ChipTaskSlotState &pending) {
+        for (auto &state : context.core_exec_states_) {
+            state.reg_addr = 0x1234;
+            state.running_slot_state = &running;
+            state.pending_slot_state = &pending;
+            state.running_reg_task_id = 17;
+            state.pending_reg_task_id = 19;
+        }
+    }
+    static void expect_entry_reset(const SchedulerContext &context) {
+        for (const auto &state : context.core_exec_states_) {
+            EXPECT_EQ(state.reg_addr, 0u);
+            EXPECT_EQ(state.running_slot_state, nullptr);
+            EXPECT_EQ(state.pending_slot_state, nullptr);
+            EXPECT_EQ(state.running_reg_task_id, 0);
+            EXPECT_EQ(state.pending_reg_task_id, 0);
+        }
     }
 };
 namespace aicpu_cache_maintenance {
@@ -223,28 +242,6 @@ TEST(EntryCacheDeinit, WaitListTrackingFailureCannotCertifyCompleteRetirement) {
     }
 }
 
-class SchedulerContextTestPeer {
-public:
-    static void dirty(SchedulerContext &context, ChipTaskSlotState &running, ChipTaskSlotState &pending) {
-        for (auto &state : context.core_exec_states_) {
-            state.reg_addr = 0x1234;
-            state.running_slot_state = &running;
-            state.pending_slot_state = &pending;
-            state.running_reg_task_id = 17;
-            state.pending_reg_task_id = 19;
-        }
-    }
-    static void expect_entry_reset(const SchedulerContext &context) {
-        for (const auto &state : context.core_exec_states_) {
-            EXPECT_EQ(state.reg_addr, 0u);
-            EXPECT_EQ(state.running_slot_state, nullptr);
-            EXPECT_EQ(state.pending_slot_state, nullptr);
-            EXPECT_EQ(state.running_reg_task_id, 0);
-            EXPECT_EQ(state.pending_reg_task_id, 0);
-        }
-    }
-};
-
 TEST(EntryCacheDeinit, SchedulerEntryResetsPreviousRunStateBeforeValidation) {
     SchedulerContext context;
     ChipTaskSlotState running{};
@@ -261,4 +258,112 @@ TEST(EntryCacheDeinit, SchedulerEntryResetsPreviousRunStateBeforeValidation) {
         EXPECT_EQ(context.pre_handshake_init(&runtime, 2, 1, 0), workers > 0 && workers % 3 == 0 ? 0 : -1);
         SchedulerContextTestPeer::expect_entry_reset(context);
     }
+}
+
+TEST(EntryCacheDeinit, PeerCounterMustArriveBeforeFailedRunFinishes) {
+    for (const bool in_wait_list : {false, true}) {
+        SCOPED_TRACE(in_wait_list);
+        auto executor = std::make_unique<AicpuExecutor>();
+        auto runtime = std::make_unique<Runtime>();
+        auto context = std::make_unique<RuntimeContext>();
+        auto header = std::make_unique<SharedMemoryHeader>();
+        runtime->set_gm_sm_ptr(header.get());
+        context->scheduler.sm_header = header.get();
+        header->sched_error_code.store(SIMPLER_ERROR_KERNEL_INDEX_OUT_OF_RANGE);
+        const auto task = TaskId::make(0, 23);
+        auto &slab = SchedulerContextTestPeer::prepare(executor->sched_ctx_, *context, task);
+        alignas(CHIP_ALIGN_SIZE) uint32_t counter = 0;
+        auto &waits = context->scheduler.async_wait_list;
+        if (in_wait_list) {
+            waits.count.store(1);
+            auto &entry = waits.entries[0];
+            entry.task_token = task;
+            entry.condition_count = 1;
+            entry.waiting_completion_count = 1;
+            entry.conditions[0].counter_addr = &counter;
+            entry.conditions[0].addr = reinterpret_cast<uint64_t>(&counter);
+            entry.conditions[0].expected_value = 1;
+        } else {
+            slab.count = 1;
+            slab.error_code = SIMPLER_ERROR_KERNEL_INDEX_OUT_OF_RANGE;
+            slab.entries[0] = {
+                reinterpret_cast<uint64_t>(&counter), 0, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0
+            };
+        }
+        std::promise<void> polled, release;
+        auto polled_future = polled.get_future();
+        auto release_future = release.get_future().share();
+        auto snapshot = std::async(std::launch::async, [&] {
+            pending_poll = &polled;
+            release_pending = release_future;
+            executor->snapshot_run_terminal(runtime.get());
+            pending_poll = nullptr;
+        });
+        EXPECT_EQ(polled_future.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+        EXPECT_EQ(snapshot.wait_for(std::chrono::seconds(0)), std::future_status::timeout);
+        __atomic_store_n(&counter, 1, __ATOMIC_RELEASE);
+        release.set_value();
+        snapshot.get();
+        NativeInvocationCompletion completion;
+        ASSERT_TRUE(completion.begin(1));
+        native_completion = &completion;
+        auto clear_completion = RAIIScopeGuard([] {
+            native_completion = nullptr;
+        });
+        ASSERT_TRUE(executor->terminal_publisher_.handoff());
+        native_completion = nullptr;
+        EXPECT_EQ(
+            completion.finish(
+                0, 0,
+                [](RunTerminalSelection selection, const void *, size_t) {
+                    EXPECT_EQ(selection.code, -SIMPLER_ERROR_KERNEL_INDEX_OUT_OF_RANGE);
+                    return NativeTerminalPublication::Published;
+                }
+            ),
+            -SIMPLER_ERROR_KERNEL_INDEX_OUT_OF_RANGE
+        );
+        KernelErrorCleanup cleanup{};
+        executor->sched_ctx_.drain_cancelled_run(UINT64_MAX, cleanup);
+        EXPECT_EQ(cleanup.complete, 1u);
+        EXPECT_EQ(cleanup.drained_conditions, 1u);
+        EXPECT_EQ(counter, 1u);
+        if (in_wait_list) {
+            EXPECT_EQ(waits.count.load(), 1);
+            EXPECT_EQ(waits.entries[0].waiting_completion_count, 1);
+            EXPECT_TRUE(waits.entries[0].conditions[0].retired);
+        } else {
+            EXPECT_EQ(slab.count, 1u);
+            EXPECT_EQ(slab.error_code, SIMPLER_ERROR_KERNEL_INDEX_OUT_OF_RANGE);
+        }
+    }
+}
+
+TEST(EntryCacheDeinit, MissingPeerCounterRetainsIdentityAndOriginalError) {
+    auto executor = std::make_unique<AicpuExecutor>();
+    auto context = std::make_unique<RuntimeContext>();
+    auto header = std::make_unique<SharedMemoryHeader>();
+    context->scheduler.sm_header = header.get();
+    header->sched_error_code.store(SIMPLER_ERROR_KERNEL_INDEX_OUT_OF_RANGE);
+    const auto task = TaskId::make(0, 23);
+    auto &slab = SchedulerContextTestPeer::prepare(executor->sched_ctx_, *context, task);
+    alignas(CHIP_ALIGN_SIZE) uint32_t counter = 0;
+    slab.count = 1;
+    slab.error_code = SIMPLER_ERROR_KERNEL_INDEX_OUT_OF_RANGE;
+    slab.entries[0] = {reinterpret_cast<uint64_t>(&counter), 0, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0};
+    KernelErrorCleanup cleanup{};
+    executor->sched_ctx_.drain_cancelled_run(0, cleanup);
+    EXPECT_EQ(cleanup.complete, 0u);
+    EXPECT_EQ(cleanup.drained_conditions, 0u);
+    EXPECT_EQ(cleanup.async_error, SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    EXPECT_EQ(cleanup.task_token, TaskId::to_uint64(task));
+    EXPECT_EQ(counter, 0u);
+    EXPECT_EQ(slab.count, 1u);
+    EXPECT_EQ(slab.entries[0].addr, reinterpret_cast<uint64_t>(&counter));
+    EXPECT_EQ(slab.entries[0].expected_value, 1u);
+    EXPECT_EQ(header->sched_error_code.load(), SIMPLER_ERROR_KERNEL_INDEX_OUT_OF_RANGE);
+    counter = 1;
+    executor->sched_ctx_.drain_cancelled_run(UINT64_MAX, cleanup);
+    EXPECT_EQ(cleanup.complete, 1u);
+    EXPECT_EQ(cleanup.drained_conditions, 1u);
+    EXPECT_EQ(header->sched_error_code.load(), SIMPLER_ERROR_KERNEL_INDEX_OUT_OF_RANGE);
 }
