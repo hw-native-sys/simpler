@@ -57,7 +57,7 @@ enum class SchedulerExtensionResult : uint8_t {
 __attribute__((visibility("hidden"))) SchedulerExtensionResult scheduler_extension_select(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
     const std::vector<SchedulerTaskMetadata> &task_metadata, const std::vector<int64_t> &inline_completed_task_ids,
-    const sm_layout::SegmentOffsets &device_segments
+    const sm_layout::SegmentOffsets &device_segments, const void *uploaded_sm
 );
 
 __attribute__((visibility("hidden"))) bool scheduler_extension_publish_profiling(Runtime *runtime);

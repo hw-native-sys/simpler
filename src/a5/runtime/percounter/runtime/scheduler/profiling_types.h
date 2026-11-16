@@ -21,19 +21,19 @@ enum class ProfilePhase : uint8_t {
     Prepare,
     Run,
     Complete,
-    Checkpoint,
-    MixPrepare,
-    MixArm,
-    MixWait,
-    MixServe,
-    MixDrain,
-    SyncEnqueue,
-    SyncPromote,
-    SyncTake,
-    SyncServe,
+    Step,
+    Claim,
+    Publish,
+    Discover,
+    SharedHead,
+    SharedService,
+    Entry,
+    Idle,
+    Aggregate,
+    AsyncPoll,
     FlushDone,
     LaneSetup,
-    Backoff,
+    AsyncSeal,
     AtomicFetchAdd,
     AtomicFetchAddIssue,
     AtomicCas,
@@ -59,39 +59,39 @@ constexpr const char *profile_phase_name(ProfilePhase kind) {
     case ProfilePhase::Resolve:
         return "scalar_percounter_resolve";
     case ProfilePhase::Fanin:
-        return "scalar_percounter_fanin_ready";
+        return "scalar_percounter_probe_fanin";
     case ProfilePhase::Prepare:
         return "scalar_percounter_prepare_subtask";
     case ProfilePhase::Run:
         return "scalar_percounter_run_prepared";
     case ProfilePhase::Complete:
         return "scalar_percounter_publish_completion";
-    case ProfilePhase::Checkpoint:
-        return "scalar_percounter_checkpoint_serve";
-    case ProfilePhase::MixPrepare:
-        return "scalar_percounter_mix_prepare";
-    case ProfilePhase::MixArm:
-        return "scalar_percounter_mix_arm";
-    case ProfilePhase::MixWait:
-        return "scalar_percounter_mix_wait";
-    case ProfilePhase::MixServe:
-        return "scalar_percounter_serve_mix";
-    case ProfilePhase::MixDrain:
-        return "scalar_percounter_mix_drain";
-    case ProfilePhase::SyncEnqueue:
-        return "scalar_percounter_sync_enqueue";
-    case ProfilePhase::SyncPromote:
-        return "scalar_percounter_sync_promote";
-    case ProfilePhase::SyncTake:
-        return "scalar_percounter_sync_take";
-    case ProfilePhase::SyncServe:
-        return "scalar_percounter_sync_serve_block";
+    case ProfilePhase::Step:
+        return "scalar_percounter_step";
+    case ProfilePhase::Claim:
+        return "scalar_percounter_claim";
+    case ProfilePhase::Publish:
+        return "scalar_percounter_own_entry";
+    case ProfilePhase::Discover:
+        return "scalar_percounter_discover_records";
+    case ProfilePhase::SharedHead:
+        return "scalar_percounter_shared_head";
+    case ProfilePhase::SharedService:
+        return "scalar_percounter_service_records";
+    case ProfilePhase::Entry:
+        return "scalar_percounter_entry";
+    case ProfilePhase::Idle:
+        return "scalar_percounter_idle";
+    case ProfilePhase::Aggregate:
+        return "scalar_percounter_complete_mix";
+    case ProfilePhase::AsyncPoll:
+        return "scalar_percounter_async_tick";
     case ProfilePhase::FlushDone:
         return "scalar_percounter_flush_done";
     case ProfilePhase::LaneSetup:
         return "scalar_run_percounter_lane";
-    case ProfilePhase::Backoff:
-        return "scalar_backoff";
+    case ProfilePhase::AsyncSeal:
+        return "scalar_percounter_async_seal";
     case ProfilePhase::AtomicFetchAdd:
         return "scalar_atomic_fetch_add";
     case ProfilePhase::AtomicFetchAddIssue:

@@ -459,7 +459,7 @@ static void release_run_tensor_leases(Runtime *runtime, const HostApi *api) {
 // the weak half of an override.
 __attribute__((weak)) SchedulerExtensionResult scheduler_extension_select(
     Runtime *, const HostApi *, SharedMemoryHandle &, int32_t, const std::vector<SchedulerTaskMetadata> &,
-    const std::vector<int64_t> &, const sm_layout::SegmentOffsets &
+    const std::vector<int64_t> &, const sm_layout::SegmentOffsets &, const void *
 ) {
     return SchedulerExtensionResult::DECLINED;
 }
@@ -1581,7 +1581,8 @@ bool create_scheduler_state(
     // An extension receives the validated top-level graph before native Graph
     // expansion and owns the remaining bind when it accepts the graph.
     const auto extension = scheduler_extension_select(
-        runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_refs, device_segments
+        runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_refs, device_segments,
+        uploaded_sm
     );
     if (extension != SchedulerExtensionResult::DECLINED) return extension == SchedulerExtensionResult::TAKEN;
     if (native_graph) {
