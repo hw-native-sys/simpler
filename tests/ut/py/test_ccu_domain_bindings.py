@@ -325,6 +325,10 @@ def test_registration_holds_worker_until_reply_and_cache_publication(monkeypatch
             assert not closed.is_set()
             return worker_module._CCU_DOMAIN_REQUEST.pack(dom.allocation_id, dom.generation, 9, target.digest, 12)
 
+        def check_control_payloads_retired(self):
+            assert dom._ccu_registrations, "control payloads checked before registration publication"
+            assert not closed.is_set()
+
         def close(self):
             assert dom._ccu_registrations, "transport closed before registration publication"
             closed.set()
