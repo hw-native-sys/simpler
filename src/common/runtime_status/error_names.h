@@ -111,7 +111,8 @@ static inline const char *error_desc(int32_t code) {
                "representation capacity";
     case SIMPLER_ERROR_INVALID_ARGS:
         return "an orchestration API rejected its arguments (bad alloc_tensors info, illegal nested "
-               "scope, unknown task id in set_dependencies, or an CoreTaskArgs carrying an error flag)";
+               "scope, unknown task id in set_dependencies or in a get/set_tensor_data dependency, or "
+               "an CoreTaskArgs carrying an error flag)";
     case SIMPLER_ERROR_REQUIRE_SYNC_START_INVALID:
         return "require_sync_start() asked for more blocks than the target core type physically has, "
                "which can never be satisfied";

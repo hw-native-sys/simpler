@@ -11,12 +11,53 @@
 
 #include <gtest/gtest.h>
 
+#include <type_traits>
+#include <utility>
 #include <array>
 #include <cstdarg>
 #include <cstdio>
 #include <string>
 
 #include "orchestration_api.h"
+
+namespace {
+
+template <
+    typename... Deps, typename = decltype(get_tensor_data<float>(
+                          std::declval<const simpler::tmr::Tensor &>(), uint32_t{}, std::declval<const uint32_t *>(),
+                          std::declval<Deps>()...
+                      ))>
+std::true_type accepts_scalar_read(int);
+template <typename... Deps>
+std::false_type accepts_scalar_read(...);
+
+static_assert(decltype(accepts_scalar_read<>(0))::value);
+static_assert(decltype(accepts_scalar_read<const TaskId *, uint32_t>(0))::value);
+static_assert(decltype(accepts_scalar_read<TaskId>(0))::value);
+static_assert(!decltype(accepts_scalar_read<const TaskId *>(0))::value);
+static_assert(!decltype(accepts_scalar_read<TaskId *>(0))::value);
+static_assert(!decltype(accepts_scalar_read<TaskId (&)[2]>(0))::value);
+static_assert(!decltype(accepts_scalar_read<std::nullptr_t>(0))::value);
+
+template <
+    typename... Deps, typename = decltype(set_tensor_data(
+                          std::declval<const simpler::tmr::Tensor &>(), uint32_t{}, std::declval<const uint32_t *>(),
+                          float{}, std::declval<Deps>()...
+                      ))>
+std::true_type accepts_scalar_write(int);
+template <typename... Deps>
+std::false_type accepts_scalar_write(...);
+
+static_assert(decltype(accepts_scalar_write<>(0))::value);
+static_assert(decltype(accepts_scalar_write<const TaskId *, uint32_t>(0))::value);
+static_assert(decltype(accepts_scalar_write<TaskId>(0))::value);
+static_assert(!decltype(accepts_scalar_write<const TaskId *>(0))::value);
+static_assert(!decltype(accepts_scalar_write<TaskId *>(0))::value);
+static_assert(!decltype(accepts_scalar_write<TaskId (&)[2]>(0))::value);
+static_assert(!decltype(accepts_scalar_write<std::nullptr_t>(0))::value);
+
+}  // namespace
+
 [[noreturn]] void assert_impl(const char *, const char *, int) { throw "assert_impl"; }
 
 namespace {
@@ -83,12 +124,17 @@ void fake_report_fatal(RuntimeContext *rt, int32_t error_code, const char *func,
 
 void fake_log(const char *, const char *, ...) {}
 
-uint64_t fake_get_tensor_data(RuntimeContext *rt, const simpler::tmr::Tensor &, uint32_t, const uint32_t[]) {
+uint64_t fake_get_tensor_data(
+    RuntimeContext *rt, const simpler::tmr::Tensor &, uint32_t, const uint32_t[], const simpler::tmr::TaskId *, uint32_t
+) {
     as_fake(rt)->get_calls++;
     return 0x1234ULL;
 }
 
-void fake_set_tensor_data(RuntimeContext *rt, const simpler::tmr::Tensor &, uint32_t, const uint32_t[], uint64_t) {
+void fake_set_tensor_data(
+    RuntimeContext *rt, const simpler::tmr::Tensor &, uint32_t, const uint32_t[], uint64_t,
+    const simpler::tmr::TaskId *, uint32_t
+) {
     as_fake(rt)->set_calls++;
 }
 

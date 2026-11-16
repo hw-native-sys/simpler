@@ -244,7 +244,7 @@ TEST(KernelError, FailureWakesAlreadyWaitingOrchestrator) {
         wait_entered = &entered;
         release_wait = resume_event;
         uint32_t index[] = {0};
-        return rt->ops->get_tensor_data(rt.get(), output.get_ref(0), 1, index);
+        return rt->ops->get_tensor_data(rt.get(), output.get_ref(0), 1, index, nullptr, 0);
     });
     ASSERT_EQ(entered_event.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     DeferredCompletionSlab slab{};

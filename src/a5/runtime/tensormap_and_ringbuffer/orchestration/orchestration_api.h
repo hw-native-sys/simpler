@@ -81,10 +81,12 @@ typedef struct RuntimeOps {
     // Cross-layer data access (orchestration reads/writes tensor values via runtime)
     // Placed after logging to avoid shifting hot-path field offsets.
     uint64_t (*get_tensor_data)(
-        RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[]
+        RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[],
+        const simpler::tmr::TaskId *deps, uint32_t dep_count
     );
     void (*set_tensor_data)(
-        RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+        RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[],
+        uint64_t value, const simpler::tmr::TaskId *deps, uint32_t dep_count
     );
     TaskOutputTensors (*alloc_tensors)(RuntimeContext *rt, const CoreTaskArgs &args);
     TaskOutputTensors (*submit_dummy_task)(RuntimeContext *rt, const CoreTaskArgs &args);
@@ -278,17 +280,42 @@ static inline bool rt_is_fatal() {
  *   uint64_t raw = get_tensor_data(tensor, 1, idx);       // old usage unchanged
  *   float val = get_tensor_data<float>(tensor, 1, idx);   // typed read
  *
- * If the tensor has a producer in TensorMap, spin-waits until the producer
- * task completes before reading. External tensors (make_tensor_external)
- * are read immediately without waiting.
+ * Waits for the tensor creator and TensorMap producers to complete before
+ * reading. External tensors have no creator; without a TensorMap producer
+ * or declared dependency, they are read immediately.
+ *
+ * A dependency pointer requires an explicit count; a single TaskId can be passed by value.
+ * `deps` declares up to `dep_count` tasks the read is ordered after, and the
+ * call waits for each of them to complete before reading. A declared
+ * dependency orders the read after a modifier that TensorMap does not
+ * record, such as a write to an external tensor inside a manual scope or
+ * with `manual_dep`. Runtime-created outputs retain their creator owner
+ * independently of scope mode and `manual_dep`. Every id must name a task
+ * already submitted in this run; an invalid id is INVALID_ARGS and the read
+ * returns 0.
  */
 template <typename T = uint64_t>
-static inline T get_tensor_data(const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
+static inline T get_tensor_data(
+    const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[], const simpler::tmr::TaskId *deps,
+    uint32_t dep_count
+) {
     RuntimeContext *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return from_u64<T>(0);
     }
-    return from_u64<T>(rt->ops->get_tensor_data(rt, tensor, ndims, indices));
+    return from_u64<T>(rt->ops->get_tensor_data(rt, tensor, ndims, indices, deps, dep_count));
+}
+
+template <typename T = uint64_t>
+static inline T get_tensor_data(const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
+    return get_tensor_data<T>(tensor, ndims, indices, nullptr, 0);
+}
+
+template <typename T = uint64_t>
+static inline T get_tensor_data(
+    const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[], simpler::tmr::TaskId dep
+) {
+    return get_tensor_data<T>(tensor, ndims, indices, &dep, 1);
 }
 
 /**
@@ -299,10 +326,10 @@ static inline T get_tensor_data(const simpler::tmr::Tensor &tensor, uint32_t ndi
  *   set_tensor_data(tensor, 1, idx, raw_u64);     // old usage unchanged
  *   set_tensor_data(tensor, 1, idx, 42.0f);       // typed write (T = float)
  *
- * If the tensor has a producer in TensorMap, spin-waits until the producer
- * and all its consumers complete before writing (WAW + WAR safety).
- * External tensors (make_tensor_external) with no TensorMap entry are
- * written immediately without waiting.
+ * Waits for the tensor creator, TensorMap producers and their retained
+ * consumers before writing (WAW + WAR safety). External tensors have no
+ * creator; without a TensorMap producer or declared dependency, they are
+ * written immediately.
  *
  * Limitation: TensorMap only tracks producers (OUTPUT/INOUT), not consumers
  * that used the tensor as INPUT. If a kernel reads this tensor as INPUT
@@ -317,15 +344,42 @@ static inline T get_tensor_data(const simpler::tmr::Tensor &tensor, uint32_t ndi
  * The tensor must already have an allocated buffer (addr != 0).
  * For runtime-created outputs, call this only on the simpler::tmr::Tensor returned by
  * add_output(TensorCreateInfo) after submit returns.
+ *
+ * A dependency pointer requires an explicit count; a single TaskId can be passed by value.
+ * `deps` declares up to `dep_count` tasks the write is ordered after. Each
+ * declared task is waited to COMPLETED and is treated as a live accessor of
+ * the buffer, so the write also waits for its retained consumers. That covers the
+ * write-after-read hazard for a reader not recorded by TensorMap, including
+ * external tensor readers in manual scopes or with `manual_dep`.
+ * Runtime-created outputs retain their creator owner in either case. Every id
+ * must name a task already submitted in this run; an invalid id is
+ * INVALID_ARGS and nothing is written.
+ * Consumers connected only by DEP_WAIT are not retained until completion.
+ * Pass those readers directly in deps; naming their producer is insufficient.
  */
 template <typename T = uint64_t>
-static inline void
-set_tensor_data(const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[], T value) {
+static inline void set_tensor_data(
+    const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[], T value,
+    const simpler::tmr::TaskId *deps, uint32_t dep_count
+) {
     RuntimeContext *rt = current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return;
     }
-    rt->ops->set_tensor_data(rt, tensor, ndims, indices, to_u64(value));
+    rt->ops->set_tensor_data(rt, tensor, ndims, indices, to_u64(value), deps, dep_count);
+}
+
+template <typename T = uint64_t>
+static inline void
+set_tensor_data(const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[], T value) {
+    set_tensor_data<T>(tensor, ndims, indices, value, nullptr, 0);
+}
+
+template <typename T = uint64_t>
+static inline void set_tensor_data(
+    const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[], T value, simpler::tmr::TaskId dep
+) {
+    set_tensor_data<T>(tensor, ndims, indices, value, &dep, 1);
 }
 
 // =============================================================================
