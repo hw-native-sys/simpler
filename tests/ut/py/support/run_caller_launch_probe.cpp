@@ -64,7 +64,9 @@ static int tokens[64], next_stream, next_event;
 static int fail_at, submits, syncs, copies;
 static int allocation_attempts, fail_allocation;
 static int resource_release_calls;
-static int set_device_error;
+static int bind_thread_error;
+static int context_token;
+static thread_local rtContext_t current_owned_context;
 static int destroy_stream_error;
 static std::unordered_map<void *, size_t> live_allocations;
 static bool capture;
@@ -401,8 +403,9 @@ static bool capture_kernel_packet;
 static bool owned_close_active, completion_events_ready = true;
 static int force_resets, stale_resource_calls, normal_reset_calls;
 static bool fail_force_reset, fail_reset_probe;
-static bool acl_initialized, fail_acl_finalize_once;
-static int acl_finalize_calls;
+static bool fail_acl_finalize_once;
+static uint64_t acl_init_refs;
+static int acl_deinit_calls;
 static std::vector<void *> reset_allocations, reset_streams, reset_events;
 static std::vector<void *> destroyed_streams, observed_streams;
 static void *timing_target;
@@ -612,42 +615,72 @@ extern "C" aclError aclrtSynchronizeDeviceWithTimeout(int32_t) {
 }
 extern "C" rtError_t rtSetDevice(int32_t) {
     assert(owned_close_active);
-    return set_device_error;
+    if (bind_thread_error != 0) return bind_thread_error;
+    current_owned_context = &context_token;
+    return 0;
+}
+extern "C" rtError_t rtCtxGetCurrent(rtContext_t *context) {
+    assert(owned_close_active);
+    *context = current_owned_context;
+    return 0;
+}
+extern "C" rtError_t rtCtxSetCurrent(rtContext_t context) {
+    assert(owned_close_active);
+    assert(context == &context_token);
+    if (bind_thread_error != 0) return bind_thread_error;
+    current_owned_context = context;
+    return 0;
 }
 extern "C" rtError_t rtDeviceReset(int32_t) {
     assert(owned_close_active);
     ++normal_reset_calls;
+    current_owned_context = nullptr;
     return 0;
 }
 extern "C" aclError aclInit(const char *) {
     assert(owned_close_active);
-    if (acl_initialized) return 100002;
-    acl_initialized = true;
-    return 0;
+    return acl_init_refs++ == 0 ? 0 : 100002;
 }
 extern "C" aclError aclFinalize() {
     assert(owned_close_active);
-    ++acl_finalize_calls;
+    assert(acl_init_refs != 0);
+    ++acl_deinit_calls;
     if (fail_acl_finalize_once) {
         fail_acl_finalize_once = false;
         return -982;
     }
-    acl_initialized = false;
+    acl_init_refs = 0;
+    return 0;
+}
+extern "C" aclError aclFinalizeReference(uint64_t *ref_count) {
+    assert(owned_close_active);
+    assert(acl_init_refs != 0);
+    if (acl_init_refs == 1) {
+        const int rc = aclFinalize();
+        if (rc != 0) return rc;
+    } else {
+        --acl_init_refs;
+    }
+    if (ref_count != nullptr) *ref_count = acl_init_refs;
     return 0;
 }
 extern "C" aclError aclrtSetDevice(int32_t) {
     assert(owned_close_active);
+    current_owned_context = &context_token;
     return 0;
 }
+extern "C" aclError aclrtSetCurrentContext(aclrtContext context) { return rtCtxSetCurrent(context); }
 extern "C" aclError aclrtResetDevice(int32_t) {
     assert(owned_close_active);
     ++normal_reset_calls;
+    current_owned_context = nullptr;
     return 0;
 }
 extern "C" aclError aclrtResetDeviceForce(int32_t) {
     assert(owned_close_active);
     ++force_resets;
     if (fail_force_reset) return -980;
+    current_owned_context = nullptr;
     destroy_stream_error = 0;
     for (const auto &allocation : live_allocations)
         reset_allocations.push_back(allocation.first);
@@ -1250,7 +1283,9 @@ static void check_observation(const std::string &scenario, uint32_t mode) {
         config.runtime_env.ring_dep_pool[ring] = 4;
     }
     const NativeRunDescriptor descriptor{0, 0, 1, 1, 1, 1};
-    assert(simpler_prepare_run(runner, storage, 1, &args, &config, &descriptor) == 0);
+    const int prepare_rc = simpler_prepare_run(runner, storage, 1, &args, &config, &descriptor);
+    std::fprintf(stderr, "observer scenario=%s mode=%u prepare_rc=%d\n", scenario.c_str(), mode, prepare_rc);
+    assert(prepare_rc == 0);
     const auto *prepared_state = static_cast<NativeRunContext<DeviceRunnerBase> *>(storage);
     const uint64_t trace_inv = prepared_state->trace_inv;
     const uint64_t trace_hid = prepared_state->trace_hid;
@@ -1411,9 +1446,9 @@ static void check_owned_unknown_close(const std::string &scenario) {
     fail_reset_probe = scenario == "probe-failure";
     const bool confirmed = !borrowed && !fail_force_reset && !fail_reset_probe;
     const bool retry_acl_close = scenario == "acl-finalize-retry";
-    acl_initialized = false;
+    acl_init_refs = 0;
     fail_acl_finalize_once = retry_acl_close;
-    acl_finalize_calls = 0;
+    acl_deinit_calls = 0;
     owned_close_active = true;
     completion_events_ready = false;
     fail_at = force_resets = stale_resource_calls = 0;
@@ -1447,7 +1482,9 @@ static void check_owned_unknown_close(const std::string &scenario) {
         config.runtime_env.ring_dep_pool[ring] = 4;
     }
     const NativeRunDescriptor descriptor{0, 0, 1, 1, 1, 1};
-    assert(simpler_prepare_run(runner, storage, 1, &args, &config, &descriptor) == 0);
+    const int prepare_rc = simpler_prepare_run(runner, storage, 1, &args, &config, &descriptor);
+    std::fprintf(stderr, "owned-close scenario=%s prepare_rc=%d\n", scenario.c_str(), prepare_rc);
+    assert(prepare_rc == 0);
     assert(
         (borrowed ? simpler_launch_run_on_stream(runner, storage, caller, nullptr) :
                     simpler_launch_run(runner, storage)) == 0
@@ -1465,11 +1502,11 @@ static void check_owned_unknown_close(const std::string &scenario) {
     if (retry_acl_close) {
         assert(close_rc == -982 && runner->device_id() == 0);
         assert(runner->device_health().generation() != generation_before);
-        assert(force_resets == 1 && acl_finalize_calls == 1 && acl_initialized);
+        assert(force_resets == 1 && acl_deinit_calls == 1 && acl_init_refs != 0);
         const uint64_t reset_generation = runner->device_health().generation();
         const auto operations = std::make_tuple(submits, syncs, copies, stale_resource_calls);
         close_rc = finalize_device(runner);
-        assert(close_rc == 0 && force_resets == 1 && acl_finalize_calls == 2 && !acl_initialized);
+        assert(close_rc == 0 && force_resets == 1 && acl_deinit_calls == 2 && acl_init_refs == 0);
         assert(runner->device_health().generation() == reset_generation);
         assert(operations == std::make_tuple(submits, syncs, copies, stale_resource_calls));
         std::fprintf(
@@ -2181,9 +2218,9 @@ static void check_standalone_collector_close(const std::string &scenario) {
                           scenario == "external-borrowed";
     const bool confirmed = !borrowed && !fail_force_reset && !fail_reset_probe;
     const bool retry_acl_close = scenario == "acl-finalize-retry";
-    acl_initialized = false;
+    acl_init_refs = 0;
     fail_acl_finalize_once = retry_acl_close;
-    acl_finalize_calls = 0;
+    acl_deinit_calls = 0;
     fail_at = force_resets = stale_resource_calls = 0;
     sync_error = -739;
     next_stream = next_event = submits = syncs = copies = 0;
@@ -2317,11 +2354,11 @@ static void check_standalone_collector_close(const std::string &scenario) {
     if (retry_acl_close) {
         assert(rc == -982 && runner->device_id() == 0);
         assert(runner->device_health().generation() != before);
-        assert(force_resets == 1 && acl_finalize_calls == 1 && acl_initialized);
+        assert(force_resets == 1 && acl_deinit_calls == 1 && acl_init_refs != 0);
         const uint64_t reset_generation = runner->device_health().generation();
         const auto operations = std::make_tuple(submits, syncs, copies, stale_resource_calls);
         rc = finalize_device(runner);
-        assert(rc == 0 && force_resets == 1 && acl_finalize_calls == 2 && !acl_initialized);
+        assert(rc == 0 && force_resets == 1 && acl_deinit_calls == 2 && acl_init_refs == 0);
         assert(runner->device_health().generation() == reset_generation);
         assert(operations == std::make_tuple(submits, syncs, copies, stale_resource_calls));
         std::fprintf(
@@ -2573,14 +2610,14 @@ static void check_external_resource_api(bool borrowed, bool grow = false) {
     const int copybacks_before = copyback_calls;
     if (!borrowed) {
         const int releases_before = resource_release_calls;
-        set_device_error = -785;
+        bind_thread_error = -785;
         assert(simpler_finalize_run(&runner, storage) == -785);
         assert(state->magic == NativeRunContext<DeviceRunnerBase>::kMagic);
         assert(state->phase.load() == NativeRunPhase::Complete);
         assert(runner.native_runs_outstanding());
         assert(!first_prepared.expired());
         assert(copyback_calls == copybacks_before && resource_release_calls == releases_before);
-        set_device_error = 0;
+        bind_thread_error = 0;
         assert(simpler_unregister_callable(&runner, 1) != 0);
     }
     fail_bindings_release = true;
