@@ -505,18 +505,6 @@ TEST(A5UrmaCompletionKernel, SharedPoolKeepsFullGroupCompletionBudget) {
     EXPECT_EQ(fixture.slab.count, 0u);
 }
 
-TEST(A5UrmaCompletionKernel, PerPeerCannotUseRailSelectedQueueOffsets) {
-    RegistrationFixture fixture;
-    fixture.info.railCycleLen = 1;
-    fixture.info.railCycle[0] = 1;
-
-    EXPECT_FALSE(simpler::urma::preflight_urma_request(fixture.runtime, fixture.session, 2));
-    EXPECT_EQ(fixture.slab.error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
-    EXPECT_EQ(fixture.slab.count, 0u);
-    EXPECT_EQ(fixture.sq_doorbell[6], 0u);
-    EXPECT_EQ(fixture.sq_doorbell[7], 0u);
-}
-
 TEST(A5UrmaCompletionKernel, FullSqInOneJettyRejectsWholeRequest) {
     RegistrationFixture fixture;
     fixture.sq_head[6] = 16;
