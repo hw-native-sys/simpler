@@ -27,8 +27,6 @@ scheduler_flush_completions(__gm__ SchedulerRunControl *run_control, SchedulerLo
     local->pending_completed = 0;
 }
 
-enum class SchedulerSubtaskFinishResult : uint8_t { PARTIAL, TASK_LAST, TASK_LAST_DEFERRED, ERROR };
-
 // Cancellation owns only an unstarted local handle. Armed groups retire at
 // the failed run's all-core fence before their storage can be reused.
 static inline __aicore__ bool
@@ -40,6 +38,8 @@ scheduler_cancel_unstarted_handle(__gm__ void *base, SchedulerLocalState *local,
     const auto phase = scheduler_prepared_phase(handle->claimed_state);
     if (phase != SchedulerPreparedPhase::CLAIMED && phase != SchedulerPreparedPhase::GROUP_RESERVED &&
         phase != SchedulerPreparedPhase::FAILED)
+        return false;
+    if (phase == SchedulerPreparedPhase::CLAIMED && scheduler_prepared_already_returned(base, prepared, *handle))
         return false;
     if (phase != SchedulerPreparedPhase::FAILED) {
         auto *control = scheduler_prepared_control_at(base, prepared, handle->execution_index);
@@ -121,26 +121,20 @@ static inline __aicore__ SchedulerSubtaskFinishResult scheduler_contribute_subta
         scheduler_protocol_subtask_complete(base, local, completed, pending_slot, true, UINT64_MAX);
         if (block_owner) scheduler_protocol_block_complete(base, local, completed.block_idx, true, UINT64_MAX);
     }
-    scheduler_cache_barrier();
-    // One physical return retires C and its compute debt in the same RMW.
-    // Group credits remain in D until the unique FINISH releases all of them.
-    const uint64_t previous_state =
-        scheduler_gm_fetch_add(control->completion_state, UINT64_C(0) - SCHEDULER_COMPLETION_RETURN_UNIT);
-    const uint64_t previous = scheduler_completion_count(previous_state);
-    const uint64_t total = scheduler_completion_total(previous_state);
+    uint64_t previous = 0;
+    const auto result = scheduler_contribute_returns(control, 1, &previous);
     if constexpr (RecordProtocol) {
         scheduler_protocol_subtask_complete(base, local, completed, pending_slot, false, previous);
         if (block_owner) scheduler_protocol_block_complete(base, local, completed.block_idx, false, previous);
     }
-    if (!scheduler_completion_valid(previous_state) || scheduler_completion_remaining(previous_state) == 0) {
+    if (result == SchedulerSubtaskFinishResult::ERROR) {
         scheduler_record_error(
             run, completed.task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local,
             SchedulerErrorSite::BLOCK_COMPLETION_INVALID, &completed
         );
-        return SchedulerSubtaskFinishResult::ERROR;
+        return result;
     }
-    if (previous + 1 != total) return SchedulerSubtaskFinishResult::PARTIAL;
-    if (scheduler_completion_debt(previous_state) != 1) return SchedulerSubtaskFinishResult::TASK_LAST_DEFERRED;
+    if (result != SchedulerSubtaskFinishResult::TASK_LAST) return result;
     if constexpr (RecordProtocol)
         scheduler_protocol_task_done_from_contribution(base, local, completed, pending_slot, previous);
     return SchedulerSubtaskFinishResult::TASK_LAST;
@@ -214,9 +208,35 @@ static inline __aicore__ bool scheduler_complete_own_slot(
         }
     }
     const SchedulerLocalSlotState completed_slot = *local_slot;
-    if (!scheduler_return_prepared_execution<FromExecutor>(
-            scheduler_state_base, scheduler->config.prepared, &local_slot->prepared
-        )) {
+    const bool contribution_retires = FromExecutor && PublishCompletion && completed_slot.execution_token &&
+                                      !completed_slot.cluster_mix && !completed_slot.gm_mix;
+    auto contribution = SchedulerSubtaskFinishResult::PARTIAL;
+    bool retirement_inferred = false;
+    if (contribution_retires) {
+        if (!scheduler_execution_token_handle_valid(
+                scheduler_state_base, scheduler->config.prepared, scheduler->worker_id(), &local_slot->prepared,
+                SchedulerPreparedPhase::CLAIMED
+            )) {
+            scheduler_record_error(
+                run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+                SchedulerErrorSite::COMPLETION_SLOT_BINDING_INVALID, local_slot
+            );
+            return false;
+        }
+        if constexpr (RecordProtocol)
+            scheduler_protocol_execution_consumed(scheduler_state_base, scheduler, pending_slot, completed_slot);
+        contribution = scheduler_contribute_subtask<RecordProtocol>(
+            graph, scheduler_state_base, scheduler, run_control, completed_slot, pending_slot
+        );
+        retirement_inferred = contribution == SchedulerSubtaskFinishResult::TASK_LAST ||
+                              contribution == SchedulerSubtaskFinishResult::TASK_LAST_DEFERRED;
+        if (retirement_inferred) local_slot->prepared = {};
+    }
+    // Partial and failed returns still publish their own execution state. The
+    // next kernel entry and the unconditional exit fence drain that publication.
+    if (!retirement_inferred && !scheduler_return_prepared_execution<FromExecutor>(
+                                    scheduler_state_base, scheduler->config.prepared, &local_slot->prepared
+                                )) {
         scheduler_record_error(
             run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
             SchedulerErrorSite::COMPLETION_SLOT_BINDING_INVALID, local_slot
@@ -232,29 +252,35 @@ static inline __aicore__ bool scheduler_complete_own_slot(
     const uint32_t completed_block_idx = local_slot->block_idx;
     const bool gm_mix = local_slot->gm_mix;
     if constexpr (RecordProtocol)
-        scheduler_protocol_execution_consumed(scheduler_state_base, scheduler, pending_slot, completed_slot);
+        if (!contribution_retires)
+            scheduler_protocol_execution_consumed(scheduler_state_base, scheduler, pending_slot, completed_slot);
     scheduler_initialize_free_slot(local_slot);
     scheduler->set_timing_slot(pending_slot, -1);
     const uint64_t completion_phase_end = phase_timing_enabled ? scheduler_cycles() : 0;
     bool completion_ok = true;
     scheduler->continuation_task_ref = SCHEDULER_TASK_REF_INVALID;
     if constexpr (PublishCompletion) {
-        const auto contribution = scheduler_contribute_subtask<RecordProtocol>(
-            graph, scheduler_state_base, scheduler, run_control, completed_slot, pending_slot
-        );
-        completion_ok = contribution != SchedulerSubtaskFinishResult::ERROR;
-        if (completed_slot.execution_token && contribution == SchedulerSubtaskFinishResult::PARTIAL)
-            scheduler->continuation_task_ref = task_ref;
-        if (contribution == SchedulerSubtaskFinishResult::TASK_LAST) {
-            ++scheduler->pending_completed;
-        } else if (contribution == SchedulerSubtaskFinishResult::TASK_LAST_DEFERRED) {
-            bool deferred = false;
-            completion_ok = scheduler_async_close_computation(scheduler->async, task_ref, deferred) && deferred;
-            if (!completion_ok)
-                scheduler_record_error(
-                    run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
-                    SchedulerErrorSite::ASYNC_CONTEXT_INVALID
+        if (completed_slot.cluster_mix || completed_slot.gm_mix) {
+            completion_ok = scheduler_read_worker_error(run_control, scheduler->worker_id()) == 0;
+        } else {
+            if (!contribution_retires)
+                contribution = scheduler_contribute_subtask<RecordProtocol>(
+                    graph, scheduler_state_base, scheduler, run_control, completed_slot, pending_slot
                 );
+            completion_ok = contribution != SchedulerSubtaskFinishResult::ERROR;
+            if (completed_slot.execution_token && contribution == SchedulerSubtaskFinishResult::PARTIAL)
+                scheduler->continuation_task_ref = task_ref;
+            if (contribution == SchedulerSubtaskFinishResult::TASK_LAST) {
+                ++scheduler->pending_completed;
+            } else if (contribution == SchedulerSubtaskFinishResult::TASK_LAST_DEFERRED) {
+                bool deferred = false;
+                completion_ok = scheduler_async_close_computation(scheduler->async, task_ref, deferred) && deferred;
+                if (!completion_ok)
+                    scheduler_record_error(
+                        run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+                        SchedulerErrorSite::ASYNC_CONTEXT_INVALID
+                    );
+            }
         }
     }
     // This core is the sole writer. Rebinding the slot happens after all trace
@@ -307,14 +333,16 @@ static inline __aicore__ bool scheduler_complete_own_slot(
     }
     // Failed completion bypasses the contribution's visibility fence. Its real
     // return must still precede a resource-lane acknowledgement.
-    if (!PublishCompletion || !completion_ok) scheduler_cache_barrier();
-    if (completed_slot.cluster_mix &&
-        !scheduler_cluster_mix_release(
-            graph, scheduler_state_base, scheduler, run_control, completed_slot, pending_slot
-        ))
+    if (!PublishCompletion || !completion_ok || completed_slot.cluster_mix || completed_slot.gm_mix)
+        scheduler_cache_barrier();
+    if (completed_slot.cluster_mix && !scheduler_cluster_mix_release(
+                                          graph, scheduler_state_base, scheduler, run_control, completed_slot,
+                                          pending_slot, PublishCompletion && completion_ok
+                                      ))
         return false;
     if (gm_mix && !scheduler_gm_mix_release_lane<RecordProtocol>(
-                      graph, scheduler_state_base, scheduler, run_control, completed_slot, pending_slot
+                      graph, scheduler_state_base, scheduler, run_control, completed_slot, pending_slot,
+                      PublishCompletion && completion_ok
                   ))
         return false;
     if (!completion_ok) return false;

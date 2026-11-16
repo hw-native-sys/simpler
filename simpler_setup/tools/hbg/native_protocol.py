@@ -13,7 +13,9 @@ Sequence integrity proves lossless local event streams, not scheduler causality,
 execution coverage, membership, dependency ordering or Mix resource correctness.
 """
 
+COMPLETION_FROM_GROUP = 1 << 29
 COMPLETION_FROM_CONTRIBUTION = 1 << 30
+COMPLETION_ALIAS_FLAGS = COMPLETION_FROM_GROUP | COMPLETION_FROM_CONTRIBUTION
 DEFERRED_FINISH = 1 << 31
 
 ROOT_NUMBERS = frozenset(
@@ -245,23 +247,32 @@ def _completion_aliases(section):
     for execution in section["executions"]:
         key = execution["task_ref"], execution["contribution_ticket"]
         contributions.setdefault(key, []).append(execution)
+    groups = {}
+    for block in section["blocks"]:
+        owner = block["owner"]
+        if owner is not None:
+            groups.setdefault((owner["task_ref"], owner["completion_ticket"]), []).append(block)
     aliases = {}
     for event in section["task_events"]:
         admission, done = event["admission"], event["completion"]
-        if admission is not None and admission["flags"] & COMPLETION_FROM_CONTRIBUTION:
+        if admission is not None and admission["flags"] & COMPLETION_ALIAS_FLAGS:
             _error("completion alias on admission")
-        if done is None or not done["flags"] & COMPLETION_FROM_CONTRIBUTION:
+        if done is None or not done["flags"] & COMPLETION_ALIAS_FLAGS:
             continue
         ref = event["index"]
         task, control = tasks[ref], controls[ref]
-        total = task["block_num"] * task["active_mask"].bit_count()
+        width = task["active_mask"].bit_count()
+        total = task["block_num"] * width
+        group_alias = bool(done["flags"] & COMPLETION_FROM_GROUP)
+        alias_flag = COMPLETION_FROM_GROUP if group_alias else COMPLETION_FROM_CONTRIBUTION
         if (
             not task["flags"] & 1
             or task["flags"] & 32
             or not 0 < task["active_mask"] < 8
             or not 0 < total <= 32767
             or done["flags"] & DEFERRED_FINISH
-            or done["flags"] != task["flags"] | COMPLETION_FROM_CONTRIBUTION
+            or done["flags"] != task["flags"] | alias_flag
+            or group_alias != bool(task["flags"] & 4)
             or done["task_ref"] != ref
             or done["run_epoch"] != section["run_epoch"]
             or control["canonical_total"] != total
@@ -270,6 +281,28 @@ def _completion_aliases(section):
             or control["state"] != 2
         ):
             _error(f"invalid physical TaskDone completion alias for task {ref}")
+        if group_alias:
+            candidates = groups.get((ref, total - width), ())
+            if len(candidates) != 1:
+                _error(f"TaskDone completion alias lacks a unique last group contribution for task {ref}")
+            block = candidates[0]
+            source = block["owner"]
+            if (
+                source["block_idx"] >= task["block_num"]
+                or source["block_num"] != task["block_num"]
+                or source["active_mask"] != task["active_mask"]
+                or source["flags"] != task["flags"]
+                or block["index"] != task["trace_base"] + source["block_idx"] * width
+                or source["run_epoch"] != done["run_epoch"]
+                or source["worker_index"] != done["worker_index"]
+                or source["order_key"] != done["order_key"]
+                or done["before"] != source["completion_before"]
+                or done["after"] != source["completion_after"]
+                or not 0 < done["before"][1] < done["after"][1]
+            ):
+                _error(f"TaskDone completion alias does not identify its last group contribution for task {ref}")
+            aliases[ref] = source
+            continue
         candidates = contributions.get((ref, total - 1), ())
         if len(candidates) != 1:
             _error(f"TaskDone completion alias lacks a unique last contribution for task {ref}")
@@ -319,8 +352,8 @@ def audit_protocol_sequences(section):
         worker = record["worker_index"]
         if worker not in workers or record["run_epoch"] != epoch:
             _error(f"foreign worker or epoch at {path}")
-        if kind == "actor" and record["flags"] & COMPLETION_FROM_CONTRIBUTION:
-            # The validated physical contribution contributes these events once.
+        if kind == "actor" and record["flags"] & COMPLETION_ALIAS_FLAGS:
+            # The validated physical or group contribution supplies these events once.
             continue
         stream = streams[worker]
         for name in STAMPS[kind].split():

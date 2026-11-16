@@ -87,6 +87,7 @@ struct alignas(64) SchedulerPreparedLayout {
     uint64_t controls_offset;
     uint64_t calls_offset;
     uint64_t bindings_offset;
+    uint64_t task_controls_offset;
 };
 
 static_assert(sizeof(SchedulerExecutionPlan) == 16);
@@ -94,6 +95,7 @@ static_assert(sizeof(SchedulerPreparedControl) == 128 && alignof(SchedulerPrepar
 static_assert(sizeof(SchedulerPreparedCall) == 512 && offsetof(SchedulerPreparedCall, args) == 64);
 static_assert(sizeof(SchedulerExecutionBinding) == 128 && offsetof(SchedulerExecutionBinding, global_context) == 64);
 static_assert(sizeof(SchedulerPreparedLayout) == 64);
+static_assert(offsetof(SchedulerPreparedLayout, task_controls_offset) == 56);
 static_assert(
     std::is_trivially_copyable_v<SchedulerExecutionPlan> && std::is_standard_layout_v<SchedulerExecutionPlan>
 );

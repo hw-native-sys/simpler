@@ -44,6 +44,14 @@ inline __aicore__ bool scheduler_prepared_layout_valid(
         ))
         return false;
     const auto *layout = reinterpret_cast<__gm__ const SchedulerPreparedLayout *>(address + layout_offset);
+    uint64_t controls_end = 0;
+    if (layout->task_controls_offset == 0 ||
+        !scheduler_prepared_region_end(
+            bytes, layout->task_controls_offset, task_count, sizeof(SchedulerTaskControl),
+            alignof(SchedulerTaskControl), &controls_end
+        ) ||
+        controls_end > layout_offset)
+        return false;
     if (layout->task_count != task_count || task_count == 0 || layout->run_epoch != run_epoch ||
         layout->execution_count == 0 || layout->plans_offset < end ||
         !scheduler_prepared_region_end(
@@ -139,6 +147,24 @@ static inline __aicore__ bool scheduler_prepared_call_valid(
            call->args[SPMD_GLOBAL_CONTEXT_INDEX] == reinterpret_cast<uint64_t>(&binding->global_context);
 }
 
+static inline __aicore__ bool scheduler_prepared_already_returned(
+    __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, const SchedulerPreparedHandle &handle
+) {
+    if (prepared == nullptr || prepared->task_controls_offset == 0 ||
+        handle.execution_index >= prepared->execution_count)
+        return false;
+    const auto *call = scheduler_prepared_call_at(base, prepared, handle.execution_index);
+    if (call->task_ref < 0 || static_cast<uint64_t>(call->task_ref) >= prepared->task_count) return false;
+    const auto &plan = scheduler_state_at<SchedulerExecutionPlan>(base, prepared->plans_offset)[call->task_ref];
+    if (plan.active_lane_count != 1) return false;
+    auto &completion =
+        scheduler_state_at<SchedulerTaskControl>(base, prepared->task_controls_offset)[call->task_ref].completion_state;
+    return scheduler_prepared_retirement_inferred(
+        handle.claimed_state, *prepared, handle.execution_index, *call, plan,
+        scheduler_gm_fetch_add(completion, UINT64_C(0))
+    );
+}
+
 // FromExecutor owns a Call that has physically returned. Its CLAIMED state
 // has no remote writer; the completion/failed-return fence drains publication.
 template <bool FromExecutor = false>
@@ -149,6 +175,8 @@ inline __aicore__ bool scheduler_return_prepared_execution(
     if (prepared == nullptr || handle == nullptr || handle->execution_index >= prepared->execution_count ||
         scheduler_prepared_phase(handle->claimed_state) != SchedulerPreparedPhase::CLAIMED)
         return false;
+    if constexpr (!FromExecutor)
+        if (scheduler_prepared_already_returned(base, prepared, *handle)) return false;
     auto *control = scheduler_prepared_control_at(base, prepared, handle->execution_index);
     const uint64_t returned =
         (handle->claimed_state & ~UINT64_C(255)) | static_cast<uint64_t>(SchedulerPreparedPhase::RETURNED);
@@ -232,6 +260,7 @@ static inline __aicore__ bool scheduler_fail_prepared_execution(
 ) {
     if (!scheduler_execution_token_handle_valid(base, prepared, worker_id, handle, SchedulerPreparedPhase::CLAIMED))
         return false;
+    if (scheduler_prepared_already_returned(base, prepared, *handle)) return false;
     auto *control = scheduler_prepared_control_at(base, prepared, handle->execution_index);
     const uint64_t failed =
         (handle->claimed_state & ~UINT64_C(255)) | static_cast<uint64_t>(SchedulerPreparedPhase::FAILED);

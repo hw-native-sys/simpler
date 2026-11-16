@@ -519,6 +519,7 @@ static inline __aicore__ bool scheduler_read_claim_cursor(
     if (seal == count && scheduler_scalar_result(local, SchedPhaseKind::ScalarNextBlockProbe, [&]() __aicore__ {
                              return scheduler_gm_query(control->next_block);
                          }) == count) {
+        scheduler_remember_task_proof(local, admission->current_task_ref, SchedulerTaskProof::SUPPLY_CLOSED);
         *cursor = count;
         if (used_seal != nullptr) *used_seal = true;
         return true;
@@ -553,6 +554,7 @@ static inline __aicore__ bool scheduler_publish_claim_seal(
     if constexpr (RecordProtocol) scheduler_protocol_claim_seal(base, local, block, true, admission->current_block_num);
     scheduler_cache_barrier();
     scheduler_gm_store(control->claim_seal, static_cast<uint64_t>(admission->current_block_num));
+    scheduler_remember_task_proof(local, admission->current_task_ref, SchedulerTaskProof::SUPPLY_CLOSED);
     if constexpr (RecordProtocol)
         scheduler_protocol_claim_seal(base, local, block, false, admission->current_block_num);
     return true;

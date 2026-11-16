@@ -32,8 +32,8 @@ static inline __aicore__ bool scheduler_issue_fail(
     return false;
 }
 
-// A valid ticket cannot be returned. Reaching the block count therefore proves
-// every block has an owner, independently of its computation or async debt.
+// The last valid claimant publishes an immutable supply seal. Admission tasks
+// publish it only after the required member registrations are complete.
 static inline __aicore__ bool scheduler_task_supply_closed(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     int64_t ref, bool *closed
@@ -46,29 +46,47 @@ static inline __aicore__ bool scheduler_task_supply_closed(
         *closed = true;
         return true;
     }
+    if (scheduler_cached_task_proof(local, ref) != SchedulerTaskProof::NONE) {
+        *closed = true;
+        return true;
+    }
     auto *control = scheduler_task_control_at(base, local, ref);
     if (scheduler_task_is_executable(metadata.flags) && !scheduler_task_is_inline(metadata.flags)) {
         const uint64_t blocks = metadata.logical_block_num;
         if (blocks == 0) return scheduler_issue_fail(graph, local, run, ref);
-        if (scheduler_gm_query(control->next_block) >= blocks &&
-            scheduler_gm_fetch_add(control->next_block, UINT64_C(0)) >= blocks) {
-            if (!scheduler_task_requires_admission(metadata.flags)) {
-                *closed = true;
-                return true;
-            }
-            const uint64_t seal = scheduler_gm_query(control->claim_seal) == 0 ?
-                                      0 :
-                                      scheduler_gm_fetch_add(control->claim_seal, UINT64_C(0));
-            if (seal != 0 && seal != blocks) return scheduler_issue_fail(graph, local, run, ref);
-            if (seal == blocks) {
-                *closed = true;
-                return true;
-            }
+        const uint64_t seal =
+            scheduler_gm_query(control->claim_seal) == 0 ? 0 : scheduler_gm_fetch_add(control->claim_seal, UINT64_C(0));
+        if (seal != 0 && seal != blocks) return scheduler_issue_fail(graph, local, run, ref);
+        if (seal == blocks) {
+            scheduler_remember_task_proof(local, ref, SchedulerTaskProof::SUPPLY_CLOSED);
+            *closed = true;
+            return true;
         }
     }
-    const auto completion = scheduler_observe_task_completion(control);
+    const auto completion = scheduler_observe_cached_completion(base, local, ref);
     if (completion == SchedulerCompletionObservation::INVALID) return scheduler_issue_fail(graph, local, run, ref);
     *closed = completion == SchedulerCompletionObservation::DONE;
+    return true;
+}
+
+// Only a successful final valid ticket owner reaches this publication. Other
+// claimants may still be receiving their Calls; every valid ticket is irrevocable.
+static inline __aicore__ bool scheduler_close_ordinary_supply(
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    int64_t ref, uint32_t block, uint32_t blocks
+) {
+    if (block + 1 != blocks) return true;
+    auto *control = scheduler_task_control_at(base, local, ref);
+    scheduler_cache_barrier();
+    scheduler_gm_store(control->claim_seal, static_cast<uint64_t>(blocks));
+    const auto &pool = *scheduler_state_at<SchedulerTaskCatalogHeader>(base, local->config.task_catalog_offset);
+    const auto catalog = scheduler_task_catalog(base, pool, local->config.self_core_type);
+    if (!scheduler_task_catalog_valid(catalog)) return scheduler_issue_fail(graph, local, run, ref);
+    scheduler_remember_task_proof(local, ref, SchedulerTaskProof::SUPPLY_CLOSED);
+    const uint64_t head = local->issue_cursor;
+    if (head < catalog.count && catalog.refs[head] == ref) {
+        local->issue_cursor = head + 1;
+    }
     return true;
 }
 
@@ -122,8 +140,8 @@ static inline __aicore__ bool scheduler_issue_fanin_ready(
         if (status != SchedulerGraphResult::OK)
             return scheduler_issue_fail(graph, local, run, ref, status, SchedulerErrorSite::ROUTE_INVALID_STATE);
         const auto &metadata = *scheduler_task_metadata_at(base, local, predecessor);
-        // Earlier executable entries in this engine have passed the shared
-        // issuance head, including the real member seal for sync-start tasks.
+        // Earlier executable entries in this engine have passed this core's
+        // issuance cursor, including the real member seal for sync-start tasks.
         const bool issued_in_engine = scheduler_task_is_executable(metadata.flags) &&
                                       !scheduler_task_is_inline(metadata.flags) &&
                                       scheduler_task_execution_engine(metadata.flags, scheduler_task_lanes(metadata)) ==
@@ -158,17 +176,11 @@ static inline __aicore__ bool scheduler_query_issue_head(
     if (!scheduler_task_catalog_valid(catalog))
         return scheduler_issue_fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
     if (catalog.count == 0) return true;
-    // Zero is the Host-published initial head. Later cached values come only
-    // from returned atomics; bypass observations cannot move this certificate.
-    uint64_t head = local->issue_observed_head;
+    // The private cursor only crosses atomically confirmed supply seals or
+    // canonical terminal states. Every earlier catalog entry is closed.
+    uint64_t head = local->issue_cursor;
     if (head > catalog.count) return scheduler_issue_fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
     if (head == catalog.count) return true;
-    const uint64_t hint = scheduler_gm_query(catalog.issue->next_task);
-    if (hint > head || ++local->issue_observe_attempts >= 8) {
-        head = scheduler_gm_fetch_add(catalog.issue->next_task, UINT64_C(0));
-        local->issue_observed_head = head;
-        local->issue_observe_attempts = 0;
-    }
     for (uint32_t visited = 0; visited < 8; ++visited) {
         if (head > catalog.count) return scheduler_issue_fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
         if (head == catalog.count) return true;
@@ -182,13 +194,7 @@ static inline __aicore__ bool scheduler_query_issue_head(
         bool closed = false;
         if (!scheduler_task_supply_closed(graph, base, local, run, task_ref, &closed)) return false;
         if (closed) {
-            const uint64_t observed = scheduler_gm_compare_exchange(catalog.issue->next_task, head, head + 1);
-            if (observed == head) {
-                ++head;
-                *progress = true;
-            } else head = observed;
-            local->issue_observed_head = head;
-            local->issue_observe_attempts = 0;
+            local->issue_cursor = ++head;
             *progress = true;
             if (scheduler_issue_needs_execution_recheck(local)) return true;
             continue;

@@ -130,6 +130,10 @@ struct AsyncFixture {
             ),
             PreparedAccessResult::READY
         );
+        ASSERT_TRUE(scheduler_close_ordinary_supply(
+            graph.graph(), base(), state, storage.run_control, slot.task_ref, slot.block_idx,
+            storage.metadata[slot.task_ref].logical_block_num
+        ));
     }
     bool next_execution(uint32_t *slot) {
         if (!storage.prepare_calls(graph.graph())) return false;
@@ -321,7 +325,18 @@ TEST(HbgAsyncControl, ReturnedExecutionReleasesSlotButCannotReleaseConsumerBefor
     slot.subtask_slot = 0;
     slot.state = SchedulerDispatchSlotState::EXECUTING;
     f.bind_package();
-    ASSERT_TRUE(scheduler_complete_own_slot(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0));
+    slot.execution_token = true;
+    const auto returned_handle = slot.prepared;
+    ASSERT_TRUE(
+        (scheduler_complete_own_slot<false, true>(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0))
+    );
+    EXPECT_TRUE(scheduler_prepared_already_returned(f.base(), f.local()->config.prepared, returned_handle));
+    EXPECT_EQ(
+        scheduler_prepared_phase(
+            scheduler_prepared_control_at(f.base(), f.local()->config.prepared, returned_handle.execution_index)->state
+        ),
+        SchedulerPreparedPhase::CLAIMED
+    );
     EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FREE);
     EXPECT_TRUE(scheduler_async_pending::closed(f.join().word));
     EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 1u);
@@ -790,6 +805,55 @@ TEST(HbgAsyncControl, ASettledWaitStillCannotFinishBeforeZeroMembersRelease) {
     EXPECT_EQ(scheduler_async_lease_phase(f.finish_lease().word), SchedulerAsyncPhase::RUNNABLE);
 }
 
+TEST(HbgAsyncControl, LeaseHintsCannotGrantOwnershipOrHideReleasedWork) {
+    SchedulerAsyncLease lease;
+    ASSERT_EQ(scheduler_async_lease_publish(lease).result, SchedulerAsyncLeaseResult::SUCCESS);
+    const uint64_t first_runnable = lease.word;
+    const auto first = scheduler_async_detail::claim_observed(lease, first_runnable, false);
+    ASSERT_EQ(first.result, SchedulerAsyncLeaseResult::SUCCESS);
+    EXPECT_EQ(
+        scheduler_async_detail::claim_observed(lease, first_runnable, false).result,
+        SchedulerAsyncLeaseResult::CONTENDED
+    );
+    EXPECT_EQ(lease.word, first.word);
+    ASSERT_EQ(scheduler_async_lease_release(lease, first.word).result, SchedulerAsyncLeaseResult::SUCCESS);
+    const uint64_t second_runnable = lease.word;
+    EXPECT_EQ(
+        scheduler_async_detail::claim_observed(lease, first.word, false).result, SchedulerAsyncLeaseResult::NOT_RUNNABLE
+    );
+    EXPECT_EQ(lease.word, second_runnable);
+    const auto second = scheduler_async_detail::claim_observed(lease, first.word, true);
+    ASSERT_EQ(second.result, SchedulerAsyncLeaseResult::SUCCESS);
+    EXPECT_EQ(scheduler_async_lease_generation(second.word), 2u);
+    ASSERT_EQ(scheduler_async_lease_release(lease, second.word).result, SchedulerAsyncLeaseResult::SUCCESS);
+    const auto third = scheduler_async_detail::claim_observed(lease, first_runnable, false);
+    ASSERT_EQ(third.result, SchedulerAsyncLeaseResult::SUCCESS);
+    EXPECT_EQ(scheduler_async_lease_generation(third.word), 3u);
+    ASSERT_EQ(scheduler_async_lease_release(lease, third.word).result, SchedulerAsyncLeaseResult::SUCCESS);
+    const auto fourth = scheduler_async_detail::claim_observed(lease, 0, false);
+    ASSERT_EQ(fourth.result, SchedulerAsyncLeaseResult::SUCCESS);
+    EXPECT_EQ(scheduler_async_lease_generation(fourth.word), 4u);
+}
+
+TEST(HbgAsyncControl, OwnedCheckProgressRemainsWithItsCurrentObserver) {
+    AsyncFixture f;
+    const auto writer = f.start();
+    f.register_counter(writer);
+    ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, writer));
+    const auto owner = scheduler_async_lease_try_claim(f.group_lease(), f.group_lease().word);
+    ASSERT_EQ(owner.result, SchedulerAsyncLeaseResult::SUCCESS);
+    auto *progress = scheduler_state_at<SchedulerAsyncGroupProgress>(f.base(), f.plan.layout.group_progress_offset);
+    const SchedulerAsyncGroupProgress before = *progress;
+    for (uint32_t pass = 0; pass < 2; ++pass) {
+        EXPECT_FALSE(f.check(1));
+        EXPECT_EQ(f.group_lease().word, owner.word);
+        EXPECT_EQ(std::memcmp(progress, &before, sizeof(before)), 0);
+    }
+    ASSERT_EQ(scheduler_async_lease_release(f.group_lease(), owner.word).result, SchedulerAsyncLeaseResult::SUCCESS);
+    f.signal[0] = 1;
+    EXPECT_TRUE(f.check(1));
+}
+
 TEST(HbgAsyncControl, DirectoryTailWrapDoesNotStarveEarlierPendingGroups) {
     std::vector<AsyncTaskPlanInput> inputs;
     for (uint32_t task = 0; task < 65; ++task)
@@ -801,6 +865,7 @@ TEST(HbgAsyncControl, DirectoryTailWrapDoesNotStarveEarlierPendingGroups) {
     f.workers[1].check_cursor = 64;
     EXPECT_FALSE(f.check(1));
     EXPECT_EQ(f.workers[1].check_cursor, 0u);
+    EXPECT_TRUE(f.workers[1].check_strong_pass);
     EXPECT_TRUE(f.check(1));
     EXPECT_EQ(scheduler_async_lease_phase(f.group_lease(0).word), SchedulerAsyncPhase::TERMINAL);
 }
@@ -828,6 +893,7 @@ TEST(HbgAsyncControl, TwoWaitersReleaseDispatchSlotsWhileTheirProducersRetainBlo
     for (uint32_t producer = 2; producer < 4; ++producer) {
         f.graph.executable(producer, 0, {static_cast<int32_t>(producer - 2)});
         f.task_control(producer - 2)->next_block = 1;
+        f.task_control(producer - 2)->claim_seal = 1;
     }
     for (uint32_t waiter = 4; waiter < 6; ++waiter) {
         int64_t task = -1;

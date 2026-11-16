@@ -811,7 +811,7 @@ TEST(HbgNativeGraphPlan, NativeCatalogOrderAllocatesEachSingleBlockOnce) {
         EXPECT_EQ(catalog.refs[expected - 1], expected);
         for (uint32_t slice = 0; slice <= catalog.count && !scheduler_execution_token_has_task(&consumer, expected);
              ++slice) {
-            const uint64_t head = consumer.issue_observed_head;
+            const uint64_t head = consumer.issue_cursor;
             const uint32_t count = scheduler_execution_token_count(&consumer);
             const int64_t task = consumer.issue_task_ref;
             const uint32_t fanin = consumer.issue_next_fanin;
@@ -821,7 +821,7 @@ TEST(HbgNativeGraphPlan, NativeCatalogOrderAllocatesEachSingleBlockOnce) {
             );
             ASSERT_TRUE(progress);
             ASSERT_TRUE(
-                consumer.issue_observed_head > head || scheduler_execution_token_count(&consumer) > count ||
+                consumer.issue_cursor > head || scheduler_execution_token_count(&consumer) > count ||
                 consumer.issue_task_ref != task || consumer.issue_next_fanin > fanin
             );
         }
@@ -833,7 +833,7 @@ TEST(HbgNativeGraphPlan, NativeCatalogOrderAllocatesEachSingleBlockOnce) {
     bool progress = false;
     ASSERT_TRUE(scheduler_refill_execution_tokens(view.graph, view.backing.get(), &competing, run, 0, &progress));
     EXPECT_TRUE(progress);
-    EXPECT_EQ(catalog.issue->next_task, catalog.count);
+    EXPECT_EQ(consumer.issue_cursor, catalog.count);
     ASSERT_TRUE(scheduler_refill_execution_tokens(view.graph, view.backing.get(), &competing, run, 0, &progress));
     EXPECT_FALSE(progress);
     EXPECT_EQ(scheduler_execution_token_count(&competing), 0u);

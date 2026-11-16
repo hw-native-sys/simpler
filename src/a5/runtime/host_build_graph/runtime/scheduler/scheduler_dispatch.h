@@ -127,13 +127,13 @@ static inline __aicore__ bool scheduler_ordered_poll_may_progress(
         for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
             if (!resources.has(static_cast<SubtaskSlot>(lane))) continue;
             auto &ack = releases ? mailbox->lanes[lane].released_seq : mailbox->lanes[lane].arrived_seq;
-            if (scheduler_scalar_result(
-                    local, releases ? SchedPhaseKind::ScalarPollMixReleased : SchedPhaseKind::ScalarPollMixArrived,
-                    [&]() __aicore__ {
-                        return scheduler_gm_query(ack);
-                    }
-                ) < group.group_seq)
-                return false;
+            const uint64_t observed = scheduler_scalar_result(
+                local, releases ? SchedPhaseKind::ScalarPollMixReleased : SchedPhaseKind::ScalarPollMixArrived,
+                [&]() __aicore__ {
+                    return scheduler_gm_query(ack);
+                }
+            );
+            if ((releases ? scheduler_group_release_sequence(observed) : observed) < group.group_seq) return false;
         }
         if (ack_prefilter_phase != nullptr) *ack_prefilter_phase = group.phase;
     }
@@ -476,13 +476,21 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_fill_own_slots
         // A sliced discovery with no issuable head has already yielded to
         // existing work. Its cached negative result cannot supply another ticket.
         if (selected == UINT32_MAX && (!snapshot.evaluated || !scheduler_task_ref_is_null(snapshot.ref))) {
-            if (!scheduler_try_execution_continuation(graph, base, local, run, profiling_level, &advanced, &snapshot) ||
-                (!advanced &&
-                 !scheduler_refill_execution_tokens(graph, base, local, run, profiling_level, &advanced, &snapshot))) {
+            if (!scheduler_try_execution_continuation(
+                    graph, base, local, run, profiling_level, &advanced, &snapshot, &selected
+                ) ||
+                (!advanced && !scheduler_refill_execution_tokens(
+                                  graph, base, local, run, profiling_level, &advanced, &snapshot, &selected
+                              ))) {
                 *failed = true;
                 return progress;
             }
             progress = progress || advanced;
+            if (selected != UINT32_MAX) {
+                if (direct_slot != nullptr) *direct_slot = selected;
+                else scheduler_local_ready_publish(local, selected);
+                return progress;
+            }
             advanced = scheduler_service_cooperative_slots<RecordProtocol>(
                 graph, base, local, run, profiling_level, failed, direct_slot
             );

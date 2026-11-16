@@ -185,7 +185,7 @@ struct GmMixFixture {
         const auto *entry = std::find(catalog.refs, catalog.refs + catalog.count, static_cast<int64_t>(task));
         if (entry == catalog.refs + catalog.count) return false;
         for (uint64_t slice = 0; slice <= catalog.count + 2 * graph.graph().task_count; ++slice) {
-            const uint64_t head = local->issue_observed_head;
+            const uint64_t head = local->issue_cursor;
             const int64_t issue_task = local->issue_task_ref;
             const uint32_t fanin = local->issue_next_fanin;
             const uint32_t tokens = scheduler_execution_token_count(local);
@@ -200,9 +200,8 @@ struct GmMixFixture {
                 ))
                 return true;
             if (scheduler_execution_token_count(local) != tokens) return false;
-            if (local->issue_observed_head == head &&
-                !(local->issue_next_fanin != 0 &&
-                  (local->issue_task_ref != issue_task || local->issue_next_fanin > fanin)))
+            if (local->issue_cursor == head && !(local->issue_next_fanin != 0 && (local->issue_task_ref != issue_task ||
+                                                                                  local->issue_next_fanin > fanin)))
                 return false;
         }
         return false;
@@ -223,16 +222,15 @@ struct GmMixFixture {
         const auto *entry = std::find(catalog.refs, catalog.refs + catalog.count, static_cast<int64_t>(task));
         if (entry == catalog.refs + catalog.count) return false;
         for (uint64_t slice = 0; slice <= catalog.count + 2 * graph.graph().task_count; ++slice) {
-            const uint64_t head = local->issue_observed_head;
+            const uint64_t head = local->issue_cursor;
             const int64_t issue_task = local->issue_task_ref;
             const uint32_t fanin = local->issue_next_fanin;
             bool progress = false;
             if (!scheduler_discover_cooperative_task(graph.graph(), base(), local, run(), &progress)) return false;
             if (!scheduler_task_ref_is_null(admissions[worker].pending_task_ref))
                 return admissions[worker].pending_task_ref == static_cast<int64_t>(task);
-            if (local->issue_observed_head == head &&
-                !(local->issue_next_fanin != 0 &&
-                  (local->issue_task_ref != issue_task || local->issue_next_fanin > fanin)))
+            if (local->issue_cursor == head && !(local->issue_next_fanin != 0 && (local->issue_task_ref != issue_task ||
+                                                                                  local->issue_next_fanin > fanin)))
                 return false;
         }
         return false;

@@ -24,7 +24,7 @@
 namespace {
 
 struct OwnershipFixture {
-    alignas(128) std::array<uint8_t, 1024> bytes{};
+    alignas(128) std::array<uint8_t, 2048> bytes{};
     SchedulerPreparedLayout *prepared;
 
     OwnershipFixture() {
@@ -33,7 +33,9 @@ struct OwnershipFixture {
         layout.task_count = 1;
         layout.prepared_layout_offset = 64;
         prepared = scheduler_state_at<SchedulerPreparedLayout>(base(), layout.prepared_layout_offset);
-        *prepared = {17, 1, 1, 128, 256, 512, 384};
+        *prepared = {17, 1, 1, 128, 256, 512, 384, 1024};
+        scheduler_state_at<SchedulerTaskControl>(base(), prepared->task_controls_offset)->completion_state =
+            scheduler_completion_initial_state(1);
         *scheduler_state_at<SchedulerExecutionPlan>(base(), prepared->plans_offset) = {0, 1, 1, 1, 1};
         const uint64_t functions[3]{1, 0, 0};
         EXPECT_TRUE(scheduler_prepare_host_calls(
@@ -117,6 +119,10 @@ struct RefillFixture {
             scheduler_acquire_execution_token(base(), local->config.prepared, worker, task, block, 0, handle),
             PreparedAccessResult::READY
         );
+        ASSERT_TRUE(scheduler_close_ordinary_supply(
+            graph.graph(), base(), storage.local_context(&storage.contexts[worker]), storage.run_control, task,
+            static_cast<uint32_t>(block), storage.metadata[task].logical_block_num
+        ));
     }
     // Seed a known ownership boundary using the actual ticket and Call claim.
     // Ordered issuance and subsequent entry remain production operations.
@@ -147,14 +153,14 @@ struct RefillFixture {
                                  scheduler_execution_token_count(local) < count;
              ++slice) {
             const auto before = pending_tasks();
-            const auto head = local->issue_observed_head;
+            const auto head = local->issue_cursor;
             const auto task = local->issue_task_ref;
             const auto fanin = local->issue_next_fanin;
             bool advanced = false;
             ASSERT_TRUE(refill(&advanced));
             ASSERT_TRUE(advanced);
             ASSERT_TRUE(
-                pending_tasks() != before || local->issue_observed_head > head || local->issue_task_ref != task ||
+                pending_tasks() != before || local->issue_cursor > head || local->issue_task_ref != task ||
                 local->issue_next_fanin > fanin
             );
         }
