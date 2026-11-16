@@ -32,39 +32,65 @@ static inline __aicore__ bool scheduler_issue_fail(
     return false;
 }
 
+// Only immutable catalog facts persist across fills. Supply and completion
+// observations retain their independent freshness and lifetime contracts.
+static inline __aicore__ bool scheduler_bind_issue_entry(
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    int64_t ref
+) {
+    auto &binding = local->issue_binding;
+    if (binding.task_ref == ref) return true;
+    if (!scheduler_task_ref_valid(graph, ref)) return scheduler_issue_fail(graph, local, run, ref);
+    const auto metadata = scheduler_load_dispatch_metadata(base, local, ref, 0);
+    if (!scheduler_task_is_executable(metadata.flags) || scheduler_task_is_inline(metadata.flags) ||
+        scheduler_task_execution_engine(metadata.flags, scheduler_task_lanes(metadata)) != local->config.self_core_type)
+        return scheduler_issue_fail(graph, local, run, ref);
+    binding.metadata = metadata;
+    binding.control = scheduler_task_control_at(base, local, ref);
+    binding.fanin_bound = false;
+    binding.task_ref = ref;
+    return true;
+}
+
 // The last valid claimant publishes an immutable supply seal. Admission tasks
 // publish it only after the required member registrations are complete.
 static inline __aicore__ bool scheduler_task_supply_closed(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    int64_t ref, bool *closed
+    int64_t ref, bool *closed, const SchedulerIssueBinding *binding = nullptr
 ) {
     SchedulerScalarScope scope(local, SchedPhaseKind::ScalarTaskSupplyClosed, ref);
     *closed = false;
     if (!scheduler_task_ref_valid(graph, ref)) return scheduler_issue_fail(graph, local, run, ref);
-    const auto &metadata = *scheduler_task_metadata_at(base, local, ref);
-    if (scheduler_predecessor_is_host_done(graph, ref, metadata)) {
-        *closed = true;
-        return true;
+    bool executable = true;
+    uint64_t blocks = 0;
+    auto *control = binding != nullptr ? binding->control : scheduler_task_control_at(base, local, ref);
+    if (binding != nullptr) {
+        if (binding->task_ref != ref) return scheduler_issue_fail(graph, local, run, ref);
+        blocks = binding->metadata.logical_block_num;
+    } else {
+        const auto &metadata = *scheduler_task_metadata_at(base, local, ref);
+        if (scheduler_predecessor_is_host_done(graph, ref, metadata)) {
+            *closed = true;
+            return true;
+        }
+        executable = scheduler_task_is_executable(metadata.flags) && !scheduler_task_is_inline(metadata.flags);
+        blocks = metadata.logical_block_num;
     }
     if (scheduler_cached_task_proof(local, ref) != SchedulerTaskProof::NONE) {
         *closed = true;
         return true;
     }
-    auto *control = scheduler_task_control_at(base, local, ref);
-    const bool executable = scheduler_task_is_executable(metadata.flags) && !scheduler_task_is_inline(metadata.flags);
-    const uint64_t blocks = metadata.logical_block_num;
     if (executable && blocks == 0) return scheduler_issue_fail(graph, local, run, ref);
     // Canonical DONE proves both closed supply and completed dependencies.
     // Pending compute or async debt still requires the independent supply seal.
-    const auto completion = scheduler_observe_cached_completion(base, local, ref);
+    const auto completion = scheduler_observe_cached_completion(base, local, ref, control);
     if (completion == SchedulerCompletionObservation::INVALID) return scheduler_issue_fail(graph, local, run, ref);
     if (completion == SchedulerCompletionObservation::DONE) {
         *closed = true;
         return true;
     }
     if (executable) {
-        const uint64_t seal =
-            scheduler_gm_query(control->claim_seal) == 0 ? 0 : scheduler_gm_fetch_add(control->claim_seal, UINT64_C(0));
+        const uint64_t seal = scheduler_gm_query(control->claim_seal);
         if (seal != 0 && seal != blocks) return scheduler_issue_fail(graph, local, run, ref);
         if (seal == blocks) {
             scheduler_remember_task_proof(local, ref, SchedulerTaskProof::SUPPLY_CLOSED);
@@ -84,7 +110,7 @@ static inline __aicore__ bool scheduler_close_ordinary_supply(
     if (block + 1 != blocks) return true;
     auto *control = scheduler_task_control_at(base, local, ref);
     scheduler_cache_barrier();
-    scheduler_gm_store(control->claim_seal, static_cast<uint64_t>(blocks));
+    scheduler_store_signal(control->claim_seal, static_cast<uint64_t>(blocks));
     const auto &pool = *scheduler_state_at<SchedulerTaskCatalogHeader>(base, local->config.task_catalog_offset);
     const auto catalog = scheduler_task_catalog(base, pool, local->config.self_core_type);
     if (!scheduler_task_catalog_valid(catalog)) return scheduler_issue_fail(graph, local, run, ref);
@@ -128,14 +154,15 @@ static inline __aicore__ bool scheduler_issue_fanin_ready(
         *ready = true;
         return true;
     }
-    SchedulerFaninView fanin{};
-    const auto view_status = scheduler_node_fanin_view(graph, ref, &fanin);
-    if (view_status != SchedulerGraphResult::OK)
-        return scheduler_issue_fail(graph, local, run, ref, view_status, SchedulerErrorSite::ROUTE_INVALID_STATE);
-    if (local->issue_next_fanin > fanin.count)
-        return scheduler_issue_fail(
-            graph, local, run, ref, SchedulerGraphResult::INVALID_FANIN_COUNT, SchedulerErrorSite::ROUTE_INVALID_STATE
-        );
+    if (!scheduler_bind_issue_entry(graph, base, local, run, ref)) return false;
+    auto &binding = local->issue_binding;
+    if (!binding.fanin_bound) {
+        const auto view_status = scheduler_node_fanin_view(graph, ref, &binding.fanin);
+        if (view_status != SchedulerGraphResult::OK)
+            return scheduler_issue_fail(graph, local, run, ref, view_status, SchedulerErrorSite::ROUTE_INVALID_STATE);
+        binding.fanin_bound = true;
+    }
+    const auto &fanin = binding.fanin;
     if (local->issue_next_fanin > fanin.count)
         return scheduler_issue_fail(
             graph, local, run, ref, SchedulerGraphResult::INVALID_FANIN_COUNT, SchedulerErrorSite::ROUTE_INVALID_STATE
@@ -193,13 +220,10 @@ static inline __aicore__ bool scheduler_query_issue_head(
         if (head == catalog.count) return true;
         const int64_t task_ref = catalog.refs[head];
         if (!scheduler_task_ref_valid(graph, task_ref)) return scheduler_issue_fail(graph, local, run, task_ref);
-        const auto &metadata = *scheduler_task_metadata_at(base, local, task_ref);
-        if (!scheduler_task_is_executable(metadata.flags) || scheduler_task_is_inline(metadata.flags) ||
-            scheduler_task_execution_engine(metadata.flags, scheduler_task_lanes(metadata)) !=
-                local->config.self_core_type)
-            return scheduler_issue_fail(graph, local, run, task_ref);
+        if (!scheduler_bind_issue_entry(graph, base, local, run, task_ref)) return false;
         bool closed = false;
-        if (!scheduler_task_supply_closed(graph, base, local, run, task_ref, &closed)) return false;
+        if (!scheduler_task_supply_closed(graph, base, local, run, task_ref, &closed, &local->issue_binding))
+            return false;
         if (closed) {
             local->issue_cursor = ++head;
             *progress = true;

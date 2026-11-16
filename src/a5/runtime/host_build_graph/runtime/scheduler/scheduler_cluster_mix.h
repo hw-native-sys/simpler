@@ -238,8 +238,7 @@ static inline __aicore__ bool scheduler_cluster_mix_claim_head(
         return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
     const uint32_t blocks = metadata.logical_block_num;
     auto *control = scheduler_task_control_at(base, local, task_ref);
-    if (scheduler_gm_query(control->next_block) >= blocks &&
-        scheduler_gm_fetch_add(control->next_block, UINT64_C(0)) >= blocks) {
+    if (scheduler_gm_query(control->next_block) >= blocks) {
         if (local->issue_task_ref == task_ref) local->issue_ticket_exhausted = true;
         return true;
     }
@@ -359,8 +358,7 @@ static inline __aicore__ bool scheduler_cluster_mix_try_arm(
         return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
     uint64_t tail = 0;
     if (local->admission != nullptr) {
-        // commit_tail is a bypass-published signal, matching ordinary entry;
-        // atomic-only words, unlike this signal, require RMW confirmation.
+        // commit_tail is a bypass-published signal, matching ordinary entry.
         tail = scheduler_gm_query(
             scheduler_state_at<SchedulerAdmissionControl>(base, local->admission->control_offset)->commit_tail
         );
@@ -423,7 +421,7 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_cluster_mix_pr
     const uint32_t previous_fanin = pending.next_fanin;
     bool ready = false;
     if (!scheduler_observe_fanin_prefix(
-            graph, base, local, run, pending.task_ref, pending.fanin, pending.next_fanin, &ready
+            graph, base, local, run, pending.task_ref, pending.fanin, pending.next_fanin, &ready, &pending.wait
         ))
         return false;
     *progress = pending.next_fanin != previous_fanin;

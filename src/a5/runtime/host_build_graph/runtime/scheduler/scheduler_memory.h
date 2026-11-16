@@ -98,8 +98,8 @@ static inline __aicore__ void scheduler_observe_data_cache(__gm__ void *address)
 #endif
 }
 
-// A5 ld_dev bypasses the scalar DCache. Terminal completion and bypass-published
-// signals use this read directly; other protocol hints retain atomic confirmation.
+// A5 ld_dev bypasses the scalar DCache. A reliable snapshot grants no
+// exclusive ownership; mutations use the atomic wrappers below.
 // Ownership changes use the CAS/exchange/fetch wrappers below.
 // Publication-protected metadata is invalidated separately before consumption.
 // The memory order every wrapper below takes is honored by the host and sim
@@ -167,21 +167,27 @@ static inline __aicore__ void scheduler_ddr_barrier() {
     });
 }
 
-// Each word has one active writer. Publication completes before ownership
-// handoff. While workers run, its whole cache line excludes AICore RMW,
-// cached stores and dirty writeback. Payload ordering belongs to the caller.
+// Only single-writer notifications with no RMW or atomic-state requirement
+// may use this path. Their region excludes cached stores and dirty writeback.
+// This store has no implicit DSB: the caller orders dependent operations.
 template <typename Word>
-static inline __aicore__ void scheduler_publish_signal(__gm__ volatile Word &value, Word desired) {
+static inline __aicore__ void scheduler_store_signal(__gm__ volatile Word &value, Word desired) {
     static_assert(std::is_same_v<Word, int64_t> || std::is_same_v<Word, uint64_t>);
 #if defined(__CCE_AICORE__)
     auto *address = reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ Word *>(&value));
     scheduler_scalar_memory_issue(SchedPhaseKind::ScalarBypassStore, 1, [address, desired]() __aicore__ {
         st_dev(static_cast<uint64_t>(desired), address, 0);
     });
-    scheduler_ddr_barrier();
 #else
     __atomic_store_n(&value, desired, __ATOMIC_RELEASE);
 #endif
+}
+
+// Existing callers require completion before subsequent publication or handoff.
+template <typename Word>
+static inline __aicore__ void scheduler_publish_signal(__gm__ volatile Word &value, Word desired) {
+    scheduler_store_signal(value, desired);
+    scheduler_ddr_barrier();
 }
 
 // Shared ownership words and atomic-published data retain atomic exchange.

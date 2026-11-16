@@ -371,7 +371,8 @@ inline __aicore__ bool scheduler_prepared_retirement_inferred(
 ) {
     const uint32_t owner = scheduler_prepared_owner(state);
     return owner < SCHEDULER_WORKER_CAPACITY &&
-           state == scheduler_prepared_state(SchedulerPreparedPhase::CLAIMED, owner) &&
+           state == (scheduler_prepared_state(SchedulerPreparedPhase::CLAIMED, owner) |
+                     (state & SCHEDULER_PREPARED_TICKET_OWNED)) &&
            index < prepared.execution_count && call.run_epoch == prepared.run_epoch && call.execution_index == index &&
            call.task_ref >= 0 && static_cast<uint64_t>(call.task_ref) < prepared.task_count &&
            plan.active_lane_count == 1 && __builtin_popcount(plan.active_mask_bits) == 1 && call.subtask_slot < 3 &&
@@ -395,8 +396,9 @@ struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerTaskControl {
     // or atomic RMW may target its line.
     alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t admission_state;
 
-    // The final valid block claimer publishes this immutable supply certificate.
+    // The final valid block claimer bypass-publishes this immutable certificate.
     // Admission claimers also certify the required member registrations.
+    // Its isolated region has no concurrent RMW or cached writeback.
     alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t claim_seal;
 };
 
@@ -724,7 +726,7 @@ static_assert(
 static_assert(
     offsetof(SchedulerTaskControl, admission_state) == 384, "admission state requires an isolated signal region"
 );
-static_assert(offsetof(SchedulerTaskControl, claim_seal) == 512, "claim seal requires an isolated atomic line");
+static_assert(offsetof(SchedulerTaskControl, claim_seal) == 512, "claim seal requires an isolated signal region");
 static_assert(sizeof(SchedulerAdmissionRecord) == 64, "admission header must occupy one cache line");
 static_assert(sizeof(SchedulerAdmissionControl) == 256, "admission control layout changed");
 static_assert(

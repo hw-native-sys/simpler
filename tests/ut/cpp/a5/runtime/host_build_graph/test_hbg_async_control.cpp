@@ -9,6 +9,17 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include "scheduler/scheduler_scalar_policy.h"
+
+namespace {
+template <>
+struct SchedulerScalarCompilation<void> {
+    static constexpr bool enabled = true;
+};
+}  // namespace
+
+#include "inner_kernel.h"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -765,17 +776,25 @@ TEST(HbgAsyncControl, InvalidDebtCarryCannotPublishAGroupOrBecomeLogicalDone) {
     EXPECT_EQ(f.storage.run_control->resolved_task_count, 0u);
 }
 
-TEST(HbgAsyncControl, StaleCreditHintCannotGrantOrRejectRegistration) {
-    for (const uint64_t hint :
-         {UINT64_C(0), UINT64_MAX, scheduler_completion_completed_state(1), scheduler_completion_initial_state(2)}) {
-        SCOPED_TRACE(hint);
+TEST(HbgAsyncControl, InvalidCreditSnapshotCannotGrantRegistration) {
+    for (const uint64_t observed : {UINT64_C(0), UINT64_MAX, scheduler_completion_completed_state(1)}) {
+        SCOPED_TRACE(observed);
         AsyncFixture f(1);
         const uint64_t initial = scheduler_completion_initial_state(1);
         ASSERT_EQ(f.task_control(0)->completion_state, initial);
-        ASSERT_TRUE(scheduler_async_register_credit_observed(f.workers[0], 0, hint));
-        EXPECT_EQ(f.task_control(0)->completion_state, initial + 1);
-        EXPECT_EQ(f.workers[0].error_code, 0);
+        EXPECT_FALSE(scheduler_async_register_credit_observed(f.workers[0], 0, observed));
+        EXPECT_EQ(f.task_control(0)->completion_state, initial);
+        EXPECT_EQ(f.workers[0].error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
     }
+}
+
+TEST(HbgAsyncControl, StaleAvailableCreditSnapshotReusesCasReturnedState) {
+    AsyncFixture f(1);
+    const uint64_t initial = scheduler_completion_initial_state(1);
+    ASSERT_EQ(f.task_control(0)->completion_state, initial);
+    ASSERT_TRUE(scheduler_async_register_credit_observed(f.workers[0], 0, scheduler_completion_initial_state(2)));
+    EXPECT_EQ(f.task_control(0)->completion_state, initial + 1);
+    EXPECT_EQ(f.workers[0].error_code, 0);
 }
 
 TEST(HbgAsyncControl, ValidCreditHintCannotOverwriteACorruptOrClosedGate) {
@@ -811,32 +830,32 @@ TEST(HbgAsyncControl, ASettledWaitStillCannotFinishBeforeZeroMembersRelease) {
     EXPECT_TRUE(f.done());
 }
 
-TEST(HbgAsyncControl, LeaseHintsCannotGrantOwnershipOrHideReleasedWork) {
+TEST(HbgAsyncControl, LeaseSnapshotsRequireCasOwnershipAndRefreshAfterRelease) {
     SchedulerAsyncLease lease;
     scheduler_async_lease_initialize(lease);
     const uint64_t first_runnable = lease.word;
-    const auto first = scheduler_async_detail::claim_observed(lease, first_runnable, false);
+    const auto first = scheduler_async_detail::claim_observed(lease, first_runnable);
     ASSERT_EQ(first.result, SchedulerAsyncLeaseResult::SUCCESS);
     EXPECT_EQ(
-        scheduler_async_detail::claim_observed(lease, first_runnable, false).result,
-        SchedulerAsyncLeaseResult::CONTENDED
+        scheduler_async_detail::claim_observed(lease, first_runnable).result, SchedulerAsyncLeaseResult::CONTENDED
     );
     EXPECT_EQ(lease.word, first.word);
     ASSERT_EQ(scheduler_async_lease_release(lease, first.word).result, SchedulerAsyncLeaseResult::SUCCESS);
     const uint64_t second_runnable = lease.word;
     EXPECT_EQ(
-        scheduler_async_detail::claim_observed(lease, first.word, false).result, SchedulerAsyncLeaseResult::NOT_RUNNABLE
+        scheduler_async_detail::claim_observed(lease, first.word).result, SchedulerAsyncLeaseResult::NOT_RUNNABLE
     );
     EXPECT_EQ(lease.word, second_runnable);
-    const auto second = scheduler_async_detail::claim_observed(lease, first.word, true);
+    const auto second = scheduler_async_detail::claim_observed(lease, scheduler_async_lease_load(lease));
     ASSERT_EQ(second.result, SchedulerAsyncLeaseResult::SUCCESS);
     EXPECT_EQ(scheduler_async_lease_generation(second.word), 2u);
     ASSERT_EQ(scheduler_async_lease_release(lease, second.word).result, SchedulerAsyncLeaseResult::SUCCESS);
-    const auto third = scheduler_async_detail::claim_observed(lease, first_runnable, false);
+    const auto third = scheduler_async_detail::claim_observed(lease, first_runnable);
     ASSERT_EQ(third.result, SchedulerAsyncLeaseResult::SUCCESS);
     EXPECT_EQ(scheduler_async_lease_generation(third.word), 3u);
     ASSERT_EQ(scheduler_async_lease_release(lease, third.word).result, SchedulerAsyncLeaseResult::SUCCESS);
-    const auto fourth = scheduler_async_detail::claim_observed(lease, 0, false);
+    EXPECT_EQ(scheduler_async_detail::claim_observed(lease, 0).result, SchedulerAsyncLeaseResult::INVALID_WORD);
+    const auto fourth = scheduler_async_detail::claim_observed(lease, scheduler_async_lease_load(lease));
     ASSERT_EQ(fourth.result, SchedulerAsyncLeaseResult::SUCCESS);
     EXPECT_EQ(scheduler_async_lease_generation(fourth.word), 4u);
 }
@@ -871,7 +890,6 @@ TEST(HbgAsyncControl, DirectoryTailWrapDoesNotStarveEarlierPendingGroups) {
     f.workers[1].check_cursor = 64;
     EXPECT_FALSE(f.check(1));
     EXPECT_EQ(f.workers[1].check_cursor, 0u);
-    EXPECT_TRUE(f.workers[1].check_strong_pass);
     EXPECT_TRUE(f.check(1));
     EXPECT_EQ(scheduler_async_lease_phase(f.group_lease(0).word), SchedulerAsyncPhase::TERMINAL);
 }
@@ -1192,6 +1210,44 @@ TEST(HbgAsyncControl, CounterAndFullWidthSdmaRecordsMustBothCompleteAndAreNeverC
     EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::TERMINAL);
     EXPECT_TRUE(f.done());
     EXPECT_EQ(completed_post, UINT64_C(0x100000003));
+}
+
+TEST(HbgAsyncControl, OrdersFinalContributionBeforeClosureSnapshots) {
+    AsyncFixture f(1);
+    f.register_counter(f.start());
+    ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
+    ASSERT_EQ(f.return_next(0, f.local(2)), SchedulerSubtaskFinishResult::TASK_LAST_DEFERRED);
+    auto buffer = std::make_unique<SchedulerActivityBuffer>();
+    auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+    SchedulerScalarTrace trace;
+    trace.buffer = buffer.get();
+    trace.records = records.get();
+    trace.window_start = scheduler_cycles();
+    {
+        SchedulerScalarBinding binding;
+        binding.attach(&trace);
+        const auto completion = scheduler_async_close_computation(&f.workers[2], 0);
+        ASSERT_EQ(completion.result, SchedulerAsyncCompletionResult::WAITING);
+    }
+    bool ordered = false;
+    bool observed = false;
+    uint32_t cursor = 0;
+    while (cursor < trace.storage_slots) {
+        SchedulerScalarRecord record{};
+        ASSERT_TRUE(scheduler_decode_scalar_storage(trace.records, trace.storage_slots, cursor, record));
+        const auto kind = static_cast<SchedPhaseKind>(record.kind & 0xffffU);
+        if (kind == SchedPhaseKind::ScalarDsbAll) ordered = true;
+        if (kind == SchedPhaseKind::ScalarBypassLoad) {
+            EXPECT_TRUE(ordered) << "Closure must order the final contribution before observing its result";
+            observed = true;
+        }
+    }
+    EXPECT_EQ(trace.dropped, 0u);
+    EXPECT_TRUE(observed);
+    EXPECT_FALSE(f.done());
+    f.signal[0] = 1;
+    EXPECT_TRUE(f.check(1));
+    EXPECT_TRUE(f.done());
 }
 
 TEST(HbgAsyncControl, JoinRmwOwnerCannotCompleteTwice) {

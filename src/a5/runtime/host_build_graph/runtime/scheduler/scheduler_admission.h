@@ -251,11 +251,9 @@ static inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission
     auto *control = scheduler_task_control_at(base, local, task);
     auto *record = scheduler_admission_record_at(base, admission, task);
     auto *shared = scheduler_state_at<SchedulerAdmissionControl>(base, admission->control_offset);
-    // A confirmed publication retires only this proposal. Adopting its
-    // obligation still requires the committed log prefix, which may lag.
-    if (scheduler_gm_query(control->admission_state) == static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED) &&
-        scheduler_gm_fetch_add(control->admission_state, UINT64_C(0)) ==
-            static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED)) {
+    // ADMITTED is final for this run. Retiring this proposal does not adopt
+    // its obligation, which still requires the committed log prefix.
+    if (scheduler_gm_query(control->admission_state) == static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED)) {
         if (!scheduler_admission_context_valid(graph, base, local, run, admission))
             return SchedulerAdmissionResult::ERROR;
         admission->pending_task_ref = SCHEDULER_TASK_REF_INVALID;
@@ -269,7 +267,7 @@ static inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission
         return SchedulerAdmissionResult::RETRY;
     }
     bool valid = scheduler_admission_context_valid(graph, base, local, run, admission);
-    const uint64_t state = scheduler_gm_fetch_add(control->admission_state, UINT64_C(0));
+    const uint64_t state = scheduler_gm_query(control->admission_state);
     if (valid && state == static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED)) {
         admission->pending_task_ref = SCHEDULER_TASK_REF_INVALID;
         scheduler_gm_store(shared->commit_lock, UINT64_C(0));
@@ -277,7 +275,7 @@ static inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission
     }
     if (valid && state != static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED))
         valid = scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
-    const uint64_t tail = valid ? scheduler_gm_fetch_add(shared->commit_tail, UINT64_C(0)) : 0;
+    const uint64_t tail = valid ? scheduler_gm_query(shared->commit_tail) : 0;
     if (valid) {
         scheduler_observe_cache_line(record);
         if (record->run_epoch != admission->epoch)
@@ -293,7 +291,7 @@ static inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission
         scheduler_publish_cache_line(record);
         auto *log = scheduler_state_at<int64_t>(base, admission->log_offset);
         scheduler_publish_signal(log[tail], task);
-        scheduler_gm_store(control->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED));
+        scheduler_store_signal(control->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED));
         scheduler_cache_barrier();
         scheduler_publish_signal(shared->commit_tail, tail + 1);
         scheduler_cache_barrier();
@@ -485,35 +483,26 @@ static inline __aicore__ bool scheduler_read_claim_cursor(
     auto *control = scheduler_task_control_at(base, local, admission->current_task_ref);
     const uint64_t count = admission->current_block_num;
     scalar_validate.close();
-    const uint64_t seal_hint = scheduler_scalar_result(local, SchedPhaseKind::ScalarClaimSealProbe, [&]() __aicore__ {
+    const uint64_t seal = scheduler_scalar_result(local, SchedPhaseKind::ScalarClaimSealProbe, [&]() __aicore__ {
         return scheduler_gm_query(control->claim_seal);
     });
-    const uint64_t seal =
-        seal_hint == 0 ? 0 : scheduler_scalar_result(local, SchedPhaseKind::ScalarClaimSealConfirm, [&]() __aicore__ {
-            return scheduler_gm_fetch_add(control->claim_seal, UINT64_C(0));
-        });
     if (seal != 0 && seal != count)
         return scheduler_admission_fail(
             graph, local, run, admission->current_task_ref, SchedulerErrorSite::BLOCK_CURSOR_INVALID
         );
-    if (seal == count && scheduler_scalar_result(local, SchedPhaseKind::ScalarNextBlockProbe, [&]() __aicore__ {
-                             return scheduler_gm_query(control->next_block);
-                         }) == count) {
-        scheduler_remember_task_proof(local, admission->current_task_ref, SchedulerTaskProof::SUPPLY_CLOSED);
-        *cursor = count;
-        if (used_seal != nullptr) *used_seal = true;
-        return true;
-    }
-    // A missing publication never stalls the original strong-read path. A weak
-    // mismatch can be a delayed atomic image, so confirm before rejecting it.
-    const uint64_t confirmed = scheduler_scalar_result(local, SchedPhaseKind::ScalarNextBlockConfirm, [&]() __aicore__ {
-        return scheduler_gm_fetch_add(control->next_block, UINT64_C(0));
+    if (seal == count) scheduler_cache_barrier();
+    const uint64_t next = scheduler_scalar_result(local, SchedPhaseKind::ScalarNextBlockProbe, [&]() __aicore__ {
+        return scheduler_gm_query(control->next_block);
     });
-    if (confirmed > count || (seal == count && confirmed != count))
+    if (next > count || (seal == count && next != count))
         return scheduler_admission_fail(
             graph, local, run, admission->current_task_ref, SchedulerErrorSite::BLOCK_CURSOR_INVALID
         );
-    *cursor = confirmed;
+    if (seal == count) {
+        scheduler_remember_task_proof(local, admission->current_task_ref, SchedulerTaskProof::SUPPLY_CLOSED);
+        if (used_seal != nullptr) *used_seal = true;
+    }
+    *cursor = next;
     return true;
 }
 
@@ -533,7 +522,7 @@ static inline __aicore__ bool scheduler_publish_claim_seal(
         );
     if constexpr (RecordProtocol) scheduler_protocol_claim_seal(base, local, block, true, admission->current_block_num);
     scheduler_cache_barrier();
-    scheduler_gm_store(control->claim_seal, static_cast<uint64_t>(admission->current_block_num));
+    scheduler_store_signal(control->claim_seal, static_cast<uint64_t>(admission->current_block_num));
     scheduler_remember_task_proof(local, admission->current_task_ref, SchedulerTaskProof::SUPPLY_CLOSED);
     if constexpr (RecordProtocol)
         scheduler_protocol_claim_seal(base, local, block, false, admission->current_block_num);
@@ -566,8 +555,7 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_curso
         const uint64_t count = admission->current_block_num;
         const uint64_t positions = admission->current_claim_positions;
         const uint64_t limit = admission->current_claim_limit;
-        if (scheduler_gm_query(control->claim_tickets) >= limit &&
-            scheduler_gm_fetch_add(control->claim_tickets, UINT64_C(0)) >= limit) {
+        if (scheduler_gm_query(control->claim_tickets) >= limit) {
             scheduler_admission_fail(
                 graph, local, run, admission->current_task_ref, SchedulerErrorSite::BLOCK_CURSOR_INVALID
             );
@@ -712,7 +700,8 @@ static inline __aicore__ bool scheduler_close_ordered_obligation(
 }
 
 static inline __aicore__ bool scheduler_ordered_restore_ordinary(
-    const SchedulerGraphAccess &graph, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    uint64_t profiling_level
 ) {
     SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarOrdinaryRestore, -1);
     auto *admission = local->admission;
@@ -721,7 +710,7 @@ static inline __aicore__ bool scheduler_ordered_restore_ordinary(
         if (slot.state != SchedulerDispatchSlotState::READY || slot.cluster_mix ||
             scheduler_slot_uses_admission(local, slot) || (local->local_ready_mask & (1U << index)) == 0)
             continue;
-        if (!slot.execution_token || !scheduler_restore_execution_token(local, index))
+        if (!slot.execution_token || !scheduler_restore_execution_token(base, local, index, profiling_level))
             return scheduler_admission_fail(
                 graph, local, run, slot.task_ref, SchedulerErrorSite::ORDERED_CANDIDATE_INVALID
             );

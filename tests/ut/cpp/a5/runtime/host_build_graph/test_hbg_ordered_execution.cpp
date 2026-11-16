@@ -354,10 +354,12 @@ TEST_P(HbgOrderedScalarDetail, FillPublishesExecutableWorkAndBalancesNestedRecor
     EXPECT_LE(candidate->end_time, discover->end_time);
     EXPECT_LE(ordered->end_time, discover->start_time);
     EXPECT_EQ(find("scalar_execution_token_refill"), nullptr);
+    // Immutable metadata can also be bound during catalog discovery.
+    ASSERT_NE(find("scalar_dispatch_metadata"), nullptr);
     for (const char *name :
          {"scalar_ordered_poll", "scalar_admission_publish", "scalar_admission_commit", "scalar_admission_refresh",
-          "scalar_ordinary_restore", "scalar_block_claim", "scalar_admission_close", "scalar_dispatch_metadata",
-          "scalar_dispatch_fill", "scalar_dispatch_publish"}) {
+          "scalar_ordinary_restore", "scalar_block_claim", "scalar_admission_close", "scalar_dispatch_fill",
+          "scalar_dispatch_publish"}) {
         const auto *child = find(name);
         ASSERT_NE(child, nullptr) << name;
         const auto parent = std::find_if(decoded.begin(), decoded.end(), [&](const auto &row) {
@@ -687,7 +689,7 @@ TEST(HbgOrderedScalarDetail, CompletionWriterReusesItsOwnDoneProofForDependencie
     }
 }
 
-TEST(HbgOrderedScalarDetail, ClaimCursorDetailPreservesSealAndFallbackPaths) {
+TEST(HbgOrderedScalarDetail, ClaimCursorDetailReadsSealAndCursorOnce) {
     for (const auto &[seal, next, valid, used_seal] :
          {std::tuple<uint64_t, uint64_t, bool, bool>{0, 1, true, false}, {2, 2, true, true}, {2, 1, false, false}}) {
         SCOPED_TRACE(seal);
@@ -729,9 +731,9 @@ TEST(HbgOrderedScalarDetail, ClaimCursorDetailPreservesSealAndFallbackPaths) {
         for (uint32_t i = 0; i < trace.committed; ++i)
             names.emplace_back(sched_phase_kind_name(static_cast<SchedPhaseKind>(decoded[i].kind & 0xffffU)));
         EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_claim_seal_probe"), 1);
-        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_claim_seal_confirm"), seal != 0 ? 1 : 0);
-        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_next_block_probe"), seal == 2 ? 1 : 0);
-        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_next_block_confirm"), used_seal ? 0 : 1);
+        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_claim_seal_confirm"), 0);
+        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_next_block_probe"), 1);
+        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_next_block_confirm"), 0);
         EXPECT_EQ(buffer->scalar_dropped, 0u);
     }
 }
@@ -747,7 +749,12 @@ TEST(HbgOrderedScalarDetail, PollDetailObservesTheAdmissionTailWithoutClaimingMe
         trace.buffer = buffer.get();
         trace.records = records.get();
         trace.window_start = scheduler_cycles();
-        EXPECT_EQ(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), fixture.locals[0]), ready);
+        EXPECT_EQ(
+            (scheduler_observe_ordered_progress(
+                 fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run()
+             ) == SchedulerOrderedPollResult::READY),
+            ready
+        );
         EXPECT_EQ(trace.depth, 0u);
         EXPECT_EQ(fixture.control(0)->next_block, 0u);
         trace.finish(scheduler_cycles());
@@ -902,7 +909,7 @@ TEST_P(HbgOrderedFirstReady, ExhaustedOrdinarySupplyStopsRetriesWithoutReplacing
                 return static_cast<SchedPhaseKind>(row.kind & 0xffffU) == SchedPhaseKind::ScalarAtomicFetchAdd;
             }
         ),
-        1
+        0
     );
     EXPECT_EQ(buffer->scalar_dropped, 0u);
     trace.buffer = nullptr;
@@ -928,7 +935,7 @@ TEST_P(HbgOrderedFirstReady, ExhaustedOrdinarySupplyStopsRetriesWithoutReplacing
     EXPECT_EQ(fixture.run()->scheduler_error, 0u);
 }
 
-TEST(HbgOrderedMix, ExhaustedSupplyIsConfirmedOnceWithoutAdvancingBeforeTheSeal) {
+TEST(HbgOrderedMix, ExhaustedSupplyIsReadWithoutAdvancingBeforeTheSeal) {
     scheduler_test::gm_mix::GmMixFixture fixture({{2, LaneMask::all()}, {2, LaneMask::all()}});
     ASSERT_TRUE(fixture.prepare_calls());
     auto *local = fixture.locals[0];
@@ -960,7 +967,7 @@ TEST(HbgOrderedMix, ExhaustedSupplyIsConfirmedOnceWithoutAdvancingBeforeTheSeal)
                 return static_cast<SchedPhaseKind>(row.kind & 0xffffU) == SchedPhaseKind::ScalarAtomicFetchAdd;
             }
         ),
-        1
+        0
     );
     EXPECT_EQ(buffer->scalar_dropped, 0u);
     trace.buffer = nullptr;
@@ -1616,15 +1623,24 @@ TEST(HbgOrderedExecution, IdlePollIsOnlyAHintAndDoesNotConsumeNewWorkOrEntryPerm
     OrderedFixture fixture({{2, LaneMask::aic()}, {1, LaneMask::aic()}});
     for (uint32_t worker = 0; worker < 6; ++worker)
         EXPECT_EQ(
-            scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), fixture.locals[worker]), false
+            (scheduler_observe_ordered_progress(
+                 fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run()
+             ) == SchedulerOrderedPollResult::READY),
+            false
         );
     ASSERT_TRUE(fixture.prepare());
     ASSERT_TRUE(fixture.admit(0, 3));
-    EXPECT_TRUE(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), fixture.locals[0]));
+    EXPECT_TRUE(
+        (scheduler_observe_ordered_progress(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run()) ==
+         SchedulerOrderedPollResult::READY)
+    );
     EXPECT_EQ(fixture.admissions[0].current_task_ref, SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(fixture.control(0)->next_block, 0u);
     ASSERT_TRUE(fixture.fill(0));
-    EXPECT_TRUE(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), fixture.locals[0]));
+    EXPECT_TRUE(
+        (scheduler_observe_ordered_progress(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run()) ==
+         SchedulerOrderedPollResult::READY)
+    );
     scheduler_record_error(
         fixture.run(), 0, SchedulerGraphResult::TIMEOUT, nullptr, fixture.locals[3],
         SchedulerErrorSite::ORDERED_EXIT_TIMEOUT
@@ -1670,7 +1686,10 @@ TEST(HbgOrderedExecution, IdlePollFindsAdmissionCommittedByAnotherWorker) {
         auto *local = fixture.locals[worker];
         ASSERT_TRUE(fixture.prepare());
         ASSERT_TRUE(fixture.admit(0, worker + 3));
-        EXPECT_TRUE(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), local));
+        EXPECT_TRUE(
+            (scheduler_observe_ordered_progress(fixture.graph.graph(), fixture.base(), local, fixture.run()) ==
+             SchedulerOrderedPollResult::READY)
+        );
         ASSERT_TRUE(fixture.fill(worker));
         OrderedExecution execution{};
         ASSERT_TRUE(fixture.begin(worker, &execution));

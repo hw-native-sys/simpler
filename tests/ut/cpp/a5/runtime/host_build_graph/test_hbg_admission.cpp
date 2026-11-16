@@ -2133,7 +2133,7 @@ TEST_P(HbgClaimSeal, OnlyFinalValidClaimPublishesAndDoesNotCompleteTheTask) {
     EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
 }
 
-TEST_P(HbgClaimSeal, MissingSignalUsesStrongCursorAndEarlyOrMalformedSignalIsRejected) {
+TEST_P(HbgClaimSeal, MissingSignalReadsCursorAndEarlyOrMalformedSignalIsRejected) {
     const auto shape = GetParam();
     for (uint32_t scenario = 0; scenario < 9; ++scenario) {
         SCOPED_TRACE(scenario);

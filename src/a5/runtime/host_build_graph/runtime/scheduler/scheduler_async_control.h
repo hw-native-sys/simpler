@@ -28,7 +28,6 @@ struct SchedulerAsyncLocalState {
     uint8_t check_service_countdown{0};
     bool work_activated{false};
     uint8_t idle_probe_countdown{0};
-    bool check_strong_pass{false};
 };
 
 static_assert(sizeof(SchedulerAsyncLocalState) == 64);
@@ -158,13 +157,10 @@ static inline __aicore__ SchedulerAsyncCompletion settle_group(SchedulerAsyncLoc
     return completion_error(local, task_ref);
 }
 
-// A weak hint grants no responsibility. The returned CAS is the acquisition
+// A snapshot grants no responsibility. The returned CAS is the acquisition
 // proof; an old runnable generation can reuse its returned current state.
 static inline __aicore__ SchedulerAsyncLeaseOutcome
-claim_observed(__gm__ SchedulerAsyncLease &lease, uint64_t observed, bool strong_pass) {
-    if (!scheduler_async_lease_word_valid(observed) ||
-        (strong_pass && scheduler_async_lease_phase(observed) != SchedulerAsyncPhase::RUNNABLE))
-        observed = scheduler_async_lease_load(lease);
+claim_observed(__gm__ SchedulerAsyncLease &lease, uint64_t observed) {
     auto result = scheduler_async_lease_try_claim(lease, observed);
     if (result.result == SchedulerAsyncLeaseResult::CONTENDED &&
         scheduler_async_lease_phase(result.word) == SchedulerAsyncPhase::RUNNABLE)
@@ -173,11 +169,10 @@ claim_observed(__gm__ SchedulerAsyncLease &lease, uint64_t observed, bool strong
 }
 
 // A directory scan visits one word. Cursors advance past a claimed record so
-// a low pending bit cannot starve a later condition in the same word. Every
-// other complete pass confirms non-runnable hints, bounding stale-hint delay.
+// a low pending bit cannot starve a later condition in the same word.
 static inline __aicore__ bool claim(
     SchedulerAsyncLocalState &local, uint64_t directory_offset, uint64_t lease_offset, uint32_t count, uint32_t &cursor,
-    bool &strong_pass, uint32_t &index, uint64_t &owned
+    uint32_t &index, uint64_t &owned
 ) {
     index = ASYNC_INVALID_INDEX;
     owned = 0;
@@ -188,17 +183,12 @@ static inline __aicore__ bool claim(
     const uint64_t mask = scheduler_gm_query(words[word].bits) & (UINT64_MAX << bit);
     const uint64_t next_word = static_cast<uint64_t>(word + 1) * 64;
     cursor = next_word < count ? static_cast<uint32_t>(next_word) : 0;
-    const bool confirm_pending = strong_pass;
-    if (mask == 0) {
-        if (cursor == 0) strong_pass = !strong_pass;
-        return true;
-    }
+    if (mask == 0) return true;
     const uint32_t found = word * 64 + static_cast<uint32_t>(__builtin_ctzll(mask));
     if (found >= count) return fail(local, -1);
     cursor = found + 1 == count ? 0 : found + 1;
-    if (cursor == 0) strong_pass = !strong_pass;
     auto *leases = scheduler_state_at<SchedulerAsyncLease>(local.base, lease_offset);
-    const auto result = claim_observed(leases[found], scheduler_gm_query(leases[found].word), confirm_pending);
+    const auto result = claim_observed(leases[found], scheduler_async_lease_load(leases[found]));
     if (result.result == SchedulerAsyncLeaseResult::NOT_RUNNABLE ||
         result.result == SchedulerAsyncLeaseResult::CONTENDED)
         return true;
@@ -316,12 +306,11 @@ inline __aicore__ bool scheduler_async_credit_available(uint64_t observed) {
                scheduler_completion_remaining(observed) + scheduler_completion_total(observed);
 }
 
-// The caller validates the task identity. A weak seed cannot grant a credit or
-// diagnose a bad gate; CAS results and the exceptional strong read are authoritative.
+// The caller validates the task identity and supplies a reliable gate snapshot.
+// Only the successful CAS grants a credit.
 static inline __aicore__ bool
 scheduler_async_register_credit_observed(SchedulerAsyncLocalState &local, int64_t task_ref, uint64_t observed) {
     auto &gate = local.controls[task_ref].completion_state;
-    if (!scheduler_async_credit_available(observed)) observed = scheduler_gm_fetch_add(gate, UINT64_C(0));
     for (;;) {
         if (!scheduler_async_credit_available(observed)) return scheduler_async_detail::fail(local, task_ref);
         const uint64_t previous = scheduler_gm_compare_exchange(gate, observed, observed + 1);
@@ -421,8 +410,11 @@ scheduler_async_close_computation(SchedulerAsyncLocalState *local, int64_t task_
     if (!task_index(*local, task_ref, index)) return completion_error(*local, task_ref);
     if (index == ASYNC_INVALID_INDEX) return {};
     auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(local->base, local->layout->joins_offset);
-    const uint64_t gate = scheduler_gm_fetch_add(local->controls[task_ref].completion_state, UINT64_C(0));
-    const uint64_t joined = scheduler_gm_fetch_add(joins[index].word, UINT64_C(0));
+    // The final contribution precedes these dependent bypass observations.
+    // Its pre-RMW fence cannot order the RMW against the following loads.
+    scheduler_cache_barrier();
+    const uint64_t gate = scheduler_gm_query(local->controls[task_ref].completion_state);
+    const uint64_t joined = scheduler_gm_query(joins[index].word);
     if (!scheduler_completion_valid(gate) || scheduler_completion_remaining(gate) != 0 ||
         !scheduler_async_pending::valid(joined) || scheduler_async_pending::closed(joined) ||
         scheduler_completion_debt(gate) != scheduler_async_pending::registered(joined))
@@ -515,7 +507,7 @@ static inline __aicore__ bool scheduler_async_check_step(
     uint64_t owned = 0;
     if (!claim(
             local, local.layout->check_directory_offset, local.layout->group_leases_offset, local.layout->group_count,
-            local.check_cursor, local.check_strong_pass, index, owned
+            local.check_cursor, index, owned
         ))
         return false;
     if (index == ASYNC_INVALID_INDEX) return true;

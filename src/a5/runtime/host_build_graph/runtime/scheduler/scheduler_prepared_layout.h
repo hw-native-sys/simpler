@@ -21,6 +21,8 @@ inline constexpr uint64_t SCHEDULER_PREPARED_ALIGNMENT = 128;
 
 enum class SchedulerPreparedPhase : uint8_t { INVALID, BUILT, CLAIMED, RETURNED, FAILED, GROUP_RESERVED, GROUP_ARMED };
 
+inline constexpr uint64_t SCHEDULER_PREPARED_TICKET_OWNED = UINT64_C(1) << 25;
+
 inline __aicore__ constexpr uint64_t
 scheduler_prepared_state(SchedulerPreparedPhase phase, uint32_t executor = UINT32_MAX) {
     return static_cast<uint64_t>(phase) | (executor == UINT32_MAX ? 0 : ((static_cast<uint64_t>(executor) + 1) << 8));
@@ -50,8 +52,10 @@ struct SchedulerExecutionPlan {
     uint8_t active_lane_count;
 };
 
-// Phase and fixed owner share one atomic word.
-// Cached stores never touch this line during a run.
+// Cooperative records use atomic ownership transitions. An irrevocable ordinary
+// ticket instead makes this whole region an owner-written diagnostic: no peer
+// reads it for entry or updates it, and Host observes it after run retirement.
+// The two access contracts never share an execution record within a run.
 struct alignas(128) SchedulerPreparedControl {
     volatile uint64_t state;
 };

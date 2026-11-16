@@ -20,6 +20,39 @@
 
 namespace {
 thread_local std::function<void(void *)> receive_observer;
+thread_local std::function<void(void *)> writeback_observer;
+thread_local std::function<void(volatile uint64_t *)> prepared_cas_observer;
+
+uint64_t observe_prepared_cas(
+    volatile uint64_t &word, uint64_t expected, uint64_t desired, int success = __ATOMIC_ACQ_REL,
+    int failure = __ATOMIC_ACQUIRE
+) {
+    if (prepared_cas_observer) prepared_cas_observer(&word);
+    return scheduler_gm_compare_exchange(word, expected, desired, success, failure);
+}
+
+class ScopedPreparedCasObserver {
+public:
+    explicit ScopedPreparedCasObserver(std::function<void(volatile uint64_t *)> observer) {
+        prepared_cas_observer = std::move(observer);
+    }
+    ~ScopedPreparedCasObserver() { prepared_cas_observer = {}; }
+};
+
+void observe_binding_writeback(void *address) {
+    if (writeback_observer) writeback_observer(address);
+    scheduler_writeback_cache_line(address);
+}
+
+void observe_binding_writeback(volatile void *address) { observe_binding_writeback(const_cast<void *>(address)); }
+
+class ScopedBindingWritebackObserver {
+public:
+    explicit ScopedBindingWritebackObserver(std::function<void(void *)> observer) {
+        writeback_observer = std::move(observer);
+    }
+    ~ScopedBindingWritebackObserver() { writeback_observer = {}; }
+};
 
 void observe_receive_cache_line(void *address) {
     if (receive_observer) {
@@ -40,15 +73,19 @@ public:
 }  // namespace
 
 #define scheduler_invalidate_cache_line observe_receive_cache_line
+#define scheduler_gm_compare_exchange observe_prepared_cas
 #include "scheduler/scheduler_prepared_execution.h"
+#undef scheduler_gm_compare_exchange
 #undef scheduler_invalidate_cache_line
 
+#define scheduler_writeback_cache_line observe_binding_writeback
 #include "hbg_scheduler_test_support.h"
 #include "prepared_execution_plan.h"
 #include "scheduler/scheduler_completion.h"
 #include "scheduler/scheduler_dispatch.h"
 #include "scheduler/scheduler_execution_tokens.h"
 #include "scheduler/scheduler_prepared_execution.h"
+#undef scheduler_writeback_cache_line
 
 namespace {
 
@@ -82,7 +119,15 @@ struct OwnershipFixture {
 TEST(HbgExecutionOwnership, FreshTicketCannotBeConsumedTwiceAndBindingIsReceived) {
     OwnershipFixture fixture;
     SchedulerPreparedHandle first{}, duplicate{};
+    std::vector<void *> received;
+    ScopedReceiveObserver observer([&](void *address) {
+        received.push_back(address);
+    });
     ASSERT_TRUE(fixture.claim(0, &first));
+    auto *binding = scheduler_execution_binding_at(fixture.base(), fixture.prepared, 0);
+    EXPECT_EQ(received, (std::vector<void *>{&binding->local_context, &binding->global_context}));
+    ASSERT_TRUE(fixture.claim(0, &first));
+    EXPECT_EQ(received.size(), 2u);
     EXPECT_EQ(first.claimed_state, scheduler_prepared_state(SchedulerPreparedPhase::CLAIMED, 0));
     EXPECT_FALSE(fixture.claim(1, &duplicate));
     EXPECT_EQ(duplicate.claimed_state, 0u);
@@ -113,6 +158,23 @@ TEST(HbgExecutionOwnership, InvalidCallFailsClosedAfterClaim) {
     EXPECT_FALSE(fixture.claim(0, &owner));
     EXPECT_EQ(scheduler_prepared_phase(fixture.control()->state), SchedulerPreparedPhase::FAILED);
     EXPECT_FALSE(scheduler_return_prepared_execution(fixture.base(), fixture.prepared, &owner));
+}
+
+TEST(HbgExecutionOwnership, TicketOwnedRetirementKeepsExactStateValidation) {
+    OwnershipFixture fixture;
+    SchedulerPreparedHandle owner{};
+    ASSERT_TRUE(scheduler_claim_execution_token<true>(fixture.base(), fixture.prepared, 0, 0, 0, 0, &owner));
+    const auto &call = *scheduler_prepared_call_at(fixture.base(), fixture.prepared, 0);
+    const auto &plan = *scheduler_state_at<SchedulerExecutionPlan>(fixture.base(), fixture.prepared->plans_offset);
+    const uint64_t completed = scheduler_completion_completed_state(1);
+    EXPECT_TRUE(
+        scheduler_prepared_retirement_inferred(owner.claimed_state, *fixture.prepared, 0, call, plan, completed)
+    );
+    for (uint32_t bit : {24u, 26u, 32u, 63u}) {
+        EXPECT_FALSE(scheduler_prepared_retirement_inferred(
+            owner.claimed_state | (UINT64_C(1) << bit), *fixture.prepared, 0, call, plan, completed
+        ));
+    }
 }
 
 TEST(HbgExecutionOwnership, OnlyTheFixedOwnerCanCancelAnUnstartedExecution) {
@@ -176,6 +238,7 @@ struct RefillFixture {
         entry->task_ref = task;
         entry->block_idx = static_cast<uint32_t>(control(task)->next_block - 1);
         entry->subtask_slot = 0;
+        ASSERT_TRUE(scheduler_prepare_token_binding(base(), local, *entry, 0));
         entry->phase = SchedulerExecutionTokenPhase::WAIT_FANIN;
         ASSERT_EQ(scheduler_node_fanin_view(graph.graph(), task, &entry->fanin), SchedulerGraphResult::OK);
     }
@@ -226,6 +289,41 @@ struct RefillFixture {
     }
 };
 
+TEST(HbgExecutionRefill, TicketOwnerKeepsLifecycleWithoutASecondOwnershipAtomic) {
+    for (bool cancel : {false, true}) {
+        RefillFixture fixture(1);
+        fixture.storage.metadata[0].logical_block_num = 2;
+        fixture.storage.metadata[0].flags |= SCHEDULER_TASK_SPMD;
+        ASSERT_NO_FATAL_FAILURE(fixture.initialize());
+        auto *record = scheduler_prepared_control_at(fixture.base(), fixture.local->config.prepared, 0);
+        uint32_t exchanges = 0;
+        ScopedPreparedCasObserver observer([&](volatile uint64_t *address) {
+            if (address == &record->state) ++exchanges;
+        });
+        bool advanced = false;
+        ASSERT_TRUE(fixture.refill(&advanced));
+        ASSERT_TRUE(advanced);
+        EXPECT_EQ(fixture.control(0)->next_block, 1u);
+        EXPECT_EQ(scheduler_prepared_owner(record->state), 0u);
+        EXPECT_EQ(scheduler_prepared_phase(record->state), SchedulerPreparedPhase::CLAIMED);
+        EXPECT_EQ(exchanges, 0u);
+        if (cancel) {
+            auto stale = fixture.local->execution_tokens[0].prepared;
+            ASSERT_TRUE(scheduler_cancel_unstarted_work(fixture.base(), fixture.local));
+            EXPECT_EQ(scheduler_prepared_phase(record->state), SchedulerPreparedPhase::FAILED);
+            EXPECT_FALSE(scheduler_fail_prepared_execution(fixture.base(), fixture.local->config.prepared, 0, &stale));
+        } else {
+            uint32_t slot = UINT32_MAX;
+            ASSERT_TRUE(fixture.progress(&slot));
+            ASSERT_LT(slot, SCHEDULER_PENDING_SLOT_COUNT);
+            ASSERT_NO_FATAL_FAILURE(fixture.execute(slot));
+            EXPECT_EQ(scheduler_prepared_phase(record->state), SchedulerPreparedPhase::RETURNED);
+        }
+        EXPECT_EQ(exchanges, 0u);
+        EXPECT_FALSE(scheduler_completion_done(fixture.control(0)->completion_state));
+    }
+}
+
 TEST(HbgExecutionRefill, LastClaimOpensSuccessorPreparationBeforeReceivingItsPayload) {
     for (bool invalid_call : {false, true}) {
         SCOPED_TRACE(invalid_call);
@@ -241,7 +339,8 @@ TEST(HbgExecutionRefill, LastClaimOpensSuccessorPreparationBeforeReceivingItsPay
         if (invalid_call) call->function_bin_addr = 0;
         uint32_t observations = 0;
         ScopedReceiveObserver observer([&](void *address) {
-            if (address != call || observations != 0) return;
+            const auto *binding = scheduler_execution_binding_at(fixture.base(), fixture.local->config.prepared, index);
+            if (address != &binding->local_context || observations != 0) return;
             ++observations;
             EXPECT_EQ(fixture.control(0)->claim_seal, 1u);
             EXPECT_EQ(fixture.local->execution_tokens[0].phase, SchedulerExecutionTokenPhase::TICKETED);
@@ -285,6 +384,44 @@ TEST(HbgExecutionRefill, LastClaimOpensSuccessorPreparationBeforeReceivingItsPay
             EXPECT_EQ(fixture.storage.run_control->scheduler_error, 0u);
         }
     }
+}
+
+TEST(HbgExecutionRefill, WaitingTokenRebindsAfterEachPredecessorCompletes) {
+    RefillFixture fixture(3);
+    fixture.graph.executable(2, 0, {0, 1});
+    ASSERT_NO_FATAL_FAILURE(fixture.initialize());
+    SchedulerPreparedHandle producers[2]{};
+    for (uint32_t task = 0; task < 2; ++task)
+        ASSERT_NO_FATAL_FAILURE(fixture.reserve(task, 3, &producers[task]));
+    uint64_t index = UINT64_MAX;
+    ASSERT_TRUE(scheduler_prepared_execution_index(fixture.base(), fixture.local->config.prepared, 2, 0, 0, &index));
+    auto *binding = scheduler_execution_binding_at(fixture.base(), fixture.local->config.prepared, index);
+    uint32_t writebacks = 0;
+    ScopedBindingWritebackObserver observer([&](void *address) {
+        if (address == &binding->local_context || address == &binding->global_context) ++writebacks;
+    });
+    ASSERT_NO_FATAL_FAILURE(fixture.own(2));
+    EXPECT_EQ(writebacks, 2u);
+    for (uint32_t predecessor = 0; predecessor < 2; ++predecessor) {
+        for (uint32_t attempt = 0; attempt < 2; ++attempt) {
+            uint32_t slot = UINT32_MAX;
+            ASSERT_TRUE(fixture.progress(&slot));
+            EXPECT_EQ(slot, UINT32_MAX);
+            EXPECT_EQ(fixture.pending_tasks(), (std::set<int64_t>{2}));
+        }
+        uint64_t previous = 0;
+        ASSERT_EQ(
+            scheduler_contribute_returns(fixture.control(predecessor), 1, &previous),
+            SchedulerSubtaskFinishResult::TASK_LAST
+        );
+    }
+    uint32_t slot = UINT32_MAX;
+    ASSERT_TRUE(fixture.progress(&slot));
+    ASSERT_LT(slot, SCHEDULER_PENDING_SLOT_COUNT);
+    EXPECT_EQ(fixture.local->slots[slot].task_ref, 2);
+    EXPECT_EQ(writebacks, 2u);
+    ASSERT_NO_FATAL_FAILURE(fixture.execute(slot));
+    EXPECT_EQ(scheduler_execution_token_count(fixture.local), 0u);
 }
 
 TEST(HbgExecutionRefill, AWorkerCannotSkipTheUnissuedRemainderOfItsCurrentTask) {

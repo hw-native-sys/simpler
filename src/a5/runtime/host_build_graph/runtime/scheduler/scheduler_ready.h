@@ -23,6 +23,14 @@
 
 enum class SchedulerCompletionObservation : uint8_t { PENDING, DONE, INVALID };
 
+// Static edge identity survives repeated polls; completion never does.
+struct SchedulerFaninWait {
+    __gm__ SchedulerTaskControl *control{nullptr};
+    int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
+    int64_t predecessor{SCHEDULER_TASK_REF_INVALID};
+    uint32_t index{0};
+};
+
 // The completion word has one task identity per run, and DONE is terminal.
 // A reliable bypass snapshot establishes completion without changing ownership.
 static inline __aicore__ SchedulerCompletionObservation
@@ -87,6 +95,7 @@ static_assert(sizeof(SchedulerClusterMixLocalState) == 48 && alignof(SchedulerCl
 struct SchedulerClusterMixPending {
     SchedulerPreparedHandle anchor{};
     SchedulerFaninView fanin{};
+    SchedulerFaninWait wait{};
     int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
     uint32_t block_idx{0};
     uint32_t next_fanin{0};
@@ -189,6 +198,8 @@ enum class SchedulerExecutionTokenPhase : uint8_t { EMPTY, TICKETED, WAIT_FANIN 
 struct SchedulerExecutionToken {
     SchedulerPreparedHandle prepared{};
     SchedulerFaninView fanin{};
+    SchedulerFaninWait wait{};
+    SchedulerTaskMetadata metadata{};
     int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
     uint64_t discovery_cycles{0};
     uint64_t acquired_cycles{0};
@@ -199,6 +210,14 @@ struct SchedulerExecutionToken {
     SchedulerPredicateState predicate{SchedulerPredicateState::UNEVALUATED};
 };
 static_assert(alignof(SchedulerExecutionToken) <= 8);
+
+struct SchedulerIssueBinding {
+    SchedulerFaninView fanin{};
+    SchedulerTaskMetadata metadata{};
+    __gm__ SchedulerTaskControl *control{nullptr};
+    int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
+    bool fanin_bound{false};
+};
 
 inline __aicore__ bool scheduler_task_uses_execution_tokens(uint8_t flags) {
     return scheduler_task_is_executable(flags) && !scheduler_task_is_inline(flags) && !scheduler_task_is_mix(flags) &&
@@ -228,6 +247,7 @@ struct SchedulerLocalState {
     SchedulerClusterMixPending cluster_pending{};
     SchedulerExecutionToken execution_tokens[SCHEDULER_EXECUTION_TOKEN_COUNT]{};
     uint64_t issue_cursor{0};
+    SchedulerIssueBinding issue_binding{};
     int64_t issue_task_ref{SCHEDULER_TASK_REF_INVALID};
     uint32_t issue_next_fanin{0};
     bool issue_fanin_confirmed{false};
@@ -238,6 +258,7 @@ struct SchedulerLocalState {
     int64_t continuation_task_ref{SCHEDULER_TASK_REF_INVALID};
     int64_t cooperative_fanin_task_ref{SCHEDULER_TASK_REF_INVALID};
     uint32_t cooperative_next_fanin{0};
+    SchedulerFaninWait cooperative_wait{};
     // Private, run-local task identity and monotone proof; zero is an empty tag.
     uint64_t task_proof_tags[SCHEDULER_TASK_PROOF_CACHE_COUNT]{};
     // High 32 bits hold ref + 1; low 32 bits hold its confirmed fanin prefix.
@@ -526,11 +547,14 @@ scheduler_remember_task_proof(SchedulerLocalState *local, int64_t task_ref, Sche
     if (entry >> 2 != tag || (entry & UINT64_C(3)) < level) entry = (tag << 2) | level;
 }
 
-static inline __aicore__ SchedulerCompletionObservation
-scheduler_observe_cached_completion(__gm__ void *base, SchedulerLocalState *local, int64_t task_ref) {
+static inline __aicore__ SchedulerCompletionObservation scheduler_observe_cached_completion(
+    __gm__ void *base, SchedulerLocalState *local, int64_t task_ref, __gm__ SchedulerTaskControl *control = nullptr
+) {
     if (scheduler_cached_task_proof(local, task_ref) == SchedulerTaskProof::DONE)
         return SchedulerCompletionObservation::DONE;
-    const auto observed = scheduler_observe_task_completion(scheduler_task_control_at(base, local, task_ref));
+    const auto observed = scheduler_observe_task_completion(
+        control != nullptr ? control : scheduler_task_control_at(base, local, task_ref)
+    );
     // DONE is irreversible within this immutable run image, including async debt.
     // Supply closure never grants DONE. Collisions forget proofs; errors grant none.
     if (observed == SchedulerCompletionObservation::DONE)
@@ -726,7 +750,6 @@ static inline __aicore__ bool scheduler_prepare_cluster_lane(__gm__ void *base, 
         uint64_t index = UINT64_MAX;
         if (!scheduler_prepared_execution_index(base, prepared, task_ref, block, static_cast<uint8_t>(lane), &index))
             return false;
-        scheduler_observe_prepared_call(scheduler_prepared_call_at(base, prepared, index));
         if (!scheduler_prepared_call_valid(base, prepared, index, task_ref, block, static_cast<uint8_t>(lane)))
             return false;
         if (scheduler_cluster_load_acquire(&signal->prepare_generation) != generation) return true;
@@ -752,7 +775,8 @@ static inline __aicore__ bool scheduler_predecessor_is_host_done(
 
 static inline __aicore__ bool scheduler_observe_fanin_prefix(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    int64_t task_ref, const SchedulerFaninView &fanin, uint32_t &next_fanin, bool *ready
+    int64_t task_ref, const SchedulerFaninView &fanin, uint32_t &next_fanin, bool *ready,
+    SchedulerFaninWait *wait = nullptr
 ) {
     SchedulerScalarScope scope(local, SchedPhaseKind::ScalarFaninObserve, task_ref);
     if (ready == nullptr || next_fanin > fanin.count) {
@@ -765,14 +789,22 @@ static inline __aicore__ bool scheduler_observe_fanin_prefix(
     *ready = false;
     while (next_fanin < fanin.count) {
         int64_t predecessor = SCHEDULER_TASK_REF_INVALID;
-        const auto status = scheduler_fanin_ref(fanin, task_ref, next_fanin, &predecessor);
-        if (status != SchedulerGraphResult::OK) {
-            scheduler_record_error(run, task_ref, status, &graph, local, SchedulerErrorSite::ROUTE_INVALID_STATE);
-            return false;
+        __gm__ SchedulerTaskControl *control = nullptr;
+        if (wait != nullptr && wait->task_ref == task_ref && wait->index == next_fanin) {
+            predecessor = wait->predecessor;
+            control = wait->control;
+        } else {
+            const auto status = scheduler_fanin_ref(fanin, task_ref, next_fanin, &predecessor);
+            if (status != SchedulerGraphResult::OK) {
+                scheduler_record_error(run, task_ref, status, &graph, local, SchedulerErrorSite::ROUTE_INVALID_STATE);
+                return false;
+            }
+            const auto &metadata = *scheduler_task_metadata_at(base, local, predecessor);
+            if (!scheduler_predecessor_is_host_done(graph, predecessor, metadata))
+                control = scheduler_task_control_at(base, local, predecessor);
         }
-        const auto &metadata = *scheduler_task_metadata_at(base, local, predecessor);
-        if (!scheduler_predecessor_is_host_done(graph, predecessor, metadata)) {
-            const auto observed = scheduler_observe_cached_completion(base, local, predecessor);
+        if (control != nullptr) {
+            const auto observed = scheduler_observe_cached_completion(base, local, predecessor, control);
             if (observed == SchedulerCompletionObservation::INVALID) {
                 scheduler_record_error(
                     run, predecessor, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local,
@@ -780,8 +812,13 @@ static inline __aicore__ bool scheduler_observe_fanin_prefix(
                 );
                 return false;
             }
-            if (observed != SchedulerCompletionObservation::DONE) return true;
+            if (observed != SchedulerCompletionObservation::DONE) {
+                if (wait != nullptr && (wait->task_ref != task_ref || wait->index != next_fanin))
+                    *wait = {control, task_ref, predecessor, next_fanin};
+                return true;
+            }
         }
+        if (wait != nullptr) wait->task_ref = SCHEDULER_TASK_REF_INVALID;
         ++next_fanin;
         if (next_fanin % 32 == 0 && scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
     }
@@ -823,8 +860,14 @@ inline __aicore__ bool scheduler_execution_token_has_task(const SchedulerLocalSt
     return false;
 }
 
+static inline __aicore__ SchedulerTaskMetadata scheduler_load_dispatch_metadata(
+    __gm__ void *base, SchedulerLocalState *scheduler, int64_t task_ref, uint64_t profiling_level
+);
+
 // The physical slot gives its sole execution handle back to its owner's window.
-inline __aicore__ bool scheduler_restore_execution_token(SchedulerLocalState *local, uint32_t index) {
+inline __aicore__ bool scheduler_restore_execution_token(
+    __gm__ void *base, SchedulerLocalState *local, uint32_t index, uint64_t profiling_level
+) {
     if (local == nullptr || local->config.graph == nullptr || index >= SCHEDULER_PENDING_SLOT_COUNT) return false;
     auto &slot = local->slots[index];
     if (!slot.execution_token || slot.state != SchedulerDispatchSlotState::READY || slot.prepared.claimed_state == 0)
@@ -840,6 +883,7 @@ inline __aicore__ bool scheduler_restore_execution_token(SchedulerLocalState *lo
         token.block_idx = slot.block_idx;
         token.subtask_slot = slot.subtask_slot;
         token.prepared = slot.prepared;
+        token.metadata = scheduler_load_dispatch_metadata(base, local, slot.task_ref, profiling_level);
         token.phase = SchedulerExecutionTokenPhase::WAIT_FANIN;
         token.next_fanin = fanin.count;
         token.predicate = slot.predicate;
@@ -917,21 +961,24 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_prepare_dispat
     return true;
 }
 
+template <bool PublishBinding = true>
 static inline __aicore__ void scheduler_stage_dispatch_slot(
     __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler, uint32_t slot_index,
     const SchedulerReadyClaim &ready_claim, const SchedulerTaskMetadata &metadata, uint8_t subtask_slot
 ) {
     SchedulerLocalSlotState *local_slot = &scheduler->slots[slot_index];
-    auto *binding = scheduler_execution_binding_at(
-        scheduler_state_base, scheduler->config.prepared, local_slot->prepared.execution_index
-    );
     local_slot->task_ref = ready_claim.task_ref;
     scheduler->set_timing_slot(slot_index, metadata.timing_slot);
     local_slot->state = SchedulerDispatchSlotState::READY;
     local_slot->subtask_slot = subtask_slot;
-    SchedulerScalarScope scalar_cache(scheduler, SchedPhaseKind::ScalarCachePublish, ready_claim.task_ref);
-    scheduler_writeback_cache_line(&binding->local_context);
-    scheduler_writeback_cache_line(&binding->global_context);
+    if constexpr (PublishBinding) {
+        auto *binding = scheduler_execution_binding_at(
+            scheduler_state_base, scheduler->config.prepared, local_slot->prepared.execution_index
+        );
+        SchedulerScalarScope scalar_cache(scheduler, SchedPhaseKind::ScalarCachePublish, ready_claim.task_ref);
+        scheduler_writeback_cache_line(&binding->local_context);
+        scheduler_writeback_cache_line(&binding->global_context);
+    }
 }
 
 static inline __aicore__ void scheduler_commit_dispatch_slot(

@@ -1,5 +1,7 @@
 # Prepared capture resources and lifetime
 
+For A5 Scalar scheduling, apply the [shared hardware and scheduling premises](../zh-cn/design/a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles). A future STARS event must retain its actual resource through all notification and observation uses; it cannot be reset or released merely because a task returned. Mapped SPRs are not a substitute without an allocation and release protocol.
+
 [Execution and API](native-capture-common-contract.md) ·
 [HBG state restoration](native-hbg-resource-reset.md)
 

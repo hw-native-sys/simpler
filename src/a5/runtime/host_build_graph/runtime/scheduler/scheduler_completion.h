@@ -45,8 +45,7 @@ scheduler_cancel_unstarted_handle(__gm__ void *base, SchedulerLocalState *local,
         auto *control = scheduler_prepared_control_at(base, prepared, handle->execution_index);
         const uint64_t failed =
             (handle->claimed_state & ~UINT64_C(255)) | static_cast<uint64_t>(SchedulerPreparedPhase::FAILED);
-        if (scheduler_gm_compare_exchange(control->state, handle->claimed_state, failed) != handle->claimed_state)
-            return false;
+        if (!scheduler_transition_prepared_state(control, handle->claimed_state, failed)) return false;
     }
     *handle = {};
     return true;
@@ -78,14 +77,14 @@ static inline __aicore__ bool scheduler_cancel_unstarted_work(__gm__ void *base,
         if (token.phase == SchedulerExecutionTokenPhase::TICKETED && token.prepared.claimed_state == 0 &&
             local->config.prepared != nullptr &&
             token.prepared.execution_index < local->config.prepared->execution_count) {
-            // The successful FAA uniquely owns this fresh block even if fanin
-            // decoding failed before its BUILT -> CLAIMED CAS.
+            // The successful FAA owns the fresh diagnostic even before receipt.
             auto *control = scheduler_prepared_control_at(base, local->config.prepared, token.prepared.execution_index);
             const uint64_t built = scheduler_prepared_state(SchedulerPreparedPhase::BUILT);
-            released =
-                scheduler_gm_compare_exchange(
-                    control->state, built, scheduler_prepared_state(SchedulerPreparedPhase::FAILED, local->worker_id())
-                ) == built;
+            released = scheduler_transition_prepared_state(
+                control, built,
+                scheduler_prepared_state(SchedulerPreparedPhase::FAILED, local->worker_id()) |
+                    SCHEDULER_PREPARED_TICKET_OWNED
+            );
         } else {
             released = scheduler_cancel_unstarted_handle(base, local, &token.prepared);
         }

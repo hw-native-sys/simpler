@@ -1,5 +1,7 @@
 # HBG per-execution state restoration
 
+A5 scheduling resets follow the [shared hardware and scheduling premises](../zh-cn/design/a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles): independent contended atomic units use 128 B isolation, and dependent ld/st or atomic sequences require explicit DSB. Future STARS events need initialization, generation/reuse and retirement ownership; no generic SPR event pool is currently assumed. These design requirements do not claim that the current wire layouts have already changed.
+
 [Execution and API](native-capture-common-contract.md) ·
 [Resource lifetime](native-hbg-prepared-lifetime.md)
 

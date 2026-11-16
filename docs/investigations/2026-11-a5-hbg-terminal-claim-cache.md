@@ -1,5 +1,68 @@
 # A5 HBG terminal claim-count memoization
 
+## Ticket-owned ordinary execution records, 2026-11-16
+
+Retain the ordinary lifecycle candidate on `3c9127783` under the user's
+atomic-reduction rule. A successful ordinary block FAA fixes its sole owner;
+the execution record is then an owner-written diagnostic, not a second
+cross-core ownership gate. A ticket-owned flag distinguishes that contract.
+The owner validates its local lifecycle, writes the diagnostic, and publishes
+the isolated line with DCCI and DSB. Cooperative reservation, arming, acquisition
+and retirement retain atomic transitions. No record mixes these two access
+contracts, no `st_dev` is added, and all shared task completion/async operations
+remain atomic. AICPU error snapshots retain cache invalidation; Host collection
+and the canonical C-zero retirement inference keep their existing formats.
+
+The focused ordinary test removes the initial execution-record CAS and checks
+successful return, cancellation, stale-handle rejection and non-completion of
+the remaining block. Production ordinary partial returns also replace their
+record Exch with diagnostic publication. These reductions add ordinary stores,
+DCCI and DSB; they are not free and do not imply fewer total memory operations.
+All seven focused CPU suites, the 84.07-second A5 build and sixteen device IR
+scans pass.
+
+Twelve paired AICore L0 mean durations sum to **20.4327887 -> 20.4940688 ms
+(+0.299911%)**. This is a measured regression, retained because it is below one
+percent with a proven ownership-atomic reduction. Latest C1A reindex increases
+1.807%, and latest layers 19-21 increases 1.128%; the acceptance rule applies to
+the twelve-case sum, not every individual row. No stable latency improvement or
+net L3 primitive-count change is claimed.
+
+Eleven replay cases pass numerical validation; native MoE is timing-only.
+Each arm uses one warmup and ten samples on automatically allocated matched
+devices. Every two-device round rendezvouses on Device before timing and takes
+the slower rank; all eight arm audits pass. No retry or sample removal was used.
+Evidence is under `artifacts/c2a-handoff-20261115/ticket-owned-execution/`, its
+`-l0/` and `-comm-l0/` siblings, and
+`artifacts/atomic-reduction-20261115/ticket-owned-execution12.json`.
+
+## Bounded fill completion observations, 2026-11-16
+
+Reject the worker-private four-entry negative completion cache on `58bf35339`.
+It lived only inside one bounded fill, shared pending observations across token
+and issue probes, reset after cooperative progress, and let canonical DONE
+override a pending entry. A focused real-fill check reduced reads of a shared
+predecessor from four to one and observed completion in the next fill. The
+ownership, ordered and GM MIX CPU suites passed; the 88.01-second A5 build and
+all sixteen device IR scans passed.
+
+Paired twelve-case AICore L0 mean sums increased from **20.5193698 to
+20.7866075 ms (+1.302368%)**, exceeding the user's one-percent retention limit.
+Eight non-communication cases increased 0.243482%; four communication cases
+increased 1.780039%. DSL layers 19-21 changed 8.8039083 -> 9.0070668 ms.
+This result does not distinguish local cache lookup cost from the effect of
+deferring a fresh observation; no causal mechanism is claimed.
+
+All eleven replay cases passed numerical checks; native MoE was timing-only.
+Both arms used the same automatically allocated devices, one warmup and ten
+samples. Every dual-device sample retained the Device rendezvous and slower-rank
+aggregation; all eight arm audits passed. No retry or sample removal was used.
+The source/runtime snapshot and rejected patch are under
+`artifacts/c2a-handoff-20261115/fill-completion-reuse/`; the complete matrix is
+`artifacts/atomic-reduction-20261115/fill-completion-reuse12.json`.
+Production code and the candidate-specific test were restored. Binding the
+static wait address while retaining every fresh observation is a separate trial.
+
 ## Decision
 
 Reject the terminal claim-count cache. It reduced repeated cursor observations

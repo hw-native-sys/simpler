@@ -535,7 +535,7 @@ TEST(HbgScalarObserverLifetime, DispatchLoopRecordsMemoryPrimitives) {
         EXPECT_EQ(startup_kernel_calls, 1u);
         EXPECT_EQ(scalar_record_count(trace, SchedPhaseKind::ScalarExecutorScan), 0u);
         EXPECT_EQ(scheduler_scalar_current(), &trace);
-        EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarAtomicCas), 0u);
+        EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarAtomicFetchAdd), 0u);
         EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarBypassLoad), 0u);
         EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarDcciOut), 0u);
         EXPECT_GT(scalar_record_count(trace, SchedPhaseKind::ScalarDsbAll), 0u);

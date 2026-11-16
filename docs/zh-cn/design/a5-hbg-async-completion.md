@@ -1,5 +1,7 @@
 # A5 HBG AICore 异步完成开发方案
 
+**共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前实现、拟修改布局和未来 STARS 后端分别标明。
+
 本方案为 A5 `host_build_graph` 的 AICore resident scheduler 定义 deferred completion。
 业务 kernel 可以登记完成条件后返回，执行核继续处理其他工作；只有计算、异步条件和数据可见性要求全部满足，原逻辑 task 才发布完成并释放消费者。
 

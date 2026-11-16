@@ -1,5 +1,7 @@
 # 把 percounter 拆成第三个 runtime
 
+**共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前实现、拟修改布局和未来 STARS 后端分别标明。
+
 ## 目标
 
 percounter 现在是 a5 `host_build_graph` 里的调度模式之一（`SCHEDULER_RUNTIME_MODE_PERCOUNTER = 5`）。
