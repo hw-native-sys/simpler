@@ -64,10 +64,12 @@ int DeviceRunner::copy_from_device(void *host, const void *ptr, size_t bytes) {
 
 int DeviceRunner::prepare_launch_shape(Runtime &runtime, const CallConfig &config) {
     const uint32_t cores = sram_.core_count();
-    if (cores < 1 || config.aicpu_thread_num != 0) {
-        LOG_ERROR(
-            "WSE core_count exceeds configured device (%u cores), or AICPU threads requested", sram_.core_count()
-        );
+    if (cores < 1) {
+        LOG_ERROR("WSE requires at least one configured Core (core_count=%u)", cores);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (config.aicpu_thread_num != 0) {
+        LOG_ERROR("WSE requires aicpu_thread_num=0 (got %d)", config.aicpu_thread_num);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (config.enable_chip_swimlane || config.enable_dump_args || config.enable_pmu || config.enable_scope_stats) {
