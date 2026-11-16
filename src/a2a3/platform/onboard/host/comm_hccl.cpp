@@ -1070,11 +1070,15 @@ static int domain_alloc_via_ipc(
     return status == ACL_SUCCESS ? 0 : -1;
 }
 
-// Host wrapper owning one SDMA-enabled Worker's provisioned resources. The
-// opaque handle returned to the runner IS this manager; dma_workspace_release()
-// destroys it. There is no per-device generation gate: an SDMA-enabled Worker
-// owns its provider for its whole life and releases it at finalize.
+// The Worker owns both the ISA manager and its external device allocation.
+// Keep the allocation independently: failed Init may not bind it to the manager.
 using SdmaManager = pto::comm::sdma::SdmaWorkspaceManager;
+
+struct SdmaWorkspaceOwner {
+    std::unique_ptr<SdmaManager> manager = std::make_unique<SdmaManager>();
+    void *allocation = nullptr;
+    bool reclamation_unconfirmed = false;
+};
 
 extern "C" uint32_t dma_workspace_supported_mask(void) { return uint32_t{1} << DMA_WORKSPACE_SDMA; }
 
@@ -1096,9 +1100,10 @@ extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_ou
     if ((required_mask & (uint32_t{1} << DMA_WORKSPACE_SDMA)) == 0) return 0;
     if (count <= DMA_WORKSPACE_SDMA) return -1;
     try {
-        auto manager = std::make_unique<SdmaManager>();
+        auto owner = std::make_unique<SdmaWorkspaceOwner>();
+        auto &manager = owner->manager;
         uint64_t workspace_size = 0;
-        void *workspace_addr = nullptr;
+        void *&workspace_addr = owner->allocation;
         SdmaManager::GetWorkspaceSize(&workspace_size);
         if (workspace_size == 0) {
             LOG_ERROR("dma_workspace_provision: SDMA GetWorkspaceSize returned zero");
@@ -1110,30 +1115,31 @@ extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_ou
         }
         bool init_ok = false;
         try {
-            // Init binds the workspace and creates 48 STARS streams. It may fail
-            // after creating only a subset; destructing that partial manager on
-            // an error-state card can itself stall, so leak it on failure rather
-            // than risk the stall.
+            // Init creates STARS streams before binding the workspace. A null
+            // workspace address can therefore still mean partial stream ownership.
+            // Retain every failed Init manager: per-stream teardown can stall on
+            // an error-state card.
             init_ok = manager->Init(workspace_addr, workspace_size);
         } catch (...) {
             LOG_ERROR("SdmaWorkspaceManager::Init threw; abandoning its partial resources");
         }
         if (!init_ok) {
-            if (workspace_addr != nullptr && manager->GetWorkspaceAddr() == nullptr &&
-                aclrtFree(workspace_addr) != ACL_SUCCESS) {
-                LOG_ERROR("dma_workspace_provision: freeing unbound workspace failed");
+            if (manager->GetWorkspaceAddr() == nullptr && aclrtFree(workspace_addr) == ACL_SUCCESS) {
+                owner->allocation = nullptr;
             }
-            (void)manager.release();
-            return -1;
+            owner->reclamation_unconfirmed = true;
+            *handle_out = owner.release();
+            return COMM_RECLAMATION_UNCONFIRMED;
         }
         const uint64_t addr = reinterpret_cast<uint64_t>(manager->GetWorkspaceAddr());
         if (addr == 0) {
-            (void)manager.release();
+            owner->reclamation_unconfirmed = true;
+            *handle_out = owner.release();
             LOG_ERROR("dma_workspace_provision: manager returned a null workspace address");
-            return -1;
+            return COMM_RECLAMATION_UNCONFIRMED;
         }
         addr_out[DMA_WORKSPACE_SDMA] = addr;
-        *handle_out = manager.release();
+        *handle_out = owner.release();
         return 0;
     } catch (...) {
         LOG_ERROR("dma_workspace_provision: exception while provisioning SDMA");
@@ -1141,17 +1147,23 @@ extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_ou
     }
 }
 
-extern "C" void dma_workspace_release(void *handle) {
-    if (!handle) return;
+extern "C" int dma_workspace_release(void *handle) {
+    if (!handle) return 0;
+    auto *owner = static_cast<SdmaWorkspaceOwner *>(handle);
+    if (owner->reclamation_unconfirmed) return COMM_RECLAMATION_UNCONFIRMED;
+    owner->reclamation_unconfirmed = true;
     try {
-        std::unique_ptr<SdmaManager> manager(static_cast<SdmaManager *>(handle));
-        void *workspace_addr = manager->GetWorkspaceAddr();
-        manager.reset();
-        if (aclrtFree(workspace_addr) != ACL_SUCCESS) {
+        owner->manager.reset();
+        if (aclrtFree(owner->allocation) != ACL_SUCCESS) {
             LOG_WARN("dma_workspace_release: workspace aclrtFree failed");
+            return COMM_RECLAMATION_UNCONFIRMED;
         }
+        owner->allocation = nullptr;
+        delete owner;
+        return 0;
     } catch (...) {
         LOG_ERROR("dma_workspace_release: exception while releasing SDMA resources");
+        return COMM_RECLAMATION_UNCONFIRMED;
     }
 }
 

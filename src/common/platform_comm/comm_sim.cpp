@@ -311,10 +311,11 @@ extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_ou
     return 0;
 }
 
-extern "C" void dma_workspace_release(void *handle) {
+extern "C" int dma_workspace_release(void *handle) {
     if (handle != nullptr) {
         std::free(handle);
     }
+    return 0;
 }
 
 extern "C" int comm_alloc_windows(CommHandle h, size_t win_size, uint64_t *device_ctx_out) try {
