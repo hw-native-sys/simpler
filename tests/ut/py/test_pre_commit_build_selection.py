@@ -150,9 +150,9 @@ def test_clang_tidy_excluded_paths_exit_before_build_or_compile_database(monkeyp
     assert module.main() == 0
 
 
-def test_self_cpu_uses_the_project_venv_for_lint() -> None:
+def test_lint_uses_the_project_venv() -> None:
     workflow = WORKFLOW.read_text()
-    setup = "      - name: venv + deps\n"
+    setup = "      - name: Set up environment\n"
     lint_only = "      - name: Lint-only venv\n"
     activate = "      - name: Use lint venv\n"
     run = "      - name: Run pre-commit\n"
@@ -163,24 +163,18 @@ def test_self_cpu_uses_the_project_venv_for_lint() -> None:
     assert "steps.lint-build.outputs.needs_build != 'true'" in lint_only_block
     assert "run: python3 -m venv .venv" in lint_only_block
     block = workflow.split(activate, 1)[1].split(run, 1)[0]
-    assert "if: inputs.setup_variant == 'self-cpu'" in block
     assert 'run: echo "$PWD/.venv/bin" >> "$GITHUB_PATH"' in block
 
 
-def test_only_selected_build_paths_install_the_project() -> None:
+def test_only_the_build_path_installs_the_project() -> None:
     workflow = WORKFLOW.read_text()
-    cache = "      - name: Cache pip packages\n"
-    install = "      - name: Install package (for clang-tidy compile databases)\n"
-    setup = "      - name: venv + deps\n"
+    setup = "      - name: Set up environment\n"
     lint_only = "      - name: Lint-only venv\n"
 
     assert "pip install torch" not in workflow
-    cache_block = workflow.split(cache, 1)[1].split(install, 1)[0]
-    assert "inputs.setup_variant == 'github' && steps.lint-build.outputs.needs_build == 'true'" in cache_block
-    install_block = workflow.split(install, 1)[1].split(setup, 1)[0]
-    assert "steps.lint-build.outputs.needs_build == 'true'" in install_block
-    assert "build.targets=build_package_sim" in install_block
     setup_block = workflow.split(setup, 1)[1].split(lint_only, 1)[0]
+    assert "steps.lint-build.outputs.needs_build == 'true'" in setup_block
+    assert "build.targets=build_package_sim" in setup_block
     assert 'install-torch: "false"' in setup_block
 
 

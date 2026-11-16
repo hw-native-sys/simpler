@@ -65,6 +65,16 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
+      - name: Validate manual mode
+        run: |
+          case "$MANUAL_MODE" in
+            exclude|include|only) ;;
+            *)
+              echo "::error::manual_mode must be exclude, include, or only"
+              exit 2
+              ;;
+          esac
+
       - name: Checkout Python setup action
         if: inputs.setup_variant == 'github'
         uses: actions/checkout@v5
@@ -85,16 +95,6 @@ jobs:
       - name: Verify Python >= 3.10
         run: |
           python3 -c 'import sys; print(sys.version); sys.exit(0 if sys.version_info >= (3, 10) else "CI requires Python >= 3.10")'
-
-      - name: Validate manual mode
-        run: |
-          case "$MANUAL_MODE" in
-            exclude|include|only) ;;
-            *)
-              echo "::error::manual_mode must be exclude, include, or only"
-              exit 2
-              ;;
-          esac
 
       - name: Set up C++ compiler
         if: inputs.setup_variant == 'github'
@@ -123,28 +123,30 @@ jobs:
         with:
           build-packages: "scikit-build-core nanobind<3 cmake>=3.20"
           packages: "--no-build-isolation --config-settings=build.targets=build_package_a5sim .[test]"
+          install-torch: ${{ inputs.setup_variant == 'github' && 'true' || 'false' }}
+          system-site-packages: ${{ inputs.setup_variant == 'self-cpu' && 'true' || 'false' }}
 
-      - name: Run pytest scene tests
+      - name: Run pytest scene tests (a5sim)
         run: |
           .venv/bin/python -m pytest examples tests/st --platform a5sim --device 0-15 -v \
             --pto-session-timeout ${{ inputs.session_timeout_seconds }} --require-pto-isa \
             --manual "$MANUAL_MODE"
 
-      - name: dep_gen smoke (a5)
+      - name: Run dep_gen smoke (a5sim)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/dep_gen/ \
             --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout ${{ inputs.session_timeout_seconds }} \
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" --enable-dep-gen
 
-      - name: dep_gen smoke (a5 host_build_graph)
+      - name: Run dep_gen smoke (a5sim, host_build_graph)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a5/host_build_graph/dfx/dep_gen/ \
             --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout ${{ inputs.session_timeout_seconds }} \
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" --enable-dep-gen
 
-      - name: chip_swimlane smoke (a5)
+      - name: Run chip_swimlane smoke (a5sim)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/chip_swimlane/ \
@@ -152,7 +154,7 @@ jobs:
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" \
             --enable-chip-swimlane --enable-dep-gen
 
-      - name: chip_swimlane smoke (a5 host_build_graph)
+      - name: Run chip_swimlane smoke (a5sim, host_build_graph)
         if: inputs.include_dfx_smokes
         run: |
           for level in 1 2; do
@@ -172,7 +174,7 @@ jobs:
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" \
             --enable-chip-swimlane 3
 
-      - name: PMU smoke (a5)
+      - name: Run PMU smoke (a5sim)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
@@ -186,7 +188,7 @@ jobs:
       # opened lazily and the manifest reports `bin_file: null` when nothing is
       # marked. This is also the mode simpler_setup.tools.core_swimlane replays
       # from, so it is the one whose producer must keep matching that consumer.
-      - name: args_dump smoke (a5, hybrid)
+      - name: Run args_dump smoke (a5sim, hybrid)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
@@ -194,7 +196,7 @@ jobs:
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" \
             --dump-args hybrid
 
-      - name: scope_stats smoke (a5)
+      - name: Run scope_stats smoke (a5sim)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/scope_stats/ \
@@ -202,7 +204,7 @@ jobs:
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" \
             --enable-scope-stats
 
-      - name: args_dump smoke (a5 HBG, task-time payloads)
+      - name: Run args_dump smoke (a5sim, HBG task-time payloads)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a5/host_build_graph/dump_args/test_dump_args_example.py \

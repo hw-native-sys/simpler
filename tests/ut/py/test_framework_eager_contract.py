@@ -240,7 +240,9 @@ def test_framework_workflow_propagates_manual_selection(tmp_path, mode, platform
     assert workflow["on"]["workflow_call"]["inputs"]["manual_mode"]["default"] == "exclude"
     daily = yaml.load((_ROOT / ".github/workflows/daily.yml").read_text(), Loader=yaml.BaseLoader)
     assert daily["jobs"][f"st-framework-{platform}"]["with"]["manual_mode"] == "include"
-    step = next(step for step in workflow["jobs"]["run"]["steps"] if "run" in step)
+    steps = workflow["jobs"]["run"]["steps"]
+    validate = next(step for step in steps if step["name"] == "Validate manual mode")
+    step = next(step for step in steps if "task-submit" in step.get("run", ""))
     assert step["env"]["MANUAL_MODE"] == "${{ inputs.manual_mode }}"
     assert step["env"]["PLATFORM"] == "${{ inputs.platform }}"
     bin_dir = tmp_path / "bin"
@@ -275,8 +277,10 @@ def test_framework_workflow_propagates_manual_selection(tmp_path, mode, platform
     cann = tmp_path / "toolkit env.sh"
     cann.write_text(":\n")
     log = tmp_path / "argv.jsonl"
+    # An invalid mode is rejected by the preparation step, before the payload runs.
+    body = validate["run"] if mode == "invalid" else step["run"]
     result = subprocess.run(
-        ["bash", "-e", "-o", "pipefail", "-c", step["run"]],
+        ["bash", "-e", "-o", "pipefail", "-c", body],
         cwd=tmp_path,
         env={
             **os.environ,

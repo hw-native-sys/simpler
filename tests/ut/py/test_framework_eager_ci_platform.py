@@ -64,6 +64,7 @@ def test_setup_selects_only_the_validated_build_target(tmp_path, platform_name):
 def test_install_body_builds_the_selected_sdk(tmp_path, platform_name, shell_builtins):
     action = _yaml(_ACTION / "action.yml")
     install = next(step for step in action["runs"]["steps"] if "Install isolated" in step["name"])
+    assert install["env"]["PIP_INDEX_URL"] == "https://mirrors.aliyun.com/pypi/simple"
     binary = tmp_path / "bin"
     command_log = tmp_path / "install.jsonl"
     requirements = [
@@ -117,7 +118,7 @@ def test_install_body_builds_the_selected_sdk(tmp_path, platform_name, shell_bui
             "--no-deps",
             requirements[0],
             "--index-url",
-            "https://download.pytorch.org/whl/cpu",
+            "https://mirrors.nju.edu.cn/pytorch/whl/cpu",
         ],
         ["-m", "pip", "install", "--ignore-installed", "--no-deps", requirements[1]],
         ["-m", "pip", "install", "--ignore-installed", "--no-deps", "nanobind>=2,<3"],
@@ -144,10 +145,8 @@ def test_install_body_builds_the_selected_sdk(tmp_path, platform_name, shell_bui
     ]
 
 
-def _identity_module(action_name="setup-framework"):
-    spec = importlib.util.spec_from_file_location(
-        "framework_ci_identity", _ROOT / ".github/actions" / action_name / "identity.py"
-    )
+def _identity_module():
+    spec = importlib.util.spec_from_file_location("framework_ci_identity", _ACTION / "identity.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -155,13 +154,9 @@ def _identity_module(action_name="setup-framework"):
 
 
 @pytest.mark.parametrize("platform_name", ["a2a3", "a5"])
-@pytest.mark.parametrize(
-    "action_name,output", [("setup-framework", "framework-ci"), ("setup-framework-eager", "framework-eager-ci")]
-)
-def test_identity_records_the_selected_platform_runtime_and_environment(
-    tmp_path, monkeypatch, platform_name, action_name, output
-):
-    identity = _identity_module(action_name)
+def test_identity_records_the_selected_platform_runtime_and_environment(tmp_path, monkeypatch, platform_name):
+    identity = _identity_module()
+    output = "framework-ci"
     site_packages = tmp_path / "framework-site"
     assets = site_packages / "simpler_setup/_assets"
     for candidate in ("a2a3", "a5"):
@@ -200,19 +195,6 @@ def test_identity_records_the_selected_platform_runtime_and_environment(
         identity.main()
 
 
-def test_default_branch_alias_delegates_setup_without_a_second_suite():
-    action = _yaml(_ROOT / ".github/actions/setup-framework-eager/action.yml")
-    assert action["inputs"]["platform"]["default"] == "a2a3"
-    assert action["runs"]["steps"] == [
-        {
-            "id": "setup",
-            "uses": "./.github/actions/setup-framework",
-            "with": {"platform": "${{ inputs.platform }}"},
-        }
-    ]
-    assert action["outputs"]["cann_env"]["value"] == "${{ steps.setup.outputs.cann_env }}"
-
-
 def test_identity_refuses_bad_platform_before_optional_backend_import(tmp_path):
     script = """
 import builtins, runpy, sys
@@ -244,7 +226,7 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
     steps = workflow["jobs"]["run"]["steps"]
     setup = next(step for step in steps if "uses" in step and step["uses"].endswith("setup-framework"))
     assert setup["with"]["platform"] == "${{ inputs.platform }}"
-    step = next(step for step in steps if "run" in step)
+    step = next(step for step in steps if "task-submit" in step.get("run", ""))
     assert step["env"]["PLATFORM"] == "${{ inputs.platform }}"
     log = tmp_path / "commands.jsonl"
     _executable(

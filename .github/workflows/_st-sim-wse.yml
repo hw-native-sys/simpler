@@ -69,6 +69,16 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
+      - name: Validate manual mode
+        run: |
+          case "$MANUAL_MODE" in
+            exclude|include|only) ;;
+            *)
+              echo "::error::manual_mode must be exclude, include, or only"
+              exit 2
+              ;;
+          esac
+
       - name: Checkout Python setup action
         if: inputs.setup_variant == 'github'
         uses: actions/checkout@v5
@@ -89,16 +99,6 @@ jobs:
       - name: Verify Python >= 3.10
         run: |
           python3 -c 'import sys; print(sys.version); sys.exit(0 if sys.version_info >= (3, 10) else "CI requires Python >= 3.10")'
-
-      - name: Validate manual mode
-        run: |
-          case "$MANUAL_MODE" in
-            exclude|include|only) ;;
-            *)
-              echo "::error::manual_mode must be exclude, include, or only"
-              exit 2
-              ;;
-          esac
 
       - name: Set up C++ compiler
         if: inputs.setup_variant == 'github'
@@ -127,14 +127,16 @@ jobs:
         with:
           build-packages: "scikit-build-core nanobind<3 cmake>=3.20"
           packages: "--no-build-isolation --config-settings=build.targets=build_package_wsesim .[test]"
+          install-torch: ${{ inputs.setup_variant == 'github' && 'true' || 'false' }}
+          system-site-packages: ${{ inputs.setup_variant == 'self-cpu' && 'true' || 'false' }}
 
-      - name: Run pytest scene tests
+      - name: Run pytest scene tests (wsesim)
         run: |
           .venv/bin/python -m pytest examples tests/st --platform wsesim --device 0-15 --max-parallel "$ST_MAX_PARALLEL" -v \
             --pto-session-timeout ${{ inputs.session_timeout_seconds }} --require-pto-isa \
             --manual "$MANUAL_MODE"
 
-      - name: Dependency capture smoke
+      - name: Run dependency capture smoke (wsesim)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/wse/host_build_graph/vector_example \

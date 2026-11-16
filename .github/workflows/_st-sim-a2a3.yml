@@ -65,6 +65,16 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
+      - name: Validate manual mode
+        run: |
+          case "$MANUAL_MODE" in
+            exclude|include|only) ;;
+            *)
+              echo "::error::manual_mode must be exclude, include, or only"
+              exit 2
+              ;;
+          esac
+
       - name: Checkout Python setup action
         if: inputs.setup_variant == 'github'
         uses: actions/checkout@v5
@@ -85,16 +95,6 @@ jobs:
       - name: Verify Python >= 3.10
         run: |
           python3 -c 'import sys; print(sys.version); sys.exit(0 if sys.version_info >= (3, 10) else "CI requires Python >= 3.10")'
-
-      - name: Validate manual mode
-        run: |
-          case "$MANUAL_MODE" in
-            exclude|include|only) ;;
-            *)
-              echo "::error::manual_mode must be exclude, include, or only"
-              exit 2
-              ;;
-          esac
 
       - name: Set up C++ compiler
         if: inputs.setup_variant == 'github'
@@ -123,28 +123,30 @@ jobs:
         with:
           build-packages: "scikit-build-core nanobind<3 cmake>=3.20"
           packages: "--no-build-isolation --config-settings=build.targets=build_package_a2a3sim .[test]"
+          install-torch: ${{ inputs.setup_variant == 'github' && 'true' || 'false' }}
+          system-site-packages: ${{ inputs.setup_variant == 'self-cpu' && 'true' || 'false' }}
 
-      - name: Run pytest scene tests
+      - name: Run pytest scene tests (a2a3sim)
         run: |
           .venv/bin/python -m pytest examples tests/st --platform a2a3sim --device 0-15 -v \
             --pto-session-timeout ${{ inputs.session_timeout_seconds }} --require-pto-isa \
             --manual "$MANUAL_MODE"
 
-      - name: dep_gen smoke (a2a3)
+      - name: Run dep_gen smoke (a2a3sim)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/ \
             --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout ${{ inputs.session_timeout_seconds }} \
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" --enable-dep-gen
 
-      - name: dep_gen smoke (a2a3 host_build_graph)
+      - name: Run dep_gen smoke (a2a3sim, host_build_graph)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a2a3/host_build_graph/dfx/dep_gen/ \
             --platform a2a3sim --device 0-15 -p no:xdist --pto-session-timeout ${{ inputs.session_timeout_seconds }} \
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" --enable-dep-gen
 
-      - name: chip_swimlane smoke (a2a3)
+      - name: Run chip_swimlane smoke (a2a3sim)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/chip_swimlane/ \
@@ -152,7 +154,7 @@ jobs:
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" \
             --enable-chip-swimlane --enable-dep-gen
 
-      - name: chip_swimlane smoke (a2a3 host_build_graph)
+      - name: Run chip_swimlane smoke (a2a3sim, host_build_graph)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a2a3/host_build_graph/dfx/chip_swimlane/ \
@@ -160,7 +162,7 @@ jobs:
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" \
             --enable-chip-swimlane 3
 
-      - name: PMU smoke (a2a3)
+      - name: Run PMU smoke (a2a3sim)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
@@ -177,7 +179,7 @@ jobs:
       # lane would be redundant, because the writer is shared
       # (src/common/platform/shared/{host,aicpu}/args_dump*). a5sim takes
       # `hybrid` and onboard takes `full`.
-      - name: args_dump smoke (a2a3, partial)
+      - name: Run args_dump smoke (a2a3sim, partial)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
@@ -185,7 +187,7 @@ jobs:
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" \
             --dump-args partial
 
-      - name: scope_stats smoke (a2a3)
+      - name: Run scope_stats smoke (a2a3sim)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/dfx/scope_stats/ \

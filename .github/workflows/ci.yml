@@ -28,9 +28,7 @@ jobs:
     uses: ./.github/workflows/_pre-commit.yml
     with:
       base_sha: ${{ github.event.pull_request.base.sha }}
-      head_sha: ${{ github.event.pull_request.head.sha }}
       runs_on: '["self-hosted","cpu"]'
-      setup_variant: self-cpu
 
   packaging-matrix:
     needs: [detect-changes, pre-commit]
@@ -81,7 +79,6 @@ jobs:
     uses: ./.github/workflows/_profiling-flags-smoke.yml
     with:
       runs_on: '["self-hosted","cpu"]'
-      setup_variant: self-cpu
 
   ut-a2a3:
     needs: [detect-changes, pre-commit]

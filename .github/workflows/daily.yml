@@ -18,20 +18,18 @@ jobs:
     with:
       runs_on: '["macos-latest"]'
       setup_variant: github
-      python_version: "3.10"
 
   ut-macos:
     uses: ./.github/workflows/_ut-no-hardware.yml
     with:
       runs_on: '["macos-latest"]'
       setup_variant: github
-      python_version: "3.10"
 
   st-sim-a2a3:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest]
+        os: [ubuntu-latest, macos-latest]
     uses: ./.github/workflows/_st-sim-a2a3.yml
     with:
       runs_on: ${{ toJSON(matrix.os) }}
@@ -45,7 +43,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest]
+        os: [ubuntu-latest, macos-latest]
     uses: ./.github/workflows/_st-sim-a5.yml
     with:
       runs_on: ${{ toJSON(matrix.os) }}
@@ -60,7 +58,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-latest]
+        os: [ubuntu-latest, macos-latest]
     uses: ./.github/workflows/_st-sim-wse.yml
     with:
       runs_on: ${{ toJSON(matrix.os) }}
