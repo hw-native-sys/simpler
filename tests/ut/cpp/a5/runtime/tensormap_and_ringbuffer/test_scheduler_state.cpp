@@ -500,6 +500,36 @@ TEST_F(SchedulerStateTest, SubtaskCompleteMultiBlock) {
     EXPECT_TRUE(sched.on_subtask_complete(slot));
 }
 
+TEST_F(SchedulerStateTest, SubtaskCompleteBatchesPreservePartialCount) {
+    alignas(64) ChipTaskSlotState slot;
+    init_slot(slot, CHIP_TASK_PENDING, 1, 1);
+    slot.total_required_subtasks = 16;
+
+    EXPECT_FALSE(sched.on_subtask_complete(slot, 7));
+    EXPECT_EQ(slot.completed_subtasks.load(), 7);
+    EXPECT_FALSE(sched.on_subtask_complete(slot, 8));
+    EXPECT_EQ(slot.completed_subtasks.load(), 15);
+    EXPECT_TRUE(sched.on_subtask_complete(slot));
+    EXPECT_EQ(slot.completed_subtasks.load(), 16);
+}
+
+TEST_F(SchedulerStateTest, ConcurrentSubtaskBatchesHaveOneTerminalOwner) {
+    alignas(64) ChipTaskSlotState slot;
+    init_slot(slot, CHIP_TASK_PENDING, 1, 1);
+    slot.total_required_subtasks = 16;
+    std::atomic<int> terminal_owners{0};
+    auto complete_batch = [&] {
+        if (sched.on_subtask_complete(slot, 8)) terminal_owners.fetch_add(1);
+    };
+    std::thread first(complete_batch);
+    std::thread second(complete_batch);
+    first.join();
+    second.join();
+
+    EXPECT_EQ(slot.completed_subtasks.load(), 16);
+    EXPECT_EQ(terminal_owners.load(), 1);
+}
+
 // =============================================================================
 // on_scope_end
 // =============================================================================

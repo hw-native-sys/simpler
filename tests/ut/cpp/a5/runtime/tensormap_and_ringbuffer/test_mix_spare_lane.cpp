@@ -65,6 +65,9 @@ public:
     static ChipTaskSlotState *pending(SchedulerContext &context, int core) {
         return context.core_exec_states_[core].pending_slot_state;
     }
+    static bool running_groupable(SchedulerContext &context, int offset) {
+        return context.core_trackers_[0].is_running_groupable(offset);
+    }
     static bool drain(SchedulerContext &context, ChipTaskSlotState &slot) {
         return context.enter_drain_mode(&slot, slot.logical_block_num);
     }
@@ -273,6 +276,22 @@ TEST_F(MixSpareLane, RunningUnusedVectorDoesNotPreventMixAdmission) {
     EXPECT_EQ(SchedulerDispatchTestPeer::running(*context, 0), &mixed);
     EXPECT_EQ(SchedulerDispatchTestPeer::running(*context, 1), &mixed);
     EXPECT_EQ(mixed.next_block_idx.load(), 1);
+}
+
+// Completion batching can only combine credits for a task with several
+// subtasks, so dispatch is what marks the slots it may group. A single-lane
+// task must stay unmarked, or its owner loses the per-core polling path.
+TEST_F(MixSpareLane, DispatchMarksOnlyMultiSubtaskSlotsAsGroupable) {
+    auto &mixed = task(0, kAicAiv0);
+    auto &vector = task(1, LaneMask::aiv0());
+    queue(mixed);
+    queue(vector);
+    SchedulerDispatchTestPeer::dispatch(*context);
+    ASSERT_EQ(SchedulerDispatchTestPeer::running(*context, 0), &mixed);
+    ASSERT_EQ(SchedulerDispatchTestPeer::running(*context, 2), &vector);
+    EXPECT_TRUE(SchedulerDispatchTestPeer::running_groupable(*context, 0));
+    EXPECT_TRUE(SchedulerDispatchTestPeer::running_groupable(*context, 1));
+    EXPECT_FALSE(SchedulerDispatchTestPeer::running_groupable(*context, 2));
 }
 
 TEST_F(MixSpareLane, ResidualMixAllowsSparePendingVector) {
