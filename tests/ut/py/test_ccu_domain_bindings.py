@@ -235,7 +235,7 @@ def test_run_set_accepts_natural_exit_without_forcing_stop():
 
 def test_run_set_bounded_natural_wait_then_confirmed_resident_stop(monkeypatch):
     calls = []
-    clock = iter((10.0, 10.05, 10.1))
+    clock = iter((10.0, 10.0005, 10.001))
     monkeypatch.setattr("simpler.ccu.time.monotonic", lambda: next(clock))
     native = SimpleNamespace(
         prepare_ccu_run_set=lambda *a: 8,
