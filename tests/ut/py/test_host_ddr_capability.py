@@ -64,7 +64,7 @@ def test_missing_mapping_support_rejected_during_prepare_before_native_submit(wo
     tensor = buffer.tensor((4,), DataType.INT32)
     allocate = Mock(side_effect=AssertionError("must not allocate"))
     monkeypatch.setattr(worker, "_create_buffer_locked", allocate)
-    with pytest.raises(RuntimeError, match="A5 onboard runtime.*Host mapping"):
+    with pytest.raises(RuntimeError, match="onboard runtime.*Host mapping"):
         worker._submit_l2_locked(1, map_args(tensor), CallConfig())
     allocate.assert_not_called()
     worker._chip_worker._submit_chip_run_direct.assert_not_called()
@@ -77,8 +77,24 @@ def test_old_binding_without_capability_is_not_supported(worker, monkeypatch):
     tensor = worker.create_buffer(64).tensor((4,), DataType.INT32)
     del worker._chip_worker._host_ddr_mapping_supported
     monkeypatch.setenv("SIMPLER_ENABLE_PTO_URMA_WORKSPACE", "ON")
-    with pytest.raises(RuntimeError, match="A5 onboard runtime.*Host mapping"):
+    with pytest.raises(RuntimeError, match="onboard runtime.*Host mapping"):
         worker._submit_l2_locked(1, map_args(tensor), CallConfig())
+
+
+@pytest.mark.parametrize("snapshot_only", [False, True])
+def test_borrowed_context_refuses_map_before_registration(worker, snapshot_only):
+    chip = worker._chip_worker
+    chip._execution_environment = (0, 0, 0, 0, True)
+    chip._host_ddr_mapping_supported = True
+    chip._validate_caller_stream = Mock()
+    chip._map_host_ddr = Mock()
+    buffer = worker.create_buffer(64)
+    args = map_args(buffer.tensor((4,), DataType.INT32))
+    with pytest.raises(ValueError, match="owning direct L2 Worker context"):
+        worker._prepare_l2_args(1, args, caller_stream=123, snapshot_only=snapshot_only)
+    chip._map_host_ddr.assert_not_called()
+    assert worker._chip_import_registry is None
+    worker.release_buffer(buffer)
 
 
 @pytest.mark.parametrize("level", [3, 4])
@@ -106,7 +122,11 @@ def test_allocation_policy_option_is_removed(worker, option):
 @pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
 @pytest.mark.parametrize(
     "platform",
-    ["a5sim", pytest.param("a5", marks=[pytest.mark.requires_hardware, pytest.mark.platforms(["a5"])])],
+    [
+        "a5sim",
+        pytest.param("a5", marks=[pytest.mark.requires_hardware, pytest.mark.platforms(["a5"])]),
+        pytest.param("a2a3", marks=[pytest.mark.requires_hardware, pytest.mark.platforms(["a2a3"])]),
+    ],
 )
 def test_creation_with_real_loaded_runtime(platform, runtime, request, monkeypatch):
     device = int(str(request.config.getoption("--device")).split("-")[0].split(",")[0])
@@ -115,7 +135,8 @@ def test_creation_with_real_loaded_runtime(platform, runtime, request, monkeypat
         worker.init()
         root = Path(__file__).resolve().parents[3]
         variant = "sim" if platform.endswith("sim") else "onboard"
-        library = ctypes.CDLL(str(root / "build/lib/a5" / variant / runtime / "libhost_runtime.so"))
+        arch = platform.removesuffix("sim")
+        library = ctypes.CDLL(str(root / "build/lib" / arch / variant / runtime / "libhost_runtime.so"))
         compiled = all(hasattr(library, symbol) for symbol in ("host_ddr_map_ctx", "host_ddr_unmap_ctx"))
         assert worker._chip_worker is not None
         assert worker._chip_worker._host_ddr_mapping_supported is compiled
@@ -142,7 +163,7 @@ def test_creation_with_real_loaded_runtime(platform, runtime, request, monkeypat
             else:
                 ordinary = worker.create_buffer(64)
                 try:
-                    with pytest.raises(RuntimeError, match="A5 onboard runtime.*Host mapping"):
+                    with pytest.raises(RuntimeError, match="onboard runtime.*Host mapping"):
                         registry = worker._l2_import_registry().host_mappings
                         assert registry is not None
                         registry.acquire(1, map_args(ordinary.tensor((4,), DataType.INT32)))
