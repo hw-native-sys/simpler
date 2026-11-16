@@ -136,7 +136,7 @@ class CcuRegistrationHandle:
 class ChipCcuRunSet:
     """One native execution collection, completed before the FIFO successor."""
 
-    def __init__(self, worker, communicator, registrations, generation, dispatch_id, natural_exit_wait=0.1):
+    def __init__(self, worker, communicator, registrations, generation, dispatch_id, natural_exit_wait=0.001):
         self.worker = worker
         self.communicator = communicator
         self.natural_exit_wait = natural_exit_wait

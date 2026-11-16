@@ -1,0 +1,51 @@
+{
+  "source_commit": "a6a9a2d49047ce67a85857c6b15f9604a7287714",
+  "host_source_sha256": "d020cc9e8063af6525aa447f5f5a251dcef2115d941c7e30a36c744684fe604f",
+  "host_tensor_indices": [
+    31
+  ],
+  "scalar_values": [
+    "rank",
+    1,
+    "comm",
+    "comm",
+    "comm",
+    "comm",
+    "comm",
+    "comm",
+    "comm",
+    "comm"
+  ],
+  "input_generator": "production/moe_inputs.py",
+  "input_provenance": {
+    "quant.py": {
+      "sha256": "da6f4063d6952edc96d7046ae0d46fea31b0c60229081480aeff45c9b9d8e0bb",
+      "functions": [
+        "decode_e8m0",
+        "encode_e8m0",
+        "pack_mx_b_scale",
+        "_nearest_fp4_indices",
+        "_pack_fp4",
+        "quantize_mxfp4_weight",
+        "_ocp_e8m0_codes_from_amax",
+        "generate_mxfp8_weight_kn",
+        "_pack_mxfp4_nibbles_kn_tiles",
+        "pack_mxfp4_weight_tiles"
+      ]
+    },
+    "expert_routed.py": {
+      "sha256": "b4a5218f885d4a23c17352dea084f731f6dbfd10a38d10f10d533865d3d12ba9",
+      "functions": [
+        "gen_routed_mxfp4_weights"
+      ]
+    },
+    "decode_moe.py": {
+      "sha256": "113f55007da5459d69eb9a21bb2accb173f7a4a55e3dc48f4a3ab6fbf152a7fb",
+      "functions": [
+        "_normalise_num_tokens",
+        "_route_bias",
+        "build_moe_specs"
+      ]
+    }
+  }
+}

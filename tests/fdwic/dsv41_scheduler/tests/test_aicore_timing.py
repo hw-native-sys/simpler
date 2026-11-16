@@ -82,3 +82,31 @@ def test_replay_rejects_profiled_samples_and_missing_rank(tmp_path):
     (tmp_path / "rank1/result.json").unlink()
     with pytest.raises(ValueError, match="Incomplete rank"):
         TIMING["summarize_replay"](tmp_path)
+
+
+def test_native_runner_timing_needs_no_replay_prefix(tmp_path):
+    for rank in range(2):
+        directory = tmp_path / f"rank{rank}"
+        (directory / "host").mkdir(parents=True)
+        (directory / "host/host.test.log").write_text(log(rank))
+        (directory / "console.log").write_text(
+            "\n".join(f"run={i} scheduler_mode=5 profiling=0 warmup={int(i == 0)}" for i in range(3))
+        )
+        (directory / "result.json").write_text(
+            json.dumps(
+                dict(
+                    passed=True,
+                    execution="native_moe_host_control",
+                    numerical_validation=False,
+                    validated_against_fused_prefix=False,
+                    rank=rank,
+                    ranks=2,
+                    device=rank,
+                    runtime="percounter",
+                    warmup=1,
+                    rounds=2,
+                    snapshot_inputs=False,
+                )
+            )
+        )
+    assert TIMING["summarize_replay"](tmp_path)["samples_ms"] == [0.009, 0.009]

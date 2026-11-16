@@ -295,7 +295,7 @@ Modules declare the THREE_EVENTS capability and the two launch words above.
    and retires the asynchronous condition before releasing dependent tasks.
 4. At L2 END, Host finishes the execution collection only after all asynchronous
    requests have completed and every associated mission has confirmed termination.
-5. Host allows a bounded natural-exit wait after L2 completion. If a mission
+5. Host allows a 1 ms natural-exit wait after L2 completion. If a mission
    remains resident, `stop_completed_stream` calls `aclrtStreamAbort`, then
    requires a successful `aclrtStreamQuery` reporting `COMPLETE`. Only confirmed
    termination permits releasing this run's parameters and controls. Expected

@@ -235,7 +235,7 @@ def test_run_set_accepts_natural_exit_without_forcing_stop():
 
 def test_run_set_bounded_natural_wait_then_confirmed_resident_stop(monkeypatch):
     calls = []
-    clock = iter((10.0, 10.05, 10.1))
+    clock = iter((10.0, 10.0005, 10.001))
     monkeypatch.setattr("simpler.ccu.time.monotonic", lambda: next(clock))
     native = SimpleNamespace(
         prepare_ccu_run_set=lambda *a: 8,
@@ -324,6 +324,10 @@ def test_registration_holds_worker_until_reply_and_cache_publication(monkeypatch
             assert release.wait(5)
             assert not closed.is_set()
             return worker_module._CCU_DOMAIN_REQUEST.pack(dom.allocation_id, dom.generation, 9, target.digest, 12)
+
+        def check_control_payloads_retired(self):
+            assert dom._ccu_registrations, "control payloads checked before registration publication"
+            assert not closed.is_set()
 
         def close(self):
             assert dom._ccu_registrations, "transport closed before registration publication"

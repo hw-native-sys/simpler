@@ -138,7 +138,8 @@ int run(int argc, char **argv) {
         // smaller test entry must not move every kernel to new I-cache sets.
         if (orchestration.size() > source->binary_size()) {
             throw std::runtime_error(
-                "Host adapter exceeds original orchestration slot; build it without debug symbols"
+                "Host adapter exceeds original orchestration slot; "
+                "build it without debug symbols"
             );
         }
         orchestration.resize(source->binary_size(), 0);
@@ -209,9 +210,15 @@ int run(int argc, char **argv) {
     HostLogger::get_instance().set_log_directory((output / "host").c_str());
     HostLogger::get_instance().set_level(simpler::log::LogLevel::TIMING);
     std::ifstream manifest(bundle / ("rank" + std::to_string(rank) + ".txt"));
-    if (read<std::string>(manifest) != "DSV41_NATIVE_V1") throw std::runtime_error("Invalid input manifest");
+    const auto input_format = read<std::string>(manifest);
+    const bool native_moe = input_format == "DSV41_MOE_V1";
+    if (!native_moe && input_format != "DSV41_NATIVE_V1") throw std::runtime_error("Invalid input manifest");
+    if (native_moe && (sliced || snapshot || materialize))
+        throw std::runtime_error("Native MoE requires the original Host orchestration");
     const int ranks = read<int>(manifest);
     const size_t window_bytes = read<size_t>(manifest);
+    if (native_moe && (ranks != 2 || window_bytes == 0))
+        throw std::runtime_error("Native MoE requires two communication ranks");
     if (snapshot && (ranks != 1 || window_bytes != 0))
         throw std::runtime_error("Local snapshot must not initialize communication");
     if (rank < 0 || rank >= ranks) throw std::runtime_error("Rank outside original workload");
@@ -427,7 +434,8 @@ int run(int argc, char **argv) {
             }
         }
         std::cout << "run=" << iteration << " scheduler_mode=" << mode << " profiling=" << profiling
-                  << " warmup=" << (iteration < warmup) << std::endl;
+                  << " warmup=" << (iteration < warmup) << '\n'
+                  << std::flush;
         host_barrier(output, "checked" + std::to_string(iteration), rank, ranks);
     }
     worker.unregister_callable(callable_id);
@@ -447,7 +455,9 @@ int run(int argc, char **argv) {
            << ",\"isolated_case\":" << (sliced ? "true" : "false")
            << ",\"validated_against_fused_prefix\":" << (sliced ? "true" : "false") << ",\"warmup\":" << warmup
            << ",\"rounds\":" << rounds << ",\"snapshot_inputs\":" << (snapshot ? "true" : "false")
-           << ",\"ranks\":" << ranks << "}\n";
+           << ",\"ranks\":" << ranks << ",\"execution\":\"" << (native_moe ? "native_moe_host_control" : "replay")
+           << "\""
+           << ",\"numerical_validation\":" << (native_moe ? "false" : "true") << "}\n";
     return 0;
 }
 }  // namespace
