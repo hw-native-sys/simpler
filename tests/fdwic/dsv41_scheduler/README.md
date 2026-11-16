@@ -124,7 +124,7 @@ checks all 40 pairs before refreshing only the selected replay regions. Native M
 
 The selected `pypto_lib_latest/moe` inherits
 [PR3038](https://github.com/hw-native-sys/simpler/pull/3038). It executes the
-original `dev/hbg` `l3_moe`/`l2_moe` orchestration, including the actual
+original generated `dev/hbg` `l2_moe` C++ Host orchestration, including the actual
 `get_tensor_data<int32_t>(num_tokens)` Host read. Counts and routes produced by
 communication remain device-side reads in AICore tasks. Frozen latest-MoE plans
 are rejected. Initial PyPTO-lib and DSL MoE remain fixed-input replay stress cases.
@@ -138,13 +138,13 @@ AICore endpoints and per-round rank maxima after the Device start rendezvous.
 The replay cases retain their inexpensive reference and output checks.
 
 Native MoE's fixed weights and scales occupy about 2.48 GB (2.31 GiB) across
-both ranks. They are cached under `build/native-weights/`, keyed by model
-revision, Torch version and tensor layout. Cache publication is atomic and
-locked; every load checks model identity, file size and tensor layouts.
-Each initializer returns a fresh tensor. Counts, routing and outputs are not
-cached. The first cache creation includes weight generation; later runtime
-comparisons reuse it without compiling business kernels. See
-[whole-test execution timings](TEST_TIME.md) for cold and warm results.
+both ranks. Initial bundle preparation uses the included Torch-only input
+generator and a local cache under `build/native-weights/`, keyed by model
+revision, Torch version and tensor layout. It exports the original inputs to
+raw local files; outputs use compact zero initializers. The prepared bundle
+is reused by daily tests without importing Torch or regenerating weights.
+The cache and prepared input files remain in ignored build directories and
+are not committed. See [whole-test execution timings](TEST_TIME.md).
 
 Native MoE uses the model's original numerical-golden inputs, including nonzero
 weights and count-dependent forced routing. Its refreshed performance row is a
@@ -154,16 +154,23 @@ Host controls execute during graph construction, outside Device wall time.
 The other replay cases preserve device execution for their captured controls;
 they do not test dynamic Host `get_tensor_data` reads.
 
-Prepare with a clean `dev/hbg` checkout and its compatible PyPTO/Simpler Python
-environment. `prepare.py`/`export_cases.py` accept `--pypto-lib-root` and optional
-`--native-moe-bundle` to reuse a verified native bundle. `production/moe.py` can
-prepare just this case with `--compile-only --lib-root PATH`; add `--reuse-bundle`
-to copy a compatible existing program. Runtime execution reuses the packed
-native callable, checks its source and binding identity, and loads the supplied
-`RUNTIME_LIB` with `--runtime=host_build_graph` or `--runtime=percounter`.
-Runtime hashes and binding provenance are recorded separately. The original
-model checkout is needed to construct the native performance inputs; standalone replay cases
-continue to use only the included sources and inputs.
+All 12 prepared cases run with the C++ `native-runner`, standard Python and
+Simpler/CANN libraries. No PyPTO, PyPTO-lib checkout, Torch or Simpler Python
+bindings are needed during execution. Only initial native MoE input preparation
+requires CPU Torch; the numerical helpers and generated Host/kernel sources
+are included here. Existing prepared bundles avoid that preparation step.
+
+`build.sh --flavor pypto_lib_latest` also builds the native MoE callable under
+`build/portable/native-moe`. `prepare.py`/`export_cases.py` prepare its input
+bundle; `--native-moe-bundle` reuses an existing standalone bundle.
+`production/moe.py BUNDLE OUTPUT --compile-only --build-dir PATH` prepares
+only this case; `--reuse-bundle PATH` copies a compatible standalone bundle.
+Old Python-runner bundles must be prepared again once. Runtime execution
+validates the callable digest, input sizes and live HOST `num_tokens` argument,
+then runs the original Host callable with the supplied HBG or percounter runtime.
+The original 33 tensor arguments and 10 scalars are preserved. Each rank
+submits one native call per round; the former outer Python `l3_moe` ordering
+token is unnecessary with these serial per-rank submissions.
 
 ## Boundary preparation and validation
 
@@ -365,9 +372,11 @@ export DSV41=tests/fdwic/dsv41_scheduler
 bash "$DSV41/build.sh" --pto-isa "$PWD/build/pto-isa"
 ```
 
-This builds the small Host tools and all three sets of model kernels. Python only
-coordinates compilation/packing using `simpler_setup`; neither PyPTO-lib,
-PyPTO JIT, torch, nor Simpler's Python bindings is required for replay cases. Native MoE additionally uses the original model and golden harness.
+This builds the small Host tools, all three sets of model kernels and the
+standalone native MoE callable. Python only coordinates compilation/packing
+using `simpler_setup`; PyPTO-lib, PyPTO JIT, Torch and Simpler Python bindings
+are not needed to build these sources. Initial native MoE input preparation
+uses CPU Torch; all prepared cases execute without it.
 The generated DSL C++ uses CANN headers directly; the DSL Python package is
 not needed to rebuild it.
 
@@ -415,8 +424,7 @@ python3 "$DSV41/production/device_start_gate.py" \
 export DSV41_RUNTIME="$PWD/$DSV41/build/device-start-gate/runtime/a5/onboard"
 python3 "$DSV41/production/device_start_gate.py" validate "$DSV41_RUNTIME" host_build_graph
 
-python3 "$DSV41/production/prepare.py" "$DSV41_RUNTIME" "$DSV41/build/prepared" \
-  --pypto-lib-root /path/to/pypto-lib-dev-hbg
+python3 "$DSV41/production/prepare.py" "$DSV41_RUNTIME" "$DSV41/build/prepared"
 
 bash "$DSV41/run.sh" \
   "$DSV41/build/prepared/cases/pypto_lib_latest/swa" \
@@ -523,8 +531,7 @@ full forward and the same replay adapter:
 python3 "$DSV41/production/export_cases.py" \
   "$DSV41/build/portable/forward/pypto_lib_latest" \
   "$DSV41/build/prepared/capture/pypto_lib_latest" \
-  "$DSV41/build/new-cases" --flavor pypto_lib_latest \
-  --pypto-lib-root /path/to/pypto-lib-dev-hbg
+  "$DSV41/build/new-cases" --flavor pypto_lib_latest
 ```
 
 Before running an exported local bundle, materialize its inputs and reference:

@@ -1,0 +1,525 @@
+{
+  "schema": 1,
+  "execution": "native_moe_host_control",
+  "platform": "a5",
+  "origin": "hw-native-sys/pypto-lib dev/hbg@a6a9a2d49047ce67a85857c6b15f9604a7287714 native l2_moe",
+  "entry_signature": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    2,
+    2,
+    3,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    2,
+    1,
+    1
+  ],
+  "kernels": [
+    {
+      "func_id": 0,
+      "name": "_hc_collapse",
+      "source": "../pypto_lib_latest/vendor/external/hc_collapse.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        1,
+        1,
+        1,
+        2,
+        2
+      ],
+      "original_sha256": "43861b58ecf6c6beaf1730d8a082d5326ee5af92cdb506e468befff76d35785e"
+    },
+    {
+      "func_id": 1,
+      "name": "hc_rms",
+      "source": "vendor/hc_rms.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        2,
+        1
+      ],
+      "original_sha256": "0b5890e4897d04c41c0f253aaddf692226b93931c18a24f3407969ab20583738"
+    },
+    {
+      "func_id": 2,
+      "name": "_hc_linear",
+      "source": "../pypto_lib_latest/vendor/external/hc_linear.cpp",
+      "core_type": "aic",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        1,
+        1,
+        2
+      ],
+      "original_sha256": "37828a7401eb92c8665f47b193185271305b5b1c084298307b27b14daaecf568"
+    },
+    {
+      "func_id": 3,
+      "name": "_hc_sinkhorn",
+      "source": "../pypto_lib_latest/vendor/external/hc_sinkhorn.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2
+      ],
+      "original_sha256": "0a7c5186b87e5c9cf03b789b419a624705741cde8a67c5e4cd317516ce5f02f7"
+    },
+    {
+      "func_id": 4,
+      "name": "_gate_quant_vf",
+      "source": "../pypto_lib_latest/vendor/external/gate_quant_vf.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        1,
+        2,
+        2
+      ],
+      "original_sha256": "6ae154d1d333e38960cd27d25c38f142a06999645dadb73f1e3b5c05077f509a"
+    },
+    {
+      "func_id": 5,
+      "name": "gate_projection_input",
+      "source": "vendor/gate_projection_input.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        2,
+        1
+      ],
+      "original_sha256": "718538ae881d9ccca5bbaa59f9a65793b150bc6273b48555cb598bee45e060b8"
+    },
+    {
+      "func_id": 6,
+      "name": "gate_projection_weight",
+      "source": "vendor/gate_projection_weight.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        2,
+        1
+      ],
+      "original_sha256": "54a48e34ed30d5318dce20f032ee5763cbdac93b6f21179c80dd5c6422c6fb0c"
+    },
+    {
+      "func_id": 7,
+      "name": "_gate_pre_route_vf",
+      "source": "../pypto_lib_latest/vendor/external/gate_pre_route_vf.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        2,
+        2,
+        2
+      ],
+      "original_sha256": "2152658c289bff2220a5aa2d63c39bbef0e230f8a23219c81558611b598cf256"
+    },
+    {
+      "func_id": 8,
+      "name": "_gate_scores_vf_aic",
+      "source": "../pypto_lib_latest/vendor/external/gate_scores_vf.cpp",
+      "core_type": "aic",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        1,
+        1,
+        1,
+        2,
+        3
+      ],
+      "original_sha256": "31d303a5def2712c80f73908e1144fb448f1cad860ef8855c5be030732018bbf"
+    },
+    {
+      "func_id": 9,
+      "name": "_gate_scores_vf_aiv",
+      "source": "../pypto_lib_latest/vendor/external/gate_scores_vf.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        1,
+        1,
+        1,
+        2,
+        3
+      ],
+      "original_sha256": "31d303a5def2712c80f73908e1144fb448f1cad860ef8855c5be030732018bbf"
+    },
+    {
+      "func_id": 10,
+      "name": "_gate_route_sort_vf",
+      "source": "../pypto_lib_latest/vendor/external/gate_route_sort_vf.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        1,
+        1,
+        3,
+        3
+      ],
+      "original_sha256": "d84878226c10f99adc8bfbb7d6c13a90a2ca30b1cacb2a175e67191c92deb1b2"
+    },
+    {
+      "func_id": 11,
+      "name": "_shared_w13_mm",
+      "source": "../pypto_lib_latest/vendor/external/expert_shared_w13.cpp",
+      "core_type": "aic",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2
+      ],
+      "original_sha256": "5005ffe4b80bf22fda86f2e66d128cd2b823e2af5a7d4ddef5bc1d049f7f6509"
+    },
+    {
+      "func_id": 12,
+      "name": "_shared_swiglu_vf",
+      "source": "../pypto_lib_latest/vendor/external/expert_shared_swiglu.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        1,
+        2,
+        2
+      ],
+      "original_sha256": "7e31b127c5e385b0faac941e03d4f19983237aab3bfa6144d78d99033b9df68d"
+    },
+    {
+      "func_id": 13,
+      "name": "sh_w2_mm",
+      "source": "vendor/sh_w2_mm.cpp",
+      "core_type": "aic",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "original_sha256": "4f8e1ed14ad178c519bd460fbf8f3c42852f985e39e99269d2324645489a9203"
+    },
+    {
+      "func_id": 14,
+      "name": "dispatch_push",
+      "source": "vendor/dispatch_push.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2
+      ],
+      "original_sha256": "94b08605c01943a66dcf3fb7153f208179fb971e30ece455c8cc4bfdd0cf366d"
+    },
+    {
+      "func_id": 15,
+      "name": "combine_notify",
+      "source": "vendor/combine_notify.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        2
+      ],
+      "original_sha256": "61357b7092f607b7c15c55fba5f502419db943ca058d3883215f83c8f2064546"
+    },
+    {
+      "func_id": 16,
+      "name": "combine_wait",
+      "source": "vendor/combine_wait.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        3
+      ],
+      "original_sha256": "d212af4fa5d49c889dee32c22b8ab4ba14d1a6044ed802bcdf12986953e031fc"
+    },
+    {
+      "func_id": 17,
+      "name": "dispatch_gather",
+      "source": "vendor/dispatch_gather.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        2,
+        3,
+        2,
+        1,
+        2,
+        2,
+        2,
+        1,
+        1,
+        1,
+        2,
+        2
+      ],
+      "original_sha256": "5f7923ba97abd88c37b30e4642e7ec722c6ee79190af67195e05bb8443d2c5f9"
+    },
+    {
+      "func_id": 18,
+      "name": "_routed_w13_aic",
+      "source": "../pypto_lib_latest/vendor/external/expert_routed_w13.cpp",
+      "core_type": "aic",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        1,
+        2
+      ],
+      "original_sha256": "9643c47e88f8749ab185dd8373efa7657fbde891fb22b6c2c6410909b3800213"
+    },
+    {
+      "func_id": 19,
+      "name": "_routed_w13_aiv",
+      "source": "../pypto_lib_latest/vendor/external/expert_routed_w13.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        2,
+        1,
+        2
+      ],
+      "original_sha256": "9643c47e88f8749ab185dd8373efa7657fbde891fb22b6c2c6410909b3800213"
+    },
+    {
+      "func_id": 20,
+      "name": "_routed_swiglu_quant",
+      "source": "../pypto_lib_latest/vendor/external/expert_routed_swiglu.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        1,
+        1,
+        1,
+        2,
+        2
+      ],
+      "original_sha256": "01959e6e30a5d37e68d7492fffc36bf5e58282530140758fc59c60af50d8fb5a"
+    },
+    {
+      "func_id": 21,
+      "name": "_routed_w2_aic",
+      "source": "../pypto_lib_latest/vendor/external/expert_routed_w2.cpp",
+      "core_type": "aic",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        2
+      ],
+      "original_sha256": "4a8bc037f68c82c0f049626525094dfe2e2c439272d0d932b8d559dcffd2ef1c"
+    },
+    {
+      "func_id": 22,
+      "name": "_routed_w2_aiv",
+      "source": "../pypto_lib_latest/vendor/external/expert_routed_w2.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        2
+      ],
+      "original_sha256": "4a8bc037f68c82c0f049626525094dfe2e2c439272d0d932b8d559dcffd2ef1c"
+    },
+    {
+      "func_id": 23,
+      "name": "ffn_scatter",
+      "source": "vendor/ffn_scatter.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        2
+      ],
+      "original_sha256": "f3912aed55b9b8b016b8d7063bd6a0f3a77a98fe7e4c01ed981f4c87e3f69660"
+    },
+    {
+      "func_id": 24,
+      "name": "combine_reduce",
+      "source": "vendor/combine_reduce.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        2,
+        1,
+        1
+      ],
+      "original_sha256": "059fca31a19b8f3756e7be16a186e6ea25e1c83431b150758f113ede74c87262"
+    },
+    {
+      "func_id": 25,
+      "name": "_hc_post",
+      "source": "../pypto_lib_latest/vendor/external/hc_post.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        1,
+        1,
+        1,
+        1,
+        3
+      ],
+      "original_sha256": "7a411307ec9c7e0b40eabb0cb254c83f96a2f34586a2e60c8a1be75f4cc811ce"
+    },
+    {
+      "func_id": 26,
+      "name": "moe_signal_clear",
+      "source": "vendor/moe_signal_clear.cpp",
+      "core_type": "aiv",
+      "include_dirs": [
+        "vendor",
+        "../pypto_lib_latest/vendor/external"
+      ],
+      "signature": [
+        3,
+        3,
+        3
+      ],
+      "original_sha256": "c5d8f7709597c7252dcb5c76e00fe7c417d0d45cc8c4a1ce0eac8988ebabcc91"
+    }
+  ]
+}
