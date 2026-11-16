@@ -49,13 +49,12 @@ namespace simpler::hbg {
  *
  *   RESOLUTION-THREAD OUTER: ResolveStandalone, AsyncPoll and Dummy. This runtime hands
  *   completed slots from Scheduler threads to a dedicated resolution thread, so these
- *   are standalone bars rather than nested ones. Resolve is the AICore completion walk.
+ *   are standalone bars rather than nested ones.
  *
- *   AICORE SCHEDULER: Bootstrap, StateProbe, Refill and Idle, plus Dispatch,
- *   Complete and Resolve. These come from the scheduler running on an AICore rather
- *   than the AICPU. Idle is a measured record here — that scheduler publishes a
- *   SchedulerIdleRecord per spin — not the host-side gap reconstruction a report
- *   derives for an AICPU capture.
+ *   AICORE SCHEDULER: Bootstrap, StateProbe and Idle, plus Dispatch and Complete.
+ *   These records come from the scheduler running on an AICore rather than the
+ *   AICPU. Idle is a measured SchedulerIdleRecord per spin, rather than the
+ *   host-side gap reconstruction used for an AICPU capture.
  */
 enum class SchedPhaseKind : uint8_t {
     Complete = 0,            // Observe FINs and run completion work inline.
@@ -66,8 +65,6 @@ enum class SchedPhaseKind : uint8_t {
                              // tasks_processed = dummy tasks consumed.
     EarlyDispatch = 3,       // Pre-stage a flagged producer's gated consumers.
                              // tasks_processed = blocks staged.
-    Resolve = 4,             // Completion work after FIN observation.
-                             // tasks_processed = consumers visited.
     Drain = 5,               // sync_start stop-the-world drain attempt.
     DrainPrepare = 6,        // Nested sync_start staging prepare pass.
                              // tasks_processed = subtasks prepared.
@@ -82,29 +79,22 @@ enum class SchedPhaseKind : uint8_t {
     Bootstrap = 11,          // AICore scheduler bring-up.
                              // tasks_processed = tasks held at bootstrap.
     StateProbe = 12,         // Scheduler-local Dispatch Slot / Ready state read.
-    Refill = 14,             // Completed Slot reuse.
     Idle = 15,               // AICore scheduler spin with no progress.
     ScalarWindow = 16,
     ScalarCompletions = 18,
     ScalarGraphControl = 19,
-    ScalarFillSlots = 20,
     ScalarAdmission = 21,
     ScalarExecutorScan = 22,
     ScalarPrepare = 23,
     ScalarSeal = 24,
-    ScalarPublishCompletion = 25,
     ScalarAsyncService = 26,
-    ScalarBackoff = 27,
-    ScalarReadyClaim = 29,
     ScalarPayload = 30,
-    ScalarResolve = 31,
     ScalarMix = 32,
     ScalarAsyncCheck = 33,
     ScalarAsyncFinish = 34,
     ScalarBootstrap = 35,
     ScalarLaunchWait = 36,
     ScalarExitDrain = 37,
-    ScalarAtomicClaim = 38,
     ScalarCacheObserve = 39,
     ScalarCachePublish = 40,
     ScalarOrderedFill = 42,
@@ -123,24 +113,19 @@ enum class SchedPhaseKind : uint8_t {
     ScalarDispatchMetadata = 57,
     ScalarDispatchFill = 58,
     ScalarDispatchPublish = 59,
-    ScalarInlineComplete = 60,
     ScalarCursorValidate = 61,
     ScalarClaimSealProbe = 62,
     ScalarClaimSealConfirm = 63,
     ScalarNextBlockProbe = 64,
     ScalarNextBlockConfirm = 65,
     ScalarPollLocalState = 66,
-    ScalarPollReadyQueue = 67,
-    ScalarPollReadyPool = 68,
     ScalarPollAdmissionTail = 70,
     ScalarPollMixState = 71,
     ScalarPollMixCloseSeal = 72,
     ScalarPollMixAssignment = 73,
     ScalarPollMixArrived = 74,
     ScalarPollMixReleased = 75,
-    ScalarAtomicLoad = 79,
     ScalarAtomicCas = 80,
-    ScalarAtomicExchange = 81,
     ScalarAtomicStoreIssue = 82,
     ScalarAtomicFetchAdd = 83,
     ScalarAtomicFetchAddIssue = 84,
@@ -154,7 +139,6 @@ enum class SchedPhaseKind : uint8_t {
     ScalarTraceFinish = 92,
     ScalarTraceFinishClean = 93,
     ScalarTraceFinishBarrier = 94,
-    ScalarEarlyPrepare = 95,
     ScalarClusterPrepare = 96,
     ScalarExecutionTokenProgress = 97,
     ScalarExecutionTokenRefill = 98,
@@ -212,8 +196,6 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "dummy";
     case SchedPhaseKind::EarlyDispatch:
         return "early_dispatch";
-    case SchedPhaseKind::Resolve:
-        return "resolve";
     case SchedPhaseKind::Drain:
         return "drain";
     case SchedPhaseKind::DrainPrepare:
@@ -230,8 +212,6 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "bootstrap";
     case SchedPhaseKind::StateProbe:
         return "state_probe";
-    case SchedPhaseKind::Refill:
-        return "refill";
     case SchedPhaseKind::Idle:
         return "idle";
     case SchedPhaseKind::ScalarWindow:
@@ -240,8 +220,6 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_completions";
     case SchedPhaseKind::ScalarGraphControl:
         return "scalar_graph_control";
-    case SchedPhaseKind::ScalarFillSlots:
-        return "scalar_fill_slots";
     case SchedPhaseKind::ScalarAdmission:
         return "scalar_admission";
     case SchedPhaseKind::ScalarExecutorScan:
@@ -250,18 +228,10 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_prepare";
     case SchedPhaseKind::ScalarSeal:
         return "scalar_seal";
-    case SchedPhaseKind::ScalarPublishCompletion:
-        return "scalar_publish_completion";
     case SchedPhaseKind::ScalarAsyncService:
         return "scalar_async_service";
-    case SchedPhaseKind::ScalarBackoff:
-        return "scalar_backoff";
-    case SchedPhaseKind::ScalarReadyClaim:
-        return "scalar_ready_claim";
     case SchedPhaseKind::ScalarPayload:
         return "scalar_payload";
-    case SchedPhaseKind::ScalarResolve:
-        return "scalar_resolve";
     case SchedPhaseKind::ScalarMix:
         return "scalar_mix";
     case SchedPhaseKind::ScalarAsyncCheck:
@@ -280,8 +250,6 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_launch_wait";
     case SchedPhaseKind::ScalarExitDrain:
         return "scalar_exit_drain";
-    case SchedPhaseKind::ScalarAtomicClaim:
-        return "scalar_atomic_claim";
     case SchedPhaseKind::ScalarCacheObserve:
         return "scalar_cache_observe";
     case SchedPhaseKind::ScalarCachePublish:
@@ -318,8 +286,6 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_dispatch_fill";
     case SchedPhaseKind::ScalarDispatchPublish:
         return "scalar_dispatch_publish";
-    case SchedPhaseKind::ScalarInlineComplete:
-        return "scalar_inline_complete";
     case SchedPhaseKind::ScalarCursorValidate:
         return "scalar_cursor_validate";
     case SchedPhaseKind::ScalarClaimSealProbe:
@@ -332,10 +298,6 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_next_block_confirm";
     case SchedPhaseKind::ScalarPollLocalState:
         return "scalar_poll_local_state";
-    case SchedPhaseKind::ScalarPollReadyQueue:
-        return "scalar_poll_ready_queue";
-    case SchedPhaseKind::ScalarPollReadyPool:
-        return "scalar_poll_ready_pool";
     case SchedPhaseKind::ScalarPollAdmissionTail:
         return "scalar_poll_admission_tail";
     case SchedPhaseKind::ScalarPollMixState:
@@ -348,12 +310,8 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_poll_mix_arrived";
     case SchedPhaseKind::ScalarPollMixReleased:
         return "scalar_poll_mix_released";
-    case SchedPhaseKind::ScalarAtomicLoad:
-        return "scalar_atomic_load";
     case SchedPhaseKind::ScalarAtomicCas:
         return "scalar_atomic_cas";
-    case SchedPhaseKind::ScalarAtomicExchange:
-        return "scalar_atomic_exchange";
     case SchedPhaseKind::ScalarAtomicStoreIssue:
         return "scalar_atomic_store_issue";
     case SchedPhaseKind::ScalarAtomicFetchAdd:
@@ -380,8 +338,6 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_trace_finish_clean";
     case SchedPhaseKind::ScalarTraceFinishBarrier:
         return "scalar_trace_finish_barrier";
-    case SchedPhaseKind::ScalarEarlyPrepare:
-        return "scalar_early_prepare";
     case SchedPhaseKind::ScalarClusterPrepare:
         return "scalar_cluster_prepare";
     case SchedPhaseKind::ScalarExecutionTokenProgress:

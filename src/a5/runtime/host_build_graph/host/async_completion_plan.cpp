@@ -112,12 +112,13 @@ bool plan_async_completion(
         !reserve_array<SchedulerAsyncLease>(&cursor, layout.async_task_count, &layout.finish_leases_offset))
         return reject(error, "deferred control storage overflows");
     for (auto &task : next.tasks) {
+        uint32_t block_entry_bytes = 0;
         for (uint32_t lane = 0; lane < 3; ++lane) {
             if (task.data.async_mask.has(static_cast<SubtaskSlot>(lane)))
-                task.block_entry_bytes += async_group_entry_bytes(task.capacities[lane]);
+                block_entry_bytes += async_group_entry_bytes(task.capacities[lane]);
         }
         uint64_t task_entry_bytes = 0;
-        if (!scheduler_layout_checked_mul(task.data.block_count, task.block_entry_bytes, &task_entry_bytes) ||
+        if (!scheduler_layout_checked_mul(task.data.block_count, block_entry_bytes, &task_entry_bytes) ||
             !scheduler_layout_reserve(&cursor, task_entry_bytes, ASYNC_RECORD_ALIGNMENT, &task.entries_offset))
             return reject(error, "async publication storage overflows");
     }

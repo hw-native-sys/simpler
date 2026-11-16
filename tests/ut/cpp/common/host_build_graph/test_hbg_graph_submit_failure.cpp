@@ -135,10 +135,10 @@ TEST_F(HbgGraphSubmitFailureTest, InFlightGraphInvocationsReserveHeapOnlyAtCommi
     const auto *first_end = static_cast<const char *>(first_upload->outer_slot->to_descriptor().packed_buffer_end);
     const auto *second_base = static_cast<const char *>(second_upload->outer_slot->to_descriptor().packed_buffer_base);
     const auto *second_end = static_cast<const char *>(second_upload->outer_slot->to_descriptor().packed_buffer_end);
-    const GraphHostImageList definitions = graph_host_definitions(*graph_state);
-    ASSERT_EQ(definitions.entries.size(), 1u);
-    ASSERT_EQ(definitions.entries[0].graph_key, first_upload->graph_key);
-    const Graph *definition = definition_image(definitions.entries[0]);
+    const std::vector<GraphHostImage> definitions = graph_host_definitions(*graph_state);
+    ASSERT_EQ(definitions.size(), 1u);
+    ASSERT_EQ(definitions[0].graph_key, first_upload->graph_key);
+    const Graph *definition = definition_image(definitions[0]);
     const uint64_t expected_extent =
         CHIP_ALIGN_UP(definition->required_heap + definition->execution_storage_bytes, CHIP_ALIGN_SIZE);
     EXPECT_EQ(static_cast<uint64_t>(first_end - first_base), expected_extent);
@@ -245,9 +245,9 @@ TEST_F(HbgGraphSubmitFailureTest, WorkerRecordsWhileMainThreadSubmitsSameHashShe
     ASSERT_FALSE(orch.is_fatal());
     ASSERT_EQ(graph_host_upload_count(*graph_state), 3u);
 
-    const GraphHostImageList definitions = graph_host_definitions(*graph_state);
-    ASSERT_EQ(definitions.entries.size(), 1u);
-    const Graph *definition = definition_image(definitions.entries[0]);
+    const std::vector<GraphHostImage> definitions = graph_host_definitions(*graph_state);
+    ASSERT_EQ(definitions.size(), 1u);
+    const Graph *definition = definition_image(definitions[0]);
     const uint64_t expected_extent =
         CHIP_ALIGN_UP(definition->required_heap + definition->execution_storage_bytes, CHIP_ALIGN_SIZE);
 
@@ -377,7 +377,7 @@ TEST_F(HbgGraphSubmitFailureTest, AFatalDuringRecordingRetiresTheEntryAndFreesTh
     EXPECT_TRUE(orch.is_fatal());
     EXPECT_EQ(orch.fatal_code.load(std::memory_order_acquire), SIMPLER_ERROR_EXPLICIT_ORCH_FATAL)
         << "first-writer-wins: commit's own SIMPLER_ERROR_INVALID_ARGS must not displace the body's code";
-    EXPECT_EQ(graph_host_definitions(*graph_state).entries.size(), 0u) << "no Definition may be published";
+    EXPECT_EQ(graph_host_definitions(*graph_state).size(), 0u) << "no Definition may be published";
 }
 
 // The ordinary path reports SIMPLER_ERROR_INVALID_ARGS for an auto scope opened
@@ -1049,7 +1049,7 @@ TEST_F(HbgGraphSubmitFailureTest, RecordsAGraphWhoseBoundaryLivesInTheHeapWindow
     const uint64_t nbytes = storage.size() * sizeof(uint32_t);
 
     auto record_with = [&](void *boundary_addr, uint64_t graph_key) -> std::optional<BoundaryRecording> {
-        const size_t definitions_before = graph_host_definitions(*graph_state).entries.size();
+        const size_t definitions_before = graph_host_definitions(*graph_state).size();
         const size_t uploads_before = graph_host_upload_count(*graph_state);
         simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(boundary_addr, shape, 1);
         GraphTaskArgs boundary_args;
@@ -1073,10 +1073,10 @@ TEST_F(HbgGraphSubmitFailureTest, RecordsAGraphWhoseBoundaryLivesInTheHeapWindow
         // and appends exactly one upload. That upload names this call's graph_key,
         // which is how the Definition is selected: graph_host_definitions walks an
         // unordered_map, so the order of `entries` says nothing about which call published which.
-        const GraphHostImageList definitions = graph_host_definitions(*graph_state);
-        if (definitions.entries.size() != definitions_before + 1) {
-            ADD_FAILURE() << "graph_key " << graph_key << " published "
-                          << (definitions.entries.size() - definitions_before) << " Definitions, expected 1";
+        const std::vector<GraphHostImage> definitions = graph_host_definitions(*graph_state);
+        if (definitions.size() != definitions_before + 1) {
+            ADD_FAILURE() << "graph_key " << graph_key << " published " << (definitions.size() - definitions_before)
+                          << " Definitions, expected 1";
             return std::nullopt;
         }
         if (graph_host_upload_count(*graph_state) != uploads_before + 1) {
@@ -1090,7 +1090,7 @@ TEST_F(HbgGraphSubmitFailureTest, RecordsAGraphWhoseBoundaryLivesInTheHeapWindow
             return std::nullopt;
         }
         const GraphHostImage *published = nullptr;
-        for (const GraphHostImage &entry : definitions.entries) {
+        for (const GraphHostImage &entry : definitions) {
             if (entry.graph_key == upload->graph_key) {
                 published = &entry;
                 break;

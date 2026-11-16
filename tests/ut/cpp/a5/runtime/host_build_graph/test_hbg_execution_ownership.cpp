@@ -45,7 +45,7 @@ struct OwnershipFixture {
 
     void *base() { return bytes.data(); }
     SchedulerPreparedControl *control() { return scheduler_prepared_control_at(base(), prepared, 0); }
-    PreparedAccessResult claim(uint32_t worker, SchedulerPreparedHandle *handle) {
+    bool claim(uint32_t worker, SchedulerPreparedHandle *handle) {
         return scheduler_acquire_execution_token(base(), prepared, worker, 0, 0, 0, handle);
     }
 };
@@ -53,21 +53,35 @@ struct OwnershipFixture {
 TEST(HbgExecutionOwnership, FreshTicketCannotBeConsumedTwiceAndBindingIsReceived) {
     OwnershipFixture fixture;
     SchedulerPreparedHandle first{}, duplicate{};
-    ASSERT_EQ(fixture.claim(0, &first), PreparedAccessResult::READY);
-    EXPECT_NE(first.claimed_state & SCHEDULER_PREPARED_BINDING_READY, 0u);
-    EXPECT_EQ(scheduler_prepared_generation(first.claimed_state), 0u);
-    EXPECT_EQ(fixture.claim(1, &duplicate), PreparedAccessResult::ERROR);
+    ASSERT_TRUE(fixture.claim(0, &first));
+    EXPECT_EQ(first.claimed_state, scheduler_prepared_state(SchedulerPreparedPhase::CLAIMED, 0));
+    EXPECT_FALSE(fixture.claim(1, &duplicate));
     EXPECT_EQ(duplicate.claimed_state, 0u);
     EXPECT_EQ(fixture.control()->state, first.claimed_state);
+    const auto &call = *scheduler_prepared_call_at(fixture.base(), fixture.prepared, 0);
+    const auto &plan = *scheduler_state_at<SchedulerExecutionPlan>(fixture.base(), fixture.prepared->plans_offset);
+    const uint64_t completed = scheduler_completion_completed_state(1);
+    ASSERT_TRUE(
+        scheduler_prepared_retirement_inferred(first.claimed_state, *fixture.prepared, 0, call, plan, completed)
+    );
+    for (uint32_t bit : {24u, 32u, 63u}) {
+        SchedulerPreparedHandle malformed = first;
+        malformed.claimed_state |= UINT64_C(1) << bit;
+        EXPECT_FALSE(fixture.claim(0, &malformed));
+        EXPECT_FALSE(
+            scheduler_prepared_retirement_inferred(malformed.claimed_state, *fixture.prepared, 0, call, plan, completed)
+        );
+        EXPECT_EQ(fixture.control()->state, first.claimed_state);
+    }
     EXPECT_TRUE(scheduler_return_prepared_execution(fixture.base(), fixture.prepared, &first));
-    EXPECT_EQ(fixture.claim(0, &duplicate), PreparedAccessResult::ERROR);
+    EXPECT_FALSE(fixture.claim(0, &duplicate));
 }
 
 TEST(HbgExecutionOwnership, InvalidCallFailsClosedAfterClaim) {
     OwnershipFixture fixture;
     scheduler_prepared_call_at(fixture.base(), fixture.prepared, 0)->run_epoch = 18;
     SchedulerPreparedHandle owner{};
-    EXPECT_EQ(fixture.claim(0, &owner), PreparedAccessResult::ERROR);
+    EXPECT_FALSE(fixture.claim(0, &owner));
     EXPECT_EQ(scheduler_prepared_phase(fixture.control()->state), SchedulerPreparedPhase::FAILED);
     EXPECT_FALSE(scheduler_return_prepared_execution(fixture.base(), fixture.prepared, &owner));
 }
@@ -75,7 +89,7 @@ TEST(HbgExecutionOwnership, InvalidCallFailsClosedAfterClaim) {
 TEST(HbgExecutionOwnership, OnlyTheFixedOwnerCanCancelAnUnstartedExecution) {
     OwnershipFixture fixture;
     SchedulerPreparedHandle owner{}, duplicate{};
-    ASSERT_EQ(fixture.claim(0, &owner), PreparedAccessResult::READY);
+    ASSERT_TRUE(fixture.claim(0, &owner));
     const auto stale = owner;
     EXPECT_FALSE(scheduler_fail_prepared_execution(fixture.base(), fixture.prepared, 1, &owner));
     EXPECT_EQ(fixture.control()->state, stale.claimed_state);
@@ -84,7 +98,7 @@ TEST(HbgExecutionOwnership, OnlyTheFixedOwnerCanCancelAnUnstartedExecution) {
     EXPECT_EQ(scheduler_prepared_phase(fixture.control()->state), SchedulerPreparedPhase::FAILED);
     auto returned = stale;
     EXPECT_FALSE(scheduler_return_prepared_execution(fixture.base(), fixture.prepared, &returned));
-    EXPECT_EQ(fixture.claim(1, &duplicate), PreparedAccessResult::ERROR);
+    EXPECT_FALSE(fixture.claim(1, &duplicate));
 }
 
 struct RefillFixture {
@@ -115,10 +129,7 @@ struct RefillFixture {
     void reserve(uint32_t task, uint32_t worker, SchedulerPreparedHandle *handle) {
         const uint64_t block = scheduler_gm_fetch_add(control(task)->next_block, UINT64_C(1));
         ASSERT_LT(block, storage.metadata[task].logical_block_num);
-        ASSERT_EQ(
-            scheduler_acquire_execution_token(base(), local->config.prepared, worker, task, block, 0, handle),
-            PreparedAccessResult::READY
-        );
+        ASSERT_TRUE(scheduler_acquire_execution_token(base(), local->config.prepared, worker, task, block, 0, handle));
         ASSERT_TRUE(scheduler_close_ordinary_supply(
             graph.graph(), base(), storage.local_context(&storage.contexts[worker]), storage.run_control, task,
             static_cast<uint32_t>(block), storage.metadata[task].logical_block_num

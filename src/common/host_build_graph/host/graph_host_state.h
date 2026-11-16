@@ -64,10 +64,6 @@ struct GraphHostImage {
     size_t bytes;
 };
 
-struct GraphHostImageList {
-    std::vector<GraphHostImage> entries;
-};
-
 struct GraphPendingUpload {
     ChipTaskSlotState *outer_slot{nullptr};
     uint64_t graph_key{0};
@@ -209,4 +205,4 @@ size_t graph_host_upload_count(const GraphHostState &state);
 // length of the region an upload must ship for the objects built in place.
 size_t graph_host_arena_used(const GraphHostState &state);
 std::optional<GraphHostUpload> graph_host_upload(GraphHostState &state, size_t index);
-GraphHostImageList graph_host_definitions(GraphHostState &state);
+std::vector<GraphHostImage> graph_host_definitions(GraphHostState &state);

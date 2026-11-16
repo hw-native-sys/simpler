@@ -51,9 +51,6 @@ bool native_graph_plan_nodes(
     const std::vector<uint32_t> &definition_indices, NativeGraphHostPlan *plan, std::string *error
 );
 
-// Validate device-wide barriers against the launched worker population.
-bool native_graph_plan_worker_capacity(const NativeGraphHostPlan &plan, uint64_t workers, std::string *error);
-
 struct NativeGraphReadonlyImage {
     std::vector<std::byte> bytes;
     uint64_t header_offset{0};

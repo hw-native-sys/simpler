@@ -393,11 +393,11 @@ A5 模拟器读取 Host 对象中的 `resolved_addr()`。A2/A3、TMR 和公共 R
 - 有效票立即保存到 token，Claim/acquire 重试不重新取票；只有越过 block 上界的超额票可以按既有合同退款。
 - Host 已发布、初次唯一票上的 Claim 失配是错误或已确认的终态取消，不是普通竞争落败。
 - `next_block >= block_num` 只证明新票已经发完，不证明 kernel 完成。已领取单元仍由各自 owner 等待、执行与退休，发票耗尽不得提前结束运行。
-- 静态初态由通用计划生成并校验 run、单元范围及布局版本，Device 不预读可变 cell 来猜初态，不提前读取未获许可的 payload。
+- 静态初态由通用计划生成并校验 run、单元范围及区段边界，Device 不预读可变 cell 来猜初态，不提前读取未获许可的 payload。
 
 ### 四 token 是有界前视，不是四份物理资源预约
 
-每 worker 初始设置 4 个普通执行 token，包含 current/inflight；同核最多一个同步 kernel 在执行，其余槽可保存其他任务尚未执行的具体单元。同一普通 SPMD 任务不能同时占用两个位置。token 保存身份、Call/Binding 指针、执行票/owner generation、已确认 fanin 前缀和私有阶段，不复制四份 512B 参数包。
+每 worker 初始设置 4 个普通执行 token，包含 current/inflight；同核最多一个同步 kernel 在执行，其余槽可保存其他任务尚未执行的具体单元。同一普通 SPMD 任务不能同时占用两个位置。token 保存身份、Call/Binding 指针、执行票/固定 owner、已确认 fanin 前缀和私有阶段，不复制四份 512B 参数包。
 
 token 与现有两个 dispatch slot 分开。slot 可继续承载当前执行、协作责任和 DFX 身份，但普通 pending 不要求先占据物理 slot。不能通过把 `SCHEDULER_PENDING_SLOT_COUNT` 从 2 改成 4 来代替此协议。具体存储选型以小型 owner-private 状态为准，不将 128B GM 对齐传播到局部栈对象。
 
@@ -409,7 +409,6 @@ token 与现有两个 dispatch slot 分开。slot 可继续承载当前执行、
 | ---------- | ---------- | ---------- |
 | EMPTY | 无 | 可以接收新票 |
 | TICKETED | 具体单元的唯一新票；尚未完成 Claim | 不可执行、不可遗忘；有限步完成 Claim 或终态处理 |
-| ACQUIRING | 已有唯一执行权，正在观察只读 Call/固定定位信息 | 原核完成接收，不得改变 executor |
 | WAIT_FANIN | 单元已领取并接收；依赖或 Graph 激活尚未齐全 | 保留原位置，检查本核其他 token |
 | ELIGIBLE | 已满足当前观察到的条件，尚待最终资源/动态许可 | 满足最终许可才进入；不把此状态视为永久许可 |
 | INFLIGHT | 实际调用已经开始 | 只能由原核返回、记账并退休，不可提前回收 |

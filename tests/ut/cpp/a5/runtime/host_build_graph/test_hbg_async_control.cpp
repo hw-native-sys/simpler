@@ -124,12 +124,9 @@ struct AsyncFixture {
         auto *state = local(worker);
         auto &slot = state->slots[0];
         ASSERT_EQ(scheduler_gm_fetch_add(task_control(slot.task_ref)->next_block, UINT64_C(1)), slot.block_idx);
-        ASSERT_EQ(
-            scheduler_acquire_execution_token(
-                base(), state->config.prepared, worker, slot.task_ref, slot.block_idx, slot.subtask_slot, &slot.prepared
-            ),
-            PreparedAccessResult::READY
-        );
+        ASSERT_TRUE(scheduler_acquire_execution_token(
+            base(), state->config.prepared, worker, slot.task_ref, slot.block_idx, slot.subtask_slot, &slot.prepared
+        ));
         ASSERT_TRUE(scheduler_close_ordinary_supply(
             graph.graph(), base(), state, storage.run_control, slot.task_ref, slot.block_idx,
             storage.metadata[slot.task_ref].logical_block_num

@@ -62,7 +62,7 @@ Graph 本身不建立新的资源顺序域，一个 cohort 也不扩大为整个
 | ------ | -------- |
 | ref 与公共身份分离 | expanded node 连续编号；统一访问器恢复 shell/local TaskId |
 | fanin 完整且无环 | Host 验证原始边、边界与 producer_ref < consumer_ref；设备确认 canonical gate |
-| 每个真实执行有唯一 owner | block ticket 与 Call control 的 phase/owner/generation CAS |
+| 每个真实执行有唯一 owner | block ticket 与 Call control 的 phase/固定 owner CAS |
 | 控制进展不依赖 kernel 空槽 | bootstrap scan gate 后的独立有界控制扫描 |
 | 参数稳定至 execution 退休 | Host 唯一写者；Call/Binding 不随 slot 复用；consumer 独立观察业务输入 |
 | 逻辑 DONE 等待真实 compute 和 async | canonical total/remaining/debt 的合法零状态 |

@@ -32,22 +32,6 @@
 #include "scheduler/scheduler_completion.h"
 
 namespace {
-TEST(NativeGraphPlanTest, SyncStartRequiresDistinctExecutionPositions) {
-    NativeGraphHostPlan plan;
-    plan.definitions.resize(1);
-    auto &definition = plan.definitions[0];
-    definition.children.resize(1);
-    auto &metadata = definition.children[0].metadata;
-    metadata.active_mask = LaneMask::all();
-    metadata.logical_block_num = 2;
-    metadata.flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_MIX | SCHEDULER_TASK_SPMD | SCHEDULER_TASK_SYNC_START;
-    std::string error;
-    EXPECT_FALSE(native_graph_plan_worker_capacity(plan, 3, &error));
-    EXPECT_TRUE(native_graph_plan_worker_capacity(plan, 6, &error)) << error;
-    metadata.flags &= ~SCHEDULER_TASK_SYNC_START;
-    EXPECT_TRUE(native_graph_plan_worker_capacity(plan, 3, &error)) << error;
-}
-
 struct DefinitionFixture {
     Graph header{};
     std::vector<std::byte> bytes{sizeof(Graph)};
@@ -512,20 +496,20 @@ TEST(HbgNativeGraphPlan, AccessRevalidatesReusedBackingForEachRun) {
         ASSERT_TRUE(scheduler_native_node_checked(access, 1, &node));
         EXPECT_EQ(node.header->run_epoch, 1u);
         EXPECT_EQ(node.definition->task_count, static_cast<uint64_t>(body.header.task_count));
-        view.header().header_bytes = 0;
+        view.header().magic = 0;
         const SchedulerGraphAccess next(access);
         EXPECT_FALSE(scheduler_graph_view_valid(next));
-        view.header().header_bytes = sizeof(SchedulerNativeGraphHeader);
+        view.header().magic = SCHEDULER_NATIVE_GRAPH_MAGIC;
     }
     view.header().run_epoch = 2;
-    view.header().header_bytes = 0;
+    view.header().magic = 0;
     {
         const SchedulerGraphAccess access(view.graph);
         EXPECT_FALSE(scheduler_graph_view_valid(access));
         SchedulerNativeNode node{};
         EXPECT_FALSE(scheduler_native_node_checked(access, 1, &node));
     }
-    view.header().header_bytes = sizeof(SchedulerNativeGraphHeader);
+    view.header().magic = SCHEDULER_NATIVE_GRAPH_MAGIC;
     const uint64_t task_count = view.definition().task_count;
     view.definition().task_count = 0;
     {

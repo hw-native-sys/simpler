@@ -53,13 +53,13 @@ std::optional<GraphHostUpload> graph_host_upload(GraphHostState &state, size_t i
 
 size_t graph_host_arena_used(const GraphHostState &state) { return state.arena_cursor.load(std::memory_order_acquire); }
 
-GraphHostImageList graph_host_definitions(GraphHostState &state) {
-    GraphHostImageList list;
-    list.entries.reserve(state.definitions.size());
+std::vector<GraphHostImage> graph_host_definitions(GraphHostState &state) {
+    std::vector<GraphHostImage> list;
+    list.reserve(state.definitions.size());
     for (const auto &[key, record] : state.definitions) {
         if (graph_record_definition(state, record) == nullptr) continue;
         const bool spilled = record.object_offset == GRAPH_NO_OBJECT_OFFSET;
-        list.entries.push_back(
+        list.push_back(
             GraphHostImage{
                 key, record.object_offset, spilled ? record.spill.data() : nullptr,
                 spilled ? record.spill.size() : record.bytes

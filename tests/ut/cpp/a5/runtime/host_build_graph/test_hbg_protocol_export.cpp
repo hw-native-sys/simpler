@@ -58,7 +58,7 @@ TEST_F(ProtocolExportFixture, PreservesFrozenGraphAndHostCompletedNodeWithoutFab
     tasks[0].bottom_level = 2;
     const auto json = dump();
     EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol\""), std::string::npos);
-    EXPECT_NE(json.find("\"close_seal_stride\":64"), std::string::npos);
+    EXPECT_EQ(json.find("\"close_seal_stride\""), std::string::npos);
     EXPECT_NE(json.find("\"claim_tickets\":0"), std::string::npos);
     EXPECT_EQ(json.find("\"admission_claim_lock\""), std::string::npos);
     EXPECT_NE(json.find("\"block_num\":2"), std::string::npos);
@@ -233,7 +233,7 @@ TEST(ProtocolCloseSealExport, ReadsEveryClusterAndTaskValueWithoutInterpretingCe
     const std::array<std::array<uint64_t, 2>, 2> expected{{{17, 29}, {41, 53}}};
     for (uint32_t task = 0; task < 2; ++task) {
         auto *record = scheduler_state_at<SchedulerAdmissionRecord>(
-            storage.base(), layout.admission_records_offset + task * layout.admission_record_stride
+            storage.base(), layout.admission_records_offset + task * sizeof(SchedulerAdmissionRecord)
         );
         auto *cells = scheduler_state_at<SchedulerMixCloseSeal>(storage.base(), record->mix_close_seals_offset);
         for (uint32_t cluster = 0; cluster < 2; ++cluster) {
@@ -246,7 +246,7 @@ TEST(ProtocolCloseSealExport, ReadsEveryClusterAndTaskValueWithoutInterpretingCe
         return scheduler_export_protocol(storage.base(), layout.total_size, layout, 91, tasks);
     };
     const auto json = dump();
-    EXPECT_NE(json.find("\"close_seal_stride\":64"), std::string::npos);
+    EXPECT_EQ(json.find("\"close_seal_stride\""), std::string::npos);
     EXPECT_NE(json.find("\"close_seals\":[17,29]"), std::string::npos);
     EXPECT_NE(json.find("\"close_seals\":[41,53]"), std::string::npos);
     auto *record = scheduler_state_at<SchedulerAdmissionRecord>(storage.base(), layout.admission_records_offset);

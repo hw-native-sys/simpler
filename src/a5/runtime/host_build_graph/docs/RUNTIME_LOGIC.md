@@ -413,11 +413,14 @@ Tensor arguments are GM descriptor addresses; scalar arguments are value bits.
 LocalContext and GlobalContext on separate cache lines. Calls and bindings have
 execution lifetime, independently of the worker's two private dispatch slots.
 
-Each execution has a 128-byte atomic-control sector. Phase, owner and claim
-generation share one atomic state word. Fresh Calls start BUILT. A successful
+Each execution has a 128-byte atomic-control sector. Phase and fixed owner
+share one atomic state word. Fresh Calls start BUILT. A successful
 block ticket and BUILT-to-CLAIMED CAS grant one worker the execution token;
 Call acquisition observes and validates the immutable Call and binding. The
 claim alone grants no permission to consume business input data.
+Call acquisition completes in the same bounded invocation; it has no pending-build
+result or separate binding-ready bit. Cooperative preparation requires an explicit
+lane and rejects predicates; ordinary execution tokens retain predicate evaluation.
 
 The Host orders tasks by Kahn generation, descending bottom level, then stable
 node identity. The AIC/MIX and AIV catalogs project that order into two shared
@@ -427,7 +430,11 @@ must have supplied their blocks before the consumer can claim space. Data
 completion dependencies still gate execution independently of issuance order.
 
 A core has four execution-token positions and two 40-byte dispatch slots.
+Dispatch and protocol publication pass the existing core-local slot index directly;
+ownership remains in the prepared execution state.
 A token may remain WAIT_FANIN while caching a confirmed positive producer prefix.
+Its private phases are EMPTY, TICKETED and WAIT_FANIN; acquisition yields no
+intermediate phase to another scheduler iteration.
 It owns a concrete execution but occupies no business slot. Each core owns at
 most one ordinary block of the same task. A full token window retains all four
 responsibilities and revisits their dependencies; no other core can reclaim a
@@ -458,7 +465,7 @@ background discovery cannot displace an admitted participant or manufacture a
 release. Cluster signaling and cache publication remain part of group ownership.
 
 After the kernel returns, its async registration is sealed. The execution's
-control moves from CLAIMED to RETURNED under its owner/generation proof. The
+control moves from CLAIMED to RETURNED under its fixed-owner proof. The
 real physical return contributes once to the task's canonical completion gate;
 inactive MIX resource lanes contribute no execution. Trace/group retirement
 finishes under its existing ownership before the slot is safely reused.

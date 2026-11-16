@@ -305,7 +305,6 @@ static inline __aicore__ bool scheduler_complete_own_slot(
         completed_trace->ready_observe_cycles = executor_trace->ready_observe_cycles;
         if (schedule_timing_enabled) completed_trace->complete_start_cycles = completion_observe;
         if (phase_timing_enabled) {
-            completed_trace->complete_scheduler_worker_id = scheduler->worker_id();
             completed_trace->complete_loop_iter = scheduler->profiling->loop_iter;
         }
     } else if (completed_trace != nullptr) {

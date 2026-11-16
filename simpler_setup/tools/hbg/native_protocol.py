@@ -22,7 +22,7 @@ ROOT_NUMBERS = frozenset(
     """
 run_epoch task_count worker_count trace_count member_count cooperative_task_count
 cluster_count mix_task_count sync_mix_task_count expected_task_count inline_completed_count resolved_task_count
-close_seal_stride active_worker_count scheduler_error error_claimed commit_tail commit_lock
+active_worker_count scheduler_error error_claimed commit_tail commit_lock
 """.split()
 )
 ROOT_TABLES = frozenset(
@@ -163,8 +163,6 @@ def read_native_protocol(section):
         _error("unknown schema or producer")
     for field in root_numbers:
         _number(section[field], field)
-    if section["close_seal_stride"] != 64:
-        _error("close_seal_stride disagrees with the close-seal layout")
     error_numbers = ERROR_NUMBERS
     _object(section["first_error"], error_numbers, "first_error")
     for field in error_numbers:

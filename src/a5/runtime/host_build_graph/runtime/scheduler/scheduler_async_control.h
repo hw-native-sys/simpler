@@ -151,8 +151,8 @@ static inline __aicore__ bool settle_group(SchedulerAsyncLocalState &local, int6
     auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(local.base, local.layout->joins_offset);
     scheduler_cache_barrier();
     const auto settled = scheduler_async_pending::complete_group(joins[index]);
-    if (settled.result == scheduler_async_pending::Result::FINISH_OWNER) return activate_finish(local, index);
-    return settled.result == scheduler_async_pending::Result::PENDING || fail(local, task_ref);
+    if (settled == scheduler_async_pending::Result::FINISH_OWNER) return activate_finish(local, index);
+    return settled == scheduler_async_pending::Result::PENDING || fail(local, task_ref);
 }
 
 // A weak hint grants no responsibility. The returned CAS is the acquisition
@@ -388,8 +388,7 @@ static inline __aicore__ bool scheduler_async_seal_execution(
         return fail(*local, task_ref);
     if (!scheduler_async_register_completion_credit(*local, task_ref)) return false;
     auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(local->base, local->layout->joins_offset);
-    if (scheduler_async_pending::register_group(joins[task_index_value]).result !=
-        scheduler_async_pending::Result::PENDING)
+    if (scheduler_async_pending::register_group(joins[task_index_value]) != scheduler_async_pending::Result::PENDING)
         return fail(*local, task_ref);
     auto *progress = scheduler_state_at<SchedulerAsyncGroupProgress>(local->base, local->layout->group_progress_offset);
     progress[writer.group_index].pending_mask = scheduler_async_condition_mask(count);
@@ -428,10 +427,10 @@ scheduler_async_close_computation(SchedulerAsyncLocalState *local, int64_t task_
     if (scheduler_async_pending::registered(joined) == 0) return true;
     scheduler_cache_barrier();
     const auto closed = scheduler_async_pending::close_computation(joins[index]);
-    if (closed.result == scheduler_async_pending::Result::SYNCHRONOUS) return true;
+    if (closed == scheduler_async_pending::Result::SYNCHRONOUS) return true;
     deferred = true;
-    if (closed.result == scheduler_async_pending::Result::FINISH_OWNER) return activate_finish(*local, index);
-    return closed.result == scheduler_async_pending::Result::PENDING || fail(*local, task_ref);
+    if (closed == scheduler_async_pending::Result::FINISH_OWNER) return activate_finish(*local, index);
+    return closed == scheduler_async_pending::Result::PENDING || fail(*local, task_ref);
 }
 
 namespace {

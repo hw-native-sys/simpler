@@ -235,8 +235,7 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
             SchedulerReadyClaim ready{};
             ready.task_ref = slot.task_ref;
             ready.source = SchedulerReadySource::COOPERATIVE;
-            const SchedulerFreeSlotClaim claim{index};
-            if (!scheduler_fill_dispatch_slot(graph, base, local, run, claim, ready, profiling_level)) {
+            if (!scheduler_fill_dispatch_slot(graph, base, local, run, index, ready, profiling_level)) {
                 *failed = true;
                 return progress;
             }

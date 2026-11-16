@@ -39,7 +39,7 @@ struct Word {
 TEST(HbgAsyncPending, NoRegistrationUsesSynchronousCompletion) {
     pending::Join join{};
     EXPECT_FALSE(pending::ready_to_finish(join.word));
-    EXPECT_EQ(pending::close_computation(join).result, Result::SYNCHRONOUS);
+    EXPECT_EQ(pending::close_computation(join), Result::SYNCHRONOUS);
     EXPECT_TRUE(pending::closed(join.word));
     EXPECT_FALSE(pending::ready_to_finish(join.word));
 }
@@ -47,9 +47,9 @@ TEST(HbgAsyncPending, NoRegistrationUsesSynchronousCompletion) {
 TEST(HbgAsyncPending, AnEarlyZeroObservationCannotAuthorizeCompletion) {
     pending::Join join{};
     ASSERT_EQ(join.word, 0u);
-    ASSERT_EQ(pending::register_group(join).result, Result::PENDING);
-    EXPECT_EQ(pending::close_computation(join).result, Result::PENDING);
-    EXPECT_EQ(pending::complete_group(join).result, Result::FINISH_OWNER);
+    ASSERT_EQ(pending::register_group(join), Result::PENDING);
+    EXPECT_EQ(pending::close_computation(join), Result::PENDING);
+    EXPECT_EQ(pending::complete_group(join), Result::FINISH_OWNER);
 }
 
 TEST(HbgAsyncPending, EnumeratesPublicationReleaseCheckAndCloseInterleavings) {
@@ -97,11 +97,11 @@ TEST(HbgAsyncPending, EnumeratesPublicationReleaseCheckAndCloseInterleavings) {
                     ++terminal_states;
                     return;
                 }
-                auto apply = [&](State next, pending::Outcome outcome) {
+                auto apply = [&](State next, pending::Result outcome) {
                     EXPECT_EQ(next.word.operations, s.word.operations + 1);
-                    if (outcome.result == Result::FINISH_OWNER) ++next.finish_owners;
-                    else if (outcome.result == Result::SYNCHRONOUS) ++next.synchronous_owners;
-                    else EXPECT_EQ(outcome.result, Result::PENDING);
+                    if (outcome == Result::FINISH_OWNER) ++next.finish_owners;
+                    else if (outcome == Result::SYNCHRONOUS) ++next.synchronous_owners;
+                    else EXPECT_EQ(outcome, Result::PENDING);
                     visit(next);
                 };
                 for (uint32_t group = 0; group < groups; ++group) {
@@ -153,16 +153,16 @@ TEST(HbgAsyncPending, EnumeratesPublicationReleaseCheckAndCloseInterleavings) {
 TEST(HbgAsyncPending, InvalidAndDuplicateTransitionsNeverGrantCompletion) {
     for (uint64_t word : {UINT64_C(1), UINT64_C(2) | pending::REGISTERED_UNIT, UINT64_C(1) << 63}) {
         Word registration{word}, completion{word}, close{word};
-        EXPECT_EQ(pending::detail::register_group(registration).result, Result::INVALID_WORD);
-        EXPECT_EQ(pending::detail::complete_group(completion).result, Result::INVALID_WORD);
-        EXPECT_EQ(pending::detail::close_computation(close).result, Result::INVALID_WORD);
+        EXPECT_EQ(pending::detail::register_group(registration), Result::INVALID_WORD);
+        EXPECT_EQ(pending::detail::complete_group(completion), Result::INVALID_WORD);
+        EXPECT_EQ(pending::detail::close_computation(close), Result::INVALID_WORD);
     }
     Word late{pending::COMPUTATION_CLOSED}, duplicate{pending::COMPUTATION_CLOSED}, empty{};
-    EXPECT_EQ(pending::detail::register_group(late).result, Result::INVALID_TRANSITION);
-    EXPECT_EQ(pending::detail::close_computation(duplicate).result, Result::INVALID_TRANSITION);
-    EXPECT_EQ(pending::detail::complete_group(empty).result, Result::COUNT_UNDERFLOW);
+    EXPECT_EQ(pending::detail::register_group(late), Result::INVALID_TRANSITION);
+    EXPECT_EQ(pending::detail::close_computation(duplicate), Result::INVALID_TRANSITION);
+    EXPECT_EQ(pending::detail::complete_group(empty), Result::COUNT_UNDERFLOW);
     Word full{pending::COUNT_MAX * pending::REGISTERED_UNIT + pending::COUNT_MAX};
-    EXPECT_EQ(pending::detail::register_group(full).result, Result::COUNT_OVERFLOW);
+    EXPECT_EQ(pending::detail::register_group(full), Result::COUNT_OVERFLOW);
 }
 
 TEST(HbgAsyncPending, RealThreadsRaceTheLastCheckAgainstComputationClose) {
@@ -171,20 +171,20 @@ TEST(HbgAsyncPending, RealThreadsRaceTheLastCheckAgainstComputationClose) {
         std::atomic<uint32_t> released{0}, owners{0}, errors{0};
         std::vector<std::thread> threads;
         auto finish = [&]() {
-            const auto result = pending::complete_group(join).result;
+            const auto result = pending::complete_group(join);
             if (result == Result::FINISH_OWNER) ++owners;
             else if (result != Result::PENDING) ++errors;
         };
         for (uint32_t index = 0; index < 8; ++index) {
             threads.emplace_back([&, index]() {
-                if (pending::register_group(join).result != Result::PENDING) ++errors;
+                if (pending::register_group(join) != Result::PENDING) ++errors;
                 if ((index + round) % 2 == 0) finish();
                 released.fetch_add(1, std::memory_order_release);
                 if ((index + round) % 2 != 0) finish();
             });
         }
         while (released.load(std::memory_order_acquire) != 8) {}
-        const auto result = pending::close_computation(join).result;
+        const auto result = pending::close_computation(join);
         if (result == Result::FINISH_OWNER) ++owners;
         else if (result != Result::PENDING) ++errors;
         for (auto &thread : threads)

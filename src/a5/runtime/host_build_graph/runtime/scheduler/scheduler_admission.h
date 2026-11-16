@@ -111,12 +111,10 @@ scheduler_initialize_admission(__gm__ void *base, const SchedulerLocalState *loc
     next.epoch = summary->run_epoch;
     next.control_offset = summary->admission_control_offset;
     next.records_offset = summary->admission_records_offset;
-    next.record_stride = summary->admission_record_stride;
     next.log_offset = summary->admission_log_offset;
     next.capacity = summary->cooperative_task_count;
     if (next.capacity == 0) {
-        if (next.control_offset != 0 || next.records_offset != 0 || next.record_stride != 0 || next.log_offset != 0)
-            return false;
+        if (next.control_offset != 0 || next.records_offset != 0 || next.log_offset != 0) return false;
     } else {
         uint64_t control_end = 0;
         uint64_t records_end = 0;
@@ -125,12 +123,10 @@ scheduler_initialize_admission(__gm__ void *base, const SchedulerLocalState *loc
             workers != clusters * PLATFORM_CORES_PER_BLOCKDIM || summary->worker_count != workers ||
             summary->cluster_count != clusters || local->config.graph->task_count > static_cast<uint64_t>(INT32_MAX) ||
             next.control_offset == 0 || next.records_offset == 0 || next.log_offset == 0 ||
-            ((next.control_offset | next.records_offset | next.log_offset | next.record_stride) &
-             (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
-            next.record_stride != sizeof(SchedulerAdmissionRecord) ||
+            ((next.control_offset | next.records_offset | next.log_offset) & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
             !scheduler_admission_range_end(next.control_offset, 1, sizeof(SchedulerAdmissionControl), &control_end) ||
             !scheduler_admission_range_end(
-                next.records_offset, local->config.graph->task_count, next.record_stride, &records_end
+                next.records_offset, local->config.graph->task_count, sizeof(SchedulerAdmissionRecord), &records_end
             ) ||
             !scheduler_admission_range_end(next.log_offset, next.capacity, sizeof(int64_t), &log_end) ||
             control_end > next.records_offset || records_end > next.log_offset ||
@@ -192,11 +188,13 @@ static inline __aicore__ bool scheduler_admission_fail(
     return false;
 }
 
-namespace scheduler_admission_detail {
-
-// Configuration pointers are validated by the enclosing bounded operation.
-// Neither the error signal nor the current run's epoch is a reusable permit.
-static inline __aicore__ bool active_run_valid(
+// Admission operations require the resident's live base/local/run and an
+// initialized admission object. run_resident_scheduler installs admission only
+// after both initializers succeed; fill/entry dispatch select this path only
+// when it is present, and exit drain handles absence before calling here.
+// The cached graph binding is immutable until the run fence. Error and epoch
+// observations remain per-operation checks, including after lock acquisition.
+static inline __aicore__ bool scheduler_admission_context_valid(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     const SchedulerAdmissionLocalState *admission
 ) {
@@ -212,25 +210,10 @@ static inline __aicore__ bool active_run_valid(
     return true;
 }
 
-}  // namespace scheduler_admission_detail
-
-// Admission operations require the resident's live base/local/run and an
-// initialized admission object. run_resident_scheduler installs admission only
-// after both initializers succeed; fill/entry dispatch select this path only
-// when it is present, and exit drain handles absence before calling here.
-// The cached graph binding is immutable until the run fence. Error and epoch
-// observations remain per-operation checks, including after lock acquisition.
-static inline __aicore__ bool scheduler_admission_context_valid(
-    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    const SchedulerAdmissionLocalState *admission
-) {
-    return scheduler_admission_detail::active_run_valid(graph, base, local, run, admission);
-}
-
 inline __aicore__ __gm__ SchedulerAdmissionRecord *
 scheduler_admission_record_at(__gm__ void *base, const SchedulerAdmissionLocalState *admission, int64_t task_ref) {
     return scheduler_state_at<SchedulerAdmissionRecord>(
-        base, admission->records_offset + static_cast<uint64_t>(task_ref) * admission->record_stride
+        base, admission->records_offset + static_cast<uint64_t>(task_ref) * sizeof(SchedulerAdmissionRecord)
     );
 }
 
@@ -685,7 +668,6 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_block
     auto &slot = local->slots[slot_index];
     slot.task_ref = task;
     slot.block_idx = block;
-    slot.args_observed = true;
     slot.gm_mix = false;
     slot.predicate = SchedulerPredicateState::UNEVALUATED;
     slot.subtask_slot = admission->current_single_subtask;

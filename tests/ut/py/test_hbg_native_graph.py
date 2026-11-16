@@ -105,7 +105,7 @@ def test_native_graph_deferred_finish_preserves_public_identity_and_dependencies
         audit_native_protocol(raw, identities)
 
 
-@pytest.mark.parametrize("field", ("graph_source", "node_map", "close_seal_stride"))
+@pytest.mark.parametrize("field", ("graph_source", "node_map"))
 def test_current_native_graph_requires_graph_and_scheduler_contracts(field):
     raw, _ = native_capture()
     del raw[field]
