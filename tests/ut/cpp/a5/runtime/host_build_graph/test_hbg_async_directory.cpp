@@ -26,13 +26,15 @@ using Result = SchedulerAsyncDirectoryResult;
 struct ScriptedAtomics {
     uint64_t word{0};
     std::vector<uint64_t> peer_changes;
-    uint32_t loads{0};
+    uint32_t queries{0};
     uint32_t attempts{0};
     uint32_t writes{0};
+    bool use_hint{false};
+    uint64_t hint{0};
 
-    uint64_t load() {
-        ++loads;
-        return word;
+    uint64_t query() {
+        ++queries;
+        return use_hint ? hint : word;
     }
 
     uint64_t compare_exchange(uint64_t expected, uint64_t desired) {
@@ -77,7 +79,7 @@ TEST(SchedulerAsyncDirectoryTest, RejectsInvalidBitBeforeAnyAtomicAccess) {
         EXPECT_EQ(scheduler_async_directory_detail::update<true>(atomics, bit), Result::INVALID_BIT);
         EXPECT_EQ(scheduler_async_directory_detail::update<false>(atomics, bit), Result::INVALID_BIT);
         EXPECT_EQ(atomics.word, UINT64_C(2));
-        EXPECT_EQ(atomics.loads, 0u);
+        EXPECT_EQ(atomics.queries, 0u);
         EXPECT_EQ(atomics.attempts, 0u);
         EXPECT_EQ(atomics.writes, 0u);
     }
@@ -88,16 +90,43 @@ TEST(SchedulerAsyncDirectoryTest, CompetingSameBitIsRejectedWithoutASecondWrite)
     ScriptedAtomics publish{UINT64_C(2), {target}};
     EXPECT_EQ(scheduler_async_directory_detail::update<true>(publish, 63), Result::UNEXPECTED_STATE);
     EXPECT_EQ(publish.word, UINT64_C(2) | target);
-    EXPECT_EQ(publish.loads, 1u);
+    EXPECT_EQ(publish.queries, 1u);
     EXPECT_EQ(publish.attempts, 1u);
     EXPECT_EQ(publish.writes, 0u);
 
     ScriptedAtomics clear{UINT64_C(2) | target, {target}};
     EXPECT_EQ(scheduler_async_directory_detail::update<false>(clear, 63), Result::UNEXPECTED_STATE);
     EXPECT_EQ(clear.word, UINT64_C(2));
-    EXPECT_EQ(clear.loads, 1u);
+    EXPECT_EQ(clear.queries, 1u);
     EXPECT_EQ(clear.attempts, 1u);
     EXPECT_EQ(clear.writes, 0u);
+}
+
+TEST(SchedulerAsyncDirectoryTest, StaleHintsCannotGrantOrRejectAChangeWithoutCasConfirmation) {
+    for (uint32_t bit : {0u, 63u}) {
+        const uint64_t target = UINT64_C(1) << bit;
+        constexpr uint64_t neighbor = UINT64_C(2);
+        for (bool publish : {false, true}) {
+            for (bool already_changed : {false, true}) {
+                const uint64_t word = neighbor | ((already_changed == publish) ? target : UINT64_C(0));
+                for (uint64_t stale_bits : {UINT64_C(0), target, neighbor, target | neighbor}) {
+                    SCOPED_TRACE(bit);
+                    SCOPED_TRACE(publish);
+                    SCOPED_TRACE(already_changed);
+                    SCOPED_TRACE(stale_bits);
+                    ScriptedAtomics atomics{word};
+                    atomics.use_hint = true;
+                    atomics.hint = word ^ stale_bits;
+                    const auto result = publish ? scheduler_async_directory_detail::update<true>(atomics, bit) :
+                                                  scheduler_async_directory_detail::update<false>(atomics, bit);
+                    EXPECT_EQ(result, already_changed ? Result::UNEXPECTED_STATE : Result::SUCCESS);
+                    EXPECT_EQ(atomics.word, publish ? word | target : word & ~target);
+                    EXPECT_EQ(atomics.queries, 1u);
+                    EXPECT_EQ(atomics.attempts, already_changed || stale_bits == 0 ? 1u : 2u);
+                }
+            }
+        }
+    }
 }
 
 std::vector<uint64_t> legal_neighbor_changes(uint32_t target) {
@@ -108,26 +137,34 @@ std::vector<uint64_t> legal_neighbor_changes(uint32_t target) {
     return changes;
 }
 
-TEST(SchedulerAsyncDirectoryTest, EveryNeighborMayPublishAndClearBeforeTheLastAllowedCasSucceeds) {
+TEST(SchedulerAsyncDirectoryTest, StaleHintAndEveryNeighborFitTheCasRetryBound) {
     for (uint32_t bit : {0u, 63u}) {
-        SCOPED_TRACE(bit);
-        const uint64_t target = UINT64_C(1) << bit;
-        const auto changes = legal_neighbor_changes(bit);
-        ASSERT_EQ(changes.size(), 126u);
+        for (bool stale : {false, true}) {
+            SCOPED_TRACE(bit);
+            SCOPED_TRACE(stale);
+            const uint64_t target = UINT64_C(1) << bit;
+            auto changes = legal_neighbor_changes(bit);
+            ASSERT_EQ(changes.size(), 126u);
+            if (stale) changes.insert(changes.begin(), UINT64_C(0));
 
-        ScriptedAtomics publish{UINT64_C(0), changes};
-        EXPECT_EQ(scheduler_async_directory_detail::update<true>(publish, bit), Result::SUCCESS);
-        EXPECT_EQ(publish.word, target);
-        EXPECT_EQ(publish.loads, 1u);
-        EXPECT_EQ(publish.attempts, 127u);
-        EXPECT_EQ(publish.writes, 1u);
+            ScriptedAtomics publish{UINT64_C(0), changes};
+            publish.use_hint = stale;
+            publish.hint = target;
+            EXPECT_EQ(scheduler_async_directory_detail::update<true>(publish, bit), Result::SUCCESS);
+            EXPECT_EQ(publish.word, target);
+            EXPECT_EQ(publish.queries, 1u);
+            EXPECT_EQ(publish.attempts, stale ? 128u : 127u);
+            EXPECT_EQ(publish.writes, 1u);
 
-        ScriptedAtomics clear{target, changes};
-        EXPECT_EQ(scheduler_async_directory_detail::update<false>(clear, bit), Result::SUCCESS);
-        EXPECT_EQ(clear.word, UINT64_C(0));
-        EXPECT_EQ(clear.loads, 1u);
-        EXPECT_EQ(clear.attempts, 127u);
-        EXPECT_EQ(clear.writes, 1u);
+            ScriptedAtomics clear{target, changes};
+            clear.use_hint = stale;
+            clear.hint = 0;
+            EXPECT_EQ(scheduler_async_directory_detail::update<false>(clear, bit), Result::SUCCESS);
+            EXPECT_EQ(clear.word, UINT64_C(0));
+            EXPECT_EQ(clear.queries, 1u);
+            EXPECT_EQ(clear.attempts, stale ? 128u : 127u);
+            EXPECT_EQ(clear.writes, 1u);
+        }
     }
 }
 
@@ -135,17 +172,17 @@ TEST(SchedulerAsyncDirectoryTest, ExceedingTheOneRunMutationContractIsTerminalCo
     const std::vector<uint64_t> changes(128, UINT64_C(1));
     ScriptedAtomics publish{UINT64_C(0), changes};
     EXPECT_EQ(scheduler_async_directory_detail::update<true>(publish, 63), Result::PROTOCOL_CORRUPTION);
-    EXPECT_EQ(publish.word, UINT64_C(1));
-    EXPECT_EQ(publish.loads, 1u);
-    EXPECT_EQ(publish.attempts, 127u);
+    EXPECT_EQ(publish.word, UINT64_C(0));
+    EXPECT_EQ(publish.queries, 1u);
+    EXPECT_EQ(publish.attempts, 128u);
     EXPECT_EQ(publish.writes, 0u);
 
     constexpr uint64_t target = UINT64_C(1) << 63;
     ScriptedAtomics clear{target, changes};
     EXPECT_EQ(scheduler_async_directory_detail::update<false>(clear, 63), Result::PROTOCOL_CORRUPTION);
-    EXPECT_EQ(clear.word, target | UINT64_C(1));
-    EXPECT_EQ(clear.loads, 1u);
-    EXPECT_EQ(clear.attempts, 127u);
+    EXPECT_EQ(clear.word, target);
+    EXPECT_EQ(clear.queries, 1u);
+    EXPECT_EQ(clear.attempts, 128u);
     EXPECT_EQ(clear.writes, 0u);
 }
 

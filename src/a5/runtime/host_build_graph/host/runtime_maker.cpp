@@ -753,7 +753,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
                 }
                 const uint32_t kind = record.kind & UINT32_C(0xffff);
                 if (kind < static_cast<uint32_t>(SchedPhaseKind::ScalarWindow) ||
-                    kind > static_cast<uint32_t>(SchedPhaseKind::ScalarBootstrapTopology) ||
+                    kind > static_cast<uint32_t>(SchedPhaseKind::ScalarPreparedClaim) ||
                     std::strcmp(sched_phase_kind_name(static_cast<SchedPhaseKind>(kind)), "unknown") == 0 ||
                     record.start_time == 0 || record.end_time < record.start_time) {
                     LOG_WARN("A5 HBG: invalid Scalar interval for worker=%" PRIu64, worker);
@@ -1818,13 +1818,27 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG: task ordering failed: %s", task_order_error.c_str());
         return false;
     }
-    if (!native_graph &&
-        !scheduler_order_ordinary_fanin(
-            reinterpret_cast<task_image::Storage *>(static_cast<char *>(uploaded_sm) + device_segments.storage),
-            task_catalog_plan.task_ranks, inline_completed_task_refs, &task_order_error
-        )) {
-        LOG_ERROR("A5 HBG: ordinary fanin ordering failed: %s", task_order_error.c_str());
-        return false;
+    if (!native_graph) {
+        auto *storage =
+            reinterpret_cast<task_image::Storage *>(static_cast<char *>(uploaded_sm) + device_segments.storage);
+        auto *fanin_pool = reinterpret_cast<int32_t *>(static_cast<char *>(uploaded_sm) + device_segments.fanin_pool);
+        const uint64_t fanin_capacity = (device_segments.tensor_pool - device_segments.fanin_pool) / sizeof(int32_t);
+        const size_t completed_before = inline_completed_task_refs.size();
+        if (!scheduler_fold_ordinary_controls(
+                storage, fanin_pool, fanin_capacity, &task_metadata, &inline_completed_task_refs, &task_order_error
+            ) ||
+            !scheduler_prepare_ordinary_fanin(
+                storage, task_catalog_plan.task_ranks, inline_completed_task_refs, &task_order_error
+            )) {
+            LOG_ERROR("A5 HBG: ordinary fanin preparation failed: %s", task_order_error.c_str());
+            return false;
+        }
+        const uint64_t folded = inline_completed_task_refs.size() - completed_before;
+        if (folded > task_catalog_plan.header.control_count) {
+            LOG_ERROR("A5 HBG: folded control count exceeds the task catalog");
+            return false;
+        }
+        task_catalog_plan.header.control_count -= folded;
     }
     if (protocol_profiling) {
         try {

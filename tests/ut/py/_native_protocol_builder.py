@@ -110,10 +110,8 @@ class ProtocolBuilder:
                 )
             )
         if raw["cooperative_task_count"]:
-            mix_index = 0
             stride = 64
             for task in raw["tasks"]:
-                mixed = bool(task["flags"] & 4 and task["flags"] & 16)
                 raw["admissions"].append(
                     dict(
                         index=task["task_ref"],
@@ -125,11 +123,8 @@ class ProtocolBuilder:
                         active_mask=0,
                         flags=0,
                         record_offset=4096 + task["task_ref"] * stride,
-                        close_seals_offset=8192 + mix_index * clusters * 64 if mixed else 0,
-                        close_seals=[0] * clusters if mixed else [],
                     )
                 )
-                mix_index += mixed
 
     def tick(self):
         self.clock += 10
@@ -209,7 +204,7 @@ class ProtocolBuilder:
                 closed=[0, 0],
                 observed_tail=self.raw["commit_tail"],
                 closed_cursor=0,
-                close_seal=0,
+                close_frontier=0,
                 last_group_seq=0,
                 pending_mask=0,
                 claim_seal_seen=0,
@@ -460,8 +455,17 @@ class ProtocolBuilder:
                     if b["owner"]["task_ref"] == task and b["owner"]["cluster_index"] == worker // 3
                 ]
                 row["last_group_seq"] = max(groups, default=0)
-                row["close_seal"] = row["last_group_seq"] + 1
-                self.raw["admissions"][task]["close_seals"][worker // 3] = row["close_seal"]
+                if worker % 3 == 0:
+                    row["close_frontier"] = row["order_key"] + 1
+                else:
+                    row["close_frontier"] = max(
+                        (
+                            member["order_key"] + 1
+                            for member in self.raw["members"]
+                            if member["worker_index"] == (worker // 3) * 3 and member["closed"][1]
+                        ),
+                        default=0,
+                    )
                 if worker % 3:
                     row["closed_cursor"] = MAX
             if not (spec["flags"] & 4 and worker % 3) and row["closed_cursor"] == spec["block_num"]:

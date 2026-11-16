@@ -369,8 +369,8 @@ scheduler_protocol_member_observed(__gm__ void *base, const Local *local, const 
 
 template <typename Local, typename Admission>
 static inline __aicore__ void scheduler_protocol_member_closed(
-    __gm__ void *base, const Local *local, const Admission *admission, uint64_t cursor, uint64_t seal,
-    uint64_t last_group_seq, bool used_claim_seal = false
+    __gm__ void *base, const Local *local, const Admission *admission, uint64_t cursor, uint64_t close_frontier,
+    uint64_t last_group_seq, bool used_claim_seal = false, bool from_claim = false
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
@@ -384,7 +384,8 @@ static inline __aicore__ void scheduler_protocol_member_closed(
     }
     if (!scheduler_protocol_stamp(base, local, layout, &member->closed)) return;
     member->closed_cursor = cursor;
-    member->close_seal = seal;
+    if (from_claim) member->flags |= SCHEDULER_PROTOCOL_MEMBER_FROM_CLAIM;
+    member->close_frontier = close_frontier;
     member->last_group_seq = last_group_seq;
     member->claim_seal_seen = used_claim_seal ? cursor : 0;
     member->claim_cursor_seen = used_claim_seal ? cursor : 0;

@@ -54,20 +54,19 @@ uint32_t original_task_count。GraphView、native header、task catalog 和 prep
 | SchedulerTaskControl | 640 B | 五个独立 128 B 原子区域：claim_tickets、next_block、completion_state、admission_state、claim_seal |
 | SchedulerWorkerContext | 320 B | 前四个 64 B 行由 READY 发布；最后一行归本核诊断 |
 | SchedulerRunControl | 7296 B | 384 B 配置/生命周期/首错前缀及 108 个独占行的 worker 错误信号 |
-| SchedulerGraphSummary | 192 B | 本轮只读拓扑和各子区 offset |
+| SchedulerGraphSummary | 128 B | 本轮只读拓扑和各子区 offset |
 | SchedulerTaskTrace | 256 B | publication、kernel timing、dispatch/completion、execution identity 四行 |
 | SchedulerExecutorTaskTrace | 24 B | 核内 start/end/ready-observe 三个时间戳 |
 | SchedulerAdmissionRecord | 64 B | sync_start 任务的冻结 admission 事实 |
 | SchedulerAdmissionControl | 256 B | commit_lock 和 bypass commit_tail 分占 128 B 区域 |
 | SchedulerGroupMailbox | 384 B | group descriptor 及三个独立 lane ack |
-| SchedulerMixCloseSeal | 64 B | 单个保留的原子 close seal |
 
 Mailbox 的 descriptor 从 0 开始，lane ack 数组从 128 开始，二者位于独立原子 sector。
 AdmissionRecord 数组直接按当前类型的 64 B 大小寻址；layout、summary 和核内 admission
 状态不再各存一份行宽。summary 的 protocol/async/prepared layout offset 字段分别位于
-88/112/120；核内 `SchedulerAdmissionLocalState` 为 176 B。
-DFX close-seal 数组也按当前 64 B 类型解释，JSON 不携带固定行宽字段。
+80/104/112；核内 `SchedulerAdmissionLocalState` 为 168 B。
 coordinator 写回 descriptor 并 barrier 后，通过参与 AIV 的 assigned_seq 发布；接收者不读取另一份全局发布计数。
+MIX 关闭复用 SSBUF 的单调 admission frontier，不按 task/cluster 分配 GM 关闭通知。
 Call.args 与 dump task 的只读参数行以 alignas(64) 对齐；没有显式 reserved 数据字段。
 
 TaskControl 的 atomic offset 依次为 0、128、256、384、512。

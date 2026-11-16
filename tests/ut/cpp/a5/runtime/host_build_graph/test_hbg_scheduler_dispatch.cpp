@@ -147,6 +147,7 @@ TEST(SchedulerTokenDispatch, OnlyTheLastOrdinaryReturnUsesTheCanonicalRetirement
             block == 0 ? SchedulerPreparedPhase::RETURNED : SchedulerPreparedPhase::CLAIMED
         );
         EXPECT_EQ(scheduler_prepared_already_returned(f.base(), f.local()->config.prepared, handle), block == 1);
+        EXPECT_EQ(scheduler_cached_task_proof(f.local(), 0) == SchedulerTaskProof::DONE, block == 1);
     }
     EXPECT_TRUE(scheduler_completion_done(f.control(0)->completion_state));
     EXPECT_EQ(f.local()->pending_completed, 1u);
@@ -319,6 +320,22 @@ TEST(SchedulerTokenDispatch, HostDoneAndConfirmedFaninPrefixDoNotReleaseTheRemai
 }
 
 TEST(SchedulerTokenDispatch, TaskProofDoesNotReleaseAsyncDebtCollidingTasksOrAnotherRun) {
+    DispatchFixture completed;
+    ASSERT_TRUE(completed.prepare());
+    scheduler_gm_store(completed.control(0)->claim_seal, UINT64_C(1));
+    scheduler_gm_store(completed.control(0)->completion_state, scheduler_completion_completed_state(1));
+    bool completed_supply = false;
+    ASSERT_TRUE(scheduler_task_supply_closed(
+        completed.graph.graph(), completed.base(), completed.local(), completed.storage.run_control, 0,
+        &completed_supply
+    ));
+    EXPECT_TRUE(completed_supply);
+    EXPECT_EQ(scheduler_cached_task_proof(completed.local(), 0), SchedulerTaskProof::DONE);
+    EXPECT_EQ(
+        scheduler_observe_cached_completion(completed.base(), completed.local(), 0),
+        SchedulerCompletionObservation::DONE
+    );
+
     DispatchFixture f(SCHEDULER_TASK_PROOF_CACHE_COUNT + 1);
     ASSERT_TRUE(f.prepare());
     scheduler_gm_store(f.control(0)->completion_state, scheduler_completion_encode(1, 0, 1));

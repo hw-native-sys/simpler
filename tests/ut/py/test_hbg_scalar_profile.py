@@ -214,6 +214,7 @@ def test_predicated_skip_is_not_counted_as_kernel_execution():
     [
         ("scalar_execution_token_refill", "scheduler_refill_execution_tokens"),
         ("scalar_prepared_acquire", "scheduler_acquire_execution_token"),
+        ("scalar_prepared_claim", "scheduler_claim_execution_token"),
         ("scalar_cooperative_discover", "scheduler_discover_cooperative_task"),
         ("scalar_cluster_mix_service", "scheduler_cluster_mix_service"),
         ("scalar_group_acquire", "scheduler_acquire_group_lane"),
@@ -241,9 +242,12 @@ def test_predicated_skip_is_not_counted_as_kernel_execution():
         ("scalar_poll_local_state", "scheduler_ordered_poll_may_progress: local state"),
         ("scalar_poll_admission_tail", "scheduler_ordered_poll_may_progress: admission commit_tail"),
         ("scalar_poll_mix_state", "scheduler_ordered_poll_may_progress: MIX state"),
-        ("scalar_poll_mix_close_seal", "scheduler_ordered_poll_may_progress: MIX close seal"),
+        ("scalar_poll_mix_close", "scheduler_ordered_poll_may_progress: MIX coordinator frontier"),
         ("scalar_poll_mix_assignment", "scheduler_ordered_poll_may_progress: MIX assigned_seq"),
-        ("scalar_poll_mix_arrived", "scheduler_ordered_poll_may_progress: MIX arrived_seq"),
+        (
+            "scalar_poll_mix_arrived",
+            "scheduler_ordered_poll_may_progress: MIX arrival readiness (GM ACK or SSBUF permit)",
+        ),
         ("scalar_poll_mix_released", "scheduler_ordered_poll_may_progress: MIX released_seq"),
         ("scalar_trace_finish", "SchedulerScalarTrace::finish"),
         ("scalar_trace_finish_clean", "SchedulerScalarTrace::finish: DCCI issue"),

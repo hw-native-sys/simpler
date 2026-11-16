@@ -121,7 +121,7 @@ enum class SchedPhaseKind : uint8_t {
     ScalarPollLocalState = 66,
     ScalarPollAdmissionTail = 70,
     ScalarPollMixState = 71,
-    ScalarPollMixCloseSeal = 72,
+    ScalarPollMixClose = 72,
     ScalarPollMixAssignment = 73,
     ScalarPollMixArrived = 74,
     ScalarPollMixReleased = 75,
@@ -180,6 +180,7 @@ enum class SchedPhaseKind : uint8_t {
     ScalarBootstrapInitWait = 139,
     ScalarBootstrapPeerWait = 140,
     ScalarBootstrapTopology = 141,
+    ScalarPreparedClaim = 142,
 };
 
 // This phase's name as a report spells it. Returns a string literal, so it is safe on
@@ -302,8 +303,8 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_poll_admission_tail";
     case SchedPhaseKind::ScalarPollMixState:
         return "scalar_poll_mix_state";
-    case SchedPhaseKind::ScalarPollMixCloseSeal:
-        return "scalar_poll_mix_close_seal";
+    case SchedPhaseKind::ScalarPollMixClose:
+        return "scalar_poll_mix_close";
     case SchedPhaseKind::ScalarPollMixAssignment:
         return "scalar_poll_mix_assignment";
     case SchedPhaseKind::ScalarPollMixArrived:
@@ -386,6 +387,8 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_prepared_receive";
     case SchedPhaseKind::ScalarPreparedAcquire:
         return "scalar_prepared_acquire";
+    case SchedPhaseKind::ScalarPreparedClaim:
+        return "scalar_prepared_claim";
     case SchedPhaseKind::ScalarPreparedReturn:
         return "scalar_prepared_return";
     case SchedPhaseKind::ScalarPreparedObserve:

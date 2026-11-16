@@ -36,6 +36,32 @@ def native(request):
         yield module
 
 
+@pytest.mark.parametrize("damage", (None, "schema", "missing_identity", "completion"))
+def test_successful_fault_fixture_run_requires_complete_protocol_evidence(native, damage):
+    from _native_protocol_builder import ProtocolBuilder  # noqa: PLC0415
+
+    protocol, identities = ProtocolBuilder([(2, 2, ()), (2, 1, (0,))]).run()
+    raw = {
+        "aicore_protocol": protocol,
+        "aicore_execution_identities": {
+            "schema": "hbg-execution-identity",
+            "producer": "aicore",
+            "records": identities,
+        },
+    }
+    if damage == "schema":
+        protocol["producer"] = "unknown"
+    elif damage == "missing_identity":
+        identities.pop()
+    elif damage == "completion":
+        protocol["task_controls"][0]["state"] = 0
+    if damage is None:
+        native._check_successful_capture(raw)
+    else:
+        with pytest.raises(ValueError):
+            native._check_successful_capture(raw)
+
+
 def test_failed_completion_proof_prints_owned_borrow_release(native, monkeypatch, tmp_path, capsys):
     # Controlled file/log leaves exercise the real failure helper, not device proof.
     logs = tmp_path / "owned-host-logs"
@@ -891,7 +917,7 @@ def _check_fault_buffer_policy(
     monkeypatch.setattr(native, "_root_block_num", lambda protocol: 1)
     monkeypatch.setattr(native, "_check_output", check_output)
     monkeypatch.setattr(native, "_check_failed_capture", failed_capture)
-    monkeypatch.setattr(native, "read_perf_data", lambda path: {"protocol_audit": {"protocol_verified": True}})
+    monkeypatch.setattr(native, "_check_successful_capture", lambda raw: None)
     if fail_second_free:
         with pytest.raises(RuntimeError, match="controlled free refused"):
             native._run_pass(

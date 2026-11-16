@@ -23,16 +23,16 @@ enum class SchedulerAsyncDirectoryResult : uint8_t {
 namespace scheduler_async_directory_detail {
 
 inline constexpr uint32_t kWordBits = 64;
-// Each other bit changes at most twice per run. Every failed strong CAS
-// observes a value change; the target bit has one writer for each transition.
-inline constexpr uint32_t kMaxCasAttempts = 2 * (kWordBits - 1) + 1;
+// Each other bit changes at most twice per run. The weak initial snapshot
+// allows one extra mismatch; later failures observe changes after a strong CAS.
+inline constexpr uint32_t kMaxCasAttempts = 2 * (kWordBits - 1) + 2;
 
 namespace {
 
 struct GmAtomics {
     __gm__ volatile uint64_t &word;
 
-    inline __aicore__ uint64_t load() { return scheduler_gm_fetch_add(word, UINT64_C(0)); }
+    inline __aicore__ uint64_t query() { return scheduler_gm_query(word); }
 
     inline __aicore__ uint64_t compare_exchange(uint64_t expected, uint64_t desired) {
         return scheduler_gm_compare_exchange(word, expected, desired);
@@ -41,16 +41,18 @@ struct GmAtomics {
 
 }  // namespace
 
-// Atomics supplies a linearizable load and a strong CAS returning the old word.
+// Atomics supplies a weak query and a strong CAS returning the old word.
 template <bool Publish, typename Atomics>
 inline __aicore__ SchedulerAsyncDirectoryResult update(Atomics &atomics, uint32_t bit_index) {
     if (bit_index >= kWordBits) return SchedulerAsyncDirectoryResult::INVALID_BIT;
     const uint64_t bit = UINT64_C(1) << bit_index;
-    uint64_t observed = atomics.load();
+    uint64_t observed = atomics.query();
     for (uint32_t attempt = 0; attempt < kMaxCasAttempts; ++attempt) {
-        if (((observed & bit) != 0) == Publish) return SchedulerAsyncDirectoryResult::UNEXPECTED_STATE;
         const uint64_t desired = Publish ? observed | bit : observed & ~bit;
         const uint64_t actual = atomics.compare_exchange(observed, desired);
+        // An apparent duplicate uses an identity CAS; only its returned word
+        // can reject the transition, even when the initial hint is stale.
+        if (((actual & bit) != 0) == Publish) return SchedulerAsyncDirectoryResult::UNEXPECTED_STATE;
         if (actual == observed) return SchedulerAsyncDirectoryResult::SUCCESS;
         observed = actual;
     }
@@ -60,8 +62,8 @@ inline __aicore__ SchedulerAsyncDirectoryResult update(Atomics &atomics, uint32_
 }  // namespace scheduler_async_directory_detail
 
 // The caller owns the bit's unique 0 -> 1 -> 0 lifecycle; a cleared bit is
-// not reused until run retirement. Its entire line admits only atomic accesses
-// while the run is live. Payload/terminal publication barriers belong to the
+// not reused until run retirement. The line admits atomic writes and weak
+// bypass queries, never cached writes. Payload/terminal barriers belong to the
 // caller. Any non-success result requires run failure, never a normal retry.
 static inline __aicore__ SchedulerAsyncDirectoryResult
 scheduler_async_directory_publish(__gm__ volatile uint64_t &word, uint32_t bit_index) {

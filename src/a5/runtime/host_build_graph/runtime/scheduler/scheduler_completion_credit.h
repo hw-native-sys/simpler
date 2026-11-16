@@ -12,7 +12,7 @@
 #pragma once
 
 #include "scheduler_admission.h"
-#include "scheduler_async_control.h"
+#include "scheduler_async_finish.h"
 
 enum class SchedulerSubtaskFinishResult : uint8_t { PARTIAL, TASK_LAST, TASK_LAST_DEFERRED, ERROR };
 
@@ -74,6 +74,7 @@ static inline __aicore__ bool scheduler_contribute_mix_group(
         return false;
     }
     if (result == SchedulerSubtaskFinishResult::TASK_LAST) {
+        scheduler_remember_task_proof(local, task_ref, SchedulerTaskProof::DONE);
         ++local->pending_completed;
         if (owner != nullptr) {
             auto *actor =
@@ -96,8 +97,10 @@ static inline __aicore__ bool scheduler_contribute_mix_group(
             scheduler_protocol_publish_record(actor);
         }
     } else if (result == SchedulerSubtaskFinishResult::TASK_LAST_DEFERRED) {
-        bool deferred = false;
-        if (!scheduler_async_close_computation(local->async, task_ref, deferred) || !deferred) {
+        const auto completion = scheduler_async_close_computation(local->async, task_ref);
+        const bool complete = completion.result == SchedulerAsyncCompletionResult::FINISH_OWNER;
+        if ((complete && !scheduler_async_complete_task(graph, base, local, run, completion)) ||
+            (!complete && completion.result != SchedulerAsyncCompletionResult::WAITING)) {
             scheduler_record_error(
                 run, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local,
                 SchedulerErrorSite::ASYNC_CONTEXT_INVALID

@@ -873,7 +873,6 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
         );
         if (config_valid && async.layout != nullptr) {
             async.check_cursor = static_cast<uint32_t>(context->worker_index % async.layout->group_count);
-            async.finish_cursor = static_cast<uint32_t>(context->worker_index % async.layout->async_task_count);
             scheduler_local_state.async = &async;
         }
         if (config_valid && summary->mix_task_count != 0)

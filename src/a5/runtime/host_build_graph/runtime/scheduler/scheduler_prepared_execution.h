@@ -223,12 +223,13 @@ static inline __aicore__ bool scheduler_receive_execution_token(
     return true;
 }
 
-// Fresh tickets identify one immutable Call; no peer may consume the same ticket.
-static inline __aicore__ bool scheduler_acquire_execution_token(
+// Fresh tickets identify one immutable Call; its fixed owner must receive the
+// payload before using the claimed handle for execution.
+static inline __aicore__ bool scheduler_claim_execution_token(
     __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, uint32_t worker_id, int64_t task_ref,
     uint32_t block, uint8_t lane, SchedulerPreparedHandle *handle
 ) {
-    SchedulerScalarScope scalar_scope(SchedPhaseKind::ScalarPreparedAcquire, task_ref);
+    SchedulerScalarScope scalar_scope(SchedPhaseKind::ScalarPreparedClaim, task_ref);
     uint64_t index = 0;
     if (base == nullptr || handle == nullptr || worker_id >= PLATFORM_MAX_CORES ||
         !scheduler_prepared_execution_index(base, prepared, task_ref, block, lane, &index) ||
@@ -244,6 +245,19 @@ static inline __aicore__ bool scheduler_acquire_execution_token(
     const uint64_t claimed = scheduler_prepared_state(SchedulerPreparedPhase::CLAIMED, worker_id);
     if (scheduler_gm_compare_exchange(control->state, initial, claimed) != initial) return false;
     handle->claimed_state = claimed;
+    return true;
+}
+
+// Cached handles belong to this caller's completed receipt; fresh claims must
+// receive the immutable Call and Binding before returning READY.
+static inline __aicore__ bool scheduler_acquire_execution_token(
+    __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, uint32_t worker_id, int64_t task_ref,
+    uint32_t block, uint8_t lane, SchedulerPreparedHandle *handle
+) {
+    SchedulerScalarScope scalar_scope(SchedPhaseKind::ScalarPreparedAcquire, task_ref);
+    const bool received = handle != nullptr && handle->claimed_state != 0;
+    const auto result = scheduler_claim_execution_token(base, prepared, worker_id, task_ref, block, lane, handle);
+    if (!result || received) return result;
     return scheduler_receive_execution_token(base, prepared, task_ref, block, lane, handle);
 }
 

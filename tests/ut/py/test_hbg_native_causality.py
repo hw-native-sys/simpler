@@ -16,6 +16,7 @@ from _native_protocol_builder import ProtocolBuilder
 
 from simpler_setup.tools.hbg.native_causality import MIX, PRECLAIM, audit_native_protocol
 from simpler_setup.tools.hbg.native_protocol import (
+    MEMBER_FROM_CLAIM,
     STAMPS,
     _event_records,
     audit_protocol_sequences,
@@ -177,41 +178,58 @@ def test_current_close_layout_preserves_claim_seal_and_sync_start_proof(mask, bl
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
 
 
-@pytest.mark.parametrize("clusters", (2, 22))
-def test_current_close_seal_rows_do_not_alias(clusters):
-    raw, identities = ProtocolBuilder(
-        [(3, 2, ()), (2, 1, ()), (6, 2, ()), (7, 2, ())], clusters=clusters, sync_tasks=(0, 2, 3)
-    ).run()
+@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
+def test_owned_sync_close_uses_its_claim_without_fabricating_a_later_cursor_read(mask):
+    raw, identities = _claim_seal_capture(mask, 2, sync=True, clusters=3)
+    owners = {block["owner"]["worker_index"] for block in raw["blocks"]}
+    for member in raw["members"]:
+        if member["worker_index"] in owners:
+            member["flags"] |= MEMBER_FROM_CLAIM
+            member.update(closed_cursor=(1 << 64) - 1, claim_seal_seen=0, claim_cursor_seen=0)
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
-    mixed = [row for row in raw["admissions"] if row["close_seals"]]
-    mixed[1]["close_seals_offset"] = mixed[0]["close_seals_offset"] + clusters * 8
-    with pytest.raises(ValueError, match="aliased or wrong task close seals"):
+
+    member = next(member for member in raw["members"] if member["worker_index"] in owners)
+    member["closed_cursor"] = 1
+    with pytest.raises(ValueError, match="invalid owned-claim close proof"):
         audit_native_protocol(raw, identities)
 
 
-@pytest.mark.parametrize("fault", ("alias", "interior", "swap", "unaligned", "gap", "claim_seal"))
-def test_current_close_seal_rows_and_claim_seal_evidence_are_both_mandatory(fault):
-    raw, identities = ProtocolBuilder([(3, 2, ()), (6, 2, ()), (7, 2, ())], sync_tasks=(0, 1, 2)).run()
-    raw, identities = _set_claim_seal_observation(raw, identities)
-    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
-    mixed = [row for row in raw["admissions"] if row["close_seals"]]
-    if fault == "alias":
-        mixed[1]["close_seals_offset"] = mixed[0]["close_seals_offset"]
-    elif fault == "interior":
-        mixed[1]["close_seals_offset"] = mixed[0]["close_seals_offset"] + 64
-    elif fault == "swap":
-        mixed[1]["close_seals_offset"], mixed[2]["close_seals_offset"] = (
-            mixed[2]["close_seals_offset"],
-            mixed[1]["close_seals_offset"],
-        )
-    elif fault == "unaligned":
-        for row in mixed:
-            row["close_seals_offset"] += 8
-    elif fault == "gap":
-        mixed[2]["close_seals_offset"] += 128
-    else:
-        raw["task_controls"][0]["claim_seal"] = 0
-    with pytest.raises(ValueError, match="native protocol"):
+@pytest.mark.parametrize("mask", (1, 7))
+def test_zero_work_member_cannot_use_another_members_claim_for_close(mask):
+    raw, identities = _claim_seal_capture(mask, 2, sync=True, clusters=3)
+    member = next(member for member in raw["members"] if member["worker_index"] == 6)
+    member["flags"] |= MEMBER_FROM_CLAIM
+    member.update(closed_cursor=(1 << 64) - 1, claim_seal_seen=0, claim_cursor_seen=0)
+    with pytest.raises(ValueError, match="invalid owned-claim close proof"):
+        audit_native_protocol(raw, identities)
+
+
+def test_mix_late_lane_consumes_closed_prefix_after_another_lane_reuses_mailbox():
+    builder = ProtocolBuilder([(3, 2, ()), (5, 2, ())], sync_tasks=(0, 1))
+    builder.admit(0)
+    for block in range(2):
+        builder.mix_block(0, block, block)
+        builder.close(0, only_worker=block * 3)
+    builder.admit(1)
+    for block in range(2):
+        builder.mix_block(1, block, block)
+    builder.close(1)
+    for worker in (1, 4):
+        builder.close(0, only_worker=worker)
+    raw, identities = builder.run(order=[])
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+    assert all(
+        member["close_frontier"] == 2
+        for member in raw["members"]
+        if member["task_ref"] == 0 and member["worker_index"] in (1, 4)
+    )
+
+
+def test_mix_peer_cannot_observe_a_future_close_that_requires_its_own_retirement():
+    raw, identities = ProtocolBuilder([(7, 2, ()), (7, 2, ())], sync_tasks=(0, 1)).run()
+    member = next(member for member in raw["members"] if member["task_ref"] == 0 and member["worker_index"] == 1)
+    member["close_frontier"] = 2
+    with pytest.raises(ValueError):
         audit_native_protocol(raw, identities)
 
 
@@ -766,7 +784,7 @@ def test_converter_refuses_corrupt_present_protocol(tmp_path, mutation):
         "wrong_permit",
         "wrong_slot",
         "wrong_pending_slot",
-        "wrong_seal",
+        "wrong_frontier",
         "stale_ack",
         "missing_lane",
         "bad_placement",
@@ -793,7 +811,11 @@ def test_counts_and_complete_sequences_cannot_hide_protocol_corruption(mutation)
         "wrong_permit": (execution, "order_key", 1),
         "wrong_slot": (execution, "subtask_slot", 1),
         "wrong_pending_slot": (execution, "pending_slot", 2),
-        "wrong_seal": (raw["admissions"][1]["close_seals"], 0, raw["admissions"][1]["close_seals"][0] + 1),
+        "wrong_frontier": (
+            next(member for member in raw["members"] if member["task_ref"] == 1 and member["worker_index"] == 0),
+            "close_frontier",
+            len(raw["admission_log"]) + 1,
+        ),
         "stale_ack": (mixed["lanes"][1]["arrived_seq"], 2, 0),
         "missing_lane": (mixed["lanes"][0], "resource_mask", 6),
         "bad_placement": (mixed["lanes"][1], "lane_subtasks", [255, 2, 1]),
@@ -852,16 +874,14 @@ def test_ordinary_variable_grids_have_no_admission_membership(blocks):
         audit_native_protocol(raw, identities)
 
 
-@pytest.mark.parametrize("mutation", (None, "record_alignment", "record_alias", "seal_alignment", "seal_alias"))
-def test_compact_admission_and_seals_accept_64_only_alignment_and_reject_bad_regions(mutation):
+@pytest.mark.parametrize("mutation", (None, "record_alignment", "record_alias"))
+def test_compact_admission_accepts_64_only_alignment_and_rejects_bad_regions(mutation):
     raw, identities = ProtocolBuilder([(7, 2, ()), (7, 2, (0,))], clusters=2, sync_tasks=(0, 1)).run()
     _set_claim_seal_observation(raw, identities)
     raw.update(schema="hbg-native-protocol")
-    for index, row in enumerate(raw["admissions"]):
+    for row in raw["admissions"]:
         row["record_offset"] += 64
-        row["close_seals_offset"] = 8192 + 64 + index * raw["cluster_count"] * 64
     assert raw["admissions"][0]["record_offset"] % 128 == 64
-    assert raw["admissions"][0]["close_seals_offset"] % 128 == 64
     assert audit_native_protocol(raw, identities)["protocol_verified"]
     if mutation is None:
         return
@@ -870,11 +890,7 @@ def test_compact_admission_and_seals_accept_64_only_alignment_and_reject_bad_reg
         first["record_offset"] += 8
     elif mutation == "record_alias":
         second["record_offset"] = first["record_offset"]
-    elif mutation == "seal_alignment":
-        first["close_seals_offset"] += 8
-    else:
-        second["close_seals_offset"] = first["close_seals_offset"]
-    with pytest.raises(ValueError, match="record|seal"):
+    with pytest.raises(ValueError, match="record"):
         audit_native_protocol(raw, identities)
 
 

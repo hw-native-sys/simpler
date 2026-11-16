@@ -37,7 +37,8 @@ struct InlineFixture {
             protocol
         ),
         locals(workers),
-        admissions(workers) {
+        admissions(workers),
+        signals((workers + 2) / 3) {
         for (uint32_t task = 0; task < 3; ++task) {
             auto &metadata = storage.metadata[task];
             metadata.active_mask = LaneMask::aiv0();
@@ -83,9 +84,12 @@ struct InlineFixture {
                 context.cluster_worker_ids[lane] = worker / 3 * 3 + lane;
             storage.test_graphs[worker] = graph.graph();
         }
+        for (auto &signal : signals)
+            scheduler_cluster_signal_clear(&signal, 61);
         for (uint32_t worker = 0; worker < workers; ++worker) {
             auto &context = storage.contexts[worker];
             locals[worker] = storage.local_context(&context);
+            locals[worker]->cluster_signal = &signals[worker / 3];
 
             if (protocol) EXPECT_TRUE(scheduler_protocol_bind(base(), locals[worker]));
             if (ordered) {
@@ -149,6 +153,7 @@ struct InlineFixture {
     scheduler_test::BasicGraphBuffer<4> graph{3};
     std::vector<SchedulerLocalState *> locals;
     std::vector<SchedulerAdmissionLocalState> admissions;
+    std::vector<SchedulerClusterSignal> signals;
 };
 
 class HbgInlineDispatch : public ::testing::TestWithParam<bool> {};
@@ -168,6 +173,7 @@ TEST_P(HbgInlineDispatch, CompletesWithoutPayloadSlotGenerationOrKernelTrace) {
         static_cast<int64_t>(SchedulerTaskState::DONE)
     );
     EXPECT_EQ(local->pending_completed, 1u);
+    EXPECT_EQ(scheduler_cached_task_proof(local, 1), SchedulerTaskProof::DONE);
     fixture.expect_no_dispatch(1);
     if (!previous.empty()) EXPECT_EQ(std::memcmp(previous.data(), calls, previous.size()), 0);
     EXPECT_EQ(fixture.trace(2).kernel_start_cycles, 123456u);

@@ -98,8 +98,8 @@ static inline __aicore__ void scheduler_observe_data_cache(__gm__ void *address)
 #endif
 }
 
-// A5 ld_dev bypasses the scalar DCache. Atomic-published words require
-// atomic confirmation; bypass-published signals use this read directly.
+// A5 ld_dev bypasses the scalar DCache. Terminal completion and bypass-published
+// signals use this read directly; other protocol hints retain atomic confirmation.
 // Ownership changes use the CAS/exchange/fetch wrappers below.
 // Publication-protected metadata is invalidated separately before consumption.
 // The memory order every wrapper below takes is honored by the host and sim

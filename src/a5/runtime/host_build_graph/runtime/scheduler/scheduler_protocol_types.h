@@ -16,6 +16,7 @@
 #include <type_traits>
 
 inline constexpr uint64_t SCHEDULER_PROTOCOL_MAGIC = UINT64_C(0x53504d4454520002);
+inline constexpr uint32_t SCHEDULER_PROTOCOL_MEMBER_FROM_CLAIM = UINT32_C(1) << 28;
 // A physical synchronous completion aliases the actual last contribution stamps.
 inline constexpr uint32_t SCHEDULER_PROTOCOL_COMPLETION_FROM_GROUP = UINT32_C(1) << 29;
 inline constexpr uint32_t SCHEDULER_PROTOCOL_COMPLETION_FROM_CONTRIBUTION = UINT32_C(1) << 30;
@@ -73,7 +74,8 @@ struct alignas(64) SchedulerProtocolMemberTrace {
     uint64_t order_key;
     uint64_t observed_tail;
     uint64_t closed_cursor;
-    uint64_t close_seal;
+    // MIX coordinator: next prefix published after closed; peer: observed prefix.
+    uint64_t close_frontier;
     uint64_t last_group_seq;
     uint32_t worker_index;
     uint32_t flags;

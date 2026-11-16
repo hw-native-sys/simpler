@@ -186,15 +186,12 @@ TEST_F(ProtocolExportFixture, RejectsRedirectedAdmissionRecords) {
     EXPECT_THROW(dump(), std::invalid_argument);
 }
 
-TEST_F(ProtocolExportFixture, RejectsOutOfRegionSeal) {
-    at<SchedulerAdmissionRecord>(layout.admission_records_offset)->mix_close_seals_offset = layout.total_size - 8;
-    EXPECT_THROW(dump(), std::invalid_argument);
-}
-
-TEST_F(ProtocolExportFixture, PreservesMemberCountRecordBindingSealAndRawTopology) {
+TEST_F(ProtocolExportFixture, PreservesMemberCountRecordBindingFrontierAndRawTopology) {
     auto *record = at<SchedulerAdmissionRecord>(layout.admission_records_offset);
     record->member_count = 65;
-    at<SchedulerMixCloseSeal>(record->mix_close_seals_offset)->value = 17;
+    auto *member = at<SchedulerProtocolMemberTrace>(layout.protocol.members_offset);
+    member->observed.sequence = 1;
+    member->close_frontier = 17;
     auto *contexts = at<SchedulerWorkerContext>(layout.worker_contexts_offset);
     contexts[1].physical_core_id = 65;
     contexts[1].cluster_index = 0;
@@ -206,63 +203,17 @@ TEST_F(ProtocolExportFixture, PreservesMemberCountRecordBindingSealAndRawTopolog
     EXPECT_NE(json.find("\"record_offset\":" + std::to_string(layout.admission_records_offset)), std::string::npos);
     EXPECT_EQ(json.find("\"member_words\""), std::string::npos);
     EXPECT_EQ(json.find("\"member_rank_offset\""), std::string::npos);
-    EXPECT_NE(json.find("\"close_seals\":[17,0]"), std::string::npos);
+    EXPECT_NE(json.find("\"close_frontier\":17"), std::string::npos);
     EXPECT_NE(json.find("\"core_id\":65"), std::string::npos);
     EXPECT_NE(json.find("\"cluster_workers\":[0,2,1]"), std::string::npos);
 }
 
-TEST(ProtocolCloseSealExport, ReadsEveryClusterAndTaskValueWithoutInterpretingCellPadding) {
-    AicoreSchedulerLayout layout{};
-    ASSERT_TRUE(scheduler_plan_layout(2, &layout, false, 8, {6, 2, 2, 2, 2}, true));
-    scheduler_test::SchedulerStateBuffer storage(layout);
-    auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(storage.base(), layout.task_metadata_offset);
-    scheduler_test::BasicGraphBuffer<2> graph(2);
-    for (uint32_t task = 0; task < 2; ++task) {
-        graph.mixed(task, LaneMask(true, true, false));
-        metadata[task].active_mask = LaneMask(true, true, false);
-        metadata[task].logical_block_num = 2;
-        metadata[task].flags =
-            SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_MIX | SCHEDULER_TASK_SPMD | SCHEDULER_TASK_SYNC_START;
-        metadata[task].trace_index_base = task * 4;
-        metadata[task].timing_slot = -1;
-        metadata[task].kernel_ids[0] = metadata[task].kernel_ids[1] = 1;
-        metadata[task].kernel_ids[2] = UINT16_MAX;
-    }
-    ASSERT_TRUE(scheduler_init_spmd_task_records(storage.base(), layout, 91));
-    const auto tasks = scheduler_protocol_freeze_graph(graph.graph(), {metadata[0], metadata[1]});
-    const std::array<std::array<uint64_t, 2>, 2> expected{{{17, 29}, {41, 53}}};
-    for (uint32_t task = 0; task < 2; ++task) {
-        auto *record = scheduler_state_at<SchedulerAdmissionRecord>(
-            storage.base(), layout.admission_records_offset + task * sizeof(SchedulerAdmissionRecord)
-        );
-        auto *cells = scheduler_state_at<SchedulerMixCloseSeal>(storage.base(), record->mix_close_seals_offset);
-        for (uint32_t cluster = 0; cluster < 2; ++cluster) {
-            auto *bytes = reinterpret_cast<uint8_t *>(&cells[cluster]);
-            std::memset(bytes + sizeof(uint64_t), 0xa5, sizeof(SchedulerMixCloseSeal) - sizeof(uint64_t));
-            cells[cluster].value = expected[task][cluster];
-        }
-    }
-    const auto dump = [&] {
-        return scheduler_export_protocol(storage.base(), layout.total_size, layout, 91, tasks);
-    };
-    const auto json = dump();
-    EXPECT_EQ(json.find("\"close_seal_stride\""), std::string::npos);
-    EXPECT_NE(json.find("\"close_seals\":[17,29]"), std::string::npos);
-    EXPECT_NE(json.find("\"close_seals\":[41,53]"), std::string::npos);
-    auto *record = scheduler_state_at<SchedulerAdmissionRecord>(storage.base(), layout.admission_records_offset);
-    for (uint64_t delta : {UINT64_C(1), UINT64_C(8), UINT64_C(16), UINT64_C(64), UINT64_C(512)}) {
-        SCOPED_TRACE(delta);
-        record->mix_close_seals_offset = layout.mix_close_seals_offset + delta;
-        EXPECT_THROW(dump(), std::invalid_argument);
-    }
-}
-
-TEST(ProtocolCloseSealExport, RejectsARegionThatContainsTheValueButNotTheCompleteCell) {
-    alignas(128) std::array<uint8_t, 2 * sizeof(SchedulerMixCloseSeal)> bytes{};
-    const scheduler_protocol_export::Image image(bytes.data(), sizeof(SchedulerMixCloseSeal) + sizeof(uint64_t));
-    EXPECT_NE(image.array<SchedulerMixCloseSeal>(0, 1), nullptr);
-    EXPECT_THROW(image.array<SchedulerMixCloseSeal>(0, 2), std::invalid_argument);
-    EXPECT_THROW(image.array<SchedulerMixCloseSeal>(sizeof(uint64_t), 1), std::invalid_argument);
+TEST(ProtocolImageBounds, RejectsARegionThatContainsTheValueButNotTheCompleteCell) {
+    alignas(128) std::array<uint8_t, 2 * sizeof(SchedulerProtocolMemberTrace)> bytes{};
+    const scheduler_protocol_export::Image image(bytes.data(), sizeof(SchedulerProtocolMemberTrace) + sizeof(uint64_t));
+    EXPECT_NE(image.array<SchedulerProtocolMemberTrace>(0, 1), nullptr);
+    EXPECT_THROW(image.array<SchedulerProtocolMemberTrace>(0, 2), std::invalid_argument);
+    EXPECT_THROW(image.array<SchedulerProtocolMemberTrace>(sizeof(uint64_t), 1), std::invalid_argument);
 }
 
 TEST(ProtocolGraphSnapshot, OwnsMetadataAndFaninsAcrossHostGraphReuse) {

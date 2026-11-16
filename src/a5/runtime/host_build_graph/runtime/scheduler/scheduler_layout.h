@@ -51,8 +51,6 @@ struct AicoreSchedulerLayout {
     uint64_t admission_records_offset;
     uint64_t admission_log_offset;
     uint64_t group_mailboxes_offset;
-    uint64_t mix_close_seals_offset;
-    uint64_t mix_close_seal_count;
     uint64_t protocol_layout_offset;
     SchedulerProtocolLayout protocol;
 };

@@ -23,22 +23,14 @@
 
 enum class SchedulerCompletionObservation : uint8_t { PENDING, DONE, INVALID };
 
-static inline __aicore__ SchedulerCompletionObservation
-scheduler_confirm_task_completion(__gm__ SchedulerTaskControl *control) {
-    const uint64_t confirmed = scheduler_gm_fetch_add(control->completion_state, UINT64_C(0));
-    if (!scheduler_completion_valid(confirmed)) return SchedulerCompletionObservation::INVALID;
-    return scheduler_completion_done(confirmed) ? SchedulerCompletionObservation::DONE :
-                                                  SchedulerCompletionObservation::PENDING;
-}
-
-// A bypass load is only a pending hint. Completion (and malformed hints) must
-// be confirmed atomically from the one canonical word before dependency use.
+// The completion word has one task identity per run, and DONE is terminal.
+// A reliable bypass snapshot establishes completion without changing ownership.
 static inline __aicore__ SchedulerCompletionObservation
 scheduler_observe_task_completion(__gm__ SchedulerTaskControl *control) {
-    const uint64_t hint = scheduler_gm_query(control->completion_state);
-    if (scheduler_completion_valid(hint) && !scheduler_completion_done(hint))
-        return SchedulerCompletionObservation::PENDING;
-    return scheduler_confirm_task_completion(control);
+    const uint64_t state = scheduler_gm_query(control->completion_state);
+    if (!scheduler_completion_valid(state)) return SchedulerCompletionObservation::INVALID;
+    return scheduler_completion_done(state) ? SchedulerCompletionObservation::DONE :
+                                              SchedulerCompletionObservation::PENDING;
 }
 
 enum class SchedulerPredicateResult : uint8_t {
@@ -70,7 +62,12 @@ struct SchedulerGmMixLocalState {
     uint8_t subtask_slot{UINT8_MAX};
     SchedulerGmMixPhase phase{SchedulerGmMixPhase::IDLE};
     bool completion_submitted{false};
+    uint8_t arrivals_confirmed{0};
+    uint8_t releases_confirmed{0};
+    bool release_failed{false};
 };
+
+static_assert(sizeof(SchedulerGmMixLocalState) == 64);
 
 struct SchedulerClusterMixLocalState {
     int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
@@ -109,7 +106,6 @@ struct SchedulerAdmissionLocalState {
     LaneMask current_active_mask{};
     uint8_t current_flags{0};
     uint64_t current_claim_limit{0};
-    uint64_t current_mix_close_seal_offset{0};
     uint32_t current_claim_positions{0};
     uint8_t current_single_subtask{UINT8_MAX};
     LaneMask current_resource_mask{};
@@ -126,7 +122,7 @@ struct SchedulerAdmissionLocalState {
 };
 
 static_assert(sizeof(SchedulerGmMixLocalState) == 64, "GM group-local state size changed");
-static_assert(sizeof(SchedulerAdmissionLocalState) == 176, "admission-local state size changed");
+static_assert(sizeof(SchedulerAdmissionLocalState) == 168, "admission-local state size changed");
 
 struct SchedulerLocalSlotState {
     SchedulerPreparedHandle prepared{};
@@ -235,12 +231,18 @@ struct SchedulerLocalState {
     int64_t issue_task_ref{SCHEDULER_TASK_REF_INVALID};
     uint32_t issue_next_fanin{0};
     bool issue_fanin_confirmed{false};
+    // An authoritative no-ticket observation forbids another allocation attempt
+    // for issue_task_ref; only the shared seal permits advancing issue_cursor.
+    bool issue_ticket_exhausted{false};
     uint32_t execution_check_cursor{0};
     int64_t continuation_task_ref{SCHEDULER_TASK_REF_INVALID};
     int64_t cooperative_fanin_task_ref{SCHEDULER_TASK_REF_INVALID};
     uint32_t cooperative_next_fanin{0};
     // Private, run-local task identity and monotone proof; zero is an empty tag.
     uint64_t task_proof_tags[SCHEDULER_TASK_PROOF_CACHE_COUNT]{};
+    // High 32 bits hold ref + 1; low 32 bits hold its confirmed fanin prefix.
+    // Graph refs fit INT32_MAX, and a fresh run initializes every entry to zero.
+    uint64_t control_fanin_tags[SCHEDULER_TASK_PROOF_CACHE_COUNT]{};
 
     inline __aicore__ explicit SchedulerLocalState(SchedulerLocalProfilingState *profile = nullptr) :
         profiling(profile) {}

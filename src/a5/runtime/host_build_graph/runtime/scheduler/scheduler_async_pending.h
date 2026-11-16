@@ -36,6 +36,12 @@ enum class Result : uint8_t {
     COUNT_UNDERFLOW,
 };
 
+// The join owner carries its RMW result into canonical completion.
+struct Outcome {
+    Result result;
+    uint64_t previous;
+};
+
 constexpr inline __aicore__ uint32_t pending(uint64_t word) { return static_cast<uint32_t>(word & UINT64_C(0xffff)); }
 constexpr inline __aicore__ uint32_t registered(uint64_t word) {
     return static_cast<uint32_t>((word >> 16) & UINT64_C(0xffff));
@@ -45,7 +51,7 @@ constexpr inline __aicore__ bool valid(uint64_t word) {
     return (word >> 33) == 0 && registered(word) <= COUNT_MAX && pending(word) <= registered(word);
 }
 
-// Readiness validates an already granted FINISH lease; reading it grants no ownership.
+// A terminal join validates an RMW-issued completion proof; reading grants no ownership.
 constexpr inline __aicore__ bool ready_to_finish(uint64_t word) {
     return valid(word) && closed(word) && pending(word) == 0 && registered(word) != 0;
 }
@@ -74,20 +80,20 @@ static inline __aicore__ Result register_group(Atomics &atomics) {
 }
 
 template <typename Atomics>
-static inline __aicore__ Result close_computation(Atomics &atomics) {
+static inline __aicore__ Outcome close_computation(Atomics &atomics) {
     const uint64_t previous = atomics.fetch_add(COMPUTATION_CLOSED);
-    if (!valid(previous)) return Result::INVALID_WORD;
-    if (closed(previous)) return Result::INVALID_TRANSITION;
-    if (pending(previous) != 0) return Result::PENDING;
-    return registered(previous) == 0 ? Result::SYNCHRONOUS : Result::FINISH_OWNER;
+    if (!valid(previous)) return {Result::INVALID_WORD, previous};
+    if (closed(previous)) return {Result::INVALID_TRANSITION, previous};
+    if (pending(previous) != 0) return {Result::PENDING, previous};
+    return {registered(previous) == 0 ? Result::SYNCHRONOUS : Result::FINISH_OWNER, previous};
 }
 
 template <typename Atomics>
-static inline __aicore__ Result complete_group(Atomics &atomics) {
+static inline __aicore__ Outcome complete_group(Atomics &atomics) {
     const uint64_t previous = atomics.fetch_add(UINT64_MAX);
-    if (!valid(previous)) return Result::INVALID_WORD;
-    if (pending(previous) == 0) return Result::COUNT_UNDERFLOW;
-    return closed(previous) && pending(previous) == 1 ? Result::FINISH_OWNER : Result::PENDING;
+    if (!valid(previous)) return {Result::INVALID_WORD, previous};
+    if (pending(previous) == 0) return {Result::COUNT_UNDERFLOW, previous};
+    return {closed(previous) && pending(previous) == 1 ? Result::FINISH_OWNER : Result::PENDING, previous};
 }
 
 }  // namespace detail
@@ -97,12 +103,12 @@ static inline __aicore__ Result register_group(__gm__ Join &join) {
     return detail::register_group(atomics);
 }
 
-static inline __aicore__ Result close_computation(__gm__ Join &join) {
+static inline __aicore__ Outcome close_computation(__gm__ Join &join) {
     detail::GmAtomics atomics{join.word};
     return detail::close_computation(atomics);
 }
 
-static inline __aicore__ Result complete_group(__gm__ Join &join) {
+static inline __aicore__ Outcome complete_group(__gm__ Join &join) {
     detail::GmAtomics atomics{join.word};
     return detail::complete_group(atomics);
 }

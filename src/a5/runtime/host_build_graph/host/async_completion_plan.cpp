@@ -95,9 +95,6 @@ bool plan_async_completion(
         !reserve_array<SchedulerAsyncTaskJoin>(&cursor, layout.async_task_count, &layout.joins_offset) ||
         !reserve_array<SchedulerAsyncDirectoryWord>(
             &cursor, (static_cast<uint64_t>(layout.group_count) + 63) / 64, &layout.check_directory_offset
-        ) ||
-        !reserve_array<SchedulerAsyncDirectoryWord>(
-            &cursor, (static_cast<uint64_t>(layout.async_task_count) + 63) / 64, &layout.finish_directory_offset
         ))
         return reject(error, "async control storage overflows");
     if (sdma_guard_count != 0 &&
@@ -108,8 +105,7 @@ bool plan_async_completion(
         return reject(error, "header storage overflows");
     cursor = next.initialized_bytes;
     if (!reserve_array<SchedulerAsyncLease>(&cursor, layout.group_count, &layout.group_leases_offset) ||
-        !reserve_array<SchedulerAsyncGroupProgress>(&cursor, layout.group_count, &layout.group_progress_offset) ||
-        !reserve_array<SchedulerAsyncLease>(&cursor, layout.async_task_count, &layout.finish_leases_offset))
+        !reserve_array<SchedulerAsyncGroupProgress>(&cursor, layout.group_count, &layout.group_progress_offset))
         return reject(error, "deferred control storage overflows");
     for (auto &task : next.tasks) {
         uint32_t block_entry_bytes = 0;
@@ -167,11 +163,8 @@ bool initialize_async_completion(void *image, uint64_t image_bytes, const AsyncC
         joins[index].word = 0;
     }
     auto *checks = scheduler_state_at<SchedulerAsyncDirectoryWord>(image, plan.layout.check_directory_offset);
-    auto *finishes = scheduler_state_at<SchedulerAsyncDirectoryWord>(image, plan.layout.finish_directory_offset);
     for (uint64_t word = 0; word < (static_cast<uint64_t>(plan.layout.group_count) + 63) / 64; ++word)
         checks[word].bits = 0;
-    for (uint64_t word = 0; word < (static_cast<uint64_t>(plan.layout.async_task_count) + 63) / 64; ++word)
-        finishes[word].bits = 0;
     AsyncGroupData header{};
     header.run_epoch = plan.layout.run_epoch;
     header.sdma_guards_offset = plan.layout.sdma_guards_offset;
