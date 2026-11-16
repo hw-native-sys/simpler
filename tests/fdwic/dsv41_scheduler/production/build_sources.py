@@ -38,6 +38,7 @@ def build(flavor, output, tools, pto, jobs):
     sources = ROOT / "kernels" / flavor
     workload = ROOT / "workloads" / flavor
     manifest = json.loads((sources / "manifest.json").read_text())
+    native = manifest.get("execution") == "native_moe_host_control"
     output.mkdir(parents=True, exist_ok=True)
     compiler = KernelCompiler("a5")
     common_includes = compiler.get_orchestration_include_dirs("host_build_graph")
@@ -126,7 +127,8 @@ def build(flavor, output, tools, pto, jobs):
     )
     orchestration = get_or_compile_incore(key, lambda: compiler.compile_orchestration("host_build_graph", str(source)))
     (output / "orchestration.so").write_bytes(orchestration)
-    shutil.copytree(workload / "inputs", output, dirs_exist_ok=True)
+    if not native:
+        shutil.copytree(workload / "inputs", output, dirs_exist_ok=True)
     rows = []
     for kernel, record in zip(manifest["kernels"], records, strict=True):
         signature = kernel["signature"]
@@ -148,23 +150,26 @@ def build(flavor, output, tools, pto, jobs):
         ],
         check=True,
     )
-    # This callable captures the full original Host submissions; case execution
-    # later uses the replay adapter with the same original core code placement.
-    subprocess.run(
-        [
-            str(tools / "native-runner"),
-            "--repack-orchestration",
-            str(output / "original-callable.bin"),
-            str(tools / "libcapture.so"),
-            str(output / "callable.bin"),
-        ],
-        check=True,
-    )
+    if native:
+        shutil.copy2(output / "original-callable.bin", output / "callable.bin")
+    else:
+        # This callable captures the full original Host submissions; case execution
+        # later uses the replay adapter with the same original core code placement.
+        subprocess.run(
+            [
+                str(tools / "native-runner"),
+                "--repack-orchestration",
+                str(output / "original-callable.bin"),
+                str(tools / "libcapture.so"),
+                str(output / "callable.bin"),
+            ],
+            check=True,
+        )
     save(
         output / "name_map.json",
         {
             "level": 2,
-            "orchestrator_name": "l2_decode_fwd",
+            "orchestrator_name": "l2_moe" if native else "l2_decode_fwd",
             "callable_id_to_name": {str(k["func_id"]): k["name"] for k in manifest["kernels"]},
         },
     )
@@ -202,6 +207,14 @@ def main():
             args.pto_isa.resolve(),
             args.jobs,
         )
+        if flavor == "pypto_lib_latest":
+            build(
+                "native_moe",
+                args.build_dir.resolve() / "native-moe",
+                args.build_dir.resolve() / "host",
+                args.pto_isa.resolve(),
+                args.jobs,
+            )
 
 
 if __name__ == "__main__":

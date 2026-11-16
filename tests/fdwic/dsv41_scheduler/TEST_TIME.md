@@ -1,43 +1,49 @@
 # DSV4.1 scheduler test execution time
 
-Measured on A5 on 2026-11-15, based on the requested HBG revision `8db8a15fc`, with the test-runner changes published as `6d050abbd`.
-These are whole-test seconds, including process startup, input preparation, device setup, warmup, measurement, validation where enabled, and teardown. They are not AICore kernel latency.
+Measured on A5 on 2026-11-16 with the 12 selected cases, runtime source
+`5abd1794980eaa493f618067b91aeff117191a63`, without PR #3108. Times below
+include startup, input loading, device setup, warmup, measurement, validation
+where enabled, and teardown. They are whole-test seconds, not AICore latency.
 
-The final 16-case run completed in **68.55 seconds** with up to eight automatically allocated devices, from first submission to all results returned. The native weight cache was warm.
-The sum of individual job durations fell from **382.53 to 226.05 seconds (40.9% less)**. This sum is not parallel wall time. Each job excludes queue time; the matrix wall time includes queueing and submission/collection. No comparable complete baseline matrix wall time was measured.
+| Scope | Previous runner (s) | Standalone native runner (s) |
+| ----- | ------------------: | ---------------------------: |
+| Native MoE, same allocated device pair | 16.29 | 6.77 |
+| Full 12-case percounter matrix, up to eight devices | 62.76 | 44.00 |
 
-| Case | Implementation | Before (s) | After, warm cache (s) |
-| ---- | -------------- | ---------: | --------------------: |
-| swa | Native PyPTO-lib | 16.55 | 10.47 |
-| c2a_full | Initial PyPTO-lib | 15.54 | 11.35 |
-| c2a_full | DSL half-sync | 12.93 | 14.68 |
-| c2a_full | DSL all-sync <=64 | 18.94 | 13.05 |
-| c2a_full | Native PyPTO-lib | 14.34 | 12.34 |
-| c1a_reindex | Native PyPTO-lib | 17.09 | 20.32 |
-| c1a_reuse | Native PyPTO-lib | 22.31 | 17.20 |
-| moe | Initial PyPTO-lib | 8.28 | 6.28 |
-| moe | DSL half-sync | 8.28 | 6.41 |
-| moe | DSL all-sync <=64 | 11.70 | 16.16 |
-| moe | Native PyPTO-lib | 139.92 | 11.03 |
-| engram | Native PyPTO-lib | 17.08 | 13.73 |
-| layers_19_21 | Initial PyPTO-lib | 19.20 | 19.41 |
-| layers_19_21 | DSL half-sync | 21.28 | 17.53 |
-| layers_19_21 | DSL all-sync <=64 | 22.88 | 19.13 |
-| layers_19_21 | Native PyPTO-lib | 16.20 | 16.99 |
+The MoE comparison ran both launchers sequentially on automatically allocated
+devices 2 and 3, using the same original callable, input bytes and percounter
+runtime. It is one observed pair; startup variability remains. The full matrices
+used separate automatic allocations and include submission, queueing and result
+collection, so their difference is not a controlled paired speedup estimate.
+The standalone matrix passed all 12 cases with ten valid samples each.
 
-## Measurement and changes
+## Execution and dependencies
 
-- Both runs use the same compiled HBG runtime and business binaries, one warmup and ten measured rounds. No target workload was shortened. All two-device launches retain the device-side start rendezvous; L0 AICore endpoints and rank aggregation are checked.
-- Replay cases retain every reference/output comparison. Bulk file reads and bulk one-byte initializer fills reduce host input and validation overhead without changing bytes.
-- Native MoE is a performance test for `72/72` tokens. It retains live Host control reads and original nonzero weights/routing, but skips `0/6`, `6/0`, numerical golden calculation and output comparison. Results explicitly mark `numerical_validation: false`.
-- Fixed native weights and scales are cached by model revision, Torch version and layout. The cache is 2,479,476,799 bytes (2.48 GB; 2.31 GiB), for both ranks combined. The measured runner verified the file digest and tensor layouts; first creation verified serialized bytes against generated tensors. The integrated runner checks identity, file size and tensor layouts without file-digest verification. These timings remain measurements of the original runner, not a rerun of that integration change.
-- First cache creation took 40.87 seconds for input preparation. A cache-hit run took 1.50 seconds for that stage and 10.57 seconds overall; the final concurrent matrix measured 11.03 seconds for native MoE. The final performance-only cold-start total was not separately measured.
-- The before/after table is one observed run per case, with different automatic allocations. Driver startup and process-exit delays vary by several seconds. Separate matched-pair replay runs reduced cumulative input setup/reset/validation from 83.23 to 45.89 seconds while retaining all comparisons; this isolates the host-side improvement more clearly than individual total durations.
+- Prepared tests use standard Python plus the C++ runner and Simpler/CANN.
+  The full matrix ran under isolated system Python (`python3 -I`), without
+  loading PyPTO, PyPTO-lib, Torch or Simpler Python bindings.
+- Native MoE retains the original generated C++ Host orchestration, actual
+  `get_tensor_data<int32_t>(num_tokens)`, nonzero weights, forced routing and
+  device communication. All 50 exported per-rank tensor inputs were checked
+  byte-for-byte against the original model fixtures. Kernels were reused.
+- All cases retain one warmup and ten measured rounds. Two-device runs retain
+  the Device-side start rendezvous before timing. The other 11 cases retain
+  numerical checks; native MoE remains performance-only for `72/72` tokens,
+  explicitly recording `numerical_validation: false`.
+- Initial native MoE bundle preparation requires CPU Torch and writes local
+  raw inputs. Its 2.48 GB weights/cache stay in ignored build directories.
+  Preparation is outside these timings; its cold duration was not remeasured.
+  Prepared bundles need no model checkout or Python ML environment.
 
 ## Reproduction and evidence
 
-Use the usual `production/run.sh` command with level `0`, warmup `1`, rounds `10`, and already prepared bundles. The native cache is created and reused automatically in `build/native-weights/`. Reserve devices with `task-submit --device auto --device-num N`; use the returned `TASK_DEVICE`. At most eight devices were occupied across concurrent jobs.
+Use `production/run.sh` with level `0`, warmup `1`, rounds `10` and prepared
+bundles. Allocate devices using `task-submit --device auto --device-num N`
+and use the returned `TASK_DEVICE`; do not pin device IDs. No more than eight
+devices were occupied concurrently.
 
-Local evidence is under `artifacts/turnaround/` in the dedicated test-turnaround worktree: `comparison.json` records actual before/after devices, `runtime-audit.json` records the verified reused runtime, `final-state.json` records matrix time and completed jobs, and per-case `wall.json`, timing files and logs retain the measurements. Prepared business bundles were reused from the existing local benchmark artifacts.
-
-Validation: all 16 final cases completed with ten valid L0 samples; replay numerical comparisons passed, native MoE timing-only execution passed. Current CPU tests cover cache byte fidelity, fresh dynamic inputs, model-revision separation, truncated-cache rejection and timing/report validation.
+Local evidence in the standalone worktree is under `artifacts/native-moe/`:
+`pair.json`, `percounter-state.json`, `summary.json`, `input-parity.json` and
+per-case `wall.json`/timing logs record allocations, measured times, input
+comparisons and rendezvous evidence. The previous matrix is recorded in the
+base-refresh worktree's `artifacts/base-refresh/summary.json`.

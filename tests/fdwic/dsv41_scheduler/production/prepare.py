@@ -33,11 +33,8 @@ def main():
         "--flavor", choices=["pypto_lib", "pypto_lib_dsl", "pypto_lib_latest", "both", "all"], default="all"
     )
     parser.add_argument("--sync-policy", choices=["half", "all-cap64", "both"], default="both")
-    parser.add_argument("--pypto-lib-root", type=Path, help="Clean dev/hbg checkout for native MoE goldens")
     parser.add_argument("--native-moe-bundle", type=Path, help="Reuse an existing compatible native MoE bundle")
     args = parser.parse_args()
-    if args.flavor in ("all", "pypto_lib_latest") and args.pypto_lib_root is None:
-        parser.error("The selected native MoE case requires --pypto-lib-root")
     output, build, runtime = args.output.resolve(), args.build_dir.resolve(), args.runtime.resolve()
     runtime_files = (
         "host_build_graph/libhost_runtime.so",
@@ -77,7 +74,6 @@ def main():
             output / "cases",
             build / "host",
             args.sync_policy,
-            args.pypto_lib_root,
             args.native_moe_bundle,
         )
         for variant in variants:

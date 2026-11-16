@@ -49,7 +49,7 @@ for ((rank=0; rank<ranks; ++rank)); do
 done
 if [[ -f "$bundle/case.json" ]] && "${DSV41_PYTHON:-python3}" -c \
     'import json,sys; sys.exit(json.load(open(sys.argv[1])).get("execution") != "native_moe_host_control")' "$bundle/case.json"; then
-    [[ -f "$bundle/native-callable.bin" ]] || { echo 'Prepare native MoE with production/moe.py first' >&2; exit 2; }
+    [[ -f "$bundle/callable.bin" ]] || { echo 'Prepare native MoE with production/moe.py first' >&2; exit 2; }
     mkdir -p "$output/ascend"
     export ASCEND_PROCESS_LOG_PATH="$output/ascend"
     "${DSV41_PYTHON:-python3}" "$root/production/moe.py" "$bundle" "$output/L$4" \

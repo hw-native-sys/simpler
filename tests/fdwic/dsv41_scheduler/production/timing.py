@@ -107,7 +107,12 @@ def summarize(per_rank, devices, warmup, rounds):
 
 
 def replay_rank_samples(directory, result):
-    require(result["passed"] and result["validated_against_fused_prefix"], "Replay numerical validation failed")
+    native = result.get("execution") == "native_moe_host_control"
+    require(result["passed"], "Execution failed")
+    if native:
+        require(result.get("numerical_validation") is False, "Native MoE is a performance-only run")
+    else:
+        require(result["validated_against_fused_prefix"], "Replay numerical validation failed")
     text = "\n".join(path.read_text() for path in sorted((directory / "host").glob("host.*.log")))
     kernels, _ = paired_spans(text)
     device = result["device"]
@@ -132,7 +137,7 @@ def replay_rank_samples(directory, result):
             "Unexpected profiled runs after L0 samples",
         )
     spans = kernels[device]
-    snapshot = result["snapshot_inputs"]
+    snapshot = result["snapshot_inputs"] or native
     require(len(spans) == (len(runs) if snapshot else 1 + 2 * len(runs)), "Missing replay kernel endpoints")
     return [
         spans[index if snapshot else 2 + 2 * index]["duration_ns"] / 1e6 for index in range(warmup, warmup + rounds)

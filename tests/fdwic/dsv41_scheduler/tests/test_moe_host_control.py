@@ -69,7 +69,7 @@ def test_frozen_pypto_lib_moe_is_rejected(tmp_path):
 
 def test_native_audit_rejects_compile_only_and_missing_count_case(tmp_path):
     audit = load("analyze", PRODUCTION.parent)
-    case = {"case": "moe", "flavor": "pypto_lib_latest", "lib_commit": "source"}
+    case = {"case": "moe", "flavor": "pypto_lib_latest", "source_commit": "source"}
     for level in (0, 1, 3):
         directory = tmp_path / "moe" / f"L{level}"
         directory.mkdir(parents=True)
