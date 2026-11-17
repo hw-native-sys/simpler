@@ -59,7 +59,7 @@ def test_unconfirmed_stop_blocks_prepared_successor():
     first.begin()
     with pytest.raises(RuntimeError, match="stop unconfirmed"):
         first.finish()
-    with pytest.raises(RuntimeError, match="confirmed stop"):
+    with pytest.raises(RuntimeError, match="admission is closed"):
         second.begin()
 
 
@@ -86,6 +86,6 @@ def test_exit_timeout_requires_stop_confirmation_before_admitting_successor(monk
         with pytest.raises(RuntimeError, match="stop is unconfirmed"):
             first.finish()
         assert operations == [(1, 1), (3, 1), (3, 1), (9, 1), (4, 1)]
-        assert binding.active
-        with pytest.raises(RuntimeError, match="confirmed stop"):
+        assert not binding.active  # The fallback abort succeeded, but the run still failed.
+        with pytest.raises(RuntimeError, match="admission is closed"):
             successor.begin()

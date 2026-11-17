@@ -11,6 +11,213 @@
 #pragma once
 
 #include "hccl/hccl_rank_graph.h"
+#include "ccu_domain_backend_hcomm.cpp"
+
+struct CcuTestStream {
+    aclrtStreamStatus status{ACL_STREAM_STATUS_COMPLETE};
+    aclError abort_error{};
+    aclError query_error{};
+    int aborts{};
+    int queries{};
+    int not_ready_query{};
+};
+static std::unordered_map<aclrtStream, std::unique_ptr<CcuTestStream>> ccu_test_streams;
+
+extern "C" aclError aclrtCreateStream(aclrtStream *out) {
+    auto stream = std::make_unique<CcuTestStream>();
+    *out = stream.get();
+    ccu_test_streams.emplace(*out, std::move(stream));
+    return ACL_SUCCESS;
+}
+extern "C" aclError aclrtDestroyStream(aclrtStream stream) {
+    assert(ccu_test_streams.erase(stream) == 1);
+    return ACL_SUCCESS;
+}
+extern "C" aclError aclrtStreamAbort(aclrtStream stream) {
+    auto &state = *ccu_test_streams.at(stream);
+    ++state.aborts;
+    return state.abort_error;
+}
+extern "C" aclError aclrtStreamQuery(aclrtStream stream, aclrtStreamStatus *status) {
+    auto &state = *ccu_test_streams.at(stream);
+    ++state.queries;
+    *status = state.queries == state.not_ready_query ? ACL_STREAM_STATUS_NOT_READY : state.status;
+    return state.query_error;
+}
+
+extern "C" CcuResult HcommCcuGetMemToken(uint64_t, uint64_t, uint64_t *token) {
+    *token = 1;
+    return CCU_SUCCESS;
+}
+extern "C" HcclResult
+HcclThreadAcquireWithStream(HcclComm, CommEngine engine, aclrtStream stream, uint32_t, ThreadHandle *thread) {
+    assert(engine == COMM_ENGINE_CCU);
+    *thread = reinterpret_cast<uint64_t>(stream);
+    return HCCL_SUCCESS;
+}
+extern "C" CcuResult HcommCcuKernelLaunch(ThreadHandle thread, CcuKernelHandle, const void *, uint32_t) {
+    assert(ccu_test_streams.count(reinterpret_cast<aclrtStream>(thread)));
+    return CCU_SUCCESS;
+}
+extern "C" aclError aclrtLaunchKernelWithHostArgs(
+    aclrtFuncHandle, uint32_t, aclrtStream, aclrtLaunchKernelCfg *, void *args, size_t, aclrtPlaceHolderInfo *, size_t
+) {
+    const auto *words = static_cast<const uint64_t *>(args);
+    *reinterpret_cast<uint64_t *>(words[2]) = 0;
+    return ACL_SUCCESS;
+}
+extern "C" aclError aclrtSynchronizeStreamWithTimeout(aclrtStream, int32_t) { return ACL_SUCCESS; }
+
+static aclrtStream
+add_ccu_abort_registration(CommHandle h, uint64_t id, uint32_t mission_count = 1, bool launch = false) {
+    using namespace simpler::ccu;
+    auto backend = std::make_unique<HcommDomainResourceBackend>();
+    backend->stream_pool = &h->ccu_stream_pool;
+    if (!launch) {
+        for (uint32_t i = 0; i < mission_count; ++i)
+            backend->streams.push_back(h->ccu_stream_pool.acquire());
+    }
+    assert(aclrtCreateStream(&backend->trigger_stream) == ACL_SUCCESS);
+    std::vector<HcommPreparedMission> missions;
+    if (launch) {
+        for (uint32_t i = 0; i < mission_count; ++i) {
+            HcommPreparedMission mission{};
+            mission.ccu_id = i;
+            mission.program_handle = 101 + i;
+            mission.ready_gate_address = 0x1000 + i * 64;
+            mission.trigger_gate_address = 0x2000 + i * 64;
+            mission.done_gate_address = 0x3000 + i * 64;
+            mission.parameter_size = 8;
+            mission.parameter_alignment = 64;
+            missions.push_back(mission);
+        }
+    }
+    assert(backend->prepare(missions, 41) != 0);
+    const auto trigger = backend->trigger_stream;
+    auto registration = std::make_unique<CcuCallableRegistration>();
+    registration->session = backend.get();
+    registration->owner = std::make_unique<DomainCcuOwner>(std::move(backend));
+    registration->prepared_allocations.emplace(41, 0);
+    if (launch) {
+        registration->owner->set_registered_kernels({{1, 0, 101}, {2, 1, 102}});
+        assert(registration->session->begin(*registration->owner, missions, 41, 0) != 0);
+    }
+    h->ccu_registrations.emplace(id, std::move(registration));
+    return trigger;
+}
+
+static void test_ccu_abort_retry(const std::string &failure) {
+    CommHandle_ h{};
+    char folder[] = "/tmp/simpler-ccu-retry-XXXXXX";
+    assert(mkdtemp(folder));
+    h.rootinfo_path = std::string(folder) + "/root";
+    if (failure == "retry_pool_error" || failure == "retry_pool_pending") {
+        const bool pending = failure == "retry_pool_pending";
+        const auto trigger = add_ccu_abort_registration(&h, 1, 2, pending);
+        auto &backend = *static_cast<simpler::ccu::HcommDomainResourceBackend *>(h.ccu_registrations.at(1)->session);
+        const auto retained_stream = backend.streams[1].stream;
+        auto &retained_state = *ccu_test_streams.at(retained_stream);
+        if (pending) retained_state.not_ready_query = 2;
+        else retained_state.query_error = ACL_ERROR_FAILURE;
+        assert(comm_control_ccu_run(&h, 1, 4, 41) == (pending ? 1 : COMM_RECLAMATION_UNCONFIRMED));
+        const auto reused = h.ccu_stream_pool.acquire();
+        assert(reused.handle == 1);
+        auto &reused_state = *ccu_test_streams.at(reused.stream);
+        reused_state.status = ACL_STREAM_STATUS_NOT_READY;
+        const int reused_queries = reused_state.queries;
+        const int retained_queries = retained_state.queries;
+        retained_state.query_error = ACL_SUCCESS;
+        if (pending) {
+            assert(retained_state.aborts == 1 && retained_queries == 2);
+            assert(comm_control_ccu_run(&h, 1, 7, 41) == COMM_RECLAMATION_UNCONFIRMED);
+            assert(mappings.size() == 5);
+            assert(comm_control_ccu_run(&h, 1, 4, 41) == 0);
+            assert(retained_state.aborts == 1 && retained_state.queries == 3);
+            assert(ccu_test_streams.at(trigger)->aborts == 1 && ccu_test_streams.at(trigger)->queries == 1);
+            assert(reused_state.aborts == 1 && reused_state.queries == reused_queries);
+            assert(!h.cleanup_failed && backend.drained());
+            reused_state.status = ACL_STREAM_STATUS_COMPLETE;
+            assert(h.ccu_stream_pool.release(reused.handle) == simpler::ccu::MissionStreamReleaseResult::RELEASED);
+            assert(comm_control_ccu_run(&h, 1, 7, 41) == 0);
+            assert(comm_release_ccu_registration(&h, 1) == 0);
+            assert(h.ccu_stream_pool.close());
+            assert(mappings.empty() && ccu_test_streams.empty());
+            std::filesystem::remove_all(folder);
+            return;
+        }
+        assert(comm_control_ccu_run(&h, 1, 4, 41) == COMM_RECLAMATION_UNCONFIRMED);
+        assert(comm_control_ccu_run(&h, 1, 7, 41) == COMM_RECLAMATION_UNCONFIRMED);
+        assert(reused_state.aborts == 0 && reused_state.queries == reused_queries);
+        assert(retained_state.queries == retained_queries);
+        assert(h.cleanup_failed && !backend.drained());
+        assert(mappings.size() == 3);
+        std::filesystem::remove_all(folder);
+        return;
+    }
+    const auto first = add_ccu_abort_registration(&h, 1);
+    const auto second = add_ccu_abort_registration(&h, 2);
+    auto &first_state = *ccu_test_streams.at(first);
+    auto &second_state = *ccu_test_streams.at(second);
+    h.ccu_run_sets[9].generation = 41;
+    h.ccu_run_sets[9].registrations = {1, 2};
+    if (failure == "retry_pending") {
+        second_state.status = ACL_STREAM_STATUS_NOT_READY;
+        assert(comm_control_ccu_run_set(&h, 9, 4) == 1);
+        assert(!h.cleanup_failed && h.ccu_admission_closed);
+        assert(comm_destroy(&h) == COMM_RECLAMATION_UNCONFIRMED);
+        assert(!h.cleanup_failed);
+        assert(comm_control_ccu_run_set(&h, 9, 7) == COMM_RECLAMATION_UNCONFIRMED);
+        assert(comm_control_ccu_run(&h, 2, 7, 41) == COMM_RECLAMATION_UNCONFIRMED);
+        assert(mappings.size() == 6 && !h.cleanup_failed);
+
+        // A completed registration has already returned its pool lease.
+        const auto reused = h.ccu_stream_pool.acquire();
+        assert(reused.handle == 1);
+        auto &reused_state = *ccu_test_streams.at(reused.stream);
+        reused_state.status = ACL_STREAM_STATUS_NOT_READY;
+        const int reused_queries = reused_state.queries;
+        first_state.query_error = ACL_ERROR_FAILURE;
+        second_state.status = ACL_STREAM_STATUS_COMPLETE;
+        assert(comm_control_ccu_run_set(&h, 9, 4) == 0);
+        assert(!h.cleanup_failed);
+        assert(comm_control_ccu_run_set(&h, 9, 4) == 0);
+        assert(first_state.aborts == 1 && first_state.queries == 1);
+        assert(second_state.aborts == 1 && second_state.queries == 2);
+        assert(reused_state.aborts == 0 && reused_state.queries == reused_queries);
+        assert(h.ccu_registrations.at(1)->owner->drained());
+        assert(comm_control_ccu_run(&h, 1, 1, 42) < 0);
+
+        reused_state.status = ACL_STREAM_STATUS_COMPLETE;
+        assert(h.ccu_stream_pool.release(reused.handle) == simpler::ccu::MissionStreamReleaseResult::RELEASED);
+        assert(comm_control_ccu_run_set(&h, 9, 7) == 0);
+        assert(comm_release_ccu_registration(&h, 1) == 0);
+        assert(comm_release_ccu_registration(&h, 2) == 0);
+        assert(h.ccu_stream_pool.close());
+        assert(ccu_test_streams.empty() && mappings.empty());
+        std::filesystem::remove_all(folder);
+        return;
+    }
+    if (failure == "retry_abort_error") first_state.abort_error = ACL_ERROR_FAILURE;
+    else if (failure == "retry_query_error") first_state.query_error = ACL_ERROR_FAILURE;
+    else {
+        assert(failure == "retry_unknown");
+        first_state.status = ACL_STREAM_STATUS_RESERVED;
+    }
+    second_state.status = ACL_STREAM_STATUS_NOT_READY;
+    assert(comm_control_ccu_run_set(&h, 9, 4) == COMM_RECLAMATION_UNCONFIRMED);
+    assert(h.cleanup_failed && h.ccu_admission_closed);
+    first_state.abort_error = first_state.query_error = ACL_SUCCESS;
+    first_state.status = second_state.status = ACL_STREAM_STATUS_COMPLETE;
+    assert(comm_control_ccu_run_set(&h, 9, 4) == COMM_RECLAMATION_UNCONFIRMED);
+    assert(h.cleanup_failed);
+    assert(first_state.aborts == 1 && first_state.queries == 1);
+    assert(second_state.aborts == 1 && second_state.queries == 2);
+    assert(!h.ccu_registrations.at(1)->owner->drained());
+    assert(comm_destroy(&h) == COMM_RECLAMATION_UNCONFIRMED);
+    assert(!h.ccu_stream_pool.close());
+    assert(!ccu_test_streams.empty());
+    std::filesystem::remove_all(folder);
+}
 
 extern "C" {
 int simpler_ccu_test_manifest_variant = 0;

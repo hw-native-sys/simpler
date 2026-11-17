@@ -2144,6 +2144,7 @@ TEST_F(NativeAdmissionTest, CapacityRefusalAllowsTheSamePreparedIdentityToLaunch
         };
         runner.launch_refusal_rc = SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
         EXPECT_EQ(launch(), SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL);
+        EXPECT_EQ(simpler_query_run_completion(&runner, candidate.storage), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
         EXPECT_EQ(state->phase.load(), NativeRunPhase::Prepared);
         EXPECT_EQ(state->prepared_execution.get(), prepared);
         EXPECT_EQ(state->active_execution, nullptr);

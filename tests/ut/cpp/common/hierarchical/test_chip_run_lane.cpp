@@ -480,6 +480,66 @@ ChipRun submit(ChipRunLane &lane, uint64_t run_id, uint32_t slot, bool activate 
     return lane.submit(1, args, CallConfig{}, PipelineSlotLease{slot, 0, run_id}, run_id, run_id, nullptr, 0, activate);
 }
 
+TEST(ChipRunLaneTest, TerminalPrepareRetainsRealLaneCarrierUntilDiscard) {
+    ChipWorker worker;
+    prime_worker(worker);
+    worker.run_lane_ = std::make_unique<ChipRunLane>(worker);
+    auto active = submit(*worker.run_lane_, 1, 0);
+    auto prepared = submit(*worker.run_lane_, 2, 1, false);
+    ASSERT_NE(std::find(g_events.begin(), g_events.end(), "prepare1"), g_events.end());
+    g_complete[0] = true;
+    ASSERT_TRUE(active.wait_until(ChipRun::Clock::now()));
+    const auto retained_events = g_events;
+    worker.control_ccu_terminal(11);
+    EXPECT_EQ(g_events, retained_events);
+    EXPECT_FALSE(prepared.launched());
+    worker.control_ccu_terminal(12);
+    EXPECT_EQ(g_events, retained_events);
+    worker.control_ccu_terminal(13);
+    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "finalize1"), 1);
+    const auto discarded_events = g_events;
+    worker.control_ccu_terminal(12);
+    worker.control_ccu_terminal(13);
+    EXPECT_EQ(g_events, discarded_events);
+}
+
+TEST(ChipRunLaneTest, TerminalFenceRetainsAuthorizedSuccessorWhileProducerFinishes) {
+    ChipWorker worker;
+    prime_worker(worker);
+    worker.query_run_completion_fn_ = [](void *, void *runtime) -> int {
+        return g_complete[slot_of(runtime)] ? SIMPLER_NATIVE_RUN_POLL_COMPLETE : SIMPLER_NATIVE_RUN_POLL_NOT_READY;
+    };
+    worker.run_lane_ = std::make_unique<ChipRunLane>(worker);
+    auto active = submit(*worker.run_lane_, 1, 0);
+    auto authorized = submit(*worker.run_lane_, 2, 1);
+    ASSERT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0", "prepare1"}));
+    EXPECT_THROW(worker.control_ccu_terminal(11), std::runtime_error);
+    const auto retained_events = g_events;
+    EXPECT_THROW(authorized.activate(), std::runtime_error);
+    EXPECT_FALSE(authorized.done());
+    EXPECT_THROW(authorized.wait_until(ChipRun::Clock::now()), std::runtime_error);
+    EXPECT_THROW(authorized.abandon(), std::runtime_error);
+    worker.stop_chip_run_lane_admission();
+    EXPECT_THROW(worker.close_chip_run_lane(), std::runtime_error);
+    EXPECT_EQ(g_events, retained_events);
+    EXPECT_EQ(g_poll_count, 0u);
+    g_complete[0] = true;
+    worker.control_ccu_terminal(11);
+    worker.control_ccu_terminal(12);
+    EXPECT_EQ(g_events, retained_events);
+    worker.control_ccu_terminal(13);
+    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "launch1"), 0);
+    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "finalize1"), 1);
+    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "finalize0"), 1);
+    EXPECT_TRUE(active.done());
+    const auto discarded_events = g_events;
+    worker.control_ccu_terminal(11);
+    worker.control_ccu_terminal(12);
+    worker.control_ccu_terminal(13);
+    EXPECT_EQ(g_events, discarded_events);
+    EXPECT_NO_THROW(worker.finalize());
+}
+
 }  // namespace
 
 namespace {
@@ -1443,15 +1503,15 @@ TEST(ChipRunLaneTest, TerminalHostRecoveryRetainsUnstoppedCcuResources) {
     prime_worker(worker);
     worker.unstopped_ccu_runs_.emplace(1, 2, 3);
     EXPECT_THROW(worker.quiesce_host_uses(), std::runtime_error);
-    EXPECT_TRUE(worker.ccu_cleanup_unconfirmed_);
+    // Pending stops block cleanup without permanently poisoning later teardown.
+    EXPECT_FALSE(worker.ccu_cleanup_unconfirmed_);
     EXPECT_FALSE(worker.host_uses_quiesced_);
     EXPECT_FALSE(worker.native_runs_closing_);
     EXPECT_EQ(worker.unstopped_ccu_runs_.size(), 1u);
     EXPECT_THROW(worker.finalize(), std::runtime_error);
+    EXPECT_EQ(worker.unstopped_ccu_runs_.size(), 1u);
     // The fake has no live CCU backend; clear only its retained test ledger.
     worker.unstopped_ccu_runs_.clear();
-    worker.ccu_cleanup_unconfirmed_ = false;
-    worker.comm_cleanup_unconfirmed_ = false;
     worker.finalize();
 }
 

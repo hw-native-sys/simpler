@@ -160,7 +160,6 @@ def build_host_resource_binary(build, rdma, *, ccu_backend=False):
         backend_sources = [
             str(host / name)
             for name in (
-                "ccu_domain_backend_hcomm.cpp",
                 "ccu_domain_registration_hcomm.cpp",
                 "ccu_run_lifecycle_hcomm.cpp",
             )
@@ -491,3 +490,19 @@ def test_legacy_ccu_channel_rollback_retains_unconfirmed_resources(ccu_failure_b
 def test_domain_and_registration_communicators_use_domain_mode(ccu_failure_binary):
     binary, module, env = ccu_failure_binary
     subprocess.run([str(binary), str(module), "modes"], env=env, check=True, timeout=20)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "retry_pending",
+        "retry_abort_error",
+        "retry_query_error",
+        "retry_unknown",
+        "retry_pool_error",
+        "retry_pool_pending",
+    ],
+)
+def test_ccu_abort_retries_only_pending_sdk_queries(ccu_failure_binary, failure):
+    binary, module, env = ccu_failure_binary
+    subprocess.run([str(binary), str(module), failure], env=env, check=True, timeout=20)

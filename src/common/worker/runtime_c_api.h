@@ -1255,6 +1255,9 @@ int simpler_launch_run_joined(DeviceContextHandle ctx, RuntimeHandle runtime, Ru
  */
 int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 
+/** Optional terminal preflight. Observe physical completion without retiring execution or releasing run storage. */
+int simpler_query_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime);
+
 /**
  * Internal blocking physical progress under the runtime's existing timeout.
  * Zero proves own boundaries and queued-wait consumption, and retires execution

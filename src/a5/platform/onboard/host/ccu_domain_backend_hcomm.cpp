@@ -166,7 +166,7 @@ public:
     aclrtStream trigger_stream{};
 
     uint64_t prepare(const std::vector<HcommPreparedMission> &missions, uint64_t generation) override {
-        if (generation == 0 || prepared_.count(generation) != 0 || closed_)
+        if (generation == 0 || prepared_.count(generation) != 0 || closed_ || abort_attempted_)
             throw std::runtime_error("invalid or duplicate CCU preparation generation");
         allocation_generation_ = generation;
         auto &prepared = prepared_[generation];
@@ -220,6 +220,8 @@ public:
     }
 
     void discard(uint64_t generation) override {
+        if (abort_attempted_ && !abort_confirmed_)
+            throw std::runtime_error("cannot discard a CCU preparation after an unconfirmed abort");
         if (generation == active_generation_ && run_ && !run_->confirmed_stopped())
             throw std::runtime_error("cannot discard an executing CCU preparation");
         release_memory(generation);
@@ -229,6 +231,8 @@ public:
     uint64_t begin(
         DomainCcuOwner &owner, const std::vector<HcommPreparedMission> &missions, uint64_t generation, uint64_t
     ) override {
+        if (closed_ || abort_attempted_ || !owner.lifecycle().admission_open())
+            throw std::runtime_error("CCU domain admission is closed");
         if (run_ && !run_->confirmed_stopped()) throw std::runtime_error("CCU prior run has no confirmed stop");
         if (generation == active_generation_) throw std::runtime_error("CCU generation was already activated");
         auto found = prepared_.find(generation);
@@ -292,29 +296,63 @@ public:
     }
 
     bool stop() override {
+        if (abort_attempted_) return abort_confirmed_;
         if (!run_) return true;
+        if (run_->confirmed_stopped()) return release_streams();
         const bool complete = run_->poll_terminal();
         if (const auto *failure = run_->primary_failure())
             throw std::runtime_error(failure->operation + ": " + std::to_string(failure->native_error));
-        if (complete) release_streams();
-        return complete;
+        return complete && release_streams();
     }
 
     bool finish_completed_requests() override {
+        if (abort_attempted_) return abort_confirmed_;
         if (!run_) return true;
+        if (run_->confirmed_stopped()) return release_streams();
         const bool complete = run_->finish_completed_requests();
         if (const auto *failure = run_->primary_failure())
             throw std::runtime_error(failure->operation + ": " + std::to_string(failure->native_error));
-        if (complete) release_streams();
-        return complete;
+        return complete && release_streams();
     }
 
-    void abort() override {
-        if (run_) run_->abort();
+    bool abort_pending() const noexcept override { return abort_attempted_ && !abort_failed_ && !abort_confirmed_; }
+
+    bool abort() override try {
+        if (abort_confirmed_) return true;
+        if (abort_failed_) return false;
+        abort_attempted_ = true;
+        bool stopped = !run_ || run_->abort();
+        if (!stopped && !run_->abort_pending()) abort_failed_ = true;
+        if (trigger_stream != nullptr && !trigger_abort_confirmed_) {
+            if (!trigger_abort_attempted_) {
+                trigger_abort_attempted_ = true;
+                const auto rc = aclrtStreamAbort(trigger_stream);
+                if (rc != ACL_SUCCESS) {
+                    LOG_ERROR("[ccu] trigger stream abort failed: %d", rc);
+                    abort_failed_ = true;
+                }
+            }
+            aclrtStreamStatus state = ACL_STREAM_STATUS_RESERVED;
+            const auto query = aclrtStreamQuery(trigger_stream, &state);
+            if (query != ACL_SUCCESS || (state != ACL_STREAM_STATUS_COMPLETE && state != ACL_STREAM_STATUS_NOT_READY)) {
+                LOG_ERROR("[ccu] trigger stream stop unconfirmed: query=%d state=%d", query, state);
+                abort_failed_ = true;
+            }
+            trigger_abort_confirmed_ = query == ACL_SUCCESS && state == ACL_STREAM_STATUS_COMPLETE;
+            stopped = trigger_abort_confirmed_ && stopped;
+        }
+        if (!stopped || abort_failed_) return false;
+        if (!release_streams()) return false;
+        abort_confirmed_ = true;
+        return true;
+    } catch (...) {
+        abort_failed_ = true;
+        throw;
     }
 
     bool drained() const override {
         if (closed_) return false;
+        if (abort_attempted_) return abort_confirmed_;
         if (run_ && !run_->confirmed_stopped()) return false;
         for (const auto &mission : streams) {
             if (mission.stream == nullptr) continue;
@@ -333,11 +371,6 @@ public:
     bool close() override {
         if (closed_) return true;
         if (!drained()) return false;
-        run_.reset();
-        sdk_.reset();
-        for (const auto &entry : prepared_)
-            release_memory(entry.first);
-        prepared_.clear();
         if (staging_instance != 0) {
             if (HcommCcuInsDestroy(staging_instance) != CCU_SUCCESS) return false;
             staging_instance = 0;
@@ -354,7 +387,7 @@ public:
             unassigned_instance = 0;
             channels.fill(0);
         }
-        release_streams();
+        if (!release_streams()) return false;
         thread_bindings.clear();
         if (trigger_stream != nullptr && aclrtDestroyStream(trigger_stream) != ACL_SUCCESS) return false;
         trigger_stream = nullptr;
@@ -364,19 +397,32 @@ public:
         communicator = nullptr;
         if (owns_channels && shared_channels && !shared_channels->close()) return false;
         shared_channels.reset();
+        for (const auto &entry : prepared_)
+            release_memory(entry.first);
+        prepared_.clear();
+        run_.reset();
+        sdk_.reset();
         closed_ = true;
         return true;
     }
 
 private:
-    void release_streams() {
+    bool release_streams() {
+        bool complete = true;
         for (auto &stream : streams) {
             if (stream.handle == 0) continue;
-            if (!stream_pool->release(stream.handle))
-                throw std::runtime_error("CCU mission pool return is unconfirmed");
+            const auto result = stream_pool->release(stream.handle);
+            if (result == MissionStreamReleaseResult::FAILED)
+                throw std::runtime_error("CCU mission pool return failed");
+            if (result == MissionStreamReleaseResult::PENDING) {
+                complete = false;
+                continue;
+            }
             stream.handle = 0;
+            stream.stream = nullptr;
         }
-        streams.clear();
+        if (complete) streams.clear();
+        return complete;
     }
 
     static void copy_to_device(uint64_t address, const void *source, size_t bytes) {
@@ -423,6 +469,11 @@ private:
     uint64_t active_generation_{};
     std::unique_ptr<HcommRunLifecycleSdk> sdk_;
     std::unique_ptr<DomainRun> run_;
+    bool abort_attempted_{false};
+    bool abort_confirmed_{false};
+    bool abort_failed_{false};
+    bool trigger_abort_attempted_{false};
+    bool trigger_abort_confirmed_{false};
     bool closed_{false};
 };
 

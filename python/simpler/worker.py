@@ -922,6 +922,9 @@ _CTRL_OP_NAMES[_CTRL_HOST_DDR] = "host_ddr"
 _CTRL_DFX_FLUSH = 27
 _CTRL_CCU_DOMAIN = 28
 _CCU_DOMAIN_REQUEST = struct.Struct("<QQI32si")
+_CCU_TERMINAL_PREPARE = 11
+_CCU_TERMINAL_STOP = 12
+_CCU_TERMINAL_DISCARD = 13
 _CTRL_BUFFER_EXPORT = 30
 _CTRL_OP_NAMES[_CTRL_DFX_FLUSH] = "flush_diagnostics"
 # The native flush wait takes a millisecond count in a C `int`. The wire field
@@ -3061,8 +3064,9 @@ def _ccu_control_requires_idle(buf: memoryview) -> bool:
         if size < _CCU_DOMAIN_REQUEST.size:
             return False
         operation = _CCU_DOMAIN_REQUEST.unpack_from(payload)[2]
-        # Association only updates the child resolver; it does not touch live CCU resources.
-        return operation != 6
+        # Terminal preflight owns its native-state check and must reach prepared
+        # successors even when the parent will never activate them.
+        return operation not in (6, _CCU_TERMINAL_PREPARE, _CCU_TERMINAL_STOP, _CCU_TERMINAL_DISCARD)
     finally:
         payload.release()
         staged.close()
@@ -3585,6 +3589,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
         )
     global_domain_store = _L2GlobalDomainStore()
     base_comm_handle = 0
+    ccu_terminal_requested = False
     diagnostic_capture_index = 0
     ccu_bindings = {}
     ccu_binding_acquisitions = {}
@@ -3642,7 +3647,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
         *,
         terminal: bool = False,
     ) -> tuple[int, str]:
-        nonlocal base_comm_handle
+        nonlocal base_comm_handle, ccu_terminal_requested
         code = 0
         msg = ""
         try:
@@ -3760,11 +3765,24 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                     if size < _CCU_DOMAIN_REQUEST.size:
                         raise ValueError("CCU domain control payload size mismatch")
                     allocation, generation, operation, digest, _ = _CCU_DOMAIN_REQUEST.unpack_from(payload)
-                    if terminal and operation not in (3, 4, 7):
+                    if terminal and operation not in (
+                        3,
+                        4,
+                        7,
+                        _CCU_TERMINAL_PREPARE,
+                        _CCU_TERMINAL_STOP,
+                        _CCU_TERMINAL_DISCARD,
+                    ):
                         raise RuntimeError("CCU admission is closed; only cleanup controls are accepted")
-                    comm = _require_base_communicator(base_comm_handle)
+                    terminal_operation = operation in (_CCU_TERMINAL_PREPARE, _CCU_TERMINAL_STOP, _CCU_TERMINAL_DISCARD)
+                    comm = base_comm_handle if terminal_operation else _require_base_communicator(base_comm_handle)
                     result = 0
-                    if operation == 9:
+                    if terminal_operation:
+                        if size != _CCU_DOMAIN_REQUEST.size:
+                            raise ValueError("CCU terminal control payload size mismatch")
+                        ccu_terminal_requested = True
+                        cw.control_ccu_terminal(operation)
+                    elif operation == 9:
                         try:
                             tail = _CCU_DOMAIN_REQUEST.size
                             collective_id, rank_count, domain_rank, ccu_id = struct.unpack_from("<QIII", payload, tail)
@@ -3972,6 +3990,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
     live_entry_count = max(1, int(granted_sets)) + MAILBOX_REQUEST_FRAMES
 
     def run_staged_frame_loop() -> None:  # noqa: PLR0912, PLR0915 -- one progress owner drives control and every run
+        nonlocal ccu_terminal_requested
         # Two pools, with different lifetimes. A request frame carries one
         # submission's bytes and goes back as soon as they are copied out; a
         # run-state entry carries the run itself, for as long as it lives.
@@ -4008,11 +4027,13 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
             launched_published: bool = False
             ended_published: bool = False
             published_disposition: int = _DISPOSITION_NONE
+            uses_ccu: bool = False
             ccu_binding: Any = None
             ccu_started: bool = False
             native_activated: bool = False
 
         staged_runs: dict[int, _StagedRun] = {}
+        terminal_staged_runs: list[_StagedRun] = []
 
         def task_frame_references_digest(digest: bytes) -> bool:
             # A live run's digest, from this side's own record of it: the frame
@@ -4127,7 +4148,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
             # its own storage, so this POD need not outlive the call.
             args = staged.pending_args  # type: ignore[attr-defined]
             plan = args.ccu_bindings()
-            if plan:
+            staged.uses_ccu = bool(plan)
+            if staged.uses_ccu:
                 from .ccu import ChipCcuRunSet  # noqa: PLC0415
 
                 registrations = []
@@ -4185,6 +4207,11 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                 staged.ccu_binding.discard()
                 staged.ccu_binding = None
 
+        def close_ccu_admission() -> None:
+            nonlocal ccu_terminal_requested
+            ccu_terminal_requested = True
+            cw._fence_chip_run_lane()
+
         def activate_run(staged: _StagedRun) -> bool:
             for previous in staged_runs.values():
                 if (
@@ -4196,13 +4223,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
             if staged.ccu_binding is not None:
                 staged.ccu_binding.begin()
                 staged.ccu_started = True
-            try:
-                staged.chip_run.activate()
-                staged.native_activated = True
-            except BaseException:
-                if staged.ccu_binding is not None:
-                    staged.ccu_binding.abort()
-                raise
+            staged.chip_run.activate()
+            staged.native_activated = True
             return True
 
         def finish_ccu_run(staged: _StagedRun) -> None:
@@ -4238,7 +4260,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                 finish_ccu_run(staged)
             except Exception as e:  # noqa: BLE001
                 if staged.ccu_started:
-                    staged.ccu_binding.abort()
+                    close_ccu_admission()
+                    terminal_staged_runs.append(staged)
                 code = 1
                 msg = _format_exc(f"chip_process dev={device_id}: chip run", e)
             if import_registry.host_mappings is not None and (
@@ -4322,7 +4345,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
 
         def serve_terminal_host_cleanup():
             mappings = import_registry.host_mappings
-            if not isinstance(mappings, ChildHostMappings):
+            if not isinstance(mappings, ChildHostMappings) and not ccu_terminal_requested:
                 return
             # The parent can retain cleanup obligations after NONE/H2D uses
             # retire. Keep the endpoint until the parent completes its protocol
@@ -4374,6 +4397,9 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                         ccu_control_requires_idle = None
                         _write_error(buf, code, msg)
                         _mailbox_store_i32(state_addr, _CONTROL_DONE)
+                        if ccu_terminal_requested:
+                            shutdown_message = f"chip_process dev={device_id}: CCU terminal cleanup closed admission"
+                            break
                         # A handler that could not establish conservative
                         # resource ownership requests this worker's own stop.
                         # Honour it here, before anything below stages,
@@ -4412,16 +4438,23 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                     break
 
                 for staged in sorted(new_runs, key=lambda run: run.identity[4]):
+                    if ccu_terminal_requested:
+                        fail_run(staged, shutdown_message)
+                        continue
                     try:
                         submit_run(staged)
                     except Exception as e:  # noqa: BLE001
-                        if staged.ccu_started:
-                            staged.ccu_binding.abort()
-                        else:
-                            discard_unlaunched_ccu(staged)
-                        fail_run(staged, _format_exc(f"chip_process dev={device_id}: chip run submit", e))
+                        message = _format_exc(f"chip_process dev={device_id}: chip run submit", e)
+                        if staged.uses_ccu:
+                            close_ccu_admission()
+                            terminal_staged_runs.append(staged)
+                            shutdown_message = message
+                        fail_run(staged, message)
                     else:
                         staged_runs[staged.index] = staged
+
+                if ccu_terminal_requested:
+                    break
 
                 stop_progress = False
                 for staged in sorted(staged_runs.values(), key=lambda run: run.identity[4]):
@@ -4523,6 +4556,25 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
                         shutdown_message = f"chip_process dev={device_id}: parent exited"
                         break
         finally:
+            if ccu_terminal_requested or any(staged.ccu_binding is not None for staged in staged_runs.values()):
+                ccu_terminal_requested = True
+                # A local CCU failure can arrive before the parent's PREPARE.
+                # Hand back frames while keeping every native owner until the
+                # all-peer STOP barrier authorizes DISCARD and lane cleanup.
+                cw._fence_chip_run_lane()
+                for staged in staged_runs.values():
+                    fail_run(staged, shutdown_message)
+                    terminal_staged_runs.append(staged)
+                staged_runs.clear()
+                reject_terminal_frames()
+                for index, entry_buf in enumerate(entry_bufs):
+                    entry_state_addr = entry_addrs[index] + _OFF_ENTRY_STATE
+                    if _mailbox_load_u64(entry_addrs[index] + _OFF_ENTRY_GENERATION) % 2 == 0:
+                        continue
+                    if _mailbox_load_i32(entry_state_addr) not in (_TASK_DONE, _TASK_FAILED):
+                        _write_entry_error(entry_buf, 1, shutdown_message)
+                        _mailbox_store_i32(entry_state_addr, _TASK_FAILED)
+                serve_terminal_host_cleanup()
             try:
                 cw._stop_chip_run_lane_admission()  # noqa: SLF001 -- terminal child teardown
                 cw._close_chip_run_lane()
@@ -6400,6 +6452,11 @@ class Worker:
         # callable, while this table only records a run's allocation binding.
         self._ccu_run_registrations: dict[tuple[int, bytes], list[int]] = {}
         self._ccu_context_registrations: dict[tuple[Any, bytes], list[int]] = {}
+        self._ccu_terminal_error: BaseException | None = None
+        self._ccu_terminal_phase = _CCU_TERMINAL_PREPARE
+        self._ccu_terminal_acks: set[int] = set()
+        self._ccu_terminal_lock = threading.Lock()
+        self._ccu_terminal_cleanup_pending = False
         # Exactly one caller drives CTRL_RELEASE_DOMAIN for a given allocation,
         # and every other caller waits for its outcome. Several paths can reach
         # one handle at once — an end-of-run or close() sweep working from its
@@ -11548,12 +11605,58 @@ class Worker:
                     self._record_unreclaimable("CCU stop is unconfirmed; domain resources are retained", error)
 
     def _stop_run_ccu_domains(self, resources, native_error) -> None:
-        if native_error is None:
+        if native_error is None or not resources.ccu_domains:
             return
-        for handle in resources.ccu_domains.values():
-            self._abort_ccu_domain(handle)
-        if resources.ccu_domains:
-            raise RuntimeError("CCU run aborted after ordinary task failure") from native_error
+        with self._ccu_terminal_lock:
+            if self._ccu_terminal_error is None:
+                self._ccu_terminal_error = native_error
+                self._ccu_terminal_cleanup_pending = True
+            self._drive_ccu_terminal_cleanup_locked()
+
+    def _finish_ccu_terminal_cleanup(self) -> None:
+        with self._ccu_terminal_lock:
+            self._drive_ccu_terminal_cleanup_locked()
+
+    def _drive_ccu_terminal_cleanup_locked(self) -> None:
+        if not self._ccu_terminal_cleanup_pending:
+            return
+        key = ("native", "CCU terminal cleanup")
+        self._cleanup_journal.add_once(*key, self._advance_ccu_terminal_cleanup)
+        error = self._cleanup_journal.drive({key})
+        if error is not None:
+            raise error
+
+    def _advance_ccu_terminal_cleanup(self) -> None:
+        native = self._worker
+        if native is None:
+            raise RuntimeError("CCU terminal cleanup lost its chip transports")
+        workers = tuple(range(len(self._config.get("device_ids", ()))))
+        if not workers:
+            raise RuntimeError("CCU terminal cleanup has no participating chip workers")
+        while self._ccu_terminal_phase <= _CCU_TERMINAL_DISCARD:
+            operation = self._ccu_terminal_phase
+            errors: list[BaseException | None] = [None] * len(workers)
+
+            def send(chip):
+                try:
+                    payload = _CCU_DOMAIN_REQUEST.pack(0, 0, operation, bytes(32), 0)
+                    reply = native.control_payload(
+                        WorkerType.NEXT_LEVEL, chip, _CTRL_CCU_DOMAIN, payload, self._py_control_timeout_s
+                    )
+                    if _CCU_DOMAIN_REQUEST.unpack_from(reply)[-1] != 0:
+                        raise RuntimeError(f"CCU terminal phase {operation} remains unconfirmed on chip {chip}")
+                except BaseException as error:
+                    errors[chip] = error
+
+            pending = tuple(chip for chip in workers if chip not in self._ccu_terminal_acks)
+            _start_and_join_threads(pending, send, name_prefix="ccu-terminal-")
+            self._ccu_terminal_acks.update(chip for chip in pending if errors[chip] is None)
+            for error in errors:
+                if error is not None:
+                    raise error
+            self._ccu_terminal_acks.clear()
+            self._ccu_terminal_phase += 1
+        self._ccu_terminal_cleanup_pending = False
 
     def _domain_serialization(self):
         return contextlib.nullcontext() if _callback_frame_for(self) is not None else self._submit_mu.exclusive()
@@ -14905,6 +15008,10 @@ class Worker:
         """Refuse if a prior run's ordered cleanup failed."""
         self._require_no_delegated_session_fatal(api)
         with self._hierarchical_start_cv:
+            if getattr(self, "_ccu_terminal_error", None) is not None:
+                raise RuntimeError(
+                    f"Worker.{api}: a CCU run failed and no further work is admitted; close() it"
+                ) from self._ccu_terminal_error
             if self._ordered_cleanup_error is not None:
                 raise RuntimeError(
                     f"Worker.{api}: a prior run's ordered cleanup failed, so this worker's device state is "
@@ -15657,6 +15764,15 @@ class Worker:
         try:
             resources = handle._resources
             orch = self._orch
+            try:
+                self._stop_run_ccu_domains(resources, native_error)
+            except BaseException:
+                # This is a release barrier, not an independent cursor action:
+                # every peer window and run keepalive survives until close retries it.
+                assert native_error is not None
+                handle._cache_finalization_error(native_error)
+                self._publish_abandoned_run(handle, native_error)
+                return native_error
 
             def _poison_endpoint() -> None:
                 if native_error is not None:
@@ -15672,7 +15788,6 @@ class Worker:
             cursor = _RunFinalizationCursor(
                 steps=(
                     ("endpoint_poison", _poison_endpoint),
-                    ("ccu_stop", lambda: self._stop_run_ccu_domains(resources, native_error)),
                     ("remote_slot_refs", lambda: self._release_active_remote_slot_refs(resources)),
                     ("remote_frees", self._flush_pending_remote_frees),
                     ("region_instances", lambda: self._region_instance_registry.cleanup_run(resources)),
@@ -16639,6 +16754,8 @@ class Worker:
             control_error = self._cleanup_journal.drive({key})
             if control_error is not None:
                 raise control_error
+
+        self._finish_ccu_terminal_cleanup()
 
         if self.level == 2:
             close_drained_chip_runs = self._close_completion is not None and self._close_completion.draining_chip_runs
