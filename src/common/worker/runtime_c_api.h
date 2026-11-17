@@ -135,6 +135,8 @@ enum {
        The run remains live and may be waited/finalized again. Never store this
        operation result as the execution's terminal error. */
     SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE = PTO_RUNTIME_ERR_BASE - 8,
+    /* Host register/unregister succeeded, but restoring the caller context failed. */
+    SIMPLER_HOST_DDR_CONTEXT_RESTORE_FAILED = PTO_RUNTIME_ERR_BASE - 9,
 };
 
 /**
