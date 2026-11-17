@@ -239,6 +239,41 @@ void prime_caller_streams(ChipWorker &worker) {
 
 using Events = std::vector<std::string>;
 
+TEST(ChipRunLaneJoinedLaunchTest, PendingCancelRetiresSuccessorBeforeJoinedSubmission) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    auto first = submit(lane, 30, 0, true, host_args());
+    auto second = submit(lane, 31, 1, false, host_args());
+    int32_t cancel = 1;
+    second.bind_peer_cancel(&cancel);
+    second.activate();
+    EXPECT_THROW(second.wait_until(ChipRun::Deadline::max()), std::runtime_error);
+    EXPECT_FALSE(second.launched());
+    EXPECT_EQ(g_events, (Events{"prepare0", "launch0", "prepare1", "finalize1"}));
+    first.wait_until(ChipRun::Deadline::max());
+    lane.close();
+}
+
+TEST(ChipRunLaneJoinedLaunchTest, DeferredBindFailureRetiresThePreparedCarrier) {
+    ChipWorker worker;
+    prime_worker(worker);
+    worker.peer_cancel_fn_ = [](void *, void *, const int32_t *) {
+        return -37;
+    };
+    ChipRunLane lane(worker);
+    auto run = submit(lane, 32, 0, false, host_args());
+    int32_t cancel = 0;
+    run.bind_peer_cancel(&cancel);
+    run.activate();
+    EXPECT_THROW(run.wait_until(ChipRun::Deadline::max()), std::runtime_error);
+    EXPECT_EQ(g_events, (Events{"prepare0", "finalize0"}));
+    EXPECT_TRUE(worker.native_runs_.empty());
+    auto next = submit(lane, 33, 0, true, host_args());
+    next.wait_until(ChipRun::Deadline::max());
+    lane.close();
+}
+
 TEST(ChipRunLaneJoinedLaunchTest, CallerSubmitQueuesItsExitBeforeReturning) {
     ChipWorker worker;
     prime_worker(worker);

@@ -510,10 +510,11 @@ def test_actual_child_submit_maps_before_native_admission_and_preserves_proofs(g
         if activation is not None:
             return SimpleNamespace(
                 preparation_disposition=worker_module._VALIDATED_ONLY,
+                bind_peer_cancel=Mock(),
                 activate=Mock(side_effect=MemoryError("device borrow failed")),
                 _owner_recovery_required=outcome == "activation-unproven",
             )
-        return SimpleNamespace(preparation_disposition=worker_module._NATIVE_PREPARED)
+        return SimpleNamespace(preparation_disposition=worker_module._NATIVE_PREPARED, bind_peer_cancel=Mock())
 
     native = Mock(side_effect=submit)
     namespace = dict(vars(worker_module))
@@ -522,6 +523,7 @@ def test_actual_child_submit_maps_before_native_admission_and_preserves_proofs(g
         import_registry=group.imports[0],
         registry={1: SimpleNamespace(sig_count=1, sig=lambda _index: worker_module.ArgDirection.IN)},
         cw=SimpleNamespace(_submit_chip_run_materialized=native),
+        _mailbox_load_i32=Mock(return_value=0),
         _mailbox_store_i32=Mock(),
         _write_entry_error=Mock(),
         staged_runs={},

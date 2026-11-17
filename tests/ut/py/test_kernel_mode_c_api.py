@@ -1544,6 +1544,22 @@ def _native_run_storage(lib):
     return storage, run
 
 
+@pytest.mark.parametrize(("arch", "runtime"), _SIM_CASES)
+def test_peer_cancel_binding_refuses_invalid_or_unsupported_runtime(arch, runtime):
+    lib = _load(arch, "sim", runtime)
+    lib.simpler_bind_peer_cancel.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32)]
+    lib.simpler_bind_peer_cancel.restype = ctypes.c_int
+    storage = ctypes.create_string_buffer(b"unprepared native owner")
+    before = bytes(storage)
+    request = ctypes.c_int32(0)
+    supported = arch == "a2a3" and runtime == "tensormap_and_ringbuffer"
+    expected = PTO_RUNTIME_ERR_INVALID_STATE if supported else PTO_RUNTIME_ERR_UNSUPPORTED
+    for _ in range(2):
+        assert lib.simpler_bind_peer_cancel(None, storage, ctypes.byref(request)) == expected
+        assert bytes(storage) == before
+        assert request.value == 0
+
+
 def _run_borrowed_prepare(arch, runtime, device, release_failure=False):  # noqa: PLR0915 -- one process owns the faulted context through exit
     from simpler.task_interface import (  # noqa: PLC0415
         AddressSpace,

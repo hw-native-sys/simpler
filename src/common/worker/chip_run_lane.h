@@ -49,6 +49,7 @@ public:
     // Release a caller-owned submission after its last possible execution.
     // Keep the handle for a checked retry if finalization fails.
     void finalize_after_last_use();
+    void bind_peer_cancel(const int32_t *request);
 
     bool launched() const;
     // Physical END awaiting result observation, distinct from cached TERMINAL.

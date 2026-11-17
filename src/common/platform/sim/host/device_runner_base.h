@@ -400,6 +400,8 @@ public:
      * "no region" exactly as it did before one existed.
      */
     uint64_t run_result_region_base(uint32_t pipeline_slot);
+    int request_peer_cancel(uint32_t pipeline_slot, uint64_t run_epoch);
+    int peer_cancel_wait_timeout_ms() const { return -1; }
 
     /**
      * That run's published diagnostic payload, or null when it published none.

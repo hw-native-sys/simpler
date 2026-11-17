@@ -97,6 +97,8 @@ private:
 struct NativeInvocationResultStorage {
     DeviceRunResultRegion result{};
     alignas(64) NativeInvocationEvidence evidence{};
+    // Host-owned line. A request names one live invocation; an old epoch is inert.
+    alignas(64) uint64_t peer_cancel_epoch{0};
 };
 static_assert(std::is_standard_layout_v<NativeInvocationEvidence>);
 static_assert(std::is_trivially_copyable_v<NativeInvocationEvidence>);

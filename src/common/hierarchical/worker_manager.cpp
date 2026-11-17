@@ -1177,6 +1177,7 @@ void LocalMailboxEndpoint::submit_progress(Ring *ring, const WorkerDispatch &dis
     const uint64_t group_size = static_cast<uint64_t>(state.group_size());
     entry->error = 0;
     entry->observation_requested = 0;
+    entry->peer_cancel_requested = 0;
     entry->preparation_disposition = static_cast<int32_t>(MailboxPreparationDisposition::NONE);
     std::memset(entry->error_text, 0, MAILBOX_ERROR_MSG_SIZE);
     entry->run_epoch = 0;
@@ -1760,6 +1761,25 @@ void WorkerManager::progress() {
         worker->progress();
     for (auto &worker : sub_threads_)
         worker->progress();
+}
+
+void LocalMailboxEndpoint::request_peer_cancel(RunId run_id) {
+    std::lock_guard<std::mutex> lk(progress_mu_);
+    for (size_t index = 0; index < entries_.size(); ++index) {
+        const EntryRecord &record = entries_[index];
+        if (!record.occupied || record.run_id != run_id) continue;
+        auto *entry = run_entry(index);
+        if (!entry_identity_matches(record, entry)) continue;
+        const auto state = static_cast<MailboxState>(load_entry_i32(&entry->state));
+        if (state != MailboxState::TASK_DONE && state != MailboxState::TASK_FAILED)
+            store_entry_i32(&entry->peer_cancel_requested, 1);
+    }
+}
+
+void WorkerManager::request_peer_cancel(RunId run_id) {
+    if (run_id == INVALID_RUN_ID) return;
+    for (auto &worker : next_level_threads_)
+        worker->request_peer_cancel(run_id);
 }
 
 void WorkerManager::request_observation(RunId run_id) {
