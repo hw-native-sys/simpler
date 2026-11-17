@@ -46,7 +46,7 @@ direct `Worker` communication-domain walkthrough from construction through
 | Example | Mechanism | Devices |
 | ------- | --------- | ------- |
 | [`prefetch_async_demo/`](prefetch_async_demo/) | `TPREFETCH_ASYNC` over the runtime-injected SDMA workspace, provisioned once by `Worker(enable_sdma=True)` and injected into every kernel's `GlobalContext`. | 1 |
-| [`sdma_async_completion_demo/`](sdma_async_completion_demo/) | `TGET_ASYNC` from a peer's window slot, completion registered via `defer_pto_async_event`. | 2 |
+| [`sdma_async_completion_demo/`](sdma_async_completion_demo/) | `send_request_entry(async_ctx, SdmaTget(...))` submits an asynchronous SDMA GET from a peer's window slot and registers completion internally. | 2 |
 
 The cross-architecture notification-counter and deferred-notify watchdogs live
 under [`tests/st/worker/comm_domain/`](../../../tests/st/worker/comm_domain/).
