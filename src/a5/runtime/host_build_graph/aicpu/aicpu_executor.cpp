@@ -180,6 +180,20 @@ static void log_unfinished_tasks(Runtime *runtime) {
         rmb();
         const uint64_t completion = controls[task].completion_state;
         if (scheduler_completion_done(completion)) continue;
+        if (context->completion_counters_offset != 0) {
+            const auto &counter = scheduler_state_at<SchedulerTaskCompletionCounter>(
+                scheduler_state_base, context->completion_counters_offset
+            )[task];
+            if (counter.add_address != 0) {
+                const uint32_t observed = *reinterpret_cast<volatile uint32_t *>(counter.read_address);
+                LOG_ERROR(
+                    "A5 HBG ADD task=%" PRIu64 " count=%u target=%u limit=%u logical_ready=%u canonical_done=%u", task,
+                    observed, counter.threshold, counter.limit,
+                    static_cast<uint32_t>(observed >= counter.threshold && observed <= counter.limit),
+                    static_cast<uint32_t>(scheduler_completion_done(completion))
+                );
+            }
+        }
         if (graph.native_header_offset != 0) {
             const auto identity = aicore_scheduler_public_identity(graph, task);
             LOG_ERROR("A5 HBG native node=%" PRIu64 " public_id=%" PRIu64, task, TaskId::to_uint64(identity));

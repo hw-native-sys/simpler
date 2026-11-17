@@ -181,6 +181,7 @@ enum class SchedPhaseKind : uint8_t {
     ScalarBootstrapPeerWait = 140,
     ScalarBootstrapTopology = 141,
     ScalarPreparedClaim = 142,
+    ScalarCounterAccounting = 143,
 };
 
 // This phase's name as a report spells it. Returns a string literal, so it is safe on
@@ -389,6 +390,8 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_prepared_acquire";
     case SchedPhaseKind::ScalarPreparedClaim:
         return "scalar_prepared_claim";
+    case SchedPhaseKind::ScalarCounterAccounting:
+        return "scalar_counter_accounting";
     case SchedPhaseKind::ScalarPreparedReturn:
         return "scalar_prepared_return";
     case SchedPhaseKind::ScalarPreparedObserve:

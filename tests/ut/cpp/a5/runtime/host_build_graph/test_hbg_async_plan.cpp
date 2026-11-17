@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "async_completion_plan.h"
+#include "completion_counter_plan.h"
 #include "async_condition_writer.h"
 #include "backend/sdma/sdma_submission_guard.h"
 
@@ -56,6 +57,48 @@ uint64_t group_offset(const AsyncCompletionHostPlan &plan, uint32_t index = 0) {
 
 const AsyncGroupData &group_at(const Image &image, const AsyncCompletionHostPlan &plan, uint32_t index) {
     return *scheduler_state_at<AsyncGroupData>(image.base, group_offset(plan, index));
+}
+
+TEST(HbgAsyncPlan, DeclaredLeafCapabilitiesPruneSyncAndRejectMissingContracts) {
+    auto input = task(0, 5, LaneMask::all());
+    const CoreAsyncCapability sync{1, CoreAsyncMode::SYNCHRONOUS, 0, 0, 0};
+    const CoreAsyncCapability deferred{1, CoreAsyncMode::DEFERRED, 7, 3, 0};
+    ASSERT_TRUE(async_task_apply_capabilities(&input, {sync, sync, deferred}));
+    EXPECT_EQ(input.capacities, (std::array<uint16_t, 3>{0, 0, 7}));
+    AsyncCompletionHostPlan plan;
+    std::string error;
+    ASSERT_TRUE(plan_async_completion(kPrefix, 2, 1, {input}, &plan, &error));
+    EXPECT_EQ(plan.layout.group_count, 5u);
+    EXPECT_EQ(plan.tasks[0].data.async_mask, LaneMask(false, false, true));
+    Image image(plan.total_bytes);
+    ASSERT_TRUE(initialize_async_completion(image.base, plan.total_bytes, plan));
+    EXPECT_EQ(scheduler_async_task_lanes(image.base, plan.layout_offset, 0), LaneMask(false, false, true));
+    ASSERT_TRUE(async_task_apply_capabilities(&input, {sync, sync, sync}));
+    ASSERT_TRUE(plan_async_completion(kPrefix, 3, 1, {input}, &plan, &error));
+    EXPECT_EQ(plan.layout_offset, 0u);
+    EXPECT_EQ(plan.layout.group_count, 0u);
+    EXPECT_EQ(plan.total_bytes, kPrefix);
+    EXPECT_EQ(scheduler_async_task_lanes(image.base, 0, 0), LaneMask::none());
+    EXPECT_FALSE(async_task_apply_capabilities(&input, {}));
+    auto invalid = sync;
+    invalid.mode = static_cast<CoreAsyncMode>(3);
+    EXPECT_FALSE(async_task_apply_capabilities(&input, {sync, invalid, deferred}));
+}
+
+TEST(HbgAsyncPlan, InputVisibilityUsesRealAncestorsIncludingControlNodes) {
+    std::vector<SchedulerTaskMetadata> metadata(5);
+    for (uint32_t task = 0; task < 5; ++task)
+        metadata[task].flags = SCHEDULER_TASK_EXECUTABLE;
+    metadata[1].flags = 0;  // Native Graph control bridges the dependency.
+    std::vector<LaneMask> producers(5);
+    producers[0] = LaneMask::aic();
+    producers[4] = LaneMask::aiv0();  // Independent deferred producer.
+    ASSERT_TRUE(async_mark_input_visibility({{}, {0}, {1}, {}, {}}, {0, 1, 2, 3, 4}, producers, &metadata));
+    EXPECT_EQ(metadata[0].flags & SCHEDULER_TASK_ASYNC_INPUT, 0);
+    EXPECT_EQ(metadata[1].flags, 0);
+    EXPECT_NE(metadata[2].flags & SCHEDULER_TASK_ASYNC_INPUT, 0);  // SYNC consumer still observes.
+    EXPECT_EQ(metadata[3].flags & SCHEDULER_TASK_ASYNC_INPUT, 0);
+    EXPECT_EQ(metadata[4].flags & SCHEDULER_TASK_ASYNC_INPUT, 0);
 }
 
 TEST(HbgAsyncPlan, SdmaGuardsAreSharedByExecutionsAndIsolatedByCluster) {
@@ -389,3 +432,86 @@ TEST(HbgAsyncPlan, InitializationChecksDestinationBeforeWritingAndResetsRetiredS
 }
 
 }  // namespace
+
+TEST(HbgCompletionCounterPlan, ReusesAcrossControlNodesAndPreservesOldThresholds) {
+    SchedulerCompletionCounterPlan plan;
+    ASSERT_TRUE(scheduler_plan_completion_counters({{}, {0}, {1}}, {0, 1, 2}, {192, 0, 128}, &plan));
+    ASSERT_EQ(plan.chains.size(), 1u);
+    EXPECT_EQ(plan.thresholds[0], 192u);
+    EXPECT_EQ(plan.thresholds[2], 320u);
+    EXPECT_EQ(plan.chains[0].limit, 320u);
+    EXPECT_EQ(plan.task_chains[1], UINT32_MAX);
+}
+
+TEST(HbgCompletionCounterPlan, IndependentBranchesDoNotShareCounter) {
+    SchedulerCompletionCounterPlan plan;
+    ASSERT_TRUE(scheduler_plan_completion_counters({{}, {0}, {0}, {1, 2}}, {0, 1, 2, 3}, {2, 4, 6, 8}, &plan));
+    EXPECT_EQ(plan.chains.size(), 2u);
+    EXPECT_NE(plan.task_chains[1], plan.task_chains[2]);
+    EXPECT_EQ(plan.task_chains[3], plan.task_chains[2]);
+}
+
+TEST(HbgCompletionCounterPlan, SplitsBeforeRegisterOverflow) {
+    SchedulerCompletionCounterPlan plan;
+    ASSERT_TRUE(scheduler_plan_completion_counters({{}, {0}}, {0, 1}, {UINT32_MAX - 1u, 2}, &plan));
+    EXPECT_EQ(plan.chains.size(), 2u);
+    EXPECT_EQ(plan.thresholds[1], 2u);
+}
+
+TEST(HbgCompletionCounterPlan, RejectsInvalidDependencyOrder) {
+    SchedulerCompletionCounterPlan plan;
+    EXPECT_FALSE(scheduler_plan_completion_counters({{}, {0}}, {1, 0}, {2, 2}, &plan));
+    EXPECT_FALSE(scheduler_plan_completion_counters({{1}, {0}}, {0, 1}, {2, 2}, &plan));
+    EXPECT_FALSE(scheduler_plan_completion_counters({{}, {}}, {0, 0}, {2, 2}, &plan));
+}
+
+TEST(HbgCompletionCounterPlan, LargeIndependentGraphKeepsSeparateUnitThresholds) {
+    constexpr uint32_t count = 100000;
+    std::vector<std::vector<int64_t>> fanin(count);
+    std::vector<int64_t> order(count);
+    for (uint32_t index = 0; index < count; ++index)
+        order[index] = index;
+    SchedulerCompletionCounterPlan plan;
+    ASSERT_TRUE(scheduler_plan_completion_counters(fanin, order, std::vector<uint32_t>(count, 1), &plan));
+    ASSERT_EQ(plan.chains.size(), count);
+    for (uint32_t index = 0; index < count; ++index) {
+        EXPECT_EQ(plan.task_chains[index], index);
+        EXPECT_EQ(plan.thresholds[index], 1u);
+        EXPECT_EQ(plan.chains[index].last_task, index);
+    }
+}
+
+TEST(HbgCompletionCounterPlan, LargeLinearGraphReusesOneCounterThroughControlNodes) {
+    constexpr uint32_t count = 100000;
+    std::vector<std::vector<int64_t>> fanin(count);
+    std::vector<int64_t> order(count);
+    std::vector<uint32_t> credits(count);
+    for (uint32_t index = 0; index < count; ++index) {
+        order[index] = index;
+        credits[index] = index % 2;
+        if (index != 0) fanin[index].push_back(index - 1);
+    }
+    SchedulerCompletionCounterPlan plan;
+    ASSERT_TRUE(scheduler_plan_completion_counters(fanin, order, credits, &plan));
+    ASSERT_EQ(plan.chains.size(), 1u);
+    EXPECT_EQ(plan.chains[0].limit, count / 2);
+    for (uint32_t index = 0; index < count; ++index) {
+        EXPECT_EQ(plan.task_chains[index], index % 2 ? 0u : UINT32_MAX);
+        EXPECT_EQ(plan.thresholds[index], index % 2 ? (index + 1) / 2 : 0u);
+    }
+}
+
+TEST(HbgCompletionCounterPlan, SelectsLatestReachableTipAcrossSparseTaskOrder) {
+    SchedulerCompletionCounterPlan plan;
+    const std::vector<std::vector<int64_t>> fanin{{3, 1}, {}, {3}, {}, {2, 0}, {4}};
+    ASSERT_TRUE(scheduler_plan_completion_counters(fanin, {3, 1, 2, 0, 4, 5}, {0, 3, 4, 2, 0, 1}, &plan));
+    EXPECT_EQ(plan.task_chains, (std::vector<uint32_t>{UINT32_MAX, 1, 0, 0, UINT32_MAX, 0}));
+    EXPECT_EQ(plan.thresholds, (std::vector<uint32_t>{0, 3, 6, 2, 0, 7}));
+}
+
+TEST(HbgCompletionCounterPlan, OverflowingLatestTipDoesNotHideAnOlderReusableBranch) {
+    SchedulerCompletionCounterPlan plan;
+    ASSERT_TRUE(scheduler_plan_completion_counters({{}, {}, {0, 1}}, {0, 1, 2}, {1, UINT32_MAX, 2}, &plan));
+    EXPECT_EQ(plan.task_chains, (std::vector<uint32_t>{0, 1, 0}));
+    EXPECT_EQ(plan.thresholds, (std::vector<uint32_t>{1, UINT32_MAX, 3}));
+}

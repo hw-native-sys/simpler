@@ -94,6 +94,14 @@ inline bool scheduler_prepare_host_calls(
             call.args[SPMD_LOCAL_CONTEXT_INDEX] = binding + offsetof(SchedulerExecutionBinding, local_context);
             call.args[SPMD_GLOBAL_CONTEXT_INDEX] = binding + offsetof(SchedulerExecutionBinding, global_context);
             auto &global = bindings[index].global_context;
+            // Synchronous bindings never call begin/seal. Clear every async
+            // field here, including after a previous run used a deferred group.
+            global.async_present = 0;
+            global.async_output_capture_refused = 0;
+            global.async_image_address = 0;
+            global.async_image_bytes = 0;
+            global.async_run_epoch = 0;
+            global.async_group_offset = 0;
             global.async_group_index = pto2::resident::ASYNC_INVALID_INDEX;
             if (async_task != nullptr && async_task->async_mask.has(static_cast<SubtaskSlot>(lane))) {
                 const uint32_t group = async_task->group_base + block * async_task->async_mask.count() +

@@ -17,6 +17,15 @@
 #include <utility>
 
 #include "common/chip_swimlane_extension.h"
+#include "host/scheduler_notifications.h"
+
+struct CoreAsyncCapability;
+
+// Registration-owned host metadata, borrowed while that callable is retained.
+struct HostCallableAsyncCapabilities {
+    const CoreAsyncCapability *data;
+    uint32_t count;
+};
 
 // Borrowed source views, valid through stage_launch_metadata; the platform
 // captures values and never takes ownership of the source containers.
@@ -292,6 +301,13 @@ struct HostApiOps {
     int (*stage_launch_metadata)(
         void *runner_ctx, uint32_t pipeline_slot, const HostMetadataRegion *regions, size_t count
     );
+    int (*acquire_scheduler_notifications)(
+        void *runner_ctx, uint32_t pipeline_slot, SchedulerNotificationPurpose purpose, size_t count,
+        SchedulerDoneNotifications *out
+    ) = nullptr;
+    std::optional<HostCallableAsyncCapabilities> (*get_callable_async_capabilities)(
+        void *runner_ctx, int32_t callable_id
+    ) = nullptr;
 };
 
 /**
@@ -336,6 +352,22 @@ public:
     // record streams stamp it into each row: per-task tokens restart every run,
     // so a row without it cannot be attributed once one file holds several runs.
     uint64_t run_epoch() const { return run_epoch_; }
+
+    std::optional<HostCallableAsyncCapabilities> get_callable_async_capabilities(int32_t callable_id) const {
+        if (ops_->get_callable_async_capabilities == nullptr) return std::nullopt;
+        return ops_->get_callable_async_capabilities(runner_ctx_, callable_id);
+    }
+
+    int acquire_scheduler_notifications(
+        SchedulerNotificationPurpose purpose, size_t count, SchedulerDoneNotifications *out
+    ) const {
+        if (out == nullptr) return -1;
+        if (ops_->acquire_scheduler_notifications != nullptr)
+            return ops_->acquire_scheduler_notifications(runner_ctx_, pipeline_slot_, purpose, count, out);
+        // CPU and simulator backends use the canonical GM protocol.
+        *out = {std::vector<uint64_t>(count, 0), std::vector<uint64_t>(count, 0), {}};
+        return 0;
+    }
 
     void *device_malloc(size_t size) const { return ops_->device_malloc(runner_ctx_, size); }
     void device_free(void *dev_ptr) const { ops_->device_free(runner_ctx_, dev_ptr); }

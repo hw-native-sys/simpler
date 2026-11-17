@@ -74,7 +74,9 @@ TEST_F(HbgPreparedBindings, OnboardCallsResolveCodeWithoutDereferencingDeviceObj
 
 TEST_F(HbgPreparedBindings, SimCallsUseTheResolvedSymbolRatherThanTheObjectAddress) {
     const std::array<uint8_t, 4> binary{};
-    auto bytes = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, binary.data(), binary.size());
+    auto bytes = make_callable<CORE_MAX_TENSOR_ARGS>(
+        nullptr, 0, binary.data(), binary.size(), {1, CoreAsyncMode::SYNCHRONOUS, 0, 0, 0}
+    );
     auto *callable = reinterpret_cast<CoreCallable *>(bytes.data());
     constexpr uint64_t entry = UINT64_C(0x98760000);
     callable->set_resolved_addr(entry);
@@ -131,6 +133,24 @@ TEST_F(HbgPreparedBindings, SparseAsyncLanesKeepExactExecutionIdentityWithoutReg
             async.layout.groups_offset + groups[index] * sizeof(pto2::resident::AsyncGroupData)
         );
     }
+}
+
+TEST_F(HbgPreparedBindings, SynchronousLaneClearsRetainedAsyncContext) {
+    auto *bindings = scheduler_state_at<SchedulerExecutionBinding>(base, layout.prepared.bindings_offset);
+    auto &global = bindings[3].global_context;  // Task1 AIC is synchronous, AIV1 is deferred.
+    global.async_present = 1;
+    global.async_output_capture_refused = 1;
+    global.async_image_address = global.async_image_bytes = global.async_run_epoch = global.async_group_offset = 99;
+    global.async_group_index = 0;
+    ASSERT_TRUE(prepare(1));
+    EXPECT_EQ(global.async_present, 0u);
+    EXPECT_EQ(global.async_output_capture_refused, 0u);
+    EXPECT_EQ(global.async_image_address, 0u);
+    EXPECT_EQ(global.async_image_bytes, 0u);
+    EXPECT_EQ(global.async_run_epoch, 0u);
+    EXPECT_EQ(global.async_group_offset, 0u);
+    EXPECT_EQ(global.async_group_index, pto2::resident::ASYNC_INVALID_INDEX);
+    EXPECT_NE(bindings[4].global_context.async_group_index, pto2::resident::ASYNC_INVALID_INDEX);
 }
 
 TEST_F(HbgPreparedBindings, MismatchedAsyncEpochIsRejectedBeforePublishingCalls) {

@@ -21,6 +21,8 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from simpler.task_interface import CoreCallable
+
 from simpler_setup.compile_pool import compile_slot, compile_worker_budget
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
@@ -28,6 +30,22 @@ from simpler_setup.scene_test_cache import compile_incore_artifact_key, get_or_c
 
 ROOT = Path(__file__).resolve().parents[1]
 FLAVORS = ("pypto_lib", "pypto_lib_dsl", "pypto_lib_latest")
+
+
+MODES = {"SYNCHRONOUS": 1, "DEFERRED": 2}
+
+
+def capability_declaration(kernel):
+    """Use the same declaration policy as every registered CoreCallable."""
+    return CoreCallable.build(
+        signature=[], binary=b"", async_capability=kernel.get("async_capability")
+    ).async_capability
+
+
+def capability_words(kernel):
+    """Return canonical wire fields without a separate benchmark capability policy."""
+    value = capability_declaration(kernel)
+    return value["version"], MODES[value["mode"]], value["max_conditions"], value["condition_types"]
 
 
 def save(path, value):
@@ -53,6 +71,7 @@ def build(flavor, output, tools, pto, jobs):
     compiler_tokens = {core: compiler.incore_compile_cache_token(core) for core in ("aic", "aiv")}
 
     def compile_kernel(kernel):
+        capability = capability_declaration(kernel)
         source = sources / kernel["source"]
         extra = common_includes + [str(sources / item) for item in kernel["include_dirs"]]
         dsl_entry = flavor == "pypto_lib_dsl" and "/external/" in kernel["source"]
@@ -108,6 +127,7 @@ def build(flavor, output, tools, pto, jobs):
             "file": target.name,
             "cache_key": key,
             "cache_hit": not compiled,
+            "async_capability": capability,
         }
 
     with compile_worker_budget(jobs), ThreadPoolExecutor(max_workers=jobs) as pool:
@@ -135,6 +155,8 @@ def build(flavor, output, tools, pto, jobs):
         rows.append(
             f"{kernel['func_id']} {len(signature)} {' '.join(map(str, signature))} "
             + json.dumps(str(output / record["file"]))
+            + " "
+            + " ".join(map(str, capability_words(kernel)))
         )
     signature = manifest["entry_signature"]
     (output / "kernels.txt").write_text(

@@ -56,6 +56,7 @@ def _chip_callable_abi_token() -> str:
     child = CoreCallable.build(
         signature=[ArgDirection.IN, ArgDirection.OUT],
         binary=b"scene-test-cache-core-abi",
+        async_capability={"version": 1, "mode": "SYNCHRONOUS", "max_conditions": 0, "condition_types": 0},
     )
     callable_obj = ChipCallable.build(
         signature=[ArgDirection.INOUT],

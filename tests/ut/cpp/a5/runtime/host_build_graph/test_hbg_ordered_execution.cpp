@@ -689,9 +689,12 @@ TEST(HbgOrderedScalarDetail, CompletionWriterReusesItsOwnDoneProofForDependencie
     }
 }
 
-TEST(HbgOrderedScalarDetail, ClaimCursorDetailReadsSealAndCursorOnce) {
+TEST(HbgOrderedScalarDetail, ClaimCursorUsesSealWithoutReadingTheCursorAgain) {
     for (const auto &[seal, next, valid, used_seal] :
-         {std::tuple<uint64_t, uint64_t, bool, bool>{0, 1, true, false}, {2, 2, true, true}, {2, 1, false, false}}) {
+         {std::tuple<uint64_t, uint64_t, bool, bool>{0, 1, true, false},
+          {2, 2, true, true},
+          {2, 1, true, true},
+          {1, 2, false, false}}) {
         SCOPED_TRACE(seal);
         SCOPED_TRACE(next);
         OrderedFixture fixture({{2, LaneMask::aic()}});
@@ -716,7 +719,7 @@ TEST(HbgOrderedScalarDetail, ClaimCursorDetailReadsSealAndCursorOnce) {
             ),
             valid
         );
-        if (valid) EXPECT_EQ(cursor, next);
+        if (valid) EXPECT_EQ(cursor, used_seal ? seal : next);
         EXPECT_EQ(observed_seal, used_seal);
         EXPECT_EQ(
             scheduler_cached_task_proof(fixture.locals[0], 0),
@@ -732,7 +735,7 @@ TEST(HbgOrderedScalarDetail, ClaimCursorDetailReadsSealAndCursorOnce) {
             names.emplace_back(sched_phase_kind_name(static_cast<SchedPhaseKind>(decoded[i].kind & 0xffffU)));
         EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_claim_seal_probe"), 1);
         EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_claim_seal_confirm"), 0);
-        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_next_block_probe"), 1);
+        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_next_block_probe"), seal == 0 ? 1 : 0);
         EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_next_block_confirm"), 0);
         EXPECT_EQ(buffer->scalar_dropped, 0u);
     }

@@ -43,7 +43,7 @@ static inline __aicore__ bool scheduler_service_controls(
             }
         }
         auto *control = scheduler_task_control_at(base, local, ref);
-        if (scheduler_gm_query(control->completion_state) == scheduler_completion_completed_state(1)) continue;
+        if (scheduler_observe_cached_completion(base, local, ref) == SchedulerCompletionObservation::DONE) continue;
         SchedulerFaninView fanin{};
         if (scheduler_node_fanin_view(graph, ref, &fanin) != SchedulerGraphResult::OK) return false;
         const uint64_t tag = static_cast<uint64_t>(ref) + 1;
@@ -70,6 +70,7 @@ static inline __aicore__ bool scheduler_service_controls(
             );
             return false;
         }
+        scheduler_publish_task_done(base, local, ref);
         if (record) {
             scheduler_protocol_task_actor(base, local, ref, UINT64_MAX, metadata.flags, true, true, before);
             scheduler_protocol_task_actor(base, local, ref, UINT64_MAX, metadata.flags, true, false, after);

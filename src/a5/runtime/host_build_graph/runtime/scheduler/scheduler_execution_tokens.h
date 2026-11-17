@@ -32,7 +32,7 @@ static inline __aicore__ bool scheduler_prepare_token_binding(
     auto *binding = scheduler_execution_binding_at(base, local->config.prepared, token.prepared.execution_index);
     binding->global_context.sub_block_id = token.subtask_slot == 2 ? 1 : 0;
     SchedulerScalarScope scalar_cache(local, SchedPhaseKind::ScalarCachePublish, token.task_ref);
-    scheduler_writeback_cache_line(&binding->local_context);
+    // LocalContext is immutable after Host publication and was received above.
     scheduler_writeback_cache_line(&binding->global_context);
     scheduler_cache_barrier();
     return true;
@@ -206,8 +206,12 @@ static inline __aicore__ bool scheduler_try_execution_continuation(
         scheduler_metadata_core_type_index(lane) != local->config.self_core_type)
         return scheduler_execution_token_fail(graph, local, run, task_ref);
     auto *control = scheduler_task_control_at(base, local, task_ref);
-    // A stale negative hint only defers this attempt to the authoritative scan.
-    if (scheduler_gm_query(control->next_block) >= blocks) return true;
+    // Issued tickets cannot reopen. Retain this terminal observation for the
+    // following refill without turning it into a supply-seal or DONE proof.
+    if (scheduler_gm_query(control->next_block) >= blocks) {
+        if (local->issue_task_ref == task_ref) local->issue_ticket_exhausted = true;
+        return true;
+    }
     const auto fanin = local->issue_binding.fanin;
     uint32_t empty = 0;
     while (empty < SCHEDULER_EXECUTION_TOKEN_COUNT &&

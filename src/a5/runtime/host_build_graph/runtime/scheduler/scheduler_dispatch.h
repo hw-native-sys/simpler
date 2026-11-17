@@ -121,7 +121,7 @@ static inline __aicore__ SchedulerOrderedPollResult scheduler_observe_ordered_pr
         if (frontier > admission.scan_cursor) return SchedulerOrderedPollResult::READY;
         const uint64_t assigned =
             scheduler_scalar_result(local, SchedPhaseKind::ScalarPollMixAssignment, [&]() __aicore__ {
-                return scheduler_gm_query(mailbox->lanes[local->config.self_lane].assigned_seq);
+                return scheduler_gm_mix_query_signal(mailbox, local->config.self_lane, SchedulerGmMixSignal::ASSIGNED);
             });
         if (assigned <= group.group_seq) return SchedulerOrderedPollResult::WAIT;
         if (observation != nullptr)

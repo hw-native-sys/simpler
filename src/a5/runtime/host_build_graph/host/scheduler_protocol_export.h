@@ -19,10 +19,12 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "scheduler/scheduler_graph.h"
+#include "scheduler/scheduler_async_layout.h"
 #include "scheduler/scheduler_types.h"
 
 struct SchedulerProtocolTaskSpec {
@@ -204,6 +206,7 @@ inline void block_owner(JsonObject &parent, const SchedulerProtocolBlockOwner &r
     row.number("order_key", record.order_key);
     row.number("group_seq", record.group_seq);
     row.number("completion_ticket", record.completion_ticket);
+    row.number("completion_credits", record.completion_credits);
     row.number("worker_index", record.worker_index);
     row.number("block_idx", record.block_idx);
     row.number("cluster_index", record.cluster_index);
@@ -268,6 +271,7 @@ inline void execution(JsonObject &row, const SchedulerProtocolExecutionTrace &re
     row.stamp("contribution_after", record.contribution_after);
     row.number("contribution_ticket", record.contribution_ticket);
     row.number("contribution_worker", record.contribution_worker);
+    row.number("contribution_credits", record.contribution_credits);
     row.number("run_epoch", record.run_epoch);
     row.number("task_ref", record.task_ref);
     row.number("order_key", record.order_key);
@@ -296,7 +300,9 @@ inline void validate_layout(const Image &image, const AicoreSchedulerLayout &lay
         wire.trace_count != plan.trace_count || wire.cooperative_task_count != plan.cooperative_task_count ||
         wire.member_count != plan.member_count || wire.tasks_offset != plan.tasks_offset ||
         wire.members_offset != plan.members_offset || wire.blocks_offset != plan.blocks_offset ||
-        wire.executions_offset != plan.executions_offset || wire.workers_offset != plan.workers_offset)
+        wire.executions_offset != plan.executions_offset || wire.workers_offset != plan.workers_offset ||
+        wire.condition_contributions_offset != plan.condition_contributions_offset ||
+        wire.counter_observations_offset != plan.counter_observations_offset)
         throw std::invalid_argument("protocol header disagrees with Host plan or run epoch");
     const auto &summary = *image.array<SchedulerGraphSummary>(layout.graph_summary_offset, 1);
     if (summary.run_epoch != epoch || summary.protocol_layout_offset != layout.protocol_layout_offset ||
@@ -335,6 +341,61 @@ inline void admissions(JsonObject &root, const Image &image, const AicoreSchedul
         row.number("record_offset", offset);
     }
     out << ']';
+}
+
+inline std::vector<uint64_t>
+completion_counters(JsonObject &root, const Image &image, const AicoreSchedulerLayout &layout) {
+    const auto *descriptors =
+        image.array<SchedulerTaskCompletionCounter>(layout.completion_counters_offset, layout.task_count);
+    const auto *observations = image.array<SchedulerProtocolCounterObservation>(
+        layout.protocol.counter_observations_offset, layout.task_count
+    );
+    std::unordered_map<uint64_t, uint64_t> indices;
+    std::vector<uint64_t> task_indices(layout.task_count, UINT64_MAX);
+    std::vector<uint64_t> representatives;
+    auto &out = root.field("completion_counters");
+    out << '[';
+    for (uint64_t task = 0; task < layout.task_count; ++task) {
+        const auto &descriptor = descriptors[task];
+        if (descriptor.add_address == 0) continue;
+        if (descriptor.read_address == 0) throw std::invalid_argument("counter has no read address");
+        const auto [position, inserted] = indices.emplace(descriptor.read_address, indices.size());
+        const uint64_t index = position->second;
+        task_indices[task] = index;
+        if (!inserted) {
+            const uint64_t previous = representatives[index];
+            if (descriptors[previous].limit != descriptor.limit ||
+                observations[previous].valid != observations[task].valid ||
+                observations[previous].value != observations[task].value)
+                throw std::invalid_argument("counter chain observations disagree after retirement");
+            continue;
+        }
+        representatives.push_back(task);
+        if (index != 0) out << ',';
+        JsonObject row(out);
+        row.number("index", index);
+        row.number("value", observations[task].value);
+        row.number("valid", observations[task].valid);
+        row.number("limit", descriptor.limit);
+    }
+    out << ']';
+    return task_indices;
+}
+
+inline std::vector<LaneMask> async_masks(const Image &image, const AicoreSchedulerLayout &layout) {
+    std::vector<LaneMask> result(layout.task_count);
+    if (layout.async_layout_offset == 0) return result;
+    const auto &async = *image.array<SchedulerAsyncLayout>(layout.async_layout_offset, 1);
+    if (async.task_count != layout.task_count) throw std::invalid_argument("async protocol task count mismatch");
+    const auto *map = image.array<uint32_t>(async.task_map_offset, async.task_count);
+    const auto *tasks = image.array<SchedulerAsyncTaskData>(async.task_data_offset, async.async_task_count);
+    for (uint64_t ref = 0; ref < layout.task_count; ++ref) {
+        if (map[ref] == pto2::resident::ASYNC_INVALID_INDEX) continue;
+        if (map[ref] >= async.async_task_count || tasks[map[ref]].task_ref != static_cast<int64_t>(ref))
+            throw std::invalid_argument("async protocol task map mismatch");
+        result[ref] = tasks[map[ref]].async_mask;
+    }
+    return result;
 }
 
 }  // namespace scheduler_protocol_export
@@ -440,6 +501,10 @@ inline std::string scheduler_export_protocol(
         }
         out << ']';
         admissions(root, image, layout);
+        const auto counter_indices = completion_counters(root, image, layout);
+        const auto task_async_masks = async_masks(image, layout);
+        const auto *counters =
+            image.array<SchedulerTaskCompletionCounter>(layout.completion_counters_offset, plan.task_count);
         const auto *controls = image.array<SchedulerTaskControl>(layout.task_controls_offset, plan.task_count);
         root.field("task_controls") << '[';
         for (uint64_t task = 0; task < plan.task_count; ++task) {
@@ -458,6 +523,12 @@ inline std::string scheduler_export_protocol(
             row.number("completed_subtasks", physical ? scheduler_completion_count(completion) : 0);
             row.number("admission_state", controls[task].admission_state);
             row.number("claim_seal", controls[task].claim_seal);
+            const bool counted = counters[task].add_address != 0;
+            row.number("completion_backend", counted ? 1 : 0);
+            row.number("counter_index", counter_indices[task]);
+            row.number("counter_threshold", counted ? counters[task].threshold : 0);
+            row.number("counter_limit", counted ? counters[task].limit : 0);
+            row.lane_mask("async_mask", task_async_masks[task]);
         }
         out << ']';
         sparse(
@@ -497,6 +568,21 @@ inline std::string scheduler_export_protocol(
         sparse(
             root, "executions", image.array<SchedulerProtocolExecutionTrace>(plan.executions_offset, plan.trace_count),
             plan.trace_count, execution
+        );
+        sparse(
+            root, "condition_contributions",
+            image.array<SchedulerProtocolConditionContribution>(plan.condition_contributions_offset, plan.trace_count),
+            plan.trace_count, [](JsonObject &row, const auto &record) {
+                row.stamp("before", record.before);
+                row.stamp("after", record.after);
+                row.number("run_epoch", record.run_epoch);
+                row.number("task_ref", record.task_ref);
+                row.number("worker_index", record.worker_index);
+                row.number("block_idx", record.block_idx);
+                row.number("subtask_slot", record.lane);
+                row.number("source", record.source);
+                row.number("credits", record.credits);
+            }
         );
     }
     return out.str();

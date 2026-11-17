@@ -16,6 +16,7 @@
  */
 
 #include "host_build_graph/runtime.h"
+#include "common/host_api.h"
 
 #include <cstring>
 
@@ -54,6 +55,7 @@ Runtime::Runtime() {
     host_.active_callable_id_ = -1;
     host_.pending_publication_ = {};
     host_.callable_table_host_ = nullptr;
+    host_.callable_async_capabilities_ = nullptr;
     host_.callable_entry_table_addr_ = 0;
 }
 
@@ -99,6 +101,24 @@ uint64_t Runtime::get_function_bin_addr(int func_id) const {
     return host_.callable_table_host_[func_id];
 }
 
+CoreAsyncCapability Runtime::get_function_async_capability(int func_id) const {
+    if (host_.callable_async_capabilities_ == nullptr || get_function_bin_addr(func_id) == 0)
+        throw std::invalid_argument("missing async capability for callable func_id=" + std::to_string(func_id));
+    const auto capability = host_.callable_async_capabilities_[func_id];
+    if (!core_async_capability_valid(capability))
+        throw std::invalid_argument("invalid async capability for callable func_id=" + std::to_string(func_id));
+    return capability;
+}
+
+bool Runtime::bind_callable_async_capabilities(const HostApi &api) {
+    host_.callable_async_capabilities_ = nullptr;
+    if (dev.callable_table_len_ == 0) return true;
+    const auto capabilities = api.get_callable_async_capabilities(get_active_callable_id());
+    if (!capabilities || capabilities->data == nullptr || capabilities->count != dev.callable_table_len_) return false;
+    host_.callable_async_capabilities_ = capabilities->data;
+    return true;
+}
+
 void Runtime::set_callable_tables(
     const uint64_t *host_view, uint64_t object_table_addr, uint64_t entry_table_addr, uint32_t len
 ) {
@@ -107,6 +127,7 @@ void Runtime::set_callable_tables(
         return;
     }
     host_.callable_table_host_ = host_view;
+    host_.callable_async_capabilities_ = nullptr;
     host_.callable_entry_table_addr_ = entry_table_addr;
     dev.callable_table_addr_ = object_table_addr;
     dev.callable_table_len_ = len;
@@ -114,6 +135,7 @@ void Runtime::set_callable_tables(
 
 void Runtime::clear_callable_tables() {
     host_.callable_table_host_ = nullptr;
+    host_.callable_async_capabilities_ = nullptr;
     host_.callable_entry_table_addr_ = 0;
     dev.callable_table_addr_ = 0;
     dev.callable_table_len_ = 0;

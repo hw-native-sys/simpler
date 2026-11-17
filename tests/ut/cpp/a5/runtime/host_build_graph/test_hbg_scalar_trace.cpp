@@ -471,18 +471,18 @@ TEST(HbgScalarTrace, CompactStoragePreservesBootstrapAndClaimPhases) {
     trace.buffer = buffer.get();
     trace.records = slots.get();
     const SchedPhaseKind phases[] = {
-        SchedPhaseKind::ScalarBootstrapInitWait,
-        SchedPhaseKind::ScalarBootstrapPeerWait,
-        SchedPhaseKind::ScalarBootstrapTopology,
-        SchedPhaseKind::ScalarPreparedClaim,
+        SchedPhaseKind::ScalarBootstrapInitWait, SchedPhaseKind::ScalarBootstrapPeerWait,
+        SchedPhaseKind::ScalarBootstrapTopology, SchedPhaseKind::ScalarPreparedClaim,
+        SchedPhaseKind::ScalarCounterAccounting,
     };
     const char *names[] = {
-        "scalar_bootstrap_init_wait", "scalar_bootstrap_peer_wait", "scalar_bootstrap_topology", "scalar_prepared_claim"
+        "scalar_bootstrap_init_wait", "scalar_bootstrap_peer_wait", "scalar_bootstrap_topology",
+        "scalar_prepared_claim", "scalar_counter_accounting"
     };
     for (auto phase : phases)
         trace.append(phase, 10, 20, -1, 2);
     const auto rows = decode(trace);
-    ASSERT_EQ(rows.size(), 4u);
+    ASSERT_EQ(rows.size(), 5u);
     for (uint32_t i = 0; i < rows.size(); ++i) {
         EXPECT_EQ(kind(rows[i]), 139u + i);
         EXPECT_STREQ(sched_phase_kind_name(static_cast<SchedPhaseKind>(kind(rows[i]))), names[i]);

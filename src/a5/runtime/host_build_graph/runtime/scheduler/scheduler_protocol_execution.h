@@ -24,7 +24,7 @@ inline __aicore__ bool scheduler_protocol_execution_matches(
 
 static inline __aicore__ void scheduler_protocol_subtask_complete(
     __gm__ void *base, const SchedulerLocalState *local, const SchedulerLocalSlotState &slot, uint32_t pending_slot,
-    bool before, uint64_t ticket
+    bool before, uint64_t ticket, uint32_t credits = 0
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
@@ -45,6 +45,7 @@ static inline __aicore__ void scheduler_protocol_subtask_complete(
         return;
     record->contribution_worker = static_cast<uint32_t>(local->worker_id());
     if (!before) record->contribution_ticket = ticket;
+    record->contribution_credits = credits;
     scheduler_protocol_publish_record(record);
 }
 

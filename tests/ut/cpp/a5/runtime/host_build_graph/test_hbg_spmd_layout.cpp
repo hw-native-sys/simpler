@@ -865,9 +865,13 @@ TEST_P(HbgProtocolTraceLayout, ReservesIndexedRecordsRatherThanPerWorkerCopiesOf
     EXPECT_EQ(p.cooperative_task_count, 2u);
     EXPECT_EQ(p.member_count, 2 * GetParam());
     EXPECT_EQ(p.trace_count, 7u);
+    constexpr uint64_t worker_alignment = alignof(SchedulerProtocolWorkerTrace);
+    const uint64_t observation_bytes =
+        (3 * sizeof(SchedulerProtocolCounterObservation) + worker_alignment - 1) / worker_alignment * worker_alignment;
     const uint64_t expected = sizeof(SchedulerProtocolLayout) + 3 * sizeof(SchedulerProtocolTaskTrace) +
                               2 * GetParam() * sizeof(SchedulerProtocolMemberTrace) +
                               7 * sizeof(SchedulerProtocolBlockTrace) + 7 * sizeof(SchedulerProtocolExecutionTrace) +
+                              7 * sizeof(SchedulerProtocolConditionContribution) + observation_bytes +
                               GetParam() * sizeof(SchedulerProtocolWorkerTrace);
     EXPECT_EQ(full.total_size - plain.total_size, expected);
     EXPECT_EQ(p.storage_end_offset, full.total_size);
@@ -877,6 +881,8 @@ TEST_P(HbgProtocolTraceLayout, ReservesIndexedRecordsRatherThanPerWorkerCopiesOf
         {p.members_offset, p.member_count * sizeof(SchedulerProtocolMemberTrace)},
         {p.blocks_offset, p.trace_count * sizeof(SchedulerProtocolBlockTrace)},
         {p.executions_offset, p.trace_count * sizeof(SchedulerProtocolExecutionTrace)},
+        {p.condition_contributions_offset, p.trace_count * sizeof(SchedulerProtocolConditionContribution)},
+        {p.counter_observations_offset, p.task_count * sizeof(SchedulerProtocolCounterObservation)},
         {p.workers_offset, p.worker_count * sizeof(SchedulerProtocolWorkerTrace)},
     };
     std::sort(regions.begin(), regions.end());

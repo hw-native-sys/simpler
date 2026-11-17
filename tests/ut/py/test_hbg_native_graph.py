@@ -216,7 +216,7 @@ def test_kernel_dependencies_preserve_all_graph_roots_and_sinks():
     }
 
 
-@pytest.mark.parametrize("flag", (2, 128))
+@pytest.mark.parametrize("flag", (128,))
 def test_current_native_graph_rejects_independent_flag(flag):
     raw, identities = native_capture()
     assert audit_native_protocol(raw, identities)["protocol_verified"]

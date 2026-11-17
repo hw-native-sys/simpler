@@ -48,6 +48,7 @@ SCALAR_FUNCTIONS = {
     "scalar_prepared_receive": "scheduler_receive_execution_token",
     "scalar_prepared_acquire": "scheduler_acquire_execution_token",
     "scalar_prepared_claim": "scheduler_claim_execution_token",
+    "scalar_counter_accounting": "scheduler_service_counter_accounting",
     "scalar_prepared_return": "scheduler_return_prepared_execution",
     "scalar_prepared_observe": "scheduler_observe_prepared_call",
     "scalar_prepared_index": "scheduler_prepared_execution_index",

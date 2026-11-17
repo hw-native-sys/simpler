@@ -71,8 +71,9 @@ struct GmAtomics {
 // existing block/lane join authorizes exactly one close after every release.
 // Error results can follow an invalid RMW and require failing the run.
 template <typename Atomics>
-static inline __aicore__ Result register_group(Atomics &atomics) {
+static inline __aicore__ Result register_group(Atomics &atomics, uint64_t *observed = nullptr) {
     const uint64_t previous = atomics.fetch_add(REGISTERED_UNIT + 1);
+    if (observed != nullptr) *observed = previous;
     if (!valid(previous)) return Result::INVALID_WORD;
     if (closed(previous)) return Result::INVALID_TRANSITION;
     if (registered(previous) == COUNT_MAX) return Result::COUNT_OVERFLOW;
@@ -98,9 +99,9 @@ static inline __aicore__ Outcome complete_group(Atomics &atomics) {
 
 }  // namespace detail
 
-static inline __aicore__ Result register_group(__gm__ Join &join) {
+static inline __aicore__ Result register_group(__gm__ Join &join, uint64_t *observed = nullptr) {
     detail::GmAtomics atomics{join.word};
-    return detail::register_group(atomics);
+    return detail::register_group(atomics, observed);
 }
 
 static inline __aicore__ Outcome close_computation(__gm__ Join &join) {

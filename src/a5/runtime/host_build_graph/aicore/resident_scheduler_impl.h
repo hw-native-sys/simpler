@@ -495,6 +495,10 @@ __aicore__ bool run_ready_dispatch_loop(
         if (!scheduler_service_controls(graph, scheduler_state_base, context, run_control, profiling_level, &advanced))
             return false;
         progress = progress || advanced;
+        bool counter_advanced = false;
+        if (!scheduler_service_counter_accounting(graph, scheduler_state_base, context, run_control, &counter_advanced))
+            return false;
+        progress = progress || counter_advanced;
         if (context->pending_completed != 0) {
             const uint64_t now = scheduler_cycles();
             if (context->pending_completed >= 32 ||
@@ -659,12 +663,13 @@ __aicore__ bool run_ready_dispatch_loop(
                 );
             // Async-protected business inputs require observation on the actual
             // consumer after dependencies settle, independently of the call package.
-            if (function_address != 0 && scheduler_async_work_activated(context->async)) {
+            if (function_address != 0 && local_slot->may_observe_async_inputs && context->async != nullptr &&
+                scheduler_async_work_activated(context->async)) {
                 SchedulerScalarScope scalar_cache(context, SchedPhaseKind::ScalarCacheObserve, task_ref);
                 scheduler_observe_data_cache(binding);
             }
             uint32_t execution_group_index = pto2::resident::ASYNC_INVALID_INDEX;
-            {
+            if (binding->global_context.async_group_index != pto2::resident::ASYNC_INVALID_INDEX) {
                 pto2::resident::AsyncWriter writer{};
                 if (!scheduler_async_begin_prebound_execution(
                         context->async, task_ref, binding->global_context, writer
@@ -727,10 +732,11 @@ __aicore__ bool run_ready_dispatch_loop(
             // private slot/admission address escapes, and this core cannot run
             // its scheduler while inside the kernel. Dispatch's validated task
             // and group binding therefore remain owned through normal return.
+            bool has_deferred = false;
             if (execution_group_index != pto2::resident::ASYNC_INVALID_INDEX) {
                 const auto writer = scheduler_async_writer_for_group(*context->async, execution_group_index);
                 if (!scheduler_async_seal_execution<true>(
-                        context->async, task_ref, local_slot->block_idx, local_slot->subtask_slot, writer
+                        context->async, task_ref, local_slot->block_idx, local_slot->subtask_slot, writer, &has_deferred
                     )) {
                     scheduler_record_error(
                         run_control, task_ref, scheduler_async_error_result(context->async), &graph, context,
@@ -754,6 +760,29 @@ __aicore__ bool run_ready_dispatch_loop(
                     graph, scheduler_state_base, context, run_control, slot_index, profiling_level
                 );
                 return false;
+            }
+            const bool possible_async = execution_group_index != pto2::resident::ASYNC_INVALID_INDEX;
+            local_slot->completion_credits = 1 + static_cast<uint8_t>(possible_async && !has_deferred);
+            if (possible_async && !has_deferred && (local_slot->cluster_mix || local_slot->gm_mix)) {
+                const auto *counter = scheduler_completion_counter_at(
+                    scheduler_state_base, context->config.completion_counters_offset, task_ref
+                );
+                if (counter != nullptr &&
+                    !scheduler_counter_publish_condition(
+                        scheduler_state_base, *counter, task_ref, local_slot->block_idx, local_slot->subtask_slot,
+                        context->config.task_metadata_offset,
+                        context->profiling == nullptr ? 0 : context->profiling->protocol_layout_offset,
+                        static_cast<uint32_t>(context->worker_id()), false
+                    )) {
+                    scheduler_record_error(
+                        run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                        SchedulerErrorSite::ASYNC_SEAL_FAILED, local_slot
+                    );
+                    (void)scheduler_complete_own_slot<record_protocol, true, false>(
+                        graph, scheduler_state_base, context, run_control, slot_index, profiling_level
+                    );
+                    return false;
+                }
             }
             scalar_seal.close();
             if (context->async != nullptr) ++context->async->business_returns;
@@ -872,6 +901,12 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
             graph.task_count, scheduler_local_state.config.task_controls_offset, async
         );
         if (config_valid && async.layout != nullptr) {
+            async.completion_counters_offset = context->completion_counters_offset;
+            async.task_metadata_offset = context->task_metadata_offset;
+            async.protocol_layout_offset = scheduler_local_state.profiling == nullptr ?
+                                               0 :
+                                               scheduler_local_state.profiling->protocol_layout_offset;
+            async.worker_index = static_cast<uint32_t>(context->worker_index);
             async.check_cursor = static_cast<uint32_t>(context->worker_index % async.layout->group_count);
             scheduler_local_state.async = &async;
         }

@@ -214,6 +214,7 @@ TEST(HbgAdmissionProgress, DeferredPredecessorLeavesIndependentCounterPublisherR
             input.task_ref = 0;
             input.block_count = 2;
             input.active_mask = LaneMask::aiv0();
+            input.capacities[1] = 1;
             std::string error;
             EXPECT_TRUE(plan_async_completion(layout.total_size, 47, task_count, {input}, &plan, &error)) << error;
             layout.total_size = plan.total_bytes;

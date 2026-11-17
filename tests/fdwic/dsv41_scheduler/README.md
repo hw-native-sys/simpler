@@ -412,6 +412,20 @@ under `vendor/`. The original Host source is losslessly compressed because the
 larger file exceeds this repository's individual-file size limit. It is
 expanded into `build/` before compilation and can be read with `gzip -dc`.
 
+Every registration declares `async_capability` alongside its signature:
+`SYNCHRONOUS` registers no deferred completion; `DEFERRED` supplies a static
+condition bound and condition-type mask. For legacy registrations, missing or
+`None` declarations and explicit `UNKNOWN` with zero condition fields normalize
+to `DEFERRED(max_conditions=64, condition_types=3)` at the input boundary;
+invalid fields remain errors. The checked-in declarations are explicit contracts maintained with the source, not deductions
+from kernel names or a successful execution. `build_sources.py` preserves them
+through the registration manifest into `CoreCallable`; model instructions are
+unchanged. The Host-only `native-runner --declare-async-capabilities INPUT
+DECLARATIONS OUTPUT` command can add reviewed declarations to an existing
+bundle's header padding without moving its kernel binaries. An A/B comparison
+must use the same declared bundle and verify each original kernel's bytes and
+offsets on both sides.
+
 Uniform zero/one initializers are stored as one element plus a repeat count;
 nonuniform metadata is stored in full. This avoids checking in tens of GB of
 materialized weights without changing the bytes uploaded to the devices.

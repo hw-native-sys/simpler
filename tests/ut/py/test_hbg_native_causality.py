@@ -14,8 +14,9 @@ import pytest
 from _capture_builder import Capture
 from _native_protocol_builder import ProtocolBuilder
 
-from simpler_setup.tools.hbg.native_causality import MIX, PRECLAIM, audit_native_protocol
+from simpler_setup.tools.hbg.native_causality import MIX, PRECLAIM, NativeAudit, audit_native_protocol
 from simpler_setup.tools.hbg.native_protocol import (
+    COUNTER_ACCOUNTING,
     MEMBER_FROM_CLAIM,
     STAMPS,
     _event_records,
@@ -407,7 +408,7 @@ def test_sync_start_rejects_two_blocks_on_one_position_even_if_first_returned(ma
     builder.admit(0)
     worker = 0 if mask & 1 or mask == 6 else 1
     for block in range(2):
-        if mask.bit_count() > 1:
+        if bin(mask).count("1") > 1:
             builder.mix_block(0, block, 0)
         else:
             owner = builder.claim(0, block, worker)
@@ -423,7 +424,7 @@ def test_sync_start_local_close_and_next_task_can_precede_remote_claim(mask):
     builder = ProtocolBuilder([(mask, 2, ()), (mask, 2, ())], sync_tasks=(0, 1))
     builder.admit(0)
     builder.admit(1, observe_members=False)
-    mixed = mask.bit_count() > 1
+    mixed = bin(mask).count("1") > 1
     for block, cluster in enumerate((0, 1)):
         workers = [cluster * 3 + lane for lane in range(3)] if mixed else [cluster * 3 + int(mask != 1)]
         for task in (0, 1):
@@ -894,7 +895,7 @@ def test_compact_admission_accepts_64_only_alignment_and_rejects_bad_regions(mut
         audit_native_protocol(raw, identities)
 
 
-@pytest.mark.parametrize("flag", (2, 128))
+@pytest.mark.parametrize("flag", (128,))
 def test_current_cooperative_capture_rejects_independent_flag(flag):
     raw, identities = ProtocolBuilder([(1, 2, ())]).run()
     _set_claim_seal_observation(raw, identities)
@@ -923,8 +924,8 @@ def _subtask_capture(shapes=((3, 2, ()), (2, 1, (0,))), *, deferred=()):
 def test_current_counts_actual_subtasks_and_aliases_mix_group_contribution(mask, blocks, deferred):
     raw, identities = _subtask_capture(((mask, blocks, ()), (2, 1, (0,))), deferred=deferred)
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
-    assert raw["task_controls"][0]["completed_subtasks"] == blocks * mask.bit_count()
-    if mask.bit_count() > 1:
+    assert raw["task_controls"][0]["completed_subtasks"] == blocks * bin(mask).count("1")
+    if bin(mask).count("1") > 1:
         last = max(
             (b["owner"] for b in raw["blocks"] if b["owner"]["task_ref"] == 0),
             key=lambda owner: owner["completion_ticket"],
@@ -1110,3 +1111,161 @@ def test_mix_group_completion_preserves_unique_credit_and_physical_retirement(fa
         done["before"] = last["completion_before"].copy()
     with pytest.raises(ValueError):
         audit_native_protocol(raw, identities)
+
+
+def _counter_capture(*, mask=1, separate=False, successor=False, sync=False, async_mask=None):
+    shapes: list[tuple[int, int, tuple[int, ...]]] = [(mask, 2, ())]
+    if successor:
+        shapes.append((1, 1, (0,)))
+    builder = ProtocolBuilder(shapes, sync_tasks=(0,) if sync else ())
+    raw, identities = builder.run()
+    threshold = 0
+    assert len(raw["tasks"]) == len(raw["task_controls"]) == len(raw["task_events"])
+    for task, control, actors in zip(raw["tasks"], raw["task_controls"], raw["task_events"]):
+        task_async_mask = task["active_mask"] if async_mask is None else task["active_mask"] & async_mask
+        threshold += task["block_num"] * (bin(task["active_mask"]).count("1") + bin(task_async_mask).count("1"))
+        control.update(completion_backend=1, counter_index=0, counter_threshold=threshold, async_mask=task_async_mask)
+        done = actors["completion"]
+        done["flags"] = task["flags"] | COUNTER_ACCOUNTING | ((1 << 31) if separate else 0)
+        when = builder.clock + 100 + 4 * task["task_ref"]
+        done.update(before=[when, 1], after=[when + 1, 1])
+    for control in raw["task_controls"]:
+        control["counter_limit"] = threshold
+    raw["completion_counters"] = [dict(index=0, value=threshold, valid=1, limit=threshold)]
+    for block in raw["blocks"]:
+        owner = block["owner"]
+        mixed = bool(raw["tasks"][owner["task_ref"]]["flags"] & MIX)
+        may_defer = bool(raw["task_controls"][owner["task_ref"]]["async_mask"])
+        owner.update(
+            completion_ticket=(1 << 64) - 1,
+            completion_credits=bin(owner["active_mask"]).count("1")
+            if mixed
+            else (1 if separate or not may_defer else 2),
+        )
+    for execution in raw["executions"]:
+        task = raw["tasks"][execution["task_ref"]]
+        mixed = bool(task["flags"] & MIX)
+        may_defer = bool(raw["task_controls"][execution["task_ref"]]["async_mask"] & (1 << execution["subtask_slot"]))
+        if not mixed:
+            execution.update(
+                contribution_ticket=(1 << 64) - 1, contribution_credits=1 if separate or not may_defer else 2
+            )
+        if may_defer and (mixed or separate):
+            when = execution["completion_consumed"][0] + 1
+            raw["condition_contributions"].append(
+                dict(
+                    index=execution["index"],
+                    run_epoch=raw["run_epoch"],
+                    task_ref=execution["task_ref"],
+                    worker_index=execution["worker_index"],
+                    block_idx=execution["block_idx"],
+                    subtask_slot=execution["subtask_slot"],
+                    source=1 if separate else 0,
+                    credits=1,
+                    before=[when, 1],
+                    after=[when + 1, 1],
+                )
+            )
+    resequence(raw)
+    return raw, identities
+
+
+@pytest.mark.parametrize(
+    ("mask", "separate", "sync"),
+    [(1, False, False), (1, True, False), (1, False, True), (3, False, False), (6, True, True)],
+)
+def test_counter_credits_preserve_physical_and_condition_causality_without_return_tickets(mask, separate, sync):
+    raw, identities = _counter_capture(mask=mask, separate=separate, sync=sync)
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+
+
+def test_counter_fixture_accepts_python39_zip_signature(monkeypatch):
+    standard_zip = zip
+
+    def zip_without_keywords(*iterables):
+        return standard_zip(*iterables)
+
+    monkeypatch.setitem(globals(), "zip", zip_without_keywords)
+    raw, identities = _counter_capture(successor=True)
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+
+
+def test_counter_successor_does_not_wait_for_deferred_gm_accounting():
+    raw, identities = _counter_capture(successor=True)
+    assert raw["executions"][-1]["entry"][0] < raw["task_events"][0]["completion"]["before"][0]
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+
+
+@pytest.mark.parametrize(("mask", "async_mask"), [(1, 0), (3, 0), (7, 6)])
+def test_counter_sync_lanes_need_only_physical_credits(mask, async_mask):
+    raw, identities = _counter_capture(mask=mask, async_mask=async_mask)
+    assert raw["completion_counters"][0]["limit"] == 2 * (bin(mask).count("1") + bin(async_mask).count("1"))
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+    raw["task_controls"][0]["async_mask"] ^= 1
+    with pytest.raises(ValueError, match="counter thresholds"):
+        audit_native_protocol(raw, identities)
+
+
+def test_counter_publication_can_be_observed_before_the_publishers_after_sample():
+    raw, identities = _counter_capture(successor=True)
+    publisher, successor = raw["executions"][1:]
+    assert publisher["worker_index"] != successor["worker_index"]
+    publisher["contribution_after"][0] = successor["entry"][0] + 1
+    publisher["trace_published"][0] = successor["entry"][0] + 2
+    resequence(raw)
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "credits",
+        "ticket",
+        "missing_condition",
+        "late_condition",
+        "incomplete",
+        "ancestor",
+        "threshold",
+        "accounting_alias",
+    ],
+)
+def test_counter_capture_rejects_missing_or_fabricated_completion_proof(fault):
+    raw, identities = _counter_capture(separate=True, successor=True)
+    if fault == "credits":
+        raw["executions"][0]["contribution_credits"] = 2
+    elif fault == "ticket":
+        raw["executions"][0]["contribution_ticket"] = 0
+    elif fault == "missing_condition":
+        raw["condition_contributions"].pop(0)
+    elif fault == "late_condition":
+        condition = raw["condition_contributions"][0]
+        execution = raw["executions"][-1]
+        condition["worker_index"] = execution["worker_index"]
+        condition["before"][0] = execution["trace_published"][0] + 1
+        condition["after"][0] = execution["trace_published"][0] + 2
+    elif fault == "incomplete":
+        raw["completion_counters"][0]["value"] -= 1
+    elif fault == "ancestor":
+        raw["tasks"][1]["dependencies"] = []
+    elif fault == "threshold":
+        raw["task_controls"][0]["counter_threshold"] += 2
+    else:
+        raw["task_events"][0]["completion"]["flags"] |= 1 << 30
+    resequence(raw)
+    with pytest.raises(ValueError):
+        audit_native_protocol(raw, identities)
+
+
+@pytest.mark.parametrize("mask", (1, 3), ids=("ordinary", "mix"))
+def test_counter_check_cannot_contribute_before_its_kernel_returns(mask):
+    raw, identities = _counter_capture(mask=mask, separate=True)
+    condition = raw["condition_contributions"][0]
+    execution = raw["executions"][condition["index"]]
+    condition["before"][0] = execution["entry"][0] + 1
+    condition["after"][0] = execution["returned"][0] - 1
+    resequence(raw)
+    # Exercise the condition contract directly. The full audit also rejects
+    # same-worker scheduler events inside a kernel for an independent reason.
+    audit = NativeAudit(raw, identities)
+    with pytest.raises(ValueError, match="counter condition precedes its execution return"):
+        audit.counter_condition(condition["index"], ("ready", 0), raw["tasks"][0])

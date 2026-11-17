@@ -66,9 +66,30 @@ TEST_F(ProtocolExportFixture, PreservesFrozenGraphAndHostCompletedNodeWithoutFab
     EXPECT_NE(json.find("\"dependencies\":[0]"), std::string::npos);
     EXPECT_NE(json.find("\"task_events\":[]"), std::string::npos);
     EXPECT_NE(json.find("\"executions\":[]"), std::string::npos);
+    EXPECT_NE(json.find("\"completion_counters\":[]"), std::string::npos);
+    EXPECT_NE(json.find("\"condition_contributions\":[]"), std::string::npos);
+    EXPECT_NE(json.find("\"async_mask\":0"), std::string::npos);
+    EXPECT_NE(json.find("\"completion_backend\":0,\"counter_index\":18446744073709551615"), std::string::npos);
     EXPECT_NE(json.find("\"admission_log\":[-1]"), std::string::npos);
     EXPECT_EQ(json.find("protocol_verified"), std::string::npos);
     EXPECT_NE(json.find("\"schedule_rank\":1,\"topological_level\":0,\"bottom_level\":2"), std::string::npos);
+}
+
+TEST_F(ProtocolExportFixture, ExportsActualCounterObservationOncePerAddressWithoutInventingTaskTickets) {
+    auto *counters = at<SchedulerTaskCompletionCounter>(layout.completion_counters_offset);
+    counters[0] = {UINT64_C(0x1000), UINT64_C(0x2000), 12, 14};
+    counters[1] = {UINT64_C(0x1000), UINT64_C(0x2000), 14, 14};
+    auto *observations = at<SchedulerProtocolCounterObservation>(layout.protocol.counter_observations_offset);
+    observations[0] = observations[1] = {14, 1};
+    const auto json = dump();
+    EXPECT_NE(
+        json.find("\"completion_counters\":[{\"index\":0,\"value\":14,\"valid\":1,\"limit\":14}]"), std::string::npos
+    );
+    EXPECT_NE(json.find("\"counter_index\":0,\"counter_threshold\":12,\"counter_limit\":14"), std::string::npos);
+    EXPECT_NE(json.find("\"counter_index\":0,\"counter_threshold\":14,\"counter_limit\":14"), std::string::npos);
+    EXPECT_NE(json.find("\"task_events\":[]"), std::string::npos);
+    observations[1].value = 13;
+    EXPECT_THROW(dump(), std::invalid_argument);
 }
 
 TEST_F(ProtocolExportFixture, NativeSchemaCarriesBothIdentitiesAndIndependentSource) {
