@@ -44,11 +44,20 @@ std::once_flag g_fork_hygiene_once;
 
 // Appends into a NUL-terminated buffer, truncating rather than overflowing.
 // snprintf reports the length it wanted, not the length it wrote, so a
-// would-be-longer result saturates `len` at the last writable index.
+// would-be-longer result saturates `len` at the last writable index. With no
+// format arguments, `fmt` is appended as text rather than interpreted.
 template <typename... Args>
 size_t append_truncating(char *buf, size_t cap, size_t len, const char *fmt, Args... args) {
     if (len + 1 >= cap) return cap - 1;
-    const int wanted = std::snprintf(buf + len, cap - len, fmt, args...);
+    int wanted;
+    if constexpr (sizeof...(Args) == 0) {
+        // No arguments to consume, so `fmt` is text, not a format string;
+        // forwarding it as one is the non-literal, argument-free shape that
+        // -Wformat-security rejects.
+        wanted = std::snprintf(buf + len, cap - len, "%s", fmt);
+    } else {
+        wanted = std::snprintf(buf + len, cap - len, fmt, args...);
+    }
     if (wanted < 0) return len;
     return static_cast<size_t>(wanted) >= cap - len ? cap - 1 : len + static_cast<size_t>(wanted);
 }
