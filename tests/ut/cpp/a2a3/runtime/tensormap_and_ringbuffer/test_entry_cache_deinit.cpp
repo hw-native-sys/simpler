@@ -64,9 +64,7 @@ TEST(EntryCacheDeinit, FailedSnapshotFallsBackToFullThroughExecutor) {
     Runtime runtime;
     runtime.dev.entry_args_source_ = static_cast<uint32_t>(EntryArgsSource::LaunchEnvelope);
     runtime.dev.entry_tensor_count_ = 4;
-    PlatformEntryArgs view{
-        &runtime, LAUNCH_ENVELOPE_HEADER_BYTES, 4, 0, static_cast<uint32_t>(EntryArgsSource::LaunchEnvelope)
-    };
+    PlatformEntryArgs view{&runtime, &runtime, 4, 0, static_cast<uint32_t>(EntryArgsSource::LaunchEnvelope)};
     view.cache_maintenance = static_cast<uint32_t>(EntryCacheMaintenance::Live);
     // Direct executor tests provide the affinity cell normally bound by the wrapper.
     int32_t affinity_index = 0;

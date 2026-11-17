@@ -265,34 +265,32 @@ namespace {
 // FullFreshen refreshes their active storage before those values are consumed.
 bool adopt_launch_entry_args(Runtime *runtime, int32_t thread_idx) {
     // This thread's own slot: `thread_idx` is the gate survivor index the
-    // platform entry published under, on this same thread, so the block the
-    // view names is the one that thread still owns.
+    // platform entry published under. The input itself is read-only RTS-owned
+    // storage that remains valid throughout the launch.
     const PlatformEntryArgs view = get_platform_entry_args(thread_idx);
     if (!simpler::tmr::valid_entry_cache_route(view)) return false;
     const uint32_t source = view.source;
-    const uint32_t offset = view.offset;
+    const void *payload = view.entry_data;
     const uint32_t tensors = view.tensor_count;
     const uint32_t scalars = view.scalar_count;
-    // Decided before any address is formed from these values; the verdict says
+    // Decided before reading the relocated input; the verdict says
     // which check refused, and Adopt is the only one that licenses the read.
-    const LaunchEntryArgsVerdict verdict = classify_launch_entry_args(*runtime, source, offset, tensors, scalars);
+    const LaunchEntryArgsVerdict verdict = classify_launch_entry_args(*runtime, source, payload, tensors, scalars);
     if (verdict == LaunchEntryArgsVerdict::Descriptor)
         return simpler::tmr::freshen_entry_descriptor(*runtime, view, cache_invalidate_range);
     if (verdict != LaunchEntryArgsVerdict::Adopt) {
         LOG_ERROR(
-            "Thread %d: launch entry-args rejected (verdict=%d, source=%u/%u, offset=%u, counts=%u/%u vs %u/%u)",
+            "Thread %d: launch entry-args rejected (verdict=%d, source=%u/%u, data=%p, counts=%u/%u vs %u/%u)",
             thread_idx, static_cast<int32_t>(verdict), source, static_cast<uint32_t>(runtime->get_entry_args_source()),
-            offset, tensors, scalars, runtime->get_entry_tensor_count(), runtime->get_entry_scalar_count()
+            payload, tensors, scalars, runtime->get_entry_tensor_count(), runtime->get_entry_scalar_count()
         );
         return false;
     }
 
-    const void *base = view.args_base;
-    if (base == nullptr) {
-        LOG_ERROR("Thread %d: launch entry-args base is null", thread_idx);
+    if (payload == nullptr) {
+        LOG_ERROR("Thread %d: launch entry-args host input is null", thread_idx);
         return false;
     }
-    const void *payload = static_cast<const unsigned char *>(base) + LAUNCH_ENVELOPE_HEADER_BYTES;
     if (!runtime->adopt_entry_args_from_launch(payload, tensors, scalars)) {
         LOG_ERROR("Thread %d: launch entry-args %u/%u were rejected by the storage", thread_idx, tensors, scalars);
         return false;
@@ -679,12 +677,10 @@ AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx, EntryArgs
 
             // Entry values arrive either in the descriptor already or as raw
             // bytes appended to this launch's arguments. Adopt the launch form
-            // before anything reads the storage, and only after the offset, the
-            // counts and the source agree with the descriptor's own — a payload
-            // address formed from unchecked values is what this ordering
-            // prevents. Runs before create_from_entry_storage below, and only on
-            // the orchestrator thread: the scheduler threads are still waiting
-            // on runtime_init_ready_, and nothing else reads these values.
+            // before anything reads the storage, and only after the pointer, the
+            // counts and the source agree with the descriptor's own. Runs before create_from_entry_storage below, and
+            // only on the orchestrator thread: the scheduler threads are still waiting on runtime_init_ready_, and
+            // nothing else reads these values.
             const auto entry_view = get_platform_entry_args(thread_idx);
             const bool kernel_invocation =
                 entry_view.source == static_cast<uint32_t>(EntryArgsSource::KernelInvocation);

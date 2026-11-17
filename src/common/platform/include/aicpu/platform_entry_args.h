@@ -17,16 +17,13 @@
  * profiling bases already are. Globals inside the AICPU SO rather than
  * `thread_local`, per docs/dynamic-linking.md.
  *
- * **One slot per gate survivor, and only that survivor touches it.** Every
- * launched thread runs the kernel entry with its *own* copy of the launch
- * arguments, so a single shared slot would be two things at once: a write-write
- * race between threads storing into it, and a pointer whose owner is whichever
- * thread happened to win — possibly one the affinity gate dropped, whose copy
- * is gone by the time a reader dereferences it. Publishing per survivor index
- * removes both: distinct threads write distinct objects, and the thread that
- * reads a slot is the thread that wrote it, still inside the call that owns the
- * block. No atomic is needed because no object here is shared, and nothing is
- * serialized on the dispatch path.
+ * **One view slot per gate survivor, and only that survivor touches it.**
+ * Concurrent threads must not overwrite each other's published header. HBG
+ * also uses the current thread's argument-copy base for its Graph Definition.
+ * TMR's relocated input is read-only RTS-owned storage and may be shared by
+ * the launch's threads; per-thread view slots do not make the input private.
+ * Distinct threads write distinct view objects, and each thread reads the view
+ * it published. No atomic is needed for these slots.
  *
  * `exec_idx` is `platform_aicpu_affinity_thread_idx()`, the gate's deterministic
  * survivor position, which is also the index `AicpuExecutor::run` assigns roles
@@ -37,10 +34,9 @@
  * index reads -1 — carries no published view and reads as the descriptor route,
  * which is what those variants use.
  *
- * Nothing here does pointer arithmetic. The base and the offset stay separate
- * until the runtime has checked the offset, the counts and the source against
- * the descriptor's own, because a payload address formed from unchecked values
- * is the thing that must not exist.
+ * RTS relocates the TMR entry pointer into its device argument allocation.
+ * The runtime checks source, counts and pointer before consuming that input.
+ * HBG retains its separately validated base-plus-offset Graph Definition view.
  *
  * Implementation: common/platform/shared/aicpu/platform_entry_args.cpp
  */
@@ -56,14 +52,13 @@
  * One thread's view of its launch package: the entry region, and the Graph
  * Definition section when this run carries one.
  *
- * The two regions are named the same way and for the same reason — a base kept
- * apart from an offset the runtime checks before it forms an address — and both
- * belong to this thread alone. `host_build_graph` uses the graph fields and no
- * entry region; `tensormap_and_ringbuffer` the reverse.
+ * `entry_data` is RTS's relocated host-input pointer; `args_base` and the graph
+ * fields describe HBG's Graph Definition section. Each thread publishes its
+ * own view after the affinity gate.
  */
 struct PlatformEntryArgs {
     const void *args_base{nullptr};
-    uint32_t offset{0};
+    const void *entry_data{nullptr};
     uint32_t tensor_count{0};
     uint32_t scalar_count{0};
     uint32_t source{static_cast<uint32_t>(EntryArgsSource::Descriptor)};
@@ -72,8 +67,8 @@ struct PlatformEntryArgs {
     uint32_t graph_source{static_cast<uint32_t>(GraphSectionSource::None)};
     uint32_t cache_maintenance{static_cast<uint32_t>(EntryCacheMaintenance::Full)};
 };
-static_assert(offsetof(PlatformEntryArgs, cache_maintenance) == 36);
-static_assert(sizeof(PlatformEntryArgs) == 40);
+static_assert(offsetof(PlatformEntryArgs, cache_maintenance) == 40);
+static_assert(sizeof(PlatformEntryArgs) == 48);
 
 /**
  * Publish this thread's view, after the affinity gate has kept it.

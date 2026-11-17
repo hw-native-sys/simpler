@@ -245,7 +245,7 @@ int KernelArgsHelper::prepare_runtime_args(
     plan_ = plan;
     if (plan_.supported) {
         // Grow-only: a slot that has served a wider run keeps the capacity.
-        const size_t package_bytes = LAUNCH_ENVELOPE_HEADER_BYTES + plan_.payload_bytes;
+        const size_t package_bytes = LAUNCH_ENVELOPE_HEADER_BYTES + std::max<size_t>(plan_.payload_bytes, 1);
         if (slot.launch_package.size() < package_bytes) slot.launch_package.resize(package_bytes);
     }
     args.runtime_args = slot.runtime_args;
@@ -260,10 +260,12 @@ int KernelArgsHelper::prepare_runtime_args(
 
 bool KernelArgsHelper::build_launch_package() {
     std::byte *package = slot_->launch_package.data();
-    const size_t package_bytes = LAUNCH_ENVELOPE_HEADER_BYTES + plan_.payload_bytes;
+    const size_t package_bytes = LAUNCH_ENVELOPE_HEADER_BYTES + std::max<size_t>(plan_.payload_bytes, 1);
     if (slot_->launch_package.size() < package_bytes) return false;
 
     std::byte *payload = package + LAUNCH_ENVELOPE_HEADER_BYTES;
+    // RTS requires dataOffset to address a byte inside the copied argument block.
+    if (plan_.payload_bytes == 0) *payload = std::byte{0};
     const size_t tensor_bytes = plan_.payload_bytes - static_cast<size_t>(plan_.scalar_count) * sizeof(uint64_t);
     // Out of the snapshot, not out of the caller's Runtime: the values a launch
     // carries and the ones its descriptor names are the same capture.
@@ -276,7 +278,7 @@ bool KernelArgsHelper::build_launch_package() {
     // Name the region this package now carries. The header bytes themselves are
     // copied in at the submission, because fields of this run are still being
     // armed between here and there.
-    args.entry_args_offset = static_cast<uint32_t>(LAUNCH_ENVELOPE_HEADER_BYTES);
+    args.entry_args_data = nullptr;
     args.entry_tensor_count = plan_.tensor_count;
     args.entry_scalar_count = plan_.scalar_count;
     args.entry_args_source = static_cast<uint32_t>(EntryArgsSource::LaunchEnvelope);
@@ -320,7 +322,7 @@ bool KernelArgsHelper::build_kernel_launch_package() {
     auto *package = slot_->launch_package.data();
     std::memset(package + sizeof(KernelArgs), 0, LAUNCH_ENVELOPE_HEADER_BYTES - sizeof(KernelArgs));
     std::memcpy(package + LAUNCH_ENVELOPE_HEADER_BYTES, kernel_invocation_.data(), kernel_invocation_.size());
-    args.entry_args_offset = static_cast<uint32_t>(LAUNCH_ENVELOPE_HEADER_BYTES);
+    args.entry_args_data = nullptr;
     args.entry_tensor_count = plan_.tensor_count;
     args.entry_scalar_count = plan_.scalar_count;
     args.entry_args_source = static_cast<uint32_t>(EntryArgsSource::KernelInvocation);
@@ -424,7 +426,7 @@ int KernelArgsHelper::publish_runtime_args(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (!launch_route && !kernel_route) {
-        args.entry_args_offset = 0;
+        args.entry_args_data = nullptr;
         args.entry_tensor_count = 0;
         args.entry_scalar_count = 0;
         args.entry_args_source = static_cast<uint32_t>(EntryArgsSource::Descriptor);

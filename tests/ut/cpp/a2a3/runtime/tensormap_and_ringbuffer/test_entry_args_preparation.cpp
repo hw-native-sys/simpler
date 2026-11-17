@@ -58,7 +58,8 @@ protected:
         std::memcpy(payload.data() + LAUNCH_ENVELOPE_HEADER_BYTES, args.tensors_, sizeof(tensor));
         std::memcpy(payload.data() + LAUNCH_ENVELOPE_HEADER_BYTES + sizeof(tensor), args.scalars_, sizeof(uint64_t));
         launch_view = {
-            payload.data(), LAUNCH_ENVELOPE_HEADER_BYTES, 1, 1, static_cast<uint32_t>(EntryArgsSource::LaunchEnvelope)
+            payload.data(), payload.data() + LAUNCH_ENVELOPE_HEADER_BYTES, 1, 1,
+            static_cast<uint32_t>(EntryArgsSource::LaunchEnvelope)
         };
         view_reads.store(0);
         execution_index = kOrchestrator;

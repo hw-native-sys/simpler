@@ -548,14 +548,13 @@ LaunchEntryArgsPlan runtime_launch_entry_args_plan(const Runtime &rt);
 // runtime-specific branch.
 uint32_t runtime_graph_section_bytes(const Runtime &rt);
 /**
- * Whether a launch header may be adopted, decided before any payload address is
- * formed from it.
+ * Whether a launch header may be adopted, decided before its input is read.
  *
  * Every rejection is its own verdict so a caller can say which check failed,
  * and the order is the contract: an undefined source is refused before it is
- * compared, the comparison before the offset, the offset before the counts, and
+ * compared, the comparison before the input pointer, and the pointer before the counts;
  * the counts — both against capacity and against the descriptor's own — before
- * anything derives an address. `Descriptor` means this run's values are already
+ * anything reads the input. `Descriptor` means this run's values are already
  * in place and there is nothing to adopt.
  */
 enum class LaunchEntryArgsVerdict : int32_t {
@@ -563,13 +562,13 @@ enum class LaunchEntryArgsVerdict : int32_t {
     Adopt,
     UndefinedSource,
     SourceMismatch,
-    UnexpectedOffset,
+    MissingHostInput,
     CountsPastCapacity,
     CountsMismatch,
 };
 
 LaunchEntryArgsVerdict classify_launch_entry_args(
-    const Runtime &rt, uint32_t source, uint32_t offset, uint32_t tensor_count, uint32_t scalar_count
+    const Runtime &rt, uint32_t source, const void *data, uint32_t tensor_count, uint32_t scalar_count
 );
 
 #endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_

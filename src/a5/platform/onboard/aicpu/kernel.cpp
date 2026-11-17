@@ -123,12 +123,12 @@ static int execute_platform_task(void *arg) {
     set_platform_phase_base(k_args->device_wall_data_base);
     // This thread's own view of the launch package, published under its gate
     // survivor index so no other thread writes the slot and no other thread's
-    // arguments are borrowed. Base and offset stay separate: the runtime forms
-    // the payload address only after checking both against its descriptor.
+    // arguments are borrowed. RTS supplies the relocated TMR input pointer;
+    // the runtime validates its source and counts before reading it.
     set_platform_entry_args(
         platform_aicpu_affinity_thread_idx(),
         PlatformEntryArgs{
-            arg, k_args->entry_args_offset, k_args->entry_tensor_count, k_args->entry_scalar_count,
+            arg, k_args->entry_args_data, k_args->entry_tensor_count, k_args->entry_scalar_count,
             k_args->entry_args_source, k_args->graph_section_offset, k_args->graph_section_bytes,
             k_args->graph_section_source
         }

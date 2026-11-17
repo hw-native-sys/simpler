@@ -27,10 +27,16 @@ struct rtKernelLaunchCfg_t {
     rtLaunchKernelAttr_t *attrs;
     uint32_t numAttrs;
 };
+struct rtHostInputInfo_t {
+    uint32_t addrOffset;
+    uint32_t dataOffset;
+};
 struct rtCpuKernelArgs_t {
     struct {
         void *args{};
         uint32_t argsSize{};
+        rtHostInputInfo_t *hostInputInfoPtr{};
+        uint16_t hostInputInfoNum{};
     } baseArgs;
 };
 enum rtLoadBinaryOption { RT_LOAD_BINARY_OPT_CPU_KERNEL_MODE };

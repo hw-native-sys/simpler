@@ -63,6 +63,7 @@ struct Transport {
     int resolve_failure_at = -1;
     int resolve_calls = 0;
     int launches = 0;
+    int relocated_inputs = 0;
     ~Transport() {
         for (auto &binary : binaries)
             dlclose(binary->module);
@@ -166,7 +167,22 @@ extern "C" rtError_t
 rtsLaunchCpuKernel(rtFuncHandle function, uint32_t, rtStream_t, const rtKernelLaunchCfg_t *, rtCpuKernelArgs_t *args) {
     ++transport->launches;
     if (transport->launch_error != 0 && !transport->execute_on_launch_error) return transport->launch_error;
-    const int rc = reinterpret_cast<int (*)(void *)>(function)(args->baseArgs.args);
+    std::vector<char> device_args;
+    void *launch_args = args->baseArgs.args;
+    if (args->baseArgs.hostInputInfoNum != 0) {
+        device_args.resize(args->baseArgs.argsSize);
+        std::memcpy(device_args.data(), launch_args, device_args.size());
+        for (uint16_t i = 0; i < args->baseArgs.hostInputInfoNum; ++i) {
+            const auto &input = args->baseArgs.hostInputInfoPtr[i];
+            EXPECT_LE(input.addrOffset + sizeof(void *), device_args.size());
+            EXPECT_LT(input.dataOffset, device_args.size());
+            const void *data = device_args.data() + input.dataOffset;
+            std::memcpy(device_args.data() + input.addrOffset, &data, sizeof(data));
+            ++transport->relocated_inputs;
+        }
+        launch_args = device_args.data();
+    }
+    const int rc = reinterpret_cast<int (*)(void *)>(function)(launch_args);
     return transport->launch_error != 0 ? transport->launch_error : rc;
 }
 
@@ -227,6 +243,31 @@ protected:
         return probe == nullptr ? -1 : probe(slot);
     }
 };
+
+TEST_F(LoadOwnership, HostInputMetadataRelocatesRegistrationPayload) {
+    host::LoadAicpuOp loader;
+    ASSERT_EQ(Bootstrap(loader), 0);
+    ASSERT_EQ(Init(loader), 0);
+    RegisterCallableArgs args{};
+    args.active_callable_id = 0;
+    args.dev_orch_so_size = orchestration.size();
+    std::snprintf(args.device_orch_func_name, sizeof(args.device_orch_func_name), "%s", "owner_x");
+    std::snprintf(args.device_orch_config_name, sizeof(args.device_orch_config_name), "%s", "owner_x_config");
+    args.residency_generation = 1;
+    std::vector<char> package(sizeof(args) + orchestration.size());
+    std::memcpy(package.data(), &args, sizeof(args));
+    std::memcpy(package.data() + sizeof(args), orchestration.data(), orchestration.size());
+    rtHostInputInfo_t input{offsetof(RegisterCallableArgs, dev_orch_so_addr), sizeof(args)};
+    ASSERT_EQ(
+        loader.LaunchBuiltInOp(
+            nullptr, package.data(), package.size(), 1, host::KernelNames::RegisterCallableName, &input, 1
+        ),
+        0
+    );
+    EXPECT_EQ(state.relocated_inputs, 1);
+    EXPECT_EQ(Live(*state.binaries.back()), 1);
+    ASSERT_EQ(Finalize(loader), 0);
+}
 
 TEST_F(LoadOwnership, RegistrationUsesProcessTemporaryDirectoryAndRemovesJson) {
     ScopedTmpdir temporary(state.dir);
