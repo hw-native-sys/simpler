@@ -1032,6 +1032,13 @@ class _FakeChipRun:
         self._lane._launch_front()
         self._lane._prepare_successor()
 
+    def bind_peer_cancel(self, address: int) -> None:
+        self.peer_cancel_address = address
+
+    @property
+    def _owner_recovery_required(self) -> bool:
+        return not self.terminal
+
     def abandon(self) -> None:
         if self._launched:
             raise RuntimeError("cannot abandon a launched fake ChipRun")
@@ -9399,3 +9406,158 @@ def test_child_host_use_retirement_consumes_native_failure_proof(monkeypatch, re
         assert bool(uses) is recovery_required
     finally:
         harness.close()
+
+
+@pytest.mark.parametrize("prepared", [False, True], ids=["queued", "prepared"])
+@pytest.mark.parametrize("cleanup", ["released", "retained", "raises"])
+def test_peer_cancel_before_activation_preserves_owner_proof(monkeypatch, prepared, cleanup):
+    imports = worker_mod.ImportRegistry
+    uses = set()
+    releases = []
+
+    def release(identity):
+        releases.append(identity)
+        uses.discard(identity)
+
+    def with_host_mappings(context):
+        registry = imports(context)
+        registry.host_mappings = SimpleNamespace(
+            acquire=lambda identity, _args: uses.add(identity), release=release, require_closed=lambda: None
+        )
+        return registry
+
+    monkeypatch.setattr(worker_mod, "ImportRegistry", with_host_mappings)
+    monkeypatch.setattr(_FakeChipRun, "_owner_recovery_required", property(lambda _run: cleanup != "released"))
+    abandon = _FakeChipRun.abandon
+
+    def abandon_with_cleanup(run):
+        abandon(run)
+        if cleanup == "raises":
+            raise RuntimeError("unlaunched owner cleanup failed")
+
+    monkeypatch.setattr(_FakeChipRun, "abandon", abandon_with_cleanup)
+    harness = _TwoFrameLoopHarness(supports_concurrent_native_prepare=prepared)
+    terminals = []
+    store = worker_mod._mailbox_store_i32
+
+    def observe_terminal(address, value):
+        if address == harness.state_addr(1) and value in (worker_mod._TASK_DONE, worker_mod._TASK_FAILED):
+            terminals.append(value)
+        store(address, value)
+
+    monkeypatch.setattr(worker_mod, "_mailbox_store_i32", observe_terminal)
+    try:
+        harness.publish(0, 1)
+        struct.pack_into("=Q", harness.buf, harness._entry_offset(0) + worker_mod._OFF_ENTRY_RUN_ID, 6)
+        harness.start()
+        assert harness.cw.launched[0].wait(5.0)
+        harness.publish(1, 2, state=worker_mod._PREPARE_READY)
+        harness.wait_state(1, worker_mod._FRAME_STAGED)
+        target = next(run for run in harness.cw._runs if run.submission.slot_id == 1)
+        assert (target.token is not None) is prepared
+        target_identity = next(identity for identity in uses if identity[2] == 1)
+        _mailbox_store_i32(target.peer_cancel_address, 1)
+        _mailbox_store_i32(harness.state_addr(1), worker_mod._ACTIVATE)
+        harness.wait_state(1, worker_mod._TASK_FAILED)
+        assert not harness.cw.launched[1].is_set()
+        assert _mailbox_load_i32(harness.accepted_addr(1)) == 0
+        assert (target_identity in uses) is (cleanup != "released")
+        assert releases.count(target_identity) == int(cleanup == "released")
+        assert sum(event == ("finalize", 1) for event in harness.cw.events) == int(prepared)
+        # A healthy predecessor remains in flight; cancellation is not its completion.
+        if cleanup != "raises":
+            assert not harness.cw.finalized[0].is_set()
+            harness.cw.completed[0].set()
+            harness.wait_state(0, worker_mod._TASK_DONE)
+        harness.stop()
+        assert terminals == [worker_mod._TASK_FAILED]
+    finally:
+        harness.close()
+
+
+@pytest.fixture
+def peer_cancel_ccu_loop(monkeypatch):
+    import simpler.ccu as ccu_mod
+
+    harness = _TwoFrameLoopHarness()
+    harness.cw.register_ccu_callable = lambda *_args: 17
+    monkeypatch.setattr(worker_mod, "_require_base_communicator", lambda _handle: 1)
+    monkeypatch.setattr(ccu_mod, "runtime_build_identity", lambda: (bytes(32), bytes(32)))
+    try:
+        harness.start()
+        yield harness
+    finally:
+        harness.close()
+
+
+def test_peer_cancel_on_initial_submission_does_not_reinsert_terminal_run(monkeypatch):
+    harness = _TwoFrameLoopHarness()
+    terminals = []
+    store = worker_mod._mailbox_store_i32
+
+    def observe_terminal(address, value):
+        if address == harness.state_addr(0) and value in (worker_mod._TASK_DONE, worker_mod._TASK_FAILED):
+            terminals.append(value)
+        store(address, value)
+
+    monkeypatch.setattr(worker_mod, "_mailbox_store_i32", observe_terminal)
+    try:
+        harness.publish(0, 1)
+        request = harness.mailbox_addr + harness._entry_offset(0) + worker_mod._OFF_ENTRY_PEER_CANCEL_REQUESTED
+        _mailbox_store_i32(request, 1)
+        harness.start()
+        harness.wait_state(0, worker_mod._TASK_FAILED)
+        assert not harness.cw.launched[0].is_set()
+        assert _mailbox_load_i32(harness.accepted_addr(0)) == 0
+        assert harness.cw._runs == []
+        harness.stop()
+        assert terminals == [worker_mod._TASK_FAILED]
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize("discard_fails", [False, True])
+def test_peer_cancel_before_activation_discards_unstarted_ccu(monkeypatch, peer_cancel_ccu_loop, discard_fails):
+    harness = peer_cancel_ccu_loop
+    payload = worker_mod._CCU_DOMAIN_REQUEST.pack(8, 0, 9, harness.digest, 0)
+    payload += struct.pack("<QIII2I", 7, 2, 0, 0, 0, 1)
+    harness.publish_ccu_control(payload)
+    harness.wait_control_state(worker_mod._CONTROL_DONE)
+    assert struct.unpack_from("i", harness.buf, worker_mod._OFF_ERROR)[0] == 0
+    _mailbox_store_i32(harness.mailbox_addr + _OFF_STATE, worker_mod._IDLE)
+    harness.publish(0, 1)
+    assert harness.cw.launched[0].wait(5.0)
+    args = TaskArgs().with_ccu_bindings([(8, 17, 0)])
+    monkeypatch.setattr(worker_mod, "read_args_from_blob", lambda *_args: args)
+    controls = []
+    harness.cw.prepare_ccu_run_set = lambda *_args: 71
+
+    def control(_communicator, run_set, operation):
+        controls.append((run_set, operation))
+        if discard_fails:
+            raise RuntimeError("CCU discard is unconfirmed")
+        return 0
+
+    harness.cw.control_ccu_run_set = control
+    terminals = []
+    store = worker_mod._mailbox_store_i32
+
+    def observe_terminal(address, value):
+        if address == harness.state_addr(1) and value in (worker_mod._TASK_DONE, worker_mod._TASK_FAILED):
+            terminals.append(value)
+        store(address, value)
+
+    monkeypatch.setattr(worker_mod, "_mailbox_store_i32", observe_terminal)
+    harness.publish(1, 2, state=worker_mod._PREPARE_READY)
+    harness.wait_state(1, worker_mod._FRAME_STAGED)
+    target = next(run for run in harness.cw._runs if run.submission.slot_id == 1)
+    _mailbox_store_i32(target.peer_cancel_address, 1)
+    _mailbox_store_i32(harness.state_addr(1), worker_mod._ACTIVATE)
+    harness.wait_state(1, worker_mod._TASK_FAILED)
+    assert not harness.cw.launched[1].is_set()
+    if not discard_fails:
+        harness.cw.completed[0].set()
+        harness.wait_state(0, worker_mod._TASK_DONE)
+    harness.stop()
+    assert terminals == [worker_mod._TASK_FAILED]
+    assert controls == [(71, 7)] * (2 if discard_fails else 1)

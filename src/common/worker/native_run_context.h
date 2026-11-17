@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -81,6 +82,37 @@ struct NativeRunContext {
     bool result_observed{false};
     bool physical_complete{false};
     bool execution_retired{false};
+    const int32_t *peer_cancel_request{nullptr};
+    bool peer_cancel_sent{false};
+
+    int poll_peer_cancel() {
+        if (peer_cancel_request == nullptr || peer_cancel_sent || execution_retired || active_execution == nullptr ||
+            __atomic_load_n(peer_cancel_request, __ATOMIC_ACQUIRE) == 0)
+            return 0;
+        const int rc = runner->request_peer_cancel(descriptor.pipeline_slot, descriptor.run_epoch);
+        if (rc == 0) peer_cancel_sent = true;
+        return rc;
+    }
+
+    int await_peer_cancel_progress() {
+        if (peer_cancel_request != nullptr) {
+            const int timeout_ms = runner->peer_cancel_wait_timeout_ms();
+            const auto start = std::chrono::steady_clock::now();
+            while (runner->poll_execution(*active_execution) == SIMPLER_NATIVE_RUN_POLL_NOT_READY) {
+                const int rc = poll_peer_cancel();
+                if (rc != 0) return rc;
+                if (timeout_ms >= 0 &&
+                    std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(timeout_ms))
+                    return SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+            }
+        }
+        return 0;
+    }
+
+    DrainOutcome drain_with_peer_cancel() {
+        const int rc = await_peer_cancel_progress();
+        return rc == 0 ? runner->drain_execution(*active_execution) : DrainOutcome::device_error(rc);
+    }
     // Captured while the actual arguments exist, before physical retirement
     // releases their Runtime. HOST views never acquire this entitlement.
     bool framework_transfer_eligible{false};

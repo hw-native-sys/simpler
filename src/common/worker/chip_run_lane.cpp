@@ -46,6 +46,7 @@ struct ChipRunState {
     // because a queued run prepares at the front, long after its submit.
     NativeRunProvenance provenance{};
     volatile int32_t *accepted_state{nullptr};
+    const int32_t *peer_cancel_request{nullptr};
     int32_t accepted_value{0};
     ChipWorkerNativeRun native_run{};
     void *caller_stream{nullptr};
@@ -390,6 +391,7 @@ struct ChipRunLaneState {
         );
         run->phase = ChipRunState::Phase::PREPARED;
         run->disposition = ChipRunPreparationDisposition::NATIVE_PREPARED;
+        if (run->peer_cancel_request != nullptr) worker->bind_peer_cancel(run->native_run, run->peer_cancel_request);
     }
 
     void poison_with(const std::shared_ptr<ChipRunState> &run, std::exception_ptr error) {
@@ -1471,6 +1473,19 @@ void ChipRun::activate() {
     // Activating a queued run is what launches it, and its launch is what lets the run behind it
     // be prepared — so this follows every activation, not only the front's.
     lane_->prepare_queued_successors();
+}
+
+void ChipRun::bind_peer_cancel(const int32_t *request) {
+    if (lane_ == nullptr || run_ == nullptr || request == nullptr)
+        throw std::runtime_error("invalid peer cancel binding");
+    lane_->validate_process();
+    std::lock_guard<std::mutex> lk(lane_->mu);
+    if (run_->phase != ChipRunState::Phase::QUEUED && run_->phase != ChipRunState::Phase::PREPARED)
+        throw std::runtime_error("peer cancellation must bind before launch");
+    if (run_->peer_cancel_request != nullptr && run_->peer_cancel_request != request)
+        throw std::runtime_error("peer cancellation already bound");
+    if (run_->phase == ChipRunState::Phase::PREPARED) lane_->worker->bind_peer_cancel(run_->native_run, request);
+    run_->peer_cancel_request = request;
 }
 
 void ChipRun::abandon() {

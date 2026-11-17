@@ -179,6 +179,8 @@ struct MailboxRunEntry {
     /* Parent, identity-checked while occupied; child acquire-loads in its
        existing mailbox loop. A level request, not an activation or verdict. */
     int32_t observation_requested;
+    /* Parent, identity-checked while occupied. Read by the child's native wait. */
+    int32_t peer_cancel_requested;
 };
 static_assert(
     std::is_trivially_copyable_v<MailboxRunEntry> && std::is_standard_layout_v<MailboxRunEntry>,
@@ -572,6 +574,7 @@ public:
     virtual bool activate_progress(RunId run_id);
     virtual void request_progress_stop() noexcept;
     virtual void request_observation(RunId) {}
+    virtual void request_peer_cancel(RunId) {}
     virtual void progress_observations() {}
     void set_observation_demand(std::function<bool(RunId)> query) { observation_demand_ = std::move(query); }
     void set_activation_permission(std::function<bool(RunId)> query) { activation_permission_ = std::move(query); }
@@ -671,6 +674,7 @@ public:
     bool activate_progress(RunId run_id) override;
     void request_progress_stop() noexcept override;
     void request_observation(RunId run_id) override;
+    void request_peer_cancel(RunId run_id) override;
     void progress_observations() override;
     void report_progress_error(const std::string &reason) override;
     bool report_submission_error(const WorkerDispatch &dispatch, const std::string &reason) override;
@@ -935,6 +939,7 @@ public:
         endpoint_->set_activation_permission(std::move(query));
     }
     void request_observation(RunId run_id) { endpoint_->request_observation(run_id); }
+    void request_peer_cancel(RunId run_id) { endpoint_->request_peer_cancel(run_id); }
     const WorkerEndpointCaps &caps() const;
     int32_t worker_id() const;
 
@@ -1170,6 +1175,7 @@ public:
     void stop();
     void progress();
     void request_observation(RunId run_id);
+    void request_peer_cancel(RunId run_id);
 
     WorkerThread *get_worker_by_id(WorkerType type, int32_t worker_id) const;
     std::vector<int32_t> next_level_worker_ids() const;

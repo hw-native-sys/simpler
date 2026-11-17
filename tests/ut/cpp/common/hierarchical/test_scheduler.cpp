@@ -5278,6 +5278,24 @@ TEST_F(GroupSchedulerFixture, GroupFailureWaitsForRunningMembersThenConsumes) {
     EXPECT_EQ(S(slot).state.load(), TaskState::CONSUMED);
 }
 
+TEST_F(GroupSchedulerFixture, FailureRequestsCancellationOfSeparatelySubmittedRanks) {
+    const auto first = orch.submit_next_level(C(42), single_tensor_args(0xC0, TensorArgType::OUTPUT), cfg, 0);
+    const auto second = orch.submit_next_level(C(43), single_tensor_args(0xC1, TensorArgType::OUTPUT), cfg, 1);
+    worker_a.wait_running();
+    worker_b.wait_running();
+    auto *peer = mailbox_run_entry(worker_b.mailbox.data(), worker_b.current_entry.load(std::memory_order_acquire));
+    worker_a.complete_with_error("original rank failure 106");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (__atomic_load_n(&peer->peer_cancel_requested, __ATOMIC_ACQUIRE) == 0 &&
+           std::chrono::steady_clock::now() < deadline) {}
+    EXPECT_EQ(__atomic_load_n(&peer->peer_cancel_requested, __ATOMIC_ACQUIRE), 1);
+    EXPECT_EQ(S(second.task_slot).state.load(), TaskState::RUNNING);
+    EXPECT_TRUE(orch.run_failed(run_id));
+    worker_b.complete_with_error("peer cancellation 108");
+    wait_consumed(first.task_slot);
+    wait_consumed(second.task_slot);
+}
+
 TEST_F(GroupSchedulerFixture, CompletionRepairPreservesRunningPeersWhenOutcomesAreMissing) {
     TaskArgs a0 = single_tensor_args(0xC2, TensorArgType::OUTPUT);
     TaskArgs a1 = single_tensor_args(0xC3, TensorArgType::OUTPUT);

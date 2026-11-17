@@ -22,6 +22,7 @@
 #include "aicpu/device_time.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/device_run_result_base_aicpu.h"
+#include "common/native_invocation_evidence.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/args_dump_aicpu.h"
@@ -81,6 +82,18 @@ LoopAction SchedulerContext::handle_orchestrator_exit(
 LoopAction SchedulerContext::check_idle_fatal_error(int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime) {
     if (completed_.load(std::memory_order_acquire)) {
         return LoopAction::BREAK_LOOP;
+    }
+    const uint64_t result_base = get_platform_run_result_base();
+    const uint64_t epoch = get_platform_run_result_epoch();
+    if (result_base != 0 && epoch != 0) {
+        auto *storage = reinterpret_cast<NativeInvocationResultStorage *>(result_base);
+        cache_invalidate_range(&storage->peer_cancel_epoch, sizeof(storage->peer_cancel_epoch));
+        if (__atomic_load_n(&storage->peer_cancel_epoch, __ATOMIC_ACQUIRE) == epoch) {
+            latch_scheduler_error(header, thread_idx, SIMPLER_ERROR_PEER_RUN_FAILED);
+            const int32_t prior = header->sched_error_code.load(std::memory_order_acquire);
+            int32_t expected = SIMPLER_ERROR_NONE;
+            header->orch_error_code.compare_exchange_strong(expected, prior, std::memory_order_acq_rel);
+        }
     }
     int32_t orch_err = header->orch_error_code.load(std::memory_order_acquire);
     if (orch_err != SIMPLER_ERROR_NONE) {

@@ -2541,6 +2541,24 @@ static int retire_completed_native_run(OnboardNativeRunContext *state) {
     return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
 }
 
+extern "C" __attribute__((weak)) int peer_cancel_supported_impl(void) { return 0; }
+
+int simpler_bind_peer_cancel(DeviceContextHandle ctx, RuntimeHandle runtime, const int32_t *request) {
+    try {
+        if (!peer_cancel_supported_impl()) return PTO_RUNTIME_ERR_UNSUPPORTED;
+        OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_bind_peer_cancel");
+        if (state == nullptr || request == nullptr ||
+            state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared)
+            return PTO_RUNTIME_ERR_INVALID_STATE;
+        if (state->peer_cancel_request != nullptr && state->peer_cancel_request != request)
+            return PTO_RUNTIME_ERR_INVALID_STATE;
+        state->peer_cancel_request = request;
+        return 0;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
 int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     try {
         OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_poll_run");
@@ -2552,6 +2570,7 @@ int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         }
         const int attach_rc = state->runner->enter_run_thread();
         if (attach_rc != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+        if (state->poll_peer_cancel() != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
         return retire_completed_native_run(state);
     } catch (...) {
         return SIMPLER_NATIVE_RUN_POLL_ERROR;
@@ -2567,6 +2586,8 @@ int simpler_wait_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime) 
         const int context_rc = state->runner->enter_run_thread();
         if (context_rc != 0) return context_rc;
         if (state->active_execution == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+        const int progress_rc = state->await_peer_cancel_progress();
+        if (progress_rc != 0) return progress_rc;
         const int rc = state->runner->wait_execution_completion(*state->active_execution);
         if (rc != 0) return rc;
         return retire_completed_native_run(state) == SIMPLER_NATIVE_RUN_POLL_COMPLETE ? 0 : PTO_RUNTIME_ERR_INTERNAL;
@@ -2588,7 +2609,7 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     note_workspace_fact(state, WorkspaceManager::RunFact::DrainAttempted);
     try {
         if (state->active_execution != nullptr) {
-            drain = state->runner->drain_execution(*state->active_execution);
+            drain = state->drain_with_peer_cancel();
         } else if (state->launch_not_started_proven) {
             drain = DrainOutcome::device_complete(0);
         } else {
@@ -2599,6 +2620,11 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         LOG_ERROR("simpler_wait_run: drain threw (%s)", state->trace_attrs);
         return drain.device_rc;
     }
+    // A bounded progress wait has not observed a stream verdict. Keep the
+    // carrier retryable so a later wait/finalize can still deliver cancellation.
+    if (drain.device_rc == SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE && !drain.physical_complete)
+        return SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+    if (!drain.physical_complete) quarantine_undrained_run(*state->runner, drain.device_rc);
     if (state->completion_rc == 0) state->completion_rc = drain.combined();
     state->result_observed = true;
     state->physical_complete = state->physical_complete || drain.physical_complete;

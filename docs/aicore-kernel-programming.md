@@ -144,8 +144,20 @@ communication window. Cleanup cannot interrupt a kernel blocked inside `TWAIT`;
 the kernel must return before the finalizer can drain its records. Use
 cooperative polling or deferred completion for waits that require cancellation.
 
-SDMA and registered counters are covered locally; cross-rank cancellation,
-HBG and A5 require their own protocols. Checks belong before the unsafe
+For A2/A3 TMR ChipWorkers directly managed by the same local L3 Worker, a
+failed task requests cancellation of the other active tasks in that L3 run.
+The parent checks each mailbox entry's identity before publishing the request.
+The native wait forwards it with the invocation epoch; AICPU periodically
+checks it even while scheduling makes progress. An old epoch is ignored.
+The peer reports runtime error 108 (`SIMPLER_ERROR_PEER_RUN_FAILED`) unless
+an earlier local error already owns the primary result. This is a runtime
+status, not an additional value accepted by `report_kernel_error`.
+
+Cancellation uses the same cooperative core exit and registered-request drain.
+It does not manufacture missing notifications, prove remote retirement, or
+make a failed Worker reusable. AICPU/stream failure and failed-output isolation
+remain in force. Remote or nested L3 propagation, HBG, A5 and direct Kernel
+mode require separate cancellation protocols. Checks belong before the unsafe
 operation and must respect the operator's valid shape, masking, and index
 semantics. The runtime does not insert checks into existing kernels.
 

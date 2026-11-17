@@ -1279,6 +1279,24 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     return 0;
 }
 
+extern "C" __attribute__((weak)) int peer_cancel_supported_impl(void) { return 0; }
+
+int simpler_bind_peer_cancel(DeviceContextHandle ctx, RuntimeHandle runtime, const int32_t *request) {
+    try {
+        if (!peer_cancel_supported_impl()) return PTO_RUNTIME_ERR_UNSUPPORTED;
+        SimNativeRunContext *state = native_run_context(ctx, runtime, "simpler_bind_peer_cancel");
+        if (state == nullptr || request == nullptr ||
+            state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared)
+            return PTO_RUNTIME_ERR_INVALID_STATE;
+        if (state->peer_cancel_request != nullptr && state->peer_cancel_request != request)
+            return PTO_RUNTIME_ERR_INVALID_STATE;
+        state->peer_cancel_request = request;
+        return 0;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
 int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     try {
         SimNativeRunContext *state = native_run_context(ctx, runtime, "simpler_poll_run");
@@ -1289,6 +1307,7 @@ int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
             return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
         }
         if (state->active_execution == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+        if (state->poll_peer_cancel() != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
         if (!state->physical_complete) {
             const int rc = state->runner->poll_execution(*state->active_execution);
             if (rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return rc;
@@ -1311,7 +1330,7 @@ int simpler_wait_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime) 
         if (attach_rc != 0) return attach_rc;
         if (state->active_execution == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
         if (!state->physical_complete) {
-            const DrainOutcome drain = state->runner->drain_execution(*state->active_execution);
+            const DrainOutcome drain = state->drain_with_peer_cancel();
             if (state->completion_rc == 0) state->completion_rc = drain.combined();
             if (!drain.physical_complete) return drain.device_rc != 0 ? drain.device_rc : PTO_RUNTIME_ERR_INTERNAL;
             // The backend consumes its active run during drain. Preserve that proof
@@ -1391,7 +1410,7 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     DrainOutcome drain{};
     try {
         if (state->active_execution != nullptr) {
-            drain = state->runner->drain_execution(*state->active_execution);
+            drain = state->drain_with_peer_cancel();
         }
     } catch (...) {
         drain = DrainOutcome{};
@@ -1450,7 +1469,7 @@ static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, b
         if (attach_rc == 0) {
             drain.device_rc = PTO_RUNTIME_ERR_INTERNAL;
             try {
-                drain = state->runner->drain_execution(*state->active_execution);
+                drain = state->drain_with_peer_cancel();
             } catch (...) {
                 drain = DrainOutcome{};
                 LOG_ERROR("simpler_finalize_run: drain_execution threw (%s)", state->trace_attrs);

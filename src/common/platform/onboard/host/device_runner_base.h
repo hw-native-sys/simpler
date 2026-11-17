@@ -1256,6 +1256,8 @@ public:
      * those, not the second — nothing was copied, so nothing was lost.
      */
     RunRecordRead device_run_result_read_status(uint32_t pipeline_slot, uint64_t run_epoch) const;
+    int request_peer_cancel(uint32_t pipeline_slot, uint64_t run_epoch);
+    int peer_cancel_wait_timeout_ms() const { return timeout_config_.stream_sync_timeout_ms; }
 
     /**
      * The boundary completion this run's own drain or poll observed, or

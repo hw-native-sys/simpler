@@ -3808,6 +3808,12 @@ NB_MODULE(_task_interface, m) {
     nb::class_<ChipRun>(m, "_ChipRun")
         .def("done", &ChipRun::done)
         .def("activate", &ChipRun::activate)
+        .def(
+            "bind_peer_cancel",
+            [](ChipRun &self, uint64_t address) {
+                self.bind_peer_cancel(reinterpret_cast<const int32_t *>(address));
+            }
+        )
         .def("abandon", &ChipRun::abandon, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("launched", &ChipRun::launched)
         .def_prop_ro("_execution_ended", &ChipRun::execution_ended)
