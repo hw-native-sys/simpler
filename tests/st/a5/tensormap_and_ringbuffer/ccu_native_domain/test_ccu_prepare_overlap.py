@@ -162,7 +162,7 @@ def test_prepared_successor_preserves_executing_ccu_resources(st_device_ids, tmp
             "-std=c++17",
             "-shared",
             "-fPIC",
-            str(Path(__file__).with_name("event_access.cpp")),
+            str(Path(__file__).parent / "support/event_access.cpp"),
             f"-I{sdk / 'include'}",
             f"-L{sdk / 'lib64'}",
             "-lascendcl",
