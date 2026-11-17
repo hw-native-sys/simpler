@@ -38,12 +38,12 @@ DomainCcuOwner::begin_run(uint64_t generation, const std::vector<MissionRunResou
 }
 
 bool DomainCcuOwner::drained() const {
-    return !closed_ && !lifecycle_.has_active_run() && lifecycle_.admission_open() &&
-           !lifecycle_.resources_retained() && backend_->drained();
+    return !closed_ && !lifecycle_.has_active_run() && !lifecycle_.resources_retained() && backend_->drained();
 }
 
 bool DomainCcuOwner::close() {
     if (closed_) return true;
+    lifecycle_.close_admission();
     if (!drained() || !backend_->close()) return false;
     registered_kernels_.clear();
     modules_.clear();

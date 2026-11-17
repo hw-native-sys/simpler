@@ -1183,7 +1183,6 @@ class CommDomainHandle:
         "requested_window_size",
         "memory_source",
         "_host_mappings",
-        "_ccu_run_generation",
         "_ccu_register_fn",
         "_ccu_registrations",
         "_ccu_registration_lock",
@@ -1216,7 +1215,6 @@ class CommDomainHandle:
         self.name = name
         self.memory_source = memory_source
         self._host_mappings = []
-        self._ccu_run_generation = 0
         self._ccu_register_fn = None
         self._ccu_registrations = {}
         self._ccu_registration_lock = threading.RLock()

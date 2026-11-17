@@ -64,7 +64,8 @@ public:
     ) = 0;
     virtual bool stop() = 0;
     virtual bool finish_completed_requests() = 0;
-    virtual void abort() = 0;
+    virtual bool abort() = 0;
+    virtual bool abort_pending() const noexcept = 0;
 };
 
 std::vector<HcommPreparedMission> prepare_hcomm_ccu_callable(

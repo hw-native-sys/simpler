@@ -61,6 +61,7 @@ public:
     bool admission_open() const noexcept { return admission_open_; }
     bool resources_retained() const noexcept { return resources_retained_; }
     bool has_active_run() const noexcept { return active_; }
+    void close_admission() noexcept { admission_open_ = false; }
 
 private:
     friend class DomainRun;
@@ -83,7 +84,9 @@ public:
     bool stop();
     // The caller has retired every request and guarantees no further triggers.
     bool finish_completed_requests();
-    void abort();
+    // Abort is issued once; retries only query streams still reported RUNNING.
+    bool abort();
+    bool abort_pending() const noexcept { return abort_attempted_ && !abort_failed_ && !confirmed_stopped_; }
 
     bool launched() const noexcept { return launched_; }
     bool ready() const noexcept { return ready_; }
@@ -109,13 +112,15 @@ private:
     std::vector<MissionRunResources> missions_;
     RunLifecycleSdk &sdk_;
     std::vector<bool> ready_events_consumed_;
+    std::vector<bool> abort_streams_confirmed_;
     std::vector<RunFailure> failures_;
     bool launched_{false};
     bool ready_{false};
     bool terminal_{false};
     bool confirmed_stopped_{false};
     bool abort_attempted_{false};
-    size_t launched_missions_{0};
+    bool abort_failed_{false};
+    size_t attempted_missions_{0};
     bool released_{false};
 };
 

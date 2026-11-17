@@ -124,11 +124,16 @@ public:
      */
     void stop_admission() noexcept;
 
+    /// Stop admission and progress while retaining every run and borrowed span.
+    /// Cleanup releases this fence only after the required peers have stopped.
+    void fence_admission() noexcept;
+
     void close(bool report_run_error = true);
     bool poisoned() const;
 
 private:
     friend class ChipWorker;
+    void release_terminal_fence() noexcept;
     int32_t with_callable_addition(const std::function<int32_t()> &operation);
     std::pair<int, bool> observe_framework_submissions();
     void stop_admission_for_close();

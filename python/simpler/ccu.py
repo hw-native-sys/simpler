@@ -59,8 +59,11 @@ class ChipCcuBinding:
         self.timeout = timeout
         self.generation = 0
         self.active = False
+        self.admission_closed = False
 
     def prepare(self, run_id, allocation_id):
+        if self.admission_closed:
+            raise RuntimeError("CCU admission is closed after a failed run")
         self.generation += 1
         self.worker.prepare_ccu_run(self.communicator, self.registration, self.generation, run_id, allocation_id)
         return ChipCcuRun(self, self.generation)
@@ -76,13 +79,18 @@ class ChipCcuRun:
         return binding.worker.control_ccu_run(binding.communicator, binding.registration, operation, self.generation)
 
     def begin(self):
+        if self.binding.admission_closed:
+            raise RuntimeError("CCU admission is closed after a failed run")
         if self.binding.active:
             raise RuntimeError("CCU predecessor has no confirmed stop")
         self.binding.active = True
         try:
             self._control(1)
-        except BaseException:
-            self.abort()
+        except BaseException as launch_error:
+            try:
+                self.abort()
+            except BaseException as cleanup_error:
+                raise launch_error from cleanup_error
             raise
 
     def finish(self):
@@ -94,8 +102,11 @@ class ChipCcuRun:
                         raise RuntimeError("CCU mission stop is unconfirmed")
                     break
             self._control(7)
-        except BaseException:
-            self.abort()
+        except BaseException as run_error:
+            try:
+                self.abort()
+            except BaseException as cleanup_error:
+                raise run_error from cleanup_error
             raise
         self.binding.active = False
 
@@ -103,11 +114,14 @@ class ChipCcuRun:
         self._control(7)
 
     def abort(self):
-        # Keep active set until a confirmed stop; a successful abort call alone is insufficient.
+        self.binding.admission_closed = True
         try:
-            self._control(4)
+            if self._control(4) != 0:
+                return False
         except Exception:
-            pass
+            return False
+        self.binding.active = False
+        return True
 
 
 @dataclass(frozen=True)
@@ -142,19 +156,20 @@ class ChipCcuRunSet:
         self.natural_exit_wait = natural_exit_wait
         self.run_set = worker.prepare_ccu_run_set(communicator, registrations, generation, dispatch_id)
         self.started = False
+        self.admission_closed = False
 
     def _control(self, operation):
         return self.worker.control_ccu_run_set(self.communicator, self.run_set, operation)
 
     def begin(self):
+        if self.admission_closed:
+            raise RuntimeError("CCU admission is closed after a failed run")
         self.started = True
         try:
             self._control(1)
-        except BaseException as launch_error:
-            try:
-                self.abort()
-            except BaseException as cleanup_error:
-                raise launch_error from cleanup_error
+        except BaseException:
+            # The parent stops partial launches after every peer confirms its producers have stopped.
+            self.admission_closed = True
             raise
 
     def finish(self):
@@ -171,8 +186,12 @@ class ChipCcuRunSet:
         self._control(7)
 
     def abort(self):
+        self.admission_closed = True
         try:
-            self._control(4)
+            if self._control(4) != 0:
+                return False
         except Exception:
             # Native ownership retains unconfirmed resources and closes admission.
-            pass
+            return False
+        self.started = False
+        return True

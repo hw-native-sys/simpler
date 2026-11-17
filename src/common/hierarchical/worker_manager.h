@@ -302,6 +302,8 @@ static constexpr ptrdiff_t MAILBOX_OFF_FRAME_GENERATION = MAILBOX_OFF_ERROR_MSG 
 // matter what state word a concurrent control command leaves behind.
 static constexpr ptrdiff_t MAILBOX_OFF_SHUTDOWN = MAILBOX_OFF_ERROR_MSG - 80;
 static constexpr int32_t MAILBOX_SHUTDOWN_REQUESTED = 1;
+// Python reserves the preceding 32-bit word (MAILBOX_OFF_SHUTDOWN - 4) for
+// the parent to publish that all CCU peers have stopped.
 // The chip child's teardown observation, published once on the control frame
 // after its device teardown returns. Reserved on every frame for the same
 // reason the shutdown word is: a task-args blob must not be able to reach it.

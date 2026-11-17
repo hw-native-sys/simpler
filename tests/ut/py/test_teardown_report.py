@@ -346,7 +346,8 @@ def test_the_record_is_reserved_below_the_shutdown_word_and_above_the_args_blob(
     # Reserved on every frame, like the shutdown word, so a task-args blob can
     # never reach it.
     assert worker_module._OFF_TASK_ARGS_BLOB + worker_module._MAILBOX_ARGS_CAPACITY == off
-    assert off + SIMPLER_TEARDOWN_REPORT_BYTES <= worker_module._OFF_SHUTDOWN
+    assert off + SIMPLER_TEARDOWN_REPORT_BYTES <= worker_module._OFF_CCU_PEERS_STOPPED
+    assert worker_module._OFF_CCU_PEERS_STOPPED + 4 <= worker_module._OFF_SHUTDOWN
     assert off % 8 == 0
 
 

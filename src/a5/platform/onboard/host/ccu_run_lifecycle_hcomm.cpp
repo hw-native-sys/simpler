@@ -53,18 +53,20 @@ HcommMissionStream HcommMissionStreamPool::acquire() {
     return {entries_.size(), 0, entry.stream};
 }
 
-bool HcommMissionStreamPool::release(uint64_t handle) {
-    if (closed_ || handle == 0 || handle > entries_.size()) return false;
+MissionStreamReleaseResult HcommMissionStreamPool::release(uint64_t handle) {
+    if (closed_ || handle == 0 || handle > entries_.size()) return MissionStreamReleaseResult::FAILED;
     auto &entry = entries_[handle - 1];
-    if (!entry.leased) return false;
-    aclrtStreamStatus status{};
-    if (aclrtStreamQuery(entry.stream, &status) != ACL_SUCCESS || status != ACL_STREAM_STATUS_COMPLETE) return false;
+    if (!entry.leased) return MissionStreamReleaseResult::FAILED;
+    aclrtStreamStatus status = ACL_STREAM_STATUS_RESERVED;
+    if (aclrtStreamQuery(entry.stream, &status) != ACL_SUCCESS) return MissionStreamReleaseResult::FAILED;
+    if (status == ACL_STREAM_STATUS_NOT_READY) return MissionStreamReleaseResult::PENDING;
+    if (status != ACL_STREAM_STATUS_COMPLETE) return MissionStreamReleaseResult::FAILED;
     entry.leased = false;
     LOG_DEBUG(
         "[ccu] pool return slot=%llu uses=%llu", static_cast<unsigned long long>(handle),
         static_cast<unsigned long long>(entry.uses)
     );
-    return true;
+    return MissionStreamReleaseResult::RELEASED;
 }
 
 bool HcommMissionStreamPool::close() {
@@ -124,7 +126,9 @@ int HcommRunLifecycleSdk::query_stream(uint64_t stream_handle, StreamState *stat
         *state = StreamState::UNKNOWN;
         return rc;
     }
-    *state = status == ACL_STREAM_STATUS_COMPLETE ? StreamState::COMPLETE : StreamState::RUNNING;
+    *state = status == ACL_STREAM_STATUS_COMPLETE  ? StreamState::COMPLETE :
+             status == ACL_STREAM_STATUS_NOT_READY ? StreamState::RUNNING :
+                                                     StreamState::UNKNOWN;
     return ACL_SUCCESS;
 }
 

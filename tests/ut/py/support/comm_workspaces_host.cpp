@@ -170,6 +170,7 @@ extern "C" HcclResult HcclBarrier(HcclComm, aclrtStream) {
     barrier_pending = barrier_submit_rc == 0;
     return static_cast<HcclResult>(barrier_submit_rc);
 }
+#ifndef SIMPLER_TEST_CCU_BACKEND
 extern "C" aclError aclrtSynchronizeStreamWithTimeout(aclrtStream stream, int32_t timeout) {
     assert(stream == reinterpret_cast<aclrtStream>(0x303));
     assert(timeout > 0 && barrier_context == barrier_caller_context);
@@ -177,6 +178,7 @@ extern "C" aclError aclrtSynchronizeStreamWithTimeout(aclrtStream stream, int32_
     if (barrier_sync_rc == 0) barrier_pending = false;
     return barrier_sync_rc;
 }
+#endif
 extern "C" aclError aclrtMalloc(void **out, size_t bytes, aclrtMemMallocPolicy) { return map_buffer(out, bytes); }
 extern "C" aclError aclrtFree(void *p) {
     const int failed_engine = rollback_free_engine >= 0           ? rollback_free_engine :
@@ -1007,6 +1009,10 @@ static void test_barrier_completion(const std::string &scenario) {
 int main(int argc, char **argv) {
 #ifdef SIMPLER_TEST_CCU_BACKEND
     assert(argc == 3);
+    if (std::string(argv[2]).find("retry_") == 0) {
+        test_ccu_abort_retry(argv[2]);
+        return 0;
+    }
     if (std::string(argv[2]) == "modes") {
         test_ccu_communicator_modes(argv[1]);
         return 0;
