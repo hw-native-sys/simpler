@@ -62,18 +62,21 @@ static inline bool is_async_tracking_error(int32_t code) {
 // per-incident device-log dive becomes a glance at the host failure line.
 #define SIMPLER_STALL_DETAIL_NONE 0             // not a timeout / no sub-class recorded
 #define SIMPLER_STALL_DETAIL_RUNNING_STALLED 1  // S1: a task is on a core but never completes (AICore hang)
-#define SIMPLER_STALL_DETAIL_READY_IDLE 3       // S3: all cores idle, a fanin-satisfied task exists, nothing dispatched
+#define SIMPLER_STALL_DETAIL_READY_IDLE 3       // S3: all cores idle, a dispatch-ready task exists
 #define SIMPLER_STALL_DETAIL_DEP_DEADLOCK 4     // S4: only WAIT tasks remain, fanin never resolves (dep cycle/wiring)
 #define SIMPLER_STALL_DETAIL_ORCH_STARVATION 5  // S5: submitted tasks done, orchestrator not done, scheduler idle
+#define SIMPLER_STALL_DETAIL_ASYNC_WAIT 6       // S6: AICore work finished, deferred completion pending
 #define SIMPLER_STALL_DETAIL_UNKNOWN 99         // premise/bookkeeping invariant violated (accounting/corruption)
 
-// Pure stall-priority decision: RUNNING > READY > WAIT > (orch-not-done) > unknown.
+// Pure stall-priority decision: RUNNING > READY > ASYNC_WAIT > WAIT > (orch-not-done) > unknown.
 // Reduces the multi-state snapshot to one dominant sub-class. Kept free-standing
 // (no scheduler state) so it is unit-testable and identical on host and device.
-static inline int32_t
-classify_stall_detail(int32_t cnt_running, int32_t cnt_ready, int32_t cnt_waiting, int32_t orch_done) {
+static inline int32_t classify_stall_detail(
+    int32_t cnt_running, int32_t cnt_ready, int32_t cnt_waiting, int32_t cnt_async_wait, int32_t orch_done
+) {
     if (cnt_running > 0) return SIMPLER_STALL_DETAIL_RUNNING_STALLED;
     if (cnt_ready > 0) return SIMPLER_STALL_DETAIL_READY_IDLE;
+    if (cnt_async_wait > 0) return SIMPLER_STALL_DETAIL_ASYNC_WAIT;
     if (cnt_waiting > 0) return SIMPLER_STALL_DETAIL_DEP_DEADLOCK;
     if (!orch_done) return SIMPLER_STALL_DETAIL_ORCH_STARVATION;
     return SIMPLER_STALL_DETAIL_UNKNOWN;
@@ -90,6 +93,8 @@ static inline const char *stall_detail_name(int32_t detail) {
         return "S4:dependency-deadlock";
     case SIMPLER_STALL_DETAIL_ORCH_STARVATION:
         return "S5:orchestrator-starvation";
+    case SIMPLER_STALL_DETAIL_ASYNC_WAIT:
+        return "S6:async-completion-wait";
     case SIMPLER_STALL_DETAIL_UNKNOWN:
         return "unknown:accounting/corruption";
     case SIMPLER_STALL_DETAIL_NONE:

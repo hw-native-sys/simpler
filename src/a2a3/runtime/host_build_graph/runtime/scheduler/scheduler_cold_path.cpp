@@ -227,7 +227,7 @@ void SchedulerContext::log_stall_diagnostics(
     // T0 owns the task-table scan; printing it from other threads would
     // produce identical TASK lines once per scheduler thread.
     if (thread_idx == 0) {
-        int32_t cnt_ready = 0, cnt_waiting = 0, cnt_running = 0;
+        int32_t cnt_ready = 0, cnt_waiting = 0, cnt_running = 0, cnt_async_wait = 0;
         SharedMemoryTaskHeader &tasks = *sched_->task_view.tasks;
         // `task_count` is the run's task total, which both callers pass from
         // total_tasks_. It bounds the scan as well as the SUMMARY line: every slot
@@ -285,6 +285,18 @@ void SchedulerContext::log_stall_diagnostics(
                 );
                 continue;
             }
+            if (slot_state.has_finished_deferred_subtasks()) {
+                cnt_async_wait++;
+                if (cnt_async_wait > STALL_DUMP_READY_MAX) continue;
+                STALL_DUMP_LOG(
+                    report,
+                    "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=0x%" PRIx64
+                    " state=ASYNC_WAIT fanin_met=%d/%d subtasks_done=%d/%d",
+                    thread_idx, idle_iterations, 0, task_id, rc, fi,
+                    slot_state.completed_subtasks.load(std::memory_order_relaxed), slot_state.total_required_subtasks
+                );
+                continue;
+            }
             if (rc >= fi) {
                 cnt_ready++;
                 if (cnt_ready > STALL_DUMP_READY_MAX) continue;
@@ -309,8 +321,9 @@ void SchedulerContext::log_stall_diagnostics(
         STALL_DUMP_LOG(
             report,
             "[STALL thread=%d idle_iterations=%d] SUMMARY completed=%d/%d last_progress_iteration=%d "
-            "scan_ready=%d scan_waiting=%d scan_running=%d",
-            thread_idx, idle_iterations, c, task_count, last_progress_count, cnt_ready, cnt_waiting, cnt_running
+            "scan_ready=%d scan_waiting=%d scan_running=%d scan_async_wait=%d",
+            thread_idx, idle_iterations, c, task_count, last_progress_count, cnt_ready, cnt_waiting, cnt_running,
+            cnt_async_wait
         );
     }
 

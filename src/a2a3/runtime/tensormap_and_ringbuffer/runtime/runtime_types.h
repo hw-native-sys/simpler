@@ -630,6 +630,14 @@ struct alignas(64) ChipTaskSlotState {
         return (lifecycle_flags.load(std::memory_order_acquire) & SUBTASK_DEFERRED) != 0;
     }
 
+    // Logical completion is checked separately. FIN accounting covers both the
+    // mailbox handoff and residence in the async wait-list.
+    bool has_finished_deferred_subtasks() const {
+        return total_required_subtasks > 0 &&
+               completed_subtasks.load(std::memory_order_acquire) == total_required_subtasks &&
+               has_any_subtask_deferred();
+    }
+
     /**
      * Reset dynamic scheduling fields for slot reuse.
      * Called by advance_ring_pointers() after a slot transitions to CONSUMED
