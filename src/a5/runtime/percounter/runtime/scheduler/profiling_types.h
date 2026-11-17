@@ -18,7 +18,7 @@ enum class ProfilePhase : uint8_t {
     Window,
     Resolve,
     Fanin,
-    Prepare,
+    BindContext,
     Run,
     Complete,
     Step,
@@ -59,10 +59,10 @@ constexpr const char *profile_phase_name(ProfilePhase kind) {
         return "scalar_percounter_resolve";
     case ProfilePhase::Fanin:
         return "scalar_percounter_probe_fanin";
-    case ProfilePhase::Prepare:
-        return "scalar_percounter_prepare_subtask";
+    case ProfilePhase::BindContext:
+        return "scalar_percounter_bind_context";
     case ProfilePhase::Run:
-        return "scalar_percounter_run_prepared";
+        return "scalar_percounter_run_task";
     case ProfilePhase::Complete:
         return "scalar_percounter_publish_completion";
     case ProfilePhase::Step:

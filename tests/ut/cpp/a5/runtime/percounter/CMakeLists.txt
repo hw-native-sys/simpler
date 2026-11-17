@@ -51,3 +51,17 @@ simpler_ut_add_target(NAME test_a5_percounter_scalar_memory
         ${SIMPLER_SRC}/a5/platform/sim/aicore
     DEFINES __CPU_SIM SIMPLER_PLATFORM_NAME="a5sim"
     LABEL no_hardware TIMEOUT 20 PRIVATE_WORKDIR)
+
+# The final Percounter image owns the kernel vectors and their Scalar tails.
+simpler_ut_add_target(NAME test_a5_percounter_task_image
+    SOURCES test_task_image.cpp
+        ${SIMPLER_SRC}/common/host_build_graph/shared/shared_memory.cpp
+        ${CMAKE_SOURCE_DIR}/support/assert_stubs.cpp
+        ${CMAKE_SOURCE_DIR}/support/unified_log_stubs.cpp
+    ARCH a5 RUNTIME percounter
+    INCLUDES
+        ${SIMPLER_SRC}/a5/runtime/percounter/host/image
+        ${SIMPLER_SRC}/a5/runtime/percounter/runtime
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/runtime
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/common
+    LABEL no_hardware TIMEOUT 20 PRIVATE_WORKDIR)

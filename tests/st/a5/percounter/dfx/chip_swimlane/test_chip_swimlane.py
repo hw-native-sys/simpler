@@ -163,7 +163,7 @@ def test_profile_levels(st_platform, st_device_ids, tmp_path, levels):
                     kinds = {r["kind"] for s in streams for r in s["records"]}
                     assert {"scalar_window", "scalar_trace_finish", "scalar_bypass_load"} <= kinds
                     if level == 4:
-                        assert "scalar_percounter_run_prepared" in kinds
+                        assert "scalar_percounter_run_task" in kinds
                     data = read_perf_data(paths[0])
                     profiles = data["scalar_profiles"]
                     assert all(p["complete"] for p in profiles)

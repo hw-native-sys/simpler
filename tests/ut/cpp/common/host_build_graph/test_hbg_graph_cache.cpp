@@ -519,6 +519,32 @@ TEST(GraphScalarProvenance, EveryBoundaryParameterNamesItself) {
     EXPECT_EQ(slot_value(params, 1), uint64_t{9});
 }
 
+TEST(GraphExecutionArguments, MaterializationWritesTheOnlyScalarStorage) {
+    std::array<uint8_t, 64> first{}, second{};
+    const auto definition = make_test_definition(0x1234, reinterpret_cast<uint64_t>(first.data()));
+    const TestDefinitionObject object(definition);
+    for (uint64_t value : {17U, 93U}) {
+        OuterHeap heap(definition, 0xa5, GraphArgumentStorage::KERNEL_ARGUMENTS);
+        auto *execution = heap.initialize_execution(object, reinterpret_cast<uint64_t>(second.data()), value);
+        ASSERT_NE(execution, nullptr);
+        auto &outer = *execution->outer_slot;
+        ASSERT_EQ(
+            graph_execution_materialize_slice(outer, *execution, heap.image(), 2), GraphMaterializeResult::MATERIALIZED
+        );
+        for (int32_t i = 0; i < 2; ++i) {
+            auto &payload = execution->task_at(i).payload;
+            auto *args = execution->kernel_arguments(i);
+            ASSERT_NE(args, nullptr);
+            EXPECT_EQ(reinterpret_cast<uintptr_t>(args) % 64, 0U);
+            EXPECT_EQ(args[0], reinterpret_cast<uint64_t>(payload.tensor_data()));
+            EXPECT_EQ(payload.scalar_data(), args + payload.tensor_count);
+            EXPECT_EQ(args[payload.tensor_count], i == 0 ? value : 18U);
+            payload.scalar_data()[0] = 271;
+            EXPECT_EQ(args[payload.tensor_count], 271U);
+        }
+    }
+}
+
 TEST(GraphExecutionStorage, ComputesAlignedExactSize) {
     constexpr int32_t TASK_COUNT = 7;
     constexpr uint32_t TENSOR_ARGS = 11;
@@ -531,11 +557,11 @@ TEST(GraphExecutionStorage, ComputesAlignedExactSize) {
     EXPECT_GE(layout.tasks_offset, sizeof(GraphExecution));
     EXPECT_EQ(layout.tensors_offset, layout.tasks_offset + TASK_COUNT * sizeof(ChipTaskStorage));
     EXPECT_EQ(layout.tensors_offset % alignof(simpler::hbg::Tensor), 0U);
-    EXPECT_EQ(layout.scalars_offset, layout.tensors_offset + TENSOR_ARGS * sizeof(simpler::hbg::Tensor));
+    EXPECT_EQ(layout.arguments_offset, layout.tensors_offset + TENSOR_ARGS * sizeof(simpler::hbg::Tensor));
     // The execution's own fanin CSR follows the scalar pool, whose element
     // alignment already covers both arrays, then the byte-aligned state array
     // closes the image.
-    EXPECT_EQ(layout.fanin_offsets_offset, layout.scalars_offset + SCALAR_ARGS * sizeof(uint64_t));
+    EXPECT_EQ(layout.fanin_offsets_offset, layout.arguments_offset + SCALAR_ARGS * sizeof(uint64_t));
     EXPECT_EQ(layout.fanin_offsets_offset % alignof(int32_t), 0U);
     EXPECT_EQ(layout.fanin_indices_offset, layout.fanin_offsets_offset + (TASK_COUNT + 1) * sizeof(int32_t));
     EXPECT_EQ(layout.fanin_indices_offset % alignof(uint16_t), 0U);

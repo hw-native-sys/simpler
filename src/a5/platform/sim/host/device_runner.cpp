@@ -375,6 +375,11 @@ int DeviceRunner::ensure_binaries_loaded() {
             return PTO_RUNTIME_ERR_INTERNAL;
         }
         set_identity_helpers(sim_context_set_subblock_id, sim_context_set_cluster_id);
+        auto install_context = reinterpret_cast<void (*)(int (*)(void *), void *(*)())>(
+            dlsym(aicore_so_handle_, "simpler_sim_install_invocation_context_hooks")
+        );
+        if (install_context != nullptr)
+            install_context(sim_context_bind_invocation_context, sim_context_get_invocation_context);
     }
 
     return 0;

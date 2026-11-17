@@ -206,49 +206,60 @@ that cannot return relies on the device operator timeout and the platform's
 failed-run teardown. Such a run fails, and its poisoned Worker cannot accept
 another run. This failure contract does not promise graceful cohort retirement.
 
-## Metadata and payload preparation
+## Task arguments and execution contexts
 
-The Host resolves callable entries and argument spans once for every ordinary
-task. AICPU materialization does the same for Graph body tasks before publishing
-`metadata_ready`. The lane reads the resolved function, packed argument counts
-and tensor/scalar bases from its task counter; it copies the argument values and
-fills the block context for its own payload. These immutable fields occupy 44
-bytes within the counter's 128-byte sector. Counter size and the uploaded region
-size do not depend on the number of argument values.
+The Host image packer directly produces one immutable argument vector for
+all executions of each ordinary task. Tensor slots contain device addresses of
+128-byte tensor descriptors; scalar slots contain their 64-bit values. The vector
+has 48 slots (384 bytes), with no context suffix pointers. Functions remain in
+the task counter. Ordinary vectors are part of the task image. Graph vectors are
+part of each invocation's device-only execution storage. In both layouts the
+payload's Scalar span aliases the vector's Scalar tail; there is no second
+runtime Scalar pool or scheduler-owned argument copy. Outer Graph boundary
+Scalars remain in their own image span because they feed materialization rather
+than a kernel and can exceed kernel argument limits. Vectors remain resident
+until the run retires, including deferred completions.
 
 Static Graph order, shape and total-subtask completion seeds are available at
 bind. Graph body fanin references encode `(producer_index << 1) | partitioned`.
-Host initializes the completion components before upload. AICPU materialization
-publishes a separate `metadata_ready` token after the descriptor and its
-argument spans, without waiting for fanin. Lanes never parse a body descriptor
-before that publication. Graph roots observe shell fanin and sinks also update
-the shell counter. The percounter Host path publishes the Definition carrier
-used by its AICPU materializers.
+Host initializes the completion components before upload. AICPU materialization binds each
+body task's descriptors and writes Tensor pointers and Scalars directly to its
+final vector, then publishes
+`metadata_ready` after writing back both. It does not wait for fanin. Lanes never
+read body arguments before that publication. Graph roots observe shell fanin and
+sinks also update the shell counter. The Host publishes the Definition carrier
+used by the AICPU materializers.
 
-The Host allocates `PERCOUNTER_PAYLOAD_SLOT_COUNT` independent GM payloads per
-lane and initializes each payload's context pointers. Payload identities carry
-task/block, shared-record generation and candidate position. Idle iterations
-may prepare immutable arguments before fanin; tensor contents and predicates
-remain behind dependency readiness. Writeback precedes reuse of the scalar
-cache. A two-buffer build can retain a prepared cohort while ordinary work uses
-the other buffer; a one-buffer build prepares the cohort again if ordinary
-work overwrote its tag. A finished participant does not prepare its old record
-again. A ready kernel never waits for the candidate window to fill.
+Each physical C/V0/V1 lane owns a 64-byte SSBUF context slot in the cluster's
+`[2816, 3008)` window, inside the scheduler's existing last-KiB reservation.
+The slot contains an 8-byte LocalContext and a 48-byte GlobalContext. Startup
+initializes the physical AIV role, run identity and lane-owned async registration
+scratch reference once. Immediately before dispatch, the selected block's logical
+index and width replace LocalContext. The input acquisition barrier also orders
+these stores. A claimed or waiting candidate does not change the current context.
+The slot remains stable until the synchronous kernel call returns.
 
-Payload publication writes back the control line, the populated argument prefix
-and the global-context line, followed by a barrier. Unused argument lines are
-untouched. When a ready candidate is prepared and dispatched in the same step,
-that preparation's data acquisition also covers kernel inputs. Cached payloads
-from earlier steps still acquire inputs after dependency readiness.
+Percounter owns its kernel-facing `intrinsic.h` and `async_kernel_api.h`. Context
+accessors read SSBUF directly, independent of `args`; standalone AIV kernels use
+the physical mixed launch's subblock register to select V0 or V1. Simulation
+injects process-owned context binding/access callbacks into the runtime and each
+child kernel, isolating threads and loaded DSOs. Kernels must be rebuilt for the
+selected runtime's current ABI. HBG retains its own GM-context ABI.
 
-Successful ordinary fanin is also cached by task identity across its blocks.
+AICore dispatch uses the final vector's GM address. Ordinary tasks derive it
+from the image base; Graph metadata publishes the address before readiness.
+Dispatch uses the shared argument vector in place. Each lane issues
+nonblocking preloads for the populated argument prefix and the contiguous
+Tensor descriptors during ordinary or SPMD resolve, or after first publishing
+MIX entry readiness. Graph body preloads follow metadata publication. Dispatch
+orders dependency observations and the lane's context writes with a DSB.
+Predicate evaluation retains its own cache-line maintenance.
+Successful ordinary fanin is cached by task identity across blocks.
 After sixteen idle passes, repeated failed fanin probes run once every four
-passes. Newly resolved tasks probe immediately; shared publication, cohort
-entry, FIN, claims and deferred completion remain serviced on every pass.
-Dependency-only blocks without predicates publish completion after fanin
-without constructing an unused dispatch payload. A barrier orders its observed
-fanin before that completion publication. Neither optimization changes
-which tasks or kernel executions contribute to the dependency counters.
+passes. Newly resolved tasks probe immediately; shared publication, cohort entry,
+FIN, claims and deferred completion remain serviced on every pass. Dependency-only
+blocks without predicates publish completion after fanin without a kernel call;
+a barrier orders the observed fanin before completion publication.
 
 ## Deferred completion
 
@@ -289,10 +300,10 @@ not another unstarted scheduling candidate.
 | 3 | L2 plus nested percounter function intervals of at least 1 microsecond, individual GM/SSBUF operations, cache issues and barriers |
 | 4 | L3 with every instrumented function interval retained, plus Host orchestration phases |
 
-Percounter dispatch means entry to execution of a ready, prepared payload;
+Percounter dispatch means entry to execution of a ready task with its immutable arguments;
 finish means local kernel return after the output-store barrier. It does not
 mean the last sibling finished or every consumer observed the task's completion.
-Earlier preparation, fanin probes, MIX rendezvous, fixed-slot acquisition, entry/idle checks and
+SSBUF context binding, fanin probes, MIX rendezvous, fixed-slot acquisition, entry/idle checks and
 completion-counter publication appear on the L3/L4 Scalar lane.
 
 Each active worker has its own **AICore Scheduler** lane, grouped by cluster
@@ -333,16 +344,16 @@ perturbs execution, so use level 0 for latency measurements.
 `runtime=percounter` and decodes the shared HBG task identity, including Graph
 body tasks. Host runtime selection reports mode 5.
 
-The receive timestamp is entry to execution of an already prepared payload;
+The receive timestamp is entry to execution using the task's immutable arguments;
 start is immediately before the kernel call, and end follows its output-store
 barrier. Local setup therefore includes execution-time cache acquisition and
-record reservation, but excludes earlier payload preparation and fanin waits.
+record reservation, but excludes argument packing and fanin waits.
 Predicated-off and dependency-only tasks do not emit kernel records.
 
 Task identity is captured from the selected task when its kernel returns and
 retained in the pending timing record. Publication copies that captured identity;
-it does not reread a reused task or payload. No async token is stored in the
-payload. A self-scheduling core reserves from its cached buffer without
+it does not reread a reused task or execution context. No async token is stored
+in the argument vector. A self-scheduling core reserves from its cached buffer without
 observing the shared head while space remains; only the first reservation and
 full-buffer replacement need to observe it. This rule belongs to the
 self-scheduled path, whose core alone publishes the full count.

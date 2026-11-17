@@ -39,9 +39,13 @@ inline sm_layout::SegmentOffsets segments(const sm_layout::BindUsage &used) {
     return out;
 }
 
+inline sm_layout::SegmentOffsets layout(const char *, uint64_t, const sm_layout::BindUsage &used) {
+    return segments(used);
+}
+
 inline uint64_t pack(
     const char *source, uint64_t capacity, const sm_layout::BindUsage &used, const sm_layout::HeapRebase &heap,
-    char *out
+    char *out, uint64_t
 ) {
     const auto limits = sm_layout::mirror_extents(capacity);
     always_assert(

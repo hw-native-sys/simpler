@@ -123,6 +123,7 @@ DeviceSimContext *get_current_device_context() {
 std::mutex g_identity_key_mutex;
 pthread_key_t g_subblock_id_key{};
 pthread_key_t g_cluster_id_key{};
+pthread_key_t g_invocation_context_key{};
 std::atomic<bool> g_identity_keys_initialized{false};
 
 int ensure_identity_keys() {
@@ -133,6 +134,12 @@ int ensure_identity_keys() {
     if (error != 0) return error;
     error = pthread_key_create(&g_cluster_id_key, nullptr);
     if (error != 0) {
+        pthread_key_delete(g_subblock_id_key);
+        return error;
+    }
+    error = pthread_key_create(&g_invocation_context_key, nullptr);
+    if (error != 0) {
+        pthread_key_delete(g_cluster_id_key);
         pthread_key_delete(g_subblock_id_key);
         return error;
     }
@@ -242,6 +249,16 @@ extern "C" uint32_t pto_sim_get_subblock_id() {
         return 0;
     }
     return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_subblock_id_key)));
+}
+
+extern "C" int sim_context_bind_invocation_context(void *context) {
+    if (const int error = ensure_identity_keys(); error != 0) return error;
+    return pthread_setspecific(g_invocation_context_key, context);
+}
+
+extern "C" void *sim_context_get_invocation_context() {
+    if (!g_identity_keys_initialized.load(std::memory_order_acquire)) return nullptr;
+    return pthread_getspecific(g_invocation_context_key);
 }
 
 extern "C" void *pto_sim_get_pipe_shared_state(uint64_t pipe_key, size_t size) {

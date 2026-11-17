@@ -1,8 +1,10 @@
 # A5 percounter acquisition: fixed slots and MIX entry
 
 The implementation uses the user-approved merged AIV/MIX order, X generic
-AIV0 slots and retirement revisits. The working configuration is X=1 with one
-DispatchPayload per lane. It is rebased onto main
+AIV0 slots and retirement revisits. The working configuration is X=1. Task
+arguments are immutable and shared across blocks; execution contexts occupy
+per-lane SSBUF slots. The acquisition measurements below describe the earlier
+per-lane payload implementation. That implementation was rebased onto main
 `cbe15ec86e559ccca2a02dfb78f228db57ee25ba`, including its kernel-bounded
 L0 work window. The measured snapshot is `8de12840d` on `1568c3da1`;
 the final rebase changes no percounter source. The historical optimization measurements below use the
@@ -203,17 +205,65 @@ conditions hold, independently of shared-record reuse.
 
 ## Preparation and instruction costs
 
-The Host resolves ordinary-task callable entries, argument counts and span bases
-once per task. AICPU materialization publishes equivalent Graph-body metadata
-before metadata_ready. AICore copies values and fills its block context without
-reparsing generic payloads or looking up callable tables for each block.
-The metadata occupies 44 previously reserved bytes of the 128-byte task counter;
-compiled before/after layout probes show zero added upload bytes.
+The ordinary-task image packer produces each task's final 384-byte kernel vector
+while staging the image. Tensor entries name GM descriptors; Scalar entries are
+the payload's own Scalar storage, so `scalar_data()` aliases the vector tail.
+Graph materialization writes the same representation directly inside each
+invocation's execution storage. The runtime selects its argument layout through
+the existing execution-size hook and an explicit materialization layout; HBG
+continues to use Scalar-only execution storage. Graph boundary Scalars retain
+one image span because they feed materialization and can exceed kernel limits.
+There is no second scheduler-owned vector allocation or Scalar repacking pass.
+Definitions remain shared and invocation state remains independent through run
+retirement. The measurements below precede this unique-vector representation
+unless explicitly identified as its A/B.
 
-Payload publication writes back the control line, populated argument prefix and
-global-context line, then fences. Cached payloads acquire inputs after readiness.
-A payload freshly prepared after readiness in the same dispatch step can reuse
-that preparation's data acquisition. No cached acquisition crosses iterations.
+The unique-vector A/B retains the Context ABI, nonblocking prefetch and frozen
+business binaries. Its first 12-case batch against `a2f24cecd3b6` changes the sum
+of means from 17.993970 to 17.991102 ms (0.016% lower), establishing no material
+gain. A separate matched batch includes the same merged startup/completion
+optimization on both arms. Complete case results and revision identities are
+recorded in [PR #3149](https://github.com/hw-native-sys/simpler/pull/3149).
+These DSV4.1 cases submit ordinary tasks, including the native MoE Host-control
+path; they do not measure Graph materialization. Graph aliasing and distinct
+invocations have separate unit, simulation and native correctness coverage.
+
+LocalContext and GlobalContext occupy each lane's 64-byte SSBUF slot. Startup
+initializes GlobalContext once per run. Dispatch writes logical block geometry
+to LocalContext before acquiring inputs. This acquisition also orders the SSBUF
+stores. It remains necessary for predecessor-output visibility even though the
+argument vector is immutable. AICore performs no argument copying or GM payload
+writeback. Kernel Context accessors use Percounter's SSBUF ABI; HBG retains its
+own GM-context ABI, so business kernels must be rebuilt for the selected runtime.
+
+The 2026-11-17 DSV4.1 comparison against `26b0511f366c` ran all 12 selected
+configurations with alternating arm order and 20 measured rounds per arm/case.
+The sum of mean AICore L0 times changed from 18.006559 to 18.033767 ms
+(0.15% slower). Device wall also increased by 0.19%. This establishes no overall
+speedup from the combined argument/Context change. The native MoE case uses its
+performance-only Host-control contract; the other 11 cases passed replay checks.
+
+The selected latest layers contain 134 executable tasks and 4,449 physical
+kernel invocations per rank. Original submission records show an average of
+6.19 Tensor pointers and 3.27 Scalar words, about 76 argument bytes
+per invocation. The old 512-byte slot size was not a full-copy cost.
+Deleting per-block packing also removes its parameter-warming effect.
+A matched follow-up held the business binaries, Host/AICPU libraries, SSBUF
+Context ABI and inputs fixed, and changed only argument warming after input
+acquisition. Each arm/case used 20 measured L0 rounds in balanced order.
+Across all 12 cases, nonblocking `dc_preload` hints reduced the sum of means
+from 18.038264 to 17.929132 ms (0.61%). Nine means improved and three regressed;
+the largest regression was 0.76%. This isolates a modest prefetch benefit over
+the SSBUF implementation without hints, not a speedup against the old GM-Context
+baseline. Dispatch retains these hints without restoring argument copying.
+
+A separate two-case experiment also tried explicit cached reads of one word per
+argument cacheline before calling the kernel. SWA increased from 0.181965 to
+0.186123 ms and latest layers from 2.333736 to 2.375971 ms. The synchronous
+warm-read version is not retained. A shorter kernel interval alone is insufficient:
+moving its cache-miss wait into dispatch need not reduce global latency.
+Instrumented core-time totals must not be subtracted directly from the
+uninstrumented global work window.
 
 Compact 24-byte claim segments and monotone closure summaries allow exhausted
 ranges to be skipped. Only the final valid claimant publishes a closure bit;

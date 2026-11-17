@@ -63,6 +63,10 @@ void pto_cpu_sim_release_device(int device_id);
 /** Return the current thread's AIV lane (0 or 1). Resolved by pto-isa via function pointer injection. */
 uint32_t pto_sim_get_subblock_id(void);
 
+// The executor binds its current lane context; child kernels receive these callbacks by injection.
+int sim_context_bind_invocation_context(void *context);
+void *sim_context_get_invocation_context(void);
+
 /** Return per-device per-cluster per-dispatch pipe shared memory. Resolved by pto-isa via function pointer injection.
  */
 void *pto_sim_get_pipe_shared_state(uint64_t pipe_key, size_t size);

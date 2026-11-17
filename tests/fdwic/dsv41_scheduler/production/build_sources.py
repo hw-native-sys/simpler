@@ -52,14 +52,14 @@ def save(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
-def build(flavor, output, tools, pto, jobs):
+def build(flavor, output, tools, pto, jobs, runtime):
     sources = ROOT / "kernels" / flavor
     workload = ROOT / "workloads" / flavor
     manifest = json.loads((sources / "manifest.json").read_text())
     native = manifest.get("execution") == "native_moe_host_control"
     output.mkdir(parents=True, exist_ok=True)
     compiler = KernelCompiler("a5")
-    common_includes = compiler.get_orchestration_include_dirs("host_build_graph")
+    common_includes = compiler.get_orchestration_include_dirs(runtime)
     sdk = Path(os.environ["ASCEND_HOME_PATH"])
     # Generated DSL C++ includes impl/c_api/... relative to the ASC SDK root.
     asc_roots = [str(path) for path in (sdk / "asc", sdk / "ascendc") if path.is_dir()]
@@ -135,8 +135,8 @@ def build(flavor, output, tools, pto, jobs):
 
     source = output / "orchestration.cpp"
     source.write_bytes(gzip.decompress((workload / "vendor/orchestration.cpp.gz").read_bytes()))
-    includes, support = compiler.get_orchestration_cache_inputs("host_build_graph")
-    host_token = compiler.compile_cache_token("host_build_graph", [])
+    includes, support = compiler.get_orchestration_cache_inputs(runtime)
+    host_token = compiler.compile_cache_token(runtime, [])
     # Cache the Host ELF as bytes without importing Simpler's Python bindings.
     # Hash every supporting translation unit and its include closure as well.
     support_keys = [compile_incore_artifact_key({"platform": "host"}, path, includes) for path in support]
@@ -145,7 +145,7 @@ def build(flavor, output, tools, pto, jobs):
         source,
         includes,
     )
-    orchestration = get_or_compile_incore(key, lambda: compiler.compile_orchestration("host_build_graph", str(source)))
+    orchestration = get_or_compile_incore(key, lambda: compiler.compile_orchestration(runtime, str(source)))
     (output / "orchestration.so").write_bytes(orchestration)
     if not native:
         shutil.copytree(workload / "inputs", output, dirs_exist_ok=True)
@@ -200,6 +200,7 @@ def build(flavor, output, tools, pto, jobs):
         {
             "flavor": flavor,
             "platform": "a5",
+            "runtime": runtime,
             "pto_isa": str(pto),
             "sdk_include_roots": asc_roots,
             "sdk_versions": sdk_versions,
@@ -216,6 +217,7 @@ def main():
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build/portable")
     parser.add_argument("--pto-isa", type=Path, default=ROOT.parents[2] / "build/pto-isa")
     parser.add_argument("--jobs", type=int, default=4)
+    parser.add_argument("--runtime", choices=("host_build_graph", "percounter"), default="host_build_graph")
     args = parser.parse_args()
     if args.jobs < 1 or not (args.pto_isa / "include/pto").is_dir():
         parser.error("--jobs must be positive and --pto-isa must contain include/pto")
@@ -228,6 +230,7 @@ def main():
             args.build_dir.resolve() / "host",
             args.pto_isa.resolve(),
             args.jobs,
+            args.runtime,
         )
         if flavor == "pypto_lib_latest":
             build(
@@ -236,6 +239,7 @@ def main():
                 args.build_dir.resolve() / "host",
                 args.pto_isa.resolve(),
                 args.jobs,
+                args.runtime,
             )
 
 

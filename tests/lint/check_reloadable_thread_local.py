@@ -64,7 +64,8 @@ KEY_SITES = {
     "src/common/log/host_log.cpp": 1,  # Process logger; libc free callback.
     "src/common/platform/include/common/module_thread_value.h": 1,  # Module-owned scalar keys.
     "src/common/platform/include/aicpu/affinity_thread_state.h": 1,  # Module-owned affinity records.
-    "src/common/platform/sim/sim_context/cpu_sim_context.cpp": 4,  # Process-owned sim selectors and cancellation.
+    # Process-owned sim identities, invocation context and cancellation.
+    "src/common/platform/sim/sim_context/cpu_sim_context.cpp": 5,
     "src/common/platform/onboard/host/c_api_shared.cpp": 1,  # Module-owned prepare admission.
     "src/a2a3/platform/sim/aicore/kernel.cpp": 1,  # Module-owned keys, stack-owned values.
     "src/a5/platform/sim/aicore/kernel.cpp": 1,  # Module-owned keys, stack-owned values.
