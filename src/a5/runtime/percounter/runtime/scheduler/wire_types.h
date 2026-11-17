@@ -68,6 +68,7 @@ struct alignas(64) PercounterMixSignal {
     volatile uint32_t sequence;
     volatile uint32_t start_arrived;
     volatile uint32_t fanin_cursor;
+    volatile uint32_t start_ready;  // Lowest active lane publishes global arrival through SSBUF.
     volatile uint64_t fanin_address;
     volatile int64_t fanin_body_base;
     volatile uint32_t fanin_count;
@@ -84,7 +85,8 @@ struct alignas(64) PercounterSsbufRegion {
     PercounterMixSignal mix[PERCOUNTER_PENDING_CAPACITY];
     volatile uint32_t mix_floor_rank;
     volatile uint32_t publish_sequence;
-    uint8_t reserved[PERCOUNTER_SSBUF_REGION_SIZE - PERCOUNTER_PENDING_CAPACITY * sizeof(PercounterMixSignal) - 8];
+    volatile uint32_t publication_closed;
+    uint8_t reserved[PERCOUNTER_SSBUF_REGION_SIZE - PERCOUNTER_PENDING_CAPACITY * sizeof(PercounterMixSignal) - 12];
 };
 static_assert(sizeof(PercounterSsbufRegion) == PERCOUNTER_SSBUF_REGION_SIZE);
 static_assert(std::is_trivially_copyable_v<PercounterSsbufRegion> && std::is_standard_layout_v<PercounterSsbufRegion>);
@@ -97,6 +99,7 @@ inline __aicore__ void percounter_mix_signal_clear(PERCOUNTER_SSBUF PercounterMi
     percounter_ssbuf_store_field(&signal->fanin_ready, uint32_t{0});
     percounter_ssbuf_store_field(&signal->completed, uint32_t{0});
     percounter_ssbuf_store_field(&signal->start_arrived, uint32_t{0});
+    percounter_ssbuf_store_field(&signal->start_ready, uint32_t{0});
     percounter_ssbuf_store_field(&signal->metadata_generation, uint32_t{0});
     for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
         percounter_ssbuf_store_field(&signal->enter_ready[lane], uint32_t{0});
@@ -187,6 +190,16 @@ struct alignas(128) PercounterTicket {
 };
 static_assert(sizeof(PercounterTicket) == 128, "a ticket owns one GM sector");
 static_assert(std::is_trivially_copyable_v<PercounterTicket> && std::is_standard_layout_v<PercounterTicket>);
+
+// Arrival counts use the logical block index, independent of its claiming core.
+inline constexpr uint32_t PERCOUNTER_START_SECTOR_COUNT = 4;
+struct alignas(128) PercounterStartBarrier {
+    PercounterTicket sectors[PERCOUNTER_START_SECTOR_COUNT];
+};
+static_assert(sizeof(PercounterStartBarrier) == 128 * PERCOUNTER_START_SECTOR_COUNT);
+static_assert(
+    std::is_trivially_copyable_v<PercounterStartBarrier> && std::is_standard_layout_v<PercounterStartBarrier>
+);
 
 inline constexpr uint32_t PERCOUNTER_CLAIM_SECTOR_COUNT = 4;
 static_assert(
@@ -473,9 +486,7 @@ struct alignas(128) PercounterControl {
 
     // Progress atomics do not share the immutable configuration or lane_error.
     alignas(128) uint64_t completed_block_count;
-    uint64_t completion_init_arrivals;
-    uint64_t completion_init_epoch;
-    uint8_t resolved_reserved[104];
+    uint8_t resolved_reserved[120];
 
     // Allocation precedes the corresponding block's completed publication.
     // Both counters are monotone; equality after all blocks ran permits exit.

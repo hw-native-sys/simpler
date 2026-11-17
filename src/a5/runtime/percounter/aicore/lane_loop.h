@@ -103,7 +103,7 @@ struct LaneConfig {
     __gm__ PercounterSegment *segments;
     __gm__ PercounterTaskClaim *task_claims;
     __gm__ PercounterClaimSummary *claim_summary;
-    __gm__ PercounterTicket *sync_arrivals;
+    __gm__ PercounterStartBarrier *sync_arrivals;
     uint64_t task_count;
     uint64_t table_task_count;
     bool has_predicates;
@@ -183,7 +183,7 @@ inline __aicore__ PercounterFaninView percounter_fanin_view(const LaneConfig &cf
     return view;
 }
 
-inline __aicore__ void
+__attribute__((noinline, cold)) __aicore__ void
 percounter_fail(const LaneConfig &cfg, SchedulerGraphResult result, int64_t task_id = -1, uint64_t detail = 0) {
     if (percounter_gm_compare_exchange(cfg.control->lane_error_claim, uint64_t{0}, uint64_t{1}) != 0) return;
     percounter_gm_store(cfg.control->lane_error_task, static_cast<uint64_t>(task_id + 1));
@@ -348,67 +348,6 @@ inline __aicore__ bool percounter_should_stop(const LaneConfig &cfg) {
            percounter_gm_read(cfg.control->lane_error) != 0;
 }
 
-inline __aicore__ void percounter_initialize_completion_partition(const LaneConfig &cfg, uint32_t clusters) {
-    for (uint64_t task = cfg.cluster_index; task < cfg.task_count; task += clusters) {
-        const uint32_t blocks =
-            static_cast<uint16_t>(percounter_gm_read_immutable_word(&cfg.metadata[task].global_order_id) >> 48);
-        const uint64_t total = PERCOUNTER_COUNTER_PUBLISHED - percounter_gm_read(cfg.counters[task].value);
-        for (uint32_t sector = 0; sector < PERCOUNTER_COMPLETION_SECTOR_COUNT; ++sector) {
-            uint64_t count = total;
-            if (blocks > 1) {
-                const uint64_t assigned =
-                    (blocks + PERCOUNTER_COMPLETION_SECTOR_COUNT - 1U - sector) / PERCOUNTER_COMPLETION_SECTOR_COUNT;
-                count = assigned * (total / blocks);
-            }
-            auto *word = &cfg.completion_sectors[task * PERCOUNTER_COMPLETION_SECTOR_COUNT + sector].value;
-            *word = percounter_counter_preset(static_cast<int64_t>(count));
-            dcci(word, SINGLE_CACHE_LINE, CACHELINE_OUT);
-        }
-    }
-    dsb((mem_dsb_t)0);
-}
-
-inline __aicore__ void percounter_initialize_claim_partition(const LaneConfig &cfg, uint32_t clusters) {
-    const uint64_t count = percounter_gm_read(cfg.control->boundary_task_count);
-    const uint64_t aic_count = cfg.segment_count[0] - 1;
-    for (uint64_t index = cfg.cluster_index; index < count; index += clusters) {
-        const uint64_t segment = index + (index >= aic_count ? 1 : 0);
-        const uint32_t blocks = static_cast<uint32_t>(percounter_gm_read(cfg.segments[segment].task_shape) >> 48);
-        auto *claim = cfg.task_claims + index;
-        for (uint32_t part = 0; part < PERCOUNTER_CLAIM_SECTOR_COUNT; ++part) {
-            claim->sectors[part].next = 0;
-            dcci(&claim->sectors[part].next, SINGLE_CACHE_LINE, CACHELINE_OUT);
-        }
-        claim->closed_sectors = blocks < PERCOUNTER_CLAIM_SECTOR_COUNT ? PERCOUNTER_CLAIM_SECTOR_COUNT - blocks : 0;
-        dcci(&claim->closed_sectors, SINGLE_CACHE_LINE, CACHELINE_OUT);
-    }
-    dsb((mem_dsb_t)0);
-}
-
-inline __aicore__ bool
-percounter_initialize_counters(const LaneConfig &cfg, uint32_t clusters, uint64_t timeout_cycles) {
-    const uint64_t epoch = cfg.async_group->run_epoch;
-    if (cfg.cluster_lane == 0) {
-        percounter_initialize_completion_partition(cfg, clusters);
-        percounter_initialize_claim_partition(cfg, clusters);
-        const uint64_t arrived = percounter_gm_fetch_add(cfg.control->completion_init_arrivals, uint64_t{1});
-        if (arrived + 1 == clusters) {
-            dsb((mem_dsb_t)0);
-            percounter_gm_store(cfg.control->completion_init_epoch, epoch);
-        }
-    }
-    const uint64_t start = get_sys_cnt_aicore();
-    while (percounter_gm_read(cfg.control->completion_init_epoch) != epoch) {
-        if (percounter_should_stop(cfg)) return false;
-        if (get_sys_cnt_aicore() - start > timeout_cycles) {
-            percounter_fail(cfg, SchedulerGraphResult::TIMEOUT);
-            return false;
-        }
-    }
-    dsb((mem_dsb_t)0);
-    return true;
-}
-
 struct PercounterSlot {
     uint64_t entry;
     PercounterTaskMetadata metadata;
@@ -470,6 +409,7 @@ struct PercounterLaneState {
     uint32_t required_mix_floor{0};
     uint32_t seen_sequence{0};
     uint32_t shared_active{0};
+    bool mix_closed{false};
     int32_t shared_head{-1};
     uint32_t batch{1};
     uint32_t idle_passes{0};
@@ -711,6 +651,7 @@ inline __aicore__ bool percounter_clear_mix_signal(const LaneConfig &cfg, uint64
         for (uint32_t i = 0; i < PERCOUNTER_PENDING_CAPACITY; ++i)
             percounter_mix_signal_clear(&cfg.ssbuf->mix[i]);
         percounter_ssbuf_store_release(&cfg.ssbuf->mix_floor_rank, 0);
+        percounter_ssbuf_store_field(&cfg.ssbuf->publication_closed, uint32_t{0});
         percounter_ssbuf_store_release(&cfg.ssbuf->publish_sequence, 0);
         percounter_gm_store(*ready, uint64_t{1});
     }
@@ -825,10 +766,19 @@ percounter_tokens_ready(PERCOUNTER_SSBUF volatile uint32_t *tokens, uint32_t mas
 
 inline __aicore__ void percounter_discover_records(const LaneConfig &cfg, PercounterLaneState *state) {
     ProfileScope profile_scope(cfg.scalar, ProfilePhase::Discover);
-    if (cfg.mix_task_count == 0) return;
+    if (cfg.mix_task_count == 0 || state->mix_closed) return;
     const uint32_t sequence = percounter_ssbuf_load_acquire(&cfg.ssbuf->publish_sequence);
     if (sequence == state->seen_sequence) return;
     state->seen_sequence = sequence;
+    if (percounter_ssbuf_load_field(&cfg.ssbuf->publication_closed) != 0) {
+        // Acquire closure before dropping records: the earlier sequence may precede
+        // the publisher's final FIN acquisitions and record retirements.
+        percounter_ssbuf_load_acquire(&cfg.ssbuf->publication_closed);
+        state->mix_closed = true;
+        state->shared_active = 0;
+        state->shared_head = -1;
+        return;
+    }
     uint32_t active = 0;
     for (uint32_t i = 0; i < PERCOUNTER_PENDING_CAPACITY; ++i) {
         PercounterCandidate c;
@@ -903,6 +853,42 @@ percounter_complete_mix(const LaneConfig &cfg, PercounterLaneState *state, const
     return true;
 }
 
+/**
+ * A participating publisher aggregates and retires its own record. When AIV0
+ * is not a participant, completion stays with an executing member so unrelated
+ * AIV0 work cannot delay logical completion.
+ */
+inline __aicore__ bool percounter_retire_owned_mix(const LaneConfig &cfg, PercounterLaneState *state) {
+    if (cfg.cluster_lane != 1) return false;
+    bool retired = false;
+    uint32_t owned = state->mix_owned;
+    while (owned != 0) {
+        const uint32_t i = __builtin_ctz(owned);
+        owned &= owned - 1;
+        auto *record = &cfg.ssbuf->mix[i];
+        const auto &slot = state->slots[i];
+        const uint32_t generation = percounter_ssbuf_load_field(&record->generation);
+        if ((slot.metadata.active_mask & 2U) != 0) {
+            const PercounterCandidate c{slot.entry,
+                                        slot.metadata.global_order_id,
+                                        generation,
+                                        0,
+                                        slot.metadata.active_mask,
+                                        static_cast<int32_t>(i),
+                                        true,
+                                        true,
+                                        slot.metadata.sync_index};
+            if (!percounter_complete_mix(cfg, state, c)) continue;
+        } else if (percounter_ssbuf_load_acquire(&record->completed) != generation) continue;
+        percounter_ssbuf_store_release(&record->generation, generation + 1);
+        state->mix_owned &= ~(1U << i);
+        state->occupied &= ~(1U << i);
+        state->revisit |= 1U << i;
+        retired = true;
+    }
+    return retired;
+}
+
 inline __aicore__ void percounter_service_records(
     const LaneConfig &cfg, PercounterLaneState *state, PercounterCandidate *candidate, bool probe_dependencies = true
 ) {
@@ -912,7 +898,8 @@ inline __aicore__ void percounter_service_records(
         auto *record = &cfg.ssbuf->mix[c.index];
         if (static_cast<uint32_t>(cfg.cluster_lane) == static_cast<uint32_t>(__builtin_ctz(c.mask))) {
             if (c.finished) {
-                if (percounter_complete_mix(cfg, state, c)) percounter_shared_head(cfg, state, candidate);
+                if ((c.mask & 2U) == 0 && percounter_complete_mix(cfg, state, c))
+                    percounter_shared_head(cfg, state, candidate);
             } else if (!c.ready && percounter_metadata_ready(cfg, percounter_order_task_id(c.entry))) {
                 const bool resolved_now = percounter_ssbuf_load_field(&record->metadata_generation) != c.generation;
                 if (resolved_now) {
@@ -957,19 +944,6 @@ inline __aicore__ void percounter_service_records(
                     }
                 }
             }
-        }
-    }
-    uint32_t owned = state->mix_owned;
-    while (owned != 0) {
-        const uint32_t i = __builtin_ctz(owned);
-        owned &= owned - 1;
-        auto *record = &cfg.ssbuf->mix[i];
-        const uint32_t generation = percounter_ssbuf_load_acquire(&record->generation);
-        if (percounter_ssbuf_load_acquire(&record->completed) == generation) {
-            percounter_ssbuf_store_release(&record->generation, generation + 1);
-            state->mix_owned &= ~(1U << i);
-            state->occupied &= ~(1U << i);
-            state->revisit |= 1U << i;
         }
     }
 }
@@ -1191,10 +1165,20 @@ inline __aicore__ uint32_t percounter_source_floor(const LaneConfig &cfg, Percou
 }
 
 inline __aicore__ void percounter_publish_mix_floor(const LaneConfig &cfg, PercounterLaneState *state) {
+    if (state->mix_closed) return;
     const uint32_t floor = percounter_source_floor(cfg, state->source, true);
     if (floor != state->published_floor) {
         percounter_ssbuf_store_release(&cfg.ssbuf->mix_floor_rank, floor);
         state->published_floor = floor;
+    }
+    if (floor == UINT32_MAX && state->mix_owned == 0) {
+        // All MIX claims are exhausted and every local publication is retired.
+        // The closing sequence orders this token after every participant's FIN.
+        percounter_ssbuf_store_field(&cfg.ssbuf->publication_closed, uint32_t{1});
+        percounter_ssbuf_store_release(&cfg.ssbuf->publish_sequence, ++state->sequence);
+        state->mix_closed = true;
+        state->shared_active = 0;
+        state->shared_head = -1;
     }
 }
 
@@ -1290,26 +1274,47 @@ inline __aicore__ bool percounter_commit_live(const LaneConfig &cfg, const Perco
            percounter_ssbuf_load_acquire(&record->completed) != state.committed_generation;
 }
 
+inline __aicore__ void percounter_start_arrive(const LaneConfig &cfg, uint32_t sync, uint32_t block) {
+    percounter_gm_fetch_add_issue(
+        cfg.sync_arrivals[sync].sectors[block & (PERCOUNTER_START_SECTOR_COUNT - 1)].next, uint64_t{1}
+    );
+}
+
+inline __aicore__ bool percounter_start_ready(const LaneConfig &cfg, uint32_t sync, uint32_t blocks, uint32_t block) {
+    // Rotate probes to spread readers as well as arrival writers. Zero-sized
+    // sectors are complete without a read; every nonempty sector must arrive.
+    for (uint32_t offset = 0; offset < PERCOUNTER_START_SECTOR_COUNT; ++offset) {
+        const uint32_t part = (block + offset) & (PERCOUNTER_START_SECTOR_COUNT - 1);
+        const uint32_t expected = (blocks + PERCOUNTER_START_SECTOR_COUNT - 1 - part) / PERCOUNTER_START_SECTOR_COUNT;
+        if (expected != 0 && percounter_gm_read(cfg.sync_arrivals[sync].sectors[part].next) != expected) return false;
+    }
+    return true;
+}
+
 inline __aicore__ bool percounter_step(const LaneConfig &cfg, PercounterLaneState *state, bool *executed) {
     ProfileScope profile_scope(cfg.scalar, ProfilePhase::Step);
     if (!percounter_async_tick(cfg, state, executed)) return false;
+    // Progress includes record retirement and async settlement, not only kernel calls.
+    if (percounter_retire_owned_mix(cfg, state)) *executed = true;
     if (*executed) state->idle_passes = 0;
     // Only repeated failed dependency reads share this bounded cadence.
     // Publication, entry, FIN and new claims are serviced on every pass.
     const bool probe_dependencies = state->idle_passes < 16 || (state->idle_passes & 3U) == 0;
-    const bool mix_coordinator = cfg.cluster_lane == 1 && cfg.mix_task_count != 0;
+    const bool mix_coordinator = cfg.cluster_lane == 1 && cfg.mix_task_count != 0 && !state->mix_closed;
     const bool claimed = state->occupied == 0;
     if (claimed) percounter_claim(cfg, state);
     if (mix_coordinator) percounter_publish_mix_floor(cfg, state);
     // An acquired lower bound remains valid for every later scan. Refresh
     // only when a candidate needs to cross it, always before discovery.
-    if (cfg.mix_task_count == 0) state->observed_mix_floor = UINT32_MAX;
+    if (cfg.mix_task_count == 0 || state->mix_closed) state->observed_mix_floor = UINT32_MAX;
     else if (cfg.cluster_lane == 1) state->observed_mix_floor = state->published_floor;
     else if (state->required_mix_floor > state->observed_mix_floor)
         state->observed_mix_floor = percounter_ssbuf_load_acquire(&cfg.ssbuf->mix_floor_rank);
-    percounter_discover_records(cfg, state);
     PercounterCandidate shared_candidate;
-    percounter_service_records(cfg, state, &shared_candidate, probe_dependencies);
+    if (!state->mix_closed) {
+        percounter_discover_records(cfg, state);
+        percounter_service_records(cfg, state, &shared_candidate, probe_dependencies);
+    }
     PercounterCandidate cohort;
     PercounterCandidate ordinary;
     PercounterCandidate prepare;
@@ -1401,7 +1406,7 @@ inline __aicore__ bool percounter_step(const LaneConfig &cfg, PercounterLaneStat
                 if (cohort_go && sync_index != PERCOUNTER_NO_SYNC) {
                     if (static_cast<uint32_t>(cfg.cluster_lane) == static_cast<uint32_t>(__builtin_ctz(cohort.mask)) &&
                         percounter_ssbuf_load_acquire(&record->start_arrived) != cohort.generation) {
-                        percounter_gm_fetch_add_issue(cfg.sync_arrivals[sync_index].next, uint64_t{1});
+                        percounter_start_arrive(cfg, sync_index, percounter_order_block_idx(cohort.entry));
                         percounter_ssbuf_store_release(&record->start_arrived, cohort.generation);
                     }
                 }
@@ -1409,12 +1414,23 @@ inline __aicore__ bool percounter_step(const LaneConfig &cfg, PercounterLaneStat
                 auto &slot = state->slots[cohort.index];
                 if (!slot.entered) {
                     slot.entered = true;
-                    percounter_gm_fetch_add_issue(cfg.sync_arrivals[sync_index].next, uint64_t{1});
+                    percounter_start_arrive(cfg, sync_index, percounter_order_block_idx(cohort.entry));
                 }
                 cohort_go = true;
             }
-            if (cohort_go && sync_index != PERCOUNTER_NO_SYNC)
-                cohort_go = percounter_gm_read(cfg.sync_arrivals[sync_index].next) == blocks;
+            if (cohort_go && sync_index != PERCOUNTER_NO_SYNC) {
+                if (!cohort.shared ||
+                    static_cast<uint32_t>(cfg.cluster_lane) == static_cast<uint32_t>(__builtin_ctz(cohort.mask))) {
+                    cohort_go =
+                        percounter_start_ready(cfg, sync_index, blocks, percounter_order_block_idx(cohort.entry));
+                    if (cohort_go && cohort.shared)
+                        percounter_ssbuf_store_release(&record->start_ready, cohort.generation);
+                } else {
+                    // One GM observer per block; other participants consume its
+                    // generation-tagged publication through the local SRAM.
+                    cohort_go = percounter_ssbuf_load_acquire(&record->start_ready) == cohort.generation;
+                }
+            }
             if (cohort_go && cohort.shared) {
                 // A peer may reach ENTER_READY during this lane's ordinary
                 // kernel. Its UB and pipelines become available only here.
@@ -1483,7 +1499,9 @@ inline __aicore__ bool percounter_step(const LaneConfig &cfg, PercounterLaneStat
             percounter_ssbuf_store_release(
                 &cfg.ssbuf->mix[selected.index].finished[cfg.cluster_lane], selected.generation
             );
-            if (static_cast<uint32_t>(cfg.cluster_lane) == static_cast<uint32_t>(__builtin_ctz(selected.mask)))
+            if (cfg.cluster_lane == 1) percounter_retire_owned_mix(cfg, state);
+            else if ((selected.mask & 2U) == 0 &&
+                     static_cast<uint32_t>(cfg.cluster_lane) == static_cast<uint32_t>(__builtin_ctz(selected.mask)))
                 percounter_complete_mix(cfg, state, selected);
         } else {
             if (!deferred) percounter_publish_completion(cfg, *task, completion, uint64_t{1});
@@ -1530,41 +1548,30 @@ inline __aicore__ bool percounter_step(const LaneConfig &cfg, PercounterLaneStat
     return true;
 }
 
+inline __aicore__ bool percounter_lane_quiescent(const LaneConfig &cfg, const PercounterLaneState &state) {
+    if (state.source.segment < cfg.segment_count[cfg.cluster_lane == 0 ? 0 : 1]) return false;
+    return state.occupied == 0 && state.revisit == 0 && state.mix_owned == 0 && state.shared_active == 0 &&
+           state.async_head == 0 && (cfg.mix_task_count == 0 || state.mix_closed);
+}
+
 template <int32_t ClusterLane>
-inline __aicore__ void percounter_lane_loop(LaneConfig &cfg, uint64_t timeout_cycles) {
+inline __aicore__ void percounter_lane_loop(LaneConfig &cfg) {
     cfg.cluster_lane = ClusterLane;
     if (percounter_should_stop(cfg)) return;
     PercounterLaneState state{};
     percounter_initialize_boundaries(cfg, &state.source);
-    uint64_t last_progress = 0;
-    uint64_t progress_time = get_sys_cnt_aicore();
     for (uint64_t iterations = 0;; ++iterations) {
         bool executed;
         if (!percounter_step(cfg, &state, &executed)) break;
         if constexpr (profile_compiled) {
             if (cfg.scalar != nullptr) cfg.scalar->end_iteration(executed);
         }
-        if (executed) progress_time = get_sys_cnt_aicore();
+        if (percounter_lane_quiescent(cfg, state)) break;
         if ((iterations % PERCOUNTER_SPIN_CHECK_INTERVAL) != 0) continue;
         percounter_flush_done(cfg, &state);
+        // AICPU owns global completion and progress timeout; lanes observe its
+        // EXIT and peer failures while servicing their local obligations.
         if (percounter_should_stop(cfg)) break;
-        const uint64_t blocks = percounter_gm_read(cfg.control->completed_block_count);
-        const bool physical_done = blocks == percounter_gm_read(cfg.control->executable_block_count);
-        // Every registration precedes physical retirement. A bypass count
-        // read alone does not order the following registration observations.
-        if (physical_done) dsb((mem_dsb_t)0);
-        const uint64_t registered = percounter_gm_read(cfg.control->async_registered);
-        const uint64_t settled = percounter_gm_read(cfg.control->async_settled);
-        const uint64_t progress = blocks + settled;
-        if (physical_done && registered == settled && state.async_head == 0) break;
-        const uint64_t now = get_sys_cnt_aicore();
-        if (progress != last_progress) {
-            last_progress = progress;
-            progress_time = now;
-        } else if (now - progress_time > timeout_cycles) {
-            percounter_fail(cfg, SchedulerGraphResult::TIMEOUT);
-            break;
-        }
     }
     percounter_flush_done(cfg, &state);
     percounter_commit_task_timing(cfg);
@@ -1572,11 +1579,14 @@ inline __aicore__ void percounter_lane_loop(LaneConfig &cfg, uint64_t timeout_cy
 
 inline __aicore__ AicoreWorkWindow
 run_percounter_lane(__gm__ PercounterControl *control, int block_idx, CoreType core_type) {
+    // The caller invalidates the data cache after observing AICPU READY.
+    // Configuration is immutable after that publication; use cached loads here.
+    // Progress, dependency and exit words retain their bypass/atomic accesses.
     const bool is_aic = core_type == CoreType::AIC;
     const uint32_t type_index = is_aic ? 0U : 1U;
     SchedulerClusterCoordinate coordinate{-1, -1};
-    const uint64_t cluster_count = percounter_gm_read(control->cluster_count);
-    const uint64_t aiv_per_cluster = percounter_gm_read(control->aiv_per_cluster);
+    const uint64_t cluster_count = control->cluster_count;
+    const uint64_t aiv_per_cluster = control->aiv_per_cluster;
     if (!scheduler_cluster_coordinate_from_worker(
             block_idx, is_aic, static_cast<int32_t>(cluster_count), static_cast<int32_t>(aiv_per_cluster), &coordinate
         )) {
@@ -1592,11 +1602,10 @@ run_percounter_lane(__gm__ PercounterControl *control, int block_idx, CoreType c
     PercounterScalarBinding scalar_binding;
     uint32_t task_count = 0;
     uint32_t task_dropped = 0;
-    const uint64_t level = percounter_gm_read(control->profiling_level);
+    const uint64_t level = control->profiling_level;
     if (level >= 2) {
         cfg.profile_buffer =
-            scheduler_state_at<PercounterProfileBuffer>(control, percounter_gm_read(control->profile_buffers_offset)) +
-            block_idx;
+            scheduler_state_at<PercounterProfileBuffer>(control, control->profile_buffers_offset) + block_idx;
         cfg.task_records = scheduler_state_at<PercounterTaskTiming>(control, cfg.profile_buffer->task_records_offset);
         cfg.profile_task_count = &task_count;
         cfg.task_dropped = &task_dropped;
@@ -1616,55 +1625,52 @@ run_percounter_lane(__gm__ PercounterControl *control, int block_idx, CoreType c
     }
     ProfileScope setup_scope(cfg.scalar, ProfilePhase::LaneSetup);
     cfg.control = control;
-    const uint64_t storage_count = percounter_gm_read(control->graph_storage_count);
-    cfg.storage_address = percounter_gm_read(control->graph_storage_address);
+    const uint64_t storage_count = control->graph_storage_count;
+    cfg.storage_address = control->graph_storage_address;
     cfg.payloads = scheduler_state_at<DispatchPayload>(
-        control, percounter_gm_read(control->dispatch_payloads_offset) +
+        control, control->dispatch_payloads_offset +
                      static_cast<uint64_t>(block_idx) * PERCOUNTER_PAYLOAD_SLOT_COUNT * sizeof(DispatchPayload)
     );
-    cfg.tickets = scheduler_state_at<PercounterTicket>(control, percounter_gm_read(control->tickets_offset));
-    cfg.metadata = scheduler_state_at<PercounterTaskMetadata>(control, percounter_gm_read(control->metadata_offset));
-    cfg.metadata_ready = scheduler_state_at<uint64_t>(control, percounter_gm_read(control->metadata_ready_offset));
-    cfg.segments = scheduler_state_at<PercounterSegment>(control, percounter_gm_read(control->segments_offset));
-    cfg.task_claims = scheduler_state_at<PercounterTaskClaim>(control, percounter_gm_read(control->task_claims_offset));
-    cfg.claim_summary =
-        scheduler_state_at<PercounterClaimSummary>(control, percounter_gm_read(control->claim_summary_offset));
-    cfg.sync_arrivals =
-        scheduler_state_at<PercounterTicket>(control, percounter_gm_read(control->sync_arrivals_offset));
+    cfg.tickets = scheduler_state_at<PercounterTicket>(control, control->tickets_offset);
+    cfg.metadata = scheduler_state_at<PercounterTaskMetadata>(control, control->metadata_offset);
+    cfg.metadata_ready = scheduler_state_at<uint64_t>(control, control->metadata_ready_offset);
+    cfg.segments = scheduler_state_at<PercounterSegment>(control, control->segments_offset);
+    cfg.task_claims = scheduler_state_at<PercounterTaskClaim>(control, control->task_claims_offset);
+    cfg.claim_summary = scheduler_state_at<PercounterClaimSummary>(control, control->claim_summary_offset);
+    cfg.sync_arrivals = scheduler_state_at<PercounterStartBarrier>(control, control->sync_arrivals_offset);
     for (uint32_t i = 0; i < PERCOUNTER_LIST_COUNT; ++i) {
-        cfg.segment_begin[i] = percounter_gm_read(control->segment_begin[i]);
-        cfg.segment_count[i] = percounter_gm_read(control->segment_count[i]);
+        cfg.segment_begin[i] = control->segment_begin[i];
+        cfg.segment_count[i] = control->segment_count[i];
     }
-    cfg.order = scheduler_state_at<uint64_t>(control, percounter_gm_read(control->orders_offset[type_index]));
-    cfg.fanin = scheduler_state_at<PercounterFanin>(control, percounter_gm_read(control->fanin_offset));
-    cfg.fanin_addresses = scheduler_state_at<uint64_t>(control, percounter_gm_read(control->fanin_addr_offset));
-    cfg.counters = scheduler_state_at<PercounterCounter>(control, percounter_gm_read(control->counters_offset));
+    cfg.order = scheduler_state_at<uint64_t>(control, control->orders_offset[type_index]);
+    cfg.fanin = scheduler_state_at<PercounterFanin>(control, control->fanin_offset);
+    cfg.fanin_addresses = scheduler_state_at<uint64_t>(control, control->fanin_addr_offset);
+    cfg.counters = scheduler_state_at<PercounterCounter>(control, control->counters_offset);
     cfg.completion_sectors =
-        scheduler_state_at<PercounterCompletionSector>(control, percounter_gm_read(control->completion_sectors_offset));
-    cfg.task_count = percounter_gm_read(control->task_count);
-    cfg.table_task_count = percounter_gm_read(control->table_task_count);
+        scheduler_state_at<PercounterCompletionSector>(control, control->completion_sectors_offset);
+    cfg.task_count = control->task_count;
+    cfg.table_task_count = control->table_task_count;
     if (cfg.table_task_count != storage_count) {
         percounter_fail(cfg, SchedulerGraphResult::INVALID_TASK_COUNT);
         return {};
     }
-    cfg.has_predicates = percounter_gm_read(control->has_predicates) != 0;
+    cfg.has_predicates = control->has_predicates != 0;
     cfg.async_group = percounter_init_async_record(control, block_idx);
     cfg.async_entries = scheduler_state_at<DeferredCompletionEntry>(
-        control, percounter_gm_read(control->async_entries_offset) +
+        control, control->async_entries_offset +
                      static_cast<uint64_t>(block_idx) * PERCOUNTER_ASYNC_CAPACITY * sizeof(DeferredCompletionEntry)
     );
-    cfg.async_completions =
-        scheduler_state_at<PercounterAsyncCompletion>(control, percounter_gm_read(control->async_completions_offset));
-    cfg.async_completion_capacity = percounter_gm_read(control->async_completion_capacity);
+    cfg.async_completions = scheduler_state_at<PercounterAsyncCompletion>(control, control->async_completions_offset);
+    cfg.async_completion_capacity = control->async_completion_capacity;
     cfg.cluster_index = coordinate.cluster_index;
     cfg.cluster_lane = coordinate.cluster_lane;
 
-    const uint64_t timeout_cycles = percounter_gm_read(control->scheduler_timeout_cycles);
-    if (!percounter_initialize_counters(cfg, static_cast<uint32_t>(cluster_count), timeout_cycles)) return {};
-    cfg.mix_task_count = percounter_gm_read(control->mix_task_count);
+    const uint64_t timeout_cycles = control->scheduler_timeout_cycles;
+    // Order lane setup before claims; completion and claim seeds arrive in the Host image.
+    dsb((mem_dsb_t)0);
+    cfg.mix_task_count = control->mix_task_count;
     if (cfg.mix_task_count != 0) {
-        cfg.mix_signal_ready =
-            scheduler_state_at<uint64_t>(control, percounter_gm_read(control->mix_signal_ready_offset));
+        cfg.mix_signal_ready = scheduler_state_at<uint64_t>(control, control->mix_signal_ready_offset);
         cfg.ssbuf = percounter_ssbuf_region(platform_ssbuf_hardware_base_address());
         if (!percounter_clear_mix_signal(cfg, timeout_cycles)) return {};
     }
@@ -1675,9 +1681,9 @@ run_percounter_lane(__gm__ PercounterControl *control, int block_idx, CoreType c
         if (cfg.profile_head != nullptr) cfg.profile = &profile;
     }
     setup_scope.close();
-    if (cfg.cluster_lane == 0) percounter_lane_loop<0>(cfg, timeout_cycles);
-    else if (cfg.cluster_lane == 1) percounter_lane_loop<1>(cfg, timeout_cycles);
-    else percounter_lane_loop<2>(cfg, timeout_cycles);
+    if (cfg.cluster_lane == 0) percounter_lane_loop<0>(cfg);
+    else if (cfg.cluster_lane == 1) percounter_lane_loop<1>(cfg);
+    else percounter_lane_loop<2>(cfg);
     percounter_commit_task_timing(cfg);
     if (cfg.profile != nullptr) percounter_flush_stream_records(&profile);
     if (cfg.profile_buffer != nullptr) {

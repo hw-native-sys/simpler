@@ -52,8 +52,9 @@ remaining sectors cyclically when that sector is exhausted. The final valid
 ticket of each nonempty sector increments the closed count; empty sectors are
 included in its initial value. The unique final closure publishes the segment
 summary bit. This preserves unique block assignment even when block and owner
-counts are not divisible by four. Each sync task reserves a separate 128-byte
-arrival sector.
+counts are not divisible by four. Each sync task reserves four independent 128-byte
+arrival sectors, selected by logical block index modulo four. Every nonempty
+sector must reach its expected block count before the cohort can start.
 Ordinary AIC, ordinary AIV and MIX sync widths are checked against their actual
 eligible owner counts. Nonempty single-block intervals reserve one ticket
 sector each, bounded by the smaller of the ordinary single-block task count
@@ -118,7 +119,10 @@ Each participant then publishes an irrevocable `enter_ready` token for the
 current generation, identified locally by candidate, entry and generation.
 Pure ordinary ready work can still run while that commitment waits. For sync
 tasks, a block contributes one start arrival after its entry commitments; all
-blocks must arrive before any enters its kernel.
+blocks must arrive before any enters its kernel. For a MIX block, its lowest active
+lane observes the global arrival sectors and publishes start_ready with the
+record generation. Other members consume that SSBUF notification. The local
+idle handshake still gates execution.
 
 Once these entry conditions hold, each MIX participant finishes its current
 ordinary kernel and publishes `enter_idle` for the generation. This second
@@ -129,16 +133,19 @@ another core can publish it during an ordinary kernel. Waiting for all entry
 conditions before reserving the cores preserves ordinary work needed by earlier
 cohorts. The idle handshake is cluster-local and adds no GM start-arrival atomic.
 
-Each participant publishes `finished` only after its kernel and payload use
-end. The lowest numbered participant checks for aggregation immediately after
-its own FIN and on subsequent record-service passes. Once all participants
-finish, it aggregates task and optional Graph shell completion, then publishes
-`completed`. Only then can AIV0 release the
-owning position and reuse the record. Every ready, entry, finish and aggregate
-token is compared to the current generation. Generation checks enclose shared
-descriptor reads, including reads by nonparticipants that can race reuse.
-SSBUF has no atomics; each token has one writer.
-No receiver task descriptor is copied into local state.
+Each participant publishes FIN only after its kernel and payload use end.
+When AIV0 participates, the publishing AIV0 acquires every member's FIN,
+aggregates task and optional Graph shell completion, and retires the record.
+It checks immediately after its own FIN and before the next claim pass, so
+retirement frees the source position before that pass selects another task.
+No completion notification between two scheduler owners is needed on this path.
+
+For a MIX without AIV0, the lowest numbered executing member aggregates and
+publishes the completed generation. This preserves completion independently of
+unrelated AIV0 work; AIV0 subsequently reclaims the source position.
+Every ready, entry, finish and aggregate token is compared to its generation.
+Generation checks enclose shared descriptor reads, including nonparticipants
+that can race reuse. SSBUF has no atomics; each token has one writer.
 
 Multi-block task completion has four components, partitioned by block index
 modulo four. Each starts at `1 - component_subtasks`; the task is complete only
@@ -161,17 +168,32 @@ components do not require an atomic snapshot.
 
 GM sectors are 128 bytes; scalar DCache maintenance retains 64-byte granularity.
 The state allocation itself is aligned to 128 bytes, including in simulation.
-The array adds `task_count * 128 * 4` device bytes beyond `upload_size`; Host
-uploads no initial array contents. AIC lanes initialize disjoint task subsets
-from the immutable total-subtask seed and block count, then publish an epoch
-barrier before any lane claims work. The SSBUF record remains 128 bytes.
-The task-claim array also lies beyond `upload_size`. AIC lanes initialize its
-tickets and closure counts before the same barrier; Host uploads no claim-state
-contents. Each boundary task uses 640 device bytes for claim state.
+The completion array uses `task_count * 128 * 4` device bytes. Host initializes
+it from each task's total-subtask seed and block count, initializes claim tickets
+and closure counts, and includes both arrays in each run's uploaded image.
+AICore observes READY and invalidates its data cache before using that image;
+lane entry does not rewrite completion or claim state.
+The SSBUF record remains 128 bytes. Each boundary task uses 640 device bytes for
+claim state. Immutable control fields use ordinary loads after the lane's entry
+cache invalidation; mutable progress and dependency fields retain bypass or atomic
+accesses.
 Host, AICPU and AICore share one current layout.
-Completed block progress is batched. Exhausted local lists do not authorize
-exit: lanes keep serving shared records until total block progress completes
-or the error/EXIT protocol stops the run.
+Completed block progress is batched. An exhausted local list alone does not
+authorize exit. AIV0 publishes cluster-local MIX closure only after all MIX
+claim boundaries are closed and every record it owns has retired. A closing
+publication sequence carries this single-writer SSBUF token; peers acquire it
+before disabling MIX discovery. Startup clears it before publishing readiness.
+
+A lane can end its scheduler loop when its local list is exhausted, all owned
+positions and retirement revisits are empty, its MIX domain is closed (or the
+run has no MIX), and it has no deferred completion record. It flushes its local
+completion batch and enters the register EXIT wait. This does not declare the
+run complete: AICPU retains global completion, async settlement, watchdog and
+EXIT/nonce-handshake ownership. Active lanes poll EXIT and the shared error word
+and flush their completed-block batches at the existing observation interval.
+They do not independently reread the run-wide completion and async counts or
+maintain another progress watchdog. Initialization and startup waits retain their
+local time bounds; a started run is supervised by AICPU.
 
 Lanes check EXIT and the shared GM error word at startup and periodically
 during scheduling. AICPU also observes errors and broadcasts EXIT. Neither
@@ -193,7 +215,7 @@ size do not depend on the number of argument values.
 
 Static Graph order, shape and total-subtask completion seeds are available at
 bind. Graph body fanin references encode `(producer_index << 1) | partitioned`.
-AICore initializes the components before claims. AICPU materialization
+Host initializes the completion components before upload. AICPU materialization
 publishes a separate `metadata_ready` token after the descriptor and its
 argument spans, without waiting for fanin. Lanes never parse a body descriptor
 before that publication. Graph roots observe shell fanin and sinks also update
@@ -234,8 +256,9 @@ to four conditions; at return, only actual registrations are copied into
 persistent records, allowing the payload and scratch to be reused immediately.
 Each record retains its block's actual completion address across slot and
 payload reuse. Each owner polls its records and publishes completion only after all conditions
-hold. Independent records can settle out of registration order. Exit requires
-both all physical blocks and all registered conditions to have completed.
+hold. Independent records can settle out of registration order. A lane cannot
+stop polling while it owns an unsettled record. Global run completion still
+requires all physical blocks and all registered conditions to have completed.
 
 A deferring MIX participant subtracts its share before FINISHED; the aggregator
 still publishes the block's full share once. The deferred record restores that

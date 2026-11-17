@@ -176,7 +176,7 @@ def assert_resident_capture(path: Path) -> None:
 
 
 @cache
-def compile_counter(platform: str):
+def compile_counter(platform: str, runtime: str = "host_build_graph"):
     spec = {
         "orchestration": {
             "source": str(HERE / "kernels/orchestration/counter.cpp"),
@@ -204,19 +204,28 @@ def compile_counter(platform: str):
         ],
     }
     return compile_chip_callable_spec(
-        spec, platform, "host_build_graph", (str(HERE), platform, "counter", _pto_isa_compile_cache_token())
+        spec, platform, runtime, (str(HERE), platform, runtime, "counter", _pto_isa_compile_cache_token())
     )
 
 
 class CounterRunner:
     """Own an L3 worker so close tests cannot terminate another case's pooled worker."""
 
-    def __init__(self, platform: str, devices: list[int], directory: Path, case: Case, *, profiling_level: int = 4):
+    def __init__(
+        self,
+        platform: str,
+        devices: list[int],
+        directory: Path,
+        case: Case,
+        *,
+        profiling_level: int = 4,
+        runtime: str = "host_build_graph",
+    ):
         self.case = case
         self.profiling_level = profiling_level
         self.directory = directory
         self.directory.mkdir(parents=True, exist_ok=True)
-        self.compiled = compile_counter(platform)
+        self.compiled = compile_counter(platform, runtime)
         # This is a fixture storage bound. Actual progress widths use rt_available_aiv_count().
         self.capacity_waiters = 256 if case.scenario == Scenario.PROGRESS else case.waiters
         self.slots = case.instances * self.capacity_waiters * case.blocks * 3
@@ -229,7 +238,7 @@ class CounterRunner:
         ).share_memory_()
         self.initial_payload = torch.full((self.slots, PAYLOAD_WORDS), POISON, dtype=torch.int32).share_memory_()
         self.worker = Worker(
-            level=3, platform=platform, runtime="host_build_graph", device_ids=[int(devices[0])], num_sub_workers=0
+            level=3, platform=platform, runtime=runtime, device_ids=[int(devices[0])], num_sub_workers=0
         )
         self.iteration = 0
         self.closed = False
