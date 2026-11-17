@@ -178,22 +178,25 @@ claim state. Immutable control fields use ordinary loads after the lane's entry
 cache invalidation; mutable progress and dependency fields retain bypass or atomic
 accesses.
 Host, AICPU and AICore share one current layout.
-Completed block progress is batched. An exhausted local list alone does not
-authorize exit. AIV0 publishes cluster-local MIX closure only after all MIX
-claim boundaries are closed and every record it owns has retired. A closing
-publication sequence carries this single-writer SSBUF token; peers acquire it
-before disabling MIX discovery. Startup clears it before publishing readiness.
+AIV0 publishes cluster-local MIX closure only after all MIX claim boundaries are
+closed and every record it owns has retired. A closing publication sequence
+carries this single-writer SSBUF token; peers acquire it before disabling MIX
+discovery. Startup clears it before publishing readiness.
 
-A lane can end its scheduler loop when its local list is exhausted, all owned
-positions and retirement revisits are empty, its MIX domain is closed (or the
-run has no MIX), and it has no deferred completion record. It flushes its local
-completion batch and enters the register EXIT wait. This does not declare the
-run complete: AICPU retains global completion, async settlement, watchdog and
-EXIT/nonce-handshake ownership. Active lanes poll EXIT and the shared error word
-and flush their completed-block batches at the existing observation interval.
-They do not independently reread the run-wide completion and async counts or
-maintain another progress watchdog. Initialization and startup waits retain their
-local time bounds; a started run is supervised by AICPU.
+Lanes publish task completion only; they keep no whole-graph progress count and
+reach no completion verdict of their own. A lane can end its scheduler loop when
+its local list is exhausted, all owned positions and retirement revisits are
+empty, its MIX domain is closed (or the run has no MIX), and it has no deferred
+completion record — that is a statement about the lane, not about the run. It
+then enters the register EXIT wait. Active lanes poll EXIT and the shared error
+word at the existing observation interval; they do not reread the run-wide
+completion and async counts or maintain another progress watchdog.
+
+The AICPU supervisor owns the completion verdict: it waits for every top-level
+sink the Host found to read published and for `async_registered ==
+async_settled`, then the ordinary retirement path signals EXIT. AICPU also
+retains watchdog and EXIT/nonce-handshake ownership. Initialization and startup
+waits retain their local time bounds; a started run is supervised by AICPU.
 
 Lanes check EXIT and the shared GM error word at startup and periodically
 during scheduling. AICPU also observes errors and broadcasts EXIT. Neither

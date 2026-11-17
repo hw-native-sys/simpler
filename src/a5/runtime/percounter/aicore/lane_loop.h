@@ -62,18 +62,6 @@ inline __aicore__ uint64_t percounter_observe(uint64_t counter_address) {
     return percounter_gm_read(*word);
 }
 
-/**
- * How many finished tasks a lane accumulates before folding them into the
- * shared progress count.
- *
- * Not per task: every lane adding to one address would queue at the atomic
- * unit. Not once at the end either: the AICPU progress watchdog would see no
- * progress on a healthy run. It must stay below the tasks a lane runs, or the
- * fold never fires before the end; 8 clears `mixed_fanin32_1024`, the smallest
- * measured shape at about 9 tasks per lane.
- */
-inline constexpr uint64_t PERCOUNTER_COMPLETION_BATCH = 8;
-
 /** How often a spinning lane looks at the exit register and the error word. */
 inline constexpr uint32_t PERCOUNTER_SPIN_CHECK_INTERVAL = 64;
 
@@ -413,7 +401,6 @@ struct PercounterLaneState {
     int32_t shared_head{-1};
     uint32_t batch{1};
     uint32_t idle_passes{0};
-    uint64_t local_done{0};
     uint64_t async_head{0};
     int64_t proven_task{-1};
     int32_t committed{-1};
@@ -637,13 +624,6 @@ struct PercounterCandidate {
     bool finished{false};
 };
 
-inline __aicore__ void percounter_flush_done(const LaneConfig &cfg, PercounterLaneState *state) {
-    ProfileScope profile_scope(cfg.scalar, ProfilePhase::FlushDone);
-    if (state->local_done == 0) return;
-    percounter_gm_fetch_add_issue(cfg.control->completed_block_count, state->local_done);
-    state->local_done = 0;
-}
-
 inline __aicore__ bool percounter_clear_mix_signal(const LaneConfig &cfg, uint64_t timeout_cycles) {
     if (cfg.mix_task_count == 0) return true;
     auto *ready = cfg.mix_signal_ready + cfg.cluster_index;
@@ -846,7 +826,6 @@ percounter_complete_mix(const LaneConfig &cfg, PercounterLaneState *state, const
         if (!percounter_resolve(cfg, id, &task)) return false;
         percounter_publish_completion(cfg, task, completion, count);
     }
-    ++state->local_done;
     percounter_ssbuf_store_release(&record->completed, c.generation);
     state->shared_active &= ~(1U << c.index);
     state->shared_head = -1;
@@ -1456,8 +1435,6 @@ inline __aicore__ bool percounter_step(const LaneConfig &cfg, PercounterLaneStat
             percounter_publish_completion(cfg, state->slots[selected.index].task, completion, uint64_t{1});
             state->occupied &= ~(1U << selected.index);
             if (state->slots[selected.index].claim_index != UINT32_MAX) state->revisit |= 1U << selected.index;
-            ++state->local_done;
-            if (state->local_done >= PERCOUNTER_COMPLETION_BATCH) percounter_flush_done(cfg, state);
             *executed = true;
             state->idle_passes = 0;
             return true;
@@ -1507,10 +1484,8 @@ inline __aicore__ bool percounter_step(const LaneConfig &cfg, PercounterLaneStat
             if (!deferred) percounter_publish_completion(cfg, *task, completion, uint64_t{1});
             state->occupied &= ~(1U << selected.index);
             if (state->slots[selected.index].claim_index != UINT32_MAX) state->revisit |= 1U << selected.index;
-            ++state->local_done;
             if (is_cohort) state->committed = -1;
         }
-        if (state->local_done >= PERCOUNTER_COMPLETION_BATCH) percounter_flush_done(cfg, state);
         percounter_commit_task_timing(cfg);
         *executed = true;
         state->idle_passes = 0;
@@ -1566,14 +1541,16 @@ inline __aicore__ void percounter_lane_loop(LaneConfig &cfg) {
         if constexpr (profile_compiled) {
             if (cfg.scalar != nullptr) cfg.scalar->end_iteration(executed);
         }
+        // A lane ends its own scheduling once its local obligations are
+        // drained; that is a statement about this lane, not about the graph.
         if (percounter_lane_quiescent(cfg, state)) break;
         if ((iterations % PERCOUNTER_SPIN_CHECK_INTERVAL) != 0) continue;
-        percounter_flush_done(cfg, &state);
-        // AICPU owns global completion and progress timeout; lanes observe its
-        // EXIT and peer failures while servicing their local obligations.
+        // The AICPU decides when the graph is done and how long a stall may
+        // last: it signals EXIT once every top-level sink has completed and
+        // every deferred record has settled. A lane publishes task completion
+        // and nothing else, and holds no whole-graph judgement of its own.
         if (percounter_should_stop(cfg)) break;
     }
-    percounter_flush_done(cfg, &state);
     percounter_commit_task_timing(cfg);
 }
 

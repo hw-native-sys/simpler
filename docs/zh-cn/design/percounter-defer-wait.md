@@ -83,11 +83,14 @@ notifier 仍未领取。
 两者均单调；每条 defer 记录使用这两次共享进度原子操作。
 任务和 shell 自身的计数器仍按现有发布规则更新。
 
-AICPU 先读取 `completed_block_count`，再检查异步计数。
-只有全部物理 block 已运行且 `async_registered == async_settled` 才允许结束。
-登记分配发生在对应 block 计数发布之前，因此末尾任务的条件不会漏查。
-没有 pending 记录的 lane 可按原 MIX/cohort 退出条件离开；拥有 pending 的 lane 留在 checkpoint。
-看门狗使用单调完成进度；条件永不满足时报告运行时超时。
+AICPU 观察全部顶层 sink 的完成组件，再检查异步计数。
+完成组件随本轮上传镜像预置，因此读到正值即属于本轮。
+只有全部顶层 sink 已发布且 `async_registered == async_settled` 才允许结束。
+登记分配发生在对应完成发布之前，因此末尾任务的条件不会漏查。
+lane 自身不判断整图完成：拥有 pending 的 lane 继续留在 checkpoint，所有 lane 都服务候选、记录与 defer，
+直到观察到 EXIT 或错误。
+看门狗的快路径是 sink 进度与异步计数；两者同时停滞时扫描全图完成组件确认是否真的没有进展，
+条件永不满足时报告运行时超时。
 
 登记错误、非法 token、条件溢出沿现有错误通道返回，不能发布为成功。
 异常终止不代表外部通信引擎已经完成；通信资源仍遵守平台的 teardown 证明。

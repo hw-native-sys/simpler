@@ -431,7 +431,10 @@ inline __aicore__ bool percounter_order_is_spmd(uint64_t entry) {
  */
 struct alignas(128) PercounterControl {
     uint64_t task_count;
-    uint64_t executable_block_count;
+    // Top-level sinks: the tasks no task in the table consumes. Every task
+    // reaches one along consumer edges, so their completion covers the graph.
+    uint64_t sink_count;
+    uint64_t sinks_offset;
     uint64_t edge_count;
     uint64_t order_count[PERCOUNTER_CORE_TYPE_COUNT];
     uint64_t orders_offset[PERCOUNTER_CORE_TYPE_COUNT];
@@ -484,30 +487,21 @@ struct alignas(128) PercounterControl {
     uint32_t first_boundary_segment[PERCOUNTER_SYNC_DOMAIN_COUNT];
     uint64_t completion_sectors_offset;
 
-    // Progress atomics do not share the immutable configuration or lane_error.
-    alignas(128) uint64_t completed_block_count;
-    uint8_t resolved_reserved[120];
-
     // Allocation precedes the corresponding block's completed publication.
     // Both counters are monotone; equality after all blocks ran permits exit.
     alignas(128) uint64_t async_registered;
     uint64_t async_settled;
     uint8_t async_reserved[112];
 };
-static_assert(sizeof(PercounterControl) == 768);
-static_assert(offsetof(PercounterControl, completed_block_count) == 512);
+static_assert(sizeof(PercounterControl) == 640);
 static_assert(
-    offsetof(PercounterControl, async_registered) % 128 == 0 &&
-        offsetof(PercounterControl, async_registered) / 128 != offsetof(PercounterControl, completed_block_count) / 128,
-    "the deferred-group counts are atomics and own their line"
+    offsetof(PercounterControl, async_registered) % 128 == 0,
+    "the deferred-group counts are the atomics lanes write; they must start a cache line, or every reader of "
+    "their neighbours pays for it"
 );
 static_assert(
-    offsetof(PercounterControl, completed_block_count) % 128 == 0,
-    "the one field lanes write must start a cache line, or every reader of its neighbours pays for it"
-);
-static_assert(
-    offsetof(PercounterControl, lane_error) / 128 != offsetof(PercounterControl, completed_block_count) / 128,
-    "lane_error is read every task; it must not share a line with the counter lanes increment"
+    offsetof(PercounterControl, lane_error) / 128 != offsetof(PercounterControl, async_registered) / 128,
+    "lane_error is read every task; it must not share a line with the counts lanes increment"
 );
 static_assert(std::is_trivially_copyable_v<PercounterControl> && std::is_standard_layout_v<PercounterControl>);
 
