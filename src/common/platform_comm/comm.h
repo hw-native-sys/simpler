@@ -38,14 +38,17 @@ extern "C" {
 
 typedef struct CommHandle_ *CommHandle;
 
+typedef enum CommCcuMode { COMM_CCU_MODE_MS = 0, COMM_CCU_MODE_SCHED = 1 } CommCcuMode;
+
 // Host-side options copied through the domain-allocation control request.
 typedef struct CommWorkspaceConfig {
     uint32_t urma_jetties_per_aiv;
     uint32_t urma_sq_depth;
+    uint32_t ccu_mode;
 } CommWorkspaceConfig;
 #ifdef __cplusplus
 static_assert(std::is_trivially_copyable_v<CommWorkspaceConfig> && std::is_standard_layout_v<CommWorkspaceConfig>);
-static_assert(sizeof(CommWorkspaceConfig) == 8);
+static_assert(sizeof(CommWorkspaceConfig) == 12);
 #endif
 // Internal callable execution controls: activate=1, stop/poll=3, abort=4, discard preparation=7.
 int comm_control_ccu_run(CommHandle h, uint64_t registration_id, uint32_t operation, uint64_t generation);

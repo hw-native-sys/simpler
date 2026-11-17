@@ -31,7 +31,7 @@ bool HcommDomainChannels::close() {
     return true;
 }
 void create_hcomm_domain_channels(
-    HcclComm, uint64_t, const std::vector<uint32_t> &, uint32_t, std::shared_ptr<HcommDomainChannels> &
+    HcclComm, uint64_t, const std::vector<uint32_t> &, uint32_t, std::shared_ptr<HcommDomainChannels> &, CommCcuMode
 ) {
     assert(false && "URMA-only fixture must not create CCU channels");
 }

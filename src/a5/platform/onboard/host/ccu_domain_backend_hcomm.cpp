@@ -50,6 +50,24 @@ void check(int code, const char *operation) {
     if (code != 0) fail(operation, code);
 }
 
+uint32_t hccl_expansion_mode(CommCcuMode mode) {
+    // HcclCommConfig uses 5/6, distinct from the HcclOpExpansionMode enum values.
+    switch (mode) {
+    case COMM_CCU_MODE_MS:
+        return 5;
+    case COMM_CCU_MODE_SCHED:
+        return 6;
+    }
+    throw std::invalid_argument("invalid CCU mode");
+}
+
+void check_communicator(int code, const char *operation, CommCcuMode mode) {
+    if (code != 0) {
+        const std::string context = std::string(operation) + " mode=" + (mode == COMM_CCU_MODE_MS ? "ms" : "sched");
+        fail(context.c_str(), code);
+    }
+}
+
 CcuResult probe_channel_die(const ChannelHandle *channel) { return CcuNotifyWait(*channel, 0, 1); }
 
 std::string sibling_trigger_binary() {
@@ -419,15 +437,16 @@ bool HcommDomainChannels::close() {
 
 void create_hcomm_domain_channels(
     HcclComm base, uint64_t allocation_id, const std::vector<uint32_t> &ranks, uint32_t rank,
-    std::shared_ptr<HcommDomainChannels> &result
+    std::shared_ptr<HcommDomainChannels> &result, CommCcuMode mode
 ) {
     if (!base || ranks.size() < 2 || ranks.size() > SIMPLER_CCU_MAX_RANKS || rank >= ranks.size())
         throw std::invalid_argument("invalid CCU domain channels");
     if (result) throw std::invalid_argument("CCU domain channels already exist");
-    result = std::make_shared<HcommDomainChannels>();
     HcclCommConfig config{};
     HcclCommConfigInit(&config);
-    config.hcclOpExpansionMode = 5;
+    config.hcclOpExpansionMode = hccl_expansion_mode(mode);
+    result = std::make_shared<HcommDomainChannels>();
+    result->mode = mode;
     // URMA uses the default child name for the same allocation ID. Keep CCU's
     // topology distinct, including across different parent communicators.
     char parent_name[COMM_NAME_MAX_LENGTH]{};
@@ -439,11 +458,11 @@ void create_hcomm_domain_channels(
     std::copy(name.begin(), name.end(), config.hcclCommName);
     config.hcclCommName[name.size()] = '\0';
     auto members = ranks;
-    check(
+    check_communicator(
         HcclCreateSubCommConfig(
             &base, members.size(), members.data(), allocation_id, rank, &config, &result->communicator
         ),
-        "HcclCreateSubCommConfig(CCU)"
+        "HcclCreateSubCommConfig(CCU)", mode
     );
     try {
         result->channels = acquire_peer_channels(result->communicator, rank, ranks.size());
@@ -514,18 +533,20 @@ std::vector<HcommPreparedMission> prepare_hcomm_ccu_callable(
             // ownership before that call so the registration keeps it reachable.
             backend->owns_channels = true;
             backend->owns_registration_communicator = false;
-            create_hcomm_domain_channels(base_communicator, domain_id, rank_ids, domain_rank, backend->shared_channels);
+            create_hcomm_domain_channels(
+                base_communicator, domain_id, rank_ids, domain_rank, backend->shared_channels, COMM_CCU_MODE_SCHED
+            );
         }
         const auto &channels = backend->shared_channels;
         if (backend->owns_registration_communicator) {
             HcclCommConfig config{};
             HcclCommConfigInit(&config);
-            config.hcclOpExpansionMode = 5;
+            config.hcclOpExpansionMode = hccl_expansion_mode(channels->mode);
             // Program resources are local; channels retain the full ordered domain topology.
             uint32_t member = rank_ids[domain_rank];
-            check(
+            check_communicator(
                 HcclCreateSubCommConfig(&base_communicator, 1, &member, domain_id, 0, &config, &backend->communicator),
-                "HcclCreateSubCommConfig(local CCU registration)"
+                "HcclCreateSubCommConfig(local CCU registration)", channels->mode
             );
             LOG_INFO(
                 "[ccu] local registration context=%llu base_rank=%u domain_rank=%u domain_size=%zu",

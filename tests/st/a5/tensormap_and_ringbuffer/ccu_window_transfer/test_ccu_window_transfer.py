@@ -13,6 +13,7 @@ import struct
 from pathlib import Path
 
 import pytest
+from simpler import CcuConfig, UrmaConfig
 from simpler.task_interface import CommBufferSpec, DataType, TaskArgs, TensorArgType
 from simpler.worker import Worker
 
@@ -22,7 +23,13 @@ from tests.st.a5.tensormap_and_ringbuffer.ccu_native_domain.test_ccu_native_doma
 @pytest.mark.platforms(["a5"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)
-@pytest.mark.parametrize("workspace_engines", [("ccu",), ("ccu", "urma")])
+@pytest.mark.parametrize(
+    "workspace_engines",
+    [
+        pytest.param({"ccu": CcuConfig()}, id="default"),
+        pytest.param({"ccu": CcuConfig(mode="sched"), "urma": UrmaConfig()}, id="sched-urma"),
+    ],
+)
 def test_ccu_real_window_transfer(st_platform, st_device_ids, tmp_path, request, workspace_engines):
     _exercise_window_transfer(
         st_platform, st_device_ids[:2], tmp_path, request, (0, 1), workspace_engines=workspace_engines
@@ -60,12 +67,14 @@ def _exercise_window_transfer(
     runtime="tensormap_and_ringbuffer",
     member_sets=None,
     masks=(3,),
-    workspace_engines=("ccu",),
+    workspace_engines=None,
 ):
     rounds = request.config.getoption("--rounds")
     assert rounds > 0
     member_sets = member_sets or (members,)
     rounds = max(2 * len(member_sets), len(masks), rounds)
+    if workspace_engines is None:
+        workspace_engines = ("ccu",)
     target = _build_callable(tmp_path, source_root=Path(__file__).resolve().parent, runtime=runtime)
     worker = Worker(
         level=3,

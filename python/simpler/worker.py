@@ -963,16 +963,16 @@ _COMM_HOST_PREPARE_MARKER_RE = re.compile(
     + r"_alloc_[0-9]+_host_(?:ready|failed)_[0-9a-f]{1,16}_[0-9]+\.ready(?:\.tmp)?"
 )
 
-# Domain-allocation request shm layout: 40-byte header + buffer_nbytes (u64) +
+# Domain-allocation request shm layout: 48-byte header + buffer_nbytes (u64) +
 # rank_ids (u32).  Buffer specs first so they remain 8-byte aligned regardless
 # of rank_count parity; rank_ids come last (u32 has no alignment concern).
-_DOMAIN_REQ_HEADER = struct.Struct("<QIIQI12x")
+_DOMAIN_REQ_HEADER = struct.Struct("<QIIQI20x")
 # fields: allocation_id (u64), rank_count (u32), domain_rank (u32),
 #         window_size (u64), buffer_count (u32), workspace_mask (u32),
-#         urma_jetties_per_aiv (u32), urma_sq_depth (u32)
-assert _DOMAIN_REQ_HEADER.size == 40
-_DOMAIN_URMA_CONFIG_OFFSET = 32
-_DOMAIN_URMA_CONFIG = struct.Struct("<II")
+#         urma_jetties_per_aiv (u32), urma_sq_depth (u32), ccu_mode (u32), padding (4 bytes)
+assert _DOMAIN_REQ_HEADER.size == 48
+_DOMAIN_WORKSPACE_CONFIG_OFFSET = 32
+_DOMAIN_WORKSPACE_CONFIG = struct.Struct("<III")
 _DOMAIN_WORKSPACE_MASK_OFFSET = struct.calcsize("<QIIQI")
 
 # Domain-allocation reply shm layout: 40-byte header + buffer_ptrs (u64).
@@ -2930,7 +2930,9 @@ def _handle_ctrl_alloc_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_han
     try:
         (allocation_id, rank_count, domain_rank, window_size, buffer_count) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
         workspace_mask = struct.unpack_from("<I", req_buf, _DOMAIN_WORKSPACE_MASK_OFFSET)[0]
-        urma_jetties, urma_sq_depth = _DOMAIN_URMA_CONFIG.unpack_from(req_buf, _DOMAIN_URMA_CONFIG_OFFSET)
+        urma_jetties, urma_sq_depth, ccu_mode = _DOMAIN_WORKSPACE_CONFIG.unpack_from(
+            req_buf, _DOMAIN_WORKSPACE_CONFIG_OFFSET
+        )
         # Layout: header | buffer_nbytes[buffer_count] (u64) | rank_ids[rank_count] (u32)
         nbytes_offset = _DOMAIN_REQ_HEADER.size
         nbytes_struct = struct.Struct(f"<{buffer_count}Q") if buffer_count else struct.Struct("")
@@ -2966,6 +2968,7 @@ def _handle_ctrl_alloc_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_han
             **({"host_shm_name": host_shm_name} if host_shm_name else {}),
             urma_jetties_per_aiv=urma_jetties,
             urma_sq_depth=urma_sq_depth,
+            ccu_mode=ccu_mode,
         )
 
         # Carve buffer pointers sequentially inside the local window.
@@ -10082,11 +10085,14 @@ class Worker:
     def _start_hierarchical(self) -> None:  # noqa: PLR0912, PLR0915 -- local fork loops and remote activation share one startup deadline
         """Start every local child, await the subtree, register endpoints, start the scheduler.
 
-        Called only by init(), which owns the lifecycle state. Any failure here
+        Called by init(), which owns the lifecycle state. Repeated calls after
+        the hierarchy reaches READY have no effect. Any startup failure here
         propagates to init(), whose single rollback entry (_cleanup_partial_init)
         closes the C++ Worker (if the scheduler started) and tears the whole
         epoch down. The readiness barriers raise on any child failure/exit/hang.
         """
+        if self._hierarchical_started:
+            return
         if self._mpi_direct_session is not None:
             self._check_mpi_controller_children()
         device_ids = self._config.get("device_ids", [])
@@ -11259,6 +11265,7 @@ class Worker:
                         ),
                         urma_jetties_per_aiv=config.urma_config().jetties_per_aiv,
                         urma_sq_depth=config.urma_config().sq_depth,
+                        ccu_mode=("ms", "sched").index(config.ccu_config().mode),
                     )
                     handle.retain_after_run = config.retain_after_run
                     handle.members = tuple(
@@ -11622,6 +11629,7 @@ class Worker:
         memory_source: AddressSpace = AddressSpace.DEVICE,
         urma_jetties_per_aiv: int = 1,
         urma_sq_depth: int = 0,
+        ccu_mode: int = 1,
     ) -> CommDomainHandle:
         # Admission is the run() lease that the driving orchestrator holds;
         # validation checks resource presence rather than the public lifecycle,
@@ -11690,8 +11698,8 @@ class Worker:
                         _DOMAIN_WORKSPACE_MASK_OFFSET,
                         workspace_mask,
                     )
-                    _DOMAIN_URMA_CONFIG.pack_into(
-                        req_buf, _DOMAIN_URMA_CONFIG_OFFSET, urma_jetties_per_aiv, urma_sq_depth
+                    _DOMAIN_WORKSPACE_CONFIG.pack_into(
+                        req_buf, _DOMAIN_WORKSPACE_CONFIG_OFFSET, urma_jetties_per_aiv, urma_sq_depth, ccu_mode
                     )
                     nbytes_off = _DOMAIN_REQ_HEADER.size
                     if buffer_count:

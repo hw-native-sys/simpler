@@ -19,6 +19,7 @@ from _task_interface import AddressSpace
 
 from ._host_exports import HostSharedMemory, seal_host_mappings  # noqa: F401 -- shared public cleanup helper
 from .workspace_config import (
+    CcuConfig,
     UrmaConfig,
     WorkspaceEngineConfig,
     normalize_workspace_configs,
@@ -110,6 +111,12 @@ class DomainConfig:
             if isinstance(config, UrmaConfig):
                 return config
         return UrmaConfig()
+
+    def ccu_config(self) -> CcuConfig:
+        for _, config in self.workspace_configs:
+            if isinstance(config, CcuConfig):
+                return config
+        return CcuConfig()
 
     def workspace_mask(self) -> int:
         return sum(1 << ("sdma", "urma", "rdma", "ccu").index(name) for name in self.workspace_engines)

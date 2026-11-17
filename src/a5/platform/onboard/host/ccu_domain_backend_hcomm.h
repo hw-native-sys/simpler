@@ -20,18 +20,20 @@
 #include "hccl/hccl_comm.h"
 #include "ccu_run_lifecycle_hcomm.h"
 #include "platform_comm/ccu/ccu_domain_owner.h"
+#include "platform_comm/comm.h"
 
 namespace simpler::ccu {
 
 struct HcommDomainChannels {
     HcclComm communicator{};
+    CommCcuMode mode{COMM_CCU_MODE_SCHED};
     uint32_t die{};
     std::array<uint64_t, SIMPLER_CCU_MAX_RANKS> channels{};
     bool close();
 };
 void create_hcomm_domain_channels(
     HcclComm base, uint64_t allocation_id, const std::vector<uint32_t> &ranks, uint32_t rank,
-    std::shared_ptr<HcommDomainChannels> &result
+    std::shared_ptr<HcommDomainChannels> &result, CommCcuMode mode
 );
 
 bool query_window_token(uint64_t address, uint64_t size, uint64_t &token);

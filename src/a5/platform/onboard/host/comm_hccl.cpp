@@ -132,7 +132,7 @@ struct DomainAllocation {
     bool host_registered = false;
     bool initialized = false;
     bool cleanup_failed = false;
-    CommWorkspaceConfig workspace_config{1, 0};
+    CommWorkspaceConfig workspace_config{1, 0, COMM_CCU_MODE_SCHED};
     uint32_t urma_aiv_count = pto::comm::urma::kUrmaAutoAivCount;
     CcuCallableRegistration *ccu = nullptr;
     std::shared_ptr<simpler::ccu::HcommDomainChannels> ccu_channels;
@@ -1769,7 +1769,7 @@ static int domain_alloc_via_ipc(
     if (ccu_requested) {
         simpler::ccu::create_hcomm_domain_channels(
             h->hccl_comm, allocation_id, std::vector<uint32_t>(rank_ids, rank_ids + rank_count), domain_rank,
-            out->ccu_channels
+            out->ccu_channels, static_cast<CommCcuMode>(out->workspace_config.ccu_mode)
         );
         std::vector<CommCcuWindow> windows;
         for (size_t i = 0; i < peers.size(); ++i) {
@@ -2137,7 +2137,12 @@ static int allocate_domain_windows(
     if (urma_requested && !validate_urma_ranks(h, rank_ids, rank_count, host_shm_name != nullptr)) {
         return COMM_DOMAIN_URMA_CONFIG_INVALID;
     }
-    const CommWorkspaceConfig config = workspace_config ? *workspace_config : CommWorkspaceConfig{1, 0};
+    const CommWorkspaceConfig config =
+        workspace_config ? *workspace_config : CommWorkspaceConfig{1, 0, COMM_CCU_MODE_SCHED};
+    if (config.ccu_mode > COMM_CCU_MODE_SCHED) {
+        LOG_ERROR("[comm rank %d] alloc_domain: invalid CCU mode %u", h->rank, config.ccu_mode);
+        return -1;
+    }
     const uint32_t jetties = config.urma_jetties_per_aiv;
     const uint32_t depth = config.urma_sq_depth;
     if (jetties == 0 || jetties > pto::comm::urma::kUrmaMaxJettiesPerCore ||
