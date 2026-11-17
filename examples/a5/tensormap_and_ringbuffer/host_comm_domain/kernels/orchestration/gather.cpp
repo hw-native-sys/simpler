@@ -25,16 +25,16 @@ __attribute__((visibility("default"))) void host_comm_domain(const ChipTaskArgs 
     CoreTaskArgs gather;
     gather.add_input(args.tensor(0).ref());
     gather.add_output(args.tensor(1).ref());
-    gather.add_output(args.tensor(2).ref());
     gather.add_scalar(args.scalar<uint64_t>(0));
-    const auto blocks = args.scalar<int32_t>(1);
+    gather.add_scalar(args.scalar<uint64_t>(1));
+    const auto blocks = args.scalar<int32_t>(2);
     gather.launch_spec.set_block_num(static_cast<int16_t>(blocks));
     gather.launch_spec.set_require_sync_start(blocks > 1);
     rt_submit_aiv_task(0, gather);
 
     CoreTaskArgs consume;
-    consume.add_input(args.tensor(2).ref());
-    consume.add_output(args.tensor(3).ref());
+    consume.add_input(args.tensor(1).ref());
+    consume.add_output(args.tensor(2).ref());
     rt_submit_aiv_task(1, consume);
 }
 }

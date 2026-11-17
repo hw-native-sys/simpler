@@ -147,10 +147,12 @@ rollback releases the partial allocation.
 
 ### A5 Host-source windows
 
-L3 A5 `tensormap_and_ringbuffer` domains accept `memory_source=AddressSpace.HOST`.
+L3 A5 `tensormap_and_ringbuffer`, `host_build_graph`, and `percounter` domains
+accept `memory_source=AddressSpace.HOST` with `workspace_engines=()` for
+synchronous peer MTE reads on PR and DT.
 The default remains `AddressSpace.DEVICE`. Each participating L2 owns independent
 Host shared memory, maps it to its Device, and optionally registers an URMA
-workspace with `workspace_engines=("urma",)`. Other Host workspace engines and
+workspace with `workspace_engines=("urma",)` on TMR. Other Host workspace engines and
 L4 Host domains are rejected before allocation.
 
 The L3 creator accesses the rank's entire Host window through
@@ -158,8 +160,11 @@ The L3 creator accesses the rank's entire Host window through
 `domain.buffer_range(name)`. Its `.tensor(...)` already addresses the named
 slice through the owning Device's mapping. L2 owns allocation and unlink;
 L3 borrows the `SharedMemory` mapping until domain release. CPU access is explicit and
-requires ordering against Device tasks. Peer reads use the domain URMA workspace;
-only the local `windowsIn`/`windowsOut` entry is populated. Host and Device domains
+requires ordering against Device tasks. With an empty workspace list, each requester
+imports peer Host windows and registers its own Device mappings, indexed by
+domain member order in `windowsIn`. Only local `windowsOut` is populated.
+A Host-source URMA domain leaves every `windowsIn` entry zero, including the local rank.
+Kernels address asynchronous reads using the peer MR in the URMA workspace and the named buffer offset. Host and Device domains
 share the same retention, reuse checks, failure policy, and release fences.
 
 See [A5 Host-source domains](a5-host-comm-domain.md) for initialization, kernel

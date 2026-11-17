@@ -257,16 +257,37 @@ def test_basic_window_issues_no_explicit_access(host_resource_binary):
         "host_coexist",
         "host_register",
         "host_pointer",
+        "host_peer_register",
+        "host_peer_pointer",
         "host_workspace",
         "host_context",
         "host_collision",
         "host_invalid",
         "host_unregister",
+        "host_local_unregister",
         "host_unregister_abort",
         "host_unregister_destroy",
     ],
 )
 def test_host_domain_backing_and_native_failure_ownership(host_resource_binary, scenario):
+    subprocess.run([str(host_resource_binary), scenario], check=True, timeout=20)
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "host_mte",
+        "host_mte_missing",
+        "host_mte_rank",
+        "host_mte_size",
+        "host_mte_register",
+        "host_mte_pointer",
+        "host_mte_context",
+        "host_mte_throw",
+        "host_mte_unregister",
+    ],
+)
+def test_host_mte_peer_windows_and_failure_ownership(host_resource_binary, scenario):
     subprocess.run([str(host_resource_binary), scenario], check=True, timeout=20)
 
 
