@@ -37,7 +37,7 @@ direct `Worker` communication-domain walkthrough from construction through
 
 | Example | Mechanism |
 | ------- | --------- |
-| [`sdma_async_completion_demo/`](sdma_async_completion_demo/) | `TGET_ASYNC` from a peer's window slot over SDMA, completion registered via `defer_pto_async_event`. Enabled by default on a5 onboard. |
+| [`sdma_async_completion_demo/`](sdma_async_completion_demo/) | `send_request_entry(async_ctx, SdmaTget(...))` submits an asynchronous SDMA GET from a peer's window slot and registers completion internally. Enabled by default on a5 onboard; A5 PUT uses a synchronous fallback (see the demo's GET/PUT comparison). |
 | [`urma_deferred_completion_demo/`](urma_deferred_completion_demo/) | The same protocol over **URMA** — `kernel_consumer.cpp` is byte-identical to the SDMA demo's, so the transport is the only variable. The two overlays are **mutually exclusive in one build**, so comparing them means rebuilding. |
 
 The cross-architecture notification-counter and deferred-notify watchdogs live
