@@ -31,7 +31,6 @@ enum class ProfilePhase : uint8_t {
     Idle,
     Aggregate,
     AsyncPoll,
-    FlushDone,
     LaneSetup,
     AsyncSeal,
     AtomicFetchAdd,
@@ -86,8 +85,6 @@ constexpr const char *profile_phase_name(ProfilePhase kind) {
         return "scalar_percounter_complete_mix";
     case ProfilePhase::AsyncPoll:
         return "scalar_percounter_async_tick";
-    case ProfilePhase::FlushDone:
-        return "scalar_percounter_flush_done";
     case ProfilePhase::LaneSetup:
         return "scalar_run_percounter_lane";
     case ProfilePhase::AsyncSeal:

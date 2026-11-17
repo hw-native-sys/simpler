@@ -48,6 +48,10 @@ struct PercounterLayout {
     uint64_t orders_offset[PERCOUNTER_CORE_TYPE_COUNT];
     uint64_t fanin_offset;
     uint64_t fanin_addr_offset;
+    // One `(task << 1) | partitioned` reference per top-level sink, in the
+    // uploaded prefix because only the AICPU reads them. Reserved for every
+    // table task, which is the bound a graph with no edges reaches.
+    uint64_t sinks_offset;
     uint64_t counters_offset;
     uint64_t completion_sectors_offset;
     uint64_t dispatch_payloads_offset;
@@ -245,6 +249,7 @@ inline bool plan_layout(
           ))) ||
         !PERCOUNTER_RESERVE(table_task_count, PercounterFanin, fanin_offset) ||
         !PERCOUNTER_RESERVE(edge_count, uint64_t, fanin_addr_offset) ||
+        !PERCOUNTER_RESERVE(table_task_count, uint64_t, sinks_offset) ||
         !PERCOUNTER_RESERVE(
             static_cast<uint64_t>(SCHEDULER_WORKER_CAPACITY) * PERCOUNTER_PAYLOAD_SLOT_COUNT, DispatchPayload,
             dispatch_payloads_offset
@@ -475,11 +480,20 @@ inline bool build_tables(
     for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l)
         eligible[l].reserve(static_cast<size_t>(list_count[l]));
     uint64_t edge_cursor = 0;
+    // Set by the fanin walk below. What it leaves clear is a top-level sink:
+    // no task in the table waits on it, so nothing but its own completion
+    // reports that its branch of the graph is finished.
+    std::vector<bool> consumed(static_cast<size_t>(task_count), false);
+    // A multi-block task publishes into partitioned sectors; the forms that
+    // publish once do not. Fanin and sink references resolve the same producer
+    // the same way, so both ask here.
+    const auto partitioned = [](const TaskInput &source) {
+        return source.block_num > 1 && !source.inline_completed && !source.published_off_lane &&
+               source.graph_invocation < 0;
+    };
     // Entries, checked against the plan as the walk goes, so an overlong list
     // fails on the task that overran it.
     uint64_t entries[PERCOUNTER_LIST_COUNT] = {};
-    // SPMD boundaries allocate blocks through task-private counters.
-    uint64_t executable_blocks = 0;
     uint64_t boundary_tasks = 0;
     uint64_t mix_tasks = 0;
     uint64_t sync_cohorts = 0;
@@ -527,9 +541,8 @@ inline bool build_tables(
             fanin_addr[edge_cursor] =
                 device_base + layout.counters_offset + static_cast<uint64_t>(producer) * sizeof(PercounterCounter);
             const auto &source = tasks[producer];
-            if (source.block_num > 1 && !source.inline_completed && !source.published_off_lane &&
-                source.graph_invocation < 0)
-                fanin_addr[edge_cursor] |= PERCOUNTER_COMPLETION_PARTITIONED;
+            if (partitioned(source)) fanin_addr[edge_cursor] |= PERCOUNTER_COMPLETION_PARTITIONED;
+            consumed[static_cast<size_t>(producer)] = true;
             ++edge_cursor;
         }
 
@@ -553,7 +566,6 @@ inline bool build_tables(
             const HostGraphTemplate &tmpl = template_of(task);
             // Published by its body's sinks, one add per sink subtask.
             counters[id].value = percounter_counter_preset(static_cast<int64_t>(tmpl.sink_subtask_total));
-            executable_blocks += tmpl.executable_blocks;
             boundary_tasks += tmpl.boundary_task_count;
             mix_tasks += tmpl.mix_task_count;
             sync_cohorts += tmpl.sync_cohort_count;
@@ -566,8 +578,8 @@ inline bool build_tables(
         }
         if (task.published_off_lane) {
             // Preset and left unpublished: its consumers wait, and whatever runs
-            // it off-lane walks the counter up. It contributes no executable
-            // block, which is what the AICPU's progress watchdog counts.
+            // it off-lane walks the counter up. No lane carries it, so it is in
+            // no order list.
             counters[id].value = percounter_counter_preset(static_cast<int64_t>(task.block_num) * task.subtask_count);
             continue;
         }
@@ -582,7 +594,6 @@ inline bool build_tables(
         const uint64_t placed = 1;
         if (task.block_num > 1 || task.is_mix) ++boundary_tasks;
         if (task.is_mix) ++mix_tasks;
-        executable_blocks += static_cast<uint64_t>(task.block_num);
         if (task.sync_start) {
             ++sync_cohorts;
         }
@@ -594,6 +605,17 @@ inline bool build_tables(
         return fail(BuildStatus::ORDER_COUNT_MISMATCH, -1, -1);
     for (size_t k = 0; k < graph.invocation_count; ++k) {
         if (!invocation_seen[k]) return fail(BuildStatus::INVALID_ARGUMENT, graph.invocations[k].shell_task_id, -1);
+    }
+
+    // A Graph invocation is represented by its shell, whose counter is preset
+    // against every sink subtask of the body, so body tasks are not sinks of
+    // their own. An inline-completed sink is preset published and reads so at
+    // once.
+    auto *sinks = region_at<uint64_t>(base, layout.sinks_offset);
+    uint64_t sink_count = 0;
+    for (uint64_t id = 0; id < task_count; ++id) {
+        if (consumed[static_cast<size_t>(id)]) continue;
+        sinks[sink_count++] = (id << 1) | (partitioned(tasks[id]) ? PERCOUNTER_COMPLETION_PARTITIONED : uint64_t{0});
     }
 
     std::vector<ResourceOrderTask> order_tasks(task_count);
@@ -802,7 +824,8 @@ inline bool build_tables(
     }
     control->task_count = layout.task_count;
     control->table_task_count = task_count;
-    control->executable_block_count = executable_blocks;
+    control->sink_count = sink_count;
+    control->sinks_offset = layout.sinks_offset;
     control->edge_count = layout.edge_count;
     control->tickets_offset = layout.tickets_offset;
     control->mix_task_count = layout.mix_task_count;

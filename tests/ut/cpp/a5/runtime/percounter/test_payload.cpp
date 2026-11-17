@@ -199,15 +199,41 @@ struct Fixture {
         ASSERT_TRUE(percounter_step(cfg[lane], &state[lane], &executed));
         ASSERT_EQ(control->lane_error, 0U);
     }
-    void drain() {
-        for (int round = 0; round < 1000; ++round) {
-            for (int lane = 0; lane < 6; ++lane) {
-                step(lane);
-                percounter_flush_done(cfg[lane], &state[lane]);
+    // What the AICPU supervisor watches: every top-level sink published.
+    bool sinks_complete() const {
+        const auto *sinks =
+            reinterpret_cast<const uint64_t *>(reinterpret_cast<const uint8_t *>(control) + layout.sinks_offset);
+        for (uint64_t i = 0; i < control->sink_count; ++i) {
+            const uint64_t task = sinks[i] >> 1;
+            if ((sinks[i] & PERCOUNTER_COMPLETION_PARTITIONED) == 0) {
+                if (!percounter_counter_published(counters[task].value)) return false;
+                continue;
             }
-            if (control->completed_block_count == control->executable_block_count) return;
+            const auto *group = cfg[0].completion_sectors + task * PERCOUNTER_COMPLETION_SECTOR_COUNT;
+            for (uint32_t s = 0; s < PERCOUNTER_COMPLETION_SECTOR_COUNT; ++s)
+                if (!percounter_counter_published(group[s].value)) return false;
         }
-        FAIL() << "finite protocol did not retire every block";
+        return true;
+    }
+    // Steps every lane until `done`, which is the event the case is about:
+    // whole-graph completion now waits on deferred settlement, so a case that
+    // leaves a condition unmet asks for the physical work it does expect.
+    template <typename Predicate>
+    void drain_until(Predicate done, const char *expected) {
+        for (int round = 0; round < 1000; ++round) {
+            for (int lane = 0; lane < 6; ++lane)
+                step(lane);
+            if (done()) return;
+        }
+        FAIL() << "finite protocol did not reach " << expected;
+    }
+    void drain() {
+        drain_until(
+            [this] {
+                return sinks_complete();
+            },
+            "every top-level sink complete"
+        );
     }
 };
 
@@ -683,8 +709,16 @@ TEST(PercounterAcquire, DeferredOddMixComponentOutlivesSharedRecordReuse) {
                 f.async_groups[lane].count = 1;
             }
         };
-        f.drain();
-        EXPECT_EQ(f.calls.size(), 6U * __builtin_popcount(mask));
+        const size_t executions = 6U * __builtin_popcount(mask);
+        // Task 1 is the sink that can complete; task 0 keeps one component
+        // withdrawn until its deferred condition is met below.
+        f.drain_until(
+            [&] {
+                return f.completed(1) && f.component(0, 0) == 1U;
+            },
+            "the undeferred sink and the odd component"
+        );
+        EXPECT_EQ(f.calls.size(), executions);
         EXPECT_EQ(f.component(0, 0), 1U);
         EXPECT_FALSE(f.completed(0)) << mask;
         f.expect_completed(1);
@@ -1163,14 +1197,13 @@ TEST(PercounterAcquire, OrdinarySpanDoesNotCloseFollowingMixBoundary) {
 
 TEST(PercounterAcquire, MissingClaimClosureHintsDoNotPreventProgress) {
     Fixture f({task(1, 7), task(7, 5), task(2, 9)});
-    for (int round = 0; round < 1000 && f.control->completed_block_count < f.control->executable_block_count; ++round) {
+    for (int round = 0; round < 1000 && !f.sinks_complete(); ++round) {
         for (int lane = 0; lane < 6; ++lane) {
             f.step(lane);
             f.cfg[lane].claim_summary[0].closed = 0;
-            percounter_flush_done(f.cfg[lane], &f.state[lane]);
         }
     }
-    EXPECT_EQ(f.control->completed_block_count, f.control->executable_block_count);
+    EXPECT_TRUE(f.sinks_complete());
     EXPECT_EQ(f.calls.size(), 31U);
     for (int task_id = 0; task_id < 3; ++task_id)
         f.expect_completed(task_id);
@@ -1736,7 +1769,6 @@ TEST(PercounterAcquire, DependencyOnlySpmdRetiresAndRevisitsWithoutPayload) {
     Fixture f({dependency});
     f.drain();
     EXPECT_TRUE(f.calls.empty());
-    EXPECT_EQ(f.control->completed_block_count, 5U);
     f.expect_completed(0);
 }
 
@@ -1759,8 +1791,6 @@ TEST(PercounterAcquire, ParticipatingPublisherRetiresWithoutRevisitingReturnedCu
         EXPECT_EQ(f.calls.size(), static_cast<size_t>(__builtin_popcount(mask)));
         EXPECT_EQ(f.state[1].mix_owned, 0U);
         EXPECT_EQ(f.signals[0].mix[0].generation, 2U);
-        percounter_flush_done(f.cfg[1], &f.state[1]);
-        EXPECT_EQ(f.control->completed_block_count, 1U);
     }
 }
 
@@ -1927,7 +1957,6 @@ TEST(PercounterAcquire, SupervisorExitDoesNotSettlePendingDeferredCompletion) {
     EXPECT_EQ(f.control->lane_error, 0U);
     EXPECT_EQ(f.control->async_registered, 1U);
     EXPECT_EQ(f.control->async_settled, 0U);
-    EXPECT_EQ(f.control->completed_block_count, 1U);
     EXPECT_FALSE(f.completed(0));
     EXPECT_FALSE(f.completed(1));
     EXPECT_EQ(f.calls.size(), 1U);
@@ -1957,8 +1986,6 @@ TEST(PercounterAcquire, LocallyExhaustedLaneReturnsBeforeOtherCoreTypeFinishes) 
     ASSERT_EQ(f.calls.size(), 1U);
     f.expect_completed(0);
     EXPECT_FALSE(f.completed(1));
-    EXPECT_EQ(f.control->completed_block_count, 1U);
-    EXPECT_EQ(f.control->executable_block_count, 2U);
     f.drain();
     EXPECT_EQ(f.calls.size(), 2U);
     f.expect_completed(1);
@@ -2434,7 +2461,7 @@ TEST(PercounterScalarStorage, CompactWordsPreserveTicksAndUseFullWidthForLongInt
     trace.window_start = 1000;
     trace.depth = 2;
     trace.append_memory(ProfilePhase::SsbufLoad, 1007, 1012);
-    EXPECT_EQ(words[0], UINT64_C(0x031c000500000007));
+    EXPECT_EQ(words[0], UINT64_C(0x031b000500000007));
     trace.append_memory(ProfilePhase::SsbufLoad, 2000, 2000 + uint64_t{UINT16_MAX} + 1);
     trace.append_memory(ProfilePhase::SsbufLoad, uint64_t{UINT32_MAX} + 1001, uint64_t{UINT32_MAX} + 1002);
     trace.depth = 127;
@@ -2555,8 +2582,11 @@ TEST(PercounterPayload, LaneEntryPublishesKernelWorkWindow) {
     uint64_t inside_kernel = 0;
     execute = [&](int64_t *) {
         inside_kernel = get_sys_cnt_aicore();
+        // The lane leaves on EXIT alone; the AICPU is what observes the sinks.
+        write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
     };
     const auto window = run_percounter_lane(f.control, 0, CoreType::AIC);
+    write_reg(RegId::DATA_MAIN_BASE, 0);
     ASSERT_EQ(f.control->lane_error, 0U);
     ASSERT_GT(inside_kernel, 0U);
     EXPECT_GT(window.start_cycle, 0U);
@@ -2647,8 +2677,11 @@ TEST(PercounterPayload, DeferredTimingDoesNotNeedStreamingBuffers) {
     execute = [&](int64_t *) {
         ++calls;
         EXPECT_EQ(count, 0U);
+        // The lane leaves on EXIT alone; the AICPU is what observes the sinks.
+        write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
     };
     percounter_lane_loop<0>(f.cfg[0]);
+    write_reg(RegId::DATA_MAIN_BASE, 0);
     EXPECT_EQ(calls, 1);
     EXPECT_TRUE(f.completed(0));
     EXPECT_EQ(f.control->lane_error, 0U);
@@ -2668,8 +2701,10 @@ TEST(PercounterPayload, ExhaustedTimingStorageDoesNotBlockCompletion) {
     int calls = 0;
     execute = [&](int64_t *) {
         ++calls;
+        write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
     };
     percounter_lane_loop<0>(f.cfg[0]);
+    write_reg(RegId::DATA_MAIN_BASE, 0);
     EXPECT_EQ(calls, 1);
     EXPECT_TRUE(f.completed(0));
     EXPECT_EQ(f.control->lane_error, 0U);
