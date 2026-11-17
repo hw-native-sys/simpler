@@ -1,5 +1,7 @@
 # A5 HBG 异步完成接口与数据布局
 
+**共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](../a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前实现、拟修改布局和未来 STARS 后端分别标明。
+
 [返回总览](../a5-hbg-async-completion.md)。本文定义 kernel 登记与 resident scheduler 之间的数据布局。
 
 ## 1. 登记接口
@@ -36,11 +38,11 @@ A5 HBG 的公开登记函数只使用当前 dispatch 的稳定 resident group。
 
 Host 已拥有展开后的普通任务和 Graph child 元数据，按 task/block/active lane 生成稳定索引。`AsyncTaskPlanInput` 只保存这些调度信息及内部容量，不携带额外资源身份。Host 每个逻辑 task 保存一个 40 B 的 `AsyncTaskHostPlan`，包含设备任务描述、三个 lane 的容量、条件区起点及每 block 的条件区步长；初始化时展开 block/lane，并复用一个 header 临时对象填充最终镜像，不为每个物理执行保存临时规划项或完整对齐 header 副本。输入 task ref 递增时不建立重复检查哈希表，其他顺序仍完整检查重复。Graph Definition、TensorData、task 参数和 callable 格式保持不变。
 
-基础实现为每个可执行物理执行预留既有上限 `MAX_COMPLETIONS_PER_TASK`，支持没有额外声明的现有 kernel。没有登记条件的执行封口后直接释放资源，不创建 CHECK 责任。预留容量与每轮初始化、上传范围分开：Host/Device backing 保留完整容量，但 `initialized_bytes` 只覆盖原调度状态及异步元数据、join、目录、SDMA guard、连续 header。token、CHECK/FINISH lease 与进度位于后缀，首次实际发布前由唯一写者初始化。Host 使用既有 pending metadata 路径上传此前缀，不清零或上传未使用后缀。空间、bind 和 H2D 成本分别计量，不将减少上传宣称为省掉全部预留内存。
+基础实现为每个可执行物理执行预留既有上限 `MAX_COMPLETIONS_PER_TASK`，支持没有额外声明的现有 kernel。没有登记条件的执行封口后直接释放资源，不创建 CHECK 责任。预留容量与每轮初始化、上传范围分开：Host/Device backing 保留完整容量，但 `initialized_bytes` 只覆盖原调度状态及异步元数据、join、目录、SDMA guard、连续 header。token、CHECK lease 与进度位于后缀，首次实际发布前由唯一写者初始化。Host 使用既有 pending metadata 路径上传此前缀，不清零或上传未使用后缀。空间、bind 和 H2D 成本分别计量，不将减少上传宣称为省掉全部预留内存。
 
-`SchedulerAsyncLayout` 为 128 B，保存 task→group 映射、连续 header 基址 `groups_offset`、lease、CHECK 进度、task join、FINISH 目录、活动位图及 run 活动标记的位置。offset 112 保存 activity_offset；标记独占 64 B 行，禁止与 cached 数据共用回写行。FINISH owner 持有 lease 直到全部后继同步传播完成；目录扫描游标位于 control state。lease、发布数据和 CHECK 进度分别隔离到 64 B cache line。
+`SchedulerAsyncLayout` 为 128 B，保存 task→group 映射、连续 header 基址 `groups_offset`、lease、CHECK 进度、task join、CHECK 目录及 run 活动标记的位置。offset 96 保存 activity_offset；标记独占 64 B 行，禁止与 cached 数据共用回写行。FINISH owner 由 join RMW 当次选出并直接完成任务，不另设 FINISH lease 或目录；CHECK 目录扫描游标位于 control state。这里的 64 B 是原布局的 DCache 维护粒度，不能作为新的 L2 侧争用隔离依据。后续 lease/join、独立目录竞争字及 SDMA guard 按 128 B 竞争单元隔离；发布数据和 owner 私有进度按真实 writer/reader 边界布局，不把每个只读字段都扩成一行。
 
-SDMA 提交互斥字在 Host 初始化为零，只在运行中使用原子操作；SDK 的 session/postId/SQ 状态仍使用原 workspace。32 个实际 cluster 对应 2048 B 互斥存储，不能按逻辑 block 数重复分配，也不扩大公共通信 context。
+SDMA 提交互斥字在 Host 初始化为零，只在运行中使用原子操作；SDK 的 session/postId/SQ 状态仍使用原 workspace。原 64 B stride 下，32 个 cluster 对应 2048 B；128 B 隔离目标下同样数量对应 4096 B。该尺寸变化尚未实现，落地时同步修改 Host 规划、Device 寻址和边界检查；按实际 cluster 数分配，不能按逻辑 block 数重复分配，也不扩大公共通信 context。
 
 run bootstrap 校验整个连续 header 数组；执行入口根据 task/block/lane 计算稳定索引，不读取未使用的 header。kernel 请求 `AsyncCtx` 时校验记录格式与 OPEN 状态，返回封口时再次核对实际 task/block/lane 和登记状态。token-only 长度须与容量一致，不能接受把 header 长度混入 token 区的记录。
 

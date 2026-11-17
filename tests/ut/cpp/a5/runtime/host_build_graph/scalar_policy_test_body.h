@@ -37,13 +37,13 @@ ScalarPolicyObservation observe_scalar_policy() {
         binding.attach(&profiling.scalar);
         // Volatile function pointers exercise emitted bodies even in optimized builds.
         auto *volatile query = static_cast<uint64_t (*)(volatile uint64_t &, int)>(&scheduler_gm_query);
-        auto *volatile poll = &scheduler_ordered_poll_may_progress;
+        auto *volatile poll = &scheduler_observe_ordered_progress;
         auto *volatile register_group =
             static_cast<scheduler_async_pending::Result (*)(scheduler_async_pending::Join &)>(
                 &scheduler_async_pending::register_group
             );
         result.value = query(value, __ATOMIC_ACQUIRE);
-        (void)poll(graph, nullptr, &local, nullptr);
+        (void)poll(graph, nullptr, &local, nullptr, nullptr);
         (void)register_group(join);
     }
     result.join_word = join.word;

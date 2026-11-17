@@ -1,5 +1,7 @@
 # A5 Graph task 实施与功能验收（历史实施记录）
 
+**适用边界：** 本页保留所标注版本的设计与实测，不能将其中的“当前”或旧硬件建议套用于现主线。后续设计统一遵守 [A5 硬件与调度原则](build-execute-separation.md#a5-hardware-principles)；128B 隔离、显式 DSB、分地址 atomic claim 及 STARS/SPR 边界以该原则为准，历史数据不改写。
+
 当前执行契约见[协议](protocol.md)、[数据布局](data-layout.md)和[工作目录](ready-queue-design.md)。下文保存旧提交的实施顺序与测量，不能据此推导当前仍有共享 ready 队列、CSR 通知或 wake-list。
 本页保存[设计总览](../a5-hbg-graph-task.md)早期方案的实施顺序。
 性能基线、用例筛选及模型优化另见[性能与自主迭代流程](performance.md)。

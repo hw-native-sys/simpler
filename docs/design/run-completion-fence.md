@@ -1,5 +1,7 @@
 # Run completion fences
 
+A5 Scalar-side publication follows the [shared hardware and scheduling premises](../zh-cn/design/a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles), including explicit DSB at dependent ld/st and atomic boundaries. A future STARS task notification is not a replacement for the run-completion and resource-retirement proofs defined here; mapped SPR storage alone cannot supply a general event lifetime.
+
 How an onboard run's completion is established, who owns the resources that
 establish it, and what runs queued on the same streams may rely on.
 

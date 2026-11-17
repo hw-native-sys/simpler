@@ -1,10 +1,12 @@
 # A5 HBG 异步完成待验证选型
 
+**共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](../a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前实现、拟修改布局和未来 STARS 后端分别标明。
+
 [返回总览](../a5-hbg-async-completion.md)。本文列出会影响实现的未决问题及替代方案，不重复定义基础协议。实现先遵守[基础设计](protocol.md)；候选只有满足相同语义和验收条件后才能替换对应部分。
 
 ## 普通 ready 队列的实现范围 {#ready-queue-implementation-scope}
 
-当前[目录发现](../a5-hbg-graph-task/ready-queue-design.md)将纯 AIC/所有 MIX 与纯 AIV 分入两份不可变 catalog；每核只扫描其 engine 目录。执行责任由 block ticket、Call Claim 和 group reservation 持有，依赖通过 canonical gate 确认；目录没有 ready enqueue 或共享队头。
+当前[目录发现](../a5-hbg-graph-task/ready-queue-design.md)将纯 AIC/所有 MIX 与纯 AIV 分入两份不可变 catalog；每核只扫描其 engine 目录。普通执行责任由有效 block ticket 持有，协作任务保留各自 Claim/group reservation，依赖通过 canonical gate 确认；目录没有 ready enqueue 或共享队头。
 
 Graph control scan、GM MIX/group 协议和异步 CHECK/FINISH 独立服务，目录没有 ready 项不能停止这些责任。
 诊断、完整故障与性能证据必须对应具体被测提交；历史队列实验不替代当前验收。
@@ -50,6 +52,8 @@ Graph control scan、GM MIX/group 协议和异步 CHECK/FINISH 独立服务，�
 run 活动标记只消除从未产生异步工作的额外扫描和获取；一旦活动开始就保守保持激活。若混排 workload 需要更细粒度获取，只能基于实际数据依赖及发布版本论证，不能根据“消费者未登记条件”跳过获取。
 
 ## 3. 工作发现与空间
+
+这里区分三个维度：发现目录怎样扫描、唯一 CHECK 责任怎样 claim、条件怎样等待。只改变扫描起点不等于 atomic 已分地址。必要 claim 的独立竞争字按 128B 隔离，单热点内的地址分散还须保持不重复授予责任；Wait 侧按可靠 ld_dev 与适用 st_dev 减少 GM 请求，后续 STARS event/notify 加 nop 入口限流，不用 SPR 绕过资源管理。所有依赖顺序显式 DSB，条件观察不能代替唯一 claim。
 
 ### 位图与直接 lease 扫描
 

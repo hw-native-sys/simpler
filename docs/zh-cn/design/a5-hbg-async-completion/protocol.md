@@ -1,10 +1,12 @@
 # A5 HBG 异步调度与完成协议
 
+**共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](../a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前实现、拟修改布局和未来 STARS 后端分别标明。
+
 [返回总览](../a5-hbg-async-completion.md)。记录身份与布局见[接口文档](interfaces-and-layout.md)，外部条件观察和 payload 可见性见[后端文档](backends-and-lifetime.md)。本协议定义基础实现，选型候选不能隐式改变它。
 
 ## 1. group 与 lease 状态机
 
-CHECK 和 FINISH 都使用一个 atomic-only 64-bit lease word。低 3 位为 phase，高 61 位为 lease generation；phase 编码为 DORMANT=0、RUNNABLE=1、OWNED=2、TERMINAL=3、FAILED=4，其余编码非法。lease 在首次发布前不具有可读取的初值，目录零位使其对扫描器不可见。唯一首次发布者先初始化进度及 DORMANT(1)，再发布 RUNNABLE 和目录位；不得重新初始化已发布或 OWNED 的记录。交权时 generation 递增，溢出报协议错误，不能回绕。run identity 保存在不可变身份区，不能用 lease generation 替代。
+本页基础状态机中的 CHECK 和 FINISH lease 使用 atomic-only 64-bit word；64-bit 是值宽，独立竞争单元的目标布局为 128B L2 侧隔离，不是 64B DCache 隔离。低 3 位为 phase，高 61 位为 lease generation；phase 编码为 DORMANT=0、RUNNABLE=1、OWNED=2、TERMINAL=3、FAILED=4，其余编码非法。lease 在首次发布前不具有可读取的初值，目录零位使其对扫描器不可见。唯一首次发布者先初始化进度及 DORMANT(1)，再发布 RUNNABLE 和目录位；不得重新初始化已发布或 OWNED 的记录。交权时 generation 递增，溢出报协议错误，不能回绕。run identity 保存在不可变身份区，不能用 lease generation 替代。
 
 | 转换 | 操作者 | 必须先完成的动作 |
 | ---- | ------ | ---------------- |
@@ -30,9 +32,9 @@ CHECK 与 FINISH 分别拥有平坦位图，每个字包含 64 条记录。每�
 
 ### 有界目录更新
 
-初值由权威原子读取获得，strong CAS 只改变目标位。置位前必须为零，清位前必须为一；状态不符直接返回协议错误，不改邻位。CAS 失败返回的当前值作为下一次 compare 值。
+初始 compare 值可由可靠 ld_dev 获得，最终更新由 strong CAS 裁定；不为纯读取增加 atomic-add-zero。strong CAS 只改变目标位。置位前必须为零，清位前必须为一；状态不符直接返回协议错误，不改邻位。CAS 失败返回的当前值作为下一次 compare 值。
 
-对合法调用，其余 63 位各最多改变两次，每次 strong-CAS 失败必对应至少一次值改变，因此最多 127 次 CAS，加一次初始原子读。超过此界限是协议损坏，不是可忽略的 RETRY；调用者锁存 run 错误、禁止进入新业务并保留资源。此上界不适用于会反复重用的普通 ready 位图，也不表示固定硬件耗时。
+对合法调用，其余 63 位各最多改变两次。当前实现保守保留最多128次 CAS，加一次初始 ld_dev，覆盖初次 compare 失配、其余位变化和最后成功；后续 compare 复用上次 CAS 返回值。超过此界限是协议损坏，不是可忽略的 RETRY；调用者锁存 run 错误、禁止进入新业务并保留资源。此上界不适用于会反复重用的普通 ready 位图，也不表示固定硬件耗时。
 
 该原语不能独立识别一位完整清除后的非法再次发布，调用者必须用 group 生命周期和 generation 维持一次性合同。禁止用算术补偿恢复重复更新。
 
@@ -42,14 +44,14 @@ CHECK 与 FINISH 分别拥有平坦位图，每个字包含 64 条记录。每�
 | -------- | ---------- | ---- |
 | task→group 映射、task 形状、header 数组基址与 token 边界 | Host 初始化并随 run 镜像发布，run 内保持只读 | run 入口完成全 DCache 获取后普通 cached 读取，不逐项重复失效 |
 | 封口身份、token | 执行核完成对应 cached 写回及实际屏障，再发布 RUNNABLE 和目录位 | 成功领取后按实际 cache 合同失效/观察，再消费数据 |
-| lease、join、目录、task 完成状态 | 专用原子操作，控制行无 cached 写入 | 权威判断使用原子观察；bypass 只能作允许过期的提示 |
-| run 异步活动标记 | 独占 64 B 行；Host 在 run 前置零，执行核在首次发布 CHECK/FINISH 前以 bypass store 写一并完成 DDR 屏障 | bypass load；本核见一后可以一直缓存 true，run 内不清零 |
+| lease、join、目录、task 完成状态 | 唯一领取、交权和多写者合并使用 atomic；无 cached 整行写回，目标按 128B 隔离，相关依赖边界显式 DSB | 可靠 ld_dev 用于条件观察或 CAS compare 值；不能用读取授予独占权，也不追加 FAA(0)确认。最终状态转换仍由 RMW 裁定 |
+| run 异步活动标记 | 现有布局为独占 64 B DCache 行，并非 128B 争用隔离的证明；Host 在 run 前置零，执行核在首次发布 CHECK/FINISH 前以 bypass store 写一并完成 DDR 屏障 | bypass load；本核见一后可以一直缓存 true，run 内不清零 |
 | owner 可变进度 | 独占期间 cached 写入，对应行写回及屏障完成后交权 | 下一 owner CAS 成功后失效并观察进度行，完成读取屏障后读取 |
 | payload、外部完成记录 | 遵守相应 backend 的可见性合同 | 不能将运行时 atomic-add-zero 原语用于 DMA/peer 写入的外部地址 |
 
 AICore helper 的 `acquire/release` 参数不自动产生全部所需屏障；实现必须分别落实缓存维护、设备屏障及原子线性化。CPU/sim 的 C++ 原子语义不能替代这项设备实现。
 
-首次发布的尾部必须完成目录置位后才允许进入业务 kernel。终态按“最后写入 → TERMINAL → 清目录位 → 完成贡献”的顺序执行。目录暂空、陈旧活动位、CAS 失败或 OWNED 均不能证明 run 完成。
+首次发布的尾部必须完成目录置位后才允许进入业务 kernel。终态按“最后写入 → TERMINAL → 清目录位 → 完成贡献”的顺序执行。每条实际时序依赖以 DSB 建立，包括连续 atomic 之间；源码顺序和 memory_order 名称不构成 A5 SoC 保序证明。目录暂空、陈旧活动位、CAS 失败或 OWNED 均不能证明 run 完成。
 
 ## 3. 按实际登记汇合与任务形状
 
@@ -132,7 +134,7 @@ TaskDone 可以早于 resolve 尾部；run 完成数必须晚于尾部。CHECK/F
 
 上述额度不包含可省略的“免费尾部”。领取前必须为本次可能发生的进度发布、交权、目录终态更新、join 贡献、FINISH 激活和已预留批次发布保留独立最坏预算；目录更新按每次最多 128 个原子操作计价。达到工作预算后不再开始新工作，只完成必要尾部。不同类型操作的实际耗时由[性能验证](validation.md)校准。
 
-最后一个 CHECK 可能先清 CHECK 位，再因 G 递减成为最后贡献者而发布 FINISH 位。这一尾部仅两次目录更新就最多需要 `2 × (1 次原子读 + 127 次 CAS) = 256` 个原子操作；lease、join、数据发布和屏障另行计价。普通工作额度为 8 不限制这个已预留的固定尾部，也不允许省掉其中一次发布。该数值是协议上界，不是常态耗时或已测性能。
+最后一个 CHECK 可能先清 CHECK 位，再因 G 递减成为最后贡献者而发布 FINISH 位。这一尾部仅两次目录更新就最多需要 `2 × 128 = 256` 次 CAS，另加两次初始 ld_dev；lease、join、数据发布和屏障另行计价。普通工作额度为 8 不限制这个已预留的固定尾部，也不允许省掉其中一次发布。该数值是协议上界，不是常态耗时或已测性能。
 
 若后续因具体读取缺口增加分段获取，须纳入同一工作预算和公平性证明，不能各追加一份隐藏 slice。等待 cohort 的核继续经过安全服务门，最终许可后不再插入服务。cohort start 及既有已预留 ready 批次按实际操作数保留固定尾部预算。
 

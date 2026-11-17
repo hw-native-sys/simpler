@@ -82,6 +82,7 @@ that ...".
 
 ## Index
 
+- [2026-11 — A5 HBG early MIX Binding publication](2026-11-a5-hbg-mix-binding-preparation.md): withdrawn at the user's request after a 0.560% aggregate regression; single-writer signal changes remain.
 - [2026-11 — A5 HBG replicated completion notices](2026-11-a5-hbg-replicated-completion-notices.md): withdrawn despite measured gain; reduce same-address atomic requests through ownership and observation design.
 
 - [2026-11 — A5 HBG GM MIX arrival permission and ACK reuse](2026-11-a5-hbg-gm-mix-arrival-permit.md): fewer FAA observations did not improve the twelve-case AICore L0 sum. — coordinator-only ACK confirmation; re-adopted under the atomic-demand criterion, with deterministic counts and latency regressions retained for reference.

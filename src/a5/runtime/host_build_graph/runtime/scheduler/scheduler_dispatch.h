@@ -21,7 +21,7 @@
 template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_service_gm_mix(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    uint64_t profiling_level, bool *progress, SchedulerGmMixPhase ack_prefilter_phase = SchedulerGmMixPhase::IDLE
+    uint64_t profiling_level, bool *progress, SchedulerGmMixAssignmentObservation *observation = nullptr
 ) {
     SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarMix, -1);
     *progress = false;
@@ -37,9 +37,7 @@ static inline __aicore__ bool scheduler_service_gm_mix(
     }
     if (local->is_mix_coordinator()) {
         if (group.phase == SchedulerGmMixPhase::RELEASED) {
-            const auto retired = scheduler_gm_mix_retire<RecordProtocol, true>(
-                graph, base, local, run, ack_prefilter_phase == SchedulerGmMixPhase::RELEASED
-            );
+            const auto retired = scheduler_gm_mix_retire<RecordProtocol, true>(graph, base, local, run);
             if (retired == SchedulerGmMixResult::ERROR) return false;
             if (retired == SchedulerGmMixResult::PROGRESS) {
                 *progress = true;
@@ -59,7 +57,8 @@ static inline __aicore__ bool scheduler_service_gm_mix(
         }
     } else if (group.phase == SchedulerGmMixPhase::IDLE || group.phase == SchedulerGmMixPhase::RELEASED) {
         bool observed = false;
-        if (!scheduler_gm_mix_observe<RecordProtocol, true>(graph, base, local, run, &observed)) return false;
+        if (!scheduler_gm_mix_observe<RecordProtocol, true>(graph, base, local, run, &observed, observation))
+            return false;
         *progress = observed;
         if (scheduler_task_ref_is_null(admission.current_task_ref)) return true;
     }
@@ -70,85 +69,85 @@ static inline __aicore__ bool scheduler_service_gm_mix(
         !scheduler_gm_mix_arrive<RecordProtocol, true>(graph, base, local, run, &arrived))
         return false;
     if (group.phase == SchedulerGmMixPhase::ARRIVED &&
-        !scheduler_gm_mix_prepare_lane<RecordProtocol, true>(
-            graph, base, local, run, profiling_level, &prepared, ack_prefilter_phase == SchedulerGmMixPhase::ARRIVED
-        ))
+        !scheduler_gm_mix_prepare_lane<RecordProtocol, true>(graph, base, local, run, profiling_level, &prepared))
         return false;
     *progress = *progress || arrived || prepared;
     return true;
 }
 
-// A false hint skips only this poll. It neither grants a kernel permit nor
-// changes ownership, a frontier, an acknowledgement, or a completion count.
-// Stale observations may postpone work; every positive hint takes the normal
-// ownership validation path before doing that work.
-static inline __aicore__ bool scheduler_ordered_poll_may_progress(
-    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local,
-    SchedulerGmMixPhase *ack_prefilter_phase = nullptr
+enum class SchedulerOrderedPollResult : uint8_t { WAIT, READY, ERROR };
+
+// Exact peer ACKs remain valid until this local group retires. WAIT may retain
+// a confirmed prefix, but grants no ticket, retirement or execution permission.
+static inline __aicore__ SchedulerOrderedPollResult scheduler_observe_ordered_progress(
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    SchedulerGmMixAssignmentObservation *observation = nullptr
 ) {
+    if (observation != nullptr) *observation = {};
     SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarOrderedPoll, -1);
     SchedulerScalarScope scalar_local(local, SchedPhaseKind::ScalarPollLocalState);
-    if (ack_prefilter_phase != nullptr) *ack_prefilter_phase = SchedulerGmMixPhase::IDLE;
     const auto &admission = *local->admission;
     if (admission.capacity == 0 || admission.scan_cursor > admission.capacity || local->local_ready_mask != 0 ||
         !scheduler_task_ref_is_null(admission.pending_task_ref))
-        return true;
+        return SchedulerOrderedPollResult::READY;
     scalar_local.close();
 
     if (scheduler_task_ref_is_null(admission.current_task_ref)) {
         auto *control = scheduler_state_at<SchedulerAdmissionControl>(base, admission.control_offset);
-        return scheduler_scalar_result(local, SchedPhaseKind::ScalarPollAdmissionTail, [&]() __aicore__ {
-                   return scheduler_gm_query(control->commit_tail);
-               }) != admission.scan_cursor;
+        return scheduler_scalar_result(
+                   local, SchedPhaseKind::ScalarPollAdmissionTail,
+                   [&]() __aicore__ {
+                       return scheduler_gm_query(control->commit_tail);
+                   }
+               ) != admission.scan_cursor ?
+                   SchedulerOrderedPollResult::READY :
+                   SchedulerOrderedPollResult::WAIT;
     }
     if (!scheduler_task_ref_valid(graph, admission.current_task_ref) || !scheduler_task_is_mix(admission.current_flags))
-        return true;
+        return SchedulerOrderedPollResult::READY;
     SchedulerScalarScope scalar_mix(local, SchedPhaseKind::ScalarPollMixState);
     const auto &group = admission.gm_mix;
-    if (group.mailbox_offset == 0 || group.cluster_index >= local->config.cluster_count) return true;
+    if (group.mailbox_offset == 0 || group.cluster_index >= local->config.cluster_count)
+        return SchedulerOrderedPollResult::READY;
     auto *mailbox = scheduler_gm_mix_mailbox(base, local);
     if (!local->is_mix_coordinator() &&
         (group.phase == SchedulerGmMixPhase::IDLE || group.phase == SchedulerGmMixPhase::RELEASED)) {
         const auto *signal = local->cluster_signal;
-        if (signal == nullptr || scheduler_cluster_load_field(&signal->run_epoch) != admission.epoch) return true;
-        return scheduler_scalar_result(
-                   local, SchedPhaseKind::ScalarPollMixClose,
-                   [&]() __aicore__ {
-                       return scheduler_cluster_load_field(&signal->sync_frontier[0]);
-                   }
-               ) > admission.scan_cursor ||
-               scheduler_scalar_result(local, SchedPhaseKind::ScalarPollMixAssignment, [&]() __aicore__ {
-                   return scheduler_gm_query(mailbox->lanes[local->config.self_lane].assigned_seq);
-               }) > group.group_seq;
+        if (signal == nullptr || scheduler_cluster_load_field(&signal->run_epoch) != admission.epoch)
+            return SchedulerOrderedPollResult::READY;
+        const uint64_t frontier = scheduler_scalar_result(local, SchedPhaseKind::ScalarPollMixClose, [&]() __aicore__ {
+            return scheduler_cluster_load_field(&signal->sync_frontier[0]);
+        });
+        if (frontier > admission.scan_cursor) return SchedulerOrderedPollResult::READY;
+        const uint64_t assigned =
+            scheduler_scalar_result(local, SchedPhaseKind::ScalarPollMixAssignment, [&]() __aicore__ {
+                return scheduler_gm_query(mailbox->lanes[local->config.self_lane].assigned_seq);
+            });
+        if (assigned <= group.group_seq) return SchedulerOrderedPollResult::WAIT;
+        if (observation != nullptr)
+            *observation = {
+                admission.epoch, admission.current_task_ref, admission.scan_cursor, group.group_seq, assigned,
+                group.phase
+            };
+        return SchedulerOrderedPollResult::READY;
     }
     const bool releases = group.phase == SchedulerGmMixPhase::RELEASED && local->is_mix_coordinator();
     if (group.phase == SchedulerGmMixPhase::ARRIVED || releases) {
-        if (group.group_seq == 0 || group.group_seq == UINT64_MAX) return true;
+        if (group.group_seq == 0 || group.group_seq == UINT64_MAX) return SchedulerOrderedPollResult::READY;
         if (!releases && !local->is_mix_coordinator()) {
-            if (local->cluster_signal == nullptr) return true;
+            if (local->cluster_signal == nullptr) return SchedulerOrderedPollResult::READY;
             if (scheduler_scalar_result(local, SchedPhaseKind::ScalarPollMixArrived, [&]() __aicore__ {
                     return scheduler_cluster_load_field(&local->cluster_signal->gm_arrival_seq);
                 }) < group.group_seq)
-                return false;
-            if (ack_prefilter_phase != nullptr) *ack_prefilter_phase = group.phase;
-            return true;
+                return SchedulerOrderedPollResult::WAIT;
+            return SchedulerOrderedPollResult::READY;
         }
-        const LaneMask resources = admission.current_resource_mask;
-        const uint8_t confirmed = releases ? group.releases_confirmed : group.arrivals_confirmed;
-        for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-            if (!resources.has(static_cast<SubtaskSlot>(lane)) || (confirmed & (1U << lane)) != 0) continue;
-            auto &ack = releases ? mailbox->lanes[lane].released_seq : mailbox->lanes[lane].arrived_seq;
-            const uint64_t observed = scheduler_scalar_result(
-                local, releases ? SchedPhaseKind::ScalarPollMixReleased : SchedPhaseKind::ScalarPollMixArrived,
-                [&]() __aicore__ {
-                    return scheduler_gm_query(ack);
-                }
-            );
-            if ((releases ? scheduler_group_release_sequence(observed) : observed) < group.group_seq) return false;
-        }
-        if (ack_prefilter_phase != nullptr) *ack_prefilter_phase = group.phase;
+        bool all = false;
+        if (!scheduler_gm_mix_check_acks<false>(graph, base, local, run, releases, &all))
+            return SchedulerOrderedPollResult::ERROR;
+        return all ? SchedulerOrderedPollResult::READY : SchedulerOrderedPollResult::WAIT;
     }
-    return true;
+    return SchedulerOrderedPollResult::READY;
 }
 
 template <bool RecordProtocol = true>
@@ -164,8 +163,13 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
         *failed = true;
         return false;
     }
-    auto ack_prefilter_phase = SchedulerGmMixPhase::IDLE;
-    if (!scheduler_ordered_poll_may_progress(graph, base, local, &ack_prefilter_phase)) return false;
+    SchedulerGmMixAssignmentObservation observation{};
+    const auto polled = scheduler_observe_ordered_progress(graph, base, local, run, &observation);
+    if (polled == SchedulerOrderedPollResult::ERROR) {
+        *failed = true;
+        return false;
+    }
+    if (polled == SchedulerOrderedPollResult::WAIT) return false;
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) {
         *failed = true;
         return false;
@@ -188,7 +192,7 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
         // A bounded scan can retire obligations without retaining a current task.
         progress = progress || admission->scan_cursor != scan_cursor_before;
         if (scheduler_task_ref_is_null(admission->current_task_ref)) break;
-        if (!scheduler_ordered_restore_ordinary(graph, local, run)) {
+        if (!scheduler_ordered_restore_ordinary(graph, base, local, run, profiling_level)) {
             *failed = true;
             return progress;
         }
@@ -219,7 +223,7 @@ static inline __aicore__ bool scheduler_fill_ordered_slots(
         if (scheduler_task_is_mix(admission->current_flags)) {
             bool group_progress = false;
             if (!scheduler_service_gm_mix<RecordProtocol>(
-                    graph, base, local, run, profiling_level, &group_progress, ack_prefilter_phase
+                    graph, base, local, run, profiling_level, &group_progress, step == 0 ? &observation : nullptr
                 )) {
                 *failed = true;
                 return progress || group_progress;
@@ -285,7 +289,7 @@ static inline __aicore__ bool scheduler_drain_ordered_exit(
     if (!scheduler_task_ref_is_null(admission->pending_task_ref)) {
         const int64_t task = admission->pending_task_ref;
         if (!scheduler_task_ref_valid(graph, task) ||
-            scheduler_gm_fetch_add(scheduler_task_control_at(base, local, task)->admission_state, UINT64_C(0)) !=
+            scheduler_gm_query(scheduler_task_control_at(base, local, task)->admission_state) !=
                 static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED))
             return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ORDERED_EXIT_IN_FLIGHT);
         admission->pending_task_ref = SCHEDULER_TASK_REF_INVALID;
@@ -305,8 +309,7 @@ static inline __aicore__ bool scheduler_drain_ordered_exit(
                 !admission->current_active_mask.has_aic() && admission->gm_mix.subtask_slot == UINT8_MAX) {
                 if (!scheduler_gm_mix_context_valid(graph, base, local, run)) return false;
                 bool arrived = false;
-                if (!scheduler_gm_mix_arrivals_ready<RecordProtocol>(graph, base, local, run, &arrived, false))
-                    return false;
+                if (!scheduler_gm_mix_arrivals_ready<RecordProtocol>(graph, base, local, run, &arrived)) return false;
                 if (!arrived) return true;
                 scheduler_gm_mix_publish_release<RecordProtocol>(base, local);
             }

@@ -268,6 +268,13 @@ on-chip scheduler exists to keep per-task control off the host link.
 
 ## Memory at a glance
 
+A5 Scalar scheduler designs additionally follow the
+[A5 memory-operation and event premises](cache-coherency.md#a5-scalar-scheduling-premises):
+128 B L2-side atomic isolation, explicit DSB for dependent operations, and
+bounded GM polling. STARS SRAM is a future Wait backend with finite ingress
+bandwidth; mapped SPRs are not a generic event allocator. These A5 premises
+do not replace the generation-specific measurements elsewhere in this page.
+
 Each tier sees a different memory landscape:
 
 - **Host**: Host DDR, plus a window into GM through the driver.

@@ -1,5 +1,7 @@
 # A5 HBG canonical completion gate
 
+**共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前实现、拟修改布局和未来 STARS 后端分别标明。
+
 默认 resident 使用 producer 的 canonical gate 证明依赖完成。
 Host 发布完整 fanin 视图；设备不会为每条边维护 remaining，也不会挂接 wake-list 或通知后继。
 本页描述当前实现，配套的工作发现见[目录与 execution token](ready-queue-design.md)。
@@ -22,9 +24,17 @@ T 为非零且不超过 INT16_MAX。每个真实 kernel 返回或合法 predicat
 异步条件以额外 debt 阻止提前 DONE；最后一次真实返回可以只关闭 computation join，
 由唯一 async FINISH 在条件满足后结清剩余 debt。
 
-`ld_dev` 的非零剩余提示只用于判定本轮仍在等待。任何 DONE 或非法提示都通过
-atomic fetch-add(0) 再确认；过期的 bypass 值不能授权消费业务输入。
-原子完成字所在区域没有 cached 整行写回。
+当前用可靠 `ld_dev` 读取并校验完成字，DONE 或非法值不再经 atomic fetch-add(0) 重复确认。
+单调 DONE 可以按本轮 task 身份私有复用；未完成值只说明这次观察未就绪，不能永久缓存。
+完成贡献仍需 RMW 合并多核更新，不能改为各核读后 `st_dev` 覆盖。
+生产者结果发布到完成贡献、消费者观察 DONE 到读取业务输入的顺序均须显式 DSB；
+atomic 本身不提供这些跨操作顺序，DSB 也不代替实际消费者的缓存获取。
+原子完成字按 128B L2 侧粒度隔离，所在区域没有 cached 整行写回。
+
+多个后继核同时观察一个 producer，仍会在其 GM 地址产生并发串行开销；
+删除 FAA(0) 只减少一次请求，并未消除同址轮询。复用已确认前缀、观察值和身份，
+控制无效请求密度；后续优先以带 `nop` 入口限流的 STARS event/notify 承载 Wait。
+STARS 不替代多写者完成计数或 task claim，也不表示当前已实现该后端。
 
 ## 依赖访问与有界观察
 

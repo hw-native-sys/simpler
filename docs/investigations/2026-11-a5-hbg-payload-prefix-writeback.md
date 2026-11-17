@@ -89,3 +89,61 @@ Evidence is under `artifacts/build-execute-separation/`: `valid-lines-rejected.p
 `benchmark18-valid-lines/`, `runtime-valid-lines/`, `cpp-valid-lines-results.json`,
 `ir-valid-lines.log`, and `critical-gap-audit/`. The shared-Call control is retained
 in `runtime-targeted-dcci/` and `benchmark18/`.
+
+## Host-prebound immutable Call receipt, 2026-11-16
+
+The current implementation constructs every Call on Host, including native Graph
+child instances. Metadata upload precedes the entry event that releases the
+AICore stream, and each resident entry runs the existing DSB/DCI/compiler-barrier
+sequence. There is no Device Call writer during a run. This gives a different
+visibility proof from the November 13 Device-builder experiment.
+
+Remove the eight-line Call DCCI loop at execution-token receipt and the separate
+eight-line observation plus tail DSB during MIX lane preparation. Receipt still
+invalidates the two writable Binding context lines and retains its trailing DSB
+and compiler barrier. Call identity, epoch, argument-count and context-pointer
+validation remain. No argument-extent protocol or layout change is introduced.
+The immutable pointers do not prove that their tensors have been produced:
+execution-time dependency, async-data observation and final permissions remain.
+
+The paired control is `9fc8242f0`, which already contains MIX observation reuse.
+Each arm uses one warmup and ten measured rounds under the same automatically
+allocated devices. The metric is the sum of twelve case means of **AICore L0
+wall**, with a Device rendezvous before each two-device sample and the maximum
+rank time per round. These results are not comparable to the historical
+fourteen-case, AICPU-inclusive measurements above.
+
+| Case | Control (ms) | Candidate (ms) | Change | Allocated devices |
+| ---- | -----------: | -------------: | -----: | ----------------- |
+| Latest SWA | 0.269764 | 0.272208 | +0.906% | 6 |
+| PyPTO-lib C2A full | 1.131782 | 1.136285 | +0.398% | 6 |
+| DSL C2A full | 1.483823 | 1.488636 | +0.324% | 7 |
+| All-sync DSL C2A full | 1.545179 | 1.545460 | +0.018% | 7 |
+| Latest C2A full | 0.338570 | 0.338604 | +0.010% | 7 |
+| Latest C1A reindex | 0.341171 | 0.341828 | +0.193% | 7 |
+| Latest C1A reuse | 0.254160 | 0.253959 | -0.079% | 7 |
+| Latest Engram | 0.996907 | 0.983713 | -1.323% | 7 |
+| DSL MoE | 1.435142 | 1.424343 | -0.752% | 6, 7 |
+| DSL layers 19–21 | 8.855164 | 8.865289 | +0.114% | 6, 7 |
+| Latest layers 19–21 | 3.172089 | 3.175320 | +0.102% | 5, 7 |
+| Latest native MoE | 0.739037 | 0.750134 | +1.501% | 5, 7 |
+| **Sum** | **20.562788** | **20.575780** | **+0.063%** | |
+
+Retain this deletion of redundant cache maintenance, without claiming a measured
+speedup. It reduces DCCI/DSB operations, not atomic or explicit `ld_dev` calls;
+the atomic/read reduction belongs to the preceding MIX observation commit.
+The aggregate change is small, but the individual native MoE row rises 1.501%.
+This one paired measurement does not identify a causal regression mechanism.
+
+All eleven replay cases pass numerical checks; native MoE is timing-only.
+The 741 focused CPU tests cover execution ownership, Binding receipt,
+native Graph planning, MIX, ordered execution and async control. The A5 HBG
+build takes 74.01 seconds, and all sixteen device IR scans pass. This round
+does not add a native Graph onboard measurement.
+
+Reproduction inputs, source hashes and runtime binaries are frozen under
+`artifacts/c2a-handoff-20261115/immutable-call-receipt/`. Per-round samples are in
+the sibling `immutable-call-receipt-l0/` and `immutable-call-receipt-comm-l0/`
+directories. The twelve-row aggregate is
+`artifacts/atomic-reduction-20261115/immutable-call-receipt12.json`; the eight
+dual-device arm audits pass. No model kernel changes are included.

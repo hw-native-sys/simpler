@@ -7,6 +7,15 @@ concepts) see
 For the cache coherency rules see
 [docs/hardware/cache-coherency.md](../../../docs/hardware/cache-coherency.md).
 
+For Scalar scheduling, use the project's
+[A5 hardware and scheduling premises](../../../docs/zh-cn/design/a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles)
+and the [A5 memory-ordering scope](../../../docs/hardware/cache-coherency.md#a5-scalar-scheduling-premises).
+Independent contended atomic units require 128 B L2-side isolation; 64 B
+describes Scalar DCache maintenance. Both `ld/st_dev` and atomic dependency
+chains need explicit DSB. STARS event/notify is a future Wait backend requiring
+poll-rate control and resource ownership; SPR mapping alone provides neither
+event allocation nor safe release.
+
 ## Chip packaging
 
 a5 is a single chip composed of **2 dies** that present to the host as

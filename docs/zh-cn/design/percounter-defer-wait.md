@@ -1,5 +1,7 @@
 # percounter defer completion
 
+**共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前实现、拟修改布局和未来 STARS 后端分别标明。
+
 A5 `percounter` 的 kernel 可以登记完成条件后返回。物理 lane 继续执行其他任务；
 逻辑任务及 Graph shell 的完成计数器，等待所有条件满足后才发布。
 用户接口沿用 `get_async_ctx`、`save_expected_notification_counter` 和
@@ -56,6 +58,10 @@ COUNTER 的 pending 检查只做一次 GM 样本读取和有符号范围/阈值�
 普通调用直接扣住自己的发布份额。MIX 沿用 rendezvous 的整块发布：
 登记了条件的 subtask 在报告 finished 前先减去自己的份额，条件完成时再补回。
 cohort 的物理 block 完成与逻辑条件完成分开计数，因此后续 cohort 可以继续。
+
+GM 同址观察和通知仍有并发串行代价，不能仅由一次检查很短推断全核开销很低。轮询复用已经确认的条件，检查请求率及实际发现延迟；单写者通知可用 st_dev，但跨核份额合并和 task 动态领取保留 atomic。必要 claim 分地址时按 128B 隔离，不能将相邻 uint64 或相邻64B行算作独立竞争单元。相关发布/消费、计数与后续判断的时序依赖都显式 DSB。
+
+上述为后续修改要求，不代表当前 percounter 的共享计数和紧凑链接已经拆散。STARS event/notify 是后续 Wait 的优先方案，空轮询用 nop 限流，并保留 early-notify、epoch、资源分配/释放和 payload 可见性；不把它或无通用分配方案的 SPR 当作 atomic claim 的替代。
 
 ## 满候选窗口的进度
 

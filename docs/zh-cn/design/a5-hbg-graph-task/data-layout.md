@@ -1,5 +1,7 @@
 # A5 原生 Graph 的数据布局与 Host 绑定
 
+**共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前实现、拟修改布局和未来 STARS 后端分别标明。
+
 本文描述默认 A5 HBG resident 的当前 wire 合同。Host、AICPU、AICore 必须配套编译。
 类型采用固定宽度 POD，内部引用用 offset/index；绝对设备地址以整数保存。
 各 wire 类型以 standard-layout、trivially-copyable、sizeof 和关键 offsetof 约束。
@@ -88,6 +90,10 @@ execution identity 从 192 开始。退休时先写回有效计时行并 barrier
 无探测事件的任务保留零起止时间，两个 DFX 读者都据此省略该事件。
 
 backing 基址满足 128 B 对齐。标量缓存维护仍按 64 B 行，不能从原子区域尺寸推导缓存指令粒度。
+
+以上大小描述现有 wire 布局，不表示每个动态字段都已经满足新的争用隔离目标。后续设计按 128B L2 侧粒度隔离独立 atomic 竞争单元，检查基址、数组 stride 和实际字段 offset；仅把结构体声明为 64B 对齐不够。TaskImageStatus、trace valid、async lease/join 及其他现有 64B 控制区应逐项区分冷路径、单写者数据和真实竞争热点，不把现有 ABI 尺寸当作通用隔离原则。变更布局时 Host 分配、Device 寻址、导出与读取方必须一起调整；本次文档修订未改变 wire ABI。
+
+只读 Call/参数区不因这一原则强制逐字段膨胀到 128B；128B 是独立竞争单元的隔离要求，64B 仍可用于普通数据的缓存维护。每 task 已有一个 128B next_block 区域也不代表该 task 内的并发 claim 已分散。st_dev 与 atomic 控制区均禁止被旧 cached 整行回写覆盖，通知发布和消费的真实时序边界显式 DSB。
 业务 kernel 不接收调度私有 slot 或 admission 对象的地址。
 
 ## Native Graph 与实例参数
@@ -154,7 +160,7 @@ Host 在 orchestration 返回前取得自有 Graph 字节与索引，不能保�
 | 对象 | 大小 | 内容 |
 | ---- | ---- | ---- |
 | SchedulerPreparedCall | 512 B | immutable function、epoch、node/block/lane、完整 args |
-| SchedulerPreparedControl | 128 B | phase、固定 owner 的单原子字 |
+| SchedulerPreparedControl | 128 B | phase、固定 owner 与 TICKET_OWNED 状态；普通票由 owner 维护，协作转换使用 atomic |
 | SchedulerExecutionBinding | 128 B | 各占一行的 LocalContext/GlobalContext |
 
 args[48]/args[49] 指向本次 execution 的 Binding，两核内 slot 复用不覆盖这些参数。

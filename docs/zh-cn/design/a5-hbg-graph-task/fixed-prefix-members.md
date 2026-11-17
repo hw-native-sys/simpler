@@ -1,5 +1,7 @@
 # 普通 SPMD 使用固定前缀成员集合
 
+**适用边界：** 本页保留所标注版本的设计与实测，不能将其中的“当前”或旧硬件建议套用于现主线。后续设计统一遵守 [A5 硬件与调度原则](build-execute-separation.md#a5-hardware-principles)；128B 隔离、显式 DSB、分地址 atomic claim 及 STARS/SPR 边界以该原则为准，历史数据不改写。
+
 2026-11-09，基于 `197991d58` 的候选只调整普通、非 `sync_start`、非 MIX SPMD：
 将 admission 成员数限制为 `min(block_num, eligible_workers)`，选取类型 bitmap 中最前面的成员。
 全局 admission、原子 block 领取、完成计数和 `defer_wait` 路径保持不变。

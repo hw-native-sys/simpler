@@ -182,9 +182,10 @@ Names identify real functions or explicitly named function sections; parent
 intervals include their children and must not be added to child totals.
 Uninstrumented work remains in the parent's exclusive time.
 
-`scheduler_read_claim_cursor` separates context validation, the claim-seal
-hint and atomic confirmation, and the next-block hint and atomic fallback.
-`scheduler_ordered_poll_may_progress` separates local state,
+`scheduler_read_claim_cursor` separates context validation and reliable bypass
+reads of `claim_seal` and `next_block`. Observing a completed seal inserts a DSB
+before the dependent cursor read; neither observation adds an FAA(0) confirmation.
+`scheduler_observe_ordered_progress` separates local state,
 probes, admission-tail checks, and MIX assignment/close/arrival/release checks.
 Each worker traverses its immutable AIC or AIV task catalog. AIC discovery
 includes MIX tasks, whose active masks and coordinator rules remain unchanged.

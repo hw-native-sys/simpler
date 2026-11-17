@@ -45,7 +45,7 @@ static inline __aicore__ bool scheduler_discover_cooperative_task(
     if (scheduler_task_ref_is_null(task_ref)) return true;
     if (!scheduler_task_ref_valid(graph, task_ref))
         return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::ADMISSION_INVALID_RECORD);
-    const auto &metadata = *scheduler_task_metadata_at(base, local, task_ref);
+    const auto &metadata = local->issue_binding.metadata;
     if (!scheduler_task_is_executable(metadata.flags) || scheduler_task_is_inline(metadata.flags)) return true;
     if (!scheduler_task_requires_admission(metadata.flags)) return true;
     if (admission == nullptr || admission->capacity == 0)
@@ -54,16 +54,14 @@ static inline __aicore__ bool scheduler_discover_cooperative_task(
     if (scheduler_gm_query(scheduler_task_control_at(base, local, task_ref)->admission_state) ==
         static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED))
         return true;
-    SchedulerFaninView fanin{};
-    if (scheduler_node_fanin_view(graph, task_ref, &fanin) != SchedulerGraphResult::OK)
-        return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::ADMISSION_INVALID_RECORD);
+    const auto &fanin = local->issue_binding.fanin;
     if (local->cooperative_fanin_task_ref != task_ref) {
         local->cooperative_fanin_task_ref = task_ref;
         local->cooperative_next_fanin = 0;
     }
     bool ready = false;
     if (!scheduler_observe_fanin_prefix(
-            graph, base, local, run, task_ref, fanin, local->cooperative_next_fanin, &ready
+            graph, base, local, run, task_ref, fanin, local->cooperative_next_fanin, &ready, &local->cooperative_wait
         ))
         return false;
     if (!ready) return true;

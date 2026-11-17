@@ -1,5 +1,7 @@
 # 独立 block 调度与 MIX lease：后续优化候选
 
+**适用边界：** 本页保留所标注版本的设计与实测，不能将其中的“当前”或旧硬件建议套用于现主线。后续设计统一遵守 [A5 硬件与调度原则](build-execute-separation.md#a5-hardware-principles)；128B 隔离、显式 DSB、分地址 atomic claim 及 STARS/SPR 边界以该原则为准，历史数据不改写。
+
 本文历史测量所引用的 JSON 仅保存在本地 `outputs/a5-hbg-graph-task/evidence-summary/`，不随仓库分发；下文保留文件名用于追溯。
 
 **状态：2026-11-03 用户决定撤回原型代码，恢复 `queue-ordinary-credit-v1` 的 T/H8 普通领取额度版本。**

@@ -57,6 +57,41 @@ bypass load, for which see
 The rest of this doc fills in why each row of the table is what it is,
 and what code lives on each side.
 
+## A5 Scalar scheduling premises
+
+For A5 scheduler design, apply the project's
+[seven hardware and scheduling premises](../zh-cn/design/a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles).
+These are owner-supplied design premises dated 2026-11-16, not new measurements
+or vendor latency guarantees. They supplement the AICPU coherency policy above;
+they do not change the a2a3 observations below.
+
+Under this model, AICore `ld_dev/st_dev` bypass Scalar DCache but use L2;
+atomic operations bypass caches and use the HBM atomic path. Both GM reads
+and writes can serialize under same-address concurrency. Dynamic task claims
+still require atomic arbitration: distribute independent claims across
+**128 B L2-side isolation units**, not adjacent 64 B DCache lines. Read-only
+payload layout and DCache maintenance need not use that larger granularity.
+
+Neither access family is ordered by the SoC interconnect. Use explicit DSB
+at actual same-core dependency boundaries, including dependent atomic operations.
+An RMW result proves arbitration, not publication of other addresses; a C++
+memory-order parameter is not evidence of a native AICore barrier. Reliable
+`ld_dev` observations do not need a second FAA(0) confirmation. Single-writer
+signals can use `st_dev` when they need neither RMW nor an indivisible atomic
+state transition. Add DSB only for an actual same-core ordering dependency,
+not merely because another core will receive the notification; notification
+arrival itself is asynchronous. Multi-writer claims and contributions still
+need RMW. Dirty cached writeback
+must not overwrite either kind of control signal.
+
+STARS event/notify SRAM is the preferred future generic Wait backend under
+these premises. Its roughly four-cycle contention cost does not imply unlimited
+ingress bandwidth: empty polling needs `nop` rate limiting. Event ownership,
+initialization, early notifications, reuse and release must be defined before
+integration; neither event readiness nor DSB replaces consumer payload visibility.
+Mapped SPR registers are not a generic event pool without allocation and release
+management. Existing fixed-role register protocols do not supply that facility.
+
 ## Cache primitives and barriers
 
 | Primitive | Side | Purpose | Cost (rough, a2a3 / DAV_3510) |

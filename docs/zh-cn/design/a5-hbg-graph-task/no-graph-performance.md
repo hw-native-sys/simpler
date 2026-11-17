@@ -1,5 +1,7 @@
 # 无 Graph 完整性能对照：T/H8
 
+**适用边界：** 本页保留所标注版本的设计与实测，不能将其中的“当前”或旧硬件建议套用于现主线。后续设计统一遵守 [A5 硬件与调度原则](build-execute-separation.md#a5-hardware-principles)；128B 隔离、显式 DSB、分地址 atomic claim 及 STARS/SPR 边界以该原则为准，历史数据不改写。
+
 本页汇总 PR #2864 的完整 19 项无 Graph 性能复测：固定 benchmark 7 项、筛选 ST 11 项、CSA 1 项。
 被测提交为 `dbf39563cb966fd7600dc1d7b93c6d4bd7c48e5c`，默认 **T/H8**。
 本表是该提交的历史实测；后续重放主线 `313499d61` 并增加 PARAM 视图范围检查，
