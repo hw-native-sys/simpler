@@ -98,8 +98,7 @@ percounter_post_handshake_init(Runtime *runtime, const AicoreLifecycle &lifecycl
     }
     control->cluster_count = static_cast<uint64_t>(aic_count);
     control->aiv_per_cluster = static_cast<uint64_t>(PLATFORM_AIV_CORES_PER_BLOCKDIM);
-    // The host prefilled the compile-time default; this carries any override,
-    // which only the AICPU reads.
+    // Publish the configured timeout for AICPU supervision and bounded lane startup waits.
     control->scheduler_timeout_cycles = scheduler_timeout_cycles;
     cache_flush_range(control, sizeof(*control));
     percounter_graph_prepare_init(control);

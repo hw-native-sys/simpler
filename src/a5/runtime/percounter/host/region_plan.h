@@ -233,7 +233,7 @@ inline bool plan_layout(
         !PERCOUNTER_RESERVE(
             (boundary_task_count + PERCOUNTER_LIST_COUNT + 63) / 64, PercounterClaimSummary, claim_summary_offset
         ) ||
-        !PERCOUNTER_RESERVE(sync_cohort_count, PercounterTicket, sync_arrivals_offset) ||
+        !PERCOUNTER_RESERVE(sync_cohort_count, PercounterStartBarrier, sync_arrivals_offset) ||
         !PERCOUNTER_RESERVE(task_count, PercounterTaskMetadata, metadata_offset) ||
         !PERCOUNTER_RESERVE(task_count, uint64_t, metadata_ready_offset) ||
         !PERCOUNTER_RESERVE(boundary_task_count + PERCOUNTER_LIST_COUNT, PercounterSegment, segments_offset) ||
@@ -254,7 +254,7 @@ inline bool plan_layout(
         !PERCOUNTER_RESERVE(task_count, PercounterCounter, counters_offset) ||
         !PERCOUNTER_RESERVE(boundary_task_count, PercounterTaskClaim, task_claims_offset) ||
         !PERCOUNTER_RESERVE(completion_sectors, PercounterCompletionSector, completion_sectors_offset) ||
-        // After the counters, so the records fall outside `upload_size` below.
+        // After the completion sectors, so these records remain outside `upload_size`.
         // The entries follow the records for the reason `layout_valid` checks:
         // a record's entry span has to start after the record itself.
         !PERCOUNTER_RESERVE(SCHEDULER_WORKER_CAPACITY, pto2::resident::AsyncGroupData, async_groups_offset) ||
@@ -267,7 +267,7 @@ inline bool plan_layout(
         return false;
     }
 #undef PERCOUNTER_RESERVE
-    next.upload_size = next.counters_offset + task_count * sizeof(PercounterCounter);
+    next.upload_size = next.completion_sectors_offset + completion_sectors * sizeof(PercounterCompletionSector);
 
     cursor = next.total_size;
     if (profiling_level >= 2 &&
@@ -830,6 +830,29 @@ inline bool build_tables(
     control->async_completions_offset = layout.async_completions_offset;
     control->async_completion_capacity = layout.async_completion_capacity;
     control->async_run_epoch = next_async_run_epoch();
+    // These initial values depend on task shape, not on physical lane placement.
+    // This run's uploaded image includes all completion and claim initial values.
+    auto *completion = region_at<PercounterCompletionSector>(base, layout.completion_sectors_offset);
+    for (uint64_t id = 0; id < layout.task_count; ++id) {
+        const uint32_t blocks = metadata[id].block_num;
+        const uint64_t total = PERCOUNTER_COUNTER_PUBLISHED - counters[id].value;
+        for (uint32_t sector = 0; sector < PERCOUNTER_COMPLETION_SECTOR_COUNT; ++sector) {
+            const uint64_t assigned =
+                (blocks + PERCOUNTER_COMPLETION_SECTOR_COUNT - 1U - sector) / PERCOUNTER_COMPLETION_SECTOR_COUNT;
+            const uint64_t count = blocks > 1 ? assigned * (total / blocks) : total;
+            completion[id * PERCOUNTER_COMPLETION_SECTOR_COUNT + sector].value =
+                percounter_counter_preset(static_cast<int64_t>(count));
+        }
+    }
+    auto *claims = region_at<PercounterTaskClaim>(base, layout.task_claims_offset);
+    const uint64_t aic_boundaries = control->segment_count[0] - 1;
+    for (uint64_t index = 0; index < layout.boundary_task_count; ++index) {
+        const uint64_t segment = index + (index >= aic_boundaries ? 1 : 0);
+        const uint32_t blocks = static_cast<uint32_t>(segments[segment].task_shape >> 48);
+        // The upload prefix was zeroed above, including every claim sector.
+        claims[index].closed_sectors =
+            blocks < PERCOUNTER_CLAIM_SECTOR_COUNT ? PERCOUNTER_CLAIM_SECTOR_COUNT - blocks : 0;
+    }
     control->scheduler_timeout_cycles = SCHEDULER_TIMEOUT_CYCLES;
     control->graph_storage_address = external.graph_storage;
     control->graph_storage_count = external.graph_storage_count;
