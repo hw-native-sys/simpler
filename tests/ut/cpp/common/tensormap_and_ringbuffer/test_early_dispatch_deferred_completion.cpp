@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -99,21 +100,37 @@ public:
 
     static CoreExecState &core(SchedulerContext &context, int core) { return context.core_exec_states_[core]; }
 
+    static auto classification(SchedulerContext &context) { return context.classify_stall_reason(); }
+
+    static std::string stall_dump(SchedulerContext &context) {
+        testing::internal::CaptureStderr();
+        context.log_global_stall_diagnostics(0, 42, 0);
+        return testing::internal::GetCapturedStderr();
+    }
+
+    static void timeout(SchedulerContext &context, SharedMemoryHeader &header) {
+        testing::internal::CaptureStderr();
+        EXPECT_EQ(context.handle_timeout_exit(0, &header, nullptr, 42, 0), -SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+        (void)testing::internal::GetCapturedStderr();
+    }
+
     static uint64_t running_gate(SchedulerContext &context, int core) {
         const auto token = context.core_exec_states_[core].running_reg_task_id;
         return token == AICPU_TASK_INVALID ? 0 : context.payload_per_core_[core][token & 1].src_payload;
     }
 
-    static void register_counter(SchedulerContext &context, int core, volatile uint32_t *counter) {
+    static void register_counter(SchedulerContext &context, int core, volatile uint32_t *counter, int count = 1) {
         const int token = context.core_exec_states_[core].running_reg_task_id;
         ASSERT_NE(token, AICPU_TASK_INVALID);
         auto &slab = context.deferred_slab_per_core_[core][token & 1];
-        slab.entries[0].addr = reinterpret_cast<uint64_t>(counter);
-        slab.entries[0].backend_cookie = 0;
-        slab.entries[0].expected_value = 1;
-        slab.entries[0].engine = COMPLETION_ENGINE_CCU;
-        slab.entries[0].completion_type = COMPLETION_TYPE_COUNTER;
-        slab.count = 1;
+        for (int i = 0; i < count; ++i) {
+            slab.entries[i].addr = reinterpret_cast<uint64_t>(counter);
+            slab.entries[i].backend_cookie = 0;
+            slab.entries[i].expected_value = 1;
+            slab.entries[i].engine = COMPLETION_ENGINE_CCU;
+            slab.entries[i].completion_type = COMPLETION_TYPE_COUNTER;
+        }
+        slab.count = count;
     }
 
     static int free_aiv_slots(SchedulerContext &context) {
@@ -329,6 +346,112 @@ protected:
         EXPECT_EQ(MixAdmissionTestPeer::drain_task(*context), nullptr);
     }
 };
+
+TEST_F(EarlyDispatchDeferredCompletion, AsyncCompletionWaitIsNotReadyBeforeOrAfterMailboxDrain) {
+    alignas(64) volatile uint32_t notification = 0;
+    const TaskId producer = submit(KernelKind::Aic);
+    const TaskId consumer = submit(KernelKind::Aiv, 1, false, &producer);
+    dispatch();
+    ack(0);
+    MixAdmissionTestPeer::register_counter(*context, 0, &notification, 2);
+    conditions[0] = MAKE_FIN_VALUE(core(0).running_reg_task_id);
+    ASSERT_EQ(poll(), 0);
+    ASSERT_EQ(core(0).running_slot_state, nullptr);
+    ASSERT_EQ(scheduler->async_wait_list.count.load(), 0);
+    ASSERT_TRUE(mailbox->has_pending());
+
+    for (int stage = 0; stage < 2; ++stage) {
+        const auto cls = MixAdmissionTestPeer::classification(*context);
+        EXPECT_STREQ(stall_detail_name(cls.detail), "S6:async-completion-wait");
+        EXPECT_EQ(cls.cnt_running, 0);
+        EXPECT_EQ(cls.cnt_ready, 0);
+        EXPECT_EQ(cls.cnt_waiting, 1);
+        EXPECT_EQ(cls.cnt_async_wait, 1);
+        EXPECT_EQ(cls.stuck_task_id, producer);
+        EXPECT_EQ(cls.stuck_core, -1);
+        const auto dump = MixAdmissionTestPeer::stall_dump(*context);
+        EXPECT_NE(dump.find("state=ASYNC_WAIT"), std::string::npos) << dump;
+        EXPECT_NE(dump.find("scan_async_wait=1"), std::string::npos) << dump;
+        EXPECT_EQ(poll_async(), 0);
+    }
+
+    ASSERT_EQ(scheduler->async_wait_list.count.load(), 1);
+    EXPECT_EQ(scheduler->async_wait_list.entries[0].condition_count, 2);
+    const TaskId independent = submit(KernelKind::Aic);
+    const auto ready = MixAdmissionTestPeer::classification(*context);
+    EXPECT_EQ(ready.detail, SIMPLER_STALL_DETAIL_READY_IDLE);
+    EXPECT_EQ(ready.cnt_ready, 1);
+    EXPECT_EQ(ready.cnt_async_wait, 1);
+    dispatch();
+    finish(independent);
+
+    notification = 1;
+    ASSERT_EQ(poll_async(), 1);
+    EXPECT_EQ(poll_async(), 0);
+    EXPECT_GE(slot(producer)->task_state.load(), CHIP_TASK_COMPLETED);
+    EXPECT_EQ(slot(consumer)->fanin_refcount.load(), slot(consumer)->fanin_count);
+    const auto cls = MixAdmissionTestPeer::classification(*context);
+    EXPECT_EQ(cls.detail, SIMPLER_STALL_DETAIL_READY_IDLE);
+    EXPECT_EQ(cls.cnt_ready, 1);
+    EXPECT_EQ(cls.cnt_async_wait, 0);
+    dispatch();
+    finish(consumer);
+}
+
+TEST_F(EarlyDispatchDeferredCompletion, RunningAndAsyncWaitRemainSeparateAndTimeoutKeepsCode100) {
+    alignas(64) volatile uint32_t notification = 0;
+    const TaskId producer = submit(KernelKind::Aic);
+    const TaskId running = submit(KernelKind::Aiv);
+    dispatch();
+    ack(0);
+    MixAdmissionTestPeer::register_counter(*context, 0, &notification);
+    conditions[0] = MAKE_FIN_VALUE(core(0).running_reg_task_id);
+    ASSERT_EQ(poll(), 0);
+    const auto mixed = MixAdmissionTestPeer::classification(*context);
+    EXPECT_EQ(mixed.cnt_running, 1);
+    EXPECT_EQ(mixed.cnt_async_wait, 1);
+    EXPECT_EQ(mixed.cnt_ready, 0);
+    EXPECT_EQ(mixed.detail, SIMPLER_STALL_DETAIL_RUNNING_STALLED);
+    EXPECT_EQ(mixed.stuck_task_id, running);
+    finish(running);
+    EXPECT_EQ(poll_async(), 0);
+    MixAdmissionTestPeer::timeout(*context, *shared.header);
+    EXPECT_EQ(shared.header->sched_error_code.load(), SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    EXPECT_EQ(shared.header->sched_stall_detail.load(), SIMPLER_STALL_DETAIL_ASYNC_WAIT);
+    EXPECT_EQ(shared.header->sched_stall_cnt_async_wait.load(), 1);
+    EXPECT_EQ(shared.header->sched_stall_cnt_ready.load(), 0);
+    EXPECT_EQ(shared.header->sched_stall_task_id.load(), producer);
+    EXPECT_EQ(shared.header->sched_stall_core.load(), -1);
+    EXPECT_EQ(slot(producer)->task_state.load(), CHIP_TASK_PENDING);
+}
+
+TEST_F(EarlyDispatchDeferredCompletion, DeferredRegistrationDoesNotHideUnfinishedSubtasks) {
+    alignas(64) volatile uint32_t notification = 0;
+    const TaskId producer = submit(KernelKind::Mix);
+    dispatch();
+    ack(0);
+    MixAdmissionTestPeer::register_counter(*context, 0, &notification);
+    conditions[0] = MAKE_FIN_VALUE(core(0).running_reg_task_id);
+    ASSERT_EQ(poll(), 0);
+    ASSERT_EQ(poll_async(), 0);
+    ASSERT_TRUE(slot(producer)->has_any_subtask_deferred());
+    ASSERT_EQ(slot(producer)->completed_subtasks.load(), 1);
+    const auto partial = MixAdmissionTestPeer::classification(*context);
+    EXPECT_EQ(partial.detail, SIMPLER_STALL_DETAIL_RUNNING_STALLED);
+    EXPECT_EQ(partial.cnt_running, 1);
+    EXPECT_EQ(partial.cnt_async_wait, 0);
+    for (int id : {1, 2}) {
+        ack(id);
+        conditions[id] = MAKE_FIN_VALUE(core(id).running_reg_task_id);
+        EXPECT_EQ(poll(), 0);
+    }
+    const auto deferred = MixAdmissionTestPeer::classification(*context);
+    EXPECT_EQ(deferred.detail, SIMPLER_STALL_DETAIL_ASYNC_WAIT);
+    EXPECT_EQ(deferred.cnt_async_wait, 1);
+    notification = 1;
+    EXPECT_EQ(poll_async(), 1);
+    EXPECT_EQ(MixAdmissionTestPeer::classification(*context).cnt_async_wait, 0);
+}
 
 class DeferredCompletionProgress : public EarlyDispatchDeferredCompletion,
                                    public testing::WithParamInterface<ProgressPath> {};

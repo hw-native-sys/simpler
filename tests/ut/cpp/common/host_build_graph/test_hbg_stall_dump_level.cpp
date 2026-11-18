@@ -88,14 +88,19 @@ public:
         }
     }
 
-    static void emit(SchedulerContext &context, SchedulerState &state, StallDumpReport report) {
+    static void emit(SchedulerContext &context, SchedulerState &state, StallDumpReport report, int task_count = 0) {
         context.sched_ = &state;
         context.aicpu_thread_num_ = 1;
         context.active_sched_threads_ = 1;
         context.completed_tasks_.store(0, std::memory_order_relaxed);
         context.log_stall_diagnostics(
-            /*thread_idx=*/0, /*task_count=*/0, /*idle_iterations=*/480000, /*last_progress_count=*/0, report
+            /*thread_idx=*/0, task_count, /*idle_iterations=*/480000, /*last_progress_count=*/0, report
         );
+    }
+
+    static void set_running(SchedulerContext &context, ChipTaskSlotState *slot) {
+        context.cores_total_num_ = 1;
+        context.core_exec_states_[0].running_slot_state = slot;
     }
 };
 
@@ -168,6 +173,40 @@ TEST(SchedulerCompletionTest, FinalEmptyGraphCompletes) {
 
     EXPECT_EQ(SchedulerContextTestPeer::check_exit(context, header), LoopAction::BREAK_LOOP);
     EXPECT_EQ(SchedulerContextTestPeer::check_exit(context, header), LoopAction::BREAK_LOOP);
+}
+
+TEST(StallDumpStateTest, DeferredTaskWaitsForAllSubtasksAndStopsCountingAfterCompletion) {
+    auto storage = std::make_unique<ChipTaskStorage>();
+    storage->task.task_id = TaskId::make_global(0);
+    storage->slot.total_required_subtasks = 2;
+    storage->slot.completed_subtasks.store(2);
+    storage->slot.mark_any_subtask_deferred();
+    std::atomic<ChipTaskState> progress{CHIP_TASK_PENDING};
+    SharedMemoryTaskHeader tasks{};
+    tasks.task_storage = storage.get();
+    tasks.task_states = &progress;
+    auto state = std::make_unique<SchedulerState>();
+    state->task_view.tasks = &tasks;
+    SchedulerContext context;
+    auto dump = [&]() {
+        testing::internal::CaptureStderr();
+        SchedulerContextTestPeer::emit(context, *state, StallDumpReport::Shutdown, 1);
+        return testing::internal::GetCapturedStderr();
+    };
+
+    const auto waiting = dump();
+    EXPECT_NE(waiting.find("state=ASYNC_WAIT"), std::string::npos) << waiting;
+    EXPECT_NE(waiting.find("scan_ready=0 scan_waiting=0 scan_running=0 scan_async_wait=1"), std::string::npos);
+    storage->slot.completed_subtasks.store(1);
+    const auto partial = dump();
+    EXPECT_NE(partial.find("state=READY"), std::string::npos) << partial;
+    EXPECT_NE(partial.find("scan_async_wait=0"), std::string::npos);
+    SchedulerContextTestPeer::set_running(context, &storage->slot);
+    EXPECT_NE(dump().find("state=RUNNING"), std::string::npos);
+    tasks.store_completed(0);
+    const auto completed = dump();
+    EXPECT_EQ(completed.find(" TASK "), std::string::npos);
+    EXPECT_NE(completed.find("scan_ready=0 scan_waiting=0 scan_running=0 scan_async_wait=0"), std::string::npos);
 }
 
 TEST(SchedulerCompletionTest, NonemptyGraphWaitsForItsLastTask) {
