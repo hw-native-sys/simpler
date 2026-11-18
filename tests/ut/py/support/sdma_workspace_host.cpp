@@ -47,6 +47,7 @@ public:
         *size = sdma_fixture::zero_size ? 0 : 16384;
         return sdma_fixture::zero_size ? ACL_ERROR_INVALID_PARAM : ACL_SUCCESS;
     }
+    uint64_t GetWorkspaceSize() const { return address_ != nullptr ? 16384 : 0; }
     bool Init(void *address, uint64_t size) {
         using namespace sdma_fixture;
         ++initializations;
@@ -124,7 +125,7 @@ int main(int argc, char **argv) {
         fail_free = true;
         assert(dma_workspace_release(handle) == COMM_RECLAMATION_UNCONFIRMED);
         auto *owner = static_cast<SdmaWorkspaceOwner *>(handle);
-        assert(!owner->manager && buffers.count(owner->allocation) == 1);
+        assert(!owner->workspace.impl && buffers.count(owner->allocation) == 1);
         const int attempts = free_attempts;
         assert(dma_workspace_release(handle) == COMM_RECLAMATION_UNCONFIRMED);
         assert(free_attempts == attempts);
@@ -157,7 +158,7 @@ int main(int argc, char **argv) {
         assert(initializations == (initialized ? attempt + 1 : 0));
         if (success) {
             assert(rc == 0 && handle != nullptr);
-            assert(static_cast<SdmaWorkspaceOwner *>(handle)->manager.get() == Manager::last);
+            assert(static_cast<SdmaWorkspaceOwner *>(handle)->workspace.impl == Manager::last);
             assert(addresses[DMA_WORKSPACE_SDMA] == reinterpret_cast<uint64_t>(Manager::last->GetWorkspaceAddr()));
             assert(buffers.size() == 1 && destructions == destroyed_before && frees == freed_before);
             assert(dma_workspace_release(handle) == 0);
@@ -166,7 +167,7 @@ int main(int argc, char **argv) {
             assert(rc != 0 && (handle != nullptr) == initialized);
             for (auto address : addresses)
                 assert(address == 0);
-            assert(destructions == destroyed_before + (initialized ? 0 : 1));
+            assert(destructions == destroyed_before);
             assert(live_streams == (initialized ? 1 : 0));
             assert(frees == freed_before + (initialized && !bound_failure ? 1 : 0));
             assert(buffers.size() == (bound_failure ? 1U : 0U));
@@ -174,6 +175,7 @@ int main(int argc, char **argv) {
             auto *owner = static_cast<SdmaWorkspaceOwner *>(handle);
             if (owner) assert(dma_workspace_release(handle) == COMM_RECLAMATION_UNCONFIRMED);
             void *bound = owner ? owner->allocation : nullptr;
+            if (owner) pto::comm::DestroyWorkspace(&owner->workspace);
             delete owner;
             if (bound != nullptr) assert(aclrtFree(bound) == ACL_SUCCESS);
         }

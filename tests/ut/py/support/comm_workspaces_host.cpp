@@ -55,8 +55,10 @@ int physical_handles = 0;
 void *fail_free_once = nullptr;
 bool fail_rollback_free = false;
 int rollback_free_attempts = 0;
+int rollback_free_engine = -1;
 bool throw_hccl_destroy = false;
 bool fail_context_upload = false;
+bool fail_dbcos_read = false;
 bool fail_host_register = false;
 bool unsupported_host_udma = false;
 int subcomm_creates = 0;
@@ -144,8 +146,9 @@ extern "C" aclError aclrtGetDevice(int32_t *id) {
 }
 extern "C" aclError aclrtMalloc(void **out, size_t bytes, aclrtMemMallocPolicy) { return map_buffer(out, bytes); }
 extern "C" aclError aclrtFree(void *p) {
-    const int failed_engine =
-        workspace_fixture::fail_engine >= 0 ? workspace_fixture::fail_engine : workspace_fixture::throw_engine;
+    const int failed_engine = rollback_free_engine >= 0           ? rollback_free_engine :
+                              workspace_fixture::fail_engine >= 0 ? workspace_fixture::fail_engine :
+                                                                    workspace_fixture::throw_engine;
     if (fail_rollback_free && failed_engine >= 0 && p == workspace_fixture::last_workspace[failed_engine]) {
         ++rollback_free_attempts;
         return ACL_ERROR_FAILURE;
@@ -156,8 +159,9 @@ extern "C" aclError aclrtFree(void *p) {
     }
     return unmap_buffer(p);
 }
-extern "C" aclError aclrtMemcpy(void *out, size_t, const void *in, size_t bytes, aclrtMemcpyKind) {
+extern "C" aclError aclrtMemcpy(void *out, size_t, const void *in, size_t bytes, aclrtMemcpyKind kind) {
     if (fail_context_upload && bytes == sizeof(CommContext)) return 1;
+    if (fail_dbcos_read && kind == ACL_MEMCPY_DEVICE_TO_HOST) return ACL_ERROR_FAILURE;
     std::memcpy(out, in, bytes);
     return ACL_SUCCESS;
 }
@@ -321,7 +325,7 @@ static void test_peer_import_rollback(CommHandle h, uint64_t &next_id) {
         assert(imported_handles.size() == held_imports && peer_mappings.size() == held_peers);
     }
     assert(comm_release_domain_windows(h, held_id, 2, 0) == 0);
-    assert(mappings.size() == 1 && mappings.count(h->sdma_workspace->GetWorkspaceAddr()) == 1);
+    assert(mappings.size() == 1 && mappings.count(h->sdma_workspace.addr) == 1);
     assert(physical_handles == 0 && imported_handles.empty() && peer_mappings.empty());
     h->nranks = old_nranks;
 }
@@ -400,6 +404,9 @@ static void test_init_rollback_failure(const std::string &scenario) {
         COMM_INITIALIZATION_ABORT_REQUIRED
     );
     assert(ctx == 0 && base == 0 && size == 0);
+    // URMA and RDMA retain the manager with the domain until the coordinated
+    // abort; SDMA destroys it during its own rollback.
+    assert(live[engine] == (engine == 0 ? 0 : 1));
     assert(comm_abort_domain_windows(h, 1, 1, 0) == COMM_RECLAMATION_UNCONFIRMED);
     assert(h->cleanup_failed && rollback_free_attempts == 1);
     void *workspace = last_workspace[engine];
@@ -415,6 +422,60 @@ static void test_init_rollback_failure(const std::string &scenario) {
     assert(comm_abort_domain_windows(h, 1, 1, 0) == COMM_RECLAMATION_UNCONFIRMED);
     assert(comm_destroy(h) == COMM_RECLAMATION_UNCONFIRMED);
     assert(rollback_free_attempts == 1 && mappings.count(workspace) == 1);
+    std::filesystem::remove_all(folder);
+}
+
+static void test_init_partial_failure(const std::string &scenario) {
+    using namespace workspace_fixture;
+    setenv("PTO_ROCE_PHYIDS", "0", 1);
+    setenv("PTO_ROCE_LOCAL_IP", "127.0.0.1", 1);
+    char folder[] = "/tmp/simpler-workspace-partial-XXXXXX";
+    assert(mkdtemp(folder));
+    auto *h = new CommHandle_{};
+    h->rank = 0;
+    h->nranks = 1;
+    h->rootinfo_path = std::string(folder) + "/root";
+    h->hccl_comm = reinterpret_cast<HcclComm>(1);
+    const uint32_t ranks[] = {0};
+    uint64_t ctx = 0, base = 0;
+    size_t size = 0;
+
+    if (scenario == "init_rdma_dbcos_fail") {
+#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
+        // Init succeeds; the dbCos device-to-host read fails.
+        fail_dbcos_read = true;
+        fail_rollback_free = true;
+        rollback_free_engine = 2;
+        assert(
+            comm_alloc_domain_windows(h, 1, ranks, 1, 0, 4096, 1U << 2, &ctx, &base, &size) ==
+            COMM_INITIALIZATION_ABORT_REQUIRED
+        );
+        assert(ctx == 0 && base == 0 && size == 0);
+        assert(live[2] == 1 && rollback_free_attempts == 0);
+        const auto &allocation = *h->domain_allocations.at(1);
+        assert(allocation.rdma_workspace_addr != nullptr && mappings.count(allocation.rdma_workspace_addr) == 1);
+        assert(comm_abort_domain_windows(h, 1, 1, 0) == COMM_RECLAMATION_UNCONFIRMED);
+        assert(live[2] == 0 && rollback_free_attempts == 1);
+        assert(mappings.count(allocation.rdma_workspace_addr) == 1);
+#else
+        assert(false);
+#endif
+    } else {
+        assert(scenario == "init_urma_alloc_fail");
+        // Device allocation succeeds; the host manager allocation fails.
+        pto::comm::urma::UrmaWorkspaceManager::fail_alloc = true;
+        assert(
+            comm_alloc_domain_windows(h, 1, ranks, 1, 0, 4096, 1U << 1, &ctx, &base, &size) ==
+            COMM_INITIALIZATION_ABORT_REQUIRED
+        );
+        assert(ctx == 0 && base == 0 && size == 0);
+        assert(live[1] == 0 && rollback_free_attempts == 0);
+        const auto &allocation = *h->domain_allocations.at(1);
+        void *workspace = allocation.urma_workspace_addr;
+        assert(workspace != nullptr && mappings.count(workspace) == 1);
+        assert(comm_abort_domain_windows(h, 1, 1, 0) == 0);
+        assert(mappings.empty() && h->domain_allocations.empty());
+    }
     std::filesystem::remove_all(folder);
 }
 
@@ -888,7 +949,12 @@ int main(int argc, char **argv) {
             return 0;
         }
         if (std::string(argv[1]).find("init_") == 0) {
-            test_init_rollback_failure(argv[1]);
+            if (std::string(argv[1]).find("dbcos_fail") != std::string::npos ||
+                std::string(argv[1]).find("alloc_fail") != std::string::npos) {
+                test_init_partial_failure(argv[1]);
+            } else {
+                test_init_rollback_failure(argv[1]);
+            }
             return 0;
         }
         if (std::string(argv[1]).find("host_") == 0) {
@@ -1125,7 +1191,7 @@ int main(int argc, char **argv) {
     release(first);
     assert(allocate(7, first, first_ctx) != 0);
     assert(allocate(16, first, first_ctx) != 0);
-    assert(mappings.size() == 1 && mappings.count(h->sdma_workspace->GetWorkspaceAddr()) == 1);
+    assert(mappings.size() == 1 && mappings.count(h->sdma_workspace.addr) == 1);
     assert(physical_handles == 0);
     test_peer_import_rollback(h, next_id);
     // Finalization must also reclaim domains whose caller skipped explicit release.
@@ -1157,17 +1223,17 @@ int main(int argc, char **argv) {
     const int starts = started[0];
     assert(allocate(1, first, first_ctx) == COMM_INITIALIZATION_ABORT_REQUIRED);
     assert(comm_abort_domain_windows(h, first, 1, 0) == 0);
-    assert(started[0] == starts && !h->sdma_workspace && mappings.empty() && physical_handles == 0);
+    assert(started[0] == starts && h->sdma_workspace.impl == nullptr && mappings.empty() && physical_handles == 0);
     zero_size_engine = -1;
     throw_engine = 0;
     assert(allocate(1, first, first_ctx) == COMM_INITIALIZATION_ABORT_REQUIRED);
     assert(comm_abort_domain_windows(h, first, 1, 0) == 0);
-    assert(!h->sdma_workspace && mappings.empty() && physical_handles == 0 && live[0] == 0);
+    assert(h->sdma_workspace.impl == nullptr && mappings.empty() && physical_handles == 0 && live[0] == 0);
     throw_engine = -1;
     fail_engine = 0;
     assert(allocate(1, first, first_ctx) == COMM_INITIALIZATION_ABORT_REQUIRED);
     assert(comm_abort_domain_windows(h, first, 1, 0) == 0);
-    assert(!h->sdma_workspace && mappings.empty() && physical_handles == 0);
+    assert(h->sdma_workspace.impl == nullptr && mappings.empty() && physical_handles == 0);
     assert(allocate(0, first, first_ctx) == 0);
     assert(!comm_workspace<CommWorkspaceKind::SDMA>(*reinterpret_cast<CommContext *>(first_ctx)).addr);
     release(first);

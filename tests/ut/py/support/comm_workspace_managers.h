@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -84,6 +85,13 @@ public:
 namespace pto::comm::urma {
 class UrmaWorkspaceManager : public workspace_fixture::Manager {
 public:
+    static inline bool fail_alloc = false;
+    static void *operator new(std::size_t size, const std::nothrow_t &) noexcept {
+        if (fail_alloc) return nullptr;
+        return ::operator new(size, std::nothrow);
+    }
+    static void operator delete(void *p, const std::nothrow_t &) noexcept { ::operator delete(p); }
+    static void operator delete(void *p) noexcept { ::operator delete(p); }
     UrmaWorkspaceManager() :
         Manager(1) {}
     using Manager::GetWorkspaceSize;
@@ -130,7 +138,7 @@ public:
 }  // namespace pto::comm::urma
 
 namespace pto::comm::rdma {
-enum class WorkspaceInitResult { READY, FAILED };
+enum class WorkspaceInitResult { READY, FAILED, DISABLED };
 struct WorkspaceConfig {
     uint32_t rankId = 0, rankCount = 0, phyId = 0, qpNum = 1;
     std::string localIp;
@@ -160,6 +168,8 @@ public:
     RdmaWorkspaceManager() :
         Manager(2) {}
     using Manager::GetWorkspaceSize;
+    static WorkspaceInitResult Preflight() { return WorkspaceInitResult::READY; }
+    void SetTraceId(uint32_t) {}
     static aclError GetWorkspaceSize(uint32_t, uint64_t *size, uint32_t) {
         if (workspace_fixture::zero_size_engine == 2) {
             *size = 0;
