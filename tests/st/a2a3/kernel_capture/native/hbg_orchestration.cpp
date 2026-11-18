@@ -11,9 +11,11 @@
 
 #include "orchestration_api.h"
 
-static void
-chain(const simpler::hbg::Tensor &input, const simpler::hbg::Tensor &output, bool early, uint64_t increment = 3) {
-    uint32_t shape[] = {16};
+static void chain(
+    const simpler::hbg::Tensor &input, const simpler::hbg::Tensor &output, bool early, uint64_t increment = 3,
+    uint32_t scratch_elements = 16
+) {
+    uint32_t shape[] = {scratch_elements};
     TensorCreateInfo intermediate(shape, 1, DataType::INT32);
     CoreTaskArgs first;
     first.add_input(input);
@@ -65,4 +67,22 @@ extern "C" void hbg_inout_orchestration(const ChipTaskArgs &args) {
     task.add_inout(args.tensor(0).ref());
     task.add_scalar(args.scalar<int32_t>(0));
     rt_submit_aiv_task(0, task);
+}
+
+extern "C" void hbg_shared_heap_orchestration(const ChipTaskArgs &args) {
+    const int32_t increment = args.scalar<int32_t>(0);
+    GraphTaskArgs boundary;
+    boundary.add_inout(args.tensor(0).ref());
+    const auto graph = rt_graph_begin(0xCAEE, boundary);
+    if (graph.recording) {
+        always_assert(rt_graph_prepare(graph.recording_handle, boundary));
+        // Models share a 64 KiB intermediate. The 256 KiB eager request must
+        // fail against the fixed 128 KiB capacity without disturbing replay.
+        const uint32_t scratch_elements = increment == 17 ? 65536 : 16384;
+        chain(
+            graph.params->tensor(0).ref(), graph.params->tensor(0).ref(), false, static_cast<uint64_t>(increment - 7),
+            scratch_elements
+        );
+        always_assert(rt_graph_end());
+    }
 }

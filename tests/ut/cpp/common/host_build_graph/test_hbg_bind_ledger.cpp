@@ -574,7 +574,7 @@ void fake_set_retained(void *, uint32_t, void *addr, size_t size) {
     g_fake->retained_addr = addr;
     g_fake->retained_size = size;
 }
-int fake_setup_static_arena(void *, uint32_t, size_t heap, size_t, size_t arena) {
+int fake_setup_static_arena(void *, uint32_t /*pipeline_slot*/, RegionBanks, size_t heap, size_t, size_t arena) {
     if (g_fake->arena_status != 0) return g_fake->arena_status;
     g_fake->requested_arena_bytes = arena;
     g_fake->requested_heap_bytes = heap;
@@ -586,7 +586,7 @@ void *aligned_in(std::vector<uint8_t> &v) {
     auto raw = reinterpret_cast<uintptr_t>(v.data());
     return reinterpret_cast<void *>((raw + kAlign - 1) & ~static_cast<uintptr_t>(kAlign - 1));
 }
-void *fake_acquire_gm_heap(void *, uint32_t) { return aligned_in(g_fake->gm_heap); }
+void *fake_acquire_gm_heap(void *, uint32_t /*pipeline_slot*/, uint32_t) { return aligned_in(g_fake->gm_heap); }
 void *fake_acquire_runtime_arena(void *, uint32_t) { return aligned_in(g_fake->runtime_arena); }
 int fake_acquire_sm_mirror(void *, uint32_t, size_t bytes, size_t alignment, void **out) {
     g_fake->sm_mirror.assign(bytes + alignment, 0);
@@ -2965,7 +2965,9 @@ TEST_F(HbgResidentSchedulerStorageTest, GraphHeapReservationContainsArgumentsWit
         capture_orch_bind
     };
     ChipStorageTaskArgs args;
-    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    const uint64_t window[4] = {8, 0, 0, 0};
+    const uint64_t heap[4] = {CHIP_ALIGN_UP(2 * 16 * 64, DeviceArena::kDefaultBaseAlign), 0, 0, 0};
+    ASSERT_EQ(bind_callable_to_runtime_impl(&runtime, &api_, &args, &eps_, nullptr, 0, window, heap, nullptr), 0);
     EXPECT_EQ(fake_.requested_heap_bytes, CHIP_ALIGN_UP(2 * 16 * 64, DeviceArena::kDefaultBaseAlign));
     EXPECT_LT(fake_.requested_heap_bytes, 2 * 16 * sizeof(ChipTaskStorage));
     ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);

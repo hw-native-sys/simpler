@@ -82,6 +82,16 @@ exit dependency follows both sides. Recorded waits must have valid records in
 the captured dependency graph. Caller-stream input copies, model execution and
 output copies must preserve their data dependencies.
 
+HBG Kernel eager calls and captured models in one context share GM heap scratch.
+The caller must order complete invocations, including publication copies and
+both device roles, in a single execution domain. Use one ordered caller stream
+or dependencies that establish the equivalent order across streams. Retaining
+several models does not permit concurrent execution against that heap. Separate
+contexts have separate pools. Preparation itself does not overwrite shared heap;
+A5 Graph argument publication into the heap is recorded and replayed before its
+consumers. Heap contents are invocation-local; persistent outputs remain in
+caller-owned tensors. No new model owner or implicit cross-stream ordering is added.
+
 For a recording, `simpler_poll_run` reports a poll error and both native wait
 entries return `UNSUPPORTED`; none reports execution completion. Finalization
 ends the original Host run without synchronizing recorded device execution or

@@ -207,6 +207,10 @@ simpler_ut_platform_case(test_ccu_completion.cpp SINGLE BARE
 
 simpler_ut_platform_case(test_ccu_device_submission.cpp SINGLE BARE
     INCLUDES ${SIMPLER_SRC}/common)
+# ReportedPool lifecycle: host-only, with the sim allocator as its byte source.
+platform_single_case(test_reported_pool.cpp
+    SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/sim/host/memory_allocator.cpp ${HOST_LOG_TEST_SOURCES}
+    INCLUDES ${SIMPLER_LOG_DIR})
 
 # Each of these covers a header-only piece of the arch's platform surface and
 # needs nothing compiled in but the CANN platform stand-in.
@@ -720,6 +724,19 @@ set(CAPACITY_REFUSAL_INCLUDES
     ${SIMPLER_LOG_DIR}
     ${SIMPLER_SRC}/common/worker)
 
+hbg_case(test_sim_region_banks.cpp
+    SOURCES ${CAPACITY_REFUSAL_SOURCES} ${HBG_COMMON_SHARED_DIR}/runtime.cpp
+    INCLUDES ${CAPACITY_REFUSAL_INCLUDES}
+    DEFINES SIMPLER_RUNTIME_NAME="host_build_graph"
+    LINK ${CMAKE_DL_LIBS})
+
+tmr_case(test_sim_region_banks.cpp
+    SOURCES ${CAPACITY_REFUSAL_SOURCES}
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
+    INCLUDES ${CAPACITY_REFUSAL_INCLUDES}
+    DEFINES SIMPLER_RUNTIME_NAME="tensormap_and_ringbuffer"
+    LINK ${CMAKE_DL_LIBS})
+
 hbg_case(test_diagnostic_capacity_refusal_phase.cpp
     SOURCES
         ${CAPACITY_REFUSAL_SOURCES}
@@ -1128,6 +1145,7 @@ simpler_ut_cases(platform_single_case
     test_retained_temp_bump.cpp
     test_run_caller_order.cpp
     test_run_completion_fence.cpp
+    test_scratch_pool.cpp
     test_run_drain_decision.cpp
     test_run_drain_result_separation.cpp
     test_run_outcome_decision.cpp

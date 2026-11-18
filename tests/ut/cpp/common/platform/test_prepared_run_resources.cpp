@@ -12,7 +12,13 @@
 #include <gtest/gtest.h>
 #include <cstring>
 #include <cstdlib>
+#include <future>
+#include <thread>
+#include <type_traits>
 #include "host/prepared_run_resources.h"
+
+static_assert(!std::is_copy_constructible_v<PreparedRunResources>);
+static_assert(!std::is_copy_assignable_v<PreparedRunResources>);
 
 namespace {
 void end_host_use(PreparedRunUse &use) {
@@ -209,18 +215,45 @@ struct ReusedArenaBackend {
 };
 }  // namespace
 
-TEST(PreparedRunResources, RetiredArenaPinsBackingUntilItsAddressesAreDetached) {
-    ReusedArenaBackend backend;
+TEST(PreparedRunResources, RetainingImageDoesNotKeepSiblingHeapAlive) {
+    std::vector<void *> freed;
     auto bank = std::make_shared<PreparedRunResources::ArenaBank>(
+        [](void *, size_t bytes) {
+            return std::malloc(bytes);
+        },
+        [](void *ctx, void *ptr) {
+            static_cast<std::vector<void *> *>(ctx)->push_back(ptr);
+            std::free(ptr);
+        },
+        &freed
+    );
+    bank->gm_heap->arena.reserve(64, 64);
+    bank->runtime_pool->arena.reserve(64, 64);
+    ASSERT_NE(bank->gm_heap->arena.commit(), nullptr);
+    ASSERT_NE(bank->runtime_pool->arena.commit(), nullptr);
+    void *heap = bank->gm_heap->arena.raw_backing();
+    void *image = bank->runtime_pool->arena.raw_backing();
+    auto held = std::make_shared<PreparedRunResources>(
+        nullptr, nullptr, bank->runtime_pool, std::vector<WorkspaceManager::BackingLease>{}
+    );
+    bank.reset();
+    EXPECT_EQ(freed, std::vector<void *>{heap});
+    held.reset();
+    EXPECT_EQ(freed, (std::vector<void *>{heap, image}));
+}
+
+TEST(PreparedRunResources, RetiredRegionPinsBackingUntilItsAddressesAreDetached) {
+    ReusedArenaBackend backend;
+    auto bank = std::make_shared<PreparedRunResources::ArenaRegion>(
         &ReusedArenaBackend::allocate, &ReusedArenaBackend::release_arena, &backend
     );
-    bank->runtime_pool.reserve(64, 64);
-    ASSERT_NE(bank->runtime_pool.commit(), nullptr);
+    bank->arena.reserve(64, 64);
+    ASSERT_NE(bank->arena.commit(), nullptr);
     auto original = std::make_shared<PreparedRunResources>(
         nullptr, nullptr, bank,
         std::vector<WorkspaceManager::BackingLease>{backend.workspace.retain_backing(backend.address)}
     );
-    PreparedRunResources::RetiredArena retired;
+    PreparedRunResources::RetiredRegion retired;
     ASSERT_EQ(retired.retain(bank, backend.workspace), 0);
     bank.reset();
     EXPECT_NE(retired.reclaim(backend.workspace), 0);
@@ -247,14 +280,14 @@ TEST(PreparedRunResources, RetiredArenaPinsBackingUntilItsAddressesAreDetached) 
     EXPECT_TRUE(backend.workspace.idle_backing(replacement));
 }
 
-TEST(PreparedRunResources, RetiredArenaAbandonMakesNoDeviceCalls) {
+TEST(PreparedRunResources, RetiredRegionAbandonMakesNoDeviceCalls) {
     ReusedArenaBackend backend;
-    auto bank = std::make_shared<PreparedRunResources::ArenaBank>(
+    auto bank = std::make_shared<PreparedRunResources::ArenaRegion>(
         &ReusedArenaBackend::allocate, &ReusedArenaBackend::release_arena, &backend
     );
-    bank->runtime_pool.reserve(64, 64);
-    ASSERT_NE(bank->runtime_pool.commit(), nullptr);
-    PreparedRunResources::RetiredArena retired;
+    bank->arena.reserve(64, 64);
+    ASSERT_NE(bank->arena.commit(), nullptr);
+    PreparedRunResources::RetiredRegion retired;
     ASSERT_EQ(retired.retain(bank, backend.workspace), 0);
     bank.reset();
     retired.abandon_after_device_failure();
@@ -263,14 +296,14 @@ TEST(PreparedRunResources, RetiredArenaAbandonMakesNoDeviceCalls) {
     EXPECT_FALSE(backend.workspace.must_keep(backend.address));
 }
 
-TEST(PreparedRunResources, RetiredArenaReleaseFailureRemainsOwnedByWorkspace) {
+TEST(PreparedRunResources, RetiredRegionReleaseFailureRemainsOwnedByWorkspace) {
     ReusedArenaBackend backend;
-    auto bank = std::make_shared<PreparedRunResources::ArenaBank>(
+    auto bank = std::make_shared<PreparedRunResources::ArenaRegion>(
         &ReusedArenaBackend::allocate, &ReusedArenaBackend::release_arena, &backend
     );
-    bank->runtime_pool.reserve(64, 64);
-    ASSERT_NE(bank->runtime_pool.commit(), nullptr);
-    PreparedRunResources::RetiredArena retired;
+    bank->arena.reserve(64, 64);
+    ASSERT_NE(bank->arena.commit(), nullptr);
+    PreparedRunResources::RetiredRegion retired;
     ASSERT_EQ(retired.retain(bank, backend.workspace), 0);
     bank.reset();
     backend.retire_run();
@@ -285,10 +318,10 @@ TEST(PreparedRunResources, RetiredArenaReleaseFailureRemainsOwnedByWorkspace) {
     EXPECT_EQ(backend.frees, 0);
 }
 
-TEST(PreparedRunResources, RetiredUnmanagedArenaFreesExactlyOnce) {
+TEST(PreparedRunResources, RetiredUnmanagedRegionFreesExactlyOnce) {
     WorkspaceManager workspace;
     int frees = 0;
-    auto bank = std::make_shared<PreparedRunResources::ArenaBank>(
+    auto bank = std::make_shared<PreparedRunResources::ArenaRegion>(
         [](void *, size_t bytes) {
             return std::malloc(bytes);
         },
@@ -298,9 +331,9 @@ TEST(PreparedRunResources, RetiredUnmanagedArenaFreesExactlyOnce) {
         },
         &frees
     );
-    bank->gm_heap.reserve(64, 64);
-    ASSERT_NE(bank->gm_heap.commit(), nullptr);
-    PreparedRunResources::RetiredArena retired;
+    bank->arena.reserve(64, 64);
+    ASSERT_NE(bank->arena.commit(), nullptr);
+    PreparedRunResources::RetiredRegion retired;
     ASSERT_EQ(retired.retain(bank, workspace), 0);
     EXPECT_NE(retired.reclaim(workspace), 0);
     EXPECT_EQ(frees, 0);
@@ -352,4 +385,27 @@ TEST(PreparedRunResources, OwnerCopiesKeepTheSameRegisteredLifetime) {
     EXPECT_FALSE(owner.expired());
     copy.reset();
     EXPECT_TRUE(owner.expired());
+}
+
+TEST(PreparedRunResources, TemporaryLeasesEndAcrossIndependentOwnerThreads) {
+    auto storage = std::make_shared<PreparedRunResources::TemporaryStorage>();
+    auto first = make_preparation();
+    auto second = make_preparation();
+    first->hold_temporary(storage);
+    second->hold_temporary(storage);
+    ASSERT_EQ(storage->run_leases.load(std::memory_order_relaxed), 2u);
+    std::promise<void> start;
+    auto ready = start.get_future().share();
+    std::thread owner([resource = std::move(first), ready]() mutable {
+        ready.wait();
+        resource.reset();
+    });
+    start.set_value();
+    second.reset();
+    auto successor = make_preparation();
+    successor->hold_temporary(storage);
+    owner.join();
+    EXPECT_EQ(storage->run_leases.load(std::memory_order_relaxed), 1u);
+    successor.reset();
+    EXPECT_EQ(storage->run_leases.load(std::memory_order_relaxed), 0u);
 }

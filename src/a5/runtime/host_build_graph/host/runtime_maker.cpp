@@ -139,25 +139,16 @@ static_assert(
 static constexpr uint32_t kKernelPipelineDepth = 2;
 
 extern "C" const PipelineContract *get_pipeline_contract(void) {
-    // Host orchestration materializes this run's own graph into the image it
-    // uploads, so every device-resident region carries per-run content.
-    //
-    // PTO_PIPELINE_GM_SM is absent because hbg has no separate shared-memory
-    // region: the image is the tail of the runtime-image region, so it shares that
-    // region's classification. The arena-topology check skips an absent kind.
-    // `pipeline_depth` is the maximum this runtime supports, not a configured
-    // count: every device-resident region it names carries per-run content and
-    // is selected by the caller's lease, so as many runs can hold one as a
-    // context cares to grant. What a context actually grants is the smaller of
-    // this and the request, and every per-run resource is built to that grant —
-    // so declaring no limit here commits nothing.
+    // The heap is pooled across ordered executions; the runtime image
+    // remains independently owned by each run. GM_SM has no separate region.
+    // pipeline_depth bounds supported resource sets without preallocating them.
     static const PipelineContract contract = {
         PTO_PIPELINE_CONTRACT_ABI_VERSION,
         4,
         UINT32_MAX,
         {
-            {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_HOST_PER_RUN, 0},
-            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_HOST_PER_RUN, 0},
+            {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_POOLED_SCRATCH, 0},
+            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DELIVERED, 0},
             {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
             {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
         },
@@ -168,12 +159,8 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
 extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, PipelineContract *out) {
     if (out == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     if (config == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    // The graph and its heap are sized by each bind's host orchestration.
-    // Init declares their bank topology, without claiming a fixed capacity.
-    //
-    // The bank topology is the program declaration's; the depth is not. A
-    // kernel context's capacity is `kKernelPipelineDepth` whatever the program
-    // path supports, so the two move independently.
+    // Retained preparations keep the shared heap allocation alive. Kernel's
+    // resource-set capacity remains independent of the program path's depth.
     *out = *get_pipeline_contract();
     out->pipeline_depth = kKernelPipelineDepth;
     return 0;
@@ -191,11 +178,8 @@ extern "C" int set_run_ccu_workspace_impl(Runtime *runtime, uint64_t address) {
 }
 
 extern "C" int joined_native_launch_supported_impl(void) {
-    // Every per-run device region this runtime names is selected by the run's
-    // own lease — the graph heap and the runtime image are both HOST_PER_RUN
-    // above — so a second launched run reads and writes nothing the first is
-    // still executing against. What orders the two on the device is a queued
-    // event wait, not this answer.
+    // Per-run images remain independently owned. A queued device event wait
+    // orders executions that reuse the context heap scratch.
     return 1;
 }
 
@@ -2299,12 +2283,8 @@ int32_t run_host_orchestration(
     const uint64_t image_bytes = task_image::segments(bind_usage).end;
     runtime->dev.sm_image_bytes = image_bytes;
 
-    // Only now are both sizes known, so this is where the two device regions are
-    // committed: the compact task image arena, and the graph heap to the
-    // bytes orchestration actually handed out. setup_static_arena commits per
-    // region and short-circuits a request an existing one already covers, so a
-    // repeated workload pays for neither twice and the heap is grow-only across a
-    // Worker's binds.
+    // Orchestration determines the required span. Bind checks it against the
+    // configured fixed capacity before committing any device heap or image.
     // The runtime arena contains only the compact shared-memory image.
     // Each outer Graph heap includes the selected runtime's invocation backing.
     // A graph whose every output is caller-owned allocates nothing, but its tasks
@@ -2574,14 +2554,11 @@ extern "C" int bind_callable_to_runtime_impl(
     if (!resolve_graph_task_capacity(ring_task_window, &task_capacity)) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    // The heap takes no configuration, so a set ring_heap reaches nothing in this
-    // runtime — most often it is a config written for the reclaiming one, whose knob
-    // it still is.
-    if (read_ring_override(ring_heap, 0) != 0) {
-        LOG_WARN(
-            "%s", "host_build_graph ignores ring_heap: its graph heap is committed after orchestration at the "
-                  "size the graph turned out to need"
-        );
+    const uint64_t heap_override = read_ring_override(ring_heap, 0);
+    const uint64_t heap_capacity = heap_override == 0 ? 256ULL * 1024 * 1024 : heap_override;
+    if (heap_capacity < 1024 || heap_capacity > MAX_HEAP_CAPACITY) {
+        LOG_ERROR("HBG heap capacity must be in [1024, %" PRIu64 "] bytes", uint64_t{MAX_HEAP_CAPACITY});
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     }
 
     // Build device args: copy from input, replace host tensor pointers with device pointers
@@ -2749,6 +2726,15 @@ extern "C" int bind_callable_to_runtime_impl(
         runtime->dev.host_total_tasks = total_tasks;
         LOG_INFO("host-orch: submitted %d tasks on host", total_tasks);
     }
+
+    if (plan->heap_bytes > heap_capacity) {
+        LOG_ERROR(
+            "HBG heap capacity exceeded: required=%" PRIu64 " configured=%" PRIu64 " bytes", plan->heap_bytes,
+            heap_capacity
+        );
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    }
+    plan->heap_bytes = heap_capacity;
 
     plan->diagnostic_outcome = dep_gen_host_graph_take(&plan->diagnostic_graph);
     plan->park(*runtime);

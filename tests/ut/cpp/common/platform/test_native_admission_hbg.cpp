@@ -10,6 +10,8 @@
  */
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include "host/platform_compile_info.h"
 #include "fixture.h"
 #include "kernel_platform_ops.h"
 #include "host/raii_scope_guard.h"
@@ -28,6 +30,223 @@ extern "C" int actual_binding_release_rc();
 #endif
 
 namespace native_admission_test {
+namespace {
+class HeapLeaseRunner : public Runner {
+public:
+    explicit HeapLeaseRunner(AdmissionMode mode) :
+        Runner(true, mode) {}
+    size_t heap_leases() const { return heap_pool_->live_leases(); }
+    size_t heap_allocations() const { return heap_pool_->current_base() != nullptr ? 1u : 0u; }
+    bool fail_preparation{false};
+    int prepare_execution(
+        Runtime &runtime, const CallConfig &config, uint32_t slot, const NativeRunIdentity &identity,
+        std::unique_ptr<PreparedExecution> *out
+    ) override {
+        if (fail_preparation) return -4311;
+        return Runner::prepare_execution(runtime, config, slot, identity, out);
+    }
+};
+}  // namespace
+
+TEST_F(NativeAdmissionTest, OversizeGraphFailsBeforeHeapAllocationAndNextPrepareRecovers) {
+    HeapLeaseRunner runner(AdmissionMode::FixedGrant);
+    Attempt oversized(runner, 0, 10);
+    oversized.config.runtime_env.ring_heap[0] = 1024;
+    EXPECT_EQ(oversized.prepare(), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(runner.pooled_heap_base(), nullptr);
+    EXPECT_EQ(runner.heap_leases(), 0u);
+    EXPECT_TRUE(oversized.consume_release());
+    Attempt valid(runner, 0, 11);
+    ASSERT_EQ(valid.prepare(), 0);
+    EXPECT_NE(runner.prepared_heap_base(0, 11), nullptr);
+    EXPECT_EQ(simpler_finalize_run(&runner, valid.storage), 0);
+}
+
+TEST_F(NativeAdmissionTest, ManualSharedHeapQuotaRefusalReportsResourceUnavailable) {
+    HeapLeaseRunner runner(AdmissionMode::FixedGrant);
+    ASSERT_TRUE(runner.set_workspace_limit(64 * kUnit));
+    {
+        DeviceRunnerBase::PrepareWorkspaceScope scope(0, 10);
+        EXPECT_EQ(
+            runner.setup_static_arena(0, {0, 0, 0}, true, 128 * kUnit, 0, kUnit),
+            SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE
+        );
+    }
+    EXPECT_EQ(runner.heap_leases(), 0u);
+    EXPECT_EQ(runner.heap_allocations(), 0u);
+    EXPECT_EQ(runner.charged(), 0u);
+    EXPECT_EQ(runner.abort_run_plan(0, 10), 0);
+}
+
+TEST_F(NativeAdmissionTest, FixedHeapCapacityChangePreservesLivePeer) {
+    HeapLeaseRunner runner(AdmissionMode::FixedGrant);
+    ASSERT_TRUE(runner.set_workspace_limit(160 * kUnit));
+    {
+        DeviceRunnerBase::PrepareWorkspaceScope scope(0, 10);
+        ASSERT_EQ(runner.setup_static_arena(0, {0, 0, 0}, true, 64 * kUnit, 0, kUnit), 0);
+        runner.note_run_resources_proven(0, 10);
+    }
+    void *old = runner.pooled_heap_base();
+    std::memset(old, 0x5a, 64 * kUnit);
+    runner.note_workspace_run_fact(NativeRunIdentity{10, 10, 10, 0}, Fact::Launched);
+    const auto charged = runner.charged();
+    {
+        DeviceRunnerBase::PrepareWorkspaceScope scope(1, 20);
+        EXPECT_EQ(
+            runner.setup_static_arena(1, {0, 0, 1}, true, 128 * kUnit, 0, kUnit), PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        );
+    }
+    EXPECT_EQ(runner.pooled_heap_base(), old);
+    EXPECT_EQ(runner.heap_leases(), 1u);
+    EXPECT_EQ(runner.heap_allocations(), 1u);
+    EXPECT_EQ(runner.charged(), charged);
+    const std::vector<unsigned char> expected(64 * kUnit, 0x5a);
+    EXPECT_EQ(std::memcmp(old, expected.data(), expected.size()), 0);
+    EXPECT_EQ(runner.abort_run_plan(1, 20), 0);
+    runner.release_heap_lease(0);
+    runner.retire(0, 10);
+}
+
+TEST_F(NativeAdmissionTest, IdleSharedHeapCannotBeResizedOnAnotherSlot) {
+    HeapLeaseRunner runner(AdmissionMode::Automatic);
+    ASSERT_TRUE(runner.set_workspace_limit(160 * kUnit));
+    {
+        DeviceRunnerBase::PrepareWorkspaceScope scope(0, 10);
+        ASSERT_EQ(runner.setup_static_arena(0, {0, 0, 0}, true, 64 * kUnit, 0, kUnit), 0);
+        runner.note_run_resources_proven(0, 10);
+    }
+    runner.release_heap_lease(0);
+    runner.note_workspace_run_fact(NativeRunIdentity{10, 10, 10, 0}, Fact::NoDeviceSubmission);
+    runner.retire(0, 10);
+    ASSERT_EQ(runner.heap_leases(), 0u);
+    ASSERT_GT(runner.charged(), 64 * kUnit);
+    {
+        DeviceRunnerBase::PrepareWorkspaceScope scope(1, 20);
+        EXPECT_EQ(
+            runner.setup_static_arena(1, {0, 0, 1}, true, 128 * kUnit, 0, kUnit), PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        );
+    }
+    EXPECT_EQ(runner.heap_leases(), 0u);
+    EXPECT_EQ(runner.heap_allocations(), 1u);
+    EXPECT_LE(runner.charged(), 160 * kUnit);
+    EXPECT_EQ(runner.abort_run_plan(1, 20), 0);
+    runner.note_workspace_run_fact(NativeRunIdentity{20, 20, 20, 1}, Fact::NoDeviceSubmission);
+    runner.retire(1, 20);
+}
+
+TEST_F(NativeAdmissionTest, IdleFixedHeapSurvivesTemporaryAllocationPressure) {
+    HeapLeaseRunner runner(AdmissionMode::Automatic);
+    ASSERT_TRUE(runner.set_workspace_limit(160 * kUnit));
+    {
+        DeviceRunnerBase::PrepareWorkspaceScope scope(0, 10);
+        ASSERT_EQ(runner.setup_static_arena(0, {0, 0, 0}, true, 64 * kUnit, 0, kUnit), 0);
+        runner.note_run_resources_proven(0, 10);
+    }
+    void *base = runner.pooled_heap_base();
+    runner.release_heap_lease(0);
+    runner.note_workspace_run_fact(NativeRunIdentity{10, 10, 10, 0}, Fact::NoDeviceSubmission);
+    runner.retire(0, 10);
+    ASSERT_EQ(runner.heap_leases(), 0u);
+    {
+        DeviceRunnerBase::PrepareWorkspaceScope scope(1, 20);
+        void *temporary = nullptr;
+        size_t capacity = 0;
+        EXPECT_NE(runner.acquire_retained_temp(1, 128 * kUnit, &temporary, &capacity), 0);
+    }
+    EXPECT_EQ(runner.pooled_heap_base(), base);
+    EXPECT_EQ(runner.heap_allocations(), 1u);
+    EXPECT_EQ(runner.abort_run_plan(1, 20), 0);
+}
+
+TEST_F(NativeAdmissionTest, FixedCapacityPersistsAfterLastPeerRetires) {
+    HeapLeaseRunner runner(AdmissionMode::Automatic);
+    ASSERT_TRUE(runner.set_workspace_limit(160 * kUnit));
+    {
+        DeviceRunnerBase::PrepareWorkspaceScope scope(0, 10);
+        ASSERT_EQ(runner.setup_static_arena(0, {0, 0, 0}, true, 64 * kUnit, 0, kUnit), 0);
+        runner.note_run_resources_proven(0, 10);
+    }
+    void *old = runner.pooled_heap_base();
+    std::memset(old, 0x5a, 64 * kUnit);
+    runner.note_workspace_run_fact(NativeRunIdentity{10, 10, 10, 0}, Fact::Launched);
+    {
+        DeviceRunnerBase::PrepareWorkspaceScope scope(1, 20);
+        EXPECT_NE(runner.setup_static_arena(1, {0, 0, 1}, true, 128 * kUnit, 0, kUnit), 0);
+    }
+    EXPECT_EQ(runner.pooled_heap_base(), old);
+    EXPECT_EQ(runner.heap_leases(), 1u);
+    EXPECT_EQ(runner.heap_allocations(), 1u);
+    const std::vector<unsigned char> expected(64 * kUnit, 0x5a);
+    EXPECT_EQ(std::memcmp(old, expected.data(), expected.size()), 0);
+    EXPECT_EQ(runner.abort_run_plan(1, 20), 0);
+    runner.release_heap_lease(0);
+    runner.retire(0, 10);
+    {
+        DeviceRunnerBase::PrepareWorkspaceScope scope(1, 21);
+        EXPECT_EQ(
+            runner.setup_static_arena(1, {0, 0, 1}, true, 128 * kUnit, 0, kUnit), PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        );
+    }
+    EXPECT_EQ(runner.heap_allocations(), 1u);
+    EXPECT_EQ(runner.abort_run_plan(1, 21), 0);
+    runner.note_workspace_run_fact(NativeRunIdentity{21, 21, 21, 1}, Fact::NoDeviceSubmission);
+    runner.retire(1, 21);
+}
+
+TEST_F(NativeAdmissionTest, FailedPrepareReturnsHeapLeaseBesideLivePeer) {
+    HeapLeaseRunner runner(AdmissionMode::FixedGrant);
+    Attempt peer(runner, 0, 10);
+    ASSERT_EQ(peer.prepare(), 0);
+    ASSERT_EQ(simpler_launch_run(&runner, peer.storage), 0);
+    ASSERT_EQ(runner.heap_leases(), 1u);
+    runner.fail_preparation = true;
+    for (uint64_t epoch : {20u, 21u}) {
+        Attempt failed(runner, 1, epoch);
+        EXPECT_EQ(failed.prepare(), -4311);
+        EXPECT_TRUE(failed.consume_release());
+        EXPECT_EQ(runner.heap_leases(), 1u);
+    }
+    ASSERT_EQ(simpler_finalize_run(&runner, peer.storage), 0);
+    EXPECT_EQ(runner.heap_leases(), 0u);
+    ASSERT_EQ(runner.setup_static_arena(1, {0, 0, 1}, true, test_heap_capacity(), 0, 4096), 0);
+    EXPECT_EQ(runner.heap_allocations(), 1u);
+    EXPECT_EQ(runner.abort_run_plan(1, 0), 0);
+    EXPECT_EQ(runner.heap_leases(), 0u);
+}
+
+TEST_F(NativeAdmissionTest, PlanlessAbortReturnsOnlyTheUnpublishedHeapLease) {
+    HeapLeaseRunner runner(AdmissionMode::FixedGrant);
+    Attempt peer(runner, 0, 10);
+    ASSERT_EQ(peer.prepare(), 0);
+    ASSERT_EQ(simpler_launch_run(&runner, peer.storage), 0);
+    const void *peer_heap = runner.prepared_heap_base(0, 10);
+    ASSERT_NE(peer_heap, nullptr);
+    ASSERT_EQ(runner.setup_static_arena(1, {0, 0, 1}, true, test_heap_capacity(), 0, 4096), 0);
+    ASSERT_EQ(runner.pooled_heap_base(), peer_heap);
+    EXPECT_EQ(runner.prepared_heap_base(0, 10), peer_heap);
+    EXPECT_EQ(runner.prepared_heap_base(0, 11), nullptr);
+    runner.enable_automatic_admission();
+    ASSERT_EQ(runner.plan(1).phase, AutoAdmissionState::Phase::None);
+    ASSERT_EQ(runner.abort_run_plan(1, 20), 0);
+    EXPECT_EQ(runner.heap_leases(), 1u);
+    EXPECT_EQ(runner.prepared_heap_base(0, 10), peer_heap);
+    ASSERT_EQ(simpler_finalize_run(&runner, peer.storage), 0);
+    EXPECT_EQ(runner.heap_leases(), 0u);
+    EXPECT_EQ(runner.heap_allocations(), 1u);
+    EXPECT_EQ(runner.prepared_heap_base(0, 10), nullptr);
+}
+
+TEST_F(NativeAdmissionTest, ReplacingSlotHeapLeaseKeepsFixedAllocation) {
+    HeapLeaseRunner runner(AdmissionMode::FixedGrant);
+    ASSERT_EQ(runner.setup_static_arena(0, {0, 0, 0}, true, 4096, 0, 4096), 0);
+    ASSERT_EQ(runner.heap_leases(), 1u);
+    ASSERT_EQ(runner.setup_static_arena(0, {0, 0, 0}, true, 4096, 0, 4096), 0);
+    EXPECT_EQ(runner.heap_leases(), 1u);
+    EXPECT_EQ(runner.heap_allocations(), 1u);
+    EXPECT_EQ(runner.abort_run_plan(0, 0), 0);
+    EXPECT_EQ(runner.heap_leases(), 0u);
+}
+
 TEST_F(NativeAdmissionTest, CallbackRejectsAnotherContextBeforeChangingItsRunState) {
     Runner outer_runner;
     Runner inner_runner;
@@ -59,7 +278,7 @@ TEST_F(NativeAdmissionTest, CallbackRejectsAnotherContextBeforeChangingItsRunSta
     ASSERT_EQ(outer.prepare(), 0);
     EXPECT_TRUE(entered);
     EXPECT_EQ(callbacks, 1);
-    EXPECT_TRUE(outer_runner.arena_referenced(1, 0));
+    EXPECT_NE(outer_runner.pooled_heap(1), nullptr);
     EXPECT_TRUE(outer_runner.arena_referenced(1, 2));
     EXPECT_TRUE(outer_runner.holds_epoch(20));
     EXPECT_FALSE(outer_runner.holds_epoch(30));
@@ -129,7 +348,7 @@ TEST_F(NativeAdmissionTest, ReservedPrepareExcludesAWarmConsumerBeforeTrimmingIt
     Attempt warmup(runner, 2, 10);
     ASSERT_EQ(warmup.prepare(), 0);
     ASSERT_EQ(simpler_finalize_run(&runner, warmup.storage), 0);
-    void *const idle_heap = runner.arena_region_backing(2, 0);
+    void *const idle_heap = runner.pooled_heap(2);
     void *const idle_image = runner.arena_region_backing(2, 2);
     ASSERT_NE(idle_heap, nullptr);
     ASSERT_NE(idle_image, nullptr);
@@ -153,7 +372,7 @@ TEST_F(NativeAdmissionTest, ReservedPrepareExcludesAWarmConsumerBeforeTrimmingIt
         EXPECT_EQ(control().allocations, allocations);
         EXPECT_EQ(runner.charged(), charged);
         EXPECT_EQ(runner.reservations(), 1u);
-        EXPECT_EQ(runner.arena_region_backing(2, 0), idle_heap);
+        EXPECT_EQ(runner.pooled_heap(2), idle_heap);
         EXPECT_EQ(runner.arena_region_backing(2, 2), idle_image);
         if (rc == 0) EXPECT_EQ(simpler_finalize_run(&runner, warm_consumer.storage), 0);
         attempts_before_refusal = control().allocations;
@@ -370,6 +589,9 @@ TEST_F(NativeAdmissionTest, RecursiveUnsupportedArgsDumpDoesNotAcquireOrCertifyA
 namespace {
 class HbgImageCaptureRunner : public Runner {
 public:
+    size_t heap_leases() const { return heap_pool_->live_leases(); }
+    size_t heap_allocations() const { return heap_pool_->current_base() != nullptr ? 1u : 0u; }
+    void trim_heap() { (void)reclaim_workspace_obsolete(); }
     HbgImageCaptureRunner() {
         static int binary;
         aicore_bin_handle_ = &binary;
@@ -414,6 +636,52 @@ public:
     size_t copies_before_entry{0};
 };
 }  // namespace
+
+TEST_F(NativeAdmissionTest, CapturedSlotSharesHeapWithoutRetainingAnotherSlotsImage) {
+    HbgImageCaptureRunner runner;
+    ASSERT_EQ(runner.initialize_kernel(), 0);
+    auto capture_args = [](Attempt &attempt) {
+        attempt.descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
+        attempt.args.tensor(0).address_space = AddressSpace::DEVICE;
+        attempt.args.tensor(0).transfer = TensorTransfer::NONE;
+    };
+    Attempt warm(runner, 0, 10030);
+    capture_args(warm);
+    ASSERT_EQ(warm.prepare(), 0);
+    ASSERT_EQ(simpler_finalize_run(&runner, warm.storage), 0);
+    void *heap0 = runner.pooled_heap_base();
+    void *image0 = runner.arena_region_backing(0, 2);
+    ASSERT_NE(heap0, nullptr);
+    ASSERT_NE(image0, nullptr);
+    Attempt captured(runner, 1, 10031);
+    capture_args(captured);
+    ASSERT_EQ(captured.prepare(), 0);
+    EXPECT_EQ(runner.prepared_heap_base(1, 10031), heap0);
+    void *image1 = runner.arena_region_backing(1, 2);
+    RuntimeHandle reference = nullptr;
+    auto cleanup = RAIIScopeGuard([&] {
+        control().recording_active = false;
+        (void)simpler_finalize_run(&runner, captured.storage);
+        if (reference != nullptr) (void)simpler_release_run_resources(&runner, reference);
+    });
+    int caller;
+    ASSERT_EQ(simpler_retain_run_resources(&runner, captured.storage, &caller, &reference), 0);
+    control().recording_active = true;
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, captured.storage, &caller, nullptr), 0);
+    control().recording_active = false;
+    ASSERT_EQ(simpler_finalize_run(&runner, captured.storage), 0);
+    ASSERT_TRUE(runner.set_workspace_limit(runner.charged()));
+    Attempt reuse(runner, 0, 10032);
+    capture_args(reuse);
+    ASSERT_EQ(reuse.prepare(), 0);
+    EXPECT_EQ(runner.prepared_heap_base(0, 10032), heap0);
+    EXPECT_EQ(runner.arena_region_backing(0, 2), image0);
+    EXPECT_EQ(runner.prepared_heap_base(1, 10031), heap0);
+    EXPECT_EQ(runner.arena_region_backing(1, 2), image1);
+    ASSERT_EQ(simpler_finalize_run(&runner, reuse.storage), 0);
+    ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
+    reference = nullptr;
+}
 
 TEST_F(NativeAdmissionTest, CapturedHbgImageUsesPinnedLaunchSourceThroughOriginalRunRetirement) {
     HbgImageCaptureRunner runner;
@@ -473,6 +741,139 @@ TEST_F(NativeAdmissionTest, CapturedHbgImageUsesPinnedLaunchSourceThroughOrigina
     reference = nullptr;
     EXPECT_TRUE(backing.expired());
     cleanup.dismiss();
+}
+
+TEST_F(NativeAdmissionTest, CapturePreparationSharesHeapAndKeepsSchedulerBackingIndependent) {
+    HbgImageCaptureRunner runner;
+    ASSERT_EQ(runner.initialize_kernel(), 0);
+    Attempt attempt(runner, 0, 7003);
+    attempt.descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
+    attempt.args.tensor(0).address_space = AddressSpace::DEVICE;
+    attempt.args.tensor(0).transfer = TensorTransfer::NONE;
+    ASSERT_EQ(attempt.prepare(), 0);
+    EXPECT_NE(runner.prepared_heap_base(0, 7003), nullptr);
+    EXPECT_EQ(runner.heap_leases(), 1u);
+    if (std::strcmp(get_platform(), "a5sim") == 0) EXPECT_GT(runner.scheduler_capacity(0), 0u);
+    ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+}
+
+TEST_F(NativeAdmissionTest, RetainedCaptureHeapSurvivesEagerPrepareTrimAndFailedRelease) {
+    HbgImageCaptureRunner runner;
+    ASSERT_EQ(runner.initialize_kernel(), 0);
+    Attempt capture(runner, 0, 7010);
+    capture.descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
+    capture.args.tensor(0).address_space = AddressSpace::DEVICE;
+    capture.args.tensor(0).transfer = TensorTransfer::NONE;
+    ASSERT_EQ(capture.prepare(), 0);
+    void *heap = runner.prepared_heap_base(0, 7010);
+    ASSERT_NE(heap, nullptr);
+    std::memset(heap, 0x5a, 16);
+    const std::array<unsigned char, 16> expected{0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a,
+                                                 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a};
+    int caller;
+    RuntimeHandle reference = nullptr;
+    RuntimeHandle successor_reference = nullptr;
+    ASSERT_EQ(simpler_retain_run_resources(&runner, capture.storage, &caller, &reference), 0);
+    auto cleanup = RAIIScopeGuard([&] {
+        control().recording_active = false;
+        control().stream_sync_rc = 0;
+        (void)simpler_finalize_run(&runner, capture.storage);
+        if (reference) (void)simpler_release_run_resources(&runner, reference);
+        if (successor_reference) (void)simpler_release_run_resources(&runner, successor_reference);
+    });
+    control().recording_active = true;
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, capture.storage, &caller, nullptr), 0);
+    control().recording_active = false;
+    ASSERT_EQ(simpler_finalize_run(&runner, capture.storage), 0);
+    ASSERT_EQ(runner.heap_leases(), 1u);
+    runner.trim_heap();
+    EXPECT_EQ(runner.pooled_heap_base(), heap);
+
+    Attempt successor(runner, 0, 7012);
+    successor.descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
+    successor.args.tensor(0).address_space = AddressSpace::DEVICE;
+    successor.args.tensor(0).transfer = TensorTransfer::NONE;
+    ASSERT_EQ(successor.prepare(), 0);
+    EXPECT_EQ(runner.prepared_heap_base(0, 7012), heap);
+    ASSERT_EQ(simpler_retain_run_resources(&runner, successor.storage, &caller, &successor_reference), 0);
+    control().recording_active = true;
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, successor.storage, &caller, nullptr), 0);
+    control().recording_active = false;
+    ASSERT_EQ(simpler_finalize_run(&runner, successor.storage), 0);
+    EXPECT_EQ(runner.heap_leases(), 2u);
+
+    Attempt eager(runner, 0, 7013);
+    eager.args.tensor(0).address_space = AddressSpace::DEVICE;
+    eager.args.tensor(0).transfer = TensorTransfer::NONE;
+    ASSERT_EQ(eager.prepare(), 0);
+    EXPECT_EQ(runner.prepared_heap_base(0, 7013), heap);
+    EXPECT_EQ(runner.heap_leases(), 3u);
+    EXPECT_EQ(runner.heap_allocations(), 1u);
+    EXPECT_EQ(std::memcmp(heap, expected.data(), expected.size()), 0)
+        << "preparation must not overwrite another execution's shared scratch";
+    ASSERT_EQ(simpler_finalize_run(&runner, eager.storage), 0);
+    EXPECT_EQ(runner.heap_leases(), 2u);
+
+    control().stream_sync_rc = -4312;
+    EXPECT_EQ(simpler_release_run_resources(&runner, reference), -4312);
+    runner.trim_heap();
+    EXPECT_EQ(runner.heap_leases(), 2u);
+    EXPECT_EQ(runner.pooled_heap_base(), heap);
+    control().stream_sync_rc = 0;
+    ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
+    reference = nullptr;
+    EXPECT_EQ(runner.heap_leases(), 1u);
+    runner.trim_heap();
+    EXPECT_EQ(runner.pooled_heap_base(), heap);
+    ASSERT_EQ(simpler_release_run_resources(&runner, successor_reference), 0);
+    successor_reference = nullptr;
+    EXPECT_EQ(runner.heap_leases(), 0u);
+    runner.trim_heap();
+    EXPECT_EQ(runner.heap_allocations(), 1u);
+}
+
+TEST_F(NativeAdmissionTest, RetainedCaptureBackingIsReplacedNotOverwrittenByASuccessor) {
+    HbgImageCaptureRunner runner;
+    ASSERT_EQ(runner.initialize_kernel(), 0);
+    Attempt capture(runner, 0, 7004);
+    capture.descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
+    capture.args.tensor(0).address_space = AddressSpace::DEVICE;
+    capture.args.tensor(0).transfer = TensorTransfer::NONE;
+    auto reset_recording = RAIIScopeGuard([] {
+        control().recording_active = false;
+    });
+    ASSERT_EQ(capture.prepare(), 0);
+    auto *capture_state = static_cast<NativeRunContext<DeviceRunnerBase> *>(capture.storage);
+    const auto capture_publication = capture_state->runtime->prepared_publication();
+    ASSERT_NE(capture_publication, nullptr);
+    const void *const capture_target = capture_publication->device_target;
+    const uint64_t capture_state_base = capture_state->runtime->dev.scheduler_bootstrap.worker_context_base;
+    int caller;
+    RuntimeHandle reference = nullptr;
+    ASSERT_EQ(simpler_retain_run_resources(&runner, capture.storage, &caller, &reference), 0);
+    auto release = RAIIScopeGuard([&] {
+        control().recording_active = false;
+        (void)simpler_release_run_resources(&runner, reference);
+    });
+    control().recording_active = true;
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, capture.storage, &caller, nullptr), 0);
+    control().recording_active = false;
+    ASSERT_EQ(simpler_finalize_run(&runner, capture.storage), 0);
+
+    // With the external reference still alive, the slot can prepare a
+    // successor. The retained backing must be replaced, never overwritten.
+    Attempt successor(runner, 0, 7005);
+    successor.args.tensor(0).address_space = AddressSpace::DEVICE;
+    successor.args.tensor(0).transfer = TensorTransfer::NONE;
+    ASSERT_EQ(successor.prepare(), 0);
+    auto *successor_state = static_cast<NativeRunContext<DeviceRunnerBase> *>(successor.storage);
+    const auto successor_publication = successor_state->runtime->prepared_publication();
+    ASSERT_NE(successor_publication, nullptr);
+    EXPECT_NE(successor_publication->device_target, capture_target);
+    if (std::strcmp(get_platform(), "a5sim") == 0)
+        EXPECT_NE(successor_state->runtime->dev.scheduler_bootstrap.worker_context_base, capture_state_base)
+            << "the retained scheduler storage is detached, not rewritten";
+    ASSERT_EQ(simpler_finalize_run(&runner, successor.storage), 0);
 }
 
 TEST_F(NativeAdmissionTest, HbgPrerequisitesAndImagePublishBeforeTheDescriptorFromOwnedSnapshots) {
