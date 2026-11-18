@@ -185,7 +185,7 @@ static inline __aicore__ bool claim(
     auto *words = scheduler_state_at<SchedulerAsyncDirectoryWord>(local.base, directory_offset);
     const uint32_t word = cursor / 64;
     const uint32_t bit = cursor % 64;
-    const uint64_t mask = scheduler_gm_query(words[word].bits) & (UINT64_MAX << bit);
+    const uint64_t mask = scheduler_async_directory_query(words[word], bit, count - word * 64) & (UINT64_MAX << bit);
     const uint64_t next_word = static_cast<uint64_t>(word + 1) * 64;
     cursor = next_word < count ? static_cast<uint32_t>(next_word) : 0;
     if (mask == 0) return true;
@@ -282,9 +282,10 @@ scheduler_async_writer_for_group(const SchedulerAsyncLocalState &local, uint32_t
     return {local.base, local.bytes, local.layout->run_epoch, offset, group_index};
 }
 
-inline __aicore__ bool scheduler_async_begin_prebound_execution(
+static inline __aicore__ bool scheduler_async_begin_prebound_execution(
     SchedulerAsyncLocalState *local, int64_t task_ref, __gm__ GlobalContext &global, pto2::resident::AsyncWriter &writer
 ) {
+    SchedulerScalarScope scalar_detail(SchedPhaseKind::ScalarAsyncBeginPrebound, task_ref);
     using namespace scheduler_async_detail;
     writer = AsyncWriter{};
     global.async_present = 0;
@@ -341,6 +342,7 @@ static inline __aicore__ bool scheduler_async_seal_execution(
     SchedulerAsyncLocalState *local, int64_t task_ref, uint32_t block, uint32_t lane,
     const pto2::resident::AsyncWriter &writer, bool *has_deferred = nullptr
 ) {
+    SchedulerScalarScope scalar_detail(SchedPhaseKind::ScalarAsyncSealExecution, task_ref);
     if (has_deferred != nullptr) *has_deferred = false;
     using namespace scheduler_async_detail;
     if (local == nullptr) return true;
@@ -408,7 +410,7 @@ static inline __aicore__ bool scheduler_async_seal_execution(
         scheduler_state_at<SchedulerAsyncDirectoryWord>(local->base, local->layout->check_directory_offset);
     scheduler_async_lease_initialize(leases[writer.group_index]);
     publish_activity(*local);
-    if (scheduler_async_directory_publish(directory[writer.group_index / 64].bits, writer.group_index % 64) !=
+    if (scheduler_async_directory_publish(directory[writer.group_index / 64], writer.group_index % 64) !=
         SchedulerAsyncDirectoryResult::SUCCESS)
         return fail(*local, task_ref);
     if (has_deferred != nullptr) *has_deferred = true;
@@ -419,6 +421,7 @@ static inline __aicore__ bool scheduler_async_seal_execution(
 // its conditions. The close RMW supplies the join observation and ownership.
 static inline __aicore__ SchedulerAsyncCompletion
 scheduler_async_close_computation(SchedulerAsyncLocalState *local, int64_t task_ref, uint64_t gate) {
+    SchedulerScalarScope scalar_detail(SchedPhaseKind::ScalarAsyncCloseComputation, task_ref);
     using namespace scheduler_async_detail;
     if (local == nullptr) return {};
     uint32_t index = ASYNC_INVALID_INDEX;
@@ -594,9 +597,11 @@ static inline __aicore__ bool scheduler_async_check_step(
         return scheduler_async_lease_release(leases[index], owned).result == SchedulerAsyncLeaseResult::SUCCESS ||
                failed(task_ref);
     auto *directory = scheduler_state_at<SchedulerAsyncDirectoryWord>(local.base, local.layout->check_directory_offset);
-    if (scheduler_async_lease_finish(leases[index], owned).result != SchedulerAsyncLeaseResult::SUCCESS ||
-        scheduler_async_directory_clear(directory[index / 64].bits, index % 64) !=
-            SchedulerAsyncDirectoryResult::SUCCESS)
+    // Only the successful terminal transition owns the clear and Q contribution.
+    // A stale directory snapshot cannot turn a finished lease into another owner.
+    if (scheduler_async_lease_finish(leases[index], owned).result != SchedulerAsyncLeaseResult::SUCCESS)
+        return fail(local, task_ref);
+    if (scheduler_async_directory_clear(directory[index / 64], index % 64) != SchedulerAsyncDirectoryResult::SUCCESS)
         return fail(local, task_ref);
     const auto *counter = scheduler_completion_counter_at(local.base, local.completion_counters_offset, task_ref);
     if (counter != nullptr) {

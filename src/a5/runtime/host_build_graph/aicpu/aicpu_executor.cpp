@@ -623,17 +623,29 @@ __attribute__((weak)) int32_t AicpuExecutor::supervise(Runtime *runtime, int32_t
             LOG_ERROR("A5 HBG AICore scheduler is missing run control");
             supervisor_rc = -1;
         } else {
+            if (run_control->inline_completed_count > run_control->expected_task_count) {
+                LOG_ERROR("A5 HBG: inline completion count exceeds expected tasks");
+                return -1;
+            }
             const uint64_t executable_task_count =
                 run_control->expected_task_count - run_control->inline_completed_count;
             uint32_t error_poll_count = 0;
             uint64_t last_progress_cycles = ready_watchdog_.last_progress();
-            uint64_t last_resolved_task_count = run_control->resolved_task_count;
+            uint64_t last_resolved_task_count = aicore_scheduler_resolved_count(run_control);
             bool bootstrap_was_complete = run_control->bootstrap_complete != 0;
             const uint64_t timeout_cycles = resident_scheduler_timeout_cycles();
             while (true) {
                 service_args_dump(thread_idx);
                 const bool bootstrap_complete = run_control->bootstrap_complete != 0;
-                const uint64_t resolved_task_count = run_control->resolved_task_count;
+                const uint64_t resolved_task_count = aicore_scheduler_resolved_count(run_control);
+                if (resolved_task_count > executable_task_count) {
+                    LOG_ERROR(
+                        "A5 HBG: progress count exceeds expected tasks: resolved=%" PRIu64 " expected=%" PRIu64,
+                        resolved_task_count, executable_task_count
+                    );
+                    supervisor_rc = -1;
+                    break;
+                }
                 const bool tasks_resolved = resolved_task_count == executable_task_count;
                 const uint64_t now = get_sys_cnt_aicpu();
                 if (args_dump_services_ != nullptr) {
@@ -671,13 +683,13 @@ __attribute__((weak)) int32_t AicpuExecutor::supervise(Runtime *runtime, int32_t
                     run_control->error_task_ref, scheduler_error, run_control->error_core_id,
                     run_control->error_core_type, run_control->error_graph_task_count,
                     run_control->error_storage_address, run_control->error_task_window_last_index,
-                    run_control->error_site, run_control->resolved_task_count, run_control->expected_task_count,
-                    run_control->inline_completed_count
+                    run_control->error_site, aicore_scheduler_resolved_count(run_control),
+                    run_control->expected_task_count, run_control->inline_completed_count
                 );
                 supervisor_rc = publish_aicore_scheduler_runtime_error(runtime, "execution");
                 if (supervisor_rc == 0) supervisor_rc = -1;
             }
-            const uint64_t resolved_task_count = run_control->resolved_task_count;
+            const uint64_t resolved_task_count = aicore_scheduler_resolved_count(run_control);
             if (supervisor_rc == 0 &&
                 resolved_task_count + run_control->inline_completed_count != run_control->expected_task_count) {
                 LOG_ERROR(

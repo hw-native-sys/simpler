@@ -756,8 +756,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
                     return false;
                 }
                 const uint32_t kind = record.kind & UINT32_C(0xffff);
-                if (kind < static_cast<uint32_t>(SchedPhaseKind::ScalarWindow) ||
-                    kind > static_cast<uint32_t>(SchedPhaseKind::ScalarCounterAccounting) ||
+                if (kind < static_cast<uint32_t>(SchedPhaseKind::ScalarWindow) || kind > UINT8_MAX ||
                     std::strcmp(sched_phase_kind_name(static_cast<SchedPhaseKind>(kind)), "unknown") == 0 ||
                     record.start_time == 0 || record.end_time < record.start_time) {
                     LOG_WARN("A5 HBG: invalid Scalar interval for worker=%" PRIu64, worker);
@@ -1922,10 +1921,14 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG: completion counter plan failed: %s", task_order_error.c_str());
         return false;
     }
+    // The optional run-progress counter precedes all chain counters in the slot's INC pool.
+    const uint64_t device_tasks = node_count - inline_completed_task_refs.size();
+    const size_t chain_base = device_tasks != 0 && device_tasks <= UINT32_MAX ? 1 : 0;
     SchedulerDoneNotifications counter_notifications;
     try {
         if (api->acquire_scheduler_notifications(
-                SchedulerNotificationPurpose::COMPLETION_COUNTER, counter_plan.chains.size(), &counter_notifications
+                SchedulerNotificationPurpose::COMPLETION_COUNTER, chain_base + counter_plan.chains.size(),
+                &counter_notifications
             ) != 0)
             throw std::runtime_error("cannot acquire retained completion counters");
     } catch (const std::exception &error) {
@@ -1940,10 +1943,11 @@ bool create_scheduler_state(
     uint64_t mapped_counter_tasks = 0;
     for (uint64_t ref = 0; ref < node_count; ++ref) {
         const uint32_t chain = counter_plan.task_chains[ref];
-        if (chain != UINT32_MAX && counter_notifications.addresses[chain] != 0 &&
-            counter_notifications.add_addresses[chain] != 0) {
+        const size_t slot = chain_base + chain;
+        if (chain != UINT32_MAX && counter_notifications.addresses[slot] != 0 &&
+            counter_notifications.add_addresses[slot] != 0) {
             counter_descriptors[ref] = {
-                counter_notifications.addresses[chain], counter_notifications.add_addresses[chain],
+                counter_notifications.addresses[slot], counter_notifications.add_addresses[slot],
                 counter_plan.thresholds[ref], counter_plan.chains[chain].limit
             };
             ++mapped_counter_tasks;
@@ -1951,10 +1955,13 @@ bool create_scheduler_state(
             legacy_done_refs.push_back(ref);
         }
     }
+    // Ordinary DONE slots precede the two 32-bit CHECK halves per directory word in the SET pool.
+    const size_t check_base = legacy_done_refs.size();
+    const size_t check_halves = (static_cast<size_t>(async_plan.layout.group_count) + 31) / 32;
     SchedulerDoneNotifications notifications;
     try {
         if (api->acquire_scheduler_notifications(
-                SchedulerNotificationPurpose::TASK_STATE, legacy_done_refs.size(), &notifications
+                SchedulerNotificationPurpose::TASK_STATE, check_base + check_halves, &notifications
             ) != 0)
             throw std::runtime_error("cannot acquire retained task notifications");
     } catch (const std::exception &error) {
@@ -1970,7 +1977,8 @@ bool create_scheduler_state(
             return credits != 0;
         });
     const size_t mapped_counter_chains = std::count_if(
-        counter_notifications.add_addresses.begin(), counter_notifications.add_addresses.end(), [](uint64_t address) {
+        counter_notifications.add_addresses.begin() + chain_base, counter_notifications.add_addresses.end(),
+        [](uint64_t address) {
             return address != 0;
         }
     );
@@ -1980,30 +1988,23 @@ bool create_scheduler_state(
         counter_plan.chains.size(), mapped_counter_chains, eligible_counter_tasks, mapped_counter_tasks
     );
 
-    // The total number of MIX blocks bounds every cluster's sequence. Larger
-    // graphs retain the full-width GM protocol; no sequence is truncated.
-    uint64_t mix_blocks = 0;
-    for (const auto &metadata : task_metadata)
-        if (scheduler_task_is_mix(metadata.flags)) mix_blocks += metadata.logical_block_num;
-    using MixNotificationAddresses = decltype(SchedulerGroupMailbox::notification_addresses);
-    constexpr size_t mix_notification_lanes = std::extent_v<MixNotificationAddresses, 0>;
-    constexpr size_t mix_notification_phases = std::extent_v<MixNotificationAddresses, 1>;
-    constexpr size_t mix_notification_words = mix_notification_lanes * mix_notification_phases;
-    SchedulerDoneNotifications mix_notifications;
-    if (spmd.sync_mix_task_count != 0 && mix_blocks < (UINT64_C(1) << 31)) {
-        try {
-            if (api->acquire_scheduler_notifications(
-                    SchedulerNotificationPurpose::MIX_ACK,
-                    static_cast<size_t>(spmd.cluster_count) * mix_notification_words, &mix_notifications
-                ) != 0)
-                throw std::runtime_error("cannot acquire retained MIX notifications");
-        } catch (const std::exception &error) {
-            LOG_ERROR("A5 HBG: cannot prepare MIX notifications: %s", error.what());
-            return false;
+    if (check_halves != 0) {
+        auto *directory =
+            scheduler_state_at<SchedulerAsyncDirectoryWord>(host_base, async_plan.layout.check_directory_offset);
+        size_t mapped = 0;
+        for (size_t half = 0; half < check_halves; ++half) {
+            const uint64_t address = notifications.addresses[check_base + half];
+            // BIT_WR and BIT_CLR are aliases of a 32-byte SET slot. Zero selects GM for this half.
+            const uint64_t slot = (address & UINT64_C(0x1f)) == 0 ? address : 0;
+            directory[half / 2].notification_addresses[half % 2] = slot;
+            mapped += slot != 0;
         }
+        LOG_TIMING(
+            "A5 HBG: CHECK directory groups=%u mapped_halves=%zu gm_halves=%zu", async_plan.layout.group_count, mapped,
+            check_halves - mapped
+        );
     }
 
-    if (mix_notifications.owner != nullptr) runtime->retain_pending_resource(std::move(mix_notifications.owner));
     if (protocol_profiling) {
         try {
             SchedulerGraphView snapshot = host_graph;
@@ -2060,6 +2061,15 @@ bool create_scheduler_state(
     auto *run_control = scheduler_state_at<SchedulerRunControl>(host_base, layout.run_control_offset);
     run_control->expected_task_count = node_count;
     run_control->inline_completed_count = inline_completed_task_refs.size();
+    if (chain_base != 0 && counter_notifications.addresses[0] != 0 && counter_notifications.add_addresses[0] != 0) {
+        run_control->run_completed_read_address = counter_notifications.addresses[0];
+        run_control->run_completed_add_address = counter_notifications.add_addresses[0];
+    }
+    LOG_TIMING(
+        "A5 HBG: run progress backend=%s device_tasks=%" PRIu64 " inline_tasks=%zu",
+        run_control->run_completed_add_address != 0 ? "CntNotify-INC" : "GM-FAA", device_tasks,
+        inline_completed_task_refs.size()
+    );
     run_control->aic_worker_demand = aic_worker_demand;
     run_control->aiv_worker_demand = aiv_worker_demand;
     run_control->chip_swimlane_level = runtime->dev.chip_swimlane_level;
@@ -2098,21 +2108,6 @@ bool create_scheduler_state(
         context.original_task_count = static_cast<uint64_t>(total_tasks);
         context.scheduler_state_bytes = layout.total_size;
         context.worker_index = static_cast<uint64_t>(i);
-    }
-
-    if (!mix_notifications.addresses.empty()) {
-        auto *mailboxes = scheduler_state_at<SchedulerGroupMailbox>(host_base, layout.group_mailboxes_offset);
-        for (uint64_t cluster = 0; cluster < spmd.cluster_count; ++cluster) {
-            const auto *addresses = mix_notifications.addresses.data() + cluster * mix_notification_words;
-            if (std::all_of(addresses, addresses + mix_notification_words, [](uint64_t address) {
-                    return address != 0;
-                }))
-                for (size_t lane = 0; lane < mix_notification_lanes; ++lane)
-                    std::copy(
-                        addresses + lane * mix_notification_phases, addresses + (lane + 1) * mix_notification_phases,
-                        mailboxes[cluster].notification_addresses[lane]
-                    );
-        }
     }
 
     runtime->publish_scheduler_bootstrap(

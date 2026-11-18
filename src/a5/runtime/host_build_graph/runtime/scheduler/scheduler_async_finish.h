@@ -59,7 +59,7 @@ static inline __aicore__ bool scheduler_async_complete_task(
     scheduler_cache_barrier();
     scheduler_publish_task_done(base, local, task_ref);
     scheduler_remember_task_proof(local, task_ref, SchedulerTaskProof::DONE);
-    ++local->pending_completed;
+    scheduler_report_task_completed(run);
     return true;
 }
 
@@ -94,6 +94,7 @@ static inline __aicore__ bool scheduler_service_async_slice(
         async, UINT32_C(1) << local->config.self_core_type, 8, SchedulerAsyncCompletionObserver{}, made_progress,
         completion
     );
+    scalar_step.close();
     if (ok && completion.result == SchedulerAsyncCompletionResult::FINISH_OWNER)
         ok = scheduler_async_complete_task(graph, base, local, run, completion);
     if (!ok)

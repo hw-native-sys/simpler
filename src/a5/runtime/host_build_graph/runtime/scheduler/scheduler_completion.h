@@ -16,17 +16,6 @@
 #include "scheduler_gm_mix.h"
 #include "scheduler_cluster_mix.h"
 
-// Idle and the run epilogue flush pending counts; native runs also publish
-// bounded progress batches. Trace/error publication precedes the exit count.
-static inline __aicore__ void
-scheduler_flush_completions(__gm__ SchedulerRunControl *run_control, SchedulerLocalState *local) {
-    const uint64_t completed = local->pending_completed;
-    if (completed == 0) return;
-    scheduler_cache_barrier();
-    scheduler_gm_fetch_add_discard(run_control->resolved_task_count, completed);
-    local->pending_completed = 0;
-}
-
 // Cancellation owns only an unstarted local handle. Armed groups retire at
 // the failed run's all-core fence before their storage can be reused.
 static inline __aicore__ bool
@@ -113,6 +102,7 @@ static inline __aicore__ SchedulerSubtaskFinishResult scheduler_contribute_subta
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     const SchedulerLocalSlotState &completed, uint32_t pending_slot, uint64_t *completed_gate = nullptr
 ) {
+    SchedulerScalarScope scope(local, SchedPhaseKind::ScalarSubtaskContribute, completed.task_ref);
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) return SchedulerSubtaskFinishResult::ERROR;
     auto *control = scheduler_task_control_at(base, local, completed.task_ref);
     const bool block_owner = scheduler_slot_uses_admission(local, completed) && !completed.gm_mix;
@@ -284,7 +274,7 @@ static inline __aicore__ bool scheduler_complete_own_slot(
                 scheduler->continuation_task_ref = task_ref;
             if (contribution == SchedulerSubtaskFinishResult::TASK_LAST) {
                 scheduler_remember_task_proof(scheduler, task_ref, SchedulerTaskProof::DONE);
-                ++scheduler->pending_completed;
+                scheduler_report_task_completed(run_control);
             } else if (contribution == SchedulerSubtaskFinishResult::TASK_LAST_DEFERRED) {
                 const auto completion = scheduler_async_close_computation(scheduler->async, task_ref, completed_gate);
                 completion_ok =

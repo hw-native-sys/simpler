@@ -13,6 +13,7 @@ Sequence integrity proves lossless local event streams, not scheduler causality,
 execution coverage, membership, dependency ordering or Mix resource correctness.
 """
 
+CONTROL_NOTIFY_ACCOUNTING = 1 << 26
 COUNTER_ACCOUNTING = 1 << 27
 MEMBER_FROM_CLAIM = 1 << 28
 COMPLETION_FROM_GROUP = 1 << 29

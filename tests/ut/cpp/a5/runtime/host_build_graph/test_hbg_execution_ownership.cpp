@@ -12,6 +12,9 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <atomic>
+#include <thread>
+#include <vector>
 #include <functional>
 #include <set>
 #include <utility>
@@ -234,8 +237,8 @@ struct RefillFixture {
     scheduler_test::BasicGraphBuffer<16> graph;
     SchedulerLocalState *local{nullptr};
 
-    explicit RefillFixture(uint32_t tasks) :
-        storage(tasks, 6, 2),
+    explicit RefillFixture(uint32_t tasks, uint32_t capacity_per_task = 2) :
+        storage(tasks, 6, capacity_per_task),
         graph(tasks) {
         for (uint32_t task = 0; task < tasks; ++task)
             graph.executable(task, 0);
@@ -255,12 +258,17 @@ struct RefillFixture {
         return scheduler_state_at<SchedulerTaskControl>(base(), storage.layout.task_controls_offset) + task;
     }
     void reserve(uint32_t task, uint32_t worker, SchedulerPreparedHandle *handle) {
-        const uint64_t block = scheduler_gm_fetch_add(control(task)->next_block, UINT64_C(1));
+        uint32_t block = storage.metadata[task].logical_block_num;
+        bool closes_supply = false;
+        ASSERT_TRUE(scheduler_claim_ordinary_block(
+            graph.graph(), base(), storage.local_context(&storage.contexts[worker]), storage.run_control, task,
+            storage.metadata[task].logical_block_num, &block, &closes_supply
+        ));
         ASSERT_LT(block, storage.metadata[task].logical_block_num);
         ASSERT_TRUE(scheduler_acquire_execution_token(base(), local->config.prepared, worker, task, block, 0, handle));
         ASSERT_TRUE(scheduler_close_ordinary_supply(
             graph.graph(), base(), storage.local_context(&storage.contexts[worker]), storage.run_control, task,
-            static_cast<uint32_t>(block), storage.metadata[task].logical_block_num
+            closes_supply, storage.metadata[task].logical_block_num
         ));
     }
     // Seed a known ownership boundary using the actual ticket and Call claim.
@@ -273,7 +281,8 @@ struct RefillFixture {
         ASSERT_NE(entry, std::end(local->execution_tokens));
         ASSERT_NO_FATAL_FAILURE(reserve(task, 0, &entry->prepared));
         entry->task_ref = task;
-        entry->block_idx = static_cast<uint32_t>(control(task)->next_block - 1);
+        entry->block_idx =
+            scheduler_prepared_call_at(base(), local->config.prepared, entry->prepared.execution_index)->block_idx;
         entry->subtask_slot = 0;
         ASSERT_TRUE(scheduler_prepare_token_binding(base(), local, *entry, 0));
         entry->phase = SchedulerExecutionTokenPhase::WAIT_FANIN;
@@ -380,7 +389,7 @@ TEST(HbgExecutionRefill, CounterAccountingReusesOnlyAnObservedDoneProof) {
     ));
     EXPECT_FALSE(progress);
     EXPECT_EQ(notify_count, 1u);
-    EXPECT_EQ(fixture.local->pending_completed, 0u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.storage.run_control), 0u);
     value = 1;
     EXPECT_EQ(
         scheduler_observe_cached_completion(fixture.base(), fixture.local, 0), SchedulerCompletionObservation::DONE
@@ -391,13 +400,13 @@ TEST(HbgExecutionRefill, CounterAccountingReusesOnlyAnObservedDoneProof) {
     ));
     EXPECT_TRUE(progress);
     EXPECT_EQ(notify_count, 2u);
-    EXPECT_EQ(fixture.local->pending_completed, 1u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.storage.run_control), 1u);
     EXPECT_TRUE(scheduler_completion_done(fixture.control(0)->completion_state));
     ASSERT_TRUE(scheduler_service_counter_accounting(
         fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, &progress
     ));
     EXPECT_FALSE(progress);
-    EXPECT_EQ(fixture.local->pending_completed, 1u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.storage.run_control), 1u);
 }
 
 TEST(HbgExecutionRefill, TicketOwnerKeepsLifecycleWithoutASecondOwnershipAtomic) {
@@ -625,6 +634,58 @@ TEST(HbgExecutionRefill, UnissuedProducerIsClaimedBeforeAnyOfItsConsumers) {
     EXPECT_TRUE(scheduler_completion_done(fixture.control(0)->completion_state));
 }
 
+TEST(HbgExecutionRefill, IndependentClaimSectorsAssignEveryBlockExactlyOnce) {
+    for (const uint16_t count : {1, 3, 8, 80, 129}) {
+        SCOPED_TRACE(count);
+        RefillFixture fixture(1, count);
+        fixture.storage.metadata[0].logical_block_num = count;
+        ASSERT_NO_FATAL_FAILURE(fixture.initialize());
+        std::array<SchedulerLocalState *, 6> locals{};
+        for (uint32_t worker = 0; worker < locals.size(); ++worker)
+            locals[worker] = fixture.storage.local_context(&fixture.storage.contexts[worker]);
+        std::array<std::vector<uint32_t>, 6> claimed;
+        std::array<std::thread, 6> workers;
+        std::atomic<bool> start{false};
+        std::atomic<uint32_t> closing_owners{0};
+        for (uint32_t worker = 0; worker < workers.size(); ++worker) {
+            workers[worker] = std::thread([&, worker] {
+                while (!start.load(std::memory_order_acquire)) {}
+                for (;;) {
+                    uint32_t block = count;
+                    bool closes = false;
+                    ASSERT_TRUE(scheduler_claim_ordinary_block(
+                        fixture.graph.graph(), fixture.base(), locals[worker], fixture.storage.run_control, 0, count,
+                        &block, &closes
+                    ));
+                    if (block == count) break;
+                    claimed[worker].push_back(block);
+                    if (closes) {
+                        closing_owners.fetch_add(1, std::memory_order_relaxed);
+                        ASSERT_TRUE(scheduler_close_ordinary_supply(
+                            fixture.graph.graph(), fixture.base(), locals[worker], fixture.storage.run_control, 0,
+                            closes, count
+                        ));
+                    }
+                }
+            });
+        }
+        start.store(true, std::memory_order_release);
+        for (auto &worker : workers)
+            worker.join();
+        std::vector<uint32_t> blocks;
+        for (const auto &owned : claimed)
+            blocks.insert(blocks.end(), owned.begin(), owned.end());
+        std::sort(blocks.begin(), blocks.end());
+        ASSERT_EQ(blocks.size(), count);
+        for (uint32_t block = 0; block < count; ++block)
+            EXPECT_EQ(blocks[block], block);
+        EXPECT_EQ(closing_owners.load(), 1u);
+        EXPECT_EQ(fixture.control(0)->next_block, count);
+        EXPECT_EQ(fixture.control(0)->claim_seal, count);
+        EXPECT_EQ(fixture.storage.run_control->scheduler_error, 0u);
+    }
+}
+
 TEST(HbgExecutionRefill, ReturnedSpmdContinuesBeforeCollectingUnreadyTasks) {
     RefillFixture fixture(12);
     fixture.storage.metadata[0].logical_block_num = 6;
@@ -645,7 +706,7 @@ TEST(HbgExecutionRefill, ReturnedSpmdContinuesBeforeCollectingUnreadyTasks) {
     ASSERT_FALSE(failed);
     ASSERT_LT(slot, SCHEDULER_PENDING_SLOT_COUNT);
     EXPECT_EQ(fixture.local->slots[slot].task_ref, 0);
-    EXPECT_EQ(fixture.local->slots[slot].block_idx, 1u);
+    EXPECT_EQ(fixture.local->slots[slot].block_idx, 4u);
     EXPECT_EQ(fixture.control(1)->next_block, 0u);
 }
 

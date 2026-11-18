@@ -147,9 +147,7 @@ struct GmMixFixture {
     SchedulerTaskControl *control(uint64_t task) const {
         return scheduler_state_at<SchedulerTaskControl>(base(), storage.layout.task_controls_offset) + task;
     }
-    SchedulerGroupMailbox *mailbox(uint32_t cluster) const {
-        return scheduler_state_at<SchedulerGroupMailbox>(base(), storage.layout.group_mailboxes_offset) + cluster;
-    }
+    SchedulerGroupMailbox *mailbox(uint32_t cluster) { return &signals[cluster].sync_mix; }
     volatile uint32_t &frontier(uint32_t cluster) { return signals[cluster].sync_frontier[0]; }
     SchedulerClusterSignal *signal(uint32_t cluster) { return &signals[cluster]; }
     bool ordinary_arm(uint64_t task, uint32_t cluster, bool *armed) {

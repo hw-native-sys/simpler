@@ -312,8 +312,7 @@ inline void validate_layout(const Image &image, const AicoreSchedulerLayout &lay
         summary.sync_mix_task_count != layout.spmd.sync_mix_task_count ||
         summary.admission_records_offset != layout.admission_records_offset ||
         summary.admission_log_offset != layout.admission_log_offset ||
-        summary.admission_control_offset != layout.admission_control_offset ||
-        summary.group_mailboxes_offset != layout.group_mailboxes_offset)
+        summary.admission_control_offset != layout.admission_control_offset)
         throw std::invalid_argument("protocol graph summary disagrees with Host plan");
 }
 

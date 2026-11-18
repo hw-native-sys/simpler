@@ -21,6 +21,7 @@ enum class SchedulerSubtaskFinishResult : uint8_t { PARTIAL, TASK_LAST, TASK_LAS
 static inline __aicore__ SchedulerSubtaskFinishResult scheduler_contribute_returns(
     __gm__ SchedulerTaskControl *control, uint64_t credits, uint64_t *previous, uint64_t *completed_gate = nullptr
 ) {
+    SchedulerScalarScope scope(SchedPhaseKind::ScalarReturnsContribute);
     scheduler_cache_barrier();
     const uint64_t state =
         scheduler_gm_fetch_add(control->completion_state, UINT64_C(0) - credits * SCHEDULER_COMPLETION_RETURN_UNIT);
@@ -41,6 +42,7 @@ static inline __aicore__ bool scheduler_contribute_mix_group(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     int64_t task_ref, uint32_t block_idx, LaneMask active
 ) {
+    SchedulerScalarScope scope(local, SchedPhaseKind::ScalarMixGroupContribute, task_ref);
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
     __gm__ SchedulerProtocolBlockOwner *owner = nullptr;
     auto *layout = RecordProtocol ? scheduler_protocol_layout_at(base, local) : nullptr;
@@ -87,7 +89,7 @@ static inline __aicore__ bool scheduler_contribute_mix_group(
     if (result == SchedulerSubtaskFinishResult::TASK_LAST) {
         scheduler_publish_task_done(base, local, task_ref);
         scheduler_remember_task_proof(local, task_ref, SchedulerTaskProof::DONE);
-        ++local->pending_completed;
+        scheduler_report_task_completed(run);
         if (owner != nullptr) {
             auto *actor =
                 &scheduler_state_at<SchedulerProtocolTaskTrace>(base, layout->tasks_offset)[task_ref].completion;
@@ -182,7 +184,10 @@ static inline __aicore__ bool scheduler_service_counter_accounting(
     );
     scheduler_protocol_task_actor(base, local, task, order, flags, true, false);
     scheduler_remember_task_proof(local, task, SchedulerTaskProof::DONE);
-    ++local->pending_completed;
+    // Successors consume the counter threshold, not this canonical mirror.
+    // EXIT cannot interrupt this call; the retirement barrier drains the mirror
+    // before AICPU reads final diagnostics, so reporting needs no extra DSB.
+    scheduler_report_task_completed(run);
     advance();
     return true;
 }

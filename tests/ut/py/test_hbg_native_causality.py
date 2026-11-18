@@ -16,6 +16,7 @@ from _native_protocol_builder import ProtocolBuilder
 
 from simpler_setup.tools.hbg.native_causality import MIX, PRECLAIM, NativeAudit, audit_native_protocol
 from simpler_setup.tools.hbg.native_protocol import (
+    CONTROL_NOTIFY_ACCOUNTING,
     COUNTER_ACCOUNTING,
     MEMBER_FROM_CLAIM,
     STAMPS,
@@ -519,6 +520,24 @@ def test_independent_b_can_be_admitted_before_smaller_host_task_ref_a():
     raw, identities = builder.run(order=(1, 0))
     assert raw["admission_log"] == [1, 0]
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+
+
+def test_control_notification_join_does_not_use_the_accounting_cas_as_ready_time():
+    builder = ProtocolBuilder([(1, 1, ()), (0, 1, (0,)), (1, 1, (1,))])
+    raw, identities = builder.run()
+    actor = raw["task_events"][1]["completion"]
+    actor["flags"] |= CONTROL_NOTIFY_ACCOUNTING
+    actor["before"][0] = builder.clock + 10
+    actor["after"][0] = builder.clock + 20
+    resequence(raw)
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+
+
+def test_control_notification_flag_cannot_relabel_a_kernel_completion():
+    raw, identities = ProtocolBuilder([(1, 1, ())]).run()
+    raw["task_events"][0]["completion"]["flags"] |= CONTROL_NOTIFY_ACCOUNTING
+    with pytest.raises(ValueError, match="control notification accounting|completion alias"):
+        audit_native_protocol(raw, identities)
 
 
 def test_per_worker_clock_offsets_are_not_a_global_execution_order():

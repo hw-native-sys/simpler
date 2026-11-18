@@ -139,6 +139,14 @@ using GraphBuffer = BasicGraphBuffer<8192>;
 // overrides that context rather than resizing this.
 inline constexpr uint64_t kFixtureCallableCount = 1024;
 
+// Read the same global progress fact as run completion; the GM word is only
+// authoritative when no CntNotify is mapped.
+inline uint64_t resolved_count(SchedulerRunControl *run) {
+    if (run->run_completed_read_address != 0)
+        return scheduler_notify_query(*reinterpret_cast<volatile uint32_t *>(run->run_completed_read_address));
+    return scheduler_gm_query(run->resolved_task_count);
+}
+
 struct FixtureStorage {
     explicit FixtureStorage(
         uint64_t task_count, uint64_t workers = 2, uint64_t traces_per_task = 1,

@@ -53,7 +53,7 @@ uint32_t original_task_count。GraphView、native header、task catalog 和 prep
 | 类型 | 大小 | 所有权与用途 |
 | ---- | ---- | ------------ |
 | SchedulerTaskMetadata | 16 B | Host 只读形状、kernel、block 和 trace prefix |
-| SchedulerTaskControl | 640 B | 五个独立 128 B 原子区域：claim_tickets、next_block、completion_state、admission_state、claim_seal |
+| SchedulerTaskControl | 1152 B | claim_tickets、next_block、completion_state、admission_state、claim_seal 各占 128 B，另有四个各占 128 B 的普通 block 领取分区 |
 | DONE 地址表 | 8 B/node | Host 不可变映射；非零为 CntNotify 32-bit SET/read 地址，零为 GM 回退 |
 | SchedulerWorkerContext | 320 B | 前四个 64 B 行由 READY 发布；最后一行归本核诊断 |
 | SchedulerRunControl | 7296 B | 384 B 配置/生命周期/首错前缀及 108 个独占行的 worker 错误信号 |

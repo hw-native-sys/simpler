@@ -70,6 +70,7 @@ struct KernelWorkWindowCapture {
 // The original idle timestamps survive the kernel in the existing worker state.
 __aicore__ __attribute__((noinline)) void
 publish_deferred_idle_activity(__gm__ void *base, SchedulerLocalState *local, SchedulerWorkerStats *stats) {
+    SchedulerScalarScope scalar_idle(local, SchedPhaseKind::ScalarPublishIdle);
     if (stats->deferred_idle_end == 0) return;
     scheduler_append_idle_activity(base, local, stats->deferred_idle_start, stats->deferred_idle_end);
     stats->deferred_idle_end = 0;
@@ -147,8 +148,12 @@ struct ArgsDumpOutputPublisher {
         pipe_barrier(PIPE_ALL);
 #endif
         SchedulerTaskPayloadArguments arguments{};
-        if (scheduler_parse_task_payload_arguments(*graph, task_ref, &arguments) != SchedulerGraphResult::OK ||
-            arguments.tensor_count != task->tensor_count ||
+        SchedulerGraphResult argument_status;
+        {
+            SchedulerScalarScope scalar_arguments(SchedPhaseKind::ScalarGraphPayloadArguments, task_ref);
+            argument_status = scheduler_parse_task_payload_arguments(*graph, task_ref, &arguments);
+        }
+        if (argument_status != SchedulerGraphResult::OK || arguments.tensor_count != task->tensor_count ||
             (arguments.tensor_count != 0 && reinterpret_cast<uint64_t>(arguments.tensors) != task->tensors_address))
             return false;
         for (int32_t arg = 0; arg < arguments.tensor_count; ++arg) {
@@ -274,11 +279,13 @@ publish_worker_stats(__gm__ SchedulerWorkerContext *context, const SchedulerWork
 // Inlining this path makes the resident loop spill enough state to fault on A5.
 __aicore__ __attribute__((noinline)) void
 stage_task_trace_before_execution(SchedulerExecutorTaskTrace *trace, uint64_t ready_observe) {
+    SchedulerScalarScope scalar_trace(SchedPhaseKind::ScalarTraceBeforeExecution);
     trace->ready_observe_cycles = ready_observe;
 }
 
 __aicore__ __attribute__((noinline)) void
 stage_task_trace_before_completion(SchedulerExecutorTaskTrace *trace, uint64_t kernel_start, uint64_t kernel_end) {
+    SchedulerScalarScope scalar_trace(SchedPhaseKind::ScalarTraceBeforeCompletion);
     trace->kernel_start_cycles = kernel_start;
     trace->kernel_end_cycles = kernel_end;
 }
@@ -494,19 +501,12 @@ __aicore__ bool run_ready_dispatch_loop(
         bool advanced = false;
         if (!scheduler_service_controls(graph, scheduler_state_base, context, run_control, profiling_level, &advanced))
             return false;
+        scalar_control.close();
         progress = progress || advanced;
         bool counter_advanced = false;
         if (!scheduler_service_counter_accounting(graph, scheduler_state_base, context, run_control, &counter_advanced))
             return false;
         progress = progress || counter_advanced;
-        if (context->pending_completed != 0) {
-            const uint64_t now = scheduler_cycles();
-            if (context->pending_completed >= 32 ||
-                now - context->last_completion_flush_cycles >= PLATFORM_PROF_SYS_CNT_FREQ / 1000) {
-                scheduler_flush_completions(run_control, context);
-                context->last_completion_flush_cycles = now;
-            }
-        }
         return true;
     };
     enum class Boundary { Proceed, Exit, Error };
@@ -795,6 +795,7 @@ __aicore__ bool run_ready_dispatch_loop(
                     scheduler_complete_own_slot<false, true>(
                         graph, scheduler_state_base, context, run_control, slot_index, profiling_level
                     );
+            scalar_completions.close();
             if (!completion_ok) return false;
             if (phase_timing_enabled) publish_deferred_idle_activity(scheduler_state_base, context, stats);
             boundary = check_boundary();
@@ -807,10 +808,6 @@ __aicore__ bool run_ready_dispatch_loop(
             scalar_iteration.progress = true;
             boundary = check_boundary();
             continue;
-        }
-        {
-            SchedulerScalarScope scalar_flush(context, SchedPhaseKind::ScalarFlushCompletions);
-            scheduler_flush_completions(run_control, context);
         }
         if (phase_timing_enabled) {
             if (!idle_active) {
@@ -969,7 +966,6 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
 
     SchedulerScalarScope scalar_exit(&scheduler_local_state, SchedPhaseKind::ScalarExitDrain);
     if (phase_timing_enabled) publish_deferred_idle_activity(scheduler_state_base, &scheduler_local_state, &stats);
-    scheduler_flush_completions(run_control, &scheduler_local_state);
 
     const uint64_t exit_wait_start = get_sys_cnt_aicore();
     while (stats.exit_observed_cycles == 0 &&

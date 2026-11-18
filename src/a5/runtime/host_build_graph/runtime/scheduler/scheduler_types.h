@@ -400,10 +400,17 @@ inline __aicore__ bool scheduler_prepared_retirement_inferred(
            scheduler_completion_remaining(completion) == 0;
 }
 
+inline constexpr uint32_t SCHEDULER_CLAIM_SECTOR_COUNT = 4;
+struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerClaimSector {
+    volatile uint64_t next;
+};
+static_assert(sizeof(SchedulerClaimSector) == SCHEDULER_GM_ATOMIC_SECTOR_BYTES);
+
 struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerTaskControl {
     volatile uint64_t claim_tickets;
 
-    // Block claimers and retiring workers update these counters concurrently.
+    // Cooperative tasks count valid claims. Ordinary tasks count the blocks
+    // covered by exhausted claim sectors; only the final value closes supply.
     alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t next_block;
     // Bits [0,32) hold total debt D, [32,48) remaining contributions C and
     // [48,64) the immutable validated total N. Only C=D=0 is logically done.
@@ -417,6 +424,10 @@ struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerTaskControl {
     // Admission claimers also certify the required member registrations.
     // Its isolated region has no concurrent RMW or cached writeback.
     alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t claim_seal;
+
+    // Ordinary block ownership is distributed over independent L2 sectors.
+    // Excess reservations stay monotonic and never return a valid block.
+    SchedulerClaimSector claim_sectors[SCHEDULER_CLAIM_SECTOR_COUNT];
 };
 
 // Each task owns one cache-line record; membership follows its frozen resource role.
@@ -437,26 +448,26 @@ struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerAdmissionControl {
     alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t commit_tail;
 };
 
-struct alignas(64) SchedulerGroupDescriptor {
-    uint64_t run_epoch;
-    int64_t task_ref;
-    uint64_t order_key;
-    uint64_t group_seq;
-    uint32_t block_idx;
-    uint32_t cluster_index;
-    uint64_t previous_lane_seq[3];
+struct SchedulerGroupDescriptor {
+    volatile uint64_t run_epoch;
+    volatile int64_t task_ref;
+    volatile uint64_t order_key;
+    volatile uint64_t group_seq;
+    volatile uint32_t block_idx;
+    volatile uint32_t cluster_index;
+    volatile uint64_t previous_lane_seq[3];
 };
 
-struct alignas(64) SchedulerGroupLaneAck {
+struct SchedulerGroupLaneAck {
     volatile uint64_t arrived_seq;
     volatile uint64_t released_seq;
     volatile uint64_t assigned_seq;
 };
 
-struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerGroupMailbox {
+// Cluster-local SSBUF storage: no GM cache-line padding or notification handles.
+struct SchedulerGroupMailbox {
     SchedulerGroupDescriptor descriptor;
-    uint64_t notification_addresses[2][3];
-    alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerGroupLaneAck lanes[3];
+    SchedulerGroupLaneAck lanes[3];
 };
 
 inline constexpr uint64_t SCHEDULER_BOOTSTRAP_CLUSTER_INIT = 1;
@@ -487,7 +498,6 @@ struct alignas(64) SchedulerGraphSummary {
     uint64_t admission_records_offset;
     uint64_t admission_log_offset;
     uint64_t admission_control_offset;
-    uint64_t group_mailboxes_offset;
     uint64_t run_epoch;
     uint64_t protocol_layout_offset;
     SchedulerTopologyLayout topology_layout;
@@ -580,6 +590,10 @@ struct alignas(64) SchedulerRunControl {
     volatile uint64_t scheduler_timeout_cycles;
     volatile uint64_t chip_swimlane_level;
     volatile uint64_t sampled_task_timing_enabled;
+    // One owned 32-bit CntNotify for this invocation. Zero addresses select
+    // immediate per-task GM reporting; neither address changes after READY.
+    uint64_t run_completed_read_address;
+    uint64_t run_completed_add_address;
 
     alignas(64) volatile uint64_t resolved_task_count;
     volatile uint64_t bootstrap_arrived_count;
@@ -736,7 +750,7 @@ static_assert(offsetof(SchedulerTaskMetadata, logical_block_num) == 14, "block c
 inline constexpr uint64_t SCHEDULER_STATE_BASE_ALIGNMENT = alignof(SchedulerTaskControl);
 static_assert(alignof(SchedulerAdmissionControl) <= SCHEDULER_STATE_BASE_ALIGNMENT);
 
-static_assert(sizeof(SchedulerTaskControl) == 640, "task control layout changed");
+static_assert(sizeof(SchedulerTaskControl) == 1152, "task control layout changed");
 static_assert(alignof(SchedulerTaskControl) == SCHEDULER_GM_ATOMIC_SECTOR_BYTES, "task control alignment changed");
 static_assert(offsetof(SchedulerTaskControl, claim_tickets) == 0, "ticket cursor must use the atomic region");
 static_assert(offsetof(SchedulerTaskControl, next_block) == 128, "block cursor requires an isolated atomic line");
@@ -747,6 +761,7 @@ static_assert(
     offsetof(SchedulerTaskControl, admission_state) == 384, "admission state requires an isolated signal region"
 );
 static_assert(offsetof(SchedulerTaskControl, claim_seal) == 512, "claim seal requires an isolated signal region");
+static_assert(offsetof(SchedulerTaskControl, claim_sectors) == 640, "claim sectors must remain isolated");
 static_assert(sizeof(SchedulerAdmissionRecord) == 64, "admission header must occupy one cache line");
 static_assert(sizeof(SchedulerAdmissionControl) == 256, "admission control layout changed");
 static_assert(
@@ -762,13 +777,13 @@ static_assert(offsetof(SchedulerGroupDescriptor, group_seq) == 24);
 static_assert(offsetof(SchedulerGroupDescriptor, block_idx) == 32);
 static_assert(offsetof(SchedulerGroupDescriptor, cluster_index) == 36);
 static_assert(offsetof(SchedulerGroupDescriptor, previous_lane_seq) == 40);
-static_assert(sizeof(SchedulerGroupLaneAck) == 64, "lane acknowledgements require separate atomic regions");
-static_assert(sizeof(SchedulerGroupMailbox) == 384, "group mailbox layout changed");
-static_assert(offsetof(SchedulerGroupMailbox, lanes) == 128, "descriptor and acknowledgements must be separate");
+static_assert(sizeof(SchedulerGroupLaneAck) == 24, "SSBUF acknowledgements use natural alignment");
+static_assert(sizeof(SchedulerGroupMailbox) == 136, "group mailbox layout changed");
+static_assert(offsetof(SchedulerGroupMailbox, lanes) == 64, "SSBUF acknowledgements follow the descriptor");
 static_assert(sizeof(SchedulerGraphSummary) == 128, "graph summary layout changed");
-static_assert(offsetof(SchedulerGraphSummary, async_layout_offset) == 104);
-static_assert(offsetof(SchedulerGraphSummary, prepared_layout_offset) == 112);
-static_assert(offsetof(SchedulerGraphSummary, bootstrap_clusters_offset) == 120);
+static_assert(offsetof(SchedulerGraphSummary, async_layout_offset) == 96);
+static_assert(offsetof(SchedulerGraphSummary, prepared_layout_offset) == 104);
+static_assert(offsetof(SchedulerGraphSummary, bootstrap_clusters_offset) == 112);
 static_assert(alignof(SchedulerGraphSummary) == 64, "graph summary alignment changed");
 static_assert(sizeof(SchedulerExecutorTaskTrace) == 24, "executor trace payload layout changed");
 static_assert(alignof(SchedulerExecutorTaskTrace) == alignof(uint64_t), "executor trace must have natural alignment");
@@ -903,10 +918,6 @@ inline bool scheduler_plan_spmd_storage(uint64_t *cursor, AicoreSchedulerLayout 
         !scheduler_layout_reserve(cursor, bytes, SCHEDULER_STATE_ALIGNMENT, &layout->admission_records_offset) ||
         !scheduler_layout_checked_mul(layout->spmd.cooperative_task_count, sizeof(int64_t), &bytes) ||
         !scheduler_layout_reserve(cursor, bytes, SCHEDULER_STATE_ALIGNMENT, &layout->admission_log_offset))
-        return false;
-    if (layout->spmd.sync_mix_task_count == 0) return true;
-    if (!scheduler_layout_checked_mul(layout->spmd.cluster_count, sizeof(SchedulerGroupMailbox), &bytes) ||
-        !scheduler_layout_reserve(cursor, bytes, alignof(SchedulerGroupMailbox), &layout->group_mailboxes_offset))
         return false;
     return true;
 }
@@ -1095,7 +1106,6 @@ inline bool scheduler_init_data_from_layout(
     summary->admission_records_offset = layout.admission_records_offset;
     summary->admission_log_offset = layout.admission_log_offset;
     summary->admission_control_offset = layout.admission_control_offset;
-    summary->group_mailboxes_offset = layout.group_mailboxes_offset;
     summary->bootstrap_clusters_offset = layout.bootstrap_clusters_offset;
     auto *bootstrap = scheduler_state_at<SchedulerBootstrapCluster>(base, layout.bootstrap_clusters_offset);
     for (uint64_t cluster = 0; cluster < layout.spmd.cluster_count; ++cluster)
@@ -1117,16 +1127,6 @@ inline bool scheduler_init_data_from_layout(
         auto *log = scheduler_state_at<int64_t>(base, layout.admission_log_offset);
         for (uint64_t index = 0; index < layout.spmd.cooperative_task_count; ++index)
             log[index] = SCHEDULER_TASK_REF_INVALID;
-    }
-    if (layout.spmd.sync_mix_task_count != 0) {
-        auto *mailboxes = scheduler_state_at<SchedulerGroupMailbox>(base, layout.group_mailboxes_offset);
-        for (uint64_t cluster = 0; cluster < layout.spmd.cluster_count; ++cluster) {
-            auto &descriptor = mailboxes[cluster].descriptor;
-            descriptor.task_ref = SCHEDULER_TASK_REF_INVALID;
-            descriptor.order_key = UINT64_MAX;
-            descriptor.block_idx = UINT32_MAX;
-            descriptor.cluster_index = UINT32_MAX;
-        }
     }
     return true;
 }
@@ -1208,13 +1208,6 @@ inline bool scheduler_init_spmd_task_records(void *base, const AicoreSchedulerLa
                 controls[task].admission_state != static_cast<uint64_t>(SchedulerAdmissionState::UNCLAIMED) ||
                 controls[task].next_block != 0 || controls[task].claim_tickets != 0 || controls[task].claim_seal != 0 ||
                 controls[task].completion_state != scheduler_completion_initial_state(1))
-                return false;
-            if (scheduler_task_is_mix(meta.flags) &&
-                (layout.group_mailboxes_offset == 0 ||
-                 layout.group_mailboxes_offset % alignof(SchedulerGroupMailbox) != 0 ||
-                 layout.group_mailboxes_offset > layout.total_size ||
-                 layout.spmd.cluster_count >
-                     (layout.total_size - layout.group_mailboxes_offset) / sizeof(SchedulerGroupMailbox)))
                 return false;
             ++cooperative_count;
         }
