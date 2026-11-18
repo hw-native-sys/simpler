@@ -72,6 +72,47 @@ scheduler_gm_mix_mailbox(__gm__ void *base, const SchedulerLocalState *local) {
     return scheduler_state_at<SchedulerGroupMailbox>(base, local->admission->gm_mix.mailbox_offset);
 }
 
+enum class SchedulerGmMixSignal : uint8_t { ASSIGNED, ARRIVED, RELEASED };
+inline constexpr uint64_t SCHEDULER_GROUP_NOTIFY_SEQUENCE_LIMIT = UINT64_C(1) << 31;
+
+static inline __aicore__ __gm__ volatile uint64_t &
+scheduler_gm_mix_signal_word(__gm__ SchedulerGroupMailbox *mailbox, uint32_t lane, SchedulerGmMixSignal signal) {
+    if (signal == SchedulerGmMixSignal::ASSIGNED) return mailbox->lanes[lane].assigned_seq;
+    if (signal == SchedulerGmMixSignal::ARRIVED) return mailbox->lanes[lane].arrived_seq;
+    return mailbox->lanes[lane].released_seq;
+}
+
+static inline __aicore__ uint64_t
+scheduler_gm_mix_signal_address(__gm__ SchedulerGroupMailbox *mailbox, uint32_t lane, SchedulerGmMixSignal signal) {
+    return lane == 0 ? 0 : mailbox->notification_addresses[lane - 1][static_cast<uint8_t>(signal)];
+}
+
+// Host admits an entire cluster to this backend only when the run's maximum
+// group count fits 31 bits. The release failure bit retains its 64-bit meaning
+// to every protocol consumer; descriptor and private sequence identities stay wide.
+static inline __aicore__ uint64_t
+scheduler_gm_mix_query_signal(__gm__ SchedulerGroupMailbox *mailbox, uint32_t lane, SchedulerGmMixSignal signal) {
+    const uint64_t address = scheduler_gm_mix_signal_address(mailbox, lane, signal);
+    if (address == 0) return scheduler_gm_query(scheduler_gm_mix_signal_word(mailbox, lane, signal));
+    const uint64_t value = scheduler_notify_query(*reinterpret_cast<__gm__ volatile uint32_t *>(address));
+    if (signal != SchedulerGmMixSignal::RELEASED) return value;
+    return (value & (SCHEDULER_GROUP_NOTIFY_SEQUENCE_LIMIT - 1)) |
+           ((value & SCHEDULER_GROUP_NOTIFY_SEQUENCE_LIMIT) != 0 ? SCHEDULER_GROUP_SEQUENCE_LIMIT : 0);
+}
+
+static inline __aicore__ void scheduler_gm_mix_store_signal(
+    __gm__ SchedulerGroupMailbox *mailbox, uint32_t lane, SchedulerGmMixSignal signal, uint64_t value
+) {
+    const uint64_t address = scheduler_gm_mix_signal_address(mailbox, lane, signal);
+    if (address == 0) {
+        scheduler_gm_store(scheduler_gm_mix_signal_word(mailbox, lane, signal), value);
+        return;
+    }
+    const uint32_t encoded = static_cast<uint32_t>(value & (SCHEDULER_GROUP_NOTIFY_SEQUENCE_LIMIT - 1)) |
+                             ((value & SCHEDULER_GROUP_SEQUENCE_LIMIT) != 0 ? UINT32_C(1) << 31 : 0);
+    scheduler_notify_store(*reinterpret_cast<__gm__ volatile uint32_t *>(address), encoded);
+}
+
 // Role and lane mapping were validated when the obligation was adopted. The
 // reusable mailbox carries only this group's dynamic identity and lane history.
 inline __aicore__ bool
@@ -204,7 +245,10 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_gm_mix_claim(
     }
     if (group.phase != SchedulerGmMixPhase::IDLE) return SchedulerBlockClaimResult::RETRY;
     if (admission.sync_claimed) return SchedulerBlockClaimResult::RETRY;
-    if (group.group_seq >= SCHEDULER_GROUP_SEQUENCE_LIMIT - 1) {
+    const auto *mailbox = scheduler_gm_mix_mailbox(base, local);
+    const uint64_t sequence_limit = mailbox->notification_addresses[0][0] != 0 ? SCHEDULER_GROUP_NOTIFY_SEQUENCE_LIMIT :
+                                                                                 SCHEDULER_GROUP_SEQUENCE_LIMIT;
+    if (group.group_seq >= sequence_limit - 1) {
         const uint64_t cursor = scheduler_gm_fetch_add(
             scheduler_task_control_at(base, local, admission.current_task_ref)->next_block, UINT64_C(0)
         );
@@ -237,12 +281,14 @@ static inline __aicore__ bool scheduler_gm_mix_publish(
     if (!scheduler_gm_mix_context_valid<StaticContextValidated>(graph, base, local, run)) return false;
     auto &admission = *local->admission;
     auto &group = admission.gm_mix;
+    auto *mailbox = scheduler_gm_mix_mailbox(base, local);
+    const uint64_t sequence_limit = mailbox->notification_addresses[0][0] != 0 ? SCHEDULER_GROUP_NOTIFY_SEQUENCE_LIMIT :
+                                                                                 SCHEDULER_GROUP_SEQUENCE_LIMIT;
     if (!local->is_mix_coordinator() || group.phase != SchedulerGmMixPhase::CLAIMED || group.group_seq == 0 ||
-        group.group_seq >= SCHEDULER_GROUP_SEQUENCE_LIMIT || group.block_idx >= admission.current_block_num)
+        group.group_seq >= sequence_limit || group.block_idx >= admission.current_block_num)
         return scheduler_admission_fail(
             graph, local, run, admission.current_task_ref, SchedulerErrorSite::GROUP_INVALID_STATE
         );
-    auto *mailbox = scheduler_gm_mix_mailbox(base, local);
     auto *descriptor = &mailbox->descriptor;
     if constexpr (RecordProtocol) scheduler_protocol_group_publish(base, local, true);
     descriptor->run_epoch = admission.epoch;
@@ -267,7 +313,7 @@ static inline __aicore__ bool scheduler_gm_mix_publish(
     scheduler_cache_barrier();
     for (uint8_t lane = 1; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
         if (admission.current_resource_mask.has(static_cast<SubtaskSlot>(lane))) {
-            scheduler_gm_store(mailbox->lanes[lane].assigned_seq, group.group_seq);
+            scheduler_gm_mix_store_signal(mailbox, lane, SchedulerGmMixSignal::ASSIGNED, group.group_seq);
             group.vector_last_published_seq[lane - 1] = group.group_seq;
         }
     }
@@ -294,12 +340,13 @@ static inline __aicore__ bool scheduler_gm_mix_observe(
     auto *mailbox = scheduler_gm_mix_mailbox(base, local);
     // Only an assigned lane holds the descriptor stable through its release.
     // Unassigned lanes must not read the mailbox while its owner can reuse it.
-    auto &assigned = mailbox->lanes[local->config.self_lane].assigned_seq;
     const bool reusable =
         observation != nullptr && observation->assigned_seq != 0 && observation->epoch == admission.epoch &&
         observation->task_ref == admission.current_task_ref && observation->order_key == admission.scan_cursor &&
         observation->group_seq == group.group_seq && observation->phase == group.phase;
-    const uint64_t seq = reusable ? observation->assigned_seq : scheduler_gm_query(assigned);
+    const uint64_t seq =
+        reusable ? observation->assigned_seq :
+                   scheduler_gm_mix_query_signal(mailbox, local->config.self_lane, SchedulerGmMixSignal::ASSIGNED);
     if (observation != nullptr) observation->assigned_seq = 0;
     if (seq <= group.group_seq) return true;
     auto *descriptor = &mailbox->descriptor;
@@ -354,7 +401,9 @@ static inline __aicore__ bool scheduler_gm_mix_arrive(
     auto *mailbox = scheduler_gm_mix_mailbox(base, local);
     if constexpr (RecordProtocol) scheduler_protocol_lane_publication(base, local, false, true);
     scheduler_cache_barrier();
-    scheduler_gm_store(mailbox->lanes[local->config.self_lane].arrived_seq, group.group_seq);
+    // Only remote lanes publish an ACK; the coordinator already owns its local proof.
+    if (!local->is_mix_coordinator())
+        scheduler_gm_mix_store_signal(mailbox, local->config.self_lane, SchedulerGmMixSignal::ARRIVED, group.group_seq);
     if constexpr (RecordProtocol) scheduler_protocol_lane_publication(base, local, false, false);
     group.arrivals_confirmed |= static_cast<uint8_t>(1U << local->config.self_lane);
     group.phase = SchedulerGmMixPhase::ARRIVED;
@@ -383,8 +432,9 @@ static inline __aicore__ bool scheduler_gm_mix_check_acks(
             if (record) observations[lane] = seq;
             continue;
         }
-        auto &value = releases ? mailbox->lanes[lane].released_seq : mailbox->lanes[lane].arrived_seq;
-        const uint64_t raw = scheduler_gm_query(value);
+        const uint64_t raw = scheduler_gm_mix_query_signal(
+            mailbox, lane, releases ? SchedulerGmMixSignal::RELEASED : SchedulerGmMixSignal::ARRIVED
+        );
         const uint64_t observed = releases ? scheduler_group_release_sequence(raw) : raw;
         if (observed < seq) return true;
         if (observed != seq)
@@ -450,10 +500,11 @@ scheduler_gm_mix_publish_release(__gm__ void *base, SchedulerLocalState *local, 
     auto &group = local->admission->gm_mix;
     if constexpr (RecordProtocol) scheduler_protocol_lane_publication(base, local, true, true);
     scheduler_cache_barrier();
-    scheduler_gm_store(
-        scheduler_gm_mix_mailbox(base, local)->lanes[local->config.self_lane].released_seq,
-        group.group_seq | (successful ? 0 : SCHEDULER_GROUP_SEQUENCE_LIMIT)
-    );
+    if (!local->is_mix_coordinator())
+        scheduler_gm_mix_store_signal(
+            scheduler_gm_mix_mailbox(base, local), local->config.self_lane, SchedulerGmMixSignal::RELEASED,
+            group.group_seq | (successful ? 0 : SCHEDULER_GROUP_SEQUENCE_LIMIT)
+        );
     if constexpr (RecordProtocol) scheduler_protocol_lane_publication(base, local, true, false);
     group.releases_confirmed |= static_cast<uint8_t>(1U << local->config.self_lane);
     if (!successful && local->admission->current_active_mask.has(static_cast<SubtaskSlot>(local->config.self_lane)))

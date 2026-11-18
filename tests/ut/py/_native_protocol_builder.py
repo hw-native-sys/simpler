@@ -57,7 +57,7 @@ class ProtocolBuilder:
             if mask == 0:
                 flags |= 32
             elif mask is not None:
-                flags |= (4 if mask.bit_count() > 1 else 0) | (8 if blocks > 1 else 0)
+                flags |= (4 if bin(mask).count("1") > 1 else 0) | (8 if blocks > 1 else 0)
             if ref in sync_tasks:
                 flags |= 16
             raw["tasks"].append(
@@ -72,19 +72,24 @@ class ProtocolBuilder:
                 )
             )
             if mask:
-                prefix += blocks * mask.bit_count()
+                prefix += blocks * bin(mask).count("1")
             raw["task_controls"].append(
                 dict(
                     task_ref=ref,
                     state=2 if mask is None else 0,
-                    canonical_total=blocks * mask.bit_count() if mask else 1,
-                    pending_compute=(blocks * mask.bit_count() if mask else 1) if mask is not None else 0,
-                    completion_debt=(blocks * mask.bit_count() if mask else 1) if mask is not None else 0,
+                    canonical_total=blocks * bin(mask).count("1") if mask else 1,
+                    pending_compute=(blocks * bin(mask).count("1") if mask else 1) if mask is not None else 0,
+                    completion_debt=(blocks * bin(mask).count("1") if mask else 1) if mask is not None else 0,
                     next_block=0,
                     completed_subtasks=0,
                     admission_state=0,
                     claim_tickets=0,
                     claim_seal=0,
+                    completion_backend=0,
+                    async_mask=0,
+                    counter_index=MAX,
+                    counter_threshold=0,
+                    counter_limit=0,
                 )
             )
             raw["inline_completed_count" if mask is None else "resolved_task_count"] += 1
@@ -224,6 +229,7 @@ class ProtocolBuilder:
             active_mask=spec["active_mask"],
             group_seq=0,
             completion_ticket=MAX,
+            completion_credits=0,
             released_seq=[0, 0, 0],
             sync_tail=0,
             sync_frontier=[0, 0, 0],
@@ -241,7 +247,7 @@ class ProtocolBuilder:
         ):
             row[name] = [0, 0]
         result: dict[str, Any] = dict(
-            index=spec["trace_base"] + block * spec["active_mask"].bit_count(), owner=row, lanes=[]
+            index=spec["trace_base"] + block * bin(spec["active_mask"]).count("1"), owner=row, lanes=[]
         )
         self.raw["blocks"].append(result)
         if spec["flags"] & 16:
@@ -274,7 +280,7 @@ class ProtocolBuilder:
         owner = block["owner"]
         task = owner["task_ref"]
         control = self.raw["task_controls"][task]
-        width = owner["active_mask"].bit_count()
+        width = bin(owner["active_mask"]).count("1")
         self.stamp(owner, "completion_before")
         owner["completion_ticket"] = control["completed_subtasks"]
         control["completed_subtasks"] += width
@@ -295,8 +301,8 @@ class ProtocolBuilder:
         pending = block % 2
         index = (
             spec["trace_base"]
-            + block * spec["active_mask"].bit_count()
-            + (spec["active_mask"] & ((1 << slot) - 1)).bit_count()
+            + block * bin(spec["active_mask"]).count("1")
+            + bin(spec["active_mask"] & ((1 << slot) - 1)).count("1")
         )
         row: dict[str, Any] = dict(
             self.common(task, worker),
@@ -323,6 +329,7 @@ class ProtocolBuilder:
         )
         for name in ("permit", "entry", "returned", "visible", "completion_consumed", "trace_published"):
             row[name] = [0, 0]
+        row["contribution_credits"] = 0
         self.raw["executions"].append(row)
         self.stamp(row, "permit")
         self.stamp(row, "entry")
@@ -373,7 +380,7 @@ class ProtocolBuilder:
         if block is not None:
             block["owner"]["completion_ticket"] = ticket
             self.stamp(block["owner"], "completion_after")
-        if control["completed_subtasks"] == spec["block_num"] * spec["active_mask"].bit_count():
+        if control["completed_subtasks"] == spec["block_num"] * bin(spec["active_mask"]).count("1"):
             self.complete_task(task, execution["worker_index"], contribution=execution)
 
     def mix_block(self, task, block, cluster, *, reserved=None) -> dict[str, Any]:

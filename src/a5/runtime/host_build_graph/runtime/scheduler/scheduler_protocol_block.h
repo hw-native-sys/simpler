@@ -98,7 +98,8 @@ static inline __aicore__ void scheduler_protocol_claim_seal(
 }
 
 static inline __aicore__ void scheduler_protocol_block_complete(
-    __gm__ void *base, const SchedulerLocalState *local, uint32_t block, bool before, uint64_t ticket
+    __gm__ void *base, const SchedulerLocalState *local, uint32_t block, bool before, uint64_t ticket,
+    uint32_t credits = 0
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
@@ -112,6 +113,7 @@ static inline __aicore__ void scheduler_protocol_block_complete(
     if (!scheduler_protocol_stamp(base, local, layout, before ? &owner->completion_before : &owner->completion_after))
         return;
     if (!before) owner->completion_ticket = ticket;
+    owner->completion_credits = credits;
     scheduler_protocol_publish_record(owner);
 }
 

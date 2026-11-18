@@ -13,8 +13,14 @@
 
 #include "scheduler_memory.h"
 
+#if defined(__CPU_SIM)
+#include "aicpu/device_time.h"
+#endif
+
 inline __aicore__ uint64_t scheduler_cycles() {
-#if defined(__CCE_AICORE__) || defined(__CPU_SIM)
+#if defined(__CPU_SIM)
+    return sys_cnt_now_ticks();
+#elif defined(__CCE_AICORE__)
     return get_sys_cnt_aicore();
 #else
     return 0;
@@ -69,6 +75,14 @@ static inline __aicore__ bool scheduler_protocol_bind(__gm__ void *base, const L
         ) ||
         !scheduler_protocol_check_region(
             layout->executions_offset, layout->trace_count, sizeof(SchedulerProtocolExecutionTrace), limit, &end
+        ) ||
+        !scheduler_protocol_check_region(
+            layout->condition_contributions_offset, layout->trace_count, sizeof(SchedulerProtocolConditionContribution),
+            limit, &end
+        ) ||
+        !scheduler_protocol_check_region(
+            layout->counter_observations_offset, layout->task_count, sizeof(SchedulerProtocolCounterObservation), limit,
+            &end
         ) ||
         !scheduler_protocol_check_region(
             layout->workers_offset, layout->worker_count, sizeof(SchedulerProtocolWorkerTrace), limit, &end

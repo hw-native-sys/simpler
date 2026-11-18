@@ -375,6 +375,20 @@ static int acquire_scheduler_state_storage(
     }
 }
 
+static int acquire_scheduler_notifications(
+    void *runner_ctx, uint32_t slot, SchedulerNotificationPurpose purpose, size_t count, SchedulerDoneNotifications *out
+) {
+    if (runner_ctx == nullptr) return -1;
+    try {
+        return static_cast<DeviceRunnerBase *>(runner_ctx)->acquire_scheduler_notifications(slot, purpose, count, out);
+    } catch (const std::exception &error) {
+        LOG_ERROR("scheduler notification acquire failed: %s", error.what());
+        return -1;
+    } catch (...) {
+        return -1;
+    }
+}
+
 static void record_scheduler_runtime_mode(void *runner_ctx, uint32_t pipeline_slot, uint32_t mode) {
     (void)pipeline_slot;
     if (runner_ctx == nullptr) return;
@@ -453,6 +467,16 @@ acquire_run_image_staging(void *runner_ctx, uint32_t pipeline_slot, size_t bytes
     } catch (...) {
         return -1;
     }
+}
+
+static std::optional<HostCallableAsyncCapabilities>
+get_callable_async_capabilities(void *runner_ctx, int32_t callable_id) {
+    if (runner_ctx == nullptr) return std::nullopt;
+    HostCallableAsyncCapabilities view{};
+    if (!static_cast<DeviceRunnerBase *>(runner_ctx)
+             ->get_callable_async_capabilities(callable_id, &view.data, &view.count))
+        return std::nullopt;
+    return view;
 }
 
 static uint64_t upload_chip_callable_buffer_wrapper(void *runner_ctx, const void *callable) {
@@ -676,6 +700,8 @@ static const HostApiOps g_host_api_ops = {
     .get_prepare_plan = get_prepare_plan,
     .set_prepare_plan = set_prepare_plan,
     .stage_launch_metadata = stage_launch_metadata,
+    .acquire_scheduler_notifications = acquire_scheduler_notifications,
+    .get_callable_async_capabilities = get_callable_async_capabilities,
 };
 
 /* ===========================================================================

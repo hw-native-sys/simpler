@@ -215,6 +215,7 @@ def test_predicated_skip_is_not_counted_as_kernel_execution():
         ("scalar_execution_token_refill", "scheduler_refill_execution_tokens"),
         ("scalar_prepared_acquire", "scheduler_acquire_execution_token"),
         ("scalar_prepared_claim", "scheduler_claim_execution_token"),
+        ("scalar_counter_accounting", "scheduler_service_counter_accounting"),
         ("scalar_cooperative_discover", "scheduler_discover_cooperative_task"),
         ("scalar_cluster_mix_service", "scheduler_cluster_mix_service"),
         ("scalar_group_acquire", "scheduler_acquire_group_lane"),

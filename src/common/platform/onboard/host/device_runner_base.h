@@ -607,6 +607,11 @@ public:
     int acquire_scheduler_state_storage(
         uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **device_out, void **host_out
     );
+    virtual int
+    acquire_scheduler_notifications(uint32_t, SchedulerNotificationPurpose, size_t, SchedulerDoneNotifications *) {
+        return -1;
+    }
+
     std::shared_ptr<void> get_orchestration_scratch(uint32_t slot) const {
         return slot < orchestration_scratch_.size() ? orchestration_scratch_[slot] : std::shared_ptr<void>{};
     }
@@ -1328,6 +1333,7 @@ public:
      * @return Device GM address of the ChipCallable header, or 0 on failure.
      */
     uint64_t upload_chip_callable_buffer(const ChipCallable *callable);
+    bool get_callable_async_capabilities(int32_t callable_id, const CoreAsyncCapability **data, uint32_t *count) const;
     int release_chip_callable_buffer(uint64_t hash);
 
     /**
@@ -2882,6 +2888,7 @@ protected:
         // never CHIP_MAX_FUNC_ID: the content hash covers the child func_ids
         // and offsets, so every cid sharing this entry has exactly this table.
         std::vector<uint64_t> object_table;
+        std::vector<CoreAsyncCapability> async_capabilities;
         uint64_t object_table_dev{0};
         // The same domain resolved to kernel-entry addresses, present only on a
         // runtime whose device scheduler dispatches from them.

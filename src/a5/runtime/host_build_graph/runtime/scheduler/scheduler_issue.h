@@ -83,7 +83,7 @@ static inline __aicore__ bool scheduler_task_supply_closed(
     if (executable && blocks == 0) return scheduler_issue_fail(graph, local, run, ref);
     // Canonical DONE proves both closed supply and completed dependencies.
     // Pending compute or async debt still requires the independent supply seal.
-    const auto completion = scheduler_observe_cached_completion(base, local, ref, control);
+    const auto completion = scheduler_observe_cached_completion(base, local, ref);
     if (completion == SchedulerCompletionObservation::INVALID) return scheduler_issue_fail(graph, local, run, ref);
     if (completion == SchedulerCompletionObservation::DONE) {
         *closed = true;

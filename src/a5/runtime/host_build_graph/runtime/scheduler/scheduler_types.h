@@ -164,6 +164,8 @@ enum class SchedulerDispatchSlotState : uint8_t {
 
 enum SchedulerTaskMetadataFlags : uint8_t {
     SCHEDULER_TASK_EXECUTABLE = 1U << 0,
+    // Host proved an actual fanin ancestor may publish deferred data.
+    SCHEDULER_TASK_ASYNC_INPUT = 1U << 1,
     SCHEDULER_TASK_MIX = 1U << 2,
     SCHEDULER_TASK_SPMD = 1U << 3,
     SCHEDULER_TASK_SYNC_START = 1U << 4,
@@ -191,6 +193,21 @@ inline uint8_t scheduler_task_metadata_flags_from_submit_state(
 #endif
 
 constexpr int32_t SCHEDULER_TASK_TIMING_SLOT_COUNT = 16;
+
+// Immutable task view of a shared monotonic CntNotify ADD chain. Strict DAG
+// ancestors precede descendants; count >= threshold stays true for this run.
+// Zero ADD address selects the established GM completion protocol.
+struct SchedulerTaskCompletionCounter {
+    uint64_t read_address;
+    uint64_t add_address;
+    uint32_t threshold;
+    uint32_t limit;
+};
+static_assert(sizeof(SchedulerTaskCompletionCounter) == 24);
+static_assert(
+    std::is_trivially_copyable_v<SchedulerTaskCompletionCounter> &&
+    std::is_standard_layout_v<SchedulerTaskCompletionCounter>
+);
 
 // GM records have a 16-byte stride. Stack copies use scalar alignment: their
 // callers pass local objects across outlined boundaries without realigning SP.
@@ -438,6 +455,7 @@ struct alignas(64) SchedulerGroupLaneAck {
 
 struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerGroupMailbox {
     SchedulerGroupDescriptor descriptor;
+    uint64_t notification_addresses[2][3];
     alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerGroupLaneAck lanes[3];
 };
 
@@ -641,6 +659,8 @@ struct alignas(64) SchedulerWorkerContext {
     uint64_t activity_buffers_offset;
     uint64_t pmu_cells_offset;
     uint64_t args_dump_address;
+    uint64_t done_notifications_offset;
+    uint64_t completion_counters_offset;
 
     // Only this worker writes its bootstrap diagnostic line.
     alignas(64) uint64_t bootstrap_task_count;
@@ -912,6 +932,12 @@ inline bool scheduler_plan_protocol_storage(uint64_t *cursor, AicoreSchedulerLay
         SCHEDULER_PROTOCOL_RESERVE(protocol.member_count, SchedulerProtocolMemberTrace, protocol.members_offset) &&
         SCHEDULER_PROTOCOL_RESERVE(protocol.trace_count, SchedulerProtocolBlockTrace, protocol.blocks_offset) &&
         SCHEDULER_PROTOCOL_RESERVE(protocol.trace_count, SchedulerProtocolExecutionTrace, protocol.executions_offset) &&
+        SCHEDULER_PROTOCOL_RESERVE(
+            protocol.trace_count, SchedulerProtocolConditionContribution, protocol.condition_contributions_offset
+        ) &&
+        SCHEDULER_PROTOCOL_RESERVE(
+            protocol.task_count, SchedulerProtocolCounterObservation, protocol.counter_observations_offset
+        ) &&
         SCHEDULER_PROTOCOL_RESERVE(protocol.worker_count, SchedulerProtocolWorkerTrace, protocol.workers_offset);
 #undef SCHEDULER_PROTOCOL_RESERVE
     if (valid) protocol.storage_end_offset = *cursor;
@@ -973,6 +999,8 @@ inline bool scheduler_plan_layout(
         ) ||
         !SCHEDULER_RESERVE_ARRAY(SCHEDULER_WORKER_CAPACITY, SchedulerWorkerContext, worker_contexts_offset) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskMetadata, task_metadata_offset) ||
+        !SCHEDULER_RESERVE_ARRAY(task_count, uint64_t, done_notifications_offset) ||
+        !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskCompletionCounter, completion_counters_offset) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskControl, task_controls_offset) ||
         !scheduler_layout_reserve(
             &cursor, sizeof(SchedulerGraphSummary), alignof(SchedulerGraphSummary), &next.graph_summary_offset

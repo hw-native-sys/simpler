@@ -39,12 +39,12 @@ ScalarPolicyObservation observe_scalar_policy() {
         auto *volatile query = static_cast<uint64_t (*)(volatile uint64_t &, int)>(&scheduler_gm_query);
         auto *volatile poll = &scheduler_observe_ordered_progress;
         auto *volatile register_group =
-            static_cast<scheduler_async_pending::Result (*)(scheduler_async_pending::Join &)>(
+            static_cast<scheduler_async_pending::Result (*)(scheduler_async_pending::Join &, uint64_t *)>(
                 &scheduler_async_pending::register_group
             );
         result.value = query(value, __ATOMIC_ACQUIRE);
         (void)poll(graph, nullptr, &local, nullptr, nullptr);
-        (void)register_group(join);
+        (void)register_group(join, nullptr);
     }
     result.join_word = join.word;
     result.records = profiling.scalar.committed;

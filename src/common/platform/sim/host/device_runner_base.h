@@ -512,6 +512,7 @@ public:
     // success, -1 on a bad block_dim / aicpu_thread_num.
     int prepare_launch_shape(Runtime &runtime, const CallConfig &config);
     uint64_t upload_chip_callable_buffer(const ChipCallable *callable);
+    bool get_callable_async_capabilities(int32_t callable_id, const CoreAsyncCapability **data, uint32_t *count) const;
     int release_chip_callable_buffer(uint64_t hash);
     int launch_device_register(int32_t callable_id);
     int commit_device_register(int32_t callable_id);
@@ -1129,6 +1130,7 @@ protected:
         // registration's dlopen resolved, which is what a device consumer of
         // resolved entries would dispatch through.
         std::vector<uint64_t> object_table;
+        std::vector<CoreAsyncCapability> async_capabilities;
         std::vector<uint64_t> entry_table;
         uint64_t object_table_dev{0};
         uint64_t entry_table_dev{0};

@@ -111,7 +111,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 1,
@@ -132,7 +138,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 2,
@@ -150,7 +162,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 3,
@@ -169,7 +187,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 4,
@@ -190,7 +214,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 5,
@@ -211,7 +241,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 6,
@@ -229,7 +265,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 7,
@@ -249,7 +291,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 8,
@@ -270,7 +318,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 9,
@@ -287,7 +341,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 10,
@@ -306,7 +366,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 11,
@@ -327,7 +393,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 12,
@@ -348,7 +420,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 13,
@@ -371,7 +449,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 14,
@@ -394,7 +478,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 15,
@@ -415,7 +505,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 16,
@@ -437,7 +533,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 17,
@@ -454,7 +556,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 18,
@@ -478,7 +586,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 19,
@@ -502,7 +616,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 20,
@@ -523,7 +643,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 21,
@@ -545,7 +671,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 22,
@@ -567,7 +699,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 23,
@@ -588,7 +726,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 24,
@@ -606,7 +750,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 25,
@@ -625,7 +775,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 26,
@@ -648,7 +804,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 27,
@@ -669,7 +831,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 28,
@@ -690,7 +858,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 29,
@@ -713,7 +887,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 30,
@@ -742,7 +922,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 31,
@@ -761,7 +947,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 32,
@@ -784,7 +976,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 33,
@@ -808,7 +1006,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 34,
@@ -832,7 +1036,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 35,
@@ -851,7 +1061,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 36,
@@ -869,7 +1085,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 37,
@@ -888,7 +1110,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 38,
@@ -919,7 +1147,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 39,
@@ -950,7 +1184,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 40,
@@ -974,7 +1214,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 41,
@@ -998,7 +1244,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 42,
@@ -1017,7 +1269,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 43,
@@ -1035,7 +1293,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 44,
@@ -1053,7 +1317,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 45,
@@ -1072,7 +1342,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 46,
@@ -1093,7 +1369,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 47,
@@ -1114,7 +1396,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 48,
@@ -1134,7 +1422,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 49,
@@ -1157,7 +1451,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 50,
@@ -1176,7 +1476,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 51,
@@ -1197,7 +1503,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 52,
@@ -1221,7 +1533,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 53,
@@ -1238,7 +1556,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 54,
@@ -1255,7 +1579,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "DEFERRED",
+        "max_conditions": 2,
+        "condition_types": 1
+      }
     },
     {
       "func_id": 55,
@@ -1283,7 +1613,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 56,
@@ -1309,7 +1645,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 57,
@@ -1335,7 +1677,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 58,
@@ -1356,7 +1704,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 59,
@@ -1378,7 +1732,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 60,
@@ -1400,7 +1760,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 61,
@@ -1421,7 +1787,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 62,
@@ -1440,7 +1812,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 63,
@@ -1458,7 +1836,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 64,
@@ -1477,7 +1861,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 65,
@@ -1500,7 +1890,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 66,
@@ -1519,7 +1915,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 67,
@@ -1538,7 +1940,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 68,
@@ -1557,7 +1965,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 69,
@@ -1577,7 +1991,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 70,
@@ -1595,7 +2015,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 71,
@@ -1622,7 +2048,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 72,
@@ -1640,7 +2072,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 73,
@@ -1671,7 +2109,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 74,
@@ -1702,7 +2146,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 75,
@@ -1720,7 +2170,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 76,
@@ -1739,7 +2195,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 77,
@@ -1760,7 +2222,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 78,
@@ -1779,7 +2247,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 79,
@@ -1798,7 +2272,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 80,
@@ -1817,7 +2297,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 81,
@@ -1835,7 +2321,13 @@
         "vendor/aic",
         "vendor/aiv",
         "vendor/external"
-      ]
+      ],
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     }
   ]
 }

@@ -744,16 +744,18 @@ TEST(HbgAdmission, ConcurrentDuplicateCandidatesCommitExactlyOnce) {
     }
 }
 
-TEST(HbgAdmission, PublishedTailCannotHideAnInvalidPhaseForMembersOrNonmembers) {
+TEST(HbgAdmission, PublishedTailSuppliesAdmissionProofForMembersAndNonmembers) {
     for (uint64_t worker : {UINT64_C(0), UINT64_C(1)}) {
         for (uint64_t phase : {UINT64_C(0), UINT64_C(1), UINT64_C(2), UINT64_MAX}) {
             AdmissionFixture fixture({{2, LaneMask::aic()}});
             ASSERT_TRUE(fixture.publish(0));
+            // Commit published ADMITTED before the tail. Once the prefix is
+            // visible, readers use its epoch/order proof rather than phase.
             scheduler_publish_signal(fixture.task_control(0)->admission_state, phase);
-            EXPECT_FALSE(fixture.refresh(worker));
-            EXPECT_EQ(fixture.admissions[worker].scan_cursor, 0u);
-            EXPECT_EQ(fixture.admissions[worker].current_task_ref, SCHEDULER_TASK_REF_INVALID);
-            EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::ADMISSION_INVALID_RECORD));
+            EXPECT_TRUE(fixture.refresh(worker));
+            EXPECT_EQ(fixture.admissions[worker].scan_cursor, worker == 0 ? 0u : 1u);
+            EXPECT_EQ(fixture.admissions[worker].current_task_ref, worker == 0 ? 0 : SCHEDULER_TASK_REF_INVALID);
+            EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
         }
     }
 }
@@ -2133,9 +2135,9 @@ TEST_P(HbgClaimSeal, OnlyFinalValidClaimPublishesAndDoesNotCompleteTheTask) {
     EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
 }
 
-TEST_P(HbgClaimSeal, MissingSignalReadsCursorAndEarlyOrMalformedSignalIsRejected) {
+TEST_P(HbgClaimSeal, MissingSignalReadsCursorAndTerminalSealSuppliesCursor) {
     const auto shape = GetParam();
-    for (uint32_t scenario = 0; scenario < 9; ++scenario) {
+    for (uint32_t scenario = 0; scenario < 10; ++scenario) {
         SCOPED_TRACE(scenario);
         AdmissionFixture fixture({shape}, 12);
         ASSERT_TRUE(fixture.publish(0));
@@ -2145,7 +2147,13 @@ TEST_P(HbgClaimSeal, MissingSignalReadsCursorAndEarlyOrMalformedSignalIsRejected
         auto *control = fixture.task_control(0);
         control->next_block = shape.blocks;
         if (scenario == 1) control->next_block = shape.blocks - 1;
-        if (scenario >= 2) control->claim_seal = shape.blocks;
+        if (scenario >= 2 && scenario < 9) {
+            ASSERT_TRUE(scheduler_publish_claim_seal(
+                fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), shape.blocks - 1
+            ));
+        }
+        // A published terminal seal is the proof; the reader need not observe
+        // next_block again, even if a stale or poisoned value is returned there.
         if (scenario == 2) control->next_block = shape.blocks - 1;
         if (scenario == 3) control->claim_seal = shape.blocks + 1;
         if (scenario == 4) control->next_block = shape.blocks + 1;
@@ -2153,14 +2161,17 @@ TEST_P(HbgClaimSeal, MissingSignalReadsCursorAndEarlyOrMalformedSignalIsRejected
         if (scenario == 6) scheduler_publish_error(fixture.run(), static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT));
         if (scenario == 7) control->claim_seal = (UINT64_C(1) << 32) + shape.blocks;
         if (scenario == 8) control->claim_seal = UINT64_MAX;
+        if (scenario == 9) control->next_block = shape.blocks + 1;
         uint64_t cursor = UINT64_MAX;
         bool sealed = true;
         const bool valid = scheduler_read_claim_cursor(
             fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), &cursor, &sealed
         );
-        EXPECT_EQ(valid, scenario < 2);
-        EXPECT_FALSE(sealed);
+        const bool terminal_seal = scenario == 2 || scenario == 4;
+        EXPECT_EQ(valid, scenario < 2 || terminal_seal);
+        EXPECT_EQ(sealed, terminal_seal);
         if (scenario < 2) EXPECT_EQ(cursor, shape.blocks - scenario);
+        else if (terminal_seal) EXPECT_EQ(cursor, shape.blocks);
         else EXPECT_NE(scheduler_read_error(fixture.run()), 0u);
         EXPECT_EQ(scheduler_completion_count(control->completion_state), 0u);
         EXPECT_NE(

@@ -15,12 +15,17 @@
 #include "scheduler_async_directory.h"
 #include "scheduler_async_layout.h"
 #include "scheduler_graph.h"
+#include "scheduler_completion_counter.h"
 
 struct SchedulerAsyncLocalState {
     __gm__ uint8_t *base{nullptr};
     __gm__ const SchedulerAsyncLayout *layout{nullptr};
     __gm__ SchedulerTaskControl *controls{nullptr};
     uint64_t bytes{0};
+    uint64_t completion_counters_offset{0};
+    uint64_t task_metadata_offset{0};
+    uint64_t protocol_layout_offset{0};
+    uint32_t worker_index{0};
     uint32_t check_cursor{0};
     int64_t failed_task_ref{-1};
     int32_t error_code{0};
@@ -30,7 +35,7 @@ struct SchedulerAsyncLocalState {
     uint8_t idle_probe_countdown{0};
 };
 
-static_assert(sizeof(SchedulerAsyncLocalState) == 64);
+static_assert(sizeof(SchedulerAsyncLocalState) == 88);
 
 enum class SchedulerAsyncCompletionResult : uint8_t { NONE, WAITING, FINISH_OWNER, ERROR };
 
@@ -296,14 +301,13 @@ inline __aicore__ bool scheduler_async_begin_prebound_execution(
     return true;
 }
 
-// A nonempty SEALED execution owns one credit until the task FINISH. Its
-// compute contribution is still outstanding, so the debt cannot reach zero.
+// The first nonempty registration holds one task-wide async marker until FINISH.
+// Its own physical contribution is outstanding, so the gate cannot reach zero.
 // Validate before CAS: an unchecked overflowing addition could manufacture a
 // syntactically valid zero gate from corrupted input.
 inline __aicore__ bool scheduler_async_credit_available(uint64_t observed) {
     return scheduler_completion_valid(observed) && scheduler_completion_remaining(observed) != 0 &&
-           scheduler_completion_debt(observed) <
-               scheduler_completion_remaining(observed) + scheduler_completion_total(observed);
+           scheduler_completion_debt(observed) == scheduler_completion_remaining(observed);
 }
 
 // The caller validates the task identity and supplies a reliable gate snapshot.
@@ -335,8 +339,9 @@ scheduler_async_register_completion_credit(SchedulerAsyncLocalState &local, int6
 template <bool BoundExecution = false>
 static inline __aicore__ bool scheduler_async_seal_execution(
     SchedulerAsyncLocalState *local, int64_t task_ref, uint32_t block, uint32_t lane,
-    const pto2::resident::AsyncWriter &writer
+    const pto2::resident::AsyncWriter &writer, bool *has_deferred = nullptr
 ) {
+    if (has_deferred != nullptr) *has_deferred = false;
     using namespace scheduler_async_detail;
     if (local == nullptr) return true;
     if (writer.image == nullptr) return true;
@@ -382,10 +387,18 @@ static inline __aicore__ bool scheduler_async_seal_execution(
     uint32_t task_index_value = ASYNC_INVALID_INDEX;
     if (!task_index(*local, task_ref, task_index_value) || task_index_value == ASYNC_INVALID_INDEX)
         return fail(*local, task_ref);
-    if (!scheduler_async_register_completion_credit(*local, task_ref)) return false;
-    auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(local->base, local->layout->joins_offset);
-    if (scheduler_async_pending::register_group(joins[task_index_value]) != scheduler_async_pending::Result::PENDING)
-        return fail(*local, task_ref);
+    if (scheduler_completion_counter_at(local->base, local->completion_counters_offset, task_ref) == nullptr) {
+        auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(local->base, local->layout->joins_offset);
+        uint64_t registered_before = 0;
+        if (scheduler_async_pending::register_group(joins[task_index_value], &registered_before) !=
+            scheduler_async_pending::Result::PENDING)
+            return fail(*local, task_ref);
+        // The first registrant cannot release its physical contribution before
+        // installing the marker. Other groups can progress without waiting for it.
+        if (scheduler_async_pending::registered(registered_before) == 0 &&
+            !scheduler_async_register_completion_credit(*local, task_ref))
+            return false;
+    }
     auto *progress = scheduler_state_at<SchedulerAsyncGroupProgress>(local->base, local->layout->group_progress_offset);
     progress[writer.group_index].pending_mask = scheduler_async_condition_mask(count);
     progress[writer.group_index].condition_cursor = 0;
@@ -398,31 +411,39 @@ static inline __aicore__ bool scheduler_async_seal_execution(
     if (scheduler_async_directory_publish(directory[writer.group_index / 64].bits, writer.group_index % 64) !=
         SchedulerAsyncDirectoryResult::SUCCESS)
         return fail(*local, task_ref);
+    if (has_deferred != nullptr) *has_deferred = true;
     return true;
 }
 
-// All executions have sealed their condition registrations before computation closes.
+// The last physical FAA supplies a stable gate after every execution sealed
+// its conditions. The close RMW supplies the join observation and ownership.
 static inline __aicore__ SchedulerAsyncCompletion
-scheduler_async_close_computation(SchedulerAsyncLocalState *local, int64_t task_ref) {
+scheduler_async_close_computation(SchedulerAsyncLocalState *local, int64_t task_ref, uint64_t gate) {
     using namespace scheduler_async_detail;
     if (local == nullptr) return {};
     uint32_t index = ASYNC_INVALID_INDEX;
     if (!task_index(*local, task_ref, index)) return completion_error(*local, task_ref);
     if (index == ASYNC_INVALID_INDEX) return {};
     auto *joins = scheduler_state_at<SchedulerAsyncTaskJoin>(local->base, local->layout->joins_offset);
-    // The final contribution precedes these dependent bypass observations.
-    // Its pre-RMW fence cannot order the RMW against the following loads.
-    scheduler_cache_barrier();
-    const uint64_t gate = scheduler_gm_query(local->controls[task_ref].completion_state);
-    const uint64_t joined = scheduler_gm_query(joins[index].word);
-    if (!scheduler_completion_valid(gate) || scheduler_completion_remaining(gate) != 0 ||
-        !scheduler_async_pending::valid(joined) || scheduler_async_pending::closed(joined) ||
-        scheduler_completion_debt(gate) != scheduler_async_pending::registered(joined))
+    if (!scheduler_completion_valid(gate) || scheduler_completion_remaining(gate) != 0)
         return completion_error(*local, task_ref);
-    // No group registered: the final compute RMW already completed the task.
-    if (scheduler_async_pending::registered(joined) == 0) return {};
+    // A synchronous checked call has no close RMW. Keep its validation out of
+    // the deferred path, whose previous join word comes from the required RMW.
+    if (scheduler_completion_debt(gate) == 0) {
+        scheduler_cache_barrier();
+        const uint64_t joined = scheduler_gm_query(joins[index].word);
+        if (!scheduler_async_pending::valid(joined) || scheduler_async_pending::closed(joined) ||
+            scheduler_async_pending::registered(joined) != 0)
+            return completion_error(*local, task_ref);
+        return {};
+    }
     scheduler_cache_barrier();
     const auto closed = scheduler_async_pending::close_computation(joins[index]);
+    if ((closed.result != scheduler_async_pending::Result::FINISH_OWNER &&
+         closed.result != scheduler_async_pending::Result::PENDING) ||
+        scheduler_completion_debt(gate) != 1 || scheduler_async_pending::registered(closed.previous) == 0 ||
+        scheduler_async_pending::registered(closed.previous) > scheduler_completion_total(gate))
+        return completion_error(*local, task_ref);
     if (closed.result == scheduler_async_pending::Result::FINISH_OWNER)
         return {
             SchedulerAsyncCompletionResult::FINISH_OWNER, task_ref, local->layout->run_epoch,
@@ -520,7 +541,17 @@ static inline __aicore__ bool scheduler_async_check_step(
     if (!span(local.bytes, offset, 1, sizeof(AsyncGroupData), pto2::resident::ASYNC_RECORD_ALIGNMENT))
         return failed(-1);
     auto *data = scheduler_state_at<AsyncGroupData>(local.base, offset);
-    observe(data, sizeof(*data));
+    auto *progress = scheduler_state_at<SchedulerAsyncGroupProgress>(local.base, local.layout->group_progress_offset);
+    auto &current = progress[index];
+    // Run entry acquires the Host-owned second header line. Only its first line
+    // and the prior CHECK owner's progress need reception after this claim.
+    static_assert(
+        offsetof(AsyncGroupData, block_index) == pto2::resident::ASYNC_RECORD_ALIGNMENT,
+        "device-written AsyncGroupData fields must stay in the first cache line"
+    );
+    scheduler_invalidate_cache_line(data);
+    scheduler_invalidate_cache_line(&current);
+    scheduler_cache_barrier();
     const int64_t task_ref = data->task_ref;
     AsyncWriter writer{local.base, local.bytes, local.layout->run_epoch, offset, index};
     if (task_ref < 0 || static_cast<uint64_t>(task_ref) >= local.layout->task_count ||
@@ -528,9 +559,6 @@ static inline __aicore__ bool scheduler_async_check_step(
         data->error_code != 0 || data->count == 0 || data->count > data->capacity ||
         !pto2::resident::detail::layout_valid(writer, *data))
         return failed(task_ref);
-    auto *progress = scheduler_state_at<SchedulerAsyncGroupProgress>(local.base, local.layout->group_progress_offset);
-    auto &current = progress[index];
-    observe(&current, sizeof(current));
     uint64_t pending = current.pending_mask;
     uint32_t cursor = current.condition_cursor;
     if (pending == 0 || (pending & ~scheduler_async_condition_mask(data->count)) != 0 || cursor >= 64 ||
@@ -570,6 +598,16 @@ static inline __aicore__ bool scheduler_async_check_step(
         scheduler_async_directory_clear(directory[index / 64].bits, index % 64) !=
             SchedulerAsyncDirectoryResult::SUCCESS)
         return fail(local, task_ref);
+    const auto *counter = scheduler_completion_counter_at(local.base, local.completion_counters_offset, task_ref);
+    if (counter != nullptr) {
+        if (!scheduler_counter_publish_condition(
+                local.base, *counter, task_ref, data->block_index, data->subtask_slot, local.task_metadata_offset,
+                local.protocol_layout_offset, local.worker_index, true
+            ))
+            return fail(local, task_ref);
+        completion = {SchedulerAsyncCompletionResult::WAITING, task_ref};
+        return true;
+    }
     completion = settle_group(local, task_ref);
     return completion.result != SchedulerAsyncCompletionResult::ERROR;
 }

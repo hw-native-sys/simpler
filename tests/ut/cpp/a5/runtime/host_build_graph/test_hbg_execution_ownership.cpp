@@ -22,6 +22,39 @@ namespace {
 thread_local std::function<void(void *)> receive_observer;
 thread_local std::function<void(void *)> writeback_observer;
 thread_local std::function<void(volatile uint64_t *)> prepared_cas_observer;
+thread_local const volatile void *query_target = nullptr;
+thread_local uint32_t query_count = 0;
+thread_local const volatile uint32_t *notify_target = nullptr;
+thread_local uint32_t notify_count = 0;
+
+template <typename Word>
+auto observe_query(volatile Word &word, int order = __ATOMIC_ACQUIRE) {
+    if (&word == query_target) ++query_count;
+    return scheduler_gm_query(word, order);
+}
+
+uint32_t observe_notify_query(volatile uint32_t &word) {
+    if (&word == notify_target) ++notify_count;
+    return scheduler_notify_query(word);
+}
+
+class ScopedQueryObserver {
+public:
+    explicit ScopedQueryObserver(const volatile void *address) {
+        query_target = address;
+        query_count = 0;
+    }
+    ~ScopedQueryObserver() { query_target = nullptr; }
+};
+
+class ScopedNotifyObserver {
+public:
+    explicit ScopedNotifyObserver(const volatile uint32_t *address) {
+        notify_target = address;
+        notify_count = 0;
+    }
+    ~ScopedNotifyObserver() { notify_target = nullptr; }
+};
 
 uint64_t observe_prepared_cas(
     volatile uint64_t &word, uint64_t expected, uint64_t desired, int success = __ATOMIC_ACQ_REL,
@@ -79,6 +112,8 @@ public:
 #undef scheduler_invalidate_cache_line
 
 #define scheduler_writeback_cache_line observe_binding_writeback
+#define scheduler_gm_query observe_query
+#define scheduler_notify_query observe_notify_query
 #include "hbg_scheduler_test_support.h"
 #include "prepared_execution_plan.h"
 #include "scheduler/scheduler_completion.h"
@@ -86,6 +121,8 @@ public:
 #include "scheduler/scheduler_execution_tokens.h"
 #include "scheduler/scheduler_prepared_execution.h"
 #undef scheduler_writeback_cache_line
+#undef scheduler_gm_query
+#undef scheduler_notify_query
 
 namespace {
 
@@ -289,6 +326,80 @@ struct RefillFixture {
     }
 };
 
+TEST(HbgExecutionRefill, ContinuationExhaustionIsReusedWithoutAdvancingAnUnsealedHead) {
+    RefillFixture fixture(1);
+    fixture.storage.metadata[0].logical_block_num = 2;
+    fixture.storage.metadata[0].flags |= SCHEDULER_TASK_SPMD;
+    ASSERT_NO_FATAL_FAILURE(fixture.initialize());
+    SchedulerIssueSnapshot snapshot{};
+    int64_t head = SCHEDULER_TASK_REF_INVALID;
+    bool progress = false;
+    ASSERT_TRUE(scheduler_issue_head(
+        fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, &head, &progress, &snapshot
+    ));
+    ASSERT_EQ(head, 0);
+    ASSERT_EQ(fixture.local->issue_task_ref, 0);
+    fixture.control(0)->next_block = 2;
+    fixture.local->continuation_task_ref = 0;
+    ScopedQueryObserver observer(&fixture.control(0)->next_block);
+    ASSERT_TRUE(scheduler_try_execution_continuation(
+        fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, 0, &progress, &snapshot
+    ));
+    EXPECT_TRUE(fixture.local->issue_ticket_exhausted);
+    EXPECT_EQ(query_count, 1u);
+    ASSERT_TRUE(scheduler_refill_execution_tokens(
+        fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, 0, &progress, &snapshot
+    ));
+    EXPECT_EQ(query_count, 1u);
+    EXPECT_TRUE(snapshot.evaluated);
+    EXPECT_EQ(fixture.local->issue_cursor, 0u);
+    EXPECT_EQ(fixture.control(0)->claim_seal, 0u);
+    fixture.control(0)->claim_seal = 2;
+    snapshot = {};
+    ASSERT_TRUE(scheduler_refill_execution_tokens(
+        fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, 0, &progress, &snapshot
+    ));
+    EXPECT_EQ(fixture.local->issue_cursor, 1u);
+    EXPECT_EQ(query_count, 1u);
+}
+
+TEST(HbgExecutionRefill, CounterAccountingReusesOnlyAnObservedDoneProof) {
+    RefillFixture fixture(1);
+    ASSERT_NO_FATAL_FAILURE(fixture.initialize());
+    uint32_t value = 0;
+    auto *counters = scheduler_state_at<SchedulerTaskCompletionCounter>(
+        fixture.base(), fixture.storage.layout.completion_counters_offset
+    );
+    counters[0] = {reinterpret_cast<uint64_t>(&value), reinterpret_cast<uint64_t>(&value), 1, 1};
+    fixture.local->config.completion_counters_offset = fixture.storage.layout.completion_counters_offset;
+    scheduler_remember_task_proof(fixture.local, 0, SchedulerTaskProof::SUPPLY_CLOSED);
+    ScopedNotifyObserver observer(&value);
+    bool progress = false;
+    ASSERT_TRUE(scheduler_service_counter_accounting(
+        fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, &progress
+    ));
+    EXPECT_FALSE(progress);
+    EXPECT_EQ(notify_count, 1u);
+    EXPECT_EQ(fixture.local->pending_completed, 0u);
+    value = 1;
+    EXPECT_EQ(
+        scheduler_observe_cached_completion(fixture.base(), fixture.local, 0), SchedulerCompletionObservation::DONE
+    );
+    EXPECT_EQ(notify_count, 2u);
+    ASSERT_TRUE(scheduler_service_counter_accounting(
+        fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, &progress
+    ));
+    EXPECT_TRUE(progress);
+    EXPECT_EQ(notify_count, 2u);
+    EXPECT_EQ(fixture.local->pending_completed, 1u);
+    EXPECT_TRUE(scheduler_completion_done(fixture.control(0)->completion_state));
+    ASSERT_TRUE(scheduler_service_counter_accounting(
+        fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, &progress
+    ));
+    EXPECT_FALSE(progress);
+    EXPECT_EQ(fixture.local->pending_completed, 1u);
+}
+
 TEST(HbgExecutionRefill, TicketOwnerKeepsLifecycleWithoutASecondOwnershipAtomic) {
     for (bool cancel : {false, true}) {
         RefillFixture fixture(1);
@@ -397,11 +508,14 @@ TEST(HbgExecutionRefill, WaitingTokenRebindsAfterEachPredecessorCompletes) {
     ASSERT_TRUE(scheduler_prepared_execution_index(fixture.base(), fixture.local->config.prepared, 2, 0, 0, &index));
     auto *binding = scheduler_execution_binding_at(fixture.base(), fixture.local->config.prepared, index);
     uint32_t writebacks = 0;
+    uint32_t local_writebacks = 0;
     ScopedBindingWritebackObserver observer([&](void *address) {
-        if (address == &binding->local_context || address == &binding->global_context) ++writebacks;
+        if (address == &binding->global_context) ++writebacks;
+        if (address == &binding->local_context) ++local_writebacks;
     });
     ASSERT_NO_FATAL_FAILURE(fixture.own(2));
-    EXPECT_EQ(writebacks, 2u);
+    EXPECT_EQ(writebacks, 1u);
+    EXPECT_EQ(local_writebacks, 0u);
     for (uint32_t predecessor = 0; predecessor < 2; ++predecessor) {
         for (uint32_t attempt = 0; attempt < 2; ++attempt) {
             uint32_t slot = UINT32_MAX;
@@ -419,7 +533,8 @@ TEST(HbgExecutionRefill, WaitingTokenRebindsAfterEachPredecessorCompletes) {
     ASSERT_TRUE(fixture.progress(&slot));
     ASSERT_LT(slot, SCHEDULER_PENDING_SLOT_COUNT);
     EXPECT_EQ(fixture.local->slots[slot].task_ref, 2);
-    EXPECT_EQ(writebacks, 2u);
+    EXPECT_EQ(writebacks, 1u);
+    EXPECT_EQ(local_writebacks, 0u);
     ASSERT_NO_FATAL_FAILURE(fixture.execute(slot));
     EXPECT_EQ(scheduler_execution_token_count(fixture.local), 0u);
 }

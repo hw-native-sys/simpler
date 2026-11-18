@@ -107,6 +107,7 @@ SCALAR_PHASES = frozenset(
         "scalar_prepared_receive",
         "scalar_prepared_acquire",
         "scalar_prepared_claim",
+        "scalar_counter_accounting",
         "scalar_prepared_return",
         "scalar_prepared_observe",
         "scalar_prepared_index",

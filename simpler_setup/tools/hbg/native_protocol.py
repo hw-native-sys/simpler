@@ -13,6 +13,7 @@ Sequence integrity proves lossless local event streams, not scheduler causality,
 execution coverage, membership, dependency ordering or Mix resource correctness.
 """
 
+COUNTER_ACCOUNTING = 1 << 27
 MEMBER_FROM_CLAIM = 1 << 28
 COMPLETION_FROM_GROUP = 1 << 29
 COMPLETION_FROM_CONTRIBUTION = 1 << 30
@@ -27,7 +28,8 @@ active_worker_count scheduler_error error_claimed commit_tail commit_lock
 """.split()
 )
 ROOT_TABLES = frozenset(
-    "tasks workers admissions admission_log task_controls task_events members blocks executions".split()
+    "tasks workers admissions admission_log task_controls task_events members blocks executions "
+    "condition_contributions completion_counters".split()
 )
 ERROR_NUMBERS = (
     "task_ref core_id core_type site run_epoch order_key block_idx group_seq worker_index cluster_lane identity_fields"
@@ -42,8 +44,11 @@ NUMBERS = {
     ),
     "admission": ("index run_epoch task_ref order_key block_num member_count active_mask flags record_offset"),
     "control": (
-        "task_ref state next_block completed_subtasks admission_state canonical_total pending_compute completion_debt"
+        "task_ref state next_block completed_subtasks admission_state canonical_total pending_compute completion_debt "
+        "completion_backend counter_index counter_threshold counter_limit async_mask"
     ),
+    "counter": "index value valid limit",
+    "condition": "index run_epoch task_ref worker_index block_idx subtask_slot source credits",
     "claim": "run_epoch worker_index block_idx confirmed_count seal_value",
     "actor": "run_epoch task_ref order_key worker_index flags",
     "member": (
@@ -52,7 +57,7 @@ NUMBERS = {
     ),
     "owner": (
         "run_epoch task_ref order_key group_seq completion_ticket worker_index "
-        "block_idx cluster_index block_num active_mask flags sync_tail"
+        "block_idx cluster_index block_num active_mask flags sync_tail completion_credits"
     ),
     "lane": (
         "index run_epoch task_ref order_key group_seq worker_index block_idx "
@@ -62,12 +67,13 @@ NUMBERS = {
         "index run_epoch task_ref order_key permit_tail worker_index block_idx "
         "pending_slot subtask_slot flags ready_source group_seq block_num cluster_index cluster_lane "
         "publication_before_cycles publication_after_cycles publication_count "
-        "contribution_ticket contribution_worker"
+        "contribution_ticket contribution_worker contribution_credits"
     ),
 }
 STAMPS = {
     "claim": "published_before published_after",
     "actor": "before after",
+    "condition": "before after",
     "member": "observed closed",
     "owner": (
         "staged claim_before claim_after publish_before publish_after "
@@ -181,17 +187,91 @@ def read_native_protocol(section):
     for table, kind, count in (
         ("members", "member", section["member_count"]),
         ("executions", "execution", section["trace_count"]),
+        ("condition_contributions", "condition", section["trace_count"]),
     ):
         _indices(section[table], count, table)
         for row in section[table]:
             extra = ("claim_seal_seen", "claim_cursor_seen") if kind == "member" else ()
             _record(row, kind, f"{table}[{row['index']}]", extra)
+    counters = section["completion_counters"]
+    if not isinstance(counters, list) or len(counters) > section["task_count"]:
+        _error("invalid completion counter count")
+    _indices(counters, len(counters), "completion_counters", dense=True)
+    for counter in counters:
+        _record(counter, "counter", f"completion_counters[{counter['index']}]")
+    counter_chains(section)
     _read_nested_events(section)
     if native:
         from .native_graph import read_graph_source  # noqa: PLC0415
 
         read_graph_source(section)
     return section
+
+
+def _counter_ancestor(tasks, task, ancestor):
+    pending, visited = list(tasks[task]["dependencies"]), set()
+    while pending:
+        current = pending.pop()
+        if current == ancestor:
+            return True
+        if current in visited or current not in tasks:
+            continue
+        visited.add(current)
+        pending.extend(tasks[current]["dependencies"])
+    return False
+
+
+def counter_chains(section):
+    """Each counter accumulates complete tasks along a true dependency chain."""
+    tasks = {row["task_ref"]: row for row in section["tasks"]}
+    counters = {row["index"]: row for row in section["completion_counters"]}
+    chains = {index: [] for index in counters}
+    for control in section["task_controls"]:
+        backend, index = control["completion_backend"], control["counter_index"]
+        threshold, limit = control["counter_threshold"], control["counter_limit"]
+        task = tasks[control["task_ref"]]
+        if control["async_mask"] & ~task["active_mask"]:
+            _error("async completion mask contains an inactive lane")
+        if backend == 0:
+            if index != (1 << 64) - 1 or threshold != 0 or limit != 0:
+                _error("GM completion carries counter metadata")
+            continue
+        if (
+            backend != 1
+            or index not in counters
+            or not task["flags"] & 1
+            or task["flags"] & 32
+            or not 0 < task["active_mask"] < 8
+            or not 0 < threshold <= limit < 1 << 32
+            or counters[index]["limit"] != limit
+        ):
+            _error("invalid completion counter descriptor")
+        chains[index].append(control)
+    for index, chain in chains.items():
+        counter = counters[index]
+        if (
+            not chain
+            or counter["valid"] not in (0, 1)
+            or not 0 <= counter["value"] <= counter["limit"]
+            or (not counter["valid"] and counter["value"] != 0)
+        ):
+            _error("invalid completion counter observation")
+        previous, threshold = None, 0
+        chain.sort(key=lambda row: row["counter_threshold"])
+        for control in chain:
+            ref = control["task_ref"]
+            task = tasks[ref]
+            threshold += task["block_num"] * (
+                bin(task["active_mask"]).count("1") + bin(control["async_mask"]).count("1")
+            )
+            if control["counter_threshold"] != threshold or (
+                previous is not None and not _counter_ancestor(tasks, ref, previous)
+            ):
+                _error("counter thresholds do not describe a true ancestor chain")
+            previous = ref
+        if threshold != counter["limit"]:
+            _error("completion counter limit does not cover its chain")
+    return chains
 
 
 def _read_nested_events(section):
@@ -227,7 +307,7 @@ def _event_records(section):
             yield row["owner"], "owner", f"blocks[{row['index']}].owner"
         for lane in row["lanes"]:
             yield lane, "lane", f"blocks[{row['index']}].lanes[{lane['index']}]"
-    for table, kind in (("members", "member"), ("executions", "execution")):
+    for table, kind in (("members", "member"), ("executions", "execution"), ("condition_contributions", "condition")):
         for row in section[table]:
             yield row, kind, f"{table}[{row['index']}]"
 
@@ -254,7 +334,7 @@ def _completion_aliases(section):
             continue
         ref = event["index"]
         task, control = tasks[ref], controls[ref]
-        width = task["active_mask"].bit_count()
+        width = bin(task["active_mask"]).count("1")
         total = task["block_num"] * width
         group_alias = bool(done["flags"] & COMPLETION_FROM_GROUP)
         alias_flag = COMPLETION_FROM_GROUP if group_alias else COMPLETION_FROM_CONTRIBUTION
@@ -308,8 +388,8 @@ def _completion_aliases(section):
             or source["block_num"] != task["block_num"]
             or source["index"]
             != task["trace_base"]
-            + block * task["active_mask"].bit_count()
-            + (task["active_mask"] & ((1 << lane) - 1)).bit_count()
+            + block * bin(task["active_mask"]).count("1")
+            + bin(task["active_mask"] & ((1 << lane) - 1)).count("1")
             or source["run_epoch"] != done["run_epoch"]
             or source["worker_index"] != done["worker_index"]
             or source["contribution_worker"] != done["worker_index"]

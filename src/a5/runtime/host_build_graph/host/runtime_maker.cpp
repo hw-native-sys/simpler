@@ -34,6 +34,8 @@
  *     outlives the run and is freed once at Worker finalization.
  */
 
+#include "host/scheduler_notifications.h"
+
 #include <dlfcn.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -59,6 +61,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <unordered_map>
 #include <vector>
@@ -71,6 +74,7 @@
 #include "prepared_execution_plan.h"
 #include "async_completion_plan.h"
 #include "task_catalog_plan.h"
+#include "completion_counter_plan.h"
 #include "dependency_plan.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_args_dump.h"
@@ -753,7 +757,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
                 }
                 const uint32_t kind = record.kind & UINT32_C(0xffff);
                 if (kind < static_cast<uint32_t>(SchedPhaseKind::ScalarWindow) ||
-                    kind > static_cast<uint32_t>(SchedPhaseKind::ScalarPreparedClaim) ||
+                    kind > static_cast<uint32_t>(SchedPhaseKind::ScalarCounterAccounting) ||
                     std::strcmp(sched_phase_kind_name(static_cast<SchedPhaseKind>(kind)), "unknown") == 0 ||
                     record.start_time == 0 || record.end_time < record.start_time) {
                     LOG_WARN("A5 HBG: invalid Scalar interval for worker=%" PRIu64, worker);
@@ -1721,6 +1725,8 @@ bool create_scheduler_state(
 
     AsyncCompletionHostPlan async_plan;
     std::vector<AsyncTaskPlanInput> async_inputs;
+    std::vector<LaneMask> possible_async_lanes(task_metadata.size());
+    std::array<uint64_t, 2> capability_lanes{}, capability_executions{};
     for (uint32_t ref = 0; ref < task_metadata.size(); ++ref) {
         const auto &metadata = task_metadata[ref];
         if ((metadata.flags & SCHEDULER_TASK_EXECUTABLE) == 0 || scheduler_task_is_inline(metadata.flags)) continue;
@@ -1728,6 +1734,30 @@ bool create_scheduler_state(
         input.task_ref = ref;
         input.block_count = metadata.logical_block_num;
         input.active_mask = metadata.active_mask;
+        std::array<CoreAsyncCapability, 3> capabilities{};
+        for (uint32_t lane = 0; lane < 3; ++lane) {
+            if (!metadata.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
+            try {
+                capabilities[lane] = runtime->get_function_async_capability(metadata.kernel_ids[lane]);
+            } catch (const std::exception &error) {
+                LOG_ERROR(
+                    "A5 HBG: async capability unavailable for task=%u lane=%u kernel=%u: %s", ref, lane,
+                    metadata.kernel_ids[lane], error.what()
+                );
+                return false;
+            }
+        }
+        if (!async_task_apply_capabilities(&input, capabilities)) {
+            LOG_ERROR("A5 HBG: invalid async capability for leaf task=%u", ref);
+            return false;
+        }
+        for (uint32_t lane = 0; lane < 3; ++lane) {
+            if (!metadata.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
+            const auto mode = static_cast<uint32_t>(capabilities[lane].mode) - 1;
+            ++capability_lanes[mode];
+            capability_executions[mode] += metadata.logical_block_num;
+            if (input.capacities[lane] != 0) possible_async_lanes[ref].activate(static_cast<SubtaskSlot>(lane));
+        }
         async_inputs.push_back(input);
     }
     std::string async_error;
@@ -1738,6 +1768,13 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG: async completion layout failed: %s", async_error.c_str());
         return false;
     }
+    LOG_TIMING(
+        "A5 HBG async capabilities: leaf_lanes synchronous=%" PRIu64 " deferred=%" PRIu64
+        " executions synchronous=%" PRIu64 " deferred=%" PRIu64 " groups=%u layout_offset=%" PRIu64
+        " async_bytes=%" PRIu64,
+        capability_lanes[0], capability_lanes[1], capability_executions[0], capability_executions[1],
+        async_plan.layout.group_count, async_plan.layout_offset, async_plan.total_bytes - async_plan.begin_offset
+    );
     layout.total_size = async_plan.total_bytes;
     layout.async_layout_offset = async_plan.layout_offset;
     layout.executable_subtask_count = executable_subtask_count;
@@ -1841,6 +1878,132 @@ bool create_scheduler_state(
         }
         task_catalog_plan.header.control_count -= folded;
     }
+    std::vector<bool> host_completed(node_count, false);
+    for (const int64_t ref : inline_completed_task_refs)
+        host_completed[ref] = true;
+    std::vector<std::vector<int64_t>> counter_fanin(node_count);
+    std::vector<uint32_t> counter_credits(node_count, 0);
+    for (uint64_t ref = 0; ref < node_count; ++ref) {
+        // Folded controls already splice live fanin into their consumers;
+        // other Host-completed nodes have no outstanding device predecessors.
+        if (host_completed[ref]) continue;
+        SchedulerFaninView view{};
+        if (scheduler_node_fanin_view(dependency_graph, ref, &view) != SchedulerGraphResult::OK) return false;
+        for (uint32_t edge = 0; edge < view.count; ++edge) {
+            int64_t predecessor = SCHEDULER_TASK_REF_INVALID;
+            if (scheduler_fanin_ref(view, ref, edge, &predecessor) != SchedulerGraphResult::OK) return false;
+            counter_fanin[ref].push_back(predecessor);
+        }
+        const auto &metadata = task_metadata[ref];
+        if ((metadata.flags & SCHEDULER_TASK_EXECUTABLE) == 0 || scheduler_task_is_inline(metadata.flags)) continue;
+        uint32_t executions = 0;
+        if (!scheduler_subtask_count_checked(
+                metadata.logical_block_num, scheduler_task_lanes(metadata).count(), &executions
+            ))
+            return false;
+        const uint64_t credits =
+            executions + static_cast<uint64_t>(metadata.logical_block_num) * possible_async_lanes[ref].count();
+        if (credits > UINT32_MAX) {
+            LOG_ERROR("A5 HBG: completion credit count overflows for task=%" PRIu64, ref);
+            return false;
+        }
+        counter_credits[ref] = static_cast<uint32_t>(credits);
+    }
+    if (!async_mark_input_visibility(
+            counter_fanin, task_catalog_plan.task_order, possible_async_lanes, &task_metadata
+        )) {
+        LOG_ERROR("A5 HBG: invalid dependency order for async input visibility");
+        return false;
+    }
+    SchedulerCompletionCounterPlan counter_plan;
+    if (!scheduler_plan_completion_counters(
+            counter_fanin, task_catalog_plan.task_order, counter_credits, &counter_plan, &task_order_error
+        )) {
+        LOG_ERROR("A5 HBG: completion counter plan failed: %s", task_order_error.c_str());
+        return false;
+    }
+    SchedulerDoneNotifications counter_notifications;
+    try {
+        if (api->acquire_scheduler_notifications(
+                SchedulerNotificationPurpose::COMPLETION_COUNTER, counter_plan.chains.size(), &counter_notifications
+            ) != 0)
+            throw std::runtime_error("cannot acquire retained completion counters");
+    } catch (const std::exception &error) {
+        LOG_ERROR("A5 HBG: cannot prepare completion counters: %s", error.what());
+        return false;
+    }
+    if (counter_notifications.owner != nullptr)
+        runtime->retain_pending_resource(std::move(counter_notifications.owner));
+    auto *counter_descriptors =
+        scheduler_state_at<SchedulerTaskCompletionCounter>(host_base, layout.completion_counters_offset);
+    std::vector<uint64_t> legacy_done_refs;
+    uint64_t mapped_counter_tasks = 0;
+    for (uint64_t ref = 0; ref < node_count; ++ref) {
+        const uint32_t chain = counter_plan.task_chains[ref];
+        if (chain != UINT32_MAX && counter_notifications.addresses[chain] != 0 &&
+            counter_notifications.add_addresses[chain] != 0) {
+            counter_descriptors[ref] = {
+                counter_notifications.addresses[chain], counter_notifications.add_addresses[chain],
+                counter_plan.thresholds[ref], counter_plan.chains[chain].limit
+            };
+            ++mapped_counter_tasks;
+        } else {
+            legacy_done_refs.push_back(ref);
+        }
+    }
+    SchedulerDoneNotifications notifications;
+    try {
+        if (api->acquire_scheduler_notifications(
+                SchedulerNotificationPurpose::TASK_STATE, legacy_done_refs.size(), &notifications
+            ) != 0)
+            throw std::runtime_error("cannot acquire retained task notifications");
+    } catch (const std::exception &error) {
+        LOG_ERROR("A5 HBG: cannot prepare DONE notifications: %s", error.what());
+        return false;
+    }
+    if (notifications.owner != nullptr) runtime->retain_pending_resource(std::move(notifications.owner));
+    auto *notification_addresses = scheduler_state_at<uint64_t>(host_base, layout.done_notifications_offset);
+    for (size_t index = 0; index < legacy_done_refs.size(); ++index)
+        notification_addresses[legacy_done_refs[index]] = notifications.addresses[index];
+    const size_t eligible_counter_tasks =
+        std::count_if(counter_credits.begin(), counter_credits.end(), [](uint32_t credits) {
+            return credits != 0;
+        });
+    const size_t mapped_counter_chains = std::count_if(
+        counter_notifications.add_addresses.begin(), counter_notifications.add_addresses.end(), [](uint64_t address) {
+            return address != 0;
+        }
+    );
+    LOG_TIMING(
+        "A5 HBG: completion counters backend=SET-slot-offset planned_chains=%zu mapped_chains=%zu eligible_tasks=%zu "
+        "mapped_tasks=%" PRIu64,
+        counter_plan.chains.size(), mapped_counter_chains, eligible_counter_tasks, mapped_counter_tasks
+    );
+
+    // The total number of MIX blocks bounds every cluster's sequence. Larger
+    // graphs retain the full-width GM protocol; no sequence is truncated.
+    uint64_t mix_blocks = 0;
+    for (const auto &metadata : task_metadata)
+        if (scheduler_task_is_mix(metadata.flags)) mix_blocks += metadata.logical_block_num;
+    using MixNotificationAddresses = decltype(SchedulerGroupMailbox::notification_addresses);
+    constexpr size_t mix_notification_lanes = std::extent_v<MixNotificationAddresses, 0>;
+    constexpr size_t mix_notification_phases = std::extent_v<MixNotificationAddresses, 1>;
+    constexpr size_t mix_notification_words = mix_notification_lanes * mix_notification_phases;
+    SchedulerDoneNotifications mix_notifications;
+    if (spmd.sync_mix_task_count != 0 && mix_blocks < (UINT64_C(1) << 31)) {
+        try {
+            if (api->acquire_scheduler_notifications(
+                    SchedulerNotificationPurpose::MIX_ACK,
+                    static_cast<size_t>(spmd.cluster_count) * mix_notification_words, &mix_notifications
+                ) != 0)
+                throw std::runtime_error("cannot acquire retained MIX notifications");
+        } catch (const std::exception &error) {
+            LOG_ERROR("A5 HBG: cannot prepare MIX notifications: %s", error.what());
+            return false;
+        }
+    }
+
+    if (mix_notifications.owner != nullptr) runtime->retain_pending_resource(std::move(mix_notifications.owner));
     if (protocol_profiling) {
         try {
             SchedulerGraphView snapshot = host_graph;
@@ -1917,6 +2080,8 @@ bool create_scheduler_state(
         context.run_control_offset = layout.run_control_offset;
         context.task_controls_offset = layout.task_controls_offset;
         context.task_metadata_offset = layout.task_metadata_offset;
+        context.done_notifications_offset = layout.done_notifications_offset;
+        context.completion_counters_offset = mapped_counter_tasks == 0 ? 0 : layout.completion_counters_offset;
         context.aicpu_lifecycle_traces_offset = layout.aicpu_lifecycle_traces_offset;
         context.worker_contexts_offset = layout.worker_contexts_offset;
         context.runtime_worker_count = static_cast<uint64_t>(runtime->get_worker_count());
@@ -1933,6 +2098,21 @@ bool create_scheduler_state(
         context.original_task_count = static_cast<uint64_t>(total_tasks);
         context.scheduler_state_bytes = layout.total_size;
         context.worker_index = static_cast<uint64_t>(i);
+    }
+
+    if (!mix_notifications.addresses.empty()) {
+        auto *mailboxes = scheduler_state_at<SchedulerGroupMailbox>(host_base, layout.group_mailboxes_offset);
+        for (uint64_t cluster = 0; cluster < spmd.cluster_count; ++cluster) {
+            const auto *addresses = mix_notifications.addresses.data() + cluster * mix_notification_words;
+            if (std::all_of(addresses, addresses + mix_notification_words, [](uint64_t address) {
+                    return address != 0;
+                }))
+                for (size_t lane = 0; lane < mix_notification_lanes; ++lane)
+                    std::copy(
+                        addresses + lane * mix_notification_phases, addresses + (lane + 1) * mix_notification_phases,
+                        mailboxes[cluster].notification_addresses[lane]
+                    );
+        }
     }
 
     runtime->publish_scheduler_bootstrap(
@@ -2539,6 +2719,10 @@ extern "C" int bind_callable_to_runtime_impl(
     }
     const int transfer_status = validate_program_tensor_transfers(orch_args, true, signature, sig_count);
     if (transfer_status != 0) return transfer_status;
+    if (!runtime->bind_callable_async_capabilities(*api)) {
+        LOG_ERROR("A5 HBG: callable async capability table is unavailable or has an invalid length");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     // host_build_graph host-orch: register_callable_impl resolved the
     // orchestration entry on the host and passed it here as host_orch_func_ptr;
     // it is run below (after the arena is built) against a host SM mirror.

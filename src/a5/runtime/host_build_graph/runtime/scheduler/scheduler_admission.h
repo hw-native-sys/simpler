@@ -373,11 +373,9 @@ static inline __aicore__ bool scheduler_refresh_local_obligation(
         scheduler_cache_barrier();
         if (record->run_epoch != admission->epoch)
             return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_EPOCH_MISMATCH);
-        auto *control = scheduler_task_control_at(base, local, task);
-        // Bootstrap validates immutable shape and topology; epoch, order and
-        // publication remain dynamic gates for every adoption.
-        if (record->order_key != admission->scan_cursor ||
-            scheduler_gm_query(control->admission_state) != static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED))
+        // The committed tail follows ADMITTED publication. Epoch and order
+        // identify this record without a second observation of the same fact.
+        if (record->order_key != admission->scan_cursor)
             return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_RECORD);
         // The validated committed prefix retires the same local proposal. It
         // does not require another acquisition of the publisher's global lock.
@@ -490,18 +488,19 @@ static inline __aicore__ bool scheduler_read_claim_cursor(
         return scheduler_admission_fail(
             graph, local, run, admission->current_task_ref, SchedulerErrorSite::BLOCK_CURSOR_INVALID
         );
-    if (seal == count) scheduler_cache_barrier();
-    const uint64_t next = scheduler_scalar_result(local, SchedPhaseKind::ScalarNextBlockProbe, [&]() __aicore__ {
-        return scheduler_gm_query(control->next_block);
-    });
-    if (next > count || (seal == count && next != count))
-        return scheduler_admission_fail(
-            graph, local, run, admission->current_task_ref, SchedulerErrorSite::BLOCK_CURSOR_INVALID
-        );
     if (seal == count) {
         scheduler_remember_task_proof(local, admission->current_task_ref, SchedulerTaskProof::SUPPLY_CLOSED);
         if (used_seal != nullptr) *used_seal = true;
+        *cursor = count;
+        return true;
     }
+    const uint64_t next = scheduler_scalar_result(local, SchedPhaseKind::ScalarNextBlockProbe, [&]() __aicore__ {
+        return scheduler_gm_query(control->next_block);
+    });
+    if (next > count)
+        return scheduler_admission_fail(
+            graph, local, run, admission->current_task_ref, SchedulerErrorSite::BLOCK_CURSOR_INVALID
+        );
     *cursor = next;
     return true;
 }
