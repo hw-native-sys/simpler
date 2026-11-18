@@ -298,15 +298,25 @@ not another unstarted scheduling candidate.
 | ----- | ------------- |
 | 0 | Disabled; the uninstrumented lane implementation is compiled separately |
 | 1 | Kernel execution and final input acquisition, streamed through the shared collector |
-| 2 | L1 plus per-execution local dispatch and return timestamps, joined by `(worker_id, reg_task_id, run_epoch)` |
-| 3 | L2 plus nested percounter function intervals of at least 1 microsecond, individual GM/SSBUF operations, cache issues and barriers |
-| 4 | L3 with every instrumented function interval retained, plus Host orchestration phases |
+| 2 | L1 plus the Scheduler View with task/block milestones |
+| 3 | L2 plus nested AICore Scheduler function intervals of at least 1 microsecond |
+| 4 | L3 with every instrumented function interval retained, individual GM/SSBUF operations, cache issues and barriers, and Host orchestration phases |
 
-Percounter dispatch means entry to execution of a ready task with its immutable arguments;
-finish means local kernel return after the output-store barrier. It does not
-mean the last sibling finished or every consumer observed the task's completion.
-SSBUF context binding, fanin probes, MIX rendezvous, fixed-slot acquisition, entry/idle checks and
-completion-counter publication appear on the L3/L4 Scalar lane.
+The Scheduler View groups events by task and block, including Graph body tasks.
+Its `Cluster 00 / 2` style labels name additional display rows used when block
+lifetimes overlap in the same physical cluster. Marker details identify the
+actual worker, cluster and C/V0/V1 role.
+
+| Milestone | Device boundary |
+| --------- | --------------- |
+| Claim | The claiming lane acquires the task/block in its local scheduler state. For MIX, the timestamp precedes publication of the entry to the participating lanes in SSBUF. |
+| Ready | A lane selects the task/block after its dependency, ordering and applicable MIX or sync-start gates. Each participating MIX lane records its own Ready. Argument prefetch can occur earlier. |
+| Kernel end | The executing lane returns from its kernel, before the output-store barrier. The marker also carries that lane's kernel start. Dependency-only and skipped entries have no kernel interval. |
+| Completion issued | The publisher issues the GM completion contribution. For MIX this includes the aggregate and any deferred-share deductions. Deferred settlement records its own publisher and may occur later. |
+
+Completion markers describe individual GM updates. A task's total completion may
+include contributions from several blocks. A consumer observes completion when
+its own dependency checks succeed.
 
 Each active worker has its own **AICore Scheduler** lane, grouped by cluster
 and C/V0/V1 role. Function names are percounter's own; task IDs retain the HBG
@@ -315,8 +325,10 @@ intervals inside execution/service functions and computes exclusive time without
 double-counting parents. Worker View retains the original kernel intervals.
 
 L2 reserves up to 65,536 task-timing records per worker, bounded by the graph's
-block count. Each worker partition starts on its own cache line. Overflow fails the timing export instead of silently joining an
-incomplete stream. L3/L4 additionally reserve 8 MiB per worker slot. A compact
+block count, and up to 16,384 scheduler task events per worker. Each worker
+partition starts on its own cache line. Task-timing overflow fails the export.
+Milestone overflow is reported as `percounter_task_events.dropped`. L3/L4
+additionally reserve 8 MiB per worker slot. A compact
 Scalar row occupies one 8-byte word: a 32-bit start offset from the worker's
 window, a 16-bit duration, an 8-bit phase and a 7-bit nesting depth. This retains
 the full clock precision. Intervals outside those bounds use five words with
@@ -329,7 +341,7 @@ complete time partition for that worker. L0/L1 allocate neither record tail.
 Profiling storage belongs to the run's scheduler-state allocation and is reset
 on reuse; each profiled AICore entry resets its local recorder binding.
 
-Memory leaves preserve the protocol's existing accesses and barriers. Returning
+L4 memory leaves preserve the protocol's existing accesses and barriers. Returning
 atomics and loads end when the result is locally consumable; stores and atomics
 whose results are unused record issue time. DCCI issue and DSB completion are
 separate events. L2+ task records are staged locally and written after the

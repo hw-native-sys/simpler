@@ -194,7 +194,8 @@ struct Fixture {
         bool deferred = false;
         return percounter_run_task(
             cfg[lane], &state[lane], task, block, inputs[task.id].block_num, 0,
-            percounter_completion_address(cfg[lane], task.id, block, inputs[task.id].block_num), &deferred
+            percounter_completion_address(cfg[lane], task.id, block, inputs[task.id].block_num), &deferred,
+            percounter_order_entry(task.id, block, inputs[task.id].block_num)
         );
     }
     PercounterTask resolve(int id) {
@@ -647,7 +648,8 @@ TEST(PercounterAcquire, EveryCompletionPartitionGatesEachObserver) {
                 if (block == held) continue;
                 percounter_publish_completion(
                     f.cfg[0], producer,
-                    percounter_completion_address(f.cfg[0], 0, block, PERCOUNTER_COMPLETION_SECTOR_COUNT), 1
+                    percounter_completion_address(f.cfg[0], 0, block, PERCOUNTER_COMPLETION_SECTOR_COUNT), 1,
+                    percounter_order_entry(0, block, PERCOUNTER_COMPLETION_SECTOR_COUNT)
                 );
             }
             const uint64_t reference = reinterpret_cast<uint64_t>(&f.counters[0]) | PERCOUNTER_COMPLETION_PARTITIONED;
@@ -659,7 +661,8 @@ TEST(PercounterAcquire, EveryCompletionPartitionGatesEachObserver) {
             EXPECT_EQ(other, cached);
             percounter_publish_completion(
                 f.cfg[0], producer,
-                percounter_completion_address(f.cfg[0], 0, held, PERCOUNTER_COMPLETION_SECTOR_COUNT), 1
+                percounter_completion_address(f.cfg[0], 0, held, PERCOUNTER_COMPLETION_SECTOR_COUNT), 1,
+                percounter_order_entry(0, held, PERCOUNTER_COMPLETION_SECTOR_COUNT)
             );
             EXPECT_TRUE(percounter_probe_completion(f.cfg[lane], reference, &pending, &other));
             EXPECT_EQ(pending, 0U);
@@ -2415,7 +2418,8 @@ TEST(PercounterPayload, TerminalDeferralKeepsLaneLiveUntilConditionHolds) {
     };
     bool deferred = false;
     ASSERT_TRUE(percounter_run_task(
-        f.cfg[0], &f.state[0], task, 0, 1, 0, percounter_completion_address(f.cfg[0], task.id, 0, 1), &deferred
+        f.cfg[0], &f.state[0], task, 0, 1, 0, percounter_completion_address(f.cfg[0], task.id, 0, 1), &deferred,
+        percounter_order_entry(task.id, 0, 1)
     ));
     ASSERT_TRUE(deferred);
     EXPECT_NE(f.control->async_registered, f.control->async_settled);
@@ -2775,12 +2779,16 @@ TEST(PercounterPayload, ProfilingLevelsReserveOnlyTheirRecordTails) {
     EXPECT_EQ(layouts[1].profile_buffers_offset, 0);
     EXPECT_NE(layouts[2].profile_buffers_offset, 0);
     EXPECT_NE(layouts[2].task_records_offset, 0);
+    EXPECT_EQ(layouts[1].event_records_offset, 0);
+    EXPECT_GT(layouts[2].event_records_offset, layouts[2].task_records_offset);
+    EXPECT_GT(layouts[2].event_record_capacity, 0);
+    EXPECT_EQ(layouts[2].event_record_capacity, layouts[3].event_record_capacity);
     EXPECT_EQ(layouts[2].scalar_records_offset, 0);
     EXPECT_EQ(layouts[3].upload_size, layouts[2].upload_size);
     EXPECT_EQ(layouts[3].total_size, layouts[4].total_size);
     EXPECT_GT(layouts[3].scalar_records_offset, layouts[3].upload_size);
     EXPECT_EQ(
-        layouts[3].total_size - layouts[3].scalar_records_offset,
+        layouts[3].event_records_offset - layouts[3].scalar_records_offset,
         SCHEDULER_WORKER_CAPACITY * SCHEDULER_SCALAR_RECORD_CAPACITY * sizeof(SchedulerScalarRecord)
     );
 }
@@ -2799,6 +2807,7 @@ TEST(PercounterPayload, TaskTimingPartitionsOwnWholeCacheLines) {
     const auto *buffers = region_at<PercounterProfileBuffer>(base, layout.profile_buffers_offset);
     for (uint32_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
         EXPECT_EQ(buffers[worker].task_records_offset % 64, 0) << worker;
+        EXPECT_EQ(buffers[worker].event_records_offset % 64, 0) << worker;
         if (worker + 1 < SCHEDULER_WORKER_CAPACITY)
             EXPECT_LE(
                 buffers[worker].task_records_offset + 3 * sizeof(PercounterTaskTiming),
@@ -2872,7 +2881,9 @@ TEST(PercounterPayload, TimingCommitFollowsCompletionAndKeepsCapturedIdentity) {
     ASSERT_TRUE(f.run(0, task));
     EXPECT_EQ(count, 0U);
     EXPECT_EQ(records[0].dispatch, 0U);
-    percounter_publish_completion(f.cfg[0], task, percounter_completion_address(f.cfg[0], task.id, 0, 1), 1);
+    percounter_publish_completion(
+        f.cfg[0], task, percounter_completion_address(f.cfg[0], task.id, 0, 1), 1, percounter_order_entry(task.id, 0, 1)
+    );
     EXPECT_TRUE(f.completed(0));
     EXPECT_EQ(count, 0U);
     task.id = 99;

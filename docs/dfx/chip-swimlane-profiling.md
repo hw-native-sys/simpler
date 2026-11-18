@@ -136,11 +136,12 @@ backward-compatible with the old boolean behavior).
 | 3 | + scheduler phases (`scheduler_records`) | Does not enable orchestrator collection; an independently enabled HBG Host pool can still export Host records |
 | 4 | + orchestrator phases (Host for HBG, AICPU for TMR) | Full collection |
 
-A5 `percounter` supports the same L1–L4 ladder. L2 timestamps describe local
-ready-task execution entry and kernel return, and L3/L4 add percounter's own
-fanin, SSBUF context binding, MIX, sync-start, completion and memory-operation
-intervals. Its Scalar lane includes nested kernel execution and uses the same
-exclusive-time accounting as HBG. See the [percounter profiling contract](../../src/a5/runtime/percounter/README.md#chip-swimlanes-l1l4)
+A5 `percounter` adds a task/block Scheduler View at L2 with Claim, Ready, Kernel
+end and GM Completion issued markers. Worker View remains available. L3 adds
+nested AICore Scheduler function intervals, such as dependency checks, MIX
+rendezvous and completion publication. L4 adds individual memory operations and
+Host phases and retains all instrumented function intervals. See the [percounter
+profiling contract](../../src/a5/runtime/percounter/README.md#chip-swimlanes-l1l4)
 for timing boundaries, storage limits and truncation behavior.
 
 ### A5 HBG Scalar detail at Level 3
@@ -1124,7 +1125,9 @@ same lane structure — the directory form repeats it once per Rank under the
   dispatch/finish timestamps (level >= 2), with the same labels
   as Worker View. HBG AICore L3/L4 puts these timestamps in Worker task
   details instead of emitting this duplicate view; L2 and AICPU scheduling
-  retain the separate view.
+  retain the separate view. Percounter L2–L4 uses this view for task/block
+  milestones. Numbered rows under a Percounter cluster display overlapping block
+  lifetimes, and each marker identifies the actual worker.
 - **Worker View** (pid=4) — one swim-lane per physical worker:
   - `AIC_N` — matrix cores (receive → kernel end from level >= 1)
   - `AIV_N` — vector cores (receive → kernel end from level >= 1)

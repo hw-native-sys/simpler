@@ -2330,6 +2330,15 @@ void ChipSwimlaneCollector::set_host_phase_records(
     host_phase_records_present_ = true;
 }
 
+void ChipSwimlaneCollector::reset_host_phase_records() {
+    host_submit_records_.clear();
+    host_upload_records_.clear();
+    host_phase_records_present_ = false;
+    host_phase_submitted_tasks_ = 0;
+    host_phase_total_records_ = 0;
+    host_phase_dropped_records_ = 0;
+}
+
 ChipSwimlaneCollector::RunExport ChipSwimlaneCollector::seal_run_export() { return seal_epoch_store(0); }
 
 ChipSwimlaneCollector::RunExport ChipSwimlaneCollector::seal_epoch_store(size_t slot) {
@@ -2743,6 +2752,10 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
     if (protocol_extension != nullptr) {
         outfile << ",\n  \"aicore_protocol\": " << *protocol_extension;
     }
+    if (const auto *task_events = extension(ChipSwimlaneExtensionSection::PercounterTaskEvents)) {
+        outfile << ",\n  \"" << chip_swimlane_extension_section_name(ChipSwimlaneExtensionSection::PercounterTaskEvents)
+                << "\": " << *task_events;
+    }
     if (data.level >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
         outfile << ",\n  \"" << chip_swimlane_extension_section_name(ChipSwimlaneExtensionSection::SchedulerTasks)
                 << "\": ";
@@ -2984,8 +2997,7 @@ int ChipSwimlaneCollector::finalize(
     collected_aicore_records_.clear();
     collected_sched_phase_records_.clear();
     collected_orch_phase_records_.clear();
-    host_submit_records_.clear();
-    host_upload_records_.clear();
+    reset_host_phase_records();
     for (EpochStore &slot_store : epoch_stores_) {
         slot_store.perf.clear();
         slot_store.aicore.clear();
@@ -3019,10 +3031,6 @@ int ChipSwimlaneCollector::finalize(
     terminal_consistency_ = RunTerminalConsistency{};
     merged_slot_ = -1;
     host_orchestrated_ = false;
-    host_phase_records_present_ = false;
-    host_phase_total_records_ = 0;
-    host_phase_dropped_records_ = 0;
-    host_phase_submitted_tasks_ = 0;
     json_extensions_.fill({});
     clear_memory_context();
 
@@ -3858,12 +3866,7 @@ bool ChipSwimlaneCollector::begin_run_window(
         // than its predecessor's. The vectors keep their capacity: the
         // metadata charge is taken from capacity and is conservative by
         // design, so carrying it forward can only over-charge.
-        host_submit_records_.clear();
-        host_upload_records_.clear();
-        host_phase_records_present_ = false;
-        host_phase_submitted_tasks_ = 0;
-        host_phase_total_records_ = 0;
-        host_phase_dropped_records_ = 0;
+        reset_host_phase_records();
         host_state_incomplete_ = false;
         bucket.state.store(static_cast<int>(EpochState::Admitting), std::memory_order_release);
         admission_guard.dismiss();

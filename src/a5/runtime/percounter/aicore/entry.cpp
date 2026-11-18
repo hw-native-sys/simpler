@@ -31,6 +31,9 @@
 template <CoreType Architecture>
 __aicore__ void percounter_execute_profiled(__gm__ Runtime *runtime, int block_idx);
 
+template <CoreType Architecture>
+__aicore__ void percounter_execute_task_profiled(__gm__ Runtime *runtime, int block_idx);
+
 __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
     // The host's bootstrap and this worker's handshake are separate 64-byte
     // lines, so each needs its own observe; one observe covers a whole line.
@@ -42,5 +45,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     if (runtime->dev.chip_swimlane_level >= 3) {
         if (core_type == CoreType::AIC) percounter_execute_profiled<CoreType::AIC>(runtime, block_idx);
         else percounter_execute_profiled<CoreType::AIV>(runtime, block_idx);
+    } else if (runtime->dev.chip_swimlane_level == 2) {
+        if (core_type == CoreType::AIC) percounter_execute_task_profiled<CoreType::AIC>(runtime, block_idx);
+        else percounter_execute_task_profiled<CoreType::AIV>(runtime, block_idx);
     } else simpler::percounter::percounter_aicore_execute(runtime, block_idx, core_type);
 }

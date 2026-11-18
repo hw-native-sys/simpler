@@ -92,7 +92,9 @@ struct PercounterLayout {
     uint64_t task_records_offset;
     uint64_t task_record_stride;
     uint64_t scalar_records_offset;
+    uint64_t event_records_offset;
     uint32_t task_record_capacity;
+    uint32_t event_record_capacity;
     uint32_t profiling_level;
 };
 
@@ -203,6 +205,7 @@ inline bool plan_layout(
     PercounterLayout next{};
     next.profiling_level = profiling_level;
     next.task_record_capacity = static_cast<uint32_t>(std::min(block_total, uint64_t{65536}));
+    if (profiling_level >= 2) next.event_record_capacity = std::min(next.task_record_capacity * 8, 16384U);
     next.task_count = task_count;
     next.edge_count = edge_count;
     for (uint32_t t = 0; t < PERCOUNTER_CORE_TYPE_COUNT; ++t)
@@ -282,6 +285,12 @@ inline bool plan_layout(
                                      sizeof(SchedulerScalarRecord), &bytes
                                  ) ||
                                  !scheduler_layout_reserve(&cursor, bytes, 64, &next.scalar_records_offset)))
+        return false;
+    if (profiling_level >= 2 &&
+        (!scheduler_layout_checked_mul(
+             uint64_t{SCHEDULER_WORKER_CAPACITY} * next.event_record_capacity, sizeof(PercounterTaskEvent), &bytes
+         ) ||
+         !scheduler_layout_reserve(&cursor, bytes, 64, &next.event_records_offset)))
         return false;
     if (!scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) return false;
     *layout = next;
@@ -815,6 +824,10 @@ inline bool build_tables(
         auto *buffers = region_at<PercounterProfileBuffer>(base, layout.profile_buffers_offset);
         for (uint32_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
             buffers[worker].task_capacity = layout.task_record_capacity;
+            buffers[worker].event_capacity = layout.event_record_capacity;
+            buffers[worker].event_records_offset = layout.event_records_offset + uint64_t{worker} *
+                                                                                     layout.event_record_capacity *
+                                                                                     sizeof(PercounterTaskEvent);
             buffers[worker].task_records_offset =
                 layout.task_records_offset + uint64_t{worker} * layout.task_record_stride;
             buffers[worker].scalar_records_offset =

@@ -23,7 +23,8 @@ enum class ChipSwimlaneExtensionSection : uint32_t {
     AicpuLifecycleRecords = 3,
     AicoreExecutionIdentities = 4,
     AicoreProtocol = 5,
-    Count = 6,
+    PercounterTaskEvents = 6,
+    Count = 7,
 };
 
 inline constexpr bool chip_swimlane_extension_section_is_valid(ChipSwimlaneExtensionSection section) {
@@ -44,6 +45,8 @@ inline constexpr const char *chip_swimlane_extension_section_name(ChipSwimlaneEx
         return "aicore_execution_identities";
     case ChipSwimlaneExtensionSection::AicoreProtocol:
         return "aicore_protocol";
+    case ChipSwimlaneExtensionSection::PercounterTaskEvents:
+        return "percounter_task_events";
     case ChipSwimlaneExtensionSection::Count:
         break;
     }
@@ -54,7 +57,8 @@ inline constexpr bool chip_swimlane_extension_section_is_object(ChipSwimlaneExte
     return section == ChipSwimlaneExtensionSection::SchedulerTasks ||
            section == ChipSwimlaneExtensionSection::SchedulerRecords ||
            section == ChipSwimlaneExtensionSection::AicoreExecutionIdentities ||
-           section == ChipSwimlaneExtensionSection::AicoreProtocol;
+           section == ChipSwimlaneExtensionSection::AicoreProtocol ||
+           section == ChipSwimlaneExtensionSection::PercounterTaskEvents;
 }
 
 /** Validate the bounded payload envelope; payload contents come only from internal serializers. */
