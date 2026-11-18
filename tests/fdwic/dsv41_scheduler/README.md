@@ -18,6 +18,8 @@ half-sync DSL cases, one capacity-bounded all-sync DSL case, and seven latest
 PyPTO-lib cases. The checked-in `workloads/<flavor>/source.json` manifests own
 this selection; both exporters and the run list use them.
 Measurement availability and the timing contract are maintained in [RESULTS.md](RESULTS.md).
+Routine refreshes measure HBG and percounter. For each supported case, record
+the AICPU TMR baseline once and carry that value forward in later reports.
 
 Retain scheduler optimizations only when the sum of all 12 case means improves,
 using AICore L0 wall with one warmup and ten measured rounds per case. Include
