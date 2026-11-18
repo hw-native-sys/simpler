@@ -11151,20 +11151,23 @@ class Worker:
             members, window_size, buffers, retain_after_run, topology, workspace_engines, memory_source
         )
         if config.memory_source == AddressSpace.HOST:
-            if (
-                self.level != 3
-                or self._config.get("platform") not in ("a2a3", "a5")
-                or self._config.get("runtime") != "tensormap_and_ringbuffer"
-            ):
-                raise ValueError("Host-source domains require onboard L3 A2/A3 or A5 tensormap_and_ringbuffer")
+            if self.level != 3 or self._config.get("platform") not in ("a2a3", "a5"):
+                raise ValueError("Host-source domains require onboard L3 A2/A3 or A5")
+            runtime = self._config.get("runtime")
             if self._config.get("platform") == "a2a3":
+                if runtime != "tensormap_and_ringbuffer":
+                    raise ValueError("A2/A3 Host-source domains require tensormap_and_ringbuffer")
                 if config.workspace_engines not in ((), ("sdma",)):
                     raise ValueError("Host-source domains on a2a3 support only the SDMA workspace")
                 if config.workspace_engines and not self._config.get("enable_sdma", False):
                     raise ValueError("A2/A3 Host-domain SDMA requires Worker(enable_sdma=True)")
                 return config
+            if runtime not in ("tensormap_and_ringbuffer", "host_build_graph", "percounter"):
+                raise ValueError("A5 Host-source MTE requires tensormap_and_ringbuffer, host_build_graph or percounter")
             if any(engine != "urma" for engine in config.workspace_engines):
                 raise ValueError("Host-source domains support only the URMA workspace")
+            if config.workspace_engines and runtime != "tensormap_and_ringbuffer":
+                raise ValueError("Host-source URMA requires the A5 tensormap_and_ringbuffer runtime")
         if config.workspace_engines:
             if self.level != 3:
                 raise ValueError("workspace_engines selection is supported only on L3 domains")
