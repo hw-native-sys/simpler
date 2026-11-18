@@ -1,5 +1,37 @@
 # DSV4.1 scheduler test execution time
 
+## Original 12 cases, HBG and percounter (2026-11-18)
+
+Each value below sums the time spent executing HBG and percounter, then averages
+two complete matrix runs per runner. The four dual-device rows use one automatic
+device pair per case for both runtimes. All sweeps used the same prepared inputs,
+the same runtime binaries (`5ccae103b`), and at most eight devices. The test
+runner was built from `fa51bfdcb` with Release optimization in both arms.
+The matrix includes the latest PyPTO-lib SWA. TMR retains its one-time baseline.
+
+| Scope | Previous runner (s) | Optimized runner (s) |
+| ----- | ------------------: | -------------------: |
+| DSL MoE | 21.96 | 20.50 |
+| Latest native MoE | 19.98 | 20.70 |
+| DSL layers 19–21 | 32.09 | 27.88 |
+| Latest layers 19–21 | 30.84 | 23.00 |
+| Sum of four two-device cases | 104.88 | 92.07 |
+| Sum of all 12 cases | 300.21 | 285.58 |
+
+End-to-end matrix wall times including the shared queue were 64.09 and 124.94 s
+before, and 70.73 and 78.95 s after. The longest submission-to-job-start delay
+in each sweep was 1.93, 80.13, 18.20 and 29.35 s, respectively. These queue-inclusive
+times vary independently of the summed case execution times.
+
+Each layers 19–21 rank initializes about 30.7 GB of repeated tensor data. The
+runner fills uniform bytes on the device and uploads raw inputs directly from
+their source buffer. Prefix generation, the Device start rendezvous, one warmup,
+ten timed rounds and all replay output comparisons run at the same boundaries.
+The Release runner target enables compiler optimization even when the build cache
+has empty Release flags.
+
+## Standalone native runner (2026-11-16)
+
 Measured on A5 on 2026-11-16 with the 12 selected cases, runtime source
 `5abd1794980eaa493f618067b91aeff117191a63`, without PR #3108. Times below
 include startup, input loading, device setup, warmup, measurement, validation
