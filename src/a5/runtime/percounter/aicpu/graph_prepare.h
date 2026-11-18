@@ -112,8 +112,6 @@ inline void percounter_flush_body_task(ChipTaskStorage &storage) {
         cache_flush_range(
             payload.tensor_data(), static_cast<size_t>(payload.tensor_count) * sizeof(*payload.tensor_data())
         );
-    if (payload.scalar_count > 0)
-        cache_flush_range(payload.scalar_data(), static_cast<size_t>(payload.scalar_count) * sizeof(uint64_t));
 }
 
 /** Materialize and publish the invocation at `rank`. Returns false on any failure, already recorded. */
@@ -135,7 +133,7 @@ inline bool percounter_prepare_invocation(
     }
     cache_invalidate_range(&storage[invocation->shell_task_id], sizeof(ChipTaskStorage));
     ChipTaskSlotState &outer = storage[invocation->shell_task_id].slot;
-    GraphExecution *execution = graph_execution_localize(outer, view);
+    GraphExecution *execution = graph_execution_localize(outer, view, GraphArgumentStorage::KERNEL_ARGUMENTS);
     if (execution == nullptr || static_cast<uint64_t>(execution->task_count) != tmpl->task_count) {
         LOG_ERROR(
             "A5 percounter: Graph localization rank=%" PRIu64 " shell=%" PRIu64 " expected=%" PRIu64 " actual=%d", rank,
@@ -195,8 +193,7 @@ inline bool percounter_prepare_invocation(
                 functions[lane] = entries[kernel];
             }
             const auto prepared = percounter_prepare_argument_metadata(
-                counter, functions, mask, mask == 0 ? 0 : reinterpret_cast<uint64_t>(payload.tensor_data()),
-                mask == 0 ? 0 : reinterpret_cast<uint64_t>(payload.scalar_data()),
+                counter, functions, mask, reinterpret_cast<uint64_t>(execution->kernel_arguments(i)),
                 mask == 0 ? 0 : static_cast<uint32_t>(payload.tensor_count),
                 mask == 0 ? 0 : static_cast<uint32_t>(payload.scalar_count)
             );
@@ -204,6 +201,9 @@ inline bool percounter_prepare_invocation(
                 percounter_graph_prepare_fail(prepare, rank, prepared);
                 return false;
             }
+            cache_flush_range(
+                execution->kernel_arguments(i), (payload.tensor_count + payload.scalar_count) * sizeof(uint64_t)
+            );
             cache_flush_range(&counter, sizeof(counter));
             wmb();
             // Publication cannot write back the completion counter's line:

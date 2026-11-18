@@ -54,9 +54,8 @@ struct PercounterLayout {
     uint64_t sinks_offset;
     uint64_t counters_offset;
     uint64_t completion_sectors_offset;
-    uint64_t dispatch_payloads_offset;
-    // One deferred-completion record per lane and its entry slots, indexed the
-    // way the payloads are. Reserved for every graph, because whether a kernel
+    // One deferred-completion registration scratch per physical lane.
+    // Reserved for every graph, because whether a kernel
     // registers a condition is not visible at bind -- the record is what lets
     // the runtime see that one did. Placed past `upload_size`, so the bytes
     // cost no DMA and a lane writes its own record's header before its loop.
@@ -250,10 +249,6 @@ inline bool plan_layout(
         !PERCOUNTER_RESERVE(table_task_count, PercounterFanin, fanin_offset) ||
         !PERCOUNTER_RESERVE(edge_count, uint64_t, fanin_addr_offset) ||
         !PERCOUNTER_RESERVE(table_task_count, uint64_t, sinks_offset) ||
-        !PERCOUNTER_RESERVE(
-            static_cast<uint64_t>(SCHEDULER_WORKER_CAPACITY) * PERCOUNTER_PAYLOAD_SLOT_COUNT, DispatchPayload,
-            dispatch_payloads_offset
-        ) ||
         (profiling_level >= 2 &&
          !PERCOUNTER_RESERVE(SCHEDULER_WORKER_CAPACITY, PercounterProfileBuffer, profile_buffers_offset)) ||
         !PERCOUNTER_RESERVE(task_count, PercounterCounter, counters_offset) ||
@@ -846,7 +841,7 @@ inline bool build_tables(
     control->fanin_addr_offset = layout.fanin_addr_offset;
     control->counters_offset = layout.counters_offset;
     control->completion_sectors_offset = layout.completion_sectors_offset;
-    control->dispatch_payloads_offset = layout.dispatch_payloads_offset;
+    control->image_bytes = layout.total_size;
     control->async_groups_offset = layout.async_groups_offset;
     control->async_entries_offset = layout.async_entries_offset;
     control->async_capacity = PERCOUNTER_ASYNC_CAPACITY;

@@ -23,7 +23,7 @@ def test_nested_kernel_in_step_exports_without_double_counting(tmp_path, level):
     for kind, begin, end, depth in [
         ("scalar_window", 10, 100, 0),
         ("scalar_percounter_step", 20, 80, 1),
-        ("scalar_percounter_run_prepared", 30, 70, 2),
+        ("scalar_percounter_run_task", 30, 70, 2),
         ("scalar_bypass_load", 32, 35, 3),
     ]:
         metrics = {"scalar_depth": depth, "scalar_calls": 1}
@@ -36,7 +36,7 @@ def test_nested_kernel_in_step_exports_without_double_counting(tmp_path, level):
     profile = data["scalar_profiles"][0]
     assert profile["complete"]
     assert profile["kernel_cycles"] == 20
-    assert profile["exclusive_cycles"]["scalar_percounter_run_prepared"] == 17
+    assert profile["exclusive_cycles"]["scalar_percounter_run_task"] == 17
     assert profile["exclusive_cycles"]["scalar_percounter_step"] == 20
     assert sum(profile["exclusive_cycles"].values()) == 90
     trace = tmp_path / "trace.json"
@@ -53,5 +53,5 @@ def test_nested_kernel_in_step_exports_without_double_counting(tmp_path, level):
     output = json.loads(trace.read_text())
     assert output["metadata"]["runtime"] == "percounter"
     names = {e["name"] for e in output["traceEvents"] if e["ph"] == "X" and e["pid"] == 2}
-    assert {"percounter_step", "percounter_run_prepared", "bypass_load"} <= names
+    assert {"percounter_step", "percounter_run_task", "bypass_load"} <= names
     assert not any(name.startswith("scheduler_") for name in names)

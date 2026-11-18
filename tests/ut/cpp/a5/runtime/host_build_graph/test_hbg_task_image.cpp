@@ -75,7 +75,9 @@ TEST_F(TaskImageTest, PublishesArgumentsAndPredicatesWithoutAicpuSchedulingState
     auto relocated = image(layout.end);
     ASSERT_NE(packed, nullptr);
     ASSERT_NE(relocated, nullptr);
-    EXPECT_EQ(task_image::pack(source, kTasks, usage, {0x10000, 256}, static_cast<char *>(packed.get())), layout.end);
+    EXPECT_EQ(
+        task_image::pack(source, kTasks, usage, {0x10000, 256}, static_cast<char *>(packed.get()), 0), layout.end
+    );
     EXPECT_EQ(task_image_error_code(packed.get())->load(), SIMPLER_ERROR_NONE);
     std::memcpy(relocated.get(), packed.get(), layout.end);
     auto graph =
@@ -103,7 +105,7 @@ TEST_F(TaskImageTest, EmptyReusedImageResetsOnlyItsCurrentErrorContract) {
     std::memset(packed.get(), 0xa5, layout.end);
     EXPECT_EQ(
         task_image::pack(
-            static_cast<const char *>(mirror.get()), kTasks, usage, {0x10000, 0}, static_cast<char *>(packed.get())
+            static_cast<const char *>(mirror.get()), kTasks, usage, {0x10000, 0}, static_cast<char *>(packed.get()), 0
         ),
         layout.end
     );

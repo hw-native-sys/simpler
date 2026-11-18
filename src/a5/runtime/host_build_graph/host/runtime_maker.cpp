@@ -2211,11 +2211,14 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     }
     char *upload_base = static_cast<char *>(staging_addr);
 
-    const uint64_t compacted =
-        task_image::pack(static_cast<const char *>(host_sm), task_capacity, bind_usage, heap_rebase, upload_base);
+    const uint64_t compacted = task_image::pack(
+        static_cast<const char *>(host_sm), task_capacity, bind_usage, heap_rebase, upload_base,
+        reinterpret_cast<uint64_t>(device_sm)
+    );
     always_assert(compacted == image_bytes);
 
-    const sm_layout::SegmentOffsets device_segments = task_image::segments(bind_usage);
+    const sm_layout::SegmentOffsets device_segments =
+        task_image::layout(static_cast<const char *>(host_sm), task_capacity, bind_usage);
     for (auto &instance : plan.native_graph.instances) {
         const auto &source = host_sm_handle.header->tasks.storage_at(instance.original_shell_id);
         const auto &definition = plan.native_graph.definitions[instance.definition_index].definition;
@@ -2471,7 +2474,7 @@ int32_t run_host_orchestration(
         static_cast<uint64_t>(orch_state.tensor_pool_cursor),
         static_cast<uint64_t>(orch_state.scalar_pool_cursor),
     };
-    const uint64_t image_bytes = task_image::segments(bind_usage).end;
+    const uint64_t image_bytes = task_image::layout(static_cast<const char *>(host_sm), task_capacity, bind_usage).end;
     runtime->dev.sm_image_bytes = image_bytes;
 
     // Only now are both sizes known, so this is where the two device regions are

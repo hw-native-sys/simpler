@@ -35,7 +35,8 @@ int SchedulerContext::prepare_block_for_dispatch(
 // register entries and the graph-execution lookup. Nothing below is called by these
 // tests — only the link needs them. Weak, so a target that does link a real
 // implementation keeps it. The target supplies its retirement entry separately.
-GraphExecution *__attribute__((weak)) graph_execution_localize(ChipTaskSlotState &, const GraphImageView &) {
+GraphExecution *__attribute__((weak))
+graph_execution_localize(ChipTaskSlotState &, const GraphImageView &, GraphArgumentStorage) {
     return nullptr;
 }
 

@@ -65,7 +65,7 @@ def finalize(bundle, capture):
     (bundle / "rank1.txt").unlink()
 
 
-def materialize(bundle, runtime, capture, env=None):
+def materialize(bundle, runtime, capture, env=None, runtime_name="host_build_graph"):
     device_count(bundle, materialize=True)
     case = json.loads((bundle / "case.json").read_text())
     detail = case["ranks"][0]
@@ -96,6 +96,7 @@ def materialize(bundle, runtime, capture, env=None):
             "0",
             "1",
             "--materialize",
+            f"--runtime={runtime_name}",
         ],
         env=env,
         check=True,
@@ -106,7 +107,10 @@ def materialize(bundle, runtime, capture, env=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("bundle", type=Path)
-    parser.add_argument("runtime", type=Path)
+    parser.add_argument("runtime_dir", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--runtime", choices=("host_build_graph", "percounter"), default="host_build_graph")
     args = parser.parse_args()
-    materialize(args.bundle.resolve(), args.runtime.resolve(), args.output.resolve(), os.environ.copy())
+    materialize(
+        args.bundle.resolve(), args.runtime_dir.resolve(), args.output.resolve(), os.environ.copy(), args.runtime
+    )
