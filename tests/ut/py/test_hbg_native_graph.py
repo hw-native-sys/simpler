@@ -105,7 +105,7 @@ def test_native_graph_deferred_finish_preserves_public_identity_and_dependencies
         audit_native_protocol(raw, identities)
 
 
-@pytest.mark.parametrize("field", ("graph_source", "node_map", "close_seal_stride"))
+@pytest.mark.parametrize("field", ("graph_source", "node_map"))
 def test_current_native_graph_requires_graph_and_scheduler_contracts(field):
     raw, _ = native_capture()
     del raw[field]
@@ -216,7 +216,7 @@ def test_kernel_dependencies_preserve_all_graph_roots_and_sinks():
     }
 
 
-@pytest.mark.parametrize("flag", (2, 128))
+@pytest.mark.parametrize("flag", (128,))
 def test_current_native_graph_rejects_independent_flag(flag):
     raw, identities = native_capture()
     assert audit_native_protocol(raw, identities)["protocol_verified"]

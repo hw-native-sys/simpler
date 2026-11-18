@@ -512,6 +512,7 @@ public:
     // success, -1 on a bad block_dim / aicpu_thread_num.
     int prepare_launch_shape(Runtime &runtime, const CallConfig &config);
     uint64_t upload_chip_callable_buffer(const ChipCallable *callable);
+    bool get_callable_async_capabilities(int32_t callable_id, const CoreAsyncCapability **data, uint32_t *count) const;
     int release_chip_callable_buffer(uint64_t hash);
     int launch_device_register(int32_t callable_id);
     int commit_device_register(int32_t callable_id);
@@ -1129,6 +1130,7 @@ protected:
         // registration's dlopen resolved, which is what a device consumer of
         // resolved entries would dispatch through.
         std::vector<uint64_t> object_table;
+        std::vector<CoreAsyncCapability> async_capabilities;
         std::vector<uint64_t> entry_table;
         uint64_t object_table_dev{0};
         uint64_t entry_table_dev{0};
@@ -1294,7 +1296,7 @@ protected:
 namespace simpler::common::sim_host {
 
 // Shared utility used by ensure_binaries_loaded() / upload_chip_callable_buffer()
-// to materialize an in-memory DSO into /tmp so dlopen can pick it up. mkstemp +
+// to materialize an in-memory DSO into a temporary file for dlopen. mkstemp +
 // fchmod 0755 + write_all + close; on success out_path receives the path.
 bool create_temp_so_file(const std::string &path_template, const uint8_t *data, size_t size, std::string *out_path);
 

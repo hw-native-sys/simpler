@@ -32,7 +32,6 @@ def capture(epoch=0):
         "expected_task_count": 1,
         "inline_completed_count": 0,
         "resolved_task_count": 1,
-        "close_seal_stride": 64,
         "active_worker_count": 3,
         "scheduler_error": 0,
         "error_claimed": 0,
@@ -80,6 +79,11 @@ def capture(epoch=0):
                 admission_state=0,
                 claim_tickets=0,
                 claim_seal=0,
+                completion_backend=0,
+                async_mask=0,
+                counter_index=(1 << 64) - 1,
+                counter_threshold=0,
+                counter_limit=0,
             )
         ],
         "task_events": [
@@ -100,6 +104,8 @@ def capture(epoch=0):
         "members": [],
         "blocks": [],
         "executions": [],
+        "condition_contributions": [],
+        "completion_counters": [],
     }
 
 
@@ -123,6 +129,20 @@ def test_task_order_metadata_survives_without_claiming_dependency_order():
     assert raw == before
 
 
+def test_counter_reader_preserves_unknown_observation_and_rejects_wrapped_values():
+    raw = capture()
+    raw["tasks"][0].update(flags=1, active_mask=1, kernel_ids=[0, 65535, 65535])
+    raw["task_controls"][0].update(
+        completion_backend=1, counter_index=0, counter_threshold=2, counter_limit=2, async_mask=1
+    )
+    raw["completion_counters"] = [dict(index=0, value=0, valid=0, limit=2)]
+    raw["condition_contributions"] = []
+    assert read_native_protocol(raw) == raw
+    raw["completion_counters"][0].update(value=3, valid=1)
+    with pytest.raises(ValueError, match="counter"):
+        read_native_protocol(raw)
+
+
 @pytest.mark.parametrize(
     "fields",
     (
@@ -141,21 +161,13 @@ def test_partial_task_order_metadata_is_rejected(fields):
         read_native_protocol(raw)
 
 
-@pytest.mark.parametrize("stride", (None, 0, 8, 63, 65, 128, True, 64.0, "64", -1, 1 << 64))
-def test_compact_schema_requires_64_byte_seals_and_omits_unused_execution_counter(stride):
+@pytest.mark.parametrize("field,value", (("executed_task_count", 0), ("close_seal_stride", 64)))
+def test_current_schema_rejects_retired_fields(field, value):
     raw = capture()
-    raw.update(schema="hbg-native-protocol", close_seal_stride=64)
     raw["task_controls"][0].update(claim_tickets=0, claim_seal=0)
     assert read_native_protocol(raw) == raw
-    raw["executed_task_count"] = 0
+    raw[field] = value
     with pytest.raises(ValueError, match="unknown fields"):
-        read_native_protocol(raw)
-    del raw["executed_task_count"]
-    if stride is None:
-        del raw["close_seal_stride"]
-    else:
-        raw["close_seal_stride"] = stride
-    with pytest.raises(ValueError, match="close_seal_stride|missing or unknown fields"):
         read_native_protocol(raw)
 
 

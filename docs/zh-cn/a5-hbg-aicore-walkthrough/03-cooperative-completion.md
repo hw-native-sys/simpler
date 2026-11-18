@@ -14,7 +14,7 @@ MIX 的 active mask 表示实际函数 lane，resource mask 还包含 AIC coordi
 AIC coordinator 从 AIC/MIX 共享头部领取具体 block 的 GROUP_RESERVED anchor。
 每簇持有正式组和至多一份固定未来组；等待 fanin 时保留原 reservation，未来组不提前占用伙伴执行资源。
 头部尚未全体发票时不跳到后序任务；已有组不转移给其他 cluster。
-原 owner、generation、fanin 重查和最终 GROUP_ARMED CAS 证明该组只发布一次。
+原固定 owner、fanin 重查和最终 GROUP_ARMED CAS 证明该组只发布一次。
 AIV 接受自己所在 cluster 的发布，完成 arrival/执行/release，不消费另一个核私有 slot。
 
 sync_start 为一个任务的 blocks 建立同驻 cohort，使用全 run 的 ordered cooperative admission。

@@ -79,11 +79,9 @@ namespace {
 struct GmAtomics {
     __gm__ volatile uint64_t &word;
 
-    inline __aicore__ uint64_t load() { return scheduler_gm_fetch_add(word, UINT64_C(0)); }
     inline __aicore__ uint64_t compare_exchange(uint64_t expected, uint64_t desired) {
         return scheduler_gm_compare_exchange(word, expected, desired);
     }
-    inline __aicore__ uint64_t fetch_add(uint64_t delta) { return scheduler_gm_fetch_add(word, delta); }
 };
 
 }  // namespace
@@ -134,19 +132,20 @@ owner_transition(Atomics &atomics, uint64_t owned, SchedulerAsyncPhase desired_p
 
 }  // namespace scheduler_async_state_detail
 
-// All live accesses are atomic. No lease is reset while any run participant may
-// retain an old word. Run identity, execution ownership and data/progress
-// barriers belong to the caller.
+// Published lease transitions use atomics. No lease is reset while any run
+// participant may retain an old word. Run identity, execution ownership and
+// data/progress barriers belong to the caller.
 static inline __aicore__ uint64_t scheduler_async_lease_load(__gm__ SchedulerAsyncLease &lease) {
-    return scheduler_gm_fetch_add(lease.word, UINT64_C(0));
+    return scheduler_gm_query(lease.word);
 }
 
-static inline __aicore__ SchedulerAsyncLeaseOutcome scheduler_async_lease_publish(__gm__ SchedulerAsyncLease &lease) {
-    scheduler_async_state_detail::GmAtomics atomics{lease.word};
-    return scheduler_async_state_detail::transition(
-        atomics, scheduler_async_lease_encode(1, SchedulerAsyncPhase::DORMANT),
-        scheduler_async_lease_encode(1, SchedulerAsyncPhase::RUNNABLE)
-    );
+// The first successful sealer is the only writer before directory publication.
+// Order this initialization before any CHECK can discover and claim the lease.
+static inline __aicore__ uint64_t scheduler_async_lease_initialize(__gm__ SchedulerAsyncLease &lease) {
+    const uint64_t word = scheduler_async_lease_encode(1, SchedulerAsyncPhase::RUNNABLE);
+    scheduler_store_signal(lease.word, word);
+    scheduler_cache_barrier();
+    return word;
 }
 
 static inline __aicore__ SchedulerAsyncLeaseOutcome

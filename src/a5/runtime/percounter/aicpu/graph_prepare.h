@@ -11,19 +11,13 @@
 /**
  * Materializing Graph bodies for percounter's lanes.
  *
- * The host planned every invocation -- its body's ids, its range in each list
- * -- but left the ranges zero and the body counters unwritten. Here the AICPU
- * threads that do not supervise take the invocations in priority order. For
- * each one they call upstream's localize, then materialize it a slice at a time,
- * and after every slice publish what it made runnable:
- *
- *   1. the slice's body tasks' counters, preset and tagged with the invocation;
- *   2. the longest prefix of each of the invocation's ranges whose tasks are
- *      all materialized, as order entries carrying the tasks' percounter ids.
- *
- * Counters before entries: a lane holding an entry reads its own counter line
- * and its producers', and a producer always has the lower body index, so it is
- * in this slice or an earlier one.
+ * The Host provides body ids, ordered entries, static task shapes and completion
+ * seeds before launch. AICore uses those seeds to initialize completion state.
+ * AICPU threads that do not supervise localize each invocation and materialize
+ * its descriptors and argument spans in slices, independently of fanin.
+ * Each task's metadata_ready publication follows its descriptor and argument
+ * metadata. A lane may claim static entries before that publication, but it
+ * cannot resolve or execute their descriptors until it observes metadata_ready.
  *
  * Header-only because aicpu_executor.cpp is included by name into a unit test.
  */
@@ -41,6 +35,7 @@
 #include "host_build_graph/graph_execution.h"
 #include "runtime.h"
 #include "scheduler/wire_types.h"
+#include "scheduler/argument_metadata.h"
 #include "scheduler/scheduler_graph.h"
 
 namespace simpler::percounter {
@@ -55,13 +50,19 @@ inline T *percounter_region(PercounterControl *control, uint64_t offset) {
  * read or partly rewrite. Leader only, after the host's upload and before any
  * thread materializes.
  *
- * An order list line holds the host's entries beside a range the AICPU fills,
- * and the flush after a fill writes the whole line back: a copy cached from an
- * earlier run would put that run's entries over this one's.
+ * The templates and invocation records remain live through every materializer.
  */
 inline void percounter_graph_prepare_init(PercounterControl *control) {
     const uint64_t invocation_count = control->graph_invocation_count;
     if (invocation_count == 0) return;
+    cache_invalidate_range(
+        reinterpret_cast<const void *>(control->callable_addresses_address),
+        static_cast<size_t>(control->callable_addresses_count) * sizeof(uint64_t)
+    );
+    cache_invalidate_range(
+        percounter_region<PercounterTaskMetadata>(control, control->metadata_offset),
+        static_cast<size_t>(control->task_count) * sizeof(PercounterTaskMetadata)
+    );
     cache_invalidate_range(
         percounter_region<uint8_t>(control, control->graph_invocations_offset),
         static_cast<size_t>(invocation_count) * sizeof(PercounterGraphInvocation)
@@ -81,27 +82,11 @@ inline void percounter_graph_prepare_init(PercounterControl *control) {
             percounter_region<uint8_t>(control, tmpl->fanin_offsets_offset),
             static_cast<size_t>(tmpl->task_count + 1) * sizeof(int32_t)
         );
-        for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l) {
-            cache_invalidate_range(
-                percounter_region<uint8_t>(control, tmpl->orders_offset[l]),
-                static_cast<size_t>(tmpl->order_count[l]) * sizeof(uint64_t)
-            );
-        }
     }
     cache_invalidate_range(
-        percounter_region<uint8_t>(control, control->orders_offset[0]),
-        static_cast<size_t>(control->order_count[0]) * sizeof(uint64_t)
+        percounter_region<uint64_t>(control, control->metadata_ready_offset),
+        static_cast<size_t>(control->task_count) * sizeof(uint64_t)
     );
-    cache_invalidate_range(
-        percounter_region<uint8_t>(control, control->orders_offset[1]),
-        static_cast<size_t>(control->order_count[1]) * sizeof(uint64_t)
-    );
-    if (control->mix_order_count != 0) {
-        cache_invalidate_range(
-            percounter_region<uint8_t>(control, control->mix_order_offset),
-            static_cast<size_t>(control->mix_order_count) * sizeof(uint64_t)
-        );
-    }
 }
 
 inline void percounter_graph_prepare_fail(PercounterGraphPrepare *prepare, uint64_t rank, SchedulerGraphResult why) {
@@ -127,8 +112,6 @@ inline void percounter_flush_body_task(ChipTaskStorage &storage) {
         cache_flush_range(
             payload.tensor_data(), static_cast<size_t>(payload.tensor_count) * sizeof(*payload.tensor_data())
         );
-    if (payload.scalar_count > 0)
-        cache_flush_range(payload.scalar_data(), static_cast<size_t>(payload.scalar_count) * sizeof(uint64_t));
 }
 
 /** Materialize and publish the invocation at `rank`. Returns false on any failure, already recorded. */
@@ -140,11 +123,7 @@ inline bool percounter_prepare_invocation(
     const auto *body = percounter_region<const PercounterBodyTask>(control, tmpl->tasks_offset);
     const auto *fanin_rows = percounter_region<const int32_t>(control, tmpl->fanin_offsets_offset);
     auto *counters = percounter_region<PercounterCounter>(control, control->counters_offset);
-    uint64_t *lists[PERCOUNTER_LIST_COUNT] = {
-        percounter_region<uint64_t>(control, control->orders_offset[0]),
-        percounter_region<uint64_t>(control, control->orders_offset[1]),
-        control->mix_order_count != 0 ? percounter_region<uint64_t>(control, control->mix_order_offset) : nullptr,
-    };
+    auto *metadata_ready = percounter_region<uint64_t>(control, control->metadata_ready_offset);
     const uint64_t body_base = invocation->body_base;
 
     auto *storage = reinterpret_cast<ChipTaskStorage *>(control->graph_storage_address);
@@ -154,15 +133,18 @@ inline bool percounter_prepare_invocation(
     }
     cache_invalidate_range(&storage[invocation->shell_task_id], sizeof(ChipTaskStorage));
     ChipTaskSlotState &outer = storage[invocation->shell_task_id].slot;
-    GraphExecution *execution = graph_execution_localize(outer, view);
+    GraphExecution *execution = graph_execution_localize(outer, view, GraphArgumentStorage::KERNEL_ARGUMENTS);
     if (execution == nullptr || static_cast<uint64_t>(execution->task_count) != tmpl->task_count) {
+        LOG_ERROR(
+            "A5 percounter: Graph localization rank=%" PRIu64 " shell=%" PRIu64 " expected=%" PRIu64 " actual=%d", rank,
+            invocation->shell_task_id, tmpl->task_count, execution == nullptr ? -1 : execution->task_count
+        );
         percounter_graph_prepare_fail(prepare, rank, SchedulerGraphResult::INVALID_ARGUMENTS);
         return false;
     }
     invocation->storage_address = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(execution->task_storage));
     cache_flush_range(&invocation->storage_address, sizeof(invocation->storage_address));
 
-    uint64_t published[PERCOUNTER_LIST_COUNT] = {0, 0, 0};
     int32_t materialized = 0;
     while (true) {
         // At the slice boundary, so a failure anywhere stops this invocation
@@ -174,6 +156,10 @@ inline bool percounter_prepare_invocation(
         const GraphMaterializeResult result =
             graph_execution_materialize_slice(outer, *execution, view, PERCOUNTER_GRAPH_SLICE_TASKS, &made);
         if (result != GraphMaterializeResult::PENDING && result != GraphMaterializeResult::MATERIALIZED) {
+            LOG_ERROR(
+                "A5 percounter: Graph materialization rank=%" PRIu64 " result=%d materialized=%d", rank,
+                static_cast<int>(result), execution->materialized_tasks
+            );
             percounter_graph_prepare_fail(prepare, rank, SchedulerGraphResult::INVALID_ARGUMENTS);
             return false;
         }
@@ -181,7 +167,8 @@ inline bool percounter_prepare_invocation(
         for (int32_t i = materialized; i < end; ++i) {
             percounter_flush_body_task(execution->task_at(i));
             PercounterCounter &counter = counters[body_base + static_cast<uint64_t>(i)];
-            counter.value = percounter_counter_preset(static_cast<int64_t>(body[i].subtask_total));
+            // Completion seeds are immutable during materialization; AICore
+            // initializes partitioned components before claims begin.
             counter.storage_address = invocation->storage_address;
             counter.body_index = static_cast<uint32_t>(i);
             counter.flags = body[i].flags;
@@ -189,32 +176,44 @@ inline bool percounter_prepare_invocation(
             counter.fanin_count = static_cast<uint32_t>(fanin_rows[i + 1] - fanin_rows[i]);
             counter.fanin_offset = tmpl->fanin_indices_offset + static_cast<uint64_t>(fanin_rows[i]) * sizeof(uint64_t);
             counter.invocation = static_cast<uint32_t>(rank);
+            const auto &task = execution->task_at(i);
+            const auto &payload = task.payload;
+            const uint32_t mask =
+                percounter_region<PercounterTaskMetadata>(control, control->metadata_offset)[body_base + i].active_mask;
+            uint64_t functions[PLATFORM_CORES_PER_BLOCKDIM]{};
+            const auto *entries = reinterpret_cast<const uint64_t *>(control->callable_addresses_address);
+            for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+                const int32_t kernel = task.task.kernel_id[lane];
+                if (!(mask & (1U << lane))) continue;
+                if (kernel < 0 || static_cast<uint64_t>(kernel) >= control->callable_addresses_count ||
+                    entries == nullptr) {
+                    percounter_graph_prepare_fail(prepare, rank, SchedulerGraphResult::INVALID_CALLABLE);
+                    return false;
+                }
+                functions[lane] = entries[kernel];
+            }
+            const auto prepared = percounter_prepare_argument_metadata(
+                counter, functions, mask, reinterpret_cast<uint64_t>(execution->kernel_arguments(i)),
+                mask == 0 ? 0 : static_cast<uint32_t>(payload.tensor_count),
+                mask == 0 ? 0 : static_cast<uint32_t>(payload.scalar_count)
+            );
+            if (prepared != SchedulerGraphResult::OK) {
+                percounter_graph_prepare_fail(prepare, rank, prepared);
+                return false;
+            }
+            cache_flush_range(
+                execution->kernel_arguments(i), (payload.tensor_count + payload.scalar_count) * sizeof(uint64_t)
+            );
             cache_flush_range(&counter, sizeof(counter));
+            wmb();
+            // Publication cannot write back the completion counter's line:
+            // a lane may increment it immediately after observing this token.
+            auto *ready = &metadata_ready[body_base + static_cast<uint64_t>(i)];
+            __atomic_store_n(ready, uint64_t{1}, __ATOMIC_RELEASE);
+            cache_flush_range(ready, sizeof(*ready));
         }
         materialized = end;
-        bool any = false;
-        for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l) {
-            const uint64_t count = tmpl->order_count[l];
-            if (count == 0) continue;
-            const auto *source = percounter_region<const uint64_t>(control, tmpl->orders_offset[l]);
-            uint64_t *target = lists[l] + invocation->order_base[l];
-            const uint64_t first = published[l];
-            uint64_t next = first;
-            while (next < count && percounter_order_task_id(source[next]) < materialized) {
-                const uint64_t entry = source[next];
-                target[next] = percounter_order_entry(
-                    static_cast<int64_t>(body_base) + percounter_order_task_id(entry),
-                    percounter_order_block_idx(entry), percounter_order_block_num(entry)
-                );
-                ++next;
-            }
-            if (next != first) {
-                cache_flush_range(target + first, static_cast<size_t>(next - first) * sizeof(uint64_t));
-                published[l] = next;
-                any = true;
-            }
-        }
-        if (any) {
+        if (made > 0) {
             uint64_t expected = 0;
             const uint64_t now = get_sys_cnt_aicpu();
             __atomic_compare_exchange_n(
@@ -222,12 +221,6 @@ inline bool percounter_prepare_invocation(
             );
         }
         if (result == GraphMaterializeResult::MATERIALIZED) break;
-    }
-    for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l) {
-        if (published[l] != tmpl->order_count[l]) {
-            percounter_graph_prepare_fail(prepare, rank, SchedulerGraphResult::INVALID_ARGUMENTS);
-            return false;
-        }
     }
     return true;
 }
@@ -245,6 +238,7 @@ inline void percounter_prepare_graphs(Runtime *runtime, PercounterControl *contr
         const uint64_t rank = __atomic_fetch_add(&prepare->next, uint64_t{1}, __ATOMIC_ACQ_REL);
         if (rank >= invocation_count) return;
         if (!view.valid()) {
+            LOG_ERROR("A5 percounter: invalid Graph image for invocation=%" PRIu64 "", rank);
             percounter_graph_prepare_fail(prepare, rank, SchedulerGraphResult::INVALID_ARGUMENTS);
             return;
         }

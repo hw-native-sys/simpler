@@ -111,12 +111,10 @@ scheduler_initialize_admission(__gm__ void *base, const SchedulerLocalState *loc
     next.epoch = summary->run_epoch;
     next.control_offset = summary->admission_control_offset;
     next.records_offset = summary->admission_records_offset;
-    next.record_stride = summary->admission_record_stride;
     next.log_offset = summary->admission_log_offset;
     next.capacity = summary->cooperative_task_count;
     if (next.capacity == 0) {
-        if (next.control_offset != 0 || next.records_offset != 0 || next.record_stride != 0 || next.log_offset != 0)
-            return false;
+        if (next.control_offset != 0 || next.records_offset != 0 || next.log_offset != 0) return false;
     } else {
         uint64_t control_end = 0;
         uint64_t records_end = 0;
@@ -125,12 +123,10 @@ scheduler_initialize_admission(__gm__ void *base, const SchedulerLocalState *loc
             workers != clusters * PLATFORM_CORES_PER_BLOCKDIM || summary->worker_count != workers ||
             summary->cluster_count != clusters || local->config.graph->task_count > static_cast<uint64_t>(INT32_MAX) ||
             next.control_offset == 0 || next.records_offset == 0 || next.log_offset == 0 ||
-            ((next.control_offset | next.records_offset | next.log_offset | next.record_stride) &
-             (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
-            next.record_stride != sizeof(SchedulerAdmissionRecord) ||
+            ((next.control_offset | next.records_offset | next.log_offset) & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
             !scheduler_admission_range_end(next.control_offset, 1, sizeof(SchedulerAdmissionControl), &control_end) ||
             !scheduler_admission_range_end(
-                next.records_offset, local->config.graph->task_count, next.record_stride, &records_end
+                next.records_offset, local->config.graph->task_count, sizeof(SchedulerAdmissionRecord), &records_end
             ) ||
             !scheduler_admission_range_end(next.log_offset, next.capacity, sizeof(int64_t), &log_end) ||
             control_end > next.records_offset || records_end > next.log_offset ||
@@ -138,25 +134,9 @@ scheduler_initialize_admission(__gm__ void *base, const SchedulerLocalState *loc
             return false;
     }
     if (summary->sync_mix_task_count != 0) {
-        uint64_t mailbox_end = 0;
-        uint64_t seals_end = 0;
         if (local->config.shared_context == nullptr) return false;
         const uint64_t cluster = local->config.shared_context->cluster_index;
-        if (cluster >= clusters || summary->group_mailboxes_offset == 0 ||
-            (summary->group_mailboxes_offset & (alignof(SchedulerGroupMailbox) - 1)) != 0 ||
-            (summary->mix_close_seals_offset & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
-            summary->group_mailboxes_offset < next.log_offset + next.capacity * sizeof(int64_t) ||
-            !scheduler_admission_range_end(
-                summary->group_mailboxes_offset, clusters, sizeof(SchedulerGroupMailbox), &mailbox_end
-            ) ||
-            mailbox_end > summary->mix_close_seals_offset ||
-            !scheduler_admission_range_end(
-                summary->mix_close_seals_offset, summary->sync_mix_task_count * clusters, sizeof(SchedulerMixCloseSeal),
-                &seals_end
-            ) ||
-            seals_end > UINT64_MAX - reinterpret_cast<uintptr_t>(base))
-            return false;
-        next.gm_mix.mailbox_offset = summary->group_mailboxes_offset + cluster * sizeof(SchedulerGroupMailbox);
+        if (cluster >= clusters) return false;
         next.gm_mix.cluster_index = static_cast<uint32_t>(cluster);
     }
     if (summary->topology_layout != SchedulerTopologyLayout::GENERAL &&
@@ -192,11 +172,13 @@ static inline __aicore__ bool scheduler_admission_fail(
     return false;
 }
 
-namespace scheduler_admission_detail {
-
-// Configuration pointers are validated by the enclosing bounded operation.
-// Neither the error signal nor the current run's epoch is a reusable permit.
-static inline __aicore__ bool active_run_valid(
+// Admission operations require the resident's live base/local/run and an
+// initialized admission object. run_resident_scheduler installs admission only
+// after both initializers succeed; fill/entry dispatch select this path only
+// when it is present, and exit drain handles absence before calling here.
+// The cached graph binding is immutable until the run fence. Error and epoch
+// observations remain per-operation checks, including after lock acquisition.
+static inline __aicore__ bool scheduler_admission_context_valid(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     const SchedulerAdmissionLocalState *admission
 ) {
@@ -212,25 +194,10 @@ static inline __aicore__ bool active_run_valid(
     return true;
 }
 
-}  // namespace scheduler_admission_detail
-
-// Admission operations require the resident's live base/local/run and an
-// initialized admission object. run_resident_scheduler installs admission only
-// after both initializers succeed; fill/entry dispatch select this path only
-// when it is present, and exit drain handles absence before calling here.
-// The cached graph binding is immutable until the run fence. Error and epoch
-// observations remain per-operation checks, including after lock acquisition.
-static inline __aicore__ bool scheduler_admission_context_valid(
-    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    const SchedulerAdmissionLocalState *admission
-) {
-    return scheduler_admission_detail::active_run_valid(graph, base, local, run, admission);
-}
-
 inline __aicore__ __gm__ SchedulerAdmissionRecord *
 scheduler_admission_record_at(__gm__ void *base, const SchedulerAdmissionLocalState *admission, int64_t task_ref) {
     return scheduler_state_at<SchedulerAdmissionRecord>(
-        base, admission->records_offset + static_cast<uint64_t>(task_ref) * admission->record_stride
+        base, admission->records_offset + static_cast<uint64_t>(task_ref) * sizeof(SchedulerAdmissionRecord)
     );
 }
 
@@ -275,6 +242,14 @@ static inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission
     auto *control = scheduler_task_control_at(base, local, task);
     auto *record = scheduler_admission_record_at(base, admission, task);
     auto *shared = scheduler_state_at<SchedulerAdmissionControl>(base, admission->control_offset);
+    // ADMITTED is final for this run. Retiring this proposal does not adopt
+    // its obligation, which still requires the committed log prefix.
+    if (scheduler_gm_query(control->admission_state) == static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED)) {
+        if (!scheduler_admission_context_valid(graph, base, local, run, admission))
+            return SchedulerAdmissionResult::ERROR;
+        admission->pending_task_ref = SCHEDULER_TASK_REF_INVALID;
+        return SchedulerAdmissionResult::PROGRESS;
+    }
     // Run entry validates the immutable worker index against runtime_worker_count.
     const uint64_t owner = local->worker_id() + 1;
     if (scheduler_gm_compare_exchange(shared->commit_lock, UINT64_C(0), owner) != 0) {
@@ -283,7 +258,7 @@ static inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission
         return SchedulerAdmissionResult::RETRY;
     }
     bool valid = scheduler_admission_context_valid(graph, base, local, run, admission);
-    const uint64_t state = scheduler_gm_fetch_add(control->admission_state, UINT64_C(0));
+    const uint64_t state = scheduler_gm_query(control->admission_state);
     if (valid && state == static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED)) {
         admission->pending_task_ref = SCHEDULER_TASK_REF_INVALID;
         scheduler_gm_store(shared->commit_lock, UINT64_C(0));
@@ -291,7 +266,7 @@ static inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission
     }
     if (valid && state != static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED))
         valid = scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_STATE);
-    const uint64_t tail = valid ? scheduler_gm_fetch_add(shared->commit_tail, UINT64_C(0)) : 0;
+    const uint64_t tail = valid ? scheduler_gm_query(shared->commit_tail) : 0;
     if (valid) {
         scheduler_observe_cache_line(record);
         if (record->run_epoch != admission->epoch)
@@ -307,7 +282,7 @@ static inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission
         scheduler_publish_cache_line(record);
         auto *log = scheduler_state_at<int64_t>(base, admission->log_offset);
         scheduler_publish_signal(log[tail], task);
-        scheduler_gm_store(control->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED));
+        scheduler_store_signal(control->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED));
         scheduler_cache_barrier();
         scheduler_publish_signal(shared->commit_tail, tail + 1);
         scheduler_cache_barrier();
@@ -334,7 +309,6 @@ inline __aicore__ void scheduler_reset_current_task_cache(SchedulerAdmissionLoca
     admission.current_uses_ticket_claim = false;
     admission.current_single_subtask = UINT8_MAX;
     admission.current_resource_mask = LaneMask::none();
-    admission.current_mix_close_seal_offset = 0;
     admission.sync_claimed = false;
     admission.preclaim_mask = 0;
     admission.preclaim_initialized = false;
@@ -390,11 +364,9 @@ static inline __aicore__ bool scheduler_refresh_local_obligation(
         scheduler_cache_barrier();
         if (record->run_epoch != admission->epoch)
             return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_EPOCH_MISMATCH);
-        auto *control = scheduler_task_control_at(base, local, task);
-        // Bootstrap validates immutable shape and topology; epoch, order and
-        // publication remain dynamic gates for every adoption.
-        if (record->order_key != admission->scan_cursor ||
-            scheduler_gm_query(control->admission_state) != static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED))
+        // The committed tail follows ADMITTED publication. Epoch and order
+        // identify this record without a second observation of the same fact.
+        if (record->order_key != admission->scan_cursor)
             return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_RECORD);
         // The validated committed prefix retires the same local proposal. It
         // does not require another acquisition of the publisher's global lock.
@@ -423,11 +395,6 @@ static inline __aicore__ bool scheduler_refresh_local_obligation(
             admission->current_resource_mask = scheduler_task_is_mix(record->flags) ?
                                                    scheduler_mix_resource_mask(admission->current_active_mask) :
                                                    admission->current_active_mask;
-            admission->current_mix_close_seal_offset =
-                scheduler_task_is_mix(record->flags) ?
-                    record->mix_close_seals_offset +
-                        static_cast<uint64_t>(admission->gm_mix.cluster_index) * sizeof(SchedulerMixCloseSeal) :
-                    0;
             admission->sync_claimed = false;
             admission->ticket_exhausted = false;
             admission->preclaim_mask = 0;
@@ -505,35 +472,27 @@ static inline __aicore__ bool scheduler_read_claim_cursor(
     auto *control = scheduler_task_control_at(base, local, admission->current_task_ref);
     const uint64_t count = admission->current_block_num;
     scalar_validate.close();
-    const uint64_t seal_hint = scheduler_scalar_result(local, SchedPhaseKind::ScalarClaimSealProbe, [&]() __aicore__ {
+    const uint64_t seal = scheduler_scalar_result(local, SchedPhaseKind::ScalarClaimSealProbe, [&]() __aicore__ {
         return scheduler_gm_query(control->claim_seal);
     });
-    const uint64_t seal =
-        seal_hint == 0 ? 0 : scheduler_scalar_result(local, SchedPhaseKind::ScalarClaimSealConfirm, [&]() __aicore__ {
-            return scheduler_gm_fetch_add(control->claim_seal, UINT64_C(0));
-        });
     if (seal != 0 && seal != count)
         return scheduler_admission_fail(
             graph, local, run, admission->current_task_ref, SchedulerErrorSite::BLOCK_CURSOR_INVALID
         );
-    if (seal == count && scheduler_scalar_result(local, SchedPhaseKind::ScalarNextBlockProbe, [&]() __aicore__ {
-                             return scheduler_gm_query(control->next_block);
-                         }) == count) {
+    if (seal == count) {
         scheduler_remember_task_proof(local, admission->current_task_ref, SchedulerTaskProof::SUPPLY_CLOSED);
-        *cursor = count;
         if (used_seal != nullptr) *used_seal = true;
+        *cursor = count;
         return true;
     }
-    // A missing publication never stalls the original strong-read path. A weak
-    // mismatch can be a delayed atomic image, so confirm before rejecting it.
-    const uint64_t confirmed = scheduler_scalar_result(local, SchedPhaseKind::ScalarNextBlockConfirm, [&]() __aicore__ {
-        return scheduler_gm_fetch_add(control->next_block, UINT64_C(0));
+    const uint64_t next = scheduler_scalar_result(local, SchedPhaseKind::ScalarNextBlockProbe, [&]() __aicore__ {
+        return scheduler_gm_query(control->next_block);
     });
-    if (confirmed > count || (seal == count && confirmed != count))
+    if (next > count)
         return scheduler_admission_fail(
             graph, local, run, admission->current_task_ref, SchedulerErrorSite::BLOCK_CURSOR_INVALID
         );
-    *cursor = confirmed;
+    *cursor = next;
     return true;
 }
 
@@ -544,6 +503,7 @@ static inline __aicore__ bool scheduler_publish_claim_seal(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint32_t block
 ) {
+    SchedulerScalarScope scope(local, SchedPhaseKind::ScalarClaimSealPublish);
     auto *admission = local->admission;
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return false;
     auto *control = scheduler_task_control_at(base, local, admission->current_task_ref);
@@ -553,7 +513,7 @@ static inline __aicore__ bool scheduler_publish_claim_seal(
         );
     if constexpr (RecordProtocol) scheduler_protocol_claim_seal(base, local, block, true, admission->current_block_num);
     scheduler_cache_barrier();
-    scheduler_gm_store(control->claim_seal, static_cast<uint64_t>(admission->current_block_num));
+    scheduler_store_signal(control->claim_seal, static_cast<uint64_t>(admission->current_block_num));
     scheduler_remember_task_proof(local, admission->current_task_ref, SchedulerTaskProof::SUPPLY_CLOSED);
     if constexpr (RecordProtocol)
         scheduler_protocol_claim_seal(base, local, block, false, admission->current_block_num);
@@ -565,6 +525,7 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_curso
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint32_t *block_idx
 ) {
+    SchedulerScalarScope scope(local, SchedPhaseKind::ScalarOrderedCursorClaim);
     auto *admission = local->admission;
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return SchedulerBlockClaimResult::ERROR;
     if (block_idx == nullptr || !scheduler_task_ref_valid(graph, admission->current_task_ref) ||
@@ -586,8 +547,7 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_curso
         const uint64_t count = admission->current_block_num;
         const uint64_t positions = admission->current_claim_positions;
         const uint64_t limit = admission->current_claim_limit;
-        if (scheduler_gm_query(control->claim_tickets) >= limit &&
-            scheduler_gm_fetch_add(control->claim_tickets, UINT64_C(0)) >= limit) {
+        if (scheduler_gm_query(control->claim_tickets) >= limit) {
             scheduler_admission_fail(
                 graph, local, run, admission->current_task_ref, SchedulerErrorSite::BLOCK_CURSOR_INVALID
             );
@@ -607,7 +567,6 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_curso
         }
         // A ticket is irrevocable ownership of one block. The bounded valid
         // count reaches N only after every valid reservation is published.
-        admission->sync_claimed = scheduler_task_requires_sync_start(admission->current_flags);
         const uint64_t previous = scheduler_gm_fetch_add(control->next_block, UINT64_C(1));
         if (previous >= count || ticket > previous + positions - 1) {
             scheduler_admission_fail(
@@ -615,6 +574,7 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_curso
             );
             return SchedulerBlockClaimResult::ERROR;
         }
+        admission->sync_claimed = scheduler_task_requires_sync_start(admission->current_flags);
         *block_idx = static_cast<uint32_t>(ticket);
         if constexpr (RecordProtocol)
             scheduler_protocol_block_claim(
@@ -685,7 +645,6 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_block
     auto &slot = local->slots[slot_index];
     slot.task_ref = task;
     slot.block_idx = block;
-    slot.args_observed = true;
     slot.gm_mix = false;
     slot.predicate = SchedulerPredicateState::UNEVALUATED;
     slot.subtask_slot = admission->current_single_subtask;
@@ -709,22 +668,32 @@ static inline __aicore__ bool scheduler_close_ordered_obligation(
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_FRONTIER);
     for (const auto &slot : local->slots)
         if (slot.task_ref == task && slot.state != SchedulerDispatchSlotState::FREE) return true;
-    uint64_t cursor = 0;
+    uint64_t cursor = UINT64_MAX;
     bool used_claim_seal = false;
-    if (!scheduler_read_claim_cursor(graph, base, local, run, &cursor, &used_claim_seal)) return false;
-    if (cursor < admission->current_block_num && !admission->sync_claimed) return true;
-    if (cursor > admission->current_block_num || (admission->sync_claimed && cursor == 0) ||
-        admission->scan_cursor >= admission->capacity)
+    // A sync position has no second block to claim. Its validated claim and
+    // empty local slots prove local retirement, not global supply closure.
+    const bool from_claim = admission->sync_claimed;
+    if (from_claim) {
+        if (!scheduler_task_requires_sync_start(admission->current_flags) || admission->current_block_num == 0)
+            return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::BLOCK_CURSOR_INVALID);
+    } else {
+        if (!scheduler_read_claim_cursor(graph, base, local, run, &cursor, &used_claim_seal)) return false;
+        if (cursor < admission->current_block_num) return true;
+        if (cursor > admission->current_block_num)
+            return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::BLOCK_CURSOR_INVALID);
+    }
+    if (admission->scan_cursor >= admission->capacity)
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::BLOCK_CURSOR_INVALID);
     if constexpr (RecordProtocol)
-        scheduler_protocol_member_closed(base, local, admission, cursor, 0, 0, used_claim_seal);
+        scheduler_protocol_member_closed(base, local, admission, cursor, 0, 0, used_claim_seal, from_claim);
     scheduler_retire_local_obligation(local, *admission);
     *closed = true;
     return true;
 }
 
 static inline __aicore__ bool scheduler_ordered_restore_ordinary(
-    const SchedulerGraphAccess &graph, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    uint64_t profiling_level
 ) {
     SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarOrdinaryRestore, -1);
     auto *admission = local->admission;
@@ -733,7 +702,7 @@ static inline __aicore__ bool scheduler_ordered_restore_ordinary(
         if (slot.state != SchedulerDispatchSlotState::READY || slot.cluster_mix ||
             scheduler_slot_uses_admission(local, slot) || (local->local_ready_mask & (1U << index)) == 0)
             continue;
-        if (!slot.execution_token || !scheduler_restore_execution_token(local, index))
+        if (!slot.execution_token || !scheduler_restore_execution_token(base, local, index, profiling_level))
             return scheduler_admission_fail(
                 graph, local, run, slot.task_ref, SchedulerErrorSite::ORDERED_CANDIDATE_INVALID
             );

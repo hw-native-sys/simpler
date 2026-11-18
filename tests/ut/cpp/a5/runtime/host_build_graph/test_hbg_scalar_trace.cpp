@@ -55,8 +55,8 @@ TEST(HbgScalarTrace, NoProgressLoopsKeepEveryFunctionInterval) {
     trace.records = records.get();
     trace.window_start = 1;
     for (uint64_t begin : {10ULL, 50ULL}) {
-        trace.append(SchedPhaseKind::ScalarAtomicClaim, begin + 2, begin + 5, -1, 2);
-        trace.append(SchedPhaseKind::ScalarFillSlots, begin, begin + 20, -1, 1);
+        trace.append(SchedPhaseKind::ScalarAtomicCas, begin + 2, begin + 5, -1, 2);
+        trace.append(SchedPhaseKind::ScalarFillOwnSlots, begin, begin + 20, -1, 1);
         trace.end_iteration(false);
     }
     EXPECT_EQ(trace.committed, 4U);
@@ -69,11 +69,11 @@ TEST(HbgScalarTrace, NoProgressLoopsKeepEveryFunctionInterval) {
         const uint64_t begin = 10 + i * 40;
         const auto &atomic = decoded[i * 2];
         const auto &fill = decoded[i * 2 + 1];
-        EXPECT_EQ(kind(atomic), static_cast<uint32_t>(SchedPhaseKind::ScalarAtomicClaim));
+        EXPECT_EQ(kind(atomic), static_cast<uint32_t>(SchedPhaseKind::ScalarAtomicCas));
         EXPECT_EQ(atomic.start_time, begin + 2);
         EXPECT_EQ(atomic.end_time, begin + 5);
         EXPECT_EQ(atomic.kind >> 16, 2U);
-        EXPECT_EQ(kind(fill), static_cast<uint32_t>(SchedPhaseKind::ScalarFillSlots));
+        EXPECT_EQ(kind(fill), static_cast<uint32_t>(SchedPhaseKind::ScalarFillOwnSlots));
         EXPECT_EQ(fill.start_time, begin);
         EXPECT_EQ(fill.end_time, begin + 20);
     }
@@ -86,8 +86,8 @@ TEST(HbgScalarTrace, ProgressKeepsTaskIdentityAndNestedDepth) {
     trace.buffer = buffer.get();
     trace.records = records.get();
     trace.window_start = 1;
-    trace.append(SchedPhaseKind::ScalarAtomicClaim, 12, 15, 7, 2);
-    trace.append(SchedPhaseKind::ScalarReadyClaim, 10, 20, 7, 1);
+    trace.append(SchedPhaseKind::ScalarAtomicCas, 12, 15, 7, 2);
+    trace.append(SchedPhaseKind::ScalarPayload, 10, 20, 7, 1);
     trace.end_iteration(true);
     trace.finish(25);
     EXPECT_EQ(trace.poll_loops, 0U);
@@ -104,14 +104,14 @@ TEST(HbgScalarTrace, LargeSliceWritesEveryRecordWithoutStaging) {
     trace.buffer = buffer.get();
     trace.records = records.get();
     for (uint32_t i = 0; i < 259; ++i)
-        trace.append(SchedPhaseKind::ScalarResolve, 10 + i * 2, 11 + i * 2, i, 1);
+        trace.append(SchedPhaseKind::ScalarCompletions, 10 + i * 2, 11 + i * 2, i, 1);
     trace.end_iteration(true);
     trace.finish(1000);
     EXPECT_EQ(trace.dropped, 0U);
     const auto decoded = decode(trace);
     uint32_t found = 0;
     for (uint32_t i = 0; i < trace.committed; ++i)
-        if (kind(decoded[i]) == static_cast<uint32_t>(SchedPhaseKind::ScalarResolve)) ++found;
+        if (kind(decoded[i]) == static_cast<uint32_t>(SchedPhaseKind::ScalarCompletions)) ++found;
     EXPECT_EQ(found, 259);
 }
 
@@ -122,7 +122,7 @@ TEST(HbgScalarTrace, FullPartitionReportsTruncationWithoutOverwriting) {
     trace.buffer = buffer.get();
     trace.records = records.get();
     for (uint32_t i = 0; i < SCHEDULER_SCALAR_RECORD_CAPACITY + 2; ++i)
-        trace.write({i + 1, i + 2, i, static_cast<uint32_t>(SchedPhaseKind::ScalarResolve), 1});
+        trace.write({i + 1, i + 2, i, static_cast<uint32_t>(SchedPhaseKind::ScalarCompletions), 1});
     EXPECT_EQ(trace.committed, SCHEDULER_SCALAR_RECORD_CAPACITY);
     EXPECT_EQ(trace.dropped, 2U);
     EXPECT_EQ(decode(trace)[0].task_ref, 0);
@@ -165,7 +165,7 @@ TEST(HbgScalarTrace, ResultTimingCallsTheOperationOnceWithAndWithoutRecording) {
         profile.scalar.buffer = enabled ? buffer.get() : nullptr;
         profile.scalar.records = records.get();
         uint32_t calls = 0;
-        const bool result = scheduler_scalar_result(&local, SchedPhaseKind::ScalarPollReadyPool, [&] {
+        const bool result = scheduler_scalar_result(&local, SchedPhaseKind::ScalarPollAdmissionTail, [&] {
             ++calls;
             return true;
         });
@@ -174,7 +174,7 @@ TEST(HbgScalarTrace, ResultTimingCallsTheOperationOnceWithAndWithoutRecording) {
         EXPECT_EQ(profile.scalar.committed, enabled ? 1u : 0u);
         EXPECT_EQ(profile.scalar.depth, 0u);
         if (enabled)
-            EXPECT_EQ(kind(decode(profile.scalar)[0]), static_cast<uint32_t>(SchedPhaseKind::ScalarPollReadyPool));
+            EXPECT_EQ(kind(decode(profile.scalar)[0]), static_cast<uint32_t>(SchedPhaseKind::ScalarPollAdmissionTail));
     }
 }
 
@@ -464,22 +464,25 @@ TEST(HbgScalarTrace, CompactStoragePreservesWideClocksTasksCountsAndDepth) {
     }
 }
 
-TEST(HbgScalarTrace, CompactStoragePreservesEveryBootstrapPhase) {
+TEST(HbgScalarTrace, CompactStoragePreservesBootstrapAndClaimPhases) {
     auto buffer = std::make_unique<SchedulerActivityBuffer>();
     auto slots = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
     SchedulerScalarTrace trace;
     trace.buffer = buffer.get();
     trace.records = slots.get();
     const SchedPhaseKind phases[] = {
-        SchedPhaseKind::ScalarBootstrapInitWait,
-        SchedPhaseKind::ScalarBootstrapPeerWait,
-        SchedPhaseKind::ScalarBootstrapTopology,
+        SchedPhaseKind::ScalarBootstrapInitWait, SchedPhaseKind::ScalarBootstrapPeerWait,
+        SchedPhaseKind::ScalarBootstrapTopology, SchedPhaseKind::ScalarPreparedClaim,
+        SchedPhaseKind::ScalarCounterAccounting,
     };
-    const char *names[] = {"scalar_bootstrap_init_wait", "scalar_bootstrap_peer_wait", "scalar_bootstrap_topology"};
+    const char *names[] = {
+        "scalar_bootstrap_init_wait", "scalar_bootstrap_peer_wait", "scalar_bootstrap_topology",
+        "scalar_prepared_claim", "scalar_counter_accounting"
+    };
     for (auto phase : phases)
         trace.append(phase, 10, 20, -1, 2);
     const auto rows = decode(trace);
-    ASSERT_EQ(rows.size(), 3u);
+    ASSERT_EQ(rows.size(), 5u);
     for (uint32_t i = 0; i < rows.size(); ++i) {
         EXPECT_EQ(kind(rows[i]), 139u + i);
         EXPECT_STREQ(sched_phase_kind_name(static_cast<SchedPhaseKind>(kind(rows[i]))), names[i]);

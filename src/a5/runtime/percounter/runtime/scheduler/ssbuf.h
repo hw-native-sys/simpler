@@ -14,7 +14,7 @@
  * **The barrier in these two is the MIX rendezvous's only ordering.** A lane
  * publishes its arrival with the release store and reads its peers' with the
  * acquire load, and nothing else separates the token from the payload it
- * stands for; `percounter_mix_wait` runs one of these per peer per spin.
+ * stands for. Cohort entry and completion acquire each actual peer's token.
  *
  * The region layout this runtime puts in the window is its own
  * (`PercounterSsbufRegion`), so what was left to share with host_build_graph

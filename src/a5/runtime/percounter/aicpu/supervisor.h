@@ -92,10 +92,13 @@ percounter_post_handshake_init(Runtime *runtime, const AicoreLifecycle &lifecycl
     }
 
     cache_invalidate_range(control, sizeof(*control));
+    if (!percounter_sync_widths_fit(control->max_sync_blocks, aic_count, PLATFORM_AIV_CORES_PER_BLOCKDIM)) {
+        LOG_ERROR("A5 percounter: sync_start width exceeds the reported topology");
+        return -1;
+    }
     control->cluster_count = static_cast<uint64_t>(aic_count);
     control->aiv_per_cluster = static_cast<uint64_t>(PLATFORM_AIV_CORES_PER_BLOCKDIM);
-    // The host prefilled the compile-time default; this carries any override,
-    // which only the AICPU reads.
+    // Publish the configured timeout for AICPU supervision and bounded lane startup waits.
     control->scheduler_timeout_cycles = scheduler_timeout_cycles;
     cache_flush_range(control, sizeof(*control));
     percounter_graph_prepare_init(control);
@@ -132,12 +135,65 @@ inline void percounter_publish_partition(
 inline void percounter_assist(Runtime *runtime) { percounter_prepare_graphs(runtime, percounter_control(runtime)); }
 
 /**
- * Wait until the lanes have run every executable block, a lane reports an
- * error, or progress stops for the scheduler timeout. Returns the run status
- * to publish: 0, or the code latched into the shared header.
+ * True when every completion component this reference names reads positive.
  *
- * The target is `executable_block_count`, not the task count: inline-completed
- * tasks are in no list, so no lane ever counts them.
+ * The reference is `(task << 1) | partitioned`, the encoding a Graph body's
+ * fanin carries. A partitioned producer publishes into
+ * PERCOUNTER_COMPLETION_SECTOR_COUNT device-only sectors, so it is complete
+ * only once all of them are.
+ */
+inline bool percounter_reference_published(
+    const PercounterCounter *counters, const PercounterCompletionSector *sectors, uint64_t reference
+) {
+    const uint64_t task = reference >> 1;
+    if ((reference & PERCOUNTER_COMPLETION_PARTITIONED) == 0) {
+        const uint64_t *value = &counters[task].value;
+        cache_invalidate_range(value, sizeof(*value));
+        return percounter_counter_published(__atomic_load_n(value, __ATOMIC_ACQUIRE));
+    }
+    const PercounterCompletionSector *group = sectors + task * PERCOUNTER_COMPLETION_SECTOR_COUNT;
+    for (uint32_t i = 0; i < PERCOUNTER_COMPLETION_SECTOR_COUNT; ++i) {
+        cache_invalidate_range(&group[i].value, sizeof(group[i].value));
+        if (!percounter_counter_published(__atomic_load_n(&group[i].value, __ATOMIC_ACQUIRE))) return false;
+    }
+    return true;
+}
+
+/**
+ * A fingerprint of every completion component in the graph, for the watchdog.
+ *
+ * A sink stays unchanged for as long as the chain behind it takes, so from the
+ * sinks alone a long run and a stalled one look the same. This reads the whole
+ * component state instead. It mixes each value with its position rather than
+ * summing: a MIX deducts its share while another component gains one, and a
+ * sum would cancel the two into a false stall.
+ *
+ * The scan is whole-graph and only the stall path runs it.
+ */
+inline uint64_t percounter_progress_fingerprint(
+    const PercounterControl *control, const PercounterCounter *counters, const PercounterCompletionSector *sectors
+) {
+    const uint64_t tasks = control->task_count;
+    const uint64_t components = tasks * PERCOUNTER_COMPLETION_SECTOR_COUNT;
+    cache_invalidate_range(counters, static_cast<size_t>(tasks) * sizeof(PercounterCounter));
+    cache_invalidate_range(sectors, static_cast<size_t>(components) * sizeof(PercounterCompletionSector));
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    for (uint64_t i = 0; i < tasks; ++i)
+        hash = (hash ^ __atomic_load_n(&counters[i].value, __ATOMIC_RELAXED)) * 0x100000001b3ULL;
+    for (uint64_t i = 0; i < components; ++i)
+        hash = (hash ^ __atomic_load_n(&sectors[i].value, __ATOMIC_RELAXED)) * 0x100000001b3ULL;
+    return hash;
+}
+
+/**
+ * Wait until every top-level sink has completed, a lane reports an error, or
+ * progress stops for the scheduler timeout. Returns the run status to publish:
+ * 0, or the code latched into the shared header.
+ *
+ * The sinks are what the host found no consumer for. Every task reaches one
+ * along consumer edges and a producer completes before its consumer, so the
+ * sinks completing covers the graph. A Graph invocation is covered by its
+ * shell, which its body's sinks publish into.
  *
  * With no other AICPU thread to assist, the supervisor materializes the Graph
  * bodies itself before it starts watching.
@@ -184,68 +240,106 @@ percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_th
 
     cache_invalidate_range(control, sizeof(*control));
     if (aicpu_thread_count <= 1) percounter_prepare_graphs(runtime, control);
-    const uint64_t expected = control->executable_block_count;
+    const uint64_t sink_count = control->sink_count;
+    const uint64_t *sinks = scheduler_state_at<uint64_t>(control, control->sinks_offset);
+    // Host-built and immutable for the run, but this line can still hold what
+    // the previous run left at the same address.
+    cache_invalidate_range(sinks, static_cast<size_t>(sink_count) * sizeof(uint64_t));
+    const auto *counters = scheduler_state_at<PercounterCounter>(control, control->counters_offset);
+    const auto *sectors = scheduler_state_at<PercounterCompletionSector>(control, control->completion_sectors_offset);
+    // Sinks before this were observed published. A sink that reads published
+    // can dip back while a deferred share is withdrawn, but its registration
+    // precedes the dip, so the outstanding check below holds the exit.
+    uint64_t resolved = 0;
     uint64_t last_progress = ~uint64_t{0};
     uint64_t last_progress_cycles = get_sys_cnt_aicpu();
+    // A whole-graph scan costs too much to repeat, so the stall path takes one
+    // fingerprint half a budget after the cheap signals go still and declares
+    // the stall a half budget later if nothing moved. A healthy run pays
+    // nothing: any sink or deferred progress resets both.
+    const uint64_t scan_cycles = timeout_cycles / 2;
+    uint64_t fingerprint = 0;
+    bool scanned = false;
     uint32_t error_poll_count = 0;
     uint64_t error = 0;
     uint64_t outstanding = 0;
+    uint64_t registered = 0;
     uint64_t settled = 0;
     while (true) {
-        cache_invalidate_range(&control->completed_block_count, sizeof(control->completed_block_count));
-        const uint64_t resolved = control->completed_block_count;
-        // The final block publication follows every registration allocation.
-        if (resolved >= expected || error_poll_count == 63) {
+        // Every completion component arrives preset in this run's uploaded
+        // image, so a positive read belongs to this run and not the last.
+        while (resolved < sink_count && percounter_reference_published(counters, sectors, sinks[resolved]))
+            ++resolved;
+        const bool sinks_done = resolved >= sink_count;
+        // The final sink publication follows every registration allocation.
+        if (sinks_done || error_poll_count == 63) {
             cache_invalidate_range(&control->async_registered, 2 * sizeof(uint64_t));
-            const uint64_t registered = control->async_registered;
+            registered = control->async_registered;
             settled = control->async_settled;
             outstanding = registered - settled;
         }
         const uint64_t now = get_sys_cnt_aicpu();
-        const uint64_t progress = resolved + settled;
+        // A deferred kernel that returned without its condition met shows up in
+        // the registration count before any counter moves, so both are progress.
+        const uint64_t progress = resolved + registered + settled;
         if (progress != last_progress) {
             last_progress = progress;
             last_progress_cycles = now;
+            scanned = false;
         }
-        if (resolved >= expected && outstanding == 0) break;
+        if (sinks_done && outstanding == 0) break;
         if (++error_poll_count == 64) {
             error_poll_count = 0;
             chip_swimlane_aicpu_poll_self_scheduled_cores(thread_idx, aicpu_thread_count, runtime->get_worker_count());
             cache_invalidate_range(&control->lane_error, sizeof(control->lane_error));
             if (control->lane_error != 0) {
                 error = control->lane_error;
+                cache_invalidate_range(&control->lane_error_claim, 3 * sizeof(uint64_t));
+                const int64_t task =
+                    control->lane_error_claim == 2 ? static_cast<int64_t>(control->lane_error_task) - 1 : -1;
                 LOG_ERROR(
-                    "A5 percounter: lane reported error %" PRIu64 "; %" PRIu64 " of %" PRIu64 " blocks resolved", error,
-                    resolved, expected
+                    "A5 percounter: lane reported error %" PRIu64 "; task=%" PRId64 " detail=%" PRIu64 "; %" PRIu64
+                    " of %" PRIu64 " sinks complete",
+                    error, task, control->lane_error_detail, resolved, sink_count
                 );
                 break;
             }
             error = percounter_graph_prepare_error(control);
             if (error != 0) break;
         }
-        if (scheduler_watchdog_expired(last_progress_cycles, now, timeout_cycles)) {
-            error = static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT);
-            LOG_ERROR(
-                "A5 percounter: no progress; %" PRIu64 " of %" PRIu64 " blocks resolved, %" PRIu64
-                " deferred completions outstanding",
-                resolved, expected, outstanding
-            );
-            break;
+        if (scheduler_watchdog_expired(last_progress_cycles, now, scan_cycles)) {
+            const uint64_t current = percounter_progress_fingerprint(control, counters, sectors);
+            if (!scanned || current != fingerprint) {
+                // Some component moved, so the graph is running and only the
+                // sinks and the deferred counts were still.
+                fingerprint = current;
+                scanned = true;
+                last_progress_cycles = now;
+            } else {
+                // Two scans a half-budget apart saw the same component state.
+                error = static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT);
+                LOG_ERROR(
+                    "A5 percounter: no progress; %" PRIu64 " of %" PRIu64 " sinks complete, %" PRIu64
+                    " deferred completions outstanding",
+                    resolved, sink_count, outstanding
+                );
+                break;
+            }
         }
         SPIN_WAIT_HINT();
     }
-    // The loop leaves on the completion count as readily as on an error, and
-    // between its last error poll and that exit a lane can still fail -- a lane
-    // that fails after publishing its final block sets the word later than any
-    // poll inside the loop could read it. So both error words are read once
-    // more here: this run is a success only when they are clear at the moment
-    // the supervisor stops watching, not merely at its last poll.
+    // The loop leaves on the sinks as readily as on an error, and between its
+    // last error poll and that exit a lane can still fail -- a lane that fails
+    // after publishing its final block sets the word later than any poll inside
+    // the loop could read it. So both error words are read once more here: this
+    // run is a success only when they are clear at the moment the supervisor
+    // stops watching, not merely at its last poll.
     if (error == 0) {
         cache_invalidate_range(&control->lane_error, sizeof(control->lane_error));
         error = control->lane_error;
         if (error != 0) {
             LOG_ERROR(
-                "A5 percounter: lane reported error %" PRIu64 " with all %" PRIu64 " blocks resolved", error, expected
+                "A5 percounter: lane reported error %" PRIu64 " with all %" PRIu64 " sinks complete", error, sink_count
             );
         } else {
             error = percounter_graph_prepare_error(control);

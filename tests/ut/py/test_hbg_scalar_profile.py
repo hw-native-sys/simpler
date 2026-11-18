@@ -81,14 +81,14 @@ def test_long_function_names_and_primitives_survive_filtered_nesting():
 
 
 def test_nested_intervals_conserve_time_without_counting_parents_twice():
-    records = [window(), record("scalar_fill_slots", 15, 35, 1), record("scalar_atomic_claim", 20, 25, 2)]
+    records = [window(), record("scalar_fill_own_slots", 15, 35, 1), record("scalar_atomic_cas", 20, 25, 2)]
     kernels = [{"start_cycles": 40, "end_cycles": 80, "run_epoch": 1, "task_id": 7}]
     result = partition(records, kernels)
     assert result["window_cycles"] == 90
     assert result["kernel_cycles"] == 40
     assert result["nonkernel_cycles"] == 50
-    assert result["exclusive_cycles"]["scalar_fill_slots"] == 15
-    assert result["exclusive_cycles"]["scalar_atomic_claim"] == 5
+    assert result["exclusive_cycles"]["scalar_fill_own_slots"] == 15
+    assert result["exclusive_cycles"]["scalar_atomic_cas"] == 5
     assert result["exclusive_cycles"]["scalar_unattributed"] == 30
     assert sum(result["exclusive_cycles"].values()) == 90
 
@@ -96,9 +96,9 @@ def test_nested_intervals_conserve_time_without_counting_parents_twice():
 @pytest.mark.parametrize(
     "children",
     [
-        [record("scalar_fill_slots", 15, 40, 1), record("scalar_seal", 30, 45, 1)],
-        [record("scalar_fill_slots", 15, 40, 1), record("scalar_atomic_claim", 35, 45, 2)],
-        [record("scalar_atomic_claim", 15, 20, 3)],
+        [record("scalar_fill_own_slots", 15, 40, 1), record("scalar_seal", 30, 45, 1)],
+        [record("scalar_fill_own_slots", 15, 40, 1), record("scalar_atomic_cas", 35, 45, 2)],
+        [record("scalar_atomic_cas", 15, 20, 3)],
     ],
 )
 def test_overlaps_escaped_children_and_missing_parents_are_rejected(children):
@@ -110,14 +110,14 @@ def test_equal_endpoints_and_zero_duration_do_not_invent_time():
     result = partition(
         [
             window(),
-            record("scalar_fill_slots", 20, 30, 1),
-            record("scalar_atomic_claim", 20, 30, 2),
+            record("scalar_fill_own_slots", 20, 30, 1),
+            record("scalar_atomic_cas", 20, 30, 2),
             record("scalar_seal", 30, 30, 1),
         ],
         [],
     )
-    assert result["exclusive_cycles"].get("scalar_fill_slots", 0) == 0
-    assert result["exclusive_cycles"]["scalar_atomic_claim"] == 10
+    assert result["exclusive_cycles"].get("scalar_fill_own_slots", 0) == 0
+    assert result["exclusive_cycles"]["scalar_atomic_cas"] == 10
     assert result["exclusive_cycles"]["scalar_unattributed"] == 80
 
 
@@ -146,8 +146,8 @@ def test_common_converter_draws_one_typed_scalar_hierarchy(tmp_path, level):
     )
     for kind, begin, end, depth in [
         ("scalar_window", 10, 100, 0),
-        ("scalar_fill_slots", 15, 30, 1),
-        ("scalar_atomic_claim", 20, 25, 2),
+        ("scalar_fill_own_slots", 15, 30, 1),
+        ("scalar_atomic_cas", 20, 25, 2),
         ("scalar_seal", 75, 90, 1),
     ]:
         metrics = {"scalar_depth": depth, "scalar_calls": 1}
@@ -189,7 +189,7 @@ def test_common_converter_draws_one_typed_scalar_hierarchy(tmp_path, level):
     assert json.loads(output.read_text())["metadata"]["scalar_detail_display"]["all_events_retained"]
     by_name = {e["name"]: e for e in detail}
     assert "idle" not in by_name
-    parent, child = by_name["scheduler_fill_own_slots"], by_name["scheduler_gm_compare_exchange (return ready)"]
+    parent, child = by_name["scheduler_fill_own_slots"], by_name["atomicCAS: return ready"]
     assert parent["ts"] <= child["ts"] < child["ts"] + child["dur"] <= parent["ts"] + parent["dur"]
     assert "window" not in by_name
     assert data["scalar_profiles"][0]["window_cycles"] == 90
@@ -214,13 +214,15 @@ def test_predicated_skip_is_not_counted_as_kernel_execution():
     [
         ("scalar_execution_token_refill", "scheduler_refill_execution_tokens"),
         ("scalar_prepared_acquire", "scheduler_acquire_execution_token"),
+        ("scalar_prepared_claim", "scheduler_claim_execution_token"),
+        ("scalar_counter_accounting", "scheduler_service_counter_accounting"),
         ("scalar_cooperative_discover", "scheduler_discover_cooperative_task"),
         ("scalar_cluster_mix_service", "scheduler_cluster_mix_service"),
         ("scalar_group_acquire", "scheduler_acquire_group_lane"),
         ("scalar_cluster_mix_needs_service", "scheduler_cluster_mix_needs_service"),
         ("scalar_execution_continuation", "scheduler_try_execution_continuation"),
         ("scalar_execution_token_fanin", "scheduler_execution_token_observe_fanin"),
-        ("scalar_ordered_poll", "scheduler_ordered_poll_may_progress"),
+        ("scalar_ordered_poll", "scheduler_observe_ordered_progress"),
         ("scalar_admission_claim", "scheduler_stage_admission_candidate"),
         ("scalar_admission_publish", "scheduler_ordered_publish_pending"),
         ("scalar_admission_commit", "scheduler_try_commit_admission"),
@@ -233,21 +235,21 @@ def test_predicated_skip_is_not_counted_as_kernel_execution():
         ("scalar_dispatch_metadata", "scheduler_load_dispatch_metadata"),
         ("scalar_dispatch_fill", "scheduler_fill_dispatch_slot"),
         ("scalar_dispatch_publish", "scheduler_publish_dispatch_slot"),
-        ("scalar_inline_complete", "scheduler_complete_inline_task"),
         ("scalar_cursor_validate", "scheduler_read_claim_cursor: validate context"),
         ("scalar_claim_seal_probe", "scheduler_read_claim_cursor: claim_seal hint"),
         ("scalar_claim_seal_confirm", "scheduler_read_claim_cursor: claim_seal atomic confirm"),
         ("scalar_next_block_probe", "scheduler_read_claim_cursor: next_block hint"),
         ("scalar_next_block_confirm", "scheduler_read_claim_cursor: next_block atomic confirm"),
-        ("scalar_poll_local_state", "scheduler_ordered_poll_may_progress: local state"),
-        ("scalar_poll_ready_queue", "scheduler_ordered_poll_may_progress: ready queue"),
-        ("scalar_poll_ready_pool", "scheduler_ready_pool_may_have_work"),
-        ("scalar_poll_admission_tail", "scheduler_ordered_poll_may_progress: admission commit_tail"),
-        ("scalar_poll_mix_state", "scheduler_ordered_poll_may_progress: MIX state"),
-        ("scalar_poll_mix_close_seal", "scheduler_ordered_poll_may_progress: MIX close seal"),
-        ("scalar_poll_mix_assignment", "scheduler_ordered_poll_may_progress: MIX assigned_seq"),
-        ("scalar_poll_mix_arrived", "scheduler_ordered_poll_may_progress: MIX arrived_seq"),
-        ("scalar_poll_mix_released", "scheduler_ordered_poll_may_progress: MIX released_seq"),
+        ("scalar_poll_local_state", "scheduler_observe_ordered_progress: local state"),
+        ("scalar_poll_admission_tail", "scheduler_observe_ordered_progress: admission commit_tail"),
+        ("scalar_poll_mix_state", "scheduler_observe_ordered_progress: MIX state"),
+        ("scalar_poll_mix_close", "scheduler_observe_ordered_progress: MIX coordinator frontier"),
+        ("scalar_poll_mix_assignment", "scheduler_observe_ordered_progress: MIX assigned_seq"),
+        (
+            "scalar_poll_mix_arrived",
+            "scheduler_observe_ordered_progress: MIX arrival readiness (GM ACK or SSBUF permit)",
+        ),
+        ("scalar_poll_mix_released", "scheduler_observe_ordered_progress: MIX released_seq"),
         ("scalar_trace_finish", "SchedulerScalarTrace::finish"),
         ("scalar_trace_finish_clean", "SchedulerScalarTrace::finish: DCCI issue"),
         ("scalar_trace_finish_barrier", "SchedulerScalarTrace::finish: DSB"),
@@ -259,7 +261,7 @@ def test_fill_detail_roundtrips_nested_function_names_and_task_identity(tmp_path
     )
     for kind, begin, end, depth in [
         ("scalar_window", 10, 100, 0),
-        ("scalar_fill_slots", 15, 35, 1),
+        ("scalar_fill_own_slots", 15, 35, 1),
         ("scalar_ordered_fill", 16, 34, 2),
         (phase, 20, 25, 3),
     ]:

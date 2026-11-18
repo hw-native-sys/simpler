@@ -27,11 +27,12 @@
  *   - `percounter_gm_read` is a bypass load. It does observe the writing
  *     core's own atomic write, but across cores it can lag.
  *   - `percounter_gm_fetch_add` adding zero is a read-modify-write, which
- *     does not lag. `percounter_gate_read` in the lane loop is that read
- *     followed by the fence.
+ *     does not lag; the atomic operation still needs an ordering fence when
+ *     its result is combined with another publication.
  *   - Neither orders a *pair* of reads. Two GM reads are two samples, not one
  *     snapshot, and only a barrier between them makes the second no older
- *     than the first -- see `percounter_observe_fence` in the lane loop.
+ *     than the first. Callers use publication or cache-observation barriers
+ *     before consuming dependent metadata or tensor values.
  */
 
 #pragma once
@@ -63,6 +64,16 @@ static inline __aicore__ uint64_t percounter_gm_atomic_fetch_add(__gm__ volatile
 }
 #endif
 
+static inline __aicore__ void percounter_memory_barrier() {
+    simpler::percounter::percounter_scalar_memory_issue(simpler::percounter::ProfilePhase::DsbAll, 1, []() __aicore__ {
+#if defined(__CCE_AICORE__)
+        dsb((mem_dsb_t)0);
+#else
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+    });
+}
+
 /** Invalidate one line, then wait for it, so the next read sees publication. */
 static inline __aicore__ void percounter_observe_cache_line(__gm__ void *address) {
     simpler::percounter::percounter_scalar_memory_issue(
@@ -74,20 +85,14 @@ static inline __aicore__ void percounter_observe_cache_line(__gm__ void *address
 #endif
         }
     );
-    simpler::percounter::percounter_scalar_memory_issue(simpler::percounter::ProfilePhase::DsbAll, 1, []() __aicore__ {
-#if defined(__CCE_AICORE__)
-        dsb((mem_dsb_t)0);
-#else
-        __atomic_thread_fence(__ATOMIC_SEQ_CST);
-#endif
-    });
+    percounter_memory_barrier();
 }
 
 static inline __aicore__ void percounter_observe_cache_line(volatile __gm__ void *address) {
     percounter_observe_cache_line(const_cast<__gm__ void *>(address));
 }
 
-/** The same for the whole data cache, before reading a producer's output. */
+/** Invalidate the whole data cache at a run boundary. */
 static inline __aicore__ void percounter_observe_data_cache(__gm__ void *address) {
     simpler::percounter::percounter_scalar_memory_issue(
         simpler::percounter::ProfilePhase::DcciEntire, 1, [=]() __aicore__ {
@@ -98,13 +103,7 @@ static inline __aicore__ void percounter_observe_data_cache(__gm__ void *address
 #endif
         }
     );
-    simpler::percounter::percounter_scalar_memory_issue(simpler::percounter::ProfilePhase::DsbAll, 1, []() __aicore__ {
-#if defined(__CCE_AICORE__)
-        dsb((mem_dsb_t)0);
-#else
-        __atomic_thread_fence(__ATOMIC_SEQ_CST);
-#endif
-    });
+    percounter_memory_barrier();
 }
 
 /** A bypass load: cheap, and behind by at most one publication. */
@@ -149,20 +148,17 @@ static inline __aicore__ uint32_t percounter_gm_read(__gm__ volatile uint32_t &v
     );
 }
 
-/** Two adjacent 32-bit fields as one word, so neither can tear from the other. */
-static inline __aicore__ uint64_t
-percounter_gm_read_u32_pair(__gm__ volatile uint32_t *values, int order = __ATOMIC_ACQUIRE) {
+/** Eight immutable metadata bytes; the device observes the Host-published word through GM. */
+static inline __aicore__ uint64_t percounter_gm_read_immutable_word(const __gm__ void *address) {
     return simpler::percounter::percounter_scalar_memory_result(
         simpler::percounter::ProfilePhase::BypassLoad, [=]() __aicore__ {
 #if defined(__CCE_AICORE__)
-            (void)order;
-            __gm__ uint32_t *first = const_cast<__gm__ uint32_t *>(values);
-            __gm__ uint64_t *address = reinterpret_cast<__gm__ uint64_t *>(first);
-            return static_cast<uint64_t>(__builtin_cce_ld_dev(address, 0));
+            auto *word = reinterpret_cast<const __gm__ uint64_t *>(address);
+            return static_cast<uint64_t>(__builtin_cce_ld_dev(const_cast<__gm__ uint64_t *>(word), 0));
 #else
-            const uint64_t low = __atomic_load_n(&values[0], order);
-            const uint64_t high = __atomic_load_n(&values[1], order);
-            return low | (high << 32);
+            uint64_t value;
+            __builtin_memcpy(&value, address, sizeof(value));
+            return value;
 #endif
         }
     );
@@ -276,31 +272,4 @@ static inline __aicore__ uint64_t percounter_gm_compare_exchange(
 #endif
         }
     );
-}
-
-/**
- * Push a whole dispatch payload out, line by line.
- *
- * A lane fills and runs its own payload, but the kernel reads its arguments
- * from GM with ordinary loads, so what this lane wrote has to leave the
- * core's cache first. The payload spans several lines, hence the loop.
- */
-static inline __aicore__ void percounter_writeback_dispatch_payload(__gm__ DispatchPayload *payload) {
-    for (uint64_t offset = 0; offset < sizeof(DispatchPayload); offset += 64) {
-        simpler::percounter::percounter_scalar_memory_issue(
-            simpler::percounter::ProfilePhase::DcciOut, 1, [payload, offset]() __aicore__ {
-#if defined(__CCE_AICORE__)
-                dcci(reinterpret_cast<__gm__ uint8_t *>(payload) + offset, SINGLE_CACHE_LINE, CACHELINE_OUT);
-#else
-                (void)payload;
-                (void)offset;
-#endif
-            }
-        );
-    }
-    simpler::percounter::percounter_scalar_memory_issue(simpler::percounter::ProfilePhase::DsbAll, 1, []() __aicore__ {
-#if defined(__CCE_AICORE__)
-        dsb((mem_dsb_t)0);
-#endif
-    });
 }

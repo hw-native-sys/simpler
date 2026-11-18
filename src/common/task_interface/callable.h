@@ -47,6 +47,7 @@
 #include "arg_direction.h"
 #include "callable_limits.h"
 #include "ccu_module_package.h"
+#include "core_async_capability.h"
 
 inline constexpr uint32_t CHIP_CALLABLE_WIRE_VERSION = 1U;
 
@@ -76,6 +77,7 @@ struct Callable<void, MaxSig, 0> {
     int32_t sig_count_;
     uint32_t binary_size_;
     uint64_t resolved_addr_;
+    CoreAsyncCapability async_capability_;
     char storage_[];
 
     ArgDirection sig(int32_t i) const {
@@ -86,6 +88,7 @@ struct Callable<void, MaxSig, 0> {
     uint32_t binary_size() const { return binary_size_; }
     uint64_t resolved_addr() const { return resolved_addr_; }
     void set_resolved_addr(uint64_t addr) { resolved_addr_ = addr; }
+    CoreAsyncCapability async_capability() const { return async_capability_; }
 
     // Binary data is placed at the next CALLABLE_ALIGN boundary after the fixed fields.
     // storage_ sits between the fixed fields and the aligned binary; binary_data()
@@ -101,8 +104,10 @@ private:
     Callable() = default;
 
     template <int MS>
-    friend std::vector<uint8_t>
-    make_callable(const ArgDirection *sig, int32_t sig_count, const void *binary, uint32_t binary_size);
+    friend std::vector<uint8_t> make_callable(
+        const ArgDirection *sig, int32_t sig_count, const void *binary, uint32_t binary_size,
+        const CoreAsyncCapability &capability
+    );
 };
 
 // ============================================================================
@@ -242,8 +247,11 @@ static_assert(offsetof(CoreCallable, signature_) == 0, "CoreCallable wire ABI: s
 static_assert(offsetof(CoreCallable, sig_count_) == 128, "CoreCallable wire ABI: sig_count offset changed");
 static_assert(offsetof(CoreCallable, binary_size_) == 132, "CoreCallable wire ABI: binary_size offset changed");
 static_assert(offsetof(CoreCallable, resolved_addr_) == 136, "CoreCallable wire ABI: resolved_addr offset changed");
-static_assert(offsetof(CoreCallable, storage_) == 144, "CoreCallable wire ABI: storage offset changed");
-static_assert(sizeof(CoreCallable) == 144, "CoreCallable wire ABI: header size changed");
+static_assert(
+    offsetof(CoreCallable, async_capability_) == 144, "CoreCallable wire ABI: async capability offset changed"
+);
+static_assert(offsetof(CoreCallable, storage_) == 152, "CoreCallable wire ABI: storage offset changed");
+static_assert(sizeof(CoreCallable) == 152, "CoreCallable wire ABI: header size changed");
 static_assert(CoreCallable::binary_data_offset() == 192, "CoreCallable wire ABI: binary data offset changed");
 
 // ============================================================================
@@ -251,8 +259,11 @@ static_assert(CoreCallable::binary_data_offset() == 192, "CoreCallable wire ABI:
 // ============================================================================
 
 template <int MaxSig>
-std::vector<uint8_t>
-make_callable(const ArgDirection *sig, int32_t sig_count, const void *binary, uint32_t binary_size) {
+std::vector<uint8_t> make_callable(
+    const ArgDirection *sig, int32_t sig_count, const void *binary, uint32_t binary_size,
+    const CoreAsyncCapability &capability
+) {
+    const auto normalized_capability = normalize_core_async_capability(capability);
     if (sig_count > MaxSig) {
         throw std::invalid_argument(
             "make_callable: requested tensor count " + std::to_string(sig_count) + " exceeds supported tensor count " +
@@ -274,9 +285,18 @@ make_callable(const ArgDirection *sig, int32_t sig_count, const void *binary, ui
     obj->sig_count_ = sig_count;
     obj->binary_size_ = binary_size;
     obj->resolved_addr_ = 0;
+    obj->async_capability_ = normalized_capability;
     if (binary_size > 0) std::memcpy(buf.data() + aligned_header, binary, binary_size);
 
     return buf;
+}
+
+// Legacy callers do not declare async capability. Reserve the full deferred
+// contract rather than infer that their kernel is synchronous.
+template <int MaxSig>
+std::vector<uint8_t>
+make_callable(const ArgDirection *sig, int32_t sig_count, const void *binary, uint32_t binary_size) {
+    return make_callable<MaxSig>(sig, sig_count, binary, binary_size, CoreAsyncCapability{});
 }
 
 // ============================================================================
@@ -358,6 +378,8 @@ std::vector<uint8_t> make_callable(
     return buf;
 }
 
+inline void normalize_chip_callable_buffer(void *raw, size_t size);
+
 inline std::vector<uint8_t> make_chip_callable(
     const ArgDirection *sig, int32_t sig_count, const char *func_name, const void *binary, uint32_t binary_size,
     const int32_t *child_func_ids, const std::vector<uint8_t> *child_buffers, int32_t child_count,
@@ -377,6 +399,7 @@ inline std::vector<uint8_t> make_chip_callable(
         callable->ccu_modules_offset_ = static_cast<uint32_t>(offset);
         callable->ccu_modules_size_ = static_cast<uint32_t>(package.size());
     }
+    normalize_chip_callable_buffer(buffer.data(), buffer.size());
     return buffer;
 }
 
@@ -418,6 +441,7 @@ inline void validate_chip_callable_buffer(const void *raw, size_t size) {
             child.binary_size_ > storage_size - offset - CoreCallable::binary_data_offset())
             throw std::invalid_argument("invalid CoreCallable header fields");
         validate_signature(child.signature_, child.sig_count_);
+        (void)normalize_core_async_capability(child.async_capability());
         end = offset + CoreCallable::binary_data_offset() + child.binary_size_;
     }
     if (callable->ccu_modules_size_ != 0) {
@@ -430,4 +454,15 @@ inline void validate_chip_callable_buffer(const void *raw, size_t size) {
         throw std::invalid_argument("empty ChipCallable CCU module table has nonzero offset");
     }
     if (end != storage_size) throw std::invalid_argument("ChipCallable has trailing bytes");
+}
+
+// Only call on owned storage. Validate the entire image before writing any
+// child, so malformed input never leaves a partially normalized artifact.
+inline void normalize_chip_callable_buffer(void *raw, size_t size) {
+    validate_chip_callable_buffer(raw, size);
+    auto *callable = static_cast<ChipCallable *>(raw);
+    for (int32_t i = 0; i < callable->child_count(); ++i) {
+        auto &child = const_cast<CoreCallable &>(callable->child(i));
+        child.async_capability_ = normalize_core_async_capability(child.async_capability());
+    }
 }

@@ -9,6 +9,17 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include "scheduler/scheduler_scalar_policy.h"
+
+namespace {
+template <>
+struct SchedulerScalarCompilation<void> {
+    static constexpr bool enabled = true;
+};
+}  // namespace
+
+#include "inner_kernel.h"
+
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -16,12 +27,39 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <functional>
+#include <type_traits>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "async_completion_plan.h"
+#include "scheduler/scheduler_memory.h"
+
+namespace {
+thread_local std::function<void(volatile uint64_t *)> async_query_observer;
+
+template <typename T>
+T observe_async_query(volatile T &word, int order = __ATOMIC_ACQUIRE) {
+    if constexpr (std::is_same_v<T, uint64_t>)
+        if (async_query_observer) async_query_observer(&word);
+    return scheduler_gm_query(word, order);
+}
+
+class ScopedAsyncQueryObserver {
+public:
+    explicit ScopedAsyncQueryObserver(std::function<void(volatile uint64_t *)> observer) {
+        async_query_observer = std::move(observer);
+    }
+    ~ScopedAsyncQueryObserver() { async_query_observer = {}; }
+};
+}  // namespace
+
+#define scheduler_gm_query observe_async_query
+#include "scheduler/scheduler_async_control.h"
+#undef scheduler_gm_query
+
 #include "hbg_scheduler_test_support.h"
 #include "scheduler/scheduler_completion.h"
 #include "scheduler/scheduler_async_finish.h"
@@ -124,14 +162,12 @@ struct AsyncFixture {
         auto *state = local(worker);
         auto &slot = state->slots[0];
         ASSERT_EQ(scheduler_gm_fetch_add(task_control(slot.task_ref)->next_block, UINT64_C(1)), slot.block_idx);
-        ASSERT_EQ(
-            scheduler_acquire_execution_token(
-                base(), state->config.prepared, worker, slot.task_ref, slot.block_idx, slot.subtask_slot, &slot.prepared
-            ),
-            PreparedAccessResult::READY
-        );
+        ASSERT_TRUE(scheduler_acquire_execution_token(
+            base(), state->config.prepared, worker, slot.task_ref, slot.block_idx, slot.subtask_slot, &slot.prepared
+        ));
         ASSERT_TRUE(scheduler_close_ordinary_supply(
-            graph.graph(), base(), state, storage.run_control, slot.task_ref, slot.block_idx,
+            graph.graph(), base(), state, storage.run_control, slot.task_ref,
+            slot.block_idx + 1 == storage.metadata[slot.task_ref].logical_block_num,
             storage.metadata[slot.task_ref].logical_block_num
         ));
     }
@@ -161,8 +197,8 @@ struct AsyncFixture {
     SchedulerAsyncLease &group_lease(uint32_t index = 0) {
         return scheduler_state_at<SchedulerAsyncLease>(base(), plan.layout.group_leases_offset)[index];
     }
-    SchedulerAsyncLease &finish_lease(uint32_t index = 0) {
-        return scheduler_state_at<SchedulerAsyncLease>(base(), plan.layout.finish_leases_offset)[index];
+    bool done(int64_t task = 0) {
+        return scheduler_completion_done(scheduler_gm_fetch_add(task_control(task)->completion_state, UINT64_C(0)));
     }
 
     AsyncWriter start(int64_t task_ref = 0, uint32_t block = 0, uint32_t lane = 0, uint32_t worker = 0) {
@@ -185,12 +221,17 @@ struct AsyncFixture {
 
     bool check(uint32_t worker = 0, uint32_t budget = 8) {
         bool progress = false;
+        SchedulerAsyncCompletion completion{};
         EXPECT_TRUE(scheduler_async_check_step(
-            workers[worker], worker == 0 ? 1 : 2, budget, SchedulerAsyncCompletionObserver{}, progress
+            workers[worker], worker == 0 ? 1 : 2, budget, SchedulerAsyncCompletionObserver{}, progress, completion
         ));
+        if (completion.result == SchedulerAsyncCompletionResult::FINISH_OWNER)
+            EXPECT_TRUE(
+                scheduler_async_complete_task(graph.graph(), base(), local(worker), storage.run_control, completion)
+            );
         return progress;
     }
-    SchedulerSubtaskFinishResult return_next(int64_t task, SchedulerLocalState *state) {
+    SchedulerSubtaskFinishResult return_next(int64_t task, SchedulerLocalState *state, uint64_t *gate = nullptr) {
         const auto word = scheduler_gm_query(task_control(task)->completion_state);
         const auto &metadata = storage.metadata[task];
         const uint32_t returned = scheduler_completion_count(word);
@@ -205,7 +246,7 @@ struct AsyncFixture {
                 break;
             }
         }
-        return scheduler_contribute_subtask<false>(graph.graph(), base(), state, storage.run_control, slot, 0);
+        return scheduler_contribute_subtask<false>(graph.graph(), base(), state, storage.run_control, slot, 0, gate);
     }
     // close_computation is called by the last physical return. Drive that
     // precondition through the real counter operation, once per remaining unit.
@@ -215,21 +256,51 @@ struct AsyncFixture {
         }
         return true;
     }
-    bool close(uint32_t worker = 0, int64_t task = 0, bool *held = nullptr) {
+    bool close(uint32_t worker = 0, int64_t task = 0, SchedulerAsyncCompletionResult *result = nullptr) {
         if (!return_remaining(task, local(worker))) return false;
-        bool deferred = false;
-        const bool ok = scheduler_async_close_computation(&workers[worker], task, deferred);
-        if (held != nullptr) *held = deferred;
-        return ok;
-    }
-    bool finish(uint32_t worker = 0) {
-        bool progress = false;
-        EXPECT_TRUE(scheduler_async_finish_step(
-            graph.graph(), base(), local(worker), storage.run_control, workers[worker], progress
-        ));
-        return progress;
+        const auto completion =
+            scheduler_async_close_computation(&workers[worker], task, task_control(task)->completion_state);
+        if (result != nullptr) *result = completion.result;
+        if (completion.result == SchedulerAsyncCompletionResult::FINISH_OWNER)
+            return scheduler_async_complete_task(graph.graph(), base(), local(worker), storage.run_control, completion);
+        return completion.result != SchedulerAsyncCompletionResult::ERROR;
     }
 };
+
+TEST(HbgAsyncControl, DeferredCloseConsumesTheReturnProofWithoutRereadingGateOrJoin) {
+    for (const bool condition_ready : {false, true}) {
+        AsyncFixture f(1);
+        f.register_counter(f.start(), 1);
+        ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
+        if (condition_ready) {
+            f.signal[0] = 1;
+            ASSERT_TRUE(f.check(1));
+        }
+        ASSERT_TRUE(f.return_remaining(0, f.local(2)));
+        const uint64_t gate = f.task_control(0)->completion_state;
+        uint32_t reads = 0;
+        SchedulerAsyncCompletion completion;
+        {
+            ScopedAsyncQueryObserver observer([&](volatile uint64_t *word) {
+                if (word == &f.task_control(0)->completion_state || word == &f.join().word) ++reads;
+            });
+            completion = scheduler_async_close_computation(&f.workers[2], 0, gate);
+        }
+        EXPECT_EQ(reads, 0u);
+        ASSERT_TRUE(scheduler_async_pending::closed(f.join().word));
+        if (condition_ready) {
+            ASSERT_EQ(completion.result, SchedulerAsyncCompletionResult::FINISH_OWNER);
+            ASSERT_TRUE(
+                scheduler_async_complete_task(f.graph.graph(), f.base(), f.local(2), f.storage.run_control, completion)
+            );
+        } else {
+            ASSERT_EQ(completion.result, SchedulerAsyncCompletionResult::WAITING);
+            f.signal[0] = 1;
+            ASSERT_TRUE(f.check(1));
+        }
+        EXPECT_TRUE(f.done());
+    }
+}
 
 TEST(HbgAsyncControl, HostPreboundEntryUsesExactGroupWithoutRegisteringCredit) {
     for (uint32_t corrupt = 0; corrupt < 3; ++corrupt) {
@@ -249,7 +320,6 @@ TEST(HbgAsyncControl, HostPreboundEntryUsesExactGroupWithoutRegisteringCredit) {
         EXPECT_EQ(f.task_control(0)->completion_state, completion_before);
         EXPECT_EQ(f.join().word, 0u);
         EXPECT_EQ(f.group_lease(1).word, kUnused);
-        EXPECT_EQ(f.finish_lease().word, kUnused);
         if (corrupt != 0) {
             EXPECT_EQ(writer.image, nullptr);
             continue;
@@ -295,7 +365,6 @@ TEST(HbgAsyncControl, BoundExecutionRejectsChangedRunOrStorageBeforePublishing) 
         EXPECT_FALSE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, writer));
         EXPECT_EQ(scheduler_async_pending::registered(f.join().word), 0u);
         EXPECT_EQ(f.group_lease().word, kUnused);
-        EXPECT_EQ(f.finish_lease().word, kUnused);
     }
 }
 
@@ -309,6 +378,122 @@ TEST(HbgAsyncControl, BoundExecutionStillChecksTaskBlockAndLaneOnReturn) {
         ));
         EXPECT_EQ(scheduler_async_pending::registered(f.join().word), 0u);
         EXPECT_EQ(f.group_lease().word, kUnused);
+    }
+}
+
+TEST(HbgAsyncControl, CapableZeroConditionGroupStillPublishesItsReservedQAtPhysicalReturn) {
+    AsyncFixture f(1);
+    uint32_t run_completed = 0;
+    f.storage.run_control->run_completed_read_address = reinterpret_cast<uint64_t>(&run_completed);
+    f.storage.run_control->run_completed_add_address = reinterpret_cast<uint64_t>(&run_completed);
+    uint32_t count = 0;
+    auto *counter =
+        scheduler_state_at<SchedulerTaskCompletionCounter>(f.base(), f.storage.layout.completion_counters_offset);
+    counter[0] = {reinterpret_cast<uint64_t>(&count), reinterpret_cast<uint64_t>(&count), 2, 2};
+    f.storage.contexts[0].completion_counters_offset = f.storage.layout.completion_counters_offset;
+    f.workers[0].completion_counters_offset = f.storage.layout.completion_counters_offset;
+    const auto writer = f.start();
+    bool deferred = true;
+    ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, writer, &deferred));
+    EXPECT_FALSE(deferred);
+    auto &slot = f.local()->slots[0];
+    slot.task_ref = 0;
+    slot.block_idx = 0;
+    slot.subtask_slot = 0;
+    slot.state = SchedulerDispatchSlotState::EXECUTING;
+    slot.completion_credits = 2;  // Has a reserved group, but it sealed empty.
+    f.bind_package();
+    slot.execution_token = true;
+    ASSERT_TRUE(
+        (scheduler_complete_own_slot<false, true>(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0))
+    );
+    EXPECT_EQ(count, 2u);
+    EXPECT_EQ(scheduler_completion_counter_observe(counter[0]), 1);
+    EXPECT_FALSE(f.check());
+    EXPECT_EQ(f.join().word, 0u);
+}
+
+TEST(HbgAsyncControl, AddConditionsBeforeOrAfterPhysicalReturnNeedNoGlobalJoinOrAccountingToReleaseFanin) {
+    for (bool condition_first : {false, true}) {
+        SCOPED_TRACE(condition_first);
+        AsyncFixture f;
+        uint32_t run_completed = 0;
+        f.storage.run_control->run_completed_read_address = reinterpret_cast<uint64_t>(&run_completed);
+        f.storage.run_control->run_completed_add_address = reinterpret_cast<uint64_t>(&run_completed);
+        f.graph.executable(1, 0, {0});
+        ASSERT_TRUE(f.storage.prepare_calls(f.graph.graph()));
+        uint32_t count = 0;
+        auto *counters =
+            scheduler_state_at<SchedulerTaskCompletionCounter>(f.base(), f.storage.layout.completion_counters_offset);
+        counters[0] = {reinterpret_cast<uint64_t>(&count), reinterpret_cast<uint64_t>(&count), 2, 2};
+        for (uint32_t worker = 0; worker < 3; ++worker) {
+            f.storage.contexts[worker].completion_counters_offset = f.storage.layout.completion_counters_offset;
+            f.local(worker)->config.completion_counters_offset = f.storage.layout.completion_counters_offset;
+            f.workers[worker].completion_counters_offset = f.storage.layout.completion_counters_offset;
+        }
+        const auto writer = f.start();
+        f.register_counter(writer);
+        bool deferred = false;
+        ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, writer, &deferred));
+        EXPECT_TRUE(deferred);
+        EXPECT_EQ(f.join().word, 0u);
+        EXPECT_EQ(f.task_control(0)->completion_state, scheduler_completion_initial_state(1));
+        if (condition_first) {
+            f.signal[0] = 1;
+            ASSERT_TRUE(f.check(1));
+            EXPECT_EQ(count, 1u);
+            EXPECT_EQ(
+                scheduler_observe_cached_completion(f.base(), f.local(), 0), SchedulerCompletionObservation::PENDING
+            );
+        }
+        auto &slot = f.local()->slots[0];
+        slot.task_ref = 0;
+        slot.block_idx = 0;
+        slot.subtask_slot = 0;
+        slot.state = SchedulerDispatchSlotState::EXECUTING;
+        slot.completion_credits = 1;
+        f.bind_package();
+        slot.execution_token = true;
+        const auto returned = slot.prepared;
+        ASSERT_TRUE((
+            scheduler_complete_own_slot<false, true>(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0)
+        ));
+        EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FREE);
+        EXPECT_EQ(
+            scheduler_prepared_phase(
+                scheduler_prepared_control_at(f.base(), f.local()->config.prepared, returned.execution_index)->state
+            ),
+            SchedulerPreparedPhase::RETURNED
+        );
+        // Retirement is explicit; it must not need the delayed canonical task proof.
+        EXPECT_FALSE(scheduler_prepared_already_returned(f.base(), f.local()->config.prepared, returned));
+        auto duplicate = returned;
+        EXPECT_FALSE(scheduler_return_prepared_execution(f.base(), f.local()->config.prepared, &duplicate));
+        EXPECT_EQ(f.join().word, 0u);
+        EXPECT_FALSE(f.done());
+        if (!condition_first) {
+            EXPECT_EQ(count, 1u);
+            EXPECT_FALSE(f.check(1));
+            uint32_t blocked_slot = UINT32_MAX;
+            ASSERT_TRUE(f.next_execution(&blocked_slot));
+            EXPECT_EQ(blocked_slot, UINT32_MAX);
+            f.signal[0] = 1;
+            EXPECT_TRUE(f.check(2));
+        }
+        EXPECT_EQ(count, 2u);
+        EXPECT_FALSE(f.check(1));
+        EXPECT_EQ(count, 2u);
+        int64_t ready = -1;
+        ASSERT_TRUE(f.select_execution(&ready));
+        EXPECT_EQ(ready, 1);
+        EXPECT_FALSE(f.done());
+        bool progress = false;
+        ASSERT_TRUE(
+            scheduler_service_counter_accounting(f.graph.graph(), f.base(), f.local(), f.storage.run_control, &progress)
+        );
+        EXPECT_TRUE(progress);
+        EXPECT_TRUE(f.done());
+        EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
     }
 }
 
@@ -344,9 +529,10 @@ TEST(HbgAsyncControl, ReturnedExecutionReleasesSlotButCannotReleaseConsumerBefor
         scheduler_completion_task_state(f.task_control(0)->completion_state),
         static_cast<int64_t>(SchedulerTaskState::BLOCKED)
     );
+    EXPECT_NE(scheduler_cached_task_proof(f.local(), 0), SchedulerTaskProof::DONE);
     EXPECT_FALSE(f.check(1));
-    EXPECT_FALSE(f.finish(2));
-    EXPECT_EQ(f.local()->pending_completed, 0u);
+    EXPECT_FALSE(f.check(2));
+    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 0u);
     uint32_t blocked_slot = UINT32_MAX;
     ASSERT_TRUE(f.next_execution(&blocked_slot));
     EXPECT_EQ(blocked_slot, UINT32_MAX);
@@ -355,10 +541,7 @@ TEST(HbgAsyncControl, ReturnedExecutionReleasesSlotButCannotReleaseConsumerBefor
     EXPECT_TRUE(f.check(2));
     EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::TERMINAL);
     EXPECT_TRUE(scheduler_async_pending::ready_to_finish(f.join().word));
-    for (uint32_t step = 0;
-         step < 100 && scheduler_async_lease_phase(f.finish_lease().word) != SchedulerAsyncPhase::TERMINAL; ++step)
-        f.finish(step % 3);
-    EXPECT_EQ(scheduler_async_lease_phase(f.finish_lease().word), SchedulerAsyncPhase::TERMINAL);
+    EXPECT_TRUE(f.done());
     EXPECT_EQ(
         scheduler_completion_task_state(f.task_control(0)->completion_state),
         static_cast<int64_t>(SchedulerTaskState::DONE)
@@ -366,12 +549,9 @@ TEST(HbgAsyncControl, ReturnedExecutionReleasesSlotButCannotReleaseConsumerBefor
     int64_t ready = -1;
     EXPECT_TRUE(f.select_execution(&ready));
     EXPECT_EQ(ready, 1);
-    for (uint32_t worker = 0; worker < 3; ++worker)
-        scheduler_flush_completions(f.storage.run_control, f.local(worker));
-    EXPECT_EQ(f.storage.run_control->resolved_task_count, 1u);
-    EXPECT_FALSE(f.finish());
-    scheduler_flush_completions(f.storage.run_control, f.local());
-    EXPECT_EQ(f.storage.run_control->resolved_task_count, 1u);
+    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
+    EXPECT_FALSE(f.check());
+    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
 }
 
 TEST(HbgAsyncControl, ConditionsMaySettleBeforeTheLastPhysicalBlockReleases) {
@@ -384,15 +564,12 @@ TEST(HbgAsyncControl, ConditionsMaySettleBeforeTheLastPhysicalBlockReleases) {
     EXPECT_EQ(f.task_control(0)->completion_state, scheduler_completion_encode(1, 1, 2));
     EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 0u);
     EXPECT_FALSE(scheduler_async_pending::closed(f.join().word));
-    EXPECT_EQ(f.finish_lease().word, kUnused);
-    EXPECT_FALSE(f.finish());
+    EXPECT_FALSE(f.check());
     EXPECT_TRUE(f.close(2));
-    EXPECT_EQ(f.task_control(0)->completion_state, scheduler_completion_encode(1, 0, 1));
-    EXPECT_TRUE(f.finish(1));
-    EXPECT_TRUE(scheduler_completion_done(f.task_control(0)->completion_state));
-    EXPECT_EQ(f.local(1)->pending_completed, 1u);
-    EXPECT_FALSE(f.finish(2));
-    EXPECT_EQ(f.local(2)->pending_completed, 0u);
+    EXPECT_TRUE(f.done());
+    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
+    EXPECT_FALSE(f.check(1));
+    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
 }
 
 TEST(HbgAsyncControl, ZeroConditionSingleExecutionPermitsItsPendingSuccessor) {
@@ -423,10 +600,8 @@ TEST(HbgAsyncControl, ZeroConditionSingleExecutionPermitsItsPendingSuccessor) {
     );
     EXPECT_EQ(f.join().word, 0u);
     EXPECT_EQ(scheduler_async_pending::registered(f.join().word), 0u);
-    EXPECT_EQ(f.finish_lease().word, kUnused);
-    EXPECT_FALSE(f.finish(1));
-    scheduler_flush_completions(f.storage.run_control, f.local());
-    EXPECT_EQ(f.storage.run_control->resolved_task_count, 1u);
+    EXPECT_FALSE(f.check(1));
+    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
 }
 
 TEST(HbgAsyncControl, LastSynchronousReturnHonorsAnEarlierPeersAsyncRegistration) {
@@ -457,7 +632,6 @@ TEST(HbgAsyncControl, LastSynchronousReturnHonorsAnEarlierPeersAsyncRegistration
     EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 1u);
     f.signal[0] = 1;
     ASSERT_TRUE(f.check(0));
-    ASSERT_TRUE(f.finish(0));
     EXPECT_EQ(
         scheduler_completion_task_state(f.task_control(0)->completion_state),
         static_cast<int64_t>(SchedulerTaskState::DONE)
@@ -476,15 +650,14 @@ TEST(HbgAsyncControl, AllZeroMixShapesCloseSynchronouslyWithoutCheckOrFinishWork
                 EXPECT_EQ(f.join().word, 0u);
             }
             EXPECT_FALSE(f.check());
-            EXPECT_FALSE(f.finish());
+            EXPECT_FALSE(f.check());
         }
-        bool deferred = true;
-        ASSERT_TRUE(f.close(0, 0, &deferred));
-        EXPECT_FALSE(deferred);
+        SchedulerAsyncCompletionResult result = SchedulerAsyncCompletionResult::ERROR;
+        ASSERT_TRUE(f.close(0, 0, &result));
+        EXPECT_EQ(result, SchedulerAsyncCompletionResult::NONE);
         EXPECT_TRUE(scheduler_completion_done(f.task_control(0)->completion_state));
         EXPECT_EQ(f.join().word, 0u);
         EXPECT_EQ(scheduler_async_pending::registered(f.join().word), 0u);
-        EXPECT_EQ(f.finish_lease().word, kUnused);
     }
 }
 
@@ -495,7 +668,6 @@ TEST(HbgAsyncControl, OpenReservationFailsSealWithoutRegisteringPendingWork) {
     EXPECT_FALSE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
     EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 0u);
     EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::FAILED);
-    EXPECT_EQ(f.finish_lease().word, kUnused);
 }
 
 TEST(HbgAsyncControl, UnmappedExecutionClearsThePreviousGroupHandle) {
@@ -560,7 +732,6 @@ TEST(HbgAsyncControl, ResidentBoundSealPreservesMutableRegistrationFailures) {
         EXPECT_FALSE(scheduler_async_seal_execution<true>(&f.workers[0], 0, 0, 0, rebuilt));
         EXPECT_EQ(f.workers[0].error_code, expected);
         EXPECT_EQ(scheduler_async_pending::registered(f.join().word), 0u);
-        EXPECT_EQ(f.finish_lease().word, kUnused);
     }
 }
 
@@ -573,7 +744,7 @@ TEST(HbgAsyncControl, ZeroWorkSkipsServiceAndActivationIsVisibleToOtherWorkers) 
         scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(1), f.storage.run_control, 0, progress)
     );
     EXPECT_FALSE(progress);
-    EXPECT_FALSE(f.workers[1].finish_first);
+    EXPECT_EQ(f.workers[1].check_service_countdown, 0u);
     EXPECT_EQ(f.workers[1].business_returns, 0u);
     const auto writer = f.start();
     f.register_counter(writer);
@@ -595,7 +766,7 @@ TEST(HbgAsyncControl, NoActivityCannotMaskALocalRegistrationFailure) {
     );
     EXPECT_FALSE(progress);
     EXPECT_NE(scheduler_read_error(f.storage.run_control), 0u);
-    EXPECT_EQ(f.storage.run_control->resolved_task_count, 0u);
+    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 0u);
 }
 
 TEST(HbgAsyncControl, ColdIdleDiscoveryIsBoundedAndConsumerAcquisitionDoesNotWaitForIt) {
@@ -666,7 +837,7 @@ TEST(HbgAsyncControl, ContinuousBusinessReturnsServiceCheckAndFinishBeforeWorkRu
             scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(1), f.storage.run_control, 0, progress)
         );
         EXPECT_EQ(f.workers[1].business_returns, 0u);
-        if (scheduler_async_lease_phase(f.finish_lease().word) == SchedulerAsyncPhase::TERMINAL) break;
+        if (f.done()) break;
     }
     ASSERT_LT(completed, returns);
     EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::TERMINAL);
@@ -709,9 +880,9 @@ TEST(HbgAsyncControl, UnusedRecordsRemainUntouchedByInitializationAndZeroWaitExe
             ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[lane], 0, block, lane, f.executions[lane]));
         }
     }
-    bool held = true;
-    ASSERT_TRUE(f.close(0, 0, &held));
-    EXPECT_FALSE(held);
+    SchedulerAsyncCompletionResult result = SchedulerAsyncCompletionResult::ERROR;
+    ASSERT_TRUE(f.close(0, 0, &result));
+    EXPECT_EQ(result, SchedulerAsyncCompletionResult::NONE);
     EXPECT_FALSE(scheduler_async_work_activated(&f.workers[0]));
     EXPECT_TRUE(std::all_of(suffix, end, [](uint8_t byte) {
         return byte == 0xa5;
@@ -719,22 +890,91 @@ TEST(HbgAsyncControl, UnusedRecordsRemainUntouchedByInitializationAndZeroWaitExe
 }
 
 TEST(HbgAsyncControl, DuplicateSealCannotReinitializeAnOwnedCheckLease) {
-    AsyncFixture f(1);
-    const auto writer = f.start();
-    f.register_counter(writer);
-    ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
-    ASSERT_EQ(
-        scheduler_async_lease_try_claim(f.group_lease(), f.group_lease().word).result,
-        SchedulerAsyncLeaseResult::SUCCESS
-    );
-    const uint64_t owned = f.group_lease().word;
-    EXPECT_FALSE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
-    EXPECT_EQ(f.group_lease().word, owned);
-    EXPECT_EQ(f.task_control(0)->completion_state, scheduler_completion_encode(1, 1, 2));
-    EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 1u);
+    for (bool mapped : {false, true}) {
+        SCOPED_TRACE(mapped);
+        AsyncFixture f(1);
+        uint32_t notification = 0;
+        if (mapped)
+            scheduler_state_at<SchedulerAsyncDirectoryWord>(f.base(), f.plan.layout.check_directory_offset)[0]
+                .notification_addresses[0] = reinterpret_cast<uint64_t>(&notification);
+        const auto writer = f.start();
+        f.register_counter(writer);
+        ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
+        ASSERT_EQ(
+            scheduler_async_lease_try_claim(f.group_lease(), f.group_lease().word).result,
+            SchedulerAsyncLeaseResult::SUCCESS
+        );
+        const uint64_t owned = f.group_lease().word;
+        EXPECT_FALSE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
+        EXPECT_EQ(f.group_lease().word, owned);
+        EXPECT_EQ(f.task_control(0)->completion_state, scheduler_completion_encode(1, 1, 2));
+        EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 1u);
+    }
 }
 
-TEST(HbgAsyncControl, DifferentConditionCountsKeepOneDebtCreditPerNonemptyGroupUntilFinish) {
+TEST(HbgAsyncControl, MappedDirectoryCannotGrantAnotherCheckAfterTerminalPublication) {
+    AsyncFixture f(1);
+    uint32_t notification = 0, credits = 0;
+    auto *directory = scheduler_state_at<SchedulerAsyncDirectoryWord>(f.base(), f.plan.layout.check_directory_offset);
+    directory[0].notification_addresses[0] = reinterpret_cast<uint64_t>(&notification);
+    auto *counter =
+        scheduler_state_at<SchedulerTaskCompletionCounter>(f.base(), f.storage.layout.completion_counters_offset);
+    counter[0] = {reinterpret_cast<uint64_t>(&credits), reinterpret_cast<uint64_t>(&credits), 2, 2};
+    for (auto &worker : f.workers)
+        worker.completion_counters_offset = f.storage.layout.completion_counters_offset;
+    f.register_counter(f.start(), 0);
+    ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
+    ASSERT_EQ(notification, 1u);
+    ASSERT_TRUE(f.check(1));
+    EXPECT_EQ(notification, 0u);
+    EXPECT_EQ(credits, 1u);
+    EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::TERMINAL);
+    const auto owned = scheduler_async_lease_encode(1, SchedulerAsyncPhase::OWNED);
+    EXPECT_EQ(scheduler_async_lease_finish(f.group_lease(), owned).result, SchedulerAsyncLeaseResult::OWNERSHIP_LOST);
+    notification = 1;  // A reader can still observe the bit before CLR arrives.
+    EXPECT_FALSE(f.check(2));
+    EXPECT_EQ(credits, 1u);
+    EXPECT_EQ(notification, 1u);
+    EXPECT_EQ(f.join().word, 0u);
+}
+
+TEST(HbgAsyncControl, FirstRegistrantWithholdsItsPhysicalReturnUntilTheTaskMarkerExists) {
+    AsyncFixture f(1, {async_task(0, 2)});
+    f.register_counter(f.start(0, 0, 0, 0), 1, 0);
+    bool interleaved = false;
+    uint32_t canonical_reads = 0;
+    {
+        ScopedAsyncQueryObserver observer([&](volatile uint64_t *word) {
+            if (word != &f.task_control(0)->completion_state) return;
+            ++canonical_reads;
+            if (interleaved) return;
+            interleaved = true;
+            ASSERT_EQ(scheduler_async_pending::registered(f.join().word), 1u);
+            f.register_counter(f.start(0, 1, 0, 1), 0, 1);
+            ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[1], 0, 1, 0, f.executions[1]));
+            uint64_t previous = 0;
+            ASSERT_EQ(
+                scheduler_contribute_returns(f.task_control(0), 1, &previous), SchedulerSubtaskFinishResult::PARTIAL
+            );
+            EXPECT_EQ(f.task_control(0)->completion_state, scheduler_completion_encode(2, 1, 1));
+            ASSERT_TRUE(f.check(2));
+            EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 1u);
+            EXPECT_FALSE(f.done());
+        });
+        ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
+    }
+    EXPECT_TRUE(interleaved);
+    EXPECT_EQ(canonical_reads, 1u);
+    EXPECT_EQ(scheduler_async_pending::registered(f.join().word), 2u);
+    EXPECT_EQ(f.task_control(0)->completion_state, scheduler_completion_encode(2, 1, 2));
+    ASSERT_TRUE(f.close());
+    EXPECT_FALSE(f.done());
+    f.signal[0] = 1;
+    ASSERT_TRUE(f.check(1));
+    EXPECT_TRUE(f.done());
+}
+
+TEST(HbgAsyncControl, DifferentConditionCountsShareOneTaskMarkerUntilFinish) {
     AsyncFixture f(1, {async_task(0, 2, LaneMask::aiv0(), 3)});
     const auto first = f.start(0, 0, 1, 1);
     for (uint32_t signal = 0; signal < 3; ++signal)
@@ -743,27 +983,25 @@ TEST(HbgAsyncControl, DifferentConditionCountsKeepOneDebtCreditPerNonemptyGroupU
     f.register_counter(f.start(0, 1, 1, 2), 1, 3);
     ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[2], 0, 1, 1, f.executions[2]));
     ASSERT_EQ(scheduler_async_pending::registered(f.join().word), 2u);
-    ASSERT_EQ(f.task_control(0)->completion_state, scheduler_completion_encode(2, 2, 4));
+    ASSERT_EQ(f.task_control(0)->completion_state, scheduler_completion_encode(2, 2, 3));
     ASSERT_EQ(f.return_next(0, f.local(1)), SchedulerSubtaskFinishResult::PARTIAL);
     for (uint32_t signal = 0; signal < 3; ++signal)
         f.signal[signal] = 1;
     for (uint32_t probe = 0; probe < 3; ++probe)
         (void)f.check(0);
     EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 1u);
-    EXPECT_EQ(f.task_control(0)->completion_state, scheduler_completion_encode(2, 1, 3));
+    EXPECT_EQ(f.task_control(0)->completion_state, scheduler_completion_encode(2, 1, 2));
     ASSERT_EQ(f.return_next(0, f.local(2)), SchedulerSubtaskFinishResult::TASK_LAST_DEFERRED);
     ASSERT_TRUE(f.close(2));
-    EXPECT_EQ(f.task_control(0)->completion_state, scheduler_completion_encode(2, 0, 2));
-    EXPECT_FALSE(f.finish(0));
+    EXPECT_EQ(f.task_control(0)->completion_state, scheduler_completion_encode(2, 0, 1));
+    EXPECT_FALSE(f.check(0));
     f.signal[3] = 1;
     for (uint32_t probe = 0; probe < 2; ++probe)
         (void)f.check(0);
     ASSERT_EQ(scheduler_async_pending::pending(f.join().word), 0u);
-    EXPECT_EQ(f.task_control(0)->completion_state, scheduler_completion_encode(2, 0, 2));
-    ASSERT_TRUE(f.finish(1));
-    EXPECT_FALSE(f.finish(2));
-    EXPECT_EQ(f.local(1)->pending_completed, 1u);
-    EXPECT_EQ(f.local(2)->pending_completed, 0u);
+    EXPECT_TRUE(f.done());
+    EXPECT_FALSE(f.check(2));
+    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
     EXPECT_TRUE(scheduler_completion_done(f.task_control(0)->completion_state));
 }
 
@@ -777,10 +1015,41 @@ TEST(HbgAsyncControl, InvalidDebtCarryCannotPublishAGroupOrBecomeLogicalDone) {
     ASSERT_FALSE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
     EXPECT_EQ(f.task_control(0)->completion_state, invalid);
     EXPECT_FALSE(scheduler_completion_done(f.task_control(0)->completion_state));
-    EXPECT_EQ(scheduler_async_pending::registered(f.join().word), 0u);
+    EXPECT_EQ(scheduler_async_pending::registered(f.join().word), 1u);
     EXPECT_EQ(f.group_lease().word, kUnused);
-    EXPECT_EQ(f.finish_lease().word, kUnused);
-    EXPECT_EQ(f.storage.run_control->resolved_task_count, 0u);
+    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 0u);
+}
+
+TEST(HbgAsyncControl, InvalidCreditSnapshotCannotGrantRegistration) {
+    for (const uint64_t observed : {UINT64_C(0), UINT64_MAX, scheduler_completion_completed_state(1)}) {
+        SCOPED_TRACE(observed);
+        AsyncFixture f(1);
+        const uint64_t initial = scheduler_completion_initial_state(1);
+        ASSERT_EQ(f.task_control(0)->completion_state, initial);
+        EXPECT_FALSE(scheduler_async_register_credit_observed(f.workers[0], 0, observed));
+        EXPECT_EQ(f.task_control(0)->completion_state, initial);
+        EXPECT_EQ(f.workers[0].error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    }
+}
+
+TEST(HbgAsyncControl, StaleAvailableCreditSnapshotReusesCasReturnedState) {
+    AsyncFixture f(1);
+    const uint64_t initial = scheduler_completion_initial_state(1);
+    ASSERT_EQ(f.task_control(0)->completion_state, initial);
+    ASSERT_TRUE(scheduler_async_register_credit_observed(f.workers[0], 0, scheduler_completion_initial_state(2)));
+    EXPECT_EQ(f.task_control(0)->completion_state, initial + 1);
+    EXPECT_EQ(f.workers[0].error_code, 0);
+}
+
+TEST(HbgAsyncControl, ValidCreditHintCannotOverwriteACorruptOrClosedGate) {
+    for (const uint64_t actual : {UINT64_MAX, scheduler_completion_completed_state(1)}) {
+        SCOPED_TRACE(actual);
+        AsyncFixture f(1);
+        f.task_control(0)->completion_state = actual;
+        EXPECT_FALSE(scheduler_async_register_credit_observed(f.workers[0], 0, scheduler_completion_initial_state(1)));
+        EXPECT_EQ(f.task_control(0)->completion_state, actual);
+        EXPECT_EQ(f.workers[0].error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    }
 }
 
 TEST(HbgAsyncControl, ASettledWaitStillCannotFinishBeforeZeroMembersRelease) {
@@ -790,47 +1059,47 @@ TEST(HbgAsyncControl, ASettledWaitStillCannotFinishBeforeZeroMembersRelease) {
     ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
     EXPECT_TRUE(f.check(1));
     EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 0u);
-    EXPECT_FALSE(f.finish(2));
+    EXPECT_FALSE(f.check(2));
     for (uint32_t block = 0; block < 2; ++block) {
         for (uint32_t lane = 0; lane < 3; ++lane) {
             if (block == 0 && lane == 0) continue;
             (void)f.start(0, block, lane, lane);
             ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[lane], 0, block, lane, f.executions[lane]));
-            EXPECT_FALSE(f.finish());
+            EXPECT_FALSE(f.check());
         }
     }
-    bool deferred = false;
-    ASSERT_TRUE(f.close(0, 0, &deferred));
-    EXPECT_TRUE(deferred);
-    EXPECT_EQ(scheduler_async_lease_phase(f.finish_lease().word), SchedulerAsyncPhase::RUNNABLE);
+    SchedulerAsyncCompletionResult result = SchedulerAsyncCompletionResult::ERROR;
+    ASSERT_TRUE(f.close(0, 0, &result));
+    EXPECT_EQ(result, SchedulerAsyncCompletionResult::FINISH_OWNER);
+    EXPECT_TRUE(f.done());
 }
 
-TEST(HbgAsyncControl, LeaseHintsCannotGrantOwnershipOrHideReleasedWork) {
+TEST(HbgAsyncControl, LeaseSnapshotsRequireCasOwnershipAndRefreshAfterRelease) {
     SchedulerAsyncLease lease;
-    ASSERT_EQ(scheduler_async_lease_publish(lease).result, SchedulerAsyncLeaseResult::SUCCESS);
+    scheduler_async_lease_initialize(lease);
     const uint64_t first_runnable = lease.word;
-    const auto first = scheduler_async_detail::claim_observed(lease, first_runnable, false);
+    const auto first = scheduler_async_detail::claim_observed(lease, first_runnable);
     ASSERT_EQ(first.result, SchedulerAsyncLeaseResult::SUCCESS);
     EXPECT_EQ(
-        scheduler_async_detail::claim_observed(lease, first_runnable, false).result,
-        SchedulerAsyncLeaseResult::CONTENDED
+        scheduler_async_detail::claim_observed(lease, first_runnable).result, SchedulerAsyncLeaseResult::CONTENDED
     );
     EXPECT_EQ(lease.word, first.word);
     ASSERT_EQ(scheduler_async_lease_release(lease, first.word).result, SchedulerAsyncLeaseResult::SUCCESS);
     const uint64_t second_runnable = lease.word;
     EXPECT_EQ(
-        scheduler_async_detail::claim_observed(lease, first.word, false).result, SchedulerAsyncLeaseResult::NOT_RUNNABLE
+        scheduler_async_detail::claim_observed(lease, first.word).result, SchedulerAsyncLeaseResult::NOT_RUNNABLE
     );
     EXPECT_EQ(lease.word, second_runnable);
-    const auto second = scheduler_async_detail::claim_observed(lease, first.word, true);
+    const auto second = scheduler_async_detail::claim_observed(lease, scheduler_async_lease_load(lease));
     ASSERT_EQ(second.result, SchedulerAsyncLeaseResult::SUCCESS);
     EXPECT_EQ(scheduler_async_lease_generation(second.word), 2u);
     ASSERT_EQ(scheduler_async_lease_release(lease, second.word).result, SchedulerAsyncLeaseResult::SUCCESS);
-    const auto third = scheduler_async_detail::claim_observed(lease, first_runnable, false);
+    const auto third = scheduler_async_detail::claim_observed(lease, first_runnable);
     ASSERT_EQ(third.result, SchedulerAsyncLeaseResult::SUCCESS);
     EXPECT_EQ(scheduler_async_lease_generation(third.word), 3u);
     ASSERT_EQ(scheduler_async_lease_release(lease, third.word).result, SchedulerAsyncLeaseResult::SUCCESS);
-    const auto fourth = scheduler_async_detail::claim_observed(lease, 0, false);
+    EXPECT_EQ(scheduler_async_detail::claim_observed(lease, 0).result, SchedulerAsyncLeaseResult::INVALID_WORD);
+    const auto fourth = scheduler_async_detail::claim_observed(lease, scheduler_async_lease_load(lease));
     ASSERT_EQ(fourth.result, SchedulerAsyncLeaseResult::SUCCESS);
     EXPECT_EQ(scheduler_async_lease_generation(fourth.word), 4u);
 }
@@ -865,7 +1134,6 @@ TEST(HbgAsyncControl, DirectoryTailWrapDoesNotStarveEarlierPendingGroups) {
     f.workers[1].check_cursor = 64;
     EXPECT_FALSE(f.check(1));
     EXPECT_EQ(f.workers[1].check_cursor, 0u);
-    EXPECT_TRUE(f.workers[1].check_strong_pass);
     EXPECT_TRUE(f.check(1));
     EXPECT_EQ(scheduler_async_lease_phase(f.group_lease(0).word), SchedulerAsyncPhase::TERMINAL);
 }
@@ -912,7 +1180,7 @@ TEST(HbgAsyncControl, TwoWaitersReleaseDispatchSlotsWhileTheirProducersRetainBlo
         EXPECT_EQ(f.local()->slots[slot].state, SchedulerDispatchSlotState::FREE);
     EXPECT_FALSE(f.check());
     EXPECT_FALSE(f.check());
-    EXPECT_FALSE(f.finish());
+    EXPECT_FALSE(f.check());
     for (uint32_t producer = 2; producer < 4; ++producer) {
         EXPECT_TRUE(scheduler_execution_token_has_task(f.local(), producer));
         ASSERT_TRUE(f.return_remaining(producer - 2, f.local(1)));
@@ -932,7 +1200,6 @@ TEST(HbgAsyncControl, TwoWaitersReleaseDispatchSlotsWhileTheirProducersRetainBlo
     }
     for (uint32_t step = 0; step < 4; ++step) {
         f.check();
-        f.finish();
     }
     for (uint32_t task = 0; task < 6; ++task)
         EXPECT_EQ(
@@ -978,10 +1245,9 @@ TEST(HbgAsyncControl, MoreWaitersThanWorkerSlotsLeavePublisherRunnableAndTermina
             EXPECT_EQ(f.workers[worker].check_cursor, (task + 1) % waiter_count);
             EXPECT_EQ(scheduler_async_lease_phase(f.group_lease(task).word), SchedulerAsyncPhase::RUNNABLE);
         }
-        EXPECT_FALSE(f.finish(worker));
-        scheduler_flush_completions(f.storage.run_control, f.local(worker));
+        EXPECT_FALSE(f.check(worker));
     }
-    EXPECT_EQ(f.storage.run_control->resolved_task_count, 0u);
+    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 0u);
 
     // Exercise the real dispatch and async entry contracts for the ordinary
     // publisher; signal stores stand in for its kernel body in this CPU test.
@@ -1004,10 +1270,7 @@ TEST(HbgAsyncControl, MoreWaitersThanWorkerSlotsLeavePublisherRunnableAndTermina
 
     for (uint32_t step = 0; step < waiter_count * worker_count; ++step) {
         f.check(step % worker_count);
-        f.finish((step + 1) % worker_count);
     }
-    for (uint32_t worker = 0; worker < worker_count; ++worker)
-        scheduler_flush_completions(f.storage.run_control, f.local(worker));
     for (uint32_t task = 0; task + 1 < waiter_count; ++task)
         EXPECT_EQ(
             scheduler_completion_task_state(f.task_control(task)->completion_state),
@@ -1023,8 +1286,7 @@ TEST(HbgAsyncControl, MoreWaitersThanWorkerSlotsLeavePublisherRunnableAndTermina
     );
     EXPECT_EQ(scheduler_async_pending::pending(f.join(waiter_count - 1).word), 1u);
     EXPECT_EQ(scheduler_async_lease_phase(f.group_lease(waiter_count - 1).word), SchedulerAsyncPhase::RUNNABLE);
-    EXPECT_EQ(f.finish_lease(waiter_count - 1).word, kUnused);
-    EXPECT_EQ(f.storage.run_control->resolved_task_count, waiter_count);
+    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), waiter_count);
     EXPECT_EQ(scheduler_read_error(f.storage.run_control), 0u);
 }
 
@@ -1055,13 +1317,10 @@ TEST(HbgAsyncControl, FinishPermitsAllSuccessorsAndCountsOnce) {
     ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
     ASSERT_TRUE(f.close());
     EXPECT_TRUE(f.check(1));
-    ASSERT_TRUE(f.finish(2));
-    for (uint32_t worker = 0; worker < 3; ++worker)
-        scheduler_flush_completions(f.storage.run_control, f.local(worker));
-    EXPECT_FALSE(f.finish(0));
-    EXPECT_FALSE(f.finish(1));
-    EXPECT_EQ(scheduler_async_lease_phase(f.finish_lease().word), SchedulerAsyncPhase::TERMINAL);
-    EXPECT_EQ(f.storage.run_control->resolved_task_count, 1u);
+    EXPECT_FALSE(f.check(0));
+    EXPECT_FALSE(f.check(1));
+    EXPECT_TRUE(f.done());
+    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
     std::array<bool, 12> seen{};
     for (uint32_t count = 0; count < 11; ++count) {
         int64_t task = -1;
@@ -1074,11 +1333,9 @@ TEST(HbgAsyncControl, FinishPermitsAllSuccessorsAndCountsOnce) {
         f.local()->slots[slot].state = SchedulerDispatchSlotState::EXECUTING;
         ASSERT_TRUE(scheduler_complete_own_slot(f.graph.graph(), f.base(), f.local(), f.storage.run_control, slot, 0));
     }
-    scheduler_flush_completions(f.storage.run_control, f.local());
-    EXPECT_EQ(f.storage.run_control->resolved_task_count, 12u);
-    EXPECT_FALSE(f.finish());
-    scheduler_flush_completions(f.storage.run_control, f.local());
-    EXPECT_EQ(f.storage.run_control->resolved_task_count, 12u);
+    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 12u);
+    EXPECT_FALSE(f.check());
+    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 12u);
 }
 
 TEST(HbgAsyncControl, SignedCounterBoundariesRemainPendingBelowTheThreshold) {
@@ -1113,17 +1370,20 @@ TEST(HbgAsyncControl, NegativeCounterHandsOffUntilPublicationWithoutFailingTheRu
     ASSERT_TRUE(f.close());
     for (uint32_t worker : {1u, 2u, 0u}) {
         bool progress = false;
-        ASSERT_TRUE(scheduler_async_check_step(f.workers[worker], 1, 8, SchedulerAsyncCompletionObserver{}, progress));
+        SchedulerAsyncCompletion completion{};
+        ASSERT_TRUE(scheduler_async_check_step(
+            f.workers[worker], 1, 8, SchedulerAsyncCompletionObserver{}, progress, completion
+        ));
+        EXPECT_NE(completion.result, SchedulerAsyncCompletionResult::FINISH_OWNER);
         EXPECT_FALSE(progress);
         EXPECT_EQ(f.workers[worker].error_code, 0);
         EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::RUNNABLE);
         EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 1u);
-        EXPECT_EQ(f.finish_lease().word, kUnused);
     }
     f.signal[0] = 0;
     EXPECT_TRUE(f.check(2));
     EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::TERMINAL);
-    EXPECT_EQ(scheduler_async_lease_phase(f.finish_lease().word), SchedulerAsyncPhase::RUNNABLE);
+    EXPECT_TRUE(f.done());
     EXPECT_EQ(f.signal[0], 0u);
 }
 
@@ -1137,12 +1397,11 @@ TEST(HbgAsyncControl, CcuEventGatesResidentJoinUntilObservedAndCleared) {
     ASSERT_TRUE(f.close());
     EXPECT_FALSE(f.check(1));
     EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 1u);
-    EXPECT_EQ(f.finish_lease().word, kUnused);
     event = 1;
     EXPECT_TRUE(f.check(2));
     EXPECT_EQ(event, 0u);
     EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::TERMINAL);
-    EXPECT_EQ(scheduler_async_lease_phase(f.finish_lease().word), SchedulerAsyncPhase::RUNNABLE);
+    EXPECT_TRUE(f.done());
 }
 
 TEST(HbgAsyncControl, InvalidCounterAndMalformedRecordFailWithoutNormalCompletion) {
@@ -1157,10 +1416,12 @@ TEST(HbgAsyncControl, InvalidCounterAndMalformedRecordFailWithoutNormalCompletio
         else entry->backend_cookie = 1;
         ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
         bool progress = false;
-        EXPECT_FALSE(scheduler_async_check_step(f.workers[1], 2, 8, SchedulerAsyncCompletionObserver{}, progress));
+        SchedulerAsyncCompletion completion{};
+        EXPECT_FALSE(
+            scheduler_async_check_step(f.workers[1], 2, 8, SchedulerAsyncCompletionObserver{}, progress, completion)
+        );
         EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::FAILED);
         EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 1u);
-        EXPECT_EQ(f.finish_lease().word, kUnused);
     }
 }
 
@@ -1184,40 +1445,138 @@ TEST(HbgAsyncControl, CounterAndFullWidthSdmaRecordsMustBothCompleteAndAreNeverC
     completed_post = UINT64_C(0x100000003);
     EXPECT_TRUE(f.check(0));
     EXPECT_EQ(scheduler_async_lease_phase(f.group_lease().word), SchedulerAsyncPhase::TERMINAL);
-    EXPECT_EQ(scheduler_async_lease_phase(f.finish_lease().word), SchedulerAsyncPhase::RUNNABLE);
+    EXPECT_TRUE(f.done());
     EXPECT_EQ(completed_post, UINT64_C(0x100000003));
 }
 
-TEST(HbgAsyncControl, OneSliceClaimsOnlyOneRecordAndAlternatesCheckAndFinish) {
+TEST(HbgAsyncControl, OrdersFinalContributionBeforeClosureRmw) {
     AsyncFixture f(1);
+    f.register_counter(f.start());
+    ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
+    uint64_t gate = 0;
+    ASSERT_EQ(f.return_next(0, f.local(2), &gate), SchedulerSubtaskFinishResult::TASK_LAST_DEFERRED);
+    auto buffer = std::make_unique<SchedulerActivityBuffer>();
+    auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+    SchedulerScalarTrace trace;
+    trace.buffer = buffer.get();
+    trace.records = records.get();
+    trace.window_start = scheduler_cycles();
+    {
+        SchedulerScalarBinding binding;
+        binding.attach(&trace);
+        const auto completion = scheduler_async_close_computation(&f.workers[2], 0, gate);
+        ASSERT_EQ(completion.result, SchedulerAsyncCompletionResult::WAITING);
+    }
+    bool ordered = false;
+    bool observed = false;
+    uint32_t cursor = 0;
+    while (cursor < trace.storage_slots) {
+        SchedulerScalarRecord record{};
+        ASSERT_TRUE(scheduler_decode_scalar_storage(trace.records, trace.storage_slots, cursor, record));
+        const auto kind = static_cast<SchedPhaseKind>(record.kind & 0xffffU);
+        if (kind == SchedPhaseKind::ScalarDsbAll) ordered = true;
+        if (kind == SchedPhaseKind::ScalarAtomicFetchAdd) {
+            EXPECT_TRUE(ordered) << "Closure must order the final contribution before its join RMW";
+            observed = true;
+        }
+    }
+    EXPECT_EQ(trace.dropped, 0u);
+    EXPECT_TRUE(observed);
+    EXPECT_FALSE(f.done());
+    f.signal[0] = 1;
+    EXPECT_TRUE(f.check(1));
+    EXPECT_TRUE(f.done());
+}
+
+TEST(HbgAsyncControl, JoinRmwOwnerCannotCompleteTwice) {
+    AsyncFixture f(1);
+    uint32_t run_completed = 0;
+    f.storage.run_control->run_completed_read_address = reinterpret_cast<uint64_t>(&run_completed);
+    f.storage.run_control->run_completed_add_address = reinterpret_cast<uint64_t>(&run_completed);
+    uint32_t notification = 0;
+    scheduler_state_at<uint64_t>(f.base(), f.storage.layout.done_notifications_offset)[0] =
+        reinterpret_cast<uint64_t>(&notification);
+    f.register_counter(f.start(), 0);
+    ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
+    ASSERT_TRUE(f.check(1));
+    ASSERT_TRUE(f.return_remaining(0, f.local(2)));
+    const auto completion = scheduler_async_close_computation(&f.workers[2], 0, f.task_control(0)->completion_state);
+    ASSERT_EQ(completion.result, SchedulerAsyncCompletionResult::FINISH_OWNER);
+    EXPECT_EQ(notification, 0u);
+    ASSERT_TRUE(
+        scheduler_async_complete_task(f.graph.graph(), f.base(), f.local(2), f.storage.run_control, completion)
+    );
+    EXPECT_TRUE(f.done());
+    EXPECT_EQ(notification, 1u);
+    EXPECT_EQ(scheduler_cached_task_proof(f.local(2), 0), SchedulerTaskProof::DONE);
+    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
+    EXPECT_FALSE(
+        scheduler_async_complete_task(f.graph.graph(), f.base(), f.local(2), f.storage.run_control, completion)
+    );
+    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
+    EXPECT_EQ(f.storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::ASYNC_FINISH_FAILED));
+}
+
+TEST(HbgAsyncControl, InvalidCompletionOwnerProofFailsRunWithoutPublishingDone) {
+    for (uint32_t invalid = 0; invalid < 5; ++invalid) {
+        SCOPED_TRACE(invalid);
+        AsyncFixture f(1);
+        f.register_counter(f.start(), 0);
+        ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
+        ASSERT_TRUE(f.check(1));
+        ASSERT_TRUE(f.return_remaining(0, f.local(2)));
+        auto completion = scheduler_async_close_computation(&f.workers[2], 0, f.task_control(0)->completion_state);
+        ASSERT_EQ(completion.result, SchedulerAsyncCompletionResult::FINISH_OWNER);
+        if (invalid == 0) ++completion.run_epoch;
+        else if (invalid == 1) completion.joined &= ~scheduler_async_pending::COMPUTATION_CLOSED;
+        else if (invalid == 2) f.task_control(0)->completion_state = scheduler_completion_encode(1, 0, 2);
+        else if (invalid == 3) f.task_control(0)->completion_state = scheduler_completion_encode(2, 0, 1);
+        else f.task_control(0)->completion_state = scheduler_completion_encode(1, 1, 1);
+        const uint64_t gate = f.task_control(0)->completion_state;
+        EXPECT_FALSE(
+            scheduler_async_complete_task(f.graph.graph(), f.base(), f.local(2), f.storage.run_control, completion)
+        );
+        EXPECT_FALSE(f.done());
+        EXPECT_EQ(f.task_control(0)->completion_state, gate);
+        EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 0u);
+        EXPECT_NE(scheduler_read_error(f.storage.run_control), 0u);
+        EXPECT_EQ(f.storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::ASYNC_FINISH_FAILED));
+    }
+}
+
+TEST(HbgAsyncControl, CheckCadenceAndBudgetRemainBoundedWhileItsOwnerFinishesInline) {
+    AsyncFixture f(1, {async_task(0, 1, LaneMask::aic(), 9)});
     const auto writer = f.start();
-    f.register_counter(writer, 0);
+    for (uint32_t condition = 0; condition < 9; ++condition)
+        f.register_counter(writer, 0);
     ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
     ASSERT_TRUE(f.close());
     f.workers[0].business_returns = 4;
+    auto *state = scheduler_state_at<SchedulerAsyncGroupProgress>(f.base(), f.plan.layout.group_progress_offset);
     bool progress = false;
     ASSERT_TRUE(
         scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, progress)
     );
     EXPECT_TRUE(progress);
     EXPECT_EQ(f.workers[0].business_returns, 0u);
-    EXPECT_TRUE(f.workers[0].finish_first);
-    EXPECT_EQ(scheduler_async_lease_phase(f.finish_lease().word), SchedulerAsyncPhase::RUNNABLE);
-    EXPECT_EQ(
-        scheduler_completion_task_state(f.task_control(0)->completion_state),
-        static_cast<int64_t>(SchedulerTaskState::BLOCKED)
+    EXPECT_EQ(f.workers[0].check_service_countdown, 1u);
+    EXPECT_EQ(__builtin_popcountll(state->pending_mask), 1);
+    EXPECT_FALSE(f.done());
+    const auto lease = f.group_lease().word;
+    ASSERT_TRUE(
+        scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, progress)
     );
-    EXPECT_EQ(f.local()->pending_completed, 0u);
+    EXPECT_FALSE(progress);
+    EXPECT_EQ(f.group_lease().word, lease);
+    EXPECT_EQ(__builtin_popcountll(state->pending_mask), 1);
+    EXPECT_EQ(f.workers[0].check_service_countdown, 0u);
+    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 0u);
     ASSERT_TRUE(
         scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, progress)
     );
     EXPECT_TRUE(progress);
-    EXPECT_FALSE(f.workers[0].finish_first);
-    EXPECT_EQ(
-        scheduler_completion_task_state(f.task_control(0)->completion_state),
-        static_cast<int64_t>(SchedulerTaskState::DONE)
-    );
-    EXPECT_EQ(f.local()->pending_completed, 1u);
+    EXPECT_TRUE(f.done());
+    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
 }
 
 TEST(HbgAsyncControl, ObserverFailureLatchesRunErrorAndOtherCoresCannotFinishNormally) {
@@ -1238,12 +1597,15 @@ TEST(HbgAsyncControl, ObserverFailureLatchesRunErrorAndOtherCoresCannotFinishNor
     EXPECT_FALSE(
         scheduler_service_async_slice(f.graph.graph(), f.base(), f.local(2), f.storage.run_control, 0, progress)
     );
-    EXPECT_EQ(f.storage.run_control->resolved_task_count, 0u);
+    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 0u);
     EXPECT_EQ(scheduler_async_pending::pending(f.join().word), 1u);
 }
 
 TEST(HbgAsyncControl, ConcurrentObserversAndBlockReleaseGrantOneFinish) {
     AsyncFixture f(1, {async_task(0, 16, LaneMask::all())});
+    uint32_t run_completed = 0;
+    f.storage.run_control->run_completed_read_address = reinterpret_cast<uint64_t>(&run_completed);
+    f.storage.run_control->run_completed_add_address = reinterpret_cast<uint64_t>(&run_completed);
     for (uint32_t block = 0; block < 16; ++block) {
         for (uint32_t lane = 0; lane < 3; ++lane) {
             const auto writer = f.start(0, block, lane);
@@ -1266,9 +1628,7 @@ TEST(HbgAsyncControl, ConcurrentObserversAndBlockReleaseGrantOneFinish) {
         observers.emplace_back([&, local] {
             while (!begin.load(std::memory_order_acquire)) {}
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-            while (!failed.load(std::memory_order_acquire) &&
-                   scheduler_async_lease_phase(scheduler_async_lease_load(f.finish_lease())) !=
-                       SchedulerAsyncPhase::TERMINAL) {
+            while (!failed.load(std::memory_order_acquire) && !f.done()) {
                 bool progress = false;
                 if (!scheduler_service_async_slice(
                         f.graph.graph(), f.base(), local, f.storage.run_control, 0, progress
@@ -1281,20 +1641,24 @@ TEST(HbgAsyncControl, ConcurrentObserversAndBlockReleaseGrantOneFinish) {
         });
     }
     begin.store(true, std::memory_order_release);
-    bool deferred = false;
-    if (!f.return_remaining(0, &producer_context) || !scheduler_async_close_computation(&producer, 0, deferred) ||
-        !deferred)
+    if (!f.return_remaining(0, &producer_context)) failed.store(true, std::memory_order_release);
+    const auto completion = scheduler_async_close_computation(&producer, 0, f.task_control(0)->completion_state);
+    if (completion.result == SchedulerAsyncCompletionResult::FINISH_OWNER) {
+        if (!scheduler_async_complete_task(
+                f.graph.graph(), f.base(), &producer_context, f.storage.run_control, completion
+            ))
+            failed.store(true, std::memory_order_release);
+    } else if (completion.result != SchedulerAsyncCompletionResult::WAITING) {
         failed.store(true, std::memory_order_release);
+    }
     __atomic_store_n(&f.signal[0], 1u, __ATOMIC_RELEASE);
     for (auto &observer : observers)
         observer.join();
     EXPECT_FALSE(failed.load());
     EXPECT_TRUE(scheduler_async_pending::ready_to_finish(f.join().word));
     EXPECT_EQ(scheduler_read_error(f.storage.run_control), 0u);
-    for (uint32_t worker = 0; worker < 3; ++worker)
-        scheduler_flush_completions(f.storage.run_control, f.local(worker));
-    EXPECT_EQ(f.storage.run_control->resolved_task_count, 1u);
-    EXPECT_EQ(scheduler_async_lease_phase(f.finish_lease().word), SchedulerAsyncPhase::TERMINAL);
+    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
+    EXPECT_TRUE(f.done());
 }
 
 }  // namespace

@@ -110,6 +110,14 @@ public:
     }
     bool ready_to_join_launch() const override { return true; }
     int fill_persistent_arch_fields(KernelArgs *, uint64_t) override { return 0; }
+    int acquire_scheduler_notifications(
+        uint32_t, SchedulerNotificationPurpose, size_t count, SchedulerDoneNotifications *out
+    ) override {
+        if (out == nullptr) return -1;
+        // The CPU transport has no notification SRAM; exercise the GM fallback.
+        *out = {std::vector<uint64_t>(count, 0), std::vector<uint64_t>(count, 0), {}};
+        return 0;
+    }
     int prepare_execution_streams(PreparedExecution &prepared, std::shared_ptr<const void> *lease) override {
         if (execution_mode_latch().is_kernel()) return DeviceRunnerBase::prepare_execution_streams(prepared, lease);
         // This fixture replaces device submission; its stream identities are

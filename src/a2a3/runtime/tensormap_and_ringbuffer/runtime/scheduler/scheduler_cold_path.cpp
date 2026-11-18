@@ -238,7 +238,7 @@ void SchedulerContext::log_owned_dispatch_records(int32_t thread_idx, StallDumpR
 void SchedulerContext::log_global_stall_diagnostics(
     int32_t trigger_thread_idx, int32_t idle_iterations, int32_t last_progress_count
 ) {
-    int32_t cnt_ready = 0, cnt_waiting = 0, cnt_running = 0, submitted_in_ring = 0;
+    int32_t cnt_ready = 0, cnt_waiting = 0, cnt_running = 0, cnt_async_wait = 0, submitted_in_ring = 0;
     for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
         SharedMemoryRingHeader &ring = *sched_->ring_sched_states[r].ring;
         int32_t ring_task_count = ring.fc.current_task_index.load(std::memory_order_relaxed);
@@ -290,6 +290,17 @@ void SchedulerContext::log_global_stall_diagnostics(
                 );
                 continue;
             }
+            if (slot_state.has_finished_deferred_subtasks()) {
+                cnt_async_wait++;
+                if (cnt_async_wait > STALL_DUMP_READY_MAX) continue;
+                LOG_WARN(
+                    "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=0x%" PRIx64
+                    " state=ASYNC_WAIT fanin_refcount=%d/%d subtasks_done=%d/%d",
+                    trigger_thread_idx, idle_iterations, r, task_id, rc, fi,
+                    slot_state.completed_subtasks.load(std::memory_order_relaxed), slot_state.total_required_subtasks
+                );
+                continue;
+            }
             if (rc >= fi) {
                 cnt_ready++;
                 if (cnt_ready > STALL_DUMP_READY_MAX) continue;
@@ -313,9 +324,9 @@ void SchedulerContext::log_global_stall_diagnostics(
     int32_t c = completed_tasks_.load(std::memory_order_relaxed);
     LOG_WARN(
         "[STALL thread=%d idle_iterations=%d] SUMMARY completed=%d/%d last_progress_iteration=%d "
-        "scan_ready=%d scan_waiting=%d scan_running=%d",
+        "scan_ready=%d scan_waiting=%d scan_running=%d scan_async_wait=%d",
         trigger_thread_idx, idle_iterations, c, effective_total, last_progress_count, cnt_ready, cnt_waiting,
-        cnt_running
+        cnt_running, cnt_async_wait
     );
 }
 
@@ -395,7 +406,8 @@ SchedulerContext::StallClassification SchedulerContext::classify_stall_reason() 
     StallClassification cls{};
     cls.stuck_task_id = TaskId::invalid();
     cls.stuck_core = -1;
-    int32_t cnt_running = 0, cnt_ready = 0, cnt_waiting = 0;
+    int32_t cnt_running = 0, cnt_ready = 0, cnt_waiting = 0, cnt_async_wait = 0;
+    TaskId async_task_id = TaskId::invalid();
     for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
         SharedMemoryRingHeader &ring = *sched_->ring_sched_states[r].ring;
         int32_t ring_task_count = ring.fc.current_task_index.load(std::memory_order_relaxed);
@@ -428,6 +440,14 @@ SchedulerContext::StallClassification SchedulerContext::classify_stall_reason() 
                 cnt_running++;
                 continue;
             }
+            if (slot_state.has_finished_deferred_subtasks()) {
+                if (cnt_async_wait == 0) {
+                    TaskDescriptor *task_ptr = slot_state.task;
+                    async_task_id = task_ptr != nullptr ? task_ptr->task_id : TaskId::invalid();
+                }
+                cnt_async_wait++;
+                continue;
+            }
             int32_t rc = slot_state.fanin_refcount.load(std::memory_order_relaxed);
             int32_t fi = slot_state.fanin_count;
             if (rc >= fi) {
@@ -440,10 +460,12 @@ SchedulerContext::StallClassification SchedulerContext::classify_stall_reason() 
     cls.cnt_running = cnt_running;
     cls.cnt_ready = cnt_ready;
     cls.cnt_waiting = cnt_waiting;
+    cls.cnt_async_wait = cnt_async_wait;
     cls.completed = completed_tasks_.load(std::memory_order_relaxed);
     cls.total = total_tasks_;
     cls.orch_done = orchestrator_done_ ? 1 : 0;
-    cls.detail = classify_stall_detail(cnt_running, cnt_ready, cnt_waiting, cls.orch_done);
+    cls.detail = classify_stall_detail(cnt_running, cnt_ready, cnt_waiting, cnt_async_wait, cls.orch_done);
+    if (cls.detail == SIMPLER_STALL_DETAIL_ASYNC_WAIT) cls.stuck_task_id = async_task_id;
     return cls;
 }
 
@@ -458,10 +480,11 @@ int32_t SchedulerContext::handle_timeout_exit(
     StallClassification cls = classify_stall_reason();
     LOG_ERROR(
         "[STALL thread=%d idle_iterations=%d] TIMEOUT_EXIT after_idle_iterations=%d sub_class=%s "
-        "completed=%d/%d running=%d ready=%d waiting=%d orch_done=%d stuck_task_id=0x%" PRIx64 " stuck_core=%d",
+        "completed=%d/%d running=%d ready=%d waiting=%d async_wait=%d orch_done=%d stuck_task_id=0x%" PRIx64
+        " stuck_core=%d",
         thread_idx, idle_iterations, idle_iterations, stall_detail_name(cls.detail), cls.completed, cls.total,
-        cls.cnt_running, cls.cnt_ready, cls.cnt_waiting, cls.orch_done, TaskId::to_uint64(cls.stuck_task_id),
-        cls.stuck_core
+        cls.cnt_running, cls.cnt_ready, cls.cnt_waiting, cls.cnt_async_wait, cls.orch_done,
+        TaskId::to_uint64(cls.stuck_task_id), cls.stuck_core
     );
     // Only the thread that wins the code-100 latch publishes the detail/locators,
     // keeping the host-visible sub-class consistent with the latched code.
@@ -471,6 +494,7 @@ int32_t SchedulerContext::handle_timeout_exit(
         header->sched_stall_cnt_running.store(cls.cnt_running, std::memory_order_relaxed);
         header->sched_stall_cnt_ready.store(cls.cnt_ready, std::memory_order_relaxed);
         header->sched_stall_cnt_waiting.store(cls.cnt_waiting, std::memory_order_relaxed);
+        header->sched_stall_cnt_async_wait.store(cls.cnt_async_wait, std::memory_order_relaxed);
         header->sched_stall_orch_done.store(cls.orch_done, std::memory_order_relaxed);
         header->sched_stall_task_id.store(cls.stuck_task_id, std::memory_order_relaxed);
         header->sched_stall_core.store(cls.stuck_core, std::memory_order_relaxed);
@@ -816,9 +840,21 @@ void SchedulerContext::drain_cancelled_run(uint64_t deadline, KernelErrorCleanup
         result.async_error = SIMPLER_ERROR_ASYNC_COMPLETION_INVALID;
         return;
     }
+    const bool incomplete_tracking =
+        sched_->sm_header != nullptr && (is_async_tracking_error(sched_->sm_header->orch_error_code.load()) ||
+                                         is_async_tracking_error(sched_->sm_header->sched_error_code.load()));
     // No completion or release callback is allowed here. The failed graph's
     // dependencies stay unsatisfied while outstanding hardware readers finish.
     auto retire = [&](CompletionCondition &condition, TaskId task, uint32_t source, int32_t core) {
+        const size_t alignment =
+            condition.completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD ? alignof(uint64_t) : alignof(uint32_t);
+        if (condition.engine != ASYNC_ENGINE_SDMA || condition.addr % alignment != 0) {
+            result.async_error = SIMPLER_ERROR_ASYNC_COMPLETION_INVALID;
+            result.task_token = TaskId::to_uint64(task);
+            result.source = source;
+            result.core = core;
+            return false;
+        }
         while (true) {
             if (condition.completion_type == COMPLETION_TYPE_COUNTER && condition.counter_addr != nullptr) {
                 cache_invalidate_range(const_cast<const uint32_t *>(condition.counter_addr), sizeof(uint32_t));
@@ -886,7 +922,8 @@ void SchedulerContext::drain_cancelled_run(uint64_t deadline, KernelErrorCleanup
             const uint32_t count = slab.count;
             const TaskId task = payload_per_core_[core][buffer].local_context.async_ctx.task_token;
             if (count > MAX_COMPLETIONS_PER_TASK || (count != 0 && !task.is_valid()) ||
-                (slab.error_code != 0 && !is_kernel_error(slab.error_code))) {
+                (slab.error_code != 0 && !is_kernel_error(slab.error_code) &&
+                 !is_async_tracking_error(slab.error_code))) {
                 result.async_error = slab.error_code != 0 && !is_kernel_error(slab.error_code) ?
                                          slab.error_code :
                                          SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED;
@@ -894,6 +931,15 @@ void SchedulerContext::drain_cancelled_run(uint64_t deadline, KernelErrorCleanup
                 result.core = core;
                 result.task_token = TaskId::to_uint64(task);
                 return;
+            }
+            if (is_async_tracking_error(slab.error_code) && result.async_error == 0) {
+                // The recorded prefix is still drainable. A failed registration
+                // or malformed SDK event may have omitted other identities, so
+                // retaining their owners remains mandatory after this prefix.
+                result.async_error = SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED;
+                result.source = 4;
+                result.core = core;
+                result.task_token = TaskId::to_uint64(task);
             }
             for (uint32_t i = 0; i < count; ++i) {
                 const auto &entry = slab.entries[i];
@@ -905,7 +951,9 @@ void SchedulerContext::drain_cancelled_run(uint64_t deadline, KernelErrorCleanup
             }
         }
     }
-    result.complete = 1;
+    // A wait-list registration failure can lose an identity outside any slab.
+    if (incomplete_tracking && result.async_error == 0) result.async_error = SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED;
+    result.complete = result.async_error == 0 ? 1u : 0u;
 }
 
 // =============================================================================

@@ -84,10 +84,12 @@ struct RuntimeOps {
     // Cross-layer data access (orchestration reads/writes tensor values via runtime)
     // Placed after logging to avoid shifting hot-path field offsets.
     uint64_t (*get_tensor_data)(
-        RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[]
+        RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[],
+        const simpler::tmr::TaskId *deps, uint32_t dep_count
     );
     void (*set_tensor_data)(
-        RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+        RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[],
+        uint64_t value, const simpler::tmr::TaskId *deps, uint32_t dep_count
     );
     TaskOutputTensors (*alloc_tensors)(RuntimeContext *rt, const CoreTaskArgs &args);
     TaskOutputTensors (*submit_dummy_task)(RuntimeContext *rt, const CoreTaskArgs &args);
@@ -295,10 +297,25 @@ void rt_orchestration_done(RuntimeContext *rt);
 void rt_report_fatal(RuntimeContext *rt, int32_t error_code, const char *func, const char *fmt, ...);
 
 /**
- * Cross-layer data access: read a tensor value by waiting for its producer.
+ * Cross-layer data access: read after the creator, TensorMap producers and declared tasks complete.
+ * See get_tensor_data in orchestration_api.h for dependency validation and overloads.
  */
-uint64_t
-get_tensor_data(RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
+uint64_t get_tensor_data(
+    RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[],
+    const simpler::tmr::TaskId *deps, uint32_t dep_count
+);
+
+inline uint64_t
+get_tensor_data(RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
+    return get_tensor_data(rt, tensor, ndims, indices, nullptr, 0);
+}
+
+inline uint64_t get_tensor_data(
+    RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[],
+    simpler::tmr::TaskId dep
+) {
+    return get_tensor_data(rt, tensor, ndims, indices, &dep, 1);
+}
 
 /**
  * Cross-layer data access: write a value to a tensor at given indices.
@@ -306,8 +323,22 @@ get_tensor_data(RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t
  * See set_tensor_data in orchestration_api.h for full documentation.
  */
 void set_tensor_data(
-    RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+    RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value,
+    const simpler::tmr::TaskId *deps, uint32_t dep_count
 );
+
+inline void set_tensor_data(
+    RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+) {
+    set_tensor_data(rt, tensor, ndims, indices, value, nullptr, 0);
+}
+
+inline void set_tensor_data(
+    RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value,
+    simpler::tmr::TaskId dep
+) {
+    set_tensor_data(rt, tensor, ndims, indices, value, &dep, 1);
+}
 
 /**
  * Slim config struct exported by orchestration .so via aicpu_orchestration_config().

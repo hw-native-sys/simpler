@@ -118,10 +118,7 @@ protected:
                     first_entries.push_back(execution.task);
                 ASSERT_TRUE(fixture.complete(execution));
             }
-            uint64_t completed = 0;
-            for (const auto *local : fixture.locals)
-                completed += local->pending_completed;
-            finished = completed == shapes.size();
+            finished = scheduler_test::resolved_count(fixture.run()) == shapes.size();
         }
         ASSERT_TRUE(finished);
         EXPECT_EQ(executions.size(), static_cast<size_t>(mask.count()) * (second_mix ? 2 : 1));

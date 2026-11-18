@@ -353,6 +353,16 @@ acquire_run_image_staging(void *runner_ctx, uint32_t pipeline_slot, size_t bytes
     }
 }
 
+static std::optional<HostCallableAsyncCapabilities>
+get_callable_async_capabilities(void *runner_ctx, int32_t callable_id) {
+    if (runner_ctx == nullptr) return std::nullopt;
+    HostCallableAsyncCapabilities view{};
+    if (!static_cast<SimDeviceRunnerBase *>(runner_ctx)
+             ->get_callable_async_capabilities(callable_id, &view.data, &view.count))
+        return std::nullopt;
+    return view;
+}
+
 static uint64_t upload_chip_callable_buffer_wrapper(void *runner_ctx, const void *callable) {
     if (runner_ctx == nullptr) return 0;
     try {
@@ -572,6 +582,7 @@ static const HostApiOps g_host_api_ops = {
     .caller_device_span_written_by_other_run = caller_device_span_written_by_other_run,
     .get_orchestration_scratch = get_orchestration_scratch,
     .set_orchestration_scratch = set_orchestration_scratch,
+    .get_callable_async_capabilities = get_callable_async_capabilities,
 };
 
 /* ===========================================================================

@@ -29,6 +29,9 @@ add_executable(native-runner
     ${COMMON}/task_interface/assert_compat.cpp
 )
 target_compile_features(native-runner PRIVATE cxx_std_17)
+# Full tensor comparisons are part of every round, including in SDK environments
+# that leave CMAKE_CXX_FLAGS_RELEASE empty.
+target_compile_options(native-runner PRIVATE $<$<CONFIG:Release>:-O3>)
 target_include_directories(native-runner PRIVATE
     ${COMMON}
     ${COMMON}/task_interface

@@ -29,8 +29,8 @@ from simpler.worker import Worker
 
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.scene_test import _pto_isa_compile_cache_token, compile_chip_callable_spec
-from simpler_setup.tools.hbg.native_protocol import has_native_graph
-from simpler_setup.tools.swimlane_converter import read_perf_data
+from simpler_setup.tools.hbg.native_causality import audit_native_protocol
+from simpler_setup.tools.hbg.native_protocol import has_native_graph, read_native_protocol
 
 _ROOT = Path(__file__).resolve().parents[5]
 _KERNELS = _ROOT / "tests/fdwic/pa_hbg/spmd/kernels"
@@ -139,6 +139,15 @@ def _capture(prefix):
     return paths[0], json.loads(paths[0].read_text())
 
 
+def _check_successful_capture(raw):
+    # The timeout fixture needs completion/ownership evidence, not a rendered
+    # Scalar partition. Audit the retained wire capture without decoding it twice.
+    protocol = read_native_protocol(raw["aicore_protocol"])
+    identities = raw["aicore_execution_identities"]
+    assert identities["schema"] == "hbg-execution-identity" and identities["producer"] == "aicore"
+    assert audit_native_protocol(protocol, identities["records"])["protocol_verified"]
+
+
 def _check_output(values, capacity, blocks, mask, *, failed):
     records = values[0].view(capacity * 3 + 1, 16)
     expected = torch.zeros_like(records)
@@ -229,7 +238,6 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
     assert controls[consumer["task_ref"]]["completed_subtasks"] == 0
     positions = protocol["cluster_count"] * (2 if mask in (2, 4) else 1)
     assert protocol.get("schema") == "hbg-native-protocol"
-    assert type(protocol.get("close_seal_stride")) is int and protocol["close_seal_stride"] == 64
     for task in protocol["tasks"]:
         control = controls[task["task_ref"]]
         seal = control.get("claim_seal")
@@ -686,7 +694,7 @@ def _run_pass(  # noqa: PLR0912 -- one Worker owns healthy, failed, and cleanup 
                 else:
                     pytest.fail("owned RTS last-use evidence unavailable; buffers retained until close")
             else:
-                assert read_perf_data(str(path))["protocol_audit"]["protocol_verified"]
+                _check_successful_capture(raw)
             evidence.append(
                 {
                     "capture": str(path.relative_to(artifacts)),

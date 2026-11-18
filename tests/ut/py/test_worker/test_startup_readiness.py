@@ -620,6 +620,29 @@ class TestEagerInitContract:
         assert hw._worker is None
 
     @_hard_timeout(_TEST_WALL_BUDGET_S)
+    def test_repeated_start_preserves_ready_children_and_dispatch(self):
+        counter_shm, counter_buf = _make_shared_counter()
+        hw = Worker(level=3, num_sub_workers=1)
+        sub = hw.register(lambda args: _increment_counter(counter_buf))
+        try:
+            hw.init()
+            child_pids = tuple(hw._sub_pids)
+
+            def orch(o, a, c):
+                o.submit_sub(sub)
+
+            for expected_count in (1, 2):
+                hw._start_hierarchical()
+                assert tuple(hw._sub_pids) == child_pids
+                assert hw._hierarchical_started is True
+                hw.run(orch)
+                assert _read_counter(counter_buf) == expected_count
+        finally:
+            hw.close()
+            counter_shm.close()
+            counter_shm.unlink()
+
+    @_hard_timeout(_TEST_WALL_BUDGET_S)
     def test_l4_l3_sub_subtree_ready_after_init_no_run(self):
         l3 = _l3_child(num_sub_workers=1)
         w4 = Worker(level=4, num_sub_workers=0, startup_timeout_s=_DEADLINE_AFTER_WATCHDOG_S)

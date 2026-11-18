@@ -14,8 +14,11 @@ import pytest
 from _capture_builder import Capture
 from _native_protocol_builder import ProtocolBuilder
 
-from simpler_setup.tools.hbg.native_causality import MIX, PRECLAIM, audit_native_protocol
+from simpler_setup.tools.hbg.native_causality import MIX, PRECLAIM, NativeAudit, audit_native_protocol
 from simpler_setup.tools.hbg.native_protocol import (
+    CONTROL_NOTIFY_ACCOUNTING,
+    COUNTER_ACCOUNTING,
+    MEMBER_FROM_CLAIM,
     STAMPS,
     _event_records,
     audit_protocol_sequences,
@@ -177,41 +180,58 @@ def test_current_close_layout_preserves_claim_seal_and_sync_start_proof(mask, bl
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
 
 
-@pytest.mark.parametrize("clusters", (2, 22))
-def test_current_close_seal_rows_do_not_alias(clusters):
-    raw, identities = ProtocolBuilder(
-        [(3, 2, ()), (2, 1, ()), (6, 2, ()), (7, 2, ())], clusters=clusters, sync_tasks=(0, 2, 3)
-    ).run()
+@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
+def test_owned_sync_close_uses_its_claim_without_fabricating_a_later_cursor_read(mask):
+    raw, identities = _claim_seal_capture(mask, 2, sync=True, clusters=3)
+    owners = {block["owner"]["worker_index"] for block in raw["blocks"]}
+    for member in raw["members"]:
+        if member["worker_index"] in owners:
+            member["flags"] |= MEMBER_FROM_CLAIM
+            member.update(closed_cursor=(1 << 64) - 1, claim_seal_seen=0, claim_cursor_seen=0)
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
-    mixed = [row for row in raw["admissions"] if row["close_seals"]]
-    mixed[1]["close_seals_offset"] = mixed[0]["close_seals_offset"] + clusters * 8
-    with pytest.raises(ValueError, match="aliased or wrong task close seals"):
+
+    member = next(member for member in raw["members"] if member["worker_index"] in owners)
+    member["closed_cursor"] = 1
+    with pytest.raises(ValueError, match="invalid owned-claim close proof"):
         audit_native_protocol(raw, identities)
 
 
-@pytest.mark.parametrize("fault", ("alias", "interior", "swap", "unaligned", "gap", "claim_seal"))
-def test_current_close_seal_rows_and_claim_seal_evidence_are_both_mandatory(fault):
-    raw, identities = ProtocolBuilder([(3, 2, ()), (6, 2, ()), (7, 2, ())], sync_tasks=(0, 1, 2)).run()
-    raw, identities = _set_claim_seal_observation(raw, identities)
-    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
-    mixed = [row for row in raw["admissions"] if row["close_seals"]]
-    if fault == "alias":
-        mixed[1]["close_seals_offset"] = mixed[0]["close_seals_offset"]
-    elif fault == "interior":
-        mixed[1]["close_seals_offset"] = mixed[0]["close_seals_offset"] + 64
-    elif fault == "swap":
-        mixed[1]["close_seals_offset"], mixed[2]["close_seals_offset"] = (
-            mixed[2]["close_seals_offset"],
-            mixed[1]["close_seals_offset"],
-        )
-    elif fault == "unaligned":
-        for row in mixed:
-            row["close_seals_offset"] += 8
-    elif fault == "gap":
-        mixed[2]["close_seals_offset"] += 128
-    else:
-        raw["task_controls"][0]["claim_seal"] = 0
-    with pytest.raises(ValueError, match="native protocol"):
+@pytest.mark.parametrize("mask", (1, 7))
+def test_zero_work_member_cannot_use_another_members_claim_for_close(mask):
+    raw, identities = _claim_seal_capture(mask, 2, sync=True, clusters=3)
+    member = next(member for member in raw["members"] if member["worker_index"] == 6)
+    member["flags"] |= MEMBER_FROM_CLAIM
+    member.update(closed_cursor=(1 << 64) - 1, claim_seal_seen=0, claim_cursor_seen=0)
+    with pytest.raises(ValueError, match="invalid owned-claim close proof"):
+        audit_native_protocol(raw, identities)
+
+
+def test_mix_late_lane_consumes_closed_prefix_after_another_lane_reuses_mailbox():
+    builder = ProtocolBuilder([(3, 2, ()), (5, 2, ())], sync_tasks=(0, 1))
+    builder.admit(0)
+    for block in range(2):
+        builder.mix_block(0, block, block)
+        builder.close(0, only_worker=block * 3)
+    builder.admit(1)
+    for block in range(2):
+        builder.mix_block(1, block, block)
+    builder.close(1)
+    for worker in (1, 4):
+        builder.close(0, only_worker=worker)
+    raw, identities = builder.run(order=[])
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+    assert all(
+        member["close_frontier"] == 2
+        for member in raw["members"]
+        if member["task_ref"] == 0 and member["worker_index"] in (1, 4)
+    )
+
+
+def test_mix_peer_cannot_observe_a_future_close_that_requires_its_own_retirement():
+    raw, identities = ProtocolBuilder([(7, 2, ()), (7, 2, ())], sync_tasks=(0, 1)).run()
+    member = next(member for member in raw["members"] if member["task_ref"] == 0 and member["worker_index"] == 1)
+    member["close_frontier"] = 2
+    with pytest.raises(ValueError):
         audit_native_protocol(raw, identities)
 
 
@@ -389,7 +409,7 @@ def test_sync_start_rejects_two_blocks_on_one_position_even_if_first_returned(ma
     builder.admit(0)
     worker = 0 if mask & 1 or mask == 6 else 1
     for block in range(2):
-        if mask.bit_count() > 1:
+        if bin(mask).count("1") > 1:
             builder.mix_block(0, block, 0)
         else:
             owner = builder.claim(0, block, worker)
@@ -405,7 +425,7 @@ def test_sync_start_local_close_and_next_task_can_precede_remote_claim(mask):
     builder = ProtocolBuilder([(mask, 2, ()), (mask, 2, ())], sync_tasks=(0, 1))
     builder.admit(0)
     builder.admit(1, observe_members=False)
-    mixed = mask.bit_count() > 1
+    mixed = bin(mask).count("1") > 1
     for block, cluster in enumerate((0, 1)):
         workers = [cluster * 3 + lane for lane in range(3)] if mixed else [cluster * 3 + int(mask != 1)]
         for task in (0, 1):
@@ -500,6 +520,24 @@ def test_independent_b_can_be_admitted_before_smaller_host_task_ref_a():
     raw, identities = builder.run(order=(1, 0))
     assert raw["admission_log"] == [1, 0]
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+
+
+def test_control_notification_join_does_not_use_the_accounting_cas_as_ready_time():
+    builder = ProtocolBuilder([(1, 1, ()), (0, 1, (0,)), (1, 1, (1,))])
+    raw, identities = builder.run()
+    actor = raw["task_events"][1]["completion"]
+    actor["flags"] |= CONTROL_NOTIFY_ACCOUNTING
+    actor["before"][0] = builder.clock + 10
+    actor["after"][0] = builder.clock + 20
+    resequence(raw)
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+
+
+def test_control_notification_flag_cannot_relabel_a_kernel_completion():
+    raw, identities = ProtocolBuilder([(1, 1, ())]).run()
+    raw["task_events"][0]["completion"]["flags"] |= CONTROL_NOTIFY_ACCOUNTING
+    with pytest.raises(ValueError, match="control notification accounting|completion alias"):
+        audit_native_protocol(raw, identities)
 
 
 def test_per_worker_clock_offsets_are_not_a_global_execution_order():
@@ -766,7 +804,7 @@ def test_converter_refuses_corrupt_present_protocol(tmp_path, mutation):
         "wrong_permit",
         "wrong_slot",
         "wrong_pending_slot",
-        "wrong_seal",
+        "wrong_frontier",
         "stale_ack",
         "missing_lane",
         "bad_placement",
@@ -793,7 +831,11 @@ def test_counts_and_complete_sequences_cannot_hide_protocol_corruption(mutation)
         "wrong_permit": (execution, "order_key", 1),
         "wrong_slot": (execution, "subtask_slot", 1),
         "wrong_pending_slot": (execution, "pending_slot", 2),
-        "wrong_seal": (raw["admissions"][1]["close_seals"], 0, raw["admissions"][1]["close_seals"][0] + 1),
+        "wrong_frontier": (
+            next(member for member in raw["members"] if member["task_ref"] == 1 and member["worker_index"] == 0),
+            "close_frontier",
+            len(raw["admission_log"]) + 1,
+        ),
         "stale_ack": (mixed["lanes"][1]["arrived_seq"], 2, 0),
         "missing_lane": (mixed["lanes"][0], "resource_mask", 6),
         "bad_placement": (mixed["lanes"][1], "lane_subtasks", [255, 2, 1]),
@@ -841,7 +883,7 @@ def test_ordinary_variable_grids_have_no_admission_membership(blocks):
     builder = ProtocolBuilder(shapes, clusters=6)
     raw, identities = builder.run()
     _set_claim_seal_observation(raw, identities)
-    raw.update(schema="hbg-native-protocol", close_seal_stride=64)
+    raw.update(schema="hbg-native-protocol")
     assert audit_native_protocol(raw, identities)["protocol_verified"]
     assert raw["cooperative_task_count"] == 0
     assert raw["admissions"] == raw["members"] == raw["blocks"] == []
@@ -852,16 +894,14 @@ def test_ordinary_variable_grids_have_no_admission_membership(blocks):
         audit_native_protocol(raw, identities)
 
 
-@pytest.mark.parametrize("mutation", (None, "record_alignment", "record_alias", "seal_alignment", "seal_alias"))
-def test_compact_admission_and_seals_accept_64_only_alignment_and_reject_bad_regions(mutation):
+@pytest.mark.parametrize("mutation", (None, "record_alignment", "record_alias"))
+def test_compact_admission_accepts_64_only_alignment_and_rejects_bad_regions(mutation):
     raw, identities = ProtocolBuilder([(7, 2, ()), (7, 2, (0,))], clusters=2, sync_tasks=(0, 1)).run()
     _set_claim_seal_observation(raw, identities)
-    raw.update(schema="hbg-native-protocol", close_seal_stride=64)
-    for index, row in enumerate(raw["admissions"]):
+    raw.update(schema="hbg-native-protocol")
+    for row in raw["admissions"]:
         row["record_offset"] += 64
-        row["close_seals_offset"] = 8192 + 64 + index * raw["cluster_count"] * 64
     assert raw["admissions"][0]["record_offset"] % 128 == 64
-    assert raw["admissions"][0]["close_seals_offset"] % 128 == 64
     assert audit_native_protocol(raw, identities)["protocol_verified"]
     if mutation is None:
         return
@@ -870,19 +910,15 @@ def test_compact_admission_and_seals_accept_64_only_alignment_and_reject_bad_reg
         first["record_offset"] += 8
     elif mutation == "record_alias":
         second["record_offset"] = first["record_offset"]
-    elif mutation == "seal_alignment":
-        first["close_seals_offset"] += 8
-    else:
-        second["close_seals_offset"] = first["close_seals_offset"]
-    with pytest.raises(ValueError, match="record|seal"):
+    with pytest.raises(ValueError, match="record"):
         audit_native_protocol(raw, identities)
 
 
-@pytest.mark.parametrize("flag", (2, 128))
+@pytest.mark.parametrize("flag", (128,))
 def test_current_cooperative_capture_rejects_independent_flag(flag):
     raw, identities = ProtocolBuilder([(1, 2, ())]).run()
     _set_claim_seal_observation(raw, identities)
-    raw.update(schema="hbg-native-protocol", close_seal_stride=64)
+    raw.update(schema="hbg-native-protocol")
     assert audit_native_protocol(raw, identities)["protocol_verified"]
     raw["tasks"][0]["flags"] |= flag
     raw["task_events"][0]["completion"]["flags"] |= flag
@@ -907,8 +943,8 @@ def _subtask_capture(shapes=((3, 2, ()), (2, 1, (0,))), *, deferred=()):
 def test_current_counts_actual_subtasks_and_aliases_mix_group_contribution(mask, blocks, deferred):
     raw, identities = _subtask_capture(((mask, blocks, ()), (2, 1, (0,))), deferred=deferred)
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
-    assert raw["task_controls"][0]["completed_subtasks"] == blocks * mask.bit_count()
-    if mask.bit_count() > 1:
+    assert raw["task_controls"][0]["completed_subtasks"] == blocks * bin(mask).count("1")
+    if bin(mask).count("1") > 1:
         last = max(
             (b["owner"] for b in raw["blocks"] if b["owner"]["task_ref"] == 0),
             key=lambda owner: owner["completion_ticket"],
@@ -1094,3 +1130,161 @@ def test_mix_group_completion_preserves_unique_credit_and_physical_retirement(fa
         done["before"] = last["completion_before"].copy()
     with pytest.raises(ValueError):
         audit_native_protocol(raw, identities)
+
+
+def _counter_capture(*, mask=1, separate=False, successor=False, sync=False, async_mask=None):
+    shapes: list[tuple[int, int, tuple[int, ...]]] = [(mask, 2, ())]
+    if successor:
+        shapes.append((1, 1, (0,)))
+    builder = ProtocolBuilder(shapes, sync_tasks=(0,) if sync else ())
+    raw, identities = builder.run()
+    threshold = 0
+    assert len(raw["tasks"]) == len(raw["task_controls"]) == len(raw["task_events"])
+    for task, control, actors in zip(raw["tasks"], raw["task_controls"], raw["task_events"]):
+        task_async_mask = task["active_mask"] if async_mask is None else task["active_mask"] & async_mask
+        threshold += task["block_num"] * (bin(task["active_mask"]).count("1") + bin(task_async_mask).count("1"))
+        control.update(completion_backend=1, counter_index=0, counter_threshold=threshold, async_mask=task_async_mask)
+        done = actors["completion"]
+        done["flags"] = task["flags"] | COUNTER_ACCOUNTING | ((1 << 31) if separate else 0)
+        when = builder.clock + 100 + 4 * task["task_ref"]
+        done.update(before=[when, 1], after=[when + 1, 1])
+    for control in raw["task_controls"]:
+        control["counter_limit"] = threshold
+    raw["completion_counters"] = [dict(index=0, value=threshold, valid=1, limit=threshold)]
+    for block in raw["blocks"]:
+        owner = block["owner"]
+        mixed = bool(raw["tasks"][owner["task_ref"]]["flags"] & MIX)
+        may_defer = bool(raw["task_controls"][owner["task_ref"]]["async_mask"])
+        owner.update(
+            completion_ticket=(1 << 64) - 1,
+            completion_credits=bin(owner["active_mask"]).count("1")
+            if mixed
+            else (1 if separate or not may_defer else 2),
+        )
+    for execution in raw["executions"]:
+        task = raw["tasks"][execution["task_ref"]]
+        mixed = bool(task["flags"] & MIX)
+        may_defer = bool(raw["task_controls"][execution["task_ref"]]["async_mask"] & (1 << execution["subtask_slot"]))
+        if not mixed:
+            execution.update(
+                contribution_ticket=(1 << 64) - 1, contribution_credits=1 if separate or not may_defer else 2
+            )
+        if may_defer and (mixed or separate):
+            when = execution["completion_consumed"][0] + 1
+            raw["condition_contributions"].append(
+                dict(
+                    index=execution["index"],
+                    run_epoch=raw["run_epoch"],
+                    task_ref=execution["task_ref"],
+                    worker_index=execution["worker_index"],
+                    block_idx=execution["block_idx"],
+                    subtask_slot=execution["subtask_slot"],
+                    source=1 if separate else 0,
+                    credits=1,
+                    before=[when, 1],
+                    after=[when + 1, 1],
+                )
+            )
+    resequence(raw)
+    return raw, identities
+
+
+@pytest.mark.parametrize(
+    ("mask", "separate", "sync"),
+    [(1, False, False), (1, True, False), (1, False, True), (3, False, False), (6, True, True)],
+)
+def test_counter_credits_preserve_physical_and_condition_causality_without_return_tickets(mask, separate, sync):
+    raw, identities = _counter_capture(mask=mask, separate=separate, sync=sync)
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+
+
+def test_counter_fixture_accepts_python39_zip_signature(monkeypatch):
+    standard_zip = zip
+
+    def zip_without_keywords(*iterables):
+        return standard_zip(*iterables)
+
+    monkeypatch.setitem(globals(), "zip", zip_without_keywords)
+    raw, identities = _counter_capture(successor=True)
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+
+
+def test_counter_successor_does_not_wait_for_deferred_gm_accounting():
+    raw, identities = _counter_capture(successor=True)
+    assert raw["executions"][-1]["entry"][0] < raw["task_events"][0]["completion"]["before"][0]
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+
+
+@pytest.mark.parametrize(("mask", "async_mask"), [(1, 0), (3, 0), (7, 6)])
+def test_counter_sync_lanes_need_only_physical_credits(mask, async_mask):
+    raw, identities = _counter_capture(mask=mask, async_mask=async_mask)
+    assert raw["completion_counters"][0]["limit"] == 2 * (bin(mask).count("1") + bin(async_mask).count("1"))
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+    raw["task_controls"][0]["async_mask"] ^= 1
+    with pytest.raises(ValueError, match="counter thresholds"):
+        audit_native_protocol(raw, identities)
+
+
+def test_counter_publication_can_be_observed_before_the_publishers_after_sample():
+    raw, identities = _counter_capture(successor=True)
+    publisher, successor = raw["executions"][1:]
+    assert publisher["worker_index"] != successor["worker_index"]
+    publisher["contribution_after"][0] = successor["entry"][0] + 1
+    publisher["trace_published"][0] = successor["entry"][0] + 2
+    resequence(raw)
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "credits",
+        "ticket",
+        "missing_condition",
+        "late_condition",
+        "incomplete",
+        "ancestor",
+        "threshold",
+        "accounting_alias",
+    ],
+)
+def test_counter_capture_rejects_missing_or_fabricated_completion_proof(fault):
+    raw, identities = _counter_capture(separate=True, successor=True)
+    if fault == "credits":
+        raw["executions"][0]["contribution_credits"] = 2
+    elif fault == "ticket":
+        raw["executions"][0]["contribution_ticket"] = 0
+    elif fault == "missing_condition":
+        raw["condition_contributions"].pop(0)
+    elif fault == "late_condition":
+        condition = raw["condition_contributions"][0]
+        execution = raw["executions"][-1]
+        condition["worker_index"] = execution["worker_index"]
+        condition["before"][0] = execution["trace_published"][0] + 1
+        condition["after"][0] = execution["trace_published"][0] + 2
+    elif fault == "incomplete":
+        raw["completion_counters"][0]["value"] -= 1
+    elif fault == "ancestor":
+        raw["tasks"][1]["dependencies"] = []
+    elif fault == "threshold":
+        raw["task_controls"][0]["counter_threshold"] += 2
+    else:
+        raw["task_events"][0]["completion"]["flags"] |= 1 << 30
+    resequence(raw)
+    with pytest.raises(ValueError):
+        audit_native_protocol(raw, identities)
+
+
+@pytest.mark.parametrize("mask", (1, 3), ids=("ordinary", "mix"))
+def test_counter_check_cannot_contribute_before_its_kernel_returns(mask):
+    raw, identities = _counter_capture(mask=mask, separate=True)
+    condition = raw["condition_contributions"][0]
+    execution = raw["executions"][condition["index"]]
+    condition["before"][0] = execution["entry"][0] + 1
+    condition["after"][0] = execution["returned"][0] - 1
+    resequence(raw)
+    # Exercise the condition contract directly. The full audit also rejects
+    # same-worker scheduler events inside a kernel for an independent reason.
+    audit = NativeAudit(raw, identities)
+    with pytest.raises(ValueError, match="counter condition precedes its execution return"):
+        audit.counter_condition(condition["index"], ("ready", 0), raw["tasks"][0])

@@ -11,22 +11,10 @@
 
 #pragma once
 
-#include "callable.h"
+#include "callable_entry.h"
 #include "scheduler/scheduler_async_layout.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
-
-enum class SchedulerCallableAddressSpace { DEVICE, HOST };
-
-inline uint64_t scheduler_resolve_callable_entry(uint64_t object, SchedulerCallableAddressSpace address_space) {
-    if (object == 0 || object % alignof(CoreCallable) != 0) return 0;
-    if (address_space == SchedulerCallableAddressSpace::HOST)
-        return reinterpret_cast<const CoreCallable *>(object)->resolved_addr();
-    // Onboard registration patches resolved_addr to this binary address;
-    // the device object itself is not readable through a Host pointer.
-    constexpr uint64_t offset = CoreCallable::binary_data_offset();
-    return object > UINT64_MAX - offset ? 0 : object + offset;
-}
 
 inline bool scheduler_prepare_host_calls(
     void *base, const AicoreSchedulerLayout &layout, uint64_t device_base, int64_t task_ref, const uint64_t *functions,
@@ -106,6 +94,14 @@ inline bool scheduler_prepare_host_calls(
             call.args[SPMD_LOCAL_CONTEXT_INDEX] = binding + offsetof(SchedulerExecutionBinding, local_context);
             call.args[SPMD_GLOBAL_CONTEXT_INDEX] = binding + offsetof(SchedulerExecutionBinding, global_context);
             auto &global = bindings[index].global_context;
+            // Synchronous bindings never call begin/seal. Clear every async
+            // field here, including after a previous run used a deferred group.
+            global.async_present = 0;
+            global.async_output_capture_refused = 0;
+            global.async_image_address = 0;
+            global.async_image_bytes = 0;
+            global.async_run_epoch = 0;
+            global.async_group_offset = 0;
             global.async_group_index = pto2::resident::ASYNC_INVALID_INDEX;
             if (async_task != nullptr && async_task->async_mask.has(static_cast<SubtaskSlot>(lane))) {
                 const uint32_t group = async_task->group_base + block * async_task->async_mask.count() +

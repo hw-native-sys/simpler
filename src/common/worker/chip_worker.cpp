@@ -2737,7 +2737,7 @@ bool ChipWorker::host_ddr_mapping_supported() const noexcept {
 
 uint64_t ChipWorker::map_host_ddr(uint64_t host, uint64_t bytes) {
     if (!initialized_ || !host_ddr_mapping_supported())
-        throw std::runtime_error("Host mapping requires an initialized A5 onboard runtime");
+        throw std::runtime_error("Host mapping requires an initialized onboard runtime with Host mapping support");
     if (!host || !bytes || host > UINT64_MAX - bytes)
         throw std::invalid_argument("Host mapping requires a nonempty address range");
     validate_execution_context();
@@ -2753,6 +2753,8 @@ uint64_t ChipWorker::map_host_ddr(uint64_t host, uint64_t bytes) {
     if (rc != 0) {
         it->second.closing = true;
         if (!it->second.registered) host_ddr_mappings_.erase(it);
+        if (rc == SIMPLER_HOST_DDR_CONTEXT_RESTORE_FAILED)
+            throw std::runtime_error("Host DDR registered but restoring the caller context failed");
         throw std::runtime_error("Host DDR mapping failed: " + std::to_string(rc));
     }
     return it->second.mapped;
@@ -2766,6 +2768,10 @@ void ChipWorker::unmap_host_ddr(uint64_t host) {
     it->second.closing = true;
     using Unmap = int (*)(DeviceContextHandle, int, uint64_t);
     const int rc = runtime_module_->required<Unmap>("host_ddr_unmap_ctx")(device_ctx_, device_id_, host);
+    if (rc == SIMPLER_HOST_DDR_CONTEXT_RESTORE_FAILED) {
+        host_ddr_mappings_.erase(it);
+        throw std::runtime_error("Host DDR unregistered but restoring the caller context failed");
+    }
     if (rc != 0) throw std::runtime_error("Host DDR unmapping failed: " + std::to_string(rc));
     host_ddr_mappings_.erase(it);
 }

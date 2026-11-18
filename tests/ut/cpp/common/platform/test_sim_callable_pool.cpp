@@ -215,7 +215,9 @@ std::vector<uint8_t> loadable_kernel_bytes() {
 }
 
 std::vector<uint8_t> make_child(const std::vector<uint8_t> &binary) {
-    return make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, binary.data(), static_cast<uint32_t>(binary.size()));
+    return make_callable<CORE_MAX_TENSOR_ARGS>(
+        nullptr, 0, binary.data(), static_cast<uint32_t>(binary.size()), {1, CoreAsyncMode::SYNCHRONOUS, 0, 0, 0}
+    );
 }
 
 // A ChipCallable whose children claim `func_ids`, each carrying `binary`.
@@ -324,6 +326,33 @@ TEST_F(SimCallablePoolTest, AnEmptyLaunchNeverEntersTheBackend) {
     EXPECT_EQ(outcome.prepared, nullptr);
     EXPECT_EQ(outcome.active, nullptr);
     EXPECT_EQ(runner.launch_calls, 0);
+}
+
+TEST_F(SimCallablePoolTest, RegistrationCanonicalizesUnknownWithoutMutatingInput) {
+    auto raw = make_chip({0, 7}, kernel_, 0x12);
+    auto *image = reinterpret_cast<ChipCallable *>(raw.data());
+    const_cast<CoreCallable &>(image->child(1)).async_capability_ = {};
+    const auto unchanged = raw;
+    auto canonical = raw;
+    normalize_chip_callable_buffer(canonical.data(), canonical.size());
+    const auto address = runner_.upload_chip_callable_buffer(as_chip(raw));
+    ASSERT_NE(address, 0u);
+    EXPECT_EQ(raw, unchanged);
+    EXPECT_EQ(runner_.upload_chip_callable_buffer(as_chip(canonical)), address);
+    EXPECT_EQ(runner_.pool_size(), 1u);
+    const auto *retained = reinterpret_cast<const ChipCallable *>(address);
+    EXPECT_EQ(retained->child(1).async_capability().mode, CoreAsyncMode::DEFERRED);
+    EXPECT_EQ(retained->child(1).async_capability().max_conditions, 64);
+    EXPECT_EQ(retained->child(1).async_capability().condition_types, 3);
+    EXPECT_EQ(runner_.view(hash_of(raw)).refcount, 2);
+}
+
+TEST_F(SimCallablePoolTest, RegistrationRejectsMalformedUnknown) {
+    auto raw = make_chip({0}, kernel_, 0x12);
+    auto *image = reinterpret_cast<ChipCallable *>(raw.data());
+    const_cast<CoreCallable &>(image->child(0)).async_capability_ = {1, static_cast<CoreAsyncMode>(0), 1, 0, 0};
+    EXPECT_EQ(runner_.upload_chip_callable_buffer(image), 0u);
+    EXPECT_EQ(runner_.pool_size(), 0u);
 }
 
 TEST_F(SimCallablePoolTest, AFailedRegistrationPublishesNothing) {
@@ -805,7 +834,7 @@ TEST(SimDeviceBinding, SuccessfulLegacyBindingAndCheckedValidation) {
 
 #if defined(__linux__)
 TEST(SimIdentityDeathTest, PartialKeyFailureRollsBackAndRetriesWithoutTouchingOtherKeys) {
-    for (int position : {0, 1}) {
+    for (int position : {0, 1, 2}) {
         ASSERT_EXIT(
             {
                 auto budget = [] {
@@ -827,7 +856,7 @@ TEST(SimIdentityDeathTest, PartialKeyFailureRollsBackAndRetriesWithoutTouchingOt
                 if (budget() != before || pthread_getspecific(sentinel) != &value) _exit(3);
                 if (sim_context_set_subblock_id(1) != 0 || sim_context_set_cluster_id(7) != 0) _exit(4);
                 if (pto_sim_get_subblock_id() != 1) _exit(5);
-                if (budget() != before - 2 || pthread_getspecific(sentinel) != &value) _exit(6);
+                if (budget() != before - 3 || pthread_getspecific(sentinel) != &value) _exit(6);
                 pthread_key_delete(sentinel);
                 _exit(0);
             },
@@ -856,6 +885,30 @@ TEST(SimIdentity, FailedUpdatesPreserveIdentityAndAllowRetry) {
     pto_cpu_sim_release_device(971);
 }
 #endif
+
+TEST(SimInvocationContext, BindingIsThreadLocalAndFailedUpdatePreservesContext) {
+    int first = 1;
+    int second = 2;
+    ASSERT_EQ(sim_context_bind_invocation_context(&first), 0);
+    EXPECT_EQ(sim_context_get_invocation_context(), &first);
+    bool other_ok = false;
+    std::thread other([&]() {
+        other_ok = sim_context_get_invocation_context() == nullptr &&
+                   sim_context_bind_invocation_context(&second) == 0 &&
+                   sim_context_get_invocation_context() == &second &&
+                   sim_context_bind_invocation_context(nullptr) == 0 && sim_context_get_invocation_context() == nullptr;
+    });
+    other.join();
+    EXPECT_TRUE(other_ok);
+    EXPECT_EQ(sim_context_get_invocation_context(), &first);
+#if defined(__linux__)
+    reject_device_bind = true;
+    EXPECT_EQ(sim_context_bind_invocation_context(&second), ENOMEM);
+    EXPECT_EQ(sim_context_get_invocation_context(), &first);
+#endif
+    ASSERT_EQ(sim_context_bind_invocation_context(nullptr), 0);
+    EXPECT_EQ(sim_context_get_invocation_context(), nullptr);
+}
 
 TEST(SimCancellation, BindingIsThreadLocalAndClearedBeforeReuse) {
     constexpr uint32_t stop = 0x7ffffff0;

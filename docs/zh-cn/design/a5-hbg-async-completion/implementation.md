@@ -1,5 +1,7 @@
 # A5 HBG 异步完成实施方案
 
+**共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](../a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前实现、拟修改布局和未来 STARS 后端分别标明。
+
 [返回总览](../a5-hbg-async-completion.md)。实现以可运行的非阻塞等待为首要闭环，复用既有注册、参数、Graph 和资源 owner。
 
 ## 1. 修改边界

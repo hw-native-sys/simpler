@@ -36,6 +36,8 @@ struct AicoreSchedulerLayout {
     uint64_t worker_contexts_offset;
     uint64_t task_metadata_offset;
     uint64_t task_controls_offset;
+    uint64_t done_notifications_offset;
+    uint64_t completion_counters_offset;
     uint64_t trace_cells_offset;
     uint64_t pmu_cells_offset;
     uint64_t activity_buffers_offset;
@@ -49,11 +51,7 @@ struct AicoreSchedulerLayout {
     SchedulerSpmdRequirements spmd;
     uint64_t admission_control_offset;
     uint64_t admission_records_offset;
-    uint64_t admission_record_stride;
     uint64_t admission_log_offset;
-    uint64_t group_mailboxes_offset;
-    uint64_t mix_close_seals_offset;
-    uint64_t mix_close_seal_count;
     uint64_t protocol_layout_offset;
     SchedulerProtocolLayout protocol;
 };

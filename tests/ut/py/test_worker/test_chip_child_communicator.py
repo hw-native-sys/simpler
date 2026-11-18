@@ -49,6 +49,7 @@ def _run_controls(
     workspace_mask=0,
     urma_jetties=1,
     urma_sq_depth=0,
+    ccu_mode=1,
     host_shm_name="",
     abort_initialization=False,
 ):
@@ -91,8 +92,8 @@ def _run_controls(
         assert domain_buf is not None
         worker_mod._DOMAIN_REQ_HEADER.pack_into(domain_buf, 0, 7, 1, 0, 64, 0)
         struct.pack_into("<I", domain_buf, worker_mod._DOMAIN_WORKSPACE_MASK_OFFSET, workspace_mask)
-        worker_mod._DOMAIN_URMA_CONFIG.pack_into(
-            domain_buf, worker_mod._DOMAIN_URMA_CONFIG_OFFSET, urma_jetties, urma_sq_depth
+        worker_mod._DOMAIN_WORKSPACE_CONFIG.pack_into(
+            domain_buf, worker_mod._DOMAIN_WORKSPACE_CONFIG_OFFSET, urma_jetties, urma_sq_depth, ccu_mode
         )
         struct.pack_into("<I", domain_buf, worker_mod._DOMAIN_REQ_HEADER.size, 0)
         if host_shm_name:
@@ -205,6 +206,7 @@ def test_bootstrap_handle_is_forwarded_without_mutating_runtime(monkeypatch):
         "workspace_mask": 0,
         "urma_jetties_per_aiv": 1,
         "urma_sq_depth": 0,
+        "ccu_mode": 1,
     }
     cw.comm_release_domain_windows.assert_called_once_with(0x1234, 7, 1, 0)
     assert published == (1, 0xC7, 0xB000, 4096, 0)
@@ -229,6 +231,7 @@ def test_async_workspace_mask_reaches_native_unmodified(monkeypatch, workspace_m
         "workspace_mask": workspace_mask,
         "urma_jetties_per_aiv": 1,
         "urma_sq_depth": 0,
+        "ccu_mode": 1,
     }
 
 
@@ -280,8 +283,9 @@ def test_failed_reinitialization_preserves_the_established_handle(monkeypatch, f
     cw.comm_release_domain_windows.assert_called_once_with(0x3456, 7, 1, 0)
 
 
+@pytest.mark.parametrize("ccu_mode", [0, 1])
 @pytest.mark.parametrize("host_shm_name", ["", "host_config_window"])
-def test_urma_queue_configuration_survives_child_control(monkeypatch, host_shm_name):
+def test_workspace_configuration_survives_child_control(monkeypatch, host_shm_name, ccu_mode):
     cw, responses, _ = _run_controls(
         monkeypatch,
         [0x1234],
@@ -289,6 +293,7 @@ def test_urma_queue_configuration_survives_child_control(monkeypatch, host_shm_n
         workspace_mask=3,
         urma_jetties=2,
         urma_sq_depth=512,
+        ccu_mode=ccu_mode,
         host_shm_name=host_shm_name,
     )
     assert responses == [(0, "")] * 2
@@ -297,4 +302,5 @@ def test_urma_queue_configuration_survives_child_control(monkeypatch, host_shm_n
         "workspace_mask": 3,
         "urma_jetties_per_aiv": 2,
         "urma_sq_depth": 512,
+        "ccu_mode": ccu_mode,
     }

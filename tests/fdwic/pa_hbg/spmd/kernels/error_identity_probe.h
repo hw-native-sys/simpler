@@ -70,7 +70,7 @@ static inline __aicore__ void error_identity_probe(__gm__ int64_t *args, uint32_
             run, block,
             scenario == 1 ? SchedulerGraphResult::INVALID_CALLABLE : SchedulerGraphResult::INVALID_ARGUMENTS, nullptr,
             nullptr,
-            scenario == 1 ? SchedulerErrorSite::DISPATCH_INVALID_CALLABLE : SchedulerErrorSite::GROUP_INVALID_STATE,
+            scenario == 1 ? SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED : SchedulerErrorSite::GROUP_INVALID_STATE,
             &identity
         );
         identity.run_epoch += 1000;
@@ -133,10 +133,10 @@ static inline __aicore__ void error_identity_probe(__gm__ int64_t *args, uint32_
         observed_identity[2] != expected_order || observed_identity[3] != expected_block ||
         observed_identity[4] != expected_group || observed_identity[5] != winner % 96 ||
         observed_identity[6] != (expected_fields << 32 | expected_lane) ||
-        observed_identity[7] !=
-            static_cast<uint64_t>(
-                scenario == 1 ? SchedulerErrorSite::DISPATCH_INVALID_CALLABLE : SchedulerErrorSite::GROUP_INVALID_STATE
-            ))
+        observed_identity[7] != static_cast<uint64_t>(
+                                    scenario == 1 ? SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED :
+                                                    SchedulerErrorSite::GROUP_INVALID_STATE
+                                ))
         errors |= 1024;
     check->block_plus_one = static_cast<int64_t>(errors);
     check->block_num = static_cast<int64_t>(winner);

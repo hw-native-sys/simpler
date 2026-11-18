@@ -7,10 +7,10 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Standard L1 collection streams beyond one buffer and survives repeated runs."""
+"""Percounter profiling levels, task milestones and stream reuse."""
 
 import json
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import pytest
@@ -155,19 +155,51 @@ def test_profile_levels(st_platform, st_device_ids, tmp_path, levels):
                     timing = raw["scheduler_tasks"]
                     assert timing["producer"] == "aicore"
                     assert {(r[0], r[1], r[4]) for r in timing["records"]} == {(r[0], r[2], r[6]) for r in rows}
+                    milestones = raw["percounter_task_events"]
+                    assert milestones["dropped"] == milestones["unmatched_deferred_updates"] == 0
+                    per_block = defaultdict(list)
+                    for event in milestones["records"]:
+                        per_block[(event["task_id"], event["block_index"])].append(event)
+                    assert len(per_block) == blocks * TASKS
+                    for events in per_block.values():
+                        assert len(events) == 4
+                        by_kind = {e["kind"]: e for e in events}
+                        claim, ready, kernel, completion = (
+                            by_kind[k] for k in ("claim", "ready", "kernel_end", "completion_issue")
+                        )
+                        assert claim["cycles"] <= ready["cycles"] <= kernel["kernel_start_cycles"]
+                        assert kernel["kernel_start_cycles"] <= kernel["cycles"] <= completion["cycles"]
+                        assert completion["contribution"] == 1
+                        assert all(e["block_count"] == blocks for e in events)
+                        assert len({(e["worker_id"], e["run_epoch"]) for e in events}) == 1
                 else:
                     assert not raw.get("scheduler_tasks", {}).get("records")
+                    assert "percounter_task_events" not in raw
                 if level >= 3:
                     streams = raw["scheduler_records"]["streams"]
                     assert streams and all(s["capture"]["dropped"] == 0 for s in streams)
                     kinds = {r["kind"] for s in streams for r in s["records"]}
-                    assert {"scalar_window", "scalar_trace_finish", "scalar_bypass_load"} <= kinds
+                    assert {"scalar_window", "scalar_trace_finish"} <= kinds
+                    memory_prefixes = (
+                        "scalar_bypass_",
+                        "scalar_atomic_",
+                        "scalar_ssbuf_",
+                        "scalar_dsb_",
+                        "scalar_dcci_",
+                    )
                     if level == 4:
-                        assert "scalar_percounter_run_prepared" in kinds
+                        assert {"scalar_percounter_run_task", "scalar_bypass_load", "scalar_ssbuf_store"} <= kinds
+                    else:
+                        assert not any(kind.startswith(memory_prefixes) for kind in kinds)
+                else:
+                    assert not raw.get("scheduler_records", {}).get("streams")
+                if level >= 2:
                     data = read_perf_data(paths[0])
-                    profiles = data["scalar_profiles"]
+                    profiles = data.get("scalar_profiles", [])
+                    assert bool(profiles) == (level >= 3)
                     assert all(p["complete"] for p in profiles)
-                    assert sum(p["kernel_cycles"] for p in profiles) == sum(r[4] - r[3] for r in rows)
+                    if profiles:
+                        assert sum(p["kernel_cycles"] for p in profiles) == sum(r[4] - r[3] for r in rows)
                     assert all(sum(p["exclusive_cycles"].values()) == p["window_cycles"] for p in profiles)
                     assert all((p["function_min_cycles"] == 0) == (level == 4) for p in profiles)
                     trace = output / "swimlane.json"
@@ -175,19 +207,19 @@ def test_profile_levels(st_platform, st_device_ids, tmp_path, levels):
                         data["tasks"],
                         str(trace),
                         runtime_name="percounter",
-                        scheduler_phases=data["scheduler_records"],
-                        scheduler_streams=data["scheduler_streams"],
+                        scheduler_phases=data.get("scheduler_records"),
+                        scheduler_streams=data.get("scheduler_streams"),
                         scalar_profiles=profiles,
                         scheduler_task_producer=data["scheduler_task_producer"],
                         chip_swimlane_level=level,
+                        percounter_task_events=data["percounter_task_events"],
                     )
                     events = json.loads(trace.read_text())["traceEvents"]
-                    assert any(e.get("pid") == 2 and e.get("name") == "trace_finish" for e in events)
-                    assert not any(e.get("ph") == "X" and e.get("pid") == 3 for e in events)
-                else:
-                    assert not raw.get("scheduler_records", {}).get("streams")
-                if level == 4:
-                    assert raw.get("host_orchestrator_phases")
+                    assert any(e.get("pid") == 2 and e.get("name") == "trace_finish" for e in events) == (level >= 3)
+                    assert any(
+                        e.get("pid") == 3 and e.get("ph") == "i" and e["args"]["kind"] == "claim" for e in events
+                    )
+                assert bool(raw.get("host_orchestrator_phases")) == (level == 4)
         finally:
             worker.free(buffer)
     finally:

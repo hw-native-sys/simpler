@@ -139,6 +139,14 @@ using GraphBuffer = BasicGraphBuffer<8192>;
 // overrides that context rather than resizing this.
 inline constexpr uint64_t kFixtureCallableCount = 1024;
 
+// Read the same global progress fact as run completion; the GM word is only
+// authoritative when no CntNotify is mapped.
+inline uint64_t resolved_count(SchedulerRunControl *run) {
+    if (run->run_completed_read_address != 0)
+        return scheduler_notify_query(*reinterpret_cast<volatile uint32_t *>(run->run_completed_read_address));
+    return scheduler_gm_query(run->resolved_task_count);
+}
+
 struct FixtureStorage {
     explicit FixtureStorage(
         uint64_t task_count, uint64_t workers = 2, uint64_t traces_per_task = 1,
@@ -183,6 +191,7 @@ struct FixtureStorage {
                 static_cast<int32_t>(worker % PLATFORM_CORES_PER_BLOCKDIM == 0 ? CoreType::AIC : CoreType::AIV);
             context.task_controls_offset = layout.task_controls_offset;
             context.task_metadata_offset = layout.task_metadata_offset;
+            context.done_notifications_offset = layout.done_notifications_offset;
 
             context.trace_cells_offset = layout.trace_cells_offset;
             context.worker_contexts_offset = layout.worker_contexts_offset;
@@ -328,6 +337,8 @@ struct FixtureStorage {
         config.graph = &graph;
         config.task_controls_offset = context->task_controls_offset;
         config.task_metadata_offset = context->task_metadata_offset;
+        config.done_notifications_offset = context->done_notifications_offset;
+        config.completion_counters_offset = context->completion_counters_offset;
         config.task_catalog_offset = task_catalog_offset;
         local->profiling->trace_cells_offset = context->trace_cells_offset;
         local->profiling->activity_buffers_offset = context->activity_buffers_offset;

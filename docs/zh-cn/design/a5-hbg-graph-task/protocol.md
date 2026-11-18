@@ -1,8 +1,24 @@
 # A5 Graph task 调度与发布协议
 
+**共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前 DONE 使用 CntNotify SRAM，其他拟修改后端分别标明。
+
 本文描述当前 resident 执行合同。节点、布局和 Host 地址来源见[数据布局](data-layout.md)；
 [目录与 token](ready-queue-design.md)说明工作发现，[canonical gate](dependency-counters.md)说明依赖完成。
 所有参与者在一次 run 中使用同一 epoch、worker 身份和稳定 backing。
+
+## GM 操作与时序边界
+
+按统一硬件工作模型，`ld_dev/st_dev` 经 L2，atomic 走 HBM；两类请求在 SoC 总线上均不保序。
+发布者完成数据写入/缓存维护后，须在通知发布前执行相应 DSB；消费者读到合法通知后，
+须在依赖它的数据读取或下一状态操作前完成相应 DSB 与必要缓存获取。
+成功 atomic 只证明该次竞争结果，不自动发布此前其他地址的数据。
+可合并没有中间依赖的一批操作的屏障，不能将有中间消费者的排序推迟到 run 末尾。
+
+唯一 owner 的通知可按字段合同采用 `st_dev`；多写者 claim、完成汇合和交权仍由 atomic 裁定。
+独立竞争单元按 128B 隔离，64B 仅描述 Scalar DCache 维护。
+GM 同址读取也有争用，故同一次推进中的合法观察值应带身份传递，不在下层重复读或 FAA(0)确认。
+CntNotify DONE 与后续其他 STARS Wait 均须保持本页的 epoch、MIX/sync_start、defer_wait 与退休语义，
+加 `nop` 限制空轮询入口带宽；当前 SPR 握手不构成通用 event 分配机制。
 
 ## 从设备入口到 launch gate
 
@@ -40,7 +56,7 @@ Host 每个真实 block/lane 生成一个 immutable Call：函数地址、完整
 Binding 的 LocalContext 与 GlobalContext 分占 cache line；逻辑 block geometry 和 async group 地址在 launch 前绑定。
 四个普通 token 可以提前取得这些 Call，依赖满足后再转入两个本核 slot。
 
-kernel 最终入口前仍需验证自己的 epoch、Claim owner/generation 和共享 admission/resource 状态。
+kernel 最终入口前仍需验证自己的 epoch、Claim 固定 owner 和共享 admission/resource 状态。
 predicate 在支持的单 block/lane 形状下按依赖顺序求值；false 跳过函数并保留正常的贡献与退休责任。
 损坏参数、非法 predicate 和不支持的 shape 在 Host 拒绝或进入设备首错处理，不能降级成普通完成。
 
@@ -54,7 +70,7 @@ predicate 在支持的单 block/lane 形状下按依赖顺序求值；false 跳�
 AIC 发现 MIX 并保留对应 block 的 group reservation；AIV 按已经发布的具体 group 参加，不能自由执行其他 cluster 的 slot。
 coordinator 写回 descriptor 并 barrier 后发布对应 lane 的 assigned_seq；arrived_seq/released_seq 记录各 lane 的进出责任。
 GROUP_RESERVED 可以等待 fanin，等待期间固定保留原组责任，不转移或跨簇重领。
-资源等待期间继续处理 async/control 进展，并在执行前重查 owner/generation、fanin 与 admission；原组的执行责任保持不变。
+资源等待期间继续处理 async/control 进展，并在执行前重查 固定 owner、fanin 与 admission；原组的执行责任保持不变。
 
 sync_start 使用全 run 的 cooperative admission 顺序与显式成员集合。
 一次 cohort 只覆盖一个 logical task 的 blocks，不覆盖整个 Graph，也不给每个 Graph 单独建顺序域。
@@ -63,7 +79,9 @@ MIX 资源 lane 的 release 负责资源退休，不增加一个未执行 kernel
 
 ## 完成、诊断与清退
 
-真实执行返回后 seal async registration，并在 owner/generation 证明下将 Claim 改为 RETURNED。
+真实执行返回后 seal async registration，并按固定 owner 退休执行责任。
+普通 TICKET_OWNED 记录由 owner 按数据发布合同维护；最后成功返回可复用同次完成贡献证明退休，
+不要求额外的 RETURNED 原子。MIX/cohort 仍按其协作状态与 ACK 合同发布返回。
 compute return 同时减少 canonical gate 的 computation 和 compute debt；async FINISH 清除额外 debt。
 合法零 gate 向消费者证明 DONE；resolved run 汇总可以稍后批量提交。
 trace 和 MIX/group retirement 仍由拥有者完成后，slot 才可复用。

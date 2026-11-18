@@ -1,5 +1,7 @@
 # A5 HBG 消费者数据可见性
 
+**共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](../a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前实现、拟修改布局和未来 STARS 后端分别标明。
+
 [返回总览](../a5-hbg-async-completion.md)。逻辑依赖解除与消费者读取到新数据分别验证，不以新增公共资源协议作为前提。
 
 ## 1. 先验证既有读取路径
@@ -18,7 +20,7 @@ signal 地址不能独自描述 payload，控制依赖也不能凭空给出数�
 
 ## 3. 必要获取的执行位置
 
-run 入口保留既有全 DCache 获取。首次非零 group 发布前置位单调活动标记；依赖该等待的消费者取得执行许可时，必须能通过 bypass load 观察到该标记。活动开始后，基础实现沿用既有全 DCache 观察原语，在依赖满足、最终执行许可确定后，由实际执行核获取输入，再写入本次执行的新异步上下文并调用 kernel。整个 run 从未登记条件时跳过这次额外获取。标记只能在 run 开始前清零，且发布者使用 bypass store 加设备屏障；不得把原子发布、可能被 bypass 读到旧值的字直接用作此门控。这样同步消费者也能读取外部更新的 payload，不依赖完成条件由哪个核观察。该位置之前的调度记录写入必须已发布；不能用获取操作代替发布旧 dirty payload 的所有权处理。具体读取路径和维护成本仍按硬件用例及性能矩阵验证。
+run 入口保留既有全 DCache 获取。首次非零 group 发布前置位单调活动标记；依赖该等待的消费者取得执行许可时，必须能通过 bypass load 观察到该标记。活动开始后，基础实现沿用既有全 DCache 观察原语，在依赖满足、最终执行许可确定后，由实际执行核获取输入，再写入本次执行的新异步上下文并调用 kernel。整个 run 从未登记条件时跳过这次额外获取。标记只能在 run 开始前清零，且发布者使用 bypass store 加设备屏障；可靠 ld_dev 可以观察协议已正确发布的状态，不再按原语类别一律否定 atomic writer；但任何 writer 都须在真实依赖边界显式 DSB，不能认为 atomic 自动提供相关顺序，也不能以读取代替领取责任的 RMW。这样同步消费者也能读取外部更新的 payload，不依赖完成条件由哪个核观察。该位置之前的调度记录写入必须已发布；不能用获取操作代替发布旧 dirty payload 的所有权处理。具体读取路径和维护成本仍按硬件用例及性能矩阵验证。
 
 只对确实缺少获取保证的读取路径增加准备：依赖满足、参数地址物化后，在读取 predicate 或进入业务 kernel 前，在实际核完成缓存操作。predicate=false 仍需先保证 predicate operand 可见，但不执行业务 kernel。
 
@@ -32,5 +34,7 @@ MIX/sync-start 若需要额外本核准备，必须覆盖全部实际参与成�
 - 同步消费者、多 fanin、同 allocation 不同 view、Graph ENTER/EXIT 后的数据读取。
 - predicate true/skip、SPMD、MIX 3/5/6/7、sync-start 和 slot 复用。
 - 多轮 run 及多卡通知：数据与 signal 顺序、peer 最后访问和覆写约束分别验证。
+
+未来用 STARS event/notify 观察条件时，SRAM 事件满足同样不代替实际消费者的 payload 获取。等待循环以 nop 限制入口请求，保留 task/epoch 身份；SPR 在没有分配释放方案前不能充当通用事件池。
 
 获取成功不释放资源，也不代表远端已经停止访问。生命周期仍由实际 owner 和 run/domain 退休协议负责。

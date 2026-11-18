@@ -2,15 +2,32 @@
 
 An A5 L3 Worker can create a Device communication domain whose per-rank windows
 live in Host DDR. Each L2 owns a separate Host allocation. The L3 CPU can fill
-those allocations directly, each Device can read its own mapped window with MTE,
-and URMA can asynchronously fetch another rank's window into local Device memory.
+those allocations directly. With `workspace_engines=()`, each requesting Device maps the local
+and peer Host windows for synchronous MTE reads. Selecting
+`workspace_engines=("urma",)` registers the table for asynchronous URMA reads
+and leaves every `windowsIn` slot zero, including the local rank. Host UBMEM
+access (including local Host DDR) and URMA cannot run concurrently, even on
+different addresses.
 The Host does not become an additional rank, and the table needs no matching
 HBM allocation.
 
-This A5 implementation supports one machine and the
-`tensormap_and_ringbuffer` runtime. Cross-machine Host windows and automatic
+This A5 implementation supports one machine. Synchronous MTE works with
+`tensormap_and_ringbuffer`, `host_build_graph`, and `percounter`; URMA requires
+`tensormap_and_ringbuffer`. Cross-machine Host windows and automatic
 table partitioning are outside its current support. A2/A3 uses the same domain
 API with MTE and SDMA; see [A2/A3 Host-source windows](comm-domain.md#a2a3-host-source-windows).
+
+| Host-source path | TMR | HBG | percounter | Workspace |
+| ---------------- | --- | --- | ---------- | --------- |
+| Synchronous peer MTE, A5 PR and DT | Supported | Supported | Supported | `()` |
+| Asynchronous peer URMA | DT qualified; PR unresolved | Unsupported | Unsupported | `("urma",)` |
+
+MTE mappings use `aclrtHostRegisterV2(..., ACL_HOST_REG_MAPPED)` followed by
+`aclrtHostGetDevicePointer` in the requesting rank's process. Each address belongs
+to the requesting Device; a source rank's Device address cannot be reused by a
+peer. With `workspace_engines=()`, no URMA or SDMA workspace or capability query
+is involved in this path.
+Peer Host writes and `MAPPED | PINNED` registration are outside this contract.
 
 Host-source URMA has passed on Ascend950DT_9581, including CANN 9.3.0 validation.
 On the A5 PR PCIe CI machine, Host mapping and segment registration succeeded
@@ -82,7 +99,7 @@ allocation. Release temporary memoryviews and NumPy arrays on both success and
 failure; do not store them in application state.
 
 Both `allocate_domain` and `get_or_allocate_domain` accept `initializer`. On A5 it
-requires an onboard L3 Host-source TMR domain. The callback only initializes CPU
+requires an onboard L3 Host-source domain. The callback only initializes CPU
 storage. It must not submit tasks, issue Worker/control operations, recursively
 create or look up domains, or release the domain. Allocation and initialization
 must precede the run's first task submission.
@@ -115,39 +132,47 @@ window with a rank and does not route table indices automatically.
 
 ## Access from a kernel
 
-Pass `domain.device_context(rank, workspace_engines=("urma",))` as a scalar
-argument alongside the local domain Tensor. Each Device receives its own
-CommContext.
+Pass `domain.device_context(worker_id)` as a scalar argument alongside the local
+domain Tensor. Obtain `worker_id` from `domain.member(rank).local_worker_id`;
+the domain rank and Worker ID can differ for reordered members. Each Device
+receives its own CommContext. For an URMA domain,
+request its workspace with `workspace_engines=("urma",)` on both allocation
+and context lookup.
 
 ```text
 L2-owned Host DDR
   +-- L3 CPU mapping -> Buffer.shm.buf
-  +-- local Device mapping -> local Tensor / windowsIn[rankId]
-  +-- URMA registration -> per-domain workspace -> peer MR address
+  +-- MTE domain -> local Device mapping -> windowsIn[rankId]
+  +-- MTE domain -> peer process mapping -> requesting Device registration -> peer MTE read
+  +-- URMA domain -> registration -> per-domain workspace -> peer MR address
 ```
 
-For local MTE access, use the Tensor's Device address or
-`ctx.windowsIn[ctx.rankId] + offset`. A Host-source context does not advertise
-ordinary peer MTE mappings. URMA peer MR addresses must be obtained through the
-URMA workspace, not read from `windowsIn[peer]`.
+For a synchronous MTE domain, use `ctx.windowsIn[peer] + offset` as the source
+address for MTE2, and MTE3 to write ordinary local HBM. The `peer` index follows
+the domain's member order, including reordered members and subsets. The local
+Tensor address minus `ctx.windowsIn[ctx.rankId]` gives the named buffer's offset.
+The kernel must complete its loads and stores before returning. Normal task
+dependencies then allow consumers to read the result; no deferred completion is
+used and the AIV remains occupied during the transfer. Only the local
+`windowsOut` entry is published; peer Host writeback is not supported.
 
-The same byte offset identifies the named slice on each rank:
+For an URMA domain, pass the byte offset returned by
+`domain.buffer_range("table")[0]` from L3 to the kernel as a scalar. Resolve
+the source through the peer MR in the URMA workspace.
 
 ```cpp
 auto *workspace = reinterpret_cast<__gm__ uint8_t *>(
     comm_workspace<CommWorkspaceKind::URMA>(*ctx).addr);
-auto offset = local_tensor_address - ctx->windowsIn[ctx->rankId];
 auto *peer_source = pto2::urma_backend::peer_mr_ptr<float>(workspace, peer, offset);
 send_request_entry(async, UrmaTget(local_destination, peer_source_tensor, workspace, peer));
 ```
 
 The destination and source in `UrmaTget` are PTO GlobalTensors. The runnable
-example constructs them for each requested row. Use a non-self peer for URMA;
-local reads use MTE. Kernel return alone does not prove URMA completion: the
+example constructs them for each requested row on a non-self peer. Kernel return alone does not prove URMA completion: the
 runtime's deferred-completion path holds the producer's output dependencies
 until the transfer completes.
 
-URMA resources belong to this communication domain. They do not replace the
+The selected MTE mappings or URMA workspace belong to this communication domain. They do not replace the
 workspaces of Device-source domains, and they do not use a separate global
 Host workspace slot. No Host registration is performed during Worker init.
 
@@ -159,7 +184,7 @@ Host-source and Device-source domains have the same lifetime:
 first inference run: create domain -> map/register -> initialize -> submit reads -> wait
 later inference runs: get retained domain -> submit reads -> wait for completion
 CPU: update table only after all readers complete
-shutdown: release domain -> retire communication and Device mappings -> release backing
+shutdown: release domain -> wait for users -> unregister/unmap peers -> release own backing
 ```
 
 `get_or_allocate_domain` checks the requested configuration and returns the
@@ -189,7 +214,10 @@ released. Drop those arrays and release memoryviews before releasing the domain
 or closing its Worker. Live exports cause `BufferError` before the domain is
 marked released or any of its native windows are freed. Dropping the last view
 allows the operation to be retried; it does not transfer allocation ownership
-from L2 to L3.
+from L2 to L3. Each requester owns its imported registration and mapping but
+never unlinks a peer's backing. Failed initialization retains partially acquired
+resources until all rank initialization requests have joined and rollback can
+close them. A successful release waits for device use before unregistering.
 
 Accepted release prevents new CPU exports while it waits for Device use to
 finish. After physical release, `.shm.buf` is `None`. Automatic run cleanup
@@ -210,12 +238,17 @@ domain.release()
 
 ## Runnable example
 
+[`host_mte_domain`](../examples/a5/host_mte_domain/README.md) reads non-self Host
+windows into ordinary local HBM with a dependent consumer, reversed member order,
+independent domains, retained reuse and CPU updates. Its runtime selection covers
+TMR, HBG and percounter. Prepare its compiled artifacts before taking a device
+allocation, then use its prepared execution mode on both PR and DT.
+
 [`host_comm_domain`](../examples/a5/tensormap_and_ringbuffer/host_comm_domain/README.md)
 initializes distinct rank tables from L3 and gathers boundary and repeated rows
-using local MTE and non-self URMA. The same L3 orchestration creates and initializes
+from the peer through URMA. The same L3 orchestration creates and initializes
 the Host domain on its first invocation and reuses it on later invocations, with
-an assertion that the initializer ran exactly once. Local MTE writes into a Host output slice,
-which L3 reads directly after completion. A dependent consumer checks the URMA
+an assertion that the initializer ran exactly once. URMA writes the gathered rows into HBM. A dependent consumer checks the URMA
 deferred-completion contract. It reuses the table across runs, updates the Host bytes
 between completed runs, and keeps a Device-source URMA domain active after the
 Host-source domain is released.

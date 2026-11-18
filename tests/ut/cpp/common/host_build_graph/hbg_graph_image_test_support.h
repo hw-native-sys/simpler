@@ -296,10 +296,23 @@ public:
     static constexpr size_t SCALAR_SPAN =
         CHIP_ALIGN_UP(static_cast<size_t>(GRAPH_MAX_SCALAR_ARGS), ARG_POOL_ALIGN / sizeof(uint64_t));
 
-    OuterHeap(const std::vector<std::byte> &definition_image, uint8_t fill = 0) {
+    OuterHeap(
+        const std::vector<std::byte> &definition_image, uint8_t fill = 0,
+        GraphArgumentStorage argument_storage = GraphArgumentStorage::SCALARS
+    ) :
+        argument_storage_(argument_storage) {
         const auto *definition = reinterpret_cast<const Graph *>(definition_image.data());
         heap_bytes_ = static_cast<size_t>(definition->required_heap);
-        storage_ = std::make_unique<AlignedStorage>(heap_bytes_ + definition->execution_storage_bytes, fill);
+        size_t execution_bytes = definition->execution_storage_bytes;
+        if (argument_storage == GraphArgumentStorage::KERNEL_ARGUMENTS) {
+            GraphExecutionStorageLayout layout{};
+            always_assert(graph_execution_storage_layout(
+                definition->task_count, definition->tensor_arg_count, definition->scalar_arg_count,
+                definition->edge_count, &layout, argument_storage
+            ));
+            execution_bytes = layout.total_bytes;
+        }
+        storage_ = std::make_unique<AlignedStorage>(heap_bytes_ + execution_bytes, fill);
         storage_entry_.task.packed_buffer_base = base();
         storage_entry_.task.packed_buffer_end = end();
         storage_entry_.slot.task_kind = TaskKind::GRAPH;
@@ -343,7 +356,7 @@ public:
         storage_entry_.slot.graph_context = nullptr;
         storage_entry_.slot.to_descriptor().graph_definition_offset = TestDefinitionObject::image_offset();
         image_ = definition_object.view();
-        return graph_execution_localize(storage_entry_.slot, image_);
+        return graph_execution_localize(storage_entry_.slot, image_, argument_storage_);
     }
 
     // The view the last initialize_execution built, so a case materializes
@@ -351,6 +364,7 @@ public:
     const GraphImageView &image() const { return image_; }
 
 private:
+    GraphArgumentStorage argument_storage_;
     GraphImageView image_{};
     size_t heap_bytes_{0};
     std::unique_ptr<AlignedStorage> storage_;

@@ -38,14 +38,17 @@ extern "C" {
 
 typedef struct CommHandle_ *CommHandle;
 
+typedef enum CommCcuMode { COMM_CCU_MODE_MS = 0, COMM_CCU_MODE_SCHED = 1 } CommCcuMode;
+
 // Host-side options copied through the domain-allocation control request.
 typedef struct CommWorkspaceConfig {
     uint32_t urma_jetties_per_aiv;
     uint32_t urma_sq_depth;
+    uint32_t ccu_mode;
 } CommWorkspaceConfig;
 #ifdef __cplusplus
 static_assert(std::is_trivially_copyable_v<CommWorkspaceConfig> && std::is_standard_layout_v<CommWorkspaceConfig>);
-static_assert(sizeof(CommWorkspaceConfig) == 8);
+static_assert(sizeof(CommWorkspaceConfig) == 12);
 #endif
 // Internal callable execution controls: activate=1, stop/poll=3, abort=4, discard preparation=7.
 int comm_control_ccu_run(CommHandle h, uint64_t registration_id, uint32_t operation, uint64_t generation);
@@ -314,8 +317,11 @@ int comm_alloc_domain_windows(
  * name of at most 31 ASCII letters, digits, underscores or hyphens.
  * The native rank creates, registers and unlinks its local POSIX backing.
  * The caller supplies the name and may borrow a CPU mapping. Local device
- * mappings support MTE. A5 reaches peers through an optional domain-owned
- * URMA workspace. On A2/A3, the SDMA bit enables peer mappings for the
+ * mappings support MTE. On A5, a Host domain with an empty workspace mask imports and registers peer
+ * Host windows in the requesting process for synchronous MTE reads through
+ * windowsIn. A Host URMA domain leaves all windowsIn entries zero and supplies
+ * peer MR addresses through the workspace for asynchronous reads.
+ * On A2/A3, the SDMA bit enables peer mappings for the
  * Worker-owned SDMA workspace.
  * Abort and release use the same entry points as comm_alloc_domain_windows.
  * This symbol is optional on other backends.

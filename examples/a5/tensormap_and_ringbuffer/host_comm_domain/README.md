@@ -2,11 +2,10 @@
 
 Each L2 owns a separate Host table. L3 initializes its named `table` slice through
 `Buffer.shm.buf` with the offset from `domain.buffer_range(name)` inside the
-domain's `initializer` callback; kernels read local rows with MTE and peer rows with URMA. A
-consumer adds one only after the asynchronous producer completes. Local MTE
-writes its gathered rows into a separate Host `local_echo` slice; L3 checks those
-bytes directly after the run, demonstrating Device writes to Host DDR. The table
-starts after a 256-byte slice, so peer addressing includes the window offset.
+domain's `initializer` callback. L3 passes the table offset (256 bytes) to each
+gather kernel. The kernel resolves the peer table through its URMA workspace
+and gathers into local HBM. A dependent consumer adds one to every gathered
+element after the asynchronous producer completes.
 
 The example keeps both a Host-source and a Device-source URMA domain alive. It
 uses the same L3 orchestration on the first and every subsequent invocation:
@@ -17,12 +16,12 @@ reuses both domains' windows across completed runs, updates the Host table from 
 releases the Host domain, and verifies that the Device domain still transfers.
 Each rank submits one gather task per domain per run. With `--aiv-blocks 4`,
 four AIV blocks start as one resident cohort. Each block handles two distinct
-output rows, using local MTE and URMA reads from the same peer. Two blocks fetch
+output rows, using URMA reads from the same peer. Two blocks fetch
 the repeated row index into separate destinations. A dependent consumer checks
 all eight URMA results, so early task completion or missing block output fails
 verification. This uses the stable resident URMA sender binding from #2886.
 
-The four hardware cases pass on Ascend950DT_9581. On the A5 PR CI machine,
+The hardware cases target Ascend950DT_9581. On the A5 PR CI machine,
 Host-source URMA reports an ACK timeout despite successful Host mapping and
 segment registration. PCIe Host-memory reachability remains under investigation
 in [#2922](https://github.com/hw-native-sys/simpler/issues/2922#issuecomment-6681771862).

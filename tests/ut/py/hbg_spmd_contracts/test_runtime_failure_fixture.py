@@ -36,6 +36,32 @@ def native(request):
         yield module
 
 
+@pytest.mark.parametrize("damage", (None, "schema", "missing_identity", "completion"))
+def test_successful_fault_fixture_run_requires_complete_protocol_evidence(native, damage):
+    from _native_protocol_builder import ProtocolBuilder  # noqa: PLC0415
+
+    protocol, identities = ProtocolBuilder([(2, 2, ()), (2, 1, (0,))]).run()
+    raw = {
+        "aicore_protocol": protocol,
+        "aicore_execution_identities": {
+            "schema": "hbg-execution-identity",
+            "producer": "aicore",
+            "records": identities,
+        },
+    }
+    if damage == "schema":
+        protocol["producer"] = "unknown"
+    elif damage == "missing_identity":
+        identities.pop()
+    elif damage == "completion":
+        protocol["task_controls"][0]["state"] = 0
+    if damage is None:
+        native._check_successful_capture(raw)
+    else:
+        with pytest.raises(ValueError):
+            native._check_successful_capture(raw)
+
+
 def test_failed_completion_proof_prints_owned_borrow_release(native, monkeypatch, tmp_path, capsys):
     # Controlled file/log leaves exercise the real failure helper, not device proof.
     logs = tmp_path / "owned-host-logs"
@@ -163,7 +189,6 @@ def _capture():
         "metadata": {"clock_freq_hz": 1_000_000_000, "num_cores": 3},
         "aicore_protocol": {
             "schema": "hbg-native-protocol",
-            "close_seal_stride": 64,
             "producer": "aicore",
             "scheduler_error": 10,
             "first_error": {"site": 95},
@@ -271,7 +296,6 @@ def test_small_fault_capture_requires_the_current_claim_policy(native, mask, lan
     protocol.update(schema="hbg-native-protocol", cluster_count=2, worker_count=6, active_worker_count=6)
     raw["metadata"]["num_cores"] = 6
     protocol["workers"] = [{"worker_index": worker, "finished": 2, "error_flags": 0} for worker in range(6)]
-    protocol["close_seal_stride"] = 64
     for control in protocol["task_controls"]:
         control["claim_seal"] = 0
     protocol["task_controls"][0]["claim_tickets"] = 0
@@ -314,7 +338,6 @@ def test_fault_capture_keeps_current_two_wave_claim_policy(native, mask, lane):
     raw = _large_ticket_capture(mask, lane, blocks)
     protocol = raw["aicore_protocol"]
     protocol["schema"] = "hbg-native-protocol"
-    protocol["close_seal_stride"] = 64
     for control in protocol["task_controls"]:
         control["claim_seal"] = 0
     protocol["task_controls"][0]["claim_tickets"] = 0
@@ -835,9 +858,7 @@ def _check_fault_buffer_policy(
                 raise FileNotFoundError("controlled missing owned capture")
             raw = _large_ticket_capture(7, 0, 1)
             protocol = raw["aicore_protocol"]
-            protocol.update(
-                schema="hbg-native-protocol", close_seal_stride=64, run_epoch=owner.scheduler_mode_publish_count
-            )
+            protocol.update(schema="hbg-native-protocol", run_epoch=owner.scheduler_mode_publish_count)
             for control in protocol["task_controls"]:
                 control["claim_tickets"] = 0
                 control["claim_seal"] = 0
@@ -896,7 +917,7 @@ def _check_fault_buffer_policy(
     monkeypatch.setattr(native, "_root_block_num", lambda protocol: 1)
     monkeypatch.setattr(native, "_check_output", check_output)
     monkeypatch.setattr(native, "_check_failed_capture", failed_capture)
-    monkeypatch.setattr(native, "read_perf_data", lambda path: {"protocol_audit": {"protocol_verified": True}})
+    monkeypatch.setattr(native, "_check_successful_capture", lambda raw: None)
     if fail_second_free:
         with pytest.raises(RuntimeError, match="controlled free refused"):
             native._run_pass(
@@ -1227,7 +1248,6 @@ def test_current_kernel_timeout_does_not_hide_invalid_claim_seal(native, task, v
     raw = _large_ticket_capture(7, 0)
     protocol = raw["aicore_protocol"]
     protocol["schema"] = "hbg-native-protocol"
-    protocol["close_seal_stride"] = 64
     for control in protocol["task_controls"]:
         control.update(claim_seal=0)
     native._check_failed_capture(raw, 257, 7, 0)
@@ -1239,27 +1259,10 @@ def test_current_kernel_timeout_does_not_hide_invalid_claim_seal(native, task, v
         native._check_failed_capture(raw, 257, 7, 0)
 
 
-@pytest.mark.parametrize("mask,lane", ((1, 0), (7, 0)))
-@pytest.mark.parametrize("stride", (None, 0, 8, 128, 127, 129, 256, True, 64.0, 128.0, "128"))
-def test_timeout_requires_exact_stride_without_relaxing_failed_run_checks(native, mask, lane, stride):
-    raw = _large_ticket_capture(mask, lane)
-    protocol = raw["aicore_protocol"]
-    protocol.update(schema="hbg-native-protocol", close_seal_stride=64)
-    for control in protocol["task_controls"]:
-        control.update(claim_seal=0)
-    native._check_failed_capture(raw, 257, mask, lane)
-    if stride is None:
-        del protocol["close_seal_stride"]
-    else:
-        protocol["close_seal_stride"] = stride
-    with pytest.raises(AssertionError):
-        native._check_failed_capture(raw, 257, mask, lane)
-
-
 def test_current_nonreturning_capture_keeps_missing_returns(native):
     raw = _nonreturning_capture()
     protocol = raw["aicore_protocol"]
-    protocol.update(schema="hbg-native-protocol", close_seal_stride=64)
+    protocol.update(schema="hbg-native-protocol")
     protocol["task_controls"][0]["claim_tickets"] = 0
     for control in protocol["task_controls"]:
         control.update(claim_seal=0)

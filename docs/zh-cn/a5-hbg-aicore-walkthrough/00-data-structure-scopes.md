@@ -26,10 +26,10 @@ Graph child 也不另占一个顶层任务镜像条目。
 | 数据 | 作用范围 | 写者与读者 |
 | ---- | -------- | ---------- |
 | SchedulerTaskMetadata，16 B | 每 expanded node | Host 只读形状、kernel IDs、trace prefix |
-| SchedulerTaskControl，640 B | 每 expanded node | 核以 atomic 管 ticket、gate、claim seal、admission；无后继通知链 |
+| SchedulerTaskControl，1152 B | 每 expanded node | 核以 atomic 管 ticket、gate、claim seal、admission；无后继通知链 |
 | SchedulerExecutionPlan，16 B | 每 node | Host 声明该 node 的真实执行区间 |
 | SchedulerPreparedCall，512 B | 每 block×active-lane 执行 | Host 唯一写者，设备读取完整函数和 args |
-| SchedulerPreparedControl，128 B | 每真实执行 | 单原子 phase/owner/generation；控制 Call 责任 |
+| SchedulerPreparedControl，128 B | 每真实执行 | 单原子 phase/固定 owner；控制 Call 责任 |
 | SchedulerExecutionBinding，128 B | 每真实执行 | 两行分别放 LocalContext/GlobalContext，地址稳定至退休 |
 | SchedulerTaskTrace，256 B | 每记录的真实执行 | 本核依次发布准备、kernel、完成与执行身份 |
 | SchedulerTaskPmuCell，64 B | 每启用 PMU 的执行 | 执行核写入，AICPU 退休后读取 |

@@ -150,9 +150,9 @@ TEST_F(HbgGraphRecordingBoundsTest, PreGraphProducerOfABoundaryTensorContributes
     ASSERT_TRUE(orch.submit_dummy_task(task_args).task_id().is_valid());
     ASSERT_TRUE(orch.graph_end());
 
-    const GraphHostImageList published = graph_host_definitions(*graph_state);
-    ASSERT_EQ(published.entries.size(), 1u);
-    const GraphHostImage &entry = published.entries.front();
+    const std::vector<GraphHostImage> published = graph_host_definitions(*graph_state);
+    ASSERT_EQ(published.size(), 1u);
+    const GraphHostImage &entry = published.front();
     ASSERT_NE(entry.object_offset, GRAPH_NO_OBJECT_OFFSET) << "the staging arena is sized to hold this image";
     const auto *definition =
         reinterpret_cast<const Graph *>(definition_staging.data() + entry.object_offset + sizeof(GraphImageHeader));
@@ -196,9 +196,9 @@ TEST_F(HbgGraphRecordingBoundsTest, TwoViewsOfOneBufferShareAWindowAndKeepTheEdg
     ASSERT_TRUE(orch.submit_dummy_task(reader_args).task_id().is_valid());
     ASSERT_TRUE(orch.graph_end());
 
-    const GraphHostImageList published = graph_host_definitions(*graph_state);
-    ASSERT_EQ(published.entries.size(), 1u);
-    const GraphHostImage &entry = published.entries.front();
+    const std::vector<GraphHostImage> published = graph_host_definitions(*graph_state);
+    ASSERT_EQ(published.size(), 1u);
+    const GraphHostImage &entry = published.front();
     ASSERT_NE(entry.object_offset, GRAPH_NO_OBJECT_OFFSET);
     const auto *definition =
         reinterpret_cast<const Graph *>(definition_staging.data() + entry.object_offset + sizeof(GraphImageHeader));
@@ -240,9 +240,9 @@ TEST_F(HbgGraphRecordingBoundsTest, ABoundaryOfNoTensorsRecordsAndPublishes) {
 
     ASSERT_TRUE(orch.graph_end()) << "the recording end must publish what the submission end admitted";
 
-    const GraphHostImageList published = graph_host_definitions(*graph_state);
-    ASSERT_EQ(published.entries.size(), 1u) << "a zero-tensor boundary yields a Definition like any other";
-    const GraphHostImage &entry = published.entries.front();
+    const std::vector<GraphHostImage> published = graph_host_definitions(*graph_state);
+    ASSERT_EQ(published.size(), 1u) << "a zero-tensor boundary yields a Definition like any other";
+    const GraphHostImage &entry = published.front();
     ASSERT_NE(entry.object_offset, GRAPH_NO_OBJECT_OFFSET);
     const auto *definition =
         reinterpret_cast<const Graph *>(definition_staging.data() + entry.object_offset + sizeof(GraphImageHeader));
@@ -315,8 +315,8 @@ TEST_F(HbgGraphRecordingBoundsTest, ExplicitPredecessorsBelongToEachOuterShell) 
         EXPECT_EQ(actual, want[i]) << "shell " << i;
     }
     const auto published = graph_host_definitions(*graph_state);
-    ASSERT_EQ(published.entries.size(), 1U);
-    const auto &entry = published.entries.front();
+    ASSERT_EQ(published.size(), 1U);
+    const auto &entry = published.front();
     const auto *definition =
         reinterpret_cast<const Graph *>(definition_staging.data() + entry.object_offset + sizeof(GraphImageHeader));
     EXPECT_EQ(definition->task_count, 1U);

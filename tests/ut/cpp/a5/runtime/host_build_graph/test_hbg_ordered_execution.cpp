@@ -33,8 +33,10 @@ struct SchedulerScalarCompilation<void> {
 #include <vector>
 
 #include "hbg_scheduler_test_support.h"
+#include "hbg_gm_mix_test_support.h"
 #include "scheduler/scheduler_admission.h"
 #include "scheduler/scheduler_dispatch.h"
+#include "scheduler/scheduler_graph_control.h"
 #include "scheduler/scheduler_protocol_execute.h"
 
 namespace {
@@ -352,10 +354,12 @@ TEST_P(HbgOrderedScalarDetail, FillPublishesExecutableWorkAndBalancesNestedRecor
     EXPECT_LE(candidate->end_time, discover->end_time);
     EXPECT_LE(ordered->end_time, discover->start_time);
     EXPECT_EQ(find("scalar_execution_token_refill"), nullptr);
+    // Immutable metadata can also be bound during catalog discovery.
+    ASSERT_NE(find("scalar_dispatch_metadata"), nullptr);
     for (const char *name :
          {"scalar_ordered_poll", "scalar_admission_publish", "scalar_admission_commit", "scalar_admission_refresh",
-          "scalar_ordinary_restore", "scalar_block_claim", "scalar_admission_close", "scalar_dispatch_metadata",
-          "scalar_dispatch_fill", "scalar_dispatch_publish"}) {
+          "scalar_ordinary_restore", "scalar_block_claim", "scalar_admission_close", "scalar_dispatch_fill",
+          "scalar_dispatch_publish"}) {
         const auto *child = find(name);
         ASSERT_NE(child, nullptr) << name;
         const auto parent = std::find_if(decoded.begin(), decoded.end(), [&](const auto &row) {
@@ -403,6 +407,183 @@ TEST(HbgOrderedScalarDetail, EmptyPollStillRecordsItsEarlyReturn) {
     EXPECT_EQ(fixture.control(0)->next_block, 0u);
     EXPECT_EQ(fixture.admissions[0].scan_cursor, 0u);
     EXPECT_EQ(buffer->scalar_dropped, 0u);
+}
+
+TEST(HbgOrderedControl, NotifyBeforeAccountingStillCountsExactlyOnceAndRejectsInvalidGate) {
+    using scheduler_test::gm_mix::GmMixFixture;
+    using scheduler_test::gm_mix::GmShape;
+    for (bool invalid : {false, true}) {
+        GmShape shape{1, LaneMask::aic()};
+        shape.inline_task = true;
+        GmMixFixture fixture({shape}, false, 1);
+        uint32_t notification = 0;
+        scheduler_state_at<uint64_t>(fixture.base(), fixture.storage.layout.done_notifications_offset)[0] =
+            reinterpret_cast<uint64_t>(&notification);
+        if (invalid) fixture.control(0)->completion_state = UINT64_MAX;
+        bool progress = false;
+        const bool succeeded = scheduler_service_controls(
+            fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 0, &progress
+        );
+        EXPECT_EQ(succeeded, !invalid);
+        EXPECT_EQ(notification, invalid ? 0u : 1u);
+        EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), invalid ? 0u : 1u);
+        if (invalid) continue;
+        ASSERT_TRUE(scheduler_service_controls(
+            fixture.graph.graph(), fixture.base(), fixture.locals[1], fixture.run(), 0, &progress
+        ));
+        EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 1u);
+        EXPECT_TRUE(scheduler_completion_done(fixture.control(0)->completion_state));
+    }
+}
+
+TEST(HbgOrderedControl, ConfirmedFaninPrefixSurvivesProofCacheCollisionAndOtherScannedNodes) {
+    using scheduler_test::gm_mix::GmMixFixture;
+    using scheduler_test::gm_mix::GmShape;
+    std::vector<GmShape> shapes(18, {1, LaneMask::aic()});
+    shapes[2].inline_task = true;
+    shapes[3].inline_task = true;
+    GmMixFixture fixture(shapes, false, 1);
+    auto &fanin = fixture.graph.payload(2);
+    fanin.fanin_count = 2;
+    fanin.fanin_data()[0] = 0;
+    fanin.fanin_data()[1] = 1;
+    auto *local = fixture.locals[0];
+    fixture.control(0)->completion_state = scheduler_completion_completed_state(1);
+    fixture.control(3)->completion_state = scheduler_completion_completed_state(1);
+    fixture.control(16)->completion_state = scheduler_completion_completed_state(1);
+    bool progress = false;
+    ASSERT_TRUE(scheduler_service_controls(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &progress));
+    EXPECT_FALSE(progress);
+    ASSERT_EQ(scheduler_cached_task_proof(local, 0), SchedulerTaskProof::DONE);
+    ASSERT_EQ(scheduler_observe_cached_completion(fixture.base(), local, 16), SchedulerCompletionObservation::DONE);
+    ASSERT_EQ(scheduler_cached_task_proof(local, 0), SchedulerTaskProof::NONE);
+
+    auto buffer = std::make_unique<SchedulerActivityBuffer>();
+    auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+    auto &trace = local->profiling->scalar;
+    trace.buffer = buffer.get();
+    trace.records = records.get();
+    trace.window_start = scheduler_cycles();
+    const uint32_t cursor = local->control_peer_cursor;
+    {
+        SchedulerScalarBinding binding;
+        binding.attach(&trace);
+        for (uint32_t poll = 0; poll < 9; ++poll) {
+            // Task 16's already confirmed DONE collides with task 0's cache entry.
+            scheduler_remember_task_proof(local, 16, SchedulerTaskProof::DONE);
+            ASSERT_TRUE(
+                scheduler_service_controls(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &progress)
+            );
+            EXPECT_FALSE(progress);
+        }
+    }
+    trace.finish(scheduler_cycles());
+    const auto rows = scalar_rows(trace);
+    EXPECT_EQ(
+        std::count_if(
+            rows.begin(), rows.end(),
+            [](const auto &row) {
+                return static_cast<SchedPhaseKind>(row.kind & 0xffffU) == SchedPhaseKind::ScalarAtomicFetchAdd;
+            }
+        ),
+        0
+    );
+    EXPECT_EQ(buffer->scalar_dropped, 0u);
+    trace.buffer = nullptr;
+    EXPECT_EQ(local->control_peer_cursor, cursor + 9 * SCHEDULER_CONTROL_NODE_BUDGET);
+    EXPECT_FALSE(scheduler_completion_done(fixture.control(2)->completion_state));
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 0u);
+    fixture.control(1)->completion_state = scheduler_completion_completed_state(1);
+    for (uint32_t slice = 0; slice < 3; ++slice)
+        ASSERT_TRUE(
+            scheduler_service_controls(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &progress)
+        );
+    EXPECT_TRUE(scheduler_completion_done(fixture.control(2)->completion_state));
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 1u);
+    EXPECT_EQ(fixture.run()->scheduler_error, 0u);
+}
+
+TEST(HbgOrderedControl, InterleavedControlsKeepPrefixesAndCollisionsOnlyForgetProgress) {
+    using scheduler_test::gm_mix::GmMixFixture;
+    using scheduler_test::gm_mix::GmShape;
+    std::vector<GmShape> shapes(20, {1, LaneMask::aic()});
+    for (uint32_t task : {2u, 3u, 5u, 18u})
+        shapes[task].inline_task = true;
+    GmMixFixture fixture(shapes, false, 1);
+    for (uint32_t task : {2u, 3u}) {
+        fixture.graph.payload(task).fanin_count = 2;
+        fixture.graph.payload(task).fanin_data()[0] = 0;
+        fixture.graph.payload(task).fanin_data()[1] = 1;
+    }
+    fixture.graph.payload(5).fanin_count = 1;
+    fixture.graph.payload(5).fanin_data()[0] = 0;
+    fixture.graph.payload(18).fanin_count = 1;
+    fixture.graph.payload(18).fanin_data()[0] = 17;
+    fixture.control(0)->completion_state = scheduler_completion_completed_state(1);
+    fixture.control(16)->completion_state = scheduler_completion_completed_state(1);
+    auto *local = fixture.locals[0];
+    bool progress = false;
+    ASSERT_TRUE(scheduler_service_controls(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &progress));
+    EXPECT_TRUE(progress);
+    EXPECT_EQ(local->control_peer_cursor, SCHEDULER_CONTROL_NODE_BUDGET);
+    EXPECT_TRUE(scheduler_completion_done(fixture.control(5)->completion_state));
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 1u);
+    ASSERT_EQ(scheduler_observe_cached_completion(fixture.base(), local, 16), SchedulerCompletionObservation::DONE);
+
+    auto buffer = std::make_unique<SchedulerActivityBuffer>();
+    auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+    auto &trace = local->profiling->scalar;
+    trace.buffer = buffer.get();
+    trace.records = records.get();
+    trace.window_start = scheduler_cycles();
+    {
+        SchedulerScalarBinding binding;
+        binding.attach(&trace);
+        for (uint32_t poll = 0; poll < 9; ++poll) {
+            scheduler_remember_task_proof(local, 16, SchedulerTaskProof::DONE);
+            ASSERT_TRUE(
+                scheduler_service_controls(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &progress)
+            );
+            EXPECT_FALSE(progress);
+        }
+    }
+    trace.finish(scheduler_cycles());
+    const auto rows = scalar_rows(trace);
+    EXPECT_EQ(
+        std::count_if(
+            rows.begin(), rows.end(),
+            [](const auto &row) {
+                return static_cast<SchedPhaseKind>(row.kind & 0xffffU) == SchedPhaseKind::ScalarAtomicFetchAdd;
+            }
+        ),
+        0
+    );
+    EXPECT_EQ(buffer->scalar_dropped, 0u);
+    trace.buffer = nullptr;
+    EXPECT_EQ(local->control_peer_cursor, 10 * SCHEDULER_CONTROL_NODE_BUDGET);
+    for (uint32_t task : {2u, 3u, 18u})
+        EXPECT_FALSE(scheduler_completion_done(fixture.control(task)->completion_state));
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 1u);
+
+    // Task 18 hashes with task 2; only its own predecessor can complete it.
+    fixture.control(17)->completion_state = scheduler_completion_completed_state(1);
+    for (uint32_t slice = 0; slice < 3; ++slice)
+        ASSERT_TRUE(
+            scheduler_service_controls(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &progress)
+        );
+    EXPECT_TRUE(scheduler_completion_done(fixture.control(18)->completion_state));
+    EXPECT_FALSE(scheduler_completion_done(fixture.control(2)->completion_state));
+    EXPECT_FALSE(scheduler_completion_done(fixture.control(3)->completion_state));
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 2u);
+    fixture.control(1)->completion_state = scheduler_completion_completed_state(1);
+    for (uint32_t slice = 0; slice < 3; ++slice)
+        ASSERT_TRUE(
+            scheduler_service_controls(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &progress)
+        );
+    EXPECT_TRUE(scheduler_completion_done(fixture.control(2)->completion_state));
+    EXPECT_TRUE(scheduler_completion_done(fixture.control(3)->completion_state));
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 4u);
+    EXPECT_EQ(fixture.run()->scheduler_error, 0u);
 }
 
 TEST(HbgOrderedExecution, TwoSyncObserversPublishOneLogEntryAndTheLoserRetiresNormally) {
@@ -486,9 +667,61 @@ TEST(HbgOrderedScalarDetail, NonAdmissionFillExposesClaimReceiveAndDirectTransfe
     EXPECT_EQ(buffer->scalar_dropped, 0u);
 }
 
-TEST(HbgOrderedScalarDetail, ClaimCursorDetailPreservesSealAndFallbackPaths) {
+TEST(HbgOrderedScalarDetail, CompletionWriterReusesItsOwnDoneProofForDependencies) {
+    for (const auto mask : kPureCAndV) {
+        OrderedFixture fixture({{1, mask}, {1, mask}});
+        fixture.dependency(1, 0);
+        ASSERT_TRUE(fixture.prepare());
+        const uint32_t worker = fixture.publisher(0);
+        SCOPED_TRACE(worker);
+        ASSERT_TRUE(fixture.fill_until_ready(worker));
+        OrderedExecution execution{};
+        ASSERT_TRUE(fixture.begin(worker, &execution));
+        ASSERT_EQ(execution.task, 0);
+        ASSERT_TRUE(fixture.complete(execution));
+        auto *local = fixture.locals[worker];
+        EXPECT_EQ(scheduler_cached_task_proof(local, 0), SchedulerTaskProof::DONE);
+        SchedulerFaninView fanin{};
+        ASSERT_EQ(scheduler_node_fanin_view(fixture.graph.graph(), 1, &fanin), SchedulerGraphResult::OK);
+        auto buffer = std::make_unique<SchedulerActivityBuffer>();
+        auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+        auto &trace = local->profiling->scalar;
+        trace.buffer = buffer.get();
+        trace.records = records.get();
+        trace.window_start = scheduler_cycles();
+        uint32_t prefix = 0;
+        bool ready = false;
+        {
+            SchedulerScalarBinding binding;
+            binding.attach(&trace);
+            ASSERT_TRUE(scheduler_observe_fanin_prefix(
+                fixture.graph.graph(), fixture.base(), local, fixture.run(), 1, fanin, prefix, &ready
+            ));
+        }
+        EXPECT_TRUE(ready);
+        EXPECT_EQ(prefix, 1u);
+        trace.finish(scheduler_cycles());
+        const auto rows = scalar_rows(trace);
+        EXPECT_EQ(
+            std::count_if(
+                rows.begin(), rows.end(),
+                [](const auto &row) {
+                    return static_cast<SchedPhaseKind>(row.kind & 0xffffU) == SchedPhaseKind::ScalarAtomicFetchAdd;
+                }
+            ),
+            0
+        );
+        EXPECT_EQ(buffer->scalar_dropped, 0u);
+        trace.buffer = nullptr;
+    }
+}
+
+TEST(HbgOrderedScalarDetail, ClaimCursorUsesSealWithoutReadingTheCursorAgain) {
     for (const auto &[seal, next, valid, used_seal] :
-         {std::tuple<uint64_t, uint64_t, bool, bool>{0, 1, true, false}, {2, 2, true, true}, {2, 1, false, false}}) {
+         {std::tuple<uint64_t, uint64_t, bool, bool>{0, 1, true, false},
+          {2, 2, true, true},
+          {2, 1, true, true},
+          {1, 2, false, false}}) {
         SCOPED_TRACE(seal);
         SCOPED_TRACE(next);
         OrderedFixture fixture({{2, LaneMask::aic()}});
@@ -513,7 +746,7 @@ TEST(HbgOrderedScalarDetail, ClaimCursorDetailPreservesSealAndFallbackPaths) {
             ),
             valid
         );
-        if (valid) EXPECT_EQ(cursor, next);
+        if (valid) EXPECT_EQ(cursor, used_seal ? seal : next);
         EXPECT_EQ(observed_seal, used_seal);
         EXPECT_EQ(
             scheduler_cached_task_proof(fixture.locals[0], 0),
@@ -528,9 +761,9 @@ TEST(HbgOrderedScalarDetail, ClaimCursorDetailPreservesSealAndFallbackPaths) {
         for (uint32_t i = 0; i < trace.committed; ++i)
             names.emplace_back(sched_phase_kind_name(static_cast<SchedPhaseKind>(decoded[i].kind & 0xffffU)));
         EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_claim_seal_probe"), 1);
-        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_claim_seal_confirm"), seal != 0 ? 1 : 0);
-        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_next_block_probe"), seal == 2 ? 1 : 0);
-        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_next_block_confirm"), used_seal ? 0 : 1);
+        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_claim_seal_confirm"), 0);
+        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_next_block_probe"), seal == 0 ? 1 : 0);
+        EXPECT_EQ(std::count(names.begin(), names.end(), "scalar_next_block_confirm"), 0);
         EXPECT_EQ(buffer->scalar_dropped, 0u);
     }
 }
@@ -546,7 +779,12 @@ TEST(HbgOrderedScalarDetail, PollDetailObservesTheAdmissionTailWithoutClaimingMe
         trace.buffer = buffer.get();
         trace.records = records.get();
         trace.window_start = scheduler_cycles();
-        EXPECT_EQ(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), fixture.locals[0]), ready);
+        EXPECT_EQ(
+            (scheduler_observe_ordered_progress(
+                 fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run()
+             ) == SchedulerOrderedPollResult::READY),
+            ready
+        );
         EXPECT_EQ(trace.depth, 0u);
         EXPECT_EQ(fixture.control(0)->next_block, 0u);
         trace.finish(scheduler_cycles());
@@ -571,7 +809,8 @@ TEST_P(HbgOrderedFirstReady, FirstBlockIsExecutableWithoutClaimingOrPublishingAS
     ASSERT_TRUE(fixture.admit(0, worker));
     ASSERT_TRUE(fixture.fill(worker));
     EXPECT_EQ(fixture.control(0)->claim_tickets, 0u);
-    EXPECT_EQ(fixture.control(0)->next_block, 1u);
+    EXPECT_EQ(fixture.control(0)->next_block, 0u);
+    EXPECT_EQ(fixture.control(0)->claim_sectors[worker & 3].next, 1u);
     EXPECT_EQ(fixture.locals[worker]->local_ready_mask, 1u);
     EXPECT_EQ(fixture.locals[worker]->slots[1].state, SchedulerDispatchSlotState::FREE);
     const auto *blocks =
@@ -579,16 +818,18 @@ TEST_P(HbgOrderedFirstReady, FirstBlockIsExecutableWithoutClaimingOrPublishingAS
     const auto *events = scheduler_state_at<SchedulerProtocolExecutionTrace>(
         fixture.base(), fixture.storage.layout.protocol.executions_offset
     );
-    EXPECT_EQ(blocks[0].owner.claim_after.sequence, 0u);
-    EXPECT_EQ(events[0].publication_count, 1u);
-    EXPECT_EQ(blocks[1].owner.claim_before.sequence, 0u);
-    EXPECT_EQ(events[1].publication_count, 0u);
+    const uint32_t first = worker & 3;
+    const uint32_t other = (first + 1) % 8;
+    EXPECT_EQ(blocks[first].owner.claim_after.sequence, 0u);
+    EXPECT_EQ(events[first].publication_count, 1u);
+    EXPECT_EQ(blocks[other].owner.claim_before.sequence, 0u);
+    EXPECT_EQ(events[other].publication_count, 0u);
     OrderedExecution execution{};
     ASSERT_TRUE(fixture.begin(worker, &execution));
-    EXPECT_EQ(execution.block, 0u);
-    EXPECT_NE(events[0].permit.sequence, 0u);
-    EXPECT_EQ(blocks[1].owner.claim_before.sequence, 0u);
-    EXPECT_EQ(events[1].publication_count, 0u);
+    EXPECT_EQ(execution.block, first);
+    EXPECT_NE(events[first].permit.sequence, 0u);
+    EXPECT_EQ(blocks[other].owner.claim_before.sequence, 0u);
+    EXPECT_EQ(events[other].publication_count, 0u);
 }
 
 TEST_P(HbgOrderedFirstReady, ReadySecondSlotRunsBeforeTheFreeFirstSlotIsRefilled) {
@@ -602,7 +843,8 @@ TEST_P(HbgOrderedFirstReady, ReadySecondSlotRunsBeforeTheFreeFirstSlotIsRefilled
     for (uint32_t poll = 0; poll < 8; ++poll) {
         ASSERT_TRUE(fixture.fill(worker));
         EXPECT_EQ(fixture.control(0)->claim_tickets, 0u);
-        EXPECT_EQ(fixture.control(0)->next_block, 1u);
+        EXPECT_EQ(fixture.control(0)->next_block, 0u);
+        EXPECT_EQ(fixture.control(0)->claim_sectors[worker & 3].next, 1u);
         EXPECT_EQ(local->local_ready_mask, 2u);
         EXPECT_EQ(local->slots[0].state, SchedulerDispatchSlotState::FREE);
         EXPECT_EQ(local->slots[1].task_ref, staged.task_ref);
@@ -612,7 +854,7 @@ TEST_P(HbgOrderedFirstReady, ReadySecondSlotRunsBeforeTheFreeFirstSlotIsRefilled
     OrderedExecution execution{};
     ASSERT_TRUE(fixture.begin(worker, &execution));
     EXPECT_EQ(execution.slot, 1u);
-    EXPECT_EQ(execution.block, 0u);
+    EXPECT_EQ(execution.block, staged.block_idx);
     ASSERT_TRUE(fixture.complete(execution));
     ASSERT_TRUE(fixture.fill(worker));
     EXPECT_EQ(fixture.control(0)->next_block, 2u);
@@ -632,7 +874,10 @@ TEST_P(HbgOrderedFirstReady, CompletionAllowsTheNextClaimWithoutLosingOrDuplicat
     std::array<bool, count> seen{};
     for (uint32_t block = 0; block < count; ++block) {
         ASSERT_TRUE(fixture.fill(worker));
-        EXPECT_EQ(fixture.control(0)->next_block, block + 1);
+        uint64_t distributed = 0;
+        for (const auto &sector : fixture.control(0)->claim_sectors)
+            distributed += sector.next;
+        EXPECT_EQ(distributed, block + 1);
         OrderedExecution execution{};
         ASSERT_TRUE(fixture.begin(worker, &execution));
         EXPECT_EQ(execution.task, 0);
@@ -652,6 +897,146 @@ TEST_P(HbgOrderedFirstReady, CompletionAllowsTheNextClaimWithoutLosingOrDuplicat
     EXPECT_FALSE(fixture.begin(worker, &extra));
     EXPECT_EQ(fixture.control(0)->next_block, count);
     EXPECT_EQ(scheduler_completion_count(fixture.control(0)->completion_state), count);
+    EXPECT_EQ(fixture.run()->scheduler_error, 0u);
+}
+
+TEST_P(HbgOrderedFirstReady, ExhaustedOrdinarySupplyStopsRetriesWithoutReplacingTheSeal) {
+    OrderedFixture fixture({{2, GetParam(), false}, {2, GetParam(), false}});
+    ASSERT_TRUE(fixture.prepare());
+    auto *local = fixture.locals[fixture.publisher(0)];
+    bool progress = false;
+    int64_t task = SCHEDULER_TASK_REF_INVALID;
+    SchedulerIssueSnapshot snapshot{};
+    ASSERT_TRUE(
+        scheduler_issue_head(fixture.graph.graph(), fixture.base(), local, fixture.run(), &task, &progress, &snapshot)
+    );
+    ASSERT_EQ(task, 0);
+    // Both peers own tickets, but the last claimant has not published its seal.
+    fixture.control(0)->next_block = 2;
+    auto buffer = std::make_unique<SchedulerActivityBuffer>();
+    auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+    auto &trace = local->profiling->scalar;
+    trace.buffer = buffer.get();
+    trace.records = records.get();
+    trace.window_start = scheduler_cycles();
+    {
+        SchedulerScalarBinding binding;
+        binding.attach(&trace);
+        ASSERT_TRUE(scheduler_refill_execution_tokens(
+            fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &progress, &snapshot
+        ));
+        EXPECT_FALSE(snapshot.evaluated);
+        for (uint32_t poll = 0; poll < 8; ++poll) {
+            ASSERT_TRUE(scheduler_refill_execution_tokens(
+                fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &progress
+            ));
+            local->continuation_task_ref = 0;
+            ASSERT_TRUE(scheduler_try_execution_continuation(
+                fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &progress
+            ));
+            EXPECT_FALSE(progress);
+        }
+    }
+    trace.finish(scheduler_cycles());
+    const auto rows = scalar_rows(trace);
+    EXPECT_EQ(
+        std::count_if(
+            rows.begin(), rows.end(),
+            [](const auto &row) {
+                return static_cast<SchedPhaseKind>(row.kind & 0xffffU) == SchedPhaseKind::ScalarAtomicFetchAdd;
+            }
+        ),
+        0
+    );
+    EXPECT_EQ(buffer->scalar_dropped, 0u);
+    trace.buffer = nullptr;
+    EXPECT_EQ(fixture.control(0)->next_block, 2u);
+    EXPECT_EQ(fixture.control(0)->claim_seal, 0u);
+    EXPECT_EQ(local->issue_cursor, 0u);
+    EXPECT_EQ(scheduler_cached_task_proof(local, 0), SchedulerTaskProof::NONE);
+    EXPECT_TRUE(local->issue_ticket_exhausted);
+    EXPECT_EQ(scheduler_execution_token_count(local), 0u);
+    EXPECT_EQ(fixture.control(1)->next_block, 0u);
+
+    fixture.control(0)->claim_seal = 2;
+    ASSERT_TRUE(
+        scheduler_refill_execution_tokens(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &progress)
+    );
+    EXPECT_TRUE(progress);
+    EXPECT_EQ(local->issue_cursor, 1u);
+    EXPECT_EQ(local->issue_task_ref, 1);
+    EXPECT_FALSE(local->issue_ticket_exhausted);
+    EXPECT_EQ(fixture.control(1)->next_block, 1u);
+    EXPECT_TRUE(scheduler_execution_token_has_task(local, 1));
+    EXPECT_EQ(scheduler_completion_count(fixture.control(0)->completion_state), 0u);
+    EXPECT_EQ(fixture.run()->scheduler_error, 0u);
+}
+
+TEST(HbgOrderedMix, ExhaustedSupplyIsReadWithoutAdvancingBeforeTheSeal) {
+    scheduler_test::gm_mix::GmMixFixture fixture({{2, LaneMask::all()}, {2, LaneMask::all()}});
+    ASSERT_TRUE(fixture.prepare_calls());
+    auto *local = fixture.locals[0];
+    // All valid blocks have owners, but their last claimant has not sealed supply.
+    fixture.control(0)->next_block = 2;
+    auto buffer = std::make_unique<SchedulerActivityBuffer>();
+    auto records = std::make_unique<SchedulerScalarStorageSlot[]>(2 * SCHEDULER_SCALAR_RECORD_CAPACITY);
+    auto &trace = local->profiling->scalar;
+    trace.buffer = buffer.get();
+    trace.records = records.get();
+    trace.window_start = scheduler_cycles();
+    {
+        SchedulerScalarBinding binding;
+        binding.attach(&trace);
+        for (uint32_t poll = 0; poll < 9; ++poll) {
+            bool progress = false;
+            ASSERT_TRUE(scheduler_cluster_mix_discover_next(
+                fixture.graph.graph(), fixture.base(), local, fixture.run(), &progress
+            ));
+            EXPECT_FALSE(progress);
+        }
+    }
+    trace.finish(scheduler_cycles());
+    const auto rows = scalar_rows(trace);
+    EXPECT_EQ(
+        std::count_if(
+            rows.begin(), rows.end(),
+            [](const auto &row) {
+                return static_cast<SchedPhaseKind>(row.kind & 0xffffU) == SchedPhaseKind::ScalarAtomicFetchAdd;
+            }
+        ),
+        0
+    );
+    EXPECT_EQ(buffer->scalar_dropped, 0u);
+    trace.buffer = nullptr;
+    EXPECT_TRUE(local->issue_ticket_exhausted);
+    EXPECT_EQ(local->issue_cursor, 0u);
+    EXPECT_EQ(fixture.control(0)->next_block, 2u);
+    EXPECT_EQ(fixture.control(0)->claim_seal, 0u);
+    EXPECT_EQ(scheduler_cached_task_proof(local, 0), SchedulerTaskProof::NONE);
+    EXPECT_EQ(local->cluster_pending.task_ref, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(fixture.control(1)->next_block, 0u);
+
+    fixture.control(0)->claim_seal = 2;
+    bool progress = false;
+    ASSERT_TRUE(
+        scheduler_cluster_mix_discover_next(fixture.graph.graph(), fixture.base(), local, fixture.run(), &progress)
+    );
+    EXPECT_TRUE(progress);
+    EXPECT_EQ(local->issue_task_ref, 1);
+    EXPECT_EQ(local->issue_cursor, 1u);
+    EXPECT_FALSE(local->issue_ticket_exhausted);
+    EXPECT_EQ(local->cluster_pending.task_ref, 1);
+    EXPECT_EQ(local->cluster_pending.block_idx, 0u);
+    const auto owner = local->cluster_pending.anchor;
+    EXPECT_EQ(scheduler_prepared_owner(owner.claimed_state), local->worker_id());
+    ASSERT_TRUE(
+        scheduler_cluster_mix_discover_next(fixture.graph.graph(), fixture.base(), local, fixture.run(), &progress)
+    );
+    EXPECT_FALSE(progress);
+    EXPECT_EQ(local->cluster_pending.anchor.execution_index, owner.execution_index);
+    EXPECT_EQ(local->cluster_pending.anchor.claimed_state, owner.claimed_state);
+    EXPECT_EQ(fixture.control(1)->next_block, 1u);
+    EXPECT_EQ(scheduler_completion_count(fixture.control(0)->completion_state), 0u);
     EXPECT_EQ(fixture.run()->scheduler_error, 0u);
 }
 
@@ -1062,9 +1447,8 @@ TEST_P(HbgOrderedBlockIdentity, RealDispatchAndCompletionExecuteEveryOriginalBlo
     );
     for (uint32_t worker = 0; worker < 6; ++worker) {
         ASSERT_TRUE(fixture.fill(worker));
-        scheduler_flush_completions(fixture.run(), fixture.locals[worker]);
     }
-    EXPECT_EQ(scheduler_gm_fetch_add(fixture.run()->resolved_task_count, UINT64_C(0)), 1u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 1u);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.run()->scheduler_error, UINT64_C(0)), 0u);
 }
 
@@ -1105,7 +1489,7 @@ TEST(HbgOrderedExecution, PartialCompletionDoesNotReleaseFaninAndLastSubtaskRele
     ASSERT_TRUE(fixture.fill(3));
     OrderedExecution premature{};
     EXPECT_FALSE(fixture.begin(3, &premature));
-    EXPECT_EQ(fixture.locals[3]->pending_completed, 0u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 0u);
     ASSERT_TRUE(fixture.complete(slow));
     EXPECT_EQ(
         scheduler_completion_count(scheduler_gm_fetch_add(fixture.control(0)->completion_state, UINT64_C(0))), 3u
@@ -1114,9 +1498,9 @@ TEST(HbgOrderedExecution, PartialCompletionDoesNotReleaseFaninAndLastSubtaskRele
         scheduler_completion_task_state(scheduler_gm_query(fixture.control(0)->completion_state)),
         static_cast<int64_t>(SchedulerTaskState::DONE)
     );
-    EXPECT_EQ(fixture.locals[0]->pending_completed, 1u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 1u);
     EXPECT_EQ(scheduler_completion_count(fixture.control(0)->completion_state), 3u);
-    EXPECT_EQ(fixture.locals[0]->pending_completed, 1u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 1u);
     uint32_t retained = 0;
     for (const auto &slot : fixture.locals[0]->slots)
         if (slot.task_ref == 1 && slot.state != SchedulerDispatchSlotState::FREE) ++retained;
@@ -1127,11 +1511,11 @@ TEST(HbgOrderedExecution, PartialCompletionDoesNotReleaseFaninAndLastSubtaskRele
     ASSERT_TRUE(fixture.begin(3, &successor));
     EXPECT_EQ(successor.task, 1);
     ASSERT_TRUE(fixture.complete(successor));
-    EXPECT_EQ(fixture.locals[0]->pending_completed + fixture.locals[3]->pending_completed, 2u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 2u);
     EXPECT_FALSE(scheduler_complete_own_slot(
         fixture.graph.graph(), fixture.base(), fixture.locals[3], fixture.run(), successor.slot, 0
     ));
-    EXPECT_EQ(fixture.locals[0]->pending_completed + fixture.locals[3]->pending_completed, 2u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 2u);
     EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::COMPLETION_SLOT_BINDING_INVALID));
 }
 
@@ -1275,15 +1659,24 @@ TEST(HbgOrderedExecution, IdlePollIsOnlyAHintAndDoesNotConsumeNewWorkOrEntryPerm
     OrderedFixture fixture({{2, LaneMask::aic()}, {1, LaneMask::aic()}});
     for (uint32_t worker = 0; worker < 6; ++worker)
         EXPECT_EQ(
-            scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), fixture.locals[worker]), false
+            (scheduler_observe_ordered_progress(
+                 fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run()
+             ) == SchedulerOrderedPollResult::READY),
+            false
         );
     ASSERT_TRUE(fixture.prepare());
     ASSERT_TRUE(fixture.admit(0, 3));
-    EXPECT_TRUE(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), fixture.locals[0]));
+    EXPECT_TRUE(
+        (scheduler_observe_ordered_progress(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run()) ==
+         SchedulerOrderedPollResult::READY)
+    );
     EXPECT_EQ(fixture.admissions[0].current_task_ref, SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(fixture.control(0)->next_block, 0u);
     ASSERT_TRUE(fixture.fill(0));
-    EXPECT_TRUE(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), fixture.locals[0]));
+    EXPECT_TRUE(
+        (scheduler_observe_ordered_progress(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run()) ==
+         SchedulerOrderedPollResult::READY)
+    );
     scheduler_record_error(
         fixture.run(), 0, SchedulerGraphResult::TIMEOUT, nullptr, fixture.locals[3],
         SchedulerErrorSite::ORDERED_EXIT_TIMEOUT
@@ -1297,7 +1690,7 @@ TEST(HbgOrderedExecution, IdlePollIsOnlyAHintAndDoesNotConsumeNewWorkOrEntryPerm
     const auto ready_mask = local->local_ready_mask;
     const auto pending_task = fixture.admissions[0].pending_task_ref;
     const auto next_block = fixture.control(0)->next_block;
-    const auto completed = local->pending_completed;
+    const auto completed = scheduler_test::resolved_count(fixture.run());
     const auto error = fixture.run()->scheduler_error;
     bool failed = true;
     EXPECT_FALSE(scheduler_fill_own_slots(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &failed));
@@ -1309,7 +1702,7 @@ TEST(HbgOrderedExecution, IdlePollIsOnlyAHintAndDoesNotConsumeNewWorkOrEntryPerm
     EXPECT_EQ(local->slots[slot_index].prepared.claimed_state, held.prepared.claimed_state);
     EXPECT_EQ(fixture.admissions[0].pending_task_ref, pending_task);
     EXPECT_EQ(fixture.control(0)->next_block, next_block);
-    EXPECT_EQ(local->pending_completed, completed);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), completed);
     EXPECT_EQ(fixture.run()->scheduler_error, error);
     EXPECT_EQ(fixture.run()->error_worker_index, 3u);
     EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::ORDERED_EXIT_TIMEOUT));
@@ -1329,7 +1722,10 @@ TEST(HbgOrderedExecution, IdlePollFindsAdmissionCommittedByAnotherWorker) {
         auto *local = fixture.locals[worker];
         ASSERT_TRUE(fixture.prepare());
         ASSERT_TRUE(fixture.admit(0, worker + 3));
-        EXPECT_TRUE(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), local));
+        EXPECT_TRUE(
+            (scheduler_observe_ordered_progress(fixture.graph.graph(), fixture.base(), local, fixture.run()) ==
+             SchedulerOrderedPollResult::READY)
+        );
         ASSERT_TRUE(fixture.fill(worker));
         OrderedExecution execution{};
         ASSERT_TRUE(fixture.begin(worker, &execution));
@@ -1793,9 +2189,8 @@ TEST_P(HbgOrderedWithoutSsbuf, MultiBlockAndDependentOrdinaryTaskCompleteWithout
         );
     for (uint32_t worker = 0; worker < 6; ++worker) {
         ASSERT_TRUE(fixture.fill(worker));
-        scheduler_flush_completions(fixture.run(), fixture.locals[worker]);
     }
-    EXPECT_EQ(scheduler_gm_fetch_add(fixture.run()->resolved_task_count, UINT64_C(0)), 2u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 2u);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.run()->scheduler_error, UINT64_C(0)), 0u);
 }
 
@@ -1816,7 +2211,6 @@ TEST_P(HbgOrdinaryTokenProbe, OrdinaryTokenRecordsDiscoveryAndAcquireBeforeDispa
     const auto &trace = traces[fixture.storage.metadata[0].trace_index_base];
     EXPECT_EQ(trace.task_ref, 0u);
     EXPECT_EQ(trace.worker_id, worker);
-    EXPECT_EQ(trace.state_probe_scheduler_worker_id, worker);
     EXPECT_GT(trace.state_probe_start_cycles, 0u);
     EXPECT_GE(trace.state_probe_end_cycles, trace.state_probe_start_cycles);
     EXPECT_GT(trace.dispatch_start_cycles, 0u);
@@ -1849,7 +2243,6 @@ TEST_P(HbgOrderedCooperativeProbe, CooperativeBlockDispatchDoesNotInventOrdinary
         const auto &trace = traces[fixture.storage.metadata[0].trace_index_base + block];
         EXPECT_EQ(trace.task_ref, 0u);
         EXPECT_EQ(trace.worker_id, executor);
-        EXPECT_EQ(trace.state_probe_scheduler_worker_id, UINT64_MAX);
         EXPECT_EQ(trace.state_probe_start_cycles, 0u);
         EXPECT_EQ(trace.state_probe_end_cycles, 0u);
         EXPECT_GT(trace.dispatch_start_cycles, 0u);
@@ -1969,7 +2362,6 @@ TEST_P(HbgOrderedDeferredPublication, DiscoveredSuccessorUsesDispatchAfterProduc
     EXPECT_EQ(trace.worker_id, resolver);
     EXPECT_GT(trace.dispatch_start_cycles, 0u);
     EXPECT_GE(trace.dispatch_end_cycles, trace.dispatch_start_cycles);
-    EXPECT_EQ(trace.state_probe_scheduler_worker_id, resolver);
     EXPECT_GT(trace.state_probe_start_cycles, 0u);
     EXPECT_GE(trace.state_probe_end_cycles, trace.state_probe_start_cycles);
     OrderedExecution successor{};
@@ -2383,8 +2775,7 @@ TEST(HbgOrderedProtocol, ConsumedPermitPreventsPayloadSnapshotFromBeingReplaced)
     const auto first = events[0];
     SchedulerReadyClaim ready{};
     ready.task_ref = 0;
-    SchedulerFreeSlotClaim claim{execution.slot};
-    scheduler_protocol_payload_publication(fixture.base(), fixture.locals[0], claim, ready, true);
+    scheduler_protocol_payload_publication(fixture.base(), fixture.locals[0], execution.slot, ready, true);
     EXPECT_EQ(events[0].publication_count, first.publication_count);
     EXPECT_EQ(events[0].publication_before_cycles, first.publication_before_cycles);
     EXPECT_EQ(events[0].publication_after_cycles, first.publication_after_cycles);
@@ -2401,8 +2792,7 @@ TEST(HbgOrderedProtocol, FinishedWorkerCannotPublishEvenAnUnsequencedPayloadSnap
     scheduler_protocol_finish(fixture.base(), local, true);
     SchedulerReadyClaim ready{};
     ready.task_ref = 0;
-    SchedulerFreeSlotClaim claim{0};
-    scheduler_protocol_payload_publication(fixture.base(), local, claim, ready, true);
+    scheduler_protocol_payload_publication(fixture.base(), local, 0, ready, true);
     const auto *events = scheduler_state_at<SchedulerProtocolExecutionTrace>(
         fixture.base(), fixture.storage.layout.protocol.executions_offset
     );
@@ -2426,8 +2816,7 @@ TEST(HbgOrderedProtocol, CooperativePayloadCannotBeRepublishedBeforeItsFirstPerm
     const auto first = events[0];
     SchedulerReadyClaim ready{};
     ready.task_ref = 0;
-    SchedulerFreeSlotClaim claim{0};
-    scheduler_protocol_payload_publication(fixture.base(), fixture.locals[0], claim, ready, true);
+    scheduler_protocol_payload_publication(fixture.base(), fixture.locals[0], 0, ready, true);
     EXPECT_EQ(events[0].publication_count, first.publication_count);
     EXPECT_EQ(events[0].pending_slot, first.pending_slot);
     const auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(

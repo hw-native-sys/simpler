@@ -46,6 +46,8 @@ a5_hbg_case(test_hbg_ccu_completion.cpp NO_OBJS LINK a5_ut_support TIMEOUT 20
 a5_hbg_case(test_hbg_async_pending.cpp NO_OBJS TIMEOUT 20)
 a5_hbg_case(test_hbg_async_writer.cpp NO_OBJS TIMEOUT 20)
 a5_hbg_case(test_hbg_async_control.cpp TIMEOUT 20
+    INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore
+    DEFINES __CPU_SIM
     SOURCES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_completion_plan.cpp)
 a5_hbg_case(test_hbg_async_plan.cpp NO_OBJS TIMEOUT 20
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host

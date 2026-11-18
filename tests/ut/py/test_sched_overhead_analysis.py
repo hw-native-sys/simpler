@@ -382,11 +382,11 @@ def test_parse_scheduler_counts_aicore_flat_dispatch_phases():
         "scheduler_records": [
             [
                 {"phase": "complete", "start_time_us": 1.0, "end_time_us": 2.0, "loop_iter": 1},
-                {"phase": "resolve", "start_time_us": 2.0, "end_time_us": 3.0, "loop_iter": 1},
+                {"phase": "state_probe", "start_time_us": 2.0, "end_time_us": 3.0, "loop_iter": 1},
                 {"phase": "state_probe", "start_time_us": 3.0, "end_time_us": 4.0, "loop_iter": 1},
                 {"phase": "dispatch", "start_time_us": 4.0, "end_time_us": 5.0, "loop_iter": 1},
                 {"phase": "dispatch", "start_time_us": 5.0, "end_time_us": 6.0, "loop_iter": 1},
-                {"phase": "refill", "start_time_us": 6.0, "end_time_us": 7.0, "loop_iter": 1},
+                {"phase": "complete", "start_time_us": 6.0, "end_time_us": 7.0, "loop_iter": 1},
             ]
         ],
     }
@@ -394,17 +394,15 @@ def test_parse_scheduler_counts_aicore_flat_dispatch_phases():
     threads = parse_scheduler_from_json_phases(data)
 
     assert threads[0]["role"] == "scheduler"
-    assert threads[0]["state_probe_us"] == 1.0
+    assert threads[0]["state_probe_us"] == 2.0
     assert threads[0]["dispatch_us"] == 2.0
     assert "worksteal_us" not in threads[0]
-    assert threads[0]["refill_us"] == 1.0
+    assert threads[0]["complete_us"] == 2.0
     assert threads[0]["total_us"] == 6.0
     assert threads[0]["phases_seen"] == {
         "complete",
-        "resolve",
         "state_probe",
         "dispatch",
-        "refill",
     }
 
 
@@ -557,17 +555,16 @@ def test_scheduler_phase_report_suppresses_absent_runtime_phases():
 def test_scheduler_phase_report_keeps_hbg_aicore_loop_order():
     """The report lists phases in the reporting runtime's own order.
 
-    state_probe / dispatch / refill is the order hbg's AICore
+    state_probe / dispatch is the order hbg's AICore
     scheduler runs them in, so the report reads that way rather than following
     any order shared with another runtime.
     """
-    threads = {0: {"phases_seen": {"refill", "dispatch", "state_probe", "complete"}}}
+    threads = {0: {"phases_seen": {"dispatch", "state_probe", "complete"}}}
 
     assert _scheduler_phases_for_report(threads, get(HBG_RUNTIME)) == [
         "complete",
         "state_probe",
         "dispatch",
-        "refill",
     ]
 
 

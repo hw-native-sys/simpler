@@ -118,8 +118,8 @@ static inline __aicore__ void scheduler_observe_data_cache(__gm__ void *address)
 #endif
 }
 
-// A5 ld_dev bypasses the scalar DCache. Atomic-published words require
-// atomic confirmation; bypass-published signals use this read directly.
+// A5 ld_dev bypasses the scalar DCache. A reliable snapshot grants no
+// exclusive ownership; mutations use the atomic wrappers below.
 // Ownership changes use the CAS/exchange/fetch wrappers below.
 // Publication-protected metadata is invalidated separately before consumption.
 // The memory order every wrapper below takes is honored by the host and sim
@@ -147,6 +147,72 @@ static inline __aicore__ uint64_t scheduler_gm_query(__gm__ volatile uint64_t &v
     return __atomic_load_n(&value, order);
 #endif
     });
+}
+
+// CntNotify exposes one 32-bit SET/read register. Never widen this access
+// into its neighbouring register, or run a cache maintenance instruction on it.
+static inline __aicore__ uint32_t scheduler_notify_query(__gm__ volatile uint32_t &value) {
+    return scheduler_scalar_memory_result(SchedPhaseKind::ScalarBypassLoad, [&value]() __aicore__ {
+#if defined(__CCE_AICORE__)
+        return static_cast<uint32_t>(__builtin_cce_ld_dev(const_cast<__gm__ uint32_t *>(&value), 0));
+#else
+        return __atomic_load_n(&value, __ATOMIC_ACQUIRE);
+#endif
+    });
+}
+
+static inline __aicore__ void scheduler_notify_store(__gm__ volatile uint32_t &value, uint32_t desired) {
+    scheduler_scalar_memory_issue(SchedPhaseKind::ScalarBypassStore, 1, [&value, desired]() __aicore__ {
+#if defined(__CCE_AICORE__)
+        __builtin_cce_st_dev(desired, const_cast<__gm__ uint32_t *>(&value), 0);
+#else
+        __atomic_store_n(&value, desired, __ATOMIC_RELEASE);
+#endif
+    });
+}
+
+// The verified A5 32-byte slot exposes BIT_WR at SET + 16 and BIT_CLR at
+// SET + 24. Both aliases share the SET mapping; writes carry a 32-bit mask.
+// Publication barriers belong to the caller, independently of these atomics.
+static inline __aicore__ void scheduler_notify_set_bits(__gm__ volatile uint32_t &value, uint32_t mask) {
+    scheduler_scalar_memory_issue(SchedPhaseKind::ScalarBypassStore, 1, [&value, mask]() __aicore__ {
+#if defined(__CCE_AICORE__)
+        auto *address = const_cast<__gm__ uint32_t *>(&value) + 4;
+        __builtin_cce_st_dev(mask, address, 0);
+#else
+        (void)__atomic_fetch_or(&value, mask, __ATOMIC_RELEASE);
+#endif
+    });
+}
+
+static inline __aicore__ void scheduler_notify_clear_bits(__gm__ volatile uint32_t &value, uint32_t mask) {
+    scheduler_scalar_memory_issue(SchedPhaseKind::ScalarBypassStore, 1, [&value, mask]() __aicore__ {
+#if defined(__CCE_AICORE__)
+        auto *address = const_cast<__gm__ uint32_t *>(&value) + 6;
+        __builtin_cce_st_dev(mask, address, 0);
+#else
+        (void)__atomic_fetch_and(&value, ~mask, __ATOMIC_RELEASE);
+#endif
+    });
+}
+
+static inline __aicore__ void scheduler_notify_done(__gm__ volatile uint32_t &value) {
+    scheduler_notify_store(value, UINT32_C(1));
+}
+
+// The validated CntNotify command is a 32-bit write of one to SET + 8:
+// command=1 increments once. Other payloads are not an arithmetic delta.
+// Ordering of publication against later work remains the caller's responsibility.
+static inline __aicore__ void scheduler_notify_add(__gm__ volatile uint32_t &value, uint32_t credits) {
+    for (uint32_t credit = 0; credit < credits; ++credit) {
+        scheduler_scalar_memory_issue(SchedPhaseKind::ScalarBypassStore, 1, [&value]() __aicore__ {
+#if defined(__CCE_AICORE__)
+            __builtin_cce_st_dev(UINT32_C(1), const_cast<__gm__ uint32_t *>(&value), 0);
+#else
+            (void)__atomic_fetch_add(&value, UINT32_C(1), __ATOMIC_RELEASE);
+#endif
+        });
+    }
 }
 
 static inline __aicore__ uint64_t
@@ -187,21 +253,27 @@ static inline __aicore__ void scheduler_ddr_barrier() {
     });
 }
 
-// Each word has one active writer. Publication completes before ownership
-// handoff. While workers run, its whole cache line excludes AICore RMW,
-// cached stores and dirty writeback. Payload ordering belongs to the caller.
+// Only single-writer notifications with no RMW or atomic-state requirement
+// may use this path. Their region excludes cached stores and dirty writeback.
+// This store has no implicit DSB: the caller orders dependent operations.
 template <typename Word>
-static inline __aicore__ void scheduler_publish_signal(__gm__ volatile Word &value, Word desired) {
+static inline __aicore__ void scheduler_store_signal(__gm__ volatile Word &value, Word desired) {
     static_assert(std::is_same_v<Word, int64_t> || std::is_same_v<Word, uint64_t>);
 #if defined(__CCE_AICORE__)
     auto *address = reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ Word *>(&value));
     scheduler_scalar_memory_issue(SchedPhaseKind::ScalarBypassStore, 1, [address, desired]() __aicore__ {
         st_dev(static_cast<uint64_t>(desired), address, 0);
     });
-    scheduler_ddr_barrier();
 #else
     __atomic_store_n(&value, desired, __ATOMIC_RELEASE);
 #endif
+}
+
+// Existing callers require completion before subsequent publication or handoff.
+template <typename Word>
+static inline __aicore__ void scheduler_publish_signal(__gm__ volatile Word &value, Word desired) {
+    scheduler_store_signal(value, desired);
+    scheduler_ddr_barrier();
 }
 
 // Shared ownership words and atomic-published data retain atomic exchange.

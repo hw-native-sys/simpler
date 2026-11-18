@@ -1,0 +1,108 @@
+diff --git a/src/a5/runtime/tensormap_and_ringbuffer/aicore/aicore_executor.cpp b/src/a5/runtime/tensormap_and_ringbuffer/aicore/aicore_executor.cpp
+index ec1892c1c..24b816b3d 100644
+--- a/src/a5/runtime/tensormap_and_ringbuffer/aicore/aicore_executor.cpp
++++ b/src/a5/runtime/tensormap_and_ringbuffer/aicore/aicore_executor.cpp
+@@ -14,6 +14,7 @@
+ #include "aicore/chip_swimlane_collector_aicore.h"
+ #include "aicore/pmu_collector_aicore.h"
+ #include "common/chip_swimlane_profiling.h"
++#include "common/device_phase.h"
+ #include "common/platform_config.h"  // Register-based communication
+ #include "common/pmu_profiling.h"
+ #include "dispatch_payload.h"
+@@ -34,13 +35,16 @@ typedef void (*UnifiedKernelFunc)(__gm__ int64_t *);
+  *
+  * @param payload Pointer to DispatchPayload in global memory
+  */
+-__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ DispatchPayload *payload) {
++__aicore__ __attribute__((always_inline)) static void
++execute_task(__gm__ DispatchPayload *payload, AicoreWorkWindow &work_window) {
+     if (payload == nullptr || payload->function_bin_addr == 0) {
+         return;
+     }
+
+     UnifiedKernelFunc kernel = (UnifiedKernelFunc)payload->function_bin_addr;
++    if (work_window.start_cycle == 0) work_window.start_cycle = get_sys_cnt_aicore();
+     kernel(reinterpret_cast<__gm__ int64_t *>(payload->args));
++    work_window.end_cycle = get_sys_cnt_aicore();
+     OUT_OF_ORDER_STORE_BARRIER();
+ }
+
+@@ -67,6 +71,10 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Dispat
+ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
+     __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->dev.workers[block_idx]);
+
++    AicoreWorkWindow work_window{};
++    my_hank->work_start_cycle = 0;
++    my_hank->work_end_cycle = 0;
++
+     // Phase 1: report physical core ID + core type and signal done in one write,
+     // with no wait for the AICPU — both fields are self-known. The AICPU opens
+     // this core's register window only after it observes aicore_done, so a single
+@@ -235,7 +243,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
+             }
+
+             // Execute the task
+-            execute_task(exec_payload);
++            execute_task(exec_payload, work_window);
+
+             // Keep start_time -> end_time scoped to AICore execution.
+             uint64_t end_time = chip_swimlane_enabled ? get_sys_cnt_aicore() : 0;
+@@ -267,7 +275,11 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
+         }
+     }
+
++    // Publish only the two kernel endpoints, before the retirement acknowledgement.
++    my_hank->work_start_cycle = work_window.start_cycle;
++    my_hank->work_end_cycle = work_window.end_cycle;
+     // Flush all dirty cache lines to HBM before kernel exit.
+     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
++    OUT_OF_ORDER_STORE_BARRIER();
+     acknowledge_aicore_cond_nonce_and_wait(&runtime->dev.teardown_gates[block_idx]);
+ }
+diff --git a/src/a5/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp b/src/a5/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp
+index 9ee070c83..0871ca10c 100644
+--- a/src/a5/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp
++++ b/src/a5/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp
+@@ -1137,6 +1137,19 @@ void AicpuExecutor::snapshot_run_terminal(Runtime *runtime) {
+     const bool normal_path = normal_path_claims_.load(std::memory_order_acquire) == aicpu_thread_num_;
+     const RunTerminalSelection selection = run_terminal_select(normal_path, header_status, terminal_);
+
++    // Ok requires every participant's successful retirement. Core-owned fields
++    // are immutable now; never inspect them on an incomplete or failed shutdown.
++    if (selection.verdict == DeviceRunVerdict::Ok && runtime != nullptr) {
++        AicoreWorkWindowAccumulator accumulator{};
++        cache_invalidate_range(runtime->dev.workers, sizeof(Handshake) * runtime->get_worker_count());
++        rmb();
++        for (int i = 0; i < runtime->get_worker_count(); ++i) {
++            const auto &worker = runtime->dev.workers[i];
++            accumulator.add(worker.work_start_cycle, worker.work_end_cycle);
++        }
++        AicoreWorkWindow work_window{};
++        if (accumulator.finish(work_window, true)) device_phase_set_aicore_work_window(work_window);
++    }
+     const uint8_t *payload = nullptr;
+     size_t payload_bytes = 0;
+     if (selection.verdict == DeviceRunVerdict::Error && runtime != nullptr) {
+diff --git a/src/a5/runtime/tensormap_and_ringbuffer/runtime/runtime.h b/src/a5/runtime/tensormap_and_ringbuffer/runtime/runtime.h
+index 549654306..8e671a935 100644
+--- a/src/a5/runtime/tensormap_and_ringbuffer/runtime/runtime.h
++++ b/src/a5/runtime/tensormap_and_ringbuffer/runtime/runtime.h
+@@ -110,6 +110,8 @@ struct Handshake {
+     volatile CoreType core_type;    // Core type: CoreType::AIC or CoreType::AIV (reported by AICore with aicore_done)
+     volatile uint32_t physical_core_id;  // Physical core ID (reported by AICore with aicore_done)
+     volatile uint64_t report_epoch;      // Commit marker for a native program run's report; 0 = unstamped
++    volatile uint64_t work_start_cycle;  // Core-owned first business-kernel entry, published before retirement ACK
++    volatile uint64_t work_end_cycle;    // Core-owned last business-kernel return; zero when no task ran
+ } __attribute__((aligned(64)));
+
+ // One whole cache line per worker, which is what lets the AICore publish its
+@@ -125,6 +127,8 @@ static_assert(offsetof(Handshake, task) == 8);
+ static_assert(offsetof(Handshake, core_type) == 16);
+ static_assert(offsetof(Handshake, physical_core_id) == 20);
+ static_assert(offsetof(Handshake, report_epoch) == 24);
++static_assert(offsetof(Handshake, work_start_cycle) == 32);
++static_assert(offsetof(Handshake, work_end_cycle) == 40);
+
+ /**
+  * Whether `handshake` carries a report this run may act on.

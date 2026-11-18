@@ -33,7 +33,7 @@ HERE = Path(__file__).resolve().parent
 
 
 @cache
-def _compile_omitted_registration(platform):
+def _compile_omitted_registration(platform, runtime="host_build_graph"):
     spec = {
         "orchestration": {
             "source": str(HERE / "kernels/orchestration/counter.cpp"),
@@ -65,8 +65,8 @@ def _compile_omitted_registration(platform):
     return compile_chip_callable_spec(
         spec,
         platform,
-        "host_build_graph",
-        (str(HERE), platform, "omitted_registration_negative_control", _pto_isa_compile_cache_token()),
+        runtime,
+        (str(HERE), platform, runtime, "omitted_registration_negative_control", _pto_isa_compile_cache_token()),
     )
 
 

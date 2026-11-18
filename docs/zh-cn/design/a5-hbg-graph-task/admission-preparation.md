@@ -1,5 +1,7 @@
 # A5 HBG admission 静态计划与一次验证：开发参考
 
+**共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前实现、拟修改布局和未来 STARS 后端分别标明。
+
 **状态：完整目标设计，尚未实现或验证收益。** 更新日期：2026-11-12。
 当前核对基线：`main@a013b1710aee9d9fe7117ba249a709c3a64a3e43`，已包含 slot 直接退休和 Scalar profiling 更新。
 旧局部实现已不在当前工作树中；历史实验不能代替本基线的功能和性能验证。
@@ -39,7 +41,7 @@ Host 每次 bind 生成 admission 静态计划。设备在既有 bootstrap 分�
 只依赖 metadata、已规划/已验证拓扑、布局和 run 身份。
 不按模型名、task ID、层号、64/96 核样本或特定 block 数选择路径；文中的 t29 仅作解释。
 不增加模型专属队列、逐任务 validated 原子位、每核整图副本、跨 run 计划缓存或新行为开关。
-保留两个 ready 队列、kernel 和用户表达；不同时改 block 分配、kernel/payload 算法或完成传播。
+保留当前两份有序 task 目录、kernel 和用户表达。静态准备方案不负责改变 block 所有权；必要 claim 的分地址设计另按统一原则推进，不受目录数量限制。
 代码可以按依赖顺序开发和检查，但只接受这套完整机制，不保留可切换的中间实现或旧 wire 兼容路径。
 
 ## 2. 静态计划、布局与 Host 准备
@@ -48,20 +50,20 @@ Host 每次 bind 生成 admission 静态计划。设备在既有 bootstrap 分�
 
 将现有 header+bitmap 的两行重新组织，采用独立类型和只读访问接口：
 
-| 区域 | 拟定字段与所有权 | 当前 A5 大小 |
-| ---- | ---------------- | ------------ |
+| 区域 | 拟定字段与所有权 | 修订后的目标布局（未实现） |
+| ---- | ---------------- | -------------------------- |
 | `SchedulerAdmissionPlan` | epoch、task_ref、MIX seal 行 offset、rank_offset、成员 words、block 数、member_count、active mask、flags；Host 唯一写者 | 64 B，对齐 64 B |
-| `SchedulerAdmissionPublication` | order_key；Host 初始化 UINT64_MAX，commit owner 唯一运行时写者 | 64 B，对齐 64 B |
+| `SchedulerAdmissionPublication` | order_key；Host 初始化 UINT64_MAX，commit owner 唯一运行时写者 | 独占 128 B，基址和 stride 均按 128 B |
 
 plan 中的前四项为四个 64-bit 字段，成员位图当前为两个 64-bit word；
 block 数/member_count 为两个 32-bit 字段，mask/flags 为两个单字节字段，合计 58 B 后自然对齐到 64 B。
 容量按 `ceil(SCHEDULER_WORKER_CAPACITY / 64)` 推导，不在算法中硬编码两个 word；
-现有 capacity=108，因此每任务总 stride 仍可为 **128 B**。编译期检查实际 size、alignment 和 offset。
+现有 capacity=108，静态 plan 可保持 64 B；动态 publication 独立以 128 B stride 排列，不能再以两个相邻 64 B 行代表两个无争用单元。两数组分别规划并检查实际 size、alignment、offset 和 padding；这取代原方案每任务合计 128 B 的布局预算，尚未变更当前代码。
 未来容量变化按类型大小重新规划，不能静默截断；寻址使用类型/offsetof，不复制魔法字节数。
 
 bitmap 内联在只读 plan，删除可写的 `member_words_offset`，按布局计算其位置。
 保留原按 node_ref 寻址方式和 cooperative log 容量；不压缩成新字典，也不保留原 record 再复制一份 plan。
-publication 行仍是单写者普通数据行，沿用写回/观察协议；不得与 atomic-only 的 TaskControl 行混放。
+publication 是单写者通知，可按统一原则评估 st_dev + DSB 发布与 ld_dev 观察；整区不混入 cached 写回或 atomic-only TaskControl 数据，读者仍核对本轮 task/order 身份。当前实现与拟替换原语分别记录。
 admission_state、claim seal、计数器、mailbox、lane ACK 留在原有动态结构中。
 
 ### 共用完整成员计算
@@ -151,7 +153,7 @@ flowchart LR
 
 所有运行时 accessor 返回只读 plan；审计 prepare、commit、MIX、async、DFX 和退出路径，确保没有合法写者。
 order_key 移到 publication 行后，commit 的整行写回不再触及 plan。
-采用现有发布原语维护动态行，保留其 cache observe、写回、DSB 和控制交权；本次不改为新的 st_dev 或原子协议。
+动态行按 writer 与发布合同选原语：单写者通知可用 st_dev，真正的竞争交权保留 atomic；两者均在真实时序依赖边界显式 DSB。删除重复读不省略实际输入获取，不把 atomic 当作隐含屏障。
 
 现有普通/native 入口在 bootstrap 前均调用 `scheduler_observe_data_cache`。
 保留并验证每核在 H2D/READY 后、首次读取 plan 前执行该维护；其他核验证成功不会刷新本核缓存。
@@ -226,7 +228,7 @@ SWA/lib 历史 t22→t29 的 kernel 间隔为 61.578 µs，其中 prepare=5.355 
 它早于当前 slot/profiling 更新；未归因 Scalar 时间不能全算可消除，原语发出时长也不是全部完成成本。
 
 硬件约束参考工作区 `pypto-a5-dev/simpler-fdwic-swimlane-deps/tests/atomic_probe/ATOMIC_USAGE_GUIDE.md`：
-保持 64 B 行所有权和 atomic/普通数据隔离；不把 DSB 当跨核会合，不从定向实验推导任意屏障可删。
+原始实验保留；后续设计统一采用 128 B L2 侧竞争隔离，64 B 只用于 Scalar DCache 维护。atomic/普通数据不混写，ld/st 与 atomic 的依赖顺序均显式 DSB；不把 DSB 当跨核会合，也不从定向实验推导任意屏障可删。
 `cache_preload_usage_guide.md` 的冷/热读差距只支持只读缓存的可能性，不可直接套算本模型收益。
 保留[循环成员规则](fixed-prefix-members.md)，避免重复[已撤回的 admission 尝试](../../investigations/2026-11-a5-hbg-admission-shortcuts.md)。
 

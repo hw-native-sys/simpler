@@ -413,11 +413,14 @@ Tensor arguments are GM descriptor addresses; scalar arguments are value bits.
 LocalContext and GlobalContext on separate cache lines. Calls and bindings have
 execution lifetime, independently of the worker's two private dispatch slots.
 
-Each execution has a 128-byte atomic-control sector. Phase, owner and claim
-generation share one atomic state word. Fresh Calls start BUILT. A successful
+Each execution has a 128-byte atomic-control sector. Phase and fixed owner
+share one atomic state word. Fresh Calls start BUILT. A successful
 block ticket and BUILT-to-CLAIMED CAS grant one worker the execution token;
 Call acquisition observes and validates the immutable Call and binding. The
 claim alone grants no permission to consume business input data.
+Call acquisition completes in the same bounded invocation; it has no pending-build
+result or separate binding-ready bit. Cooperative preparation requires an explicit
+lane and rejects predicates; ordinary execution tokens retain predicate evaluation.
 
 The Host orders tasks by Kahn generation, descending bottom level, then stable
 node identity. The AIC/MIX and AIV catalogs project that order into two shared
@@ -427,7 +430,11 @@ must have supplied their blocks before the consumer can claim space. Data
 completion dependencies still gate execution independently of issuance order.
 
 A core has four execution-token positions and two 40-byte dispatch slots.
+Dispatch and protocol publication pass the existing core-local slot index directly;
+ownership remains in the prepared execution state.
 A token may remain WAIT_FANIN while caching a confirmed positive producer prefix.
+Its private phases are EMPTY, TICKETED and WAIT_FANIN; acquisition yields no
+intermediate phase to another scheduler iteration.
 It owns a concrete execution but occupies no business slot. Each core owns at
 most one ordinary block of the same task. A full token window retains all four
 responsibilities and revisits their dependencies; no other core can reclaim a
@@ -458,7 +465,7 @@ background discovery cannot displace an admitted participant or manufacture a
 release. Cluster signaling and cache publication remain part of group ownership.
 
 After the kernel returns, its async registration is sealed. The execution's
-control moves from CLAIMED to RETURNED under its owner/generation proof. The
+control moves from CLAIMED to RETURNED under its fixed-owner proof. The
 real physical return contributes once to the task's canonical completion gate;
 inactive MIX resource lanes contribute no execution. Trace/group retirement
 finishes under its existing ownership before the slot is safely reused.
@@ -472,12 +479,17 @@ remaining computation and compute debt. Async conditions retain additional debt
 until their join completes. DONE requires a valid total and zero computation
 and debt; a kernel return alone is insufficient.
 
-The unique final completion owner adds one pending logical completion. Workers
-flush pending counts to `resolved_task_count`; control nodes use the same
-canonical gate and winner rule. Successors observe producer gates directly.
-Async CHECK is bounded and FINISH retains its exclusive lease until its debt
-settlement completes. Trace publication, group release and safe reuse still
-have their own ownership requirements.
+Each unique logical-task accountant immediately contributes one INC to a
+run-owned CntNotify. AICPU reads that count for progress and completion;
+Host-completed nodes remain separately counted. There is no per-worker pending
+count, batching threshold, timer or flush. Unmapped runs use one GM FAA per
+task. The reporting helper adds no DSB: existing completion publication and
+unconditional worker-retirement barriers preserve their respective ordering.
+After every core retires, AICPU snapshots the actual count into the GM
+`resolved_task_count` diagnostic field. Successors observe producer completion
+directly. Async CHECK keeps its exclusive lease and only settled logical
+completion reports progress; physical return with pending conditions does not.
+Trace publication, group release and safe reuse retain their ownership rules.
 
 On an error, a worker cancels only its provably owned unstarted handles to FAILED;
 it cannot invent a RETURNED Call, computation contribution or group-finished ACK.
@@ -509,6 +521,14 @@ runs on the host. Important validation paths include:
 
 Device logs contain scheduler records only. Host graph-construction diagnostics
 remain host-side. See [device_log_profiling.md](device_log_profiling.md).
+
+A5 HBG L3 traces name the scheduler functions that claim blocks, observe and
+publish completion, service MIX and asynchronous work, and decode Graph inputs.
+Identity capture, trace staging and deferred idle publication have their own
+intervals. Completion and CHECK intervals end when the corresponding calls
+return. A parent interval includes its children. Its remaining time includes
+control flow, ordinary memory access and instrumentation. See the
+[Scalar trace format](../../../../../docs/dfx/chip-swimlane-profiling.md#a5-hbg-scalar-detail-at-level-3).
 
 ## 10. Verification
 

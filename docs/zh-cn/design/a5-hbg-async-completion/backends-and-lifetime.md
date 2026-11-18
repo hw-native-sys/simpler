@@ -1,5 +1,7 @@
 # A5 HBG 异步后端与资源生命周期
 
+**共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](../a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前实现、拟修改布局和未来 STARS 后端分别标明。
+
 [返回总览](../a5-hbg-async-completion.md)。延迟逻辑完成、资源持有、数据可见性是三个相互关联的要求，分别验证，优先复用现有机制。
 
 ## 1. 条件观察
@@ -10,13 +12,17 @@ SDMA 使用当前 SDK 公共完成记录 API 返回的 post-done 地址和完整
 
 提交资格与观察资格分开验证。参与调度的 AIC/AIV 均须能观察支持的条件；不能把仅在 AIV 上可用的提交 helper 原样搬到 AIC。编译与反汇编只证明指令形态，真实可见性仍需硬件用例。
 
+GM 条件的多核同址观察仍有串行代价；一次 READY 观察可在相同 task/epoch/sequence 的本次推进内复用，不以 FAA(0)再确认。通知与数据之间、状态读取与后续消费之间均须显式 DSB；单写者通知可用 st_dev，多写者计数和唯一 CHECK claim 仍需 atomic。
+
+后续优先接入 STARS event/notify SRAM，沿用现有条件登记语义。资源必须绑定实际任务与 generation，支持早到通知并在所有旧访问结束后复用；空轮询加 nop 约束入口带宽，约四拍排队的前提不代表无限请求吞吐。它不替代 payload 可见性、peer 退休或 atomic claim；SPR 在具备通用分配释放机制前不作为该后端。
+
 ## 2. 提交与登记
 
 SDMA adapter 保持现有调用接口。提交前检查形状、字节数和明确的零工作，并为可能产生的完成记录预留足够容量；提交后使用公共记录数量/索引 API 登记实际条件，归还未用预留。非空 TGET 得到零 handle、未知完成类型、登记溢出或 helper 失败必须锁存错误，不把它们当成零登记成功。
 
 A5 SDK 的 TPUT 使用同步 MTE 回退，搬运完成后合法返回 SDMA 类型的零 handle。adapter 依据实际操作类型接受该结果，将本次预留按零条条件结束，不查询完成记录、不发布 CHECK。`postFailed`、错误引擎和既有首错仍必须失败；不能将 TPUT 的零 handle 规则推广到 TGET，也不能把同步回退表述为异步 SDMA PUT。
 
-SDK 默认以物理 `get_block_idx()` 选择 channel group，同一 cluster 的两个 AIV 共享该值。resident 为每个实际 cluster 保存一个独立 cache line 的提交互斥字；所有 task 和 Graph 实例共享这组 run 内状态。取得互斥权后才构造 session，完成提交、SDK postId/SQ 状态持久化及条件登记后交权。不同 cluster 可以并行，同 cluster 的不同 workspace 保守串行提交。
+SDK 默认以物理 `get_block_idx()` 选择 channel group，同一 cluster 的两个 AIV 共享该值。resident 为每个实际 cluster 保存一个提交互斥字；现有布局按 64B DCache 行分隔，后续须按 128B L2 侧竞争单元隔离，所有 task 和 Graph 实例共享这组 run 内状态。取得互斥权后才构造 session，完成提交、SDK postId/SQ 状态持久化及条件登记后交权。不同 cluster 可以并行，同 cluster 的不同 workspace 保守串行提交。
 
 基础 adapter 使用 SDK 默认的单队列 session；一次非空 TGET 导出一条公共完成记录，同一物理执行可通过多次请求登记多条记录。直接改变共享 workspace 的队列分组不属于该提交互斥保证：多队列 session 必须按实际物理队列的重叠范围保护提交，并保持 workspace 的分组一致，不能仅沿用每 cluster 一个互斥字就宣称支持。
 

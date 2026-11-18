@@ -119,6 +119,15 @@ A timeout or invalid request leaves drain incomplete and preserves the primary
 failure. This is error-path bookkeeping, not a new Host recovery protocol:
 existing failed-run isolation remains in force, and no worker reuse is enabled.
 The retirement diagnostic distinguishes core failure from async drain failure.
+SDMA tracking errors 101/102 also enter this cleanup path. Valid registered
+records are drained even when their slab carries either error. Invalid records
+and pending requests remain owned. Because a submission or registration failure
+can omit a request identity, draining the known records alone does not certify
+complete retirement: cleanup reports registration failure 103 and `complete=0`.
+Cleanup checks both orchestration and scheduler error channels, even when an
+earlier orchestration error outranks scheduler error 101/102. The selected
+primary error remains unchanged, including the final nonzero AICPU return and
+caller-stream or captured-model failure; no Host-only success path is used.
 On hardware, an SDMA-provisioned Worker can surface RTS 507018 and refuse
 safe result copy-back even after AICPU reports a completed drain. The original
 code and drain result remain in device logs; this contract does not promise

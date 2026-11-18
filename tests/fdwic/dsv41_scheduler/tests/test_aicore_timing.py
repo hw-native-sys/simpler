@@ -54,13 +54,14 @@ def test_old_loop_or_missing_endpoints_never_fall_back_to_runwall(fault):
         TIMING["paired_spans"](text)
 
 
-def test_replay_rejects_profiled_samples_and_missing_rank(tmp_path):
+@pytest.mark.parametrize("runtime,mode", [("host_build_graph", 1), ("tensormap_and_ringbuffer", 0)])
+def test_replay_rejects_profiled_samples_and_missing_rank(tmp_path, runtime, mode):
     for rank in range(2):
         directory = tmp_path / f"rank{rank}"
         (directory / "host").mkdir(parents=True)
         (directory / "host/host.test.log").write_text(log(rank))
         (directory / "console.log").write_text(
-            "\n".join(f"run={index} scheduler_mode=1 profiling=0 warmup={int(index == 0)}" for index in range(3))
+            "\n".join(f"run={index} scheduler_mode={mode} profiling=0 warmup={int(index == 0)}" for index in range(3))
         )
         report = dict(
             passed=True,
@@ -68,7 +69,7 @@ def test_replay_rejects_profiled_samples_and_missing_rank(tmp_path):
             rank=rank,
             ranks=2,
             device=rank,
-            runtime="host_build_graph",
+            runtime=runtime,
             warmup=1,
             rounds=2,
             snapshot_inputs=True,

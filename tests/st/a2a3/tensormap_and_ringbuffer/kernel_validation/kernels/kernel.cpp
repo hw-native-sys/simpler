@@ -10,10 +10,27 @@
  */
 #include <pto/pto-inst.hpp>
 #include "kernel_error_api.h"
+#include "async_kernel_api.h"
 #include "tensor.h"
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     const auto code = static_cast<KernelErrorCode>(args[1]);
+    if (args[1] == 101 || args[1] == 102) {
+        auto ctx = get_async_ctx(args);
+        auto *tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+        auto *out = reinterpret_cast<__gm__ uint32_t *>(tensor->buffer.addr) + tensor->start_offset;
+        // Kernel mode does not provision SDMA workspaces. A ready counter
+        // exercises the same failure slab and final caller-stream contract.
+        save_expected_notification_counter(ctx, out, 77);
+        if (args[1] == 102) {
+            ctx.completion_capacity = *ctx.completion_count;
+            save_expected_notification_counter(ctx, out, 77);
+        } else {
+            pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        }
+        pto2::detail::defer_flush(ctx);
+        return;
+    }
     if (is_kernel_error(static_cast<int32_t>(code))) {
         auto ctx = get_async_ctx(args);
         report_kernel_error(ctx, code);

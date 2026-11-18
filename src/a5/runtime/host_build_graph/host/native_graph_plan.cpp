@@ -323,7 +323,6 @@ bool native_graph_plan_readonly_image(
     NativeGraphReadonlyImage next;
     SchedulerNativeGraphHeader header{};
     header.magic = SCHEDULER_NATIVE_GRAPH_MAGIC;
-    header.header_bytes = sizeof(header);
     header.node_count = plan.bindings.size();
     header.original_task_count = plan.completion_refs.size();
     header.definition_count = plan.definitions.size();
@@ -403,23 +402,6 @@ bool native_graph_plan_readonly_image(
     }
     if (error != nullptr) error->clear();
     *out = std::move(next);
-    return true;
-}
-
-bool native_graph_plan_worker_capacity(const NativeGraphHostPlan &plan, uint64_t workers, std::string *error) {
-    if (workers == 0 || workers > PLATFORM_MAX_CORES || workers % PLATFORM_CORES_PER_BLOCKDIM != 0)
-        return fail(error, "invalid native worker topology");
-    for (const auto &definition : plan.definitions) {
-        for (const auto &child : definition.children) {
-            const auto &metadata = child.metadata;
-            if (!scheduler_task_requires_sync_start(metadata.flags)) continue;
-            SchedulerMinimumWorkerDemand demand{};
-            if (!scheduler_resident_worker_demand_checked(
-                    metadata.active_mask, metadata.logical_block_num, true, workers, &demand
-                ))
-                return fail(error, "Graph child exceeds sync-start worker capacity");
-        }
-    }
     return true;
 }
 

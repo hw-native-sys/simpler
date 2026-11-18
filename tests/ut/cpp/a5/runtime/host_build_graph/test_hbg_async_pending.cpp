@@ -47,7 +47,7 @@ TEST(HbgAsyncPending, NoRegistrationUsesSynchronousCompletion) {
 TEST(HbgAsyncPending, AnEarlyZeroObservationCannotAuthorizeCompletion) {
     pending::Join join{};
     ASSERT_EQ(join.word, 0u);
-    ASSERT_EQ(pending::register_group(join).result, Result::PENDING);
+    ASSERT_EQ(pending::register_group(join), Result::PENDING);
     EXPECT_EQ(pending::close_computation(join).result, Result::PENDING);
     EXPECT_EQ(pending::complete_group(join).result, Result::FINISH_OWNER);
 }
@@ -97,11 +97,11 @@ TEST(HbgAsyncPending, EnumeratesPublicationReleaseCheckAndCloseInterleavings) {
                     ++terminal_states;
                     return;
                 }
-                auto apply = [&](State next, pending::Outcome outcome) {
+                auto apply = [&](State next, pending::Result outcome) {
                     EXPECT_EQ(next.word.operations, s.word.operations + 1);
-                    if (outcome.result == Result::FINISH_OWNER) ++next.finish_owners;
-                    else if (outcome.result == Result::SYNCHRONOUS) ++next.synchronous_owners;
-                    else EXPECT_EQ(outcome.result, Result::PENDING);
+                    if (outcome == Result::FINISH_OWNER) ++next.finish_owners;
+                    else if (outcome == Result::SYNCHRONOUS) ++next.synchronous_owners;
+                    else EXPECT_EQ(outcome, Result::PENDING);
                     visit(next);
                 };
                 for (uint32_t group = 0; group < groups; ++group) {
@@ -132,7 +132,7 @@ TEST(HbgAsyncPending, EnumeratesPublicationReleaseCheckAndCloseInterleavings) {
                         if (!(s.completed & bit)) {
                             auto next = s;
                             next.completed |= bit;
-                            const auto result = pending::detail::complete_group(next.word);
+                            const auto result = pending::detail::complete_group(next.word).result;
                             apply(next, result);
                         }
                     }
@@ -140,7 +140,7 @@ TEST(HbgAsyncPending, EnumeratesPublicationReleaseCheckAndCloseInterleavings) {
                 if (s.released == all && !s.closed) {
                     auto next = s;
                     next.closed = true;
-                    const auto result = pending::detail::close_computation(next.word);
+                    const auto result = pending::detail::close_computation(next.word).result;
                     apply(next, result);
                 }
             };
@@ -153,16 +153,16 @@ TEST(HbgAsyncPending, EnumeratesPublicationReleaseCheckAndCloseInterleavings) {
 TEST(HbgAsyncPending, InvalidAndDuplicateTransitionsNeverGrantCompletion) {
     for (uint64_t word : {UINT64_C(1), UINT64_C(2) | pending::REGISTERED_UNIT, UINT64_C(1) << 63}) {
         Word registration{word}, completion{word}, close{word};
-        EXPECT_EQ(pending::detail::register_group(registration).result, Result::INVALID_WORD);
+        EXPECT_EQ(pending::detail::register_group(registration), Result::INVALID_WORD);
         EXPECT_EQ(pending::detail::complete_group(completion).result, Result::INVALID_WORD);
         EXPECT_EQ(pending::detail::close_computation(close).result, Result::INVALID_WORD);
     }
     Word late{pending::COMPUTATION_CLOSED}, duplicate{pending::COMPUTATION_CLOSED}, empty{};
-    EXPECT_EQ(pending::detail::register_group(late).result, Result::INVALID_TRANSITION);
+    EXPECT_EQ(pending::detail::register_group(late), Result::INVALID_TRANSITION);
     EXPECT_EQ(pending::detail::close_computation(duplicate).result, Result::INVALID_TRANSITION);
     EXPECT_EQ(pending::detail::complete_group(empty).result, Result::COUNT_UNDERFLOW);
     Word full{pending::COUNT_MAX * pending::REGISTERED_UNIT + pending::COUNT_MAX};
-    EXPECT_EQ(pending::detail::register_group(full).result, Result::COUNT_OVERFLOW);
+    EXPECT_EQ(pending::detail::register_group(full), Result::COUNT_OVERFLOW);
 }
 
 TEST(HbgAsyncPending, RealThreadsRaceTheLastCheckAgainstComputationClose) {
@@ -177,7 +177,7 @@ TEST(HbgAsyncPending, RealThreadsRaceTheLastCheckAgainstComputationClose) {
         };
         for (uint32_t index = 0; index < 8; ++index) {
             threads.emplace_back([&, index]() {
-                if (pending::register_group(join).result != Result::PENDING) ++errors;
+                if (pending::register_group(join) != Result::PENDING) ++errors;
                 if ((index + round) % 2 == 0) finish();
                 released.fetch_add(1, std::memory_order_release);
                 if ((index + round) % 2 != 0) finish();

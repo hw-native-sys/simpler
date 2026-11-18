@@ -47,9 +47,11 @@ struct SchedulerClusterSignal {
     volatile uint32_t active_mask;
     volatile uint32_t arrived[PLATFORM_CORES_PER_BLOCKDIM];
     volatile uint32_t finished[PLATFORM_CORES_PER_BLOCKDIM];
+    volatile uint64_t gm_arrival_seq;
+    SchedulerGroupMailbox sync_mix;
 };
 static_assert(sizeof(SchedulerClusterSignal) <= SCHEDULER_CLUSTER_REGION_BYTES);
-static_assert(sizeof(SchedulerClusterSignal) == 128 && offsetof(SchedulerClusterSignal, anchor_state) == 80);
+static_assert(sizeof(SchedulerClusterSignal) == 272 && offsetof(SchedulerClusterSignal, anchor_state) == 80);
 static_assert(alignof(SchedulerClusterSignal) <= 8);
 static_assert(std::is_standard_layout_v<SchedulerClusterSignal>);
 
@@ -106,6 +108,14 @@ scheduler_cluster_store_release(SCHEDULER_CLUSTER_SSBUF volatile uint32_t *field
 inline __aicore__ void
 scheduler_cluster_signal_clear(SCHEDULER_CLUSTER_SSBUF SchedulerClusterSignal *signal, uint64_t run_epoch) {
     scheduler_cluster_store_field(&signal->run_epoch, run_epoch);
+    scheduler_cluster_store_field(&signal->gm_arrival_seq, UINT64_C(0));
+    auto *descriptor = &signal->sync_mix.descriptor;
+    descriptor->run_epoch = 0;
+    descriptor->task_ref = SCHEDULER_TASK_REF_INVALID;
+    descriptor->order_key = UINT64_MAX;
+    descriptor->group_seq = 0;
+    descriptor->block_idx = UINT32_MAX;
+    descriptor->cluster_index = UINT32_MAX;
     scheduler_cluster_store_field(&signal->prepare_task_ref, INT64_C(-1));
     scheduler_cluster_store_field(&signal->prepare_block, UINT32_C(0));
     scheduler_cluster_store_field(&signal->prepare_mask, UINT32_C(0));
@@ -117,6 +127,10 @@ scheduler_cluster_signal_clear(SCHEDULER_CLUSTER_SSBUF SchedulerClusterSignal *s
     scheduler_cluster_store_field(&signal->block_idx, UINT32_C(0));
     scheduler_cluster_store_field(&signal->active_mask, UINT32_C(0));
     for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+        descriptor->previous_lane_seq[lane] = 0;
+        scheduler_cluster_store_field(&signal->sync_mix.lanes[lane].assigned_seq, UINT64_C(0));
+        scheduler_cluster_store_field(&signal->sync_mix.lanes[lane].arrived_seq, UINT64_C(0));
+        scheduler_cluster_store_field(&signal->sync_mix.lanes[lane].released_seq, UINT64_C(0));
         scheduler_cluster_store_field(&signal->prepared[lane], UINT32_C(0));
         scheduler_cluster_store_field(&signal->sync_frontier[lane], UINT32_C(0));
         scheduler_cluster_store_field(&signal->sync_hold[lane], UINT32_C(0));

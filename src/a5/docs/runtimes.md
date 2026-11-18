@@ -1,5 +1,7 @@
 # Runtime Variants (a5)
 
+A5 scheduler work follows the [shared hardware and scheduling premises](../../../docs/zh-cn/design/a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles): early parallel preparation, atomic dynamic claims distributed over 128 B isolation units, explicit DSB for dependent operations, and lightweight condition observation. STARS is a future Wait backend; it is not part of the current generic task-event implementation.
+
 Two runtime implementations live under `src/a5/runtime/`, each providing a different graph-building strategy. The `RUNTIME_CONFIG.runtime` field in `kernel_config.py` selects which runtime to use.
 
 ## Comparison

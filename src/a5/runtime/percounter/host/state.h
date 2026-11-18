@@ -31,6 +31,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <utility>
 #include <vector>
@@ -41,6 +42,10 @@
 #include "host_build_graph/runtime.h"
 #include "host_build_graph/shared_memory.h"
 #include "intrinsic.h"
+#include "host/platform_compile_info.h"
+#include "callable_entry.h"
+#include "image/image_pack.h"
+#include "scheduler/argument_metadata.h"
 #include "graph_template.h"
 #include "region_plan.h"
 #include "scheduler/scheduler_layout.h"
@@ -143,7 +148,7 @@ enum class StateSelection : uint8_t {
 inline StateSelection select_percounter_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
     const std::vector<SchedulerTaskMetadata> &task_metadata, const std::vector<int64_t> &inline_completed_task_ids,
-    const sm_layout::SegmentOffsets &device_segments
+    const sm_layout::SegmentOffsets &device_segments, const void *uploaded_sm
 ) {
     const size_t task_count = static_cast<size_t>(total_tasks);
     std::vector<bool> inline_completed(task_count, false);
@@ -177,7 +182,8 @@ inline StateSelection select_percounter_state(
     std::vector<int32_t> edges;
     std::vector<size_t> edge_begin(task_count, 0);
     uint64_t order_count[PERCOUNTER_CORE_TYPE_COUNT] = {0, 0};
-    uint64_t mix_order_count = 0;
+    uint64_t mix_task_count = 0;
+    uint64_t boundary_task_count = 0;
     uint64_t sync_cohort_count = 0;
     // Each GRAPH task places its body's blocks, and holds one of its own that
     // no list carries.
@@ -193,7 +199,8 @@ inline StateSelection select_percounter_state(
                 graph.templates[graph.invocations[static_cast<size_t>(input.graph_invocation)].template_index];
             order_count[0] += tmpl.orders[0].size();
             order_count[1] += tmpl.orders[1].size();
-            mix_order_count += tmpl.orders[PERCOUNTER_LIST_MIX].size();
+            mix_task_count += tmpl.mix_task_count;
+            boundary_task_count += tmpl.boundary_task_count;
             sync_cohort_count += tmpl.sync_cohort_count;
             ++block_total;
             for (const auto &body_task : tmpl.tasks)
@@ -209,16 +216,20 @@ inline StateSelection select_percounter_state(
                 );
                 return StateSelection::FAILED;
             }
+            input.active_mask = 0;
+            const auto &descriptor = slot.to_descriptor();
+            for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane)
+                if (descriptor.kernel_id[lane] >= 0) input.active_mask |= 1U << lane;
             input.block_num = slot.logical_block_num;
             input.is_mix = placement == TaskPlacement::MIX;
             input.subtask_count = __builtin_popcount(active_mask);
             execution_count += static_cast<uint64_t>(input.block_num) * input.subtask_count;
-            // A sync-start task holds one arming entry; its blocks are handed
-            // out from the cohort queue instead of from a list.
-            const uint64_t entries = input.sync_start ? 1 : static_cast<uint64_t>(input.block_num);
+            // SPMD tasks allocate blocks through a task-private counter.
+            const uint64_t entries = 1;
+            if (input.block_num > 1 || input.is_mix) ++boundary_task_count;
             if (input.sync_start) ++sync_cohort_count;
-            if (input.is_mix) mix_order_count += entries;
-            else order_count[input.core_type_index] += entries;
+            if (input.is_mix) mix_task_count += entries;
+            order_count[input.is_mix ? 1 : input.core_type_index] += entries;
             block_total += static_cast<uint64_t>(input.block_num);
         } else {
             ++block_total;
@@ -234,8 +245,8 @@ inline StateSelection select_percounter_state(
 
     PercounterLayout layout{};
     if (!plan_layout(
-            task_count, block_total, edges.size(), order_count, &layout, mix_order_count, sync_cohort_count,
-            graph.layout, execution_count, runtime->dev.chip_swimlane_level
+            task_count, block_total, edges.size(), order_count, &layout, mix_task_count, boundary_task_count,
+            sync_cohort_count, graph.layout, execution_count, runtime->dev.chip_swimlane_level
         )) {
         LOG_ERROR("A5 percounter: state layout overflow");
         return StateSelection::FAILED;
@@ -243,8 +254,7 @@ inline StateSelection select_percounter_state(
     void *device_state = nullptr;
     void *host_base = nullptr;
     if (api->acquire_scheduler_state_storage(
-            static_cast<size_t>(layout.total_size), static_cast<size_t>(SCHEDULER_STATE_ALIGNMENT), &device_state,
-            &host_base
+            static_cast<size_t>(layout.total_size), alignof(PercounterControl), &device_state, &host_base
         ) != 0 ||
         device_state == nullptr || host_base == nullptr) {
         LOG_ERROR("A5 percounter: failed to obtain %" PRIu64 " scheduler state bytes", layout.total_size);
@@ -261,7 +271,11 @@ inline StateSelection select_percounter_state(
     const GraphPlanInput graph_plan{
         graph.templates.data(), graph.templates.size(), graph.invocations.data(), graph.invocations.size()
     };
-    if (!build_tables(inputs.data(), task_count, layout, host_base, device_base, external, &build, graph_plan)) {
+    if (!build_tables(
+            inputs.data(), task_count, layout, host_base, device_base,
+            static_cast<uint32_t>(runtime->get_worker_count() / PLATFORM_CORES_PER_BLOCKDIM), external, &build,
+            graph_plan
+        )) {
         LOG_ERROR(
             "A5 percounter: %s (task id=%" PRId64 ", fanin index=%d)", build_status_name(build.status), build.task_id,
             build.fanin_index
@@ -269,27 +283,52 @@ inline StateSelection select_percounter_state(
         return StateSelection::FAILED;
     }
 
-    const uint64_t async_run_epoch = region_at<PercounterControl>(host_base, layout.control_offset)->async_run_epoch;
-    // Each slot points at its own contexts, so preparing another candidate
-    // cannot replace the block identity of a payload already held by the lane.
-    for (uint64_t slot = 0; slot < SCHEDULER_WORKER_CAPACITY * PERCOUNTER_PAYLOAD_SLOT_COUNT; ++slot) {
-        const uint64_t offset = layout.dispatch_payloads_offset + slot * sizeof(DispatchPayload);
-        auto *payload = region_at<DispatchPayload>(host_base, offset);
-        const uint64_t device_payload = device_base + offset;
-        payload->args[PAYLOAD_LOCAL_CONTEXT_INDEX] = device_payload + offsetof(DispatchPayload, local_context);
-        payload->args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = device_payload + offsetof(DispatchPayload, global_context);
-        payload->local_context.block_idx = 0;
-        payload->local_context.block_num = 1;
-        // Every prepared payload on a lane names that lane's registration scratch.
-        const uint64_t first_record = slot / PERCOUNTER_PAYLOAD_SLOT_COUNT;
-        payload->global_context.async_present = 1;
-        payload->global_context.async_image_address = device_base;
-        payload->global_context.async_image_bytes = layout.total_size;
-        payload->global_context.async_run_epoch = async_run_epoch;
-        payload->global_context.async_group_offset =
-            layout.async_groups_offset + first_record * sizeof(pto2::resident::AsyncGroupData);
-        payload->global_context.async_group_index = static_cast<uint32_t>(first_record);
-        payload->global_context.async_output_capture_refused = 0;
+    if (task_count != 0 && uploaded_sm == nullptr) return StateSelection::FAILED;
+    const auto address_space = std::strcmp(get_platform(), "a5sim") == 0 ? SchedulerCallableAddressSpace::HOST :
+                                                                           SchedulerCallableAddressSpace::DEVICE;
+    const uint64_t host_image = reinterpret_cast<uint64_t>(uploaded_sm);
+    const uint64_t device_image = reinterpret_cast<uint64_t>(runtime->get_gm_sm_ptr());
+    const auto image_address = [&](const void *address, uint64_t bytes, uint64_t &device_address) {
+        device_address = 0;
+        if (bytes == 0) return true;
+        const uint64_t source = reinterpret_cast<uint64_t>(address);
+        if (source < host_image || source - host_image > runtime->dev.sm_image_bytes ||
+            bytes > runtime->dev.sm_image_bytes - (source - host_image) ||
+            source - host_image > UINT64_MAX - device_image)
+            return false;
+        device_address = device_image + (source - host_image);
+        return true;
+    };
+    auto *counters = region_at<PercounterCounter>(host_base, layout.counters_offset);
+    region_at<PercounterControl>(host_base, layout.control_offset)->arguments_address =
+        device_image + device_segments.scalar_pool;
+    for (size_t id = 0; id < task_count; ++id) {
+        const auto &input = inputs[id];
+        if (input.graph_invocation >= 0 || input.inline_completed || input.published_off_lane || input.active_mask == 0)
+            continue;
+        const auto &payload = task_image::payload(uploaded_sm, device_segments, id);
+        if (payload.tensor_count < 0 || payload.scalar_count < 0) return StateSelection::FAILED;
+        const uint32_t tensors = static_cast<uint32_t>(payload.tensor_count);
+        const uint32_t scalars = static_cast<uint32_t>(payload.scalar_count);
+        uint64_t arguments_address = 0;
+        const void *arguments =
+            reinterpret_cast<const uint8_t *>(uploaded_sm) + device_segments.scalar_pool + id * sizeof(DispatchPayload);
+        if (!image_address(arguments, sizeof(DispatchPayload), arguments_address)) return StateSelection::FAILED;
+        uint64_t functions[PLATFORM_CORES_PER_BLOCKDIM]{};
+        for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane)
+            if (input.active_mask & (1U << lane))
+                functions[lane] = scheduler_resolve_callable_entry(
+                    runtime->get_function_bin_addr(task_metadata[id].kernel_ids[lane]), address_space
+                );
+        const auto prepared = percounter_prepare_argument_metadata(
+            counters[id], functions, input.active_mask, arguments_address, tensors, scalars
+        );
+        if (prepared != SchedulerGraphResult::OK) {
+            LOG_ERROR(
+                "A5 percounter: invalid argument metadata task=%zu status=%u", id, static_cast<unsigned>(prepared)
+            );
+            return StateSelection::FAILED;
+        }
     }
 
     if (graph.section_bytes != 0) {
@@ -311,7 +350,7 @@ inline StateSelection select_percounter_state(
         "A5 percounter: selected for %d tasks (%" PRIu64 " AIC, %" PRIu64 " AIV and %" PRIu64
         " MIX list entries, %" PRIu64 " sync cohorts, %zu edges, %zu Graph invocations of %zu Definitions with %" PRIu64
         " body tasks; %" PRIu64 " of %" PRIu64 " region bytes uploaded)",
-        total_tasks, order_count[0], order_count[1], mix_order_count, sync_cohort_count, edges.size(),
+        total_tasks, order_count[0], order_count[1], mix_task_count, sync_cohort_count, edges.size(),
         graph.invocations.size(), graph.templates.size(), graph.layout.body_task_count, layout.upload_size,
         layout.total_size
     );

@@ -57,7 +57,7 @@ class ProtocolBuilder:
             if mask == 0:
                 flags |= 32
             elif mask is not None:
-                flags |= (4 if mask.bit_count() > 1 else 0) | (8 if blocks > 1 else 0)
+                flags |= (4 if bin(mask).count("1") > 1 else 0) | (8 if blocks > 1 else 0)
             if ref in sync_tasks:
                 flags |= 16
             raw["tasks"].append(
@@ -72,19 +72,24 @@ class ProtocolBuilder:
                 )
             )
             if mask:
-                prefix += blocks * mask.bit_count()
+                prefix += blocks * bin(mask).count("1")
             raw["task_controls"].append(
                 dict(
                     task_ref=ref,
                     state=2 if mask is None else 0,
-                    canonical_total=blocks * mask.bit_count() if mask else 1,
-                    pending_compute=(blocks * mask.bit_count() if mask else 1) if mask is not None else 0,
-                    completion_debt=(blocks * mask.bit_count() if mask else 1) if mask is not None else 0,
+                    canonical_total=blocks * bin(mask).count("1") if mask else 1,
+                    pending_compute=(blocks * bin(mask).count("1") if mask else 1) if mask is not None else 0,
+                    completion_debt=(blocks * bin(mask).count("1") if mask else 1) if mask is not None else 0,
                     next_block=0,
                     completed_subtasks=0,
                     admission_state=0,
                     claim_tickets=0,
                     claim_seal=0,
+                    completion_backend=0,
+                    async_mask=0,
+                    counter_index=MAX,
+                    counter_threshold=0,
+                    counter_limit=0,
                 )
             )
             raw["inline_completed_count" if mask is None else "resolved_task_count"] += 1
@@ -110,10 +115,8 @@ class ProtocolBuilder:
                 )
             )
         if raw["cooperative_task_count"]:
-            mix_index = 0
             stride = 64
             for task in raw["tasks"]:
-                mixed = bool(task["flags"] & 4 and task["flags"] & 16)
                 raw["admissions"].append(
                     dict(
                         index=task["task_ref"],
@@ -125,11 +128,8 @@ class ProtocolBuilder:
                         active_mask=0,
                         flags=0,
                         record_offset=4096 + task["task_ref"] * stride,
-                        close_seals_offset=8192 + mix_index * clusters * 64 if mixed else 0,
-                        close_seals=[0] * clusters if mixed else [],
                     )
                 )
-                mix_index += mixed
 
     def tick(self):
         self.clock += 10
@@ -209,7 +209,7 @@ class ProtocolBuilder:
                 closed=[0, 0],
                 observed_tail=self.raw["commit_tail"],
                 closed_cursor=0,
-                close_seal=0,
+                close_frontier=0,
                 last_group_seq=0,
                 pending_mask=0,
                 claim_seal_seen=0,
@@ -229,6 +229,7 @@ class ProtocolBuilder:
             active_mask=spec["active_mask"],
             group_seq=0,
             completion_ticket=MAX,
+            completion_credits=0,
             released_seq=[0, 0, 0],
             sync_tail=0,
             sync_frontier=[0, 0, 0],
@@ -246,7 +247,7 @@ class ProtocolBuilder:
         ):
             row[name] = [0, 0]
         result: dict[str, Any] = dict(
-            index=spec["trace_base"] + block * spec["active_mask"].bit_count(), owner=row, lanes=[]
+            index=spec["trace_base"] + block * bin(spec["active_mask"]).count("1"), owner=row, lanes=[]
         )
         self.raw["blocks"].append(result)
         if spec["flags"] & 16:
@@ -279,7 +280,7 @@ class ProtocolBuilder:
         owner = block["owner"]
         task = owner["task_ref"]
         control = self.raw["task_controls"][task]
-        width = owner["active_mask"].bit_count()
+        width = bin(owner["active_mask"]).count("1")
         self.stamp(owner, "completion_before")
         owner["completion_ticket"] = control["completed_subtasks"]
         control["completed_subtasks"] += width
@@ -300,8 +301,8 @@ class ProtocolBuilder:
         pending = block % 2
         index = (
             spec["trace_base"]
-            + block * spec["active_mask"].bit_count()
-            + (spec["active_mask"] & ((1 << slot) - 1)).bit_count()
+            + block * bin(spec["active_mask"]).count("1")
+            + bin(spec["active_mask"] & ((1 << slot) - 1)).count("1")
         )
         row: dict[str, Any] = dict(
             self.common(task, worker),
@@ -328,6 +329,7 @@ class ProtocolBuilder:
         )
         for name in ("permit", "entry", "returned", "visible", "completion_consumed", "trace_published"):
             row[name] = [0, 0]
+        row["contribution_credits"] = 0
         self.raw["executions"].append(row)
         self.stamp(row, "permit")
         self.stamp(row, "entry")
@@ -378,7 +380,7 @@ class ProtocolBuilder:
         if block is not None:
             block["owner"]["completion_ticket"] = ticket
             self.stamp(block["owner"], "completion_after")
-        if control["completed_subtasks"] == spec["block_num"] * spec["active_mask"].bit_count():
+        if control["completed_subtasks"] == spec["block_num"] * bin(spec["active_mask"]).count("1"):
             self.complete_task(task, execution["worker_index"], contribution=execution)
 
     def mix_block(self, task, block, cluster, *, reserved=None) -> dict[str, Any]:
@@ -460,8 +462,17 @@ class ProtocolBuilder:
                     if b["owner"]["task_ref"] == task and b["owner"]["cluster_index"] == worker // 3
                 ]
                 row["last_group_seq"] = max(groups, default=0)
-                row["close_seal"] = row["last_group_seq"] + 1
-                self.raw["admissions"][task]["close_seals"][worker // 3] = row["close_seal"]
+                if worker % 3 == 0:
+                    row["close_frontier"] = row["order_key"] + 1
+                else:
+                    row["close_frontier"] = max(
+                        (
+                            member["order_key"] + 1
+                            for member in self.raw["members"]
+                            if member["worker_index"] == (worker // 3) * 3 and member["closed"][1]
+                        ),
+                        default=0,
+                    )
                 if worker % 3:
                     row["closed_cursor"] = MAX
             if not (spec["flags"] & 4 and worker % 3) and row["closed_cursor"] == spec["block_num"]:

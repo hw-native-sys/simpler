@@ -454,7 +454,7 @@ bool bind_graph_definitions(
     if (graph_host_upload_count(graph_state) != 0)
         invocation_definitions.resize(static_cast<size_t>(total_tasks), SCHEDULER_NATIVE_NO_INSTANCE);
     const size_t count = graph_host_upload_count(graph_state);
-    GraphHostImageList definitions = graph_host_definitions(graph_state);
+    std::vector<GraphHostImage> definitions = graph_host_definitions(graph_state);
     const auto align_up = [](size_t value) {
         return (value + GRAPH_DEFINITION_OBJECT_ALIGN - 1) & ~(GRAPH_DEFINITION_OBJECT_ALIGN - 1);
     };
@@ -470,7 +470,7 @@ bool bind_graph_definitions(
     // offsets they claimed, so the block starts out that long and the rest are
     // appended past them.
     size_t block_bytes = graph_host_arena_used(graph_state);
-    for (const GraphHostImage &entry : definitions.entries) {
+    for (const GraphHostImage &entry : definitions) {
         if (entry.bytes < sizeof(Graph)) continue;
         if (entry.spill == nullptr) {
             packed.emplace(entry.graph_key, PackedDefinition{entry.object_offset, entry.bytes, nullptr, {}, false});

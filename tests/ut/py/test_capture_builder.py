@@ -55,9 +55,10 @@ def test_a_phase_no_runtime_records_is_refused():
 
 
 @pytest.mark.parametrize(
-    "phase", ("worksteal", "scalar_ready_refresh", "scalar_ready_directory", "scalar_poll_own_inbox")
+    "phase",
+    ("worksteal", "scalar_ready_refresh", "scalar_ready_directory", "scalar_poll_own_inbox", "resolve", "refill"),
 )
-def test_current_hbg_resident_rejects_removed_inbox_phases(phase):
+def test_current_hbg_resident_rejects_removed_phases(phase):
     with pytest.raises(ValueError, match=f"aicore producer does not record the phase '{phase}'"):
         Capture(runtime=HBG_RUNTIME, level=3).aicore_sched_phase(phase=phase, start=1, end=2)
 
@@ -159,9 +160,9 @@ def test_legal_phase_names_are_the_wire_vocabulary_not_a_render_table():
         assert legal_phase_names(runtime_name) == runtime.PHASES
         # Every alias is a name the wire can carry, whatever a report calls it.
         assert set(runtime.PHASE_ALIASES) <= runtime.PHASES
-        # Every drawn phase is one the wire can carry, minus nothing: a colour for a
-        # phase no producer emits would be a bar that never appears.
-        assert set(runtime.PHASE_COLORS) <= runtime.PHASES
+        # Colours use report labels, including aliases of live wire phases.
+        rendered_phases = {runtime.canonical_sched_phase(phase) for phase in runtime.PHASES}
+        assert set(runtime.PHASE_COLORS) <= rendered_phases
 
 
 def test_row_widths_and_epochs_are_generated():

@@ -26,6 +26,72 @@ extern "C" HcclResult HcclRankGraphGetLinks(HcclComm comm, uint32_t, uint32_t, u
     return HCCL_E_INTERNAL;
 }
 
+static void test_ccu_communicator_modes(const char *module_path) {
+    using namespace simpler::ccu;
+    std::ifstream input(module_path, std::ios::binary);
+    assert(input.good());
+    const std::vector<uint8_t> module((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    ExpectedBuildIdentity identity{};
+    identity.sdk.fill(0x11);
+    identity.pto_isa.fill(0x22);
+    const auto base = reinterpret_cast<HcclComm>(1);
+    HcommMissionStreamPool stream_pool;
+    std::vector<std::shared_ptr<HcommDomainChannels>> domains;
+    for (const auto mode : {COMM_CCU_MODE_SCHED, COMM_CCU_MODE_MS, COMM_CCU_MODE_SCHED}) {
+        const uint32_t expansion = mode == COMM_CCU_MODE_MS ? 5 : 6;
+        const std::string name = mode == COMM_CCU_MODE_MS ? "ms" : "sched";
+        std::shared_ptr<HcommDomainChannels> channels;
+        fail_ccu_create = true;
+        try {
+            create_hcomm_domain_channels(base, 41, {0, 1}, 0, channels, mode);
+            assert(false);
+        } catch (const std::runtime_error &error) {
+            const std::string message = error.what();
+            assert(message.find("mode=" + name) != std::string::npos);
+            assert(message.find("failed with code " + std::to_string(HCCL_E_PARA)) != std::string::npos);
+        }
+        assert((ccu_communicator_modes.back() == std::make_pair(2u, expansion)));
+        assert(channels && channels->mode == mode && channels->close());
+        domains.push_back(channels);
+    }
+    // Registration uses its domain even when other modes were configured later.
+    for (const auto &channels : domains) {
+        std::unique_ptr<DomainCcuOwner> owner;
+        HcommDomainSession *session{};
+        try {
+            prepare_hcomm_ccu_callable(
+                base, 42, {0, 1}, 0, identity, {module}, "mode_test", owner, session, channels, 0, stream_pool
+            );
+            assert(false);
+        } catch (const std::runtime_error &error) {
+            const std::string message = error.what();
+            const std::string mode = channels->mode == COMM_CCU_MODE_MS ? "ms" : "sched";
+            assert(message.find("local CCU registration) mode=" + mode) != std::string::npos);
+            assert(message.find("failed with code " + std::to_string(HCCL_E_PARA)) != std::string::npos);
+        }
+        const uint32_t expansion = channels->mode == COMM_CCU_MODE_MS ? 5 : 6;
+        assert((ccu_communicator_modes.back() == std::make_pair(1u, expansion)));
+        assert(!owner && session == nullptr);
+        assert(channels->close());
+    }
+    std::unique_ptr<DomainCcuOwner> owner;
+    HcommDomainSession *session{};
+    try {
+        prepare_hcomm_ccu_callable(
+            base, 43, {0, 1}, 0, identity, {module}, "default_mode", owner, session, nullptr, 0, stream_pool
+        );
+        assert(false);
+    } catch (const std::runtime_error &error) {
+        const std::string message = error.what();
+        assert(message.find("HcclCreateSubCommConfig(CCU) mode=sched") != std::string::npos);
+        assert(message.find("failed with code " + std::to_string(HCCL_E_PARA)) != std::string::npos);
+    }
+    assert((ccu_communicator_modes.back() == std::make_pair(2u, 6u)));
+    assert(!owner && session == nullptr);
+    assert(live_ccu_communicators.empty());
+    fail_ccu_create = false;
+}
+
 static void test_ccu_channel_rollback(const char *module_path, bool destroy_failure) {
     std::ifstream input(module_path, std::ios::binary);
     assert(input.good());

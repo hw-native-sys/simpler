@@ -68,10 +68,9 @@ TEST(SchedulerAsyncStateTest, LeaseEncodingRejectsZeroGenerationAndReservedPhase
 
 TEST(SchedulerAsyncStateTest, HandoffRejectsAStaleClaimAndAStaleOwner) {
     SchedulerAsyncLease lease{};
-    const auto published = scheduler_async_lease_publish(lease);
-    ASSERT_EQ(published.result, LeaseResult::SUCCESS);
-    const uint64_t original_snapshot = published.word;
-    ASSERT_EQ(scheduler_async_lease_publish(lease).result, LeaseResult::OWNERSHIP_LOST);
+    lease.word = UINT64_MAX;
+    const auto published = scheduler_async_lease_initialize(lease);
+    const uint64_t original_snapshot = published;
 
     const auto first = scheduler_async_lease_try_claim(lease, original_snapshot);
     ASSERT_EQ(first.result, LeaseResult::SUCCESS);
@@ -94,7 +93,6 @@ TEST(SchedulerAsyncStateTest, HandoffRejectsAStaleClaimAndAStaleOwner) {
     EXPECT_EQ(scheduler_async_lease_phase(finished.word), Phase::TERMINAL);
     EXPECT_EQ(scheduler_async_lease_try_claim(lease, finished.word).result, LeaseResult::NOT_RUNNABLE);
     EXPECT_EQ(scheduler_async_lease_try_claim(lease, handed_off.word).result, LeaseResult::CONTENDED);
-    EXPECT_EQ(scheduler_async_lease_publish(lease).result, LeaseResult::OWNERSHIP_LOST);
     EXPECT_EQ(scheduler_async_lease_finish(lease, second.word).result, LeaseResult::OWNERSHIP_LOST);
 }
 
@@ -117,8 +115,7 @@ TEST(SchedulerAsyncStateTest, OwnerGenerationNeverWrapsAndMayStillFinishOrFail) 
 
 TEST(SchedulerAsyncStateTest, ConcurrentClaimsOfOneVersionGrantOneOwner) {
     SchedulerAsyncLease lease{};
-    const auto publication = scheduler_async_lease_publish(lease);
-    ASSERT_EQ(publication.result, LeaseResult::SUCCESS);
+    const auto publication = scheduler_async_lease_initialize(lease);
     std::mutex mutex;
     std::condition_variable ready;
     bool start = false;
@@ -135,7 +132,7 @@ TEST(SchedulerAsyncStateTest, ConcurrentClaimsOfOneVersionGrantOneOwner) {
                     return start;
                 });
             }
-            const auto result = scheduler_async_lease_try_claim(lease, publication.word);
+            const auto result = scheduler_async_lease_try_claim(lease, publication);
             if (result.result == LeaseResult::SUCCESS) {
                 ++owners;
                 owned_word.store(result.word);
@@ -200,12 +197,12 @@ TEST(SchedulerAsyncStateTest, ObservedMalformedLeaseCannotBeOverwrittenByAClaimO
 TEST(SchedulerAsyncStateTest, FailureWriterCannotTakeOverAnotherOwner) {
     SchedulerAsyncLease lease{};
     const uint64_t dormant = scheduler_async_lease_load(lease);
-    const auto publication = scheduler_async_lease_publish(lease);
-    const auto owner = scheduler_async_lease_try_claim(lease, publication.word);
+    const auto publication = scheduler_async_lease_initialize(lease);
+    const auto owner = scheduler_async_lease_try_claim(lease, publication);
     ASSERT_EQ(owner.result, LeaseResult::SUCCESS);
     EXPECT_EQ(scheduler_async_lease_fail(lease, dormant).result, LeaseResult::OWNERSHIP_LOST);
     EXPECT_EQ(lease.word, owner.word);
-    EXPECT_EQ(scheduler_async_lease_fail(lease, publication.word).result, LeaseResult::INVALID_TRANSITION);
+    EXPECT_EQ(scheduler_async_lease_fail(lease, publication).result, LeaseResult::INVALID_TRANSITION);
     const auto failed = scheduler_async_lease_fail(lease, owner.word);
     ASSERT_EQ(failed.result, LeaseResult::SUCCESS);
     EXPECT_EQ(scheduler_async_lease_try_claim(lease, failed.word).result, LeaseResult::NOT_RUNNABLE);
@@ -219,10 +216,10 @@ TEST(SchedulerAsyncStateTest, FailureWriterCannotTakeOverAnotherOwner) {
 
 TEST(SchedulerAsyncStateTest, FailedGroupRetainsItsPendingObligation) {
     SchedulerAsyncTaskJoin join{};
-    ASSERT_EQ(scheduler_async_pending::register_group(join).result, scheduler_async_pending::Result::PENDING);
+    ASSERT_EQ(scheduler_async_pending::register_group(join), scheduler_async_pending::Result::PENDING);
     SchedulerAsyncLease group{};
-    const auto published = scheduler_async_lease_publish(group);
-    const auto owner = scheduler_async_lease_try_claim(group, published.word);
+    const auto published = scheduler_async_lease_initialize(group);
+    const auto owner = scheduler_async_lease_try_claim(group, published);
     ASSERT_EQ(owner.result, LeaseResult::SUCCESS);
     ASSERT_EQ(scheduler_async_pending::close_computation(join).result, scheduler_async_pending::Result::PENDING);
     ASSERT_EQ(scheduler_async_lease_fail(group, owner.word).result, LeaseResult::SUCCESS);

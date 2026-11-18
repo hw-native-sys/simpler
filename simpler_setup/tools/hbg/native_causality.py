@@ -17,7 +17,10 @@ from .native_protocol import (
     COMPLETION_ALIAS_FLAGS,
     COMPLETION_FROM_CONTRIBUTION,
     COMPLETION_FROM_GROUP,
+    CONTROL_NOTIFY_ACCOUNTING,
+    COUNTER_ACCOUNTING,
     DEFERRED_FINISH,
+    MEMBER_FROM_CLAIM,
     _completion_aliases,
     _error,
     audit_protocol_sequences,
@@ -26,6 +29,7 @@ from .native_protocol import (
 
 MAX = (1 << 64) - 1
 EXECUTABLE, MIX, SPMD, SYNC, INLINE, PREDICATE = (1, 4, 8, 16, 32, 64)
+ASYNC_INPUT = 1 << 1
 ENTRY, EXECUTED, COOPERATIVE, GM_GROUP, PERMIT_TAIL, PERMIT_NO_LOG, PUBLISHED = (1, 2, 4, 8, 16, 32, 64)
 CLUSTER_GROUP = 1 << 7
 PRECLAIM = 1 << 8
@@ -70,6 +74,8 @@ class NativeAudit:
         self.members = {row["index"]: row for row in section["members"]}
         self.blocks = {row["index"]: row for row in section["blocks"]}
         self.executions = {row["index"]: row for row in section["executions"]}
+        self.conditions = {row["index"]: row for row in section["condition_contributions"]}
+        self.used_conditions = set()
         self.orders = {ref: order for order, ref in enumerate(section["admission_log"])}
         self.expected_executions = {}
         self.expected_blocks = {}
@@ -81,7 +87,7 @@ class NativeAudit:
         self.claim_points = {}
         self.confirm_points = {}
         self.claim_seals = {}
-        self.close_reads = {}
+        self.close_proofs = {}
         self.payload_points = {}
 
     def chain(self, record, *fields):
@@ -136,7 +142,10 @@ class NativeAudit:
             flags, mask, blocks = task["flags"], task["active_mask"], task["block_num"]
             deps = task["dependencies"]
             require(len(set(deps)) == len(deps) and all(0 <= dep < ref for dep in deps), "invalid frozen dependencies")
-            require(flags & ~(EXECUTABLE | MIX | SPMD | SYNC | INLINE | PREDICATE) == 0, "unknown task flags")
+            require(
+                flags & ~(EXECUTABLE | ASYNC_INPUT | MIX | SPMD | SYNC | INLINE | PREDICATE) == 0,
+                "unknown task flags",
+            )
             if ref in self.control_nodes:
                 require(mask == 0 and blocks == 1 and flags == 0, "invalid native control metadata")
                 continue
@@ -159,7 +168,7 @@ class NativeAudit:
                     "invalid inline service",
                 )
                 continue
-            active = mask.bit_count()
+            active = bin(mask).count("1")
             require(0 < mask < 8 and 0 < blocks * active <= 32767, "invalid frozen task shape")
             require(bool(flags & MIX) == (active > 1) and bool(flags & SPMD) == (blocks > 1), "shape/flags mismatch")
             if flags & SYNC:
@@ -189,6 +198,25 @@ class NativeAudit:
         for ref in device:
             done = self.actors[ref]["completion"]
             require(done is not None, "missing TaskDone publication")
+            if done["flags"] & CONTROL_NOTIFY_ACCOUNTING:
+                require(
+                    (self.tasks[ref]["flags"] & INLINE or ref in self.control_nodes)
+                    and self.controls[ref]["completion_backend"] == 0
+                    and not done["flags"] & (COUNTER_ACCOUNTING | DEFERRED_FINISH | COMPLETION_ALIAS_FLAGS),
+                    "control notification accounting on a non-control task or conflicting source",
+                )
+                # No record identifies the earliest SET among multiple publishers.
+                # Keep the logical fanin join untimed; the actor retains CAS time.
+                self.done_points[ref] = ("ControlReady", ref)
+                continue
+            if self.controls[ref]["completion_backend"] == 1:
+                require(
+                    done["flags"] & COUNTER_ACCOUNTING and not done["flags"] & COMPLETION_ALIAS_FLAGS,
+                    "counter completion must identify accounting, not a last-writer alias",
+                )
+                self.done_points[ref] = ("CounterReady", ref)
+                continue
+            require(not done["flags"] & COUNTER_ACCOUNTING, "GM completion has counter accounting actor")
             source = self.completion_aliases.get(ref)
             name = (
                 ("TaskDone", ref)
@@ -262,7 +290,6 @@ class NativeAudit:
         stride = 64
         first = self.admissions[0]["record_offset"]
         require(first >= 64 and first % alignment == 0, "misaligned admission record")
-        seals = []
         for ref, record in sorted(self.admissions.items()):
             require(record["record_offset"] == first + ref * stride, "wrong task admission record binding")
             if ref not in cooperative:
@@ -273,25 +300,15 @@ class NativeAudit:
                     and record["block_num"] == record["member_count"] == record["active_mask"] == record["flags"] == 0,
                     "ordinary task has a cooperative admission",
                 )
-            if self.tasks[ref]["flags"] & MIX and ref in cooperative:
-                require(len(record["close_seals"]) == self.raw["cluster_count"], "missing cluster close seals")
-                seals.append(record["close_seals_offset"])
-            else:
-                require(
-                    record["close_seals_offset"] == 0 and record["close_seals"] == [], "non-Mix task has close seals"
-                )
-        if seals:
-            require(seals[0] > 0 and seals[0] % alignment == 0, "invalid close seal base")
-            seal_stride = self.raw["close_seal_stride"]
-            require(
-                seals == [seals[0] + index * self.raw["cluster_count"] * seal_stride for index in range(len(seals))],
-                "aliased or wrong task close seals",
-            )
 
-    def record_identity(self, record, ref, *, completion=False):
+    def record_identity(self, record, ref, *, completion=False, member=False):
         flags = self.tasks[ref]["flags"]
         if completion:
-            flags |= record["flags"] & (DEFERRED_FINISH | COMPLETION_ALIAS_FLAGS)
+            flags |= record["flags"] & (
+                DEFERRED_FINISH | COMPLETION_ALIAS_FLAGS | COUNTER_ACCOUNTING | CONTROL_NOTIFY_ACCOUNTING
+            )
+        if member:
+            flags |= record["flags"] & MEMBER_FROM_CLAIM
         require(
             record["task_ref"] == ref
             and record["run_epoch"] == self.raw["run_epoch"]
@@ -315,7 +332,7 @@ class NativeAudit:
         for index, member in self.members.items():
             order, worker = divmod(index, count)
             ref = self.raw["admission_log"][order]
-            self.record_identity(member, ref)
+            self.record_identity(member, ref, member=True)
             require(
                 member["worker_index"] == worker and member["pending_mask"] == 0,
                 "member closed with pending work or wrong owner",
@@ -326,8 +343,8 @@ class NativeAudit:
             self.causal.add(publication, point(member, "observed"))
             if not self.tasks[ref]["flags"] & MIX:
                 require(
-                    member["close_seal"] == member["last_group_seq"] == 0,
-                    "pure member closed with a Mix seal",
+                    member["close_frontier"] == member["last_group_seq"] == 0,
+                    "pure member closed with a Mix frontier",
                 )
             frontiers[worker].append(member)
         for members in frontiers.values():
@@ -389,11 +406,16 @@ class NativeAudit:
             if task["flags"] & MIX:
                 require(
                     execution["contribution_before"] == execution["contribution_after"] == [0, 0]
-                    and execution["contribution_ticket"] == execution["contribution_worker"] == 0,
+                    and execution["contribution_ticket"]
+                    == execution["contribution_worker"]
+                    == execution["contribution_credits"]
+                    == 0,
                     "Mix lane fabricated an individual completion contribution",
                 )
             else:
                 require(execution["contribution_worker"] == worker, "foreign subtask completion contributor")
+                if self.controls[ref]["completion_backend"] == 0:
+                    require(execution["contribution_credits"] == 0, "GM contribution carries counter credits")
                 self.chain(
                     execution, "completion_consumed", "contribution_before", "contribution_after", "trace_published"
                 )
@@ -441,7 +463,9 @@ class NativeAudit:
                 and execution["publication_count"] == 1,
                 "invalid cluster permit or republished payload",
             )
-            owner = self.blocks[task["trace_base"] + execution["block_idx"] * task["active_mask"].bit_count()]["owner"]
+            owner = self.blocks[task["trace_base"] + execution["block_idx"] * bin(task["active_mask"]).count("1")][
+                "owner"
+            ]
             require(
                 owner is not None and execution["permit_tail"] == owner["sync_tail"], "cluster permit lost sync prefix"
             )
@@ -502,7 +526,7 @@ class NativeAudit:
         self.causal.add(self.payload_points[execution["index"]][1], permit)
         self.before(point(member, "observed"), permit, "preclaim execution preceded cohort observation")
         self.before(finished, point(member, "closed"), "preclaim execution crossed member closure")
-        stride = cohort["active_mask"].bit_count()
+        stride = bin(cohort["active_mask"]).count("1")
         for block_index in range(cohort["block_num"]):
             block = self.blocks[cohort["trace_base"] + block_index * stride]
             owner = block["owner"]
@@ -685,14 +709,21 @@ class NativeAudit:
             if self.tasks[ref]["flags"] & SYNC:
                 by_claim = sorted(blocks, key=lambda block: block["owner"]["block_idx"])
                 self.ordered_intervals([b["owner"] for b in by_claim], "claim_before", "claim_after")
-            width = self.tasks[ref]["active_mask"].bit_count()
-            by_ticket = sorted(blocks, key=lambda block: block["owner"]["completion_ticket"])
-            require(
-                [b["owner"]["completion_ticket"] for b in by_ticket]
-                == list(range(0, self.tasks[ref]["block_num"] * width, width)),
-                "duplicate or missing block completion ticket",
-            )
-            self.ordered_intervals([b["owner"] for b in by_ticket], "completion_before", "completion_after")
+            width = bin(self.tasks[ref]["active_mask"]).count("1")
+            if self.controls[ref]["completion_backend"] == 1:
+                require(
+                    all(b["owner"]["completion_ticket"] == MAX for b in blocks),
+                    "counter block fabricated a returned completion ticket",
+                )
+            else:
+                by_ticket = sorted(blocks, key=lambda block: block["owner"]["completion_ticket"])
+                require(
+                    [b["owner"]["completion_ticket"] for b in by_ticket]
+                    == list(range(0, self.tasks[ref]["block_num"] * width, width))
+                    and all(b["owner"]["completion_credits"] == 0 for b in blocks),
+                    "duplicate or missing block completion ticket",
+                )
+                self.ordered_intervals([b["owner"] for b in by_ticket], "completion_before", "completion_after")
             self.claim_certificates(ref, blocks)
             if not self.tasks[ref]["flags"] & SYNC:
                 continue
@@ -708,6 +739,7 @@ class NativeAudit:
                         member["claim_seal_seen"] == member["claim_cursor_seen"] == 0,
                         "vector Mix member fabricated a cursor read",
                     )
+                    require(not member["flags"] & MEMBER_FROM_CLAIM, "vector Mix member fabricated a claim")
                     continue
                 self.close_cursor(ref, worker, owned[worker])
 
@@ -716,7 +748,7 @@ class NativeAudit:
         count = task["block_num"]
         if not task["flags"] & SYNC:
             # Ordinary records identify the fixed group owner. They carry
-            # no fresh-ticket order certificate or sync close seal.
+            # no fresh-ticket order certificate or sync retirement frontier.
             require(
                 all(block["claim"] is None for block in blocks), "ordinary cluster fabricated a sync claim certificate"
             )
@@ -785,6 +817,20 @@ class NativeAudit:
     def close_cursor(self, ref, worker, owned):
         task, member = self.tasks[ref], self.member(ref, worker)
         cursor, blocks = member["closed_cursor"], task["block_num"]
+        if member["flags"] & MEMBER_FROM_CLAIM:
+            require(
+                task["flags"] & SYNC
+                and len(owned) == 1
+                and cursor == MAX
+                and member["claim_seal_seen"] == member["claim_cursor_seen"] == 0,
+                "invalid owned-claim close proof",
+            )
+            # This event consumes the member's existing claim, not a fresh
+            # global cursor read between this and the next member's claim.
+            proof = self.claim_points[(ref, owned[0])]
+            self.close_proofs[(ref, worker)] = proof
+            self.causal.add(proof, point(member, "closed"))
+            return
         require(
             0 < cursor <= blocks
             and all(block < cursor for block in owned)
@@ -792,8 +838,8 @@ class NativeAudit:
             "invalid close cursor: unclaimed work without a retired sync_start position",
         )
         closed = point(member, "closed")
-        read = ("close_cursor_read", ref, worker)
-        self.close_reads[(ref, worker)] = read
+        read = ("close_cursor_proof", ref, worker)
+        self.close_proofs[(ref, worker)] = read
         self.causal.add(("event", worker, closed[2] - 1), read)
         self.causal.add(read, closed)
         self.causal.add(self.confirm_points[(ref, cursor)], read)
@@ -818,7 +864,7 @@ class NativeAudit:
                 "terminal block counters mismatch",
             )
             total = (
-                task["block_num"] * task["active_mask"].bit_count()
+                task["block_num"] * bin(task["active_mask"]).count("1")
                 if task["flags"] & EXECUTABLE and not task["flags"] & INLINE
                 else 0
             )
@@ -852,6 +898,9 @@ class NativeAudit:
             self.dependencies(task, done)
 
     def subtask_completion(self, task, done):
+        if self.controls[task["task_ref"]]["completion_backend"] == 1:
+            self.counter_completion(task, done)
+            return
         if task["flags"] & MIX:
             last = max(self.task_blocks[task["task_ref"]], key=lambda block: block["owner"]["completion_ticket"])[
                 "owner"
@@ -863,7 +912,7 @@ class NativeAudit:
             else:
                 require(done["flags"] & COMPLETION_FROM_GROUP, "TaskDone must alias its last group contribution")
             return
-        count = task["block_num"] * task["active_mask"].bit_count()
+        count = task["block_num"] * bin(task["active_mask"]).count("1")
         executions = [self.executions[index] for index in range(task["trace_base"], task["trace_base"] + count)]
         by_ticket = sorted(executions, key=lambda execution: execution["contribution_ticket"])
         require(
@@ -880,12 +929,90 @@ class NativeAudit:
             require(done["flags"] & COMPLETION_FROM_CONTRIBUTION, "TaskDone must alias its last subtask contribution")
             self.before(point(done, "after"), point(last, "trace_published"), "last subtask trace preceded TaskDone")
 
+    def counter_completion(self, task, accounting):
+        ref, width = task["task_ref"], bin(task["active_mask"]).count("1")
+        count, ready = task["block_num"] * width, self.done_points[ref]
+        if task["flags"] & MIX:
+            for block in self.task_blocks[ref]:
+                owner = block["owner"]
+                require(owner["completion_credits"] == width, "invalid counter group physical credits")
+                publication = self.causal.bounded(
+                    ("counter_return", ref, owner["block_idx"]),
+                    point(owner, "completion_before"),
+                    point(owner, "completion_after"),
+                )
+                self.causal.add(publication, ready)
+        for index in range(task["trace_base"], task["trace_base"] + count):
+            execution = self.executions[index]
+            may_defer = bool(self.controls[ref]["async_mask"] & (1 << execution["subtask_slot"]))
+            if not task["flags"] & MIX:
+                require(
+                    execution["contribution_ticket"] == MAX
+                    and execution["contribution_credits"] in ((1, 2) if may_defer else (1,)),
+                    "counter execution fabricated a ticket or invalid credits",
+                )
+                publication = self.causal.bounded(
+                    ("counter_return", ref, execution["block_idx"]),
+                    point(execution, "contribution_before"),
+                    point(execution, "contribution_after"),
+                )
+                self.causal.add(publication, ready)
+                if index in self.blocks:
+                    owner = self.blocks[index]["owner"]
+                    require(
+                        owner["completion_credits"] == execution["contribution_credits"],
+                        "pure block counter credits disagree with its execution",
+                    )
+                    self.causal.add(point(owner, "completion_before"), publication)
+                    self.causal.add(publication, point(owner, "completion_after"))
+                if execution["contribution_credits"] == 2:
+                    require(index not in self.conditions, "combined ADD2 duplicated a condition contribution")
+                    continue
+            if not may_defer:
+                require(index not in self.conditions, "synchronous execution has a condition contribution")
+                continue
+            self.counter_condition(index, ready, task)
+        self.causal.add(ready, point(accounting, "before"))
+
+    def counter_condition(self, index, ready, task):
+        require(index in self.conditions, "missing counter condition contribution")
+        condition, execution = self.conditions[index], self.executions[index]
+        require(
+            condition["task_ref"] == task["task_ref"]
+            and condition["block_idx"] == execution["block_idx"]
+            and condition["subtask_slot"] == execution["subtask_slot"]
+            and condition["credits"] == 1
+            and condition["source"] in (0, 1),
+            "invalid counter condition identity or credits",
+        )
+        if condition["source"] == 0:
+            require(
+                task["flags"] & MIX and condition["worker_index"] == execution["worker_index"],
+                "empty counter condition has a foreign owner or non-Mix task",
+            )
+        self.before(point(execution, "entry"), point(condition, "before"), "counter condition precedes its execution")
+        if condition["source"] == 1:
+            self.before(
+                point(execution, "returned"),
+                point(condition, "before"),
+                "counter condition precedes its execution return",
+            )
+        publication = self.causal.bounded(
+            ("counter_condition", index), point(condition, "before"), point(condition, "after")
+        )
+        self.causal.add(publication, ready)
+        self.used_conditions.add(index)
+
     def dependencies(self, task, done):
         ref = task["task_ref"]
         if ref in self.orders:
             earliest = point(self.actors[ref]["admission"], "before")
         elif task["flags"] & INLINE or ref in self.control_nodes:
-            earliest = point(done, "before")
+            if done["flags"] & CONTROL_NOTIFY_ACCOUNTING:
+                earliest = self.done_points[ref]
+                self.causal.add(earliest, point(done, "before"))
+            else:
+                earliest = point(done, "before")
         elif task["flags"] & MIX:
             # Speculative preparation may precede readiness; formal resource
             # staging may not. Every block needs this dependency edge.
@@ -917,6 +1044,11 @@ class NativeAudit:
 
         audit_mix(self)
         self.completions()
+        require(set(self.conditions) == self.used_conditions, "counter condition coverage mismatch")
+        require(
+            all(row["valid"] == 1 and row["value"] == row["limit"] for row in self.raw["completion_counters"]),
+            "counter observation is missing or not terminal",
+        )
         self.causal.validate()
         return dict(
             self.sequence_result,

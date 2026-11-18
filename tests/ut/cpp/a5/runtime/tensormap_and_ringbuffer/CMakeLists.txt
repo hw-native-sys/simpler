@@ -83,6 +83,21 @@ else()
     target_link_options(test_a5_tmr_urma_completion_kernel PRIVATE -Wl,--gc-sections)
 endif()
 
+# Replace only the clock boundary to drive scalar waits deterministically.
+if(APPLE)
+    set(_scalar_gc_link_option -Wl,-dead_strip)
+else()
+    set(_scalar_gc_link_option -Wl,--gc-sections)
+endif()
+get_target_property(_scalar_sources a5_tmr_objs SOURCES)
+list(FILTER _scalar_sources EXCLUDE REGEX "device_time_stub.cpp$")
+a5_tmr_case(test_scalar_access_deps.cpp NO_OBJS
+    SOURCES ${_scalar_sources} ${SIMPLER_SRC}/a5/runtime/tensormap_and_ringbuffer/runtime/runtime_core.cpp
+    LINK a5_ut_support
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK_OPTIONS ${_scalar_gc_link_option}
+    TIMEOUT 20)
+
 # Everything not named above is a plain case: one file, this runtime's whole
 # object library, nothing else to say. Dropping a new test_*.cpp into this
 # directory is all it takes — declaring one by hand above is what removes it

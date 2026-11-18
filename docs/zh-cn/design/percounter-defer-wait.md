@@ -1,5 +1,7 @@
 # percounter defer completion
 
+**共同前提：** 本页的 A5 调度设计遵守 [A5 硬件与调度统一原则](a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles)。与本原则冲突的旧设计按此修订；当前实现、拟修改布局和未来 STARS 后端分别标明。
+
 A5 `percounter` 的 kernel 可以登记完成条件后返回。物理 lane 继续执行其他任务；
 逻辑任务及 Graph shell 的完成计数器，等待所有条件满足后才发布。
 用户接口沿用 `get_async_ctx`、`save_expected_notification_counter` 和
@@ -57,6 +59,10 @@ COUNTER 的 pending 检查只做一次 GM 样本读取和有符号范围/阈值�
 登记了条件的 subtask 在报告 finished 前先减去自己的份额，条件完成时再补回。
 cohort 的物理 block 完成与逻辑条件完成分开计数，因此后续 cohort 可以继续。
 
+GM 同址观察和通知仍有并发串行代价，不能仅由一次检查很短推断全核开销很低。轮询复用已经确认的条件，检查请求率及实际发现延迟；单写者通知可用 st_dev，但跨核份额合并和 task 动态领取保留 atomic。必要 claim 分地址时按 128B 隔离，不能将相邻 uint64 或相邻64B行算作独立竞争单元。相关发布/消费、计数与后续判断的时序依赖都显式 DSB。
+
+上述为后续修改要求，不代表当前 percounter 的共享计数和紧凑链接已经拆散。STARS event/notify 是后续 Wait 的优先方案，空轮询用 nop 限流，并保留 early-notify、epoch、资源分配/释放和 payload 可见性；不把它或无通用分配方案的 SPR 当作 atomic claim 的替代。
+
 ## 满候选窗口的进度
 
 仅按 b-level 排序并保留有限候选，不能保证 defer 图的执行进度。例如一个 waiter 后面
@@ -77,11 +83,14 @@ notifier 仍未领取。
 两者均单调；每条 defer 记录使用这两次共享进度原子操作。
 任务和 shell 自身的计数器仍按现有发布规则更新。
 
-AICPU 先读取 `completed_block_count`，再检查异步计数。
-只有全部物理 block 已运行且 `async_registered == async_settled` 才允许结束。
-登记分配发生在对应 block 计数发布之前，因此末尾任务的条件不会漏查。
-没有 pending 记录的 lane 可按原 MIX/cohort 退出条件离开；拥有 pending 的 lane 留在 checkpoint。
-看门狗使用单调完成进度；条件永不满足时报告运行时超时。
+AICPU 观察全部顶层 sink 的完成组件，再检查异步计数。
+完成组件随本轮上传镜像预置，因此读到正值即属于本轮。
+只有全部顶层 sink 已发布且 `async_registered == async_settled` 才允许结束。
+登记分配发生在对应完成发布之前，因此末尾任务的条件不会漏查。
+lane 自身不判断整图完成：拥有 pending 的 lane 继续留在 checkpoint，所有 lane 都服务候选、记录与 defer，
+直到观察到 EXIT 或错误。
+看门狗的快路径是 sink 进度与异步计数；两者同时停滞时扫描全图完成组件确认是否真的没有进展，
+条件永不满足时报告运行时超时。
 
 登记错误、非法 token、条件溢出沿现有错误通道返回，不能发布为成功。
 异常终止不代表外部通信引擎已经完成；通信资源仍遵守平台的 teardown 证明。

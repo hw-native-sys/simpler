@@ -94,6 +94,21 @@ a2a3_tmr_case(test_kernel_error.cpp NO_OBJS
     LINK_OPTIONS ${_entry_preparation_gc}
     TIMEOUT 30)
 
+# Replace only the clock boundary to drive scalar waits deterministically.
+if(APPLE)
+    set(_scalar_gc_link_option -Wl,-dead_strip)
+else()
+    set(_scalar_gc_link_option -Wl,--gc-sections)
+endif()
+get_target_property(_scalar_sources a2a3_tmr_objs SOURCES)
+list(FILTER _scalar_sources EXCLUDE REGEX "device_time_stub.cpp$")
+a2a3_tmr_case(test_scalar_access_deps.cpp NO_OBJS
+    SOURCES ${_scalar_sources} ${SIMPLER_SRC}/a2a3/runtime/tensormap_and_ringbuffer/runtime/runtime_core.cpp
+    LINK a2a3_ut_support
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK_OPTIONS ${_scalar_gc_link_option}
+    TIMEOUT 20)
+
 # Everything not named above is a plain case: one file, this runtime's whole
 # object library, nothing else to say. Dropping a new test_*.cpp into this
 # directory is all it takes — declaring one by hand above is what removes it

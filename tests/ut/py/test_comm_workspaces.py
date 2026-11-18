@@ -28,6 +28,30 @@ def test_ccu_workspace_mapping_uses_same_configuration_as_name_sequence():
     mapped = DomainConfig.capture([0, 1], 4096, [], True, (), {"ccu": CcuConfig()})
     assert named == mapped
     assert mapped.workspace_mask() == 8
+    assert mapped.ccu_config().mode == "sched"
+
+
+def test_ccu_mode_is_immutable_and_part_of_domain_reuse_identity():
+    engines = {"ccu": CcuConfig(mode="ms")}
+    saved = DomainConfig.capture([0, 1], 4096, [], True, (), engines)
+    engines["ccu"] = CcuConfig()
+    replacement = DomainConfig.capture([0, 1], 4096, [], True, (), engines)
+    assert saved.ccu_config().mode == "ms"
+    assert saved.difference(replacement).startswith("workspace_configs:")
+    with pytest.raises(AttributeError):
+        saved.ccu_config().mode = "sched"
+
+
+@pytest.mark.parametrize("mode", ["", "MS", "CCU_SCHED", "auto"])
+def test_invalid_ccu_mode_is_rejected_before_allocation(mode):
+    with pytest.raises(ValueError, match="CCU mode"):
+        CcuConfig(mode=mode)
+
+
+@pytest.mark.parametrize("mode", [None, 5, 6, True, []])
+def test_ccu_mode_requires_a_string(mode):
+    with pytest.raises(TypeError, match="CCU mode"):
+        CcuConfig(mode=mode)
 
 
 @pytest.mark.parametrize(
@@ -233,16 +257,37 @@ def test_basic_window_issues_no_explicit_access(host_resource_binary):
         "host_coexist",
         "host_register",
         "host_pointer",
+        "host_peer_register",
+        "host_peer_pointer",
         "host_workspace",
         "host_context",
         "host_collision",
         "host_invalid",
         "host_unregister",
+        "host_local_unregister",
         "host_unregister_abort",
         "host_unregister_destroy",
     ],
 )
 def test_host_domain_backing_and_native_failure_ownership(host_resource_binary, scenario):
+    subprocess.run([str(host_resource_binary), scenario], check=True, timeout=20)
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "host_mte",
+        "host_mte_missing",
+        "host_mte_rank",
+        "host_mte_size",
+        "host_mte_register",
+        "host_mte_pointer",
+        "host_mte_context",
+        "host_mte_throw",
+        "host_mte_unregister",
+    ],
+)
+def test_host_mte_peer_windows_and_failure_ownership(host_resource_binary, scenario):
     subprocess.run([str(host_resource_binary), scenario], check=True, timeout=20)
 
 
@@ -441,3 +486,8 @@ def ccu_failure_binary(tmp_path_factory):
 def test_legacy_ccu_channel_rollback_retains_unconfirmed_resources(ccu_failure_binary, failure):
     binary, module, env = ccu_failure_binary
     subprocess.run([str(binary), str(module), failure], env=env, check=True, timeout=20)
+
+
+def test_domain_and_registration_communicators_use_domain_mode(ccu_failure_binary):
+    binary, module, env = ccu_failure_binary
+    subprocess.run([str(binary), str(module), "modes"], env=env, check=True, timeout=20)

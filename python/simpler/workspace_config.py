@@ -28,7 +28,15 @@ class RdmaConfig:
 
 @dataclass(frozen=True)
 class CcuConfig:
-    """CCU window credentials with the provider's default configuration."""
+    """Per-domain CCU execution mode: ``sched`` (default) or ``ms``."""
+
+    mode: str = "sched"
+
+    def __post_init__(self):
+        if not isinstance(self.mode, str):
+            raise TypeError("CCU mode must be a string: 'ms' or 'sched'")
+        if self.mode not in ("ms", "sched"):
+            raise ValueError("CCU mode must be 'ms' or 'sched'")
 
 
 @dataclass(frozen=True)

@@ -49,16 +49,22 @@ def test_manifests_and_tables_contain_only_selected_cases():
 
 def test_performance_table_matches_selected_variants():
     actual = []
+    tmr = []
     for line in (SUITE / "RESULTS.md").read_text().splitlines():
         cells = [cell.strip() for cell in line.split("|")[1:-1]]
-        if len(cells) == 6 and re.fullmatch(r"[0-9]+\.[0-9]{6}", cells[2]):
+        if len(cells) == 7 and re.fullmatch(r"[0-9]+\.[0-9]{6}", cells[2]):
             actual.append((cells[0], cells[1]))
+            if cells[4] != "—":
+                assert re.fullmatch(r"[0-9]+\.[0-9]{6}", cells[4])
+                tmr.append((cells[0], cells[1]))
     labels = [label for case, label in actual if case == "c2a_full"]
     assert len(set(labels)) == 4
     sources = ("pypto_lib", "pypto_lib_dsl", "pypto_lib_dsl_all_sync64", "pypto_lib_latest")
     expected = {(case, label) for label, flavor in zip(labels, sources, strict=True) for case in VARIANTS[flavor]}
     assert set(actual) == expected
     assert len(actual) == 12
+    assert len(tmr) == 11
+    assert set(tmr) == expected - {("moe", labels[-1])}
 
 
 @pytest.mark.parametrize("flavor", SELECTED)
@@ -109,3 +115,12 @@ def test_run_list_excludes_removed_cached_bundles():
     expected = {f"{variant}/{case}" for variant, cases in VARIANTS.items() for case in cases}
     assert set(listed) == expected
     assert len(listed) == 12
+
+
+def test_tmr_run_list_excludes_only_native_moe():
+    listed = subprocess.check_output(
+        [sys.executable, str(SUITE / "production/list_cases.py"), "--runtime=tensormap_and_ringbuffer"], text=True
+    ).splitlines()
+    expected = {f"{variant}/{case}" for variant, cases in VARIANTS.items() for case in cases}
+    assert set(listed) == expected - {"pypto_lib_latest/moe"}
+    assert len(listed) == 11

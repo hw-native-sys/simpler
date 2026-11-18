@@ -232,32 +232,36 @@ static inline __aicore__ bool scheduler_cluster_mix_claim_head(
         scheduler_cluster_load_field(&signal->task_ref) == task_ref)
         return true;
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
+    if (local->issue_task_ref == task_ref && local->issue_ticket_exhausted) return true;
     SchedulerFaninView fanin{};
-    if (scheduler_node_fanin_view(graph, task_ref, &fanin) != SchedulerGraphResult::OK)
+    if (scheduler_profiled_node_fanin_view(graph, task_ref, &fanin) != SchedulerGraphResult::OK)
         return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
     const uint32_t blocks = metadata.logical_block_num;
     auto *control = scheduler_task_control_at(base, local, task_ref);
-    if (scheduler_gm_query(control->next_block) >= blocks &&
-        scheduler_gm_fetch_add(control->next_block, UINT64_C(0)) >= blocks)
+    if (scheduler_gm_query(control->next_block) >= blocks) {
+        if (local->issue_task_ref == task_ref) local->issue_ticket_exhausted = true;
         return true;
-    const uint64_t block = scheduler_gm_fetch_add(control->next_block, UINT64_C(1));
+    }
+    uint32_t block = blocks;
+    bool closes_supply = false;
+    if (!scheduler_claim_ordinary_block(graph, base, local, run, task_ref, blocks, &block, &closes_supply))
+        return false;
     scheduler_invalidate_issue_snapshot(snapshot);
     if (block >= blocks) {
-        if (scheduler_gm_fetch_add(control->next_block, UINT64_MAX) <= blocks)
-            return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::BLOCK_CURSOR_INVALID);
+        if (local->issue_task_ref == task_ref) local->issue_ticket_exhausted = true;
         return true;
     }
     pending.task_ref = task_ref;
     pending.block_idx = static_cast<uint32_t>(block);
-    if (scheduler_reserve_group_execution(
+    if (!scheduler_reserve_group_execution(
             base, local->config.prepared, local->worker_id(), task_ref, pending.block_idx, &pending.anchor
-        ) != PreparedAccessResult::READY)
+        ))
         return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
     pending.fanin = fanin;
     pending.next_fanin = 0;
     if (!scheduler_cluster_mix_publish_preparation(local, active))
         return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
-    if (!scheduler_close_ordinary_supply(graph, base, local, run, task_ref, pending.block_idx, blocks)) return false;
+    if (!scheduler_close_ordinary_supply(graph, base, local, run, task_ref, closes_supply, blocks)) return false;
     *progress = true;
     return true;
 }
@@ -355,8 +359,7 @@ static inline __aicore__ bool scheduler_cluster_mix_try_arm(
         return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
     uint64_t tail = 0;
     if (local->admission != nullptr) {
-        // commit_tail is a bypass-published signal, matching ordinary entry;
-        // atomic-only words, unlike this signal, require RMW confirmation.
+        // commit_tail is a bypass-published signal, matching ordinary entry.
         tail = scheduler_gm_query(
             scheduler_state_at<SchedulerAdmissionControl>(base, local->admission->control_offset)->commit_tail
         );
@@ -410,6 +413,7 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_cluster_mix_pr
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     bool *progress
 ) {
+    SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarClusterMixPendingActive);
     auto &pending = local->cluster_pending;
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
     if (!scheduler_group_handle_valid(
@@ -419,7 +423,7 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_cluster_mix_pr
     const uint32_t previous_fanin = pending.next_fanin;
     bool ready = false;
     if (!scheduler_observe_fanin_prefix(
-            graph, base, local, run, pending.task_ref, pending.fanin, pending.next_fanin, &ready
+            graph, base, local, run, pending.task_ref, pending.fanin, pending.next_fanin, &ready, &pending.wait
         ))
         return false;
     *progress = pending.next_fanin != previous_fanin;
@@ -512,10 +516,7 @@ static inline __aicore__ bool scheduler_cluster_mix_observe(
     if (scheduler_cluster_load_acquire(&signal->armed_generation) != generation) return true;
     if (scheduler_cluster_load_field(&signal->run_epoch) != local->config.prepared->run_epoch ||
         !scheduler_task_ref_valid(graph, task_ref) || active_bits > 7 ||
-        anchor_state != scheduler_prepared_state(
-                            SchedulerPreparedPhase::GROUP_ARMED, local->config.worker_ids[0],
-                            scheduler_prepared_generation(anchor_state)
-                        ))
+        anchor_state != scheduler_prepared_state(SchedulerPreparedPhase::GROUP_ARMED, local->config.worker_ids[0]))
         return scheduler_admission_fail(graph, local, run, task_ref, SchedulerErrorSite::GROUP_INVALID_DESCRIPTOR);
     const auto &metadata = *scheduler_task_metadata_at(base, local, task_ref);
     const LaneMask active = scheduler_task_lanes(metadata);
@@ -544,6 +545,7 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_cluster_mix_se
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint64_t profiling_level, bool *progress
 ) {
+    SchedulerScalarScope scalar_detail(local, SchedPhaseKind::ScalarClusterMixServiceActive);
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
     bool advanced = false;
     if (!scheduler_cluster_mix_retire(graph, base, local, run, &advanced)) return false;
@@ -597,18 +599,16 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_cluster_mix_se
     SchedulerReadyClaim ready{};
     ready.task_ref = group.task_ref;
     ready.source = SchedulerReadySource::COOPERATIVE;
-    const SchedulerFreeSlotClaim claim{group.slot_index};
     if (slot.prepared.claimed_state == 0) {
         group.prepare_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
-        if (scheduler_acquire_group_lane(
+        if (!scheduler_acquire_group_lane(
                 base, local->config.prepared, local->worker_id(), local->config.worker_ids[0], group.task_ref,
                 group.block_idx, group.subtask_slot, group.anchor_state, &slot.prepared
-            ) != PreparedAccessResult::READY)
+            ))
             return scheduler_admission_fail(graph, local, run, group.task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
-        const auto result = scheduler_prepare_dispatch_slot(
-            graph, base, local, run, claim, ready, metadata, profiling_level, group.subtask_slot, nullptr
-        );
-        if (result != PreparedAccessResult::READY)
+        if (!scheduler_prepare_dispatch_slot<false>(
+                graph, base, local, run, group.slot_index, ready, metadata, profiling_level, group.subtask_slot, nullptr
+            ))
             return scheduler_admission_fail(
                 graph, local, run, group.task_ref, SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED
             );
@@ -620,7 +620,7 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_cluster_mix_se
         return true;
     scheduler_protocol_cluster_all(base, local, false);
     scheduler_publish_dispatch_slot(
-        base, local, claim, ready, metadata, profiling_level, group.subtask_slot, group.prepare_start_cycles
+        base, local, group.slot_index, ready, metadata, profiling_level, group.subtask_slot, group.prepare_start_cycles
     );
     group.phase = SchedulerGmMixPhase::RUNNING;
     *progress = true;

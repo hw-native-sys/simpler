@@ -35,6 +35,7 @@
 #include <unordered_map>
 
 #include "host/run_progress_slots.h"
+#include "host/scheduler_notification_cache.h"
 
 #include "callable.h"
 #include "prepare_callable_common.h"
@@ -86,6 +87,9 @@ public:
     bool supports_args_dump_capture() const override { return SIMPLER_DFX != 0; }
 
     DeviceRunner() = default;
+    int acquire_scheduler_notifications(
+        uint32_t slot, SchedulerNotificationPurpose purpose, size_t count, SchedulerDoneNotifications *out
+    ) override;
     ~DeviceRunner();
     std::thread create_thread(std::function<void()> fn) override;
 
@@ -195,6 +199,9 @@ public:
     int destroy_comm_stream(void *stream);
 
 private:
+    static std::shared_ptr<SchedulerNotificationStorage>
+    make_scheduler_notification_storage(void *context, SchedulerNotificationPurpose purpose);
+    SchedulerNotificationCache scheduler_notifications_;
     int bind_current_thread(int device_id) override;
     int prepare_kernel_arch_context(rtStream_t control_stream) override;
     int release_arch_context_resources(bool abandon_device_resources) override;

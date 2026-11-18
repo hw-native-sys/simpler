@@ -16,6 +16,7 @@ namespace {
 // The slot belongs to this physical core (or one CPU test thread). Binding is
 // confined to the percounter lane lifetime and never survives its return.
 static constexpr bool profile_compiled = ProfileCompilation<>::enabled;
+static constexpr bool task_profile_compiled = profile_compiled || TaskProfileCompilation<>::enabled;
 #if defined(__CCE_AICORE__)
 [[block_local]] static PercounterScalarTrace *percounter_scalar_active = nullptr;
 // Primitive wrappers own the slot address calculation and load its current

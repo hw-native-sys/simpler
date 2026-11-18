@@ -55,7 +55,13 @@
         2,
         2
       ],
-      "original_sha256": "43861b58ecf6c6beaf1730d8a082d5326ee5af92cdb506e468befff76d35785e"
+      "original_sha256": "43861b58ecf6c6beaf1730d8a082d5326ee5af92cdb506e468befff76d35785e",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 1,
@@ -70,7 +76,13 @@
         2,
         1
       ],
-      "original_sha256": "0b5890e4897d04c41c0f253aaddf692226b93931c18a24f3407969ab20583738"
+      "original_sha256": "0b5890e4897d04c41c0f253aaddf692226b93931c18a24f3407969ab20583738",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 2,
@@ -86,7 +98,13 @@
         1,
         2
       ],
-      "original_sha256": "37828a7401eb92c8665f47b193185271305b5b1c084298307b27b14daaecf568"
+      "original_sha256": "37828a7401eb92c8665f47b193185271305b5b1c084298307b27b14daaecf568",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 3,
@@ -106,7 +124,13 @@
         2,
         2
       ],
-      "original_sha256": "0a7c5186b87e5c9cf03b789b419a624705741cde8a67c5e4cd317516ce5f02f7"
+      "original_sha256": "0a7c5186b87e5c9cf03b789b419a624705741cde8a67c5e4cd317516ce5f02f7",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 4,
@@ -122,7 +146,13 @@
         2,
         2
       ],
-      "original_sha256": "6ae154d1d333e38960cd27d25c38f142a06999645dadb73f1e3b5c05077f509a"
+      "original_sha256": "6ae154d1d333e38960cd27d25c38f142a06999645dadb73f1e3b5c05077f509a",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 5,
@@ -137,7 +167,13 @@
         2,
         1
       ],
-      "original_sha256": "718538ae881d9ccca5bbaa59f9a65793b150bc6273b48555cb598bee45e060b8"
+      "original_sha256": "718538ae881d9ccca5bbaa59f9a65793b150bc6273b48555cb598bee45e060b8",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 6,
@@ -152,7 +188,13 @@
         2,
         1
       ],
-      "original_sha256": "54a48e34ed30d5318dce20f032ee5763cbdac93b6f21179c80dd5c6422c6fb0c"
+      "original_sha256": "54a48e34ed30d5318dce20f032ee5763cbdac93b6f21179c80dd5c6422c6fb0c",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 7,
@@ -168,7 +210,13 @@
         2,
         2
       ],
-      "original_sha256": "2152658c289bff2220a5aa2d63c39bbef0e230f8a23219c81558611b598cf256"
+      "original_sha256": "2152658c289bff2220a5aa2d63c39bbef0e230f8a23219c81558611b598cf256",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 8,
@@ -186,7 +234,13 @@
         2,
         3
       ],
-      "original_sha256": "31d303a5def2712c80f73908e1144fb448f1cad860ef8855c5be030732018bbf"
+      "original_sha256": "31d303a5def2712c80f73908e1144fb448f1cad860ef8855c5be030732018bbf",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 9,
@@ -204,7 +258,13 @@
         2,
         3
       ],
-      "original_sha256": "31d303a5def2712c80f73908e1144fb448f1cad860ef8855c5be030732018bbf"
+      "original_sha256": "31d303a5def2712c80f73908e1144fb448f1cad860ef8855c5be030732018bbf",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 10,
@@ -221,7 +281,13 @@
         3,
         3
       ],
-      "original_sha256": "d84878226c10f99adc8bfbb7d6c13a90a2ca30b1cacb2a175e67191c92deb1b2"
+      "original_sha256": "d84878226c10f99adc8bfbb7d6c13a90a2ca30b1cacb2a175e67191c92deb1b2",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 11,
@@ -241,7 +307,13 @@
         1,
         2
       ],
-      "original_sha256": "5005ffe4b80bf22fda86f2e66d128cd2b823e2af5a7d4ddef5bc1d049f7f6509"
+      "original_sha256": "5005ffe4b80bf22fda86f2e66d128cd2b823e2af5a7d4ddef5bc1d049f7f6509",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 12,
@@ -257,7 +329,13 @@
         2,
         2
       ],
-      "original_sha256": "7e31b127c5e385b0faac941e03d4f19983237aab3bfa6144d78d99033b9df68d"
+      "original_sha256": "7e31b127c5e385b0faac941e03d4f19983237aab3bfa6144d78d99033b9df68d",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 13,
@@ -275,7 +353,13 @@
         1,
         3
       ],
-      "original_sha256": "4f8e1ed14ad178c519bd460fbf8f3c42852f985e39e99269d2324645489a9203"
+      "original_sha256": "4f8e1ed14ad178c519bd460fbf8f3c42852f985e39e99269d2324645489a9203",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 14,
@@ -296,7 +380,13 @@
         2,
         2
       ],
-      "original_sha256": "94b08605c01943a66dcf3fb7153f208179fb971e30ece455c8cc4bfdd0cf366d"
+      "original_sha256": "94b08605c01943a66dcf3fb7153f208179fb971e30ece455c8cc4bfdd0cf366d",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 15,
@@ -310,7 +400,13 @@
       "signature": [
         2
       ],
-      "original_sha256": "61357b7092f607b7c15c55fba5f502419db943ca058d3883215f83c8f2064546"
+      "original_sha256": "61357b7092f607b7c15c55fba5f502419db943ca058d3883215f83c8f2064546",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 16,
@@ -324,7 +420,13 @@
       "signature": [
         3
       ],
-      "original_sha256": "d212af4fa5d49c889dee32c22b8ab4ba14d1a6044ed802bcdf12986953e031fc"
+      "original_sha256": "d212af4fa5d49c889dee32c22b8ab4ba14d1a6044ed802bcdf12986953e031fc",
+      "async_capability": {
+        "version": 1,
+        "mode": "DEFERRED",
+        "max_conditions": 2,
+        "condition_types": 1
+      }
     },
     {
       "func_id": 17,
@@ -349,7 +451,13 @@
         2,
         2
       ],
-      "original_sha256": "5f7923ba97abd88c37b30e4642e7ec722c6ee79190af67195e05bb8443d2c5f9"
+      "original_sha256": "5f7923ba97abd88c37b30e4642e7ec722c6ee79190af67195e05bb8443d2c5f9",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 18,
@@ -372,7 +480,13 @@
         1,
         2
       ],
-      "original_sha256": "9643c47e88f8749ab185dd8373efa7657fbde891fb22b6c2c6410909b3800213"
+      "original_sha256": "9643c47e88f8749ab185dd8373efa7657fbde891fb22b6c2c6410909b3800213",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 19,
@@ -395,7 +509,13 @@
         1,
         2
       ],
-      "original_sha256": "9643c47e88f8749ab185dd8373efa7657fbde891fb22b6c2c6410909b3800213"
+      "original_sha256": "9643c47e88f8749ab185dd8373efa7657fbde891fb22b6c2c6410909b3800213",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 20,
@@ -413,7 +533,13 @@
         2,
         2
       ],
-      "original_sha256": "01959e6e30a5d37e68d7492fffc36bf5e58282530140758fc59c60af50d8fb5a"
+      "original_sha256": "01959e6e30a5d37e68d7492fffc36bf5e58282530140758fc59c60af50d8fb5a",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 21,
@@ -432,7 +558,13 @@
         1,
         2
       ],
-      "original_sha256": "4a8bc037f68c82c0f049626525094dfe2e2c439272d0d932b8d559dcffd2ef1c"
+      "original_sha256": "4a8bc037f68c82c0f049626525094dfe2e2c439272d0d932b8d559dcffd2ef1c",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 22,
@@ -451,7 +583,13 @@
         1,
         2
       ],
-      "original_sha256": "4a8bc037f68c82c0f049626525094dfe2e2c439272d0d932b8d559dcffd2ef1c"
+      "original_sha256": "4a8bc037f68c82c0f049626525094dfe2e2c439272d0d932b8d559dcffd2ef1c",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 23,
@@ -469,7 +607,13 @@
         1,
         2
       ],
-      "original_sha256": "f3912aed55b9b8b016b8d7063bd6a0f3a77a98fe7e4c01ed981f4c87e3f69660"
+      "original_sha256": "f3912aed55b9b8b016b8d7063bd6a0f3a77a98fe7e4c01ed981f4c87e3f69660",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 24,
@@ -485,7 +629,13 @@
         1,
         1
       ],
-      "original_sha256": "059fca31a19b8f3756e7be16a186e6ea25e1c83431b150758f113ede74c87262"
+      "original_sha256": "059fca31a19b8f3756e7be16a186e6ea25e1c83431b150758f113ede74c87262",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 25,
@@ -503,7 +653,13 @@
         1,
         3
       ],
-      "original_sha256": "7a411307ec9c7e0b40eabb0cb254c83f96a2f34586a2e60c8a1be75f4cc811ce"
+      "original_sha256": "7a411307ec9c7e0b40eabb0cb254c83f96a2f34586a2e60c8a1be75f4cc811ce",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     },
     {
       "func_id": 26,
@@ -519,7 +675,13 @@
         3,
         3
       ],
-      "original_sha256": "c5d8f7709597c7252dcb5c76e00fe7c417d0d45cc8c4a1ce0eac8988ebabcc91"
+      "original_sha256": "c5d8f7709597c7252dcb5c76e00fe7c417d0d45cc8c4a1ce0eac8988ebabcc91",
+      "async_capability": {
+        "version": 1,
+        "mode": "SYNCHRONOUS",
+        "max_conditions": 0,
+        "condition_types": 0
+      }
     }
   ]
 }

@@ -70,6 +70,7 @@ struct KernelWorkWindowCapture {
 // The original idle timestamps survive the kernel in the existing worker state.
 __aicore__ __attribute__((noinline)) void
 publish_deferred_idle_activity(__gm__ void *base, SchedulerLocalState *local, SchedulerWorkerStats *stats) {
+    SchedulerScalarScope scalar_idle(local, SchedPhaseKind::ScalarPublishIdle);
     if (stats->deferred_idle_end == 0) return;
     scheduler_append_idle_activity(base, local, stats->deferred_idle_start, stats->deferred_idle_end);
     stats->deferred_idle_end = 0;
@@ -147,8 +148,12 @@ struct ArgsDumpOutputPublisher {
         pipe_barrier(PIPE_ALL);
 #endif
         SchedulerTaskPayloadArguments arguments{};
-        if (scheduler_parse_task_payload_arguments(*graph, task_ref, &arguments) != SchedulerGraphResult::OK ||
-            arguments.tensor_count != task->tensor_count ||
+        SchedulerGraphResult argument_status;
+        {
+            SchedulerScalarScope scalar_arguments(SchedPhaseKind::ScalarGraphPayloadArguments, task_ref);
+            argument_status = scheduler_parse_task_payload_arguments(*graph, task_ref, &arguments);
+        }
+        if (argument_status != SchedulerGraphResult::OK || arguments.tensor_count != task->tensor_count ||
             (arguments.tensor_count != 0 && reinterpret_cast<uint64_t>(arguments.tensors) != task->tensors_address))
             return false;
         for (int32_t arg = 0; arg < arguments.tensor_count; ++arg) {
@@ -274,11 +279,13 @@ publish_worker_stats(__gm__ SchedulerWorkerContext *context, const SchedulerWork
 // Inlining this path makes the resident loop spill enough state to fault on A5.
 __aicore__ __attribute__((noinline)) void
 stage_task_trace_before_execution(SchedulerExecutorTaskTrace *trace, uint64_t ready_observe) {
+    SchedulerScalarScope scalar_trace(SchedPhaseKind::ScalarTraceBeforeExecution);
     trace->ready_observe_cycles = ready_observe;
 }
 
 __aicore__ __attribute__((noinline)) void
 stage_task_trace_before_completion(SchedulerExecutorTaskTrace *trace, uint64_t kernel_start, uint64_t kernel_end) {
+    SchedulerScalarScope scalar_trace(SchedPhaseKind::ScalarTraceBeforeCompletion);
     trace->kernel_start_cycles = kernel_start;
     trace->kernel_end_cycles = kernel_end;
 }
@@ -494,15 +501,12 @@ __aicore__ bool run_ready_dispatch_loop(
         bool advanced = false;
         if (!scheduler_service_controls(graph, scheduler_state_base, context, run_control, profiling_level, &advanced))
             return false;
+        scalar_control.close();
         progress = progress || advanced;
-        if (context->pending_completed != 0) {
-            const uint64_t now = scheduler_cycles();
-            if (context->pending_completed >= 32 ||
-                now - context->last_completion_flush_cycles >= PLATFORM_PROF_SYS_CNT_FREQ / 1000) {
-                scheduler_flush_completions(run_control, context);
-                context->last_completion_flush_cycles = now;
-            }
-        }
+        bool counter_advanced = false;
+        if (!scheduler_service_counter_accounting(graph, scheduler_state_base, context, run_control, &counter_advanced))
+            return false;
+        progress = progress || counter_advanced;
         return true;
     };
     enum class Boundary { Proceed, Exit, Error };
@@ -659,12 +663,13 @@ __aicore__ bool run_ready_dispatch_loop(
                 );
             // Async-protected business inputs require observation on the actual
             // consumer after dependencies settle, independently of the call package.
-            if (function_address != 0 && scheduler_async_work_activated(context->async)) {
+            if (function_address != 0 && local_slot->may_observe_async_inputs && context->async != nullptr &&
+                scheduler_async_work_activated(context->async)) {
                 SchedulerScalarScope scalar_cache(context, SchedPhaseKind::ScalarCacheObserve, task_ref);
                 scheduler_observe_data_cache(binding);
             }
             uint32_t execution_group_index = pto2::resident::ASYNC_INVALID_INDEX;
-            {
+            if (binding->global_context.async_group_index != pto2::resident::ASYNC_INVALID_INDEX) {
                 pto2::resident::AsyncWriter writer{};
                 if (!scheduler_async_begin_prebound_execution(
                         context->async, task_ref, binding->global_context, writer
@@ -727,10 +732,11 @@ __aicore__ bool run_ready_dispatch_loop(
             // private slot/admission address escapes, and this core cannot run
             // its scheduler while inside the kernel. Dispatch's validated task
             // and group binding therefore remain owned through normal return.
+            bool has_deferred = false;
             if (execution_group_index != pto2::resident::ASYNC_INVALID_INDEX) {
                 const auto writer = scheduler_async_writer_for_group(*context->async, execution_group_index);
                 if (!scheduler_async_seal_execution<true>(
-                        context->async, task_ref, local_slot->block_idx, local_slot->subtask_slot, writer
+                        context->async, task_ref, local_slot->block_idx, local_slot->subtask_slot, writer, &has_deferred
                     )) {
                     scheduler_record_error(
                         run_control, task_ref, scheduler_async_error_result(context->async), &graph, context,
@@ -755,6 +761,29 @@ __aicore__ bool run_ready_dispatch_loop(
                 );
                 return false;
             }
+            const bool possible_async = execution_group_index != pto2::resident::ASYNC_INVALID_INDEX;
+            local_slot->completion_credits = 1 + static_cast<uint8_t>(possible_async && !has_deferred);
+            if (possible_async && !has_deferred && (local_slot->cluster_mix || local_slot->gm_mix)) {
+                const auto *counter = scheduler_completion_counter_at(
+                    scheduler_state_base, context->config.completion_counters_offset, task_ref
+                );
+                if (counter != nullptr &&
+                    !scheduler_counter_publish_condition(
+                        scheduler_state_base, *counter, task_ref, local_slot->block_idx, local_slot->subtask_slot,
+                        context->config.task_metadata_offset,
+                        context->profiling == nullptr ? 0 : context->profiling->protocol_layout_offset,
+                        static_cast<uint32_t>(context->worker_id()), false
+                    )) {
+                    scheduler_record_error(
+                        run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                        SchedulerErrorSite::ASYNC_SEAL_FAILED, local_slot
+                    );
+                    (void)scheduler_complete_own_slot<record_protocol, true, false>(
+                        graph, scheduler_state_base, context, run_control, slot_index, profiling_level
+                    );
+                    return false;
+                }
+            }
             scalar_seal.close();
             if (context->async != nullptr) ++context->async->business_returns;
             SchedulerScalarScope scalar_completions(context, SchedPhaseKind::ScalarCompletions, task_ref);
@@ -766,6 +795,7 @@ __aicore__ bool run_ready_dispatch_loop(
                     scheduler_complete_own_slot<false, true>(
                         graph, scheduler_state_base, context, run_control, slot_index, profiling_level
                     );
+            scalar_completions.close();
             if (!completion_ok) return false;
             if (phase_timing_enabled) publish_deferred_idle_activity(scheduler_state_base, context, stats);
             boundary = check_boundary();
@@ -778,10 +808,6 @@ __aicore__ bool run_ready_dispatch_loop(
             scalar_iteration.progress = true;
             boundary = check_boundary();
             continue;
-        }
-        {
-            SchedulerScalarScope scalar_flush(context, SchedPhaseKind::ScalarFlushCompletions);
-            scheduler_flush_completions(run_control, context);
         }
         if (phase_timing_enabled) {
             if (!idle_active) {
@@ -872,8 +898,13 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
             graph.task_count, scheduler_local_state.config.task_controls_offset, async
         );
         if (config_valid && async.layout != nullptr) {
+            async.completion_counters_offset = context->completion_counters_offset;
+            async.task_metadata_offset = context->task_metadata_offset;
+            async.protocol_layout_offset = scheduler_local_state.profiling == nullptr ?
+                                               0 :
+                                               scheduler_local_state.profiling->protocol_layout_offset;
+            async.worker_index = static_cast<uint32_t>(context->worker_index);
             async.check_cursor = static_cast<uint32_t>(context->worker_index % async.layout->group_count);
-            async.finish_cursor = static_cast<uint32_t>(context->worker_index % async.layout->async_task_count);
             scheduler_local_state.async = &async;
         }
         if (config_valid && summary->mix_task_count != 0)
@@ -935,7 +966,6 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
 
     SchedulerScalarScope scalar_exit(&scheduler_local_state, SchedPhaseKind::ScalarExitDrain);
     if (phase_timing_enabled) publish_deferred_idle_activity(scheduler_state_base, &scheduler_local_state, &stats);
-    scheduler_flush_completions(run_control, &scheduler_local_state);
 
     const uint64_t exit_wait_start = get_sys_cnt_aicore();
     while (stats.exit_observed_cycles == 0 &&

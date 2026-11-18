@@ -21,12 +21,11 @@ inline constexpr uint64_t SCHEDULER_PREPARED_ALIGNMENT = 128;
 
 enum class SchedulerPreparedPhase : uint8_t { INVALID, BUILT, CLAIMED, RETURNED, FAILED, GROUP_RESERVED, GROUP_ARMED };
 
-inline constexpr uint64_t SCHEDULER_PREPARED_BINDING_READY = UINT64_C(1) << 24;
+inline constexpr uint64_t SCHEDULER_PREPARED_TICKET_OWNED = UINT64_C(1) << 25;
 
 inline __aicore__ constexpr uint64_t
-scheduler_prepared_state(SchedulerPreparedPhase phase, uint32_t executor = UINT32_MAX, uint32_t generation = 0) {
-    return static_cast<uint64_t>(phase) | (executor == UINT32_MAX ? 0 : ((static_cast<uint64_t>(executor) + 1) << 8)) |
-           (static_cast<uint64_t>(generation) << 32);
+scheduler_prepared_state(SchedulerPreparedPhase phase, uint32_t executor = UINT32_MAX) {
+    return static_cast<uint64_t>(phase) | (executor == UINT32_MAX ? 0 : ((static_cast<uint64_t>(executor) + 1) << 8));
 }
 
 inline __aicore__ constexpr SchedulerPreparedPhase scheduler_prepared_phase(uint64_t state) {
@@ -35,10 +34,6 @@ inline __aicore__ constexpr SchedulerPreparedPhase scheduler_prepared_phase(uint
 
 inline __aicore__ constexpr uint32_t scheduler_prepared_owner(uint64_t state) {
     return static_cast<uint32_t>((state >> 8) & UINT64_C(65535)) - 1;
-}
-
-inline __aicore__ constexpr uint32_t scheduler_prepared_generation(uint64_t state) {
-    return static_cast<uint32_t>(state >> 32);
 }
 
 inline __aicore__ constexpr uint32_t scheduler_prepared_execute_owner(uint64_t state) {
@@ -57,8 +52,10 @@ struct SchedulerExecutionPlan {
     uint8_t active_lane_count;
 };
 
-// Phase, fixed owner and identity generation share one atomic word.
-// Cached stores never touch this line during a run.
+// Cooperative records use atomic ownership transitions. An irrevocable ordinary
+// ticket instead makes this whole region an owner-written diagnostic: no peer
+// reads it for entry or updates it, and Host observes it after run retirement.
+// The two access contracts never share an execution record within a run.
 struct alignas(128) SchedulerPreparedControl {
     volatile uint64_t state;
 };

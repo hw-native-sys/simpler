@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Retained A5 Host-source communication windows with local MTE and peer URMA reads."""
+"""Retained A5 Host-source communication windows with peer URMA reads."""
 
 import argparse
 import sys
@@ -37,14 +37,14 @@ def build_callable():
             "source": str(ROOT / "kernels/orchestration/gather.cpp"),
             "function_name": "host_comm_domain",
             "config_name": "host_comm_domain_config",
-            "signature": [D.IN, D.OUT, D.OUT, D.OUT, D.IN, D.IN],
+            "signature": [D.IN, D.OUT, D.OUT, D.IN, D.IN, D.IN],
         },
         "incores": [
             {
                 "func_id": 0,
                 "source": str(ROOT / "kernels/aiv/gather.cpp"),
                 "core_type": "aiv",
-                "signature": [D.IN, D.OUT, D.OUT, D.IN],
+                "signature": [D.IN, D.OUT, D.IN, D.IN],
             },
             {
                 "func_id": 1,
@@ -67,7 +67,7 @@ def _specs(*, outputs=False, depth=1):
         CommBufferSpec("reserved", "uint8", PREFIX_BYTES, PREFIX_BYTES),
         CommBufferSpec("table", "float32", ROWS * WIDTH, TABLE_BYTES),
     ]
-    names = ("host_peer", "host_result", "device_local", "device_peer", "device_result") if outputs else ("local_echo",)
+    names = ("host_peer", "host_result", "device_peer", "device_result") if outputs else ()
     specs.extend(CommBufferSpec(name, "float32", depth * len(INDICES) * WIDTH, depth * OUTPUT_BYTES) for name in names)
     return specs
 
@@ -92,13 +92,6 @@ def _write_host(domain, generation):
     for rank in range(2):
         with domain.member(rank).buffers["table"].shm.buf[offset : offset + nbytes] as memory:
             memory[:] = _table(rank, generation).tobytes()
-
-
-def _clear_host_output(domain):
-    offset, nbytes = domain.buffer_range("local_echo")
-    for rank in range(2):
-        with domain.member(rank).buffers["local_echo"].shm.buf[offset : offset + nbytes] as memory:
-            memory[:] = bytes(nbytes)
 
 
 def _read_device(worker, buffer, scratch, *, slot=0):
@@ -133,7 +126,6 @@ def run(devices=(0, 1), *, staged=False, aiv_blocks=1):
 
         def initialize_host(domain):
             _write_host(domain, 1)
-            _clear_host_output(domain)
             initialized.append(domain.domain_id)
 
         def submit(orch, _args, config, *, sources=("host", "device"), slot=0):
@@ -159,17 +151,14 @@ def run(devices=(0, 1), *, staged=False, aiv_blocks=1):
                 for rank in range(2):
                     args = TaskArgs()
                     args.add_tensor(domain.member(rank).buffers["table"].tensor((ROWS, WIDTH), DataType.FLOAT32))
-                    for name in ("local", "peer", "result"):
-                        output = (
-                            domain.member(rank).buffers["local_echo"]
-                            if source == "host" and name == "local"
-                            else target.member(rank).buffers[f"{source}_{name}"]
-                        )
+                    for name in ("peer", "result"):
+                        output = target.member(rank).buffers[f"{source}_{name}"]
                         args.add_tensor(
                             output.tensor((len(INDICES), WIDTH), DataType.FLOAT32, byte_offset=slot * OUTPUT_BYTES),
                             TensorArgType.OUTPUT_EXISTING,
                         )
                     args.add_scalar(domain.device_context(rank, workspace_engines=("urma",)))
+                    args.add_scalar(domain.buffer_range("table")[0])
                     args.add_scalar(aiv_blocks)
                     orch.submit_next_level(entry, args, config, worker=rank)
 
@@ -178,22 +167,11 @@ def run(devices=(0, 1), *, staged=False, aiv_blocks=1):
                 is_device = source == "device"
                 source_generation = 1 if is_device else generation
                 for rank in range(2):
-                    local = _table(rank, source_generation, device=is_device)[list(INDICES)]
                     peer = _table(1 - rank, source_generation, device=is_device)[list(INDICES)]
-                    for name, expected in (("local", local), ("peer", peer), ("result", peer + 1.0)):
-                        if source == "host" and name == "local":
-                            offset, _ = host.buffer_range("local_echo")
-                            offset += slot * OUTPUT_BYTES
-                            with (
-                                host.member(rank)
-                                .buffers["local_echo"]
-                                .shm.buf[offset : offset + OUTPUT_BYTES] as memory
-                            ):
-                                actual = np.frombuffer(memory, dtype=np.float32).reshape(len(INDICES), WIDTH).copy()
-                        else:
-                            actual = _read_device(
-                                worker, device.member(rank).buffers[f"{source}_{name}"], scratch, slot=slot
-                            )
+                    for name, expected in (("peer", peer), ("result", peer + 1.0)):
+                        actual = _read_device(
+                            worker, device.member(rank).buffers[f"{source}_{name}"], scratch, slot=slot
+                        )
                         np.testing.assert_array_equal(actual, expected)
             print(f"PASS generation={generation} sources={sources} staged={staged} aiv_blocks={aiv_blocks}", flush=True)
 
@@ -202,8 +180,6 @@ def run(devices=(0, 1), *, staged=False, aiv_blocks=1):
         for generation in (1, 1, 2):
             if generation == 2:
                 _write_host(domains["host"], generation)
-            if "host" in domains:
-                _clear_host_output(domains["host"])
             pending = worker.submit(submit)
             following = worker.submit(partial(submit, slot=1)) if staged else None
             pending.wait()
@@ -238,7 +214,7 @@ def run(devices=(0, 1), *, staged=False, aiv_blocks=1):
         assert not device.released
         device.release()
         assert device.freed and worker.live_domains == {}
-        print("PASS Host-domain retention, CPU updates, local MTE, peer URMA and Device-domain coexistence", flush=True)
+        print("PASS Host-domain retention, CPU updates, peer URMA and Device-domain coexistence", flush=True)
     finally:
         original = sys.exc_info()[1]
         try:

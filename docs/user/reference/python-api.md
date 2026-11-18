@@ -109,6 +109,8 @@ requires matching torch/torch_npu/CANN and does not enable capture submission.
 | `copy_to(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | H2D; `dst` is a device `Buffer`, `src` a host `Buffer` from `create_buffer` (at L2, also any torch tensor or writable buffer). `nbytes` defaults to the rest of the host side after `src_offset`, so `copy_to(dst, src)` transfers the whole host backing |
 | `copy_from(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | D2H; `dst` is the host `Buffer` (at L2, also any writable buffer). Same defaulting, measured from `dst_offset` on the host side |
 | `create_buffer(nbytes) -> Buffer` / `Buffer.close()` | Shared host backing this Worker owns; build a view over `handle.shm.buf`, name it on the wire with `Tensor(handle, shapes=shapes, dtype=dtype)` |
+| `Buffer.host_view()` | CPU view of the local Host backing. Release the view and its derivatives before closing the backing |
+| `release_buffer(buffer)` | Release Worker-owned storage after accepted uses retire. For a mapped Host Buffer, this also releases its cached registration |
 | `Buffer.shm.buf` | CPU bytes of shared Host storage. Host-source domain buffers expose the whole rank window; select slices with `domain.buffer_range(name)`. Device-source HBM buffers have `shm=None` |
 | `remote_malloc` / `remote_free` / `remote_copy_to` / `remote_copy_from` / `remote_export` / `remote_import` / `remote_release_import` | L4 only |
 
@@ -117,6 +119,13 @@ dst_offset=32, nbytes=16)`. A handle rebuilt at `base + 32` is not an interior v
 allocation; it is a different canonical identity that names no allocation at all, and is refused.
 Both offsets are bounded together with the length against the *registered* extent, so an offset
 cannot walk a legal-looking length past the end.
+
+For direct A3/A5 L2 Workers with an owned device context, use
+`args.add_tensor(tensor, transfer=TensorTransfer.MAP)` to let the device access
+a Worker-owned Host Buffer without staging a copy. The Tensor keeps its HOST
+descriptor. Each accepted call retains its use until completion or proven
+cancellation. Borrowed contexts and graph capture do not accept Host MAP. See
+[Buffer ABI](../../buffer-abi.md) for transfer defaults and release behavior.
 
 ### Execution
 
@@ -200,7 +209,10 @@ a child lookup does not enroll the owner's run.
 ## Callables and task args
 
 ```python
-CoreCallable.build(signature=[ArgDirection...], binary=kernel_bytes)
+CoreCallable.build(
+    signature=[ArgDirection...], binary=kernel_bytes,
+    async_capability={"version": 1, "mode": "SYNCHRONOUS", "max_conditions": 0, "condition_types": 0},
+)
 
 ChipCallable.build(
     signature=[ArgDirection...],
@@ -209,6 +221,18 @@ ChipCallable.build(
     children=[(func_id, core_callable), ...],
 )
 ```
+
+Core callables accept a version-1 `async_capability` declaration.
+`SYNCHRONOUS` requires zero `max_conditions` and `condition_types`; `DEFERRED`
+requires a bound of 1–64 conditions and a nonzero condition-type mask from 1–3.
+For compatibility, an omitted declaration, `None`, or `UNKNOWN` with zero
+condition fields is normalized at registration to `DEFERRED` with
+`max_conditions=64` and `condition_types=3`. Legacy all-zero serialized metadata
+uses the same conservative default. Scene specs use this normalization for each
+`incores` entry and cache the canonical declaration. Invalid versions, fields,
+and bounds are still rejected. Explicit `SYNCHRONOUS` declarations retain the
+synchronous fast path; a run that happens to register no conditions does not
+establish that a kernel is synchronous.
 
 `ArgDirection` is `SCALAR`, `IN`, `OUT`, or `INOUT`. The signature list is
 positional and defines the task-arg order. `func_id` must match the id the

@@ -198,7 +198,6 @@ inline __aicore__ bool scheduler_task_ref_precedes(int64_t producer, int64_t con
 inline __aicore__ bool scheduler_task_ref_is_null(int64_t ref) { return ref < 0; }
 
 struct SchedulerTaskShape {
-    int64_t task_ref;
     int32_t kernel_ids[3];
     LaneMask active_mask;
 };
@@ -210,8 +209,8 @@ static_assert(offsetof(SchedulerGraphView, native_header_offset) == 32);
 static_assert(offsetof(SchedulerGraphView, scheduler_state_bytes) == 40);
 static_assert(offsetof(SchedulerGraphView, original_task_count) == 48);
 static_assert(std::is_trivially_copyable_v<SchedulerGraphView> && std::is_standard_layout_v<SchedulerGraphView>);
-static_assert(sizeof(SchedulerTaskShape) == 24, "task shape result layout changed");
-static_assert(offsetof(SchedulerTaskShape, active_mask) == 20);
+static_assert(sizeof(SchedulerTaskShape) == 16, "task shape result layout changed");
+static_assert(offsetof(SchedulerTaskShape, active_mask) == 12);
 static_assert(std::is_trivially_copyable_v<SchedulerTaskShape> && std::is_standard_layout_v<SchedulerTaskShape>);
 static_assert(sizeof(SchedulerDispatchPredicate) == 24, "dispatch predicate layout changed");
 
@@ -461,7 +460,6 @@ inline __aicore__ SchedulerGraphResult
 scheduler_classify_task_shape(const SchedulerGraphAccess &graph, int64_t task_ref, SchedulerTaskShape *shape) {
     if (shape == nullptr) return SchedulerGraphResult::UNSUPPORTED_SHAPE;
     *shape = {
-        -1,
         {SCHEDULER_GRAPH_INVALID_KERNEL_ID, SCHEDULER_GRAPH_INVALID_KERNEL_ID, SCHEDULER_GRAPH_INVALID_KERNEL_ID},
         LaneMask::none()
     };
@@ -487,7 +485,6 @@ scheduler_classify_task_shape(const SchedulerGraphAccess &graph, int64_t task_re
                 if (shape->active_mask.has(static_cast<SubtaskSlot>(slot)))
                     shape->kernel_ids[slot] = child->metadata.kernel_ids[slot];
             }
-            shape->task_ref = task_ref;
             return SchedulerGraphResult::OK;
         }
         if (node.binding->kind != SchedulerNodeKind::TOP_KERNEL) return SchedulerGraphResult::UNSUPPORTED_SHAPE;
@@ -533,7 +530,6 @@ scheduler_classify_task_shape(const SchedulerGraphAccess &graph, int64_t task_re
     );
     if (shape->active_mask.is_empty()) return SchedulerGraphResult::UNSUPPORTED_SHAPE;
 
-    shape->task_ref = task_ref;
     return SchedulerGraphResult::OK;
 }
 

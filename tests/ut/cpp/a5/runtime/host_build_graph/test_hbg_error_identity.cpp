@@ -105,9 +105,11 @@ struct ErrorFixture {
                 context.cluster_worker_ids[lane] = worker / 3 * 3 + lane;
             storage.test_graphs[worker] = graph.graph();
         }
+        scheduler_cluster_signal_clear(&signal, 61);
         for (uint32_t worker = 0; worker < 3; ++worker) {
             auto &context = storage.contexts[worker];
             locals[worker] = storage.local_context(&context);
+            locals[worker]->cluster_signal = &signal;
             EXPECT_TRUE(scheduler_initialize_admission(base(), locals[worker], &admissions[worker]));
             locals[worker]->admission = &admissions[worker];
             auto &admission = admissions[worker];
@@ -136,6 +138,7 @@ struct ErrorFixture {
     scheduler_test::BasicGraphBuffer<2> graph{2};
     std::array<SchedulerLocalState *, 3> locals{};
     std::array<SchedulerAdmissionLocalState, 3> admissions{};
+    SchedulerClusterSignal signal{};
 };
 
 TEST(HbgErrorIdentity, DedicatedStatusLineSeparatesDiagnosticIdentity) {
@@ -266,12 +269,9 @@ TEST(HbgErrorIdentity, PurePreparationFailureNamesTheExactFillingBlockAmongTwoOw
     }
     SchedulerReadyClaim ready{};
     ready.task_ref = 0;
-    EXPECT_EQ(
-        scheduler_prepare_dispatch_slot(
-            fixture.graph.graph(), fixture.base(), local, fixture.run(), {1}, ready, metadata, 0, 1
-        ),
-        PreparedAccessResult::ERROR
-    );
+    EXPECT_FALSE(scheduler_prepare_dispatch_slot(
+        fixture.graph.graph(), fixture.base(), local, fixture.run(), {1}, ready, metadata, 0, 1
+    ));
     EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED));
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, 0, 2, UINT64_MAX, 1, 1}));
 }
@@ -339,7 +339,7 @@ TEST(HbgErrorIdentity, ActualMixPreparationFailureRetainsTheClaimedBlock) {
     admission.current_resource_mask = scheduler_mix_resource_mask(admission.current_active_mask);
     admission.current_single_subtask = 1;
     admission.gm_mix.phase = SchedulerGmMixPhase::ARRIVED;
-    auto *mailbox = scheduler_state_at<SchedulerGroupMailbox>(fixture.base(), admission.gm_mix.mailbox_offset);
+    auto *mailbox = &fixture.signal.sync_mix;
     for (auto &lane : mailbox->lanes)
         scheduler_gm_store(lane.arrived_seq, UINT64_C(7));
     uint64_t execution_index = UINT64_MAX;
@@ -354,7 +354,7 @@ TEST(HbgErrorIdentity, ActualMixPreparationFailureRetainsTheClaimedBlock) {
     ));
     EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED));
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, 0, 2, 7, 1, 1}));
-    EXPECT_EQ(fixture.locals[1]->pending_completed, 0u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 0u);
 }
 
 TEST(HbgErrorIdentity, AicoreFirstWriterSurvivesALaterAicpuTimeoutAndAnotherWorker) {
@@ -397,25 +397,32 @@ TEST(HbgErrorIdentity, AicpuFirstWriterPublishesUnknownRatherThanStaleAicoreIden
         );
 }
 
-TEST(HbgErrorIdentity, OrdinarySingleBlockPreparationHasKnownBlockWithoutClaimingAnAdmissionOrder) {
-    ErrorFixture fixture;
-    auto *local = fixture.locals[1];
-    local->admission = nullptr;
-    local->slots[0].state = SchedulerDispatchSlotState::FILLING;
-    auto &metadata = fixture.storage.metadata[0];
-    metadata.active_mask = LaneMask::aiv0();
-    metadata.logical_block_num = 1;
-    metadata.flags = SCHEDULER_TASK_EXECUTABLE;
-    SchedulerReadyClaim ready{};
-    ready.task_ref = 0;
-    EXPECT_EQ(
-        scheduler_prepare_dispatch_slot(
-            fixture.graph.graph(), fixture.base(), local, fixture.run(), {0}, ready, metadata, 0, 1
-        ),
-        PreparedAccessResult::ERROR
-    );
-    EXPECT_EQ(read_identity(*fixture.run()), (Identity{UINT64_MAX, UINT64_MAX, 0, UINT64_MAX, 1, 1}));
-    EXPECT_EQ(read_valid_fields(*fixture.run()), 52u);
+TEST(HbgErrorIdentity, PreparationFailureKeepsKnownBlockWithoutClaimingAnAdmissionOrder) {
+    for (uint32_t corruption : {0u, 1u, 2u}) {
+        ErrorFixture fixture;
+        auto *local = fixture.locals[1];
+        local->admission = nullptr;
+        local->slots[0].state = SchedulerDispatchSlotState::FILLING;
+        auto &metadata = fixture.storage.metadata[0];
+        metadata.active_mask = LaneMask::aiv0();
+        metadata.logical_block_num = 1;
+        metadata.flags = SCHEDULER_TASK_EXECUTABLE;
+        if (corruption == 1) metadata.flags |= SCHEDULER_TASK_HAS_PREDICATE;
+        const uint8_t subtask = corruption == 2 ? UINT8_MAX : 1;
+        SchedulerReadyClaim ready{};
+        ready.task_ref = 0;
+        EXPECT_FALSE(scheduler_prepare_dispatch_slot(
+            fixture.graph.graph(), fixture.base(), local, fixture.run(), {0}, ready, metadata, 0, subtask
+        ));
+        EXPECT_EQ(read_identity(*fixture.run()), (Identity{UINT64_MAX, UINT64_MAX, 0, UINT64_MAX, 1, 1}));
+        EXPECT_EQ(read_valid_fields(*fixture.run()), 52u);
+        EXPECT_EQ(
+            fixture.run()->error_site, static_cast<uint64_t>(
+                                           corruption == 0 ? SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED :
+                                                             SchedulerErrorSite::DISPATCH_INVALID_SHAPE
+                                       )
+        );
+    }
 }
 
 TEST(HbgErrorIdentity, NonExecutingCompletionNamesTheSlotWithoutGuessingFromTheOtherSlot) {
@@ -431,7 +438,7 @@ TEST(HbgErrorIdentity, NonExecutingCompletionNamesTheSlotWithoutGuessingFromTheO
     EXPECT_FALSE(scheduler_complete_own_slot(fixture.graph.graph(), fixture.base(), local, fixture.run(), 1, 0));
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, 0, 2, UINT64_MAX, 1, 1}));
     EXPECT_EQ(read_valid_fields(*fixture.run()), 55u);
-    EXPECT_EQ(local->pending_completed, 0u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 0u);
 }
 
 TEST(HbgErrorIdentity, ExtraCompletionRetainsItsBlockAndDoesNotCountSuccess) {
@@ -452,9 +459,9 @@ TEST(HbgErrorIdentity, ExtraCompletionRetainsItsBlockAndDoesNotCountSuccess) {
         SchedulerSubtaskFinishResult::ERROR
     );
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, 0, 3, UINT64_MAX, 1, 1}));
-    EXPECT_EQ(local->pending_completed, 0u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 0u);
     EXPECT_FALSE(scheduler_completion_valid(scheduler_gm_fetch_add(controls[0].completion_state, UINT64_C(0))));
-    EXPECT_EQ(fixture.run()->resolved_task_count, 0u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 0u);
 }
 
 TEST(HbgErrorIdentity, RetiredGroupKeepsItsLastIdentityOnlyWhileItBelongsToTheCurrentTask) {

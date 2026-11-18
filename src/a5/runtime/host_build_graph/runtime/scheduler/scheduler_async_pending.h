@@ -36,6 +36,7 @@ enum class Result : uint8_t {
     COUNT_UNDERFLOW,
 };
 
+// The join owner carries its RMW result into canonical completion.
 struct Outcome {
     Result result;
     uint64_t previous;
@@ -50,7 +51,7 @@ constexpr inline __aicore__ bool valid(uint64_t word) {
     return (word >> 33) == 0 && registered(word) <= COUNT_MAX && pending(word) <= registered(word);
 }
 
-// Readiness validates an already granted FINISH lease; reading it grants no ownership.
+// A terminal join validates an RMW-issued completion proof; reading grants no ownership.
 constexpr inline __aicore__ bool ready_to_finish(uint64_t word) {
     return valid(word) && closed(word) && pending(word) == 0 && registered(word) != 0;
 }
@@ -70,12 +71,13 @@ struct GmAtomics {
 // existing block/lane join authorizes exactly one close after every release.
 // Error results can follow an invalid RMW and require failing the run.
 template <typename Atomics>
-static inline __aicore__ Outcome register_group(Atomics &atomics) {
+static inline __aicore__ Result register_group(Atomics &atomics, uint64_t *observed = nullptr) {
     const uint64_t previous = atomics.fetch_add(REGISTERED_UNIT + 1);
-    if (!valid(previous)) return {Result::INVALID_WORD, previous};
-    if (closed(previous)) return {Result::INVALID_TRANSITION, previous};
-    if (registered(previous) == COUNT_MAX) return {Result::COUNT_OVERFLOW, previous};
-    return {Result::PENDING, previous};
+    if (observed != nullptr) *observed = previous;
+    if (!valid(previous)) return Result::INVALID_WORD;
+    if (closed(previous)) return Result::INVALID_TRANSITION;
+    if (registered(previous) == COUNT_MAX) return Result::COUNT_OVERFLOW;
+    return Result::PENDING;
 }
 
 template <typename Atomics>
@@ -97,9 +99,9 @@ static inline __aicore__ Outcome complete_group(Atomics &atomics) {
 
 }  // namespace detail
 
-static inline __aicore__ Outcome register_group(__gm__ Join &join) {
+static inline __aicore__ Result register_group(__gm__ Join &join, uint64_t *observed = nullptr) {
     detail::GmAtomics atomics{join.word};
-    return detail::register_group(atomics);
+    return detail::register_group(atomics, observed);
 }
 
 static inline __aicore__ Outcome close_computation(__gm__ Join &join) {

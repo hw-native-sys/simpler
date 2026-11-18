@@ -123,13 +123,13 @@ TEST_F(HbgGraphDefinitionArenaTest, ObjectsAreBuiltInTheArenaAtAlignedDisjointOf
     orch.graph_commit();
     ASSERT_FALSE(orch.is_fatal());
 
-    const GraphHostImageList definitions = graph_host_definitions(*graph_state);
-    ASSERT_EQ(definitions.entries.size(), 2u);
+    const std::vector<GraphHostImage> definitions = graph_host_definitions(*graph_state);
+    ASSERT_EQ(definitions.size(), 2u);
 
     const size_t used = graph_host_arena_used(*graph_state);
     EXPECT_LE(used, arena.capacity);
     size_t claimed_total = 0;
-    for (const GraphHostImage &entry : definitions.entries) {
+    for (const GraphHostImage &entry : definitions) {
         EXPECT_EQ(entry.spill, nullptr) << "an arena this size has room for every object";
         ASSERT_NE(entry.object_offset, GRAPH_NO_OBJECT_OFFSET);
         EXPECT_EQ(entry.object_offset % GRAPH_DEFINITION_OBJECT_ALIGN, 0u);
@@ -149,8 +149,8 @@ TEST_F(HbgGraphDefinitionArenaTest, ObjectsAreBuiltInTheArenaAtAlignedDisjointOf
 
     // Distinct offsets alone would pass if two objects overlapped, so pin the
     // disjointness the shared block depends on.
-    const GraphHostImage &first = definitions.entries[0];
-    const GraphHostImage &second = definitions.entries[1];
+    const GraphHostImage &first = definitions[0];
+    const GraphHostImage &second = definitions[1];
     const size_t first_end = first.object_offset + arena.object_prefix_bytes + first.bytes;
     const size_t second_end = second.object_offset + arena.object_prefix_bytes + second.bytes;
     EXPECT_TRUE(first_end <= second.object_offset || second_end <= first.object_offset)
@@ -163,7 +163,7 @@ TEST_F(HbgGraphDefinitionArenaTest, ObjectsAreBuiltInTheArenaAtAlignedDisjointOf
         const std::optional<GraphHostUpload> upload = graph_host_upload(*graph_state, i);
         ASSERT_TRUE(upload.has_value());
         size_t matches = 0;
-        for (const GraphHostImage &entry : definitions.entries) {
+        for (const GraphHostImage &entry : definitions) {
             if (entry.graph_key != upload->graph_key) continue;
             EXPECT_EQ(definition_image(entry)->total_bytes, entry.bytes) << "shell " << i;
             matches++;
@@ -185,9 +185,9 @@ TEST_F(HbgGraphDefinitionArenaTest, AnArenaWithNoRoomSpillsAndStillPublishesTheI
     orch.graph_commit();
     ASSERT_FALSE(orch.is_fatal()) << "outgrowing the arena must cost a copy, not the run";
 
-    const GraphHostImageList definitions = graph_host_definitions(*graph_state);
-    ASSERT_EQ(definitions.entries.size(), 1u);
-    const GraphHostImage &entry = definitions.entries[0];
+    const std::vector<GraphHostImage> definitions = graph_host_definitions(*graph_state);
+    ASSERT_EQ(definitions.size(), 1u);
+    const GraphHostImage &entry = definitions[0];
     ASSERT_NE(entry.spill, nullptr);
     EXPECT_EQ(entry.object_offset, GRAPH_NO_OBJECT_OFFSET);
     EXPECT_EQ(graph_host_arena_used(*graph_state), 0u) << "nothing was claimed, so the upload ships no prefix";
@@ -216,11 +216,11 @@ TEST_F(HbgGraphDefinitionArenaTest, AnArenaTooSmallForAnObjectSpillsIt) {
     orch.graph_commit();
     ASSERT_FALSE(orch.is_fatal());
 
-    const GraphHostImageList definitions = graph_host_definitions(*graph_state);
-    ASSERT_EQ(definitions.entries.size(), 1u);
-    EXPECT_NE(definitions.entries[0].spill, nullptr);
-    EXPECT_EQ(definitions.entries[0].object_offset, GRAPH_NO_OBJECT_OFFSET);
+    const std::vector<GraphHostImage> definitions = graph_host_definitions(*graph_state);
+    ASSERT_EQ(definitions.size(), 1u);
+    EXPECT_NE(definitions[0].spill, nullptr);
+    EXPECT_EQ(definitions[0].object_offset, GRAPH_NO_OBJECT_OFFSET);
     EXPECT_EQ(graph_host_arena_used(*graph_state), 0u)
         << "a failed claim must leave the cursor where it was, so a later object still fits";
-    EXPECT_EQ(definition_image(definitions.entries[0])->total_bytes, definitions.entries[0].bytes);
+    EXPECT_EQ(definition_image(definitions[0])->total_bytes, definitions[0].bytes);
 }

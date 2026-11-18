@@ -13,8 +13,14 @@
 
 #include "scheduler_memory.h"
 
+#if defined(__CPU_SIM)
+#include "aicpu/device_time.h"
+#endif
+
 inline __aicore__ uint64_t scheduler_cycles() {
-#if defined(__CCE_AICORE__) || defined(__CPU_SIM)
+#if defined(__CPU_SIM)
+    return sys_cnt_now_ticks();
+#elif defined(__CCE_AICORE__)
     return get_sys_cnt_aicore();
 #else
     return 0;
@@ -69,6 +75,14 @@ static inline __aicore__ bool scheduler_protocol_bind(__gm__ void *base, const L
         ) ||
         !scheduler_protocol_check_region(
             layout->executions_offset, layout->trace_count, sizeof(SchedulerProtocolExecutionTrace), limit, &end
+        ) ||
+        !scheduler_protocol_check_region(
+            layout->condition_contributions_offset, layout->trace_count, sizeof(SchedulerProtocolConditionContribution),
+            limit, &end
+        ) ||
+        !scheduler_protocol_check_region(
+            layout->counter_observations_offset, layout->task_count, sizeof(SchedulerProtocolCounterObservation), limit,
+            &end
         ) ||
         !scheduler_protocol_check_region(
             layout->workers_offset, layout->worker_count, sizeof(SchedulerProtocolWorkerTrace), limit, &end
@@ -224,13 +238,13 @@ static inline __aicore__ __gm__ SchedulerProtocolExecutionTrace *scheduler_proto
     return scheduler_state_at<SchedulerProtocolExecutionTrace>(base, layout->executions_offset) + index;
 }
 
-template <typename Local, typename Claim, typename Ready>
+template <typename Local, typename Ready>
 static inline __aicore__ void scheduler_protocol_payload_publication(
-    __gm__ void *base, Local *local, const Claim &claim, const Ready &ready, bool before
+    __gm__ void *base, Local *local, uint32_t slot_index, const Ready &ready, bool before
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
-    if (claim.slot_index >= SCHEDULER_PENDING_SLOT_COUNT) {
+    if (slot_index >= SCHEDULER_PENDING_SLOT_COUNT) {
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
         return;
     }
@@ -238,13 +252,13 @@ static inline __aicore__ void scheduler_protocol_payload_publication(
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_AFTER_FINISH);
         return;
     }
-    const auto &slot = *local->slot_state(claim);
+    const auto &slot = local->slots[slot_index];
     auto *record =
         scheduler_protocol_execution_at(base, local, layout, slot.task_ref, slot.block_idx, slot.subtask_slot);
     if (record == nullptr) return;
     if (before) {
         scheduler_protocol_observe_record(record);
-        if ((local->local_ready_mask & (1U << claim.slot_index)) != 0 || record->permit.sequence != 0 ||
+        if ((local->local_ready_mask & (1U << slot_index)) != 0 || record->permit.sequence != 0 ||
             record->entry.sequence != 0 ||
             (record->publication_count != 0 &&
              (scheduler_slot_uses_admission(local, slot) || slot.cluster_mix ||
@@ -267,12 +281,12 @@ static inline __aicore__ void scheduler_protocol_payload_publication(
         record->task_ref = slot.task_ref;
         record->block_idx = slot.block_idx;
         record->worker_index = static_cast<uint32_t>(local->worker_id());
-        record->pending_slot = static_cast<uint16_t>(claim.slot_index);
+        record->pending_slot = static_cast<uint16_t>(slot_index);
         record->subtask_slot = slot.subtask_slot;
         record->ready_source = static_cast<uint32_t>(ready.source);
     } else {
         if (record->publication_count == 0 || record->worker_index != local->worker_id() ||
-            record->task_ref != slot.task_ref || record->pending_slot != claim.slot_index ||
+            record->task_ref != slot.task_ref || record->pending_slot != slot_index ||
             record->subtask_slot != slot.subtask_slot || record->block_idx != slot.block_idx ||
             record->run_epoch != layout->run_epoch) {
             scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
@@ -369,8 +383,8 @@ scheduler_protocol_member_observed(__gm__ void *base, const Local *local, const 
 
 template <typename Local, typename Admission>
 static inline __aicore__ void scheduler_protocol_member_closed(
-    __gm__ void *base, const Local *local, const Admission *admission, uint64_t cursor, uint64_t seal,
-    uint64_t last_group_seq, bool used_claim_seal = false
+    __gm__ void *base, const Local *local, const Admission *admission, uint64_t cursor, uint64_t close_frontier,
+    uint64_t last_group_seq, bool used_claim_seal = false, bool from_claim = false
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
@@ -384,7 +398,8 @@ static inline __aicore__ void scheduler_protocol_member_closed(
     }
     if (!scheduler_protocol_stamp(base, local, layout, &member->closed)) return;
     member->closed_cursor = cursor;
-    member->close_seal = seal;
+    if (from_claim) member->flags |= SCHEDULER_PROTOCOL_MEMBER_FROM_CLAIM;
+    member->close_frontier = close_frontier;
     member->last_group_seq = last_group_seq;
     member->claim_seal_seen = used_claim_seal ? cursor : 0;
     member->claim_cursor_seen = used_claim_seal ? cursor : 0;
