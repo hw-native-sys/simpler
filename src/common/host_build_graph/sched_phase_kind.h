@@ -182,6 +182,36 @@ enum class SchedPhaseKind : uint8_t {
     ScalarBootstrapTopology = 141,
     ScalarPreparedClaim = 142,
     ScalarCounterAccounting = 143,
+    ScalarOrdinaryBlockClaim = 144,
+    ScalarOrderedCursorClaim = 145,
+    ScalarClaimSealPublish = 146,
+    ScalarTaskCompletionObserve = 147,
+    ScalarCachedCompletionObserve = 148,
+    ScalarCachedCompletionLookup = 149,
+    ScalarSubtaskContribute = 150,
+    ScalarMixGroupContribute = 151,
+    ScalarReturnsContribute = 152,
+    ScalarCounterConditionPublish = 153,
+    ScalarExecutionIdentityCapture = 154,
+    ScalarAsyncBeginPrebound = 155,
+    ScalarAsyncSealExecution = 156,
+    ScalarAsyncCloseComputation = 157,
+    ScalarClusterMixServiceActive = 158,
+    ScalarClusterMixPendingActive = 159,
+    ScalarGmMixClose = 160,
+    ScalarGmMixClaim = 161,
+    ScalarGmMixPublish = 162,
+    ScalarGmMixObserve = 163,
+    ScalarGmMixArrive = 164,
+    ScalarGmMixCheckAcks = 165,
+    ScalarGmMixArrivalsReady = 166,
+    ScalarGmMixPrepareLane = 167,
+    ScalarGmMixRetire = 168,
+    ScalarGraphFaninView = 169,
+    ScalarGraphPayloadArguments = 170,
+    ScalarPublishIdle = 171,
+    ScalarTraceBeforeExecution = 172,
+    ScalarTraceBeforeCompletion = 173,
 };
 
 // This phase's name as a report spells it. Returns a string literal, so it is safe on
@@ -392,6 +422,66 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_prepared_claim";
     case SchedPhaseKind::ScalarCounterAccounting:
         return "scalar_counter_accounting";
+    case SchedPhaseKind::ScalarOrdinaryBlockClaim:
+        return "scalar_ordinary_block_claim";
+    case SchedPhaseKind::ScalarOrderedCursorClaim:
+        return "scalar_ordered_cursor_claim";
+    case SchedPhaseKind::ScalarClaimSealPublish:
+        return "scalar_claim_seal_publish";
+    case SchedPhaseKind::ScalarTaskCompletionObserve:
+        return "scalar_task_completion_observe";
+    case SchedPhaseKind::ScalarCachedCompletionObserve:
+        return "scalar_cached_completion_observe";
+    case SchedPhaseKind::ScalarCachedCompletionLookup:
+        return "scalar_cached_completion_lookup";
+    case SchedPhaseKind::ScalarSubtaskContribute:
+        return "scalar_subtask_contribute";
+    case SchedPhaseKind::ScalarMixGroupContribute:
+        return "scalar_mix_group_contribute";
+    case SchedPhaseKind::ScalarReturnsContribute:
+        return "scalar_returns_contribute";
+    case SchedPhaseKind::ScalarCounterConditionPublish:
+        return "scalar_counter_condition_publish";
+    case SchedPhaseKind::ScalarExecutionIdentityCapture:
+        return "scalar_execution_identity_capture";
+    case SchedPhaseKind::ScalarAsyncBeginPrebound:
+        return "scalar_async_begin_prebound";
+    case SchedPhaseKind::ScalarAsyncSealExecution:
+        return "scalar_async_seal_execution";
+    case SchedPhaseKind::ScalarAsyncCloseComputation:
+        return "scalar_async_close_computation";
+    case SchedPhaseKind::ScalarClusterMixServiceActive:
+        return "scalar_cluster_mix_service_active";
+    case SchedPhaseKind::ScalarClusterMixPendingActive:
+        return "scalar_cluster_mix_pending_active";
+    case SchedPhaseKind::ScalarGmMixClose:
+        return "scalar_gm_mix_close";
+    case SchedPhaseKind::ScalarGmMixClaim:
+        return "scalar_gm_mix_claim";
+    case SchedPhaseKind::ScalarGmMixPublish:
+        return "scalar_gm_mix_publish";
+    case SchedPhaseKind::ScalarGmMixObserve:
+        return "scalar_gm_mix_observe";
+    case SchedPhaseKind::ScalarGmMixArrive:
+        return "scalar_gm_mix_arrive";
+    case SchedPhaseKind::ScalarGmMixCheckAcks:
+        return "scalar_gm_mix_check_acks";
+    case SchedPhaseKind::ScalarGmMixArrivalsReady:
+        return "scalar_gm_mix_arrivals_ready";
+    case SchedPhaseKind::ScalarGmMixPrepareLane:
+        return "scalar_gm_mix_prepare_lane";
+    case SchedPhaseKind::ScalarGmMixRetire:
+        return "scalar_gm_mix_retire";
+    case SchedPhaseKind::ScalarGraphFaninView:
+        return "scalar_graph_fanin_view";
+    case SchedPhaseKind::ScalarGraphPayloadArguments:
+        return "scalar_graph_payload_arguments";
+    case SchedPhaseKind::ScalarPublishIdle:
+        return "scalar_publish_idle";
+    case SchedPhaseKind::ScalarTraceBeforeExecution:
+        return "scalar_trace_before_execution";
+    case SchedPhaseKind::ScalarTraceBeforeCompletion:
+        return "scalar_trace_before_completion";
     case SchedPhaseKind::ScalarPreparedReturn:
         return "scalar_prepared_return";
     case SchedPhaseKind::ScalarPreparedObserve:

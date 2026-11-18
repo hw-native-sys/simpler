@@ -22,6 +22,12 @@
 #include "scheduler_error.h"
 #include "scheduler_task_catalog.h"
 
+static inline __aicore__ SchedulerGraphResult
+scheduler_profiled_node_fanin_view(const SchedulerGraphAccess &graph, int64_t task_ref, SchedulerFaninView *view) {
+    SchedulerScalarScope scope(SchedPhaseKind::ScalarGraphFaninView, task_ref);
+    return scheduler_node_fanin_view(graph, task_ref, view);
+}
+
 enum class SchedulerCompletionObservation : uint8_t { PENDING, DONE, INVALID };
 
 struct SchedulerCompletionSource {
@@ -42,6 +48,7 @@ struct SchedulerFaninWait {
 // A reliable bypass snapshot establishes completion without changing ownership.
 static inline __aicore__ SchedulerCompletionObservation
 scheduler_observe_task_completion(const SchedulerCompletionSource &source) {
+    SchedulerScalarScope scope(SchedPhaseKind::ScalarTaskCompletionObserve);
     if (source.counter != nullptr) {
         const int state = scheduler_completion_counter_observe(*source.counter);
         return state < 0  ? SchedulerCompletionObservation::INVALID :
@@ -78,7 +85,6 @@ struct SchedulerReadyClaim {
 enum class SchedulerGmMixPhase : uint8_t { IDLE, CLAIMED, PUBLISHED, ARRIVED, RUNNING, RELEASED };
 
 struct SchedulerGmMixLocalState {
-    uint64_t mailbox_offset{0};
     uint64_t group_seq{0};
     uint64_t task_last_seq{0};
     uint64_t prepare_start_cycles{0};
@@ -94,7 +100,7 @@ struct SchedulerGmMixLocalState {
     bool release_failed{false};
 };
 
-static_assert(sizeof(SchedulerGmMixLocalState) == 64);
+static_assert(sizeof(SchedulerGmMixLocalState) == 56);
 
 struct SchedulerClusterMixLocalState {
     int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
@@ -149,8 +155,8 @@ struct SchedulerAdmissionLocalState {
     uint64_t topology_worker_count{0};
 };
 
-static_assert(sizeof(SchedulerGmMixLocalState) == 64, "GM group-local state size changed");
-static_assert(sizeof(SchedulerAdmissionLocalState) == 168, "admission-local state size changed");
+static_assert(sizeof(SchedulerGmMixLocalState) == 56, "GM group-local state size changed");
+static_assert(sizeof(SchedulerAdmissionLocalState) == 160, "admission-local state size changed");
 
 struct SchedulerLocalSlotState {
     SchedulerPreparedHandle prepared{};
@@ -229,6 +235,7 @@ struct SchedulerExecutionToken {
     uint32_t block_idx{0};
     uint32_t next_fanin{0};
     uint8_t subtask_slot{UINT8_MAX};
+    bool closes_supply{false};
     SchedulerExecutionTokenPhase phase{SchedulerExecutionTokenPhase::EMPTY};
     SchedulerPredicateState predicate{SchedulerPredicateState::UNEVALUATED};
 };
@@ -262,9 +269,7 @@ struct SchedulerLocalState {
     SchedulerAsyncLocalState *async{nullptr};
     SCHEDULER_CLUSTER_SSBUF SchedulerClusterSignal *cluster_signal{nullptr};
     uint32_t *direct_slot{nullptr};
-    uint64_t pending_completed{0};
     uint32_t completion_accounting_ref{UINT32_MAX};
-    uint64_t last_completion_flush_cycles{0};
     uint32_t control_peer_cursor{0};
     uint32_t cluster_prepare_seen{0};
     SchedulerClusterMixLocalState cluster_mix{};
@@ -596,9 +601,19 @@ scheduler_publish_task_done(__gm__ void *base, const SchedulerLocalState *local,
     if (notification != nullptr) scheduler_notify_done(*notification);
 }
 
+// Call exactly once from the logical-DONE owner. Data publication and any
+// required ordering of canonical DONE belong to that completion path. EXIT
+// requests still wait for every worker's unconditional retirement barrier.
+static inline __aicore__ void scheduler_report_task_completed(__gm__ SchedulerRunControl *run) {
+    if (run->run_completed_add_address != 0)
+        scheduler_notify_add(*reinterpret_cast<__gm__ volatile uint32_t *>(run->run_completed_add_address), 1);
+    else scheduler_gm_fetch_add_discard(run->resolved_task_count, UINT64_C(1));
+}
+
 static inline __aicore__ SchedulerCompletionObservation scheduler_observe_cached_completion(
     SchedulerLocalState *local, int64_t task_ref, const SchedulerCompletionSource &source
 ) {
+    SchedulerScalarScope scope(local, SchedPhaseKind::ScalarCachedCompletionObserve, task_ref);
     if (scheduler_cached_task_proof(local, task_ref) == SchedulerTaskProof::DONE)
         return SchedulerCompletionObservation::DONE;
     const auto observed = scheduler_observe_task_completion(source);
@@ -611,6 +626,7 @@ static inline __aicore__ SchedulerCompletionObservation scheduler_observe_cached
 
 static inline __aicore__ SchedulerCompletionObservation
 scheduler_observe_cached_completion(__gm__ void *base, SchedulerLocalState *local, int64_t task_ref) {
+    SchedulerScalarScope scope(local, SchedPhaseKind::ScalarCachedCompletionLookup, task_ref);
     if (scheduler_cached_task_proof(local, task_ref) == SchedulerTaskProof::DONE)
         return SchedulerCompletionObservation::DONE;
     return scheduler_observe_cached_completion(local, task_ref, scheduler_completion_source(base, local, task_ref));
@@ -742,6 +758,7 @@ static inline __aicore__ void scheduler_capture_execution_identity(
     const __gm__ LocalContext &local_context
 ) {
     const auto &slot = local->slots[pending_slot];
+    SchedulerScalarScope scope(local, SchedPhaseKind::ScalarExecutionIdentityCapture, slot.task_ref);
     auto *traces = scheduler_state_at<SchedulerTaskTrace>(base, local->profiling->trace_cells_offset);
     auto *trace = &traces[scheduler_trace_index_at(
         base, local, slot.task_ref, static_cast<SubtaskSlot>(slot.subtask_slot), slot.block_idx
@@ -931,7 +948,7 @@ inline __aicore__ bool scheduler_restore_execution_token(
     for (auto &token : local->execution_tokens) {
         if (token.phase != SchedulerExecutionTokenPhase::EMPTY) continue;
         SchedulerFaninView fanin{};
-        if (scheduler_node_fanin_view(*local->config.graph, slot.task_ref, &fanin) != SchedulerGraphResult::OK)
+        if (scheduler_profiled_node_fanin_view(*local->config.graph, slot.task_ref, &fanin) != SchedulerGraphResult::OK)
             return false;
         token = {};
         token.fanin = fanin;
@@ -968,6 +985,9 @@ static inline __aicore__ SchedulerTaskMetadata scheduler_load_dispatch_metadata(
 
 // A task-local ticket reserves one canonical execution index. Its owner keeps
 // that reservation across owner-local slot restoration without reserving another block.
+// AcquireHandle=false consumes this worker's freshly received group handle.
+// Its identity stays fixed through this same service invocation.
+template <bool AcquireHandle = true>
 static inline __aicore__ __attribute__((noinline)) bool scheduler_prepare_dispatch_slot(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
     __gm__ SchedulerRunControl *run_control, uint32_t slot_index, const SchedulerReadyClaim &ready_claim,
@@ -998,16 +1018,18 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_prepare_dispat
     }
     slot.task_ref = ready_claim.task_ref;
     slot.subtask_slot = subtask_slot;
-    const auto result = scheduler_acquire_execution_token(
-        scheduler_state_base, scheduler->config.prepared, scheduler->worker_id(), ready_claim.task_ref, slot.block_idx,
-        subtask_slot, &slot.prepared
-    );
-    if (!result) {
-        scheduler_record_dispatch_error(
-            run_control, ready_claim.task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler, &slot,
-            metadata, SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED
+    if constexpr (AcquireHandle) {
+        const auto result = scheduler_acquire_execution_token(
+            scheduler_state_base, scheduler->config.prepared, scheduler->worker_id(), ready_claim.task_ref,
+            slot.block_idx, subtask_slot, &slot.prepared
         );
-        return false;
+        if (!result) {
+            scheduler_record_dispatch_error(
+                run_control, ready_claim.task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler, &slot,
+                metadata, SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED
+            );
+            return false;
+        }
     }
     auto *binding =
         scheduler_execution_binding_at(scheduler_state_base, scheduler->config.prepared, slot.prepared.execution_index);

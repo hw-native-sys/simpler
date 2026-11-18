@@ -324,6 +324,26 @@ TEST_F(ResidentEntryResult, BothResidentModesReturnSuccessThroughTheMixedTopolog
     }
 }
 
+TEST_F(ResidentEntryResult, EmptyAndHostCompletedGraphsRequireNoDeviceProgressCredits) {
+    for (uint64_t host_tasks : {0u, 1u}) {
+        SCOPED_TRACE(host_tasks);
+        configure(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING);
+        runtime->dev.host_total_tasks = host_tasks;
+        for (auto &context : image->contexts)
+            context.graph_task_count = host_tasks;
+        image->control.expected_task_count = host_tasks;
+        image->control.inline_completed_count = host_tasks;
+        image->control.resolved_task_count = 0;
+        uint32_t stale_progress = 7;
+        image->control.run_completed_read_address = reinterpret_cast<uint64_t>(&stale_progress);
+        image->control.run_completed_add_address = reinterpret_cast<uint64_t>(&stale_progress);
+        EXPECT_EQ(execute(), (std::array<int32_t, kParticipants>{0, 0, 0}));
+        EXPECT_EQ(stale_progress, 0u);
+        EXPECT_EQ(image->control.resolved_task_count, 0u);
+        EXPECT_EQ(device_run_result_terminal(result, kEpoch).state, DeviceRunTerminalState::Succeeded);
+    }
+}
+
 TEST_F(ResidentEntryResult, TheActualLastEntryReturnsAnErrorClaimedAfterItsPeersReturned) {
     for (int32_t last = 0; last < kParticipants; ++last) {
         SCOPED_TRACE(last);

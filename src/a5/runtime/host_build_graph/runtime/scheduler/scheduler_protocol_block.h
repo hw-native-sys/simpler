@@ -136,7 +136,8 @@ scheduler_protocol_group_publish(__gm__ void *base, const SchedulerLocalState *l
 }
 
 static inline __aicore__ void scheduler_protocol_group_descriptor(
-    __gm__ void *base, const SchedulerLocalState *local, __gm__ const SchedulerGroupDescriptor *descriptor
+    __gm__ void *base, const SchedulerLocalState *local,
+    const SCHEDULER_CLUSTER_SSBUF SchedulerGroupDescriptor *descriptor
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;

@@ -13,6 +13,7 @@
 
 #include "scheduler_memory.h"
 #include "scheduler_protocol.h"
+#include "scheduler_scalar_trace.h"
 
 inline __aicore__ const __gm__ SchedulerTaskCompletionCounter *
 scheduler_completion_counter_at(__gm__ void *base, uint64_t offset, int64_t task) {
@@ -49,10 +50,11 @@ struct SchedulerCounterProtocolActor {
 // Only async-capable empty MIX seals and successful CHECK owners publish Q.
 // Known-synchronous executions have only P. An async-capable ordinary execution
 // with no registered condition combines P and Q in its physical-return interval.
-inline __aicore__ bool scheduler_counter_publish_condition(
+static inline __aicore__ bool scheduler_counter_publish_condition(
     __gm__ void *base, const __gm__ SchedulerTaskCompletionCounter &counter, int64_t task, uint32_t block,
     uint32_t lane, uint64_t metadata_offset, uint64_t protocol_offset, uint32_t worker, bool acquired
 ) {
+    SchedulerScalarScope scope(SchedPhaseKind::ScalarCounterConditionPublish, task);
     SchedulerCounterProtocolActor actor(protocol_offset, worker);
     auto *layout = scheduler_protocol_layout_at(base, &actor);
     __gm__ SchedulerProtocolConditionContribution *event = nullptr;

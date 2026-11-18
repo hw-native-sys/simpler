@@ -940,12 +940,7 @@ struct ControlFixture : NativeViewFixture {
                 slot.state = SchedulerDispatchSlotState::READY;
         }
     }
-    uint64_t completed() const {
-        uint64_t value = 0;
-        for (const auto &local : locals)
-            value += local.pending_completed;
-        return value;
-    }
+    uint64_t completed() const { return scheduler_test::resolved_count(run); }
 };
 }  // namespace
 
@@ -969,9 +964,9 @@ TEST(HbgNativeGraphPlan, HostInitializedDummyChainProgressesWithFullKernelSlots)
 
     for (uint32_t step = 0; step < 512 && view.completed() < view.graph.task_count; ++step) {
         for (auto &local : view.locals) {
-            const auto before = local.pending_completed;
+            const auto before = view.completed();
             ASSERT_TRUE(scheduler_service_controls(view.graph, view.backing.get(), &local, view.run, 0, &progress));
-            EXPECT_LE(local.pending_completed - before, SCHEDULER_CONTROL_NODE_BUDGET);
+            EXPECT_LE(view.completed() - before, SCHEDULER_CONTROL_NODE_BUDGET);
         }
     }
     ASSERT_EQ(view.completed(), view.graph.task_count);
@@ -987,17 +982,37 @@ TEST(HbgNativeGraphPlan, HostInitializedDummyChainProgressesWithFullKernelSlots)
 TEST(HbgNativeGraphPlan, IndependentControlsRespectEachServiceBudget) {
     DefinitionFixture body(std::vector<std::vector<uint16_t>>(130), true);
     ControlFixture view(body);
+    uint32_t completed = 0;
+    view.run->run_completed_read_address = reinterpret_cast<uint64_t>(&completed);
+    view.run->run_completed_add_address = reinterpret_cast<uint64_t>(&completed);
 
     bool progress = false;
     ASSERT_TRUE(scheduler_service_controls(view.graph, view.backing.get(), &view.locals[0], view.run, 0, &progress));
     EXPECT_TRUE(progress);
-    EXPECT_GT(view.locals[0].pending_completed, 0);
-    EXPECT_LE(view.locals[0].pending_completed, SCHEDULER_CONTROL_NODE_BUDGET);
+    EXPECT_GT(view.completed(), 0);
+    EXPECT_LE(view.completed(), SCHEDULER_CONTROL_NODE_BUDGET);
     auto *root = scheduler_task_control_at(view.backing.get(), &view.locals[0], 0);
     EXPECT_EQ(root->completion_state, scheduler_completion_completed_state(1));
-    for (uint32_t step = 0; step < 128 && view.completed() < view.graph.task_count; ++step)
-        for (auto &local : view.locals)
-            ASSERT_TRUE(scheduler_service_controls(view.graph, view.backing.get(), &local, view.run, 0, &progress));
+    std::array<std::thread, 3> workers;
+    std::atomic<uint32_t> first_reports{0};
+    for (uint32_t worker = 0; worker < workers.size(); ++worker)
+        view.locals[worker].control_peer_cursor = (worker + 1) * SCHEDULER_CONTROL_NODE_BUDGET;
+    for (uint32_t worker = 0; worker < workers.size(); ++worker)
+        workers[worker] = std::thread([&, worker] {
+            bool advanced = false;
+            EXPECT_TRUE(
+                scheduler_service_controls(view.graph, view.backing.get(), &view.locals[worker], view.run, 0, &advanced)
+            );
+            EXPECT_TRUE(advanced);  // Every worker must actually contribute, not just observe the final sum.
+            first_reports.fetch_add(1, std::memory_order_release);
+            while (first_reports.load(std::memory_order_acquire) != workers.size()) {}
+            for (uint32_t step = 0; step < 128 && view.completed() < view.graph.task_count; ++step)
+                ASSERT_TRUE(scheduler_service_controls(
+                    view.graph, view.backing.get(), &view.locals[worker], view.run, 0, &advanced
+                ));
+        });
+    for (auto &worker : workers)
+        worker.join();
     EXPECT_EQ(view.completed(), view.graph.task_count);
 }
 

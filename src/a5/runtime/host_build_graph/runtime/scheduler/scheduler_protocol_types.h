@@ -16,6 +16,8 @@
 #include <type_traits>
 
 inline constexpr uint64_t SCHEDULER_PROTOCOL_MAGIC = UINT64_C(0x53504d4454520002);
+// Control completion stamps describe accounting after idempotent notification.
+inline constexpr uint32_t SCHEDULER_PROTOCOL_CONTROL_NOTIFY_ACCOUNTING = UINT32_C(1) << 26;
 inline constexpr uint32_t SCHEDULER_PROTOCOL_COUNTER_ACCOUNTING = UINT32_C(1) << 27;
 inline constexpr uint32_t SCHEDULER_PROTOCOL_MEMBER_FROM_CLAIM = UINT32_C(1) << 28;
 // A physical synchronous completion aliases the actual last contribution stamps.

@@ -479,12 +479,17 @@ remaining computation and compute debt. Async conditions retain additional debt
 until their join completes. DONE requires a valid total and zero computation
 and debt; a kernel return alone is insufficient.
 
-The unique final completion owner adds one pending logical completion. Workers
-flush pending counts to `resolved_task_count`; control nodes use the same
-canonical gate and winner rule. Successors observe producer gates directly.
-Async CHECK is bounded and FINISH retains its exclusive lease until its debt
-settlement completes. Trace publication, group release and safe reuse still
-have their own ownership requirements.
+Each unique logical-task accountant immediately contributes one INC to a
+run-owned CntNotify. AICPU reads that count for progress and completion;
+Host-completed nodes remain separately counted. There is no per-worker pending
+count, batching threshold, timer or flush. Unmapped runs use one GM FAA per
+task. The reporting helper adds no DSB: existing completion publication and
+unconditional worker-retirement barriers preserve their respective ordering.
+After every core retires, AICPU snapshots the actual count into the GM
+`resolved_task_count` diagnostic field. Successors observe producer completion
+directly. Async CHECK keeps its exclusive lease and only settled logical
+completion reports progress; physical return with pending conditions does not.
+Trace publication, group release and safe reuse retain their ownership rules.
 
 On an error, a worker cancels only its provably owned unstarted handles to FAILED;
 it cannot invent a RETURNED Call, computation contribution or group-finished ACK.
@@ -516,6 +521,14 @@ runs on the host. Important validation paths include:
 
 Device logs contain scheduler records only. Host graph-construction diagnostics
 remain host-side. See [device_log_profiling.md](device_log_profiling.md).
+
+A5 HBG L3 traces name the scheduler functions that claim blocks, observe and
+publish completion, service MIX and asynchronous work, and decode Graph inputs.
+Identity capture, trace staging and deferred idle publication have their own
+intervals. Completion and CHECK intervals end when the corresponding calls
+return. A parent interval includes its children. Its remaining time includes
+control flow, ordinary memory access and instrumentation. See the
+[Scalar trace format](../../../../../docs/dfx/chip-swimlane-profiling.md#a5-hbg-scalar-detail-at-level-3).
 
 ## 10. Verification
 

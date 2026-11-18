@@ -183,8 +183,8 @@ intervals include their children and must not be added to child totals.
 Uninstrumented work remains in the parent's exclusive time.
 
 `scheduler_read_claim_cursor` separates context validation and reliable bypass
-reads of `claim_seal` and `next_block`. Observing a completed seal inserts a DSB
-before the dependent cursor read; neither observation adds an FAA(0) confirmation.
+reads of `claim_seal` and, only when the seal is zero, `next_block`. A valid
+terminal seal supplies the cursor directly, so the trace has no next-block probe on that path.
 `scheduler_observe_ordered_progress` separates local state,
 probes, admission-tail checks, and MIX assignment/close/arrival/release checks.
 Each worker traverses its immutable AIC or AIV task catalog. AIC discovery

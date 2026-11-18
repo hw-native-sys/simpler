@@ -107,7 +107,7 @@ static inline __aicore__ SchedulerOrderedPollResult scheduler_observe_ordered_pr
         return SchedulerOrderedPollResult::READY;
     SchedulerScalarScope scalar_mix(local, SchedPhaseKind::ScalarPollMixState);
     const auto &group = admission.gm_mix;
-    if (group.mailbox_offset == 0 || group.cluster_index >= local->config.cluster_count)
+    if (local->cluster_signal == nullptr || group.cluster_index >= local->config.cluster_count)
         return SchedulerOrderedPollResult::READY;
     auto *mailbox = scheduler_gm_mix_mailbox(base, local);
     if (!local->is_mix_coordinator() &&

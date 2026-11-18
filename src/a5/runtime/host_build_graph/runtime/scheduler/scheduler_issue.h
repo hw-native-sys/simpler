@@ -101,13 +101,56 @@ static inline __aicore__ bool scheduler_task_supply_closed(
     return true;
 }
 
-// Only a successful final valid ticket owner reaches this publication. Other
-// claimants may still be receiving their Calls; every valid ticket is irrevocable.
+// Each sector contains block indices part + 4*k. Its final valid claimant
+// contributes that sector's capacity once; excess claims never roll back or
+// contribute. A total of N therefore proves all N blocks have fixed owners.
+static inline __aicore__ bool scheduler_claim_ordinary_block(
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    int64_t ref, uint32_t blocks, uint32_t *block, bool *closes_supply
+) {
+    SchedulerScalarScope scope(local, SchedPhaseKind::ScalarOrdinaryBlockClaim, ref);
+    *block = blocks;
+    *closes_supply = false;
+    auto *control = scheduler_task_control_at(base, local, ref);
+    if (blocks == 1) {
+        const uint64_t claimed = scheduler_gm_fetch_add(control->next_block, UINT64_C(1));
+        if (claimed != 0) {
+            if (scheduler_gm_fetch_add(control->next_block, UINT64_MAX) <= blocks)
+                return scheduler_issue_fail(graph, local, run, ref);
+            return true;
+        }
+        *block = 0;
+        *closes_supply = true;
+        return true;
+    }
+    const uint32_t first = static_cast<uint32_t>(local->worker_id()) & (SCHEDULER_CLAIM_SECTOR_COUNT - 1);
+    for (uint32_t offset = 0; offset < SCHEDULER_CLAIM_SECTOR_COUNT; ++offset) {
+        const uint32_t part = (first + offset) & (SCHEDULER_CLAIM_SECTOR_COUNT - 1);
+        const uint32_t capacity =
+            blocks / SCHEDULER_CLAIM_SECTOR_COUNT + (part < blocks % SCHEDULER_CLAIM_SECTOR_COUNT ? 1 : 0);
+        if (capacity == 0) continue;
+        auto &next = control->claim_sectors[part].next;
+        if (scheduler_gm_query(next) >= capacity) continue;
+        const uint64_t ticket = scheduler_gm_fetch_add(next, UINT64_C(1));
+        if (ticket >= capacity) continue;
+        *block = part + static_cast<uint32_t>(ticket) * SCHEDULER_CLAIM_SECTOR_COUNT;
+        if (ticket + 1 == capacity) {
+            const uint64_t covered = scheduler_gm_fetch_add(control->next_block, static_cast<uint64_t>(capacity));
+            if (covered > blocks - capacity) return scheduler_issue_fail(graph, local, run, ref);
+            *closes_supply = covered + capacity == blocks;
+        }
+        return true;
+    }
+    return true;
+}
+
+// Only the claimant that completes the final sector reaches this publication.
+// Other owners may still receive Calls; their block assignments cannot move.
 static inline __aicore__ bool scheduler_close_ordinary_supply(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    int64_t ref, uint32_t block, uint32_t blocks
+    int64_t ref, bool closes_supply, uint32_t blocks
 ) {
-    if (block + 1 != blocks) return true;
+    if (!closes_supply) return true;
     auto *control = scheduler_task_control_at(base, local, ref);
     scheduler_cache_barrier();
     scheduler_store_signal(control->claim_seal, static_cast<uint64_t>(blocks));
@@ -157,7 +200,7 @@ static inline __aicore__ bool scheduler_issue_fanin_ready(
     if (!scheduler_bind_issue_entry(graph, base, local, run, ref)) return false;
     auto &binding = local->issue_binding;
     if (!binding.fanin_bound) {
-        const auto view_status = scheduler_node_fanin_view(graph, ref, &binding.fanin);
+        const auto view_status = scheduler_profiled_node_fanin_view(graph, ref, &binding.fanin);
         if (view_status != SchedulerGraphResult::OK)
             return scheduler_issue_fail(graph, local, run, ref, view_status, SchedulerErrorSite::ROUTE_INVALID_STATE);
         binding.fanin_bound = true;

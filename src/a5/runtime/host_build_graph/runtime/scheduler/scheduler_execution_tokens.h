@@ -55,7 +55,7 @@ static inline __aicore__ bool scheduler_execution_token_receive(
     if (!result) return scheduler_execution_token_fail(graph, local, run, token.task_ref);
     const uint32_t blocks = scheduler_task_metadata_at(base, local, token.task_ref)->logical_block_num;
     const bool supplied =
-        scheduler_close_ordinary_supply(graph, base, local, run, token.task_ref, token.block_idx, blocks);
+        scheduler_close_ordinary_supply(graph, base, local, run, token.task_ref, token.closes_supply, blocks);
     // Cancellation of a claimed handle inspects its Call, so payload receipt
     // completes even when supply publication reports an error.
     const auto received = scheduler_receive_execution_token(
@@ -219,17 +219,19 @@ static inline __aicore__ bool scheduler_try_execution_continuation(
         ++empty;
     if (empty == SCHEDULER_EXECUTION_TOKEN_COUNT) return scheduler_execution_token_fail(graph, local, run, task_ref);
     const uint64_t discovery_start = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
-    const uint64_t block = scheduler_gm_fetch_add(control->next_block, UINT64_C(1));
+    uint32_t block = blocks;
+    bool closes_supply = false;
+    if (!scheduler_claim_ordinary_block(graph, base, local, run, task_ref, blocks, &block, &closes_supply))
+        return false;
     scheduler_invalidate_issue_snapshot(snapshot);
     if (block >= blocks) {
-        if (scheduler_gm_fetch_add(control->next_block, UINT64_MAX) <= blocks)
-            return scheduler_execution_token_fail(graph, local, run, task_ref);
         if (local->issue_task_ref == task_ref) local->issue_ticket_exhausted = true;
         return true;
     }
     auto &token = local->execution_tokens[empty];
     token.task_ref = task_ref;
-    token.block_idx = static_cast<uint32_t>(block);
+    token.block_idx = block;
+    token.closes_supply = closes_supply;
     token.subtask_slot = lane;
     token.fanin = fanin;
     token.next_fanin = fanin.count;
@@ -289,17 +291,19 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_refill_executi
             if (local->issue_task_ref == task_ref) local->issue_ticket_exhausted = true;
             return true;
         }
-        const uint64_t block = scheduler_gm_fetch_add(control->next_block, UINT64_C(1));
+        uint32_t block = blocks;
+        bool closes_supply = false;
+        if (!scheduler_claim_ordinary_block(graph, base, local, run, task_ref, blocks, &block, &closes_supply))
+            return false;
         scheduler_invalidate_issue_snapshot(snapshot);
         if (block >= blocks) {
-            if (scheduler_gm_fetch_add(control->next_block, UINT64_MAX) <= blocks)
-                return scheduler_execution_token_fail(graph, local, run, task_ref);
             if (local->issue_task_ref == task_ref) local->issue_ticket_exhausted = true;
             return true;
         }
         auto &token = local->execution_tokens[empty];
         token.task_ref = task_ref;
-        token.block_idx = static_cast<uint32_t>(block);
+        token.block_idx = block;
+        token.closes_supply = closes_supply;
         token.subtask_slot = lane;
         token.discovery_cycles = discovery_start;
         token.fanin = fanin;

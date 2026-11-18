@@ -587,7 +587,7 @@ TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
 
     std::array<SchedulerTaskControl, 2> controls{};
     std::array<SchedulerWorkerContext, 2> contexts{};
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 640u);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 1152u);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(&contexts[1]) - reinterpret_cast<uintptr_t>(&contexts[0]), 320u);
     EXPECT_NE(offsetof(SchedulerTaskControl, next_block) / 128, offsetof(SchedulerTaskControl, claim_tickets) / 128);
     EXPECT_NE(offsetof(SchedulerTaskControl, next_block) / 128, offsetof(SchedulerTaskControl, completion_state) / 128);

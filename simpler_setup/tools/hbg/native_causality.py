@@ -17,6 +17,7 @@ from .native_protocol import (
     COMPLETION_ALIAS_FLAGS,
     COMPLETION_FROM_CONTRIBUTION,
     COMPLETION_FROM_GROUP,
+    CONTROL_NOTIFY_ACCOUNTING,
     COUNTER_ACCOUNTING,
     DEFERRED_FINISH,
     MEMBER_FROM_CLAIM,
@@ -197,6 +198,17 @@ class NativeAudit:
         for ref in device:
             done = self.actors[ref]["completion"]
             require(done is not None, "missing TaskDone publication")
+            if done["flags"] & CONTROL_NOTIFY_ACCOUNTING:
+                require(
+                    (self.tasks[ref]["flags"] & INLINE or ref in self.control_nodes)
+                    and self.controls[ref]["completion_backend"] == 0
+                    and not done["flags"] & (COUNTER_ACCOUNTING | DEFERRED_FINISH | COMPLETION_ALIAS_FLAGS),
+                    "control notification accounting on a non-control task or conflicting source",
+                )
+                # No record identifies the earliest SET among multiple publishers.
+                # Keep the logical fanin join untimed; the actor retains CAS time.
+                self.done_points[ref] = ("ControlReady", ref)
+                continue
             if self.controls[ref]["completion_backend"] == 1:
                 require(
                     done["flags"] & COUNTER_ACCOUNTING and not done["flags"] & COMPLETION_ALIAS_FLAGS,
@@ -292,7 +304,9 @@ class NativeAudit:
     def record_identity(self, record, ref, *, completion=False, member=False):
         flags = self.tasks[ref]["flags"]
         if completion:
-            flags |= record["flags"] & (DEFERRED_FINISH | COMPLETION_ALIAS_FLAGS | COUNTER_ACCOUNTING)
+            flags |= record["flags"] & (
+                DEFERRED_FINISH | COMPLETION_ALIAS_FLAGS | COUNTER_ACCOUNTING | CONTROL_NOTIFY_ACCOUNTING
+            )
         if member:
             flags |= record["flags"] & MEMBER_FROM_CLAIM
         require(
@@ -994,7 +1008,11 @@ class NativeAudit:
         if ref in self.orders:
             earliest = point(self.actors[ref]["admission"], "before")
         elif task["flags"] & INLINE or ref in self.control_nodes:
-            earliest = point(done, "before")
+            if done["flags"] & CONTROL_NOTIFY_ACCOUNTING:
+                earliest = self.done_points[ref]
+                self.causal.add(earliest, point(done, "before"))
+            else:
+                earliest = point(done, "before")
         elif task["flags"] & MIX:
             # Speculative preparation may precede readiness; formal resource
             # staging may not. Every block needs this dependency edge.

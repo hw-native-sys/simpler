@@ -124,9 +124,9 @@ struct InlineFixture {
     bool service_until_done(uint32_t task, uint32_t worker = 1) {
         for (uint32_t probe = 0; probe < 2 * graph.graph().task_count; ++probe) {
             if (scheduler_completion_done(scheduler_gm_query(control(task).completion_state))) return true;
-            const uint64_t before = locals[worker]->pending_completed;
+            const uint64_t before = scheduler_test::resolved_count(run());
             if (!fill(worker)) return false;
-            EXPECT_LE(locals[worker]->pending_completed - before, SCHEDULER_CONTROL_NODE_BUDGET);
+            EXPECT_LE(scheduler_test::resolved_count(run()) - before, SCHEDULER_CONTROL_NODE_BUDGET);
             expect_no_dispatch(worker);
         }
         return scheduler_completion_done(scheduler_gm_query(control(task).completion_state));
@@ -172,15 +172,14 @@ TEST_P(HbgInlineDispatch, CompletesWithoutPayloadSlotGenerationOrKernelTrace) {
         scheduler_completion_task_state(scheduler_gm_query(fixture.control(1).completion_state)),
         static_cast<int64_t>(SchedulerTaskState::DONE)
     );
-    EXPECT_EQ(local->pending_completed, 1u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 1u);
     EXPECT_EQ(scheduler_cached_task_proof(local, 1), SchedulerTaskProof::DONE);
     fixture.expect_no_dispatch(1);
     if (!previous.empty()) EXPECT_EQ(std::memcmp(previous.data(), calls, previous.size()), 0);
     EXPECT_EQ(fixture.trace(2).kernel_start_cycles, 123456u);
     EXPECT_EQ(fixture.trace(2).valid, 0u);
     ASSERT_TRUE(fixture.fill());
-    scheduler_flush_completions(fixture.run(), local);
-    EXPECT_EQ(scheduler_gm_fetch_add(fixture.run()->resolved_task_count, UINT64_C(0)), 1u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 1u);
 }
 
 INSTANTIATE_TEST_SUITE_P(OrdinaryAndOrdered, HbgInlineDispatch, ::testing::Bool());
@@ -193,7 +192,7 @@ TEST(HbgInlineService, CancellationIsObservedBeforePublishingTaskDone) {
         scheduler_completion_task_state(fixture.control(1).completion_state),
         static_cast<int64_t>(SchedulerTaskState::BLOCKED)
     );
-    EXPECT_EQ(fixture.locals[1]->pending_completed, 0u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 0u);
 }
 
 TEST(HbgInlineService, ProgressesWhileAnUnrelatedMixWaitsForAnotherLane) {
@@ -250,7 +249,7 @@ TEST(HbgInlineService, ConsumerPollingServicesDummyWithoutReportingKernelRefill)
         scheduler_completion_task_state(scheduler_gm_query(fixture.control(1).completion_state)),
         static_cast<int64_t>(SchedulerTaskState::DONE)
     );
-    EXPECT_EQ(fixture.locals[1]->pending_completed, 2u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 2u);
     EXPECT_EQ(fixture.trace(2).valid, 0u);
 }
 
@@ -260,24 +259,27 @@ TEST(HbgInlineService, TwoBlocksThenDummyReleaseTheSuccessorExactlyOnce) {
     fixture.dependency(2, 1);
     ASSERT_TRUE(fixture.fill());
     ASSERT_EQ(fixture.locals[1]->slots[0].task_ref, 0);
-    ASSERT_EQ(fixture.locals[1]->slots[0].block_idx, 0u);
+    const auto first = fixture.locals[1]->slots[0].block_idx;
+    ASSERT_LT(first, 2u);
     ASSERT_EQ(fixture.locals[1]->slots[1].state, SchedulerDispatchSlotState::FREE);
     ASSERT_TRUE(fixture.complete(1, 0));
-    EXPECT_EQ(fixture.locals[1]->pending_completed, 0u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 0u);
     EXPECT_NE(
         scheduler_completion_task_state(scheduler_gm_query(fixture.control(1).completion_state)),
         static_cast<int64_t>(SchedulerTaskState::DONE)
     );
     ASSERT_TRUE(fixture.fill());
     ASSERT_EQ(fixture.locals[1]->slots[0].task_ref, 0);
-    ASSERT_EQ(fixture.locals[1]->slots[0].block_idx, 1u);
+    const auto second = fixture.locals[1]->slots[0].block_idx;
+    ASSERT_LT(second, 2u);
+    ASSERT_NE(first, second);
     ASSERT_TRUE(fixture.complete(1, 0));
     ASSERT_TRUE(fixture.fill());
     EXPECT_EQ(
         scheduler_completion_task_state(scheduler_gm_query(fixture.control(1).completion_state)),
         static_cast<int64_t>(SchedulerTaskState::DONE)
     );
-    EXPECT_EQ(fixture.locals[1]->pending_completed, 2u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 2u);
     ASSERT_TRUE(fixture.fill());
     uint32_t successor_slots = 0;
     for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
@@ -288,8 +290,7 @@ TEST(HbgInlineService, TwoBlocksThenDummyReleaseTheSuccessorExactlyOnce) {
     }
     EXPECT_EQ(successor_slots, 1u);
     ASSERT_TRUE(fixture.fill());
-    scheduler_flush_completions(fixture.run(), fixture.locals[1]);
-    EXPECT_EQ(scheduler_gm_fetch_add(fixture.run()->resolved_task_count, UINT64_C(0)), 3u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 3u);
     EXPECT_EQ(fixture.trace(0).valid, 1u);
     EXPECT_EQ(fixture.trace(1).valid, 1u);
     EXPECT_EQ(fixture.trace(2).valid, 1u);
@@ -301,11 +302,11 @@ TEST(HbgInlineService, AServiceChainCompletesWithinTheBoundedControlSlice) {
     fixture.dependency(1, 0);
     fixture.dependency(2, 1);
     ASSERT_TRUE(fixture.fill());
-    EXPECT_GE(fixture.locals[1]->pending_completed, 1u);
-    EXPECT_LE(fixture.locals[1]->pending_completed, SCHEDULER_CONTROL_NODE_BUDGET);
+    EXPECT_GE(scheduler_test::resolved_count(fixture.run()), 1u);
+    EXPECT_LE(scheduler_test::resolved_count(fixture.run()), SCHEDULER_CONTROL_NODE_BUDGET);
     fixture.expect_no_dispatch(1);
     ASSERT_TRUE(fixture.service_until_done(2));
-    EXPECT_EQ(fixture.locals[1]->pending_completed, 3u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 3u);
     fixture.expect_no_dispatch(1);
 }
 
@@ -320,7 +321,7 @@ TEST(HbgInlineService, HostCompletedServiceDoesNotCompleteAgainOnDevice) {
         scheduler_completion_completed_state(scheduler_completion_total(fixture.control(1).completion_state))
     );
     ASSERT_TRUE(fixture.fill());
-    EXPECT_EQ(fixture.locals[1]->pending_completed, 0u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 0u);
     fixture.expect_no_dispatch(1);
 }
 
@@ -330,7 +331,7 @@ TEST(HbgInlineService, RepeatedServiceAndInvalidCompletionDoNotAddSuccessfulComp
         if (invalid_state) fixture.control(1).completion_state = 0;
         EXPECT_EQ(fixture.service(), !invalid_state);
         EXPECT_EQ(fixture.service(), !invalid_state);
-        EXPECT_EQ(fixture.locals[1]->pending_completed, invalid_state ? 0u : 1u);
+        EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), invalid_state ? 0u : 1u);
         EXPECT_EQ(scheduler_read_error(fixture.run()) != 0, invalid_state);
         fixture.expect_no_dispatch(1);
     }
@@ -372,7 +373,7 @@ TEST_P(HbgInvalidInlineMetadata, HostRejectsKernelCooperativeAndPredicateShapesW
     const std::vector<SchedulerTaskMetadata> metadata_rows(fixture.storage.metadata, fixture.storage.metadata + 3);
     EXPECT_FALSE(scheduler_plan_task_catalog(metadata_rows, 1, fixture.storage.catalog_begin, &plan));
     EXPECT_EQ(plan.total_size, 123u);
-    EXPECT_EQ(fixture.locals[1]->pending_completed, 0u);
+    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 0u);
     EXPECT_FALSE(scheduler_completion_done(fixture.control(1).completion_state));
     fixture.expect_no_dispatch(1);
 }

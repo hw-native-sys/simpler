@@ -134,18 +134,9 @@ scheduler_initialize_admission(__gm__ void *base, const SchedulerLocalState *loc
             return false;
     }
     if (summary->sync_mix_task_count != 0) {
-        uint64_t mailbox_end = 0;
         if (local->config.shared_context == nullptr) return false;
         const uint64_t cluster = local->config.shared_context->cluster_index;
-        if (cluster >= clusters || summary->group_mailboxes_offset == 0 ||
-            (summary->group_mailboxes_offset & (alignof(SchedulerGroupMailbox) - 1)) != 0 ||
-            summary->group_mailboxes_offset < next.log_offset + next.capacity * sizeof(int64_t) ||
-            !scheduler_admission_range_end(
-                summary->group_mailboxes_offset, clusters, sizeof(SchedulerGroupMailbox), &mailbox_end
-            ) ||
-            mailbox_end > UINT64_MAX - reinterpret_cast<uintptr_t>(base))
-            return false;
-        next.gm_mix.mailbox_offset = summary->group_mailboxes_offset + cluster * sizeof(SchedulerGroupMailbox);
+        if (cluster >= clusters) return false;
         next.gm_mix.cluster_index = static_cast<uint32_t>(cluster);
     }
     if (summary->topology_layout != SchedulerTopologyLayout::GENERAL &&
@@ -512,6 +503,7 @@ static inline __aicore__ bool scheduler_publish_claim_seal(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint32_t block
 ) {
+    SchedulerScalarScope scope(local, SchedPhaseKind::ScalarClaimSealPublish);
     auto *admission = local->admission;
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return false;
     auto *control = scheduler_task_control_at(base, local, admission->current_task_ref);
@@ -533,6 +525,7 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_curso
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint32_t *block_idx
 ) {
+    SchedulerScalarScope scope(local, SchedPhaseKind::ScalarOrderedCursorClaim);
     auto *admission = local->admission;
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return SchedulerBlockClaimResult::ERROR;
     if (block_idx == nullptr || !scheduler_task_ref_valid(graph, admission->current_task_ref) ||

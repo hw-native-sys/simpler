@@ -218,8 +218,6 @@ struct StartupFixture {
                 static_cast<int64_t>(SchedulerTaskState::DONE)
             );
         }
-        for (uint32_t lane = 0; lane < 6; ++lane)
-            scheduler_flush_completions(run, &locals[lane]);
     }
 
     void run_late_worker(uint32_t worker = 3) {
@@ -295,7 +293,7 @@ TEST(HbgGmMixStartupExit, RejectsMalformedPublishedGraphBeforeBootstrap) {
 TEST_P(HbgGmMixStartupExit, LateZeroWorkCoordinatorClosesEveryAdmittedMixBeforeExitAck) {
     StartupFixture fixture(GetParam());
     fixture.finish_both_tasks_on_early_clusters();
-    ASSERT_EQ(scheduler_gm_fetch_add(fixture.storage.run_control->resolved_task_count, UINT64_C(0)), 2u);
+    ASSERT_EQ(scheduler_test::resolved_count(fixture.storage.run_control), 2u);
     ASSERT_EQ(scheduler_gm_fetch_add(fixture.storage.run_control->scheduler_error, UINT64_C(0)), 0u);
     ASSERT_EQ(scheduler_cluster_load_field(&fixture.frontier(1)), 0u);
     for (uint64_t task = 0; task < 2; ++task) {
@@ -337,7 +335,7 @@ TEST(HbgGmMixStartupExit, FailedRunAcknowledgesExitWithoutFabricatingClosedFront
         SCOPED_TRACE(worker);
         StartupFixture fixture({LaneMask::both_aiv(), LaneMask::both_aiv()});
         fixture.finish_both_tasks_on_early_clusters();
-        ASSERT_EQ(scheduler_gm_fetch_add(fixture.storage.run_control->resolved_task_count, UINT64_C(0)), 2u);
+        ASSERT_EQ(scheduler_test::resolved_count(fixture.storage.run_control), 2u);
         scheduler_record_error(
             fixture.storage.run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS,
             &fixture.graph_view, &fixture.storage.contexts[3], SchedulerErrorSite::ORDERED_EXIT_IN_FLIGHT
@@ -576,7 +574,7 @@ TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCa
     identity_test_payload = scheduler_execution_binding_at(base, local->config.prepared, 0);
     write_reg(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
     ScopedStartupRegisterObserver stop_after_completion([&] {
-        if (local->pending_completed + run->resolved_task_count == run->expected_task_count)
+        if (scheduler_test::resolved_count(run) == run->expected_task_count)
             write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
     });
     SchedulerWorkerStats stats{};
@@ -787,7 +785,7 @@ TEST(HbgProtocolExecution, ConsumerDiscoveryKeepsTheCompletedGenerationSeparateF
     startup_kernel_calls = 0;
     write_reg(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
     ScopedStartupRegisterObserver stop_after_completion([&] {
-        if (local->pending_completed + run->resolved_task_count == run->expected_task_count)
+        if (scheduler_test::resolved_count(run) == run->expected_task_count)
             write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
     });
     SchedulerWorkerStats stats{};

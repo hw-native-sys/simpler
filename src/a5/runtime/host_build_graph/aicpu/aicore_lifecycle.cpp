@@ -198,6 +198,11 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
     if (scheduler_state_base == nullptr || run_control == nullptr) return -1;
     // No AICore can observe READY yet. Replay resets the same owned registers
     // before any publisher or waiter from this invocation can access them.
+    if (run_control->run_completed_read_address != 0) {
+        *reinterpret_cast<volatile uint32_t *>(run_control->run_completed_read_address) = 0;
+        run_control->resolved_task_count = 0;
+        wmb();
+    }
     if (bootstrap_context->done_notifications_offset != 0) {
         const auto *addresses =
             scheduler_state_at<uint64_t>(scheduler_state_base, bootstrap_context->done_notifications_offset);
@@ -234,14 +239,16 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
     }
     const auto *notification_summary =
         scheduler_state_at<SchedulerGraphSummary>(scheduler_state_base, bootstrap_context->graph_summary_offset);
-    if (notification_summary->group_mailboxes_offset != 0) {
-        const auto *mailboxes = scheduler_state_at<SchedulerGroupMailbox>(
-            scheduler_state_base, notification_summary->group_mailboxes_offset
-        );
-        for (uint64_t cluster = 0; cluster < notification_summary->cluster_count; ++cluster)
-            for (const auto &lane : mailboxes[cluster].notification_addresses)
-                for (uint64_t address : lane)
-                    if (address != 0) *reinterpret_cast<volatile uint32_t *>(address) = 0;
+    if (notification_summary->async_layout_offset != 0) {
+        const auto *async =
+            scheduler_state_at<SchedulerAsyncLayout>(scheduler_state_base, notification_summary->async_layout_offset);
+        const auto *directory =
+            scheduler_state_at<SchedulerAsyncDirectoryWord>(scheduler_state_base, async->check_directory_offset);
+        const uint64_t halves = (static_cast<uint64_t>(async->group_count) + 31) / 32;
+        for (uint64_t half = 0; half < halves; ++half) {
+            const uint64_t address = directory[half / 2].notification_addresses[half % 2];
+            if (address != 0) *reinterpret_cast<volatile uint32_t *>(address) = 0;
+        }
         wmb();
     }
     if (!initialize_resident_args_dump_outputs(
@@ -711,6 +718,13 @@ bool AicoreLifecycle::settle_run_diagnostics(Runtime *runtime, bool graph_comple
         return false;
     }
     auto *counter_context = aicore_scheduler_bootstrap_context(runtime);
+    // All publishers have retired. Preserve the observed progress in the GM
+    // diagnostic image without racing the fallback's per-task FAA writers.
+    auto *retired_run = aicore_scheduler_run_control(counter_context);
+    if (retired_run != nullptr && retired_run->run_completed_read_address != 0) {
+        retired_run->resolved_task_count = aicore_scheduler_resolved_count(retired_run);
+        wmb();
+    }
     if (counter_context != nullptr && counter_context->completion_counters_offset != 0) {
         auto *base = aicore_scheduler_state_base(counter_context);
         const auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, counter_context->graph_summary_offset);
