@@ -111,6 +111,8 @@ def urma_lifecycle_binary(tmp_path_factory):
         "context_upload",
         "late_import",
         "early_get_device",
+        "mapped_success",
+        "mixed_engines",
         "peer_import",
         "peer_reserve",
         "peer_map",

@@ -72,6 +72,8 @@ def normalize_workspace_configs(workspace_engines) -> tuple[tuple[str, Workspace
     names = tuple(workspace_engines)
     if any(not isinstance(name, str) or name not in _CONFIG_TYPES for name in names) or len(set(names)) != len(names):
         raise ValueError("workspace_engines requires distinct names from sdma, urma, rdma, ccu")
+    if "urma" in names and len(names) > 1:
+        raise ValueError("URMA requires a dedicated domain")
     if "rdma" in names and len(names) > 1:
         raise ValueError("RDMA domains do not map peer windows; use separate domains for other engines")
     configs = []

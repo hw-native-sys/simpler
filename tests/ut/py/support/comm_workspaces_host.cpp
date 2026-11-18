@@ -289,9 +289,7 @@ static void test_peer_import_rollback(CommHandle h, uint64_t &next_id) {
     const auto held_domains = h->domain_allocations.size();
     const int held_physical = physical_handles;
     assert(held_imports == 1 && held_peers == 1);
-    std::vector<uint32_t> masks{0, 1};
-    if ((compiled_comm_workspaces() & 2) != 0) masks.push_back(3);
-    for (uint32_t mask : masks) {
+    for (uint32_t mask : {0u, 1u}) {
         for (auto failure : {PeerFailure::IMPORT, PeerFailure::RESERVE, PeerFailure::MAP, PeerFailure::NONE}) {
             peer_failure = failure;
             fail_context_upload = failure == PeerFailure::NONE;
@@ -624,8 +622,8 @@ static void test_host_domain(const std::string &scenario) {
         return;
     }
     assert(rc == 0 && ctx != 0 && base != 0 && size >= 64);
-    assert(physical_handles == (device_context != 0 ? 2 : 0));
-    assert(peer_import_calls == (device_context != 0 ? 1 : 0));
+    assert(physical_handles == (device_context != 0 ? 1 : 0));
+    assert(peer_import_calls == 0);
     const auto *context = reinterpret_cast<const CommContext *>(ctx);
     assert(context->windowsOut[0] == base);
     if (mask != 0) {
@@ -695,7 +693,7 @@ static void test_host_domain(const std::string &scenario) {
         if (device_context != 0) {
             assert(h->domain_allocations.size() == 1 && live[1] == 1);
             const auto *device_view = reinterpret_cast<const CommContext *>(device_context);
-            assert(device_view->windowsIn[0] != 0 && device_view->windowsIn[1] != 0);
+            assert(device_view->windowsIn[0] != 0 && device_view->windowsIn[1] == 0);
             assert(comm_workspace<CommWorkspaceKind::URMA>(*device_view).addr != 0);
             assert(comm_release_domain_windows(h.get(), 2, 2, 0) == 0);
         }
@@ -954,6 +952,10 @@ int main(int argc, char **argv) {
         ) == COMM_DOMAIN_URMA_CONFIG_INVALID
     );
     assert(h->used_domain_ids.empty() && h->domain_allocations.empty() && mappings.empty());
+    for (uint32_t mask : {3u, 6u, 10u}) {
+        assert(allocate(mask, first, first_ctx) == COMM_DOMAIN_WORKSPACE_UNSUPPORTED);
+        assert(h->used_domain_ids.empty() && h->domain_allocations.empty() && mappings.empty());
+    }
     assert(allocate(0, first, first_ctx) == 0);
     assert(started[0] == 0 && started[1] == 0 && started[2] == 0);
     release(first);
@@ -1037,23 +1039,20 @@ int main(int argc, char **argv) {
 
     if ((compiled_comm_workspaces() & 2) != 0) {
         uint64_t second = 0, second_ctx = 0;
-        assert(allocate(3, first, first_ctx) == 0);
-        assert(allocate(3, second, second_ctx) == 0);
+        assert(allocate(2, first, first_ctx) == 0);
+        assert(allocate(2, second, second_ctx) == 0);
         const auto *a = reinterpret_cast<CommContext *>(first_ctx);
         const auto *b = reinterpret_cast<CommContext *>(second_ctx);
-        assert(comm_workspace<CommWorkspaceKind::SDMA>(*a).size == pto::comm::sdma::kSdmaWorkspaceBytes);
-        assert(comm_workspace<CommWorkspaceKind::SDMA>(*b).size == pto::comm::sdma::kSdmaWorkspaceBytes);
-        assert(comm_workspace<CommWorkspaceKind::SDMA>(*a).addr == comm_workspace<CommWorkspaceKind::SDMA>(*b).addr);
+        assert(comm_workspace<CommWorkspaceKind::SDMA>(*a).addr == 0);
         assert(comm_workspace<CommWorkspaceKind::URMA>(*a).addr != comm_workspace<CommWorkspaceKind::URMA>(*b).addr);
-        assert(comm_workspace<CommWorkspaceKind::SDMA>(*a).addr != comm_workspace<CommWorkspaceKind::URMA>(*a).addr);
         release(first);
-        assert(live[1] == 1 && live[0] == 1);
+        assert(live[1] == 1 && live[0] == 0);
         const auto held_mappings = mappings.size();
         const int held_physical = physical_handles;
         zero_size_engine = 1;
         const int starts = started[1];
         uint64_t zero_id = 0, zero_ctx = 0;
-        assert(allocate(3, zero_id, zero_ctx) == COMM_INITIALIZATION_ABORT_REQUIRED);
+        assert(allocate(2, zero_id, zero_ctx) == COMM_INITIALIZATION_ABORT_REQUIRED);
         assert(started[1] == starts);
         assert(comm_abort_domain_windows(h, zero_id, h->domain_allocations.at(zero_id)->nranks, 0) == 0);
         assert(mappings.size() == held_mappings && physical_handles == held_physical);
@@ -1065,12 +1064,12 @@ int main(int argc, char **argv) {
             throw_engine = failure == 1 ? 1 : -1;
             fail_context_upload = failure == 2;
             uint64_t rejected = 0, rejected_ctx = 0;
-            assert(allocate(3, rejected, rejected_ctx) == COMM_INITIALIZATION_ABORT_REQUIRED);
+            assert(allocate(2, rejected, rejected_ctx) == COMM_INITIALIZATION_ABORT_REQUIRED);
             assert(h->domain_allocations.count(rejected) == 1);
             assert(comm_abort_domain_windows(h, rejected, h->domain_allocations.at(rejected)->nranks, 0) == 0);
             assert(h->domain_allocations.count(rejected) == 0);
             assert(mappings.size() == held_mappings && physical_handles == held_physical);
-            assert(live[1] == 1 && live[0] == 1);
+            assert(live[1] == 1 && live[0] == 0);
         }
         fail_engine = throw_engine = invalid_addr_engine = invalid_size_engine = -1;
         fail_context_upload = false;
@@ -1112,6 +1111,8 @@ int main(int argc, char **argv) {
         fail_context_upload = false;
         release(first);
     }
+    assert(allocate(1, first, first_ctx) == 0);
+    release(first);
     const int sdma_starts = started[0];
     assert(allocate(0, first, first_ctx) == 0);
     assert(started[0] == sdma_starts);
@@ -1131,7 +1132,7 @@ int main(int argc, char **argv) {
     assert(allocate(1, first, first_ctx) == 0);
     if ((compiled_comm_workspaces() & 2) != 0) {
         uint64_t held = 0, held_ctx = 0;
-        assert(allocate(3, held, held_ctx) == 0);
+        assert(allocate(2, held, held_ctx) == 0);
     }
     if ((compiled_comm_workspaces() & 4) != 0) {
         uint64_t held = 0, held_ctx = 0;
