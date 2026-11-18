@@ -11,31 +11,18 @@
 
 #pragma once
 
-#include "scheduler_admission.h"
+#include "scheduler_order.h"
 #include "scheduler_issue.h"
 
 inline __aicore__ bool scheduler_execution_token_fail(
-    const SchedulerGraphAccess &graph, SchedulerLocalState *local, __gm__ SchedulerRunControl *run, int64_t task_ref
+    const SchedulerGraphAccess &graph, SchedulerLocalState *local, __gm__ SchedulerRunControl *run, int64_t task_ref,
+    const SchedulerLocalSlotState *owner = nullptr
 ) {
     scheduler_record_error(
         run, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local,
-        SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED
+        SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED, owner
     );
     return false;
-}
-
-static inline __aicore__ bool scheduler_prepare_token_binding(
-    __gm__ void *base, SchedulerLocalState *local, SchedulerExecutionToken &token, uint64_t profiling_level
-) {
-    token.metadata = scheduler_load_dispatch_metadata(base, local, token.task_ref, profiling_level);
-    if (!scheduler_task_uses_execution_tokens(token.metadata.flags)) return false;
-    auto *binding = scheduler_execution_binding_at(base, local->config.prepared, token.prepared.execution_index);
-    binding->global_context.sub_block_id = token.subtask_slot == 2 ? 1 : 0;
-    SchedulerScalarScope scalar_cache(local, SchedPhaseKind::ScalarCachePublish, token.task_ref);
-    // LocalContext is immutable after Host publication and was received above.
-    scheduler_writeback_cache_line(&binding->global_context);
-    scheduler_cache_barrier();
-    return true;
 }
 
 static inline __aicore__ bool scheduler_execution_token_receive(
@@ -47,24 +34,36 @@ static inline __aicore__ bool scheduler_execution_token_receive(
         return token.phase == SchedulerExecutionTokenPhase::WAIT_FANIN;
     if (!scheduler_task_ref_valid(graph, token.task_ref) ||
         !scheduler_task_uses_execution_tokens(scheduler_task_metadata_at(base, local, token.task_ref)->flags))
-        return scheduler_execution_token_fail(graph, local, run, token.task_ref);
+        return scheduler_execution_token_fail(graph, local, run, token.task_ref, &token);
     const auto result = scheduler_claim_execution_token<true>(
         base, local->config.prepared, local->worker_id(), token.task_ref, token.block_idx, token.subtask_slot,
         &token.prepared
     );
-    if (!result) return scheduler_execution_token_fail(graph, local, run, token.task_ref);
+    if (!result) return scheduler_execution_token_fail(graph, local, run, token.task_ref, &token);
     const uint32_t blocks = scheduler_task_metadata_at(base, local, token.task_ref)->logical_block_num;
-    const bool supplied =
-        scheduler_close_ordinary_supply(graph, base, local, run, token.task_ref, token.closes_supply, blocks);
+    const bool supplied = scheduler_close_ordinary_supply(
+        graph, base, local, run, token.task_ref, token.closes_supply, blocks, token.block_idx
+    );
     // Cancellation of a claimed handle inspects its Call, so payload receipt
     // completes even when supply publication reports an error.
     const auto received = scheduler_receive_execution_token(
         base, local->config.prepared, token.task_ref, token.block_idx, token.subtask_slot, &token.prepared
     );
     if (!supplied) return false;
-    if (!received) return scheduler_execution_token_fail(graph, local, run, token.task_ref);
-    if (!scheduler_prepare_token_binding(base, local, token, profiling_level))
-        return scheduler_execution_token_fail(graph, local, run, token.task_ref);
+    if (!received) return scheduler_execution_token_fail(graph, local, run, token.task_ref, &token);
+    if (token.sync_start && graph.native_header_offset != 0) {
+        const auto error = scheduler_observe_graph_arguments(graph, token.task_ref);
+        if (error != SchedulerGraphBindingError::NONE) {
+            scheduler_record_error(
+                run, token.task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local,
+                scheduler_graph_binding_error_site(error), &token
+            );
+            return false;
+        }
+    }
+    token.metadata = scheduler_load_dispatch_metadata(base, local, token.task_ref, profiling_level);
+    if (!scheduler_task_uses_execution_tokens(token.metadata.flags))
+        return scheduler_execution_token_fail(graph, local, run, token.task_ref, &token);
     token.acquired_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
     token.phase = SchedulerExecutionTokenPhase::WAIT_FANIN;
     return true;
@@ -85,89 +84,72 @@ static inline __aicore__ bool scheduler_execution_token_observe_fanin(
     return true;
 }
 
-static inline __aicore__ bool scheduler_dispatch_execution_token(
+static inline __aicore__ bool scheduler_select_execution_token(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    SchedulerExecutionToken &token, uint64_t profiling_level, uint32_t *direct_slot, bool *progress,
-    bool preclaim = false
+    uint32_t index, uint64_t profiling_level, uint32_t *selected, bool *progress
 ) {
-    // Local obligations can reject preparation, but never grant entry past
-    // the final shared admission and MIX checks.
-    const auto *admission = local->admission;
-    if (!preclaim && admission != nullptr &&
-        (!scheduler_task_ref_is_null(admission->pending_task_ref) ||
-         !scheduler_task_ref_is_null(admission->current_task_ref)))
+    auto &token = local->execution_tokens[index];
+    if (token.state != SchedulerDispatchSlotState::FILLING && token.state != SchedulerDispatchSlotState::READY)
         return true;
-    if (scheduler_cluster_names_lane(local->cluster_signal, local->config.self_lane)) return true;
-    uint32_t index = 0;
-    while (index < SCHEDULER_PENDING_SLOT_COUNT && local->slots[index].state != SchedulerDispatchSlotState::FREE)
-        ++index;
-    if (index == SCHEDULER_PENDING_SLOT_COUNT) return true;
-    const auto metadata = token.metadata;
-    SchedulerScalarScope transfer(local, SchedPhaseKind::ScalarExecutionTokenDispatch, token.task_ref);
-    SchedulerPredicateState predicate = token.predicate;
-    if (predicate == SchedulerPredicateState::UNEVALUATED && scheduler_task_has_predicate(metadata.flags)) {
-        const auto result = scheduler_evaluate_task_predicate(graph, token.task_ref);
-        if (result == SchedulerPredicateResult::MALFORMED)
-            return scheduler_execution_token_fail(graph, local, run, token.task_ref);
-        predicate =
-            result == SchedulerPredicateResult::PASS ? SchedulerPredicateState::PASS : SchedulerPredicateState::FAIL;
+    if (token.state != SchedulerDispatchSlotState::READY) {
+        SchedulerScalarScope scope(local, SchedPhaseKind::ScalarExecutionTokenSelect, token.task_ref);
+        if (token.predicate == SchedulerPredicateState::UNEVALUATED &&
+            scheduler_task_has_predicate(token.metadata.flags)) {
+            const auto result = scheduler_evaluate_task_predicate(graph, token.task_ref);
+            if (result == SchedulerPredicateResult::MALFORMED)
+                return scheduler_execution_token_fail(graph, local, run, token.task_ref, &token);
+            token.predicate = result == SchedulerPredicateResult::PASS ? SchedulerPredicateState::PASS :
+                                                                         SchedulerPredicateState::FAIL;
+        }
+        if (token.predicate == SchedulerPredicateState::UNEVALUATED) token.predicate = SchedulerPredicateState::PASS;
+        const uint64_t start = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
+        SchedulerReadyClaim ready{};
+        ready.task_ref = token.task_ref;
+        ready.state_probe_start_cycles = token.discovery_cycles;
+        ready.state_probe_end_cycles = token.acquired_cycles;
+        scheduler_publish_dispatch_slot(
+            base, local, index, ready, token.metadata, profiling_level, token.subtask_slot, start
+        );
+        *progress = true;
     }
-    if (predicate == SchedulerPredicateState::UNEVALUATED) predicate = SchedulerPredicateState::PASS;
-    auto &slot = local->slots[index];
-    slot.prepared = token.prepared;
-    slot.task_ref = token.task_ref;
-    slot.subtask_slot = token.subtask_slot;
-    slot.block_idx = token.block_idx;
-    slot.predicate = predicate;
-    slot.execution_token = true;
-    slot.preclaim_order = !preclaim ? UINT64_MAX : admission->scan_cursor;
-    slot.state = SchedulerDispatchSlotState::FILLING;
-    SchedulerReadyClaim ready{};
-    ready.task_ref = token.task_ref;
-    ready.state_probe_start_cycles = token.discovery_cycles;
-    ready.state_probe_end_cycles = token.acquired_cycles;
-    const uint64_t dispatch_start = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
-    token = {};
-    SchedulerDirectSlotScope direct_scope(local, direct_slot);
-    scheduler_stage_dispatch_slot<false>(base, local, {index}, ready, metadata, slot.subtask_slot);
-    scheduler_commit_dispatch_slot(
-        base, local, {index}, ready, metadata, profiling_level, slot.subtask_slot, dispatch_start
-    );
-    *progress = true;
+    bool permitted = false;
+    if (!scheduler_self_order_ready(
+            graph, base, local, run, token.rank, token.required_floor, token.sync_start, &permitted
+        ))
+        return false;
+    if (!permitted) return true;
+    *selected = index;
     return true;
 }
 
 static inline __aicore__ bool scheduler_progress_execution_tokens(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    uint64_t profiling_level, uint32_t *direct_slot, bool *progress, uint8_t *preclaim_mask = nullptr
+    uint64_t profiling_level, uint32_t *selected, bool *progress
 ) {
     SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarExecutionTokenProgress);
-    if (local == nullptr || direct_slot == nullptr || progress == nullptr) return false;
+    if (local == nullptr || selected == nullptr || progress == nullptr) return false;
     *progress = false;
-    *direct_slot = UINT32_MAX;
-    if (local->config.prepared == nullptr || local->local_ready_mask != 0) return true;
-    if (preclaim_mask != nullptr && !scheduler_can_delay_cohort_claim(local->admission)) return true;
+    *selected = UINT32_MAX;
+    if (local->config.prepared == nullptr) return true;
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
     for (uint32_t checked = 0; checked < SCHEDULER_EXECUTION_TOKEN_COUNT; ++checked) {
         const uint32_t token_index = local->execution_check_cursor++ % SCHEDULER_EXECUTION_TOKEN_COUNT;
-        if (preclaim_mask != nullptr) {
-            const uint8_t bit = static_cast<uint8_t>(1U << token_index);
-            if ((*preclaim_mask & bit) == 0) continue;
-            *preclaim_mask &= static_cast<uint8_t>(~bit);
-        }
         auto &token = local->execution_tokens[token_index];
-        if (token.phase == SchedulerExecutionTokenPhase::EMPTY) continue;
+        if (token.phase == SchedulerExecutionTokenPhase::EMPTY || token.state == SchedulerDispatchSlotState::EXECUTING)
+            continue;
         if (token.phase == SchedulerExecutionTokenPhase::TICKETED) {
             if (!scheduler_execution_token_receive(graph, base, local, run, token, profiling_level)) return false;
             *progress = true;
         }
         if (token.phase != SchedulerExecutionTokenPhase::WAIT_FANIN || token.prepared.claimed_state == 0)
-            return scheduler_execution_token_fail(graph, local, run, token.task_ref);
+            return scheduler_execution_token_fail(graph, local, run, token.task_ref, &token);
         if (!scheduler_execution_token_observe_fanin(graph, base, local, run, token, progress)) return false;
         if (token.next_fanin != token.fanin.count) continue;
-        return scheduler_dispatch_execution_token(
-            graph, base, local, run, token, profiling_level, direct_slot, progress, preclaim_mask != nullptr
-        );
+        if (!scheduler_select_execution_token(
+                graph, base, local, run, token_index, profiling_level, selected, progress
+            ))
+            return false;
+        if (*selected != UINT32_MAX) return true;
     }
     return true;
 }
@@ -176,11 +158,10 @@ static inline __aicore__ bool scheduler_progress_execution_tokens(
 // can only claim while its task remains the local issuance entry.
 static inline __aicore__ bool scheduler_try_execution_continuation(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    uint64_t profiling_level, bool *progress, SchedulerIssueSnapshot *snapshot = nullptr,
-    uint32_t *direct_slot = nullptr
+    uint64_t profiling_level, bool *progress, SchedulerIssueSnapshot *snapshot = nullptr, uint32_t *selected = nullptr
 ) {
     *progress = false;
-    if (direct_slot != nullptr) *direct_slot = UINT32_MAX;
+    if (selected != nullptr) *selected = UINT32_MAX;
     const int64_t task_ref = local->continuation_task_ref;
     local->continuation_task_ref = SCHEDULER_TASK_REF_INVALID;
     if (scheduler_task_ref_is_null(task_ref)) return true;
@@ -194,14 +175,10 @@ static inline __aicore__ bool scheduler_try_execution_continuation(
         return true;
     if (!scheduler_task_ref_valid(graph, task_ref)) return scheduler_execution_token_fail(graph, local, run, task_ref);
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
-    bool permit = !scheduler_cluster_names_lane(local->cluster_signal, local->config.self_lane);
-    if (permit && local->admission != nullptr &&
-        !scheduler_can_enter_ordinary(graph, base, local, run, local->admission, &permit))
-        return false;
-    if (!permit) return true;
     const auto &metadata = local->issue_binding.metadata;
     const uint32_t blocks = metadata.logical_block_num;
     const uint8_t lane = scheduler_metadata_single_subtask_slot(scheduler_task_lanes(metadata));
+    if (scheduler_task_requires_sync_start(metadata.flags)) return true;
     if (!scheduler_task_uses_execution_tokens(metadata.flags) || blocks == 0 || lane >= 3 ||
         scheduler_metadata_core_type_index(lane) != local->config.self_core_type)
         return scheduler_execution_token_fail(graph, local, run, task_ref);
@@ -215,7 +192,7 @@ static inline __aicore__ bool scheduler_try_execution_continuation(
     const auto fanin = local->issue_binding.fanin;
     uint32_t empty = 0;
     while (empty < SCHEDULER_EXECUTION_TOKEN_COUNT &&
-           local->execution_tokens[empty].phase != SchedulerExecutionTokenPhase::EMPTY)
+           local->execution_tokens[empty].state != SchedulerDispatchSlotState::FREE)
         ++empty;
     if (empty == SCHEDULER_EXECUTION_TOKEN_COUNT) return scheduler_execution_token_fail(graph, local, run, task_ref);
     const uint64_t discovery_start = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
@@ -229,6 +206,10 @@ static inline __aicore__ bool scheduler_try_execution_continuation(
         return true;
     }
     auto &token = local->execution_tokens[empty];
+    const auto &order = scheduler_order_for(base, local, task_ref);
+    token.rank = order.rank;
+    token.required_floor = order.required_floor[local->config.self_lane];
+    token.sync_start = scheduler_task_requires_sync_start(metadata.flags);
     token.task_ref = task_ref;
     token.block_idx = block;
     token.closes_supply = closes_supply;
@@ -237,26 +218,24 @@ static inline __aicore__ bool scheduler_try_execution_continuation(
     token.next_fanin = fanin.count;
     token.discovery_cycles = discovery_start;
     token.phase = SchedulerExecutionTokenPhase::TICKETED;
+    token.state = SchedulerDispatchSlotState::FILLING;
     if (!scheduler_execution_token_receive(graph, base, local, run, token, profiling_level)) return false;
     *progress = true;
-    if (direct_slot != nullptr) {
+    if (selected != nullptr) {
         if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
-        return scheduler_dispatch_execution_token(
-            graph, base, local, run, token, profiling_level, direct_slot, progress
-        );
+        return scheduler_select_execution_token(graph, base, local, run, empty, profiling_level, selected, progress);
     }
     return true;
 }
 
 static inline __aicore__ __attribute__((noinline)) bool scheduler_refill_execution_tokens(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    uint64_t profiling_level, bool *progress, SchedulerIssueSnapshot *snapshot = nullptr,
-    uint32_t *direct_slot = nullptr
+    uint64_t profiling_level, bool *progress, SchedulerIssueSnapshot *snapshot = nullptr, uint32_t *selected = nullptr
 ) {
     SchedulerScalarScope scalar_scope(local, SchedPhaseKind::ScalarExecutionTokenRefill);
     if (base == nullptr || local == nullptr || run == nullptr || progress == nullptr) return false;
     *progress = false;
-    if (direct_slot != nullptr) *direct_slot = UINT32_MAX;
+    if (selected != nullptr) *selected = UINT32_MAX;
     if (local->config.prepared == nullptr) return true;
     const uint64_t discovery_start = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
     uint32_t count = scheduler_execution_token_count(local);
@@ -279,7 +258,7 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_refill_executi
         const auto fanin = local->issue_binding.fanin;
         uint32_t empty = 0;
         while (empty < SCHEDULER_EXECUTION_TOKEN_COUNT &&
-               local->execution_tokens[empty].phase != SchedulerExecutionTokenPhase::EMPTY)
+               local->execution_tokens[empty].state != SchedulerDispatchSlotState::FREE)
             ++empty;
         if (empty == SCHEDULER_EXECUTION_TOKEN_COUNT)
             return scheduler_execution_token_fail(graph, local, run, task_ref);
@@ -291,6 +270,23 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_refill_executi
             if (local->issue_task_ref == task_ref) local->issue_ticket_exhausted = true;
             return true;
         }
+        const bool sync = scheduler_task_requires_sync_start(metadata.flags);
+        if (sync && local->last_sync_self_ref == task_ref) return true;
+        uint32_t rank = 0;
+        uint32_t required_floor = 0;
+        const auto read_order = [&]() __aicore__ {
+            const auto &order = scheduler_order_for(base, local, task_ref);
+            rank = order.rank;
+            required_floor = order.required_floor[local->config.self_lane];
+        };
+        if (sync) {
+            read_order();
+            bool permit = false;
+            if (!scheduler_self_order_ready(graph, base, local, run, rank, required_floor, true, &permit)) return false;
+            if (!permit) return true;
+        }
+        const bool trace_claim = sync && scheduler_protocol_enabled(local);
+        const uint64_t before = trace_claim ? scheduler_protocol_cycles(local) : 0;
         uint32_t block = blocks;
         bool closes_supply = false;
         if (!scheduler_claim_ordinary_block(graph, base, local, run, task_ref, blocks, &block, &closes_supply))
@@ -300,7 +296,21 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_refill_executi
             if (local->issue_task_ref == task_ref) local->issue_ticket_exhausted = true;
             return true;
         }
+        if (sync) {
+            local->last_sync_self_ref = task_ref;
+            if (trace_claim) {
+                scheduler_protocol_block_claim(
+                    base, local, task_ref, block, before, scheduler_protocol_cycles(local), closes_supply ? blocks : 0
+                );
+                scheduler_protocol_member(base, local, task_ref, false);
+            }
+        } else {
+            read_order();
+        }
         auto &token = local->execution_tokens[empty];
+        token.rank = rank;
+        token.required_floor = required_floor;
+        token.sync_start = sync;
         token.task_ref = task_ref;
         token.block_idx = block;
         token.closes_supply = closes_supply;
@@ -309,13 +319,14 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_refill_executi
         token.fanin = fanin;
         token.next_fanin = 0;
         token.phase = SchedulerExecutionTokenPhase::TICKETED;
+        token.state = SchedulerDispatchSlotState::FILLING;
         if (!scheduler_execution_token_receive(graph, base, local, run, token, profiling_level)) return false;
         *progress = true;
         if (!scheduler_execution_token_observe_fanin(graph, base, local, run, token, progress)) return false;
-        if (direct_slot != nullptr && token.next_fanin == token.fanin.count) {
+        if (selected != nullptr && token.next_fanin == token.fanin.count) {
             if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
-            return scheduler_dispatch_execution_token(
-                graph, base, local, run, token, profiling_level, direct_slot, progress
+            return scheduler_select_execution_token(
+                graph, base, local, run, empty, profiling_level, selected, progress
             );
         }
         // Reconsider owned executions before taking another task's ticket.

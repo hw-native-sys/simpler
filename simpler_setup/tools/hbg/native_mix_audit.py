@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""MIX resource handshakes and sync retirement frontiers, independent of TaskDone."""
+"""Check fixed cluster ownership, real lane returns and non-overlapping descriptor generations."""
 
 from collections import defaultdict
 
@@ -16,43 +16,47 @@ from .native_causality import MAX, MIX, SYNC, point, require
 
 def _group(audit, block):
     owner = block["owner"]
-    ordered = bool(audit.tasks[owner["task_ref"]]["flags"] & SYNC)
-    ref, worker, group = owner["task_ref"], owner["worker_index"], owner["group_seq"]
-    require(audit.positions[worker][1] == 0 and 0 < group < MAX, "invalid GM group coordinator/sequence")
-    audit.chain(owner, "claim_after", "publish_before", "publish_after", "releases_observed", "completion_before")
-    publication = audit.causal.bounded(
-        ("group", ref, owner["block_idx"]), point(owner, "publish_before"), point(owner, "publish_after")
+    ref, cluster, proxy, generation = (owner[k] for k in ("task_ref", "cluster_index", "worker_index", "group_seq"))
+    mask = owner["active_mask"]
+    peers = audit.workers[proxy]["cluster_workers"]
+    active = [lane for lane in range(3) if mask & 1 << lane]
+    accountant_lane = 1 if 1 in active else active[0]
+    require(
+        audit.positions[proxy] == (cluster, 1) and 0 < generation < MAX and generation % 2 == 1,
+        "invalid MIX publisher or generation",
     )
-    lanes = {row["index"]: row for row in block["lanes"]}
-    resources = owner["active_mask"] | 1
-    require(set(lanes) == {i for i in range(3) if resources & (1 << i)}, "missing or extra GM resource lane")
-    expected_acks = [group if resources & (1 << i) else 0 for i in range(3)]
-    require(owner["released_seq"] == expected_acks, "stale GM release observation")
-    arrivals, releases = {}, {}
-    for index, lane in lanes.items():
-        arrivals[index] = audit.causal.bounded(
-            ("arrive", ref, owner["block_idx"], index), point(lane, "arrive_before"), point(lane, "arrive_after")
-        )
-        releases[index] = audit.causal.bounded(
-            ("release", ref, owner["block_idx"], index), point(lane, "release_before"), point(lane, "release_after")
-        )
-    mapping = [lane if owner["active_mask"] & (1 << lane) else 255 for lane in range(3)]
-    for index, lane in lanes.items():
+    require(owner["completion_worker"] == peers[accountant_lane], "MIX completion from the wrong computing member")
+    audit.chain(owner, "claim_after", "publish_before", "publish_after")
+    audit.chain(owner, "releases_observed", "completion_before", "completion_after")
+    publication = audit.causal.bounded(
+        ("MIX descriptor", ref, owner["block_idx"]), point(owner, "publish_before"), point(owner, "publish_after")
+    )
+    lanes = {lane["index"]: lane for lane in block["lanes"]}
+    require(set(lanes) == set(active), "MIX members differ from the computing mask")
+    values = [generation if lane in active else 0 for lane in range(3)]
+    mapping = [lane if lane in active else 255 for lane in range(3)]
+    require(owner["released_seq"] == values, "incomplete MIX FIN observation")
+    arrivals = []
+    for i, lane in lanes.items():
         audit.record_identity(lane, ref)
-        peer = audit.workers[worker]["cluster_workers"][index]
         require(
-            lane["worker_index"] == peer
-            and lane["lane"] == index
-            and lane["cluster_index"] == owner["cluster_index"]
+            lane["worker_index"] == peers[i]
+            and lane["lane"] == i
+            and lane["cluster_index"] == cluster
             and lane["block_idx"] == owner["block_idx"]
             and lane["block_num"] == owner["block_num"]
-            and lane["active_mask"] == owner["active_mask"]
-            and lane["group_seq"] == group
-            and lane["resource_mask"] == resources
+            and lane["group_seq"] == generation
+            and lane["active_mask"] == lane["resource_mask"] == mask
             and lane["lane_subtasks"] == mapping,
-            "GM descriptor identity/placement mismatch",
+            "MIX descriptor identity or placement mismatch",
         )
-        require(lane["arrived_seq"] == expected_acks, "stale GM arrival observation")
+        require(lane["arrived_seq"] == values, "incomplete MIX group arrival observation")
+        audit.check_opposite_source(
+            ref,
+            peers[i],
+            {"observed_mix_floor": 0, "observed_self_floor": lane["observed_self_floor"]},
+            point(lane, "arrive_before"),
+        )
         audit.chain(
             lane,
             "descriptor_ready",
@@ -62,135 +66,63 @@ def _group(audit, block):
             "release_before",
             "release_after",
         )
-        member = audit.member(ref, peer) if ordered else None
-        if member is not None:
-            audit.before(
-                point(member, "observed"), point(lane, "descriptor_ready"), "GM lane bypassed its local frontier"
-            )
         audit.causal.add(publication, point(lane, "descriptor_ready"))
-        if index == 0:
-            audit.before(
-                point(owner, "publish_after"),
-                point(lane, "descriptor_ready"),
-                "coordinator used its unpublished descriptor",
+        arrival = audit.causal.bounded(
+            ("arrive", ref, owner["block_idx"], i), point(lane, "arrive_before"), point(lane, "arrive_after")
+        )
+        release = audit.causal.bounded(
+            ("FIN", ref, owner["block_idx"], i), point(lane, "release_before"), point(lane, "release_after")
+        )
+        arrivals.append(arrival)
+        audit.causal.add(release, point(owner, "releases_observed"))
+        if audit.tasks[ref]["flags"] & SYNC:
+            member = audit.member(ref, peers[i])
+            require(
+                member["observed_self_floor"] == lane["observed_self_floor"], "inconsistent MIX self-floor observation"
             )
-        for arrival in arrivals.values():
+            audit.before(
+                point(lane, "descriptor_ready"), point(member, "committed"), "member committed to unseen descriptor"
+            )
+            audit.before(point(member, "committed"), point(lane, "arrive_before"), "arrival without a commitment")
+            audit.before(point(lane, "release_after"), point(member, "retired"), "member retired before publishing FIN")
+        execution = audit.executions[block["index"] + active.index(i)]
+        require(
+            execution["worker_index"] == peers[i] and execution["group_seq"] == generation,
+            "execution belongs to another MIX generation or lane",
+        )
+        require(
+            execution["observed_self_floor"] == lane["observed_self_floor"], "inconsistent MIX self-floor observation"
+        )
+        require(
+            lane["arrivals_observed"][0] <= execution["publication_before_cycles"],
+            "MIX payload publication before local group handshake",
+        )
+        audit.causal.add(point(lane, "arrivals_observed"), audit.payload_points[execution["index"]][0])
+        audit.before(
+            point(execution, "trace_published"), point(lane, "release_before"), "MIX FIN before local trace/return"
+        )
+    for lane in lanes.values():
+        for arrival in arrivals:
             audit.causal.add(arrival, point(lane, "arrivals_observed"))
-        audit.causal.add(releases[index], point(owner, "releases_observed"))
-        if member is not None:
-            audit.before(point(lane, "release_after"), point(member, "closed"), "GM member closed before lane release")
-        else:
-            require(lane["previous_lane_seq"] == [0, 0, 0], "cluster group fabricated a GM predecessor")
-            frontier = owner["sync_frontier"][index]
-            for sync_block in audit.blocks.values():
-                sync_owner = sync_block["owner"]
-                sync_ref = sync_owner["task_ref"]
-                if (
-                    audit.tasks[sync_ref]["flags"] & SYNC
-                    and sync_owner["worker_index"] == peer
-                    and audit.orders[sync_ref] >= frontier
-                ):
-                    audit.before(
-                        point(lane, "release_after"),
-                        point(sync_owner, "claim_before"),
-                        "sync claimed a position before its ordinary cluster group released",
-                    )
-        if mapping[index] != 255:
-            trace = block["index"] + (owner["active_mask"] & ((1 << index) - 1)).bit_count()
-            execution = audit.executions[trace]
-            require(
-                execution["worker_index"] == peer
-                and execution["subtask_slot"] == index
-                and execution["group_seq"] == group,
-                "GM execution belongs to another group/lane",
-            )
-            require(
-                lane["arrivals_observed"][0] <= execution["publication_before_cycles"],
-                "GM payload prepared before resources arrived",
-            )
-            audit.before(
-                point(lane, "arrivals_observed"), point(execution, "permit"), "GM entered before resource handshake"
-            )
-            audit.before(
-                point(execution, "trace_published"),
-                point(lane, "release_before"),
-                "GM lane released before output/trace retirement",
-            )
-    audit.before(
-        point(lanes[0], "release_after"),
-        point(owner, "releases_observed"),
-        "coordinator aggregate preceded its release",
-    )
 
 
 def audit_mix(audit):
     clusters = defaultdict(list)
-    task_clusters = defaultdict(list)
-    block_by_owner = {}
     for block in audit.blocks.values():
         owner = block["owner"]
-        if not audit.tasks[owner["task_ref"]]["flags"] & MIX:
-            continue
-        _group(audit, block)
-        block_by_owner[id(owner)] = block
-        clusters[(owner["cluster_index"], bool(audit.tasks[owner["task_ref"]]["flags"] & SYNC))].append(owner)
-        task_clusters[(owner["task_ref"], owner["cluster_index"])].append(owner)
-    for (_, ordered), groups in clusters.items():
-        groups.sort(key=lambda row: row["group_seq"])
+        if audit.tasks[owner["task_ref"]]["flags"] & MIX:
+            _group(audit, block)
+            clusters[owner["cluster_index"]].append(owner)
+    for groups in clusters.values():
+        groups.sort(key=lambda owner: owner["group_seq"])
         require(
-            [row["group_seq"] for row in groups] == list(range(1, len(groups) + 1))
-            if ordered
-            else [row["group_seq"] for row in groups] == list(range(1, 2 * len(groups), 2)),
-            "missing or duplicate cluster group sequence",
+            [g["group_seq"] for g in groups] == list(range(1, 2 * len(groups), 2)),
+            "missing or duplicated MIX generation",
         )
-        previous_lane_seq = [0, 0, 0]
-        for owner in groups:
-            block = block_by_owner[id(owner)]
-            for lane in block["lanes"]:
-                require(
-                    lane["previous_lane_seq"] == (previous_lane_seq if ordered else [0, 0, 0]),
-                    "wrong per-lane group predecessor",
-                )
-            for lane in block["lanes"]:
-                previous_lane_seq[lane["lane"]] = owner["group_seq"]
-        for previous, current in zip(groups, groups[1:], strict=False):
+        for previous, current in zip(groups, groups[1:]):
+            require(previous["order_key"] <= current["order_key"], "decreasing MIX rank within a cluster")
             audit.before(
                 point(previous, "completion_after"),
-                point(current, "claim_before" if ordered else "staged"),
-                "MIX record reused before prior group retired",
+                point(current, "publish_before"),
+                "MIX descriptor reused before the previous accountant retired it",
             )
-    coordinators = {cluster: worker for worker, (cluster, lane) in audit.positions.items() if lane == 0}
-    coordinator_members = defaultdict(list)
-    for member in audit.members.values():
-        if audit.positions[member["worker_index"]][1] == 0:
-            coordinator_members[member["worker_index"]].append(member)
-    for members in coordinator_members.values():
-        members.sort(key=lambda row: row["order_key"])
-    for ref, task in audit.tasks.items():
-        if not task["flags"] & MIX or not task["flags"] & SYNC:
-            continue
-        order = audit.orders[ref]
-        for worker in audit.task_members[ref]:
-            member = audit.member(ref, worker)
-            cluster, lane = audit.positions[worker]
-            groups = task_clusters[(ref, cluster)]
-            last = max((row["group_seq"] for row in groups), default=0)
-            frontier = member["close_frontier"]
-            require(member["last_group_seq"] == last, "stale Mix group at retirement")
-            require(order < frontier <= len(audit.orders), "invalid Mix close frontier")
-            if lane == 0:
-                require(frontier == order + 1, "coordinator skipped its current close frontier")
-                for group in groups:
-                    audit.causal.add(point(group, "completion_after"), point(member, "closed"))
-                continue
-            require(member["closed_cursor"] == MAX, "Mix AIV close cursor is not an actual observation")
-            observed = audit.causal.bounded(
-                ("mix_close_frontier", ref, worker),
-                ("event", worker, member["closed"][1] - 1),
-                point(member, "closed"),
-            )
-            coordinator = coordinators[cluster]
-            prior = [row for row in coordinator_members[coordinator] if row["order_key"] < frontier]
-            require(prior and prior[-1]["order_key"] >= order, "frontier lacks coordinator retirement")
-            audit.causal.add(point(prior[-1], "closed"), observed)
-            audit.causal.add(audit.admission_points[audit.raw["admission_log"][frontier - 1]], observed)

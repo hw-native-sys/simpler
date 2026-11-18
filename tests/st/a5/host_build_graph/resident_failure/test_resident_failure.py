@@ -29,7 +29,7 @@ from simpler.worker import Worker
 
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.scene_test import _pto_isa_compile_cache_token, compile_chip_callable_spec
-from simpler_setup.tools.hbg.native_causality import audit_native_protocol
+from simpler_setup.tools.hbg.native_causality import MIX, SYNC, audit_native_protocol
 from simpler_setup.tools.hbg.native_protocol import has_native_graph, read_native_protocol
 
 _ROOT = Path(__file__).resolve().parents[5]
@@ -124,7 +124,8 @@ def _compile(platform, *, native_graph=False):
 
 def _args(worker, buffers, values, blocks, mask, lane, stall_ms):
     args = TaskArgs()
-    for buffer, value in zip(buffers, values, strict=True):
+    assert len(buffers) == len(values)
+    for buffer, value in zip(buffers, values):
         value.zero_()
         worker.copy_to(buffer, value)
         args.add_tensor(buffer.tensor(shapes=tuple(value.shape), dtype=DataType.INT64), TensorArgType.INOUT)
@@ -163,7 +164,7 @@ def _check_output(values, capacity, blocks, mask, *, failed):
     torch.testing.assert_close(records, expected, rtol=0, atol=0)
     summary = torch.zeros_like(values[1])
     if not failed:
-        summary[0] = blocks * mask.bit_count()
+        summary[0] = blocks * bin(mask).count("1")
     torch.testing.assert_close(values[1], summary, rtol=0, atol=0)
 
 
@@ -173,7 +174,7 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
     assert protocol["scheduler_error"] == 10
     assert protocol["first_error"]["site"] in (95, 102)
     worker_count = protocol["active_worker_count"]
-    assert worker_count > 0 and protocol["worker_count"] == worker_count
+    assert worker_count > 0 and protocol["worker_count"] == worker_count == 3 * protocol["cluster_count"]
     assert worker_count == raw["metadata"]["num_cores"]
     assert len(protocol["workers"]) == worker_count
     assert {worker["worker_index"] for worker in protocol["workers"]} == set(range(worker_count))
@@ -233,10 +234,9 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
     controls = {control["task_ref"]: control for control in control_rows}
     assert len(controls) == len(control_rows) == len(protocol["tasks"])
     assert set(controls) == {task["task_ref"] for task in protocol["tasks"]}
-    total_subtasks = blocks * root["active_mask"].bit_count()
+    total_subtasks = blocks * bin(root["active_mask"]).count("1")
     assert controls[root["task_ref"]]["completed_subtasks"] < total_subtasks
     assert controls[consumer["task_ref"]]["completed_subtasks"] == 0
-    positions = protocol["cluster_count"] * (2 if mask in (2, 4) else 1)
     assert protocol.get("schema") == "hbg-native-protocol"
     for task in protocol["tasks"]:
         control = controls[task["task_ref"]]
@@ -244,18 +244,8 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
         assert type(seal) is int and seal >= 0
         # Supply closure covers ordinary tasks too; it does not prove execution completion.
         assert seal == 0 or seal == control["next_block"] == task["block_num"]
-    minimum_blocks = 2
-    sync = bool(root.get("flags", 0) & 16)
-    uses_tickets = sync and minimum_blocks <= blocks < positions
-    tickets = controls[root["task_ref"]]["claim_tickets"]
-    assert type(tickets) is int
-    assert 0 <= controls[root["task_ref"]]["next_block"] <= blocks
-    if uses_tickets:
-        assert 1 <= tickets <= positions
-        assert controls[root["task_ref"]]["next_block"] <= min(blocks, tickets)
-    else:
-        assert tickets == 0
-    assert controls[consumer["task_ref"]]["claim_tickets"] == 0
+        assert 0 <= control["next_block"] <= task["block_num"]
+    _check_failed_block_claim(protocol, root, execution)
     if has_native_graph(protocol):
         enters = [node["node_ref"] for node in protocol["node_map"] if node["kind"] == 3]
         exits = [node["node_ref"] for node in protocol["node_map"] if node["kind"] == 4]
@@ -265,6 +255,49 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
     else:
         assert protocol["resolved_task_count"] == 0
     assert all(controls[ref]["state"] == 0 for ref in (root["task_ref"], consumer["task_ref"]))
+
+
+def _check_failed_block_claim(protocol, root, execution):
+    flags = root["flags"]
+    assert bool(flags & MIX) == (bin(root["active_mask"]).count("1") > 1)
+    workers = {row["index"]: row for row in protocol["workers"]}
+    worker = workers[execution["worker_index"]]
+    cluster = worker["cluster_workers"]
+    assert worker["worker_index"] == worker["index"] and worker["index"] in cluster
+    assert len(cluster) == len(set(cluster)) == 3
+    assert all(
+        peer in workers
+        and workers[peer]["cluster_index"] == worker["cluster_index"]
+        and workers[peer]["cluster_workers"] == cluster
+        for peer in cluster
+    )
+    assert 0 <= worker["cluster_index"] == execution["cluster_index"] < protocol["cluster_count"]
+    assert execution["run_epoch"] == protocol["run_epoch"]
+    # An interrupted claim may only have its before stamp. Only a published
+    # acquisition can account for the block that actually reached the kernel.
+    claims = [
+        row["owner"]
+        for row in protocol["blocks"]
+        if row["owner"] is not None and row["owner"]["task_ref"] == root["task_ref"] and row["owner"]["claim_after"][1]
+    ]
+    if not flags & (MIX | SYNC):
+        assert not claims
+        return
+    by_block = {claim["block_idx"]: claim for claim in claims}
+    assert len(by_block) == len(claims) and all(0 <= block < root["block_num"] for block in by_block)
+    assert execution["block_idx"] in by_block
+    claim = by_block[execution["block_idx"]]
+    assert claim["run_epoch"] == execution["run_epoch"] and claim["cluster_index"] == worker["cluster_index"]
+    assert 0 < claim["claim_before"][1] < claim["claim_after"][1]
+    if flags & MIX:
+        assert claim["worker_index"] == cluster[1]
+        generation = claim["group_seq"]
+        assert generation == execution["group_seq"] and generation > 0 and generation % 2 == 1
+        # The proxy and executing lane share the device counter. Their stamp sequences are local to each worker.
+        assert 0 < claim["claim_before"][0] <= claim["claim_after"][0] < execution["entry"][0]
+    else:
+        assert claim["worker_index"] == execution["worker_index"]
+        assert claim["claim_after"][1] < execution["entry"][1]
 
 
 # Compilation, healthy/fault/recovery runs and diagnostic decoding share this case budget.
@@ -658,7 +691,8 @@ def _run_pass(  # noqa: PLR0912 -- one Worker owns healthy, failed, and cleanup 
             # not readable evidence. Host-exported failure records remain
             # mandatory and must not masquerade as a successful capture.
             if not (failed and nonreturning):
-                for buffer, value in zip(buffers, values, strict=True):
+                assert len(buffers) == len(values)
+                for buffer, value in zip(buffers, values):
                     worker.copy_from(value, buffer)
                 _check_output(values, capacity, launched, mask, failed=failed)
             _check_two_wave_topology(raw["aicore_protocol"], launched, mask, two_wave)

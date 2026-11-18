@@ -98,7 +98,7 @@ def _capture(*, function_min_cycles=0, include_token_functions=True):
             ("scalar_execution_token_refill", 0, 1, 1),
             ("scalar_execution_token_receive", 0, 1, 2),
             ("scalar_execution_token_fanin", 1, 2, 1),
-            ("scalar_execution_token_dispatch", 2, 3, 1),
+            ("scalar_execution_token_select", 2, 3, 1),
         ):
             if not include_token_functions:
                 continue

@@ -363,8 +363,6 @@ __aicore__ bool bootstrap_ready_graph(
         }
     }
     // INIT proves this cluster's old SSBUF state can no longer be observed.
-    for (uint32_t slot_index = 0; slot_index < SCHEDULER_PENDING_SLOT_COUNT; ++slot_index)
-        scheduler_initialize_free_slot(&scheduler->slots[slot_index]);
     if (phase_timing_enabled) stats->target_bootstrap_end_cycles = scheduler_cycles();
 
     // Prepare the first executable wave while the sole DMB launch gate is
@@ -382,12 +380,12 @@ __aicore__ bool bootstrap_ready_graph(
     );
     if (fill_failed) return false;
 
-    // Each physical lane publishes success once, after its bounded first fill.
+    // AIC and AIV1 set their own DONE bits after the first fill. AIV0 waits for both before counting the cluster.
     scheduler_cache_barrier();
     if (scheduler_read_worker_error(run_control, scheduler->worker_id()) != 0) return false;
     if (!scheduler->is_mix_coordinator()) {
         const uint64_t done =
-            scheduler->config.self_lane == 1 ? SCHEDULER_BOOTSTRAP_AIV0_DONE : SCHEDULER_BOOTSTRAP_AIV1_DONE;
+            scheduler->config.self_lane == 0 ? SCHEDULER_BOOTSTRAP_AIC_DONE : SCHEDULER_BOOTSTRAP_AIV1_DONE;
         const uint64_t previous = scheduler_gm_fetch_add(cluster_state, done);
         if ((previous & SCHEDULER_BOOTSTRAP_CLUSTER_INIT) == 0 || (previous & done) != 0 ||
             previous > SCHEDULER_BOOTSTRAP_CLUSTER_DONE) {
@@ -539,99 +537,59 @@ __aicore__ bool run_ready_dispatch_loop(
         SchedulerScalarIteration scalar_iteration(phase_timing_enabled ? &context->profiling->scalar : nullptr);
 
         bool scheduler_progress = false;
-        uint32_t direct_slot = UINT32_MAX;
+        uint32_t selected = UINT32_MAX;
         const bool service_due = ++execution_service_rounds >= 4;
         if (service_due) {
             execution_service_rounds = 0;
             if (!service_async(scheduler_progress) || !service_controls(scheduler_progress)) return false;
         }
-        bool token_progress = false;
-        if (context->local_ready_mask == 0 &&
-            !scheduler_progress_execution_tokens(
-                graph, scheduler_state_base, context, run_control, profiling_level, &direct_slot, &token_progress
-            ))
-            return false;
-        scheduler_progress = scheduler_progress || token_progress;
-        if (direct_slot == UINT32_MAX && context->local_ready_mask == 0) {
-            execution_service_rounds = 0;
-            if (!service_controls(scheduler_progress)) return false;
-            bool fill_failed = false;
-            const bool dispatch_progress = scheduler_fill_own_slots<record_protocol>(
-                graph, scheduler_state_base, context, run_control, profiling_level, &fill_failed, &direct_slot
-            );
-            scheduler_progress = dispatch_progress || scheduler_progress;
-            if (fill_failed) return false;
-        }
-
+        bool failed = false;
+        const bool advanced = scheduler_fill_own_slots<record_protocol>(
+            graph, scheduler_state_base, context, run_control, profiling_level, &failed, &selected
+        );
+        if (failed) return false;
+        scheduler_progress = scheduler_progress || advanced;
+        if (selected == UINT32_MAX && !service_controls(scheduler_progress)) return false;
         if (phase_timing_enabled && scheduler_progress && idle_active) {
             stats->deferred_idle_start = idle_start_cycles;
             stats->deferred_idle_end = idle_candidate_start;
             idle_active = false;
         }
 
-        int32_t ready_slot = -1;
-        uint64_t ready_scan_start = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
-        SchedulerScalarScope scalar_scan(
-            direct_slot == UINT32_MAX ? context : nullptr, SchedPhaseKind::ScalarExecutorScan, -1, ready_scan_start
-        );
-        {
-            uint32_t local_slot = direct_slot;
-            if (direct_slot != UINT32_MAX || context->local_ready_mask != 0) {
-                const bool selected = direct_slot != UINT32_MAX || scheduler_local_ready_peek(context, &local_slot);
-                if (!selected || local_slot >= SCHEDULER_PENDING_SLOT_COUNT ||
-                    context->slots[local_slot].state != SchedulerDispatchSlotState::READY ||
-                    (direct_slot != UINT32_MAX &&
-                     ((context->local_ready_mask & (1U << local_slot)) != 0 ||
-                      scheduler_prepared_phase(context->slots[local_slot].prepared.claimed_state) !=
-                          SchedulerPreparedPhase::CLAIMED ||
-                      scheduler_prepared_execute_owner(context->slots[local_slot].prepared.claimed_state) !=
-                          context->worker_id()))) {
-                    scheduler_record_error(
-                        run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph,
-                        context, SchedulerErrorSite::EXECUTOR_PREFERRED_SLOT_INVALID
-                    );
-                    return false;
-                }
-                ready_slot = static_cast<int32_t>(local_slot);
-                if (context->async != nullptr && context->async->business_returns >= 4) {
-                    if (!service_async(scheduler_progress)) return false;
-                }
-                {
-                    bool permit = false;
-                    if (!scheduler_can_enter_dispatch_slot<record_protocol>(
-                            graph, scheduler_state_base, context, run_control, local_slot, &permit
-                        ))
-                        return false;
-                    if (!permit) {
-                        if (direct_slot != UINT32_MAX) scheduler_local_ready_publish(context, local_slot);
-                        ready_slot = -1;
-                        // A blocked READY slot must not hide the services that
-                        // can release its admission or cluster restriction.
-                        if (!service_async(scheduler_progress) || !service_controls(scheduler_progress)) return false;
-                        bool service_failed = false;
-                        const bool advanced = scheduler_service_cooperative_slots<record_protocol>(
-                            graph, scheduler_state_base, context, run_control, profiling_level, &service_failed
-                        );
-                        scheduler_progress = scheduler_progress || advanced;
-                        if (service_failed) return false;
-                    }
-                }
-            }
-        }
-        scalar_scan.close();
-        if (ready_slot >= 0) {
-            scalar_iteration.progress = true;
-            uint32_t slot_index = static_cast<uint32_t>(ready_slot);
-            if (direct_slot != UINT32_MAX) {
-                context->slots[slot_index].state = SchedulerDispatchSlotState::EXECUTING;
-            } else if (!scheduler_local_ready_execute(context, slot_index)) {
+        if (selected != UINT32_MAX) {
+            auto &candidate = context->execution_at(selected);
+            if (candidate.state != SchedulerDispatchSlotState::READY ||
+                scheduler_prepared_phase(candidate.prepared.claimed_state) != SchedulerPreparedPhase::CLAIMED ||
+                scheduler_prepared_execute_owner(candidate.prepared.claimed_state) != context->worker_id()) {
                 scheduler_record_error(
-                    run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
-                    SchedulerErrorSite::EXECUTOR_INVALID_DISPATCH_SLOT
+                    run_control, candidate.task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                    SchedulerErrorSite::EXECUTOR_PREFERRED_SLOT_INVALID
                 );
                 return false;
             }
-            SchedulerLocalSlotState *local_slot = &context->slots[slot_index];
+            if (context->async != nullptr && context->async->business_returns >= 4 &&
+                !service_async(scheduler_progress))
+                return false;
+            bool permit = false;
+            if (!scheduler_can_enter_execution<record_protocol>(
+                    graph, scheduler_state_base, context, run_control, selected, &permit
+                ))
+                return false;
+            if (!permit) {
+                // Keep the owner in place and serve the obligation blocking entry.
+                selected = UINT32_MAX;
+                if (!service_async(scheduler_progress) || !service_controls(scheduler_progress)) return false;
+                if (!scheduler_service_groups(
+                        graph, scheduler_state_base, context, run_control, profiling_level, &scheduler_progress
+                    ))
+                    return false;
+            }
+        }
+        if (selected != UINT32_MAX) {
+            scalar_iteration.progress = true;
+            const uint32_t slot_index = selected;
+            auto *local_slot = &context->execution_at(slot_index);
+            local_slot->state = SchedulerDispatchSlotState::EXECUTING;
             const int32_t timing_slot = context->timing_slot(slot_index);
             auto *call = scheduler_prepared_call_at(
                 scheduler_state_base, context->config.prepared, local_slot->prepared.execution_index
@@ -712,10 +670,8 @@ __aicore__ bool run_ready_dispatch_loop(
             else execute_task(function_address, call->args);
             if (pmu_reg_base != 0) {
                 pmu_aicore_end();
-                // The subtask this lane ran, not the lane: a task's subtasks
-                // are placed on whichever lanes of the cluster are free, so a
-                // mix task's three records are told apart by this and nothing
-                // else.
+                // PMU records use the logical subtask slot. MIX fixes each subtask to its
+                // named cluster lane, while a pure vector block can run on either AIV.
                 stage_task_pmu(
                     scheduler_state_base, context, task_ref, local_slot->subtask_slot, local_slot->block_idx,
                     pmu_reg_base
@@ -727,7 +683,7 @@ __aicore__ bool run_ready_dispatch_loop(
             if (function_address != 0) work_capture.last_end = kernel_end;
             SchedulerScalarScope scalar_seal(context, SchedPhaseKind::ScalarSeal, task_ref, kernel_end);
             if (commit_executor_trace) stage_task_trace_before_completion(&execution_trace, kernel_start, kernel_end);
-            if (commit_executor_trace) context->profiling->executor_traces[slot_index] = execution_trace;
+            if (commit_executor_trace) context->profiling->executor_trace = execution_trace;
             // The kernel receives only call->args and its GM contexts. No
             // private slot/admission address escapes, and this core cannot run
             // its scheduler while inside the kernel. Dispatch's validated task
@@ -763,7 +719,7 @@ __aicore__ bool run_ready_dispatch_loop(
             }
             const bool possible_async = execution_group_index != pto2::resident::ASYNC_INVALID_INDEX;
             local_slot->completion_credits = 1 + static_cast<uint8_t>(possible_async && !has_deferred);
-            if (possible_async && !has_deferred && (local_slot->cluster_mix || local_slot->gm_mix)) {
+            if (possible_async && !has_deferred && local_slot->cluster_mix) {
                 const auto *counter = scheduler_completion_counter_at(
                     scheduler_state_base, context->config.completion_counters_offset, task_ref
                 );
@@ -858,8 +814,11 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     std::conditional_t<WithProfiling, SchedulerLocalProfilingState, SchedulerNoProfilingState> profile{};
     SchedulerLocalState scheduler_local_state{};
     SchedulerScalarBinding scalar_binding;
-    SchedulerAdmissionLocalState admission{};
     SchedulerAsyncLocalState async{};
+    // The A5 toolchain configures a 32 KiB stack shared by this state, callees and spills.
+    constexpr size_t resident_state_bytes = sizeof(graph) + sizeof(stats) + sizeof(profile) +
+                                            sizeof(scheduler_local_state) + sizeof(scalar_binding) + sizeof(async);
+    static_assert(resident_state_bytes < 0x8000, "resident scheduler state exhausts the A5 AICore stack");
     if constexpr (WithProfiling) scheduler_local_state.profiling = &profile;
     // READY publishes a new image even when its GM address was used by an older
     // run. Observe it before local-config validation reads the native header.
@@ -886,8 +845,7 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
         }
     }
     if (config_valid) {
-        config_valid = scheduler_initialize_admission(scheduler_state_base, &scheduler_local_state, &admission);
-        if (config_valid && admission.capacity != 0) scheduler_local_state.admission = &admission;
+        config_valid = scheduler_initialize_order(scheduler_state_base, &scheduler_local_state);
     }
     if (config_valid) {
         auto *summary = scheduler_state_at<SchedulerGraphSummary>(
@@ -971,9 +929,8 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     while (stats.exit_observed_cycles == 0 &&
            static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) != AICORE_EXIT_SIGNAL) {
         if (scheduler_watchdog_expired(exit_wait_start, get_sys_cnt_aicore(), timeout_cycles)) {
-            const int64_t task = scheduler_local_state.admission != nullptr ?
-                                     scheduler_local_state.admission->current_task_ref :
-                                     SCHEDULER_TASK_REF_INVALID;
+            const auto &group = scheduler_local_state.cluster_mix;
+            const int64_t task = group.phase == SchedulerGmMixPhase::IDLE ? SCHEDULER_TASK_REF_INVALID : group.task_ref;
             scheduler_record_error(
                 run_control, task, SchedulerGraphResult::TIMEOUT, &graph, &scheduler_local_state,
                 SchedulerErrorSite::EXIT_WAIT_TIMEOUT
@@ -1005,15 +962,13 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
         const uint64_t drain_start = get_sys_cnt_aicore();
         while (true) {
             bool drained = false;
-            if (!scheduler_drain_ordered_exit<record_protocol>(
+            if (!scheduler_drain_ordered_exit(
                     graph, scheduler_state_base, &scheduler_local_state, run_control, &drained
                 ) ||
                 drained)
                 break;
             if (scheduler_watchdog_expired(drain_start, get_sys_cnt_aicore(), timeout_cycles)) {
-                const int64_t task = scheduler_local_state.admission != nullptr ?
-                                         scheduler_local_state.admission->current_task_ref :
-                                         SCHEDULER_TASK_REF_INVALID;
+                const int64_t task = scheduler_ordered_drain_task(&scheduler_local_state);
                 scheduler_record_error(
                     run_control, task, SchedulerGraphResult::TIMEOUT, &graph, &scheduler_local_state,
                     SchedulerErrorSite::ORDERED_EXIT_TIMEOUT

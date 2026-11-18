@@ -611,7 +611,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
 
     const uint64_t swimlane_run_epoch = api->run_epoch();
     std::ostringstream identities_json;
-    identities_json << "{\"schema\":\"hbg-execution-identity\",\"producer\":\"aicore\",\"records\":[";
+    identities_json << "{\"schema\":\"hbg-execution-identity\",\"version\":2,\"producer\":\"aicore\",\"records\":[";
     bool first_identity = true;
     for (uint64_t trace_index : emitted_traces) {
         const SchedulerTaskTrace &trace = traces[trace_index];
@@ -631,16 +631,12 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
                         << ",\"pending_slot\":" << trace.execution_pending_slot
                         << ",\"cluster_index\":" << trace.execution_cluster_index
                         << ",\"cluster_lane\":" << trace.execution_cluster_lane << ",\"order_key\":";
-        if ((flags & SCHEDULER_TRACE_ORDERED) != 0) identities_json << trace.execution_order_key;
-        else identities_json << "null";
+        identities_json << trace.execution_order_key;
         identities_json << ",\"group_seq\":";
         if ((flags & SCHEDULER_TRACE_GROUP) != 0) identities_json << trace.execution_group_seq;
         else identities_json << "null";
-        identities_json << ",\"group_kind\":"
-                        << ((flags & SCHEDULER_TRACE_CLUSTER_GROUP) != 0 ? 2 :
-                            (flags & SCHEDULER_TRACE_GROUP) != 0         ? 1 :
-                                                                           0);
-        identities_json << ",\"executed\":" << ((flags & SCHEDULER_TRACE_EXECUTED) != 0 ? "true" : "false") << "}";
+        identities_json << ",\"group_kind\":" << ((flags & SCHEDULER_TRACE_CLUSTER_GROUP) != 0 ? 2 : 0)
+                        << ",\"executed\":" << ((flags & SCHEDULER_TRACE_EXECUTED) != 0 ? "true" : "false") << "}";
     }
     identities_json << "]}";
     const std::string identities_payload = identities_json.str();
@@ -1692,9 +1688,10 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG AICore scheduler: scheduler state layout overflow");
         return false;
     }
-    // Each executable task appears once in its immutable engine catalog.
+    // Reserve the wire image before forming the dependency graph. Project once
+    // from the final topological order of actual instance nodes below.
     SchedulerTaskCatalogPlan task_catalog_plan;
-    if (!scheduler_plan_task_catalog(
+    if (!scheduler_size_task_catalog(
             task_metadata, static_cast<uint32_t>(spmd.cluster_count), layout.total_size, &task_catalog_plan
         )) {
         LOG_ERROR("A5 HBG: task catalog layout overflow or invalid topology");
@@ -2028,7 +2025,7 @@ bool create_scheduler_state(
             }
             protocol_tasks = scheduler_protocol_freeze_graph(snapshot, task_metadata);
             for (size_t ref = 0; ref < protocol_tasks.size(); ++ref) {
-                protocol_tasks[ref].schedule_rank = task_catalog_plan.task_ranks[ref];
+                protocol_tasks[ref].order = task_catalog_plan.order_rows[ref];
                 protocol_tasks[ref].topological_level = task_catalog_plan.task_levels[ref];
                 protocol_tasks[ref].bottom_level = task_catalog_plan.task_bottom_levels[ref];
             }

@@ -82,6 +82,12 @@ that ...".
 
 ## Index
 
+Newest first.
+
+- [2026-11 — CntNotify ADD completion chains and SET-slot access](2026-11-a5-hbg-cnt-notify-add-deferred.md) — withdrawal history retained; SET-slot +0x08 access was subsequently verified and authorized for re-enablement without a driver update.
+- [2026-11 — CntNotify completion bitmaps with DAG bank reuse](2026-11-a5-hbg-cnt-notify-completion-reuse.md) — rejected: strict-ancestor bank reuse resolves the observed notification-capacity failure, but the twelve-case AICore L0 sum regresses 5.959%; MIX handshakes and the Host mapping pool remain.
+- [2026-11 — CntNotify task flags and admission tail](2026-11-a5-hbg-cnt-notify-task-flags.md) — rejected: twelve-case AICore L0 sum regresses 1.756%; paired L3 shows increased scheduling visits and primitive traffic despite moving control fields to SRAM.
+
 - [2026-11 — A5 HBG early MIX Binding publication](2026-11-a5-hbg-mix-binding-preparation.md): withdrawn at the user's request after a 0.560% aggregate regression; single-writer signal changes remain.
 - [2026-11 — A5 HBG replicated completion notices](2026-11-a5-hbg-replicated-completion-notices.md): withdrawn despite measured gain; reduce same-address atomic requests through ownership and observation design.
 
@@ -90,8 +96,6 @@ that ...".
 - [2026-11 — Percounter DFX recording cost](2026-11-percounter-dfx-recording-cost.md) — compares deferred publication and lossless encoding with rejected inlining and bypass-store trials; documents the remaining L3 overhead.
 
 - [2026-11 — A5 early immutable Call observation](../zh-cn/investigations/2026-11-a5-early-call-observation.md) — withdrawn: pre-ready observation is visible in the trace, but fourteen paired L0 means sum increases from 19.4512 to 19.5149 ms. Keeps cold Build/Execute provenance and records the remaining MIX and SPMD allocation delays.
-
-Newest first.
 
 - [2026-11 — Completed fanin shortcut](../zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md#completed-fanin-shortcut) — withdrawn: all 18 A5 cases pass, but the fourteen noncommunication L0 means sum rises 1.059%; adding faster MIX discovery still leaves a 0.339% regression and increases unready PARK churn.
 - [2026-11 — Immutable Call cache reuse](../zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md#immutable-call-cache-reuse) — withdrawn: the Host-before-startup publication contract passes all 18 A5 cases, but removing receive-side Call DCCI increases the fourteen noncommunication L0 means sum by 0.474%; mutable Binding observation remained intact.
@@ -189,3 +193,8 @@ Newest first.
 - [2026-06 — chip swimlane: defer per-task wmb to rotation](2026-06-chip-swimlane-defer-wmb.md)
 
 - [A5 HBG control-node fanin progress](2026-11-a5-hbg-control-fanin-progress.md) — single-entry trial superseded; task-keyed private cache reduces repeated control FAA with a recorded 0.306% L0 regression.
+
+- [A5 single-lane sync_start prepared ownership](../zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md#sync-prepared-ownership) — +0.599% twelve-case AICore L0; withdrawn after review of replacement cache writes and barriers.
+
+- [A5 Host-initialized Binding lane fields](../zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md#host-static-binding-fields) — +0.568% twelve-case AICore L0; withdrawn after receive-to-execution cost shifting was identified.
+- [Host-completed DONE notifications](../zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md#host-completed-done-notifications): removing a notification can move remaining readers from SRAM to GM.

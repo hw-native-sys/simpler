@@ -87,6 +87,10 @@ a5_hbg_case(test_hbg_scheduler_dispatch.cpp
     INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore
     DEFINES __CPU_SIM)
 
+a5_hbg_case(test_hbg_cluster_owned_groups.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore
+    DEFINES __CPU_SIM)
+
 a5_hbg_case(test_hbg_direct_mix_handoff.cpp
     INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore
     DEFINES __CPU_SIM)

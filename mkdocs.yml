@@ -138,7 +138,7 @@ nav:
           - 设计总览: zh-cn/design/a5-hbg-graph-task.md
           - 数据布局与 Host 绑定: zh-cn/design/a5-hbg-graph-task/data-layout.md
           - 调度与发布协议: zh-cn/design/a5-hbg-graph-task/protocol.md
-          - Admission 静态计划与一次验证: zh-cn/design/a5-hbg-graph-task/admission-preparation.md
+          - 协作任务的 Host 准备与 Device 校验: zh-cn/design/a5-hbg-graph-task/admission-preparation.md
           - HBG 调度优化开发参考: zh-cn/design/a5-hbg-graph-task/build-execute-separation.md
           - Canonical completion gate: zh-cn/design/a5-hbg-graph-task/dependency-counters.md
           - 工作目录与 execution token: zh-cn/design/a5-hbg-graph-task/ready-queue-design.md

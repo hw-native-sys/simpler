@@ -56,10 +56,13 @@ static inline __aicore__ bool scheduler_contribute_mix_group(
         owner = &scheduler_state_at<SchedulerProtocolBlockTrace>(base, layout->blocks_offset)[index].owner;
         scheduler_protocol_observe_record(owner);
         if (owner->completion_before.sequence != 0 || owner->task_ref != task_ref || owner->block_idx != block_idx ||
-            owner->worker_index != local->worker_id() || scheduler_lane_mask_load(owner->active_mask) != active) {
+            owner->worker_index != local->config.worker_ids[1] ||
+            local->config.self_lane != scheduler_mix_accountant_lane(active) ||
+            scheduler_lane_mask_load(owner->active_mask) != active) {
             scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
             return false;
         }
+        owner->completion_worker = static_cast<uint32_t>(local->worker_id());
         scheduler_protocol_stamp(base, local, layout, &owner->completion_before);
     }
     uint64_t previous = UINT64_MAX;
@@ -164,25 +167,14 @@ static inline __aicore__ bool scheduler_service_counter_accounting(
         );
         return false;
     }
-    uint64_t order = UINT64_MAX;
-    auto *layout = scheduler_protocol_layout_at(base, local);
-    if (layout != nullptr && scheduler_task_requires_admission(metadata.flags)) {
-        auto *event = &scheduler_state_at<SchedulerProtocolTaskTrace>(base, layout->tasks_offset)[task].admission;
-        scheduler_protocol_observe_record(event);
-        if (event->task_ref != task || event->run_epoch != layout->run_epoch || event->after.sequence == 0) {
-            scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
-            return false;
-        }
-        order = event->order_key;
-    }
     const uint32_t flags = metadata.flags | SCHEDULER_PROTOCOL_COUNTER_ACCOUNTING;
-    scheduler_protocol_task_actor(base, local, task, order, flags, true, true);
+    scheduler_protocol_task_actor(base, local, task, flags, true);
     // No credit registration, return, or CHECK RMW touches the mapped task's
     // canonical word. This unique accountant is its only device writer.
     scheduler_store_signal(
         scheduler_task_control_at(base, local, task)->completion_state, scheduler_completion_completed_state(total)
     );
-    scheduler_protocol_task_actor(base, local, task, order, flags, true, false);
+    scheduler_protocol_task_actor(base, local, task, flags, false);
     scheduler_remember_task_proof(local, task, SchedulerTaskProof::DONE);
     // Successors consume the counter threshold, not this canonical mirror.
     // EXIT cannot interrupt this call; the retirement barrier drains the mirror

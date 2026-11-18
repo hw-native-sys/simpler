@@ -440,11 +440,16 @@ TEST(HbgNativeGraphPlan, CanonicalFaninConnectsGraphControlsAcrossInstances) {
     view.original.executable(3, 0, {2});
     std::vector<SchedulerTaskMetadata> metadata(view.graph.task_count);
     for (uint64_t ref = 0; ref < view.plan.bindings.size(); ++ref) {
-        const auto kind = view.plan.bindings[ref].kind;
+        const auto &binding = view.plan.bindings[ref];
+        const auto kind = binding.kind;
         if (kind == SchedulerNodeKind::CHILD_KERNEL || kind == SchedulerNodeKind::TOP_KERNEL) {
             metadata[ref].flags = SCHEDULER_TASK_EXECUTABLE;
             metadata[ref].active_mask = LaneMask::aiv0();
             metadata[ref].logical_block_num = 1;
+            if (kind == SchedulerNodeKind::CHILD_KERNEL && binding.source_index == 0) {
+                metadata[ref].flags |= SCHEDULER_TASK_MIX;
+                metadata[ref].active_mask = LaneMask::both_aiv();
+            }
         }
     }
     ASSERT_TRUE(scheduler_validate_dependencies(view.graph, metadata, {0}));
@@ -471,6 +476,14 @@ TEST(HbgNativeGraphPlan, CanonicalFaninConnectsGraphControlsAcrossInstances) {
     EXPECT_EQ(ordered.catalogs[1], (std::vector<int64_t>{0, 2, 3, 4, 7, 8, 9, 11}));
     for (const auto &[producer, consumer] : edges)
         EXPECT_LT(ordered.task_ranks[producer], ordered.task_ranks[consumer]);
+    const auto &first = view.plan.instances[0];
+    const auto &second = view.plan.instances[1];
+    ASSERT_EQ(first.definition_index, second.definition_index);
+    EXPECT_EQ(ordered.header.first_mix_ref, first.child_begin);
+    EXPECT_EQ(ordered.order_rows[first.child_begin].next_mix_ref, second.child_begin);
+    EXPECT_EQ(ordered.order_rows[second.child_begin].next_mix_ref, UINT32_MAX);
+    EXPECT_LT(ordered.order_rows[first.exit_ref].rank, ordered.order_rows[second.enter_ref].rank);
+    EXPECT_EQ(ordered.order_rows[11].required_floor[1], ordered.order_rows[second.child_begin].rank + 1);
     EXPECT_FALSE(scheduler_validate_dependencies(view.graph, metadata, {view.graph.task_count}));
 }
 
@@ -696,8 +709,6 @@ SchedulerLocalState ready_worker(NativeViewFixture &view, uint32_t type, uint64_
     config.shared_context =
         scheduler_state_at<SchedulerWorkerContext>(view.backing.get(), view.layout.worker_contexts_offset) +
         local.worker_id();
-    for (auto &slot : local.slots)
-        scheduler_initialize_free_slot(&slot);
     return local;
 }
 
@@ -793,6 +804,25 @@ TEST(HbgNativeGraphPlan, NativeCatalogOrderAllocatesEachSingleBlockOnce) {
     ASSERT_EQ(catalog.count, 3u);
     for (int64_t expected : {1, 2, 3}) {
         EXPECT_EQ(catalog.refs[expected - 1], expected);
+        if (scheduler_execution_token_count(&consumer) == SCHEDULER_EXECUTION_TOKEN_COUNT) {
+            uint32_t selected = UINT32_MAX;
+            bool advanced = false;
+            ASSERT_TRUE(scheduler_progress_execution_tokens(
+                view.graph, view.backing.get(), &consumer, run, 0, &selected, &advanced
+            ));
+            ASSERT_LT(selected, SCHEDULER_EXECUTION_TOKEN_COUNT);
+            bool permitted = false;
+            ASSERT_TRUE(
+                scheduler_can_enter_execution<false>(
+                    view.graph, view.backing.get(), &consumer, run, selected, &permitted
+                )
+            );
+            ASSERT_TRUE(permitted);
+            consumer.execution_at(selected).state = SchedulerDispatchSlotState::EXECUTING;
+            ASSERT_TRUE(
+                scheduler_complete_own_slot<false>(view.graph, view.backing.get(), &consumer, run, selected, 0)
+            );
+        }
         for (uint32_t slice = 0; slice <= catalog.count && !scheduler_execution_token_has_task(&consumer, expected);
              ++slice) {
             const uint64_t head = consumer.issue_cursor;
@@ -810,7 +840,12 @@ TEST(HbgNativeGraphPlan, NativeCatalogOrderAllocatesEachSingleBlockOnce) {
             );
         }
         ASSERT_TRUE(scheduler_execution_token_has_task(&consumer, expected));
-        EXPECT_EQ(consumer.execution_tokens[expected - 1].task_ref, expected);
+        const auto held = std::count_if(
+            std::begin(consumer.execution_tokens), std::end(consumer.execution_tokens), [&](const auto &entry) {
+                return entry.state != SchedulerDispatchSlotState::FREE && entry.task_ref == expected;
+            }
+        );
+        EXPECT_EQ(held, 1u);
         EXPECT_EQ(scheduler_task_control_at(view.backing.get(), &consumer, expected)->next_block, 1u);
     }
     auto competing = ready_worker(view, 0, 9);
@@ -848,7 +883,7 @@ TEST(HbgNativeGraphPlan, ConcurrentConsumersOwnAndCompleteEachNativeCallOnce) {
                     break;
                 }
                 if (slot_index == UINT32_MAX) continue;
-                auto &slot = local.slots[slot_index];
+                auto &slot = local.execution_at(slot_index);
                 if (slot.task_ref < 1 || slot.task_ref > tasks || slot.block_idx != 0 ||
                     scheduler_prepared_owner(slot.prepared.claimed_state) != local.worker_id()) {
                     ++failures;
@@ -893,7 +928,7 @@ TEST(HbgNativeGraphPlan, NativeEntryDependencyPrecedesChildTicketIssuance) {
         ASSERT_TRUE(scheduler_progress_execution_tokens(view.graph, base, &local, run, 0, &direct, &progress));
         EXPECT_EQ(direct, UINT32_MAX);
         EXPECT_FALSE(progress);
-        for (const auto &slot : local.slots)
+        for (const auto &slot : local.execution_tokens)
             EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FREE);
         EXPECT_FALSE(scheduler_completion_done(control->completion_state));
         complete_native_entry(view);
@@ -903,9 +938,9 @@ TEST(HbgNativeGraphPlan, NativeEntryDependencyPrecedesChildTicketIssuance) {
         ASSERT_TRUE(scheduler_progress_execution_tokens(view.graph, base, &local, run, 0, &direct, &progress));
         ASSERT_NE(direct, UINT32_MAX);
         EXPECT_TRUE(progress);
-        EXPECT_EQ(local.slots[direct].task_ref, 1);
-        EXPECT_EQ(local.slots[direct].prepared.execution_index, owned.execution_index);
-        EXPECT_EQ(local.slots[direct].prepared.claimed_state, owned.claimed_state);
+        EXPECT_EQ(local.execution_at(direct).task_ref, 1);
+        EXPECT_EQ(local.execution_at(direct).prepared.execution_index, owned.execution_index);
+        EXPECT_EQ(local.execution_at(direct).prepared.claimed_state, owned.claimed_state);
         EXPECT_EQ(control->next_block, 1u) << "dependency completion dispatches the existing reservation";
         EXPECT_EQ(scheduler_read_error(run), 0u);
     }
@@ -936,7 +971,7 @@ struct ControlFixture : NativeViewFixture {
 
             local.control_peer_cursor = worker;
             // No free payload slots: control readiness must remain independent.
-            for (auto &slot : local.slots)
+            for (auto &slot : local.execution_tokens)
                 slot.state = SchedulerDispatchSlotState::READY;
         }
     }
@@ -1263,13 +1298,13 @@ DefinitionFixture cooperative_argument_definition(bool mix, LaneMask mix_mask = 
     body.put(body.header.off_sub_tasks, 0, task);
     return body;
 }
-struct NativeAdmissionFixture : NativeViewFixture {
+struct NativeMixFixture : NativeViewFixture {
     static constexpr uint32_t worker_count = 6;
     std::array<SchedulerLocalState, worker_count> locals;
-    std::array<SchedulerAdmissionLocalState, worker_count> admissions;
+    std::array<SchedulerClusterSignal, worker_count / 3> signals{};
     BoundArgumentsFixture bound;
     SchedulerRunControl *run;
-    explicit NativeAdmissionFixture(bool mix, LaneMask mix_mask = LaneMask::all()) :
+    explicit NativeMixFixture(bool mix, LaneMask mix_mask = LaneMask::all()) :
         NativeViewFixture(cooperative_argument_definition(mix, mix_mask), {0}, true, worker_count),
         bound(*this, 0) {
         run = static_cast<SchedulerRunControl *>(backing.get());
@@ -1285,6 +1320,7 @@ struct NativeAdmissionFixture : NativeViewFixture {
                 contexts[worker].cluster_worker_ids[lane] = cluster * 3 + lane;
             auto &config = locals[worker].config;
             config.graph = &graph;
+            config.prepared = scheduler_state_at<SchedulerPreparedLayout>(backing.get(), layout.prepared_layout_offset);
             config.shared_context = contexts + worker;
             config.graph_summary_offset = layout.graph_summary_offset;
             config.worker_contexts_offset = layout.worker_contexts_offset;
@@ -1297,97 +1333,91 @@ struct NativeAdmissionFixture : NativeViewFixture {
             config.self_core_type = self_lane == 0 ? 0 : 1;
             for (uint32_t lane = 0; lane < 3; ++lane)
                 config.worker_ids[lane] = cluster * 3 + lane;
-            locals[worker].admission = &admissions[worker];
+            locals[worker].cluster_signal = &signals[cluster];
+            locals[worker].next_mix_ref = catalog_plan.header.first_mix_ref;
+            if (self_lane == 1) scheduler_cluster_signal_clear(&signals[cluster], config.prepared->run_epoch);
         }
-        for (uint32_t worker = 0; worker < worker_count; ++worker)
-            if (!scheduler_initialize_admission(backing.get(), &locals[worker], &admissions[worker]))
-                throw std::runtime_error("admission init");
     }
     int64_t child() const { return bound.instance->child_begin; }
-    SchedulerAdmissionControl *control() {
-        return scheduler_state_at<SchedulerAdmissionControl>(backing.get(), layout.admission_control_offset);
+    bool discover() {
+        bool progress = false;
+        return scheduler_cluster_mix_discover_next(graph, backing.get(), &locals[1], run, &progress);
+    }
+    bool publish() {
+        bool progress = false;
+        return scheduler_cluster_mix_progress_pending(graph, backing.get(), &locals[1], run, &progress);
     }
 };
 }  // namespace
 
-TEST(HbgNativeGraphPlan, HostArgumentsSurviveMixAdmissionRetries) {
-    NativeAdmissionFixture view(true);
+TEST(HbgNativeGraphPlan, HostArgumentsRemainBoundWhileMixWaitsForGraphEnterAndPartner) {
+    NativeMixFixture view(true);
     auto *base = view.backing.get();
-    auto *local = &view.locals[0];
-    auto *admission = &view.admissions[0];
+    auto *control = scheduler_task_control_at(base, &view.locals[1], view.child());
     ASSERT_EQ(bind_host_arguments(view, view.bound, view.child()), NativeGraphBindingError::NONE);
+    prepare_native_calls(view);
+    // Discovery must not allocate a child whose ENTER is not complete.
+    ASSERT_TRUE(view.discover());
+    EXPECT_EQ(view.locals[1].cluster_pending.task_ref, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(control->next_block, 0u);
+    EXPECT_EQ(view.signals[0].armed_generation, 0u);
     complete_native_entry(view);
     view.bound.scalar = 999;
-    SchedulerReadyClaim candidate{};
-    candidate.task_ref = view.child();
-    ASSERT_EQ(
-        scheduler_stage_admission_candidate(view.graph, base, local, view.run, admission, candidate.task_ref),
-        SchedulerAdmissionResult::PROGRESS
-    );
-    view.control()->commit_lock = 3;
+    ASSERT_TRUE(view.discover());
+    ASSERT_EQ(view.locals[1].cluster_pending.task_ref, view.child());
+    ASSERT_TRUE(view.publish());
+    ASSERT_EQ(view.signals[0].task_ref, view.child());
     const auto &plan = view.plan.definitions[0].children[0];
-    auto *scalars = reinterpret_cast<uint64_t *>(view.bound.instance->args_base + plan.scalars_offset);
-    EXPECT_EQ(scalars[0], 71);
-    EXPECT_EQ(
-        scheduler_try_commit_admission(view.graph, base, local, view.run, admission), SchedulerAdmissionResult::RETRY
-    );
-    EXPECT_EQ(scalars[0], 71) << "admission does not rewrite Host's immutable argument publication";
-    view.control()->commit_lock = 0;
-    ASSERT_EQ(
-        scheduler_try_commit_admission(view.graph, base, local, view.run, admission), SchedulerAdmissionResult::PROGRESS
-    );
-    EXPECT_EQ(view.control()->commit_tail, 1);
-    for (uint32_t worker = 0; worker < NativeAdmissionFixture::worker_count; ++worker) {
-        ASSERT_TRUE(scheduler_refresh_local_obligation(
-            view.graph, base, &view.locals[worker], view.run, &view.admissions[worker]
-        ));
-        EXPECT_EQ(view.admissions[worker].current_task_ref, view.child());
+    const auto *scalars = reinterpret_cast<const uint64_t *>(view.bound.instance->args_base + plan.scalars_offset);
+    for (uint32_t pass = 0; pass < 2; ++pass) {
+        bool progress = false;
+        ASSERT_TRUE(scheduler_cluster_mix_service(view.graph, base, &view.locals[1], view.run, 0, &progress));
+        EXPECT_EQ(scalars[0], 71u);
+        EXPECT_NE(view.locals[1].cluster_mix.phase, SchedulerGmMixPhase::RUNNING);
     }
-    EXPECT_EQ(scalars[0], 71);
 }
 
 TEST(HbgNativeGraphPlan, HostBindingRejectsInvalidArgumentsBeforeDevicePublication) {
-    NativeAdmissionFixture view(true);
+    NativeMixFixture view(true);
     view.bound.arguments.scalars = nullptr;
     EXPECT_EQ(bind_host_arguments(view, view.bound, view.child()), NativeGraphBindingError::SCALAR);
     EXPECT_EQ(view.run->bootstrap_complete, 0u);
     EXPECT_EQ(view.run->bootstrap_arrived_count, 0u);
-    auto *control = scheduler_task_control_at(view.backing.get(), &view.locals[0], view.child());
-    EXPECT_EQ(control->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED));
-    EXPECT_EQ(view.control()->commit_tail, 0);
-    EXPECT_EQ(view.control()->commit_lock, 0);
+    const auto *control = scheduler_task_control_at(view.backing.get(), &view.locals[1], view.child());
+    EXPECT_EQ(control->next_block, 0u);
+    EXPECT_EQ(control->claim_seal, 0u);
+    EXPECT_EQ(view.signals[0].armed_generation, 0u);
 }
 
-TEST(HbgNativeGraphPlan, NativeMixAdmissionIncludesOnlyActiveLanesAndCoordinator) {
+TEST(HbgNativeGraphPlan, NativeMixDistributesOnlyTheActualChildLanes) {
     for (const auto mask : {LaneMask{true, true, false}, LaneMask{true, false, true}, LaneMask::both_aiv()}) {
-        NativeAdmissionFixture view(true, mask);
-        auto *base = view.backing.get();
-        auto *local = &view.locals[0];
-        auto *admission = &view.admissions[0];
+        NativeMixFixture view(true, mask);
         ASSERT_EQ(bind_host_arguments(view, view.bound, view.child()), NativeGraphBindingError::NONE);
+        prepare_native_calls(view);
         complete_native_entry(view);
-        SchedulerReadyClaim candidate{};
-        candidate.task_ref = view.child();
-        ASSERT_EQ(
-            scheduler_stage_admission_candidate(view.graph, base, local, view.run, admission, candidate.task_ref),
-            SchedulerAdmissionResult::PROGRESS
-        );
-
-        ASSERT_EQ(
-            scheduler_try_commit_admission(view.graph, base, local, view.run, admission),
-            SchedulerAdmissionResult::PROGRESS
-        );
-        const auto *record = scheduler_admission_record_at(base, admission, view.child());
-        EXPECT_EQ(record->member_count, (NativeAdmissionFixture::worker_count / 3) * (mask.has_aic() ? 2u : 3u));
-        for (uint32_t worker = 0; worker < NativeAdmissionFixture::worker_count; ++worker) {
-            ASSERT_TRUE(scheduler_refresh_local_obligation(
-                view.graph, base, &view.locals[worker], view.run, &view.admissions[worker]
-            ));
-            const bool participates = worker % 3 == 0 || mask.has(static_cast<SubtaskSlot>(worker % 3));
-            EXPECT_EQ(
-                view.admissions[worker].current_task_ref, participates ? view.child() : SCHEDULER_TASK_REF_INVALID
-            );
+        ASSERT_TRUE(view.discover());
+        ASSERT_TRUE(view.publish());
+        ASSERT_EQ(view.signals[0].active_mask, mask.raw());
+        for (uint32_t unit = 0; unit < 3; ++unit)
+            for (uint32_t lane = 0; lane < 3; ++lane) {
+                bool progress = false;
+                ASSERT_TRUE(scheduler_cluster_mix_service(
+                    view.graph, view.backing.get(), &view.locals[lane], view.run, 0, &progress
+                ));
+            }
+        for (uint32_t lane = 0; lane < 3; ++lane) {
+            const auto &owned = view.locals[lane].execution_at(SCHEDULER_CLUSTER_MIX_EXECUTION);
+            const bool participates = mask.has(static_cast<SubtaskSlot>(lane));
+            EXPECT_EQ(owned.state, participates ? SchedulerDispatchSlotState::READY : SchedulerDispatchSlotState::FREE);
+            if (participates) {
+                EXPECT_EQ(owned.task_ref, view.child());
+                EXPECT_EQ(owned.subtask_slot, lane);
+                EXPECT_EQ(view.signals[0].arrived[lane], view.signals[0].armed_generation);
+            } else {
+                EXPECT_EQ(view.signals[0].arrived[lane], 0u);
+            }
         }
+        EXPECT_EQ(view.run->scheduler_error, 0u);
     }
 }
 

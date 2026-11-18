@@ -15,11 +15,10 @@
 #include <cstdint>
 #include <type_traits>
 
-inline constexpr uint64_t SCHEDULER_PROTOCOL_MAGIC = UINT64_C(0x53504d4454520002);
+inline constexpr uint64_t SCHEDULER_PROTOCOL_MAGIC = UINT64_C(0x53504d4454520003);
 // Control completion stamps describe accounting after idempotent notification.
 inline constexpr uint32_t SCHEDULER_PROTOCOL_CONTROL_NOTIFY_ACCOUNTING = UINT32_C(1) << 26;
 inline constexpr uint32_t SCHEDULER_PROTOCOL_COUNTER_ACCOUNTING = UINT32_C(1) << 27;
-inline constexpr uint32_t SCHEDULER_PROTOCOL_MEMBER_FROM_CLAIM = UINT32_C(1) << 28;
 // A physical synchronous completion aliases the actual last contribution stamps.
 inline constexpr uint32_t SCHEDULER_PROTOCOL_COMPLETION_FROM_GROUP = UINT32_C(1) << 29;
 inline constexpr uint32_t SCHEDULER_PROTOCOL_COMPLETION_FROM_CONTRIBUTION = UINT32_C(1) << 30;
@@ -48,6 +47,8 @@ struct alignas(64) SchedulerProtocolLayout {
     uint64_t member_count;
     uint64_t tasks_offset;
     uint64_t members_offset;
+    uint64_t floor_count;
+    uint64_t floors_offset;
     uint64_t blocks_offset;
     uint64_t executions_offset;
     uint64_t condition_contributions_offset;
@@ -67,7 +68,6 @@ struct alignas(64) SchedulerProtocolTaskActor {
 };
 
 struct alignas(64) SchedulerProtocolTaskTrace {
-    SchedulerProtocolTaskActor admission;
     SchedulerProtocolTaskActor completion;
 };
 
@@ -89,22 +89,24 @@ struct SchedulerProtocolCounterObservation {
 };
 
 struct alignas(64) SchedulerProtocolMemberTrace {
-    SchedulerProtocolStamp observed;
-    SchedulerProtocolStamp closed;
+    SchedulerProtocolStamp committed;
+    SchedulerProtocolStamp retired;
     uint64_t run_epoch;
     int64_t task_ref;
-    uint64_t order_key;
-    uint64_t observed_tail;
-    uint64_t closed_cursor;
-    // MIX coordinator: next prefix published after closed; peer: observed prefix.
-    uint64_t close_frontier;
-    uint64_t last_group_seq;
+    uint32_t order_key;
     uint32_t worker_index;
-    uint32_t flags;
-    uint64_t pending_mask;
-    uint64_t claim_seal_seen;
-    // A nonzero seal supplies this terminal cursor; no second GM read is implied.
-    uint64_t claim_cursor_seen;
+    uint32_t observed_mix_floor;
+    uint32_t observed_self_floor;
+};
+
+struct alignas(64) SchedulerProtocolFloorTrace {
+    SchedulerProtocolStamp before;
+    SchedulerProtocolStamp after;
+    uint64_t run_epoch;
+    uint32_t cluster_index;
+    uint32_t worker_index;
+    uint32_t prior_mix_ref;
+    uint32_t floor;
 };
 
 struct alignas(64) SchedulerProtocolBlockOwner {
@@ -127,10 +129,7 @@ struct alignas(64) SchedulerProtocolBlockOwner {
     uint8_t flags;
     SchedulerProtocolStamp releases_observed;
     uint64_t released_seq[3];
-    SchedulerProtocolStamp staged;
-    uint64_t sync_tail;
-    uint32_t sync_frontier[3];
-    uint32_t sync_hold[3];
+    uint32_t completion_worker;
     uint32_t completion_credits;
 };
 
@@ -155,7 +154,7 @@ struct alignas(64) SchedulerProtocolLaneTrace {
     uint32_t logical_block_num;
     LaneMask resource_mask;
     uint8_t lane_subtasks[3];
-    uint64_t previous_lane_seq[3];
+    uint32_t observed_self_floor;
 };
 
 struct alignas(64) SchedulerProtocolClaimTrace {
@@ -182,7 +181,8 @@ struct alignas(64) SchedulerProtocolExecutionTrace {
     uint64_t run_epoch;
     int64_t task_ref;
     uint64_t order_key;
-    uint64_t permit_tail;
+    uint32_t observed_mix_floor;
+    uint32_t observed_self_floor;
     uint32_t worker_index;
     uint32_t block_idx;
     uint16_t pending_slot;
@@ -195,8 +195,8 @@ struct alignas(64) SchedulerProtocolExecutionTrace {
     uint32_t logical_block_num;
     uint32_t cluster_index;
     uint32_t cluster_lane;
-    // Ordinary payloads can be rebuilt before their one entry permit. Only the final
-    // publication is retained; these snapshot times consume no event sequence.
+    // Each execution records one payload publication interval before permit.
+    // The two timestamps consume no worker event sequence.
     uint64_t publication_before_cycles;
     uint64_t publication_after_cycles;
     uint32_t publication_count;
@@ -211,12 +211,8 @@ enum SchedulerProtocolExecutionFlags : uint32_t {
     SCHEDULER_PROTOCOL_ENTRY = 1U << 0,
     SCHEDULER_PROTOCOL_EXECUTED = 1U << 1,
     SCHEDULER_PROTOCOL_COOPERATIVE = 1U << 2,
-    SCHEDULER_PROTOCOL_GM_GROUP = 1U << 3,
-    SCHEDULER_PROTOCOL_PERMIT_TAIL = 1U << 4,
-    SCHEDULER_PROTOCOL_PERMIT_NO_LOG = 1U << 5,
     SCHEDULER_PROTOCOL_PAYLOAD_PUBLISHED = 1U << 6,
     SCHEDULER_PROTOCOL_CLUSTER_GROUP = 1U << 7,
-    SCHEDULER_PROTOCOL_PERMIT_PRECLAIM = 1U << 8,
 };
 
 // One worker owns this record; no global event counter participates in scheduling.
@@ -229,19 +225,22 @@ struct alignas(64) SchedulerProtocolWorkerTrace {
 };
 
 static_assert(sizeof(SchedulerProtocolStamp) == 16);
-static_assert(sizeof(SchedulerProtocolLayout) == 128);
+static_assert(sizeof(SchedulerProtocolLayout) == 192);
 static_assert(sizeof(SchedulerProtocolTaskActor) == 64);
-static_assert(sizeof(SchedulerProtocolTaskTrace) == 128);
+static_assert(sizeof(SchedulerProtocolTaskTrace) == 64);
 static_assert(sizeof(SchedulerProtocolConditionContribution) == 64);
 static_assert(sizeof(SchedulerProtocolCounterObservation) == 8);
-static_assert(offsetof(SchedulerProtocolTaskTrace, completion) == 64);
-static_assert(sizeof(SchedulerProtocolMemberTrace) == 128);
+static_assert(sizeof(SchedulerProtocolMemberTrace) == 64);
+static_assert(sizeof(SchedulerProtocolFloorTrace) == 64);
+static_assert(
+    std::is_standard_layout_v<SchedulerProtocolFloorTrace> && std::is_trivially_copyable_v<SchedulerProtocolFloorTrace>
+);
 static_assert(sizeof(SchedulerProtocolBlockOwner) == 256);
 static_assert(sizeof(SchedulerProtocolClaimTrace) == 64);
 static_assert(offsetof(SchedulerProtocolBlockTrace, claim) == 256);
-static_assert(sizeof(SchedulerProtocolLaneTrace) == 256);
+static_assert(sizeof(SchedulerProtocolLaneTrace) == 192);
 static_assert(offsetof(SchedulerProtocolBlockTrace, lanes) == 320);
-static_assert(sizeof(SchedulerProtocolBlockTrace) == 1088);
+static_assert(sizeof(SchedulerProtocolBlockTrace) == 896);
 static_assert(sizeof(SchedulerProtocolExecutionTrace) == 256);
 static_assert(sizeof(SchedulerProtocolWorkerTrace) == 64);
 static_assert(
