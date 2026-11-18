@@ -48,7 +48,7 @@ def _build_callable(
         f"#include <cstdint>\nextern const uint32_t ccu_test_variant = {variant};\n", encoding="ascii"
     )
     module = compiler.compile_ccu(
-        str(source_root / "native_module.cpp"), extra_sources=[str(variant_source)], build_dir=str(tmp_path)
+        str(source_root / "kernels/ccu/native_module.cpp"), extra_sources=[str(variant_source)], build_dir=str(tmp_path)
     )
     orch_source = source_root / "kernels/orchestration/ccu_orch.cpp"
     if not orch_source.exists():
