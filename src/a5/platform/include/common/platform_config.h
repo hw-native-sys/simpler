@@ -294,6 +294,7 @@ inline double cycles_to_us(uint64_t cycles) {
 #define SIMPLER_DFX_FLAG_PMU (1u << 2)
 #define SIMPLER_DFX_FLAG_DEP_GEN (1u << 3)
 #define SIMPLER_DFX_FLAG_SCOPE_STATS (1u << 4)
+#define SIMPLER_DFX_FLAG_L0_SWIMLANE (1u << 5)
 #define SIMPLER_GET_DFX_FLAG(flags, bit) ((((uint32_t)(flags)) & ((uint32_t)(bit))) != 0u)
 #define SIMPLER_SET_DFX_FLAG(flags, bit) ((flags) |= (uint32_t)(bit))
 #define SIMPLER_CLEAR_DFX_FLAG(flags, bit) ((flags) &= ~((uint32_t)(bit)))
@@ -527,6 +528,15 @@ constexpr uint32_t REG_MMIO_PMU_CNT7_IDX_OFFSET = 0x251C;    // Event selector f
 constexpr uint32_t REG_MMIO_PMU_CNT8_IDX_OFFSET = 0x2520;    // Event selector for CNT8 (a5 only)
 constexpr uint32_t REG_MMIO_PMU_CNT9_IDX_OFFSET = 0x2524;    // Event selector for CNT9 (a5 only)
 
+constexpr uint32_t REG_MMIO_L0_EN_OFFSET = 0x00C4;
+constexpr uint32_t REG_MMIO_L0_GLOBAL_EN_OFFSET = 0xB000;
+constexpr uint32_t REG_MMIO_L0_BUF_LEN_OFFSET = 0xB004;
+constexpr uint32_t REG_MMIO_L0_GLITCH_FILTER_OFFSET = 0xB008;
+constexpr uint32_t REG_MMIO_L0_BASE_LO_OFFSET = 0xB00C;
+constexpr uint32_t REG_MMIO_L0_BASE_HI_OFFSET = 0xB010;
+constexpr uint32_t REG_MMIO_L0_WPTR_OFFSET = 0xB01C;
+constexpr uint32_t REG_MMIO_L0_SAMP_WRT_OFFSET = 0xB028;
+
 // PMU_CTRL_0 enable value: GLB_PMU_EN | (USER_PMU_MODE_EN << 1) | (SAMPLE_PMU_MODE_EN << 2)
 constexpr uint32_t REG_MMIO_PMU_CTRL_0_ENABLE_VAL = 0x7;
 // PMU_CTRL_1 enable value: GLB_PMU_EN (a5 only; second control register)
@@ -582,6 +592,14 @@ enum class RegId : uint8_t {
     PMU_CNT7_IDX = 28,
     PMU_CNT8_IDX = 29,
     PMU_CNT9_IDX = 30,
+    L0_EN = 31,
+    L0_GLOBAL_EN = 32,
+    L0_BUF_LEN = 33,
+    L0_GLITCH_FILTER = 34,
+    L0_BASE_LO = 35,
+    L0_BASE_HI = 36,
+    L0_WPTR = 37,
+    L0_SAMP_WRT = 38,
 };
 
 static_assert(
@@ -660,6 +678,22 @@ constexpr uint32_t reg_offset(RegId reg) {
         return REG_MMIO_PMU_CNT8_IDX_OFFSET;
     case RegId::PMU_CNT9_IDX:
         return REG_MMIO_PMU_CNT9_IDX_OFFSET;
+    case RegId::L0_EN:
+        return REG_MMIO_L0_EN_OFFSET;
+    case RegId::L0_GLOBAL_EN:
+        return REG_MMIO_L0_GLOBAL_EN_OFFSET;
+    case RegId::L0_BUF_LEN:
+        return REG_MMIO_L0_BUF_LEN_OFFSET;
+    case RegId::L0_GLITCH_FILTER:
+        return REG_MMIO_L0_GLITCH_FILTER_OFFSET;
+    case RegId::L0_BASE_LO:
+        return REG_MMIO_L0_BASE_LO_OFFSET;
+    case RegId::L0_BASE_HI:
+        return REG_MMIO_L0_BASE_HI_OFFSET;
+    case RegId::L0_WPTR:
+        return REG_MMIO_L0_WPTR_OFFSET;
+    case RegId::L0_SAMP_WRT:
+        return REG_MMIO_L0_SAMP_WRT_OFFSET;
     }
     return 0;  // unreachable: all RegId cases handled above
 }

@@ -61,6 +61,7 @@ _RUNTIME_ENV_KEYS = frozenset({"ring_task_window", "ring_heap", "ring_dep_pool"}
 
 class _DiagnosticOptions(NamedTuple):
     chip_swimlane: int
+    l0_swimlane: bool
     dump_args: int
     pmu: int
     dep_gen: bool
@@ -102,6 +103,7 @@ def effective_diagnostic_options(
     rounds: int,
     *,
     chip_swimlane: int,
+    l0_swimlane: bool,
     dump_args: int,
     pmu: int,
     dep_gen: bool,
@@ -112,10 +114,11 @@ def effective_diagnostic_options(
     """Return the diagnostics that may run for the requested round count."""
     _validate_diagnostic_flags(chip_swimlane=chip_swimlane, swimlane_overhead=swimlane_overhead)
     if rounds <= 1:
-        return _DiagnosticOptions(chip_swimlane, dump_args, pmu, dep_gen, scope_stats, swimlane_overhead)
+        return _DiagnosticOptions(chip_swimlane, l0_swimlane, dump_args, pmu, dep_gen, scope_stats, swimlane_overhead)
 
     disabled = (
         ("chip swimlane", chip_swimlane),
+        ("L0 swimlane", l0_swimlane),
         ("args dump", dump_args),
         ("PMU", pmu),
         ("dep_gen", dep_gen),
@@ -125,7 +128,7 @@ def effective_diagnostic_options(
     for name, enabled in disabled:
         if warn and enabled:
             logger.warning("%s disabled: --rounds > 1", name)
-    return _DiagnosticOptions(0, 0, 0, False, False, False)
+    return _DiagnosticOptions(0, False, 0, 0, False, False, False)
 
 
 @cache
@@ -169,6 +172,7 @@ def standalone_pytest_options(request) -> dict:
         "rounds": getoption("--rounds", default=1),
         "skip_golden": getoption("--skip-golden", default=False),
         "enable_chip_swimlane": getoption("--enable-chip-swimlane", default=0),
+        "enable_l0_swimlane": getoption("--enable-l0-swimlane", default=False),
         "dump_args": dump_args_level(getoption("--dump-args", default="off")),
         "enable_pmu": getoption("--enable-pmu", default=0),
         "enable_dep_gen": getoption("--enable-dep-gen", default=False),
@@ -1631,6 +1635,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     rounds,
     skip_golden,
     enable_chip_swimlane,
+    enable_l0_swimlane,
     enable_dump_args,
     enable_pmu,
     enable_dep_gen,
@@ -1648,6 +1653,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     callable_spec = getattr(type(cls_inst), "CALLABLE", None)
     diagnostics_on = (
         enable_chip_swimlane
+        or enable_l0_swimlane
         or enable_dump_args
         or enable_pmu
         or enable_dep_gen
@@ -1670,6 +1676,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 rounds=rounds,
                 skip_golden=skip_golden,
                 enable_chip_swimlane=enable_chip_swimlane,
+                enable_l0_swimlane=enable_l0_swimlane,
                 enable_dump_args=enable_dump_args,
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
@@ -2109,6 +2116,7 @@ class SceneTestCase:
         self,
         config_dict,
         enable_chip_swimlane=0,
+        enable_l0_swimlane=False,
         enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,
@@ -2131,6 +2139,7 @@ class SceneTestCase:
         config.runtime_env.ring_heap = runtime_env.get("ring_heap", 0)
         config.runtime_env.ring_dep_pool = runtime_env.get("ring_dep_pool", 0)
         config.enable_chip_swimlane = enable_chip_swimlane
+        config.enable_l0_swimlane = enable_l0_swimlane
         config.enable_dump_args = enable_dump_args
         config.enable_pmu = enable_pmu  # 0=disabled, >0=enabled with event type
         config.enable_dep_gen = enable_dep_gen
@@ -2168,6 +2177,7 @@ class SceneTestCase:
         rounds=1,
         skip_golden=False,
         enable_chip_swimlane=0,
+        enable_l0_swimlane=False,
         enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,
@@ -2182,6 +2192,7 @@ class SceneTestCase:
                 rounds=rounds,
                 skip_golden=skip_golden,
                 enable_chip_swimlane=enable_chip_swimlane,
+                enable_l0_swimlane=enable_l0_swimlane,
                 enable_dump_args=enable_dump_args,
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
@@ -2197,6 +2208,7 @@ class SceneTestCase:
                 rounds=rounds,
                 skip_golden=skip_golden,
                 enable_chip_swimlane=enable_chip_swimlane,
+                enable_l0_swimlane=enable_l0_swimlane,
                 enable_dump_args=enable_dump_args,
                 enable_pmu=enable_pmu,
                 enable_dep_gen=enable_dep_gen,
@@ -2212,6 +2224,7 @@ class SceneTestCase:
         rounds=1,
         skip_golden=False,
         enable_chip_swimlane=0,
+        enable_l0_swimlane=False,
         enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,
@@ -2274,6 +2287,7 @@ class SceneTestCase:
                 config = self._build_config(
                     config_dict,
                     enable_chip_swimlane=enable_chip_swimlane,
+                    enable_l0_swimlane=enable_l0_swimlane,
                     enable_dump_args=enable_dump_args,
                     enable_pmu=enable_pmu,
                     enable_dep_gen=enable_dep_gen,
@@ -2299,6 +2313,7 @@ class SceneTestCase:
         rounds=1,
         skip_golden=False,
         enable_chip_swimlane=0,
+        enable_l0_swimlane=False,
         enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,
@@ -2357,6 +2372,7 @@ class SceneTestCase:
                 config = self._build_config(
                     config_dict,
                     enable_chip_swimlane=enable_chip_swimlane,
+                    enable_l0_swimlane=enable_l0_swimlane,
                     enable_dump_args=enable_dump_args,
                     enable_pmu=enable_pmu,
                     enable_dep_gen=enable_dep_gen,
@@ -2396,6 +2412,7 @@ class SceneTestCase:
         return effective_diagnostic_options(
             request.config.getoption("--rounds", default=1),
             chip_swimlane=request.config.getoption("--enable-chip-swimlane", default=0),
+            l0_swimlane=False,
             dump_args=0,
             pmu=0,
             dep_gen=False,
@@ -2414,6 +2431,7 @@ class SceneTestCase:
         return effective_diagnostic_options(
             request.config.getoption("--rounds", default=1),
             chip_swimlane=0,
+            l0_swimlane=False,
             dump_args=0,
             pmu=0,
             dep_gen=request.config.getoption("--enable-dep-gen", default=False),
@@ -2436,6 +2454,7 @@ class SceneTestCase:
         rounds = request.config.getoption("--rounds", default=1)
         skip_golden = request.config.getoption("--skip-golden", default=False)
         enable_chip_swimlane = request.config.getoption("--enable-chip-swimlane", default=0)
+        enable_l0_swimlane = request.config.getoption("--enable-l0-swimlane", default=False)
         enable_dump_args = dump_args_level(request.config.getoption("--dump-args", default="off"))
         enable_pmu = request.config.getoption("--enable-pmu", default=0)
         enable_dep_gen = request.config.getoption("--enable-dep-gen", default=False)
@@ -2444,6 +2463,7 @@ class SceneTestCase:
         diagnostics = effective_diagnostic_options(
             rounds,
             chip_swimlane=enable_chip_swimlane,
+            l0_swimlane=enable_l0_swimlane,
             dump_args=enable_dump_args,
             pmu=enable_pmu,
             dep_gen=enable_dep_gen,
@@ -2451,6 +2471,7 @@ class SceneTestCase:
             swimlane_overhead=enable_swimlane_overhead,
         )
         enable_chip_swimlane = diagnostics.chip_swimlane
+        enable_l0_swimlane = diagnostics.l0_swimlane
         enable_dump_args = diagnostics.dump_args
         enable_pmu = diagnostics.pmu
         enable_dep_gen = diagnostics.dep_gen
@@ -2474,6 +2495,7 @@ class SceneTestCase:
             rounds=rounds,
             skip_golden=skip_golden,
             enable_chip_swimlane=enable_chip_swimlane,
+            enable_l0_swimlane=enable_l0_swimlane,
             enable_dump_args=enable_dump_args,
             enable_pmu=enable_pmu,
             enable_dep_gen=enable_dep_gen,
@@ -2558,6 +2580,14 @@ class SceneTestCase:
             metavar="PERF_LEVEL",
             help="Enable chip swimlane. Bare flag=level 4 (full). "
             "1=AICore timing, 2=+dispatch/fanout, 3=+sched phases, 4=+orch phases",
+        )
+        parser.add_argument(
+            "--enable-l0-swimlane",
+            action="store_true",
+            default=False,
+            help="Enable the L0 hardware-sampler capture (writes "
+            "<output_prefix>/l0_dfx_capture/). Independent of "
+            "--enable-chip-swimlane; not implied by any chip-swimlane level.",
         )
         parser.add_argument(
             "--dump-args",
@@ -2670,6 +2700,7 @@ class SceneTestCase:
             diagnostics = effective_diagnostic_options(
                 args.rounds,
                 chip_swimlane=args.enable_chip_swimlane,
+                l0_swimlane=args.enable_l0_swimlane,
                 dump_args=args.dump_args,
                 pmu=args.enable_pmu,
                 dep_gen=args.enable_dep_gen,
@@ -2679,6 +2710,7 @@ class SceneTestCase:
         except ValueError as e:
             parser.error(str(e))
         args.enable_chip_swimlane = diagnostics.chip_swimlane
+        args.enable_l0_swimlane = diagnostics.l0_swimlane
         args.dump_args = diagnostics.dump_args
         args.enable_pmu = diagnostics.pmu
         args.enable_dep_gen = diagnostics.dep_gen
@@ -2796,6 +2828,7 @@ class SceneTestCase:
                                 rounds=args.rounds,
                                 skip_golden=args.skip_golden,
                                 enable_chip_swimlane=args.enable_chip_swimlane,
+                                enable_l0_swimlane=args.enable_l0_swimlane,
                                 enable_dump_args=args.dump_args,
                                 enable_pmu=args.enable_pmu,
                                 enable_dep_gen=args.enable_dep_gen,
@@ -2838,6 +2871,8 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
         common.append("--skip-golden")
     if args.enable_chip_swimlane:
         common += ["--enable-chip-swimlane", str(args.enable_chip_swimlane)]
+    if args.enable_l0_swimlane:
+        common.append("--enable-l0-swimlane")
     if args.dump_args:
         common += ["--dump-args", str(args.dump_args)]
     if args.enable_pmu:

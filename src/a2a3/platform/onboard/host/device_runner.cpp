@@ -389,6 +389,10 @@ int DeviceRunner::prepare_execution(
     std::unique_ptr<PreparedExecution> *prepared
 ) {
     if (prepared == nullptr || *prepared != nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    if (config.enable_l0_swimlane != 0) {
+        LOG_ERROR("L0 swimlane is supported only on A5 onboard hardware");
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
     auto execution = std::make_unique<PreparedExecution>(identity, runtime, config, pipeline_slot);
     execution->scheduler_runtime_mode = last_scheduler_runtime_mode();
     // Resolved from this run's own CallConfig rather than read off the runner:

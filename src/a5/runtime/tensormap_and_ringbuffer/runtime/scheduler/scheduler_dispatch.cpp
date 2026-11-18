@@ -32,6 +32,7 @@
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/args_dump_aicpu.h"
+#include "common/l0_profiling.h"
 
 // =============================================================================
 // Dispatch helpers
@@ -987,6 +988,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     // "now" so the first budget cycle starts when this thread does, not at
     // an undefined value.
     uint64_t last_progress_ts = get_sys_cnt_aicpu();
+    // One cadence per scheduler thread is enough: each physical core keeps its
+    // own L0 cursor, so staggered task starts need no per-core timer.
+    uint64_t last_l0_checkpoint_ts = last_progress_ts;
     bool stall_warning_reported = false;
     // Per-device override latched once at worker init by simpler_aicpu_init
     // (InitArgs.scheduler_timeout_ms -> resident-SO global). 0 means no
@@ -1050,6 +1054,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 }
             }
         }
+        bool l0_checkpoint_due = completed_this_turn > 0;
 
 #if SIMPLER_DFX
         // Close the Complete phase BEFORE the async-wait poll so async-engine
@@ -1107,6 +1112,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 int32_t new_total = prev + poll_result.completed;
                 last_progress_count = new_total;
                 made_progress = true;
+                l0_checkpoint_due = true;
             }
 #if SIMPLER_DFX
             // AsyncPoll phase: the async-wait completion poll, split out of
@@ -1139,6 +1145,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             }
 #endif
         }
+
+        simpler::dfx::l0::tick_checkpoint(thread_idx, last_l0_checkpoint_ts, l0_checkpoint_due, [] {
+            return get_sys_cnt_aicpu();
+        });
 
         bool try_pushed = false;
 

@@ -2237,6 +2237,7 @@ int DeviceRunnerBase::ensure_aicpu_runtime_registered(rtStream_t control_stream)
     for (size_t i = 0; i < extra_count && extra != nullptr; ++i) {
         if (extra[i] != nullptr) extra_symbols.emplace_back(extra[i]);
     }
+    append_arch_aicpu_symbols(extra_symbols);
     rc = load_aicpu_op_.Init(extra_symbols);
     if (rc != 0) {
         LOG_ERROR("LoadAicpuOp::Init failed: %d", rc);
@@ -4031,9 +4032,11 @@ int DeviceRunnerBase::admit_recording(PreparedExecution &prepared) {
     return PTO_RUNTIME_ERR_INVALID_STATE;
 }
 
-int DeviceRunnerBase::queue_run_entry(PreparedExecution &prepared, LaunchProgressSink &sink) {
+int DeviceRunnerBase::queue_run_entry(
+    PreparedExecution &prepared, LaunchProgressSink &sink, std::function<int()> after_publish
+) {
     return submission_storage_[prepared.pipeline_slot]->caller_order->fork(prepared.identity, sink, [&] {
-        const int rc = publish_for_launch(prepared.kernel_args, prepared.streams.aicpu, sink, prepared.recording);
+        int rc = publish_for_launch(prepared.kernel_args, prepared.streams.aicpu, sink, prepared.recording);
         if (rc == 0 && prepared.kernel_args.args.run_result_data_base != 0) {
             std::lock_guard<std::mutex> lock(run_result_mu_);
             run_result_storage_.at(prepared.identity.run_epoch).initialized = true;
@@ -4041,6 +4044,7 @@ int DeviceRunnerBase::queue_run_entry(PreparedExecution &prepared, LaunchProgres
         if (rc == 0 && prepared.kernel_args.args.device_wall_data_base != 0) {
             device_timing_armed_[prepared.pipeline_slot] = true;
         }
+        if (rc == 0 && after_publish) rc = after_publish();
         return rc;
     });
 }
@@ -4682,6 +4686,7 @@ int DeviceRunnerBase::poll_run_fence(const PreparedExecution &prepared) {
 int DeviceRunnerBase::wait_execution_completion(ActiveExecution &active) {
     if (active.prepared == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
     PreparedExecution &prepared = *active.prepared;
+    if (prepared.retirement_device_rc != 0) return prepared.retirement_device_rc;
     if (!prepared.physical_complete) {
         const RunBoundaryWait observed = wait_and_retain_run_boundaries(
             run_fence(prepared.pipeline_slot), run_boundaries_observed_, prepared.identity,

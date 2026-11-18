@@ -31,9 +31,13 @@
 #include "aicpu_loader/host/load_aicpu_op.h"
 
 #include <cstddef>
+#include <exception>
+#include <filesystem>
 #include <future>
+#include "host/l0_trace_records.h"
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "aicpu_topology_probe.h"
@@ -106,6 +110,10 @@ int DeviceRunner::fill_persistent_arch_fields(KernelArgs *args, uint64_t device_
         LOG_ERROR("fill_persistent_arch_fields: init_aicore_register_addresses failed: %d", rc);
     }
     return rc;
+}
+
+void DeviceRunner::append_arch_aicpu_symbols(std::vector<std::string> &symbols) const {
+    symbols.emplace_back("simpler_aicpu_l0_config");
 }
 
 DeviceRunner::~DeviceRunner() { finalize(); }
@@ -653,6 +661,60 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
                         chip_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
                     }
                 }
+                if (!prepared.recording && prepared.dfx.l0_swimlane_enabled()) {
+                    const auto disable_l0 = [&](int setup_rc, bool abandon_channels) -> int {
+                        if (abandon_channels || l0_capture_session_.device_io_failed() ||
+                            l0_capture_collector_.device_io_failed()) {
+                            l0_capture_session_.reset(/*abandon_device_resources=*/true);
+                            mark_device_unusable(setup_rc);
+                            return setup_rc;
+                        }
+                        l0_capture_collector_.finalize([this](void *ptr) {
+                            return mem_alloc_.free(ptr);
+                        });
+                        l0_capture_session_.reset();
+                        if (l0_capture_session_.channels_unresolved()) {
+                            mark_device_unusable(setup_rc);
+                            return setup_rc;
+                        }
+                        LOG_WARN("L0 setup failed (%d); continuing without L0 capture", setup_rc);
+                        prepared.dfx.enable_l0_swimlane = false;
+                        prepared.kernel_args.args.enable_profiling_flag &= ~SIMPLER_DFX_FLAG_L0_SWIMLANE;
+                        return 0;
+                    };
+                    try {
+                        // The register table is indexed by physical sub-core ID.
+                        // Available IDs are sparse, so num_aicore is not its extent.
+                        const int l0_rc = l0_capture_session_.arm(
+                            device_id_, PLATFORM_MAX_CORES, prepared.kernel_args.args.regs, prepared.identity.run_epoch,
+                            prepared.dfx.output_prefix,
+                            [this](size_t bytes) {
+                                return mem_alloc_.alloc(bytes);
+                            },
+                            [this](void *ptr) {
+                                return mem_alloc_.free(ptr);
+                            }
+                        );
+                        if (l0_rc != 0) {
+                            const int fallback_rc = disable_l0(l0_rc, false);
+                            if (fallback_rc != 0) return fallback_rc;
+                        } else if (int capture_rc = init_l0_capture_collector(prepared); capture_rc != 0) {
+                            const int fallback_rc = disable_l0(capture_rc, false);
+                            if (fallback_rc != 0) return fallback_rc;
+                        } else if (int start_rc = l0_capture_session_.start_capture_channels(); start_rc != 0) {
+                            const int fallback_rc = disable_l0(start_rc, l0_capture_session_.has_open_channels());
+                            if (fallback_rc != 0) return fallback_rc;
+                        } else {
+                            l0_capture_collector_.start([this](std::function<void()> fn) {
+                                return create_thread(std::move(fn));
+                            });
+                        }
+                    } catch (const std::exception &error) {
+                        LOG_WARN("L0 setup raised an exception: %s", error.what());
+                        const int fallback_rc = disable_l0(PTO_RUNTIME_ERR_INTERNAL, false);
+                        if (fallback_rc != 0) return fallback_rc;
+                    }
+                }
 
                 // Launch the AICore worker BEFORE the AICPU Run task. This is a first-launch
                 // latency optimization, not a correctness requirement (the handshake is
@@ -687,7 +749,19 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
                 const int join_rc = queue_cross_run_wait(prepared, streams.aicpu, sink);
                 if (join_rc != 0) return join_rc;
             }
-            if (int caller_rc = queue_run_entry(prepared, sink); caller_rc != 0) return caller_rc;
+            const auto configure_l0 = [&]() -> int {
+                if (!prepared.dfx.l0_swimlane_enabled()) return 0;
+                // The entry fork records its event after this config launch. The
+                // AICore stream waits for that event, so the asynchronous config
+                // task finishes before the AICore kernel starts.
+                L0ConfigArgs config =
+                    l0_capture_session_.config_args(reinterpret_cast<uint64_t>(l0_capture_collector_.device_shm()));
+                int l0_rc = launch_aicpu_payload(streams.aicpu, &config, sizeof(config), "simpler_aicpu_l0_config", 1);
+                if (l0_rc != 0) return l0_rc;
+                sink.mark_submitted();
+                return 0;
+            };
+            if (int caller_rc = queue_run_entry(prepared, sink, configure_l0); caller_rc != 0) return caller_rc;
 
             // After any cross-run wait and before the kernel: the instant this stream was
             // released to begin this run's AICore work. A record is not a wait and no stream
@@ -787,9 +861,116 @@ int DeviceRunner::poll_execution(const ActiveExecution &active) {
     return rc;
 }
 
+int DeviceRunner::init_l0_capture_collector(PreparedExecution &prepared) {
+    std::vector<uint32_t> physical_ids;
+    physical_ids.reserve(PLATFORM_MAX_CORES);
+    for (uint32_t core = 0; core < PLATFORM_MAX_CORES; ++core)
+        physical_ids.push_back(core);
+    auto alloc_cb = [this](size_t bytes) {
+        return mem_alloc_.alloc(bytes);
+    };
+    auto free_cb = [this](void *ptr) {
+        return mem_alloc_.free(ptr);
+    };
+    const int l0_producer_threads = prepared.runtime->l0_sampler_thread_count();
+    int rc = l0_capture_collector_.init(
+        physical_ids, l0_producer_threads, l0_capture_session_.buffers(), alloc_cb, free_cb, device_id_
+    );
+    if (rc != 0) return rc;
+    rc = l0_capture_collector_.begin_run(
+        prepared.identity.run_epoch, std::filesystem::path(prepared.dfx.output_prefix) / "l0_dfx_capture",
+        l0_capture_session_.ring_len(), l0_capture_session_.ring_capacity(), l0_capture_session_.aic_frequency_hz(),
+        l0_capture_session_.aiv_frequency_hz()
+    );
+    if (rc != 0) return rc;
+    return 0;
+}
+
+int DeviceRunner::collect_l0_terminal(PreparedExecution &prepared) {
+    if (!l0_capture_session_.active()) return 0;
+    if (device_unusable_.load(std::memory_order_acquire)) {
+        l0_capture_session_.reset(/*abandon_device_resources=*/true);
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    auto free_cb = [this](void *ptr) {
+        return mem_alloc_.free(ptr);
+    };
+    const bool capture_collector_ready = l0_capture_collector_.initialized();
+
+    const int channel_rc = l0_capture_session_.stop_producer();
+    if (channel_rc != 0) {
+        mark_device_unusable(channel_rc);
+        l0_capture_session_.reset(/*abandon_device_resources=*/true);
+        return channel_rc;
+    }
+    if (capture_collector_ready) {
+        // The AICPU run entry publishes the terminal range at run exit, so this
+        // final drain pass collects it without a separate snapshot launch.
+        l0_capture_collector_.stop();
+        l0_capture_collector_.drain_remaining();
+        if (!l0_capture_collector_.dump_gm_rings()) {
+            LOG_WARN(
+                "L0 GM snapshot incomplete for run %llu", static_cast<unsigned long long>(prepared.identity.run_epoch)
+            );
+        }
+    }
+    // L0 collection is best-effort: a sampling or transport failure is logged
+    // and never fails the run. A producer-stop failure above instead fails
+    // this run because subsequent device reads would be unsafe.
+    bool terminal_status_ok = false;
+    const int read_rc = l0_capture_session_.read_terminal_snapshot();
+    if (read_rc == 0) {
+        terminal_status_ok = !capture_collector_ready || l0_capture_session_.verify_terminal_status() == 0;
+        if (!terminal_status_ok) {
+            LOG_WARN(
+                "L0 terminal status verification failed for run %llu",
+                static_cast<unsigned long long>(prepared.identity.run_epoch)
+            );
+        }
+    } else {
+        LOG_WARN(
+            "L0 terminal snapshot read failed for run %llu",
+            static_cast<unsigned long long>(prepared.identity.run_epoch)
+        );
+    }
+    std::vector<uint32_t> l0_physical_core_types;
+    if (capture_collector_ready) {
+        if (!l0_capture_collector_.reconcile(terminal_status_ok)) {
+            LOG_WARN(
+                "L0 capture reconciliation reported incomplete data for run %llu",
+                static_cast<unsigned long long>(prepared.identity.run_epoch)
+            );
+        }
+        l0_physical_core_types = l0_capture_collector_.physical_core_types();
+        l0_capture_collector_.finalize(free_cb);
+        if (l0_capture_collector_.output_failed()) {
+            LOG_WARN(
+                "L0 capture transport or output failed for run %llu",
+                static_cast<unsigned long long>(prepared.identity.run_epoch)
+            );
+        }
+    }
+    if (capture_collector_ready) {
+        const auto run_dir = std::filesystem::path(prepared.dfx.output_prefix) / "l0_dfx_capture" / "l0_raw" /
+                             ("run_" + std::to_string(prepared.identity.run_epoch));
+        if (!export_l0_event_records(
+                run_dir, prepared.identity.run_epoch, l0_capture_session_.aic_frequency_hz(),
+                l0_capture_session_.aiv_frequency_hz(), l0_physical_core_types
+            )) {
+            LOG_WARN(
+                "L0 raw capture succeeded, but structured event export failed for run %llu",
+                static_cast<unsigned long long>(prepared.identity.run_epoch)
+            );
+        }
+    }
+    l0_capture_session_.reset(device_unusable_.load(std::memory_order_acquire));
+    return 0;
+}
+
 int DeviceRunner::retire_completed_execution(ActiveExecution &active) {
     if (active.prepared == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
     PreparedExecution &prepared = *active.prepared;
+    if (prepared.retirement_device_rc != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
     if (!prepared.resources_owned)
         return prepared.physical_complete ? SIMPLER_NATIVE_RUN_POLL_COMPLETE : SIMPLER_NATIVE_RUN_POLL_ERROR;
     const int poll_rc = poll_execution(active);
@@ -798,6 +979,11 @@ int DeviceRunner::retire_completed_execution(ActiveExecution &active) {
     const int wait_rc = poll_boundary_waits(prepared);
     if (wait_rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return wait_rc;
     read_device_wall_ns(prepared.pipeline_slot);
+    if (const int l0_rc = collect_l0_terminal(prepared); l0_rc != 0) {
+        prepared.retirement_device_rc = l0_rc;
+        cleanup_execution(prepared, true);
+        return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    }
     if (prepared.dfx.chip_swimlane_enabled() && prepared.kernel_args.runtime_args_published() &&
         !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
         LOG_WARN("Runtime chip-swimlane extension publication failed");
@@ -814,6 +1000,8 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     if (active.prepared == nullptr) return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
     PreparedExecution &prepared = *active.prepared;
     const uint32_t pipeline_slot = prepared.pipeline_slot;
+    if (prepared.retirement_device_rc != 0)
+        return DrainOutcome::device_error(prepared.retirement_device_rc, prepared.physical_complete);
     if (!prepared.resources_owned && prepared.physical_complete) {
         const int rc = wait_run_fence(prepared);
         if (rc != 0) {
@@ -896,6 +1084,11 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
         return DrainOutcome::device_error(discharge_rc, prepared.physical_complete);
     }
 
+    if (const int l0_rc = collect_l0_terminal(prepared); l0_rc != 0) {
+        prepared.retirement_device_rc = l0_rc;
+        return DrainOutcome::device_error(l0_rc, prepared.physical_complete);
+    }
+
     if (prepared.dfx.chip_swimlane_enabled() && prepared.kernel_args.runtime_args_published() &&
         !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
         LOG_WARN("Runtime chip-swimlane extension publication failed");
@@ -971,6 +1164,33 @@ void DeviceRunner::emit_device_dep_gen_graph(
 
 void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool launched) noexcept {
     if (!prepared.resources_owned) return;
+    // The drain thread can still be copying directly from an L0 GM ring.
+    // Stop it before any path below can release those rings.
+    if (l0_capture_collector_.initialized()) l0_capture_collector_.stop();
+    if (l0_capture_session_.active()) {
+        bool abandon_l0 = device_unusable_.load(std::memory_order_acquire);
+        if (!abandon_l0) {
+            // A partial launch can still have a producer in flight. A failure
+            // to synchronize quarantines the GM allocation for device close.
+            const auto &streams = prepared.streams;
+            if ((streams.aicore != nullptr && aclrtSynchronizeStream(static_cast<aclrtStream>(streams.aicore)) != 0) ||
+                (streams.aicpu != nullptr && aclrtSynchronizeStream(static_cast<aclrtStream>(streams.aicpu)) != 0)) {
+                abandon_l0 = true;
+                device_unusable_.store(true, std::memory_order_release);
+            }
+        }
+        l0_capture_session_.reset(abandon_l0);
+        if (l0_capture_session_.channels_unresolved()) device_unusable_.store(true, std::memory_order_release);
+    }
+    if (l0_capture_collector_.initialized()) {
+        if (device_unusable_.load(std::memory_order_acquire)) {
+            l0_capture_collector_.stop_for_device_failure();
+        } else {
+            l0_capture_collector_.finalize([this](void *ptr) {
+                return mem_alloc_.free(ptr);
+            });
+        }
+    }
 
     // Before anything is released, and before the poison is read: a queued
     // stream wait naming one of this run's boundaries must not outlive the
@@ -1292,6 +1512,8 @@ int DeviceRunner::finalize_impl() {
     // Stop collector threads locally, drain and force-reset the card, then
     // forget the old generation's handles.
     if (device_unusable_.load(std::memory_order_acquire)) {
+        l0_capture_session_.reset(/*abandon_device_resources=*/true);
+        if (l0_capture_collector_.initialized()) l0_capture_collector_.stop_for_device_failure();
         begin_fatal_close();
         stop_shared_collectors_for_device_failure();
         dep_gen_collector_.stop_for_device_failure();
@@ -1342,8 +1564,11 @@ int DeviceRunner::finalize_impl() {
             }
             return owns_device_reset && reset_rc != 0 ? reset_rc : PTO_RUNTIME_ERR_INVALID_STATE;
         }
+        l0_capture_session_.confirm_device_reset();
         abandon_shared_collectors_after_device_reset();
         dep_gen_collector_.abandon_after_device_reset();
+        if (l0_capture_collector_.initialized() || l0_capture_collector_.device_io_failed())
+            l0_capture_collector_.abandon_after_device_reset();
         int abandon_rc = abandon_common_after_device_failure();
         owned_context_ = nullptr;
         rts_device_ref_ = acl_device_ref_ = false;
@@ -1369,6 +1594,13 @@ int DeviceRunner::finalize_impl() {
                 return rc;
             }
         }
+        l0_capture_session_.reset();
+        if (l0_capture_collector_.initialized()) {
+            l0_capture_collector_.finalize([this](void *ptr) {
+                return mem_alloc_.free(ptr);
+            });
+        }
+
         // A failed terminal release still owns memory in this allocator/context.
         // Preserve both for a later close, before any allocator sweep or reset.
         collector_rc = finalize_collectors();
@@ -1587,6 +1819,7 @@ int DeviceRunner::prepare_collector_storage(const Runtime &runtime, PreparedExec
     uint32_t enable_profiling_flag = SIMPLER_DFX_FLAG_NONE;
     if (dfx.dump_args_enabled()) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
     if (dfx.chip_swimlane_enabled()) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
+    if (dfx.l0_swimlane_enabled()) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_L0_SWIMLANE);
     if (dfx.pmu_enabled) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_PMU);
     // The device flag drives the AICPU writer only; a host-orch runtime has no
     // device-side dep_gen to switch on.

@@ -31,6 +31,7 @@
 #include "aicpu/platform_entry_args.h"
 #include "callable_protocol.h"
 #include "common/kernel_args.h"
+#include "common/l0_profiling.h"
 #include "dispatch_payload.h"
 #include "runtime.h"
 #include "tensormap_and_ringbuffer/kernel_launch_admission.h"
@@ -1085,6 +1086,15 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     // The retirement claim makes repeated requests harmless; orchestrator
     // threads own no group. Initializers service requests that precede READY.
     int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx);
+    // Each scheduler lane owns one L0 partition, including lanes that skipped
+    // dispatch after a peer marked the run complete. The shared snapshot entry
+    // leaves an already completed partition unchanged. The snapshot runs after
+    // a successful shutdown, reading a retired sampler in HBG's order; a failed
+    // shutdown leaves the cores unretired and their sampler registers unread.
+    if (shutdown_rc == 0 && thread_idx < sched_thread_num_) {
+        const CoreTracker &tracker = sched_ctx_.core_tracker(thread_idx);
+        simpler_aicpu_l0_snapshot(thread_idx, tracker.core_ids(), tracker.core_num());
+    }
     // Both outcomes reach the terminal record before this thread's arrival, and
     // with the state that produced each: folding shutdown_rc into run_rc first
     // would publish a teardown failure as an execution one.

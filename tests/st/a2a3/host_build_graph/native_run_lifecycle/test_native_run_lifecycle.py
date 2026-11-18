@@ -130,13 +130,14 @@ class TestNativeRunLifecycle(SceneTestCase):
         rounds=1,
         skip_golden=False,
         enable_chip_swimlane=False,
+        enable_l0_swimlane=False,
         enable_dump_args=False,
         enable_pmu=0,
         enable_dep_gen=False,
         enable_scope_stats=False,
         output_prefix="",
     ):
-        del rounds, skip_golden, enable_chip_swimlane, enable_dump_args
+        del rounds, skip_golden, enable_chip_swimlane, enable_l0_swimlane, enable_dump_args
         del enable_pmu, enable_dep_gen, enable_scope_stats, output_prefix
         config = self._build_config(case.get("config", {}))
         chip_worker = worker._chip_worker

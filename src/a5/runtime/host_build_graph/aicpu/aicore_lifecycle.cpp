@@ -30,6 +30,7 @@
 #include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/pmu_collector_aicpu.h"
+#include "common/l0_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/unified_log.h"
 #include "runtime.h"
@@ -151,6 +152,7 @@ void AicoreLifecycle::handshake_partition(Runtime *runtime, int32_t tidx, int32_
             // Discovery also owns failure cleanup, even if a peer never reports.
             cores_[i] = {regs[physical_core_id], physical_core_id, handshake->core_type};
             physical_core_ids_[i] = physical_core_id;
+            simpler::dfx::l0::l0_live_capture_note_core_type(physical_core_id, handshake->core_type == CoreType::AIC);
         }
         if (scheduler_watchdog_expired(wait_start, get_sys_cnt_aicpu(), timeout_cycles)) {
             LOG_ERROR("A5 HBG AICore Scheduler handshake timeout thread=%d remaining=%d", tidx, remaining);

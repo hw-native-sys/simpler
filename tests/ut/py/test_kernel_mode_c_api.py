@@ -231,6 +231,7 @@ class CallConfig(ctypes.Structure):
     _fields_ = [
         ("aicpu_thread_num", ctypes.c_int32),
         ("enable_chip_swimlane", ctypes.c_int32),
+        ("enable_l0_swimlane", ctypes.c_int32),
         ("enable_dump_args", ctypes.c_int32),
         ("enable_pmu", ctypes.c_int32),
         ("enable_dep_gen", ctypes.c_int32),

@@ -113,6 +113,7 @@ public:
     // Shutdown AICore registers for this thread's assigned cores.
     // Also runs PMU finalize (SIMPLER_DFX) before deinit when enabled.
     // Orchestrator threads (core_trackers_[thread_idx].core_num() == 0) are a no-op.
+    const CoreTracker &core_tracker(int32_t thread_idx) const { return core_trackers_[thread_idx]; }
     int32_t shutdown(int32_t thread_idx);
 
     // Claim each core independently; requests for unpublished cores stay pending.

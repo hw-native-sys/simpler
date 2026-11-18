@@ -838,6 +838,7 @@ def run(  # noqa: PLR0913 -- one knob per CLI flag
     diagnostics = effective_diagnostic_options(
         rounds,
         chip_swimlane=0,
+        l0_swimlane=False,
         dump_args=dump_args,
         pmu=enable_pmu,
         dep_gen=enable_dep_gen,
