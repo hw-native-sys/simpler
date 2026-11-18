@@ -87,7 +87,7 @@ TEST(HbgScalarTrace, ProgressKeepsTaskIdentityAndNestedDepth) {
     trace.records = records.get();
     trace.window_start = 1;
     trace.append(SchedPhaseKind::ScalarAtomicCas, 12, 15, 7, 2);
-    trace.append(SchedPhaseKind::ScalarPayload, 10, 20, 7, 1);
+    trace.append(SchedPhaseKind::ScalarClusterMixPrepareMember, 10, 20, 7, 1);
     trace.end_iteration(true);
     trace.finish(25);
     EXPECT_EQ(trace.poll_loops, 0U);
@@ -165,7 +165,7 @@ TEST(HbgScalarTrace, ResultTimingCallsTheOperationOnceWithAndWithoutRecording) {
         profile.scalar.buffer = enabled ? buffer.get() : nullptr;
         profile.scalar.records = records.get();
         uint32_t calls = 0;
-        const bool result = scheduler_scalar_result(&local, SchedPhaseKind::ScalarPollAdmissionTail, [&] {
+        const bool result = scheduler_scalar_result(&local, SchedPhaseKind::ScalarAdvanceMixFloor, [&] {
             ++calls;
             return true;
         });
@@ -174,7 +174,7 @@ TEST(HbgScalarTrace, ResultTimingCallsTheOperationOnceWithAndWithoutRecording) {
         EXPECT_EQ(profile.scalar.committed, enabled ? 1u : 0u);
         EXPECT_EQ(profile.scalar.depth, 0u);
         if (enabled)
-            EXPECT_EQ(kind(decode(profile.scalar)[0]), static_cast<uint32_t>(SchedPhaseKind::ScalarPollAdmissionTail));
+            EXPECT_EQ(kind(decode(profile.scalar)[0]), static_cast<uint32_t>(SchedPhaseKind::ScalarAdvanceMixFloor));
     }
 }
 
@@ -263,7 +263,7 @@ TEST(HbgScalarTrace, NestedSemanticSpanOwnsItsPrimitiveAndBindingEndsWithItsScop
         binding.attach(&profile.scalar);
         EXPECT_EQ(
             scheduler_scalar_result(
-                &local, SchedPhaseKind::ScalarClaimSealConfirm,
+                &local, SchedPhaseKind::ScalarMixLaneOrderReady,
                 [&] {
                     return scheduler_gm_fetch_add(word, UINT64_C(0));
                 }
@@ -320,8 +320,8 @@ TEST(HbgScalarTrace, FunctionThresholdKeepsLongSpansAndEveryPrimitive) {
     trace.records = records.get();
     trace.function_min_cycles = 100;
     trace.window_start = 1;
-    trace.append_function(SchedPhaseKind::ScalarOrderedPoll, 10, 109, 7, 1);
-    trace.append_function(SchedPhaseKind::ScalarOrderedFill, 10, 110, 7, 1);
+    trace.append_function(SchedPhaseKind::ScalarMixLaneOrderReady, 10, 109, 7, 1);
+    trace.append_function(SchedPhaseKind::ScalarAdvanceMixFloor, 10, 110, 7, 1);
     trace.append(SchedPhaseKind::ScalarAtomicCas, 20, 21, 7, 3);
     trace.append(SchedPhaseKind::ScalarDcciOut, 21, 22, 7, 3);
     trace.append(SchedPhaseKind::ScalarDsbAll, 22, 23, 7, 3);
@@ -332,7 +332,7 @@ TEST(HbgScalarTrace, FunctionThresholdKeepsLongSpansAndEveryPrimitive) {
     EXPECT_EQ(buffer->scalar_short_intervals, 1u);
     EXPECT_EQ(buffer->scalar_function_min_cycles, 100u);
     EXPECT_EQ(buffer->scalar_dropped, 0u);
-    EXPECT_EQ(kind(decode(trace)[0]), static_cast<uint32_t>(SchedPhaseKind::ScalarOrderedFill));
+    EXPECT_EQ(kind(decode(trace)[0]), static_cast<uint32_t>(SchedPhaseKind::ScalarAdvanceMixFloor));
     EXPECT_EQ(kind(decode(trace)[1]), static_cast<uint32_t>(SchedPhaseKind::ScalarAtomicCas));
     EXPECT_EQ(kind(decode(trace)[2]), static_cast<uint32_t>(SchedPhaseKind::ScalarDcciOut));
     EXPECT_EQ(kind(decode(trace)[3]), static_cast<uint32_t>(SchedPhaseKind::ScalarDsbAll));
@@ -416,7 +416,7 @@ TEST(HbgScalarTrace, FilteringSemanticParentsDoesNotSuppressAtomicChildren) {
     uint64_t word = 3;
     EXPECT_EQ(
         scheduler_scalar_result(
-            &local, SchedPhaseKind::ScalarClaimSealConfirm,
+            &local, SchedPhaseKind::ScalarMixLaneOrderReady,
             [&] {
                 return scheduler_gm_fetch_add(word, UINT64_C(0));
             }
@@ -565,7 +565,7 @@ TEST(HbgScalarTrace, LinkedTranslationUnitsRetainTheirInstrumentationPolicy) {
         EXPECT_EQ(profiled.join_word, plain.join_word);
         EXPECT_EQ(profiled.bypass_loads, 1u);
         EXPECT_EQ(profiled.atomic_adds, 1u);
-        EXPECT_EQ(profiled.ordered_polls, 1u);
+        EXPECT_EQ(profiled.floor_checks, 1u);
         EXPECT_EQ(scheduler_scalar_current(), nullptr);
     }
 }

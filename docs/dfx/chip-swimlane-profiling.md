@@ -168,12 +168,11 @@ The outer `window` interval is used for accounting but is not drawn.
 
 `scheduler_fill_own_slots` expands into its actual callees. Ordinary work
 shows token discovery/refill, Claim and Call reception, incremental fanin
-observation, and direct token transfer to execution. Cooperative discovery and
-cluster MIX service have independent names; MIX preparation, arm, observation,
-retirement, and group ownership operations are nested beneath their callers.
-The ordered path shows its progress probe, admission staging/commit,
-local-obligation refresh, ordinary-task parking, block claim and cursor read,
-obligation close, and ordinary-entry permit. Functions without a worker argument
+observation and execution directly from the original record. Each cluster's AIV0
+publishes MIX groups. The trace names preparation, member arrival, execution,
+completion accounting, and descriptor reuse. The two order checks are
+`scheduler_self_order_ready` and `scheduler_mix_lane_order_ready`. The cluster
+publisher advances its boundary in `scheduler_advance_mix_floor`. Functions without a worker argument
 use the same core-local trace binding and preserve the caller's nesting depth.
 L3 function spans shorter than 1 us are omitted on device; L4 retains every
 instrumented function span, including short empty polls. Atomic, bypass, DCCI
@@ -183,17 +182,15 @@ Names identify real functions or explicitly named function sections; parent
 intervals include their children and must not be added to child totals.
 Uninstrumented work remains in the parent's exclusive time.
 
-`scheduler_read_claim_cursor` separates context validation and reliable bypass
-reads of `claim_seal` and, only when the seal is zero, `next_block`. A valid
-terminal seal supplies the cursor directly, so the trace has no next-block probe on that path.
-`scheduler_observe_ordered_progress` separates local state,
-probes, admission-tail checks, and MIX assignment/close/arrival/release checks.
-Each worker traverses its immutable AIC or AIV task catalog. AIC discovery
-includes MIX tasks, whose active masks and coordinator rules remain unchanged.
-The catalogs contain task identities, not ready publications; task-local tickets
-and execution ownership decide who can execute a block. Missing one catalog
-entry does not establish idleness. Ordinary discovery yields after a bounded
-slice to admission, MIX, Graph controls, and async CHECK/FINISH service. DFX
+Each worker traverses its immutable task catalog. AIC workers claim pure AIC
+blocks. AIV workers claim pure vector blocks, and AIV0 can also claim a MIX
+group on behalf of its cluster. A task's final supply seal records that all
+blocks have owners. Kernel entry still observes the actual data dependencies.
+The Host records the rank of the latest earlier conflict for each lane.
+A zero threshold eliminates the opposing-source read. Otherwise a self-claimed
+candidate acquires the cluster's MIX boundary and checks any earlier published
+group. A MIX member checks the local catalog and earlier self-owned cohorts
+before committing to its group. DFX
 collection shards are independent of the task catalogs.
 Conditional probes retain their original short-circuit behavior: an unexecuted
 branch has no interval. Read-result endpoints use a return-dependent Scalar
@@ -219,10 +216,9 @@ to the measured window. Older captures without Scalar detail keep their
 coarse scheduler lanes.
 
 Detailed phases cover bootstrap, launch wait, ready refresh/claim, completion,
-slot filling, cooperative admission/MIX, payload preparation, execution return,
+source selection, cooperative MIX, payload preparation, execution return,
 completion publication, dependency resolution, async CHECK/FINISH, and exit
-work. Selected ready/admission CAS sites end at a Scalar-consumable return
-value; this does not establish remote visibility.
+work. Return-value atomics are measured through the point where the Scalar can consume the result.
 
 Memory-operation leaves distinguish atomic read/FAA/CAS/exchange, bypass
 loads/stores, DCCI issue, and DSB completion waits. DCCI labels retain the
@@ -656,7 +652,7 @@ that run's bucket is still `Admitting` — the window between its `run_begin` an
 its `run_close` — because after the close the bucket's storage belongs to the
 writer that may publish and release it at any moment.
 
-These artifacts carry no schema version. They are written by platform C++ in
+The platform task and phase rows carry no schema version. They are written by platform C++ in
 this repo and read by `swimlane_converter.py` from the same checkout and the
 same build, so a declared number could never disagree with the rows it
 describes — and a producer wrong about its own rows would stamp a wrong number
@@ -746,7 +742,7 @@ field but render differently in Perfetto:
 
 | Phase | Role | Lane | `tasks_processed` semantic |
 | ----- | ---- | ---- | -------------------------- |
-| `bootstrap` | A5 HBG AICore outer | AICore Scheduler lane | executable and control nodes scanned, admission initialized before normal scheduling |
+| `bootstrap` | A5 HBG AICore outer | AICore Scheduler lane | run topology, ordered catalog and per-cluster coordination initialized before normal scheduling |
 | `complete` | outer | sched (pid=2) | FIN'd subtasks + sub-block retires this iter |
 | `async_poll` | outer | sched | async-wait completions resolved; zero means polling consumed CPU without completing work |
 | `dispatch` | outer | sched | subtasks published this iter |
@@ -786,29 +782,32 @@ Bootstrap, Dispatch, Completion and Idle are mutually time-exclusive. For an
 ordinary token, StateProbe starts at its directory-search slice and ends when
 the worker acquires the prepared execution. Several acquisitions in one slice
 share that start, so their envelopes can overlap. Each envelope ends before its
-Dispatch; subsequent fanin, admission and physical-slot waits are outside it.
+Dispatch. Subsequent fanin and resource waits remain on the original owner.
 Use `scalar_execution_token_refill`, `scalar_execution_token_receive`,
-`scalar_execution_token_fanin`, and `scalar_execution_token_dispatch` with the
+`scalar_execution_token_fanin`, and `scalar_execution_token_select` with the
 Scalar profile's exclusive-cycle accounting to measure the underlying work.
 
-Ownership uses task-local FAA tickets and a per-execution Claim CAS. Pending
-tokens can wait for fanin while retaining their prepared Call. MIX and
-`sync_start` retain their cooperative and admission protocols. See the
+A successful task-local claim fixes the execution owner. The worker retains its
+prepared Call while waiting for fanin and executes it from the same record. MIX members execute from their SSBUF group. For `sync_start`, each physical member accepts at most one block from the same task instance. See the
 [execution ownership contract](../zh-cn/design/a5-hbg-graph-task/build-execute-separation.md).
 The shared trace vocabulary still recognizes `resolve` and `refill`, but the
 current A5 token path does not emit these outer phases.
 The A5 wire trace contains only current timing and execution identity fields: a
-256-byte per-execution trace and a 24-byte local staging record. Native protocol
-schemas v22 (ordinary) and v23 (Graph) omit the duplicate scheduler count and
-unproduced refill publication mode. Ready sources are catalog discovery (0) and
-cooperative/group preparation (3); older protocol schemas are rejected.
+256-byte per-execution trace and a 24-byte local staging record. The native protocol records
+catalog discovery (0) and cooperative/group preparation (3) as ready sources.
+Graph captures also carry the expanded node map and Graph source.
 
-For ordinary MIX, L4 block-owner Claim stamps surround the final
-`GROUP_RESERVED` to `GROUP_ARMED` CAS after staging and conflict checks. The
-earlier reservation can wait, be parked, and resume across other protocol
-events, so its old timestamps must not be attached to sequences allocated at
-publication. The recorded order is `staged`, `claim_before`, `claim_after`,
-`publish_before`, `publish_after`; sync-start ticket claims keep their own order.
+A5 HBG writes version 2 of the `aicore_execution_identities` section. Every
+version 2 execution carries a scheduling rank. The converter also reads
+unversioned identity sections from earlier runs, including ordinary executions
+with a null rank. Full ranked L4 audits still require a rank for each execution.
+
+For MIX, the L4 `claim_before` and `claim_after` stamps bracket allocation of
+the logical block. AIV0 immediately reserves the prepared group anchor. It
+waits for the preceding generation to retire before arming that anchor. AIV0
+then publishes the descriptor and its new generation between `publish_before`
+and `publish_after`. Each participating lane records its own arrival. Its final
+payload publication follows its observation that all active lanes have arrived.
 
 The `ready_claim`, `ready_steal` and `direct_refill` names were
 emitted by this scheduler between #2104 and #2178; no current scheduler emits

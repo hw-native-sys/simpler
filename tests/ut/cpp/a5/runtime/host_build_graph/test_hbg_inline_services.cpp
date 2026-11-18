@@ -20,6 +20,7 @@
 #include "hbg_scheduler_test_support.h"
 #include "scheduler/scheduler_dispatch.h"
 #include "scheduler/scheduler_graph_control.h"
+#include "test_hbg_owned_execution.h"
 
 namespace {
 
@@ -37,7 +38,6 @@ struct InlineFixture {
             protocol
         ),
         locals(workers),
-        admissions(workers),
         signals((workers + 2) / 3) {
         for (uint32_t task = 0; task < 3; ++task) {
             auto &metadata = storage.metadata[task];
@@ -92,10 +92,6 @@ struct InlineFixture {
             locals[worker]->cluster_signal = &signals[worker / 3];
 
             if (protocol) EXPECT_TRUE(scheduler_protocol_bind(base(), locals[worker]));
-            if (ordered) {
-                EXPECT_TRUE(scheduler_initialize_admission(base(), locals[worker], &admissions[worker]));
-                locals[worker]->admission = &admissions[worker];
-            }
         }
     }
 
@@ -134,25 +130,22 @@ struct InlineFixture {
     bool complete(uint32_t worker, uint32_t slot) {
         auto *local = locals[worker];
         bool permit = false;
-        if (scheduler_slot_uses_admission(local, local->slots[slot]) &&
-            (!scheduler_ordered_can_enter_slot(graph.graph(), base(), local, run(), slot, &permit) || !permit))
-            return false;
-        if (!scheduler_local_ready_execute(local, slot)) return false;
+        if (!scheduler_can_enter_execution(graph.graph(), base(), local, run(), slot, &permit) || !permit) return false;
+        if (!hbg_test_begin_execution(local, slot)) return false;
         return scheduler_complete_own_slot(graph.graph(), base(), local, run(), slot, 4);
     }
     void expect_no_dispatch(uint32_t worker) {
-        EXPECT_EQ(locals[worker]->local_ready_mask, 0u);
-        for (const auto &slot : locals[worker]->slots) {
+        EXPECT_EQ(hbg_test_eligible_mask(locals[worker]), 0u);
+        for (uint32_t index = 0; index < SCHEDULER_LOCAL_EXECUTION_COUNT; ++index) {
+            const auto &slot = locals[worker]->execution_at(index);
             EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FREE);
             EXPECT_EQ(slot.task_ref, SCHEDULER_TASK_REF_INVALID);
         }
-        EXPECT_EQ(admissions[worker].pending_task_ref, SCHEDULER_TASK_REF_INVALID);
     }
 
     scheduler_test::FixtureStorage storage;
     scheduler_test::BasicGraphBuffer<4> graph{3};
     std::vector<SchedulerLocalState *> locals;
-    std::vector<SchedulerAdmissionLocalState> admissions;
     std::vector<SchedulerClusterSignal> signals;
 };
 
@@ -207,20 +200,11 @@ TEST(HbgInlineService, ProgressesWhileAnUnrelatedMixWaitsForAnotherLane) {
         scheduler_completion_task_state(scheduler_gm_query(fixture.control(0).completion_state)),
         static_cast<int64_t>(SchedulerTaskState::DONE)
     );
-    EXPECT_EQ(fixture.admissions[1].current_task_ref, 0);
-    EXPECT_EQ(fixture.locals[1]->local_ready_mask, 0u);
-    bool waiting_mix = false;
-    for (const auto &slot : fixture.locals[1]->slots) {
-        EXPECT_NE(slot.task_ref, 1);
-        if (slot.task_ref == 0) {
-            EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FILLING);
-            waiting_mix = true;
-        } else {
-            EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FREE);
-            EXPECT_EQ(slot.task_ref, SCHEDULER_TASK_REF_INVALID);
-        }
-    }
-    EXPECT_TRUE(waiting_mix);
+    const auto &group = fixture.locals[1]->cluster_mix;
+    EXPECT_EQ(group.task_ref, 0);
+    EXPECT_NE(group.phase, SchedulerGmMixPhase::IDLE);
+    EXPECT_EQ(hbg_test_eligible_mask(fixture.locals[1]), 0u);
+    EXPECT_EQ(scheduler_execution_token_count(fixture.locals[1]), 0u);
 }
 
 TEST(HbgInlineService, FaninCompletionDoesNotWriteTheNextKernelTrace) {
@@ -242,9 +226,9 @@ TEST(HbgInlineService, ConsumerPollingServicesDummyWithoutReportingKernelRefill)
     ASSERT_TRUE(fixture.fill());
     ASSERT_TRUE(fixture.complete(1, 0));
     ASSERT_TRUE(fixture.service());
-    EXPECT_EQ(fixture.locals[1]->local_ready_mask, 0u);
-    EXPECT_EQ(fixture.locals[1]->slots[0].state, SchedulerDispatchSlotState::FREE);
-    EXPECT_EQ(fixture.locals[1]->slots[0].task_ref, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(hbg_test_eligible_mask(fixture.locals[1]), 0u);
+    EXPECT_EQ(fixture.locals[1]->execution_at(0).state, SchedulerDispatchSlotState::FREE);
+    EXPECT_EQ(fixture.locals[1]->execution_at(0).task_ref, SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(
         scheduler_completion_task_state(scheduler_gm_query(fixture.control(1).completion_state)),
         static_cast<int64_t>(SchedulerTaskState::DONE)
@@ -258,10 +242,10 @@ TEST(HbgInlineService, TwoBlocksThenDummyReleaseTheSuccessorExactlyOnce) {
     fixture.dependency(1, 0);
     fixture.dependency(2, 1);
     ASSERT_TRUE(fixture.fill());
-    ASSERT_EQ(fixture.locals[1]->slots[0].task_ref, 0);
-    const auto first = fixture.locals[1]->slots[0].block_idx;
+    ASSERT_EQ(fixture.locals[1]->execution_at(0).task_ref, 0);
+    const auto first = fixture.locals[1]->execution_at(0).block_idx;
     ASSERT_LT(first, 2u);
-    ASSERT_EQ(fixture.locals[1]->slots[1].state, SchedulerDispatchSlotState::FREE);
+    ASSERT_EQ(fixture.locals[1]->execution_at(1).state, SchedulerDispatchSlotState::FREE);
     ASSERT_TRUE(fixture.complete(1, 0));
     EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 0u);
     EXPECT_NE(
@@ -269,8 +253,8 @@ TEST(HbgInlineService, TwoBlocksThenDummyReleaseTheSuccessorExactlyOnce) {
         static_cast<int64_t>(SchedulerTaskState::DONE)
     );
     ASSERT_TRUE(fixture.fill());
-    ASSERT_EQ(fixture.locals[1]->slots[0].task_ref, 0);
-    const auto second = fixture.locals[1]->slots[0].block_idx;
+    ASSERT_EQ(fixture.locals[1]->execution_at(0).task_ref, 0);
+    const auto second = fixture.locals[1]->execution_at(0).block_idx;
     ASSERT_LT(second, 2u);
     ASSERT_NE(first, second);
     ASSERT_TRUE(fixture.complete(1, 0));
@@ -282,9 +266,9 @@ TEST(HbgInlineService, TwoBlocksThenDummyReleaseTheSuccessorExactlyOnce) {
     EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 2u);
     ASSERT_TRUE(fixture.fill());
     uint32_t successor_slots = 0;
-    for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
-        if (fixture.locals[1]->slots[slot].state != SchedulerDispatchSlotState::READY) continue;
-        ASSERT_EQ(fixture.locals[1]->slots[slot].task_ref, 2);
+    for (uint32_t slot = 0; slot < SCHEDULER_LOCAL_EXECUTION_COUNT; ++slot) {
+        if (fixture.locals[1]->execution_at(slot).state != SchedulerDispatchSlotState::READY) continue;
+        ASSERT_EQ(fixture.locals[1]->execution_at(slot).task_ref, 2);
         ++successor_slots;
         ASSERT_TRUE(fixture.complete(1, slot));
     }
@@ -380,7 +364,7 @@ TEST_P(HbgInvalidInlineMetadata, HostRejectsKernelCooperativeAndPredicateShapesW
 
 INSTANTIATE_TEST_SUITE_P(InvalidServiceWireShapes, HbgInvalidInlineMetadata, ::testing::Range<uint32_t>(0, 8));
 
-TEST(HbgInlineProtocol, RecordsOnlyRealLogicalCompletionWithoutAdmissionOrKernel) {
+TEST(HbgInlineProtocol, RecordsTheLogicalCompletionAndRankWithoutKernelEntry) {
     for (bool ordered : {false, true}) {
         InlineFixture fixture(ordered, false, true);
         ASSERT_TRUE(fixture.service_until_done(1));
@@ -393,9 +377,8 @@ TEST(HbgInlineProtocol, RecordsOnlyRealLogicalCompletionWithoutAdmissionOrKernel
         EXPECT_EQ(done.task_ref, 1);
         EXPECT_EQ(done.run_epoch, 61u);
         EXPECT_EQ(done.worker_index, 1u);
-        EXPECT_EQ(done.order_key, UINT64_MAX);
+        EXPECT_EQ(done.order_key, scheduler_order_for(fixture.base(), fixture.locals[1], 1).rank);
         EXPECT_NE(done.flags & SCHEDULER_TASK_INLINE, 0u);
-        EXPECT_EQ(tasks[1].admission.before.sequence, 0u);
         EXPECT_EQ(tasks[0].completion.before.sequence, 0u);
         const auto *executions = scheduler_state_at<SchedulerProtocolExecutionTrace>(
             fixture.base(), fixture.storage.layout.protocol.executions_offset

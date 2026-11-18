@@ -47,7 +47,6 @@ static inline __aicore__ bool admission_signal_record_visible(
 }
 
 static inline __aicore__ void admission_signal_probe(__gm__ int64_t *args, uint32_t lane) {
-    static_assert(sizeof(SchedulerAdmissionControl) == 256, "probe admission control layout mismatch");
     const uint32_t block = static_cast<uint32_t>(get_block_idx(args));
     const uint32_t blocks = static_cast<uint32_t>(args[2]);
     const uint32_t rounds = static_cast<uint32_t>(args[3]);
@@ -62,8 +61,11 @@ static inline __aicore__ void admission_signal_probe(__gm__ int64_t *args, uint3
     const uint32_t log_stride = (entries + 15) / 16 * 16;
     const uint32_t arena_words = 48 + log_stride + entries * 32 + 16;
     auto *base = reinterpret_cast<__gm__ uint64_t *>(tensor_data(args[0])) + arena * arena_words;
-    auto *control = reinterpret_cast<__gm__ SchedulerAdmissionControl *>(base);
-    auto &notice = base[32];
+    constexpr uint32_t sector_words = SCHEDULER_GM_ATOMIC_SECTOR_BYTES / sizeof(uint64_t);
+    static_assert(sector_words == 16, "the host probe reserves sixteen words per control sector");
+    auto &lock = base[0];
+    auto &tail = base[sector_words];
+    auto &notice = base[2 * sector_words];
     auto *log = reinterpret_cast<__gm__ int64_t *>(base + 48);
     auto *payloads = base + 48 + log_stride;
     auto *states = payloads + entries * 16;
@@ -80,8 +82,7 @@ static inline __aicore__ void admission_signal_probe(__gm__ int64_t *args, uint3
         bool locked = false;
         const uint64_t started = get_sys_cnt_aicore();
         while (get_sys_cnt_aicore() - started <= PLATFORM_PROF_SYS_CNT_FREQ * 5) {
-            if (scheduler_gm_compare_exchange(control->commit_lock, UINT64_C(0), static_cast<uint64_t>(rank + 1)) ==
-                0) {
+            if (scheduler_gm_compare_exchange(lock, UINT64_C(0), static_cast<uint64_t>(rank + 1)) == 0) {
                 locked = true;
                 break;
             }
@@ -92,7 +93,7 @@ static inline __aicore__ void admission_signal_probe(__gm__ int64_t *args, uint3
         }
         // The preceding publisher returned before its atomic notice and lock
         // release. This first bypass observation must see its entire prefix.
-        if (scheduler_gm_query(control->commit_tail) != index) errors |= 4;
+        if (scheduler_gm_query(tail) != index) errors |= 4;
         if (index != 0 && !admission_signal_record_visible(log, payloads, states, epoch, index - 1)) errors |= 8;
         if (static_cast<int64_t>(rank) == delayed_rank) {
             const uint64_t delay_start = get_sys_cnt_aicore();
@@ -111,17 +112,17 @@ static inline __aicore__ void admission_signal_probe(__gm__ int64_t *args, uint3
         scheduler_publish_signal(log[index], admission_signal_log_value(index));
         scheduler_publish_signal(states[index * 16], UINT64_C(3));
         scheduler_cache_barrier();
-        scheduler_publish_signal(control->commit_tail, static_cast<uint64_t>(index + 1));
+        scheduler_publish_signal(tail, static_cast<uint64_t>(index + 1));
         scheduler_cache_barrier();
         scheduler_gm_store(notice, static_cast<uint64_t>(index + 1));
-        scheduler_gm_store(control->commit_lock, UINT64_C(0));
+        scheduler_gm_store(lock, UINT64_C(0));
         ++completed;
     }
     if (completed == rounds) {
         if (!admission_signal_wait(notice, entries)) {
             errors |= 16;
         } else {
-            if (scheduler_gm_query(control->commit_tail) != entries) errors |= 32;
+            if (scheduler_gm_query(tail) != entries) errors |= 32;
             for (uint32_t round = 0; round < rounds; ++round)
                 if (!admission_signal_record_visible(log, payloads, states, epoch, round * participants + rank))
                     errors |= 64;

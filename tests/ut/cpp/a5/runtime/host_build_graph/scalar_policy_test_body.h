@@ -25,8 +25,6 @@ ScalarPolicyObservation observe_scalar_policy() {
     profiling.scalar.buffer = buffer.get();
     profiling.scalar.records = records.get();
     SchedulerLocalState local{&profiling};
-    SchedulerAdmissionLocalState admission{};
-    local.admission = &admission;
     const SchedulerGraphView view{};
     const SchedulerGraphAccess graph{view};
     uint64_t value = 37;
@@ -37,13 +35,14 @@ ScalarPolicyObservation observe_scalar_policy() {
         binding.attach(&profiling.scalar);
         // Volatile function pointers exercise emitted bodies even in optimized builds.
         auto *volatile query = static_cast<uint64_t (*)(volatile uint64_t &, int)>(&scheduler_gm_query);
-        auto *volatile poll = &scheduler_observe_ordered_progress;
+        auto *volatile advance_floor = &scheduler_advance_mix_floor;
         auto *volatile register_group =
             static_cast<scheduler_async_pending::Result (*)(scheduler_async_pending::Join &, uint64_t *)>(
                 &scheduler_async_pending::register_group
             );
         result.value = query(value, __ATOMIC_ACQUIRE);
-        (void)poll(graph, nullptr, &local, nullptr, nullptr);
+        bool progress = false;
+        (void)advance_floor(graph, nullptr, &local, nullptr, &progress);
         (void)register_group(join, nullptr);
     }
     result.join_word = join.word;
@@ -58,7 +57,7 @@ ScalarPolicyObservation observe_scalar_policy() {
         const auto kind = static_cast<SchedPhaseKind>(record.kind & 0xffffU);
         result.bypass_loads += kind == SchedPhaseKind::ScalarBypassLoad;
         result.atomic_adds += kind == SchedPhaseKind::ScalarAtomicFetchAdd;
-        result.ordered_polls += kind == SchedPhaseKind::ScalarOrderedPoll;
+        result.floor_checks += kind == SchedPhaseKind::ScalarAdvanceMixFloor;
     }
     return result;
 }

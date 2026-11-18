@@ -157,11 +157,6 @@ struct FixtureStorage {
         test_contexts(workers),
         test_graphs(workers),
         local_states(workers) {
-        for (auto &local : test_contexts)
-            for (auto &slot : local.slots)
-                scheduler_initialize_free_slot(&slot);
-        for (auto &slot : scheduler_local_state.slots)
-            scheduler_initialize_free_slot(&slot);
         EXPECT_TRUE(
             scheduler_plan_layout(task_count, &layout, false, task_count * traces_per_task, spmd, protocol_profiling)
         );
@@ -299,7 +294,7 @@ struct FixtureStorage {
         auto *controls = scheduler_state_at<SchedulerTaskControl>(scheduler_state->base(), layout.task_controls_offset);
         for (uint64_t task = 0; task < layout.task_count; ++task) {
             const auto &meta = metadata[task];
-            if (scheduler_task_requires_admission(meta)) continue;
+            if (scheduler_task_requires_sync_start(meta.flags)) continue;
             const uint32_t total = scheduler_task_is_executable(meta.flags) && !scheduler_task_is_inline(meta.flags) ?
                                        meta.logical_block_num * meta.active_mask.count() :
                                        1;
@@ -314,11 +309,15 @@ struct FixtureStorage {
         task_catalog_offset = plan.header_offset;
         scheduler_state_at<SchedulerGraphSummary>(scheduler_state->base(), layout.graph_summary_offset)
             ->task_catalog_offset = task_catalog_offset;
+        const auto bind_catalog = [&](SchedulerLocalState &local) {
+            local.config.task_catalog_offset = task_catalog_offset;
+            local.next_mix_ref = plan.header.first_mix_ref;
+        };
         for (auto &local : test_contexts)
-            local.config.task_catalog_offset = task_catalog_offset;
+            bind_catalog(local);
         for (auto &local : local_states)
-            local.config.task_catalog_offset = task_catalog_offset;
-        scheduler_local_state.config.task_catalog_offset = task_catalog_offset;
+            bind_catalog(local);
+        bind_catalog(scheduler_local_state);
     }
 
     // Dispatch tests configure synthetic wire contexts directly. Snapshot

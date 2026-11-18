@@ -30,7 +30,13 @@ FIELDS = frozenset(
 JOIN = ("run_epoch", "core_id", "reg_task_id")
 
 
-def _validate_record(record):
+def valid_source_index(index, group_kind):
+    if group_kind == 0:
+        return 0 <= index < 4
+    return group_kind == 2 and index == 4
+
+
+def _validate_record(record, *, legacy=False):
     if not isinstance(record, dict) or set(record) != FIELDS:
         raise ValueError("execution identity has missing or unknown fields")
     for field in FIELDS - {"order_key", "group_seq", "executed"}:
@@ -42,18 +48,22 @@ def _validate_record(record):
         if value is not None and (type(value) is not int or not minimum <= value < 1 << 64):
             raise ValueError(f"invalid execution identity {field}")
     group_kind = record["group_kind"]
-    if (
-        group_kind not in (0, 1, 2)
-        or (group_kind == 0) != (record["group_seq"] is None)
-        or (group_kind == 1 and record["order_key"] is None)
-        or (group_kind == 2 and (record["order_key"] is not None or record["group_seq"] % 2 != 1))
-    ):
+    rank, generation = record["order_key"], record["group_seq"]
+    if legacy:
+        # The original two pending slots carried unranked ordinary tasks, ordered
+        # groups (kind 1), or unranked cluster groups (kind 2).
+        valid_source = group_kind == 0 or (group_kind == 1 and rank is not None) or (group_kind == 2 and rank is None)
+        valid_slot = record["pending_slot"] < 2
+    else:
+        valid_source = group_kind in (0, 2) and rank is not None
+        valid_slot = valid_source_index(record["pending_slot"], group_kind)
+    if not valid_source or (group_kind == 0) != (generation is None) or (group_kind == 2 and generation % 2 != 1):
         raise ValueError("execution identity group source mismatch")
     if (
         type(record["executed"]) is not bool
         or not 0 <= record["block_idx"] < record["block_num"] <= 32767
         or record["subtask_slot"] > 2
-        or record["pending_slot"] > 1
+        or not valid_slot
         or record["cluster_lane"] > 2
     ):
         raise ValueError("invalid execution identity shape")
@@ -63,19 +73,26 @@ def attach_execution_identities(section, tasks, runtime):
     if (
         runtime != "host_build_graph"
         or not isinstance(section, dict)
-        or set(section) != {"schema", "producer", "records"}
+        or set(section) not in ({"schema", "producer", "records"}, {"schema", "version", "producer", "records"})
+        or ("version" in section and (type(section["version"]) is not int or section["version"] != 2))
         or section["schema"] != "hbg-execution-identity"
         or section["producer"] != "aicore"
         or not isinstance(section["records"], list)
     ):
         raise ValueError("invalid execution identity envelope")
+    # Before the ranked exporter gained a version tag, both layouts used this
+    # envelope. A null rank or an ordered-group source identifies the old layout.
+    legacy = "version" not in section and any(
+        isinstance(row, dict) and (row.get("order_key") is None or row.get("group_kind") == 1)
+        for row in section["records"]
+    )
     rows = {tuple(task[field] for field in JOIN): task for task in tasks}
     if len(rows) != len(tasks):
         raise ValueError("duplicate execution identity row join")
     observed, executions = set(), set()
     positions, orders, groups, block_counts = {}, {}, {}, {}
     for record in section["records"]:
-        _validate_record(record)
+        _validate_record(record, legacy=legacy)
         key = tuple(record[field] for field in JOIN)
         task = rows.get(key)
         if key in observed or task is None or task["task_id"] != record["task_id"]:
@@ -94,7 +111,7 @@ def attach_execution_identities(section, tasks, runtime):
             raise ValueError("execution identity worker changed physical position")
         order_key = (record["run_epoch"], record["task_id"])
         if orders.setdefault(order_key, record["order_key"]) != record["order_key"]:
-            raise ValueError("execution identity task has inconsistent admission order")
+            raise ValueError("execution identity task has inconsistent schedule rank")
         group_key = execution[:3]
         group = (
             record["group_seq"],

@@ -53,14 +53,13 @@ struct ProtocolExportFixture : ::testing::Test {
 
 TEST_F(ProtocolExportFixture, PreservesFrozenGraphAndHostCompletedNodeWithoutFabricatingEvents) {
     at<SchedulerTaskMetadata>(layout.task_metadata_offset)[0].logical_block_num = 99;
-    tasks[0].schedule_rank = 1;
+    tasks[0].order.rank = 1;
     tasks[0].topological_level = 0;
     tasks[0].bottom_level = 2;
     const auto json = dump();
     EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol\""), std::string::npos);
     EXPECT_EQ(json.find("\"close_seal_stride\""), std::string::npos);
-    EXPECT_NE(json.find("\"claim_tickets\":0"), std::string::npos);
-    EXPECT_EQ(json.find("\"admission_claim_lock\""), std::string::npos);
+    EXPECT_NE(json.find("\"claim_seal\":0"), std::string::npos);
     EXPECT_NE(json.find("\"block_num\":2"), std::string::npos);
     EXPECT_EQ(json.find("\"block_num\":99"), std::string::npos);
     EXPECT_NE(json.find("\"dependencies\":[0]"), std::string::npos);
@@ -70,7 +69,7 @@ TEST_F(ProtocolExportFixture, PreservesFrozenGraphAndHostCompletedNodeWithoutFab
     EXPECT_NE(json.find("\"condition_contributions\":[]"), std::string::npos);
     EXPECT_NE(json.find("\"async_mask\":0"), std::string::npos);
     EXPECT_NE(json.find("\"completion_backend\":0,\"counter_index\":18446744073709551615"), std::string::npos);
-    EXPECT_NE(json.find("\"admission_log\":[-1]"), std::string::npos);
+    EXPECT_NE(json.find("\"floor_publications\":[]"), std::string::npos);
     EXPECT_EQ(json.find("protocol_verified"), std::string::npos);
     EXPECT_NE(json.find("\"schedule_rank\":1,\"topological_level\":0,\"bottom_level\":2"), std::string::npos);
 }
@@ -152,12 +151,13 @@ TEST_F(ProtocolExportFixture, ZeroCycleAndMaximumEpochRemainLiteralValues) {
     std::copy(metadata.begin(), metadata.end(), at<SchedulerTaskMetadata>(layout.task_metadata_offset));
     ASSERT_TRUE(scheduler_init_spmd_task_records(storage->base(), layout, UINT64_MAX));
     auto *events = at<SchedulerProtocolTaskTrace>(layout.protocol.tasks_offset);
-    events[0].admission.before = {0, 1};
-    events[0].admission.run_epoch = UINT64_MAX;
+    events[0].completion.before = {0, 1};
+    events[0].completion.run_epoch = UINT64_MAX;
     const auto json = dump(UINT64_MAX);
-    EXPECT_NE(json.find("\"before\":[0,1]"), std::string::npos);
-    EXPECT_NE(json.find("\"run_epoch\":18446744073709551615"), std::string::npos);
-    EXPECT_NE(json.find("\"after\":[0,0]"), std::string::npos);
+    EXPECT_NE(
+        json.find("\"completion\":{\"before\":[0,1],\"after\":[0,0],\"run_epoch\":18446744073709551615"),
+        std::string::npos
+    );
 }
 
 TEST_F(ProtocolExportFixture, IncompleteAndErroneousRecordsAreExportedRatherThanDropped) {
@@ -202,17 +202,19 @@ TEST_F(ProtocolExportFixture, RejectsTruncatedOrMisalignedImageAndMissingFrozenT
     EXPECT_THROW(dump(), std::invalid_argument);
 }
 
-TEST_F(ProtocolExportFixture, RejectsRedirectedAdmissionRecords) {
-    at<SchedulerGraphSummary>(layout.graph_summary_offset)->admission_records_offset = layout.run_control_offset;
+TEST_F(ProtocolExportFixture, RejectsRedirectedFloorStorage) {
+    at<SchedulerProtocolLayout>(layout.protocol_layout_offset)->floors_offset = layout.run_control_offset;
     EXPECT_THROW(dump(), std::invalid_argument);
 }
 
-TEST_F(ProtocolExportFixture, PreservesMemberCountRecordBindingFrontierAndRawTopology) {
-    auto *record = at<SchedulerAdmissionRecord>(layout.admission_records_offset);
-    record->member_count = 65;
+TEST_F(ProtocolExportFixture, KeepsMemberCommitAndActualFloorPublicationSeparate) {
     auto *member = at<SchedulerProtocolMemberTrace>(layout.protocol.members_offset);
-    member->observed.sequence = 1;
-    member->close_frontier = 17;
+    member->committed.sequence = 1;
+    auto *floor = at<SchedulerProtocolFloorTrace>(layout.protocol.floors_offset);
+    floor->before.sequence = 2;
+    floor->worker_index = 2;
+    floor->prior_mix_ref = UINT32_MAX;
+    floor->floor = 17;
     auto *contexts = at<SchedulerWorkerContext>(layout.worker_contexts_offset);
     contexts[1].physical_core_id = 65;
     contexts[1].cluster_index = 0;
@@ -220,11 +222,14 @@ TEST_F(ProtocolExportFixture, PreservesMemberCountRecordBindingFrontierAndRawTop
     contexts[1].cluster_worker_ids[1] = 2;
     contexts[1].cluster_worker_ids[2] = 1;
     const auto json = dump();
-    EXPECT_NE(json.find("\"member_count\":65"), std::string::npos);
-    EXPECT_NE(json.find("\"record_offset\":" + std::to_string(layout.admission_records_offset)), std::string::npos);
-    EXPECT_EQ(json.find("\"member_words\""), std::string::npos);
-    EXPECT_EQ(json.find("\"member_rank_offset\""), std::string::npos);
-    EXPECT_NE(json.find("\"close_frontier\":17"), std::string::npos);
+    EXPECT_NE(json.find(R"("members":[{"index":0,"committed":[0,1],"retired":[0,0])"), std::string::npos);
+    EXPECT_NE(
+        json.find(
+            R"("floor_publications":[{"index":0,"before":[0,2],"after":[0,0],"run_epoch":0,"cluster_index":0,)"
+            R"("worker_index":2,"prior_mix_ref":4294967295,"floor":17}])"
+        ),
+        std::string::npos
+    );
     EXPECT_NE(json.find("\"core_id\":65"), std::string::npos);
     EXPECT_NE(json.find("\"cluster_workers\":[0,2,1]"), std::string::npos);
 }

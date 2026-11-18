@@ -57,7 +57,7 @@ def test_long_function_names_and_primitives_survive_filtered_nesting():
         record("scalar_execution_token_receive", 1000, 5000, 2, task_id=7),
         record("scalar_prepared_acquire", 2000, 4000, 3, task_id=7),
         record("scalar_dcci_out", 2500, 2600, 4),
-        record("scalar_admission", 6000, 8000, 2, task_id=7),
+        record("scalar_self_order_ready", 6000, 8000, 2, task_id=7),
     ]
     profile = partition(rows, [])
     profile.update(worker_id=0, scheduler_id=0, clock_freq_hz=1_000_000_000)
@@ -74,7 +74,7 @@ def test_long_function_names_and_primitives_survive_filtered_nesting():
         ("scheduler_execution_token_receive(t7)", 4.0),
         ("scheduler_acquire_execution_token(t7)", 2.0),
         ("DCCI: SINGLE CACHELINE_OUT issue", 0.1),
-        ("scheduler_ordered_can_enter_slot(t7)", 2.0),
+        ("scheduler_self_order_ready(t7)", 2.0),
     ]
     assert [event["args"]["scalar_depth"] for event in events] == [1, 2, 3, 4, 2]
     assert sum(profile["exclusive_cycles"].values()) == 10_000
@@ -212,44 +212,19 @@ def test_predicated_skip_is_not_counted_as_kernel_execution():
 @pytest.mark.parametrize(
     ("phase", "function"),
     [
+        ("scalar_advance_mix_floor", "scheduler_advance_mix_floor"),
+        ("scalar_self_order_ready", "scheduler_self_order_ready"),
+        ("scalar_mix_lane_order_ready", "scheduler_mix_lane_order_ready"),
         ("scalar_execution_token_refill", "scheduler_refill_execution_tokens"),
         ("scalar_prepared_acquire", "scheduler_acquire_execution_token"),
         ("scalar_prepared_claim", "scheduler_claim_execution_token"),
         ("scalar_counter_accounting", "scheduler_service_counter_accounting"),
-        ("scalar_cooperative_discover", "scheduler_discover_cooperative_task"),
         ("scalar_cluster_mix_service", "scheduler_cluster_mix_service"),
         ("scalar_group_acquire", "scheduler_acquire_group_lane"),
-        ("scalar_cluster_mix_needs_service", "scheduler_cluster_mix_needs_service"),
         ("scalar_execution_continuation", "scheduler_try_execution_continuation"),
         ("scalar_execution_token_fanin", "scheduler_execution_token_observe_fanin"),
-        ("scalar_ordered_poll", "scheduler_observe_ordered_progress"),
-        ("scalar_admission_claim", "scheduler_stage_admission_candidate"),
-        ("scalar_admission_publish", "scheduler_ordered_publish_pending"),
-        ("scalar_admission_commit", "scheduler_try_commit_admission"),
-        ("scalar_admission_refresh", "scheduler_refresh_local_obligation"),
-        ("scalar_ordinary_restore", "scheduler_ordered_restore_ordinary"),
-        ("scalar_block_claim", "scheduler_claim_ordered_block"),
-        ("scalar_block_cursor_read", "scheduler_read_claim_cursor"),
-        ("scalar_admission_close", "scheduler_close_ordered_obligation"),
-        ("scalar_ordinary_permit", "scheduler_can_enter_ordinary"),
         ("scalar_dispatch_metadata", "scheduler_load_dispatch_metadata"),
-        ("scalar_dispatch_fill", "scheduler_fill_dispatch_slot"),
         ("scalar_dispatch_publish", "scheduler_publish_dispatch_slot"),
-        ("scalar_cursor_validate", "scheduler_read_claim_cursor: validate context"),
-        ("scalar_claim_seal_probe", "scheduler_read_claim_cursor: claim_seal hint"),
-        ("scalar_claim_seal_confirm", "scheduler_read_claim_cursor: claim_seal atomic confirm"),
-        ("scalar_next_block_probe", "scheduler_read_claim_cursor: next_block hint"),
-        ("scalar_next_block_confirm", "scheduler_read_claim_cursor: next_block atomic confirm"),
-        ("scalar_poll_local_state", "scheduler_observe_ordered_progress: local state"),
-        ("scalar_poll_admission_tail", "scheduler_observe_ordered_progress: admission commit_tail"),
-        ("scalar_poll_mix_state", "scheduler_observe_ordered_progress: MIX state"),
-        ("scalar_poll_mix_close", "scheduler_observe_ordered_progress: MIX coordinator frontier"),
-        ("scalar_poll_mix_assignment", "scheduler_observe_ordered_progress: MIX assigned_seq"),
-        (
-            "scalar_poll_mix_arrived",
-            "scheduler_observe_ordered_progress: MIX arrival readiness (GM ACK or SSBUF permit)",
-        ),
-        ("scalar_poll_mix_released", "scheduler_observe_ordered_progress: MIX released_seq"),
         ("scalar_trace_finish", "SchedulerScalarTrace::finish"),
         ("scalar_trace_finish_clean", "SchedulerScalarTrace::finish: DCCI issue"),
         ("scalar_trace_finish_barrier", "SchedulerScalarTrace::finish: DSB"),
@@ -262,7 +237,7 @@ def test_fill_detail_roundtrips_nested_function_names_and_task_identity(tmp_path
     for kind, begin, end, depth in [
         ("scalar_window", 10, 100, 0),
         ("scalar_fill_own_slots", 15, 35, 1),
-        ("scalar_ordered_fill", 16, 34, 2),
+        ("scalar_service_cooperative_slots", 16, 34, 2),
         (phase, 20, 25, 3),
     ]:
         metrics = {"scalar_depth": depth, "scalar_calls": 1, "iterations_detailed": True}
@@ -294,7 +269,7 @@ def test_fill_detail_roundtrips_nested_function_names_and_task_identity(tmp_path
         scalar_profiles=data["scalar_profiles"],
     )
     details = [e for e in json.loads(output.read_text())["traceEvents"] if e["ph"] == "X" and e["pid"] == 2]
-    parent = next(e for e in details if e["name"] == "scheduler_fill_ordered_slots")
+    parent = next(e for e in details if e["name"] == "scheduler_service_groups")
     child = next(e for e in details if e["name"].startswith(function + "("))
     assert child["name"] == f"{function}(t7)"
     assert next(row for row in profile["rows"] if row["kind"] == phase)["task_id"] == 7
@@ -372,7 +347,7 @@ def test_filtered_function_scopes_keep_memory_children_and_exact_time():
     root = window() | {"function_min_cycles": 10, "short_function_intervals_omitted": 2}
     rows = [
         root,
-        record("scalar_ordered_fill", 20, 80, 1),
+        record("scalar_service_cooperative_slots", 20, 80, 1),
         record("scalar_atomic_cas", 30, 35, 3),
         record("scalar_dcci_out", 35, 39, 3),
         record("scalar_dsb_all", 40, 55, 3),

@@ -12,6 +12,7 @@
 #pragma once
 
 #include "scheduler_ready.h"
+#include "scheduler_protocol_block.h"
 
 // One fill invocation owns this snapshot; INVALID is also a cached result.
 struct SchedulerIssueSnapshot {
@@ -52,8 +53,8 @@ static inline __aicore__ bool scheduler_bind_issue_entry(
     return true;
 }
 
-// The last valid claimant publishes an immutable supply seal. Admission tasks
-// publish it only after the required member registrations are complete.
+// The final valid claim publishes the block count. Other owners may still
+// be recording their membership or waiting to execute.
 static inline __aicore__ bool scheduler_task_supply_closed(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     int64_t ref, bool *closed, const SchedulerIssueBinding *binding = nullptr
@@ -148,12 +149,18 @@ static inline __aicore__ bool scheduler_claim_ordinary_block(
 // Other owners may still receive Calls; their block assignments cannot move.
 static inline __aicore__ bool scheduler_close_ordinary_supply(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    int64_t ref, bool closes_supply, uint32_t blocks
+    int64_t ref, bool closes_supply, uint32_t blocks, uint32_t block
 ) {
     if (!closes_supply) return true;
     auto *control = scheduler_task_control_at(base, local, ref);
+    const bool trace = scheduler_protocol_enabled(local);
+    const bool cooperative =
+        trace && (scheduler_task_is_mix(scheduler_task_metadata_at(base, local, ref)->flags) ||
+                  scheduler_task_requires_sync_start(scheduler_task_metadata_at(base, local, ref)->flags));
+    if (cooperative) scheduler_protocol_claim_seal(base, local, ref, block, true, blocks);
     scheduler_cache_barrier();
     scheduler_store_signal(control->claim_seal, static_cast<uint64_t>(blocks));
+    if (cooperative) scheduler_protocol_claim_seal(base, local, ref, block, false, blocks);
     const auto &pool = *scheduler_state_at<SchedulerTaskCatalogHeader>(base, local->config.task_catalog_offset);
     const auto catalog = scheduler_task_catalog(base, pool, local->config.self_core_type);
     if (!scheduler_task_catalog_valid(catalog)) return scheduler_issue_fail(graph, local, run, ref);
@@ -167,10 +174,8 @@ static inline __aicore__ bool scheduler_close_ordinary_supply(
 
 // Private ownership only: this chooses a recheck boundary, never grants entry.
 inline __aicore__ bool scheduler_issue_needs_execution_recheck(const SchedulerLocalState *local) {
-    if (local->local_ready_mask != 0 || local->cluster_mix.phase != SchedulerGmMixPhase::IDLE ||
-        !scheduler_task_ref_is_null(local->cluster_pending.task_ref) ||
-        (local->admission != nullptr && (!scheduler_task_ref_is_null(local->admission->current_task_ref) ||
-                                         !scheduler_task_ref_is_null(local->admission->pending_task_ref))))
+    if (local->cluster_mix.phase != SchedulerGmMixPhase::IDLE ||
+        !scheduler_task_ref_is_null(local->cluster_pending.task_ref))
         return true;
     for (const auto &token : local->execution_tokens)
         if (token.phase != SchedulerExecutionTokenPhase::EMPTY) return true;

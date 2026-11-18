@@ -35,8 +35,7 @@ def capture(epoch=0):
         "active_worker_count": 3,
         "scheduler_error": 0,
         "error_claimed": 0,
-        "commit_tail": 0,
-        "commit_lock": 0,
+        "floor_count": 0,
         "first_error": dict.fromkeys(
             (
                 "task_ref core_id core_type site run_epoch order_key block_idx "
@@ -46,7 +45,18 @@ def capture(epoch=0):
         ),
         "tasks": [
             dict(
-                task_ref=0, flags=33, active_mask=2, block_num=1, trace_base=0, kernel_ids=[65535] * 3, dependencies=[]
+                task_ref=0,
+                flags=33,
+                active_mask=2,
+                block_num=1,
+                trace_base=0,
+                kernel_ids=[65535] * 3,
+                dependencies=[],
+                schedule_rank=0,
+                topological_level=0,
+                bottom_level=0,
+                cooperative_index=(1 << 32) - 1,
+                required_floor=[0, 0, 0],
             )
         ],
         "workers": [
@@ -65,8 +75,7 @@ def capture(epoch=0):
             )
             for index in range(3)
         ],
-        "admission_log": [],
-        "admissions": [],
+        "floor_publications": [],
         "task_controls": [
             dict(
                 task_ref=0,
@@ -76,8 +85,6 @@ def capture(epoch=0):
                 completion_debt=0,
                 next_block=0,
                 completed_subtasks=0,
-                admission_state=0,
-                claim_tickets=0,
                 claim_seal=0,
                 completion_backend=0,
                 async_mask=0,
@@ -89,13 +96,12 @@ def capture(epoch=0):
         "task_events": [
             dict(
                 index=0,
-                admission=None,
                 completion=dict(
                     before=[0, 1],
                     after=[5, 2],
                     run_epoch=epoch,
                     task_ref=0,
-                    order_key=(1 << 64) - 1,
+                    order_key=0,
                     worker_index=0,
                     flags=33,
                 ),
@@ -156,7 +162,8 @@ def test_counter_reader_preserves_unknown_observation_and_rejects_wrapped_values
 )
 def test_partial_task_order_metadata_is_rejected(fields):
     raw = capture()
-    raw["tasks"][0].update(dict.fromkeys(fields, 0))
+    for field in fields:
+        del raw["tasks"][0][field]
     with pytest.raises(ValueError, match=r"tasks\[0\].*missing or unknown fields"):
         read_native_protocol(raw)
 
@@ -164,7 +171,6 @@ def test_partial_task_order_metadata_is_rejected(fields):
 @pytest.mark.parametrize("field,value", (("executed_task_count", 0), ("close_seal_stride", 64)))
 def test_current_schema_rejects_retired_fields(field, value):
     raw = capture()
-    raw["task_controls"][0].update(claim_tickets=0, claim_seal=0)
     assert read_native_protocol(raw) == raw
     raw[field] = value
     with pytest.raises(ValueError, match="unknown fields"):
@@ -273,9 +279,7 @@ def test_parser_preserves_error_and_incomplete_evidence_for_diagnostics():
         audit_protocol_sequences(raw)
 
 
-@pytest.mark.parametrize(
-    "field", ("claim_tickets", "claim_seal", "canonical_total", "pending_compute", "completion_debt")
-)
+@pytest.mark.parametrize("field", ("claim_seal", "canonical_total", "pending_compute", "completion_debt"))
 @pytest.mark.parametrize("value", (None, True, -1, 1 << 64, "0"))
 def test_current_control_words_are_mandatory_uint64(field, value):
     raw = capture()

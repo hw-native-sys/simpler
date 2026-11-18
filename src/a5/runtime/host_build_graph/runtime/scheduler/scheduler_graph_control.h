@@ -93,8 +93,8 @@ static inline __aicore__ bool scheduler_service_controls(
                 metadata.flags | (notification != nullptr ? SCHEDULER_PROTOCOL_CONTROL_NOTIFY_ACCOUNTING : 0);
             // These timestamps describe the unique accounting CAS. They do not
             // identify the first of possibly several idempotent notifications.
-            scheduler_protocol_task_actor(base, local, ref, UINT64_MAX, flags, true, true, before);
-            scheduler_protocol_task_actor(base, local, ref, UINT64_MAX, flags, true, false, after);
+            scheduler_protocol_task_actor(base, local, ref, flags, true, before);
+            scheduler_protocol_task_actor(base, local, ref, flags, false, after);
         }
         scheduler_remember_task_proof(local, ref, SchedulerTaskProof::DONE);
         scheduler_report_task_completed(run);
