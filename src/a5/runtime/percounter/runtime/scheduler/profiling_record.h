@@ -133,7 +133,7 @@ struct PercounterScalarTrace {
         append(kind, begin, end, task_ref, record_depth);
     }
 
-    inline __aicore__ __attribute__((noinline)) void finish(uint64_t begin) {
+    inline __aicore__ __attribute__((noinline)) void finish(uint64_t begin, bool record_memory) {
         if (buffer == nullptr) return;
         // Evicted lines are already in GM; one whole-cache clean covers every remaining dirty trace line.
 #if defined(__CCE_AICORE__)
@@ -145,8 +145,10 @@ struct PercounterScalarTrace {
         write_cycles += end - begin;
         const uint32_t first = storage_words;
         write({begin, end, -1, static_cast<uint32_t>(ProfilePhase::TraceFinish) | (1U << 16), 1});
-        write({begin, clean_end, -1, static_cast<uint32_t>(ProfilePhase::TraceFinishCleanEntire) | (2U << 16), 1});
-        write({clean_end, end, -1, static_cast<uint32_t>(ProfilePhase::TraceFinishBarrier) | (2U << 16), 1});
+        if (record_memory) {
+            write({begin, clean_end, -1, static_cast<uint32_t>(ProfilePhase::TraceFinishCleanEntire) | (2U << 16), 1});
+            write({clean_end, end, -1, static_cast<uint32_t>(ProfilePhase::TraceFinishBarrier) | (2U << 16), 1});
+        }
         write({window_start, end, -1, static_cast<uint32_t>(ProfilePhase::Window), 1});
         // Publication of the terminal observer rows lies outside their window.
         clean_records(first);
@@ -171,6 +173,11 @@ struct PercounterScalarTrace {
 
 template <typename = void>
 struct ProfileCompilation {
+    static constexpr bool enabled = false;
+};
+
+template <typename = void>
+struct TaskProfileCompilation {
     static constexpr bool enabled = false;
 };
 }  // namespace

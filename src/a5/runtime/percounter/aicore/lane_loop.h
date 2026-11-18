@@ -73,6 +73,10 @@ struct LaneConfig {
     __gm__ PercounterTaskTiming *task_records{nullptr};
     uint32_t *profile_task_count{nullptr};
     uint32_t *task_dropped{nullptr};
+    __gm__ PercounterTaskEvent *task_events{nullptr};
+    uint32_t task_event_capacity{0};
+    mutable uint32_t task_event_count{0};
+    mutable uint32_t task_event_dropped{0};
     mutable PercounterTaskTiming pending_task{};
     mutable bool pending_task_valid{false};
     mutable AicoreWorkWindow work_window{};
@@ -134,6 +138,10 @@ inline __aicore__ void percounter_commit_task_timing(const LaneConfig &cfg) {
             record->start = cfg.pending_task.start;
             record->finish = cfg.pending_task.finish;
             TaskId::assign(record->task_token, cfg.pending_task.task_token);
+            if constexpr (task_profile_compiled) {
+                record->entry = cfg.pending_task.entry;
+                record->kernel_end = cfg.pending_task.kernel_end;
+            }
             ++*cfg.profile_task_count;
         } else if (*cfg.task_dropped != UINT32_MAX) ++*cfg.task_dropped;
     } else {
@@ -146,6 +154,30 @@ inline __aicore__ void percounter_commit_task_timing(const LaneConfig &cfg) {
         if (cfg.profile->slot_within_buf == PLATFORM_AICORE_BUFFER_SIZE) percounter_publish_stream_records(cfg.profile);
     }
     cfg.pending_task_valid = false;
+}
+
+inline __aicore__ uint64_t percounter_task_event_clock(const LaneConfig &cfg) {
+    if constexpr (task_profile_compiled) {
+        if (cfg.task_events != nullptr) return get_sys_cnt_aicore();
+    }
+    return 0;
+}
+
+inline __aicore__ void percounter_record_task_event(
+    const LaneConfig &cfg, PercounterTaskEventKind kind, uint64_t entry, uint64_t cycles, uint64_t detail = 0
+) {
+    if constexpr (task_profile_compiled) {
+        if (cycles == 0) return;
+        if (cfg.task_event_count == cfg.task_event_capacity) {
+            if (cfg.task_event_dropped != UINT32_MAX) ++cfg.task_event_dropped;
+            return;
+        }
+        auto *record = &cfg.task_events[cfg.task_event_count++];
+        record->cycles = cycles;
+        record->entry = entry;
+        record->detail = detail;
+        record->kind = kind;
+    }
 }
 
 /** Where a task's producer counters are: `addresses[0 .. count)`. */
@@ -334,11 +366,13 @@ percounter_completion_address(const LaneConfig &cfg, int64_t task_id, uint32_t b
  * is preset against every sink subtask of the body.
  */
 inline __aicore__ void percounter_publish_completion(
-    const LaneConfig &cfg, const PercounterTask &task, uint64_t completion_address, uint64_t count
+    const LaneConfig &cfg, const PercounterTask &task, uint64_t completion_address, uint64_t count, uint64_t entry
 ) {
     ProfileScope profile_scope(cfg.scalar, ProfilePhase::Complete);
     percounter_gm_fetch_add_issue(*reinterpret_cast<__gm__ uint64_t *>(completion_address), count);
+    const uint64_t issued = percounter_task_event_clock(cfg);
     if (task.sink) percounter_gm_fetch_add_issue(cfg.counters[task.shell].value, count);
+    percounter_record_task_event(cfg, PercounterTaskEventKind::CompletionIssue, entry, issued, count);
 }
 
 /** True when the lane should stop: EXIT is signalled or some lane has failed. */
@@ -444,7 +478,7 @@ inline __aicore__ __gm__ pto2::resident::AsyncGroupData *percounter_init_async_r
 // appends at most one group; the registration scratch is reusable at return.
 inline __aicore__ bool percounter_async_seal(
     const LaneConfig &cfg, PercounterLaneState *state, const PercounterTask &task, uint64_t completion_address,
-    bool *deferred
+    bool *deferred, uint64_t entry
 ) {
     ProfileScope profile_scope(cfg.scalar, ProfilePhase::AsyncSeal);
     auto *record = cfg.async_group;
@@ -498,6 +532,9 @@ inline __aicore__ bool percounter_async_seal(
     dcci(reinterpret_cast<__gm__ uint8_t *>(record), SINGLE_CACHE_LINE, CACHELINE_OUT);
     dsb((mem_dsb_t)0);
     *deferred = true;
+    percounter_record_task_event(
+        cfg, PercounterTaskEventKind::DeferRegistered, entry, percounter_task_event_clock(cfg), index + 1
+    );
     return true;
 }
 
@@ -529,9 +566,11 @@ inline __aicore__ bool percounter_async_tick(const LaneConfig &cfg, PercounterLa
             // Relay the observed peer publication to downstream task counters.
             dsb((mem_dsb_t)0);
             percounter_gm_fetch_add_issue(*reinterpret_cast<__gm__ uint64_t *>(held->completion_address), uint64_t{1});
+            const uint64_t issued = percounter_task_event_clock(cfg);
             if (held->sink) percounter_gm_fetch_add_issue(cfg.counters[held->shell].value, uint64_t{1});
             dsb((mem_dsb_t)0);  // Task/shell completion precedes global settlement.
             percounter_gm_fetch_add_issue(cfg.control->async_settled, uint64_t{1});
+            percounter_record_task_event(cfg, PercounterTaskEventKind::DeferredCompletionIssue, 0, issued, current);
             if (previous == 0) state->async_head = next;
             else {
                 auto *link = &cfg.async_completions[previous - 1];
@@ -556,7 +595,7 @@ inline __aicore__ bool percounter_async_tick(const LaneConfig &cfg, PercounterLa
 
 inline __aicore__ bool percounter_run_task(
     const LaneConfig &cfg, PercounterLaneState *state, const PercounterTask &task, int32_t block, int32_t blocks,
-    uint32_t role, uint64_t completion_address, bool *deferred
+    uint32_t role, uint64_t completion_address, bool *deferred, uint64_t entry
 ) {
     *deferred = false;
     ProfileScope profile_scope(cfg.scalar, ProfilePhase::Run);
@@ -606,6 +645,7 @@ inline __aicore__ bool percounter_run_task(
         if (cfg.scalar != nullptr) ++cfg.scalar->depth;
     }
     kernel(reinterpret_cast<__gm__ int64_t *>(arguments->args));
+    const uint64_t kernel_end = percounter_task_event_clock(cfg);
     OUT_OF_ORDER_STORE_BARRIER();
     if constexpr (profile_compiled) {
         if (cfg.scalar != nullptr) --cfg.scalar->depth;
@@ -613,6 +653,10 @@ inline __aicore__ bool percounter_run_task(
     const uint64_t end_time = get_sys_cnt_aicore();
     cfg.work_window.end_cycle = end_time;
     if (timing_enabled) {
+        if constexpr (task_profile_compiled) {
+            cfg.pending_task.kernel_end = kernel_end;
+            cfg.pending_task.entry = entry;
+        }
         cfg.pending_task.finish = end_time;
         cfg.pending_task.dispatch = receive_time;
         cfg.pending_task.start = start_time;
@@ -622,7 +666,7 @@ inline __aicore__ bool percounter_run_task(
         cfg.pending_stream_record = record;
         cfg.pending_task_valid = true;
     }
-    return percounter_async_seal(cfg, state, task, completion_address, deferred);
+    return percounter_async_seal(cfg, state, task, completion_address, deferred, entry);
 }
 
 struct PercounterCandidate {
@@ -835,10 +879,13 @@ percounter_complete_mix(const LaneConfig &cfg, PercounterLaneState *state, const
     if (completion == 0) return false;
     if (static_cast<uint64_t>(id) < cfg.table_task_count) {
         percounter_gm_fetch_add_issue(*reinterpret_cast<__gm__ uint64_t *>(completion), count);
+        percounter_record_task_event(
+            cfg, PercounterTaskEventKind::CompletionIssue, c.entry, percounter_task_event_clock(cfg), count
+        );
     } else {
         PercounterTask task;
         if (!percounter_resolve(cfg, id, &task)) return false;
-        percounter_publish_completion(cfg, task, completion, count);
+        percounter_publish_completion(cfg, task, completion, count, c.entry);
     }
     percounter_ssbuf_store_release(&record->completed, c.generation);
     state->shared_active &= ~(1U << c.index);
@@ -952,6 +999,7 @@ inline __aicore__ void percounter_own_entry(
     owned.entry = entry;
     owned.metadata = metadata;
     owned.claim_index = claim_index;
+    const uint64_t claimed = percounter_task_event_clock(cfg);
     if (!mix) {
         owned.fanin_cursor = 0;
         owned.fanin_pending = 0;
@@ -959,6 +1007,7 @@ inline __aicore__ void percounter_own_entry(
         owned.resolved = false;
         owned.ready = false;
         owned.entered = false;
+        percounter_record_task_event(cfg, PercounterTaskEventKind::Claim, entry, claimed);
         return;
     }
     state->mix_owned |= 1U << slot;
@@ -974,6 +1023,7 @@ inline __aicore__ void percounter_own_entry(
     percounter_ssbuf_store_field(&record->fanin_other, uint64_t{0});
     percounter_ssbuf_store_release(&record->generation, generation);
     percounter_ssbuf_store_release(&cfg.ssbuf->publish_sequence, state->sequence);
+    percounter_record_task_event(cfg, PercounterTaskEventKind::Claim, entry, claimed);
 }
 
 // Each interval has one final draw; each boundary has one final sector closure.
@@ -1377,6 +1427,9 @@ inline __aicore__ bool percounter_step(const LaneConfig &cfg, PercounterLaneStat
     PercounterCandidate selected = ordinary_allowed ? ordinary : PercounterCandidate{};
     if (cohort_go) selected = cohort;
     if (selected.index >= 0) {
+        percounter_record_task_event(
+            cfg, PercounterTaskEventKind::Ready, selected.entry, percounter_task_event_clock(cfg)
+        );
         if (!selected.shared && selected.mask == 0 && !cfg.has_predicates &&
             selected.sync_index == PERCOUNTER_NO_SYNC) {
             // A dependency-only block has no payload or tensor inputs to
@@ -1387,7 +1440,9 @@ inline __aicore__ bool percounter_step(const LaneConfig &cfg, PercounterLaneStat
                 percounter_order_block_num(selected.entry)
             );
             if (completion == 0) return false;
-            percounter_publish_completion(cfg, state->slots[selected.index].task, completion, uint64_t{1});
+            percounter_publish_completion(
+                cfg, state->slots[selected.index].task, completion, uint64_t{1}, selected.entry
+            );
             state->occupied &= ~(1U << selected.index);
             if (state->slots[selected.index].claim_index != UINT32_MAX) state->revisit |= 1U << selected.index;
             *executed = true;
@@ -1417,14 +1472,15 @@ inline __aicore__ bool percounter_step(const LaneConfig &cfg, PercounterLaneStat
         const uint64_t completion = percounter_completion_address(cfg, task->id, block, blocks);
         const uint32_t role =
             selected.shared ? cfg.cluster_lane : (selected.mask == 0 ? 0 : __builtin_ctz(selected.mask));
-        if (!percounter_run_task(cfg, state, *task, block, blocks, role, completion, &deferred)) return false;
+        if (!percounter_run_task(cfg, state, *task, block, blocks, role, completion, &deferred, selected.entry))
+            return false;
         state->batch = measure_batch && get_sys_cnt_aicore() - start < PLATFORM_PROF_SYS_CNT_FREQ * 3 / 1000000 ?
                            PERCOUNTER_PENDING_CAPACITY :
                            1;
         if (selected.shared) {
             // Remove a deferred share before FIN; the aggregator adds the full
             // block share, and its owner restores this share after the condition.
-            if (deferred) percounter_publish_completion(cfg, *task, completion, ~uint64_t{0});
+            if (deferred) percounter_publish_completion(cfg, *task, completion, ~uint64_t{0}, selected.entry);
             percounter_ssbuf_store_release(
                 &cfg.ssbuf->mix[selected.index].finished[cfg.cluster_lane], selected.generation
             );
@@ -1433,7 +1489,7 @@ inline __aicore__ bool percounter_step(const LaneConfig &cfg, PercounterLaneStat
                      static_cast<uint32_t>(cfg.cluster_lane) == static_cast<uint32_t>(__builtin_ctz(selected.mask)))
                 percounter_complete_mix(cfg, state, selected);
         } else {
-            if (!deferred) percounter_publish_completion(cfg, *task, completion, uint64_t{1});
+            if (!deferred) percounter_publish_completion(cfg, *task, completion, uint64_t{1}, selected.entry);
             state->occupied &= ~(1U << selected.index);
             if (state->slots[selected.index].claim_index != UINT32_MAX) state->revisit |= 1U << selected.index;
             if (is_cohort) state->committed = -1;
@@ -1519,13 +1575,18 @@ run_percounter_lane(__gm__ PercounterControl *control, int block_idx, CoreType c
         cfg.profile_buffer->core_type = static_cast<int32_t>(core_type);
         cfg.profile_buffer->cluster_index = coordinate.cluster_index;
         cfg.profile_buffer->cluster_lane = coordinate.cluster_lane;
+        if constexpr (task_profile_compiled) {
+            cfg.task_events =
+                scheduler_state_at<PercounterTaskEvent>(control, cfg.profile_buffer->event_records_offset);
+            cfg.task_event_capacity = cfg.profile_buffer->event_capacity;
+        }
         if constexpr (profile_compiled) {
             scalar.buffer = cfg.profile_buffer;
             scalar.records = scheduler_state_at<uint64_t>(control, scalar.buffer->scalar_records_offset);
             scalar.window_start = percounter_scalar_clock();
             scalar.function_min_cycles = level >= 4 ? 0 : PLATFORM_PROF_SYS_CNT_FREQ / 1000000;
             cfg.scalar = &scalar;
-            scalar_binding.attach(&scalar);
+            if (level >= 4) scalar_binding.attach(&scalar);
         }
     }
     ProfileScope setup_scope(cfg.scalar, ProfilePhase::LaneSetup);
@@ -1612,7 +1673,15 @@ run_percounter_lane(__gm__ PercounterControl *control, int block_idx, CoreType c
         auto *records = reinterpret_cast<__gm__ uint8_t *>(cfg.task_records);
         for (uint64_t offset = 0; offset < uint64_t{task_count} * sizeof(PercounterTaskTiming); offset += 64)
             dcci(records + offset, SINGLE_CACHE_LINE, CACHELINE_OUT);
-        if constexpr (profile_compiled) scalar.finish(percounter_scalar_clock());
+        if constexpr (task_profile_compiled) {
+            cfg.profile_buffer->event_committed = cfg.task_event_count;
+            cfg.profile_buffer->event_dropped = cfg.task_event_dropped;
+            auto *events = reinterpret_cast<__gm__ uint8_t *>(cfg.task_events);
+            for (uint64_t offset = 0; offset < uint64_t{cfg.task_event_count} * sizeof(PercounterTaskEvent);
+                 offset += 64)
+                dcci(events + offset, SINGLE_CACHE_LINE, CACHELINE_OUT);
+        }
+        if constexpr (profile_compiled) scalar.finish(percounter_scalar_clock(), level >= 4);
         dcci(cfg.profile_buffer, SINGLE_CACHE_LINE, CACHELINE_OUT);
         dcci(reinterpret_cast<__gm__ uint8_t *>(cfg.profile_buffer) + 64, SINGLE_CACHE_LINE, CACHELINE_OUT);
         dsb((mem_dsb_t)0);
