@@ -443,6 +443,11 @@ struct PercounterLaneState {
     uint64_t committed_entry{0};
     uint64_t committed_function_address{0};
     uint32_t committed_generation{0};
+#if defined(__CCE_AICORE__)
+    uint64_t prefetched_mix_entry{0};
+    uint64_t prefetched_mix_function{0};
+    uint32_t prefetched_mix_generation{0};
+#endif
 };
 
 inline __aicore__ __gm__ pto2::resident::AsyncGroupData *percounter_init_async_record(
@@ -1293,6 +1298,22 @@ inline __aicore__ bool percounter_step(const LaneConfig &cfg, PercounterLaneStat
         percounter_discover_records(cfg, state);
         percounter_service_records(cfg, state, &shared_candidate, probe_dependencies);
     }
+#if defined(__CCE_AICORE__)
+    // Table arguments are available at bind. Warm an already discovered record
+    // while its lowest participating lane is still waiting on dependencies.
+    if (shared_candidate.index >= 0 && !shared_candidate.ready && !shared_candidate.finished &&
+        (state->prefetched_mix_generation != shared_candidate.generation ||
+         state->prefetched_mix_entry != shared_candidate.entry)) {
+        const int64_t id = percounter_order_task_id(shared_candidate.entry);
+        if (static_cast<uint64_t>(id) < cfg.table_task_count) {
+            auto &counter = cfg.counters[id];
+            state->prefetched_mix_function = percounter_gm_read(counter.function_addresses[cfg.cluster_lane]);
+            percounter_prefetch_arguments(reinterpret_cast<uint64_t>(cfg.arguments + id), counter);
+            state->prefetched_mix_entry = shared_candidate.entry;
+            state->prefetched_mix_generation = shared_candidate.generation;
+        }
+    }
+#endif
     PercounterCandidate cohort;
     PercounterCandidate ordinary;
     for (uint32_t i = 0; i < PERCOUNTER_PENDING_CAPACITY; ++i) {
@@ -1352,13 +1373,21 @@ inline __aicore__ bool percounter_step(const LaneConfig &cfg, PercounterLaneStat
             return false;
         }
         auto *record = cohort.shared ? &cfg.ssbuf->mix[cohort.index] : nullptr;
+#if defined(__CCE_AICORE__)
+        const bool prefetched_mix = cohort.shared && state->prefetched_mix_entry == cohort.entry &&
+                                    state->prefetched_mix_generation == cohort.generation;
+#endif
         if (!cohort.finished) {
             if (cohort.mask != 0 && !percounter_commit_matches(*state, cohort)) {
                 const uint32_t role = cohort.shared ? cfg.cluster_lane : __builtin_ctz(cohort.mask);
                 const int64_t id = percounter_order_task_id(cohort.entry);
-                const uint64_t function = cohort.shared ?
-                                              percounter_gm_read(cfg.counters[id].function_addresses[role]) :
-                                              state->slots[cohort.index].task.function_address;
+                uint64_t function;
+#if defined(__CCE_AICORE__)
+                if (prefetched_mix) function = state->prefetched_mix_function;
+                else
+#endif
+                    function = cohort.shared ? percounter_gm_read(cfg.counters[id].function_addresses[role]) :
+                                               state->slots[cohort.index].task.function_address;
                 if (function == 0) {
                     percounter_fail(cfg, SchedulerGraphResult::INVALID_CALLABLE, id, role);
                     return false;
@@ -1377,13 +1406,15 @@ inline __aicore__ bool percounter_step(const LaneConfig &cfg, PercounterLaneStat
                 if (percounter_ssbuf_load_acquire(&record->enter_ready[cfg.cluster_lane]) != cohort.generation) {
                     percounter_ssbuf_store_release(&record->enter_ready[cfg.cluster_lane], cohort.generation);
 #if defined(__CCE_AICORE__)
-                    // This generation's fanin_ready also publishes its immutable Graph metadata.
-                    const int64_t id = percounter_order_task_id(cohort.entry);
-                    auto &counter = cfg.counters[id];
-                    const uint64_t address = static_cast<uint64_t>(id) < cfg.table_task_count ?
-                                                 reinterpret_cast<uint64_t>(cfg.arguments + id) :
-                                                 percounter_gm_read(counter.arguments_address);
-                    percounter_prefetch_arguments(address, counter);
+                    if (!prefetched_mix) {
+                        // fanin_ready also publishes the immutable Graph metadata.
+                        const int64_t id = percounter_order_task_id(cohort.entry);
+                        auto &counter = cfg.counters[id];
+                        const uint64_t address = static_cast<uint64_t>(id) < cfg.table_task_count ?
+                                                     reinterpret_cast<uint64_t>(cfg.arguments + id) :
+                                                     percounter_gm_read(counter.arguments_address);
+                        percounter_prefetch_arguments(address, counter);
+                    }
 #endif
                 }
                 cohort_go = percounter_tokens_ready(record->enter_ready, cohort.mask, cohort.generation);
