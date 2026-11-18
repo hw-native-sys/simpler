@@ -155,6 +155,8 @@ Single-block, off-lane and inline-completed tasks, and
 Graph shells, have one component. MIX publishes once per block with its actual
 subtask count. Completion publication updates the task, not its successors.
 
+The Host omits predecessors already complete at bind from device fanin rows.
+The logical DAG still determines ordering and sink discovery.
 Fanin references tag partitioned producers in bit zero. Ordinary owned slots
 retain their producer cursor, current component address and remaining-component
 state; MIX retains the same state in its observer-owned SSBUF record. The

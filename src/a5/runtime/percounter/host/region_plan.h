@@ -528,8 +528,10 @@ inline bool build_tables(
         if (task.fanin_count < 0 || (task.fanin_count > 0 && task.fanin_ids == nullptr))
             return fail(BuildStatus::INVALID_ARGUMENT, static_cast<int64_t>(id), -1);
 
-        fanin[id].count = task.fanin_count;
-        fanin[id].begin = static_cast<int32_t>(edge_cursor);
+        const uint64_t row_begin = edge_cursor;
+        auto &row = fanin[id];
+        row.count = 0;
+        row.begin = static_cast<int32_t>(row_begin);
         for (int32_t e = 0; e < task.fanin_count; ++e) {
             if (edge_cursor >= layout.edge_count)
                 return fail(BuildStatus::EDGE_COUNT_MISMATCH, static_cast<int64_t>(id), e);
@@ -538,10 +540,16 @@ inline bool build_tables(
                 return fail(BuildStatus::PRODUCER_OUT_OF_RANGE, static_cast<int64_t>(id), e);
             if (static_cast<uint64_t>(producer) >= id)
                 return fail(BuildStatus::PRODUCER_NOT_BEFORE_CONSUMER, static_cast<int64_t>(id), e);
-            fanin_addr[edge_cursor] =
-                device_base + layout.counters_offset + static_cast<uint64_t>(producer) * sizeof(PercounterCounter);
             const auto &source = tasks[producer];
-            if (partitioned(source)) fanin_addr[edge_cursor] |= PERCOUNTER_COMPLETION_PARTITIONED;
+            // The device row contains only dependencies that can block at run time.
+            if (!source.inline_completed) {
+                auto &ref = fanin_addr[row_begin + row.count];
+                ref =
+                    device_base + layout.counters_offset + static_cast<uint64_t>(producer) * sizeof(PercounterCounter);
+                if (partitioned(source)) ref |= PERCOUNTER_COMPLETION_PARTITIONED;
+                ++row.count;
+            }
+            // Edge validation and sink discovery use the input DAG.
             consumed[static_cast<size_t>(producer)] = true;
             ++edge_cursor;
         }

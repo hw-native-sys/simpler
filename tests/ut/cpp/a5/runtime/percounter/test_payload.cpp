@@ -443,6 +443,39 @@ TEST(PercounterAcquire, FaninObserverDoesNotWaitForPeerDiscoveryButEntryDoes) {
     f.expect_completed(0);
 }
 
+TEST(PercounterAcquire, RuntimeFaninSkipsOnlyHostCompletedProducers) {
+    auto host_completed = task(0);
+    host_completed.inline_completed = true;
+    host_completed.subtask_count = 1;
+    auto off_lane = task(1);
+    off_lane.published_off_lane = true;
+    const int32_t producers[]{0, 1};
+    auto mixed_consumer = task(2);
+    mixed_consumer.fanin_ids = producers;
+    mixed_consumer.fanin_count = 2;
+    auto ready_consumer = task(1);
+    ready_consumer.fanin_ids = producers;
+    ready_consumer.fanin_count = 1;
+    Fixture f({host_completed, off_lane, mixed_consumer, ready_consumer});
+
+    const auto remaining = percounter_fanin_view(f.cfg[1], 2);
+    ASSERT_EQ(remaining.count, 1);
+    EXPECT_EQ(remaining.addresses[0], reinterpret_cast<uint64_t>(&f.counters[1].value));
+    EXPECT_EQ(percounter_fanin_view(f.cfg[0], 3).count, 0);
+
+    f.step(1);
+    EXPECT_TRUE(f.calls.empty());
+    f.step(0);
+    ASSERT_EQ(f.calls.size(), 1U);
+    EXPECT_EQ(f.calls[0][0], 3);
+    f.component(1, 0) = PERCOUNTER_COUNTER_PUBLISHED;
+    f.drain();
+    ASSERT_EQ(f.calls.size(), 2U);
+    EXPECT_EQ(f.calls[1][0], 2);
+    f.expect_completed(2);
+    f.expect_completed(3);
+}
+
 TEST(PercounterAcquire, FaninCursorWaitsForEachProducerBeforePublishingReady) {
     for (const uint32_t mask : {1U, 6U, 7U}) {
         auto producer = task(1);
