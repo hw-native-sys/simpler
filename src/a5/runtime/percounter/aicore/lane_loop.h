@@ -740,21 +740,40 @@ inline __aicore__ bool percounter_shared_candidate(const LaneConfig &cfg, uint32
     const uint32_t mask = percounter_ssbuf_load_field(&record->active_mask);
     const uint32_t sequence = percounter_ssbuf_load_field(&record->sequence);
     const uint32_t sync_index = percounter_ssbuf_load_field(&record->sync_index);
-    if (percounter_ssbuf_load_acquire(&record->generation) != generation) return false;
+    // The field loads complete before the generation is read back. An acquire
+    // load carries its barrier after the read, which orders what follows the
+    // read-back rather than what precedes it, so the validation needs this
+    // barrier of its own: without it a republication between the two reads
+    // can pass validation with one generation's entry beside another's mask.
+    percounter_memory_barrier();
+    if (percounter_ssbuf_load_field(&record->generation) != generation) return false;
     if ((mask & (1U << cfg.cluster_lane)) == 0) return false;
-    if (percounter_ssbuf_load_acquire(&record->completed) == generation) return false;
+    if (percounter_ssbuf_load_field(&record->completed) == generation) return false;
+    // Three monotone tokens of the validated generation, with the same
+    // one-sided staleness: one barrier before the caller acts on them.
+    const uint32_t fanin_ready = percounter_ssbuf_load_field(&record->fanin_ready);
+    const uint32_t finished = percounter_ssbuf_load_field(&record->finished[cfg.cluster_lane]);
+    percounter_memory_barrier();
     *out = {entry,      rank,
             generation, sequence,
             mask,       static_cast<int32_t>(index),
-            true,       percounter_ssbuf_load_acquire(&record->fanin_ready) == generation,
-            sync_index, percounter_ssbuf_load_acquire(&record->finished[cfg.cluster_lane]) == generation};
+            true,       fanin_ready == generation,
+            sync_index, finished == generation};
     return true;
 }
 
 inline __aicore__ bool
 percounter_tokens_ready(PERCOUNTER_SSBUF volatile uint32_t *tokens, uint32_t mask, uint32_t generation) {
+    // Each token is one lane's monotone generation, so a load that misses a
+    // concurrent publication reads an older value and the conjunction fails:
+    // this reports "not yet", never a cohort that has not committed. The
+    // tokens need no order among themselves, and only a caller acting on a
+    // true verdict needs them ordered against what it does next. One barrier
+    // after the last token carries that; a false verdict reads nothing
+    // afterwards and takes none.
     for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane)
-        if ((mask & (1U << lane)) && percounter_ssbuf_load_acquire(tokens + lane) != generation) return false;
+        if ((mask & (1U << lane)) && percounter_ssbuf_load_field(tokens + lane) != generation) return false;
+    percounter_memory_barrier();
     return true;
 }
 
