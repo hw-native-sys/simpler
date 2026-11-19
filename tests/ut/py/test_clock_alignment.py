@@ -9,11 +9,14 @@
 # -----------------------------------------------------------------------------------------------------------
 import copy
 import json
+import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 from _capture_builder import Capture
 
+from simpler_setup.tools import sched_overhead_analysis
 from simpler_setup.tools import swimlane_converter as sc
 from simpler_setup.tools._runtime_dispatch import HBG_RUNTIME
 
@@ -65,6 +68,223 @@ def _artifacts(tmp_path, *, frequency=1_000_000_000, logs=True, sidecar_pid=42):
 def _convert(monkeypatch, path, *extra):
     monkeypatch.setattr(sys, "argv", ["swimlane_converter", str(path), *extra])
     assert sc.main() == 0
+
+
+def _recorded_capture():
+    raw = _capture()
+    raw["metadata"]["collection"] = {
+        "recorded_window": True,
+        "counts_unknown": True,
+        "device_total": None,
+        "device_dropped": None,
+        "fatal": None,
+        "verdict": "published",
+        "transport_retired_records": 0,
+    }
+    raw["aicore_tasks"] *= 2
+    raw["scheduler_tasks"]["records"] *= 2
+    stream = raw["scheduler_records"]["streams"][0]
+    stream["scheduler_id"] = 7
+    stream["worker_id"] = 11
+    stream["capture"] = {"committed": 1, "dropped": None, "truncated": None}
+    stream["metrics"] = [{"record_index": 0, "pop_hit": 19}]
+    return raw
+
+
+def test_recorded_window_preserves_duplicate_rows_and_real_scheduler_id(tmp_path):
+    raw = _recorded_capture()
+    data = sc._decode_perf_data(raw)
+    output = tmp_path / "window.json"
+    sc.generate_chrome_trace_json(
+        data["tasks"], output, runtime_name=data["runtime"], timeline_metadata=data["timeline_metadata"]
+    )
+    trace = json.loads(output.read_text())
+    events = [event for event in trace["traceEvents"] if event["ph"] == "X"]
+    assert len(events) == 5
+    cores = [event for event in events if event["args"]["population"] == "aicore_tasks"]
+    assert [event["args"]["record_index"] for event in cores] == [0, 1]
+    assert cores[0]["ts"] == cores[1]["ts"]
+    assert cores[0]["args"]["task_id"] == cores[1]["args"]["task_id"]
+    (scheduler,) = [event for event in events if event["args"]["population"] == "scheduler_records"]
+    assert scheduler["tid"] == 7
+    assert scheduler["args"]["stream_index"] == 0
+    assert scheduler["args"]["scheduler_id"] == 7 and scheduler["args"]["worker_id"] == 11
+    assert scheduler["args"]["pop_hit"] == 19
+    assert trace["metadata"]["collection"] == raw["metadata"]["collection"]
+    assert all(event["ph"] in ("M", "X") for event in trace["traceEvents"])
+
+
+@pytest.mark.parametrize("missing", ["run_epoch", "loop_iter", "kind", "tasks_processed", "task_id"])
+def test_recorded_scheduler_phase_requires_fixed_fields(missing):
+    raw = _recorded_capture()
+    del raw["scheduler_records"]["streams"][0]["records"][0][missing]
+    with pytest.raises(ValueError, match="scheduler.*record"):
+        sc._decode_perf_data(raw)
+
+
+def test_recorded_trace_accepts_string_output(tmp_path):
+    data = sc._decode_perf_data(_recorded_capture())
+    output = tmp_path / "trace.json"
+    sc.generate_chrome_trace_json(
+        data["tasks"], str(output), runtime_name=data["runtime"], timeline_metadata=data["timeline_metadata"]
+    )
+    assert json.loads(output.read_text())["metadata"]["recorded_window"] is True
+
+
+def test_recorded_overhead_analysis_reports_unsupported(tmp_path, capsys):
+    path = tmp_path / "records.json"
+    path.write_text(json.dumps(_recorded_capture()))
+    assert sched_overhead_analysis.run_analysis(path) == 1
+    error = capsys.readouterr().err
+    assert "recorded windows" in error and "unsupported" in error
+    assert "missing=" not in error and "recapture" not in error.lower()
+
+
+def test_recorded_failed_device_replacement_preserves_previous_companion(tmp_path, monkeypatch):
+    path = tmp_path / "records.json"
+    raw = _recorded_capture()
+    path.write_text(json.dumps(raw))
+    output = tmp_path / "trace.json"
+    _convert(monkeypatch, path, "-o", str(output))
+    old_trace = output.read_bytes()
+    old_companion = tmp_path / json.loads(old_trace)["metadata"]["host_preparation_file"]
+    old_host = old_companion.read_bytes()
+    raw["host_orchestrator_phases"][0][0]["task_id"] += 1
+    path.write_text(json.dumps(raw))
+    publish = sc._atomic_json
+
+    def fail_device(target, value):
+        if target == output:
+            raise OSError("injected device publication failure")
+        publish(target, value)
+
+    monkeypatch.setattr(sc, "_atomic_json", fail_device)
+    monkeypatch.setattr(sys, "argv", ["swimlane_converter", str(path), "-o", str(output)])
+    assert sc.main() == 1
+    assert output.read_bytes() == old_trace
+    assert old_companion.read_bytes() == old_host
+
+
+def test_recorded_cli_keeps_host_preparation_separate_and_source_unchanged(tmp_path, monkeypatch):
+    path, _ = _artifacts(tmp_path)
+    raw = _recorded_capture()
+    # A saved one-invocation mapping and sibling Host logs are not replay anchors.
+    raw["metadata"]["clock_alignment"] = {"status": "bounded"}
+    path.write_text(json.dumps(raw))
+    before = path.read_bytes()
+    output = tmp_path / "window.json"
+    _convert(monkeypatch, path, "-o", str(output))
+    trace = json.loads(output.read_text())
+    host = json.loads((tmp_path / trace["metadata"]["host_preparation_file"]).read_text())
+    assert trace["metadata"]["clock_domain"] == "device_syscnt_cycles"
+    assert trace["metadata"]["clock_alignment"]["status"] == "unavailable"
+    assert host["metadata"]["clock_domain"] == "host_monotonic_ns"
+    assert host["metadata"]["preparation_only"] is True
+    assert len([event for event in host["traceEvents"] if event["ph"] == "X"]) == 2
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("options", [{"placement": object()}, {"timeline_origin_ns": 1}])
+def test_recorded_window_refuses_single_invocation_placement(options):
+    with pytest.raises(ValueError, match="recorded.*(placement|Host)"):
+        sc._decode_perf_data(_recorded_capture(), **options)
+
+
+@pytest.mark.parametrize("option", ["--host-log", "--overhead", "--deps-json"])
+def test_recorded_cli_refuses_derived_analysis_without_mutating_input(tmp_path, monkeypatch, option):
+    path, log = _artifacts(tmp_path)
+    path.write_text(json.dumps(_recorded_capture()))
+    before = path.read_bytes()
+    output = tmp_path / "rejected.json"
+    extra = [option] if option == "--overhead" else [option, str(log)]
+    monkeypatch.setattr(sys, "argv", ["swimlane_converter", str(path), "-o", str(output), *extra])
+    assert sc.main() == 1
+    assert not output.exists()
+    assert path.read_bytes() == before
+
+
+def test_recorded_window_empty_and_known_loss_remain_distinct(tmp_path):
+    raw = _recorded_capture()
+    for key in ("aicore_tasks", "aicpu_orchestrator_phases", "host_orchestrator_phases", "host_device_uploads"):
+        raw[key] = []
+    raw["scheduler_tasks"]["records"] = []
+    raw["scheduler_records"]["streams"] = []
+    raw["metadata"]["collection"]["transport_retired_records"] = 3
+    raw["metadata"]["collection"]["verdict"] = "partial_safe"
+    data = sc._decode_perf_data(raw)
+    output = tmp_path / "empty.json"
+    sc.generate_chrome_trace_json(
+        data["tasks"], output, runtime_name=data["runtime"], timeline_metadata=data["timeline_metadata"]
+    )
+    trace = json.loads(output.read_text())
+    assert trace["traceEvents"] == []
+    assert trace["metadata"]["collection"]["device_dropped"] is None
+    assert trace["metadata"]["collection"]["transport_retired_records"] == 3
+    assert trace["metadata"]["collection"]["verdict"] == "partial_safe"
+
+
+@pytest.mark.parametrize("alias", ["same", "symlink", "hardlink", "companion"])
+def test_recorded_cli_cannot_overwrite_raw_input_through_output_alias(tmp_path, monkeypatch, alias):
+    monkeypatch.setattr(sc.uuid, "uuid4", lambda: SimpleNamespace(hex="test-generation"))
+    path = tmp_path / ("window.host-preparation.test-generation.json" if alias == "companion" else "records.json")
+    path.write_text(json.dumps(_recorded_capture()))
+    before = path.read_bytes()
+    output = tmp_path / "window.json"
+    if alias == "same":
+        output = path
+    elif alias == "symlink":
+        output.symlink_to(path)
+    elif alias == "hardlink":
+        os.link(path, output)
+    monkeypatch.setattr(sys, "argv", ["swimlane_converter", str(path), "-o", str(output)])
+    assert sc.main() == 1
+    assert path.read_bytes() == before
+
+
+def test_recorded_window_does_not_pair_unmatched_task_populations():
+    raw = _recorded_capture()
+    raw["scheduler_tasks"]["records"].pop()
+    data = sc._decode_perf_data(raw)
+    assert [row["population"] for row in data["tasks"]].count("aicore_tasks") == 2
+    assert [row["population"] for row in data["tasks"]].count("scheduler_tasks") == 1
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["aicore-width", "scheduler-width", "reverse-time", "scheduler-id", "metric-index", "metric-overwrite", "clock"],
+)
+def test_recorded_window_rejects_malformed_observations(corruption):
+    raw = _recorded_capture()
+    if corruption == "aicore-width":
+        raw["aicore_tasks"][0].pop()
+    elif corruption == "scheduler-width":
+        raw["scheduler_tasks"]["records"][0].pop()
+    elif corruption == "reverse-time":
+        raw["aicore_tasks"][0][4] = raw["aicore_tasks"][0][3] - 1
+    elif corruption == "scheduler-id":
+        del raw["scheduler_records"]["streams"][0]["scheduler_id"]
+    elif corruption == "metric-index":
+        raw["scheduler_records"]["streams"][0]["metrics"][0]["record_index"] = 9
+    elif corruption == "metric-overwrite":
+        raw["scheduler_records"]["streams"][0]["metrics"][0]["start_cycles"] = 1
+    else:
+        raw["metadata"]["clock_freq_hz"] = True
+    with pytest.raises(ValueError):
+        sc._decode_perf_data(raw)
+
+
+def test_recorded_cli_reports_output_failure_and_keeps_raw(tmp_path, monkeypatch):
+    path = tmp_path / "records.json"
+    path.write_text(json.dumps(_recorded_capture()))
+    before = path.read_bytes()
+
+    def fail_write(*args):
+        raise OSError("injected output write failure")
+
+    monkeypatch.setattr(sc, "_atomic_json", fail_write)
+    monkeypatch.setattr(sys, "argv", ["swimlane_converter", str(path), "-o", str(tmp_path / "trace.json")])
+    assert sc.main() == 1
+    assert path.read_bytes() == before
 
 
 @pytest.mark.parametrize("frequency", [1_000_000_000, 50_000_000])

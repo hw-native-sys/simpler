@@ -37,8 +37,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     const simpler::tmr::Tensor &out = orch_args.tensor(2).ref();
 
     // SIMPLER_SCOPE ensures rt_submit_aiv_task flushes through the task
-    // ringbuffer before the entry returns. No set_core_num — let the
-    // runtime use the config's block_dim.
+    // ringbuffer before the entry returns. With no set_block_num call,
+    // LaunchSpec uses its default of one block.
     SIMPLER_SCOPE() {
         CoreTaskArgs args;
         args.add_input(src);

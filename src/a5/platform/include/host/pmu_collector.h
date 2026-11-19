@@ -47,8 +47,7 @@
  *   finalize()                   — Free all device memory and unregister.
  */
 
-#ifndef SRC_A5_PLATFORM_INCLUDE_HOST_PMU_COLLECTOR_H_
-#define SRC_A5_PLATFORM_INCLUDE_HOST_PMU_COLLECTOR_H_
+#pragma once
 
 #include <atomic>
 #include <array>
@@ -71,6 +70,7 @@
 #include "common/platform_config.h"
 #include "common/pmu_profiling.h"
 #include "common/unified_log.h"
+#include "host/diagnostic_run_banks.h"
 #include "host/pmu_runs.h"
 #include "host/profiler_base.h"
 
@@ -200,6 +200,10 @@ class PmuCollector : public profiling_common::ProfilerBase<PmuCollector, PmuModu
 public:
     PmuCollector() = default;
     ~PmuCollector();
+    /** Join host readers without a final device drain. */
+    void stop_for_device_failure();
+    /** Forget backing only after confirmed reset and host-reader stop. */
+    void abandon_after_device_reset();
 
     PmuCollector(const PmuCollector &) = delete;
     PmuCollector &operator=(const PmuCollector &) = delete;
@@ -219,36 +223,28 @@ public:
      *
      * @param num_cores                         Number of AICore instances in use
      * @param num_threads                       Number of AICPU scheduling threads
-     * @param csv_path                          Output CSV path
-     * @param event_type                        PmuEventType selector (written
-     *                                          to PmuDataHeader::event_type
-     *                                          so AICPU can configure HW
-     *                                          counters)
      * @param alloc_cb / register_cb / free_cb  Memory operation callbacks
      *                                          (register_cb nullptr on a5)
-     * @param user_data                         Opaque pointer forwarded to callbacks
      * @param device_id                         Device ID (for register_cb)
      * @return 0 on success, non-zero on failure
      */
     // Allocates the device-side resources.
     //
     // Per-run configuration (CSV destination, event selection) is bound
-    // separately by begin_run(), which must run before this on the first run so
-    // the event type reaches the device header and the CSV header string.
+    // separately by begin_run(). The device receives each run's selection
+    // through its Runtime descriptor.
     int init(
         int num_cores, int num_threads, const PmuAllocCallback &alloc_cb, PmuRegisterCallback register_cb,
-        const PmuFreeCallback &free_cb, int device_id
+        const PmuFreeCallback &free_cb, int device_id, PmuUnregisterCallback unregister_cb = nullptr
     );
 
     // Start a run's collection window: bind its CSV destination and event
     // selection, drop the previous run's shard state, rebuild the CSV header
-    // (its columns are named by the event config), and — once the region exists
-    // — republish the event type the device reads.
+    // (its columns are named by the event config). Device state is untouched.
     //
     // The collector initializes once and serves every run, so this is the only
-    // point at which a run's shard files, CSV columns and device event type are
-    // established; init() establishes none of them.
-    void begin_run(const std::string &csv_path, PmuEventType event_type);
+    // point at which a run's shard files and CSV columns are established.
+    bool begin_run(const std::string &csv_path, PmuEventType event_type, uint64_t run_epoch = 0);
 
     void start(const profiling_common::ThreadFactory &thread_factory);
 
@@ -306,6 +302,94 @@ public:
      * keeps its single-run window, its in-place merge and its per-run drain,
      * byte for byte.
      */
+    /**
+     * Map the device bank array this collector's cores publish their per-run
+     * accounting into, one entry per core in use.
+     *
+     * Device entry resets per-core counters. Without a bank, an ordinary
+     * serialized run reads the live counters at close; a recorded window leaves
+     * cumulative accounting unknown. The address only reaches the device through the
+     * launching run's kernel arguments, so a mapped array with nobody
+     * publishing into it would report every core missing.
+     */
+    bool open_run_terminal_banks(int expected_producers);
+
+    /** The address this run's cores publish into, for its kernel arguments. */
+    uint64_t run_terminal_device_address() const { return terminal_banks_.device_address(); }
+
+    /**
+     * Terminal banks held out of this collector's pool right now — one per live
+     * run that reserved one, plus any a run that ended with neither a
+     * completion nor a producer-stop proof still owes. The pool's own
+     * occupancy, which is the only figure that still answers once a run's slot
+     * has been retired.
+     */
+    size_t run_terminal_banks_in_use() const { return terminal_banks_.credits().banks_in_use(); }
+
+    /**
+     * The device address this run's cores publish their accounting into.
+     *
+     * Resolved from the bank the run's own admission reserved, so two runs open
+     * at once get two addresses. 0 when the run holds no reservation — it was
+     * never admitted, its admission was refused, ordinary retention is off, or
+     * it is a recorded aggregate — which is
+     * what the device reads as "publish no accounting".
+     */
+    uint64_t run_terminal_bank_address(uint64_t run_epoch) const {
+        const int bank = retained_runs_.run_terminal_bank_index(run_epoch);
+        if (bank < 0) return 0;
+        return terminal_banks_.bank_address(static_cast<size_t>(bank));
+    }
+
+    /**
+     * Whether this run could take a terminal bank right now.
+     *
+     * True when the run already holds one — the question is idempotent across
+     * launch rounds — or when the array has one free. A run ordered behind the
+     * open ones with no bank left waits rather than launching without the
+     * accounting its diagnostic exists to produce; the banks come back as the
+     * runs ahead of it report.
+     */
+    bool can_take_run_terminal_bank(uint64_t run_epoch) const {
+        if (run_epoch == 0) return false;
+        if (run_terminal_bank_address(run_epoch) != 0) return true;
+        return terminal_banks_.can_reserve();
+    }
+
+    /**
+     * Give back the bank `run_epoch` holds without reading it, on proof that
+     * every producer that could write into it has terminated.
+     *
+     * Forwarded to the retained bookkeeping, which holds the reservation; see
+     * `simpler::dfx::runs::settle_failed_run_terminal_bank` for when a caller
+     * may state the proof.
+     */
+    void discard_run_terminal_bank(uint64_t run_epoch) { retained_runs_.discard_run_terminal_bank(run_epoch); }
+
+    /** Whether this collector's producers publish a per-run terminal at all. */
+    bool device_publishes_run_terminal() const { return terminal_banks_.opened(); }
+    bool terminal_backing_retained() const { return terminal_banks_.backing_retained(); }
+
+    /** Whether a further run could be admitted to the retained path. */
+    bool can_admit_retained_run() const { return retained_runs_.can_admit_retained_run(); }
+
+    /** Whether no admitted epoch is still unpublished. */
+    bool retained_runs_idle() const { return retained_runs_.retained_runs_idle(); }
+
+    /**
+     * Tell the owning context that this collector's capacity may have moved.
+     *
+     * Set once by the runner after init. Over-notifying is free — a woken
+     * admission re-attempts and parks again — while under-notifying costs a
+     * blocked run its whole deadline.
+     */
+    void set_credit_release_notifier(std::function<void()> notifier) {
+        retained_runs_.set_credit_release_notifier(std::move(notifier));
+    }
+
+    /** Producers this collector brought up: one per core. */
+    int terminal_producer_count() const { return num_cores_; }
+
     void configure_retained_runs(bool enabled) { retained_runs_.configure(enabled); }
     bool retains_runs() const { return retained_runs_.retains_runs(); }
 
@@ -319,14 +403,26 @@ public:
      * falling back to `begin_run` would reset a store a predecessor is still
      * publishing into.
      */
-    bool run_begin(uint64_t run_epoch, const std::string &csv_path, PmuEventType event_type) {
-        return retained_runs_.run_begin(run_epoch, csv_path, event_type);
+    bool run_begin(
+        uint64_t run_epoch, const std::string &csv_path, PmuEventType event_type,
+        simpler::dfx::runs::AdmissionRefusal *why = nullptr
+    ) {
+        return retained_runs_.run_begin(run_epoch, csv_path, event_type, why);
     }
+
+    bool begin_recorded_window(uint64_t epoch, const std::string &path, PmuEventType event, const char *protection) {
+        if (!retained_runs_.begin_recorded_window(epoch, path, event)) return false;
+        retained_runs_.note_recorded_protection(epoch, protection);
+        return true;
+    }
+    bool recorded_window_open(uint64_t epoch) const { return retained_runs_.recorded_window_open(epoch); }
+    bool recorded_windows_open() const { return retained_runs_.recorded_windows_open(); }
+    int close_recorded_window(uint64_t epoch) { return retained_runs_.close_recorded_window(epoch); }
 
     /**
      * Close one run's collection window while it still holds the execution
      * claim: snapshot the device counters and live buffers the successor's
-     * admission will zero, then arm the transport cut and hand the epoch to the
+     * device entry will zero, then arm the transport cut and hand the epoch to the
      * writer. Does not drain and does not merge.
      */
     void run_close(uint64_t run_epoch, bool device_execution_complete) {
@@ -416,8 +512,50 @@ private:
     size_t retained_shard_count() const { return static_cast<size_t>(manager_.shard_count()); }
     FrozenRunConfig freeze_run_config(PmuEventType event_type) const;
     std::string build_csv_header(const FrozenRunConfig &frozen) const;
-    bool publish_run_config(PmuEventType event_type);
+    /** Device allocation trampolines for the bank array, bound to `this`. */
+    static void *bank_alloc(void *owner, size_t bytes, void **host_out);
+    static int bank_initialize(void *owner, void *device_dst, void *host_dst, const void *initial, size_t bytes);
+    static int bank_unmap(void *owner, void *device_ptr);
+    static int bank_free(void *owner, void *device_ptr);
+    static int bank_copy(void *owner, void *host_dst, const void *device_src, const void *host_src, size_t bytes);
+
+    void set_run_config(PmuEventType event_type);
     simpler::dfx::pmu::RecordProofs snapshot_run_records(bool device_execution_complete) const;
+
+    /** True while this run's own cores report their accounting. */
+
+    /** Reserve the bank this run's cores publish into. */
+    simpler::dfx::credit::Reservation reserve_run_terminal_bank(uint64_t run_epoch) {
+        return terminal_banks_.reserve(run_epoch);
+    }
+
+    /**
+     * Hold a run's bank out of the pool because nothing proved its cores
+     * stopped. The token carries the run it belongs to, so a proof arriving
+     * later still returns this bank and no other.
+     */
+    void quarantine_run_terminal_bank(simpler::dfx::credit::Reservation &&bank) {
+        terminal_banks_.quarantine(std::move(bank));
+    }
+
+    /** Return a bank this collector parked for `run_epoch`, if it has one. */
+    bool reclaim_run_terminal_bank(uint64_t run_epoch) { return terminal_banks_.reclaim(run_epoch); }
+
+    /**
+     * This run's figures, out of the bank its cores published into.
+     *
+     * Consumes the reservation, so the bank is the next run's as soon as the
+     * accounting is in host storage. Every core this collector brought up must
+     * have published; one that did not leaves the counts unknown rather than
+     * narrowing the producer set to whoever answered.
+     *
+     * The receipt comparison is not made here: this collector counts its rows
+     * when the writer merges the shards, which is where `classify` compares
+     * them against the device total.
+     */
+    simpler::dfx::pmu::RecordProofs snapshot_run_records_from_terminal(
+        bool device_execution_complete, simpler::dfx::credit::Reservation &bank, uint64_t run_epoch
+    );
     uint64_t buffer_run_epoch(const void *buf_host_ptr) const;
     uint64_t buffer_record_count(const void *buf_host_ptr) const;
     uint64_t write_buffer_rows(
@@ -435,6 +573,31 @@ private:
     );
 
     bool initialized_ = false;
+    simpler::dfx::credit::RunTerminalBanks terminal_banks_{};
+    // Kept from `init` so the bank array uses the same device allocator
+    // as this collector's buffers.
+    PmuAllocCallback device_alloc_cb_{nullptr};
+    PmuFreeCallback device_free_cb_{nullptr};
+    /**
+     * The callback the terminal bank array is released through.
+     *
+     * Separate from `device_free_cb_` because the two are not the same
+     * function at the only moment the array is released: `finalize` is handed
+     * its own free callback, and a teardown that abandons device resources
+     * hands one that frees nothing. The array is this collector's last device
+     * allocation and must follow the same policy as the pooled buffers
+     * released beside it, so `finalize` rebinds this to its own argument
+     * before releasing — using the init-time allocator there would hand memory
+     * back to an allocator the caller has deliberately stopped using.
+     */
+    PmuFreeCallback bank_free_cb_{nullptr};
+    /**
+     * The teardown's unregister callback, stashed beside the free one and for
+     * the same reason: the bank array's host mapping has to come down before
+     * its memory does, and `finalize` is the only place that callback exists.
+     */
+    PmuUnregisterCallback bank_unregister_cb_{nullptr};
+
     int num_cores_ = 0;
     int num_threads_ = 0;
     PmuEventType event_type_{PmuEventType::PIPE_UTILIZATION};
@@ -482,6 +645,7 @@ private:
 
     // Constructed with a reference to this collector, so it stays a member and
     // is never copied.
+    std::atomic<uint64_t> ordinary_run_epoch_{0};
     RetainedRunTable retained_runs_{*this};
 };
 
@@ -527,5 +691,3 @@ inline std::string make_pmu_csv_path(const std::string &output_dir) {
     }
     return output_dir + "/pmu.csv";
 }
-
-#endif  // SRC_A5_PLATFORM_INCLUDE_HOST_PMU_COLLECTOR_H_

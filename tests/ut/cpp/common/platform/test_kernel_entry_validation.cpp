@@ -11,10 +11,7 @@
 
 #include <gtest/gtest.h>
 
-#include <cstdlib>
-
 #include "host/kernel_entry_validation.h"
-#include "utils/device_arena.h"
 
 namespace {
 
@@ -150,13 +147,39 @@ TEST(KernelEntryValidation, PrepareCallableChecksIdRangeAndImageSize) {
     );
 }
 
+TEST(KernelEntryValidation, CallableImageAcceptsExpandedChildCapacity) {
+    const auto child = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, kBinary, sizeof(kBinary));
+    for (int32_t count : {1024, 1025, 1427, ChipCallable::MAX_CHILDREN - 1, ChipCallable::MAX_CHILDREN}) {
+        SCOPED_TRACE(count);
+        std::vector<int32_t> ids(count);
+        std::vector<std::vector<uint8_t>> children(count, child);
+        for (int32_t i = 0; i < count; ++i)
+            ids[i] = i;
+        auto image =
+            make_chip_callable(nullptr, 0, "orch", kBinary, sizeof(kBinary), ids.data(), children.data(), count, "");
+        EXPECT_EQ(validate_kernel_prepare_callable_args(kCtx, 0, image.data(), image.size()), 0);
+        EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), 0);
+        auto *callable = reinterpret_cast<ChipCallable *>(image.data());
+        callable->child_offsets_[count - 1] = static_cast<uint32_t>(image.size());
+        EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    }
+}
+
+TEST(KernelEntryValidation, CallableImageRejectsChildCountOverflow) {
+    auto image = make_chip_callable(nullptr, 0, "orch", nullptr, 0, nullptr, nullptr, 0, "");
+    auto *callable = reinterpret_cast<ChipCallable *>(image.data());
+    for (int32_t count : {-1, ChipCallable::MAX_CHILDREN + 1}) {
+        SCOPED_TRACE(count);
+        callable->child_count_ = count;
+        EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    }
+}
+
 TEST(KernelEntryValidation, CallableImageRejectsTruncatedVariableTail) {
     const auto child = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, kBinary, sizeof(kBinary));
     const int32_t child_id = 7;
     const std::vector<uint8_t> children[] = {child};
-    const auto image = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
-        nullptr, 0, "orch", kBinary, sizeof(kBinary), &child_id, children, 1, ""
-    );
+    const auto image = make_chip_callable(nullptr, 0, "orch", kBinary, sizeof(kBinary), &child_id, children, 1, "");
     ASSERT_GT(image.size(), sizeof(ChipCallable));
     EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), 0);
     EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size() - 1), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
@@ -166,9 +189,7 @@ TEST(KernelEntryValidation, CallableImageRejectsOutOfRangeChildMetadata) {
     const auto child = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, kBinary, sizeof(kBinary));
     const int32_t child_id = 7;
     const std::vector<uint8_t> children[] = {child};
-    auto image = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
-        nullptr, 0, "orch", nullptr, 0, &child_id, children, 1, ""
-    );
+    auto image = make_chip_callable(nullptr, 0, "orch", nullptr, 0, &child_id, children, 1, "");
     auto *callable = reinterpret_cast<ChipCallable *>(image.data());
     callable->child_offsets_[0] = static_cast<uint32_t>(image.size());
     EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
@@ -186,69 +207,40 @@ TEST(KernelEntryValidation, LaunchChecksPointersAndIdRange) {
     );
 }
 
-TEST(KernelArenaGuard, UncommittedRegionAcceptsAnyRequest) {
-    // Kernel mode must be able to establish capacity once, so nothing about an
-    // uncommitted region is refusable.
-    EXPECT_FALSE(kernel_arena_change_is_forbidden(false, 0, 0));
-    EXPECT_FALSE(kernel_arena_change_is_forbidden(false, 0, 4096));
-    EXPECT_FALSE(kernel_arena_change_is_forbidden(false, 4096, 8192));
-}
-
-TEST(KernelArenaGuard, CommittedRegionRefusesGrowAndRelease) {
-    EXPECT_TRUE(kernel_arena_change_is_forbidden(true, 4096, 4097));
-    EXPECT_TRUE(kernel_arena_change_is_forbidden(true, 4096, 0));
-}
-
-TEST(KernelArenaGuard, CommittedRegionAllowsSameSizeAndShrink) {
-    // A shrink keeps the base and the committed size, so a captured graph's
-    // addresses survive it.
-    EXPECT_FALSE(kernel_arena_change_is_forbidden(true, 4096, 4096));
-    EXPECT_FALSE(kernel_arena_change_is_forbidden(true, 4096, 2048));
-    // Committed with nothing cached: asking for nothing changes nothing.
-    EXPECT_FALSE(kernel_arena_change_is_forbidden(true, 0, 0));
-}
-
-struct CountingBackend {
-    int frees = 0;
-    static void *alloc(void * /*ctx*/, size_t size) { return std::malloc(size); }
-    static void free_fn(void *ctx, void *ptr) {
-        static_cast<CountingBackend *>(ctx)->frees++;
-        std::free(ptr);
+TEST(KernelEntryValidation, CallableImageValidatesCcuPackageBeforeHashing) {
+    auto valid = make_chip_callable(nullptr, 0, "orch", kBinary, sizeof(kBinary), nullptr, nullptr, 0, "", {{1, 2, 3}});
+    ASSERT_EQ(validate_kernel_callable_image(valid.data(), valid.size()), 0);
+    for (int variant = 0; variant < 6; ++variant) {
+        SCOPED_TRACE(variant);
+        auto image = valid;
+        auto *callable = reinterpret_cast<ChipCallable *>(image.data());
+        switch (variant) {
+        case 0:
+            ++callable->wire_version_;
+            break;
+        case 1:
+            callable->ccu_modules_offset_ = UINT32_MAX;
+            break;
+        case 2:
+            callable->ccu_modules_size_ = UINT32_MAX;
+            break;
+        case 3:
+            callable->ccu_modules_size_ = 0;
+            break;
+        case 4:
+            image[offsetof(ChipCallable, storage_) + callable->ccu_modules_offset_] = 0;
+            break;
+        default:
+            image.pop_back();
+            break;
+        }
+        EXPECT_EQ(validate_kernel_callable_image(image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
     }
-};
-
-TEST(KernelArenaGuard, RefusalScanOverCommittedRegionsReleasesNothing) {
-    // setup_static_arena's three-region shape. The guard is evaluated over
-    // every region before any of them is touched, so reaching a refusal must
-    // leave each committed peer's base, size and committed flag intact —
-    // the arena commit sequence's rollback would free exactly these.
-    CountingBackend backend;
-    DeviceArena gm_heap(&CountingBackend::alloc, &CountingBackend::free_fn, &backend);
-    DeviceArena gm_sm(&CountingBackend::alloc, &CountingBackend::free_fn, &backend);
-    DeviceArena runtime_pool(&CountingBackend::alloc, &CountingBackend::free_fn, &backend);
-
-    const size_t cached[] = {4096, 2048, 1024};
-    DeviceArena *arenas[] = {&gm_heap, &gm_sm, &runtime_pool};
-    for (size_t i = 0; i < 3; ++i) {
-        arenas[i]->reserve(cached[i], 64);
-        ASSERT_NE(arenas[i]->commit(), nullptr);
-    }
-    const int frees_after_commit = backend.frees;
-    void *const bases[] = {gm_heap.base(), gm_sm.base(), runtime_pool.base()};
-
-    // The third region asks to grow; the first two are unchanged requests.
-    const size_t requested[] = {4096, 2048, 8192};
-    bool refused = false;
-    for (size_t i = 0; i < 3 && !refused; ++i) {
-        refused = kernel_arena_change_is_forbidden(arenas[i]->is_committed(), cached[i], requested[i]);
-    }
-
-    EXPECT_TRUE(refused);
-    EXPECT_EQ(backend.frees, frees_after_commit);
-    for (size_t i = 0; i < 3; ++i) {
-        EXPECT_TRUE(arenas[i]->is_committed());
-        EXPECT_EQ(arenas[i]->base(), bases[i]);
-    }
+    auto forged = make_chip_callable(nullptr, 0, "orch", nullptr, 0, nullptr, nullptr, 0, "");
+    auto *callable = reinterpret_cast<ChipCallable *>(forged.data());
+    callable->ccu_modules_offset_ = UINT32_MAX;
+    callable->ccu_modules_size_ = UINT32_MAX;
+    EXPECT_EQ(validate_kernel_callable_image(forged.data(), forged.size()), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
 }
 
 }  // namespace

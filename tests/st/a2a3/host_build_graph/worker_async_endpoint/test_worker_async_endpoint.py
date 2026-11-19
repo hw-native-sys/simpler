@@ -19,13 +19,18 @@ from pathlib import Path
 
 import pytest
 import torch
+from simpler.task_interface import (
+    MAILBOX_RUN_ENTRY_STRIDE,
+    MAILBOX_RUN_ENTRY_TABLE_OFFSET,
+    DataType,
+    TaskArgs,
+    TensorArgType,
+)
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import DataType, TaskArgs, TensorArgType
 from simpler.worker import (
     _FRAME_STAGED,
-    _OFF_ACCEPTED,
-    _OFF_STATE,
-    MAILBOX_FRAME_SIZE,
+    _OFF_ENTRY_ACCEPTED,
+    _OFF_ENTRY_STATE,
     _mailbox_load_i32,
 )
 
@@ -210,9 +215,13 @@ class TestWorkerAsyncEndpoint(SceneTestCase):
             shm_buf = st_worker._chip_shms[0].buf
             assert shm_buf is not None
             mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(shm_buf))
-            successor_frame_addr = mailbox_addr + 2 * MAILBOX_FRAME_SIZE
-            successor_state_addr = successor_frame_addr + _OFF_STATE
-            successor_accepted_addr = successor_frame_addr + _OFF_ACCEPTED
+            # The successor's run-state entry, not a request frame: a run's state and the
+            # acceptance word the device writes live there, and the frame that delivered its
+            # payload has already gone back to the parent. Entries are allocated in submission
+            # order, so the successor holds the second one.
+            successor_entry_addr = mailbox_addr + MAILBOX_RUN_ENTRY_TABLE_OFFSET + MAILBOX_RUN_ENTRY_STRIDE
+            successor_state_addr = successor_entry_addr + _OFF_ENTRY_STATE
+            successor_accepted_addr = successor_entry_addr + _OFF_ENTRY_ACCEPTED
 
             saw_staged = False
             deadline = time.monotonic() + 10.0

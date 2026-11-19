@@ -1,0 +1,671 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+"""Real native modules, Worker registration, READY, AIV/TMR and confirmed stop."""
+
+import logging
+import os
+import re
+import select
+import struct
+from pathlib import Path
+
+import pytest
+from simpler import CcuConfig
+from simpler.ccu import ChipCcuRunSet
+from simpler.task_interface import ArgDirection as D
+from simpler.task_interface import (
+    ChipCallable,
+    CoreCallable,
+    DataType,
+    TaskArgs,
+    TensorArgType,
+)
+from simpler.worker import Worker
+
+from simpler_setup.elf_parser import extract_text_section
+from simpler_setup.kernel_compiler import KernelCompiler
+from simpler_setup.pto_isa import ensure_pto_isa_root
+
+_ROOT = Path(__file__).resolve().parent
+_RUNTIME = "tensormap_and_ringbuffer"
+
+
+def _build_callable(
+    tmp_path, variant=0, source_root=_ROOT, runtime=_RUNTIME, multidomain=False, orchestration_source=None
+):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    compiler = KernelCompiler(platform="a5")
+    isa_root = Path(ensure_pto_isa_root())
+    variant_source = tmp_path / "variant.cpp"
+    variant_source.write_text(
+        f"#include <cstdint>\nextern const uint32_t ccu_test_variant = {variant};\n", encoding="ascii"
+    )
+    module = compiler.compile_ccu(
+        str(source_root / "kernels/ccu/native_module.cpp"), extra_sources=[str(variant_source)], build_dir=str(tmp_path)
+    )
+    orch_source = source_root / "kernels/orchestration/ccu_orch.cpp"
+    if not orch_source.exists():
+        orch_source = _ROOT / "kernels/orchestration/ccu_orch.cpp"
+    if multidomain:
+        orch_source = _ROOT / "kernels/orchestration/ccu_multidomain_orch.cpp"
+    if orchestration_source is not None:
+        orch_source = orchestration_source
+    orchestration = compiler.compile_orchestration(runtime, str(orch_source))
+    signatures = [[D.OUT, D.IN, D.IN, D.IN], [D.IN, D.OUT, D.IN, D.IN, D.IN], [D.IN, D.IN, D.OUT, D.IN, D.IN]]
+    children = []
+    for index, name in enumerate(("trigger_b", "trigger_a", "verify")):
+        binary = compiler.compile_incore(
+            str(source_root / f"kernels/aiv/{name}.cpp"),
+            core_type="aiv",
+            pto_isa_root=str(isa_root),
+            extra_include_dirs=compiler.get_orchestration_include_dirs(runtime),
+        )
+        children.append((index, CoreCallable.build(signature=signatures[index], binary=extract_text_section(binary))))
+    return ChipCallable.build(
+        signature=[D.OUT, D.OUT, D.OUT, D.IN, D.IN] + ([D.IN] if multidomain else []),
+        func_name="ccu_orchestration",
+        config_name="ccu_orchestration_config",
+        binary=orchestration,
+        children=children,
+        ccu_modules=[module],
+    )
+
+
+@pytest.mark.platforms(["a5"])
+@pytest.mark.runtime(_RUNTIME)
+@pytest.mark.device_count(2)
+def test_registration_isolated_across_two_live_domains(st_platform, st_device_ids, tmp_path):
+    worker = Worker(
+        level=3,
+        platform=st_platform,
+        runtime=_RUNTIME,
+        device_ids=[int(device) for device in st_device_ids[:2]],
+        num_sub_workers=0,
+    )
+    domains = []
+    try:
+        callable_handle = worker.register(_build_callable(tmp_path))
+        worker.init()
+
+        def allocate(orch, _args, _config):
+            for name in ("first", "second"):
+                domains.append(
+                    orch.allocate_domain(
+                        name=name,
+                        members=[0, 1],
+                        window_size=4 * 1024 * 1024,
+                        workspace_engines=("ccu",),
+                        retain_after_run=True,
+                    )
+                )
+            with pytest.raises(ValueError, match="workspace_configs"):
+                orch.get_or_allocate_domain(
+                    name="first",
+                    members=[0, 1],
+                    window_size=4 * 1024 * 1024,
+                    workspace_engines={"ccu": CcuConfig(mode="ms")},
+                    retain_after_run=True,
+                )
+
+        worker.run(allocate)
+        first, second = domains
+        assert first.allocation_id != second.allocation_id
+        initial = first.get_or_register_ccu(callable_handle, ccu_id=0, worker=0)
+        assert first.get_or_register_ccu(callable_handle, ccu_id=0, worker=0) is initial
+        other = second.get_or_register_ccu(callable_handle, ccu_id=0, worker=0)
+        assert initial.registration_id != other.registration_id
+        first.release()
+        assert first.freed
+        with pytest.raises(RuntimeError, match="released"):
+            initial.require_live(worker)
+        assert second.get_or_register_ccu(callable_handle, ccu_id=0, worker=0) is other
+        second.release()
+        assert second.freed
+        domains.clear()
+        worker.run(allocate)
+        rebuilt = domains[0].get_or_register_ccu(callable_handle, ccu_id=0, worker=0)
+        assert rebuilt.registration_id not in (initial.registration_id, other.registration_id)
+        assert domains[0].allocation_id != first.allocation_id
+        for domain in domains:
+            domain.release()
+    finally:
+        worker.close()
+
+
+@pytest.mark.platforms(["a5"])
+@pytest.mark.runtime(_RUNTIME)
+@pytest.mark.device_count(2)
+def test_unenabled_domain_rejects_ccu_registration(st_platform, st_device_ids, tmp_path):
+    worker = Worker(
+        level=3,
+        platform=st_platform,
+        runtime=_RUNTIME,
+        device_ids=[int(device) for device in st_device_ids[:2]],
+        num_sub_workers=0,
+    )
+    try:
+        callable_handle = worker.register(_build_callable(tmp_path))
+        worker.init()
+        domains = []
+
+        def allocate(orch, _args, _config):
+            domains.append(
+                orch.allocate_domain(
+                    name="disabled", members=[0, 1], window_size=4 * 1024 * 1024, retain_after_run=True
+                )
+            )
+
+        worker.run(allocate)
+        assert not worker._ccu_run_registrations
+        with pytest.raises(ValueError, match="workspace_engines"):
+            domains[0].get_or_register_ccu(callable_handle, ccu_id=0, worker=0)
+        domains[0].release()
+    finally:
+        worker.close()
+
+
+@pytest.mark.platforms(["a5"])
+@pytest.mark.runtime(_RUNTIME)
+@pytest.mark.device_count(2)
+@pytest.mark.parametrize("replace_callable", [False, True])
+def test_two_missions_b_before_a(st_platform, st_device_ids, tmp_path, request, replace_callable):
+    rounds = request.config.getoption("--rounds")
+    assert rounds > 0
+    target = _build_callable(tmp_path)
+    worker = Worker(
+        level=3,
+        platform=st_platform,
+        runtime=_RUNTIME,
+        device_ids=[int(device) for device in st_device_ids[:2]],
+        num_sub_workers=0,
+    )
+    retained = []
+    try:
+        callable_handle = worker.register(target)
+        replacement_handle = (
+            worker.register(_build_callable(tmp_path / "replacement", variant=1))
+            if replace_callable
+            else callable_handle
+        )
+        worker.init()
+        assert not worker._ccu_run_registrations
+        outputs = [[worker.create_buffer(64) for _ in range(3)] for _ in range(2)]
+
+        def run_round(orch, _args, config):
+            domain = orch.get_or_allocate_domain(
+                name="native_ccu",
+                members=[0, 1],
+                window_size=4 * 1024 * 1024,
+                workspace_engines=("ccu",),
+                retain_after_run=True,
+            )
+            if retained:
+                assert domain is retained[0]
+            else:
+                retained.append(domain)
+            selected = replacement_handle if round_index > max(1, rounds // 2) else callable_handle
+            bindings = {
+                rank: tuple(domain.get_or_register_ccu(selected, ccu_id=i, worker=rank) for i in range(2))
+                for rank in range(2)
+            }
+            for rank in range(2):
+                args = TaskArgs()
+                for output in outputs[rank]:
+                    args.add_tensor(output.tensor((8,), DataType.UINT64), TensorArgType.OUTPUT_EXISTING)
+                args.add_scalar(domain.device_context(rank))
+                args.add_scalar(round_index * 100 + rank * 10)
+                orch.submit_next_level(selected, args, config, worker=rank, ccu_bindings=bindings[rank])
+
+        for round_index in range(1, rounds + 1):
+            worker.run(run_round)
+            for rank in range(2):
+                value = round_index * 100 + rank * 10
+                assert [struct.unpack_from("<Q", output.shm.buf)[0] for output in outputs[rank]] == [
+                    value + 2,
+                    value + 1,
+                    value,
+                ]
+                assert struct.unpack_from("<Q", outputs[rank][0].shm.buf, 8)[0] == value + 3
+            if round_index in (1, rounds) or round_index % 100 == 0:
+                print(
+                    f"CCU round={round_index}/{rounds}: B-before-A, dynamic parameters and confirmed stop passed",
+                    flush=True,
+                )
+            if round_index == max(1, rounds // 2) and rounds > 1:
+                retained[0].release()
+                assert retained[0].freed
+                retained.clear()
+                print("Next round enables CCU on a fresh window allocation", flush=True)
+        # Merely borrowing a retained domain does not launch CCU work.
+        worker.run(lambda orch, _args, _cfg: orch.get_domain("native_ccu"))
+        retained[0].release()
+        assert retained[0].freed
+    finally:
+        worker.close()
+
+
+@pytest.mark.platforms(["a5"])
+@pytest.mark.runtime(_RUNTIME)
+@pytest.mark.device_count(2)
+def test_interleaved_callable_association_during_active_run(st_platform, st_device_ids, tmp_path, monkeypatch):
+    worker = Worker(
+        level=3,
+        platform=st_platform,
+        runtime=_RUNTIME,
+        device_ids=[int(device) for device in st_device_ids[:2]],
+        num_sub_workers=0,
+    )
+    started_reader, started_writer = os.pipe()
+    begin = ChipCcuRunSet.begin
+
+    def observe_begin(run):
+        begin(run)
+        os.write(started_writer, b"1")
+
+    monkeypatch.setattr(ChipCcuRunSet, "begin", observe_begin)
+    try:
+        handles = [worker.register(_build_callable(tmp_path / str(index), variant=index)) for index in range(2)]
+        worker.init()
+        outputs = [[[worker.create_buffer(64) for _ in range(3)] for _ in range(2)] for _ in handles]
+        for callable_outputs in outputs:
+            for rank_outputs in callable_outputs:
+                for output in rank_outputs:
+                    output.shm.buf[:] = bytes(64)
+
+        def interleave(orch, _args, config):
+            domain = orch.allocate_domain(
+                name="interleaved_ccu",
+                members=[0, 1],
+                window_size=4 * 1024 * 1024,
+                workspace_engines=("ccu",),
+            )
+
+            bindings = [
+                {
+                    rank: tuple(domain.get_or_register_ccu(handle, ccu_id=i, worker=rank) for i in range(2))
+                    for rank in range(2)
+                }
+                for handle in handles
+            ]
+
+            def submit(index, rank, predecessor=None):
+                args = TaskArgs()
+                for output in outputs[index][rank]:
+                    args.add_tensor(output.tensor((8,), DataType.UINT64), TensorArgType.OUTPUT_EXISTING)
+                args.add_scalar(domain.device_context(rank))
+                args.add_scalar((index + 1) * 100 + rank * 10)
+                if predecessor is not None:
+                    args.add_dep(predecessor)
+                return orch.submit_next_level(
+                    handles[index], args, config, worker=rank, ccu_bindings=bindings[index][rank]
+                )
+
+            first_rank0 = submit(0, 0)
+            # A started run cannot finish its exit handshake until the peer is submitted.
+            ready, _, _ = select.select([started_reader], [], [], 30.0)
+            assert ready, "rank 0 did not begin the first CCU run"
+            assert os.read(started_reader, 1) == b"1"
+            submit(1, 0, first_rank0)
+            first_rank1 = submit(0, 1)
+            submit(1, 1, first_rank1)
+
+        worker.run(interleave)
+        for index, callable_outputs in enumerate(outputs):
+            for rank, rank_outputs in enumerate(callable_outputs):
+                value = (index + 1) * 100 + rank * 10
+                assert [struct.unpack_from("<Q", output.shm.buf)[0] for output in rank_outputs] == [
+                    value + 2,
+                    value + 1,
+                    value,
+                ]
+                assert struct.unpack_from("<Q", rank_outputs[0].shm.buf, 8)[0] == value + 3
+    finally:
+        try:
+            worker.close()
+        finally:
+            os.close(started_reader)
+            os.close(started_writer)
+
+
+def _assert_unconfirmed_ccu_cleanup(worker, retained, outputs, child_pids, close_error):
+    assert close_error is not None and "Host mapping RECOVER failed" in str(close_error)
+    causes = []
+    cause: BaseException | None = close_error
+    while cause is not None:
+        causes.append(str(cause))
+        cause = cause.__cause__
+    assert any("communication cleanup is unconfirmed" in message for message in causes)
+    assert retained and not retained[0].freed
+    assert all(not output.closed for rank_outputs in outputs for output in rank_outputs)
+    assert worker._host_group_mappings is not None and worker._host_group_mappings.holds_resources
+    assert set(worker._chip_pids) == child_pids and len(worker._chip_shms) == len(child_pids)
+    assert all(shm.buf is not None for shm in worker._chip_shms)
+    assert not worker.teardown_reports()
+    for pid in child_pids:
+        os.kill(pid, 0)
+    with pytest.raises(RuntimeError, match="Host mapping RECOVER failed"):
+        worker.close()
+    assert not retained[0].freed and set(worker._chip_pids) == child_pids
+    print("CCU unconfirmed cleanup retains backing and child transports; close retry refused", flush=True)
+
+
+@pytest.mark.platforms(["a5"])
+@pytest.mark.runtime(_RUNTIME)
+@pytest.mark.device_count(2)
+@pytest.mark.parametrize("fault", ["missing_done", "missing_trigger"])
+def test_mission_failure_closes_admission_and_retains_domain(st_platform, st_device_ids, tmp_path, monkeypatch, fault):
+    log_root = tmp_path / "ascend"
+    log_root.mkdir()
+    monkeypatch.setenv("ASCEND_PROCESS_LOG_PATH", str(log_root))
+    target = _build_callable(tmp_path)
+    worker = Worker(
+        level=3,
+        platform=st_platform,
+        runtime=_RUNTIME,
+        device_ids=[int(device) for device in st_device_ids[:2]],
+        num_sub_workers=0,
+    )
+    retained = []
+    outputs = []
+    child_pids = set()
+    exit_reader, exit_writer = os.pipe()
+    os.set_blocking(exit_reader, False)
+    child_exit = os._exit
+
+    def observe_child_exit(code):
+        try:
+            os.write(exit_writer, f"{os.getpid()}:{code}\n".encode())
+        finally:
+            child_exit(code)
+
+    # The native scheduler may reap first; a signal never reaches os._exit.
+    monkeypatch.setattr(os, "_exit", observe_child_exit)
+
+    try:
+        callable_handle = worker.register(target)
+        worker.init()
+        child_pids.update(worker._chip_pids)
+        assert len(child_pids) == 2
+        outputs = [[worker.create_buffer(64) for _ in range(3)] for _ in range(2)]
+        for rank_outputs in outputs:
+            for output in rank_outputs:
+                output.shm.buf[:] = bytes(64)
+
+        def fail_round(orch, _args, config):
+            domain = orch.allocate_domain(
+                name="failed_ccu",
+                members=[0, 1],
+                window_size=4 * 1024 * 1024,
+                workspace_engines=("ccu",),
+                retain_after_run=True,
+            )
+            retained.append(domain)
+            bindings = {
+                rank: tuple(domain.get_or_register_ccu(callable_handle, ccu_id=i, worker=rank) for i in range(2))
+                for rank in range(2)
+            }
+            for rank in range(2):
+                args = TaskArgs()
+                for output in outputs[rank]:
+                    args.add_tensor(output.tensor((8,), DataType.UINT64), TensorArgType.OUTPUT_EXISTING)
+                args.add_scalar(domain.device_context(rank))
+                args.add_scalar({"missing_done": (1 << 64) - 2, "missing_trigger": 2}[fault])
+                orch.submit_next_level(callable_handle, args, config, worker=rank, ccu_bindings=bindings[rank])
+
+        with pytest.raises(RuntimeError):
+            worker.run(fail_round)
+        assert retained and not retained[0].freed
+        assert worker._ordered_cleanup_error is not None
+        for device in st_device_ids[:2]:
+            logs = list(log_root.glob(f"debug/device-{device}/device-*.log"))
+            assert logs, f"no device logs for {fault} on device {device} under {log_root}"
+            evidence = "\n".join(log.read_text(errors="replace") for log in logs)
+            assert evidence.strip(), f"empty device logs for {fault} on device {device} under {log_root}"
+            assert any(
+                all(
+                    field in line
+                    for field in (
+                        "ASYNC_WAIT reason=scheduler_timeout",
+                        "normal_done=1",
+                        "engine=CCU type=4",
+                        "cookie=0x1",
+                        "retired=0",
+                    )
+                )
+                for line in evidence.splitlines()
+            ), f"unexpected scheduler timeout evidence for {fault}"
+        with pytest.raises(RuntimeError):
+            worker.run(lambda *_: None)
+        assert not retained[0].freed
+        print(f"CCU {fault} observed; admission closed and domain retained", flush=True)
+    finally:
+        exit_records = bytearray()
+        close_error = None
+        try:
+            try:
+                worker.close()
+            except RuntimeError as error:
+                close_error = error
+                assert worker._ordered_cleanup_error is not None
+            try:
+                while chunk := os.read(exit_reader, 4096):
+                    exit_records.extend(chunk)
+            except BlockingIOError:
+                pass
+        finally:
+            os.close(exit_reader)
+            os.close(exit_writer)
+        child_exits = {
+            int(pid): int(code) for record in exit_records.decode().splitlines() for pid, code in [record.split(":")]
+        }
+        if worker._worker is not None:
+            assert not child_exits
+            _assert_unconfirmed_ccu_cleanup(worker, retained, outputs, child_pids, close_error)
+        else:
+            assert child_pids <= child_exits.keys(), "CCU chip child crashed or did not reach controlled exit"
+            for pid in child_pids:
+                assert child_exits[pid] in (0, 1), f"CCU chip child {pid} has unexpected exit code {child_exits[pid]}"
+            print(f"CCU chip children reached controlled exit: {child_exits}", flush=True)
+
+
+@pytest.mark.platforms(["a5"])
+@pytest.mark.runtime(_RUNTIME)
+@pytest.mark.device_count(2)
+def test_multidomain_chip_resident_missions_reuse(st_platform, st_device_ids, tmp_path, request, capfd):
+    """Two reordered domains execute in one CHIP run; resident missions stop normally."""
+    _exercise_multidomain_chip(st_platform, st_device_ids, tmp_path, request, capfd, finite=False)
+
+
+@pytest.mark.platforms(["a5"])
+@pytest.mark.runtime(_RUNTIME)
+@pytest.mark.device_count(2)
+def test_multidomain_chip_finite_missions_reuse(st_platform, st_device_ids, tmp_path, request, capfd):
+    """Three domain registrations execute and naturally exit in one CHIP run."""
+    _exercise_multidomain_chip(st_platform, st_device_ids, tmp_path, request, capfd, finite=True)
+
+
+@pytest.mark.platforms(["a5"])
+@pytest.mark.runtime(_RUNTIME)
+@pytest.mark.device_count(2)
+def test_ccu_stream_pool_grows_and_reuses_across_callables(st_platform, st_device_ids, tmp_path, request, capfd):
+    """Alternate two finite and three resident missions on one L2 stream pool."""
+    _exercise_multidomain_chip(st_platform, st_device_ids, tmp_path, request, capfd, finite=False, vary_missions=True)
+
+
+def _exercise_multidomain_chip(st_platform, st_device_ids, tmp_path, request, capfd, *, finite, vary_missions=False):
+    rounds = max(4 if vary_missions else 2, request.config.getoption("--rounds"))
+    logger = logging.getLogger("simpler")
+    previous_level = logger.level
+    logger.setLevel(logging.INFO)
+    worker = Worker(
+        level=3,
+        platform=st_platform,
+        runtime=_RUNTIME,
+        device_ids=[int(d) for d in st_device_ids[:2]],
+        num_sub_workers=0,
+    )
+    retained = []
+    registrations = []
+    try:
+        orchestration_source = _ROOT / "kernels/orchestration/ccu_multidomain_finite_orch.cpp" if finite else None
+        handle = worker.register(_build_callable(tmp_path, multidomain=True, orchestration_source=orchestration_source))
+        single_handle = worker.register(_build_callable(tmp_path / "single")) if vary_missions else None
+        worker.init()
+        outputs = [[worker.create_buffer(64) for _ in range(3)] for _ in range(2)]
+        for generation in range(1, rounds + 1):
+            single_domain = vary_missions and generation % 2 == 1
+
+            def run(orch, _args, config):
+                domains = [
+                    orch.get_or_allocate_domain(
+                        name=f"multi-{i}",
+                        members=members,
+                        window_size=4 * 1024 * 1024,
+                        workspace_engines=("ccu",),
+                        retain_after_run=True,
+                    )
+                    for i, members in enumerate(([0, 1], [1, 0]))
+                ]
+                bindings = {
+                    rank: (
+                        domains[0].get_or_register_ccu(handle, ccu_id=0, worker=rank),
+                        domains[1].get_or_register_ccu(handle, ccu_id=1, worker=rank),
+                        domains[1].get_or_register_ccu(handle, ccu_id=0, worker=rank),
+                    )
+                    for rank in range(2)
+                }
+                if retained:
+                    assert domains == retained
+                    assert bindings == registrations[0]
+                else:
+                    retained.extend(domains)
+                    registrations.append(bindings)
+                rank_args = []
+                for rank in range(2):
+                    args = TaskArgs()
+                    for output in outputs[rank]:
+                        args.add_tensor(output.tensor((8,), DataType.UINT64), TensorArgType.OUTPUT_EXISTING)
+                    if not single_domain:
+                        args.add_scalar(domains[0].device_context(rank))
+                    args.add_scalar(domains[1].device_context(rank))
+                    args.add_scalar(generation * 100 + rank * 10)
+                    rank_args.append(args)
+                orch.submit_next_level_group(
+                    single_handle if single_domain else handle,
+                    rank_args,
+                    config,
+                    workers=[0, 1],
+                    ccu_bindings={rank: plan[1:] if single_domain else plan for rank, plan in bindings.items()},
+                )
+
+            worker.run(run)
+            for rank in range(2):
+                value = generation * 100 + rank * 10
+                assert [struct.unpack_from("<Q", o.shm.buf)[0] for o in outputs[rank]] == [
+                    value + 2,
+                    value + 1,
+                    value if single_domain else value + 3,
+                ]
+                if finite:
+                    assert [struct.unpack_from("<Q", o.shm.buf, 8)[0] for o in outputs[rank]] == [
+                        value + 12,
+                        value + 11,
+                        value + 13,
+                    ]
+        for dom in retained:
+            dom.release()
+            assert dom.freed
+    finally:
+        try:
+            worker.close()
+        finally:
+            logger.setLevel(previous_level)
+
+    captured = capfd.readouterr()
+    ccu_lines = [line for line in (captured.out + captured.err).splitlines() if "[ccu]" in line]
+    (tmp_path / "ccu_resource_evidence.txt").write_text("\n".join(ccu_lines) + "\n")
+    assert sum("HCOMM register " in line for line in ccu_lines) == 6
+    assert sum("pool create " in line for line in ccu_lines) == 6
+    destroyed = [line for line in ccu_lines if "pool destroy " in line]
+    assert len(destroyed) == 6
+    uses = [int(re.search(r"uses=(\d+)", line)[1]) for line in destroyed]
+    expected_uses = [rounds, rounds, rounds // 2] if vary_missions else [rounds] * 3
+    assert sorted(uses) == sorted(expected_uses * 2)
+    resident_runs = rounds // 2 if vary_missions else (0 if finite else rounds)
+    assert sum("completed mission abort confirmed " in line for line in ccu_lines) == 6 * resident_runs
+
+
+@pytest.mark.platforms(["a5"])
+@pytest.mark.runtime(_RUNTIME)
+@pytest.mark.device_count(2)
+def test_register_and_launch_only_target_worker(st_platform, st_device_ids, tmp_path, capfd):
+    """A passive domain member does not register or launch a mission."""
+    logger = logging.getLogger("simpler")
+    previous_level = logger.level
+    logger.setLevel(logging.INFO)
+    worker = Worker(
+        level=3,
+        platform=st_platform,
+        runtime=_RUNTIME,
+        device_ids=[int(d) for d in st_device_ids[:2]],
+        num_sub_workers=0,
+    )
+    retained = []
+    registrations = []
+    try:
+        handle = worker.register(
+            _build_callable(tmp_path, orchestration_source=_ROOT / "kernels/orchestration/ccu_target_orch.cpp"),
+        )
+        worker.init()
+        outputs = [worker.create_buffer(64) for _ in range(3)]
+        for output in outputs:
+            output.shm.buf[:] = bytes(64)
+        for generation in range(1, 4):
+
+            def run(orch, _args, config):
+                domain = orch.get_or_allocate_domain(
+                    name="target-only",
+                    members=[1, 0],
+                    window_size=4 * 1024 * 1024,
+                    workspace_engines=("ccu",),
+                    retain_after_run=True,
+                )
+                reg = domain.get_or_register_ccu(handle, ccu_id=0, worker=0)
+                assert domain.get_or_register_ccu(handle, ccu_id=0, worker=0) is reg
+                if retained:
+                    assert domain is retained[0]
+                    assert reg is registrations[0]
+                else:
+                    retained.append(domain)
+                    registrations.append(reg)
+                args = TaskArgs()
+                for output in outputs:
+                    args.add_tensor(output.tensor((8,), DataType.UINT64), TensorArgType.OUTPUT_EXISTING)
+                args.add_scalar(domain.device_context(0))
+                args.add_scalar(generation * 100)
+                orch.submit_next_level(handle, args, config, worker=0, ccu_bindings=(reg, reg))
+
+            worker.run(run)
+            assert struct.unpack_from("<Q", outputs[1].shm.buf)[0] == generation * 100
+        retained[0].release()
+        assert retained[0].freed
+    finally:
+        try:
+            worker.close()
+        finally:
+            logger.setLevel(previous_level)
+    captured = capfd.readouterr()
+    lines = [line for line in (captured.out + captured.err).splitlines() if "[ccu]" in line]
+    (tmp_path / "ccu_resource_evidence.txt").write_text("\n".join(lines) + "\n")
+    assert sum("HCOMM register " in line for line in lines) == 1
+    assert sum("pool create " in line for line in lines) == 1
+    destroyed = [line for line in lines if "pool destroy " in line]
+    assert len(destroyed) == 1 and "uses=3" in destroyed[0]
+    assert sum("completed mission abort confirmed " in line for line in lines) == 3

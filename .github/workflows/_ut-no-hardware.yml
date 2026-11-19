@@ -20,6 +20,7 @@ on:
         required: true
         type: string
       python_version:
+        description: Hosted Python version; CI requires Python 3.10 or newer.
         required: false
         default: "3.10"
         type: string
@@ -28,35 +29,70 @@ jobs:
   run:
     name: ut
     runs-on: ${{ fromJSON(inputs.runs_on) }}
-    timeout-minutes: 20
+    timeout-minutes: ${{ inputs.setup_variant == 'github' && 30 || 20 }}
+    # Single-host CPU MPI tests must not select the runner's unsupported RDMA devices.
+    env:
+      UCX_TLS: "self,sm,tcp"
     steps:
       - name: Checkout target
         uses: actions/checkout@v5
         with:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
-          fetch-depth: ${{ inputs.setup_variant == 'self-cpu' && '0' || '1' }}
+          fetch-depth: ${{ inputs.setup_variant == 'self-cpu' && '100' || '1' }}
           persist-credentials: false
 
-      - name: Set up Python ${{ inputs.python_version }}
+      - name: Checkout Python setup action
         if: inputs.setup_variant == 'github'
-        uses: actions/setup-python@v6
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          path: .ci-support
+          sparse-checkout: .github/actions/setup-python
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        if: inputs.setup_variant == 'github'
+        uses: ./.ci-support/.github/actions/setup-python
         with:
           python-version: ${{ inputs.python_version }}
 
-      - name: Install GoogleTest
+      - name: Verify Python >= 3.10
+        run: |
+          python3 -c 'import sys; print(sys.version); sys.exit(0 if sys.version_info >= (3, 10) else "CI requires Python >= 3.10")'
+
+      - name: Set up C++ compiler
+        uses: ./.github/actions/setup-gcc-15
+
+      - name: Install GoogleTest and AArch64 C++ compiler
         if: inputs.setup_variant == 'github' && runner.os == 'Linux'
         uses: ./.github/actions/apt-install
         with:
-          required-packages: libgtest-dev
+          required-packages: libgtest-dev g++-aarch64-linux-gnu
+          # ccache only makes the C++ build faster, and the build step below
+          # reads whether it arrived rather than assuming it, so a package
+          # manager that cannot serve it costs minutes and fails nothing.
+          optional-packages: ccache
           install-timeout-seconds: "240"
 
       - name: Install GoogleTest on macOS
         if: inputs.setup_variant == 'github' && runner.os != 'Linux'
-        run: brew install googletest
+        run: |
+          brew install googletest
+          command -v ccache >/dev/null 2>&1 || brew install ccache ||
+            echo "::warning::brew could not install ccache; the C++ build will compile from scratch"
 
       - name: Cache pip packages
+        if: inputs.setup_variant == 'github'
         uses: ./.github/actions/cache-pip
+
+      # Self-hosted runners keep one checkout and one home directory across
+      # runs, so their ccache persists on disk and needs no upload.
+      - name: Cache ccache objects
+        if: inputs.setup_variant == 'github'
+        uses: ./.github/actions/cache-ccache
 
       - name: Install dependencies
         if: inputs.setup_variant == 'github'
@@ -73,13 +109,22 @@ jobs:
         with:
           packages: ".[test]"
 
+      - name: Install MPI for Linux unit tests
+        if: inputs.setup_variant == 'github' && runner.os == 'Linux'
+        run: |
+          # Use matching MPI wheels: Ubuntu 24.04's MPICH package cannot
+          # form a Hydra world (https://github.com/pmodels/mpich/issues/7064).
+          pip install --only-binary=:all: 'mpi4py==4.1.2' 'mpich==4.3.2'
+          python -c "import mpi4py; mpi4py.rc.initialize=False; from mpi4py import MPI; vendor=MPI.get_vendor(); print(vendor); assert 'mpich' in vendor[0].lower()"
+          mpirun -n 3 python -c "from mpi4py import MPI; comm=MPI.COMM_WORLD; print(comm.Get_rank(), comm.Get_size()); assert comm.Get_size()==3; assert comm.allreduce(1)==3"
+
       - name: Run Python unit tests
         run: |
           if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
             source .venv/bin/activate
-            python -m pytest tests/ut -m "not requires_hardware" -v
+            python -m pytest tests/ut -m "not requires_hardware" -q -n 32
           else
-            pytest tests/ut -m "not requires_hardware" -v
+            pytest tests/ut -m "not requires_hardware" -q
           fi
 
       - name: Build and run C++ unit tests
@@ -89,32 +134,84 @@ jobs:
           fi
           # Real entry tests may skip in a standalone C++ build, but not in CI.
           test -f build/lib/libcpu_sim_context.so
-          # discover_runtimes is the one definition of what a runtime is — a
-          # directory under src/<arch>/runtime with a build_config.py — so a new
-          # one is asserted here without editing this list into existence. An
-          # empty result would make the loop body run zero times and the step
-          # pass having asserted nothing, which `set -e` does not catch in a
-          # `for` list, so it is rejected before the loop.
+          # default_build_runtimes is what a build that names no runtime leaves
+          # behind: discovery alone would include one that opted out of the
+          # default set, whose artifact is correctly absent here. A new runtime
+          # is still asserted without editing a list into existence. An empty
+          # result would make the loop body run zero times and the step pass
+          # having asserted nothing, which `set -e` does not catch in a `for`
+          # list, so it is rejected before the loop.
           for arch in a2a3 a5; do
             runtimes=$(python -c \
-                "from simpler_setup.platform_info import discover_runtimes; print(' '.join(discover_runtimes('$arch')))")
+                "from simpler_setup.platform_info import default_build_runtimes; print(' '.join(default_build_runtimes('$arch')))")
             test -n "$runtimes"
             for runtime in $runtimes; do
               test -f "build/lib/$arch/sim/$runtime/libhost_runtime.so"
             done
           done
-          cmake -B tests/ut/cpp/build -S tests/ut/cpp -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-          cmake --build tests/ut/cpp/build --parallel 4
-          ctest --test-dir tests/ut/cpp/build -LE requires_hardware -j4 --output-on-failure --timeout 300
+          # A compiler launcher is a configure-time choice, so it is passed
+          # conditionally rather than exported: a runner whose package manager
+          # could not serve ccache configures without it and compiles as before.
+          # The launcher appears in compile_commands.json, which the axis check
+          # below re-executes with `-E -H`; ccache forwards both transparently,
+          # so the recorded line stays usable as a preprocess command.
+          launcher=()
+          if command -v ccache >/dev/null 2>&1; then
+            launcher=(-DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+            ccache --zero-stats >/dev/null 2>&1 || true
+          fi
+          cmake -B tests/ut/cpp/build -S tests/ut/cpp -DCMAKE_EXPORT_COMPILE_COMMANDS=ON "${launcher[@]}"
+          cmake --build tests/ut/cpp/build --parallel 32
+          # The hit rate is what says whether the restored cache was usable, and
+          # it is only readable here — a cold cache and a key that stopped
+          # matching produce the same full-length build otherwise.
+          if command -v ccache >/dev/null 2>&1; then
+            ccache --show-stats
+          fi
+          ctest --test-dir tests/ut/cpp/build -LE requires_hardware -j32 --output-on-failure --timeout 300
+
+      - name: Check C++ unit-test axis coverage
+        run: |
+          if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
+            source .venv/bin/activate
+          fi
           # A case built once against one arch or one runtime passes exactly like
           # one that covers every configuration, so the gap is invisible to ctest.
           # This reads the build's compile lines instead. It needs the configured
           # build above, which is why it is here and not in pre-commit.
-          python tests/lint/check_ut_cpp_axis.py --jobs 4
+          #
+          # Which configurations a case is built for is decided by the include
+          # paths this repository's CMakeLists compose, so the answer is the same
+          # on every platform and one runner can establish it. Linux is the one
+          # that can, because its build graph is the superset: a non-Linux
+          # configure drops test_thread_scheduling.cpp, whose wrapped sched_*
+          # symbols are a GNU ld feature. The check reads every translation
+          # unit's include tree, which costs ~44 s on Linux and ~175 s on macOS,
+          # so the second run is the more expensive one and establishes less.
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            python tests/lint/check_ut_cpp_axis.py --jobs 32
+          else
+            echo "Axis coverage is established by the Linux leg, whose build graph is a superset of this one; skipping."
+          fi
+
+      - name: Check C++ unit-test stub linkage
+        run: |
+          if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
+            source .venv/bin/activate
+          fi
           # A stub the support archive lost to a weak fallback links fine and
           # then hangs, so ctest only catches it by timing out. This reads the
           # built binaries' symbol tables and names every target that took one.
+          # Unlike the axis check this runs everywhere: which archive member
+          # resolves a symbol, and whether a weak definition wins, is decided by
+          # the platform's linker rather than by this repository.
           python tests/lint/check_ut_cpp_stub_linkage.py
+
+      - name: Check swimlane exporter roundtrip
+        run: |
+          if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
+            source .venv/bin/activate
+          fi
           # The swimlane export→parse roundtrip needs the C++ exporter binary, so
           # it runs here rather than in the pyut sweep above (which precedes this
           # build and skips it). Asserting the parser against hand-written JSON

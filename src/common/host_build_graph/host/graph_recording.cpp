@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "host_build_graph/graph_recording.h"
+#include "host_build_graph/host/graph_recording.h"
 
 #include <algorithm>
 #include <atomic>
@@ -18,8 +18,8 @@
 #include <vector>
 
 #include "common/unified_log.h"
-#include "host_build_graph/graph_cache.h"
-#include "host_build_graph/graph_host_state.h"
+#include "host_build_graph/host/graph_cache.h"
+#include "host_build_graph/host/graph_host_state.h"
 
 namespace {
 
@@ -85,8 +85,8 @@ bool graph_recording_init_tensor_map(GraphRecording &recording) {
 // get dense enough to push it past ~128 KB.
 //
 // The tensor pool is 4 MB and the rest ~1.3 MB per recorder thread, next to the 2.17 MB
-// hazard map. Only the pool's used prefix ever becomes resident: it is default-initialized
-// and a body writes the bytes its tensors need, contiguously.
+// hazard map. Default construction writes each tensor's TaskId invalid sentinel,
+// touching the pool throughout its allocation during recorder stand-up.
 //
 // Returns false when the pool cannot be allocated, which the caller treats like a hazard
 // map it could not stand up.
@@ -207,37 +207,6 @@ bool graph_boundary_relocate_params(GraphBoundary &boundary) {
     return true;
 }
 
-uint64_t graph_full_key(uint64_t callable_hash, uint64_t graph_key) {
-    uint64_t h = 1469598103934665603ULL;
-    h = graph_hash_bytes(h, &callable_hash, sizeof(callable_hash));
-    return graph_hash_bytes(h, &graph_key, sizeof(graph_key));
-}
-
-// The recorder thread's own storage for the body it is recording, and the reason none
-// of this is allocated per recording.
-//
-// A recorder thread outlives the bind that first used it: the pool parks
-// kPrewarmedWorkerCount threads at callable registration and keeps them across runs
-// (GraphAsyncRecordingState in orchestration_api.h). Its storage now does too. What a
-// recording needs is a hazard map of 2.17 MB and seven flat arrays; standing those up
-// per recording made the first touch of every page a minor fault, and paid it again on
-// every bind because the memory went back to the kernel in between — with the
-// allocation itself sitting on the submitting thread inside graph_begin, between two
-// outer shells. Held per thread instead, the pages fault once in the process's life and
-// a recording starts by resetting what is already resident.
-//
-// This retains no content across recordings: reset() clears every array and empties the
-// map. Only the pages stay.
-//
-// Safe as a thread_local because a thread records one body at a time: graph_prepare
-// refuses to bind while this thread already has a recording active, so a Graph nested
-// inside a recorded body takes the ordinary path rather than claiming this storage
-// twice.
-GraphRecording &recorder_recording() {
-    static thread_local GraphRecording storage;
-    return storage;
-}
-
 // Stand this thread's storage up once, or report that it could not be. Idempotent.
 //
 // Either allocation failing drops whatever the other one took, so the next attempt starts
@@ -322,10 +291,19 @@ bool graph_classify_tensor(const GraphRecording &recording, int32_t task_index, 
 // settled without writing any of it so the destination can be claimed at the
 // exact size. required_heap comes from the fill, which is the pass that walks the
 // tasks in order.
-std::optional<GraphDefinition> graph_layout_definition(const GraphRecording &recording) {
+std::optional<Graph> graph_layout_definition(const GraphRecording &recording) {
+    // The boundary's tensor count is bounded above by the fixed boundary and not at all below.
+    // GRAPH_MAX_TENSOR_ARGS is the cap `GraphTaskArgs` is sized to, so this states the same
+    // contract `rt_graph_args_cacheable` admits a submission under; the two have to agree,
+    // because a boundary admitted there and refused here records a whole body and then fails at
+    // `graph_end` instead of at the submission that named it.
+    //
+    // No lower bound: a body that reaches its buffers through its Config passes no tensors, and
+    // nothing here indexes one. The only reader of a boundary tensor on this path is a body
+    // tensor whose owner names a parameter, and `graph_boundary_relocate_params` stamps a PARAM
+    // owner once per boundary tensor — so a boundary of none produces no such owner.
     if (recording.unsupported || recording.task_count == 0 || recording.task_count > SUB_TASK_MAX_NUM ||
-        recording.bound_boundary().params.tensor_count() <= 0 ||
-        recording.bound_boundary().params.tensor_count() > UINT16_MAX) {
+        recording.bound_boundary().params.tensor_count() > GRAPH_MAX_TENSOR_ARGS) {
         return std::nullopt;
     }
 
@@ -365,8 +343,8 @@ std::optional<GraphDefinition> graph_layout_definition(const GraphRecording &rec
     }
     if (predicate_count > UINT16_MAX) return std::nullopt;
 
-    GraphDefinition definition{};
-    definition.full_key = recording.full_key;
+    Graph definition{};
+    definition.graph_key = recording.graph_key;
     definition.task_count = recording.task_count;
     definition.edge_count = total_fanins;
     definition.root_count = root_count;
@@ -389,7 +367,7 @@ std::optional<GraphDefinition> graph_layout_definition(const GraphRecording &rec
     }
     definition.execution_storage_bytes = static_cast<uint32_t>(execution_storage_bytes);
 
-    size_t image_bytes = sizeof(GraphDefinition);
+    size_t image_bytes = sizeof(Graph);
     if (!graph_layout_section<int32_t>(recording.task_count + 1, &image_bytes, &definition.off_fanout_offsets) ||
         !graph_layout_section<uint16_t>(total_fanins, &image_bytes, &definition.off_fanout_indices) ||
         !graph_layout_section<int32_t>(recording.task_count + 1, &image_bytes, &definition.off_fanin_offsets) ||
@@ -420,7 +398,7 @@ std::optional<GraphDefinition> graph_layout_definition(const GraphRecording &rec
 // between sections, and `SubTaskDefinition`'s interior padding, which the
 // per-field assignment below cannot reach and a static_assert on that struct's
 // size pins against further growth.
-bool graph_fill_definition(const GraphRecording &recording, GraphDefinition definition, std::byte *image) {
+bool graph_fill_definition(const GraphRecording &recording, Graph definition, std::byte *image) {
     if (image == nullptr) return false;
     always_assert(
         reinterpret_cast<uintptr_t>(image) % GRAPH_DEFINITION_OBJECT_ALIGN == 0 &&
@@ -501,7 +479,7 @@ bool graph_fill_definition(const GraphRecording &recording, GraphDefinition defi
 
         SubTaskDefinition &task = tasks[i];
         std::copy(source.kernel_ids.begin(), source.kernel_ids.end(), std::begin(task.kernel_id));
-        task.active_mask = source.active_mask.raw();
+        task.active_mask = source.active_mask;
         // The recorded attrs carry the caller's early-resolve intent, which the
         // qualification above consumes; no sub-task reaches the device with
         // that bit set.
@@ -583,9 +561,9 @@ bool graph_fill_definition(const GraphRecording &recording, GraphDefinition defi
 // The image at `data`, once it is a Definition of exactly `bytes`. Rejects a
 // region whose own total_bytes disagrees, which is what makes a record's
 // bookkeeping and the bytes it points at one fact rather than two.
-const GraphDefinition *graph_definition(const std::byte *data, size_t bytes) {
-    if (data == nullptr || bytes < sizeof(GraphDefinition)) return nullptr;
-    const auto *definition = reinterpret_cast<const GraphDefinition *>(data);
+const Graph *graph_definition(const std::byte *data, size_t bytes) {
+    if (data == nullptr || bytes < sizeof(Graph)) return nullptr;
+    const auto *definition = reinterpret_cast<const Graph *>(data);
     return definition->total_bytes == bytes ? definition : nullptr;
 }
 
@@ -594,8 +572,8 @@ const GraphDefinition *graph_definition(const std::byte *data, size_t bytes) {
 // report whatever its x0 held.
 std::atomic<size_t> g_recorder_storage_failures{0};
 
-bool graph_recorder_stand_up_storage() {
-    if (graph_recording_stand_up(recorder_recording())) return true;
+bool graph_recorder_stand_up_storage(GraphRecording &recording) {
+    if (graph_recording_stand_up(recording)) return true;
     g_recorder_storage_failures.fetch_add(1, std::memory_order_relaxed);
     return false;
 }

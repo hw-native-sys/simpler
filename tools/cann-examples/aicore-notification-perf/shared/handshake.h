@@ -28,18 +28,7 @@
 
 #include <cstddef>
 #include <cstdint>
-
-// REG_SPR_COND_OFFSET on a2a3 chip family. The AICPU consumer reads
-// `reg_addr_base + core_stride * core_idx + REG_SPR_COND_OFFSET` to poll
-// AICore's COND register. Mirrors src/a2a3/platform/include/common/platform_config.h.
-constexpr uint32_t kNotifPerfRegSprCondOffset = 0x4C8;
-
-// Per-core stride within the AIC_CTRL window — only the first sub-core (AIC,
-// i.e. CUBE) slot is used here, since the producer runs with block_dim=1.
-// Mirrors host_regs.cpp::core_stride. AICPU consumer only needs the AIC[0]
-// COND register; a future extension that drives multiple cores would
-// recompute this per core_idx.
-constexpr uint64_t kNotifPerfCoreStride = 8ULL * 1024 * 1024;
+#include <type_traits>
 
 // FIN encoding — AICore producer writes COND with `MAKE_FIN_VALUE(seq)`
 // because production set_cond paths exercise this bit pattern; bit-31 = 1
@@ -48,12 +37,8 @@ constexpr uint64_t kNotifPerfCoreStride = 8ULL * 1024 * 1024;
 constexpr uint32_t kNotifPerfTaskIdMask = 0x7FFFFFFFu;
 constexpr uint32_t kNotifPerfTaskStateMask = 0x80000000u;
 
-// get_coreid() is not a bare index: the runtime masks it with AICORE_COREID_MASK
-// before indexing the AIC_CTRL window (0x8010 has been observed raw), and an
-// unmasked value addresses outside the window and faults the AICPU op
-// (src/a2a3/platform/onboard/aicore/inner_kernel.h::get_physical_core_id).
+// get_coreid() carries flags above the physical core index on both arches.
 constexpr uint32_t kNotifPerfCoreIdMask = 0x0FFF;
-constexpr uint32_t kNotifPerfMaxCores = 64;
 
 // Producer mode selector — AICPU consumer writes `mode` before flipping
 // `go = 1`; producer reads it once per inner-loop iteration.
@@ -154,7 +139,7 @@ struct alignas(64) NotifPerfResult {
     uint32_t gm_unordered;
     uint32_t cond_unordered;
 
-    // What the producer reported and what actually indexed the COND window.
+    // What the producer reported and what actually indexed the register table.
     uint32_t core_id_raw;
     uint32_t core_id_used;
     // 1 = the producer published it, 0 = the wait timed out and target_core_idx
@@ -174,13 +159,17 @@ constexpr uint32_t kNotifPerfResultMagic = 0xC0DECAFEu;
 // aicpu-kernel-launch tool uses for `DeviceArgs.result_addr` and
 // `DeviceArgs.input_token`; we extend with three pointer fields.
 struct alignas(8) NotifPerfDeviceArgs {
-    uint64_t reserved_pre[12];   // 0..95 — dispatcher bootstrap uses these
-    uint64_t result_addr;        // 96 — &NotifPerfResult
-    uint64_t input_token;        // 104 — echoed for sanity
-    uint64_t handshake_addr;     // 112 — &NotifPerfHandshake
-    uint64_t aic_ctrl_reg_base;  // 120 — halMemCtl(REG_AIC_CTRL).ptr
-    uint32_t target_core_idx;    // 128 — which AIC core's COND to poll
-    uint32_t n_samples;          // 132 — per subtest, default 100
+    uint64_t reserved_pre[12];  // 0..95 — dispatcher bootstrap uses these
+    uint64_t result_addr;       // 96 — &NotifPerfResult
+    uint64_t input_token;       // 104 — echoed for sanity
+    uint64_t handshake_addr;    // 112 — &NotifPerfHandshake
+    uint64_t reg_bases_addr;    // 120 — GM array of AICore register bases
+    uint32_t target_core_idx;   // 128 — which AIC core's COND to poll
+    uint32_t n_samples;         // 132 — per subtest, default 100
+    uint32_t reg_core_count;
+    uint32_t cond_offset;
 };
+static_assert(sizeof(NotifPerfDeviceArgs) <= 160, "DeviceArgs must fit the dispatcher allocation");
+static_assert(std::is_trivially_copyable_v<NotifPerfDeviceArgs> && std::is_standard_layout_v<NotifPerfDeviceArgs>);
 
 #endif  // AICORE_NOTIFICATION_PERF_HANDSHAKE_H_

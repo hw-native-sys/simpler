@@ -104,32 +104,25 @@ bool launch_entry_args_permitted(rtStream_t aicpu_stream) {
     return launch_route_permitted_by_capture(static_cast<int>(rc), static_cast<int>(status));
 }
 
-int publish_for_launch(KernelArgsHelper &kernel_args, rtStream_t aicpu_stream) {
+int publish_for_launch(
+    KernelArgsHelper &kernel_args, rtStream_t aicpu_stream, LaunchProgressSink &sink, bool retained_recording
+) {
     if (kernel_args.runtime_args_published()) return 0;
-    const bool permitted = launch_entry_args_permitted(aicpu_stream);
-    const int rc = kernel_args.publish_runtime_args(permitted);
+    // A retained recording has passed resource admission; RTS records the
+    // same launch packet used by eager, including KernelInvocation identity.
+    const bool permitted = retained_recording || launch_entry_args_permitted(aicpu_stream);
+    const int rc = kernel_args.publish_runtime_args(permitted, aicpu_stream, sink, retained_recording);
     if (rc != 0) {
-        LOG_ERROR("publish_for_launch: this run's Runtime descriptor did not reach the device: %d", rc);
+        LOG_ERROR("publish_for_launch: launch metadata publication failed: %d", rc);
     }
     return rc;
 }
 
-int KernelArgsHelper::prepare_runtime_args(
-    const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot
+int reserve_slot_runtime_args(
+    const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot, uint64_t metadata_bytes,
+    RuntimeWorkerInit worker_init, int *capture_mode_restore_error
 ) {
-    if (runtime_args_state_ == RuntimeArgsState::Prepared) return PTO_RUNTIME_ERR_INVALID_STATE;
-    // Ahead of the allocation and of the snapshot, so a descriptor carrying
-    // counts no consumer may believe fails the run here: nothing is allocated,
-    // nothing is copied, and the caller's prepare returns the error rather than
-    // publishing lengths the device would trust.
-    const LaunchEntryArgsPlan plan = runtime_launch_entry_args_plan(host_runtime);
-    if (!plan.counts_valid) {
-        LOG_ERROR("prepare_runtime_args: this run's entry-argument counts are outside capacity");
-        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    }
-    release_run_view();
-    allocator_ = &allocator;
-
+    if (capture_mode_restore_error != nullptr) *capture_mode_restore_error = 0;
     // Both runtime variants publish the descriptor at offset zero. Host-only
     // orchestration state and tensor leases remain outside this snapshot, and so
     // does any tail no host copy reaches: the block is sized to the whole
@@ -147,7 +140,7 @@ int KernelArgsHelper::prepare_runtime_args(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (slot.runtime_args == nullptr) {
-        void *runtime_dev = allocator_->alloc(runtime_extent);
+        void *runtime_dev = allocator.alloc(runtime_extent);
         if (runtime_dev == nullptr) {
             LOG_ERROR("Alloc for runtime_args failed");
             return PTO_RUNTIME_ERR_INTERNAL;
@@ -155,12 +148,85 @@ int KernelArgsHelper::prepare_runtime_args(
         slot.runtime_args = reinterpret_cast<Runtime *>(runtime_dev);
         slot.runtime_bytes = runtime_extent;
         slot.workers_initialized = false;
+        slot.entry_cache_qualification.clear();
+        slot.entry_cmo_may_have_trimmed = false;
         // A fresh block inherits no claim about its contents. The two teardown
         // paths reset the whole struct, but a slot reaching this branch with a
         // freed pointer has not been through either, so the transition is made
         // here rather than inherited.
         slot.published_prefix_bytes = 0;
     }
+    if (metadata_bytes > UINT64_MAX - runtime_extent) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    const uint64_t upload_bytes = runtime_extent + metadata_bytes;
+    // Initialization owns unused backing; per-run reservation excludes prior DMA readers.
+    // A failed free retains ownership; a failed allocation leaves a retryable slot.
+    if (slot.runtime_upload_source != nullptr && slot.runtime_upload_bytes < upload_bytes) {
+        const int free_rc = rtFreeHost(slot.runtime_upload_source);
+        if (free_rc != 0) return free_rc;
+        slot.runtime_upload_source = nullptr;
+        slot.runtime_upload_bytes = 0;
+    }
+    if (slot.runtime_upload_source == nullptr) {
+        void *source = nullptr;
+        const int host_rc = rtMallocHost(&source, upload_bytes, 0);
+        if (host_rc != 0) return host_rc;
+        if (source == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+        slot.runtime_upload_source = source;
+        slot.runtime_upload_bytes = upload_bytes;
+    }
+    if (worker_init != RuntimeWorkerInit::OnPublication && !slot.workers_initialized) {
+        constexpr size_t begin = offsetof(DeviceRuntimeLaunchDesc, workers);
+        constexpr size_t bytes = sizeof(DeviceRuntimeLaunchDesc::workers);
+        if (begin + bytes > runtime_extent) return PTO_RUNTIME_ERR_INTERNAL;
+        const bool recording = worker_init == RuntimeWorkerInit::DuringRecording;
+        aclmdlRICaptureMode previous_mode = ACL_MODEL_RI_CAPTURE_MODE_RELAXED;
+        if (recording) {
+            // The backing is private to this preparation. The synchronous copy
+            // initializes it once without adding an overwrite to the graph.
+            const int rc = aclmdlRICaptureThreadExchangeMode(&previous_mode);
+            if (rc != 0) return rc;
+        }
+        const int copy_rc = rtMemcpy(
+            reinterpret_cast<std::byte *>(slot.runtime_args) + begin, bytes,
+            reinterpret_cast<const std::byte *>(&host_runtime) + begin, bytes, RT_MEMCPY_HOST_TO_DEVICE
+        );
+        if (recording) {
+            const int restore_rc = aclmdlRICaptureThreadExchangeMode(&previous_mode);
+            if (restore_rc != 0) {
+                if (capture_mode_restore_error != nullptr) *capture_mode_restore_error = restore_rc;
+                LOG_ERROR("Restoring the caller's capture mode failed: %d", restore_rc);
+                return copy_rc != 0 ? copy_rc : restore_rc;
+            }
+        }
+        if (copy_rc != 0) return copy_rc;
+        slot.workers_initialized = true;
+    }
+    return 0;
+}
+
+int KernelArgsHelper::prepare_runtime_args(
+    const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot, bool replayable
+) {
+    if (runtime_args_state_ == RuntimeArgsState::Prepared) return PTO_RUNTIME_ERR_INVALID_STATE;
+    entry_cache_eligible_ = slot.entry_cache_qualification.consume();
+    // Ahead of the allocation and of the snapshot, so a descriptor carrying
+    // counts no consumer may believe fails the run here: nothing is allocated,
+    // nothing is copied, and the caller's prepare returns the error rather than
+    // publishing lengths the device would trust.
+    const LaunchEntryArgsPlan plan = runtime_launch_entry_args_plan(host_runtime);
+    if (!plan.counts_valid) {
+        LOG_ERROR("prepare_runtime_args: this run's entry-argument counts are outside capacity");
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    }
+    release_run_view();
+    allocator_ = &allocator;
+
+    if (slot.runtime_args == nullptr) entry_cache_eligible_ = false;
+    const int reserve_rc = reserve_slot_runtime_args(
+        host_runtime, allocator, slot, slot.staged_launch_metadata.size(),
+        replayable ? RuntimeWorkerInit::BeforeRecording : RuntimeWorkerInit::OnPublication
+    );
+    if (reserve_rc != 0) return reserve_rc;
     // A block whose handshake region has never been published still holds
     // whatever the allocator returned, so the first publication onto it carries
     // that region from the ctor-zeroed host copy. Every later publication stops
@@ -187,6 +253,7 @@ int KernelArgsHelper::prepare_runtime_args(
     // Definition section, which the publication compares against what the bind
     // staged on the slot.
     graph_section_bytes_ = runtime_graph_section_bytes(host_runtime);
+    launch_metadata_ = std::move(slot.staged_launch_metadata);
     runtime_args_state_ = RuntimeArgsState::Prepared;
     return 0;
 }
@@ -221,6 +288,47 @@ bool KernelArgsHelper::build_launch_package() {
     return true;
 }
 
+int KernelArgsHelper::prepare_kernel_invocation(const simpler::tmr::KernelCallableIdentity &identity) {
+    if (runtime_args_state_ != RuntimeArgsState::Prepared || !plan_.supported || slot_ == nullptr)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (!simpler::tmr::valid_kernel_identity(identity) || identity.tensor_count != plan_.tensor_count ||
+        identity.scalar_count != plan_.scalar_count)
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    using EntryStorage = std::decay_t<decltype(std::declval<const Runtime &>().get_orch_args())>;
+    EntryStorage storage{};
+    if (!runtime_image_.read(plan_.tensor_offset, storage.tensors_, plan_.tensor_count * sizeof(storage.tensors_[0])) ||
+        !runtime_image_.read(plan_.scalar_offset, storage.scalars_, plan_.scalar_count * sizeof(uint64_t)))
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    storage.tensor_count_ = static_cast<int32_t>(plan_.tensor_count);
+    storage.scalar_count_ = static_cast<int32_t>(plan_.scalar_count);
+    const size_t bytes = simpler::tmr::kernel_invocation_bytes(identity.tensor_count, identity.scalar_count);
+    std::vector<std::byte> packet(bytes);
+    if (!simpler::tmr::encode_kernel_invocation(
+            storage, identity, {reinterpret_cast<uint64_t>(args.runtime_args), args.run_result_epoch}, packet.data(),
+            packet.size()
+        ))
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    const size_t package_bytes = LAUNCH_ENVELOPE_HEADER_BYTES + bytes;
+    if (slot_->launch_package.size() < package_bytes) slot_->launch_package.resize(package_bytes);
+    kernel_invocation_ = std::move(packet);
+    return 0;
+}
+
+bool KernelArgsHelper::build_kernel_launch_package() {
+    const size_t bytes = LAUNCH_ENVELOPE_HEADER_BYTES + kernel_invocation_.size();
+    if (slot_->launch_package.size() < bytes) return false;
+    auto *package = slot_->launch_package.data();
+    std::memset(package + sizeof(KernelArgs), 0, LAUNCH_ENVELOPE_HEADER_BYTES - sizeof(KernelArgs));
+    std::memcpy(package + LAUNCH_ENVELOPE_HEADER_BYTES, kernel_invocation_.data(), kernel_invocation_.size());
+    args.entry_args_offset = static_cast<uint32_t>(LAUNCH_ENVELOPE_HEADER_BYTES);
+    args.entry_tensor_count = plan_.tensor_count;
+    args.entry_scalar_count = plan_.scalar_count;
+    args.entry_args_source = static_cast<uint32_t>(EntryArgsSource::KernelInvocation);
+    launch_payload_ = package;
+    launch_payload_bytes_ = bytes;
+    return true;
+}
+
 int stage_graph_section(SlotPersistentArgs &slot, const void *bytes, size_t length) {
     if (bytes == nullptr || length == 0) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     // `argsSize` is a uint32 at the launch boundary, so the whole package —
@@ -249,16 +357,24 @@ void *KernelArgsHelper::launch_payload() {
     return launch_payload_;
 }
 
-int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted) {
+int KernelArgsHelper::publish_runtime_args(
+    bool launch_route_permitted, rtStream_t stream, LaunchProgressSink &sink, bool retained_recording
+) {
     if (runtime_args_state_ != RuntimeArgsState::Prepared) return PTO_RUNTIME_ERR_INVALID_STATE;
     if (args.runtime_args == nullptr || slot_ == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    if (stream == nullptr || slot_->runtime_upload_source == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
 
     // The first publication onto a block sends the whole initialized prefix,
     // entry storage included, so its values are in the descriptor whether or
-    // not the launch could also have carried them. Routing it through the
-    // launch as well would send them twice.
+    // not the launch could also have carried them. Program calls keep those
+    // initial values on the descriptor; kernel calls also carry their validated
+    // packet because the registration and run binding belong to that format.
+    const bool kernel_route = !kernel_invocation_.empty();
+    if (kernel_route && !launch_route_permitted) return PTO_RUNTIME_ERR_UNSUPPORTED;
     const bool launch_route = launch_route_permitted && plan_.supported && initializing_slot_ == nullptr;
-    const EntryArgsSource source = launch_route ? EntryArgsSource::LaunchEnvelope : EntryArgsSource::Descriptor;
+    const EntryArgsSource source = kernel_route ? EntryArgsSource::KernelInvocation :
+                                   launch_route ? EntryArgsSource::LaunchEnvelope :
+                                                  EntryArgsSource::Descriptor;
 
     // The Graph Definition section, decided before anything is written, so a
     // refusal here leaves no half-formed payload behind. Its length is consumed
@@ -281,7 +397,7 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted) {
         );
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    if (graph_bytes != 0 && launch_route) {
+    if (graph_bytes != 0 && (launch_route || kernel_route)) {
         LOG_ERROR("runtime metadata publication: a run carries both entry values and a Graph section");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -302,11 +418,12 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted) {
 
     // The launch package is built before the copy, because publication consumes
     // the snapshot both read from.
-    if (launch_route && !build_launch_package()) {
+    if ((kernel_route && !build_kernel_launch_package()) ||
+        (!kernel_route && launch_route && !build_launch_package())) {
         LOG_ERROR("runtime metadata publication: the captured snapshot does not contain its entry values");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    if (!launch_route) {
+    if (!launch_route && !kernel_route) {
         args.entry_args_offset = 0;
         args.entry_tensor_count = 0;
         args.entry_scalar_count = 0;
@@ -331,23 +448,48 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted) {
         launch_payload_bytes_ = graph_package_bytes;
     }
 
+    EntryCacheMaintenance maintenance = EntryCacheMaintenance::Full;
+    if (PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE && plan_.supported && !kernel_route) {
+        if (launch_route && entry_cache_eligible_) {
+            maintenance = EntryCacheMaintenance::Live;
+            slot_->entry_cmo_may_have_trimmed = true;
+        } else if (source == EntryArgsSource::Descriptor && slot_->entry_cmo_may_have_trimmed) {
+            maintenance = EntryCacheMaintenance::FullFreshen;
+        }
+    }
+    args.entry_cache_maintenance = static_cast<uint32_t>(maintenance);
+    entry_cache_eligible_ = false;
+
     const size_t publish_bytes = launch_route ? plan_.descriptor_bytes_when_launched : runtime_image_.size();
     // A publication this block may already be holding: the launch route's own
     // prefix, onto an allocation a previous launch-route publication recorded.
     // Every other publication — the first onto a block, the descriptor
     // fallback, a runtime with no launch route — writes a range nothing
     // recorded, so it copies and records nothing.
-    const bool prefix_cacheable = launch_route && plan_.supported && initializing_slot_ == nullptr &&
-                                  publish_bytes == plan_.descriptor_bytes_when_launched &&
-                                  publish_bytes <= LAUNCH_ROUTE_PREFIX_CACHE_BYTES;
+    // Recording queues no DMA execution and cannot establish device contents.
+    // The graph needs its own copy even when a preceding eager run matches.
+    const bool prefix_cacheable =
+        !retained_recording && launch_route && plan_.supported && initializing_slot_ == nullptr &&
+        publish_bytes == plan_.descriptor_bytes_when_launched && publish_bytes <= LAUNCH_ROUTE_PREFIX_CACHE_BYTES;
     // The consumed snapshot is neither pending nor published during the copy.
     // Reentrant publish is rejected; copy failure leaves fresh prepare admissible.
     runtime_args_state_ = RuntimeArgsState::Empty;
     const int rc = runtime_image_.publish(
-        [this, prefix_cacheable](const void *source, size_t bytes) -> int {
+        [this, prefix_cacheable, stream, &sink](const void *source, size_t bytes) -> int {
+            // Metadata and descriptor occupy disjoint ranges of the slot's
+            // pinned source. Neither range changes until this run retires.
+            const int metadata_rc = launch_metadata_.publish(
+                static_cast<std::byte *>(slot_->runtime_upload_source) + slot_->runtime_bytes,
+                slot_->runtime_upload_bytes - slot_->runtime_bytes,
+                [stream, &sink](void *target, const void *metadata, size_t length) {
+                    sink.mark_submitted();
+                    return rtMemcpyAsync(target, length, metadata, length, RT_MEMCPY_HOST_TO_DEVICE, stream);
+                }
+            );
+            if (metadata_rc != 0) return metadata_rc;
             // Compared and recorded here, inside the callback, because `source`
-            // is the snapshot the publication consumes: it is alive for exactly
-            // this call and gone once it returns.
+            // is the snapshot the publication consumes. The DMA reads the slot's
+            // pinned copy, which survives this callback.
             if (prefix_cacheable && slot_->published_prefix_bytes == bytes &&
                 std::memcmp(source, slot_->published_prefix.data(), bytes) == 0) {
                 // The block holds these bytes already, and a skipped copy
@@ -361,7 +503,13 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted) {
             // the mechanism — a warm failure leaves `workers_initialized` set,
             // so the next prepare sends this same length again.
             slot_->published_prefix_bytes = 0;
-            const int copy_rc = rtMemcpy(args.runtime_args, bytes, source, bytes, RT_MEMCPY_HOST_TO_DEVICE);
+            if (bytes > slot_->runtime_upload_bytes) return PTO_RUNTIME_ERR_INTERNAL;
+            std::memcpy(slot_->runtime_upload_source, source, bytes);
+            // A failed enqueue does not prove the stream holds no DMA reader.
+            sink.mark_submitted();
+            const int copy_rc = rtMemcpyAsync(
+                args.runtime_args, bytes, slot_->runtime_upload_source, bytes, RT_MEMCPY_HOST_TO_DEVICE, stream
+            );
             if (copy_rc != 0) return copy_rc;
             if (prefix_cacheable) {
                 // After the copy that earned it, into fixed storage: no
@@ -390,9 +538,15 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted) {
         return rc;
     }
     runtime_args_state_ = RuntimeArgsState::Published;
-    // Committed here and nowhere earlier: this copy is what put a defined value
-    // in that block's handshake region, so the fact is recorded by the call
-    // that earned it rather than by a caller that has to remember the order.
+    slot_->entry_cache_qualification.published(
+        PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE && plan_.supported && !kernel_route &&
+                valid_entry_cache_maintenance(args.entry_cache_maintenance) ?
+            entry_cache_epoch_ :
+            0
+    );
+    // An accepted initializing copy precedes the entry fork on the AICPU
+    // stream; both kernels wait behind it. Slot retirement protects the next
+    // publication from reusing this block or its source while that copy is live.
     if (initializing_slot_ != nullptr) {
         initializing_slot_->workers_initialized = true;
         initializing_slot_ = nullptr;
@@ -401,18 +555,30 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted) {
 }
 
 int release_slot_persistent_args(SlotPersistentArgs &slot, MemoryAllocator &allocator) {
+    slot.entry_cache_qualification.clear();
     int first_error = 0;
     if (slot.runtime_args != nullptr) {
         const int rc = allocator.free(slot.runtime_args);
+        if (rc != 0) first_error = rc;
+        else {
+            slot.runtime_args = nullptr;
+            slot.entry_cmo_may_have_trimmed = false;
+        }
+    }
+    if (slot.runtime_upload_source != nullptr) {
+        const int rc = rtFreeHost(slot.runtime_upload_source);
         if (rc != 0) {
             if (first_error == 0) first_error = rc;
         } else {
-            // Whole-struct reset, so every fact recorded about the released
-            // block goes with it and a successor allocation starts uninitialized.
-            slot = SlotPersistentArgs{};
+            slot.runtime_upload_source = nullptr;
         }
     }
+    if (first_error == 0) slot = SlotPersistentArgs{};
     return first_error;
 }
 
+// No release calls: the generation has ended or completion is unproven, so a
+// queued DMA may still read the pinned source as well as name the device block.
+// Freeing that source before a reader stops is a host-memory use-after-free;
+// abandonment leaves it allocated for the rest of this process.
 void abandon_slot_persistent_args(SlotPersistentArgs &slot) { slot = SlotPersistentArgs{}; }

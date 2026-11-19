@@ -35,6 +35,7 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -49,6 +50,7 @@
 #include "common/pmu_profiling.h"
 #include "host/pmu_collector.h"
 #include "support/test_task_id.h"
+#include "profiler_test_allocator.h"
 
 // The platform register accessors, for the reason test_pmu_run_identity.cpp
 // gives: the two architectures define them in translation units that reach
@@ -89,7 +91,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-void *retained_alloc(size_t size) { return std::calloc(1, size); }
+void *retained_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int retained_free(void *ptr) {
     std::free(ptr);
@@ -185,11 +187,11 @@ struct RetainedPmuFixture {
     void *shm = nullptr;
     PmuDataHeader *header = nullptr;
 
-    RetainedPmuFixture(const char *name, int cores = 1, int threads = 1) :
+    RetainedPmuFixture(const char *name, int cores = 1, int threads = 1, bool retention = true) :
         root(name),
         num_cores(cores),
         num_threads(threads) {
-        collector.configure_retained_runs(true);
+        collector.configure_retained_runs(retention);
         EXPECT_EQ(collector.init(cores, threads, retained_alloc, nullptr, retained_free, /*device_id=*/0), 0);
         shm = collector.get_pmu_shm_device_ptr();
         EXPECT_NE(shm, nullptr);
@@ -224,7 +226,7 @@ struct RetainedPmuFixture {
         std::vector<uint32_t> core_ids;
         for (int c = 0; c < num_cores; c++)
             core_ids.push_back(static_cast<uint32_t>(c));
-        pmu_aicpu_init(core_ids.data(), num_cores);
+        pmu_aicpu_init(core_ids.data(), num_cores, PmuEventType::PIPE_UTILIZATION);
         if (records > 0) fill_records(state(core)->current_buf_ptr, records, core);
         const int cores[] = {core};
         pmu_aicpu_flush_buffers(thread, cores, /*core_num=*/1);
@@ -491,7 +493,7 @@ TEST(PmuRetainedRuns, ALateBufferForASealedRunIsABoundedCollectorError) {
     ASSERT_TRUE(fx.begin(902, b));
     set_platform_run_result(/*region_base=*/0, 902);
     const uint32_t core_ids[] = {0};
-    pmu_aicpu_init(core_ids, /*num_cores=*/1);
+    pmu_aicpu_init(core_ids, /*num_cores=*/1, PmuEventType::PIPE_UTILIZATION);
     auto *buf = reinterpret_cast<PmuBuffer *>(fx.state(0)->current_buf_ptr);
     ASSERT_NE(buf, nullptr);
     buf->records[0].task_id = simpler::ut::test_task_id(0x1);
@@ -640,7 +642,7 @@ TEST(PmuRetainedRuns, RetentionOffKeepsTheSingleRunPath) {
     set_platform_pmu_reg_addrs(0);
     set_platform_run_result(/*region_base=*/0, 1201);
     const uint32_t core_ids[] = {0};
-    pmu_aicpu_init(core_ids, /*num_cores=*/1);
+    pmu_aicpu_init(core_ids, /*num_cores=*/1, PmuEventType::PIPE_UTILIZATION);
     auto *state = get_pmu_buffer_state(shm, 0);
     auto *buf = reinterpret_cast<PmuBuffer *>(state->current_buf_ptr);
     ASSERT_NE(buf, nullptr);
@@ -682,3 +684,486 @@ TEST(PmuRetainedRuns, RetentionOffKeepsTheSingleRunPath) {
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// Per-run terminal banks, mapped
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/**
+ * A retained collector whose cores publish their own per-run accounting.
+ *
+ * The bank address normally reaches the cores through the launching run's
+ * kernel arguments, which this collector does not own, so this pushes it and
+ * calls each core's close — exactly where the runner will. `pmu_aicpu_init`
+ * already runs per run and is what starts this run's counters.
+ */
+struct MappedPmuFixture : RetainedPmuFixture {
+    MappedPmuFixture(const char *name, int cores = 1, int threads = 1) :
+        RetainedPmuFixture(name, cores, threads) {
+        EXPECT_TRUE(collector.open_run_terminal_banks(cores));
+        EXPECT_NE(collector.run_terminal_device_address(), 0u);
+    }
+
+    ~MappedPmuFixture() { set_platform_pmu_run_terminal(0); }
+
+    /**
+     * Admit a run and push the bank its admission reserved, which is what the
+     * host does at launch: the device is handed one resolved address per run,
+     * so a successor publishes into its own bank rather than deriving one.
+     */
+    bool begin(uint64_t epoch, const fs::path &csv, PmuEventType event_type = PmuEventType::PIPE_UTILIZATION) {
+        if (!RetainedPmuFixture::begin(epoch, csv, event_type)) return false;
+        const uint64_t bank = collector.run_terminal_bank_address(epoch);
+        EXPECT_NE(bank, 0u) << "an admitted run resolved no terminal bank";
+        set_platform_pmu_run_terminal(bank);
+        return true;
+    }
+
+    /** One run's device side, closed through every core's own entry. */
+    void produce_run(uint64_t epoch, int records, int core = 0, int thread = 0) {
+        produce(epoch, records, core, thread);
+        for (int c = 0; c < num_cores; c++)
+            pmu_aicpu_close_run(c);
+    }
+};
+
+}  // namespace
+
+TEST(PmuRunTerminal, AMappedRunIsSettledFromItsOwnCoreAccounting) {
+    MappedPmuFixture fx("pmu-mapped-settled");
+    const fs::path csv = fx.root.csv("run-a");
+    ASSERT_TRUE(fx.begin(8001, csv));
+    fx.produce_run(8001, /*records=*/3);
+    fx.close(8001);
+
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    EXPECT_TRUE(fs::exists(csv)) << "a run whose cores reported produced no csv";
+}
+
+TEST(PmuRunTerminal, ACoreThatNeverPublishedLeavesTheRunUnknown) {
+    MappedPmuFixture fx("pmu-mapped-missing", /*cores=*/2);
+    const fs::path csv = fx.root.csv("run-a");
+    ASSERT_TRUE(fx.begin(8101, csv));
+    // Core 0 records and publishes; core 1 is a participant this collector
+    // brought up and never closes. The survivors must not be read as the run.
+    fx.produce(8101, /*records=*/2, /*core=*/0);
+    pmu_aicpu_close_run(0);
+    fx.close(8101);
+
+    std::string error;
+    (void)fx.flush(&error);
+    const auto stats = fx.collector.retained_run_stats_for_test();
+    EXPECT_GT(stats.errors.counts_unknown + stats.errors.published_short, 0u)
+        << "a partial core set was reported as a complete run";
+}
+
+TEST(PmuRunTerminal, TheHostDoesNotResetCountersWhenACoreOwnsThem) {
+    MappedPmuFixture fx("pmu-mapped-no-host-reset");
+    const fs::path csv = fx.root.csv("run-a");
+    // The producer's own init is the only thing that zeroes these, so a value
+    // standing before admission survives it and is cleared by the device side.
+    fx.state(0)->total_record_count = 7;
+    ASSERT_TRUE(fx.begin(8201, csv));
+    EXPECT_EQ(fx.state(0)->total_record_count, 7u) << "the host reset counters a core owns";
+
+    fx.produce_run(8201, /*records=*/1);
+    fx.close(8201);
+    std::string error;
+    (void)fx.flush(&error);
+}
+
+TEST(PmuRunTerminal, AFatalOnlyRunIsNotPublishedEmpty) {
+    // The shape the review names: a producer that recorded nothing and latched
+    // a fatal. Every count balances — total 0, published 0, dropped 0, live 0 —
+    // so the only thing distinguishing it from an ordinary empty run is the
+    // fatal, and dropping it on the way out of the terminal publishes the run
+    // as empty and successful.
+    //
+    // Exercised through `classify` directly rather than through the fixture:
+    // `fatal_latched` is a field of the shared per-run terminal, and this
+    // collector's producer has no device-side fatal latch to set it from. The
+    // adapter carries it so that a producer which gains one is not silently
+    // dropped, which is what this holds in place.
+    simpler::dfx::pmu::CutProofs cut;
+    cut.cut_known = true;
+    cut.stage2_done = true;
+
+    simpler::dfx::pmu::RecordProofs clean;
+    clean.device_execution_complete = true;
+    clean.snapshot_readable = true;
+    EXPECT_EQ(
+        simpler::dfx::pmu::classify(cut, clean, /*collected=*/0, /*io_failed=*/false),
+        simpler::dfx::pmu::Verdict::PublishedEmpty
+    );
+
+    simpler::dfx::pmu::RecordProofs fatal = clean;
+    fatal.fatal_latched = true;
+    EXPECT_EQ(
+        simpler::dfx::pmu::classify(cut, fatal, /*collected=*/0, /*io_failed=*/false),
+        simpler::dfx::pmu::Verdict::PublishedShort
+    ) << "a latched fatal was lost and the run published as empty";
+
+    // And with records, where the counts also balance on their own.
+    simpler::dfx::pmu::RecordProofs fatal_with_records = clean;
+    fatal_with_records.fatal_latched = true;
+    fatal_with_records.total_device = 4;
+    EXPECT_EQ(
+        simpler::dfx::pmu::classify(cut, fatal_with_records, /*collected=*/4, /*io_failed=*/false),
+        simpler::dfx::pmu::Verdict::PublishedShort
+    );
+}
+
+TEST(PmuRetainedRuns, FatalStopReportsAnUnpublishedRunOnceWithoutReleasingIt) {
+    RetainedPmuFixture fx("fatal-held");
+    ASSERT_TRUE(fx.begin(9201, fx.root.csv("run-a")));
+    const auto before = fx.stats();
+    ASSERT_EQ(before.open_epochs, 1u);
+    fx.collector.stop_for_device_failure();
+    EXPECT_EQ(fx.stats().open_epochs, before.open_epochs);
+    EXPECT_EQ(fx.stats().errors.abandoned, 1u);
+    std::string error;
+    EXPECT_FALSE(fx.flush(&error));
+    EXPECT_NE(error.find("abandoned=1"), std::string::npos) << error;
+    fx.collector.stop_for_device_failure();
+    EXPECT_EQ(fx.stats().errors.abandoned, 1u);
+    fx.collector.finalize(nullptr, retained_free);
+    EXPECT_EQ(fx.stats().errors.abandoned, 1u);
+}
+
+TEST(PmuRetainedRuns, FatalLossSurvivesConfirmedResetWithoutInvokingReleaseCallbacks) {
+    OutputRoot root("fatal-reset");
+    // The fixture owns host backing across the simulated device reset.
+    std::vector<std::unique_ptr<void, decltype(&std::free)>> backing;
+    size_t releases = 0;
+    PmuCollector collector;
+    auto alloc = [&](size_t bytes) {
+        void *ptr = profiler_test_calloc(bytes);
+        backing.emplace_back(ptr, &std::free);
+        return ptr;
+    };
+    auto release = [&](void *) {
+        ++releases;
+        return 0;
+    };
+    collector.configure_retained_runs(true);
+    ASSERT_EQ(collector.init(1, 1, alloc, nullptr, release, 0), 0);
+    collector.start(retained_thread_factory);
+    ASSERT_TRUE(collector.run_begin(9301, root.csv("run-a").string(), PmuEventType::PIPE_UTILIZATION));
+    const auto allocations = backing.size();
+    collector.stop_for_device_failure();
+    collector.stop_for_device_failure();
+    EXPECT_EQ(collector.retained_run_stats_for_test().errors.abandoned, 1u);
+    EXPECT_EQ(releases, 0u);
+    EXPECT_EQ(backing.size(), allocations);
+    collector.abandon_after_device_reset();
+    collector.finalize(nullptr, release);
+    EXPECT_EQ(releases, 0u);
+    EXPECT_EQ(collector.retained_run_stats_for_test().errors.abandoned, 1u);
+    std::string error;
+    EXPECT_FALSE(collector.flush_retained_runs(100, &error));
+    EXPECT_NE(error.find("abandoned=1"), std::string::npos) << error;
+}
+
+TEST(PmuRecordedWindow, ReplaysKeepEveryRowWithFrozenColumnsAndUnknownDeviceTotals) {
+    RetainedPmuFixture fx("recorded-replays", 1, 1, false);
+    const auto csv = fx.root.csv("capture");
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1801, csv.string(), PmuEventType::MEMORY, "held"));
+    EXPECT_FALSE(fx.collector.retains_runs());
+    EXPECT_FALSE(fx.collector.retained_runs_idle());
+    for (int replay = 0; replay < 2; ++replay) {
+        fx.produce(1801, 2);
+        fx.collector.quiesce();
+        EXPECT_EQ(fx.device_total(), 2u) << "device accounting resets at each replay entry";
+    }
+    // Reopening ordinary host state must not steal the recorded window's columns.
+    const auto eager = fx.root.csv("eager");
+    ASSERT_TRUE(fx.collector.begin_run(eager.string(), PmuEventType::PIPE_UTILIZATION, 1802));
+    fx.collector.start(retained_thread_factory);
+    fx.produce(1802, 1);
+    fx.collector.quiesce();
+    fx.collector.reconcile_counters();
+    fx.produce(1801, 2);
+    fx.collector.quiesce();
+    ASSERT_EQ(fx.collector.close_recorded_window(1801), 0);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    const auto tasks = csv_column(read_file(csv), "task_id");
+    ASSERT_EQ(tasks.size(), 6u);
+    EXPECT_EQ(tasks[0], tasks[2]);
+    EXPECT_EQ(tasks[0], tasks[4]);
+    EXPECT_EQ(csv_column(read_file(csv), "event_type"), std::vector<std::string>(6, "4"));
+    const auto metadata = read_file(csv.parent_path() / "pmu.collection.json");
+    EXPECT_NE(metadata.find("\"written_records\": 6"), std::string::npos);
+    EXPECT_NE(metadata.find("\"device_total_records\": null"), std::string::npos);
+    EXPECT_NE(metadata.find("aggregate_counts_unknown"), std::string::npos);
+    EXPECT_EQ(csv_column(read_file(eager), "run_epoch"), std::vector<std::string>({"1802"}));
+    EXPECT_FALSE(fs::exists(eager.parent_path() / "pmu.collection.json"));
+}
+
+TEST(PmuRecordedWindow, ZeroReplayAndDestinationReuseCannotPublishStaleRecordedSuccess) {
+    RetainedPmuFixture fx("recorded-reuse", 1, 1, false);
+    const auto csv = fx.root.csv("same-destination");
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1811, csv.string(), PmuEventType::MEMORY, "absent"));
+    fx.produce(1811, 1);
+    ASSERT_EQ(fx.collector.close_recorded_window(1811), 0);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    const auto metadata = csv.parent_path() / "pmu.collection.json";
+    ASSERT_TRUE(fs::exists(metadata));
+    ASSERT_TRUE(fx.collector.begin_run(csv.string(), PmuEventType::PIPE_UTILIZATION, 1812));
+    EXPECT_FALSE(fs::exists(metadata));
+    fx.produce(1812, 1);
+    fx.collector.quiesce();
+    fx.collector.reconcile_counters();
+    EXPECT_FALSE(fs::exists(metadata));
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1813, csv.string(), PmuEventType::MEMORY, "absent"));
+    ASSERT_EQ(fx.collector.close_recorded_window(1813), 0);
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    EXPECT_TRUE(csv_column(read_file(csv), "task_id").empty());
+    EXPECT_NE(read_file(metadata).find("\"written_records\": 0"), std::string::npos);
+    EXPECT_NE(read_file(metadata).find("\"run_epoch\": 1813"), std::string::npos);
+}
+
+TEST(PmuRecordedWindow, DestinationRefusalPreservesTheCurrentOwnersMetadata) {
+    RetainedPmuFixture fx("recorded-destination", 1, 1, false);
+    const auto csv = fx.root.csv("owned");
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1821, csv.string(), PmuEventType::MEMORY, "held"));
+    const auto metadata = csv.parent_path() / "pmu.collection.json";
+    {
+        std::ofstream old(metadata);
+        old << "owner evidence";
+    }
+    EXPECT_FALSE(fx.collector.begin_recorded_window(1822, csv.string(), PmuEventType::MEMORY, "held"));
+    EXPECT_FALSE(fx.collector.begin_run(csv.string(), PmuEventType::MEMORY));
+    EXPECT_EQ(read_file(metadata), "owner evidence");
+    EXPECT_TRUE(fx.collector.abandon_run(1821));
+}
+
+TEST(PmuRecordedWindow, TwoIndependentWindowsDoNotChangeOrdinaryRetention) {
+    RetainedPmuFixture fx("recorded-two", 1, 1, false);
+    const auto a = fx.root.csv("a"), b = fx.root.csv("b"), c = fx.root.csv("c");
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1831, a.string(), PmuEventType::MEMORY, "held"));
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1832, b.string(), PmuEventType::PIPE_UTILIZATION, "held"));
+    EXPECT_FALSE(fx.collector.begin_recorded_window(1833, c.string(), PmuEventType::MEMORY, "held"));
+    fx.produce(1831, 1);
+    fx.collector.quiesce();
+    fx.produce(1832, 2);
+    fx.collector.quiesce();
+    ASSERT_EQ(fx.collector.close_recorded_window(1831), 0);
+    EXPECT_TRUE(fx.collector.recorded_window_open(1832));
+    fx.produce(1832, 2);
+    fx.collector.quiesce();
+    ASSERT_EQ(fx.collector.close_recorded_window(1832), 0);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    EXPECT_EQ(csv_column(read_file(a), "event_type"), std::vector<std::string>(1, "4"));
+    EXPECT_EQ(csv_column(read_file(b), "event_type"), std::vector<std::string>(4, "2"));
+    EXPECT_FALSE(fx.collector.retains_runs());
+}
+
+TEST(PmuRecordedWindow, WriterFailureDoesNotReopenSettledResourceRelease) {
+    RetainedPmuFixture fx("recorded-writer-failure", 1, 1, false);
+    const auto csv = fx.root.csv("capture");
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1841, csv.string(), PmuEventType::MEMORY, "refused"));
+    // An incompatible destination guarantees rename failure without root-sensitive permissions.
+    fs::create_directory(csv.parent_path() / "pmu.collection.json");
+    fx.produce(1841, 1);
+    ASSERT_EQ(fx.collector.close_recorded_window(1841), 0);
+    std::string error;
+    EXPECT_FALSE(fx.flush(&error));
+    EXPECT_TRUE(fs::is_directory(csv.parent_path() / "pmu.collection.json"));
+    EXPECT_FALSE(evidence_files(csv.parent_path()).empty());
+    EXPECT_EQ(fx.collector.close_recorded_window(1841), 0);
+}
+
+TEST(PmuRecordedWindow, UnattributedLateTrafficCannotBecomeHealthyAggregateUnknown) {
+    RetainedPmuFixture fx("recorded-unknown-traffic", 1, 1, true);
+    const auto csv = fx.root.csv("capture");
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1851, csv.string(), PmuEventType::MEMORY, "occupied"));
+    fx.produce(9999, 1);
+    fx.collector.quiesce();
+    ASSERT_EQ(fx.collector.close_recorded_window(1851), 0);
+    std::string error;
+    EXPECT_FALSE(fx.flush(&error));
+    const auto metadata = read_file(csv.parent_path() / "pmu.collection.json");
+    EXPECT_NE(metadata.find("\"collector_unknown_epoch_buffers\": 1"), std::string::npos);
+    EXPECT_EQ(metadata.find("aggregate_counts_unknown"), std::string::npos);
+    EXPECT_NE(metadata.find("\"transport_retired_buffers\": null"), std::string::npos);
+}
+
+TEST(PmuRecordedWindow, UnmappableTransportRetirementRemainsUnattributedAndFailsFlush) {
+    RetainedPmuFixture fx("recorded-transport-retirement", 1, 1, false);
+    const auto csv = fx.root.csv("capture");
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1861, csv.string(), PmuEventType::MEMORY, "held"));
+    uint64_t unmapped = 0;
+    const uint32_t tail = fx.header->queue_tails[0];
+    auto &entry = fx.header->queues[0][tail % PLATFORM_PMU_READYQUEUE_SIZE];
+    entry.core_index = 0;
+    entry.buffer_ptr = reinterpret_cast<uint64_t>(&unmapped);
+    entry.buffer_seq = 0;
+    wmb();
+    fx.header->queue_tails[0] = tail + 1;
+    wmb();
+    ASSERT_EQ(fx.collector.close_recorded_window(1861), 0);
+    std::string error;
+    EXPECT_FALSE(fx.flush(&error));
+    const auto metadata = read_file(csv.parent_path() / "pmu.collection.json");
+    EXPECT_NE(metadata.find("\"collector_transport_retired_buffers\": 1"), std::string::npos);
+    EXPECT_NE(metadata.find("\"transport_retired_buffers\": null"), std::string::npos);
+    EXPECT_EQ(metadata.find("aggregate_counts_unknown"), std::string::npos);
+}
+
+TEST(PmuRecordedWindow, ClampedProducerBufferIsLossRatherThanExpectedUnknownAccounting) {
+    RetainedPmuFixture fx("recorded-clamped", 1, 1, false);
+    const auto csv = fx.root.csv("capture");
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1871, csv.string(), PmuEventType::MEMORY, "held"));
+    set_platform_run_result(0, 1871);
+    const uint32_t physical[] = {0};
+    pmu_aicpu_init(physical, 1, PmuEventType::MEMORY);
+    fx.fill_records(fx.state(0)->current_buf_ptr, PLATFORM_PMU_RECORDS_PER_BUFFER, 0);
+    reinterpret_cast<PmuBuffer *>(fx.state(0)->current_buf_ptr)->count = PLATFORM_PMU_RECORDS_PER_BUFFER + 1;
+    const int core[] = {0};
+    pmu_aicpu_flush_buffers(0, core, 1);
+    ASSERT_EQ(fx.collector.close_recorded_window(1871), 0);
+    std::string error;
+    EXPECT_FALSE(fx.flush(&error));
+    const auto metadata = read_file(csv.parent_path() / "pmu.collection.json");
+    EXPECT_NE(metadata.find("\"clamped_buffers\": 1"), std::string::npos);
+    EXPECT_EQ(metadata.find("aggregate_counts_unknown"), std::string::npos);
+}
+
+TEST(PmuRecordedWindow, TerminalBankRefusalPreservesPreviouslyPublishedMetadata) {
+    MappedPmuFixture fx("recorded-bank-refusal");
+    const auto csv = fx.root.csv("previous");
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1900, csv.string(), PmuEventType::MEMORY, "held"));
+    ASSERT_EQ(fx.collector.close_recorded_window(1900), 0);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    const auto metadata = csv.parent_path() / "pmu.collection.json";
+    const auto previous_csv = read_file(csv), previous_metadata = read_file(metadata);
+    ASSERT_FALSE(previous_metadata.empty());
+    for (size_t bank = 0; bank < PLATFORM_DIAGNOSTIC_TERMINAL_BANKS; bank++) {
+        const auto epoch = 1901 + bank;
+        ASSERT_TRUE(fx.begin(epoch, fx.root.csv(("unproved-" + std::to_string(bank)).c_str())));
+        fx.close(epoch, false);
+        EXPECT_FALSE(fx.flush(&error));
+        ASSERT_EQ(fx.collector.run_terminal_banks_in_use(), bank + 1);
+    }
+    simpler::dfx::runs::AdmissionRefusal why{};
+    EXPECT_FALSE(fx.collector.run_begin(1910, csv.string(), PmuEventType::MEMORY, &why));
+    EXPECT_EQ(why, simpler::dfx::runs::AdmissionRefusal::Capacity);
+    EXPECT_EQ(read_file(csv), previous_csv);
+    EXPECT_EQ(read_file(metadata), previous_metadata);
+}
+
+TEST(PmuRecordedWindow, DirectoryAliasesCannotTakeAnOpenWindowsDestination) {
+    for (int alias_kind = 0; alias_kind < 3; alias_kind++) {
+        SCOPED_TRACE(alias_kind);
+        RetainedPmuFixture fx("recorded-alias", 1, 1, false);
+        const auto csv = fx.root.csv("owned");
+        ASSERT_TRUE(fx.collector.begin_recorded_window(1920, csv.string(), PmuEventType::MEMORY, "held"));
+        const auto metadata = csv.parent_path() / "pmu.collection.json";
+        {
+            std::ofstream previous(metadata);
+            previous << "owner evidence";
+        }
+        fs::path alias;
+        if (alias_kind == 0) {
+            alias = csv.parent_path() / "." / csv.filename();
+        } else if (alias_kind == 1) {
+            ASSERT_TRUE(fs::create_directory(csv.parent_path() / "child"));
+            alias = csv.parent_path() / "child" / ".." / csv.filename();
+        } else {
+            const auto link = fx.root.path() / "linked";
+            fs::create_directory_symlink(csv.parent_path(), link);
+            alias = link / csv.filename();
+        }
+        EXPECT_FALSE(fx.collector.begin_run(alias.string(), PmuEventType::PIPE_UTILIZATION, 1921));
+        const bool admitted = fx.collector.begin_recorded_window(1922, alias.string(), PmuEventType::MEMORY, "held");
+        EXPECT_FALSE(admitted);
+        EXPECT_EQ(read_file(metadata), "owner evidence");
+        EXPECT_TRUE(fx.collector.recorded_window_open(1920));
+        if (admitted) EXPECT_TRUE(fx.collector.abandon_run(1922));
+        EXPECT_TRUE(fx.collector.begin_run(fx.root.csv("distinct").string(), PmuEventType::PIPE_UTILIZATION, 1923));
+        fx.produce(1920, 1);
+        ASSERT_EQ(fx.collector.close_recorded_window(1920), 0);
+        std::string error;
+        ASSERT_TRUE(fx.flush(&error)) << error;
+        EXPECT_EQ(csv_column(read_file(csv), "event_type"), std::vector<std::string>({"4"}));
+        EXPECT_EQ(csv_column(read_file(csv), "run_epoch"), std::vector<std::string>({"1920"}));
+        EXPECT_EQ(csv_column(read_file(csv), "pmu_total_cycles"), std::vector<std::string>({"4000"}));
+    }
+}
+
+TEST(PmuRecordedWindow, MetadataRefusalReturnsTheReservedTerminalBank) {
+    MappedPmuFixture fx("recorded-bank-rollback");
+    const auto csv = fx.root.csv("refused");
+    ASSERT_TRUE(fs::create_directory(csv.parent_path() / "pmu.collection.json"));
+    EXPECT_FALSE(fx.collector.run_begin(1930, csv.string(), PmuEventType::MEMORY));
+    EXPECT_EQ(fx.collector.run_terminal_banks_in_use(), 0u);
+    ASSERT_TRUE(fx.begin(1931, fx.root.csv("accepted")));
+    EXPECT_EQ(fx.collector.run_terminal_banks_in_use(), 1u);
+    EXPECT_TRUE(fx.collector.abandon_run(1931));
+    EXPECT_EQ(fx.collector.run_terminal_banks_in_use(), 0u);
+}
+
+TEST(PmuRecordedWindow, PublicationReplacesTheFinalSymlinkRatherThanItsTarget) {
+    RetainedPmuFixture fx("recorded-final-symlink", 1, 1, false);
+    const auto csv = fx.root.csv("published");
+    const auto target = fx.root.path() / "target.csv";
+    {
+        std::ofstream previous(target);
+        previous << "unrelated target";
+    }
+    fs::create_symlink(target, csv);
+    ASSERT_TRUE(fx.collector.begin_recorded_window(1940, csv.string(), PmuEventType::MEMORY, "held"));
+    ASSERT_EQ(fx.collector.close_recorded_window(1940), 0);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    EXPECT_FALSE(fs::is_symlink(csv));
+    EXPECT_EQ(read_file(target), "unrelated target");
+    EXPECT_NE(read_file(csv).find("thread_id,core_id"), std::string::npos);
+}
+
+TEST(PmuRecordedWindow, AdmittedRelativeDestinationsSurviveWorkingDirectoryChanges) {
+    for (bool recorded : {false, true}) {
+        SCOPED_TRACE(recorded);
+        RetainedPmuFixture fx("frozen-relative-destination", 1, 1, false);
+        const auto csv = fx.root.csv("published");
+        const auto other = fx.root.path() / "other-working-directory";
+        ASSERT_TRUE(fs::create_directories(other / "published"));
+        {
+            struct RestoreDirectory {
+                fs::path previous{fs::current_path()};
+                ~RestoreDirectory() {
+                    std::error_code error;
+                    fs::current_path(previous, error);
+                }
+            } restore;
+            fs::current_path(fx.root.path());
+            const auto relative = fs::path("published") / "pmu.csv";
+            if (recorded) {
+                ASSERT_TRUE(fx.collector.begin_recorded_window(1950, relative.string(), PmuEventType::MEMORY, "held"));
+            } else {
+                ASSERT_TRUE(fx.collector.begin_run(relative.string(), PmuEventType::MEMORY, 1950));
+            }
+            fs::current_path(other);
+            fx.produce(1950, 1);
+            if (recorded) {
+                EXPECT_EQ(fx.collector.close_recorded_window(1950), 0);
+                std::string error;
+                EXPECT_TRUE(fx.flush(&error)) << error;
+            } else {
+                fx.collector.quiesce();
+                fx.collector.reconcile_counters();
+            }
+        }
+        EXPECT_EQ(csv_column(read_file(csv), "event_type"), std::vector<std::string>({"4"}));
+        EXPECT_EQ(csv_column(read_file(csv), "run_epoch"), std::vector<std::string>({"1950"}));
+        EXPECT_EQ(csv_column(read_file(csv), "pmu_total_cycles"), std::vector<std::string>({"4000"}));
+        EXPECT_FALSE(fs::exists(other / "published" / "pmu.csv"));
+    }
+}

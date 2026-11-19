@@ -11,13 +11,14 @@
 
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 #include "native_run_execution.h"
 #include "run_completion_fence.h"
+#include "run_resource_arena.h"
 #include "runtime_c_api.h"
 
 /**
@@ -32,7 +33,7 @@
  *   boundary therefore covers the whole operator — both kernels — rather than
  *   only the AICPU one. The run's own boundaries completing is the proof: the
  *   wait sits ahead of a boundary that has fired.
- * - **Cross-run.** A successor queues, on its own AICore stream, a wait for the
+ * - **Cross-run.** A successor queues, on its execution stream, a wait for the
  *   predecessor's whole-operator boundary. Nothing about the predecessor
  *   completing proves the host has observed the successor's stream passing that
  *   wait, so the wait carries a proof event of its own, recorded into the
@@ -171,7 +172,9 @@ public:
      * caller decides what an undischarged reference costs by asking
      * `holds_reference_to` afterwards.
      */
-    int discharge(const NativeRunIdentity &boundary_owner, bool boundaries_complete, int timeout_ms) {
+    int discharge(
+        const NativeRunIdentity &boundary_owner, bool boundaries_complete, int timeout_ms, bool wait_for_proofs = true
+    ) {
         std::lock_guard<std::mutex> lock(mutex_);
         int first_rc = 0;
         for (Entry &entry : entries_) {
@@ -198,7 +201,7 @@ public:
                 if (first_rc == 0) first_rc = rc;
                 continue;
             }
-            if (!complete && boundaries_complete) {
+            if (!complete && boundaries_complete && wait_for_proofs) {
                 rc = ops_.wait(entry.proof_event, timeout_ms);
                 if (rc != 0) {
                     if (first_rc == 0) first_rc = rc;
@@ -218,10 +221,9 @@ public:
     }
 
     /**
-     * Retire every wait naming a boundary of `boundary_owner` against a proof
-     * that covers the device as a whole — a stream-pair synchronize the caller
-     * itself issued and that returned success, which covers everything queued
-     * behind the boundary as well as the boundary itself.
+     * Retire waits covered by the owner's synchronized stream pair. A cross-run
+     * CPU wait still needs its own proof event because the table does not retain
+     * enough stream identity to prove it shares that pair.
      */
     int discharge_on_quiescence(const NativeRunIdentity &boundary_owner) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -229,6 +231,8 @@ public:
         for (Entry &entry : entries_) {
             if (!entry.occupied || entry.boundary_owner != boundary_owner) continue;
             if (!entry.reference.committed()) continue;
+            // A CPU cross-run wait has no stream-identity proof tying it to this pair.
+            if (entry.shape == Shape::CrossRun && entry.reference.waiter() == StreamRole::Aicpu) continue;
             int rc = entry.fence->release_wait_reference_on_quiescence(entry.reference);
             if (rc != 0) {
                 if (first_rc == 0) first_rc = rc;
@@ -354,8 +358,40 @@ private:
     }
 
     mutable std::mutex mutex_;
-    // One own wait and one cross-run wait per pipeline slot is the most the
-    // launch path can queue, and the slot count is the runner's admission bound.
-    std::array<Entry, PTO_PIPELINE_MAX_DEPTH * 2> entries_{};
+    // One own wait and one cross-run wait per run-resource set is the most the
+    // launch path can queue, and the grant is the runner's admission bound.
+    std::vector<Entry> entries_ = std::vector<Entry>(kDefaultRunResourceSets * 2);
     RunCompletionFence::DeviceEventOps ops_;
+
+public:
+    using Storage = std::vector<Entry>;
+
+    /**
+     * Build a wait table for the grant, detached.
+     *
+     * May throw; mutates nothing. Constructed in place rather than assigned: an
+     * entry carries a move-only wait reference, so it is built, never copied.
+     */
+    static Storage build(size_t granted) { return Storage(granted * 2); }
+
+    /**
+     * Whether the table may be replaced at all.
+     *
+     * Refused while any entry is live: an entry is reachable from the
+     * predecessor's drain, which is the side that must not release anything
+     * while the wait it names is still queued.
+     */
+    bool grant_is_replaceable() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const Entry &entry : entries_) {
+            if (entry.occupied || entry.reference.valid()) return false;
+        }
+        return true;
+    }
+
+    /** Adopt a built table. Never throws, so a multi-owner grant cannot half-apply. */
+    void commit(Storage &&built) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        entries_.swap(built);
+    }
 };

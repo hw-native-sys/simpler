@@ -121,19 +121,21 @@ runs:
           job_pids[$index]=""
         }
 
+        # Manual DFX cases run here whenever the Onboard scene job is selected.
+        # PR CI gates that job on architecture and scene-test changes; Daily runs it too.
         if [[ "$platform" == "a2a3" ]]; then
           start_job "dep_gen (tensormap_and_ringbuffer)" \
             tests/st/a2a3/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
-            --enable-dep-gen
+            --manual include --enable-dep-gen
         else
           start_job "dep_gen" \
             tests/st/a5/tensormap_and_ringbuffer/dfx/dep_gen/test_dep_gen.py \
-            --enable-dep-gen
+            --manual include --enable-dep-gen
         fi
 
         start_job "chip_swimlane" \
           "tests/st/$platform/tensormap_and_ringbuffer/dfx/chip_swimlane/" \
-          --enable-chip-swimlane --enable-dep-gen
+          --manual include --enable-chip-swimlane --enable-dep-gen
 
         if [[ "$platform" == "a5" ]]; then
           start_job "chip_swimlane (host_build_graph)" \
@@ -143,7 +145,15 @@ runs:
 
         start_job "PMU" \
           "tests/st/$platform/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py" \
-          --enable-pmu 2
+          --manual include --enable-pmu 2
+
+        # A2/A3 checks exact FP32 counts across a utilization query on the
+        # allocated chip. Event group 1 contains the FP32 repeat counter.
+        if [[ "$platform" == "a2a3" ]]; then
+          start_job "PMU counting window (host_build_graph)" \
+            "tests/st/a2a3/host_build_graph/dfx/pmu/test_pmu_counting_window.py" \
+            --manual include --enable-pmu 1
+        fi
 
         # Mode "full" here; see the mode-per-lane rationale in _st-sim-a2a3.yml.
         # This action runs for both a2a3 and a5 onboard, so full -- the only
@@ -154,7 +164,20 @@ runs:
         # they would become command substitution if it were ever unquoted.
         start_job "args_dump (full)" \
           "tests/st/$platform/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py" \
-          --dump-args full
+          --manual include --dump-args full
+
+        if [[ "$platform" == "a5" ]]; then
+          for mode in full hybrid partial; do
+            start_job "args_dump (host_build_graph, $mode)" \
+              tests/st/a5/host_build_graph/dump_args/test_dump_args_example.py \
+              --manual include --dump-args "$mode"
+            # Mode runs share scene output names even on different devices.
+            wait_job "$((${#job_labels[@]} - 1))"
+          done
+          start_job "args_dump (host_build_graph Mix, full)" \
+            tests/st/a5/host_build_graph/single_block_mix/test_single_block_mix.py \
+            --manual include --dump-args full
+        fi
 
         # The directory, not a named file: every case here needs --enable-dep-gen
         # to assert anything, so one this job does not select reports a pass
@@ -162,7 +185,7 @@ runs:
         # so neither is branched on.
         start_job "dep_gen (host_build_graph)" \
           "tests/st/$platform/host_build_graph/dfx/dep_gen/" \
-          --enable-dep-gen
+          --manual include --enable-dep-gen
 
         for index in "${!job_labels[@]}"; do
           wait_job "$index"

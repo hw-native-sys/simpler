@@ -244,10 +244,10 @@ def run(
         worker.run(build_and_run, args=None, config=CallConfig())
         if domain_handle is None:
             raise RuntimeError("the Global CommDomain was not allocated")
-        domain = domain_handle
         observed: list[tuple[float, ...]] = []
 
         def read_and_release(orch, _args, _cfg):
+            domain = orch.get_domain("global-tload-mixed-l3")
             try:
                 for rank in range(len(RANK_LABELS)):
                     raw = orch.copy_from_global_domain(domain, rank, COUNT * FLOAT_NBYTES, buffer="result")

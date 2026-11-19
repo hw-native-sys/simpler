@@ -39,7 +39,6 @@ using simpler::dfx::prepared_handle_is_owned;
 JoinedDiagnosticRun eligible_run(uint32_t slot, ChipSwimlaneLevel level = ChipSwimlaneLevel::TASK_TIMING) {
     JoinedDiagnosticRun run;
     run.chip_swimlane_level = level;
-    run.other_channel_enabled = false;
     run.pipeline_slot = slot;
     return run;
 }
@@ -83,11 +82,10 @@ TEST(JoinedDiagnosticPairTest, LevelsThatDisagreeAreRefusedEvenThoughBothAreAdmi
     );
 }
 
-TEST(JoinedDiagnosticPairTest, AgreeingLevelsOutsideOneAndTwoAreNotAdmitted) {
+TEST(JoinedDiagnosticPairTest, AgreeingSwimlaneLevelsAboveTwoAreNotAdmitted) {
     // Agreement is not enough. Levels 3 and 4 arm phase pools this has not
-    // established an ordering for, and 0 is not a diagnostic run at all.
-    for (const ChipSwimlaneLevel level :
-         {ChipSwimlaneLevel::DISABLED, ChipSwimlaneLevel::SCHED_PHASES, ChipSwimlaneLevel::ORCH_PHASES}) {
+    // established an ordering for.
+    for (const ChipSwimlaneLevel level : {ChipSwimlaneLevel::SCHED_PHASES, ChipSwimlaneLevel::ORCH_PHASES}) {
         EXPECT_EQ(
             classify_joined_diagnostic_pair(false, eligible_run(0, level), eligible_run(1, level)),
             JoinedDiagnosticVerdict::kLevelNotAdmitted
@@ -96,15 +94,86 @@ TEST(JoinedDiagnosticPairTest, AgreeingLevelsOutsideOneAndTwoAreNotAdmitted) {
     }
 }
 
-TEST(JoinedDiagnosticPairTest, AnotherChannelOnEitherSideRefusesThePair) {
-    JoinedDiagnosticRun noisy = eligible_run(0);
-    noisy.other_channel_enabled = true;
-    EXPECT_EQ(
-        classify_joined_diagnostic_pair(false, noisy, eligible_run(1)), JoinedDiagnosticVerdict::kOtherChannelEnabled
-    ) << "the successor's own channel";
-    EXPECT_EQ(
-        classify_joined_diagnostic_pair(false, eligible_run(1), noisy), JoinedDiagnosticVerdict::kOtherChannelEnabled
-    ) << "and the predecessor's, which the successor cannot see from its own config";
+TEST(JoinedDiagnosticPairTest, SwimlaneOffOnBothSidesConstrainsNothing) {
+    // An owner that is off has no device word for either run to latch, so it
+    // is not a term in the decision. The pair's eligibility then rests on the
+    // other owners, and on the resource terms the runner holds.
+    JoinedDiagnosticRun succ = eligible_run(0, ChipSwimlaneLevel::DISABLED);
+    JoinedDiagnosticRun pred = eligible_run(1, ChipSwimlaneLevel::DISABLED);
+    succ.scope_stats_enabled = true;
+    pred.scope_stats_enabled = true;
+    EXPECT_EQ(classify_joined_diagnostic_pair(false, succ, pred), JoinedDiagnosticVerdict::kConfigurationAgrees)
+        << "a scope-stats-only pair was refused for a swimlane neither run asked for";
+}
+
+TEST(JoinedDiagnosticPairTest, EachQueuePairOwnerMustAgreeOnBothSides) {
+    // Each owner is compared rather than refused outright: its producers stamp
+    // their own run's identity onto what they publish, so two open runs are
+    // told apart. What is still one shared word is the *setting*.
+    struct Case {
+        const char *what;
+        void (*set)(JoinedDiagnosticRun &);
+    };
+    const Case cases[] = {
+        {"args dump level",
+         [](JoinedDiagnosticRun &run) {
+             run.dump_args_level = DumpArgsLevel::FULL;
+         }},
+        {"pmu",
+         [](JoinedDiagnosticRun &run) {
+             run.pmu_enabled = true;
+         }},
+        {"dep gen",
+         [](JoinedDiagnosticRun &run) {
+             run.dep_gen_enabled = true;
+         }},
+        {"scope stats", [](JoinedDiagnosticRun &run) {
+             run.scope_stats_enabled = true;
+         }},
+    };
+    for (const Case &c : cases) {
+        JoinedDiagnosticRun one_sided = eligible_run(0);
+        c.set(one_sided);
+        EXPECT_EQ(
+            classify_joined_diagnostic_pair(false, one_sided, eligible_run(1)),
+            JoinedDiagnosticVerdict::kChannelDisagrees
+        ) << c.what
+          << ": on for the successor only";
+        EXPECT_EQ(
+            classify_joined_diagnostic_pair(false, eligible_run(1), one_sided),
+            JoinedDiagnosticVerdict::kChannelDisagrees
+        ) << c.what
+          << ": on for the predecessor only, which the successor cannot see from its own config";
+
+        // And agreeing on it is what makes the pair eligible again.
+        JoinedDiagnosticRun matching = eligible_run(1);
+        c.set(matching);
+        EXPECT_EQ(
+            classify_joined_diagnostic_pair(false, one_sided, matching), JoinedDiagnosticVerdict::kConfigurationAgrees
+        ) << c.what
+          << ": agreeing on both sides";
+    }
+}
+
+TEST(JoinedDiagnosticPairTest, ThePmuEventModeIsOnlyATermWhilePmuIsOn) {
+    // The mode selects the counter group the device programs, so a pair
+    // measuring different groups could not be told apart by any later count.
+    JoinedDiagnosticRun succ = eligible_run(0);
+    JoinedDiagnosticRun pred = eligible_run(1);
+    succ.pmu_enabled = true;
+    pred.pmu_enabled = true;
+    succ.pmu_event_type = PmuEventType::PIPE_UTILIZATION;
+    pred.pmu_event_type = PmuEventType::ARITHMETIC_UTILIZATION;
+    EXPECT_EQ(classify_joined_diagnostic_pair(false, succ, pred), JoinedDiagnosticVerdict::kChannelDisagrees);
+
+    // With PMU off on both sides the mode is whatever the default left behind
+    // and names nothing the device programs, so it cannot refuse the pair.
+    JoinedDiagnosticRun off_succ = eligible_run(0);
+    JoinedDiagnosticRun off_pred = eligible_run(1);
+    off_succ.pmu_event_type = PmuEventType::PIPE_UTILIZATION;
+    off_pred.pmu_event_type = PmuEventType::ARITHMETIC_UTILIZATION;
+    EXPECT_EQ(classify_joined_diagnostic_pair(false, off_succ, off_pred), JoinedDiagnosticVerdict::kConfigurationAgrees)
+        << "a disagreeing event mode refused a pair that programs no counters";
 }
 
 TEST(JoinedDiagnosticPairTest, OnePipelineSlotIsOneRunsStateNotAPair) {

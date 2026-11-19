@@ -27,9 +27,13 @@ if(NOT DEFINED ENV{ASCEND_HOME_PATH})
 endif()
 set(ASCEND_HOME_PATH $ENV{ASCEND_HOME_PATH})
 
-include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/ascend_driver_path.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../../cmake/ascend_driver_path.cmake")
+simpler_require_ascend_driver_library()
 
 add_executable(query query.cpp)
+get_filename_component(SIMPLER_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../.." ABSOLUTE)
+include("${SIMPLER_ROOT}/cmake/aicpu_topology_driver.cmake")
+simpler_configure_aicpu_topology_driver(query)
 
 # `runtime/rt.h` transitively includes `prof_common.h`, which lives under
 # pkg_inc/profiling — both pkg_inc roots are needed here.

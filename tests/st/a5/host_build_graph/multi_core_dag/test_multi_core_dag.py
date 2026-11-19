@@ -11,6 +11,7 @@
 
 import ctypes
 
+import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 
@@ -28,6 +29,7 @@ def _case(name, graph_case, task_count):
     return case
 
 
+@pytest.mark.scheduler_mode("resident")
 @scene_test(level=2, runtime="host_build_graph")
 class TestHbgMultiCoreDag(SceneTestCase):
     RTOL = 0
@@ -57,7 +59,7 @@ class TestHbgMultiCoreDag(SceneTestCase):
 
     CASES = [
         *[_case(f"mixed_chain_{count}", 0, count) for count in (1, 2, 63, 65, 1024)],
-        _case("mixed_fanin32_1024", 1, 1024),
+        *[_case(f"mixed_fanin32_{count}", 1, count) for count in (64, 128, 256, 1024)],
         _case("mixed_random_1024", 3, 1024),
         _case("mixed_multi_root_4096", 2, 4096),
     ]

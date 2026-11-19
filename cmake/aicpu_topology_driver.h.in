@@ -1,0 +1,56 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+#include <driver/ascend_hal_base.h>
+// Toolkit HAL and standalone DSMI headers define DLLEXPORT differently.
+#pragma push_macro("DLLEXPORT")
+#undef DLLEXPORT
+#include "@_dsmi_include_dir@/dsmi_common_interface.h"
+#pragma pop_macro("DLLEXPORT")
+
+// Generated from compile checks, including enum members that #ifdef cannot detect.
+#cmakedefine01 SIMPLER_HAS_DSMI_CPU_TOPOLOGY
+
+namespace pto::driver {
+
+inline constexpr int32_t kCpuTopoHalInfoType = @SIMPLER_CPU_TOPO_HAL_SELECTOR@;
+inline constexpr unsigned int kCpuTopoDsmiSubcommand = @SIMPLER_CPU_TOPO_DSMI_SUBCOMMAND@;
+inline constexpr unsigned int kCpuTopoCapacity = @SIMPLER_CPU_TOPO_DSMI_CAPACITY@;
+
+#if SIMPLER_HAS_DSMI_CPU_TOPOLOGY
+using SingleCpuTopology = ::dsmi_single_cpu_topology_info;
+using CpuTopology = ::dsmi_cpu_topology_info;
+#else
+// Legacy ABI for packages that do not publish the CPU_TOPO structures.
+// Natural alignment is required by the driver's buffer-size check.
+struct SingleCpuTopology {
+    unsigned long long cpu_mask;
+    unsigned char cpu_id;
+    unsigned char is_share;
+    unsigned char phy_cpu_id;
+    unsigned char hyperthread_id;
+};
+struct CpuTopology {
+    unsigned int total_nums;
+    SingleCpuTopology single_cpu_topo_info[kCpuTopoCapacity];
+};
+static_assert(sizeof(SingleCpuTopology) == 16);
+static_assert(offsetof(CpuTopology, single_cpu_topo_info) == 8);
+#endif
+
+static_assert(std::extent_v<decltype(CpuTopology::single_cpu_topo_info)> == kCpuTopoCapacity);
+
+}  // namespace pto::driver

@@ -11,8 +11,8 @@
 Stated in full, not layered over a table shared with tmr. A name both runtimes use
 is not a shared phase: it is two phases that happen to carry the same label, and
 each runtime's own entry is what describes it. ``resolve`` is the clearest case --
-here it is this runtime's AICore completion walk and its dedicated resolution
-thread's work; under tmr it is a bar nested inside whichever phase observed the FIN.
+the AICPU producer's dedicated resolution thread emits ``resolve_standalone``;
+under tmr, ``resolve`` is nested inside whichever phase observed the FIN.
 Because the two vocabularies are independent, so is the classification built on
 them: this module carries its own ``canonical_sched_phase`` /
 ``nested_resolve_record_ids`` / ``scheduler_thread_role`` rather than passing a
@@ -22,13 +22,16 @@ The Python mirror of ``simpler::hbg::SchedPhaseKind``
 (src/common/host_build_graph/sched_phase_kind.h). Both of this runtime's producers
 are covered, because both are this runtime:
 
-  AICPU scheduler -- ``graph_prepare`` (bounded Definition expansion) and
+  AICPU scheduler (a2a3/wse) -- ``graph_prepare`` (bounded Definition expansion) and
       ``resolve_standalone``, which canonicalizes to ``resolve``.
-  AICore scheduler -- ``bootstrap``, ``state_probe``, ``worksteal``, ``refill`` and
-      ``idle``, plus ``dispatch`` / ``complete`` / ``resolve``. Written by
+  AICore scheduler (a5) -- ``bootstrap``, ``state_probe`` and
+      ``idle``, plus ``dispatch`` / ``complete`` and detailed Scalar phases. Written by
       append_scheduler_record() in
       a5/runtime/host_build_graph/host/runtime_maker.cpp. tmr has no AICore
       scheduler at all.
+
+StateProbe acquisition envelopes can overlap within one discovery batch;
+Scalar profiles account for exclusive work.
 """
 
 from __future__ import annotations
@@ -38,9 +41,8 @@ from __future__ import annotations
 # is the question a reader and a fixture both ask, and PHASES below is a consequence
 # of it rather than a second list to keep in step.
 #
-# ``resolve`` is the AICore scheduler's completion walk. The AICPU scheduler's
-# resolution thread writes ``resolve_standalone`` instead, which PHASE_ALIASES folds
-# into ``resolve`` for a report -- so on the wire the plain name is AICore's alone.
+# The AICPU resolution thread writes ``resolve_standalone``, which PHASE_ALIASES
+# folds into ``resolve`` for a report.
 PHASES_BY_PRODUCER = {
     "aicpu": frozenset(
         {
@@ -60,15 +62,113 @@ PHASES_BY_PRODUCER = {
         {
             "complete",
             "dispatch",
-            "resolve",
             "bootstrap",
             "state_probe",
-            "worksteal",
-            "refill",
             "idle",
         }
     ),
 }
+
+# Detailed Scalar phases share the L3 stream. Their hierarchy and exclusive
+# statistics are separate from the coarse phase totals.
+SCALAR_PHASES = frozenset(
+    {
+        "scalar_window",
+        "scalar_completions",
+        "scalar_graph_control",
+        "scalar_executor_scan",
+        "scalar_prepare",
+        "scalar_seal",
+        "scalar_async_service",
+        "scalar_execution_token_progress",
+        "scalar_execution_token_refill",
+        "scalar_execution_token_receive",
+        "scalar_advance_mix_floor",
+        "scalar_self_order_ready",
+        "scalar_mix_lane_order_ready",
+        "scalar_cluster_owes_before",
+        "scalar_cluster_mix_account",
+        "scalar_cluster_mix_dependencies",
+        "scalar_cluster_mix_prepare_member",
+        "scalar_cluster_mix_recycle",
+        "scalar_execution_token_select",
+        "scalar_fanin_observe",
+        "scalar_fill_own_slots",
+        "scalar_cluster_mix_service",
+        "scalar_cluster_mix_discover_task",
+        "scalar_cluster_mix_discover_next",
+        "scalar_cluster_mix_pending",
+        "scalar_cluster_mix_observe",
+        "scalar_cluster_mix_enter",
+        "scalar_cluster_mix_release",
+        "scalar_cluster_mix_drain",
+        "scalar_cluster_mix_all",
+        "scalar_prepared_receive",
+        "scalar_prepared_acquire",
+        "scalar_prepared_claim",
+        "scalar_counter_accounting",
+        "scalar_prepared_return",
+        "scalar_prepared_observe",
+        "scalar_prepared_index",
+        "scalar_prepared_validate",
+        "scalar_group_reserve",
+        "scalar_group_arm",
+        "scalar_group_acquire",
+        "scalar_execution_continuation",
+        "scalar_execution_token_fanin",
+        "scalar_task_issue_head",
+        "scalar_task_issue_fanin",
+        "scalar_task_supply_closed",
+        "scalar_service_cooperative_slots",
+        "scalar_ordinary_block_claim",
+        "scalar_task_completion_observe",
+        "scalar_cached_completion_observe",
+        "scalar_cached_completion_lookup",
+        "scalar_subtask_contribute",
+        "scalar_mix_group_contribute",
+        "scalar_returns_contribute",
+        "scalar_counter_condition_publish",
+        "scalar_execution_identity_capture",
+        "scalar_async_begin_prebound",
+        "scalar_async_seal_execution",
+        "scalar_async_close_computation",
+        "scalar_cluster_mix_service_active",
+        "scalar_graph_fanin_view",
+        "scalar_graph_payload_arguments",
+        "scalar_publish_idle",
+        "scalar_trace_before_execution",
+        "scalar_trace_before_completion",
+        "scalar_async_check",
+        "scalar_async_finish",
+        "scalar_bootstrap",
+        "scalar_bootstrap_init_wait",
+        "scalar_bootstrap_peer_wait",
+        "scalar_bootstrap_topology",
+        "scalar_launch_wait",
+        "scalar_exit_drain",
+        "scalar_cache_observe",
+        "scalar_cache_publish",
+        "scalar_flush_completions",
+        "scalar_loop_control",
+        "scalar_dispatch_metadata",
+        "scalar_dispatch_publish",
+        "scalar_trace_finish",
+        "scalar_trace_finish_clean",
+        "scalar_trace_finish_barrier",
+        "scalar_atomic_cas",
+        "scalar_atomic_store_issue",
+        "scalar_atomic_fetch_add",
+        "scalar_atomic_fetch_add_issue",
+        "scalar_dcci_out",
+        "scalar_dcci_single",
+        "scalar_dcci_entire",
+        "scalar_dsb_all",
+        "scalar_dsb_ddr",
+        "scalar_bypass_load",
+        "scalar_bypass_store",
+    }
+)
+PHASES_BY_PRODUCER["aicore"] |= SCALAR_PHASES
 
 # Every phase name a capture of this runtime may carry -- the wire vocabulary, which
 # is what a fixture is checked against when it names no producer. ``idle`` is in it
@@ -99,8 +199,6 @@ PHASE_COLORS = {
     # AICore scheduler's own loop.
     "bootstrap": "rail_animation",
     "state_probe": "cq_build_running",
-    "worksteal": "cq_build_attempt_failed",
-    "refill": "cq_build_attempt_passed",
     "idle": "grey",  # AICore scheduler spin with no progress
 }
 
@@ -131,8 +229,6 @@ PHASE_REPORT_LABELS = {
     "early_dispatch": "EarlyDispatch (speculative staging)",
     "drain": "Drain (sync-start staging)",
     "state_probe": "StateProbe (Scheduler-local Dispatch Slot / Ready state)",
-    "worksteal": "Worksteal (remote Inbox claim and dispatch)",
-    "refill": "Refill (completed Slot reuse)",
     "graph_prepare": "GraphPrepare (Definition expansion)",
     "resolve": "Resolve (completion/dependency resolution)",
 }
@@ -144,12 +240,10 @@ PHASE_DISPLAY_NAMES = {
     "resolve": "Resolve",
     "state_probe": "StateProbe",
     "dispatch": "Dispatch",
-    "worksteal": "Worksteal",
-    "refill": "Refill",
 }
 
 # Every outer phase this runtime can emit, in the order a report lists them. The
-# order carries meaning -- state_probe / dispatch / worksteal / refill is the
+# order carries meaning -- state_probe / dispatch is the
 # AICore scheduler's own loop -- which is one reason this is each runtime's own to
 # state rather than an interleaving of both.
 OUTER_PHASES = (
@@ -157,8 +251,6 @@ OUTER_PHASES = (
     "async_poll",
     "state_probe",
     "dispatch",
-    "worksteal",
-    "refill",
     "dummy",
     "early_dispatch",
     "drain",
@@ -174,8 +266,6 @@ WORK_PHASES = frozenset(
         "complete",
         "state_probe",
         "dispatch",
-        "worksteal",
-        "refill",
         "early_dispatch",
         "drain",
         "graph_prepare",

@@ -36,6 +36,10 @@ void platform_init_aicore_regs(uint64_t reg_addr) {
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
 }
 
+void platform_open_aicore_exit_window(uint64_t) {
+    // A5 has no separate FAST_PATH enable register. EXIT itself opens the window.
+}
+
 void platform_signal_aicore_exit(uint64_t reg_addr) { write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL); }
 
 // Timeout is variant-specific (sim wider than onboard) — see
@@ -68,6 +72,21 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
         if (targets[i].reg_addr == 0 || targets[i].teardown == nullptr) return -1;
     }
 
+    // COND can retain a prior launch's EXITED or nonce. Only this physical
+    // core writes it; ordinary task tokens cannot use the reserved encodings.
+    // The unique retirement owner selects a value different from that actual
+    // retained value, so only a response to this request can acknowledge exit.
+    uint32_t exit_requests[PLATFORM_MAX_CORES];
+    for (size_t i = 0; i < count; ++i) {
+        const uint32_t old_cond = static_cast<uint32_t>(read_reg(targets[i].reg_addr, RegId::COND));
+        const uint32_t request = old_cond == AICORE_EXIT_NONCE_0 ? AICORE_EXIT_NONCE_1 : AICORE_EXIT_NONCE_0;
+        exit_requests[i] = request;
+        __atomic_store_n(&targets[i].teardown->exit_request, request, __ATOMIC_RELAXED);
+    }
+    // The request is Normal memory and EXIT is posted Device memory. Publish
+    // every request before any core can observe the EXIT that asks for it.
+    wmb();
+
     // Broadcast to the whole group before waiting on any member, so the cores
     // drain concurrently and a dead core's wait does not serialize behind the
     // cores ahead of it.
@@ -90,7 +109,8 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
     while (remaining != 0) {
         for (size_t i = 0; i < count; ++i) {
             if (acknowledged[i]) continue;
-            if (read_reg(targets[i].reg_addr, RegId::COND) == AICORE_EXITED_VALUE) {
+            const uint32_t cond = static_cast<uint32_t>(read_reg(targets[i].reg_addr, RegId::COND));
+            if (cond == exit_requests[i]) {
                 acknowledged[i] = true;
                 --remaining;
             }

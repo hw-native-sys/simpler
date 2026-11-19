@@ -10,6 +10,9 @@
  */
 
 #include <gtest/gtest.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <thread>
@@ -381,4 +384,52 @@ TEST(Ring, NewSlotStatesCarryRingMetadata) {
     a.release(r.slot);
     a.release(r2.slot);
     a.release(r3.slot);
+}
+
+TEST(Ring, SharedDescriptorMapsExactSlabAndClosesOwnedFds) {
+    std::vector<int> creator_fds;
+    for (int i = 0; i < MAX_RING_DEPTH; ++i) {
+        char path[] = "/tmp/simpler-ring-XXXXXX";
+        const int fd = mkstemp(path);
+        ASSERT_GE(fd, 0);
+        unlink(path);
+        ASSERT_EQ(ftruncate(fd, kSmallHeap), 0);
+        creator_fds.push_back(fd);
+    }
+    void *mapping = MAP_FAILED;
+    std::vector<int> owned_fds;
+    {
+        Ring ring;
+        ring.init_shared(kSmallHeap, creator_fds);
+        owned_fds = ring.shared_fds();
+        for (int fd : creator_fds)
+            close(fd);
+        const auto first = ring.alloc(64);
+        const auto second = ring.alloc(64);
+        CanonicalIdentity identity{};
+        identity.owner_instance_id[0] = 1;
+        identity.buffer_id = 2;
+        identity.generation = 1;
+        const auto descriptor = ring.shared_descriptor(reinterpret_cast<uint64_t>(second.heap_ptr), 64, identity);
+        EXPECT_EQ(descriptor.backend_kind, static_cast<uint8_t>(BackendKind::SHARED_FD_SLICE));
+        uint32_t pid = 0;
+        uint32_t fd = 0;
+        uint64_t offset = 0;
+        std::memcpy(&pid, descriptor.body, 4);
+        std::memcpy(&fd, descriptor.body + 4, 4);
+        std::memcpy(&offset, descriptor.body + 8, 8);
+        EXPECT_EQ(pid, static_cast<uint32_t>(getpid()));
+        EXPECT_EQ(offset, HEAP_ALIGN);
+        mapping = mmap(nullptr, kSmallHeap, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        ASSERT_NE(mapping, MAP_FAILED);
+        static_cast<char *>(mapping)[offset] = 42;
+        EXPECT_EQ(*static_cast<char *>(second.heap_ptr), 42);
+        EXPECT_THROW(ring.shared_descriptor(UINT64_MAX, 64, identity), std::invalid_argument);
+        ring.release(first.slot);
+        ring.release(second.slot);
+    }
+    for (int fd : owned_fds)
+        EXPECT_EQ(fcntl(fd, F_GETFD), -1);
+    EXPECT_EQ(static_cast<char *>(mapping)[HEAP_ALIGN], 42);
+    munmap(mapping, kSmallHeap);
 }

@@ -27,9 +27,11 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -41,12 +43,13 @@
 #include "common/memory_barrier.h"
 #include "host/args_dump_collector.h"
 #include "support/test_task_id.h"
+#include "profiler_test_allocator.h"
 
 namespace fs = std::filesystem;
 
 namespace {
 
-void *retained_alloc(size_t size) { return std::calloc(1, size); }
+void *retained_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int retained_free(void *ptr) {
     std::free(ptr);
@@ -185,7 +188,7 @@ struct RetainedArgsDumpFixture {
     /** The device side of one run: init, record `args` tensors, flush. */
     void produce(uint64_t epoch, int args, bool flush_device = true) {
         set_platform_run_result(/*region_base=*/0, epoch);
-        dump_args_init(/*num_dump_threads=*/1);
+        dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
         for (int i = 0; i < args; i++)
             record_tensor(0x700 + i, static_cast<uint32_t>(i));
         if (flush_device) dump_args_flush(kLane);
@@ -285,6 +288,43 @@ TEST(ArgsDumpRetainedRuns, TwoRunsKeepTheirOwnPayloadFileAndManifest) {
     // Both runs' charges came back with their slots.
     EXPECT_EQ(st.open_epochs, 0u);
     EXPECT_EQ(st.open_collected_records, 0u);
+}
+
+TEST(ArgsDumpRetainedRuns, SuccessorAdmissionDoesNotChangeAPredecessorsSelection) {
+    RetainedArgsDumpFixture fx("selection-overlap");
+    fx.collector.hold_retained_writer_for_test(true);
+    ASSERT_TRUE(fx.collector.run_begin(297, fx.root.prefix("run-a").string(), DumpArgsLevel::PARTIAL));
+    ASSERT_TRUE(fx.collector.run_begin(298, fx.root.prefix("run-b").string(), DumpArgsLevel::HYBRID));
+    for (auto epoch : {297u, 298u}) {
+        const auto level = epoch == 297 ? DumpArgsLevel::PARTIAL : DumpArgsLevel::HYBRID;
+        set_platform_run_result(0, epoch);
+        dump_args_init(/*num_dump_threads=*/1, level);
+        EXPECT_EQ(is_dump_args_selective_mode(), level == DumpArgsLevel::PARTIAL);
+        fx.record_tensor(0x700, 0);
+        dump_args_flush(kLane);
+        fx.close(epoch);
+    }
+    fx.collector.hold_retained_writer_for_test(false);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    for (auto name : {"run-a", "run-b"}) {
+        const std::string manifest = read_file(fx.root.manifest(name));
+        ASSERT_FALSE(manifest.empty());
+        EXPECT_EQ(manifest_number(manifest, "dump_args_level"), std::string(name) == "run-a" ? 1 : 2);
+        EXPECT_EQ(manifest_number(manifest, "total_args"), 1);
+    }
+}
+
+TEST(ArgsDumpRetainedRuns, AdmissionDoesNotPublishADeviceSelection) {
+    RetainedArgsDumpFixture fx("level-host-only");
+    std::vector<unsigned char> before(sizeof(*fx.header));
+    std::memcpy(before.data(), fx.header, before.size());
+    ASSERT_TRUE(fx.collector.run_begin(299, fx.root.prefix("run-a").string(), DumpArgsLevel::PARTIAL));
+    EXPECT_EQ(std::memcmp(fx.header, before.data(), before.size()), 0);
+    fx.produce(299, /*args=*/0);
+    fx.close(299);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
 }
 
 /**
@@ -476,7 +516,7 @@ TEST(ArgsDumpRetainedRuns, ABudgetRefusedPayloadKeepsItsMetadataAndFailsTheFlush
 
     ASSERT_TRUE(fx.begin(801, fx.root.prefix("run-a")));
     set_platform_run_result(/*region_base=*/0, 801);
-    dump_args_init(/*num_dump_threads=*/1);
+    dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
     // One tensor whose payload is twice the whole working set, so no ordering
     // of the other charges can make room for it.
     const uint64_t huge_elements = (2 * simpler::dfx::runs::kMinWorkingSetBytes) / sizeof(int32_t);
@@ -593,7 +633,7 @@ TEST(ArgsDumpRetainedRuns, FinalizeCarriesAFailureTheEarlierFlushAlreadyReported
 
     ASSERT_TRUE(collector.run_begin(1101, root.prefix("run-a").string(), DumpArgsLevel::FULL));
     set_platform_run_result(/*region_base=*/0, 1101);
-    dump_args_init(/*num_dump_threads=*/1);
+    dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
     dump_args_flush(kLane);
     // No fence: the run is incomplete and the flush says so.
     collector.run_close(1101, /*device_execution_complete=*/false);
@@ -632,10 +672,10 @@ TEST(ArgsDumpRetainedRuns, RetentionOffKeepsTheSingleRunOutput) {
     set_dump_args_enabled(true);
     set_platform_dump_base(reinterpret_cast<uint64_t>(shm));
 
-    collector.begin_run(root.prefix("run-a").string(), DumpArgsLevel::FULL);
+    collector.begin_run(root.prefix("run-a").string(), DumpArgsLevel::FULL, 1201);
     std::vector<int32_t> tensor(kTensorElements, 3);
     set_platform_run_result(/*region_base=*/0, 1201);
-    dump_args_init(/*num_dump_threads=*/1);
+    dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
     ArgsDumpInfo info{};
     info.task_id = simpler::ut::test_task_id(0x1200);
     info.role = ArgsDumpRole::INPUT;
@@ -678,4 +718,71 @@ TEST(ArgsDumpRetainedRuns, RetentionOffKeepsTheSingleRunOutput) {
     set_platform_run_result(0, 0);
     collector.stop();
     EXPECT_EQ(collector.finalize(nullptr, retained_free), 0);
+}
+
+TEST(ArgsDumpRetainedRuns, FatalStopWritesCopiedPayloadsAndReportsTheHeldRunOnce) {
+    RetainedArgsDumpFixture fx("fatal-held-payloads");
+    constexpr int kPayloads = 100;
+    fx.collector.hold_retained_writer_for_test(true);
+    ASSERT_TRUE(fx.begin(9202, fx.root.prefix("run-a")));
+    fx.produce(9202, kPayloads);
+    ASSERT_TRUE(fx.wait_for_collected(kPayloads));
+    const auto before = fx.stats();
+    auto payload_bytes = [&] {
+        std::string bytes;
+        for (const auto &entry : fs::directory_iterator(fx.root.run_dir("run-a"))) {
+            if (entry.path().extension() == ".bin") bytes += read_file(entry.path());
+        }
+        return bytes;
+    };
+    EXPECT_TRUE(payload_bytes().empty());
+    fx.collector.stop_for_device_failure();
+    const auto bytes = payload_bytes();
+    ASSERT_EQ(bytes.size(), kPayloads * kTensorBytes);
+    for (int i = 0; i < kPayloads; ++i) {
+        EXPECT_EQ(std::memcmp(bytes.data() + i * kTensorBytes, fx.tensor.data(), kTensorBytes), 0);
+    }
+    EXPECT_FALSE(fs::exists(fx.root.manifest("run-a")));
+    EXPECT_EQ(fx.stats().open_epochs, before.open_epochs);
+    EXPECT_LT(fx.stats().charged_bytes, before.charged_bytes);
+    EXPECT_EQ(fx.stats().errors.abandoned, 1u);
+    fx.collector.stop_for_device_failure();
+    EXPECT_EQ(payload_bytes(), bytes);
+    EXPECT_EQ(fx.stats().errors.abandoned, 1u);
+    EXPECT_NE(fx.collector.finalize(nullptr, retained_free), 0);
+    EXPECT_EQ(fx.stats().errors.abandoned, 1u);
+}
+
+TEST(ArgsDumpRetainedRuns, FatalLossSurvivesConfirmedResetWithoutInvokingReleaseCallbacks) {
+    OutputRoot root("fatal-reset");
+    // The fixture owns host backing across the simulated device reset.
+    std::vector<std::unique_ptr<void, decltype(&std::free)>> backing;
+    size_t releases = 0;
+    ArgsDumpCollector collector;
+    auto alloc = [&](size_t bytes) {
+        void *ptr = profiler_test_calloc(bytes);
+        backing.emplace_back(ptr, &std::free);
+        return ptr;
+    };
+    auto release = [&](void *) {
+        ++releases;
+        return 0;
+    };
+    collector.configure_retained_runs(true, simpler::dfx::runs::kDefaultBudgetBytes);
+    ASSERT_EQ(collector.initialize(1, 0, DumpArgsLevel::FULL, alloc, nullptr, release), 0);
+    collector.start(retained_thread_factory);
+    ASSERT_TRUE(collector.run_begin(9302, root.prefix("run-a").string(), DumpArgsLevel::FULL));
+    const auto allocations = backing.size();
+    collector.stop_for_device_failure();
+    collector.stop_for_device_failure();
+    EXPECT_EQ(collector.retained_run_stats_for_test().errors.abandoned, 1u);
+    EXPECT_EQ(releases, 0u);
+    EXPECT_EQ(backing.size(), allocations);
+    collector.abandon_after_device_reset();
+    EXPECT_EQ(collector.finalize(nullptr, release), 0);
+    EXPECT_EQ(releases, 0u);
+    EXPECT_EQ(collector.retained_run_stats_for_test().errors.abandoned, 1u);
+    std::string error;
+    EXPECT_FALSE(collector.flush_retained_runs(100, &error));
+    EXPECT_NE(error.find("abandoned=1"), std::string::npos) << error;
 }

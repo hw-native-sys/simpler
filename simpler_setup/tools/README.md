@@ -2,7 +2,8 @@
 
 End-user CLIs for preparing scene tests and analyzing profiling data or args dumps.
 All are invokable as Python modules once the `simpler` wheel is installed —
-no repo checkout required.
+no repo checkout required for profiling tools. CI coverage tools additionally
+require the matching source checkout and its pytest configuration.
 
 > Dev-only scripts (`benchmark_rounds.sh`, `verify_packaging.sh`) live in the
 > repo-level [`tools/`](../../tools/) directory and are **not** shipped.
@@ -10,6 +11,8 @@ no repo checkout required.
 ## Tool list
 
 - **[scene_test_compile](#scene_test_compile)** — collect and compile selected Scene Test callables without an NPU
+- **[feature_coverage_report](#feature_coverage_report)** — reverify environment receipts and render CI coverage
+- **[collection_inventory](#collection_inventory)** — record the actual pytest collection without executing tests
 - **[swimlane_converter](#swimlane_converter)** — perf JSON → Chrome Trace Event (Perfetto)
 - **[sched_overhead_analysis](#sched_overhead_analysis)** — scheduler overhead / Tail OH breakdown
 - **[critical_path](#critical_path)** — chip swimlane critical-path compute/stall analysis
@@ -25,6 +28,45 @@ For CLIs that allow an omitted input, auto-detection paths
 relative to the **current working directory** — run these from the directory
 that holds your `outputs/`. Each test case writes into its own
 `outputs/<case>_<ts>/` directory; those tools auto-pick the latest by mtime.
+
+---
+
+## feature_coverage_report
+
+Verify the explicit receipt files against their original plans before reporting
+selected, body-entered, passed, failed, skipped and missing counts. Run from the original checkout
+while the receipt paths recorded in the manifests still exist:
+
+```bash
+python -m simpler_setup.tools.feature_coverage_report \
+    --root outputs/default-ci --environment default --platform a2a3 --manual exclude
+```
+
+Default A2/A3 expects `main.plan.json`, `sdma.plan.json` and
+`sdma_fault.plan.json`; manual-only expects `main`. A5 expects `main`.
+The `torch_npu` environment expects `results.plan.json` and `results.xml` in
+`outputs/framework-ci`. Default plans have a matching `.plan.results.json`
+manifest listing dispatcher and retry receipts. Missing or invalid evidence
+exits nonzero, removes stale coverage for that partition and reports it as
+unverified. Source-checked partial results remain visible, with failed attempts
+counted once per case and absent/invalid results counted as missing. The tool writes
+`coverage-summary.md` and `coverage-summary.json`, including partition verification
+status, source/environment identity and evidence paths, and appends to
+`GITHUB_STEP_SUMMARY` when set. CI summaries link to the run and its artifacts.
+The report never changes a failed verification into success. It does not execute
+tests or access devices.
+
+## collection_inventory
+
+Load this pytest plugin with `-p simpler_setup.tools.collection_inventory`
+and supply `--collect-only --collection-inventory inventory.json` alongside the
+normal environment/platform filters. The inventory records exact node IDs,
+classification errors and duplicates. Coverage policy errors are retained as
+`policy_error` in the JSON; invalid inventories exit nonzero without a pytest
+internal-error traceback. Add
+`--environment-receipts --verify-feature-coverage` to check feature obligations.
+See [CI coverage verification](../../docs/ci.md#feature-coverage-verification)
+for the supported scopes and skip policy. Collection cannot prove execution.
 
 ---
 
@@ -92,8 +134,22 @@ and its `critical_path_report.md` is written beside
 creates one local report per rank/device rather than one combined report at the
 scan root.
 
-For each rank/device, the tool builds a happens-before DAG from the dependency
-graph oriented by observed timestamps, then computes two critical paths:
+Within each rank/device, seven-column task records are grouped by `run_epoch`.
+The same task ID in two runs is two executions: each run gets its own report
+section, block counts, makespan and paths. The time between runs is not counted
+as task compute. Both Perfetto files retain the full source trace and highlight
+each run's path using `(run_epoch, task_id)`, so a missing bar cannot be supplied
+by another run's execution of the same task.
+
+Historical five-/six-column task records have no run identity and are analyzed
+as one run, with unstamped traces. Mixing identified and historical rows is
+rejected because the historical rows cannot be assigned to a run. Seven-column
+records require a nonnegative integer epoch; zero is an identity, not an absent
+field. An identified capture also requires matching epochs on Worker View bars
+in its merged trace.
+
+For each run, the tool builds a happens-before DAG from the dependency graph
+oriented by observed timestamps, then computes two critical paths:
 
 - **Static CPM** — the longest duration-weighted path, i.e. the
   dependency-limited latency floor with unlimited cores.
@@ -209,10 +265,13 @@ See [the single-capture schema](../../docs/dfx/chip-swimlane-profiling.md#option
 
 Directory mode puts the Ranks on one axis by containment, not by calibration:
 each Rank's device work is placed inside the `chip.run.runner_run` window that
-held it, read from persistent or capture-local timing logs. Default lookup reads
-`host.*.log` and `host_clock_alignment.*.log` directly under the input directory,
-plus `rank*/d*/host_clock_alignment.*.log` (`--host-log` overrides this lookup)
-and works at any capture level. Device slices carry their Rank's `slack_ns`.
+held it, read from live session logs, derived capture logs, or legacy timing logs.
+SceneTest's automatic conversion writes selected `[STRACE]` records from its
+session logs into the L3 capture and links them from each `dispatch_identity.json`.
+Manual `--host-log` selects input without changing the capture's identity files.
+Offline lookup follows these relative links, then falls back to `host.*.log`
+and `host_clock_alignment.*.log` under the input directory and Rank captures.
+It works at any capture level. Device slices carry their Rank's `slack_ns`.
 Each Rank's metadata carries the full `placement` record, and the top level carries
 `cross_rank_uncertainty_ns` — the sum of the two widest slacks, bounding
 placement freedom between two Ranks for their selected joins. Phase-join freedom
@@ -220,13 +279,17 @@ is reported separately as `join.residual_ns` and must also be considered when
 interpreting cross-Rank gaps. See
 [`containment.py`](containment.py) for the mechanism.
 
-The merged trace also carries the processes that dispatched to the Ranks —
-the L3 scheduler's `node.*` lanes, and an L4's `network1.*` above them, listed
-in `metadata.dispatcher_pids`. Those are Host `CLOCK_MONOTONIC` and same-host
-cross-process comparable, so they are drawn directly and carry no `slack_ns`:
-containment is only needed where a device clock is. Only the invocations
-overlapping the Ranks' own span on the axis are drawn, since one log covers the
-whole run.
+`metadata.parent_dispatch_status` is `present`, `missing`, or `unknown`;
+`missing` means the Ranks were merged without their parent scheduler spans.
+Automatic conversion still saves the available Rank Host records for offline reopening.
+
+The merged trace also carries the L3 scheduler's `node.*` lanes, listed in
+`metadata.dispatcher_pids`. A Rank's parent dispatch identity identifies that
+L3 task; it does not identify an L4 task, so automatic conversion does not
+attach `network1.*` by timestamp alone. These lanes are Host `CLOCK_MONOTONIC`
+and same-host cross-process comparable, so they are drawn directly and carry no `slack_ns`:
+containment is only needed where a device clock is. A parent dispatch identity
+selects the matching L3 task; legacy captures without one use the Rank window.
 
 Ranks must report the same `metadata.host_clock_domain_id`, since two Hosts'
 windows are not on one axis; a capture from before that field existed is placed
@@ -300,9 +363,9 @@ SPMD tasks are present.
 | ------ | ----- | ----------- |
 | `input` | | Input JSON file (chip_swimlane_records_*.json), **or** a `dfx_outputs` directory containing `rank*/dN/` for directory mode. If omitted, the latest file in outputs/ is used |
 | `--output` | `-o` | Output JSON file (default: `merged_swimlane.json` beside a file input, `l3_swimlane.json` inside a directory input) |
-| `--dispatch` | | Directory mode only: local capture directory to merge across Ranks, e.g. `d0`. Mutually exclusive with `--dispatch-id` |
-| `--dispatch-id` | | Directory mode only: parent dispatch identity to merge, formatted `RUN_ID:TASK_SLOT`. Resolves each Rank's own `dN` through `dispatch_identity.json`. Mutually exclusive with `--dispatch` |
-| `--host-log` | | Host `[STRACE]` log holding the `chip.run.runner_run` windows (repeatable). Single-file mode prefers sibling `host_clock_alignment.*.log`, falling back to `host.*.log`; directory mode reads both at the root plus `rank*/d*/host_clock_alignment.*.log`. An explicit argument recalculates single-file alignment |
+| `--dispatch` | | Directory mode only: local capture directory to merge across Ranks, e.g. `d0`. A directory holding both a `chip_swimlane_records.json` and a retained `swimlane-*/` artifact offers two separate units, which are never merged — name one with `d0:fixed` or `d0:retained`. Mutually exclusive with `--dispatch-id` |
+| `--dispatch-id` | | Directory mode only: parent dispatch identity to merge, formatted `RUN_ID:TASK_SLOT`, optionally suffixed `:fixed` or `:retained`. Resolves each Rank's own `dN` through `dispatch_identity.json`. Mutually exclusive with `--dispatch` |
+| `--host-log` | | Host `[STRACE]` log holding the `chip.run.runner_run` windows (repeatable). Single-file mode prefers sibling `host_clock_alignment.*.log`, falling back to `host.*.log`; directory mode reads linked derived logs, then legacy logs. An explicit argument selects the input and recalculates single-file alignment; only SceneTest's automatic flow publishes L3 derived logs |
 | `--rank-pid` | | Directory mode: pin one Rank's capture to the Host invocation that ran it, `RANK=PID` or `RANK=PID:INV` (repeatable). Only needed when the captures carry no `dispatch_identity.json` and Ranks running the same shape cannot be told apart by their device windows |
 | `--kernel-config` | `-k` | Path to kernel_config.py, used for function name mapping. Rejected in directory mode |
 | `--func-names` | | Path to name_map*.json (SceneTest format) for function name mapping. Rejected in directory mode |
@@ -401,7 +464,7 @@ Emitted in six parts:
 - **Part 1: Overhead verdict** — per-engine overhead (idle T-core *and* a ready, undispatched T-task, MIX-aware) + system `all_overhead` / `has_overhead`, all as % of makespan. An engine with no ready work is not overhead (dependency-mandated idle, not waste).
 - **Part 2: aicore switch** — the pre-dispatched pickup gap (`dispatch < prev_end`), reported **per core** (min/mean/max, ~0.8 µs each), the overhead-vs-independent split, and the makespan switch bound `[min over cores, sum of per-engine minima]`.
 - **Part 3 / 4: Head / Tail OH distributions** — P10–P99 + mean + total (per-task pickup and detect-latency magnitude).
-- **Part 5: Scheduler phase breakdown** — Level >= 3 reports the producer's phases. AICPU includes per-thread loop, queue-pop, fanout/fanin, and tail-vs-loop metrics; AICore reports its flat bootstrap, completion, resolve, StateProbe, dispatch/worksteal/refill, and idle phase totals without applying AICPU-only queue formulas. Deferred waiting is left as an empty interval between StateProbe and publication. At Level 2 this section is explicitly marked unavailable while Parts 1–4 and 6 remain available.
+- **Part 5: Scheduler phase breakdown** — Level >= 3 reports the producer's phases. AICPU includes per-thread loop, queue-pop, fanout/fanin, and tail-vs-loop metrics; AICore reports its flat bootstrap, completion, resolve, StateProbe, dispatch/refill, and idle phase totals without applying AICPU-only queue formulas. Deferred waiting is left as an empty interval between StateProbe and publication. At Level 2 this section is explicitly marked unavailable while Parts 1–4 and 6 remain available.
 - **Part 6: Critical-path latency attribution** — along the makespan path, scheduler-injected µs vs compute µs ("scheduler adds X% to the critical path").
 
 The common dependency-aware analysis works at chip_swimlane_level >= 2 for

@@ -58,6 +58,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         args.add_inout(ext_out);
         args.add_scalar(first ? spin_iters : static_cast<uint64_t>(0));
         args.add_scalar(first ? static_cast<uint64_t>(0) : static_cast<uint64_t>(1));
+        // The first two tasks mark their arguments for capture, and only those
+        // two. Selective capture keeps a 64-task chain's dump to a few
+        // payloads, and this pair is the one worth reading: every task writes
+        // the same `ext_out`, so the first task's output and the second task's
+        // input are the same buffer at two different instants — which is what
+        // lets a reader check an argument against its own task rather than
+        // against whatever that buffer held when the run ended.
+        if (i < 2) args.dump();
         (void)rt_submit_aiv_task(kSpinAdd, args);
     }
 }

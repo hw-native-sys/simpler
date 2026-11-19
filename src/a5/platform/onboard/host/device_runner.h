@@ -26,17 +26,16 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
-#include <cstring>
 #include <functional>
 #include <iostream>
 #include <map>
+#include <mutex>
+#include <optional>
 #include <string>
-#include <thread>
 #include <unordered_map>
 
 #include "host/run_progress_slots.h"
-#include <unordered_set>
-#include <vector>
+#include "host/scheduler_notification_cache.h"
 
 #include "callable.h"
 #include "prepare_callable_common.h"
@@ -83,12 +82,20 @@ class DeviceRunner : public DeviceRunnerBase {
     friend class RunRetentionProbePeer;
 
 public:
+    bool supports_pmu_capture() const override { return SIMPLER_DFX != 0; }
+    bool supports_swimlane_capture() const override { return SIMPLER_DFX != 0; }
+    bool supports_args_dump_capture() const override { return SIMPLER_DFX != 0; }
+
     DeviceRunner() = default;
+    int acquire_scheduler_notifications(
+        uint32_t slot, SchedulerNotificationPurpose purpose, size_t count, SchedulerDoneNotifications *out
+    ) override;
     ~DeviceRunner();
+    std::thread create_thread(std::function<void()> fn) override;
 
     // `setup_static_arena`, `allocate_tensor`, `free_tensor`,
     // `copy_to_device`, `copy_from_device`,
-    // `acquire_pooled_{gm_heap,gm_sm,runtime_arena}`, `create_thread`,
+    // `acquire_pooled_{gm_heap,gm_sm,runtime_arena}`,
     // `attach_current_thread`, `ensure_device_initialized`,
     // `print_handshake_results`, `set_executors`, `set_dispatcher_binary`,
     // `device_id`, `last_device_wall_ns`, `launch_aicpu_payload`, and
@@ -100,9 +107,9 @@ public:
         Runtime &runtime, const CallConfig &config, uint32_t pipeline_slot, const NativeRunIdentity &identity,
         std::unique_ptr<PreparedExecution> *prepared
     ) override;
-    LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) override;
     void abandon_prepared_execution(PreparedExecution &prepared) noexcept override;
     int poll_execution(const ActiveExecution &active) override;
+    int retire_completed_execution(ActiveExecution &active) override;
     DrainOutcome drain_execution(ActiveExecution &active) override;
     bool can_accept_run() const override { return !device_unusable_.load(std::memory_order_acquire); }
 
@@ -129,10 +136,16 @@ public:
      * instead of the device collector. Defined in the .cpp so this header stays
      * free of the runtime-provided capture symbols.
      */
-    void arm_host_dep_gen_capture(bool enable) override;
     void configure_dep_gen_retention(bool enabled, std::size_t budget_bytes) override;
     bool dep_gen_retains_runs() const override;
-    int admit_dep_gen_run(const DfxRunConfig &dfx, uint64_t run_epoch) override;
+    int admit_dep_gen_run(
+        const DfxRunConfig &dfx, uint64_t run_epoch, simpler::dfx::runs::AdmissionRefusal *why = nullptr
+    ) override;
+    bool dep_gen_can_admit_joined_run(uint64_t run_epoch) const override;
+    uint64_t dep_gen_run_terminal_bank(uint64_t run_epoch) const override;
+    int open_dep_gen_run_terminal_banks(const DfxRunConfig &dfx) override;
+    void install_dep_gen_credit_release_notifier(const std::function<void()> &notify) override;
+    bool dep_gen_retained_runs_outstanding() const override;
     void withdraw_dep_gen_run(uint64_t run_epoch) noexcept override;
     bool dep_gen_flush_retained(int timeout_ms, std::string *error) override;
     void dep_gen_finish_retained() override;
@@ -151,18 +164,19 @@ public:
     /**
      * Make the ACL context ready on the current thread.
      *
-     * Calls aclInit() once per process (subsequent calls are idempotent and
-     * tolerate the ACL_ERROR_REPEAT_INITIALIZE sentinel) and aclrtSetDevice()
-     * on the current thread. This is the entry point for consumers that need
+     * Acquires one ACL initialization and device reference per runner, then
+     * binds the existing context on subsequent calls. This is the entry point for consumers that need
      * to call acl* / Hccl* APIs (for example the comm_hccl backend) but
      * intentionally do not want those modules to own ACL lifecycle themselves.
      *
-     * Symmetric with finalize(): aclrtResetDevice + aclFinalize run there.
+     * Symmetric with finalize(): aclrtResetDevice + aclFinalizeReference run there.
      *
      * @param device_id  Device ID to bind on the current thread.
      * @return 0 on success, error code on failure.
      */
     int ensure_acl_ready(int device_id);
+    /** Terminal Host last-use proof; keeps ACL mappings alive for explicit unregister. */
+    int quiesce_host_uses();
 
     /**
      * Create a caller-owned aclrtStream for comm_* usage.
@@ -185,13 +199,21 @@ public:
     int destroy_comm_stream(void *stream);
 
 private:
+    static std::shared_ptr<SchedulerNotificationStorage>
+    make_scheduler_notification_storage(void *context, SchedulerNotificationPurpose purpose);
+    SchedulerNotificationCache scheduler_notifications_;
+    int bind_current_thread(int device_id) override;
+    int prepare_kernel_arch_context(rtStream_t control_stream) override;
+    int release_arch_context_resources(bool abandon_device_resources) override;
+    LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override;
+
     int finalize_impl() override;
 
     // Most lifecycle state (device_id_, block_dim_, cores_per_blockdim_,
     // executor + dispatcher bytes, aicore_bin_handle_,
     // load_aicpu_op_, mem_alloc_, the three DeviceArenas + their cached
     // sizes, persistent AICPU/AICore streams, device_wall_*,
-    // binaries_loaded_) is inherited from `DeviceRunnerBase`.
+    // aicpu_runtime_registered_) is inherited from `DeviceRunnerBase`.
 
     // Group D state (`chip_callable_buffers_`, `callables_`,
     // `aicpu_seen_callable_ids_`, `aicpu_dlopen_total_`,
@@ -206,14 +228,19 @@ private:
     // offline replay. a5-specific (the base keeps dep_gen as a virtual hook).
     DepGenCollector dep_gen_collector_;
 
-    // `query_max_block_dim`, `validate_block_dim`, `ensure_binaries_loaded`,
-    // `configure_aicore_op_timeout`, and `prepare_orch_so` are inherited
+    // `query_max_block_dim`, `validate_block_dim`, `ensure_aicpu_runtime_registered`,
+    // `configure_aicore_op_timeout`, and `validate_active_callable` are inherited
     // (protected) from `DeviceRunnerBase`.
 
-    // ACL lifecycle (process-wide). aclInit must run exactly once; ensure_acl_ready
-    // gates it behind this flag. finalize() drives aclFinalize only if we observed
-    // acl_ready_, so runtimes that never ask for ACL (e.g. pure rt-layer) stay unaffected.
-    bool acl_ready_{false};
+    int capture_owned_context(int device_id);
+    int finalize_unbound() override;
+
+    rtContext_t owned_context_{nullptr};
+    bool rts_device_ref_{false};
+    bool acl_device_ref_{false};
+    bool acl_init_ref_{false};
+    std::mutex acl_init_mutex_;
+    std::optional<bool> device_sweep_clean_;
 
     // Set true when an AICore launch/sync error (e.g. an op-timeout reaped by
     // STARS, surfaced as 507000/507018 at stream sync, or a 207001 launch
@@ -237,6 +264,18 @@ private:
     // check relies on.
     RunProgressSlots run_progress_;
 
+protected:
+    /** The progress table holds one slot per run-resource set. */
+    ArchRunResourceStaging build_arch_run_resources(size_t granted) override {
+        ArchRunResourceStaging staged;
+        staged.run_progress = RunProgressSlots::build(granted);
+        return staged;
+    }
+    void commit_arch_run_resources(ArchRunResourceStaging &&staged) noexcept override {
+        run_progress_.commit(std::move(staged.run_progress));
+    }
+
+private:
     // Queue this run's own AICore boundary into the AICPU stream, ahead of the
     // AICPU boundary record that then covers the whole operator. The reservation
     // is taken by the caller, so a refusal costs only joinability; this is the
@@ -259,10 +298,9 @@ private:
     // are released in finalize().
     void cleanup_execution(PreparedExecution &prepared, bool launched) noexcept;
 
-    // On an AICore launch/sync error, best-effort drain the device so a later
-    // enqueue on the same DeviceRunner can recover in place; if the drain itself
-    // errors the context is unrecoverable without a full reset, so flip
-    // device_unusable_ and let admission/enqueue fail fast.
+    // Quarantine needs no current device; recovery may drain an owned device.
+    // Both keep admission closed until owner recovery or terminal quarantine.
+    void mark_device_unusable(int runtime_rc) override;
     void recover_device_or_mark_unusable(int aicore_rc) override;
 
     // Force-reset the card via aclrtResetDeviceForce to clear an op-timeout
@@ -290,15 +328,11 @@ private:
      * @param device_id Device ID
      * @return 0 on success, error code on failure
      */
-    /**
-     * Build this run's collector pools, profiling flag and device KernelArgs
-     * refresh, under the execution claim.
-     *
-     * The collectors are resident and shared by every run on this runner, and a
-     * run whose core / AICPU-thread counts differ from the pools' releases and
-     * rebuilds them. Neither is safe while another run is executing against
-     * them, which is why none of it happens during preparation.
-     */
+    // Resident pools may still have device/retained-writer users. Storage
+    // construction holds the execution claim, or native_run_mu_ with no active
+    // claims during cold retention. It acquires no run bank and starts no readers.
+    int prepare_collector_storage(const Runtime &runtime, PreparedExecution &prepared) override;
+    // Bind the per-run terminal bank after storage preparation succeeds.
     int arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared);
 
     /**
@@ -351,17 +385,20 @@ private:
     //
     // dep_gen enablement is a5-specific (a2a3 carries its own copy).
 
-    int query_aicpu_device_occupancy(pto::a5::AicpuDeviceOccupancy &out);
-    int query_aicpu_topology(pto::a5::AicpuTopology &out);
+    int query_aicpu_device_occupancy(simpler::a5::AicpuDeviceOccupancy &out, rtStream_t control_stream);
+    int query_aicpu_topology(simpler::a5::AicpuTopology &out, rtStream_t control_stream);
+    void *aicpu_topology_query_result_{nullptr};
+    bool aicpu_topology_query_pending_{false};
+    rtStream_t aicpu_topology_query_stream_{nullptr};
     void clear_aicpu_topology_cache();
     // Device-side occupancy and the merged Host topology are immutable during
     // one DeviceRunner attach/reset lifetime. Cache successful probes only;
     // allowed CPU selection still runs per call because the requested active
     // count may change. Recovery, reset, and finalize clear both values.
     bool aicpu_device_occupancy_cached_{false};
-    pto::a5::AicpuDeviceOccupancy aicpu_device_occupancy_{};
+    simpler::a5::AicpuDeviceOccupancy aicpu_device_occupancy_{};
     bool aicpu_topology_cached_{false};
-    pto::a5::AicpuTopology aicpu_topology_{};
+    simpler::a5::AicpuTopology aicpu_topology_{};
 
     int init_pmu(int num_cores, int num_threads, int device_id, KernelArgsHelper &kernel_args);
     int init_scope_stats(int num_threads, int device_id, KernelArgsHelper &kernel_args);
@@ -386,7 +423,9 @@ private:
      * whole of the completion proof: without it the retained path reads nothing
      * shared and publishes nothing.
      */
-    void emit_device_dep_gen_graph(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
+    void emit_device_dep_gen_graph(
+        const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
+    );
 
     // Per-run collector teardown: stops mgmt + poll threads on every collector
     // whose init succeeded, in the only safe order (stop() joins mgmt before
@@ -402,4 +441,5 @@ private:
      * failure is the more useful diagnosis and keeps priority.
      */
     int finalize_collectors(bool abandon_device_resources = false);
+    bool terminal_backing_retained() const override;
 };

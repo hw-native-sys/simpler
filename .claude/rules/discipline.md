@@ -156,3 +156,30 @@ git worktree list        # each branch name must appear at most once
 Any branch listed against two worktrees is already the broken state; move your
 own worktree off it with `git checkout --detach HEAD` before doing anything
 else, and leave the other worktree's copy alone.
+
+## 7. CI correctness tests use explicit events
+
+Every CI correctness test — unit, simulation and onboard hardware — must
+establish the state or event ordering it asserts. Use explicit handshakes,
+barriers, acknowledgements or observable state transitions to reach the
+scenario and verify its functional result.
+
+Do not use sleeps, calibrated spin counts, elapsed observation windows or
+relative execution speed to infer concurrency, ordering, blocking or successful
+fault coverage. For example, "the successor prepared before a one-second
+predecessor finished" depends on machine speed; hold the predecessor at an
+observable gate, verify the successor's state, then release the gate. A fault
+test must confirm the injected event occurred at the required state, rather
+than waiting long enough for background interference to become likely.
+
+Timeouts bound waits and fail a stuck test; their expiry or non-expiry must
+not stand in for an unrelated correctness property. When time is itself the
+contract under test (a timeout, deadline or configured budget), assert that
+contract with tolerance for CI variance and check its observable outcome.
+Explicit performance benchmarks are separate from functional correctness tests.
+
+Probabilistic duration-based stress experiments belong in explicitly requested
+diagnostics, not required correctness CI. Increasing a delay, timeout or retry
+count does not replace deterministic synchronization.
+
+See [the testing assertion principle](../../docs/testing.md#assertion-principle-no-wall-clock-proxies).

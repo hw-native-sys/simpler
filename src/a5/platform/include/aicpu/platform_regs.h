@@ -150,19 +150,26 @@ struct AicoreExitTarget {
     AicoreTeardownControl *teardown;
 };
 
-// Retires one exclusively-claimed set of cores: signal every member, collect
-// every ACK against one shared deadline, close every acknowledged window, then
-// release those workers.
-// Callers claim their targets first, so concurrent callers never name the same
-// core and the set need not be the whole chip. An unacknowledged core is neither
-// closed nor released and stays the host recovery path's responsibility.
+// Enable exit signalling without releasing a core into normal initialization.
+void platform_open_aicore_exit_window(uint64_t reg_addr);
+
+// Retires one exclusively claimed set of cores. Each target's request and
+// release gate must be reset before READY or any EXIT; Native and unstamped
+// launches use the same reserved COND nonce protocol. Each core echoes its
+// current request once after quiescence and makes no subsequent SPR writes.
 //
-// `released`, when non-null, receives one flag per target and lets the caller
-// name the cores it failed to retire; this layer takes no logging dependency.
-// Every path that returns fills those entries first, rejection included, so the
-// caller may read them without initializing the buffer; a `count` above
-// PLATFORM_MAX_CORES is rejected and only that many are filled.
-// Returns 0 when every target was released, -1 on timeout or invalid targets.
+// Publish requests, broadcast EXIT to the group, and collect matching COND
+// values against one shared deadline. Close/read back every acknowledged
+// window, drain the closes, then release only those cores. An unacknowledged
+// core is neither closed nor released; it remains owned by host recovery.
+// ACK arriving after return does not run another close/release pass. A failed
+// group remains retained until device-owner recovery proves it safe to retire;
+// repeating a kernel or publishing another request is not that proof.
+//
+// `released`, when non-null, receives one flag per target on every return,
+// including rejection. A count above PLATFORM_MAX_CORES is rejected and only
+// PLATFORM_MAX_CORES entries are filled. Return 0 if all targets were released,
+// otherwise -1. Concurrent callers must never claim the same core.
 int32_t platform_retire_aicore_group(
     const AicoreExitTarget *targets, size_t count, uint64_t deadline, bool *released = nullptr
 );

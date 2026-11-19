@@ -37,6 +37,7 @@
 #include "common/unified_log.h"
 
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <mutex>
@@ -91,17 +92,15 @@ std::mutex g_device_key_mutex;
 pthread_key_t g_device_id_key{};
 std::atomic<bool> g_device_key_initialized{false};
 
-void ensure_device_key() {
-    if (g_device_key_initialized.load(std::memory_order_acquire)) {
-        return;
-    }
+int ensure_device_key() {
+    if (g_device_key_initialized.load(std::memory_order_acquire)) return 0;
     std::lock_guard<std::mutex> lock(g_device_key_mutex);
     if (!g_device_key_initialized.load(std::memory_order_relaxed)) {
-        if (pthread_key_create(&g_device_id_key, nullptr) != 0) {
-            return;
-        }
+        const int error = pthread_key_create(&g_device_id_key, nullptr);
+        if (error != 0) return error;
         g_device_key_initialized.store(true, std::memory_order_release);
     }
+    return 0;
 }
 
 int get_current_device_id() {
@@ -124,24 +123,28 @@ DeviceSimContext *get_current_device_context() {
 std::mutex g_identity_key_mutex;
 pthread_key_t g_subblock_id_key{};
 pthread_key_t g_cluster_id_key{};
+pthread_key_t g_invocation_context_key{};
 std::atomic<bool> g_identity_keys_initialized{false};
 
-void ensure_identity_keys() {
-    if (g_identity_keys_initialized.load(std::memory_order_acquire)) {
-        return;
-    }
+int ensure_identity_keys() {
+    if (g_identity_keys_initialized.load(std::memory_order_acquire)) return 0;
     std::lock_guard<std::mutex> lock(g_identity_key_mutex);
-    if (g_identity_keys_initialized.load(std::memory_order_relaxed)) {
-        return;
-    }
-    if (pthread_key_create(&g_subblock_id_key, nullptr) != 0) {
-        return;
-    }
-    if (pthread_key_create(&g_cluster_id_key, nullptr) != 0) {
+    if (g_identity_keys_initialized.load(std::memory_order_relaxed)) return 0;
+    int error = pthread_key_create(&g_subblock_id_key, nullptr);
+    if (error != 0) return error;
+    error = pthread_key_create(&g_cluster_id_key, nullptr);
+    if (error != 0) {
         pthread_key_delete(g_subblock_id_key);
-        return;
+        return error;
+    }
+    error = pthread_key_create(&g_invocation_context_key, nullptr);
+    if (error != 0) {
+        pthread_key_delete(g_cluster_id_key);
+        pthread_key_delete(g_subblock_id_key);
+        return error;
     }
     g_identity_keys_initialized.store(true, std::memory_order_release);
+    return 0;
 }
 
 }  // namespace
@@ -150,9 +153,17 @@ void ensure_identity_keys() {
 // Device lifecycle
 // ---------------------------------------------------------------------------
 
+extern "C" int pto_cpu_sim_bind_device_checked(int device_id) {
+    if (device_id < -1) return EINVAL;
+    if (const int error = ensure_device_key(); error != 0) return error;
+    return pthread_setspecific(
+        g_device_id_key, reinterpret_cast<void *>(static_cast<intptr_t>(device_id) + DEVICE_ID_OFFSET)
+    );
+}
+
 extern "C" void pto_cpu_sim_bind_device(int device_id) {
-    ensure_device_key();
-    pthread_setspecific(g_device_id_key, reinterpret_cast<void *>(static_cast<intptr_t>(device_id + DEVICE_ID_OFFSET)));
+    // The legacy ABI cannot report failure or safely continue with a stale binding.
+    if (pto_cpu_sim_bind_device_checked(device_id) != 0) std::abort();
 }
 
 extern "C" int pto_cpu_sim_get_bound_device(void) { return get_current_device_id(); }
@@ -213,14 +224,20 @@ void clear_cpu_sim_shared_storage() {
 // Per-thread core identity setters (called by sim aicore platform code)
 // ---------------------------------------------------------------------------
 
-void sim_context_set_subblock_id(uint32_t subblock_id) {
-    ensure_identity_keys();
-    pthread_setspecific(g_subblock_id_key, reinterpret_cast<void *>(static_cast<uintptr_t>(subblock_id)));
+int sim_context_set_subblock_id(uint32_t subblock_id) {
+    if (const int error = ensure_identity_keys(); error != 0) return error;
+    const int error =
+        pthread_setspecific(g_subblock_id_key, reinterpret_cast<void *>(static_cast<uintptr_t>(subblock_id)));
+    if (error != 0) LOG_ERROR("Sim subblock identity binding failed: %d", error);
+    return error;
 }
 
-void sim_context_set_cluster_id(uint32_t cluster_id) {
-    ensure_identity_keys();
-    pthread_setspecific(g_cluster_id_key, reinterpret_cast<void *>(static_cast<uintptr_t>(cluster_id)));
+int sim_context_set_cluster_id(uint32_t cluster_id) {
+    if (const int error = ensure_identity_keys(); error != 0) return error;
+    const int error =
+        pthread_setspecific(g_cluster_id_key, reinterpret_cast<void *>(static_cast<uintptr_t>(cluster_id)));
+    if (error != 0) LOG_ERROR("Sim cluster identity binding failed: %d", error);
+    return error;
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +249,16 @@ extern "C" uint32_t pto_sim_get_subblock_id() {
         return 0;
     }
     return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_subblock_id_key)));
+}
+
+extern "C" int sim_context_bind_invocation_context(void *context) {
+    if (const int error = ensure_identity_keys(); error != 0) return error;
+    return pthread_setspecific(g_invocation_context_key, context);
+}
+
+extern "C" void *sim_context_get_invocation_context() {
+    if (!g_identity_keys_initialized.load(std::memory_order_acquire)) return nullptr;
+    return pthread_getspecific(g_invocation_context_key);
 }
 
 extern "C" void *pto_sim_get_pipe_shared_state(uint64_t pipe_key, size_t size) {
@@ -260,4 +287,28 @@ extern "C" void *pto_sim_get_pipe_shared_state(uint64_t pipe_key, size_t size) {
     void *storage = std::calloc(1, size);
     dev->pipe_states.emplace(key, storage);
     return storage;
+}
+
+namespace {
+std::mutex g_cancel_key_mutex;
+pthread_key_t g_cancel_key{};
+std::atomic<bool> g_cancel_key_initialized{false};
+}  // namespace
+
+extern "C" int pto_cpu_sim_bind_cancel_register(volatile uint32_t *reg) {
+    if (!g_cancel_key_initialized.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(g_cancel_key_mutex);
+        if (!g_cancel_key_initialized.load(std::memory_order_relaxed)) {
+            const int error = pthread_key_create(&g_cancel_key, nullptr);
+            if (error != 0) return error;
+            g_cancel_key_initialized.store(true, std::memory_order_release);
+        }
+    }
+    return pthread_setspecific(g_cancel_key, const_cast<uint32_t *>(reg));
+}
+
+extern "C" bool pto_cpu_sim_cancel_requested(uint32_t exit_signal) {
+    if (!g_cancel_key_initialized.load(std::memory_order_acquire)) return false;
+    auto *reg = static_cast<uint32_t *>(pthread_getspecific(g_cancel_key));
+    return reg != nullptr && __atomic_load_n(reg, __ATOMIC_ACQUIRE) == exit_signal;
 }

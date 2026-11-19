@@ -7,6 +7,13 @@ End-user profiling / debug CLIs live in
 [`simpler_setup/tools/`](../simpler_setup/tools/) and ship with the wheel —
 invoke them via `python -m simpler_setup.tools.<name>`.
 
+## framework_queue_gil
+
+[Controlled Torch NPU queue/GIL probe](framework_queue_gil/README.md) for
+`query()` and `empty_cache()` with pending Python callbacks. It includes native
+and released-GIL positive controls and captures bounded subprocess failures.
+It is a diagnostic, not a Simpler runtime acceptance test.
+
 ## benchmark_rounds.sh
 
 Batch-run a predefined set of scene tests on hardware and report per-round
@@ -31,6 +38,13 @@ control a2a3 + TMR, a2a3 + HBG, a5 + TMR, and a5 + HBG. Every corpus includes
 the workloads shared by both runtimes plus its matching Qwen case:
 `StressBatch16Seq3500` for TMR and `GraphExecutionBatch16Seq3500` for HBG. SPMD
 paged attention is not part of the benchmark sweep.
+
+## benchmarks/a5_hbg_graph_task/
+
+The A5 HBG collector and its three input manifests cover 19 no-Graph cases:
+seven fixed benchmarks, eleven selected scene tests, and CSA. Qwen is measured
+separately. Raw results and experiment artifacts belong under `outputs/` and
+are not committed. See the [validation and collection guide](../tests/docs/a5-hbg-graph-task/README.zh-CN.md).
 
 ## verify_packaging.sh
 
@@ -92,9 +106,10 @@ that are a2a3's. Making them per-arch would remove the skips. So a full sweep is
 7 built + 7 run on a2a3, and 7 built + 4 run + 3 skipped on a5.
 
 Tools that link `libascend_hal.so` resolve the driver package through
-`cann-examples/cmake/ascend_driver_path.cmake` (overridable with
-`-DASCEND_DRIVER_PATH=`), which fails the configure naming the missing library
-instead of leaving a bare `cannot find -lascend_hal`.
+[`cmake/ascend_driver_path.cmake`](../cmake/ascend_driver_path.cmake) (overridable with
+`-DASCEND_DRIVER_PATH=`), also used by runtime topology header discovery.
+Direct-link tools call `simpler_require_ascend_driver_library()` to fail configure
+with the missing library path instead of leaving a bare `cannot find -lascend_hal`.
 
 ### cann-examples/query
 
@@ -165,3 +180,28 @@ when adding a new notification mechanism that needs head-to-head
 comparison with the existing two. See the tool's own
 [README](./cann-examples/aicore-notification-perf/README.md) for the
 pipeline diagram, build steps, and expected numbers.
+
+## a5-ir-check/
+
+Preflight scanner for the A5 **stack-realignment miscompile** ([simpler#2973](https://github.com/hw-native-sys/simpler/issues/2973)):
+a stack object with a large alignment can get inconsistent address fixups once
+its address escapes into an outlined call, so a predicate reads a shifted object
+and reports an error that never happened. The source looks correct, the build is
+clean, unit tests pass.
+
+Point it at the build directory of the configuration under review — Ninja and
+CMake Makefile trees are both detected — and it flags the objects whose escaping
+address it can trace to a non-`alwaysinline` call, function-pointer calls
+included:
+
+```bash
+./tools/a5-ir-check/a5_ir_check.py <build-dir>
+```
+
+On the real AICore target it maps the exposure: 0 findings at `-O1` (everything
+inlined, nothing crosses a boundary) versus 48 in `aicore_executor.cpp` at
+`-O0`, all on `SchedulerTaskMetadata` escaping into the dispatch path. A clean
+run only speaks for the configuration it scanned, and a scan that skipped a TU
+exits 2 rather than claiming clean. See the tool's own
+[README](./a5-ir-check/README.md) for the verified A/B matrix, runtime cost, and
+limits (`kernel.cpp` at `-O1` exceeds what system `llvm-dis` 17 can read).

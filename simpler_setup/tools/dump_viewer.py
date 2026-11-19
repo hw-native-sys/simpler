@@ -41,6 +41,7 @@ import argparse
 import json
 import struct
 import sys
+import tempfile
 from pathlib import Path
 
 DTYPE_INFO = {
@@ -64,9 +65,18 @@ def bfloat16_to_float32(raw: int) -> float:
 
 
 def read_arg_data(bin_path: Path, offset: int, size: int) -> bytes:
+    if type(offset) is not int or type(size) is not int or offset < 0 or size < 0:
+        raise ValueError("invalid payload range")
     with open(bin_path, "rb") as f:
+        f.seek(0, 2)
+        available = f.tell()
+        if offset > available or size > available - offset:
+            raise ValueError("payload range exceeds the named binary")
         f.seek(offset)
-        return f.read(size)
+        data = f.read(size)
+        if len(data) != size:
+            raise ValueError("payload range changed while reading")
+        return data
 
 
 def decode_elements(data: bytes, dtype: str, count: int) -> list:
@@ -91,12 +101,13 @@ def format_element(val, dtype: str) -> str:
     return str(val)
 
 
-def arg_filename(arg: dict) -> str:
+def arg_filename(arg: dict, *, entry_index: int | None = None) -> str:
     stage_map = {"before_dispatch": "before", "after_completion": "after"}
     role_map = {"input": "in", "output": "out", "inout": "inout"}
     stage_str = stage_map.get(arg["stage"], arg["stage"])
     role_str = role_map.get(arg["role"], arg["role"])
-    return f"task_{arg['task_id']}_{stage_str}_{role_str}{arg['arg_index']}.txt"
+    prefix = f"entry_{entry_index:06d}_" if entry_index is not None else ""
+    return f"{prefix}task_{arg['task_id']}_{stage_str}_{role_str}{arg['arg_index']}.txt"
 
 
 def write_arg(arg: dict, bin_path: Path | None, out):
@@ -113,6 +124,10 @@ def write_arg(arg: dict, bin_path: Path | None, out):
 
     if arg.get("truncated"):
         out.write("# DATA TRUNCATED (tensor too large for arena)\n")
+
+    if arg.get("host_discarded"):
+        out.write("# DATA DISCARDED (host collection lost this payload)\n")
+        return
 
     if arg.get("kind") == "scalar":
         val = arg.get("value")
@@ -172,13 +187,22 @@ def write_arg(arg: dict, bin_path: Path | None, out):
         out.write(f"[{idx_str}] {s}\n")
 
 
-def export_arg(arg: dict, bin_path: Path | None, dump_dir: Path):
+def export_arg(arg: dict, bin_path: Path | None, dump_dir: Path, *, entry_index: int | None = None):
     txt_dir = dump_dir / "txt"
     txt_dir.mkdir(exist_ok=True)
-    fname = arg_filename(arg)
+    fname = arg_filename(arg, entry_index=entry_index)
     txt_path = txt_dir / fname
-    with open(txt_path, "w") as f:
-        write_arg(arg, bin_path, f)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", dir=txt_dir, prefix=f".{fname}.", suffix=".tmp", delete=False
+        ) as out:
+            temporary_path = Path(out.name)
+            write_arg(arg, bin_path, out)
+        temporary_path.replace(txt_path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
     return txt_path
 
 
@@ -186,17 +210,18 @@ def collect_valid_values(tensors: list, field: str) -> list:
     return sorted(set(str(t[field]) for t in tensors))
 
 
-def list_args(tensors: list):
+def list_args(tensors: list, indices=None):
     print(
         f"{'idx':>6}  {'task_id':>18}  {'stage':>7}  {'role':>5}"
         f"  {'arg':>3}  {'dtype':>8}  {'shape':<20}  {'bytes':>10}"
     )
     print("-" * 100)
-    for i, t in enumerate(tensors):
+    for i, t in zip(range(len(tensors)) if indices is None else indices, tensors):
         stage_short = "before" if t["stage"] == "before_dispatch" else "after"
+        status = " DISCARDED" if t.get("host_discarded") else ""
         print(
             f"{i:>6}  {t['task_id']:>18}  {stage_short:>7}  {t['role']:>5}  "
-            f"{t['arg_index']:>3}  {t['dtype']:>8}  {str(t['shape']):<20}  {t['bin_size']:>10}"
+            f"{t['arg_index']:>3}  {t['dtype']:>8}  {str(t['shape']):<20}  {t['bin_size']:>10}{status}"
         )
 
 
@@ -277,12 +302,21 @@ def main():
     with open(manifest_path) as f:
         manifest = json.load(f)
 
+    if manifest.get("recorded_window"):
+        print("Recorded window: raw samples; aggregate device counts and dropped records are unknown.")
+        print(f"Collection verdict: {manifest.get('collection_verdict', 'unknown')}")
+        print(
+            f"Observed losses: host_discarded_args={manifest.get('host_discarded_args', 0)}, "
+            f"metadata_discarded_records={manifest.get('metadata_discarded_records', 0)}"
+        )
+
     # Level 3 names args.bin only when orchestration marked at least one tensor
     # with Arg::dump(). Follow the manifest rather than inferring payload
     # availability from the level.
-    bin_name = manifest.get("bin_file", "args.bin")
+    bin_name = manifest.get("bin_file") if manifest.get("recorded_window") else manifest.get("bin_file", "args.bin")
     bin_path = (dump_dir / bin_name) if bin_name else None
     args_data = manifest.get("args", manifest.get("tensors", []))
+    entry_indices = {id(arg): index for index, arg in enumerate(args_data)}
 
     filtered = _apply_filters(args_data, args)
 
@@ -295,6 +329,13 @@ def main():
         args.export = True  # --index always exports
 
     if not filtered:
+        if (
+            not args_data
+            and manifest.get("recorded_window")
+            and not any([args.task, args.stage, args.role, args.arg is not None])
+        ):
+            print("No samples were exported in this recorded window.")
+            return
         print("No args match the given filters.", file=sys.stderr)
         sys.exit(1)
 
@@ -303,14 +344,19 @@ def main():
 
     if args.export or args.index is not None:
         for arg in filtered:
-            txt_path = export_arg(arg, bin_path, dump_dir)
+            txt_path = export_arg(
+                arg,
+                bin_path,
+                dump_dir,
+                entry_index=entry_indices[id(arg)] if manifest.get("recorded_window") else None,
+            )
             print(f"Saved: {txt_path}")
         print(f"\nExported {len(filtered)} arg(s) to {dump_dir / 'txt/'}")
     else:
         if has_filters:
             print(f"Filtered: {len(filtered)}/{len(args_data)} args")
             print(f"Add --export to save these args to {dump_dir / 'txt/'}\n")
-        list_args(filtered)
+        list_args(filtered, [entry_indices[id(arg)] for arg in filtered])
 
 
 if __name__ == "__main__":

@@ -9,12 +9,14 @@
 # -----------------------------------------------------------------------------------------------------------
 """Graph Execution replays dynamic tensor and scalar bindings across config-keyed definitions."""
 
+import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
 
+@pytest.mark.scheduler_mode("resident")
 @scene_test(level=2, runtime="host_build_graph")
 class TestGraphExecutionHostBuildGraphA5(SceneTestCase):
     RTOL = 1e-5
@@ -77,6 +79,10 @@ class TestGraphExecutionHostBuildGraphA5(SceneTestCase):
         args.output_1[:] = (base + 1.0) * (base + 2.0)
         args.output_3[:] = (base + 100.0) * (base + 4.0)
         args.output_5[:] = (base + 5.0) * (base + 6.0)
+
+    @pytest.mark.platforms(["a5sim"])
+    def test_repeated_aicore_so_load(self, st_platform, st_worker):
+        self._run_and_validate_l2(st_worker, self.build_callable(st_platform), self.CASES[1], rounds=180)
 
 
 if __name__ == "__main__":

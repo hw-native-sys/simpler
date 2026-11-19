@@ -17,6 +17,6 @@ Detection procedures referenced below live in
      --pto-session-timeout <timeout> -v
    ```
 
-   xdist parallelism is auto-enabled via `--max-parallel`; see `docs/testing.md`.
+   xdist parallelism is auto-enabled via `--max-parallel`; see `docs/testing/parallel-execution.md`.
 4. Report the results summary (pass/fail counts).
 5. If any tests fail, show the relevant error output.

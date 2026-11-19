@@ -129,9 +129,14 @@ RunId Orchestrator::begin_run() {
     return run_id;
 }
 
-void Orchestrator::configure_pipeline_depth(uint32_t depth, uint32_t pending_depth, uint32_t launch_depth) {
-    if (depth == 0 || depth > PTO_PIPELINE_MAX_DEPTH) {
+void Orchestrator::configure_pipeline_depth(
+    uint32_t depth, uint32_t pending_depth, uint32_t launch_depth, uint32_t initial_admission_depth
+) {
+    if (depth == 0) {
         throw std::invalid_argument("Orchestrator: pipeline depth is outside the supported range");
+    }
+    if (initial_admission_depth > depth) {
+        throw std::invalid_argument("Orchestrator: initial admission exceeds the directory");
     }
     if (launch_depth == 0 || launch_depth > depth) {
         throw std::invalid_argument("Orchestrator: launch depth must be between one and the pipeline depth");
@@ -140,18 +145,72 @@ void Orchestrator::configure_pipeline_depth(uint32_t depth, uint32_t pending_dep
     if (!runs_.empty() || building_run_id_ != INVALID_RUN_ID || active_run_id_ != INVALID_RUN_ID) {
         throw std::logic_error("Orchestrator: pipeline depth cannot change after admission starts");
     }
-    admission_depth_ = depth;
+    // The arena holds exactly the granted count: a set exists because a run can
+    // hold it, not because a layout reserved room for it.
+    run_resources_.regrant(depth);
+    admission_depth_ = initial_admission_depth == 0 ? depth : initial_admission_depth;
     // Below `depth` is legal: it leaves the successor role unfillable, because
     // that role needs a second FIFO entry to exist, and admission serializes.
     // That is a caller's choice, not an error.
-    pending_run_limit_ = pending_depth == 0 ? depth : pending_depth;
+    pending_run_limit_ = pending_depth == 0 ? admission_depth_ : pending_depth;
+    pending_run_limit_configured_ = pending_depth != 0;
     launch_depth_ = launch_depth;
 }
 
+void Orchestrator::note_endpoint_capacity(int32_t worker_id, uint32_t sets) {
+    if (sets == 0) return;
+    std::lock_guard<std::mutex> lk(runs_mu_);
+    endpoint_capacity_[worker_id] = sets;
+}
+
+uint32_t Orchestrator::folded_endpoint_capacity_locked() const {
+    uint32_t folded = 0;
+    for (const auto &[worker_id, sets] : endpoint_capacity_) {
+        (void)worker_id;
+        if (folded == 0 || sets < folded) folded = sets;
+    }
+    return folded;
+}
+
+bool Orchestrator::apply_admissible_depth_locked(uint32_t sets) {
+    const uint32_t grant = run_resources_.granted();
+    if (grant == 0) return false;
+    const uint32_t clamped = sets == 0 ? 1u : (sets > grant ? grant : sets);
+    const bool widened = clamped > admission_depth_;
+    admission_depth_ = clamped;
+    if (!pending_run_limit_configured_) pending_run_limit_ = clamped;
+    return widened;
+}
+
+void Orchestrator::update_admissible_depth(uint32_t sets) {
+    bool widened = false;
+    {
+        std::lock_guard<std::mutex> lk(runs_mu_);
+        widened = apply_admissible_depth_locked(sets);
+    }
+    // A widening can make a run that is already queued leasable, and nothing
+    // else would announce that. A narrowing needs no notify: it only removes
+    // choices from the next acquisition, and the waiters it affects are already
+    // waiting on a queue that has to drain either way.
+    if (!widened) return;
+    bool leased = false;
+    {
+        std::lock_guard<std::mutex> lk(runs_mu_);
+        leased = refresh_leases_locked();
+    }
+    runs_cv_.notify_all();
+    if (leased && ready_notify_cb_) ready_notify_cb_();
+    activate_fifo_head();
+}
+
+uint32_t Orchestrator::admissible_depth() const {
+    std::lock_guard<std::mutex> lk(runs_mu_);
+    return admission_depth_;
+}
+
 bool Orchestrator::acquire_lease_locked(const std::shared_ptr<RunState> &run, bool *assigned) {
-    if (run->lease_released) return false;
-    if (pipeline_slots_.owns(run->lease)) return true;
-    std::optional<PipelineSlotLease> lease = pipeline_slots_.try_acquire(admission_depth_);
+    if (run_resources_.owns(run->lease)) return true;
+    std::optional<PipelineSlotLease> lease = run_resources_.try_acquire(admission_depth_);
     if (!lease.has_value()) return false;
 
     // Publishing the lease and restamping the slots already registered under it
@@ -237,10 +296,13 @@ void Orchestrator::retire_terminal_run(const std::shared_ptr<RunState> &run) {
         // active or preparable role has the invalid encoding.
         if (!run->lease_released) {
             run->lease_released = true;
-            if (run->lease.generation != 0) pipeline_slots_.release(run->lease);
+            if (run->lease.generation != 0) run_resources_.release(run->lease);
         }
-        // `activate_fifo_head` below returns early while a run is active, which
-        // is exactly the case where a successor handed its lease back.
+        // Every endpoint task has reported before terminal retirement. Apply
+        // the fold under the same lock as FIFO removal, before leasing or
+        // waking a submitter; a smaller capacity must not admit on old proof.
+        const uint32_t folded_capacity = folded_endpoint_capacity_locked();
+        if (folded_capacity != 0) apply_admissible_depth_locked(folded_capacity);
         leased_a_successor = refresh_leases_locked();
         authorized_early_launch = refresh_early_launch_locked();
     }
@@ -268,8 +330,10 @@ void Orchestrator::activate_fifo_head() {
             run.reset();
             return;
         }
+        if (test_hook_) test_hook_(OrchestratorTestPoint::RUN_ACTIVATION_LEASE_ACQUIRED);
         active_run_id_ = run->id;
         run->phase.store(RunPhase::EXECUTING, std::memory_order_release);
+        if (test_hook_) test_hook_(OrchestratorTestPoint::RUN_ACTIVATION_PUBLISHED);
         refresh_leases_locked();
         refresh_early_launch_locked();
     }
@@ -277,6 +341,10 @@ void Orchestrator::activate_fifo_head() {
     // successor blocked in copy_to must wake when it becomes the active run.
     runs_cv_.notify_all();
     if (ready_notify_cb_) ready_notify_cb_();
+    // A fast endpoint may already have ended every member of this successor
+    // while a predecessor still held another endpoint. Promotion is the last
+    // missing condition; no later END event is owed for those members.
+    retire_execution_if_ready(run);
     finish_run_if_ready(run);
 }
 
@@ -289,6 +357,7 @@ void Orchestrator::close_run_submission(RunId run_id) {
         }
         building_run_id_ = INVALID_RUN_ID;
     }
+    if (test_hook_) test_hook_(OrchestratorTestPoint::RUN_CLOSE_BUILDER_RELEASED);
     {
         std::lock_guard<std::mutex> lk(run->completion_mu);
         if (run->submission_closed) {
@@ -296,7 +365,11 @@ void Orchestrator::close_run_submission(RunId run_id) {
         }
         run->submission_closed = true;
         if (run->phase.load(std::memory_order_acquire) == RunPhase::BUILDING) {
-            run->phase.store(RunPhase::PREPARED, std::memory_order_release);
+            if (test_hook_) test_hook_(OrchestratorTestPoint::RUN_CLOSE_PHASE_OBSERVED);
+            // Activation uses runs_mu_, so completion_mu alone cannot protect
+            // this transition from overwriting a concurrent EXECUTING state.
+            RunPhase expected = RunPhase::BUILDING;
+            run->phase.compare_exchange_strong(expected, RunPhase::PREPARED, std::memory_order_acq_rel);
         }
     }
     run->completion_cv.notify_all();
@@ -313,6 +386,7 @@ void Orchestrator::close_run_submission(RunId run_id) {
     }
     if (ready_notify_cb_) ready_notify_cb_();
     activate_fifo_head();
+    retire_execution_if_ready(run);
     finish_run_if_ready(run);
 }
 
@@ -364,11 +438,23 @@ bool Orchestrator::run_accepted(RunId run_id) const {
     return acceptance_ready(run);
 }
 
+void Orchestrator::request_run_observation(const std::shared_ptr<RunState> &run) {
+    if (run->observation_requested.exchange(true, std::memory_order_acq_rel)) return;
+    if (manager_ == nullptr) return;
+    manager_->request_observation(run->id);
+    if (ready_notify_cb_) ready_notify_cb_();
+}
+
 void Orchestrator::wait_run(RunId run_id) {
     auto run = get_run(run_id);
     std::exception_ptr error;
     {
         std::unique_lock<std::mutex> lk(run->completion_mu);
+        if (!is_terminal(run->phase.load(std::memory_order_acquire))) {
+            lk.unlock();
+            request_run_observation(run);
+            lk.lock();
+        }
         run->completion_cv.wait(lk, [&run] {
             return is_terminal(run->phase.load(std::memory_order_acquire));
         });
@@ -378,15 +464,20 @@ void Orchestrator::wait_run(RunId run_id) {
 }
 
 bool Orchestrator::wait_run_for(RunId run_id, double timeout_seconds) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(timeout_seconds);
     auto run = get_run(run_id);
     std::exception_ptr error;
     {
         std::unique_lock<std::mutex> lk(run->completion_mu);
-        if (!run->completion_cv.wait_for(lk, std::chrono::duration<double>(timeout_seconds), [&run] {
-                return is_terminal(run->phase.load(std::memory_order_acquire));
-            })) {
-            return false;
+        if (!is_terminal(run->phase.load(std::memory_order_acquire)) && std::chrono::steady_clock::now() < deadline) {
+            lk.unlock();
+            request_run_observation(run);
+            lk.lock();
         }
+        if (!run->completion_cv.wait_until(lk, deadline, [&run] {
+                return is_terminal(run->phase.load(std::memory_order_acquire));
+            }))
+            return false;
         error = run->first_error;
     }
     if (error) std::rethrow_exception(error);
@@ -395,6 +486,11 @@ bool Orchestrator::wait_run_for(RunId run_id, double timeout_seconds) {
 
 bool Orchestrator::run_done(RunId run_id) const {
     return is_terminal(get_run(run_id)->phase.load(std::memory_order_acquire));
+}
+
+bool Orchestrator::run_observation_requested(RunId run_id) const noexcept {
+    const auto run = find_run(run_id);
+    return run != nullptr && run->observation_requested.load(std::memory_order_acquire);
 }
 
 bool Orchestrator::run_failed(RunId run_id) const {
@@ -407,7 +503,7 @@ bool Orchestrator::dispatchable_locked(RunId run_id) const {
     if (active_run_id_ != run_id) return false;
     auto it = runs_.find(run_id);
     return it != runs_.end() && it->second->phase.load(std::memory_order_acquire) == RunPhase::EXECUTING &&
-           pipeline_slots_.owns(it->second->lease);
+           run_resources_.owns(it->second->lease);
 }
 
 bool Orchestrator::can_dispatch_run(RunId run_id) const {
@@ -441,14 +537,64 @@ std::vector<RunId> Orchestrator::preparable_run_ids() const {
         auto it = runs_.find(run_fifo_[index]);
         if (it == runs_.end()) break;
         if (it->second->phase.load(std::memory_order_acquire) != RunPhase::PREPARED) break;
-        if (!pipeline_slots_.owns(it->second->lease)) break;
+        if (!run_resources_.owns(it->second->lease)) break;
         ids.push_back(it->first);
     }
     return ids;
 }
 
+bool Orchestrator::can_stage_run_on_worker(RunId run_id, int32_t worker_id) const {
+    std::lock_guard<std::mutex> lk(runs_mu_);
+    auto candidate = runs_.find(run_id);
+    if (candidate == runs_.end() || candidate->second->phase.load(std::memory_order_acquire) != RunPhase::PREPARED ||
+        !run_resources_.owns(candidate->second->lease)) {
+        return false;
+    }
+    for (RunId predecessor_id : run_fifo_) {
+        if (predecessor_id == run_id) return true;
+        const auto &predecessor = runs_.at(predecessor_id);
+        std::lock_guard<std::mutex> run_lk(predecessor->completion_mu);
+        if (!predecessor->submission_closed) return false;
+        for (TaskSlot slot : predecessor->task_slots) {
+            const TaskSlotState *task = allocator_->slot_state(slot);
+            if (task == nullptr) continue;
+            const TaskState state = task->state.load(std::memory_order_acquire);
+            if (state != TaskState::PENDING && state != TaskState::READY && state != TaskState::BUILDING) continue;
+            if (task->worker_type == WorkerType::NEXT_LEVEL &&
+                std::find(task->target_worker_ids.begin(), task->target_worker_ids.end(), worker_id) !=
+                    task->target_worker_ids.end()) {
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
 std::vector<RunId> Orchestrator::early_launch_run_ids() const {
     std::lock_guard<std::mutex> lk(runs_mu_);
+    return early_launch_prefix_locked();
+}
+
+bool Orchestrator::run_activation_authorized(RunId run_id) const noexcept {
+    try {
+        std::lock_guard<std::mutex> lk(runs_mu_);
+        if (dispatchable_locked(run_id)) return true;
+        if (launch_depth_ < 2 || !dispatchable_locked(active_run_id_) || run_fifo_.size() < 2 ||
+            run_fifo_.front() != active_run_id_) {
+            return false;
+        }
+        for (size_t index = 0; index + 1 < run_fifo_.size() && index + 1 < launch_depth_; ++index) {
+            const RunId candidate = early_launch_successor_locked(index);
+            if (candidate == INVALID_RUN_ID) break;
+            if (candidate == run_id) return true;
+        }
+    } catch (...) {
+        // Losing overlap is preferable to stranding an explicit observer.
+    }
+    return false;
+}
+
+std::vector<RunId> Orchestrator::early_launch_prefix_locked() const {
     std::vector<RunId> ids;
     if (launch_depth_ < 2) return ids;
     if (!dispatchable_locked(active_run_id_) || run_fifo_.size() < 2 || run_fifo_.front() != active_run_id_) {
@@ -459,14 +605,9 @@ std::vector<RunId> Orchestrator::early_launch_run_ids() const {
     // to be ordered behind. The walk stops at the first run that fails either
     // test, so an authorization never skips a run.
     for (size_t index = 0; index + 1 < run_fifo_.size() && ids.size() + 1 < launch_depth_; ++index) {
-        auto predecessor = runs_.find(run_fifo_[index]);
-        if (predecessor == runs_.end() || !all_dispatches_accepted(predecessor->second)) break;
-        auto candidate = runs_.find(run_fifo_[index + 1]);
-        if (candidate == runs_.end()) break;
-        const std::shared_ptr<RunState> &successor = candidate->second;
-        if (successor->phase.load(std::memory_order_acquire) != RunPhase::PREPARED) break;
-        if (!pipeline_slots_.owns(successor->lease)) break;
-        ids.push_back(successor->id);
+        const RunId successor = early_launch_successor_locked(index);
+        if (successor == INVALID_RUN_ID) break;
+        ids.push_back(successor);
     }
     return ids;
 }
@@ -478,7 +619,7 @@ RunId Orchestrator::preparable_run_id() const {
     }
     auto it = runs_.find(run_fifo_[1]);
     if (it == runs_.end() || it->second->phase.load(std::memory_order_acquire) != RunPhase::PREPARED ||
-        !pipeline_slots_.owns(it->second->lease)) {
+        !run_resources_.owns(it->second->lease)) {
         return INVALID_RUN_ID;
     }
     return it->first;
@@ -498,31 +639,52 @@ bool Orchestrator::all_dispatches_accepted(const std::shared_ptr<RunState> &run)
 }
 
 bool Orchestrator::refresh_early_launch_locked() {
-    if (launch_depth_ < 2) {
-        early_launch_run_id_ = INVALID_RUN_ID;
-        return false;
+    // The whole authorized prefix, not one latched successor: at a launch depth
+    // above two several runs are authorized at once, and a single id could name
+    // only the first of them. The prefix is recomputed rather than remembered,
+    // so every reader gets the current answer; what is kept here is only what
+    // was already authorized, to decide which transitions owe a wake.
+    std::vector<RunId> authorized = early_launch_prefix_locked();
+    bool newly_authorized = false;
+    for (RunId run_id : authorized) {
+        if (std::find(early_launch_authorized_.begin(), early_launch_authorized_.end(), run_id) ==
+            early_launch_authorized_.end()) {
+            newly_authorized = true;
+            break;
+        }
     }
-    const RunId held = early_launch_run_id_;
-    early_launch_run_id_ = INVALID_RUN_ID;
-    if (!dispatchable_locked(active_run_id_) || run_fifo_.size() < 2 || run_fifo_.front() != active_run_id_) {
-        return false;
-    }
-    auto active = runs_.find(active_run_id_);
-    if (active == runs_.end() || !all_dispatches_accepted(active->second)) return false;
-    auto candidate = runs_.find(run_fifo_[1]);
-    if (candidate == runs_.end()) return false;
-    const std::shared_ptr<RunState> &successor = candidate->second;
-    if (successor->phase.load(std::memory_order_acquire) != RunPhase::PREPARED) return false;
-    if (!pipeline_slots_.owns(successor->lease)) return false;
-    early_launch_run_id_ = successor->id;
+    early_launch_authorized_ = std::move(authorized);
     // Only a *new* authorization owes a wake. Re-deriving the same answer on
-    // every transition would otherwise wake the scheduler for nothing.
-    return held != early_launch_run_id_;
+    // every transition would otherwise wake the scheduler for nothing, and a
+    // prefix that only shrank as its head retired authorizes nobody new.
+    return newly_authorized;
 }
 
 RunId Orchestrator::early_launch_run_id() const {
     std::lock_guard<std::mutex> lk(runs_mu_);
-    return early_launch_run_id_;
+    return early_launch_first_locked();
+}
+
+RunId Orchestrator::early_launch_first_locked() const {
+    if (launch_depth_ < 2 || !dispatchable_locked(active_run_id_) || run_fifo_.size() < 2 ||
+        run_fifo_.front() != active_run_id_) {
+        return INVALID_RUN_ID;
+    }
+    return early_launch_successor_locked(0);
+}
+
+RunId Orchestrator::early_launch_successor_locked(size_t predecessor_index) const {
+    if (predecessor_index + 1 >= run_fifo_.size()) return INVALID_RUN_ID;
+    auto predecessor = runs_.find(run_fifo_[predecessor_index]);
+    if (predecessor == runs_.end() || !all_dispatches_accepted(predecessor->second)) return INVALID_RUN_ID;
+    auto candidate = runs_.find(run_fifo_[predecessor_index + 1]);
+    if (candidate == runs_.end()) return INVALID_RUN_ID;
+    const std::shared_ptr<RunState> &successor = candidate->second;
+    if (successor->phase.load(std::memory_order_acquire) != RunPhase::PREPARED ||
+        !run_resources_.owns(successor->lease)) {
+        return INVALID_RUN_ID;
+    }
+    return successor->id;
 }
 
 void Orchestrator::compact_if_quiescent() {
@@ -566,13 +728,19 @@ void Orchestrator::release_run(RunId run_id) {
 #endif
 }
 
-void Orchestrator::register_run_slot(const std::shared_ptr<RunState> &run, TaskSlot slot) {
+void Orchestrator::register_run_slot(const std::shared_ptr<RunState> &run, TaskSlot slot, size_t members) {
     std::lock_guard<std::mutex> lk(run->completion_mu);
     // Registration and the identity stamp are one step, paired with the
     // publication in `acquire_lease_locked`: whichever of the two runs second
     // sees the other's effect.
     TaskSlotState *state = allocator_->slot_state(slot);
     if (state != nullptr) state->pipeline_lease = run->lease;
+    // Allocate both ledgers before publishing ownership. END/terminal progress
+    // only sets existing member bytes, including under allocation pressure.
+    RunState::PhysicalTask physical{slot, std::vector<uint8_t>(members, 0)};
+    run->task_slots.reserve(run->task_slots.size() + 1);
+    run->physical_tasks.reserve(run->physical_tasks.size() + 1);
+    run->physical_tasks.push_back(std::move(physical));
     run->task_slots.push_back(slot);
     run->active_tasks.fetch_add(1, std::memory_order_relaxed);
 }
@@ -738,6 +906,47 @@ size_t Orchestrator::begin_run_waiter_count_for_test() const {
 void Orchestrator::report_task_error(TaskSlot slot, const std::string &message) {
     TaskSlotState &task = slot_state(slot);
     record_run_error(task.run_id, std::make_exception_ptr(std::runtime_error(message)));
+}
+
+bool Orchestrator::execution_ended_locked(const RunState &run) {
+    if (!run.submission_closed) return false;
+    for (const auto &task : run.physical_tasks)
+        for (uint8_t ended : task.ended_members)
+            if (!ended) return false;
+    return true;
+}
+
+void Orchestrator::retire_execution_if_ready(const std::shared_ptr<RunState> &run) {
+    {
+        std::lock_guard<std::mutex> lk(run->completion_mu);
+        if (!execution_ended_locked(*run)) return;
+        const auto phase = run->phase.load(std::memory_order_acquire);
+        if (phase != RunPhase::EXECUTING && !run->submission_failed) return;
+    }
+    retire_terminal_run(run);
+}
+
+void Orchestrator::mark_task_ended(TaskSlot slot, int32_t group_index) {
+    const TaskSlotState *task = allocator_->slot_state(slot);
+    if (task == nullptr) return;
+    auto run = find_run(task->run_id);
+    if (run == nullptr) return;
+    {
+        std::lock_guard<std::mutex> lk(run->completion_mu);
+        auto physical = std::find_if(run->physical_tasks.begin(), run->physical_tasks.end(), [slot](const auto &entry) {
+            return entry.slot == slot;
+        });
+        if (physical == run->physical_tasks.end()) return;
+        if (group_index < 0) {
+            // Existing semantic consumption also covers cancelled unsubmitted
+            // tasks and skipped group members; it does not imply early END.
+            std::fill(physical->ended_members.begin(), physical->ended_members.end(), 1);
+        } else {
+            if (static_cast<size_t>(group_index) >= physical->ended_members.size()) return;
+            physical->ended_members[static_cast<size_t>(group_index)] = 1;
+        }
+    }
+    retire_execution_if_ready(run);
 }
 
 void Orchestrator::mark_task_accepted(TaskSlot slot) {
@@ -990,7 +1199,7 @@ SubmitResult Orchestrator::submit_impl(
     s.state.store(TaskState::BUILDING, std::memory_order_release);
     try {
         if (test_hook_) test_hook_(OrchestratorTestPoint::SUBMIT_RUN_SLOT_REGISTERING);
-        register_run_slot(run, slot);
+        register_run_slot(run, slot, args_list.size());
     } catch (...) {
         // The run never acquired this slot, so cancellation cannot discover
         // it. Return the combined slot/HeapRing reservation directly.
@@ -1488,12 +1697,16 @@ void Orchestrator::infer_deps(
                     TensorAddressKind kind = desc.address_space == RemoteAddressSpace::HOST_INLINE ?
                                                  TensorAddressKind::HOST_INLINE :
                                                  TensorAddressKind::REMOTE_BUFFER;
-                    // A remote key already carries the view's offset, so every entry under one
-                    // of them denotes the same origin and a footprint adds nothing; the default
-                    // whole-backing one keeps this path's behaviour exactly as it was.
+                    const bool inline_payload = desc.address_space == RemoteAddressSpace::HOST_INLINE;
                     key = TensorKey::remote_buffer(
-                        kind, desc.owner_worker_id, desc.buffer_id, desc.generation, desc.offset
+                        kind, desc.owner_worker_id, desc.buffer_id, desc.generation, inline_payload ? desc.offset : 0
                     );
+                    if (!inline_payload) {
+                        view = tensor_footprint(r);
+                        // Imported ranges use the owner's byte origin, not the import's local origin.
+                        view.byte_offset = desc.offset;
+                        view.backing_nbytes = tensor_add_sat(desc.offset, desc.nbytes);
+                    }
                     has_key = true;
                 }
             }
@@ -1597,6 +1810,7 @@ bool Orchestrator::on_consumed(TaskSlot slot) {
     }
 
     RunId run_id = s.run_id;
+    mark_task_ended(slot);
     tensormap_->erase_task_outputs(run_id, slot, s.output_keys);
 
     // HeapRing-owned OUTPUT slabs are reclaimed implicitly when the allocator

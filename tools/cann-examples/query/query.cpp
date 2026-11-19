@@ -34,8 +34,9 @@
 
 #include <acl/acl.h>
 #include <driver/ascend_hal_base.h>
-#include <driver/dsmi_common_interface.h>
 #include <runtime/rt.h>
+
+#include "aicpu_topology_driver.h"  // Selected DSMI declarations and topology ABI.
 
 #include <cstdint>
 #include <cstdio>
@@ -207,40 +208,18 @@ const char *arch_from_short_soc(const std::string &short_soc) {
 //     therefore intentionally NOT queried below.
 //   * AICORE+DIE_NUM is meaningful on a5 (device = 2 dies) but returns
 //     FAILED on a3 (device = 1 die); we attempt it and skip on failure.
-//   * CPU_TOPO is undocumented in public CANN; HAL path fails on a3 and a5
-//     in our tests, DSMI path works on a5 and fails on a3. We try both and
-//     print whichever succeeds.
+//   * CANN 9.3 names CPU_TOPO in its HAL driver header and the HAL path
+//     works on a5. The DSMI fallback also works on a5; both fail on a3.
+//     We print whichever succeeds.
 
-// CPU_TOPO struct + constants are not in CANN's public headers.
-constexpr int kMaxCpuTopoNum = 64;
-#ifndef INFO_TYPE_CPU_TOPO
-constexpr int INFO_TYPE_CPU_TOPO = 59;
-#endif
-#ifndef DSMI_SOC_INFO_SUB_CMD_CPU_TOPO
-constexpr unsigned int DSMI_SOC_INFO_SUB_CMD_CPU_TOPO = 2;
-#endif
-
-struct single_cpu_topology_info {
-    unsigned long long cpu_mask;
-    unsigned char cpu_id;
-    unsigned char is_share;
-    unsigned char phy_cpu_id;
-    unsigned char hyperthread_id;
-};
-
-struct cpu_topology_info {
-    unsigned int total_nums;
-    single_cpu_topology_info single_cpu_topo[kMaxCpuTopoNum];
-};
-
-void print_cpu_topo(const cpu_topology_info &topo) {
+void print_cpu_topo(const pto::driver::CpuTopology &topo) {
     printf(
         "  cpu_topo (logical): %-16u  # AICPU logical CPUs visible to driver (physical + hyperthread)\n",
         topo.total_nums
     );
-    unsigned n = topo.total_nums < kMaxCpuTopoNum ? topo.total_nums : kMaxCpuTopoNum;
+    unsigned n = topo.total_nums < pto::driver::kCpuTopoCapacity ? topo.total_nums : pto::driver::kCpuTopoCapacity;
     for (unsigned i = 0; i < n; ++i) {
-        const auto &c = topo.single_cpu_topo[i];
+        const auto &c = topo.single_cpu_topo_info[i];
         printf(
             "    cpu_id=%u phy_cpu_id=%u hyperthread_id=%u is_share=%u cpu_mask=0x%llx\n",
             static_cast<unsigned>(c.cpu_id), static_cast<unsigned>(c.phy_cpu_id),
@@ -305,15 +284,16 @@ void print_hal_extras(uint32_t devu) {
     }
 
     // CPU topology — try HAL first, fall back to DSMI.
-    cpu_topology_info topo = {};
+    pto::driver::CpuTopology topo{};
     bool got_topo = false;
     {
         int32_t sz = sizeof(topo);
-        if (halGetDeviceInfoByBuff(devu, MODULE_TYPE_SYSTEM, INFO_TYPE_CPU_TOPO, &topo, &sz) == 0) got_topo = true;
+        if (halGetDeviceInfoByBuff(devu, MODULE_TYPE_SYSTEM, pto::driver::kCpuTopoHalInfoType, &topo, &sz) == 0)
+            got_topo = true;
     }
     if (!got_topo) {
         unsigned int sz = sizeof(topo);
-        if (dsmi_get_device_info(devu, DSMI_MAIN_CMD_SOC_INFO, DSMI_SOC_INFO_SUB_CMD_CPU_TOPO, &topo, &sz) == 0) {
+        if (dsmi_get_device_info(devu, DSMI_MAIN_CMD_SOC_INFO, pto::driver::kCpuTopoDsmiSubcommand, &topo, &sz) == 0) {
             got_topo = true;
         }
     }

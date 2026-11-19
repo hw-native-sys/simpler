@@ -58,12 +58,12 @@ def _ensure_torch_map():
         torch.uint32: DataType.UINT32,
     }
     # MX low-precision dtypes — A5 only (consumed by the A5-only pto.tquant.mx /
-    # tmatmul.mx ops). MX paths use E4M3FN (+ E8M0 scale) and packed E2M1;
-    # FP8E5M2 is not registered. float8_e4m3fn needs torch >= 2.1;
+    # tmatmul.mx ops). float8_e4m3fn and float8_e5m2 need torch >= 2.1;
     # float8_e8m0fnu needs >= 2.7; float4_e2m1fn_x2 needs a recent torch.
     # Guard with getattr so an older torch silently skips the ones it lacks.
     for _torch_dt_name, _sim_dt in (
         ("float8_e4m3fn", DataType.FP8E4M3FN),  # A5 only
+        ("float8_e5m2", DataType.FP8E5M2),  # A5 only
         ("float8_e8m0fnu", DataType.FP8E8M0),  # A5 only
         ("float4_e2m1fn_x2", DataType.FP4E2M1),  # A5 only
     ):

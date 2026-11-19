@@ -97,14 +97,14 @@ class TestHbgSingleAicSpmdLegacyFallback(TestHbgSingleAicRoot):
     CALLABLE = {
         **TestHbgSingleAicRoot.CALLABLE,
         "orchestration": {
-            "source": "kernels/orchestration/single_aic_spmd_fallback_orch.cpp",
+            "source": "kernels/orchestration/single_aic_spmd_orch.cpp",
             "function_name": "aicpu_orchestration_entry",
             "signature": [D.INOUT],
         },
     }
     CASES = [
         {
-            "name": "single_aic_spmd_legacy_fallback",
+            "name": "single_aic_spmd",
             "platforms": ["a5sim", "a5"],
             "params": {},
         },

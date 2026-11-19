@@ -179,9 +179,9 @@ Provides:
   to `Derived::on_buffer_collected`, then calls
   `manager_.notify_copy_done(...)` itself; its idle-timeout detector reports
   stalled traffic but keeps the consumer alive until execution completes.
-- `set_memory_context` / `clear_memory_context` so `Derived::init` can
-  stash the alloc/reg/free callbacks before threads start; if init aborts
-  before stashing, `start(tf)` becomes a no-op.
+- `set_memory_context` / `publish_shared_memory` / `clear_memory_context`
+  separate callback binding from successful resource publication. A failed
+  init leaves the region unpublished, so `start(tf)` remains a no-op.
 
 `ProfilerAlgorithms<Module>` (in the same
 [profiler_base.h](../../src/common/platform/include/host/profiler_base.h))
@@ -283,10 +283,18 @@ and only has to provide:
 - `static constexpr const char* kSubsystemName` — appears in the idle
   timeout log line (e.g. `"PMU"`, `"ChipSwimlane"`, `"ArgsDump"`).
 - `init(...)` and `finalize(...)` — domain-specific setup/teardown.
-  `init` must call `set_memory_context()` on the success path so
-  `start(tf)` is not a no-op. `finalize` must release framework-owned
-  buffers (`release_owned_buffers`) and drop the mapping table
-  (`clear_mappings`).
+  `init` binds callbacks with `set_memory_context()` and null shared-memory
+  pointers before acquiring resources. `InitRollbackGuard` rolls back failed
+  initialization; `publish_shared_memory()` publishes the region only after
+  success. Allocation exceptions are translated to the initialization error
+  code after rollback. `finalize` releases resources through
+  `release_one_buffer()` using its current callbacks, then calls
+  `clear_mappings()`. The manager records actual HAL registration state per
+  resource: host-visible buffers can be HAL-mapped, identity-mapped or paired
+  with a malloc shadow; device-only allocations such as A5 PMU rings have no
+  host view and are never unregistered. A missing required release callback
+  preserves resources for a later finalize attempt. Callback failures latch
+  `release_unproven()` instead of declaring an emptied pool clean.
 
 ### 3.5 `DeviceProfilerEngine<Module>` — AICPU producer algorithm layer
 
@@ -382,14 +390,16 @@ the hot SPSC path and is released at teardown.
 
 ```text
   Derived::init(...)
-    rtMalloc + register pre-allocated buffers
-    register_mapping for each (dev, host) pair
-    set_memory_context(alloc_cb, register_cb, free_cb, ud, shm_host, device_id)
+    set_memory_context(alloc_cb, register_cb, free_cb, copy_to, copy_from,
+                       nullptr, nullptr, 0, device_id, allocation_unregister_cb)
+    construct InitRollbackGuard
+    allocate host-visible or device-only resources; track actual registration
+    initialize and upload shared state, checking every error
+    guard.commit()
+    publish_shared_memory(shm_dev, shm_host, shm_size)
 
   ProfilerBase::start(thread_factory)
-    assemble MemoryOps from stashed callbacks (sim mode installs an
-      identity reg wrapper so register == nullptr is supported uniformly)
-    manager_.set_memory_context(ops, shm_host, device_id)
+    use the MemoryOps already bound by init (SVM identity or non-SVM shadow)
     spawn drain mgmt thread(s)
     spawn replenish mgmt thread
                               ← started first; mgmt writes host ready shards
@@ -434,7 +444,7 @@ mid-run by the framework.
 | `recycled_[shard][kind]` | drain shard at runtime | replenish | fixed-capacity SPSC ring; startup code may pop any shard before threads start |
 | `retired_[shard][kind]` | teardown | exceptional fallback paths | mutex-protected holding pool; not used by the hot recycle path |
 | `dev_to_host_` / block ranges | drain shards (`resolve_host_ptr`) | init/startup allocation, runtime replenish, teardown | shared `mapping_mutex_` for resolution; exclusive `mapping_mutex_` for mutation |
-| `MemoryOps` / `shared_mem_host_` / `device_id_` | both threads | start-only | `set_memory_context` is called once before threads spawn; read-only afterwards |
+| `MemoryOps` / `shared_mem_host_` / `device_id_` | both threads | init-only | `set_memory_context` is called once before threads spawn; read-only afterwards |
 | AICPU per-thread ready queues (`header->queues[q]`) | mgmt (head advance) | AICPU (tail advance) | `read_range_from_device` in split drain, then `write_range_to_device` for `queue_heads[q]` |
 | Per-instance `FreeQueue` | AICPU (head advance) | owning drain shard (tail advance) | SPSC ownership; host refreshes `head` before writing `buffer_ptrs[]` / `tail` |
 
@@ -478,9 +488,9 @@ Two things follow:
    unusual cross-core protocols local unless their semantics match the
    standard engine contract.
 4. Write a `XxxCollector : public profiling_common::ProfilerBase<XxxCollector, XxxModule>`:
-   - `init(...)`: `rtMalloc` + register pre-allocated buffers, populate
-     the shared header, call `register_mapping` per buffer, then call
-     `set_memory_context(...)`.
+   - `init(...)`: bind callbacks with null shared-memory pointers, construct
+     an `InitRollbackGuard`, acquire tracked resources, populate and upload
+     the shared state, then commit and publish the shared-memory region.
    - `on_buffer_collected(info)`: copy records out of
      `info.host_buffer_ptr`. **Do not** call `notify_copy_done`.
    - `kIdleTimeoutSec`, `kSubsystemName`.

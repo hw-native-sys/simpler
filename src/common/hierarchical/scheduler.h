@@ -99,6 +99,9 @@ public:
         // `preparable_run_cb`; the single-run form stays for callers that only
         // ever have one.
         std::function<std::vector<RunId>()> preparable_runs_cb;
+        // An earlier run's undispatched work on this endpoint must precede a
+        // staged successor in the endpoint's dispatch-id FIFO.
+        std::function<bool(RunId, int32_t)> can_stage_run_on_worker_cb;
         // Every staged successor authorized to launch early, in FIFO order.
         std::function<std::vector<RunId>()> early_launch_runs_cb;
         // The staged successor authorized to launch its device work while the
@@ -107,6 +110,12 @@ public:
         std::function<RunId()> early_launch_run_cb;
         // Called when a task reaches CONSUMED (TensorMap cleanup + ring release).
         std::function<void(TaskSlot)> on_consumed_cb;
+        /**
+         * What one endpoint reports it can hold, taken where that endpoint's
+         * identity is still in hand. Optional: unset on every route whose
+         * endpoints do not size themselves.
+         */
+        std::function<void(int32_t, uint32_t)> note_endpoint_capacity_cb;
         // Called as soon as an endpoint reports failure so the error is
         // attached to the task's run even when a group has other members live.
         std::function<void(TaskSlot, const std::string &)> on_task_failed_cb;

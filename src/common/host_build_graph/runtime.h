@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <memory>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -37,21 +38,24 @@
 #include <vector>
 
 #include "common/core_type.h"
+#include "common/device_phase.h"
 #include "common/host_phase_kind.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
+#include "callable_limits.h"
+#include "core_async_capability.h"
 #include "task_args.h"
 #include "aicore_teardown.h"
 #include "common/launch_entry_args.h"     // LaunchEntryArgsPlan
 #include "host_build_graph/entry_args.h"  // EntryArgsStorage
 #include "utils/tensor_lease.h"
+#include "host/scope_stats_capacity.h"
 
 // =============================================================================
 // Configuration Macros
 // =============================================================================
 
 #define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES
-#define RUNTIME_MAX_FUNC_ID 1024
 
 // The AICore compiler defines these; host and AICPU builds compile the same
 // declarations with them empty. Mirrors the guard in the a5 scheduler's
@@ -100,7 +104,8 @@
  *   it. The host publishes the selected mode in
  *   DeviceRuntimeLaunchDesc::scheduler_bootstrap, not here
  * - aicore_done: Written by AICore, read by AICPU (final report; physical_core_id
- *   and core_type are published alongside it in the same write)
+ *   and core_type are published alongside it in the same write). AICPU clears
+ *   this marker and aicpu_ready only after acknowledged retirement.
  * - task: Written by AICPU before window-open, read by AICore after window-open.
  *   On a5 the AICPU publishes it again at resident hand-off; the AICore's
  *   pre-READY context address comes from scheduler_bootstrap instead
@@ -120,13 +125,15 @@ struct Handshake {
     volatile CoreType core_type;    // Core type: CoreType::AIC or CoreType::AIV (reported by AICore with aicore_done)
     volatile uint32_t physical_core_id;  // Physical core ID (reported by AICore with aicore_done)
     volatile uint64_t report_epoch;      // Commit marker for a native program run's report; 0 = unstamped
+    volatile uint64_t work_start_cycle;  // First business kernel on this core; zero when no kernel executed
+    volatile uint64_t work_end_cycle;    // Last business kernel on this core, after its output store barrier
 } __attribute__((aligned(64)));
 
 // The AICore owns this line's writeback: it flushes the whole line with
 // dcci(..., CACHELINE_OUT) on its report and again on exit. A word the AICPU
 // must publish independently cannot live here — a stale line writeback would
 // overwrite it. The post-close return gates live in
-// Runtime::teardown_gates, one isolated line each on both platforms.
+// Runtime::teardown_gates, one AICPU-owned request/release line per worker on both platforms.
 static_assert(sizeof(Handshake) == 64);
 static_assert(std::is_standard_layout_v<Handshake> && std::is_trivially_copyable_v<Handshake>);
 // The payload offsets are the device-side wire contract: AICore writes them and
@@ -139,6 +146,22 @@ static_assert(offsetof(Handshake, task) == 8);
 static_assert(offsetof(Handshake, core_type) == 16);
 static_assert(offsetof(Handshake, physical_core_id) == 20);
 static_assert(offsetof(Handshake, report_epoch) == 24);
+static_assert(offsetof(Handshake, work_start_cycle) == 32);
+static_assert(offsetof(Handshake, work_end_cycle) == 40);
+
+// Read only after every core has retired. Missing endpoints invalidate the
+// whole window. A business-kernel window may explicitly exclude idle cores
+// with two zero endpoints; a half-written pair remains invalid.
+inline bool
+aicore_reduce_work_window(const Handshake *reports, int count, AicoreWorkWindow &out, bool allow_idle = false) {
+    out = {};
+    if (reports == nullptr || count <= 0) return false;
+    AicoreWorkWindowAccumulator summary;
+    for (int i = 0; i < count; ++i) {
+        summary.add(reports[i].work_start_cycle, reports[i].work_end_cycle);
+    }
+    return summary.finish(out, allow_idle);
+}
 
 /**
  * Whether `handshake` carries a report this run may act on.
@@ -151,12 +174,22 @@ static_assert(offsetof(Handshake, report_epoch) == 24);
  *
  * A kernel/persistent launch passes 0 and keeps the original predicate: its
  * producer writes no stamp, and its per-run reset is what makes `aicore_done`
- * meaningful. Accepting the epoch here does not order the payload reads that
+ * meaningful. HBG invalidates retired reports before serial reuse, including
+ * replays with an unchanged epoch. Accepting the epoch does not order the payload reads that
  * follow — the caller's existing `rmb()` does that.
  */
 inline bool aicore_report_accepted(const volatile Handshake *handshake, uint64_t expected_epoch) {
     if (handshake->aicore_done == 0) return false;
     return expected_epoch == 0 || handshake->report_epoch == expected_epoch;
+}
+
+/** Retire a report only after its core's final writeback and exit ACK.
+ * The caller owns cache publication and excludes the next execution until it
+ * completes. Payload and identity remain available for post-run diagnostics.
+ */
+inline void aicore_invalidate_retired_report(Handshake *handshake) {
+    handshake->aicore_done = 0;
+    handshake->aicpu_ready = 0;
 }
 
 /**
@@ -192,8 +225,8 @@ inline __aicore__ void aicore_stage_native_report(
  * the address the AICPU republishes at hand-off.
  *
  * `runtime_mode` is 0 until a run publishes a choice: a zero is "no scheduler
- * selected", not a selection, and every supported fallback is published
- * explicitly. `worker_context_base` is the device address of worker 0's
+ * selected", not a selection. A5 HBG accepts only resident modes.
+ * `worker_context_base` is the device address of worker 0's
  * SchedulerWorkerContext, so worker i's context is
  * `worker_context_base + i * sizeof(SchedulerWorkerContext)`; it is 0 whenever
  * the mode is not resident.
@@ -276,6 +309,7 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // to AICore. The highest-index thread additionally performs the one-time
     // host-orch boot (attach SM, latch task count) before it starts dispatching.
     int aicpu_thread_num;
+    uint64_t ccu_workspace_addr;
 
     // Filter-style affinity gate input (a2a3 onboard). Host fills these
     // before launch from AICPU OCCUPY, and the device gate keeps threads whose
@@ -322,7 +356,11 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     uint64_t graph_section_base;
     uint32_t graph_section_bytes;
     uint32_t graph_section_source;
-    uint32_t graph_section_reserved[12];
+    // Per-invocation granularity travels in every descriptor publication.
+    uint32_t chip_swimlane_level;
+    uint32_t pmu_event_type;   // PmuEventType; zero while PMU is disabled.
+    uint32_t dump_args_level;  // DumpArgsLevel; zero while argument dumping is disabled.
+    uint32_t graph_section_reserved[9];
 
     // Size of the shipped shared-memory image, argument pools included. Set by the
     // host before the image is copied; the AICPU cannot recompute it because the pool
@@ -358,8 +396,8 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // Separate from workers[] because the AICore flushes its whole Handshake
     // line, which would overwrite a gate sharing it.
     //
-    // Last, and outside both the uploaded prefix and the initialized prefix: on
-    // both platforms the AICPU zeroes every active entry in `pre_handshake_init` and
+    // Last, and outside both the uploaded prefix and the initialized prefix: the
+    // AICPU resets the active controls in `pre_handshake_init` and
     // executes `wmb()` before it publishes `hs_setup_done_`, and no register
     // window opens before that publication, so the meaningful initial value is
     // produced on the device ahead of every read of it. No host-supplied gate
@@ -367,6 +405,9 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // initialized — `Runtime()` does not touch it — so no host copy may reach
     // this range. `device_initialized_prefix_bytes()` ends where this array
     // begins; the allocation still covers it.
+    // Each 64-byte control is written only by AICPU and cleared before READY
+    // or EXIT. AICore bypass-loads the request and returns its nonce in COND;
+    // it never caches or writes the control.
     AicoreTeardownControl teardown_gates[RUNTIME_MAX_WORKER];
 };
 
@@ -445,6 +486,7 @@ private:
         // the first is a host pointer, and because the host lookup must not
         // reach for the device address `dev` carries.
         const uint64_t *callable_table_host_;
+        const CoreAsyncCapability *callable_async_capabilities_;
         uint64_t callable_entry_table_addr_;
 
         // Host-side tensor ledger for the run's H2D and D2H transfers.
@@ -483,8 +525,10 @@ private:
             uint64_t tensor_elems;
             uint64_t scalar_elems;
             std::vector<MetadataRegion> prerequisites;
+            std::vector<std::shared_ptr<const void>> resources;
         };
         RunImagePublication pending_publication_;
+        std::shared_ptr<const RunImagePublication> prepared_publication_;
     };
     HostOnlyState host_;
 
@@ -534,6 +578,7 @@ public:
         void *device_target, const void *source, uint64_t bytes, uint64_t fanin_elems, uint64_t tensor_elems,
         uint64_t scalar_elems
     ) {
+        host_.prepared_publication_.reset();
         auto &pending = host_.pending_publication_;
         pending.device_target = device_target;
         pending.source = source;
@@ -550,13 +595,31 @@ public:
             {target, source, bytes, phase, std::move(attributes), std::move(storage)}
         );
     }
+    void retain_pending_resource(std::shared_ptr<const void> resource) {
+        host_.pending_publication_.resources.push_back(std::move(resource));
+    }
+    using RunImagePublication = HostOnlyState::RunImagePublication;
+    void restore_pending_publication(RunImagePublication publication) {
+        host_.pending_publication_ = std::move(publication);
+    }
     auto take_pending_publication() { return std::exchange(host_.pending_publication_, {}); }
     void clear_pending_publication() { host_.pending_publication_ = {}; }
+
+    // Large image bytes remain in their leased backing. Prerequisite values
+    // already belong to staged launch metadata; retain no duplicate sources.
+    void retain_prepared_publication(RunImagePublication publication) {
+        publication.prerequisites.clear();
+        host_.prepared_publication_ = std::make_shared<const RunImagePublication>(std::move(publication));
+    }
+    std::shared_ptr<const RunImagePublication> prepared_publication() const { return host_.prepared_publication_; }
+    void clear_prepared_publication() { host_.prepared_publication_.reset(); }
 
     /**
      * Constructor - zero-initialize all arrays
      */
     Runtime();
+
+    simpler::dfx::scope_stats_runs::CapacityMetadata scope_stats_capacity() const { return {false, std::nullopt}; }
 
     // =========================================================================
     // Accessors for the execution-parameter fields
@@ -650,6 +713,8 @@ public:
      * the descriptor carries is never dereferenced here.
      */
     uint64_t get_function_bin_addr(int func_id) const;
+    CoreAsyncCapability get_function_async_capability(int func_id) const;
+    bool bind_callable_async_capabilities(const struct HostApi &api);
 
     /**
      * Bind this run to one registration-owned function-table pair.

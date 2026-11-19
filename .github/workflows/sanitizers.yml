@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   sanitizer-sim:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     # Both ASAN and TSAN gate (no continue-on-error). They run different scopes:
     # ASAN (~1.7x) takes the broader set with --max-parallel 2; TSAN (~5-15x)

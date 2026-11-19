@@ -2,9 +2,10 @@
 
 ← [Device Error Codes](../device-error-codes.md)
 
-Four codes and three stall sub-classes have no ST — not from neglect, but because
-they cannot be provoked. Recording why, so the next person does not re-derive it
-(the argument lives in `tests/st/runtime_fatal_codes/test_runtime_fatal_codes.py`):
+The entries below describe missing end-to-end scene coverage, including
+runtime-specific gaps. Code 1 is tested in TMR; its entry applies only to HBG.
+Reachability and narrower regression coverage are recorded here (the defensive
+branches are also discussed in `tests/st/runtime_fatal_codes/test_runtime_fatal_codes.py`):
 
 - **103 ASYNC_REGISTRATION_FAILED** is structurally pre-empted. The AICore side caps
   at `MAX_COMPLETIONS_PER_TASK` (64) and latches **102** on the 65th condition, so
@@ -25,6 +26,14 @@ they cannot be provoked. Recording why, so the next person does not re-derive it
 - **11 TENSORMAP_OVERFLOW** needs the 65536-entry pool (`CHIP_TENSORMAP_POOL_SIZE`,
   compile-time, not tunable via `runtime_env`) flooded *and* a stalled producer
   holding entries.
+- **S3 ready-but-all-idle**: no stable public-API reproducer after orchestration-side
+  dependency wiring. The CPU scheduler tests hold a genuinely ready task before
+  dispatch and verify S3, including when another task awaits async completion.
+- **S6 async-completion-wait**: reachable when a deferred task's AICore work has
+  finished but logical completion is pending. CPU scheduler tests cover mailbox
+  handoff, wait-list residence, mixed running work, timeout publication and
+  eventual completion/dependency release. Hardware transport-stall reproduction
+  is separate from this diagnostic regression coverage.
 - **S4 / S5 / unknown**: not expressible through the public API. `set_dependencies()`
   can only name already-submitted tasks, so a dependency cycle cannot be written; a
   stuck producer is RUNNING (→ S1), never pure WAIT (S4). `total_tasks_` counts

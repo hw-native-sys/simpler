@@ -427,6 +427,14 @@ TEST_F(TaskAllocatorTest, AllocLargerThanHeap) {
     EXPECT_EQ(error_code.load(), SIMPLER_ERROR_HEAP_RING_DEADLOCK);
 }
 
+TEST_F(TaskAllocatorTest, AllocAboveInt32MaxDoesNotWrapToZeroSize) {
+    const uint64_t big = 1ull << 31;
+    auto r = allocator.alloc(big);
+    EXPECT_TRUE(r.failed()) << "A request above INT32_MAX must fail by capacity, not wrap to a zero-size allocation";
+    EXPECT_EQ(error_code.load(), SIMPLER_ERROR_HEAP_RING_DEADLOCK);
+    EXPECT_EQ(allocator.heap_top(), 0ull);
+}
+
 TEST_F(TaskAllocatorTest, TaskWindowSaturates) {
     for (int i = 0; i < WINDOW_SIZE - 1; i++) {
         auto r = allocator.alloc(0);

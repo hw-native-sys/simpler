@@ -31,13 +31,27 @@
 #include <cstring>
 
 #include "aicpu/device_run_result_base_aicpu.h"
+#include "aicpu/diagnostic_run_terminal_aicpu.h"
 #include "aicpu/profiler_device_engine.h"
+#include "common/diagnostic_run_terminal.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 
 static uint64_t g_platform_dep_gen_base = 0;
 static bool g_enable_dep_gen = false;
+
+// Where this run's producer accounting is published, and which bank of it is
+// this run's. Zero means the host mapped none, which is the default path: the
+// host owns the counter reset and reads the live counters, as it does without
+// retention.
+/**
+ * This run's terminal bank — the address of its first producer entry — pushed
+ * at kernel entry from the launching run's KernelArgs. 0 means the host
+ * resolved none, which is every run with this collector's retention off, and
+ * is what keeps the device off an address nobody mapped.
+ */
+static uint64_t s_run_terminal_bank = 0;
 
 // File-local cached state for the single dep_gen instance (the orchestrator).
 static DepGenDataHeader *s_dep_gen_header = nullptr;
@@ -80,6 +94,37 @@ extern "C" bool is_dep_gen_enabled() { return g_enable_dep_gen; }
 
 void dep_gen_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx = thread_idx; }
 
+void set_platform_dep_gen_run_terminal(uint64_t bank) { s_run_terminal_bank = bank; }
+
+void dep_gen_aicpu_close_run() {
+    if (s_dep_gen_state == nullptr) return;
+
+    uint32_t live_at_close = 0;
+    const uint64_t held_ptr = s_dep_gen_state->current_buf_ptr;
+    if (held_ptr != 0) {
+        live_at_close = reinterpret_cast<const DepGenBuffer *>(held_ptr)->count;
+    }
+
+    DiagnosticRunTerminalCounts counts{};
+    // Buffer slots, which is the unit `published_records` and `live_at_close`
+    // are in. `total_record_count` is one per submit and the chain a submit
+    // spills into is charged to `total_overflow_record_count`, so the two have
+    // to be added here or a single overflowing submit would read as one record
+    // produced and two published. The host's existing equation,
+    // `collected + dropped == total + total_overflow`, is in the same unit.
+    counts.total =
+        diagnostic_terminal_add_u32(s_dep_gen_state->total_record_count, s_dep_gen_state->total_overflow_record_count);
+    counts.dropped = s_dep_gen_state->dropped_record_count;
+    counts.published_records = s_dep_gen_state->published_record_count;
+    counts.published_buffers = s_dep_gen_state->published_buffer_count;
+    counts.live_at_close = live_at_close;
+
+    simpler::dfx::terminal::publish(
+        s_run_terminal_bank, DEP_GEN_TERMINAL_PRODUCERS, DEP_GEN_TERMINAL_PRODUCER, get_platform_run_result_epoch(),
+        counts
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Internal: enqueue full buffer to per-thread ready_queue
 // ---------------------------------------------------------------------------
@@ -119,6 +164,14 @@ struct DepGenDeviceModule {
 
     static void account_dropped(Context, State *state, uint32_t count) {
         saturating_add(state->dropped_record_count, count);
+    }
+    // Reported once per successful commit, with the count read before the
+    // ready-queue tail advanced. What reached the host is not derivable from
+    // total and dropped: a committed buffer can still be lost afterwards, and
+    // only the gap against the host's receipt count shows it.
+    static void on_publish_committed(Context, State *state, uint32_t committed) {
+        saturating_add(state->published_record_count, committed);
+        saturating_add(state->published_buffer_count, 1);
     }
     static void on_pop_success(Context, State *state, Buffer *buffer) {
         buffer->run_epoch = get_platform_run_result_epoch();
@@ -167,6 +220,22 @@ void dep_gen_aicpu_init() {
     s_pre_orch_idx_drop_reported = false;
     s_dep_gen_header = get_dep_gen_header(base);
     s_dep_gen_state = get_dep_gen_buffer_state(base, /*instance_index=*/0);
+
+    // This run's counters start here rather than at the host's admission: a
+    // host instant is not a producer boundary once a successor may already be
+    // queued, while this init provably runs after the predecessor's producers
+    // left with their operator. The host keeps its own reset for the path that
+    // maps no terminal bank, where no successor can be admitted at all.
+    if (s_run_terminal_bank != 0) {
+        s_dep_gen_state->total_record_count = 0;
+        s_dep_gen_state->dropped_record_count = 0;
+        s_dep_gen_state->total_overflow_record_count = 0;
+    }
+    s_dep_gen_state->published_record_count = 0;
+    s_dep_gen_state->published_buffer_count = 0;
+    simpler::dfx::terminal::begin_run(
+        s_run_terminal_bank, DEP_GEN_TERMINAL_PRODUCERS, DEP_GEN_TERMINAL_PRODUCER, get_platform_run_result_epoch()
+    );
 
     rmb();
     // Keep the buffer this instance already holds, or pop the first one.
@@ -447,9 +516,12 @@ void dep_gen_aicpu_flush() {
     }
 
     uint32_t seq = s_dep_gen_state->current_buf_seq;
+    const uint32_t committed = buf->count;
     int rc = enqueue_dep_gen_ready_buffer(buf_ptr, seq);
     if (rc == 0) {
-        LOG_INFO("dep_gen: flushed buffer with %u records", buf->count);
+        LOG_INFO("dep_gen: flushed buffer with %u records", committed);
+        saturating_add(s_dep_gen_state->published_record_count, committed);
+        saturating_add(s_dep_gen_state->published_buffer_count, 1);
         s_dep_gen_state->current_buf_ptr = 0;
         wmb();
     } else {
@@ -458,8 +530,8 @@ void dep_gen_aicpu_flush() {
         // so nothing returns it to the free queue. Retaining it lets the next
         // run's init reuse it in place, which is the only return available to
         // AICPU.
-        LOG_ERROR("dep_gen: flush failed (ready_queue full), %u records dropped", buf->count);
-        saturating_add(s_dep_gen_state->dropped_record_count, buf->count);
+        LOG_ERROR("dep_gen: flush failed (ready_queue full), %u records dropped", committed);
+        saturating_add(s_dep_gen_state->dropped_record_count, committed);
         buf->count = 0;
         wmb();
     }

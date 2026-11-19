@@ -20,10 +20,9 @@
  *     run's final state rather than one thread's view of it.
  *   - Run **before the kernel returns**, so the write precedes the fence that
  *     releases any successor to reset the shared state it was folded from.
- *   - Make the record visible to the host **before** the epoch that marks it
- *     valid. A thread-ordering fence does not do this: the host reads through a
- *     D2H copy of device memory, so the bytes have to leave this core's cache.
- *     Hence an explicit flush of payload and header words, then of the epoch.
+ *   - Write back the record on A2/A3 for the host's D2H read. A5 is coherent;
+ *     the host reads only after the run's kernel completion boundaries, so
+ *     the epoch is an identity check, not a flag polled during publication.
  *
  * A record is refused rather than clamped or repaired. A payload that outgrew
  * the capacity, a success carrying a code, and a failure carrying no code or no
@@ -34,16 +33,28 @@
  * back as undecided.
  */
 
-#ifndef SRC_COMMON_PLATFORM_INCLUDE_AICPU_DEVICE_RUN_RESULT_AICPU_H_
-#define SRC_COMMON_PLATFORM_INCLUDE_AICPU_DEVICE_RUN_RESULT_AICPU_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 
 #include "aicpu/cache_maintenance.h"
+#include "aicpu/device_run_result_base_aicpu.h"
 #include "common/device_run_result.h"
 #include "common/run_terminal_accumulator.h"
+
+// Call only after the prior writers have physically exited and their required
+// evidence has been retained outside this region. Replayed bindings can carry
+// the same epoch: invalidate before any new producer can publish under it.
+inline bool aicpu_invalidate_run_terminal(uint64_t region_base, uint64_t run_epoch) {
+    if (region_base == 0) return true;
+    if (run_epoch == 0) return false;
+    auto *region = reinterpret_cast<DeviceRunResultRegion *>(region_base);
+    region->published = 0;
+    cache_flush_range(&region->published, sizeof(region->published));
+    return true;
+}
 
 /**
  * Publish this run's terminal record into the region at `region_base` under
@@ -77,10 +88,9 @@ inline bool aicpu_publish_run_terminal(
     region->verdict = static_cast<uint32_t>(verdict);
     region->completion_code = completion_code;
     region->code_source = static_cast<uint32_t>(code_source);
-    // Record out of cache first; only then the epoch that says it is readable.
-    // A host that sees the epoch must already be able to see what it vouches
-    // for. The header words are contiguous from `payload_bytes`, so one flush
-    // covers them.
+    // The host reads after kernel completion, with the slot still reserved.
+    // A2/A3 needs writeback; A5 needs no additional publication barrier here.
+    // The header words are contiguous from `payload_bytes`.
     if (payload_bytes != 0) {
         cache_flush_range(region->payload, payload_bytes);
     }
@@ -95,14 +105,12 @@ inline bool aicpu_publish_run_terminal(
  * the record is decided where the runtime's shared state is still valid, and
  * published where the run's teardown is already finished.
  *
- * `take` runs in the run's finalizer, before anything resets the state it read
- * from; `publish` runs on the sole cleanup owner, after teardown and before
- * that thread returns from the kernel. The rendezvous between them
- * (`ThreadCompletionGate`) is what makes the snapshot visible to the owner, so
- * this holds no synchronization of its own.
+ * `take` snapshots the runtime result before teardown. The runtime cleanup
+ * owner calls `handoff` after teardown; the native completion owner publishes
+ * only after every callback's work and local destructors finish. The runtime
+ * rendezvous makes this snapshot visible to its cleanup owner.
  *
- * Publishing clears the snapshot, so a run whose owner never publishes cannot
- * hand a successor a predecessor's verdict.
+ * Both handoff and the standalone `publish` helper consume the snapshot.
  */
 class RunTerminalPublisher {
 public:
@@ -113,6 +121,16 @@ public:
         if (payload_bytes == 0 || payload_bytes > DEVICE_RUN_RESULT_PAYLOAD_BYTES) return;
         std::memcpy(payload_, payload, payload_bytes);
         payload_bytes_ = static_cast<uint32_t>(payload_bytes);
+    }
+
+    bool snapshot_is_ok() const { return selection_.verdict == DeviceRunVerdict::Ok; }
+
+    bool handoff() {
+        const auto selection = selection_;
+        const auto bytes = payload_bytes_;
+        selection_ = {};
+        payload_bytes_ = 0;
+        return aicpu_accept_runtime_terminal(selection, bytes != 0 ? payload_ : nullptr, bytes);
     }
 
     bool publish(uint64_t region_base, uint64_t run_epoch) {
@@ -132,5 +150,3 @@ private:
     uint32_t payload_bytes_{0};
     uint8_t payload_[DEVICE_RUN_RESULT_PAYLOAD_BYTES]{};
 };
-
-#endif  // SRC_COMMON_PLATFORM_INCLUDE_AICPU_DEVICE_RUN_RESULT_AICPU_H_

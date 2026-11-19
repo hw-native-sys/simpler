@@ -1,0 +1,372 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+// CPU-only transport. Production runner, allocator, ledger, maker and C API own the policy.
+#include "transport.h"
+#include "ascend_hal.h"
+#include "runtime/rt.h"
+#include "acl/acl.h"
+#include "aicpu_loader/host/load_aicpu_op.h"
+#include "kernel_platform_ops.h"
+#include "platform_comm/comm.h"
+#include "run_retention_probe.h"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <unordered_map>
+#include <unordered_set>
+
+namespace native_admission_transport {
+Control &control() {
+    static Control c;
+    return c;
+}
+}  // namespace native_admission_transport
+namespace {
+std::unordered_map<void *, size_t> allocations;
+std::unordered_set<void *> streams;
+}  // namespace
+namespace native_admission_transport {
+void release_provider_state() {
+    for (auto &entry : allocations)
+        std::free(entry.first);
+    allocations.clear();
+    for (void *stream : streams)
+        std::free(stream);
+    streams.clear();
+    control().bytes = 0;
+}
+}  // namespace native_admission_transport
+extern "C" {
+// The CPU transport has no device SDMA channels to warm up.
+uint32_t dma_workspace_channel_count(void) { return 0; }
+int rtMalloc(void **out, uint64_t bytes, uint32_t, uint16_t) {
+    auto &c = native_admission_transport::control();
+    ++c.allocations;
+    *out = nullptr;
+    const bool failed = c.allocations == c.fail_allocation ||
+                        (c.failed_allocation_bytes != 0 && bytes == c.failed_allocation_bytes) || c.bytes > c.ceiling ||
+                        bytes > c.ceiling - c.bytes;
+    if (failed && !c.allocation_failure_with_storage) return c.allocation_failure_rc;
+    // Match the device allocator's alignment for real callable images.
+    if (posix_memalign(out, 64, bytes == 0 ? 1 : bytes) != 0) *out = nullptr;
+    if (*out != nullptr) std::memset(*out, 0, bytes);
+    if (!*out) return -12;
+    ++c.successful_allocations;
+    c.allocated_device_blocks.emplace_back(*out, bytes);
+    allocations[*out] = bytes;
+    c.bytes += bytes;
+    return failed ? c.allocation_failure_rc : 0;
+}
+int rtFree(void *ptr) {
+    auto &c = native_admission_transport::control();
+    if (c.selected_free != nullptr && ptr == c.selected_free) {
+        ++c.selected_free_attempts;
+        if (c.selected_free_rc != 0) return c.selected_free_rc;
+    }
+    if (const int rc = c.free_rc) return rc;
+    if (native_admission_transport::control().retired) {
+        ++native_admission_transport::control().calls_after_retire;
+        return -4244;
+    }
+    auto it = allocations.find(ptr);
+    if (it == allocations.end()) return ptr == nullptr ? 0 : -1;
+    native_admission_transport::control().bytes -= it->second;
+    allocations.erase(it);
+    std::free(ptr);
+    return 0;
+}
+int rtMallocHost(void **ptr, uint64_t bytes, uint16_t) {
+    auto &c = native_admission_transport::control();
+    ++c.host_allocations;
+    *ptr = nullptr;
+    if (c.host_alloc_rc != 0) return c.host_alloc_rc;
+    *ptr = std::malloc(bytes);
+    if (*ptr == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    ++c.live_host_allocations;
+    return 0;
+}
+int rtFreeHost(void *ptr) {
+    auto &c = native_admission_transport::control();
+    if (ptr == c.selected_host_free && ptr != nullptr) {
+        ++c.selected_host_free_attempts;
+        if (c.selected_host_free_rc != 0) return c.selected_host_free_rc;
+    }
+    if (ptr != nullptr) --c.live_host_allocations;
+    std::free(ptr);
+    return 0;
+}
+int rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t) {
+    auto &c = native_admission_transport::control();
+    if (c.defer_async_copies && kind == RT_MEMCPY_HOST_TO_DEVICE) {
+        if (bytes > capacity || (bytes != 0 && (dst == nullptr || src == nullptr))) return -2;
+        c.deferred_copies.push_back({dst, src, static_cast<size_t>(bytes)});
+        return dst == c.failed_async_destination ? c.async_copy_rc : 0;
+    }
+    return rtMemcpy(dst, capacity, src, bytes, kind);
+}
+int rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind) {
+    if (kind == RT_MEMCPY_DEVICE_TO_HOST) {
+        ++native_admission_transport::control().d2h_calls;
+        native_admission_transport::control().downloads.push_back(src);
+        native_admission_transport::control().d2h_bytes += bytes;
+    }
+    if (kind == RT_MEMCPY_HOST_TO_DEVICE) native_admission_transport::control().uploads.emplace_back(dst, src);
+    const auto &control = native_admission_transport::control();
+    if (control.copy_rc != 0 && (control.copy_error_bytes == 0 || control.copy_error_bytes == bytes))
+        return control.copy_rc;
+    if (bytes > capacity || (bytes && (!dst || !src))) return -2;
+    std::memcpy(dst, src, bytes);
+    return 0;
+}
+int rtSetDevice(int32_t) { return native_admission_transport::control().attach_rc; }
+int rtDeviceReset(int32_t) {
+    auto &c = native_admission_transport::control();
+    c.retired = true;
+    if (c.reset_error == 0) native_admission_transport::release_provider_state();
+    return c.reset_error;
+}
+int rtStreamCreate(rtStream_t *out, int32_t) {
+    auto &c = native_admission_transport::control();
+    if (++c.stream_create_calls == c.fail_stream_create) return -4242;
+    *out = std::malloc(1);
+    if (*out != nullptr) streams.insert(*out);
+    return *out ? 0 : -12;
+}
+int rtStreamDestroy(rtStream_t p) {
+    if (native_admission_transport::control().retired) {
+        ++native_admission_transport::control().calls_after_retire;
+        return -4244;
+    }
+    streams.erase(p);
+    std::free(p);
+    return 0;
+}
+int rtStreamQuery(rtStream_t) { return 0; }
+int rtStreamSynchronize(rtStream_t stream) {
+    auto &control = native_admission_transport::control();
+    control.observed_streams.push_back(stream);
+    if (control.stream_sync_hook) control.stream_sync_hook();
+    return control.stream_sync_rc;
+}
+int rtRegisterAllKernel(const rtDevBinary_t *, void **out) {
+    ++native_admission_transport::control().binary_register_calls;
+    *out = std::malloc(1);
+    return *out ? 0 : -12;
+}
+int rtUnregisterAllKernel(void *p) {
+    std::free(p);
+    return 0;
+}
+int rtKernelLaunchWithHandleV2(void *, uint64_t, uint32_t, rtArgsEx_t *, void *, rtStream_t, rtTaskCfgInfo_t *) {
+    return -1;
+}
+const char *aclGetRecentErrMsg() { return "native admission CPU transport"; }
+int aclFinalize() { return 0; }
+int aclrtGetMemInfo(int, size_t *free, size_t *total) {
+    *free = *total = 1ULL << 30;
+    return 0;
+}
+int aclrtCreateEventExWithFlag(aclrtEvent *out, uint32_t) {
+    auto &c = native_admission_transport::control();
+    ++c.event_create_calls;
+    *out = nullptr;
+    if (c.event_create_calls == c.fail_event_create) return -4210;
+    *out = std::malloc(1);
+    if (*out != nullptr) ++c.live_events;
+    return *out ? 0 : -12;
+}
+int aclrtDestroyEvent(aclrtEvent p) {
+    auto &c = native_admission_transport::control();
+    ++c.event_destroy_calls;
+    if (c.event_destroy_rc != 0) return c.event_destroy_rc;
+    --c.live_events;
+    std::free(p);
+    return 0;
+}
+int aclrtRecordEvent(aclrtEvent, aclrtStream) { return 0; }
+int aclrtResetEvent(aclrtEvent, aclrtStream) { return 0; }
+int aclrtQueryEventStatus(aclrtEvent, aclrtEventRecordedStatus *out) {
+    *out = native_admission_transport::control().events_complete ? ACL_EVENT_RECORDED_STATUS_COMPLETE :
+                                                                   ACL_EVENT_RECORDED_STATUS_NOT_READY;
+    return 0;
+}
+int aclrtSynchronizeEventWithTimeout(aclrtEvent, int32_t) {
+    return native_admission_transport::control().event_wait_rc;
+}
+int aclrtEventGetTimestamp(aclrtEvent, uint64_t *out) {
+    *out = 1;
+    return 0;
+}
+int aclrtStreamWaitEvent(aclrtStream, aclrtEvent) { return 0; }
+int aclrtSynchronizeStream(aclrtStream stream) { return rtStreamSynchronize(stream); }
+int aclrtSynchronizeStreamWithTimeout(aclrtStream stream, int32_t) { return rtStreamSynchronize(stream); }
+int aclrtGetStreamResLimit(aclrtStream, int, uint32_t *out) {
+    *out = 1;
+    return 0;
+}
+int aclrtMemset(void *p, size_t capacity, int32_t value, size_t bytes) {
+    if (bytes > capacity) return -2;
+    std::memset(p, value, bytes);
+    return 0;
+}
+int aclrtSetOpExecuteTimeOutV2(uint64_t wanted, uint64_t *actual) {
+    auto &c = native_admission_transport::control();
+    ++c.op_timeout_calls;
+    c.requested_op_timeout_us = wanted;
+    if (c.op_timeout_rc != 0) return c.op_timeout_rc;
+    *actual = c.replace_op_timeout ? c.actual_op_timeout_us : wanted;
+    return 0;
+}
+int aclrtStreamGetId(aclrtStream, int32_t *out) {
+    *out = 1;
+    return 0;
+}
+int aclmdlRICaptureThreadExchangeMode(aclmdlRICaptureMode *mode) {
+    auto &c = native_admission_transport::control();
+    if (++c.capture_mode_exchanges == c.fail_capture_mode_exchange) return -872;
+    static thread_local auto current = ACL_MODEL_RI_CAPTURE_MODE_GLOBAL;
+    std::swap(current, *mode);
+    return 0;
+}
+int aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus *status, aclmdlRI *model) {
+    const auto &c = native_admission_transport::control();
+    if (c.capture_info_rc != 0) return c.capture_info_rc;
+    if (c.recording_invalidated) {
+        *status = ACL_MODEL_RI_CAPTURE_STATUS_INVALIDATED;
+        *model = nullptr;
+        return 0;
+    }
+    *status = c.recording_active ? ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE : ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    *model = nullptr;
+    return 0;
+}
+int dlog_setlevel(int, int, int) { return 0; }
+}
+namespace host {
+LoadAicpuOp::~LoadAicpuOp() = default;
+int LoadAicpuOp::Finalize(rtStream_t) {
+    auto &c = native_admission_transport::control();
+    ++c.loader_finalize_calls;
+    return c.loader_finalize_error;
+}
+void LoadAicpuOp::ForgetWithoutUnload() {}
+int LoadAicpuOp::BootstrapDispatcher(const void *, size_t, const void *, size_t, rtStream_t, int) {
+    return native_admission_transport::control().loader_start_rc;
+}
+int LoadAicpuOp::Init(const std::vector<std::string> &) {
+    return native_admission_transport::control().loader_start_rc;
+}
+int LoadAicpuOp::LaunchBuiltInOp(rtStream_t stream, void *args, size_t bytes, int, const std::string &name) {
+    auto &c = native_admission_transport::control();
+    if (c.aicpu_payload) return c.aicpu_payload(stream, args, bytes, name);
+    if (name != KernelNames::RegisterCallableName) return c.loader_start_rc;
+    if (!c.allow_registration || bytes != sizeof(RegisterCallableArgs)) return -1;
+    c.registered_ids.push_back(static_cast<RegisterCallableArgs *>(args)->active_callable_id);
+    c.registration_streams.push_back(stream);
+    return c.registration_launch_rc;
+}
+}  // namespace host
+
+KernelContextOps make_onboard_kernel_context_ops() {
+    return {
+        nullptr,
+        [](void *, int *device) noexcept {
+            *device = 0;
+            return 0;
+        },
+        [](void *, void **context) noexcept {
+            static int token;
+            *context = &token;
+            return 0;
+        },
+        [](void *, void **stream) noexcept {
+            return rtStreamCreate(stream, 0);
+        },
+        [](void *, void *stream) noexcept {
+            return rtStreamDestroy(stream);
+        },
+        [](void *, void **event) noexcept {
+            return aclrtCreateEventExWithFlag(event, ACL_EVENT_SYNC);
+        },
+        [](void *, void *event) noexcept {
+            return aclrtDestroyEvent(event);
+        }
+    };
+}
+
+// The late-read hardware probe needs real stream-pair ownership. This transport
+// cannot retire that ownership; native admission/close uses the real base runner.
+int RunRetentionProbePeer::retire_predecessor_ownership(DeviceRunnerBase &, PreparedExecution &) {
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
+void RunRetentionProbePeer::adopt_drain_ownership(DeviceRunnerBase &, const PreparedExecution &) {
+    std::fputs("native admission CPU transport cannot adopt hardware drain ownership\n", stderr);
+    std::abort();
+}
+
+// The native-admission binary exports these for the real PMU lease's dlsym.
+extern "C" int prof_drv_start(unsigned int, unsigned int, void *) {
+    auto &state = native_admission_transport::control();
+    ++state.pmu_start_calls;
+    return state.pmu_start_rc;
+}
+extern "C" int prof_stop(unsigned int, unsigned int) {
+    ++native_admission_transport::control().pmu_stop_calls;
+    return 0;
+}
+extern "C" int halProfDataFlush(unsigned int, unsigned int, unsigned int *bytes) {
+    *bytes = 0;
+    return 0;
+}
+extern "C" int prof_channel_read(unsigned int, unsigned int, char *, unsigned int) { return 0; }
+
+extern "C" {
+int rtGetC2cCtrlAddr(uint64_t *address, uint32_t *bytes) {
+    auto &c = native_admission_transport::control();
+    ++c.c2c_calls;
+    if (c.c2c_rc != 0) return c.c2c_rc;
+    *address = c.c2c_address;
+    *bytes = 4096;
+    return 0;
+}
+int halGetDeviceInfo(uint32_t, int32_t module, int32_t info, int64_t *out) {
+    auto &c = native_admission_transport::control();
+    ++c.topology_query_calls;
+    if (c.topology_query_rc != 0) return c.topology_query_rc;
+    *out = module == MODULE_TYPE_SYSTEM && info == INFO_TYPE_PHY_DIE_ID ? 0 : static_cast<int64_t>(c.topology_mask);
+    return 0;
+}
+int halGetDeviceInfoByBuff(uint32_t, int32_t, int32_t, void *out, int32_t *bytes) {
+    if (*bytes < static_cast<int32_t>(sizeof(uint64_t))) return -1;
+    *static_cast<uint64_t *>(out) = 0xffffff;
+    return 0;
+}
+int halMemCtl(int, void *, size_t, void *out, size_t *) {
+    auto &c = native_admission_transport::control();
+    ++c.ctrl_query_calls;
+    if (c.ctrl_query_hook) c.ctrl_query_hook();
+    if (c.ctrl_query_rc != 0) return c.ctrl_query_rc;
+    auto *mapping = static_cast<AddrMapOutPara *>(out);
+    mapping->ptr = 0x100000000;
+    mapping->len = 0x100000000;
+    return 0;
+}
+int halResMap(unsigned int, res_map_info *info, uint64_t *address, unsigned int *bytes) {
+    auto &c = native_admission_transport::control();
+    ++c.ctrl_query_calls;
+    if (c.ctrl_query_hook) c.ctrl_query_hook();
+    if (c.ctrl_query_rc != 0) return c.ctrl_query_rc;
+    *address = 0x100000000UL + info->res_id * 0x300000UL;
+    *bytes = 0x300000;
+    return 0;
+}
+}

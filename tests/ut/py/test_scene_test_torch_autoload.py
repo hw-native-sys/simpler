@@ -158,7 +158,6 @@ def test_l2_records_after_argument_build_before_run(monkeypatch):
             events.append("run")
 
     monkeypatch.setattr(_MinimalCase, "CALLABLE", {"orchestration": {"signature": []}})
-    monkeypatch.delattr(_MinimalCase, "_st_l2_handle", raising=False)
     monkeypatch.setattr(
         scene_test,
         "_build_l2_ref_args",

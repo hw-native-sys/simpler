@@ -26,12 +26,15 @@ add_library(hierarchical_objs OBJECT
     ${HIERARCHICAL_SRC_DIR}/scope.cpp
     ${HIERARCHICAL_SRC_DIR}/remote_wire.cpp
     ${HIERARCHICAL_SRC_DIR}/remote_endpoint.cpp
+    ${HIERARCHICAL_SRC_DIR}/mpi_direct_transport.cpp
     ${HIERARCHICAL_SRC_DIR}/orchestrator.cpp
     ${HIERARCHICAL_SRC_DIR}/worker_manager.cpp
     ${HIERARCHICAL_SRC_DIR}/scheduler.cpp
     ${HIERARCHICAL_SRC_DIR}/worker.cpp
     ${WORKER_SRC_DIR}/chip_run_lane.cpp
     ${WORKER_SRC_DIR}/chip_worker.cpp
+    ${WORKER_SRC_DIR}/native_submission_state.cpp
+    ${WORKER_SRC_DIR}/runtime_module.cpp
     # ChipWorker binds the process's device-fault monitor into every host
     # runtime it loads, so the owner that defines it comes along. In production
     # this pair is exactly the same: both are compiled into the module the
@@ -50,6 +53,7 @@ add_library(hierarchical_objs OBJECT
     ${SIMPLER_SRC}/common/task_interface/assert_compat.cpp
 )
 target_include_directories(hierarchical_objs PUBLIC
+    ${SIMPLER_SRC}/common
     ${HIERARCHICAL_SRC_DIR}
     ${SIMPLER_SRC}/common/log/include
     ${SIMPLER_SRC}/common/platform/include
@@ -99,3 +103,16 @@ hierarchical_case(test_pipeline_contract_loader.cpp
         RUNTIME_LIBRARY_ROOT="${SIMPLER_REPO_ROOT}/build/lib")
 
 simpler_ut_glob_cases(hierarchical_case)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(test_device_execution_owners PRIVATE "LINKER:--wrap=pthread_atfork")
+    # libstdc++ condition_variable::wait(unique_lock<mutex>&), called by the predicate overload.
+    target_link_options(test_three_run_capacity PRIVATE
+        "LINKER:--wrap=_ZNSt18condition_variable4waitERSt11unique_lockISt5mutexE")
+    target_link_options(test_chip_run_lane PRIVATE
+        "LINKER:--wrap=pthread_mutex_lock"
+        "LINKER:--wrap=pthread_cond_wait"
+        "LINKER:--wrap=pthread_cond_timedwait"
+        "LINKER:--wrap=pthread_cond_clockwait"
+        "LINKER:--wrap=_ZNSt18condition_variable10notify_allEv")
+endif()

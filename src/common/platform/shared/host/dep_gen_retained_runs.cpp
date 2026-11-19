@@ -58,6 +58,7 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_d
 
 namespace runs = simpler::dfx::runs;
 namespace dg_runs = simpler::dfx::dep_gen_runs;
+namespace credit = simpler::dfx::credit;
 
 namespace {
 
@@ -114,7 +115,10 @@ bool DepGenCollector::epoch_admitted_locked(uint64_t run_epoch) const {
 // Admission and close
 // ---------------------------------------------------------------------------
 
-bool DepGenCollector::run_begin(uint64_t run_epoch, const std::string &output_prefix) {
+bool DepGenCollector::run_begin(
+    uint64_t run_epoch, const std::string &output_prefix, simpler::dfx::runs::AdmissionRefusal *why
+) {
+    if (why != nullptr) *why = simpler::dfx::runs::AdmissionRefusal::Fatal;
     if (!retain_across_runs_) return false;
     if (shm_host_ == nullptr) {
         LOG_ERROR("dep_gen: the collector is not initialized, so it can retain no runs");
@@ -153,6 +157,12 @@ bool DepGenCollector::run_begin(uint64_t run_epoch, const std::string &output_pr
             }
         }
         if (free_slot == runs::kMaxOpenEpochs) {
+            // Capacity, exactly as ScopeStats reports the same condition: an
+            // export slot is held until this collector's writer publishes, so a
+            // run refused here is waiting for a writer rather than for anything
+            // re-attempting cannot change. Reported as `Fatal` it would fail
+            // the run instead of parking it on the credit signal.
+            if (why != nullptr) *why = simpler::dfx::runs::AdmissionRefusal::Capacity;
             LOG_ERROR(
                 "dep_gen: run %llu is refused, both unpublished export slots are in use",
                 static_cast<unsigned long long>(run_epoch)
@@ -172,6 +182,22 @@ bool DepGenCollector::run_begin(uint64_t run_epoch, const std::string &output_pr
         }
         slots_[free_slot].state = SlotState::Open;
         slots_[free_slot].run_epoch = run_epoch;
+        // The bank this run's producer publishes into. Refused like the output
+        // slot above: a run that cannot be accounted for runs without
+        // diagnostics rather than unaccounted.
+        if (terminal_banks_.opened()) {
+            slots_[free_slot].terminal_bank = terminal_banks_.reserve(run_epoch);
+            if (!slots_[free_slot].terminal_bank.held()) {
+                slots_[free_slot] = Slot{};
+                lk.unlock();
+                if (why != nullptr) *why = simpler::dfx::runs::AdmissionRefusal::Capacity;
+                LOG_ERROR(
+                    "dep_gen: run %llu is refused, every per-run terminal bank is in use",
+                    static_cast<unsigned long long>(run_epoch)
+                );
+                return false;
+            }
+        }
         admitted = free_slot;
         // The receive path reads these under `records_mutex_`, so that is what
         // owns them. Taken inside `retained_mu_` here, which is the one order
@@ -195,8 +221,37 @@ bool DepGenCollector::run_begin(uint64_t run_epoch, const std::string &output_pr
             retained_epoch_open_ = false;
         }
         retained_cv_.notify_all();
+        if (credit_notifier_) credit_notifier_();
         note_host_failure("the background writer could not be started");
         return false;
+    }
+    // With a bank mapped the producer zeroes its own device counters at this
+    // run's device init, so the host must not: its write would land either side
+    // of a producer transition. The host half of the admission is not the
+    // producer's and runs either way.
+    //
+    // The host half is this run's own receipts, not a reset of the collector's:
+    // a predecessor may still be open, and `begin_run_host_state` would release
+    // the edges it has not sealed. Each admitted run gets its own entry and
+    // retires it at its own close.
+    if (terminal_banks_.opened()) {
+        if (!open_run_receipts(run_epoch)) {
+            {
+                std::lock_guard<std::mutex> lk(retained_mu_);
+                slots_[admitted] = Slot{};
+                std::scoped_lock records(records_mutex_);
+                retained_epoch_open_ = false;
+            }
+            retained_cv_.notify_all();
+            if (credit_notifier_) credit_notifier_();
+            if (why != nullptr) *why = simpler::dfx::runs::AdmissionRefusal::Capacity;
+            LOG_ERROR(
+                "dep_gen: run %llu is refused, every per-run receipt store is in use",
+                static_cast<unsigned long long>(run_epoch)
+            );
+            return false;
+        }
+        return true;
     }
     if (!begin_run()) {
         // The device would reconcile this run against the previous run's
@@ -215,12 +270,16 @@ bool DepGenCollector::run_begin(uint64_t run_epoch, const std::string &output_pr
             retained_epoch_open_ = false;
         }
         retained_cv_.notify_all();
+        if (credit_notifier_) credit_notifier_();
         return false;
     }
     return true;
 }
 
 void DepGenCollector::abandon_run(uint64_t run_epoch) {
+    // Outside the lock below: the receipts are the receive path's and are
+    // released under its own lock.
+    drop_run_receipts(run_epoch);
     size_t charged = 0;
     {
         std::lock_guard<std::mutex> lk(retained_mu_);
@@ -246,6 +305,7 @@ void DepGenCollector::abandon_run(uint64_t run_epoch) {
     }
     if (charged > 0) host_budget_.credit(charged);
     retained_cv_.notify_all();
+    if (credit_notifier_) credit_notifier_();
 }
 
 void DepGenCollector::quarantine_locked(uint64_t run_epoch, const char *detail) {
@@ -291,7 +351,19 @@ void DepGenCollector::run_close_locked_path(uint64_t run_epoch, bool device_exec
 
     // The receive drain and the terminal read stay here, under the claim.
     quiesce();
-    const dg_runs::ReconcileReport report = reconcile_report();
+    // Taken in this file's own lock order: `retained_mu_` outside,
+    // `records_mutex_` inside, as every path here that needs both does.
+    credit::Reservation bank;
+    if (terminal_banks_.opened()) {
+        std::lock_guard<std::mutex> lk(retained_mu_);
+        for (Slot &slot : slots_) {
+            if (slot.state != SlotState::Open || slot.run_epoch != run_epoch) continue;
+            bank = std::move(slot.terminal_bank);
+            break;
+        }
+    }
+    const dg_runs::ReconcileReport report =
+        terminal_banks_.opened() ? reconcile_report_from_terminal(run_epoch, bank) : reconcile_report();
 
     dg_runs::RunExport data;
     data.run_epoch = run_epoch;
@@ -330,7 +402,20 @@ void DepGenCollector::run_close_locked_path(uint64_t run_epoch, bool device_exec
             size_t charged = 0;
             {
                 std::scoped_lock records(records_mutex_);
-                charged = retained_records_.release();
+                // This run's own store, which is where its edges are once a
+                // bank is mapped. Releasing the legacy one instead would leave
+                // the entry open and its blocks charged, and admissions would
+                // then run out of receipt entries while output slots sat free.
+                if (terminal_banks_.opened()) {
+                    for (RunReceipts &entry : run_receipts_) {
+                        if (!entry.open || entry.run_epoch != run_epoch) continue;
+                        charged = entry.records.release();
+                        entry = RunReceipts{};
+                        break;
+                    }
+                } else {
+                    charged = retained_records_.release();
+                }
             }
             if (charged > 0) host_budget_.credit(charged);
             for (Slot &slot : slots_) {
@@ -343,15 +428,27 @@ void DepGenCollector::run_close_locked_path(uint64_t run_epoch, bool device_exec
         // refusal that did not notify would make it wait out its deadline and
         // report a timeout instead of the cause.
         retained_cv_.notify_all();
+        if (credit_notifier_) credit_notifier_();
         return;
     }
 
     {
         // The records are the receive path's until this moves them out, so the
-        // move happens under that path's lock.
+        // move happens under that path's lock. With a bank mapped they come
+        // from this run's own entry: a predecessor's or a successor's are in
+        // their own entries and are not touched here.
         std::scoped_lock records(records_mutex_);
-        data.records = std::move(retained_records_);
-        retained_records_ = dg_runs::RecordBlocks{};
+        if (terminal_banks_.opened()) {
+            for (RunReceipts &entry : run_receipts_) {
+                if (!entry.open || entry.run_epoch != run_epoch) continue;
+                data.records = std::move(entry.records);
+                entry = RunReceipts{};
+                break;
+            }
+        } else {
+            data.records = std::move(retained_records_);
+            retained_records_ = dg_runs::RecordBlocks{};
+        }
     }
 
     // From here the records belong to `data`. Every exit below has to settle
@@ -387,6 +484,7 @@ void DepGenCollector::run_close_locked_path(uint64_t run_epoch, bool device_exec
                 self->stats_.refused++;
             }
             self->retained_cv_.notify_all();
+            if (self->credit_notifier_) self->credit_notifier_();
         }
     } guard{this, &data, &handed_over};
 
@@ -399,6 +497,7 @@ void DepGenCollector::run_close_locked_path(uint64_t run_epoch, bool device_exec
         handed_over = true;
     }
     retained_cv_.notify_all();
+    if (credit_notifier_) credit_notifier_();
 }
 
 // ---------------------------------------------------------------------------
@@ -501,6 +600,7 @@ void DepGenCollector::writer_loop() {
         writer_running_ = true;
     }
     retained_cv_.notify_all();
+    if (credit_notifier_) credit_notifier_();
     while (true) {
         dg_runs::RunExport data;
         {
@@ -557,12 +657,14 @@ void DepGenCollector::writer_loop() {
         // Outside the lock and on both outcomes: the slot release and the
         // error are what a blocked flush is waiting to observe.
         retained_cv_.notify_all();
+        if (credit_notifier_) credit_notifier_();
     }
     {
         std::lock_guard<std::mutex> lk(retained_mu_);
         writer_running_ = false;
     }
     retained_cv_.notify_all();
+    if (credit_notifier_) credit_notifier_();
 }
 
 void DepGenCollector::pause_writer_for_test(bool paused) {
@@ -571,6 +673,7 @@ void DepGenCollector::pause_writer_for_test(bool paused) {
         writer_paused_ = paused;
     }
     retained_cv_.notify_all();
+    if (credit_notifier_) credit_notifier_();
 }
 
 void DepGenCollector::ensure_writer_started() {
@@ -599,6 +702,7 @@ void DepGenCollector::stop_writer() {
         writer_paused_ = false;
     }
     retained_cv_.notify_all();
+    if (credit_notifier_) credit_notifier_();
     if (writer_.joinable()) writer_.join();
 }
 
@@ -655,6 +759,14 @@ void DepGenCollector::discard_quarantined_runs() {
         {
             std::scoped_lock records(records_mutex_);
             charged += retained_records_.release();
+            // Every per-run entry too: a run quarantined or still open at
+            // teardown keeps its edges in its own entry, and the reader threads
+            // are joined by now, so this is the first point at which they are
+            // nobody's.
+            for (RunReceipts &entry : run_receipts_) {
+                charged += entry.records.release();
+                entry = RunReceipts{};
+            }
         }
         for (Slot &slot : slots_) {
             if (slot.state == SlotState::Quarantined) slot = Slot{};
@@ -679,4 +791,51 @@ DepGenCollector::RetainedRunStats DepGenCollector::retained_run_stats_for_test()
         if (slot.state != SlotState::Free) out.open_slots++;
     }
     return out;
+}
+
+uint64_t DepGenCollector::run_terminal_bank_address(uint64_t run_epoch) const {
+    if (run_epoch == 0) return 0;
+    std::lock_guard<std::mutex> lk(retained_mu_);
+    for (const Slot &slot : slots_) {
+        if (slot.run_epoch != run_epoch || !slot.terminal_bank.held()) continue;
+        return terminal_banks_.bank_address(slot.terminal_bank.index());
+    }
+    return 0;
+}
+
+void DepGenCollector::discard_run_terminal_bank(uint64_t run_epoch) {
+    if (run_epoch == 0) return;
+    std::lock_guard<std::mutex> lk(retained_mu_);
+    for (Slot &slot : slots_) {
+        if (slot.run_epoch != run_epoch || !slot.terminal_bank.held()) continue;
+        // Only the device storage; this run's quarantined host records are the
+        // reader threads' to release at the join.
+        slot.terminal_bank.release();
+        LOG_INFO(
+            "dep_gen terminal: run %llu returns its bank unread — it failed with every producer proved stopped, so "
+            "its entries are discarded rather than withdrawn",
+            static_cast<unsigned long long>(run_epoch)
+        );
+        return;
+    }
+}
+
+bool DepGenCollector::can_admit_retained_run() const {
+    if (!retain_across_runs_) return false;
+    std::lock_guard<std::mutex> lk(retained_mu_);
+    if (!retained_ready_) return false;
+    if (run_errors_.has_error()) return false;
+    for (const Slot &slot : slots_) {
+        if (slot.state == SlotState::Free) return true;
+    }
+    return false;
+}
+
+bool DepGenCollector::retained_runs_idle() const {
+    if (!retain_across_runs_) return true;
+    std::lock_guard<std::mutex> lk(retained_mu_);
+    for (const Slot &slot : slots_) {
+        if (slot.state != SlotState::Free) return false;
+    }
+    return true;
 }

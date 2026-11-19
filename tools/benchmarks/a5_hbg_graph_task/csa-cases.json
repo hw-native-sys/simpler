@@ -1,0 +1,16 @@
+{
+  "source": "A5 HBG CSA 无 Graph 调度性能用例",
+  "scenes": [
+    {
+      "path": "examples/a5/host_build_graph/deepseek_v4_pro_csa/test_deepseek_v4_pro_csa.py",
+      "class": "TestDeepSeekV4ProCSAHBG",
+      "case": "B4S2Seed0",
+      "params": {},
+      "config": {},
+      "manual": true,
+      "markers": [],
+      "measure": true,
+      "selection": "用户指定补齐的现有 A5 无 Graph CSA 负载；保留全部 kernel/block 与七项输出"
+    }
+  ]
+}

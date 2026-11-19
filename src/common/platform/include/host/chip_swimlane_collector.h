@@ -44,6 +44,7 @@
 #include "common/chip_swimlane_extension.h"
 #include "common/chip_swimlane_profiling.h"
 #include "host/chip_swimlane_runs.h"
+#include "host/host_phase_records.h"
 #include "host/collected_record.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
@@ -135,6 +136,31 @@ struct ChipSwimlaneModule {
     // Producers are the scheduler threads (task / sched-phase records) plus the
     // orchestrator (orch-phase records) — one per AICPU thread.
     static constexpr int kMaxCollectorThreads = PLATFORM_MAX_AICPU_THREADS;
+
+    /**
+     * How many retained runs this collector's storage is *built* for, and how
+     * many transport cuts may be armed beside them.
+     *
+     * Swimlane's own ceiling, deliberately not `dfx::runs::kMaxOpenEpochs`:
+     * that constant is shared with five other collector families, and every one
+     * of them sizes an array and a fixed-budget term from it. Raising it there
+     * would change their approved limits; raising it here changes only this
+     * collector.
+     *
+     * The ceiling is what the arrays are sized to. How many of those slots a
+     * given collector may actually use is `active_epoch_limit()`, which a
+     * backend grants once before this collector is initialized and which
+     * defaults to `dfx::runs::kMaxOpenEpochs` — so a collector nobody grants
+     * anything to behaves exactly as it does today.
+     *
+     * Cuts match epochs because a cut is armed at `run_close` and released only
+     * once the writer reaches a terminal verdict: with N runs admitted, N may
+     * be closed and unpublished at once. Fewer cuts than epochs would not
+     * refuse — `cut_arm` returning -1 downgrades that run to `CutUnknown` —
+     * so the two counts are kept equal rather than tuned.
+     */
+    static constexpr size_t kMaxOpenEpochs = 3;
+    static constexpr size_t kMaxCutSlots = kMaxOpenEpochs;
 
     /**
      * Startup-only batch allocation size for proactive_replenish. Sched and
@@ -436,6 +462,10 @@ public:
 
     ChipSwimlaneCollector() = default;
     ~ChipSwimlaneCollector();
+    /** Join host readers without a final device drain. */
+    void stop_for_device_failure();
+    /** Forget backing only after confirmed reset and host-reader stop. */
+    void abandon_after_device_reset();
 
     ChipSwimlaneCollector(const ChipSwimlaneCollector &) = delete;
     ChipSwimlaneCollector &operator=(const ChipSwimlaneCollector &) = delete;
@@ -455,13 +485,9 @@ public:
      * @param device_id                Device ID (forwarded to register_cb)
      * @param chip_swimlane_level   Collection granularity (DISABLED / TASK_TIMING
      *                                 / SCHEDULE_TIMING / SCHED_PHASES / ORCH_PHASES).
-     *                                 Written into
-     *                                 `ChipSwimlaneDataHeader::chip_swimlane_level`
-     *                                 so AICPU can promote it in
-     *                                 `chip_swimlane_aicpu_init`, AND cached on the
-     *                                 collector so `export_swimlane_json()`
-     *                                 can gate phase sections and stamp the
-     *                                 JSON `version`.
+     *                                 Sets the initial pool layout and the collector's
+     *                                 export level. The device consumes its own
+     *                                 invocation's Runtime descriptor level.
      * @param alloc_cb                 Device memory allocation callback
      * @param register_cb              Memory registration callback (nullptr for
      *                                 simulation and non-SVM platforms)
@@ -489,29 +515,20 @@ public:
     int initialize(
         int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level,
         const ChipSwimlaneAllocCallback &alloc_cb, ChipSwimlaneRegisterCallback register_cb,
-        const ChipSwimlaneFreeCallback &free_cb
+        const ChipSwimlaneFreeCallback &free_cb, ChipSwimlaneUnregisterCallback unregister_cb = nullptr
     );
 
     /**
-     * Start a run's collection window: bind its artifact configuration, drop the
-     * previous run's records, counters, and runtime extensions, and — once the
-     * region exists — republish the level the device reads.
-     *
-     * The collector initializes once and serves every run, so this is the only
-     * point at which a run's records, counters and device level are established;
-     * initialize() establishes none of them. Skip it and this run's artifact
-     * carries the records every earlier run collected, reconcile compares an
-     * accumulated collected count against one run's device total, and the device
-     * stays on whichever level the first run asked for.
-     *
-     * Before the first initialize() there is no region and no shard storage yet;
-     * reset_collector_shards() is then a no-op over empty extents and
-     * publish_run_config() has no header to write.
+     * Open a host collection window: clear previous export records, counters
+     * and receipts, and bind this run's output prefix and level. Device level
+     * selection belongs to the invocation descriptor; this operation writes no
+     * device configuration or producer counters.
      */
     void begin_run(const std::string &output_prefix, ChipSwimlaneLevel chip_swimlane_level) {
         output_prefix_ = output_prefix;
         chip_swimlane_level_ = chip_swimlane_level;
         json_extensions_.fill({});
+        reset_host_phase_records();
         // The previous run's live figures are not this run's; a comparison must
         // report unknown until this run's reconcile has produced its own.
         live_counters_ = LiveTaskCounters{};
@@ -522,10 +539,32 @@ public:
         handoff_report_ = HandoffReport{};
         transport_retired_buffers_ = 0;
         reset_collector_shards();
-        publish_run_config();
+        validate_run_pool();
     }
 
-    bool set_json_extension(ChipSwimlaneExtensionSection section, const std::string &json_value);
+    /**
+     * One host-side JSON section, published by the run that produced it.
+     *
+     * The epoch is the publication's identity, not a hint. Under retention a
+     * successor is admitted while its predecessor still executes, so the
+     * predecessor publishes *after* the `begin_run`-equivalent that would have
+     * cleared a resident slot — one shared slot therefore belongs to no run,
+     * and the section goes into the bucket this epoch holds. A publication
+     * naming a run this collector does not hold open is refused; so is a second
+     * publication of the same section by the same run.
+     *
+     * Non-retained mode keeps the resident slots, where one run reaches the
+     * device at a time and `begin_run` clears them per run.
+     *
+     * Charged to that run's own host budget before the copy is made — measured
+     * from the caller's bytes, so a payload the budget refuses is never
+     * materialized here — and accepted only while that run's bucket is still
+     * `Admitting`, which is the window between its `run_begin` and its
+     * `run_close`. After the close the bucket's storage belongs to the writer.
+     */
+    bool set_json_extension(
+        uint64_t run_epoch, ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
+    );
 
     /**
      * Per-buffer callback invoked by ProfilerBase's poll loop. Dispatches on
@@ -666,9 +705,9 @@ public:
      *
      * The order is the contract: a seal waits on the reader shards'
      * acknowledgement that they hold no reference, so the writer has to finish
-     * while those shards are still running. Idempotent, and the sole owner of
-     * the writer's lifetime — no close path joins it, and the only place it is
-     * spawned is the preparation that gives it something to seal.
+     * while those shards are still running. Idempotent; fatal shutdown also
+     * joins the writer before the readers. Preparation starts the writer when
+     * it has something to seal.
      */
     void stop() {
         stop_run_writer();
@@ -706,9 +745,9 @@ public:
      */
     void read_phase_header_metadata();
 
-    // Push the run's level into the device-visible header. A no-op before the
-    // region exists, and a single narrow field write once it does.
-    void publish_run_config();
+    // Check that the requested level has a device orch pool, without changing
+    // shared configuration or producer-owned state.
+    void validate_run_pool();
 
     /**
      * Sum per-core / per-thread total_record_count and dropped_record_count
@@ -816,6 +855,80 @@ public:
      * it. Entries start zeroed by the region's initialization memset.
      */
     void *arm_run_terminal_bank(uint32_t bank_index, uint64_t run_epoch);
+
+    /**
+     * Take a terminal bank for `run_epoch`, or report that none is free.
+     *
+     * The banks are a fixed device resource and a run is not: a bank is held by
+     * whichever epoch acquired it until that run's report releases it, so the
+     * mapping is by epoch and not by the set a run happens to borrow. Asking
+     * again for an epoch that already holds one answers with the same bank,
+     * which is what makes arming idempotent across a re-prepare.
+     *
+     * Returns the bank index, or -1 when every bank is held. A caller that gets
+     * -1 has not lost its diagnostic: the banks come back as runs retire, so
+     * the question is asked again next round rather than answered once.
+     */
+    int acquire_run_terminal_bank(uint64_t run_epoch);
+
+    /** Which bank `run_epoch` holds, or -1 when it holds none. */
+    int run_terminal_bank_of(uint64_t run_epoch) const;
+
+    /**
+     * Whether `run_epoch` could take a terminal bank right now.
+     *
+     * The question a scheduling round asks before ordering a further diagnostic
+     * run behind the ones already open: a run with no bank would publish no
+     * snapshot, so it waits for one instead of launching without it. Asked
+     * again every round, and the banks come back as runs retire.
+     */
+    bool can_take_run_terminal_bank(uint64_t run_epoch) const;
+
+    /**
+     * Give back the bank `run_epoch` held, so another run may take it.
+     *
+     * Only for a run whose bank is proved finished with: its snapshot has been
+     * consumed — reported, or copied into the epoch's own bucket — or it never
+     * submitted anything, so no producer can be holding the address. Those are
+     * the proofs that the *data* is done with; `discard_run_terminal_bank` adds
+     * the one for a run whose data is worthless but whose producers are proved
+     * gone. A run whose completion is merely unobserved is quarantined instead.
+     */
+    void release_run_terminal_bank(uint64_t run_epoch);
+
+    /**
+     * Give back the bank `run_epoch` held without reading it, on proof that
+     * every producer that could write into it has terminated.
+     *
+     * The failed-run counterpart of `release_run_terminal_bank`. What the bank
+     * holds is not this run's accounting — the run never reached its terminal
+     * publication, so the entries are whatever its producers managed before the
+     * failure, mixed with whatever the previous occupant left. None of it is
+     * read: no consumer is waiting on it, the host never copies it, and an entry
+     * that outlives this epoch is counted as foreign by the next occupant's
+     * snapshot, which compares each entry's own stamp. So the storage is free
+     * and saying so costs nothing but the bytes.
+     *
+     * The proof is the caller's and it is about producers, not about success:
+     * a simulated device's producers are host threads, and joining them
+     * establishes that none remains. A real device's do not become observable
+     * this way — there the answer is `quarantine_run_terminal_bank`.
+     */
+    void discard_run_terminal_bank(uint64_t run_epoch);
+
+    /**
+     * Withdraw the bank `run_epoch` held, without returning it.
+     *
+     * For a run that reached the device and whose producers could not be proved
+     * stopped. The AICPU may still be writing into that bank, so handing it to
+     * another run would let two producers share it and would publish one run's
+     * accounting as another's. A quarantined bank is never reissued; it comes
+     * back only when the region itself goes, at `finalize`.
+     */
+    void quarantine_run_terminal_bank(uint64_t run_epoch);
+
+    /** How many banks are withdrawn, for a caller reporting degraded capacity. */
+    int quarantined_run_terminal_banks() const;
 
     /**
      * Read back the snapshot armed for `run_epoch` at `bank_index`.
@@ -1129,6 +1242,18 @@ public:
         // byte-for-byte, which is what makes the default path unchanged.
         std::string artifact_path;
         simpler::dfx::runs::CollectionVerdict collection{};
+        /**
+         * The submission this run's records belong to.
+         *
+         * Owned here, inside the bucket's export, because the writer publishes
+         * from `bucket.pending` and must not reach back into any caller's
+         * storage. An all-zero `owner_instance_id` means the admitting caller
+         * stated no identity, which is the only state a reader may not match on.
+         */
+        NativeRunArtifactIdentity artifact_identity{};
+        bool recorded_window{false};
+        bool legacy_destination{false};
+        HandoffReport handoff{};
     };
 
     /**
@@ -1168,6 +1293,7 @@ public:
     }
 
 private:
+    friend struct ChipSwimlaneCollectorTestPeer;
     static constexpr size_t kProducerClasses = 4;  // indexed by ProfBufferType
 
     /**
@@ -1301,7 +1427,7 @@ private:
         RecordsByCollector<CollectedRecord<ChipSwimlaneAicpuOrchPhaseRecord>> orch_phase;
         std::vector<CollectorShardCounters> counters;
     };
-    std::array<EpochStore, simpler::dfx::runs::kMaxOpenEpochs> epoch_stores_{};
+    std::array<EpochStore, ChipSwimlaneModule::kMaxOpenEpochs> epoch_stores_{};
 
     EpochStore &store(size_t slot) { return epoch_stores_[slot < epoch_stores_.size() ? slot : 0]; }
     const EpochStore &store(size_t slot) const { return epoch_stores_[slot < epoch_stores_.size() ? slot : 0]; }
@@ -1379,6 +1505,20 @@ private:
     // attribute no record to a run, so the AICore accounting carries no
     // verdict rather than inheriting the previous run's identity.
     uint64_t armed_run_epoch_{0};
+
+    // Which run holds each terminal bank, or 0 for a free one. The banks are a
+    // fixed device resource and a run is not, so a bank is keyed by the epoch
+    // that acquired it and comes back when that run's snapshot has been
+    // reported, or when its producers are proved stopped and the snapshot is
+    // discarded. Keyed by epoch rather than by the run-resource set a run
+    // borrows: the sets are as many as the grant allows and the banks are
+    // three, so the two counts do not have to agree for either to be correct.
+    uint64_t bank_epoch_[PLATFORM_RUN_TERMINAL_BANKS]{};
+    // A bank whose holder could not prove its device work finished *and* could
+    // not prove its producers stopped. Never reissued: a producer may still be
+    // writing into it, and the host cannot tell from here. Cleared only by
+    // `finalize`, where the region goes away.
+    bool bank_quarantined_[PLATFORM_RUN_TERMINAL_BANKS]{};
 
     // Per-class handoff receipt, summed from the shards at merge time.
     HandoffReceipt merged_receipt_[kProducerClasses]{};
@@ -1473,12 +1613,24 @@ private:
         // records are not kept, and the artifact says so.
         std::atomic<bool> retain{true};
         bool target_installed{false};
+        bool recorded_window{false};
         int cut_slot{-1};
         // The capture request this run's cut published. Every question about
         // that cut is asked against it, because an acknowledgement of a later
         // request says nothing about this capture.
         uint64_t cut_request{0};
         std::chrono::steady_clock::time_point closed_at{};
+        /**
+         * The directory this run's artifact is published into.
+         *
+         * Reserved for this run alone, from its own output prefix, at
+         * admission: a Worker that changes its prefix between submissions
+         * writes each run where that run asked, and every artifact sits beside
+         * the dispatch companions its own submission produced. One run owns it
+         * outright, so withdrawing that run can give it back without consulting
+         * any other. Empty means nothing is reserved and nothing is owed.
+         */
+        std::string artifact_dir;
         // Everything the writer needs, captured at run_close while the device
         // state is still this run's.
         RunExport pending{};
@@ -1487,14 +1639,15 @@ private:
         RunTerminalSnapshot terminal{};
         bool terminal_ok{false};
         /**
-         * Whether this run's admission-time metadata was fully kept.
+         * Whether this run's caller-sized metadata was kept in full.
          *
-         * False when the budget refused the core-type copy at `run_begin`. It
+         * Cleared when the budget refused the core-type copy at `run_begin`, or
+         * refused a section this run published through `set_json_extension`. It
          * has to be remembered rather than re-derived at close: the close-time
          * charge is a different allocation, and a sibling bucket publishing in
          * between can credit enough for it to succeed. Without this the
-         * artifact would claim complete metadata for a run whose core types
-         * were dropped.
+         * artifact would claim complete metadata for a run whose core types, or
+         * whose published section, were dropped.
          */
         bool admission_metadata_complete{true};
         /**
@@ -1548,7 +1701,7 @@ private:
             int slot{-1};
             bool retain{true};
         };
-        std::array<Entry, simpler::dfx::runs::kMaxOpenEpochs> entries{};
+        std::array<Entry, ChipSwimlaneModule::kMaxOpenEpochs> entries{};
         size_t count{0};
 
         int slot_for(uint64_t epoch, bool *retain_out) const {
@@ -1606,8 +1759,33 @@ public:
      */
     void configure_retained_runs(bool retain_across_runs, size_t budget_bytes);
 
+    /**
+     * Raise how many runs this collector may hold open at once.
+     *
+     * Returns false and changes **nothing** unless every condition holds: the
+     * limit is between the shared default and this module's ceiling, the
+     * collector has not been initialized, no reader or writer thread has been
+     * started, retention has not been prepared, and no slot holds a run. Those
+     * are checked before the single write, so a refusal leaves the previous
+     * grant, the budget and the arrays exactly as they were — a caller that
+     * reaches this through the C API cannot resize a collector that is already
+     * serving runs, and does not have to be trusted to call it early.
+     *
+     * Granting more does not open a wider launch: it answers what this
+     * collector can hold, and the backend decides separately whether a run may
+     * be ordered behind another.
+     */
+    bool set_retained_epoch_limit(size_t limit);
+
+    /** How many runs this collector may hold open at once. */
+    size_t active_epoch_limit() const { return active_epoch_limit_; }
+
     /** Whether this collector is configured to hold a run past its boundary. */
     bool retains_runs() const { return retain_across_runs_; }
+
+    /** Explicit model windows share this table without changing ordinary policy. */
+    bool has_retained_run_table() const { return retained_ready_.load(std::memory_order_acquire); }
+    bool recorded_window_open(uint64_t run_epoch) const;
 
     /**
      * Whether this collector has ever completed retention setup.
@@ -1628,6 +1806,24 @@ public:
      * mutex that makes it consistent.
      */
     bool can_admit_retained_run() const;
+
+    /**
+     * Whether this collector holds no unpublished retained run.
+     *
+     * True without an admitted ordinary or explicit model window, and once
+     * every admitted run's writer has published. A writer may still be reading
+     * this collector's pools — which outlives a run's native retirement.
+     */
+    bool retained_runs_idle() const;
+
+    /**
+     * Tell the owning context that this collector's capacity may have moved.
+     *
+     * Set once by the runner after init. Over-notifying is free — a woken
+     * admission re-attempts and parks again — while under-notifying costs a
+     * blocked run its whole deadline.
+     */
+    void set_credit_release_notifier(std::function<void()> notifier) { credit_notifier_ = std::move(notifier); }
 
     /**
      * Open one run's window on a collector that retains runs.
@@ -1653,7 +1849,8 @@ public:
      */
     bool run_begin(
         uint64_t run_epoch, const std::string &output_prefix, ChipSwimlaneLevel level, const CoreType *core_types,
-        int core_type_count, bool host_orchestrated
+        int core_type_count, bool host_orchestrated, const NativeRunArtifactIdentity *artifact_identity = nullptr,
+        simpler::dfx::runs::AdmissionRefusal *why = nullptr
     );
 
     /**
@@ -1662,8 +1859,39 @@ public:
      * Called on the teardown thread while the run still holds its execution
      * claim, which is what makes the per-queue capture consistent: the device
      * has stopped and the successor has not launched.
+     *
+     * The terminal bank is resolved from `run_epoch` here rather than taken as
+     * an argument: a bank is held by the epoch that acquired it, so no caller
+     * can be in a position to name the right index, and one passing a run's
+     * resource-set index would read another run's accounting. This also settles
+     * the bank, and the two facts it settles it on are separate:
+     * `device_execution_complete` decides whether the snapshot is *valid* to
+     * read, and `device_producers_stopped` decides whether the bank is *safe*
+     * to hand on. A completed run is both. A failed run whose every producer is
+     * proved terminated — which a simulated device can establish by joining the
+     * threads that are its producers, and a real one cannot — reads nothing and
+     * still returns the bank. Only a run that is neither is quarantined.
      */
-    void run_close(uint64_t run_epoch, uint32_t bank_index, bool device_execution_complete);
+    void run_close(uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped = false);
+
+    /**
+     * Hold one recorded node's receipts and one prepared metadata snapshot.
+     * This does not change the ordinary retention policy. Device record arrays
+     * in `metadata` must be empty; the collector receives those from its pools.
+     */
+    bool begin_recorded_window(
+        uint64_t run_epoch, const RunExport &metadata, const CoreType *core_types = nullptr, int core_type_count = 0,
+        const simpler::dfx::HostPhaseRecordStore *host_records = nullptr,
+        simpler::dfx::runs::AdmissionRefusal *why = nullptr
+    );
+
+    /**
+     * Close after the caller proves every use of the recorded node quiescent.
+     * Waits for reader references and the transport cut to retire, independently
+     * of file publication. A pending processing cut can retry with the same
+     * owner; failed reader/cut retirement retains storage until reader join.
+     */
+    bool close_recorded_window(uint64_t run_epoch, int timeout_ms);
 
     /**
      * Withdraw a run that was admitted and never launched.
@@ -1712,9 +1940,12 @@ public:
      * Wait until every run up to the current close watermark is published.
      *
      * Returns false and fills `error` when any of them ended without a file, or
-     * when the wait ran out. A published partial is a verdict, not a failure.
+     * when the wait ran out. Ordinary published partials keep their existing
+     * verdict-only policy; a recorded window with known loss fails quality.
+     * A nonzero epoch follows that admitted run's run_close and waits only for
+     * its publication. The owning execution claim prevents identity reuse.
      */
-    bool flush_retained_runs(int timeout_ms, std::string *error);
+    bool flush_retained_runs(int timeout_ms, std::string *error, uint64_t run_epoch = 0);
 
     /** Collector-shard hook called by ProfilerBase's poll loop. */
     void refresh_retained_run_view(int collector_shard);
@@ -1760,19 +1991,36 @@ public:
     RetainedRunStats retained_run_stats_for_test() const;
 
 private:
+    /**
+     * Take one unused `swimlane-<k>` under `output_root`, by exclusive creation.
+     *
+     * `mkdir` fails EEXIST without a window, so two processes sharing a root
+     * take different directories by construction and no index is derived from
+     * a pid, which repeats. One run owns what this reserves: `run_begin` calls
+     * it once per admission, so a withdrawal can give the directory back
+     * without asking whether another run is publishing into it.
+     */
     bool reserve_artifact_directory(const std::string &output_root, std::string *reserved_dir);
 
     /**
      * Take everything retaining a run needs, on the first run that needs it.
      *
-     * Lazy because `initialize()` is given no output prefix, and reserving a
-     * directory for a run that arms and then fails to launch would leave one
-     * behind. Readiness is the single `retained_ready_` latch and it is
-     * published last: every step before it either succeeded or undid itself,
-     * and a step that fails after the latch undoes the whole preparation, so
-     * no half-prepared collector can be mistaken for a prepared one.
+     * Lazy because `initialize()` is given no output prefix and the budget this
+     * takes is sized against one. It reserves no directory: that is per run, in
+     * `run_begin`, under the prefix that run itself named. Readiness is the
+     * single `retained_ready_` latch and it is published last: every step
+     * before it either succeeded or undid itself, and a step that fails after
+     * the latch undoes the whole preparation, so no half-prepared collector can
+     * be mistaken for a prepared one.
      */
     bool ensure_retained_runs_ready(const std::string &output_root);
+    bool begin_run_window(
+        uint64_t run_epoch, const std::string &output_prefix, ChipSwimlaneLevel level, const CoreType *core_types,
+        int core_type_count, bool host_orchestrated, const NativeRunArtifactIdentity *artifact_identity,
+        simpler::dfx::runs::AdmissionRefusal *why, const RunExport *recorded_metadata,
+        const simpler::dfx::HostPhaseRecordStore *host_records = nullptr
+    );
+    void install_run_cut(size_t slot);
 
     /**
      * Spawn the writer. A no-op before a run can be retained, and idempotent.
@@ -1800,7 +2048,9 @@ private:
     void writer_main();
     void service_retained_runs();
     void finish_retained_run(size_t slot, simpler::dfx::runs::Verdict verdict, const char *detail);
-    bool seal_and_publish_run(size_t slot, simpler::dfx::runs::Verdict verdict);
+    bool seal_run_for_export(size_t slot, simpler::dfx::runs::Verdict verdict);
+    bool publish_sealed_run(size_t slot);
+    std::mutex seal_mutex_;
     int publish_run_file(RunExport &data, const std::string &path);
     /**
      * Publish the collector's fatal state and wake every waiter, allocating
@@ -1911,11 +2161,27 @@ private:
     std::atomic<bool> retained_ready_{false};
     std::atomic<bool> fatal_{false};
     std::string fatal_reason_;
-    std::string artifact_dir_;
+    // Labels this collector incarnation in every artifact it writes. Each run's
+    // directory is its own and lives on its bucket; this is not a path.
     uint64_t artifact_dir_index_{0};
-    std::array<EpochBucket, simpler::dfx::runs::kMaxOpenEpochs> retained_runs_{};
+    std::array<EpochBucket, ChipSwimlaneModule::kMaxOpenEpochs> retained_runs_{};
+    /**
+     * How many of `retained_runs_` this collector may use.
+     *
+     * The arrays above are built to the module ceiling; this is the bound every
+     * admission, capacity answer, budget term and preparation loop reads. It
+     * stays at the shared default until a backend grants more through
+     * `set_retained_epoch_limit`, so an ungranted collector allocates, reserves
+     * and admits exactly what it does today — including never sizing the slots
+     * past it, which is what keeps the ceiling off the heap.
+     *
+     * Written once, before this collector is initialized and before any reader
+     * or writer thread exists; read without a lock everywhere after that.
+     */
+    size_t active_epoch_limit_{simpler::dfx::runs::kMaxOpenEpochs};
     std::array<ShardEpochView, profiling_common::BufferPoolManager<ChipSwimlaneModule>::kMaxCollectorShards>
         shard_views_{};
+    std::function<void()> credit_notifier_;
     mutable std::mutex retained_mu_;
     std::condition_variable retained_cv_;
     std::thread writer_thread_;
@@ -2008,16 +2274,16 @@ private:
     );
     HandoffReport build_handoff_report(const RunTerminalSnapshot &snapshot, size_t slot);
     void reset_collector_shards();
+    void reset_host_phase_records();
     void merge_collector_shards();
 
     /**
      * Give the device orch-phase pool its buffers when this run's level needs
      * them and no earlier run built them.
      *
-     * The pool's existence is the one thing initialize() derives from the level,
-     * and the level is the one part of a run's configuration that begin_run()
-     * re-publishes every run. Since initialize() returns early while the region
-     * is held, a run that escalates past ORCH_PHASES would otherwise publish a
+     * The pool's existence is the one thing initialize() derives from the level.
+     * Since initialize() returns early while the region is held, an invocation
+     * that escalates to ORCH_PHASES would otherwise publish a
      * level the pool cannot serve and the device would emit nothing — no error,
      * no reconcile gap, just an empty orch section.
      *

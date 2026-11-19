@@ -154,13 +154,13 @@ whole edge list; both are independent of the hash and both stay.
 So `content_hash` is removed from `GraphDefinition` and from the object header,
 along with `verify_state` and its spin-wait. What the device checks before it
 reads a section offset is now O(1) framing: `magic`, `definition_bytes` against
-the image's own `total_bytes`, and the header's `full_key` against the image's.
+the image's own `total_bytes`, and the header's `graph_key` against the image's.
 The whole-image zero-fill went with it — every section is written in full by the
 fill except `fanout_offsets`, which is accumulated and is now explicitly zeroed
 on its own.
 
 Two things this gives up, both deliberately: a stale or mis-packed byte in the
-retained staging block, and "same `full_key`, different bytes", are no longer
+retained staging block, and "same `graph_key`, different bytes", are no longer
 detected at run time. The first is covered instead by
 `GraphDefinitionObject.RejectsHeaderFramingAnotherGraph` in
 `tests/ut/cpp/common/host_build_graph/test_hbg_graph_cache.cpp`, which pins that a header framing

@@ -71,22 +71,19 @@ def test_rdma_completion_type_is_registered_in_async_wait() -> None:
     assert "COMPLETION_TYPE_RDMA_EVENT_HANDLE = 3" in wait_source
 
 
-def test_a5_host_cmake_gates_rdma_workspace_overlay() -> None:
+def test_a5_host_cmake_keeps_optional_rdma_provider() -> None:
     cmake = HOST_CMAKE.read_text(encoding="utf-8")
 
     assert "option(SIMPLER_ENABLE_PTO_RDMA_WORKSPACE" in cmake
-    assert "set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE OFF)" in cmake
-    assert "set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ON)" in cmake
-    assert "Only one PTO async workspace overlay may be enabled" in cmake
     assert "PTO RDMA workspace overlay requires pto-isa RDMA headers" in cmake
     assert "PTO_RDMA_SUPPORTED" in cmake
     assert "PTO_RDMA_BACKEND_HNS_1825_SUPPORTED" in cmake
 
 
-def test_a5_comm_hccl_keeps_urma_and_rdma_workspace_paths_macro_gated() -> None:
+def test_a5_comm_hccl_keeps_rdma_optional_and_urma_unconditional() -> None:
     source = HOST_COMM.read_text(encoding="utf-8")
 
-    assert "#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE" in source
+    assert "SIMPLER_ENABLE_PTO_URMA_WORKSPACE" not in source
     assert "#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE" in source
     assert '#include "pto/comm/async/rdma/rdma_workspace_manager.hpp"' in source
     assert "std::unique_ptr<pto::comm::rdma::RdmaWorkspaceManager> rdma_workspace" in source
@@ -110,7 +107,8 @@ def test_a5_comm_hccl_uses_mr1374_rdma_host_api_shape() -> None:
     assert 's.find("\\"CLOS\\"", dev_key_pos)' in source
     assert "hccn_tool -g -dev_info -i %d" in source
     assert '\\"addr\\"' in source
-    assert "manager->Init(config)" in source
+    assert "RdmaWorkspaceManager::GetWorkspaceSize(rank_count, &workspace_size, config.qpNum)" in source
+    assert "manager->Init(config, workspace_addr, workspace_size)" in source
     assert "WorkspaceInitResult::READY" in source
     assert "RdmaBackend::HNS_1825" not in source
 
@@ -213,18 +211,19 @@ def test_rdma_kernel_uses_peer_independent_session_and_explicit_peer_ops() -> No
     assert "desc.scratch, desc.workspace, desc.peer_rank, desc.local_rank, session" not in backend
     assert "TGET_ASYNC<pto::comm::DmaEngine::RDMA>(desc.dst, desc.src, session, desc.peer_rank)" in backend
     assert "TPUT_ASYNC<pto::comm::DmaEngine::RDMA>(desc.dst, desc.src, session, desc.peer_rank)" in backend
-    assert "comm_ctx->workSpace), comm_ctx->rankId," in consumer
+    assert "comm_workspace<CommWorkspaceKind::RDMA>(*comm_ctx).addr), comm_ctx->rankId," in " ".join(consumer.split())
     assert "readback_session, 2" in consumer
     assert "TGET_ASYNC<pto::comm::DmaEngine::RDMA>(local_scratch, remote_tput, readback_session, peer)" in consumer
 
 
-def test_a5_scheduler_invalidates_deferred_completion_slab_before_reading_count() -> None:
+def test_a5_scheduler_orders_deferred_completion_slab_reads_after_cond() -> None:
     source = SCHEDULER_COMPLETION.read_text(encoding="utf-8")
     assert "volatile DeferredCompletionSlab *deferred_slab" in source
-    assert "cache_invalidate_range" in source
-    assert "offsetof(DeferredCompletionSlab, entries)" in source
-    assert source.index("cache_invalidate_range") < source.index("deferred_slab->error_code")
-    assert source.index("cache_invalidate_range") < source.index("deferred_slab->count")
+    poll = source[source.index("void SchedulerContext::check_running_cores_for_completion(") :]
+    assert poll.index("reg_load_acquire(core.cond_ptr)") < poll.index("rmb();")
+    assert poll.index("rmb();") < poll.index("complete_slot_task(")
+    assert "deferred_slab->error_code" in source
+    assert "deferred_slab->count = 0" in source
 
 
 def test_rdma_deferred_demo_serializes_hns1825_sq_posts() -> None:

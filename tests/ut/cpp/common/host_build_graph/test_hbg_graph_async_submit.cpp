@@ -23,7 +23,7 @@
 #include <thread>
 #include <vector>
 
-#include "host_build_graph/graph_recorder_pool.h"
+#include "host_build_graph/host/graph_recorder_pool.h"
 #include "orchestration_api.h"
 
 namespace {
@@ -34,10 +34,10 @@ namespace {
 // budgeted for a badly loaded host rather than for the expected microseconds.
 constexpr std::chrono::seconds kHandshakeTimeout{5};
 
-RuntimeContext *g_bound_runtime = nullptr;
+OrchContext *g_bound_orch_context = nullptr;
 
-extern "C" RuntimeContext *framework_current_runtime(void) { return g_bound_runtime; }
-extern "C" void framework_bind_runtime(RuntimeContext *rt) { g_bound_runtime = rt; }
+extern "C" OrchContext *framework_current_orch_context(void) { return g_bound_orch_context; }
+extern "C" void framework_bind_orch_context(OrchContext *ctx) { g_bound_orch_context = ctx; }
 
 // One recording's formal parameters and the tensor storage its TensorRefs point at.
 // The two travel together because gen_scalar_params_from_args resolves against storage
@@ -48,8 +48,7 @@ struct FakeBoundary {
 };
 
 struct FakeRuntime {
-    const RuntimeOps *ops;
-    ScopeMode pending_scope_mode{ScopeMode::AUTO};
+    const OrchOps *ops;
     std::mutex mutex;
     std::condition_variable cv;
     bool record_entered{false};
@@ -60,11 +59,17 @@ struct FakeRuntime {
     int four_prepare_overlaps{0};
     int prepare_overlaps{0};
     int begin_calls{0};
+    uint32_t begin_explicit_dep_count{0};
+    TaskId begin_first_explicit_dep{TaskId::invalid()};
     int prepare_calls{0};
     int end_calls{0};
     // A recorded body reports a fatal on the recorder thread while the bind thread
     // reads it, which is what the runtime's own fatal_code is atomic for.
     std::atomic<bool> fatal{false};
+    // The code the last report_fatal carried, so a case can tell which refusal fired
+    // rather than only that one did. Atomic for the same reason `fatal` is.
+    std::atomic<int32_t> fatal_code{0};
+    std::atomic<int> report_fatal_calls{0};
     // graph_end's view of the fatal at the moment it ran, so a test can tell "end
     // was reached after the body latched" from "end was reached at all".
     bool end_saw_fatal{false};
@@ -104,18 +109,29 @@ struct FakeRuntime {
 };
 
 static_assert(offsetof(FakeRuntime, ops) == 0);
-static_assert(offsetof(FakeRuntime, pending_scope_mode) == offsetof(RuntimeContext, pending_scope_mode));
 
-FakeRuntime *as_fake(RuntimeContext *rt) { return reinterpret_cast<FakeRuntime *>(rt); }
+FakeRuntime *as_fake(OrchContext *ctx) { return reinterpret_cast<FakeRuntime *>(ctx); }
 
-bool fake_is_fatal(RuntimeContext *rt) { return as_fake(rt)->fatal.load(std::memory_order_acquire); }
+bool fake_is_fatal(OrchContext *ctx) { return as_fake(ctx)->fatal.load(std::memory_order_acquire); }
 
-GraphScopeResult fake_graph_begin(RuntimeContext *rt, uint64_t, const GraphTaskArgs &args) {
-    FakeRuntime &fake = *as_fake(rt);
+// What a refusal latches. The real runtime's report_fatal also logs; a case here only
+// needs the code, which is what tells a boundary refusal apart from any other fatal.
+void fake_report_fatal(OrchContext *ctx, int32_t error_code, const char * /*func*/, const char * /*fmt*/, ...) {
+    FakeRuntime &fake = *as_fake(ctx);
+    fake.fatal_code.store(error_code, std::memory_order_release);
+    fake.report_fatal_calls.fetch_add(1, std::memory_order_acq_rel);
+    fake.fatal.store(true, std::memory_order_release);
+}
+
+GraphScopeResult fake_graph_begin(OrchContext *ctx, uint64_t, const GraphTaskArgs &args) {
+    FakeRuntime &fake = *as_fake(ctx);
     std::lock_guard<std::mutex> lock(fake.mutex);
     fake.begin_calls++;
+    fake.begin_explicit_dep_count = args.explicit_dep_count();
+    fake.begin_first_explicit_dep = args.explicit_dep_count() == 0 ? TaskId::invalid() : args.explicit_dep(0);
     GraphScopeResult result;
-    result.execute_block = false;
+    result.task_id = TaskId::make_global(fake.begin_calls);
+    result.has_error = false;
     result.recording = fake.record_every_begin || fake.begin_calls == 1;
     if (result.recording) {
         // Each recording resolves against its own list, so a body queued by an earlier
@@ -151,8 +167,8 @@ GraphScopeResult fake_graph_begin(RuntimeContext *rt, uint64_t, const GraphTaskA
     return result;
 }
 
-bool fake_graph_prepare(RuntimeContext *rt, void *recording_handle, const GraphTaskArgs &args) {
-    FakeRuntime &fake = *as_fake(rt);
+bool fake_graph_prepare(OrchContext *ctx, void *recording_handle, const GraphTaskArgs &args) {
+    FakeRuntime &fake = *as_fake(ctx);
     std::unique_lock<std::mutex> lock(fake.mutex);
     fake.prepare_calls++;
     fake.prepare_handle = recording_handle;
@@ -195,14 +211,14 @@ bool fake_graph_prepare(RuntimeContext *rt, void *recording_handle, const GraphT
     return true;
 }
 
-void fake_graph_abort(RuntimeContext *rt, void *recording_handle) {
-    FakeRuntime &fake = *as_fake(rt);
+void fake_graph_abort(OrchContext *ctx, void *recording_handle) {
+    FakeRuntime &fake = *as_fake(ctx);
     fake.abort_handle = recording_handle;
     fake.abort_calls.fetch_add(1, std::memory_order_acq_rel);
 }
 
-bool fake_graph_end(RuntimeContext *rt) {
-    FakeRuntime &fake = *as_fake(rt);
+bool fake_graph_end(OrchContext *ctx) {
+    FakeRuntime &fake = *as_fake(ctx);
     std::lock_guard<std::mutex> lock(fake.mutex);
     fake.end_calls++;
     fake.submit_thread = std::this_thread::get_id();
@@ -212,11 +228,11 @@ bool fake_graph_end(RuntimeContext *rt) {
     return !fake.end_saw_fatal;
 }
 
-void fake_graph_commit(RuntimeContext *rt) { as_fake(rt)->commit_calls++; }
+void fake_graph_commit(OrchContext *ctx) { as_fake(ctx)->commit_calls++; }
 
-void fake_scope_begin(RuntimeContext *rt) { as_fake(rt)->scope_begin_calls++; }
+void fake_scope_begin(OrchContext *ctx, ScopeMode) { as_fake(ctx)->scope_begin_calls++; }
 
-void fake_scope_end(RuntimeContext *rt) { as_fake(rt)->scope_end_calls++; }
+void fake_scope_end(OrchContext *ctx) { as_fake(ctx)->scope_end_calls++; }
 
 // The pool is the runtime's now, so rt_graph_submit reaches it through these two rather
 // than through a static in the orchestration header. Wiring them to the same process-wide
@@ -231,17 +247,18 @@ GraphAsyncRecordingState &test_pool() {
     return pool;
 }
 
-bool fake_graph_record_start(RuntimeContext *rt, const GraphTaskArgs &args, void *job) {
+bool fake_graph_record_start(OrchContext *ctx, const GraphTaskArgs &args, void *job) {
     auto *record = static_cast<std::function<void(const GraphTaskArgs &)> *>(job);
-    return test_pool().start(args, std::move(*record), rt);
+    return test_pool().start(args, std::move(*record), ctx);
 }
 
-void fake_graph_record_wait(RuntimeContext *rt) { test_pool().wait(rt); }
+void fake_graph_record_wait(OrchContext *ctx) { test_pool().wait(ctx); }
 
-const RuntimeOps kFakeOps = {
+const OrchOps kFakeOps = {
     .scope_begin = fake_scope_begin,
     .scope_end = fake_scope_end,
     .is_fatal = fake_is_fatal,
+    .report_fatal = fake_report_fatal,
     .graph_begin = fake_graph_begin,
     .graph_prepare = fake_graph_prepare,
     .graph_abort = fake_graph_abort,
@@ -389,7 +406,7 @@ TEST(HbgGraphAsyncSubmit, FourDistinctGraphMissesDoNotInsertAnIntermediateCommit
     fake.boundary_capacity = static_cast<int32_t>(boundaries.size());
     fake.record_every_begin = true;
     fake.gate_four_prepares = true;
-    framework_bind_runtime(reinterpret_cast<RuntimeContext *>(&fake));
+    framework_bind_orch_context(reinterpret_cast<OrchContext *>(&fake));
 
     uint32_t storage[4]{};
     uint32_t shape[] = {4};
@@ -407,7 +424,7 @@ TEST(HbgGraphAsyncSubmit, FourDistinctGraphMissesDoNotInsertAnIntermediateCommit
         EXPECT_TRUE(result.recording);
     }
     rt_graph_commit();
-    framework_bind_runtime(nullptr);
+    framework_bind_orch_context(nullptr);
 
     EXPECT_EQ(fake.begin_calls, 4);
     EXPECT_EQ(fake.prepare_calls, 4);
@@ -423,7 +440,7 @@ TEST(HbgGraphAsyncSubmit, WorkerRecordsWhileMainSubmitsLaterGraphs) {
     fake.ops = &kFakeOps;
     fake.boundaries = boundaries.data();
     fake.boundary_capacity = static_cast<int32_t>(boundaries.size());
-    framework_bind_runtime(reinterpret_cast<RuntimeContext *>(&fake));
+    framework_bind_orch_context(reinterpret_cast<OrchContext *>(&fake));
 
     uint32_t storage[4]{};
     uint32_t shape[] = {4};
@@ -490,7 +507,7 @@ TEST(HbgGraphAsyncSubmit, WorkerRecordsWhileMainSubmitsLaterGraphs) {
     }
     rt_graph_commit();
 
-    framework_bind_runtime(nullptr);
+    framework_bind_orch_context(nullptr);
     EXPECT_TRUE(first.recording);
     EXPECT_FALSE(second.recording);
     EXPECT_EQ(fake.begin_calls, 2);
@@ -518,7 +535,7 @@ TEST(HbgGraphAsyncSubmit, RecordingReadsAnOwnedCopyOfTheBoundary) {
     fake.ops = &kFakeOps;
     fake.boundaries = boundaries.data();
     fake.boundary_capacity = static_cast<int32_t>(boundaries.size());
-    framework_bind_runtime(reinterpret_cast<RuntimeContext *>(&fake));
+    framework_bind_orch_context(reinterpret_cast<OrchContext *>(&fake));
 
     uint32_t storage[8]{};
     uint32_t shape[] = {8};
@@ -541,7 +558,7 @@ TEST(HbgGraphAsyncSubmit, RecordingReadsAnOwnedCopyOfTheBoundary) {
         (void)rt_submit_graph_impl(0x1719, args, [](const GraphTaskArgs &) {});
     }
     rt_graph_commit();
-    framework_bind_runtime(nullptr);
+    framework_bind_orch_context(nullptr);
 
     ASSERT_TRUE(fake.prepare_saw_args);
     EXPECT_EQ(fake.recorded_tensor_count, args.tensor_count());
@@ -578,7 +595,7 @@ TEST(HbgGraphAsyncSubmit, AFatalInsideARecordedBodyReachesGraphEndAndAbortsNothi
     fake.ops = &kFakeOps;
     fake.boundaries = boundaries.data();
     fake.boundary_capacity = static_cast<int32_t>(boundaries.size());
-    framework_bind_runtime(reinterpret_cast<RuntimeContext *>(&fake));
+    framework_bind_orch_context(reinterpret_cast<OrchContext *>(&fake));
 
     uint32_t storage[4]{};
     uint32_t shape[] = {4};
@@ -602,11 +619,247 @@ TEST(HbgGraphAsyncSubmit, AFatalInsideARecordedBodyReachesGraphEndAndAbortsNothi
     }
     // Drains the recorder pool through the ops table, as orchestration completion does.
     rt_graph_commit();
-    framework_bind_runtime(nullptr);
+    framework_bind_orch_context(nullptr);
 
     EXPECT_EQ(body_calls, 1);
     EXPECT_EQ(fake.end_calls, 1) << "a fatal must not stop the recording pass from reaching graph_end";
     EXPECT_TRUE(fake.end_saw_fatal) << "graph_end has to observe the fatal — it is the retire point";
     EXPECT_EQ(fake.abort_calls.load(std::memory_order_acquire), 0)
         << "graph_end retires its own entry, so a caller-side abort would be a second one racing graph_commit's free";
+}
+
+namespace {
+
+struct SubmitConfig : simpler::hbg::ConfigBase {
+    explicit SubmitConfig(int v) :
+        variant(v) {}
+
+    int variant;
+
+    uint64_t hash() const { return simpler::hbg::config_hash(variant); }
+    bool operator==(const SubmitConfig &other) const { return variant == other.variant; }
+};
+
+void config_graph_body(const GraphTaskArgs & /*args*/, const SubmitConfig & /*config*/) {}
+
+}  // namespace
+
+// Submitting with a Config retains it, and framework_finish_orch releases it. Those two
+// together are what keeps the registry covering the same window as the host's Definition
+// cache, which lives and dies inside one bind.
+TEST(HbgGraphAsyncSubmit, SubmittingWithAConfigRetainsItUntilTheBindFinishes) {
+    std::array<FakeBoundary, 4> boundaries;
+    FakeRuntime fake{};
+    fake.ops = &kFakeOps;
+    fake.boundaries = boundaries.data();
+    fake.boundary_capacity = static_cast<int32_t>(boundaries.size());
+    fake.record_every_begin = true;
+    // This case is about the registry, not the handshake: let fake_graph_prepare return
+    // without waiting for a later submission that never comes.
+    fake.later_submit_entered = true;
+    framework_bind_orch_context(reinterpret_cast<OrchContext *>(&fake));
+    simpler::hbg::config_registry().clear();
+
+    uint32_t storage[8]{};
+    uint32_t shape[] = {8};
+    simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage, shape, 1);
+    GraphTaskArgs args;
+    args.add_input(boundary);
+
+    {
+        ScopeGuard scope;
+        rt_submit_graph(&config_graph_body, args, SubmitConfig{1});
+        EXPECT_EQ(simpler::hbg::config_registry().size(), 1u) << "a submitted Config must be retained for the bind";
+
+        // A second Graph with a different Config is a different key, so it takes its own
+        // entry rather than being compared against the first.
+        rt_submit_graph(&config_graph_body, args, SubmitConfig{2});
+        EXPECT_EQ(simpler::hbg::config_registry().size(), 2u);
+    }
+    rt_graph_commit();
+
+    framework_finish_orch();
+    EXPECT_TRUE(simpler::hbg::config_registry().empty()) << "the bind's teardown must release every retained Config";
+
+    framework_bind_orch_context(nullptr);
+}
+
+// The two refusals a caller can trigger at this entry, exercised through the public
+// wrapper rather than through the host layer below it.
+//
+// Going through rt_submit_graph is the whole point. The host-layer cases reach
+// graph_begin directly, so they cannot see an entry-side guard at all -- and an entry
+// that asserted instead of reporting would throw here in a debug build, which is the
+// build cpput runs, while a release build reported the fatal. A refusal has to arrive
+// the same way in both.
+TEST(HbgGraphAsyncSubmit, ABoundaryCarryingAConstructionErrorIsRefusedAtTheEntry) {
+    std::array<FakeBoundary, 2> boundaries;
+    FakeRuntime fake{};
+    fake.ops = &kFakeOps;
+    fake.boundaries = boundaries.data();
+    fake.boundary_capacity = static_cast<int32_t>(boundaries.size());
+    fake.later_submit_entered = true;
+    framework_bind_orch_context(reinterpret_cast<OrchContext *>(&fake));
+    simpler::hbg::config_registry().clear();
+
+    uint32_t storage[8]{};
+    uint32_t shape[] = {8};
+    simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage, shape, 1);
+
+    // Past the scalar cap, which records the error rather than raising the count.
+    GraphTaskArgs args;
+    args.add_input(boundary);
+    for (int32_t i = 0; i <= GRAPH_MAX_SCALAR_ARGS; ++i) {
+        args.add_scalar(uint64_t{1});
+    }
+    ASSERT_TRUE(args.has_error());
+
+    bool body_ran = false;
+    GraphSubmitResult result{};
+    {
+        ScopeGuard scope;
+        result = rt_submit_graph_impl(0x1740, args, [&](const GraphTaskArgs &) {
+            body_ran = true;
+        });
+    }
+
+    EXPECT_TRUE(result.has_error);
+    EXPECT_FALSE(body_ran) << "a refused boundary records nothing";
+    EXPECT_EQ(fake.fatal_code.load(), SIMPLER_ERROR_INVALID_ARGS);
+    EXPECT_EQ(fake.begin_calls, 0) << "the entry refuses before it reaches graph_begin";
+
+    framework_bind_orch_context(nullptr);
+}
+
+TEST(HbgGraphAsyncSubmit, ABoundaryPredecessorReachesAdmissionAndStaysOutsideRecording) {
+    std::array<FakeBoundary, 2> boundaries;
+    FakeRuntime fake{};
+    fake.ops = &kFakeOps;
+    fake.boundaries = boundaries.data();
+    fake.boundary_capacity = static_cast<int32_t>(boundaries.size());
+    fake.later_submit_entered = true;
+    framework_bind_orch_context(reinterpret_cast<OrchContext *>(&fake));
+    simpler::hbg::config_registry().clear();
+
+    uint32_t storage[8]{};
+    uint32_t shape[] = {8};
+    simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage, shape, 1);
+
+    // The outer predecessor is admission data, never a recorded-local task id.
+    const std::array<TaskId, 1> deps{TaskId::make_global(3)};
+    GraphTaskArgs args;
+    args.add_input(boundary);
+    args.set_dependencies(deps.data(), static_cast<uint32_t>(deps.size()));
+    ASSERT_FALSE(args.has_error());
+    ASSERT_EQ(args.explicit_dep_count(), 1U);
+    ASSERT_TRUE(rt_graph_args_cacheable(args)) << "valid tensors and invocation predecessors are cacheable";
+
+    bool body_ran = false;
+    GraphSubmitResult result{};
+    {
+        ScopeGuard scope;
+        result = rt_submit_graph_impl(0x1741, args, [&](const GraphTaskArgs &) {
+            body_ran = true;
+        });
+        // Admission is asynchronous. Join the recorder through the same public
+        // barrier an orchestration completion uses before inspecting its writes.
+        rt_graph_commit();
+    }
+
+    EXPECT_FALSE(result.has_error);
+    EXPECT_EQ(result.task_id, TaskId::make_global(1));
+    EXPECT_TRUE(body_ran);
+    EXPECT_EQ(fake.fatal_code.load(), 0);
+    EXPECT_EQ(fake.begin_calls, 1);
+    EXPECT_EQ(fake.begin_explicit_dep_count, 1U);
+    EXPECT_EQ(fake.begin_first_explicit_dep, deps[0]);
+    EXPECT_EQ(boundaries[0].params.explicit_dep_count(), 0U)
+        << "the recorded body must not retain the borrowed outer predecessor";
+
+    framework_bind_orch_context(nullptr);
+}
+
+// A submission onto an already-fatal runtime is a failed submission, so it answers like
+// one. It reports nothing of its own: `has_error` promises a latched fatal, and the one
+// that short-circuited the call is it -- which is why this case pins that the code was not
+// overwritten and that report_fatal was never called again.
+//
+// The value matters because a caller cannot tell a submission apart from a no-op by
+// task_id alone: an invalid id arrives on both. Reporting no error here also carried the
+// call past rt_submit_graph_impl's early return into its phase bookkeeping, recording a
+// span for a submission that never happened.
+TEST(HbgGraphAsyncSubmit, ASubmissionOntoAnAlreadyFatalRuntimeFailsRatherThanNoOps) {
+    std::array<FakeBoundary, 2> boundaries;
+    FakeRuntime fake{};
+    fake.ops = &kFakeOps;
+    fake.boundaries = boundaries.data();
+    fake.boundary_capacity = static_cast<int32_t>(boundaries.size());
+    fake.later_submit_entered = true;
+    framework_bind_orch_context(reinterpret_cast<OrchContext *>(&fake));
+    simpler::hbg::config_registry().clear();
+
+    uint32_t storage[8]{};
+    uint32_t shape[] = {8};
+    simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage, shape, 1);
+    GraphTaskArgs args;
+    args.add_input(boundary);
+    ASSERT_TRUE(rt_graph_args_cacheable(args)) << "the boundary itself is valid";
+
+    // Someone else's fatal, latched before this submission runs.
+    fake.fatal_code.store(SIMPLER_ERROR_SCHEDULER_TIMEOUT, std::memory_order_release);
+    fake.fatal.store(true, std::memory_order_release);
+    const int reports_before = fake.report_fatal_calls.load();
+
+    bool body_ran = false;
+    GraphSubmitResult result{};
+    {
+        ScopeGuard scope;
+        result = rt_submit_graph_impl(0x1742, args, [&](const GraphTaskArgs &) {
+            body_ran = true;
+        });
+    }
+
+    EXPECT_TRUE(result.has_error) << "an already-latched fatal still means this submission failed";
+    EXPECT_FALSE(body_ran);
+    EXPECT_EQ(fake.begin_calls, 0);
+    EXPECT_EQ(fake.report_fatal_calls.load(), reports_before) << "the latched fatal is the report; this adds none";
+    EXPECT_EQ(fake.fatal_code.load(), SIMPLER_ERROR_SCHEDULER_TIMEOUT) << "the first fatal's code survives";
+
+    framework_bind_orch_context(nullptr);
+}
+
+TEST(HbgGraphAsyncSubmit, ConcurrentShutdownClosesAdmissionAndJoinsWorkers) {
+    GraphAsyncRecordingState pool;
+    ASSERT_TRUE(pool.prewarm());
+    GraphTaskArgs args;
+    std::promise<void> entered, release;
+    auto released = release.get_future().share();
+    ASSERT_TRUE(pool.start(args, [&](const GraphTaskArgs &) {
+        EXPECT_NE(recorder_recording(), nullptr);
+        entered.set_value();
+        released.wait();
+        pool.wait();
+    }));
+    entered.get_future().wait();
+    auto first = std::async(std::launch::async, [&] {
+        pool.shutdown();
+    });
+    const auto deadline = std::chrono::steady_clock::now() + kHandshakeTimeout;
+    bool closed = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!pool.prewarm()) {
+            closed = true;
+            break;
+        }
+    }
+    auto second = std::async(std::launch::async, [&] {
+        pool.shutdown();
+    });
+    EXPECT_TRUE(closed);
+    EXPECT_FALSE(pool.start(args, [](const GraphTaskArgs &) {}));
+    release.set_value();
+    first.get();
+    second.get();
+    EXPECT_FALSE(pool.prewarm());
+    EXPECT_EQ(recorder_recording(), nullptr);
 }

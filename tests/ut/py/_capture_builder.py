@@ -49,7 +49,7 @@ first.
 
 from __future__ import annotations
 
-from simpler_setup.tools._runtime_dispatch import HBG_RUNTIME, get, resolve_runtime
+from simpler_setup.tools._runtime_dispatch import HBG_RUNTIME, PERCOUNTER_RUNTIME, get, resolve_runtime
 
 _DEFAULT_CLOCK_FREQ_HZ = 50_000_000
 # The arch a stream reports. Fixed because it is a label on the capture rather
@@ -319,10 +319,10 @@ class Capture:
         Raises:
             ValueError: this runtime has no AICore scheduler.
         """
-        if self.runtime != HBG_RUNTIME:
+        if self.runtime not in (HBG_RUNTIME, PERCOUNTER_RUNTIME):
             raise ValueError(
                 f"{self.runtime} has no AICore scheduler, so it records no stream with producer 'aicore'. "
-                "Only host_build_graph hands scheduling to an AICore."
+                "host_build_graph and percounter schedule on AICore."
             )
         self.sched_phase(
             phase=phase,

@@ -145,11 +145,10 @@
  * when the manager can map it, and withheld entirely when it cannot.
  *
  * Lifecycle (the only correct teardown order):
- *   1. Derived::init() — on the success path, calls set_memory_context() to
- *      stash the alloc/reg/free callbacks, shm_dev/host pointers,
- *      shm_size and device_id on the base and bind the manager's memory
- *      operations to that region. If init aborts before that,
- *      start(tf) becomes a no-op (shm_host_ stays nullptr).
+ *   1. Derived::init() binds callbacks with null shared-memory pointers before
+ *      acquiring resources. A rollback guard owns every acquisition; only
+ *      after success does publish_shared_memory() make the collector startable.
+ *      Failed init returns an error after rollback, with shm_host_ still null.
  *   2. start(tf) — launches the mgmt thread(s), then the collector thread(s).
  *      Mgmt is started before collectors because mgmt is the only writer to
  *      the host ready queue shard(s) and collectors are their consumers.
@@ -230,6 +229,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <type_traits>
@@ -239,6 +239,7 @@
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
+#include "host/aligned_allocation.h"
 #include "host/buffer_pool_manager.h"
 #include "host/chip_swimlane_runs.h"
 #include "host/profiling_copy.h"
@@ -274,18 +275,19 @@ using ProfUnregisterCallback = int (*)(void *dev_ptr, int device_id);
 using ProfFreeCallback = std::function<int(void *dev_ptr)>;
 
 // `default_host_shadow_register` was previously a free function; it has been
-// folded into `bind_manager_memory_context()` so its malloc'd shadow can
+// folded into `bind_manager_memory_context()` so its aligned host shadow can
 // be registered with the manager's `malloc_shadows_` set for
 // safe teardown via `clear_mappings()` / `release_all_owned()`. See
 // `ProfilerBase::bind_manager_memory_context()` for the inline definition.
 
 /**
+ * Registered allocations are unregistered before release; direct allocations
+ * carry their own registration state.
  * RAII scope guard for collector `init()` rollback. On destruction (without
  * `commit()`) it (1) calls `manager.release_all_owned(release_fn)` to free
- * every framework-tracked device allocation and malloc shadow, and (2)
+ * every framework-tracked device allocation and host shadow, and (2)
  * releases any extra direct dev_ptrs the collector added via `add_direct_ptr()`
- * (used for pointers the collector owns outside the framework — e.g. PMU
- * per-core `PmuAicoreRing` allocations on a5).
+ * for caller-owned allocations not transferred to the manager.
  *
  * Pattern:
  *   int Collector::init(...) {
@@ -308,45 +310,70 @@ class InitRollbackGuard {
 public:
     using ReleaseFn = std::function<int(void *)>;
 
-    InitRollbackGuard(Manager &manager, ReleaseFn release_fn) :
+    InitRollbackGuard(
+        Manager &manager, ReleaseFn release_fn, ProfUnregisterCallback unregister_fn = nullptr, int device_id = -1
+    ) :
         manager_(manager),
         release_fn_(std::move(release_fn)),
+        unregister_fn_(unregister_fn),
+        device_id_(device_id),
         committed_(false) {}
 
     ~InitRollbackGuard() {
         if (committed_) return;
-        for (void *p : direct_ptrs_) {
-            if (p != nullptr && release_fn_) {
-                // The status is observed, not discarded: a rollback that could
-                // not free what it allocated leaves memory held, and the
-                // manager's paired occupancy has to keep reflecting it.
-                if (int rc = release_fn_(p); rc != 0) manager_.note_release_failed(p, rc);
+        manager_.release_all_owned([this](void *p, bool registered) {
+            for (auto &entry : direct_ptrs_) {
+                if (entry.ptr == p) {
+                    entry.released = true;
+                    registered = registered || entry.registered;
+                }
             }
-        }
-        // Call release_all_owned unconditionally: it also frees malloc'd
-        // host shadows (via std::free, no callback needed). Gating on
-        // release_fn_ here would leak shadows if a collector ever passed
-        // an empty free_cb. Device-pointer release is gated inside the
-        // lambda instead.
-        manager_.release_all_owned([this](void *p) {
-            if (p != nullptr && release_fn_) {
-                if (int rc = release_fn_(p); rc != 0) manager_.note_release_failed(p, rc);
-            }
+            release(p, registered);
         });
+        for (const auto &entry : direct_ptrs_) {
+            if (!entry.released) release(entry.ptr, entry.registered);
+        }
     }
 
     InitRollbackGuard(const InitRollbackGuard &) = delete;
     InitRollbackGuard &operator=(const InitRollbackGuard &) = delete;
 
-    void add_direct_ptr(void *p) {
-        if (p != nullptr) direct_ptrs_.push_back(p);
+    void add_direct_ptr(void *p, bool registered = false) {
+        if (p == nullptr) return;
+        for (auto &entry : direct_ptrs_) {
+            if (entry.ptr == p) {
+                entry.registered = entry.registered || registered;
+                return;
+            }
+        }
+        try {
+            direct_ptrs_.push_back({p, registered, false});
+        } catch (...) {
+            release(p, registered);
+            throw;
+        }
     }
     void commit() { committed_ = true; }
 
 private:
+    struct DirectAllocation {
+        void *ptr;
+        bool registered;
+        bool released;
+    };
+
+    // The manager invokes this while holding its mapping lock. No manager
+    // ownership lookup or release claim is permitted from this callback.
+    void release(void *p, bool registered) {
+        if (p == nullptr) return;
+        (void)manager_.release_resource(p, registered, unregister_fn_, release_fn_, device_id_);
+    }
+
     Manager &manager_;
     ReleaseFn release_fn_;
-    std::vector<void *> direct_ptrs_;
+    ProfUnregisterCallback unregister_fn_;
+    int device_id_;
+    std::vector<DirectAllocation> direct_ptrs_;
     bool committed_;
 };
 
@@ -1008,6 +1035,7 @@ public:
 
 private:
     friend Derived;
+    friend struct ProfilerBaseTestPeer;
     ProfilerBase() = default;
     ~ProfilerBase() = default;
 
@@ -1060,13 +1088,14 @@ public:
         const ProfAllocCallback &alloc_cb, ProfRegisterCallback register_cb, const ProfFreeCallback &free_cb,
         std::function<int(void *, const void *, size_t)> copy_to_device,
         std::function<int(void *, const void *, size_t)> copy_from_device, void *shm_dev, void *shm_host,
-        size_t shm_size, int device_id
+        size_t shm_size, int device_id, ProfUnregisterCallback allocation_unregister_cb = nullptr
     ) {
         // A new region carries a new producer's declaration, so nothing read
         // from the previous one may be believed about this one.
         reset_handoff_identity_trust();
         alloc_cb_ = alloc_cb;
         register_cb_ = register_cb;
+        allocation_unregister_cb_ = allocation_unregister_cb;
         free_cb_ = free_cb;
         copy_to_device_ = std::move(copy_to_device);
         copy_from_device_ = std::move(copy_from_device);
@@ -1080,6 +1109,15 @@ public:
         bind_manager_memory_context();
     }
 
+    // Init has already bound the callbacks; publication cannot allocate or
+    // throw after the resource guard has committed.
+    void publish_shared_memory(void *shm_dev, void *shm_host, size_t shm_size) noexcept {
+        shm_dev_ = shm_dev;
+        shm_host_ = shm_host;
+        shm_size_ = shm_size;
+        manager_.publish_shared_memory(shm_dev, shm_host, shm_size);
+    }
+
     /**
      * Drop the stashed memory context. Called by Derived::finalize() so
      * that a subsequent start(tf) on a finalized collector becomes a no-op.
@@ -1087,6 +1125,7 @@ public:
     void clear_memory_context() {
         alloc_cb_ = nullptr;
         register_cb_ = nullptr;
+        allocation_unregister_cb_ = nullptr;
         free_cb_ = nullptr;
         copy_to_device_ = nullptr;
         copy_from_device_ = nullptr;
@@ -1099,15 +1138,15 @@ public:
 
     /**
      * Launch the mgmt + collector threads. If shm_host_ is nullptr (Derived's
-     * init() aborted before set_memory_context, or finalize() has cleared
+     * init() did not publish shared memory, or finalize() has cleared
      * the context) this is a no-op.
      *
      * Order matters: mgmt is started before collectors because mgmt is the only
      * writer to the host ready queue shards and collectors are the consumers. The
      * register slot defaults to identity on the SVM path (copy_to_device_
-     * is null) or to a host-shadow malloc lambda on the non-SVM path
+     * is null) or to a host-shadow allocation lambda on the non-SVM path
      * (copy_to_device_ installed) — so BufferPoolManager always has a
-     * valid reg path. The host-shadow lambda registers each malloc'd
+     * valid reg path. The host-shadow lambda registers each allocated
      * shadow with `manager_.add_malloc_shadow()` so teardown can free
      * exactly the framework-owned shadows and leave HAL mappings alone.
      */
@@ -1155,36 +1194,52 @@ public:
         // queues rely on.
         const int n = shard_count_;
 
-        mgmt_running_.store(true, std::memory_order_release);
-        mgmt_drain_threads_.reserve(n);
-        for (int i = 0; i < n; i++) {
-            if (thread_factory) {
-                mgmt_drain_threads_.push_back(thread_factory([this, i, n]() {
-                    mgmt_drain_loop(i, n);
-                }));
-            } else {
-                mgmt_drain_threads_.emplace_back(&ProfilerBase::mgmt_drain_loop, this, i, n);
+        try {
+            drain_device_queues_on_stop_.store(true, std::memory_order_relaxed);
+            mgmt_drain_threads_.reserve(n);
+            collector_threads_.reserve(n);
+            mgmt_running_.store(true, std::memory_order_release);
+            for (int i = 0; i < n; i++) {
+                if (thread_factory) {
+                    mgmt_drain_threads_.push_back(thread_factory([this, i, n]() {
+                        mgmt_drain_loop(i, n);
+                    }));
+                } else {
+                    mgmt_drain_threads_.emplace_back(&ProfilerBase::mgmt_drain_loop, this, i, n);
+                }
             }
-        }
-        if (thread_factory) {
-            mgmt_replenish_thread_ = thread_factory([this]() {
-                mgmt_replenish_loop();
-            });
-        } else {
-            mgmt_replenish_thread_ = std::thread(&ProfilerBase::mgmt_replenish_loop, this);
-        }
+            if (thread_factory) {
+                mgmt_replenish_thread_ = thread_factory([this]() {
+                    mgmt_replenish_loop();
+                });
+            } else {
+                mgmt_replenish_thread_ = std::thread(&ProfilerBase::mgmt_replenish_loop, this);
+            }
 
-        collector_threads_.reserve(n);
-        for (int i = 0; i < n; i++) {
-            if (thread_factory) {
-                collector_threads_.push_back(thread_factory([this, i]() {
-                    poll_and_collect_loop(i);
-                }));
-            } else {
-                collector_threads_.emplace_back(&ProfilerBase::poll_and_collect_loop, this, i);
+            for (int i = 0; i < n; i++) {
+                if (thread_factory) {
+                    collector_threads_.push_back(thread_factory([this, i]() {
+                        poll_and_collect_loop(i);
+                    }));
+                } else {
+                    collector_threads_.emplace_back(&ProfilerBase::poll_and_collect_loop, this, i);
+                }
             }
+        } catch (...) {
+            // Missing collector shards cannot consume a final device-queue drain.
+            stop(false);
+            throw;
         }
     }
+
+    /**
+     * Whether `start()` has spawned this collector's threads.
+     *
+     * The same test `start()` itself uses for idempotence, exposed so a derived
+     * collector can refuse a configuration change that would resize storage its
+     * running threads already read.
+     */
+    bool collector_threads_started() const { return !collector_threads_.empty(); }
 
     /**
      * Drain to a quiescent point without retiring the threads. On return the
@@ -1195,7 +1250,6 @@ public:
      * Precondition: the device-side producers have stopped. A drain worker
      * reports its shard quiescent after one full sweep that found nothing, so a
      * producer still writing could push a record in behind that report.
-     * Callers already satisfy this — the run is drained before teardown.
      *
      * Idempotent, and a no-op before start() or after stop(). Like stop(), it
      * waits without a deadline: a wedged worker hangs the caller here exactly
@@ -1217,18 +1271,22 @@ public:
     }
 
     /**
-     * Stop the drain/replenish mgmt threads, drain whatever the drain side
-     * pushes during its final pass, and join the collector. Idempotent. Caller
-     * is guaranteed on return that mgmt's device-side ringbuffer and the
-     * host-side ready queue shard(s) are empty and Derived::on_buffer_collected
-     * has been called for every entry that was in either queue. Framework-owned
-     * buffers are NOT freed here — Derived's finalize() must do that.
+     * Stop the drain/replenish mgmt threads and join the collector. A proven
+     * producer stop permits a final device-queue drain; without that proof,
+     * only entries already handed to host collectors are finished. Idempotent. Caller
+     * is guaranteed on return that host readers have exited. With a final drain
+     * requested and device producers stopped, mgmt's device-side ringbuffer and the host-side ready
+     * queue shard(s) are empty and Derived::on_buffer_collected has been called
+     * for every entry that was in either queue. Host-thread exit does not prove
+     * producer completion. Framework-owned buffers are NOT freed here —
+     * Derived's finalize() must do that.
      *
      * Order matters: stop+join mgmt first so its final-drain pass is fully
      * landed in the host shards BEFORE we tell poll to exit. Otherwise mgmt's
      * last batch has no consumer.
      */
-    void stop() {
+    void stop(bool drain_device_queues = true) {
+        drain_device_queues_on_stop_.store(drain_device_queues, std::memory_order_relaxed);
         mgmt_running_.store(false, std::memory_order_release);
         for (auto &thread : mgmt_drain_threads_) {
             if (thread.joinable()) {
@@ -1247,6 +1305,12 @@ public:
             }
         }
         collector_threads_.clear();
+    }
+
+    /** Host readers are joined and a confirmed reset invalidated device backing. */
+    void abandon_memory_after_device_reset() {
+        manager_.release_all_owned([](void *) {});
+        clear_memory_context();
     }
 
     Manager &manager() { return manager_; }
@@ -1309,9 +1373,9 @@ protected:
 
     /**
      * Name what the drain path lost, so a reconcile gap is attributable instead
-     * of anonymous. Derived::reconcile_counters() is the only caller: the read
-     * consumes the count, which is what makes each run report its own rather
-     * than the collector's cumulative total across a resident lifetime.
+     * of anonymous. Reconciliation or an unproven ordinary close consumes the
+     * host-only count before the next run starts, so a report names this run's
+     * losses rather than the collector's cumulative total.
      */
     void report_drain_drops() {
         const uint64_t dropped = drain_dropped_buffers_.exchange(0, std::memory_order_relaxed);
@@ -1459,30 +1523,32 @@ protected:
         MemoryOps ops;
         ops.alloc = alloc_cb_;
         ops.free_ = free_cb_;
+        ops.unregister_ = allocation_unregister_cb_;
+        ops.registration_requires_unregister = register_cb_ != nullptr;
         if (register_cb_ != nullptr) {
             ops.reg = register_cb_;
         } else if (copy_to_device_) {
             // Non-SVM platform: host-shadow allocate + copy zeros to device.
-            // Capture `this` so the malloc'd shadow can be registered as
+            // Capture `this` so the aligned host shadow can be registered as
             // framework-owned via the manager.
             auto copy_to_device = copy_to_device_;
             ops.reg = [this,
                        copy_to_device](void *dev_ptr, size_t size, int /*device_id*/, void **host_ptr_out) -> int {
                 if (host_ptr_out == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-                void *host_ptr = std::malloc(size);
+                void *host_ptr = simpler::platform::aligned_host_alloc(size);
                 if (host_ptr == nullptr) {
                     *host_ptr_out = nullptr;
                     return PTO_RUNTIME_ERR_INTERNAL;
                 }
+                std::unique_ptr<void, decltype(&std::free)> shadow(host_ptr, &std::free);
                 std::memset(host_ptr, 0, size);
                 int rc = copy_to_device(dev_ptr, host_ptr, size);
                 if (rc != 0) {
-                    std::free(host_ptr);
                     *host_ptr_out = nullptr;
                     return rc;
                 }
                 manager_.add_malloc_shadow(host_ptr);
-                *host_ptr_out = host_ptr;
+                *host_ptr_out = shadow.release();
                 return 0;
             };
         } else {
@@ -1511,12 +1577,14 @@ protected:
     int shard_count_{Manager::kMaxCollectorShards};
     bool thread_num_set_{false};
 
-    // Memory context stashed by Derived::init() via set_memory_context().
+    // Callbacks bound before acquisition; shared memory published after success.
     // Derived may read these from finalize() / alloc helpers via the
     // inherited names. ProfilerBase owns the lifetime: Derived must call
     // clear_memory_context() in finalize() to drop them.
     ProfAllocCallback alloc_cb_{nullptr};
     ProfRegisterCallback register_cb_{nullptr};
+    // Used only for allocation-failure cleanup; finalize uses its current callbacks.
+    ProfUnregisterCallback allocation_unregister_cb_{nullptr};
     ProfFreeCallback free_cb_{nullptr};
     // copy_to_device_ / copy_from_device_ are set by non-SVM platforms
     // (a5) to profiling_copy_* wrappers; left null by SVM platforms (a2a3)
@@ -1539,20 +1607,7 @@ protected:
      */
     void release_one_buffer(void *dev_ptr, ProfUnregisterCallback unregister_cb, const ProfFreeCallback &free_cb) {
         if (dev_ptr == nullptr) return;
-        void *release_ptr = nullptr;
-        if (!manager_.claim_release_pointer(dev_ptr, &release_ptr)) return;
-        if (unregister_cb != nullptr) {
-            int rc = unregister_cb(release_ptr, device_id_);
-            if (rc != 0) {
-                LOG_ERROR("halHostUnregister failed for dev_ptr %p: %d", release_ptr, rc);
-            }
-        }
-        if (free_cb) {
-            // A release that does not report success leaves memory held, so the
-            // manager's paired occupancy keeps counting it rather than treating
-            // an emptied mapping table as proof.
-            if (int rc = free_cb(release_ptr); rc != 0) manager_.note_release_failed(release_ptr, rc);
-        }
+        (void)manager_.release_allocation(dev_ptr, unregister_cb, free_cb);
     }
 
     /**
@@ -1564,7 +1619,7 @@ protected:
      *     installs the halHostRegister mapping; host_ptr is the
      *     identity-mapped view of the same memory.
      *   - non-SVM platform (a5):   `copy_to_device_` is installed →
-     *     malloc a paired host shadow, zero it, push the zeros to the
+     *     allocate an aligned host shadow, zero it, push the zeros to the
      *     device side. The host shadow lives until BufferPoolManager teardown
      *     via `clear_mappings()` or `release_all_owned()`.
      *   - SVM platform (a2a3 sim): `register_cb_` null AND `copy_to_device_`
@@ -1578,47 +1633,75 @@ protected:
      * region and any per-instance buffers, replacing the per-arch ad-hoc
      * branch trees they used to carry.
      */
-    void *alloc_paired_buffer(size_t size, void **host_ptr_out) {
+    void *alloc_paired_buffer(size_t size, void **host_ptr_out, int *error_out = nullptr) {
+        if (error_out != nullptr) *error_out = PTO_RUNTIME_ERR_INTERNAL;
         if (host_ptr_out == nullptr) return nullptr;
         *host_ptr_out = nullptr;
         if (!alloc_cb_) return nullptr;
 
-        void *dev_ptr = alloc_cb_(size);
+        void *dev_ptr = alloc_device_buffer(size);
         if (dev_ptr == nullptr) return nullptr;
-
-        void *host_ptr = nullptr;
-        if (register_cb_ != nullptr) {
-            int rc = register_cb_(dev_ptr, size, device_id_, &host_ptr);
-            if (rc != 0 || host_ptr == nullptr) {
-                LOG_ERROR("ProfilerBase::alloc_paired_buffer: register_cb_ failed: %d", rc);
-                release_unregistered_buffer(dev_ptr);
-                return nullptr;
+        auto rollback = [&] {
+            (void)manager_.release_allocation(dev_ptr, allocation_unregister_cb_, free_cb_);
+            manager_.forget_allocation(dev_ptr);
+        };
+        try {
+            void *host_ptr = dev_ptr;
+            if (register_cb_ != nullptr) {
+                const int rc = register_cb_(dev_ptr, size, device_id_, &host_ptr);
+                if (rc == 0) manager_.mark_registered(dev_ptr);
+                if (rc != 0 || host_ptr == nullptr) {
+                    if (error_out != nullptr && rc != 0) *error_out = rc;
+                    rollback();
+                    return nullptr;
+                }
+            } else if (copy_to_device_) {
+                host_ptr = simpler::platform::aligned_host_alloc(size);
+                if (host_ptr == nullptr) {
+                    rollback();
+                    return nullptr;
+                }
+                std::unique_ptr<void, decltype(&std::free)> shadow(host_ptr, &std::free);
+                std::memset(host_ptr, 0, size);
+                const int rc = copy_to_device_(dev_ptr, host_ptr, size);
+                if (rc != 0) {
+                    if (error_out != nullptr) *error_out = rc;
+                    rollback();
+                    return nullptr;
+                }
+                manager_.add_malloc_shadow(host_ptr);
+                host_ptr = shadow.release();
             }
-        } else if (copy_to_device_) {
-            // Non-SVM: malloc + zero + push to device.
-            host_ptr = std::malloc(size);
-            if (host_ptr == nullptr) {
-                LOG_ERROR("ProfilerBase::alloc_paired_buffer: host shadow alloc failed for %zu bytes", size);
-                release_unregistered_buffer(dev_ptr);
-                return nullptr;
-            }
-            std::memset(host_ptr, 0, size);
-            int rc = copy_to_device_(dev_ptr, host_ptr, size);
-            if (rc != 0) {
-                LOG_ERROR("ProfilerBase::alloc_paired_buffer: copy_to_device failed: %d", rc);
-                std::free(host_ptr);
-                release_unregistered_buffer(dev_ptr);
-                return nullptr;
-            }
-            manager_.add_malloc_shadow(host_ptr);
-        } else {
-            // SVM: identity-map.
-            host_ptr = dev_ptr;
+            manager_.publish_host_view(dev_ptr, host_ptr, register_cb_ != nullptr);
+            *host_ptr_out = host_ptr;
+            if (error_out != nullptr) *error_out = 0;
+            return dev_ptr;
+        } catch (...) {
+            rollback();
+            throw;
         }
+    }
 
-        *host_ptr_out = host_ptr;
-        manager_.register_mapping(dev_ptr, host_ptr);
-        return dev_ptr;
+    void *alloc_device_buffer(size_t size) {
+        void *p = alloc_cb_ ? alloc_cb_(size) : nullptr;
+        if (p != nullptr) {
+            try {
+                manager_.register_device_allocation(p);
+            } catch (...) {
+                release_unregistered_buffer(p);
+                throw;
+            }
+        }
+        return p;
+    }
+
+    bool validate_release_callbacks(ProfUnregisterCallback unregister_cb, const ProfFreeCallback &free_cb) {
+        if (!free_cb || (manager_.has_registered_resources() && unregister_cb == nullptr)) {
+            manager_.note_release_failed(shm_dev_, PTO_RUNTIME_ERR_INTERNAL);
+            LOG_ERROR("Collector finalize requires the current release and registration callbacks");
+            return false;
+        }
+        return true;
     }
 
     /**
@@ -1638,6 +1721,70 @@ protected:
         if (rc != 0) manager_.note_release_failed(dev_ptr, rc);
     }
 
+    /**
+     * Allocate a buffer the collector owns outside the manager's mapping
+     * table, together with whatever host view this platform gives it.
+     *
+     * The pairing is `alloc_paired_buffer`'s, and for the same reason: an
+     * allocation's host readability is a property of how it was mapped, never
+     * of which platform it is on. What differs is ownership. `alloc_paired_buffer`
+     * registers the mapping with the buffer pool, whose teardown then frees the
+     * pointer — and a per-run terminal bank is released only on a proof about
+     * the device that no teardown can make, so this keeps the pointer out of
+     * that table and leaves the release to its owner.
+     *
+     * `*host_out` is the address the host may dereference, and is null on a
+     * platform that mirrors by copying: there is no host view of that memory,
+     * and a reader has to go through `copy_from_device`. No host shadow is
+     * allocated here; a caller that needs host storage brings its own.
+     */
+    void *alloc_unmanaged_paired_buffer(size_t size, void **host_out) {
+        if (host_out == nullptr) return nullptr;
+        *host_out = nullptr;
+        if (!alloc_cb_ || size == 0) return nullptr;
+
+        void *dev_ptr = alloc_cb_(size);
+        if (dev_ptr == nullptr) return nullptr;
+
+        if (register_cb_ != nullptr) {
+            void *host_ptr = nullptr;
+            const int rc = register_cb_(dev_ptr, size, device_id_, &host_ptr);
+            if (rc != 0 || host_ptr == nullptr) {
+                LOG_ERROR("ProfilerBase::alloc_unmanaged_paired_buffer: register_cb_ failed: %d", rc);
+                release_unregistered_buffer(dev_ptr);
+                return nullptr;
+            }
+            *host_out = host_ptr;
+        } else if (!copy_from_device_) {
+            // Neither a registration step nor a copy shim: this platform's
+            // device memory is the host's own, so the allocation is already
+            // the host view of itself.
+            *host_out = dev_ptr;
+        }
+        return dev_ptr;
+    }
+
+    /**
+     * Take down the host mapping `alloc_unmanaged_paired_buffer` installed,
+     * before its memory is released.
+     *
+     * Separate from the free so that each outcome is recordable on its own:
+     * an unregister that succeeded and a free that then failed leave the
+     * memory held with no mapping, and a retry must not unregister a second
+     * time. Returns 0 when there is no mapping to take down, because then
+     * there is nothing this step could fail at.
+     */
+    int unmap_unmanaged_paired_buffer(void *dev_ptr, ProfUnregisterCallback unregister_cb) {
+        if (dev_ptr == nullptr) return -1;
+        if (register_cb_ == nullptr) return 0;
+        // Registration exists even when its teardown callback has not yet
+        // arrived from finalize. Keep the mapped allocation until it does.
+        if (unregister_cb == nullptr) return -1;
+        const int rc = unregister_cb(dev_ptr, device_id_);
+        if (rc != 0) LOG_ERROR("halHostUnregister failed for dev_ptr %p: %d", dev_ptr, rc);
+        return rc;
+    }
+
     // -------------------------------------------------------------------------
     // Cross-run transport cut
     // -------------------------------------------------------------------------
@@ -1655,7 +1802,10 @@ protected:
     // written unless a run has been retained, so the five other profilers
     // pay one relaxed load per sweep and nothing else.
 
-    static constexpr size_t kMaxCutSlots = 2;
+    // A module that retains more than the shared default declares its own
+    // ceiling; every other module keeps two and is not recompiled into a
+    // different shape by this.
+    static constexpr size_t kMaxCutSlots = profiling_common::ProfilerModuleMaxCutSlots<Module>::value;
     static constexpr size_t kMaxCutQueues = static_cast<size_t>(PLATFORM_MAX_AICPU_THREADS);
 
     /**
@@ -1871,6 +2021,100 @@ protected:
     /** A transport counter ran out of headroom; no cut can be trusted after this. */
     bool cut_counters_exhausted() const { return cut_counter_exhausted_.load(std::memory_order_acquire); }
 
+    struct TransportFailureSnapshot {
+        struct Shard {
+            uint64_t capture_ack{0};
+            uint64_t control_ack{0};
+            uint64_t pushed{0};
+            uint64_t processed{0};
+            uint64_t watermark{0};
+            uint8_t stage1{0};
+        };
+        struct Queue {
+            uint64_t consumed{0};
+            uint8_t state{0};
+        };
+        std::array<Shard, Manager::kMaxCollectorShards> shards{};
+        std::array<Queue, kMaxCutQueues> queues{};
+        uint64_t capture_request{0};
+        uint64_t control_epoch{0};
+        int shard_count{0};
+        int queue_count{0};
+        int cut_state{-1};
+        bool exhausted{false};
+    };
+
+    /**
+     * Failure evidence only: these acquire loads are a mixed-time observation,
+     * never a completion proof. Dimensions are fixed before workers start.
+     * No device read, plain cut target or worker-owned container is inspected.
+     */
+    TransportFailureSnapshot transport_failure_snapshot(int slot) const noexcept {
+        TransportFailureSnapshot out;
+        out.shard_count = std::max(0, std::min(shard_count_, Manager::kMaxCollectorShards));
+        out.queue_count = std::max(0, std::min(queue_count_, static_cast<int>(kMaxCutQueues)));
+        out.capture_request = cut_request_.load(std::memory_order_acquire);
+        out.control_epoch = control_epoch_.load(std::memory_order_acquire);
+        out.exhausted = cut_counter_exhausted_.load(std::memory_order_acquire);
+        const CutSlot *cut = slot >= 0 && static_cast<size_t>(slot) < kMaxCutSlots ? &cut_slots_[slot] : nullptr;
+        if (cut != nullptr) out.cut_state = cut->state.load(std::memory_order_acquire);
+        for (int i = 0; i < out.shard_count; i++) {
+            auto &shard = out.shards[i];
+            shard.capture_ack = cut_ack_[i].load(std::memory_order_acquire);
+            shard.control_ack = control_acked_[i].load(std::memory_order_acquire);
+            shard.pushed = pushed_total_[i].load(std::memory_order_acquire);
+            shard.processed = ring_processed_[i].load(std::memory_order_acquire);
+            if (cut != nullptr) {
+                shard.stage1 = cut->stage1[i].load(std::memory_order_acquire);
+                shard.watermark = cut->push_watermark[i].load(std::memory_order_acquire);
+            }
+        }
+        for (int q = 0; q < out.queue_count; q++) {
+            out.queues[q].consumed = consumed_total_[q].load(std::memory_order_acquire);
+            if (cut != nullptr) out.queues[q].state = cut->qstate[q].load(std::memory_order_acquire);
+        }
+        return out;
+    }
+
+    /** Bounded failure-only output; a logger failure cannot replace the original error. */
+    void log_transport_failure(
+        const char *reason, uint64_t run_epoch, int slot, uint64_t cut_request, uint64_t reference_request
+    ) const noexcept {
+        try {
+            const auto snapshot = transport_failure_snapshot(slot);
+            LOG_ERROR(
+                "%s transport failure: reason=%s run=%llu cut=%d request=%llu capture_now=%llu "
+                "reference_request=%llu control_now=%llu state=%d exhausted=%d shards=%d queues=%d "
+                "mixed_time=1 (diagnostic only)",
+                Module::kSubsystemName, reason, static_cast<unsigned long long>(run_epoch), slot,
+                static_cast<unsigned long long>(cut_request), static_cast<unsigned long long>(snapshot.capture_request),
+                static_cast<unsigned long long>(reference_request),
+                static_cast<unsigned long long>(snapshot.control_epoch), snapshot.cut_state, snapshot.exhausted ? 1 : 0,
+                snapshot.shard_count, snapshot.queue_count
+            );
+            for (int i = 0; i < snapshot.shard_count; i++) {
+                const auto &shard = snapshot.shards[i];
+                LOG_ERROR(
+                    "%s transport shard: run=%llu cut=%d shard=%d capture_ack=%llu control_ack=%llu "
+                    "stage1=%u pushed=%llu watermark=%llu processed=%llu",
+                    Module::kSubsystemName, static_cast<unsigned long long>(run_epoch), slot, i,
+                    static_cast<unsigned long long>(shard.capture_ack),
+                    static_cast<unsigned long long>(shard.control_ack), static_cast<unsigned>(shard.stage1),
+                    static_cast<unsigned long long>(shard.pushed), static_cast<unsigned long long>(shard.watermark),
+                    static_cast<unsigned long long>(shard.processed)
+                );
+            }
+            for (int q = 0; q < snapshot.queue_count; q++) {
+                LOG_ERROR(
+                    "%s transport queue: run=%llu cut=%d queue=%d state=%u consumed=%llu", Module::kSubsystemName,
+                    static_cast<unsigned long long>(run_epoch), slot, q,
+                    static_cast<unsigned>(snapshot.queues[q].state),
+                    static_cast<unsigned long long>(snapshot.queues[q].consumed)
+                );
+            }
+        } catch (...) {}
+    }
+
     /**
      * Publish a reference-release request and wait for every collector shard.
      *
@@ -1879,7 +2123,8 @@ protected:
      * the caller marked an epoch non-admitting. Returns false on timeout, and a
      * false return is never permission to free: the caller quarantines.
      */
-    bool request_run_reference_release(int timeout_ms) {
+    bool request_run_reference_release(int timeout_ms, uint64_t *request_out = nullptr) {
+        if (request_out != nullptr) *request_out = 0;
         // One requester at a time. Two overlapping requests would each wait for
         // their own epoch value while a shard, which only ever adopts the
         // newest, could skip the older one entirely — so the older waiter would
@@ -1890,6 +2135,7 @@ protected:
             return false;
         }
         const uint64_t epoch = control_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (request_out != nullptr) *request_out = epoch;
         manager_.notify_ready_waiters();
         std::unique_lock<std::mutex> wait_lk(cut_mu_);
         return cut_cv_.wait_for(wait_lk, std::chrono::milliseconds(timeout_ms), [this, epoch] {
@@ -1971,7 +2217,7 @@ private:
         // budget.
         std::vector<std::chrono::steady_clock::time_point> stalled_since(static_cast<size_t>(queue_count_));
 
-        while (mgmt_running_.load(std::memory_order_relaxed)) {
+        while (mgmt_running_.load(std::memory_order_acquire)) {
             // An ack covers only a sweep that starts after this epoch is observed.
             const uint64_t requested = drain_quiesce_epoch_.load(std::memory_order_acquire);
             // `found_any` gates quiescence — it means a queue still holds an entry
@@ -1993,7 +2239,8 @@ private:
                 ReadyEntry entry;
                 int served = 0;
                 const int quantum = drain_quantum_.load(std::memory_order_relaxed);
-                while (Alg::try_peek_aicpu_entry(manager_, header, q, entry, true)) {
+                while (mgmt_running_.load(std::memory_order_acquire) &&
+                       Alg::try_peek_aicpu_entry(manager_, header, q, entry, true)) {
                     // Settled with an entry already in hand, never ahead of
                     // one: that is what makes a "no declaration" answer a fact
                     // about the producer rather than about when this shard
@@ -2090,6 +2337,7 @@ private:
             }
         }
 
+        if (!drain_device_queues_on_stop_.load(std::memory_order_relaxed)) return;
         for (int q = queue_start; q < queue_count_; q += queue_stride) {
             if (static_cast<size_t>(q) < kMaxCutQueues && queue_ownership_unknown_[static_cast<size_t>(q)]) {
                 // Already stopped, and the final drain cannot re-establish where
@@ -2479,6 +2727,7 @@ private:
     std::vector<std::thread> mgmt_drain_threads_;
     std::thread mgmt_replenish_thread_;
     std::atomic<bool> mgmt_running_{false};
+    std::atomic<bool> drain_device_queues_on_stop_{true};
 
     // Written by every drain shard, read once per run by reconcile_counters().
     std::atomic<uint64_t> drain_dropped_buffers_{0};

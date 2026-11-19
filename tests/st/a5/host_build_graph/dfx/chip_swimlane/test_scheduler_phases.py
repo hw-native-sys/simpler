@@ -21,7 +21,22 @@ from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 from simpler_setup.scene_test import _build_l3_task_args, _outputs_dir, _sanitize_for_filename
+from simpler_setup.tools.hbg.scalar_profile import analyze_streams
 from simpler_setup.tools.strace_timing import parse_spans
+
+
+def _verify_scalar_streams(raw, streams):
+    records = []
+    for stream in streams:
+        rows = [dict(record) for record in stream["records"]]
+        for metric in stream.get("metrics", []):
+            rows[metric["record_index"]].update({key: value for key, value in metric.items() if key != "record_index"})
+        records.append(rows)
+    profiles = analyze_streams(records, streams, raw["aicore_tasks"], raw.get("aicore_execution_identities"))
+    assert len(profiles) == len(streams)
+    assert all(profile["complete"] for profile in profiles)
+    for profile in profiles:
+        assert sum(profile["exclusive_cycles"].values()) == profile["window_cycles"]
 
 
 def _verify_runtime_clock_logs(monkeypatch, st_platform, after_finalize=None):
@@ -30,7 +45,8 @@ def _verify_runtime_clock_logs(monkeypatch, st_platform, after_finalize=None):
     original = scene_test_module.finalize_diagnostic_outputs
 
     def finalize(case_label, output_prefix, **kwargs):
-        for capture in output_prefix.rglob("chip_swimlane_records.json"):
+        captures = output_prefix.rglob("chip_swimlane_records.json") if kwargs.get("chip_swimlane", 0) else ()
+        for capture in captures:
             raw = json.loads(capture.read_text())
             logs = list(capture.parent.glob("host_clock_alignment.*.log"))
             has_host = raw["metadata"].get("orchestrator_source") == "host"
@@ -55,7 +71,10 @@ def _verify_runtime_clock_logs(monkeypatch, st_platform, after_finalize=None):
 
 
 FANOUT_WIDTH = 32
-EXPECTED_PROFILED_TASKS = 1 + FANOUT_WIDTH + 1 + 1  # root + children + final + terminal dummy
+# The terminal dummy is dependency-only. Such a node routes as an inline
+# dispatch that owns no trace cell, so the subtask count the trace array is
+# sized by excludes it and no profiled row ever carries it.
+EXPECTED_PROFILED_TASKS = 1 + FANOUT_WIDTH + 1  # root + children + final
 
 
 @scene_test(level=2, runtime="host_build_graph")
@@ -123,7 +142,7 @@ class TestSchedulerPhases(SceneTestCase):
             aicore_rows = raw["aicore_tasks"]
             assert len(aicore_rows) == EXPECTED_PROFILED_TASKS, (
                 f"task timing covers {len(aicore_rows)} tasks, expected {EXPECTED_PROFILED_TASKS} "
-                "for the fanout/fanin DAG and terminal dummy"
+                "for the fanout/fanin DAG"
             )
 
             if level >= 2:
@@ -168,54 +187,71 @@ class TestSchedulerPhases(SceneTestCase):
                 assert all("runtime" not in stream for stream in streams)
                 assert all(stream["capture"]["dropped"] == 0 for stream in streams)
                 emitted_kinds = {record["kind"] for stream in streams for record in stream["records"]}
-                required_kinds = {"bootstrap", "state_probe", "dispatch", "complete", "resolve", "refill", "idle"}
+                required_kinds = {
+                    "bootstrap",
+                    "state_probe",
+                    "dispatch",
+                    "complete",
+                    "idle",
+                }
+                # L3 omits function spans below the recorded threshold; the
+                # unfiltered task acquisition/dispatch/completion records remain mandatory.
+                filtered = any(
+                    metric.get("function_min_cycles", 0) > 0
+                    for stream in streams
+                    for metric in stream.get("metrics", [])
+                )
+                if not filtered:
+                    required_kinds |= {
+                        "scalar_execution_token_refill",
+                        "scalar_execution_token_receive",
+                        "scalar_execution_token_fanin",
+                        "scalar_execution_token_select",
+                    }
                 assert required_kinds <= emitted_kinds, (
                     f"missing Scheduler kinds: {sorted(required_kinds - emitted_kinds)}"
                 )
-                assert not ({"fanin", "ready_claim", "ready_steal", "direct_refill"} & emitted_kinds)
+                assert not (
+                    {"fanin", "ready_claim", "ready_steal", "direct_refill", "worksteal", "resolve", "refill"}
+                    & emitted_kinds
+                )
                 records = [record for stream in streams for record in stream["records"]]
-                launch_kinds = {"dispatch", "worksteal", "refill"}
                 launches_by_task = Counter(
                     int(record["task_id"])
                     for record in records
-                    if record["kind"] in launch_kinds and record["task_id"] is not None
+                    if record["kind"] == "dispatch" and record["task_id"] is not None
                 )
                 assert set(launches_by_task) == {int(row[1]) for row in aicore_rows}
                 assert set(launches_by_task.values()) == {1}
-                profiled_task_ids = set(launches_by_task)
-                state_probe_task_ids = {
+                probes_by_task = Counter(
                     int(record["task_id"])
                     for record in records
                     if record["kind"] == "state_probe" and record["task_id"] is not None
-                }
-                assert state_probe_task_ids <= profiled_task_ids
-                inbox_launch_task_ids = {
+                )
+                assert probes_by_task == launches_by_task, "each execution token needs one acquisition record"
+                completions_by_task = Counter(
                     int(record["task_id"])
                     for record in records
-                    if record["kind"] in {"dispatch", "worksteal"} and record["task_id"] is not None
-                }
-                assert inbox_launch_task_ids <= state_probe_task_ids, (
-                    "Ready Inbox launches are missing state_probe records: "
-                    f"{sorted(inbox_launch_task_ids - state_probe_task_ids)}"
+                    if record["kind"] == "complete" and record["task_id"] is not None
                 )
-                refill_task_ids = {
-                    int(record["task_id"])
-                    for record in records
-                    if record["kind"] == "refill" and record["task_id"] is not None
-                }
-                assert profiled_task_ids - state_probe_task_ids <= refill_task_ids, (
-                    "tasks without state_probe were not launched by refill: "
-                    f"{sorted(profiled_task_ids - state_probe_task_ids - refill_task_ids)}"
-                )
+                assert completions_by_task == launches_by_task, "each execution token needs one completion record"
                 for stream in streams:
+                    # Batched token acquisitions share a discovery start, so
+                    # StateProbe envelopes may overlap. Scalar profiles below
+                    # account for the actual work without double-counting it.
                     ordered = sorted(
-                        stream["records"],
+                        (
+                            record
+                            for record in stream["records"]
+                            if not record["kind"].startswith("scalar_") and record["kind"] != "state_probe"
+                        ),
                         key=lambda record: (record["start_cycles"], record["end_cycles"]),
                     )
                     assert all(
                         previous["end_cycles"] <= current["start_cycles"]
                         for previous, current in zip(ordered, ordered[1:])
                     )
+                _verify_scalar_streams(raw, streams)
                 probe_by_task = {
                     int(record["task_id"]): record
                     for record in records
@@ -224,7 +260,7 @@ class TestSchedulerPhases(SceneTestCase):
                 launch_by_task = {
                     int(record["task_id"]): record
                     for record in records
-                    if record["kind"] in launch_kinds and record["task_id"] is not None
+                    if record["kind"] == "dispatch" and record["task_id"] is not None
                 }
                 assert all(
                     probe["end_cycles"] <= launch_by_task[task_id]["start_cycles"]
@@ -277,10 +313,10 @@ class TestConsecutiveClockAlignment(SceneTestCase):
             if not captured_outputs:
                 archived = archive_root / output_prefix.name
                 shutil.copytree(output_prefix, archived)
-                captured_outputs[case_label] = (archived, output_prefix)
+                captured_outputs[case_label] = archived
                 shutil.rmtree(output_prefix)
             else:
-                captured_outputs[case_label] = (output_prefix, output_prefix)
+                captured_outputs[case_label] = output_prefix
 
         _verify_runtime_clock_logs(
             monkeypatch,
@@ -294,7 +330,7 @@ class TestConsecutiveClockAlignment(SceneTestCase):
         invocations = []
         for case in self._matching_cases(st_platform, request):
             label = _sanitize_for_filename(f"TestConsecutiveClockAlignment_{case['name']}")
-            output_prefix, original_prefix = captured_outputs[label]
+            output_prefix = captured_outputs[label]
             captures = list(output_prefix.rglob("chip_swimlane_records.json"))
             assert len(captures) == 1
             capture = captures[0]
@@ -304,8 +340,7 @@ class TestConsecutiveClockAlignment(SceneTestCase):
             assert alignment["status"] == "bounded"
             rank_metadata = merged["metadata"]["ranks"]
             assert len(rank_metadata) == 1
-            expected_input = original_prefix / capture.relative_to(output_prefix)
-            assert rank_metadata[0]["input"] == str(expected_input)
+            assert rank_metadata[0]["input"] == str(capture.relative_to(output_prefix))
             placement = rank_metadata[0]["placement"]
             pid, inv = placement["outer_pid"], placement["outer_inv"]
             assert pid != os.getpid(), "the producer must be a forked ChipWorker"

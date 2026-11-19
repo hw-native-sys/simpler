@@ -16,6 +16,7 @@ from .main import run
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim"])
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)
+@pytest.mark.manual(["a2a3sim"])
 def test_ep_dispatch_combine(st_device_ids, st_platform):
     rc = run([int(d) for d in st_device_ids], platform=st_platform)
     assert rc == 0

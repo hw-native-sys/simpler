@@ -33,6 +33,13 @@ from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
 from simpler_setup.torch_interop import make_tensor_arg
 
+pytestmark = [
+    pytest.mark.coverage_runtime("tensormap_and_ringbuffer"),
+    pytest.mark.coverage_skip(
+        reason="rdma_deferred_completion_demo requires SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON", platforms=["a5"]
+    ),
+]
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 DTYPE_NBYTES = 4
 STATUS_WORDS = 8
@@ -179,6 +186,7 @@ def _run_case_on_worker(worker: Worker, chip_handle, elem_count: int, nranks: in
 
     def orch_fn(orch, _args, cfg):
         with orch.allocate_domain(
+            workspace_engines=("rdma",),
             name=f"rdma_deferred_completion_{elem_count}",
             workers=list(range(nranks)),
             window_size=window_size,

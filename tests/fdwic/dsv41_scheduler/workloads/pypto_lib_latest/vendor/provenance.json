@@ -1,0 +1,12 @@
+{
+  "origin": "hw-native-sys/pypto-lib dev/hbg@a6a9a2d49047ce67a85857c6b15f9604a7287714, unchanged full-forward kernels",
+  "model_commit": "a6a9a2d49047ce67a85857c6b15f9604a7287714",
+  "source_name": "l2_decode_fwd.cpp",
+  "source_sha256": "cc7f101fbb356f0e27a4375e6f4ff057deb136421d93312f13db2867f137ff96",
+  "source_bytes": 544664,
+  "host_tensor_indices": [
+    65,
+    66
+  ],
+  "native_graph_submissions": 0
+}

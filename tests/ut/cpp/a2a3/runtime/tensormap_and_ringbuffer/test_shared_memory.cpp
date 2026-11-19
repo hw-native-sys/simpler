@@ -95,6 +95,7 @@ TEST_F(SharedMemoryTest, HeaderInitValues) {
     EXPECT_EQ(hdr->sched_stall_cnt_running.load(), 0);
     EXPECT_EQ(hdr->sched_stall_cnt_ready.load(), 0);
     EXPECT_EQ(hdr->sched_stall_cnt_waiting.load(), 0);
+    EXPECT_EQ(hdr->sched_stall_cnt_async_wait.load(), 0);
     EXPECT_EQ(hdr->sched_stall_orch_done.load(), 0);
     EXPECT_EQ(hdr->sched_stall_task_id.load(), TaskId::invalid());
     EXPECT_EQ(hdr->sched_stall_core.load(), -1);
@@ -112,20 +113,27 @@ TEST_F(SharedMemoryTest, HeaderInitValues) {
 
 TEST(StallClassificationTest, PriorityRunningOverEverything) {
     // RUNNING dominates regardless of ready/waiting/orch_done.
-    EXPECT_EQ(classify_stall_detail(2, 5, 7, 0), SIMPLER_STALL_DETAIL_RUNNING_STALLED);
-    EXPECT_EQ(classify_stall_detail(1, 0, 0, 1), SIMPLER_STALL_DETAIL_RUNNING_STALLED);
+    EXPECT_EQ(classify_stall_detail(2, 5, 7, 0, 0), SIMPLER_STALL_DETAIL_RUNNING_STALLED);
+    EXPECT_EQ(classify_stall_detail(1, 0, 0, 0, 1), SIMPLER_STALL_DETAIL_RUNNING_STALLED);
 }
 
 TEST(StallClassificationTest, PriorityReadyThenWaiting) {
-    EXPECT_EQ(classify_stall_detail(0, 3, 4, 0), SIMPLER_STALL_DETAIL_READY_IDLE);
-    EXPECT_EQ(classify_stall_detail(0, 0, 4, 1), SIMPLER_STALL_DETAIL_DEP_DEADLOCK);
+    EXPECT_EQ(classify_stall_detail(0, 3, 4, 0, 0), SIMPLER_STALL_DETAIL_READY_IDLE);
+    EXPECT_EQ(classify_stall_detail(0, 0, 4, 0, 1), SIMPLER_STALL_DETAIL_DEP_DEADLOCK);
+}
+
+TEST(StallClassificationTest, AsyncWaitPrecedesDependencyWaitAndPreservesRunningAndReadyPriority) {
+    EXPECT_EQ(classify_stall_detail(0, 0, 0, 1, 1), SIMPLER_STALL_DETAIL_ASYNC_WAIT);
+    EXPECT_EQ(classify_stall_detail(0, 0, 3, 1, 0), SIMPLER_STALL_DETAIL_ASYNC_WAIT);
+    EXPECT_EQ(classify_stall_detail(1, 0, 3, 1, 1), SIMPLER_STALL_DETAIL_RUNNING_STALLED);
+    EXPECT_EQ(classify_stall_detail(0, 1, 3, 1, 1), SIMPLER_STALL_DETAIL_READY_IDLE);
 }
 
 TEST(StallClassificationTest, AllZeroSplitsOnOrchDone) {
     // No running/ready/waiting: orchestrator-not-done is starvation; done is the
     // accounting/corruption 'unknown' bucket.
-    EXPECT_EQ(classify_stall_detail(0, 0, 0, 0), SIMPLER_STALL_DETAIL_ORCH_STARVATION);
-    EXPECT_EQ(classify_stall_detail(0, 0, 0, 1), SIMPLER_STALL_DETAIL_UNKNOWN);
+    EXPECT_EQ(classify_stall_detail(0, 0, 0, 0, 0), SIMPLER_STALL_DETAIL_ORCH_STARVATION);
+    EXPECT_EQ(classify_stall_detail(0, 0, 0, 0, 1), SIMPLER_STALL_DETAIL_UNKNOWN);
 }
 
 TEST(StallClassificationTest, NamesAreStableAndDistinct) {
@@ -134,6 +142,7 @@ TEST(StallClassificationTest, NamesAreStableAndDistinct) {
     EXPECT_STREQ(stall_detail_name(SIMPLER_STALL_DETAIL_READY_IDLE), "S3:ready-but-all-idle");
     EXPECT_STREQ(stall_detail_name(SIMPLER_STALL_DETAIL_DEP_DEADLOCK), "S4:dependency-deadlock");
     EXPECT_STREQ(stall_detail_name(SIMPLER_STALL_DETAIL_ORCH_STARVATION), "S5:orchestrator-starvation");
+    EXPECT_STREQ(stall_detail_name(SIMPLER_STALL_DETAIL_ASYNC_WAIT), "S6:async-completion-wait");
     EXPECT_STREQ(stall_detail_name(SIMPLER_STALL_DETAIL_UNKNOWN), "unknown:accounting/corruption");
     EXPECT_STREQ(stall_detail_name(12345), "invalid");
 }
@@ -251,12 +260,16 @@ TEST(RuntimeArenaLayout, PerRingConfigInitializesRuntimeComponents) {
     void *sm = sm_arena.region_ptr(sm_off);
     std::memset(sm, 0, static_cast<size_t>(sm_size));
 
+    std::memset(runtime_arena.base(), 0xA5, runtime_arena.total_size());
     std::vector<char> gm(static_cast<size_t>(total_heap));
     RuntimeContext *rt =
         runtime_init_data_from_layout(runtime_arena, layout, MODE_EXECUTE, sm, sm_size, gm.data(), heaps);
     ASSERT_NE(rt, nullptr);
     runtime_wire_arena_pointers(runtime_arena, layout, rt);
 
+    EXPECT_EQ(rt->aicore_mailbox->head.load(), 0);
+    EXPECT_EQ(rt->aicore_mailbox->tail.load(), 0);
+    EXPECT_EQ(rt->aicore_mailbox->entries[0].seq.load(), 0);
     EXPECT_EQ(rt->gm_heap_size, total_heap);
     for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
         EXPECT_EQ(layout.sizing.task_window_sizes[r], ws[r]);
@@ -267,6 +280,21 @@ TEST(RuntimeArenaLayout, PerRingConfigInitializesRuntimeComponents) {
         EXPECT_EQ(rt->orchestrator.rings[r].fanin_pool.capacity, dep_caps[r]);
         EXPECT_EQ(rt->scheduler.ring_sched_states[r].dep_pool.capacity, dep_caps[r]);
     }
+    auto *original = rt;
+    rt->total_cycles = 99;
+    rt->aicore_mailbox->head.store(7);
+    rt->aicore_mailbox->tail.store(7);
+    rt->aicore_mailbox->entries[0].seq.store(7);
+    runtime_destroy(rt, runtime_arena);
+    rt = runtime_init_data_from_layout(runtime_arena, layout, MODE_EXECUTE, sm, sm_size, gm.data(), heaps);
+    ASSERT_EQ(rt, original);
+    runtime_wire_arena_pointers(runtime_arena, layout, rt);
+    EXPECT_EQ(rt->total_cycles, 0);
+    EXPECT_EQ(rt->gm_heap_size, total_heap);
+    EXPECT_EQ(rt->aicore_mailbox->head.load(), 0);
+    EXPECT_EQ(rt->aicore_mailbox->tail.load(), 0);
+    EXPECT_EQ(rt->aicore_mailbox->entries[0].seq.load(), 0);
+    runtime_destroy(rt, runtime_arena);
 }
 
 TEST(RuntimeArenaLayout, RejectsOverflowingPerRingHeapSum) {

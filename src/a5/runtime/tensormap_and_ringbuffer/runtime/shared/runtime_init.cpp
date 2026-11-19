@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include <limits>
+#include <new>
 
 #include "orchestrator.h"
 #include "runtime_core.h"
@@ -55,18 +56,23 @@ size_t ready_queue_reserve_layout(DeviceArena &arena, uint64_t capacity) {
     return arena.reserve(capacity * sizeof(ChipReadyQueueSlot), CHIP_ALIGN_SIZE);
 }
 
-bool ready_queue_init_data_from_layout(ChipReadyQueue *queue, DeviceArena &arena, size_t slots_off, uint64_t capacity) {
+bool ready_queue_init_data_from_layout(
+    ChipReadyQueue *queue, DeviceArena &arena, size_t slots_off, uint64_t capacity, bool track_mix_resources
+) {
     // Address the slots region for data writes without storing the pointer in
     // queue->slots — that field is set by ready_queue_wire_arena_pointers.
     auto *slots_arena = static_cast<ChipReadyQueueSlot *>(arena.region_ptr(slots_off));
+    always_assert(capacity <= ChipReadyQueue::kMaxCapacity && "ready queue exceeds lane counter capacity");
     queue->capacity = capacity;
     queue->mask = capacity - 1;
+    queue->track_mix_resources = track_mix_resources;
+    queue->lane_demand_.reset();
     queue->enqueue_pos.store(0, std::memory_order_relaxed);
     queue->dequeue_pos.store(0, std::memory_order_relaxed);
 
     for (uint64_t i = 0; i < capacity; i++) {
         slots_arena[i].sequence.store((int64_t)i, std::memory_order_relaxed);
-        slots_arena[i].slot_state = nullptr;
+        slots_arena[i].slot = LaneTaggedSlot{};
     }
 
     return true;
@@ -182,14 +188,16 @@ bool SchedulerState::init_data_from_layout(const SchedulerLayout &layout, Device
 
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         if (!ready_queue_init_data_from_layout(
-                &sched->ready_queues[i], arena, layout.off_ready_queue_slots[i], layout.ready_queue_capacity
+                &sched->ready_queues[i], arena, layout.off_ready_queue_slots[i], layout.ready_queue_capacity,
+                i == static_cast<int>(ResourceShape::MIX)
             )) {
             return false;
         }
     }
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         if (!ready_queue_init_data_from_layout(
-                &sched->ready_sync_queues[i], arena, layout.off_ready_sync_queue_slots[i], layout.ready_queue_capacity
+                &sched->ready_sync_queues[i], arena, layout.off_ready_sync_queue_slots[i], layout.ready_queue_capacity,
+                i == static_cast<int>(ResourceShape::MIX)
             )) {
             return false;
         }
@@ -202,7 +210,7 @@ bool SchedulerState::init_data_from_layout(const SchedulerLayout &layout, Device
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         if (!ready_queue_init_data_from_layout(
                 &sched->early_dispatch_queues[i], arena, layout.off_early_dispatch_queue_slots[i],
-                CHIP_EARLY_DISPATCH_QUEUE_SIZE
+                CHIP_EARLY_DISPATCH_QUEUE_SIZE, i == static_cast<int>(ResourceShape::MIX)
             )) {
             return false;
         }
@@ -610,8 +618,7 @@ RuntimeContext *runtime_init_data_from_layout(
     DeviceArena &arena, const RuntimeArenaLayout &layout, RuntimeMode mode, void *sm_dev_base, uint64_t /*sm_size*/,
     void *gm_heap_dev_base, const uint64_t heap_sizes[CHIP_MAX_RING_DEPTH]
 ) {
-    RuntimeContext *rt = static_cast<RuntimeContext *>(arena.region_ptr(layout.offsets.off_runtime));
-    memset(rt, 0, sizeof(*rt));
+    auto *rt = ::new (arena.region_ptr(layout.offsets.off_runtime)) RuntimeContext{};
 
     auto *sm_wrap = static_cast<SharedMemoryHandle *>(arena.region_ptr(layout.offsets.off_sm_handle));
     memset(sm_wrap, 0, sizeof(*sm_wrap));
@@ -636,8 +643,7 @@ RuntimeContext *runtime_init_data_from_layout(
         return nullptr;
     }
 
-    auto *mailbox = static_cast<AICoreCompletionMailbox *>(arena.region_ptr(layout.offsets.off_mailbox));
-    memset(mailbox, 0, sizeof(*mailbox));
+    ::new (arena.region_ptr(layout.offsets.off_mailbox)) AICoreCompletionMailbox{};
 
     return rt;
 }

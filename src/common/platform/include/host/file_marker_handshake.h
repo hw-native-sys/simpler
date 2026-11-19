@@ -12,6 +12,10 @@
 #ifndef SIMPLER_COMMON_PLATFORM_INCLUDE_HOST_FILE_MARKER_HANDSHAKE_H
 #define SIMPLER_COMMON_PLATFORM_INCLUDE_HOST_FILE_MARKER_HANDSHAKE_H
 
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
@@ -42,6 +46,7 @@ enum class Error {
     MARKER_REMOVE_FAILED,
     CLEANUP_FAILED,
     TIMED_OUT,
+    ABORTED,
 };
 
 struct Result {
@@ -55,6 +60,7 @@ struct Result {
 struct WaitOptions {
     std::chrono::milliseconds timeout{std::chrono::seconds(120)};
     std::chrono::milliseconds poll_interval{std::chrono::milliseconds(50)};
+    std::string abort_path{};
 };
 
 inline const char *stage_name(Stage stage) {
@@ -103,12 +109,12 @@ inline std::string marker_path(const std::string &rootinfo_path, uint64_t run_to
            run_token_hex(run_token) + "_" + std::to_string(rank) + ".ready";
 }
 
-inline bool publish_marker(const std::string &path) {
+inline bool publish_marker(const std::string &path, const char *payload = "1") {
     // Waiters treat visibility as publication, so never expose a partial
     // marker. Each token/tag/rank path has exactly one serialized writer.
     const std::string tmp_path = path + ".tmp";
     std::ofstream marker(tmp_path, std::ios::trunc);
-    marker << "1";
+    marker << payload;
     marker.close();
     if (!marker.good() || std::rename(tmp_path.c_str(), path.c_str()) != 0) {
         std::remove(tmp_path.c_str());
@@ -145,9 +151,10 @@ inline Result cleanup(const std::string &rootinfo_path) {
 
 inline Result wait_for_path(
     const std::string &path, Stage stage, int rank, std::chrono::steady_clock::time_point deadline,
-    std::chrono::milliseconds poll_interval
+    std::chrono::milliseconds poll_interval, const std::string &abort_path = {}
 ) {
     while (true) {
+        if (!abort_path.empty() && std::ifstream(abort_path).good()) return {Error::ABORTED, stage, rank};
         std::ifstream marker(path);
         if (marker.good()) return {};
         if (std::chrono::steady_clock::now() >= deadline) {
@@ -159,9 +166,12 @@ inline Result wait_for_path(
 
 inline Result wait_for_marker(
     const std::string &rootinfo_path, uint64_t run_token, const char *tag, int rank, Stage stage,
-    std::chrono::steady_clock::time_point deadline, std::chrono::milliseconds poll_interval
+    std::chrono::steady_clock::time_point deadline, const WaitOptions &options
 ) {
-    return wait_for_path(marker_path(rootinfo_path, run_token, tag, rank), stage, rank, deadline, poll_interval);
+    return wait_for_path(
+        marker_path(rootinfo_path, run_token, tag, rank), stage, rank, deadline, options.poll_interval,
+        options.abort_path
+    );
 }
 
 inline std::string release_path(const std::string &rootinfo_path, uint64_t run_token, int rank) {
@@ -171,6 +181,20 @@ inline std::string release_path(const std::string &rootinfo_path, uint64_t run_t
     // token-scoped file; it may only be swept after every rank has joined a
     // newer generation, never by the init-entry cleanup.
     return rootinfo_path + ".destroy_released." + run_token_hex(run_token) + "." + std::to_string(rank);
+}
+
+inline std::string failure_path(const std::string &rootinfo_path, uint64_t run_token) {
+    // Like final releases, failures must survive cleanup and the next init's sweep.
+    return rootinfo_path + ".destroy_failed." + run_token_hex(run_token);
+}
+
+inline bool publish_failure(const std::string &path) {
+    if (path.empty()) return true;
+    // Existence is the entire message; multiple ranks can report the same failure.
+    const int fd = open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
+    if (fd < 0) return errno == EEXIST;
+    close(fd);
+    return true;
 }
 
 inline Result
@@ -183,9 +207,8 @@ destroy_barrier(const std::string &rootinfo_path, int rank, int nranks, uint64_t
         return {Error::MARKER_WRITE_FAILED, Stage::ARRIVAL_PUBLISH, rank};
     }
     for (int peer_rank = 0; peer_rank < nranks; ++peer_rank) {
-        Result result = wait_for_marker(
-            rootinfo_path, run_token, kArrivalTag, peer_rank, Stage::ARRIVAL_WAIT, deadline, options.poll_interval
-        );
+        Result result =
+            wait_for_marker(rootinfo_path, run_token, kArrivalTag, peer_rank, Stage::ARRIVAL_WAIT, deadline, options);
         if (!result.ok()) return result;
     }
 
@@ -198,8 +221,7 @@ destroy_barrier(const std::string &rootinfo_path, int rank, int nranks, uint64_t
     // marker. Successful rank-0 return makes a later marker sweep safe.
     for (int follower_rank = 1; follower_rank < nranks; ++follower_rank) {
         Result result = wait_for_marker(
-            rootinfo_path, run_token, kDepartureTag, follower_rank, Stage::DEPARTURE_WAIT, deadline,
-            options.poll_interval
+            rootinfo_path, run_token, kDepartureTag, follower_rank, Stage::DEPARTURE_WAIT, deadline, options
         );
         if (!result.ok()) return result;
     }
@@ -211,7 +233,10 @@ inline Result release_after_cleanup(
 ) {
     if (rank == 0) {
         Result cleanup_result = cleanup(rootinfo_path);
-        if (!cleanup_result.ok()) return cleanup_result;
+        if (!cleanup_result.ok()) {
+            (void)publish_failure(options.abort_path);
+            return cleanup_result;
+        }
 
         Result first_error;
         for (int follower_rank = 1; follower_rank < nranks; ++follower_rank) {
@@ -219,12 +244,14 @@ inline Result release_after_cleanup(
                 first_error = {Error::MARKER_WRITE_FAILED, Stage::RELEASE_PUBLISH, follower_rank};
             }
         }
+        if (!first_error.ok()) (void)publish_failure(options.abort_path);
         return first_error;
     }
 
     const std::string path = release_path(rootinfo_path, run_token, rank);
     Result wait_result = wait_for_path(
-        path, Stage::RELEASE_WAIT, rank, std::chrono::steady_clock::now() + options.timeout, options.poll_interval
+        path, Stage::RELEASE_WAIT, rank, std::chrono::steady_clock::now() + options.timeout, options.poll_interval,
+        options.abort_path
     );
     if (!wait_result.ok()) return wait_result;
 

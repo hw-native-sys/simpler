@@ -18,12 +18,16 @@ leave the word set in whichever mailbox frame carried it.
 import ctypes
 
 import torch
+from simpler.task_interface import (
+    MAILBOX_RUN_ENTRY_STRIDE,
+    MAILBOX_RUN_ENTRY_TABLE_OFFSET,
+    mailbox_run_entry_count,
+)
 from simpler.task_interface import ArgDirection as D
 from simpler.worker import (
-    _OFF_ACCEPTED,
+    _DEFAULT_PIPELINE_DEPTH_REQUEST,
+    _OFF_ENTRY_ACCEPTED,
     _TASK_ACCEPTED,
-    MAILBOX_FRAME_SIZE,
-    MAILBOX_SIZE,
     _mailbox_load_i32,
 )
 
@@ -32,7 +36,10 @@ from simpler_setup.scene_test import _build_l3_task_args
 
 KERNELS_BASE = "../../../../examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels"
 _SIZE = 128 * 128
-_FRAME_COUNT = MAILBOX_SIZE // MAILBOX_FRAME_SIZE
+# This Worker leaves pipeline_depth unset, so its mailbox is created for the default request's
+# worth of run-resource sets: one run-state entry per run it may hold, plus the hand-offs in
+# flight.
+_ENTRY_COUNT = mailbox_run_entry_count(_DEFAULT_PIPELINE_DEPTH_REQUEST)
 
 
 def run_dag(orch, callables, task_args, config):
@@ -105,14 +112,21 @@ class TestL3LaunchAcceptance(SceneTestCase):
 
     @staticmethod
     def _assert_acceptance_published(worker):
-        """The sticky word survives completion: the parent clears it only when
-        it publishes the next task into that frame."""
+        """The sticky word survives completion: the parent clears it only when it allocates the
+        entry to the next run.
+
+        Read from the run-state entries rather than the request frames. The device writes this
+        word after the frame that delivered the payload has already gone back to the parent, so
+        the frame is not where it can be.
+        """
         shm_buf = worker._chip_shms[0].buf  # noqa: SLF001 -- scene-test white-box validation
         assert shm_buf is not None
         mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(shm_buf))
         words = [
-            _mailbox_load_i32(mailbox_addr + index * MAILBOX_FRAME_SIZE + _OFF_ACCEPTED)
-            for index in range(_FRAME_COUNT)
+            _mailbox_load_i32(
+                mailbox_addr + MAILBOX_RUN_ENTRY_TABLE_OFFSET + index * MAILBOX_RUN_ENTRY_STRIDE + _OFF_ENTRY_ACCEPTED
+            )
+            for index in range(_ENTRY_COUNT)
         ]
         assert _TASK_ACCEPTED in words, f"the chip worker never published launch acceptance: {words}"
 

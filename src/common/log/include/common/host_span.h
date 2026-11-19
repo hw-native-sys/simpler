@@ -54,6 +54,18 @@ typedef struct SimplerHostSpan {
 int unified_log_host_span_enabled(void);
 void unified_log_host_span(const SimplerHostSpan *span);
 
+/* Thread-owned scalars with no pointers into a producer DSO. */
+typedef struct SimplerHostTraceState {
+    uint64_t inv;
+    int32_t depth;
+    uint64_t hid;
+} SimplerHostTraceState;
+
+/* Null when the process owner has not initialized tracing or allocation fails. */
+SimplerHostTraceState *unified_log_host_trace_state(void);
+/* IDs start at 1; zero means no invocation was allocated because tracing is unavailable. */
+uint64_t unified_log_host_trace_allocate_inv(void);
+
 #ifdef __cplusplus
 }
 #endif

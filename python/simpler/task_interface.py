@@ -40,12 +40,14 @@ from dataclasses import dataclass
 from enum import IntEnum
 from math import prod
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     # Annotation-only: `CallableHandle` is imported lazily at its use site, and
     # PEP 563 keeps these annotations as strings, so nothing is imported at
     # runtime.
+    from simpler_setup.runtime_builder import RuntimeBinaries
+
     from .callable_identity import CallableHandle
 
 import _task_interface as _ti_module  # pyright: ignore[reportMissingImports]
@@ -56,6 +58,11 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAILBOX_OFF_ERROR_MSG,
     MAILBOX_OFF_TEARDOWN_REPORT,
     MAILBOX_PREPARATION_DISPOSITION_VALUES,
+    MAILBOX_REQUEST_FRAME_OFFSETS,
+    MAILBOX_REQUEST_FRAMES,
+    MAILBOX_RUN_ENTRY_OFFSETS,
+    MAILBOX_RUN_ENTRY_STRIDE,
+    MAILBOX_RUN_ENTRY_TABLE_OFFSET,
     MAILBOX_SIZE,
     MAILBOX_STATE_VALUES,
     MAILBOX_TASK_PROTOCOL_VERSION,
@@ -73,7 +80,9 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     CoreCallable,
     DataType,
     DeviceMemoryInfo,
+    ExecutionContextRefused,
     ProvenanceTable,
+    RunPreparationRefused,
     RuntimeEnv,
     TaskArgs,
     TaskHandle,
@@ -85,6 +94,8 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     arg_direction_name,
     get_dtype_name,
     get_element_size,
+    mailbox_run_entry_count,
+    mailbox_size,
     read_args_from_blob,
 )
 from _task_interface import (
@@ -116,6 +127,7 @@ from _task_interface import (
 )
 
 from .buffer import AccessMode, AddressSpace, Buffer, ImportContext, ImportRegistry, Tensor, TensorTransfer
+from .comm_domain import CommDomainRef, normalize_workspace_engines, seal_host_mappings
 from .comm_endpoints import DEVICE_AICPU
 
 
@@ -123,7 +135,10 @@ def _validate_host_control_access(target: ChipCallable | None, args: TaskArgs) -
     """Check callable-side host access before descriptors become address-only PODs."""
     for i in range(args.tensor_count()):
         buffer = args.tensor(i).buffer
-        if buffer.address_space != AddressSpace.HOST or args.transfer(i) != TensorTransfer.NONE:
+        if buffer.address_space != AddressSpace.HOST or args.transfer(i) not in (
+            TensorTransfer.NONE,
+            TensorTransfer.MAP,
+        ):
             continue
         direction = target.sig(i) if target is not None and i < target.sig_count else None
         needed = {
@@ -134,7 +149,22 @@ def _validate_host_control_access(target: ChipCallable | None, args: TaskArgs) -
         # Wire TaskArgs do not carry dependency tags. The callable signature governs
         # actual host reads/writes, so a weaker caller tag cannot widen the grant.
         if needed is None or buffer.access not in (needed, AccessMode.READWRITE):
-            raise ValueError(f"argument {i}: HOST/NONE Buffer grant does not cover callable direction {direction}")
+            raise ValueError(
+                f"argument {i}: HOST/{args.transfer(i).name} access grant does not cover callable direction {direction}"
+            )
+
+
+def _materialize_chip_task_args(args: TaskArgs, registry: ImportRegistry) -> ChipStorageTaskArgs:
+    """Resolve accepted argument descriptors into this process's chip-only POD.
+
+    The caller owns submission/callable checks, backing retention and the registry's
+    lifetime. Mapping and conversion do not copy tensor contents or close imports,
+    including when a later descriptor fails to resolve.
+    """
+    if not isinstance(args, TaskArgs):
+        raise TypeError("chip argument materialization requires address-free TaskArgs")
+    resolved = registry.materialize_args(args)
+    return _ti_module.materialize_task_args(args, resolved)
 
 
 def _assert_bindings_match_source_tree() -> None:
@@ -206,6 +236,8 @@ from .global_comm_domain import GlobalDomainAttachment, GlobalDomainBuffer, Glob
 __all__ = [
     "DataType",
     "DeviceMemoryInfo",
+    "ExecutionContextRefused",
+    "RunPreparationRefused",
     "get_element_size",
     "get_dtype_name",
     "MAX_TENSOR_DIMS",
@@ -236,6 +268,13 @@ __all__ = [
     "PROV_DESCRIPTOR_MISMATCH",
     "_Worker",
     "MAILBOX_SIZE",
+    "MAILBOX_REQUEST_FRAMES",
+    "MAILBOX_REQUEST_FRAME_OFFSETS",
+    "MAILBOX_RUN_ENTRY_OFFSETS",
+    "MAILBOX_RUN_ENTRY_STRIDE",
+    "MAILBOX_RUN_ENTRY_TABLE_OFFSET",
+    "mailbox_size",
+    "mailbox_run_entry_count",
     "MAILBOX_FRAME_SIZE",
     "MAILBOX_OFF_ERROR_MSG",
     "MAILBOX_ERROR_MSG_SIZE",
@@ -251,6 +290,8 @@ __all__ = [
     "CommBufferSpec",
     "ChipDomainContext",
     "CommDomainHandle",
+    "CommDomainRef",
+    "CommDomainMember",
     "GlobalCommDomainHandle",
     "GlobalCommDomainView",
 ]
@@ -981,19 +1022,22 @@ def _validate_remote_sidecar_access(args: TaskArgs, remote_sidecar: _RemoteTaskA
             )
 
 
+class _CommWorkspaceStruct(ctypes.Structure):
+    _fields_ = [("addr", ctypes.c_uint64), ("size", ctypes.c_uint64)]
+
+
 class _CommContextStruct(ctypes.Structure):
     _fields_ = [
-        ("workSpace", ctypes.c_uint64),
-        ("workSpaceSize", ctypes.c_uint64),
         ("rankId", ctypes.c_uint32),
         ("rankNum", ctypes.c_uint32),
         ("winSize", ctypes.c_uint64),
         ("windowsIn", ctypes.c_uint64 * COMM_MAX_RANK_NUM),
         ("windowsOut", ctypes.c_uint64 * COMM_MAX_RANK_NUM),
+        ("workspaces", _CommWorkspaceStruct * 4),
     ]
 
 
-assert ctypes.sizeof(_CommContextStruct) == 1056
+assert ctypes.sizeof(_CommContextStruct) == 1104
 
 
 def scalar_to_uint64(value) -> int:
@@ -1045,7 +1089,11 @@ def scalar_to_uint64(value) -> int:
 class CommBufferSpec:
     """A named slice of the per-rank communicator window.
 
-    Buffers are placed sequentially inside the window in declaration order.
+    Buffers are placed sequentially inside the window in declaration order,
+    without implicit padding. ``nbytes`` is the caller-padded physical size
+    and must be a positive multiple of 64 bytes. ``count`` may describe a
+    smaller logical extent. ``window_size`` must cover all physical sizes
+    and must also be a multiple of 64 bytes.
     The ``CommDomainHandle.contexts[chip_idx].buffers`` dict returned by
     ``Orchestrator.allocate_domain`` is keyed by ``CommBufferSpec.name``.
     """
@@ -1075,10 +1123,13 @@ class ChipDomainContext:
     buffers: dict[str, Buffer]
 
 
+CommDomainMember = GlobalDomainMember
+
+
 class CommDomainHandle:
     """User-facing handle for one dynamically-allocated CommDomain.
 
-    Returned by ``Orchestrator.allocate_domain(...)``.  Acts as a context
+    Returned by the L3/L4 ``Orchestrator.allocate_domain(...)`` API.  Acts as a context
     manager: ``with`` exit *marks* the handle for release and prevents
     further use; the actual backend free runs **after** ``Worker.run`` has
     drained any tasks the orch function submitted using this domain.  This
@@ -1090,11 +1141,19 @@ class CommDomainHandle:
         live           — allocated, indexable, can be passed to submit_*
         released       — release() called; further indexing raises;
                           backend memory still alive until Worker.run drain
-        freed          — backend release_domain has executed, memory gone
+        freed          — physical reclamation has been confirmed
 
     Most users only see ``released``; the ``live → released`` transition
     happens at ``with`` exit (or explicit ``release()``), and the
     ``released → freed`` transition is the runtime's job at end-of-run.
+
+    Callers must treat handle attributes and context/buffer mappings as read-only
+    metadata. Reassignment is unsupported; configure through allocation arguments
+    and end ownership through ``release()``. Buffer contents remain writable.
+    Tensor submissions register domain use in the current run, including cached
+    Tensors. Scalar-only use requires explicit lookup. Failed or unconfirmed
+    reclamation remains tracked and reported with ``freed=False``. Retained
+    handles may be inspected and released serially after run completion.
     """
 
     __slots__ = (
@@ -1103,52 +1162,185 @@ class CommDomainHandle:
         "contexts",
         "allocation_id",
         "_domain_size",
+        "_allocation_pending",
+        "_initializing",
+        "_initialization_failed",
         "_domain_ranks",
         "_release_fn",
+        "_release_scope",
+        "_use_fn",
         "_released",
         "_freed",
+        "members",
+        "buffers",
+        "domain_id",
+        "generation",
+        "mapping_size",
+        "retain_after_run",
+        "attachments",
+        "_config",
+        "_ref",
+        "requested_window_size",
+        "memory_source",
+        "_host_mappings",
+        "_ccu_run_generation",
+        "_ccu_register_fn",
+        "_ccu_registrations",
+        "_ccu_registration_lock",
+        "_ccu_registration_failed",
     )
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 -- preserve the L3 and legacy L4 constructor keywords
         self,
         *,
         name: str,
-        workers: tuple[int, ...],
-        contexts: dict[int, ChipDomainContext],
-        allocation_id: int,
+        workers: tuple[int, ...] = (),
+        contexts: dict[int, ChipDomainContext] | None = None,
+        allocation_id: int = 0,
         _release_fn,
+        members: tuple[GlobalDomainMember, ...] = (),
+        buffers: tuple[GlobalDomainBuffer, ...] = (),
+        domain_id: int | None = None,
+        generation: int = 1,
+        mapping_size: int = 0,
+        retain_after_run: bool = False,
+        attachments: tuple[GlobalDomainAttachment, ...] = (),
         _domain_size: int | None = None,
         _domain_ranks: dict[int, int] | None = None,
+        ref: CommDomainRef | None = None,
+        requested_window_size: int | None = None,
+        memory_source: AddressSpace = AddressSpace.DEVICE,
+        _release_scope: Callable[[CommDomainHandle], contextlib.AbstractContextManager] = contextlib.nullcontext,
+        _use_fn: Callable[[CommDomainHandle], None] | None = None,
     ) -> None:
         self.name = name
+        self.memory_source = memory_source
+        self._host_mappings = []
+        self._ccu_run_generation = 0
+        self._ccu_register_fn = None
+        self._ccu_registrations = {}
+        self._ccu_registration_lock = threading.RLock()
+        self._ccu_registration_failed = False
         self.workers = tuple(workers)
-        # Frozen dict-ish — we don't expose mutation
-        self.contexts: dict[int, ChipDomainContext] = dict(contexts)
+        self.contexts: dict[int, ChipDomainContext] = dict(contexts or {})
         self.allocation_id = int(allocation_id)
+        self._allocation_pending = False
+        self._initializing = False
+        self._initialization_failed = False
         self._domain_size = len(self.workers) if _domain_size is None else int(_domain_size)
         self._domain_ranks = (
             {worker: rank for rank, worker in enumerate(self.workers)} if _domain_ranks is None else dict(_domain_ranks)
         )
         self._release_fn = _release_fn
+        self._release_scope = _release_scope
+        self._use_fn = _use_fn
+        self.members = tuple(members)
+        self.buffers = tuple(buffers)
+        self.domain_id = self.allocation_id if domain_id is None else int(domain_id)
+        self.generation = int(generation)
+        self.mapping_size = int(mapping_size)
+        self.retain_after_run = bool(retain_after_run)
+        self.attachments = tuple(attachments)
+        self._config = None
         self._released = False
         self._freed = False
+        self._ref = ref
+        self.requested_window_size = self.mapping_size if requested_window_size is None else int(requested_window_size)
+
+    def get_or_register_ccu(self, callable_handle: CallableHandle, *, ccu_id: int, worker: int):
+        """Register a kernel on a domain member without launching it.
+
+        ``worker`` is the L2 Worker ID used for submission, not a logical domain
+        rank. Repeating the same registration returns the cached handle.
+        """
+        self._require_ready()
+        if self._ccu_register_fn is None:
+            raise RuntimeError("CCU registration requires an owned L3 domain")
+        return self._ccu_register_fn(self, callable_handle, ccu_id=ccu_id, worker=worker)
 
     def __getitem__(self, chip_idx: int) -> ChipDomainContext:
-        if self._released:
-            raise RuntimeError(
-                f"CommDomainHandle({self.name!r}) already released; do not pass it to submit_* "
-                "after release(). Submitted tasks that captured device_ctx / buffers before"
-                "release will still see live memory until Worker.run drains."
-            )
+        self._require_live()
         return self.contexts[chip_idx]
+
+    def device_context(self, worker: int, *, workspace_engines=()) -> int:
+        """Return a live context requiring the named communication engines.
+
+        Engine selection is immutable for the domain's lifetime. A2/A3 SDMA
+        uses the Worker's workspace with the domain's peer mappings.
+        This method records scalar-only context use in the orchestration run.
+        """
+        self._require_ready()
+        context = self[worker]
+        required = normalize_workspace_engines(workspace_engines)
+        initialized = self._config.workspace_engines if self._config is not None else ()
+        for engine in required:
+            if engine not in initialized:
+                raise ValueError(
+                    f"domain {self.name!r}: {engine} workspace is not initialized; "
+                    f"request workspace_engines={required!r} when allocating the domain"
+                )
+        if context.device_ctx == 0:
+            raise RuntimeError(f"domain {self.name!r}: device context is null")
+        if self._use_fn is not None:
+            self._use_fn(self)
+        return context.device_ctx
+
+    def _require_ready(self) -> None:
+        self._require_live()
+        if self._initializing:
+            raise RuntimeError(f"CommDomainHandle({self.name!r}) is initializing")
+
+    def _require_live(self) -> None:
+        if self._initialization_failed:
+            raise RuntimeError(f"CommDomainHandle({self.name!r}) initialization failed")
+        if self._released:
+            raise RuntimeError(f"CommDomainHandle({self.name!r}) is already released")
+
+    def member(self, domain_rank: int) -> GlobalDomainMember:
+        """Return rank-ordered topology and ordinary Buffer slices."""
+        self._require_live()
+        rank = int(domain_rank)
+        if rank < 0 or rank >= len(self.members):
+            raise IndexError(f"domain rank {rank} is out of range")
+        return self.members[rank]
+
+    def local_context(self, domain_rank: int) -> ChipDomainContext:
+        """Return this creator's local chip mapping; L4 creators hold no such mappings."""
+        member = self.member(domain_rank)
+        context = self[member.local_worker_id]
+        if context.domain_rank != member.domain_rank:
+            raise KeyError(f"domain rank {domain_rank} is not mapped on this node")
+        return context
+
+    @property
+    def ref(self) -> CommDomainRef:
+        """Return identity; scalar-only use still requires owner lookup in each run."""
+        self._require_live()
+        if self._ref is None:
+            raise RuntimeError("domain has no exported reference")
+        return self._ref
+
+    @property
+    def borrowed(self) -> bool:
+        return self._release_fn is None
+
+    def buffer_range(self, name: str) -> tuple[int, int]:
+        self._require_live()
+        offset = 0
+        for buffer in self.buffers:
+            if buffer.name == name:
+                return offset, buffer.nbytes
+            offset += buffer.nbytes
+        raise KeyError(f"domain {self.name!r} has no buffer {name!r}")
 
     @property
     def released(self) -> bool:
-        """True once ``release()`` (or ``with`` exit) has been called.
+        """True once release has been accepted (including ``with`` exit).
 
         Backend memory may still be alive — it is freed by the Worker after
         DAG drain at end-of-run.  Use this to gate further indexing /
         submission, not to assert physical teardown (use ``freed`` for that).
+        A release refused because of live Host CPU exports leaves this false.
         """
         return self._released
 
@@ -1156,9 +1348,9 @@ class CommDomainHandle:
     def freed(self) -> bool:
         """True once the backend ``comm_release_domain_windows`` has executed.
 
-        Only flips after the owning ``Worker.run`` completes and processes the
-        pending-release queue.  An ``orch_fn`` will never observe ``True``
-        for a handle it released within the same ``run`` call.
+        Flips after the owning run's fence and physical release. Releasing a
+        retained handle after run completion frees it synchronously. An ``orch_fn``
+        will never observe ``True`` for a handle it released within the same run.
         """
         return self._freed
 
@@ -1169,20 +1361,34 @@ class CommDomainHandle:
         backend ``comm_release_domain_windows`` runs after
         the owning run's completion wait so that tasks already submitted with
         this domain's ``device_ctx`` see live memory through execution.
+        Serial release after run completion frees a retained domain immediately.
+        Host CPU arrays and memoryviews must be dropped first. Live exports
+        raise ``BufferError`` without marking the domain released; retry after
+        dropping them. Accepted release prevents new CPU exports immediately.
 
         After this returns, the handle is treated as released for the
         user's purposes: ``__getitem__`` raises, repeated ``release()`` is
         a no-op, and the orch function must not pass it to further
         ``submit_*`` calls.
         """
+        if self._initializing:
+            raise RuntimeError("cannot release a domain from its initializer")
+        if self.borrowed:
+            raise RuntimeError("borrowed domain handles cannot release their owner")
         if self._released:
             return
-        self._released = True
-        # _release_fn is owned by Worker; it queues the actual backend
-        # release and runs it after the owning run completes. Worker also flips _freed.
-        self._release_fn(self)
+        with self._release_scope(self):
+            if self._released:
+                return
+            seal_host_mappings(self._host_mappings)
+            self._released = True
+            assert self._release_fn is not None
+            self._release_fn(self)
 
     def __enter__(self) -> CommDomainHandle:
+        if self.borrowed:
+            raise RuntimeError("borrowed domain handles cannot own a with scope")
+        self._require_live()
         return self
 
     def __exit__(self, *_):
@@ -1198,93 +1404,8 @@ class CommDomainHandle:
         return f"CommDomainHandle(name={self.name!r}, workers={self.workers}, {state})"
 
 
-class GlobalCommDomainHandle:
-    """L4-owned handle for one CommDomain spanning local and/or remote L3 nodes.
-
-    The handle contains stable topology, attachment metadata, and buffer
-    offsets only. Device addresses remain in the L3/L2 process that imported
-    the transport handles.
-    """
-
-    __slots__ = (
-        "_freed",
-        "_release_fn",
-        "_released",
-        "attachments",
-        "buffers",
-        "domain_id",
-        "generation",
-        "mapping_size",
-        "members",
-        "name",
-        "retain_after_run",
-    )
-
-    def __init__(
-        self,
-        *,
-        name: str,
-        members: tuple[GlobalDomainMember, ...],
-        buffers: tuple[GlobalDomainBuffer, ...],
-        domain_id: int,
-        generation: int,
-        mapping_size: int,
-        retain_after_run: bool,
-        _release_fn,
-        attachments: tuple[GlobalDomainAttachment, ...] = (),
-    ) -> None:
-        self.name = str(name)
-        self.members = tuple(members)
-        self.buffers = tuple(buffers)
-        self.attachments = tuple(attachments)
-        self.domain_id = int(domain_id)
-        self.generation = int(generation)
-        self.mapping_size = int(mapping_size)
-        self.retain_after_run = bool(retain_after_run)
-        self._release_fn = _release_fn
-        self._released = False
-        self._freed = False
-
-    def member(self, domain_rank: int) -> GlobalDomainMember:
-        if self._released:
-            raise RuntimeError(f"GlobalCommDomainHandle({self.name!r}) is already released")
-        rank = int(domain_rank)
-        if rank < 0 or rank >= len(self.members):
-            raise IndexError(f"global domain rank {rank} is out of range")
-        member = self.members[rank]
-        if member.domain_rank != rank:
-            raise RuntimeError("global domain member table is not rank ordered")
-        return member
-
-    def buffer_range(self, name: str) -> tuple[int, int]:
-        if self._released:
-            raise RuntimeError(f"GlobalCommDomainHandle({self.name!r}) is already released")
-        offset = 0
-        for buffer in self.buffers:
-            if buffer.name == name:
-                return offset, buffer.nbytes
-            offset += buffer.nbytes
-        raise KeyError(f"global domain {self.name!r} has no buffer {name!r}")
-
-    @property
-    def released(self) -> bool:
-        return self._released
-
-    @property
-    def freed(self) -> bool:
-        return self._freed
-
-    def release(self) -> None:
-        if self._released:
-            return
-        self._released = True
-        self._release_fn(self)
-
-    def __enter__(self) -> GlobalCommDomainHandle:
-        return self
-
-    def __exit__(self, *_):
-        self.release()
+# The legacy L4 spelling denotes the same owning handle type.
+GlobalCommDomainHandle = CommDomainHandle
 
 
 class GlobalCommDomainView:
@@ -1447,6 +1568,53 @@ def _resolve_collect_across_runs(collect_across_runs: bool | None, dfx_session: 
             f"collect_across_runs={collect_across_runs!r} and dfx_session={dfx_session!r} disagree; pass one of them"
         )
     return bool(dfx_session)
+
+
+def _initialize_chip_runtime(  # noqa: PLR0913 -- explicit binary, workspace and environment options initialize one native owner
+    impl: _ChipWorker,
+    device_id: int,
+    bins: RuntimeBinaries,
+    *,
+    log_level: int | None = None,
+    prewarm_config: CallConfig | None = None,
+    enable_sdma: bool = False,
+    collect_across_runs: bool = False,
+    workspace_budget_bytes: int = 0,
+    manage_workspace: bool = False,
+    requested_pipeline_depth: int = 0,
+    borrowed_context_generation: int | None = None,
+) -> None:
+    """Bind one native chip runtime from binary paths and initialize its host logger.
+
+    The caller owns lifecycle admission, callable slots and cleanup after failure.
+    """
+    _initialize_host_log(log_level)
+    dispatcher_path = getattr(bins, "dispatcher_path", None)
+    sim_context_path = getattr(bins, "sim_context_path", None)
+    sdma_warmup_path = getattr(bins, "sdma_warmup_path", None)
+    init_options = {}
+    if borrowed_context_generation is not None:
+        init_options["borrowed_context_generation"] = borrowed_context_generation
+        # Borrowed bootstrap takes no Program-owned SDMA warmup ELF.
+        sdma_warmup_path = None
+    # C++ retains libcpu_sim_context.so in the sim process registry. Sim has
+    # no dispatcher; onboard bootstrap consumes its actual binary path.
+    impl.init(
+        str(bins.host_path),
+        "" if bins.aicpu_path is None else str(bins.aicpu_path),
+        str(bins.aicore_path),
+        "" if dispatcher_path is None else str(dispatcher_path),
+        int(device_id),
+        prewarm_config,
+        bool(enable_sdma),
+        "" if sim_context_path is None else str(sim_context_path),
+        "" if sdma_warmup_path is None else str(sdma_warmup_path),
+        bool(collect_across_runs),
+        int(workspace_budget_bytes),
+        bool(manage_workspace),
+        int(requested_pipeline_depth),
+        **init_options,
+    )
 
 
 class ChipWorker:
@@ -1613,28 +1781,17 @@ class ChipWorker:
             self._init_in_progress = True
 
         try:
-            _initialize_host_log(log_level)
-
-            # C++ retains libcpu_sim_context.so in the sim process registry,
-            # loads host_runtime.so, and binds both private logger copies.
-            # dispatcher_path is empty on sim; onboard consumes the real path.
-            dispatcher_path = getattr(bins, "dispatcher_path", None)
-            sim_context_path = getattr(bins, "sim_context_path", None)
-            sdma_warmup_path = getattr(bins, "sdma_warmup_path", None)
-            self._impl.init(
-                str(bins.host_path),
-                str(bins.aicpu_path),
-                str(bins.aicore_path),
-                "" if dispatcher_path is None else str(dispatcher_path),
-                int(device_id),
-                prewarm_config,
-                bool(enable_sdma),
-                "" if sim_context_path is None else str(sim_context_path),
-                "" if sdma_warmup_path is None else str(sdma_warmup_path),
-                bool(_resolve_collect_across_runs(collect_across_runs, dfx_session)),
-                int(workspace_budget_bytes),
-                bool(manage_workspace),
-                int(requested_pipeline_depth),
+            _initialize_chip_runtime(
+                self._impl,
+                device_id,
+                bins,
+                log_level=log_level,
+                prewarm_config=prewarm_config,
+                enable_sdma=enable_sdma,
+                collect_across_runs=_resolve_collect_across_runs(collect_across_runs, dfx_session),
+                workspace_budget_bytes=workspace_budget_bytes,
+                manage_workspace=manage_workspace,
+                requested_pipeline_depth=requested_pipeline_depth,
             )
             for slot_id, callable_obj in list(self._callable_registry.items()):
                 self._impl.register_callable(int(slot_id), callable_obj)
@@ -1753,6 +1910,8 @@ class ChipWorker:
             hashid_to_digest,
         )
 
+        if self.initialized:
+            self._impl._validate_execution_context()
         descriptor = build_chip_callable_descriptor(target=callable)
         hashid = compute_callable_hashid(descriptor)
         digest = hashid_to_digest(hashid)
@@ -1835,7 +1994,10 @@ class ChipWorker:
                     if args.transfer(i) == TensorTransfer.NONE:
                         continue
                     if args.transfer(i) != TensorTransfer.H2D:
-                        raise ValueError(f"ChipWorker.run: argument {i} requires NONE or H2D transfer")
+                        raise ValueError(
+                            f"ChipWorker.run: argument {i} requires NONE or H2D; "
+                            "use Worker(level=2).submit for MAP preparation and lifetime validation"
+                        )
                     tensor = args.tensor(i)
                     expected = 1
                     shapes, strides = tensor.shapes, tensor.strides
@@ -1846,13 +2008,17 @@ class ChipWorker:
                 registry = ImportRegistry(ImportContext(deployment=DEVICE_AICPU))
                 self._argument_imports = registry
                 try:
-                    args = _ti_module.materialize_task_args(args, registry.materialize_args(args))
+                    args = _materialize_chip_task_args(args, registry)
                 except BaseException:
                     self._close_argument_imports()
                     raise
-            # A native exception leaves completion unproven. Imports remain live
-            # until successful device teardown; no finally block may unmap them.
-            self._impl.run(int(state.slot_id), args, config)
+            # Only a proven pre-execution refusal releases imports on an error;
+            # other native exceptions keep them through successful teardown.
+            try:
+                self._impl.run(int(state.slot_id), args, config)
+            except RunPreparationRefused:
+                self._close_argument_imports()
+                raise
             self._close_argument_imports()
 
     def _close_argument_imports(self) -> None:
@@ -1863,6 +2029,8 @@ class ChipWorker:
 
     def unregister_callable(self, handle) -> None:
         """Drop one live callable handle and release its private resources when final."""
+        if self.initialized:
+            self._impl._validate_execution_context()
         with self._registry_lock:
             state = self._resolve_handle_locked(handle)
             self._live_handles.pop(handle._handle_id, None)
@@ -1976,6 +2144,26 @@ class ChipWorker:
         return self._impl.run_stream_set_create_count
 
     @property
+    def scheduler_runtime_mode(self) -> int:
+        """SCHEDULER_RUNTIME_MODE_* of the most recent bind; 0 if none published."""
+        return self._impl.scheduler_runtime_mode
+
+    @property
+    def scheduler_mode_publish_count(self) -> int:
+        """How many binds have published a scheduler selection."""
+        return self._impl.scheduler_mode_publish_count
+
+    @property
+    def unobserved_completed_run_count(self) -> int:
+        """Recorded-complete calls whose result has not been delivered yet."""
+        return self._impl.unobserved_completed_run_count
+
+    @property
+    def unobserved_completed_run_high_water(self) -> int:
+        """Largest unobserved_completed_run_count sampled; monotonic."""
+        return self._impl.unobserved_completed_run_high_water
+
+    @property
     def pipeline_depth(self):
         return self._impl.pipeline_depth
 
@@ -1983,6 +2171,32 @@ class ChipWorker:
     def launch_depth(self):
         """How many runs this worker may have launched at once, after its request was resolved."""
         return self._impl.launch_depth
+
+    def enable_automatic_admission(self) -> bool:
+        """Let this worker's device context size its own run concurrency.
+
+        Asked once, after init, by a caller that specified no depth and no byte budget. Returns
+        False when the loaded module or the context cannot — a simulated backend, a borrowed
+        context, or a module without the entry — and the worker then admits exactly what it was
+        granted, as it did before.
+        """
+        return bool(self._impl._enable_automatic_admission())  # noqa: SLF001 -- no public equivalent
+
+    @property
+    def automatic_admission(self) -> bool:
+        """Whether this worker's context sizes its own run concurrency."""
+        return bool(self._impl.automatic_admission)
+
+    @property
+    def admissible_run_resource_sets(self) -> int:
+        """Run-resource sets this context reports it can hold right now.
+
+        A count of identities, never a byte figure: it is one until a run has completed its
+        resource commit, grows with what this context has proved it can hold, and falls when those
+        resources are reclaimed or become unprovable. The granted count on a context that does not
+        size itself.
+        """
+        return int(self._impl.admissible_run_resource_sets)
 
     def configure_launch_depth(self, depth):
         """Ask, before init, for a launch depth.

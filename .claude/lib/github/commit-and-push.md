@@ -26,7 +26,10 @@ else
 fi
 ```
 
-On conflicts: resolve files, `git add <file>`, `git rebase --continue`. If stuck: `git rebase --abort`.
+On conflicts, follow the
+[merge-conflict procedure](../../skills/fix-pr/references/merge-conflicts.md):
+resolve files, `git add <file>`, `git rebase --continue`. Abort only when the
+rebase target is wrong or the branch is corrupted.
 
 If `REBASE_CHANGED == true`, validate the commit message and content.
 

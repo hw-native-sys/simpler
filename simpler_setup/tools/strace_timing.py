@@ -137,7 +137,9 @@ class Span:
 
     @property
     def is_device(self) -> bool:
-        return "clk=dev" in self.attrs
+        # Old device-boundary records tagged their device-clock *attributes*
+        # as clk=dev, although their own ts is a Host CLOCK_MONOTONIC point.
+        return "clk=dev" in self.attrs and self.name != "chip.run.runner_run.device_boundaries"
 
 
 class NativeOverlapError(ValueError):
@@ -255,9 +257,15 @@ def warn_about_lost_records(lines, spans):
 
 def parse_spans(lines):
     """Yield every complete span, including adjacent records on one line."""
+    for span, _record in parse_span_records(lines):
+        yield span
+
+
+def parse_span_records(lines):
+    """Yield each complete span with its own exact [STRACE] record text."""
     for line in lines:
         for m in _STRACE_RE.finditer(line):
-            yield Span(
+            span = Span(
                 pid=int(m["pid"]),
                 tid=int(m["tid"]),
                 inv=int(m["inv"]),
@@ -268,6 +276,7 @@ def parse_spans(lines):
                 dur=int(m["dur"]),
                 attrs=m["attrs"].strip(),
             )
+            yield span, m.group(0).rstrip("\r\n")
 
 
 def _trace_document(events, **extra):
@@ -552,6 +561,7 @@ def print_tpot_table(buckets, label_for_hid=None, stream=sys.stdout):
 _ROUNDS_TABLE_NAMES = {
     "run": "chip.run",
     "device": "chip.run.runner_run.device_wall",
+    "aicore": "chip.run.runner_run.aicore_wall",
     "orch": "chip.run.runner_run.device_wall.orch",
     "sched": "chip.run.runner_run.device_wall.sched",
 }
@@ -560,11 +570,11 @@ _ROUNDS_TABLE_NAMES = {
 # window (the old device-log "Total"), recomputed here purely from the orch/sched
 # markers' device-domain ts+dur — no device log needed. label is the column
 # header / "Avg <label>".
-_ROUNDS_TABLE_COLUMNS = ("Host", "Device", "Effective", "Orch", "Sched")
+_ROUNDS_TABLE_COLUMNS = ("Host", "Device", "Effective", "Orch", "Sched", "AICore")
 
 
 def _round_metrics(inv):
-    """Return one round's (Host, Device, Effective, Orch, Sched) in µs from spans.
+    """Return one round's Host/Device/Effective/Orch/Sched/AICore times in µs.
 
     Host/Device/Orch/Sched are span durations; Effective =
     ``max(orch_end, sched_end) - min(orch_start, sched_start)`` from the orch/sched
@@ -587,11 +597,11 @@ def _round_metrics(inv):
     else:
         effective = 0.0
 
-    return (_dur("run"), _dur("device"), effective, _dur("orch"), _dur("sched"))
+    return (_dur("run"), _dur("device"), effective, _dur("orch"), _dur("sched"), _dur("aicore"))
 
 
 def print_rounds_table(buckets, stream=sys.stdout):
-    """Print a per-round Host/Device/Effective/Orch/Sched table (µs) for the busiest hid.
+    """Print per-round Host/Device/Effective/Orch/Sched/AICore times for the busiest hid.
 
     This renders the per-round benchmark table that ``scene_test`` used to print
     inline. The most-invoked hid bucket is treated as the rounds (one row per

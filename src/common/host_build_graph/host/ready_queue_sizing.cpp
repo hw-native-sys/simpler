@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "host_build_graph/ready_queue_sizing.h"
+#include "host_build_graph/host/ready_queue_sizing.h"
 
 #include "host_build_graph/runtime_status.h"
 
@@ -35,23 +35,6 @@ uint64_t capacity_for_population(uint64_t population) {
 
 }  // namespace
 
-void ReadyQueuePopulations::add_task(ActiveMask active_mask, TaskAttrs task_attrs, TaskKind task_kind, uint64_t count) {
-    if (task_kind == TaskKind::GRAPH) {
-        add_population(&graph_prepare, count);
-        return;
-    }
-
-    const ResourceShape shape = active_mask.to_shape();
-    if (shape == ResourceShape::DUMMY) {
-        add_population(&dummy, count);
-        return;
-    }
-
-    if (task_attrs.has_predicate()) add_population(&dummy, count);
-    uint64_t *population = task_attrs.requires_sync_start() ? ready_sync : ready;
-    add_population(&population[static_cast<int32_t>(shape)], count);
-}
-
 void ReadyQueuePopulations::add(const ReadyQueuePopulations &other) {
     for (int i = 0; i < NUM_RESOURCE_SHAPES; ++i) {
         add_population(&ready[i], other.ready[i]);
@@ -76,7 +59,7 @@ bool ReadyQueuePopulations::derive_capacities(ReadyQueueCapacities *capacities) 
         capacities->ready_sync[i] = capacity_for_population(ready_sync[i]);
     }
     capacities->dummy = capacity_for_population(dummy);
-    capacities->graph_prepare = capacity_for_population(graph_prepare);
+    capacities->graph_prepare = 2 * capacity_for_population(graph_prepare);
     return true;
 }
 

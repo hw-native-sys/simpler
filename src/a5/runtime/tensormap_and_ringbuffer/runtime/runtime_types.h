@@ -156,7 +156,7 @@ struct TaskAllocResult {
 struct OutputLayout {
     uint64_t offsets[MAX_TENSOR_ARGS] = {};
     uint64_t buffer_sizes[MAX_TENSOR_ARGS] = {};
-    int32_t total_output_size = 0;
+    uint64_t total_output_size = 0;
 };
 
 // =============================================================================
@@ -540,8 +540,8 @@ struct alignas(64) ChipTaskSlotState {
     TaskDescriptor *task;
 
     // --- Set per-submit (depend on task inputs) ---
-    ActiveMask active_mask;  // Bitmask of active subtask slots (set once)
-    uint8_t ring_id;         // Ring layer (immutable after init)
+    LaneMask active_mask;  // Bitmask of active subtask slots (set once)
+    uint8_t ring_id;       // Ring layer (immutable after init)
     // Single per-task attributes byte (early-dispatch hint, sync_start,
     // has_predicate, selective timing tag). Lives on slot_state (not payload) so
     // fanin walks and the completion path read them off the already-hot producer
@@ -630,6 +630,14 @@ struct alignas(64) ChipTaskSlotState {
         return (lifecycle_flags.load(std::memory_order_acquire) & SUBTASK_DEFERRED) != 0;
     }
 
+    // Logical completion is checked separately. FIN accounting covers both the
+    // mailbox handoff and residence in the async wait-list.
+    bool has_finished_deferred_subtasks() const {
+        return total_required_subtasks > 0 &&
+               completed_subtasks.load(std::memory_order_acquire) == total_required_subtasks &&
+               has_any_subtask_deferred();
+    }
+
     /**
      * Reset dynamic scheduling fields for slot reuse.
      * Called by advance_ring_pointers() after a slot transitions to CONSUMED
@@ -706,6 +714,7 @@ struct alignas(64) ChipTaskSlotState {
 };
 
 static_assert(sizeof(ChipTaskSlotState) == 64);
+static_assert(offsetof(ChipTaskSlotState, active_mask) == 48);
 // FaninSpillEntry packs DepFlags into the low bits of a ChipTaskSlotState*.
 // That is only lossless while the type is aligned past those tag bits.
 static_assert(

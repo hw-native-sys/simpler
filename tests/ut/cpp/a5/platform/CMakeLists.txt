@@ -34,7 +34,7 @@ simpler_ut_add_target(NAME test_host_log_off
 # a5 CPU_TOPO fallback and affinity selection. Pure logic; packaged fallback
 # entries enforce their own verified SoC, host-architecture and OCCUPY constraints.
 a5_platform_case(test_aicpu_topology_fallback.cpp
-    SOURCES ${A5_ONBOARD_HOST_DIR}/aicpu_topology_probe.cpp
+    SOURCES ${A5_ONBOARD_HOST_DIR}/aicpu_affinity_select.cpp
     INCLUDES ${A5_ONBOARD_HOST_DIR}
     LINK ${CMAKE_DL_LIBS})
 # The probe reads this table from beside its own binary.
@@ -49,6 +49,7 @@ a5_platform_case(test_aicore_retirement.cpp
         ${SIMPLER_SRC}/a5/platform/shared/aicpu/platform_regs.cpp
         ${SIMPLER_SRC}/a5/platform/sim/aicpu/inner_platform_regs.cpp
         ${SIMPLER_SRC}/common/platform/sim/aicpu/device_time.cpp
+        ${SIMPLER_SRC}/common/platform/sim/aicpu/cache_ops.cpp
         ${HOST_LOG_TEST_SOURCES}
     INCLUDES ${SIMPLER_SRC}/common/platform/sim/aicpu)
 set_tests_properties(test_a5_aicore_retirement PROPERTIES TIMEOUT 20)
@@ -62,8 +63,32 @@ a5_platform_case(test_return_gate_wait.cpp
         ${SIMPLER_SRC}/a5/platform/shared/aicpu/platform_regs.cpp
         ${SIMPLER_SRC}/a5/platform/sim/aicpu/inner_platform_regs.cpp
         ${SIMPLER_SRC}/common/platform/sim/aicpu/device_time.cpp
+        ${SIMPLER_SRC}/common/platform/sim/aicpu/cache_ops.cpp
         ${HOST_LOG_TEST_SOURCES}
     INCLUDES ${SIMPLER_SRC}/common/platform/sim/aicpu ${SIMPLER_SRC}/a5/platform/sim)
 set_tests_properties(test_a5_return_gate_wait PROPERTIES TIMEOUT 20)
+
+# The real sim wrapper is loaded and unloaded with each runtime's Runtime ABI.
+# The executor is an identity-checking fixture; pthread key accounting uses
+# the process's actual resource limit and calls the production wrapper.
+foreach(runtime ${SIMPLER_RUNTIMES})
+    simpler_runtime_tag(${runtime} runtime_tag)
+    simpler_ut_includes(a5 ${runtime} host tls_contract)
+    set(tls_fixture a5_${runtime_tag}_sim_tls_fixture)
+    add_library(${tls_fixture} SHARED
+        ${SIMPLER_SRC}/a5/platform/sim/aicore/kernel.cpp
+        support/sim_aicore_tls_fixture.cpp)
+    target_include_directories(${tls_fixture} PRIVATE
+        ${tls_contract}
+        ${SIMPLER_SRC}/a5/platform/sim/aicore)
+    target_link_libraries(${tls_fixture} PRIVATE pthread ${CMAKE_DL_LIBS})
+    simpler_ut_add_target(NAME test_a5_${runtime_tag}_sim_aicore_tls
+        SOURCES test_sim_aicore_tls.cpp
+        DEFINES SIM_TLS_FIXTURE_PATH="$<TARGET_FILE:${tls_fixture}>"
+        LINK ${CMAKE_DL_LIBS}
+        DEPENDS ${tls_fixture}
+        LABEL no_hardware
+        TIMEOUT 30)
+endforeach()
 
 simpler_ut_glob_cases(a5_platform_case)

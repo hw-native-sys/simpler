@@ -17,4 +17,11 @@ macro(worker_case src)
         LABEL no_hardware ${ARGN})
 endmacro()
 
+add_library(runtime_module_fixture MODULE ${CMAKE_SOURCE_DIR}/support/runtime_module_fixture.cpp)
+worker_case(test_runtime_module.cpp
+    SOURCES ${SIMPLER_SRC}/common/worker/runtime_module.cpp
+    DEFINES RUNTIME_MODULE_FIXTURE_PATH="$<TARGET_FILE:runtime_module_fixture>"
+    DEPENDS runtime_module_fixture
+    LINK ${CMAKE_DL_LIBS})
+
 simpler_ut_glob_cases(worker_case)

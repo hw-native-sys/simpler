@@ -48,8 +48,12 @@ my_example/
   kernels/
     aic/                 # AICore kernel sources (optional)
     aiv/                 # AIV kernel sources (optional)
+    ccu/                 # CCU program definitions, module exports and manifest (optional)
     orchestration/       # Orchestration C++ source
 ```
+
+A CCU module may export multiple kernels from one source file. Keep its program
+definitions under `kernels/ccu/`.
 
 Run via pytest: `pytest examples tests/st --platform <platform>`, or standalone: `python <example_or_test>/test_*.py -p <platform>`.
 

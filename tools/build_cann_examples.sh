@@ -103,7 +103,7 @@ built=()
 
 for tool in "$ROOT"/tools/cann-examples/*/; do
     name="$(basename "$tool")"
-    # cmake/ holds shared modules, not a tool.
+    # cmake/ holds shared code and a CPU-only regression test, not a tool.
     [ "$name" = "cmake" ] && continue
 
     echo "=== $name"
@@ -176,6 +176,22 @@ for tool in "$ROOT"/tools/cann-examples/*/; do
         failed+=("$name")
     fi
 done
+
+# Check the shared register mapper with fake HAL calls on both CI architectures.
+# This catches the a5 second-die core-ID layout and ACL-to-HAL device remapping
+# even when the smoke producer happens to land on the first die.
+echo "=== shared aicore register mapping"
+mapping_test_dir="$ROOT/tools/cann-examples/cmake"
+if build_one "$mapping_test_dir"; then
+    if ctest --test-dir "$mapping_test_dir/build" --output-on-failure; then
+        echo "  test ok"
+    else
+        echo "  TEST FAILED: aicore register mapping"
+        failed+=("aicore-reg-mapping")
+    fi
+else
+    failed+=("aicore-reg-mapping")
+fi
 
 echo
 echo "built  (${#built[@]}): ${built[*]:-none}"

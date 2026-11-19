@@ -17,9 +17,112 @@ endmacro()
 a5_hbg_case(test_hbg_scheduler_contracts.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu)
 
+a5_hbg_case(test_hbg_args_dump_service.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu
+    SOURCES
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu/args_dump_service.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp)
+
+a5_hbg_case(test_hbg_args_dump_rendezvous.cpp)
+
+a5_hbg_case(test_hbg_graph_view.cpp)
+
+a5_hbg_case(test_hbg_task_image.cpp
+    SOURCES ${SIMPLER_SRC}/common/host_build_graph/shared/shared_memory.cpp)
+
+a5_hbg_case(test_hbg_scalar_trace.cpp NO_OBJS TIMEOUT 20
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/scalar_policy_plain.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/scalar_policy_profiled.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore
+    DEFINES __CPU_SIM)
+
+a5_hbg_case(test_hbg_scalar_trace_header.cpp NO_OBJS TIMEOUT 20
+    DEFINES __CPU_SIM)
+
+a5_hbg_case(test_hbg_async_directory.cpp NO_OBJS TIMEOUT 20)
+a5_hbg_case(test_hbg_async_state.cpp NO_OBJS TIMEOUT 20)
+a5_hbg_case(test_hbg_ccu_completion.cpp NO_OBJS LINK a5_ut_support TIMEOUT 20
+    SOURCES ${HBG_COMMON_SHARED_DIR}/runtime.cpp)
+a5_hbg_case(test_hbg_async_pending.cpp NO_OBJS TIMEOUT 20)
+a5_hbg_case(test_hbg_async_writer.cpp NO_OBJS TIMEOUT 20)
+a5_hbg_case(test_hbg_async_control.cpp TIMEOUT 20
+    INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore
+    DEFINES __CPU_SIM
+    SOURCES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_completion_plan.cpp)
+a5_hbg_case(test_hbg_async_plan.cpp NO_OBJS TIMEOUT 20
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host
+    SOURCES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_completion_plan.cpp)
+
+a5_hbg_case(test_hbg_execution_ownership.cpp NO_OBJS TIMEOUT 20
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host)
+
+a5_hbg_case(test_hbg_prepared_bindings.cpp NO_OBJS TIMEOUT 20
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host
+    SOURCES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_completion_plan.cpp)
+
+a5_hbg_case(test_hbg_task_catalog.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host)
+
+a5_hbg_case(test_hbg_native_graph_plan.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host
+    SOURCES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/native_graph_plan.cpp)
+
+a5_hbg_case(test_hbg_protocol_export.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host)
+
+a5_hbg_case(test_hbg_ordered_execution.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore
+    DEFINES __CPU_SIM)
+
+a5_hbg_case(test_hbg_admission_progress.cpp TIMEOUT 20
+    INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore
+    DEFINES __CPU_SIM
+    SOURCES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_completion_plan.cpp)
+
+a5_hbg_case(test_hbg_gm_mix.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore
+    DEFINES __CPU_SIM)
+
+a5_hbg_case(test_hbg_scheduler_dispatch.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore
+    DEFINES __CPU_SIM)
+
+a5_hbg_case(test_hbg_cluster_owned_groups.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore
+    DEFINES __CPU_SIM)
+
+a5_hbg_case(test_hbg_direct_mix_handoff.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore
+    DEFINES __CPU_SIM)
+
+a5_hbg_case(test_hbg_inline_services.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore
+    DEFINES __CPU_SIM)
+
+a5_hbg_case(test_hbg_error_identity.cpp
+    INCLUDES
+        ${SIMPLER_SRC}/a5/platform/sim/aicore
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu
+    DEFINES __CPU_SIM)
+
 a5_hbg_case(test_hbg_scheduler_bootstrap.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu
     SOURCES  ${HBG_COMMON_SHARED_DIR}/runtime.cpp)
+
+a5_hbg_case(test_hbg_nonce_exit.cpp NO_OBJS TIMEOUT 20
+    SOURCES
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/aicore_executor.cpp
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_ordinary.cpp
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_native.cpp
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_ordinary_profiled.cpp
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_native_profiled.cpp
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_ordinary_timing.cpp
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicore/resident_native_timing.cpp
+        ${SIMPLER_SRC}/a5/platform/shared/aicpu/platform_regs.cpp
+        ${SIMPLER_SRC}/a5/platform/sim/aicpu/inner_platform_regs.cpp
+        ${SIMPLER_SRC}/common/platform/sim/aicpu/device_time.cpp
+        ${SIMPLER_SRC}/common/platform/sim/aicpu/cache_ops.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore ${SIMPLER_SRC}/common/platform/sim/aicpu)
 
 # Exercise the HBG owners against a recording retirement boundary. The platform
 # register tests separately drive the real ACK/close/read-back/drain sequence.
@@ -32,27 +135,24 @@ a5_hbg_case(test_hbg_retirement_wiring.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu
     SOURCES
         ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp
-        ${SIMPLER_SRC}/a5/runtime/host_build_graph/runtime/scheduler/scheduler_cold_path.cpp
         ${HBG_COMMON_SHARED_DIR}/runtime.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
         ${SIMPLER_SRC}/a5/platform/shared/aicpu/pmu_collector_aicpu.cpp
     COMPILE_OPTIONS -ffunction-sections -fdata-sections
     LINK_OPTIONS ${_retirement_gc_link_option})
 
+a5_hbg_case(test_hbg_gm_mix_startup.cpp
+    INCLUDES
+        ${SIMPLER_SRC}/a5/platform/sim/aicore
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph
+    DEFINES __CPU_SIM
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK_OPTIONS ${_retirement_gc_link_option})
+
 # Drives the real orchestrator submit path.
 a5_hbg_case(test_hbg_submit_poison.cpp ORCH)
 
-# Incremental activation inits a real SchedulerState (ready queues), so it links
-# the scheduler and shared runtime out-of-line members.
-a5_hbg_case(test_graph_activation.cpp
-    SOURCES ${HBG_SHARED_RUNTIME_SOURCES})
-
-# The epoch the scheduler reports under, and the terminal record the legacy
-# path still writes. Both read state this arch's hbg AICPU headers declare and
-# call the shared runtime's out-of-line members.
-simpler_ut_cases(a5_hbg_case
-    test_hbg_report_epoch.cpp
-    test_hbg_legacy_terminal_record.cpp
+a5_hbg_case(test_hbg_report_epoch.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu
     SOURCES  ${HBG_COMMON_SHARED_DIR}/runtime.cpp)
 
@@ -66,8 +166,29 @@ else()
 endif()
 a5_hbg_case(test_hbg_resident_late_aicore_error.cpp
     INCLUDES        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu
-    SOURCES         ${HBG_COMMON_SHARED_DIR}/runtime.cpp
+    SOURCES
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu/args_dump_service.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/aicpu_device_config.cpp
+        ${HBG_COMMON_SHARED_DIR}/runtime.cpp
+        ${SIMPLER_SRC}/common/host_build_graph/device/graph_execution.cpp
     COMPILE_OPTIONS -ffunction-sections -fdata-sections
     LINK_OPTIONS    ${_gc_link_option})
+
+a5_hbg_case(test_hbg_resident_entry_result.cpp TIMEOUT 30
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu
+    SOURCES
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu/args_dump_service.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp
+        ${HBG_COMMON_SHARED_DIR}/runtime.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/aicpu_device_config.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_phase_aicpu.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/sim/aicpu/platform_aicpu_affinity.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/chip_swimlane_collector_aicpu.cpp
+        ${SIMPLER_SRC}/a5/platform/shared/aicpu/pmu_collector_aicpu.cpp
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK_OPTIONS ${_gc_link_option})
 
 simpler_ut_glob_cases(a5_hbg_case)

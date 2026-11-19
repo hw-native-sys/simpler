@@ -481,7 +481,7 @@ _KERNELS = [
 # Chip orchestration tensor-argument directions (scalars excluded), from kernel_config.py.
 _ORCH_SIG = "iiiiiiiiiiixiiiiiiiixiiiixiiiiiiiixxxxiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiiioooxiiiiooioooooi"
 
-# Comm-window buffers from the generated host orchestration (dtype opaque, 32 B aligned).
+# Comm-window logical byte sizes; each physical allocation is padded to 64 B.
 _WINDOW_BUFFERS = [
     ("recv_meta_buf", 256),
     ("recv_x_buf", 2097152),
@@ -497,7 +497,7 @@ _WINDOW_BUFFERS = [
     ("lm_head_logits_done_buf", 8),
 ]
 
-_WINDOW_SIZE = sum(-(-count // 32) * 32 for _, count in _WINDOW_BUFFERS)
+_WINDOW_SIZE = sum(-(-count // 64) * 64 for _, count in _WINDOW_BUFFERS)
 
 # Per-rank TaskArgs build steps, transcribed from the generated host_orch.py:
 #   ("param",  name, argtype)               -> this rank's shard  (child-memory tensor)
@@ -761,7 +761,7 @@ def _submit(orch, chip_handle, params, whole, config, n_ranks: int, keepalive: l
         workers=list(range(n_ranks)),
         window_size=_WINDOW_SIZE,
         buffers=[
-            CommBufferSpec(name=name, dtype="opaque", count=count, nbytes=-(-count // 32) * 32)
+            CommBufferSpec(name=name, dtype="opaque", count=count, nbytes=-(-count // 64) * 64)
             for name, count in _WINDOW_BUFFERS
         ],
     ) as domain:

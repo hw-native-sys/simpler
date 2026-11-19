@@ -49,7 +49,7 @@ TEST(ChipMaxTensorArgs, ChipStorageHoldsCapacity) {
 
 TEST(ChipMaxTensorArgs, ChipCallableAcceptsCapacity) {
     std::vector<ArgDirection> signature(256, ArgDirection::IN);
-    auto buffer = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
+    auto buffer = make_chip_callable(
         signature.data(), static_cast<int32_t>(signature.size()), "composed", nullptr, 0, nullptr, nullptr, 0, ""
     );
 
@@ -62,9 +62,7 @@ TEST(ChipMaxTensorArgs, ChipCallableOverflowReportsRequestedAndSupportedCounts) 
     std::vector<ArgDirection> signature(static_cast<size_t>(requested), ArgDirection::IN);
 
     try {
-        (void)make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
-            signature.data(), requested, "overflow", nullptr, 0, nullptr, nullptr, 0, ""
-        );
+        (void)make_chip_callable(signature.data(), requested, "overflow", nullptr, 0, nullptr, nullptr, 0, "");
         FAIL() << "expected signature capacity validation to fail";
     } catch (const std::invalid_argument &error) {
         const std::string message = error.what();

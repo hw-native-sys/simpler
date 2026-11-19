@@ -7,6 +7,15 @@ concepts) see
 For the cache coherency rules see
 [docs/hardware/cache-coherency.md](../../../docs/hardware/cache-coherency.md).
 
+For Scalar scheduling, use the project's
+[A5 hardware and scheduling premises](../../../docs/zh-cn/design/a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles)
+and the [A5 memory-ordering scope](../../../docs/hardware/cache-coherency.md#a5-scalar-scheduling-premises).
+Independent contended atomic units require 128 B L2-side isolation; 64 B
+describes Scalar DCache maintenance. Both `ld/st_dev` and atomic dependency
+chains need explicit DSB. STARS event/notify is a future Wait backend requiring
+poll-rate control and resource ownership; SPR mapping alone provides neither
+event allocation nor safe release.
+
 ## Chip packaging
 
 a5 is a single chip composed of **2 dies** that present to the host as
@@ -275,8 +284,9 @@ that exact value. `PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 14`
 remains a compile-time **upper bound** (array sizes, headroom), not the
 actual launch count. See:
 
-- `src/a5/platform/onboard/host/aicpu_topology_probe.{h,cpp}` — probe +
-  cluster-first packing
+- `src/a5/platform/onboard/host/aicpu_topology_probe.cpp` — driver queries
+- `src/a5/platform/onboard/host/aicpu_affinity_select.cpp` — topology assembly,
+  fallback and cluster-first packing (`compute_allowed_cpus`)
 - `src/a5/platform/onboard/host/device_runner.cpp` — fills
   `aicpu_allowed_cpus[]` + `aicpu_launch_count` in Runtime, launches
   with that count

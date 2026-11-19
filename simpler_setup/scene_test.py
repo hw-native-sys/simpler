@@ -259,8 +259,29 @@ def _class_pipeline_depth(cls, cases) -> int:
     return requested.pop() if requested else 0
 
 
+def _scene_admission_kwargs(cls, cases) -> dict:
+    """Preserve explicit scene controls, or omit every control for a default-mode scene."""
+    controls = {"pipeline_depth", "launch_depth", "pending_run_depth", "workspace_budget_bytes"}
+    if getattr(cls, "_st_automatic_admission", False):
+        if cls._st_level != 3:
+            raise ValueError("automatic_admission scene metadata requires level 3")
+        for case in cases:
+            contradictory = controls.intersection(case.get("config", {}))
+            if contradictory:
+                raise ValueError(f"{cls.__name__} automatic_admission contradicts {sorted(contradictory)}")
+        return {}
+    depths = {int(c.get("config", {}).get("launch_depth", 1)) for c in cases}
+    if len(depths) > 1:
+        raise SystemExit(
+            f"{cls.__name__} mixes launch_depth values {sorted(depths)} across its cases; "
+            "launch_depth applies to the whole Worker, so split them into one class per depth"
+        )
+    capacity = _class_pipeline_depth(cls, cases)
+    return {"launch_depth": depths.pop() if depths else 1, **({"pipeline_depth": capacity} if capacity else {})}
+
+
 def _standalone_worker_groups(selected_by_cls):
-    """The classes that may share one Worker, keyed by `(runtime, level, capacity, retention)`.
+    """The classes that may share one Worker, keyed by runtime, level, capacity, retention and cold-start owner.
 
     Capacity is part of the key rather than something reconciled after grouping: a Worker's
     `pipeline_depth` is granted once, before its first run, so classes that ask for different
@@ -272,13 +293,15 @@ def _standalone_worker_groups(selected_by_cls):
     artifact is not written until `flush_diagnostics()`. A class that never asked for it must
     not be moved onto that path by a neighbour that did.
     """
-    groups: dict[tuple[str, int, int, bool], list[type]] = {}
+    # Automatic scenes measure cold startup, so each class owns a fresh Worker.
+    groups: dict[tuple[str, int, int, bool, type | None], list[type]] = {}
     for cls, cases in selected_by_cls.items():
         key = (
             cls._st_runtime,
             cls._st_level,
             _class_pipeline_depth(cls, cases),
             bool(getattr(cls, "_st_collect_across_runs", False)),
+            cls if getattr(cls, "_st_automatic_admission", False) else None,
         )
         groups.setdefault(key, []).append(cls)
     return groups
@@ -1249,6 +1272,7 @@ def _run_swimlane_converter(
     dispatch: str | None = None,
     dispatch_id: str | None = None,
     output_path: Path | None = None,
+    publish_derived_host_logs: bool = False,
 ) -> bool:
     """Invoke the bundled swimlane converter as a subprocess.
 
@@ -1281,6 +1305,8 @@ def _run_swimlane_converter(
         cmd += ["--output", str(output_path)]
     for host_log in host_logs or []:
         cmd += ["--host-log", str(host_log)]
+    if publish_derived_host_logs:
+        cmd.append("--publish-derived-host-logs")
     if enable_overhead:
         cmd.append("--overhead")
     try:
@@ -1362,7 +1388,10 @@ def _convert_rank_swimlanes(
     relative timeline. Losing the common axis should cost the common axis, not
     the whole case's swimlane.
     """
-    from simpler_setup.tools.swimlane_converter import discover_l3_conversion_targets  # noqa: PLC0415
+    from simpler_setup.tools.swimlane_converter import (  # noqa: PLC0415, PLC2701
+        _capture_records_paths,
+        discover_l3_conversion_targets,
+    )
 
     def dump_name_map(capture_dir: Path) -> Path | None:
         if not callable_spec:
@@ -1370,7 +1399,9 @@ def _convert_rank_swimlanes(
         safe_label = _sanitize_for_filename(case_label)
         return _dump_name_map(_extract_name_map(callable_spec), capture_dir / f"name_map_{safe_label}.json")
 
-    captures = [path for path in _rank_capture_dirs(output_prefix) if (path / "chip_swimlane_records.json").is_file()]
+    # Both shapes count: the fixed name the non-retained path writes, and a
+    # retained artifact the capture's own dispatch identity names.
+    captures = [path for path in _rank_capture_dirs(output_prefix) if _capture_records_paths(path)]
     if not captures:
         logger.warning(f"[{case_label}] no Rank capture is present under {output_prefix}")
         return
@@ -1396,11 +1427,17 @@ def _convert_rank_swimlanes(
             dispatch=target["dispatch"],
             dispatch_id=target["dispatch_id"],
             output_path=output_prefix / f"{target['output_stem']}.json" if len(targets) > 1 else None,
+            publish_derived_host_logs=bool(host_logs),
         )
         if not merged:
-            for capture_dir in target["capture_dirs"]:
+            # The files this target selected, never a fresh scan of its
+            # directories: a scan would offer the other form too, and could
+            # resurrect a capture discovery rejected for a duplicate identity.
+            if len(target["capture_dirs"]) != len(target["records_paths"]):
+                raise ValueError("swimlane capture directories and record paths must have equal lengths")
+            for capture_dir, records_path in zip(target["capture_dirs"], target["records_paths"]):
                 _run_swimlane_converter(
-                    input_path=capture_dir / "chip_swimlane_records.json",
+                    input_path=records_path,
                     host_logs=host_logs,
                     func_names_path=dump_name_map(capture_dir),
                     enable_overhead=enable_overhead,
@@ -1424,18 +1461,7 @@ def _convert_case_swimlane(
 
     logger = logging.getLogger(__name__)
     if _rank_dirs(output_prefix):
-        captures = [
-            directory
-            for directory in _rank_capture_dirs(output_prefix)
-            if (directory / "chip_swimlane_records.json").is_file()
-        ]
-        # Runtime-exported timing logs allow capture-local lookup when all are present.
-        # Other Rank merges use the bound persistent logs.
-        host_logs = (
-            None
-            if captures and all(list(path.glob("host_clock_alignment.*.log")) for path in captures)
-            else _bound_host_logs()
-        )
+        host_logs = _bound_host_logs()
         _convert_rank_swimlanes(
             case_label,
             output_prefix,
@@ -1656,6 +1682,11 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
             _name_failing_case(exc, cls_name, case["name"])
             raise
         finally:
+            if enable_chip_swimlane and getattr(worker, "_config", {}).get("collect_across_runs"):
+                try:
+                    worker.flush_diagnostics()
+                except RuntimeError as error:
+                    logger.warning("[%s] diagnostic flush failed: %s", case_label, error)
             finalize_diagnostic_outputs(
                 case_label,
                 prefix,
@@ -1752,9 +1783,6 @@ def compile_chip_callable_spec(spec, platform, runtime, cache_key):
     ``l3_compile_cache_key`` so every path shares one cache entry per
     orchestration.
     """
-    if cache_key in _compile_cache:
-        return _compile_cache[cache_key]
-
     from simpler.task_interface import ChipCallable, CoreCallable  # noqa: PLC0415
 
     from .elf_parser import extract_text_section  # noqa: PLC0415
@@ -1763,6 +1791,27 @@ def compile_chip_callable_spec(spec, platform, runtime, cache_key):
 
     orch = spec["orchestration"]
     incores = spec["incores"]
+    capability_keys = []
+    capabilities = []
+    for kernel in incores:
+        # Validate before cache lookup or compilation through the same public
+        # constructor that owns the serialized declaration contract.
+        capability = CoreCallable.build(
+            signature=[], binary=b"", async_capability=kernel.get("async_capability")
+        ).async_capability
+        capabilities.append(capability)
+        capability_keys.append(
+            (
+                kernel["func_id"],
+                capability["version"],
+                capability["mode"],
+                capability["max_conditions"],
+                capability["condition_types"],
+            )
+        )
+    cache_key = (cache_key, tuple(capability_keys))
+    if cache_key in _compile_cache:
+        return _compile_cache[cache_key]
 
     pto_isa_root = ensure_pto_isa_root()
     kc = KernelCompiler(platform=platform)
@@ -1797,6 +1846,10 @@ def compile_chip_callable_spec(spec, platform, runtime, cache_key):
                 include_dirs,
             )
         )
+    if not (len(incores) == len(resolved_extra_dirs) == len(incore_artifact_keys) == len(capabilities)):
+        raise ValueError(
+            "incore specifications, include paths, artifact keys, and capabilities must have equal lengths"
+        )
     compiler_token = kc.compile_cache_token(runtime, [k["core_type"] for k in incores])
     artifact_key = compile_artifact_key(
         {
@@ -1817,9 +1870,10 @@ def compile_chip_callable_spec(spec, platform, runtime, cache_key):
                     "func_id": k["func_id"],
                     "core_type": k["core_type"],
                     "signature": k.get("signature", []),
+                    "async_capability": capability,
                     "artifact_key": incore_artifact_key,
                 }
-                for k, incore_artifact_key in zip(incores, incore_artifact_keys, strict=True)
+                for k, incore_artifact_key, capability in zip(incores, incore_artifact_keys, capabilities)
             ],
         },
         orchestration_units,
@@ -1854,21 +1908,23 @@ def compile_chip_callable_spec(spec, platform, runtime, cache_key):
                     extra,
                     incore_artifact_key,
                 )
-                for k, extra, incore_artifact_key in zip(
-                    incores, resolved_extra_dirs, incore_artifact_keys, strict=True
-                )
+                for k, extra, incore_artifact_key in zip(incores, resolved_extra_dirs, incore_artifact_keys)
             ]
             orch_binary = orch_future.result()
             incores_binary = [future.result() for future in incore_futures]
 
-        if len(incores_binary) != len(incores):
+        if not (len(incores_binary) == len(incores) == len(capabilities)):
             raise AssertionError("compiled incore binaries must match the incore specification")
         kernel_binaries = []
-        for k, incore in zip(incores, incores_binary):
+        for k, incore, capability in zip(incores, incores_binary, capabilities):
             kernel_binaries.append(
                 (
                     k["func_id"],
-                    CoreCallable.build(signature=k.get("signature", []), binary=incore),
+                    CoreCallable.build(
+                        signature=k.get("signature", []),
+                        binary=incore,
+                        async_capability=capability,
+                    ),
                 )
             )
 
@@ -1925,10 +1981,19 @@ def _validate_case_configs(cls: type) -> None:
             )
 
 
-def scene_test(level: int | SceneTestLevel, runtime: str, collect_across_runs: bool = False):
+def scene_test(
+    level: int | SceneTestLevel,
+    runtime: str,
+    collect_across_runs: bool = False,
+    automatic_admission: bool = False,
+):
     """Decorator marking a SceneTestCase with level and runtime.
 
     Platforms are declared per-case in CASES, not here.
+
+    ``automatic_admission`` is test-only metadata for an L3 Worker constructed
+    with all admission controls omitted. Explicit controls on such a class
+    are contradictory and rejected; existing scenes keep explicit launch depth.
 
     ``collect_across_runs`` opts the class's Worker into cross-run diagnostic
     retention. It changes when a diagnostic file exists — with it on, ``run()``
@@ -1939,8 +2004,11 @@ def scene_test(level: int | SceneTestLevel, runtime: str, collect_across_runs: b
     level_decorator = scene_level(level)
 
     def decorator(cls):
-        _validate_case_configs(cls)
         level_decorator(cls)
+        cls._st_automatic_admission = automatic_admission
+        if automatic_admission:
+            _scene_admission_kwargs(cls, cls.CASES)
+        _validate_case_configs(cls)
         cls._st_runtime = runtime
         cls._st_collect_across_runs = collect_across_runs
         cls_dir = Path(inspect.getfile(cls)).parent
@@ -1961,6 +2029,12 @@ class SceneTestCase:
 
     Subclasses declare CALLABLE, CASES, generate_args(), compute_golden().
     """
+
+    # The standard runner owns its Worker environment and submits eager runs.
+    # The mode only classifies Kernel scene tests; Program tests are always eager.
+    # Tests using a different execution contract must override these declarations.
+    _st_runtime_product = "program"
+    _st_execution_mode = "eager"
 
     CALLABLE: dict = {}
     CASES: list[dict] = []
@@ -2176,12 +2250,14 @@ class SceneTestCase:
         skip_golden = skip_golden or bool(case.get("skip_golden", self.SKIP_GOLDEN))
         orch_sig = self.CALLABLE.get("orchestration", {}).get("signature", [])
 
-        # The L2 entry point is `Worker.run(handle, args, cfg)`. Reuse the
-        # handle registered by the st_worker fixture / standalone path.
-        handle = getattr(type(self), "_st_l2_handle", None)
-        if handle is None:
+        # A registration belongs to one Worker and callable. Instance-local
+        # storage cannot inherit a parent's handle for a different signature.
+        registration = self.__dict__.get("_st_l2_registration")
+        if registration is None or registration[0] is not worker or registration[1] is not callable_obj:
             handle = worker.register(callable_obj)
-            type(self)._st_l2_handle = handle
+            self._st_l2_registration = (worker, callable_obj, handle)
+        else:
+            handle = registration[2]
 
         test_args = self.generate_args(params)
         with _child_memory_args(worker, test_args, orch_sig) as child_args:
@@ -2464,7 +2540,7 @@ class SceneTestCase:
         one device is provided (or any L3 case needs more than its single
         device), the outer invocation becomes a test dispatcher that spawns
         per-case subprocesses via ``parallel_scheduler``; each child re-enters
-        this function in single-group mode via ``--runtime`` + ``--level``.
+        this function in single-group mode via ``--resource-child``.
         """
         import argparse  # noqa: PLC0415
 
@@ -2556,7 +2632,7 @@ class SceneTestCase:
         parser.add_argument(
             "--runtime",
             default=None,
-            help="Only run classes with this _st_runtime (child-mode marker when combined with --level)",
+            help="Only run classes with this _st_runtime",
         )
         parser.add_argument(
             "--level",
@@ -2568,8 +2644,9 @@ class SceneTestCase:
             # rankN numbering is per L3 Worker and collides above it.
             choices=[2, 3],
             default=None,
-            help="Only run classes with this _st_level (child-mode marker when combined with --runtime)",
+            help="Only run classes with this _st_level",
         )
+        parser.add_argument("--resource-child", action="store_true", help=argparse.SUPPRESS)
         parser.add_argument(
             "-x", "--exitfirst", action="store_true", help="Stop on first failing case (matches pytest -x)"
         )
@@ -2671,8 +2748,7 @@ class SceneTestCase:
         module = sys.modules[module_name]
         test_classes = _discover_module_test_classes(module)
 
-        # Apply --runtime/--level filters (child mode sets both; parent may also
-        # use them when the user wants a narrow run).
+        # Apply --runtime/--level filters for both parent and child runs.
         if args.runtime is not None:
             test_classes = [c for c in test_classes if getattr(c, "_st_runtime", None) == args.runtime]
         if args.level is not None:
@@ -2695,10 +2771,8 @@ class SceneTestCase:
         for cls, case in selected:
             selected_by_cls.setdefault(cls, []).append(case)
 
-        # Child mode: both --runtime and --level set. Run inline without
-        # spawning further subprocesses; this is the path dispatcher
-        # children take after we re-enter run_module.
-        child_mode = args.runtime is not None and args.level is not None
+        # A dispatcher child runs inline without spawning further subprocesses.
+        child_mode = args.resource_child
 
         if not child_mode:
             has_multi_dev_case = any(
@@ -2716,7 +2790,7 @@ class SceneTestCase:
         by_rt_level = _standalone_worker_groups(selected_by_cls)
 
         ok = True
-        for (runtime, level, capacity, retention), group in by_rt_level.items():
+        for (runtime, level, capacity, retention, _automatic), group in by_rt_level.items():
             retained = "  Cross-run retention: on" if retention else ""
             print(f"\n=== Runtime: {runtime}  Level: {level}  Pipeline depth: {capacity or 'default'}{retained} ===")
             worker, per_class_sub_handles, per_class_chip_handles = _create_standalone_worker(
@@ -2830,6 +2904,7 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
                 _rt,
                 "--level",
                 "3",
+                "--resource-child",
             ]
 
         # Per-case output_prefix is chosen inside the child by run_class_cases,
@@ -2923,6 +2998,7 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
                     _rt,
                     "--level",
                     "2",
+                    "--resource-child",
                 ]
                 for f in _filters:
                     cmd += ["--case", f]
@@ -2993,26 +3069,20 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
         (c.get("config", {}).get("num_sub_workers", 0) for cls in group for c in selected_by_cls.get(cls, [])),
         default=0,
     )
-    # `min`, not `max`: this Worker is shared by every class in the group, and a
-    # depth above one changes how their runs reach the device. A class that asked
-    # for one must get one, so a mixed group runs serially and a class that needs
-    # the greater depth fails visibly on its own assertions rather than silently
-    # imposing it on its neighbours.
-    launch_depth = min(
-        (c.get("config", {}).get("launch_depth", 1) for cls in group for c in selected_by_cls.get(cls, [])),
-        default=1,
-    )
-    # Not reconciled here: a Worker's capacity is granted once, before any run, so a group whose
-    # classes disagree has no single answer and the caller must partition instead. Zero means
-    # unset, which takes the standing default request.
-    capacities = {_class_pipeline_depth(cls, selected_by_cls.get(cls, [])) for cls in group}
+    modes = {bool(getattr(cls, "_st_automatic_admission", False)) for cls in group}
+    if len(modes) > 1:
+        raise SystemExit("one Worker cannot serve both automatic and explicit admission scenes")
+    policies = [_scene_admission_kwargs(cls, selected_by_cls.get(cls, [])) for cls in group]
+    capacities = {policy.get("pipeline_depth", 0) for policy in policies}
     if len(capacities) > 1:
-        raise SystemExit(
-            f"one Worker cannot serve pipeline_depth values {sorted(capacities)}: "
-            f"{', '.join(sorted(cls.__name__ for cls in group))} were grouped together, and a granted "
-            f"capacity cannot be changed once a Worker is up"
-        )
-    pipeline_depth = capacities.pop() if capacities else 0
+        raise SystemExit(f"one Worker cannot serve pipeline_depth values {sorted(capacities)}")
+    admission_kwargs = {}
+    if not modes.pop():
+        # Existing explicit classes sharing a Worker retain their conservative minimum.
+        admission_kwargs["launch_depth"] = min(policy["launch_depth"] for policy in policies)
+        capacity = capacities.pop()
+        if capacity:
+            admission_kwargs["pipeline_depth"] = capacity
     # Not reconciled here either, and for a second reason on top of capacity's: retention changes
     # what `run()` returning means, so neither answer is safe to pick for a class that chose the
     # other. The caller partitions on it (see `_standalone_worker_groups`); this refusal is what a
@@ -3039,9 +3109,8 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
         platform=args.platform,
         runtime=first_cls._st_runtime,
         enable_sdma=any(_class_wants_sdma(c) for c in group),
-        launch_depth=launch_depth,
         collect_across_runs=collect_across_runs,
-        **({"pipeline_depth": pipeline_depth} if pipeline_depth else {}),
+        **admission_kwargs,
     )
     # Prepare sub callables per-class to avoid name collisions.
     per_class_sub_handles: dict[type, dict] = {}

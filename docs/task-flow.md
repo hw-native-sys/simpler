@@ -250,13 +250,20 @@ memcpy from the mailbox tensor array into `ChipTensor[]`. Host-backed arguments
 may need a device copy-in and output copy-back; device-backed arguments must
 resolve to allocations owned by the target chip. The native `ChipWorker`
 consumes the resulting POD and invokes the runtime's execution lifecycle.
+The stream/pipeline boundary behind that lifecycle — what the CANN stream does
+and does not provide — is explained in [run-pipeline.md](run-pipeline.md).
 
 #### Pipeline resource leases
 
-A2/A3 host runtimes and the A5 tensor-map-and-ring-buffer runtime declare
-`pipeline_depth = 2` as resource capacity. The contract determines the
-concrete copy count rather than permitting concurrent device execution by
-itself:
+Every runtime declares no `pipeline_depth` limit of its own: the declaration
+says what the runtime can support, and how much of it a context uses is the
+grant that context was given. A caller may state that grant —
+`Worker(pipeline_depth=N)` — and an unconfigured local level-3 Worker on an
+onboard program backend instead lets its endpoints measure it (see
+[Automatic run admission](#automatic-run-admission)). Each owner of a per-run
+resource is built to the grant, so a declaration costs nothing until a run holds
+a set. The contract determines the concrete copy count rather than permitting
+concurrent device execution by itself:
 
 | Resource class | Copies | Selection |
 | -------------- | -----: | --------- |
@@ -264,9 +271,120 @@ itself:
 | `DEVICE_SCRATCH` | 1 | slot 0 |
 | `EXEC_HANDLE` | `pipeline_depth` | lease `slot_id`, plus any hardware-generation key |
 
-A run-owned lease is `{slot_id, generation}`. `PipelineSlotPool` mints it and
+A run-owned lease is `{slot_id, generation}`. `RunResourceArena` mints it and
 is the authority on ownership: releasing the current lease is idempotent, while
-releasing it after the slot has been re-leased is rejected.
+releasing it after the set has been re-leased is rejected. The arena holds
+exactly the granted count and reports the three counts that always partition it
+— free, live, and quarantined. A set whose run could not prove what it left
+behind is quarantined: never reused, and still counted against the grant, so a
+context cannot acquire more concurrency by failing.
+
+#### Automatic run admission
+
+A local level-3 `Worker` with direct device endpoints on an onboard program backend that configured no
+`pipeline_depth`, `pending_run_depth`, `launch_depth` or
+`workspace_budget_bytes`, and that is the root of its own startup, lets its
+endpoints size their own concurrency. Every other shape — an explicit
+configuration, a level-2 Worker, a nested level-3 child, a remote- or
+MPI-hosted inner Worker, a kernel or borrowed context, and any simulated
+platform or a root without local devices — keeps its existing behaviour. The simulated
+exclusion is the parent's and not the endpoint's, because this decision sizes
+the mailbox entry table and seeds the FIFO bound before any child reports
+anything.
+
+Two numbers, and keeping them apart is the point:
+
+- the **identity directory** is how many runs may ever be *named*. It comes
+  from a 64 KiB budget on the mailbox's run-state entry table, so it is
+  `64 KiB / MAILBOX_RUN_ENTRY_STRIDE − MAILBOX_REQUEST_FRAMES` identities. An
+  identity costs one table entry and no device memory. It is finite and
+  internal: reaching it backpressures like any other bound.
+- the **admitted capacity** is how many runs may be in flight. It starts at
+  **one** and is `proven_prefix + 1`, where a slot is *proven* once a run on it
+  completed its resource commit — including a run whose private byte demand was
+  legitimately zero, because every argument was already on the device and every
+  region already covered. The exploratory `+1` is offered only while no growth
+  is in flight.
+
+The parent installs admission one before accepting a submission. The static
+launch ceiling is the identity directory; the dynamic admission prefix and
+existing backend/pair compatibility checks determine which successors can
+actually enqueue beside their predecessors.
+
+A slot's proof is withdrawn when the resources that commit established are
+reclaimed, become unprovable, or when the first launch on the slot cannot take
+the per-set resources that live outside the workspace ledger. The count is a
+prefix rather than a population because the lease pool hands out the lowest
+free slot, so a proven slot above an unproven one must not be offered.
+
+Each endpoint publishes its figure with a run's terminal state; the parent
+folds the reports by `min` when the **whole** run retires, which is the one
+point at which every endpoint that executed any of its tasks has reported for
+it. An endpoint that does not size itself publishes zero, which the fold reads
+as "no report" rather than as a capacity. A decrease confines the next
+acquisition and nothing else: a lease already granted stays valid, its run
+keeps its slot, and admission waits for the queue to drain. No record, result
+or output is dropped. Retirement applies the new bound under the FIFO lock
+before assigning a successor lease or waking an admission waiter.
+
+Growing device storage is serialized by one permission per endpoint, so two
+plans never hold their old and new blocks at once — which is also what makes an
+allocation refusal attributable to one shortfall. A prepare that cannot take
+what it needs performs two steps before its one further attempt:
+
+- it **reclaims** the generations a region has replaced, and
+- it **trims** every run-resource set nothing can reach — a set cached by an
+  earlier run, with no consumer left, whose storage no reclamation would ever
+  offer, because a region's current block is kept warm on purpose. The asking
+  set is excluded by name; a set a live run reserved, one whose arena bank
+  another run reserved — which is every set on a runtime whose arena is shared
+  — and one a saved plan would resume into are excluded by what holds them;
+  quarantined, release-unconfirmed and still-mapped storage is excluded because
+  its bytes cannot come back at all. A trimmed set stops naming its storage and
+  loses its proof *before* the release, so no freed address stays published and
+  the admitted capacity falls with the resources it rested on.
+
+If a launched run on the endpoint has a finish this endpoint will reach, a
+prepare that still cannot be served is **stood down rather than failed**: its
+saved plan, its input staging and its growth permission are kept, the caller's
+orchestration callback is not invoked again, and it is retried when one of the
+consumers it named at that moment finishes — at which point that consumer's set
+is itself trimmable. The holders are the endpoint's launched runs whatever
+regions they hold, because every managed block is charged against one device
+allocator: a predecessor occupying another set holds that set's region keys and
+never the candidate's, and a set being offered for the first time has no prior
+holder of its own keys at all. A run that has merely prepared is queued behind
+the same permission and is not something to wait for. Each named identity is
+spent once, so the waits are bounded by the set captured at the first wait and
+the directory, never by a capacity that can shrink underneath the plan. With no
+such consumer, or with that set exhausted, the run fails with a typed
+resource-unavailable error. Only an allocator capacity refusal enters this
+retry policy; invalid requests, bookkeeping failures and a degraded ledger fail
+without waiting for a consumer.
+
+For host-built graphs, the slot owns the completed host plan while parked:
+its task-image sources, Definition publication, tensor leases and captured
+dependency graph survive destruction of each preparation attempt. Full-arena
+runtimes also retain their host arena; A5 HBG retains the compact task image
+and resident scheduler plan without a common arena header. A retry references the
+retained inputs and commits that plan without copying HOST inputs or invoking
+the callback again. Pending publication and leases move to exactly one Runtime;
+a successful bind cannot be rebound before publication. A backend without plan
+retention rejects a post-callback wait. Terminal failure retires the native
+context before aborting the plan, and an unproven abort retains caller borrows.
+
+Phase traces drain at each wait so no trace retains a destroyed HostApi. The
+slot's bounded record pool appends retry records and preserves its dropped
+count; the successful attempt's invocation identity labels the combined
+artifact. Dependency capture moves with the plan and is restored only after image
+publication succeeds, for the existing exporter on that thread. Diagnostic exclusivity and artifact
+formats are unchanged.
+
+There is no device-byte quota and no device-memory fraction. Only the four
+managed workspace regions take part in waiting and reclamation; per-set
+completion events, runtime storage and host buffers are separately fallible and
+fail outright, so this is not whole-device OOM recovery. No latency or
+throughput benefit is claimed.
 
 `ChipWorker` is downstream of that pool and cannot re-derive ownership — it
 never sees an acquire or a release. It keeps a per-slot high-water mark and
@@ -344,11 +462,12 @@ ready-queue partition is erased, and any lease the run held is returned without
 dispatching device work — a run that never reached an active or preparable role
 holds none and returns none.
 
-Each direct chip child publishes its runtime contract's `pipeline_depth` in
-the startup mailbox before `INIT_READY`. The parent configures the native
-pipeline-slot lease pool to the minimum published depth. Backends without a
-depth-two contract therefore keep depth-one serial behavior instead of
-receiving an invalid slot-1 lease.
+Each direct chip child publishes the depth it granted in the startup mailbox
+before `INIT_READY`, having already sized its own per-run resources to it. The
+parent configures the arena to the minimum published grant, and an explicit
+request the children could not meet fails startup rather than being quietly
+reduced. A backend that granted one therefore keeps depth-one serial behavior
+instead of receiving an invalid slot-1 lease.
 
 Logical admission and that lease pool are separate budgets. `begin_run` admits
 a run against the admission FIFO's own capacity and gives it no lease; the
@@ -389,7 +508,7 @@ prepared-but-not-launched run.
 
 #### HBG build ownership
 
-A loaded host-orchestration SO keeps its current `RuntimeContext` in a
+A loaded host-orchestration SO keeps its current `OrchContext` in a
 module-local global. One build owns that binding until **all recorder jobs
 have returned**, including their captured-object cleanup. A later build must
 not rebind it early. Recording different Graph bodies within the same build
@@ -402,7 +521,7 @@ The supported entry paths establish this ownership as follows:
 | -------- | -------------- |
 | `Worker.submit` | The submission lock serializes the Python construction callback. |
 | `ChipWorker::prepare_native_run_on_slot` | A slot in `PREPARING` or `PREPARED` rejects another prepare; a successor may prepare only beside a `LAUNCHED` or `REAPED` predecessor. |
-| `simpler_prepare_run` | The runner reservation is acquired before bind and permits only one reserved successor beside the active owner. |
+| `simpler_prepare_run` | Onboard same-thread reentry within one loaded runtime module is refused before changing the nested request's state, even for another context. The runner reservation is acquired before bind and permits only one reserved successor beside the active owner. |
 | Callable registration | Each registration materializes a unique temporary SO and loads it with `RTLD_LOCAL`; separate registrations do not intentionally share a binding global. |
 | Host orchestration entry | A scope guard drains the recorder pool on normal return and exception unwinding, before Graph commit or destruction of the local build state. |
 
@@ -426,56 +545,25 @@ unit.
 #### HBG host access and input readiness
 
 HBG reads control values while constructing the graph on the host. Those
-values must already exist when bind begins; ordering device launches on a
-stream cannot make an earlier host read wait for a kernel that has not run.
+values must exist before bind; ordering later device launches on a stream does
+not make an earlier host read wait for them.
 
-| Access during host construction | Contract |
-| ------------------------------- | -------- |
-| Host-backed `IN` / `INOUT` argument | Bind copies input bytes before calling the orchestration entry and exposes the caller's host view. A host scalar write updates that view and pushes the scalar to its device staging slice. |
-| Child-memory argument | The caller supplies ready device data. The accessor uses a host mapping when available, otherwise a device copy for each scalar access. |
-| Runtime-created output, or an alias the overlap checker cannot prove disjoint from a writer in this graph | Both `get_tensor_data` and `set_tensor_data` reject the access with `INVALID_ARGS`; they do not wait for the current graph to execute. |
-| A region the overlap checker proves disjoint, or an independent / shared read-only input | A writer elsewhere does not impose a wait on this host access. The data still has to satisfy the caller's cross-run contract. |
-| Host-backed pure `OUT` argument | It has no initialized input value or registered host view during bind. |
+Host scalar access requires explicit `HOST/NONE` arguments: reads require
+`IN`/`INOUT`, writes require `OUT`/`INOUT`, and both check registered bounds and
+Buffer grants. `HOST/H2D` arguments become device storage during bind, and
+`DEVICE/NONE` arguments retain device storage. Neither is accessible through
+these host scalar APIs. Supply distinct host controls and device operands when
+both construction and execution need a value.
 
-Disjointness is decided by `ChipTensorMap::lookup` and
-`ChipTensorMapEntry::check_overlap`, and it is proven two ways: the two views'
-flat element ranges do not intersect, which needs no shared layout, or both
-views share the same canonical row-major layout and the per-dimension check
-finds no intersection. When the flat ranges do intersect and that per-dimension
-check does not apply — a differing dtype or rank, a stride mismatch, a stepped
-or permuted view, a start offset that does not decompose, or a higher tensor
-version — the checker conservatively reports an overlap. A host access to such
-a view of a buffer this graph writes is therefore refused even where the two
-regions are in fact disjoint, and the refusal names a producer task.
+The caller completes earlier producers and any explicit device-to-host copy
+before submitting a consumer that needs those host bytes. Conflicting host
+writes must also be ordered against earlier readers. Host scalar access is
+not a synchronization barrier for the current graph's device tasks.
 
-Across runs, the caller owns readiness and conflicting access ordering. Before
-constructing a successor that reads or modifies a predecessor's output, wait
-for that predecessor and complete any required device-to-host copy-back. With
-the public API, finish the producer handle's `result()` before submitting the
-consumer whose host construction needs those bytes. A native device fence by
-itself is insufficient when the host view still holds the old value. For
-child memory, preserve the allocation and wait for the device writer; there
-is no host staging copy-back to substitute for that wait.
-
-An independent successor or one sharing only read-only inputs may prepare
-early. No global cross-run tensor reader/writer registry or implicit accessor
-wait enforces this caller contract. The current-graph producer check is local
-to that build and does not prove cross-run readiness. In particular, a host
-`set_tensor_data` must not race a predecessor device reader, even if a later
-kernel launch would be ordered behind that predecessor.
-
-`copy_in_run_inputs_impl` therefore remains a no-op for HBG: moving its input
-copy after bind would leave host construction without its promised input
-view. TMR's device-side ordering and WAR/INOUT dependency handling are separate
-contracts.
-
-`HbgHostAccessContractTest` exercises the real bind, scalar accessors and
-copy-back against a fake memory backend on both architectures. It covers
-ready host/child inputs, explicit predecessor copy-back, independent early
-preparation, producer and overlapping-writer rejection, and disjoint access.
-It models completed device writes; it does not prove hardware completion,
-cache visibility, or the public handle's scheduling behavior. Those boundaries
-must remain covered when native admission or `Worker.submit` changes.
+See [HBG host data access](hbg-host-data-access.md) for the shared location,
+transfer, error and readiness contract, and the
+[Buffer memory model](buffer-abi.md#why-tensor-and-chiptensor-are-two-types)
+for argument materialization.
 
 #### Two-frame endpoint staging lane
 
@@ -779,7 +867,7 @@ returns only once the whole tree is READY:
 3. Child publishes `INIT_READY` (whole L3 subtree ready), then enters
    `_child_worker_loop(mailbox, registry, inner_worker)` for dispatch
 4. **Parent**: awaits each child's `INIT_READY`, then registers each mailbox
-   with L4's Worker via `add_next_level_worker_at(worker_id, mailbox_addr)`
+   with L4's Worker via `add_next_level_worker_at(worker_id, mailbox_addr, mailbox_bytes)`
 
 ```text
 L4 parent process

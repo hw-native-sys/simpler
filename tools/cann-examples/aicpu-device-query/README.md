@@ -59,7 +59,7 @@ Full writeup: [`src/a5/docs/hardware.md`](../../../src/a5/docs/hardware.md#devic
 ## Architecture
 
 Three pieces, exact same wiring as the production runtime's AICPU upload
-chain — see [`src/common/aicpu_dispatcher/README.md`](../../../src/common/aicpu_dispatcher/README.md)
+chain — see [`src/common/aicpu_loader/README.md`](../../../src/common/aicpu_loader/README.md)
 for the dispatcher's role and
 [`docs/aicpu-kernel-launch-mechanisms.md`](../../../docs/aicpu-kernel-launch-mechanisms.md)
 for why this method (Path A) and not tar.gz pre-deployment or the
@@ -68,8 +68,8 @@ broken Path B (`KERNEL_TYPE_AICPU_CUSTOM`, issue #822).
 ```text
 +---------------------+        rtAicpuKernelLaunchExWithArgs (KFC, libaicpu_extend_kernels)
 |   host launcher     | ---->  bootstrap: libaicpu_extend_kernels dlopens dispatcher SO,
-|  query_device_hal   |        which writes our inner SO bytes to /usr/lib64/aicpu_kernels/0/...
-+---------------------+
+|  query_device_hal   |        which writes our inner SO bytes to
++---------------------+        /usr/lib64/aicpu_kernels/<vf>/aicpu_kernels_device/<hostPid>_<localDeviceId>/simpler_inner_<fp>_<dev>.so
           |
           | rtsBinaryLoadFromFile (JSON), rtsFuncGetByName, rtsLaunchCpuKernel
           v

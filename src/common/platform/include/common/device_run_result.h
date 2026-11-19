@@ -30,14 +30,15 @@
  *       -> N+1 may reset the shared state
  *     host, later: reads N's region
  *
- * The platform owns one region per pipeline slot. It interprets the header —
+ * Each live call retains its original region through observation. A slot keeps
+ * an idle allocation for sequential reuse; reuse of its execution resources
+ * while an old call remains live requires another region. The platform interprets the header —
  * verdict, code and code source are a common vocabulary — but never the
  * payload, which is opaque diagnostic bytes whose layout the runtime picks
  * (`tensormap_and_ringbuffer` publishes the error tail of its
  * `SharedMemoryHeader`; `host_build_graph` keeps no such shared state and
- * publishes none). A slot's region is not handed to another run until the run
- * holding it finalizes — the reservation is what guarantees that — so the
- * host's read of its own slot is unhurried.
+ * publishes none). Late host reads follow the call's owner, independently of
+ * which run currently occupies its execution slot.
  *
  * **`published` carries the run's epoch, not a constant.** Staleness is then
  * decided by value rather than by the host having cleared the region first, so
@@ -49,8 +50,8 @@
  *
  * **Every run publishes, success included.** A producer folds each
  * participant's error state and its runtime's shared error state into one
- * record and publishes it from a single cleanup owner after the last work that
- * could still change the run's outcome. So a matching epoch carries a verdict:
+ * record. The runtime cleanup owner hands off its snapshot; the final native
+ * callback publishes after all callback work that could change the outcome. So a matching epoch carries a verdict:
  *
  *   - `Ok` — the run reached the end of its audited normal path. Code 0, no
  *     source, no payload.
@@ -136,7 +137,7 @@ static_assert(
 static_assert(offsetof(DeviceRunResultRegion, payload) == 24, "run-result payload offset drift");
 static_assert(sizeof(DeviceRunResultRegion) == DEVICE_RUN_RESULT_PAYLOAD_BYTES + 24, "run-result region layout drift");
 
-/** Bytes the platform allocates per pipeline slot for one run's result. */
+/** Bytes the platform retains for one live call's result. */
 constexpr size_t device_run_result_bytes() { return sizeof(DeviceRunResultRegion); }
 
 /** What the host concluded about a run from its region. */

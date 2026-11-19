@@ -13,36 +13,42 @@
 
 #include <cstdint>
 
+#include "scheduler_protocol_types.h"
+#include "scheduler_prepared_layout.h"
+
 constexpr uint32_t SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING = 1;
 constexpr uint32_t SCHEDULER_RUNTIME_MODE_RESIDENT_READY = 2;
-// A zeroed Handshake is not a scheduler choice. Every supported fallback is
-// published explicitly so an ordinary run cannot silently drift back to the
-// legacy dependency scheduler while continuing to pass result-only tests.
-constexpr uint32_t SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH = 3;
-constexpr uint32_t SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE = 4;
+
+struct SchedulerSpmdRequirements {
+    uint64_t worker_count{0};
+    uint64_t cluster_count{0};
+    uint64_t cooperative_task_count{0};
+    uint64_t mix_task_count{0};
+    uint64_t sync_mix_task_count{0};
+};
 
 struct AicoreSchedulerLayout {
     uint64_t total_size;
     uint64_t task_count;
-    uint64_t aic_task_count;
-    uint64_t aiv_task_count;
     uint64_t run_control_offset;
+    uint64_t native_readonly_end_offset;
     uint64_t aicpu_lifecycle_traces_offset;
     uint64_t worker_contexts_offset;
-    uint64_t dispatch_payloads_offset;
     uint64_t task_metadata_offset;
     uint64_t task_controls_offset;
-    uint64_t ready_inboxes_offset;
-    uint64_t ready_directory_offset;
+    uint64_t done_notifications_offset;
+    uint64_t completion_counters_offset;
     uint64_t trace_cells_offset;
+    uint64_t pmu_cells_offset;
     uint64_t activity_buffers_offset;
-    uint64_t gang_coordinator_offset;
-    uint64_t gang_cohorts_offset;
-    uint64_t gang_participants_offset;
-    uint64_t gang_commands_offset;
-    uint64_t executable_task_count;
+    uint64_t scalar_records_offset;
+    uint64_t graph_summary_offset;
+    uint64_t bootstrap_clusters_offset;
+    uint64_t async_layout_offset;
+    uint64_t prepared_layout_offset;
+    SchedulerPreparedLayout prepared;
     uint64_t executable_subtask_count;
-    uint64_t gang_task_count;
-    uint64_t aic_worker_demand;
-    uint64_t aiv_worker_demand;
+    SchedulerSpmdRequirements spmd;
+    uint64_t protocol_layout_offset;
+    SchedulerProtocolLayout protocol;
 };

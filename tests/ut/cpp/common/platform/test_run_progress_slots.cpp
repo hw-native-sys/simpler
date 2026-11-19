@@ -36,6 +36,8 @@ TEST(RunProgressSlotsTest, AnUnclaimedSetDescribesNoRun) {
     EXPECT_EQ(slots.state_of(kFirst), RunProgressState::Idle);
 }
 
+TEST(RunProgressSlotsTest, AnEmptyGrantBuildsAnEmptyTable) { EXPECT_TRUE(RunProgressSlots::build(0).empty()); }
+
 TEST(RunProgressSlotsTest, AClaimedSetCarriesItsOwnRunsStates) {
     RunProgressSlots slots;
     slots.claim(kFirst);
@@ -105,9 +107,10 @@ TEST(RunProgressSlotsTest, AClaimClearsTheOutgoingRunsTerminalState) {
     EXPECT_EQ(slots.state_of(kFirstReused), RunProgressState::Idle);
 }
 
-TEST(RunProgressSlotsTest, ASetOutsideTheLayoutAndAnEpochlessRunAreRefused) {
+TEST(RunProgressSlotsTest, ASetOutsideTheGrantAndAnEpochlessRunAreRefused) {
     RunProgressSlots slots;
-    constexpr NativeRunIdentity kOutOfRange{44, 1, 103, PTO_PIPELINE_MAX_DEPTH};
+    slots.commit(RunProgressSlots::build(kDefaultRunResourceSets));
+    constexpr NativeRunIdentity kOutOfRange{44, 1, 103, kDefaultRunResourceSets};
     slots.claim(kOutOfRange);
     EXPECT_FALSE(slots.publish(kOutOfRange, RunProgressState::Submitted));
     EXPECT_EQ(slots.state_of(kOutOfRange), RunProgressState::Idle);

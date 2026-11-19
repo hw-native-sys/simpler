@@ -61,11 +61,11 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Dispat
  * ACK/FIN protocol.
  *
  * @param runtime Pointer to Runtime in global memory
- * @param s_block_idx Block index (core ID)
+ * @param block_idx Block index (core ID)
  * @param core_type Core type (AIC or AIV)
  */
-__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int s_block_idx, CoreType core_type) {
-    __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->dev.workers[s_block_idx]);
+__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
+    __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->dev.workers[block_idx]);
 
     // Phase 1: report physical core ID + core type and signal done in one write,
     // with no wait for the AICPU — both fields are self-known. The AICPU opens
@@ -79,7 +79,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         // Native program run: `aicore_done` is payload, and `report_epoch` is
         // the marker that commits it. The barrier separates the two, so the
         // AICPU cannot see this run's epoch without the report it stands for.
-        my_hank->aicore_done = s_block_idx + 1;
+        my_hank->aicore_done = block_idx + 1;
         OUT_OF_ORDER_STORE_BARRIER();
         my_hank->report_epoch = report_epoch;
     } else {
@@ -87,7 +87,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         // marker, its per-run reset is what makes it meaningful, and no stamp
         // is written.
         OUT_OF_ORDER_STORE_BARRIER();
-        my_hank->aicore_done = s_block_idx + 1;
+        my_hank->aicore_done = block_idx + 1;
     }
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
@@ -103,6 +103,12 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // pointer, swimlane head): the AICPU writes those before opening the window.
     while (read_reg(RegId::DATA_MAIN_BASE) == 0) {
         SPIN_WAIT_HINT();
+    }
+    // Entry rejection can cancel before tasks or profiling state are published.
+    // Acknowledge without accessing those buffers or writing an initial IDLE.
+    if (read_reg(RegId::DATA_MAIN_BASE) == AICORE_EXIT_SIGNAL) {
+        acknowledge_aicore_cond_nonce_and_wait(&runtime->dev.teardown_gates[block_idx]);
+        return;
     }
     // Report initial idle status via register (the window is now open).
     write_reg(RegId::COND, AICORE_IDLE_VALUE);
@@ -137,8 +143,6 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     while (true) {
         reg_val = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
         if (reg_val == AICORE_EXIT_SIGNAL) {
-            // Signal exit acknowledgment to AICPU
-            write_reg(RegId::COND, AICORE_EXITED_VALUE);
             break;
         }
 
@@ -209,7 +213,6 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
                     SPIN_WAIT_HINT();
                 }
                 if (exiting) {
-                    write_reg(RegId::COND, AICORE_EXITED_VALUE);
                     break;
                 }
             }
@@ -266,5 +269,5 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
     // Flush all dirty cache lines to HBM before kernel exit.
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
-    wait_for_post_close_release(&runtime->dev.teardown_gates[s_block_idx].post_close_release);
+    acknowledge_aicore_cond_nonce_and_wait(&runtime->dev.teardown_gates[block_idx]);
 }

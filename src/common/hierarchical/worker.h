@@ -19,8 +19,9 @@
  *
  * Public surface:
  *   - add_worker(type, mailbox)    — register a sub-worker (before init).
- *                                    `mailbox` is a MAILBOX_SIZE-byte
- *                                    MAP_SHARED region; the real worker
+ *                                    `mailbox` is a MAP_SHARED region whose
+ *                                    byte extent the caller passes with it;
+ *                                    the real worker
  *                                    (a `ChipWorker` for NEXT_LEVEL, a
  *                                    Python callable for SUB) lives in
  *                                    the forked child.
@@ -66,19 +67,31 @@ public:
     // installation) also runs in the ctor, still in the parent, before
     // child forks.
     explicit Worker(int32_t level, uint64_t heap_ring_size = DEFAULT_HEAP_RING_SIZE);
+    Worker(int32_t level, uint64_t heap_ring_size, const std::vector<int> &heap_fds);
+    std::vector<int> shared_heap_fds() const { return allocator_.shared_fds(); }
     ~Worker();
+
+    // The native mapping remains valid through endpoint and scheduler teardown,
+    // independently of the caller's descriptor and Python mapping lifetime.
+    void *map_mailbox(int fd, size_t bytes);
 
     Worker(const Worker &) = delete;
     Worker &operator=(const Worker &) = delete;
 
-    // Register a sub-worker before calling init(). `mailbox` is a
-    // MAILBOX_SIZE-byte MAP_SHARED region; the real worker (a `ChipWorker`
-    // for NEXT_LEVEL, a Python callable for SUB) lives in the forked
-    // child and consumes the mailbox via the Python child loop.
+    // Register a sub-worker before calling init(). `mailbox` is a MAP_SHARED
+    // region of `mailbox_bytes` bytes, which must hold the
+    // `mailbox_size(granted_sets)` the grant implies — an undersized
+    // registration is refused here rather than when the endpoint writes its
+    // entry table. The real worker (a `ChipWorker` for NEXT_LEVEL, a Python
+    // callable for SUB) lives in the forked child and consumes the mailbox via
+    // the Python child loop.
     // `child_pid` is the forked child servicing `mailbox`, or -1 when the
     // caller owns no waitable child.
-    void add_worker(WorkerType type, void *mailbox, int child_pid = -1, uint32_t task_frame_count = 1);
-    void add_next_level_worker(int32_t worker_id, void *mailbox, int child_pid = -1, uint32_t task_frame_count = 1);
+    void
+    add_worker(WorkerType type, void *mailbox, size_t mailbox_bytes, int child_pid = -1, uint32_t granted_sets = 1);
+    void add_next_level_worker(
+        int32_t worker_id, void *mailbox, size_t mailbox_bytes, int child_pid = -1, uint32_t granted_sets = 1
+    );
 
     // Register a REMOTE_L3 endpoint only after its session runner completed
     // prestart and reported HELLO READY on the command lane.
@@ -91,15 +104,21 @@ public:
         const std::vector<int32_t> &worker_ids, const std::vector<uint64_t> &session_ids, void *mailbox,
         size_t mailbox_bytes, int mpirun_pid, double runtime_timeout_s
     );
+    void add_remote_l3_mpi(
+        int32_t worker_id, uint64_t session_id, const std::string &transport_name,
+        const std::shared_ptr<class MpiDirectTransportHub> &hub, double attach_timeout_s, double runtime_timeout_s
+    );
 
     // Start the scheduler thread. Must be called AFTER the parent has forked
     // any child workers — init() spins up threads in the parent that would
     // otherwise be accidentally inherited across fork.
     void init();
 
-    void configure_pipeline_depth(uint32_t depth, uint32_t pending_depth = 0, uint32_t launch_depth = 1) {
+    void configure_pipeline_depth(
+        uint32_t depth, uint32_t pending_depth = 0, uint32_t launch_depth = 1, uint32_t initial_admission_depth = 0
+    ) {
         if (initialized_) throw std::logic_error("Worker: configure_pipeline_depth after init");
-        orchestrator_.configure_pipeline_depth(depth, pending_depth, launch_depth);
+        orchestrator_.configure_pipeline_depth(depth, pending_depth, launch_depth, initial_admission_depth);
     }
 
     // Shut down the Scheduler thread and release resources.
@@ -132,10 +151,12 @@ public:
         return manager_.control_digest_only(type, worker_id, sub_cmd, digest, timeout_s);
     }
     std::vector<uint8_t> control_payload(
-        WorkerType type, int worker_id, uint64_t sub_cmd, const void *payload, size_t payload_size, double timeout_s
+        WorkerType type, int worker_id, uint64_t sub_cmd, const void *payload, size_t payload_size, double timeout_s,
+        bool retiring = false
     ) {
-        return manager_.control_payload(type, worker_id, sub_cmd, payload, payload_size, timeout_s);
+        return manager_.control_payload(type, worker_id, sub_cmd, payload, payload_size, timeout_s, retiring);
     }
+    void check_control_payloads_retired() { manager_.check_control_payloads_retired(); }
     ControlResult remote_prepare_register(
         int worker_id, remote_l3::RemoteRegistryTarget target_registry, CallableKind callable_kind, const void *payload,
         size_t payload_size, const uint8_t *digest
@@ -241,6 +262,10 @@ public:
 private:
     int32_t level_;
     bool initialized_{false};
+
+    struct MailboxMapping;
+    // Destroyed after every component that can access a mailbox.
+    std::vector<std::unique_ptr<MailboxMapping>> mailbox_mappings_;
 
     // --- Scheduling engine components ---
     // Per-task slot state lives inside `allocator_` (Ring) — Orchestrator

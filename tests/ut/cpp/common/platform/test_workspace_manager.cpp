@@ -657,6 +657,37 @@ void retire(WorkspaceManager &m, uint32_t slot, uint64_t epoch) {
     report_host_side_done(m, slot, epoch);
 }
 
+TEST(WorkspaceManagerLifecycle, PreparedBackingSurvivesRunRetirementAndBlocksReuseAndSweep) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const auto region = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::RuntimePool);
+    void *first = m.acquire(region, 1, 4096);
+    ASSERT_NE(first, nullptr);
+    auto held = m.retain_backing(first);
+    ASSERT_NE(held, nullptr);
+    retire(m, 0, 1);
+    m.note_run_fact(0, 1, WorkspaceManager::RunFact::ContextDestroyed);
+    EXPECT_TRUE(m.must_keep(first));
+    EXPECT_EQ(m.block_state(first), WorkspaceManager::BlockState::Referenced);
+    {
+        auto sweep = m.begin_terminal_sweep();
+        EXPECT_TRUE(sweep.must_keep(first));
+    }
+    EXPECT_EQ(m.detach_idle_backing(first), 0U);
+    void *next = m.acquire(region, 2, 4096);
+    ASSERT_NE(next, nullptr);
+    EXPECT_NE(next, first);
+    m.note_published(region, next);
+    ASSERT_EQ(m.reclaim_obsolete(), 0);
+    ASSERT_EQ(m.release_unreferenced(), 0);
+    EXPECT_EQ(backend.live_bytes.count(first), 1U);
+    held.reset();
+    EXPECT_FALSE(m.must_keep(first));
+    ASSERT_EQ(m.reclaim_obsolete(), 0);
+    EXPECT_EQ(backend.live_bytes.count(first), 0U);
+}
+
 TEST(WorkspaceManagerLifecycle, TheContextsOwnBackingIsNoConsumerACloseMustWaitFor) {
     FakeBackend backend;
     WorkspaceManager m;
@@ -685,13 +716,16 @@ TEST(WorkspaceManagerLifecycle, TheContextsOwnBackingIsNoConsumerACloseMustWaitF
     EXPECT_EQ(m.reserved_bytes(), 0u);
 }
 
-TEST(WorkspaceManagerLifecycle, EveryRunResourceSetTheLayoutCarriesMayHoldAConsumerOfOneBlock) {
-    // The ledger is sized by the layout's slot count rather than by the capacity a context
-    // happened to grant, so a run in the last set has a record of its own and is counted like the
-    // others. A close waits for all of them: the block is unused only once the last one retires,
-    // and a run whose set is above the old two-slot bound must not read as already gone.
+TEST(WorkspaceManagerLifecycle, EveryGrantedRunResourceSetMayHoldAConsumerOfOneBlock) {
+    // The ledger is sized by the grant, with no width of its own, so a run in the last set has a
+    // record and is counted like the others however large that grant is. A close waits for all of
+    // them: the block is unused only once the last one retires, and a run whose set is above the
+    // old three-slot bound must neither read as already gone nor be refused a reference.
+    constexpr uint32_t kGranted = 9;
     FakeBackend backend;
     WorkspaceManager m;
+    ASSERT_TRUE(m.grant_is_replaceable());
+    m.commit(WorkspaceManager::build(kGranted));
     ASSERT_TRUE(m.configure(backend.ops()));
     ASSERT_TRUE(m.set_limit(kBudget));
     const WorkspaceManager::RegionKey region = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap);
@@ -699,14 +733,14 @@ TEST(WorkspaceManagerLifecycle, EveryRunResourceSetTheLayoutCarriesMayHoldAConsu
     ASSERT_NE(block, nullptr);
     m.note_published(region, block);
 
-    const uint32_t last_slot = PTO_PIPELINE_MAX_DEPTH - 1;
+    const uint32_t last_slot = kGranted - 1;
     for (uint32_t slot = 1; slot <= last_slot; ++slot) {
         ASSERT_TRUE(m.reference(block, 31 + slot)) << "slot " << slot << " could not reference the block";
     }
     for (uint32_t slot = 0; slot <= last_slot; ++slot) {
         m.note_run_fact(slot, 31 + slot, WorkspaceManager::RunFact::Launched);
     }
-    EXPECT_EQ(m.live_drainable_consumers(), PTO_PIPELINE_MAX_DEPTH);
+    EXPECT_EQ(m.live_drainable_consumers(), kGranted);
 
     for (uint32_t slot = 0; slot < last_slot; ++slot) {
         retire(m, slot, 31 + slot);
@@ -1037,6 +1071,109 @@ TEST(WorkspaceManagerDefault, ACurrentBackingIsNeverReclaimed) {
     EXPECT_EQ(m.acquire(region, 2, kOneMiB), warm);
 }
 
+// Idle current backing and an obsolete generation differ in exactly one fact —
+// whether a region still publishes the block — and only the second is the
+// reclaim's to take. The first is a trim's, and only after its owner has given
+// up naming it.
+TEST(WorkspaceManagerDefault, IdleBackingIsDetachableWhereAnObsoleteGenerationIsReclaimable) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const WorkspaceManager::RegionKey region = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap);
+
+    void *warm = nullptr;
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, region, 1, kOneMiB, &warm));
+    EXPECT_TRUE(m.idle_backing(warm));
+    EXPECT_FALSE(m.has_reclaimable()) << "published, so no reclaim reaches it";
+
+    EXPECT_EQ(m.detach_idle_backing(warm), kOneMiB);
+    EXPECT_FALSE(m.idle_backing(warm)) << "it publishes nothing now";
+    EXPECT_TRUE(m.has_reclaimable());
+    EXPECT_EQ(m.reclaim_obsolete(), 0);
+    ASSERT_EQ(backend.released.size(), 1u);
+    EXPECT_EQ(backend.released[0], warm);
+}
+
+// Capacity is not permission here either: a block a consumer still references
+// is refused rather than detached, so a request that found it idle a moment
+// earlier cannot take it from the run that took it since.
+TEST(WorkspaceManagerDefault, ReferencedBackingIsRefusedByTheDetach) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(0);
+
+    void *block = m.acquire(region, 1, kOneMiB);
+    ASSERT_NE(block, nullptr);
+    m.note_published(region, block);
+    EXPECT_FALSE(m.idle_backing(block));
+    EXPECT_EQ(m.detach_idle_backing(block), 0u);
+    EXPECT_TRUE(m.owns(block));
+    EXPECT_EQ(m.reclaim_obsolete(), 0);
+    EXPECT_TRUE(backend.released.empty());
+}
+
+// The holders a refused plan may wait for are the endpoint's launched runs,
+// whatever regions they hold: the blocks are charged against one allocator, so
+// a predecessor on another set holds bytes this request can receive. The
+// context's own backing is no consumer, and a run that has only prepared
+// cannot retire while the caller waits.
+TEST(WorkspaceManagerOwnership, EligibleHoldersAreTheEndpointsLaunchedRunsWhateverTheyHold) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    m.commit(WorkspaceManager::build(6));
+    const WorkspaceManager::RegionKey other_set =
+        WorkspaceManager::arena_region(3, WorkspaceManager::ArenaRegion::RuntimePool);
+    const WorkspaceManager::RegionKey context_own = WorkspaceManager::staging_region(5);
+
+    void *launched = m.acquire(other_set, 11, kOneMiB);
+    ASSERT_NE(launched, nullptr);
+    m.note_published(other_set, launched);
+    m.note_run_fact(3, 11, WorkspaceManager::RunFact::Launched);
+
+    void *prepared = m.acquire(WorkspaceManager::staging_region(2), 12, kOneMiB);
+    ASSERT_NE(prepared, nullptr);  // no fact at all: prepared and nothing more
+
+    void *context = m.acquire(context_own, WorkspaceManager::kContextEpoch, kOneMiB);
+    ASSERT_NE(context, nullptr);
+
+    std::vector<uint64_t> holders;
+    m.eligible_holders(/*requesting_epoch=*/99, &holders);
+    ASSERT_EQ(holders.size(), 1u);
+    EXPECT_EQ(holders[0], 11u);
+
+    // The launched run finishes: there is nothing left to wait for.
+    report_launched_and_drained(m, 3, 11);
+    report_host_side_done(m, 3, 11);
+    holders.clear();
+    m.eligible_holders(99, &holders);
+    EXPECT_TRUE(holders.empty());
+}
+
+// The context's own backing is unreferenced from the moment it is published —
+// a runtime that commits its pooled arena at prewarm holds exactly that, with
+// its device image already uploaded into it — so idleness alone cannot tell it
+// apart from a warm set. Only a block a run has held is a set's to give back.
+TEST(WorkspaceManagerDefault, TheContextsOwnBackingIsNeverIdleBackingToTrim) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const WorkspaceManager::RegionKey region = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap);
+
+    void *prewarmed = m.acquire(region, WorkspaceManager::kContextEpoch, kOneMiB);
+    ASSERT_NE(prewarmed, nullptr);
+    m.note_published(region, prewarmed);
+    EXPECT_FALSE(m.idle_backing(prewarmed));
+    EXPECT_EQ(m.detach_idle_backing(prewarmed), 0u);
+
+    // A run holds it, then retires: now it is a set's storage, and idle.
+    ASSERT_TRUE(m.reference(prewarmed, 1));
+    report_launched_and_drained(m, 0, 1);
+    report_host_side_done(m, 0, 1);
+    EXPECT_TRUE(m.idle_backing(prewarmed));
+}
+
 TEST(WorkspaceManagerLedger, CompactionBoundsTheLedgerAndSurvivesAReissuedAddress) {
     FakeBackend backend;
     WorkspaceManager m;
@@ -1157,6 +1294,135 @@ TEST(WorkspaceManagerDegraded, AnUnprovableRunStopsNewPublication) {
     // Nothing was freed to get there.
     EXPECT_TRUE(backend.released.empty());
     EXPECT_EQ(m.reserved_bytes(), kOneMiB);
+}
+
+TEST(WorkspaceManagerPreparedClose, OnlyNamedBackingIsFreedAndUnrelatedFailureStillBlocksGrowth) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    void *selected = nullptr;
+    void *other = nullptr;
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, WorkspaceManager::staging_region(0), 1, kOneMiB, &selected));
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, WorkspaceManager::staging_region(1), 2, kTwoMiB, &other));
+    std::vector<WorkspaceManager::BackingIdentity> selected_identity{m.retain_backing(selected)};
+    std::vector<WorkspaceManager::BackingIdentity> other_identity{m.retain_backing(other)};
+    ASSERT_TRUE(m.note_unpublished(selected));
+    ASSERT_TRUE(m.note_unpublished(other));
+
+    backend.fail_release_of = other;
+    ASSERT_EQ(m.release_prepared_backing(selected_identity), 0);
+    ASSERT_EQ(backend.released, std::vector<void *>({selected}));
+    EXPECT_EQ(m.reserved_bytes(), kTwoMiB);
+    EXPECT_EQ(m.release_prepared_backing(other_identity), -7);
+    EXPECT_EQ(m.block_state(other), WorkspaceManager::BlockState::ReleaseUnconfirmed);
+    backend.fail_release_of = nullptr;
+    const auto attempts = backend.released.size();
+    EXPECT_EQ(m.reclaim_obsolete(), 0);
+    EXPECT_EQ(m.release_prepared_backing(selected_identity), 0);
+    EXPECT_EQ(backend.released.size(), attempts);
+    WorkspaceManager::AcquireRefusal why{};
+    EXPECT_EQ(m.acquire(WorkspaceManager::staging_region(2), 3, kOneMiB, &why), nullptr);
+    EXPECT_EQ(why, WorkspaceManager::AcquireRefusal::Degraded);
+
+    ASSERT_EQ(m.release_prepared_backing(other_identity), 0);
+    EXPECT_EQ(backend.released.back(), other);
+    EXPECT_EQ(m.reserved_bytes(), 0u);
+    SimplerWorkspaceReport recovered{};
+    ASSERT_TRUE(m.report(&recovered));
+    EXPECT_EQ(recovered.proof_unavailable, 0u);
+    EXPECT_NE(m.acquire(WorkspaceManager::staging_region(2), 4, kOneMiB), nullptr);
+}
+
+TEST(WorkspaceManagerPreparedClose, SuccessfulRetryDoesNotClearUnrelatedFailedOrQuarantinedBacking) {
+    for (int other_failure : {0, 1, 2}) {
+        SCOPED_TRACE(other_failure);
+        FakeBackend backend;
+        WorkspaceManager m;
+        ASSERT_TRUE(m.configure(backend.ops()));
+        void *selected = nullptr;
+        void *other = nullptr;
+        ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, WorkspaceManager::staging_region(0), 1, kOneMiB, &selected));
+        ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, WorkspaceManager::staging_region(1), 2, kTwoMiB, &other));
+        std::vector<WorkspaceManager::BackingIdentity> selected_identity{m.retain_backing(selected)};
+        std::vector<WorkspaceManager::BackingIdentity> other_identity{m.retain_backing(other)};
+        ASSERT_TRUE(m.note_unpublished(selected));
+        backend.fail_release_of = selected;
+        ASSERT_EQ(m.release_prepared_backing(selected_identity), -7);
+        backend.fail_release_of = nullptr;
+        ASSERT_TRUE(m.note_unpublished(other));
+        if (other_failure == 0) backend.fail_release_of = other;
+        if (other_failure == 1) backend.keep_mapped_of = other;
+        if (other_failure == 2) ASSERT_TRUE(m.note_mapping_unregister_failed(other));
+        EXPECT_NE(m.release_prepared_backing(other_identity), 0);
+        const auto attempts = backend.released.size();
+        backend.fail_release_of = backend.keep_mapped_of = nullptr;
+        EXPECT_EQ(m.release_prepared_backing(selected_identity), 0);
+        EXPECT_EQ(backend.released.size(), attempts + 1);
+        EXPECT_EQ(backend.released.back(), selected);
+        WorkspaceManager::AcquireRefusal why{};
+        EXPECT_EQ(m.acquire(WorkspaceManager::staging_region(2), 3, kOneMiB, &why), nullptr);
+        EXPECT_EQ(why, WorkspaceManager::AcquireRefusal::Degraded);
+    }
+}
+
+TEST(WorkspaceManagerPreparedClose, MappedAndUnprovedDeviceUseAreNeverRetried) {
+    for (bool mapped : {false, true}) {
+        SCOPED_TRACE(mapped);
+        FakeBackend backend;
+        WorkspaceManager m;
+        ASSERT_TRUE(m.configure(backend.ops()));
+        void *block = m.acquire(WorkspaceManager::staging_region(0), 1, kOneMiB);
+        ASSERT_NE(block, nullptr);
+        m.note_published(WorkspaceManager::staging_region(0), block);
+        std::vector<WorkspaceManager::BackingIdentity> identity{m.retain_backing(block)};
+        if (mapped) {
+            report_launched_and_drained(m, 0, 1);
+            report_host_side_done(m, 0, 1);
+            ASSERT_TRUE(m.note_unpublished(block));
+            backend.keep_mapped_of = block;
+            ASSERT_EQ(m.release_prepared_backing(identity), -9);
+            backend.keep_mapped_of = nullptr;
+        } else {
+            m.note_run_fact(0, 1, WorkspaceManager::RunFact::Launched);
+            m.note_run_fact(0, 1, WorkspaceManager::RunFact::ContextDestroyed);
+        }
+        const auto attempts = backend.released.size();
+        EXPECT_NE(m.release_prepared_backing(identity), 0);
+        EXPECT_EQ(backend.released.size(), attempts);
+        EXPECT_EQ(m.block_state(block), WorkspaceManager::BlockState::Quarantined);
+        EXPECT_EQ(m.reserved_bytes(), kOneMiB);
+        EXPECT_TRUE(m.must_keep(block));
+    }
+}
+
+TEST(WorkspaceManagerPreparedClose, EmptyAndExpiredIdentitiesCannotReleaseAReissuedAddress) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const auto region = WorkspaceManager::staging_region(0);
+    void *old = nullptr;
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, region, 1, kOneMiB, &old));
+    std::vector<WorkspaceManager::BackingIdentity> old_identity{m.retain_backing(old), {}};
+    ASSERT_TRUE(m.note_unpublished(old));
+    ASSERT_EQ(m.release_prepared_backing(old_identity), 0);
+    ASSERT_TRUE(old_identity.front().expired());
+    backend.next_forced = old;
+    void *reissued = nullptr;
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, region, 2, kTwoMiB, &reissued));
+    ASSERT_EQ(reissued, old);
+    std::vector<WorkspaceManager::BackingIdentity> new_identity{m.retain_backing(reissued)};
+    ASSERT_TRUE(m.note_unpublished(reissued));
+    backend.fail_release_of = reissued;
+    ASSERT_EQ(m.release_prepared_backing(new_identity), -7);
+    backend.fail_release_of = nullptr;
+    const auto attempts = backend.released.size();
+    EXPECT_EQ(m.release_prepared_backing({}), 0);
+    EXPECT_EQ(m.release_prepared_backing(old_identity), 0);
+    EXPECT_EQ(backend.released.size(), attempts);
+    EXPECT_EQ(m.block_state(reissued), WorkspaceManager::BlockState::ReleaseUnconfirmed);
+    EXPECT_EQ(m.release_prepared_backing(new_identity), 0);
+    EXPECT_EQ(backend.released.size(), attempts + 1);
+    EXPECT_EQ(m.reserved_bytes(), 0u);
 }
 
 TEST(WorkspaceManagerOwnership, ALateFactFromAReleasedSlotDoesNotReplaceItsSuccessor) {

@@ -156,7 +156,7 @@ class TestDynamicAllocateContextManager:
                 name="tp",
                 workers=[0, 1],
                 window_size=4096,
-                buffers=[CommBufferSpec(name="scratch", dtype="float32", count=4, nbytes=16)],
+                buffers=[CommBufferSpec(name="scratch", dtype="float32", count=4, nbytes=64)],
             ) as tp:
                 captured["alive_inside_with"] = tp.released
                 captured["device_ctx_0"] = int(tp[0].device_ctx)

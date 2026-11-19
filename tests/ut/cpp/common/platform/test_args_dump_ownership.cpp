@@ -33,26 +33,141 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
+#include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#if defined(__linux__)
+#include <pthread.h>
+#endif
 
 #include "aicpu/args_dump_aicpu.h"
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "common/args_dump.h"
 #include "common/memory_barrier.h"
 #include "host/args_dump_collector.h"
+#include "host/raii_scope_guard.h"
 #include "support/test_task_id.h"
+#include "profiler_test_allocator.h"
+
+namespace args_dump_ownership_test {
+std::atomic<size_t> fail_allocation_bytes{0};
+std::atomic<size_t> allocation_failures{0};
+}  // namespace args_dump_ownership_test
+
+// This target fails one exact payload allocation on the real collector thread.
+// All other unaligned allocations keep their malloc-compatible delete pairing.
+void *operator new(std::size_t bytes) {
+    size_t expected = bytes;
+    if (bytes != 0 && args_dump_ownership_test::fail_allocation_bytes.compare_exchange_strong(expected, 0)) {
+        args_dump_ownership_test::allocation_failures.fetch_add(1);
+        throw std::bad_alloc();
+    }
+    if (void *storage = std::malloc(bytes == 0 ? 1 : bytes)) return storage;
+    throw std::bad_alloc();
+}
 
 namespace fs = std::filesystem;
 
+// Observe the real generation/CV without adding a hook to the writer hot path.
+// This checks admission/release notification; it does not freeze the writer's
+// own instruction at its predicate boundary or replace a race-detector run.
+struct ArgsDumpCollectorTestPeer {
+    static std::thread wait_for_progress(ArgsDumpCollector &collector, std::promise<void> &entered, bool &notified) {
+        return std::thread([&collector, &entered, &notified] {
+            std::unique_lock<std::mutex> lock(collector.write_mutex_);
+            const uint64_t seen = collector.retained_progress_;
+            entered.set_value();
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (collector.retained_progress_ == seen) {
+                // Expiry is failure even if the generation changed silently:
+                // a timeout's final predicate check is not a notification.
+                if (collector.write_cv_.wait_until(lock, deadline) == std::cv_status::timeout) return;
+            }
+            notified = true;
+        });
+    }
+
+    static std::unique_lock<std::mutex> hold_ordinary_completion(ArgsDumpCollector &collector) {
+        std::unique_lock<std::mutex> lock(collector.write_mutex_);
+        collector.ordinary_queued_payloads_.store(1, std::memory_order_relaxed);
+        return lock;
+    }
+
+    static void complete_ordinary_payload(ArgsDumpCollector &collector) { collector.complete_ordinary_payload(); }
+
+    static auto completion_native_handle(ArgsDumpCollector &collector) {
+        return collector.write_mutex_.native_handle();
+    }
+    static size_t charged(const ArgsDumpCollector &collector) { return collector.retained_budget_.charged(); }
+    static size_t fixed(const ArgsDumpCollector &collector) { return collector.retained_budget_.fixed(); }
+    static size_t first_window_allocation(const ArgsDumpCollector &collector) {
+        return (static_cast<size_t>(collector.manager_.shard_count()) + 1) * sizeof(std::vector<DumpedArg>);
+    }
+    static uint64_t ordinary_pending(const ArgsDumpCollector &collector) {
+        return collector.ordinary_queued_payloads_.load(std::memory_order_acquire);
+    }
+    static std::unique_lock<std::mutex> hold_configuration(ArgsDumpCollector &collector) {
+        return std::unique_lock<std::mutex>(collector.writer_start_mutex_);
+    }
+    static auto configuration_native_handle(ArgsDumpCollector &collector) {
+        return collector.writer_start_mutex_.native_handle();
+    }
+    static uint64_t ordinary_epoch(const ArgsDumpCollector &collector) { return collector.run_epoch_; }
+    static void request_progress_report(ArgsDumpCollector &collector) {
+        collector.last_progress_ms_.store(0, std::memory_order_relaxed);
+    }
+    static int64_t progress_stamp(const ArgsDumpCollector &collector) {
+        return collector.last_progress_ms_.load(std::memory_order_acquire);
+    }
+
+    static void cross_wait_boundary(ArgsDumpCollector &collector) {
+        // Once entered is ready, acquiring this mutex proves the waiter has
+        // atomically released it into its CV wait. No sleep schedules the test.
+        std::scoped_lock lock(collector.write_mutex_);
+    }
+};
+
+#if defined(__linux__)
+namespace {
+struct ArgsDumpLockGate {
+    pthread_mutex_t *target;
+    std::promise<void> reached;
+    std::shared_future<void> proceed;
+};
+thread_local ArgsDumpLockGate *args_dump_lock_gate = nullptr;
+std::atomic<ArgsDumpLockGate *> callback_configuration_gate{nullptr};
+}  // namespace
+
+extern "C" int __real_pthread_mutex_lock(pthread_mutex_t *mutex);
+extern "C" int __wrap_pthread_mutex_lock(pthread_mutex_t *mutex) {
+    auto *gate = args_dump_lock_gate;
+    if (gate != nullptr && gate->target == mutex) {
+        args_dump_lock_gate = nullptr;
+    } else {
+        gate = callback_configuration_gate.load(std::memory_order_acquire);
+        if (gate == nullptr || gate->target != mutex ||
+            !callback_configuration_gate.compare_exchange_strong(gate, nullptr, std::memory_order_acq_rel))
+            gate = nullptr;
+    }
+    if (gate != nullptr) {
+        gate->reached.set_value();
+        gate->proceed.wait();
+    }
+    return __real_pthread_mutex_lock(mutex);
+}
+#endif
+
 namespace {
 
-void *ownership_alloc(size_t size) { return std::calloc(1, size); }
+void *ownership_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int ownership_free(void *ptr) {
     std::free(ptr);
@@ -82,6 +197,43 @@ long manifest_number(const std::string &json, const std::string &key) {
     const size_t at = json.find(needle);
     if (at == std::string::npos) return -1;
     return std::strtol(json.c_str() + at + needle.size(), nullptr, 10);
+}
+
+/** One `args[]` entry of a manifest, as the fields a payload reader needs. */
+struct ManifestArg {
+    std::string task_id;
+    std::string role;
+    std::string stage;
+    long bin_offset{-1};
+    long bin_size{-1};
+};
+
+std::vector<ManifestArg> manifest_args(const std::string &json) {
+    std::vector<ManifestArg> args;
+    const std::string needle = "{\"run_epoch\"";
+    for (size_t at = json.find(needle); at != std::string::npos; at = json.find(needle, at + 1)) {
+        const size_t end = json.find('}', at);
+        if (end == std::string::npos) break;
+        const std::string entry = json.substr(at, end - at + 1);
+        ManifestArg arg;
+        arg.task_id = manifest_string(entry, "task_id");
+        arg.role = manifest_string(entry, "role");
+        arg.stage = manifest_string(entry, "stage");
+        arg.bin_offset = manifest_number(entry, "bin_offset");
+        arg.bin_size = manifest_number(entry, "bin_size");
+        args.push_back(arg);
+    }
+    return args;
+}
+
+/** The first element of the payload one record named, from the run's bin file. */
+int32_t payload_first_element(const std::string &bytes, const ManifestArg &arg) {
+    EXPECT_GE(arg.bin_offset, 0);
+    EXPECT_GE(arg.bin_size, static_cast<long>(sizeof(int32_t)));
+    EXPECT_LE(static_cast<size_t>(arg.bin_offset) + sizeof(int32_t), bytes.size());
+    int32_t value = 0;
+    std::memcpy(&value, bytes.data() + arg.bin_offset, sizeof(value));
+    return value;
 }
 
 size_t count_occurrences(const std::string &haystack, const std::string &needle) {
@@ -120,12 +272,12 @@ struct OwnershipFixture {
     DumpDataHeader *header = nullptr;
     std::vector<int32_t> tensor;
 
-    explicit OwnershipFixture(const char *name) :
+    explicit OwnershipFixture(const char *name, bool retaining = true) :
         root(name),
         tensor(kTensorElements) {
         for (size_t i = 0; i < tensor.size(); i++)
             tensor[i] = static_cast<int32_t>(i + 1);
-        collector.configure_retained_runs(true, simpler::dfx::runs::kDefaultBudgetBytes);
+        collector.configure_retained_runs(retaining, simpler::dfx::runs::kDefaultBudgetBytes);
         EXPECT_EQ(
             collector.initialize(
                 /*num_dump_threads=*/1, /*device_id=*/0, DumpArgsLevel::FULL, ownership_alloc, nullptr, ownership_free
@@ -141,6 +293,7 @@ struct OwnershipFixture {
     }
 
     ~OwnershipFixture() {
+        collector.hold_retained_writer_for_test(false);
         collector.fail_arena_copy_for_test(false);
         set_dump_args_enabled(false);
         set_platform_dump_base(0);
@@ -166,13 +319,16 @@ struct OwnershipFixture {
 
     ArgsDumpCollector::RetainedRunStats stats() const { return collector.retained_run_stats_for_test(); }
 
-    /** The device side of one run: init, record `args` tensors, flush. */
-    void produce(uint64_t epoch, int args) {
+    /**
+     * The device side of one run: init, record `args` tensors, and flush unless
+     * the case is about what a producer still holds at its close.
+     */
+    void produce(uint64_t epoch, int args, bool flush_at_end = true) {
         set_platform_run_result(/*region_base=*/0, epoch);
-        dump_args_init(/*num_dump_threads=*/1);
+        dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
         for (int i = 0; i < args; i++)
             record_tensor(0x900 + i, static_cast<uint32_t>(i));
-        dump_args_flush(kLane);
+        if (flush_at_end) dump_args_flush(kLane);
     }
 
     void record_tensor(int32_t task_id, uint32_t arg_index) {
@@ -185,6 +341,26 @@ struct OwnershipFixture {
         info.dtype = static_cast<uint8_t>(DataType::INT32);
         info.capture_payload = 1;
         info.buffer_addr = reinterpret_cast<uint64_t>(tensor.data());
+        info.func_count = 1;
+        info.func_ids[0] = 5;
+        info.ndims = 1;
+        info.shapes[0] = static_cast<uint32_t>(kTensorElements);
+        info.strides[0] = 1;
+        ASSERT_EQ(dump_arg_record(kLane, info), 0);
+    }
+
+    /** One argument of one task, recorded over `buffer` at this instant. */
+    void
+    record_arg(int32_t task_id, uint32_t arg_index, ArgsDumpRole role, ArgsDumpStage stage, const int32_t *buffer) {
+        ArgsDumpInfo info{};
+        info.task_id = simpler::ut::test_task_id(task_id);
+        info.role = role;
+        info.stage = stage;
+        info.arg_index = arg_index;
+        info.kind = static_cast<uint8_t>(ArgsDumpKind::TENSOR);
+        info.dtype = static_cast<uint8_t>(DataType::INT32);
+        info.capture_payload = 1;
+        info.buffer_addr = reinterpret_cast<uint64_t>(buffer);
         info.func_count = 1;
         info.func_ids[0] = 5;
         info.ndims = 1;
@@ -258,12 +434,14 @@ TEST(ArgsDumpOwnership, ACloseProvesProcessingBeforeItDecidesALeftover) {
  */
 TEST(ArgsDumpOwnership, ACloseReturnsOnlyAfterEveryPublishedBufferIsReceived) {
     OwnershipFixture fx("processing-proof-multi");
+    // Open-epoch statistics remain available until the writer releases the epoch.
+    fx.collector.hold_retained_writer_for_test(true);
     // Two switches plus the end-of-run flush.
     constexpr int kRecords = 2 * PLATFORM_DUMP_RECORDS_PER_BUFFER + 88;
 
     ASSERT_TRUE(fx.begin(2301, fx.root.prefix("run-a")));
     set_platform_run_result(/*region_base=*/0, 2301);
-    dump_args_init(/*num_dump_threads=*/1);
+    dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
     for (int i = 0; i < kRecords; i++)
         fx.record_tensor(0xA00 + i, static_cast<uint32_t>(i % 8));
     dump_args_flush(kLane);
@@ -274,6 +452,7 @@ TEST(ArgsDumpOwnership, ACloseReturnsOnlyAfterEveryPublishedBufferIsReceived) {
     EXPECT_EQ(fx.stats().open_collected_records, static_cast<uint64_t>(kRecords))
         << "the close returned with published buffers still unreceived";
 
+    fx.collector.hold_retained_writer_for_test(false);
     std::string error;
     ASSERT_TRUE(fx.flush(&error)) << error;
     const std::string manifest = read_file(fx.root.manifest("run-a"));
@@ -295,6 +474,72 @@ TEST(ArgsDumpOwnership, ACloseReturnsOnlyAfterEveryPublishedBufferIsReceived) {
  * the device, because the bytes are already in storage this host owns. A slow
  * or failing disk must not hold a producer behind bytes it has handed over.
  */
+/**
+ * A record's payload is the buffer's content at the instant it was recorded.
+ *
+ * The counterexample this exists for: task A produces X and task B consumes
+ * it, and both write the same buffer. A capture taken at the run's boundaries
+ * instead of each task's would read *one* value for both inputs (X before A
+ * ran) and *one* for both outputs (X after B ran) — arithmetically a complete
+ * manifest, and wrong about three of these four records. So the bytes are
+ * decoded and compared per record rather than counted.
+ *
+ * The sequence below is the one a dispatching scheduler performs: each record
+ * is taken where that task's own data is live, with the buffer mutated between
+ * them exactly as the kernels would.
+ */
+TEST(ArgsDumpOwnership, EachRecordHoldsItsOwnTasksDataAtItsOwnInstant) {
+    OwnershipFixture fx("per-task-values");
+    std::vector<int32_t> shared(kTensorElements, 11);
+
+    ASSERT_TRUE(fx.begin(2501, fx.root.prefix("run-a")));
+    set_platform_run_result(/*region_base=*/0, 2501);
+    dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
+
+    // Task A: input is 11, and A writes 22 over the same buffer.
+    fx.record_arg(0x7001, /*arg_index=*/0, ArgsDumpRole::INPUT, ArgsDumpStage::BEFORE_DISPATCH, shared.data());
+    std::fill(shared.begin(), shared.end(), 22);
+    fx.record_arg(0x7001, /*arg_index=*/1, ArgsDumpRole::OUTPUT, ArgsDumpStage::AFTER_COMPLETION, shared.data());
+
+    // Task B consumes what A produced, then overwrites it with 33.
+    fx.record_arg(0x7002, /*arg_index=*/0, ArgsDumpRole::INPUT, ArgsDumpStage::BEFORE_DISPATCH, shared.data());
+    std::fill(shared.begin(), shared.end(), 33);
+    fx.record_arg(0x7002, /*arg_index=*/1, ArgsDumpRole::OUTPUT, ArgsDumpStage::AFTER_COMPLETION, shared.data());
+
+    dump_args_flush(kLane);
+    dump_args_close_run(kLane);
+    ASSERT_EQ(fx.close(2501), 0);
+
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    const std::string manifest = read_file(fx.root.manifest("run-a"));
+    ASSERT_FALSE(manifest.empty());
+    const std::string payload = read_file(fx.root.run_dir("run-a") / manifest_string(manifest, "bin_file"));
+    ASSERT_FALSE(payload.empty()) << "the manifest named a payload file with no bytes";
+
+    const std::vector<ManifestArg> args = manifest_args(manifest);
+    ASSERT_EQ(args.size(), 4u) << "the four records this run took are not all in its manifest";
+
+    // Keyed by what each record says it is, because the manifest's order is the
+    // writer's rather than the producer's.
+    const std::vector<std::pair<std::string, int32_t>> expected = {
+        {"0x0000000000007001|input|before_dispatch", 11},
+        {"0x0000000000007001|output|after_completion", 22},
+        {"0x0000000000007002|input|before_dispatch", 22},
+        {"0x0000000000007002|output|after_completion", 33},
+    };
+    for (const auto &[key, want] : expected) {
+        bool found = false;
+        for (const ManifestArg &arg : args) {
+            if (arg.task_id + "|" + arg.role + "|" + arg.stage != key) continue;
+            found = true;
+            EXPECT_EQ(payload_first_element(payload, arg), want)
+                << "record " << key << " holds the buffer's content at some other task's instant";
+        }
+        EXPECT_TRUE(found) << "no record for " << key;
+    }
+}
+
 TEST(ArgsDumpOwnership, ArenaIsAcknowledgedOnHostOwnershipNotOnDiskProgress) {
     OwnershipFixture fx("arena-ack");
     // Held means this writer does nothing: no payload write, no seal.
@@ -372,4 +617,501 @@ TEST(ArgsDumpOwnership, AFailedArenaReadIsRecordedAsLossNotExportedStale) {
     std::string second_error;
     EXPECT_FALSE(fx.flush(&second_error));
     EXPECT_EQ(fx.stats().errors.published_short, 1u);
+}
+
+// ---------------------------------------------------------------------------
+// Per-run terminal banks, mapped
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/**
+ * A retained collector whose producers publish their own per-run accounting.
+ *
+ * The bank address normally reaches the producers through the launching run's
+ * kernel arguments, which this collector does not own, so this pushes it and
+ * calls each producer's close — exactly where the runner will. Their init
+ * already runs per run and is what starts this run's counters.
+ */
+struct MappedOwnershipFixture : OwnershipFixture {
+    explicit MappedOwnershipFixture(const char *name) :
+        OwnershipFixture(name) {
+        EXPECT_TRUE(collector.open_run_terminal_banks(/*expected_producers=*/1));
+        EXPECT_TRUE(collector.device_publishes_run_terminal());
+    }
+
+    ~MappedOwnershipFixture() { set_platform_dump_args_run_terminal(0); }
+
+    /**
+     * Admit a run and push the bank its admission reserved, which is what the
+     * host does at launch: the device is handed one resolved address per run,
+     * so a successor publishes into its own bank rather than deriving one.
+     */
+    bool begin(uint64_t epoch, const fs::path &prefix) {
+        if (!OwnershipFixture::begin(epoch, prefix)) return false;
+        const uint64_t bank = collector.run_terminal_bank_address(epoch);
+        EXPECT_NE(bank, 0u) << "an admitted run resolved no terminal bank";
+        set_platform_dump_args_run_terminal(bank);
+        return true;
+    }
+
+    /** One run's device side, closed through the producer's own entry. */
+    void produce_run(uint64_t epoch, int args) {
+        produce(epoch, args);
+        dump_args_close_run(kLane);
+    }
+};
+
+}  // namespace
+
+TEST(ArgsDumpRunTerminal, AMappedRunIsSettledFromItsOwnProducerAccounting) {
+    MappedOwnershipFixture fx("mapped-settled");
+    ASSERT_TRUE(fx.begin(6001, fx.root.prefix("run-a")));
+    fx.produce_run(6001, /*args=*/2);
+    ASSERT_EQ(fx.close(6001), 0);
+
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    const std::string manifest = read_file(fx.root.manifest("run-a"));
+    ASSERT_FALSE(manifest.empty()) << "a run whose producers reported published no manifest";
+    EXPECT_EQ(manifest_string(manifest, "collection_verdict"), "published");
+    EXPECT_EQ(manifest_number(manifest, "total_args"), 2);
+}
+
+TEST(ArgsDumpRunTerminal, AProducerThatNeverPublishedLeavesTheRunUnknown) {
+    MappedOwnershipFixture fx("mapped-missing");
+    ASSERT_TRUE(fx.begin(6101, fx.root.prefix("run-a")));
+    // Records are produced and received, but the producer's close never runs.
+    // The receipts alone must not be read as a complete run.
+    fx.produce(6101, /*args=*/2);
+    (void)fx.close(6101);
+
+    std::string error;
+    (void)fx.flush(&error);
+    const std::string manifest = read_file(fx.root.manifest("run-a"));
+    if (!manifest.empty()) {
+        EXPECT_NE(manifest_string(manifest, "collection_verdict"), "published")
+            << "a run with no producer accounting was reported complete";
+    }
+}
+
+TEST(ArgsDumpRunTerminal, TheBankIsFreedAtTheBoundaryNotAtPublication) {
+    MappedOwnershipFixture fx("mapped-bank-release");
+    // The writer is held, so the first run keeps its output resources while its
+    // bank must already be back: the two capacities have two release points.
+    fx.collector.hold_retained_writer_for_test(true);
+    ASSERT_TRUE(fx.begin(6201, fx.root.prefix("run-a")));
+    fx.produce_run(6201, /*args=*/1);
+    ASSERT_EQ(fx.close(6201), 0);
+
+    ASSERT_TRUE(fx.begin(6202, fx.root.prefix("run-b")));
+    fx.produce_run(6202, /*args=*/1);
+    ASSERT_EQ(fx.close(6202), 0);
+
+    fx.collector.hold_retained_writer_for_test(false);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    EXPECT_FALSE(read_file(fx.root.manifest("run-a")).empty());
+    EXPECT_FALSE(read_file(fx.root.manifest("run-b")).empty());
+}
+
+TEST(ArgsDumpRunTerminal, ANormalMappedCloseSucceeds) {
+    MappedOwnershipFixture fx("mapped-normal-close");
+    ASSERT_TRUE(fx.begin(6301, fx.root.prefix("run-a")));
+    fx.produce_run(6301, /*args=*/2);
+
+    // The close itself, not just the artifact: a mapped run whose transport is
+    // processed and whose producers all reported is a successful close, and
+    // must not take the branch that reads a successor's live buffer and reports
+    // INTERNAL.
+    EXPECT_EQ(fx.close(6301), 0) << "a proved mapped close returned an error";
+
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    const std::string manifest = read_file(fx.root.manifest("run-a"));
+    ASSERT_FALSE(manifest.empty());
+    EXPECT_EQ(manifest_string(manifest, "collection_verdict"), "published");
+}
+
+TEST(ArgsDumpRunTerminal, AMappedCloseReadsNoLaneBuffer) {
+    MappedOwnershipFixture fx("mapped-no-lane-read");
+    ASSERT_TRUE(fx.begin(6401, fx.root.prefix("run-a")));
+    // The producer keeps a buffer: on the mapped path the close must leave it
+    // alone — a successor adopts it at its own device init — and must not turn
+    // its presence into an unknown lane. One record is handed over and one is
+    // not, because a fully flushed run holds no buffer for the close to leave
+    // alone and would assert nothing.
+    fx.produce(6401, /*args=*/1);
+    fx.record_tensor(0x910, /*arg_index=*/1);
+    dump_args_close_run(kLane);
+    const uint64_t held = fx.state()->current_buf_ptr;
+    ASSERT_NE(held, 0u) << "the producer kept no buffer for this close to leave alone";
+    EXPECT_EQ(fx.close(6401), 0) << "a held producer buffer was read as a failed close";
+    EXPECT_EQ(fx.state()->current_buf_ptr, held) << "the producer's buffer was taken by the host";
+
+    std::string error;
+    (void)fx.flush(&error);
+}
+
+TEST(ArgsDumpRunTerminal, ARunNoProducerClaimedIsUnprovedHoweverLittleArrived) {
+    // Silence is not a proof of emptiness. A producer that recorded and then
+    // died before publishing its terminal leaves the same absent entry as one
+    // that never started, so a host that read "nothing claimed, nothing
+    // arrived" as a complete empty manifest would export the first case as a
+    // successful dump.
+    MappedOwnershipFixture fx("mapped-no-producer");
+    ASSERT_TRUE(fx.begin(6601, fx.root.prefix("run-a")));
+    // No produce, no close_run: the lane is never initialized, so it claims
+    // nothing and records nothing.
+    EXPECT_NE(fx.close(6601), 0) << "a run no producer claimed was reported as a proved empty dump";
+
+    std::string error;
+    (void)fx.flush(&error);
+    // And nothing was published under it. A manifest here would be the same
+    // successful-looking artifact a complete run leaves, written for a run
+    // whose accounting could not be read.
+    const std::string manifest = read_file(fx.root.manifest("run-a"));
+    if (!manifest.empty()) {
+        EXPECT_NE(manifest_string(manifest, "collection_verdict"), "published")
+            << "a run no producer claimed published a complete manifest";
+    }
+}
+
+TEST(ArgsDumpRunTerminal, AClaimedRunThatRecordedNothingIsAProvedEmptyManifest) {
+    // What an empty run does look like: the producer came up, claimed the run
+    // in the bank, and settled zeroes. The identity and the terminal are both
+    // present, so the host states that nothing was dumped rather than that it
+    // could not tell — and it states it in a published artifact, which is the
+    // difference between a proved empty run and one that produced no output at
+    // all.
+    MappedOwnershipFixture fx("mapped-claimed-empty");
+    ASSERT_TRUE(fx.begin(6801, fx.root.prefix("run-a")));
+    set_platform_run_result(/*region_base=*/0, 6801);
+    dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
+    dump_args_close_run(kLane);
+    EXPECT_EQ(fx.close(6801), 0) << "a producer that claimed the run and settled zeroes was read as unproved";
+
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    const std::string manifest = read_file(fx.root.manifest("run-a"));
+    ASSERT_FALSE(manifest.empty()) << "a proved empty run published no manifest at all";
+    // Its own verdict, distinct from a run that published records: the artifact
+    // says the run was collected and held nothing, rather than leaving a reader
+    // to infer that from a zero count.
+    EXPECT_EQ(manifest_string(manifest, "collection_verdict"), "published_empty");
+    EXPECT_EQ(manifest_number(manifest, "total_args"), 0);
+}
+
+TEST(ArgsDumpRunTerminal, RecordsFromAProducerThatNeverClaimedStayUnproved) {
+    // The opposite case, and the one that must stay strict: records reached
+    // the host from a lane whose producer published no terminal, so what
+    // arrived cannot be shown to be all of it. An empty-run shortcut that
+    // ignored the receipts would report this as a complete dump.
+    MappedOwnershipFixture fx("mapped-unclaimed-records");
+    ASSERT_TRUE(fx.begin(6701, fx.root.prefix("run-a")));
+    fx.produce(6701, /*args=*/2);
+    ASSERT_TRUE(fx.wait_for_collected(2)) << "the fixture's records never reached the host";
+    // No `dump_args_close_run`: the producer recorded and never settled.
+    EXPECT_NE(fx.close(6701), 0) << "records with no producer accounting were reported as proved";
+
+    std::string error;
+    (void)fx.flush(&error);
+}
+
+TEST(ArgsDumpRunTerminal, AProducersHeldRecordsAreNotASuccessfulManifest) {
+    MappedOwnershipFixture fx("mapped-live-records");
+    ASSERT_TRUE(fx.begin(6501, fx.root.prefix("run-a")));
+
+    // The shape the review names: a balanced terminal whose records never left
+    // the producer. total 1, published 0, dropped 0, live 1 — arithmetically
+    // consistent and still a loss, so it must not read as a complete dump. No
+    // flush, because a flush is exactly what hands the records over.
+    fx.produce(6501, /*args=*/1, /*flush_at_end=*/false);
+    ASSERT_NE(fx.state()->current_buf_ptr, 0u) << "the producer handed its buffer over anyway";
+    dump_args_close_run(kLane);
+    (void)fx.close(6501);
+
+    std::string error;
+    (void)fx.flush(&error);
+    const std::string manifest = read_file(fx.root.manifest("run-a"));
+    if (!manifest.empty()) {
+        EXPECT_NE(manifest_string(manifest, "collection_verdict"), "published")
+            << "records the producer still held were published as a complete dump";
+    }
+}
+
+TEST(ArgsDumpOwnership, AdmissionNotifiesProgressWaiter) {
+    OwnershipFixture fx("admission-progress");
+    fx.collector.hold_retained_writer_for_test(true);
+    std::promise<void> entered;
+    auto ready = entered.get_future();
+    bool notified = false;
+    auto waiter = ArgsDumpCollectorTestPeer::wait_for_progress(fx.collector, entered, notified);
+    ready.wait();
+    ArgsDumpCollectorTestPeer::cross_wait_boundary(fx.collector);
+    const bool admitted = fx.begin(7101, fx.root.prefix("run-a"));
+    waiter.join();
+    EXPECT_TRUE(admitted);
+    EXPECT_TRUE(notified);
+    EXPECT_TRUE(fx.collector.abandon_run(7101));
+}
+
+TEST(ArgsDumpOwnership, SlotReleaseNotifiesProgressWaiter) {
+    OwnershipFixture fx("release-progress");
+    fx.collector.hold_retained_writer_for_test(true);
+    ASSERT_TRUE(fx.begin(7102, fx.root.prefix("run-a")));
+    std::promise<void> entered;
+    auto ready = entered.get_future();
+    bool notified = false;
+    auto waiter = ArgsDumpCollectorTestPeer::wait_for_progress(fx.collector, entered, notified);
+    ready.wait();
+    ArgsDumpCollectorTestPeer::cross_wait_boundary(fx.collector);
+    const bool released = fx.collector.abandon_run(7102);
+    waiter.join();
+    EXPECT_TRUE(released);
+    EXPECT_TRUE(notified);
+    EXPECT_EQ(fx.stats().quarantined_epochs, 0u);
+    // The released slot can admit another run; the notification is not allowed
+    // to change admission, release or output ownership.
+    EXPECT_TRUE(fx.begin(7103, fx.root.prefix("run-b")));
+    EXPECT_TRUE(fx.collector.abandon_run(7103));
+}
+
+TEST(ArgsDumpOwnership, ReferenceFailureKeepsQuarantinedEpoch) {
+    OwnershipFixture fx("reference-failure-evidence");
+    fx.collector.hold_retained_writer_for_test(true);
+    ASSERT_TRUE(fx.begin(7104, fx.root.prefix("run-a")));
+    // Join real readers before requesting withdrawal: none can acknowledge the
+    // next control epoch. Keep the production two-second failure budget.
+    fx.collector.stop();
+    testing::internal::CaptureStderr();
+    const bool released = fx.collector.abandon_run(7104);
+    const std::string failure = testing::internal::GetCapturedStderr();
+    EXPECT_FALSE(released);
+    EXPECT_NE(failure.find("reason=abandon-reference run=7104 cut=-1"), std::string::npos);
+    EXPECT_NE(failure.find("reference_request=2 control_now=2"), std::string::npos);
+    EXPECT_NE(failure.find("shards=1 queues=1 mixed_time=1"), std::string::npos);
+    EXPECT_NE(failure.find("shard=0 capture_ack=0 control_ack=1"), std::string::npos);
+    EXPECT_EQ(failure.find("shard=1 "), std::string::npos);
+    const auto stats = fx.stats();
+    EXPECT_TRUE(stats.fatal);
+    EXPECT_EQ(stats.quarantined_epochs, 1u);
+    EXPECT_FALSE(fs::exists(fx.root.manifest("run-a")));
+    EXPECT_FALSE(fx.begin(7105, fx.root.prefix("run-b")));
+    EXPECT_EQ(fx.stats().quarantined_epochs, 1u);
+}
+
+TEST(ArgsDumpOwnership, OrdinaryCompletionSharesTheCloseWaitMutex) {
+    OwnershipFixture fx("ordinary-completion-mutex", false);
+#if defined(__linux__)
+    auto close_mutex = ArgsDumpCollectorTestPeer::hold_ordinary_completion(fx.collector);
+    std::promise<void> proceed;
+    ArgsDumpLockGate gate{
+        ArgsDumpCollectorTestPeer::completion_native_handle(fx.collector), {}, proceed.get_future().share()
+    };
+    auto reached = gate.reached.get_future();
+    auto completion = std::async(std::launch::async, [&] {
+        args_dump_lock_gate = &gate;
+        auto clear_gate = RAIIScopeGuard([] {
+            args_dump_lock_gate = nullptr;
+        });
+        ArgsDumpCollectorTestPeer::complete_ordinary_payload(fx.collector);
+    });
+    auto release = RAIIScopeGuard([&] {
+        close_mutex.unlock();
+        proceed.set_value();
+    });
+    ASSERT_EQ(reached.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    // This writer reached the actual close-wait mutex before changing the predicate.
+    EXPECT_EQ(ArgsDumpCollectorTestPeer::ordinary_pending(fx.collector), 1u);
+    close_mutex.unlock();
+    proceed.set_value();
+    release.dismiss();
+    ASSERT_EQ(completion.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    completion.get();
+#else
+    {
+        auto close_mutex = ArgsDumpCollectorTestPeer::hold_ordinary_completion(fx.collector);
+    }
+    ArgsDumpCollectorTestPeer::complete_ordinary_payload(fx.collector);
+#endif
+    EXPECT_EQ(ArgsDumpCollectorTestPeer::ordinary_pending(fx.collector), 0u);
+
+    // Exercise the real producer, writer and ordinary close after contention.
+    fx.collector.begin_run(fx.root.prefix("ordinary").string(), DumpArgsLevel::FULL, 7201);
+    fx.produce(7201, 1);
+    ASSERT_EQ(fx.collector.close_ordinary_run(true), 0);
+    const auto manifest = read_file(fx.root.manifest("ordinary"));
+    EXPECT_EQ(manifest_number(manifest, "total_args"), 1u);
+    EXPECT_EQ(fs::file_size(fx.root.run_dir("ordinary") / "args.bin"), kTensorBytes);
+}
+
+TEST(ArgsDumpOwnership, OrdinaryAdmissionAndRecordedCallbackShareConfiguration) {
+    OwnershipFixture fx("recorded-callback-config", false);
+    ASSERT_TRUE(fx.collector.begin_recorded_window(7301, fx.root.prefix("recorded").string(), DumpArgsLevel::FULL));
+#if defined(__linux__)
+    auto configuration = ArgsDumpCollectorTestPeer::hold_configuration(fx.collector);
+    std::promise<void> callback_proceed, admission_proceed;
+    ArgsDumpLockGate callback{
+        ArgsDumpCollectorTestPeer::configuration_native_handle(fx.collector), {}, callback_proceed.get_future().share()
+    };
+    ArgsDumpLockGate admission{
+        ArgsDumpCollectorTestPeer::configuration_native_handle(fx.collector), {}, admission_proceed.get_future().share()
+    };
+    auto callback_reached = callback.reached.get_future();
+    auto admission_reached = admission.reached.get_future();
+    std::future<void> begin;
+    bool callback_released = false, admission_released = false;
+    auto release = RAIIScopeGuard([&] {
+        callback_configuration_gate.store(nullptr, std::memory_order_release);
+        if (configuration.owns_lock()) configuration.unlock();
+        if (!admission_released) admission_proceed.set_value();
+        if (!callback_released) callback_proceed.set_value();
+        if (begin.valid()) begin.wait();
+        fx.collector.quiesce();
+    });
+    callback_configuration_gate.store(&callback, std::memory_order_release);
+    fx.produce(7301, 1);
+    ASSERT_EQ(callback_reached.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    begin = std::async(std::launch::async, [&] {
+        args_dump_lock_gate = &admission;
+        auto clear_gate = RAIIScopeGuard([] {
+            args_dump_lock_gate = nullptr;
+        });
+        fx.collector.begin_run(fx.root.prefix("ordinary").string(), DumpArgsLevel::FULL, 7302);
+    });
+    ASSERT_EQ(admission_reached.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_EQ(ArgsDumpCollectorTestPeer::ordinary_epoch(fx.collector), 0u);
+    admission_proceed.set_value();
+    admission_released = true;
+    configuration.unlock();
+    ASSERT_EQ(begin.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    begin.get();
+    ArgsDumpCollectorTestPeer::request_progress_report(fx.collector);
+    callback_proceed.set_value();
+    callback_released = true;
+    fx.collector.quiesce();
+    EXPECT_GT(ArgsDumpCollectorTestPeer::progress_stamp(fx.collector), 0);
+    release.dismiss();
+#else
+    fx.produce(7301, 1);
+    fx.collector.quiesce();
+    fx.collector.begin_run(fx.root.prefix("ordinary").string(), DumpArgsLevel::FULL, 7302);
+#endif
+    fx.produce(7302, 1);
+    ASSERT_EQ(fx.collector.close_ordinary_run(true), 0);
+    ASSERT_EQ(fx.collector.close_recorded_window(7301), 0);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    for (const auto *leaf : {"recorded", "ordinary"}) {
+        const auto manifest = read_file(fx.root.manifest(leaf));
+        EXPECT_EQ(manifest_number(manifest, "total_args"), 1u);
+        const auto bytes = read_file(fx.root.run_dir(leaf) / manifest_string(manifest, "bin_file"));
+        ASSERT_EQ(bytes.size(), kTensorBytes);
+        EXPECT_EQ(std::memcmp(bytes.data(), fx.tensor.data(), kTensorBytes), 0);
+    }
+}
+
+TEST(ArgsDumpOwnership, OrdinaryPayloadAllocationLossSettlesButFailsQuality) {
+    OwnershipFixture fx("ordinary-allocation-loss", false);
+    fx.collector.begin_run(fx.root.prefix("ordinary").string(), DumpArgsLevel::FULL, 7202);
+    set_platform_run_result(0, 7202);
+    dump_args_init(1, DumpArgsLevel::FULL);
+    std::vector<int32_t> payload(257, 123);
+    ArgsDumpInfo info{};
+    info.task_id = simpler::ut::test_task_id(0xA22);
+    info.role = ArgsDumpRole::INPUT;
+    info.stage = ArgsDumpStage::BEFORE_DISPATCH;
+    info.kind = static_cast<uint8_t>(ArgsDumpKind::TENSOR);
+    info.dtype = static_cast<uint8_t>(DataType::INT32);
+    info.capture_payload = 1;
+    info.buffer_addr = reinterpret_cast<uint64_t>(payload.data());
+    info.ndims = 1;
+    info.shapes[0] = payload.size();
+    info.strides[0] = 1;
+    ASSERT_EQ(dump_arg_record(kLane, info), 0);
+    const size_t failures_before = args_dump_ownership_test::allocation_failures.load();
+    args_dump_ownership_test::fail_allocation_bytes.store(payload.size() * sizeof(int32_t));
+    dump_args_flush(kLane);
+    const int rc = fx.collector.close_ordinary_run(true);
+    const size_t unconsumed_fault = args_dump_ownership_test::fail_allocation_bytes.exchange(0);
+    EXPECT_EQ(unconsumed_fault, 0u) << "the real payload allocation did not reach the fault";
+    EXPECT_EQ(args_dump_ownership_test::allocation_failures.load(), failures_before + 1);
+    EXPECT_NE(rc, 0) << "known host loss cannot be a complete ordinary artifact";
+    fx.collector.publish_arena_acks();
+    EXPECT_EQ(fx.state()->published_payload_count, 1u);
+    EXPECT_EQ(fx.state()->completed_payload_count, 1u) << "discarded payloads no longer hold device storage";
+    const auto manifest = read_file(fx.root.manifest("ordinary"));
+    EXPECT_NE(manifest.find("\"host_discarded\": true"), std::string::npos);
+    EXPECT_NE(manifest.find("\"dropped_records_complete\": false"), std::string::npos);
+    std::string error;
+    EXPECT_FALSE(fx.flush(&error)) << "resource settlement must not erase sticky diagnostic loss";
+
+    // A fresh zero-record invocation has no failed payload of its own. It
+    // succeeds even while the collector-wide quality report remains sticky.
+    fx.collector.begin_run(fx.root.prefix("ordinary-empty").string(), DumpArgsLevel::FULL, 7203);
+    set_platform_run_result(0, 7203);
+    dump_args_init(1, DumpArgsLevel::FULL);
+    EXPECT_EQ(fx.collector.close_ordinary_run(true), 0);
+    EXPECT_FALSE(fx.flush(&error));
+}
+
+TEST(ArgsDumpOwnership, OrdinaryMetadataAllocationFailurePreservesQueuedPayloadOwnership) {
+    OwnershipFixture fx("ordinary-metadata-allocation", false);
+    fx.collector.begin_run(fx.root.prefix("ordinary").string(), DumpArgsLevel::FULL, 9931);
+    fx.collector.stop(false);
+    fx.produce(9931, 1);
+    fx.collector.hold_retained_writer_for_test(true);
+    const size_t failures = args_dump_ownership_test::allocation_failures.load();
+    args_dump_ownership_test::fail_allocation_bytes.store(sizeof(DumpedArg));
+    fx.collector.start(ownership_thread_factory);
+    fx.collector.quiesce();
+    const size_t remaining = args_dump_ownership_test::fail_allocation_bytes.exchange(0);
+    EXPECT_EQ(remaining, 0u) << "the real ordinary metadata allocation was not reached";
+    EXPECT_EQ(args_dump_ownership_test::allocation_failures.load(), failures + 1);
+    EXPECT_EQ(fx.collector.retained_lane_transport_credit_for_test(0), 1u);
+    EXPECT_EQ(ArgsDumpCollectorTestPeer::ordinary_pending(fx.collector), 1u);
+    fx.collector.publish_arena_acks();
+    EXPECT_EQ(fx.state()->completed_payload_count, 1u);
+    fx.collector.hold_retained_writer_for_test(false);
+    EXPECT_NE(fx.collector.close_ordinary_run(true), 0);
+    EXPECT_EQ(ArgsDumpCollectorTestPeer::charged(fx.collector), ArgsDumpCollectorTestPeer::fixed(fx.collector));
+    const auto manifest = read_file(fx.root.manifest("ordinary"));
+    EXPECT_EQ(manifest_number(manifest, "total_args"), 0);
+    EXPECT_EQ(manifest_number(manifest, "metadata_discarded_records"), 1);
+    EXPECT_EQ(fs::file_size(fx.root.run_dir("ordinary") / "args.bin"), kTensorBytes);
+    std::string error;
+    EXPECT_FALSE(fx.flush(&error));
+}
+
+TEST(ArgsDumpOwnership, RecordedInitializationFailureDoesNotResetOrdinaryPayloadCharges) {
+    OwnershipFixture fx("ordinary-budget-during-init", false);
+    fx.collector.begin_run(fx.root.prefix("ordinary").string(), DumpArgsLevel::FULL, 9941);
+    fx.collector.hold_retained_writer_for_test(true);
+    fx.produce(9941, 1);
+    fx.collector.quiesce();
+    const size_t charge = ArgsDumpCollectorTestPeer::charged(fx.collector);
+    EXPECT_GT(charge, ArgsDumpCollectorTestPeer::fixed(fx.collector));
+    const size_t failures = args_dump_ownership_test::allocation_failures.load();
+    args_dump_ownership_test::fail_allocation_bytes.store(
+        ArgsDumpCollectorTestPeer::first_window_allocation(fx.collector)
+    );
+    bool admitted = false;
+    EXPECT_NO_THROW(
+        admitted = fx.collector.begin_recorded_window(9942, fx.root.prefix("model").string(), DumpArgsLevel::FULL)
+    );
+    args_dump_ownership_test::fail_allocation_bytes.store(0);
+    EXPECT_FALSE(admitted);
+    EXPECT_EQ(args_dump_ownership_test::allocation_failures.load(), failures + 1);
+    EXPECT_EQ(ArgsDumpCollectorTestPeer::charged(fx.collector), charge);
+    EXPECT_EQ(fx.collector.retained_lane_transport_credit_for_test(0), 1u);
+    ASSERT_TRUE(fx.collector.begin_recorded_window(9942, fx.root.prefix("model").string(), DumpArgsLevel::FULL));
+    EXPECT_EQ(ArgsDumpCollectorTestPeer::charged(fx.collector), charge);
+    fx.collector.publish_arena_acks();
+    EXPECT_EQ(fx.state()->completed_payload_count, 1u);
+    fx.collector.hold_retained_writer_for_test(false);
+    EXPECT_EQ(fx.collector.close_ordinary_run(true), 0);
+    EXPECT_EQ(fx.collector.close_recorded_window(9942), 0);
+    std::string error;
+    EXPECT_TRUE(fx.flush(&error)) << error;
 }

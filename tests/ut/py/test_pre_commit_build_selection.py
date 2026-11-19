@@ -176,7 +176,7 @@ def test_only_selected_build_paths_install_the_project() -> None:
 
     assert "pip install torch" not in workflow
     cache_block = workflow.split(cache, 1)[1].split(install, 1)[0]
-    assert "inputs.setup_variant == 'self-cpu' || steps.lint-build.outputs.needs_build == 'true'" in cache_block
+    assert "inputs.setup_variant == 'github' && steps.lint-build.outputs.needs_build == 'true'" in cache_block
     install_block = workflow.split(install, 1)[1].split(setup, 1)[0]
     assert "steps.lint-build.outputs.needs_build == 'true'" in install_block
     assert "build.targets=build_package_sim" in install_block

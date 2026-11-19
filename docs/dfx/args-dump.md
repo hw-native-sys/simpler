@@ -39,6 +39,25 @@ saw, without the timing distortion of inline printing.
   Real tensor-payload consumption is currently supported only on the
   `a2a3` platform family; see the platform scope below.
 
+### Which runtimes capture
+
+Capture requires each task's own entry and completion boundaries. The runtime
+supplies these through its scheduler or the A5 HBG task-time copy service:
+
+| Platform | Runtime | Per-task capture | Request for it |
+| -------- | ------- | ---------------- | -------------- |
+| a2a3 | `host_build_graph` | yes — AICPU scheduler dispatches and reaps | served |
+| a2a3 | `tensormap_and_ringbuffer` | yes | served |
+| a5 | `tensormap_and_ringbuffer` | yes | served |
+| a5 | `host_build_graph` | yes — AICore task boundaries with AICPU copy service | served for resident ordinary/native Graph runs |
+
+The table describes ordinary runs, including native graph child tasks, on both
+onboard and simulated backends. It does not add ArgsDump to retained Kernel
+capture/replay. On A5 HBG, a task selected for output payload capture cannot
+request a resident deferred-completion context. The request fails before
+submitting asynchronous work. Input-only capture and unselected tasks keep
+the normal deferred-completion path. See §3.1.1 for the A5 HBG task boundary contract.
+
 Enable in one line (`full` = every task, every arg):
 
 ```bash
@@ -92,8 +111,10 @@ python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --dump-args        # partial
 
 # pytest
 pytest tests/st/<case> --platform a5sim --dump-args full
-# a5 host_build_graph has no examples — use the scene test
+# A5 HBG uses resident task-time capture (§3.1.1).
 pytest tests/st/a5/host_build_graph/dump_args --platform a5sim --dump-args full
+pytest tests/st/a2a3/host_build_graph/dump_args --platform a2a3sim --dump-args full
+pytest tests/st/a5/tensormap_and_ringbuffer/dfx/args_dump --platform a5sim --dump-args hybrid
 pytest tests/st/<case> --platform a2a3sim --dump-args full
 pytest tests/st/a2a3/host_build_graph/vector_example --platform a2a3sim --manual include --dump-args full
 ```
@@ -104,14 +125,22 @@ allocates dump storage, publishes its base address through
 `kernel_args.dump_data_base`, and sets `SIMPLER_DFX_FLAG_DUMP_ARGS`
 (every mode but `off`) in each worker handshake's `enable_profiling_flag` for
 the enable/disable decision. The **partial / full / hybrid**
-distinction is carried as a `DumpArgsLevel` in the dump shared-memory header
-(`DumpDataHeader::dump_args_level`, host-written before launch) rather
-than in the profiling-flag bitmask. The on-device AICPU reads the storage base
+distinction is carried in `Runtime::dev.dump_args_level`, published with this
+invocation's descriptor in stream order, rather than in the profiling-flag bitmask. The on-device AICPU reads the storage base
 via `set_platform_dump_base()`, the enable bit via
-`set_dump_args_enabled(SIMPLER_GET_DFX_FLAG(...))`, and latches the mode
-from the header level before task dispatch (`PARTIAL` → selective,
+`set_dump_args_enabled(SIMPLER_GET_DFX_FLAG(...))`, and latches the descriptor selection
+before task dispatch (`PARTIAL` → selective,
 `HYBRID` → all metadata, payload copy controlled by the
-same per-task mask as `PARTIAL`). The runtime resolves the mask before each
+same per-task mask as `PARTIAL`). Host admission freezes the export selection
+without writing or reading back a shared device level; descriptor publication
+failure stops kernel submission. Host admission only resets its local collection
+window. Device entry records the payload-credit baseline used by ordinary collectors
+and clears per-invocation drop accounting; transport counters and queue/arena cursors remain
+monotonic for both ordinary and retained collection. Device entry publishes the
+initialized epoch after the baseline is ready. Ordinary arena acknowledgements
+and leftover recovery require that epoch to match the host invocation; recovery
+reads must succeed before cached bytes can be consumed. Already collected records
+remain best-effort output; retained error reporting is unchanged. The runtime resolves the mask before each
 record reaches the platform writer, so the writer does not depend on a second
 task-id lookup. Because the
 level is decided host-side **before any task is
@@ -119,6 +148,64 @@ dispatched**, it is latched up front — there is no dependence on task
 submission order. AICore executors read the same `SIMPLER_DFX_FLAG_DUMP_ARGS`
 bit to insert a `pipe_barrier(PIPE_ALL)` before FIN when dump is on, so
 `AFTER_COMPLETION` snapshots see the kernel's final writes.
+
+### 3.1.1 Task-time boundaries on A5 HBG
+
+A record describes the task's own data: inputs before any participant executes,
+outputs after all its participants return. A run-boundary snapshot cannot supply
+this contract when tasks reuse an intermediate buffer.
+
+A5 `host_build_graph` captures at its AICore scheduler's selected task
+boundaries. The existing AICPU participants provide bounded copy service; they
+do not dispatch or complete these tasks. Control-only nodes have no kernel
+argument records, including ordinary inline dependency nodes and native graph
+control nodes.
+
+1. The first participant requests the BEFORE copy. Every participant waits for
+   that task's seal before entering the kernel. It does not wait for blocks
+   that have not been dispatched, so a task can span several waves.
+2. Each returning participant completes its output writes and publishes the
+   selected physical cache lines before incrementing the returned count.
+3. Earlier blocks retire normally. The last returning participant requests the
+   AFTER copy and holds the task's existing final completion until it is sealed.
+   Dependents therefore cannot overwrite the bytes being copied.
+
+Ordinary tasks and native Graph children use the same path. Records preserve
+native children's public parent/local `TaskId`, rather than their private
+scheduler index. Mix tasks include all active AIC/AIV participants and emit one
+argument set per task, rather than one per block or core.
+
+Each task boundary has one publisher identified by run epoch, task reference,
+stage and worker. Request/Ack records carry that publisher and the existing
+monotonic request tick; they carry no execution-slot generation. The ACK commit
+encodes `(task_ref + 1) << 32 | stage << 8 | status`. The service clears commit,
+publishes the body and echoed tick, then publishes commit. Readers double-check
+commit and tick. Waiting participants track monotonic copy progress for the full
+boundary identity even after the publisher advances to the next request tick.
+Publisher request advancement and sealing require the current request tick.
+Stale epochs, tasks, stages, publishers, chunks and torn ACKs cannot seal a boundary.
+The last returning participant remains EXECUTING until its AFTER seal and return
+gate permit direct slot retirement.
+
+The runtime answers `args_dump_capture_supported_impl = 1`. A5 HBG uses
+resident scheduling with or without argument dumping. Invalid shapes or
+Definition layouts fail preparation under the same input contract; a dump flag
+does not select a different execution path.
+
+The copy service uses the existing bounded metadata buffers and payload arena.
+One reservation per AICPU lane prevents partially copied records from being
+published. A service step copies at most 64 KiB; back-pressure is retried without
+inventing dropped records, while actual copy/publication progress extends the
+wait budget. Abort abandons the open record and acknowledges failure; it never
+publishes a successful seal. Unproven core retirement leaves producer accounting
+unsettled rather than reading or closing a possibly active producer.
+
+`tests/st/a5/host_build_graph/dump_args` checks intermediate values, native child
+identities, a 73-block Mix child and empty views in FULL, HYBRID and PARTIAL.
+The A5 DFX smoke action explicitly selects these cases when `/run-a5` or a
+scheduled sweep requests its DFX jobs; default PR CI does not acquire an A5.
+See [the boundary and storage contract](../investigations/2026-10-a5-resident-per-task-args-capture.md)
+for memory ownership and failure details.
 
 ### 3.2 Partial Dump — Select Specific Args
 
@@ -203,8 +290,10 @@ The dump artifacts land under the per-task output prefix
     └── [args.bin]      # eager for partial/full; present for hybrid only with selected tensor payload
 ```
 
-Filenames are fixed (no per-file timestamp) — the directory is the
-per-task uniqueness boundary. Once at least one record reaches the collector,
+Ordinary non-retained filenames are fixed (no per-file timestamp). Recorded
+windows and ordinary calls with `collect_across_runs=True` use distinct named
+payload files; always follow `bin_file` in the published manifest. With ordinary
+retention disabled, once at least one record reaches the collector,
 `partial` and `full` create `args.bin`, which may be empty when no tensor
 payload was selected or recorded. `hybrid` with records but no selected tensor
 payload emits only `args_dump.json`; otherwise it also emits `args.bin`.
@@ -214,7 +303,8 @@ payload emits only `args_dump.json`; otherwise it also emits `args.bin`.
 `args_dump.json` is the manifest; its `bin_file` field points at
 the sibling binary payload. A `hybrid` capture with no marked tensors has
 `bin_file: null`, no `.bin`, and `bin_size: 0` for every entry. A `hybrid`
-capture with marked tensors has `bin_file: "args.bin"`; only the
+capture with marked tensors names its payload in `bin_file` (`"args.bin"` for
+ordinary calls with retention disabled); only the
 `CoreTaskArgs::dump(...)`-marked tensor records have a non-zero `bin_size`.
 
 Example manifest, from a `full` capture (one input tensor captured before
@@ -236,6 +326,7 @@ dispatch):
   "inout_args": 0,
   "truncated_args": 0,
   "dropped_records": 0,
+  "dropped_records_complete": true,
   "bin_file": "args.bin",
   "args": [
     {
@@ -260,6 +351,9 @@ dispatch):
 
 Key fields:
 
+- `dropped_records_complete` — ordinary manifests distinguish a confirmed
+  device-reported loss count from an unread or incomplete one. It does not
+  certify payload/file or whole-artifact completeness; see §7.3.
 - `dump_args_level` — the capture mode, as its wire value
   (`0` off / `1` partial / `2` hybrid / `3` full).
 - `task_id` — runtime task identity. Use to correlate with swimlane / PMU
@@ -286,7 +380,7 @@ Key fields:
   `is_contiguous` — logical view geometry. Tensor `bin_size` is
   `numel × elem_size` of the *logical* view, gathered if
   non-contiguous; scalar entries have `bin_size = 0`.
-- `bin_offset` — byte offset into `args.bin` where the
+- `bin_offset` — byte offset into the file named by `bin_file` where the
   payload starts.
 - `truncated` — set when the tensor exceeded arena size; see §7.
 - Top-level `dropped_records` surfaces aggregate metadata-buffer loss — useful
@@ -317,6 +411,15 @@ Exported `.txt` files include metadata headers, a row-major overview
 with aligned columns, and a detail listing with multi-dim indices —
 diff-friendly against golden tensors and pasteable into a
 spreadsheet.
+
+For a recorded window, the viewer first reports unknown aggregate accounting
+and observed host/metadata losses. Printed indices refer to the original
+manifest, even after filtering. `--index N` selects that same entry. Recorded
+exports include `entry_NNNNNN` in each filename: equal task, stage and argument
+IDs from different executions remain separate files. Ordinary export filenames
+are unchanged. A host-discarded payload is explicitly labelled; selected
+payload ranges must fit the binary named by the manifest. An empty recorded
+window is valid and contains no samples to export.
 
 ### 3.4 Add dump support to a new test
 
@@ -351,9 +454,58 @@ exist (inputs passed by the caller), the geometry travels directly on
 the Tensor object and needs no explicit per-task registration.
 
 Full template:
-[`tests/st/a5/host_build_graph/dump_args`](../../tests/st/a5/host_build_graph/dump_args/)
-(and the `a2a3` mirror at
-`tests/st/a2a3/host_build_graph/dump_args`).
+[`tests/st/a2a3/host_build_graph/dump_args`](../../tests/st/a2a3/host_build_graph/dump_args/).
+The A5 mirror at `tests/st/a5/host_build_graph/dump_args` checks the same
+intermediate payloads through the AICore-scheduled ordinary and native Graph
+paths, including Mix waves and ranked empty views (§3.1.1).
+
+### 3.5 Native A3 capture/replay collection
+
+ArgsDump alone can accompany native Kernel capture on A3 TMR and HBG. It uses
+the [common capture and resource lifetime](../design/native-capture-common-contract.md)
+path: prepare and retain before `CaptureBegin`, record the normal launch, then
+retire the original Host carrier. No eager computation is required. The retained
+reference keeps the dump pool and output window alive for model replay. Caller
+IO remains caller-owned and stream-ordered. Program remains eager-only.
+
+Diagnostic producers sharing a context's collector pool execute serially in one
+caller-ordered domain. Before releasing any retained model reference, finish
+all producers sharing that pool and start none until release returns. Multiple
+model windows may remain retained; closing one does not close the others.
+
+The task hooks sample inputs before dispatch and outputs after completion,
+including INOUT at both points. Replaying a model repeats these hooks without
+Host orchestration or a new Host-side run. Captured task IDs and diagnostic
+`run_epoch` may repeat: the epoch routes the window and is not a replay number.
+Manifest order is export order, not a cross-lane execution timeline.
+
+The settled artifact is the existing `args_dump.json` plus its named `bin_file`.
+Do not assume the payload is named `args.bin`. A healthy recorded manifest has:
+
+```json
+{
+  "recorded_window": true,
+  "counts_unknown": true,
+  "dropped_records": null,
+  "dropped_records_complete": false,
+  "collection_verdict": "aggregate_counts_unknown"
+}
+```
+
+Observed entry, role, stage, truncation and host-loss counts remain meaningful.
+The final replay's device counters cannot certify an aggregate replay total.
+Healthy recorded publication can therefore settle with
+`flush_diagnostics() == 0` while aggregate completeness remains unknown. Known
+collection loss or file publication failure still fails the diagnostic flush;
+it does not decide whether ordinary task computation executes. A zero-replay
+model publishes zero entries and `bin_file: null`. Truncated or discarded data
+never certifies a complete tensor.
+
+Repeated entries are raw samples, not paired replay invocations. Inspect them
+with `dump_viewer --index N` or export them all. `core_swimlane` refuses to
+reconstruct a task from a recorded aggregate before grouping task IDs, because
+that grouping could combine arguments from different executions. Ordinary
+single-run reconstruction remains available.
 
 ## 4. Capabilities
 
@@ -444,11 +596,12 @@ What changes for a caller:
 
 Two honest limits of this mode:
 
-- **A run that dies without an observed device fence is not recovered.** The
-  default path reads a hung run's un-flushed buffer back; the retained path
-  does not, because nothing there proves the device producers stopped, and
-  reading a buffer a successor may already have recycled is worse than an
-  incomplete dump. Leave `collect_across_runs` off for that investigation.
+- **A run that dies without an observed device fence is not recovered.**
+  Ordinary collection also requires a stop proof before reading an un-flushed
+  buffer: observed execution completion or independently joined producers.
+  The onboard boundary supplies no independent producer-stop proof after a
+  failed fence. Both modes therefore preserve host-owned best-effort output
+  without recovering a buffer that a live producer may still modify.
 - **A blocked disk is not a bounded wait.** `flush_diagnostics` is bounded by
   the timeout you pass it, not by a promise that the writer finishes. It does
   not, however, hold the *device*: the producer's arena is released once the
@@ -458,10 +611,12 @@ Two honest limits of this mode:
   not an acknowledgement, and contributes nothing to it.
 
 The lane payload counters (`published_payload_count`,
-`completed_payload_count`) become monotonic for the collector's life on this
-path instead of being reset per run, so a predecessor's writer cannot have its
-acknowledgements zeroed by a successor's admission. The design assumes one
-collector's lifetime does not produce 2⁶⁴ payload records; admission checks the
+`completed_payload_count`) are monotonic for the collector's life on both paths.
+Retained collection uses lifetime host-ownership credits. Ordinary collection
+uses the device-entry `run_published_payload_base` plus this invocation's
+written payload count, so opening a new host window cannot erase or manufacture
+transport credits. The design assumes one
+collector's lifetime does not produce 2⁶⁴ payload records; retained admission checks the
 counters' headroom and refuses a run that is close to it, which lowers the risk
 of reaching that bound rather than proving no single run can.
 
@@ -484,7 +639,7 @@ DumpDataHeader                                  (host init, AICPU reads)
 ├── num_dump_threads
 ├── records_per_buffer
 ├── magic = 0x44554D50 ("DUMP")
-└── dump_args_level  (DumpArgsLevel: 0=off, 1=partial, 2=hybrid, 3=full; AICPU latches before dispatch)
+└── reserved  (zero; the per-invocation level is in Runtime::dev.dump_args_level)
 
 DumpBufferState[num_dump_threads]               (per-thread)
 ├── free_queue {buffer_ptrs[SLOT_COUNT], head, tail}
@@ -494,7 +649,10 @@ DumpBufferState[num_dump_threads]               (per-thread)
 ├── arena_write_offset         (AICPU cursor in the current arena reuse cycle)
 ├── published_payload_count    (payloads committed to Host through RQ entries)
 ├── completed_payload_count    (published watermark acknowledged by Host)
-└── dropped_record_count
+├── dropped_record_count       (lifetime, retained fallback accounting)
+├── run_published_payload_base  (device-entry lifetime cursor)
+├── run_dropped_record_count    (this invocation only)
+└── run_epoch                   (initialized baseline identity)
 
 DumpMetaBuffer pool (rotated)                   (BUFFERS_PER_THREAD per thread)
 └── ArgsDumpRecord records[RECORDS_PER_BUFFER] + count   ← 128 B each
@@ -520,11 +678,13 @@ Each record is fixed at 128 B (two cache lines) — see
 
 ### 5.2 Where dump calls are wired in
 
-Each runtime's scheduler dispatch code calls
+Each capturing runtime's AICPU scheduler dispatch code calls
 `dump_args_for_task` at two points in the per-task state machine
 (for `tensormap_and_ringbuffer`, this is in
 `runtime/scheduler/scheduler_completion.cpp` and
-`runtime/scheduler/scheduler_dispatch.cpp`):
+`runtime/scheduler/scheduler_dispatch.cpp`). a5 `host_build_graph` has no such
+call site reachable on its route — the two points below belong to whichever
+thread owns the task, and there they are the cores' (§3.1.1):
 
 ```text
 ┌──────────────────────────────────────┐
@@ -632,11 +792,11 @@ metadata by `(task_id, stage, arg_index, role)` before writing JSON.
 │   │   host mapping     │<┼──mapping─────<│                          │
 │   └────────────────────┘ │               │                          │
 │                          │               │ dump_args_flush()        │
-│ stop()                   │               │   log per-thread stats   │
-│   join mgmt → collectors │               └──────────────────────────┘
-│ reconcile_counters()     │
-│   recover leftovers      │
-│   + dropped accounting   │
+│ ordinary close(proof)    │               │   log per-thread stats   │
+│   proved: quiesce        │               └──────────────────────────┘
+│     reconcile counters   │
+│   unknown: stop(false)   │
+│     no held recovery     │
 │                          │
 │ export_dump_files()      │
 │   → <output_prefix>/     │
@@ -655,12 +815,13 @@ init_args_dump()
 start()                          ← spawn split mgmt threads (drain/refill
                                    + replenish), then collector shards
 launch AICPU / AICore
-rtStreamSynchronize              ← wait for kernel completion
-stop()                           ← join mgmt/replenish after final drain,
-                                   then signal collector shards and join them
-reconcile_counters()             ← recover leftover current buffers
-                                   + dropped accounting
-export_dump_files()
+observe run completion
+close_ordinary_run(completed || producers_joined)
+  proof: quiesce() → reconcile_counters() → export_dump_files()
+         collector threads remain resident
+  unknown: stop(false) → export_dump_files()
+           join host readers; skip final device drain and held recovery
+           dropped_records_complete is false
 ```
 
 [`ArgsDumpCollector`](../../src/common/platform/include/host/args_dump_collector.h)
@@ -697,8 +858,9 @@ the fields host modified (advanced `queue_heads[q]`, refilled
 The per-thread arena lives outside the shm region, so
 `on_buffer_collected` separately refreshes `arena_write_offset` and
 copies the arena bytes. The arena-ack pass refreshes each thread's
-`published_payload_count` and compares it with that thread's writer completion
-count. For each thread whose counts match, Host writes that published watermark
+`published_payload_count` and the device-entry `run_published_payload_base`.
+For ordinary collection it compares the published cursor with that baseline
+plus the thread's current-window writer completion count. For each thread whose counts match, Host writes that published watermark
 back as `completed_payload_count`; AICPU requires this acknowledgement before
 reusing that thread's arena. The comparison and the write-back are both
 per-thread, so one lane's outstanding payload never holds up another's arena.
@@ -740,12 +902,12 @@ per-thread, so one lane's outstanding payload never holds up another's arena.
 │     queue to writer thrd │               │                          │
 │   notify_copy_done       │               │                          │
 │                          │               │                          │
-│ rtStreamSynchronize      │               │                          │
-│ stop()                   │               │                          │
-│   join mgmt + collectors │               │                          │
-│ reconcile_counters()     │               │                          │
-│   recover leftovers      │               │                          │
-│   + dropped accounting   │               │                          │
+│ observe completion       │               │                          │
+│ ordinary close(proof)    │               │                          │
+│   proved: quiesce        │               │                          │
+│     reconcile counters   │               │                          │
+│   unknown: stop(false)   │               │                          │
+│     no held recovery     │               │                          │
 │ export_dump_files()      │               │                          │
 │   → <output_prefix>/     │               │                          │
 │     args_dump/...        │               │                          │
@@ -760,11 +922,10 @@ init_args_dump()
   kernel_args_.args.dump_data_base = dump_collector_.get_dump_shm_device_ptr()
 dump_collector_.start(thread_factory)   ← split mgmt + collector shards
 launch AICPU / AICore
-rtStreamSynchronize
-dump_collector_.stop()                  ← join mgmt + collectors, drain final batch
-dump_collector_.reconcile_counters()    ← recover leftover current buffers
-                                          + dropped accounting
-dump_collector_.export_dump_files()
+observe run completion
+dump_collector_.close_ordinary_run(completed || producers_joined)
+  proof: quiesce → reconcile counters → export; keep host threads resident
+  unknown: stop(false) → export host-owned records; no held recovery
 dump_collector_.finalize()
 ```
 
@@ -778,10 +939,11 @@ with `DumpModule`. The only a5-specific glue is the 5-callback
 inside `on_buffer_collected`.
 
 a5 normally relies on per-thread AICPU flush (`dump_args_flush`) to move
-the current buffer into the ready queue. If a hang/op-timeout reaps AICPU
-before that flush runs, `reconcile_counters` recovers a non-empty
-`current_buf_ptr` host-side before export, then accumulates each thread's
-`dropped_record_count` for the final anomaly report.
+the current buffer into the ready queue. Recovery of a non-empty
+`current_buf_ptr` requires proof that producers stopped, plus current-epoch
+and successful-read checks. A failed onboard fence supplies no independent
+stop proof: close exports host-owned records, skips held recovery and marks
+the dropped-record count incomplete.
 
 ### 5.6 a2a3 vs a5 at a glance
 
@@ -796,8 +958,9 @@ before that flush runs, `reconcile_counters` recovers a non-empty
 | `MemoryOps` callbacks | 3 (`alloc`, `reg`, `free_`) | 5 (+ `copy_to_device`, `copy_from_device`) |
 | Arena access | direct via SVM | targeted `copy_from_device` inside `on_buffer_collected` |
 | Tensor-payload support | Supported | Supported |
-| `reconcile_counters` | recover leftover current buffers + dropped accounting | identical |
-| Lifecycle | `initialize` → `start` → `stop` → `reconcile_counters` → `export_dump_files` → `finalize` | identical |
+| Per-task capture by runtime | both runtimes | both runtimes; `host_build_graph` requires AICore scheduling (§3.1.1) |
+| `reconcile_counters` | recover held buffers and snapshot loss counts only after producer-stop proof and host quiescence | identical |
+| Ordinary close | proof: `quiesce` → reconcile → export; unknown: `stop(false)` → export host-owned records | identical |
 
 ## 6. Overhead
 
@@ -828,10 +991,14 @@ device.
 
 ## 7. Limitations
 
-Three pressure or failure conditions exist when dump buffers run out
-of space. Successful arena backpressure preserves payload; truncation
-and record discard surface in the JSON manifest plus the
-`dump_args_flush` log line so users can detect and diagnose them.
+On A5 `host_build_graph`, argument dumping uses resident task-time boundaries.
+It does not change scheduler selection or add ArgsDump support to retained
+Kernel capture/replay (§3.1.1).
+
+Three pressure or failure conditions then exist, on the runtimes that do
+capture, when dump buffers run out of space. Successful arena backpressure
+preserves payload; truncation and record discard surface in the JSON manifest
+plus the `dump_args_flush` log line so users can detect and diagnose them.
 
 ### 7.1 Truncation (`truncated = true`)
 
@@ -877,6 +1044,12 @@ per replenish tick — writes that watermark back as the thread's
 monotonic logical offset to the next physical arena boundary and writes the
 pending payload from the arena start.
 
+The ordinary host window counts writes from zero. Device initialization snapshots
+the lifetime published cursor into `run_published_payload_base`; adding that
+baseline converts current-window disk completions to lifetime transport credits.
+The retained path continues using lifetime receipt/discard credits. Neither host
+admission nor device entry resets published/completed cursors.
+
 Every quantity here is per-thread: each AICPU thread owns its own arena, so
 thread *t* may wrap as soon as thread *t*'s own payloads are on disk. The cursor
 is never reset and no reclaimed/published arena offset is needed. The wait is
@@ -904,14 +1077,35 @@ the current records are accounted as dropped.
 // Reuse current buffer — account for lost records
 account_dropped_records(state, cur_buf.count)
 cur_buf.count = 0          ← reset and reuse
-dropped_record_count += N  ← tracks total lost records
+dropped_record_count += N      ← saturating lifetime loss counter
+run_dropped_record_count += N  ← saturating loss counter for this invocation
 ```
 
 The same fallback applies during `dump_args_flush()` at end of
 execution if the ready queue is full.
 
-**Effect:** `dropped_records` in the manifest summary shows how
-many argument records were lost. Dropped arguments do not appear in
+**Effect:** `dropped_records` in the manifest summary counts device-reported
+record losses in this invocation. Ordinary manifests also include
+`dropped_records_complete`: it is `true` only after stopped-producer reconciliation
+has read the invocation's counters and resolved every held metadata buffer without
+an uncounted transport loss. A failed shared-state or held-buffer read, an
+unattributable held buffer, a retired unreadable ready buffer, or a saturated
+counter leaves it `false`. A held-buffer read failure leaves its potential record
+loss unknown even when the device's loss counter was readable. Without completed
+reconciliation, including when producer stop is unknown, it also remains `false`.
+In those cases the numeric field is an observed lower bound; zero does not prove
+zero loss. This flag describes record-loss accounting only: it does not certify
+payload reads, file writes, or the completeness of the entire artifact.
+
+Ordinary collection retains its no-data convention: when no records were
+collected, it writes no manifest, including on an unproven close. Absence of an
+artifact is not evidence of zero device loss or complete collection. The
+completeness flag describes ordinary manifests that were actually written.
+
+Device initialization clears
+`run_dropped_record_count`, independently of the lifetime counter used by retained
+collection. A saturated lifetime counter therefore does not hide a later
+ordinary invocation's losses. Dropped arguments do not appear in
 the `args[]` array at all.
 
 **Tuning:** raise `PLATFORM_DUMP_BUFFERS_PER_THREAD` (more
@@ -924,7 +1118,8 @@ host hand-off queue).
 | --------- | ---- | -------- | ------- | ---- | -- |
 | Tensor > arena | `truncated` | Preserved | Partial (`arena/2` bytes) | Same | Same |
 | Arena host writer falls behind | none on success | Preserved | Preserved after bounded wait for this thread's ack | Same | Same |
-| Record buffer full, no free buffer | `dropped_records` summary | Lost | Lost | After gate timeout | Same |
+| Record buffer full, no free buffer | `dropped_records`; `dropped_records_complete` states accounting confidence | Lost | Lost | After gate timeout | Same |
+| Ordinary close without producer-stop proof | `dropped_records_complete: false` when a manifest exists; no artifact does not prove zero loss | Host-owned records preserved; held records not recovered | Host-owned payload preserved; held payload not recovered | Same | Same |
 
 ### 7.5 Configuration knobs
 
@@ -947,7 +1142,7 @@ Per-thread arena =
 
 **No `args_dump/` directory or `args_dump.json` in the output.** Check that
 `--dump-args` was passed; without it the host does not allocate dump storage.
-The collector exports files only after receiving at least one record, so the
+An ordinary collector exports files only after receiving at least one record, so the
 same result is expected when the kernel dispatches no arguments or when
 `partial` has no `CoreTaskArgs::dump(...)` markers. Add markers (§3.2), or pass
 `--dump-args full`.
@@ -996,8 +1191,9 @@ still a dump?** Yes. The host exports the manifest even though `run()` returns
 the timeout error. Within the selected level's record scope, it contains task
 inputs captured at `BEFORE_DISPATCH`, outputs from tasks that completed before
 the hang, and any recoverable partial output from an in-flight task. This rests
-on the timeout ordering — the three budgets are tuned so the **AICPU detects the
-hang first**, dumps, and only then the hardware/host timeouts fire:
+on the opportunity for the AICPU to detect and dump the hang before a hardware
+watchdog or Host wait expires. The configured budgets express that intended
+relationship; they do not establish actual firing order:
 
 ```text
 SCHEDULER_TIMEOUT_MS (20 s)           <  PLATFORM_OP_EXECUTE_TIMEOUT_US (45 s)  <  PLATFORM_STREAM_SYNC_TIMEOUT_MS (50 s)
@@ -1007,9 +1203,14 @@ SCHEDULER_TIMEOUT_MS (20 s)           <  PLATFORM_OP_EXECUTE_TIMEOUT_US (45 s)  
 
 These defaults can be overridden without rebuilding by setting
 `SIMPLER_SCHEDULER_TIMEOUT_MS`, `SIMPLER_OP_EXECUTE_TIMEOUT_US`, and
-`SIMPLER_STREAM_SYNC_TIMEOUT_MS`. Invalid values, or onboard combinations that
-break the ordering above, are ignored with a warning and fall back to the
-defaults. The onboard host also requires stream-sync to cover the scheduler
+`SIMPLER_STREAM_SYNC_TIMEOUT_MS`. Invalid requested values or requested onboard
+orderings are ignored with a warning and fall back to the defaults. Owned
+onboard initialization then checks the ACL-reported operator timeout. A successful
+setter with an invalid adjusted ordering emits a warning and continues with the
+original budgets; setter failure still rejects initialization. The host does
+not enlarge the stream budget automatically. Borrowed kernel contexts do
+not configure or validate the caller's external operator watchdog.
+The onboard host also requires stream-sync to cover the scheduler
 budget plus a 1.5 s scheduler-arming guard for cold init work before the
 no-progress timer starts. This guard covers fixed/cold costs such as kernel
 registration, orchestration SO dlopen, runtime init, and AICore handshake.
@@ -1019,8 +1220,9 @@ callers that raise scheduler/op timeouts must also size
 builds do not have STARS or ACL stream-sync timeouts, but scheduler overrides
 are still parsed and applied independently so slow CPU-sim kernels can raise
 the no-progress budget without onboard-only ordering limits. CI restores the
-old fast-fail values through these env vars: 2 s scheduler, 3 s op-execute,
-and 4 s stream-sync for onboard jobs; 5 s scheduler for sim jobs.
+fast-fail values through these env vars: 2 s scheduler, 3 s requested op-execute,
+and 6 s stream-sync for onboard jobs; 10 s scheduler for sim jobs. ACL may adjust
+the operator value; its reported setting is not a measured firing deadline.
 
 - **Device-side graceful flush (primary).** At 20 s of no progress
   the AICPU declares the hang, runs the end-of-loop flush, *and*
@@ -1028,27 +1230,39 @@ and 4 s stream-sync for onboard jobs; 5 s scheduler for sim jobs.
   — written at the `after_completion` stage, reflecting current GM,
   so you can see how far a stuck kernel got and how much it wrote.
   Because this fires before STARS reaps the op (45 s), it
-  normally completes while the kernel is still wedged (and host-side
-  recovery below backstops the rest). Best-effort:
+  normally completes while the kernel is still wedged. Only records whose
+  publication reaches the host are available without a later stop proof. Best-effort:
   only AICore writes already drained to GM are visible (the stuck
   core issued no `pipe_barrier`, so writes still in its cache are
   not), and a read may be torn if the core is mid-write. To tell a
   running task's partial output apart from a genuine completion,
   cross-reference the `[STALL …] state=RUNNING` / `SHUTDOWN_SNAPSHOT`
   log lines — those task_ids are the in-flight ones.
-- **Host-side recovery (backstop).** If the AICPU is killed before
-  it finishes flushing (it loses the race, or `emergency_shutdown`
-  blocks on the wedged core), its last buffer is left un-flushed on
-  the device (`current_buf_ptr != 0`). The host's `reconcile_counters`
-  detects this and recovers those records directly from the device
-  buffer + arena (the device is not reset until *after* the export),
-  so whatever the AICPU managed to record — including in-flight
-  output written before the kill — still reaches the manifest.
+- **Host-side recovery after proven stop.** A producer that stops before
+  flushing can leave its last buffer on the device (`current_buf_ptr != 0`).
+  Only after observed execution completion or independent producer termination
+  may `reconcile_counters` recover its records from the device buffer and arena.
+  An onboard failed fence provides neither proof, so it does not enable this backstop. Recovery
+  requires the current invocation's initialized lane and buffer epochs and
+  successful shared-state and buffer reads; failed reads do not authorize
+  cached-shadow recovery. Records already owned by the host retain best-effort
+  export. Unread producer accounting or an unreadable held buffer leaves
+  `dropped_records_complete: false`; `dropped_records: 0` alone does not prove no loss.
+  Recovery requires either observed execution completion or independently joined
+  producers. Without either proof, ordinary close joins the host drain,
+  replenish, and collector threads before exporting host-owned records, and
+  skips the final device-queue drain and recovery of producer-held buffers.
+  Entries already handed to host collectors finish; later device publications
+  remain on the device. This host shutdown does not establish
+  device completion or authorize freeing device storage. Epoch and read checks
+  alone do not establish quiescence.
 
-This ordering is load-bearing: if the timeouts were inverted (STARS
-reaping before the AICPU's budget, as in earlier versions), the
-device-side dump would never run on a real AICore hang and you would
-only recover what was already in the buffer. The chain lives in
+If STARS reaps the operator before the AICPU publishes its dump, recovery may
+be limited to records already available to Host collectors. Numeric timeout
+ordering alone does not prove that the device-side dump has run. Host waits use
+per-Event or per-Stream budgets rather than one deadline for the entire run;
+see [local timeout boundaries](../troubleshooting/local-timeout-defaults.md#what-the-host-wait-budget-measures).
+The configured chain lives in
 `platform_config.h`, which holds all three (`PLATFORM_SCHEDULER_TIMEOUT_MS`,
 surfaced as `SCHEDULER_TIMEOUT_MS` — 20 s, one value for onboard and sim,
 `PLATFORM_OP_EXECUTE_TIMEOUT_US` /

@@ -22,9 +22,6 @@
  * producer at the row's tail, which is where the device's backward scan starts.
  * Non-candidate rows keep their record order.
  *
- * The second fixture covers the device side of the same row: the tail-first
- * scan, the wake-scan cursor that resumes it, the row-index-to-producer mapping,
- * and the drain's single-producer fast path.
  */
 
 #include <gtest/gtest.h>
@@ -37,8 +34,7 @@
 
 #include "graph_execution.h"
 #include "graph_host_state.h"
-#include "scheduler/scheduler.h"
-#include "host_build_graph/orchestrator.h"
+#include "host_build_graph/host/orchestrator.h"
 #include "host_build_graph/shared_memory.h"
 #include "utils/device_arena.h"
 #include "host_build_graph/task_id.h"
@@ -46,11 +42,8 @@
 class HbgGraphEdQualificationTest : public ::testing::Test {
 protected:
     DeviceArena sm_arena;
-    DeviceArena runtime_arena;
     SharedMemoryHandle *sm_handle = nullptr;
     OrchestratorState orch{};
-    SchedulerState sched{};
-    SchedulerLayout sched_layout{};
     GraphHostStatePtr graph_state;
     std::vector<char> gm_heap;
     std::vector<std::byte> definition_staging;
@@ -66,18 +59,13 @@ protected:
         gm_heap.resize(HEAP_BYTES);
         create_infos.reserve(16);
 
-        sched_layout = SchedulerState::reserve_layout(runtime_arena);
-        ASSERT_NE(runtime_arena.commit(), nullptr);
-
-        ASSERT_TRUE(sched.init_data_from_layout(sched_layout, runtime_arena, sm_handle->sm_base));
-        sched.wire_arena_pointers(sched_layout, runtime_arena);
         ASSERT_TRUE(orch.init(sm_handle->sm_base, gm_heap.data(), HEAP_BYTES, CHIP_DEFAULT_GRAPH_TASKS));
 
         definition_staging.assign(STAGING_BYTES, std::byte{0});
-        GraphDefinitionArena arena{};
+        GraphImageArena arena{};
         arena.base = definition_staging.data();
         arena.capacity = definition_staging.size();
-        arena.object_prefix_bytes = sizeof(GraphDefinitionHeader);
+        arena.object_prefix_bytes = sizeof(GraphImageHeader);
         arena.object_align = GRAPH_DEFINITION_OBJECT_ALIGN;
         graph_state = make_graph_host_state(arena);
         ASSERT_NE(graph_state, nullptr);
@@ -87,8 +75,6 @@ protected:
     void TearDown() override {
         orch.graph_host_state = nullptr;
         graph_state.reset();
-        sched.destroy();
-        runtime_arena.release();
         sm_arena.release();
     }
 
@@ -106,7 +92,7 @@ protected:
     simpler::hbg::Tensor begin_body(uint64_t key, GraphTaskArgs &boundary_args, const simpler::hbg::Tensor &boundary) {
         orch.begin_scope();
         boundary_args.add_input(boundary);
-        const GraphScopeResult graph = orch.graph_begin(key, boundary_args, 0);
+        const GraphScopeResult graph = orch.graph_begin(key, boundary_args);
         EXPECT_TRUE(graph.recording);
         EXPECT_NE(graph.recording_handle, nullptr);
         EXPECT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
@@ -174,7 +160,7 @@ protected:
     // Replays a recorded body by its key. The cache hit is what submits the
     // outer shell, which is where the shell's own verdict is decided.
     TaskId submit_shell(uint64_t key, GraphTaskArgs &boundary_args) {
-        const GraphScopeResult replay = orch.graph_begin(key, boundary_args, 0);
+        const GraphScopeResult replay = orch.graph_begin(key, boundary_args);
         EXPECT_FALSE(replay.recording) << "the body is already recorded, so this must be a cache hit";
         EXPECT_TRUE(replay.task_id.is_valid());
         return replay.task_id;
@@ -184,14 +170,14 @@ protected:
         return orch.sm_header->tasks.get_slot_state_by_task_id(id.local_id());
     }
 
-    const GraphDefinition *published_definition() {
-        const GraphHostDefinitionList published = graph_host_definitions(*graph_state);
-        EXPECT_EQ(published.entries.size(), 1u);
-        if (published.entries.empty()) return nullptr;
-        const GraphHostDefinition &entry = published.entries.front();
+    const Graph *published_definition() {
+        const std::vector<GraphHostImage> published = graph_host_definitions(*graph_state);
+        EXPECT_EQ(published.size(), 1u);
+        if (published.empty()) return nullptr;
+        const GraphHostImage &entry = published.front();
         EXPECT_NE(entry.object_offset, GRAPH_NO_OBJECT_OFFSET) << "the staging arena is sized to hold this image";
-        return reinterpret_cast<const GraphDefinition *>(
-            definition_staging.data() + entry.object_offset + sizeof(GraphDefinitionHeader)
+        return reinterpret_cast<const Graph *>(
+            definition_staging.data() + entry.object_offset + sizeof(GraphImageHeader)
         );
     }
 };
@@ -208,7 +194,7 @@ TEST_F(HbgGraphEdQualificationTest, AllFlaggedProducersMakeCandidateAndSortItsRo
     ASSERT_TRUE(record_consumer(t1, t0).is_valid());
     ASSERT_TRUE(orch.graph_end());
 
-    const GraphDefinition *definition = published_definition();
+    const Graph *definition = published_definition();
     ASSERT_NE(definition, nullptr);
     ASSERT_EQ(definition->task_count, 3);
     const auto *tasks = graph_definition_array<SubTaskDefinition>(*definition, definition->off_sub_tasks, 3);
@@ -243,7 +229,7 @@ TEST_F(HbgGraphEdQualificationTest, OneUnflaggedProducerDisqualifiesAndLeavesIts
     ASSERT_TRUE(record_consumer(t1, t0).is_valid());
     ASSERT_TRUE(orch.graph_end());
 
-    const GraphDefinition *definition = published_definition();
+    const Graph *definition = published_definition();
     ASSERT_NE(definition, nullptr);
     ASSERT_EQ(definition->task_count, 3);
     const auto *tasks = graph_definition_array<SubTaskDefinition>(*definition, definition->off_sub_tasks, 3);
@@ -280,7 +266,7 @@ TEST_F(HbgGraphEdQualificationTest, HiddenAllocProducerDoesNotDisqualifyItsConsu
     ASSERT_TRUE(record_consumer(flagged, allocated).is_valid());
     ASSERT_TRUE(orch.graph_end());
 
-    const GraphDefinition *definition = published_definition();
+    const Graph *definition = published_definition();
     ASSERT_NE(definition, nullptr);
     ASSERT_EQ(definition->task_count, 3);
     const auto *tasks = graph_definition_array<SubTaskDefinition>(*definition, definition->off_sub_tasks, 3);
@@ -334,186 +320,4 @@ TEST_F(HbgGraphEdQualificationTest, OneUnflaggedProducerDisqualifiesTheShell) {
 
     EXPECT_EQ(slot_of(shell).ed_flags & ED_FLAG_CANDIDATE, 0);
     EXPECT_EQ(slot_of(producer).ed_flags & ED_FLAG_TRACKED, 0);
-}
-
-// The device side of a body's fanin CSR row. The scheduler reads only the CSR
-// pair and the slots it indexes, so a topology can be stated directly here
-// rather than materialized from a Definition.
-class HbgGraphWakeScanTest : public ::testing::Test {
-protected:
-    DeviceArena sm_arena;
-    DeviceArena runtime_arena;
-    SharedMemoryHandle *sm_handle = nullptr;
-    SchedulerState sched{};
-    SchedulerLayout sched_layout{};
-    GraphExecution execution{};
-    // ChipTaskStorage holds atomics, so it is neither copyable nor movable and
-    // cannot back a vector; this constructs each element in place.
-    std::unique_ptr<ChipTaskStorage[]> storage;
-    // The execution's readiness array, allocated with the storage it indexes.
-    std::unique_ptr<std::atomic<ChipTaskState>[]> states;
-    std::vector<int32_t> fanin_offsets;
-    std::vector<uint16_t> fanin_indices;
-
-    void SetUp() override {
-        sm_handle = SharedMemoryHandle::create_and_init_default(sm_arena);
-        ASSERT_NE(sm_handle, nullptr);
-        sched_layout = SchedulerState::reserve_layout(runtime_arena);
-        ASSERT_NE(runtime_arena.commit(), nullptr);
-        ASSERT_TRUE(sched.init_data_from_layout(sched_layout, runtime_arena, sm_handle->sm_base));
-        sched.wire_arena_pointers(sched_layout, runtime_arena);
-        sched.seed_queue_slots();
-    }
-
-    void TearDown() override {
-        sched.destroy();
-        runtime_arena.release();
-        sm_arena.release();
-    }
-
-    // `rows[i]` holds task i's producers in row order. Every task starts as a
-    // pending AIV leaf, the state materialization leaves it in.
-    void build(const std::vector<std::vector<uint16_t>> &rows) {
-        storage = std::make_unique<ChipTaskStorage[]>(rows.size());
-        states = std::make_unique<std::atomic<ChipTaskState>[]>(rows.size());
-        execution.task_states = states.get();
-        fanin_offsets.assign(1, 0);
-        for (size_t i = 0; i < rows.size(); ++i) {
-            fanin_indices.insert(fanin_indices.end(), rows[i].begin(), rows[i].end());
-            fanin_offsets.push_back(static_cast<int32_t>(fanin_indices.size()));
-            ChipTaskSlotState &s = storage[i].slot;
-            s.reset_for_reuse();
-            s.sub_task_local_id = static_cast<int32_t>(i);
-            s.active_mask = ActiveMask(SUBTASK_MASK_AIV0);
-            s.graph_context = &execution;
-            execution.reset_task_state(static_cast<int32_t>(i));
-        }
-        execution.task_count = static_cast<int32_t>(rows.size());
-        execution.task_storage = storage.get();
-        execution.fanin_offsets = fanin_offsets.data();
-        execution.fanin_indices = fanin_indices.data();
-    }
-
-    ChipTaskSlotState &slot(size_t i) { return storage[i].slot; }
-
-    ChipTaskSlotState *pop_ready() {
-        ChipTaskSlotState *out = nullptr;
-        const int popped = sched.ready_queues[static_cast<int32_t>(ResourceShape::AIV)].pop_batch(&out, 1);
-        return popped == 1 ? out : nullptr;
-    }
-};
-
-// A wide sub-task row exceeds what a byte cursor can index. The scan must
-// report the row unfinished until every producer has published: a truncated
-// cursor would wrap to a low index, find that one entry published, and stage a
-// candidate whose remaining producers have not.
-TEST_F(HbgGraphWakeScanTest, WideRowCursorDoesNotTruncate) {
-    constexpr int32_t kProducers = 300;  // > 0xFF, the old cursor width
-    std::vector<std::vector<uint16_t>> rows(kProducers);
-    std::vector<uint16_t> consumer_row;
-    consumer_row.reserve(kProducers);
-    for (int32_t i = 0; i < kProducers; ++i)
-        consumer_row.push_back(static_cast<uint16_t>(i));
-    rows.push_back(consumer_row);
-    build(rows);
-
-    ChipTaskSlotState &consumer = slot(kProducers);
-    consumer.ed_flags |= ED_FLAG_CANDIDATE;
-    for (int32_t i = 0; i < kProducers; ++i)
-        slot(i).ed_flags |= ED_FLAG_TRACKED;
-
-    // Intake hangs it on the row's tail, and the cursor must name that entry
-    // rather than a wrapped one.
-    ASSERT_FALSE(sched.register_on_ed_publish_list(consumer));
-    EXPECT_EQ(consumer.ed_publish_scan_cursor, kProducers - 1);
-
-    // Publishing every producer but the first leaves the row unfinished.
-    for (int32_t i = kProducers - 1; i > 0; --i) {
-        execution.store_published(i);
-        sched.seal_ed_publish_list(slot(i));
-    }
-    ChipTaskSlotState *detached = nullptr;
-    while (sched.ed_publish_drain_queue.pop_batch(&detached, 1) == 1) {
-        if (sched.advance_ed_publish_scan(*detached)) FAIL() << "staged while producer 0 is unpublished";
-    }
-
-    execution.store_published(0);
-    sched.seal_ed_publish_list(slot(0));
-    ASSERT_EQ(sched.ed_publish_drain_queue.pop_batch(&detached, 1), 1);
-    EXPECT_TRUE(sched.advance_ed_publish_scan(*detached));
-}
-
-// Each classification resumes where the last one hung and never re-walks the
-// row's completed tail. Completion is monotone, so the resume reaches the same
-// verdict a full rescan would.
-TEST_F(HbgGraphWakeScanTest, CursorResumesAndNeverRewalks) {
-    build({{}, {}, {}, {0, 1, 2}});
-    ChipTaskSlotState &consumer = slot(3);
-
-    // Never hung: the sentinel folds the scan start to the row's tail.
-    EXPECT_EQ(consumer.wake_scan_cursor, 0xFFFF);
-    EXPECT_EQ(sched.graph_first_unmet_producer(execution, consumer), 2);
-    EXPECT_EQ(consumer.wake_scan_cursor, 2);
-
-    // The hung-at producer completes: the rescan resumes at the cursor and walks
-    // down to the next unmet row entry.
-    execution.store_completed(2);
-    EXPECT_EQ(sched.graph_first_unmet_producer(execution, consumer), 1);
-    EXPECT_EQ(consumer.wake_scan_cursor, 1);
-
-    // An entry above the cursor completing does not move it — nothing re-walks
-    // that tail — and clearing the rest yields the ready verdict.
-    execution.store_completed(0);
-    EXPECT_EQ(sched.graph_first_unmet_producer(execution, consumer), 1);
-    EXPECT_EQ(consumer.wake_scan_cursor, 1);
-    execution.store_completed(1);
-    EXPECT_EQ(sched.graph_first_unmet_producer(execution, consumer), -1);
-}
-
-// The classifier names a row index, not a producer index; graph_producer_at is
-// what maps one to the other. A row that is not in producer order separates them.
-TEST_F(HbgGraphWakeScanTest, ClassifierNamesARowIndexNotAProducerIndex) {
-    build({{}, {}, {}, {2, 0, 1}});
-    ChipTaskSlotState &consumer = slot(3);
-
-    EXPECT_EQ(sched.graph_first_unmet_producer(execution, consumer), 2);
-    EXPECT_EQ(&sched.graph_producer_at(execution, consumer, 2), &slot(1));
-    EXPECT_EQ(&sched.graph_producer_at(execution, consumer, 0), &slot(2));
-}
-
-// A waiter with exactly one producer is by construction waiting only on the
-// producer draining it, so the drain routes it without a classification pass.
-TEST_F(HbgGraphWakeScanTest, SingleProducerWaiterIsRoutedByTheDrain) {
-    build({{}, {0}});
-    ChipTaskSlotState &producer = slot(0);
-    ChipTaskSlotState &consumer = slot(1);
-
-    sched.register_graph_wake(execution, &producer, &consumer);
-    ASSERT_EQ(producer.wake_list_head.load(std::memory_order_relaxed), &consumer);
-
-    execution.store_completed(0);
-    EXPECT_EQ(sched.drain_graph_wake_list(execution, producer), 1u);
-    EXPECT_EQ(pop_ready(), &consumer);
-    // Decided from the row's length alone, so the never-hung sentinel stands.
-    EXPECT_EQ(consumer.wake_scan_cursor, 0xFFFF);
-}
-
-// A multi-producer waiter takes the classification path instead: it re-registers
-// on the row's next unmet entry and reaches the queue only once that clears too.
-TEST_F(HbgGraphWakeScanTest, MultiProducerWaiterReRegistersUntilItsRowClears) {
-    build({{}, {}, {0, 1}});
-    ChipTaskSlotState &consumer = slot(2);
-
-    sched.register_graph_wake(execution, &slot(1), &consumer);
-    execution.store_completed(1);
-    EXPECT_EQ(sched.drain_graph_wake_list(execution, slot(1)), 1u);
-
-    // Producer 0 is still pending, so the waiter moved rather than became ready.
-    EXPECT_EQ(pop_ready(), nullptr);
-    EXPECT_EQ(slot(0).wake_list_head.load(std::memory_order_relaxed), &consumer);
-    EXPECT_EQ(consumer.wake_scan_cursor, 0);
-
-    execution.store_completed(0);
-    EXPECT_EQ(sched.drain_graph_wake_list(execution, slot(0)), 1u);
-    EXPECT_EQ(pop_ready(), &consumer);
 }

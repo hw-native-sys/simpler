@@ -13,20 +13,11 @@
  * @file intrinsic.h
  * @brief SPMD execution context for AICore user kernels
  *
- * Topology data exposed to user kernels has two distinct lifetimes:
+ * GlobalContext exposes the final physical AIV lane and resident
+ * run/execution addressing. LocalContext carries logical block geometry. Both contexts belong to the
+ * invocation Binding; their addresses remain stable for the kernel invocation.
  *
- *   1. Global topology (per-core, fixed after runtime init):
- *      - sub_block_id : identifies the AIV lane within a cluster
- *        (0 = AIV0/left, 1 = AIV1/right).  Initialized once at runtime
- *        startup based on each core's cluster position; never changes.
- *        Only meaningful for AIV kernels in MIX tasks.
- *
- *   2. Local per-dispatch context (changes each dispatch):
- *      - block_idx : which logical block the current worker is executing
- *      - block_num : total number of blocks in this task (= block_dim)
- *      Written by build_payload() before each dispatch.
- *
- * Both categories are injected via two pointer slots appended at the tail
+ * Both contexts are injected via two pointer slots appended at the tail
  * of the kernel args[] array:
  *
  *   args layout:
@@ -79,9 +70,11 @@
 
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
+#include <type_traits>
 
-#include "aicore_completion_mailbox_types.h"
+#include "host_build_graph/completion_types.h"
 #include "host_build_graph/task_id.h"
 
 #ifndef __gm__
@@ -106,53 +99,36 @@ static constexpr int32_t PAYLOAD_LOCAL_CONTEXT_INDEX = SPMD_LOCAL_CONTEXT_INDEX;
 static constexpr int32_t PAYLOAD_GLOBAL_CONTEXT_INDEX = SPMD_GLOBAL_CONTEXT_INDEX;
 
 /**
- * Per-dispatch global context, stored in DispatchPayload. Resident graph
+ * Per-invocation global context. Resident graph
  * Mix dispatch sets sub_block_id from the final physical AIV placement; the
- * legacy scheduler seeds the equivalent per-core value during startup.
+ * writer fields name this invocation's stable completion publication.
  */
 struct GlobalContext {
     // AIV lane within cluster: 0=AIV0(left), 1=AIV1(right).
     // Used by AIV to select the correct intra-cluster hw instruction.
     // Not meaningful for AIC kernels or single-AIV tasks.
     int32_t sub_block_id;
+    uint32_t async_present;
+    uint64_t async_image_address;
+    uint64_t async_image_bytes;
+    uint64_t async_run_epoch;
+    uint64_t async_group_offset;
+    uint32_t async_group_index;
+    uint32_t async_output_capture_refused;
 };
 
-struct AsyncCtx {
-    volatile __gm__ uint32_t *completion_count;
-    volatile __gm__ int32_t *completion_error_code;
-    volatile __gm__ DeferredCompletionEntry *completion_entries;
-    uint32_t completion_capacity;
-    TaskId task_token;
+static_assert(sizeof(GlobalContext) == 48);
+static_assert(offsetof(GlobalContext, async_present) == 4 && offsetof(GlobalContext, async_group_index) == 40);
+static_assert(std::is_standard_layout_v<GlobalContext> && std::is_trivially_copyable_v<GlobalContext>);
 
-    static inline AsyncCtx make(TaskId task_token, volatile __gm__ DeferredCompletionSlab *buffer) {
-        AsyncCtx ctx{};
-        ctx.task_token = task_token;
-        if (buffer == nullptr) {
-            ctx.task_token = TaskId::invalid();
-            return ctx;
-        }
-        ctx.completion_count = &buffer->count;
-        ctx.completion_error_code = &buffer->error_code;
-        ctx.completion_entries = &buffer->entries[0];
-        ctx.completion_capacity = MAX_COMPLETIONS_PER_TASK;
-        return ctx;
-    }
-};
-
-/**
- * Per-dispatch local context, stored in DispatchPayload.
- * Written by build_payload() before each dispatch. Different blocks of the
- * same task receive different block_idx values but the same block_num.
- *
- */
+// Resident and percounter preparation assign the current logical block geometry.
 struct LocalContext {
     int32_t block_idx;  // Logical block index within the task [0, block_num)
-    int32_t block_num;  // How many logical blocks this task requires.
-                        // Currently fixed to 1 (block_dim > 1 not yet implemented).
+    int32_t block_num;  // Original logical block count, including multi-wave execution.
                         // NOT the same as RUNTIME_CONFIG.block_dim in kernel_config.py,
                         // which controls how many physical cores the runtime launches.
-    AsyncCtx async_ctx;
 };
+static_assert(sizeof(LocalContext) == 8);
 
 /**
  * Return the AIV lane index within the cluster.
@@ -164,7 +140,7 @@ struct LocalContext {
  * communication.
  *
  * AIC kernels should NOT call this function.
- * Single-AIV tasks have no intra-cluster communication, so sub_block_id
+ * Pure AIV tasks have no intra-cluster communication, so sub_block_id
  * has no meaning and should not be used.
  */
 static __aicore__ inline int32_t get_sub_block_id(__gm__ int64_t *args) {
@@ -187,7 +163,6 @@ static __aicore__ inline int32_t get_block_idx(__gm__ int64_t *args) {
 /**
  * Return how many logical blocks the current task requires.
  * All blocks of the same task see the same value.
- * Currently always returns 1 (block_dim>1 not yet implemented).
  *
  * Note: this is NOT the same as RUNTIME_CONFIG.block_dim in
  * kernel_config.py, which controls how many physical cores are launched.

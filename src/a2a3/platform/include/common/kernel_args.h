@@ -41,6 +41,8 @@
 #include "common/dma_workspace.h"
 #include "common/launch_entry_args.h"
 
+inline constexpr bool PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE = true;
+
 // Forward declarations
 class Runtime;
 
@@ -97,8 +99,8 @@ struct KernelArgs {
     uint64_t regs{0};                                       // Per-core register base address array (platform-specific)
     // Remaining 64-bit fields. Grouped before the 32-bit tail so the struct
     // needs no interior alignment padding — every uint64_t lands on its natural
-    // 8-byte boundary, and the tail's eight uint32_t fill the last two 8-byte
-    // slots exactly, so the struct carries no padding byte at all. Order among
+    // 8-byte boundary. The nine 32-bit tail members require four trailing
+    // padding bytes for the structure's 8-byte alignment. Order among
     // these is free (device reads by field name, not offset); only
     // runtime_args/regs are offset-locked.
     uint64_t ffts_base_addr{0};  // FFTS base address for AICore
@@ -137,18 +139,26 @@ struct KernelArgs {
     // Zero when the buffer was not allocated.
     uint64_t device_wall_data_base{0};
 
-    // Device pointer to this run's result region (DeviceRunResultRegion), and
-    // the run epoch its device side publishes into that region. Same reason the
-    // wall base travels here rather than inline: AICPU gets KernelArgs as a
-    // CANN-private copy, so an inline field would be write-only from AICPU.
-    //
-    // Unlike the wall buffer this is NOT gated on diagnostics — a run's error
-    // result has to survive whether or not timing capture is on. The host does
-    // not clear the region per run; the epoch is what makes a previous run's
-    // payload recognisable as stale, so arming costs no H2D.
-    // Both zero when no region was allocated.
+    // Optional private result address and the actual invocation/report epoch.
+    // Kernel diagnostics-off calls keep the nonzero epoch for packet and Core
+    // identity while publishing no private record (base 0). Program retains its
+    // structured error record. A nonzero base names fully initialized storage
+    // and requires a nonzero epoch; raw legacy no-record calls may use 0/0.
     uint64_t run_result_data_base{0};
     uint64_t run_result_epoch{0};
+
+    // This run's per-run terminal banks for the four queue-pair diagnostic
+    // owners, each the address of that bank's first producer entry, resolved by
+    // the host from the identity that reserved it. 0 whenever the host resolved
+    // no bank — the owner is off, its retention is off, or every bank was in
+    // use — and the device treats 0 as "publish no accounting" and never
+    // derives an address of its own. One address rather than a base and an
+    // index, for the same reason the swimlane's is: the host owns the bank
+    // indexing, so a producer can only add its own producer index.
+    uint64_t args_dump_run_terminal_bank{0};
+    uint64_t pmu_run_terminal_bank{0};
+    uint64_t dep_gen_run_terminal_bank{0};
+    uint64_t scope_stats_run_terminal_bank{0};
     // 32-bit tail.
     uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_args|chip_swimlane|pmu|dep_gen|scope_stats
 
@@ -174,6 +184,7 @@ struct KernelArgs {
     uint32_t graph_section_offset{0};
     uint32_t graph_section_bytes{0};
     uint32_t graph_section_source{static_cast<uint32_t>(GraphSectionSource::None)};
+    uint32_t entry_cache_maintenance{static_cast<uint32_t>(EntryCacheMaintenance::Full)};
 };
 
 static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");
@@ -190,12 +201,18 @@ static_assert(
     offsetof(KernelArgs, chip_swimlane_run_terminal_bank) == 40,
     "KernelArgs::chip_swimlane_run_terminal_bank offset drift"
 );
+// The first of the four queue-pair terminal banks, pinned for the same reason:
+// the four are read by name, so only their offsets say whether the group was
+// reordered or one of them was dropped.
+static_assert(
+    offsetof(KernelArgs, args_dump_run_terminal_bank) == 112, "KernelArgs::args_dump_run_terminal_bank offset drift"
+);
 // Where the 32-bit tail's Graph triple begins. `sizeof` alone cannot see a
 // reorder inside that tail, because every member of it is the same width: the
-// fourteen 8-byte fields end at 112 and the eight uint32_t that follow fill 144
-// exactly, in whatever order they are written.
-static_assert(offsetof(KernelArgs, graph_section_offset) == 132, "KernelArgs::graph_section_offset offset drift");
-static_assert(sizeof(KernelArgs) == 144, "KernelArgs launch-payload size drift");
+// eighteen 8-byte fields end at 144; the Graph triple starts at 164.
+static_assert(offsetof(KernelArgs, graph_section_offset) == 164, "KernelArgs::graph_section_offset offset drift");
+static_assert(offsetof(KernelArgs, entry_cache_maintenance) == 176, "entry cache policy offset drift");
+static_assert(sizeof(KernelArgs) == 184, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so
 // these values are the same in every translation unit that sees this header.
@@ -303,6 +320,9 @@ struct RegisterCallableArgs {
     uint64_t dev_orch_so_size{0};                                    // orch SO image size in bytes
     char device_orch_func_name[INIT_ARGS_MAX_ORCH_SYMBOL_NAME]{};    // entry symbol
     char device_orch_config_name[INIT_ARGS_MAX_ORCH_SYMBOL_NAME]{};  // config symbol
+    uint64_t residency_generation{0};
+    uint32_t tensor_count{0};
+    uint32_t scalar_count{0};
 };
 
 #ifdef __cplusplus

@@ -1,0 +1,198 @@
+{
+  "selection": "覆盖长链、高 fanin、不均匀 fanout、随机 DAG、多 root、单 AIC/AIV、MIX 交错和 SPMD 波次；固定 benchmark 集另列。",
+  "scenes": [
+    {
+      "path": "tests/st/a5/host_build_graph/fanout_imbalance/test_fanout_imbalance.py",
+      "class": "TestFanoutImbalance",
+      "case": "fanout_1024",
+      "params": {
+        "task_count": 1024
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true,
+      "selection": "screening candidate",
+      "selection_reason": "1024-node 不均匀 fanout，检查 completion/wake 与跨核 ready 分发。"
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/multi_core_dag/test_multi_core_dag.py",
+      "class": "TestHbgMultiCoreDag",
+      "case": "mixed_chain_1024",
+      "params": {
+        "graph_case": 0,
+        "task_count": 1024
+      },
+      "config": {},
+      "manual": true,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true,
+      "selection": "screening candidate",
+      "selection_reason": "1024-node AIC/AIV 长链，检查依赖推进与每任务固定开销。"
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/multi_core_dag/test_multi_core_dag.py",
+      "class": "TestHbgMultiCoreDag",
+      "case": "mixed_fanin32_1024",
+      "params": {
+        "graph_case": 1,
+        "task_count": 1024
+      },
+      "config": {},
+      "manual": true,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true,
+      "selection": "screening candidate",
+      "selection_reason": "1024-node、每节点最多 32 fanin，检查依赖扫描吞吐。"
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/multi_core_dag/test_multi_core_dag.py",
+      "class": "TestHbgMultiCoreDag",
+      "case": "mixed_random_1024",
+      "params": {
+        "graph_case": 3,
+        "task_count": 1024
+      },
+      "config": {},
+      "manual": true,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true,
+      "selection": "screening candidate",
+      "selection_reason": "1024-node 随机 DAG，检查非规则依赖与 ready 分布。"
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/multi_core_dag/test_multi_core_dag.py",
+      "class": "TestHbgMultiCoreDag",
+      "case": "mixed_multi_root_4096",
+      "params": {
+        "graph_case": 2,
+        "task_count": 4096
+      },
+      "config": {},
+      "manual": true,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true,
+      "selection": "screening candidate",
+      "selection_reason": "4096-node 多 root，检查独立短任务吞吐与 bootstrap。"
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/single_block_mix/test_single_block_mix.py",
+      "class": "TestSingleBlockMixHostBuildGraphA5",
+      "case": "chain16_mask7",
+      "params": {
+        "graph_case": 0,
+        "mask": 7
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true,
+      "selection": "screening candidate",
+      "selection_reason": "三 lane MIX 串行链，检查 admission/release 临界路径。"
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/single_block_mix/test_single_block_mix.py",
+      "class": "TestSingleBlockMixHostBuildGraphA5",
+      "case": "ordinary_mix_interleaved",
+      "params": {
+        "graph_case": 2,
+        "mask": 7
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true,
+      "selection": "screening candidate",
+      "selection_reason": "ordinary 与 MIX 交错，检查共享资源竞争。"
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/single_core_dag/test_single_core_dag.py",
+      "class": "TestHbgSingleCoreDag",
+      "case": "aic_chain_64",
+      "params": {
+        "graph_case": 0,
+        "task_count": 64,
+        "core_type": "aic"
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true,
+      "selection": "screening candidate",
+      "selection_reason": "单 AIC 短链，保留较小规模的调度延迟对照。"
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/single_core_dag/test_single_core_dag.py",
+      "class": "TestHbgSingleCoreDag",
+      "case": "aiv_chain_64",
+      "params": {
+        "graph_case": 0,
+        "task_count": 64,
+        "core_type": "aiv"
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true,
+      "selection": "screening candidate",
+      "selection_reason": "单 AIV 短链，与 AIC 分别定位开销变化。"
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/spmd_mixed_waves/test_spmd_mixed_waves.py",
+      "class": "TestSpmdMixedWaves",
+      "case": "waves_40x24_stress",
+      "params": {
+        "rounds": 40,
+        "width": 24,
+        "seed": 1
+      },
+      "config": {
+        "runtime_env": {
+          "ring_task_window": 4096
+        }
+      },
+      "manual": true,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true,
+      "selection": "screening candidate",
+      "selection_reason": "40×24 混合任务波次，覆盖 ordinary/SPMD/MIX/cohort 争用；无人工延时。"
+    },
+    {
+      "path": "tests/st/a5/host_build_graph/spmd_multiblock_aic/test_spmd_multiblock_aic.py",
+      "class": "TestSpmdMultiblockAic",
+      "case": "aiv_block_num_128_waves",
+      "params": {
+        "blocks": 128,
+        "aiv": 1
+      },
+      "config": {},
+      "manual": false,
+      "markers": [
+        "scheduler_mode"
+      ],
+      "measure": true,
+      "selection": "screening candidate",
+      "selection_reason": "128-block AIV 任务分多波执行，检查 block 分配与最后完成。"
+    }
+  ]
+}

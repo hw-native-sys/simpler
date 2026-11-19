@@ -77,8 +77,8 @@
 // naturally — e.g. `if (level >= SCHED_PHASES)` means "this section runs when
 // scheduler phase records are being collected (or any higher tier)".
 //
-// Transported via `ChipSwimlaneDataHeader::chip_swimlane_level` (host → AICPU,
-// shared memory) and `CallConfig::enable_chip_swimlane` (Python → C). The wire
+// Transported via the per-invocation Runtime descriptor (host → AICPU)
+// and `CallConfig::enable_chip_swimlane` (Python → C). The wire
 // representation stays integer (uint32_t / int32_t) for ABI stability; this
 // enum is the canonical in-code type used for comparisons.
 // =============================================================================
@@ -170,22 +170,22 @@ static_assert(sizeof(ChipSwimlaneAicpuTaskRecord) == 32, "ChipSwimlaneAicpuTaskR
  * 32B (half a cache line). Two records pack into one cache line so AICore's
  * per-task store is at most a single line commit + dcci.
  *
- * receive_to_start_cycles isolates the AICore-side dcci+ack cost from the
- * AICPU→AICore NoC propagation. AICore captures receive_time right after
- * `read_reg(DATA_MAIN_BASE)` returns the new task_id (before dcci+ack), and
- * start_time after them. Host derives:
+ * receive_to_start_cycles measures local execution setup. Dispatch-driven
+ * cores capture receive_time after reading the task register; self-scheduling
+ * cores capture it on entry to prepared-payload execution. The interval can
+ * include cache acquisition, acknowledgment and profiling-buffer waits.
+ * Host derives:
  *   - receive_time  = start_time - receive_to_start_cycles
  *   - propagation   = receive_time - dispatch_ts (AICPU view)
- *   - local_setup   = receive_to_start_cycles    (dcci + ack)
- * Delta fits in 32 bits on all supported platforms (minimum wrap window
- * is approximately 4.3 s at the fastest 1 GHz counter).
+ *   - local_setup   = receive_to_start_cycles
+ * The 32-bit delta represents intervals below 2^32 ticks (about 4.3 s at 1 GHz).
  */
 struct ChipSwimlaneAicoreTaskRecord {
     uint64_t start_time;               // Post-dcci+ack timestamp (kernel begins next)
     uint64_t end_time;                 // Post-kernel timestamp
     TaskId task_token;                 // identity, in the minting runtime's layout (NOT join key)
     uint32_t reg_task_id;              // Per-core dispatch token — host join key vs AICPU stream
-    uint32_t receive_to_start_cycles;  // start_time - receive_time (AICore-local dcci + ack cost)
+    uint32_t receive_to_start_cycles;  // Local setup interval: start_time - receive_time
 } __attribute__((aligned(32)));
 
 static_assert(sizeof(ChipSwimlaneAicoreTaskRecord) == 32, "ChipSwimlaneAicoreTaskRecord must be 32B");
@@ -202,8 +202,8 @@ static_assert(sizeof(ChipSwimlaneAicoreTaskRecord) == 32, "ChipSwimlaneAicoreTas
  *
  * Concrete instantiations live below as `using` aliases.
  *   - ChipSwimlaneAicpuTaskBuffer        — AICPU-written, rotated, ready-queue tagged kind=AicpuTask
- *   - ChipSwimlaneAicoreTaskBuffer  — AICore-written, NOT rotated (sized for the whole
- *                           run), read by host at flush time
+ *   - ChipSwimlaneAicoreTaskBuffer — AICore-written, rotated by AICPU and
+ *                           handed to the Host through the shared ready queue
  */
 template <typename Record, size_t N>
 struct TypedBuffer {
@@ -306,10 +306,10 @@ static_assert(sizeof(ChipSwimlaneFreeQueue) == 128, "ChipSwimlaneFreeQueue must 
  *   - dropped_record_count : producer-maintained tally; counts records lost
  *                            (free_queue empty / overwrite / no buffer).
  *
- * Single-writer (AICPU) for every pool; readers are either AICore (via dcci
- * SINGLE_CACHE_LINE, AicoreTask pool only) or the host at drain time. Because
- * AICore only reads current_buf_ptr/current_buf_seq and invalidates the whole
- * line, the cohabiting counter fields are harmless — AICore never reads them.
+ * AICPU is the only writer of every head. Self-scheduling cores publish the
+ * active buffer's committed count, which the AICPU collector observes before
+ * updating this head and rotating through the same queues. AICore only reads
+ * current_buf_ptr/current_buf_seq; the Host reads settled counts at drain time.
  *
  * Race avoidance for AicoreTask pools: AICPU rotates strictly before
  * `write_reg(DATA_MAIN_BASE)` for the first task of a new BUFFER_SIZE batch.
@@ -331,9 +331,7 @@ struct ChipSwimlaneActiveHead {
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(ChipSwimlaneActiveHead) == 64, "ChipSwimlaneActiveHead must be one cache line");
-// `publish_run_config` resets the cumulative counters with one narrow write
-// over this contiguous span, so a gap here would leave a counter carrying the
-// previous run's value into the next one.
+// Cumulative record accounting occupies bytes [12, 32) of the producer head.
 static_assert(offsetof(ChipSwimlaneActiveHead, total_record_count) == 12, "cumulative counter span drift");
 static_assert(offsetof(ChipSwimlaneActiveHead, published_buffer_count) == 28, "cumulative counter span drift");
 
@@ -359,9 +357,9 @@ inline void chip_swimlane_add_saturating(volatile uint32_t &counter, uint32_t n)
 /**
  * One producer's final record accounting for one run, retained past that run.
  *
- * `publish_run_config` zeroes every pool head at each `begin_run`, so a run's
- * totals do not survive its successor. A producer copies its settled counters
- * here at its last flush; the entry stays readable until its bank is reused.
+ * `chip_swimlane_aicpu_init` zeroes pool-head counters before producers start
+ * each invocation. A producer copies its settled counters here at its last
+ * flush; the entry stays readable until its bank is reused.
  *
  * `run_epoch` is the run identity the producer was executing under. Zero means
  * "no snapshot": it is the initialized state, and it is not a value a live run
@@ -430,10 +428,13 @@ constexpr int PLATFORM_RUN_TERMINAL_SCHED_PHASE_BASE = 2 * PLATFORM_MAX_CORES;
 constexpr int PLATFORM_RUN_TERMINAL_ORCH_PHASE_BASE = 2 * PLATFORM_MAX_CORES + PLATFORM_MAX_AICPU_THREADS;
 constexpr int PLATFORM_RUN_TERMINAL_PRODUCERS = 2 * PLATFORM_MAX_CORES + 2 * PLATFORM_MAX_AICPU_THREADS;
 
-// One bank per retained run. This file is compiled by ccec for AICore, which
-// must not pull in the host worker API, so the pipeline depth is mirrored here
-// and cross-checked against PTO_PIPELINE_MAX_DEPTH in the host collector, where
-// both headers are visible.
+// How many runs may hold a terminal snapshot at once. A bank is held by the
+// epoch that acquired it and comes back when that run's snapshot is reported,
+// so this bounds concurrent *diagnostics*, not concurrent runs: a run that
+// finds no free bank keeps its diagnostic and is ordered behind the ones ahead
+// of it for that round. Device-side storage compiled by ccec for AICore, which
+// must not pull in the host worker API, so the count lives here and the host
+// collector maps epochs onto it.
 constexpr int PLATFORM_RUN_TERMINAL_BANKS = 3;
 
 inline size_t calc_run_terminal_bank_size() {
@@ -630,9 +631,7 @@ struct ChipSwimlaneDataHeader {
 
     // Metadata (Host initializes, Device read-only)
     uint32_t num_cores;            // Actual number of cores launched
-    uint32_t chip_swimlane_level;  // 0=off, 1=AICore timing, 2=+Scheduler task timing,
-                                   // 3=+sched phases, 4=+orch phases. Host writes
-                                   // at init; AICPU reads in chip_swimlane_aicpu_init.
+    uint32_t chip_swimlane_level;  // Initial pool level; per-run level is in the Runtime descriptor.
 
     // Phase profiling metadata (AICPU writes in chip_swimlane_aicpu_init_phase;
     // Host reads at drain time). Both counts == 0 means phase profiling was not
@@ -819,6 +818,8 @@ inline const char *host_phase_kind_name(HostPhaseKind kind) {
         return "arena_h2d";
     case HostPhaseKind::BindHostViewClose:
         return "host_view_close";
+    case HostPhaseKind::BindImageStage:
+        return "image_stage";
     case HostPhaseKind::OrchSubmitTask:
         return "submit_task";
     case HostPhaseKind::OrchAllocTensors:

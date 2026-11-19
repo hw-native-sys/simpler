@@ -11,13 +11,15 @@
 
 #pragma once
 
-#include <array>
 #include <atomic>
 #include <cstddef>
 #include <functional>
 #include <mutex>
+#include <memory>
 #include <utility>
+#include <vector>
 
+#include "run_resource_arena.h"
 #include "runtime_c_api.h"
 
 /**
@@ -35,8 +37,9 @@
  * The AICore stream carries instruction-cache state: cores may retain code
  * fetched from a GM address whose contents a later registration replaced.
  * Publishing new AICore code therefore marks the stream stale, and the next
- * launch destroys it and creates a replacement. Creating a stream is the only
- * operation known to leave a core free of the previous image's instructions.
+ * prepare replaces it; retained preparations keep their original stream.
+ * Creating a stream is the only operation known to leave a core free of the
+ * previous image's instructions.
  *
  * **Submission state is per owner.** More than one run may have submitted and
  * not yet retired, so a completion, a query and a retirement each name the run
@@ -56,6 +59,11 @@
  */
 class RunStreamPair {
 public:
+    struct Lease {
+        void *aicpu{nullptr};
+        void *aicore{nullptr};
+    };
+
     using CreateFn = std::function<int(void **out_stream)>;
     using DestroyFn = std::function<int(void *stream)>;
     enum class CompletionStatus { Unproven, Complete };
@@ -74,6 +82,8 @@ public:
      */
     int ensure() {
         std::lock_guard<std::mutex> lock(mutex_);
+        const int reclaim_rc = reclaim_locked();
+        if (reclaim_rc != 0) return reclaim_rc;
         if (aicpu_ == nullptr) {
             int rc = create_(&aicpu_);
             if (rc != 0) {
@@ -83,12 +93,19 @@ public:
         }
         if (aicore_ != nullptr) {
             if (!stale_) return 0;
-            // A run that has not retired still owns the pair: a device-complete
-            // poll is not a finalized run, and replacing the stream under it
-            // would strand a live submission.
+            // Active executions still name this queue. Retired observations
+            // retain their own lifetime reference independently of this table.
             if (owner_count_ != 0) return PTO_RUNTIME_ERR_INTERNAL;
-            int rc = destroy_(aicore_);
-            if (rc != 0) return rc;
+            if (lease_.use_count() > 1) {
+                auto next = std::make_shared<Lease>();
+                next->aicpu = aicpu_;
+                retired_.push_back(lease_);
+                lease_ = std::move(next);
+            } else {
+                int rc = destroy_(aicore_);
+                if (rc != 0) return rc;
+                lease_->aicore = nullptr;
+            }
             aicore_ = nullptr;
         }
         int rc = create_(&aicore_);
@@ -96,6 +113,8 @@ public:
             aicore_ = nullptr;
             return rc;
         }
+        lease_->aicpu = aicpu_;
+        lease_->aicore = aicore_;
         created_count_.fetch_add(1, std::memory_order_relaxed);
         stale_ = false;
         last_retired_owner_ = nullptr;
@@ -110,13 +129,23 @@ public:
     }
 
     /** Make this run's submission visible to poll, in submission order. */
-    int mark_submitted(const void *owner) {
+    int mark_submitted(const void *owner, void *core_stream = nullptr, void *borrowed_cpu = nullptr) {
         if (owner == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
         std::lock_guard<std::mutex> lock(mutex_);
-        if (aicpu_ == nullptr || aicore_ == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+        if (borrowed_cpu == nullptr && (aicpu_ == nullptr || aicore_ == nullptr)) return PTO_RUNTIME_ERR_INTERNAL;
+        if (borrowed_cpu != nullptr && core_stream == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
         if (owner_count_ >= owners_.size()) return PTO_RUNTIME_ERR_INTERNAL;
         if (find_owner(owner) != nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-        owners_[owner_count_] = OwnerSlot{owner, false};
+        std::shared_ptr<Lease> submitted = lease_;
+        if (borrowed_cpu != nullptr) {
+            submitted = std::make_shared<Lease>(Lease{borrowed_cpu, core_stream});
+        } else if (core_stream != nullptr && core_stream != submitted->aicore) {
+            submitted.reset();
+            for (const auto &old : retired_)
+                if (old->aicore == core_stream) submitted = old;
+            if (!submitted) return PTO_RUNTIME_ERR_INVALID_STATE;
+        }
+        owners_[owner_count_] = OwnerSlot{owner, false, std::move(submitted)};
         ++owner_count_;
         if (last_retired_owner_ == owner) {
             last_retired_owner_ = nullptr;
@@ -143,8 +172,9 @@ public:
             return sticky ? SIMPLER_NATIVE_RUN_POLL_COMPLETE : SIMPLER_NATIVE_RUN_POLL_ERROR;
         }
         if (slot->complete) return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
-        if (aicpu_ == nullptr || aicore_ == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
-        const int rc = std::forward<QueryPairFn>(query)(aicpu_, aicore_);
+        if (!slot->streams || slot->streams->aicpu == nullptr || slot->streams->aicore == nullptr)
+            return SIMPLER_NATIVE_RUN_POLL_ERROR;
+        const int rc = std::forward<QueryPairFn>(query)(slot->streams->aicpu, slot->streams->aicore);
         if (rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE) slot->complete = true;
         return rc;
     }
@@ -168,25 +198,34 @@ public:
         // either finishes its in-flight query first or observes this result.
         // An error-path retirement clears a completion that raced ahead of a
         // later failing sync, so the sync error remains authoritative.
+        const bool current_generation = find_owner(owner)->streams == lease_;
         erase_owner(owner);
         last_retired_owner_ = owner;
         last_retired_complete_ = completion_status == CompletionStatus::Complete;
-        if (completion_status == CompletionStatus::Complete) return 0;
+        if (completion_status == CompletionStatus::Complete || !current_generation) return 0;
         if (owner_count_ != 0) {
             stale_ = true;
             return 0;
         }
         if (aicore_ == nullptr) return 0;
+        if (lease_.use_count() > 1) {
+            stale_ = true;
+            return 0;
+        }
         int rc = destroy_(aicore_);
         if (rc != 0) return rc;
         aicore_ = nullptr;
+        lease_->aicore = nullptr;
         return 0;
     }
 
     /** Destroy both streams, keeping a handle whose destroy failed. */
     int destroy() {
         std::lock_guard<std::mutex> lock(mutex_);
-        int first_error = 0;
+        if (lease_.use_count() > 1) return PTO_RUNTIME_ERR_INVALID_STATE;
+        for (const auto &old : retired_)
+            if (old.use_count() > 1) return PTO_RUNTIME_ERR_INVALID_STATE;
+        int first_error = reclaim_locked();
         owner_count_ = 0;
         last_retired_owner_ = nullptr;
         last_retired_complete_ = false;
@@ -201,6 +240,8 @@ public:
         }
         // A handle that survived teardown may still hold the previous image's
         // instructions, so it stays stale for whoever retries it.
+        lease_->aicpu = aicpu_;
+        lease_->aicore = aicore_;
         stale_ = aicore_ != nullptr;
         return first_error;
     }
@@ -210,10 +251,26 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         aicpu_ = nullptr;
         aicore_ = nullptr;
+        lease_->aicpu = nullptr;
+        lease_->aicore = nullptr;
+        for (auto &old : retired_) {
+            old->aicpu = nullptr;
+            old->aicore = nullptr;
+        }
+        retired_.clear();
+        for (auto &owner : owners_)
+            owner = OwnerSlot{};
         stale_ = false;
         owner_count_ = 0;
         last_retired_owner_ = nullptr;
         last_retired_complete_ = false;
+    }
+
+    // The pair keeps ownership of the actual handle; the call keeps this
+    // lifetime reference until its explicit observer no longer uses it.
+    std::shared_ptr<void> retain_aicore() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return lease_;
     }
 
     // Handle reads are unsynchronized: the claim holder is the only writer once
@@ -228,7 +285,10 @@ public:
      * failed may still hold queued instructions, so anything whose safety rests on this pair
      * being finished has to ask rather than assume the destroy succeeded.
      */
-    bool retired() const { return aicpu_ == nullptr && aicore_ == nullptr; }
+    bool retired() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return aicpu_ == nullptr && aicore_ == nullptr && retired_.empty();
+    }
     size_t created_count() const { return created_count_.load(std::memory_order_relaxed); }
     /** How many runs have submitted on this pair and not yet retired. */
     size_t live_owner_count() const {
@@ -249,10 +309,39 @@ public:
         return stale_ || aicore_ == nullptr;
     }
 
+    std::shared_ptr<const Lease> retain() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (aicpu_ == nullptr || aicore_ == nullptr) return {};
+        return lease_;
+    }
+    int reclaim() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return reclaim_locked();
+    }
+
 private:
+    int reclaim_locked() {
+        int first = 0;
+        for (auto it = retired_.begin(); it != retired_.end();) {
+            if (it->use_count() > 1) {
+                ++it;
+                continue;
+            }
+            const int rc = (*it)->aicore == nullptr ? 0 : destroy_((*it)->aicore);
+            if (rc != 0) {
+                if (first == 0) first = rc;
+                ++it;
+            } else it = retired_.erase(it);
+        }
+        return first;
+    }
+    std::shared_ptr<Lease> lease_ = std::make_shared<Lease>();
+    std::vector<std::shared_ptr<Lease>> retired_;
+
     struct OwnerSlot {
         const void *owner{nullptr};
         bool complete{false};
+        std::shared_ptr<Lease> streams;
     };
 
     OwnerSlot *find_owner(const void *owner) {
@@ -277,8 +366,10 @@ private:
     mutable std::mutex mutex_;
     void *aicpu_{nullptr};
     void *aicore_{nullptr};
-    // Runs that submitted and have not retired, in submission order.
-    std::array<OwnerSlot, PTO_PIPELINE_MAX_DEPTH> owners_{};
+    // Runs that submitted and have not retired, in submission order. As many as
+    // the grant allows: a run holds its place here for as long as it is
+    // unretired, so the capacity is the count of runs a context may hold.
+    std::vector<OwnerSlot> owners_ = std::vector<OwnerSlot>(kDefaultRunResourceSets);
     size_t owner_count_{0};
     // The most recent retirement, so a poll arriving after it still reads that
     // run's proven result instead of an error.
@@ -288,5 +379,30 @@ private:
 
     CreateFn create_;
     DestroyFn destroy_;
+
+public:
+    using Storage = std::vector<OwnerSlot>;
+
+    /** Build an unretired-owner table for the grant, detached. May throw; mutates nothing. */
+    static Storage build(size_t granted) { return Storage(granted); }
+
+    /**
+     * Whether the table may be replaced at all.
+     *
+     * Refused while any run is still unretired: an entry is identified by the
+     * run that holds it, so the table is settled before the first submission.
+     */
+    bool grant_is_replaceable() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return owner_count_ == 0;
+    }
+
+    /** Adopt a built table. Never throws, so a multi-owner grant cannot half-apply. */
+    void commit(Storage &&built) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        owners_.swap(built);
+    }
+
+private:
     std::atomic<size_t> created_count_{0};
 };

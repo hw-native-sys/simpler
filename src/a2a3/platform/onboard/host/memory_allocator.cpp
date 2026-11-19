@@ -24,19 +24,12 @@
 
 MemoryAllocator::~MemoryAllocator() { finalize(); }
 
-void *MemoryAllocator::alloc(size_t size) {
-    void *ptr = nullptr;
-    int rc = rtMalloc(&ptr, size, RT_MEMORY_HBM, 0);
-    if (rc != 0) {
-        LOG_ERROR("rtMalloc failed: %d (size=%zu)", rc, size);
-        ACL_LOG_ERROR_DETAIL(rc);
-        return nullptr;
-    }
-
-    std::scoped_lock<std::mutex> lk(mu_);
-    ptr_size_map_[ptr] = size;
-    committed_bytes_ += size;
-    return ptr;
+void *MemoryAllocator::alloc(size_t size, int *status) {
+    auto reservation = begin_reservation();
+    int rc = 0;
+    void *ptr = reservation.commit_alloc(size, &rc);
+    if (status != nullptr) *status = rc;
+    return rc == 0 || status != nullptr ? ptr : nullptr;
 }
 
 int MemoryAllocator::free(void *ptr) {
@@ -50,6 +43,7 @@ int MemoryAllocator::free(void *ptr) {
         return 0;
     }
 
+    if (adopted_.count(ptr)) return release_adopted_locked(ptr);
     int rc = rtFree(ptr);
     if (rc != 0) {
         LOG_ERROR("rtFree failed: %d", rc);
@@ -64,6 +58,7 @@ int MemoryAllocator::free(void *ptr) {
 
 int MemoryAllocator::finalize() {
     std::scoped_lock<std::mutex> lk(mu_);
+    if (int rc = sweep_adopted_locked()) return rc;
     int last_error = 0;
     for (const auto &kv : ptr_size_map_) {
         int rc = rtFree(kv.first);
@@ -77,25 +72,27 @@ int MemoryAllocator::finalize() {
     return last_error;
 }
 
-void *MemoryAllocator::Reservation::commit_alloc(size_t size) {
+void *MemoryAllocator::Reservation::commit_alloc(size_t size, int *status) {
+    if (status != nullptr) *status = -1;
     if (!valid()) {
         LOG_ERROR("commit_alloc without a valid reservation (size=%zu)", size);
         return nullptr;
     }
     void *ptr = nullptr;
     int rc = rtMalloc(&ptr, size, RT_MEMORY_HBM, 0);
+    if (status != nullptr) *status = rc;
     if (rc != 0) {
         LOG_ERROR("rtMalloc failed: %d (size=%zu)", rc, size);
         ACL_LOG_ERROR_DETAIL(rc);
-        return nullptr;
     }
+    if (ptr == nullptr) return nullptr;
     // Under the lock this reservation has held since it was taken, into the
     // node it created then: no allocation, no rehash, nothing left to fail.
     node_.key() = ptr;
     node_.mapped() = size;
     owner_->ptr_size_map_.insert(std::move(node_));
     owner_->committed_bytes_ += size;
-    return ptr;
+    return rc == 0 || status != nullptr ? ptr : nullptr;
 }
 
 int MemoryAllocator::finalize_except(SweepClassifyFn classify, SweepRecordFn record, void *ctx) {
@@ -104,6 +101,7 @@ int MemoryAllocator::finalize_except(SweepClassifyFn classify, SweepRecordFn rec
     void *last_failed = nullptr;
     {
         std::scoped_lock<std::mutex> lk(mu_);
+        if (int rc = sweep_adopted_locked(classify, record, ctx)) return rc;
         for (const auto &kv : ptr_size_map_) {
             const SweepAction acted = classify == nullptr ? SweepAction::FreeIt : classify(kv.first, kv.second, ctx);
             int rc = 0;

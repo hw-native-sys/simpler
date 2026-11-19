@@ -212,6 +212,35 @@ void launch(RunCompletionFence &fence, FakeDevice &device, const NativeRunIdenti
     ASSERT_EQ(fence.record(identity, StreamRole::Aicpu, device.aicpu_stream()), 0);
 }
 
+TEST(RunCompletionFenceTest, ColdPreparationDoesNotArmOrSubmitAndArmReusesEvents) {
+    FakeDevice device;
+    RunCompletionFence fence(device.ops());
+    ASSERT_EQ(fence.prepare_resources(), 0);
+    EXPECT_EQ(device.live_events(), 2U);
+    EXPECT_EQ(device.queued(device.aicpu_stream()), 0U);
+    EXPECT_EQ(device.queued(device.aicore_stream()), 0U);
+    EXPECT_NE(fence.record(kRunA, StreamRole::Aicpu, device.aicpu_stream()), 0);
+    device.fail_next_creates(1);
+    ASSERT_EQ(fence.arm(kRunA), 0);
+    fence.note_kernel_submitted(kRunA, StreamRole::Aicpu);
+    ASSERT_EQ(fence.record(kRunA, StreamRole::Aicpu, device.aicpu_stream()), 0);
+    ASSERT_EQ(fence.prepare_resources(), 0);
+    EXPECT_EQ(device.queued(device.aicpu_stream()), 1U);
+    EXPECT_EQ(device.live_events(), 2U);
+}
+
+TEST(RunCompletionFenceTest, ColdPreparationFailureCanRetryWithoutArming) {
+    FakeDevice device;
+    RunCompletionFence fence(device.ops());
+    device.fail_next_creates(1);
+    EXPECT_EQ(fence.prepare_resources(), -101);
+    EXPECT_EQ(device.live_events(), 0U);
+    ASSERT_EQ(fence.prepare_resources(), 0);
+    EXPECT_NE(fence.record(kRunA, StreamRole::Aicpu, device.aicpu_stream()), 0);
+    EXPECT_EQ(fence.release(), 0);
+    EXPECT_EQ(device.live_events(), 0U);
+}
+
 TEST(RunCompletionFenceTest, OneBoundaryCompleteIsNotCompletion) {
     FakeDevice device;
     RunCompletionFence fence(device.ops());

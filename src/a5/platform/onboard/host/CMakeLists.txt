@@ -36,36 +36,9 @@ else()
 endif()
 set(ASCEND_ARCH_HOME "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux")
 
-option(SIMPLER_ENABLE_PTO_URMA_WORKSPACE "Enable a5 PTO URMA workspace overlay" OFF)
 option(SIMPLER_ENABLE_PTO_RDMA_WORKSPACE "Enable a5 PTO RDMA workspace overlay" OFF)
-# SDMA is the default a5 async-workspace backend. URMA and RDMA remain
-# explicit alternatives because CommContext exposes one workSpace/workSpaceSize
-# pair. SIMPLER_ENABLE_PTO_SDMA_WORKSPACE is an internal compile marker, not a
-# user-configurable option.
-if(SIMPLER_ENABLE_PTO_URMA_WORKSPACE OR SIMPLER_ENABLE_PTO_RDMA_WORKSPACE)
-    set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE OFF)
-else()
-    set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ON)
-endif()
-
-# Only one async-workspace overlay may be selected; CommContext carries a
-# single workSpace/workSpaceSize pair shared by every backend.
-set(SIMPLER_PTO_ASYNC_WORKSPACE_OVERLAY_COUNT 0)
-foreach(OVERLAY
-        SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-        SIMPLER_ENABLE_PTO_URMA_WORKSPACE
-        SIMPLER_ENABLE_PTO_RDMA_WORKSPACE)
-    if(${OVERLAY})
-        math(EXPR SIMPLER_PTO_ASYNC_WORKSPACE_OVERLAY_COUNT "${SIMPLER_PTO_ASYNC_WORKSPACE_OVERLAY_COUNT} + 1")
-    endif()
-endforeach()
-if(SIMPLER_PTO_ASYNC_WORKSPACE_OVERLAY_COUNT GREATER 1)
-    message(FATAL_ERROR
-        "Only one PTO async workspace overlay may be enabled at a time "
-        "(SDMA=${SIMPLER_ENABLE_PTO_SDMA_WORKSPACE}, "
-        "URMA=${SIMPLER_ENABLE_PTO_URMA_WORKSPACE}, "
-        "RDMA=${SIMPLER_ENABLE_PTO_RDMA_WORKSPACE})")
-endif()
+# Async providers are available only to domains that explicitly request them.
+# SDMA is compiled in every a5 build; compilation creates no SDMA streams.
 
 # Pin-resolved checkout path is passed by RuntimeBuilder as -DPTO_ISA_ROOT=
 # (#1403). Do not read $ENV{PTO_ISA_ROOT} — ambient exports are not the pin.
@@ -94,7 +67,10 @@ set(HOST_RUNTIME_SOURCES "")
 list(APPEND HOST_RUNTIME_SOURCES ${SIMPLER_HOST_LOG_SOURCES})
 list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/aicpu_topology_probe.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/aicpu_affinity_select.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/device_runner.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/scheduler_done_notifications.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/context_preparation.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/memory_allocator.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/profiling_copy.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime_c_api.cpp"
@@ -103,6 +79,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/chip_swimlane_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/host_phase_records.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/kernel_execution_state.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/run_resource_growth.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/pmu_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/dep_gen_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/dep_gen_retained_runs.cpp"
@@ -112,6 +89,14 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/args_dump_retained_runs.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/scope_stats_retained_runs.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/comm_hccl.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/host_ddr_mapping.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ccu_domain_registration_hcomm.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ccu_domain_backend_hcomm.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/ccu_run_lifecycle_hcomm.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform_comm/ccu/ccu_domain_registration.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform_comm/ccu/ccu_domain_owner.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform_comm/ccu/ccu_native_module.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform_comm/ccu/ccu_run_lifecycle.cpp"
 )
 # Add common/aicpu_loader/host sources (LoadAicpuOp)
 list(APPEND HOST_RUNTIME_SOURCES
@@ -124,6 +109,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/kernel_persistent_args.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_phase_capture.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/device_fault_monitor_binding.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/aicore_pmu_lease.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_base.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/run_retention_probe.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/c_api_shared.cpp"
@@ -142,9 +128,16 @@ list(LENGTH HOST_RUNTIME_SOURCES NUM_HOST_RUNTIME_SOURCES)
 message(STATUS "Host runtime: ${NUM_HOST_RUNTIME_SOURCES} source files")
 message(VERBOSE "Host runtime sources: ${HOST_RUNTIME_SOURCES}")
 add_library(host_runtime SHARED ${HOST_RUNTIME_SOURCES})
+include("${CMAKE_CURRENT_SOURCE_DIR}/ccu_event_trigger.cmake")
+add_dependencies(host_runtime ccu_event_trigger)
+include("${SIMPLER_CMAKE_DIR}/aicpu_topology_driver.cmake")
+simpler_configure_aicpu_topology_driver(host_runtime)
 include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
 simpler_configure_profiling(host_runtime)
 add_custom_command(TARGET host_runtime POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CCU_EVENT_TRIGGER_ELF}"
+        "$<TARGET_FILE_DIR:host_runtime>/ccu_event_trigger.o"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/aicpu_cpu_topo_fallback.json"
         "$<TARGET_FILE_DIR:host_runtime>/aicpu_cpu_topo_fallback.json"
@@ -176,15 +169,7 @@ target_compile_definitions(host_runtime PRIVATE
     SIMPLER_RUNTIME_NAME="${SIMPLER_RUNTIME_NAME}"
 )
 
-if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
-    target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1)
-endif()
-if(SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
-    target_compile_definitions(host_runtime PRIVATE
-        SIMPLER_ENABLE_PTO_URMA_WORKSPACE=1
-        PTO_URMA_SUPPORTED
-    )
-endif()
+target_compile_definitions(host_runtime PRIVATE PTO_URMA_SUPPORTED)
 if(SIMPLER_ENABLE_PTO_RDMA_WORKSPACE)
     target_compile_definitions(host_runtime PRIVATE
         SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=1
@@ -231,6 +216,9 @@ target_include_directories(host_runtime
         ${ASCEND_ARCH_HOME}/pkg_inc/profiling
         ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/asc/include
         ${ASCEND_ARCH_HOME}/asc/include
+        ${ASCEND_ARCH_HOME}/include/hccl
+        ${ASCEND_ARCH_HOME}/include/hcomm/ccu
+        ${ASCEND_ARCH_HOME}/pkg_inc/hcomm/ccu
         ${ASCEND_ARCH_HOME}/include/driver
         ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/driver
 )
@@ -279,10 +267,12 @@ target_link_libraries(host_runtime
     PRIVATE
         runtime
         ascendcl
+        asccomm_ccu
         -Wl,--no-as-needed ${HCCL_LINK_TARGETS} -Wl,--as-needed
         c_sec
         nnopbase
         dl
+        rt
         pthread
 )
 

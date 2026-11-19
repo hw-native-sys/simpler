@@ -102,7 +102,7 @@ register_pto_async_event(AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsy
 
     uint64_t post_id = 0;
     uint32_t queue_num = 0;
-    __gm__ uint8_t *post_done_base = session.sdmaRuntimeCtx.postDoneBase;
+    __gm__ uint8_t *post_done_base = session.rt.sdma.postDoneBase;
     if (!::pto::comm::sdma::detail::DecodeSdmaEventHandle(event.handle, post_id, queue_num) ||
         post_done_base == nullptr) {
         defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);

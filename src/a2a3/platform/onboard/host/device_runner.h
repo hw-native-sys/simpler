@@ -25,19 +25,16 @@
 
 #include <atomic>
 #include <cstdint>
-#include <cstring>
 #include <functional>
 #include <iostream>
 #include <map>
 #include <string>
-#include <thread>
 #include <unordered_map>
-#include <unordered_set>
-#include <vector>
 
+#include "aicpu_topology_probe.h"
 #include "callable.h"
 #include "prepare_callable_common.h"
-#include "runtime_c_api.h"  // PTO_PIPELINE_MAX_DEPTH
+#include "runtime_c_api.h"
 #include "host/run_stream_pair.h"
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
@@ -81,6 +78,14 @@ int kernel_args_init_ffts_base_addr(KernelArgsHelper &helper);
  * - Runtime execution workflow
  */
 class DeviceRunner : public DeviceRunnerBase {
+public:
+    bool supports_scope_stats_capture() const override { return SIMPLER_DFX != 0; }
+    bool supports_pmu_capture() const override { return SIMPLER_DFX != 0; }
+    bool supports_swimlane_capture() const override { return SIMPLER_DFX != 0; }
+    bool supports_args_dump_capture() const override { return SIMPLER_DFX != 0; }
+
+private:
+    int prepare_kernel_arch_context(rtStream_t control_stream) override;
     // #2267's retention probe retires only this run's stream-pair ownership,
     // on real boundary completion and without the drain that normally
     // accompanies it, so its successor's `ensure()` is accepted while the
@@ -101,13 +106,15 @@ public:
 
     // The blocking entry point composes these operations. enqueue owns rollback
     // until the AICPU launch marker; drain takes that ownership on success.
+    int prepare_execution_streams(PreparedExecution &prepared, std::shared_ptr<const void> *lease) override;
+    int reclaim_execution_streams() override { return run_streams_.reclaim(); }
     int prepare_execution(
         Runtime &runtime, const CallConfig &config, uint32_t pipeline_slot, const NativeRunIdentity &identity,
         std::unique_ptr<PreparedExecution> *prepared
     ) override;
-    LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) override;
     void abandon_prepared_execution(PreparedExecution &prepared) noexcept override;
     int poll_execution(const ActiveExecution &active) override;
+    int retire_completed_execution(ActiveExecution &active) override;
     DrainOutcome drain_execution(ActiveExecution &active) override;
     bool can_accept_run() const override { return !device_unusable_.load(std::memory_order_acquire); }
     // provision/abandon_native_run_resources keep the base no-op: preparation
@@ -144,10 +151,16 @@ public:
      * `set_output_prefix`, `output_prefix`, and `launch_aicpu_payload` live on
      * `DeviceRunnerBase`.
      */
-    void arm_host_dep_gen_capture(bool enable) override;
     void configure_dep_gen_retention(bool enabled, std::size_t budget_bytes) override;
     bool dep_gen_retains_runs() const override;
-    int admit_dep_gen_run(const DfxRunConfig &dfx, uint64_t run_epoch) override;
+    int admit_dep_gen_run(
+        const DfxRunConfig &dfx, uint64_t run_epoch, simpler::dfx::runs::AdmissionRefusal *why = nullptr
+    ) override;
+    bool dep_gen_can_admit_joined_run(uint64_t run_epoch) const override;
+    uint64_t dep_gen_run_terminal_bank(uint64_t run_epoch) const override;
+    int open_dep_gen_run_terminal_banks(const DfxRunConfig &dfx) override;
+    void install_dep_gen_credit_release_notifier(const std::function<void()> &notify) override;
+    bool dep_gen_retained_runs_outstanding() const override;
     void withdraw_dep_gen_run(uint64_t run_epoch) noexcept override;
     bool dep_gen_flush_retained(int timeout_ms, std::string *error) override;
     void dep_gen_finish_retained() override;
@@ -220,13 +233,15 @@ public:
     size_t run_stream_set_create_count() const override { return run_streams_.created_count(); }
 
 private:
+    LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override;
+
     int finalize_impl() override;
 
     // Most lifecycle state (device_id_, block_dim_, cores_per_blockdim_,
     // executor + dispatcher bytes, aicore_bin_handle_,
     // load_aicpu_op_, mem_alloc_, the three DeviceArenas + their cached
     // sizes, persistent AICPU/AICore streams, device_wall_*,
-    // binaries_loaded_) is inherited from `DeviceRunnerBase`.
+    // aicpu_runtime_registered_) is inherited from `DeviceRunnerBase`.
 
     // Group D state (`chip_callable_buffers_`, `callables_`,
     // `aicpu_seen_callable_ids_`, `aicpu_dlopen_total_`,
@@ -255,11 +270,6 @@ private:
     // executor may poison the runner after a failed launch.
     std::atomic<bool> device_unusable_{false};
 
-    struct RunStreamSet {
-        rtStream_t aicpu{nullptr};
-        rtStream_t aicore{nullptr};
-    };
-
     // One pair carries every run: the execution claim is exclusive, so runs
     // reach the device one at a time and the stream orders them. Pipeline slots
     // index resources that preparation mutates, and preparing a run writes
@@ -273,6 +283,20 @@ private:
             return rtStreamDestroy(static_cast<rtStream_t>(stream));
         }
     };
+
+protected:
+    /** The unretired-owner table holds one entry per run this context may hold. */
+    ArchRunResourceStaging build_arch_run_resources(size_t granted) override {
+        ArchRunResourceStaging staged;
+        staged.run_streams = RunStreamPair::build(granted);
+        return staged;
+    }
+    void commit_arch_run_resources(ArchRunResourceStaging &&staged) noexcept override {
+        run_streams_.commit(std::move(staged.run_streams));
+    }
+    bool arch_run_resources_are_replaceable() const override { return run_streams_.grant_is_replaceable(); }
+
+private:
     int create_run_stream(void **out);
     int ensure_run_streams();
     // Retires the run pair on behalf of `owner`, the PreparedExecution that
@@ -299,6 +323,10 @@ private:
     // handing the device an uncommitted table would deadlock the next task on a
     // stream-sync timeout rather than fail the prepare (see host_regs.cpp).
     int ensure_aicore_reg_table(AicoreRegKind kind);
+    int ensure_aicpu_topology();
+    uint64_t c2c_ctrl_address_{0};
+    bool c2c_ctrl_address_valid_{false};
+    std::vector<simpler::a2a3::AicpuLogicalCpu> aicpu_topology_;
 
     // Release the resources this run owns, in runtime-argument, register-buffer,
     // then stream order. Collectors are not among them: their device resources
@@ -317,7 +345,7 @@ private:
      * device: a non-zero here takes the unproven-completion cleanup path and
      * can retire a proven-complete stream as unproven.
      */
-    int reap_run(const PreparedExecution &prepared, int *diagnostics_rc);
+    int reap_run(PreparedExecution &prepared, int *diagnostics_rc);
 
     // Queue this run's own AICore boundary into its AICPU stream, ahead of the
     // AICPU boundary record that then covers the whole operator. The reservation
@@ -343,12 +371,13 @@ private:
      * nothing shared and publishes nothing, and the default path is not
      * reached at all.
      */
-    void emit_device_dep_gen_graph(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
+    void emit_device_dep_gen_graph(
+        const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
+    );
 
-    // On an AICore launch/sync error, best-effort drain the device so a later
-    // enqueue on the same DeviceRunner can recover in place; if the drain itself
-    // errors the context is unrecoverable without a full reset, so flip
-    // device_unusable_ and let admission/enqueue fail fast.
+    // Quarantine needs no current device; recovery may drain an owned device.
+    // Both keep admission closed until owner recovery or terminal quarantine.
+    void mark_device_unusable(int runtime_rc) override;
     void recover_device_or_mark_unusable(int aicore_rc) override;
 
     // Force-reset the card via aclrtResetDeviceForce to clear an op-timeout
@@ -370,8 +399,8 @@ private:
     // offline replay. a2a3-only.
     DepGenCollector dep_gen_collector_;
 
-    // `query_max_block_dim`, `validate_block_dim`, `ensure_binaries_loaded`,
-    // `configure_aicore_op_timeout`, and `prepare_orch_so` are inherited
+    // `query_max_block_dim`, `validate_block_dim`, `ensure_aicpu_runtime_registered`,
+    // `configure_aicore_op_timeout`, and `validate_active_callable` are inherited
     // (protected) from `DeviceRunnerBase`.
 
     /**
@@ -385,15 +414,11 @@ private:
      * @param device_id Device ID for host registration
      * @return 0 on success, error code on failure
      */
-    /**
-     * Build this run's collector pools, profiling flag and device KernelArgs
-     * refresh, under the execution claim.
-     *
-     * The collectors are resident and shared by every run on this runner, and a
-     * run whose core / AICPU-thread counts differ from the pools' releases and
-     * rebuilds them. Neither is safe while another run is executing against
-     * them, which is why none of it happens during preparation.
-     */
+    // Resident pools may still have device/retained-writer users. Storage
+    // construction holds the execution claim, or native_run_mu_ with no active
+    // claims during cold retention. It acquires no run bank and starts no readers.
+    int prepare_collector_storage(const Runtime &runtime, PreparedExecution &prepared) override;
+    // Bind the per-run terminal bank after storage preparation succeeds.
     int arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared);
 
     int init_chip_swimlane(
@@ -463,6 +488,7 @@ private:
      * failure is the more useful diagnosis and keeps priority.
      */
     int finalize_collectors(bool abandon_device_resources = false);
+    bool terminal_backing_retained() const override;
     // Shared enable flags (`enable_chip_swimlane_`, `enable_dump_args_`,
     // `enable_pmu_`, `enable_scope_stats_`, `chip_swimlane_level_`,
     // `pmu_event_type_`, `output_prefix_`) live on `DeviceRunnerBase`.

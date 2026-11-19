@@ -1,0 +1,26 @@
+{
+  "source_deps_sha256": "d5c65f1fa228a0b16d0d8736594f901e4ace4bd11b0e09c6c53a8108ff786185",
+  "source_names_sha256": "a803903eff2e09dcd88724dc6bd1edc59c1e488c19fb8d2d895e699a6b0b5efa",
+  "source_tasks": 20279,
+  "source_runtime": "host_build_graph",
+  "cases": {
+    "c2a_full": {
+      "tasks": 43,
+      "executions": 908,
+      "edges": 65,
+      "first_source_task": "1335",
+      "last_source_task": "1388",
+      "task_table_sha256": "d2917eccf4d9ab9b40dc012f21ca1d80848535e833c07458b5d34c4236b49aee",
+      "edge_table_sha256": "5a9046e6001b48c23b047ba00bcdf0ca5a5ddbf0657f2ccbc0a0c8f80d49b45a",
+      "incoming_edges": 111
+    }
+  },
+  "boundary": "Incoming values are produced by executing the real original prefix before measuring the case.",
+  "preserved": [
+    "original kernel sources",
+    "tensor views and scalar values",
+    "task and block boundaries",
+    "SPMD/MIX/sync-start launch attributes",
+    "internal dependencies"
+  ]
+}

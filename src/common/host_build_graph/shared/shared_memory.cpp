@@ -139,10 +139,7 @@ void SharedMemoryHandle::init_header() {
     // orchestration, so the real value is not known here yet.
     header->tasks.total_tasks = 0;
 
-    // Error reporting
-    header->sched_error_bitmap.store(0, std::memory_order_relaxed);
-    header->sched_error_code.store(SIMPLER_ERROR_NONE, std::memory_order_relaxed);
-    header->sched_error_thread.store(-1, std::memory_order_relaxed);
+    header->reset_execution_state();
 
     // Per-slot init (slot.reset_for_reuse() + active_mask, and clearing the
     // progress state) happens init-on-write in orch::prepare_task as each slot

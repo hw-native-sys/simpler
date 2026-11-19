@@ -64,7 +64,10 @@ public:
      *         the block it had; a run needing 0 bytes leaves the slot untouched
      *         and succeeds
      */
-    bool begin(const HostApi *api, size_t required) {
+    bool begin(const HostApi *api, size_t required) { return begin_status(api, required) == 0; }
+
+    // Preserve a managed resource wait or exhaustion for the prepare caller.
+    int begin_status(const HostApi *api, size_t required) {
         offset_ = 0;
         base_ = nullptr;
         capacity_ = 0;
@@ -78,17 +81,14 @@ public:
             // may consume, so a buffer of this size yields `required` usable
             // bytes whatever address the backend returns.
             const size_t wanted = required + kAlignment - 1;
-            if (wanted > size) {
-                // The platform owns the grow: whether the previous block may be
-                // released depends on facts only it tracks, and a refusal must
-                // leave the slot naming the block it already had.
-                if (api->acquire_retained_temp(wanted, &raw, &size) != 0) {
-                    return false;
-                }
+            // Acquiring also references warm storage for this attempt. The
+            // platform grows only when the retained block is too small.
+            if (const int rc = api->acquire_retained_temp(wanted, &raw, &size); rc != 0) {
+                return rc;
             }
         }
         if (raw == nullptr) {
-            return true;  // nothing retained, and this run needs nothing
+            return 0;  // nothing retained, and this run needs nothing
         }
 
         // Align inside the allocation rather than trusting the backend to have
@@ -101,7 +101,7 @@ public:
             base_ = reinterpret_cast<void *>(base_addr);
             capacity_ = size - head;
         }
-        return true;
+        return 0;
     }
 
     /**

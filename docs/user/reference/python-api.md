@@ -39,6 +39,7 @@ into `**config` and validated later. The recognized keys:
 | `device_ids` | L3+ | one chip child process per entry |
 | `num_sub_workers` | L3+ | host-side Python callables to fork |
 | `enable_sdma` | a2a3 | provisions the SDMA workspace; defaults to `False` |
+| `workspace_budget_bytes` | onboard L2 | Optional positive byte limit on internal retained temporary storage and three pooled arenas; both owned and borrowed contexts manage these regions by default |
 | `heap_ring_size` | all | heap ring sizing |
 | `remote_heap_ring_size`, `remote_session_timeout_s` | L4 | remote-session sizing and timeout |
 
@@ -50,11 +51,53 @@ else raises. Remote-worker and remote-memory calls require `level >= 4`.
 | Method | Notes |
 | ------ | ----- |
 | `register(target, *, workers=None) -> CallableHandle` | Accepts a `ChipCallable` or, at L3+, a Python callable. Pre-init registrations enter the startup snapshot; post-init registration installs the callable on eligible live targets before returning |
-| `unregister(handle_or_slot)` | Releases a registration |
+| `unregister(handle_or_slot)` | Releases a registration; the last L2 use must be [safely retired](#native-framework-queue-submission) |
 | `add_worker(worker) -> int` | Attaches a child worker; returns its id |
 | `add_remote_worker(spec: RemoteWorkerSpec) -> int` | L4; see the remote-L3 design doc |
-| `init(prewarm_config=None)` | Resolves runtime binaries, opens the device, forks children. First place setup errors appear |
-| `close()` | Releases the device and reaps children. Put it in a `finally` — a skipped `close()` leaves the device held |
+| `init(prewarm_config=None, *, borrowed_context_generation=None)` | Resolves binaries; owns or borrows the direct L2 device context, or starts children |
+| `close()` | Retires runtime resources and children; resets only an owned device. Put it in a `finally` |
+
+### Borrowed device context and caller ordering
+
+For direct onboard L2, `worker.init(borrowed_context_generation=token)` borrows
+an already-current RTS context. `token` is a nonzero uint64 supplied by the caller,
+which must keep that context alive and use a new token for a new context generation.
+It is not a reset detector or an allocation-ownership certificate. Simulator and
+SDMA options are rejected for borrowed initialization.
+
+Both onboard ownership policies install the same internal workspace accounting.
+`workspace_budget_bytes` optionally limits the retained temporary buffer and
+three pooled arenas, including retained generations. It excludes caller tensors,
+registered code, diagnostics, RTS argument blocks and provider memory; it is not
+a device-wide memory ceiling. An absent budget imposes no byte limit. A budget
+refusal whose native preparation rolls back completely releases this invocation's
+Buffer references. The same Worker can accept a smaller valid call; the Buffer
+can close once all its other users retire. A rollback without complete release
+evidence retains its references and stops further native admission.
+
+`worker.submit(handle, args, caller_stream=stream)` uses a nonzero integer RTS
+stream handle for this invocation; `run` accepts the same keyword. The stream is
+required for borrowed execution and may also be supplied to owned L2 execution.
+L3+/Remote do not accept these process-local context/stream values. Registration,
+TaskArgs, Buffer/Tensor and RunHandle remain the same public interfaces.
+
+Borrowed submission accepts DEVICE operands and explicit HOST/NONE controls; it
+rejects implicit tensor H2D. Keep external allocations, context and stream alive
+through retirement. Successful submit has already enqueued both kernels and the
+caller exit dependency, so work appended to that caller stream is ordered after
+the operator. Caller synchronization can establish device results; `RunHandle.wait`
+still performs runtime retirement. Capture is rejected before run/source state is
+published. Borrowed close does not reset the caller device or destroy its stream.
+
+Frameworks with a separate host emission queue must place the submission in
+that queue's callback; passing a stream integer alone does not order a Python
+call against framework work still waiting for host emission. The optional
+[A3 framework eager reference](../../../examples/workers/l2/framework_eager/README.md)
+uses the same public Worker for TMR and HBG, preserves frame/storage owners and
+uses the final framework completion boundary before runtime retirement. It
+demonstrates ordering, not overlapping execution: native admission, predecessor
+retirement and capacity backpressure can still wait. It
+requires matching torch/torch_npu/CANN and does not enable capture submission.
 
 ### Memory
 
@@ -66,6 +109,9 @@ else raises. Remote-worker and remote-memory calls require `level >= 4`.
 | `copy_to(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | H2D; `dst` is a device `Buffer`, `src` a host `Buffer` from `create_buffer` (at L2, also any torch tensor or writable buffer). `nbytes` defaults to the rest of the host side after `src_offset`, so `copy_to(dst, src)` transfers the whole host backing |
 | `copy_from(dst, src, *, dst_offset=0, src_offset=0, nbytes=None)` | D2H; `dst` is the host `Buffer` (at L2, also any writable buffer). Same defaulting, measured from `dst_offset` on the host side |
 | `create_buffer(nbytes) -> Buffer` / `Buffer.close()` | Shared host backing this Worker owns; build a view over `handle.shm.buf`, name it on the wire with `Tensor(handle, shapes=shapes, dtype=dtype)` |
+| `Buffer.host_view()` | CPU view of the local Host backing. Release the view and its derivatives before closing the backing |
+| `release_buffer(buffer)` | Release Worker-owned storage after accepted uses retire. For a mapped Host Buffer, this also releases its cached registration |
+| `Buffer.shm.buf` | CPU bytes of shared Host storage. Host-source domain buffers expose the whole rank window; select slices with `domain.buffer_range(name)`. Device-source HBM buffers have `shm=None` |
 | `remote_malloc` / `remote_free` / `remote_copy_to` / `remote_copy_from` / `remote_export` / `remote_import` / `remote_release_import` | L4 only |
 
 A partial update names the **whole allocation plus an offset** — `copy_to(dev, src,
@@ -74,16 +120,63 @@ allocation; it is a different canonical identity that names no allocation at all
 Both offsets are bounded together with the length against the *registered* extent, so an offset
 cannot walk a legal-looking length past the end.
 
+For direct A3/A5 L2 Workers with an owned device context, use
+`args.add_tensor(tensor, transfer=TensorTransfer.MAP)` to let the device access
+a Worker-owned Host Buffer without staging a copy. The Tensor keeps its HOST
+descriptor. Each accepted call retains its use until completion or proven
+cancellation. Borrowed contexts and graph capture do not accept Host MAP. See
+[Buffer ABI](../../buffer-abi.md) for transfer defaults and release behavior.
+
 ### Execution
 
 | Method | Notes |
 | ------ | ----- |
-| `run(callable, args=None, config=None) -> None` | Blocks until the run completes |
-| `submit(callable, args=None, config=None) -> RunHandle` | Non-blocking |
+| `run(callable, args=None, config=None, *, caller_stream=None) -> None` | Blocks until the run completes |
+| `submit(callable, args=None, config=None, *, caller_stream=None) -> RunHandle` | Non-blocking |
 | `live_domains() -> dict[str, CommDomainHandle]` | Currently allocated communication domains |
 
-`RunHandle` exposes `done() -> bool`, `wait(timeout=None)`, and
+`RunHandle` exposes the `done` property, `wait(timeout=None)`, and
 `result(timeout=None)`.
+
+Direct L2 handles validate the execution context inside the native wait.
+`ExecutionContextRefused`, imported from `simpler.task_interface`, is a
+`RuntimeError` subclass for current-context preflight refusal. It supplies no
+completion verdict: the handle, its argument snapshot and its Buffer uses remain
+intact; restore the required context before retrying.
+
+`RunPreparationRefused`, also from `simpler.task_interface`, is a terminal
+`RuntimeError` subclass stating that this invocation enqueued no operator kernel and
+released its native input bindings and preparation resources. It can surface
+from submit, or from wait when preparation was deferred. It also covers launch
+setup that explicitly returned `NotStarted`, once finalize has released all
+bindings and preparation resources. The original launch error code and message
+remain observable, and a usable Worker can retry with the same Buffer. A backend
+exception or absent active-execution pointer alone supplies no such proof.
+The Worker releases
+only that invocation's source references; another live run still protects a
+shared Buffer. It does not certify that the environment accepts another call,
+or undo host orchestration effects and completed synchronous copies.
+Unclassified native errors and partial launches retain unproven uses; error
+messages do not determine the classification. Borrowed-context initialization
+is available for direct onboard L2 through
+`Worker.init(borrowed_context_generation=...)`. Neither refusal type proves
+that an external allocation belongs to that context.
+
+READY Worker operations validate through the shared operation lease, outside the
+lifecycle lock and before their bodies run. Direct L2 operations check the native
+current-context predicate; L3+ operations retain their own child/environment
+contracts. This covers allocation, free, copies, registration and future leased
+APIs. Only `device_location`, a source-descriptor query with no device operation,
+explicitly skips current-context validation. Close checks separately before its
+CLOSED admission fence and teardown-attempt publication. An unaccepted context
+refusal preserves READY, callable handles and source uses; restore the context
+before retrying. Once close has been accepted, a teardown failure retains CLOSED
+and its cleanup debt. Re-entering close in the required context can retry that
+debt; it does not reopen the Worker. Native registration and the legacy
+ChipWorker registry also check before their state changes. Direct native
+allocation, free, copies, device-memory queries and diagnostic flush validate
+before calling the backend; cached host counters and descriptors do not perform
+device operations.
 
 At L2 the `callable` is a registered `ChipCallable` handle. At L3+ the top-level
 callable is a **Python orchestration function** `f(orch, args, cfg)`, where
@@ -94,13 +187,32 @@ callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 | `submit_next_level(callable_handle, args, config=None, *, worker: int) -> TaskHandle` | Hands a callable to one exact NEXT_LEVEL child and returns an opaque handle for explicit task dependencies |
 | `submit_next_level_group(callable_handle, args_list, config=None, *, workers: list[int]) -> TaskHandle` | Submits one group DAG node and returns its opaque handle |
 | `submit_sub(callable_handle, args=None)` | Schedules a registered host-side Python callable |
-| `allocate_domain(*, name, workers, window_size, buffers=())` | Context manager returning a handle indexed by domain-local rank |
+| `allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False, memory_source=AddressSpace.DEVICE)` | L3/L4 creation returning `CommDomainHandle`; legacy L3 `workers=` and chip-id indexing remain supported |
+| `get_or_allocate_domain(*, name, members, window_size, buffers=(), retain_after_run=False, memory_source=AddressSpace.DEVICE)` | Reuse the same live handle after full configuration validation, or create it |
+| `get_domain(name_or_ref)` / `release_domain(handle)` | Creator-local name lookup or borrowing by `CommDomainRef`; only the creator owns release |
+| `copy_to_domain(handle, rank, data, ...)` / `copy_from_domain(handle, rank, nbytes, ...)` | Synchronous bounded staging for Device-source domains before task submission. L3 requires declared slices. |
 | `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Delegates allocation to the owning Worker; target chip memory is named by the returned handle |
+
+Onboard A2/A3 and A5 TMR L3 domains may select `memory_source=AddressSpace.HOST`.
+Each rank has a Host window. L3 accesses it with `buffer.shm.buf` and selects named
+slices with `domain.buffer_range(name)`. Both allocation methods accept a synchronous
+`initializer(domain)` for new Host domains. See [A5 Host-source domains](../../a5-host-comm-domain.md)
+and [A2/A3 Host-source windows](../../comm-domain.md#a2a3-host-source-windows).
+
+`domain.member(rank).buffers[name].tensor(...)` has the same L3/L4 semantics and routes to its owning chip.
+`domain.ref` is immutable across nodes; `local_context(rank)` requires a local mapping.
+Borrowed handles reject `release()` and `with`. Cached Tensor use enrolls later runs automatically;
+release waits for accepted tasks, and unknown cleanup remains tracked and reported with `freed=False`.
+For scalar-only ref/context tasks, the owner's callback must call `get_domain(name_or_ref)`;
+a child lookup does not enroll the owner's run.
 
 ## Callables and task args
 
 ```python
-CoreCallable.build(signature=[ArgDirection...], binary=kernel_bytes)
+CoreCallable.build(
+    signature=[ArgDirection...], binary=kernel_bytes,
+    async_capability={"version": 1, "mode": "SYNCHRONOUS", "max_conditions": 0, "condition_types": 0},
+)
 
 ChipCallable.build(
     signature=[ArgDirection...],
@@ -109,6 +221,18 @@ ChipCallable.build(
     children=[(func_id, core_callable), ...],
 )
 ```
+
+Core callables accept a version-1 `async_capability` declaration.
+`SYNCHRONOUS` requires zero `max_conditions` and `condition_types`; `DEFERRED`
+requires a bound of 1–64 conditions and a nonzero condition-type mask from 1–3.
+For compatibility, an omitted declaration, `None`, or `UNKNOWN` with zero
+condition fields is normalized at registration to `DEFERRED` with
+`max_conditions=64` and `condition_types=3`. Legacy all-zero serialized metadata
+uses the same conservative default. Scene specs use this normalization for each
+`incores` entry and cache the canonical declaration. Invalid versions, fields,
+and bounds are still rejected. Explicit `SYNCHRONOUS` declarations retain the
+synchronous fast path; a run that happens to register no conditions does not
+establish that a kernel is synchronous.
 
 `ArgDirection` is `SCALAR`, `IN`, `OUT`, or `INOUT`. The signature list is
 positional and defines the task-arg order. `func_id` must match the id the
@@ -121,6 +245,12 @@ Public `Worker` calls use `TaskArgs` containing address-free `Tensor` views at
 every level. The L2 leaf resolves those views into the internal
 `ChipStorageTaskArgs` / `ChipTensor` representation; callers do not pass that
 internal representation to `Worker.run()`.
+
+Direct L2 `Worker` and forked chip children each own a native chip binding.
+They share runtime initialization; the parent Worker owns public callable handles,
+and each child resolves them to its local native slots.
+The lower-level public `ChipWorker` remains a separate compatibility entry;
+its handles and Python registry are not used by `Worker` internally.
 
 The lower-level `ChipWorker.run(handle, args)` accepts the same `TaskArgs` for
 scalars and contiguous HOST/H2D tensors. DEVICE Buffer arguments use
@@ -152,7 +282,24 @@ Add tensors **in signature order**, before any scalars. Use `INPUT` for an
 input, `OUTPUT_EXISTING` for a caller-allocated output, and `INOUT` for an
 input/output view. `DataType` carries the element types.
 
+### Eager workspace capacity
+
+Owned and borrowed direct-L2 calls reuse internal arena capacity and grow it
+when a later invocation needs more storage. An empty first HBG call does not
+require a nonempty warmup or a new Worker before submitting a larger graph.
+A failed replacement allocation preserves the existing arena addresses and
+capacities; public submission errors retain their existing cleanup requirements.
+
+Each native run retains its bank through retirement. Concurrent HBG preparation
+uses a different bank, while shared-bank runtimes require compatible storage
+before preparing ahead of an executing run. This does not make capture/replay
+supported: captured graphs require their own address-retention contract.
+
 ### Borrowed device storage
+
+The example uses an initialized direct L2 Worker and a caller stream belonging
+to its current RTS context. Supplying the stream works with owned initialization
+and is required with borrowed initialization.
 
 ```python
 from simpler.buffer import Buffer
@@ -160,13 +307,16 @@ from simpler.buffer import Buffer
 source = Buffer.wrap(address=ptr, nbytes=capacity, location=worker.device_location)
 args = TaskArgs()
 args.add_tensor(Tensor(source, shapes=(count,), dtype=DataType.FLOAT32), TensorArgType.INPUT)
-worker.submit(callable_handle, args).result()
+worker.submit(callable_handle, args, caller_stream=stream).result()
 source.close()
 ```
 
 `worker.device_location` is available after direct L2 initialization. The token
-identifies that live process/context incarnation; it cannot be replaced by a
-device ordinal or used on another Worker. `Buffer.wrap(..., access=...)` accepts
+identifies that native environment binding, including its process, incarnation
+and context generation; it cannot be replaced by a device ordinal or used on
+another Worker. Source checks reject a changed or successfully retired native
+binding even if the Python facade still reports READY. Reading the location
+performs no RTS call; current-context validation remains an execution precondition. `Buffer.wrap(..., access=...)` accepts
 an existing `AccessMode` grant (default `READWRITE`) and registers caller-owned
 storage without consumer attachment. Submission performs that attachment.
 
@@ -174,8 +324,9 @@ The caller owns the allocation and guarantees its real device, capacity and
 lifetime. `source.close()` revokes an idle registration without freeing memory;
 it refuses in-flight or unproven completion. `Worker.free` and Worker copy
 operations do not manage this external allocation. Use its allocator for IO
-and physical release. HOST, remote, and borrowed RTS context attachment are
-outside this interface. See the [source lifetime contract](../../buffer-abi.md#borrowed-device-sources-at-direct-l2)
+and physical release. HOST and remote wrapping are outside this interface.
+The provider may use owned or borrowed RTS initialization; this does not transfer
+physical ownership of the wrapped allocation. See the [source lifetime contract](../../buffer-abi.md#borrowed-device-sources-at-direct-l2)
 for failure and Program Worker teardown behavior.
 
 ## `CallConfig`
@@ -219,6 +370,68 @@ the runtime's own. See
 [host trace markers](../../dfx/host-trace.md#emitting-your-own-spans-with-simplertrace)
 for what the namespace guarantees in each view, the cost of one attempt, and how
 to read the records back.
+
+## Native framework queue submission
+
+`Worker.prepare_submission(callable, args, config, caller_stream=address,
+keepalive=(...))` prepares a direct L2 invocation without launching it or waiting
+for lane capacity. It snapshots arguments/configuration, including readonly HOST/NONE control
+contents, and reserves the callable
+and referenced Simpler buffers. Pass external tensor and stream owners in
+`keepalive`; raw addresses do not retain storage. Capture and L3 Python
+orchestration are outside this interface.
+
+The returned `PreparedSubmission` supports the usual `RunHandle.wait()` and
+`done` property. On the Python thread, pass `ticket.native_handle` to your native adapter.
+The capsule is named `simpler.NativeSubmission`. The adapter and extension must
+be rebuilt together; there is no independent ABI version negotiation. Its header is
+`src/common/worker/native_submission.h`. Resolve the include directory with
+`from simpler_setup.environment import PROJECT_ROOT`, then
+`PROJECT_ROOT / "src/common/worker"`. This selects the repository in an editable
+install and `simpler_setup/_assets/src/common/worker` in a wheel install.
+The adapter retains a
+`NativeSubmissionRef` before returning to Python and captures only that native
+reference in its framework queue callback. Calling its `submit()` uses the
+existing chip lane admission and caller-stream entry/exit ordering. Retain,
+submit and release require no Python calls or GIL. Native submit errors must be
+reported through the adapter's error channel before consumers use outputs.
+
+Tokens are one-shot. If enqueue fails, `ticket.cancel()` retires a token that has
+not started native submission; it returns false once the token is consumed or
+already cancelled. A true result confirms cancellation, not successful cleanup:
+check `safe_to_release` before dropping owners. If cancellation raises, keep
+tracking the ticket; the exception does not prove that it remains unconsumed.
+A cancelled or consumed token rejects later submission. `ticket.wait()` or
+`Worker.close()` retires Python owners after completion. An unsubmitted,
+uncancelled token can make close time out; cancel it and retry close. Keep every
+pending ticket in the adapter's tracking collection: dropping its last accessible
+Python reference does not cancel it, and there is no public lookup API to recover
+that ticket for cancellation. If it is never consumed, close cannot drain it.
+Unknown completion errors conservatively retain owners.
+
+`ticket.safe_to_release` reports whether this invocation's external owner uses
+have been discharged by existing cleanup. It is false before retirement and on
+timeout or unknown completion. It can become true even when `wait()` raises an
+execution error whose cleanup is proven; the original error remains observable.
+A successful owner-close recovery can also discharge previously unknown uses.
+An unclassified native submission failure without a returned run supplies no
+cleanup proof and may require successful Worker close before owners can be
+released. This differs from a proven pre-launch refusal or a failed run whose
+cleanup is already complete; do not treat all failures as requiring a new Worker.
+Do not use `done` or error message text as release evidence. The adapter should
+periodically retire completed tickets with bounded observation and retain any
+that cannot yet be safely retired. An enqueue exception may occur after the
+callback starts: check `cancel()` and keep tracking the ticket if it returns false.
+
+The last callable registration cannot be unregistered while a prepared token or
+ordinary L2 run still retains its use. A refusal preserves the registration for
+retry after retirement; physical completion alone does not retire the Python use.
+
+Keep the interpreter alive
+until queued callbacks and Worker cleanup finish; tokens cannot cross a fork.
+
+See the [native queue example](../../../examples/workers/l2/framework_eager/native_submission.py)
+for real framework producer/kernel/consumer ordering and cancellation handling.
 
 ## `simpler_setup`
 

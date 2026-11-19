@@ -13,30 +13,21 @@
 // Mirrors the smaller surface of aicore-notification-perf/shared/handshake.h:
 // no AICore is involved here, so there is no Handshake — just a result block
 // for the AICPU to write timing samples into, and a DeviceArgs envelope that
-// tells the AICPU which AIC_CTRL base + how many cores it can probe.
+// tells the AICPU where the per-core register bases are and how many it can probe.
 
 #ifndef AICPU_MMIO_PROBES_TYPES_H_
 #define AICPU_MMIO_PROBES_TYPES_H_
 
 #include <cstdint>
-
-// Register offsets within an AIC sub-core slot. Mirrors
-// src/a2a3/platform/include/common/platform_config.h. The a5 chip uses
-// 0xD0 for DMB and 0x5108 for COND; override per-chip if you port the
-// probe.
-constexpr uint32_t kProbeRegSprDmbOffset = 0xA0;
-constexpr uint32_t kProbeRegSprCondOffset = 0x4C8;
-
-constexpr uint64_t kProbeCoreStride = 8ULL * 1024 * 1024;  // 8 MiB per AICore
-constexpr uint64_t kProbeSubCoreStride = 0x100000ULL;      // 1 MiB per sub-core
+#include <type_traits>
 
 // Sentinels — match production runtime so STR DMB tests leave AIC_CTRL in a
 // state the chip considers idle.
 constexpr uint32_t kProbeAicpuIdleTaskId = 0x7FFFFFFDu;
 
 // Max core counts we probe over. Phase 12-C scales M-threads up to
-// kProbeMaxConcurrentReaders, each owning a distinct AIC core. A real chip
-// has 24 AICs, but capping at 8 keeps the result block small and pthreads
+// kProbeMaxConcurrentReaders, each owning a distinct AIC core. Capping at 8
+// keeps the result block small and pthreads
 // well-behaved on the AICPU OS.
 constexpr uint32_t kProbeMaxCores = 8;
 constexpr uint32_t kProbeMaxConcurrentReaders = 4;
@@ -77,9 +68,12 @@ struct alignas(8) MmioProbeDeviceArgs {
     uint64_t reserved_pre[12];       // 0..95 — dispatcher bootstrap uses these
     uint64_t result_addr;            // 96 — &MmioProbeResult
     uint64_t input_token;            // 104 — echoed token, sanity
-    uint64_t aic_ctrl_reg_base;      // 112 — halMemCtl(REG_AIC_CTRL).ptr
+    uint64_t reg_bases_addr;         // 112 — GM array of AICore register bases
     uint32_t n_aic_cores_available;  // 120 — host caller's count of probable AICs
-    uint32_t _pad;                   // 124
+    uint32_t cond_offset;
+    uint32_t dmb_offset;
 };
+static_assert(sizeof(MmioProbeDeviceArgs) <= 160, "DeviceArgs must fit the dispatcher allocation");
+static_assert(std::is_trivially_copyable_v<MmioProbeDeviceArgs> && std::is_standard_layout_v<MmioProbeDeviceArgs>);
 
 #endif  // AICPU_MMIO_PROBES_TYPES_H_

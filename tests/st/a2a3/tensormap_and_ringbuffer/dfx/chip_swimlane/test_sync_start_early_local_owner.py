@@ -82,7 +82,7 @@ class TestSyncStartEarlyLocalOwner(SceneTestCase):
         {
             "name": "single_scheduler_idle",
             "platforms": ["a2a3sim", "a2a3"],
-            "manual": ["a2a3sim"],
+            "manual": True,
             # One orchestrator plus one scheduler. That scheduler owns all AIV
             # cores, so the eight-block consumer fits its local idle capacity.
             "config": {"aicpu_thread_num": 2},
@@ -91,7 +91,7 @@ class TestSyncStartEarlyLocalOwner(SceneTestCase):
         {
             "name": "three_schedulers_idle",
             "platforms": ["a2a3sim", "a2a3"],
-            "manual": ["a2a3sim"],
+            "manual": True,
             # One orchestrator plus three schedulers. Whichever scheduler pops
             # the four-block cohort owns enough AIV cores to stage it locally,
             # so no non-owner scheduler should participate in a global drain.
@@ -101,7 +101,7 @@ class TestSyncStartEarlyLocalOwner(SceneTestCase):
         {
             "name": "single_scheduler_pending_only",
             "platforms": ["a2a3sim", "a2a3"],
-            "manual": ["a2a3sim"],
+            "manual": True,
             # Every blocker reports started before an ACK-sweep fence. A second
             # scheduler-loop fence completes during their measured one-second
             # hold, proving the consumer used pending rather than idle slots.

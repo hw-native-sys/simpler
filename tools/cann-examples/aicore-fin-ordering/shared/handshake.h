@@ -40,12 +40,7 @@
 
 #include <cstddef>
 #include <cstdint>
-
-// REG_SPR_COND_OFFSET on the a2a3 chip family; the consumer reads
-// `aic_ctrl_reg_base + core_stride * core_id + offset` to poll a core's COND.
-// Mirrors src/a2a3/platform/include/common/platform_config.h.
-constexpr uint32_t kFinRegSprCondOffset = 0x4C8;
-constexpr uint64_t kFinCoreStride = 8ULL * 1024 * 1024;
+#include <type_traits>
 
 // FIN encoding — matches the runtime's MAKE_FIN_VALUE: bit 31 marks "finished",
 // the low 31 bits carry the id. Rounds therefore must stay below 2^31 so the
@@ -56,12 +51,8 @@ constexpr uint64_t kFinMaxRound = 0x40000000ULL;  // stays well inside the mask
 
 constexpr uint32_t kFinCacheLine = 64;
 
-// get_coreid() is not a bare index: the runtime masks it with AICORE_COREID_MASK
-// before using it to index the AIC_CTRL register window
-// (src/a2a3/platform/onboard/aicore/inner_kernel.h::get_physical_core_id).
+// get_coreid() carries flags above the physical core index on both arches.
 constexpr uint32_t kFinCoreIdMask = 0x0FFF;
-// Upper bound on cores the window can address; polling past it faults.
-constexpr uint32_t kFinMaxCores = 64;
 
 // Producer publish sequence under test. P0 and P1 differ ONLY in the dsb.
 enum FinProducerMode : uint32_t {
@@ -186,7 +177,7 @@ struct FinResult {
     uint64_t dsb_cost_ticks;         // measured; sizes the C7 delay arm
     uint64_t delay_arm_ticks;        // what C4 actually spent
     uint32_t core_id_raw;            // get_coreid() as reported
-    uint32_t core_id_used;           // after AICORE_COREID_MASK, what indexed the window
+    uint32_t core_id_used;           // after AICORE_COREID_MASK, what indexed the register table
     uint64_t producer_publishes;     // rpt.publish_count at the end: did it publish at all
     uint64_t producer_last_round;    // rpt.published_round at the end
     uint64_t final_payload;          // payload after an invalidate, at the end
@@ -206,10 +197,14 @@ struct alignas(8) FinDeviceArgs {
     uint64_t result_addr;
     uint64_t input_token;
     uint64_t handshake_addr;
-    uint64_t aic_ctrl_reg_base;
+    uint64_t reg_bases_addr;
     uint64_t records_addr;
     uint32_t records_capacity;
     uint32_t rounds_per_cell;
     uint32_t fallback_core_idx;  // used only if the producer never reports one
+    uint32_t reg_core_count;
+    uint32_t cond_offset;
     uint32_t _pad;
 };
+static_assert(sizeof(FinDeviceArgs) <= 160, "DeviceArgs must fit the dispatcher allocation");
+static_assert(std::is_trivially_copyable_v<FinDeviceArgs> && std::is_standard_layout_v<FinDeviceArgs>);

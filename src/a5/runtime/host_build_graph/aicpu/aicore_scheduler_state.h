@@ -13,47 +13,24 @@
 
 #include "runtime.h"
 #include "scheduler/scheduler_types.h"
+#include "scheduler/scheduler_graph.h"
 
 inline bool aicore_scheduler_runtime_mode_is_resident(uint32_t mode) {
     return mode == SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING || mode == SCHEDULER_RUNTIME_MODE_RESIDENT_READY;
 }
 
-inline bool aicore_scheduler_runtime_mode_is_explicit_legacy(uint32_t mode) {
-    return mode == SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH || mode == SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE;
-}
-
 inline bool aicore_scheduler_runtime_enabled(const Runtime *runtime) {
     return runtime != nullptr && runtime->get_worker_count() > 0 &&
-           aicore_scheduler_runtime_mode_is_resident(runtime->dev.scheduler_bootstrap.runtime_mode);
-}
-
-inline bool aicore_scheduler_explicit_legacy_enabled(const Runtime *runtime) {
-    return runtime != nullptr && runtime->get_worker_count() > 0 &&
-           aicore_scheduler_runtime_mode_is_explicit_legacy(runtime->dev.scheduler_bootstrap.runtime_mode);
-}
-
-/**
- * Whether a legacy run reached the end of the path its terminal record may call
- * a success — what `LegacyAicpuExecutor::snapshot_run_terminal` passes to
- * `run_terminal_select` as `normal_path_completed`.
- *
- * Two conditions, and the first is this producer's alone. `aicpu_execute`
- * rejects a legacy run whose mode does not say legacy was chosen, and that
- * rejection reaches the host only as the kernel's return; a record calling such
- * a run Ok would contradict it. The second is the shared one: a participant
- * that never dispatched withholds its claim, so a short tally means some thread
- * cannot vouch for the path.
- *
- * Neither condition suppresses a failure — `run_terminal_select` reports a
- * header or participant error whatever this answers.
- */
-inline bool aicore_legacy_run_completed_audited_path(const Runtime *runtime, int32_t claims, int32_t participants) {
-    return aicore_scheduler_explicit_legacy_enabled(runtime) && claims == participants;
+           runtime->get_worker_count() <= static_cast<int32_t>(SCHEDULER_WORKER_CAPACITY) &&
+           aicore_scheduler_runtime_mode_is_resident(runtime->dev.scheduler_bootstrap.runtime_mode) &&
+           runtime->dev.scheduler_bootstrap.worker_context_base != 0 &&
+           runtime->dev.scheduler_bootstrap.worker_context_base % alignof(SchedulerWorkerContext) == 0 &&
+           runtime->dev.scheduler_bootstrap.worker_context_base <=
+               UINT64_MAX - static_cast<uint64_t>(runtime->get_worker_count()) * sizeof(SchedulerWorkerContext);
 }
 
 // Worker 0's context sits at the published base, so the bootstrap context is the
-// base itself. A zero base is "no resident scheduler state", the same verdict a
-// zero handshake task carried before.
+// base itself. Invalid bootstrap inputs never name a scheduler context.
 inline SchedulerWorkerContext *aicore_scheduler_bootstrap_context(Runtime *runtime) {
     if (!aicore_scheduler_runtime_enabled(runtime) || runtime->dev.scheduler_bootstrap.worker_context_base == 0) {
         return nullptr;
@@ -90,4 +67,35 @@ inline SchedulerRunControl *aicore_scheduler_run_control(SchedulerWorkerContext 
     void *state_base = aicore_scheduler_state_base(context);
     return state_base == nullptr ? nullptr :
                                    scheduler_state_at<SchedulerRunControl>(state_base, context->run_control_offset);
+}
+
+inline uint64_t aicore_scheduler_resolved_count(const SchedulerRunControl *run) {
+    return run->run_completed_read_address == 0 ?
+               run->resolved_task_count :
+               *reinterpret_cast<volatile uint32_t *>(run->run_completed_read_address);
+}
+
+inline SchedulerGraphView aicore_scheduler_graph_view(const SchedulerWorkerContext &context) {
+    return {
+        context.graph_storage_address,
+        context.graph_task_count,
+        context.task_window_last_index,
+        context.scheduler_state_base_address,
+        context.native_header_offset,
+        context.scheduler_state_bytes,
+        static_cast<uint32_t>(context.original_task_count),
+    };
+}
+
+inline TaskId aicore_scheduler_public_identity(const SchedulerGraphView &graph, uint64_t ref) {
+    uint64_t identity = UINT64_MAX;
+    if (scheduler_node_identity(graph, ref, &identity) != SchedulerGraphResult::OK) return TaskId::invalid();
+    const auto space = static_cast<TaskId::Space>(identity >> TaskId::SPACE_SHIFT);
+    if (space == TaskId::Space::GLOBAL) return TaskId::make_global(static_cast<int32_t>(identity));
+    if (space == TaskId::Space::SUB_TASK)
+        return TaskId::make_sub_task(
+            static_cast<int32_t>((identity >> TaskId::PARENT_SHIFT) & TaskId::PARENT_MASK),
+            static_cast<int32_t>(identity)
+        );
+    return TaskId::invalid();
 }

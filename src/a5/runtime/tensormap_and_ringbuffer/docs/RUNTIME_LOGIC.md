@@ -79,7 +79,7 @@ Two platform implementations exist under `src/platform/`, sharing a common inter
 | --------- | ----------- |
 | `device_runner.cpp` | Uses `std::thread` to simulate AICPU/AICore |
 | `memory_allocator.cpp` | Wraps `malloc`/`free` |
-| `aicore/kernel.cpp` | `aicore_execute_wrapper` sets `g_sim_reg_base` per core |
+| `aicore/kernel.cpp` | `aicore_execute_wrapper_checked` sets the borrowed register-base cell per core |
 | `upload_chip_callable_buffer` | Copy ChipCallable bytes to a host scratch, `dlopen` each child SO, `dlsym` "kernel_entry", patch the scratch's `resolved_addr_` with the function pointer |
 
 ### 2.3 Platform Constants (`platform_config.h`)
@@ -745,7 +745,7 @@ edge (#1405).
 #### a5 platform notes
 
 - `RUNTIME_MAX_WORKER = 108` — doorbell table / `staged_core_mask` words must cover 108 cores.
-- AICore index fields are `s_block_idx` / `s_block_num` (not a2a3 `block_idx` / `block_num`).
+- AICore `LocalContext` uses `block_idx` / `block_num` for logical blocks, matching A2/A3.
 - DMB MMIO offset is **`0xD0`** (a2a3 uses `0xA0`). Ready dispatch writes the low 32 bits;
   early release rings high 32 via 64-bit STR `(token<<32)|token`. AICore gated path spins on
   `read_dmb_high32() == task_id` before ACK.

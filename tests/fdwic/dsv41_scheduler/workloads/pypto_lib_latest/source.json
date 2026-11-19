@@ -1,0 +1,83 @@
+{
+  "source_deps_sha256": "ee1a9514fce935fbecc41e09aca641de69e47b4cb5a139bf9b91edaf044d32ff",
+  "source_names_sha256": "f1fe0fafb1c4bd5ac056f5c5993369c615db8504439a69a02d8c3212b66e74be",
+  "source_tasks": 1786,
+  "source_runtime": "host_build_graph",
+  "cases": {
+    "swa": {
+      "tasks": 16,
+      "executions": 578,
+      "edges": 17,
+      "incoming_edges": 45,
+      "first_source_task": "8",
+      "last_source_task": "35",
+      "task_table_sha256": "630452ca90a12a175638a048117dcfbcb0aad37799eb7209f284a4a844822f92",
+      "edge_table_sha256": "2eeb8d3efd0f1b6692d74f77a8e7f96f84e0755e2a41e5144a4d4b946e79d9ea"
+    },
+    "c2a_full": {
+      "tasks": 27,
+      "executions": 715,
+      "edges": 38,
+      "incoming_edges": 88,
+      "first_source_task": "147",
+      "last_source_task": "190",
+      "task_table_sha256": "c5b03b1709c59a40a65a37a8f3810978e487e84e3f2168efc77b155c8f8f086f",
+      "edge_table_sha256": "8e1952b5aee3b8af2f03ab5ca6dbe006d74013deb3cb28c2986e8d1b9a9eb150"
+    },
+    "c1a_reindex": {
+      "tasks": 22,
+      "executions": 709,
+      "edges": 29,
+      "incoming_edges": 88,
+      "first_source_task": "1551",
+      "last_source_task": "1591",
+      "task_table_sha256": "b89922d9fab86d006642180ce0c622aeaeef631ce93fc150f39c05b7798282d0",
+      "edge_table_sha256": "c122fed1c96d4c3847d613eeb7cbc1a52081a6d21bb7bf94639d91131f1554b6"
+    },
+    "c1a_reuse": {
+      "tasks": 16,
+      "executions": 523,
+      "edges": 18,
+      "incoming_edges": 59,
+      "first_source_task": "1371",
+      "last_source_task": "1398",
+      "task_table_sha256": "c3a5cca4237918a6417d51e64febaf19ccdffb5157075236afdeb72f24bac4ba",
+      "edge_table_sha256": "50823f0026efa6bc960207b97f382c8dc98fbc327f7bdc2f1b9bd00975d11680"
+    },
+    "moe": {
+      "execution": "native_moe_host_control",
+      "source_branch": "dev/hbg",
+      "source_commit": "a6a9a2d49047ce67a85857c6b15f9604a7287714",
+      "entry": "models/deepseek_v4_1_flash/decode_moe.py:l3_moe",
+      "device_count": 2
+    },
+    "engram": {
+      "tasks": 12,
+      "executions": 960,
+      "edges": 11,
+      "incoming_edges": 18,
+      "first_source_task": "68",
+      "last_source_task": "83",
+      "task_table_sha256": "40972a33d2df79750ee261fda905f9c9cd67bac349abca7edf2741821cbfd1cc",
+      "edge_table_sha256": "f73b6f1ee8dd52be9b1225f732232f78b8fcc44880467753d947842fcf3b73cf"
+    },
+    "layers_19_21": {
+      "tasks": 138,
+      "executions": 4449,
+      "edges": 229,
+      "incoming_edges": 299,
+      "first_source_task": "1235",
+      "last_source_task": "1428",
+      "task_table_sha256": "96b81b4733469b3845bc578c61f96d6eb3a2504ac0b855b582353bf5a631f1d0",
+      "edge_table_sha256": "456c065c8cfd520b22d9b257de2437d2c0fdd99699e08bc0e5ca476065890090"
+    }
+  },
+  "boundary": "Incoming edges are recorded for reference. Production replay runs the real prefix to produce boundary data.",
+  "preserved": [
+    "logical task boundaries",
+    "block counts",
+    "AIC/AIV subtask masks",
+    "unique internal dependency edges"
+  ],
+  "execution": "These tables describe topology only. Use production/export_cases.py with the original C++ capture and source-built kernels to preserve tensors, communication, MIX and sync-start."
+}

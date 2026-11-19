@@ -37,6 +37,7 @@
 #include "common/chip_swimlane_profiling.h"
 #include "host/chip_swimlane_collector.h"
 #include "support/test_task_id.h"
+#include "profiler_test_allocator.h"
 
 namespace chip_swimlane_fixture {
 
@@ -64,7 +65,7 @@ static_assert(
     "the phase_data union's task_id arm"
 );
 
-inline void *fixture_alloc(size_t size) { return std::calloc(1, size); }
+inline void *fixture_alloc(size_t size) { return profiler_test_calloc(size); }
 
 inline int fixture_free(void *ptr) {
     std::free(ptr);
@@ -79,9 +80,9 @@ struct PhaseBuffers {
     ChipSwimlaneAicpuTaskBuffer *perf{nullptr};
 
     PhaseBuffers() {
-        sched = static_cast<ChipSwimlaneAicpuSchedPhaseBuffer *>(std::calloc(1, sizeof(*sched)));
-        orch = static_cast<ChipSwimlaneAicpuOrchPhaseBuffer *>(std::calloc(1, sizeof(*orch)));
-        perf = static_cast<ChipSwimlaneAicpuTaskBuffer *>(std::calloc(1, sizeof(*perf)));
+        sched = static_cast<ChipSwimlaneAicpuSchedPhaseBuffer *>(profiler_test_calloc(sizeof(*sched)));
+        orch = static_cast<ChipSwimlaneAicpuOrchPhaseBuffer *>(profiler_test_calloc(sizeof(*orch)));
+        perf = static_cast<ChipSwimlaneAicpuTaskBuffer *>(profiler_test_calloc(sizeof(*perf)));
     }
     ~PhaseBuffers() {
         std::free(sched);
@@ -119,7 +120,7 @@ inline void populate(ChipSwimlaneCollector &collector, PhaseBuffers &buffers, co
     set_platform_chip_swimlane_run_terminal_bank(
         reinterpret_cast<uint64_t>(collector.arm_run_terminal_bank(/*bank_index=*/0, kEpoch))
     );
-    chip_swimlane_aicpu_init(kNumAicore);
+    chip_swimlane_aicpu_init(kNumAicore, ChipSwimlaneLevel::SCHED_PHASES);
 
     // AICore records through the real dispatch/flush path.
     for (int core = 0; core < kNumAicore; core++) {
@@ -207,7 +208,7 @@ inline void populate(ChipSwimlaneCollector &collector, PhaseBuffers &buffers, co
     collector.reconcile_counters();
     collector.report_run_terminal_snapshot(/*bank_index=*/0, kEpoch);
 
-    collector.set_json_extension(ChipSwimlaneExtensionSection::AicpuLifecycleRecords, "[[11, 12]]");
+    collector.set_json_extension(kEpoch, ChipSwimlaneExtensionSection::AicpuLifecycleRecords, "[[11, 12]]", 10);
 
     std::vector<HostPhaseRecord> submits(1);
     submits[0].index = 1;

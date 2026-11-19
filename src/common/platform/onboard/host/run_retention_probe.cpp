@@ -42,20 +42,13 @@ void set_reason(RunRetentionProbeReport &report, const char *reason) {
 }
 
 /**
- * Whether any AICore of `prepared`'s run has reported itself started.
- *
- * The AICore publishes its report on kernel entry, gated by nothing, so a
- * report this run's epoch accepts is a device-written fact that the kernel is
- * executing — which is what the probe needs, because a launch call returning
- * says only that the driver accepted a submission.
- *
- * The epoch is what makes the answer this run's. The block is not reset per
- * run: its handshake region is published once per allocation and carries the
- * previous run's reports afterwards, so a bare `aicore_done != 0` would report
- * a predecessor as this successor. Read the same way the handshake dump reads
- * it, by copying the region back rather than dereferencing it in place.
+ * Whether a core published this unique eager run's startup report.
+ * Retirement invalidates the handshake but retains its epoch, so even a short
+ * successor remains observable after it exits. Completion is sampled separately;
+ * this history alone does not prove the successor is still running. The probe
+ * does not support replay identities shared by repeated model executions.
  */
-bool successor_is_running(const DeviceRunnerBase::PreparedExecution &prepared) {
+bool successor_has_started(const DeviceRunnerBase::PreparedExecution &prepared) {
     const Runtime *device_runtime = prepared.kernel_args.args.runtime_args;
     if (device_runtime == nullptr || prepared.num_aicore <= 0) return false;
     const size_t count = static_cast<size_t>(prepared.num_aicore);
@@ -65,7 +58,7 @@ bool successor_is_running(const DeviceRunnerBase::PreparedExecution &prepared) {
         return false;
     }
     for (const Handshake &worker : workers) {
-        if (aicore_report_accepted(&worker, prepared.identity.run_epoch)) return true;
+        if (prepared.identity.run_epoch != 0 && worker.report_epoch == prepared.identity.run_epoch) return true;
     }
     return false;
 }
@@ -94,8 +87,8 @@ int run_retention_probe(
     }
 
     // Step 1 — the predecessor's own two boundaries, and nothing else. This is
-    // `wait_run_fence`'s boundary wait without any `sync_stream_pair`, which is
-    // the call that would wait for the successor once one is queued.
+    // Physical progress waits on these boundaries without sync_stream_pair;
+    // the explicit stream observer can also wait for a queued successor.
     const int boundary_timeout_ms = config.boundary_timeout_ms != 0 ?
                                         static_cast<int>(config.boundary_timeout_ms) :
                                         RunRetentionProbePeer::stream_sync_timeout_ms(runner);
@@ -168,7 +161,7 @@ int run_retention_probe(
             static_cast<uint64_t>(config.successor_start_timeout_ms != 0 ? config.successor_start_timeout_ms : 5000) *
             1000000ULL;
         while (elapsed_ns(launch_start) < start_budget_ns) {
-            if (successor_is_running(*successor)) {
+            if (successor_has_started(*successor)) {
                 report->successor_started = 1;
                 break;
             }
@@ -184,17 +177,15 @@ int run_retention_probe(
         );
     }
 
-    // The control arm. This is the call `wait_run_fence` falls back to after
-    // the boundaries: with a successor in flight it waits for that successor,
-    // which is exactly what the record read must not do. Running it here,
+    // The control arm uses the explicit stream observer. With a successor in
+    // flight it waits for that successor, while the diagnostic record read
+    // measures a separate operation. Running it here,
     // against the same sequence, is what turns the Pending reading below into
     // evidence.
     if (config.use_retained_sync != 0) {
-        rtStream_t aicpu = nullptr;
-        rtStream_t aicore = nullptr;
-        RunRetentionProbePeer::run_streams(runner, &aicpu, &aicore);
         const Clock::time_point sync_start = Clock::now();
-        report->retained_sync_rc = RunRetentionProbePeer::sync_streams(runner, aicpu, aicore);
+        report->retained_sync_rc =
+            RunRetentionProbePeer::sync_streams(runner, prepared.streams.aicpu, prepared.streams.aicore);
         report->reference_sync_ns = elapsed_ns(sync_start);
         if (report->retained_sync_rc != 0) {
             // A synchronize that failed proves nothing about waiting, so the

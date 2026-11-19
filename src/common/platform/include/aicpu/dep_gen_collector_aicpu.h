@@ -82,6 +82,25 @@ void dep_gen_aicpu_set_orch_thread_idx(int thread_idx);
 void dep_gen_aicpu_init();
 
 /**
+ * Name this run's terminal bank — the address of its first producer entry,
+ * resolved by the host from the identity that reserved it.
+ *
+ * A zero address is the default path: the host owns the counter reset and reads
+ * the live counters, exactly as it does without retention.
+ *
+ * C linkage because the sim runner reaches it by `dlsym` into the AICPU SO,
+ * the same way it reaches `set_platform_dep_gen_base`.
+ */
+extern "C" void set_platform_dep_gen_run_terminal(uint64_t bank);
+
+/**
+ * Settle this run's accounting into its terminal entry, after every path that
+ * can still change a counter. A run with no identity, or with no mapped bank,
+ * publishes nothing.
+ */
+void dep_gen_aicpu_close_run();
+
+/**
  * Append a base DepGenRecord (and zero or more DepGenOverflowRecord chain
  * records) for a completed submit_task call. Switches buffer via the SPSC
  * free_queue / ready_queue protocol when the current buffer cannot hold the

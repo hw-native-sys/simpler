@@ -1,0 +1,306 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""Legacy communicator controls use child-local state, not runtime attributes."""
+
+import ctypes
+import struct
+import threading
+import time
+from contextlib import ExitStack
+from multiprocessing.shared_memory import SharedMemory
+from unittest.mock import MagicMock, call
+
+import pytest
+import simpler.worker as worker_mod
+from simpler.buffer import LocalEndpointBufferIdentityAllocator
+from simpler.comm_provider import (
+    DeviceAllocationTarget,
+    ProviderRegionStore,
+    RegionAllocationContext,
+    RegionEnvironmentKind,
+)
+
+pytestmark = pytest.mark.timeout(20)
+
+
+@pytest.fixture(autouse=True, params=[1, 16384], ids=["exact-size", "page-rounded"])
+def shared_memory_granularity(monkeypatch, request):
+    shared_memory = SharedMemory
+
+    def allocate(*, create, size):
+        granularity = request.param
+        rounded_size = ((size + granularity - 1) // granularity) * granularity
+        return shared_memory(create=create, size=rounded_size)
+
+    monkeypatch.setattr(f"{__name__}.SharedMemory", allocate)
+
+
+def _run_controls(
+    _monkeypatch,
+    init_results,
+    commands,
+    *,
+    workspace_mask=0,
+    urma_jetties=1,
+    urma_sq_depth=0,
+    ccu_mode=1,
+    host_shm_name="",
+    abort_initialization=False,
+):
+    cw = MagicMock(
+        spec_set=(
+            "comm_init",
+            "comm_alloc_domain_windows",
+            "comm_release_domain_windows",
+            "comm_abort_domain_windows",
+            "set_exported_device_regions_live",
+            "_stop_chip_run_lane_admission",
+            "_close_chip_run_lane",
+        )
+    )
+    cw.comm_init.side_effect = init_results
+    cw.comm_alloc_domain_windows.return_value = (0xC7, 0xB000, 4096)
+    responses = []
+    owner = worker_mod.mint_owner_instance_id()
+    store = ProviderRegionStore(
+        RegionAllocationContext(environment_kind=RegionEnvironmentKind.SIM, target=DeviceAllocationTarget(0)),
+        identity_allocator=LocalEndpointBufferIdentityAllocator(owner),
+    )
+    with ExitStack() as stack:
+
+        def allocate(size):
+            shm = SharedMemory(create=True, size=size)
+            stack.callback(shm.unlink)
+            stack.callback(shm.close)
+            return shm
+
+        rootinfo_path = b"/shared/rootinfo\0"
+        init_request = allocate(worker_mod._COMM_INIT_HEADER.size + len(rootinfo_path))
+        init_buf = init_request.buf
+        assert init_buf is not None
+        worker_mod._COMM_INIT_HEADER.pack_into(init_buf, 0, 0, 1)
+        path_offset = worker_mod._COMM_INIT_HEADER.size
+        init_buf[path_offset : path_offset + len(rootinfo_path)] = rootinfo_path
+        domain_request = allocate(worker_mod._DOMAIN_REQ_HEADER.size + 4 + (32 if host_shm_name else 0))
+        domain_buf = domain_request.buf
+        assert domain_buf is not None
+        worker_mod._DOMAIN_REQ_HEADER.pack_into(domain_buf, 0, 7, 1, 0, 64, 0)
+        struct.pack_into("<I", domain_buf, worker_mod._DOMAIN_WORKSPACE_MASK_OFFSET, workspace_mask)
+        worker_mod._DOMAIN_WORKSPACE_CONFIG.pack_into(
+            domain_buf, worker_mod._DOMAIN_WORKSPACE_CONFIG_OFFSET, urma_jetties, urma_sq_depth, ccu_mode
+        )
+        struct.pack_into("<I", domain_buf, worker_mod._DOMAIN_REQ_HEADER.size, 0)
+        if host_shm_name:
+            struct.pack_into("32s", domain_buf, worker_mod._DOMAIN_REQ_HEADER.size + 4, host_shm_name.encode("ascii"))
+        release_request = allocate(worker_mod._DOMAIN_REQ_HEADER.size)
+        release_buf = release_request.buf
+        assert release_buf is not None
+        worker_mod._DOMAIN_REQ_HEADER.pack_into(release_buf, 0, 7, 1, 0, int(abort_initialization), 0)
+        reply = allocate(worker_mod._DOMAIN_REPLY_HEADER.size)
+        with memoryview(bytearray(worker_mod.mailbox_size(1))) as mailbox:
+            address = ctypes.addressof(ctypes.c_char.from_buffer(mailbox))
+
+            errors = []
+            stopped = threading.Event()
+            state_addr = address + worker_mod._OFF_STATE
+
+            def submit_controls():
+                try:
+                    for command in commands:
+                        requests = {
+                            worker_mod._CTRL_COMM_INIT: init_request,
+                            worker_mod._CTRL_ALLOC_DOMAIN: domain_request,
+                            worker_mod._CTRL_RELEASE_DOMAIN: release_request,
+                        }
+                        request = requests[command]
+                        for offset, name in (
+                            (worker_mod._OFF_ARGS, request.name),
+                            (worker_mod._OFF_ARGS + worker_mod._CTRL_SHM_NAME_BYTES, reply.name),
+                        ):
+                            mailbox[offset : offset + worker_mod._CTRL_SHM_NAME_BYTES] = name.encode().ljust(
+                                worker_mod._CTRL_SHM_NAME_BYTES, b"\0"
+                            )
+                        struct.pack_into("Q", mailbox, worker_mod._OFF_CALLABLE, command)
+                        worker_mod._mailbox_store_i32(state_addr, worker_mod._CONTROL_REQUEST)
+                        deadline = time.monotonic() + 5.0
+                        while worker_mod._mailbox_load_i32(state_addr) != worker_mod._CONTROL_DONE:
+                            assert time.monotonic() < deadline, "communicator control was not acknowledged"
+                            assert worker_mod._mailbox_load_i32(state_addr) != worker_mod._SHUTDOWN
+                            assert not stopped.wait(0.001), "communicator control loop stopped before acknowledgment"
+                        code = struct.unpack_from("i", mailbox, worker_mod._OFF_ERROR)[0]
+                        responses.append((code, worker_mod._read_error_msg(mailbox)))
+                        worker_mod._mailbox_store_i32(state_addr, worker_mod._IDLE)
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    worker_mod._request_child_shutdown(mailbox)
+
+            producer = threading.Thread(target=submit_controls)
+            producer.start()
+            try:
+                worker_mod._run_chip_main_loop(
+                    cw,
+                    mailbox,
+                    address,
+                    state_addr,
+                    0,
+                    {},
+                    {},
+                    {},
+                    owner,
+                    chip_platform="a2a3sim",
+                    provider_region_store=store,
+                )
+            finally:
+                worker_mod._request_child_shutdown(mailbox)
+                stopped.set()
+                producer.join(timeout=6.0)
+                assert not producer.is_alive(), "communicator control producer outlived its mailbox"
+            if errors:
+                raise errors[0]
+            assert len(responses) == len(commands)
+            cw._stop_chip_run_lane_admission.assert_called_once_with()
+            cw._close_chip_run_lane.assert_called_once_with()
+            cw.assert_has_calls([call._stop_chip_run_lane_admission(), call._close_chip_run_lane()])
+        reply_buf = reply.buf
+        assert reply_buf is not None
+        published = worker_mod._DOMAIN_REPLY_HEADER.unpack_from(reply_buf, 0)
+    return cw, responses, published
+
+
+def test_unpublished_domain_abort_reaches_the_creating_chip(monkeypatch):
+    cw, responses, _ = _run_controls(
+        monkeypatch,
+        [0x1234],
+        [worker_mod._CTRL_COMM_INIT, worker_mod._CTRL_RELEASE_DOMAIN],
+        abort_initialization=True,
+    )
+    assert responses == [(0, "")] * 2
+    cw.comm_abort_domain_windows.assert_called_once_with(0x1234, 7, 1, 0)
+    cw.comm_release_domain_windows.assert_not_called()
+
+
+def test_bootstrap_handle_is_forwarded_without_mutating_runtime(monkeypatch):
+    cw, responses, published = _run_controls(
+        monkeypatch,
+        [0x1234, 0x1234],
+        [
+            worker_mod._CTRL_COMM_INIT,
+            worker_mod._CTRL_COMM_INIT,
+            worker_mod._CTRL_ALLOC_DOMAIN,
+            worker_mod._CTRL_RELEASE_DOMAIN,
+        ],
+    )
+    assert responses == [(0, "")] * 4
+    assert cw.comm_init.call_args_list == [call(0, 1, "/shared/rootinfo")] * 2
+    allocated = cw.comm_alloc_domain_windows.call_args.args
+    assert allocated[:5] == (0x1234, 7, [0], 0, 64)
+    assert allocated[5] != 0
+    assert cw.comm_alloc_domain_windows.call_args.kwargs == {
+        "workspace_mask": 0,
+        "urma_jetties_per_aiv": 1,
+        "urma_sq_depth": 0,
+        "ccu_mode": 1,
+    }
+    cw.comm_release_domain_windows.assert_called_once_with(0x1234, 7, 1, 0)
+    assert published == (1, 0xC7, 0xB000, 4096, 0)
+
+    cold, refused, _ = _run_controls(monkeypatch, [], [worker_mod._CTRL_ALLOC_DOMAIN, worker_mod._CTRL_RELEASE_DOMAIN])
+    assert all(code == 1 and "CTRL_COMM_INIT must succeed first" in message for code, message in refused)
+    cold.comm_init.assert_not_called()
+    cold.comm_alloc_domain_windows.assert_not_called()
+    cold.comm_release_domain_windows.assert_not_called()
+
+
+@pytest.mark.parametrize("workspace_mask", [1, 2, 3, 4])
+def test_async_workspace_mask_reaches_native_unmodified(monkeypatch, workspace_mask):
+    cw, responses, _ = _run_controls(
+        monkeypatch,
+        [0x1234],
+        [worker_mod._CTRL_COMM_INIT, worker_mod._CTRL_ALLOC_DOMAIN],
+        workspace_mask=workspace_mask,
+    )
+    assert responses == [(0, "")] * 2
+    assert cw.comm_alloc_domain_windows.call_args.kwargs == {
+        "workspace_mask": workspace_mask,
+        "urma_jetties_per_aiv": 1,
+        "urma_sq_depth": 0,
+        "ccu_mode": 1,
+    }
+
+
+@pytest.mark.parametrize("failed_init", [0, RuntimeError("init failed")])
+def test_failed_bootstrap_rejects_domain_controls_until_retry(monkeypatch, failed_init):
+    cw, responses, _ = _run_controls(
+        monkeypatch,
+        [failed_init, 0x2345],
+        [
+            worker_mod._CTRL_ALLOC_DOMAIN,
+            worker_mod._CTRL_RELEASE_DOMAIN,
+            worker_mod._CTRL_COMM_INIT,
+            worker_mod._CTRL_ALLOC_DOMAIN,
+            worker_mod._CTRL_RELEASE_DOMAIN,
+            worker_mod._CTRL_COMM_INIT,
+            worker_mod._CTRL_ALLOC_DOMAIN,
+            worker_mod._CTRL_RELEASE_DOMAIN,
+        ],
+    )
+    assert all(
+        code == 1 and "CTRL_COMM_INIT must succeed first" in message
+        for code, message in [responses[i] for i in (0, 1, 3, 4)]
+    )
+    assert responses[2][0] == 1
+    assert ("returned 0 handle" if failed_init == 0 else "init failed") in responses[2][1]
+    assert responses[5:] == [(0, "")] * 3
+    assert cw.comm_alloc_domain_windows.call_count == 1
+    cw.comm_release_domain_windows.assert_called_once_with(0x2345, 7, 1, 0)
+    assert cw.comm_alloc_domain_windows.call_args.args[0] == 0x2345
+
+
+@pytest.mark.parametrize("failed_init", [0, RuntimeError("retry failed")])
+def test_failed_reinitialization_preserves_the_established_handle(monkeypatch, failed_init):
+    cw, responses, _ = _run_controls(
+        monkeypatch,
+        [0x3456, failed_init],
+        [
+            worker_mod._CTRL_COMM_INIT,
+            worker_mod._CTRL_COMM_INIT,
+            worker_mod._CTRL_ALLOC_DOMAIN,
+            worker_mod._CTRL_RELEASE_DOMAIN,
+        ],
+    )
+    assert responses[0] == (0, "")
+    assert responses[1][0] == 1
+    assert ("returned 0 handle" if failed_init == 0 else "retry failed") in responses[1][1]
+    assert responses[2:] == [(0, "")] * 2
+    assert cw.comm_alloc_domain_windows.call_args.args[0] == 0x3456
+    cw.comm_release_domain_windows.assert_called_once_with(0x3456, 7, 1, 0)
+
+
+@pytest.mark.parametrize("ccu_mode", [0, 1])
+@pytest.mark.parametrize("host_shm_name", ["", "host_config_window"])
+def test_workspace_configuration_survives_child_control(monkeypatch, host_shm_name, ccu_mode):
+    cw, responses, _ = _run_controls(
+        monkeypatch,
+        [0x1234],
+        [worker_mod._CTRL_COMM_INIT, worker_mod._CTRL_ALLOC_DOMAIN],
+        workspace_mask=3,
+        urma_jetties=2,
+        urma_sq_depth=512,
+        ccu_mode=ccu_mode,
+        host_shm_name=host_shm_name,
+    )
+    assert responses == [(0, "")] * 2
+    assert cw.comm_alloc_domain_windows.call_args.kwargs == {
+        **({"host_shm_name": host_shm_name} if host_shm_name else {}),
+        "workspace_mask": 3,
+        "urma_jetties_per_aiv": 2,
+        "urma_sq_depth": 512,
+        "ccu_mode": ccu_mode,
+    }

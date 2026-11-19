@@ -76,3 +76,18 @@ TEST(SimRunCompletionTest, AbandonPublishesStickyErrorAndLateCompletionCannotOve
     completion.task_finished();
     EXPECT_EQ(completion.poll(), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
 }
+
+TEST(SimRunCompletionTest, StartupFailureRemainsTheFirstErrorUntilReset) {
+    SimRunCompletion completion;
+    completion.reset(2);
+    completion.abandon(-12);
+    completion.abandon(-14);
+    completion.task_finished(-16);
+    completion.task_finished();
+    EXPECT_EQ(completion.poll(), SIMPLER_NATIVE_RUN_POLL_ERROR);
+    EXPECT_EQ(completion.first_error(), -12);
+    completion.reset(1);
+    EXPECT_EQ(completion.first_error(), 0);
+    completion.task_finished();
+    EXPECT_EQ(completion.poll(), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
+}

@@ -1,15 +1,13 @@
 # aicpu-mmio-probes
 
-AICPU-side MMIO microbenchmarks against the chip's AIC_CTRL register
-window. AICore is not involved — every number measures **what happens
+AICPU-side MMIO microbenchmarks against each chip's AICore register
+mapping. AICore is not involved — every number measures **what happens
 when the AICPU CPU issues a load / store at this MMIO address**.
 
-Reproduces three measurements from
+Reproduces the a2a3 measurements from
 [`docs/hardware/mmio-performance.md`](../../../docs/hardware/mmio-performance.md):
 
-- **Phase 4** — STR DMB burst throughput (~5 ns / STR posted) and
-  STR + LDR round-trip (~250–300 ns; the LDR drains the in-flight queue
-  because `Device-nGnRE` `nR` ordering forbids overlap).
+- **Phase 4** — STR DMB burst throughput and STR + LDR round-trip.
 - **Phase 12-A** — Single AICPU thread, 10000 LDR COND at the same
   core. Per-LDR ~95 ns; the bus round trip dominates.
 - **Phase 12-B** — Single AICPU thread, 10000 LDR COND rotating across
@@ -46,13 +44,13 @@ plumbing in `host/launch.cpp` stays untouched.
 ```text
 host launch.cpp                                        |  AICPU probes.cpp (block_dim=1)
 -------------------------------------------------------|---------------------------------
-halMemCtl(REG_AIC_CTRL) -> aic_ctrl_reg_base           |
+map AICore register bases                              |
 aclrtMalloc dev_args, dev_result                       |
 H2D dispatcher + inner SO + DeviceArgs(bootstrap)      |
 rtAicpuKernelLaunchExWithArgs(KFC, libaicpu_extend...) |
 fingerprint inner SO + JSON descriptor                 |
 rtsBinaryLoadFromFile + rtsFuncGetByName               |
-rewrite DeviceArgs(run) with reg_base + result_addr    |
+rewrite DeviceArgs(run) with register table + result_addr |
 rtsLaunchCpuKernel(run_handle)                         |
                                                        |  simpler_aicpu_run entered
                                                        |  RunPhase4: burst STR, round trip
@@ -70,7 +68,7 @@ D2H result; pretty-print Phase 4 / 12 table            |
 | `shared/probes_types.h` | `MmioProbeResult`, `MmioProbeDeviceArgs`, register offsets |
 | `device/probes.cpp` | AICPU SO, two-export contract (`simpler_aicpu_init`, `simpler_aicpu_run`), pthread Phase 12-C |
 | `device/CMakeLists.txt` | aarch64 cross-compile to `.so`, links pthread |
-| `host/launch.cpp` | Host orchestration — Path-A dispatcher bootstrap + halMemCtl + pretty-print |
+| `host/launch.cpp` | Host orchestration — Path-A dispatcher bootstrap + register mapping + pretty-print |
 | `host/CMakeLists.txt` | Host build |
 
 ## Build
@@ -112,6 +110,9 @@ Arguments:
   `vector_example` block_dim used in experiments; cap is
   `kProbeMaxCores = 8` in `shared/probes_types.h`).
 
+For a5, use the a5 dispatcher SO and export `SIMPLER_SMOKE_ARCH=a5`.
+The suite runner sets the architecture variable.
+
 ## Expected output (a3, ~50 MHz sys counter)
 
 ```text
@@ -146,9 +147,12 @@ chip-architecture doc needs an update).
 
 ## Caveats
 
-- **a2a3 register offsets** (`DMB=0xA0`, `COND=0x4C8`) are hard-coded
-  in `shared/probes_types.h`. The a5 chip uses `0xD0` / `0x5108`; flip
-  the constants there for an a5 port.
+- **Architecture-specific mapping** — a2a3 uses one AIC_CTRL window
+  (`DMB=0xA0`, `COND=0x4C8`); a5 uses per-core `halResMap` mappings
+  (`DMB=0xD0`, `COND=0x5108`). The host passes both offsets to AICPU.
+  A5 table slots match hardware core IDs across both dies, and HAL calls
+  translate ACL logical device IDs when `ASCEND_RT_VISIBLE_DEVICES` is set.
+  The a3 measurements above are examples, not a5 performance targets.
 - **kProbeMaxConcurrentReaders = 4** in `shared/probes_types.h`. A
   fuller scaling sweep up to 8 or 16 threads needs to grow that and
   the on-device result array — but watch the AICPU OS pthread limits

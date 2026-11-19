@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <optional>
 #include <string>
 #include <type_traits>
 
@@ -16,35 +17,15 @@
 
 #include "chip_worker.h"
 #include "pipeline_contract.h"
-#include "pipeline_slot_pool.h"
+#include "run_resource_arena.h"
 
 namespace {
 
-// `ChipWorker::init`'s parameter order is a caller-visible contract: the Python
-// binding passes positionally, so a parameter inserted rather than appended
-// silently changes what an existing call means. Pinning the whole signature makes
-// any reordering a build failure here instead of a runtime mystery; a genuinely
-// intended change updates this alias and says so.
-// Appended (never inserted) since the last revision: `sdma_warmup_path`, the
-// vector-only ELF used to warm the SDMA control path during init-time workspace
-// provisioning; `dfx_session`, the opt-in that keeps one diagnostic collection
-// session across this chip's runs instead of rebuilding it at every run
-// boundary; and `workspace_budget_bytes`, the finite budget that puts this
-// context's retained temporary buffer and three pooled arena regions under one
-// owner. Zero means no finite budget, which is separate from whether those
-// four regions have an owner at all: the onboard program init entry installs
-// one for every caller, so `manage_workspace`, the last parameter, is accepted
-// and ignored.
-// Retyped in place, not moved: the async-DMA parameter is `bool enable_sdma`
-// rather than a DmaWorkspaceKind bitmask. SDMA is the only engine a caller can
-// decline, so a set was never the question being asked; every other supported
-// engine is provisioned unconditionally.
-// Appended last: `requested_pipeline_depth`, how many native run-resource sets this context may
-// hold at once. Zero takes whatever the runtime publishes; a positive value is clamped to that
-// maximum, and the grant is latched before any per-slot storage is built.
+// The binding passes the existing parameters positionally. Borrowed context
+// generation is appended and optional; an insertion would change those callers.
 using ExpectedChipWorkerInit = void (ChipWorker::*)(
     const std::string &, const std::string &, const std::string &, const std::string &, int, const CallConfig *, bool,
-    const std::string &, const std::string &, bool, uint64_t, bool, uint32_t
+    const std::string &, const std::string &, bool, uint64_t, bool, uint32_t, std::optional<uint64_t>
 );
 static_assert(
     std::is_same_v<decltype(&ChipWorker::init), ExpectedChipWorkerInit>,
@@ -110,12 +91,17 @@ TEST(PipelineContract, AcceptsDepthTwoAndDerivesResourceCopies) {
     EXPECT_EQ(pipeline_resource_slot(c, c.resources[2], second_slot), 0u);
 }
 
-TEST(PipelineContract, RejectsDepthOutsideSupportedRange) {
+TEST(PipelineContract, RejectsNoDepthAndAcceptsAnyDeclaredOne) {
     PipelineContract c = accepted_contract();
     c.pipeline_depth = 0;
     EXPECT_FALSE(is_valid_pipeline_contract(&c));
-    c.pipeline_depth = PTO_PIPELINE_MAX_DEPTH + 1;
-    EXPECT_FALSE(is_valid_pipeline_contract(&c));
+    // A declaration is what a runtime says it can support, not a count anything
+    // commits to, so there is no upper bound to reject against: what a context
+    // uses is the grant, and every per-run resource is built to that.
+    c.pipeline_depth = 64;
+    EXPECT_TRUE(is_valid_pipeline_contract(&c));
+    c.pipeline_depth = UINT32_MAX;
+    EXPECT_TRUE(is_valid_pipeline_contract(&c));
 }
 
 TEST(PipelineContract, RejectsAnOutOfRangeKindOrClass) {
@@ -262,7 +248,8 @@ TEST(PipelineContract, KernelByteRulesAreModeSpecific) {
 }
 
 TEST(PipelineContract, KernelPerRunImagesMayBeSizedAtBind) {
-    PipelineContract c{PTO_PIPELINE_CONTRACT_ABI_VERSION, 4, PTO_PIPELINE_MAX_DEPTH, {}};
+    constexpr uint32_t kDeclaredDepth = 3;
+    PipelineContract c{PTO_PIPELINE_CONTRACT_ABI_VERSION, 4, kDeclaredDepth, {}};
     c.resources[0] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_HOST_PER_RUN, 0};
     c.resources[1] = {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_HOST_PER_RUN, 0};
     c.resources[2] = {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0};
@@ -270,7 +257,7 @@ TEST(PipelineContract, KernelPerRunImagesMayBeSizedAtBind) {
     EXPECT_TRUE(is_valid_pipeline_contract(&c, SIMPLER_MODE_KERNEL));
     EXPECT_TRUE(has_serviceable_arena_topology(c));
     EXPECT_TRUE(has_serviceable_stream_topology(c));
-    EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[0]), PTO_PIPELINE_MAX_DEPTH);
+    EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[0]), kDeclaredDepth);
     c.resources[0].resource_class = PTO_PIPELINE_DEVICE_SCRATCH;
     EXPECT_FALSE(is_valid_pipeline_contract(&c, SIMPLER_MODE_KERNEL));
 }
@@ -297,8 +284,8 @@ TEST(PipelineContract, KernelRequiresExactlyItsSupportedResourceShape) {
     EXPECT_TRUE(is_valid_tmr_kernel_pipeline_contract(&invalid));
     invalid.pipeline_depth = 0;
     EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&invalid));
-    invalid.pipeline_depth = PTO_PIPELINE_MAX_DEPTH + 1;
-    EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&invalid));
+    invalid.pipeline_depth = 64;
+    EXPECT_TRUE(is_valid_tmr_kernel_pipeline_contract(&invalid));
     invalid = c;
     invalid.resource_count = PTO_PIPELINE_MAX_RESOURCES + 1;
     EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&invalid));
@@ -354,54 +341,134 @@ TEST(PipelineContract, CommonKernelAdmissionDoesNotRequireTmrResourceSet) {
     EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&c));
 }
 
-TEST(PipelineSlotPool, DepthOneKeepsLegacySingleSlotBehavior) {
-    PipelineSlotPool pool(1);
-    auto first = pool.try_acquire();
+TEST(RunResourceArena, OneSetKeepsLegacySingleSlotBehavior) {
+    RunResourceArena arena(1);
+    auto first = arena.try_acquire();
     ASSERT_TRUE(first.has_value());
     EXPECT_EQ(first->slot_id, 0u);
-    EXPECT_FALSE(pool.try_acquire().has_value());
-    EXPECT_TRUE(pool.release(*first));
+    EXPECT_FALSE(arena.try_acquire().has_value());
+    EXPECT_TRUE(arena.release(*first));
 }
 
-TEST(PipelineSlotPool, DepthTwoProvidesExactlyTwoIndependentLeases) {
-    PipelineSlotPool pool(2);
-    auto first = pool.try_acquire();
-    auto second = pool.try_acquire();
+TEST(RunResourceArena, TwoSetsProvideExactlyTwoIndependentLeases) {
+    RunResourceArena arena(2);
+    auto first = arena.try_acquire();
+    auto second = arena.try_acquire();
     ASSERT_TRUE(first.has_value());
     ASSERT_TRUE(second.has_value());
     EXPECT_NE(first->slot_id, second->slot_id);
-    EXPECT_FALSE(pool.try_acquire().has_value());
-    EXPECT_TRUE(pool.owns(*first));
-    EXPECT_TRUE(pool.owns(*second));
+    EXPECT_FALSE(arena.try_acquire().has_value());
+    EXPECT_TRUE(arena.owns(*first));
+    EXPECT_TRUE(arena.owns(*second));
 }
 
-TEST(PipelineSlotPool, AdmissionDepthCanConservativelyLimitACapablePool) {
-    PipelineSlotPool pool(2);
-    auto first = pool.try_acquire(/*admission_depth=*/1);
+TEST(RunResourceArena, AdmissionDepthCanConservativelyLimitACapableArena) {
+    RunResourceArena arena(2);
+    auto first = arena.try_acquire(/*admission_depth=*/1);
     ASSERT_TRUE(first.has_value());
     EXPECT_EQ(first->slot_id, 0u);
-    EXPECT_FALSE(pool.try_acquire(/*admission_depth=*/1).has_value());
-    EXPECT_TRUE(pool.release(*first));
-    EXPECT_THROW((void)pool.try_acquire(/*admission_depth=*/3), std::invalid_argument);
+    EXPECT_FALSE(arena.try_acquire(/*admission_depth=*/1).has_value());
+    EXPECT_TRUE(arena.release(*first));
+    EXPECT_THROW((void)arena.try_acquire(/*admission_depth=*/3), std::invalid_argument);
 }
 
-TEST(PipelineSlotPool, StaleGenerationCannotAccessOrReleaseAReusedSlot) {
-    PipelineSlotPool pool(1);
-    const PipelineSlotLease first = *pool.try_acquire();
-    ASSERT_TRUE(pool.release(first));
-    EXPECT_TRUE(pool.release(first));  // idempotent before reuse
+TEST(RunResourceArena, StaleGenerationCannotAccessOrReleaseAReusedSet) {
+    RunResourceArena arena(1);
+    const PipelineSlotLease first = *arena.try_acquire();
+    ASSERT_TRUE(arena.release(first));
+    EXPECT_TRUE(arena.release(first));  // idempotent before reuse
 
-    const PipelineSlotLease replacement = *pool.try_acquire();
+    const PipelineSlotLease replacement = *arena.try_acquire();
     ASSERT_EQ(replacement.slot_id, first.slot_id);
     ASSERT_GT(replacement.generation, first.generation);
-    EXPECT_FALSE(pool.owns(first));
-    EXPECT_FALSE(pool.release(first));
-    EXPECT_TRUE(pool.owns(replacement));
-    EXPECT_TRUE(pool.release(replacement));
+    EXPECT_FALSE(arena.owns(first));
+    EXPECT_FALSE(arena.release(first));
+    EXPECT_TRUE(arena.owns(replacement));
+    EXPECT_TRUE(arena.release(replacement));
+}
+
+// No ceiling: a grant is whatever the context was granted, and every set in it
+// is a set a run can actually hold.
+TEST(RunResourceArena, AGrantFarAboveTheOldCeilingHandsOutEverySet) {
+    constexpr uint32_t kGranted = 64;
+    RunResourceArena arena(kGranted);
+    EXPECT_EQ(arena.granted(), kGranted);
+    EXPECT_EQ(arena.free_count(), kGranted);
+
+    std::vector<PipelineSlotLease> held;
+    for (uint32_t i = 0; i < kGranted; ++i) {
+        auto lease = arena.try_acquire();
+        ASSERT_TRUE(lease.has_value()) << "set " << i << " of the grant was not available";
+        held.push_back(*lease);
+    }
+    EXPECT_FALSE(arena.try_acquire().has_value());
+    EXPECT_EQ(arena.live_count(), kGranted);
+    EXPECT_EQ(arena.free_count(), 0u);
+    for (const PipelineSlotLease &lease : held) {
+        EXPECT_TRUE(arena.release(lease));
+    }
+    EXPECT_EQ(arena.free_count(), kGranted);
+}
+
+// The three counts always partition the grant, and a quarantined set stays in
+// it: a context cannot buy itself more concurrency by failing.
+TEST(RunResourceArena, QuarantineWithdrawsASetWithoutLoweringTheGrant) {
+    RunResourceArena arena(3);
+    const PipelineSlotLease first = *arena.try_acquire();
+    const PipelineSlotLease second = *arena.try_acquire();
+    EXPECT_EQ(arena.live_count(), 2u);
+    EXPECT_EQ(arena.free_count(), 1u);
+    EXPECT_EQ(arena.quarantined_count(), 0u);
+
+    ASSERT_TRUE(arena.quarantine(first));
+    EXPECT_EQ(arena.quarantined_count(), 1u);
+    EXPECT_EQ(arena.live_count(), 1u);
+    EXPECT_EQ(arena.free_count(), 1u);
+    EXPECT_TRUE(arena.quarantined(first.slot_id));
+    EXPECT_EQ(arena.free_count() + arena.live_count() + arena.quarantined_count(), arena.granted());
+
+    // Never handed out again, and never released back into service.
+    EXPECT_FALSE(arena.release(first));
+    const PipelineSlotLease third = *arena.try_acquire();
+    EXPECT_NE(third.slot_id, first.slot_id);
+    EXPECT_FALSE(arena.try_acquire().has_value()) << "the quarantined set was handed to a run";
+    EXPECT_TRUE(arena.release(second));
+    EXPECT_TRUE(arena.release(third));
+    EXPECT_EQ(arena.free_count(), 2u);
+    EXPECT_EQ(arena.quarantined_count(), 1u);
+}
+
+// A grant settled after construction resizes the arena, but only while no set
+// has been handed out: an index whose meaning changed under a live run is a
+// different resource, not a bigger capacity.
+TEST(RunResourceArena, RegrantIsRefusedOnceASetHasBeenHandedOut) {
+    RunResourceArena arena(kDefaultRunResourceSets);
+    arena.regrant(8);
+    EXPECT_EQ(arena.granted(), 8u);
+    EXPECT_EQ(arena.free_count(), 8u);
+
+    const PipelineSlotLease lease = *arena.try_acquire();
+    EXPECT_THROW(arena.regrant(16), std::logic_error);
+    EXPECT_TRUE(arena.release(lease));
+    EXPECT_THROW(arena.regrant(16), std::logic_error) << "a reused generation was forgotten by a regrant";
+    EXPECT_THROW(arena.regrant(0), std::invalid_argument);
+}
+
+// The filter is sized by the grant, so a set beyond it is refused rather than
+// silently admitted against an index nobody owns.
+TEST(PipelineSlotGenerationFilter, SizingTracksTheGrant) {
+    PipelineSlotGenerationFilter filter;
+    EXPECT_FALSE(filter.is_admissible(PipelineSlotLease{0, 0, 1})) << "an unsized filter admitted a lease";
+    filter.resize(5);
+    EXPECT_TRUE(filter.admit(PipelineSlotLease{4, 0, 1}));
+    EXPECT_FALSE(filter.admit(PipelineSlotLease{5, 0, 1}));
+    filter.reset();
+    EXPECT_TRUE(filter.admit(PipelineSlotLease{4, 0, 1}));
 }
 
 TEST(PipelineSlotGenerationFilter, CompatibilityPreviewDoesNotConsumeGeneration) {
     PipelineSlotGenerationFilter filter;
+    filter.resize(kDefaultRunResourceSets);
     const PipelineSlotLease retried{1, 0, 2};
 
     EXPECT_TRUE(filter.is_admissible(retried));
@@ -411,6 +478,7 @@ TEST(PipelineSlotGenerationFilter, CompatibilityPreviewDoesNotConsumeGeneration)
 
 TEST(PipelineSlotGenerationFilter, CommitRechecksGenerationAfterCompatibilityPreview) {
     PipelineSlotGenerationFilter filter;
+    filter.resize(kDefaultRunResourceSets);
     const PipelineSlotLease delayed{0, 0, 1};
 
     EXPECT_TRUE(filter.is_admissible(delayed));
@@ -419,3 +487,20 @@ TEST(PipelineSlotGenerationFilter, CommitRechecksGenerationAfterCompatibilityPre
 }
 
 }  // namespace
+
+TEST(PipelineContract, OptionalAicpuRequiresExactlyTheDeclaredExecutionRoles) {
+    auto c = accepted_contract();
+    EXPECT_TRUE(has_serviceable_stream_topology(c));
+    EXPECT_FALSE(has_serviceable_stream_topology(c, false));
+    c.resources[2] = c.resources[3];
+    c.resource_count = 3;
+    EXPECT_FALSE(has_serviceable_stream_topology(c));
+    EXPECT_TRUE(has_serviceable_stream_topology(c, false));
+    c.resources[2].resource_class = PTO_PIPELINE_HOST_PER_RUN;
+    EXPECT_FALSE(has_serviceable_stream_topology(c, false));
+    c.resources[2].resource_class = PTO_PIPELINE_EXEC_HANDLE;
+    c.resource_count = 4;
+    EXPECT_FALSE(has_serviceable_stream_topology(c, false));
+    c.resource_count = 2;
+    EXPECT_FALSE(has_serviceable_stream_topology(c, false));
+}

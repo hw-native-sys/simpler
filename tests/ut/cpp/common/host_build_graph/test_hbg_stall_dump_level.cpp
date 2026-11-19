@@ -34,9 +34,9 @@ int SchedulerContext::prepare_block_for_dispatch(
 // The cold path also holds the emergency-shutdown half, which reaches the platform's
 // register entries and the graph-execution lookup. Nothing below is called by these
 // tests — only the link needs them. Weak, so a target that does link a real
-// implementation keeps it. The retirement entry differs per architecture and is
-// stubbed per target instead.
-GraphExecution *__attribute__((weak)) graph_execution_localize(ChipTaskSlotState &, const GraphImageView &) {
+// implementation keeps it. The target supplies its retirement entry separately.
+GraphExecution *__attribute__((weak))
+graph_execution_localize(ChipTaskSlotState &, const GraphImageView &, GraphArgumentStorage) {
     return nullptr;
 }
 
@@ -51,25 +51,68 @@ uint32_t __attribute__((weak)) platform_get_physical_cores_count() { return 0; }
 // sanctioned reach into its private state.
 class SchedulerContextTestPeer {
 public:
-    static void emit(SchedulerContext &context, SchedulerState &state, StallDumpReport report) {
+    static void set_completion(SchedulerContext &context, int32_t total, int32_t completed) {
+        context.total_tasks_ = total;
+        context.completed_tasks_.store(completed, std::memory_order_relaxed);
+    }
+
+    static LoopAction check_exit(SchedulerContext &context, SharedMemoryHeader &header) {
+        int32_t task_count = -1;
+        return context.check_exit_conditions(0, &header, nullptr, task_count);
+    }
+
+    static void seed_dispatch(SchedulerContext &context) {
+        auto &tracker = context.core_trackers_[0];
+        tracker.init(1);
+        tracker.set_cluster(0, 0, 1, 2);
+        tracker.change_core_state(1);
+        for (int i = 0; i < 3; ++i) {
+            auto &core = context.core_exec_states_[i];
+            core = {};
+            core.running_reg_task_id = AICPU_TASK_INVALID;
+            core.pending_reg_task_id = AICPU_TASK_INVALID;
+#if SIMPLER_DFX
+            context.physical_core_ids_[i] = 35 + i;
+#else
+            core.physical_core_id = 35 + i;
+#endif
+        }
+        auto &core = context.core_exec_states_[1];
+        core.running_reg_task_id = 5;
+        core.pending_reg_task_id = 6;
+        for (int bank = 0; bank < 2; ++bank) {
+            auto &payload = context.payload_per_core_[1][bank];
+            payload = {};
+            payload.function_bin_addr = bank == 1 ? 0x123400 : 0x567800;
+            payload.src_payload = bank == 1 ? 0 : 0x9abc00;
+        }
+    }
+
+    static void emit(SchedulerContext &context, SchedulerState &state, StallDumpReport report, int task_count = 0) {
         context.sched_ = &state;
         context.aicpu_thread_num_ = 1;
         context.active_sched_threads_ = 1;
         context.completed_tasks_.store(0, std::memory_order_relaxed);
         context.log_stall_diagnostics(
-            /*thread_idx=*/0, /*task_count=*/0, /*idle_iterations=*/480000, /*last_progress_count=*/0, report
+            /*thread_idx=*/0, task_count, /*idle_iterations=*/480000, /*last_progress_count=*/0, report
         );
+    }
+
+    static void set_running(SchedulerContext &context, ChipTaskSlotState *slot) {
+        context.cores_total_num_ = 1;
+        context.core_exec_states_[0].running_slot_state = slot;
     }
 };
 
 namespace {
 
-std::string capture_dump(StallDumpReport report) {
+std::string capture_dump(StallDumpReport report, bool with_dispatch = false) {
     auto state = std::make_unique<SchedulerState>();
     SharedMemoryTaskHeader tasks{};
     state->task_view.tasks = &tasks;
 
     SchedulerContext context;
+    if (with_dispatch) SchedulerContextTestPeer::seed_dispatch(context);
     testing::internal::CaptureStderr();
     SchedulerContextTestPeer::emit(context, *state, report);
     return testing::internal::GetCapturedStderr();
@@ -105,4 +148,73 @@ TEST(StallDumpLevelTest, APeriodicRoundStaysBehindTheLogLevel) {
     EXPECT_NE(dump.find("[INFO]"), std::string::npos) << "the periodic round is not at INFO";
     EXPECT_EQ(dump.find("[WARN]"), std::string::npos)
         << "the periodic round would reach the default log level, where its cadence floods device_log";
+}
+
+TEST(StallDumpLevelTest, ShutdownIdentifiesBothPublishedDispatchBanksAndThePhysicalCore) {
+    const std::string dump = capture_dump(StallDumpReport::Shutdown, true);
+    EXPECT_NE(dump.find("DISPATCH core=1 physical_core=36 slot=running token=5 bank=1"), std::string::npos);
+    EXPECT_NE(dump.find("function_bin_addr=0x123400 src_payload=0x0"), std::string::npos);
+    EXPECT_NE(dump.find("DISPATCH core=1 physical_core=36 slot=pending token=6 bank=0"), std::string::npos);
+    EXPECT_NE(dump.find("function_bin_addr=0x567800 src_payload=0x9abc00"), std::string::npos);
+    EXPECT_EQ(dump.find("DISPATCH core=0"), std::string::npos);
+    EXPECT_EQ(dump.find("DISPATCH core=2"), std::string::npos);
+}
+
+TEST(StallDumpLevelTest, PeriodicReportsDoNotDumpDispatchPayloads) {
+    const std::string dump = capture_dump(StallDumpReport::Periodic, true);
+    EXPECT_NE(dump.find("CLUSTER"), std::string::npos);
+    EXPECT_EQ(dump.find("DISPATCH"), std::string::npos);
+}
+
+TEST(SchedulerCompletionTest, FinalEmptyGraphCompletes) {
+    SchedulerContext context;
+    SharedMemoryHeader header{};
+    SchedulerContextTestPeer::set_completion(context, 0, 0);
+
+    EXPECT_EQ(SchedulerContextTestPeer::check_exit(context, header), LoopAction::BREAK_LOOP);
+    EXPECT_EQ(SchedulerContextTestPeer::check_exit(context, header), LoopAction::BREAK_LOOP);
+}
+
+TEST(StallDumpStateTest, DeferredTaskWaitsForAllSubtasksAndStopsCountingAfterCompletion) {
+    auto storage = std::make_unique<ChipTaskStorage>();
+    storage->task.task_id = TaskId::make_global(0);
+    storage->slot.total_required_subtasks = 2;
+    storage->slot.completed_subtasks.store(2);
+    storage->slot.mark_any_subtask_deferred();
+    std::atomic<ChipTaskState> progress{CHIP_TASK_PENDING};
+    SharedMemoryTaskHeader tasks{};
+    tasks.task_storage = storage.get();
+    tasks.task_states = &progress;
+    auto state = std::make_unique<SchedulerState>();
+    state->task_view.tasks = &tasks;
+    SchedulerContext context;
+    auto dump = [&]() {
+        testing::internal::CaptureStderr();
+        SchedulerContextTestPeer::emit(context, *state, StallDumpReport::Shutdown, 1);
+        return testing::internal::GetCapturedStderr();
+    };
+
+    const auto waiting = dump();
+    EXPECT_NE(waiting.find("state=ASYNC_WAIT"), std::string::npos) << waiting;
+    EXPECT_NE(waiting.find("scan_ready=0 scan_waiting=0 scan_running=0 scan_async_wait=1"), std::string::npos);
+    storage->slot.completed_subtasks.store(1);
+    const auto partial = dump();
+    EXPECT_NE(partial.find("state=READY"), std::string::npos) << partial;
+    EXPECT_NE(partial.find("scan_async_wait=0"), std::string::npos);
+    SchedulerContextTestPeer::set_running(context, &storage->slot);
+    EXPECT_NE(dump().find("state=RUNNING"), std::string::npos);
+    tasks.store_completed(0);
+    const auto completed = dump();
+    EXPECT_EQ(completed.find(" TASK "), std::string::npos);
+    EXPECT_NE(completed.find("scan_ready=0 scan_waiting=0 scan_running=0 scan_async_wait=0"), std::string::npos);
+}
+
+TEST(SchedulerCompletionTest, NonemptyGraphWaitsForItsLastTask) {
+    SchedulerContext context;
+    SharedMemoryHeader header{};
+    SchedulerContextTestPeer::set_completion(context, 1, 0);
+    EXPECT_EQ(SchedulerContextTestPeer::check_exit(context, header), LoopAction::NONE);
+
+    SchedulerContextTestPeer::set_completion(context, 1, 1);
+    EXPECT_EQ(SchedulerContextTestPeer::check_exit(context, header), LoopAction::BREAK_LOOP);
 }

@@ -20,6 +20,8 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
+#include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
@@ -56,10 +58,14 @@
 #include <vector>
 
 #include "arg_direction.h"
+#include "call_argument_snapshot.h"
 #include "callable.h"
 #include "callable_protocol.h"
 #include "chip_run_lane.h"
 #include "chip_worker.h"
+#include "host/caller_device_buffers.h"
+#include "host/raii_scope_guard.h"
+#include "native_submission_bind.h"
 #include "common/host_span_names.h"
 #include "common/host_span_scope.h"
 #include "common/log_clock.h"
@@ -73,6 +79,36 @@
 namespace nb = nanobind;
 
 namespace {
+
+/**
+ * Build one run's provenance from the values the chip child already holds.
+ *
+ * `owner_instance_id` is the submitting Worker's nonce, carried as `bytes`
+ * because it is `os.urandom` output: it may hold NUL and is not text, so it is
+ * copied verbatim and never decoded. Anything other than exactly
+ * `OWNER_INSTANCE_ID_BYTES` of it — including the empty `bytes` a caller passes
+ * when it has no Worker identity — leaves the nonce all-zero, which is this
+ * structure's "nothing stated" value and the only state a reader refuses to
+ * match on. A short or long nonce is therefore declined rather than padded into
+ * something that looks like an identity.
+ *
+ * Reads the Python object, so every caller builds the whole POD before it
+ * releases the GIL.
+ */
+NativeRunProvenance make_run_provenance(
+    const nb::bytes &owner_instance_id, uint32_t chip_rank, uint32_t capture_index, uint32_t task_slot,
+    uint32_t group_index, uint32_t group_size
+) {
+    NativeRunProvenance provenance{};
+    if (owner_instance_id.size() != OWNER_INSTANCE_ID_BYTES) return provenance;
+    std::memcpy(provenance.owner_instance_id, owner_instance_id.c_str(), OWNER_INSTANCE_ID_BYTES);
+    provenance.chip_rank = chip_rank;
+    provenance.capture_index = capture_index;
+    provenance.task_slot = task_slot;
+    provenance.group_index = group_index;
+    provenance.group_size = group_size;
+    return provenance;
+}
 
 struct LocalAclMemLocation {
     uint32_t id{0};
@@ -109,6 +145,8 @@ public:
     int (*aclInit)(const char *){nullptr};
     int (*aclrtSetDevice)(int){nullptr};
     int (*aclrtGetDevice)(int *){nullptr};
+    int (*aclrtGetCurrentContext)(void **){nullptr};
+    int (*aclrtSetCurrentContext)(void *){nullptr};
     int (*aclrtMemcpy)(void *, size_t, const void *, size_t, int){nullptr};
     int (*aclrtMemGetAllocationGranularity)(LocalAclPhysicalMemProp *, int, size_t *){nullptr};
     int (*aclrtMallocPhysical)(void **, size_t, const LocalAclPhysicalMemProp *, uint64_t){nullptr};
@@ -132,6 +170,8 @@ public:
         aclInit = reinterpret_cast<int (*)(const char *)>(resolve_symbol("aclInit"));
         aclrtSetDevice = reinterpret_cast<int (*)(int)>(resolve_symbol("aclrtSetDevice"));
         aclrtGetDevice = reinterpret_cast<int (*)(int *)>(resolve_symbol("aclrtGetDevice"));
+        aclrtGetCurrentContext = reinterpret_cast<int (*)(void **)>(resolve_symbol("aclrtGetCurrentContext"));
+        aclrtSetCurrentContext = reinterpret_cast<int (*)(void *)>(resolve_symbol("aclrtSetCurrentContext"));
         aclrtMemcpy =
             reinterpret_cast<int (*)(void *, size_t, const void *, size_t, int)>(resolve_symbol("aclrtMemcpy"));
         aclrtMemGetAllocationGranularity = reinterpret_cast<int (*)(LocalAclPhysicalMemProp *, int, size_t *)>(
@@ -164,13 +204,31 @@ public:
             return;
         }
         int rc = aclInit(nullptr);
-        if (rc != kAclSuccess) {
+        if (rc != kAclSuccess && rc != kAclRepeatInitialize) {
             throw std::runtime_error("aclInit failed with code " + std::to_string(rc));
         }
         initialized_ = true;
     }
 
     void bind_device_with_check(int device_id) const { acl_check(aclrtSetDevice(device_id), "aclrtSetDevice"); }
+
+    void *current_context_with_check(int device_id) const {
+        const int current_device = current_device_with_check();
+        if (current_device != device_id) {
+            throw std::invalid_argument(
+                "buffer import device mismatch: expected " + std::to_string(device_id) + ", got " +
+                std::to_string(current_device)
+            );
+        }
+        void *context = nullptr;
+        acl_check(aclrtGetCurrentContext(&context), "aclrtGetCurrentContext");
+        if (context == nullptr) throw std::invalid_argument("buffer requires a current ACL context");
+        return context;
+    }
+
+    void set_context_with_check(void *context) const {
+        acl_check(aclrtSetCurrentContext(context), "aclrtSetCurrentContext");
+    }
 
     int current_device_with_check() const {
         int device_id = -1;
@@ -223,11 +281,16 @@ public:
         acl_check(aclrtMapMem(va, static_cast<size_t>(bytes), 0, handle, 0), "aclrtMapMem");
     }
 
-    void vmm_set_access_with_check(void *va, uint64_t bytes, int device_id) const {
+    // Grants read/write access to a device through `access_location_id`. The id
+    // is in the namespace the installed Runtime consumes for
+    // aclrtMemAccessDesc::location.id (A2/A3: 9.0 driver-visible, 9.3
+    // ACL-logical; #2884). A mapping's owner device already receives access
+    // from aclrtMapMem and needs no grant.
+    void vmm_set_access_with_check(void *va, uint64_t bytes, uint32_t access_location_id) const {
         LocalAclMemAccessDesc access{};
         access.flags = kAclRtMemAccessReadwrite;
         access.location.type = kAclMemLocationTypeDevice;
-        access.location.id = static_cast<uint32_t>(device_id);
+        access.location.id = access_location_id;
         acl_check(aclrtMemSetAccess(va, static_cast<size_t>(bytes), &access, 1), "aclrtMemSetAccess");
     }
 
@@ -251,10 +314,15 @@ public:
     }
 
     int vmm_unmap(void *va) const { return aclrtUnmapMem(va); }
+    void vmm_unmap_with_check(void *va) const { acl_check(vmm_unmap(va), "aclrtUnmapMem"); }
 
     int vmm_release_address(void *va) const { return aclrtReleaseMemAddress(va); }
+    void vmm_release_address_with_check(void *va) const {
+        acl_check(vmm_release_address(va), "aclrtReleaseMemAddress");
+    }
 
     int vmm_free_physical(void *handle) const { return aclrtFreePhysical(handle); }
+    void vmm_free_physical_with_check(void *handle) const { acl_check(vmm_free_physical(handle), "aclrtFreePhysical"); }
 
     void vmm_zero_bytes(void *va, uint64_t offset, uint64_t nbytes) const {
         std::vector<uint8_t> zeros(static_cast<size_t>(nbytes), 0);
@@ -283,6 +351,7 @@ public:
 
 private:
     static constexpr int kAclSuccess = 0;
+    static constexpr int kAclRepeatInitialize = 100002;
     static constexpr int kAclMemcpyHostToDevice = 1;
     static constexpr int kAclMemcpyDeviceToHost = 2;
     static constexpr int kAclMemHandleTypeNone = 0;
@@ -438,6 +507,8 @@ public:
     uint64_t shareable_handle{0};
     void *vmm_handle{nullptr};
     uint64_t mapping_bytes{0};
+    void *borrowed_context{nullptr};
+    bool vmm_mapped{false};
 
     void close() {
         std::string cleanup_error;
@@ -447,7 +518,29 @@ public:
         }
     }
 
+    void close_buffer_mapping() {
+        if (device_addr == 0 && vmm_handle == nullptr) return;
+        bind_acl_device();
+        auto &api = acl_api();
+        if (vmm_mapped) {
+            api.vmm_unmap_with_check(reinterpret_cast<void *>(device_addr));
+            vmm_mapped = false;
+        }
+        if (device_addr != 0) {
+            api.vmm_release_address_with_check(reinterpret_cast<void *>(device_addr));
+            device_addr = 0;
+        }
+        if (vmm_handle != nullptr) {
+            api.vmm_free_physical_with_check(vmm_handle);
+            vmm_handle = nullptr;
+        }
+    }
+
     void bind_acl_device() const {
+        if (borrowed_context != nullptr) {
+            acl_api().set_context_with_check(borrowed_context);
+            return;
+        }
         if (device_id < 0) {
             throw std::runtime_error("onboard mapped-region handle has no device id");
         }
@@ -542,6 +635,26 @@ public:
 
 private:
     void close_collecting(std::string &cleanup_error) {
+        if (borrowed_context != nullptr) {
+            try {
+                auto &api = acl_api();
+                void *previous = nullptr;
+                if (api.aclrtGetCurrentContext(&previous) != 0 || previous == nullptr) {
+                    throw std::runtime_error("buffer cleanup requires a current ACL context");
+                }
+                auto restore = RAIIScopeGuard([&] {
+                    try {
+                        api.set_context_with_check(previous);
+                    } catch (const std::exception &error) {
+                        append_cleanup_error(cleanup_error, error.what());
+                    }
+                });
+                close_buffer_mapping();
+            } catch (const std::exception &error) {
+                append_cleanup_error(cleanup_error, error.what());
+            }
+            return;
+        }
         uint64_t mapped_addr = std::exchange(device_addr, 0);
         uint64_t mapped_bytes = std::exchange(mapping_bytes, 0);
         void *physical_handle = std::exchange(vmm_handle, nullptr);
@@ -857,7 +970,7 @@ RegionHandle import_sim_region(
 
 RegionHandle import_onboard_region(
     int device_id, uint64_t shareable_handle, uint64_t mapping_bytes, const std::string &owner_token,
-    const char *device_error, const char *size_error, const char *owner_error
+    const char *device_error, const char *size_error, const char *owner_error, void *borrowed_context = nullptr
 ) {
     if (device_id < 0) {
         throw std::invalid_argument(device_error);
@@ -872,16 +985,44 @@ RegionHandle import_onboard_region(
     auto mapping = std::make_unique<RegionMapping>();
     mapping->owner_token = owner_token;
     mapping->profile = RegionMappingProfile::OnboardVmm;
+    mapping->borrowed_context = borrowed_context;
     mapping->device_id = device_id;
     mapping->mapping_bytes = mapping_bytes;
-    mapping->bind_acl_device();
-    AclRuntimeApi &api = acl_api();
-    mapping->shareable_handle = shareable_handle;
-    mapping->vmm_handle = api.vmm_import_shareable_with_check(shareable_handle, device_id);
-    void *mapped_addr = api.vmm_reserve_with_check(mapping_bytes);
-    mapping->device_addr = reinterpret_cast<uint64_t>(mapped_addr);
-    api.vmm_map_with_check(mapped_addr, mapping_bytes, mapping->vmm_handle);
-    api.vmm_set_access_with_check(mapped_addr, mapping_bytes, device_id);
+    auto map_region = [&](RegionMapping &region) {
+        region.bind_acl_device();
+        auto &api = acl_api();
+        region.shareable_handle = shareable_handle;
+        region.vmm_handle = api.vmm_import_shareable_with_check(shareable_handle, device_id);
+        void *mapped_addr = api.vmm_reserve_with_check(mapping_bytes);
+        region.device_addr = reinterpret_cast<uint64_t>(mapped_addr);
+        api.vmm_map_with_check(mapped_addr, mapping_bytes, region.vmm_handle);
+        // MapMem grants access to the importing device.
+        region.vmm_mapped = true;
+    };
+    if (borrowed_context != nullptr) {
+        // Register before acquiring native resources so failed imports have a retry owner.
+        auto *pending = mapping.get();
+        uint64_t handle = region_registry().emplace(std::move(mapping));
+        RegionHandle owner(handle, std::move(handle_owner_token));
+        try {
+            map_region(*pending);
+        } catch (const std::exception &error) {
+            try {
+                pending->close_buffer_mapping();
+            } catch (const std::exception &cleanup) {
+                nb::object failure =
+                    nb::module_::import_("builtins")
+                        .attr("RuntimeError")(std::string(error.what()) + "; import cleanup: " + cleanup.what());
+                failure.attr("_buffer_mapping_handle") = nb::cast(std::move(owner));
+                PyErr_SetObject(PyExc_RuntimeError, failure.ptr());
+                throw nb::python_error();
+            }
+            region_registry().close(handle);
+            throw;
+        }
+        return owner;
+    }
+    map_region(*mapping);
     uint64_t handle = region_registry().emplace(std::move(mapping));
     return RegionHandle(handle, std::move(handle_owner_token));
 }
@@ -916,7 +1057,6 @@ enum class RegionVmmStage {
     PhysicalAlloc,
     VaReserve,
     Map,
-    SetAccess,
     Export,
     Unmap,
     VaRelease,
@@ -946,7 +1086,6 @@ struct RegionVmmInspect {
     bool physical_allocated{false};
     bool va_reserved{false};
     bool mapped{false};
-    bool access_set{false};
     bool exported{false};
     bool unmap_attempted{false};
     bool unmap_complete{false};
@@ -960,6 +1099,7 @@ struct RegionVmmInspect {
 };
 
 struct RegionVmmAllocation {
+    void *borrowed_context{nullptr};
     int device_id{-1};
     void *physical_handle{nullptr};
     void *va{nullptr};
@@ -968,7 +1108,6 @@ struct RegionVmmAllocation {
     bool physical_allocated{false};
     bool va_reserved{false};
     bool mapped{false};
-    bool access_set{false};
     bool exported{false};
     bool unmap_attempted{false};
     bool unmap_complete{false};
@@ -983,8 +1122,7 @@ struct RegionVmmAllocation {
 
 struct RegionVmmTestHooks {
     bool use_fake{false};
-    std::optional<RegionVmmStage> fail_stage;
-    RegionVmmFailWhen fail_when{RegionVmmFailWhen::Before};
+    std::vector<std::pair<RegionVmmStage, RegionVmmFailWhen>> failures;
     bool unmap_already_gone{false};
     std::vector<std::string> issued_ops;
     uint64_t fake_granularity{64};
@@ -1021,8 +1159,6 @@ const char *region_vmm_stage_name(RegionVmmStage stage) {
         return "va_reserve";
     case RegionVmmStage::Map:
         return "map";
-    case RegionVmmStage::SetAccess:
-        return "set_access";
     case RegionVmmStage::Export:
         return "export";
     case RegionVmmStage::Unmap:
@@ -1051,9 +1187,6 @@ RegionVmmStage region_vmm_parse_stage(const std::string &name) {
     if (name == "map") {
         return RegionVmmStage::Map;
     }
-    if (name == "set_access") {
-        return RegionVmmStage::SetAccess;
-    }
     if (name == "export") {
         return RegionVmmStage::Export;
     }
@@ -1079,10 +1212,9 @@ void region_vmm_record_issued(const char *op) { region_vmm_test_hooks().issued_o
 
 bool region_vmm_consume_fail(RegionVmmStage stage, RegionVmmFailWhen when) {
     RegionVmmTestHooks &hooks = region_vmm_test_hooks();
-    if (!hooks.fail_stage.has_value() || *hooks.fail_stage != stage || hooks.fail_when != when) {
-        return false;
-    }
-    hooks.fail_stage.reset();
+    auto found = std::find(hooks.failures.begin(), hooks.failures.end(), std::make_pair(stage, when));
+    if (found == hooks.failures.end()) return false;
+    hooks.failures.erase(found);
     return true;
 }
 
@@ -1155,17 +1287,6 @@ void region_vmm_map(void *va, uint64_t bytes, void *handle) {
         return;
     }
     acl_api().vmm_map_with_check(va, bytes, handle);
-}
-
-void region_vmm_set_access(void *va, uint64_t bytes, int device_id) {
-    region_vmm_record_issued("set_access");
-    if (region_vmm_test_hooks().use_fake) {
-        (void)va;
-        (void)bytes;
-        (void)device_id;
-        return;
-    }
-    acl_api().vmm_set_access_with_check(va, bytes, device_id);
 }
 
 uint64_t region_vmm_export_shareable(void *handle) {
@@ -1273,7 +1394,6 @@ RegionVmmInspect region_vmm_inspect_record(uint64_t handle, const RegionVmmAlloc
     inspect.physical_allocated = record->physical_allocated;
     inspect.va_reserved = record->va_reserved;
     inspect.mapped = record->mapped;
-    inspect.access_set = record->access_set;
     inspect.exported = record->exported;
     inspect.unmap_attempted = record->unmap_attempted;
     inspect.unmap_complete = record->unmap_complete;
@@ -1330,7 +1450,11 @@ RegionVmmExport region_vmm_allocate_export(uint64_t handle, uint64_t logical_byt
     if (record.physical_allocated || record.va_reserved || record.mapped || record.exported) {
         throw std::runtime_error("region VMM allocate_export already has partial or complete state");
     }
-    region_vmm_bind_device(record.device_id);
+    if (record.borrowed_context != nullptr) {
+        acl_api().set_context_with_check(record.borrowed_context);
+    } else {
+        region_vmm_bind_device(record.device_id);
+    }
     uint64_t mapping_bytes = align_vmm_bytes(logical_bytes, region_vmm_granularity_under_lock(record.device_id));
     record.mapping_bytes = mapping_bytes;
 
@@ -1361,15 +1485,9 @@ RegionVmmExport region_vmm_allocate_export(uint64_t handle, uint64_t logical_byt
             record.mapped = true;
         }
     );
-    region_vmm_run_allocate_stage(
-        RegionVmmStage::SetAccess,
-        [&]() {
-            region_vmm_set_access(record.va, mapping_bytes, record.device_id);
-        },
-        [&]() {
-            record.access_set = true;
-        }
-    );
+    // MapMem grants read/write access to the device that owns the physical
+    // handle; this allocation relies on that owner grant and issues no
+    // explicit access grant.
     region_vmm_run_allocate_stage(
         RegionVmmStage::Export,
         [&]() {
@@ -1439,15 +1557,14 @@ void region_vmm_release(uint64_t handle) {
         return;
     }
     RegionVmmAllocation &record = it->second;
-    if (record.release_once_done) {
-        if (!record.first_cleanup_failure.empty()) {
-            throw std::runtime_error(record.first_cleanup_failure);
-        }
-        return;
-    }
+    record.first_cleanup_failure.clear();
     record.release_once_done = true;
     try {
-        region_vmm_bind_device(record.device_id);
+        if (record.borrowed_context != nullptr) {
+            acl_api().set_context_with_check(record.borrowed_context);
+        } else {
+            region_vmm_bind_device(record.device_id);
+        }
     } catch (const std::exception &exc) {
         region_vmm_note_cleanup_failure(record, std::string("bind_device failed: ") + exc.what());
         throw std::runtime_error(record.first_cleanup_failure);
@@ -1470,7 +1587,7 @@ void region_vmm_release(uint64_t handle) {
         throw std::runtime_error(record.first_cleanup_failure);
     }
 
-    if (record.va_reserved && !record.va_release_attempted) {
+    if (record.va_reserved) {
         region_vmm_run_cleanup_stage(
             record, RegionVmmStage::VaRelease, record.va_release_attempted, record.va_release_complete,
             [&]() {
@@ -1482,7 +1599,7 @@ void region_vmm_release(uint64_t handle) {
             }
         );
     }
-    if (record.physical_allocated && !record.physical_free_attempted) {
+    if (record.physical_allocated) {
         region_vmm_run_cleanup_stage(
             record, RegionVmmStage::PhysicalFree, record.physical_free_attempted, record.physical_free_complete,
             [&]() {
@@ -1505,6 +1622,51 @@ void region_vmm_release(uint64_t handle) {
     );
 }
 
+int release_shared_vmm(void *storage, void *) noexcept {
+    auto *handle = static_cast<uint64_t *>(storage);
+    try {
+        if (*handle != 0) region_vmm_release(*handle);
+        delete handle;
+        return 0;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+RegionVmmExport allocate_shared_buffer(ChipWorker &worker, uint64_t nbytes) {
+    if (!worker.supports_shareable_storage()) {
+        throw std::invalid_argument("VMM storage requires an initialized onboard ChipWorker in program mode");
+    }
+    worker.validate_execution_context();
+    void *context = acl_api().current_context_with_check(worker.device_id());
+    auto storage = std::make_unique<uint64_t>(0);
+    worker.retain_pending_storage(release_shared_vmm, storage.get());
+    auto *owned = storage.release();
+    try {
+        const auto handle = *owned = region_vmm_begin(worker.device_id());
+        {
+            std::lock_guard<std::mutex> lock(region_vmm_mu());
+            g_region_vmm_allocations().at(handle).borrowed_context = context;
+        }
+        auto result = region_vmm_allocate_export(handle, nbytes);
+        worker.adopt_shared_buffer(result.device_addr, nbytes, result.mapping_bytes, release_shared_vmm, owned);
+        return result;
+    } catch (const std::exception &error) {
+        try {
+            worker.release_pending_storage(owned);
+        } catch (const std::exception &cleanup) {
+            std::string detail = cleanup.what();
+            {
+                std::lock_guard<std::mutex> lock(region_vmm_mu());
+                auto found = g_region_vmm_allocations().find(*owned);
+                if (found != g_region_vmm_allocations().end()) detail += ": " + found->second.first_cleanup_failure;
+            }
+            throw std::runtime_error(std::string(error.what()) + "; rollback retained by Worker: " + detail);
+        }
+        throw;
+    }
+}
+
 void region_vmm_zero_range(uint64_t handle, uint64_t offset, uint64_t nbytes) {
     std::lock_guard<std::mutex> lk(region_vmm_mu());
     auto it = g_region_vmm_allocations().find(handle);
@@ -1519,7 +1681,11 @@ void region_vmm_zero_range(uint64_t handle, uint64_t offset, uint64_t nbytes) {
     if (end < offset || end > record.mapping_bytes) {
         throw std::invalid_argument("region VMM zero_bytes range exceeds mapping_bytes");
     }
-    region_vmm_bind_device(record.device_id);
+    if (record.borrowed_context != nullptr) {
+        acl_api().set_context_with_check(record.borrowed_context);
+    } else {
+        region_vmm_bind_device(record.device_id);
+    }
     if (region_vmm_consume_fail(RegionVmmStage::ZeroBytes, RegionVmmFailWhen::Before)) {
         region_vmm_throw_stage_failure(RegionVmmStage::ZeroBytes, "before");
     }
@@ -1577,8 +1743,7 @@ void region_vmm_test_use_fake_driver() {
 void region_vmm_test_reset_hooks() {
     std::lock_guard<std::mutex> lk(region_vmm_mu());
     RegionVmmTestHooks &hooks = region_vmm_test_hooks();
-    hooks.fail_stage.reset();
-    hooks.fail_when = RegionVmmFailWhen::Before;
+    hooks.failures.clear();
     hooks.unmap_already_gone = false;
     hooks.issued_ops.clear();
 }
@@ -1586,11 +1751,11 @@ void region_vmm_test_reset_hooks() {
 void region_vmm_test_fail_stage(const std::string &stage, const std::string &when) {
     std::lock_guard<std::mutex> lk(region_vmm_mu());
     RegionVmmTestHooks &hooks = region_vmm_test_hooks();
-    hooks.fail_stage = region_vmm_parse_stage(stage);
+    const auto failure_stage = region_vmm_parse_stage(stage);
     if (when == "before") {
-        hooks.fail_when = RegionVmmFailWhen::Before;
+        hooks.failures.emplace_back(failure_stage, RegionVmmFailWhen::Before);
     } else if (when == "after") {
-        hooks.fail_when = RegionVmmFailWhen::After;
+        hooks.failures.emplace_back(failure_stage, RegionVmmFailWhen::After);
     } else {
         throw std::invalid_argument("region VMM fail when must be before or after");
     }
@@ -1744,29 +1909,38 @@ CtypesFormat classify_ctypes_format(const char *format) {
     }
 }
 
-// Resolve one wire tensor onto a local base and build the address-bearing device POD.
-// `resolved` maps CanonicalIdentity -> (local_base, address_space); the caller populates it by
-// materializing each embedded descriptor.
-ChipTensor materialize_one(const Tensor &r, TensorTransfer transfer, nb::dict resolved) {
-    uint64_t elem = get_element_size(r.dtype);
-    if (elem == 0) {
-        throw std::runtime_error("materialize: unknown dtype");
+// Each binding belongs to one argument, including aliases with different access requests.
+ChipTensor materialize_one(const Tensor &r, TensorTransfer request, nb::tuple binding) {
+    validate_tensor(r);
+    if (binding.size() != 3) throw std::invalid_argument("materialize: expected base, address space and transfer");
+    const auto base = nb::cast<uint64_t>(binding[0]);
+    const auto space_value = nb::cast<int>(binding[1]);
+    const auto transfer_value = nb::cast<int>(binding[2]);
+    if ((space_value != static_cast<int>(AddressSpace::HOST) &&
+         space_value != static_cast<int>(AddressSpace::DEVICE)) ||
+        (transfer_value != static_cast<int>(TensorTransfer::NONE) &&
+         transfer_value != static_cast<int>(TensorTransfer::H2D))) {
+        throw std::invalid_argument("materialize: invalid execution placement or transfer");
     }
-    if (r.byte_offset % elem != 0) {
-        throw std::runtime_error("materialize: byte_offset is not a multiple of dtype size");
+    const auto space = static_cast<AddressSpace>(space_value);
+    const auto transfer = static_cast<TensorTransfer>(transfer_value);
+    const bool mapped = request == TensorTransfer::MAP;
+    if (mapped) {
+        if (r.buffer.address_space != static_cast<uint8_t>(AddressSpace::HOST) || space != AddressSpace::DEVICE ||
+            transfer != TensorTransfer::NONE) {
+            throw std::invalid_argument("materialize: MAP requires a prepared DEVICE/NONE binding");
+        }
+    } else if (space != static_cast<AddressSpace>(r.buffer.address_space) || transfer != request) {
+        throw std::invalid_argument("materialize: native binding differs from the argument request");
     }
-    nb::object key = nb::cast(r.buffer.identity);
-    if (!resolved.contains(key)) {
-        throw std::runtime_error("materialize: canonical identity not in the import registry");
+    if (const char *error = tensor_transfer_error(space, transfer)) throw std::invalid_argument(error);
+    const uint64_t extent = tensor_extent_bytes(r);
+    if (!base || base > UINT64_MAX - r.byte_offset || base + r.byte_offset > UINT64_MAX - extent) {
+        throw std::invalid_argument("materialize: invalid address range");
     }
-    nb::tuple val = nb::cast<nb::tuple>(resolved[key]);
-    auto base = nb::cast<uint64_t>(val[0]);
-    auto addr_space = nb::cast<int>(val[1]);
-    // The view origin is base + byte_offset (start_offset folded into addr); strides carry any
-    // non-row-major layout (transpose / permute / step-slice), which ChipTensor expresses natively.
     return make_tensor_strided(
         reinterpret_cast<void *>(static_cast<uintptr_t>(base + r.byte_offset)), r.shapes, r.strides, r.ndims, r.dtype,
-        static_cast<AddressSpace>(addr_space), transfer
+        space, transfer
     );
 }
 
@@ -2021,6 +2195,9 @@ NB_MODULE(_task_interface, m) {
     // silently — struct layouts differ and fields read as garbage.
     m.attr("__build_commit__") = SIMPLER_BUILD_COMMIT;
 
+    nb::exception<ExecutionContextRefused>(m, "ExecutionContextRefused", PyExc_RuntimeError);
+    nb::exception<RunPreparationRefused>(m, "RunPreparationRefused", PyExc_RuntimeError);
+
     // --- DataType enum ---
     nb::enum_<DataType>(m, "DataType")
         .value("FLOAT32", DataType::FLOAT32)
@@ -2036,7 +2213,8 @@ NB_MODULE(_task_interface, m) {
         .value("UINT32", DataType::UINT32)
         .value("FP8E4M3FN", DataType::FP8E4M3FN)  // A5 only
         .value("FP8E8M0", DataType::FP8E8M0)      // A5 only
-        .value("FP4E2M1", DataType::FP4E2M1);     // A5 only
+        .value("FP4E2M1", DataType::FP4E2M1)      // A5 only
+        .value("FP8E5M2", DataType::FP8E5M2);     // A5 only
 
     // --- Free functions ---
     m.def(
@@ -2216,7 +2394,8 @@ NB_MODULE(_task_interface, m) {
     nb::enum_<TensorTransfer>(m, "TensorTransfer", nb::is_arithmetic())
         .value("NONE", TensorTransfer::NONE)
         .value("H2D", TensorTransfer::H2D)
-        .value("D2H", TensorTransfer::D2H);
+        .value("D2H", TensorTransfer::D2H)
+        .value("MAP", TensorTransfer::MAP);
 
     nb::enum_<AccessMode>(m, "AccessMode", nb::is_arithmetic())
         .value("READ", AccessMode::READ)
@@ -2230,7 +2409,8 @@ NB_MODULE(_task_interface, m) {
         .value("REMOTE_SIDECAR", BackendKind::REMOTE_SIDECAR)
         .value("DEVICE_MALLOC", BackendKind::DEVICE_MALLOC)
         .value("FORK_COW", BackendKind::FORK_COW)
-        .value("VMM_SHAREABLE", BackendKind::VMM_SHAREABLE);
+        .value("VMM_SHAREABLE", BackendKind::VMM_SHAREABLE)
+        .value("SHARED_FD_SLICE", BackendKind::SHARED_FD_SLICE);
 
     // --- CanonicalIdentity ---
     // Equality and hashing fold exactly the three meaningful fields, so a decode with dirty wire
@@ -2762,6 +2942,31 @@ NB_MODULE(_task_interface, m) {
     // --- TaskArgs (unified vector-backed builder with per-tensor TensorArgType tags) ---
     nb::class_<TaskArgs>(m, "TaskArgs", nb::is_weak_referenceable())
         .def(nb::init<>())
+        .def(
+            "with_ccu_bindings",
+            [](const TaskArgs &self, nb::list entries) {
+                TaskArgs result = self;
+                std::vector<CcuTaskBinding> bindings;
+                for (auto entry : entries) {
+                    const auto tuple = nb::cast<nb::tuple>(entry);
+                    if (tuple.size() != 3) throw std::invalid_argument("CCU binding requires three fields");
+                    bindings.push_back(
+                        {nb::cast<uint64_t>(tuple[0]), nb::cast<uint64_t>(tuple[1]), nb::cast<uint32_t>(tuple[2]), 0}
+                    );
+                }
+                result.set_ccu_bindings(std::move(bindings));
+                return result;
+            }
+        )
+        .def(
+            "ccu_bindings",
+            [](const TaskArgs &self) {
+                nb::list result;
+                for (const auto &entry : self.ccu_bindings())
+                    result.append(nb::make_tuple(entry.allocation_id, entry.registration_id, entry.ccu_id));
+                return result;
+            }
+        )
 
         .def(
             "add_tensor",
@@ -2925,6 +3130,10 @@ NB_MODULE(_task_interface, m) {
         "Copy and validate one local submission's views, tags, requests and scalar values before binding."
     );
 
+    nb::class_<CallArgumentSnapshot>(m, "_CallArgumentSnapshot")
+        .def(nb::init<const ChipStorageTaskArgs &, const std::vector<ArgDirection> &>())
+        .def_prop_ro("args", &CallArgumentSnapshot::args, nb::rv_policy::reference_internal);
+
     // --- ProvenanceTable ---
     // The owner's live child device allocations, as the dispatch path consumes them. The Python
     // Worker writes it alongside its own registry and reads it back only through `check_dispatch`.
@@ -3009,6 +3218,38 @@ NB_MODULE(_task_interface, m) {
         nb::arg("direction"), "Return the string name of an ArgDirection."
     );
 
+    const auto parse_core_async_capability = [](const nb::object &value) {
+        CoreAsyncCapability result{};
+        if (value.is_none()) return normalize_core_async_capability(result);
+        if (!nb::isinstance<nb::dict>(value))
+            throw std::invalid_argument("async_capability must be a version-1 dictionary");
+        const auto dictionary = nb::cast<nb::dict>(value);
+        if (dictionary.size() != 4 || !dictionary.contains("version") || !dictionary.contains("mode") ||
+            !dictionary.contains("max_conditions") || !dictionary.contains("condition_types"))
+            throw std::invalid_argument("invalid async_capability fields");
+        const auto integer = [&](const char *key) -> int64_t {
+            const auto field = dictionary[key];
+            if (!PyLong_CheckExact(field.ptr()))
+                throw std::invalid_argument("async_capability fields must be integers");
+            return nb::cast<int64_t>(field);
+        };
+        const int64_t version = integer("version");
+        const int64_t count = integer("max_conditions");
+        const int64_t types = integer("condition_types");
+        if (version != 1 || count < 0 || count > 64 || types < 0 || types > 3 ||
+            !nb::isinstance<nb::str>(dictionary["mode"]))
+            throw std::invalid_argument("invalid async_capability version, mode, or bounds");
+        const auto mode = nb::cast<std::string>(dictionary["mode"]);
+        if (mode == "SYNCHRONOUS") result.mode = CoreAsyncMode::SYNCHRONOUS;
+        else if (mode == "DEFERRED") result.mode = CoreAsyncMode::DEFERRED;
+        else if (mode == "UNKNOWN") result.mode = static_cast<CoreAsyncMode>(0);
+        else throw std::invalid_argument("invalid async_capability mode");
+        result.version = 1;
+        result.max_conditions = static_cast<uint8_t>(count);
+        result.condition_types = static_cast<uint8_t>(types);
+        return normalize_core_async_capability(result);
+    };
+
     // --- PyCoreCallable wrapper ---
     struct PyCoreCallable {
         std::vector<uint8_t> buffer_;
@@ -3018,17 +3259,33 @@ NB_MODULE(_task_interface, m) {
     nb::class_<PyCoreCallable>(m, "CoreCallable")
         .def_static(
             "build",
-            [](std::vector<ArgDirection> signature, nb::bytes binary) -> PyCoreCallable {
+            [parse_core_async_capability](
+                std::vector<ArgDirection> signature, nb::bytes binary, nb::object async_capability
+            ) -> PyCoreCallable {
                 auto bin_ptr = reinterpret_cast<const void *>(binary.c_str());
                 auto bin_size = static_cast<uint32_t>(binary.size());
                 auto buf = make_callable<CORE_MAX_TENSOR_ARGS>(
-                    signature.data(), static_cast<int32_t>(signature.size()), bin_ptr, bin_size
+                    signature.data(), static_cast<int32_t>(signature.size()), bin_ptr, bin_size,
+                    parse_core_async_capability(async_capability)
                 );
                 return PyCoreCallable{std::move(buf)};
             },
-            nb::arg("signature"), nb::arg("binary"),
+            nb::arg("signature"), nb::arg("binary"), nb::arg("async_capability") = nb::none(),
             "Build a CoreCallable from a signature list and binary bytes. The dump "
             "maps signature entry i to payload slot i positionally."
+        )
+
+        .def_prop_ro(
+            "async_capability",
+            [](const PyCoreCallable &self) {
+                const auto value = normalize_core_async_capability(self.get().async_capability());
+                nb::dict result;
+                result["version"] = 1;
+                result["mode"] = value.mode == CoreAsyncMode::SYNCHRONOUS ? "SYNCHRONOUS" : "DEFERRED";
+                result["max_conditions"] = value.max_conditions;
+                result["condition_types"] = value.condition_types;
+                return result;
+            }
         )
 
         .def(
@@ -3085,10 +3342,20 @@ NB_MODULE(_task_interface, m) {
     };
 
     nb::class_<PyChipCallable>(m, "ChipCallable")
+        .def_prop_ro_static(
+            "MAX_CHILDREN",
+            [](nb::handle) {
+                return ChipCallable::MAX_CHILDREN;
+            },
+            "Maximum number of child kernels in a ChipCallable."
+        )
         .def_static(
             "build",
             [](std::vector<ArgDirection> signature, std::string func_name, nb::bytes binary,
-               std::vector<std::tuple<int32_t, PyCoreCallable>> children, std::string config_name) -> PyChipCallable {
+               std::vector<std::tuple<int32_t, PyCoreCallable>> children, std::string config_name,
+               std::vector<nb::bytes> ccu_modules) -> PyChipCallable {
+                if (binary.size() > std::numeric_limits<uint32_t>::max())
+                    throw std::invalid_argument("ChipCallable binary exceeds wire size limit");
                 auto bin_ptr = reinterpret_cast<const void *>(binary.c_str());
                 auto bin_size = static_cast<uint32_t>(binary.size());
                 auto child_count = static_cast<int32_t>(children.size());
@@ -3100,14 +3367,21 @@ NB_MODULE(_task_interface, m) {
                     child_bufs[i] = std::get<1>(children[i]).buffer_;
                 }
 
-                auto buf = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
+                std::vector<std::vector<uint8_t>> module_bytes;
+                module_bytes.reserve(ccu_modules.size());
+                for (const auto &module : ccu_modules) {
+                    const auto *begin = reinterpret_cast<const uint8_t *>(module.c_str());
+                    module_bytes.emplace_back(begin, begin + module.size());
+                }
+
+                auto buf = make_chip_callable(
                     signature.data(), static_cast<int32_t>(signature.size()), func_name.c_str(), bin_ptr, bin_size,
-                    func_ids.data(), child_bufs.data(), child_count, config_name.c_str()
+                    func_ids.data(), child_bufs.data(), child_count, config_name.c_str(), module_bytes
                 );
                 return PyChipCallable{std::move(buf)};
             },
             nb::arg("signature"), nb::arg("func_name"), nb::arg("binary"), nb::arg("children"),
-            nb::arg("config_name") = "",
+            nb::arg("config_name") = "", nb::arg("ccu_modules") = std::vector<nb::bytes>{},
             "Build a ChipCallable from signature, func_name, binary, and list of (func_id, CoreCallable) children."
         )
 
@@ -3125,6 +3399,7 @@ NB_MODULE(_task_interface, m) {
                     reinterpret_cast<const uint8_t *>(raw.c_str()),
                     reinterpret_cast<const uint8_t *>(raw.c_str()) + raw.size()
                 );
+                normalize_chip_callable_buffer(buf.data(), buf.size());
                 return PyChipCallable{std::move(buf)};
             },
             nb::arg("raw"),
@@ -3132,6 +3407,25 @@ NB_MODULE(_task_interface, m) {
             "buffer_ptr() points to (size buffer_size()). Inverse of the "
             "serialisation used to ship a ChipCallable across the L4 "
             "cascade IPC channel."
+        )
+
+        .def_prop_ro(
+            "ccu_modules",
+            [](const PyChipCallable &self) {
+                nb::list result;
+                for (const auto &module : self.get().ccu_modules())
+                    result.append(nb::bytes(reinterpret_cast<const char *>(module.data()), module.size()));
+                return result;
+            },
+            "Exact native CCU Host module bytes packaged with this callable."
+        )
+
+        .def_prop_ro(
+            "ccu_module_count",
+            [](const PyChipCallable &self) {
+                return self.get().ccu_module_count();
+            },
+            "Number of native CCU Host modules packaged with this callable."
         )
 
         .def(
@@ -3208,15 +3502,10 @@ NB_MODULE(_task_interface, m) {
                 // Reconstruct a PyCoreCallable by copying the child's raw bytes
                 auto offset = parent.child_offset(i);
                 const uint8_t *child_start = reinterpret_cast<const uint8_t *>(parent.storage_ + offset);
-                // Determine child size: from offset to next child or end of buffer
-                size_t child_size;
-                if (i + 1 < parent.child_count()) {
-                    child_size = parent.child_offset(i + 1) - offset;
-                } else {
-                    size_t header_size = offsetof(ChipCallable, storage_);
-                    child_size = self.buffer_.size() - header_size - offset;
-                }
+                const size_t child_size = CoreCallable::binary_data_offset() + c.binary_size();
                 std::vector<uint8_t> child_buf(child_start, child_start + child_size);
+                reinterpret_cast<CoreCallable *>(child_buf.data())->async_capability_ =
+                    normalize_core_async_capability(c.async_capability());
                 return PyCoreCallable{std::move(child_buf)};
             },
             nb::arg("i"), "Return the CoreCallable child at index i."
@@ -3521,7 +3810,9 @@ NB_MODULE(_task_interface, m) {
         .def("activate", &ChipRun::activate)
         .def("abandon", &ChipRun::abandon, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("launched", &ChipRun::launched)
+        .def_prop_ro("_execution_ended", &ChipRun::execution_ended)
         .def_prop_ro("lane_poisoned", &ChipRun::lane_poisoned)
+        .def_prop_ro("_owner_recovery_required", &ChipRun::owner_recovery_required)
         .def_prop_ro("preparation_disposition", &ChipRun::preparation_disposition)
         .def(
             "wait",
@@ -3559,27 +3850,31 @@ NB_MODULE(_task_interface, m) {
         );
 
     // --- ChipWorker ---
+    bind_native_submission(m);
     nb::class_<ChipWorker>(m, "_ChipWorker")
-        .def(nb::init<>())
+        .def(nb::new_([] {
+            return std::make_shared<ChipWorker>();
+        }))
         .def(
             "init",
             [](ChipWorker &self, const std::string &host_lib_path, const std::string &aicpu_path,
                const std::string &aicore_path, const std::string &dispatcher_path, int device_id,
                std::optional<CallConfig> prewarm_config, bool enable_sdma, const std::string &sim_context_path,
                const std::string &sdma_warmup_path, bool collect_across_runs, uint64_t workspace_budget_bytes,
-               bool manage_workspace, uint32_t requested_pipeline_depth) {
+               bool manage_workspace, uint32_t requested_pipeline_depth,
+               std::optional<uint64_t> borrowed_context_generation) {
                 self.init(
                     host_lib_path, aicpu_path, aicore_path, dispatcher_path, device_id,
                     prewarm_config.has_value() ? &(*prewarm_config) : nullptr, enable_sdma, sim_context_path,
                     sdma_warmup_path, collect_across_runs, workspace_budget_bytes, manage_workspace,
-                    requested_pipeline_depth
+                    requested_pipeline_depth, borrowed_context_generation
                 );
             },
             nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("aicore_path"), nb::arg("dispatcher_path"),
             nb::arg("device_id"), nb::arg("prewarm_config") = nb::none(), nb::arg("enable_sdma") = false,
             nb::arg("sim_context_path") = "", nb::arg("sdma_warmup_path") = "", nb::arg("collect_across_runs") = false,
             nb::arg("workspace_budget_bytes") = 0, nb::arg("manage_workspace") = false,
-            nb::arg("requested_pipeline_depth") = 0,
+            nb::arg("requested_pipeline_depth") = 0, nb::kw_only(), nb::arg("borrowed_context_generation") = nb::none(),
             // Release the GIL for the (potentially long) native device attach so
             // another Python thread can run during it — e.g. a concurrent close()
             // observing INITIALIZING and failing fast (a GIL held for the whole
@@ -3591,9 +3886,32 @@ NB_MODULE(_task_interface, m) {
             "given, its ring sizing is built + cached inside init (fork-constant, no "
             "cross-process control command). A no-op for runtimes without a prebuilt arena. "
             "When enable_sdma is True, provisions the async-DMA (SDMA) workspace at init so "
-            "kernels can use get_dma_workspace; init raises if the platform lacks support for the requested workspace."
+            "kernels can use get_dma_workspace; init raises if the platform lacks support for the requested workspace. "
+            "borrowed_context_generation selects the already-current caller RTS context; it must be nonzero. "
+            "The caller keeps that context current and alive through successful finalize. Failed rollback "
+            "retains the binding for explicit finalize and prevents reinitialization."
         )
         .def("finalize", &ChipWorker::finalize)
+        .def("_validate_execution_context", &ChipWorker::validate_execution_context)
+        .def(
+            "_validate_caller_stream",
+            [](ChipWorker &self, uintptr_t caller_stream) {
+                self.validate_caller_stream(reinterpret_cast<void *>(caller_stream));
+            },
+            nb::arg("caller_stream"),
+            "Check caller context, stream ownership and eager capture state before submission."
+        )
+        .def_prop_ro(
+            "_execution_environment",
+            [](const ChipWorker &self) -> nb::object {
+                const auto environment = self.execution_environment();
+                if (!environment) return nb::none();
+                return nb::make_tuple(
+                    environment->process_id, environment->incarnation, environment->context_generation,
+                    environment->device_id, environment->borrowed
+                );
+            }
+        )
         .def(
             "flush_diagnostics", &ChipWorker::flush_diagnostics, nb::arg("timeout_ms") = 30000,
             nb::call_guard<nb::gil_scoped_release>(),
@@ -3602,10 +3920,19 @@ NB_MODULE(_task_interface, m) {
         )
         .def(
             "register_callable",
+            [](ChipWorker &self, const PyChipCallable &callable) {
+                return self.register_callable(callable.buffer_.data(), callable.buffer_.size());
+            },
+            nb::arg("callable"), nb::call_guard<nb::gil_scoped_release>(),
+            "Register on an initialized worker and return a runtime-assigned ID. "
+            "Supports owned and borrowed contexts; retire users before unregistering."
+        )
+        .def(
+            "register_callable",
             [](ChipWorker &self, int32_t callable_id, const PyChipCallable &callable) {
                 self.register_callable(callable_id, callable.buffer_.data());
             },
-            nb::arg("callable_id"), nb::arg("callable"),
+            nb::arg("callable_id"), nb::arg("callable"), nb::call_guard<nb::gil_scoped_release>(),
             "Stage a ChipCallable under callable_id for cheap repeated launches "
             "via run. Variants without per-callable_id support raise."
         )
@@ -3614,7 +3941,7 @@ NB_MODULE(_task_interface, m) {
             [](ChipWorker &self, int32_t callable_id, uint64_t blob_ptr) {
                 self.register_callable(callable_id, reinterpret_cast<const void *>(blob_ptr));
             },
-            nb::arg("callable_id"), nb::arg("blob_ptr"),
+            nb::arg("callable_id"), nb::arg("blob_ptr"), nb::call_guard<nb::gil_scoped_release>(),
             "Stage a ChipCallable from a raw contiguous-buffer pointer (used by "
             "post-fork dynamic register handlers that receive the ChipCallable "
             "bytes via shared memory; see docs/callable-identity-registration.md). "
@@ -3655,19 +3982,34 @@ NB_MODULE(_task_interface, m) {
             "_submit_chip_run_materialized",
             [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
                uint32_t slot_id, uint64_t generation, uint64_t run_id, uint64_t dispatch_id,
-               uint64_t accepted_state_addr, int32_t accepted_value, bool activated) {
+               uint64_t accepted_state_addr, int32_t accepted_value, bool activated, nb::bytes owner_instance_id,
+               uint32_t chip_rank, uint32_t capture_index, uint32_t task_slot, uint32_t group_index,
+               uint32_t group_size) {
+                const NativeRunProvenance provenance = make_run_provenance(
+                    owner_instance_id, chip_rank, capture_index, task_slot, group_index, group_size
+                );
+                nb::gil_scoped_release release;
                 return self.submit_chip_run(
                     callable_id, args, config, PipelineSlotLease{slot_id, 0, generation}, run_id, dispatch_id,
-                    reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value, activated
+                    reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value, activated, provenance
                 );
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::arg("slot_id"), nb::arg("generation"),
             nb::arg("run_id"), nb::arg("dispatch_id"), nb::arg("accepted_state_addr"), nb::arg("accepted_value"),
-            nb::arg("activated"), nb::call_guard<nb::gil_scoped_release>(),
-            "Submit materialized task args to the chip native-run lane."
+            nb::arg("activated"), nb::arg("owner_instance_id") = nb::bytes(""), nb::arg("chip_rank") = 0,
+            nb::arg("capture_index") = 0, nb::arg("task_slot") = 0, nb::arg("group_index") = 0,
+            nb::arg("group_size") = 0,
+            "Submit materialized task args to the chip native-run lane. The provenance arguments name the "
+            "submission a diagnostic artifact belongs to; an empty owner_instance_id states none. The nonce is "
+            "copied into the POD under the GIL, which the submission itself then releases."
         )
         .def(
-            "_close_chip_run_lane", &ChipWorker::close_chip_run_lane, nb::call_guard<nb::gil_scoped_release>(),
+            "_observe_framework_submissions", &ChipWorker::observe_framework_submissions,
+            nb::call_guard<nb::gil_scoped_release>()
+        )
+        .def(
+            "_close_chip_run_lane", &ChipWorker::close_chip_run_lane, nb::arg("report_run_error") = true,
+            nb::call_guard<nb::gil_scoped_release>(),
             "Drain active native ownership, abandon unlaunched work, and close the chip run lane."
         )
         .def(
@@ -3678,14 +4020,31 @@ NB_MODULE(_task_interface, m) {
             "close cannot serve that, because a drain launches before it waits."
         )
         .def(
-            "_submit_chip_run_direct",
-            [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config) {
-                return self.submit_chip_run(callable_id, args, config);
+            "_prepare_chip_submission",
+            [](ChipWorker &self, int32_t callable_id, const CallArgumentSnapshot &values, const CallConfig &config,
+               uintptr_t caller_stream) {
+                return self.prepare_chip_submission(
+                    callable_id, values, config, reinterpret_cast<void *>(caller_stream)
+                );
             },
-            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::call_guard<nb::gil_scoped_release>(),
+            nb::arg("callable_id"), nb::arg("values"), nb::arg("config"), nb::kw_only(), nb::arg("caller_stream"),
+            nb::call_guard<nb::gil_scoped_release>()
+        )
+        .def(
+            "_submit_chip_run_direct",
+            [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
+               uintptr_t caller_stream) {
+                return self.submit_chip_run(
+                    callable_id, args, config, nullptr, 0, reinterpret_cast<void *>(caller_stream)
+                );
+            },
+            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::kw_only(), nb::arg("caller_stream") = 0,
+            nb::call_guard<nb::gil_scoped_release>(),
             "Submit materialized task args to the chip native-run lane without a pipeline lease and return the live "
             "run. The lane follows the runtime PipelineContract: compatible runs admit one active plus one prepared "
-            "successor; otherwise this call drains its predecessor before admitting."
+            "successor; otherwise this call drains its predecessor before admitting. With caller_stream, "
+            "success means both kernels and the caller exit wait are enqueued; launch failures throw. "
+            "The caller keeps its stream and buffers alive through retirement. Host copy-back still requires wait."
         )
         .def(
             "_prepare_native_run_materialized",
@@ -3703,8 +4062,18 @@ NB_MODULE(_task_interface, m) {
             "Prepare a native run from materialized task args after lease admission."
         )
         .def(
-            "_launch_native_run", &ChipWorker::launch_native_run, nb::arg("run"),
-            nb::call_guard<nb::gil_scoped_release>(),
+            "_launch_native_run",
+            [](ChipWorker &self, const ChipWorkerNativeRun &run) {
+                // A capacity decline is the one non-failure result, and this
+                // raw entry has no queue to defer into: the caller asked for
+                // this run to go now, so a refusal is reported as one.
+                if (self.launch_native_run(run) == ChipWorker::NativeLaunch::DiagnosticCreditFull) {
+                    throw std::runtime_error(
+                        "native run was not admitted: a diagnostic collector had no capacity free"
+                    );
+                }
+            },
+            nb::arg("run"), nb::call_guard<nb::gil_scoped_release>(),
             "Launch a prepared native run and return after its real device launch fence."
         )
         .def(
@@ -3771,7 +4140,23 @@ NB_MODULE(_task_interface, m) {
             "run_materialized",
             [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
                uint64_t accepted_state_addr, int32_t accepted_value, uint32_t pipeline_slot,
-               uint64_t pipeline_generation) {
+               uint64_t pipeline_generation, uint64_t run_id, uint64_t dispatch_id, nb::bytes owner_instance_id,
+               uint32_t chip_rank, uint32_t capture_index, uint32_t task_slot, uint32_t group_index,
+               uint32_t group_size) {
+                // Read while the GIL is still held: this is the only argument
+                // whose storage is Python's, and `make_run_provenance` copies
+                // it into a POD. Everything else is already a bound C++ object
+                // nanobind keeps alive for the call.
+                const NativeRunProvenance provenance = make_run_provenance(
+                    owner_instance_id, chip_rank, capture_index, task_slot, group_index, group_size
+                );
+                // Released for the whole submission. The run's own wait blocks
+                // on the device and, when a diagnostic owner's capacity is
+                // exhausted, on that capacity coming back — both are waits of
+                // unbounded length to this thread, and holding the interpreter
+                // across either stops every other Python thread, including the
+                // ones whose progress could end the wait.
+                nb::gil_scoped_release release;
                 if (pipeline_generation == 0) {
                     self.run(
                         callable_id, &args, config, reinterpret_cast<volatile int32_t *>(accepted_state_addr),
@@ -3780,14 +4165,20 @@ NB_MODULE(_task_interface, m) {
                 } else {
                     self.run_with_lease(
                         callable_id, &args, config, PipelineSlotLease{pipeline_slot, 0, pipeline_generation},
-                        reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value
+                        reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value, run_id, dispatch_id,
+                        provenance
                     );
                 }
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::arg("accepted_state_addr") = 0,
             nb::arg("accepted_value") = 0, nb::arg("pipeline_slot") = 0, nb::arg("pipeline_generation") = 0,
+            nb::arg("run_id") = 0, nb::arg("dispatch_id") = 0, nb::arg("owner_instance_id") = nb::bytes(""),
+            nb::arg("chip_rank") = 0, nb::arg("capture_index") = 0, nb::arg("task_slot") = 0,
+            nb::arg("group_index") = 0, nb::arg("group_size") = 0,
             "Launch a callable_id from the runtime.so-ABI POD a chip-child mailbox loop built with "
-            "materialize_task_args, so no Python code re-implements the tensor/scalar layout."
+            "materialize_task_args, so no Python code re-implements the tensor/scalar layout. The identity and "
+            "provenance arguments name the submission a diagnostic artifact belongs to; an empty "
+            "owner_instance_id states none."
         )
         .def(
             "unregister_callable",
@@ -3848,10 +4239,30 @@ NB_MODULE(_task_interface, m) {
         )
         .def_prop_ro("pipeline_depth", &ChipWorker::pipeline_depth)
         .def_prop_ro("runtime_slot_count", &ChipWorker::runtime_slot_count)
+        .def(
+            "_enable_automatic_admission", &ChipWorker::enable_automatic_admission,
+            "Let this worker's device context size its own run concurrency from the resources it "
+            "proves. False when the loaded module or the context cannot, in which case the worker "
+            "keeps admitting exactly what it was granted."
+        )
+        .def_prop_ro(
+            "automatic_admission", &ChipWorker::automatic_admission,
+            "Whether this worker's context sizes its own run concurrency."
+        )
+        .def_prop_ro(
+            "admissible_run_resource_sets", &ChipWorker::admissible_run_resource_sets,
+            "Run-resource sets this context reports it can hold right now: a count of identities, "
+            "never a byte figure. One until a run has completed its resource commit; the granted "
+            "count on a context that does not size itself."
+        )
         .def_prop_ro(
             "supports_concurrent_native_prepare", &ChipWorker::supports_concurrent_native_prepare,
             "Whether non-diagnostic native preparation may overlap one active run in another slot."
         )
+        .def_prop_ro("_host_ddr_mapping_supported", &ChipWorker::host_ddr_mapping_supported)
+        .def("_map_host_ddr", &ChipWorker::map_host_ddr, nb::call_guard<nb::gil_scoped_release>())
+        .def("_unmap_host_ddr", &ChipWorker::unmap_host_ddr, nb::call_guard<nb::gil_scoped_release>())
+        .def("_quiesce_host_uses", &ChipWorker::quiesce_host_uses, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro(
             "launch_depth", &ChipWorker::launch_depth,
             "How many runs this worker may have launched at once, after its request was resolved "
@@ -3910,6 +4321,43 @@ NB_MODULE(_task_interface, m) {
             "Platforms using the persistent bootstrap pair report 0."
         )
         .def_prop_ro(
+            "scheduler_runtime_mode", &ChipWorker::last_scheduler_runtime_mode,
+            "Which device-side scheduler the most recent bind selected, as a "
+            "SCHEDULER_RUNTIME_MODE_* value: 1 = resident pending, 2 = resident "
+            "ready, 3 = legacy (graph task present), 4 = legacy (unsupported task "
+            "shape). 0 means no selection was ever published -- which is the "
+            "value every runtime other than the a5 host_build_graph one reports, "
+            "because only it selects between schedulers. Latched by the runner: "
+            "the runtime's own copy is cleared when a run releases its bindings."
+        )
+        .def_prop_ro(
+            "scheduler_mode_publish_count", &ChipWorker::scheduler_mode_publish_count,
+            "How many times this worker's binds have published a scheduler "
+            "selection. Tells 'this bind selected again' apart from 'the latch "
+            "still holds an earlier run's value', which the mode alone cannot."
+        )
+        .def_prop_ro(
+            "unobserved_completed_run_count", &ChipWorker::unobserved_completed_run_count,
+            "Calls whose completion this worker has recorded and whose result "
+            "has not been delivered yet, including one a finalization already "
+            "owns. Each holds a native carrier and, for Program, its staging, "
+            "so host footprint tracks this number rather than the pipeline "
+            "depth -- the depth bounds concurrent execution only. Nothing caps "
+            "it: these are results a caller is still entitled to, held by its "
+            "own handles, so a rising value means handles are being kept rather "
+            "than that anything leaked. Recorded, not probed: a call whose "
+            "device work has finished stays uncounted until a poll or wait "
+            "records it, so this is a lower bound on what the device finished."
+        )
+        .def_prop_ro(
+            "unobserved_completed_run_high_water", &ChipWorker::unobserved_completed_run_high_water,
+            "Largest unobserved_completed_run_count this worker has sampled. "
+            "Sampled at every preparation and at every read of either property, "
+            "so a backlog that grows and drains entirely between two samples is "
+            "not recorded. Monotonic, which is what makes it usable as a test "
+            "discriminator where the instantaneous count races the drain."
+        )
+        .def_prop_ro(
             "committed_device_memory", &ChipWorker::committed_device_memory,
             "Total device HBM (bytes) currently committed by this worker's "
             "MemoryAllocator (user tensors + pooled arenas + runtime buffers). "
@@ -3928,6 +4376,23 @@ NB_MODULE(_task_interface, m) {
                 }
             },
             "Return the ACL_HBM_MEM free/total byte snapshot for this worker's device."
+        )
+        .def("_malloc_shareable", &allocate_shared_buffer, nb::arg("nbytes"))
+        .def(
+            "_vmm_borrow",
+            [](ChipWorker &worker, uint64_t base, uint64_t bytes, uint64_t token, bool retain) {
+                if (token < CallerDeviceBuffers::EXTERNAL_BORROW_MIN_ID) {
+                    throw std::invalid_argument("external buffer borrow token must have its high bit set");
+                }
+                if (retain) {
+                    const ChipWorker::CallerDeviceSpan span{base, bytes};
+                    if (!worker.borrow_caller_device_spans(token, &span, 1)) {
+                        throw std::runtime_error("buffer is not a live owner allocation");
+                    }
+                } else {
+                    worker.release_caller_device_borrow(token, false);
+                }
+            }
         )
         .def("malloc", &ChipWorker::malloc, nb::arg("size"))
         .def("free", &ChipWorker::free, nb::arg("ptr"))
@@ -3959,27 +4424,78 @@ NB_MODULE(_task_interface, m) {
         .def(
             "comm_alloc_domain_windows",
             [](ChipWorker &self, uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids,
-               uint32_t domain_rank, size_t window_size, uint64_t commit_flag_address) {
+               uint32_t domain_rank, size_t window_size, uint64_t commit_flag_address, uint32_t workspace_mask,
+               const std::string &host_shm_name, uint32_t urma_jetties_per_aiv, uint32_t urma_sq_depth,
+               uint32_t ccu_mode) {
                 if (commit_flag_address == 0 || commit_flag_address % alignof(uint64_t) != 0) {
                     throw std::invalid_argument("comm_alloc_domain_windows: commit flag address is invalid");
                 }
-                auto [device_ctx, local_window_base] =
-                    self.comm_alloc_domain_windows(comm_handle, allocation_id, rank_ids, domain_rank, window_size);
-                __atomic_store_n(
-                    reinterpret_cast<uint64_t *>(static_cast<uintptr_t>(commit_flag_address)), uint64_t{1},
-                    __ATOMIC_RELEASE
+                const CommWorkspaceConfig config{urma_jetties_per_aiv, urma_sq_depth, ccu_mode};
+                auto [device_ctx, local_window_base, actual_window_size] = self.comm_alloc_domain_windows(
+                    comm_handle, allocation_id, rank_ids, domain_rank, window_size, workspace_mask,
+                    reinterpret_cast<uint64_t *>(static_cast<uintptr_t>(commit_flag_address)), host_shm_name, &config
                 );
-                return nb::make_tuple(device_ctx, local_window_base);
+                return nb::make_tuple(device_ctx, local_window_base, actual_window_size);
             },
             nb::arg("comm_handle"), nb::arg("allocation_id"), nb::arg("rank_ids"), nb::arg("domain_rank"),
-            nb::arg("window_size"), nb::arg("commit_flag_address"),
+            nb::arg("window_size"), nb::arg("commit_flag_address"), nb::arg("workspace_mask") = 0,
+            nb::arg("host_shm_name") = "", nb::arg("urma_jetties_per_aiv") = 1, nb::arg("urma_sq_depth") = 0,
+            nb::arg("ccu_mode") = uint32_t{COMM_CCU_MODE_SCHED},
             "Collectively allocate a fresh per-rank pool for a subset; returns "
-            "(device_ctx, local_window_base) for this rank and publishes the commit flag before result conversion."
+            "(device_ctx, local_window_base, actual_window_size) for this rank. The commit flag records cleanup "
+            "responsibility before result conversion or an allocation error; it does not imply a usable context."
+        )
+        .def("communication_cleanup_confirmed", &ChipWorker::communication_cleanup_confirmed)
+        .def(
+            "register_ccu_callable",
+            [](ChipWorker &self, uint64_t comm_handle, uint64_t collective_id, int32_t callable_id,
+               const std::vector<uint32_t> &rank_ids, uint32_t domain_rank, const nb::bytes &sdk_build_id,
+               const nb::bytes &pto_isa_build_id, uint32_t workspace_mask, uint64_t allocation_id, uint32_t ccu_id) {
+                if (sdk_build_id.size() != SIMPLER_CCU_BUILD_ID_SIZE ||
+                    pto_isa_build_id.size() != SIMPLER_CCU_BUILD_ID_SIZE) {
+                    throw std::invalid_argument("CCU build identities must each contain exactly 32 bytes");
+                }
+                simpler::ccu::ExpectedBuildIdentity identity{};
+                std::memcpy(identity.sdk.data(), sdk_build_id.c_str(), identity.sdk.size());
+                std::memcpy(identity.pto_isa.data(), pto_isa_build_id.c_str(), identity.pto_isa.size());
+                return self.register_ccu_callable(
+                    comm_handle, collective_id, callable_id, rank_ids, domain_rank, identity, workspace_mask,
+                    allocation_id, ccu_id
+                );
+            },
+            nb::arg("comm_handle"), nb::arg("collective_id"), nb::arg("callable_id"), nb::arg("rank_ids"),
+            nb::arg("domain_rank"), nb::arg("sdk_build_id"), nb::arg("pto_isa_build_id"), nb::arg("workspace_mask") = 0,
+            nb::arg("allocation_id") = 0, nb::arg("ccu_id") = UINT32_MAX
+        )
+        .def(
+            "prepare_ccu_run_set", &ChipWorker::prepare_ccu_run_set, nb::arg("comm_handle"), nb::arg("registrations"),
+            nb::arg("generation"), nb::arg("dispatch_id")
+        )
+        .def(
+            "control_ccu_run_set", &ChipWorker::control_ccu_run_set, nb::arg("comm_handle"), nb::arg("run_set_id"),
+            nb::arg("operation")
+        )
+        .def(
+            "release_ccu_registration", &ChipWorker::release_ccu_registration, nb::arg("comm_handle"),
+            nb::arg("registration_id")
+        )
+        .def(
+            "prepare_ccu_run", &ChipWorker::prepare_ccu_run, nb::arg("comm_handle"), nb::arg("registration_id"),
+            nb::arg("generation"), nb::arg("dispatch_id"), nb::arg("allocation_id")
+        )
+        .def(
+            "control_ccu_run", &ChipWorker::control_ccu_run, nb::arg("comm_handle"), nb::arg("allocation_id"),
+            nb::arg("operation"), nb::arg("generation")
         )
         .def(
             "comm_release_domain_windows", &ChipWorker::comm_release_domain_windows, nb::arg("comm_handle"),
             nb::arg("allocation_id"), nb::arg("rank_count"), nb::arg("domain_rank"),
             "Pair to comm_alloc_domain_windows: collectively release the per-rank pool."
+        )
+        .def(
+            "comm_abort_domain_windows", &ChipWorker::comm_abort_domain_windows, nb::arg("comm_handle"),
+            nb::arg("allocation_id"), nb::arg("rank_count"), nb::arg("domain_rank"),
+            "Locally roll back a domain the coordinating owner has never published to device users."
         )
         .def(
             "comm_global_domain_prepare",
@@ -4035,10 +4551,12 @@ NB_MODULE(_task_interface, m) {
 
     m.def(
         "materialize_task_args",
-        [](const TaskArgs &args, nb::dict resolved) -> ChipStorageTaskArgs {
+        [](const TaskArgs &args, nb::list resolved) -> ChipStorageTaskArgs {
+            if (resolved.size() != static_cast<size_t>(args.tensor_count()))
+                throw std::invalid_argument("materialize: argument binding count mismatch");
             ChipStorageTaskArgs out;
             for (int32_t i = 0; i < args.tensor_count(); i++) {
-                out.add_tensor(materialize_one(args.tensor(i), args.transfer(i), resolved));
+                out.add_tensor(materialize_one(args.tensor(i), args.transfer(i), nb::cast<nb::tuple>(resolved[i])));
             }
             for (int32_t i = 0; i < args.scalar_count(); i++) {
                 out.add_scalar(args.scalar(i));
@@ -4048,12 +4566,11 @@ NB_MODULE(_task_interface, m) {
         nb::arg("args"), nb::arg("resolved"),
         "Materialize a TaskArgs held in this process into the runtime.so-ABI ChipStorageTaskArgs "
         "POD — the sole path to that POD, whether the args are an L2 leaf's own or a chip child's "
-        "read back from its mailbox with read_args_from_blob. Each tensor's embedded buffer "
-        "identity is resolved via `resolved` {CanonicalIdentity: (local_base, address_space)}; "
-        "addr = base + byte_offset. The caller pre-populates `resolved` by materializing each "
-        "embedded descriptor on first receipt. Strided views (transpose / permute / step-slice) "
-        "materialize to strided ChipTensors. Rejects an unknown identity and a non-dtype-aligned "
-        "byte_offset."
+        "read back from its mailbox with read_args_from_blob. Each tensor "
+        "is bound through the corresponding resolved list entry (base, address_space, execution_transfer). "
+        "MAP entries require DEVICE/NONE; native requests preserve placement and transfer. "
+        "The caller retains the validated registration and backing through execution. "
+        "The byte offset is applied once, and strided views retain their geometry."
     );
 
     m.def(
@@ -4067,6 +4584,10 @@ NB_MODULE(_task_interface, m) {
             for (int32_t i = 0; i < view.scalar_count; i++) {
                 args.add_scalar(view.scalars[i]);
             }
+            std::vector<CcuTaskBinding> bindings;
+            for (uint32_t i = 0; i < view.ccu_binding_count; ++i)
+                bindings.push_back(view.ccu_binding(i));
+            args.set_ccu_bindings(std::move(bindings));
             return args;
         },
         nb::arg("blob_ptr"), nb::arg("capacity"),
@@ -4092,7 +4613,6 @@ NB_MODULE(_task_interface, m) {
         .def_ro("physical_allocated", &RegionVmmInspect::physical_allocated)
         .def_ro("va_reserved", &RegionVmmInspect::va_reserved)
         .def_ro("mapped", &RegionVmmInspect::mapped)
-        .def_ro("access_set", &RegionVmmInspect::access_set)
         .def_ro("exported", &RegionVmmInspect::exported)
         .def_ro("unmap_attempted", &RegionVmmInspect::unmap_attempted)
         .def_ro("unmap_complete", &RegionVmmInspect::unmap_complete)
@@ -4105,6 +4625,39 @@ NB_MODULE(_task_interface, m) {
         .def_ro("local_cleanup_details", &RegionVmmInspect::local_cleanup_details);
 
     nb::class_<RegionHandle>(m, "_RegionHandle").def("__int__", &RegionHandle::value);
+
+    m.def("_buffer_import_vmm", [](int device, uint64_t shareable, uint64_t size, const std::string &token) {
+        void *context = acl_api().current_context_with_check(device);
+        return import_onboard_region(
+            device, shareable, size, token, "invalid buffer device", "invalid mapping size",
+            "missing buffer export identity", context
+        );
+    });
+    m.def("_buffer_mapped_base", [](uint64_t handle) {
+        auto lease = region_registry().lease(handle);
+        if (acl_api().current_context_with_check(lease->device_id) != lease->borrowed_context) {
+            throw std::invalid_argument("buffer mapping belongs to another ACL context");
+        }
+        if (!lease->vmm_mapped) {
+            throw std::runtime_error("buffer mapping is partially closed; finish cleanup before releasing the lease");
+        }
+        return lease->device_addr;
+    });
+    m.def(
+        "_buffer_close_vmm",
+        [](uint64_t handle) {
+            {
+                auto lease = region_registry().lease(handle);
+                if (acl_api().current_context_with_check(lease->device_id) != lease->borrowed_context) {
+                    throw std::invalid_argument("buffer mapping belongs to another ACL context");
+                }
+                // Failed stages leave the registry entry and remaining handles available for explicit cleanup.
+                lease->close_buffer_mapping();
+            }
+            region_registry().close(handle);
+        },
+        nb::arg("handle"), "Close an imported buffer without discarding unfinished cleanup."
+    );
 
     m.def(
         "_region_import_sim",

@@ -1,6 +1,6 @@
 ---
 name: hbg-bind-phases
-description: Measure host_build_graph's `bind` phases — the host-side stage between "caller data in place" and "device can start" (orchestration, Definition upload, H2D), also called the bind path or control plane — on the dsv4 and qwen decode cases, and compare two branches. Use when the user asks how long bind or the control plane takes, whether a change moved host_orch / graph_upload / arena_h2d, or to A/B a host-side change. This is the HOST stage with the device run skipped — for on-device latency use `benchmark` or `perf-example-device` instead.
+description: Measure host_build_graph's `bind` phases — the host-side stage between "caller data in place" and "device can start" (orchestration, Definition packing, image staging), also called the bind path or control plane — on the dsv4 and qwen decode cases, and compare two branches. Use when the user asks how long bind or the control plane takes, whether a change moved host_orch / graph_pack / image_stage / historical arena_h2d, or to A/B a host-side change. This is the HOST stage with the device run skipped — for on-device latency use `benchmark` or `perf-example-device` instead.
 ---
 
 # Measuring the `host_build_graph` bind phases
@@ -9,8 +9,9 @@ What the phases are, why each switch is there, and the reference numbers:
 [`docs/dfx/hbg-bind-phases.md`](../../../docs/dfx/hbg-bind-phases.md).
 Read it before interpreting any number. This file is the invocation.
 
-The device run is skipped, so a case whose device execution does not complete
-still yields its whole host picture.
+The device run is skipped, so the log measures bind and host image staging.
+It does not execute the later launch-owned image H2D; see the doc for that
+measurement boundary.
 
 ## The recipe
 
@@ -130,6 +131,9 @@ python -m simpler_setup.tools.strace_timing "$D/bind_timeline.log" \
   identical coverage: #2353 makes `graph_upload` copy-only and leaves Definition
   preparation outside the reported three-segment subtotal. Do not report that
   subtotal as the complete control plane or infer a speedup across this boundary.
+  Current `image_stage` measures host snapshotting; historical `arena_h2d`
+  measured synchronous copying. Their costs/subtotals are not comparable, and
+  skipped-device runs do not measure the later launch-owned image upload.
 - Follow the remaining comparison rules in that section, including interleaving
   the arms and taking minima of per-bind sums.
 

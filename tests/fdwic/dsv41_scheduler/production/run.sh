@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+if (($# < 6)); then
+    echo 'usage: production/run.sh BUNDLE RUNTIME_LIB OUTPUT LEVEL WARMUP ROUNDS [--runtime=host_build_graph|percounter|tensormap_and_ringbuffer] [--materialize]' >&2
+    exit 2
+fi
+preparation=""
+runtime_name=host_build_graph
+for option in "${@:7}"; do
+    case "$option" in
+        --materialize) preparation=--materialize ;;
+        --runtime=host_build_graph|--runtime=percounter|--runtime=tensormap_and_ringbuffer) runtime_name=${option#--runtime=} ;;
+        *) echo "Unknown option: $option" >&2; exit 2 ;;
+    esac
+done
+: "${ASCEND_HOME_PATH:?source the CANN set_env.sh first}"
+bundle=$(realpath "$1")
+runtime=$(realpath "$2")
+if [[ "$runtime_name" == tensormap_and_ringbuffer && ( "$4" == 0 || "$4" == all ) ]]; then
+    "${DSV41_PYTHON:-python3}" "$root/production/tmr_runtime.py" validate "$runtime"
+fi
+ranks=$("${DSV41_PYTHON:-python3}" "$root/production/topology.py" "$bundle" "$preparation")
+if [[ "$ranks" == 2 ]]; then
+    "${DSV41_PYTHON:-python3}" "$root/production/device_start_gate.py" validate "$runtime" "$runtime_name"
+fi
+mkdir -p "$3"
+output=$(realpath "$3")
+[[ ! -e "$output/rank0" && ! -e "$output/rank1" ]] || { echo 'Refusing to overwrite a run' >&2; exit 2; }
+if [[ -z "${TASK_DEVICE:-}" ]]; then
+    bash "$root/../../../.claude/skills/onboard-arch-precheck/check.sh" a5
+    printf -v command 'TASK_DEVICE="$TASK_DEVICE" bash %q' "$root/production/run.sh"
+    for argument in "$@"; do printf -v command '%s %q' "$command" "$argument"; done
+    command -v task-submit >/dev/null || { echo 'task-submit is required to reserve devices' >&2; exit 2; }
+    exec task-submit --device auto --device-num "$ranks" --max-time "${DSV41_MAX_TIME:-300}" --run "$command"
+fi
+IFS=',' read -r -a devices <<< "$TASK_DEVICE"
+[[ ${#devices[@]} == "$ranks" ]] || { echo "Case requires $ranks devices; reservation contains ${#devices[@]}" >&2; exit 2; }
+for ((rank=0; rank<ranks; ++rank)); do
+    [[ ${devices[$rank]} =~ ^[0-9]+$ ]] || { echo 'Invalid device ID' >&2; exit 2; }
+    for ((peer=0; peer<rank; ++peer)); do
+        [[ ${devices[$rank]} != "${devices[$peer]}" ]] || { echo 'Device IDs must be distinct' >&2; exit 2; }
+    done
+done
+if [[ -f "$bundle/case.json" ]] && "${DSV41_PYTHON:-python3}" -c \
+    'import json,sys; sys.exit(json.load(open(sys.argv[1])).get("execution") != "native_moe_host_control")' "$bundle/case.json"; then
+    [[ -f "$bundle/callable.bin" ]] || { echo 'Prepare native MoE with production/moe.py first' >&2; exit 2; }
+    mkdir -p "$output/ascend"
+    export ASCEND_PROCESS_LOG_PATH="$output/ascend"
+    "${DSV41_PYTHON:-python3}" "$root/production/moe.py" "$bundle" "$output/L$4" \
+        --runtime-lib "$runtime" --runtime "$runtime_name" --level "$4" --warmup "$5" --rounds "$6" \
+        > "$output/L$4.log" 2>&1 || { tail -n 60 "$output/L$4.log"; exit 1; }
+    tail -n 12 "$output/L$4.log"
+    exit 0
+fi
+runner=${DSV41_RUNNER:-"${DSV41_BUILD_DIR:-$root/build/portable}/host/native-runner"}
+[[ -x "$runner" && -f "$bundle/callable.bin" ]] || { echo 'Build the native runner and bundle first' >&2; exit 2; }
+pids=()
+for ((rank=0; rank<ranks; ++rank)); do
+    mkdir -p "$output/rank$rank/ascend"
+    ASCEND_PROCESS_LOG_PATH="$output/rank$rank/ascend" DSV41_RECORD_PATH="$output/rank$rank/submissions.bin" DSV41_ORIGINAL_ORCH="$bundle/orchestration.so" \
+    "$runner" "$bundle" "$runtime" "${devices[$rank]}" "$rank" "$output/rootinfo" \
+        "$output/rank$rank" "$4" "$5" "$6" "${@:7}" > "$output/rank$rank/console.log" 2>&1 &
+    pids+=("$!")
+done
+status=0
+for pid in "${pids[@]}"; do wait "$pid" || status=1; done
+for ((rank=0; rank<ranks; ++rank)); do tail -n 12 "$output/rank$rank/console.log"; done
+if [[ "$status" == 0 && ( "$4" == 0 || "$4" == all ) && -z "$preparation" ]]; then
+    "${DSV41_PYTHON:-python3}" "$root/production/timing.py" "$output"
+fi
+exit "$status"

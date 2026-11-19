@@ -17,7 +17,7 @@
  *
  * Platform Support (same shape for both arches):
  * - onboard: Device memory management using CANN runtime API (rtMalloc/rtFree)
- * - sim: Host memory management using standard malloc/free
+ * - sim: Host memory management using 64-byte-aligned allocation and free
  *
  * Key Features:
  * - Automatic tracking of all allocated memory
@@ -26,8 +26,7 @@
  * - Idempotent finalize() for explicit cleanup with error checking
  */
 
-#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_MEMORY_ALLOCATOR_H_
-#define SRC_COMMON_PLATFORM_INCLUDE_HOST_MEMORY_ALLOCATOR_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -40,7 +39,7 @@
  *
  * Platform Behavior:
  * - onboard: Wraps CANN runtime memory allocation APIs (rtMalloc/rtFree)
- * - sim: Wraps standard malloc/free
+ * - sim: Wraps 64-byte-aligned host allocation and free
  *
  * Both implementations provide automatic tracking of allocations to
  * prevent memory leaks. Uses RAII pattern for automatic cleanup.
@@ -59,12 +58,16 @@ public:
      *
      * Platform-specific behavior:
      * - onboard: Allocates device memory using rtMalloc
-     * - sim: Allocates host memory using malloc
+     * - sim: Allocates 64-byte-aligned host memory
      *
      * @param size  Size in bytes to allocate
-     * @return Memory pointer on success, nullptr on failure
+     * @param status Optional raw platform status. When supplied, return any
+     *               nonnull output even on error so the caller can retain it.
+     * @return The allocation on success. Without status, failure returns null.
+     *         Every nonnull platform output is tracked for checked cleanup;
+     *         an error does not establish that its contents are usable.
      */
-    void *alloc(size_t size);
+    void *alloc(size_t size, int *status = nullptr);
 
     /**
      * Free memory if tracked
@@ -81,6 +84,31 @@ public:
      * @return 0 on success, error code on failure, 0 if ptr not tracked
      */
     int free(void *ptr);
+
+    /** Release adopted storage and its metadata; a nonzero status retains allocator ownership. */
+    using StorageReleaseFn = int (*)(void *storage, void *base);
+
+    /**
+     * Take ownership only on success. Logical bytes bound views; physical bytes include VMM padding.
+     * The release callback runs under the allocator lock and must not reenter this allocator.
+     */
+    bool
+    adopt(void *base, size_t logical_bytes, size_t physical_bytes, StorageReleaseFn release_storage, void *storage) {
+        std::scoped_lock lock(mu_);
+        if (base == nullptr || logical_bytes == 0 || physical_bytes < logical_bytes || release_storage == nullptr ||
+            ptr_size_map_.count(base)) {
+            return false;
+        }
+        ptr_size_map_.emplace(base, logical_bytes);
+        try {
+            adopted_.emplace(base, AdoptedStorage{physical_bytes, release_storage, storage});
+        } catch (...) {
+            ptr_size_map_.erase(base);
+            throw;
+        }
+        committed_bytes_ += physical_bytes;
+        return true;
+    }
 
     /** Which action a sweep took on one tracked allocation. */
     enum class SweepAction : uint32_t { FreeIt = 0, KeepIt = 1 };
@@ -128,10 +156,13 @@ public:
         /**
          * Allocate `size` bytes and commit this slot's bookkeeping.
          *
-         * @return the allocation, or nullptr when the platform call failed or
-         *         this reservation is not valid. Nothing is changed on failure.
+         * @param status Optional raw platform status, with the same error-output
+         *               ownership contract as alloc().
+         * @return the allocation on success; null on error when status is absent.
+         *         A nonnull error output is tracked. An invalid reservation or
+         *         null platform output commits no allocation.
          */
-        void *commit_alloc(size_t size);
+        void *commit_alloc(size_t size, int *status = nullptr);
 
     private:
         friend class MemoryAllocator;
@@ -162,11 +193,11 @@ public:
     }
 
     /**
-     * Free every tracked allocation the classifier does not keep, then clear
-     * the tracking map unconditionally.
+     * Release adopted storage first, then sweep ordinary allocations through the classifier.
+     * Failed or kept adopted storage retains its handles/accounting and stops this sweep.
      *
-     * Terminal by construction: the map is empty when this returns whether or
-     * not a platform free failed, so no later free path — a second close, the
+     * The ordinary-allocation sweep is terminal: its map is cleared even if a platform free
+     * failed, so no later free path — a second close, the
      * destructor — can reach an address this call has already accounted for.
      * A kept allocation is not freed and its bytes move to the relinquished
      * total, which is what keeps a caller that could not prove its last
@@ -207,6 +238,7 @@ public:
      */
     void abandon_after_device_failure() {
         std::scoped_lock lk(mu_);
+        adopted_.clear();
         ptr_size_map_.clear();
         committed_bytes_ = 0;
     }
@@ -251,11 +283,11 @@ public:
     /**
      * Get total bytes currently committed by this allocator
      *
-     * Sums the requested sizes of all currently-tracked allocations. Used by
+     * Sums committed physical bytes, including VMM padding. Used by
      * downstream runtimes to account for device HBM this process has reserved
      * (which may be invisible to aclrtGetMemInfo) when sizing their own caches.
      *
-     * @return Sum of the requested sizes of all currently-tracked allocations
+     * @return Physical bytes committed by currently tracked allocations
      */
     size_t committed_bytes() const {
         std::scoped_lock lk(mu_);
@@ -263,10 +295,41 @@ public:
     }
 
 private:
+    struct AdoptedStorage {
+        size_t physical_bytes;
+        StorageReleaseFn release_storage;
+        void *storage;
+    };
+
+    int release_adopted_locked(void *base) {
+        const auto allocation = adopted_.find(base);
+        if (allocation == adopted_.end()) return -1;
+        const auto &record = allocation->second;
+        const int status = record.release_storage(record.storage, base);
+        if (status != 0) return status;
+        committed_bytes_ -= record.physical_bytes;
+        adopted_.erase(allocation);
+        ptr_size_map_.erase(base);
+        return 0;
+    }
+
+    int
+    sweep_adopted_locked(SweepClassifyFn classify = nullptr, SweepRecordFn record = nullptr, void *context = nullptr) {
+        while (!adopted_.empty()) {
+            void *base = adopted_.begin()->first;
+            if (classify != nullptr && classify(base, ptr_size_map_.at(base), context) == SweepAction::KeepIt) {
+                return -1;
+            }
+            const int status = release_adopted_locked(base);
+            if (record != nullptr) record(base, status, SweepAction::FreeIt, context);
+            if (status != 0) return status;
+        }
+        return 0;
+    }
+
+    std::unordered_map<void *, AdoptedStorage> adopted_;
     mutable std::mutex mu_;
     std::unordered_map<void *, size_t> ptr_size_map_;
     size_t committed_bytes_ = 0;
     uint64_t relinquished_bytes_ = 0;
 };
-
-#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_MEMORY_ALLOCATOR_H_

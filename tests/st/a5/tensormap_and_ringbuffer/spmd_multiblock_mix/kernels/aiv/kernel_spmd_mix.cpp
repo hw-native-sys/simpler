@@ -56,11 +56,11 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ float *out = reinterpret_cast<__gm__ float *>(out_tensor->buffer.addr) + out_tensor->start_offset;
 
     int32_t base_cl = static_cast<int32_t>(args[1]);
-    int32_t core_idx = get_block_idx(args);
+    int32_t block_idx = get_block_idx(args);
     int32_t sub_block_id = get_sub_block_id(args);
-    int32_t offset = (base_cl + core_idx * SLOTS_PER_BLOCK + 1 + sub_block_id) * FLOATS_PER_CACHE_LINE;
+    int32_t offset = (base_cl + block_idx * SLOTS_PER_BLOCK + 1 + sub_block_id) * FLOATS_PER_CACHE_LINE;
 
-    out[offset] = static_cast<float>(core_idx);
+    out[offset] = static_cast<float>(block_idx);
 
     dcci(&out[offset], SINGLE_CACHE_LINE, CACHELINE_OUT);
 }

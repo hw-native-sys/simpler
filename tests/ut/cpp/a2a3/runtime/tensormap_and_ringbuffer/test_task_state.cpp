@@ -70,7 +70,7 @@ protected:
         slot.fanout_lock.store(0);
         slot.fanout_head = nullptr;
         slot.ring_id = 0;
-        slot.active_mask = ActiveMask(SUBTASK_MASK_AIC);
+        slot.active_mask = LaneMask::aic();
         slot.completed_subtasks.store(0);
         slot.total_required_subtasks = 1;
         slot.logical_block_num = 1;

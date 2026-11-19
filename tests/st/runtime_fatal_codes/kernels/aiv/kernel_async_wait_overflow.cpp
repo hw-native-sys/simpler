@@ -30,16 +30,22 @@
 #include <pto/pto-inst.hpp>
 
 #include "async_kernel_api.h"
+#include "tensor.h"
 
 using namespace pto;
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     AsyncCtx ctx = get_async_ctx(args);
+    auto *output = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    auto *counter = reinterpret_cast<__gm__ uint32_t *>(output->buffer.addr) + output->start_offset;
+    *counter = 1;
+    pto2::detail::defer_flush_range(counter, sizeof(*counter));
+    // Failure cleanup polls the registered prefix. Keep its counters valid
+    // and complete so the overflow remains the only injected error.
     // The (capacity + 1)-th registration overflows and latches code 102.
     for (int32_t i = 0; i <= MAX_COMPLETIONS_PER_TASK; i++) {
         CompletionToken token{
-            static_cast<uint64_t>(0x1000 + i * 64), static_cast<uint32_t>(i), COMPLETION_ENGINE_SDMA,
-            COMPLETION_TYPE_COUNTER, 0
+            reinterpret_cast<uint64_t>(counter), 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0
         };
         register_completion_condition(ctx, token);
     }

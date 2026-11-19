@@ -34,9 +34,9 @@ endif()
 # Build complete source list from CUSTOM_SOURCE_DIRS and core sources.
 # Sources come from three buckets:
 #   1. `${CMAKE_CURRENT_SOURCE_DIR}/*.cpp` — onboard-aicpu sources that are
-#      still arch-specific (a2a3-only files like kernel.cpp).
+#      still arch-specific (kernel.cpp, cache_ops.cpp, inner_platform_regs.cpp).
 #   2. `common/platform/onboard/aicpu/*.cpp` — onboard-aicpu sources shared
-#      by both arches (cache_ops, device_log, device_time, device_malloc,
+#      by both arches (device_log, device_time, device_malloc,
 #      orch_so_file, platform_aicpu_affinity).
 #   3. arch-shared (between onboard and sim) sources under `../../shared/aicpu/`
 #      and `common/platform/shared/aicpu/` (unified log, scope_stats, args_dump).
@@ -62,6 +62,9 @@ list(LENGTH AICPU_KERNEL_SOURCES NUM_AICPU_KERNEL_SOURCES)
 message(STATUS "AICpu kernel: ${NUM_AICPU_KERNEL_SOURCES} source files")
 message(VERBOSE "AICpu kernel sources: ${AICPU_KERNEL_SOURCES}")
 add_library(aicpu_kernel SHARED ${AICPU_KERNEL_SOURCES})
+# CANN can retain the preceding runtime image after its Worker closes.
+# Each successor image must call its own executor/configuration functions.
+target_link_options(aicpu_kernel PRIVATE -Wl,-Bsymbolic-functions)
 include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
 simpler_configure_profiling(aicpu_kernel)
 
@@ -111,7 +114,7 @@ set_target_properties(aicpu_kernel PROPERTIES OUTPUT_NAME aicpu_kernel)
 # rtAicpuKernelLaunchExWithArgs(KERNEL_TYPE_AICPU_KFC), invokes
 # DynTileFwkBackendKernelServerInit, which writes the bundled inner SO bytes
 # (passed via the extended DeviceArgs at offsets 120/128) to
-# /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<device_id>.so
+# <preinstall>/<hostPid>_<localDeviceId>/simpler_inner_<fp>_<device_id>.so
 # under a content-fingerprint + device-id basename. After bootstrap the host registers the
 # preinstall file via rtsBinaryLoadFromFile + rtsFuncGetByName and launches
 # per-task through rtsLaunchCpuKernel; the dispatcher SO itself is never
@@ -122,6 +125,7 @@ set_target_properties(aicpu_kernel PROPERTIES OUTPUT_NAME aicpu_kernel)
 # extended DeviceArgs layout and the FNV-1a/Build-ID fingerprint protocol.
 set(AICPU_DISPATCHER_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/aicpu_loader/device/aicpu_dispatcher.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cache_ops.cpp"
 )
 add_library(aicpu_dispatcher SHARED ${AICPU_DISPATCHER_SOURCES})
 simpler_configure_profiling(aicpu_dispatcher)
@@ -139,9 +143,11 @@ target_compile_options(aicpu_dispatcher
 
 target_include_directories(aicpu_dispatcher
     PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/include
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CUSTOM_INCLUDE_DIRS}
-        # src/common is needed so `#include "utils/elf_build_id.h"` resolves;
+        ${ASCEND_HOME_PATH}/pkg_inc
+        # src/common resolves utils/elf_build_id.h and aicpu_loader/bootstrap_protocol.h;
         # host_runtime.so already has this on its include path (see host
         # CMakeLists), and the dispatcher uses the same header to fingerprint
         # the inner SO bytes by their ELF Build-ID rather than a 64-byte FNV

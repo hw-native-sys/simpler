@@ -171,8 +171,8 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_run(void *ar
     }
     auto *k = reinterpret_cast<KernelArgs *>(args);
     auto *d = reinterpret_cast<FinDeviceArgs *>(k->device_args);
-    if (d == nullptr || d->result_addr == 0 || d->handshake_addr == 0 || d->aic_ctrl_reg_base == 0 ||
-        d->records_addr == 0) {
+    if (d == nullptr || d->result_addr == 0 || d->handshake_addr == 0 || d->reg_bases_addr == 0 ||
+        d->reg_core_count == 0 || d->cond_offset == 0 || d->records_addr == 0) {
         Diag(kDlogWarn, "device_args missing pointers");
         return 1;
     }
@@ -229,23 +229,29 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_run(void *ar
             return 0;
         }
     }
-    // get_coreid() carries more than the core index; the runtime masks it with
-    // AICORE_COREID_MASK (0x0FFF) before indexing the AIC_CTRL window. Using the
-    // raw value produces an address outside that window, and reading it faults
-    // the AICPU op ("aicpu exception") rather than merely failing to match.
+    // get_coreid() carries flags above the core index on both chip families.
     uint32_t core_id_raw = rpt->core_id;
     uint32_t core_id = core_id_raw & kFinCoreIdMask;
     result->core_id_raw = core_id_raw;
     result->core_id_used = core_id;
-    if (core_id >= kFinMaxCores) {
-        Diag(kDlogWarn, "reported core id is outside the AIC_CTRL window; refusing to poll");
+    if (core_id >= d->reg_core_count) {
+        Diag(kDlogWarn, "reported core id is outside the register table; refusing to poll");
         result->magic = kFinResultMagic;
         result->consumer_rc = -4;
         ctl->go = 0;
         CleanLine(ctl);
         return 0;
     }
-    uint64_t cond_va = d->aic_ctrl_reg_base + static_cast<uint64_t>(core_id) * kFinCoreStride + kFinRegSprCondOffset;
+    const auto *reg_bases = reinterpret_cast<const uint64_t *>(d->reg_bases_addr);
+    if (reg_bases[core_id] == 0) {
+        Diag(kDlogWarn, "reported core has no register mapping");
+        result->magic = kFinResultMagic;
+        result->consumer_rc = -4;
+        ctl->go = 0;
+        CleanLine(ctl);
+        return 0;
+    }
+    uint64_t cond_va = reg_bases[core_id] + d->cond_offset;
     auto *cond_addr = reinterpret_cast<volatile uint32_t *>(cond_va);
     result->cond_addr = cond_va;
     if (stage == 2) {

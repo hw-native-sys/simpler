@@ -1,7 +1,6 @@
 # CI Change Detection and Job Gating
 
-Every *downstream* PR job in `.github/workflows/ci.yml` and the emergency CPU
-lane in `.github/workflows/ci-self-cpu.yml` is gated by an output of the
+Every *downstream automatic* PR job in `.github/workflows/ci.yml` is gated by an output of the
 canonical `.github/workflows/_detect-changes.yml` reusable workflow. Two jobs
 are deliberately ungated in the main CI path: `detect-changes` itself, which
 produces the outputs, and `pre-commit`, which every gated job declares in
@@ -11,12 +10,17 @@ ninety seconds on a GitHub runner. They are cheap to get subtly wrong and the
 symptom is silent — a job that should have skipped merely *passes*, so nobody
 notices until a flake in it reddens an unrelated PR.
 
+The explicit maintainer/admin `/run-a5` command in `ci-a5-comment.yml` is a separate
+exception: it runs all three requested A5 hardware suites without change
+detection, even for non-code PRs. Ordinary `ci.yml` has no automatic A5 hardware
+jobs; A5 simulation, CPU and profiling gates remain automatic. Daily retains its A5 jobs.
+
 This rule is about keeping the gates honest. It is not a description of the
 current filters; those change. It is the set of invariants they must satisfy.
 
 ## 1. One vocabulary for "cannot change what the code does"
 
-`detect-changes` defines exactly one such set, `NON_CODE`. **Every gate derives
+`detect-changes` defines exactly one such set, `NON_CODE`. **Every change-selection gate derives
 from it.** Do not introduce a second, narrower notion for some jobs and a wider
 one for others.
 
@@ -38,10 +42,11 @@ A file belongs in `NON_CODE` when changing it cannot change what the code does
 - `mkdocs.yml` sits at the repo root and is pure docs tooling. **In.**
 - `.github/workflows/docs.yml` is a workflow, and is also pure docs tooling —
   and it runs unconditionally on every PR, so it is its own gate. **In.**
-- `.github/workflows/ci.yml`, `.github/workflows/ci-self-cpu.yml`, and the
+- `.github/workflows/ci.yml` and the
   reusable `.github/workflows/_*.yml` CI implementation workflows define gates
   or job bodies. **Out, always.** A change to CI implementation must run
-  everything, including the jobs it might have just switched off.
+  the complete automatic matrix, including any automatically gated jobs it
+  might have just switched off. Explicit `/run-a5` hardware suites remain manual.
 
 The corollary is a habit, not a pattern: **adding a top-level config file or a
 tooling workflow is a change-detection event.** Ask whether `NON_CODE` needs to
@@ -61,12 +66,12 @@ is wrong (see §1) — fix that instead of widening the gate.
 | Axis | Output | Answers |
 | ---- | ------ | ------- |
 | non-code | `non_code_only` | can this diff change what the code does at all? |
-| architecture | `a2a3_changed` / `a5_changed` | which silicon can it reach? |
+| architecture | `a2a3_changed` / `a5_changed` / `wse_changed` | which platform can it reach? |
 | test category | `st_affected` / `ut_affected` | which suite can it break? |
 | corpus | `examples_only` / `tests_only` | can it reach a job that builds the product and runs a fixed payload? |
 
 They are layered, not redundant. **Every arch and category flag subtracts
-`NON_CODE` before deciding**, so a non-code-only change already makes all four
+`NON_CODE` before deciding**, so a non-code-only change already makes every architecture and category flag
 false. An arch- or category-gated job therefore needs no separate non-code
 check, and adding one would be noise.
 
@@ -74,10 +79,14 @@ A job composes the axes it is actually subject to:
 
 | Job family | Gate |
 | ---------- | ---- |
-| `st-sim-*`, `st-onboard-*` | `<arch>_changed && st_affected` |
+| `st-sim-{a2a3,a5}`, `st-onboard-*` | `<arch>_changed && st_affected` |
+| `st-sim-wse` | `wse_changed && st_affected` |
 | `profiling-flags-smoke` | `(a2a3_changed \|\| a5_changed) && !examples_only && !tests_only` |
 | `ut`, `ut-a2a3`, `ut-a5` | `non_code_only != true && ut_affected` |
 | `packaging-matrix` | `non_code_only != true && !examples_only && !tests_only` |
+
+WSE has a simulation scene job and no onboard job. `profiling-flags-smoke`
+exercises A2/A3 and A5; WSE dependency capture runs in `_st-sim-wse.yml`.
 
 `packaging-matrix` and `profiling-flags-smoke` build and install the product and
 then exercise it with a **fixed, tiny payload** — packaging's entry-point smoke
@@ -97,10 +106,9 @@ contracts, so the cost of a falsely-skipped regression outweighs the minutes.
 That is a decision about the *arch* axis only; the category axis is a different
 question, because a scene-test-only change genuinely cannot break a unit test.
 
-The vocabulary exists once, in `.github/workflows/_detect-changes.yml`. Both
-`.github/workflows/ci.yml` and `.github/workflows/ci-self-cpu.yml` call that
-workflow and consume the same output names. Do not reintroduce a lane-local
-copy. That copy drifted twice — `examples_only` never reached the CPU lane
+The vocabulary exists once, in `.github/workflows/_detect-changes.yml`.
+`.github/workflows/ci.yml` calls that workflow and consumes its declared
+output names. Do not duplicate these filters in a caller. Historical copies drifted twice — `examples_only` never reached the self-hosted lane
 (#1607), and `tests_only` did not either (#1635). Any change to an axis now
 means one detector file plus any consumers whose `if:` expression actually
 changes.
@@ -126,6 +134,22 @@ rather than invent one:
   root `conftest.py`, `pyproject.toml`, `simpler_setup/` and `tests/lint/`
   belong to no single partition, so they match no `SIBLING` and flip every flag
   true — which is what they should do, since both suites load them.
+
+### Explicit manual-only benchmark
+
+`tests/fdwic/dsv41_scheduler/` is a self-contained manual benchmark, including
+its local CPU checks. The canonical detector removes this exact subtree from
+`AUTO_TEST_FILES`, used only for architecture and ST/UT impact. It is **not**
+non-code: retain the original `FILES` for `NON_CODE`, packaging/corpus checks
+and the initial fail-open guard. Pre-commit remains unconditional.
+
+Do not extend this exception to all of `tests/fdwic/`, `tests/`, shared unit
+tests or imported runtime helpers. Mixed changes must still select the checks
+required by the remaining automatic files. Validate manual-only, mixed,
+similarly named sibling, workflow and unattributable diffs with the actual
+shell detector, and verify the resulting job gates rather than only flags.
+The manual benchmark's own checks stay under its directory and are explicitly
+invoked by its operator; they do not require a new automatic CI job.
 
 ## 5. Fail open once, at the top
 
@@ -180,8 +204,8 @@ bug shows up as a green check, so "CI passed" is not evidence.** Where the
 change is to `NON_CODE` itself, replay the pattern locally against
 representative file lists — a docs-only set, a `.gitignore`-only set, a
 single-arch set, a CI workflow set — and check all four land where you
-intended before pushing. Where the change is to an *axis*, also verify both callers
-consume only outputs declared by the canonical reusable workflow:
+intended before pushing. Where the change is to an *axis*, also verify that the caller
+consumes only outputs declared by the canonical reusable workflow:
 
 ```bash
 echo "== declared by _detect-changes.yml"
@@ -194,7 +218,7 @@ awk '
 
 echo "== consumed by callers"
 grep -h -oE 'needs\.detect-changes\.outputs\.[a-z0-9_]+' \
-  .github/workflows/ci.yml .github/workflows/ci-self-cpu.yml |
+  .github/workflows/ci.yml |
   sed 's/.*outputs\.//' | sort -u
 ```
 

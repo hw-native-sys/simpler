@@ -50,7 +50,7 @@
 #include <string>
 #include <type_traits>
 
-#include "data_type.h"
+#include "tensor_geometry.h"
 
 // Leading sentinel of a BufferDescriptor, NOT a version. A descriptor decoder needs a cheap
 // leading discriminator because `TaskArgs.add_tensor` accepts raw bytes; the sentinel rejects most
@@ -86,7 +86,7 @@ enum class AccessMode : uint8_t {
 
 // Materialization backend of a buffer. The consumer resolves a Tensor to a local address via the
 // import registry keyed by canonical identity; this tag selects how. REMOTE_SIDECAR is reserved for
-// P2 and rejected on decode in P1. Values 0–5 are frozen; VMM_SHAREABLE is 6; 7.. reserved
+// P2 and rejected on decode in P1. Values 0–7 are assigned; 8.. reserved
 // (unknown tag => reject).
 //
 // FORK_SHM and FORK_COW materialize identically — the body is a base VA the child already has,
@@ -106,6 +106,7 @@ enum class BackendKind : uint8_t {
     DEVICE_MALLOC = 4,
     FORK_COW = 5,
     VMM_SHAREABLE = 6,
+    SHARED_FD_SLICE = 7,
 };
 
 /**
@@ -234,45 +235,6 @@ struct Tensor {
     uint8_t _pad[3];
 };
 
-// Saturating u64 arithmetic. Every input below is wire-supplied, and `shapes[i]` and `strides[i]`
-// are each u32, so one product alone reaches ~2^64: an unsaturated sum would wrap to a SMALL extent
-// and pass the bound check in validate_tensor while the view really spans exabytes.
-inline uint64_t tensor_mul_sat(uint64_t a, uint64_t b) {
-#if defined(__clang__) || defined(__GNUC__)
-    uint64_t result = 0;
-    return __builtin_mul_overflow(a, b, &result) ? UINT64_MAX : result;
-#else
-    return (a != 0 && b > UINT64_MAX / a) ? UINT64_MAX : a * b;
-#endif
-}
-inline uint64_t tensor_add_sat(uint64_t a, uint64_t b) {
-#if defined(__clang__) || defined(__GNUC__)
-    uint64_t result = 0;
-    return __builtin_add_overflow(a, b, &result) ? UINT64_MAX : result;
-#else
-    return (a > UINT64_MAX - b) ? UINT64_MAX : a + b;
-#endif
-}
-
-// Sentinel `tensor_extent_bytes` returns when a view's extent does not fit 64 bits. No real backing
-// is 16 EiB, so a Tensor whose extent lands here describes no representable view and is rejected.
-inline constexpr uint64_t TENSOR_EXTENT_UNREPRESENTABLE = UINT64_MAX;
-
-// Byte extent of a (possibly strided) view: the last addressable element, plus one element.
-// Saturates at TENSOR_EXTENT_UNREPRESENTABLE rather than wrapping, so an extent a hostile
-// shape/stride cannot express is rejected instead of comparing as a small, in-bounds value.
-// Callers that have not yet validated the view must not trust the result for anything but a bound.
-inline uint64_t view_extent_bytes(const uint32_t *shapes, const uint32_t *strides, uint32_t ndims, DataType dtype) {
-    uint64_t last_elem = 0;
-    for (uint32_t i = 0; i < ndims && i < static_cast<uint32_t>(MAX_TENSOR_DIMS); ++i) {
-        if (shapes[i] == 0) continue;
-        last_elem = tensor_add_sat(
-            last_elem, tensor_mul_sat(static_cast<uint64_t>(shapes[i] - 1), static_cast<uint64_t>(strides[i]))
-        );
-    }
-    return tensor_mul_sat(tensor_add_sat(last_elem, 1), get_element_size(dtype));
-}
-
 inline uint64_t tensor_extent_bytes(const Tensor &r) {
     return view_extent_bytes(r.shapes, r.strides, r.ndims, r.dtype);
 }
@@ -298,7 +260,7 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
     if (h.address_space > static_cast<uint8_t>(AddressSpace::DEVICE))
         reject("invalid BufferDescriptor: address_space out of range");
     if (h.access > static_cast<uint8_t>(AccessMode::READWRITE)) reject("invalid BufferDescriptor: access out of range");
-    if (h.backend_kind > static_cast<uint8_t>(BackendKind::VMM_SHAREABLE))
+    if (h.backend_kind > static_cast<uint8_t>(BackendKind::SHARED_FD_SLICE))
         reject("invalid BufferDescriptor: backend_kind out of range");
     if (h.body_len > DESC_MAX_BYTES) reject("invalid BufferDescriptor: body_len exceeds DESC_MAX_BYTES");
     if (h.identity.generation == 0) reject("invalid BufferDescriptor: generation 0 is reserved (uninitialized)");
@@ -348,6 +310,19 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
                 reject("invalid BufferDescriptor: POSIX_SHM shm name must be printable ASCII without '/'");
             }
         }
+        break;
+    }
+    case BackendKind::SHARED_FD_SLICE: {
+        if (h.body_len != 16) reject("invalid BufferDescriptor: SHARED_FD_SLICE body must be 16 bytes");
+        uint32_t pid = 0;
+        uint32_t fd = 0;
+        uint64_t offset = 0;
+        std::memcpy(&pid, h.body, sizeof(pid));
+        std::memcpy(&fd, h.body + 4, sizeof(fd));
+        std::memcpy(&offset, h.body + 8, sizeof(offset));
+        if (pid == 0 || fd < 3 || fd > INT32_MAX)
+            reject("invalid BufferDescriptor: SHARED_FD_SLICE process or fd is invalid");
+        if (offset > UINT64_MAX - h.nbytes) reject("invalid BufferDescriptor: SHARED_FD_SLICE span overflows uint64");
         break;
     }
     case BackendKind::VMM_SHAREABLE: {
@@ -478,9 +453,8 @@ enum class TensorOverlap : uint8_t {
  * The geometry of a view inside its backing — what decides whether two views touch a common byte.
  *
  * `ndims == 0` is the whole-backing footprint: what a caller registers when it knows a buffer is
- * touched but not which bytes (an allocation; a remote argument whose key already carries the
- * offset). No valid Tensor has `ndims == 0`, so a default-constructed footprint means exactly
- * that, and overlaps everything.
+ * touched but not which bytes (an allocation). No valid Tensor has `ndims == 0`, so a
+ * default-constructed footprint means exactly that, and overlaps everything.
  *
  * The backing's identity is deliberately absent: a footprint is only ever compared against
  * another over the SAME backing, which the caller establishes — a shared dependency key, or the

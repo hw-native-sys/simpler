@@ -168,3 +168,29 @@ def test_a_prompt_that_is_not_the_pinned_one_is_refused(tmp_path, monkeypatch):
     report = validator.validate_inputs(model_dir=model_dir, prompt=prompt, fixture=None, artifact=None)
     assert report["prompt"] == validator.EXPECTED_PROMPT
     assert set(report["model_checksums"]) == set(validator.EXPECTED_MODEL_FILES)
+
+
+def test_checkpoint_verifies_all_consumed_shards_against_pinned_digests(tmp_path, monkeypatch):
+    validator = _validator()
+    model = _model_dir(tmp_path)
+    shards = {"part-a.safetensors": b"first", "part-b.safetensors": b"second"}
+    for name, payload in shards.items():
+        (model / name).write_bytes(payload)
+    (model / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"a": "part-a.safetensors", "b": "part-b.safetensors"}})
+    )
+    pinned = {name: hashlib.sha256((model / name).read_bytes()).hexdigest() for name in validator.EXPECTED_MODEL_FILES}
+    monkeypatch.setattr(validator, "EXPECTED_MODEL_FILES", pinned)
+    monkeypatch.setattr(
+        validator,
+        "EXPECTED_SHARD_FILES",
+        {name: hashlib.sha256(payload).hexdigest() for name, payload in shards.items()},
+    )
+    observed = validator.validate_checkpoint(model)
+    assert set(observed) == set(pinned) | set(shards)
+    (model / "part-b.safetensors").write_bytes(b"replaced")
+    with pytest.raises(ValueError, match="part-b"):
+        validator.validate_checkpoint(model)
+    del validator.EXPECTED_SHARD_FILES["part-a.safetensors"]
+    with pytest.raises(ValueError, match="unpinned"):
+        validator.validate_checkpoint(model)

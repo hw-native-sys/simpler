@@ -12,8 +12,28 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <optional>
+#include <utility>
 
 #include "common/chip_swimlane_extension.h"
+#include "host/scheduler_notifications.h"
+
+struct CoreAsyncCapability;
+
+// Registration-owned host metadata, borrowed while that callable is retained.
+struct HostCallableAsyncCapabilities {
+    const CoreAsyncCapability *data;
+    uint32_t count;
+};
+
+// Borrowed source views, valid through stage_launch_metadata; the platform
+// captures values and never takes ownership of the source containers.
+struct HostMetadataRegion {
+    void *device_target;
+    const void *host_source;
+    size_t bytes;
+};
 
 /**
  * Host API function pointers for device memory operations.
@@ -140,6 +160,12 @@ struct HostApiOps {
     int (*acquire_scheduler_state_storage)(
         void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
     );
+    // Records which device-side scheduler a bind selected, so a caller can
+    // observe the choice after the run. The runtime publishes the same value
+    // into its own launch descriptor, but that field is cleared when the run
+    // releases its bindings; the runner's copy is what outlives the run.
+    // Called only where a selection is published, never where one is cleared.
+    void (*record_scheduler_runtime_mode)(void *runner_ctx, uint32_t pipeline_slot, uint32_t mode);
     // Runner-owned host mirror of the runtime shared memory, one retained buffer
     // per pipeline slot: the block a host-side orchestrator (host_build_graph)
     // writes its shared-memory image into before the bounded H2D ships the live
@@ -219,19 +245,25 @@ struct HostApiOps {
     // chip-swimlane level, `producer_wants_records` carries the producer's own
     // (a runtime knob the platform does not read).
     uint32_t (*get_chip_swimlane_level)(void *runner_ctx);
+    int (*get_pmu_enabled)(void *runner_ctx);
     void *(*host_phase_pool_arm)(void *runner_ctx, uint32_t pipeline_slot, int producer_wants_records);
     void (*host_phase_pool_finish)(
         void *runner_ctx, uint32_t pipeline_slot, uint64_t submitted_tasks, uint64_t invocation_id
     );
+    // One host-side JSON section this run produced. `run_epoch` is the
+    // publication's identity: a retaining collector keeps one bucket per open
+    // run and the section goes into this run's, because a predecessor publishes
+    // after its successor has been admitted and no shared slot belongs to
+    // either of them then.
     bool (*publish_chip_swimlane_extension)(
-        void *runner_ctx, ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
+        void *runner_ctx, uint64_t run_epoch, ChipSwimlaneExtensionSection section, const char *json_value,
+        size_t json_size
     );
-    // This run's device-published result payload, or nullptr when the run
-    // published none. The platform holds one region per pipeline slot and never
-    // interprets the bytes — the layout is the runtime's own. `run_epoch` is the
-    // epoch the caller's run was given: a region still carrying an earlier run's
-    // epoch reads as absent, so a predecessor's payload cannot be returned as
-    // this run's. See common/device_run_result.h for why the region exists and
+    // This live call's device-published result payload, or nullptr when absent
+    // or unpublished for its own `run_epoch`. The platform retains a call's
+    // result across pipeline-slot reuse; another epoch's payload is not this
+    // call's result. The platform validates the common result header, while
+    // the payload layout belongs to the runtime. See common/device_run_result.h
     // for what "absent" does and does not mean.
     const void *(*get_run_result)(void *runner_ctx, uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out);
     // Declare which caller device allocations this run produces. Taken from the orchestration
@@ -251,6 +283,31 @@ struct HostApiOps {
     // input has no declared producer and stays readable. Zero for a runner with no such
     // allocation, no other declaring run, or no table at all.
     int (*caller_device_span_written_by_other_run)(void *runner_ctx, uint64_t run_id, uint64_t addr, uint64_t bytes);
+    // Appending entries preserves existing offsets. All providers and consumers
+    // must be built with the same table definition; null fallback applies only
+    // to optional callbacks zero-initialized within that definition. An older,
+    // shorter binary table cannot safely expose these fields.
+    // Host-only runtime scratch, isolated by pipeline slot and released with
+    // the slot's retained mirrors. No pointer in this object travels to device.
+    std::shared_ptr<void> (*get_orchestration_scratch)(void *runner_ctx, uint32_t pipeline_slot);
+    void (*set_orchestration_scratch)(void *runner_ctx, uint32_t pipeline_slot, std::shared_ptr<void> scratch);
+    // An unpublished host plan survives native prepare attempts on the same slot.
+    // Optional: only automatic onboard admission can park a managed commit.
+    std::shared_ptr<void> (*get_prepare_plan)(void *runner_ctx, uint32_t pipeline_slot);
+    void (*set_prepare_plan)(void *runner_ctx, uint32_t pipeline_slot, uint64_t run_epoch, std::shared_ptr<void> plan);
+    // Replaces this slot's pending launch metadata with owned byte snapshots.
+    // An empty batch clears a previous unpublished batch. No device work is
+    // submitted here; the onboard launch owns publication and source lifetime.
+    int (*stage_launch_metadata)(
+        void *runner_ctx, uint32_t pipeline_slot, const HostMetadataRegion *regions, size_t count
+    );
+    int (*acquire_scheduler_notifications)(
+        void *runner_ctx, uint32_t pipeline_slot, SchedulerNotificationPurpose purpose, size_t count,
+        SchedulerDoneNotifications *out
+    ) = nullptr;
+    std::optional<HostCallableAsyncCapabilities> (*get_callable_async_capabilities)(
+        void *runner_ctx, int32_t callable_id
+    ) = nullptr;
 };
 
 /**
@@ -261,19 +318,56 @@ struct HostApiOps {
  */
 struct HostApi {
 public:
+    int stage_launch_metadata(const HostMetadataRegion *regions, size_t count) const {
+        if (ops_->stage_launch_metadata != nullptr)
+            return ops_->stage_launch_metadata(runner_ctx_, pipeline_slot_, regions, count);
+        // CPU transports publish during prepare and have no asynchronous reader.
+        for (size_t i = 0; i < count; ++i) {
+            const auto &region = regions[i];
+            const int rc = copy_to_device(region.device_target, region.host_source, region.bytes);
+            if (rc != 0) return rc;
+        }
+        return 0;
+    }
+
+    struct DiagnosticConfig {
+        uint32_t chip_swimlane_level;
+        bool pmu_enabled;
+    };
+
+    // Native runs supply their own selection before bind. Registration and
+    // prewarm callers without a run retain the runner-query fallback.
     HostApi(
-        void *runner_ctx, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch, const HostApiOps *ops
+        void *runner_ctx, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch, const HostApiOps *ops,
+        std::optional<DiagnosticConfig> diagnostics = std::nullopt
     ) noexcept :
         runner_ctx_(runner_ctx),
         pipeline_slot_(pipeline_slot),
         arena_bank_(arena_bank),
         run_epoch_(run_epoch),
-        ops_(ops) {}
+        ops_(ops),
+        diagnostics_(diagnostics) {}
 
     // The epoch this run was given. Runtimes that build their own swimlane
     // record streams stamp it into each row: per-task tokens restart every run,
     // so a row without it cannot be attributed once one file holds several runs.
     uint64_t run_epoch() const { return run_epoch_; }
+
+    std::optional<HostCallableAsyncCapabilities> get_callable_async_capabilities(int32_t callable_id) const {
+        if (ops_->get_callable_async_capabilities == nullptr) return std::nullopt;
+        return ops_->get_callable_async_capabilities(runner_ctx_, callable_id);
+    }
+
+    int acquire_scheduler_notifications(
+        SchedulerNotificationPurpose purpose, size_t count, SchedulerDoneNotifications *out
+    ) const {
+        if (out == nullptr) return -1;
+        if (ops_->acquire_scheduler_notifications != nullptr)
+            return ops_->acquire_scheduler_notifications(runner_ctx_, pipeline_slot_, purpose, count, out);
+        // CPU and simulator backends use the canonical GM protocol.
+        *out = {std::vector<uint64_t>(count, 0), std::vector<uint64_t>(count, 0), {}};
+        return 0;
+    }
 
     void *device_malloc(size_t size) const { return ops_->device_malloc(runner_ctx_, size); }
     void device_free(void *dev_ptr) const { ops_->device_free(runner_ctx_, dev_ptr); }
@@ -333,6 +427,23 @@ public:
             runner_ctx_, pipeline_slot_, bytes, alignment, device_out, host_out
         );
     }
+    std::shared_ptr<void> get_orchestration_scratch() const {
+        return ops_->get_orchestration_scratch == nullptr ?
+                   std::shared_ptr<void>{} :
+                   ops_->get_orchestration_scratch(runner_ctx_, pipeline_slot_);
+    }
+    void set_orchestration_scratch(std::shared_ptr<void> scratch) const {
+        if (ops_->set_orchestration_scratch != nullptr)
+            ops_->set_orchestration_scratch(runner_ctx_, pipeline_slot_, std::move(scratch));
+    }
+    std::shared_ptr<void> get_prepare_plan() const {
+        return ops_->get_prepare_plan == nullptr ? std::shared_ptr<void>{} :
+                                                   ops_->get_prepare_plan(runner_ctx_, pipeline_slot_);
+    }
+    void set_prepare_plan(std::shared_ptr<void> plan) const {
+        if (ops_->set_prepare_plan != nullptr)
+            ops_->set_prepare_plan(runner_ctx_, pipeline_slot_, run_epoch_, std::move(plan));
+    }
     int acquire_sm_mirror(size_t bytes, size_t alignment, void **addr_out) const {
         if (ops_->acquire_sm_mirror == nullptr) {
             if (addr_out != nullptr) *addr_out = nullptr;
@@ -375,7 +486,19 @@ public:
         return ops_->upload_chip_callable_buffer(runner_ctx_, callable);
     }
     uint32_t chip_swimlane_level() const {
+        if (diagnostics_) return diagnostics_->chip_swimlane_level;
         return ops_->get_chip_swimlane_level != nullptr ? ops_->get_chip_swimlane_level(runner_ctx_) : 0;
+    }
+    /**
+     * Whether this bind's run collects PMU.
+     *
+     * A runtime that reserves per-run storage for an owner asks this so a run
+     * with the owner off does not pay for it. Absent means "assume it does":
+     * a platform that cannot answer must not be told an owner is off.
+     */
+    bool pmu_enabled() const {
+        if (diagnostics_) return diagnostics_->pmu_enabled;
+        return ops_->get_pmu_enabled == nullptr || ops_->get_pmu_enabled(runner_ctx_) != 0;
     }
     /**
      * Arm this pass's host phase pool.
@@ -400,6 +523,19 @@ public:
             ops_->host_phase_pool_finish(runner_ctx_, pipeline_slot_, submitted_tasks, invocation_id);
         }
     }
+    void record_scheduler_runtime_mode(uint32_t mode) const noexcept {
+        if (ops_->record_scheduler_runtime_mode != nullptr) {
+            ops_->record_scheduler_runtime_mode(runner_ctx_, pipeline_slot_, mode);
+        }
+    }
+    /**
+     * Publish one host-side JSON section as this run's.
+     *
+     * The run epoch travels with it, taken from this instance rather than from
+     * the runner: a runner serves every run and a retained predecessor
+     * publishes while its successor is already admitted, so only the caller's
+     * own identity says whose section this is.
+     */
     bool publish_chip_swimlane_extension(
         ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
     ) const noexcept {
@@ -407,7 +543,7 @@ public:
             json_value == nullptr)
             return false;
         try {
-            return ops_->publish_chip_swimlane_extension(runner_ctx_, section, json_value, json_size);
+            return ops_->publish_chip_swimlane_extension(runner_ctx_, run_epoch_, section, json_value, json_size);
         } catch (...) {
             return false;
         }
@@ -421,6 +557,9 @@ public:
      * its publish point both read as absent. A caller decides that a run failed
      * from the execution error channel and comes here for the detail.
      */
+    void set_observed_run_status(int32_t code) noexcept { observed_run_status_ = code; }
+    std::optional<int32_t> observed_run_status() const noexcept { return observed_run_status_; }
+
     const void *run_result(size_t *bytes_out) const noexcept {
         if (ops_->get_run_result == nullptr) {
             if (bytes_out != nullptr) *bytes_out = 0;
@@ -463,11 +602,12 @@ public:
     }
 
 private:
+    std::optional<int32_t> observed_run_status_;
     /**
      * This run's identity for the caller-buffer table: its pipeline slot, offset so it is never
-     * zero. A slot holds one run for that run's whole lifetime, so it names the declaring run for
-     * exactly as long as the declaration may exist, and it is the same identity the lane's
-     * reference uses.
+     * zero. The lane ends its declarations and device borrows after physical
+     * last use, before that slot can name another execution. A late host-output
+     * observer holds separate call-owned staging and never clears this identity.
      */
     uint64_t run_identity() const noexcept { return static_cast<uint64_t>(pipeline_slot_) + 1; }
 
@@ -476,4 +616,5 @@ private:
     uint32_t arena_bank_{0};
     uint64_t run_epoch_{0};
     const HostApiOps *ops_{nullptr};
+    std::optional<DiagnosticConfig> diagnostics_;
 };

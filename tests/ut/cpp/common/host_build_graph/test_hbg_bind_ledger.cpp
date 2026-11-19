@@ -23,9 +23,11 @@
 // needed because bind takes the resolved host-orch entry points as a parameter.
 
 #include <gtest/gtest.h>
+#include "host/host_dependency_capture_scope.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -35,6 +37,7 @@
 #include <future>
 #include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -42,17 +45,26 @@
 #include "callable.h"
 #include "common/host_api.h"
 #include "common/launch_entry_args.h"
-#include "host_build_graph/graph_host_state.h"
-#include "host_build_graph/host_tensor_access.h"
+#include "host_build_graph/host/graph_host_state.h"
+#include "host_build_graph/host/dep_gen_host_graph.h"
+#include "host_build_graph/host/host_tensor_access.h"
 #include "host/raii_scope_guard.h"
 #include "host_build_graph/runtime_status.h"
 #include "runtime.h"
 #include "runtime_core.h"
-#include "host_build_graph/orchestrator.h"
+#include "host_build_graph/host/orchestrator.h"
+#include "host_build_graph/host/orch_ops.h"
 #include "task_args.h"
 #include "host/host_phase_records.h"
 #include "host/platform_compile_info.h"
 #include "worker/runtime_c_api.h"
+#include "worker/native_run_context.h"
+#if __has_include("scheduler/scheduler_args_dump.h")
+#include "scheduler/scheduler_async_layout.h"
+#include "scheduler/scheduler_args_dump.h"
+#include "scheduler/scheduler_graph.h"
+#include "scheduler/scheduler_graph_binding.h"
+#endif
 
 extern "C" int bind_callable_to_runtime_impl(
     Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
@@ -69,24 +81,27 @@ namespace {
 constexpr size_t kAlign = 1024;
 
 // Mirrors the file-local HostOrchEntryPoints in runtime_maker.cpp: bind reads
-// exactly these two function pointers out of host_orch_func_ptr.
+// exactly these function pointers out of host_orch_func_ptr. A field added there
+// and not here is read past the end of this object, so the two must move together.
 using TestOrchEntryFunc = void (*)(const ChipTaskArgs &);
-using TestOrchBindFunc = void (*)(RuntimeContext *);
+using TestOrchBindFunc = void (*)(OrchContext *);
+using TestOrchFinishFunc = void (*)();
 struct TestHostOrchEntryPoints {
     TestOrchEntryFunc entry{nullptr};
     TestOrchBindFunc bind{nullptr};
+    TestOrchFinishFunc finish{+[]() {}};
 };
 
 // An orchestration that submits nothing: this suite is about the ledger, and a
 // graph with no tasks exercises bind end to end all the same.
 void empty_orch_entry(const ChipTaskArgs & /*args*/) {}
-void empty_orch_bind(RuntimeContext * /*rt*/) {}
+void empty_orch_bind(OrchContext * /*ctx*/) {}
 
 // The wait callback releases a real recorder job only while its borrowed build
 // state is still alive. The test's boundary outlives bind even on the negative
 // path, so a missing wait is an assertion failure rather than a use-after-free.
 struct RecordingLifetime {
-    RuntimeOps ops{};
+    OrchOps ops{};
     GraphTaskArgs boundary;
     std::mutex mutex;
     std::condition_variable cv;
@@ -97,27 +112,30 @@ struct RecordingLifetime {
 };
 
 RecordingLifetime *g_recording = nullptr;
-RuntimeContext *g_recording_runtime = nullptr;
+OrchContext *g_recording_orch_context = nullptr;
 
-void recording_wait(RuntimeContext *rt) {
-    EXPECT_NE(rt->orchestrator, nullptr);
-    EXPECT_NE(rt->orchestrator->graph_host_state, nullptr);
-    EXPECT_NE(rt->tensor_access, nullptr);
+void recording_wait(OrchContext *ctx) {
+    EXPECT_NE(ctx->orchestrator, nullptr);
+    EXPECT_NE(ctx->orchestrator->graph_host_state, nullptr);
+    EXPECT_NE(ctx->tensor_access, nullptr);
     ++g_recording->wait_calls;
     {
         std::lock_guard<std::mutex> lock(g_recording->mutex);
         g_recording->release_job = true;
     }
     g_recording->cv.notify_all();
-    graph_record_wait_impl(rt);
+    graph_record_wait_impl(ctx);
     EXPECT_TRUE(g_recording->job_finished);
 }
 
-void recording_bind(RuntimeContext *rt) {
-    g_recording_runtime = rt;
-    g_recording->ops = *rt->ops;
+void recording_bind(OrchContext *ctx) {
+    g_recording_orch_context = ctx;
+    // The unbind a bind frame performs on its way out carries no context, matching
+    // the .so's own framework_bind_orch_context, which only stores the pointer.
+    if (ctx == nullptr) return;
+    g_recording->ops = *ctx->ops;
     g_recording->ops.graph_record_wait = recording_wait;
-    rt->ops = &g_recording->ops;
+    ctx->ops = &g_recording->ops;
 }
 
 void recording_entry(const ChipTaskArgs &) {
@@ -128,7 +146,7 @@ void recording_entry(const ChipTaskArgs &) {
         });
         g_recording->job_finished = true;
     };
-    if (!graph_record_start_impl(g_recording_runtime, g_recording->boundary, &job)) {
+    if (!graph_record_start_impl(g_recording_orch_context, g_recording->boundary, &job)) {
         throw std::runtime_error("could not start recorder");
     }
     if (g_recording->throw_from_entry) throw std::runtime_error("host orchestration failed");
@@ -137,7 +155,7 @@ void recording_entry(const ChipTaskArgs &) {
 enum class InputProducer { None, Allocated, Overlapping, Disjoint };
 
 struct HostAccessProbe {
-    RuntimeContext *runtime{nullptr};
+    OrchContext *orch_ctx{nullptr};
     InputProducer producer{InputProducer::None};
     bool write{false};
     // A failure of the orchestration's own, reported before it touches any tensor — the order a
@@ -150,12 +168,12 @@ struct HostAccessProbe {
 
 HostAccessProbe *g_access = nullptr;
 
-void access_bind(RuntimeContext *rt) { g_access->runtime = rt; }
+void access_bind(OrchContext *ctx) { g_access->orch_ctx = ctx; }
 
 void access_entry(const ChipTaskArgs &args) {
-    RuntimeContext *rt = g_access->runtime;
+    OrchContext *ctx = g_access->orch_ctx;
     if (g_access->pre_fatal != 0) {
-        rt->orchestrator->report_fatal(g_access->pre_fatal, "access_entry", "an independent orchestration failure");
+        ctx->orchestrator->report_fatal(g_access->pre_fatal, "access_entry", "an independent orchestration failure");
     }
     for (int i = 0; i < args.tensor_count(); ++i) {
         simpler::hbg::Tensor tensor = args.tensor(i).ref();
@@ -167,14 +185,14 @@ void access_entry(const ChipTaskArgs &args) {
                 const uint32_t shape[] = {1};
                 TensorCreateInfo output(shape, 1, DataType::UINT8);
                 task_args.add_output(output);
-                const TaskOutputTensors result = rt->orchestrator->submit_task(kernels, task_args);
+                const TaskOutputTensors result = ctx->orchestrator->submit_task(kernels, task_args);
                 ASSERT_EQ(result.size(), 1u);
                 tensor = result.get_ref(0);
                 ASSERT_TRUE(tensor.owner_task_id.is_valid());
             } else {
                 const simpler::hbg::Tensor written = tensor.slice(0, 0, 1);
                 task_args.add_output(written);
-                const TaskOutputTensors result = rt->orchestrator->submit_task(kernels, task_args);
+                const TaskOutputTensors result = ctx->orchestrator->submit_task(kernels, task_args);
                 ASSERT_TRUE(result.task_id().is_valid());
                 // Both the original device view and its aliases stay device-only.
                 ASSERT_FALSE(tensor.owner_task_id.is_valid());
@@ -183,20 +201,28 @@ void access_entry(const ChipTaskArgs &args) {
         }
         const uint32_t index[] = {0};
         if (g_access->write) {
-            set_tensor_data(rt, tensor, 1, index, 0x5a);
+            set_tensor_data(ctx, tensor, 1, index, 0x5a);
         } else {
-            g_access->reads.push_back(get_tensor_data(rt, tensor, 1, index));
+            g_access->reads.push_back(get_tensor_data(ctx, tensor, 1, index));
         }
-        g_access->error = rt->orchestrator->fatal_code.load(std::memory_order_acquire);
+        g_access->error = ctx->orchestrator->fatal_code.load(std::memory_order_acquire);
     }
 }
 
 struct FakeHostApi {
+    std::unordered_map<int32_t, HostCallableAsyncCapabilities> callable_capabilities;
+    int staging_status{0};
+    int arena_status{0};
+    bool retain_plan{false};
+    std::shared_ptr<void> prepare_plan;
+
     void *retained_addr = nullptr;
     size_t retained_size = 0;
     std::unordered_set<void *> live;
     std::vector<uint8_t> gm_heap;
     std::vector<uint8_t> runtime_arena;
+    size_t requested_arena_bytes{0};
+    size_t requested_heap_bytes{0};
     std::vector<uint8_t> sm_mirror;
     std::vector<uint8_t> definition_staging;
     // The section the bind handed to the carrier, and how many times it did.
@@ -220,7 +246,9 @@ struct FakeHostApi {
         size_t capacity{0};
         int grows{0};
     };
-    std::array<SchedulerStateSlot, PTO_PIPELINE_MAX_DEPTH> scheduler_slots{};
+    // Wider than any grant this fixture drives; the production storage is sized
+    // to the grant and this is only the stand-in it writes through.
+    std::array<SchedulerStateSlot, 4> scheduler_slots{};
     int scheduler_acquires{0};
     size_t definition_offset{0};
     int device_malloc_count{0};
@@ -233,39 +261,21 @@ struct FakeHostApi {
     // A real record pool, so what the prepare path records is observable. Armed
     // unconditionally: whether the runner would offer one is the platform's
     // decision and not what these tests are about.
-    std::vector<HostPhaseRecordBuffer> phase_buffers;
-    HostPhaseRecordPool phase_pool{};
+    simpler::dfx::HostPhaseRecordStore phase_records;
     uint64_t phase_finish_calls = 0;
 
-    HostPhaseRecordPool *arm_phase_pool() {
-        phase_buffers.assign(PLATFORM_HOST_PHASE_BUFFERS, HostPhaseRecordBuffer{});
-        phase_pool.buffers = phase_buffers.data();
-        phase_pool.buffer_count = static_cast<uint32_t>(phase_buffers.size());
-        phase_pool.next_buffer.store(0);
-        phase_pool.generation.fetch_add(1);
-        phase_pool.dropped.store(0);
-        return &phase_pool;
-    }
+    HostPhaseRecordPool *arm_phase_pool() { return prepare_plan ? phase_records.resume() : phase_records.arm(true); }
 
     size_t phase_records_of(HostPhaseKind kind, uint64_t *payload_out = nullptr) const {
         size_t found = 0;
-        for (const HostPhaseRecordBuffer &buffer : phase_buffers) {
-            const uint32_t count = buffer.count;
-            for (uint32_t i = 0; i < count && i < PLATFORM_HOST_PHASE_RECORDS_PER_BUFFER; ++i) {
-                if (buffer.records[i].kind != static_cast<uint32_t>(kind)) continue;
-                if (payload_out != nullptr) *payload_out = buffer.records[i].payload;
-                ++found;
-            }
+        for (const auto &record : phase_records.records()) {
+            if (record.kind != static_cast<uint32_t>(kind)) continue;
+            if (payload_out != nullptr) *payload_out = record.payload;
+            ++found;
         }
         return found;
     }
-    size_t phase_records_total() const {
-        size_t found = 0;
-        for (const HostPhaseRecordBuffer &buffer : phase_buffers) {
-            found += buffer.count;
-        }
-        return found;
-    }
+    size_t phase_records_total() const { return phase_records.records().size(); }
     struct H2D {
         void *dst;
         const void *src;
@@ -291,8 +301,16 @@ struct FakeHostApi {
 
 FakeHostApi *g_fake = nullptr;
 
-RuntimeContext *g_orch_runtime = nullptr;
-void capture_orch_bind(RuntimeContext *rt) { g_orch_runtime = rt; }
+void register_test_callable(
+    Runtime &runtime, const uint64_t *objects, uint64_t object_address, uint64_t entry_address, uint32_t count,
+    const CoreAsyncCapability *capabilities
+) {
+    runtime.set_callable_tables(objects, object_address, entry_address, count);
+    g_fake->callable_capabilities[runtime.get_active_callable_id()] = {capabilities, count};
+}
+
+OrchContext *g_orch_runtime = nullptr;
+void capture_orch_bind(OrchContext *ctx) { g_orch_runtime = ctx; }
 void recording_orch_entry(const ChipTaskArgs &) {
     ++g_fake->orchestration_count;
     auto &orch = *g_orch_runtime->orchestrator;
@@ -301,7 +319,7 @@ void recording_orch_entry(const ChipTaskArgs &) {
     GraphTaskArgs boundary;
     auto input = simpler::hbg::make_tensor_external(data, shape, 1);
     boundary.add_input(input);
-    auto graph = orch.graph_begin(0x521, boundary, 0x523);
+    auto graph = orch.graph_begin(0x521, boundary);
     ASSERT_TRUE(graph.recording);
     ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary));
     CoreTaskArgs task;
@@ -311,6 +329,196 @@ void recording_orch_entry(const ChipTaskArgs &) {
     ASSERT_TRUE(orch.submit_dummy_task(task).task_id().is_valid());
     ASSERT_TRUE(orch.graph_end());
     orch.graph_commit();
+}
+
+void delayed_graph_recording_orch_entry(const ChipTaskArgs &) {
+    ++g_fake->orchestration_count;
+    auto &orch = *g_orch_runtime->orchestrator;
+    uint32_t data[16]{};
+    uint32_t shape[] = {16};
+    GraphTaskArgs boundary;
+    auto input = simpler::hbg::make_tensor_external(data, shape, 1);
+    boundary.add_input(input);
+    const GraphScopeResult graph = orch.graph_begin(0x522, boundary);
+    ASSERT_TRUE(graph.recording);
+
+    std::promise<void> start_recording;
+    std::future<void> ready = start_recording.get_future();
+    bool recorded = false;
+    std::thread recorder([&] {
+        ready.wait();
+        if (!orch.graph_prepare(graph.recording_handle, boundary)) {
+            orch.graph_abort(graph.recording_handle);
+            return;
+        }
+        CoreTaskArgs task;
+        task.add_input(graph.params->tensor(0).ref());
+        TensorCreateInfo output(shape, 1, DataType::UINT32);
+        task.add_output(output);
+        if (!orch.submit_dummy_task(task).task_id().is_valid()) {
+            orch.graph_abort(graph.recording_handle);
+            return;
+        }
+        recorded = orch.graph_end();
+    });
+
+    CoreTaskArgs ordinary;
+    MixedKernels kernels{};
+    kernels.aiv0_kernel_id = 0;
+    const bool submitted = orch.submit_task(kernels, ordinary).task_id().is_valid();
+    // The recorder starts after the submit thread advances past its owning Graph shell.
+    start_recording.set_value();
+    recorder.join();
+    ASSERT_TRUE(submitted);
+    ASSERT_TRUE(recorded);
+    orch.graph_commit();
+}
+
+void concurrent_graph_recording_orch_entry(const ChipTaskArgs &) {
+    ++g_fake->orchestration_count;
+    auto *ctx = g_orch_runtime;
+    auto &orch = *ctx->orchestrator;
+    uint32_t data[16]{};
+    uint32_t shape[] = {16};
+    GraphTaskArgs boundary;
+    auto input = simpler::hbg::make_tensor_external(data, shape, 1);
+    boundary.add_input(input);
+
+    std::array<GraphScopeResult, 2> graphs;
+    graphs[0] = orch.graph_begin(0x531, boundary);
+    ASSERT_TRUE(graphs[0].recording);
+    graphs[1] = orch.graph_begin(0x532, boundary);
+    if (!graphs[1].recording) orch.graph_abort(graphs[0].recording_handle);
+    ASSERT_TRUE(graphs[1].recording);
+
+    struct Probe {
+        std::mutex mutex;
+        std::condition_variable cv;
+        int prepared{0};
+        bool release{false};
+        std::array<bool, 2> recorded{};
+    } probe;
+    std::array<bool, 2> started{};
+    auto drain = RAIIScopeGuard([&]() {
+        {
+            std::lock_guard<std::mutex> lock(probe.mutex);
+            probe.release = true;
+        }
+        probe.cv.notify_all();
+        graph_record_wait_impl(ctx);
+        for (size_t i = 0; i < graphs.size(); ++i) {
+            if (!started[i]) orch.graph_abort(graphs[i].recording_handle);
+        }
+    });
+
+    for (size_t i = 0; i < graphs.size(); ++i) {
+        std::function<void(const GraphTaskArgs &)> job =
+            [&, i, handle = graphs[i].recording_handle](const GraphTaskArgs &record_args) {
+                if (!orch.graph_prepare(handle, record_args)) {
+                    orch.graph_abort(handle);
+                    return;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(probe.mutex);
+                    ++probe.prepared;
+                }
+                probe.cv.notify_all();
+                {
+                    std::unique_lock<std::mutex> lock(probe.mutex);
+                    if (!probe.cv.wait_for(lock, std::chrono::seconds(5), [&] {
+                            return probe.release;
+                        })) {
+                        lock.unlock();
+                        orch.graph_abort(handle);
+                        return;
+                    }
+                }
+                for (size_t task_index = 0; task_index < i + 2; ++task_index) {
+                    CoreTaskArgs task;
+                    task.add_input(record_args.tensor(0).ref());
+                    TensorCreateInfo output(shape, 1, DataType::UINT32);
+                    task.add_output(output);
+                    if (!orch.submit_dummy_task(task).task_id().is_valid()) {
+                        orch.graph_abort(handle);
+                        return;
+                    }
+                }
+                probe.recorded[i] = orch.graph_end();
+            };
+        started[i] = graph_record_start_impl(ctx, *graphs[i].params, &job);
+        ASSERT_TRUE(started[i]);
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(probe.mutex);
+        ASSERT_TRUE(probe.cv.wait_for(lock, std::chrono::seconds(5), [&] {
+            return probe.prepared == 2;
+        }));
+    }
+    CoreTaskArgs ordinary;
+    MixedKernels kernels{};
+    kernels.aiv0_kernel_id = 0;
+    ASSERT_TRUE(orch.submit_task(kernels, ordinary).task_id().is_valid());
+    {
+        std::lock_guard<std::mutex> lock(probe.mutex);
+        probe.release = true;
+    }
+    probe.cv.notify_all();
+    // After the common start signal, the submitter and both recorders access
+    // their phases without another inter-thread ordering point.
+    for (int i = 0; i < 16; ++i) {
+        ASSERT_TRUE(orch.submit_task(kernels, ordinary).task_id().is_valid());
+    }
+    graph_record_wait_impl(ctx);
+    ASSERT_TRUE(probe.recorded[0]);
+    ASSERT_TRUE(probe.recorded[1]);
+    orch.graph_commit();
+}
+
+void scalar_dump_orch_entry(const ChipTaskArgs &) {
+    CoreTaskArgs args;
+    args.add_scalar(uint32_t{37});
+    args.launch_spec.set_block_num(5);
+    MixedKernels kernels{};
+    kernels.aiv0_kernel_id = 0;
+    ASSERT_TRUE(g_orch_runtime->orchestrator->submit_task(kernels, args).task_id().is_valid());
+}
+
+void native_scalar_dump_orch_entry(const ChipTaskArgs &) {
+    auto &orch = *g_orch_runtime->orchestrator;
+    GraphTaskArgs boundary;
+    boundary.add_scalar(uint32_t{37});
+    const auto graph = orch.graph_begin(0x526, boundary);
+    ASSERT_TRUE(graph.recording);
+    ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary));
+    CoreTaskArgs child;
+    child.add_scalar(graph.params->scalar(0));
+    child.launch_spec.set_block_num(3);
+    MixedKernels kernels{};
+    kernels.aic_kernel_id = kernels.aiv0_kernel_id = kernels.aiv1_kernel_id = 0;
+    ASSERT_TRUE(orch.submit_task(kernels, child).task_id().is_valid());
+    ASSERT_TRUE(orch.graph_end());
+    orch.graph_commit();
+}
+
+void pending_inline_dump_orch_entry(const ChipTaskArgs &) {
+    auto &orch = *g_orch_runtime->orchestrator;
+    CoreTaskArgs producer;
+    producer.add_scalar(uint32_t{13});
+    MixedKernels kernels{};
+    kernels.aiv0_kernel_id = 0;
+    const auto producer_id = orch.submit_task(kernels, producer).task_id();
+    ASSERT_TRUE(producer_id.is_valid());
+    CoreTaskArgs control;
+    control.add_scalar(uint32_t{37});
+    control.set_dependencies(&producer_id, 1);
+    ASSERT_TRUE(orch.submit_dummy_task(control).task_id().is_valid());
+    EXPECT_FALSE(orch.sm_header->tasks.is_completed(1));
+}
+
+void native_inline_dump_orch_entry(const ChipTaskArgs &args) {
+    pending_inline_dump_orch_entry(args);
+    native_scalar_dump_orch_entry(args);
 }
 
 void ordinary_orch_entry(const ChipTaskArgs &) {
@@ -377,6 +585,9 @@ void fake_set_retained(void *, uint32_t, void *addr, size_t size) {
     g_fake->retained_size = size;
 }
 int fake_setup_static_arena(void *, uint32_t, size_t heap, size_t, size_t arena) {
+    if (g_fake->arena_status != 0) return g_fake->arena_status;
+    g_fake->requested_arena_bytes = arena;
+    g_fake->requested_heap_bytes = heap;
     g_fake->gm_heap.assign(std::max<size_t>(heap, kAlign) + kAlign, 0);
     g_fake->runtime_arena.assign(std::max<size_t>(arena, kAlign) + kAlign, 0);
     return 0;
@@ -475,6 +686,7 @@ void fake_get_graph_definition_staging(void *, uint32_t, void **addr, size_t *si
 int fake_acquire_retained_temp(
     void *runner_ctx, uint32_t pipeline_slot, size_t bytes, void **addr_out, size_t *size_out
 ) {
+    if (g_fake->staging_status != 0) return g_fake->staging_status;
     fake_get_retained(runner_ctx, pipeline_slot, addr_out, size_out);
     if (bytes == 0 || bytes <= *size_out) return 0;
     if (*addr_out != nullptr) fake_device_free(runner_ctx, *addr_out);
@@ -532,6 +744,12 @@ int fake_caller_device_span_written_by_other_run(void *, uint64_t, uint64_t addr
 const HostApiOps &fake_ops() {
     static const HostApiOps ops = []() {
         HostApiOps r{};
+        r.get_callable_async_capabilities = [](void *,
+                                               int32_t callable_id) -> std::optional<HostCallableAsyncCapabilities> {
+            const auto found = g_fake->callable_capabilities.find(callable_id);
+            if (found == g_fake->callable_capabilities.end()) return std::nullopt;
+            return found->second;
+        };
         r.device_malloc = fake_device_malloc;
         r.device_free = fake_device_free;
         r.copy_to_device = fake_copy_to_device;
@@ -547,7 +765,8 @@ const HostApiOps &fake_ops() {
         r.host_phase_pool_arm = [](void *, uint32_t, int) -> void * {
             return g_fake->arm_phase_pool();
         };
-        r.host_phase_pool_finish = [](void *, uint32_t, uint64_t, uint64_t) {
+        r.host_phase_pool_finish = [](void *, uint32_t, uint64_t tasks, uint64_t invocation) {
+            g_fake->phase_records.finish(tasks, invocation);
             ++g_fake->phase_finish_calls;
         };
         r.acquire_graph_staging = fake_acquire_graph_staging;
@@ -556,6 +775,12 @@ const HostApiOps &fake_ops() {
         r.acquire_scheduler_state_storage = fake_acquire_scheduler_state_storage;
         r.declare_caller_device_writes = fake_declare_caller_device_writes;
         r.caller_device_span_written_by_other_run = fake_caller_device_span_written_by_other_run;
+        r.get_prepare_plan = [](void *, uint32_t) {
+            return g_fake->prepare_plan;
+        };
+        r.set_prepare_plan = [](void *, uint32_t, uint64_t, std::shared_ptr<void> plan) {
+            if (g_fake->retain_plan) g_fake->prepare_plan = std::move(plan);
+        };
         return r;
     }();
     return ops;
@@ -624,7 +849,7 @@ protected:
             }
             recording.cv.notify_all();
             graph_record_wait_impl(nullptr);
-            g_recording_runtime = nullptr;
+            g_recording_orch_context = nullptr;
             g_recording = nullptr;
         });
     }
@@ -657,7 +882,7 @@ protected:
     }
 
     FakeHostApi fake_;
-    HostApi api_{nullptr, 0, 0, 0, &fake_ops()};
+    HostApi api_{nullptr, 0, 0, 1, &fake_ops()};
     TestHostOrchEntryPoints eps_{empty_orch_entry, empty_orch_bind};
 };
 
@@ -696,6 +921,7 @@ protected:
 // hbg used to reject it: the staging loop handed it to HostTensorAccessor::add,
 // which refuses an empty region, and the bind failed with "no host view". TRB
 // has always passed it through, and hbg now matches.
+
 TEST_F(HbgBindLedgerTest, AnEmptyTensorIsPassedThroughAndTakesNoSlice) {
     Runtime runtime;
     init_runtime(runtime);
@@ -765,20 +991,42 @@ TEST_F(HbgBindLedgerTest, PreparingTheRunImageDoesNotPublishIt) {
 
     // Consumed: a second publication is an error, not a second write.
     EXPECT_EQ(runtime.pending_publication().bytes, 0u);
+    auto initial = runtime.prepared_publication();
+    ASSERT_NE(initial, nullptr);
+    EXPECT_EQ(initial->source, source);
+    EXPECT_EQ(initial->device_target, target);
+    EXPECT_EQ(initial->bytes, bytes);
     EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
     EXPECT_EQ(copies_to_target(), 1u);
 
     ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+    EXPECT_EQ(runtime.prepared_publication(), nullptr);
+    EXPECT_EQ(initial->source, source);
+    EXPECT_EQ(initial->bytes, bytes);
 }
 
-// One trace spans preparation and publication. The image's H2D segment is the
-// publication's to record, and the trace the bind armed has to still be open when
-// it does — a trace that ended at the bind's return would drop the segment
-// silently, leaving the timeline with no host-to-device handover for the run's
-// largest transfer. Asserted against a real record pool: the kind has to be
-// present with the published byte count, and other segments have to be there too,
-// so a recorder that was never armed cannot pass this by recording nothing.
-TEST_F(HbgBindLedgerTest, ThePublicationRecordsTheArenaH2dSegment) {
+TEST_F(HbgBindLedgerTest, CapturedPublicationKeepsNotificationResourcesAfterBindingsRelease) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto resource = std::make_shared<uint32_t>(0);
+    std::weak_ptr<uint32_t> lifetime = resource;
+    runtime.retain_pending_resource(resource);
+    resource.reset();
+    runtime.retain_prepared_publication(runtime.take_pending_publication());
+    auto captured = runtime.prepared_publication();
+    ASSERT_NE(captured, nullptr);
+    ASSERT_EQ(captured->resources.size(), 1u);
+    runtime.clear_pending_publication();
+    runtime.clear_prepared_publication();
+    EXPECT_FALSE(lifetime.expired());
+    captured.reset();
+    EXPECT_TRUE(lifetime.expired());
+}
+
+// Preparation and metadata staging share one trace. The staging segment names
+// the host work even on a synchronous fallback backend; it is not a device
+// upload anchor. The actual launch-owned enqueue is outside the bind interval.
+TEST_F(HbgBindLedgerTest, ThePublicationRecordsTheImageStagingSegment) {
     Runtime runtime;
     init_runtime(runtime);
     std::vector<uint8_t> payload(64, 0x33);
@@ -792,19 +1040,51 @@ TEST_F(HbgBindLedgerTest, ThePublicationRecordsTheArenaH2dSegment) {
 
     // The bind recorded its own segments, so the pool is live and armed.
     EXPECT_GT(fake_.phase_records_total(), 0u) << "no phase records at all: the recorder was never armed";
-    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindArenaH2d), 0u) << "the bind recorded a copy it did not perform";
+    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindImageStage), 0u)
+        << "the bind recorded image staging it did not perform";
 
     ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
 
     uint64_t recorded_bytes = 0;
-    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindArenaH2d, &recorded_bytes), 1u)
-        << "the publication's host-to-device segment was dropped";
-    EXPECT_EQ(recorded_bytes, published_bytes) << "the segment's byte count is not the one published";
+    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindImageStage, &recorded_bytes), 1u)
+        << "the publication's host staging segment was dropped";
+    EXPECT_EQ(recorded_bytes, published_bytes) << "the segment's byte count is not the staged image size";
     // The trace closes once, over preparation and publication together.
     EXPECT_EQ(fake_.phase_finish_calls, 1u);
 
     ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
     EXPECT_EQ(fake_.phase_finish_calls, 1u) << "releasing a published run closed a second trace";
+}
+
+TEST_F(HbgBindLedgerTest, StagedImageRecordsHostWorkWithoutAnUploadAnchor) {
+    Runtime runtime;
+    init_runtime(runtime);
+    std::vector<uint8_t> payload(64, 0x33);
+    ChipStorageTaskArgs args;
+    args.add_tensor(host_tensor(payload));
+    ArgDirection sig[1] = {ArgDirection::INOUT};
+    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
+    const auto copies_before = fake_.copies.size();
+    std::vector<HostMetadataRegion> staged;
+    HostApiOps ops = fake_ops();
+    ops.stage_launch_metadata = [](void *context, uint32_t, const HostMetadataRegion *regions, size_t count) {
+        auto &snapshot = *static_cast<std::vector<HostMetadataRegion> *>(context);
+        snapshot.assign(regions, regions + count);
+        return 0;
+    };
+    HostApi api(&staged, 0, 0, 1, &ops);
+    ASSERT_EQ(publish_run_image_impl(&runtime, &api), 0);
+    ASSERT_FALSE(staged.empty());
+    EXPECT_EQ(fake_.copies.size(), copies_before);
+    EXPECT_TRUE(fake_.phase_records.device_upload_records().empty());
+    size_t stages = 0;
+    for (const auto &record : fake_.phase_records.records())
+        if (std::strcmp(host_phase_kind_name(static_cast<HostPhaseKind>(record.kind)), "image_stage") == 0) {
+            ++stages;
+            EXPECT_EQ(record.payload, runtime.prepared_publication()->bytes);
+        }
+    EXPECT_EQ(stages, 1u);
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
 }
 
 // A preparation nobody publishes still closes its trace exactly once, at the
@@ -850,6 +1130,57 @@ TEST_F(HbgBindLedgerTest, AnUnpublishedBindLeavesTheImageTargetUnwritten) {
     // loss.
     EXPECT_EQ(publish_run_image_impl(&runtime, &api_), 0);
     ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+}
+
+TEST_F(HbgBindLedgerTest, TaskImagePublicationMatchesTheDeviceArenaContract) {
+    for (auto entry : {empty_orch_entry, ordinary_orch_entry, recording_orch_entry}) {
+        SCOPED_TRACE(entry == recording_orch_entry ? "Graph" : entry == empty_orch_entry ? "empty" : "ordinary");
+        eps_ = {entry, capture_orch_bind};
+        Runtime runtime;
+        init_runtime(runtime);
+        auto cleanup = cleanup_runtime(runtime);
+        auto callable =
+            make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0, {1, CoreAsyncMode::SYNCHRONOUS, 0, 0, 0});
+        reinterpret_cast<CoreCallable *>(callable.data())->set_resolved_addr(0x1000);
+        const uint64_t objects[] = {reinterpret_cast<uint64_t>(callable.data())};
+        const uint64_t entries[] = {0x1000};
+        register_test_callable(
+            runtime, objects, reinterpret_cast<uint64_t>(objects), reinterpret_cast<uint64_t>(entries), 1,
+            &reinterpret_cast<const CoreCallable *>(objects[0])->async_capability_
+        );
+        ChipStorageTaskArgs args;
+        ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+        const auto &publication = runtime.pending_publication();
+        const auto *arena = static_cast<const char *>(fake_acquire_runtime_arena(nullptr, 0));
+        const auto *sm = static_cast<const char *>(runtime.get_gm_sm_ptr());
+        ASSERT_NE(publication.source, nullptr);
+        ASSERT_NE(sm, nullptr);
+        const bool resident = std::strcmp(get_platform(), "a5sim") == 0;
+        if (resident) {
+            EXPECT_EQ(sm, arena);
+            EXPECT_EQ(publication.device_target, arena);
+            EXPECT_EQ(publication.bytes, runtime.dev.sm_image_bytes);
+            EXPECT_EQ(fake_.requested_arena_bytes, runtime.dev.sm_image_bytes);
+            EXPECT_EQ(runtime.get_prebuilt_arena_base(), nullptr);
+            EXPECT_EQ(runtime.get_prebuilt_runtime_offset(), 0u);
+        } else {
+            ASSERT_EQ(runtime.get_prebuilt_arena_base(), arena);
+            EXPECT_GT(sm, arena);
+            EXPECT_LT(static_cast<const char *>(publication.device_target), sm);
+            const auto *rt = reinterpret_cast<const RuntimeContext *>(
+                static_cast<const char *>(publication.source) +
+                (runtime.get_prebuilt_runtime_offset() - (static_cast<const char *>(publication.device_target) - arena))
+            );
+            EXPECT_NE(rt->scheduler, nullptr);
+            EXPECT_NE(rt->aicore_mailbox, nullptr);
+            EXPECT_EQ(fake_.requested_arena_bytes, static_cast<size_t>(sm - arena) + runtime.dev.sm_image_bytes);
+        }
+        ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+        if (!resident) {
+            const auto *header = static_cast<const SharedMemoryHeader *>(runtime.get_gm_sm_ptr());
+            EXPECT_EQ(header->tasks.total_tasks, runtime.dev.host_total_tasks);
+        }
+    }
 }
 
 // What the device image is allowed to contain. The boundary is already a
@@ -919,7 +1250,7 @@ TEST_F(HbgBindLedgerTest, TheDeviceImageCarriesNoHostOnlyBytes) {
     EXPECT_EQ(uploaded.sm_image_bytes, runtime.dev.sm_image_bytes);
     EXPECT_EQ(uploaded.gm_sm_ptr_, runtime.get_gm_sm_ptr());
     EXPECT_EQ(uploaded.prebuilt_runtime_offset_, runtime.get_prebuilt_runtime_offset())
-        << "the last device-read field ahead of the handshake region must be inside the upload";
+        << "the retained prebuilt-arena ABI field must be inside the upload";
     EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
 }
 
@@ -987,29 +1318,126 @@ TEST_F(HbgBindLedgerTest, AllMetadataSourcesSurviveBindAndPublishInOrder) {
     ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
     EXPECT_EQ(fake_.copy_count, 0);
     EXPECT_EQ(fake_.orchestration_count, 1);
+    const bool native = std::strcmp(get_platform(), "a5sim") == 0;
     const auto &pending = runtime.pending_publication();
-    // The Definition bytes are no longer a publication prerequisite: the bind
-    // hands them to the launch carrier, so the only metadata left to copy is the
-    // run image itself.
-    ASSERT_EQ(pending.prerequisites.size(), 0u);
-    EXPECT_EQ(fake_.section_publications, 1u);
-    const auto definition_bytes = fake_.published_section.size();
-    EXPECT_GT(definition_bytes, 0u);
-    EXPECT_EQ(runtime.get_graph_section_bytes(), definition_bytes);
-    EXPECT_EQ(runtime.get_graph_section_source(), GraphSectionSource::LaunchEnvelope);
-    EXPECT_EQ(runtime.get_graph_section_base(), 0u) << "the launch carrier publishes no shared address";
+    ASSERT_EQ(pending.prerequisites.size(), static_cast<size_t>(native));
+    EXPECT_EQ(fake_.section_publications, native ? 0u : 1u);
+    EXPECT_EQ(
+        runtime.get_graph_section_source(), native ? GraphSectionSource::None : GraphSectionSource::LaunchEnvelope
+    );
+    EXPECT_EQ(runtime.get_graph_section_bytes(), fake_.published_section.size());
+    EXPECT_EQ(runtime.get_graph_section_base(), 0u);
+    uint64_t packed_bytes = 0;
+    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindGraphPack, &packed_bytes), 1u);
+    EXPECT_GT(packed_bytes, 0u);
+    if (!native) EXPECT_EQ(packed_bytes, fake_.published_section.size());
     auto *image_target = pending.device_target;
     const auto image_bytes = pending.bytes;
+    std::vector<uint8_t> scheduler_snapshot;
+    if (native) {
+        const auto &region = pending.prerequisites.front();
+        const auto *source = static_cast<const uint8_t *>(region.source);
+        scheduler_snapshot.assign(source, source + region.bytes);
+    }
     ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
-    ASSERT_EQ(fake_.copies.size(), 1u);
-    EXPECT_EQ(fake_.copies[0].dst, image_target);
-    EXPECT_EQ(fake_.copies[0].bytes, image_bytes);
-    uint64_t recorded_bytes = 0;
-    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindGraphPack, &recorded_bytes), 1u);
-    EXPECT_EQ(recorded_bytes, definition_bytes);
+    ASSERT_EQ(fake_.copies.size(), 1u + static_cast<size_t>(native));
+    EXPECT_EQ(fake_.copies.back().dst, image_target);
+    EXPECT_EQ(fake_.copies.back().bytes, image_bytes);
+    if (native)
+        EXPECT_EQ(std::memcmp(fake_.copies.front().dst, scheduler_snapshot.data(), scheduler_snapshot.size()), 0);
     EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
-    EXPECT_EQ(fake_.copies.size(), 1u) << "a second publication of the same run copies nothing";
-    EXPECT_EQ(fake_.section_publications, 1u) << "and hands the carrier nothing a second time";
+    EXPECT_EQ(fake_.copies.size(), 1u + static_cast<size_t>(native));
+    EXPECT_EQ(fake_.section_publications, native ? 0u : 1u);
+    EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+}
+
+TEST_F(HbgBindLedgerTest, DelayedGraphRecordingKeepsItsOwningSubmitIndex) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto callable =
+        make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0, {1, CoreAsyncMode::SYNCHRONOUS, 0, 0, 0});
+    reinterpret_cast<CoreCallable *>(callable.data())->set_resolved_addr(0x1000);
+    const uint64_t objects[] = {reinterpret_cast<uint64_t>(callable.data())};
+    const uint64_t entries[] = {0x1000};
+    register_test_callable(
+        runtime, objects, reinterpret_cast<uint64_t>(objects), reinterpret_cast<uint64_t>(entries), 1,
+        &reinterpret_cast<const CoreCallable *>(objects[0])->async_capability_
+    );
+    eps_ = {delayed_graph_recording_orch_entry, capture_orch_bind};
+    ChipStorageTaskArgs args;
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+
+    const auto records = fake_.phase_records.records();
+    const auto find_phase = [&](HostPhaseKind kind) {
+        return std::find_if(records.begin(), records.end(), [kind](const HostPhaseRecord &record) {
+            return record.kind == static_cast<uint32_t>(kind);
+        });
+    };
+    const auto graph_submit = find_phase(HostPhaseKind::OrchGraphSubmit);
+    const auto ordinary_submit = find_phase(HostPhaseKind::OrchSubmitTask);
+    const auto sub_task = find_phase(HostPhaseKind::OrchRecordSubTask);
+    const auto definition = find_phase(HostPhaseKind::OrchBuildDefinition);
+    ASSERT_NE(graph_submit, records.end());
+    ASSERT_NE(ordinary_submit, records.end());
+    ASSERT_NE(sub_task, records.end());
+    ASSERT_NE(definition, records.end());
+    EXPECT_EQ(ordinary_submit->index, graph_submit->index + 1);
+    EXPECT_EQ(sub_task->index, graph_submit->index);
+    EXPECT_EQ(definition->index, graph_submit->index);
+    EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+}
+
+TEST_F(HbgBindLedgerTest, ConcurrentGraphRecordingsKeepTheirOwnSubmitIndices) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto callable =
+        make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0, {1, CoreAsyncMode::SYNCHRONOUS, 0, 0, 0});
+    reinterpret_cast<CoreCallable *>(callable.data())->set_resolved_addr(0x1000);
+    const uint64_t objects[] = {reinterpret_cast<uint64_t>(callable.data())};
+    const uint64_t entries[] = {0x1000};
+    register_test_callable(
+        runtime, objects, reinterpret_cast<uint64_t>(objects), reinterpret_cast<uint64_t>(entries), 1,
+        &reinterpret_cast<const CoreCallable *>(objects[0])->async_capability_
+    );
+    eps_ = {concurrent_graph_recording_orch_entry, capture_orch_bind};
+    ChipStorageTaskArgs args;
+    const uint64_t task_window[4] = {32, 0, 0, 0};
+    ASSERT_EQ(
+        bind_callable_to_runtime_impl(&runtime, &api_, &args, &eps_, nullptr, 0, task_window, nullptr, nullptr), 0
+    );
+
+    const auto records = fake_.phase_records.records();
+    const auto phases = [&](HostPhaseKind kind) {
+        std::vector<HostPhaseRecord> found;
+        for (const HostPhaseRecord &record : records) {
+            if (record.kind == static_cast<uint32_t>(kind)) found.push_back(record);
+        }
+        return found;
+    };
+    const auto shells = phases(HostPhaseKind::OrchGraphSubmit);
+    const auto ordinary = phases(HostPhaseKind::OrchSubmitTask);
+    const auto subtasks = phases(HostPhaseKind::OrchRecordSubTask);
+    const auto definitions = phases(HostPhaseKind::OrchBuildDefinition);
+    ASSERT_EQ(shells.size(), 2u);
+    ASSERT_EQ(ordinary.size(), 17u);
+    ASSERT_EQ(subtasks.size(), 5u);
+    ASSERT_EQ(definitions.size(), 2u);
+    EXPECT_EQ(fake_.phase_records.dropped_records(), 0u);
+    EXPECT_EQ(shells[1].index, shells[0].index + 1);
+    EXPECT_EQ(ordinary[0].index, shells[1].index + 1);
+    EXPECT_NE(definitions[0].thread_id, definitions[1].thread_id);
+    for (const HostPhaseRecord &definition : definitions) {
+        ASSERT_TRUE(definition.payload == 2 || definition.payload == 3);
+        const uint32_t owning_index = shells[definition.payload - 2].index;
+        EXPECT_EQ(definition.index, owning_index);
+        size_t own_subtasks = 0;
+        for (const HostPhaseRecord &subtask : subtasks) {
+            if (subtask.thread_id != definition.thread_id) continue;
+            ++own_subtasks;
+            EXPECT_EQ(subtask.index, owning_index);
+        }
+        EXPECT_EQ(own_subtasks, definition.payload);
+    }
     EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
 }
 
@@ -1017,24 +1445,25 @@ TEST_F(HbgBindLedgerTest, SchedulerModeChangesPublishOnlyThisRunsSources) {
     Runtime runtime;
     init_runtime(runtime);
     auto cleanup = cleanup_runtime(runtime);
-    auto callable = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0);
+    auto callable =
+        make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0, {1, CoreAsyncMode::SYNCHRONOUS, 0, 0, 0});
     reinterpret_cast<CoreCallable *>(callable.data())->set_resolved_addr(0x1000);
     // The one-entry function tables a registration would own for this callable:
     // the object view addresses the CoreCallable, the entry view carries the
     // address the a5 AICore scheduler dispatches through.
     const uint64_t object_table[] = {reinterpret_cast<uint64_t>(callable.data())};
     const uint64_t entry_table[] = {0x1000};
-    runtime.set_callable_tables(
-        object_table, reinterpret_cast<uint64_t>(object_table), reinterpret_cast<uint64_t>(entry_table), 1
+    register_test_callable(
+        runtime, object_table, reinterpret_cast<uint64_t>(object_table), reinterpret_cast<uint64_t>(entry_table), 1,
+        &reinterpret_cast<const CoreCallable *>(object_table[0])->async_capability_
     );
     const bool a5 = std::strcmp(get_platform(), "a5sim") == 0;
     uint32_t resident_mode = 0;
-    uint32_t graph_mode = 0;
-    // A5 selects resident for ordinary/Mix tasks and legacy for GRAPH. A2/A3
-    // uses AICPU scheduling throughout, with no resident scheduler region.
+    // A5 keeps ordinary, MIX and Graph nodes in one resident state. A2/A3
+    // carries Definitions through its AICPU launch package.
     for (TestOrchEntryFunc entry : {ordinary_orch_entry, recording_orch_entry, mixed_orch_entry, ordinary_orch_entry}) {
         SCOPED_TRACE(entry == recording_orch_entry ? "graph" : entry == mixed_orch_entry ? "mixed" : "ordinary");
-        const bool resident = a5 && entry != recording_orch_entry;
+        const bool resident = a5;
         const bool definitions = entry == recording_orch_entry;
         fake_.copy_count = 0;
         fake_.copies.clear();
@@ -1044,10 +1473,9 @@ TEST_F(HbgBindLedgerTest, SchedulerModeChangesPublishOnlyThisRunsSources) {
         ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
         EXPECT_EQ(fake_.copy_count, 0);
         const auto &pending = runtime.pending_publication();
-        // Only the resident scheduler state is a prerequisite now; a Definition
-        // travels in the launch package instead of a publication copy.
+        // Native Definitions share the scheduler-state publication.
         ASSERT_EQ(pending.prerequisites.size(), static_cast<size_t>(resident));
-        EXPECT_EQ(fake_.section_publications, definitions ? 1u : 0u);
+        EXPECT_EQ(fake_.section_publications, definitions && !a5 ? 1u : 0u);
         std::vector<void *> destinations;
         std::vector<std::vector<uint8_t>> snapshots;
         for (const auto &region : pending.prerequisites) {
@@ -1057,30 +1485,14 @@ TEST_F(HbgBindLedgerTest, SchedulerModeChangesPublishOnlyThisRunsSources) {
             snapshots.emplace_back(source, source + region.bytes);
         }
         if (a5) {
-            // The bootstrap inputs are host-authored and per run, not per worker:
-            // workers[i].aicpu_ready and .task now carry the AICPU's handshake alone.
-            // Worker i derives its own context from the base, which the AICore does
-            // through scheduler_worker_context_address; that derivation is covered by
-            // test_a5_hbg_scheduler_bootstrap and not re-asserted here.
             const uint32_t mode = runtime.dev.scheduler_bootstrap.runtime_mode;
             const uint64_t base = runtime.dev.scheduler_bootstrap.worker_context_base;
             EXPECT_NE(mode, 0u);
-            if (resident) {
-                if (resident_mode == 0) resident_mode = mode;
-                EXPECT_EQ(mode, resident_mode);
-                const auto &scheduler = pending.prerequisites.front();
-                EXPECT_GE(base, reinterpret_cast<uint64_t>(scheduler.device_target));
-                EXPECT_LT(base, reinterpret_cast<uint64_t>(scheduler.device_target) + scheduler.bytes);
-            } else {
-                EXPECT_EQ(base, 0u) << "legacy launch must not borrow a previous scheduler";
-                EXPECT_NE(mode, resident_mode);
-                if (definitions) {
-                    if (graph_mode == 0) graph_mode = mode;
-                    EXPECT_EQ(mode, graph_mode);
-                } else {
-                    EXPECT_NE(mode, graph_mode);
-                }
-            }
+            if (resident_mode == 0) resident_mode = mode;
+            EXPECT_EQ(mode, resident_mode);
+            const auto &scheduler = pending.prerequisites.front();
+            EXPECT_GE(base, reinterpret_cast<uint64_t>(scheduler.device_target));
+            EXPECT_LT(base, reinterpret_cast<uint64_t>(scheduler.device_target) + scheduler.bytes);
             for (int i = 0; i < runtime.get_worker_count(); ++i) {
                 EXPECT_EQ(runtime.dev.workers[i].task, 0u) << "handshake state is the AICPU's to write";
                 EXPECT_EQ(runtime.dev.workers[i].aicpu_ready, 0u);
@@ -1112,23 +1524,23 @@ TEST_F(HbgBindLedgerTest, SchedulerPublicationFailureAllowsFreshModeSelection) {
     Runtime runtime;
     init_runtime(runtime);
     auto cleanup = cleanup_runtime(runtime);
-    auto callable = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0);
+    auto callable =
+        make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0, {1, CoreAsyncMode::SYNCHRONOUS, 0, 0, 0});
     reinterpret_cast<CoreCallable *>(callable.data())->set_resolved_addr(0x1000);
     // The one-entry function tables a registration would own for this callable:
     // the object view addresses the CoreCallable, the entry view carries the
     // address the a5 AICore scheduler dispatches through.
     const uint64_t object_table[] = {reinterpret_cast<uint64_t>(callable.data())};
     const uint64_t entry_table[] = {0x1000};
-    runtime.set_callable_tables(
-        object_table, reinterpret_cast<uint64_t>(object_table), reinterpret_cast<uint64_t>(entry_table), 1
+    register_test_callable(
+        runtime, object_table, reinterpret_cast<uint64_t>(object_table), reinterpret_cast<uint64_t>(entry_table), 1,
+        &reinterpret_cast<const CoreCallable *>(object_table[0])->async_capability_
     );
     const bool a5 = std::strcmp(get_platform(), "a5sim") == 0;
     for (TestOrchEntryFunc entry : {ordinary_orch_entry, recording_orch_entry, mixed_orch_entry}) {
         SCOPED_TRACE(entry == recording_orch_entry ? "graph" : entry == mixed_orch_entry ? "mixed" : "ordinary");
         // The run image, plus a resident scheduler state where one is selected.
-        // A Graph run adds nothing here: its Definition section goes to the
-        // launch carrier rather than through a publication copy.
-        const size_t regions = 1 + static_cast<size_t>(a5 && entry != recording_orch_entry);
+        const size_t regions = 1 + static_cast<size_t>(a5);
         for (size_t failure = 1; failure <= regions; ++failure) {
             SCOPED_TRACE(failure);
             fake_.copy_count = 0;
@@ -1156,7 +1568,7 @@ TEST_F(HbgBindLedgerTest, SchedulerPublicationFailureAllowsFreshModeSelection) {
             }
             fake_.fail_copy_on = 0;
             const bool definitions = entry != recording_orch_entry;
-            const bool resident = a5 && !definitions;
+            const bool resident = a5;
             eps_ = {definitions ? recording_orch_entry : ordinary_orch_entry, capture_orch_bind};
             ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
             const auto &replacement = runtime.pending_publication();
@@ -1168,14 +1580,10 @@ TEST_F(HbgBindLedgerTest, SchedulerPublicationFailureAllowsFreshModeSelection) {
                 const uint32_t mode = runtime.dev.scheduler_bootstrap.runtime_mode;
                 const uint64_t base = runtime.dev.scheduler_bootstrap.worker_context_base;
                 EXPECT_NE(mode, 0u);
-                EXPECT_NE(mode, failed_mode);
-                if (resident) {
-                    const auto &scheduler = replacement.prerequisites.front();
-                    EXPECT_GE(base, reinterpret_cast<uint64_t>(scheduler.device_target));
-                    EXPECT_LT(base, reinterpret_cast<uint64_t>(scheduler.device_target) + scheduler.bytes);
-                } else {
-                    EXPECT_EQ(base, 0u) << "legacy call must not reuse the failed scheduler";
-                }
+                EXPECT_EQ(mode, failed_mode);
+                const auto &scheduler = replacement.prerequisites.front();
+                EXPECT_GE(base, reinterpret_cast<uint64_t>(scheduler.device_target));
+                EXPECT_LT(base, reinterpret_cast<uint64_t>(scheduler.device_target) + scheduler.bytes);
             }
             ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
             ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
@@ -1275,7 +1683,7 @@ TEST_F(HbgBindLedgerTest, OldReleaseDoesNotCloseSuccessorTrace) {
     ChipStorageTaskArgs args;
     ASSERT_EQ(bind(predecessor, args, nullptr, 0), 0);
     ASSERT_EQ(publish_run_image_impl(&predecessor, &api_), 0);
-    HostApi successor_api{nullptr, 1, 1, 0, &fake_ops()};
+    HostApi successor_api{nullptr, 1, 1, 2, &fake_ops()};
     uint64_t win[4] = {8, 0, 0, 0};
     ASSERT_EQ(
         bind_callable_to_runtime_impl(&successor, &successor_api, &args, &eps_, nullptr, 0, win, nullptr, nullptr), 0
@@ -1284,7 +1692,7 @@ TEST_F(HbgBindLedgerTest, OldReleaseDoesNotCloseSuccessorTrace) {
     ASSERT_EQ(release_run_bindings_impl(&predecessor, &api_), 0);
     EXPECT_EQ(fake_.phase_finish_calls, finishes_before);
     ASSERT_EQ(publish_run_image_impl(&successor, &successor_api), 0);
-    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindArenaH2d), 1u);
+    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindImageStage), 1u);
     EXPECT_EQ(release_run_bindings_impl(&successor, &successor_api), 0);
 }
 
@@ -1334,7 +1742,7 @@ TEST_F(HbgBindLedgerTest, BindDrainsItsRecordersWithoutJoiningAnotherRuntime) {
         init_runtime(runtime);
         auto runtime_cleanup = cleanup_runtime(runtime);
         ChipStorageTaskArgs args;
-        RuntimeContext other{};
+        OrchContext other{};
         GraphTaskArgs boundary;
         std::promise<void> entered, release;
         auto released = release.get_future().share();
@@ -1538,12 +1946,14 @@ TEST_F(HbgHostAccessContractTest, DisjointDeviceWriterDoesNotGrantHostAccess) {
         auto runtime_cleanup = cleanup_runtime(runtime);
         // a5sim resolves the callable metadata while constructing its scheduler
         // image, even though this memory backend never launches the kernel.
-        auto callable = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0);
+        auto callable =
+            make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0, {1, CoreAsyncMode::SYNCHRONOUS, 0, 0, 0});
         reinterpret_cast<CoreCallable *>(callable.data())->set_resolved_addr(0x1000);
         const uint64_t object_table[] = {reinterpret_cast<uint64_t>(callable.data())};
         const uint64_t entry_table[] = {0x1000};
-        runtime.set_callable_tables(
-            object_table, reinterpret_cast<uint64_t>(object_table), reinterpret_cast<uint64_t>(entry_table), 1
+        register_test_callable(
+            runtime, object_table, reinterpret_cast<uint64_t>(object_table), reinterpret_cast<uint64_t>(entry_table), 1,
+            &reinterpret_cast<const CoreCallable *>(object_table[0])->async_capability_
         );
         std::vector<uint8_t> input(4, 0x17);
         ChipStorageTaskArgs args;
@@ -1572,13 +1982,15 @@ protected:
 
     // The one-entry function tables a registration would own: create_scheduler_state
     // refuses a task whose kernel id has no registered address.
-    void install_callable_tables(Runtime &rt) {
-        callable_ = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0);
+    void
+    install_callable_tables(Runtime &rt, CoreAsyncCapability capability = {1, CoreAsyncMode::SYNCHRONOUS, 0, 0, 0}) {
+        callable_ = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0, capability);
         reinterpret_cast<CoreCallable *>(callable_.data())->set_resolved_addr(0x1000);
         object_table_[0] = reinterpret_cast<uint64_t>(callable_.data());
         entry_table_[0] = 0x1000;
-        rt.set_callable_tables(
-            object_table_, reinterpret_cast<uint64_t>(object_table_), reinterpret_cast<uint64_t>(entry_table_), 1
+        register_test_callable(
+            rt, object_table_, reinterpret_cast<uint64_t>(object_table_), reinterpret_cast<uint64_t>(entry_table_), 1,
+            &reinterpret_cast<const CoreCallable *>(object_table_[0])->async_capability_
         );
     }
 
@@ -1589,10 +2001,127 @@ protected:
         return prerequisites.empty() ? nullptr : prerequisites.front().device_target;
     }
 
+    // Keep the predecessor's runner settings in place while preparing another
+    // slot through the real NativeRunContext and real scheduler layout builder.
+    void check_diagnostic_transition(int before_pmu, int after_pmu, int before_level, int after_level) {
+        struct Runner {
+            struct PreparedExecution {};
+            struct ActiveExecution {};
+            int pmu;
+            uint32_t level;
+            int queries{0};
+        } runner{before_pmu, static_cast<uint32_t>(before_level)};
+        HostApiOps ops = fake_ops();
+        ops.get_pmu_enabled = [](void *ctx) {
+            auto &r = *static_cast<Runner *>(ctx);
+            ++r.queries;
+            return r.pmu;
+        };
+        ops.get_chip_swimlane_level = [](void *ctx) {
+            auto &r = *static_cast<Runner *>(ctx);
+            ++r.queries;
+            return r.level;
+        };
+        CallConfig before{};
+        before.enable_pmu = before_pmu;
+        before.enable_chip_swimlane = before_level;
+        CallConfig after{};
+        after.enable_pmu = after_pmu;
+        after.enable_chip_swimlane = after_level;
+        NativeRunDescriptor first_id{};
+        first_id.run_epoch = 11;
+        NativeRunDescriptor second_id{};
+        second_id.pipeline_slot = 1;
+        second_id.arena_bank = 1;
+        second_id.run_epoch = 12;
+        NativeRunContext<Runner> first(&runner, before, 0, first_id, &ops);
+        NativeRunContext<Runner> second(&runner, after, 0, second_id, &ops);
+        auto cleanup = RAIIScopeGuard([&]() {
+            EXPECT_EQ(release_run_bindings_impl(second.runtime.get(), &second.host_api), 0);
+            EXPECT_EQ(release_run_bindings_impl(first.runtime.get(), &first.host_api), 0);
+        });
+        init_runtime(*first.runtime);
+        init_runtime(*second.runtime);
+        // Production prepare_launch_shape fills these before binding.
+        first.runtime->dev.chip_swimlane_level = static_cast<uint32_t>(before.enable_chip_swimlane);
+        second.runtime->dev.chip_swimlane_level = static_cast<uint32_t>(after.enable_chip_swimlane);
+        install_callable_tables(*first.runtime);
+        register_test_callable(
+            *second.runtime, object_table_, reinterpret_cast<uint64_t>(object_table_),
+            reinterpret_cast<uint64_t>(entry_table_), 1,
+            &reinterpret_cast<const CoreCallable *>(object_table_[0])->async_capability_
+        );
+        eps_ = {ordinary_orch_entry, capture_orch_bind};
+        ChipStorageTaskArgs args;
+        const uint64_t window[4] = {8, 0, 0, 0};
+        ASSERT_EQ(
+            bind_callable_to_runtime_impl(
+                first.runtime.get(), &first.host_api, &args, &eps_, nullptr, 0, window, nullptr, nullptr
+            ),
+            0
+        );
+        ASSERT_GT(first.runtime->dev.scheduler_bootstrap.worker_context_base, 0u);
+        const size_t predecessor_bytes = slot(0).capacity;
+        const auto predecessor_host = slot(0).host;
+#if __has_include("scheduler/scheduler_args_dump.h")
+        const auto check_diagnostics = [](const Runtime &rt, int pmu, int level) {
+            const auto &prerequisites = rt.pending_publication().prerequisites;
+            ASSERT_EQ(prerequisites.size(), 1u);
+            const auto &region = prerequisites.front();
+            const uint64_t device_base = reinterpret_cast<uint64_t>(region.device_target);
+            const uint64_t context_address = rt.dev.scheduler_bootstrap.worker_context_base;
+            ASSERT_GE(context_address, device_base);
+            const uint64_t context_offset = context_address - device_base;
+            ASSERT_LE(context_offset + sizeof(SchedulerWorkerContext), region.bytes);
+            const auto *context = reinterpret_cast<const SchedulerWorkerContext *>(
+                static_cast<const uint8_t *>(region.source) + context_offset
+            );
+            EXPECT_EQ(context->pmu_cells_offset != 0, pmu != 0);
+            EXPECT_EQ(context->activity_buffers_offset != 0, level >= 3);
+            if (pmu != 0) EXPECT_LE(context->pmu_cells_offset + sizeof(SchedulerTaskPmuCell), region.bytes);
+            if (level >= 3) EXPECT_LE(context->activity_buffers_offset + sizeof(SchedulerActivityBuffer), region.bytes);
+        };
+        check_diagnostics(*first.runtime, before_pmu, before_level);
+#endif
+        ASSERT_EQ(
+            bind_callable_to_runtime_impl(
+                second.runtime.get(), &second.host_api, &args, &eps_, nullptr, 0, window, nullptr, nullptr
+            ),
+            0
+        );
+        ASSERT_GT(second.runtime->dev.scheduler_bootstrap.worker_context_base, 0u);
+        // Optional cells can occupy alignment padding without changing total capacity.
+#if __has_include("scheduler/scheduler_args_dump.h")
+        check_diagnostics(*second.runtime, after_pmu, after_level);
+        check_diagnostics(*first.runtime, before_pmu, before_level);
+#endif
+        EXPECT_EQ(slot(0).capacity, predecessor_bytes);
+        EXPECT_EQ(slot(0).host, predecessor_host);
+        EXPECT_EQ(runner.pmu, before_pmu);
+        EXPECT_EQ(runner.level, static_cast<uint32_t>(before_level));
+        EXPECT_EQ(runner.queries, 0);
+    }
+
     std::vector<uint8_t> callable_;
     uint64_t object_table_[1]{};
     uint64_t entry_table_[1]{};
 };
+
+TEST_F(HbgResidentSchedulerStorageTest, PreparedSuccessorEnablesPmuWithoutChangingPredecessor) {
+    check_diagnostic_transition(0, 1, 0, 0);
+}
+
+TEST_F(HbgResidentSchedulerStorageTest, PreparedSuccessorDisablesPmuWithoutChangingPredecessor) {
+    check_diagnostic_transition(1, 0, 0, 0);
+}
+
+TEST_F(HbgResidentSchedulerStorageTest, PreparedSuccessorEnablesActivityWithoutChangingPredecessor) {
+    check_diagnostic_transition(0, 0, 0, 3);
+}
+
+TEST_F(HbgResidentSchedulerStorageTest, PreparedSuccessorDisablesActivityWithoutChangingPredecessor) {
+    check_diagnostic_transition(0, 0, 3, 0);
+}
 
 // The storage belongs to the pipeline slot, not to the run that used it: a
 // second run of the same shape gets the same two blocks back, and the release
@@ -1624,6 +2153,27 @@ TEST_F(HbgResidentSchedulerStorageTest, ASameSizedRunReusesItsSlotStorageAndAllo
     EXPECT_EQ(slot(0).grows, 1) << "a same-sized run allocates nothing";
     EXPECT_EQ(slot(0).device, device);
     EXPECT_EQ(published_scheduler_target(runtime), target);
+}
+
+TEST_F(HbgResidentSchedulerStorageTest, PhaseStorageUsesThisInvocationRatherThanTheRunnerLevel) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    install_callable_tables(runtime);
+    eps_ = {ordinary_orch_entry, capture_orch_bind};
+    ChipStorageTaskArgs args;
+    ASSERT_EQ(api_.chip_swimlane_level(), 0U);
+    runtime.dev.chip_swimlane_level = 0;
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    ASSERT_FALSE(runtime.pending_publication().prerequisites.empty());
+    const size_t plain_bytes = runtime.pending_publication().prerequisites.front().bytes;
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+
+    runtime.dev.chip_swimlane_level = static_cast<uint32_t>(ChipSwimlaneLevel::SCHED_PHASES);
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    ASSERT_FALSE(runtime.pending_publication().prerequisites.empty());
+    EXPECT_GT(runtime.pending_publication().prerequisites.front().bytes, plain_bytes);
+    EXPECT_EQ(api_.chip_swimlane_level(), 0U) << "the runner still describes the predecessor";
 }
 
 // A wider graph needs more state than the slot retained, so the slot replaces
@@ -1673,20 +2223,20 @@ TEST_F(HbgResidentSchedulerStorageTest, AWiderRunGrowsItsSlotAndANarrowerOneReus
 
 // Two pipeline slots prepare at once, so their storage cannot be one block.
 TEST_F(HbgResidentSchedulerStorageTest, TwoPipelineSlotsHoldDistinctStorage) {
-    static_assert(PTO_PIPELINE_MAX_DEPTH >= 2, "this case needs two pipeline slots");
     Runtime first;
     Runtime second;
     init_runtime(first);
     init_runtime(second);
     auto cleanup_first = cleanup_runtime(first);
     install_callable_tables(first);
-    second.set_callable_tables(
-        object_table_, reinterpret_cast<uint64_t>(object_table_), reinterpret_cast<uint64_t>(entry_table_), 1
+    register_test_callable(
+        second, object_table_, reinterpret_cast<uint64_t>(object_table_), reinterpret_cast<uint64_t>(entry_table_), 1,
+        &reinterpret_cast<const CoreCallable *>(object_table_[0])->async_capability_
     );
     eps_ = {ordinary_orch_entry, capture_orch_bind};
     ChipStorageTaskArgs args;
     uint64_t win[4] = {8, 0, 0, 0};
-    HostApi other_slot{nullptr, 1, 1, 0, &fake_ops()};
+    HostApi other_slot{nullptr, 1, 1, 2, &fake_ops()};
     auto cleanup_second = RAIIScopeGuard([&second, &other_slot]() {
         EXPECT_EQ(release_run_bindings_impl(&second, &other_slot), 0);
     });
@@ -1702,10 +2252,8 @@ TEST_F(HbgResidentSchedulerStorageTest, TwoPipelineSlotsHoldDistinctStorage) {
     EXPECT_NE(first.dev.scheduler_bootstrap.worker_context_base, second.dev.scheduler_bootstrap.worker_context_base);
 }
 
-// A graph-execution run selects the legacy scheduler, which publishes no
-// context base — and the storage its predecessor retained stays untouched
-// rather than being named by a run that never initialized it.
-TEST_F(HbgResidentSchedulerStorageTest, ALegacyRunNamesNoRetainedStorage) {
+// Graph and ordinary runs publish initialized resident state owned by their slot.
+TEST_F(HbgResidentSchedulerStorageTest, AGraphRunPublishesItsOwnResidentStorage) {
     Runtime runtime;
     init_runtime(runtime);
     auto cleanup = cleanup_runtime(runtime);
@@ -1722,34 +2270,23 @@ TEST_F(HbgResidentSchedulerStorageTest, ALegacyRunNamesNoRetainedStorage) {
 
     ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
 
-    // A graph-execution run, which is what selects the legacy scheduler: the
-    // orchestration records a Graph body and submits its outer task. A
-    // recording that captures no graph task would leave the resident selection
-    // in place and prove nothing here.
     eps_ = {recording_orch_entry, capture_orch_bind};
     ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
-
-    // The selection this run made, before anything about the storage: the
-    // metadata it published is a Graph Definition block rather than scheduler
-    // state, and its mode is neither unset nor the resident one.
     const auto &pending = runtime.pending_publication();
-    // A graph run publishes no metadata prerequisite at all: its Definition
-    // section rides the launch, and this run allocated no scheduler state.
-    ASSERT_EQ(pending.prerequisites.size(), 0u);
-    EXPECT_EQ(fake_.section_publications, 1u);
-    EXPECT_EQ(runtime.get_graph_section_source(), GraphSectionSource::LaunchEnvelope);
-    const uint32_t legacy_mode = runtime.dev.scheduler_bootstrap.runtime_mode;
-    EXPECT_NE(legacy_mode, 0u);
-    EXPECT_NE(legacy_mode, resident_mode) << "a graph-execution run selects the legacy scheduler";
-
-    EXPECT_EQ(runtime.dev.scheduler_bootstrap.worker_context_base, 0u)
-        << "a legacy run must not borrow the storage a resident run left";
-    // Untouched, not merely unpublished: the same raw block, no growth, and no
-    // acquire at all, because the legacy branch returns before asking for it.
-    EXPECT_EQ(slot(0).device, retained);
-    EXPECT_EQ(slot(0).grows, 1);
-    EXPECT_EQ(fake_.scheduler_acquires, acquires_after_resident);
-    EXPECT_EQ(fake_.live.count(retained), 1u);
+    ASSERT_EQ(pending.prerequisites.size(), 1u);
+    EXPECT_EQ(fake_.section_publications, 0u);
+    EXPECT_EQ(runtime.get_graph_section_source(), GraphSectionSource::None);
+    EXPECT_EQ(runtime.dev.scheduler_bootstrap.runtime_mode, resident_mode);
+    const auto &region = pending.prerequisites.front();
+    EXPECT_EQ(region.device_target, slot(0).device_published);
+    EXPECT_GE(runtime.dev.scheduler_bootstrap.worker_context_base, reinterpret_cast<uint64_t>(region.device_target));
+    EXPECT_LT(
+        runtime.dev.scheduler_bootstrap.worker_context_base,
+        reinterpret_cast<uint64_t>(region.device_target) + region.bytes
+    );
+    EXPECT_EQ(fake_.scheduler_acquires, acquires_after_resident + 1);
+    EXPECT_EQ(fake_.live.count(slot(0).device), 1u);
+    if (slot(0).device != retained) EXPECT_EQ(fake_.live.count(retained), 0u);
 }
 
 // Caller-write declarations remain a queue/lifetime contract. They do not grant
@@ -1913,19 +2450,20 @@ TEST_F(HbgHostAccessContractTest, AHostArgumentIsNeverRefusedByADeclaration) {
     EXPECT_EQ(writes_.query_calls, 0);
 }
 
-// A carrier that cannot take this run's section fails the bind, and the run's
-// descriptor is left naming no section at all rather than a length nothing
-// delivered.
-TEST_F(HbgBindLedgerTest, ARefusedCarrierFailsTheBindAndNamesNoSection) {
+TEST_F(HbgBindLedgerTest, CarrierRefusalAffectsOnlyRunsThatUseTheCarrier) {
     Runtime runtime;
     init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
     eps_ = {recording_orch_entry, capture_orch_bind};
     ChipStorageTaskArgs args;
     fake_.refuse_section = true;
-    EXPECT_NE(bind(runtime, args, nullptr, 0), 0);
+    const bool native = std::strcmp(get_platform(), "a5sim") == 0;
+    const int rc = bind(runtime, args, nullptr, 0);
+    if (native) EXPECT_EQ(rc, 0);
+    else EXPECT_NE(rc, 0);
     EXPECT_EQ(runtime.get_graph_section_source(), GraphSectionSource::None);
     EXPECT_EQ(runtime.get_graph_section_bytes(), 0u);
-    EXPECT_EQ(runtime.pending_publication().prerequisites.size(), 0u);
+    EXPECT_EQ(runtime.pending_publication().prerequisites.size(), static_cast<size_t>(native));
 }
 
 // A run with no Graph task names no section, so a reader cannot be handed a
@@ -1937,20 +2475,24 @@ TEST_F(HbgBindLedgerTest, AnOrdinaryRunAfterAGraphRunNamesNoSection) {
     // The ordinary run below selects a5's AICore scheduler, which resolves every
     // task's callable at bind, so this run needs the tables a registration would
     // have installed.
-    auto callable = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0);
+    auto callable =
+        make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0, {1, CoreAsyncMode::SYNCHRONOUS, 0, 0, 0});
     reinterpret_cast<CoreCallable *>(callable.data())->set_resolved_addr(0x1000);
     const uint64_t object_table[] = {reinterpret_cast<uint64_t>(callable.data())};
     const uint64_t entry_table[] = {0x1000};
-    runtime.set_callable_tables(
-        object_table, reinterpret_cast<uint64_t>(object_table), reinterpret_cast<uint64_t>(entry_table), 1
+    register_test_callable(
+        runtime, object_table, reinterpret_cast<uint64_t>(object_table), reinterpret_cast<uint64_t>(entry_table), 1,
+        &reinterpret_cast<const CoreCallable *>(object_table[0])->async_capability_
     );
     ChipStorageTaskArgs args;
 
     eps_ = {recording_orch_entry, capture_orch_bind};
     ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
-    ASSERT_EQ(runtime.get_graph_section_source(), GraphSectionSource::LaunchEnvelope);
-    const uint32_t graph_bytes = runtime.get_graph_section_bytes();
-    ASSERT_GT(graph_bytes, 0u);
+    const bool native = std::strcmp(get_platform(), "a5sim") == 0;
+    ASSERT_EQ(
+        runtime.get_graph_section_source(), native ? GraphSectionSource::None : GraphSectionSource::LaunchEnvelope
+    );
+    EXPECT_EQ(runtime.get_graph_section_bytes() != 0, !native);
     ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
 
     fake_.section_publications = 0;
@@ -1967,7 +2509,8 @@ TEST_F(HbgBindLedgerTest, RejectsUnsupportedTransferBeforeReadingEarlierArgument
     const uint32_t shape[] = {16};
     // Any copy of the first input is a fault, not a weak copy-count assertion.
     const ChipTensor first = make_tensor_external(reinterpret_cast<void *>(1), shape, 1, DataType::UINT8);
-    for (auto transfer : {TensorTransfer::H2D, TensorTransfer::D2H, static_cast<TensorTransfer>(255)}) {
+    for (auto transfer :
+         {TensorTransfer::H2D, TensorTransfer::D2H, TensorTransfer::MAP, static_cast<TensorTransfer>(255)}) {
         SCOPED_TRACE(static_cast<int>(transfer));
         ChipTensor invalid = first;
         invalid.transfer = transfer;
@@ -1976,7 +2519,10 @@ TEST_F(HbgBindLedgerTest, RejectsUnsupportedTransferBeforeReadingEarlierArgument
         args.add_tensor(first);
         args.add_tensor(invalid);
         const ArgDirection sig[] = {ArgDirection::IN, ArgDirection::IN};
-        EXPECT_EQ(bind(runtime, args, sig, 2), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+        EXPECT_EQ(
+            bind(runtime, args, sig, 2),
+            transfer == TensorTransfer::MAP ? PTO_RUNTIME_ERR_UNSUPPORTED : PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        );
         EXPECT_EQ(fake_.copy_count, 0);
         EXPECT_TRUE(fake_.live.empty());
     }
@@ -2073,7 +2619,7 @@ TEST_F(HbgBindLedgerTest, HostArgumentsCannotReachDeviceTasksOrGraphBoundaries) 
             if (mode == 3) {
                 GraphTaskArgs boundary;
                 boundary.add_input(host);
-                EXPECT_FALSE(orch.graph_begin(0x543, boundary, 0x546).recording);
+                EXPECT_FALSE(orch.graph_begin(0x543, boundary).recording);
             } else {
                 CoreTaskArgs task;
                 if (mode == 4) {
@@ -2116,12 +2662,12 @@ TEST_F(HbgBindLedgerTest, HostArgumentsCannotReachDeviceTasksOrGraphBoundaries) 
 TEST_F(HbgBindLedgerTest, HostAndDeviceBindingsOfOneSourceRemainIndependent) {
     eps_ = {
         +[](const ChipTaskArgs &args) {
-            auto *rt = g_orch_runtime;
+            auto *ctx = g_orch_runtime;
             const uint32_t index[] = {0};
             EXPECT_EQ(args.tensor(0).ref().address_space, AddressSpace::HOST);
             EXPECT_EQ(args.tensor(1).ref().address_space, AddressSpace::DEVICE);
-            EXPECT_EQ(get_tensor_data(rt, args.tensor(0).ref(), 1, index), 0x37u);
-            set_tensor_data(rt, args.tensor(0).ref(), 1, index, 0x52);
+            EXPECT_EQ(get_tensor_data(ctx, args.tensor(0).ref(), 1, index), 0x37u);
+            set_tensor_data(ctx, args.tensor(0).ref(), 1, index, 0x52);
         },
         capture_orch_bind
     };
@@ -2192,4 +2738,548 @@ TEST_F(HbgBindLedgerTest, AcceptsOverlappingReadOnlyH2dCopies) {
     args.add_tensor(tensor);
     const ArgDirection sig[] = {ArgDirection::IN, ArgDirection::IN};
     EXPECT_EQ(bind(runtime, args, sig, 2), 0);
+}
+
+TEST_F(HbgBindLedgerTest, ManagedStagingStatusReachesThePrepareCallerUnchanged) {
+    std::vector<uint8_t> input(16, 0x71);
+    ChipStorageTaskArgs args;
+    args.add_tensor(host_tensor(input));
+    const ArgDirection signature[] = {ArgDirection::IN};
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    for (int status : {SIMPLER_RUNTIME_ERR_RESOURCE_WAIT, SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE}) {
+        Runtime runtime;
+        init_runtime(runtime);
+        fake_.staging_status = status;
+        EXPECT_EQ(bind(runtime, args, signature, 1), status);
+        EXPECT_EQ(fake_.orchestration_count, 0u);
+        EXPECT_EQ(fake_.copy_count, 0);
+    }
+}
+
+TEST_F(HbgBindLedgerTest, AResourceWaitRetainsTheGraphAcrossRuntimeDestructionAndPublishesOnce) {
+    fake_.retain_plan = true;
+    fake_.arena_status = SIMPLER_RUNTIME_ERR_RESOURCE_WAIT;
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    std::vector<uint8_t> input(16, 0x71);
+    ChipStorageTaskArgs args;
+    args.add_tensor(host_tensor(input));
+    const ArgDirection signature[] = {ArgDirection::IN};
+    {
+        HostDependencyCaptureScope capture(true);
+        Runtime attempt;
+        init_runtime(attempt);
+        EXPECT_EQ(bind(attempt, args, signature, 1), SIMPLER_RUNTIME_ERR_RESOURCE_WAIT);
+        EXPECT_TRUE(attempt.tensor_leases().empty());
+        EXPECT_TRUE(attempt.pending_publication().prerequisites.empty());
+    }
+    ASSERT_NE(fake_.prepare_plan, nullptr);
+    EXPECT_EQ(fake_.orchestration_count, 1u);
+    const int copies_after_plan = fake_.copy_count;
+    void *const staging_after_plan = fake_.retained_addr;
+    const auto callback_records = fake_.phase_records_of(HostPhaseKind::BindHostOrch);
+    EXPECT_EQ(callback_records, 1u);
+    // Retrying an unchanged refusal preserves the same plan and source bytes.
+    {
+        HostDependencyCaptureScope capture(true);
+        Runtime attempt;
+        init_runtime(attempt);
+        EXPECT_EQ(bind(attempt, args, signature, 1), SIMPLER_RUNTIME_ERR_RESOURCE_WAIT);
+    }
+    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindHostOrch), callback_records);
+    fake_.arena_status = 0;
+    Runtime resumed;
+    init_runtime(resumed);
+    auto cleanup = cleanup_runtime(resumed);
+    // The resumed attempt may run on a different lane thread. Capture belongs
+    // to the saved plan, not to the original thread's diagnostic state.
+    auto retry = std::async(std::launch::async, [&] {
+        HostDependencyCaptureScope capture(true);
+        const int rc = bind(resumed, args, signature, 1);
+        if (rc != 0) return rc;
+        const int published = publish_run_image_impl(&resumed, &api_);
+        if (published != 0) return published;
+        simpler::dfx::host_graph::HostGraphExport graph;
+        EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(simpler::dfx::host_graph::TakeOutcome::Complete));
+        EXPECT_FALSE(graph.tasks.empty());
+        return 0;
+    });
+    ASSERT_EQ(retry.get(), 0);
+    EXPECT_EQ(fake_.orchestration_count, 1u);
+    EXPECT_EQ(fake_.retained_addr, staging_after_plan);
+    EXPECT_GE(fake_.copy_count, copies_after_plan);
+    EXPECT_EQ(
+        std::count_if(
+            fake_.copies.begin(), fake_.copies.end(),
+            [&](const auto &copy) {
+                return copy.src == input.data();
+            }
+        ),
+        1
+    ) << "HOST inputs are copied once";
+    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindHostOrch), callback_records);
+    const bool native = std::strcmp(get_platform(), "a5sim") == 0;
+    EXPECT_EQ(fake_.section_publications, native ? 0u : 1u);
+    EXPECT_EQ(resumed.get_graph_section_bytes(), fake_.published_section.size());
+    if (native) EXPECT_TRUE(fake_.published_section.empty());
+    else EXPECT_FALSE(fake_.published_section.empty());
+    EXPECT_EQ(resumed.tensor_leases().size(), 1u);
+    EXPECT_EQ(resumed.pending_publication().bytes, 0u);
+    EXPECT_NE(publish_run_image_impl(&resumed, &api_), 0);
+    fake_.prepare_plan.reset();  // the runner releases the plan after proof/publication
+}
+
+TEST_F(HbgBindLedgerTest, AResumedUnpublishedImageHasOneOwnerEvenWhenPublicationFails) {
+    fake_.retain_plan = true;
+    fake_.arena_status = SIMPLER_RUNTIME_ERR_RESOURCE_WAIT;
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    ChipStorageTaskArgs args;
+    {
+        HostDependencyCaptureScope capture(true);
+        Runtime attempt;
+        init_runtime(attempt);
+        ASSERT_EQ(bind(attempt, args, nullptr, 0), SIMPLER_RUNTIME_ERR_RESOURCE_WAIT);
+    }
+    fake_.arena_status = 0;
+    HostDependencyCaptureScope resumed_capture(true);
+    Runtime resumed;
+    init_runtime(resumed);
+    ASSERT_EQ(bind(resumed, args, nullptr, 0), 0);
+    const auto source = resumed.pending_publication().source;
+    const auto bytes = resumed.pending_publication().bytes;
+    ASSERT_NE(bytes, 0u);
+    EXPECT_NE(bind(resumed, args, nullptr, 0), 0);
+    EXPECT_EQ(resumed.pending_publication().source, source);
+    EXPECT_EQ(resumed.pending_publication().bytes, bytes);
+    fake_.fail_copy_on = fake_.copy_count + 1;
+    EXPECT_NE(publish_run_image_impl(&resumed, &api_), 0);
+    simpler::dfx::host_graph::HostGraphExport graph;
+    EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(simpler::dfx::host_graph::TakeOutcome::NotCaptured));
+    EXPECT_EQ(resumed.pending_publication().bytes, 0u);
+    EXPECT_NE(publish_run_image_impl(&resumed, &api_), 0);
+    EXPECT_EQ(release_run_bindings_impl(&resumed, &api_), 0);
+    std::weak_ptr<void> owner = fake_.prepare_plan;
+    fake_.prepare_plan.reset();  // terminal cleanup after native context retirement
+    EXPECT_TRUE(owner.expired());
+    EXPECT_EQ(fake_.orchestration_count, 1u);
+    expect_only_slot_scheduler_storage_live();
+}
+
+TEST_F(HbgBindLedgerTest, AbandoningAWaitingPlanReleasesItsHostOwnerBeforeSlotReuse) {
+    fake_.retain_plan = true;
+    fake_.arena_status = SIMPLER_RUNTIME_ERR_RESOURCE_WAIT;
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    ChipStorageTaskArgs args;
+    {
+        Runtime attempt;
+        init_runtime(attempt);
+        ASSERT_EQ(bind(attempt, args, nullptr, 0), SIMPLER_RUNTIME_ERR_RESOURCE_WAIT);
+    }
+    std::weak_ptr<void> owner = fake_.prepare_plan;
+    fake_.prepare_plan.reset();  // the runner's proven-unlaunched abort boundary
+    EXPECT_TRUE(owner.expired());
+    fake_.arena_status = 0;
+    Runtime next;
+    init_runtime(next);
+    auto cleanup = cleanup_runtime(next);
+    ASSERT_EQ(bind(next, args, nullptr, 0), 0);
+    EXPECT_EQ(fake_.orchestration_count, 2u);
+    ASSERT_EQ(publish_run_image_impl(&next, &api_), 0);
+    fake_.prepare_plan.reset();
+}
+
+TEST_F(HbgBindLedgerTest, ABackendWithoutPlanRetentionCannotRetryAnExecutedCallback) {
+    fake_.arena_status = SIMPLER_RUNTIME_ERR_RESOURCE_WAIT;
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    Runtime runtime;
+    init_runtime(runtime);
+    ChipStorageTaskArgs args;
+    EXPECT_EQ(bind(runtime, args, nullptr, 0), SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE);
+    EXPECT_EQ(fake_.orchestration_count, 1u);
+    EXPECT_EQ(fake_.prepare_plan, nullptr);
+}
+
+TEST_F(HbgBindLedgerTest, LaunchStagingOwnsPrerequisitesAndImageWithoutPrepareDeviceCopies) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    auto callable =
+        make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0, {1, CoreAsyncMode::SYNCHRONOUS, 0, 0, 0});
+    reinterpret_cast<CoreCallable *>(callable.data())->set_resolved_addr(0x1000);
+    const uint64_t objects[] = {reinterpret_cast<uint64_t>(callable.data())};
+    const uint64_t entries[] = {0x1000};
+    register_test_callable(
+        runtime, objects, reinterpret_cast<uint64_t>(objects), reinterpret_cast<uint64_t>(entries), 1,
+        &reinterpret_cast<const CoreCallable *>(objects[0])->async_capability_
+    );
+    struct Captured {
+        void *target;
+        std::vector<uint8_t> bytes;
+    };
+    struct Staging {
+        std::vector<Captured> captured;
+        int calls{0};
+        int rc{0};
+    } staging;
+    HostApiOps ops = fake_ops();
+    ops.stage_launch_metadata = [](void *ctx, uint32_t slot, const HostMetadataRegion *regions, size_t count) {
+        EXPECT_EQ(slot, 0u);
+        auto &state = *static_cast<Staging *>(ctx);
+        ++state.calls;
+        if (state.rc != 0) return state.rc;
+        state.captured.clear();
+        for (size_t i = 0; i < count; ++i) {
+            const auto *source = static_cast<const uint8_t *>(regions[i].host_source);
+            state.captured.push_back({regions[i].device_target, {source, source + regions[i].bytes}});
+        }
+        return 0;
+    };
+    api_ = HostApi(&staging, 0, 0, 1, &ops);
+    const bool a5 = std::strcmp(get_platform(), "a5sim") == 0;
+    for (TestOrchEntryFunc entry : {ordinary_orch_entry, recording_orch_entry, ordinary_orch_entry}) {
+        SCOPED_TRACE(entry == ordinary_orch_entry ? "resident" : "graph");
+        eps_ = {entry, capture_orch_bind};
+        ChipStorageTaskArgs args;
+        ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+        const auto &pending = runtime.pending_publication();
+        const size_t count = pending.prerequisites.size();
+        ASSERT_EQ(count, static_cast<size_t>(a5));
+        std::vector<Captured> expected;
+        for (const auto &region : pending.prerequisites) {
+            const auto *source = static_cast<const uint8_t *>(region.source);
+            expected.push_back({region.device_target, {source, source + region.bytes}});
+            std::memset(region.device_target, 0xa5, region.bytes);
+        }
+        void *image_target = pending.device_target;
+        const auto *image_source = static_cast<const uint8_t *>(pending.source);
+        const std::vector<uint8_t> image(image_source, image_source + pending.bytes);
+        expected.push_back({image_target, image});
+        std::memset(image_target, 0xa5, pending.bytes);
+        const int copies = fake_.copy_count;
+        const int calls = staging.calls;
+        ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+        ASSERT_EQ(staging.calls, calls + 1) << "each batch replaces the previous run's metadata";
+        ASSERT_EQ(fake_.copy_count, copies);
+        ASSERT_EQ(staging.captured.size(), expected.size());
+        for (size_t i = 0; i < expected.size(); ++i) {
+            EXPECT_EQ(staging.captured[i].target, expected[i].target);
+            EXPECT_EQ(staging.captured[i].bytes, expected[i].bytes);
+            const auto *target = static_cast<const uint8_t *>(expected[i].target);
+            EXPECT_TRUE(std::all_of(target, target + expected[i].bytes.size(), [](uint8_t b) {
+                return b == 0xa5;
+            }));
+        }
+        ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+    }
+    // Staging refusal prevents the large image copy and consumes the pending record.
+    eps_ = {ordinary_orch_entry, capture_orch_bind};
+    ChipStorageTaskArgs args;
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    staging.rc = -73;
+    const int copies = fake_.copy_count;
+    EXPECT_EQ(publish_run_image_impl(&runtime, &api_), -73);
+    EXPECT_EQ(fake_.copy_count, copies);
+    EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
+    EXPECT_EQ(fake_.copy_count, copies);
+}
+
+#if __has_include("scheduler/scheduler_args_dump.h")
+
+TEST_F(HbgBindLedgerTest, MissingFinishCallbackRejectsBeforeOrchestration) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    eps_.entry = +[](const ChipTaskArgs &) {
+        FAIL() << "invalid callbacks reached orchestration";
+    };
+    eps_.finish = nullptr;
+    ChipStorageTaskArgs args{};
+    EXPECT_EQ(bind(runtime, args, nullptr, 0), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(runtime.pending_publication().bytes, 0u);
+}
+
+TEST_F(HbgResidentSchedulerStorageTest, PartialNotificationPoolsKeepProgressChainsDoneAndCheckDisjoint) {
+    HostApiOps ops = fake_ops();
+    ops.acquire_scheduler_notifications = [](void *, uint32_t, SchedulerNotificationPurpose purpose, size_t count,
+                                             SchedulerDoneNotifications *out) {
+        *out = {std::vector<uint64_t>(count), std::vector<uint64_t>(count), {}};
+        if (purpose == SchedulerNotificationPurpose::COMPLETION_COUNTER && count == 3) {
+            // Two of three slots are available: progress and the first independent task.
+            out->addresses = {0x1000, 0x1020, 0};
+            out->add_addresses = {0x1008, 0x1028, 0};
+        } else if (purpose == SchedulerNotificationPurpose::TASK_STATE && count == 3) {
+            // DONE accepts a word-aligned SET address. Only the second CHECK half has bit aliases.
+            out->addresses = {0x2004, 0x2044, 0x2080};
+        } else {
+            return -1;
+        }
+        return 0;
+    };
+    api_ = HostApi(nullptr, 0, 0, 11, &ops);
+    Runtime rt;
+    init_runtime(rt);
+    auto cleanup = cleanup_runtime(rt);
+    install_callable_tables(rt, {1, CoreAsyncMode::DEFERRED, 1, 1, 0});
+    eps_ = {
+        [](const ChipTaskArgs &) {
+            MixedKernels kernels{};
+            kernels.aiv0_kernel_id = 0;
+            CoreTaskArgs args;
+            args.launch_spec.set_block_num(17);
+            for (int i = 0; i < 2; ++i)
+                ASSERT_TRUE(g_orch_runtime->orchestrator->submit_task(kernels, args).task_id().is_valid());
+        },
+        capture_orch_bind
+    };
+    ChipStorageTaskArgs args;
+    ASSERT_EQ(bind(rt, args, nullptr, 0), 0);
+    ASSERT_FALSE(rt.pending_publication().prerequisites.empty());
+    const auto &region = rt.pending_publication().prerequisites.front();
+    const auto *base = static_cast<const uint8_t *>(region.source);
+    const auto offset =
+        rt.dev.scheduler_bootstrap.worker_context_base - reinterpret_cast<uint64_t>(region.device_target);
+    const auto &ctx = *reinterpret_cast<const SchedulerWorkerContext *>(base + offset);
+    const auto &run = *reinterpret_cast<const SchedulerRunControl *>(base + ctx.run_control_offset);
+    EXPECT_EQ(run.run_completed_read_address, 0x1000u);
+    EXPECT_EQ(run.run_completed_add_address, 0x1008u);
+    const auto *chains =
+        reinterpret_cast<const SchedulerTaskCompletionCounter *>(base + ctx.completion_counters_offset);
+    EXPECT_EQ(chains[0].read_address, 0x1020u);
+    EXPECT_EQ(chains[0].add_address, 0x1028u);
+    EXPECT_EQ(chains[1].read_address, 0u);
+    const auto *done = reinterpret_cast<const uint64_t *>(base + ctx.done_notifications_offset);
+    EXPECT_EQ(done[0], 0u);
+    EXPECT_EQ(done[1], 0x2004u);
+    const auto &summary = *reinterpret_cast<const SchedulerGraphSummary *>(base + ctx.graph_summary_offset);
+    ASSERT_NE(summary.async_layout_offset, 0u);
+    const auto &layout = *reinterpret_cast<const SchedulerAsyncLayout *>(base + summary.async_layout_offset);
+    const auto *directory = reinterpret_cast<const SchedulerAsyncDirectoryWord *>(base + layout.check_directory_offset);
+    ASSERT_EQ(layout.group_count, 34u);
+    EXPECT_EQ(directory[0].notification_addresses[0], 0u);
+    EXPECT_EQ(directory[0].notification_addresses[1], 0x2080u);
+}
+
+TEST_F(HbgResidentSchedulerStorageTest, GraphHeapReservationContainsArgumentsWithoutAicpuTaskStorage) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    install_callable_tables(runtime);
+    eps_ = {
+        [](const ChipTaskArgs &) {
+            auto &orch = *g_orch_runtime->orchestrator;
+            GraphTaskArgs boundary;
+            const auto graph = orch.graph_begin(0x529, boundary);
+            ASSERT_TRUE(graph.recording);
+            ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary));
+            MixedKernels kernels{};
+            kernels.aiv0_kernel_id = 0;
+            for (uint64_t i = 0; i < 16; ++i) {
+                CoreTaskArgs args;
+                args.add_scalar(i);
+                ASSERT_TRUE(orch.submit_task(kernels, args).task_id().is_valid());
+            }
+            ASSERT_TRUE(orch.graph_end());
+            orch.graph_commit();
+            const auto cached = orch.graph_begin(0x529, boundary);
+            EXPECT_FALSE(cached.recording);
+            EXPECT_FALSE(cached.has_error);
+            EXPECT_TRUE(cached.task_id.is_valid());
+        },
+        capture_orch_bind
+    };
+    ChipStorageTaskArgs args;
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    EXPECT_EQ(fake_.requested_heap_bytes, CHIP_ALIGN_UP(2 * 16 * 64, DeviceArena::kDefaultBaseAlign));
+    EXPECT_LT(fake_.requested_heap_bytes, 2 * 16 * sizeof(ChipTaskStorage));
+    ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+}
+
+TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpUsesCurrentAicoreNodesAndChargedSchedulerPublication) {
+    api_ = HostApi(nullptr, 0, 0, 11, &fake_ops());
+    for (TestOrchEntryFunc entry : {scalar_dump_orch_entry, native_scalar_dump_orch_entry}) {
+        SCOPED_TRACE(entry == scalar_dump_orch_entry ? "ordinary" : "native-graph-mix");
+        Runtime runtime;
+        init_runtime(runtime);
+        auto cleanup = cleanup_runtime(runtime);
+        install_callable_tables(runtime);
+        // This publication-order case explicitly includes deferred storage.
+        reinterpret_cast<CoreCallable *>(callable_.data())->async_capability_ = {1, CoreAsyncMode::DEFERRED, 4, 3, 0};
+        eps_ = {entry, capture_orch_bind};
+        runtime.dev.dump_args_level = static_cast<uint32_t>(DumpArgsLevel::FULL);
+        ChipStorageTaskArgs args;
+        ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+        ASSERT_EQ(runtime.pending_publication().prerequisites.size(), entry == native_scalar_dump_orch_entry ? 2u : 1u);
+        const auto &region = runtime.pending_publication().prerequisites.back();
+        const auto context_offset =
+            runtime.dev.scheduler_bootstrap.worker_context_base - reinterpret_cast<uint64_t>(region.device_target);
+        const auto *context = reinterpret_cast<const SchedulerWorkerContext *>(
+            static_cast<const uint8_t *>(region.source) + context_offset
+        );
+        ASSERT_NE(context->args_dump_address, 0u);
+        const uint64_t dump_offset = context->args_dump_address - reinterpret_cast<uint64_t>(region.device_target);
+        ASSERT_LT(dump_offset, region.bytes);
+        const auto *dump = reinterpret_cast<const SchedulerArgsDumpHeader *>(
+            static_cast<const uint8_t *>(region.source) + dump_offset
+        );
+        ASSERT_EQ(dump->selected_count, 1u);
+        EXPECT_EQ(dump->initialized_count, 1u);
+        EXPECT_LE(dump_offset + dump->total_size, region.bytes);
+        const auto *source = static_cast<const uint8_t *>(region.source);
+        ASSERT_LE(context->graph_summary_offset + sizeof(SchedulerGraphSummary), region.bytes);
+        const auto *summary = reinterpret_cast<const SchedulerGraphSummary *>(source + context->graph_summary_offset);
+        ASSERT_NE(summary->async_layout_offset, 0u);
+        EXPECT_LE(dump_offset + dump->total_size, summary->async_layout_offset);
+        ASSERT_LE(summary->async_layout_offset + sizeof(SchedulerAsyncLayout), region.bytes);
+        const auto *async = reinterpret_cast<const SchedulerAsyncLayout *>(source + summary->async_layout_offset);
+        EXPECT_EQ(async->image_bytes, context->scheduler_state_bytes);
+        EXPECT_EQ(async->group_leases_offset, region.bytes);
+        EXPECT_LT(region.bytes, context->scheduler_state_bytes);
+        const auto *tasks = reinterpret_cast<const SchedulerArgsDumpTask *>(
+            reinterpret_cast<const uint8_t *>(dump) + dump->tasks_offset
+        );
+        EXPECT_EQ(tasks[0].scalar_count, 1u);
+        EXPECT_EQ(tasks[0].tensor_count, 0u);
+        EXPECT_EQ(
+            tasks[0].dump_metadata.scalar_dtypes[0],
+            static_cast<uint8_t>(entry == scalar_dump_orch_entry ? DataType::UINT32 : DataType::UINT64)
+        );
+        if (entry == scalar_dump_orch_entry) {
+            EXPECT_EQ(context->native_header_offset, 0u);
+            EXPECT_EQ(dump->task_count, 1u);
+            EXPECT_EQ(tasks[0].task_id, TaskId::make_global(0));
+            EXPECT_EQ(tasks[0].expected_participants, 5u);
+        } else {
+            EXPECT_NE(context->native_header_offset, 0u);
+            EXPECT_EQ(dump->task_count, 3u);
+            EXPECT_EQ(tasks[0].task_ref, 1u);
+            EXPECT_EQ(tasks[0].task_id, TaskId::make_sub_task(0, 0));
+            EXPECT_EQ(tasks[0].active_mask, 7u);
+            EXPECT_EQ(tasks[0].expected_participants, 9u);
+        }
+        const SchedulerArgsDumpTask expected = tasks[0];
+        ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+        const auto *published =
+            scheduler_args_dump_task(reinterpret_cast<void *>(context->args_dump_address), expected.task_ref);
+        ASSERT_NE(published, nullptr);
+        EXPECT_EQ(published->task_id, expected.task_id);
+        EXPECT_EQ(published->scalars_address, expected.scalars_address);
+        EXPECT_EQ(published->returned_participants, 0u);
+        EXPECT_EQ(published->before_state, 0u);
+        const auto *device_context =
+            reinterpret_cast<const SchedulerWorkerContext *>(runtime.dev.scheduler_bootstrap.worker_context_base);
+        SchedulerGraphView view{
+            device_context->graph_storage_address,
+            device_context->graph_task_count,
+            device_context->task_window_last_index,
+            device_context->scheduler_state_base_address,
+            device_context->native_header_offset,
+            device_context->scheduler_state_bytes,
+            static_cast<uint32_t>(device_context->original_task_count),
+        };
+        SchedulerGraphAccess graph(view);
+        if (entry != scalar_dump_orch_entry)
+            ASSERT_EQ(scheduler_observe_graph_arguments(graph, expected.task_ref), SchedulerGraphBindingError::NONE);
+        SchedulerTaskPayloadArguments actual{};
+        ASSERT_EQ(scheduler_parse_task_payload_arguments(graph, expected.task_ref, &actual), SchedulerGraphResult::OK);
+        EXPECT_EQ(actual.scalar_count, expected.scalar_count);
+        ASSERT_EQ(reinterpret_cast<uint64_t>(actual.scalars), expected.scalars_address);
+        EXPECT_EQ(actual.scalars[0], 37u);
+        uint64_t identity = UINT64_MAX;
+        ASSERT_EQ(scheduler_node_identity(graph, expected.task_ref, &identity), SchedulerGraphResult::OK);
+        EXPECT_EQ(identity, TaskId::to_uint64(expected.task_id));
+        ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+    }
+}
+
+TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpExcludesPendingInlineControlOperands) {
+    api_ = HostApi(nullptr, 0, 0, 11, &fake_ops());
+    for (TestOrchEntryFunc entry : {pending_inline_dump_orch_entry, native_inline_dump_orch_entry}) {
+        const bool native = entry == native_inline_dump_orch_entry;
+        SCOPED_TRACE(native ? "native-neighbor" : "ordinary");
+        Runtime runtime;
+        init_runtime(runtime);
+        auto cleanup = cleanup_runtime(runtime);
+        install_callable_tables(runtime);
+        eps_ = {entry, capture_orch_bind};
+        runtime.dev.dump_args_level = static_cast<uint32_t>(DumpArgsLevel::FULL);
+        ChipStorageTaskArgs args;
+        ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+        ASSERT_EQ(runtime.pending_publication().prerequisites.size(), native ? 2u : 1u);
+        const auto &region = runtime.pending_publication().prerequisites.back();
+        const auto context_offset =
+            runtime.dev.scheduler_bootstrap.worker_context_base - reinterpret_cast<uint64_t>(region.device_target);
+        const auto *context = reinterpret_cast<const SchedulerWorkerContext *>(
+            static_cast<const uint8_t *>(region.source) + context_offset
+        );
+        ASSERT_NE(context->args_dump_address, 0u);
+        const auto *dump = reinterpret_cast<const SchedulerArgsDumpHeader *>(
+            static_cast<const uint8_t *>(region.source) + context->args_dump_address -
+            reinterpret_cast<uint64_t>(region.device_target)
+        );
+        const auto *tasks = reinterpret_cast<const SchedulerArgsDumpTask *>(
+            reinterpret_cast<const uint8_t *>(dump) + dump->tasks_offset
+        );
+        const auto *indices =
+            reinterpret_cast<const uint32_t *>(reinterpret_cast<const uint8_t *>(dump) + dump->task_indices_offset);
+        EXPECT_EQ(dump->task_count, native ? 5u : 2u);
+        ASSERT_EQ(dump->selected_count, native ? 2u : 1u);
+        EXPECT_EQ(indices[0], 0u);
+        EXPECT_EQ(indices[1], UINT32_MAX);
+        EXPECT_EQ(tasks[0].task_ref, 0u);
+        EXPECT_EQ(tasks[0].task_id, TaskId::make_global(0));
+        EXPECT_EQ(tasks[0].kernel_id[1], 0u);
+        if (native) {
+            EXPECT_EQ(indices[2], UINT32_MAX);
+            EXPECT_EQ(indices[3], 1u);
+            EXPECT_EQ(indices[4], UINT32_MAX);
+            EXPECT_EQ(tasks[1].task_ref, 3u);
+            EXPECT_EQ(tasks[1].task_id, TaskId::make_sub_task(2, 0));
+            EXPECT_EQ(tasks[1].scalar_count, 1u);
+            EXPECT_EQ(tasks[1].expected_participants, 9u);
+        }
+        ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+        EXPECT_EQ(scheduler_args_dump_task(reinterpret_cast<void *>(context->args_dump_address), 1), nullptr);
+        ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+    }
+}
+
+#endif
+
+TEST(HbgAsyncCapabilityBinding, UsesOnlyTheActiveCallableAndClearsOnRebind) {
+    Runtime runtime;
+    const uint64_t first_objects[] = {0x1000, 0, 0x3000};
+    const CoreAsyncCapability first_capabilities[] = {
+        {1, CoreAsyncMode::SYNCHRONOUS, 0, 0, 0}, {}, {1, CoreAsyncMode::DEFERRED, 4, 3, 0}
+    };
+    EXPECT_THROW(runtime.get_function_async_capability(0), std::invalid_argument);
+    HostCallableAsyncCapabilities view{first_capabilities, 3};
+    HostApiOps ops{};
+    ops.get_callable_async_capabilities = [](void *ctx, int32_t id) -> std::optional<HostCallableAsyncCapabilities> {
+        if (id != 17) return std::nullopt;
+        return *static_cast<HostCallableAsyncCapabilities *>(ctx);
+    };
+    HostApi api(&view, 0, 0, 1, &ops);
+    runtime.set_active_callable_id(17);
+    runtime.set_callable_tables(first_objects, 0x4000, 0, 3);
+    ASSERT_TRUE(runtime.bind_callable_async_capabilities(api));
+    EXPECT_EQ(runtime.get_function_async_capability(0).mode, CoreAsyncMode::SYNCHRONOUS);
+    EXPECT_EQ(runtime.get_function_async_capability(2).max_conditions, 4);
+    EXPECT_THROW(runtime.get_function_async_capability(1), std::invalid_argument);
+    EXPECT_THROW(runtime.get_function_async_capability(-1), std::invalid_argument);
+    EXPECT_THROW(runtime.get_function_async_capability(3), std::invalid_argument);
+    runtime.set_active_callable_id(18);
+    EXPECT_FALSE(runtime.bind_callable_async_capabilities(api));
+    EXPECT_THROW(runtime.get_function_async_capability(0), std::invalid_argument);
+    runtime.set_active_callable_id(17);
+    ASSERT_TRUE(runtime.bind_callable_async_capabilities(api));
+    const uint64_t second_objects[] = {0x5000};
+    runtime.set_callable_tables(second_objects, 0x6000, 0, 1);
+    EXPECT_THROW(runtime.get_function_async_capability(0), std::invalid_argument);
+    EXPECT_THROW(runtime.get_function_async_capability(2), std::invalid_argument);
+    EXPECT_FALSE(runtime.bind_callable_async_capabilities(api));
+    EXPECT_THROW(runtime.get_function_async_capability(0), std::invalid_argument);
+    view = {first_capabilities, 1};
+    ASSERT_TRUE(runtime.bind_callable_async_capabilities(api));
+    EXPECT_EQ(runtime.get_function_async_capability(0).mode, CoreAsyncMode::SYNCHRONOUS);
+    runtime.clear_callable_tables();
+    EXPECT_THROW(runtime.get_function_async_capability(0), std::invalid_argument);
 }

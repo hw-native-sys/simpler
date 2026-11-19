@@ -62,6 +62,8 @@ runs:
         set -f
         if [ "${{ inputs.source-cann }}" = "true" ]; then
           source "$CANN_ENV"
+          # Older runner Ninja versions reject CMake's AICore depfile rules.
+          BUILD_PACKAGES="$BUILD_PACKAGES ninja>=1.11"
         fi
 
         # Only the network1 workflow passes these; every other caller runs on a

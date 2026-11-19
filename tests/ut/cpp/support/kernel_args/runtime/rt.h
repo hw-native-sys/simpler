@@ -22,6 +22,10 @@ enum rtMemcpyKind_t { RT_MEMCPY_HOST_TO_DEVICE = 1 };
 extern "C" {
 rtError_t rtMalloc(void **ptr, uint64_t bytes, uint32_t type, uint16_t module_id);
 rtError_t rtFree(void *ptr);
+rtError_t rtMallocHost(void **ptr, uint64_t bytes, uint16_t module_id);
+rtError_t rtFreeHost(void *ptr);
+rtError_t
+rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t stream);
 rtError_t rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind);
 rtError_t rtStreamQuery(rtStream_t stream);
 }

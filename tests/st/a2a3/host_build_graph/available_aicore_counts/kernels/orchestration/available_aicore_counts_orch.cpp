@@ -31,18 +31,6 @@
 #define FUNC_SPMD_MIX_AIV0 1
 #define FUNC_SPMD_MIX_AIV1 2
 
-// LaunchSpec spells the SPMD block-count setter differently per arch
-// (a5: set_core_num, a2a3: set_block_num) for the same field. Bridge it so this
-// one fixture compiles on both; keyed off the arch's types.h include guard,
-// which orchestration_api.h pulls in transitively.
-static inline void set_block_count(CoreTaskArgs &args, int16_t n) {
-#if defined(SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_TYPES_H_)
-    args.launch_spec.set_core_num(n);
-#else
-    args.launch_spec.set_block_num(n);
-#endif
-}
-
 extern "C" {
 
 __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
@@ -68,7 +56,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     CoreTaskArgs args;
     args.add_inout(blocks);
     args.add_scalar(static_cast<int64_t>(0));  // base cache line
-    set_block_count(args, static_cast<int16_t>(cluster_count));
+    args.launch_spec.set_block_num(static_cast<int16_t>(cluster_count));
     args.launch_spec.set_require_sync_start(true);
     rt_submit_task(mk, args);
 

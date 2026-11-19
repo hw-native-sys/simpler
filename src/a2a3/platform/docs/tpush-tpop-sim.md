@@ -106,7 +106,7 @@ hardware behavior where both AIV sub-cores read from the same VEC_FIFO entry.
 The simulation platform sets up per-thread identity without any runtime
 involvement:
 
-1. **`aicore_execute_wrapper`** (in `kernel.cpp`): computes `cluster_id` and
+1. **`aicore_execute_wrapper_checked`** (in `kernel.cpp`): computes `cluster_id` and
    `subblock_id` from `physical_core_id` and `core_type`, sets them in
    per-thread TLS via function pointer injection from `cpu_sim_context.cpp`.
 

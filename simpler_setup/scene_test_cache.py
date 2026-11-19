@@ -56,6 +56,7 @@ def _chip_callable_abi_token() -> str:
     child = CoreCallable.build(
         signature=[ArgDirection.IN, ArgDirection.OUT],
         binary=b"scene-test-cache-core-abi",
+        async_capability={"version": 1, "mode": "SYNCHRONOUS", "max_conditions": 0, "condition_types": 0},
     )
     callable_obj = ChipCallable.build(
         signature=[ArgDirection.INOUT],
@@ -182,6 +183,7 @@ def _compile_source_key(
     for source, include_dirs in compilation_units:
         normalized_include_dirs = tuple(Path(os.path.abspath(directory)) for directory in include_dirs)
         source_path, file_digests, edges = _source_closure(source, normalized_include_dirs)
+        encoded_paths = {path: os.fsencode(compiler_visible_path(path)) for path in file_digests}
         digest.update(b"unit")
         # The complete, ordered -I list affects preprocessing even when no
         # matching #include appears in the source closure (for example,
@@ -191,13 +193,11 @@ def _compile_source_key(
             digest.update(b"include-dir")
             digest.update(len(encoded_include_dir).to_bytes(8, "little"))
             digest.update(encoded_include_dir)
-        encoded_source_path = os.fsencode(compiler_visible_path(source_path))
+        encoded_source_path = encoded_paths[source_path]
         digest.update(len(encoded_source_path).to_bytes(8, "little"))
         digest.update(encoded_source_path)
         digest.update(file_digests[source_path])
-        file_records = sorted(
-            (os.fsencode(compiler_visible_path(path)), file_digest) for path, file_digest in file_digests.items()
-        )
+        file_records = sorted((encoded_paths[path], file_digest) for path, file_digest in file_digests.items())
         for encoded_path, file_digest in file_records:
             digest.update(b"file")
             digest.update(len(encoded_path).to_bytes(8, "little"))
@@ -205,10 +205,10 @@ def _compile_source_key(
             digest.update(file_digest)
         edge_records = sorted(
             (
-                os.fsencode(compiler_visible_path(parent)),
+                encoded_paths[parent],
                 file_digests[parent],
                 name.encode(),
-                os.fsencode(compiler_visible_path(dependency)),
+                encoded_paths[dependency],
                 file_digests[dependency],
             )
             for parent, name, dependency in edges
@@ -237,6 +237,10 @@ def compile_incore_artifact_key(
     metadata: Mapping[str, Any], source: str | Path, include_dirs: Iterable[str | Path]
 ) -> str:
     """Return a content key for one independently compiled incore artifact."""
+    if metadata.get("platform") in ("a2a3", "a5"):
+        from .elf_parser import ELF_TEXT_POLICY_VERSION  # noqa: PLC0415
+
+        metadata = {**metadata, "text_extraction_policy": ELF_TEXT_POLICY_VERSION}
     return _compile_source_key(metadata, [(source, include_dirs)], abi_token=None)
 
 

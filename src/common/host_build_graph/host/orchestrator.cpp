@@ -17,7 +17,7 @@
  * Based on: docs/RUNTIME_LOGIC.md
  */
 
-#include "host_build_graph/orchestrator.h"
+#include "host_build_graph/host/orchestrator.h"
 
 #include <assert.h>
 #include <inttypes.h>
@@ -39,20 +39,20 @@
 #include "assert_compat.h"
 #include "common/host_phase_kind.h"
 #include "common/unified_log.h"
-#include "host_build_graph/dep_gen_host_graph.h"
-#include "host_build_graph/dep_compute.h"
-#include "host_build_graph/graph_recording.h"
-#include "host_build_graph/graph_submit.h"
-#include "host_build_graph/host_phase_trace.h"
-#include "host_build_graph/orch_profiling.h"
-#include "host_build_graph/orchestrator_internal.h"
+#include "host_build_graph/host/dep_gen_host_graph.h"
+#include "host_build_graph/host/dep_compute.h"
+#include "host_build_graph/host/graph_recording.h"
+#include "host_build_graph/host/graph_submit.h"
+#include "host_build_graph/host/host_phase_trace.h"
+#include "host_build_graph/host/orch_profiling.h"
+#include "host_build_graph/host/orchestrator_internal.h"
 #include "host_build_graph/task_id.h"
 #include "host_build_graph/runtime_status.h"
 #include "host_build_graph/runtime_types.h"
 #include "host_build_graph/shared_memory.h"
-#include "host_build_graph/tensormap.h"
+#include "host_build_graph/host/tensormap.h"
 #include "host_build_graph/types.h"
-#include "tensor.h"
+#include "host_build_graph/tensor.h"
 
 // A report that names no code still means "fatal", so it is latched -- and logged --
 // under the explicit-fatal code rather than as a zero that reads like "no error".
@@ -137,8 +137,16 @@ bool OrchestratorState::init(void *sm_base, void *gm_heap, uint64_t heap_size, u
     // Reset in place rather than by move-assignment: fatal_code is a std::atomic,
     // which is neither copy- nor move-assignable, and a re-init has to clear every
     // field the previous pass left behind (the pool cursors below rely on it).
+    // Keep only storage; reconstruct every per-run field, including fatal state
+    // and borrowed pointers, so failed or differently shaped runs cannot leak state.
+    auto retained_map = std::move(tensor_map);
+    auto retained_seen = std::move(fanin_seen_epoch);
+    const size_t retained_capacity = fanin_seen_capacity;
     this->~OrchestratorState();
     auto *orch = new (static_cast<void *>(this)) OrchestratorState{};
+    orch->tensor_map = std::move(retained_map);
+    orch->fanin_seen_epoch = std::move(retained_seen);
+    orch->fanin_seen_capacity = retained_capacity;
 
     always_assert(max_tasks > 0);
 
@@ -156,11 +164,18 @@ bool OrchestratorState::init(void *sm_base, void *gm_heap, uint64_t heap_size, u
     orch->scalar_pool = reinterpret_cast<uint64_t *>(sm_bytes + pools.scalar_pool);
 
     // Polling: no fanin-spill pool — producer ids are inline on the payload.
+    // The epoch table's pointer and capacity are only ever assigned together
+    // from a successful allocation, so a grow that succeeds leaves the pair
+    // non-null with the memset below in range.
     const auto slots = static_cast<size_t>(max_tasks);
-    orch->fanin_seen_epoch.reset(new (std::nothrow) uint32_t[slots]);
-    if (orch->fanin_seen_epoch == nullptr) {
-        LOG_ERROR("Orchestrator scratch allocation failed (max_tasks=%" PRIu64 ")", max_tasks);
-        return false;
+    if (slots > orch->fanin_seen_capacity) {
+        std::unique_ptr<uint32_t[]> grown(new (std::nothrow) uint32_t[slots]);
+        if (!grown) {
+            LOG_ERROR("Orchestrator scratch allocation failed (max_tasks=%" PRIu64 ")", max_tasks);
+            return false;
+        }
+        orch->fanin_seen_epoch = std::move(grown);
+        orch->fanin_seen_capacity = slots;
     }
     memset(orch->fanin_seen_epoch.get(), 0, slots * sizeof(uint32_t));
 
@@ -288,8 +303,8 @@ struct PreparedTask {
 };
 
 namespace simpler::hbg {
-OutputLayout calculate_output_layout(const CoreTaskArgs &args) {
-    OutputLayout layout;
+void calculate_output_layout(const CoreTaskArgs &args, OutputLayout &layout) {
+    layout.total_output_size = 0;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         if (args.tag(i) != TensorArgType::OUTPUT) {
             continue;
@@ -298,19 +313,18 @@ OutputLayout calculate_output_layout(const CoreTaskArgs &args) {
         layout.buffer_sizes[i] = CHIP_ALIGN_UP(args.tensor(i).create_info().buffer_size_bytes(), PACKED_OUTPUT_ALIGN);
         layout.total_output_size += layout.buffer_sizes[i];
     }
-    return layout;
 }
 }  // namespace simpler::hbg
 
 static bool prepare_task(
-    OrchestratorState *orch, const CoreTaskArgs &args, int32_t total_output_size, ActiveMask active_mask,
+    OrchestratorState *orch, const CoreTaskArgs &args, uint64_t total_output_size, LaneMask active_mask,
     TaskAttrs task_attrs, PreparedTask *out
 ) {
     always_assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");
     auto &allocator = orch->task_allocator;
 
     int16_t block_num = args.launch_spec.block_num();
-    int32_t active_subtasks_per_block = __builtin_popcount(active_mask.core_mask());
+    int32_t active_subtasks_per_block = active_mask.count();
     int32_t total_required_subtasks = static_cast<int32_t>(block_num) * active_subtasks_per_block;
     if (block_num <= 0 || total_required_subtasks > std::numeric_limits<int16_t>::max()) {
         orch->report_fatal(
@@ -354,8 +368,8 @@ static bool prepare_task(
     // Init-on-write: this slot's dynamic scheduling fields and progress state are
     // initialized here, as the orchestrator claims the slot. whole-graph-resident
     // hbg claims slots [0, total_tasks) exactly once and the device reads no slot
-    // past total_tasks, so this claim-time write is the only per-slot SM reset and
-    // the unclaimed tail is neither initialized nor read.
+    // past total_tasks. Claim establishes prepared state; device entry restores
+    // progress for each execution without touching the unclaimed tail.
     out->slot_state->reset_for_reuse();
     orch->sm_header->tasks.reset_task_state(out->alloc_result.task_id);
 
@@ -374,7 +388,8 @@ static bool prepare_task(
     out->slot_state->logical_block_num = block_num;
     out->slot_state->active_mask = active_mask;
     out->slot_state->task_attrs = task_attrs;
-    out->slot_state->task_kind = active_mask.is_dummy() ? TaskKind::DUMMY : TaskKind::KERNEL;
+    out->slot_state->task_kind = active_mask.is_empty() ? TaskKind::DUMMY : TaskKind::KERNEL;
+    orch->ready_queue_populations.add_task(active_mask, task_attrs, out->slot_state->task_kind);
     // payload.fanin_count is left untouched here: submit_task_common zeroes it before
     // its fanin appends, which accumulate into it in place.
 
@@ -565,7 +580,7 @@ resolve_dispatch_predicate(OrchestratorState *orch, const CoreTaskPredicate &pre
 // computation (explicit_deps + auto), output registration, slot init, and
 // Orch-side wiring/ready publication.
 static TaskOutputTensors submit_task_common(
-    OrchestratorState *orch, const CoreTaskArgs &args, ActiveMask active_mask, TaskAttrs task_attrs,
+    OrchestratorState *orch, const CoreTaskArgs &args, LaneMask active_mask, TaskAttrs task_attrs,
     int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
 ) {
     ORCH_STEP_START();
@@ -573,7 +588,8 @@ static TaskOutputTensors submit_task_common(
     TaskOutputTensors result;
     DispatchPredicate resolved_predicate{};
     if (!resolve_dispatch_predicate(orch, args.predicate(), &resolved_predicate)) return result;
-    OutputLayout layout = calculate_output_layout(args);
+    OutputLayout layout;
+    calculate_output_layout(args, layout);
     PreparedTask prepared;
     if (!prepare_task(orch, args, layout.total_output_size, active_mask, task_attrs, &prepared)) {
         return result;
@@ -618,28 +634,18 @@ static TaskOutputTensors submit_task_common(
     }
 #endif
 
-    for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
-        TaskId dep_task_id = args.explicit_dep(i);
-        if (!dep_task_id.is_valid()) {
-            orch->report_fatal(
-                SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.set_dependencies(...) requires valid task ids"
-            );
-            return result;
-        }
-        if (capture_dep_graph) {
-            dep_gen_host_graph_add_explicit_edge(dep_task_id);
-        }
-        if (!append_fanin_or_fail(*orch, dep_task_id, fanin_slots, payload.fanin_count)) {
-            return result;
-        }
-    }
-
-    // === STEP 3: Lookup inputs (creator retention + tensormap modifier lookup) ===
     DepInputs dep_inputs{
         args.tensor_count(),       args.tensor_data(), args.tag_data(), static_cast<int32_t>(args.explicit_dep_count()),
         args.explicit_deps_data(),
     };
+    if (!append_explicit_fanins_or_fail(
+            *orch, task_id, dep_inputs, fanin_slots, payload.fanin_count, capture_dep_graph
+        )) {
+        if (capture_dep_graph) dep_gen_host_graph_end_task();
+        return result;
+    }
 
+    // === STEP 3: Lookup inputs (creator retention + tensormap modifier lookup) ===
     auto runtime_emit = [&](TaskId producer_task_id) -> bool {
         return append_fanin_or_fail(*orch, producer_task_id, fanin_slots, payload.fanin_count);
     };
@@ -781,8 +787,8 @@ TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kerne
         return TaskOutputTensors{};
     }
     // === Validate submit inputs ===
-    ActiveMask active_mask = mixed_kernels.to_active_mask();
-    if (!static_cast<bool>(active_mask)) {
+    LaneMask active_mask = mixed_kernels.to_lanes();
+    if (active_mask.is_empty()) {
         report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
             "MixedKernels names no active slot; set at least one of aic/aiv0/aiv1 kernel_id"
@@ -798,13 +804,13 @@ TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kerne
     // Mixed tasks (AIC+AIV) keep their original AIV identity so the correct
     // hardware channel (AIV0→AIC vs AIV1→AIC) is used at dispatch time.
     MixedKernels normalized = mixed_kernels;
-    bool has_aic = active_mask.has_mask(SUBTASK_MASK_AIC);
-    bool has_aiv0 = active_mask.has_mask(SUBTASK_MASK_AIV0);
-    bool has_aiv1 = active_mask.has_mask(SUBTASK_MASK_AIV1);
+    bool has_aic = active_mask.has_aic();
+    bool has_aiv0 = active_mask.has_aiv0();
+    bool has_aiv1 = active_mask.has_aiv1();
     if (!has_aic && has_aiv1 && !has_aiv0) {
         normalized.aiv0_kernel_id = normalized.aiv1_kernel_id;
         normalized.aiv1_kernel_id = INVALID_KERNEL_ID;
-        active_mask = normalized.to_active_mask();
+        active_mask = normalized.to_lanes();
     }
 
     TaskAttrs task_attrs;
@@ -882,12 +888,12 @@ TaskOutputTensors OrchestratorState::submit_dummy_task(const CoreTaskArgs &args)
 
     if (active_graph_recording(orch) != nullptr) {
         return graph_record_submit_sub_task(
-            orch, args, ActiveMask{}, task_attrs, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID
+            orch, args, LaneMask{}, task_attrs, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID
         );
     }
 
     return submit_task_common(
-        orch, args, ActiveMask{}, task_attrs, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID
+        orch, args, LaneMask{}, task_attrs, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID
     );
 }
 
@@ -944,15 +950,16 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
         TaskAttrs alloc_attrs;
         alloc_attrs.set_early_resolve(true);
         return graph_record_submit_sub_task(
-            orch, args, ActiveMask{}, alloc_attrs, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID
+            orch, args, LaneMask{}, alloc_attrs, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID
         );
     }
 
-    OutputLayout layout = calculate_output_layout(args);
+    OutputLayout layout;
+    calculate_output_layout(args, layout);
     PreparedTask prepared;
     // Kernel-less alloc task: no active subtasks, no dispatch-time attributes. The
     // early-dispatch hint is force-set below (see the flag-the-creator note).
-    if (!prepare_task(orch, args, layout.total_output_size, ActiveMask{}, TaskAttrs{}, &prepared)) {
+    if (!prepare_task(orch, args, layout.total_output_size, LaneMask{}, TaskAttrs{}, &prepared)) {
         return TaskOutputTensors{};
     }
 
@@ -1004,6 +1011,7 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
         // on device and the run hangs.
         SharedMemoryTaskHeader &done_tasks = orch->sm_header->tasks;
         int32_t done_local = prepared.task_id.local_id();
+        prepared.slot_state->initial_task_state = CHIP_TASK_COMPLETED;
         done_tasks.store_completed(done_local);
     }
     orch->inline_completed_tasks++;

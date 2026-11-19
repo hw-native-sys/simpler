@@ -34,6 +34,7 @@
 
 #include "common/dep_gen.h"
 #include "host/chip_swimlane_runs.h"
+#include "host/diagnostic_run_credit.h"
 
 namespace simpler::dfx::dep_gen_runs {
 
@@ -104,6 +105,38 @@ struct ReconcileReport {
     uint64_t overflow_device{0};
     uint64_t collected_host{0};
 };
+
+/**
+ * Build this run's report from its own producer accounting.
+ *
+ * DepGen publishes one whole graph or no file, so every unknown is a refusal —
+ * which is why the terminal's verdict maps onto refusal flags rather than onto
+ * a partial artifact. A missing participant or a figure that does not conserve
+ * is `identity_broken`: the run's edges cannot be shown to be all of its edges.
+ *
+ * `host_clamped` and `identity_foreign` stay the host's own observations; the
+ * device cannot see either.
+ */
+inline ReconcileReport reconcile_from_terminal(
+    const simpler::dfx::credit::RunReconciliation &settled, bool host_clamped, bool identity_foreign
+) {
+    ReconcileReport out;
+    out.total_device = settled.produced;
+    out.dropped_device = settled.dropped;
+    out.collected_host = settled.received;
+    out.counters_unknown = settled.counts_unknown;
+    out.identity_broken = settled.counts_unknown || settled.missing_producers != 0;
+    out.unflushed_records = settled.unsettled != 0;
+    out.device_dropped = settled.dropped != 0;
+    out.host_clamped = host_clamped;
+    out.identity_foreign = identity_foreign;
+    // A record the producer committed and the host never received is a hole in
+    // the graph, and this collector has no way to say so in its file.
+    const bool unaccounted = settled.unaccounted != 0;
+    out.clean = !out.counters_unknown && !out.identity_broken && !out.unflushed_records && !out.device_dropped &&
+                !out.host_clamped && !out.identity_foreign && !unaccounted;
+    return out;
+}
 
 /** True iff this run's graph may be published. */
 inline bool publishable(const ReconcileReport &r) { return r.clean; }

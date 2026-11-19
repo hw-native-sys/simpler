@@ -107,6 +107,8 @@ public:
     // default. Must be called before any fork if the heaps are to be
     // inherited by children.
     void init(uint64_t heap_bytes = DEFAULT_HEAP_RING_SIZE, uint32_t timeout_ms = ALLOC_TIMEOUT_MS);
+    void init_shared(uint64_t heap_bytes, const std::vector<int> &fds, uint32_t timeout_ms = ALLOC_TIMEOUT_MS);
+    std::vector<int> shared_fds() const;
 
     // Allocate a slot and, if `bytes > 0`, a heap slab from the ring chosen
     // by `scope_depth` (L2-style 0-based: 0 is the outermost scope). The
@@ -118,6 +120,8 @@ public:
     // `shutdown()`. `bytes` is rounded up to `HEAP_ALIGN`. Passing `0`
     // skips the heap bump entirely (slot-only allocation).
     AllocResult alloc(uint64_t bytes = 0, int32_t scope_depth = 0);
+
+    BufferDescriptor shared_descriptor(uint64_t address, uint64_t nbytes, const CanonicalIdentity &identity) const;
 
     // Release a slot. Reads the slot's `ring_idx` / `ring_slot_idx` to find
     // its ring, marks the slot consumed, and advances that ring's
@@ -156,6 +160,7 @@ private:
         uint64_t top{0};   // next free byte (bump head, can wrap)
         uint64_t tail{0};  // oldest live byte (derived from last_alive_)
         bool mapped{false};
+        int fd{-1};
 
         // Per-ring FIFO ordering — vectors are indexed by a slot's
         // ring_slot_idx (the order it was allocated into this ring).
@@ -201,4 +206,5 @@ private:
 
     // Ring-index validation for the public introspection accessors.
     const HeapRing &ring_at(int32_t ring_idx) const;
+    void release_heaps();
 };

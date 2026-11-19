@@ -81,6 +81,7 @@
 
 #include <stdint.h>
 
+#include "common/dma_workspace.h"
 #include "aicore_completion_mailbox_types.h"
 #include "host_build_graph/task_id.h"
 
@@ -122,6 +123,8 @@ struct GlobalContext {
     // through it does not allocate in L2. 0 means the device exposes no alias, and
     // adding 0 leaves the load ordinary. Read via get_l2_cache_offset(args).
     uint64_t l2_cache_offset;
+    // Per-engine device addresses, fixed after cold start; zero when unavailable.
+    uint64_t dma_workspace[DMA_WORKSPACE_KIND_COUNT];
 };
 
 struct AsyncCtx {
@@ -200,6 +203,14 @@ static __aicore__ inline uint64_t get_l2_cache_offset(__gm__ int64_t *args) {
     __gm__ GlobalContext *ctx =
         reinterpret_cast<__gm__ GlobalContext *>(static_cast<uint64_t>(args[SPMD_GLOBAL_CONTEXT_INDEX]));
     return ctx->l2_cache_offset;
+}
+
+/** Return the runtime-owned workspace for an engine, or nullptr when unavailable. */
+static __aicore__ inline __gm__ uint8_t *get_dma_workspace(__gm__ int64_t *args, int kind) {
+    if (kind < 0 || kind >= DMA_WORKSPACE_KIND_COUNT) return nullptr;
+    __gm__ GlobalContext *ctx =
+        reinterpret_cast<__gm__ GlobalContext *>(static_cast<uint64_t>(args[SPMD_GLOBAL_CONTEXT_INDEX]));
+    return reinterpret_cast<__gm__ uint8_t *>(ctx->dma_workspace[kind]);
 }
 
 /**

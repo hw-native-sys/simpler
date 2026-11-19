@@ -17,6 +17,44 @@ macro(a5_tmr_case)
     tmr_case(${ARGV} ARCHS a5)
 endmacro()
 
+a5_tmr_case(test_ccu_completion.cpp NO_OBJS LINK a5_ut_support TIMEOUT 20
+    SOURCES ${A5_RUNTIME_DIR}/shared/runtime.cpp)
+
+a5_tmr_case(test_ready_queue_profiling.cpp
+    NO_OBJS
+    SOURCES
+        ${A5_RUNTIME_DIR}/shared/runtime_init.cpp
+        ${CMAKE_SOURCE_DIR}/support/device_time_stub.cpp
+    DEFINES SIMPLER_DFX=1 SIMPLER_SCHED_PROFILING=1 SIMPLER_ORCH_PROFILING=1
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK a5_ut_support
+    TIMEOUT 20)
+if(APPLE)
+    target_link_options(test_a5_tmr_ready_queue_profiling PRIVATE -Wl,-dead_strip)
+else()
+    target_link_options(test_a5_tmr_ready_queue_profiling PRIVATE -Wl,--gc-sections)
+endif()
+
+a5_tmr_case(test_mix_spare_lane.cpp
+    NO_OBJS
+    SOURCES
+        ${A5_RUNTIME_DIR}/ring_buffer.cpp
+        ${A5_RUNTIME_DIR}/shared/shared_memory.cpp
+        ${A5_RUNTIME_DIR}/shared/runtime_init.cpp
+        ${A5_RUNTIME_DIR}/scheduler/scheduler.cpp
+        ${A5_RUNTIME_DIR}/scheduler/scheduler_dispatch.cpp
+        ${A5_RUNTIME_DIR}/scheduler/scheduler_completion.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
+    DEFINES SIMPLER_DFX=0
+    LINK a5_ut_support
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    TIMEOUT 30)
+if(APPLE)
+    target_link_options(test_a5_tmr_mix_spare_lane PRIVATE -Wl,-dead_strip)
+else()
+    target_link_options(test_a5_tmr_mix_spare_lane PRIVATE -Wl,--gc-sections)
+endif()
+
 # Exercise the production cold path with an observable platform retirement sink.
 a5_tmr_case(test_scheduler_retirement.cpp
     SOURCES
@@ -31,6 +69,34 @@ if(APPLE)
 else()
     target_link_options(test_a5_tmr_scheduler_retirement PRIVATE -Wl,--gc-sections)
 endif()
+
+# Exercise the failed submission slab through the real FIN completion path.
+a5_tmr_case(test_urma_completion_kernel.cpp
+    SOURCES
+        ${A5_RUNTIME_DIR}/scheduler/scheduler_completion.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
+        ${SIMPLER_SRC}/a5/platform/shared/aicpu/pmu_collector_aicpu.cpp
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections)
+if(APPLE)
+    target_link_options(test_a5_tmr_urma_completion_kernel PRIVATE -Wl,-dead_strip)
+else()
+    target_link_options(test_a5_tmr_urma_completion_kernel PRIVATE -Wl,--gc-sections)
+endif()
+
+# Replace only the clock boundary to drive scalar waits deterministically.
+if(APPLE)
+    set(_scalar_gc_link_option -Wl,-dead_strip)
+else()
+    set(_scalar_gc_link_option -Wl,--gc-sections)
+endif()
+get_target_property(_scalar_sources a5_tmr_objs SOURCES)
+list(FILTER _scalar_sources EXCLUDE REGEX "device_time_stub.cpp$")
+a5_tmr_case(test_scalar_access_deps.cpp NO_OBJS
+    SOURCES ${_scalar_sources} ${SIMPLER_SRC}/a5/runtime/tensormap_and_ringbuffer/runtime/runtime_core.cpp
+    LINK a5_ut_support
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK_OPTIONS ${_scalar_gc_link_option}
+    TIMEOUT 20)
 
 # Everything not named above is a plain case: one file, this runtime's whole
 # object library, nothing else to say. Dropping a new test_*.cpp into this

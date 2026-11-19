@@ -12,10 +12,15 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
-namespace pto::a5 {
+namespace simpler::a5 {
+
+// aicpu_topology_probe.cpp owns driver queries. aicpu_affinity_select.cpp
+// owns topology assembly, fallback and CPU selection without CANN dependencies.
+// Both translation units share this CANN-free header.
 
 // Per-cpu_id metadata used by the packing algorithm. Filled from CPU_TOPO
 // data when available. Topology fields are -1 in the OCCUPY-only fallback.
@@ -180,4 +185,29 @@ std::string format_aicpu_topology_json(
     const AicpuTopology &topology, AicpuSelectionPolicy policy, const AicpuLaunchPlan &launch_plan
 );
 
-}  // namespace pto::a5
+namespace detail {
+
+constexpr unsigned int kCpuOccupancyBits = std::numeric_limits<uint64_t>::digits;
+
+// Internal topology metadata, bounded by the runtime's occupancy bitmap.
+// Driver buffers are converted field by field; this is not a driver ABI type.
+struct CpuTopologyEntry {
+    uint64_t cpu_mask;
+    uint8_t cpu_id;
+    uint8_t is_share;
+    uint8_t phy_cpu_id;
+    uint8_t hyperthread_id;
+};
+struct CpuTopologyData {
+    uint32_t total_nums;
+    CpuTopologyEntry cpus[kCpuOccupancyBits];
+};
+
+bool build_aicpu_topology(
+    const AicpuDeviceOccupancy &device_occupancy, const char *soc_name, bool driver_topology_available,
+    const CpuTopologyData &driver_topology, AicpuTopology &out_topology
+);
+
+}  // namespace detail
+
+}  // namespace simpler::a5

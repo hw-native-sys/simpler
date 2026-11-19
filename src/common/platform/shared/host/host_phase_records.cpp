@@ -78,6 +78,16 @@ HostPhaseRecordPool *HostPhaseRecordStore::arm(bool collect_records) {
     return &pool_;
 }
 
+HostPhaseRecordPool *HostPhaseRecordStore::resume() {
+    if (!armed_ || !finished_ || records_written_) return nullptr;
+    finished_ = false;
+    // Existing buffers, their dropped ledger and the allocation cursor stay
+    // owned by this run. A retry takes unused buffers instead of overwriting
+    // a previous producer's partially filled one.
+    pool_.generation.store(next_pass_generation(), std::memory_order_release);
+    return &pool_;
+}
+
 uint64_t HostPhaseRecordStore::stored_records() const {
     uint64_t total = 0;
     for (const auto &buffer : buffers_) {
@@ -95,8 +105,7 @@ void HostPhaseRecordStore::finish(uint64_t submitted_tasks, uint64_t invocation_
     finished_ = true;
     if (dropped_records() > 0) {
         LOG_WARN(
-            "Host phase pool dropped %llu of %llu records (%d buffers of %d); the per-event views are truncated while "
-            "the per-kind totals stay exact",
+            "Host phase pool dropped %llu of %llu records (%d buffers of %d); trace data is incomplete",
             static_cast<unsigned long long>(dropped_records()), static_cast<unsigned long long>(total_records()),
             PLATFORM_HOST_PHASE_BUFFERS, PLATFORM_HOST_PHASE_RECORDS_PER_BUFFER
         );

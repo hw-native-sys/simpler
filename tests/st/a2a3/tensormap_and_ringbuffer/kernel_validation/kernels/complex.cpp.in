@@ -1,0 +1,136 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+#include <pto/pto-inst.hpp>
+#include "tensor.h"
+#if defined(__CPU_SIM)
+#include <cstdio>
+#endif
+#include "kernel_error_api.h"
+#include "kernel_cancellation_api.h"
+#include "async_kernel_api.h"
+#if CASE_MODE == 4
+#include "backend/sdma/sdma_completion_kernel.h"
+#endif
+
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    auto ctx = get_async_ctx(args);
+    auto *tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    auto *data = reinterpret_cast<__gm__ float *>(tensor->buffer.addr) + tensor->start_offset;
+    const int code = static_cast<int>(args[CONSUMER ? 2 : 1]);
+    if (code == 108) {
+#if defined(__CPU_SIM)
+        // Independent entry evidence: primary-error selection cannot suppress it.
+        fprintf(stderr, "VALIDATION_DEPENDENT_ENTERED\n");
+        fflush(stderr);
+#endif
+        report_kernel_error(ctx, KernelErrorCode::INVALID_OUTPUT);
+        return;
+    }
+    if (code == 109) {
+        auto *input = reinterpret_cast<__gm__ Tensor *>(args[1]);
+        auto *source = reinterpret_cast<__gm__ float *>(input->buffer.addr) + input->start_offset;
+        for (int i = 0; i < 1024; ++i) {
+            if (source[1024 + i] != 1.0f) {
+                report_kernel_error(ctx, KernelErrorCode::INVALID_OUTPUT);
+                return;
+            }
+        }
+        *data = 1.0f;
+        pto2::detail::defer_flush_range(data, sizeof(float));
+        return;
+    }
+    if (code == 0) {
+        *data = 1.0f;
+        pto2::detail::defer_flush_range(data, sizeof(float));
+#if CASE_MODE < 3 || CONSUMER
+        return;
+#endif
+    }
+    if (WAIT_LANE && code != 0) {
+        while (!kernel_cancel_requested(ctx)) {}
+        return;
+    }
+    if (get_block_idx(args) != 0) return;
+#if CASE_MODE == 2
+    for (volatile int i = 0; i < 200000; ++i) {}
+#endif
+#if CASE_MODE == 3
+    auto *counter = reinterpret_cast<__gm__ uint32_t *>(data);
+    *counter = 1;
+    pto2::detail::defer_flush_range(counter, sizeof(*counter));
+    save_expected_notification_counter(ctx, counter, 1);
+#endif
+#if CASE_MODE == 4
+    for (int i = 0; i < 1024; ++i)
+        data[i] = 1.0f;
+    pto2::detail::defer_flush_range(data, 1024 * sizeof(float));
+    pipe_barrier(PIPE_ALL);
+    using Shape = pto::Shape<1, 1, 1, 1, 1024>;
+    using Stride = pto::Stride<1024, 1024, 1024, 1024, 1>;
+    using Data = pto::GlobalTensor<float, Shape, Stride>;
+    using Scratch = pto::Tile<pto::TileType::Vec, uint8_t, 1, SDMA_SCRATCH_ALIGNMENT>;
+    Scratch scratch;
+    pto::TASSIGN(scratch, 0);
+    auto *witness = reinterpret_cast<__gm__ uint32_t *>(data + 3072);
+    witness[0] = 0;
+    witness[1] = 0;
+    pto2::detail::defer_flush_range(witness, 2 * sizeof(uint32_t));
+    // Negative control: reject A before the SDK submit boundary.
+    if (code == 111) ctx.completion_capacity = 0;
+    if (!send_request_entry(
+            ctx, SdmaTget(Data(data + 1024), Data(data), scratch, get_dma_workspace(args, DMA_WORKSPACE_SDMA))
+        ))
+        return;
+    witness[0] = 1;
+    if (code == 102) {
+        const uint32_t capacity = ctx.completion_capacity;
+        ctx.completion_capacity = *ctx.completion_count;
+        send_request_entry(
+            ctx, SdmaTget(Data(data + 2048), Data(data), scratch, get_dma_workspace(args, DMA_WORKSPACE_SDMA))
+        );
+        // Restore space for the test witnesses, preserving the latched error.
+        ctx.completion_capacity = capacity;
+    } else if (code == 101 || code == 110) {
+        pto::comm::AsyncSession session;
+        if (!pto::comm::BuildAsyncSession(scratch, get_dma_workspace(args, DMA_WORKSPACE_SDMA), session, 0)) {
+            report_kernel_error(ctx, KernelErrorCode::INVALID_OUTPUT);
+            return;
+        }
+        // Inject the SDK's zero-handle rejection or failed event with valid
+        // records after a real SDMA request has been submitted and registered.
+        pto::comm::AsyncEvent event{};
+        event.engine = pto::comm::DmaEngine::SDMA;
+        if (code == 110) {
+            pto::comm::sdma::detail::EncodeSdmaEventHandle(
+                ctx.completion_entries[0].backend_cookie, *ctx.completion_count, event.handle
+            );
+            event.postFailed = true;
+        }
+        pto2::detail::register_pto_async_event(ctx, event, session);
+        pto2::detail::defer_flush(ctx);
+    } else if (code == 112) {
+        // Negative control: A succeeded, but the primary error is not 101.
+        report_kernel_error(ctx, KernelErrorCode::INVALID_OUTPUT);
+    } else if (code != 0) {
+        report_kernel_error(ctx, KernelErrorCode::INDEX_OUT_OF_RANGE);
+    }
+    if (code != 0) {
+        witness[1] = code;
+        pto2::detail::defer_flush_range(witness, 2 * sizeof(uint32_t));
+        // These records are appended after injection so they cannot change the
+        // SDK event's queue count. Drain counts them only after polling their values.
+        save_expected_notification_counter(ctx, witness, 1);
+        save_expected_notification_counter(ctx, witness + 1, code);
+    }
+#else
+    if (code != 0) report_kernel_error(ctx, KernelErrorCode::INDEX_OUT_OF_RANGE);
+#endif
+}

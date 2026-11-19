@@ -67,6 +67,8 @@ enum class HostPhaseKind : uint32_t {
     OrchSubmitAdmit,    // rt_submit_graph: entry until the Graph is admitted
     OrchRecordHandoff,  // rt_graph_begin's return until the recorder's first sub-task
     OrchGeneratedArgs,  // between two submissions: the generated code's own arg setup
+    // Host metadata snapshotting in publish_run_image_impl; no device upload.
+    BindImageStage,
     Count
 };
 

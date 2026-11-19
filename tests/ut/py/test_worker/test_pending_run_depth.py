@@ -17,7 +17,7 @@ happens, so these cases construct a Worker and never start it.
 """
 
 import pytest
-from simpler.worker import _PENDING_RUN_DEPTH_MAX, Worker, _validated_pending_run_depth
+from simpler.worker import _UINT32_MAX, Worker, _validated_pending_run_depth
 
 
 def test_absent_key_derives_from_the_negotiated_depth():
@@ -45,7 +45,7 @@ def test_negative_depth_is_rejected(bad):
 
 
 def test_the_uint32_boundary_value_is_accepted():
-    assert Worker(level=3, pending_run_depth=_PENDING_RUN_DEPTH_MAX)._pending_run_depth == _PENDING_RUN_DEPTH_MAX
+    assert Worker(level=3, pending_run_depth=_UINT32_MAX)._pending_run_depth == _UINT32_MAX
 
 
 @pytest.mark.parametrize("bad", [2**32, 2**32 + 1, 2**64])

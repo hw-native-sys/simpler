@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -29,7 +30,16 @@ from simpler_setup.scene_test import (
 )
 
 
-def _recording_converter(calls):
+def _root_conftest():
+    path = Path(__file__).resolve().parents[3] / "conftest.py"
+    spec = importlib.util.spec_from_file_location("_cli_root_conftest", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _recording_converter(calls, merged=True):
     """Stand in for the converter subprocess, reporting the success it models.
 
     The return value is the contract `_convert_rank_swimlanes` reads to decide
@@ -39,9 +49,126 @@ def _recording_converter(calls):
 
     def run(**kwargs):
         calls.append(kwargs)
-        return True
+        return merged
 
     return run
+
+
+def _write_retained_capture(capture, *, nonce="0f1e2d3c4b5a6978", run_id=17, epoch=4):
+    """One retained run's artifact and the sidecar that names it.
+
+    The artifact is not called `chip_swimlane_records.json` and does not sit in
+    the capture directory, so both the discovery and the per-Rank fallback have
+    to find it by the identity the two publish.
+    """
+    rank = int(capture.parent.name.removeprefix("rank"))
+    capture_index = int(capture.name.removeprefix("d"))
+    (capture / "swimlane-0").mkdir(parents=True)
+    artifact = capture / "swimlane-0" / f"records_e{epoch}.json"
+    artifact.write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "collection": {
+                        "run_epoch": epoch,
+                        "dispatch": {
+                            "status": "identified",
+                            "owner_instance_id": nonce,
+                            "chip_rank": rank,
+                            "run_id": run_id,
+                            "endpoint_dispatch_id": capture_index + 1,
+                        },
+                    }
+                }
+            }
+        )
+    )
+    (capture / "dispatch_identity.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "task_slot": 5,
+                "group_index": 0,
+                "group_size": 1,
+                "owner_instance_id": nonce,
+                "chip_rank": rank,
+                "local_capture_index": capture_index,
+                "endpoint_dispatch_id": capture_index + 1,
+                "pipeline_slot": 0,
+                "pipeline_generation": 1,
+                "callable_digest": "ab" * 32,
+            }
+        )
+    )
+    return artifact
+
+
+def test_l3_swimlane_postprocess_converts_the_retained_runs_of_each_dispatch(tmp_path, monkeypatch) -> None:
+    scene_test_module = importlib.import_module("simpler_setup.scene_test")
+    artifacts = []
+    for dispatch, run_id in (("d0", 17), ("d1", 18)):
+        capture = tmp_path / "rank0" / dispatch
+        capture.mkdir(parents=True)
+        artifacts.append(_write_retained_capture(capture, run_id=run_id, epoch=4 + len(artifacts)))
+
+    calls = []
+    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", _recording_converter(calls))
+
+    scene_test_module._convert_case_swimlane("case", tmp_path)
+
+    assert [call["dispatch"] for call in calls] == ["d0", "d1"]
+
+
+def test_l3_swimlane_postprocess_falls_back_to_the_retained_file_itself(tmp_path, monkeypatch) -> None:
+    scene_test_module = importlib.import_module("simpler_setup.scene_test")
+    capture = tmp_path / "rank0" / "d0"
+    capture.mkdir(parents=True)
+    artifact = _write_retained_capture(capture)
+
+    calls = []
+    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", _recording_converter(calls, merged=False))
+
+    scene_test_module._convert_case_swimlane("case", tmp_path)
+
+    # The merge first, then this Rank's own capture — named by what the
+    # directory actually holds, not by the fixed name it does not.
+    assert [call["input_path"] for call in calls] == [tmp_path, artifact]
+
+
+def test_l3_auto_postprocess_publishes_only_when_session_logs_exist(tmp_path, monkeypatch) -> None:
+    scene_test_module = importlib.import_module("simpler_setup.scene_test")
+    capture = tmp_path / "rank0" / "d0"
+    capture.mkdir(parents=True)
+    (capture / "chip_swimlane_records.json").write_text("{}")
+    calls = []
+    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", _recording_converter(calls))
+    monkeypatch.setattr(scene_test_module, "_bound_host_logs", lambda: [tmp_path / "session" / "host.1.log"])
+
+    scene_test_module._convert_case_swimlane("case", tmp_path)
+
+    assert calls[0]["publish_derived_host_logs"] is True
+    assert calls[0]["host_logs"] == [tmp_path / "session" / "host.1.log"]
+
+
+def test_l3_swimlane_postprocess_fallback_converts_only_the_selected_form(tmp_path, monkeypatch) -> None:
+    """A mixed directory is two units. Each failed merge falls back to the file
+    its own target selected; re-scanning the directory would convert the other
+    form again under the wrong target."""
+    scene_test_module = importlib.import_module("simpler_setup.scene_test")
+    capture = tmp_path / "rank0" / "d0"
+    capture.mkdir(parents=True)
+    retained = _write_retained_capture(capture)
+    fixed = capture / "chip_swimlane_records.json"
+    fixed.write_text("{}")
+
+    calls = []
+    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", _recording_converter(calls, merged=False))
+
+    scene_test_module._convert_case_swimlane("case", tmp_path)
+
+    assert [call.get("dispatch") for call in calls] == ["d0:fixed", None, "d0:retained", None]
+    assert [call["input_path"] for call in calls] == [tmp_path, fixed, tmp_path, retained]
 
 
 def test_l3_swimlane_postprocess_merges_dispatches_present_on_every_rank(tmp_path, monkeypatch) -> None:
@@ -194,7 +321,7 @@ def test_swimlane_overhead_requires_chip_swimlane() -> None:
 
 
 def test_pytest_front_end_reports_a_usage_error_not_a_test_failure() -> None:
-    conftest = importlib.import_module("conftest")
+    conftest = _root_conftest()
     options = {"--enable-swimlane-overhead": True, "--enable-chip-swimlane": 0}
     config = SimpleNamespace(getoption=lambda name, default=None: options.get(name, default))
 
@@ -333,7 +460,7 @@ def test_run_class_cases_names_the_case_without_args() -> None:
 
 
 def test_run_class_cases_keeps_device_error_visible_to_poison_classifier() -> None:
-    conftest = importlib.import_module("conftest")
+    conftest = _root_conftest()
 
     class FailingScene:
         def _run_and_validate(self, *_args, **_kwargs):
@@ -396,4 +523,36 @@ def test_standalone_dispatch_forwards_every_diagnostic_flag(monkeypatch) -> None
     assert "--enable-dep-gen" in command
     assert "--enable-scope-stats" in command
     assert "--enable-swimlane-overhead" in command
+    assert "--resource-child" in command
     assert command[0] == sys.executable
+
+
+@pytest.mark.parametrize("child", [False, True])
+def test_standalone_runtime_and_level_filter_without_marking_a_child(monkeypatch, child) -> None:
+    scene_test_module = importlib.import_module("simpler_setup.scene_test")
+    scene_class = type("FilteredScene", (), {"_st_level": 2, "_st_runtime": "host_build_graph"})
+    dispatched = []
+
+    monkeypatch.setattr(scene_test_module, "ensure_pto_isa_root", lambda **_kwargs: None)
+    monkeypatch.setattr(scene_test_module, "_discover_module_test_classes", lambda _module: [scene_class])
+    monkeypatch.setattr(
+        scene_test_module,
+        "_select_cases",
+        lambda _classes, _platform, _selectors, _manual: [(scene_class, {"name": "selected"})],
+    )
+    monkeypatch.setattr(
+        scene_test_module,
+        "_dispatch_test_phases_standalone",
+        lambda *_args: dispatched.append(True) or True,
+    )
+    monkeypatch.setattr(scene_test_module, "_standalone_worker_groups", lambda _selected: {})
+    argv = ["test_scene.py", "-p", "a2a3sim", "-d", "0-1", "--runtime", "host_build_graph", "--level", "2"]
+    if child:
+        argv.append("--resource-child")
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(SystemExit) as result:
+        SceneTestCase.run_module(__name__)
+
+    assert result.value.code == 0
+    assert dispatched == ([] if child else [True])

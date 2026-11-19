@@ -1,9 +1,10 @@
-# Scope Stats — Per-scope Resource Usage Peaks
+# Scope Stats — Scope Boundary Resource Samples
 
-Scope stats records the peak resource usage — task-window slots, heap
-bytes, dep-pool entries, and tensormap entries — for every `SIMPLER_SCOPE` region in an
-orchestration, so you can see *which scope* drove each resource to its
-high-water mark. When a model runs out of task windows, heap, or
+Scope stats records task-window slots, heap bytes, dep-pool entries, and
+tensormap entries at the beginning and end of every `SIMPLER_SCOPE` region.
+For ordinary runs, paired boundaries identify which scope allocated resources
+and give an occupancy upper bound; they do not measure a realized peak.
+When a model runs out of task windows, heap, or
 tensormap / dependency-list entries, the failure tells you *which* resource is exhausted
 but not *where*; scope stats gives you the where.
 
@@ -30,7 +31,7 @@ python "tests/st/${CASE}/test_${NAME}.py" -p a2a3 -d 0 --enable-scope-stats
 ```
 
 The flag is bit 4 of `enable_profiling_flag`; on a T&R run it turns on
-per-scope peak tracking. On other runtimes the flag is accepted but
+scope-boundary resource sampling. On other runtimes the flag is accepted but
 produces no records.
 
 ### Step 2 — Locate the output
@@ -161,9 +162,9 @@ only the `real_occupancy` curve.
 - **Capacity denominators.** The `*_max` capacities in the metadata line
   are snapshots of what the runtime actually configured for that run, so
   `used/cap` ratios are exact.
-- **Disk-bounded, no wrap.** Full buffers stream off the device during
-  the run, so the record count is bounded only by disk — there is no
-  fixed-ring overwrite.
+- **Streaming collection.** Full buffers stream off the device during the
+  run. Retained runs and recorded windows use bounded host storage; refused
+  samples remain visible as collection loss rather than silent overwrite.
 
 ## 3. Output: `scope_stats.jsonl`
 
@@ -181,18 +182,132 @@ Metadata line (line 1):
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `fatal` | bool | `true` iff a fatal was latched during the run; records past it are diagnostic-only |
-| `dropped` | uint | Records dropped on device (free_queue empty / ready_queue full); `0` on a healthy run |
-| `total` | uint | Total records the device attempted (collected + dropped) |
-| `task_window_max` | int[] | Per-ring task-window capacity (indexed by `ring`) |
-| `heap_max` | int[] | Per-ring heap-byte capacity (indexed by `ring`) |
-| `dep_pool_max` | int[] | Per-ring dependency-list pool capacity (indexed by `ring`) |
-| `tensormap_max` | int | Tensormap entry capacity (scalar) |
+| `fatal` | bool or null | `true` iff a fatal was latched during the run; records past it are diagnostic-only |
+| `dropped` | uint or null | Records dropped on device (free_queue empty / ready_queue full); `0` on a healthy run |
+| `total` | uint or null | Total records the device attempted (collected + dropped) |
+| `task_window_max` | int[] or null | Per-ring task-window capacity (indexed by `ring`) |
+| `heap_max` | int[] or null | Per-ring heap-byte capacity (indexed by `ring`) |
+| `dep_pool_max` | int[] or null | Per-ring dependency-list pool capacity (indexed by `ring`) |
+| `tensormap_max` | int or null | Tensormap entry capacity (scalar) |
+
+Retained TMR runs carry these capacities from their resolved runtime layout into
+their own export slot, including when binding uses a cached arena. A delayed
+export therefore keeps its run's configuration after a successor initializes.
+Missing required capacity metadata refuses admission; numeric zero is not an
+unknown-capacity sentinel. The serialized, retention-off path freezes checked shared metadata after
+producer completion or an independent producer-stop proof.
 
 At the counting limit these two numbers saturate rather than wrap: the device
 counters clamp at `4294967295`, and a run that reaches it is reported with
 unknown counts instead of a small wrapped number that would look complete. The
-figure is the only way a default-mode artifact differs from earlier releases.
+figure does not certify that every attempted sample reached the host.
+
+### Native TMR capture/replay collection
+
+A3 native Kernel capture supports ScopeStats as the only enabled diagnostic
+family. It uses the same preparation, launch and resource-reference APIs as
+DFX-off capture. Program mode remains eager-only. HBG has no ScopeStats device
+producer; enabling this flag does not add one. A5 capture and framework graph
+capture are outside this collection contract.
+
+| When | API/action | ScopeStats lifetime |
+| ---- | ---------- | ------------------- |
+| Before capture | `simpler_prepare_run`, with `SIMPLER_PREPARE_CAPTURE`, `enable_scope_stats=1` and a nonempty `output_prefix` | Snapshots config and bound capacities; does not execute user work |
+| Before capture | `simpler_retain_run_resources` | Reserves the bounded collection window, starts readers and arms stable device addresses |
+| During capture | `simpler_launch_run_on_stream` | Records the common execution closure, including the existing device scope probes |
+| After recording the node | `simpler_finalize_run` | Retires only the original Host run; the external reference retains the diagnostic window |
+| Replay | Native RTS model execution | Device scope probes append samples; no per-replay Host callback or counter reset is required |
+| After all external uses end | Checked model destruction/cancellation, then `simpler_release_run_resources` | Drains the retained caller stream and readers, closes this window and hands Host-owned records to the writer |
+| After release | `simpler_flush_diagnostics_ctx` | Waits for artifact publication and reports diagnostic export failures |
+
+The caller keeps its context, stream and device tensors alive through successful
+resource-reference release. A failed stream drain or uncertain reader settlement
+retains the reference for cleanup retry. A successful release proves resource
+settlement; it does not by itself promise that the writer has published the file.
+No file is promised at the original recording run's finalization.
+
+All ScopeStats-enabled model replays and eager runs sharing this context's
+collector pool execute in one caller-ordered domain, without concurrent
+producers. Multiple retained references and collection windows may coexist.
+Before releasing any reference, the caller finishes all such producers sharing
+the pool and starts none until release returns. Closing one collection window
+does not close another live window. The retained caller stream's synchronization
+cannot prove that raw replays on other streams have stopped; the caller supplies
+that ordering. No whole-context stream synchronization is added by this rule.
+
+One retained node collects a model-lifetime aggregate at
+`<output_prefix>/scope_stats/scope_stats.jsonl`. Its metadata includes
+`"recorded_window": true`, known bound capacities and known
+`host_received_records` / `host_retained_records`. Device `total`, `dropped`
+and `fatal` are `null`, with `counts_unknown=true` and
+`collection_verdict="partial_cut_unknown"`: each replay overwrites those device
+counters, so a final read cannot establish cumulative counts. This expected
+uncertainty does not make a successfully published, otherwise healthy aggregate
+fail diagnostic flush. Actual host-storage refusal or writer failure is reported
+through diagnostic flush; it does not change an otherwise successful computation
+or restore already-settled device ownership.
+
+`run_epoch` identifies this collection window and is identical across its replays;
+`buf_seq` identifies a producer buffer, not a replay. The HTML report therefore
+shows **raw boundary samples and bound capacities**, without pairing begin/end
+records or computing per-scope allocation, duration or peaks. Otherwise a lost
+end from one replay and a lost begin from another could create a fictitious
+scope. Ordinary eager reports keep their paired-scope charts.
+
+Destroying an unexecuted model exports an empty recorded window with zero Host
+counts and unknown device counters. Such a file does not claim that a replay
+executed or that no samples were lost. Preparation can refuse a diagnostic
+request before capture when the finite export slots or Host budget are exhausted.
+During execution, collection can lose samples without introducing a functional
+dependency on DFX.
+
+The native qualification is
+`tests/ut/py/test_tmr_scope_capture.py`: it checks cold recording without user
+execution, original-run retirement, three numerical replays with changed input
+contents, actual outer/inner scope samples, model release, zero-replay cancellation
+and a subsequent ordinary eager run. Run it with the usual exclusive `task-submit`
+reservation on A3; CPU-only checker tests do not substitute for this RTS test.
+
+### Ordinary close without producer-stop proof
+
+A failed execution fence does not prove that the device producer stopped.
+Without either execution completion or an independent producer-stop proof,
+the ordinary boundary stops chasing device publications, finishes entries
+already handed to host ownership, and joins its host readers. It does not
+read final shared accounting or recover the producer's unpublished buffer.
+Host-thread exit does not authorize freeing device allocations. Published
+buffers left in the device queue retain their original epoch; after restart,
+an admitted ordinary collector rejects and reports records from another epoch
+rather than importing them into its new run.
+
+If this run has host-owned samples, they are exported with this metadata:
+
+```json
+{"fatal": null, "dropped": null, "total": null, "task_window_max": null, "heap_max": null, "dep_pool_max": null, "tensormap_max": null, "collection_verdict": "partial_cut_unknown", "counts_unknown": true, "host_received_records": 2, "host_retained_records": 2}
+```
+
+`fatal`, `dropped` and `total` are unknown, not false or zero. The two host
+counts name received and retained samples; their difference records a host
+storage refusal and is not a device drop count. Capacities come only from
+this run's host binding, saved by value at admission. The binding supplies
+all four capacity fields together, or all four are `null`; numeric zero is
+never an unknown sentinel.
+
+A begin sample without its end remains in JSONL. The plot labels incomplete
+statistics and unpaired samples; it does not fabricate pairs, report unknown
+counts as healthy, or compute percentages from missing capacities. With no
+host sample, an unproven close emits no artifact; artifact absence proves
+neither zero samples nor zero loss. When reusing an output prefix, an empty
+unproven close removes only the old `scope_stats/scope_stats.jsonl`, so it
+cannot leave a predecessor's healthy artifact at the current result path;
+unrelated files remain. A removal failure is logged and returned. It does
+not export prior-run metadata.
+
+With a stop proof, ordinary collection keeps its resident threads, recovers
+held records and preserves its seven-key metadata line. A direct export
+without successful checked metadata still refuses, including read failure
+or a required producer that never initialized. Retained runs keep their
+stricter quarantine/no-artifact contract on incomplete execution.
 
 ### Background mode (`collect_across_runs=True`)
 
@@ -203,33 +318,51 @@ while this run's file is still being written. **`run()` returning no longer
 means `scope_stats.jsonl` exists — `Worker.flush_diagnostics()` is the barrier
 that says the files up to that point are published.** TMR only; on
 `host_build_graph` there is no producer and the boundary behaves as it always
-has. The default (`collect_across_runs=False`) path is unchanged.
+has. The default (`collect_across_runs=False`) path continues to attempt export at its
+run boundary.
 
-Four keys are added to the metadata line in this mode only, so a reader that
-ignores them sees the same shape as before:
+The four collection-quality keys below are used by background exports and
+by unproven ordinary closes. Proven ordinary exports keep their original
+seven-key metadata line:
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `collection_verdict` | string | `published`, `partial_safe` (loss, host refusal or a latched fatal, counts still known) or `partial_cut_unknown` (a saturated counter or an accounting mismatch) |
+| `collection_verdict` | string | `published`, `partial_safe` (loss, host refusal or a latched fatal, counts still known) or `partial_cut_unknown` (unproved producer stop, a saturated counter or an accounting mismatch) |
 | `counts_unknown` | bool | `true` only when the counts themselves cannot be trusted; a device fatal alone leaves this `false` |
-| `host_received_records` | uint | Records the host took delivery of, including one recovered unpublished buffer |
-| `host_retained_records` | uint | Of those, how many the 256 MiB per-collector budget kept |
+| `host_received_records` | uint | Records the host took delivery of; held-buffer recovery is included only when producer stop is proved |
+| `host_retained_records` | uint | Of those, how many host storage kept; the 256 MiB per-collector budget applies to background collection and recorded windows |
 
 A run that ends without the producer handing its last buffer over leaves that
-buffer named in `current_buf_ptr` — holding whatever records the boundary has
-just recovered, possibly none, and still stamped with the run that acquired it.
-Because the producer only re-stamps a buffer it *pops*, reusing that pointer
-would make the next run append behind those records and inherit their identity.
-Admission therefore re-stamps the buffer's 64-byte header — `count`,
-`run_epoch`, `local_seq` — for the run being admitted, so each artifact holds
-only its own records. The pointer and the free queue are left alone: the drain
-shard is the sole runtime writer of the free queue, and clearing the pointer
-would orphan a pool buffer. A header that cannot be republished to the device
-fails the admission, so no artifact is written for a run whose records the
-device could misattribute.
+buffer named in `current_buf_ptr`, possibly containing unsettled records and
+still stamped with the run that acquired it.
+Before handshake and orchestration configuration, the next enabled run's AICPU
+leader resets the four producer counters and re-stamps the held buffer's `count`,
+`run_epoch` and `local_seq`. This device
+entry runs after the preceding producer has stopped. Ordinary/unmapped collection
+settles the predecessor's host boundary before reuse; mapped retained collection
+uses its device terminal's `live_at_close`, even when host sealing happens later.
+The rule applies both with and without a retained terminal bank; host admission clears only its host collection window and performs
+no producer-state readback or header upload. The pointer and the free queue are
+left alone: the drain shard is the sole runtime writer of the free queue, and
+clearing the pointer would orphan a pool buffer. A mapped terminal bank supplies
+per-run accounting publication; it does not select who initializes the producer.
+Disabled invocations leave the resident producer state and terminal untouched,
+even when sim retains the pool address.
+The shared accounting epoch is published after initialization, using existing
+padding without growing the shared region. Ordinary collection checks it against
+the admitted run before recovery or export. A run that never reaches device
+initialization, or whose shared-region read fails, cannot export the predecessor's
+accounting. This marker identifies initialization; it does not prove completion.
+A producerless runtime (`CapacityMetadata.required=false`, as in HBG) still
+exports its metadata-only artifact; it has no producer epoch to validate.
+Unknown/required producers retain the epoch check.
 
-A published file is not by itself a success: loss, a fatal and unknown counts
-each make `flush_diagnostics()` raise, and the error is sticky for the runner's
+Ordinary collection is best effort: a rejected snapshot is logged and no artifact
+is written; the diagnostic rejection does not replace the computation result.
+Retained collection uses its existing collection-error reporting below.
+
+In retained mode, a published file is not by itself a success: loss, a fatal and
+unknown counts each make `flush_diagnostics()` raise, and the error is sticky for the runner's
 life. A file already occupying the destination is never removed or overwritten
 — the run fails instead. And a run whose device completion could not be proved
 writes **no** file at all: nothing shared is read on that path, its host copies
@@ -252,8 +385,8 @@ Per-sample lines, oldest-first:
 | `dep_pool_start` | int | Scheduler-published dependency-list pool tail at this boundary |
 | `dep_pool_end` | int | Scheduler-published dependency-list pool top at this boundary |
 | `tensormap` | int | Tensormap entries in use |
-| `run_epoch` | uint | Which run produced this record. Copied out of the buffer the record came from, so it stays correct after that buffer is returned to the pool and reused by a later run. `0` means the producer had no run identity to stamp |
-| `buf_seq` | uint | Buffer generation within that run. Restarts per run, so it identifies a buffer only together with `run_epoch` — not a cross-run ordering key |
+| `run_epoch` | uint | Ordinary run identity, or a fixed recorded-window identity across all replays. Copied from the producer buffer before pool reuse. `0` means the producer had no identity to stamp |
+| `buf_seq` | uint | Generation from the producer's persistent rotation counter, so it identifies a buffer only together with `run_epoch` — not a cross-run ordering key |
 
 `start`/`end` are the ring's tail/head pointers at that boundary — see
 the metric formulas in [§1](#reading-the-report) for how a scope's peak
@@ -389,11 +522,11 @@ ScopeStatsCollector                platform scope_stats_collector_aicpu.cpp
    append records to memory  ◀──┐      runtime samples task/heap/dep_pool/tensormap
       │                         │      runtime: scope_stats_begin()/end()
       │                         │         └─ emit record, append to buffer;
-  stop() (drain + join)         └──────────── push full buffer to ready_queue
-  reconcile_counters()               orch exit: flush remaining buffers
-    recover current_buf_ptr
-    if abnormal exit left one
-  write_jsonl()
+  proved close: quiesce        └──────────── push full buffer to ready_queue
+    recover held + snapshot          orch exit: flush remaining buffers
+  unproven close: stop(false)
+    join; host-owned samples only
+  write_jsonl() (frozen host values)
 ```
 
 A worked example is in

@@ -25,7 +25,7 @@ def async_notify_orch_fn(orch, callables, task_args, config):
         name="default",
         workers=list(range(NRANKS)),
         window_size=4 * 1024,
-        buffers=[CommBufferSpec(name="notify_counter", dtype="int32", count=1, nbytes=4)],
+        buffers=[CommBufferSpec(name="notify_counter", dtype="int32", count=1, nbytes=64)],
     ) as handle:
         for rank in range(NRANKS):
             domain = handle[rank]

@@ -64,20 +64,13 @@ void platform_init_aicore_regs(uint64_t reg_addr) {
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
 }
 
+void platform_open_aicore_exit_window(uint64_t reg_addr) {
+    write_reg(reg_addr, RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_OPEN);
+}
+
 void platform_signal_aicore_exit(uint64_t reg_addr) { write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL); }
 
 uint64_t platform_aicore_exit_deadline() { return get_sys_cnt_aicpu() + inner_get_deinit_timeout_ticks(); }
-
-void platform_close_aicore_window(uint64_t reg_addr) {
-    // Initialize task dispatch register to idle state
-    write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
-    // Close fast path control
-    write_reg(reg_addr, RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_CLOSE);
-    // Complete the posted MMIO close. A release store alone is not a
-    // device-write completion fence; the drain that pairs with this read is the
-    // caller's, so several windows share one.
-    (void)read_reg(reg_addr, RegId::FAST_PATH_ENABLE);
-}
 
 int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t count, uint64_t deadline, bool *released) {
     // `released` is filled before anything can return, rejection included, so a
@@ -93,6 +86,21 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
     for (size_t i = 0; i < count; ++i) {
         if (targets[i].reg_addr == 0 || targets[i].teardown == nullptr) return -1;
     }
+
+    // COND can retain a prior launch's EXITED or nonce. Only this physical
+    // core writes it; ordinary task tokens cannot use the reserved encodings.
+    // The unique retirement owner selects a value different from that actual
+    // retained value, so only a response to this request can acknowledge exit.
+    uint32_t exit_requests[PLATFORM_MAX_CORES];
+    for (size_t i = 0; i < count; ++i) {
+        const uint32_t old_cond = static_cast<uint32_t>(read_reg(targets[i].reg_addr, RegId::COND));
+        const uint32_t request = old_cond == AICORE_EXIT_NONCE_0 ? AICORE_EXIT_NONCE_1 : AICORE_EXIT_NONCE_0;
+        exit_requests[i] = request;
+        __atomic_store_n(&targets[i].teardown->exit_request, request, __ATOMIC_RELAXED);
+    }
+    // The request is Normal memory and EXIT is posted Device memory. Publish
+    // every request before any core can observe the EXIT that asks for it.
+    wmb();
 
     // Broadcast to the whole group before waiting on any member, so the cores
     // drain concurrently and a dead core's wait does not serialize behind the
@@ -116,7 +124,8 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
     while (remaining != 0) {
         for (size_t i = 0; i < count; ++i) {
             if (acknowledged[i]) continue;
-            if (read_reg(targets[i].reg_addr, RegId::COND) == AICORE_EXITED_VALUE) {
+            const uint32_t cond = static_cast<uint32_t>(read_reg(targets[i].reg_addr, RegId::COND));
+            if (cond == exit_requests[i]) {
                 acknowledged[i] = true;
                 --remaining;
             }
@@ -130,9 +139,17 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
     int32_t rc = 0;
     for (size_t i = 0; i < count; ++i) {
         if (acknowledged[i]) {
-            platform_close_aicore_window(targets[i].reg_addr);
+            write_reg(targets[i].reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
+            write_reg(targets[i].reg_addr, RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_CLOSE);
         } else {
             rc = -1;
+        }
+    }
+    // Each acknowledged window retains its own completion readback before
+    // the common drain and release pass. Unacknowledged windows stay open.
+    for (size_t i = 0; i < count; ++i) {
+        if (acknowledged[i]) {
+            (void)read_reg(targets[i].reg_addr, RegId::FAST_PATH_ENABLE);
         }
     }
     // One drain covers every readback the close pass issued, and it is what

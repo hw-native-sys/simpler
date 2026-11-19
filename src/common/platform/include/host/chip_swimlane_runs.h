@@ -25,8 +25,8 @@
  * error summary.
  *
  * These are host-only and are reached exclusively through the swimlane
- * collector's retained-run path. With retention off none of them is
- * constructed against a budget and every collector behaves as it does today.
+ * collector's retained-run path, including explicitly retained model windows.
+ * Ordinary retention policy remains unchanged by those private windows.
  */
 namespace simpler::dfx::runs {
 
@@ -48,17 +48,48 @@ inline constexpr int kControlAckBudgetMs = 2000;
 inline constexpr size_t kErrorMsgBytes = 256;
 
 /**
+ * How long a run at the front of its lane may stay un-admitted for want of
+ * diagnostic credit before it fails.
+ *
+ * Bounded in both directions, which neither prior behaviour was: the swimlane
+ * blocked forever waiting for a bucket, and the other owners refused at once.
+ * The figure matches the only comparable existing default — the 30 s fallback
+ * `simpler_flush_diagnostics_ctx` applies to a non-positive budget — but is a
+ * separate constant, because that one is a flush budget and not a run's.
+ *
+ * Not a user knob, not in `CallConfig`, not in `KernelArgs`: it never crosses
+ * the ABI, and only the per-wait `timeout_ms` derived from it does.
+ */
+inline constexpr int kCreditWaitBudgetMs = 30000;
+
+/**
+ * Why an owner refused to admit a run, as the admission attempt reads it.
+ *
+ * The distinction decides what the caller does next, so it is reported rather
+ * than inferred from a second capacity query: `Capacity` is about right now
+ * and is re-attempted when credit moves, while `Fatal` is about this owner and
+ * re-attempting it would only burn the run's deadline.
+ */
+enum class AdmissionRefusal : int {
+    None = 0,
+    Capacity,
+    Fatal,
+};
+
+/**
  * Why a run's artifact says what it says.
  *
- * `Published` and `PartialSafe` both produce a file; `CutUnknown` produces one
- * too, with `processing_complete = false`, because the reference handshake
- * proved the records were safe to move even though the transport count did
- * not settle. The remaining three produce no file and must wake every waiter.
+ * In retained collection, `Published`, `PartialSafe` and `CutUnknown` produce
+ * files only after the required reference handshake makes the records safe to
+ * move; `CutUnknown` carries incomplete counts. The remaining three produce no
+ * file and must wake every waiter. Ordinary collection also serializes these
+ * names for host-owned partial evidence. A verdict describes the artifact, not
+ * device termination: resource release still requires its owner's own proof.
  */
 enum class Verdict {
     Published,    // stages settled, nothing lost on the host side
     PartialSafe,  // stages settled, content incomplete (retired / evicted / untrusted)
-    CutUnknown,   // count unreachable, references proved released
+    CutUnknown,   // counts unknown; resource safety comes from the owner's protocol
     WriteFailed,  // sealed, but no file exists
     Quarantined,  // references not proved; nothing may be moved or freed
     CounterExhausted,
@@ -159,7 +190,9 @@ struct CollectionVerdict {
  */
 class ErrorSummary {
 public:
-    void record(uint64_t epoch, Verdict v, const char *detail) {
+    // Recorded windows report known loss as an error even when their partial
+    // artifact was published. Ordinary callers retain verdict-only partials.
+    void record(uint64_t epoch, Verdict v, const char *detail, bool partial_is_error = false) {
         std::lock_guard<std::mutex> lk(mu_);
         switch (v) {
         case Verdict::Published:
@@ -183,7 +216,7 @@ public:
         }
         if (verdict_publishes(v)) {
             if (epoch > highest_published_) highest_published_ = epoch;
-            return;
+            if (v != Verdict::PartialSafe || !partial_is_error) return;
         }
         if (!error_recorded_) {
             error_recorded_ = true;

@@ -1,0 +1,76 @@
+name: Set up framework environment
+description: Install the CANN 9.0+ framework consumer in its own virtual environment.
+
+inputs:
+  platform:
+    description: Canonical onboard platform (a2a3 or a5).
+    required: false
+    default: a2a3
+
+outputs:
+  cann_env:
+    description: Environment script for the exact compatible installed CANN toolkit.
+    value: ${{ steps.toolchain.outputs.cann_env }}
+
+runs:
+  using: composite
+  steps:
+    - name: Select the installed framework toolchain
+      id: toolchain
+      shell: bash
+      run: |
+        python3 simpler_setup/test_environments.py select torch_npu
+
+    - name: Validate the onboard platform
+      id: platform
+      shell: bash
+      env:
+        PLATFORM: ${{ inputs.platform }}
+      run: |
+        case "$PLATFORM" in
+          a2a3|a5) ;;
+          *) echo "::error::platform must be a2a3 or a5"; exit 1 ;;
+        esac
+        echo "build_target=build_package_$PLATFORM" >> "$GITHUB_OUTPUT"
+
+    - name: Install isolated framework dependencies and runtime
+      shell: bash
+      env:
+        TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
+        CANN_ENV: ${{ steps.toolchain.outputs.cann_env }}
+        BUILD_TARGET: ${{ steps.platform.outputs.build_target }}
+      run: |
+        source "$CANN_ENV"
+        python3 simpler_setup/test_environments.py preflight torch_npu
+        python3 -m venv --system-site-packages .venv-framework
+        source .venv-framework/bin/activate
+        python -m pip install --upgrade pip
+        constraints=.github/actions/setup-framework/constraints.txt
+        requirements=()
+        while IFS= read -r requirement; do
+          requirements+=("$requirement")
+        done < <(python simpler_setup/test_environments.py requirements torch_npu)
+        # Explicit local wheels shadow inherited distributions without changing them.
+        python -m pip install --ignore-installed --no-deps "$(python simpler_setup/test_environments.py requirements torch_npu torch)" --index-url https://download.pytorch.org/whl/cpu
+        python -m pip install --ignore-installed --no-deps "$(python simpler_setup/test_environments.py requirements torch_npu torch_npu)"
+        python -m pip install --ignore-installed --no-deps 'nanobind>=2,<3'
+        python -m pip install -c "$constraints" "${requirements[@]}" \
+          'scikit-build-core>=0.10' 'cmake>=3.20' ninja setuptools
+        python -m pip install -c "$constraints" --no-build-isolation \
+          --config-settings="build.targets=$BUILD_TARGET" '.[test]'
+        # Pytest and its dispatcher children prioritize the installed runtime assets.
+        site_packages=$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))')
+        printf 'FRAMEWORK_WHEEL_SITE=%s\n' "$site_packages" >> "$GITHUB_ENV"
+        printf 'PYTEST_ADDOPTS=%s-o pythonpath=%s\n' "${PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }" "$site_packages" >> "$GITHUB_ENV"
+        python - <<'PYEOF'
+        import json
+        import sys
+        from pathlib import Path
+
+        from simpler_setup.test_environments import preflight
+
+        record = preflight("torch_npu")
+        assert all(Path(package["path"]).is_relative_to(Path(sys.prefix))
+                   for package in record["packages"].values()), record
+        print("TEST_ENVIRONMENT_PACKAGES " + json.dumps(record), flush=True)
+        PYEOF

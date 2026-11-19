@@ -59,7 +59,7 @@ std::vector<uint8_t> build_test_chip_callable() {
     int32_t child_ids[2] = {5, 7};
     std::vector<uint8_t> children[2] = {std::move(core0), std::move(core1)};
 
-    return make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
+    return make_chip_callable(
         nullptr, 0, "orch_fn", fake_orch_so, sizeof(fake_orch_so), child_ids, children, 2, "cfg_name"
     );
 }

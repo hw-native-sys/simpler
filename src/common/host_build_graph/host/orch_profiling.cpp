@@ -9,11 +9,11 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "host_build_graph/orch_profiling.h"
+#include "host_build_graph/host/orch_profiling.h"
 
 #include <stdint.h>
 
-#include "host_build_graph/orchestrator.h"
+#include "host_build_graph/host/orchestrator.h"
 
 namespace simpler::hbg {
 

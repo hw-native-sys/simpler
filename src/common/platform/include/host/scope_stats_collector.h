@@ -17,8 +17,8 @@
  * split mgmt threads (drain polls per-thread ready queues and refills the
  * single instance's free_queue from recycled lanes; replenish returns done
  * buffers to recycled lanes). ScopeStatsCollector's collector thread shards
- * append each full buffer's ScopeStatsRecords to an in-memory vector. After
- * stop(), write_jsonl() renders them to
+ * append each full buffer's ScopeStatsRecords to host-owned storage. The
+ * ordinary run boundary renders safe evidence to
  * <output_dir>/scope_stats/scope_stats.jsonl.
  *
  * Memory mirroring is handled by the framework via the MemoryOps installed
@@ -34,12 +34,12 @@
  *                          (pre-fills free_queue; surplus → recycled pool).
  *   start(tf)            — Inherited: launches mgmt + collector threads.
  *   [device execution]
- *   stop()               — Inherited: drain queues, join threads.
- *   reconcile_counters() — Recover any un-flushed current buffer left by an
- *                          abnormal exit, then cross-check collected ==
- *                          total - dropped.
- *   write_jsonl()        — Emit scope_stats/scope_stats.jsonl
- *                          (meta line + one record/line).
+ *   close_ordinary_run() — With producer-stop proof: quiesce, recover held
+ *                          records and snapshot accounting; keep resident threads.
+ *                          Without proof: stop(false), join host readers and
+ *                          export host-owned samples with unknown accounting.
+ *   write_jsonl()        — Render the frozen host snapshot, never refresh live
+ *                          device state; direct use requires reconciliation.
  *   finalize()           — Free all device memory, unregister.
  *
  * Output (scope_stats/scope_stats.jsonl), NDJSON:
@@ -53,12 +53,12 @@
  *            "tensormap":int,"run_epoch":uint,"buf_seq":uint}
  */
 
-#ifndef SRC_COMMON_PLATFORM_INCLUDE_HOST_SCOPE_STATS_COLLECTOR_H_
-#define SRC_COMMON_PLATFORM_INCLUDE_HOST_SCOPE_STATS_COLLECTOR_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <array>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -71,8 +71,10 @@
 #include "common/scope_stats.h"
 #include "common/unified_log.h"
 #include "host/collected_record.h"
+#include "host/diagnostic_run_banks.h"
 #include "host/profiler_base.h"
 #include "host/scope_stats_runs.h"
+#include "host/scope_stats_capacity.h"
 
 // ---------------------------------------------------------------------------
 // scope_stats Module (drives BufferPoolManager<ScopeStatsModule>)
@@ -165,6 +167,10 @@ class ScopeStatsCollector : public profiling_common::ProfilerBase<ScopeStatsColl
 public:
     ScopeStatsCollector() = default;
     ~ScopeStatsCollector();
+    /** Join host readers without a final device drain. */
+    void stop_for_device_failure();
+    /** Forget backing only after confirmed reset and host-reader stop. */
+    void abandon_after_device_reset();
 
     ScopeStatsCollector(const ScopeStatsCollector &) = delete;
     ScopeStatsCollector &operator=(const ScopeStatsCollector &) = delete;
@@ -174,25 +180,13 @@ public:
 
     int init(
         int num_threads, const ScopeStatsAllocCallback &alloc_cb, ScopeStatsRegisterCallback register_cb,
-        const ScopeStatsFreeCallback &free_cb, int device_id
+        const ScopeStatsFreeCallback &free_cb, int device_id, ScopeStatsUnregisterCallback unregister_cb = nullptr
     );
 
-    // Start a run's collection window: drop the previous run's records, its
-    // counter, and the recovered-buffer bookkeeping reconcile_counters() leaves
-    // behind. execution_complete_ is re-armed because it is what tells the
-    // collector loop a run is still producing.
-    //
-    // The collector initializes once and serves every run, so this is the only
-    // point at which they are cleared; init() clears none of them, and left
-    // alone they accumulate across runs. The device's producer state is part of
-    // that: `run_epoch` is the identity a buffer the previous run left in
-    // `current_buf_ptr` is re-stamped with, so this run's records cannot inherit
-    // the previous run's.
-    //
-    // False iff such a buffer could not be made this run's, which leaves the
-    // device able to attribute this run's records to the previous one. Callers
-    // that keep per-run artifacts must refuse the run.
-    bool begin_run(uint64_t run_epoch);
+    // Clear the host collection window after the preceding run is settled.
+    // Producer counters and a carried buffer's identity belong to device init;
+    // admission does not read or write their device storage.
+    void begin_run(uint64_t run_epoch, const simpler::dfx::scope_stats_runs::CapacityMetadata *capacities = nullptr);
 
     // Device pointer to the ScopeStatsDataHeader. Set
     // kernel_args.scope_stats_data_base to this after init().
@@ -200,22 +194,43 @@ public:
 
     // Poll-thread hook: append the buffer's records to the in-memory vector.
     void on_buffer_collected(const ScopeStatsReadyBufferInfo &info);
+    // A retired unreadable payload has no trustworthy per-window record count.
+    void on_handoff_retired(const profiling_common::RetiredHandoff<ScopeStatsModule> &retired);
 
-    // After stop(): recover a non-empty current buffer left by abnormal exit,
+    // Ordinary close recovers producer-held records only with a completion or
+    // independent producer-stop proof. Otherwise stop(false) joins host readers
+    // and exports only host-owned samples with unknown device accounting.
+    // Host-thread exit grants no authority to release device allocations.
+    int close_ordinary_run(const std::string &output_dir, bool producer_stop_proved);
+
+    // After producer stop and host quiescence: recover a non-empty current buffer left by abnormal exit,
     // warn on drops, and cross-check collected == total - dropped. Returns
     // true iff the run is clean.
     bool reconcile_counters();
 
-    // Render the collected records to
-    // <output_dir>/scope_stats/scope_stats.jsonl. Reads the static capacity
-    // metadata + fatal latch from the shared header (constant after
-    // orchestrator init). Must be called after stop().
+    // Render host-owned records and the checked, frozen metadata snapshot.
+    // Only close_ordinary_run can authorize a host-only unknown export; a
+    // skipped/failed direct reconciliation still refuses the direct export.
+    // Requires stopped or quiesced host readers.
     int write_jsonl(const std::string &output_dir);
 
     void finalize(ScopeStatsUnregisterCallback unregister_cb, const ScopeStatsFreeCallback &free_cb);
 
     bool is_initialized() const { return initialized_; }
-    uint64_t total_collected() const { return total_collected_; }
+
+    /**
+     * How many records this collector has received, across every run.
+     *
+     * Read under `records_mutex_`, the lock the collector thread increments it
+     * with, so an observer on another thread is ordered against that thread's
+     * appends rather than racing them. Collector-wide telemetry: a run's
+     * verdict is built from its own receipts, which this deliberately does not
+     * separate.
+     */
+    uint64_t total_collected() const {
+        std::scoped_lock lock(records_mutex_);
+        return total_collected_;
+    }
 
     /**
      * Collected records, each carrying the run that produced it.
@@ -232,14 +247,135 @@ public:
 
     // --- Cross-run retention -------------------------------------------------
     //
-    // Off unless `configure_retained_runs(true, ...)` is called before init, in
-    // which case the run boundary keeps its ownership steps — the receive drain
-    // and the terminal read — and hands only the rendering and the file write
-    // to a writer thread. Every entry point below is inert with retention off.
+    // Ordinary retention is off unless configured before init. Its run boundary
+    // keeps the receive drain and terminal read, handing rendering and file IO
+    // to the writer. Recorded windows use that writer independently of the
+    // ordinary retention setting.
 
     /** Latch retention and this collector's own host byte budget. */
     void configure_retained_runs(bool retain_across_runs, size_t budget_bytes);
     bool retains_runs() const { return retain_across_runs_; }
+
+    /** Open one lifetime window outside capture; its fixed tag may recur on replay. */
+    bool begin_recorded_window(
+        uint64_t run_epoch, const std::string &output_prefix,
+        const simpler::dfx::scope_stats_runs::CapacityMetadata &capacities
+    );
+    /** After producer stop, settle pool readers; writer failure remains diagnostic loss. */
+    int close_recorded_window(uint64_t run_epoch);
+    bool recorded_window_open(uint64_t run_epoch) const;
+    bool recorded_windows_open() const;
+
+    /**
+     * Map the device bank array this collector's producer publishes its per-run
+     * accounting into, for `expected_producers` participants.
+     *
+     * Until this is called the collector reconciles a run exactly as it does
+     * today, from the live shared header under the run's execution claim. That
+     * is correct only while runs are serialized, which is what the caller is
+     * asserting by *not* calling this: the address only reaches the device
+     * through the launching run's kernel arguments, so a mapped array with no
+     * one publishing into it would report every participant missing.
+     *
+     * One producer — the orchestrator thread is this collector's only writer —
+     * so `expected_producers` is 1 and the stride is the same.
+     */
+    bool open_run_terminal_banks(int expected_producers);
+
+    /** True while a run's own producer accounting is what settles its verdict. */
+    bool device_publishes_run_terminal() const { return terminal_banks_.opened(); }
+    bool terminal_backing_retained() const { return terminal_banks_.backing_retained(); }
+
+    /** The address this run's producer publishes into, for its kernel arguments. */
+    uint64_t run_terminal_device_address() const { return terminal_banks_.device_address(); }
+
+    /**
+     * Terminal banks held out of this collector's pool right now — one per live
+     * run that reserved one, plus any a run that ended with neither a
+     * completion nor a producer-stop proof still owes. The pool's own
+     * occupancy, which is the only figure that still answers once a run's slot
+     * has been retired.
+     */
+    size_t run_terminal_banks_in_use() const { return terminal_banks_.credits().banks_in_use(); }
+
+    /**
+     * The device address this run's producer publishes its accounting into.
+     *
+     * Resolved from the bank the run's own admission reserved, so two runs open
+     * at once get two addresses. 0 when the run holds no reservation — it was
+     * never admitted, its admission was refused, or retention is off — which is
+     * what the device reads as "publish no accounting".
+     */
+    uint64_t run_terminal_bank_address(uint64_t run_epoch) const;
+
+    /**
+     * Whether this run could take a terminal bank right now.
+     *
+     * True when the run already holds one — the question is idempotent across
+     * launch rounds — or when the array has one free. A run ordered behind the
+     * open ones with no bank left waits rather than launching without the
+     * accounting its diagnostic exists to produce; the banks come back as the
+     * runs ahead of it report.
+     */
+    bool can_take_run_terminal_bank(uint64_t run_epoch) const {
+        if (run_epoch == 0) return false;
+        if (run_terminal_bank_address(run_epoch) != 0) return true;
+        return terminal_banks_.can_reserve();
+    }
+
+    /**
+     * Give back the bank `run_epoch` holds without reading it, on proof that
+     * every producer that could write into it has terminated.
+     *
+     * For a run whose completion was never observed: its accounting is settled
+     * by `run_close` on the completion path alone, so here the bank holds
+     * whatever its producers managed before the failure. None of it is read —
+     * no consumer waits on it, the host never copies it, and an entry that
+     * outlives this epoch is counted as foreign by the next occupant, whose
+     * reconciliation compares each entry against its own run identity. So the
+     * storage is free and the host copies this run quarantined are untouched:
+     * they are the reader threads' to release at the join, which this proof
+     * says nothing about.
+     *
+     * The proof is the caller's and it is about producers, not success: a
+     * simulated device's producers are host threads and joining them
+     * establishes that none remains, while a real device's do not become
+     * observable that way. Without it the quarantine keeps the bank, because a
+     * producer may still be writing into it.
+     */
+    void discard_run_terminal_bank(uint64_t run_epoch);
+
+    /**
+     * Whether a further run could be admitted to the retained path.
+     *
+     * Retention configured, no sticky failure, and an output slot actually
+     * free — read as one answer, because a free slot on a collector that is not
+     * retaining proves nothing and a failed collector refuses admission
+     * whatever its capacity.
+     */
+    bool can_admit_retained_run() const;
+
+    /**
+     * Whether this collector holds no unpublished retained run.
+     *
+     * True once every admitted ordinary run or recorded window has settled.
+     * A recorded window holds its slot even with ordinary retention off.
+     * What it answers is whether a writer may still be reading
+     * this collector's pools — which outlives a run's native retirement, so
+     * it is not the same question as whether a run is executing.
+     */
+    bool retained_runs_idle() const;
+
+    /**
+     * Tell the owning context that this collector's capacity may have moved.
+     *
+     * Set once by the runner after init. Over-notifying is free — a woken
+     * admission re-attempts and parks again — while under-notifying costs a
+     * blocked run its whole deadline, so every path that signals this
+     * collector's own waiters signals this too rather than reasoning about
+     * whether it had to. Invoked with no collector lock held.
+     */
+    void set_credit_release_notifier(std::function<void()> notifier) { credit_notifier_ = std::move(notifier); }
 
     /**
      * Admit one run and open its export slot. False refuses the run, and the
@@ -249,8 +385,21 @@ public:
      * not be proved are still held — `begin_run()` would clear the very records
      * the quarantine protects — and when both unpublished export slots are in
      * use.
+     *
+     * Mapped banks require the binding's capacity metadata. TMR must supply its
+     * resolved values; a runtime without TMR rings marks them not required. The
+     * slot takes a copy before any producer starts, and withdrawal releases it.
+     *
+     * `why` is meaningful only when this returns false, and says whether the
+     * refusal is a capacity shortage the caller should re-attempt when credit
+     * moves or a condition re-attempting cannot change. Any refusal this does
+     * not classify reports `Fatal`: an over-strict answer fails the run early,
+     * where an over-lenient one would retry until its deadline.
      */
-    bool run_begin(uint64_t run_epoch, const std::string &output_prefix);
+    bool run_begin(
+        uint64_t run_epoch, const std::string &output_prefix, simpler::dfx::runs::AdmissionRefusal *why = nullptr,
+        const simpler::dfx::scope_stats_runs::CapacityMetadata *capacities = nullptr
+    );
 
     /**
      * Close one run's boundary, under its execution claim.
@@ -303,6 +452,7 @@ public:
     void fail_handoff_for_test(bool fail) { fail_handoff_ = fail; }
 
 private:
+    friend struct ScopeStatsCollectorTestPeer;
     bool initialized_ = false;
 
     // Shared memory region (ScopeStatsDataHeader + ScopeStatsBufferState).
@@ -312,8 +462,69 @@ private:
 
     simpler::dfx::scope_stats_runs::RecordBlocks records_;
     mutable std::mutex records_mutex_;
+    // A required producer must initialize this run before ordinary/unmapped
+    // export. Zero also permits a producerless runtime's metadata-only artifact.
+    uint64_t expected_producer_epoch_ = 0;
+    simpler::dfx::scope_stats_runs::DeviceSnapshot device_snapshot_{};
+    // Owned at admission; an unproven close must not refresh the live header.
+    simpler::dfx::scope_stats_runs::CapacityMetadata ordinary_capacities_{};
+    bool ordinary_stop_unproved_ = false;
+    // Bound by begin_run, including producerless runs; direct legacy collectors
+    // without an admission retain their existing identity-observation behavior.
+    std::optional<uint64_t> ordinary_run_epoch_;
     uint64_t total_collected_ = 0;
     uint64_t refused_records_ = 0;
+
+    /**
+     * One admitted run's own receipts, so two runs can be open at once.
+     *
+     * The single accumulator above cannot serve a joined pair: admitting a
+     * successor would release records its predecessor has not yet sealed, and
+     * every later arrival would be counted against whichever run happened to be
+     * admitted last. Each entry is claimed by `run_begin`, routed to by
+     * `append_buffer_records` using the identity the producer stamped on the
+     * buffer, and retired by that run's own close.
+     *
+     * Guarded by `records_mutex_`, the lock the receive path already holds, so
+     * routing adds no lock interaction. The accumulator above stays in use on
+     * the unmapped path, where no successor can be admitted at all and the
+     * artifact's bytes must not change.
+     */
+    struct RunReceipts {
+        uint64_t run_epoch{0};
+        bool open{false};
+        simpler::dfx::scope_stats_runs::RecordBlocks records;
+        uint64_t received{0};
+        uint64_t refused{0};
+    };
+    std::array<RunReceipts, simpler::dfx::runs::kMaxOpenEpochs> run_receipts_{};
+    // Records that arrived stamped with a run this collector holds no open
+    // receipts for — a run already sealed, or one it never admitted. Reported,
+    // never folded into another run's totals.
+    uint64_t foreign_epoch_records_ = 0;
+    // One-shot, so the receive path logs once rather than per record.
+    bool foreign_epoch_reported_ = false;
+    // Set by the receive path under `records_mutex_` and drained by the
+    // boundary, which is where the sticky error channel can be reached:
+    // `note_host_failure` takes `retained_mu_`, and the receive path must not
+    // hold both. Counting alone is not a reported loss, so this is what turns
+    // it into one.
+    bool foreign_epoch_pending_report_ = false;
+
+    /**
+     * Turn a pending foreign-record observation into this collector's sticky
+     * error, outside the receive path's lock.
+     *
+     * Safe to call with no observation pending; it is a no-op then.
+     */
+    void report_foreign_epoch_records() noexcept;
+
+    /** Claim `run_epoch` its own receipts. False when every entry is in use. */
+    bool open_run_receipts(uint64_t run_epoch);
+    /** Hand one run its receipts and close its entry. */
+    bool take_run_receipts(uint64_t run_epoch, simpler::dfx::scope_stats_runs::RunExport *into);
+    /** Release one run's receipts without publishing them. */
+    void drop_run_receipts(uint64_t run_epoch);
     uint64_t recovered_current_buf_ = 0;
     uint64_t recovered_current_total_ = 0;
 
@@ -323,43 +534,19 @@ private:
     void append_buffer_records(const void *buf_host_ptr);
 
     /**
-     * Make the buffer the producer still names in `current_buf_ptr` belong to
-     * `run_epoch`, by rewriting its 64-byte header and nothing below it.
-     *
-     * A producer that reuses a non-zero `current_buf_ptr` never pops, so the
-     * engine's `claim_free` — the only writer of a buffer's `count` reset and,
-     * via `on_pop_success`, of its identity stamp — does not run. Left alone,
-     * this run would append after the previous run's records and carry its
-     * `run_epoch` and `local_seq`, which is a duplicate in one artifact and a
-     * misattribution in the other.
-     *
-     * The buffer is pool memory outside the manager's shm window, so
-     * `publish_field` cannot reach it; this publishes the header range alone
-     * rather than the whole buffer, so the records below it are never written
-     * back from the host shadow.
-     *
-     * The pointer is left in place. Clearing it would orphan a pool buffer, and
-     * pushing it back onto the free queue would make this a second runtime
-     * writer of `free_queue.tail` — the drain shard that serves the buffer's
-     * ready queue is its sole runtime writer (see `profiler_base.h`).
-     *
-     * Only ever called between runs, where the previous run's completion is
-     * proved and this run has submitted nothing, so the producer is not running.
-     */
-    bool adopt_current_buffer(uint64_t run_epoch);
-
-    /**
-     * Render one artifact's bytes. `extra` adds the background-mode metadata
-     * keys; a null `extra` reproduces today's metadata line exactly, which is
-     * what keeps the default path's file unchanged.
+     * Render host-owned artifact values. `extra` describes retained collection
+     * or an unproven ordinary close; null preserves the ordinary seven keys.
+     * Non-null `host_only_capacities` makes device accounting null and admits
+     * only its owned capacities, with null for absent capacity values.
      */
     static int render_jsonl_to(
         std::FILE *fp, const simpler::dfx::scope_stats_runs::DeviceSnapshot &device,
         const simpler::dfx::scope_stats_runs::RecordBlocks &records,
-        const simpler::dfx::scope_stats_runs::Collection *extra
+        const simpler::dfx::scope_stats_runs::Collection *extra,
+        const simpler::dfx::scope_stats_runs::CapacityMetadata *host_only_capacities = nullptr
     );
 
-    /** Today's unchecked read of the shared header, for the default path only. */
+    /** Read the shared mirror only while establishing a checked terminal snapshot. */
     simpler::dfx::scope_stats_runs::DeviceSnapshot snapshot_unchecked() const;
 
     /**
@@ -388,8 +575,17 @@ private:
 
     struct Slot {
         SlotState state{SlotState::Free};
+        bool recorded_window{false};
         uint64_t run_epoch{0};
         std::string output_dir;
+        simpler::dfx::scope_stats_runs::CapacityMetadata capacities;
+        // The device bank this run's producer publishes into, held from
+        // admission until the host has copied the accounting out of it. Every
+        // path that gives a slot back does so by assigning a fresh `Slot`,
+        // which releases this with it — so a refused admission, a failed
+        // handoff and a reclaimed quarantine all return the bank without
+        // naming it.
+        simpler::dfx::credit::Reservation terminal_bank;
     };
 
     /**
@@ -400,6 +596,13 @@ private:
      * have left behind are never published: the caller quarantines instead.
      */
     bool read_terminal_checked(simpler::dfx::scope_stats_runs::DeviceSnapshot *out);
+
+    /** Device allocation trampolines for the bank array, bound to `this`. */
+    static void *bank_alloc(void *owner, size_t bytes, void **host_out);
+    static int bank_initialize(void *owner, void *device_dst, void *host_dst, const void *initial, size_t bytes);
+    static int bank_unmap(void *owner, void *device_ptr);
+    static int bank_free(void *owner, void *device_ptr);
+    static int bank_copy(void *owner, void *host_dst, const void *device_src, const void *host_src, size_t bytes);
 
     /**
      * Take the producer's unpublished current buffer, if it left one.
@@ -412,6 +615,11 @@ private:
      */
     bool recover_unpublished_buffer_checked();
 
+    bool open_run_slot(
+        uint64_t run_epoch, const std::string &output_prefix, simpler::dfx::runs::AdmissionRefusal *why,
+        const simpler::dfx::scope_stats_runs::CapacityMetadata *capacities, bool recorded_window
+    );
+
     /** `run_close`'s body, wrapped by the boundary's exception guard. */
     void run_close_locked_path(uint64_t run_epoch, bool device_execution_complete);
 
@@ -421,8 +629,37 @@ private:
     void stop_writer();
     int publish_export(const simpler::dfx::scope_stats_runs::RunExport &data);
 
+    std::function<void()> credit_notifier_;
+    simpler::dfx::credit::RunTerminalBanks terminal_banks_{};
+    // Kept from `initialize` so an allocation this collector makes later — the
+    // terminal bank array, which only exists once retention maps one — uses the
+    // same device allocator as its buffers. `initialize` takes them by
+    // reference and `finalize` takes them again, so neither call is the owner
+    // of a lifetime that spans both.
+    ScopeStatsAllocCallback device_alloc_cb_{nullptr};
+    ScopeStatsFreeCallback device_free_cb_{nullptr};
+    /**
+     * The callback the terminal bank array is released through.
+     *
+     * Separate from `device_free_cb_` because the two are not the same function
+     * at the only moment the array is released: `finalize` is handed its own
+     * free callback, and a teardown that abandons device resources hands one
+     * that frees nothing. The array is this collector's last device allocation
+     * and must follow the same policy as the pooled buffers released beside it,
+     * so `finalize` rebinds this to its own argument before releasing — using
+     * the `initialize`-time allocator there would hand memory back to an
+     * allocator the caller has deliberately stopped using.
+     */
+    ScopeStatsFreeCallback bank_free_cb_{nullptr};
+    /**
+     * The teardown's unregister callback, stashed beside the free one and for
+     * the same reason: the bank array's host mapping has to come down before
+     * its memory does, and `finalize` is the only place that callback exists.
+     */
+    ScopeStatsUnregisterCallback bank_unregister_cb_{nullptr};
+
     bool retain_across_runs_{false};
-    size_t retained_budget_bytes_{0};
+    std::optional<size_t> retained_budget_bytes_;
     bool retained_ready_{false};
     bool fail_terminal_copy_{false};
     bool throw_in_collector_{false};
@@ -444,5 +681,3 @@ private:
     std::thread writer_;
     RetainedRunStats stats_{};
 };
-
-#endif  // SRC_COMMON_PLATFORM_INCLUDE_HOST_SCOPE_STATS_COLLECTOR_H_

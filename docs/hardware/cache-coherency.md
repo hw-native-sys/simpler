@@ -3,8 +3,9 @@
 This page is the authoritative reference for **when to insert a cache
 operation** on Ascend onboard hardware. The coherency model differs
 between chip generations supported in this repo: a2a3 requires AICPU
-cache maintenance for host-DMA and SDMA-published GM, while a5 AICPU
-loads are coherent with DMA/HBM and do not need those invalidates.
+cache maintenance for host-DMA and SDMA-published GM, while a5 GM
+accesses need no AICPU-side cache clean or invalidate. Completion and
+ordering remain explicit on both architectures.
 Cycle costs and a few code-path examples below are sampled on a2a3
 unless stated otherwise. Misapplying these rules either leaks stale data
 (correctness bug) or burns a `dsb sy` per record on a hot path (perf
@@ -14,7 +15,7 @@ on AICore.
 
 ## Who shares GM, and with what consistency
 
-GM (HBM) is read and written by four parties on Ascend onboard. Their
+GM (HBM) is read and written by several parties on Ascend onboard. Their
 relationship to **AICPU's data cache** is **not symmetric** on a2a3,
 and a5 has a stronger DMA/HBM coherency model:
 
@@ -24,6 +25,26 @@ and a5 has a stronger DMA/HBM coherency model:
 | **AICore** (AIC / AIV / MIX) | **Yes** | **No** | **No** |
 | Host DMA (`rtMemcpy` from host RAM) | No | **Yes** | **No** |
 | SDMA engine (device-side DMA) | No (assumed) | **Yes** | **No** |
+| Device writes to RDMA/URMA completion records (CQEs) | N/A (unsupported) | N/A (unsupported) | **No** |
+
+The RDMA/URMA backends are supported only on A5. A2/A3 is outside their
+supported platform scope; the corresponding cache-policy entries are not applicable.
+
+These are AICPU-side data-cache rules, not instructions to flush an
+AICore L2 cache. The AICPU cache can contain an old copy of a GM address;
+a non-coherent DMA update changes HBM without invalidating that copy.
+An AICPU load can then return the old value even after the DMA has finished.
+The maintenance decision follows the writer and architecture, not the
+name of the copy API or whether the address happens to be in HBM.
+
+**Basis: project architecture premises, clarified in #2745.** The owner
+confirmed that A5 requires no AICPU-side GM cache maintenance, including
+Host DMA, SDMA and communication completion reads, and that completed
+AICPU GM writes are visible to consumers without an additional clean.
+The a2a3 Host DMA path and conservative SDMA invalidation remain intact.
+These are project-supplied architecture facts, not vendor specifications
+or new silicon measurements. They do not establish ordering, atomicity,
+writer ownership or safe reuse by themselves.
 
 Likewise, **AICore's own cache is non-coherent with GM** in the other
 direction: AICore-side writes stay in its data cache until explicitly
@@ -36,18 +57,75 @@ bypass load, for which see
 The rest of this doc fills in why each row of the table is what it is,
 and what code lives on each side.
 
-## The two cache primitives
+## A5 Scalar scheduling premises
+
+For A5 scheduler design, apply the project's
+[seven hardware and scheduling premises](../zh-cn/design/a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles).
+These are owner-supplied design premises dated 2026-11-16, not new measurements
+or vendor latency guarantees. They supplement the AICPU coherency policy above;
+they do not change the a2a3 observations below.
+
+Under this model, AICore `ld_dev/st_dev` bypass Scalar DCache but use L2;
+atomic operations bypass caches and use the HBM atomic path. Both GM reads
+and writes can serialize under same-address concurrency. Dynamic task claims
+still require atomic arbitration: distribute independent claims across
+**128 B L2-side isolation units**, not adjacent 64 B DCache lines. Read-only
+payload layout and DCache maintenance need not use that larger granularity.
+
+Neither access family is ordered by the SoC interconnect. Use explicit DSB
+at actual same-core dependency boundaries, including dependent atomic operations.
+An RMW result proves arbitration, not publication of other addresses; a C++
+memory-order parameter is not evidence of a native AICore barrier. Reliable
+`ld_dev` observations do not need a second FAA(0) confirmation. Single-writer
+signals can use `st_dev` when they need neither RMW nor an indivisible atomic
+state transition. Add DSB only for an actual same-core ordering dependency,
+not merely because another core will receive the notification; notification
+arrival itself is asynchronous. Multi-writer claims and contributions still
+need RMW. Dirty cached writeback
+must not overwrite either kind of control signal.
+
+STARS event/notify SRAM is the preferred future generic Wait backend under
+these premises. Its roughly four-cycle contention cost does not imply unlimited
+ingress bandwidth: empty polling needs `nop` rate limiting. Event ownership,
+initialization, early notifications, reuse and release must be defined before
+integration; neither event readiness nor DSB replaces consumer payload visibility.
+Mapped SPR registers are not a generic event pool without allocation and release
+management. Existing fixed-role register protocols do not supply that facility.
+
+## Cache primitives and barriers
 
 | Primitive | Side | Purpose | Cost (rough, a2a3 / DAV_3510) |
 | --------- | ---- | ------- | ----------------------------- |
 | `dcci` (`__attribute__((aicore))` intrinsic) | AICore | Push a cache line out to GM (clean+invalidate). Required after AICore stores that AICPU or peer AICore must read. | 1 cache line per call + a following `dsb` to commit ordering. |
-| `cache_invalidate_range(addr, size)` (`src/common/platform/include/aicpu/cache_maintenance.h`) | AICPU | `dc civac` + `dsb sy` + `isb` over a byte range on onboard builds; sim builds keep it a no-op. Required on a2a3 before AICPU reads GM that **a non-coherent writer** (host DMA, SDMA) most recently published. | `dsb sy` dominates (tens to hundreds of cycles, fixed regardless of range). |
+| `cache_invalidate_range(addr, size)` (`src/common/platform/include/aicpu/cache_maintenance.h`) | AICPU | a2a3 onboard: `dc civac` over whole cache lines plus completion barriers. Required before reading GM published by a **non-coherent writer** (Host DMA, conservative SDMA). A5 onboard and sim implementations are empty, with no cache operations or barriers. | a2a3: line count plus the completion barrier; `dsb sy` can dominate. |
+| `cache_flush_range(addr, size)` | AICPU | a2a3 onboard: `dc cvac` plus completion barriers. A5 onboard and sim implementations are empty, with no cache operations or barriers. | a2a3: line count plus the completion barrier. |
+
+`dc civac` means **clean and invalidate to the Point of Coherency**,
+not pure invalidation: it can write dirty bytes back. The existing platform
+build selects separate a2a3 onboard, A5 onboard and common sim source files.
+Only a2a3 performs cache-line operations and their completion sequence
+`dsb sy; isb` for nonempty ranges; zero-length ranges return immediately.
+Callers, including shared Region and diagnostic code, express protocol
+ordering through explicit `rmb()`/`wmb()` or their existing acquire/release
+operations. A cache call supplies no ordering on A5 or sim.
+
+Removing a cache call does not automatically require a replacement barrier.
+Scalar completion polling and diagnostic snapshots do not consume a payload
+published by the observed counter; their existing completion/dispatch protocols
+provide the hand-off. Region notifications do publish payload for a following
+read, so their stores use release and observations use acquire. The run-terminal
+record is read after kernel completion with its slot reserved, so it needs no
+additional A5 publication barrier. An error flag followed by reads of its error
+details needs read ordering at that consumption point, not on every status poll.
 
 `cache_invalidate_range` is the protocol-correct primitive for the
 **host-DMA → AICPU** case on a2a3. It was introduced in PR #204
 specifically for `Runtime` struct hand-off where the host writes via
-`rtMemcpy` and AICPU reads. **It is NOT the right primitive for
-AICore → AICPU, and it is not required for a5 DMA/HBM reads.**
+`rtMemcpy` and AICPU reads. It is not required **for cache coherency**
+when reading properly published AICore writes or a5 DMA/HBM writes.
+Cache visibility and protocol ordering are separate: a caller must not rely
+on the a2a3 implementation's embedded barrier for a cross-platform protocol.
+See the [historical pitfall](#historical-pitfall).
 
 ### `dcci` is whole-cache-line: no parallel sub-line writes
 
@@ -66,8 +144,8 @@ cache line) lives in
 
 ## The "AICore → AICPU" path: AICPU does not invalidate, but DOES barrier
 
-AICore and AICPU share a coherency domain on GM. When AICore writes a
-slot, the correct handshake is:
+For the task-slot handoff below, AICore and AICPU share a coherency
+domain on GM. When AICore writes a slot, the correct handshake is:
 
 ```text
 AICore                              AICPU
@@ -150,14 +228,16 @@ earlier run's reader is still live on the line. For this one field, existing cod
 provides the **two intra-run ordering edges** below, under the lifetime preconditions
 that code already assumes — it does not establish those preconditions:
 
-- **Reset before window-open.** `memset` over the gates then `wmb()`
-  (`scheduler_cold_path.cpp:1183-1184` TRB, `:890-891` HBG). The barrier is what orders
+- **Reset before window-open.** AICPU resets the request/release words in each
+  64-byte `AicoreTeardownControl` with a whole-control clear, then executes
+  `wmb()` in `pre_handshake_init`. AICPU is its only writer; AICore only
+  bypass-loads the request and release words. The barrier orders
   the resets before `hs_setup_done_` and before any register window opens — a window is a
   plain `Device-nGnRE` store carrying no release semantics of its own. No core can read
   its gate before its window opens.
 - **RELEASE after window-close.** The quiesce pass, then the CLOSE pass and its
   readbacks, then `rmb()`, then the relaxed `post_close_release` stores
-  (`platform_regs.cpp:82`, `:142`, `:149`). The drain is what orders every store after
+  in `platform_retire_aicore_group`. The drain is what orders every store after
   the CLOSE it belongs to, so an open return gate is never paired with an open window.
 
 **Lifetime across runs is a separate, open question.** Whether a reader left behind by a
@@ -166,15 +246,65 @@ releases the same gates is **not** established — the recovery path is untraced
 neither the premise nor the two edges above settle it. See
 [the exceptional-exit limit in the descriptor visibility investigation](../investigations/2026-09-runtime-descriptor-input-visibility-chain.md#exceptional-and-partial-exits-audited-separately).
 
-The AICore reads that word with `wait_for_post_close_release`
-(`src/a2a3/platform/onboard/aicore/inner_kernel.h:52-59`), a `ld_dev` spin followed by
-`dsb(DSB_DDR)`. Nothing else is published through the gate: it is permission-to-return,
-one `uint32_t` in its own 64-byte line.
+The AICore reads the release word with `acknowledge_aicore_cond_nonce_and_wait` in
+`src/a2a3/platform/onboard/aicore/inner_kernel.h`: bypass `ld_dev` loads followed
+by a final `dsb(DSB_DDR)`. The release word is permission-to-return. It shares an
+AICPU-owned 64-byte line with `exit_request`. AICore publishes its response in
+COND, so no GM ACK field or AICore writeback shares this line.
+`AicoreTeardownControl` has 64-byte size and alignment and requires matching
+host, AICPU and AICore builds.
 
-**This licenses no deletion.** In particular the descriptor-wide
-`cache_invalidate_range` in `deinit` stays: `dc civac` also cleans, and its role toward
-other readers — including the host's D2H direction, which this premise does not address —
-is a separate question tracked in
+### Exit acknowledgement freshness
+
+`COND=EXITED` can survive a launch. A current report does not prove that the
+current core has observed EXIT, and failure can precede its first IDLE. Waiting
+for IDLE or using one fixed exit marker does not establish current retirement.
+
+#### Unified COND nonce
+
+A2/A3 and A5 HBG/TMR use `platform_retire_aicore_group` for Native, legacy and
+unstamped launches. Native report epochs still commit the current physical-core
+report; the epoch neither selects an exit protocol nor acknowledges retirement.
+
+| Order | AICPU | AICore |
+| ----- | ----- | ------ |
+| 1 | Reset request/release before READY; accept the current report; claim each target once | Publish the current physical-core report |
+| 2 | Read that target's retained COND; choose `0xfffffff1` or `0xfffffff2`, different from that observation | Continue or fail before the first IDLE |
+| 3 | Store each request, `wmb()`, then broadcast DMB EXIT from the retirement helper | Observe current EXIT; complete preceding writes with `dsb(DSB_DDR)` |
+| 4 | Accept only COND equal to that target's request, within the shared absolute deadline | Bypass-load the request, publish the nonce once, then perform no further SPR writes |
+| 5 | Close acknowledged targets, read back, drain, then publish post-close release | Bypass-poll release; final drain; return |
+
+The two nonce values are reserved FIN encodings excluded by the scheduler's
+task-ID allocator. Ordinary FIN, IDLE and fixed EXITED cannot satisfy the match.
+Selection uses the actual target's old COND, rather than a global launch parity:
+a physical core can skip intervening launches. Only this physical core writes
+its COND, and a uniquely claimed retirement publishes one request.
+
+A5 HBG resident shutdown can broadcast EXIT before the partition's retirement
+helper publishes its request. The Core waits for the reserved request before
+echoing it; this ordering does not require a second protocol or a request
+update. Its pre-READY failure and local-watchdog paths wait for actual AICPU
+DMB EXIT before reading the control, because AICPU resets it before that signal.
+Thus a prior request or RELEASE cannot let an early failure acknowledge or return.
+
+The Core's completion barrier precedes the request load and dependent COND
+write. AICPU accepts the MMIO nonce match itself; there is no following GM ACK
+load, ACK-line invalidate, or AICore ACK-line initialization/writeback.
+The a2a3 descriptor retains its Host DMA maintenance below; A5 uses
+completion ordering without descriptor-wide cache operations.
+
+The protocol proves a response to this retirement request without requiring an IDLE
+observation. A silent core retains EXIT, its open window and its closed return
+gate when the shared deadline expires; the original host recovery owns it.
+Descriptor reuse still requires the previous generation to have completed or
+been recovered. The nonce match does not make concurrent reuse valid.
+
+The gate protocol alone does not decide descriptor cache policy. On a2a3,
+the descriptor-wide `cache_invalidate_range` in `deinit` stays for the
+non-coherent Host DMA path. On A5, the broader GM coherence premise covers
+both incoming reads and outgoing completed AICPU writes, so neither side
+requires a descriptor clean/invalidate. Required completion and retirement
+ordering remains separate. The earlier, narrower audit is preserved in
 [the descriptor visibility investigation](../investigations/2026-09-runtime-descriptor-input-visibility-chain.md).
 
 ## The "host DMA → AICPU" path: a2a3 MUST invalidate, a5 does not
@@ -203,39 +333,16 @@ Two details of the call as it stands, both verified against the source:
 On a5, host DMA writes to GM are coherent with AICPU reads, so the
 matching runtime hand-off code does not call `cache_invalidate_range`.
 
-**Basis: a project architecture premise.** The host↔device distinction is stated by
-the project owner: **A3 host/device is not cache-coherent; A5 host/device is.** Take
-that as the premise this section rests on. It is an architectural statement from the
-project, **not** a vendor specification quoted here and **not** something this
-repository measured — no external citation is linked from this file, and none should
-be inferred.
+The host distinction is a project premise: **A3 Host DMA is not coherent
+with AICPU reads; A5 is.** The a2a3 implementation retains the conservative
+path for both A2 and A3. The broader A5 premise at the top of this page
+also covers outgoing completed AICPU writes; it does not change the
+ordering, atomicity or lifetime requirements of a launch.
 
-Three limits on how far that premise reaches, because the rest of this document makes
-endpoint-specific claims that do **not** follow from it:
-
-- **It is about the host↔device edge only.** The `AICore → AICPU` and
-  `SDMA → AICPU` sections below concern on-device producers. Their claims rest on
-  their own basis and are not derived from this premise.
-- **It names A3.** A2 is not covered by it. The `a2a3` tree serves both and remains on
-  the conservative path; this documentation does not change that path. No A2 coherence
-  model follows from the premise, and nothing here establishes that an additional
-  clean-and-invalidate is harmless on any architecture — that would be a separate
-  question about the operation's outbound role, below.
-- **Coherence is not ordering, atomicity or ownership.** It says a host write becomes
-  visible without AICPU-side invalidation. It does not make a multi-field publication
-  atomic, does not supply happens-before between a writer and a reader, and does not
-  permit overwriting a field another agent is live on. Those obligations are tracked
-  separately in
-  [the descriptor visibility investigation](../investigations/2026-09-runtime-descriptor-input-visibility-chain.md).
-
-**Consequently this premise licenses no code change on its own.** In particular it does
-not authorise deleting any cache operation now in the tree: a `dc civac` call also
-cleans, so its outbound role toward on-device readers is a separate question from the
-inbound freshness the premise settles.
-
-**In-tree history of the a5 difference.** a5 `host_build_graph` calls
-`cache_invalidate_range` over the descriptor at two sites while a5
-`tensormap_and_ringbuffer` calls it at none. The statement itself entered the tree with
+**In-tree history of the a5 difference.** Before #2745, a5
+`host_build_graph` called `cache_invalidate_range` over the descriptor at
+two sites while a5 `tensormap_and_ringbuffer` called it at none. The
+architecture distinction entered the tree with
 [`153daee6b`](https://github.com/hw-native-sys/simpler/commit/153daee6bb302554bbff85e4e91f80e66691df25)
 (#1235), whose message gives the rationale as "per hardware guidance" and names no
 document, version or section. The sequence:
@@ -254,8 +361,8 @@ document, version or section. The sequence:
 One reading of 1–3 is that the call returned as part of the migration copy rather than
 by a decision specific to a5. **That is an inference from commit history, and history
 proves neither a hardware model nor its absence** — it records when the call returned,
-not why it was kept. It is kept here because it explains how the two a5 runtimes came
-to differ, which is a maintenance fact, independent of the premise above.
+not why it was kept. The A5 descriptor call sites are removed under the
+clarified coherence contract; the a2a3 descriptor maintenance stays.
 
 ## The "SDMA → AICPU" path: a2a3 is conservative, a5 is coherent
 
@@ -269,11 +376,12 @@ on the conservative assumption that SDMA is not in AICPU's coherency
 domain.
 
 On a5, SDMA writes are coherent with AICPU reads, so the matching a5
-SDMA completion helpers do not invalidate or flush cache lines.
-
-Note the basis: SDMA is an **on-device** engine, so this row is *not* covered by the
-host↔device architecture premise recorded in the host-DMA section above. It rests on
-whatever established it originally, which this file does not record.
+SDMA completion helpers do not invalidate or flush cache lines. The same
+A5 premise covers device-written RDMA/URMA completion records (CQEs);
+their owner/sequence checks,
+acquire ordering and completion retirement remain part of the backend
+protocol. This follows the broader A5 GM premise recorded above, not an
+inference from the narrower Host DMA distinction.
 
 ## Quick decision table
 
@@ -281,11 +389,9 @@ When you are about to insert a cache operation, ask in order:
 
 1. Who actually wrote the bytes I'm reading? Look at the producer
    code, not the address.
-2. Is this a5? If yes → no AICPU invalidate/flush for GM reads written
-   by host DMA, SDMA, AICPU, or AICore.
-   The **host DMA** arm of this rule is the one the architecture premise in the
-   host-DMA section supports. The other three producers are on-device and rest on
-   their own basis; do not cite that premise for them.
+2. Is this a5? If yes → no AICPU cache clean/invalidate for GM, including
+   Host DMA, SDMA, communication completion and AICore publications.
+   Preserve the protocol's completion and ordering requirements.
 3. On a2a3, is the producer in the AICPU coherency domain (AICPU itself
    or AICore)? If yes → no invalidate. If no (host, SDMA) → invalidate.
 4. For AICore writes specifically, does the producer already `dcci`
@@ -296,8 +402,9 @@ When you are about to insert a cache operation, ask in order:
    yes, and there is no data/address dependency between that read and
    this one, insert `rmb()` between them — coherency does not imply
    load-load ordering on ARM64.
-6. Am I about to add an AICPU clean so an **AICore** read sees my
-   store? On a2a3, for an ordinary GM store read back by an AICore
+6. Am I about to add an AICPU clean to publish my store? On A5,
+   completed AICPU GM writes need no clean. On a2a3, for an ordinary GM
+   store read back by an AICore
    `ld_dev` bypass load, no clean is needed — see the AICPU → AICore
    section. What you still owe that reader is *ordering*, from a
    barrier and the surrounding protocol, not from cache maintenance.
@@ -311,7 +418,8 @@ forever once they ship.
 ## Related code
 
 - `src/common/platform/include/aicpu/cache_maintenance.h` — public cache-maintenance wrappers.
-- `src/common/platform/onboard/aicpu/cache_ops.cpp` — onboard implementation (`dc civac` / `dsb sy` / `isb`).
+- `src/a2a3/platform/onboard/aicpu/cache_ops.cpp` — a2a3 cache operations and their completion barriers.
+- `src/a5/platform/onboard/aicpu/cache_ops.cpp` — empty A5 implementations, with no cache operations or barriers.
 - `src/common/platform/sim/aicpu/cache_ops.cpp` — sim no-op.
 - AICore-side `dcci` usage lives in the chip swimlane / PMU AICore collectors and any kernel that publishes to a GM slot AICPU reads.
 

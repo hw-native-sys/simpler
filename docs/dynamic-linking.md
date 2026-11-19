@@ -10,7 +10,7 @@ and per-thread state is managed across simulation and onboard platforms.
 ```text
 Python process (ChipWorker)
   |
-  dlopen(host_runtime.so, RTLD_GLOBAL)        ← host SO
+  dlopen(host_runtime.so, RTLD_NOW | RTLD_LOCAL)        ← host SO
     |
     +-- DeviceRunner::ensure_binaries_loaded()
     |     |
@@ -30,14 +30,14 @@ Python process (ChipWorker)
 ```text
 Python process (ChipWorker)
   |
-  dlopen(host_runtime.so, RTLD_GLOBAL)        ← host SO
+  dlopen(host_runtime.so, RTLD_NOW | RTLD_LOCAL)        ← host SO
     |
     +-- DeviceRunner (handle-based, one per ChipWorker)
     |     |
     |     +-- LoadAicpuOp::BootstrapDispatcher()
     |     |     |
     |     |     +-- rtAicpuKernelLaunchExWithArgs(KERNEL_TYPE_AICPU_KFC)
-    |     |           dispatcher writes simpler_inner_<fp>_<device_id>.so
+    |     |           dispatcher writes <hostPid>_<localDeviceId>/simpler_inner_<fp>_<device_id>.so
     |     |
     |     +-- LoadAicpuOp::Init()
     |     |     |
@@ -51,37 +51,40 @@ Python process (ChipWorker)
 ```
 
 Key difference: onboard does **not** dlopen AICPU/AICore as host-side SOs.
-The runtime AICPU SO is written once to the device preinstall path through
+The runtime AICPU SO is uploaded per runner into CANN's process directory through
 the dispatcher bootstrap, then registered and launched by CANN runtime handles.
+TSD removes the process directory at session teardown.
 AICore remains a CANN-registered binary blob.
 
 ## RTLD Flags and Rationale
 
-### Host Runtime SO: `RTLD_NOW | RTLD_GLOBAL`
+### Host Runtime SO: `RTLD_NOW | RTLD_LOCAL`
 
-`RTLD_GLOBAL` is **required**. PTO ISA's TPUSH/TPOP instructions (AIC-AIV
-data transfer for mix-type kernels) use `dlsym(RTLD_DEFAULT, ...)` internally
-to locate shared storage hooks defined in the host SO:
+`RuntimeModule` owns one dynamic-loader reference. Its required symbol lookup
+throws on a missing export; optional lookup returns null. Existing C symbols
+and their required/optional policies are unchanged.
 
-```cpp
-// PTO ISA: pto/common/cpu_stub.hpp
-inline GetSharedStorageHookFn ResolveSharedStorageHook() {
-    static auto hook = reinterpret_cast<...>(
-        dlsym(RTLD_DEFAULT, "pto_cpu_sim_get_shared_storage"));
-    return hook;
-}
-```
+The runtime stays local so identically named entries in TMR and HBG do not
+interpose on each other. Simulation's process-wide `libcpu_sim_context.so`
+is loaded separately with `RTLD_GLOBAL`; it supplies the PTO-ISA hooks reached
+by `dlsym(RTLD_DEFAULT, ...)`, including shared storage and task identity.
+Those hooks do not require global visibility for the host runtime itself.
 
-With `RTLD_LOCAL`, this symbol is not in the global scope. The hook returns
-`nullptr`, and TPUSH/TPOP fall back to a `static` local variable per SO.
-Since AIC and AIV kernel threads run in different contexts, they get separate
-storage instances and deadlock — the producer (TPUSH) writes to one storage,
-the consumer (TPOP) waits on another.
+The context binding and each opaque native-run storage slot share the module
+owner. A storage move transfers both its bytes and its code reference; freeing
+the bytes precedes dropping that reference. Successful close destroys the
+context and releases native storage before dropping the binding's module
+reference. Failed initialization clears uncommitted bindings before its local
+module owner exits. Failed close keeps the binding for retry.
 
-**Cross-runtime isolation** (running different runtime SOs sequentially) relies
-on `-fno-gnu-unique` to ensure `dlclose` actually unloads the SO. The next
-`dlopen` with `RTLD_GLOBAL` then replaces the global symbol scope with the
-new runtime's symbols.
+If destruction cannot prove teardown, the context and abandoned storage remain
+retained and their module is kept loaded for the process lifetime. Ordinary
+C++ reference destruction cannot unload code that retained state may call.
+This is terminal retention, not proof that device work stopped. Captured-graph
+ownership is a separate consumer; this eager owner does not enable capture.
+
+`-fno-gnu-unique` permits actual unload after the final reference on supported
+ELF builds. The process-owned simulator context retains its separate lifetime.
 
 ### Inner SOs: `RTLD_LOCAL`
 
@@ -90,16 +93,25 @@ All SOs loaded by DeviceRunner (AICPU, AICore, kernel, orchestration) use
 SOs need from the host SO are passed via explicit function pointer injection
 (see "Function Pointer Injection" below).
 
-### Orchestration SO: `RTLD_LAZY | RTLD_LOCAL`
+### Orchestration SO
 
-Loaded by the AICPU executor at runtime from a temp file. Uses `RTLD_LAZY`
-because not all symbols may be referenced. Communicates with the runtime
-through a function pointer table (`RuntimeOps`), not direct symbol
-linkage.
+Loaded from a temp file. Which side loads it, with which flags, and which ops
+table it calls through all differ by runtime:
 
-`RuntimeOps` is a binary ABI without size or version negotiation.
+| Runtime | Loaded by | Flags | Ops table |
+| ------- | --------- | ----- | --------- |
+| `tensormap_and_ringbuffer` | the AICPU executor | `RTLD_LAZY \| RTLD_LOCAL` — not all symbols may be referenced | `RuntimeOps`, reached through `RuntimeContext` |
+| `host_build_graph` | the host | `RTLD_NOW \| RTLD_LOCAL` | `OrchOps`, reached through `OrchContext` |
+
+`host_build_graph` orchestrates on the host, so its orchestration SO never
+reaches the AICPU at all, and the context it calls through carries only host
+state — none of it travels in the image uploaded to the device. Either way the
+SO communicates with its runtime through the function pointer table, not direct
+symbol linkage.
+
+Both tables are a binary ABI without size or version negotiation.
 Orchestration SOs and their runtime must therefore be built from the same
-simpler revision. Changing the table's field count, order, or signatures
+simpler revision. Changing a table's field count, order, or signatures
 invalidates previously built orchestration SOs; cached or prebuilt artifacts
 must be rebuilt before they are loaded by the updated runtime.
 
@@ -120,8 +132,8 @@ in a file-scope `g_hal_handle` and never explicitly dlclosed.
 | ------ | ---- | ------- | ------------ |
 | `pto_cpu_sim_set_execution_context` | PTO ISA `cpu_stub.hpp` | Kernel `set_execution_context()` | Sim: injected via `set_sim_context_helpers` (bypasses dlsym) |
 | `pto_cpu_sim_get_execution_context` | PTO ISA `cpu_stub.hpp` | Kernel `get_block_idx()` etc. | Sim: same injection mechanism |
-| `pto_cpu_sim_get_shared_storage` | PTO ISA `cpu_stub.hpp` | TPUSH/TPOP shared state | Requires `RTLD_GLOBAL` on host SO |
-| `pto_cpu_sim_get_task_cookie` | PTO ISA `cpu_stub.hpp` | Kernel `get_task_cookie()` | Requires `RTLD_GLOBAL` on host SO |
+| `pto_cpu_sim_get_shared_storage` | PTO ISA `cpu_stub.hpp` | TPUSH/TPOP shared state | Provided by the process-global simulator context |
+| `pto_cpu_sim_get_task_cookie` | PTO ISA `cpu_stub.hpp` | Kernel `get_task_cookie()` | Provided by the process-global simulator context |
 | `halMemAlloc` / `halMemFree` | Onboard `device_malloc.cpp` | AICPU device memory | Resolved once, cached in statics |
 | `halGetDeviceInfoByBuff` | Onboard `host_regs.cpp` | Core validity query | a2a3 only |
 | `halMemCtl` | Onboard `host_regs.cpp` | Register address mapping | a2a3 only |
@@ -134,8 +146,8 @@ and `RTLD_LOCAL`.
 
 The next two (`get_shared_storage`, `get_task_cookie`) are called from PTO ISA
 template code instantiated **inside kernel SOs** — not the AICore SO. Function
-pointer injection into the AICore SO cannot reach them. They require the host
-SO to be loaded with `RTLD_GLOBAL`.
+pointer injection into the AICore SO cannot reach them. They resolve against the process-global simulator context; the host runtime
+remains local.
 
 The HAL symbols are onboard-only. CANN's scheduler process pre-loads
 `libascend_hal.so` into the global scope before launching AICPU kernels.
@@ -173,29 +185,247 @@ C++ `thread_local` uses ELF TLSDESC on aarch64, which has known issues
 with dlclose/re-dlopen cycles in older glibc versions. The sim platform
 uses `pthread_key_t` (POSIX TLS) for per-thread state in framework SOs.
 
+### Module-owned scalar thread state
+
+`ModuleThreadValue<T>` stores small trivially-copyable values in pthread slots,
+one key per pointer-sized word. It does not allocate owning objects per thread
+or register thread-exit callbacks. Each module owns its keys and deletes them
+at unload, after callers have quiesced; a caller thread may remain alive after
+its last call into the module. Pointer values are borrowed, never freed by the
+selector. This requires the existing `-fno-gnu-unique` build contract on GCC.
+
+Partial key creation releases only keys already acquired. Required updates
+return an error or throw; a failed multiword update restores the complete prior
+value. A failed rollback or mandatory restore terminates rather than returning
+with a potentially dangling selector. Optional caches disable reads for the
+whole cache after a binding failure and return their initial value thereafter.
+Host-phase lane failures count as dropped records in the exported JSON, including
+passes with no stored events; per-kind totals omit events denied a lane.
+Notification suppression uses a mutex-protected list of live stack scopes when
+TLS setup fails. This allocation-free fallback suppresses only the scope's
+thread; other threads still publish genuine credit progress. Nested rollback
+scopes remain quiet without manufacturing their own retry notifications.
+
+The host-phase lane/generation and thread-ID caches, per-producer record buffers,
+submission timing and notification suppression use this storage. These are
+module-local values, not the shared host-log state. Recorder scratch and prepare
+transaction ownership are separate migrations; this helper does not make it
+safe to unload a module while a thread is executing its code.
+
+On 64-bit hosts, the trace lane/generation cache uses two keys, the thread-ID
+cache one, the record-buffer selector two, and notification suppression one per
+module instance when initialized. Each orchestration module uses two more keys
+for submission timing only when its bound ops table provides `record_orch_phase`.
+Once initialized, those keys remain owned until module unload.
+The record buffer owns its write cursor; pthread slots change only on pass/buffer
+changes. A context admits at most 64 callable IDs, but pthread key capacity is
+process-wide: independently loaded modules across contexts and other libraries
+share that budget. Additional threads reuse the same keys. Unregistration returns
+keys only when the last loader reference is released and the module really unloads.
+
 ### All TLS Variables
+
+HBG recorder storage is worker-owned. Borrowed worker-storage pointers and
+active-recording identities use module-owned pthread keys without thread-exit
+callbacks. Direct recordings borrow bounded reusable scratch from their graph
+state; no recording payload is owned by TLS.
+
+The prepare transaction owns its dependency capture session and workspace claim
+ledger through success, rollback and exception cleanup. Selectors only borrow
+these objects and are cleared before their storage dies. Recursive prepare on
+the same thread is rejected, including calls naming a different context. A failed
+selector binding leaves its previous value intact and fails the operation; a
+failed restore terminates rather than leaving a dangling borrowed pointer. Key
+initialization failures remain unavailable until module reload.
+
+`HostDependencyCaptureScope` receives the current prepare's enable flag. An
+enabled scope creates a session; a disabled scope allocates no capture storage.
+There is no capture configuration retained on the calling thread between sessions.
+The orchestration entry still calls `begin_capture()` to start a fresh graph;
+restoring a parked graph for export does not start another recording.
+`PrepareWorkspaceScope` owns temporary workspace state and the claim ledger.
+Its destructor restores selectors and frees the ledger; the prepare paths must
+commit or roll back the workspace claims explicitly before that destruction.
+
+`tests/lint/check_reloadable_thread_local.py` rejects new compiler TLS
+declarations and unreviewed pthread-key creation sites. This tree has no
+compiler TLS exceptions left; every `pthread_key_create` site has an inventoried
+owner. Third-party PTO ISA TLS is outside this source-tree check.
+
+HBG exports paired `simpler_runtime_acquire_host_services` and
+`simpler_runtime_release_host_services` hooks. RuntimeModule acquires one lease per
+loader owner; the last safe release closes admission, drains and joins the recorder
+pool before dlclose. Missing both hooks is supported for runtimes without these
+services; a partial pair or failed acquire rejects the load. Terminal abandonment
+retains the loader reference and lease together. Lifecycle release must run outside
+recorder workers, after the owner's binds and native runs have finished.
+The declarations, function types and ownership contract are centralized in
+`src/common/worker/runtime_host_services.h` and shared by loader and runtime.
 
 | Variable | Storage | SO | Purpose |
 | -------- | ------- | -- | ------- |
+| host-phase lane/generation and thread ID | `ModuleThreadValue` | host runtime SO | Borrowed producer identity; generation rejects stale passes |
+| `HostPhaseProducerLane` | `ModuleThreadValue` | producing host module | Buffer identity only; exclusive buffer owns the write cursor |
+| `RtSubmitPhaseState` | `ModuleThreadValue` | orchestration SO | Per-thread submission timing; no keys when the bound runtime lacks phase recording |
+| `SuppressSelfNotify` depth | `ModuleThreadValue` with stack-scope fallback | host module | Suppress this thread's rollback notifications |
 | `g_reg_base_key` | `pthread_key_t` | AICore SO | Per-core simulated register base address |
+| percounter Scalar recorder | `pthread_key_t` | profiled AICore simulation SO | Borrows a lane-stack recorder; binding clears before the stack expires, key deletes at module unload, no thread-exit callback; uninstrumented TUs allocate no key |
 | `g_core_id_key` | `pthread_key_t` | AICore SO | Per-core physical core ID |
 | `g_device_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread device binding (device_id) |
 | `g_subblock_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread subblock identity (for TPUSH/TPOP) |
 | `g_cluster_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread cluster identity (for TPUSH/TPOP) |
-| `s_orch_thread_idx` | `__thread int` | AICPU SO | Profiling thread index (profiling off by default) |
+| affinity executor index | `AffinityTlsKey` | AICPU SO | Fixed module-owned record pool; each record points at a simulated thread stack cell or an onboard classification slot and is recycled on unbind |
+| recorder storage / active recording | `ModuleThreadValue` | host runtime SO | Borrowed worker scratch / recording identity |
+| dependency capture | `ModuleThreadValue` | host runtime SO | Borrowed prepare-owned session; enabled only by the current prepare |
+| workspace plan / claims | `ModuleThreadValue` | onboard host runtime SO | Prepare-owned identity and rollback ledger |
 | `g_platform_phase_base` | plain global + `extern "C"` setter | AICPU SO | Device-phase buffer base; published by host (onboard kernel.cpp / sim dlsym), read by the `[STRACE]` phase stamps. Per-thread slotting via the affinity pthread-key index, not TLS. |
-| strace `inv`/`depth`/`hid` | `pthread_key_t` (`ThreadState`) | host runtime SO | Per-thread `[STRACE]` host-trace state (was C++ `thread_local`, converted per this rule). |
+| strace `inv`/`depth`/`hid` | process-owned `pthread_key_t` (`SimplerHostTraceState`) | resident `_task_interface` host-log owner; borrowed by runtime/generated SOs | Scalar trace state allocated with `calloc`, freed by libc at thread exit. |
+| onboard prepare ownership | `pthread_key_t` | host runtime SO | Rejects same-thread recursive prepare across contexts; the key is deleted when the module unloads. |
+| sim prepare admission | `ModuleThreadValue<bool>` | sim platform SO | Rejects same-thread recursive prepare before any state change; the key is deleted when the module unloads. |
 | `execution_context` | `thread_local` | Kernel SO (PTO ISA) | Per-thread execution context (fallback, cached values only) |
 | `NPUMemoryModel::instance` | `thread_local` | Kernel SO (PTO ISA) | Per-core memory model simulation |
 
+The selectors added here consume a bounded number of keys per loaded module,
+not per callable: three for the active recording identity, and one each for
+recorder scratch, dependency capture, workspace plan, claims and sim prepare
+admission. The lint counts `pthread_key_create` sites, not template
+instantiations, so this inventory is the budget of record.
+
+The affinity gate's classification slots remain borrowed throughout executor
+execution. The next invocation must wait for all prior executors to stop reading
+those slots; gate return, callback admission and reset counters alone do not prove
+that lifetime has ended. Within one invocation, a participant invalidates its
+previous binding record before claiming a slot, and no participant publishes a
+slot until every participant has claimed. Invalidation clears the thread-exclusive
+record without writing the previously bound cell, so a stale binding cannot land
+in a slot already handed to another thread. Backend classification stays platform-specific,
+while `AffinityBindingCohort` owns the common first-error publication and
+binding-arrival barrier. Its reset runs only after all participants copied the
+result.
+
+The same-build loader/wrapper callback types live in `aicore/sim_core_abi.h`.
+The existing 6/10-key layout is retained: consolidating to a single typed context
+would also change all getter/setter accessors and key-position fault injection.
+That optimization is separate from proving startup failure and core retirement.
+
+### Sim Context device binding and thread startup
+
+The process-resident `libcpu_sim_context.so` owns the device-binding key. It
+stores only an encoded device ID, with no heap value or thread-exit destructor;
+releasing a device or unloading a runtime does not delete this shared key.
+
+`pto_cpu_sim_bind_device_checked` returns a pthread error code on key creation
+or binding failure, preserving the previous binding. IDs below -1 are rejected;
+-1 unbinds. The existing `void pto_cpu_sim_bind_device(int)` symbol retains its
+ABI and aborts on failure, since it cannot report an error to an old consumer.
+New host runtimes require the matching sim-context library exporting the checked
+entry point; legacy consumers can still use the new library.
+
+For a valid launched run, `simpler_wait_run` returns
+`SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE` when device attachment fails before drain.
+The original attachment error remains in the log; the reserved return code is
+an operation failure, not the run's terminal result. `ChipWorker` preserves its
+launched state, reports the failed wait, and permits another wait or finalize.
+Its finalize path likewise stops before teardown when its wait is incomplete.
+Other wait results, including execution errors, record the observer result.
+Physical completion is established separately by poll or wait-completion.
+Rebuild host consumers and runtime modules together for this return contract;
+old consumers that treat every returned integer as completion are unsupported.
+
+`attach_current_thread` reports binding failure before publishing the runner's
+device ID. `create_thread` waits for the child's binding result, joins a failed
+child, and throws without invoking its body. A successful child owns its scalar
+binding until thread exit. For simulated execution, an additional run-owned gate
+holds both AICore and AICPU bodies until the entire cohort has been created and
+bound. Failure cancels the gate and joins the created threads before returning;
+the run retains its launch failure. Partial launches still follow the existing
+conservative poisoned-run lifecycle. The gate adds one startup wait per core,
+with no work in task dispatch and no extra pthread keys.
+
+If caller-thread binding fails in `simpler_wait_run` or `simpler_finalize_run`,
+the entry returns an error without declaring the run drained or releasing its
+execution claim and carrier. The caller must retain the run's resources and
+retry finalization after binding becomes available; a failed attach is not
+proof that simulated worker threads have stopped.
+
+### Core identity and module-owned simulator keys
+
+Each AICore module owns six keys on A2/A3 or ten on A5. The host calls
+`initialize_aicore_sim_tls` before launching threads; partial creation releases
+only acquired keys and preserves the error until unload. A5's existing key owner
+and A2/A3's matching owner delete the keys when the module unloads, after every
+core thread has joined. Keys have no thread-exit callbacks and do not own values.
+
+The checked executor wrapper binds keys to cells on its stack. Profiling setters
+update those cells without fallible pthread writes during execution. Before any
+executor starts, the run's gate collects every AICore binding result, including
+Sim Context subblock/cluster identity, and every AICPU affinity binding result.
+Failure cancels and joins created threads before releasing their module or run
+storage. AICore identity failure is a before-submission refusal; an AICPU startup
+failure conservatively retains the existing partial-launch/drain contract.
+The process-resident Sim Context also owns a cancellation-register key.
+The A2/A3 Host runner binds it before executor startup, reports binding failures
+to the same startup gate, and clears it on thread exit. Its value borrows the
+run-owned simulated register cell; it has no callback into an unloadable SO.
+Compute kernel SOs query the resident context, not runtime-private TLS.
+
+Sim Context's two identity keys are process-resident; their checked setters
+return pthread errors, roll back partial key creation and allow later retry.
+
+Simulation AICPU threads and onboard AICPU workers each hold a module-owned
+per-thread binding record through one key. The record points at the simulated
+thread stack executor index or the module's classification slot and is the
+source of identity; invalidating a stale binding clears the record without
+writing the cell. Binding snapshots the cell's value; while bound,
+set_thread_idx updates the record and the cell, and direct cell writes are not
+observed. The key owns a fixed record pool sized to the gate budget and
+recycles a record when its thread unbinds. The key registers no thread-exit
+callback; a thread that exits without unbinding keeps only its own record
+checked out. Direct gate callers must unbind after their last identity use.
+Both onboard kernel entries release the binding through `NativeInvocationEntry`
+after executor or rejection cleanup and before contributing native completion.
+Release failure contributes an error without replacing an existing execution
+error. Sim host workers retain their explicit scope cleanup. Onboard workers
+bind through a cohort barrier that publishes all binding results before
+admitting any survivor.
+An onboard binding error rejects the entire cohort. Each caller copies the error
+before the last participant resets shared gate state, allowing the next launch
+to retry. Failed affinity key creation is also retryable without unloading the
+resident AICPU SO. Native entry initialization still runs on binding failure;
+each callback retains its index and receives a failed gate result so it can
+contribute to invocation completion without entering the executor. Onboard has
+already launched AICores at this point: callback 0 first discovers this launch's
+core reports and runs the EXIT/nonce/close/release protocol, without affinity
+TLS or executor initialization. Its completion contribution is held until this
+retirement attempt ends. Startup EXIT bypasses task and profiling initialization
+on the cores. Missing reports or ACKs are bounded failures and leave unreleased
+cores to host device recovery; a failed native result alone does not authorize
+resource reuse or another launch on a poisoned runner. Gate/key retryability
+therefore does not imply same-Worker recovery from a device execution failure.
+No identity binding failure may silently drop just one required executor. The filter gate requires exactly `total_launched` participants and no
+next launch until all prior calls return; a late excess arrival after reset
+cannot be distinguished from a new launch without a launch identity.
+These internal wrapper/helper symbols require host, AICPU and AICore libraries
+from the same build; mixed old/new wrappers are not supported. The public legacy
+`pto_cpu_sim_bind_device` ABI is unchanged.
+
+### STRACE ownership across module unload
+
+STRACE borrows one process-owned pthread key through the bound host-log state.
+The resident host-log owner creates the key; consumers neither create nor delete
+it. Values contain scalar invocation, depth and callable IDs, are allocated with
+`calloc`, and use libc `free` at thread exit. Unloading a consumer leaves no
+thread-exit callback pointing into that consumer.
+
+Unbound consumers stay silent. Key creation, allocation or assignment failure
+disables the affected trace scope; failed assignment frees the unpublished value.
+The log owner and consumers must be rebuilt together because the shared state
+layout includes the key and invocation counter. See [logging.md](logging.md)
+for the owner lifetime and binding contract.
+
 ### Known Risks
 
-1. **`s_orch_thread_idx`** uses `__thread` (ELF TLS) in the AICPU SO. Could
-   cause issues on aarch64 glibc <2.39 if the AICPU SO is dlclosed and
-   re-dlopen'd while profiling is enabled. Currently safe because profiling
-   is off by default and the variable is only accessed during profiling.
-
-2. **PTO ISA `thread_local`** variables (`execution_context`,
+1. **PTO ISA `thread_local`** variables (`execution_context`,
    `NPUMemoryModel::instance`) are in kernel SOs. Kernel SOs are short-lived
    (loaded per task, dlclosed after validation), and each kernel thread is
    freshly created, so stale TLS is not a concern in practice.
@@ -240,7 +470,15 @@ SchedulerContext owns its own teardown:
   (`initialized_`, `init_done_`, `init_failed_`, `finished_`, `thread_idx_`,
   `finished_count_`).
 
-Applies to all 4 runtime executors: a2a3 (hbg, tmr), a5 (hbg, tmr).
+This scheduler-owned teardown applies to A2A3 HBG/TMR and A5 TMR.
+
+A5 HBG instead owns an `AicoreLifecycle` and resident argument-dump services.
+Its per-run reset clears only invocation coordination; retirement proof gates
+diagnostic settlement and service cleanup. The final participant selects the
+terminal result before executor teardown, and the sole cleanup owner hands it
+off afterward. Failed initialization follows the same lifetime obligations and
+publishes a failed terminal result. A static executor reused by the next run
+must not destroy unresolved owners or reuse backing from unproved retirement.
 
 ## SO Handle Caching and Reuse
 
@@ -249,7 +487,7 @@ Applies to all 4 runtime executors: a2a3 (hbg, tmr), a5 (hbg, tmr).
 | SO | Caching | Lifecycle |
 | -- | ------- | --------- |
 | Sim context | Process registry keyed by path | Process lifetime: loaded once with `RTLD_GLOBAL`, never explicitly closed |
-| Host runtime | `ChipWorker::lib_handle_` | Per-init: dlopen in `init()`, dlclose in `finalize()` |
+| Host runtime | `RuntimeModule` shared by context and native storage | Final reference after successful teardown; terminal failure retains code for process lifetime |
 | AICPU | `DeviceRunner::aicpu_so_handle_` | Per-init: loaded lazily by the first `prepare_execution()`, retained across runs, closed by `finalize()` |
 | AICore | `DeviceRunner::aicore_so_handle_` | Per-run: reloaded for the run's kernel binary, closed after a successful `drain_execution()` (or by final cleanup) |
 | Kernel | `DeviceRunner::func_id_to_addr_` (map by func_id) | Per-task: uploaded in `init_runtime_impl()`, removed in `release_run_bindings_impl()` |
@@ -259,9 +497,9 @@ Applies to all 4 runtime executors: a2a3 (hbg, tmr), a5 (hbg, tmr).
 
 | Resource | Caching | Lifecycle |
 | -------- | ------- | --------- |
-| Host runtime | `ChipWorker::lib_handle_` | Per-runtime-group: shared across tasks in same group |
+| Host runtime | `RuntimeModule` shared by context and native storage | Per runtime group, released after its final proven consumer; terminal failure retains code |
 | Dispatcher SO bytes | `DeviceRunnerBase::dispatcher_so_binary_` | Init-only: passed to `LoadAicpuOp::BootstrapDispatcher`, then cleared |
-| Runtime AICPU SO | Preinstall file `simpler_inner_<fp>_<device_id>.so` | Written once through dispatcher bootstrap, then registered via `rtsBinaryLoadFromFile` |
+| Runtime AICPU SO | Process-directory file `simpler_inner_<fp>_<device_id>.so` | Uploaded per runner; TSD removes the directory at session teardown |
 | AICPU entry handles | `LoadAicpuOp` cached `rtFuncHandle`s | Per-runtime-group: reused by `rtsLaunchCpuKernel` on every task |
 | AICore binary | `rtRegisterAllKernel` handle | Lazily registered on the first `launch_aicore_kernel()`, then the cached handle is reused |
 | Kernel binaries | `func_id_to_addr_` (device GM addresses) | Per-task: uploaded to device GM, cached by func_id |
@@ -270,7 +508,7 @@ Applies to all 4 runtime executors: a2a3 (hbg, tmr), a5 (hbg, tmr).
 ### Key difference
 
 Onboard caches more aggressively. The `DeviceRunner` persists across tasks
-within a runtime group, the runtime AICPU SO is preinstalled once through the
+within a runtime group, each runner uploads its runtime AICPU SO through the
 dispatcher bootstrap, and per-task launches reuse cached `rtFuncHandle`s.
 Simulation also retains the AICPU SO across runs so `g_aicpu_executor` can
 reuse its orchestration-SO cache; `AicpuExecutor::deinit()` resets its per-run
@@ -310,11 +548,14 @@ ChipWorker.init(device_id, bins)                       # Python wrapper
            finalize_device, simpler_kernel_mode_supported,
            simpler_kernel_mode_init, simpler_kernel_mode_prepare_callable,
            simpler_kernel_mode_launch
+    dlsym optional versioned registration entry; absence is a capability
+           verdict, not a stale build:
+           simpler_register_callable_v2
     create_device_context() → DeviceContextHandle
     allocate zeroed, aligned, stable native-run storage per pipeline slot
     simpler_init(ctx, device_id, aicpu*, aicpu_size, aicore*, aicore_size, ...)
       DeviceRunner::attach_current_thread(device_id)
-        pto_cpu_sim_bind_device(device_id)
+        pto_cpu_sim_bind_device_checked(device_id)  // return on error
         pto_cpu_sim_acquire_device(device_id)
       DeviceRunner::set_executors(aicpu, aicore)       binaries owned by runner
 
@@ -343,7 +584,7 @@ ChipWorker.finalize()
   finalize_device(ctx)
     unload_executor_binaries()               dlclose AICPU and any residual AICore SO
   destroy_device_context(ctx)
-  dlclose(host_runtime.so)                   -fno-gnu-unique ensures real unload
+  release native storage and module owners   final reference permits dlclose
 ```
 
 ### Onboard (subprocess per device, ChipWorker reused per runtime group)
@@ -369,7 +610,7 @@ device_worker_main(device_id)
             rtStreamCreate(AICPU + AICore)
             LoadAicpuOp::BootstrapDispatcher()
               rtAicpuKernelLaunchExWithArgs(KERNEL_TYPE_AICPU_KFC)
-              dispatcher writes simpler_inner_<fp>_<device_id>.so
+              dispatcher writes <hostPid>_<localDeviceId>/simpler_inner_<fp>_<device_id>.so
             LoadAicpuOp::Init()
               rtsBinaryLoadFromFile()
               rtsFuncGetByName(simpler_aicpu_exec, ...)
@@ -388,7 +629,8 @@ device_worker_main(device_id)
                 DeviceRunner::prepare_execution(..., slot, identity)
               simpler_launch_run(...)
                 child progress path: DeviceRunner::launch_execution(prepared, permit)
-                  ensure_binaries_loaded()     already done by init
+                  # AICPU runtime registration completed during init via
+                  # ensure_aicpu_runtime_registered(); launch uses cached handles
                   launch_aicore_kernel()       cached rtRegisterAllKernel handle
                                                  + rtKernelLaunchWithHandleV2
                                                  + record core_done on that stream
@@ -410,5 +652,5 @@ device_worker_main(device_id)
     ChipWorker.finalize()
       finalize_device(ctx)                     rtDeviceReset()
       destroy_device_context(ctx)
-      dlclose(host_runtime.so)
+      release native storage and module owners
 ```

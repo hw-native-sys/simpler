@@ -24,19 +24,12 @@
 
 MemoryAllocator::~MemoryAllocator() { finalize(); }
 
-void *MemoryAllocator::alloc(size_t size) {
-    void *ptr = nullptr;
-    int rc = rtMalloc(&ptr, size, RT_MEMORY_HBM, 0);
-    if (rc != 0) {
-        LOG_ERROR("rtMalloc failed: %d (size=%zu)", rc, size);
-        ACL_LOG_ERROR_DETAIL(rc);
-        return nullptr;
-    }
-
-    std::scoped_lock<std::mutex> lk(mu_);
-    ptr_size_map_[ptr] = size;
-    committed_bytes_ += size;
-    return ptr;
+void *MemoryAllocator::alloc(size_t size, int *status) {
+    auto reservation = begin_reservation();
+    int rc = 0;
+    void *ptr = reservation.commit_alloc(size, &rc);
+    if (status != nullptr) *status = rc;
+    return rc == 0 || status != nullptr ? ptr : nullptr;
 }
 
 int MemoryAllocator::free(void *ptr) {
@@ -77,25 +70,27 @@ int MemoryAllocator::finalize() {
     return last_error;
 }
 
-void *MemoryAllocator::Reservation::commit_alloc(size_t size) {
+void *MemoryAllocator::Reservation::commit_alloc(size_t size, int *status) {
+    if (status != nullptr) *status = -1;
     if (!valid()) {
         LOG_ERROR("commit_alloc without a valid reservation (size=%zu)", size);
         return nullptr;
     }
     void *ptr = nullptr;
     int rc = rtMalloc(&ptr, size, RT_MEMORY_HBM, 0);
+    if (status != nullptr) *status = rc;
     if (rc != 0) {
         LOG_ERROR("rtMalloc failed: %d (size=%zu)", rc, size);
         ACL_LOG_ERROR_DETAIL(rc);
-        return nullptr;
     }
+    if (ptr == nullptr) return nullptr;
     // Under the lock this reservation has held since it was taken, into the
     // node it created then: no allocation, no rehash, nothing left to fail.
     node_.key() = ptr;
     node_.mapped() = size;
     owner_->ptr_size_map_.insert(std::move(node_));
     owner_->committed_bytes_ += size;
-    return ptr;
+    return rc == 0 || status != nullptr ? ptr : nullptr;
 }
 
 int MemoryAllocator::finalize_except(SweepClassifyFn classify, SweepRecordFn record, void *ctx) {

@@ -40,10 +40,12 @@
 
 #include "common/core_type.h"
 #include "common/host_api.h"
+#include "host/scope_stats_capacity.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
 #include "dispatch_payload.h"
 #include "aicore_teardown.h"
+#include "callable_limits.h"
 #include "task_args.h"
 #include "common/launch_entry_args.h"             // EntryArgsSource, LaunchEntryArgsPlan
 #include "tensormap_and_ringbuffer/entry_args.h"  // EntryArgsStorage
@@ -54,7 +56,6 @@
 // =============================================================================
 
 #define RUNTIME_MAX_WORKER PLATFORM_MAX_CORES  // 36 AIC + 72 AIV cores
-#define RUNTIME_MAX_FUNC_ID 1024
 #define RUNTIME_MAX_ORCH_SYMBOL_NAME 64
 
 // =============================================================================
@@ -180,10 +181,11 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // thread (highest idx, runs aicpu_orchestration_entry) and the remaining
     // aicpu_thread_num-1 scheduler threads that dispatch tasks to AICore.
     int aicpu_thread_num;
+    uint64_t ccu_workspace_addr;
 
     // Filter-style affinity gate input (a5 onboard). Host fills before
     // launch from device-side OCCUPY + DSMI CPU_TOPO via
-    // pto::a5::compute_allowed_cpus. The on-device gate keeps threads whose
+    // simpler::a5::compute_allowed_cpus. The on-device gate keeps threads whose
     // sched_getcpu() lands on one of these cpu_ids; exec_idx = position in
     // this array drives sched/orch role assignment. Indices 0..count-2 are
     // scheduler slots, index count-1 is the orchestrator slot. Sized to
@@ -238,6 +240,11 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     uint32_t entry_scalar_count_;
     uint32_t entry_args_source_;  // EntryArgsSource
 
+    // Per-invocation granularity travels in every descriptor publication.
+    uint32_t chip_swimlane_level;
+    uint32_t pmu_event_type;   // PmuEventType; zero while PMU is disabled.
+    uint32_t dump_args_level;  // DumpArgsLevel; zero while argument dumping is disabled.
+
     // Entry args, adopted on the host. Last of the uploaded fields, because it
     // is the only one whose useful length is a property of the run: a
     // steady-state publication stops after `tensor_count_` of its
@@ -258,6 +265,8 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // block a defined starting value. The initialized prefix ends here; the
     // AICPU initializes the isolated return gates before opening any window.
     Handshake workers[RUNTIME_MAX_WORKER];
+    // Each 64-byte control is written only by AICPU and cleared before READY
+    // or EXIT. AICore bypass-loads the request and returns its nonce in COND.
     AicoreTeardownControl teardown_gates[RUNTIME_MAX_WORKER];
 };
 
@@ -409,6 +418,13 @@ public:
     // copy_in_run_inputs_impl and copy_back_run_outputs_impl, and released by
     // release_run_bindings_impl. Host-only (after `dev`): never uploaded.
     std::vector<TensorLease> tensor_leases_;
+    std::vector<TensorLease> &tensor_leases() { return tensor_leases_; }
+    const std::vector<TensorLease> &tensor_leases() const { return tensor_leases_; }
+
+    simpler::dfx::scope_stats_runs::CapacityMetadata scope_stats_capacity_;
+    const simpler::dfx::scope_stats_runs::CapacityMetadata &scope_stats_capacity() const {
+        return scope_stats_capacity_;
+    }
 
     // Host view of the active callable's registration-owned object-address
     // table, borrowed for as long as that callable stays registered, plus the

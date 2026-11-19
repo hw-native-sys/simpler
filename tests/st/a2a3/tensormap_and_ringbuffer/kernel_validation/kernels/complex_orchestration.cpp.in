@@ -1,0 +1,49 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+#include "orchestration_api.h"
+#include "arg_with_deps.h"
+
+extern "C" OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &) {
+    return OrchestrationConfig{.expected_arg_count = 1};
+}
+extern "C" void aicpu_orchestration_entry(const ChipTaskArgs &args) {
+#if FORCE_CONSUMER
+    CoreTaskArgs probe;
+    probe.add_output(args.tensor(0).ref());
+    probe.add_input(args.tensor(0).ref());
+    probe.add_scalar(int64_t{108});
+    rt_submit_aiv_task(221, probe);
+    return;
+#endif
+    uint32_t shape[1] = {4096};
+    TensorCreateInfo info(shape, 1, DataType::FLOAT32);
+    CoreTaskArgs producer;
+    producer.add_output(info);
+    producer.add_scalar(int64_t{ERROR_CODE});
+    producer.launch_spec.set_block_num(CASE_MODE < 3 ? 4 : 1);
+    producer.set_allow_early_resolve(CASE_MODE == 2);
+#if CASE_MODE == 1
+    MixedKernels kernels;
+    kernels.aic_kernel_id = 219;
+    kernels.aiv0_kernel_id = 220;
+    kernels.aiv1_kernel_id = 220;
+    auto result = rt_submit_task(kernels, producer);
+#else
+    auto result = rt_submit_aiv_task(219, producer);
+#endif
+    CoreTaskArgsWithDeps<4> consumer;
+    consumer.add_output(args.tensor(0).ref());
+    consumer.add_input(result.get_ref(0));
+    consumer.add_scalar(int64_t{ERROR_CODE != 0 ? 108 : (CASE_MODE == 4 ? 109 : 0)});
+    consumer.add_dep(result.task_id());
+    consumer.launch_spec.set_require_sync_start(CASE_MODE == 2);
+    rt_submit_aiv_task(221, consumer);
+}

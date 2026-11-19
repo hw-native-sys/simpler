@@ -1,0 +1,2310 @@
+{
+  "configuration": {
+    "ep": 2,
+    "valid_tokens_per_rank": 72,
+    "padded_tokens_per_rank": 80,
+    "local_experts": 64,
+    "weights": "original zero-weight data"
+  },
+  "window_bytes": 68208256,
+  "ranks": [
+    [
+      {
+        "name": "engram_lookup",
+        "kind": "DEVICE",
+        "bytes": 1966080,
+        "shape": [
+          2,
+          80,
+          6144
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "engram_wkv",
+        "kind": "DEVICE",
+        "bytes": 314572800,
+        "shape": [
+          2,
+          6144,
+          25600
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "engram_wkv_scale",
+        "kind": "DEVICE",
+        "bytes": 9830400,
+        "shape": [
+          384,
+          25600
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "engram_weight",
+        "kind": "DEVICE",
+        "bytes": 163840,
+        "shape": [
+          2,
+          4,
+          5120
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "x_hc",
+        "kind": "DEVICE",
+        "bytes": 6553600,
+        "shape": [
+          80,
+          4,
+          5120
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "pre_mix",
+        "kind": "DEVICE",
+        "bytes": 1280,
+        "shape": [
+          80,
+          4
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "hc_attn_fn",
+        "kind": "DEVICE",
+        "bytes": 78643200,
+        "shape": [
+          960,
+          20480
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "hc_attn_scale",
+        "kind": "HOST",
+        "bytes": 480,
+        "shape": [
+          120
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/e00e5eb9444182f35232.bin",
+        "repeat": true,
+        "initializer_sha256": "e00e5eb9444182f352323374ef4e08ebcb784725fdd4fd612d7730540b3e0c8c"
+      },
+      {
+        "name": "hc_attn_base",
+        "kind": "DEVICE",
+        "bytes": 3840,
+        "shape": [
+          960
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "attn_norm_weight",
+        "kind": "DEVICE",
+        "bytes": 409600,
+        "shape": [
+          204800
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "wq_a",
+        "kind": "DEVICE",
+        "bytes": 262144000,
+        "shape": [
+          40,
+          5120,
+          1280
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "q_norm_weight",
+        "kind": "DEVICE",
+        "bytes": 102400,
+        "shape": [
+          51200
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "wq_b",
+        "kind": "DEVICE",
+        "bytes": 1677721600,
+        "shape": [
+          40,
+          1280,
+          32768
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "wkv",
+        "kind": "DEVICE",
+        "bytes": 104857600,
+        "shape": [
+          40,
+          5120,
+          512
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "kv_norm_weight",
+        "kind": "DEVICE",
+        "bytes": 40960,
+        "shape": [
+          20480
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "attn_sink",
+        "kind": "DEVICE",
+        "bytes": 10240,
+        "shape": [
+          2560
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "wo_a",
+        "kind": "DEVICE",
+        "bytes": 1342177280,
+        "shape": [
+          320,
+          4096,
+          1024
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "wo_a_scale",
+        "kind": "DEVICE",
+        "bytes": 41943040,
+        "shape": [
+          320,
+          128,
+          1024
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "wo_b",
+        "kind": "DEVICE",
+        "bytes": 1677721600,
+        "shape": [
+          40,
+          8192,
+          5120
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "freqs_cos",
+        "kind": "DEVICE",
+        "bytes": 1536,
+        "shape": [
+          2,
+          6,
+          32
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/cc7fd71ac71da2d1d2a7.bin",
+        "repeat": false,
+        "initializer_sha256": "cc7fd71ac71da2d1d2a7de6d7226621c3412a40b79b19cd764c83ea21872922f"
+      },
+      {
+        "name": "freqs_sin",
+        "kind": "DEVICE",
+        "bytes": 1536,
+        "shape": [
+          2,
+          6,
+          32
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/9c0b1ea5d99739ad2ba7.bin",
+        "repeat": false,
+        "initializer_sha256": "9c0b1ea5d99739ad2ba7c066f319e395f60e5cd4317eddcfbd4bb1b3ebd9e089"
+      },
+      {
+        "name": "window_slots",
+        "kind": "DEVICE",
+        "bytes": 576,
+        "shape": [
+          72
+        ],
+        "dtype": "int64",
+        "initializer": "vendor/data/539fea80c782d165cab5.bin",
+        "repeat": false,
+        "initializer_sha256": "539fea80c782d165cab51e6b52c4acdd1f32c9a999e30eac53e1a8f670248c70"
+      },
+      {
+        "name": "window_indices",
+        "kind": "DEVICE",
+        "bytes": 36864,
+        "shape": [
+          72,
+          128
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/7c6cbcef9ac24956b196.bin",
+        "repeat": false,
+        "initializer_sha256": "7c6cbcef9ac24956b196fe49d5135d1cb0ee7e90ba402e8c413e0f662f979784"
+      },
+      {
+        "name": "window_cache_pool",
+        "kind": "DEVICE",
+        "bytes": 31457280,
+        "shape": [
+          480,
+          128,
+          1,
+          512
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "window_cache_scale_pool",
+        "kind": "DEVICE",
+        "bytes": 1966080,
+        "shape": [
+          480,
+          128,
+          1,
+          16
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "compressed_cache_pool",
+        "kind": "DEVICE",
+        "bytes": 1572864,
+        "shape": [
+          48,
+          128,
+          1,
+          256
+        ],
+        "dtype": "uint8",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "compressed_cache_scale_pool",
+        "kind": "DEVICE",
+        "bytes": 393216,
+        "shape": [
+          48,
+          128,
+          1,
+          32
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "token_to_req_indices",
+        "kind": "DEVICE",
+        "bytes": 288,
+        "shape": [
+          72
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/5819b90cbb81303c5ea6.bin",
+        "repeat": false,
+        "initializer_sha256": "5819b90cbb81303c5ea61668fb123326f973c3f19c5c2bd1d42964633738ed6f"
+      },
+      {
+        "name": "position_ids",
+        "kind": "DEVICE",
+        "bytes": 288,
+        "shape": [
+          72
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/ca59aaaa0f1e145768e7.bin",
+        "repeat": false,
+        "initializer_sha256": "ca59aaaa0f1e145768e7dba210fc007dee5740c5cac9b21202966b82dcbed0b0"
+      },
+      {
+        "name": "index_cache_pool",
+        "kind": "DEVICE",
+        "bytes": 393216,
+        "shape": [
+          48,
+          128,
+          1,
+          64
+        ],
+        "dtype": "uint8",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "index_cache_scale_pool",
+        "kind": "DEVICE",
+        "bytes": 24576,
+        "shape": [
+          48,
+          128,
+          1,
+          4
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "c2a_index_block_table",
+        "kind": "DEVICE",
+        "bytes": 48,
+        "shape": [
+          12,
+          1
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/b68e9a05823d7b9bcae5.bin",
+        "repeat": false,
+        "initializer_sha256": "b68e9a05823d7b9bcae5177815047c2635261fe99e7771c3ed4f8c8185216e39"
+      },
+      {
+        "name": "c1a_index_block_table",
+        "kind": "DEVICE",
+        "bytes": 96,
+        "shape": [
+          12,
+          2
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/47c263db531645f32d35.bin",
+        "repeat": false,
+        "initializer_sha256": "47c263db531645f32d351d19e572b02ee0739cc177fde4095fb5e08cb06d9e3d"
+      },
+      {
+        "name": "c2a_compressor_wkv_logical",
+        "kind": "DEVICE",
+        "bytes": 15728640,
+        "shape": [
+          3,
+          5120,
+          512
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "c2a_compressor_wgate_logical",
+        "kind": "DEVICE",
+        "bytes": 15728640,
+        "shape": [
+          3,
+          5120,
+          512
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "c1a_compressor_wkv_logical",
+        "kind": "DEVICE",
+        "bytes": 5242880,
+        "shape": [
+          5120,
+          512
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "query_start_loc",
+        "kind": "DEVICE",
+        "bytes": 52,
+        "shape": [
+          13
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/bbb0338de58a4020f34e.bin",
+        "repeat": false,
+        "initializer_sha256": "bbb0338de58a4020f34ee6955e0da8011e454ceba7b3c6176854ca6d12235d23"
+      },
+      {
+        "name": "state_block_table",
+        "kind": "DEVICE",
+        "bytes": 48,
+        "shape": [
+          12,
+          1
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/a4886fc88eadb553f030.bin",
+        "repeat": false,
+        "initializer_sha256": "a4886fc88eadb553f0300776411b64c557a02e7a09f9df7da871fb2f9f4c8278"
+      },
+      {
+        "name": "state_cache_pool",
+        "kind": "DEVICE",
+        "bytes": 589824,
+        "shape": [
+          36,
+          4,
+          1024
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "compressor_norm_weight",
+        "kind": "DEVICE",
+        "bytes": 4096,
+        "shape": [
+          2048
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "c2a_compressed_slots",
+        "kind": "DEVICE",
+        "bytes": 576,
+        "shape": [
+          72
+        ],
+        "dtype": "int64",
+        "initializer": "vendor/data/1e18c486b0a4f7bed94a.bin",
+        "repeat": false,
+        "initializer_sha256": "1e18c486b0a4f7bed94add57c336143bb9df449b1684d74e0c99784ef8686935"
+      },
+      {
+        "name": "c1a_compressed_slots",
+        "kind": "DEVICE",
+        "bytes": 576,
+        "shape": [
+          72
+        ],
+        "dtype": "int64",
+        "initializer": "vendor/data/539fea80c782d165cab5.bin",
+        "repeat": false,
+        "initializer_sha256": "539fea80c782d165cab51e6b52c4acdd1f32c9a999e30eac53e1a8f670248c70"
+      },
+      {
+        "name": "index_wk_logical",
+        "kind": "DEVICE",
+        "bytes": 1048576,
+        "shape": [
+          8,
+          512,
+          128
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "index_norm_weight",
+        "kind": "DEVICE",
+        "bytes": 2048,
+        "shape": [
+          1024
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "index_wq_b",
+        "kind": "DEVICE",
+        "bytes": 41943040,
+        "shape": [
+          8,
+          1280,
+          4096
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "index_weights_proj_logical",
+        "kind": "DEVICE",
+        "bytes": 2621440,
+        "shape": [
+          8,
+          5120,
+          32
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "hc_ffn_fn",
+        "kind": "DEVICE",
+        "bytes": 78643200,
+        "shape": [
+          960,
+          20480
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "hc_ffn_scale",
+        "kind": "HOST",
+        "bytes": 480,
+        "shape": [
+          120
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/e00e5eb9444182f35232.bin",
+        "repeat": true,
+        "initializer_sha256": "e00e5eb9444182f352323374ef4e08ebcb784725fdd4fd612d7730540b3e0c8c"
+      },
+      {
+        "name": "hc_ffn_base",
+        "kind": "DEVICE",
+        "bytes": 3840,
+        "shape": [
+          960
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "ffn_norm_weight",
+        "kind": "DEVICE",
+        "bytes": 409600,
+        "shape": [
+          204800
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "gate_weight",
+        "kind": "DEVICE",
+        "bytes": 104857600,
+        "shape": [
+          5120,
+          5120
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "correction_bias",
+        "kind": "DEVICE",
+        "bytes": 20480,
+        "shape": [
+          5120
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/f4a07432f64c01a753d9.bin",
+        "repeat": false,
+        "initializer_sha256": "f4a07432f64c01a753d98bfb74b917a9fe8eb4f0557d34d2d273044b3abd1bfd"
+      },
+      {
+        "name": "routed_w1",
+        "kind": "DEVICE",
+        "bytes": 15099494400,
+        "shape": [
+          2560,
+          46080,
+          128
+        ],
+        "dtype": "uint8",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "routed_w2",
+        "kind": "DEVICE",
+        "bytes": 15099494400,
+        "shape": [
+          2560,
+          46080,
+          128
+        ],
+        "dtype": "uint8",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "routed_w3",
+        "kind": "DEVICE",
+        "bytes": 15099494400,
+        "shape": [
+          2560,
+          46080,
+          128
+        ],
+        "dtype": "uint8",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "mxfp4_pair_lut",
+        "kind": "DEVICE",
+        "bytes": 1024,
+        "shape": [
+          2,
+          256
+        ],
+        "dtype": "int16",
+        "initializer": "vendor/data/364a3c58f9baefc64f00.bin",
+        "repeat": false,
+        "initializer_sha256": "364a3c58f9baefc64f0034a00e02bd4cefe449798d12b766b65d61e26d55d023"
+      },
+      {
+        "name": "shared_w1",
+        "kind": "DEVICE",
+        "bytes": 471859200,
+        "shape": [
+          40,
+          5120,
+          2304
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "shared_w2",
+        "kind": "DEVICE",
+        "bytes": 471859200,
+        "shape": [
+          40,
+          2304,
+          5120
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "shared_w3",
+        "kind": "DEVICE",
+        "bytes": 471859200,
+        "shape": [
+          40,
+          5120,
+          2304
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "recv_meta",
+        "kind": "COMM",
+        "bytes": 512,
+        "shape": [
+          2,
+          64
+        ],
+        "offset": 0
+      },
+      {
+        "name": "recv_x",
+        "kind": "COMM",
+        "bytes": 52428800,
+        "shape": [
+          10240,
+          5120
+        ],
+        "offset": 512
+      },
+      {
+        "name": "recv_scale",
+        "kind": "COMM",
+        "bytes": 1638400,
+        "shape": [
+          10240,
+          160
+        ],
+        "offset": 52429312
+      },
+      {
+        "name": "recv_weights",
+        "kind": "COMM",
+        "bytes": 327680,
+        "shape": [
+          10240,
+          8
+        ],
+        "offset": 54067712
+      },
+      {
+        "name": "recv_routes",
+        "kind": "COMM",
+        "bytes": 327680,
+        "shape": [
+          10240,
+          8
+        ],
+        "offset": 54395392
+      },
+      {
+        "name": "arrived",
+        "kind": "COMM",
+        "bytes": 1024,
+        "shape": [
+          2,
+          128
+        ],
+        "offset": 54723072
+      },
+      {
+        "name": "data_arrived",
+        "kind": "COMM",
+        "bytes": 65536,
+        "shape": [
+          2,
+          64,
+          128
+        ],
+        "offset": 54724096
+      },
+      {
+        "name": "routed_output",
+        "kind": "COMM",
+        "bytes": 4915200,
+        "shape": [
+          480,
+          5120
+        ],
+        "offset": 54789632
+      },
+      {
+        "name": "combine_arrived",
+        "kind": "COMM",
+        "bytes": 65536,
+        "shape": [
+          2,
+          64,
+          128
+        ],
+        "offset": 59704832
+      },
+      {
+        "name": "moe_num_tokens",
+        "kind": "HOST",
+        "bytes": 8,
+        "shape": [
+          2
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/a711abc23618a87eb096.bin",
+        "repeat": false,
+        "initializer_sha256": "a711abc23618a87eb096d8294e63eb835e8f056abbd05c1c06d74b80ec58c666"
+      },
+      {
+        "name": "attention_num_tokens",
+        "kind": "HOST",
+        "bytes": 8,
+        "shape": [
+          2
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/a711abc23618a87eb096.bin",
+        "repeat": false,
+        "initializer_sha256": "a711abc23618a87eb096d8294e63eb835e8f056abbd05c1c06d74b80ec58c666"
+      },
+      {
+        "name": "wq_a_scale",
+        "kind": "DEVICE",
+        "bytes": 8192000,
+        "shape": [
+          6400,
+          1280
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "wq_b_scale",
+        "kind": "DEVICE",
+        "bytes": 52428800,
+        "shape": [
+          1600,
+          32768
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "wkv_scale",
+        "kind": "DEVICE",
+        "bytes": 3276800,
+        "shape": [
+          6400,
+          512
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "wo_b_scale",
+        "kind": "DEVICE",
+        "bytes": 52428800,
+        "shape": [
+          10240,
+          5120
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "index_wq_b_scale",
+        "kind": "DEVICE",
+        "bytes": 1310720,
+        "shape": [
+          320,
+          4096
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "routed_w1_scale",
+        "kind": "DEVICE",
+        "bytes": 943718400,
+        "shape": [
+          409600,
+          2304
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "routed_w2_scale",
+        "kind": "DEVICE",
+        "bytes": 943718400,
+        "shape": [
+          184320,
+          5120
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "routed_w3_scale",
+        "kind": "DEVICE",
+        "bytes": 943718400,
+        "shape": [
+          409600,
+          2304
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "shared_w1_scale",
+        "kind": "DEVICE",
+        "bytes": 14745600,
+        "shape": [
+          6400,
+          2304
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "shared_w2_scale",
+        "kind": "DEVICE",
+        "bytes": 14745600,
+        "shape": [
+          2880,
+          5120
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "shared_w3_scale",
+        "kind": "DEVICE",
+        "bytes": 14745600,
+        "shape": [
+          6400,
+          2304
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "final_norm_weight",
+        "kind": "DEVICE",
+        "bytes": 10240,
+        "shape": [
+          5120
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/b9c205bdac187f20bf87.bin",
+        "repeat": true,
+        "initializer_sha256": "b9c205bdac187f20bf876cea369cb6032ad1bf69043b31d716b36b8defbffdf2"
+      },
+      {
+        "name": "lm_head_weight",
+        "kind": "DEVICE",
+        "bytes": 1323827200,
+        "shape": [
+          129280,
+          5120
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "logit_row_indices",
+        "kind": "DEVICE",
+        "bytes": 64,
+        "shape": [
+          16
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/d5b258c06f68cf9acceb.bin",
+        "repeat": false,
+        "initializer_sha256": "d5b258c06f68cf9accebb90500dc0857fb2da7e7657167fc01e20e3b4857420d"
+      },
+      {
+        "name": "logits",
+        "kind": "DEVICE",
+        "bytes": 8273920,
+        "shape": [
+          16,
+          129280
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "sampled_ids",
+        "kind": "DEVICE",
+        "bytes": 512,
+        "shape": [
+          16,
+          8
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "hidden_window",
+        "kind": "COMM",
+        "bytes": 163840,
+        "shape": [
+          16,
+          5120
+        ],
+        "offset": 59770368
+      },
+      {
+        "name": "hidden_done",
+        "kind": "COMM",
+        "bytes": 4,
+        "shape": [
+          1,
+          1
+        ],
+        "offset": 59934208
+      },
+      {
+        "name": "logits_window",
+        "kind": "COMM",
+        "bytes": 8273920,
+        "shape": [
+          16,
+          129280
+        ],
+        "offset": 59934272
+      },
+      {
+        "name": "logits_done",
+        "kind": "COMM",
+        "bytes": 4,
+        "shape": [
+          1,
+          1
+        ],
+        "offset": 68208192
+      }
+    ],
+    [
+      {
+        "name": "engram_lookup",
+        "kind": "DEVICE",
+        "bytes": 1966080,
+        "shape": [
+          2,
+          80,
+          6144
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "engram_wkv",
+        "kind": "DEVICE",
+        "bytes": 314572800,
+        "shape": [
+          2,
+          6144,
+          25600
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "engram_wkv_scale",
+        "kind": "DEVICE",
+        "bytes": 9830400,
+        "shape": [
+          384,
+          25600
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "engram_weight",
+        "kind": "DEVICE",
+        "bytes": 163840,
+        "shape": [
+          2,
+          4,
+          5120
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "x_hc",
+        "kind": "DEVICE",
+        "bytes": 6553600,
+        "shape": [
+          80,
+          4,
+          5120
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "pre_mix",
+        "kind": "DEVICE",
+        "bytes": 1280,
+        "shape": [
+          80,
+          4
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "hc_attn_fn",
+        "kind": "DEVICE",
+        "bytes": 78643200,
+        "shape": [
+          960,
+          20480
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "hc_attn_scale",
+        "kind": "HOST",
+        "bytes": 480,
+        "shape": [
+          120
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/e00e5eb9444182f35232.bin",
+        "repeat": true,
+        "initializer_sha256": "e00e5eb9444182f352323374ef4e08ebcb784725fdd4fd612d7730540b3e0c8c"
+      },
+      {
+        "name": "hc_attn_base",
+        "kind": "DEVICE",
+        "bytes": 3840,
+        "shape": [
+          960
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "attn_norm_weight",
+        "kind": "DEVICE",
+        "bytes": 409600,
+        "shape": [
+          204800
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "wq_a",
+        "kind": "DEVICE",
+        "bytes": 262144000,
+        "shape": [
+          40,
+          5120,
+          1280
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "q_norm_weight",
+        "kind": "DEVICE",
+        "bytes": 102400,
+        "shape": [
+          51200
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "wq_b",
+        "kind": "DEVICE",
+        "bytes": 1677721600,
+        "shape": [
+          40,
+          1280,
+          32768
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "wkv",
+        "kind": "DEVICE",
+        "bytes": 104857600,
+        "shape": [
+          40,
+          5120,
+          512
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "kv_norm_weight",
+        "kind": "DEVICE",
+        "bytes": 40960,
+        "shape": [
+          20480
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "attn_sink",
+        "kind": "DEVICE",
+        "bytes": 10240,
+        "shape": [
+          2560
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "wo_a",
+        "kind": "DEVICE",
+        "bytes": 1342177280,
+        "shape": [
+          320,
+          4096,
+          1024
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "wo_a_scale",
+        "kind": "DEVICE",
+        "bytes": 41943040,
+        "shape": [
+          320,
+          128,
+          1024
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "wo_b",
+        "kind": "DEVICE",
+        "bytes": 1677721600,
+        "shape": [
+          40,
+          8192,
+          5120
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "freqs_cos",
+        "kind": "DEVICE",
+        "bytes": 1536,
+        "shape": [
+          2,
+          6,
+          32
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/cc7fd71ac71da2d1d2a7.bin",
+        "repeat": false,
+        "initializer_sha256": "cc7fd71ac71da2d1d2a7de6d7226621c3412a40b79b19cd764c83ea21872922f"
+      },
+      {
+        "name": "freqs_sin",
+        "kind": "DEVICE",
+        "bytes": 1536,
+        "shape": [
+          2,
+          6,
+          32
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/9c0b1ea5d99739ad2ba7.bin",
+        "repeat": false,
+        "initializer_sha256": "9c0b1ea5d99739ad2ba7c066f319e395f60e5cd4317eddcfbd4bb1b3ebd9e089"
+      },
+      {
+        "name": "window_slots",
+        "kind": "DEVICE",
+        "bytes": 576,
+        "shape": [
+          72
+        ],
+        "dtype": "int64",
+        "initializer": "vendor/data/539fea80c782d165cab5.bin",
+        "repeat": false,
+        "initializer_sha256": "539fea80c782d165cab51e6b52c4acdd1f32c9a999e30eac53e1a8f670248c70"
+      },
+      {
+        "name": "window_indices",
+        "kind": "DEVICE",
+        "bytes": 36864,
+        "shape": [
+          72,
+          128
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/7c6cbcef9ac24956b196.bin",
+        "repeat": false,
+        "initializer_sha256": "7c6cbcef9ac24956b196fe49d5135d1cb0ee7e90ba402e8c413e0f662f979784"
+      },
+      {
+        "name": "window_cache_pool",
+        "kind": "DEVICE",
+        "bytes": 31457280,
+        "shape": [
+          480,
+          128,
+          1,
+          512
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "window_cache_scale_pool",
+        "kind": "DEVICE",
+        "bytes": 1966080,
+        "shape": [
+          480,
+          128,
+          1,
+          16
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "compressed_cache_pool",
+        "kind": "DEVICE",
+        "bytes": 1572864,
+        "shape": [
+          48,
+          128,
+          1,
+          256
+        ],
+        "dtype": "uint8",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "compressed_cache_scale_pool",
+        "kind": "DEVICE",
+        "bytes": 393216,
+        "shape": [
+          48,
+          128,
+          1,
+          32
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "token_to_req_indices",
+        "kind": "DEVICE",
+        "bytes": 288,
+        "shape": [
+          72
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/5819b90cbb81303c5ea6.bin",
+        "repeat": false,
+        "initializer_sha256": "5819b90cbb81303c5ea61668fb123326f973c3f19c5c2bd1d42964633738ed6f"
+      },
+      {
+        "name": "position_ids",
+        "kind": "DEVICE",
+        "bytes": 288,
+        "shape": [
+          72
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/ca59aaaa0f1e145768e7.bin",
+        "repeat": false,
+        "initializer_sha256": "ca59aaaa0f1e145768e7dba210fc007dee5740c5cac9b21202966b82dcbed0b0"
+      },
+      {
+        "name": "index_cache_pool",
+        "kind": "DEVICE",
+        "bytes": 393216,
+        "shape": [
+          48,
+          128,
+          1,
+          64
+        ],
+        "dtype": "uint8",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "index_cache_scale_pool",
+        "kind": "DEVICE",
+        "bytes": 24576,
+        "shape": [
+          48,
+          128,
+          1,
+          4
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "c2a_index_block_table",
+        "kind": "DEVICE",
+        "bytes": 48,
+        "shape": [
+          12,
+          1
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/b68e9a05823d7b9bcae5.bin",
+        "repeat": false,
+        "initializer_sha256": "b68e9a05823d7b9bcae5177815047c2635261fe99e7771c3ed4f8c8185216e39"
+      },
+      {
+        "name": "c1a_index_block_table",
+        "kind": "DEVICE",
+        "bytes": 96,
+        "shape": [
+          12,
+          2
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/47c263db531645f32d35.bin",
+        "repeat": false,
+        "initializer_sha256": "47c263db531645f32d351d19e572b02ee0739cc177fde4095fb5e08cb06d9e3d"
+      },
+      {
+        "name": "c2a_compressor_wkv_logical",
+        "kind": "DEVICE",
+        "bytes": 15728640,
+        "shape": [
+          3,
+          5120,
+          512
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "c2a_compressor_wgate_logical",
+        "kind": "DEVICE",
+        "bytes": 15728640,
+        "shape": [
+          3,
+          5120,
+          512
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "c1a_compressor_wkv_logical",
+        "kind": "DEVICE",
+        "bytes": 5242880,
+        "shape": [
+          5120,
+          512
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "query_start_loc",
+        "kind": "DEVICE",
+        "bytes": 52,
+        "shape": [
+          13
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/bbb0338de58a4020f34e.bin",
+        "repeat": false,
+        "initializer_sha256": "bbb0338de58a4020f34ee6955e0da8011e454ceba7b3c6176854ca6d12235d23"
+      },
+      {
+        "name": "state_block_table",
+        "kind": "DEVICE",
+        "bytes": 48,
+        "shape": [
+          12,
+          1
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/a4886fc88eadb553f030.bin",
+        "repeat": false,
+        "initializer_sha256": "a4886fc88eadb553f0300776411b64c557a02e7a09f9df7da871fb2f9f4c8278"
+      },
+      {
+        "name": "state_cache_pool",
+        "kind": "DEVICE",
+        "bytes": 589824,
+        "shape": [
+          36,
+          4,
+          1024
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "compressor_norm_weight",
+        "kind": "DEVICE",
+        "bytes": 4096,
+        "shape": [
+          2048
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "c2a_compressed_slots",
+        "kind": "DEVICE",
+        "bytes": 576,
+        "shape": [
+          72
+        ],
+        "dtype": "int64",
+        "initializer": "vendor/data/1e18c486b0a4f7bed94a.bin",
+        "repeat": false,
+        "initializer_sha256": "1e18c486b0a4f7bed94add57c336143bb9df449b1684d74e0c99784ef8686935"
+      },
+      {
+        "name": "c1a_compressed_slots",
+        "kind": "DEVICE",
+        "bytes": 576,
+        "shape": [
+          72
+        ],
+        "dtype": "int64",
+        "initializer": "vendor/data/539fea80c782d165cab5.bin",
+        "repeat": false,
+        "initializer_sha256": "539fea80c782d165cab51e6b52c4acdd1f32c9a999e30eac53e1a8f670248c70"
+      },
+      {
+        "name": "index_wk_logical",
+        "kind": "DEVICE",
+        "bytes": 1048576,
+        "shape": [
+          8,
+          512,
+          128
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "index_norm_weight",
+        "kind": "DEVICE",
+        "bytes": 2048,
+        "shape": [
+          1024
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "index_wq_b",
+        "kind": "DEVICE",
+        "bytes": 41943040,
+        "shape": [
+          8,
+          1280,
+          4096
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "index_weights_proj_logical",
+        "kind": "DEVICE",
+        "bytes": 2621440,
+        "shape": [
+          8,
+          5120,
+          32
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "hc_ffn_fn",
+        "kind": "DEVICE",
+        "bytes": 78643200,
+        "shape": [
+          960,
+          20480
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "hc_ffn_scale",
+        "kind": "HOST",
+        "bytes": 480,
+        "shape": [
+          120
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/e00e5eb9444182f35232.bin",
+        "repeat": true,
+        "initializer_sha256": "e00e5eb9444182f352323374ef4e08ebcb784725fdd4fd612d7730540b3e0c8c"
+      },
+      {
+        "name": "hc_ffn_base",
+        "kind": "DEVICE",
+        "bytes": 3840,
+        "shape": [
+          960
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "ffn_norm_weight",
+        "kind": "DEVICE",
+        "bytes": 409600,
+        "shape": [
+          204800
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "gate_weight",
+        "kind": "DEVICE",
+        "bytes": 104857600,
+        "shape": [
+          5120,
+          5120
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "correction_bias",
+        "kind": "DEVICE",
+        "bytes": 20480,
+        "shape": [
+          5120
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/f4a07432f64c01a753d9.bin",
+        "repeat": false,
+        "initializer_sha256": "f4a07432f64c01a753d98bfb74b917a9fe8eb4f0557d34d2d273044b3abd1bfd"
+      },
+      {
+        "name": "routed_w1",
+        "kind": "DEVICE",
+        "bytes": 15099494400,
+        "shape": [
+          2560,
+          46080,
+          128
+        ],
+        "dtype": "uint8",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "routed_w2",
+        "kind": "DEVICE",
+        "bytes": 15099494400,
+        "shape": [
+          2560,
+          46080,
+          128
+        ],
+        "dtype": "uint8",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "routed_w3",
+        "kind": "DEVICE",
+        "bytes": 15099494400,
+        "shape": [
+          2560,
+          46080,
+          128
+        ],
+        "dtype": "uint8",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "mxfp4_pair_lut",
+        "kind": "DEVICE",
+        "bytes": 1024,
+        "shape": [
+          2,
+          256
+        ],
+        "dtype": "int16",
+        "initializer": "vendor/data/364a3c58f9baefc64f00.bin",
+        "repeat": false,
+        "initializer_sha256": "364a3c58f9baefc64f0034a00e02bd4cefe449798d12b766b65d61e26d55d023"
+      },
+      {
+        "name": "shared_w1",
+        "kind": "DEVICE",
+        "bytes": 471859200,
+        "shape": [
+          40,
+          5120,
+          2304
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "shared_w2",
+        "kind": "DEVICE",
+        "bytes": 471859200,
+        "shape": [
+          40,
+          2304,
+          5120
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "shared_w3",
+        "kind": "DEVICE",
+        "bytes": 471859200,
+        "shape": [
+          40,
+          5120,
+          2304
+        ],
+        "dtype": "float8_e4m3fn",
+        "initializer": "vendor/data/6e340b9cffb37a989ca5.bin",
+        "repeat": true,
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+      },
+      {
+        "name": "recv_meta",
+        "kind": "COMM",
+        "bytes": 512,
+        "shape": [
+          2,
+          64
+        ],
+        "offset": 0
+      },
+      {
+        "name": "recv_x",
+        "kind": "COMM",
+        "bytes": 52428800,
+        "shape": [
+          10240,
+          5120
+        ],
+        "offset": 512
+      },
+      {
+        "name": "recv_scale",
+        "kind": "COMM",
+        "bytes": 1638400,
+        "shape": [
+          10240,
+          160
+        ],
+        "offset": 52429312
+      },
+      {
+        "name": "recv_weights",
+        "kind": "COMM",
+        "bytes": 327680,
+        "shape": [
+          10240,
+          8
+        ],
+        "offset": 54067712
+      },
+      {
+        "name": "recv_routes",
+        "kind": "COMM",
+        "bytes": 327680,
+        "shape": [
+          10240,
+          8
+        ],
+        "offset": 54395392
+      },
+      {
+        "name": "arrived",
+        "kind": "COMM",
+        "bytes": 1024,
+        "shape": [
+          2,
+          128
+        ],
+        "offset": 54723072
+      },
+      {
+        "name": "data_arrived",
+        "kind": "COMM",
+        "bytes": 65536,
+        "shape": [
+          2,
+          64,
+          128
+        ],
+        "offset": 54724096
+      },
+      {
+        "name": "routed_output",
+        "kind": "COMM",
+        "bytes": 4915200,
+        "shape": [
+          480,
+          5120
+        ],
+        "offset": 54789632
+      },
+      {
+        "name": "combine_arrived",
+        "kind": "COMM",
+        "bytes": 65536,
+        "shape": [
+          2,
+          64,
+          128
+        ],
+        "offset": 59704832
+      },
+      {
+        "name": "moe_num_tokens",
+        "kind": "HOST",
+        "bytes": 8,
+        "shape": [
+          2
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/a711abc23618a87eb096.bin",
+        "repeat": false,
+        "initializer_sha256": "a711abc23618a87eb096d8294e63eb835e8f056abbd05c1c06d74b80ec58c666"
+      },
+      {
+        "name": "attention_num_tokens",
+        "kind": "HOST",
+        "bytes": 8,
+        "shape": [
+          2
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/a711abc23618a87eb096.bin",
+        "repeat": false,
+        "initializer_sha256": "a711abc23618a87eb096d8294e63eb835e8f056abbd05c1c06d74b80ec58c666"
+      },
+      {
+        "name": "wq_a_scale",
+        "kind": "DEVICE",
+        "bytes": 8192000,
+        "shape": [
+          6400,
+          1280
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "wq_b_scale",
+        "kind": "DEVICE",
+        "bytes": 52428800,
+        "shape": [
+          1600,
+          32768
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "wkv_scale",
+        "kind": "DEVICE",
+        "bytes": 3276800,
+        "shape": [
+          6400,
+          512
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "wo_b_scale",
+        "kind": "DEVICE",
+        "bytes": 52428800,
+        "shape": [
+          10240,
+          5120
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "index_wq_b_scale",
+        "kind": "DEVICE",
+        "bytes": 1310720,
+        "shape": [
+          320,
+          4096
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "routed_w1_scale",
+        "kind": "DEVICE",
+        "bytes": 943718400,
+        "shape": [
+          409600,
+          2304
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "routed_w2_scale",
+        "kind": "DEVICE",
+        "bytes": 943718400,
+        "shape": [
+          184320,
+          5120
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "routed_w3_scale",
+        "kind": "DEVICE",
+        "bytes": 943718400,
+        "shape": [
+          409600,
+          2304
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "shared_w1_scale",
+        "kind": "DEVICE",
+        "bytes": 14745600,
+        "shape": [
+          6400,
+          2304
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "shared_w2_scale",
+        "kind": "DEVICE",
+        "bytes": 14745600,
+        "shape": [
+          2880,
+          5120
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "shared_w3_scale",
+        "kind": "DEVICE",
+        "bytes": 14745600,
+        "shape": [
+          6400,
+          2304
+        ],
+        "dtype": "float8_e8m0fnu",
+        "initializer": "vendor/data/620bfdaa346b088fb499.bin",
+        "repeat": true,
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731"
+      },
+      {
+        "name": "final_norm_weight",
+        "kind": "DEVICE",
+        "bytes": 10240,
+        "shape": [
+          5120
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/b9c205bdac187f20bf87.bin",
+        "repeat": true,
+        "initializer_sha256": "b9c205bdac187f20bf876cea369cb6032ad1bf69043b31d716b36b8defbffdf2"
+      },
+      {
+        "name": "lm_head_weight",
+        "kind": "DEVICE",
+        "bytes": 1323827200,
+        "shape": [
+          129280,
+          5120
+        ],
+        "dtype": "bfloat16",
+        "initializer": "vendor/data/96a296d224f285c67bee.bin",
+        "repeat": true,
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7"
+      },
+      {
+        "name": "logit_row_indices",
+        "kind": "DEVICE",
+        "bytes": 64,
+        "shape": [
+          16
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/d5b258c06f68cf9acceb.bin",
+        "repeat": false,
+        "initializer_sha256": "d5b258c06f68cf9accebb90500dc0857fb2da7e7657167fc01e20e3b4857420d"
+      },
+      {
+        "name": "logits",
+        "kind": "DEVICE",
+        "bytes": 8273920,
+        "shape": [
+          16,
+          129280
+        ],
+        "dtype": "float32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "sampled_ids",
+        "kind": "DEVICE",
+        "bytes": 512,
+        "shape": [
+          16,
+          8
+        ],
+        "dtype": "int32",
+        "initializer": "vendor/data/df3f619804a92fdb4057.bin",
+        "repeat": true,
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+      },
+      {
+        "name": "hidden_window",
+        "kind": "COMM",
+        "bytes": 163840,
+        "shape": [
+          16,
+          5120
+        ],
+        "offset": 59770368
+      },
+      {
+        "name": "hidden_done",
+        "kind": "COMM",
+        "bytes": 4,
+        "shape": [
+          1,
+          1
+        ],
+        "offset": 59934208
+      },
+      {
+        "name": "logits_window",
+        "kind": "COMM",
+        "bytes": 8273920,
+        "shape": [
+          16,
+          129280
+        ],
+        "offset": 59934272
+      },
+      {
+        "name": "logits_done",
+        "kind": "COMM",
+        "bytes": 4,
+        "shape": [
+          1,
+          1
+        ],
+        "offset": 68208192
+      }
+    ]
+  ]
+}

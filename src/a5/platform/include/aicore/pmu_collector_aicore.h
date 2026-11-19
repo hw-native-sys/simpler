@@ -41,16 +41,64 @@ constexpr uint64_t PMU_AICORE_CTRL_ENABLE_BIT = 0x1ULL;
 
 /**
  * Begin PMU counting window: set CTRL bit 0 so hardware counters start accruing.
+ *
+ * Fenced on both sides for the reason the a2a3 copy states: the toolchain's own
+ * `metrics_prof_start` / `metrics_prof_stop`
+ * (`__clang_cce_aicore_functions.h`, CANN 9.0.0 BiSheng) set and clear this
+ * same bit 0 with a `pipe_barrier(PIPE_ALL)` either side, and its guard covers
+ * `__NPU_ARCH__ == 3510` as well. Contract conformance, not evidence about
+ * what the counters hold afterwards.
  */
 __aicore__ __attribute__((always_inline)) static inline void pmu_aicore_begin() {
+    pipe_barrier(PIPE_ALL);
     write_reg(RegId::CTRL, read_reg(RegId::CTRL) | PMU_AICORE_CTRL_ENABLE_BIT);
+    pipe_barrier(PIPE_ALL);
 }
 
 /**
- * End PMU counting window: clear CTRL bit 0 so counters freeze until next begin.
+ * End PMU counting window: clear CTRL bit 0.
+ *
+ * Whether the counter registers hold their accumulated value after this is not
+ * stated by any contract this repo can cite; this executor reads them on the
+ * core immediately afterwards, so that assumption is carried here rather than
+ * asserted. Fenced on both sides for the same reason as the begin above.
  */
 __aicore__ __attribute__((always_inline)) static inline void pmu_aicore_end() {
+    pipe_barrier(PIPE_ALL);
     write_reg(RegId::CTRL, read_reg(RegId::CTRL) & ~PMU_AICORE_CTRL_ENABLE_BIT);
+    pipe_barrier(PIPE_ALL);
+}
+
+/**
+ * Read this core's ten event counters and its 64-bit cycle counter.
+ *
+ * Valid only between `pmu_aicore_end()` and the next `pmu_aicore_begin()`,
+ * where the counters are frozen.
+ *
+ * The 10 event counters + 64-bit cycle counter come through the AICore MMIO
+ * load intrinsic ld_dev(base, offset) — the only legal way for AICore to read
+ * its own MMIO regs. CCE constrains `offset` to a 12-bit signed immediate
+ * ([-2048, 2047]), so the pointer is rebased to the start of the PMU CTRL/CNT
+ * block (0x4200); relative offsets then fit within [0x10, 0x64] and stay
+ * inside the immediate range.
+ */
+__aicore__ __attribute__((always_inline)) static inline void
+pmu_aicore_read_counters(uint64_t reg_base, __gm__ uint32_t *counters, __gm__ uint64_t *total_cycles) {
+    int32_t *pmu_base = reinterpret_cast<int32_t *>(reg_base + REG_MMIO_PMU_CTRL_0_OFFSET);
+    constexpr int16_t REL = static_cast<int16_t>(REG_MMIO_PMU_CTRL_0_OFFSET);
+    counters[0] = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT0_OFFSET - REL));
+    counters[1] = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT1_OFFSET - REL));
+    counters[2] = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT2_OFFSET - REL));
+    counters[3] = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT3_OFFSET - REL));
+    counters[4] = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT4_OFFSET - REL));
+    counters[5] = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT5_OFFSET - REL));
+    counters[6] = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT6_OFFSET - REL));
+    counters[7] = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT7_OFFSET - REL));
+    counters[8] = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT8_OFFSET - REL));
+    counters[9] = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT9_OFFSET - REL));
+    uint64_t lo = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT_TOTAL0_OFFSET - REL));
+    uint64_t hi = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT_TOTAL1_OFFSET - REL));
+    *total_cycles = lo | (hi << 32);
 }
 
 /**
@@ -74,27 +122,7 @@ pmu_aicore_record_task(__gm__ PmuAicoreRing *ring, uint64_t reg_base, uint32_t t
 
     __gm__ PmuAicoreSlot *slot = &ring->dual_issue_slots[task_id % PLATFORM_PMU_AICORE_RING_SIZE];
 
-    // Read the 10 event counters + 64-bit cycle counter via the AICore MMIO
-    // load intrinsic ld_dev(base, offset) — the only legal way for AICore to
-    // read its own MMIO regs. CCE constrains `offset` to a 12-bit signed
-    // immediate ([-2048, 2047]), so we rebase the pointer to the start of
-    // the PMU CTRL/CNT block (0x4200) — relative offsets then fit within
-    // [0x10, 0x64] and stay inside the immediate range.
-    int32_t *pmu_base = reinterpret_cast<int32_t *>(reg_base + REG_MMIO_PMU_CTRL_0_OFFSET);
-    constexpr int16_t REL = static_cast<int16_t>(REG_MMIO_PMU_CTRL_0_OFFSET);
-    slot->pmu_counters[0] = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT0_OFFSET - REL));
-    slot->pmu_counters[1] = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT1_OFFSET - REL));
-    slot->pmu_counters[2] = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT2_OFFSET - REL));
-    slot->pmu_counters[3] = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT3_OFFSET - REL));
-    slot->pmu_counters[4] = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT4_OFFSET - REL));
-    slot->pmu_counters[5] = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT5_OFFSET - REL));
-    slot->pmu_counters[6] = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT6_OFFSET - REL));
-    slot->pmu_counters[7] = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT7_OFFSET - REL));
-    slot->pmu_counters[8] = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT8_OFFSET - REL));
-    slot->pmu_counters[9] = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT9_OFFSET - REL));
-    uint64_t lo = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT_TOTAL0_OFFSET - REL));
-    uint64_t hi = static_cast<uint32_t>(ld_dev(pmu_base, REG_MMIO_PMU_CNT_TOTAL1_OFFSET - REL));
-    slot->pmu_total_cycles = lo | (hi << 32);
+    pmu_aicore_read_counters(reg_base, slot->pmu_counters, &slot->pmu_total_cycles);
 
     // Publish the dispatch token last so AICPU can tell a filled slot from one
     // this core has not reached yet.

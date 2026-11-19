@@ -1,0 +1,195 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+
+"""Frozen real CSA graph shape/edge/view regression gates without large tensors."""
+
+import copy
+
+import pytest
+from _native_protocol_builder import ProtocolBuilder
+
+from examples.a5.host_build_graph.deepseek_v4_pro_csa import fixture, graph_contract
+
+FROZEN = graph_contract.frozen_graph()
+NODES = FROZEN["graph"]["nodes"]
+
+
+def dependency_capture():
+    # Reconstruct only fields retained by the graph projection, with arbitrary tensor identities.
+    tasks = []
+    for node in NODES:
+        task = {
+            key: copy.deepcopy(node[key]) for key in ("task_id", "kernel_ids", "block_num", "early_dispatch", "args")
+        }
+        for arg in task["args"]:
+            arg["tensor_id"] = "address-independent"
+        tasks.append(task)
+    edges = [{"pred": pred, "succ": node["task_id"]} for node in NODES for pred in node["deps"]]
+    edges += [{"pred": ref, "succ": NODES[0]["task_id"]} for ref in FROZEN["graph"]["host_ready_refs"]]
+    return {"runtime": "host_build_graph", "tasks": tasks, "edges": edges}
+
+
+def test_graph_capture_provenance_and_roundtrip():
+    assert FROZEN["source_manifest_sha256"] == fixture.sha256(fixture.CASE_DIR / "manifest.json")
+    assert FROZEN["fixture_id"] == fixture.manifest()["fixture_id"]
+    assert graph_contract.validate_graph(dependency_capture()) == FROZEN["graph"]
+
+
+@pytest.mark.parametrize("ref", [node["task_id"] for node in NODES if node["block_num"] > 1])
+def test_each_real_spmd_task_must_keep_its_original_block_count(ref):
+    deps = dependency_capture()
+    next(t for t in deps["tasks"] if t["task_id"] == ref)["block_num"] = 1
+    with pytest.raises(ValueError, match="frozen graph"):
+        graph_contract.validate_graph(deps)
+
+
+@pytest.mark.parametrize("pred,succ", [(p, n["task_id"]) for n in NODES for p in n["deps"]])
+def test_each_real_dependency_edge_cannot_disappear(pred, succ):
+    deps = dependency_capture()
+    deps["edges"].remove({"pred": pred, "succ": succ})
+    with pytest.raises(ValueError, match="frozen graph"):
+        graph_contract.validate_graph(deps)
+
+
+@pytest.mark.parametrize(
+    "ref", [node["task_id"] for node in NODES if node["kernel_ids"][0] >= 0 and node["kernel_ids"][1] >= 0]
+)
+def test_each_real_mix_task_must_keep_its_vector_payload(ref):
+    deps = dependency_capture()
+    next(t for t in deps["tasks"] if t["task_id"] == ref)["kernel_ids"][1] = -1
+    with pytest.raises(ValueError, match="frozen graph"):
+        graph_contract.validate_graph(deps)
+
+
+@pytest.mark.parametrize("ref", list(range(59, 105, 3)))
+def test_sixteen_same_kernel_pack_tasks_keep_distinct_tensor_views(ref):
+    deps = dependency_capture()
+    task = next(t for t in deps["tasks"] if t["task_id"] == ref)
+    target = next(a for a in task["args"] if a["type"].startswith("OUTPUT"))
+    target["start_offset"] = str(int(target["start_offset"]) + 1)
+    with pytest.raises(ValueError, match="frozen graph"):
+        graph_contract.validate_graph(deps)
+
+
+@pytest.mark.parametrize("mutation", ["duplicate_task", "runtime", "early_dispatch"])
+def test_capture_metadata_corruption_is_rejected(mutation):
+    deps = dependency_capture()
+    if mutation == "duplicate_task":
+        deps["tasks"].append(copy.deepcopy(deps["tasks"][0]))
+    elif mutation == "runtime":
+        deps["runtime"] = "tensormap_and_ringbuffer"
+    else:
+        deps["tasks"][0]["early_dispatch"] = True
+    with pytest.raises(ValueError):
+        graph_contract.validate_graph(deps)
+
+
+def execution_rows():
+    return [
+        dict(
+            task_id=node["task_id"],
+            core_type="aic" if slot == 0 else "aiv",
+            run_epoch=1,
+            start_time_us=node["task_id"] * 1000000 + block * 4 + slot,
+            end_time_us=node["task_id"] * 1000000 + block * 4 + slot + 1,
+            block_idx=block,
+            block_num=node["block_num"],
+            subtask_slot=slot,
+            executed=True,
+        )
+        for node in NODES
+        for block in range(node["block_num"])
+        for slot, kernel in enumerate(node["kernel_ids"])
+        if kernel >= 0
+    ]
+
+
+def test_all_real_csa_execution_identities_match_the_external_graph():
+    rows = execution_rows()
+    assert len(rows) == 2308
+    assert graph_contract.audit_execution(dependency_capture(), rows)["block_identity_verified"] is True
+
+
+@pytest.mark.parametrize(
+    "mutation", ("duplicate_block", "wrong_slot", "wrong_block_num", "missing_field", "not_executed")
+)
+def test_exact_counts_cannot_hide_corrupt_csa_block_identity(mutation):
+    rows = execution_rows()
+    target = next(row for row in rows if row["block_idx"] == 1 and row["subtask_slot"] == 1)
+    if mutation == "duplicate_block":
+        target["block_idx"] = 0
+    elif mutation == "wrong_slot":
+        target["subtask_slot"] = 2
+    elif mutation == "wrong_block_num":
+        target["block_num"] += 1
+    elif mutation == "missing_field":
+        del target["block_idx"]
+    else:
+        target["executed"] = False
+    with pytest.raises(ValueError, match="identity"):
+        graph_contract.audit_execution(dependency_capture(), rows)
+
+
+def test_historical_csa_rows_stay_explicitly_unverified():
+    rows = execution_rows()
+    for row in rows:
+        for field in ("block_idx", "block_num", "subtask_slot", "executed"):
+            del row[field]
+    assert graph_contract.audit_execution(dependency_capture(), rows)["block_identity_verified"] is False
+
+
+@pytest.mark.parametrize("mutation", (None, "missing_task", "kernel", "blocks", "fanin"))
+def test_native_frozen_graph_must_match_independent_dependency_capture(mutation):
+    protocol, _ = ProtocolBuilder([(None, 0, ()), (1, 1, (0,)), (0, 1, (1,)), (6, 2, (2,))]).run()
+    deps = {
+        "tasks": [
+            {"task_id": 1, "kernel_ids": [0, -1, -1], "block_num": 1},
+            {"task_id": 2, "kernel_ids": [-1, -1, -1], "block_num": 1},
+            {"task_id": 3, "kernel_ids": [-1, 0, 0], "block_num": 2},
+        ],
+        "edges": [{"pred": 0, "succ": 1}, {"pred": 1, "succ": 2}, {"pred": 2, "succ": 3}],
+    }
+    if mutation is None:
+        graph_contract.validate_native_graph(deps, protocol)
+        return
+    if mutation == "missing_task":
+        deps["tasks"].pop()
+    elif mutation == "kernel":
+        deps["tasks"][0]["kernel_ids"][0] = 7
+    elif mutation == "blocks":
+        deps["tasks"][-1]["block_num"] += 1
+    else:
+        deps["edges"].pop()
+    with pytest.raises(ValueError, match="native protocol graph"):
+        graph_contract.validate_native_graph(deps, protocol)
+
+
+def test_native_proof_does_not_suppress_the_existing_csa_timing_guard():
+    protocol, identities = ProtocolBuilder([(1, 1, ()), (2, 1, (0,))], epoch=1).run()
+    deps = {
+        "tasks": [
+            {"task_id": 0, "kernel_ids": [0, -1, -1], "block_num": 1},
+            {"task_id": 1, "kernel_ids": [-1, 0, -1], "block_num": 1},
+        ],
+        "edges": [{"pred": 0, "succ": 1}],
+    }
+    rows = [
+        dict(
+            identity,
+            core_type="aic" if identity["subtask_slot"] == 0 else "aiv",
+            start_time_us=identity["task_id"] * 100,
+            end_time_us=identity["task_id"] * 100 + 1,
+        )
+        for identity in identities
+    ]
+    assert graph_contract.audit_execution(deps, rows, protocol=protocol)["protocol_verified"] is True
+    rows[0]["end_time_us"] = 200
+    with pytest.raises(ValueError, match="dependency started early"):
+        graph_contract.audit_execution(deps, rows, protocol=protocol)

@@ -27,7 +27,9 @@
  *   - prepared run: simpler_register_callable, simpler_prepare_run,
  *                   simpler_launch_run, simpler_launch_run_joined,
  *                   simpler_poll_run, simpler_wait_run,
- *                   simpler_finalize_run, simpler_run,
+ *                   simpler_finalize_run_with_delivery, simpler_finalize_run,
+ *                   simpler_run, simpler_launch_run_on_stream,
+ *                   simpler_validate_caller_stream, simpler_validate_execution_context,
  *                   simpler_unregister_callable,
  *                   get_aicpu_dlopen_count, get_host_dlopen_count,
  *                   get_run_stream_set_create_count
@@ -44,6 +46,11 @@
  *                   destroy_comm_stream_ctx
  *   - comm:         comm_init, comm_alloc_windows, comm_get_local_window_base,
  *                   comm_get_window_size, comm_barrier, comm_destroy
+ *
+ * Optional API — resolved opportunistically; a runtime built before these
+ * entries simply lacks the capability, and ChipWorker raises an explicit error
+ * when a caller requests it:
+ *   - registration: simpler_register_callable_v2
  *
  * Native-run storage: caller allocates at least get_runtime_size() bytes with
  * get_runtime_alignment() alignment, zero-initializes it before first use, and
@@ -76,6 +83,7 @@ extern "C" {
 #endif
 
 typedef void *RuntimeHandle;
+/** Opaque simpler runner handle, not an ACL/RTS current-context handle. */
 typedef void *DeviceContextHandle;
 
 /**
@@ -113,6 +121,39 @@ enum {
     PTO_RUNTIME_ERR_INVALID_STATE = PTO_RUNTIME_ERR_BASE - 3,
     /* A caller supplied an invalid pointer, id, size, or other argument. */
     PTO_RUNTIME_ERR_INVALID_ARGUMENT = PTO_RUNTIME_ERR_BASE - 4,
+    /* BASE - 5 is reserved for diagnostic collector capacity refusal. */
+    /* A prepare could not take the device resources it needs now, and a
+       consumer that still holds some of them has a retirement this context will
+       reach. The plan is kept and retried once that consumer finishes, so this
+       is a wait rather than a failure and the caller must not discard the run. */
+    SIMPLER_RUNTIME_ERR_RESOURCE_WAIT = PTO_RUNTIME_ERR_BASE - 6,
+    /* A prepare could not take the device resources it needs and no consumer
+       remains whose retirement could supply them: either none ever held any, or
+       this plan has already waited for every one that did. Terminal. */
+    SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE = PTO_RUNTIME_ERR_BASE - 7,
+    /* Reserved for simpler_wait_run: this wait did not observe the result.
+       The run remains live and may be waited/finalized again. Never store this
+       operation result as the execution's terminal error. */
+    SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE = PTO_RUNTIME_ERR_BASE - 8,
+    /* Host register/unregister succeeded, but restoring the caller context failed. */
+    SIMPLER_HOST_DDR_CONTEXT_RESTORE_FAILED = PTO_RUNTIME_ERR_BASE - 9,
+};
+
+/**
+ * A launch result that is not a failure of the run.
+ *
+ * Every diagnostic output slot or terminal bank some enabled owner needs is
+ * still held by a run ahead. Nothing was submitted and nothing was admitted:
+ * the run keeps its prepared state and may be launched again, unchanged, once
+ * `simpler_diagnostic_credit_generation_ctx` advances. A caller that treats it
+ * as a failure turns a run that is merely waiting into one that is lost.
+ *
+ * It takes a value in the host-side band so it cannot collide with a latched
+ * device code, and sits in its own enum because the band's other members are
+ * externally-contracted legacy names this one does not join.
+ */
+enum {
+    SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL = PTO_RUNTIME_ERR_BASE - 5,
 };
 
 /** Return values from simpler_poll_run(). */
@@ -125,13 +166,6 @@ enum {
 enum {
     PTO_PIPELINE_CONTRACT_ABI_VERSION = 1,
     PTO_PIPELINE_MAX_RESOURCES = 8,
-    /* Ceiling on pipeline_depth, and the width every per-slot array and wire
-       frame is laid out for. A context grants at most this many run resource
-       sets; what a Worker requests and what a runtime supports are both
-       clamped to it. Raising it costs static footprint — one more mailbox
-       frame per endpoint and one more entry in each per-slot array — whether
-       or not any run holds the extra set. */
-    PTO_PIPELINE_MAX_DEPTH = 3,
 };
 
 /**
@@ -194,6 +228,31 @@ typedef struct PipelineContract {
 } PipelineContract;
 
 /**
+ * Where one dispatch came from in the submitting Worker's tree.
+ *
+ * Carried beside a run's resource identity so that a diagnostic artifact can be
+ * attributed to the submission that produced it. **An all-zero
+ * `owner_instance_id` means the whole structure is unstated**, which is what a
+ * caller reaching the native lane without a Worker mailbox leaves behind: the
+ * remaining fields are then not read, and no consumer may treat their zeros as
+ * an identity. A stated nonce is a full-width random draw, so all-zero cannot
+ * collide with a real one.
+ */
+typedef struct NativeRunProvenance {
+    /** The submitting Worker's incarnation nonce; all-zero ⇔ nothing stated. */
+    uint8_t owner_instance_id[8];
+    /** Index of the chip child serving the dispatch. */
+    uint32_t chip_rank;
+    /** That child's own count of diagnostic dispatches before this one. */
+    uint32_t capture_index;
+    /** Parent task slot, and this member's place in a grouped dispatch. */
+    uint32_t task_slot;
+    uint32_t group_index;
+    uint32_t group_size;
+    uint32_t reserved;
+} NativeRunProvenance;
+
+/**
  * Ownership token for one pipeline resource slot.
  *
  * `slot_id` selects the per-run/exec-handle copies. `generation` changes every
@@ -208,10 +267,37 @@ typedef struct PipelineSlotLease {
 } PipelineSlotLease;
 
 /**
+ * One run's whole published identity, by value.
+ *
+ * Assembled from a prepared run's descriptor and owned by every stage that
+ * keeps it, so no consumer dereferences the submitter's storage. Deliberately
+ * excludes the descriptor's acceptance sink and its value — a caller pointer
+ * and its sentinel, which must never reach output metadata — and excludes
+ * `run_epoch`, which a retaining collector already holds and publishes from its
+ * own bucket. An all-zero `owner_instance_id` carries the same meaning it has
+ * on `NativeRunProvenance`: nothing was stated, and the rest is not an identity.
+ */
+typedef struct NativeRunArtifactIdentity {
+    uint64_t run_id;
+    uint64_t dispatch_id;
+    uint64_t generation;
+    uint8_t owner_instance_id[8];
+    uint32_t pipeline_slot;
+    uint32_t chip_rank;
+    uint32_t capture_index;
+    uint32_t task_slot;
+    uint32_t group_index;
+    uint32_t group_size;
+} NativeRunArtifactIdentity;
+
+typedef enum NativeRunPreparePurpose { SIMPLER_PREPARE_EAGER = 0, SIMPLER_PREPARE_CAPTURE = 1 } NativeRunPreparePurpose;
+
+/**
  * Immutable resource and trace identity copied into one prepared run.
- * `pipeline_slot` and `arena_bank` must be smaller than
- * PTO_PIPELINE_MAX_DEPTH; they remain explicit because some runtimes map a
- * leased slot to a different arena bank. `run_epoch` is the process-unique
+ * `pipeline_slot` and `arena_bank` must be smaller than the run-resource grant
+ * this context was given (`simpler_set_run_resource_grant_ctx`); they remain
+ * explicit because some runtimes map a leased slot to a different arena bank.
+ * `run_epoch` is the process-unique
  * identity used by later phase calls; lease generation, run id, and dispatch
  * id remain diagnostic after admission. A non-null acceptance sink is written
  * only at the real kernel-launch marker.
@@ -237,6 +323,14 @@ typedef struct NativeRunDescriptor {
      * Worker at launch depth one gets on every run.
      */
     uint32_t joinable_boundary;
+    /** Where this dispatch came from, for diagnostic attribution only. */
+    NativeRunProvenance provenance;
+    /** Host-only purpose, fixed before orchestration. Zero preserves eager.
+     * CAPTURE requires Kernel mode and rejects writable HOST/NONE arguments
+     * before user code runs. All callers must use this descriptor layout. */
+    uint32_t prepare_purpose;
+    /** This execution's immutable CCU controls for AICPU READY admission. Zero without CCU. */
+    uint64_t ccu_workspace_addr;
 } NativeRunDescriptor;
 
 /**
@@ -478,6 +572,16 @@ const PipelineContract *get_pipeline_contract(void);
 /**
  * Create a new device context (heap-allocated DeviceRunner).
  * Each ChipWorker should own one context for the lifetime of its init→finalize cycle.
+ * The caller serializes init/finalize/destroy against other operations on this
+ * handle. The mode latch protects identity, not the runner's whole lifecycle.
+ * finalize_device is additionally serialized against callable registration and
+ * unregistration; initialization and destroy are not.
+ * Finalize must establish resource retirement before destroy; the handle's
+ * immutable mode alone is not evidence that its resources can be released.
+ * An already-fatal Program owner may close with retained unknown runs only
+ * after a reset and its probes confirm generation end. That exceptional zero
+ * return is terminal environment teardown, not successful execution; old run
+ * carriers remain abandoned and subsequent run operations are rejected.
  * @return Opaque handle on success, NULL on failure.
  */
 DeviceContextHandle create_device_context(void);
@@ -509,6 +613,17 @@ size_t get_runtime_alignment(void);
  * context allocates for itself does not come through here and is not nameable by a run.
  */
 void *device_malloc_ctx(DeviceContextHandle ctx, size_t size);
+/** Return zero after releasing storage and its metadata; nonzero leaves the allocation retained. */
+typedef int (*CallerStorageReleaseFn)(void *storage, void *base);
+
+/**
+ * Adopt a fresh allocation. Ownership of storage transfers only on success.
+ * logical_bytes bounds views; physical_bytes includes padding and controls HBM accounting.
+ */
+int device_adopt_caller_buffer_ctx(
+    DeviceContextHandle ctx, void *base, size_t logical_bytes, size_t physical_bytes,
+    CallerStorageReleaseFn release_storage, void *storage
+);
 
 /** Free device memory previously allocated in the given device context. */
 void device_free_ctx(DeviceContextHandle ctx, void *dev_ptr);
@@ -521,9 +636,7 @@ void device_free_ctx(DeviceContextHandle ctx, void *dev_ptr);
  * question and its release cannot be missed.
  *
  * @return 0 when the allocation is gone, PTO_RUNTIME_ERR_INVALID_STATE when a borrow still holds
- *         it — in which case nothing changed. Nothing else: the platform free underneath reports
- *         no status, so 0 means this path did not refuse rather than that the pages are provably
- *         returned.
+ *         it — in which case nothing changed — or the allocator error when storage release fails.
  */
 int device_free_caller_buffer_ctx(DeviceContextHandle ctx, void *dev_ptr);
 
@@ -586,6 +699,42 @@ int device_memory_info_ctx(DeviceContextHandle ctx, DeviceMemoryInfo *info);
 int simpler_set_retain_runs_ctx(DeviceContextHandle ctx, int32_t enabled);
 
 /**
+ * Raise how many retained runs this context's swimlane collector may hold open
+ * at once, and report whether it was granted.
+ *
+ * Optional, and resolved by `dlsym` like the gate above: a module built before
+ * this exports no such symbol, and the caller then keeps the shipped capacity.
+ * A module that exports it still refuses whatever it cannot serve — a limit
+ * outside its range, a runtime with no joined-diagnostic backend, or a
+ * collector already in use — and a refusal changes nothing, so the caller may
+ * carry on at the shipped capacity rather than treating it as an error.
+ *
+ * Returns 0 when the limit is in force. Only a 0 return licenses the caller to
+ * record the larger grant.
+ */
+int simpler_set_retained_epoch_limit_ctx(DeviceContextHandle ctx, int32_t limit);
+
+/**
+ * Tell this context how many run-resource sets its worker granted it, so every
+ * per-run resource is built to that count.
+ *
+ * The module declares in its `PipelineContract` what it can support; a worker
+ * decides how much of that this context uses, and that decision is not derivable
+ * here. So it is published once, after the context is created and before any run
+ * names a set.
+ *
+ * Optional, and resolved by `dlsym` like the gate above: a module built before
+ * this exports no such symbol, and its own default sizing then stands. A module
+ * that exports it refuses a grant it cannot build or one that would change the
+ * meaning of a set a run already holds, and a refusal leaves the previous sizing
+ * in force.
+ *
+ * Returns 0 when the grant is in force. Only a 0 return licenses the caller to
+ * hand this context a set index above its previous sizing.
+ */
+int simpler_set_run_resource_grant_ctx(DeviceContextHandle ctx, uint32_t granted);
+
+/**
  * The name the gate above shipped under, forwarding to it.
  *
  * Both are exported by every runtime module built from this tree, and each is
@@ -597,21 +746,11 @@ int simpler_set_dfx_session_ctx(DeviceContextHandle ctx, int32_t enabled);
 /**
  * Latch a finite workspace budget on this context, once, at init.
  *
- * Ownership of the four workspace regions is not what this asks for: a program
- * context gets that from `simpler_init` whether or not anyone asked. What this
- * adds is the optional finite limit on them. Recorded here and applied by
- * `simpler_init` once the execution mode is latched, so the limit is in place
- * before the eager prewarm allocates. The first accepted request stands: a
- * second call is refused rather than replacing it.
- *
- * Optional capability: a module that does not export this symbol cannot manage
- * workspace, and a caller that asked for a budget must fail rather than run
- * unmanaged. Off by default — a context that never calls this keeps every
- * allocation path it had.
- *
- * Separate from `simpler_init` for the same reason the diagnostics session gate
- * is: the init signature is resolved by name across the runtime .so boundary,
- * so extending it would break every module that does not ship in lockstep.
+ * Both onboard init entries install ownership management without a request.
+ * This adds an optional finite limit, applied before workspace allocation.
+ * The first accepted request stands: a second is refused rather than replacing
+ * it. A module without this symbol cannot honor a requested limit, and the
+ * caller must fail instead of running without that limit.
  *
  * The budget covers the per-slot retained temporary buffer and the three pooled
  * arena regions. It is not a device-wide ceiling; see SimplerWorkspaceReport.
@@ -625,14 +764,9 @@ int simpler_set_workspace_budget_ctx(DeviceContextHandle ctx, uint64_t limit_byt
 /**
  * Ask for workspace ownership management with no byte limit.
  *
- * Retained for compatibility and no longer necessary: `simpler_init` installs
- * the manager on every program context, so a caller that never calls this gets
- * the same ownership. Calling it before init still succeeds and still records a
- * request, which only reserves the once-only slot
- * `simpler_set_workspace_budget_ctx` also uses.
- *
- * A kernel context is still never managed, because the install lives in
- * `simpler_init` and kernel mode has its own entry.
+ * Compatibility entry: both owned and borrowed onboard initialization install
+ * management by default. Calling this before init reserves the once-only
+ * request slot also used by `simpler_set_workspace_budget_ctx`.
  *
  * @return 0 on success, PTO_RUNTIME_ERR_INVALID_ARGUMENT when this context has
  *         already made a request, PTO_RUNTIME_ERR_INVALID_STATE once
@@ -656,6 +790,43 @@ int simpler_enable_workspace_management_ctx(DeviceContextHandle ctx);
 int simpler_get_workspace_report_ctx(DeviceContextHandle ctx, SimplerWorkspaceReport *out, size_t out_bytes);
 
 /**
+ * Let this context size its own run concurrency from the resources it proves.
+ *
+ * Asked once, before anything is prepared, by a caller that was given no
+ * explicit depth and no explicit byte budget. A context that is never asked
+ * admits exactly what it was granted, as it did before.
+ *
+ * @return 0 when the context will size itself, PTO_RUNTIME_ERR_UNSUPPORTED on a
+ *         context that cannot (no managed workspace, or already prepared work)
+ */
+int simpler_enable_automatic_admission_ctx(DeviceContextHandle ctx);
+
+/**
+ * Run-resource sets this context reports it can hold.
+ *
+ * A count of identities, never a byte figure. One until a run has completed its
+ * resource commit; it then grows with what the context has proved and shrinks
+ * when those resources are reclaimed or become unprovable. Equal to the grant
+ * on a context that does not size itself.
+ */
+uint32_t simpler_admissible_run_resource_sets_ctx(DeviceContextHandle ctx);
+
+/**
+ * Give up every resource a saved plan on `pipeline_slot` still holds, and
+ * forget the plan.
+ *
+ * The one entry an abandonment uses for a run whose prepare asked to wait: such
+ * a run holds its input staging reference, the context's growth permission and
+ * whatever its in-flight transaction staged, none of which an unprepared run
+ * holds. Idempotent — a slot with no plan for this epoch reports success.
+ *
+ * @return 0 when the slot holds no plan for `run_epoch` afterwards,
+ *         PTO_RUNTIME_ERR_INVALID_STATE when the run could still have reached
+ *         the device, so its borrows must not be handed back here
+ */
+int simpler_abort_run_plan_ctx(DeviceContextHandle ctx, uint32_t pipeline_slot, uint64_t run_epoch);
+
+/**
  * Publish every diagnostic run this context has closed, then report.
  *
  * Returns 0 when each promised file exists — a published partial counts, an
@@ -664,6 +835,44 @@ int simpler_get_workspace_report_ctx(DeviceContextHandle ctx, SimplerWorkspaceRe
  * collector's own budget.
  */
 int simpler_flush_diagnostics_ctx(DeviceContextHandle ctx, int32_t timeout_ms, char *error, size_t error_capacity);
+
+/**
+ * A snapshot of this context's diagnostic credit progress.
+ *
+ * Monotonic. Every release of a diagnostic output slot or terminal bank
+ * advances it, as does an owner becoming fatal, cancellation and teardown — so
+ * "the value changed" is the whole of what a waiter needs, and no caller has to
+ * name which owner it is waiting for.
+ *
+ * Non-blocking and safe to call while holding the caller's own lane mutex. A
+ * runtime that does not export it leaves the caller with no progress
+ * information, which the caller reads as "re-ask next round".
+ */
+uint64_t simpler_diagnostic_credit_generation_ctx(DeviceContextHandle ctx);
+
+/**
+ * Block until the credit generation differs from `seen`.
+ *
+ * Must NOT be called while holding the caller's lane mutex or any collector
+ * lock: the threads that advance the generation are the collectors' own
+ * writers, and a waiter holding either could stop the release it is waiting
+ * for.
+ *
+ * @return 1 when the generation advanced, 0 when `timeout_ms` elapsed, and a
+ *         negative value when waits were cancelled, the context is shutting
+ *         down, or the handle is not one this runtime owns.
+ */
+int simpler_wait_diagnostic_credit_ctx(DeviceContextHandle ctx, uint64_t seen, int32_t timeout_ms);
+
+/**
+ * Make every present and future credit wait on this context return.
+ *
+ * Non-blocking and idempotent: it sets the cancelled flag, broadcasts, and
+ * returns. It proves nothing about any waiter having left — that is the
+ * caller's own to establish — which is what makes it safe to call from a
+ * thread that is itself inside a guarded call.
+ */
+void simpler_cancel_diagnostic_credit_waits_ctx(DeviceContextHandle ctx);
 
 /** Copy host memory to a device pointer within the given device context. */
 int copy_to_device_ctx(DeviceContextHandle ctx, void *dev_ptr, const void *host_ptr, size_t size);
@@ -742,6 +951,14 @@ int simpler_init(
 );
 
 /**
+ * Required runtime entry for initialization diagnostics; NULL means no detail.
+ * The context owns the returned string; copy it before cleanup, destruction,
+ * or another initialization attempt. Initialization and cleanup are serialized
+ * by the caller. Backends with no detail still export this entry and return NULL.
+ */
+const char *simpler_get_init_error_ctx(DeviceContextHandle ctx);
+
+/**
  * Release all device resources held by the context.
  * Must be called before destroy_device_context() / dlclose(). Returns an error
  * without teardown while a prepared native run remains unfinalized.
@@ -751,7 +968,7 @@ int finalize_device(DeviceContextHandle ctx);
 /* ===========================================================================
  * Per-callable_id preparation
  *
- * The triplet below decouples the one-shot prep work (kernel upload + orch SO
+ * These entries decouple the one-shot prep work (kernel upload + orch SO
  * H2D + caching keyed by `callable_id`) from each `simpler_run` invocation,
  * so the per-run cost shrinks to "rebuild Runtime args + launch". Callers
  * keep a stable small-int `callable_id` per ChipCallable; the platform side
@@ -762,6 +979,20 @@ int finalize_device(DeviceContextHandle ctx);
  * resident until finalize regardless. Register and unregister mutate state
  * referenced by a prepared run, so both are rejected from successful prepare
  * until its matching finalize.
+ *
+ * The table is a slot array on both host and AICPU, and the slot number is
+ * the callable_id itself. A registration occupies one slot until
+ * `unregister_callable`; a later registration may reuse it. Capacity is a
+ * slot count, not a memory budget: with all 64 slots occupied, explicit and
+ * auto-ID registration both fail until an ID is unregistered, and a consumer
+ * whose working set exceeds 64 resident callables must recycle IDs or raise
+ * the table size on both sides in a protocol change.
+ *
+ * Registration and unregistration entry points serialize against each other
+ * on one context, so an auto-ID scan and the slot it claims are atomic with
+ * respect to an explicit-ID claim of the same slot. `finalize_device` takes
+ * the same lock, so teardown cannot clear the registry under a registration.
+ * Runs, initialization and destroy still rely on the caller contract.
  * =========================================================================== */
 
 /**
@@ -775,14 +1006,55 @@ int finalize_device(DeviceContextHandle ctx);
  * `simpler_run(callable_id, ...)` calls reuse this state.
  *
  * `device_id` and the executor binaries are not threaded through this entry
- * — they were captured by `simpler_init` and live on the DeviceRunner.
+ * — they were captured by context initialization and live on the DeviceRunner.
+ * Owned contexts attach their device; borrowed contexts validate the caller
+ * context and register on their context-owned control stream. Unknown device
+ * registration completion retains the callable until context close.
  * Callable-registry mutation is rejected while a native run is prepared or
  * executing on this context.
  *
+ * A callable_id that is already registered is rejected with
+ * PTO_RUNTIME_ERR_INVALID_ARGUMENT; unregister the ID before reusing it.
+ *
  * @return 0 on success, negative on error (NULL ctx, callable_id out of
- *         range, upload/copy failure, or AICPU prewarm failure).
+ *         range or already registered, upload/copy failure, or AICPU
+ *         prewarm failure).
  */
 int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable);
+
+/**
+ * Register on an initialized PROGRAM or KERNEL context with an unused ID.
+ * KERNEL contexts use the kernel preparation path internally. The entry does
+ * not initialize the context; an uninitialized, failed-init or finalized
+ * context returns INVALID_STATE. `callable` points to a canonical ChipCallable
+ * image of exactly `callable_size` bytes, fully validated before it is hashed
+ * or uploaded.
+ *
+ * The registry is shared with explicit-ID registration, so both draw from the
+ * same MAX_REGISTERED_CALLABLE_IDS (64) slots. Each successful call owns a
+ * distinct ID, even for equal images; upload sharing follows the runtime's
+ * existing image cache. Exhaustion returns INVALID_STATE.
+ *
+ * Registration and unregistration serialize internally on the context, so
+ * concurrent auto-ID and explicit-ID registration cannot claim the same slot.
+ * Registration is refused with PTO_RUNTIME_ERR_INTERNAL while a native run is
+ * prepared or executing on the context. finalize_device takes the same lock;
+ * runs, initialization and destroy do not, and callers still order those.
+ *
+ * Explicit-ID registration rejects an already registered ID with
+ * INVALID_ARGUMENT; auto-ID never returns an occupied slot. IDs may be reused
+ * after unregister, so callers retire all users first and discard stale IDs.
+ *
+ * @return 0 on success, PTO_RUNTIME_ERR_INVALID_ARGUMENT for a null output
+ *         pointer or malformed image, PTO_RUNTIME_ERR_INVALID_STATE for an
+ *         uninitialized/wrong-mode context or exhausted slots, and
+ *         PTO_RUNTIME_ERR_INTERNAL for an outstanding native run or an
+ *         unexpected failure. On failure *out_callable_id is -1 and cleanup
+ *         ownership stays with the runtime.
+ */
+int simpler_register_callable_v2(
+    DeviceContextHandle ctx, const void *callable, size_t callable_size, int32_t *out_callable_id
+);
 
 /**
  * Launch a callable previously staged via `simpler_register_callable`.
@@ -826,9 +1098,13 @@ int simpler_run(
  * Build and bind one run into caller-owned opaque storage without launching it.
  * A successful prepare must be paired with simpler_finalize_run(), even when
  * launch is abandoned or fails. The `args` container itself is consumed during
- * prepare and need not remain alive afterward, but every tensor backing buffer
- * referenced by it must remain valid through finalize (which may copy results
- * back to those addresses). See the storage size/alignment/lifetime contract at
+ * prepare and need not remain alive afterward. Eager tensor backing buffers
+ * must remain valid through finalize, including Program output delivery. After
+ * successful capture-purpose preparation, readonly HOST/NONE control values
+ * have been consumed and their source backing may be released. Borrowed device
+ * tensors and the execution environment must survive all model/external uses
+ * through resource-reference release, even after the Host run is finalized.
+ * See the storage size/alignment/lifetime contract at
  * the top of this header. `descriptor` is required and copied before this
  * function returns. A non-null acceptance sink in the descriptor must remain
  * valid until launch returns or the prepared run is finalized without launch.
@@ -838,8 +1114,27 @@ int simpler_run(
  * must be DEVICE/NONE or HOST/NONE; host tensor consumption is supported only
  * by a host-orchestrating runtime. No implicit tensor transfer is performed.
  * This preparation can allocate and synchronously publish metadata and must
- * run outside capture. Kernel execution is not supported yet: launch remains
- * rejected, including through simpler_launch_run().
+ * run outside capture. Borrowed execution requires simpler_launch_run_on_stream;
+ * the legacy simpler_kernel_mode_launch entry remains unsupported.
+ *
+ * A clean failed preparation writes a host-only release marker and this
+ * descriptor's run_epoch into its destroyed carrier storage. This marker is
+ * consumed by ChipWorker; zero only means destruction, not input release.
+ * Missing, stale or unrecognized markers do not permit releasing inputs.
+ * Failed prepare storage can be reused directly; prepare clears an unconsumed
+ * release marker before constructing its next carrier.
+ *
+ * Onboard prepare is non-reentrant on one thread within a loaded runtime
+ * module, including calls for a different context or through simpler_run().
+ * A nested call returns PTO_RUNTIME_ERR_INVALID_STATE before validating its
+ * arguments or modifying runtime storage, reservations, plans, or acceptance
+ * sinks. The outer prepare remains owned until it returns or unwinds; a later
+ * sequential call is permitted. This guard does not serialize different
+ * threads, which remain subject to the context's native reservation rules.
+ *
+ * Capture callers set descriptor.prepare_purpose before preparation. HOST/NONE
+ * controls must be IN: their prepare-time values determine fixed task arguments,
+ * not values re-read by each replay. Eager preparation cannot later be recorded.
  */
 int simpler_prepare_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
@@ -859,6 +1154,46 @@ int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx);
  * execution failure before the marker leaves it unchanged.
  */
 int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime);
+
+/**
+ * Check the execution environment and reject capture before per-call preparation.
+ * No run is admitted or published. A successful check does not reserve the stream;
+ * the caller serializes capture changes and keeps it live through finalization.
+ */
+int simpler_validate_caller_stream(DeviceContextHandle ctx, void *caller_stream);
+
+/**
+ * Validate the current borrowed RTS context before changing host run state.
+ * Owned/unclaimed contexts impose no current-context requirement. This call
+ * neither binds a device nor mutates resources; restoration permits retry.
+ */
+int simpler_validate_execution_context(DeviceContextHandle ctx);
+
+/**
+ * Submit a prepared native run between the caller stream's preceding and
+ * following work. For eager execution, the caller retains its stream and
+ * external tensor storage through run finalization. For recording, the borrowed
+ * execution environment, stream and device tensors remain valid through all
+ * model/external uses and resource-reference release. Prepare runs outside
+ * capture. An active capture requires a resource reference retained before
+ * CaptureBegin and no predecessor. Supported diagnostics are ScopeStats alone
+ * on A3 TMR, or one of PMU, ArgsDump and Swimlane on A3 TMR/HBG. The same task sequence is
+ * recorded once; an invalidated capture is refused before publication.
+ * `predecessor`, when non-null outside capture, has the joined-launch contract.
+ *
+ * Both owned and borrowed contexts use the same native run. A borrowed context
+ * requires this explicit stream entry. Poll/wait/finalize retain the run and
+ * its event references through the caller's exit wait. A partial enqueue
+ * failure in eager poisons the execution domain; it is not a rollback permission.
+ * During recording, poll/wait do not report execution completion; finalize
+ * ends only the Host run without synchronization or output copyback. RTS owns
+ * failed/cancelled capture teardown. The external reference must survive it.
+ * Host recording support does not qualify the runtime's device replay reset
+ * protocol; repeated hardware replay still requires that implementation.
+ */
+int simpler_launch_run_on_stream(
+    DeviceContextHandle ctx, RuntimeHandle runtime, void *caller_stream, RuntimeHandle predecessor
+);
 
 /**
  * Return nonzero when this context can order one prepared run's native
@@ -900,8 +1235,10 @@ int supports_joined_diagnostic_launch_ctx(DeviceContextHandle ctx, RuntimeHandle
  *
  * The successor's native submission reaches the device while the predecessor is
  * still executing; the device still executes one at a time, ordered by a queued
- * wait for the predecessor's whole-operator completion boundary. Neither run's
- * results, outputs or errors are shared: each is decided from its own evidence.
+ * wait for the predecessor's whole-operator completion boundary. Each call
+ * retains its own results and output backing. Explicit observation synchronizes
+ * that call's retained streams, so later work on those streams can affect its
+ * latency or returned SDK error; per-call SDK error isolation is not promised.
  *
  * Returns PTO_RUNTIME_ERR_UNSUPPORTED, having changed nothing, when this
  * context, this runtime or this moment cannot order the two — the run is still
@@ -912,23 +1249,103 @@ int supports_joined_diagnostic_launch_ctx(DeviceContextHandle ctx, RuntimeHandle
 int simpler_launch_run_joined(DeviceContextHandle ctx, RuntimeHandle runtime, RuntimeHandle predecessor);
 
 /**
- * Non-blocking device-completion query. Returns
- * SIMPLER_NATIVE_RUN_POLL_NOT_READY, SIMPLER_NATIVE_RUN_POLL_COMPLETE, or a
- * negative validation, phase, or device-query error. COMPLETE is published
- * only after the executor has also finished host-side drain work. Polling
- * never releases the prepared run's resources; call only after
- * simpler_launch_run() returns.
+ * Nonblocking own-execution completion query after launch. Returns POLL_*.
+ * COMPLETE proves owned physical retirement, without reading semantic status
+ * or copying Program outputs. The live call still requires wait/finalize.
  */
 int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 
-/** Wait for device execution to terminate. Does not release prepared resources. */
+/**
+ * Internal blocking physical progress under the runtime's existing timeout.
+ * Zero proves own boundaries and queued-wait consumption, and retires execution
+ * resources. Never synchronizes whole streams or reads the private result.
+ * An error retains unresolved debt and does not prove device stop.
+ */
+int simpler_wait_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime);
+
+/**
+ * Observe the actual run streams once; may include later queued work.
+ * For a valid launched run, SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE means the
+ * operation failed before observation; retain the run for retry. Every other
+ * return records the observer result, not proof of physical completion; use
+ * poll or wait_run_completion to establish that separate fact.
+ * The reserved incomplete code is never a terminal run result. Host consumers
+ * and runtime modules must be rebuilt together for this contract.
+ */
 int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 
 /**
  * Wait if needed, validate/copy results, and release the opaque prepared run.
  * Also safely aborts a run that was prepared but never launched.
+ * A launch explicitly known not to have submitted execution-visible work
+ * leaves its epoch release marker after successful cleanup. A returned
+ * NotStarted transaction supplies that fact; a backend exception or an absent
+ * ActiveExecution alone does not. The original launch error remains observable.
+ * Onboard binding-cleanup failure keeps the carrier live for a finalize retry;
+ * returned copyback is not repeated and the carrier cannot be launched again.
  */
 int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime);
+
+/**
+ * Internal worker finalization: observe and release the run while permitting
+ * (1) or withholding (0) successful Program HOST-output delivery. A rejected
+ * result still owes the same drain and ownership cleanup. The run's own native
+ * status is returned unchanged; an earlier lane failure is reported by its
+ * caller. This operation is required before a worker accepts any run.
+ */
+int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs);
+
+// Internal same-build framework owner operations. Transfer requires independently
+// retired eager DEVICE/NONE work without requested diagnostics/model references.
+// Observation acknowledges a stored original pair only on a returned zero.
+// A prior error remains the return verdict even after all_observed becomes one.
+int simpler_transfer_completed_kernel_run(DeviceContextHandle ctx, RuntimeHandle runtime);
+int simpler_observe_framework_submissions(DeviceContextHandle ctx, int *all_observed);
+
+/**
+ * Retain preparation backing independently of the original Prepared run;
+ * exactly one retention is allowed per run. Kernel capture-purpose preparations
+ * allow an already ACTIVE caller stream, verified by its actual capture status.
+ * Other preparations require a caller stream outside recording.
+ * The output is a resource reference, not an executable RuntimeHandle. The
+ * caller still finalizes the original run. Success submits no user task and
+ * does not advertise capture/replay support on this backend.
+ *
+ * Onboard Program and Kernel retain their actual internal backing, including
+ * Program input staging; Program execution remains eager-only. Kernel A3 TMR
+ * additionally retains ScopeStats-only diagnostic windows; onboard A3/A5
+ * retain PMU-only, ArgsDump-only or Swimlane-only windows when the runtime
+ * provides the requested task-time producer. All producers sharing a
+ * diagnostic pool must be caller-ordered
+ * and stopped during resource-reference release. Other diagnostic combinations
+ * are refused; sim returns
+ * UNSUPPORTED. Borrowed context, caller stream and device tensor addresses
+ * must remain valid through successful release. Internal code,
+ * workspace, staging, arguments, streams and events stay protected.
+ */
+int simpler_retain_run_resources(
+    DeviceContextHandle ctx, RuntimeHandle runtime, void *caller_stream, RuntimeHandle *out_reference
+);
+
+/**
+ * The caller must first finish capture cancellation/model destruction and ALL
+ * external in-flight uses, including uses on other execution streams. This
+ * call cannot infer those facts from a recording stream or a reference count.
+ * It additionally synchronizes the retained caller stream and respects the
+ * original run's device/wait/binding completion obligations.
+ *
+ * On failure the reference remains valid for release retry; after close has
+ * begun it must never be used for execution. After confirmed owned Program
+ * reset, existing resource retirement can consume release-requested references;
+ * those tokens are then invalid even if close returns an earlier device error
+ * or a later cleanup error. The close return code alone proves neither reset
+ * confirmation nor whether a reference remains valid. Borrowed contexts never
+ * reset the caller's device. On ordinary release success the reference is consumed.
+ * Backing still needed by the original run or reusable caches may remain
+ * allocated. This API is not called once per replay and must not be called
+ * directly from a callback that forbids synchronization/device APIs.
+ */
+int simpler_release_run_resources(DeviceContextHandle ctx, RuntimeHandle reference);
 
 /**
  * Committed GM heap base of one arena bank, or 0 when that bank has never been
@@ -1025,6 +1442,27 @@ size_t get_host_dlopen_count(DeviceContextHandle ctx);
 size_t get_run_stream_set_create_count(DeviceContextHandle ctx);
 
 /**
+ * Which device-side scheduler the most recent bind on `ctx` selected, as a
+ * SCHEDULER_RUNTIME_MODE_* value; 0 means no bind has published a selection.
+ *
+ * Optional: ChipWorker resolves it with a bare dlsym, so a module that does not
+ * export it is a fact about the backend rather than a stale build. Only the a5
+ * host_build_graph runtime publishes a selection — every other arch and runtime
+ * reports 0 because nothing ever calls the recording hook.
+ *
+ * The value is latched by the runner, not read back from the runtime: the
+ * launch descriptor's copy is cleared when a run releases its bindings.
+ */
+uint32_t get_last_scheduler_runtime_mode(DeviceContextHandle ctx);
+
+/**
+ * How many times a bind on `ctx` has published a scheduler selection. Separates
+ * "this bind selected again" from "the latch still holds an older run's value",
+ * which a mode alone cannot express. Optional, like the getter above.
+ */
+size_t get_scheduler_mode_publish_count(DeviceContextHandle ctx);
+
+/**
  * Copy out what this context's `finalize_device` observed about its own device
  * teardown.
  *
@@ -1055,13 +1493,14 @@ int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
  * which init entry runs first. simpler_init latches program mode — the
  * exclusive-device path driven through the prepared-run family
  * above. simpler_kernel_mode_init latches kernel mode, which borrows the
- * caller's already-current device and caller-owned stream to enqueue one
- * bounded asynchronous operator per launch: no device reset, no caller-stream
- * or device synchronize on any path, zero allocation at launch, and no
- * capture/model-state queries, so a launch is capturable by ACLGraph as an
- * ordinary node. Cold-path bring-up and registration do synchronize a
- * context-owned stream — both run outside capture; the launch path
- * synchronizes nothing at all.
+ * caller's already-current device. Native eager uses simpler_prepare_run,
+ * simpler_launch_run_on_stream, and the shared poll/wait/finalize family.
+ * Its caller edges order the whole operator on the explicitly supplied stream.
+ * No borrowed path resets or synchronizes the whole device. Cold-path bring-up
+ * and registration synchronize a context-owned stream; partial enqueue cleanup
+ * may synchronize the bound caller and private streams to prove references are
+ * consumed. Capture/replay and the legacy simpler_kernel_mode_launch entry
+ * remain unsupported.
  *
  * Identity is a write-once property of the context, not a state that evolves:
  * ExecutionModeLatch on the platform runner holds it, the first init entry to
@@ -1076,11 +1515,12 @@ int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
  *
  * Each call supplies its own config. TMR init validates config-derived scratch
  * sizes; HBG declares per-run banks whose sizes are determined at bind time.
- * Neither declaration commits those arenas. The kernel arena guard fixes each
- * region's capacity at its first commit: a later growth or release request
- * returns PTO_RUNTIME_ERR_INTERNAL. A caller needing larger regions must
- * finalize its runs and close the context before creating another context.
- * This resource guard alone does not establish capture support.
+ * Neither declaration commits those arenas. Native eager calls reuse an arena
+ * while its capacity suffices and transactionally replace it when more is
+ * needed. Native-run admission protects a shared bank; HBG per-run banks may
+ * prepare independently. Failed staging preserves the committed regions.
+ * Capture/replay remains unsupported; graph retention of arena addresses is
+ * not provided by this eager resource lifecycle.
  *
  * Every host_runtime.so exports all four entries below, so a consumer resolves
  * them unconditionally like the rest of the uniform ABI; supported answers the
@@ -1100,8 +1540,8 @@ int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
  * Structural argument errors return PTO_RUNTIME_ERR_INVALID_ARGUMENT before
  * capability or lifecycle checks. These entries accept only POD structs,
  * serialized blobs, and device/stream pointers — never framework objects.
- * The caller stream is always an explicit parameter and is never stored
- * beyond the call or destroyed by simpler.
+ * The caller stream is explicit and borrowed: a native execution retains its
+ * handle through finalization, and simpler never destroys it.
  * =========================================================================== */
 
 /**
@@ -1110,11 +1550,13 @@ int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
  * Launches, not resources: it stays zero while simpler_kernel_mode_launch is a
  * rejecting stub, including on a runtime whose simpler_kernel_mode_init already
  * establishes a kernel context. Both onboard runtimes support initialization
- * and per-invocation preparation; simulated components refuse kernel init
+ * and the shared native eager path via simpler_launch_run_on_stream. This
+ * legacy capability bit does not advertise that native entry. Simulated
+ * components refuse kernel init
  * with PTO_RUNTIME_ERR_UNSUPPORTED and establish nothing.
  *
  * This is the capability question a caller asks before choosing between the
- * kernel-mode entries and the program-mode prepared-run family. It is callable
+ * legacy kernel-mode entries and the shared native-run family. It is callable
  * on a context that create_device_context() has returned but that no init has
  * touched; at that point the context exists but names no device —
  * create_device_context() takes no device and device_id_ is still unset — so an
@@ -1129,7 +1571,7 @@ int simpler_kernel_mode_supported(DeviceContextHandle ctx);
  *
  * A successful call latches kernel mode on the context — mutually exclusive
  * with the program-mode simpler_init — and the latch controls the
- * kernel-mode guards on the platform's device/ACL lifecycle and arena paths.
+ * kernel-mode guards on the platform's device/ACL lifecycle.
  *
  * Takes no device ownership: no device reset and no ACL init/finalize. Creates
  * only context-owned persistent handles used by asynchronous preparation and
@@ -1182,13 +1624,21 @@ int simpler_kernel_mode_init(
  * synchronizes a caller stream or the device. Preparation neither accepts nor
  * retains a caller stream; the current caller/capture stream is supplied
  * independently to each launch.
+ *
+ * A callable_id that is already registered is rejected with
+ * PTO_RUNTIME_ERR_INVALID_ARGUMENT. Registration is refused with
+ * PTO_RUNTIME_ERR_INTERNAL while a native run is prepared or executing on the
+ * context; retire the run before reusing the registry.
  */
 int simpler_kernel_mode_prepare_callable(
     DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size
 );
 
 /**
- * Enqueue one bounded asynchronous kernel-mode operator invocation.
+ * Reserved legacy single-call entry; currently a rejecting stub.
+ * Native eager callers use simpler_prepare_run and simpler_launch_run_on_stream.
+ *
+ * The intended single-call contract is:
  *
  * `args` points to a ChipStorageTaskArgs POD whose tensor addresses are
  * caller-owned device addresses; they are passed through without ever being

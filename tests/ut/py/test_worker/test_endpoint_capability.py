@@ -79,7 +79,8 @@ def test_submit_sub_accepts_host_tensor():
         w.run(orch)
         shm_buf = shm.buf
         assert shm_buf is not None
-        assert bytes(shm_buf[:4]) == b"\x2a\x00\x00\x00"
+        with shm_buf:
+            assert bytes(shm_buf[:4]) == b"\x2a\x00\x00\x00"
     finally:
         w.close()
 

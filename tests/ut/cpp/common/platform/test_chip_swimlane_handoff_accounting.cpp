@@ -37,13 +37,14 @@
 #include "common/scheduler_profiling.h"
 #include "host/chip_swimlane_collector.h"
 #include "support/test_task_id.h"
+#include "profiler_test_allocator.h"
 
 using Handoff = ChipSwimlaneCollector::HandoffVerdict;
 using Coverage = ChipSwimlaneCollector::HandoffCoverage;
 
 namespace {
 
-void *ha_alloc(size_t size) { return std::calloc(1, size); }
+void *ha_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int ha_free(void *ptr) {
     std::free(ptr);
@@ -70,7 +71,7 @@ void arm_run(
     set_platform_chip_swimlane_run_terminal_bank(
         reinterpret_cast<uint64_t>(collector.arm_run_terminal_bank(/*bank_index=*/0, epoch))
     );
-    chip_swimlane_aicpu_init(num_aicore);
+    chip_swimlane_aicpu_init(num_aicore, level);
 }
 
 // Dispatch `records` AICore tasks on `core_id`, writing each slot so the host

@@ -3,7 +3,7 @@
 Architecture and contracts for the host and device logging subsystem.
 
 For the user-facing level model and CLI flags, see
-[testing.md § Log levels](testing.md#log-levels). This document covers the
+[test CLI log levels](testing/cli.md#log-levels). This document covers the
 implementation, cross-DSO state ABI, build wiring, and output formats.
 
 ## Mental model
@@ -35,7 +35,9 @@ Device logging:
 ```
 
 One threshold controls `DEBUG / INFO / TIMING / WARN / ERROR`; `NUL` suppresses
-all output. The values match Python logging (`10 / 20 / 25 / 30 / 40 / 60`).
+these standard levels. Python still applies `level >= threshold`, so records at
+level 60 or higher can reach Python handlers even with `--log-level null`.
+The values match Python logging (`10 / 20 / 25 / 30 / 40 / 60`).
 CANN has no TIMING level, so onboard setup maps both TIMING and WARN to CANN
 WARN. The default TIMING threshold keeps host `[STRACE]` markers without
 opening CANN's INFO stream.
@@ -185,6 +187,9 @@ typedef struct SimplerHostLogState {
     uint64_t sink_producer_state;
     uint64_t dropped_by_reason[4];
     uint64_t reported_drop_count;
+    uint64_t trace_key_plus_one;
+    uint64_t trace_error_reported;
+    uint64_t trace_next_invocation;
 } SimplerHostLogState;
 
 int simpler_host_log_bind_state(SimplerHostLogState *state);
@@ -199,6 +204,28 @@ is compiled from this repository in the same build, and the orchestration SOs
 compiled at run time hash this header's whole include closure into their
 scene-test cache key, so a stale layout cannot reach a binding. A module that
 binds is rejected only for a null pointer or a threshold outside the ladder.
+
+The process owner initializes one STRACE pthread key when it seeds the log
+level or adopts externally supplied state. `trace_key_plus_one` publishes that
+key to bound consumers; zero leaves tracing disabled. Consumers never create or
+delete it. The key intentionally lives until process exit, independently of
+writer stop/restart and business-module unload. Its values contain only the
+invocation ID, depth and callable hash, are allocated with `calloc`, and are
+freed at thread exit by libc `free`. No callback points into an unloadable
+consumer. The process owner must remain resident, as it already must for the
+shared logger state. A transient module must bind rather than seed its own state.
+
+Trace allocation and `pthread_setspecific` failures leave the affected scope
+disabled; a failed assignment frees the new value. Key creation failure leaves
+tracing disabled for that owner. A direct stderr diagnostic is emitted at most
+once per shared log state. This failure diagnostic is an exception to the normal
+record routing and producer I/O rules: it always goes to stderr, even after
+`set_log_directory()`, and does not pass through the log queue. Context scopes
+restore their borrowed thread state on normal and exceptional exit; all bound
+modules on the same thread share it.
+Invocation IDs come from the shared state's atomic counter, starting at 1; zero
+means no invocation has been allocated. Every consumer
+must be rebuilt with the state layout above.
 
 Only `simpler_host_log_bind_state` is exported from a host logging consumer.
 `HostLogger` and every `unified_log_*` definition are hidden. This avoids
@@ -324,7 +351,7 @@ message tag.
 | ----- | ------ | ------ |
 | Python import | Register `TIMING` / `NUL`; default the `simpler` logger to TIMING | `python/simpler/_log.py` |
 | `Worker.init()` | Normalize the Python level, attach it to the host logger, quiesce an old writer before local forks, then start a new writer after the final fork | `python/simpler/worker.py` |
-| `ChipWorker.init()` | Re-seed inherited native state in a chip child, then enter C++ | `python/simpler/task_interface.py` |
+| `_initialize_chip_runtime()` | Re-seed inherited native state for every chip route — direct L2, a chip child, and the compatibility `ChipWorker` — then enter C++ | `python/simpler/task_interface.py` |
 | `_ChipWorker.init()` | Load sim context and host runtime, then bind each module's logger state | `src/common/worker/chip_worker.cpp` |
 | `simpler_init` | Onboard maps the bound threshold to CANN; attach and take executor binaries | `src/common/platform/{onboard,sim}/host/c_api_shared.cpp` |
 | Nested host load | Bind generated host orchestration/AICore logger state before entry | runtime maker / sim device runner |
@@ -452,7 +479,7 @@ There is no logger build step or logger field in `RuntimeBinaries`. Instead:
 
 | You want to … | Look at |
 | ------------- | ------- |
-| Change the user-facing level model | `python/simpler/_log.py` and `docs/testing.md` |
+| Change the user-facing level model | `python/simpler/_log.py` and `docs/testing/cli.md` |
 | Change host output or STRACE grammar | `src/common/log/host_log.cpp` |
 | Change the shared-state ABI | `src/common/log/include/common/host_log_state.h` |
 | Change sim AICPU adaptation | `src/common/platform/sim/aicpu/device_log.cpp` |

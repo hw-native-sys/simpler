@@ -14,9 +14,7 @@
 
 #include "aicpu/platform_regs.h"
 
-// a2a3 retires a whole AICore group through one entry, against a deadline; a5 has no
-// equivalent, which is why this stub is per-target rather than beside the test. The
-// stall-dump tests never reach it — only the link does.
+// Stall-dump tests do not execute retirement; these stubs satisfy the link.
 int32_t __attribute__((weak))
 platform_retire_aicore_group(const AicoreExitTarget *, size_t count, uint64_t, bool *released) {
     if (released != nullptr) {

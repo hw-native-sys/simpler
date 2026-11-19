@@ -53,7 +53,7 @@ static void submit_spmd_mix(
     CoreTaskArgs args;
     args.add_inout(out);
     args.add_scalar(base_cl);
-    args.launch_spec.set_core_num(block_num);
+    args.launch_spec.set_block_num(block_num);
     rt_submit_task(mk, args);
 }
 

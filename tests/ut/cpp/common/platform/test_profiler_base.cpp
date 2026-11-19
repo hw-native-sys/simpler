@@ -27,6 +27,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
+#include <memory>
+#include <system_error>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -37,6 +40,53 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include "profiler_test_allocator.h"
+
+namespace profiling_common {
+
+// Drives the real cut/consume/control paths without starting worker threads.
+// No transport algorithm or snapshot calculation is reimplemented here.
+struct ProfilerBaseTestPeer {
+    template <typename Collector>
+    static int arm(Collector &collector, uint64_t *request) {
+        collector.set_run_counters(true);
+        return collector.cut_arm(request);
+    }
+    template <typename Collector, typename Header>
+    static void boundary(Collector &collector, Header *header, int shard) {
+        collector.run_drain_boundary(header, shard, collector.manager().shard_count());
+    }
+    template <typename Collector>
+    static auto snapshot(const Collector &collector, int slot) {
+        return collector.transport_failure_snapshot(slot);
+    }
+    template <typename Collector>
+    static bool done(const Collector &collector, int slot) {
+        return collector.cut_stage2_done(slot);
+    }
+    template <typename Collector>
+    static void deliver(Collector &collector, int queue, int shard) {
+        collector.note_buffer_delivered(queue, shard);
+    }
+    template <typename Collector>
+    static void consume(Collector &collector, const typename Collector::ReadyBufferInfo &info, int shard) {
+        collector.consume(info, shard);
+    }
+    template <typename Collector>
+    static bool release_without_readers(Collector &collector, uint64_t *request) {
+        return collector.request_run_reference_release(0, request);
+    }
+    template <typename Collector>
+    static void acknowledge(Collector &collector, int shard, uint64_t request) {
+        collector.control_acked_[shard].store(request, std::memory_order_release);
+    }
+    template <typename Collector>
+    static void log(const Collector &collector, int slot, uint64_t cut_request, uint64_t reference_request) {
+        collector.log_transport_failure("test-failure", 7001, slot, cut_request, reference_request);
+    }
+};
+
+}  // namespace profiling_common
 
 namespace {
 
@@ -140,7 +190,7 @@ public:
         };
         this->set_memory_context(
             [](size_t size) {
-                return std::calloc(1, size);
+                return profiler_test_calloc(size);
             },
             nullptr,
             [](void *ptr) {
@@ -801,7 +851,9 @@ TEST(ProfilerBaseTest, FailedBufferCopyLeavesTheEntryUnacknowledged) {
             buffer_copy_attempts.fetch_add(1, std::memory_order_relaxed);
             if (copy_buffer_fails.load(std::memory_order_relaxed)) return -1;
         }
-        std::memcpy(dst, src, size);
+        // This fixture identity-maps device and host storage. Copying a header
+        // field onto itself can write a stale value over a concurrent publish.
+        if (dst != src) std::memcpy(dst, src, size);
         return 0;
     };
 
@@ -842,7 +894,7 @@ TEST(ProfilerBaseTest, PermanentlyFailingCopyIsRetiredSoQuiesceCompletes) {
     uint64_t buffer = 0;
     auto copy = [&](void *dst, const void *src, size_t size) {
         if (src == &buffer) return -1;
-        std::memcpy(dst, src, size);
+        if (dst != src) std::memcpy(dst, src, size);
         return 0;
     };
 
@@ -943,4 +995,124 @@ TEST(ProfilerBaseTest, UnresolvableEntryWithholdsAnUnownedBufferFromTeardown) {
 
     const std::vector<void *> released = released_at_teardown(collector);
     EXPECT_EQ(std::find(released.begin(), released.end(), &foreign), released.end());
+}
+
+TEST(ProfilerBaseTest, FailureSnapshotSeparatesCaptureFromDrainCompletion) {
+    using Peer = profiling_common::ProfilerBaseTestPeer;
+    TestHeader header{};
+    TestCollector<PerThreadModule> collector;
+    collector.init(2, &header);
+    uint64_t request = 0;
+    const int slot = Peer::arm(collector, &request);
+    ASSERT_GE(slot, 0);
+    header.queue_tails[0] = 1;
+    Peer::boundary(collector, &header, 0);
+    Peer::boundary(collector, &header, 1);
+
+    const auto snapshot = Peer::snapshot(collector, slot);
+    EXPECT_EQ(snapshot.shard_count, 2);
+    EXPECT_EQ(snapshot.queue_count, 2);
+    EXPECT_EQ(snapshot.shards[0].capture_ack, request);
+    EXPECT_EQ(snapshot.shards[1].capture_ack, request);
+    EXPECT_EQ(snapshot.shards[0].stage1, 0);
+    EXPECT_EQ(snapshot.shards[1].stage1, 1);
+    EXPECT_EQ(snapshot.queues[0].state, 1);
+    EXPECT_EQ(snapshot.queues[0].consumed, 0u);
+    EXPECT_FALSE(Peer::done(collector, slot));
+    Peer::log(collector, slot, request, 0);
+    EXPECT_FALSE(Peer::done(collector, slot));
+    EXPECT_EQ(header.queue_heads[0], 0u);
+}
+
+TEST(ProfilerBaseTest, FailureSnapshotSeparatesDrainFromCollectorCompletion) {
+    using Peer = profiling_common::ProfilerBaseTestPeer;
+    TestHeader header{};
+    TestCollector<PerThreadModule> collector;
+    collector.init(2, &header);
+    uint64_t request = 0;
+    const int slot = Peer::arm(collector, &request);
+    ASSERT_GE(slot, 0);
+    // A real delivery advances the watermark; consume has not run yet.
+    Peer::deliver(collector, 1, 1);
+    Peer::boundary(collector, &header, 0);
+    Peer::boundary(collector, &header, 1);
+    const auto before = Peer::snapshot(collector, slot);
+    EXPECT_EQ(before.shards[1].stage1, 1);
+    EXPECT_EQ(before.shards[1].watermark, 1u);
+    EXPECT_EQ(before.shards[1].processed, 0u);
+    EXPECT_FALSE(Peer::done(collector, slot));
+    Peer::log(collector, slot, request, 0);
+    EXPECT_FALSE(Peer::done(collector, slot));
+
+    uint64_t buffer = 0;
+    Peer::consume(collector, TestReadyBufferInfo{&buffer, &buffer, 1}, 1);
+    const auto after = Peer::snapshot(collector, slot);
+    EXPECT_EQ(after.shards[1].processed, 1u);
+    EXPECT_EQ(collector.collected(), 1);
+    EXPECT_TRUE(Peer::done(collector, slot));
+}
+
+TEST(ProfilerBaseTest, FailureSnapshotNamesUnacknowledgedReferenceShard) {
+    using Peer = profiling_common::ProfilerBaseTestPeer;
+    TestHeader header{};
+    TestCollector<PerThreadModule> collector;
+    collector.init(2, &header);
+    // Only shard zero has answered the next request. No readers are running,
+    // so the real control wait must fail even with an immediate test deadline.
+    Peer::acknowledge(collector, 0, 1);
+    uint64_t request = 99;
+    EXPECT_FALSE(Peer::release_without_readers(collector, &request));
+    EXPECT_EQ(request, 1u);
+    const auto before = Peer::snapshot(collector, -1);
+    EXPECT_EQ(before.cut_state, -1);
+    EXPECT_EQ(before.control_epoch, request);
+    EXPECT_EQ(before.shards[0].control_ack, request);
+    EXPECT_EQ(before.shards[1].control_ack, 0u);
+    Peer::log(collector, -1, 0, request);
+    const auto after = Peer::snapshot(collector, -1);
+    EXPECT_EQ(after.control_epoch, before.control_epoch);
+    EXPECT_EQ(after.shards[1].control_ack, before.shards[1].control_ack);
+}
+
+TEST(ProfilerBaseTest, FailedStartJoinsEveryCreatedThreadBeforeRetry) {
+    // Two drain threads, one replenisher and two collectors.
+    for (int fail_at = 0; fail_at < 5; ++fail_at) {
+        SCOPED_TRACE(fail_at);
+        TestHeader header{};
+        TestCollector<PerThreadModule> collector;
+        collector.init(2, &header);
+        int attempts = 0;
+        std::vector<std::weak_ptr<int>> closures;
+        EXPECT_THROW(
+            collector.start([&](std::function<void()> fn) {
+                if (attempts++ == fail_at) throw std::system_error(EAGAIN, std::generic_category());
+                auto token = std::make_shared<int>(0);
+                closures.push_back(token);
+                return std::thread([fn = std::move(fn), token = std::move(token)] {
+                    (void)token;
+                    fn();
+                });
+            }),
+            std::system_error
+        );
+        const bool joined = std::all_of(closures.begin(), closures.end(), [](const auto &token) {
+            return token.expired();
+        });
+        EXPECT_TRUE(joined);
+        EXPECT_FALSE(collector.collector_threads_started());
+        // Keep the regression safe to run against the broken implementation.
+        if (joined && !collector.collector_threads_started()) {
+            int restarted = 0;
+            collector.start([&](std::function<void()> fn) {
+                ++restarted;
+                return std::thread(std::move(fn));
+            });
+            EXPECT_EQ(restarted, 5);
+            collector.quiesce();
+        }
+        collector.stop(false);
+        collector.manager().release_all_owned([](void *ptr) {
+            std::free(ptr);
+        });
+    }
 }

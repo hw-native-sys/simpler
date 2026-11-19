@@ -112,10 +112,30 @@ void SchedulerContext::complete_slot_task(
         volatile DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][expected_reg_task_id & 1];
         int32_t slab_err = deferred_slab->error_code;
         if (slab_err != SIMPLER_ERROR_NONE) {
+            // Publish the primary fatal before diagnostics: a concurrent tensor
+            // timeout must not win after this completion has reported failure.
+            // Preserve a scheduler error that was already observed before us.
+            const int32_t prior_sched_error = sched_->sm_header->sched_error_code.load(std::memory_order_acquire);
+            const int32_t primary_error = prior_sched_error == SIMPLER_ERROR_NONE ? slab_err : prior_sched_error;
             int32_t expected = SIMPLER_ERROR_NONE;
-            sched_->sm_header->sched_error_code.compare_exchange_strong(
-                expected, slab_err, std::memory_order_acq_rel, std::memory_order_acquire
-            );
+            if (sched_->sm_header->orch_error_code.compare_exchange_strong(
+                    expected, primary_error, std::memory_order_acq_rel, std::memory_order_acquire
+                )) {
+                LOG_ERROR(
+                    "Kernel failure: code=%d task=0x%llx func=%d block=%d core=%d primary_code=%d", slab_err,
+                    (unsigned long long)TaskId::to_uint64(slot_state.task->task_id),
+                    slot_state.task->kernel_id[static_cast<int32_t>(subslot)],
+                    payload_per_core_[core_id][expected_reg_task_id & 1].local_context.block_idx, core_id, primary_error
+                );
+            }
+            // Keep the scheduler channel's own first code/thread diagnostic.
+            // The Host primary is the common fatal-channel CAS winner above.
+            expected = SIMPLER_ERROR_NONE;
+            if (sched_->sm_header->sched_error_code.compare_exchange_strong(
+                    expected, slab_err, std::memory_order_acq_rel, std::memory_order_acquire
+                )) {
+                sched_->sm_header->sched_error_thread.store(thread_idx, std::memory_order_relaxed);
+            }
             completed_.store(true, std::memory_order_release);
             return;
         }
@@ -143,6 +163,23 @@ void SchedulerContext::complete_slot_task(
                 while (!mailbox->try_push_condition(
                     token, e->addr, e->backend_cookie, e->expected_value, e->engine, e->completion_type
                 )) {
+                    if (completed_.load(std::memory_order_acquire)) {
+                        // The consumer may already have stopped. Keep only the
+                        // unforwarded suffix for error-path drain after every
+                        // producer joins; the prefix is now owned by the mailbox.
+                        for (uint32_t j = i; j < cond_count; ++j) {
+                            const volatile auto &source = deferred_slab->entries[j];
+                            volatile auto &target = deferred_slab->entries[j - i];
+                            target.addr = source.addr;
+                            target.backend_cookie = source.backend_cookie;
+                            target.expected_value = source.expected_value;
+                            target.engine = source.engine;
+                            target.completion_type = source.completion_type;
+                            target._pad = 0;
+                        }
+                        deferred_slab->count = cond_count - i;
+                        return;
+                    }
                     sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
                     SPIN_WAIT_HINT();
                 }
@@ -169,6 +206,7 @@ void SchedulerContext::complete_slot_task(
         // Some subtask of this task registered conditions; finish the
         // registration by handing the slot_state off to the consumer.
         while (!mailbox->try_push_normal_done(slot_state.task->task_id, reinterpret_cast<uint64_t>(&slot_state))) {
+            if (completed_.load(std::memory_order_acquire)) return;
             sched_->async_wait_list.mpsc_skipped_count.fetch_add(1, std::memory_order_relaxed);
             SPIN_WAIT_HINT();
         }
@@ -180,11 +218,7 @@ void SchedulerContext::complete_slot_task(
         if (is_dump_args_enabled()) {
             dump_args_for_task<SUBTASK_SLOT_COUNT>(
                 thread_idx, *slot_state.task, *slot_state.payload, slot_state.active_mask,
-                ArgsDumpStage::AFTER_COMPLETION,
-                [](ActiveMask active_mask, int raw_subtask_id) {
-                    return active_mask.subtask_active(static_cast<SubtaskSlot>(raw_subtask_id));
-                },
-                [this](int32_t func_id) {
+                ArgsDumpStage::AFTER_COMPLETION, [this](int32_t func_id) {
                     return get_function_bin_addr(func_id);
                 }
             );
@@ -525,10 +559,10 @@ bool SchedulerContext::enter_drain_mode(ChipTaskSlotState *slot_state, int32_t b
 // include_pending adds each thread's pending-capable cores/clusters — used by the
 // gated (early) sync_start drain, which pre-stages onto idle running slots AND onto
 // busy cores' pending slots. The ready drain (include_pending=false) counts idle only.
-int32_t SchedulerContext::count_global_available(ResourceShape shape, uint8_t core_mask, bool include_pending) {
+int32_t SchedulerContext::count_global_available(ResourceShape shape, LaneMask lanes, bool include_pending) {
     int32_t total = 0;
     for (int32_t t = 0; t < active_sched_threads_; t++) {
-        total += core_trackers_[t].count_available_blocks(shape, core_mask, include_pending);
+        total += core_trackers_[t].count_available_blocks(shape, lanes, include_pending);
     }
     return total;
 }
@@ -554,7 +588,7 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
 ) {
     CoreTracker &tracker = core_trackers_[thread_idx];
     ResourceShape shape = slot_state->active_mask.to_shape();
-    uint8_t core_mask = slot_state->active_mask.core_mask();
+    LaneMask lanes = slot_state->active_mask;
     bool mix_split = gated && shape == ResourceShape::MIX;
     SyncStartStageResult result;
 
@@ -585,7 +619,7 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
                 if (b + 1 < claim) prefetch_block_dst(thread_idx, claimed[b + 1], is_mix);
                 auto core_offset = claimed[b];
                 if (shape == ResourceShape::MIX) {
-                    result.running_cores += tracker.mix_cluster_idle_core_count(core_offset, core_mask);
+                    result.running_cores += tracker.mix_cluster_idle_core_count(core_offset, lanes);
                 }
                 handle_count += prepare_block_for_dispatch(
                     thread_idx, core_offset, *slot_state, shape, to_pending, start + b, &handles[handle_count], gated
@@ -649,9 +683,9 @@ SchedulerContext::SyncStartStageResult SchedulerContext::stage_sync_start_cores(
     if (mix_split) {
         // Gated MIX: to_pending=true opts every BUSY used core into its pending slot while idle
         // used cores take running slots (prepare_block_for_dispatch: to_pending && !is_core_idle).
-        stage(tracker.get_mix_split_cluster_offset_states(core_mask), /*to_pending=*/true);
+        stage(tracker.get_mix_split_cluster_offset_states(lanes), /*to_pending=*/true);
     } else {
-        auto idle = (shape == ResourceShape::MIX) ? tracker.get_mix_running_cluster_offset_states(core_mask) :
+        auto idle = (shape == ResourceShape::MIX) ? tracker.get_mix_running_cluster_offset_states(lanes) :
                                                     tracker.get_idle_core_offset_states(shape);
         stage(idle, /*to_pending=*/false);  // idle -> running (ready launch + gated pre-stage)
         if (gated) {
@@ -737,8 +771,7 @@ void SchedulerContext::handle_drain_mode(
         ResourceShape shape = slot_state->active_mask.to_shape();
         // A gated drain may pre-stage onto pending slots too (idle+pending); the ready drain
         // needs block_num idle cores/clusters.
-        int32_t available =
-            count_global_available(shape, slot_state->active_mask.core_mask(), /*include_pending=*/gated);
+        int32_t available = count_global_available(shape, slot_state->active_mask, /*include_pending=*/gated);
         if (available < block_num) {
             // Insufficient -- reset so all threads resume completion polling to free cores, then retry.
             drain_state_.drain_attempt.store(sync_start_drain_next_attempt(drain_attempt), std::memory_order_release);

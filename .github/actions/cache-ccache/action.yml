@@ -1,0 +1,29 @@
+name: Cache ccache objects
+description: Restore and save the per-runner ccache directory, and point ccache at it.
+
+runs:
+  using: composite
+  steps:
+    - name: Configure ccache
+      shell: bash
+      run: |
+        # The directory is exported rather than left to ccache's own default
+        # because that default moved between versions and differs by platform
+        # (~/.ccache against ~/Library/Caches/ccache), while actions/cache needs
+        # one literal path. Compression is what keeps the saved entry an
+        # 84 MB upload instead of a 567 MB one; object files compress ~7x.
+        echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+        echo "CCACHE_COMPRESS=1" >> "$GITHUB_ENV"
+        echo "CCACHE_MAXSIZE=1G" >> "$GITHUB_ENV"
+
+    - name: Cache ccache objects
+      uses: actions/cache@v5
+      with:
+        path: ~/.ccache
+        # The run id is in the key so every run writes a fresh entry and the
+        # restore-key prefix hands it the newest previous one: this repository
+        # runs CI on pull_request only, so no default-branch run exists to
+        # populate a shared entry that pull requests could merely read.
+        key: ${{ runner.os }}-${{ runner.arch }}-ccache-${{ github.run_id }}
+        restore-keys: |
+          ${{ runner.os }}-${{ runner.arch }}-ccache-

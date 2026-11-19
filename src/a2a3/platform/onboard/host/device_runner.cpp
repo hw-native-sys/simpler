@@ -26,10 +26,8 @@
 #include <dlfcn.h>
 
 #include <algorithm>
-#include <cassert>
 #include <chrono>
 #include <cstddef>
-#include <cstring>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -45,6 +43,7 @@
 // Include HAL constants from CANN (header only, library loaded dynamically)
 #include "ascend_hal.h"
 #include "aicpu_topology_probe.h"
+#include "context_preparation.h"
 #include "callable.h"
 #include "callable_protocol.h"
 #include "call_config.h"
@@ -54,6 +53,7 @@
 #include "host/host_graph_runs.h"
 #include "host/host_regs.h"  // Register address retrieval
 #include "host/raii_scope_guard.h"
+#include "host/run_boundary.h"
 #include "utils/fatal_shutdown_latch.h"
 
 // dep_gen has two shapes, one per orchestration site, and each runtime provides
@@ -80,7 +80,6 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_d
 }
 
 extern "C" __attribute__((weak, visibility("hidden"))) bool dep_gen_host_graph_active() { return false; }
-extern "C" __attribute__((weak, visibility("hidden"))) void dep_gen_host_graph_set_enabled(bool /*enable*/) {}
 extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_host_graph_take(
     simpler::dfx::host_graph::HostGraphExport * /*out*/
 ) {
@@ -126,6 +125,11 @@ HalHostUnregisterFn get_halHostUnregister() {
         return nullptr;
     }
     return reinterpret_cast<HalHostUnregisterFn>(dlsym(g_hal_handle, "halHostUnregister"));
+}
+
+int unregister_collector_memory(void *dev_ptr, int device_id) {
+    HalHostUnregisterFn fn = get_halHostUnregister();
+    return fn != nullptr ? fn(dev_ptr, device_id) : PTO_RUNTIME_ERR_INTERNAL;
 }
 
 }  // namespace
@@ -188,6 +192,23 @@ int DeviceRunner::fill_persistent_arch_fields(KernelArgs *args, uint64_t device_
         return rc;
     }
     return 0;
+}
+
+int DeviceRunner::ensure_aicpu_topology() {
+    if (!aicpu_topology_.empty()) return 0;
+    std::vector<simpler::a2a3::AicpuLogicalCpu> topology;
+    if (!simpler::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), topology))
+        return PTO_RUNTIME_ERR_INTERNAL;
+    aicpu_topology_ = std::move(topology);
+    return 0;
+}
+
+int DeviceRunner::prepare_kernel_arch_context(rtStream_t /*control_stream*/) {
+    int rc = ensure_aicore_reg_table(AicoreRegKind::Ctrl);
+    if (rc != 0) return rc;
+    rc = simpler::a2a3::ensure_c2c_ctrl_address(c2c_ctrl_address_, c2c_ctrl_address_valid_);
+    if (rc != 0) return rc;
+    return ensure_aicpu_topology();
 }
 
 DeviceRunner::~DeviceRunner() { finalize(); }
@@ -276,17 +297,9 @@ int DeviceRunner::destroy_comm_stream(void *stream) {
     return 0;
 }
 
-// `ensure_binaries_loaded`, `query_max_block_dim`, and `validate_block_dim`
+// `ensure_aicpu_runtime_registered`, `query_max_block_dim`, and `validate_block_dim`
 // live on `DeviceRunnerBase` — see
 // `src/common/platform/onboard/host/device_runner_base.cpp`.
-
-void DeviceRunner::arm_host_dep_gen_capture(bool enable) {
-    // Arms host-side capture for a host-orch runtime (no-op weak stub for the
-    // device-orch one). The capture is thread-local between orchestration and
-    // emit, so the c_api calls this on the binding thread before every bind; the
-    // orchestration entry resets the graph before recording it.
-    dep_gen_host_graph_set_enabled(enable);
-}
 
 void DeviceRunner::configure_dep_gen_retention(bool enabled, std::size_t budget_bytes) {
     dep_gen_collector_.configure_retained_runs(enabled, budget_bytes);
@@ -294,7 +307,9 @@ void DeviceRunner::configure_dep_gen_retention(bool enabled, std::size_t budget_
 
 bool DeviceRunner::dep_gen_retains_runs() const { return dep_gen_collector_.retains_runs(); }
 
-int DeviceRunner::admit_dep_gen_run(const DfxRunConfig &dfx, uint64_t run_epoch) {
+int DeviceRunner::admit_dep_gen_run(
+    const DfxRunConfig &dfx, uint64_t run_epoch, simpler::dfx::runs::AdmissionRefusal *why
+) {
     if (!dfx.dep_gen_enabled || dep_gen_host_graph_active()) return 0;
     if (!dep_gen_collector_.retains_runs()) {
         // Default path: the window is opened, then the threads that serve it
@@ -312,13 +327,42 @@ int DeviceRunner::admit_dep_gen_run(const DfxRunConfig &dfx, uint64_t run_epoch)
         return create_thread(std::move(fn));
     };
     dep_gen_collector_.start(thread_factory);
-    if (!dep_gen_collector_.run_begin(run_epoch, dfx.output_prefix)) {
+    if (!dep_gen_collector_.run_begin(run_epoch, dfx.output_prefix, why)) {
         LOG_ERROR(
             "dep_gen: run %llu was not admitted for retained collection", static_cast<unsigned long long>(run_epoch)
         );
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     return 0;
+}
+
+bool DeviceRunner::dep_gen_can_admit_joined_run(uint64_t run_epoch) const {
+    // A host-orch runtime builds the graph on the host and has no device
+    // producer, so there is nothing for a successor to publish into and nothing
+    // the pair decision could make safe.
+    if (dep_gen_host_graph_active()) return false;
+    if (!dep_gen_collector_.device_publishes_run_terminal()) return false;
+    if (!dep_gen_collector_.can_admit_retained_run()) return false;
+    return dep_gen_collector_.can_take_run_terminal_bank(run_epoch);
+}
+
+bool DeviceRunner::dep_gen_retained_runs_outstanding() const { return !dep_gen_collector_.retained_runs_idle(); }
+
+void DeviceRunner::install_dep_gen_credit_release_notifier(const std::function<void()> &notify) {
+    dep_gen_collector_.set_credit_release_notifier(notify);
+}
+
+int DeviceRunner::open_dep_gen_run_terminal_banks(const DfxRunConfig &dfx) {
+    if (!dfx.dep_gen_enabled || dep_gen_host_graph_active()) return 0;
+    if (!dep_gen_collector_.retains_runs() || dep_gen_collector_.device_publishes_run_terminal()) return 0;
+    if (dep_gen_collector_.open_run_terminal_banks(DEP_GEN_TERMINAL_PRODUCERS)) return 0;
+    LOG_ERROR("DepGen: per-run terminal backing could not be initialized");
+    return PTO_RUNTIME_ERR_INTERNAL;
+}
+
+uint64_t DeviceRunner::dep_gen_run_terminal_bank(uint64_t run_epoch) const {
+    if (dep_gen_host_graph_active()) return 0;
+    return dep_gen_collector_.run_terminal_bank_address(run_epoch);
 }
 
 void DeviceRunner::withdraw_dep_gen_run(uint64_t run_epoch) noexcept {
@@ -332,12 +376,21 @@ bool DeviceRunner::dep_gen_flush_retained(int timeout_ms, std::string *error) {
 
 void DeviceRunner::dep_gen_finish_retained() { dep_gen_collector_.finish_retained_runs(); }
 
+int DeviceRunner::prepare_execution_streams(PreparedExecution &prepared, std::shared_ptr<const void> *lease) {
+    if (execution_mode_latch().is_kernel()) return DeviceRunnerBase::prepare_execution_streams(prepared, lease);
+    // Program binds under the launch claim. Preparing a successor must not
+    // replace the current pair while earlier calls still own observation.
+    lease->reset();
+    return 0;
+}
+
 int DeviceRunner::prepare_execution(
     Runtime &runtime, const CallConfig &config, uint32_t pipeline_slot, const NativeRunIdentity &identity,
     std::unique_ptr<PreparedExecution> *prepared
 ) {
     if (prepared == nullptr || *prepared != nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     auto execution = std::make_unique<PreparedExecution>(identity, runtime, config, pipeline_slot);
+    execution->scheduler_runtime_mode = last_scheduler_runtime_mode();
     // Resolved from this run's own CallConfig rather than read off the runner:
     // apply_call_config() is skipped when this prepare overlaps an in-flight
     // predecessor, so the members still describe that predecessor.
@@ -373,12 +426,12 @@ int DeviceRunner::prepare_execution(
         return rc;
     }
 
-    ensure_device_wall_buffer(pipeline_slot, execution->kernel_args);
+    rc = ensure_device_wall_buffer(pipeline_slot, execution->kernel_args);
+    if (rc != 0) return rc;
 
-    // A run without somewhere to publish its result must not launch: it would
-    // leave the host with no way to recover the run's own error scene, and a
-    // region still holding a predecessor's payload.
-    rc = ensure_device_run_result_region(pipeline_slot, identity.run_epoch, execution->kernel_args);
+    // Kernel execution keeps its invocation identity without requesting private
+    // detail when diagnostics are off. Program retains its structured errors.
+    rc = ensure_device_run_result_region(identity, execution->kernel_args, execution->dfx);
     if (rc != 0) return rc;
 
     if (block_dim < 1) {
@@ -413,19 +466,19 @@ int DeviceRunner::prepare_execution(
     // cpu_ids deterministically, writes them into Runtime, and the AICPU-side
     // gate only matches sched_getcpu() against this table.
     {
-        std::vector<pto::a2a3::AicpuLogicalCpu> user_cpus;
         std::vector<int32_t> allowed;
         runtime.set_aicpu_allowed_cpu_count(0);
         runtime.set_aicpu_launch_count(0);
-        if (!pto::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), user_cpus)) {
+        if (ensure_aicpu_topology() != 0) {
             LOG_ERROR("A2A3 AICPU topology probe failed; cannot configure affinity gate");
             return PTO_RUNTIME_ERR_INTERNAL;
         }
+        const auto &user_cpus = aicpu_topology_;
         int resolved_aicpu = resolve_aicpu_thread_num(
             runtime.get_aicpu_thread_num(), static_cast<int>(user_cpus.size()), PLATFORM_DEFAULT_AICPU_THREAD_NUM
         );
         if (resolved_aicpu < 0) return PTO_RUNTIME_ERR_INTERNAL;
-        if (!pto::a2a3::compute_allowed_cpus(user_cpus, resolved_aicpu, allowed)) {
+        if (!simpler::a2a3::compute_allowed_cpus(user_cpus, resolved_aicpu, allowed)) {
             LOG_ERROR(
                 "A2A3 AICPU topology has %zu user cpus, cannot fit %d active threads", user_cpus.size(), resolved_aicpu
             );
@@ -460,11 +513,9 @@ int DeviceRunner::prepare_execution(
         );
     }
 
-    // Resolve the orchestration SO into a device-resident buffer and refresh
-    // runtime metadata before the Runtime struct is uploaded to device.
-    rc = prepare_orch_so(runtime);
+    rc = validate_active_callable(runtime);
     if (rc != 0) {
-        LOG_ERROR("prepare_orch_so failed: %d", rc);
+        LOG_ERROR("validate_active_callable failed: %d", rc);
         return rc;
     }
 
@@ -472,7 +523,13 @@ int DeviceRunner::prepare_execution(
     rc = init_runtime_args_with_metadata(runtime, execution->kernel_args, slot_args);
     if (rc != 0) return rc;
 
-    rc = kernel_args_init_ffts_base_addr(execution->kernel_args);
+    if (execution_mode_latch().is_kernel()) {
+        if (!c2c_ctrl_address_valid_) return PTO_RUNTIME_ERR_INVALID_STATE;
+        execution->kernel_args.args.ffts_base_addr = c2c_ctrl_address_;
+        rc = 0;
+    } else {
+        rc = kernel_args_init_ffts_base_addr(execution->kernel_args);
+    }
     if (rc != 0) {
         LOG_ERROR("init_ffts_base_addr failed: %d", rc);
         return rc;
@@ -480,6 +537,8 @@ int DeviceRunner::prepare_execution(
 
     execution->num_aicore = num_aicore;
     execution->launch_aicpu_num = launch_aicpu_num;
+    rc = prepare_submission_resources(*execution);
+    if (rc != 0) return rc;
     prepare_rollback.dismiss();
     *prepared = std::move(execution);
     return 0;
@@ -490,20 +549,48 @@ int DeviceRunner::poll_execution(const ActiveExecution &active) {
     const PreparedExecution &prepared = *active.prepared;
     // The pair still gates the query: it owns the try-lock against a concurrent
     // retirement, the per-owner submitter check, and that run's sticky terminal
-    // result. What it no longer decides is completion — the handles it hands
-    // over are only the evidence the no-boundary fallback inside
-    // poll_run_fence needs. The owner is named because a second run may have
-    // submitted on the same pair, and its result is not this run's.
-    return run_streams_.poll(&prepared, [this, &prepared](void *aicpu, void *aicore) {
-        return poll_run_fence(prepared, static_cast<rtStream_t>(aicpu), static_cast<rtStream_t>(aicore));
+    // result. Completion uses the run's bound handles, including the no-boundary
+    // fallback inside poll_run_fence. A second run may have submitted on the
+    // same pair; the named owner's result belongs only to this run.
+    return run_streams_.poll(&prepared, [this, &prepared](void *, void *) {
+        return poll_run_fence(prepared);
     });
 }
 
-DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
-    if (active.prepared == nullptr || !active.prepared->resources_owned) {
-        return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
-    }
+int DeviceRunner::retire_completed_execution(ActiveExecution &active) {
+    if (active.prepared == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
     PreparedExecution &prepared = *active.prepared;
+    if (!prepared.resources_owned)
+        return prepared.physical_complete ? SIMPLER_NATIVE_RUN_POLL_COMPLETE : SIMPLER_NATIVE_RUN_POLL_ERROR;
+    const int poll_rc = poll_execution(active);
+    if (poll_rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return poll_rc;
+    prepared.physical_complete = true;
+    const int wait_rc = poll_boundary_waits(prepared);
+    if (wait_rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return wait_rc;
+    const int diagnostics_rc =
+        teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, true);
+    prepared.retirement_diagnostics_rc = diagnostics_rc;
+    read_device_wall_ns(prepared.pipeline_slot);
+    emit_device_dep_gen_graph(prepared.dfx, prepared.identity.run_epoch, true, false);
+    print_handshake_results(prepared.kernel_args, prepared.num_aicore);
+    prepared.aicore_retirement_attempted = true;
+    const int retire_rc = retire_run_aicore_stream(&prepared, RunStreamPair::CompletionStatus::Complete);
+    if (retire_rc != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    cleanup_execution(prepared, true);
+    return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+}
+
+DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
+    if (active.prepared == nullptr) return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
+    PreparedExecution &prepared = *active.prepared;
+    if (!prepared.resources_owned) {
+        const int rc = wait_run_fence(prepared);
+        if (rc != 0) {
+            log_run_failure(prepared, rc);
+            recover_device_or_mark_unusable(rc);
+        }
+        return DrainOutcome{rc, prepared.retirement_diagnostics_rc, prepared.physical_complete};
+    }
     auto drain_cleanup = RAIIScopeGuard([this, &prepared]() {
         cleanup_execution(prepared, /*retire_aicore=*/true);
     });
@@ -516,25 +603,22 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     int rc = reap_run(prepared, &diagnostics_rc);
     if (rc != 0) {
         // The device/sync error remains authoritative over teardown errors.
-        return DrainOutcome::device_error(rc);
+        return DrainOutcome::device_error(rc, prepared.physical_complete);
     }
 
     // Both this run's boundaries completed, so every wait queued on one of them
     // is discharged here — before anything this run owns is released, and while
     // a fallible call can still report. Nothing waits on a successor's kernels:
     // a cross-run wait is proved by the event recorded immediately behind it.
-    rc = discharge_boundary_waits(
-        prepared, /*boundaries_complete=*/true, static_cast<rtStream_t>(run_streams_.aicpu()),
-        static_cast<rtStream_t>(run_streams_.aicore())
-    );
-    if (rc != 0) return DrainOutcome::device_error(rc);
+    rc = discharge_boundary_waits(prepared, /*boundaries_complete=*/true);
+    if (rc != 0) return DrainOutcome::device_error(rc, prepared.physical_complete);
 
     // A proven-complete stream is reusable until a code publication marks it
     // stale. Publish retirement so cleanup does not replace it with an
     // unproven state after the device result has already been established.
     prepared.aicore_retirement_attempted = true;
     rc = retire_run_aicore_stream(&prepared, RunStreamPair::CompletionStatus::Complete);
-    if (rc != 0) return DrainOutcome::device_error(rc);
+    if (rc != 0) return DrainOutcome::device_error(rc, prepared.physical_complete);
 
     // Reads device memory, so it must precede KernelArgs/runtime cleanup. Sized
     // by this run's own core count rather than the runner's, which describes
@@ -549,25 +633,22 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
 void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool retire_aicore) noexcept {
     if (!prepared.resources_owned) return;
 
-    // A poisoned card cannot retire per-resource frees or stream destroys, and
-    // issuing them can block in the driver. Drop host-side ownership instead;
-    // finalize()'s force reset invalidates the whole device generation.
-    const bool abandon = device_unusable_.load(std::memory_order_acquire);
-
     // Before anything is released, on the paths that did not reach the drain's
     // fallible discharge: a queued stream wait naming one of this run's
     // boundaries must not outlive the events it names. No proof is available
     // here — this run's completion was never established — so the ladder falls
     // through to the synchronize and, failing that, poisons. On the abandon
-    // branch the reset already invalidated every such reference, and the device
-    // must not be touched at all.
-    if (!abandon) {
-        discharge_boundary_waits_noexcept(
-            prepared, /*boundaries_complete=*/false, static_cast<rtStream_t>(run_streams_.aicpu()),
-            static_cast<rtStream_t>(run_streams_.aicore())
-        );
+    // branch completion is unproven and no per-resource device calls are issued.
+    if (!device_unusable_.load(std::memory_order_acquire)) {
+        discharge_boundary_waits_noexcept(prepared, /*boundaries_complete=*/false);
     }
     clear_whole_operator_boundary(prepared);
+
+    // Discharge can poison the runner. Retirement uses the resulting state:
+    // a poisoned card permits no per-resource frees or stream destroys.
+    // An owned device is force-reset at finalize; a borrowed device's recovery
+    // belongs to the caller.
+    const bool abandon = device_unusable_.load(std::memory_order_acquire);
 
     // Collectors must stop before their backing arguments are released; the
     // per-run stream retires last. Each cleanup operation is idempotent.
@@ -581,6 +662,7 @@ void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool retire_ai
         abandon_slot_persistent_args(slot_persistent_args(prepared.pipeline_slot));
     } else {
         prepared.kernel_args.release_run_view();
+        slot_persistent_args(prepared.pipeline_slot).staged_launch_metadata.clear();
     }
     prepared.kernel_args.args.regs = 0;
     prepared.kernel_args.args.pmu_reg_addrs = 0;
@@ -647,6 +729,10 @@ int DeviceRunner::ensure_run_streams() {
 // observe a newer mask than the dispatch table it is measuring. A gating change
 // mid-worker is not something a per-run PMU re-query could have made safe.
 int DeviceRunner::ensure_aicore_reg_table(AicoreRegKind kind) {
+    if (kind == AicoreRegKind::Ctrl)
+        return simpler::a2a3::ensure_ctrl_table(
+            mem_alloc_, device_id_, aicore_ctrl_reg_table_dev_, aicore_ctrl_reg_table_committed_
+        );
     const bool is_pmu = kind == AicoreRegKind::Pmu;
     uint64_t &table = is_pmu ? aicore_pmu_reg_table_dev_ : aicore_ctrl_reg_table_dev_;
     bool &committed = is_pmu ? aicore_pmu_reg_table_committed_ : aicore_ctrl_reg_table_committed_;
@@ -682,40 +768,17 @@ int DeviceRunner::destroy_run_streams() {
     return rc;
 }
 
-DeviceRunnerBase::LaunchOutcome
-DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) {
-    LaunchOutcome outcome;
-    if (prepared == nullptr) return outcome;
+LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) {
     // Prepared is admitted as well as Published: publication happens inside
     // `launch_run`, once this run holds the stream it will submit on. What a
     // kernel submission requires is Published, which `launch_run` establishes
     // before it submits anything.
-    if (!prepared->kernel_args.launchable()) {
+    if (!prepared.kernel_args.launchable()) {
         LOG_ERROR("launch_execution: this run holds no Runtime descriptor to publish");
-        outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
-        outcome.prepared = std::move(prepared);
-        return outcome;
+        return LaunchTransactionResult{PTO_RUNTIME_ERR_INVALID_STATE, LaunchProgress::NotStarted, LaunchReceipt{}};
     }
 
-    LaunchTransactionResult transaction = launch_run(*prepared, std::move(permit));
-    if (transaction.poisoned()) recover_device_or_mark_unusable(transaction.rc);
-    outcome.rc = transaction.rc;
-    outcome.progress = transaction.progress;
-    outcome.receipt = std::move(transaction.receipt);
-    if (transaction.progress == LaunchProgress::NotStarted) {
-        // Ownership first, then the withdrawal. Nothing was submitted, so the
-        // collectors' admission for this run is the runner's to give back —
-        // left in place it holds a retained slot that neither the writer nor a
-        // flush can see — but handing this rollback's `prepared` back to the
-        // caller is what lets it roll back at all, so it cannot come second to
-        // a diagnostic. The withdrawal itself reports nothing to this caller
-        // and throws nothing at it.
-        outcome.prepared = std::move(prepared);
-        withdraw_unlaunched_collectors_for_run(outcome.prepared->dfx, outcome.prepared->identity.run_epoch);
-    } else {
-        outcome.active = std::make_unique<ActiveExecution>(std::move(prepared), transaction.progress);
-    }
-    return outcome;
+    return launch_run(prepared, std::move(permit));
 }
 
 LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, LaunchPermit permit) {
@@ -728,23 +791,27 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
     // handshake region belongs to the device, and this run's reports are told
     // apart from a predecessor's by the report epoch.
     //
-    // The pair is readied here rather than at prepare because this is the first
-    // point the caller holds the execution claim: a prepared successor overlaps
-    // its predecessor's execution, so replacing a stale AICore stream during
-    // preparation would destroy a stream the predecessor is still running on.
-    if (ensure_run_streams() != 0) {
+    // Kernel preparation binds its borrowed streams before capture. Program
+    // selects its pair here under the execution claim, preserving earlier
+    // generations until their observation owners have released them.
+    if (!prepared.streams.ready() && ensure_run_streams() != 0) {
         return LaunchTransactionResult{};
     }
-    RunStreamSet streams{static_cast<rtStream_t>(run_streams_.aicpu()), static_cast<rtStream_t>(run_streams_.aicore())};
-    // The one descriptor H2D for this run, ahead of activate_launch_shape, DFX
-    // arming and every kernel or event this run submits. It is here rather than
-    // at prepare because the route its entry values take is a question about
-    // `streams.aicpu` — the same handle the AICPU launch below submits on, held
-    // under this run's execution claim. A failure carries its own error out
-    // with the run NotStarted, so nothing was submitted and the run stays
-    // rollback-able.
-    if (const int publish_rc = publish_for_launch(prepared.kernel_args, streams.aicpu); publish_rc != 0) {
-        return LaunchTransactionResult{publish_rc, LaunchProgress::NotStarted, LaunchReceipt{}};
+    if (!prepared.streams.ready())
+        prepared.streams = {
+            static_cast<rtStream_t>(run_streams_.aicpu()), static_cast<rtStream_t>(run_streams_.aicore())
+        };
+    if (!prepared.stream_lifetime) prepared.stream_lifetime = run_streams_.retain_aicore();
+    if (prepared.caller_stream != nullptr) prepared.streams.aicpu = prepared.caller_stream;
+    const auto &streams = prepared.streams;
+    if (prepared.caller_stream != nullptr) {
+        bool recording = false;
+        const int rc = validate_caller_stream(prepared.caller_stream, &recording);
+        if (rc == 0 && recording != prepared.recording)
+            return LaunchTransactionResult{PTO_RUNTIME_ERR_UNSUPPORTED, LaunchProgress::NotStarted, LaunchReceipt{}};
+        if (rc != 0) {
+            return LaunchTransactionResult{rc, LaunchProgress::NotStarted, LaunchReceipt{}};
+        }
     }
     LaunchTransactionResult result = exact_launch_transaction(
         prepared.identity, std::move(permit),
@@ -757,39 +824,62 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             try {
                 activate_launch_shape(runtime);
                 if (int fence_rc = arm_run_fence(prepared); fence_rc != 0) return fence_rc;
-                (void)arm_device_wall_buffer(prepared.pipeline_slot, prepared.kernel_args);
-                if (int arm_rc = arm_collectors_for_run(runtime, prepared); arm_rc != 0) return arm_rc;
-                // This run's own core types, resolved from its own prepared
-                // runtime and handed to admission. The resident copy the
-                // collector keeps is set below and belongs to whichever run
-                // launched last, which under an early-enqueued successor is not
-                // the run whose bucket is being opened here.
-                std::vector<CoreType> core_types;
-                if (prepared.dfx.chip_swimlane_enabled() && chip_swimlane_collector_.is_initialized()) {
-                    core_types.resize(static_cast<size_t>(num_aicore));
-                    for (int i = 0; i < num_aicore; i++)
-                        core_types[static_cast<size_t>(i)] = runtime.core_type_rule(i);
-                }
-                const RunLocalDfxMetadata run_metadata{
-                    core_types.empty() ? nullptr : core_types.data(), static_cast<int>(core_types.size()),
-                    host_orchestrated_for_slot(prepared.pipeline_slot)
-                };
-                if (int collect_rc =
-                        start_shared_collectors_for_run(prepared.dfx, prepared.identity.run_epoch, run_metadata);
-                    collect_rc != 0) {
-                    return collect_rc;
-                }
-                // Admission before any submission. A refusal gives back what the
-                // collectors above already admitted, or their export slots stay held
-                // by a run that never reaches a boundary.
-                if (int dep_rc = admit_dep_gen_run(prepared.dfx, prepared.identity.run_epoch); dep_rc != 0) {
-                    withdraw_unlaunched_collectors_for_run(prepared.dfx, prepared.identity.run_epoch);
-                    return dep_rc;
-                }
-                // The resident copy, which the serial non-retained path reads at
-                // its own close.
-                if (!core_types.empty()) {
-                    chip_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
+                if (!prepared.recording) {
+                    if (int arm_rc = arm_collectors_for_run(runtime, prepared); arm_rc != 0) return arm_rc;
+                    // This run's own core types, resolved from its own prepared
+                    // runtime and handed to admission. The resident copy the
+                    // collector keeps is set below and belongs to whichever run
+                    // launched last, which under an early-enqueued successor is not
+                    // the run whose bucket is being opened here.
+                    std::vector<CoreType> core_types;
+                    if (prepared.dfx.chip_swimlane_enabled() && chip_swimlane_collector_.is_initialized()) {
+                        core_types.resize(static_cast<size_t>(num_aicore));
+                        for (int i = 0; i < num_aicore; i++)
+                            core_types[static_cast<size_t>(i)] = runtime.core_type_rule(i);
+                    }
+                    const RunLocalDfxMetadata run_metadata{
+                        core_types.empty() ? nullptr : core_types.data(), static_cast<int>(core_types.size()),
+                        host_orchestrated_for_slot(prepared.pipeline_slot), &prepared.artifact_identity,
+                        &prepared.scope_stats_capacity
+                    };
+                    // One all-or-nothing admission across every enabled owner.
+                    // A capacity shortage is reported as its own code and nothing
+                    // is submitted, so the caller parks on the credit signal and
+                    // re-attempts rather than failing a run whose slots are merely
+                    // in use; any other refusal is this run's failure.
+                    DiagnosticAdmission admission;
+                    if (int collect_rc = start_shared_collectors_for_run(
+                            prepared.dfx, prepared.identity.run_epoch, run_metadata, &admission
+                        );
+                        collect_rc != 0) {
+                        return admission.refusal == simpler::dfx::runs::AdmissionRefusal::Capacity ?
+                                   SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL :
+                                   collect_rc;
+                    }
+                    // dep_gen admits last and rolls the others back itself, for the
+                    // same reason: an export slot held by a run that never reaches
+                    // a boundary is never given back. Through the same undo the
+                    // all-or-nothing guard takes, so a decline here neither wakes its
+                    // own retry nor hides a withdrawal that restored nothing.
+                    simpler::dfx::runs::AdmissionRefusal dep_why = simpler::dfx::runs::AdmissionRefusal::None;
+                    if (int dep_rc = admit_dep_gen_run(prepared.dfx, prepared.identity.run_epoch, &dep_why);
+                        dep_rc != 0) {
+                        undo_admission_attempt(prepared.dfx, prepared.identity.run_epoch);
+                        return dep_why == simpler::dfx::runs::AdmissionRefusal::Capacity ?
+                                   SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL :
+                                   dep_rc;
+                    }
+                    // Every owner has now admitted this run, so each one's bank is
+                    // reserved and its address is resolvable. Written here rather
+                    // than during arming because dep_gen admits last, and a run
+                    // whose arming resolved an address it was later refused would
+                    // hand the device a bank it does not hold.
+                    resolve_run_terminal_banks(prepared.dfx, prepared.identity.run_epoch, prepared.kernel_args);
+                    // The resident copy, which the serial non-retained path reads at
+                    // its own close.
+                    if (!core_types.empty()) {
+                        chip_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
+                    }
                 }
 
                 // Launch the AICore worker BEFORE the AICPU Run task — mirrors the a5 path
@@ -813,34 +903,40 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
 
             // Publishing query/drain ownership is a state change, so it sits past
             // the arming block: everything the block covers is rollback-free.
-            int rc = run_streams_.mark_submitted(&prepared);
+            int rc = prepared.recording ? 0 :
+                                          run_streams_.mark_submitted(
+                                              &prepared, prepared.streams.aicore,
+                                              execution_mode_latch().is_kernel() ? prepared.streams.aicpu : nullptr
+                                          );
             if (rc != 0) {
                 LOG_ERROR("launch_run: failed to publish the run stream pair: %d", rc);
                 return rc;
             }
 
             if (prepared.join.predecessor_owner != nullptr) {
-                int join_rc = queue_cross_run_wait(prepared, streams.aicore, sink);
+                const int join_rc = queue_cross_run_wait(prepared, streams.aicpu, sink);
                 if (join_rc != 0) return join_rc;
             }
+            if (int caller_rc = queue_run_entry(prepared, sink); caller_rc != 0) return caller_rc;
 
             // After any cross-run wait and before the kernel: the instant this stream was
             // released to begin this run's AICore work. A record is not a wait and no stream
             // waits on it, so a successor's marker cannot stand in for the production wait
             // above. A failed record does not fail the run; it makes the position unavailable.
-            (void)mark_run_boundary(RunBoundaryMarks::Position::AicoreStart, prepared.identity, streams.aicore);
+            if (!prepared.recording)
+                (void)mark_run_boundary(RunBoundaryMarks::Position::AicoreStart, prepared.identity, streams.aicore);
 
             LOG_INFO("=== launch_aicore_kernel ===");
             int launch_rc = launch_aicore_kernel(streams.aicore, prepared.kernel_args.args);
             if (launch_rc != 0) {
                 LOG_ERROR("launch_aicore_kernel failed: %d", launch_rc);
-                recover_device_or_mark_unusable(launch_rc);
+                if (!prepared.recording) recover_device_or_mark_unusable(launch_rc);
                 return launch_rc;
             }
             sink.mark_submitted();
             // Nothing else enters this stream between the kernel and its
             // boundary, so the boundary completes exactly when the kernel exits.
-            return record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicore, streams.aicore);
+            return record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicore);
         },
         [&](LaunchProgressSink &sink) -> int {
             int aicpu_launch_n =
@@ -862,14 +958,16 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             // kernels, and it is the only thing a successor can safely be
             // ordered behind.
             //
-            // Failing to reserve the reference costs the run nothing but its
-            // joinability — no boundary is published, so no successor is ever
-            // ordered behind a boundary that covers only one kernel. Failing to
-            // *queue* the wait is different: the stream may hold it, so the run
-            // is graded Partial rather than continued.
+            // A caller-bound run requires this reference; reservation failure
+            // fails its launch. Without a caller, an optional successor boundary
+            // can degrade to non-joinable. Once the wait is attempted, failure
+            // is Partial because the stream may already hold the reference.
             void *core_done = nullptr;
             bool whole_operator = false;
-            if (prepared.joinable_boundary && open_own_boundary_wait(prepared, &core_done) == 0) {
+            const bool needs_join = prepared.joinable_boundary || prepared.caller_stream != nullptr;
+            const int own_rc = needs_join ? open_own_boundary_wait(prepared, &core_done) : 0;
+            if (prepared.caller_stream != nullptr && own_rc != 0) return own_rc;
+            if (needs_join && own_rc == 0) {
                 int wait_rc = queue_own_boundary_wait(prepared, streams.aicpu, core_done);
                 if (wait_rc != 0) return wait_rc;
                 whole_operator = true;
@@ -877,17 +975,22 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
                 // AICore kernel had returned, which is what makes the time a *whole-operator*
                 // end rather than an AICPU-kernel end. Recorded only on this path, because only
                 // here does the stream position carry that meaning.
-                (void)mark_run_boundary(RunBoundaryMarks::Position::WholeOperatorEnd, prepared.identity, streams.aicpu);
+                if (!prepared.recording)
+                    (void)mark_run_boundary(
+                        RunBoundaryMarks::Position::WholeOperatorEnd, prepared.identity, streams.aicpu
+                    );
             }
-            int boundary_rc = record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicpu, streams.aicpu);
-            if (boundary_rc == 0 && whole_operator) note_whole_operator_boundary(prepared);
-            return boundary_rc;
+            int boundary_rc = record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicpu);
+            if (!prepared.recording && boundary_rc == 0 && whole_operator) note_whole_operator_boundary(prepared);
+            if (boundary_rc != 0) return boundary_rc;
+            return queue_caller_exit(prepared);
         }
     );
     return result;
 }
 
 int DeviceRunner::queue_own_boundary_wait(PreparedExecution &prepared, rtStream_t aicpu_stream, void *core_done) {
+    if (prepared.recording) return aclrtStreamWaitEvent(static_cast<aclrtStream>(aicpu_stream), core_done);
     const aclError wait_rc = aclrtStreamWaitEvent(static_cast<aclrtStream>(aicpu_stream), core_done);
     // The API documents no guarantee that a failure means the wait was not
     // queued, so the reference is committed either way: a revoked reservation
@@ -930,17 +1033,16 @@ int DeviceRunner::queue_cross_run_wait(
     return record_cross_run_proof(prepared, waiter_stream);
 }
 
-int DeviceRunner::reap_run(const PreparedExecution &prepared, int *diagnostics_rc) {
-    if (!run_streams_.ready()) {
-        LOG_ERROR("reap_run: the run stream pair is not ready");
+int DeviceRunner::reap_run(PreparedExecution &prepared, int *diagnostics_rc) {
+    if (!prepared.streams.ready()) {
+        LOG_ERROR("reap_run: this run has no stream binding");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     const DfxRunConfig &dfx = prepared.dfx;
     const uint32_t pipeline_slot = prepared.pipeline_slot;
-    int rc = wait_run_fence(
-        prepared, static_cast<rtStream_t>(run_streams_.aicpu()), static_cast<rtStream_t>(run_streams_.aicore())
-    );
+    int rc = wait_run_fence(prepared);
     if (rc != 0) {
+        log_run_failure(prepared, rc);
         // The fence wait surfaces the AICore op-timeout (STARS-reaped op ->
         // 507000/507018/507046 at the boundary or, on the no-fence fallback, at
         // stream sync). The op-timeout leaves the device context poisoned for
@@ -962,7 +1064,9 @@ int DeviceRunner::reap_run(const PreparedExecution &prepared, int *diagnostics_r
         if (teardown_rc != 0) {
             LOG_ERROR("Diagnostics teardown reported %d on the error path; run error %d is kept", teardown_rc, rc);
         }
-        emit_device_dep_gen_graph(dfx, prepared.identity.run_epoch, false);
+        emit_device_dep_gen_graph(
+            dfx, prepared.identity.run_epoch, /*device_execution_complete=*/false, /*device_producers_stopped=*/false
+        );
         return rc;
     }
 
@@ -979,13 +1083,15 @@ int DeviceRunner::reap_run(const PreparedExecution &prepared, int *diagnostics_r
     // finished.
     const int teardown_rc = teardown_shared_collectors_after_run(dfx, pipeline_slot, prepared.identity.run_epoch, true);
     if (teardown_rc != 0 && diagnostics_rc != nullptr) *diagnostics_rc = teardown_rc;
-    emit_device_dep_gen_graph(dfx, prepared.identity.run_epoch, true);
+    emit_device_dep_gen_graph(
+        dfx, prepared.identity.run_epoch, /*device_execution_complete=*/true, /*device_producers_stopped=*/false
+    );
 
     return 0;
 }
 
 void DeviceRunner::emit_device_dep_gen_graph(
-    const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete
+    const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
 ) {
     // The host-orch shape emits at the end of bind instead, where its capture
     // window closes — see `emit_host_dep_gen_graph` in c_api_shared.cpp.
@@ -996,6 +1102,9 @@ void DeviceRunner::emit_device_dep_gen_graph(
         // the writer. It is the whole of this run's emission — the default
         // body below must not also run.
         dep_gen_collector_.run_close(run_epoch, device_execution_complete);
+        simpler::dfx::runs::settle_failed_run_terminal_bank(
+            dep_gen_collector_, run_epoch, device_execution_complete, device_producers_stopped
+        );
         return;
     }
     dep_gen_collector_.quiesce();
@@ -1032,12 +1141,25 @@ void DeviceRunner::emit_device_dep_gen_graph(
     }
 }
 
-// `print_handshake_results`, `prepare_orch_so`, `register_callable`,
+// `print_handshake_results`, `validate_active_callable`, `register_callable`,
 // `record_host_orch_callable`, `unregister_callable`, `has_callable`,
 // `bind_callable_to_runtime`, and `upload_chip_callable_buffer` live on
 // `DeviceRunnerBase`.
 
+void DeviceRunner::mark_device_unusable(int runtime_rc) {
+    device_unusable_.store(true, std::memory_order_release);
+    if (execution_mode_latch_.is_kernel()) kernel_exec_state_.poison(runtime_rc);
+}
+
 void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {
+    mark_device_unusable(aicore_rc);
+    // A borrowed context cannot drain or reset the caller's entire device.
+    // Poison stops this runner's admission; recovery belongs to the caller.
+    if (execution_mode_latch_.is_kernel()) {
+        LOG_ERROR("Execution error %d: borrowed device context marked unusable", aicore_rc);
+        return;
+    }
+
     // An AICore launch failure (207001) or an op-timeout reaped by STARS
     // (surfaced as 507000/507018/507046 at stream sync) leaves the device
     // context in a sticky-error state: the streams stay poisoned and the
@@ -1069,7 +1191,6 @@ void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {
             aicore_rc
         );
     }
-    device_unusable_.store(true, std::memory_order_release);
 }
 
 namespace {
@@ -1305,12 +1426,21 @@ int DeviceRunner::unregister_device_memory_from_host(void *dev_ptr) {
 }
 
 int DeviceRunner::finalize_impl() {
-    // Fatal path: the ordinary stream completion/error boundary has already
-    // reaped the submitted run. Stop host collector threads locally, drain and
-    // force-reset the card, then forget old handles without per-resource
-    // RTS/HAL calls.
+    // Unknown device readers remain owned until the reset and probes confirm
+    // generation end; host readers stop without draining device queues.
     if (device_unusable_.load(std::memory_order_acquire)) {
         teardown_recorder_.begin(TEARDOWN_PATH_FATAL, device_id_);
+        // Join host users before resetting their backing. Already admitted
+        // host entries may finish; no final device-queue drain is requested.
+        begin_fatal_close();
+        stop_shared_collectors_for_device_failure();
+        dep_gen_collector_.stop_for_device_failure();
+        if (prepared_resources_block_fatal_reset()) {
+            LOG_ERROR("Fatal teardown: prepared resources remain referenced; device reset deferred");
+            teardown_recorder_.note_stage(TEARDOWN_STAGE_REFUSED);
+            teardown_recorder_.finish(PTO_RUNTIME_ERR_INVALID_STATE);
+            return PTO_RUNTIME_ERR_INVALID_STATE;
+        }
         // A Worker that provisioned SDMA holds 48 CP-process streams, which is
         // what makes both the handoff delay and the single reset attempt below
         // necessary. Read before abandon_common_after_device_failure() clears
@@ -1335,15 +1465,6 @@ int DeviceRunner::finalize_impl() {
             std::this_thread::sleep_for(std::chrono::milliseconds(reset_delay_ms));
         }
 
-        // Its result cannot displace the device failure that brought this path
-        // here, so it is folded in below only if nothing about the device
-        // itself was reported. It is sticky in the collector's own summary
-        // either way.
-        const int fatal_collector_rc = finalize_collectors(true);
-        if (fatal_collector_rc != 0) {
-            LOG_ERROR("Fatal teardown: diagnostics collectors reported %d while being released", fatal_collector_rc);
-        }
-
         // force_reset_device() drains before it resets and returns 0 only when
         // its post-reset probe confirms the card, so a second pass runs against
         // a settled card and can recover a poison the first pass could not
@@ -1355,21 +1476,22 @@ int DeviceRunner::finalize_impl() {
         // once per attempt and then report a reset that "did not confirm
         // clean", which reads as a failed reset rather than the designed
         // refusal it is.
-        const bool owns_device_reset = !execution_mode_latch().is_kernel();
+        const bool owns_device_reset = execution_mode_latch().latched_mode() == SIMPLER_MODE_PROGRAM;
         if (!owns_device_reset) teardown_recorder_.note_stage(TEARDOWN_STAGE_REFUSED);
         constexpr int kFatalResetAttempts = 3;
-        int reset_rc = owns_device_reset ? attempt_fatal_reset(
-                                               [this]() {
-                                                   teardown_recorder_.note_recovery_attempt();
-                                                   return force_reset_device();
-                                               },
-                                               sdma_provisioned ? 1 : kFatalResetAttempts
-                                           ) :
-                                           0;
+        int reset_rc = owns_device_reset && !terminal_reset_confirmed() ?
+                           attempt_fatal_reset(
+                               [this]() {
+                                   teardown_recorder_.note_recovery_attempt();
+                                   return force_reset_device();
+                               },
+                               sdma_provisioned ? 1 : kFatalResetAttempts
+                           ) :
+                           0;
         // The wrapper's verdict, which the post-reset probe is part of, is a
         // different value from the reset call's own return.
         if (owns_device_reset) teardown_recorder_.note_recovery_sequence(reset_rc);
-        const bool reset_confirmed = owns_device_reset && reset_rc == 0;
+        const bool reset_confirmed = owns_device_reset && terminal_reset_confirmed();
         if (!reset_confirmed && owns_device_reset) {
             LOG_ERROR(
                 "Fatal teardown: force reset of device %d did not confirm clean (rc=%d); "
@@ -1378,57 +1500,45 @@ int DeviceRunner::finalize_impl() {
             );
         }
 
-        // Program mode abandons resource bookkeeping after the reset attempt.
-        // Kernel mode cannot reset the borrowed device, so it retains ownership
-        // and quarantines the context permanently. Later close calls cannot
-        // release these resources.
-        int abandon_rc = 0;
-        if (owns_device_reset) {
-            run_streams_.abandon();
-            abandon_rc = abandon_common_after_device_failure();
-        } else {
-            kernel_exec_state_.poison(PTO_RUNTIME_ERR_INVALID_STATE);
+        if (!reset_confirmed) {
+            if (!owns_device_reset) {
+                kernel_exec_state_.poison(PTO_RUNTIME_ERR_INVALID_STATE);
+                LOG_ERROR(
+                    "Fatal teardown: kernel context on borrowed device %d quarantined — resources stay pinned for the "
+                    "process lifetime; no later close can retire them",
+                    device_id_
+                );
+            }
+            teardown_recorder_.finish(owns_device_reset ? reset_rc : PTO_RUNTIME_ERR_INVALID_STATE);
+            return owns_device_reset && reset_rc != 0 ? reset_rc : PTO_RUNTIME_ERR_INVALID_STATE;
         }
+        abandon_shared_collectors_after_device_reset();
+        dep_gen_collector_.abandon_after_device_reset();
+        run_streams_.abandon();
+        int abandon_rc = abandon_common_after_device_failure();
 
         // Only finalize the ACL owner after force reset established a clean
         // generation. On reset failure, aclFinalize may itself walk poisoned
         // stream resources and enter the same remote-event timeout.
         if (acl_ready_) {
-            if (reset_confirmed) {
-                int finalize_rc = aclFinalize();
-                if (finalize_rc != 0) {
-                    LOG_ERROR("aclFinalize failed during fatal finalize: %d", finalize_rc);
-                    if (abandon_rc == 0) abandon_rc = finalize_rc;
-                }
+            const int finalize_rc = aclFinalize();
+            if (finalize_rc != 0) {
+                LOG_ERROR("aclFinalize failed during fatal finalize: %d", finalize_rc);
+                if (abandon_rc == 0) abandon_rc = finalize_rc;
             } else {
-                LOG_WARN("Fatal teardown: skipping aclFinalize because device reset was not confirmed");
+                acl_ready_ = false;
             }
-            acl_ready_ = false;
         }
 
-        // The quarantine is terminal: `device_unusable_` routes every later
-        // close onto this same branch, so these resources stay pinned for the
-        // process lifetime. No entry point retires them.
-        if (!owns_device_reset) {
-            LOG_ERROR(
-                "Fatal teardown: kernel context on borrowed device %d quarantined — resources stay pinned for the "
-                "process lifetime; no later close can retire them",
-                device_id_
-            );
-            const int quarantine_rc = abandon_rc != 0 ? abandon_rc : PTO_RUNTIME_ERR_INVALID_STATE;
-            teardown_recorder_.finish(quarantine_rc);
-            return quarantine_rc;
-        }
-
-        device_id_ = -1;
-        if (reset_confirmed) {
+        if (abandon_rc == 0) {
+            aicpu_topology_.clear();
+            c2c_ctrl_address_valid_ = false;
+            c2c_ctrl_address_ = 0;
+            device_id_ = -1;
             device_unusable_.store(false, std::memory_order_release);
         }
         LOG_WARN("DeviceRunner finalized after fatal device failure");
         int fatal_rc = abandon_rc != 0 ? abandon_rc : reset_rc;
-        // Last in priority: a diagnostics failure found while releasing the
-        // collectors is reported only when the device side reported nothing.
-        if (fatal_rc == 0) fatal_rc = fatal_collector_rc;
         teardown_recorder_.finish(fatal_rc);
         return fatal_rc;
     }
@@ -1439,7 +1549,7 @@ int DeviceRunner::finalize_impl() {
     // this thread needs no bind and the context owns no device state to adopt.
     int rc = 0;
     if (!execution_mode_latch().is_kernel()) {
-        rc = attach_current_thread(device_id_);
+        rc = bind_current_thread(device_id_);
         if (rc != 0) {
             LOG_ERROR("Failed to attach finalize thread to device %d: %d", device_id_, rc);
             teardown_recorder_.finish(rc);
@@ -1451,6 +1561,12 @@ int DeviceRunner::finalize_impl() {
     // already done by drain or enqueue rollback; this is the backstop
     // for the no-run-since-init case.
     const int collector_rc = finalize_collectors();
+    // A failed terminal release still owns memory in this allocator/context.
+    // Preserve both for a later close, before any allocator sweep or reset.
+    if (terminal_backing_retained()) {
+        teardown_recorder_.finish(collector_rc);
+        return collector_rc;
+    }
 
     // The run stream pair is this subclass's own RTS-owning member, so it is
     // released here, while RTS is live and before the device reset below — the
@@ -1462,14 +1578,9 @@ int DeviceRunner::finalize_impl() {
     // mem_alloc_.finalize(), and cached arena sizes.
     rc = finalize_common();
     if (rc == 0) rc = stream_rc;
-    // The kernel-mode early return is about device resources this context still
-    // owns and a later close must retry, so only a device result may take it. A
-    // diagnostics failure owns nothing and is folded in further down, where it
-    // can report without diverting teardown.
-    if (rc != 0 && execution_mode_latch().is_kernel()) {
-        teardown_recorder_.finish(rc);
-        return rc;
-    }
+    // Ordinary release failures retain backing for retry. Sticky device errors
+    // use the shared owned-reset policy; borrowed contexts never take that path.
+    if (rc != 0) return recover_failed_close(rc);
 
     // Reset device AFTER all device memory is freed. Two paths:
     //
@@ -1487,7 +1598,6 @@ int DeviceRunner::finalize_impl() {
     //   "test_dedup_shared_so_independent_unregister → 507899 cascade"
     //   pattern seen across PR CI all session.
     if (device_id_ >= 0) {
-        bool reset_completed = false;
         if (acl_ready_) {
             int reset_rc = aclrtResetDevice(device_id_);
             teardown_recorder_.note_reset_api(TEARDOWN_RESET_API_ACL_RESET_DEVICE, reset_rc);
@@ -1496,9 +1606,10 @@ int DeviceRunner::finalize_impl() {
             teardown_recorder_.note_stage(reset_rc == 0 ? TEARDOWN_STAGE_API_OK_NO_PROBE : TEARDOWN_STAGE_API_FAILED);
             if (reset_rc != 0) {
                 LOG_ERROR("aclrtResetDevice(%d) failed during finalize: %d", device_id_, reset_rc);
-                if (rc == 0) rc = reset_rc;
+                // Keep the device owner reachable until its reset succeeds.
+                teardown_recorder_.finish(reset_rc);
+                return reset_rc;
             }
-            reset_completed = reset_rc == 0;
             int finalize_rc = aclFinalize();
             if (finalize_rc != 0) {
                 LOG_ERROR("aclFinalize failed during finalize: %d", finalize_rc);
@@ -1511,25 +1622,19 @@ int DeviceRunner::finalize_impl() {
             teardown_recorder_.note_stage(reset_rc == 0 ? TEARDOWN_STAGE_API_OK_NO_PROBE : TEARDOWN_STAGE_API_FAILED);
             if (reset_rc != 0) {
                 LOG_ERROR("rtDeviceReset(%d) failed during finalize: %d", device_id_, reset_rc);
-                if (rc == 0) rc = reset_rc;
+                // Keep the device owner reachable until its reset succeeds.
+                teardown_recorder_.finish(reset_rc);
+                return reset_rc;
             }
-            reset_completed = reset_rc == 0;
         }
-        // A successful reset invalidates the retained loader handle.
-        // If reset failed, abandon the handle to prevent an implicit unload;
-        // the device binary may remain resident and release is unconfirmed.
-        // A kernel context runs neither reset arm and so arrives here with
-        // `reset_completed` false — the abandon argument, whose job is to
-        // forget a handle without unloading it. The helper's latch guard is
-        // what makes that inert, independently of the early return above.
-        retire_loader_after_device_teardown(reset_completed);
     }
 
     // A poisoned card returned from the fatal branch at the top of finalize(),
     // which owns the force reset, so the card reaching here is not poisoned.
-    // Its reset may still have failed: `rc` carries that, and every owner —
-    // including the loader handle retired just above — has already been
-    // released or abandoned, so there is nothing a later close could reach.
+    // Resource cleanup and the device reset have succeeded here.
+    aicpu_topology_.clear();
+    c2c_ctrl_address_valid_ = false;
+    c2c_ctrl_address_ = 0;
     device_id_ = -1;
     device_unusable_.store(false, std::memory_order_release);
     // Last in priority, and after every device decision has been taken: a
@@ -1543,6 +1648,21 @@ int DeviceRunner::finalize_impl() {
 // `launch_aicpu_payload` and `launch_aicore_kernel` live on `DeviceRunnerBase`.
 
 int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared) {
+    prepared.kernel_args.args.chip_swimlane_run_terminal_bank = 0;
+    const int rc = prepare_collector_storage(runtime, prepared);
+    if (rc != 0) return rc;
+    // A per-run bank is acquired only after all enabled storage is ready.
+    // Collector admission and thread startup remain in the launch transaction.
+    if (prepared.dfx.chip_swimlane_enabled() && !prepared.recording &&
+        !chip_swimlane_collector_.recorded_window_open(prepared.identity.run_epoch)) {
+        prepared.kernel_args.args.chip_swimlane_run_terminal_bank =
+            arm_chip_swimlane_run_terminal_bank(prepared.identity.run_epoch);
+    }
+    return 0;
+}
+
+int DeviceRunner::prepare_collector_storage(const Runtime &runtime, PreparedExecution &prepared) {
+    if (terminal_backing_retained()) return PTO_RUNTIME_ERR_INTERNAL;
     const DfxRunConfig &dfx = prepared.dfx;
     const int num_aicore = prepared.num_aicore;
     const int launch_aicpu_num = prepared.launch_aicpu_num;
@@ -1555,10 +1675,24 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
     // against them — so the whole block runs here, where this run holds the
     // execution claim, rather than during its preparation.
     if (collector_shape_is_stale(num_aicore, aicpu_thread_num, launch_aicpu_num)) {
+        // Holding the execution claim says no run is *executing*; it does not
+        // say no writer is *reading*. A retained predecessor's writer outlives
+        // that run's native retirement by design, and the release below frees
+        // the pools it is reading — so a rebuild waits for those writers
+        // instead, reported as a capacity block and bounded by this run's own
+        // admission deadline. The joined gate declines a stale shape outright;
+        // this is the ordinary front, which that gate never sees.
+        if (retained_consumers_outstanding()) {
+            LOG_INFO(
+                "Collector rebuild: deferring, a retained run's writer still holds the pools this shape would release"
+            );
+            return SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
+        }
         // A rebuild's own release can report a diagnostics failure; it is
         // sticky in the collector's summary, so the next flush reports it and
         // this run is not failed for a predecessor's output.
         const int rebuild_rc = finalize_collectors();
+        if (terminal_backing_retained()) return rebuild_rc;
         if (rebuild_rc != 0) {
             LOG_ERROR("Collector rebuild: diagnostics collectors reported %d while being released", rebuild_rc);
         }
@@ -1571,11 +1705,6 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
     // that state.
     publish_host_phase_run_to_collector(prepared.pipeline_slot);
 
-    // This run's bank, so a run that arms none publishes 0 rather than whatever
-    // the last run left. Stated unconditionally: the field means "this run's
-    // bank", independently of whether the KernelArgs storage happens to be fresh.
-    prepared.kernel_args.args.chip_swimlane_run_terminal_bank = 0;
-
     int rc = 0;
     if (dfx.chip_swimlane_enabled()) {
         rc =
@@ -1584,11 +1713,6 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
             LOG_ERROR("init_chip_swimlane failed: %d", rc);
             return rc;
         }
-        // After the init that publishes the region base: the bank is a slice of
-        // that region, and it is resolved per run because it is keyed on this
-        // run's pipeline slot and identity, not on the device's.
-        prepared.kernel_args.args.chip_swimlane_run_terminal_bank =
-            arm_chip_swimlane_run_terminal_bank(prepared.pipeline_slot, prepared.identity.run_epoch);
     }
 
     if (dfx.dump_args_enabled()) {
@@ -1630,6 +1754,12 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
     // on the same host-orch check the init above makes, and because a run that
     // degrades a channel must not ship a flag that still advertises it.
     // a2a3 carries an extra dep_gen bit.
+    // Each enabled owner's bank array, mapped once and skipped afterwards.
+    // After the inits above, which is what creates the allocator and the
+    // producer counts the arrays are dimensioned by, and before the launch
+    // that first needs an address out of one.
+    if (int terminal_rc = open_run_terminal_banks_for_enabled_owners(dfx); terminal_rc != 0) return terminal_rc;
+
     uint32_t enable_profiling_flag = SIMPLER_DFX_FLAG_NONE;
     if (dfx.dump_args_enabled()) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
     if (dfx.chip_swimlane_enabled()) SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
@@ -1671,7 +1801,8 @@ int DeviceRunner::init_chip_swimlane(
     };
 
     int rc = chip_swimlane_collector_.initialize(
-        num_aicore, aicpu_thread_num, device_id, chip_swimlane_level, alloc_cb, register_cb, free_cb
+        num_aicore, aicpu_thread_num, device_id, chip_swimlane_level, alloc_cb, register_cb, free_cb,
+        unregister_collector_memory
     );
     if (rc != 0) {
         return rc;
@@ -1710,7 +1841,9 @@ int DeviceRunner::init_args_dump(
         return mem_alloc_.free(dev_ptr);
     };
 
-    int rc = dump_collector_.initialize(num_dump_threads, device_id, dump_args_level, alloc_cb, register_cb, free_cb);
+    int rc = dump_collector_.initialize(
+        num_dump_threads, device_id, dump_args_level, alloc_cb, register_cb, free_cb, unregister_collector_memory
+    );
     if (rc != 0) {
         return rc;
     }
@@ -1741,7 +1874,9 @@ int DeviceRunner::init_pmu(int num_cores, int num_threads, int device_id, Kernel
         return mem_alloc_.free(dev_ptr);
     };
 
-    int rc = pmu_collector_.init(num_cores, num_threads, alloc_cb, register_cb, free_cb, device_id);
+    int rc = pmu_collector_.init(
+        num_cores, num_threads, alloc_cb, register_cb, free_cb, device_id, unregister_collector_memory
+    );
     if (rc != 0) {
         return rc;
     }
@@ -1772,7 +1907,8 @@ int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper 
         return mem_alloc_.free(dev_ptr);
     };
 
-    int rc = dep_gen_collector_.init(num_threads, alloc_cb, register_cb, free_cb, device_id);
+    int rc =
+        dep_gen_collector_.init(num_threads, alloc_cb, register_cb, free_cb, device_id, unregister_collector_memory);
     if (rc != 0) {
         return rc;
     }
@@ -1803,7 +1939,9 @@ int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHel
         return mem_alloc_.free(dev_ptr);
     };
 
-    int rc = scope_stats_collector_.init(num_threads, alloc_cb, register_cb, free_cb, device_id);
+    int rc = scope_stats_collector_.init(
+        num_threads, alloc_cb, register_cb, free_cb, device_id, unregister_collector_memory
+    );
     if (rc != 0) {
         return rc;
     }
@@ -1813,6 +1951,11 @@ int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHel
     return 0;
 }
 
+bool DeviceRunner::terminal_backing_retained() const {
+    return dump_collector_.terminal_backing_retained() || pmu_collector_.terminal_backing_retained() ||
+           dep_gen_collector_.terminal_backing_retained() || scope_stats_collector_.terminal_backing_retained();
+}
+
 int DeviceRunner::finalize_collectors(bool abandon_device_resources) {
     clear_collector_shape();
     auto healthy_unregister_cb = [](void *dev_ptr, int device_id) -> int {
@@ -1820,7 +1963,7 @@ int DeviceRunner::finalize_collectors(bool abandon_device_resources) {
         if (fn != nullptr) {
             return fn(dev_ptr, device_id);
         }
-        return 0;
+        return PTO_RUNTIME_ERR_INTERNAL;
     };
     auto no_op_unregister_cb = [](void *, int) -> int {
         return 0;
@@ -1852,18 +1995,13 @@ int DeviceRunner::finalize_collectors(bool abandon_device_resources) {
     if (scope_stats_collector_.is_initialized()) {
         scope_stats_collector_.finalize(unregister_cb, free_cb);
     }
+    if (terminal_backing_retained() && rc == 0) rc = PTO_RUNTIME_ERR_INTERNAL;
     return rc;
 }
 
 // =============================================================================
 // Group Z — #2267's late-read retention fixture (see run_retention_probe.h)
 // =============================================================================
-
-void RunRetentionProbePeer::run_streams(DeviceRunnerBase &runner, rtStream_t *aicpu, rtStream_t *aicore) {
-    auto &self = static_cast<DeviceRunner &>(runner);
-    *aicpu = static_cast<rtStream_t>(self.run_streams_.aicpu());
-    *aicore = static_cast<rtStream_t>(self.run_streams_.aicore());
-}
 
 int RunRetentionProbePeer::retire_predecessor_ownership(DeviceRunnerBase &runner, PreparedExecution &prepared) {
     auto &self = static_cast<DeviceRunner &>(runner);

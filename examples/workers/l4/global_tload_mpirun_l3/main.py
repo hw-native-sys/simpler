@@ -172,10 +172,10 @@ def run(  # noqa: PLR0913, PLR0915 -- mirrors the CLI surface; one linear two-ru
         worker.run(build_and_run, args=None, config=CallConfig())
         if domain_handle is None:
             raise RuntimeError("the Global CommDomain was not allocated")
-        domain = domain_handle
         observed: list[tuple[float, ...]] = []
 
         def read_and_release(orch, _args, _cfg):
+            domain = orch.get_domain("global-tload-mpirun-l3")
             try:
                 for domain_rank in range(member_count):
                     raw = orch.copy_from_global_domain(domain, domain_rank, COUNT * FLOAT_NBYTES, buffer="result")

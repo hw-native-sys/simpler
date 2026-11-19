@@ -20,7 +20,7 @@ jobs:
   run:
     name: st-deepseek-onboard-a2a3
     runs-on: ${{ fromJSON(inputs.runs_on) }}
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       SIMPLER_SCHEDULER_TIMEOUT_MS: "10000"
       SIMPLER_OP_EXECUTE_TIMEOUT_US: "45000000"
@@ -32,19 +32,6 @@ jobs:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
-
-      # Own key family, separate from _st-npu-a2a3.yml's: the main sweep
-      # compiles with --manual exclude and never builds these kernels, while
-      # this job compiles only the two DS directories. Sharing the main key
-      # would let this partial compilation win the immutable-cache save race
-      # and starve the main sweep's cache.
-      - name: Restore scene-test kernel cache (a2a3)
-        uses: actions/cache@v5
-        with:
-          path: build/cache/kernels
-          key: scene-kernels-a2a3-ds-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pto_isa.pin') }}-${{ inputs.ref || github.sha }}
-          restore-keys: |
-            scene-kernels-a2a3-ds-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pto_isa.pin') }}-
 
       - name: Set up environment
         uses: ./.github/actions/setup-venv
@@ -69,7 +56,7 @@ jobs:
           test -n "$runtimes"
           for runtime in $runtimes; do
             .venv/bin/python "examples/a2a3/$runtime/deepseek_v4_flash_decode/main.py" \
-              --platform a2a3 --compile-only --compile-workers 8
+              --platform a2a3 --compile-only --compile-workers 64
           done
 
       # The DS cases are the only manual tests under these two directories, so

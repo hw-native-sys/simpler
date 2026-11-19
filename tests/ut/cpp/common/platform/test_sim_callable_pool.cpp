@@ -33,18 +33,54 @@
 #include <gtest/gtest.h>
 
 #include <dlfcn.h>
+#include <pthread.h>
 
+#include <atomic>
+#include <cerrno>
+#include <climits>
+#include <csignal>
+#include <system_error>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
+#include <thread>
 
 #include "callable.h"
 #include "chip_callable_layout.h"
 #include "device_runner_base.h"
+#include "cpu_sim_context.h"
+#include "host/sim_thread_start_gate.h"
 #include "runtime.h"
+#include "profiler_test_allocator.h"
+
+#if defined(__linux__)
+static std::atomic<bool> reject_device_bind{false};
+static std::atomic<bool> reject_device_key{false};
+static std::atomic<int> reject_identity_key_after{-1};
+static std::atomic<bool> reject_thread_create{false};
+extern "C" int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*entry)(void *), void *arg) {
+    if (reject_thread_create.exchange(false)) return EAGAIN;
+    using Create = int (*)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
+    static auto real = reinterpret_cast<Create>(dlsym(RTLD_NEXT, "pthread_create"));
+    return real(thread, attr, entry, arg);
+}
+extern "C" int __real_pthread_setspecific(pthread_key_t, const void *);
+extern "C" int __real_pthread_key_create(pthread_key_t *, void (*)(void *));
+extern "C" int __wrap_pthread_setspecific(pthread_key_t key, const void *value) {
+    if (reject_device_bind.exchange(false)) return ENOMEM;
+    return __real_pthread_setspecific(key, value);
+}
+extern "C" int __wrap_pthread_key_create(pthread_key_t *key, void (*destroy)(void *)) {
+    if (reject_device_key.exchange(false) || reject_identity_key_after.fetch_sub(1) == 0) return EAGAIN;
+    return __real_pthread_key_create(key, destroy);
+}
+
+#endif
 
 namespace {
 
@@ -80,19 +116,34 @@ extern "C" int bind_callable_to_runtime_impl(
 
 namespace {
 
-// A concrete runner: the pure virtuals below are the execution surface, which
-// no case here drives. The accessors read the production pool the registration
-// publishes into.
+// The collector owns host storage for its terminal banks; this is the allocator pair the runner
+// would otherwise be handed by the platform.
+void *sim_bank_alloc(size_t size) { return profiler_test_calloc(size); }
+
+int sim_bank_free(void *ptr) {
+    std::free(ptr);
+    return 0;
+}
+
+// A concrete runner for registration and execution-owner contracts. The
+// accessors read the production pool published by registration.
 class PoolRunner : public SimDeviceRunnerBase {
 public:
+    const char *cpu_sim_target_family() const override { return "a2a3sim"; }
     int prepare_execution(
         Runtime & /*runtime*/, const CallConfig & /*config*/, uint32_t /*pipeline_slot*/,
         const NativeRunIdentity & /*identity*/, std::unique_ptr<PreparedExecution> * /*prepared*/
     ) override {
         return -1;
     }
-    LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> /*prepared*/, LaunchPermit /*permit*/) override {
-        return LaunchOutcome{};
+    bool throw_on_launch{false};
+    bool partial_on_launch{false};
+    int launch_calls{0};
+    LaunchTransactionResult launch_execution_impl(PreparedExecution & /*prepared*/, LaunchPermit /*permit*/) override {
+        ++launch_calls;
+        if (throw_on_launch) throw std::bad_alloc();
+        if (partial_on_launch) return LaunchTransactionResult{-4321, LaunchProgress::Partial, LaunchReceipt{}};
+        return LaunchTransactionResult{};
     }
     void abandon_prepared_execution(PreparedExecution & /*prepared*/) noexcept override {}
     int poll_execution(const ActiveExecution & /*active*/) override { return 0; }
@@ -104,6 +155,13 @@ public:
     // The bulk-free finalize() performs, so each case leaves no scratch or
     // handle behind.
     void release_all() { release_callable_state(); }
+    void release_retained_orchestration() { release_sm_mirrors(); }
+
+    // The diagnostic bank surface, which is a runner method rather than a pool one: the sim
+    // runner has its own copy of it and its own collector instance, so this is where a parity
+    // claim about banks can be made against sim code rather than against shared code.
+    uint64_t arm_terminal_bank(uint64_t run_epoch) { return arm_chip_swimlane_run_terminal_bank(run_epoch); }
+    ChipSwimlaneCollector &swimlane() { return chip_swimlane_collector_; }
 
     size_t pool_size() const { return chip_callable_buffers_.size(); }
 
@@ -157,7 +215,9 @@ std::vector<uint8_t> loadable_kernel_bytes() {
 }
 
 std::vector<uint8_t> make_child(const std::vector<uint8_t> &binary) {
-    return make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, binary.data(), static_cast<uint32_t>(binary.size()));
+    return make_callable<CORE_MAX_TENSOR_ARGS>(
+        nullptr, 0, binary.data(), static_cast<uint32_t>(binary.size()), {1, CoreAsyncMode::SYNCHRONOUS, 0, 0, 0}
+    );
 }
 
 // A ChipCallable whose children claim `func_ids`, each carrying `binary`.
@@ -170,7 +230,7 @@ make_chip(const std::vector<int32_t> &func_ids, const std::vector<uint8_t> &bina
     for (size_t i = 0; i < func_ids.size(); ++i)
         children.push_back(make_child(binary));
     const uint8_t orch[64] = {orch_tag};
-    return make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
+    return make_chip_callable(
         nullptr, 0, "orch_entry", orch, sizeof(orch), func_ids.data(), children.data(),
         static_cast<int32_t>(func_ids.size()), "orch_config"
     );
@@ -224,6 +284,77 @@ protected:
 // pool entry, and therefore no chip_dev any caller could reach. The successful
 // registration that follows proves the refused one left the pool usable rather
 // than merely empty.
+TEST_F(SimCallablePoolTest, AThrowingLaunchStillOwnsItsPreparedState) {
+    PoolRunner runner;
+    Runtime runtime;
+    auto prepared =
+        std::make_unique<PoolRunner::PreparedExecution>(NativeRunIdentity{10, 10, 10, 0}, runtime, CallConfig{}, 0);
+    auto *original = prepared.get();
+    runner.throw_on_launch = true;
+    auto outcome = runner.launch_execution(std::move(prepared), LaunchPermit{});
+    EXPECT_EQ(outcome.rc, PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(outcome.progress, LaunchProgress::Partial);
+    ASSERT_NE(outcome.active, nullptr);
+    EXPECT_EQ(outcome.active->prepared.get(), original);
+    EXPECT_EQ(outcome.active->progress, LaunchProgress::Partial);
+    EXPECT_FALSE(outcome.receipt.valid());
+    EXPECT_EQ(outcome.prepared, nullptr);
+    EXPECT_EQ(runner.launch_calls, 1);
+    EXPECT_FALSE(runner.can_accept_run());
+}
+
+TEST_F(SimCallablePoolTest, APartialLaunchStopsFurtherAdmission) {
+    PoolRunner runner;
+    Runtime runtime;
+    auto prepared =
+        std::make_unique<PoolRunner::PreparedExecution>(NativeRunIdentity{10, 10, 10, 0}, runtime, CallConfig{}, 0);
+    auto *original = prepared.get();
+    runner.partial_on_launch = true;
+    auto outcome = runner.launch_execution(std::move(prepared), LaunchPermit{});
+    EXPECT_EQ(outcome.rc, -4321);
+    EXPECT_EQ(outcome.progress, LaunchProgress::Partial);
+    ASSERT_NE(outcome.active, nullptr);
+    EXPECT_EQ(outcome.active->prepared.get(), original);
+    EXPECT_FALSE(runner.can_accept_run());
+}
+
+TEST_F(SimCallablePoolTest, AnEmptyLaunchNeverEntersTheBackend) {
+    PoolRunner runner;
+    auto outcome = runner.launch_execution(nullptr, LaunchPermit{});
+    EXPECT_NE(outcome.rc, 0);
+    EXPECT_EQ(outcome.progress, LaunchProgress::NotStarted);
+    EXPECT_EQ(outcome.prepared, nullptr);
+    EXPECT_EQ(outcome.active, nullptr);
+    EXPECT_EQ(runner.launch_calls, 0);
+}
+
+TEST_F(SimCallablePoolTest, RegistrationCanonicalizesUnknownWithoutMutatingInput) {
+    auto raw = make_chip({0, 7}, kernel_, 0x12);
+    auto *image = reinterpret_cast<ChipCallable *>(raw.data());
+    const_cast<CoreCallable &>(image->child(1)).async_capability_ = {};
+    const auto unchanged = raw;
+    auto canonical = raw;
+    normalize_chip_callable_buffer(canonical.data(), canonical.size());
+    const auto address = runner_.upload_chip_callable_buffer(as_chip(raw));
+    ASSERT_NE(address, 0u);
+    EXPECT_EQ(raw, unchanged);
+    EXPECT_EQ(runner_.upload_chip_callable_buffer(as_chip(canonical)), address);
+    EXPECT_EQ(runner_.pool_size(), 1u);
+    const auto *retained = reinterpret_cast<const ChipCallable *>(address);
+    EXPECT_EQ(retained->child(1).async_capability().mode, CoreAsyncMode::DEFERRED);
+    EXPECT_EQ(retained->child(1).async_capability().max_conditions, 64);
+    EXPECT_EQ(retained->child(1).async_capability().condition_types, 3);
+    EXPECT_EQ(runner_.view(hash_of(raw)).refcount, 2);
+}
+
+TEST_F(SimCallablePoolTest, RegistrationRejectsMalformedUnknown) {
+    auto raw = make_chip({0}, kernel_, 0x12);
+    auto *image = reinterpret_cast<ChipCallable *>(raw.data());
+    const_cast<CoreCallable &>(image->child(0)).async_capability_ = {1, static_cast<CoreAsyncMode>(0), 1, 0, 0};
+    EXPECT_EQ(runner_.upload_chip_callable_buffer(image), 0u);
+    EXPECT_EQ(runner_.pool_size(), 0u);
+}
+
 TEST_F(SimCallablePoolTest, AFailedRegistrationPublishesNothing) {
     const std::vector<uint8_t> unloadable = make_chip({0}, std::vector<uint8_t>(256, 0x7f), 0x11);
 
@@ -239,7 +370,7 @@ TEST_F(SimCallablePoolTest, AFailedRegistrationPublishesNothing) {
 // A func_id the runtime's tables cannot address is refused before anything is
 // allocated, so it too publishes nothing.
 TEST_F(SimCallablePoolTest, AnUnaddressableFuncIdPublishesNothing) {
-    const std::vector<uint8_t> chip = make_chip({RUNTIME_MAX_FUNC_ID}, kernel_, 0x33);
+    const std::vector<uint8_t> chip = make_chip({CHIP_MAX_FUNC_ID}, kernel_, 0x33);
     EXPECT_EQ(runner_.upload_chip_callable_buffer(as_chip(chip)), 0u);
     EXPECT_EQ(runner_.pool_size(), 0u);
 }
@@ -434,4 +565,368 @@ TEST_F(SimCallablePoolTest, ReRegisteringRebuildsTheTables) {
     EXPECT_NE(second.entry_table[0], 0u);
 }
 
+// Contract rows 37 and 39, where they meet: `arm_chip_swimlane_run_terminal_bank` is the
+// production function that turns "no bank is free" into the zero the device reads, and the sim
+// runner has its own copy of it and its own collector. This drives that function, not the
+// collector beneath it.
+//
+// Both of its zero-returning branches are covered: a collector with no shared region, where the
+// acquire succeeds and the *arm* refuses — the branch that must give the credit back, since
+// keeping it would retire one of the fixed banks per failed arm — and a full bank table, where
+// the acquire itself refuses.
+//
+// On what this says about parity more widely: the lane and the operation lease are shared code
+// a sim build links unchanged, but the C entry points beneath them are not — sim has its own
+// `prepare` / `launch` / `poll` / `wait` / `finalize`. So this is a parity claim about the bank
+// surface specifically, and the lifecycle rows are not transferred to sim by it.
+TEST_F(SimCallablePoolTest, TheSimRunnerHandsDiagnosticBanksOutByEpochAndRefusesBeyondTheBankCount) {
+    // No region yet, so the acquire inside the runner succeeds and the arm refuses. Zero reaches
+    // the device, and the bank it briefly took is not lost.
+    EXPECT_EQ(runner_.arm_terminal_bank(6001), 0u) << "the sim runner armed a bank with no shared region to arm it in";
+
+    ASSERT_EQ(
+        runner_.swimlane().initialize(
+            /*num_aicore=*/1, /*aicpu_thread_num=*/1, /*device_id=*/0, ChipSwimlaneLevel::SCHEDULE_TIMING,
+            sim_bank_alloc, nullptr, sim_bank_free
+        ),
+        0
+    );
+
+    std::vector<uint64_t> armed;
+    for (int index = 0; index < PLATFORM_RUN_TERMINAL_BANKS; index++) {
+        const uint64_t address = runner_.arm_terminal_bank(7000 + static_cast<uint64_t>(index));
+        EXPECT_NE(address, 0u) << "epoch " << (7000 + index)
+                               << " found no bank while the table was not yet full; a refused arm kept its credit";
+        armed.push_back(address);
+    }
+    EXPECT_EQ(std::set<uint64_t>(armed.begin(), armed.end()).size(), armed.size())
+        << "two live runs were armed into one bank";
+
+    // Beyond the count: zero, which is what the device reads as "publish no snapshot".
+    EXPECT_EQ(runner_.arm_terminal_bank(7999), 0u) << "the sim runner invented an address for a run with no bank";
+    // A holder re-arming gets its own storage back rather than a second bank.
+    EXPECT_EQ(runner_.arm_terminal_bank(7000), armed[0]);
+
+    // And the same release-then-serve order the onboard runner has.
+    runner_.swimlane().release_run_terminal_bank(7001);
+    EXPECT_EQ(runner_.arm_terminal_bank(7999), armed[1]) << "the released bank was not the one handed on";
+
+    runner_.swimlane().finalize(nullptr, sim_bank_free);
+}
+
+// Exercise the real runner storage and teardown helper; no device execution
+// is needed to observe host ownership. Finalization must drop every slot once.
+TEST(SimOrchestrationScratchTest, TeardownReleasesAllSlotsAndIsIdempotent) {
+    PoolRunner runner;
+    PoolRunner other;
+    constexpr uint32_t granted = 7;
+    ASSERT_TRUE(runner.set_run_resource_grant(granted));
+    ASSERT_TRUE(other.set_run_resource_grant(granted));
+    auto outside_grant = std::make_shared<int>(0);
+    std::weak_ptr<int> unretained = outside_grant;
+    runner.set_orchestration_scratch(granted, outside_grant);
+    outside_grant.reset();
+    EXPECT_TRUE(unretained.expired());
+    EXPECT_EQ(runner.get_orchestration_scratch(granted), nullptr);
+    int destroyed = 0;
+    std::vector<std::weak_ptr<void>> weak(granted);
+    for (uint32_t slot = 0; slot < granted; ++slot) {
+        std::shared_ptr<void> value(new int(slot), [&destroyed](void *p) {
+            ++destroyed;
+            delete static_cast<int *>(p);
+        });
+        weak[slot] = value;
+        runner.set_orchestration_scratch(slot, value);
+        EXPECT_EQ(other.get_orchestration_scratch(slot), nullptr);
+    }
+    EXPECT_EQ(destroyed, 0);
+    // A bind's local reference remains valid until that borrower leaves.
+    auto borrower = runner.get_orchestration_scratch(0);
+    runner.release_retained_orchestration();
+    EXPECT_EQ(destroyed, granted - 1);
+    EXPECT_FALSE(weak[0].expired());
+    for (uint32_t slot = 0; slot < granted; ++slot) {
+        EXPECT_EQ(runner.get_orchestration_scratch(slot), nullptr);
+        if (slot != 0) EXPECT_TRUE(weak[slot].expired());
+    }
+    borrower.reset();
+    EXPECT_TRUE(weak[0].expired());
+    EXPECT_EQ(destroyed, granted);
+    runner.release_retained_orchestration();
+    EXPECT_EQ(destroyed, granted);
+}
+
+TEST(SimOrchestrationScratchTest, RunnerDestructionReleasesRetainedStorage) {
+    std::weak_ptr<void> weak;
+    {
+        PoolRunner runner;
+        auto value = std::make_shared<int>(7);
+        weak = value;
+        runner.set_orchestration_scratch(0, value);
+        value.reset();
+        EXPECT_FALSE(weak.expired());
+    }
+    EXPECT_TRUE(weak.expired());
+}
+
 }  // namespace
+
+#if defined(__linux__)
+TEST(SimDeviceBinding, AttachReturnsBindingFailure) {
+    PoolRunner runner;
+    reject_device_bind = true;
+    EXPECT_NE(runner.attach_current_thread(0), 0);
+    reject_device_bind = false;
+    pto_cpu_sim_release_device(0);
+}
+TEST(SimDeviceBinding, FailedChildBindingDoesNotInvokeBodyAndIsJoinedBeforeThrow) {
+    PoolRunner runner;
+    ASSERT_EQ(runner.attach_current_thread(0), 0);
+    std::atomic<bool> body_ran{false};
+    reject_device_bind = true;
+    std::weak_ptr<int> child_capture;
+    bool threw = false;
+    try {
+        auto value = std::make_shared<int>(1);
+        child_capture = value;
+        auto child = runner.create_thread([&, value = std::move(value)] {
+            (void)value;
+            body_ran = true;
+        });
+        child.join();
+    } catch (const std::system_error &error) {
+        threw = true;
+        EXPECT_EQ(error.code().value(), ENOMEM);
+    }
+    reject_device_bind = false;
+    EXPECT_TRUE(threw);
+    EXPECT_FALSE(body_ran.load());
+    EXPECT_TRUE(child_capture.expired());
+    pto_cpu_sim_release_device(0);
+}
+
+TEST(SimDeviceBindingDeathTest, FailedKeyCreationIsReportedAndCanRetryWithoutChangingOtherKeys) {
+    ::testing::FLAGS_gtest_death_test_style = "threadsafe";
+    ASSERT_EXIT(
+        {
+            pthread_key_t sentinel_key;
+            if (pthread_key_create(&sentinel_key, nullptr) != 0) _exit(1);
+            int sentinel = 41;
+            if (pthread_setspecific(sentinel_key, &sentinel) != 0) _exit(2);
+            PoolRunner runner;
+            reject_device_key = true;
+            if (runner.attach_current_thread(0) == 0 || pto_cpu_sim_get_bound_device() != -1) _exit(3);
+            reject_device_key = true;
+            if (pto_cpu_sim_bind_device_checked(0) != EAGAIN) _exit(7);
+            if (pthread_getspecific(sentinel_key) != &sentinel) _exit(4);
+            if (pto_cpu_sim_bind_device_checked(0) != 0 || pto_cpu_sim_get_bound_device() != 0) _exit(5);
+            if (pto_cpu_sim_bind_device_checked(-1) != 0 || pto_cpu_sim_get_bound_device() != -1) _exit(6);
+            pthread_key_delete(sentinel_key);
+            _exit(0);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
+}
+TEST(SimDeviceBinding, FailedRebindPreservesPreviousDeviceAndSuccessfulChildIsIsolated) {
+    PoolRunner runner;
+    ASSERT_EQ(runner.attach_current_thread(0), 0);
+    ASSERT_EQ(pto_cpu_sim_bind_device_checked(7), 0);
+    reject_device_bind = true;
+    EXPECT_EQ(pto_cpu_sim_bind_device_checked(8), ENOMEM);
+    EXPECT_EQ(pto_cpu_sim_get_bound_device(), 7);
+    int child_device = -1;
+    auto child = runner.create_thread([&] {
+        child_device = pto_cpu_sim_get_bound_device();
+    });
+    child.join();
+    EXPECT_EQ(child_device, 0);
+    EXPECT_EQ(pto_cpu_sim_get_bound_device(), 7);
+    EXPECT_EQ(pto_cpu_sim_bind_device_checked(-1), 0);
+    pto_cpu_sim_release_device(0);
+}
+TEST(SimDeviceBinding, FailedThreadCreationReportsErrorWithoutInvokingBody) {
+    PoolRunner runner;
+    ASSERT_EQ(runner.attach_current_thread(0), 0);
+    std::atomic<bool> body_ran{false};
+    reject_thread_create = true;
+    bool threw = false;
+    try {
+        auto child = runner.create_thread([&] {
+            body_ran = true;
+        });
+        child.join();
+    } catch (const std::system_error &error) {
+        EXPECT_EQ(error.code().value(), EAGAIN);
+        threw = true;
+    }
+    reject_thread_create = false;
+    EXPECT_TRUE(threw);
+    EXPECT_FALSE(body_ran.load());
+    pto_cpu_sim_release_device(0);
+}
+
+TEST(SimDeviceBindingDeathTest, LegacyBindingFailureDoesNotReturnWithStaleDevice) {
+    ASSERT_EXIT(
+        {
+            if (pto_cpu_sim_bind_device_checked(7) != 0) _exit(1);
+            reject_device_bind = true;
+            pto_cpu_sim_bind_device(8);
+            _exit(0);
+        },
+        ::testing::KilledBySignal(SIGABRT), ""
+    );
+}
+
+#endif
+
+TEST(SimDeviceBinding, UninitializedRunnerCannotStartAnUnboundTask) {
+    PoolRunner runner;
+    std::atomic<bool> ran{false};
+    EXPECT_THROW(
+        {
+            auto child = runner.create_thread([&] {
+                ran = true;
+            });
+            child.join();
+        },
+        std::system_error
+    );
+    EXPECT_FALSE(ran.load());
+}
+
+TEST(SimDeviceBinding, CohortStartsOnlyAfterReleaseAndCanRetryAfterCancellation) {
+    PoolRunner runner;
+    ASSERT_EQ(runner.attach_current_thread(0), 0);
+    SimThreadStartGate startup;
+    for (bool release : {false, true}) {
+        startup.reset();
+        std::atomic<int> executed{0};
+        std::vector<std::thread> children;
+        for (int i = 0; i < 8; ++i) {
+            children.push_back(runner.create_thread([&] {
+                if (startup.wait()) {
+                    EXPECT_EQ(pto_cpu_sim_get_bound_device(), 0);
+                    ++executed;
+                }
+            }));
+        }
+        EXPECT_EQ(executed.load(), 0);
+        if (release) startup.release();
+        else startup.cancel();
+        for (auto &child : children)
+            child.join();
+        EXPECT_EQ(executed.load(), release ? 8 : 0);
+    }
+    pto_cpu_sim_bind_device(-1);
+    pto_cpu_sim_release_device(0);
+}
+
+TEST(SimDeviceBinding, SuccessfulLegacyBindingAndCheckedValidation) {
+    pto_cpu_sim_bind_device(7);
+    EXPECT_EQ(pto_cpu_sim_get_bound_device(), 7);
+    EXPECT_EQ(pto_cpu_sim_bind_device_checked(-2), EINVAL);
+    EXPECT_EQ(pto_cpu_sim_get_bound_device(), 7);
+    EXPECT_EQ(pto_cpu_sim_bind_device_checked(INT_MAX), 0);
+    EXPECT_EQ(pto_cpu_sim_get_bound_device(), INT_MAX);
+    pto_cpu_sim_bind_device(-1);
+    EXPECT_EQ(pto_cpu_sim_get_bound_device(), -1);
+}
+
+#if defined(__linux__)
+TEST(SimIdentityDeathTest, PartialKeyFailureRollsBackAndRetriesWithoutTouchingOtherKeys) {
+    for (int position : {0, 1, 2}) {
+        ASSERT_EXIT(
+            {
+                auto budget = [] {
+                    std::vector<pthread_key_t> keys;
+                    pthread_key_t key;
+                    while (pthread_key_create(&key, nullptr) == 0)
+                        keys.push_back(key);
+                    for (auto k : keys)
+                        pthread_key_delete(k);
+                    return keys.size();
+                };
+                pthread_key_t sentinel;
+                int value = 11;
+                if (pthread_key_create(&sentinel, nullptr) != 0 || pthread_setspecific(sentinel, &value) != 0) _exit(1);
+                const auto before = budget();
+                reject_identity_key_after = position;
+                if (sim_context_set_subblock_id(1) != EAGAIN) _exit(2);
+                reject_identity_key_after = -1;
+                if (budget() != before || pthread_getspecific(sentinel) != &value) _exit(3);
+                if (sim_context_set_subblock_id(1) != 0 || sim_context_set_cluster_id(7) != 0) _exit(4);
+                if (pto_sim_get_subblock_id() != 1) _exit(5);
+                if (budget() != before - 3 || pthread_getspecific(sentinel) != &value) _exit(6);
+                pthread_key_delete(sentinel);
+                _exit(0);
+            },
+            ::testing::ExitedWithCode(0), ""
+        );
+    }
+}
+TEST(SimIdentity, FailedUpdatesPreserveIdentityAndAllowRetry) {
+    ASSERT_EQ(sim_context_set_subblock_id(1), 0);
+    pto_cpu_sim_acquire_device(971);
+    ASSERT_EQ(pto_cpu_sim_bind_device_checked(971), 0);
+    ASSERT_EQ(sim_context_set_cluster_id(7), 0);
+    void *original = pto_sim_get_pipe_shared_state(1, 8);
+    ASSERT_NE(original, nullptr);
+    reject_device_bind = true;
+    EXPECT_EQ(sim_context_set_subblock_id(0), ENOMEM);
+    EXPECT_EQ(pto_sim_get_subblock_id(), 1u);
+    reject_device_bind = true;
+    EXPECT_EQ(sim_context_set_cluster_id(9), ENOMEM);
+    EXPECT_EQ(pto_sim_get_pipe_shared_state(1, 8), original);
+    ASSERT_EQ(sim_context_set_subblock_id(0), 0);
+    ASSERT_EQ(sim_context_set_cluster_id(9), 0);
+    EXPECT_EQ(pto_sim_get_subblock_id(), 0u);
+    EXPECT_NE(pto_sim_get_pipe_shared_state(1, 8), original);
+    pto_cpu_sim_bind_device(-1);
+    pto_cpu_sim_release_device(971);
+}
+#endif
+
+TEST(SimInvocationContext, BindingIsThreadLocalAndFailedUpdatePreservesContext) {
+    int first = 1;
+    int second = 2;
+    ASSERT_EQ(sim_context_bind_invocation_context(&first), 0);
+    EXPECT_EQ(sim_context_get_invocation_context(), &first);
+    bool other_ok = false;
+    std::thread other([&]() {
+        other_ok = sim_context_get_invocation_context() == nullptr &&
+                   sim_context_bind_invocation_context(&second) == 0 &&
+                   sim_context_get_invocation_context() == &second &&
+                   sim_context_bind_invocation_context(nullptr) == 0 && sim_context_get_invocation_context() == nullptr;
+    });
+    other.join();
+    EXPECT_TRUE(other_ok);
+    EXPECT_EQ(sim_context_get_invocation_context(), &first);
+#if defined(__linux__)
+    reject_device_bind = true;
+    EXPECT_EQ(sim_context_bind_invocation_context(&second), ENOMEM);
+    EXPECT_EQ(sim_context_get_invocation_context(), &first);
+#endif
+    ASSERT_EQ(sim_context_bind_invocation_context(nullptr), 0);
+    EXPECT_EQ(sim_context_get_invocation_context(), nullptr);
+}
+
+TEST(SimCancellation, BindingIsThreadLocalAndClearedBeforeReuse) {
+    constexpr uint32_t stop = 0x7ffffff0;
+    uint32_t running = 0;
+    uint32_t cancelled = stop;
+    ASSERT_EQ(pto_cpu_sim_bind_cancel_register(&running), 0);
+    EXPECT_FALSE(pto_cpu_sim_cancel_requested(stop));
+    bool other_ok = false;
+    std::thread other([&]() {
+        other_ok = !pto_cpu_sim_cancel_requested(stop) && pto_cpu_sim_bind_cancel_register(&cancelled) == 0 &&
+                   pto_cpu_sim_cancel_requested(stop) && pto_cpu_sim_bind_cancel_register(nullptr) == 0 &&
+                   !pto_cpu_sim_cancel_requested(stop);
+    });
+    other.join();
+    EXPECT_TRUE(other_ok);
+    EXPECT_FALSE(pto_cpu_sim_cancel_requested(stop));
+    ASSERT_EQ(pto_cpu_sim_bind_cancel_register(&cancelled), 0);
+    EXPECT_TRUE(pto_cpu_sim_cancel_requested(stop));
+    ASSERT_EQ(pto_cpu_sim_bind_cancel_register(nullptr), 0);
+    EXPECT_FALSE(pto_cpu_sim_cancel_requested(stop));
+}

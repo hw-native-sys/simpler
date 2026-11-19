@@ -16,10 +16,13 @@
  * the executor.
  */
 
+#include <cstddef>
 #include <cstdint>
+#include "aicore/sim_core_abi.h"
 #include <pthread.h>
 
 #include "inner_kernel.h"
+#include "aicore/sim_tls_state.h"
 #include "aicore/aicore.h"
 #include "aicore/aicore_profiling_state.h"
 #include "common/core_type.h"
@@ -39,20 +42,51 @@ static pthread_key_t g_chip_swimlane_aicore_head_slot_key;
 static pthread_key_t g_chip_swimlane_aicore_head_key;
 static pthread_key_t g_aicore_report_epoch_key;
 static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
+static pthread_key_t *const g_tls_keys[] = {
+    &g_reg_base_key,
+    &g_core_id_key,
+    &g_aicore_profiling_flag_key,
+    &g_chip_swimlane_aicore_head_slot_key,
+    &g_chip_swimlane_aicore_head_key,
+    &g_aicore_report_epoch_key,
+};
+static size_t g_tls_key_count = 0;
+static int g_tls_init_result = 0;
 
-static void create_tls_keys() {
-    pthread_key_create(&g_reg_base_key, nullptr);
-    pthread_key_create(&g_core_id_key, nullptr);
-    pthread_key_create(&g_aicore_profiling_flag_key, nullptr);
-    pthread_key_create(&g_chip_swimlane_aicore_head_slot_key, nullptr);
-    pthread_key_create(&g_chip_swimlane_aicore_head_key, nullptr);
-    pthread_key_create(&g_aicore_report_epoch_key, nullptr);
+static void release_tls_keys() {
+    while (g_tls_key_count != 0)
+        pthread_key_delete(*g_tls_keys[--g_tls_key_count]);
 }
 
-volatile uint8_t *sim_get_reg_base() { return static_cast<volatile uint8_t *>(pthread_getspecific(g_reg_base_key)); }
+// DeviceRunner joins every AICore thread before unloading its per-run SO.
+// POSIX keys belong to the process and need explicit deletion at that boundary.
+namespace {
+struct SimTlsKeyOwner {
+    ~SimTlsKeyOwner() { release_tls_keys(); }
+};
+SimTlsKeyOwner g_tls_key_owner;
+}  // namespace
+
+static void create_tls_keys() {
+    for (pthread_key_t *key : g_tls_keys) {
+        g_tls_init_result = pthread_key_create(key, nullptr);
+        if (g_tls_init_result != 0) {
+            release_tls_keys();
+            return;
+        }
+        ++g_tls_key_count;
+    }
+}
+
+extern "C" int initialize_aicore_sim_tls() {
+    const int result = pthread_once(&g_tls_once, create_tls_keys);
+    return result != 0 ? result : g_tls_init_result;
+}
+
+volatile uint8_t *sim_get_reg_base() { return static_cast<volatile uint8_t *>(sim_tls_value(g_reg_base_key)); }
 
 uint32_t sim_get_physical_core_id() {
-    return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_core_id_key)));
+    return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(sim_tls_value(g_core_id_key)));
 }
 
 // Per-core profiling state setters/getters. Same contract as the onboard
@@ -61,46 +95,44 @@ uint32_t sim_get_physical_core_id() {
 // aicore_execute keeps its original signature, and adding profiling fields
 // only touches KernelArgs + this state surface.
 __aicore__ void set_aicore_profiling_flag(uint32_t flag) {
-    pthread_setspecific(g_aicore_profiling_flag_key, reinterpret_cast<void *>(static_cast<uintptr_t>(flag)));
+    sim_set_tls_value(g_aicore_profiling_flag_key, reinterpret_cast<void *>(static_cast<uintptr_t>(flag)));
 }
 __aicore__ uint32_t get_aicore_profiling_flag() {
-    return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_aicore_profiling_flag_key)));
+    return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(sim_tls_value(g_aicore_profiling_flag_key)));
 }
 
 __aicore__ void set_aicore_report_epoch(uint64_t epoch) {
-    pthread_setspecific(g_aicore_report_epoch_key, reinterpret_cast<void *>(static_cast<uintptr_t>(epoch)));
+    sim_set_tls_value(g_aicore_report_epoch_key, reinterpret_cast<void *>(static_cast<uintptr_t>(epoch)));
 }
 __aicore__ uint64_t get_aicore_report_epoch() {
-    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_aicore_report_epoch_key)));
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(sim_tls_value(g_aicore_report_epoch_key)));
 }
 
 __aicore__ void set_chip_swimlane_aicore_head_slot(__gm__ uint64_t *slot_ptr) {
-    pthread_setspecific(g_chip_swimlane_aicore_head_slot_key, reinterpret_cast<void *>(slot_ptr));
-    pthread_setspecific(g_chip_swimlane_aicore_head_key, nullptr);  // force lazy resolve on next get
+    sim_set_tls_value(g_chip_swimlane_aicore_head_slot_key, reinterpret_cast<void *>(slot_ptr));
+    sim_set_tls_value(g_chip_swimlane_aicore_head_key, nullptr);  // force lazy resolve on next get
 }
 __aicore__ __gm__ ChipSwimlaneActiveHead *get_chip_swimlane_aicore_head() {
-    auto *cached =
-        reinterpret_cast<__gm__ ChipSwimlaneActiveHead *>(pthread_getspecific(g_chip_swimlane_aicore_head_key));
+    auto *cached = reinterpret_cast<__gm__ ChipSwimlaneActiveHead *>(sim_tls_value(g_chip_swimlane_aicore_head_key));
     if (cached != nullptr) return cached;
-    auto *slot = reinterpret_cast<__gm__ uint64_t *>(pthread_getspecific(g_chip_swimlane_aicore_head_slot_key));
+    auto *slot = reinterpret_cast<__gm__ uint64_t *>(sim_tls_value(g_chip_swimlane_aicore_head_slot_key));
     if (slot == nullptr) return nullptr;
     // Lazy first-call resolve — see aicore_profiling_state.h.
     cached = reinterpret_cast<__gm__ ChipSwimlaneActiveHead *>(*slot);
-    pthread_setspecific(g_chip_swimlane_aicore_head_key, reinterpret_cast<void *>(cached));
+    sim_set_tls_value(g_chip_swimlane_aicore_head_key, reinterpret_cast<void *>(cached));
     return cached;
 }
 
 // Core identity setter function pointers — set by DeviceRunner after dlopen.
 // These point into cpu_sim_context.cpp (host_runtime SO) and set per-thread
 // subblock_id and cluster_id for pto-isa's TPUSH/TPOP hooks.
-using SimSetUint32Fn = void (*)(uint32_t);
 
-static SimSetUint32Fn g_set_subblock_id_fn = nullptr;
-static SimSetUint32Fn g_set_cluster_id_fn = nullptr;
+static SimIdentitySetFn g_set_subblock_id_fn = nullptr;
+static SimIdentitySetFn g_set_cluster_id_fn = nullptr;
 
-extern "C" void set_sim_core_identity_helpers(void *set_subblock_id, void *set_cluster_id) {
-    g_set_subblock_id_fn = reinterpret_cast<SimSetUint32Fn>(set_subblock_id);
-    g_set_cluster_id_fn = reinterpret_cast<SimSetUint32Fn>(set_cluster_id);
+extern "C" void sim_install_core_identity_setters(SimIdentitySetFn set_subblock_id, SimIdentitySetFn set_cluster_id) {
+    g_set_subblock_id_fn = set_subblock_id;
+    g_set_cluster_id_fn = set_cluster_id;
 }
 
 // Declare the original function (defined in aicore_executor.cpp with weak linkage)
@@ -110,21 +142,28 @@ void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type);
 // KERNEL_ENTRY: receives launch arguments straight from the host, populates
 // the per-thread profiling slots via set_aicore_*(), then invokes the runtime
 // executor with its original signature.
-extern "C" void aicore_execute_wrapper(
+extern "C" int aicore_execute_wrapper_checked(
     __gm__ Runtime *runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs,
-    uint32_t enable_profiling_flag, uint64_t chip_swimlane_aicore_rotation_table, uint64_t report_epoch
+    uint32_t enable_profiling_flag, uint64_t chip_swimlane_aicore_rotation_table, uint64_t report_epoch,
+    SimAdmissionReportFn ready, void *startup
 ) {
-    pthread_once(&g_tls_once, create_tls_keys);
+    SimAicoreTlsBinding state(g_tls_keys);
+    int error = initialize_aicore_sim_tls();
+    if (error == 0) error = state.bind();
+    if (error != 0) {
+        ready(startup, error);
+        return error;
+    }
 
     // Set up simulated register base for this thread.
     // regs points to an array of uint64_t base addresses (one per core).
     // physical_core_id indexes into it to get this core's register block.
     if (regs != 0) {
         uint64_t *regs_array = reinterpret_cast<uint64_t *>(regs);
-        pthread_setspecific(g_reg_base_key, reinterpret_cast<void *>(regs_array[physical_core_id]));
+        sim_set_tls_value(g_reg_base_key, reinterpret_cast<void *>(regs_array[physical_core_id]));
     }
 
-    pthread_setspecific(g_core_id_key, reinterpret_cast<void *>(static_cast<uintptr_t>(physical_core_id)));
+    sim_set_tls_value(g_core_id_key, reinterpret_cast<void *>(static_cast<uintptr_t>(physical_core_id)));
 
     // Publish per-core profiling state before the executor runs.
     set_aicore_profiling_flag(enable_profiling_flag);
@@ -158,11 +197,14 @@ extern "C" void aicore_execute_wrapper(
     }
 
     if (g_set_subblock_id_fn != nullptr) {
-        g_set_subblock_id_fn(subblock_id);
+        error = g_set_subblock_id_fn(subblock_id);
     }
-    if (g_set_cluster_id_fn != nullptr) {
-        g_set_cluster_id_fn(cluster_id);
+    if (error == 0 && g_set_cluster_id_fn != nullptr) {
+        error = g_set_cluster_id_fn(cluster_id);
     }
 
-    aicore_execute(runtime, block_idx, core_type);
+    const bool admitted = ready(startup, error);
+    if (error == 0 && admitted) aicore_execute(runtime, block_idx, core_type);
+    const int clear_error = state.clear();
+    return error != 0 ? error : clear_error;
 }

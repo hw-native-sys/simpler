@@ -34,7 +34,7 @@ on:
       runs_on:
         description: "JSON-encoded runs-on value for the detector job."
         required: false
-        default: '["ubuntu-latest"]'
+        default: '["ubuntu-24.04"]'
         type: string
     outputs:
       a2a3_changed:
@@ -43,6 +43,9 @@ on:
       a5_changed:
         description: "Whether the diff can affect a5."
         value: ${{ jobs.detect.outputs.a5_changed }}
+      wse_changed:
+        description: "Whether the diff can affect WSE."
+        value: ${{ jobs.detect.outputs.wse_changed }}
       non_code_only:
         description: "Whether every changed file is non-code."
         value: ${{ jobs.detect.outputs.non_code_only }}
@@ -66,6 +69,7 @@ jobs:
     outputs:
       a2a3_changed: ${{ steps.check.outputs.a2a3_changed }}
       a5_changed: ${{ steps.check.outputs.a5_changed }}
+      wse_changed: ${{ steps.check.outputs.wse_changed }}
       non_code_only: ${{ steps.check.outputs.non_code_only }}
       st_affected: ${{ steps.check.outputs.st_affected }}
       ut_affected: ${{ steps.check.outputs.ut_affected }}
@@ -77,7 +81,7 @@ jobs:
         with:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || inputs.head_sha || github.sha }}
-          fetch-depth: 0
+          fetch-depth: 100
           persist-credentials: false
 
       - name: Check file changes
@@ -88,7 +92,7 @@ jobs:
           BASE_SHA: ${{ inputs.base_sha }}
           HEAD_SHA: ${{ inputs.head_sha }}
         run: |
-          HEAD_REV=HEAD
+          HEAD_REV=$(git rev-parse HEAD)
           if [ -n "$HEAD_SHA" ]; then
             if git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; then
               HEAD_REV="$HEAD_SHA"
@@ -98,25 +102,28 @@ jobs:
           fi
 
           BASE_URL="https://github.com/${BASE_REPOSITORY}.git"
-          BASE_REMOTE="refs/remotes/base/${BASE_REF}"
-          BASE_FETCHED=false
-          if git fetch --no-tags "$BASE_URL" "+refs/heads/${BASE_REF}:${BASE_REMOTE}"; then
-            BASE_FETCHED=true
-          else
-            echo "base fetch failed for ${BASE_REPOSITORY}/${BASE_REF}; treating diff as unattributable"
+          BASE="$BASE_SHA"
+          if [ -z "$BASE" ]; then
+            if git fetch --no-tags --depth=100 "$BASE_URL" "refs/heads/${BASE_REF}"; then
+              BASE=$(git rev-parse FETCH_HEAD)
+            else
+              echo "base fetch failed for ${BASE_REPOSITORY}/${BASE_REF}; treating diff as unattributable"
+            fi
+          elif ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=100 "$BASE_URL" "$BASE" || BASE=""
           fi
 
-          BASE=""
-          if [ -n "$BASE_SHA" ]; then
-            if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
-              git fetch --no-tags "$BASE_URL" "$BASE_SHA" || true
-            fi
-            BASE="$BASE_SHA"
-          elif [ "$BASE_FETCHED" = "true" ]; then
-            if ! BASE=$(git merge-base "$BASE_REMOTE" "$HEAD_REV"); then
-              echo "merge-base failed for $BASE_REMOTE...$HEAD_REV; treating diff as unattributable"
-              BASE=""
-            fi
+          if [ -n "$BASE" ]; then
+            for deepen in 100 400; do
+              if git merge-base "$BASE" "$HEAD_REV" >/dev/null 2>&1; then
+                break
+              fi
+              if [ "$(git rev-parse --is-shallow-repository)" != true ]; then
+                break
+              fi
+              git fetch --no-tags --deepen="$deepen" origin "$HEAD_REV" || break
+              git fetch --no-tags --deepen="$deepen" "$BASE_URL" "$BASE" || break
+            done
           fi
 
           # `run:` is `bash -e`, so a failing git diff would abort the step
@@ -138,6 +145,7 @@ jobs:
             echo "non_code_only=false" >> "$GITHUB_OUTPUT"
             echo "a2a3_changed=true" >> "$GITHUB_OUTPUT"
             echo "a5_changed=true" >> "$GITHUB_OUTPUT"
+            echo "wse_changed=true" >> "$GITHUB_OUTPUT"
             echo "st_affected=true" >> "$GITHUB_OUTPUT"
             echo "ut_affected=true" >> "$GITHUB_OUTPUT"
             echo "examples_only=false" >> "$GITHUB_OUTPUT"
@@ -162,43 +170,60 @@ jobs:
             echo "non_code_only=false" >> "$GITHUB_OUTPUT"
           fi
 
+          # This self-contained benchmark and its local tests run manually.
+          # Keep FILES intact for fail-open attribution, code classification and
+          # packaging gates; only automatic ST/UT impact excludes this subtree.
+          MANUAL_ONLY='^tests/fdwic/dsv41_scheduler/'
+          AUTO_TEST_FILES=$(echo "$FILES" | grep -vE "$MANUAL_ONLY" || true)
+
           # Architecture axis: skip a partition only when every changed file is
           # in the sibling partition or non-code.
+          WSE_ONLY='^(src/wse/|examples/wse/|tests/(st|ut/cpp)/wse/)'
           A5_ONLY='^(src/a5/|examples/a5/|tests/(st|ut/cpp)/a5/)'
-          A2A3_REMAINING=$(echo "$FILES" | grep -vE "$A5_ONLY" | grep -vE "$NON_CODE" || true)
+          A2A3_REMAINING=$(echo "$AUTO_TEST_FILES" | grep -vE "$A5_ONLY|$WSE_ONLY" | grep -vE "$NON_CODE" || true)
           if [ -n "$A2A3_REMAINING" ]; then
             echo "a2a3_changed=true" >> "$GITHUB_OUTPUT"
             echo "Files affecting a2a3:"
             echo "$A2A3_REMAINING"
           else
             echo "a2a3_changed=false" >> "$GITHUB_OUTPUT"
-            echo "All changes are a5-only or non-code; skipping a2a3"
+            echo "All changes are confined to other architectures or non-code; skipping a2a3"
           fi
 
           A2A3_ONLY='^(src/a2a3/|examples/a2a3/|tests/(st|ut/cpp)/a2a3/)'
-          A5_REMAINING=$(echo "$FILES" | grep -vE "$A2A3_ONLY" | grep -vE "$NON_CODE" || true)
+          A5_REMAINING=$(echo "$AUTO_TEST_FILES" | grep -vE "$A2A3_ONLY|$WSE_ONLY" | grep -vE "$NON_CODE" || true)
           if [ -n "$A5_REMAINING" ]; then
             echo "a5_changed=true" >> "$GITHUB_OUTPUT"
             echo "Files affecting a5:"
             echo "$A5_REMAINING"
           else
             echo "a5_changed=false" >> "$GITHUB_OUTPUT"
-            echo "All changes are a2a3-only or non-code; skipping a5"
+            echo "All changes are confined to other architectures or non-code; skipping a5"
           fi
 
-          # Test-category axis, same shape as the arch axis.
-          ST_ONLY='^(tests/st/|examples/)'
-          UT_ONLY='^tests/ut/'
+          WSE_REMAINING=$(echo "$AUTO_TEST_FILES" | grep -vE "$A2A3_ONLY|$A5_ONLY" | grep -vE "$NON_CODE" || true)
+          if [ -n "$WSE_REMAINING" ]; then
+            echo "wse_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Files affecting wse:"
+            echo "$WSE_REMAINING"
+          else
+            echo "wse_changed=false" >> "$GITHUB_OUTPUT"
+            echo "All changes are confined to other architectures or non-code; skipping wse"
+          fi
 
-          ST_REMAINING=$(echo "$FILES" | grep -vE "$UT_ONLY" | grep -vE "$NON_CODE" || true)
+          # Test-category axis. Repo-local tools are not used by scene tests.
+          ST_ONLY='^(tests/st/|examples/)'
+          UT_ONLY='^(tests/ut/|tools/)'
+
+          ST_REMAINING=$(echo "$AUTO_TEST_FILES" | grep -vE "$UT_ONLY" | grep -vE "$NON_CODE" || true)
           if [ -n "$ST_REMAINING" ]; then
             echo "st_affected=true" >> "$GITHUB_OUTPUT"
           else
             echo "st_affected=false" >> "$GITHUB_OUTPUT"
-            echo "All changes are unit-test-only or non-code; skipping scene tests"
+            echo "All changes are unit-test/tooling-only or non-code; skipping scene tests"
           fi
 
-          UT_REMAINING=$(echo "$FILES" | grep -vE "$ST_ONLY" | grep -vE "$NON_CODE" || true)
+          UT_REMAINING=$(echo "$AUTO_TEST_FILES" | grep -vE "$ST_ONLY" | grep -vE "$NON_CODE" || true)
           if [ -n "$UT_REMAINING" ]; then
             echo "ut_affected=true" >> "$GITHUB_OUTPUT"
           else

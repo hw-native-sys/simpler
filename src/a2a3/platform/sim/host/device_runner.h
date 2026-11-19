@@ -18,6 +18,7 @@
  */
 
 #pragma once
+#include "aicore/sim_core_abi.h"
 
 #include <cstdint>
 #include <memory>
@@ -25,6 +26,7 @@
 #include <vector>
 
 #include "common/core_type.h"
+#include "aicpu/native_invocation_entry.h"
 #include "device_runner_base.h"
 #include "host/dep_gen_collector.h"
 #include "sim_run_completion.h"
@@ -34,11 +36,12 @@ public:
     DeviceRunner();
     ~DeviceRunner() override;
 
+    const char *cpu_sim_target_family() const override { return "a2a3sim"; }
+
     int prepare_execution(
         Runtime &runtime, const CallConfig &config, uint32_t pipeline_slot, const NativeRunIdentity &identity,
         std::unique_ptr<PreparedExecution> *prepared
     ) override;
-    LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) override;
     void abandon_prepared_execution(PreparedExecution &prepared) noexcept override;
     int poll_execution(const ActiveExecution &active) override;
     DrainOutcome drain_execution(ActiveExecution &active) override;
@@ -46,15 +49,23 @@ public:
     // Also arms the loaded runtime's host-side graph capture, which a host-orch
     // runtime uses instead of the device collector. Defined in the .cpp so this
     // header stays free of the runtime-provided capture symbols.
-    void arm_host_dep_gen_capture(bool enable) override;
     void configure_dep_gen_retention(bool enabled, std::size_t budget_bytes) override;
     bool dep_gen_retains_runs() const override;
-    int admit_dep_gen_run(const DfxRunConfig &dfx, uint64_t run_epoch) override;
+    int admit_dep_gen_run(
+        const DfxRunConfig &dfx, uint64_t run_epoch, simpler::dfx::runs::AdmissionRefusal *why = nullptr
+    ) override;
+    bool dep_gen_can_admit_joined_run(uint64_t run_epoch) const override;
+    uint64_t dep_gen_run_terminal_bank(uint64_t run_epoch) const override;
+    int open_dep_gen_run_terminal_banks(const DfxRunConfig &dfx) override;
+    void install_dep_gen_credit_release_notifier(const std::function<void()> &notify) override;
+    bool dep_gen_retained_runs_outstanding() const override;
     void withdraw_dep_gen_run(uint64_t run_epoch) noexcept override;
     bool dep_gen_flush_retained(int timeout_ms, std::string *error) override;
     void dep_gen_finish_retained() override;
 
 private:
+    LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override;
+
     struct ActiveRun;
 
     int ensure_binaries_loaded() override;
@@ -87,7 +98,9 @@ private:
      * whole of the completion proof: without it the retained path reads nothing
      * shared and publishes nothing.
      */
-    void emit_device_dep_gen_graph(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
+    void emit_device_dep_gen_graph(
+        const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
+    );
 
     // Per-run collector teardown: releases shared memory back to mem_alloc_.
     // Idempotent. Mirrors the onboard helper.
@@ -97,14 +110,17 @@ private:
      * ArgsDump, whose last host sealing happens there.
      */
     int finalize_collectors();
+    bool terminal_backing_retained() const override;
 
     // a2a3 sim's dlsym'd function-pointer table. Loaded once via
     // ensure_binaries_loaded(), nulled on unload_executor_binaries().
     int (*aicpu_execute_func_)(Runtime *){nullptr};
+    NativeInvocationFunctions native_invocation_functions_;
     // The runtime exports simpler_aicpu_register_callable(void*) directly (TMARB
     // only; hbg does not export it). Optional dlsym: null on the hbg SO.
     int (*aicpu_register_callable_func_)(void *){nullptr};
-    void (*aicore_execute_func_)(Runtime *, int, CoreType, uint32_t, uint64_t, uint32_t, uint64_t, uint64_t){nullptr};
+    SimA2a3CoreEntryFn aicore_execute_func_{nullptr};
+    int (*bind_aicpu_thread_func_)(int32_t *){nullptr};
     void (*set_platform_regs_func_)(uint64_t){nullptr};
     void (*set_orch_device_id_func_)(int){nullptr};
     void (*set_scheduler_timeout_ms_func_)(int){nullptr};
@@ -123,6 +139,12 @@ private:
     void (*set_dep_gen_enabled_func_)(bool){nullptr};
     void (*set_scope_stats_enabled_func_)(bool){nullptr};
     void (*set_platform_scope_stats_base_func_)(uint64_t){nullptr};
+    // This run's terminal bank for each queue-pair owner, pushed per run the
+    // same way the swimlane's is. C linkage on all four, reached by `dlsym`.
+    void (*set_platform_dump_args_run_terminal_func_)(uint64_t){nullptr};
+    void (*set_platform_pmu_run_terminal_func_)(uint64_t){nullptr};
+    void (*set_platform_dep_gen_run_terminal_func_)(uint64_t){nullptr};
+    void (*set_platform_scope_stats_run_terminal_func_)(uint64_t){nullptr};
 
     // dep_gen collector — captures orchestrator submit_task inputs for offline replay.
     // a2a3-only; a5 has no dep_gen.

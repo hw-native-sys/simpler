@@ -32,10 +32,44 @@
 #include "common/dma_workspace.h"
 
 #ifdef __cplusplus
+#include <type_traits>
 extern "C" {
 #endif
 
 typedef struct CommHandle_ *CommHandle;
+
+typedef enum CommCcuMode { COMM_CCU_MODE_MS = 0, COMM_CCU_MODE_SCHED = 1 } CommCcuMode;
+
+// Host-side options copied through the domain-allocation control request.
+typedef struct CommWorkspaceConfig {
+    uint32_t urma_jetties_per_aiv;
+    uint32_t urma_sq_depth;
+    uint32_t ccu_mode;
+} CommWorkspaceConfig;
+#ifdef __cplusplus
+static_assert(std::is_trivially_copyable_v<CommWorkspaceConfig> && std::is_standard_layout_v<CommWorkspaceConfig>);
+static_assert(sizeof(CommWorkspaceConfig) == 12);
+#endif
+// Internal callable execution controls: activate=1, stop/poll=3, abort=4, discard preparation=7.
+int comm_control_ccu_run(CommHandle h, uint64_t registration_id, uint32_t operation, uint64_t generation);
+
+// Domain allocation failures that callers can distinguish from generic ACL errors.
+typedef enum CommDomainStatus {
+    COMM_DOMAIN_WORKSPACE_UNSUPPORTED = -2,
+    COMM_DOMAIN_URMA_CONFIG_INVALID = -3,
+    COMM_DOMAIN_URMA_INIT_FAILED = -4,
+    COMM_DOMAIN_URMA_WORKSPACE_INVALID = -5,
+} CommDomainStatus;
+
+// The backend still owns resources whose reclamation could not be confirmed.
+// Callers must retain the handle, its stream and device environment; retrying
+// destruction is not supported without a backend-specific recovery contract.
+enum { COMM_RECLAMATION_UNCONFIRMED = -6 };
+
+// Initialization failed but its unpublished allocation still owns resources.
+// Join every participant's allocation request before aborting these owners;
+// a peer may still be importing an exported handle. This is not a usable domain.
+enum { COMM_INITIALIZATION_ABORT_REQUIRED = -7 };
 
 #define COMM_GLOBAL_DOMAIN_VERSION 2U
 #define COMM_GLOBAL_DOMAIN_HANDLE_BYTES 256U
@@ -107,11 +141,10 @@ uint32_t dma_workspace_channel_count(void);
  * dma_workspace_release(). Bits outside dma_workspace_supported_mask() are
  * rejected, so provisioning fails fast on a platform/runtime without SDMA.
  *
- * At most one bit may be set. A single opaque handle cannot own two providers,
- * and dma_workspace_release() recovers the concrete type by casting it, so a
- * second engine would be released as the type of the first. Provisioning more
- * than one engine per call needs a per-kind handle on both sides of this seam;
- * until then callers get a rejection rather than that silent type confusion.
+ * At most one bit may be set: each backend's opaque owner supports one provider.
+ * A failed provision may return a non-null handle when reclamation cannot be
+ * confirmed. Retain that handle, keep the device addresses unpublished, and
+ * stop using this owner; a non-null handle alone does not imply successful Init.
  *
  * @return 0 on success, non-zero on invalid/unsupported input or provisioning
  *         failure.
@@ -119,11 +152,14 @@ uint32_t dma_workspace_channel_count(void);
 int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_out, int count, void **handle_out);
 
 /**
- * Release the resources returned by a successful dma_workspace_provision().
- * Ordinary teardown: destroys the provider's streams and workspace. A null
- * handle is a no-op.
+ * Release an owner returned by dma_workspace_provision(). Ordinary teardown
+ * destroys provider resources before freeing the caller-owned device allocation.
+ * Returns 0 and consumes the handle on success (including a null handle).
+ * COMM_RECLAMATION_UNCONFIRMED retains the handle and allocation identity;
+ * the caller must preserve them and stop using the owner. Repeated release of
+ * an unconfirmed owner returns the same error without retrying device teardown.
  */
-void dma_workspace_release(void *handle);
+int dma_workspace_release(void *handle);
 
 /**
  * Initialize a communicator for the given rank.
@@ -238,48 +274,126 @@ int comm_derive_context(
  * @param h                       Base handle from comm_init().
  * @param allocation_id           Caller-assigned unique id; scopes the
  *                                handshake / barrier filenames.  Must be
- *                                unique among currently-live allocations
- *                                on this handle.
+ *                                unique for the lifetime of this handle, including
+ *                                failed and released allocations (A5 enforces this).
  * @param rank_ids                Base-communicator rank ids in dense
  *                                domain order (length rank_count).
  * @param rank_count              Number of subset members.
  * @param domain_rank             This caller's dense rank in the subset.
- * @param window_size             Bytes per rank.  Backend must allocate
- *                                exactly this size; no auto-rounding.
+ * @param window_size             Requested bytes per rank. Backend may round
+ *                                up to its allocation granularity.
+ * @param workspace_mask          Requested async engines, bit N for CommWorkspaceKind N.
+ *                                Zero creates synchronous mapped windows only.
+ *                                All members must request the same mask.
+ *                                A5 accepts compiled engines; RDMA requires its
+ *                                own domain. A2/A3 and sim require zero.
  * @param device_ctx_out          Receives a device pointer to a new
  *                                CommContext for the subset.
  * @param local_window_base_out   Receives this rank's local window start
  *                                address (for buffer carving on the
  *                                caller side).
- * @return 0 on success, non-zero on failure.
+ * @param actual_window_size_out  Receives the allocated per-rank byte extent.
+ * @param workspace_config       Optional engine configuration; null uses one URMA
+ *                               jetty per AIV and provider-default SQ depth.
+ *                               All members must request the same configuration.
+ * @return 0 on success. COMM_INITIALIZATION_ABORT_REQUIRED means initialization
+ *         failed with an unpublished owner: join all allocation requests, then
+ *         call comm_abort_domain_windows for this allocation. Output pointers
+ *         are not published. Other non-zero values report failure; the retained
+ *         error contract also applies to COMM_RECLAMATION_UNCONFIRMED.
  */
 int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out
+    size_t window_size, uint32_t workspace_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
+    size_t *actual_window_size_out,
+    const CommWorkspaceConfig *workspace_config
+#ifdef __cplusplus
+    = nullptr
+#endif
 );
 
 /**
- * Collectively release a domain window pool allocated by
- * comm_alloc_domain_windows().
+ * Initialize a Host-backed domain window identified by host_shm_name, a bare
+ * name of at most 31 ASCII letters, digits, underscores or hyphens.
+ * The native rank creates, registers and unlinks its local POSIX backing.
+ * The caller supplies the name and may borrow a CPU mapping. Local device
+ * mappings support MTE. On A5, a Host domain with an empty workspace mask imports and registers peer
+ * Host windows in the requesting process for synchronous MTE reads through
+ * windowsIn. A Host URMA domain leaves all windowsIn entries zero and supplies
+ * peer MR addresses through the workspace for asynchronous reads.
+ * On A2/A3, the SDMA bit enables peer mappings for the
+ * Worker-owned SDMA workspace.
+ * Abort and release use the same entry points as comm_alloc_domain_windows.
+ * This symbol is optional on other backends.
+ */
+int comm_alloc_host_domain_windows(
+    CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
+    size_t window_size, uint32_t workspace_mask, const char *host_shm_name, uint64_t *device_ctx_out,
+    uint64_t *local_window_base_out, size_t *actual_window_size_out,
+    const CommWorkspaceConfig *workspace_config
+#ifdef __cplusplus
+    = nullptr
+#endif
+);
+
+/* Register/cache all callable kernels for a rank topology, independently of window allocation.
+ * collective_id is assigned once by the parent across all participating ranks.
+ * The returned registration_id is rank-local. The communicator owns registration
+ * resources until confirmed comm_destroy. */
+int comm_register_ccu_callable(
+    CommHandle h, uint32_t workspace_mask, uint64_t collective_id, const uint32_t *rank_ids, size_t rank_count,
+    uint32_t domain_rank, const void *module_package, size_t module_package_size, const uint8_t sdk_build_id[32],
+    const uint8_t pto_isa_build_id[32], uint64_t *registration_id
+);
+/* Domain registration and execution-set APIs are optional backend symbols. */
+int comm_register_domain_ccu(
+    CommHandle h, uint64_t allocation_id, uint64_t collective_id, uint32_t ccu_id, const void *module_package,
+    size_t module_package_size, const uint8_t sdk_build_id[32], const uint8_t pto_isa_build_id[32],
+    uint64_t *registration_id
+);
+int comm_release_ccu_registration(CommHandle h, uint64_t registration_id);
+int comm_prepare_ccu_run_set(
+    CommHandle h, const uint64_t *registrations, size_t count, uint64_t generation, uint64_t *set_id,
+    uint64_t *workspace
+);
+int comm_control_ccu_run_set(CommHandle h, uint64_t set_id, uint32_t operation);
+
+/* Prepare independent run storage; valid while a previous execution is active. */
+int comm_prepare_ccu_run(
+    CommHandle h, uint64_t registration_id, uint64_t generation, uint64_t allocation_id, uint64_t *workspace
+);
+
+/**
+ * Release the per-rank resources of a published communication domain.
  *
- * Frees the per-rank buffer (HCCL: aclrtFree; sim: munmap + shm_unlink)
- * and the device-side CommContext.  Synchronises subset members via a
- * release barrier scoped by `allocation_id` + the caller's `domain_rank`
- * within the subset.  `rank_count` is the subset size — used only to
- * size the barrier wait, not the rank list (which was already established
- * during alloc).
+ * Frees domain-owned local/peer windows, communication resources and the
+ * device-side CommContext. The caller must prove all domain users have
+ * stopped before invoking this API. A2/A3 Host-backed domains release
+ * each rank's resources independently after that fence. Backends that
+ * use a native subset barrier scope it by `allocation_id` and use
+ * `rank_count` for its participant count and `domain_rank` for the caller's position.
  *
- * IPC import refs and EnablePeerAccess routes are NOT explicitly torn
- * down — they get reclaimed by aclrtResetDevice at DeviceRunner::finalize.
- * Mirrors the lifetime contract of comm_alloc_windows on HCCL.
+ * Domain VMM mappings and imported physical handles are released explicitly.
+ * Shared workspace borrows end here; process-wide EnablePeerAccess routes and
+ * communicator-owned workspaces remain owned by their enclosing lifetime.
+ * COMM_RECLAMATION_UNCONFIRMED retains the domain on h, including on allocation
+ * rollback, and forbids further use or destruction of the enclosing session.
  *
  * @param h               Base handle from comm_init().
- * @param allocation_id   Same id passed to comm_alloc_domain_windows.
- * @param rank_count      Number of subset members (for barrier sizing).
+ * @param allocation_id   Same id passed to the domain allocation entry point.
+ * @param rank_count      Number of subset members.
  * @param domain_rank     This caller's dense rank in the subset.
  * @return 0 on success, non-zero on failure.
  */
 int comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
+
+/**
+ * Roll back an unpublished domain without a release collective. The parent
+ * must have joined all allocation requests and proved the domain was never
+ * exposed to device users. Successful participants can abort even when another
+ * member failed initialization. Retained-error ownership matches release.
+ */
+int comm_abort_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
 
 /**
  * Create one local window for a Global CommDomain and export its transport
@@ -330,7 +444,8 @@ int comm_barrier(CommHandle h);
 /**
  * Destroy the communicator and release all resources.
  *
- * After this call the handle is invalid.
+ * The handle is consumed except when COMM_RECLAMATION_UNCONFIRMED is returned.
+ * That result retains the owner and its dependent stream/device environment.
  *
  * @param h  Handle from comm_init().
  * @return 0 on success, non-zero on failure.

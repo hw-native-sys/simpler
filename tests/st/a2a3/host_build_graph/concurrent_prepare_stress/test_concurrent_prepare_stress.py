@@ -137,8 +137,8 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
         The property folds ``initialized_``, the runtime PipelineContract's
         ``pipeline_depth > 1``, and the runtime's concurrent-prepare capability
         symbol. On a2a3 host_build_graph all three hold unconditionally — the
-        contract declares depth 2 (as does every onboard runtime, and
-        PTO_PIPELINE_MAX_DEPTH is 2) and the capability impl returns 1 outright —
+        contract declares no limit of its own and this Worker is granted the
+        standing default of two — and the capability impl returns 1 outright —
         so a false here means one of them regressed, not that this box is
         differently configured. Neither is reachable from a CallConfig, which is
         why this is an assert and not a skip: skipping would report green for the
@@ -149,7 +149,7 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
         """
         chip_worker = worker._chip_worker
         assert chip_worker is not None
-        assert chip_worker._impl.supports_concurrent_native_prepare, (
+        assert chip_worker.supports_concurrent_native_prepare, (
             f"a2a3 host_build_graph must be able to stage a successor, have pipeline_depth={chip_worker.pipeline_depth}"
         )
         return chip_worker
@@ -157,11 +157,11 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
     @contextlib.contextmanager
     def _registered_callable(self, chip_worker, callable_id, callable_obj):
         """Hold ``callable_obj`` in one slot for the duration of the block."""
-        chip_worker._register_callable_at_slot(callable_id, callable_obj)
+        chip_worker.register_callable(callable_id, callable_obj)
         try:
             yield
         finally:
-            chip_worker._unregister_slot(callable_id)
+            chip_worker.unregister_callable(callable_id)
 
     def _submit_iteration(self, chip_worker, callable_id, orch_sig, config, iteration):
         """Submit run ``iteration`` with its own data; return its in-flight entry.
@@ -177,7 +177,7 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
         chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
         golden_args = test_args.clone()
         self.compute_golden(golden_args, params)
-        chip_run = chip_worker._impl._submit_chip_run_direct(callable_id, chip_args, config)
+        chip_run = chip_worker._submit_chip_run_direct(callable_id, chip_args, config)
         return (chip_run, test_args, golden_args, output_names, chip_args, iteration)
 
     def _retire(self, entry):

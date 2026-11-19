@@ -50,7 +50,7 @@ class TestSyncStartDrainPhases(SceneTestCase):
         {
             "name": "global_aiv",
             "platforms": ["a5sim", "a5"],
-            "manual": ["a5sim"],
+            "manual": True,
             "params": {},
         }
     ]

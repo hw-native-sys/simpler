@@ -1,0 +1,2226 @@
+[
+  {
+    "rank": 0,
+    "entries": [
+      {
+        "index": 0,
+        "name": "engram_lookup",
+        "shape": [
+          2,
+          80,
+          6144
+        ],
+        "kind": "DEVICE",
+        "bytes": 1966080,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 0
+      },
+      {
+        "index": 1,
+        "name": "engram_wkv",
+        "shape": [
+          2,
+          6144,
+          25600
+        ],
+        "kind": "DEVICE",
+        "bytes": 314572800,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 0
+      },
+      {
+        "index": 2,
+        "name": "engram_wkv_scale",
+        "shape": [
+          384,
+          25600
+        ],
+        "kind": "DEVICE",
+        "bytes": 9830400,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 0
+      },
+      {
+        "index": 3,
+        "name": "engram_weight",
+        "shape": [
+          2,
+          4,
+          5120
+        ],
+        "kind": "DEVICE",
+        "bytes": 163840,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 0
+      },
+      {
+        "index": 4,
+        "name": "x_hc",
+        "shape": [
+          80,
+          4,
+          5120
+        ],
+        "kind": "DEVICE",
+        "bytes": 6553600,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 0
+      },
+      {
+        "index": 5,
+        "name": "pre_mix",
+        "shape": [
+          80,
+          4
+        ],
+        "kind": "DEVICE",
+        "bytes": 1280,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 0
+      },
+      {
+        "index": 6,
+        "name": "dspark_target_hidden",
+        "shape": [
+          80,
+          15360
+        ],
+        "kind": "DEVICE",
+        "bytes": 2457600,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 0
+      },
+      {
+        "index": 7,
+        "name": "hc_attn_fn",
+        "shape": [
+          960,
+          20480
+        ],
+        "kind": "DEVICE",
+        "bytes": 78643200,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 0
+      },
+      {
+        "index": 8,
+        "name": "hc_attn_scale",
+        "shape": [
+          120
+        ],
+        "kind": "DEVICE",
+        "bytes": 480,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "e00e5eb9444182f352323374ef4e08ebcb784725fdd4fd612d7730540b3e0c8c",
+        "rank_slice": 0
+      },
+      {
+        "index": 9,
+        "name": "hc_attn_base",
+        "shape": [
+          960
+        ],
+        "kind": "DEVICE",
+        "bytes": 3840,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 0
+      },
+      {
+        "index": 10,
+        "name": "attn_norm_weight",
+        "shape": [
+          204800
+        ],
+        "kind": "DEVICE",
+        "bytes": 409600,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 0
+      },
+      {
+        "index": 11,
+        "name": "wq_a",
+        "shape": [
+          40,
+          5120,
+          1280
+        ],
+        "kind": "DEVICE",
+        "bytes": 262144000,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 0
+      },
+      {
+        "index": 12,
+        "name": "q_norm_weight",
+        "shape": [
+          51200
+        ],
+        "kind": "DEVICE",
+        "bytes": 102400,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 0
+      },
+      {
+        "index": 13,
+        "name": "wq_b",
+        "shape": [
+          40,
+          1280,
+          32768
+        ],
+        "kind": "DEVICE",
+        "bytes": 1677721600,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 0
+      },
+      {
+        "index": 14,
+        "name": "wkv",
+        "shape": [
+          40,
+          5120,
+          512
+        ],
+        "kind": "DEVICE",
+        "bytes": 104857600,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 0
+      },
+      {
+        "index": 15,
+        "name": "kv_norm_weight",
+        "shape": [
+          20480
+        ],
+        "kind": "DEVICE",
+        "bytes": 40960,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 0
+      },
+      {
+        "index": 16,
+        "name": "attn_sink",
+        "shape": [
+          2560
+        ],
+        "kind": "DEVICE",
+        "bytes": 10240,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 0
+      },
+      {
+        "index": 17,
+        "name": "wo_a",
+        "shape": [
+          320,
+          4096,
+          1024
+        ],
+        "kind": "DEVICE",
+        "bytes": 1342177280,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 0
+      },
+      {
+        "index": 18,
+        "name": "wo_a_scale",
+        "shape": [
+          320,
+          128,
+          1024
+        ],
+        "kind": "DEVICE",
+        "bytes": 41943040,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 0
+      },
+      {
+        "index": 19,
+        "name": "wo_b",
+        "shape": [
+          40,
+          8192,
+          5120
+        ],
+        "kind": "DEVICE",
+        "bytes": 1677721600,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 0
+      },
+      {
+        "index": 20,
+        "name": "freqs_cos",
+        "shape": [
+          2,
+          6,
+          32
+        ],
+        "kind": "DEVICE",
+        "bytes": 1536,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "cc7fd71ac71da2d1d2a7de6d7226621c3412a40b79b19cd764c83ea21872922f",
+        "rank_slice": 0
+      },
+      {
+        "index": 21,
+        "name": "freqs_sin",
+        "shape": [
+          2,
+          6,
+          32
+        ],
+        "kind": "DEVICE",
+        "bytes": 1536,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "9c0b1ea5d99739ad2ba7c066f319e395f60e5cd4317eddcfbd4bb1b3ebd9e089",
+        "rank_slice": 0
+      },
+      {
+        "index": 22,
+        "name": "window_slots",
+        "shape": [
+          72
+        ],
+        "kind": "DEVICE",
+        "bytes": 576,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "539fea80c782d165cab51e6b52c4acdd1f32c9a999e30eac53e1a8f670248c70",
+        "rank_slice": 0
+      },
+      {
+        "index": 23,
+        "name": "window_indices",
+        "shape": [
+          72,
+          128
+        ],
+        "kind": "DEVICE",
+        "bytes": 36864,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "7c6cbcef9ac24956b196fe49d5135d1cb0ee7e90ba402e8c413e0f662f979784",
+        "rank_slice": 0
+      },
+      {
+        "index": 24,
+        "name": "window_cache_pool",
+        "shape": [
+          480,
+          128,
+          1,
+          544
+        ],
+        "kind": "DEVICE",
+        "bytes": 33423360,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 0
+      },
+      {
+        "index": 25,
+        "name": "compressed_cache_pool",
+        "shape": [
+          48,
+          128,
+          1,
+          320
+        ],
+        "kind": "DEVICE",
+        "bytes": 1966080,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 0
+      },
+      {
+        "index": 26,
+        "name": "token_to_req_indices",
+        "shape": [
+          72
+        ],
+        "kind": "DEVICE",
+        "bytes": 288,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "5819b90cbb81303c5ea61668fb123326f973c3f19c5c2bd1d42964633738ed6f",
+        "rank_slice": 0
+      },
+      {
+        "index": 27,
+        "name": "position_ids",
+        "shape": [
+          72
+        ],
+        "kind": "DEVICE",
+        "bytes": 288,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "ca59aaaa0f1e145768e7dba210fc007dee5740c5cac9b21202966b82dcbed0b0",
+        "rank_slice": 0
+      },
+      {
+        "index": 28,
+        "name": "index_cache_pool",
+        "shape": [
+          48,
+          128,
+          1,
+          64
+        ],
+        "kind": "DEVICE",
+        "bytes": 393216,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 0
+      },
+      {
+        "index": 29,
+        "name": "index_cache_scale_pool",
+        "shape": [
+          48,
+          128,
+          1,
+          4
+        ],
+        "kind": "DEVICE",
+        "bytes": 24576,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 0
+      },
+      {
+        "index": 30,
+        "name": "c2a_index_block_table",
+        "shape": [
+          12,
+          1
+        ],
+        "kind": "DEVICE",
+        "bytes": 48,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "b68e9a05823d7b9bcae5177815047c2635261fe99e7771c3ed4f8c8185216e39",
+        "rank_slice": 0
+      },
+      {
+        "index": 31,
+        "name": "c1a_index_block_table",
+        "shape": [
+          12,
+          2
+        ],
+        "kind": "DEVICE",
+        "bytes": 96,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "47c263db531645f32d351d19e572b02ee0739cc177fde4095fb5e08cb06d9e3d",
+        "rank_slice": 0
+      },
+      {
+        "index": 32,
+        "name": "c2a_compressor_wkv",
+        "shape": [
+          3,
+          5120,
+          512
+        ],
+        "kind": "DEVICE",
+        "bytes": 15728640,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 0
+      },
+      {
+        "index": 33,
+        "name": "c2a_compressor_wgate",
+        "shape": [
+          3,
+          5120,
+          512
+        ],
+        "kind": "DEVICE",
+        "bytes": 15728640,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 0
+      },
+      {
+        "index": 34,
+        "name": "c1a_compressor_wkv",
+        "shape": [
+          5120,
+          512
+        ],
+        "kind": "DEVICE",
+        "bytes": 5242880,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 0
+      },
+      {
+        "index": 35,
+        "name": "query_start_loc",
+        "shape": [
+          13
+        ],
+        "kind": "DEVICE",
+        "bytes": 52,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "bbb0338de58a4020f34ee6955e0da8011e454ceba7b3c6176854ca6d12235d23",
+        "rank_slice": 0
+      },
+      {
+        "index": 36,
+        "name": "state_block_table",
+        "shape": [
+          12,
+          1
+        ],
+        "kind": "DEVICE",
+        "bytes": 48,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "a4886fc88eadb553f0300776411b64c557a02e7a09f9df7da871fb2f9f4c8278",
+        "rank_slice": 0
+      },
+      {
+        "index": 37,
+        "name": "state_cache_pool",
+        "shape": [
+          36,
+          8,
+          1024
+        ],
+        "kind": "DEVICE",
+        "bytes": 1179648,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 0
+      },
+      {
+        "index": 38,
+        "name": "compressor_norm_weight",
+        "shape": [
+          2048
+        ],
+        "kind": "DEVICE",
+        "bytes": 4096,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 0
+      },
+      {
+        "index": 39,
+        "name": "c2a_compressed_slots",
+        "shape": [
+          72
+        ],
+        "kind": "DEVICE",
+        "bytes": 576,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "1e18c486b0a4f7bed94add57c336143bb9df449b1684d74e0c99784ef8686935",
+        "rank_slice": 0
+      },
+      {
+        "index": 40,
+        "name": "c1a_compressed_slots",
+        "shape": [
+          72
+        ],
+        "kind": "DEVICE",
+        "bytes": 576,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "539fea80c782d165cab51e6b52c4acdd1f32c9a999e30eac53e1a8f670248c70",
+        "rank_slice": 0
+      },
+      {
+        "index": 41,
+        "name": "index_wk",
+        "shape": [
+          8,
+          512,
+          128
+        ],
+        "kind": "DEVICE",
+        "bytes": 1048576,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 0
+      },
+      {
+        "index": 42,
+        "name": "index_norm_weight",
+        "shape": [
+          1024
+        ],
+        "kind": "DEVICE",
+        "bytes": 2048,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 0
+      },
+      {
+        "index": 43,
+        "name": "index_wq_b",
+        "shape": [
+          8,
+          1280,
+          4096
+        ],
+        "kind": "DEVICE",
+        "bytes": 41943040,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 0
+      },
+      {
+        "index": 44,
+        "name": "index_weights_proj",
+        "shape": [
+          8,
+          5120,
+          32
+        ],
+        "kind": "DEVICE",
+        "bytes": 2621440,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 0
+      },
+      {
+        "index": 45,
+        "name": "hc_ffn_fn",
+        "shape": [
+          960,
+          20480
+        ],
+        "kind": "DEVICE",
+        "bytes": 78643200,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 0
+      },
+      {
+        "index": 46,
+        "name": "hc_ffn_scale",
+        "shape": [
+          120
+        ],
+        "kind": "DEVICE",
+        "bytes": 480,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "e00e5eb9444182f352323374ef4e08ebcb784725fdd4fd612d7730540b3e0c8c",
+        "rank_slice": 0
+      },
+      {
+        "index": 47,
+        "name": "hc_ffn_base",
+        "shape": [
+          960
+        ],
+        "kind": "DEVICE",
+        "bytes": 3840,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 0
+      },
+      {
+        "index": 48,
+        "name": "ffn_norm_weight",
+        "shape": [
+          204800
+        ],
+        "kind": "DEVICE",
+        "bytes": 409600,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 0
+      },
+      {
+        "index": 49,
+        "name": "gate_weight",
+        "shape": [
+          5120,
+          5120
+        ],
+        "kind": "DEVICE",
+        "bytes": 52428800,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 0
+      },
+      {
+        "index": 50,
+        "name": "correction_bias",
+        "shape": [
+          5120
+        ],
+        "kind": "DEVICE",
+        "bytes": 20480,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "f4a07432f64c01a753d98bfb74b917a9fe8eb4f0557d34d2d273044b3abd1bfd",
+        "rank_slice": 0
+      },
+      {
+        "index": 51,
+        "name": "routed_w1",
+        "shape": [
+          2560,
+          46080,
+          128
+        ],
+        "kind": "DEVICE",
+        "bytes": 15099494400,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 0
+      },
+      {
+        "index": 52,
+        "name": "routed_w2",
+        "shape": [
+          2560,
+          46080,
+          128
+        ],
+        "kind": "DEVICE",
+        "bytes": 15099494400,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 0
+      },
+      {
+        "index": 53,
+        "name": "routed_w3",
+        "shape": [
+          2560,
+          46080,
+          128
+        ],
+        "kind": "DEVICE",
+        "bytes": 15099494400,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 0
+      },
+      {
+        "index": 54,
+        "name": "shared_w1",
+        "shape": [
+          40,
+          5120,
+          2304
+        ],
+        "kind": "DEVICE",
+        "bytes": 471859200,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 0
+      },
+      {
+        "index": 55,
+        "name": "shared_w2",
+        "shape": [
+          40,
+          2304,
+          5120
+        ],
+        "kind": "DEVICE",
+        "bytes": 471859200,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 0
+      },
+      {
+        "index": 56,
+        "name": "shared_w3",
+        "shape": [
+          40,
+          5120,
+          2304
+        ],
+        "kind": "DEVICE",
+        "bytes": 471859200,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 0
+      },
+      {
+        "index": 57,
+        "name": "recv_meta_buffer__ssa_v0",
+        "shape": [
+          2,
+          64
+        ],
+        "kind": "COMM",
+        "offset": 0
+      },
+      {
+        "index": 58,
+        "name": "recv_x_buffer__ssa_v0",
+        "shape": [
+          10240,
+          5120
+        ],
+        "kind": "COMM",
+        "offset": 512
+      },
+      {
+        "index": 59,
+        "name": "recv_scale_buffer__ssa_v0",
+        "shape": [
+          10240,
+          160
+        ],
+        "kind": "COMM",
+        "offset": 52429312
+      },
+      {
+        "index": 60,
+        "name": "recv_weights_buffer__ssa_v0",
+        "shape": [
+          10240,
+          8
+        ],
+        "kind": "COMM",
+        "offset": 54067712
+      },
+      {
+        "index": 61,
+        "name": "recv_routes_buffer__ssa_v0",
+        "shape": [
+          10240,
+          8
+        ],
+        "kind": "COMM",
+        "offset": 54395392
+      },
+      {
+        "index": 62,
+        "name": "data_arrived_buffer__ssa_v0",
+        "shape": [
+          2,
+          64,
+          128
+        ],
+        "kind": "COMM",
+        "offset": 54723072
+      },
+      {
+        "index": 63,
+        "name": "routed_output_buffer__ssa_v0",
+        "shape": [
+          480,
+          5120
+        ],
+        "kind": "COMM",
+        "offset": 54788608
+      },
+      {
+        "index": 64,
+        "name": "combine_arrived_buffer__ssa_v0",
+        "shape": [
+          2,
+          64,
+          128
+        ],
+        "kind": "COMM",
+        "offset": 59703808
+      },
+      {
+        "index": 65,
+        "name": "moe_num_tokens",
+        "shape": [
+          2
+        ],
+        "kind": "HOST",
+        "bytes": 8,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "a711abc23618a87eb096d8294e63eb835e8f056abbd05c1c06d74b80ec58c666",
+        "rank_slice": null
+      },
+      {
+        "index": 66,
+        "name": "attention_num_tokens",
+        "shape": [
+          2
+        ],
+        "kind": "HOST",
+        "bytes": 8,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "a711abc23618a87eb096d8294e63eb835e8f056abbd05c1c06d74b80ec58c666",
+        "rank_slice": null
+      },
+      {
+        "index": 67,
+        "name": "wq_a_scale",
+        "shape": [
+          6400,
+          1280
+        ],
+        "kind": "DEVICE",
+        "bytes": 8192000,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 0
+      },
+      {
+        "index": 68,
+        "name": "wq_b_scale",
+        "shape": [
+          1600,
+          32768
+        ],
+        "kind": "DEVICE",
+        "bytes": 52428800,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 0
+      },
+      {
+        "index": 69,
+        "name": "wkv_scale",
+        "shape": [
+          6400,
+          512
+        ],
+        "kind": "DEVICE",
+        "bytes": 3276800,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 0
+      },
+      {
+        "index": 70,
+        "name": "wo_b_scale",
+        "shape": [
+          10240,
+          5120
+        ],
+        "kind": "DEVICE",
+        "bytes": 52428800,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 0
+      },
+      {
+        "index": 71,
+        "name": "index_wq_b_scale",
+        "shape": [
+          320,
+          4096
+        ],
+        "kind": "DEVICE",
+        "bytes": 1310720,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 0
+      },
+      {
+        "index": 72,
+        "name": "routed_w1_scale",
+        "shape": [
+          409600,
+          2304
+        ],
+        "kind": "DEVICE",
+        "bytes": 943718400,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 0
+      },
+      {
+        "index": 73,
+        "name": "routed_w2_scale",
+        "shape": [
+          184320,
+          5120
+        ],
+        "kind": "DEVICE",
+        "bytes": 943718400,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 0
+      },
+      {
+        "index": 74,
+        "name": "routed_w3_scale",
+        "shape": [
+          409600,
+          2304
+        ],
+        "kind": "DEVICE",
+        "bytes": 943718400,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 0
+      },
+      {
+        "index": 75,
+        "name": "shared_w1_scale",
+        "shape": [
+          6400,
+          2304
+        ],
+        "kind": "DEVICE",
+        "bytes": 14745600,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 0
+      },
+      {
+        "index": 76,
+        "name": "shared_w2_scale",
+        "shape": [
+          2880,
+          5120
+        ],
+        "kind": "DEVICE",
+        "bytes": 14745600,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 0
+      },
+      {
+        "index": 77,
+        "name": "shared_w3_scale",
+        "shape": [
+          6400,
+          2304
+        ],
+        "kind": "DEVICE",
+        "bytes": 14745600,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 0
+      },
+      {
+        "index": 78,
+        "name": "final_norm_weight",
+        "shape": [
+          5120
+        ],
+        "kind": "DEVICE",
+        "bytes": 10240,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "b9c205bdac187f20bf876cea369cb6032ad1bf69043b31d716b36b8defbffdf2",
+        "rank_slice": 0
+      },
+      {
+        "index": 79,
+        "name": "lm_head_weight",
+        "shape": [
+          5120,
+          129280
+        ],
+        "kind": "DEVICE",
+        "bytes": 1323827200,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 0
+      },
+      {
+        "index": 80,
+        "name": "logit_row_indices",
+        "shape": [
+          16
+        ],
+        "kind": "DEVICE",
+        "bytes": 64,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "d5b258c06f68cf9accebb90500dc0857fb2da7e7657167fc01e20e3b4857420d",
+        "rank_slice": 0
+      },
+      {
+        "index": 81,
+        "name": "logits",
+        "shape": [
+          16,
+          129280
+        ],
+        "kind": "DEVICE",
+        "bytes": 8273920,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 0
+      },
+      {
+        "index": 82,
+        "name": "sampled_ids",
+        "shape": [
+          16,
+          8
+        ],
+        "kind": "DEVICE",
+        "bytes": 512,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 0
+      },
+      {
+        "index": 83,
+        "name": "head_hidden_buffer__ssa_v0",
+        "shape": [
+          16,
+          5120
+        ],
+        "kind": "COMM",
+        "offset": 59769344
+      },
+      {
+        "index": 84,
+        "name": "head_hidden_done_buffer__ssa_v0",
+        "shape": [
+          1,
+          1
+        ],
+        "kind": "COMM",
+        "offset": 59933184
+      },
+      {
+        "index": 85,
+        "name": "head_logits_buffer__ssa_v0",
+        "shape": [
+          16,
+          129280
+        ],
+        "kind": "COMM",
+        "offset": 59933248
+      },
+      {
+        "index": 86,
+        "name": "head_logits_done_buffer__ssa_v0",
+        "shape": [
+          1,
+          1
+        ],
+        "kind": "COMM",
+        "offset": 68207168
+      }
+    ]
+  },
+  {
+    "rank": 1,
+    "entries": [
+      {
+        "index": 0,
+        "name": "engram_lookup",
+        "shape": [
+          2,
+          80,
+          6144
+        ],
+        "kind": "DEVICE",
+        "bytes": 1966080,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 1
+      },
+      {
+        "index": 1,
+        "name": "engram_wkv",
+        "shape": [
+          2,
+          6144,
+          25600
+        ],
+        "kind": "DEVICE",
+        "bytes": 314572800,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 1
+      },
+      {
+        "index": 2,
+        "name": "engram_wkv_scale",
+        "shape": [
+          384,
+          25600
+        ],
+        "kind": "DEVICE",
+        "bytes": 9830400,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 1
+      },
+      {
+        "index": 3,
+        "name": "engram_weight",
+        "shape": [
+          2,
+          4,
+          5120
+        ],
+        "kind": "DEVICE",
+        "bytes": 163840,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 1
+      },
+      {
+        "index": 4,
+        "name": "x_hc",
+        "shape": [
+          80,
+          4,
+          5120
+        ],
+        "kind": "DEVICE",
+        "bytes": 6553600,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 1
+      },
+      {
+        "index": 5,
+        "name": "pre_mix",
+        "shape": [
+          80,
+          4
+        ],
+        "kind": "DEVICE",
+        "bytes": 1280,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 1
+      },
+      {
+        "index": 6,
+        "name": "dspark_target_hidden",
+        "shape": [
+          80,
+          15360
+        ],
+        "kind": "DEVICE",
+        "bytes": 2457600,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 1
+      },
+      {
+        "index": 7,
+        "name": "hc_attn_fn",
+        "shape": [
+          960,
+          20480
+        ],
+        "kind": "DEVICE",
+        "bytes": 78643200,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 1
+      },
+      {
+        "index": 8,
+        "name": "hc_attn_scale",
+        "shape": [
+          120
+        ],
+        "kind": "DEVICE",
+        "bytes": 480,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "e00e5eb9444182f352323374ef4e08ebcb784725fdd4fd612d7730540b3e0c8c",
+        "rank_slice": 1
+      },
+      {
+        "index": 9,
+        "name": "hc_attn_base",
+        "shape": [
+          960
+        ],
+        "kind": "DEVICE",
+        "bytes": 3840,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 1
+      },
+      {
+        "index": 10,
+        "name": "attn_norm_weight",
+        "shape": [
+          204800
+        ],
+        "kind": "DEVICE",
+        "bytes": 409600,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 1
+      },
+      {
+        "index": 11,
+        "name": "wq_a",
+        "shape": [
+          40,
+          5120,
+          1280
+        ],
+        "kind": "DEVICE",
+        "bytes": 262144000,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 1
+      },
+      {
+        "index": 12,
+        "name": "q_norm_weight",
+        "shape": [
+          51200
+        ],
+        "kind": "DEVICE",
+        "bytes": 102400,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 1
+      },
+      {
+        "index": 13,
+        "name": "wq_b",
+        "shape": [
+          40,
+          1280,
+          32768
+        ],
+        "kind": "DEVICE",
+        "bytes": 1677721600,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 1
+      },
+      {
+        "index": 14,
+        "name": "wkv",
+        "shape": [
+          40,
+          5120,
+          512
+        ],
+        "kind": "DEVICE",
+        "bytes": 104857600,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 1
+      },
+      {
+        "index": 15,
+        "name": "kv_norm_weight",
+        "shape": [
+          20480
+        ],
+        "kind": "DEVICE",
+        "bytes": 40960,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 1
+      },
+      {
+        "index": 16,
+        "name": "attn_sink",
+        "shape": [
+          2560
+        ],
+        "kind": "DEVICE",
+        "bytes": 10240,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 1
+      },
+      {
+        "index": 17,
+        "name": "wo_a",
+        "shape": [
+          320,
+          4096,
+          1024
+        ],
+        "kind": "DEVICE",
+        "bytes": 1342177280,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 1
+      },
+      {
+        "index": 18,
+        "name": "wo_a_scale",
+        "shape": [
+          320,
+          128,
+          1024
+        ],
+        "kind": "DEVICE",
+        "bytes": 41943040,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 1
+      },
+      {
+        "index": 19,
+        "name": "wo_b",
+        "shape": [
+          40,
+          8192,
+          5120
+        ],
+        "kind": "DEVICE",
+        "bytes": 1677721600,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 1
+      },
+      {
+        "index": 20,
+        "name": "freqs_cos",
+        "shape": [
+          2,
+          6,
+          32
+        ],
+        "kind": "DEVICE",
+        "bytes": 1536,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "cc7fd71ac71da2d1d2a7de6d7226621c3412a40b79b19cd764c83ea21872922f",
+        "rank_slice": 1
+      },
+      {
+        "index": 21,
+        "name": "freqs_sin",
+        "shape": [
+          2,
+          6,
+          32
+        ],
+        "kind": "DEVICE",
+        "bytes": 1536,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "9c0b1ea5d99739ad2ba7c066f319e395f60e5cd4317eddcfbd4bb1b3ebd9e089",
+        "rank_slice": 1
+      },
+      {
+        "index": 22,
+        "name": "window_slots",
+        "shape": [
+          72
+        ],
+        "kind": "DEVICE",
+        "bytes": 576,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "539fea80c782d165cab51e6b52c4acdd1f32c9a999e30eac53e1a8f670248c70",
+        "rank_slice": 1
+      },
+      {
+        "index": 23,
+        "name": "window_indices",
+        "shape": [
+          72,
+          128
+        ],
+        "kind": "DEVICE",
+        "bytes": 36864,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "7c6cbcef9ac24956b196fe49d5135d1cb0ee7e90ba402e8c413e0f662f979784",
+        "rank_slice": 1
+      },
+      {
+        "index": 24,
+        "name": "window_cache_pool",
+        "shape": [
+          480,
+          128,
+          1,
+          544
+        ],
+        "kind": "DEVICE",
+        "bytes": 33423360,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 1
+      },
+      {
+        "index": 25,
+        "name": "compressed_cache_pool",
+        "shape": [
+          48,
+          128,
+          1,
+          320
+        ],
+        "kind": "DEVICE",
+        "bytes": 1966080,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 1
+      },
+      {
+        "index": 26,
+        "name": "token_to_req_indices",
+        "shape": [
+          72
+        ],
+        "kind": "DEVICE",
+        "bytes": 288,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "5819b90cbb81303c5ea61668fb123326f973c3f19c5c2bd1d42964633738ed6f",
+        "rank_slice": 1
+      },
+      {
+        "index": 27,
+        "name": "position_ids",
+        "shape": [
+          72
+        ],
+        "kind": "DEVICE",
+        "bytes": 288,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "ca59aaaa0f1e145768e7dba210fc007dee5740c5cac9b21202966b82dcbed0b0",
+        "rank_slice": 1
+      },
+      {
+        "index": 28,
+        "name": "index_cache_pool",
+        "shape": [
+          48,
+          128,
+          1,
+          64
+        ],
+        "kind": "DEVICE",
+        "bytes": 393216,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 1
+      },
+      {
+        "index": 29,
+        "name": "index_cache_scale_pool",
+        "shape": [
+          48,
+          128,
+          1,
+          4
+        ],
+        "kind": "DEVICE",
+        "bytes": 24576,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 1
+      },
+      {
+        "index": 30,
+        "name": "c2a_index_block_table",
+        "shape": [
+          12,
+          1
+        ],
+        "kind": "DEVICE",
+        "bytes": 48,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "b68e9a05823d7b9bcae5177815047c2635261fe99e7771c3ed4f8c8185216e39",
+        "rank_slice": 1
+      },
+      {
+        "index": 31,
+        "name": "c1a_index_block_table",
+        "shape": [
+          12,
+          2
+        ],
+        "kind": "DEVICE",
+        "bytes": 96,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "47c263db531645f32d351d19e572b02ee0739cc177fde4095fb5e08cb06d9e3d",
+        "rank_slice": 1
+      },
+      {
+        "index": 32,
+        "name": "c2a_compressor_wkv",
+        "shape": [
+          3,
+          5120,
+          512
+        ],
+        "kind": "DEVICE",
+        "bytes": 15728640,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 1
+      },
+      {
+        "index": 33,
+        "name": "c2a_compressor_wgate",
+        "shape": [
+          3,
+          5120,
+          512
+        ],
+        "kind": "DEVICE",
+        "bytes": 15728640,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 1
+      },
+      {
+        "index": 34,
+        "name": "c1a_compressor_wkv",
+        "shape": [
+          5120,
+          512
+        ],
+        "kind": "DEVICE",
+        "bytes": 5242880,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 1
+      },
+      {
+        "index": 35,
+        "name": "query_start_loc",
+        "shape": [
+          13
+        ],
+        "kind": "DEVICE",
+        "bytes": 52,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "bbb0338de58a4020f34ee6955e0da8011e454ceba7b3c6176854ca6d12235d23",
+        "rank_slice": 1
+      },
+      {
+        "index": 36,
+        "name": "state_block_table",
+        "shape": [
+          12,
+          1
+        ],
+        "kind": "DEVICE",
+        "bytes": 48,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "a4886fc88eadb553f0300776411b64c557a02e7a09f9df7da871fb2f9f4c8278",
+        "rank_slice": 1
+      },
+      {
+        "index": 37,
+        "name": "state_cache_pool",
+        "shape": [
+          36,
+          8,
+          1024
+        ],
+        "kind": "DEVICE",
+        "bytes": 1179648,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 1
+      },
+      {
+        "index": 38,
+        "name": "compressor_norm_weight",
+        "shape": [
+          2048
+        ],
+        "kind": "DEVICE",
+        "bytes": 4096,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 1
+      },
+      {
+        "index": 39,
+        "name": "c2a_compressed_slots",
+        "shape": [
+          72
+        ],
+        "kind": "DEVICE",
+        "bytes": 576,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "1e18c486b0a4f7bed94add57c336143bb9df449b1684d74e0c99784ef8686935",
+        "rank_slice": 1
+      },
+      {
+        "index": 40,
+        "name": "c1a_compressed_slots",
+        "shape": [
+          72
+        ],
+        "kind": "DEVICE",
+        "bytes": 576,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "539fea80c782d165cab51e6b52c4acdd1f32c9a999e30eac53e1a8f670248c70",
+        "rank_slice": 1
+      },
+      {
+        "index": 41,
+        "name": "index_wk",
+        "shape": [
+          8,
+          512,
+          128
+        ],
+        "kind": "DEVICE",
+        "bytes": 1048576,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 1
+      },
+      {
+        "index": 42,
+        "name": "index_norm_weight",
+        "shape": [
+          1024
+        ],
+        "kind": "DEVICE",
+        "bytes": 2048,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 1
+      },
+      {
+        "index": 43,
+        "name": "index_wq_b",
+        "shape": [
+          8,
+          1280,
+          4096
+        ],
+        "kind": "DEVICE",
+        "bytes": 41943040,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 1
+      },
+      {
+        "index": 44,
+        "name": "index_weights_proj",
+        "shape": [
+          8,
+          5120,
+          32
+        ],
+        "kind": "DEVICE",
+        "bytes": 2621440,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 1
+      },
+      {
+        "index": 45,
+        "name": "hc_ffn_fn",
+        "shape": [
+          960,
+          20480
+        ],
+        "kind": "DEVICE",
+        "bytes": 78643200,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 1
+      },
+      {
+        "index": 46,
+        "name": "hc_ffn_scale",
+        "shape": [
+          120
+        ],
+        "kind": "DEVICE",
+        "bytes": 480,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "e00e5eb9444182f352323374ef4e08ebcb784725fdd4fd612d7730540b3e0c8c",
+        "rank_slice": 1
+      },
+      {
+        "index": 47,
+        "name": "hc_ffn_base",
+        "shape": [
+          960
+        ],
+        "kind": "DEVICE",
+        "bytes": 3840,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 1
+      },
+      {
+        "index": 48,
+        "name": "ffn_norm_weight",
+        "shape": [
+          204800
+        ],
+        "kind": "DEVICE",
+        "bytes": 409600,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 1
+      },
+      {
+        "index": 49,
+        "name": "gate_weight",
+        "shape": [
+          5120,
+          5120
+        ],
+        "kind": "DEVICE",
+        "bytes": 52428800,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 1
+      },
+      {
+        "index": 50,
+        "name": "correction_bias",
+        "shape": [
+          5120
+        ],
+        "kind": "DEVICE",
+        "bytes": 20480,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "f4a07432f64c01a753d98bfb74b917a9fe8eb4f0557d34d2d273044b3abd1bfd",
+        "rank_slice": 1
+      },
+      {
+        "index": 51,
+        "name": "routed_w1",
+        "shape": [
+          2560,
+          46080,
+          128
+        ],
+        "kind": "DEVICE",
+        "bytes": 15099494400,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 1
+      },
+      {
+        "index": 52,
+        "name": "routed_w2",
+        "shape": [
+          2560,
+          46080,
+          128
+        ],
+        "kind": "DEVICE",
+        "bytes": 15099494400,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 1
+      },
+      {
+        "index": 53,
+        "name": "routed_w3",
+        "shape": [
+          2560,
+          46080,
+          128
+        ],
+        "kind": "DEVICE",
+        "bytes": 15099494400,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 1
+      },
+      {
+        "index": 54,
+        "name": "shared_w1",
+        "shape": [
+          40,
+          5120,
+          2304
+        ],
+        "kind": "DEVICE",
+        "bytes": 471859200,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 1
+      },
+      {
+        "index": 55,
+        "name": "shared_w2",
+        "shape": [
+          40,
+          2304,
+          5120
+        ],
+        "kind": "DEVICE",
+        "bytes": 471859200,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 1
+      },
+      {
+        "index": 56,
+        "name": "shared_w3",
+        "shape": [
+          40,
+          5120,
+          2304
+        ],
+        "kind": "DEVICE",
+        "bytes": 471859200,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        "rank_slice": 1
+      },
+      {
+        "index": 57,
+        "name": "recv_meta_buffer__ssa_v0",
+        "shape": [
+          2,
+          64
+        ],
+        "kind": "COMM",
+        "offset": 0
+      },
+      {
+        "index": 58,
+        "name": "recv_x_buffer__ssa_v0",
+        "shape": [
+          10240,
+          5120
+        ],
+        "kind": "COMM",
+        "offset": 512
+      },
+      {
+        "index": 59,
+        "name": "recv_scale_buffer__ssa_v0",
+        "shape": [
+          10240,
+          160
+        ],
+        "kind": "COMM",
+        "offset": 52429312
+      },
+      {
+        "index": 60,
+        "name": "recv_weights_buffer__ssa_v0",
+        "shape": [
+          10240,
+          8
+        ],
+        "kind": "COMM",
+        "offset": 54067712
+      },
+      {
+        "index": 61,
+        "name": "recv_routes_buffer__ssa_v0",
+        "shape": [
+          10240,
+          8
+        ],
+        "kind": "COMM",
+        "offset": 54395392
+      },
+      {
+        "index": 62,
+        "name": "data_arrived_buffer__ssa_v0",
+        "shape": [
+          2,
+          64,
+          128
+        ],
+        "kind": "COMM",
+        "offset": 54723072
+      },
+      {
+        "index": 63,
+        "name": "routed_output_buffer__ssa_v0",
+        "shape": [
+          480,
+          5120
+        ],
+        "kind": "COMM",
+        "offset": 54788608
+      },
+      {
+        "index": 64,
+        "name": "combine_arrived_buffer__ssa_v0",
+        "shape": [
+          2,
+          64,
+          128
+        ],
+        "kind": "COMM",
+        "offset": 59703808
+      },
+      {
+        "index": 65,
+        "name": "moe_num_tokens",
+        "shape": [
+          2
+        ],
+        "kind": "HOST",
+        "bytes": 8,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "a711abc23618a87eb096d8294e63eb835e8f056abbd05c1c06d74b80ec58c666",
+        "rank_slice": null
+      },
+      {
+        "index": 66,
+        "name": "attention_num_tokens",
+        "shape": [
+          2
+        ],
+        "kind": "HOST",
+        "bytes": 8,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "a711abc23618a87eb096d8294e63eb835e8f056abbd05c1c06d74b80ec58c666",
+        "rank_slice": null
+      },
+      {
+        "index": 67,
+        "name": "wq_a_scale",
+        "shape": [
+          6400,
+          1280
+        ],
+        "kind": "DEVICE",
+        "bytes": 8192000,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 1
+      },
+      {
+        "index": 68,
+        "name": "wq_b_scale",
+        "shape": [
+          1600,
+          32768
+        ],
+        "kind": "DEVICE",
+        "bytes": 52428800,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 1
+      },
+      {
+        "index": 69,
+        "name": "wkv_scale",
+        "shape": [
+          6400,
+          512
+        ],
+        "kind": "DEVICE",
+        "bytes": 3276800,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 1
+      },
+      {
+        "index": 70,
+        "name": "wo_b_scale",
+        "shape": [
+          10240,
+          5120
+        ],
+        "kind": "DEVICE",
+        "bytes": 52428800,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 1
+      },
+      {
+        "index": 71,
+        "name": "index_wq_b_scale",
+        "shape": [
+          320,
+          4096
+        ],
+        "kind": "DEVICE",
+        "bytes": 1310720,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 1
+      },
+      {
+        "index": 72,
+        "name": "routed_w1_scale",
+        "shape": [
+          409600,
+          2304
+        ],
+        "kind": "DEVICE",
+        "bytes": 943718400,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 1
+      },
+      {
+        "index": 73,
+        "name": "routed_w2_scale",
+        "shape": [
+          184320,
+          5120
+        ],
+        "kind": "DEVICE",
+        "bytes": 943718400,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 1
+      },
+      {
+        "index": 74,
+        "name": "routed_w3_scale",
+        "shape": [
+          409600,
+          2304
+        ],
+        "kind": "DEVICE",
+        "bytes": 943718400,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 1
+      },
+      {
+        "index": 75,
+        "name": "shared_w1_scale",
+        "shape": [
+          6400,
+          2304
+        ],
+        "kind": "DEVICE",
+        "bytes": 14745600,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 1
+      },
+      {
+        "index": 76,
+        "name": "shared_w2_scale",
+        "shape": [
+          2880,
+          5120
+        ],
+        "kind": "DEVICE",
+        "bytes": 14745600,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 1
+      },
+      {
+        "index": 77,
+        "name": "shared_w3_scale",
+        "shape": [
+          6400,
+          2304
+        ],
+        "kind": "DEVICE",
+        "bytes": 14745600,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
+        "rank_slice": 1
+      },
+      {
+        "index": 78,
+        "name": "final_norm_weight",
+        "shape": [
+          5120
+        ],
+        "kind": "DEVICE",
+        "bytes": 10240,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "b9c205bdac187f20bf876cea369cb6032ad1bf69043b31d716b36b8defbffdf2",
+        "rank_slice": 1
+      },
+      {
+        "index": 79,
+        "name": "lm_head_weight",
+        "shape": [
+          5120,
+          129280
+        ],
+        "kind": "DEVICE",
+        "bytes": 1323827200,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
+        "rank_slice": 1
+      },
+      {
+        "index": 80,
+        "name": "logit_row_indices",
+        "shape": [
+          16
+        ],
+        "kind": "DEVICE",
+        "bytes": 64,
+        "initializer_mode": "RAW",
+        "initializer_sha256": "d5b258c06f68cf9accebb90500dc0857fb2da7e7657167fc01e20e3b4857420d",
+        "rank_slice": 1
+      },
+      {
+        "index": 81,
+        "name": "logits",
+        "shape": [
+          16,
+          129280
+        ],
+        "kind": "DEVICE",
+        "bytes": 8273920,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 1
+      },
+      {
+        "index": 82,
+        "name": "sampled_ids",
+        "shape": [
+          16,
+          8
+        ],
+        "kind": "DEVICE",
+        "bytes": 512,
+        "initializer_mode": "REPEAT",
+        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
+        "rank_slice": 1
+      },
+      {
+        "index": 83,
+        "name": "head_hidden_buffer__ssa_v0",
+        "shape": [
+          16,
+          5120
+        ],
+        "kind": "COMM",
+        "offset": 59769344
+      },
+      {
+        "index": 84,
+        "name": "head_hidden_done_buffer__ssa_v0",
+        "shape": [
+          1,
+          1
+        ],
+        "kind": "COMM",
+        "offset": 59933184
+      },
+      {
+        "index": 85,
+        "name": "head_logits_buffer__ssa_v0",
+        "shape": [
+          16,
+          129280
+        ],
+        "kind": "COMM",
+        "offset": 59933248
+      },
+      {
+        "index": 86,
+        "name": "head_logits_done_buffer__ssa_v0",
+        "shape": [
+          1,
+          1
+        ],
+        "kind": "COMM",
+        "offset": 68207168
+      }
+    ]
+  }
+]

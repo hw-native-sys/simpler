@@ -24,6 +24,7 @@ set(HIERARCHICAL_SOURCES
     ${HIERARCHICAL_SRC}/scope.cpp
     ${HIERARCHICAL_SRC}/remote_wire.cpp
     ${HIERARCHICAL_SRC}/remote_endpoint.cpp
+    ${HIERARCHICAL_SRC}/mpi_direct_transport.cpp
     ${HIERARCHICAL_SRC}/orchestrator.cpp
     ${HIERARCHICAL_SRC}/worker_manager.cpp
     ${HIERARCHICAL_SRC}/scheduler.cpp
@@ -51,6 +52,8 @@ target_compile_definitions(_task_interface PRIVATE
 
 target_sources(_task_interface PRIVATE
     ${CMAKE_SOURCE_DIR}/src/common/worker/chip_worker.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/worker/native_submission_state.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/worker/runtime_module.cpp
     ${CMAKE_SOURCE_DIR}/src/common/worker/chip_run_lane.cpp
     ${CMAKE_SOURCE_DIR}/src/common/worker/device_fault_monitor_host.cpp
     ${CMAKE_SOURCE_DIR}/src/common/log/host_log.cpp
@@ -62,6 +65,7 @@ target_sources(_task_interface PRIVATE
 )
 
 target_include_directories(_task_interface PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/common
     ${CMAKE_SOURCE_DIR}/src/common/task_interface
     ${CMAKE_SOURCE_DIR}/src/common/worker
     ${CMAKE_SOURCE_DIR}/src/common/hierarchical

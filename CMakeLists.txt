@@ -23,7 +23,23 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Find Python and nanobind
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
-find_package(nanobind CONFIG REQUIRED)
+find_package(nanobind CONFIG QUIET)
+if(NOT nanobind_FOUND)
+    # Python-visible packages outside the venv may not be CMake search prefixes.
+    execute_process(
+        COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+        RESULT_VARIABLE _nanobind_query_status
+        OUTPUT_VARIABLE nanobind_ROOT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_VARIABLE _nanobind_query_error
+    )
+    if(NOT _nanobind_query_status EQUAL 0 OR nanobind_ROOT STREQUAL "")
+        message(FATAL_ERROR
+            "Cannot locate nanobind for ${Python_EXECUTABLE}: ${_nanobind_query_error}"
+        )
+    endif()
+    find_package(nanobind CONFIG REQUIRED)
+endif()
 
 # Include Python bindings
 add_subdirectory(python/bindings)
@@ -47,7 +63,7 @@ add_custom_target(build_runtimes ALL
     COMMAND ${_SIMPLER_BUILD_RUNTIMES_COMMAND}
     COMMENT "Building runtime binaries (incremental)..."
 )
-foreach(_platform IN ITEMS a2a3sim a5sim a2a3 a5)
+foreach(_platform IN ITEMS a2a3sim a5sim wsesim a2a3 a5)
     add_custom_target(build_runtimes_${_platform}
         COMMAND ${_SIMPLER_BUILD_RUNTIMES_COMMAND} --platforms ${_platform}
         COMMENT "Building ${_platform} runtime binaries (incremental)..."
@@ -57,7 +73,7 @@ foreach(_platform IN ITEMS a2a3sim a5sim a2a3 a5)
     )
 endforeach()
 add_custom_target(build_runtimes_sim
-    COMMAND ${_SIMPLER_BUILD_RUNTIMES_COMMAND} --platforms a2a3sim a5sim
+    COMMAND ${_SIMPLER_BUILD_RUNTIMES_COMMAND} --platforms a2a3sim a5sim wsesim
     COMMENT "Building sim runtime binaries (incremental)..."
 )
 add_custom_target(build_package_sim
@@ -66,7 +82,11 @@ add_custom_target(build_package_sim
 
 if(SKBUILD_MODE)
     install(DIRECTORY ${CMAKE_SOURCE_DIR}/src/
-            DESTINATION simpler_setup/_assets/src)
+            DESTINATION simpler_setup/_assets/src
+            PATTERN "__pycache__" EXCLUDE
+            PATTERN "*.pyc" EXCLUDE
+            PATTERN "*.pyo" EXCLUDE
+            PATTERN "compile_commands.json" EXCLUDE)
     # The platform CMakeLists include these through SIMPLER_CMAKE_DIR, which
     # runtime_compiler.py resolves to PROJECT_ROOT/cmake — the installed
     # simpler_setup/_assets/cmake in a wheel. All four are reachable from a
@@ -86,4 +106,9 @@ if(SKBUILD_MODE)
         install(FILES ${CMAKE_SOURCE_DIR}/pto_isa.pin
                 DESTINATION simpler_setup/_assets)
     endif()
+    configure_file(
+        "${CMAKE_SOURCE_DIR}/cmake/install_simpler_pin.cmake.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/install_simpler_pin.cmake"
+        @ONLY)
+    install(SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/install_simpler_pin.cmake")
 endif()

@@ -26,10 +26,10 @@ def deferred_notify_orch_fn(orch, callables, task_args, config):
     with orch.allocate_domain(
         name="default",
         workers=list(range(NRANKS)),
-        window_size=max(mailbox_nbytes + DTYPE_NBYTES, 4 * 1024),
+        window_size=max(mailbox_nbytes + 64, 4 * 1024),
         buffers=[
             CommBufferSpec(name="mailbox", dtype="float32", count=N, nbytes=mailbox_nbytes),
-            CommBufferSpec(name="notify_counter", dtype="int32", count=1, nbytes=DTYPE_NBYTES),
+            CommBufferSpec(name="notify_counter", dtype="int32", count=1, nbytes=64),
         ],
     ) as handle:
         for rank in range(NRANKS):
@@ -84,6 +84,7 @@ class TestDeferredNotifyDemo(SceneTestCase):
         {
             "name": "peer_notification",
             "platforms": ["a2a3", "a2a3sim", "a5sim"],
+            "manual": ["a2a3sim"],
             "config": {"device_count": NRANKS, "num_sub_workers": 0},
             "params": {},
         }

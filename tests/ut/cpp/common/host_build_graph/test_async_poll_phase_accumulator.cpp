@@ -11,7 +11,7 @@
 
 #include <gtest/gtest.h>
 
-#include "host_build_graph/async_poll_phase_accumulator.h"
+#include "host_build_graph/device/async_poll_phase_accumulator.h"
 
 using simpler::hbg::AsyncPollPhaseAccumulator;
 

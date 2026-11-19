@@ -11,8 +11,8 @@ Three standalone programs, no dependency on this repo's runtime
 ```text
 host launch.cpp                 AICPU consumer.cpp                AICore producer.cce
 ------------------------------  --------------------------------  --------------------------
-allocate GM, resolve            request round r                   wait for ctl.round_request == r
-  aic_ctrl_reg_base                                               payload = r          (one store)
+allocate GM, map per-core        request round r                   wait for ctl.round_request == r
+  register bases                                                  payload = r          (one store)
 register + launch both                                            dcci(payload)
                                 wait for COND == FIN|r             [P1] dsb(DSB_DDR)
                                 apply consumer variant             set_cond(FIN|r)
@@ -132,6 +132,13 @@ task-submit --device auto --device-num 1 \
     --run "./host/build/launch_fin_order \$TASK_DEVICE 0 50"
 ```
 
+For a5, build the producer with `-DCCE_AICORE_ARCH=dav-c310-cube`, use
+`build/lib/a5/dispatcher/libsimpler_aicpu_dispatcher.so`, and export
+`SIMPLER_SMOKE_ARCH=a5`. The suite runner sets the architecture variable.
+The a5 register table follows hardware core IDs: AIC slots are 0–17 and
+54–71 across the two dies. Direct HAL calls translate ACL logical device
+IDs through `ASCEND_RT_VISIBLE_DEVICES`.
+
 `stage` is a bisect gate for bring-up failures, not a measurement mode:
 `1` returns after touching the result block, `2` after the producer reports
 its core id, `3` after cost calibration, `0` runs the matrix.
@@ -152,9 +159,9 @@ Both cost a debugging round-trip to rediscover:
   `get_coreid` and `get_sys_cnt` are `-x cce` builtins. Leaving it out also
   keeps the build independent of where a CANN release puts its `tikcpp` subtree.
 - **`get_coreid()` is not a bare core index.** It must be masked with
-  `0x0FFF` before indexing the AIC_CTRL window, the way
+  `0x0FFF` before indexing the per-core register table, the way
   `get_physical_core_id()` does. Using the raw value (observed `0x8010`)
-  produces an address outside the window, and reading it faults the AICPU op
+  produces an address outside the mapping, and reading it faults the AICPU op
   — surfacing as `507018 / aicpu exception`, not as a failed match.
 
 ## Reading the output

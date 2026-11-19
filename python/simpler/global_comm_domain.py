@@ -12,9 +12,16 @@ from __future__ import annotations
 
 import enum
 import struct
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
-from _task_interface import AddressSpace  # pyright: ignore[reportMissingImports]
+from _task_interface import (  # pyright: ignore[reportMissingImports]
+    AddressSpace,
+    BufferDescriptor,
+    _decode_buffer_descriptor_wire,
+    _encode_buffer_descriptor_wire,
+)
 
 from .comm_endpoints import (
     _ADAPTER_KIND_IDS,  # noqa: F401 — re-export of the comm_endpoints numeric table
@@ -42,6 +49,9 @@ from .comm_endpoints import (
     _adapter_profile_id as _neutral_adapter_profile_id,
 )
 
+if TYPE_CHECKING:
+    from .buffer import Buffer
+
 #: Descriptor layout. Paired with ``COMM_GLOBAL_DOMAIN_VERSION`` in
 #: ``src/common/platform_comm/comm.h``: the platform backend stamps this number into every
 #: descriptor it exports and ``_validate_descriptor`` checks it on decode, so advancing one
@@ -63,6 +73,8 @@ GLOBAL_DOMAIN_PROFILE_IDS = {
 }
 GLOBAL_DOMAIN_MAX_STRING_BYTES = 1024
 GLOBAL_DOMAIN_MAX_COPY_BYTES = 8 * 1024 * 1024
+GLOBAL_DOMAIN_BUFFER_REF_BYTES = 104
+_DOMAIN_COMMAND_MAGIC = b"SDC1"
 
 CTRL_GLOBAL_DOMAIN_PREPARE = 19
 CTRL_GLOBAL_DOMAIN_IMPORT = 20
@@ -93,6 +105,7 @@ class GlobalDomainMember:
     local_worker_id: int
     global_device_rank: int
     domain_rank: int
+    buffers: dict[str, Buffer] = field(default_factory=dict, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -116,6 +129,10 @@ class GlobalDomainAttachment:
 class GlobalDomainBuffer:
     name: str
     nbytes: int
+    dtype: str = ""
+    count: int = 0
+    load_from_host: bool = False
+    store_to_host: bool = False
 
 
 @dataclass(frozen=True)
@@ -213,6 +230,8 @@ class GlobalDomainCommand:
     buffers: tuple[GlobalDomainBuffer, ...]
     descriptors: tuple[GlobalDomainDescriptor, ...] = ()
     attachments: tuple[GlobalDomainAttachment, ...] = ()
+    owner_instance_id: bytes = b""
+    retain_after_run: bool = False
 
     def attachments_for_node(self, node_worker_id: int) -> tuple[GlobalDomainAttachment, ...]:
         """Return the row addressed to one receiving L3 node.
@@ -668,8 +687,18 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
             raise ValueError("global domain IMPORT/COMMIT requires a complete descriptor table")
     elif command.descriptors:
         raise ValueError("global domain PREPARE/ABORT must not carry descriptors")
+    if command.owner_instance_id and (len(command.owner_instance_id) != 8 or not any(command.owner_instance_id)):
+        raise ValueError("global domain creator must be a nonzero 8-byte instance identity")
+    if not command.owner_instance_id and (
+        command.retain_after_run
+        or any(
+            buffer.dtype or buffer.count or buffer.load_from_host or buffer.store_to_host for buffer in command.buffers
+        )
+    ):
+        raise ValueError("global domain extended layout requires a creator identity")
 
-    out = bytearray(
+    out = bytearray(_DOMAIN_COMMAND_MAGIC)
+    out.extend(
         struct.pack(
             "<IQQQ",
             int(command.phase),
@@ -678,6 +707,7 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
             int(command.window_size),
         )
     )
+    out.extend(struct.pack("<8s?", command.owner_instance_id, command.retain_after_run))
     _put_string(out, command.name, "name")
     _put_string(out, command.profile, "profile")
     out.extend(struct.pack("<I", len(command.members)))
@@ -690,6 +720,8 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
     for buffer in command.buffers:
         _put_string(out, buffer.name, "buffer.name")
         out.extend(struct.pack("<Q", int(buffer.nbytes)))
+        _put_string(out, buffer.dtype, "buffer.dtype")
+        out.extend(struct.pack("<q??", buffer.count, buffer.load_from_host, buffer.store_to_host))
     out.extend(struct.pack("<I", len(command.descriptors)))
     for descriptor in command.descriptors:
         out.extend(descriptor.encode())
@@ -698,6 +730,8 @@ def encode_domain_command(command: GlobalDomainCommand) -> bytes:  # noqa: PLR09
 
 def decode_domain_command(data: bytes) -> GlobalDomainCommand:
     reader = _Reader(data)
+    if reader.fixed(4, "domain command magic") != _DOMAIN_COMMAND_MAGIC:
+        raise ValueError("global domain command format is unknown")
     try:
         phase = GlobalDomainPhase(reader.u32())
     except ValueError as exc:
@@ -705,6 +739,12 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
     domain_id = reader.u64()
     generation = reader.u64()
     window_size = reader.u64()
+    owner_instance_id = reader.fixed(8, "creator identity")
+    if not any(owner_instance_id):
+        owner_instance_id = b""
+    retention = reader.fixed(1, "retention policy")
+    if retention not in (b"\x00", b"\x01"):
+        raise ValueError("global domain retention policy is invalid")
     name = reader.string("name")
     profile = reader.string("profile")
     member_count = reader.u32()
@@ -718,7 +758,15 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
     buffer_count = reader.u32()
     if buffer_count > GLOBAL_DOMAIN_MAX_BUFFERS:
         raise ValueError("global domain command buffer count exceeds maximum")
-    buffers = tuple(GlobalDomainBuffer(reader.string("buffer.name"), reader.u64()) for _ in range(buffer_count))
+    buffers = tuple(
+        GlobalDomainBuffer(
+            reader.string("buffer.name"),
+            reader.u64(),
+            reader.string("buffer.dtype"),
+            *struct.unpack("<q??", reader.fixed(10, "buffer definition")),
+        )
+        for _ in range(buffer_count)
+    )
     descriptor_count = reader.u32()
     if descriptor_count > GLOBAL_DOMAIN_MAX_RANKS:
         raise ValueError("global domain command descriptor count exceeds maximum")
@@ -738,6 +786,8 @@ def decode_domain_command(data: bytes) -> GlobalDomainCommand:
         buffers=buffers,
         descriptors=descriptors,
         attachments=attachments,
+        owner_instance_id=owner_instance_id,
+        retain_after_run=retention == b"\x01",
     )
     encode_domain_command(command)
     return command
@@ -759,6 +809,30 @@ def decode_descriptor_table(data: bytes) -> tuple[GlobalDomainDescriptor, ...]:
     )
     reader.done("descriptor table")
     return descriptors
+
+
+def encode_domain_buffer_refs(references: Sequence[tuple[BufferDescriptor, int, int]]) -> bytes:
+    """Encode committed backings in the command's node-member and buffer order."""
+    if len(references) > GLOBAL_DOMAIN_MAX_RANKS * GLOBAL_DOMAIN_MAX_BUFFERS:
+        raise ValueError("global domain Buffer reference count exceeds maximum")
+    return b"".join(
+        _encode_buffer_descriptor_wire(descriptor) + struct.pack("<QQ", reference_id, generation)
+        for descriptor, reference_id, generation in references
+    )
+
+
+def decode_domain_buffer_refs(data: bytes) -> tuple[tuple[BufferDescriptor, int, int], ...]:
+    if len(data) % GLOBAL_DOMAIN_BUFFER_REF_BYTES or len(data) > (
+        GLOBAL_DOMAIN_MAX_RANKS * GLOBAL_DOMAIN_MAX_BUFFERS * GLOBAL_DOMAIN_BUFFER_REF_BYTES
+    ):
+        raise ValueError("global domain Buffer reference reply size is invalid")
+    return tuple(
+        (
+            _decode_buffer_descriptor_wire(data[offset : offset + 88]),
+            *struct.unpack_from("<QQ", data, offset + 88),
+        )
+        for offset in range(0, len(data), GLOBAL_DOMAIN_BUFFER_REF_BYTES)
+    )
 
 
 def encode_release_command(command: GlobalDomainReleaseCommand) -> bytes:

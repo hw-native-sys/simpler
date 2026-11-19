@@ -146,6 +146,12 @@ void Scheduler::stop() {
 
 void Scheduler::worker_done(WorkerCompletion completion) {
     TaskSlotState &s = *cfg_.ring->slot_state(completion.task_slot);
+    // Recorded here, where the endpoint identity is still in hand, and applied
+    // when the whole run retires. This is a capacity report, not a task
+    // outcome, so it is taken whatever the outcome below turns out to be.
+    if (completion.admissible_run_resource_sets != 0 && cfg_.note_endpoint_capacity_cb) {
+        cfg_.note_endpoint_capacity_cb(completion.worker_id, completion.admissible_run_resource_sets);
+    }
     bool failure_reported = is_failure(completion.outcome);
     if (failure_reported && cfg_.on_task_failed_cb) {
         cfg_.on_task_failed_cb(completion.task_slot, completion.error_message);
@@ -482,6 +488,21 @@ void Scheduler::dispatch_ready(bool scan_preparable) {
         cfg_.manager->activate_prepared_run(active_run);
     }
 
+    // Group reservations and every queue pop in one pass belong to the same
+    // whole-run FIFO head, even if a completion advances the head mid-pass.
+    bool group_arrived_between_phases = false;
+    do {
+        const NextLevelGroupDispatchResult group_result = dispatch_next_level_group(run_snapshot);
+        update_reservation_stall(group_result);
+        if (cfg_.after_group_phase_cb) cfg_.after_group_phase_cb();
+        group_arrived_between_phases = dispatch_next_level_singles(
+            group_result.reserved_worker_ids, run_snapshot, group_result.blocked_group_slot == INVALID_SLOT
+        );
+    } while (group_arrived_between_phases);
+    dispatch_sub_ready(run_snapshot);
+
+    // Publish the active run before staging successors: native endpoint FIFOs
+    // order dispatch ids, and an inactive successor cannot lead its predecessor.
     // A busy endpoint keeps this loop spinning, so a full prepared-worker scan
     // is tied to existing scheduler state-change signals rather than every
     // iteration. Completions are included because they can make dependent
@@ -503,19 +524,6 @@ void Scheduler::dispatch_ready(bool scan_preparable) {
         const RunId early_launch = cfg_.early_launch_run_cb();
         if (early_launch != INVALID_RUN_ID) (void)cfg_.manager->authorize_staged_launch(early_launch);
     }
-
-    // Group reservations and every queue pop in one pass belong to the same
-    // whole-run FIFO head, even if a completion advances the head mid-pass.
-    bool group_arrived_between_phases = false;
-    do {
-        const NextLevelGroupDispatchResult group_result = dispatch_next_level_group(run_snapshot);
-        update_reservation_stall(group_result);
-        if (cfg_.after_group_phase_cb) cfg_.after_group_phase_cb();
-        group_arrived_between_phases = dispatch_next_level_singles(
-            group_result.reserved_worker_ids, run_snapshot, group_result.blocked_group_slot == INVALID_SLOT
-        );
-    } while (group_arrived_between_phases);
-    dispatch_sub_ready(run_snapshot);
 }
 
 bool claim_for_dispatch(TaskSlotState &s) {
@@ -561,6 +569,8 @@ void Scheduler::stage_preparable_run(RunId run_id) {
     for (int32_t worker_id : cfg_.ready_next_level_queues->worker_ids()) {
         WorkerThread *worker = cfg_.manager->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
         if (worker == nullptr || !worker->can_stage()) continue;
+        if (cfg_.ready_next_level_queues->single_empty(worker_id, run_id)) continue;
+        if (cfg_.can_stage_run_on_worker_cb && !cfg_.can_stage_run_on_worker_cb(run_id, worker_id)) continue;
         TaskSlot slot;
         if (!cfg_.ready_next_level_queues->try_pop_single(worker_id, run_id, slot)) continue;
         if (!cfg_.ready_next_level_queues->groups_empty(run_id)) {
@@ -681,7 +691,11 @@ Scheduler::NextLevelGroupDispatchResult Scheduler::dispatch_next_level_group(con
             if (!result.reserved_worker_ids.insert(worker_id).second) {
                 throw std::runtime_error("Scheduler::dispatch_next_level_group: duplicate target worker");
             }
-            const bool worker_idle = worker->idle();
+            // A free lane with no request frame behind it cannot carry this
+            // member's publication, so it counts as busy here. Treating it as
+            // idle would claim the whole group and fail the member that found
+            // no transport.
+            const bool worker_idle = worker->can_dispatch();
             if (!worker_idle) {
                 all_workers_idle = false;
                 result.busy_target_worker_ids.push_back(worker_id);
@@ -784,7 +798,10 @@ bool Scheduler::dispatch_next_level_singles(
                 "Scheduler::dispatch_next_level_singles: unknown worker id " + std::to_string(worker_id)
             );
         }
-        if (!worker->idle()) continue;
+        // Lane and transport together: a task is claimed only against a worker
+        // that can publish it. The frames come back as the child acknowledges
+        // them, so a worker skipped here is asked again next round.
+        if (!worker->can_dispatch()) continue;
 
         TaskSlot slot;
         while (run_snapshot ? cfg_.ready_next_level_queues->try_pop_single(worker_id, *run_snapshot, slot) :

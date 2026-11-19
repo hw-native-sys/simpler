@@ -17,27 +17,17 @@
 #include "host/run_completion_fence.h"
 
 /**
- * What a run's two evidence channels, together, say about that run's execution.
+ * Interpret cached private records for diagnostic logs and retention probes.
  *
- * The channels are independent and neither subsumes the other. The completion
- * fence reports whether the work this run submitted has *ended*; the record its
- * device side published reports whether that work *succeeded*. A run can end
- * without publishing, and can publish a failure and keep tearing down, so the
- * two are combined by rule rather than by preferring one.
- *
- * This decides execution only. It says nothing about whether the device is
- * healthy, whether this run's resources may be retired, or whether copy-back
- * succeeded — those are separate axes with separate evidence, and folding them
- * in here would let a delivery failure be reported as a kernel error.
- *
- * Pure and device-free: everything it reads is already in hand, so the rule is
- * exercisable without hardware and both the poll and the wait path can share it
- * rather than each growing its own version.
+ * The record's claim and physical completion are separate facts. This helper
+ * describes those facts; explicit wait/result obtains the execution verdict
+ * from the actual retained RTS streams. Missing or inconsistent diagnostics
+ * cannot override that verdict or require a normal private-result transfer.
  */
 
 /** Whether this run's result region was read back, and with what outcome. */
 enum class RunRecordRead : uint8_t {
-    /** No read was attempted — a run that never launched, or one still running. */
+    /** No diagnostic read was requested, including ordinary observed success. */
     NotAttempted,
     /** A read was attempted and the copy failed, so the host copy holds nothing. */
     Failed,
@@ -76,7 +66,7 @@ struct RunExecutionOutcome {
 };
 
 /**
- * Combine both channels into this run's execution outcome.
+ * Interpret the cached record alongside the observed physical boundaries.
  *
  * Three rules carry the weight, and each exists because the obvious reading is
  * wrong:
@@ -162,53 +152,4 @@ inline const char *run_execution_state_name(RunExecutionState state) {
         return "undecided";
     }
     return "unknown";
-}
-
-/** What a fenced drain does once this run's completion boundaries have settled. */
-enum class RunDrainAction : uint8_t {
-    /**
-     * The record transfer reported a status of its own. That is an SDK error
-     * this host thread has already observed, and it is what the run returns.
-     */
-    ReportTransferError,
-    /**
-     * This run's own evidence decides success: no whole-stream wait is taken.
-     */
-    AcceptRecordedSuccess,
-    /**
-     * Every other shape. The device's verdict comes from the stream
-     * synchronize, which is the only call measured to produce one.
-     */
-    Synchronize,
-};
-
-/**
- * Choose the drain's action from this run's own evidence.
- *
- * Two rules carry it, and the first exists because the read is itself an SDK
- * call on the drain path:
- *
- *  - **An observed transfer error outranks everything.** A non-zero
- *    `record_transfer_rc` is a code the transport already reported to this
- *    thread. Whatever a later call answers — including zero — does not annul
- *    it, so the decision cannot fall through to a branch that would replace
- *    it. A caller that still synchronizes to converge the device must keep
- *    returning this code.
- *  - **Success needs this run's own boundaries and its own record.**
- *    `decide_run_execution` already requires both completed boundaries and a
- *    valid `Ok` read for this run's identity; nothing weaker reaches
- *    `AcceptRecordedSuccess`, and `Failed`, `Pending` and every `Undecided`
- *    shape synchronize as before.
- *
- * `AcceptRecordedSuccess` asserts what those channels observed about this run.
- * It does not assert that the device raised no exception for other work on the
- * same stream: a fault no participant recorded reaches the caller only through
- * a later API call or the device-health channel.
- */
-inline RunDrainAction decide_run_drain(int record_transfer_rc, const RunOutcomeEvidence &evidence) {
-    if (record_transfer_rc != 0) return RunDrainAction::ReportTransferError;
-    if (decide_run_execution(evidence).state == RunExecutionState::Succeeded) {
-        return RunDrainAction::AcceptRecordedSuccess;
-    }
-    return RunDrainAction::Synchronize;
 }

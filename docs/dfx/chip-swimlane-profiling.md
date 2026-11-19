@@ -50,8 +50,8 @@ that loads directly in Perfetto. For the scheduler-overhead deep-dive, capture
   share a label, not one shared phase. See
   `src/common/{host_build_graph,tensormap_and_ringbuffer}/sched_phase_kind.h`.
   Within a runtime the vocabulary splits again by producer, because a stream is
-  written by one: `host_build_graph`'s `bootstrap` / `state_probe` / `worksteal` /
-  `refill` / `idle` and its plain `resolve` come only from its AICore scheduler,
+  written by one: `host_build_graph`'s `bootstrap` / `state_probe` /
+  `idle` come only from its AICore scheduler,
   `graph_prepare` / `resolve_standalone` / `dummy` / `early_dispatch` / `drain` /
   `async_poll` only from its AICPU one, and `complete` / `dispatch` from either.
   `tensormap_and_ringbuffer` has one producer, so every phase of its own is its
@@ -94,14 +94,14 @@ that loads directly in Perfetto. For the scheduler-overhead deep-dive, capture
   Fanout was renamed Resolve and now also filters out <1 µs walks;
   Prestage was renamed EarlyDispatch).
   A5 `host_build_graph` uses the AICore Scheduler as the producer and emits one
-  flat lane per Scheduler. Every executed task has exactly one publication
-  phase: `dispatch`, `worksteal`, or `refill`. Tasks acquired from a Ready Inbox
-  first emit `state_probe`; a compatible single-fanin successor selected by
-  `DIRECT_RESOLVE` moves from `resolve` directly to `refill` and emits no
-  `state_probe`. The converter displays these phases as Completion, Resolve,
-  StateProbe, Dispatch, Worksteal, and Refill. Bootstrap ends before the initial
-  task dispatch, and its dependency initialization is not emitted again as a
-  nested `fanin` phase.
+  flat lane per Scheduler. Each executed unit has one `dispatch` publication
+  record. Ordinary execution tokens emit `state_probe` for discovery and
+  acquisition before dispatch; fanin checks happen after acquisition and are
+  recorded as `scalar_execution_token_fanin`. The token path emits neither an
+  outer `resolve` nor an outer `refill`; `scalar_execution_token_refill` measures
+  token discovery, not replacement publication. Batched StateProbe envelopes
+  may overlap, so use the Scalar profile for exclusive scheduler costs.
+  Bootstrap ends before the initial task dispatch, with no nested `fanin` phase.
 - **Orchestrator submit envelope** — one record per `submit_task()`
   / `alloc_tensors()` call covering the whole submit's
   `[start, end]` window (`orch_submit` phase). Per-sub-step
@@ -135,6 +135,217 @@ backward-compatible with the old boolean behavior).
 | 2 | + Scheduler per-task dispatch_time_us, finish_time_us | Producer is identified as `aicpu` or `aicore` |
 | 3 | + scheduler phases (`scheduler_records`) | Does not enable orchestrator collection; an independently enabled HBG Host pool can still export Host records |
 | 4 | + orchestrator phases (Host for HBG, AICPU for TMR) | Full collection |
+
+A5 `percounter` adds a task/block Scheduler View at L2 with Claim, Ready, Kernel
+end and GM Completion issued markers. Worker View remains available. L3 adds
+nested AICore Scheduler function intervals, such as dependency checks, MIX
+rendezvous and completion publication. L4 adds individual memory operations and
+Host phases and retains all instrumented function intervals. See the [percounter
+profiling contract](../../src/a5/runtime/percounter/README.md#chip-swimlanes-l1l4)
+for timing boundaries, storage limits and truncation behavior.
+
+### A5 HBG Scalar detail at Level 3
+
+Level 3 records the resident AICore scheduler's memory operations individually
+and ordinary function spans lasting at least 1 us. Level 4 retains
+all function spans as well. The converter draws one nested lane per worker in
+**AICore Scheduler**, labeled with its core type, worker ID and physical ID,
+for example `Cluster 00 / C / AIC_0 (physical 0)` or
+`Cluster 00 / V0 / AIV_32 (physical 18)`. AICore Scheduler and Worker View
+use cluster order: C, V0, V1. HBG AICore L3/L4 omits the separate Scheduler
+View. Each Worker task's details retain dispatch, receive, kernel start/end,
+finish-observation timestamps, and dispatch-to-finish duration. Its visible
+bar still spans receive to kernel end. Worker dependency, dispatch and
+completion flows remain; Scheduler View mirror flows are omitted.
+Raw collection and its timing fields are unchanged. Standard L3 export carries
+`cluster_index` and `cluster_lane` from each worker's runtime topology,
+including workers with no kernel executions. Older captures can reuse their
+execution identities; absent or conflicting topology is left ungrouped rather
+than inferred from physical core numbers. Task IDs and timestamps stay intact.
+The detail lane preserves the phase hierarchy and original L1 kernel intervals. The coarse scheduler lane
+(including its `idle` bars) is omitted when Scalar detail is available.
+The outer `window` interval is used for accounting but is not drawn.
+
+`scheduler_fill_own_slots` expands into its actual callees. Ordinary work
+shows token discovery/refill, Claim and Call reception, incremental fanin
+observation and execution directly from the original record. Each cluster's AIV0
+publishes MIX groups. The trace names preparation, member arrival, execution,
+completion accounting, and descriptor reuse. The two order checks are
+`scheduler_self_order_ready` and `scheduler_mix_lane_order_ready`. The cluster
+publisher advances its boundary in `scheduler_advance_mix_floor`. Functions without a worker argument
+use the same core-local trace binding and preserve the caller's nesting depth.
+L3 function spans shorter than 1 us are omitted on device; L4 retains every
+instrumented function span, including short empty polls. Atomic, bypass, DCCI
+and DSB leaves are retained regardless of duration; recorder intervals are also
+retained. The dispatch loop does not insert NOP backoff between discovery slices.
+Names identify real functions or explicitly named function sections; parent
+intervals include their children and must not be added to child totals.
+Uninstrumented work remains in the parent's exclusive time.
+
+Each worker traverses its immutable task catalog. AIC workers claim pure AIC
+blocks. AIV workers claim pure vector blocks, and AIV0 can also claim a MIX
+group on behalf of its cluster. A task's final supply seal records that all
+blocks have owners. Kernel entry still observes the actual data dependencies.
+The Host records the rank of the latest earlier conflict for each lane.
+A zero threshold eliminates the opposing-source read. Otherwise a self-claimed
+candidate acquires the cluster's MIX boundary and checks any earlier published
+group. A MIX member checks the local catalog and earlier self-owned cohorts
+before committing to its group. DFX
+collection shards are independent of the task catalogs.
+Conditional probes retain their original short-circuit behavior: an unexecuted
+branch has no interval. Read-result endpoints use a return-dependent Scalar
+instruction before reading the counter; they measure local result availability,
+not cross-core publication.
+
+`SchedulerScalarTrace::append` encodes each event directly into its GM trace
+partition through ordinary cached stores, without a staging buffer or batch
+drain. It does not issue a trace DCCI or DSB between tasks. Recording costs
+remain in enclosing function or unattributed time; primitive endpoints
+precede the record write. `SchedulerScalarTrace::finish` exposes the DCCI
+over every written trace line and the completion DSB as separate children.
+The Scalar window includes this terminal work. Publication of these four
+final observer/window rows and the header remains outside that window and
+inside the full device interval. The existing `batch_write_cycles` metric
+counts the measured terminal publication; it does not measure each direct
+record write. Older captures retain their per-drain stores/DCCI/DSB labels.
+
+Exclusive-time accounting remains in the analysis summary, without a separate
+swimlane. Parent time excludes its children; uncovered time remains
+`unattributed`. Kernel, scheduling, recording and unattributed segments sum
+to the measured window. Older captures without Scalar detail keep their
+coarse scheduler lanes.
+
+Detailed phases cover bootstrap, launch wait, ready refresh/claim, completion,
+source selection, cooperative MIX, payload preparation, execution return,
+completion publication, dependency resolution, async CHECK/FINISH, and exit
+work. Return-value atomics are measured through the point where the Scalar can consume the result.
+
+Memory-operation leaves distinguish atomic read/FAA/CAS/exchange, bypass
+loads/stores, DCCI issue, and DSB completion waits. DCCI labels retain the
+single-line/entire-cache scope and selector. Each payload cache-line operation
+has its own interval. The recorder's self-observation uses a DCCI batch interval
+with the exact issued line count in `scalar_calls`, without recursively recording
+its own recording. The subsequent DSB
+is a separate sibling interval. `DSB_ALL`, `DSB_DDR`, and the A5 DDR barrier
+behind `OUT_OF_ORDER_STORE_BARRIER` are observed without adding a business
+barrier or changing its placement. Returned atomic values use a dependent
+Scalar instruction before the end timestamp. Stores and the discarded
+completion-counter FAA retain issue-only endpoints; observing them does not
+force an otherwise unused result to become a returning atomic.
+Display durations are computed by subtracting integer counters before unit
+conversion. Relative timestamps likewise divide the integer-scaled counter
+delta by the clock frequency. This avoids floating-point cancellation and
+redundant decimal tails without rounding away counter resolution or events.
+Both 32-bit counter and 64-bit SDMA event-record reads in
+`SchedulerAsyncCompletionObserver` retain their original load width and expose
+one `ld_dev: return ready` event per executed read. The ready-pool probe's
+`scheduler_gm_query` calls use the same leaf label. These sub-microsecond leaves
+remain in L3 even when a short semantic parent is omitted.
+
+These leaves bind to the current resident scheduler's per-core record stream.
+Primitive wrappers share the enable check, clock sampling and record submission
+across call sites through bounded, internally linked functions. The timed
+operation is inlined inside its wrapper, and AIC/AIV implementations remain
+separate in the final ELF. Semantic result wrappers also keep their timing and
+depth bookkeeping outside the surrounding scheduler loop. Ordinary operands
+and address values are captured by value; GM words remain references so their
+accesses stay inside the timed operation. With no bound stream, a memory
+wrapper executes the original primitive directly after its null check.
+The block-local slot address is obtained through an internally linked, constant
+address helper. A register identity keeps CCEC from folding the returned global
+address back into every caller. Only the address is invariant; reading or writing
+the slot still observes binding and teardown. No enabled-state value is cached.
+Helper call/return and recording costs lie outside the primitive's timestamps;
+they remain part of the measured device time and enclosing function time.
+The binding is reset on every kernel entry and cleared before its stack
+storage expires. Business kernels are unchanged. The recorder uses raw cache
+operations and its own terminal children, avoiding recursive instrumentation.
+Compiler-inserted Scalar DCCI is disabled in the existing A5 executor build;
+the explicit operations retain their original order. The initial handshake
+before the stream can bind and final record publication after its window
+remain outside this detailed interval stream.
+
+Iterations without scheduling progress retain memory operations, backoff and
+functions meeting the duration threshold. The viewer uses function names; inline loop sections are
+explicitly labeled as sections of `run_ready_dispatch_loop`. It does not
+replace those calls with an aggregated polling span.
+
+Records use per-core storage and local cursors. The logical row retains its
+32-byte fields. Physical
+storage uses 16-byte slots: a 64-bit absolute start, the original kind/depth,
+and a 32-bit duration when the task is absent and the call count is one.
+Other rows use two slots to preserve the full end time, signed 64-bit task
+reference and 32-bit count. No clock rollover inference or field truncation is
+needed. The reserved phase bit 15 identifies the extended form; depth bits
+remain unchanged. Four compact rows fit in one 64-byte line.
+Each append writes these slots through DCache without forced publication.
+Each core exclusively owns its cache-line-aligned trace partition, and no
+consumer reads it before that core retires. Dirty eviction can write lines
+back naturally; a runtime-wide cache clean can also include trace lines.
+Terminal publication cleans the entire written range and completes its
+barrier. Final observer rows and headers are published before the core
+acknowledges exit. Business cache operations and synchronization keep their
+original placement. Record payload lives in an uninitialized
+device tail; only headers are initialized and uploaded before launch.
+Each worker has room for 262,144 detailed records; overflow reports truncation
+and does not produce a complete accounting result. The reserved tail still fits
+262,144 extended rows, so compact encoding does not lower record capacity.
+This reserves 8 MiB per worker at L3/L4; unused payload is not initialized
+or written by the recorder. L1 does not allocate this Scalar record tail.
+The header records the slot count in existing padding.
+Host decoding uses the compact storage format and rejects malformed,
+truncated or trailing slots. Raw JSON keeps the logical fields. The A5 AICore
+exporter writes one scheduler record per line without indentation or spaces
+around field separators; this changes neither the schema nor the values.
+Scalar-window
+metrics expose `scalar_storage_bytes` and
+`scalar_logical_records` for inspecting the actual write volume.
+Existing `metrics` entries
+carry the function threshold in cycles, the number of
+omitted short function intervals, nesting depth and the no-progress iteration
+count. Omissions are distinct from dropped records. `iterations_detailed=true`
+identifies per-iteration capture without polling aggregation.
+The fixed scheduler record fields retain their existing shape.
+
+For a positive function threshold, omitted short parents can leave gaps in
+recorded nesting depth. The converter uses the actual interval containment
+to attach leaves to the nearest retained ancestor, preserving the original
+depth separately. It rejects overlapping siblings and escaped bounds; it
+does not synthesize missing time intervals. Schema-1 captures and full-detail
+schema-2 captures retain strict contiguous-depth validation.
+
+Recorder intervals and `batch_write_cycles` measure explicit publication
+work only (batch drains in older captures, terminal publication with direct
+stores). Timestamp reads, direct record stores, local bookkeeping, and the final publication/ACK are not magically
+removed from execution time. The Scalar window ends before final trace
+observer/header publication; the actual Device measurement includes that cost. Timing detail
+therefore supports attribution, not reconstruction of uninstrumented timing.
+
+The normal converter renders these lanes automatically. For integer-cycle
+accounting without rendering, run:
+
+```bash
+python -m simpler_setup.tools.hbg.scalar_profile chip_swimlane_records.json \
+  --output scalar-summary.json
+```
+
+The merged display uses compact event JSON. Every interval is retained with
+its original timestamp, duration and lane. Function/operation names carry task
+identity and non-unit call counts; constant run identity and completeness move
+to per-lane metadata. The display omits redundant per-event raw fields and
+streams one compact event per line. The source capture remains authoritative
+for integer cycles, nesting depth and all other analysis fields. Non-Scalar
+task and dependency events retain their existing attributes.
+
+An output name ending in `.json.gz` produces a losslessly compressed merged
+display. Raw captures can also be gzip-compressed without changing any bytes
+after decompression; compression does not merge polling calls or shorten
+individual Atomic/DCCI/DSB intervals. The device record layout is unchanged.
+
+For profiling-overhead comparisons, use the same kernels, inputs, device and
+runtime binary for L1 and L3. Measure after warmup and report the complete
+AICPU Device interval without subtracting recording costs. Also compare L1
+against the base revision to detect changes to the unprofiled path.
 
 Dependency arrows are not produced by any swimlane level — see
 [§3.5](#35-dependency-arrows-from-dep_gen) for the dep_gen join.
@@ -216,6 +427,32 @@ and pipeline diagnostics. All members submitted through one
 `group_index` values. Individually submitted tasks do not share that identity;
 the current postprocessor therefore retains local-capture-index pairing for
 them and requires symmetric `dN` sets.
+
+#### Retained runs (`collect_across_runs=True`)
+
+A retained collector keeps several runs open at once, so one fixed file name
+cannot hold them. Each admitted run reserves its own directory under the prefix
+*that run* named and publishes one file in it:
+
+```text
+<output_prefix>/rank0/d0/
+├── dispatch_identity.json          # the submission that produced the run
+└── swimlane-0/
+    └── records_e<run_epoch>.json   # that run's records, and nothing else
+```
+
+`swimlane-<k>` is a reservation index taken by exclusive `mkdir`, not an
+identity: two processes sharing a prefix take different indexes, and nothing is
+derived from a pid. The run's own identity is published inside the artifact, as
+`metadata.collection.dispatch`, and that is what pairs it with the sidecar
+beside it — `owner_instance_id`, `chip_rank`, `run_id` and
+`endpoint_dispatch_id`, all four, never a filename or a directory order. A run
+whose caller stated no identity publishes `"status": "unidentified"` with null
+fields and is converted by naming its file explicitly.
+
+The two file forms are read by different rules and are never merged. A
+directory holding both offers two conversion units; name one of them with
+`--dispatch d0:fixed` or `--dispatch d0:retained`.
 
 When an L3 Worker is attached below L4, all of its outputs first enter the
 parent-assigned node namespace:
@@ -397,7 +634,25 @@ its task ids. AICore is the
 canonical producer of `task_token`; the Scheduler producer stamps the
 dispatch / finish timestamps and the per-core join token.
 
-These artifacts carry no schema version. They are written by platform C++ in
+**A host-side section belongs to the run that published it.** `aicore_tasks`
+and `scheduler_tasks` are published by the runtime through
+`HostApi::publish_chip_swimlane_extension`, which carries the publishing run's
+own epoch, and a retaining collector stores the section in that run's bucket.
+That addressing is load-bearing under a joined launch: the successor is admitted
+while the predecessor is still executing, so the predecessor publishes *after*
+the admission that would have cleared any shared slot — one resident slot then
+belongs to neither run, and the collector would hand the predecessor's rows to
+the successor's artifact (where their `run_epoch` column, correctly, matches
+nothing the successor executed) while refusing the successor's own publication
+as a double write. A section naming a run the collector does not hold open is
+refused rather than stored anywhere, and the per-run host budget is charged at
+the publication, against that run's bucket, measured from the caller's bytes so
+a payload the budget refuses is never copied. A section is accepted only while
+that run's bucket is still `Admitting` — the window between its `run_begin` and
+its `run_close` — because after the close the bucket's storage belongs to the
+writer that may publish and release it at any moment.
+
+The platform task and phase rows carry no schema version. They are written by platform C++ in
 this repo and read by `swimlane_converter.py` from the same checkout and the
 same build, so a declared number could never disagree with the rows it
 describes — and a producer wrong about its own rows would stamp a wrong number
@@ -487,19 +742,17 @@ field but render differently in Perfetto:
 
 | Phase | Role | Lane | `tasks_processed` semantic |
 | ----- | ---- | ---- | -------------------------- |
-| `bootstrap` | A5 HBG AICore outer | AICore Scheduler lane | initial executable tasks classified and published before normal scheduling |
-| `complete` | outer | sched (pid=2) | FIN'd subtasks + sub-block retires this iter; A5 HBG ends this phase before dependency resolution |
+| `bootstrap` | A5 HBG AICore outer | AICore Scheduler lane | run topology, ordered catalog and per-cluster coordination initialized before normal scheduling |
+| `complete` | outer | sched (pid=2) | FIN'd subtasks + sub-block retires this iter |
 | `async_poll` | outer | sched | async-wait completions resolved; zero means polling consumed CPU without completing work |
 | `dispatch` | outer | sched | subtasks published this iter |
-| `state_probe` | A5 HBG AICore outer | AICore Scheduler lane | Scheduler-local Dispatch Slot / Ready state checked, a task acquired from a Ready Inbox, and immediate or deferred placement decided |
-| `worksteal` | A5 HBG AICore outer | AICore Scheduler lane | a task acquired from another non-empty Inbox is published |
-| `refill` | A5 HBG AICore outer | AICore Scheduler lane | completed Slot reused for one replacement task; `DIRECT_RESOLVE` omits a preceding `state_probe` |
+| `state_probe` | A5 HBG acquisition envelope | AICore Scheduler lane | discovery through acquisition of one concrete execution token; batched envelopes may overlap |
 | `release` | outer | sched | deferred-release slots drained this iter |
 | `dummy` | outer | sched | `dummy_ready_queue` entries handled this iter (explicit dummies and false-predicate tasks) |
 | `early_dispatch` | outer | sched | blocks staged by speculative early-dispatch this pass |
 | `drain` | outer | sched | blocks staged by this thread's global sync-start drain pass |
 | `graph_prepare` | outer | sched | Graph Definition nodes expanded this pass |
-| `resolve` | inner (TMR); A5 HBG AICore outer | TMR sched sub-lane or AICore Scheduler lane | consumers visited after completion |
+| `resolve` | inner (TMR) | TMR sched sub-lane | consumers visited after completion |
 | `resolve_standalone` | P-thread outer (HBG); rendered as `resolve` | HBG P sched lane | completed SPSC slots |
 | `drain_prepare` | inner | sched, nested in `drain` | subtasks prepared for global sync-start publication |
 | `drain_publish` | inner | sched, nested in `drain` | subtasks published during global sync-start staging |
@@ -511,7 +764,8 @@ orchestrator submit path, so it has no swimlane lane. Read its cost
 from `g_orch_fanin_cycle` in the device-log orch breakdown (the
 `fanin` line) instead.
 
-Outer phases are mutually time-exclusive within an iter. In
+Outer work phases are mutually time-exclusive within an iter; the A5 HBG
+StateProbe acquisition envelope is not an exclusive work phase. In
 `tensormap_and_ringbuffer`, the converter renders `resolve` on a sibling
 `Sched_N` tid because it is time-contained by the outer `complete`/`dummy`
 lane. In `host_build_graph`, standalone `resolve` stays beside `async_poll` and
@@ -524,17 +778,38 @@ bars even when their timestamps fall inside an outer span.
 For the A5 HBG AICore producer, all phases render on the single
 `Scheduler_<worker_id>` lane, matching the worker ID used in Worker View.
 If `worker_id` is missing or null, the suffix falls back to `scheduler_id`.
-Completion, Resolve, StateProbe when present, and the selected publication phase
-are mutually time-exclusive.
-StateProbe includes Ready claim or steal and ends when immediate or deferred
-placement has been decided. Deferred waiting is intentionally left as an empty
-interval before the eventual Dispatch, Worksteal, or Refill. Worksteal
-identifies a task whose Ready source was another Inbox when its publication
-mode is not Refill; a completed Slot reused for a replacement task remains
-Refill regardless of its Ready source. A Ready-Inbox replacement retains its
-StateProbe, while a `DIRECT_RESOLVE` replacement proceeds directly from
-Resolve to Refill without one. The steal operation itself is included in
-StateProbe. The `ready_claim`, `ready_steal` and `direct_refill` names were
+Bootstrap, Dispatch, Completion and Idle are mutually time-exclusive. For an
+ordinary token, StateProbe starts at its directory-search slice and ends when
+the worker acquires the prepared execution. Several acquisitions in one slice
+share that start, so their envelopes can overlap. Each envelope ends before its
+Dispatch. Subsequent fanin and resource waits remain on the original owner.
+Use `scalar_execution_token_refill`, `scalar_execution_token_receive`,
+`scalar_execution_token_fanin`, and `scalar_execution_token_select` with the
+Scalar profile's exclusive-cycle accounting to measure the underlying work.
+
+A successful task-local claim fixes the execution owner. The worker retains its
+prepared Call while waiting for fanin and executes it from the same record. MIX members execute from their SSBUF group. For `sync_start`, each physical member accepts at most one block from the same task instance. See the
+[execution ownership contract](../zh-cn/design/a5-hbg-graph-task/build-execute-separation.md).
+The shared trace vocabulary still recognizes `resolve` and `refill`, but the
+current A5 token path does not emit these outer phases.
+The A5 wire trace contains only current timing and execution identity fields: a
+256-byte per-execution trace and a 24-byte local staging record. The native protocol records
+catalog discovery (0) and cooperative/group preparation (3) as ready sources.
+Graph captures also carry the expanded node map and Graph source.
+
+A5 HBG writes version 2 of the `aicore_execution_identities` section. Every
+version 2 execution carries a scheduling rank. The converter also reads
+unversioned identity sections from earlier runs, including ordinary executions
+with a null rank. Full ranked L4 audits still require a rank for each execution.
+
+For MIX, the L4 `claim_before` and `claim_after` stamps bracket allocation of
+the logical block. AIV0 immediately reserves the prepared group anchor. It
+waits for the preceding generation to retire before arming that anchor. AIV0
+then publishes the descriptor and its new generation between `publish_before`
+and `publish_after`. Each participating lane records its own arrival. Its final
+payload publication follows its observation that all active lanes have arrived.
+
+The `ready_claim`, `ready_steal` and `direct_refill` names were
 emitted by this scheduler between #2104 and #2178; no current scheduler emits
 them and nothing reads them. `fanin` names a host-side orchestration step, not a
 scheduler phase, and has never appeared in this stream.
@@ -612,7 +887,8 @@ python -m simpler_setup.tools.swimlane_converter \
 ### Optional alignment embedded in a single capture
 
 For `host_build_graph` captures, single-file conversion prefers sibling
-`host_clock_alignment.*.log` files, falling back to persistent `host.*.log` files.
+`host_clock_alignment.*.log` files, falling back to sibling `host.*.log` files
+when present.
 Explicit `--host-log` arguments override this lookup. The converter identifies
 HBG by the document-level `metadata.runtime`. Automatic alignment also requires Host capture
 information (`host_orchestrator_phases`, `host_device_uploads`, or Host capture
@@ -657,8 +933,11 @@ before runtime returns; the exported `chip.run` span ends before the export itse
 
 SceneTest and PyPTO can then invoke the converter, which reads the sibling timing
 logs, performs containment, saves `metadata.clock_alignment` in mixed HBG source
-captures, and generates the merged trace. Timing-log export itself does not
-calculate or save clock alignment. Device-only captures and other diagnostics
+captures, and generates the merged trace. For automatic multi-Rank conversion,
+SceneTest also reads the live session spool and saves selected `[STRACE]` records
+beside the capture; `dispatch_identity.json` links those derived logs for offline
+conversion. Timing-log export itself does not calculate or save clock
+alignment. Device-only captures and other diagnostics
 alone do not trigger this export. Directory merging retains containment for all
 runtimes and levels. While the process is alive, complete Host call trees
 remain in the session spool's `host.<pid>.log` files and can be supplied through
@@ -766,18 +1045,14 @@ It describes placement freedom for the selected join. Phase-join freedom is
 reported separately as `join.residual_ns`; the saved HBG anchor bounds include
 both sources of uncertainty.
 
-The Host block comes first and has two parts. Above the Ranks are the
-processes that dispatched to them — the L3 scheduler's `node.*` lanes, and an
-L4's `network1.*` above those. Each process binds its persistent host log to the root of
-the level namespace it owns, so a direct L3 run stores them above the Rank
-captures. Under a parent-assigned namespace only that namespace's own
-levels are beside them — the L4 above a `nodeN` writes one directory up, where
-a merge reading that `nodeN` does not look. They are Host CLOCK_MONOTONIC and
-same-host cross-process comparable, so they are drawn directly and **carry no
-`slack_ns` at all** — containment is a device-clock term. Their logs cover the
-whole run while the merge covers one dispatch, so the invocations drawn are
-those overlapping the Ranks' own span on the axis, and
-`metadata.dispatcher_pids` names the processes they came from.
+The Host block comes first and has two parts. Above the Ranks are the L3
+scheduler's `node.*` lanes. Automatic conversion reads their spans from the live
+session spool and saves the selected records beside the merged capture. A Rank's
+parent dispatch identity identifies the L3 task, but carries no link to an L4
+task; the converter does not attach `network1.*` spans by timestamp alone. The
+selected L3 spans are Host CLOCK_MONOTONIC and same-host cross-process comparable,
+so they are drawn directly and **carry no `slack_ns` at all** — containment is a
+device-clock term. `metadata.dispatcher_pids` names their source process.
 
 Then each Rank contributes three lanes read off its own Host log — its
 `chip.run` call tree (on the Host clock, no placement error), the `clk=dev`
@@ -847,7 +1122,11 @@ same lane structure — the directory form repeats it once per Rank under the
   only on the leader thread.
 - **Scheduler View** (pid=3) — task-execution overlay using Scheduler
   dispatch/finish timestamps (level >= 2), with the same labels
-  as Worker View.
+  as Worker View. HBG AICore L3/L4 puts these timestamps in Worker task
+  details instead of emitting this duplicate view; L2 and AICPU scheduling
+  retain the separate view. Percounter L2–L4 uses this view for task/block
+  milestones. Numbered rows under a Percounter cluster display overlapping block
+  lifetimes, and each marker identifies the actual worker.
 - **Worker View** (pid=4) — one swim-lane per physical worker:
   - `AIC_N` — matrix cores (receive → kernel end from level >= 1)
   - `AIV_N` — vector cores (receive → kernel end from level >= 1)
@@ -900,6 +1179,45 @@ The scheduler-budget parser counts every mutually exclusive outer phase and
 standalone HBG P-thread `resolve` bars. It excludes only `resolve` records whose
 timestamps are contained by a TMR `complete` or `dummy` parent, preventing the
 nested TMR work from being counted twice.
+
+#### Recorded Kernel model windows
+
+On A3, a native Kernel model can retain Swimlane records across cold capture and
+replay. Capture prepares the model without executing its kernels. Destroying the
+model and releasing its resources closes its collection window; flushing
+diagnostics finishes writing `swimlane-*/records_e<epoch>.json`. Program execution
+remains eager-only.
+
+Convert that file with the same command:
+
+```bash
+python -m simpler_setup.tools.swimlane_converter path/to/records_e1.json -o observations.json
+```
+
+`metadata.collection.recorded_window` selects the recorded-window reader. Every
+received interval is preserved, including repeated task IDs and identical
+timestamps. Trace event arguments retain the population, original stream and
+record indices, fixed window epoch, and raw timestamps. The epoch identifies the
+recorded node; it is not a replay number. Scheduler and AICore observations are
+separate tracks, without inferred task joins, dependency arrows or invocation
+overhead statistics.
+
+The device trace uses relative device SysCnt time. When Host preparation records
+exist, the trace's `host_preparation_file` names a unique companion containing
+that **one-time preparation** on its separate Host monotonic clock. Replacing a
+device trace publishes its companion first; a failed replacement preserves the
+previous trace and its companion. It is not repeated Host activity for each
+replay. There are no replay-local Host anchors, so saved/sibling Host logs cannot
+align these windows; explicit Host placement, dependency/overhead analysis and
+multi-rank merging are refused. Conversion preserves the original records file;
+output paths that alias it are refused.
+
+`counts_unknown: true` and null cumulative device totals/drop/fatal fields mean
+the collector cannot infer those totals across replays. Numeric Host receipts and
+known transport, budget or writer loss remain evidence of actual observations and
+quality. An empty recorded artifact is valid for a model destroyed without replay;
+it does not establish a replay count or zero cumulative loss. A5 recorded-window
+capture is not supported by this route.
 
 ### 3.4 Adding human-readable names
 

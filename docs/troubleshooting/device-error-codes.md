@@ -88,7 +88,7 @@ So on hardware the exception code is the *least* informative thing on screen. Th
 The description and remedy come from the log. What it cannot tell you is which
 layer to go looking in, which is what these columns are for.
 
-### Orchestration errors (1-11)
+### Orchestration errors (1-12)
 
 | Code | Name | Whose bug, usually |
 | ---- | ---- | ------------------ |
@@ -103,6 +103,7 @@ layer to go looking in, which is what these columns are for.
 | 9 | EXPLICIT_ORCH_FATAL | orchestration (deliberate) |
 | 10 | SCOPE_TASKS_OVERFLOW | runtime-internal |
 | 11 | TENSORMAP_OVERFLOW | runtime-internal / extreme scale |
+| 12 | SUBMIT_CAPACITY_EXCEEDED | orchestration / config (HBG only) |
 
 ### Scheduler errors (100+)
 
@@ -113,6 +114,15 @@ layer to go looking in, which is what these columns are for.
 | 102 | ASYNC_WAIT_OVERFLOW | kernel (async) |
 | 103 | ASYNC_REGISTRATION_FAILED | runtime-internal |
 | 104 | READY_QUEUE_OVERFLOW | host bind / runtime-internal / config |
+| 105 | KERNEL_INVALID_OUTPUT | kernel output validation (A2/A3 T&R) |
+| 106 | KERNEL_INDEX_OUT_OF_RANGE | kernel index validation / input data (A2/A3 T&R) |
+| 107 | KERNEL_NON_FINITE_VALUE | kernel numerical validation / input data (A2/A3 T&R) |
+
+Codes 105–107 come from explicit checks in ordinary AIC/AIV kernels. The
+`Kernel failure:` line carries the task/function/block/core identity from the scheduler;
+start with that diagnostic and the reporting kernel.
+See [kernel validation reporting](../aicore-kernel-programming.md#reporting-invalid-kernel-data-a2a3-tmr)
+for the API and supported exit contract.
 
 ### READY_QUEUE_OVERFLOW origins
 
@@ -133,22 +143,38 @@ verdict plus locators, so you rarely need the device log:
 
 ```text
 [ERROR] scheduler timeout sub_class=S1:running-stalled (detail=1) completed=0/1 \
-        running=1 ready=0 waiting=0 orch_done=1 stuck_task_id=0x0000000100000001 stuck_core=5
+        running=1 ready=0 waiting=0 async_wait=0 orch_done=1 stuck_task_id=0x0000000100000001 stuck_core=5
 ```
 
 | Sub-class | Cause |
 | --------- | ----- |
 | **S1** running-stalled | AICore kernel hang, or a kernel that is merely very slow |
-| **S3** ready-but-all-idle | dispatch loop / sync-start gate |
+| **S3** ready-but-all-idle | Dispatch-ready work exists with no observed running core; inspect dispatch loop / sync-start gate |
 | **S4** dependency-deadlock | dependency wiring |
 | **S5** orchestrator-starvation | orchestration stuck upstream |
+| **S6** async-completion-wait | All AICore subtasks of a deferred task finished, but logical completion is still pending |
 | **unknown** | runtime bug / memory corruption |
 
-The counters *are* the decision: priority is `running > ready > waiting > orch not
-done`. `running=1` is always S1; `running=0, ready>0` is S3.
+The TMR counters determine the dominant observation: priority is
+`running > ready > async_wait > waiting > orch not done`. `running` counts logical
+tasks with observed AICore ownership, not all execution engines. `ready` excludes
+the all-FIN deferred-completion phase; it is not a ready-queue occupancy count.
+With no running or ready work, `async_wait>0` is S6 even when downstream tasks
+still wait on dependencies. S1 and S3 retain priority in mixed snapshots; the
+separate `async_wait` count remains visible.
 
-**Only S1 and S3 are reproducible in practice.** S4, S5 and unknown are defensive
-labels — see [Codes with no end-to-end test](device-error-codes/untested.md).
+Async-wait accounting counts each live task slot once across mailbox handoff and
+wait-list residence. It includes deferred completion awaiting consumer processing;
+it does not prove an engine is still executing. S6 carries the first async-wait
+task ID and `stuck_core=-1`. The device log's `ASYNC_WAIT` records describe
+registered engines and conditions, or report pending mailbox messages / a busy
+snapshot. A timeout observation does not establish a transport fault's root cause.
+A2/A3 HBG reports `state=ASYNC_WAIT` and `scan_async_wait`, but does not use TMR's
+S1–S6 timeout sub-classification. A5 HBG has a separate diagnostic path.
+
+**S1 has end-to-end fault coverage; S6 has CPU scheduler regression coverage
+for deferred completion.** S3, S4, S5 and unknown have no stable public-API scene
+reproducer — see [Codes with no end-to-end test](device-error-codes/untested.md).
 
 ### Host-side CANN codes
 
@@ -180,7 +206,7 @@ always *fallout* — scroll up for the first failure on that device. For classif
 
 | You have | Go to |
 | -------- | ----- |
-| a capacity code — 1, 2, 3, 4, 11 | [Capacity](device-error-codes/capacity.md) |
+| a capacity code — 1, 2, 3, 4, 11, 12 | [Capacity](device-error-codes/capacity.md) |
 | a stall — 100, or code 8 | [Stalls](device-error-codes/stall.md) |
 | a `VEC`/`CUBE` instruction error or UB out of bounds in the device log | [AICore faults](device-error-codes/aicore-fault.md) |
 | 10, 11, 103, S4, S5 or unknown | [Codes with no end-to-end test](device-error-codes/untested.md) — and it is a runtime bug |

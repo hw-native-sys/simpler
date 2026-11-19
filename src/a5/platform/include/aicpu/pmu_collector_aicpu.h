@@ -31,8 +31,7 @@
  *   pmu_aicpu_finalize()          — per-thread: restore CTRL registers.
  */
 
-#ifndef PLATFORM_AICPU_PMU_COLLECTOR_AICPU_H_
-#define PLATFORM_AICPU_PMU_COLLECTOR_AICPU_H_
+#pragma once
 
 #include <cstdint>
 
@@ -68,9 +67,10 @@ extern "C" bool is_pmu_enabled();
  * touch any Handshake field.
  *
  * @param physical_core_ids   Array of hardware physical core ids (length num_cores)
+ * @param event_type         This invocation's published descriptor selection.
  * @param num_cores           Number of active AICore workers
  */
-void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores);
+void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores, PmuEventType event_type);
 
 /**
  * Commit one PmuRecord from the per-core stable AICore staging-ring slot.
@@ -86,6 +86,27 @@ void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores);
  */
 void pmu_aicpu_complete_record(
     int core_id, int thread_idx, uint32_t reg_task_id, TaskId task_id, uint32_t func_id, CoreType core_type
+);
+
+/**
+ * Commit one subtask's PMU snapshot that the caller already holds.
+ *
+ * The same accounting and buffer rotation `pmu_aicpu_complete_record` performs,
+ * for a route whose staging is not the per-core dual-issue ring: the AICore
+ * scheduler dispatches on-core, so no AICPU thread sees a FIN to drain that
+ * ring on, and its cores stage one cell per executed subtask instead.
+ *
+ * @param core_id       Logical core index the subtask executed on
+ * @param thread_idx    AICPU thread index (selects ready_queue)
+ * @param task_id       Identity to store in the PmuRecord
+ * @param func_id       kernel_id of the executed subtask
+ * @param core_type     AIC or AIV
+ * @param total_cycles  PMU_CNT_TOTAL as the core read it
+ * @param counters      PMU_COUNTER_COUNT_A5 event counters
+ */
+void pmu_aicpu_record_staged_task(
+    int core_id, int thread_idx, TaskId task_id, uint32_t func_id, CoreType core_type, uint64_t total_cycles,
+    const uint32_t *counters
 );
 
 /**
@@ -107,5 +128,33 @@ void pmu_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, int co
  * @param core_num          Entries in cur_thread_cores
  */
 void pmu_aicpu_finalize(const int *cur_thread_cores, int core_num);
+/**
+ * Name the bank array this collector's producers publish their per-run
+ * accounting into, and which bank belongs to the launching run.
+ *
+ * One producer per core, so the bank holds `PLATFORM_MAX_CORES` entries. A zero
+ * base is the default path: nothing is published, and the host owns the counter
+ * reset and reads the live counters as it does without retention.
+ */
+extern "C" void set_platform_pmu_run_terminal(uint64_t bank);
 
-#endif  // PLATFORM_AICPU_PMU_COLLECTOR_AICPU_H_
+/**
+ * Settle one core's accounting for this run into its terminal entry, after
+ * every path that can still change one of its counters.
+ *
+ * @param core_id Logical core index
+ */
+void pmu_aicpu_close_run(int core_id);
+
+/**
+ * Settle every core this thread owns, at the thread's own exit.
+ *
+ * Core ownership is a partition, so the thread retiring a core is the only one
+ * that settles it and no core is settled twice. Runs before the registers are
+ * restored and before the cores are retired: those are what stop the producer,
+ * and this reads the counters the producer wrote.
+ *
+ * @param core_ids This thread's cores
+ * @param core_num How many of them
+ */
+void pmu_aicpu_close_run_cores(const int32_t *core_ids, int32_t core_num);

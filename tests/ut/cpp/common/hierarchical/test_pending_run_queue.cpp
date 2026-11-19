@@ -138,10 +138,8 @@ constexpr std::chrono::seconds kHookParkBound{30};
 // this harness configuring a two-slot pool and both slots being demonstrably
 // held elsewhere — run one is dispatchable and run two preparable, and neither
 // predicate is satisfiable without a lease. The configured depth is what bounds
-// the leases, not the compile-time ceiling, which only has to be wide enough to
-// hold it.
+// the leases, and nothing else does.
 TEST(PendingQueue, ThirdAndFourthRunsBuildWithoutTakingNativeLeases) {
-    static_assert(PTO_PIPELINE_MAX_DEPTH >= 2, "this test reasons from a two-slot native pool");
     PendingQueueHarness h(/*depth=*/2, /*pending_depth=*/4);
 
     auto first = h.build_closed_run(0xE001);
@@ -210,8 +208,8 @@ TEST(PendingQueue, BothDispatchIdentitiesResolveAfterALeaselessBuild) {
     EXPECT_NE(prepared.generation, 0u) << "the prepared successor's slot would fail the same check";
     EXPECT_EQ(active.reserved, 0u);
     EXPECT_EQ(prepared.reserved, 0u);
-    EXPECT_LT(active.slot_id, static_cast<uint32_t>(PTO_PIPELINE_MAX_DEPTH));
-    EXPECT_LT(prepared.slot_id, static_cast<uint32_t>(PTO_PIPELINE_MAX_DEPTH));
+    EXPECT_LT(active.slot_id, 2u);
+    EXPECT_LT(prepared.slot_id, 2u);
     EXPECT_NE(active.slot_id, prepared.slot_id);
 
     h.complete(first.second);
@@ -480,7 +478,7 @@ TEST(PendingQueue, SlotRegisteredAfterPromotionStillGetsAValidIdentity) {
     const PipelineSlotLease stamped = h.slot_lease(task);
     EXPECT_NE(stamped.generation, 0u) << "a slot registered after promotion kept the invalid encoding";
     EXPECT_EQ(stamped.reserved, 0u);
-    EXPECT_LT(stamped.slot_id, static_cast<uint32_t>(PTO_PIPELINE_MAX_DEPTH));
+    EXPECT_LT(stamped.slot_id, 2u);
 
     h.orch.close_run_submission(second);
     EXPECT_TRUE(h.orch.can_dispatch_run(second));
@@ -564,7 +562,9 @@ TEST(PendingQueue, ConfigurationRejectsOnlyTheNativeDepthRange) {
     orch.init(&tm, &allocator, &scope, &rq_sub, &rq_next_level);
 
     EXPECT_THROW(orch.configure_pipeline_depth(0, 1), std::invalid_argument);
-    EXPECT_THROW(orch.configure_pipeline_depth(PTO_PIPELINE_MAX_DEPTH + 1, 1), std::invalid_argument);
+    // No ceiling of its own: a depth far above anything that ever shipped is
+    // configured and the arena is built to it.
+    EXPECT_NO_THROW(orch.configure_pipeline_depth(64, 1));
     // A pending depth above the native depth is the point of the knob, and one
     // below it is legal too — it leaves the successor role unfillable rather
     // than rejecting the configuration.

@@ -8,7 +8,7 @@ the reported code or watchdog signature, then use the matching guide below.
 
 | Document | What it covers |
 | -------- | -------------- |
-| [Capacity Codes](capacity.md) | Diagnosing codes 1, 2, 3, 4, and 11 across HBG fixed capacity and TRB reclaim |
+| [Capacity Codes](capacity.md) | Diagnosing codes 1, 2, 3, 4, 11, and 12 across HBG fixed capacity and TRB reclaim |
 | [Stalls](stall.md) | Diagnosing scheduler timeout code 100 and tensor-wait code 8 by ordering watchdogs and locating the stuck task |
 
 ## Core faults and defensive codes

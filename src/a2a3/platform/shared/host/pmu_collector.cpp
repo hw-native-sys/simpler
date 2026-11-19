@@ -62,6 +62,19 @@ bool recycled_seed_capacity_is_sufficient(int num_cores, int thread_count, int s
 
 }  // namespace
 
+void PmuCollector::stop_for_device_failure() {
+    retained_runs_.stop_writer();
+    profiling_common::ProfilerBase<PmuCollector, PmuModule>::stop(false);
+    retained_runs_.note_unpublished_runs_abandoned();
+}
+
+void PmuCollector::abandon_after_device_reset() {
+    terminal_banks_.abandon_after_device_reset();
+    abandon_memory_after_device_reset();
+    shm_dev_ = nullptr;
+    initialized_ = false;
+}
+
 PmuCollector::~PmuCollector() {
     // The writer before the collector threads: it is the one that asks them for
     // a reference release, so joining it second could leave it waiting on
@@ -76,8 +89,17 @@ PmuCollector::~PmuCollector() {
 
 int PmuCollector::init(
     int num_cores, int num_threads, const PmuAllocCallback &alloc_cb, PmuRegisterCallback register_cb,
-    const PmuFreeCallback &free_cb, int device_id
-) {
+    const PmuFreeCallback &free_cb, int device_id, PmuUnregisterCallback unregister_cb
+) try {
+    if (register_cb != nullptr && unregister_cb == nullptr) {
+        LOG_ERROR("Pmu collector registration requires an unregister callback");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+
+    if (terminal_banks_.backing_retained()) {
+        LOG_ERROR("PmuCollector: terminal backing still requires cleanup before initialization");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     if (num_cores <= 0 || num_threads <= 0 || alloc_cb == nullptr || free_cb == nullptr) {
         LOG_ERROR("PmuCollector::init: invalid arguments");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -89,6 +111,9 @@ int PmuCollector::init(
         );
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    device_alloc_cb_ = alloc_cb;
+    device_free_cb_ = free_cb;
+    bank_free_cb_ = free_cb;
     if (initialized_) {
         // Already holding this run's device resources. They are not per-run:
         // configuration arrives via begin_run() and the layout is fixed at
@@ -102,7 +127,6 @@ int PmuCollector::init(
 
     num_cores_ = num_cores;
     num_threads_ = num_threads;
-    buffers_registered_ = (register_cb != nullptr);
 
     reset_collector_shards();
     execution_complete_.store(false, std::memory_order_release);
@@ -118,29 +142,18 @@ int PmuCollector::init(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    // ---- Allocate shared header + buffer-state region ----
-    shm_size_ = calc_pmu_data_size(num_cores);
-    shm_dev_ = alloc_cb(shm_size_);
-    if (shm_dev_ == nullptr) {
-        LOG_ERROR("PmuCollector: failed to allocate PMU shared memory (%zu bytes)", shm_size_);
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
+    set_memory_context(alloc_cb, register_cb, free_cb, nullptr, nullptr, nullptr, nullptr, 0, device_id, unregister_cb);
+    profiling_common::InitRollbackGuard<decltype(manager_)> guard(
+        manager_, free_cb, register_cb != nullptr ? unregister_cb : nullptr, device_id
+    );
+    int allocation_rc = 0;
+    const size_t shm_size_local = calc_pmu_data_size(num_cores);
+    void *shm_host_local = nullptr;
+    void *shm_dev_local = alloc_paired_buffer(shm_size_local, &shm_host_local, &allocation_rc);
+    if (shm_dev_local == nullptr) return allocation_rc;
+    std::memset(shm_host_local, 0, shm_size_local);
 
-    if (register_cb != nullptr) {
-        int rc = register_cb(shm_dev_, shm_size_, device_id, &shm_host_);
-        if (rc != 0) {
-            LOG_ERROR("PmuCollector: halHostRegister for PMU SHM failed: %d", rc);
-            free_cb(shm_dev_);
-            shm_dev_ = nullptr;
-            return rc;
-        }
-        shm_registered_ = true;
-    } else {
-        shm_host_ = shm_dev_;
-    }
-    std::memset(shm_host_, 0, shm_size_);
-
-    PmuDataHeader *hdr = get_pmu_header(shm_host_);
+    PmuDataHeader *hdr = get_pmu_header(shm_host_local);
     hdr->event_type = static_cast<uint32_t>(event_type_);
     hdr->num_cores = static_cast<uint32_t>(num_cores);
 
@@ -148,28 +161,13 @@ int PmuCollector::init(
     const size_t buf_size = sizeof(PmuBuffer);
 
     for (int c = 0; c < num_cores; c++) {
-        PmuBufferState *state = pmu_state(c);
+        PmuBufferState *state = get_pmu_buffer_state(shm_host_local, c);
 
         for (int b = 0; b < PLATFORM_PMU_BUFFERS_PER_CORE; b++) {
-            void *dev_ptr = alloc_cb(buf_size);
-            if (dev_ptr == nullptr) {
-                LOG_ERROR("PmuCollector: failed to allocate PmuBuffer c=%d b=%d", c, b);
-                return PTO_RUNTIME_ERR_INTERNAL;
-            }
-
-            void *host_ptr = dev_ptr;
-            if (register_cb != nullptr) {
-                int rc = register_cb(dev_ptr, buf_size, device_id, &host_ptr);
-                if (rc != 0) {
-                    LOG_ERROR("PmuCollector: halHostRegister for PmuBuffer c=%d b=%d failed: %d", c, b, rc);
-                    free_cb(dev_ptr);
-                    return rc;
-                }
-            }
+            void *host_ptr = nullptr;
+            void *dev_ptr = alloc_paired_buffer(buf_size, &host_ptr, &allocation_rc);
+            if (dev_ptr == nullptr) return allocation_rc;
             std::memset(host_ptr, 0, buf_size);
-
-            // Track dev→host so the mgmt thread can resolve_host_ptr().
-            manager_.register_mapping(dev_ptr, host_ptr);
 
             if (b < PLATFORM_PMU_SLOT_COUNT) {
                 // First N buffers go directly into this core's free_queue.
@@ -192,21 +190,19 @@ int PmuCollector::init(
 
     rebuild_csv_header();
 
+    guard.commit();
+    shm_dev_ = shm_dev_local;
+    shm_size_ = shm_size_local;
+    publish_shared_memory(shm_dev_local, shm_host_local, shm_size_local);
     initialized_ = true;
-    // Hand the memory context to the base. start(tf) (inherited) will assemble
-    // a MemoryOps from these and launch mgmt + poll threads. PmuModule's alloc
-    // fallback in process_entry can then grow the buffer pool on demand if
-    // both the per-core free_queue and the recycled pool drain.
-    set_memory_context(
-        alloc_cb, register_cb, free_cb, /*copy_to=*/nullptr, /*copy_from=*/nullptr, shm_dev_, shm_host_, shm_size_,
-        device_id
-    );
 
     LOG_INFO(
         "PMU collector initialized: %d cores, %d threads, SHM=0x%lx, CSV=%s (opened on first record)", num_cores,
         num_threads, reinterpret_cast<unsigned long>(shm_dev_), csv_path_.c_str()
     );
     return 0;
+} catch (const std::bad_alloc &) {
+    return PTO_RUNTIME_ERR_INTERNAL;
 }
 
 void PmuCollector::start(const profiling_common::ThreadFactory &thread_factory) {
@@ -214,7 +210,7 @@ void PmuCollector::start(const profiling_common::ThreadFactory &thread_factory) 
     // A retaining collector owns no single-run shard state: its files, counters
     // and header belong to an epoch, and dropping them here would reset what a
     // predecessor is still publishing into.
-    if (!retains_runs()) {
+    if (!retains_runs() && !recorded_windows_open()) {
         reset_collector_shards();
     }
     profiling_common::ProfilerBase<PmuCollector, PmuModule>::start(thread_factory);
@@ -298,10 +294,17 @@ void PmuCollector::rebuild_csv_header() {
     csv_header_ = build_csv_header(pmu_resolve_event_config_a2a3(event_type_));
 }
 
-void PmuCollector::begin_run(const std::string &csv_path, PmuEventType event_type) {
+bool PmuCollector::begin_run(const std::string &csv_path, PmuEventType event_type, uint64_t run_epoch) {
+    const auto destination = retained_runs_.available_destination(csv_path);
+    if (!destination) return false;
+    if (!simpler::dfx::pmu::invalidate_collection_metadata(*destination)) {
+        retained_runs_.note_collector_failure("ordinary CSV could not invalidate a previous recorded descriptor");
+        return false;
+    }
     // Before reset_collector_shards(): it rebuilds the shard paths from csv_path_.
-    csv_path_ = csv_path;
+    csv_path_ = *destination;
     event_type_ = event_type;
+    ordinary_run_epoch_ = run_epoch;
 
     reset_collector_shards();
     if (csv_file_.is_open()) {
@@ -309,62 +312,151 @@ void PmuCollector::begin_run(const std::string &csv_path, PmuEventType event_typ
     }
     execution_complete_.store(false, std::memory_order_release);
     rebuild_csv_header();
-    // The single-run path keeps its behaviour: a field the device would not
-    // take is logged by `publish_field` and the run proceeds, exactly as it did
-    // before retention existed. Only a retained admission treats that as a
-    // refusal, because only it promises that the frozen host configuration and
-    // the device's agree.
-    (void)publish_run_config(event_type);
+    set_run_config(event_type);
+    return true;
 }
 
-bool PmuCollector::publish_run_config(PmuEventType event_type) {
-    event_type_ = event_type;
-    // Before the first init() there is no region; init() writes the event type
-    // from the member just set. Afterwards the device needs the new value by
-    // another route — one narrow field, not a bulk write-back, so it cannot race
-    // the AICPU's own header fields.
-    if (shm_host_ == nullptr) return true;
-    bool published = true;
-    PmuDataHeader *hdr = get_pmu_header(shm_host_);
-    hdr->event_type = static_cast<uint32_t>(event_type_);
-    wmb();
-    // The device reads the event type out of this header to program its
-    // counters, so a copy the device did not take leaves it measuring the
-    // previous run's event group while the host names this run's columns.
-    // `publish_field` returns false in exactly that case.
-    published = publish_field(&hdr->event_type, sizeof(hdr->event_type), "event_type") && published;
+void *PmuCollector::bank_alloc(void *owner, size_t bytes, void **host_out) {
+    auto *self = static_cast<PmuCollector *>(owner);
+    // Paired, because an allocation's host readability is a property of how it
+    // was mapped and not of the platform: the raw device allocator alone leaves
+    // an address this process may not dereference. Kept out of the buffer
+    // pool's mapping table, whose teardown would free it on a path that proves
+    // nothing about this collector's producers.
+    return self->alloc_unmanaged_paired_buffer(bytes, host_out);
+}
 
-    // The per-core record counters are producer-side and never reset by the
-    // device, so they carry the previous run's totals into this run's
-    // reconcile. The two are adjacent, so one write-back per core covers
-    // them and leaves the device-owned fields beside them alone.
-    // a2a3 orders these dropped-then-total and has no mismatch counter;
-    // a5's layout differs, so neither the order nor the span is shared.
-    //
-    // A retaining collector reaches here through an admission, which the
-    // predecessor's close precedes: those totals have already been snapshotted
-    // into that run's own epoch, so resetting them here destroys nothing.
-    static_assert(
-        offsetof(PmuBufferState, total_record_count) ==
-            offsetof(PmuBufferState, dropped_record_count) + sizeof(uint32_t),
-        "the two counters must stay adjacent for this single write-back to cover both"
+int PmuCollector::bank_unmap(void *owner, void *device_ptr) {
+    auto *self = static_cast<PmuCollector *>(owner);
+    return self->unmap_unmanaged_paired_buffer(device_ptr, self->bank_unregister_cb_);
+}
+
+int PmuCollector::bank_free(void *owner, void *device_ptr) {
+    auto *self = static_cast<PmuCollector *>(owner);
+    if (self->bank_free_cb_ == nullptr || device_ptr == nullptr) return -1;
+    // The allocator's own status, reported rather than dropped: a refused free
+    // may leave the allocator still owning the pointer, and the bank array is
+    // the memory a producer writes.
+    return self->bank_free_cb_(device_ptr);
+}
+
+int PmuCollector::bank_copy(void *owner, void *host_dst, const void *device_src, const void *host_src, size_t bytes) {
+    auto *self = static_cast<PmuCollector *>(owner);
+    // Both addresses and this collector's own copy context, so the shared rule
+    // reads the mapping this allocation actually has rather than the one its
+    // platform usually gives.
+    return simpler::dfx::credit::read_run_terminal_bank(host_dst, device_src, host_src, bytes, self->copy_from_device_);
+}
+
+int PmuCollector::bank_initialize(void *owner, void *device_dst, void *host_dst, const void *initial, size_t bytes) {
+    auto *self = static_cast<PmuCollector *>(owner);
+    return simpler::dfx::credit::initialize_run_terminal_bank(
+        device_dst, host_dst, initial, bytes, self->copy_to_device_
     );
-    // The region holds num_cores_ states (calc_pmu_data_size), so that is
-    // the bound — a wider loop writes past its end. The runner rebuilds this
-    // collector when a run's core count changes, so a resident one is never
-    // asked to reset a state it does not own.
-    for (int c = 0; c < num_cores_; c++) {
-        PmuBufferState *state = get_pmu_buffer_state(shm_host_, c);
-        state->dropped_record_count = 0;
-        state->total_record_count = 0;
-        wmb();
-        // A reset the device did not take carries the predecessor's totals into
-        // this run's reconcile, so its completeness comparison would be against
-        // somebody else's producer count.
-        published = publish_field(&state->dropped_record_count, 2 * sizeof(uint32_t), "record counters") && published;
-    }
-    return published;
 }
+
+bool PmuCollector::open_run_terminal_banks(int expected_producers) {
+    if (shm_host_ == nullptr || device_alloc_cb_ == nullptr || device_free_cb_ == nullptr) return false;
+    // One producer per core, in a bank dimensioned by the platform maximum: the
+    // stride is what the device indexes by core, the expected count is what this
+    // collector brought up.
+    if (expected_producers != num_cores_ || expected_producers <= 0) return false;
+    return terminal_banks_.open(
+        PLATFORM_MAX_CORES, expected_producers, this, &PmuCollector::bank_alloc, &PmuCollector::bank_unmap,
+        &PmuCollector::bank_free, &PmuCollector::bank_copy, &PmuCollector::bank_initialize
+    );
+}
+
+simpler::dfx::pmu::RecordProofs PmuCollector::snapshot_run_records_from_terminal(
+    bool device_execution_complete, simpler::dfx::credit::Reservation &bank, uint64_t run_epoch
+) {
+    simpler::dfx::pmu::RecordProofs proofs;
+    proofs.device_execution_complete = device_execution_complete;
+    if (!device_execution_complete) {
+        // Neither read nor released on this path. This run never reached its
+        // terminal publication, so the bank holds whatever its cores managed
+        // before the failure mixed with whatever the previous occupant left —
+        // not this run's accounting — and the counts stay unknown, which is the
+        // verdict such a run already carries. Whether the storage comes back is
+        // the separate producer-stop question its run boundary settles, the
+        // same way every other owner's failed close leaves it.
+        return proofs;
+    }
+    // The receipt is this collector's own and is counted when the writer merges
+    // the shards, so none is offered here; the figures below are the run's.
+    // Bounded per-producer detail, read out of the same mirror under the same
+    // identity before the bank is released. Only producers that both claimed
+    // this run and recorded something are listed, so a run whose graph used a
+    // handful of a fully occupied device's cores reports that handful — which
+    // is what lets a reader line a zero-cycle row up with the observation its
+    // own core made. The bound is the collector's producer capacity.
+    simpler::dfx::credit::ProducerNote notes[PLATFORM_MAX_CORES];
+    int note_count = 0;
+    const simpler::dfx::credit::RunReconciliation settled =
+        terminal_banks_.settle(bank, run_epoch, /*received=*/0, notes, PLATFORM_MAX_CORES, &note_count);
+    // One line per run, from the host, where CI keeps it: what each of this
+    // run's own cores observed of its counting window at its own init, taken
+    // from the entries that carry this run's epoch.
+    //
+    // At LOG_TIMING because that is the default threshold (`InitArgs::log_level`
+    // and `simpler::log::kDefaultThreshold` are both 25): an INFO line is below
+    // it, so a run's evidence would exist only under a verbosity nobody turns
+    // on, which is how the first version of this line reached no CI log at all.
+    //
+    // It decides nothing, and its limits are stated in the line itself. Two
+    // instants, each from its own field and each counted over every producer
+    // that claimed the run: `enabled` / `not-enabled` are what a core's init
+    // read **before any task ran**, and `held` / `lost` are what its own close
+    // read **after every task had**. The pair is what a reader compares —
+    // `enabled` with `lost` is a window that was armed and stopped being
+    // armed, `not-enabled` is one that never took the write, and `enabled`
+    // with neither close code is a core whose close never ran. All of them are
+    // read back from the address the AICPU programmed, so none tells a correct
+    // window from a wrong-but-writable one; and the AICore CTRL gate is an
+    // AICore SPR with no AICPU read path, so none of them observes whether a
+    // kernel's counting window was ever opened.
+    if (settled.reported_producers > 0) {
+        LOG_TIMING(
+            "PmuCollector terminal: run %llu control read-back across %d reporting core(s): at init enabled=%d "
+            "not-enabled=%d no-window=%d; at close held=%d lost=%d; first reporting producer: physical core %u, "
+            "PMU_CTRL_0 0x%x at init, 0x%x at close. Every figure is read back from the address this run "
+            "programmed, so none distinguishes a wrong-but-writable window, and none observes whether the AICore "
+            "opened its own per-task gate; the physical id is what selected that window",
+            static_cast<unsigned long long>(run_epoch), settled.reported_producers,
+            settled.notes_by_code[PMU_NOTE_ENABLED], settled.notes_by_code[PMU_NOTE_DISABLED],
+            settled.notes_by_code[PMU_NOTE_NO_WINDOW], settled.close_notes_by_code[PMU_NOTE_HELD],
+            settled.close_notes_by_code[PMU_NOTE_LOST],
+            diagnostic_terminal_note_payload(settled.first_note) & PMU_NOTE_PHYSICAL_MASK,
+            diagnostic_terminal_note_payload(settled.first_note) >> PMU_NOTE_PHYSICAL_BITS,
+            diagnostic_terminal_note_payload(settled.first_close_note) >> PMU_NOTE_PHYSICAL_BITS
+        );
+    }
+    for (int i = 0; i < note_count; i++) {
+        const uint32_t payload = diagnostic_terminal_note_payload(notes[i].note);
+        const uint32_t close_payload = diagnostic_terminal_note_payload(notes[i].close_note);
+        LOG_TIMING(
+            "PmuCollector terminal: run %llu core %d recorded %llu task(s); physical core %u, PMU_CTRL_0 0x%x "
+            "at init (code %u) and 0x%x at close (code %u)",
+            static_cast<unsigned long long>(run_epoch), notes[i].producer,
+            static_cast<unsigned long long>(notes[i].records), payload & PMU_NOTE_PHYSICAL_MASK,
+            payload >> PMU_NOTE_PHYSICAL_BITS, diagnostic_terminal_note_code(notes[i].note),
+            close_payload >> PMU_NOTE_PHYSICAL_BITS, diagnostic_terminal_note_code(notes[i].close_note)
+        );
+    }
+    proofs.snapshot_readable = !settled.counts_unknown;
+    proofs.total_device = settled.produced;
+    proofs.dropped_device = settled.dropped;
+    // A core's held records are reported by the core itself, so nothing here
+    // reads a buffer the next run's producer adopts.
+    proofs.unflushed_records = settled.unsettled;
+    // Carried rather than dropped: a core that latched a fatal makes this a
+    // partial run even when every count balances, which a run with no records
+    // would otherwise publish as empty and successful.
+    proofs.fatal_latched = settled.fatal_latched;
+    return proofs;
+}
+
+void PmuCollector::set_run_config(PmuEventType event_type) { event_type_ = event_type; }
 
 void PmuCollector::reset_collector_shards() {
     (void)close_csv_shards();
@@ -533,7 +625,13 @@ void PmuCollector::on_buffer_collected(const PmuReadyBufferInfo &info, int colle
     // A retaining collector routes by the buffer's own run identity, so a
     // predecessor's late buffer lands in that run's file with that run's
     // columns rather than in whatever run is currently admitting.
-    if (retains_runs()) {
+    if (retained_runs_.route_known_buffer(
+            info.host_buffer_ptr, static_cast<int>(info.core_index), static_cast<int>(info.thread_index),
+            collector_shard
+        ))
+        return;
+    if (retains_runs() || (retained_runs_.ready() && buffer_run_epoch(info.host_buffer_ptr) !=
+                                                         ordinary_run_epoch_.load(std::memory_order_acquire))) {
         retained_runs_.route_buffer(
             info.host_buffer_ptr, static_cast<int>(info.core_index), static_cast<int>(info.thread_index),
             collector_shard
@@ -564,7 +662,7 @@ void PmuCollector::reconcile_counters() {
     // teardown rather than per run. Reaching here would read a successor's
     // counters and merge in place under a path an epoch owns.
     if (retains_runs()) return;
-    report_drain_drops();
+    retained_runs_.reconcile_transport();
 
     rmb();
     flush_collector_shards_to_csv();
@@ -641,6 +739,28 @@ void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, const PmuFreeCa
 
     // Stop mgmt + collector threads if the caller didn't already (idempotent).
     stop();
+
+    // After the join above, so no thread of this collector's can still reserve
+    // a bank or settle a run against one. Released through this teardown's own
+    // callback, the one that also frees each core's `current_buf_ptr` below —
+    // buffers a producer writes into — so the array follows exactly the policy
+    // the caller chose for every other device resource here: freed on the
+    // ordinary paths, and abandoned untouched on a teardown whose callback
+    // frees nothing. The init-time allocator is deliberately not used: it would
+    // hand this memory back on a path where the caller abandoned everything
+    // else. A release the callback refuses leaves the array mapped and reported.
+    bank_free_cb_ = free_cb;
+    bank_unregister_cb_ = unregister_cb;
+    const auto bank_release = terminal_banks_.release_backing(/*device_stopped=*/true);
+    if (terminal_banks_.backing_retained()) {
+        retained_runs_.note_collector_failure(
+            bank_release == simpler::dfx::credit::RunTerminalBanks::Release::FreeFailed ?
+                "the device refused the per-run terminal bank array; it stays mapped" :
+                "the per-run terminal bank array could not be released and stays mapped"
+        );
+        return;
+    }
+
     // Only now: the shards whose references a quarantined epoch could not prove
     // released are joined, so its storage is unreachable by any reader. Its
     // files stay on disk as evidence.
@@ -659,8 +779,10 @@ void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, const PmuFreeCa
     // Release per-buffer mappings tracked by the framework. PMU registered
     // each PmuBuffer individually at init time (when register_cb was set), so
     // unregister each one here before freeing.
+    if (!validate_release_callbacks(unregister_cb, free_cb)) return;
+
     auto release_buf = [&](void *p) {
-        release_one_buffer(p, buffers_registered_ ? unregister_cb : nullptr, free_cb);
+        release_one_buffer(p, unregister_cb, free_cb);
     };
     manager_.release_owned_buffers(release_buf);
 
@@ -688,14 +810,10 @@ void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, const PmuFreeCa
             state->free_queue.head = tail;
         }
     }
+    release_buf(shm_dev_);
+    shm_dev_ = nullptr;
+    shm_host_ = nullptr;
     manager_.clear_mappings();
-
-    // Free shared header region via the shared RAII helper.
-    if (shm_dev_ != nullptr) {
-        release_one_buffer(shm_dev_, shm_registered_ ? unregister_cb : nullptr, free_cb);
-        shm_dev_ = nullptr;
-        shm_host_ = nullptr;
-    }
 
     initialized_ = false;
     (void)close_csv_shards();

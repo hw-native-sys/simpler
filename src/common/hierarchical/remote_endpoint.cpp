@@ -977,7 +977,8 @@ std::vector<uint8_t> MpiGroupMailboxChannel::exchange_group_task(
     {
         std::unique_lock<std::mutex> lock(group_mu_);
         while (group_active_ && group_task_slot_ != task_slot) {
-            if (group_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+            if (group_cv_.wait_until(lock, deadline) == std::cv_status::timeout && group_active_ &&
+                group_task_slot_ != task_slot) {
                 throw std::runtime_error("MpiGroupMailboxChannel: timed out waiting for the prior group task batch");
             }
         }
@@ -1029,7 +1030,8 @@ std::vector<uint8_t> MpiGroupMailboxChannel::exchange_group_task(
 
     std::unique_lock<std::mutex> lock(group_mu_);
     while (!group_done_) {
-        if (group_cv_.wait_until(lock, deadline) == std::cv_status::timeout) {
+        // A timed wait may reacquire the mutex after the leader has completed.
+        if (group_cv_.wait_until(lock, deadline) == std::cv_status::timeout && !group_done_) {
             if (!group_leader_running_) {
                 // No leader formed: withdraw this rank's frame so a later,
                 // correctly-targeted batch starts from a clean slate.
@@ -1258,6 +1260,8 @@ remote_l3::TaskPayloadWire RemoteL3Endpoint::build_task_payload(const TaskSlotSt
     payload.config = slot.config;
 
     const TaskArgs &a = slot.args(group_index);
+    if (!a.ccu_bindings().empty())
+        throw std::invalid_argument("CCU bindings are local L3-to-CHIP metadata, not remote L3 arguments");
     const RemoteTaskArgsSidecar &sidecar = slot.remote_sidecar_for(group_index);
     if (!sidecar.tensors.empty() && sidecar.tensors.size() != static_cast<size_t>(a.tensor_count())) {
         throw std::runtime_error(
@@ -1385,7 +1389,12 @@ void RemoteL3Endpoint::request_progress_stop() noexcept {
         progress_stop_requested_ = true;
         progress_stop_reason_ = "RemoteL3Endpoint progress stopped";
         command_cv_.notify_all();
-        transport_->shutdown();
+        // Worker::close() stops Scheduler progress before WorkerManager owns
+        // child shutdown. Keep an idle transport alive across that handoff so
+        // shutdown_child() can still submit the lifecycle SHUTDOWN frame. An
+        // in-flight task cannot be drained by normal shutdown and still needs
+        // transport cancellation to terminalize its progress lane.
+        if (pending_task_.occupied) transport_->shutdown();
     } catch (...) {}
 }
 

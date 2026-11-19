@@ -13,7 +13,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import warnings
+from collections.abc import Sequence
 from functools import cache
 from pathlib import Path
 from typing import Optional, Union
@@ -22,15 +24,19 @@ from simpler import env_manager
 
 from .compile_paths import compiler_visible_path
 from .environment import PROJECT_ROOT
+from .pto_isa import ensure_pto_isa_root, read_pto_isa_pin
 from .toolchain import (
     Aarch64GxxToolchain,
     CCECToolchain,
+    CCUToolchain,
     Gxx15Toolchain,
     GxxToolchain,
     ToolchainType,
+    _CcuCacheInputs,
 )
 
 logger = logging.getLogger(__name__)
+_ascend_include_search_lock = threading.Lock()
 
 # Covers the part of the persistent scene-test cache key that nothing else
 # fingerprints: how ``scene_test.compile_chip_callable_spec`` assembles
@@ -43,11 +49,18 @@ _COMPILE_CACHE_SCHEMA = 1
 # Modules whose logic turns kernel sources into artifact bytes: compiler
 # invocation and flags, toolchain selection, and the ELF section extraction
 # applied to every onboard incore.
-_ARTIFACT_LOGIC_MODULES = ("kernel_compiler.py", "toolchain.py", "compile_paths.py", "elf_parser.py")
+_ARTIFACT_LOGIC_MODULES = (
+    "kernel_compiler.py",
+    "toolchain.py",
+    "compile_paths.py",
+    "elf_parser.py",
+    "incore/cpu_sim_target.h",
+)
 
 _CPU_SIM_TARGET_FLAGS = {
-    "a2a3sim": "-DPTO_CPU_SIM_TARGET_A2A3",
-    "a5sim": "-DPTO_CPU_SIM_TARGET_A5",
+    "a2a3sim": ("-DPTO_CPU_SIM_TARGET_A2A3",),
+    "a5sim": ("-DPTO_CPU_SIM_TARGET_A5",),
+    "wsesim": ("-DPTO_CPU_SIM_TARGET_A5", "-DSIMPLER_CPU_SIM_TARGET_WSE"),
 }
 
 
@@ -99,12 +112,58 @@ def _cmake_bool_env_enabled(name: str, default: bool = False) -> bool:
     return default
 
 
+@cache
+def _ascend_incore_include_dirs(ascend_home: str) -> tuple[str, ...]:
+    """Find CANN header roots once per toolchain installation in this process."""
+    roots = [Path(ascend_home)]
+    roots += [Path(ascend_home) / arch for arch in ("aarch64-linux", "x86_64-linux")]
+
+    candidates: list[Path] = []
+    for root in roots:
+        candidates.extend(
+            [
+                root / "include",
+                root / "include" / "external",
+                root / "include" / "c_api",
+                root / "include" / "c_api" / "internal",
+                root / "asc" / "include",
+                root / "asc" / "include" / "interface",
+                root / "asc" / "include" / "basic_api",
+                root / "asc" / "include" / "basic_api" / "interface",
+                root / "ascendc" / "include",
+                root / "ascendc" / "include" / "basic_api",
+                root / "ascendc" / "include" / "basic_api" / "interface",
+            ]
+        )
+    for header in ("kernel_operator_sys_var_intf.h", "kernel_operator_sys_var_intf_impl.h"):
+        try:
+            candidates.extend(path.parent for path in Path(ascend_home).rglob(header))
+        except OSError:
+            continue
+
+    include_dirs = []
+    seen = set()
+    for path in candidates:
+        if path.is_dir() and path not in seen:
+            include_dirs.append(str(path))
+            seen.add(path)
+    return tuple(include_dirs)
+
+
+class _CcuCompileCacheToken(_CcuCacheInputs):
+    schema: int
+    logic: str
+    extra_include_dirs: tuple[str, ...]
+    working_directory: str
+
+
 class KernelCompiler:
     """
     Compiler for PTO kernels and orchestration functions.
 
     Public entry points:
     - compile_incore(): Compile a kernel source file for AICore/AIVector
+    - compile_ccu(): Compile a native CCU Host module
     - compile_orchestration(): Compile an orchestration function for a given runtime
 
     Toolchain selection happens here, not in C++. `_orchestration_toolchain()`
@@ -122,11 +181,12 @@ class KernelCompiler:
     - HOST_GXX_15: g++-15 for simulation kernels (host execution)
     - HOST_GXX: g++ (g++-15 under sanitizers) for host orchestration .so
     - AARCH64_GXX: aarch64 cross-compiler for device orchestration
+    - CCU: shared Host G++ for native A5 CCU modules
     """
 
     # Comma-separated `-fsanitize` tokens, set once by conftest from the pytest
     # `--sanitizer` option (default "" = off). Only host toolchains (Gxx15 sim
-    # incore, Gxx host orchestration) honor it; ccec/aarch64 device builds never
+    # incore, Gxx host orchestration and CCU) honor it; ccec/aarch64 device builds never
     # do. Must match the runtime's install-time SIMPLER_SANITIZER.
     _sanitizers = ""
 
@@ -150,6 +210,8 @@ class KernelCompiler:
             self.platform_dir = self.project_root / "src" / "a2a3" / "platform"
         elif platform in ("a5", "a5sim"):
             self.platform_dir = self.project_root / "src" / "a5" / "platform"
+        elif platform == "wsesim":
+            self.platform_dir = self.project_root / "src" / "wse" / "platform"
         else:
             raise ValueError(f"Unknown platform: {platform}")
 
@@ -165,6 +227,7 @@ class KernelCompiler:
             self.host_gxx = GxxToolchain(prefer_g15=bool(self._sanitizers))
 
         self.gxx15 = Gxx15Toolchain()
+        self.ccu = CCUToolchain(self.host_gxx) if platform == "a5" else None
 
     def _sanitizer_flags(self, toolchain) -> list[str]:
         """Sanitizer flags for a host-compiled kernel / orchestration .so.
@@ -180,12 +243,16 @@ class KernelCompiler:
     def _sim_incore_compile_flags(self, core_type: str) -> list[str]:
         """Return the complete compiler flags for one CPU-sim kernel."""
         try:
-            target_flag = _CPU_SIM_TARGET_FLAGS[self.platform]
+            target_flags = _CPU_SIM_TARGET_FLAGS[self.platform]
         except KeyError as error:
             raise ValueError(f"Unsupported CPU simulator platform: {self.platform}") from error
         return [
             *self.gxx15.get_compile_flags(core_type=core_type),
-            target_flag,
+            *target_flags,
+            "-include",
+            "pto/cpu/target_config.hpp",
+            "-include",
+            "cpu_sim_target.h",
             *self._sanitizer_flags(self.gxx15),
         ]
 
@@ -209,20 +276,25 @@ class KernelCompiler:
         """
         Get all include directories needed for orchestration compilation.
 
-        Combines the runtime-specific directory with platform include directories.
+        The conventional directories come first, then whatever the runtime's
+        build_config declares. A runtime that compiles a sibling's sources keeps
+        no copy of that sibling's headers, so the declaration is the only record
+        of where they are. It goes last because the first match on an include
+        path wins: appending can only resolve an include that had none.
 
         Args:
             runtime_name: Name of the runtime (e.g., "host_build_graph")
 
         Returns:
-            List of include directory paths:
-            [runtime_dir, platform_host_dir, platform_include_dir]
+            List of include directory paths, in search order.
         """
         # Map platform to runtime architecture
         if self.platform in ("a2a3", "a2a3sim"):
             arch = "a2a3"
         elif self.platform in ("a5", "a5sim"):
             arch = "a5"  # Phase 2: A5 uses A5 runtime
+        elif self.platform == "wsesim":
+            arch = "wse"
         else:
             arch = "a2a3"
 
@@ -230,7 +302,10 @@ class KernelCompiler:
         runtime_common_dir = str(self.project_root / "src" / arch / "runtime" / runtime_name / "common")
         common_dir = str(self.project_root / "src" / "common" / "task_interface")
         src_common_dir = str(self.project_root / "src" / "common")
-        return [runtime_dir, runtime_common_dir, common_dir, src_common_dir] + self.get_platform_include_dirs()
+        conventional = [runtime_dir, runtime_common_dir, common_dir, src_common_dir]
+        conventional += self.get_platform_include_dirs()
+        config_include_dirs, _ = self._get_orchestration_config(runtime_name)
+        return conventional + [d for d in config_include_dirs if d not in conventional]
 
     def get_incore_include_dirs(self) -> list[str]:
         """
@@ -247,10 +322,14 @@ class KernelCompiler:
         headers (e.g. ``intrinsic.h``) can pull shared platform headers like
         ``common/dma_workspace.h`` regardless of what the call site passes.
         """
-        return [
+        platform_dirs = [str(self.platform_dir / "include")] if self.platform == "wsesim" else []
+        include_dirs = platform_dirs + [
             str(Path(__file__).resolve().parent / "incore"),
             str(self.project_root / "src" / "common" / "platform" / "include"),
         ]
+        if self.platform in ("a5", "a5sim"):
+            include_dirs.append(str(self.project_root / "src" / "a5" / "runtime"))
+        return include_dirs
 
     def _incore_feature_defines(self) -> list[str]:
         """Feature macros forwarded to incore compiles for the RDMA overlay."""
@@ -272,39 +351,8 @@ class KernelCompiler:
         ascend_home = env_manager.get("ASCEND_HOME_PATH")
         if not ascend_home:
             return []
-        roots = [Path(ascend_home)]
-        roots += [Path(ascend_home) / arch for arch in ("aarch64-linux", "x86_64-linux")]
-
-        candidates: list[Path] = []
-        for root in roots:
-            candidates.extend(
-                [
-                    root / "include",
-                    root / "include" / "external",
-                    root / "include" / "c_api",
-                    root / "include" / "c_api" / "internal",
-                    root / "asc" / "include",
-                    root / "asc" / "include" / "interface",
-                    root / "asc" / "include" / "basic_api",
-                    root / "asc" / "include" / "basic_api" / "interface",
-                    root / "ascendc" / "include",
-                    root / "ascendc" / "include" / "basic_api",
-                    root / "ascendc" / "include" / "basic_api" / "interface",
-                ]
-            )
-        for header in ("kernel_operator_sys_var_intf.h", "kernel_operator_sys_var_intf_impl.h"):
-            try:
-                candidates.extend(path.parent for path in Path(ascend_home).rglob(header))
-            except OSError:
-                continue
-
-        include_dirs = []
-        seen = set()
-        for path in candidates:
-            if path.is_dir() and path not in seen:
-                include_dirs.append(str(path))
-                seen.add(path)
-        return include_dirs
+        with _ascend_include_search_lock:
+            return list(_ascend_incore_include_dirs(str(ascend_home)))
 
     def _get_orchestration_config(self, runtime_name: str) -> tuple[list[str], list[str]]:
         """
@@ -325,6 +373,8 @@ class KernelCompiler:
             arch = "a2a3"
         elif self.platform in ("a5", "a5sim"):
             arch = "a5"  # Phase 2: A5 uses A5 runtime
+        elif self.platform == "wsesim":
+            arch = "wse"
         else:
             arch = "a2a3"
 
@@ -354,6 +404,13 @@ class KernelCompiler:
                 for f in sorted(src_dir.iterdir()):
                     if f.suffix in (".cpp", ".c") and f.is_file():
                         source_files.append(str(f))
+        # Individually named sources, for a file whose directory holds more than the
+        # .so needs. Unlike source_dirs this names one file, so nothing beside it is
+        # swept in.
+        for src_file_rel in orch_cfg.get("source_files", []):
+            src_file = (config_dir / src_file_rel).resolve()
+            if src_file.is_file():
+                source_files.append(str(src_file))
 
         return include_dirs, source_files
 
@@ -361,8 +418,9 @@ class KernelCompiler:
         """Sources needed when public AICPU helper headers are used by orchestration SOs."""
         variant = "sim" if self.platform.endswith("sim") else "onboard"
         source_dir = self.project_root / "src" / "common" / "platform" / variant / "aicpu"
+        cache_dir = source_dir if variant == "sim" else self.platform_dir / "onboard" / "aicpu"
         return [
-            str(source_dir / "cache_ops.cpp"),
+            str(cache_dir / "cache_ops.cpp"),
             str(source_dir / "device_time.cpp"),
         ]
 
@@ -373,19 +431,19 @@ class KernelCompiler:
         persistent scene-test cache hashes the same inputs the compiler sees.
         """
         include_dirs = self.get_orchestration_include_dirs(runtime_name)
-        config_include_dirs, config_sources = self._get_orchestration_config(runtime_name)
+        _, config_sources = self._get_orchestration_config(runtime_name)
         platform_sources = self._get_orchestration_platform_sources()
         if self._orchestration_toolchain(runtime_name).is_host:
             include_dirs.append(str(self.project_root / "src" / "common" / "log" / "include"))
             host_log_dir = self.project_root / "src" / "common" / "log"
             platform_sources.extend([str(host_log_dir / "host_log.cpp"), str(host_log_dir / "unified_log_host.cpp")])
         return (
-            [*include_dirs, *config_include_dirs],
+            include_dirs,
             [*config_sources, *platform_sources],
         )
 
     def _orchestration_toolchain(self, runtime_name: str) -> Union[GxxToolchain, Aarch64GxxToolchain]:
-        if runtime_name == "host_build_graph":
+        if runtime_name in ("host_build_graph", "percounter"):
             return self.host_gxx
         if runtime_name == "tensormap_and_ringbuffer":
             if self.platform.endswith("sim"):
@@ -451,6 +509,7 @@ class KernelCompiler:
             "core_type": core_type,
             "flags": flags,
             "linker": linker,
+            "pto_isa_commit": read_pto_isa_pin() if self.platform.endswith("sim") else None,
         }
 
     def _run_subprocess(
@@ -459,6 +518,7 @@ class KernelCompiler:
         label: str,
         error_hint: str = "Compiler not found",
         surface_diagnostics: bool = False,
+        cwd: Optional[str] = None,
     ) -> subprocess.CompletedProcess:
         """Run a subprocess command with standardized logging and error handling.
 
@@ -474,7 +534,9 @@ class KernelCompiler:
         """
         logger.debug(f"[{label}] Command: {' '.join(cmd)}")
         try:
-            result = subprocess.run(cmd, check=False, capture_output=True, text=True, cwd=self.project_root)
+            result = subprocess.run(
+                cmd, check=False, capture_output=True, text=True, cwd=cwd if cwd is not None else self.project_root
+            )
 
             if result.stdout and logger.isEnabledFor(10):  # DEBUG = 10
                 logger.debug(f"[{label}] stdout:\n{result.stdout}")
@@ -500,6 +562,7 @@ class KernelCompiler:
         error_hint: str = "Compiler not found",
         delete_output: bool = True,
         surface_diagnostics: bool = False,
+        cwd: Optional[str] = None,
     ) -> bytes:
         """Run compilation command, read output file, clean up, return bytes.
 
@@ -521,7 +584,7 @@ class KernelCompiler:
         # warnings.warn, which raises under an error-level warning filter -- a compile
         # that produced its output would otherwise leave the file behind.
         try:
-            self._run_subprocess(cmd, label, error_hint, surface_diagnostics=surface_diagnostics)
+            self._run_subprocess(cmd, label, error_hint, surface_diagnostics=surface_diagnostics, cwd=cwd)
 
             if not os.path.isfile(output_path):
                 raise RuntimeError(f"Compilation succeeded but output file not found: {output_path}")
@@ -557,10 +620,104 @@ class KernelCompiler:
         The file is created atomically to avoid races, then immediately
         closed so the caller can overwrite it with compiler output.
         """
-        directory = os.path.abspath(build_dir) if build_dir else "/tmp"
+        directory = os.path.abspath(build_dir) if build_dir else tempfile.gettempdir()
         fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=directory)
         os.close(fd)
         return path
+
+    def _ccu_toolchain(self) -> CCUToolchain:
+        if self.ccu is None:
+            raise ValueError(f"Native CCU modules require platform 'a5', got {self.platform!r}")
+        return self.ccu
+
+    def get_ccu_include_dirs(self) -> list[str]:
+        """Return the simpler ABI and CANN/HCOMM header search paths."""
+        return self._ccu_toolchain().get_include_dirs()
+
+    def get_ccu_library_paths(self) -> list[str]:
+        """Return the validated CCU/HCOMM shared libraries in link order."""
+        return self._ccu_toolchain().get_library_paths()
+
+    def _ccu_build_inputs(
+        self,
+        extra_compile_flags: Sequence[str] = (),
+        extra_link_flags: Sequence[str] = (),
+        extra_include_dirs: Optional[list[str]] = None,
+    ):
+        toolchain = self._ccu_toolchain()
+        sanitizers = self._sanitizer_flags(toolchain)
+        return toolchain._build_inputs(
+            extra_include_dirs=tuple(os.path.abspath(path) for path in extra_include_dirs or ()),
+            extra_compile_flags=(*sanitizers, *extra_compile_flags),
+            extra_link_flags=(*sanitizers, *extra_link_flags),
+        )
+
+    def ccu_compile_cache_token(
+        self,
+        *,
+        extra_include_dirs: Optional[list[str]] = None,
+        extra_compile_flags: Sequence[str] = (),
+        extra_link_flags: Sequence[str] = (),
+    ) -> _CcuCompileCacheToken:
+        """Describe CCU compiler, SDK, ABI and runtime-library inputs.
+
+        Source files and their transitive dependencies remain caller-owned.
+        Before each cache lookup, scan them with -M (including system headers).
+        The manifest_identity_header field contains the matching C++17 header.
+        """
+        inputs = self._ccu_build_inputs(extra_compile_flags, extra_link_flags, extra_include_dirs)
+        return {
+            "schema": _COMPILE_CACHE_SCHEMA,
+            "logic": _artifact_logic_token(),
+            **inputs.cache_token,
+            "extra_include_dirs": tuple(os.path.abspath(path) for path in extra_include_dirs or ()),
+            "working_directory": os.getcwd(),
+        }
+
+    def compile_ccu(
+        self,
+        source_path: str,
+        extra_include_dirs: Optional[list[str]] = None,
+        build_dir: Optional[str] = None,
+        *,
+        extra_sources: Sequence[str] = (),
+        extra_compile_flags: Sequence[str] = (),
+        extra_link_flags: Sequence[str] = (),
+    ) -> bytes:
+        """Build a complete native CCU shared library for ChipCallable.ccu_modules.
+
+        The sources provide the manifest export and native kernel entries.
+        Include ccu_manifest_identity.h for the SDK/PTO-ISA identity arrays.
+        Every call owns a private directory beneath build_dir (or the system
+        temporary directory), removed on both success and failure. Relative
+        paths and options are resolved from the caller's working directory.
+        """
+        self._ccu_toolchain()
+        cwd = os.getcwd()
+        sources = [Path(path).absolute() for path in (source_path, *extra_sources)]
+        for source in sources:
+            if not source.is_file():
+                raise FileNotFoundError(f"CCU source file not found: {source}")
+        inputs = self._ccu_build_inputs(extra_compile_flags, extra_link_flags, extra_include_dirs)
+        includes = [*inputs.include_dirs, *(Path(path).absolute() for path in extra_include_dirs or ())]
+        with tempfile.TemporaryDirectory(prefix="ccu-module-", dir=build_dir) as directory:
+            build = Path(directory).absolute()
+            (build / "ccu_manifest_identity.h").write_text(inputs.manifest_identity_header(), encoding="ascii")
+            output = str(build / "module.so")
+            cmd = [
+                inputs.cxx_path,
+                *inputs.compile_flags,
+                f"-I{build}",
+                *(f"-I{path}" for path in includes),
+                *(str(source) for source in sources),
+                *inputs.link_flags,
+                *(str(path) for path in inputs.library_paths),
+                "-o",
+                output,
+            ]
+            return self._compile_to_bytes(
+                cmd, output, "CCU", error_hint=f"CCU compiler not found: {inputs.cxx_path}", cwd=cwd
+            )
 
     def compile_incore(
         self,
@@ -577,8 +734,9 @@ class KernelCompiler:
 
         Args:
             source_path: Path to kernel source file (.cpp)
-            core_type: Core type: "aic" (cube) or "aiv" (vector). Default: "aiv"
-            pto_isa_root: Path to PTO-ISA root directory. Required for a2a3.
+            core_type: "aic" (cube), "aiv" (vector), or empty for a homogeneous simulator. Default: "aiv"
+            pto_isa_root: Path to PTO-ISA root directory. Required for hardware;
+                simulator builds default to the managed pinned checkout.
             extra_include_dirs: Additional include directories
 
         Returns:
@@ -597,6 +755,7 @@ class KernelCompiler:
                 "a2a3sim": ToolchainType.HOST_GXX_15,
                 "a5": ToolchainType.CCEC,  # Phase 1: A5 uses same as A2A3
                 "a5sim": ToolchainType.HOST_GXX_15,  # Phase 1: A5sim uses same as A2A3sim
+                "wsesim": ToolchainType.HOST_GXX_15,
             },
         )
 
@@ -674,7 +833,9 @@ class KernelCompiler:
         out-of-line template instantiations into the single output ``.text``.
 
         The linked image is position-independent: ``--image-base`` does not
-        change the emitted ``.text`` bytes.
+        change the emitted ``.text`` bytes. A separate allocated ``.rodata``
+        still lies outside the text-only payload; the extractor rejects such
+        images, including linked jump tables with no remaining relocations.
         """
         assert self.ccec is not None, "incore linking is only available for hardware platforms"
         linked_path = self._make_temp_path(
@@ -816,7 +977,7 @@ class KernelCompiler:
 
         Args:
             source_path: Path to kernel source file (.cpp)
-            core_type: Core type: "aic" (cube) or "aiv" (vector).
+            core_type: "aic" (cube), "aiv" (vector), or empty for a homogeneous simulator.
             pto_isa_root: Path to PTO-ISA root directory (for PTO ISA headers)
             extra_include_dirs: Additional include directories
 
@@ -840,13 +1001,11 @@ class KernelCompiler:
         # Build command from toolchain
         cmd = [self.gxx15.cxx_path, *self._sim_incore_compile_flags(core_type)]
 
-        # Add PTO ISA header paths if provided. The path always comes from
-        # ensure_pto_isa_root(), which has already verified HEAD == pto_isa.pin,
-        # so no per-compile re-check is needed here.
-        if pto_isa_root:
-            pto_include = os.path.join(pto_isa_root, "include")
-            pto_pto_include = os.path.join(pto_isa_root, "include", "pto")
-            cmd.extend([f"-I{compiler_visible_path(pto_include)}", f"-I{compiler_visible_path(pto_pto_include)}"])
+        if pto_isa_root is None:
+            pto_isa_root = ensure_pto_isa_root()
+        pto_include = os.path.join(pto_isa_root, "include")
+        pto_pto_include = os.path.join(pto_isa_root, "include", "pto")
+        cmd.extend([f"-I{compiler_visible_path(pto_include)}", f"-I{compiler_visible_path(pto_pto_include)}"])
 
         for inc_dir in self.get_incore_include_dirs():
             cmd.append(f"-I{compiler_visible_path(inc_dir)}")

@@ -58,8 +58,12 @@ validation:
 # omitted_files strict for everything else.
 not_in_nav: |
   investigations/*
+  zh-cn/investigations/2026-11-a5-early-call-observation.md
+  zh-cn/investigations/2026-11-a5-prepared-binding-publication.md
   remote-l3-worker-design/*
   troubleshooting/device-error-codes/*
+  zh-cn/design/percounter-runtime-split.md
+  zh-cn/design/percounter-defer-wait.md
 
 hooks:
   - docs/_hooks/repo_links.py
@@ -111,12 +115,63 @@ nav:
       - Chip-Level Architecture: chip-level-arch.md
       - Hierarchical Level Runtime: hierarchical-level-runtime.md
       - Task Flow: task-flow.md
+      - Run Pipeline and the KernelLaunch Stream: run-pipeline.md
       - Buffer Memory Model: buffer-abi.md
+      - HBG host data access: hbg-host-data-access.md
       - Orchestrator: orchestrator.md
       - Scheduler: scheduler.md
+      - A5 HBG AICore Walkthrough:
+          - Execution flow: zh-cn/a5-hbg-aicore-walkthrough/README.md
+          - Structure scopes: zh-cn/a5-hbg-aicore-walkthrough/00-data-structure-scopes.md
+          - Initialization: zh-cn/a5-hbg-aicore-walkthrough/01-initialization.md
+          - Ready queues and execution: zh-cn/a5-hbg-aicore-walkthrough/02-ready-execution.md
+          - Cooperative tasks and completion: zh-cn/a5-hbg-aicore-walkthrough/03-cooperative-completion.md
+          - Native graphs and async completion: zh-cn/a5-hbg-aicore-walkthrough/04-native-async.md
       - TMR A2/A3 vs A5: tensormap-and-ringbuffer-a2a3-vs-a5.md
       - A5 AICPU core selection: design/a5-fg-pg-core-selection.en.md
+      - A5 local Host DDR access: design/a5-host-ddr.md
       - Run completion fences: design/run-completion-fence.md
+      - Native framework submission: design/native-framework-submission.md
+      - Native CCU ABI: design/ccu-native-abi.md
+      - CCU Window Validation: design/ccu-window-validation.md
+      - A5 HBG Graph task 设计:
+          - 设计总览: zh-cn/design/a5-hbg-graph-task.md
+          - 数据布局与 Host 绑定: zh-cn/design/a5-hbg-graph-task/data-layout.md
+          - 调度与发布协议: zh-cn/design/a5-hbg-graph-task/protocol.md
+          - 协作任务的 Host 准备与 Device 校验: zh-cn/design/a5-hbg-graph-task/admission-preparation.md
+          - HBG 调度优化开发参考: zh-cn/design/a5-hbg-graph-task/build-execute-separation.md
+          - Canonical completion gate: zh-cn/design/a5-hbg-graph-task/dependency-counters.md
+          - 工作目录与 execution token: zh-cn/design/a5-hbg-graph-task/ready-queue-design.md
+          - Ready 队列算法与竞争控制: zh-cn/design/a5-hbg-graph-task/ready-queue-algorithms.md
+          - 独立 block 调度待选方案: zh-cn/design/a5-hbg-graph-task/block-ready-scheduling.md
+          - 实施与功能验收: zh-cn/design/a5-hbg-graph-task/implementation.md
+          - 性能与自主迭代流程: zh-cn/design/a5-hbg-graph-task/performance.md
+          - Admission 方案排查记录: zh-cn/investigations/2026-11-a5-hbg-admission-shortcuts.md
+          - DSV4.1 调度改动取舍: zh-cn/investigations/2026-11-a5-hbg-dsv-scheduler-review.md
+          - Legacy 执行路径移除: zh-cn/investigations/2026-11-a5-hbg-legacy-removal.md
+          - HBG L0 kernel 首尾计时: zh-cn/investigations/2026-11-a5-hbg-l0-aicore-wall.md
+          - HBG 固定版本 L0 实测: zh-cn/investigations/2026-11-a5-hbg-latest-aicore-wall.md
+          - Percounter L0 kernel 首尾实测: zh-cn/investigations/2026-11-a5-percounter-kernel-wall.md
+          - 设计复审: zh-cn/design/a5-hbg-graph-task/review.md
+          - 已否定的性能尝试: zh-cn/design/a5-hbg-graph-task/rejected-optimizations.md
+          - 固定前缀成员历史测量: zh-cn/design/a5-hbg-graph-task/fixed-prefix-members.md
+          - 无 Graph 性能实测: zh-cn/design/a5-hbg-graph-task/no-graph-performance.md
+          - Qwen 性能与正确性实测: zh-cn/design/a5-hbg-graph-task/qwen-performance.md
+          - 独立 block 原型历史测量: zh-cn/design/a5-hbg-graph-task/qwen-block-work.md
+          - Qwen 历史测量与排查: zh-cn/design/a5-hbg-graph-task/qwen-performance-history.md
+      - Native capture:
+          - Execution and API: design/native-capture-common-contract.md
+          - Resource lifetime: design/native-hbg-prepared-lifetime.md
+          - HBG state restoration: design/native-hbg-resource-reset.md
+      - A5 HBG 异步完成设计:
+          - 设计总览: zh-cn/design/a5-hbg-async-completion.md
+          - 接口与数据布局: zh-cn/design/a5-hbg-async-completion/interfaces-and-layout.md
+          - 调度与完成协议: zh-cn/design/a5-hbg-async-completion/protocol.md
+          - 后端与资源生命周期: zh-cn/design/a5-hbg-async-completion/backends-and-lifetime.md
+          - 消费准备与准入: zh-cn/design/a5-hbg-async-completion/consumer-preparation.md
+          - 实现方案: zh-cn/design/a5-hbg-async-completion/implementation.md
+          - 验证与性能验收: zh-cn/design/a5-hbg-async-completion/validation.md
+          - 待验证选型: zh-cn/design/a5-hbg-async-completion/choices.md
       - Worker Manager: worker-manager.md
       - Hardware:
           - Overview: hardware/README.md
@@ -126,6 +181,7 @@ nav:
           - CANN source references: hardware/cann-source-references.md
   - Kernels:
       - AICore Kernel Programming: aicore-kernel-programming.md
+      - TMR task dependencies and progress: aicore-kernel-programming/task-progress.md
       - L2 Cache Bypass: l2-cache-bypass.md
       - a5 SIMT Launch: simt-launch.md
       - Manual Scope: manual-scope.md
@@ -139,6 +195,7 @@ nav:
       - Python Callable Serialization: python-callable-serialization.md
   - Multi-chip and comm:
       - Communication Domains: comm-domain.md
+      - A5 Host-source Domains: a5-host-comm-domain.md
       - L3-L2 Orchestrator Comm: l3-l2-orch-comm.md
       - L3-L2 Message Queue: l3-l2-message-queue.md
       - Directed NEXT_LEVEL Scheduling: directed-next-level-scheduling.md
@@ -167,8 +224,15 @@ nav:
       - Buffer capacity audit: dfx/dfx-buffer-capacity-audit.md
   - Build and test:
       - Developer Guide: developer-guide.md
-      - Testing: testing.md
-      - Adding a C++ unit test: testing/adding-a-cpp-unit-test.md
+      - Testing:
+          - Overview: testing.md
+          - Environments and hardware: testing/environments.md
+          - CLI and logging: testing/cli.md
+          - Parallel execution: testing/parallel-execution.md
+          - Test suites and unit tests: testing/unit-tests.md
+          - Writing scene tests: testing/writing-tests.md
+          - Adding a C++ unit test: testing/adding-a-cpp-unit-test.md
+          - Scene-test device-memory fixtures: testing/child-memory.md
       - CI Pipeline: ci.md
       - Python Packaging: python-packaging.md
       - Sanitizers: sanitizers.md
@@ -187,4 +251,5 @@ nav:
       - macOS libomp collision: troubleshooting/macos-libomp-collision.md
       - cpput gtest ABI: troubleshooting/ut-cpp-gtest-abi.md
       - a2a3 worker retirement: troubleshooting/a2a3-worker-retirement.md
+      - AICore retirement recovery: troubleshooting/aicore-retirement-recovery.md
   - Investigations: investigations/README.md

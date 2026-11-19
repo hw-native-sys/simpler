@@ -17,14 +17,18 @@
 
 constexpr uint32_t AICORE_POST_CLOSE_RELEASE = 1;
 
-// AICPU resets this word before window-open and publishes it only after
-// window-close. AICore bypass-loads it after EXITED; no cached stores or dcci
-// may touch this line while the protocol is active.
+// Only AICPU writes this line. It clears both words before READY or EXIT,
+// publishes one reserved request per exclusively claimed core, and releases
+// only after the matching COND nonce and window-close/readback/drain.
+// AICore bypass-loads both words and never caches or writes this line.
 struct alignas(64) AicoreTeardownControl {
     uint32_t post_close_release;
+    uint32_t exit_request;
 };
 
 static_assert(sizeof(AicoreTeardownControl) == 64);
+static_assert(offsetof(AicoreTeardownControl, post_close_release) == 0);
+static_assert(offsetof(AicoreTeardownControl, exit_request) == 4);
 static_assert(alignof(AicoreTeardownControl) == 64);
 static_assert(std::is_standard_layout_v<AicoreTeardownControl>);
 static_assert(std::is_trivially_copyable_v<AicoreTeardownControl>);

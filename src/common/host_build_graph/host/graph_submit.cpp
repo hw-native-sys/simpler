@@ -9,7 +9,8 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "host_build_graph/graph_submit.h"
+#include "common/module_thread_value.h"
+#include "host_build_graph/host/graph_submit.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -18,11 +19,13 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -30,22 +33,22 @@
 #include "assert_compat.h"
 #include "common/host_phase_kind.h"
 #include "common/unified_log.h"
-#include "host_build_graph/dep_compute.h"
-#include "host_build_graph/dep_gen_host_graph.h"
-#include "host_build_graph/graph_boundary_match.h"
 #include "host_build_graph/graph_execution.h"
-#include "host_build_graph/graph_host_state.h"
-#include "host_build_graph/graph_recording.h"
-#include "host_build_graph/host_phase_trace.h"
-#include "host_build_graph/orch_profiling.h"
-#include "host_build_graph/orchestrator_internal.h"
+#include "host_build_graph/host/dep_compute.h"
+#include "host_build_graph/host/dep_gen_host_graph.h"
+#include "host_build_graph/host/graph_boundary_match.h"
+#include "host_build_graph/host/graph_host_state.h"
+#include "host_build_graph/host/graph_recording.h"
+#include "host_build_graph/host/host_phase_trace.h"
+#include "host_build_graph/host/orch_profiling.h"
+#include "host_build_graph/host/orchestrator_internal.h"
 #include "host_build_graph/runtime_status.h"
 #include "host_build_graph/runtime_types.h"
 #include "host_build_graph/shared_memory.h"
 #include "host_build_graph/task_id.h"
-#include "host_build_graph/tensormap.h"
+#include "host_build_graph/host/tensormap.h"
 #include "host_build_graph/types.h"
-#include "tensor.h"
+#include "host_build_graph/tensor.h"
 
 namespace {
 
@@ -53,19 +56,32 @@ GraphHostState *graph_state_from(OrchestratorState *orch) {
     return orch == nullptr ? nullptr : static_cast<GraphHostState *>(orch->graph_host_state);
 }
 
-// The in-flight entry this thread is recording into, bound by graph_prepare and
-// cleared by graph_end / graph_abort.
-thread_local GraphInflightRecording *g_active_graph_entry = nullptr;
-thread_local GraphRecording *g_active_graph_recording = nullptr;
-// The recording a thread holds belongs to one GraphHostState. Recording into it
-// from a different orchestrator would silently mix two graphs, so the owner is
-// part of the thread-local identity rather than implied by it.
-thread_local GraphHostState *g_active_graph_owner = nullptr;
+// Borrowed identity for the recording currently bound on this thread. Storage
+// belongs to a worker scope or an in-flight fallback lease, never to TLS.
+struct ActiveGraphRecording {
+    GraphInflightRecording *entry{nullptr};
+    GraphRecording *recording{nullptr};
+    GraphHostState *owner{nullptr};
+};
+simpler::ModuleThreadValue<ActiveGraphRecording> active_graph_selector;
+ActiveGraphRecording active_graph() { return active_graph_selector.get(); }
 
 // Drop this thread's recording's view of an in-flight entry's boundary. Called where a
 // recording ends, because the entry does not outlive graph_commit while the storage does.
 void unbind_recorder_boundary() {
-    if (g_active_graph_recording != nullptr) g_active_graph_recording->boundary = nullptr;
+    if (active_graph().recording != nullptr) active_graph().recording->boundary = nullptr;
+}
+
+void recycle_fallback_scratch(GraphHostState &state, GraphInflightRecording &entry) {
+    if (!entry.fallback_scratch) return;
+    entry.fallback_scratch->boundary = nullptr;
+    for (auto &cached : state.fallback_scratch_cache) {
+        if (!cached) {
+            cached = std::move(entry.fallback_scratch);
+            return;
+        }
+    }
+    entry.fallback_scratch.reset();
 }
 
 // Bind this thread's storage to one in-flight entry and empty it. Returns false when the
@@ -83,7 +99,7 @@ bool graph_recording_reset(GraphRecording &recording, const GraphInflightRecordi
         return false;
     }
     recording.tensor_map.reset();
-    recording.full_key = entry.full_key;
+    recording.graph_key = entry.graph_key;
     recording.boundary = &entry.boundary;
     recording.next_virtual_offset = 0;
     recording.unsupported = false;
@@ -105,92 +121,57 @@ bool graph_recording_reset(GraphRecording &recording, const GraphInflightRecordi
 
 GraphRecording *active_graph_recording(OrchestratorState *orch) {
     GraphHostState *state = graph_state_from(orch);
-    if (state == nullptr || state != g_active_graph_owner) return nullptr;
-    return g_active_graph_recording;
+    if (state == nullptr || state != active_graph().owner) return nullptr;
+    return active_graph().recording;
 }
 
 namespace {
 
-// The one-line diagnosis of a scalar mismatch. Shared by both match paths: they differ in
-// where they hold the recorded boundary, not in what a mismatch there means.
-//
-// The index is what makes this actionable -- a boundary of a dozen scalars gives the author
-// nowhere to look without it.
-void graph_boundary_warn_scalar_mismatch(
-    const GraphBoundaryScalarMatch &recorded, const GraphTaskArgs &args, int32_t index
-) {
-    if (args.scalar_dynamic(index) != recorded.dynamic) {
-        LOG_WARN(
-            "[GraphExecution] boundary scalar %d declaration differs from recording; using ordinary path: "
-            "recorded=%s actual=%s",
-            index, recorded.dynamic ? "dynamic" : "static", args.scalar_dynamic(index) ? "dynamic" : "static"
-        );
-        return;
+// Which side an expectation came from. It reaches the log line only, so the two cases are
+// the two places a boundary can be compared against.
+enum class BoundaryExpectation : int32_t { CachedDefinition = 0, InFlightRecording = 1 };
+
+const char *boundary_expectation_name(BoundaryExpectation origin) {
+    switch (origin) {
+    case BoundaryExpectation::CachedDefinition:
+        return "cached";
+    case BoundaryExpectation::InFlightRecording:
+        return "in-flight";
     }
-    // Reaching here means the declarations agree and the values did not, which
-    // graph_boundary_scalar_mismatch only reports for a slot it found static. That is what
-    // makes the scalar<uint64_t> read below legal: Arg::scalar<T> refuses a dynamic
-    // parameter, so widening this branch to cover a declaration mismatch would trip it.
-    LOG_WARN(
-        "[GraphExecution] boundary scalar %d is declared static and its value moved; using ordinary path: "
-        "recorded=%llu actual=%llu",
-        index, static_cast<unsigned long long>(recorded.value),
-        static_cast<unsigned long long>(args.scalar<uint64_t>(index))
-    );
+    return "unknown";
 }
 
-bool graph_boundary_matches(
-    const GraphDefinition &definition, const GraphDefinitionRecord &record, const GraphTaskArgs &args
+// One expectation, whatever side it came from: `origin` names that side for the log line,
+// and everything else about the check is identical. Written once rather than per caller so
+// that a cached Definition and an in-flight recording cannot drift into refusing different
+// boundaries.
+bool graph_require_boundary_match(
+    OrchestratorState *orch, BoundaryExpectation origin, int32_t expected_tensor_count, int32_t expected_scalar_count,
+    const GraphBoundaryTensorMatch *expected_tensors, const GraphTaskArgs &args
 ) {
-    if (args.scalar_count() != definition.boundary_scalar_count || args.explicit_dep_count() != 0 ||
-        args.tensor_count() != definition.boundary_tensor_count) {
-        LOG_WARN(
-            "[GraphExecution] fixed boundary contract mismatch: tensors=%d/%d scalars=%d/%d explicit_deps=%u",
-            args.tensor_count(), definition.boundary_tensor_count, args.scalar_count(),
-            definition.boundary_scalar_count, args.explicit_dep_count()
+    if (args.scalar_count() != expected_scalar_count || args.tensor_count() != expected_tensor_count) {
+        orch->report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
+            "[GraphExecution] %s boundary contract mismatch: tensors=%d/%d scalars=%d/%d explicit_deps=%u",
+            boundary_expectation_name(origin), args.tensor_count(), expected_tensor_count, args.scalar_count(),
+            expected_scalar_count, args.explicit_dep_count()
         );
-        return false;
-    }
-    // Before the tensors, because it is the cheaper half and the likelier reject: a static
-    // scalar whose value moved is a declared fallback, where a tensor whose geometry moved is
-    // a contract this runtime does not support. That asymmetry is also why no debug_assert
-    // sits beside this one.
-    //
-    // The count checked above is the image's copy while the array walked here is the host
-    // record's, so state the invariant locally: both are filled from the same
-    // bound_boundary().params.scalar_count() when the Definition is published, which is two
-    // hops away from either reader. The tensor half below indexes the same way.
-    debug_assert(
-        record.boundary_match_info.scalars.size() == static_cast<size_t>(definition.boundary_scalar_count) &&
-        "a published record's scalar match array is sized by the boundary the image counted"
-    );
-    if (const int32_t i = graph_boundary_scalar_mismatch(record.boundary_match_info.scalars.data(), args); i >= 0) {
-        graph_boundary_warn_scalar_mismatch(record.boundary_match_info.scalars[i], args, i);
         return false;
     }
     for (int32_t i = 0; i < args.tensor_count(); ++i) {
         const simpler::hbg::Tensor &actual = args.tensor(i).ref();
-        if (actual.ndims > MAX_TENSOR_DIMS) {
-            debug_assert(
-                actual.ndims <= MAX_TENSOR_DIMS && "Graph boundary simpler::hbg::Tensor rank is not supported"
-            );
-            LOG_WARN(
-                "[GraphExecution] simpler::hbg::Tensor rank %u exceeds the fixed Graph boundary limit",
-                static_cast<unsigned>(actual.ndims)
-            );
-            return false;
-        }
-        const GraphBoundaryTensorMatch &expected = record.boundary_match_info.tensors[i];
+        // Rank is bounded at construction (Tensor::init_external, make_tensor_strided), so
+        // an over-rank tensor reaching a boundary is this runtime's own bug.
+        always_assert(actual.ndims <= MAX_TENSOR_DIMS && "a Graph boundary Tensor's rank is within MAX_TENSOR_DIMS");
+        const GraphBoundaryTensorMatch &expected = expected_tensors[i];
         if (!graph_boundary_tensor_matches(expected, actual, args.tag(i))) {
-            // Logged before the assertion, which aborts a debug build: an assertion that
-            // fires first takes the one line saying what actually moved down with it.
-            //
             // start_offset is not among these: an argument may slide, and what that costs
             // is checked as an arrangement below rather than per parameter.
-            LOG_WARN(
-                "[GraphExecution] fixed tensor metadata mismatch at boundary arg %d; using ordinary path: "
+            orch->report_fatal(
+                SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
+                "[GraphExecution] %s tensor metadata mismatch at boundary arg %d: "
                 "size=%llu/%llu ndims=%u/%u dtype=%u/%u tag=%u/%u manual_dep=%d/%d contiguous=%d/%d",
-                i, static_cast<unsigned long long>(actual.buffer.size),
+                boundary_expectation_name(origin), i, static_cast<unsigned long long>(actual.buffer.size),
                 static_cast<unsigned long long>(expected.buffer_size), static_cast<unsigned>(actual.ndims),
                 static_cast<unsigned>(expected.ndims), static_cast<unsigned>(actual.dtype),
                 static_cast<unsigned>(expected.dtype), static_cast<unsigned>(args.tag(i)),
@@ -198,42 +179,45 @@ bool graph_boundary_matches(
                 static_cast<int>(expected.manual_dep), static_cast<int>(actual.is_contiguous),
                 static_cast<int>(expected.is_contiguous)
             );
-            debug_assert(false && "Variable Graph boundary tensor shape/metadata is not supported");
             return false;
         }
     }
-    if (!graph_boundary_arrangement_matches(record.boundary_match_info.tensors.data(), args)) {
-        LOG_WARN(
-            "%s", "[GraphExecution] boundary alias partition or intra-partition offsets differ from recording; "
-                  "using ordinary path"
+    if (!graph_boundary_arrangement_matches(expected_tensors, args)) {
+        orch->report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
+            "[GraphExecution] %s boundary alias partition or intra-partition offsets differ from the recording",
+            boundary_expectation_name(origin)
         );
-        debug_assert(false && "Changing the Graph boundary arrangement is not supported");
         return false;
     }
     return true;
 }
 
-bool graph_boundary_matches(const GraphBoundary &boundary, const GraphTaskArgs &args) {
-    if (args.scalar_count() != boundary.params.scalar_count() || args.explicit_dep_count() != 0 ||
-        args.tensor_count() != boundary.params.tensor_count()) {
-        return false;
+// Every Graph key this bind has claimed, published and in-flight alike, as one log field.
+//
+// Sorted, because what the reader is looking for is a run of keys that differ only in their
+// low bits: a Config whose fields are genuinely fixed for the run folds into one key per
+// Graph, so near-identical keys mean a field that varies per submission is being carried as
+// a construction parameter. Unsorted, that pattern is invisible in a hash table's order.
+std::string graph_claimed_keys(const GraphHostState &state) {
+    std::vector<std::pair<uint64_t, const char *>> claimed;
+    claimed.reserve(state.definitions.size() + state.inflight.size());
+    for (const auto &entry : state.definitions)
+        claimed.emplace_back(entry.first, "published");
+    for (const auto &entry : state.inflight)
+        claimed.emplace_back(entry.first, "in-flight");
+    // By key alone: a key that is published and in flight at once would otherwise order its
+    // two entries by comparing unrelated string literals' addresses.
+    std::sort(claimed.begin(), claimed.end(), [](const auto &left, const auto &right) {
+        return left.first < right.first;
+    });
+    std::string out;
+    for (const auto &[key, kind] : claimed) {
+        char one[48];
+        snprintf(one, sizeof(one), "%s0x%llx(%s)", out.empty() ? "" : " ", static_cast<unsigned long long>(key), kind);
+        out += one;
     }
-    // The one diagnosed mismatch on this path. The structural ones stay silent because a
-    // same-key submission whose shape differs is an ordinary outcome of the key folding only
-    // construction parameters, while a static scalar whose value moved is the author's
-    // declaration failing to hold -- the same reason the published path words it.
-    if (const int32_t i = graph_boundary_scalar_mismatch(boundary.match_info.scalars.data(), args); i >= 0) {
-        graph_boundary_warn_scalar_mismatch(boundary.match_info.scalars[i], args, i);
-        return false;
-    }
-    for (int32_t i = 0; i < args.tensor_count(); ++i) {
-        const simpler::hbg::Tensor &actual = args.tensor(i).ref();
-        if (actual.ndims > MAX_TENSOR_DIMS ||
-            !graph_boundary_tensor_matches(boundary.match_info.tensors[i], actual, args.tag(i))) {
-            return false;
-        }
-    }
-    return graph_boundary_arrangement_matches(boundary.match_info.tensors.data(), args);
+    return out;
 }
 
 void graph_reset_outer_payload(TaskPayload &payload) {
@@ -251,14 +235,27 @@ void graph_reset_outer_payload(TaskPayload &payload) {
 }
 
 bool graph_submit_outer(
-    OrchestratorState *orch, GraphHostState *state, uint64_t full_key, int32_t owned_heap, bool defer_heap,
+    OrchestratorState *orch, GraphHostState *state, uint64_t graph_key, int32_t owned_heap, bool defer_heap,
     const GraphTaskArgs &args, TaskId *submitted_id
 ) {
     always_assert(orch->scope_stack_top >= 0 && "Cannot submit Graph outside a scope");
     auto &allocator = orch->task_allocator;
-    if (allocator.active_count() >= allocator.capacity() ||
-        (!defer_heap && static_cast<uint64_t>(owned_heap) > allocator.heap_available())) {
-        LOG_WARN("%s", "[GraphExecution] task-capacity/heap preflight failed; using ordinary path");
+    // Reported apart, because they are different knobs and a deferred shell can only fail the
+    // first: its heap is reserved at commit, so owned_heap is zero here and a combined line
+    // would print `heap=0/<available>` for what is purely a task-window shortfall.
+    if (allocator.active_count() >= allocator.capacity()) {
+        orch->report_fatal(
+            SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED, __FUNCTION__,
+            "[GraphExecution] task-window preflight failed: tasks=%d/%d", allocator.active_count(), allocator.capacity()
+        );
+        return false;
+    }
+    if (!defer_heap && static_cast<uint64_t>(owned_heap) > allocator.heap_available()) {
+        orch->report_fatal(
+            SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED, __FUNCTION__,
+            "[GraphExecution] heap preflight failed: heap=%llu/%llu", static_cast<unsigned long long>(owned_heap),
+            static_cast<unsigned long long>(allocator.heap_available())
+        );
         return false;
     }
 
@@ -267,24 +264,34 @@ bool graph_submit_outer(
     // GraphTaskArgs-wide, so a wide one draws more than the single slot it occupies is
     // worth — GraphBoundaryPool.WidestBoundaryExceedsOneSlotBudget pins how much. The
     // cursors bump through a fixed mirror whose last segment is the scalar pool, so an
-    // overdraw writes past that mirror rather than merely exhausting a quota. Test it
-    // ahead of the slot claim and decline the Graph path, which leaves the caller to
-    // replay the block as ordinary tasks.
+    // overdraw writes past that mirror rather than merely exhausting a quota. The test
+    // precedes the slot claim, so an overdraw is reported before anything is written.
     const uint64_t max_tasks = static_cast<uint64_t>(orch->task_allocator.capacity());
+    const uint64_t tensor_pool_capacity = max_tasks * MAX_TENSOR_ARGS;
+    const uint64_t scalar_pool_capacity = max_tasks * MAX_SCALAR_ARGS;
     const int32_t tensor_slots = args.tensor_count();
     const int32_t scalar_span = CHIP_ALIGN_UP(args.scalar_count(), ARG_POOL_ALIGN / (int32_t)sizeof(uint64_t));
-    if (static_cast<uint64_t>(orch->tensor_pool_cursor) + tensor_slots > max_tasks * MAX_TENSOR_ARGS ||
-        static_cast<uint64_t>(orch->scalar_pool_cursor) + scalar_span > max_tasks * MAX_SCALAR_ARGS) {
-        LOG_WARN("%s", "[GraphExecution] boundary exceeds the argument pools; using ordinary path");
+    if (static_cast<uint64_t>(orch->tensor_pool_cursor) + tensor_slots > tensor_pool_capacity ||
+        static_cast<uint64_t>(orch->scalar_pool_cursor) + scalar_span > scalar_pool_capacity) {
+        orch->report_fatal(
+            SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED, __FUNCTION__,
+            "[GraphExecution] boundary exceeds the argument pools: tensors=%d+%d/%llu scalars=%d+%d/%llu",
+            orch->tensor_pool_cursor, tensor_slots, static_cast<unsigned long long>(tensor_pool_capacity),
+            orch->scalar_pool_cursor, scalar_span, static_cast<unsigned long long>(scalar_pool_capacity)
+        );
         return false;
     }
 
     GraphPendingUpload pending;
-    pending.full_key = full_key;
+    pending.graph_key = graph_key;
     pending.deferred_heap = defer_heap;
 
+    // Explicit predecessors belong to this invocation's outer shell. They are
+    // consumed now, like ordinary task dependencies, and never become edges or
+    // identity fields of the immutable recorded body.
     DepInputs boundary_inputs{
-        args.tensor_count(), args.tensor_data(), args.tag_data(), 0, nullptr,
+        args.tensor_count(),       args.tensor_data(), args.tag_data(), static_cast<int32_t>(args.explicit_dep_count()),
+        args.explicit_deps_data(),
     };
     const int32_t tensormap_needed = count_registrable_outputs(boundary_inputs, orch->in_manual_scope());
     if (tensormap_needed > 0 && !ensure_tensormap_capacity(orch, tensormap_needed)) return false;
@@ -318,7 +325,7 @@ bool graph_submit_outer(
     );
     orch->tensor_pool_cursor += tensor_slots;
     orch->scalar_pool_cursor += scalar_span;
-    slot.active_mask = ActiveMask{};
+    slot.active_mask = LaneMask{};
     slot.task_attrs = TaskAttrs{};
     slot.total_required_subtasks = 0;
     // A shell places no block, but this must stay positive: an early-released
@@ -329,6 +336,7 @@ bool graph_submit_outer(
     // activates — visible only as SIMPLER_ERROR_SCHEDULER_TIMEOUT.
     slot.logical_block_num = 1;
     slot.task_kind = TaskKind::GRAPH;
+    orch->ready_queue_populations.add_task(slot.active_mask, slot.task_attrs, slot.task_kind);
 
     task.task_id = task_id;
     std::fill(std::begin(task.kernel_id), std::end(task.kernel_id), INVALID_KERNEL_ID);
@@ -371,6 +379,14 @@ bool graph_submit_outer(
             task_id, orch->in_manual_scope(), /*early_dispatch=*/false, kernel_ids_capture.data(),
             slot.logical_block_num, args.tensor_count(), args.tensor_data(), args.tag_data()
         );
+    }
+    if (!append_explicit_fanins_or_fail(
+            *orch, task_id, boundary_inputs, fanin_slots, payload.fanin_count, capture_dep_graph
+        )) {
+        if (capture_dep_graph) dep_gen_host_graph_end_task();
+        return false;
+    }
+    if (capture_dep_graph) {
         const bool ok =
             compute_task_fanin(boundary_inputs, orch->tensor_map, orch->in_manual_scope(), emit, DepGraphAnnotate{});
         // The task's last capture point, so the entry closes whether or not the
@@ -423,49 +439,66 @@ bool graph_submit_outer(
 }
 
 bool graph_submit_definition(
-    OrchestratorState *orch, GraphHostState *state, const GraphDefinition *definition,
-    const GraphDefinitionRecord &record, const GraphTaskArgs &args, TaskId *submitted_id
+    OrchestratorState *orch, GraphHostState *state, const Graph *definition, const GraphCacheRecord &record,
+    const GraphTaskArgs &args, TaskId *submitted_id
 ) {
-    if (definition == nullptr || !graph_boundary_matches(*definition, record, args) ||
-        definition->execution_storage_bytes == 0 ||
-        definition->required_heap > UINT64_MAX - definition->execution_storage_bytes) {
+    // A published Definition is immutable and has a cached runtime-owned
+    // invocation budget. Native argument backing can legitimately be empty.
+    always_assert(definition != nullptr && "a cached Definition record carries a Definition");
+    const uint64_t execution_bytes = record.invocation_storage_bytes;
+    if (execution_bytes > UINT64_MAX - definition->required_heap) {
+        orch->report_fatal(SIMPLER_ERROR_INVALID_ARGS, __func__, "invalid Graph execution storage");
         return false;
     }
-    const uint64_t owned_heap = definition->required_heap + definition->execution_storage_bytes;
-    if (owned_heap > static_cast<uint64_t>(INT32_MAX)) return false;
+    if (!graph_require_boundary_match(
+            orch, BoundaryExpectation::CachedDefinition, definition->boundary_tensor_count,
+            definition->boundary_scalar_count, record.boundary_match_info.tensors.data(), args
+        )) {
+        return false;
+    }
+    const uint64_t owned_heap = definition->required_heap + execution_bytes;
+    if (owned_heap > static_cast<uint64_t>(INT32_MAX)) {
+        orch->report_fatal(
+            SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED, __FUNCTION__,
+            "[GraphExecution] Definition owns %llu heap bytes, beyond the %d a task slot can hold",
+            static_cast<unsigned long long>(owned_heap), INT32_MAX
+        );
+        return false;
+    }
     return graph_submit_outer(
-        orch, state, definition->full_key, static_cast<int32_t>(owned_heap), false, args, submitted_id
+        orch, state, definition->graph_key, static_cast<int32_t>(owned_heap), false, args, submitted_id
     );
 }
 
 bool graph_submit_pending_definition(
-    OrchestratorState *orch, GraphHostState *state, uint64_t full_key, const GraphTaskArgs &args, TaskId *submitted_id
+    OrchestratorState *orch, GraphHostState *state, uint64_t graph_key, const GraphTaskArgs &args, TaskId *submitted_id
 ) {
-    return graph_submit_outer(orch, state, full_key, 0, true, args, submitted_id);
+    return graph_submit_outer(orch, state, graph_key, 0, true, args, submitted_id);
 }
 
 bool graph_finalize_pending_submissions(OrchestratorState *orch, GraphHostState *state, uint64_t *failed_key) {
     for (GraphPendingUpload &pending : state->pending_uploads) {
         if (!pending.deferred_heap) continue;
-        auto definition_it = state->definitions.find(pending.full_key);
-        const GraphDefinition *definition = definition_it == state->definitions.end() ?
-                                                nullptr :
-                                                graph_record_definition(*state, definition_it->second);
-        if (definition == nullptr || definition->execution_storage_bytes == 0 ||
-            definition->required_heap > UINT64_MAX - definition->execution_storage_bytes ||
+        auto definition_it = state->definitions.find(pending.graph_key);
+        const Graph *definition = definition_it == state->definitions.end() ?
+                                      nullptr :
+                                      graph_record_definition(*state, definition_it->second);
+        const uint64_t execution_bytes =
+            definition_it == state->definitions.end() ? 0 : definition_it->second.invocation_storage_bytes;
+        if (definition == nullptr || execution_bytes > UINT64_MAX - definition->required_heap ||
             pending.outer_slot == nullptr || pending.outer_slot->task_kind != TaskKind::GRAPH) {
-            if (failed_key != nullptr) *failed_key = pending.full_key;
+            if (failed_key != nullptr) *failed_key = pending.graph_key;
             return false;
         }
-        const uint64_t owned_heap = definition->required_heap + definition->execution_storage_bytes;
+        const uint64_t owned_heap = definition->required_heap + execution_bytes;
         if (owned_heap > static_cast<uint64_t>(INT32_MAX)) {
-            if (failed_key != nullptr) *failed_key = pending.full_key;
+            if (failed_key != nullptr) *failed_key = pending.graph_key;
             return false;
         }
         void *packed_base = nullptr;
         void *packed_end = nullptr;
         if (!orch->task_allocator.reserve_deferred_heap(static_cast<int32_t>(owned_heap), &packed_base, &packed_end)) {
-            if (failed_key != nullptr) *failed_key = pending.full_key;
+            if (failed_key != nullptr) *failed_key = pending.graph_key;
             return false;
         }
         TaskDescriptor &outer_task = pending.outer_slot->to_descriptor();
@@ -479,7 +512,7 @@ bool graph_finalize_pending_submissions(OrchestratorState *orch, GraphHostState 
 }  // namespace
 
 TaskOutputTensors graph_record_submit_sub_task(
-    OrchestratorState *orch, const CoreTaskArgs &args, ActiveMask active_mask, TaskAttrs task_attrs,
+    OrchestratorState *orch, const CoreTaskArgs &args, LaneMask active_mask, TaskAttrs task_attrs,
     int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
 ) {
     ORCH_PHASE_START();
@@ -498,7 +531,8 @@ TaskOutputTensors graph_record_submit_sub_task(
         recording.unsupported = true;
     }
 
-    const OutputLayout layout = calculate_output_layout(args);
+    OutputLayout layout;
+    calculate_output_layout(args, layout);
     const uint64_t aligned_output = CHIP_ALIGN_UP(static_cast<uint64_t>(layout.total_output_size), CHIP_ALIGN_SIZE);
     // Outputs are bumped past the parameter windows: both regions belong to one simulated
     // heap, so the bound counts them together. That is deliberately conservative -- the
@@ -535,8 +569,7 @@ TaskOutputTensors graph_record_submit_sub_task(
     // recording unsupported and makes commit fail-fast, rather than baking a
     // truncated or negative count into the cached Definition (which the device
     // would expand into a sub-task that never completes).
-    const int32_t required_subtasks =
-        static_cast<int32_t>(task.logical_block_num) * __builtin_popcount(active_mask.core_mask());
+    const int32_t required_subtasks = static_cast<int32_t>(task.logical_block_num) * active_mask.count();
     if (task.logical_block_num <= 0 || required_subtasks > std::numeric_limits<int16_t>::max()) {
         recording.unsupported = true;
         task.total_required_subtasks = 0;
@@ -768,41 +801,55 @@ TaskOutputTensors graph_record_submit_sub_task(
     // Published last: until this advances, the slot is not part of the recording, so
     // nothing that scans the recorded tasks can see the task being built.
     recording.task_count = task_index + 1;
-    ORCH_PHASE_END(HostPhaseKind::OrchRecordSubTask, TaskId::to_uint64(task_id));
+    ORCH_PHASE_END_WITH_INDEX(
+        HostPhaseKind::OrchRecordSubTask, TaskId::to_uint64(task_id), active_graph().entry->submit_idx
+    );
     return result;
 }
 
-GraphScopeResult OrchestratorState::graph_begin(uint64_t graph_key, const GraphTaskArgs &args, uint64_t callable_hash) {
-    if (!require_device_arguments(this, args)) return {};
-    ORCH_PHASE_START_SPANNING();
-    const GraphScopeResult result = graph_begin_inner(graph_key, args, callable_hash);
+GraphScopeResult OrchestratorState::graph_begin(uint64_t graph_key, const GraphTaskArgs &args) {
+    if (!require_device_arguments(this, args)) {
+        GraphScopeResult rejected;
+        rejected.has_error = true;
+        return rejected;
+    }
+    ORCH_PHASE_START_SPANNING(active_graph().entry != nullptr ? active_graph().entry->submit_idx : g_orch_submit_idx);
+    const GraphScopeResult result = graph_begin_inner(graph_key, args);
     ORCH_PHASE_END_SPANNING(HostPhaseKind::OrchGraphBegin, graph_key);
     return result;
 }
 
-GraphScopeResult
-OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &args, uint64_t callable_hash) {
+GraphScopeResult OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &args) {
     auto *orch = this;
     GraphScopeResult result;
     GraphHostState *state = graph_state_from(orch);
-    if (state == nullptr || !rt_graph_args_cacheable(args) || args.explicit_dep_count() != 0) {
-        debug_assert(args.explicit_dep_count() == 0 && "Graph boundary explicit dependencies are not supported");
+    // Every orchestrator this runtime builds carries a Graph host state; reaching here
+    // without one means the orchestrator was not the one this call belongs to.
+    always_assert(state != nullptr && "an HBG orchestrator owns a Graph host state");
+    if (!rt_graph_args_cacheable(args)) {
+        orch->report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
+            "[GraphExecution] boundary cannot open a Graph: tensors=%d scalars=%d explicit_deps=%u error=%d",
+            args.tensor_count(), args.scalar_count(), args.explicit_dep_count(), static_cast<int>(args.has_error())
+        );
+        result.has_error = true;
         return result;
     }
     if (GraphRecording *active = active_graph_recording(orch); active != nullptr) {
         active->unsupported = true;
-        debug_assert(active == nullptr && "Nested Graph recording is not supported");
-        LOG_WARN("%s", "[GraphExecution] nested Graph recording is not supported");
+        orch->report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "%s", "[GraphExecution] nested Graph recording is not supported"
+        );
+        result.has_error = true;
         return result;
     }
 
-    const uint64_t full_key = graph_full_key(callable_hash, graph_key);
     std::unique_lock<std::mutex> lock(state->recording_mutex);
 
     // A published Definition is immutable, so the cache lookup comes first and
     // answers regardless of what else is recording. Gating it on an idle recorder
     // would make an already-built Definition wait for an unrelated one.
-    auto definition_it = state->definitions.find(full_key);
+    auto definition_it = state->definitions.find(graph_key);
     if (definition_it != state->definitions.end()) {
         TaskId submitted = TaskId::invalid();
         ORCH_PHASE_START();
@@ -810,7 +857,6 @@ OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &ar
                 orch, state, graph_record_definition(*state, definition_it->second), definition_it->second, args,
                 &submitted
             )) {
-            result.execute_block = false;
             result.task_id = submitted;
             ORCH_PHASE_END(HostPhaseKind::OrchGraphSubmit, TaskId::to_uint64(submitted));
 #if SIMPLER_DFX
@@ -819,6 +865,8 @@ OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &ar
             g_orch_submit_count++;
 #endif
 #endif
+        } else {
+            result.has_error = true;
         }
         return result;
     }
@@ -826,16 +874,30 @@ OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &ar
     // This key is already recording: publish another zero-heap shell against it.
     // A recording that ended has its Definition in the cache, so reaching here
     // with a spent status means the recording failed and this key is spent.
-    auto inflight_it = state->inflight.find(full_key);
+    auto inflight_it = state->inflight.find(graph_key);
     if (inflight_it != state->inflight.end()) {
         GraphInflightRecording &entry = *inflight_it->second;
-        if (entry.status() != GraphRecordingStatus::RECORDING || !graph_boundary_matches(entry.boundary, args)) {
+        if (entry.status() != GraphRecordingStatus::RECORDING) {
+            // The recording thread latches its own failure where it happens; this line is
+            // what connects that failure to the submission it takes down here.
+            orch->report_fatal(
+                SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, __FUNCTION__,
+                "[GraphExecution] key 0x%llx cannot be submitted: its recording failed",
+                static_cast<unsigned long long>(graph_key)
+            );
+            result.has_error = true;
+            return result;
+        }
+        if (!graph_require_boundary_match(
+                orch, BoundaryExpectation::InFlightRecording, entry.boundary.params.tensor_count(),
+                entry.boundary.params.scalar_count(), entry.boundary.match_info.tensors.data(), args
+            )) {
+            result.has_error = true;
             return result;
         }
         TaskId submitted = TaskId::invalid();
         ORCH_PHASE_START();
-        if (graph_submit_pending_definition(orch, state, full_key, args, &submitted)) {
-            result.execute_block = false;
+        if (graph_submit_pending_definition(orch, state, graph_key, args, &submitted)) {
             result.task_id = submitted;
             ORCH_PHASE_END(HostPhaseKind::OrchGraphSubmit, TaskId::to_uint64(submitted));
 #if SIMPLER_DFX
@@ -844,19 +906,25 @@ OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &ar
             g_orch_submit_count++;
 #endif
 #endif
+        } else {
+            result.has_error = true;
         }
         return result;
     }
 
     if (state->claimed_definitions() >= GRAPH_MAX_DEFINITIONS) {
-        debug_assert(
-            state->claimed_definitions() < GRAPH_MAX_DEFINITIONS &&
-            "Graph Definition cache exceeds the supported per-worker limit"
+        // The claimed keys travel with the count: the limit alone says a budget ran out, and
+        // the list says whether it ran out on distinct Graphs or on one Graph whose Config
+        // is not holding still.
+        const std::string claimed = graph_claimed_keys(*state);
+        orch->report_fatal(
+            SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED, __FUNCTION__,
+            "[GraphExecution] Definition cache is full (%zu published, %zu in flight, limit %d); "
+            "rejected key 0x%llx; claimed: %s",
+            state->definitions.size(), state->inflight.size(), GRAPH_MAX_DEFINITIONS,
+            static_cast<unsigned long long>(graph_key), claimed.c_str()
         );
-        LOG_WARN(
-            "[GraphExecution] Definition cache is full (%zu published, %zu in flight); using ordinary path",
-            state->definitions.size(), state->inflight.size()
-        );
+        result.has_error = true;
         return result;
     }
 
@@ -865,7 +933,10 @@ OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &ar
     // allocates the boundary copy and nothing else — a megabyte-scale hazard map stood
     // up here would sit on the submitting thread, between two outer shells.
     auto entry = std::make_unique<GraphInflightRecording>();
-    entry->full_key = full_key;
+    entry->graph_key = graph_key;
+#if SIMPLER_DFX
+    entry->submit_idx = g_orch_submit_idx;
+#endif
     // The boundary is built once, here, and only read afterwards -- by the recorder that
     // picks this entry up, and by later same-key submissions comparing against it.
     //
@@ -896,15 +967,13 @@ OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &ar
         case TensorArgType::OUTPUT:
             // GraphTaskArgs::add_output rejects a TensorCreateInfo at compile time, so no
             // boundary carries this tag. The case exists because the switch is exhaustive.
-            debug_assert(false && "a Graph boundary cannot hold a runtime-allocated output");
+            always_assert(false && "a Graph boundary cannot hold a runtime-allocated output");
             break;
         }
     }
-    // Values resolved, declarations carried over. A dynamic parameter names itself, so
-    // `params` stays the basis recording resolves against.
+    // Values resolved into slots that each name themselves, so `params` stays the basis
+    // recording resolves against.
     boundary.params.gen_scalar_params_from_args(args);
-    boundary.match_info.scalars.resize(static_cast<size_t>(boundary.params.scalar_count()));
-    graph_boundary_capture_scalars(boundary.match_info.scalars.data(), boundary.params);
     boundary.params.launch_spec = args.launch_spec;
     boundary.params.set_allow_early_resolve(args.allow_early_resolve());
     if (args.task_timing_slot() != TASK_TIMING_SLOT_NONE) {
@@ -915,25 +984,25 @@ OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &ar
     // same-key submission -- sees one consistent set of addresses. `params` already names
     // them, and by reference, so it carries the move across.
     //
-    // A boundary this runtime cannot represent takes the ordinary path, like a structural
-    // mismatch does: the entry is dropped before it is published, the body runs against the
-    // caller's own arguments, and the run stays correct without a Definition.
+    // The entry is dropped before it is published, so a boundary this runtime cannot
+    // represent leaves no partial recording behind.
     if (!graph_boundary_relocate_params(boundary)) {
-        LOG_WARN(
-            "%s", "[GraphExecution] boundary tensors must name non-empty buffers, and two at one address must "
-                  "name one size; using ordinary path"
+        orch->report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "%s",
+            "[GraphExecution] boundary tensors must name non-empty buffers, and two at one address must "
+            "name one size"
         );
+        result.has_error = true;
         return result;
     }
     boundary.params.set_predicate(args.predicate());
     GraphInflightRecording *entry_ptr = entry.get();
-    state->inflight.emplace(full_key, std::move(entry));
+    state->inflight.emplace(graph_key, std::move(entry));
     state->inflight_count.store(state->inflight.size(), std::memory_order_release);
 
     TaskId submitted = TaskId::invalid();
     ORCH_PHASE_START();
-    if (graph_submit_pending_definition(orch, state, full_key, args, &submitted)) {
-        result.execute_block = false;
+    if (graph_submit_pending_definition(orch, state, graph_key, args, &submitted)) {
         result.recording = true;
         result.recording_handle = entry_ptr;
         result.params = &entry_ptr->boundary.params;
@@ -946,7 +1015,8 @@ OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &ar
 #endif
 #endif
     } else {
-        state->inflight.erase(full_key);
+        result.has_error = true;
+        state->inflight.erase(graph_key);
         state->inflight_count.store(state->inflight.size(), std::memory_order_release);
     }
     return result;
@@ -960,7 +1030,7 @@ OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &ar
 // against it.
 bool OrchestratorState::graph_prepare(void *recording_handle, const GraphTaskArgs &) {
     GraphHostState *state = graph_state_from(this);
-    if (state == nullptr || recording_handle == nullptr || g_active_graph_recording != nullptr) return false;
+    if (state == nullptr || recording_handle == nullptr || active_graph().recording != nullptr) return false;
     auto *entry = static_cast<GraphInflightRecording *>(recording_handle);
     // graph_begin published this entry before the private job was enqueued, and
     // the entry's address is stable for as long as the recording lives, so the
@@ -973,18 +1043,28 @@ bool OrchestratorState::graph_prepare(void *recording_handle, const GraphTaskArg
     if (entry->status() != GraphRecordingStatus::RECORDING) {
         return false;
     }
-    // This thread's own storage, emptied rather than allocated -- see
-    // recorder_recording(). Failure is reachable only on this thread's first recording,
-    // where the hazard map is stood up; the caller then aborts the recording, and the
-    // outer shell it already submitted replays nothing.
-    GraphRecording &recording = recorder_recording();
+    GraphRecording *scratch = recorder_recording();
+    if (scratch == nullptr) {
+        std::scoped_lock lock(state->recording_mutex);
+        for (auto &cached : state->fallback_scratch_cache) {
+            if (cached) {
+                entry->fallback_scratch = std::move(cached);
+                break;
+            }
+        }
+        if (!entry->fallback_scratch) entry->fallback_scratch = std::make_unique<GraphRecording>();
+        scratch = entry->fallback_scratch.get();
+    }
+    GraphRecording &recording = *scratch;
     if (!graph_recording_reset(recording, *entry)) {
         LOG_WARN("%s", "[GraphExecution] recording hazard map allocation failed; recording abandoned");
         return false;
     }
-    g_active_graph_entry = entry;
-    g_active_graph_recording = &recording;
-    g_active_graph_owner = state;
+    if (const int error = active_graph_selector.try_set({entry, &recording, state})) {
+        recording.boundary = nullptr;
+        LOG_WARN("[GraphExecution] recording TLS binding failed: %d", error);
+        return false;
+    }
     return true;
 }
 
@@ -992,20 +1072,30 @@ void OrchestratorState::graph_abort(void *recording_handle) {
     GraphHostState *state = graph_state_from(this);
     auto *entry = static_cast<GraphInflightRecording *>(recording_handle);
     if (state == nullptr || entry == nullptr) return;
-    {
-        std::scoped_lock lock(state->recording_mutex);
-        entry->set_status(GraphRecordingStatus::FAILED);
+    std::scoped_lock lock(state->recording_mutex);
+    // A failed graph_end can already have retired the handle. Match addresses
+    // before dereferencing it, and never clear another owner's active binding.
+    const ActiveGraphRecording active = active_graph();
+    const bool mine = active.owner == state && active.entry == entry;
+    bool found = false;
+    for (const auto &item : state->inflight) {
+        if (item.second.get() == entry) {
+            found = true;
+            break;
+        }
     }
-    // The storage outlives the entry it was bound to, and graph_commit destroys the
-    // entries, so leaving the pointer behind parks a stale one in thread_local state for
-    // the rest of the process. The next graph_prepare rebinds before anything reads it,
-    // which is why this is hygiene rather than a fix -- but clearing it turns a dangling
-    // boundary into a null one, and null is the only state bound_boundary()'s assertion
-    // can catch a read outside a recording by.
-    unbind_recorder_boundary();
-    g_active_graph_entry = nullptr;
-    g_active_graph_recording = nullptr;
-    g_active_graph_owner = nullptr;
+    if (!found || entry->status() != GraphRecordingStatus::RECORDING) {
+        // The entry is gone or no longer recording, so its storage may already
+        // be recycled. Drop our stale selector without dereferencing it.
+        if (mine) active_graph_selector.restore({});
+        return;
+    }
+    if (mine) {
+        unbind_recorder_boundary();
+        active_graph_selector.restore({});
+    }
+    recycle_fallback_scratch(*state, *entry);
+    entry->set_status(GraphRecordingStatus::FAILED);
     state->recording_cv.notify_all();
 }
 
@@ -1013,19 +1103,18 @@ void OrchestratorState::graph_abort(void *recording_handle) {
 // thread finalizes the already-submitted outer Graph tasks in graph_commit.
 //
 // Retires the entry it bound on every path below that has one, so a caller never has
-// to pair a `false` return with an abort — and must not: graph_commit frees a drained
-// entry after releasing recording_mutex, so a second abort would take that mutex and
-// still touch freed memory.
+// to pair a `false` return with an abort. graph_commit may free a retired entry,
+// so the caller must stop using the handle once graph_end has returned.
 bool OrchestratorState::graph_end() {
     GraphHostState *state = graph_state_from(this);
     GraphRecording *recording = active_graph_recording(this);
-    GraphInflightRecording *entry = g_active_graph_entry;
+    GraphInflightRecording *entry = active_graph().entry;
     if (state == nullptr || recording == nullptr || entry == nullptr) return false;
 
     // A fatal latched anywhere in the run ends this pass with no Definition, but the
     // entry still has to leave RECORDING: graph_commit's drain blocks until every
     // in-flight entry has, and nothing else transitions this one. Returning early
-    // instead would park the entry — and this thread's recorder thread_locals — for
+    // instead would park the entry — and this thread's recorder selectors — for
     // the rest of the process, and hang the bind that is already failing.
     if (is_fatal()) {
         graph_abort(entry);
@@ -1033,12 +1122,12 @@ bool OrchestratorState::graph_end() {
     }
 
     ORCH_PHASE_START();
-    std::optional<GraphDefinition> layout = graph_layout_definition(*recording);
+    std::optional<Graph> layout = graph_layout_definition(*recording);
     // The claim is what decides where this thread writes, so it precedes the fill
     // and never moves the arena: a Definition the retained capacity cannot hold is
     // built in a buffer of its own and copied at upload instead, which keeps the
     // run correct while the next one's arena is sized for it.
-    GraphDefinitionRecord record;
+    GraphCacheRecord record;
     std::byte *image = nullptr;
     if (layout.has_value()) {
         record.bytes = layout->total_bytes;
@@ -1057,34 +1146,33 @@ bool OrchestratorState::graph_end() {
         // The counts are not copied: they are in the image, where the device checks this
         // invocation's argument counts against them.
         record.boundary_match_info = recording->bound_boundary().match_info;
-        ORCH_PHASE_END(HostPhaseKind::OrchBuildDefinition, recording->task_count);
+        ORCH_PHASE_END_WITH_INDEX(HostPhaseKind::OrchBuildDefinition, recording->task_count, entry->submit_idx);
     }
-    const GraphDefinition *header = built ? graph_record_definition(*state, record) : nullptr;
-    if (header == nullptr) {
+    const Graph *header = built ? graph_record_definition(*state, record) : nullptr;
+    if (header == nullptr || !state->execution_storage_bytes(*header, &record.invocation_storage_bytes)) {
         debug_assert(false && "The recorded Graph contains a construct that Graph Execution does not support");
         LOG_WARN("%s", "[GraphExecution] asynchronous recording produced an unsupported Graph");
         graph_abort(entry);
         return false;
     }
     LOG_DEBUG(
-        "[GraphExecution] define key=0x%llx tasks=%d bytes=%u", static_cast<unsigned long long>(header->full_key),
+        "[GraphExecution] define key=0x%llx tasks=%d bytes=%u", static_cast<unsigned long long>(header->graph_key),
         header->task_count, header->total_bytes
     );
     bool ready = false;
+    unbind_recorder_boundary();
+    active_graph_selector.restore({});
     {
         std::scoped_lock lock(state->recording_mutex);
-        if (entry->status() != GraphRecordingStatus::RECORDING || entry->full_key != header->full_key) {
+        recycle_fallback_scratch(*state, *entry);
+        if (entry->status() != GraphRecordingStatus::RECORDING || entry->graph_key != header->graph_key) {
             entry->set_status(GraphRecordingStatus::FAILED);
         } else {
-            state->definitions.emplace(header->full_key, std::move(record));
+            state->definitions.emplace(header->graph_key, std::move(record));
             entry->set_status(GraphRecordingStatus::READY);
         }
         ready = entry->status() == GraphRecordingStatus::READY;
     }
-    unbind_recorder_boundary();
-    g_active_graph_entry = nullptr;
-    g_active_graph_recording = nullptr;
-    g_active_graph_owner = nullptr;
     state->recording_cv.notify_all();
     return ready;
 }
@@ -1092,7 +1180,7 @@ bool OrchestratorState::graph_end() {
 // Join every recording in flight and back-patch all deferred shells in submit
 // order. Orchestration completion is the only normal-path barrier.
 void OrchestratorState::graph_commit() {
-    ORCH_PHASE_START_SPANNING();
+    ORCH_PHASE_START_SPANNING(active_graph().entry != nullptr ? active_graph().entry->submit_idx : g_orch_submit_idx);
     graph_commit_inner();
     ORCH_PHASE_END_SPANNING(HostPhaseKind::OrchGraphCommit, 0);
 }

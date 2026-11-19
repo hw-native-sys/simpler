@@ -15,6 +15,11 @@ from unittest.mock import patch
 
 import pytest
 
+
+def _execution_targets(platform):
+    return ("host", "aicore") if platform == "wsesim" else ("host", "aicpu", "aicore")
+
+
 # --- Discovery tests (no compilation needed) ---
 
 
@@ -241,18 +246,22 @@ class TestRuntimeBuilderGetBinaries:
                 }
             }
         """)
+        if test_arch == "wse":
+            config_content += '\nBUILD_CONFIG.pop("aicpu")\n'
         (rt_dir / "build_config.py").write_text(config_content)
         return rt_dir
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_returns_runtime_binaries(self, MockCompiler, tmp_path, default_test_platform, test_arch):
-        """get_binaries(build=True) returns RuntimeBinaries with three paths."""
+        """get_binaries(build=True) returns paths for the declared components."""
         from simpler_setup.runtime_builder import RuntimeBinaries, RuntimeBuilder  # noqa: PLC0415
 
         self._make_runtime(tmp_path, test_arch)
 
         # compile() returns Path when output_dir is set
         mock_instance = MockCompiler.get_instance.return_value
+        if default_test_platform == "wsesim":
+            mock_instance.aicpu_target = None
         mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
 
         builder = RuntimeBuilder(platform=default_test_platform)
@@ -260,7 +269,11 @@ class TestRuntimeBuilderGetBinaries:
 
         assert isinstance(result, RuntimeBinaries)
         assert result.host_path.name == "libhost.so"
-        assert result.aicpu_path.name == "libaicpu.so"
+        if "aicpu" in _execution_targets(default_test_platform):
+            assert result.aicpu_path is not None
+            assert result.aicpu_path.name == "libaicpu.so"
+        else:
+            assert result.aicpu_path is None
         assert result.aicore_path.name == "libaicore.so"
 
     def _isolated_builder(self, MockCompiler, tmp_path, monkeypatch, platform):
@@ -276,6 +289,8 @@ class TestRuntimeBuilderGetBinaries:
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         mock_instance = MockCompiler.get_instance.return_value
+        if platform == "wsesim":
+            mock_instance.aicpu_target = None
         mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
         monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "a" * 40)
         monkeypatch.setattr(pto_isa, "ensure_pto_isa_root", lambda verbose=False: "/tmp/pto-isa")
@@ -375,21 +390,23 @@ class TestRuntimeBuilderGetBinaries:
         assert dests["aicore"] == builder._LIB_DIR / "a2a3" / "sdma_warmup"
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
-    def test_calls_compiler_three_times(self, MockCompiler, tmp_path, default_test_platform, test_arch):
-        """get_binaries(build=True) invokes compiler.compile() exactly 3 times."""
+    def test_calls_compiler_for_each_runtime_target(self, MockCompiler, tmp_path, default_test_platform, test_arch):
+        """get_binaries(build=True) compiles each declared component exactly once."""
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         self._make_runtime(tmp_path, test_arch)
 
         mock_instance = MockCompiler.get_instance.return_value
+        if default_test_platform == "wsesim":
+            mock_instance.aicpu_target = None
         mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
 
         builder = RuntimeBuilder(platform=default_test_platform)
         builder.get_binaries("test_rt", build=True)
 
-        assert mock_instance.compile.call_count == 3
+        assert mock_instance.compile.call_count == len(_execution_targets(default_test_platform))
         targets = sorted(call.args[0] for call in mock_instance.compile.call_args_list)
-        assert targets == ["aicore", "aicpu", "host"]
+        assert targets == sorted(_execution_targets(default_test_platform))
         expected_defaults = {
             "SIMPLER_DFX": "1",
             "SIMPLER_ORCH_PROFILING": "0",
@@ -400,6 +417,10 @@ class TestRuntimeBuilderGetBinaries:
             expected = dict(expected_defaults)
             if call.args[0] == "host":
                 expected["SIMPLER_RUNTIME_NAME"] = "test_rt"
+            if call.args[0] == "host" and default_test_platform in {"a5sim", "wsesim"}:
+                from simpler_setup.pto_isa import read_pto_isa_pin  # noqa: PLC0415
+
+                expected["SIMPLER_PTO_ISA_BUILD_COMMIT"] = read_pto_isa_pin()
             assert call.kwargs["cmake_defines"] == expected
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
@@ -410,6 +431,8 @@ class TestRuntimeBuilderGetBinaries:
         self._make_runtime(tmp_path, test_arch)
 
         mock_instance = MockCompiler.get_instance.return_value
+        if default_test_platform == "wsesim":
+            mock_instance.aicpu_target = None
         mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
 
         builder = RuntimeBuilder(platform=default_test_platform)
@@ -425,6 +448,8 @@ class TestRuntimeBuilderGetBinaries:
 
         self._make_runtime(tmp_path, test_arch)
         mock_instance = MockCompiler.get_instance.return_value
+        if default_test_platform == "wsesim":
+            mock_instance.aicpu_target = None
         mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
         config = {
             "SIMPLER_DFX": "1",
@@ -435,11 +460,15 @@ class TestRuntimeBuilderGetBinaries:
 
         RuntimeBuilder(platform=default_test_platform).get_binaries("test_rt", build=True, profiling_config=config)
 
-        assert mock_instance.compile.call_count == 3
+        assert mock_instance.compile.call_count == len(_execution_targets(default_test_platform))
         for call in mock_instance.compile.call_args_list:
             expected = dict(config)
             if call.args[0] == "host":
                 expected["SIMPLER_RUNTIME_NAME"] = "test_rt"
+            if call.args[0] == "host" and default_test_platform in {"a5sim", "wsesim"}:
+                from simpler_setup.pto_isa import read_pto_isa_pin  # noqa: PLC0415
+
+                expected["SIMPLER_PTO_ISA_BUILD_COMMIT"] = read_pto_isa_pin()
             assert call.kwargs["cmake_defines"] == expected
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
@@ -450,6 +479,8 @@ class TestRuntimeBuilderGetBinaries:
         rt_dir = self._make_runtime(tmp_path, test_arch)
 
         mock_instance = MockCompiler.get_instance.return_value
+        if default_test_platform == "wsesim":
+            mock_instance.aicpu_target = None
         mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
 
         builder = RuntimeBuilder(platform=default_test_platform)
@@ -470,6 +501,8 @@ class TestRuntimeBuilderGetBinaries:
         self._make_runtime(tmp_path, test_arch)
 
         mock_instance = MockCompiler.get_instance.return_value
+        if default_test_platform == "wsesim":
+            mock_instance.aicpu_target = None
         mock_instance.compile.side_effect = RuntimeError("cmake failed")
 
         builder = RuntimeBuilder(platform=default_test_platform)
@@ -604,7 +637,6 @@ class TestRuntimeBuilderGetBinaries:
         mock_instance = MockCompiler.get_instance.return_value
         mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
         for var in (
-            "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE",
             "SIMPLER_ENABLE_PTO_URMA_WORKSPACE",
             "SIMPLER_ENABLE_PTO_RDMA_WORKSPACE",
         ):
@@ -618,17 +650,15 @@ class TestRuntimeBuilderGetBinaries:
 
         host_call = next(call for call in mock_instance.compile.call_args_list if call.args[0] == "host")
         assert host_call.kwargs["cmake_defines"]["SIMPLER_PTO_ISA_BUILD_COMMIT"] == pin
-        # Default a5 onboard forwards the two cached overlay options explicitly
-        # (both OFF) so a stale cached option cannot survive a reconfigure. SDMA
-        # is the CMakeLists-derived default and is not forwarded.
-        assert host_call.kwargs["cmake_defines"]["SIMPLER_ENABLE_PTO_URMA_WORKSPACE"] == "OFF"
+        # RDMA is explicitly OFF so a stale cached option cannot survive a reconfigure.
+        # SDMA and URMA are compiled unconditionally.
+        assert "SIMPLER_ENABLE_PTO_URMA_WORKSPACE" not in host_call.kwargs["cmake_defines"]
         assert host_call.kwargs["cmake_defines"]["SIMPLER_ENABLE_PTO_RDMA_WORKSPACE"] == "OFF"
-        assert "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE" not in host_call.kwargs["cmake_defines"]
         assert host_call.kwargs["cmake_defines"]["PTO_ISA_ROOT"] == "/tmp/pto-isa"
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_a5_rdma_overlay_host_build_forwards_overlay_defines(self, MockCompiler, tmp_path, monkeypatch):
-        """RDMA overlay is forwarded to host CMake with URMA pinned off."""
+        """RDMA selection is independent of the always compiled URMA provider."""
         from simpler_setup import pto_isa  # noqa: PLC0415
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
@@ -636,7 +666,6 @@ class TestRuntimeBuilderGetBinaries:
         self._make_runtime(tmp_path, "a5")
         mock_instance = MockCompiler.get_instance.return_value
         mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
-        monkeypatch.delenv("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", raising=False)
         monkeypatch.delenv("SIMPLER_ENABLE_PTO_URMA_WORKSPACE", raising=False)
         monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: pin)
         monkeypatch.setattr(pto_isa, "ensure_pto_isa_root", lambda verbose=False: "/tmp/pto-isa")
@@ -648,38 +677,8 @@ class TestRuntimeBuilderGetBinaries:
 
         host_call = next(call for call in mock_instance.compile.call_args_list if call.args[0] == "host")
         assert host_call.kwargs["cmake_defines"]["SIMPLER_ENABLE_PTO_RDMA_WORKSPACE"] == "ON"
-        assert host_call.kwargs["cmake_defines"]["SIMPLER_ENABLE_PTO_URMA_WORKSPACE"] == "OFF"
-        assert "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE" not in host_call.kwargs["cmake_defines"]
+        assert "SIMPLER_ENABLE_PTO_URMA_WORKSPACE" not in host_call.kwargs["cmake_defines"]
         assert host_call.kwargs["cmake_defines"]["SIMPLER_PTO_ISA_BUILD_COMMIT"] == pin
-
-    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
-    def test_a5_sdma_overlay_host_build_forwards_overlay_defines(self, MockCompiler, tmp_path, monkeypatch):
-        """Selecting SDMA explicitly still forces the URMA option off.
-
-        SDMA is the CMakeLists-derived default, so it is not forwarded; what
-        matters is that URMA is pinned OFF rather than left to a cached value.
-        """
-        from simpler_setup import pto_isa  # noqa: PLC0415
-        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
-
-        pin = "f" * 40
-        self._make_runtime(tmp_path, "a5")
-        mock_instance = MockCompiler.get_instance.return_value
-        mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
-        monkeypatch.delenv("SIMPLER_ENABLE_PTO_URMA_WORKSPACE", raising=False)
-        monkeypatch.delenv("SIMPLER_ENABLE_PTO_RDMA_WORKSPACE", raising=False)
-        monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: pin)
-        monkeypatch.setattr(pto_isa, "ensure_pto_isa_root", lambda verbose=False: "/tmp/pto-isa")
-        monkeypatch.setattr(pto_isa, "write_pto_isa_build_metadata", lambda *args: None)
-        monkeypatch.setenv("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", "ON")
-
-        builder = RuntimeBuilder(platform="a5")
-        builder.get_binaries("test_rt", build=True)
-
-        host_call = next(call for call in mock_instance.compile.call_args_list if call.args[0] == "host")
-        assert host_call.kwargs["cmake_defines"]["SIMPLER_ENABLE_PTO_URMA_WORKSPACE"] == "OFF"
-        assert host_call.kwargs["cmake_defines"]["SIMPLER_ENABLE_PTO_RDMA_WORKSPACE"] == "OFF"
-        assert "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE" not in host_call.kwargs["cmake_defines"]
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_a5_overlay_off_survives_reconfigure_after_rdma_on(self, MockCompiler, tmp_path, monkeypatch):
@@ -691,7 +690,6 @@ class TestRuntimeBuilderGetBinaries:
         mock_instance = MockCompiler.get_instance.return_value
         mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
         for var in (
-            "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE",
             "SIMPLER_ENABLE_PTO_URMA_WORKSPACE",
             "SIMPLER_ENABLE_PTO_RDMA_WORKSPACE",
         ):
@@ -712,42 +710,7 @@ class TestRuntimeBuilderGetBinaries:
         monkeypatch.delenv("SIMPLER_ENABLE_PTO_RDMA_WORKSPACE", raising=False)
         defines = host_defines()
         assert defines["SIMPLER_ENABLE_PTO_RDMA_WORKSPACE"] == "OFF"
-        assert defines["SIMPLER_ENABLE_PTO_URMA_WORKSPACE"] == "OFF"
-
-    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
-    def test_a5_overlay_rdma_to_sdma_reconfigures_both(self, MockCompiler, tmp_path, monkeypatch):
-        """RDMA=ON then SDMA=ON must yield SDMA=ON and RDMA=OFF."""
-        from simpler_setup import pto_isa  # noqa: PLC0415
-        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
-
-        self._make_runtime(tmp_path, "a5")
-        mock_instance = MockCompiler.get_instance.return_value
-        mock_instance.compile.side_effect = lambda target, *a, **kw: (Path(kw["output_dir"]) / f"lib{target}.so")
-        for var in (
-            "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE",
-            "SIMPLER_ENABLE_PTO_URMA_WORKSPACE",
-            "SIMPLER_ENABLE_PTO_RDMA_WORKSPACE",
-        ):
-            monkeypatch.delenv(var, raising=False)
-        monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "e" * 40)
-        monkeypatch.setattr(pto_isa, "ensure_pto_isa_root", lambda verbose=False: "/tmp/pto-isa")
-        monkeypatch.setattr(pto_isa, "write_pto_isa_build_metadata", lambda *args: None)
-
-        def host_defines() -> dict[str, str]:
-            builder = RuntimeBuilder(platform="a5")
-            builder.get_binaries("test_rt", build=True)
-            host_calls = [call for call in mock_instance.compile.call_args_list if call.args[0] == "host"]
-            return host_calls[-1].kwargs["cmake_defines"]
-
-        monkeypatch.setenv("SIMPLER_ENABLE_PTO_RDMA_WORKSPACE", "ON")
-        assert host_defines()["SIMPLER_ENABLE_PTO_RDMA_WORKSPACE"] == "ON"
-
-        monkeypatch.delenv("SIMPLER_ENABLE_PTO_RDMA_WORKSPACE", raising=False)
-        monkeypatch.setenv("SIMPLER_ENABLE_PTO_SDMA_WORKSPACE", "ON")
-        defines = host_defines()
-        assert defines["SIMPLER_ENABLE_PTO_RDMA_WORKSPACE"] == "OFF"
-        assert defines["SIMPLER_ENABLE_PTO_URMA_WORKSPACE"] == "OFF"
-        assert "SIMPLER_ENABLE_PTO_SDMA_WORKSPACE" not in defines
+        assert "SIMPLER_ENABLE_PTO_URMA_WORKSPACE" not in defines
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_sim_direct_build_does_not_write_pto_isa_metadata(self, MockCompiler, tmp_path, monkeypatch):
@@ -835,7 +798,7 @@ class TestAbbrevStamp:
 
 
 class TestBuildCacheStamp:
-    """Test cmake cache stamp composition (runtime HEAD + pto-isa commit)."""
+    """Test cmake cache stamp composition (runtime source content + pto-isa commit)."""
 
     def _make_builder(self, platform):
         from simpler_setup.platform_info import parse_platform  # noqa: PLC0415
@@ -851,7 +814,7 @@ class TestBuildCacheStamp:
         import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
         from simpler_setup import pto_isa  # noqa: PLC0415
 
-        monkeypatch.setattr(rb_module, "_get_git_head", lambda _root: "runtime_sha")
+        monkeypatch.setattr(rb_module, "_runtime_source_stamp", lambda _root: "runtime_sha")
         monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "isa_sha")
 
         builder = self._make_builder("a2a3")
@@ -863,7 +826,7 @@ class TestBuildCacheStamp:
         from simpler_setup import pto_isa  # noqa: PLC0415
 
         monkeypatch.delenv("SIMPLER_ENABLE_PTO_URMA_WORKSPACE", raising=False)
-        monkeypatch.setattr(rb_module, "_get_git_head", lambda _root: "runtime_sha")
+        monkeypatch.setattr(rb_module, "_runtime_source_stamp", lambda _root: "runtime_sha")
         monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "isa_sha")
 
         builder = self._make_builder("a5")
@@ -874,7 +837,7 @@ class TestBuildCacheStamp:
         import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
         from simpler_setup import pto_isa  # noqa: PLC0415
 
-        monkeypatch.setattr(rb_module, "_get_git_head", lambda _root: "runtime_sha")
+        monkeypatch.setattr(rb_module, "_runtime_source_stamp", lambda _root: "runtime_sha")
         monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: pytest.fail("unexpected pin read"))
 
         builder = self._make_builder("a2a3sim")
@@ -885,7 +848,7 @@ class TestBuildCacheStamp:
         import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
         from simpler_setup import pto_isa  # noqa: PLC0415
 
-        monkeypatch.setattr(rb_module, "_get_git_head", lambda _root: "")
+        monkeypatch.setattr(rb_module, "_runtime_source_stamp", lambda _root: "")
         monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: pytest.fail("unexpected pin read"))
 
         builder = self._make_builder("a2a3")
@@ -912,6 +875,12 @@ class TestResolveBuildPtoIsaCommit:
         builder = self._make_builder("a2a3sim")
         assert builder._resolve_build_pto_isa_commit() == ""
 
+    def test_a5sim_reads_pin_for_workspace_types(self, monkeypatch):
+        from simpler_setup import pto_isa  # noqa: PLC0415
+
+        monkeypatch.setattr(pto_isa, "read_pto_isa_pin", lambda: "isa_sha")
+        assert self._make_builder("a5sim")._resolve_build_pto_isa_commit() == "isa_sha"
+
     def test_a5_default_reads_pin(self, monkeypatch):
         from simpler_setup import pto_isa  # noqa: PLC0415
 
@@ -921,8 +890,8 @@ class TestResolveBuildPtoIsaCommit:
         builder = self._make_builder("a5")
         assert builder._resolve_build_pto_isa_commit() == "isa_sha"
 
-    def test_a5_urma_overlay_on_reads_pin(self, monkeypatch):
-        """URMA overlay also embeds pto-isa, so it reads the pin too (#1392)."""
+    def test_a5_retired_urma_variable_does_not_change_pin(self, monkeypatch):
+        """The A5 provider build embeds the pinned ISA regardless of ambient flags."""
         from simpler_setup import pto_isa  # noqa: PLC0415
 
         monkeypatch.setenv("SIMPLER_ENABLE_PTO_URMA_WORKSPACE", "ON")
@@ -1043,10 +1012,29 @@ class TestRuntimeBuilderIntegration:
         result = builder.get_binaries(runtime_name, build=True)
 
         assert isinstance(result, RuntimeBinaries)
-        for label, path in [
-            ("host", result.host_path),
-            ("aicpu", result.aicpu_path),
-            ("aicore", result.aicore_path),
-        ]:
+        targets = _execution_targets(platform)
+        if "aicpu" not in targets:
+            assert result.aicpu_path is None
+        for label in targets:
+            path = getattr(result, f"{label}_path")
+            assert path is not None
             assert path.is_file(), f"{label} binary not found: {path}"
             assert path.stat().st_size > 0, f"{label} binary is empty: {path}"
+
+
+@pytest.mark.parametrize("platform", ["a5", "a5sim"])
+@pytest.mark.parametrize("target", ["host", "aicpu", "aicore"])
+def test_a5_tmr_targets_use_pinned_isa_headers(tmp_path, monkeypatch, platform, target):
+    from simpler_setup import pto_isa  # noqa: PLC0415
+    from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+    pto_root = tmp_path / "pinned-isa"
+    monkeypatch.setattr(pto_isa, "ensure_pto_isa_root", lambda: str(pto_root))
+    builder = RuntimeBuilder.__new__(RuntimeBuilder)
+    builder._arch = "a5"
+    builder.platform = platform
+    config_dir = tmp_path / "tensormap_and_ringbuffer"
+    config = {target: {"include_dirs": ["runtime"], "source_dirs": [target]}}
+    includes, sources = builder._resolve_target_dirs(config_dir, config, target)
+    assert includes == [str(config_dir / "runtime"), str(pto_root / "include")]
+    assert sources == [str(config_dir / target)]

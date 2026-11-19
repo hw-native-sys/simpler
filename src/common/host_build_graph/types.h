@@ -33,10 +33,6 @@
 #include <type_traits>
 #include <utility>
 
-#if defined(__aarch64__)
-#include <arm_neon.h>
-#endif
-
 #include "assert_compat.h"
 #include "aicpu/dump_arg_selection.h"
 #include "common/device_phase.h"
@@ -185,6 +181,8 @@ public:
 
 template <size_t MaxT, size_t MaxS>
 class Arg;
+template <size_t MaxT, size_t MaxS>
+class InheritableArg;
 class InheritableScalar;
 
 /**
@@ -210,12 +208,12 @@ public:
 
 private:
     // A handle offers no value read at all. It cannot tell a dynamic parameter from a
-    // static one -- Arg::scalar(i) hands out a self-pointing origin either way -- so a read
-    // taken from one could not be checked against the slot's declaration, where
-    // Arg::scalar<T>(i) has the Arg and can. Forwarding is all a handle is for, and
-    // add_scalar_one copies these bytes across as they are.
+    // static one -- InheritableArg::scalar(i) hands out a self-pointing origin either way --
+    // so a read taken from one could not be checked against the slot's declaration, where
+    // InheritableArg::scalar<T>(i) has the Arg and can. Forwarding is all a handle is for,
+    // and add_scalar_one copies these bytes across as they are.
     template <size_t MaxT, size_t MaxS>
-    friend class Arg;
+    friend class InheritableArg;
 
     uint64_t bits_;
     const void *origin_;
@@ -284,6 +282,7 @@ public:
     // implicit derived-to-base conversion, through which its members are public again
     // however this class hides their names, so `static_cast<const Base &>(args).tags_`
     // would read the tag array the accessors exist to mediate.
+    using Base::scalar;
     using Base::scalar_count;
     using Base::tag;
     using Base::tag_data;
@@ -294,7 +293,10 @@ public:
     // Minimal-permission: an Arg is built in place and consumed by reference;
     // it is never copied/moved (it is a large object, and its TensorRef slots
     // are non-copyable by design).
-    Arg() = default;
+    //
+    // Construction is protected: Arg is the shared implementation of the task-args layer,
+    // never a type a caller names. What a caller builds is one of the aliases below --
+    // CoreTaskArgs, GraphTaskArgs, ChipTaskArgs -- each of which decides what its slots mean.
     Arg(const Arg &) = delete;
     Arg(Arg &&) = delete;
     Arg &operator=(const Arg &) = delete;
@@ -319,21 +321,6 @@ public:
         task_timing_slot_ = slot;
     }
     int32_t task_timing_slot() const { return task_timing_slot_; }
-
-    void clear() {
-        Base::clear();
-        // All-null is a correct empty state: every parameter reads as static, so nothing
-        // below scalar_count_ can be mistaken for one that follows a source.
-        scalar_inherited_.fill(nullptr);
-#if SIMPLER_DFX
-        dump_arg_selection_.clear();
-#endif
-        explicit_deps_ = nullptr;
-        explicit_dep_count_ = 0;
-        allow_early_resolve_ = false;
-        task_timing_slot_ = TASK_TIMING_SLOT_NONE;
-        predicate_ = CoreTaskPredicate{};
-    }
 
     void reset() {
         clear();
@@ -466,128 +453,46 @@ public:
     const TaskId *explicit_deps_data() const { return explicit_deps_; }
 
     /**
-     * Add scalar values, declaring each one a **dynamic** parameter. Types are deduced per
-     * argument; each value is bit-cast to uint64_t for storage. Mixed types are allowed:
+     * Add scalar values. Types are deduced per argument; each value is bit-cast to uint64_t
+     * for storage. Mixed types are allowed:
      *
      *   args.add_scalar(token_pos);                   // single
      *   args.add_scalar(3.14f, int32_t(42), 7u);      // mixed batch
      *
-     * "Dynamic" means the value may differ per invocation, so a Graph cache lookup must
-     * not compare it. What declares it is the argument's value category: an lvalue (the
-     * caller holds it somewhere) or an InheritableScalar (it already names a parameter)
-     * is dynamic; a literal or any other rvalue is static. Say it explicitly with
-     * add_static_scalar when an lvalue holds a value that does not change.
-     *
-     * A GraphTaskArgs::scalar(i) may be passed alongside plain values; that slot then
-     * follows the boundary parameter instead of freezing its current value.
+     * Every slot of an Arg holds a value of its own. A slot that instead follows a Graph
+     * boundary parameter is something only an InheritableArg has, and only its add_scalar
+     * accepts the handle that makes one.
      */
     template <typename... Args>
     void add_scalar(Args &&...args) {
         static_assert(sizeof...(Args) >= 1, "add_scalar: at least one argument required");
-        static_assert(
-            ((is_supported_scalar_arg_v<Args> || is_inheritable_scalar_v<Args>) && ...),
-            "add_scalar: all types must be arithmetic, enum, or a Graph boundary scalar"
-        );
+        static_assert((is_supported_scalar_arg_v<Args> && ...), "add_scalar: all types must be arithmetic or enum");
         if (scalar_count_ + sizeof...(Args) > MaxS) {
             set_error(scalar_cap_msg());
             return;
         }
-        (add_scalar_one<true>(std::forward<Args>(args)), ...);
+        (add_scalar_one(std::forward<Args>(args)), ...);
     }
 
-    /**
-     * Add scalar values, declaring each one a **static** parameter regardless of value
-     * category.
-     *
-     * On a sub-task's arguments the declaration takes effect at once: recording
-     * reads it back through scalar_dynamic() and records the slot as static Definition
-     * data instead of following a parameter.
-     *
-     * On a Graph's own parameter list it decides two things, and
-     * gen_scalar_params_from_args carries it onto the boundary to decide them. Nothing
-     * refreshes a static slot on replay, so a body may read it as a value where
-     * Arg::scalar<T> refuses a dynamic one; and the value a static slot held at record
-     * time joins the condition the Definition is reused under, since whatever the body
-     * computed from it is fixed in the image.
-     *
-     * Declare a parameter static when its value is fixed for the run. A static value that
-     * moves costs the key its Definition for the rest of the run -- the match fails,
-     * nothing replaces the published record, and every later invocation runs the body
-     * itself -- so a parameter that varies is forwarded rather than frozen.
-     *
-     * An InheritableScalar is rejected. A handle names a parameter, so declaring the
-     * handle static would freeze whatever value that parameter holds right now without
-     * the body ever saying it read one. Freezing an enclosing Graph's parameter into an
-     * inner boundary is spelled add_static_scalar(args.scalar<uint64_t>(i)): the read
-     * takes the value, and this declares the destination slot static.
-     */
-    template <typename... Args>
-    void add_static_scalar(Args &&...args) {
-        static_assert(sizeof...(Args) >= 1, "add_static_scalar: at least one argument required");
-        static_assert(
-            ((!is_inheritable_scalar_v<Args>) && ...),
-            "add_static_scalar: a Graph boundary scalar handle names a parameter and cannot be "
-            "declared static; read its value first with args.scalar<uint64_t>(i)"
-        );
-        static_assert(
-            (is_supported_scalar_arg_v<Args> && ...), "add_static_scalar: all types must be arithmetic or enum"
-        );
-        if (scalar_count_ + sizeof...(Args) > MaxS) {
-            set_error(scalar_cap_msg());
-            return;
-        }
-        (add_scalar_one<false>(std::forward<Args>(args)), ...);
-    }
-
-    // Bulk form of add_scalar: an array element is an lvalue, so every parameter added
-    // here is dynamic. Use add_static_scalars for a run of values that does not change.
+    // Bulk form of add_scalar.
     template <typename T>
     void add_scalars(const T *values, int count) {
-        add_scalars_impl(values, count, true);
-    }
-
-    template <typename T>
-    void add_static_scalars(const T *values, int count) {
-        add_scalars_impl(values, count, false);
-    }
-
-    // Hand out parameter i. The default template argument (InheritableScalar) is for
-    // forwarding: its value, plus the slot that value comes from. Passing the result to
-    // another Arg's add_scalar makes that slot follow this one; InheritableScalar has no
-    // implicit conversion to a raw value, so reading it as one instead of forwarding it
-    // requires explicitly requesting a different ScalarT.
-    //
-    // An already-inherited slot yields its own origin rather than itself, so the chain a
-    // destination records is always one hop: "C inherits B, B inherits A" records C -> A.
-    //
-    // scalar<T>(i) for any other T reads the slot directly as T, with to_u64's actual
-    // inverse applied. It is the only spelling that reads a parameter as a value: a handle
-    // offers no value read, because it cannot tell a dynamic parameter from a static
-    // one. static_cast on the pattern is not that inverse: a float slot holds a
-    // bit pattern, so static_cast<float> of 1.0f's pattern yields 1065353216.0. An enum has
-    // no other spelling at all -- the handle converts to nothing, so
-    // static_cast<DataType>(scalar(i)) has no conversion to apply.
-    //
-    // A value read requires parameter i to be static. A dynamic one names a value the
-    // caller may change, and a number taken out of it becomes ordinary host data: whatever
-    // the body computes from it is fixed in the Definition, and every later invocation
-    // replays that number instead of the one it passed. The check is a run-time one because
-    // the declaration is a run-time value and i is usually a loop variable; the assertion's
-    // stack trace names the read.
-    template <typename ScalarT = InheritableScalar>
-    ScalarT scalar(int32_t i) const {
-        if constexpr (is_inheritable_scalar_v<ScalarT>) {
-            return {scalars_[i], scalar_inherited_[i] != nullptr ? scalar_inherited_[i] : &scalars_[i]};
-        } else {
-            static_assert(sizeof(ScalarT) <= sizeof(uint64_t), "scalar<T>: type must fit in the slot");
-            always_assert(
-                scalar_inherited_[i] == nullptr &&
-                "scalar<T>(i): this parameter is declared dynamic, so reading it as a value would "
-                "freeze what it holds now into the Definition. Forward it with scalar(i), or declare "
-                "it static with add_static_scalar where the boundary is built."
-            );
-            return from_u64<ScalarT>(scalars_[i]);
+        static_assert(is_supported_scalar_arg_v<T>, "add_scalars: element type must be arithmetic or enum");
+        if (count < 0 || scalar_count_ + count > MaxS) {
+            set_error(scalar_cap_msg());
+            return;
         }
+        if constexpr (std::is_same_v<std::remove_cv_t<T>, uint64_t>) {
+            memcpy(&scalars_[scalar_count_], values, static_cast<size_t>(count) * sizeof(uint64_t));
+        } else {
+            for (int i = 0; i < count; ++i) {
+                scalars_[scalar_count_ + i] = to_u64(values[i]);
+            }
+        }
+#if SIMPLER_DFX
+        dump_arg_selection_.clear_scalar_metadata(scalar_count_, count);
+#endif
+        scalar_count_ += count;
     }
 
     // Copy every value into a compact uint64 array -- what submit and payload
@@ -596,18 +501,6 @@ public:
     void pack_scalars(uint64_t *out) const {
         memcpy(out, scalars_, static_cast<size_t>(scalar_count_) * sizeof(uint64_t));
     }
-
-    // A parameter is dynamic exactly when it names where its value came from. The address
-    // is never dereferenced -- see scalar_origin.
-    bool scalar_dynamic(int32_t i) const { return scalar_inherited_[i] != nullptr; }
-
-    // Where parameter i's value came from, or null when it is static.
-    //
-    // This address MUST NOT be dereferenced: it may already dangle, since a caller's local
-    // goes out of scope once submit returns. It is only ever tested against null and
-    // subtracted from a slot array base, and that is safe precisely because the value was
-    // copied at add_scalar time.
-    const void *scalar_origin(int32_t i) const { return scalar_inherited_[i]; }
 
     // Base of the slot array. Its only use is turning an origin pointer into a boundary
     // parameter index; named apart from a value accessor because what it hands out is an
@@ -621,6 +514,27 @@ public:
 #endif
 
 protected:
+    Arg() = default;
+
+    // Empty every field an Arg carries, keeping the error state. Protected rather than
+    // public: a derived Arg may add state that clearing has to reach -- InheritableArg's
+    // origin array does -- and this one is not virtual, so a call through an `Arg &` would
+    // run this body alone and leave that state behind. A slot still naming an origin while
+    // holding a value of its own is recorded as following a boundary parameter, so the
+    // Definition takes its value from the wrong place. `reset()` is the public spelling,
+    // and each derived Arg overrides it to cover its own fields.
+    void clear() {
+        Base::clear();
+#if SIMPLER_DFX
+        dump_arg_selection_.clear();
+#endif
+        explicit_deps_ = nullptr;
+        explicit_dep_count_ = 0;
+        allow_early_resolve_ = false;
+        task_timing_slot_ = TASK_TIMING_SLOT_NONE;
+        predicate_ = CoreTaskPredicate{};
+    }
+
     // Capacity-overflow message — spells the actual limit (MaxS, whatever the
     // instantiation is) into the text via std::to_string. Built once into a
     // function-local static so set_error() can hold the const char* safely.
@@ -628,6 +542,34 @@ protected:
         static const std::string msg = "Too many scalar args (max " + std::to_string(MaxS) + ")";
         return msg.c_str();
     }
+
+    // Add one value. T is still known here, which is why a slot of any width is stored
+    // correctly: deferring the conversion would need the width, and the slot has nowhere
+    // to keep it.
+    //
+    // Protected rather than private: InheritableArg builds on it, adding the origin that
+    // makes a slot follow a parameter.
+    template <typename T>
+    void add_scalar_one(T &&value) {
+        scalars_[scalar_count_] = to_u64(value);
+#if SIMPLER_DFX
+        uintptr_t scalar_source_ptr = 0;
+        if constexpr (std::is_lvalue_reference_v<T>) {
+            scalar_source_ptr = reinterpret_cast<uintptr_t>(&value);
+        }
+        dump_arg_selection_.record_scalar_source(
+            scalar_count_, scalar_source_ptr, dtype_of<std::remove_cv_t<std::remove_reference_t<T>>>()
+        );
+#endif
+        scalar_count_++;
+    }
+
+#if SIMPLER_DFX
+    // What dump() matches a scalar by, for a slot a derived Arg filled itself.
+    void record_scalar_source_for_slot(int32_t slot, uintptr_t source_ptr, uint8_t dtype) {
+        dump_arg_selection_.record_scalar_source(slot, source_ptr, dtype);
+    }
+#endif
 
 private:
     // Held fully private: these two hand out the slot array with nothing to qualify it.
@@ -644,82 +586,6 @@ private:
     static const char *tensor_cap_msg() {
         static const std::string msg = "Too many tensor args (max " + std::to_string(MaxT) + ")";
         return msg.c_str();
-    }
-
-    // Add one value plus its declaration. Dynamic == true is add_scalar's promise that the
-    // caller may change this parameter between invocations; the origin recorded for it is
-    // what a Graph recording turns into a boundary parameter index.
-    //
-    // The value is converted here, where T is still known -- which is why a parameter of
-    // any width can be dynamic. Deferring the conversion to a read of the origin would
-    // require the origin's width, and the slot has nowhere to keep it.
-    template <bool Dynamic, typename T>
-    void add_scalar_one(T &&value) {
-        if constexpr (is_inheritable_scalar_v<T>) {
-            static_assert(
-                Dynamic, "an InheritableScalar is always a dynamic parameter: add_static_scalar rejects the handle, "
-                         "so freezing one goes through an explicit scalar<T>() read instead"
-            );
-            // The value travels with the handle, so following the parameter costs no
-            // dereference of the origin -- and lets the origin dangle harmlessly. A slot is
-            // 8 bytes whatever the source type was, so the bits copy across as they are.
-            scalars_[scalar_count_] = value.bits_;
-            scalar_inherited_[scalar_count_] = value.origin();
-#if SIMPLER_DFX
-            // No host address to identify this slot by: it names a boundary parameter,
-            // not a caller variable, so dump() cannot match it by pointer. The dtype is
-            // u64 for the same reason -- an InheritableScalar carries bits and origin and
-            // nothing else -- so a forwarded float or int32 slot prints as its bit
-            // pattern rather than as its source type.
-            dump_arg_selection_.record_scalar_source(scalar_count_, 0, dtype_of<uint64_t>());
-#endif
-        } else {
-            scalars_[scalar_count_] = to_u64(value);
-            // An lvalue is a parameter the caller holds and may change; an rvalue cannot
-            // be changed by anyone, so it is static however add_scalar was called.
-            if constexpr (Dynamic && std::is_lvalue_reference_v<T>) {
-                scalar_inherited_[scalar_count_] = &value;
-            } else {
-                scalar_inherited_[scalar_count_] = nullptr;
-            }
-#if SIMPLER_DFX
-            uintptr_t scalar_source_ptr = 0;
-            if constexpr (std::is_lvalue_reference_v<T>) {
-                scalar_source_ptr = reinterpret_cast<uintptr_t>(&value);
-            }
-            dump_arg_selection_.record_scalar_source(
-                scalar_count_, scalar_source_ptr, dtype_of<std::remove_cv_t<std::remove_reference_t<T>>>()
-            );
-#endif
-        }
-        scalar_count_++;
-    }
-
-    // Shared body of add_scalars / add_static_scalars. An array element is an lvalue, so
-    // value category cannot tell a dynamic parameter from a static one the way it does in
-    // add_scalar. The caller states the declaration instead, which is why it arrives as a
-    // run-time argument rather than as add_scalar_one's template parameter.
-    template <typename T>
-    void add_scalars_impl(const T *values, int count, bool dynamic) {
-        static_assert(is_supported_scalar_arg_v<T>, "add_scalars: element type must be arithmetic or enum");
-        if (count < 0 || scalar_count_ + count > MaxS) {
-            set_error(scalar_cap_msg());
-            return;
-        }
-        if constexpr (std::is_same_v<std::remove_cv_t<T>, uint64_t>) {
-            memcpy(&scalars_[scalar_count_], values, static_cast<size_t>(count) * sizeof(uint64_t));
-        } else {
-            for (int i = 0; i < count; ++i) {
-                scalars_[scalar_count_ + i] = to_u64(values[i]);
-            }
-        }
-        for (int i = 0; i < count; ++i) {
-            scalar_inherited_[scalar_count_ + i] = dynamic ? static_cast<const void *>(&values[i]) : nullptr;
-        }
-#if SIMPLER_DFX
-        dump_arg_selection_.clear_scalar_metadata(scalar_count_, count);
-#endif
-        scalar_count_ += count;
     }
 
 #if SIMPLER_DFX
@@ -820,13 +686,6 @@ protected:
     using Base::tensor_count_;
     using Base::tensors_;
 
-    // Where this parameter's value came from, or null when it is static.
-    //
-    // These addresses are compared and subtracted, never dereferenced -- one may point at
-    // a caller local that has already gone out of scope. That is safe precisely because
-    // the value was copied at add_scalar time.
-    std::array<const void *, MaxS> scalar_inherited_{};
-
 private:
     bool has_error_{false};
     const char *error_msg_{nullptr};
@@ -859,13 +718,230 @@ private:
     uint32_t explicit_dep_count_{0};
 };
 
+/**
+ * An Arg whose slots may follow someone else's.
+ *
+ * The difference from Arg is one array: where each slot's value came from. A slot that
+ * names an origin is a parameter being forwarded -- a Graph boundary scalar passed through
+ * to a sub-task -- and recording resolves that origin into a boundary parameter index
+ * instead of freezing the value into the Definition.
+ *
+ * Which Args need it is decided by whether they can inherit at all, not by their position
+ * in the hierarchy. A sub-task's arguments and a Graph's boundary both can; an orchestration
+ * entry's arguments cannot -- those are the run's own values, with nothing above them to
+ * follow -- so ChipTaskArgs stays on plain Arg and keeps a value read that is always legal.
+ */
+template <size_t MaxT, size_t MaxS>
+class InheritableArg : private Arg<MaxT, MaxS> {
+    using Base = Arg<MaxT, MaxS>;
+
+public:
+    // Arg's own API, re-exported one name at a time, for the reason Arg itself inherits
+    // privately: a public base is reachable by an implicit derived-to-base conversion, and
+    // every mutator here is non-virtual, so `Arg &a = args; a.reset();` would run Arg's body
+    // alone and leave `scalar_inherited_` holding origins for slots that no longer exist. A
+    // slot still naming an origin while holding a value of its own is recorded as following
+    // a boundary parameter, so the Definition takes its value from the wrong place.
+    //
+    // Four names are deliberately absent and defined below instead -- clear, reset,
+    // add_scalar, add_scalars -- because each has to cover the origin array too. Arg::scalar
+    // is absent for a different reason: a slot here may follow a parameter, so the only
+    // read this class offers is the handle.
+    using Base::add_inout;
+    using Base::add_input;
+    using Base::add_no_dep;
+    using Base::add_output;
+    using Base::allow_early_resolve;
+    using Base::error_msg;
+    using Base::explicit_dep;
+    using Base::explicit_dep_count;
+    using Base::explicit_deps_data;
+    using Base::has_error;
+    using Base::pack_scalars;
+    using Base::predicate;
+    using Base::scalar_count;
+    using Base::scalar_dtypes;
+    using Base::scalar_slot_base;
+    using Base::set_allow_early_resolve;
+    using Base::set_dependencies;
+    using Base::set_error;
+    using Base::set_predicate;
+    using Base::set_task_timing_slot;
+    using Base::tag;
+    using Base::tag_data;
+    using Base::task_timing_slot;
+    using Base::tensor;
+    using Base::tensor_count;
+    using Base::tensor_data;
+#if SIMPLER_DFX
+    using Base::dump;
+#endif
+    using Base::dump_arg_index_ambiguous_mask;
+    using Base::dump_arg_mask;
+
+    void reset() {
+        Base::reset();
+        scalar_inherited_.fill(nullptr);
+    }
+
+    /**
+     * Add scalar values. Types are deduced per argument; each value is bit-cast to uint64_t
+     * for storage. Mixed types are allowed:
+     *
+     *   args.add_scalar(token_pos);                            // a value of this slot's own
+     *   args.add_scalar(boundary.scalar(0));                   // follows a boundary parameter
+     *   args.add_scalar(3.14f, boundary.scalar(1), 7u);        // mixed batch
+     *
+     * **What a slot follows is decided by what was passed, not by its value category.** An
+     * InheritableScalar names a parameter, so the slot follows it and is refreshed on every
+     * replay; anything else is a value of this slot's own, whether it arrived as an lvalue
+     * or a literal.
+     */
+    template <typename... Args>
+    void add_scalar(Args &&...args) {
+        static_assert(sizeof...(Args) >= 1, "add_scalar: at least one argument required");
+        static_assert(
+            ((is_supported_scalar_arg_v<Args> || is_inheritable_scalar_v<Args>) && ...),
+            "add_scalar: all types must be arithmetic, enum, or a Graph boundary scalar"
+        );
+        if (this->scalar_count_ + sizeof...(Args) > MaxS) {
+            this->set_error(Base::scalar_cap_msg());
+            return;
+        }
+        (add_scalar_one(std::forward<Args>(args)), ...);
+    }
+
+    // Bulk form of add_scalar, dispatching on the element type the same way: a run of values
+    // fills value slots, a run of handles fills slots that follow their parameters. One call
+    // is necessarily homogeneous -- `const T *` has one T -- so mixing the two takes the
+    // variadic form above.
+    template <typename T>
+    void add_scalars(const T *values, int count) {
+        if constexpr (is_inheritable_scalar_v<T>) {
+            if (count < 0 || this->scalar_count_ + count > MaxS) {
+                this->set_error(Base::scalar_cap_msg());
+                return;
+            }
+            for (int i = 0; i < count; ++i) {
+                add_scalar_one(values[i]);
+            }
+        } else {
+            const int32_t first = this->scalar_count_;
+            Base::add_scalars(values, count);
+            // A refused batch left the count where it was, so nothing below is reached.
+            for (int i = 0; first + i < this->scalar_count_; ++i) {
+                scalar_inherited_[first + i] = nullptr;
+            }
+        }
+    }
+
+    // Hand out parameter i for forwarding: its value, plus the slot that value comes from.
+    // Passing the result to another InheritableArg's add_scalar makes that slot follow this
+    // one.
+    //
+    // There is no value read. A slot here may follow a parameter the caller refreshes per
+    // invocation, and a number taken out of one becomes ordinary host data: whatever the
+    // body computes from it is fixed in the Definition, and every later invocation replays
+    // that number instead of the one it passed. A Graph's fixed values belong in its Config,
+    // which the body receives alongside these.
+    //
+    // An already-inherited slot yields its own origin rather than itself, so the chain a
+    // destination records is always one hop: "C inherits B, B inherits A" records C -> A.
+    InheritableScalar scalar(int32_t i) const {
+        return {this->scalars_[i], scalar_inherited_[i] != nullptr ? scalar_inherited_[i] : &this->scalars_[i]};
+    }
+
+    // A parameter follows another exactly when it names where its value came from. The
+    // address is never dereferenced -- see scalar_origin.
+    bool scalar_dynamic(int32_t i) const { return scalar_inherited_[i] != nullptr; }
+
+    // Where parameter i's value came from, or null when it is static.
+    //
+    // This address MUST NOT be dereferenced: it may already dangle, since a caller's local
+    // goes out of scope once submit returns. It is only ever tested against null and
+    // subtracted from a slot array base, and that is safe precisely because the value was
+    // copied at add_scalar time.
+    const void *scalar_origin(int32_t i) const { return scalar_inherited_[i]; }
+
+protected:
+    // The base's protected functions. Private inheritance would otherwise end the chain
+    // here: Arg's protected members are private in this class, so a class derived from this
+    // one could not reach them at all.
+    using Base::scalar_cap_msg;
+
+    // Covers the origin array the base cannot see. Protected for the same reason the base's
+    // is, and overriding it is what keeps a derived Arg's own clear() correct.
+    void clear() {
+        Base::clear();
+        // All-null is a correct empty state: every slot reads as its own value, so nothing
+        // below scalar_count_ can be mistaken for one that follows a source.
+        scalar_inherited_.fill(nullptr);
+    }
+
+private:
+    // Add one slot. What it ends up being is decided by T alone: a handle names a parameter
+    // and the slot follows it, anything else is a value of this slot's own.
+    template <typename T>
+    void add_scalar_one(T &&value) {
+        if constexpr (is_inheritable_scalar_v<T>) {
+            // The value travels with the handle, so following the parameter costs no
+            // dereference of the origin -- and lets the origin dangle harmlessly. A slot is
+            // 8 bytes whatever the source type was, so the bits copy across as they are.
+            this->scalars_[this->scalar_count_] = value.bits_;
+            scalar_inherited_[this->scalar_count_] = value.origin();
+#if SIMPLER_DFX
+            // No host address to identify this slot by: it names a boundary parameter,
+            // not a caller variable, so dump() cannot match it by pointer. The dtype is
+            // u64 for the same reason -- an InheritableScalar carries bits and origin and
+            // nothing else -- so a forwarded float or int32 slot prints as its bit
+            // pattern rather than as its source type.
+            this->record_scalar_source_for_slot(this->scalar_count_, 0, dtype_of<uint64_t>());
+#endif
+            this->scalar_count_++;
+        } else {
+            const int32_t slot = this->scalar_count_;
+            Base::add_scalar_one(std::forward<T>(value));
+            scalar_inherited_[slot] = nullptr;
+        }
+    }
+
+    // ---- Data members ----------------------------------------------------------------
+    //
+    // Below this line the access specifiers run a second time, for storage rather than for
+    // functions. The base's `launch_spec` is assigned through rather than called, which is
+    // what puts it here and not among the re-exports above.
+
+public:
+    using Base::launch_spec;
+
+protected:
+    // Slot storage, carried through for the same reason as the protected functions above: a
+    // derived Arg writes it directly, GraphTaskArgs::gen_scalar_params_from_args filling a
+    // whole parameter list at once.
+    using Base::scalar_count_;
+    using Base::scalars_;
+    using Base::tags_;
+    using Base::tensor_count_;
+    using Base::tensors_;
+
+    // One more column of those same slots, and this class's own rather than the base's --
+    // which is why it is a declaration where the five above are using-declarations.
+    //
+    // Where each parameter's value came from, or null when the slot holds a value of its
+    // own. These addresses are compared and subtracted, never dereferenced -- one may point
+    // at a caller local that has already gone out of scope. That is safe precisely because
+    // the value was copied at add_scalar time.
+    std::array<const void *, MaxS> scalar_inherited_{};
+};
+
 // =============================================================================
 // Task-args layer aliases
 // =============================================================================
 //
 // CoreTaskArgs — core-level container used to build and submit tasks inside
-//   orchestration (small, stack-friendly).
-using CoreTaskArgs = Arg<MAX_TENSOR_ARGS, MAX_SCALAR_ARGS>;
+//   orchestration (small, stack-friendly). On the inheritable layer: a sub-task's
+//   slot may forward a Graph boundary parameter.
+using CoreTaskArgs = InheritableArg<MAX_TENSOR_ARGS, MAX_SCALAR_ARGS>;
 
 // Tensor and scalar capacity of a Graph boundary.
 inline constexpr int32_t GRAPH_MAX_TENSOR_ARGS = 128;
@@ -890,7 +966,7 @@ inline constexpr int32_t GRAPH_MAX_SCALAR_ARGS = 64;
  * something only a Graph does: the one method below writes the slot arrays directly,
  * which is why they are protected rather than private.
  */
-struct GraphTaskArgs : Arg<GRAPH_MAX_TENSOR_ARGS, GRAPH_MAX_SCALAR_ARGS> {
+struct GraphTaskArgs : InheritableArg<GRAPH_MAX_TENSOR_ARGS, GRAPH_MAX_SCALAR_ARGS> {
     /**
      * Existing tensors only: a Graph boundary cannot take a runtime-allocated output.
      *
@@ -906,22 +982,26 @@ struct GraphTaskArgs : Arg<GRAPH_MAX_TENSOR_ARGS, GRAPH_MAX_SCALAR_ARGS> {
             "a Graph boundary cannot take a runtime-allocated output (TensorCreateInfo); "
             "allocate the tensor before the Graph and pass it as an existing Tensor"
         );
-        Arg<GRAPH_MAX_TENSOR_ARGS, GRAPH_MAX_SCALAR_ARGS>::add_output(std::forward<Args>(args)...);
+        InheritableArg<GRAPH_MAX_TENSOR_ARGS, GRAPH_MAX_SCALAR_ARGS>::add_output(std::forward<Args>(args)...);
     }
 
     /**
      * Build this Graph's scalar parameters from the arguments a caller passed.
      *
      * Values are resolved straight into the slots, because an argument's origin does not
-     * outlive the submit call that lent it. The declaration does carry over, and a dynamic
-     * parameter ends up naming **itself** -- which is what keeps this list the basis
-     * recording resolves against: scalar(i) folds to &scalars_[i] whether the parameter is
-     * dynamic or static, so a task slot that follows parameter i reports this array's i-th
-     * slot and graph_classify_scalars turns that into the index i.
+     * outlive the submit call that lent it. **Every parameter then names itself**, which is
+     * what keeps this list the basis recording resolves against: scalar(i) folds to
+     * &scalars_[i], so a task slot that follows parameter i reports this array's i-th slot
+     * and graph_classify_scalars turns that into the index i.
      *
-     * Naming the caller's variable instead would hand out an address outside this array,
-     * the task slot would be recorded as static, and the parameter would silently stop
-     * being refreshed on replay.
+     * Naming the caller's variable instead would hand out an address outside this array, the
+     * task slot would be recorded as the body's own value, and the parameter would silently
+     * stop being refreshed on replay.
+     *
+     * Unconditional because a boundary parameter is refreshed per invocation, with no second
+     * kind to tell apart: a Graph's fixed values live in its Config. Carrying the caller
+     * slot's own origin across would make a parameter the caller happened to pass by value
+     * stop being refreshed, which is the distinction this boundary no longer has.
      */
     void gen_scalar_params_from_args(const GraphTaskArgs &args) {
         // The whole list is generated at once, into an Arg that has none yet -- graph_begin
@@ -932,7 +1012,7 @@ struct GraphTaskArgs : Arg<GRAPH_MAX_TENSOR_ARGS, GRAPH_MAX_SCALAR_ARGS> {
         const int32_t count = args.scalar_count();
         args.pack_scalars(scalars_);
         for (int32_t i = 0; i < count; ++i) {
-            scalar_inherited_[i] = args.scalar_dynamic(i) ? &scalars_[i] : nullptr;
+            scalar_inherited_[i] = &scalars_[i];
         }
         scalar_count_ = count;
     }
@@ -954,12 +1034,11 @@ struct ChipTaskArgs : Arg<CHIP_MAX_TENSOR_ARGS, CHIP_MAX_SCALAR_ARGS> {
             debug_assert(!t.manual_dep && t.version == 0);
             add_input(t);
         }
-        // An orchestration entry's scalars are the run's own values, not a Graph
-        // boundary's parameters, so no slot here follows anything. Declared rather than
-        // inferred from src.scalar(i)'s value category: that accessor has a by-value
-        // const overload and a by-reference non-const one.
+        // An orchestration entry's scalars are the run's own values, not a Graph boundary's
+        // parameters, so no slot here follows anything -- which is what every Arg slot
+        // already is.
         for (int32_t i = 0; i < src.scalar_count(); ++i) {
-            add_static_scalar(src.scalar(i));
+            add_scalar(src.scalar(i));
         }
     }
 };

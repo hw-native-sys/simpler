@@ -14,7 +14,10 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <utility>
+#include <vector>
+#include <limits>
 
 #include "acl/acl.h"
 #include "device_runner_helpers.h"
@@ -28,6 +31,25 @@ struct RtsState {
     int alloc_rc = 0;
     int copy_rc = 0;
     int copies = 0;
+    int async_copies = 0;
+    int fail_copy_on = 0;
+    struct Copy {
+        void *target;
+        const void *source;
+        size_t bytes;
+        rtStream_t stream;
+    };
+    std::vector<Copy> queued;
+    int host_alloc_rc = 0;
+    int host_free_rc = 0;
+    int host_allocations = 0;
+    int host_frees = 0;
+    LaunchProgressSink sink;
+    bool defer = false;
+    void *pending_target = nullptr;
+    const void *pending_source = nullptr;
+    size_t pending_bytes = 0;
+    rtStream_t stream = nullptr;
     int allocations = 0;
     int frees = 0;
     // What a publication is expected to carry. Which of the two prefixes that
@@ -79,7 +101,7 @@ extern "C" rtError_t rtFree(void *ptr) {
     std::free(ptr);
     return 0;
 }
-extern "C" rtError_t rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind) {
+static rtError_t copy_descriptor(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind) {
     ++rts.copies;
     EXPECT_EQ(kind, RT_MEMCPY_HOST_TO_DEVICE);
     // A published prefix, not the allocated extent: a publication that carried
@@ -87,19 +109,62 @@ extern "C" rtError_t rtMemcpy(void *dst, uint64_t capacity, const void *src, uin
     // commit happens after this call returns, so the slot still shows the state
     // this copy was issued in.
     const bool initializing = rts.destination != nullptr && !rts.destination->workers_initialized;
-    EXPECT_EQ(bytes, initializing ? rts.initializing_copy_bytes : rts.steady_copy_bytes);
+    if (rts.destination != nullptr && dst == rts.destination->runtime_args)
+        EXPECT_EQ(bytes, initializing ? rts.initializing_copy_bytes : rts.steady_copy_bytes);
     EXPECT_EQ(capacity, bytes);
-    if (rts.copy_rc != 0) return rts.copy_rc;
+    if (rts.copy_rc != 0 && (rts.fail_copy_on == 0 || rts.copies == rts.fail_copy_on)) return rts.copy_rc;
     std::memcpy(dst, src, bytes);
     return 0;
+}
+extern "C" rtError_t rtMallocHost(void **ptr, uint64_t bytes, uint16_t) {
+    if (rts.host_alloc_rc != 0) return rts.host_alloc_rc;
+    *ptr = std::malloc(bytes);
+    if (*ptr == nullptr) return -1;
+    ++rts.host_allocations;
+    return 0;
+}
+extern "C" rtError_t rtFreeHost(void *ptr) {
+    if (rts.host_free_rc != 0) return rts.host_free_rc;
+    ++rts.host_frees;
+    std::free(ptr);
+    return 0;
+}
+extern "C" rtError_t rtMemcpy(void *, uint64_t, const void *, uint64_t, rtMemcpyKind_t) {
+    ADD_FAILURE() << "descriptor publication must enqueue on its execution stream";
+    return -99;
+}
+extern "C" rtError_t
+rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t stream) {
+    ++rts.async_copies;
+    rts.stream = stream;
+    rts.queued.push_back({dst, src, bytes, stream});
+    if (rts.defer) {
+        ++rts.copies;
+        rts.pending_target = dst;
+        rts.pending_source = src;
+        rts.pending_bytes = bytes;
+        return rts.copy_rc;
+    }
+    return copy_descriptor(dst, capacity, src, bytes, kind);
 }
 extern "C" rtError_t rtStreamQuery(rtStream_t) { return 0; }
 extern "C" const char *aclGetRecentErrMsg() { return nullptr; }
 // These cases drive the publication step with the launch route refused, so the
 // permit never consults a live stream; the query only has to link.
+extern "C" aclError aclmdlRICaptureThreadExchangeMode(aclmdlRICaptureMode *) { return -1; }
 extern "C" aclError aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus *status, aclmdlRI *) {
     if (status != nullptr) *status = ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
     return ACL_SUCCESS;
+}
+
+TEST(KernelArgsDefaults, FreshRuntimeStartsWithDiagnosticsDisabled) {
+    alignas(Runtime) unsigned char storage[sizeof(Runtime)];
+    std::memset(storage, kDeviceMark, sizeof(storage));
+    auto *fresh = new (storage) Runtime;
+    EXPECT_EQ(fresh->dev.chip_swimlane_level, 0U);
+    EXPECT_EQ(fresh->dev.pmu_event_type, 0U);
+    EXPECT_EQ(fresh->dev.dump_args_level, 0U);
+    fresh->~Runtime();
 }
 
 TEST_F(KernelArgsPublication, PrepareDoesNotPublishAndOwnsAnIndependentSnapshot) {
@@ -116,12 +181,12 @@ TEST_F(KernelArgsPublication, PrepareDoesNotPublishAndOwnsAnIndependentSnapshot)
         ASSERT_EQ(bytes[i], kDeviceMark);
 
     runtime.dev.worker_count = 19;
-    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false), 0);
+    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false, &rts, rts.sink), 0);
     EXPECT_EQ(published_worker_count(), 7);
     EXPECT_EQ(rts.copies, 1);
     EXPECT_EQ(helper.args.runtime_args, slot.runtime_args);
     EXPECT_TRUE(helper.runtime_args_published());
-    EXPECT_NE(helper.publish_runtime_args(/*launch_route_permitted=*/false), 0);
+    EXPECT_NE(helper.publish_runtime_args(/*launch_route_permitted=*/false, &rts, rts.sink), 0);
     EXPECT_EQ(rts.copies, 1);
     EXPECT_TRUE(helper.runtime_args_published());
 }
@@ -131,7 +196,7 @@ TEST_F(KernelArgsPublication, FailedPublicationWithdrawsRunViewButRetainsSlotFor
     ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
     Runtime *destination = slot.runtime_args;
     rts.copy_rc = -91;
-    EXPECT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false), -91);
+    EXPECT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false, &rts, rts.sink), -91);
     EXPECT_EQ(helper.args.runtime_args, nullptr);
     EXPECT_FALSE(helper.runtime_args_published());
     EXPECT_EQ(slot.runtime_args, destination);
@@ -139,11 +204,11 @@ TEST_F(KernelArgsPublication, FailedPublicationWithdrawsRunViewButRetainsSlotFor
     EXPECT_EQ(rts.frees, 0);
 
     rts.copy_rc = 0;
-    EXPECT_NE(helper.publish_runtime_args(/*launch_route_permitted=*/false), 0);
+    EXPECT_NE(helper.publish_runtime_args(/*launch_route_permitted=*/false, &rts, rts.sink), 0);
     EXPECT_EQ(rts.copies, 1);
     runtime.dev.worker_count = 3;
     ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
-    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false), 0);
+    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false, &rts, rts.sink), 0);
     EXPECT_EQ(published_worker_count(), 3);
     EXPECT_TRUE(helper.runtime_args_published());
     EXPECT_EQ(slot.runtime_args, destination);
@@ -158,7 +223,7 @@ TEST_F(KernelArgsPublication, AllocationFailureLeavesNoPublishableRun) {
     EXPECT_EQ(slot.runtime_args, nullptr);
     EXPECT_EQ(slot.runtime_bytes, 0U);
     EXPECT_EQ(allocator.get_allocation_count(), 0U);
-    EXPECT_NE(helper.publish_runtime_args(/*launch_route_permitted=*/false), 0);
+    EXPECT_NE(helper.publish_runtime_args(/*launch_route_permitted=*/false, &rts, rts.sink), 0);
     EXPECT_EQ(rts.copies, 0);
 }
 
@@ -171,7 +236,7 @@ TEST_F(KernelArgsPublication, RepreparePreservesThePendingSnapshotAndDestination
     EXPECT_EQ(helper.args.runtime_args, destination);
     EXPECT_EQ(rts.allocations, 1);
     EXPECT_EQ(rts.copies, 0);
-    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false), 0);
+    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false, &rts, rts.sink), 0);
     EXPECT_EQ(published_worker_count(), 7);
 }
 
@@ -184,7 +249,7 @@ TEST_F(KernelArgsPublication, RejectedReprepareDoesNotTouchAnotherSlot) {
     EXPECT_EQ(other.runtime_args, nullptr);
     EXPECT_EQ(rts.allocations, 1);
     EXPECT_EQ(helper.args.runtime_args, slot.runtime_args);
-    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false), 0);
+    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false, &rts, rts.sink), 0);
     EXPECT_EQ(published_worker_count(), 7);
     EXPECT_EQ(release_slot_persistent_args(other, allocator), 0);
 }
@@ -198,7 +263,7 @@ TEST_F(KernelArgsPublication, MismatchedSlotLeavesNoPublishableRun) {
     EXPECT_EQ(helper.args.runtime_args, nullptr);
     EXPECT_FALSE(helper.runtime_args_published());
     EXPECT_EQ(slot.runtime_args, destination);
-    EXPECT_NE(helper.publish_runtime_args(/*launch_route_permitted=*/false), 0);
+    EXPECT_NE(helper.publish_runtime_args(/*launch_route_permitted=*/false, &rts, rts.sink), 0);
     EXPECT_EQ(rts.copies, 0);
     EXPECT_EQ(rts.allocations, 1);
     EXPECT_EQ(rts.frees, 0);
@@ -211,7 +276,7 @@ TEST_F(KernelArgsPublication, ReleaseDiscardsPendingSourceWithoutFreeingDestinat
     EXPECT_EQ(helper.args.runtime_args, nullptr);
     EXPECT_FALSE(helper.runtime_args_published());
     EXPECT_EQ(slot.runtime_args, destination);
-    EXPECT_NE(helper.publish_runtime_args(/*launch_route_permitted=*/false), 0);
+    EXPECT_NE(helper.publish_runtime_args(/*launch_route_permitted=*/false, &rts, rts.sink), 0);
     EXPECT_EQ(rts.copies, 0);
     EXPECT_EQ(rts.frees, 0);
     EXPECT_EQ(release_slot_persistent_args(slot, allocator), 0);
@@ -227,9 +292,9 @@ TEST_F(KernelArgsPublication, MovedHelperRetainsSnapshotAfterSourceRunViewIsRele
     helper.release_run_view();
     EXPECT_EQ(helper.args.runtime_args, nullptr);
     EXPECT_FALSE(helper.runtime_args_published());
-    EXPECT_NE(helper.publish_runtime_args(/*launch_route_permitted=*/false), 0);
+    EXPECT_NE(helper.publish_runtime_args(/*launch_route_permitted=*/false, &rts, rts.sink), 0);
     runtime.dev.worker_count = 23;
-    ASSERT_EQ(moved.publish_runtime_args(/*launch_route_permitted=*/false), 0);
+    ASSERT_EQ(moved.publish_runtime_args(/*launch_route_permitted=*/false, &rts, rts.sink), 0);
     EXPECT_EQ(published_worker_count(), 11);
     EXPECT_EQ(rts.copies, 1);
     moved.release_run_view();
@@ -240,7 +305,7 @@ TEST_F(KernelArgsPublication, MovedHelperRetainsSnapshotAfterSourceRunViewIsRele
 TEST_F(KernelArgsPublication, FreshPrepareCannotReuseAnEarlierPublicationVerdict) {
     runtime.dev.worker_count = 7;
     ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
-    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false), 0);
+    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false, &rts, rts.sink), 0);
     ASSERT_TRUE(helper.runtime_args_published());
 
     runtime.dev.worker_count = 19;
@@ -249,14 +314,14 @@ TEST_F(KernelArgsPublication, FreshPrepareCannotReuseAnEarlierPublicationVerdict
     EXPECT_EQ(published_worker_count(), 7);
     EXPECT_EQ(rts.allocations, 1);
     rts.copy_rc = -93;
-    EXPECT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false), -93);
+    EXPECT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false, &rts, rts.sink), -93);
     EXPECT_FALSE(helper.runtime_args_published());
     EXPECT_EQ(published_worker_count(), 7);
 }
 
 TEST_F(KernelArgsPublication, PublishedVerdictMovesAndIsRevokedByAbandonment) {
     ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
-    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false), 0);
+    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false, &rts, rts.sink), 0);
     KernelArgsHelper moved(std::move(helper));
     EXPECT_FALSE(helper.runtime_args_published());
     EXPECT_TRUE(moved.runtime_args_published());
@@ -270,13 +335,13 @@ TEST_F(KernelArgsPublication, PublishedVerdictMovesAndIsRevokedByAbandonment) {
 
 TEST_F(KernelArgsPublication, ReleaseAllowsFreshPrepareWithoutRetainingPublication) {
     ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
-    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false), 0);
+    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false, &rts, rts.sink), 0);
     helper.release_run_view();
     EXPECT_FALSE(helper.runtime_args_published());
     runtime.dev.worker_count = 23;
     ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
     EXPECT_FALSE(helper.runtime_args_published());
-    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false), 0);
+    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false, &rts, rts.sink), 0);
     EXPECT_TRUE(helper.runtime_args_published());
     EXPECT_EQ(published_worker_count(), 23);
     EXPECT_EQ(rts.allocations, 1);
@@ -305,7 +370,7 @@ TEST_F(KernelArgsPublication, PublicationLeavesTheDeviceInitializedTailUntouched
     // Bounds before any tail read: an allocation that shrank to the prefix is
     // reported here rather than read past below.
     ASSERT_EQ(slot.runtime_bytes, extent_bytes) << "the allocation does not cover the device-read tail";
-    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false), 0);
+    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false, &rts, rts.sink), 0);
     ASSERT_EQ(rts.copies, 1);
 
     const auto *bytes = reinterpret_cast<const unsigned char *>(slot.runtime_args);
@@ -327,12 +392,12 @@ TEST_F(KernelArgsPublication, RepeatedPublicationPreservesTheDeviceInitializedTa
 
     runtime.dev.worker_count = 5;
     ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
-    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false), 0);
+    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false, &rts, rts.sink), 0);
     Runtime *const destination = slot.runtime_args;
 
     runtime.dev.worker_count = 9;
     ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
-    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false), 0);
+    ASSERT_EQ(helper.publish_runtime_args(/*launch_route_permitted=*/false, &rts, rts.sink), 0);
 
     EXPECT_EQ(slot.runtime_args, destination) << "the slot reallocated instead of reusing its block";
     EXPECT_EQ(rts.allocations, 1);
@@ -344,4 +409,256 @@ TEST_F(KernelArgsPublication, RepeatedPublicationPreservesTheDeviceInitializedTa
     for (size_t i = image_bytes; i < extent_bytes; ++i) {
         ASSERT_EQ(bytes[i], kDeviceMark) << "a repeated publication reached the tail at byte " << i;
     }
+}
+
+TEST_F(KernelArgsPublication, LaunchPublicationQueuesAnImmutableSourceOnItsExecutionStream) {
+    runtime.dev.worker_count = 7;
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    rts.defer = true;
+    rtStream_t stream = &rts;
+    ASSERT_EQ(publish_for_launch(helper, stream, rts.sink), 0);
+    ASSERT_EQ(rts.async_copies, 1);
+    EXPECT_EQ(rts.stream, stream);
+    EXPECT_EQ(published_worker_count(), static_cast<int>(0xa5a5a5a5U));
+    runtime.dev.worker_count = 19;
+    helper.release_run_view();
+    ASSERT_EQ(rts.host_frees, 0);
+    ASSERT_EQ(rts.pending_source, slot.runtime_upload_source);
+    std::memcpy(rts.pending_target, rts.pending_source, rts.pending_bytes);
+    EXPECT_EQ(published_worker_count(), 7);
+}
+
+TEST_F(KernelArgsPublication, PinnedSourceIsReusedAndItsReleaseFailureRemainsRetryable) {
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    void *source = slot.runtime_upload_source;
+    ASSERT_NE(source, nullptr);
+    ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+    ASSERT_TRUE(rts.sink.submitted());
+    helper.release_run_view();
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    EXPECT_EQ(slot.runtime_upload_source, source);
+    EXPECT_EQ(rts.host_allocations, 1);
+    rts.host_free_rc = -79;
+    EXPECT_EQ(release_slot_persistent_args(slot, allocator), -79);
+    EXPECT_EQ(slot.runtime_upload_source, source);
+    EXPECT_EQ(slot.runtime_args, nullptr);
+    EXPECT_EQ(rts.host_frees, 0);
+    rts.host_free_rc = 0;
+    EXPECT_EQ(release_slot_persistent_args(slot, allocator), 0);
+    EXPECT_EQ(rts.host_frees, 1);
+    EXPECT_EQ(slot.runtime_upload_source, nullptr);
+}
+
+TEST_F(KernelArgsPublication, PinnedAllocationFailurePrecedesAnyPublicationAndCanRetry) {
+    rts.host_alloc_rc = -78;
+    EXPECT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), -78);
+    EXPECT_EQ(rts.async_copies, 0);
+    EXPECT_FALSE(rts.sink.submitted());
+    EXPECT_FALSE(helper.launchable());
+    EXPECT_EQ(slot.runtime_upload_source, nullptr);
+    rts.host_alloc_rc = 0;
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    EXPECT_EQ(rts.allocations, 1);
+    EXPECT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+}
+
+TEST_F(KernelArgsPublication, FailedAsyncEnqueueCannotCertifyNoSubmission) {
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    rts.copy_rc = -81;
+    EXPECT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), -81);
+    EXPECT_TRUE(rts.sink.submitted());
+    EXPECT_FALSE(helper.runtime_args_published());
+    EXPECT_EQ(helper.launch_payload(), nullptr);
+    EXPECT_NE(slot.runtime_upload_source, nullptr);
+    EXPECT_EQ(rts.host_frees, 0);
+}
+
+TEST_F(KernelArgsPublication, AbandonmentNeverFreesAPotentialDmaSource) {
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    rts.defer = true;
+    ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+    void *source = slot.runtime_upload_source;
+    void *destination = slot.runtime_args;
+    abandon_slot_persistent_args(slot);
+    ASSERT_EQ(rts.host_frees, 0);
+    ASSERT_EQ(rts.frees, 0);
+    EXPECT_EQ(slot.runtime_upload_source, nullptr);
+    // Finish the modeled reader before reclaiming the test's orphaned blocks.
+    std::memcpy(rts.pending_target, rts.pending_source, rts.pending_bytes);
+    std::free(source);
+    EXPECT_EQ(allocator.free(destination), 0);
+}
+
+TEST_F(KernelArgsPublication, MetadataValuesArePublishedBeforeDescriptorFromSlotOwnedSources) {
+    uint64_t first = 0, second = 0;
+    {
+        uint64_t values[] = {17, 29};
+        const HostMetadataRegion regions[] = {
+            {&first, &values[0], sizeof(first)}, {&second, &values[1], sizeof(second)}
+        };
+        ASSERT_EQ(slot.staged_launch_metadata.prepare(regions, 2), 0);
+        values[0] = 900;
+    }
+    runtime.dev.worker_count = 7;
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    EXPECT_EQ(rts.copies, 0);
+    EXPECT_EQ(first, 0U);
+    EXPECT_EQ(second, 0U);
+    EXPECT_EQ(slot.runtime_upload_bytes, slot.runtime_bytes + sizeof(first) + sizeof(second));
+    KernelArgsHelper moved(std::move(helper));
+    helper.release_run_view();
+    rts.defer = true;
+    ASSERT_EQ(moved.publish_runtime_args(false, &rts, rts.sink), 0);
+    moved.release_run_view();
+    ASSERT_EQ(rts.queued.size(), 3U);
+    EXPECT_EQ(first, 0U);
+    EXPECT_EQ(second, 0U);
+    EXPECT_EQ(rts.queued[0].target, &first);
+    EXPECT_EQ(rts.queued[1].target, &second);
+    EXPECT_EQ(rts.queued[2].target, slot.runtime_args);
+    auto *pinned = static_cast<std::byte *>(slot.runtime_upload_source);
+    ASSERT_EQ(rts.queued[0].source, pinned + slot.runtime_bytes);
+    ASSERT_EQ(rts.queued[1].source, pinned + slot.runtime_bytes + sizeof(first));
+    ASSERT_EQ(rts.queued[2].source, pinned);
+    ASSERT_EQ(rts.host_frees, 0);
+    for (const auto &copy : rts.queued) {
+        EXPECT_EQ(copy.stream, &rts);
+        std::memcpy(copy.target, copy.source, copy.bytes);
+    }
+    EXPECT_EQ(first, 17U);
+    EXPECT_EQ(second, 29U);
+    EXPECT_EQ(published_worker_count(), 7);
+    // Replay the recorded DMA operations without another Host prepare/publication.
+    const int recorded_copies = rts.copies;
+    for (int round = 0; round < 3; ++round) {
+        first = 800 + round;
+        second = 900 + round;
+        for (const auto &copy : rts.queued)
+            std::memcpy(copy.target, copy.source, copy.bytes);
+        EXPECT_EQ(first, 17U);
+        EXPECT_EQ(second, 29U);
+        EXPECT_EQ(rts.copies, recorded_copies);
+    }
+}
+
+TEST_F(KernelArgsPublication, EveryMetadataEnqueueFailureStopsTheDescriptorAndRetainsTheSource) {
+    for (int failure = 1; failure <= 3; ++failure) {
+        SCOPED_TRACE(failure);
+        uint64_t first = 0, second = 0;
+        const uint64_t value = 37;
+        const HostMetadataRegion regions[] = {{&first, &value, sizeof(value)}, {&second, &value, sizeof(value)}};
+        ASSERT_EQ(slot.staged_launch_metadata.prepare(regions, 2), 0);
+        ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+        rts.copies = 0;
+        rts.queued.clear();
+        rts.sink = {};
+        rts.copy_rc = -81;
+        rts.fail_copy_on = failure;
+        EXPECT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), -81);
+        EXPECT_EQ(rts.copies, failure);
+        EXPECT_EQ(rts.queued.size(), static_cast<size_t>(failure));
+        EXPECT_TRUE(rts.sink.submitted());
+        EXPECT_FALSE(helper.launchable());
+        EXPECT_FALSE(helper.runtime_args_published()) << "scheduler DFX cannot read an unpublished batch";
+        EXPECT_EQ(helper.launch_payload(), nullptr);
+        EXPECT_EQ(first, failure > 1 ? value : 0U);
+        EXPECT_EQ(second, failure > 2 ? value : 0U);
+        EXPECT_EQ(published_worker_count(), static_cast<int>(0xa5a5a5a5U));
+        EXPECT_EQ(rts.host_frees, 0);
+        EXPECT_NE(slot.runtime_upload_source, nullptr);
+        EXPECT_NE(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+        EXPECT_EQ(rts.copies, failure);
+    }
+    rts.copy_rc = 0;
+    // A fresh legacy run has no metadata. It cannot replay the failed batch.
+    rts.queued.clear();
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+    ASSERT_EQ(rts.queued.size(), 1U);
+    EXPECT_EQ(rts.queued.front().target, slot.runtime_args);
+}
+
+TEST_F(KernelArgsPublication, MetadataSourceGrowthFailuresAreRetryableWithoutDeviceSubmission) {
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+    Runtime *destination = slot.runtime_args;
+    void *old_source = slot.runtime_upload_source;
+    uint64_t value = 73, target = 0;
+    const HostMetadataRegion region{&target, &value, sizeof(value)};
+    ASSERT_EQ(slot.staged_launch_metadata.prepare(&region, 1), 0);
+    rts.queued.clear();
+    rts.sink = {};
+    rts.host_free_rc = -71;
+    EXPECT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), -71);
+    EXPECT_EQ(slot.runtime_upload_source, old_source);
+    EXPECT_FALSE(helper.launchable());
+    EXPECT_FALSE(rts.sink.submitted());
+    rts.host_free_rc = 0;
+    rts.host_alloc_rc = -72;
+    EXPECT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), -72);
+    EXPECT_EQ(slot.runtime_upload_source, nullptr);
+    EXPECT_EQ(slot.runtime_upload_bytes, 0U);
+    EXPECT_EQ(slot.runtime_args, destination);
+    EXPECT_TRUE(rts.queued.empty());
+    rts.host_alloc_rc = 0;
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+    EXPECT_EQ(target, value);
+    EXPECT_EQ(slot.runtime_args, destination);
+    EXPECT_EQ(rts.queued.size(), 2U);
+}
+
+TEST_F(KernelArgsPublication, WholeMetadataBatchIsValidatedBeforeAnySourceIsRead) {
+    uint64_t target = 0;
+    const HostMetadataRegion regions[] = {
+        {&target, reinterpret_cast<void *>(1), sizeof(target)}, {nullptr, &target, sizeof(target)}
+    };
+    EXPECT_EQ(slot.staged_launch_metadata.prepare(regions, 2), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    const HostMetadataRegion overflowing[] = {{&target, reinterpret_cast<void *>(1), SIZE_MAX}, {&target, &target, 1}};
+    EXPECT_EQ(slot.staged_launch_metadata.prepare(overflowing, 2), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    const uint64_t value = 47;
+    const HostMetadataRegion valid{&target, &value, sizeof(value)};
+    ASSERT_EQ(slot.staged_launch_metadata.prepare(&valid, 1), 0);
+    EXPECT_EQ(slot.staged_launch_metadata.prepare(regions, 2), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+    EXPECT_EQ(target, value);
+}
+
+TEST_F(KernelArgsPublication, EmptyStagingClearsAnAbandonedUnpublishedBatch) {
+    uint64_t target = 0, value = 53;
+    const HostMetadataRegion region{&target, &value, sizeof(value)};
+    ASSERT_EQ(slot.staged_launch_metadata.prepare(&region, 1), 0);
+    ASSERT_EQ(slot.staged_launch_metadata.prepare(nullptr, 0), 0);
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+    EXPECT_EQ(target, 0U);
+    ASSERT_EQ(rts.queued.size(), 1U);
+    EXPECT_EQ(rts.queued.front().target, slot.runtime_args);
+}
+
+TEST_F(KernelArgsPublication, AppendedResetPreservesEarlierMetadataAndOwnsItsSnapshot) {
+    uint64_t target = 0, reset_target = 0;
+    const uint64_t value = 67;
+    const HostMetadataRegion first{&target, &value, sizeof(value)};
+    ASSERT_EQ(slot.staged_launch_metadata.prepare(&first, 1), 0);
+    {
+        uint64_t reset = 91;
+        ASSERT_EQ(slot.staged_launch_metadata.append({&reset_target, &reset, sizeof(reset)}), 0);
+        reset = 0;
+    }
+    // A rejected addition cannot consume or replace the previously staged batch.
+    EXPECT_EQ(slot.staged_launch_metadata.append({nullptr, &value, 8}), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(
+        slot.staged_launch_metadata.append({&target, reinterpret_cast<void *>(1), SIZE_MAX}),
+        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+    EXPECT_EQ(target, value);
+    EXPECT_EQ(reset_target, 91U);
+    ASSERT_EQ(rts.queued.size(), 3U);
+    EXPECT_EQ(rts.queued[0].target, &target);
+    EXPECT_EQ(rts.queued[1].target, &reset_target);
+    EXPECT_EQ(rts.queued[2].target, slot.runtime_args);
 }

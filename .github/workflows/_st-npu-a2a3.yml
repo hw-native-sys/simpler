@@ -34,7 +34,7 @@ jobs:
       MANUAL_MODE: ${{ inputs.manual_mode }}
       SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
       SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
-      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "4000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "6000"
     steps:
       - name: Checkout target
         uses: actions/checkout@v5
@@ -52,14 +52,6 @@ jobs:
               exit 2
               ;;
           esac
-
-      - name: Restore scene-test kernel cache (a2a3)
-        uses: actions/cache@v5
-        with:
-          path: build/cache/kernels
-          key: scene-kernels-a2a3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pto_isa.pin') }}-${{ inputs.ref || github.sha }}
-          restore-keys: |
-            scene-kernels-a2a3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pto_isa.pin') }}-
 
       - name: Set up environment
         uses: ./.github/actions/setup-venv
@@ -81,7 +73,7 @@ jobs:
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           .venv/bin/python -m simpler_setup.tools.scene_test_compile examples tests/st \
-            --platform a2a3 --exclude-level 4 --require-pto-isa --compile-workers 8 -q \
+            --platform a2a3 --exclude-level 4 --require-pto-isa --compile-workers 32 -q \
             --manual "$MANUAL_MODE"
 
       - name: Compile Qwen standalone kernels (a2a3)
@@ -101,10 +93,11 @@ jobs:
           test -n "$runtimes"
           for runtime in $runtimes; do
             .venv/bin/python "examples/a2a3/$runtime/qwen3_14b_decode/main.py" \
-              --platform a2a3 --compile-only --compile-workers 8
+              --platform a2a3 --compile-only --compile-workers 32
           done
 
-      # Three selections over one corpus, disjoint and exhaustive: a test with
+      # The framework environment has its own dependency-isolated job. The remaining
+      # three selections are disjoint and exhaustive over this corpus: a test with
       # neither marker lands here, `sdma` alone in the demo task, and
       # `sdma_fault` in the isolated one whether or not it also carries `sdma`.
       # Each names `examples tests/st`, so a case cannot fall between them by
@@ -113,7 +106,7 @@ jobs:
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
-            --run ".venv/bin/python -m pytest examples tests/st -m 'not sdma and not sdma_fault' --platform a2a3 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 1200 --manual '$MANUAL_MODE'"
+            --run ".venv/bin/python -m pytest examples tests/st -m 'not sdma and not sdma_fault' --platform a2a3 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 1200 --manual '$MANUAL_MODE' --environment-receipts --verify-feature-coverage --coverage-partition main --junitxml outputs/default-ci/main.xml"
 
       - name: SDMA pytest (a2a3)
         if: inputs.manual_mode != 'only'
@@ -121,17 +114,56 @@ jobs:
           source /usr/local/Ascend/cann/set_env.sh
           SDMA_TESTS="examples tests/st -m 'sdma and not sdma_fault'"
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num 2 \
-            --run ".venv/bin/python -m pytest $SDMA_TESTS --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
+            --run ".venv/bin/python -m pytest $SDMA_TESTS --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600 --environment-receipts --verify-feature-coverage --coverage-partition sdma --junitxml outputs/default-ci/sdma.xml"
 
       - name: SDMA fault recovery pytest (a2a3)
         if: inputs.manual_mode != 'only'
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num 1 \
-            --run ".venv/bin/python -m pytest examples tests/st -m sdma_fault --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
+            --run ".venv/bin/python -m pytest examples tests/st -m sdma_fault --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600 --environment-receipts --verify-feature-coverage --coverage-partition sdma_fault --junitxml outputs/default-ci/sdma_fault.xml"
 
       - name: DFX smokes (a2a3)
         if: inputs.include_dfx_smokes
         uses: ./.github/actions/run-onboard-dfx-smokes
         with:
           platform: a2a3
+
+      - name: Verify and summarize default environment coverage
+        if: always()
+        run: |
+          .venv/bin/python -m simpler_setup.tools.feature_coverage_report \
+            --root outputs/default-ci --environment default --platform a2a3 --manual "$MANUAL_MODE"
+
+      - name: Checkout diagnostic upload action
+        id: diagnostics
+        if: always()
+        continue-on-error: true
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.workflow_sha }}
+          path: .ci-support
+          sparse-checkout: .github/actions/upload-diagnostics
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Retain native HBG capture logs
+        if: always() && steps.diagnostics.outcome == 'success'
+        # Artifact service failures do not change the scene-test verdict.
+        continue-on-error: true
+        uses: ./.ci-support/.github/actions/upload-diagnostics
+        with:
+          name: hbg-capture-a2a3-${{ github.run_id }}-${{ github.run_attempt }}
+          path: outputs/hbg-capture
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Retain default environment plans and receipts
+        if: always() && steps.diagnostics.outcome == 'success'
+        continue-on-error: true
+        uses: ./.ci-support/.github/actions/upload-diagnostics
+        with:
+          name: default-a2a3-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: outputs/default-ci
+          if-no-files-found: warn

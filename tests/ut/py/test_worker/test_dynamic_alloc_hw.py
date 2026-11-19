@@ -66,7 +66,7 @@ def test_two_rank_allocate_release_round_trip(st_platform, st_device_ids):
             window_size=4 * 1024 * 1024,
             buffers=[
                 CommBufferSpec(name="scratch", dtype="float32", count=16, nbytes=64),
-                CommBufferSpec(name="signal", dtype="uint32", count=4, nbytes=16),
+                CommBufferSpec(name="signal", dtype="uint32", count=4, nbytes=64),
             ],
         ) as tp:
             captured["workers"] = tuple(tp.workers)

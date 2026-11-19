@@ -5,9 +5,9 @@ End-to-end measurement of the **two AICore → AICPU notification paths**:
 - `GM + dcci` (Normal cacheable, coherency-routed) — AICore writes a
   field in GM and flushes its L1 with `dcci`; AICPU's coherent L1 fetches
   the new line.
-- `COND register` (Device-nGnRE MMIO) — AICore writes via `set_cond`
-  SPR instruction; AICPU reads via MMIO LDR at
-  `aic_ctrl_reg_base + core_stride * core_idx + COND_OFFSET`.
+- `COND register` (MMIO) — AICore writes via `set_cond` SPR instruction;
+  AICPU reads the register at its mapped per-core base plus the chip's
+  COND offset.
 
 The tool reproduces Phase 13 (idle-state LDR rate) and Phase 14
 (end-to-end "write → AICPU first sees" latency) from
@@ -35,7 +35,7 @@ add another mode to `producer.cce`, add another subtest to
 ```text
 host launch.cpp                 |  AICPU consumer.cpp (block_dim=1)          |  AICore producer.cce (block_dim=1)
 --------------------------------|--------------------------------------------|-----------------------------------
-halMemCtl(REG_AIC_CTRL) -> base |                                            |
+map AICore register bases       |                                            |
 aclrtMalloc handshake, result   |                                            |
 register producer.o             |                                            |
 bootstrap consumer.so (Path A)  |                                            |
@@ -145,6 +145,10 @@ Arguments:
   says which happened.
 - `n_samples` — per E2E subtest (default 100).
 
+For a5, build the producer with `-DCCE_AICORE_ARCH=dav-c310-cube`, use
+the a5 dispatcher SO, and export `SIMPLER_SMOKE_ARCH=a5`. The suite runner
+sets the architecture variable.
+
 ## Expected output (a3, ~50 MHz sys counter)
 
 Measured on CANN 9.0.0, driver 26.0.rc1, one locked a2a3 die:
@@ -208,10 +212,11 @@ the [investigation doc](../../../docs/investigations/2026-06-cond-vs-gm-notifica
   The current `NotifPerfHandshake` design assumes one producer; extend
   to an array of handshakes (one per block) and a multi-core consumer
   loop to scale.
-- **a2a3 register offsets** — `kNotifPerfRegSprCondOffset = 0x4C8`
-  matches `src/a2a3/platform/include/common/platform_config.h`. The
-  a5 chip uses `0x5108`; flip the constant in `shared/handshake.h`
-  (and the CCE arch flag) for a5.
+- **Register mapping** — a2a3 uses one AIC_CTRL window; a5 uses
+  `halResMap` for each core. The host passes the mapped bases and the
+  architecture's COND offset to the AICPU consumer. A5 table slots follow
+  hardware core IDs (AIC 0–17 and 54–71), and HAL calls translate ACL
+  logical device IDs when `ASCEND_RT_VISIBLE_DEVICES` is set.
 - **Throttle** — `NotifPerfHandshake.throttle_iter` (default 50 ≈ 1 µs
   spin) prevents the producer from racing ahead so far that the
   consumer's polling loop drops events. Tune up for a slower consumer,

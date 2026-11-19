@@ -49,7 +49,7 @@
 // OUT_OF_ORDER_FULL_BARRIER - no-op on real hardware (dcci handles full cache coherency)
 #define OUT_OF_ORDER_FULL_BARRIER() ((void)0)
 
-// EXITED acknowledges quiescence; only the AICPU's post-close gate permits return.
+// AICPU owns the release line; AICore only observes it.
 __aicore__ inline void wait_for_post_close_release(__gm__ uint32_t *release) {
     while (static_cast<uint32_t>(ld_dev(release, 0)) != AICORE_POST_CLOSE_RELEASE) {
         SPIN_WAIT_HINT();
@@ -144,5 +144,21 @@ __aicore__ inline uint64_t platform_ssbuf_hardware_base_address() { return 0; }
  * @return Hardware counter value (ticks)
  */
 __aicore__ __attribute__((always_inline)) inline uint64_t get_sys_cnt_aicore() { return get_sys_cnt(); }
+
+// The caller has observed this run's EXIT after the gate reset. The
+// unique retirement owner publishes one request, possibly after that EXIT.
+// Echo it after quiescence; no subsequent instruction writes an SPR.
+__aicore__ inline void acknowledge_aicore_cond_nonce_and_wait(__gm__ AicoreTeardownControl *control) {
+    dsb(DSB_DDR);
+    while (true) {
+        const uint32_t request = static_cast<uint32_t>(ld_dev(&control->exit_request, 0));
+        if (request == AICORE_EXIT_NONCE_0 || request == AICORE_EXIT_NONCE_1) {
+            set_cond(request);
+            break;
+        }
+        SPIN_WAIT_HINT();
+    }
+    wait_for_post_close_release(&control->post_close_release);
+}
 
 #endif  // PLATFORM_A5_AICORE_INNER_KERNEL_H_

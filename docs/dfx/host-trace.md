@@ -51,6 +51,26 @@ complete trace must survive process exit. The AICPU-launch marker is a TIMING Ho
 before the launch API call (`dur=0`, `depth=2`), not a Device-start or
 launch-completion timestamp.
 
+For automatic L3 swimlane conversion, SceneTest selects each Rank's paired
+invocation and the parent dispatch spans from these complete logs. It writes
+Rank-local `host_trace_<pid>_<inv>_<publication>.log` files and a shared
+`host_trace_<output-stem>_<publication>.log`
+beside the merged trace, then records relative paths in each
+`dispatch_identity.json`. Only selected `[STRACE]` records enter these derived
+files; ordinary messages remain in the session logs. The derived files allow
+the capture directory to be reopened after the transient session logs are removed.
+Each publication writes new files before updating the identities, so a failed
+retry leaves the previously linked logs intact. All Ranks in a publication
+record the same `host_trace_publication_id`; offline conversion refuses mixed
+publications, while older captures without this field remain readable. If the
+merged JSON cannot be written, the identities revert to their previous links.
+Manual `--host-log` conversion reads the specified logs without publishing
+derived paths. If the parent dispatch span is unavailable, the converter still
+merges Rank timelines, saves the available Rank Host records, and marks
+`metadata.parent_dispatch_status=missing`. The same Rank-only result is used
+when matching parent spans come from multiple PIDs and cannot be attributed
+without guessing.
+
 **The destination belongs to the logger, not to a record.** Everything that logger
 writes follows it: `LOG_*` records, `[STRACE]` spans, the `host-orch phase=`
 cost-share summaries, and the spans Python emits through
@@ -133,6 +153,11 @@ One line per span, emitted on scope exit
 | `ts` `dur` | start + duration in ns. Maps 1:1 onto a Chrome-trace `"X"` event. For host spans `ts` is `CLOCK_MONOTONIC` (`steady_clock`), same-host cross-process comparable. For `clk=dev` device spans (see below) `ts` is instead a **device-clock** start offset on a per-invocation origin — comparable to the other device spans (so the orch∪sched window is recoverable), not the host clock, and **not comparable between invocations**; for that, see [Comparing device spans across runs](#comparing-device-spans-across-runs). |
 | `k=v ...` | optional per-span attributes (e.g. `ntensor=4`); a parser that doesn't recognize one ignores it. |
 
+`chip.run.runner_run.device_boundaries` is a Host-clock point carrying device
+counter readings in its attributes. New logs tag it `clk=host`; the parser also
+recognizes old logs that tagged this point `clk=dev` so its absolute Host `ts`
+does not stretch a merged timeline.
+
 Span names and attributes percent-encode control bytes and record delimiters.
 They are length-capped (with `~` marking truncation) so each marker remains a
 single atomic pipe write even when forked workers share captured stderr.
@@ -145,7 +170,7 @@ output sees the original text; a consumer reading the raw log does not.
 chip.run                                      (= host_wall)
 ├─ chip.run.bind
 │  ├─ chip.run.bind.args        (ntensor=N: per-tensor retained-buffer slice + H2D)
-│  ├─ chip.run.bind.prebuilt    (TMR: prebuilt runtime-arena cache hit or build + upload)
+│  ├─ chip.run.bind.prebuilt    (TMR: prebuilt runtime-arena lookup/build + host image snapshot)
 │  └─ .{arena_build,static_arena,gm_heap,shared_mem,runtime_init,host_orch,
 │       graph_pack,arena_h2d,host_view_close}
 │           HBG host prepare-path segments, with SIMPLER_HBG_BIND_BREAKDOWN_ENABLE=1
@@ -184,6 +209,21 @@ back after stream-sync, converts cycles → ns, and emits the marker. `orch`/
 device-log lines. A phase that was never stamped
 (0 ns) is skipped — e.g. `so_load` is ~0 on a cached-callable run. See
 [device-phases.md](device-phases.md) for the device-side mechanism.
+
+The A5 HBG and percounter runtimes also emit `chip.run.runner_run.aicore_wall`, shown
+as `AICore` by `strace_timing --rounds-table`, independently of L1 collection.
+Each core records its first actual business-kernel begin and its latest
+business-kernel end, after the output store barrier. The chip window is
+`max(end) - min(start)` across participating cores. It includes scheduling gaps
+and dependency waits between those endpoints, and excludes startup before the
+first kernel and retirement after the last kernel. Skipped predicates and
+tasks without a callable do not contribute endpoints.
+The endpoints are written back once per core and reduced only after all cores
+retire. Two zero endpoints identify an idle core and are excluded; an incomplete
+or reversed pair, or a wholly idle run, suppresses the metric. This fixed-size result
+uses the common device-timing readback, with no per-task records or rotation.
+Its marker has `clock_source=aicore` and a zero-relative origin: do not align
+that origin with the AICPU phases or subtract their start timestamps.
 
 ### Comparing device spans across runs
 
@@ -566,11 +606,11 @@ held per pipeline slot and published to the resident collector at launch, so a
 level-4 run can overlap without resetting its predecessor's records.
 
 Staging has three inputs and only that one is reachable from a submission. The
-other two — the runtime PipelineContract's `pipeline_depth` and the runtime's
-concurrent-prepare capability symbol — are compile-time properties: every onboard
-runtime declares depth 2 (`PTO_PIPELINE_MAX_DEPTH` is 2) and returns 1 from the
-capability impl, while the sim platform hardcodes 0, so overlap never happens
-under simulation. Because neither is configurable, being unable to stage a
+other two — the granted run-resource depth and the runtime's concurrent-prepare
+capability symbol — are not reachable from a submission either: every onboard
+runtime declares no depth limit and returns 1 from the capability impl, and an
+unconfigured Worker is granted the standing default of two, while the sim
+platform hardcodes 0 so overlap never happens under simulation. Because neither is configurable, being unable to stage a
 successor is a **failure** in the scene test rather than a skip — a skip would
 report green for the one state in which the property cannot hold. The platform
 gate runs first, so the sim path never reaches that assert.

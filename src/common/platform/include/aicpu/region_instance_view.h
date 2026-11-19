@@ -76,13 +76,15 @@ struct CounterLocalOps {
     bool load_i32(uint64_t addr, int32_t &out) const {
         volatile int32_t *ptr = reinterpret_cast<volatile int32_t *>(static_cast<uintptr_t>(addr));
         cache_invalidate_range(reinterpret_cast<const void *>(static_cast<uintptr_t>(addr)), sizeof(int32_t));
-        out = *ptr;
+        // A matched notification permits the caller to read the producer's payload.
+        out = __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
         return true;
     }
 
     bool store_i32(uint64_t addr, int32_t value) const {
         volatile int32_t *ptr = reinterpret_cast<volatile int32_t *>(static_cast<uintptr_t>(addr));
-        *ptr = value;
+        // Publish preceding payload writes before the notification.
+        __atomic_store_n(ptr, value, __ATOMIC_RELEASE);
         cache_flush_range(reinterpret_cast<const void *>(static_cast<uintptr_t>(addr)), sizeof(int32_t));
         return true;
     }

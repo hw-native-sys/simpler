@@ -12,12 +12,14 @@
  * Where one run's entry arguments reach the AICPU, and the vocabulary both ends
  * of that choice speak.
  *
- * Two routes exist. The descriptor route publishes the values inside the run's
+ * The descriptor route publishes the values inside the run's
  * `Runtime` descriptor, which the host copies with one `rtMemcpy`. The launch
  * route appends them to the AICPU launch arguments, which RTS copies as part of
  * the launch it is already making. The same `EntryArgsSource` value is written
  * into both the descriptor and the launch header, so the device can reject a
  * pair that does not agree rather than decode whichever it happens to read.
+ * Borrowed TMR eager calls use a framed kernel invocation on the launch route;
+ * its registered occupancy and run binding are checked before consumption.
  *
  * Shared by the host that selects the route, the platform AICPU entry that
  * forwards the launch header, and the runtime that decodes it.
@@ -28,10 +30,17 @@
 #include <cstddef>
 #include <cstdint>
 
-/** Which of the two routes carries this run's entry-argument values. */
+enum class EntryCacheMaintenance : uint32_t { Full = 0, FullFreshen = 1, Live = 2 };
+
+inline constexpr bool valid_entry_cache_maintenance(uint32_t policy) {
+    return policy <= static_cast<uint32_t>(EntryCacheMaintenance::Live);
+}
+
+/** The carrier and format of this run's entry-argument values. */
 enum class EntryArgsSource : uint32_t {
-    Descriptor = 0,      // inside the published Runtime descriptor
-    LaunchEnvelope = 1,  // appended to the AICPU launch arguments, copied by RTS
+    Descriptor = 0,        // inside the published Runtime descriptor
+    LaunchEnvelope = 1,    // appended to the AICPU launch arguments, copied by RTS
+    KernelInvocation = 2,  // validated kernel packet in the RTS launch package
 };
 
 /**

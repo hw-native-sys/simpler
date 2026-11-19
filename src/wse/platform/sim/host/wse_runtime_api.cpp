@@ -1,0 +1,1666 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+// WSE implementation of the unchanged Host runtime C ABI.
+// DeviceRunner creation and ACL stubs live in runtime_c_api.cpp.
+
+#include "host/host_dependency_capture_scope.h"
+#include <optional>
+#include "runtime_c_api.h"
+
+#include "callable.h"
+#include "callable_protocol.h"
+#include "call_config.h"
+#include "wse_host_runner.h"
+#include "host/dep_gen_collector.h"  // make_deps_json_path
+#include "host/kernel_entry_validation.h"
+#include "host/kernel_pipeline_contract.h"
+#include "worker/pipeline_contract.h"
+#include "prepare_callable_common.h"
+#include "task_args.h"
+#include "wse_native_run_context.h"
+
+#include <dlfcn.h>
+
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <new>
+#include <utility>
+#include <type_traits>
+#include <vector>
+
+#include "common/device_phase.h"
+#include "common/module_thread_value.h"
+#include "common/strace.h"
+#include "host/host_clock_alignment_log.h"
+#include "common/unified_log.h"
+#include "cpu_sim_context.h"
+#include "host/raii_scope_guard.h"
+#include "runtime.h"
+
+using SimNativeRunContext = wse::NativeRunContext<WseHostRunner>;
+using wse::destroy_native_run_context;
+// Phase entry points validate raw caller storage before beginning object
+// lifetime, so the on-storage magic must remain the leading bytes.
+static_assert(__builtin_offsetof(SimNativeRunContext, magic) == 0, "native-run magic must lead runtime storage");
+
+// Forward-declared rather than including the host_build_graph header, whose
+// types belong to that runtime .so. Each platform .so carries weak `false` /
+// `-1` fallbacks for the runtimes that capture on the device instead — see each
+// arch's device_runner.cpp.
+// Runtimes without host graph capture own no capture session.
+extern "C" __attribute__((weak, visibility("hidden"))) void *dep_gen_host_graph_create_capture_session() {
+    return nullptr;
+}
+extern "C" __attribute__((weak, visibility("hidden"))) void
+dep_gen_host_graph_destroy_capture_session(void *) noexcept {}
+
+extern "C" bool dep_gen_host_graph_active();
+extern "C" int dep_gen_host_graph_emit(const char *deps_json_path);
+
+/**
+ * Write a host-orchestrated run's dependency graph, at the point its capture
+ * window closes.
+ *
+ * The graph is complete when bind returns — host_build_graph runs its
+ * orchestrator there — and it lives in state private to the thread that ran it.
+ * Writing it here keeps the write on that thread and ahead of any later capture,
+ * which is what the alternative (writing at drain) cannot promise: a drain may
+ * land on another thread, and a successor's bind resets the capture state.
+ *
+ * The destination comes from this run's own config rather than the runner's.
+ *
+ * A no-op for runtimes that capture on the device: their `dep_gen_host_graph_active`
+ * is the weak `false`, and their graph is emitted from the collector at drain.
+ *
+ * With cross-run retention on, the graph is handed to the runner's exporter
+ * here instead of being serialized here: the hand-off still happens on this
+ * thread, which is the whole reason this call site exists, but the file is
+ * written off the submit path. The synchronous branch below is unchanged.
+ */
+static void
+emit_host_dep_gen_graph(WseHostRunner *runner, const CallConfig &config, uint64_t run_epoch, const char *trace_attrs) {
+    if (config.enable_dep_gen == 0 || !dep_gen_host_graph_active()) return;
+    if (runner->host_graph_retains_runs()) {
+        // The graph moves out of this thread's capture into storage the
+        // exporter owns, and the file is published off this path. A failure is
+        // the exporter's sticky error, which `flush_diagnostics` and `close`
+        // report; this run's result is unchanged either way.
+        if (!runner->seal_host_dep_gen_graph(DfxRunConfig::from(config), run_epoch)) {
+            LOG_ERROR("dep_gen host graph was not handed to the background writer (%s)", trace_attrs);
+        }
+        return;
+    }
+    const std::string deps_path = make_deps_json_path(config.output_prefix);
+    const int emit_rc = dep_gen_host_graph_emit(deps_path.c_str());
+    if (emit_rc != 0) {
+        LOG_ERROR("dep_gen host graph emit failed (%d) — deps.json not produced (%s)", emit_rc, trace_attrs);
+    }
+}
+
+// Keep exceptions inside the runtime C ABI; each entry supplies its existing failure value.
+template <auto Method, class... Args>
+auto guarded_runner_call(
+    void *context, std::invoke_result_t<decltype(Method), WseHostRunner &, Args...> failure, Args &&...args
+) noexcept {
+    try {
+        return (static_cast<WseHostRunner *>(context)->*Method)(std::forward<Args>(args)...);
+    } catch (...) {
+        return failure;
+    }
+}
+
+extern "C" {
+
+/* ===========================================================================
+ * Runtime Implementation Functions (defined in runtime_maker.cpp)
+ * =========================================================================== */
+int register_callable_impl(const ChipCallable *callable, const HostApi *api, CallableArtifacts *out);
+/**
+ * Perform the device write a run's bind prepared.
+ *
+ * The bind computes its device execution image into staging that outlives it and
+ * records where the bytes go; this ships them. Two steps rather than one, so the
+ * write can be ordered against something — or captured and replayed — without
+ * the host graph building that produced the bytes having to run again. Consumes
+ * the record: publishing twice, or publishing a bind that recorded nothing, is an
+ * error, because a run whose image never reached the device must not launch. A
+ * runtime whose bind writes its own image where it builds it implements this as a
+ * no-op.
+ */
+int publish_run_image_impl(Runtime *runtime, const HostApi *api);
+/** @see the onboard c_api_shared.cpp declarations for the three halves' contract. */
+int copy_in_run_inputs_impl(const Runtime *runtime, const HostApi *api);
+int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched);
+int release_run_bindings_impl(Runtime *runtime, const HostApi *api);
+/**
+ * Whether this runtime has a producer that reads a task's arguments at that
+ * task's own boundaries.
+ *
+ * WSE has no legacy task-boundary argument-dump observer. The runtime
+ * declares support independently of individual run bindings.
+ */
+__attribute__((weak)) int args_dump_capture_supported_impl(void) { return 0; }
+
+/* ===========================================================================
+ * Context-bound HostApi functions passed to runtime implementations.
+ * =========================================================================== */
+
+static void *device_malloc(void *runner_ctx, size_t size) {
+    if (runner_ctx == nullptr) return nullptr;
+    return guarded_runner_call<&WseHostRunner::allocate_tensor>(runner_ctx, nullptr, size);
+}
+
+static void device_free(void *runner_ctx, void *dev_ptr) {
+    if (runner_ctx == nullptr || dev_ptr == nullptr) return;
+    try {
+        static_cast<WseHostRunner *>(runner_ctx)->free_tensor(dev_ptr);
+    } catch (...) {}
+}
+
+static int copy_to_device(void *runner_ctx, void *dev_ptr, const void *host_ptr, size_t size) {
+    if (runner_ctx == nullptr || dev_ptr == nullptr || host_ptr == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    return guarded_runner_call<&WseHostRunner::copy_to_device>(
+        runner_ctx, PTO_RUNTIME_ERR_INTERNAL, dev_ptr, host_ptr, size
+    );
+}
+
+static int copy_from_device(void *runner_ctx, void *host_ptr, const void *dev_ptr, size_t size) {
+    if (runner_ctx == nullptr || host_ptr == nullptr || dev_ptr == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    return guarded_runner_call<&WseHostRunner::copy_from_device>(
+        runner_ctx, PTO_RUNTIME_ERR_INTERNAL, host_ptr, dev_ptr, size
+    );
+}
+
+static void *register_device_memory_to_host(void *runner_ctx, void *dev_ptr, size_t bytes) {
+    if (runner_ctx == nullptr) return nullptr;
+    return guarded_runner_call<&WseHostRunner::register_device_memory_to_host>(runner_ctx, nullptr, dev_ptr, bytes);
+}
+
+static void unregister_device_memory_from_host(void *runner_ctx, void *dev_ptr) {
+    if (runner_ctx == nullptr) return;
+    try {
+        static_cast<WseHostRunner *>(runner_ctx)->unregister_device_memory_from_host(dev_ptr);
+    } catch (...) {}
+}
+
+static void *acquire_child_memory_host_view(void *runner_ctx, void *dev_ptr, size_t bytes) {
+    if (runner_ctx == nullptr) return nullptr;
+    return guarded_runner_call<&WseHostRunner::acquire_child_memory_host_view>(runner_ctx, nullptr, dev_ptr, bytes);
+}
+
+static int device_memset(void *runner_ctx, void *dev_ptr, int value, size_t size) {
+    if (runner_ctx == nullptr || dev_ptr == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    return guarded_runner_call<&WseHostRunner::device_memset>(
+        runner_ctx, PTO_RUNTIME_ERR_INTERNAL, dev_ptr, value, size
+    );
+}
+
+static void get_retained_temp_buffer(void *runner_ctx, uint32_t pipeline_slot, void **addr, size_t *size) {
+    if (runner_ctx == nullptr) {
+        if (addr != nullptr) *addr = nullptr;
+        if (size != nullptr) *size = 0;
+        return;
+    }
+    try {
+        static_cast<WseHostRunner *>(runner_ctx)->get_retained_temp_buffer(pipeline_slot, addr, size);
+    } catch (...) {
+        if (addr != nullptr) *addr = nullptr;
+        if (size != nullptr) *size = 0;
+    }
+}
+
+static void set_retained_temp_buffer(void *runner_ctx, uint32_t pipeline_slot, void *addr, size_t size) {
+    if (runner_ctx == nullptr) return;
+    try {
+        static_cast<WseHostRunner *>(runner_ctx)->set_retained_temp_buffer(pipeline_slot, addr, size);
+    } catch (...) {}
+}
+
+static int
+acquire_retained_temp(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, void **addr_out, size_t *size_out) {
+    if (runner_ctx == nullptr || addr_out == nullptr || size_out == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    // The sim backend manages no workspace, so this is the sequence
+    // RetainedTempBump used to run itself: release the old block, take a bigger
+    // one, and stop naming the old one either way.
+    try {
+        auto *runner = static_cast<WseHostRunner *>(runner_ctx);
+        runner->get_retained_temp_buffer(pipeline_slot, addr_out, size_out);
+        if (bytes == 0 || bytes <= *size_out) return 0;
+        if (*addr_out != nullptr) runner->free_tensor(*addr_out);
+        void *grown = runner->allocate_tensor(bytes);
+        runner->set_retained_temp_buffer(pipeline_slot, grown, grown == nullptr ? 0 : bytes);
+        if (grown == nullptr) {
+            *addr_out = nullptr;
+            *size_out = 0;
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        *addr_out = grown;
+        *size_out = bytes;
+        return 0;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+static int acquire_scheduler_state_storage(
+    void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
+) {
+    if (runner_ctx == nullptr) return -1;
+    return guarded_runner_call<&WseHostRunner::acquire_scheduler_state_storage>(
+        runner_ctx, -1, pipeline_slot, bytes, alignment, device_out, host_out
+    );
+}
+
+static void record_scheduler_runtime_mode(void *runner_ctx, uint32_t pipeline_slot, uint32_t mode) {
+    (void)pipeline_slot;
+    if (runner_ctx == nullptr) return;
+    try {
+        static_cast<WseHostRunner *>(runner_ctx)->record_scheduler_runtime_mode(mode);
+    } catch (...) {}
+}
+
+static int
+acquire_graph_staging(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **staging_out) {
+    if (runner_ctx == nullptr) return -1;
+    return guarded_runner_call<&WseHostRunner::acquire_graph_staging>(
+        runner_ctx, -1, pipeline_slot, bytes, alignment, staging_out
+    );
+}
+
+static int publish_graph_section(
+    void *runner_ctx, uint32_t pipeline_slot, const void *bytes, size_t length, uint32_t *source_out, uint64_t *base_out
+) {
+    if (runner_ctx == nullptr) return -1;
+    return guarded_runner_call<&WseHostRunner::publish_graph_section>(
+        runner_ctx, -1, pipeline_slot, bytes, length, source_out, base_out
+    );
+}
+
+static void get_graph_definition_staging(void *runner_ctx, uint32_t pipeline_slot, void **addr, size_t *size) {
+    if (addr != nullptr) *addr = nullptr;
+    if (size != nullptr) *size = 0;
+    if (runner_ctx == nullptr) return;
+    try {
+        static_cast<WseHostRunner *>(runner_ctx)->get_graph_definition_staging(pipeline_slot, addr, size);
+    } catch (...) {}
+}
+
+static std::shared_ptr<void> get_orchestration_scratch(void *runner_ctx, uint32_t slot) {
+    return runner_ctx == nullptr ? std::shared_ptr<void>{} :
+                                   static_cast<WseHostRunner *>(runner_ctx)->get_orchestration_scratch(slot);
+}
+static void set_orchestration_scratch(void *runner_ctx, uint32_t slot, std::shared_ptr<void> scratch) {
+    if (runner_ctx != nullptr)
+        static_cast<WseHostRunner *>(runner_ctx)->set_orchestration_scratch(slot, std::move(scratch));
+}
+
+static int
+acquire_sm_mirror(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out) {
+    if (addr_out != nullptr) *addr_out = nullptr;
+    if (runner_ctx == nullptr) return -1;
+    return guarded_runner_call<&WseHostRunner::acquire_sm_mirror>(
+        runner_ctx, -1, pipeline_slot, bytes, alignment, addr_out
+    );
+}
+
+static int
+acquire_run_image_staging(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out) {
+    if (addr_out != nullptr) *addr_out = nullptr;
+    if (runner_ctx == nullptr) return -1;
+    return guarded_runner_call<&WseHostRunner::acquire_run_image_staging>(
+        runner_ctx, -1, pipeline_slot, bytes, alignment, addr_out
+    );
+}
+
+static uint64_t upload_chip_callable_buffer_wrapper(void *runner_ctx, const void *callable) {
+    if (runner_ctx == nullptr) return 0;
+    return guarded_runner_call<&WseHostRunner::upload_chip_callable_buffer>(
+        runner_ctx, 0, static_cast<const ChipCallable *>(callable)
+    );
+}
+
+static const void *
+get_run_result_wrapper(void *runner_ctx, uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out) {
+    if (runner_ctx == nullptr) {
+        if (bytes_out != nullptr) *bytes_out = 0;
+        return nullptr;
+    }
+    try {
+        return static_cast<WseHostRunner *>(runner_ctx)->device_run_result(pipeline_slot, run_epoch, bytes_out);
+    } catch (...) {
+        if (bytes_out != nullptr) *bytes_out = 0;
+        return nullptr;
+    }
+}
+
+static uint32_t get_chip_swimlane_level(void *runner_ctx) {
+    if (runner_ctx == nullptr) return 0;
+    return static_cast<WseHostRunner *>(runner_ctx)->chip_swimlane_level();
+}
+
+static int get_pmu_enabled(void *runner_ctx) {
+    if (runner_ctx == nullptr) return 0;
+    return static_cast<WseHostRunner *>(runner_ctx)->pmu_enabled() ? 1 : 0;
+}
+
+static bool publish_chip_swimlane_extension(
+    void *runner_ctx, uint64_t run_epoch, ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
+) {
+    return runner_ctx != nullptr && static_cast<WseHostRunner *>(runner_ctx)
+                                        ->publish_chip_swimlane_extension(run_epoch, section, json_value, json_size);
+}
+
+static void *host_phase_pool_arm(void *runner_ctx, uint32_t pipeline_slot, int producer_wants_records) {
+    if (runner_ctx == nullptr) return nullptr;
+    return static_cast<WseHostRunner *>(runner_ctx)->host_phase_pool_arm(pipeline_slot, producer_wants_records != 0);
+}
+
+static void
+host_phase_pool_finish(void *runner_ctx, uint32_t pipeline_slot, uint64_t submitted_tasks, uint64_t invocation_id) {
+    if (runner_ctx == nullptr) return;
+    static_cast<WseHostRunner *>(runner_ctx)->host_phase_pool_finish(pipeline_slot, submitted_tasks, invocation_id);
+}
+
+static int setup_static_arena_wrapper(
+    void *runner_ctx, uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
+) {
+    if (runner_ctx == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    return guarded_runner_call<&WseHostRunner::setup_static_arena>(
+        runner_ctx, PTO_RUNTIME_ERR_INTERNAL, arena_bank, gm_heap_size, gm_sm_size, runtime_arena_size
+    );
+}
+
+static void *acquire_pooled_gm_heap_wrapper(void *runner_ctx, uint32_t arena_bank) {
+    if (runner_ctx == nullptr) return nullptr;
+    return guarded_runner_call<&WseHostRunner::acquire_pooled_gm_heap>(runner_ctx, nullptr, arena_bank);
+}
+
+static void *acquire_pooled_gm_sm_wrapper(void *runner_ctx, uint32_t arena_bank) {
+    if (runner_ctx == nullptr) return nullptr;
+    return guarded_runner_call<&WseHostRunner::acquire_pooled_gm_sm>(runner_ctx, nullptr, arena_bank);
+}
+
+static void *acquire_pooled_runtime_arena_wrapper(void *runner_ctx, uint32_t arena_bank) {
+    if (runner_ctx == nullptr) return nullptr;
+    return guarded_runner_call<&WseHostRunner::acquire_pooled_runtime_arena>(runner_ctx, nullptr, arena_bank);
+}
+
+// HBG materializes each run; the TMR prebuilt-image cache is not used by WSE.
+static bool lookup_prebuilt_runtime_arena_cache_wrapper(
+    void *, uint32_t, uint64_t, const void *, size_t, void **, void **, void **, size_t *, const void **, size_t *
+) {
+    return false;
+}
+
+static void mark_prebuilt_runtime_arena_cached_wrapper(
+    void *, uint32_t, uint64_t, const void *, size_t, void *, void *, void *, size_t, const void *, size_t
+) {}
+
+// One immutable function table is shared by all runners. Each HostApi value
+// binds it to a specific runner and immutable per-run slot/bank selection.
+
+// WSE HBG sizes arenas during bind, so prewarm is a no-op.
+extern "C" int prewarm_config_impl(
+    const HostApi *api, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
+);
+
+static int
+declare_caller_device_writes(void *runner_ctx, uint64_t run_id, const CallerBufferSpan *spans, uint32_t count) {
+    if (runner_ctx == nullptr || (count != 0 && spans == nullptr)) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    try {
+        std::vector<CallerDeviceBuffers::Span> written(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            written[i] = CallerDeviceBuffers::Span{spans[i].addr, spans[i].bytes};
+        }
+        std::size_t unresolved = 0;
+        if (!static_cast<WseHostRunner *>(runner_ctx)
+                 ->declare_caller_buffer_writes(run_id, written.data(), written.size(), &unresolved)) {
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        if (unresolved != 0) {
+            // Recorded, but not for every span the run named: an address this context cannot
+            // resolve to a caller mint is an unknown owner, not an absent producer. The fence is
+            // exactly as wide as what was recorded, so those bytes read as having no declared
+            // producer — which is why this is said out loud rather than skipped silently.
+            LOG_WARN(
+                "declare_caller_device_writes: %zu of %u produced span(s) name no caller allocation of this "
+                "device context; their bytes carry no readable-yet fence for a concurrently preparing run",
+                unresolved, count
+            );
+        }
+        return 0;
+    } catch (...) {
+        // Reported, never swallowed: a statement that was not recorded reads to every other run as
+        // a buffer with no producer, so proceeding would serve bytes this run has not written.
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+static int caller_device_span_written_by_other_run(void *runner_ctx, uint64_t run_id, uint64_t addr, uint64_t bytes) {
+    if (runner_ctx == nullptr) return 0;
+    try {
+        return static_cast<WseHostRunner *>(runner_ctx)->caller_buffer_written_by_other_run(run_id, addr, bytes) ? 1 :
+                                                                                                                   0;
+    } catch (...) {
+        // Unreadable is the safe answer to a question that could not be answered: refusing one
+        // access beats serving bytes a producer may not have written.
+        return 1;
+    }
+}
+
+static const HostApiOps g_host_api_ops = {
+    .device_malloc = device_malloc,
+    .device_free = device_free,
+    .copy_to_device = copy_to_device,
+    .copy_from_device = copy_from_device,
+    .register_device_memory_to_host = register_device_memory_to_host,
+    .unregister_device_memory_from_host = unregister_device_memory_from_host,
+    .acquire_child_memory_host_view = acquire_child_memory_host_view,
+    .device_memset = device_memset,
+    .get_retained_temp_buffer = get_retained_temp_buffer,
+    .set_retained_temp_buffer = set_retained_temp_buffer,
+    .acquire_retained_temp = acquire_retained_temp,
+    .acquire_graph_staging = acquire_graph_staging,
+    .publish_graph_section = publish_graph_section,
+    .get_graph_definition_staging = get_graph_definition_staging,
+    .acquire_scheduler_state_storage = acquire_scheduler_state_storage,
+    .record_scheduler_runtime_mode = record_scheduler_runtime_mode,
+    .acquire_sm_mirror = acquire_sm_mirror,
+    .acquire_run_image_staging = acquire_run_image_staging,
+    .setup_static_arena = setup_static_arena_wrapper,
+    .acquire_pooled_gm_heap = acquire_pooled_gm_heap_wrapper,
+    .acquire_pooled_gm_sm = acquire_pooled_gm_sm_wrapper,
+    .acquire_pooled_runtime_arena = acquire_pooled_runtime_arena_wrapper,
+    .lookup_prebuilt_runtime_arena_cache = lookup_prebuilt_runtime_arena_cache_wrapper,
+    .mark_prebuilt_runtime_arena_cached = mark_prebuilt_runtime_arena_cached_wrapper,
+    .upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper,
+    .get_chip_swimlane_level = get_chip_swimlane_level,
+    .get_pmu_enabled = get_pmu_enabled,
+    .host_phase_pool_arm = host_phase_pool_arm,
+    .host_phase_pool_finish = host_phase_pool_finish,
+    .publish_chip_swimlane_extension = publish_chip_swimlane_extension,
+    // The simulated AICPU runs in this process and shares the runtime's
+    // address space, so the region is host memory its device side writes
+    // directly rather than an allocation a transfer has to cross. The channel
+    // is still the run-owned one: a run publishes its own record before its
+    // kernel returns, and the epoch decides whose record a reader gets.
+    .get_run_result = get_run_result_wrapper,
+    .declare_caller_device_writes = declare_caller_device_writes,
+    .caller_device_span_written_by_other_run = caller_device_span_written_by_other_run,
+    .get_orchestration_scratch = get_orchestration_scratch,
+    .set_orchestration_scratch = set_orchestration_scratch,
+};
+
+/* ===========================================================================
+ * Public C API (resolved by ChipWorker via dlsym)
+ * =========================================================================== */
+
+void destroy_device_context(DeviceContextHandle ctx) {
+    WseHostRunner *runner = static_cast<WseHostRunner *>(ctx);
+    if (runner != nullptr && runner->native_runs_outstanding()) {
+        LOG_ERROR("destroy_device_context: refusing to destroy a context with an unfinalized native run");
+        return;
+    }
+    if (runner != nullptr && runner->terminal_backing_retained()) {
+        LOG_ERROR("destroy_device_context: terminal backing requires close retry; leaving context alive");
+        return;
+    }
+    delete runner;
+}
+
+size_t get_runtime_size(void) { return sizeof(SimNativeRunContext); }
+
+size_t get_runtime_alignment(void) { return alignof(SimNativeRunContext); }
+
+void *device_malloc_ctx(DeviceContextHandle ctx, size_t size) {
+    if (ctx == NULL) return NULL;
+    return guarded_runner_call<&WseHostRunner::allocate_caller_buffer>(ctx, nullptr, size);
+}
+
+void device_free_ctx(DeviceContextHandle ctx, void *dev_ptr) {
+    if (ctx == NULL || dev_ptr == NULL) return;
+    try {
+        // The same guarded release the recording mint pairs with, so this legacy entry cannot
+        // release an allocation a run may still reach, nor leave the table holding an address
+        // whose pages are gone. It returns void, so a refusal can only be logged — which is
+        // still the right outcome: not freeing is recoverable, freeing under a live borrow is
+        // not. `device_free_caller_buffer_ctx` is the entry that reports it.
+        (void)static_cast<WseHostRunner *>(ctx)->free_caller_buffer(dev_ptr);
+    } catch (...) {}
+}
+
+int device_free_caller_buffer_ctx(DeviceContextHandle ctx, void *dev_ptr) {
+    if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    if (dev_ptr == NULL) return 0;
+    return guarded_runner_call<&WseHostRunner::free_caller_buffer>(ctx, PTO_RUNTIME_ERR_INTERNAL, dev_ptr);
+}
+
+int device_borrow_caller_buffers_ctx(
+    DeviceContextHandle ctx, const CallerBufferSpan *spans, uint32_t count, uint64_t borrow_id
+) {
+    if (ctx == NULL || borrow_id == 0) return PTO_RUNTIME_ERR_INTERNAL;
+    if (count != 0 && spans == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        std::vector<CallerDeviceBuffers::Span> resolved(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            resolved[i] = CallerDeviceBuffers::Span{spans[i].addr, spans[i].bytes};
+        }
+        const bool held =
+            static_cast<WseHostRunner *>(ctx)->borrow_caller_buffers(borrow_id, resolved.data(), resolved.size());
+        return held ? 0 : PTO_RUNTIME_ERR_INVALID_STATE;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+void device_release_caller_buffers_ctx(DeviceContextHandle ctx, uint64_t borrow_id, int keep) {
+    if (ctx == NULL || borrow_id == 0) return;
+    try {
+        static_cast<WseHostRunner *>(ctx)->release_caller_buffers(borrow_id, keep != 0);
+    } catch (...) {}
+}
+
+int copy_to_device_ctx(DeviceContextHandle ctx, void *dev_ptr, const void *host_ptr, size_t size) {
+    return copy_to_device(ctx, dev_ptr, host_ptr, size);
+}
+
+int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *dev_ptr, size_t size) {
+    return copy_from_device(ctx, host_ptr, dev_ptr, size);
+}
+
+int finalize_device(DeviceContextHandle ctx) {
+    if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        WseHostRunner *runner = static_cast<WseHostRunner *>(ctx);
+        // Teardown clears the registry, so it is ordered against registration
+        // and unregistration. Initialization still relies on the caller contract.
+        std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
+        if (runner->native_runs_outstanding()) {
+            LOG_ERROR("finalize_device: native run must be finalized first");
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        runner->set_program_initialized(false);
+        // An unclaimed runner owns no simulated binding. The caller thread
+        // may still be bound to another worker's live device.
+        if (runner->device_id() < 0) return 0;
+        // Publish what is still retained before any collector storage is
+        // released. A no-op on a collector that retains no run.
+        runner->finish_retained_runs();
+        int rc = runner->finalize();
+        if (runner->terminal_backing_retained()) return rc;
+        int dev = pto_cpu_sim_get_bound_device();
+        if (dev >= 0) {
+            pto_cpu_sim_release_device(dev);
+        }
+        return rc;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+const char *simpler_get_init_error_ctx(DeviceContextHandle) {
+    // Sim does not retain a context-specific initialization diagnostic.
+    return nullptr;
+}
+
+int simpler_init(
+    DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
+    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
+    const CallConfig *prewarm_config, int enable_sdma, const void *sdma_warmup_binary, uint64_t sdma_warmup_size
+) {
+    // WSE has no AICPU dispatcher. Accept
+    // the parameters for ABI parity with the onboard implementation and ignore
+    // them — callers that pass dispatcher bytes get the same shape as onboard,
+    // and the dispatcher / preinstall load path on sim isn't taken anyway.
+    (void)dispatcher_binary;
+    (void)dispatcher_size;
+    // Simulation drives no SDMA control path, so the warmup ELF has nothing to
+    // walk.
+    (void)sdma_warmup_binary;
+    (void)sdma_warmup_size;
+
+    if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+
+    WseHostRunner *runner = static_cast<WseHostRunner *>(ctx);
+
+    // Latching the identity is the first thing this entry does, so a context
+    // that already belongs to kernel mode is refused before any process- or
+    // runner-state mutation below. Latching PROGRAM is idempotent, which is
+    // what lets an init -> finalize -> init sequence on the same device run
+    // again.
+    const int latch_rc = runner->execution_mode_latch().latch(SIMPLER_MODE_PROGRAM);
+    if (latch_rc != 0) {
+        LOG_ERROR("simpler_init: refused — this context already belongs to kernel mode");
+        return latch_rc;
+    }
+
+    runner->set_program_initialized(false);
+    runner->set_dma_workspace_request(enable_sdma != 0);
+
+    int rc;
+    try {
+        rc = runner->attach_current_thread(device_id);
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (rc != 0) return rc;
+
+    // Provisioning follows the attach because the release path depends on it:
+    // finalize() returns early on a runner that never attached, and its
+    // dma_workspace_release() sits past that guard, so a block acquired before
+    // the attach would outlive the runner.
+    try {
+        rc = runner->ensure_dma_workspace_provisioned();
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (rc != 0) return rc;
+
+    try {
+        std::vector<uint8_t> aicpu_vec;
+        std::vector<uint8_t> aicore_vec;
+        if (aicpu_binary != NULL && aicpu_size > 0) {
+            aicpu_vec.assign(aicpu_binary, aicpu_binary + aicpu_size);
+        }
+        if (aicore_binary != NULL && aicore_size > 0) {
+            aicore_vec.assign(aicore_binary, aicore_binary + aicore_size);
+        }
+        runner->set_executors(std::move(aicpu_vec), std::move(aicore_vec));
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    // No CANN dlog on sim. ChipWorker bound this module's logger to the
+    // process-owned state before calling simpler_init.
+
+    // Prebuilt runtime-arena prewarm for the fork-constant ring sizing, now that
+    // the runner is attached. trb links a strong prewarm_config_impl; other
+    // runtimes link the weak no-op. Only the ring sizing is read.
+    if (prewarm_config != NULL) {
+        try {
+            const HostApi prewarm_api(runner, 0, 0, 0, &g_host_api_ops);
+            rc = prewarm_config_impl(
+                &prewarm_api, prewarm_config->runtime_env.ring_task_window, prewarm_config->runtime_env.ring_heap,
+                prewarm_config->runtime_env.ring_dep_pool
+            );
+        } catch (...) {
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        if (rc != 0) return rc;
+    }
+    runner->set_program_initialized(true);
+    return 0;
+}
+
+/* ===========================================================================
+ * Per-callable_id preparation
+ * =========================================================================== */
+
+// The caller holds callable_registration_mutex().
+static int
+register_callable_locked(DeviceContextHandle ctx, int32_t callable_id, const void *callable, const char *entry) {
+    if (ctx == NULL || callable == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    WseHostRunner *runner = static_cast<WseHostRunner *>(ctx);
+    if (runner->native_run_active()) {
+        LOG_ERROR("%s: native run must be finalized before mutating the callable registry", entry);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (runner->has_callable(callable_id)) {
+        LOG_ERROR("%s: callable_id=%d is already registered; unregister it before reuse", entry, callable_id);
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    }
+
+    try {
+        CallableArtifacts artifacts;
+        auto chip_buffer_guard = RAIIScopeGuard([runner, &artifacts]() {
+            if (artifacts.chip_buffer_hash != 0) {
+                runner->release_chip_callable_buffer(artifacts.chip_buffer_hash);
+            }
+        });
+        const HostApi host_api(runner, 0, 0, 0, &g_host_api_ops);
+        int rc = register_callable_impl(reinterpret_cast<const ChipCallable *>(callable), &host_api, &artifacts);
+        if (rc != 0) {
+            return rc;
+        }
+        auto host_dlopen_guard = RAIIScopeGuard([&artifacts]() {
+            if (artifacts.host_dlopen_handle != nullptr) {
+                dlclose(artifacts.host_dlopen_handle);
+            }
+        });
+
+        // WSE's host_build_graph registration always owns a Host orchestration DSO.
+        if (artifacts.host_dlopen_handle == nullptr) return PTO_RUNTIME_ERR_UNSUPPORTED;
+        rc = runner->record_host_orch_callable(
+            callable_id, artifacts.chip_buffer_hash, artifacts.host_dlopen_handle, artifacts.host_orch_func_ptr,
+            std::move(artifacts.signature)
+        );
+        if (rc == 0) {
+            host_dlopen_guard.dismiss();
+            chip_buffer_guard.dismiss();
+        }
+        return rc;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int simpler_register_callable_v2(
+    DeviceContextHandle ctx, const void *callable, size_t callable_size, int32_t *out_callable_id
+) {
+    if (out_callable_id == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    *out_callable_id = -1;
+    int rc = validate_kernel_prepare_callable_args(ctx, 0, callable, callable_size);
+    if (rc != 0) return rc;
+    rc = validate_kernel_callable_image(callable, callable_size);
+    if (rc != 0) return rc;
+    auto *runner = static_cast<WseHostRunner *>(ctx);
+    try {
+        std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
+        if (runner->execution_mode_latch().is_kernel()) {
+            LOG_ERROR("simpler_register_callable_v2: kernel mode is not supported by the simulator");
+            return PTO_RUNTIME_ERR_INVALID_STATE;
+        }
+        if (runner->native_run_active()) {
+            LOG_ERROR(
+                "simpler_register_callable_v2: native run must be finalized before mutating the callable registry"
+            );
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        if (!runner->program_initialized()) {
+            LOG_ERROR("simpler_register_callable_v2: callable registration requires an initialized PROGRAM context");
+            return PTO_RUNTIME_ERR_INVALID_STATE;
+        }
+        for (int32_t id = 0; id < MAX_REGISTERED_CALLABLE_IDS; ++id) {
+            if (runner->has_callable(id)) continue;
+            rc = register_callable_locked(ctx, id, callable, "simpler_register_callable_v2");
+            if (rc == 0) *out_callable_id = id;
+            return rc;
+        }
+        LOG_ERROR(
+            "simpler_register_callable_v2: callable ID capacity exhausted (slots=%d, device=%d, mode=program)",
+            MAX_REGISTERED_CALLABLE_IDS, runner->device_id()
+        );
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable) {
+    if (ctx == NULL || callable == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    auto *runner = static_cast<WseHostRunner *>(ctx);
+    std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
+    return register_callable_locked(ctx, callable_id, callable, "simpler_register_callable");
+}
+
+// Runtime gate for device-domain phase emission. SIMPLER_DEVICE_STRACE_ENABLE=0
+// suppresses the device (clk=dev) markers so a deployment can profile host and
+// device independently; any other value (or unset) keeps them on. Host-side
+// [STRACE] spans are unaffected — they ride SIMPLER_HOST_STRACE + the log level.
+// Read once and cached (process-lifetime config knob).
+static bool device_profiling_enabled() {
+    static const bool enabled = [] {
+        const char *v = std::getenv("SIMPLER_DEVICE_STRACE_ENABLE");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
+// Emit device-domain phase markers (RunWall + its 4 AICPU subdivisions),
+// mirroring the onboard c_api. Phases never stamped (0 ns) are skipped.
+// STRACE_DEV_SPAN_AT self-compiles to nothing when profiling is off.
+static void emit_device_phase_markers(WseHostRunner *runner) {
+    if (!device_profiling_enabled()) return;
+    const uint64_t run_wall_ns = runner->last_device_phase_ns(AicpuPhase::RunWall);
+    if (run_wall_ns != 0) {
+        STRACE_DEV_SPAN_AT("chip.run.runner_run.device_wall", 0, static_cast<long long>(run_wall_ns), 2);
+    }
+    struct PhaseName {
+        AicpuPhase phase;
+        const char *name;
+    };
+    static const PhaseName kPhases[] = {
+        {AicpuPhase::Preamble, "chip.run.runner_run.device_wall.preamble"},
+        {AicpuPhase::SoLoad, "chip.run.runner_run.device_wall.so_load"},
+        {AicpuPhase::GraphBuild, "chip.run.runner_run.device_wall.graph_build"},
+        {AicpuPhase::ConfigValidate, "chip.run.runner_run.device_wall.config_validate"},
+        {AicpuPhase::ArenaWire, "chip.run.runner_run.device_wall.arena_wire"},
+        {AicpuPhase::SmReset, "chip.run.runner_run.device_wall.sm_reset"},
+        {AicpuPhase::PostOrch, "chip.run.runner_run.device_wall.post_orch"},
+        {AicpuPhase::OrchWindow, "chip.run.runner_run.device_wall.orch"},
+        {AicpuPhase::SchedWindow, "chip.run.runner_run.device_wall.sched"},
+    };
+    // RunWall is emitted above as device_wall; every other phase is in the table.
+    static_assert(
+        sizeof(kPhases) / sizeof(kPhases[0]) == NUM_AICPU_PHASES - 1,
+        "kPhases[] must list every AicpuPhase except RunWall — add the new phase here"
+    );
+    for (const auto &p : kPhases) {
+        const uint64_t ns = runner->last_device_phase_ns(p.phase);
+        if (ns != 0) {
+            STRACE_DEV_SPAN_AT(
+                p.name, static_cast<long long>(runner->last_device_phase_start_ns(p.phase)), static_cast<long long>(ns),
+                3
+            );
+        }
+    }
+
+    // Selective task-timing slots: one span per complete slot, start = dispatch
+    // and duration = finish - dispatch, both on the phase timeline so cross-slot
+    // intervals (e.g. finish(slot_1) - dispatch(slot_0)) stay recoverable.
+    // Untagged / incomplete slots read back 0/0 and are skipped.
+    static const char *const kTaskSlotNames[NUM_TASK_TIMING_SLOTS] = {
+        "chip.run.runner_run.device_wall.task_slot_0",  "chip.run.runner_run.device_wall.task_slot_1",
+        "chip.run.runner_run.device_wall.task_slot_2",  "chip.run.runner_run.device_wall.task_slot_3",
+        "chip.run.runner_run.device_wall.task_slot_4",  "chip.run.runner_run.device_wall.task_slot_5",
+        "chip.run.runner_run.device_wall.task_slot_6",  "chip.run.runner_run.device_wall.task_slot_7",
+        "chip.run.runner_run.device_wall.task_slot_8",  "chip.run.runner_run.device_wall.task_slot_9",
+        "chip.run.runner_run.device_wall.task_slot_10", "chip.run.runner_run.device_wall.task_slot_11",
+        "chip.run.runner_run.device_wall.task_slot_12", "chip.run.runner_run.device_wall.task_slot_13",
+        "chip.run.runner_run.device_wall.task_slot_14", "chip.run.runner_run.device_wall.task_slot_15",
+    };
+    for (int s = 0; s < NUM_TASK_TIMING_SLOTS; ++s) {
+        const uint64_t dispatch_ns = runner->last_task_slot_dispatch_ns(s);
+        const uint64_t finish_ns = runner->last_task_slot_finish_ns(s);
+        if (finish_ns > dispatch_ns) {
+            STRACE_DEV_SPAN_AT(
+                kTaskSlotNames[s], static_cast<long long>(dispatch_ns), static_cast<long long>(finish_ns - dispatch_ns),
+                3
+            );
+        }
+    }
+}
+
+static SimNativeRunContext *native_run_context(DeviceContextHandle ctx, RuntimeHandle runtime, const char *operation) {
+    if (ctx == nullptr || runtime == nullptr) return nullptr;
+    uint64_t magic = 0;
+    std::memcpy(&magic, runtime, sizeof(magic));
+    if (magic != SimNativeRunContext::kMagic) {
+        LOG_ERROR("%s: runtime does not contain a prepared native run", operation);
+        return nullptr;
+    }
+    auto *state = static_cast<SimNativeRunContext *>(runtime);
+    if (state->runner != static_cast<WseHostRunner *>(ctx)) {
+        LOG_ERROR("%s: prepared run belongs to a different device context", operation);
+        return nullptr;
+    }
+    return state;
+}
+
+static void emit_native_run_host_wall(uint64_t trace_inv, uint64_t trace_hid, long long trace_start_ns) {
+    const long long end_ns = STRACE_NOW_NS();
+    STRACE_CONTEXT(trace_inv, trace_hid, 0);
+    STRACE_HOST_SPAN_AT("chip.run", trace_start_ns, end_ns - trace_start_ns, 0);
+}
+
+static void emit_native_run_runner_wall(SimNativeRunContext *state) {
+    if (state->runner_trace_start_ns == 0) return;
+    const long long end_ns = STRACE_NOW_NS();
+    STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
+    STRACE_HOST_SPAN_AT("chip.run.runner_run", state->runner_trace_start_ns, end_ns - state->runner_trace_start_ns, 1);
+    state->runner_trace_start_ns = 0;
+}
+
+static int cleanup_failed_prepare(SimNativeRunContext *state, int execution_rc) {
+    const uint64_t run_epoch = state->descriptor.run_epoch;
+    const uint64_t trace_inv = state->trace_inv;
+    const uint64_t trace_hid = state->trace_hid;
+    const long long trace_start_ns = state->trace_start_ns;
+    // A prepare that failed produced no device work, so there is no status to
+    // read and nothing written to copy back. Whatever bindings its bind got as
+    // far as recording are this attempt's, and end with it.
+    int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        validation_rc = release_run_bindings_impl(state->runtime.get(), &state->host_api);
+    } catch (...) {
+        validation_rc = PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (state->prepared_execution != nullptr) {
+        state->runner->abandon_prepared_execution(*state->prepared_execution);
+    }
+    if (state->runner_claimed) {
+        state->runner->release_native_run(state);
+        state->runner_claimed = false;
+    }
+    destroy_native_run_context(state);
+    emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns);
+    if (validation_rc != 0) return validation_rc;
+    publish_released_preparation(state, run_epoch);
+    return execution_rc;
+}
+
+int simpler_prepare_run(
+    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
+    const NativeRunDescriptor *descriptor
+) {
+    // The thread owns capture/prepare state even when a recursive call names
+    // another runner or disables capture. Hold admission through all cleanup.
+    static simpler::ModuleThreadValue<bool> preparing;
+    if (preparing.get()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (preparing.try_set(true) != 0) return PTO_RUNTIME_ERR_INTERNAL;
+    const auto prepare_scope = RAIIScopeGuard([&]() {
+        preparing.restore(false);
+    });
+    if (ctx == nullptr || runtime == nullptr || config == nullptr || descriptor == nullptr)
+        return PTO_RUNTIME_ERR_INTERNAL;
+    if (descriptor->prepare_purpose != SIMPLER_PREPARE_EAGER)
+        return descriptor->prepare_purpose == SIMPLER_PREPARE_CAPTURE ? PTO_RUNTIME_ERR_UNSUPPORTED :
+                                                                        PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    // Against the grant this context was given, not a compile-time width: a set
+    // exists because this context was granted it, so a slot past the grant names
+    // no resource here rather than one that happens to be laid out.
+    const size_t granted_sets = static_cast<WseHostRunner *>(ctx)->run_resource_grant();
+    if (descriptor->pipeline_slot >= granted_sets || descriptor->arena_bank >= granted_sets) {
+        LOG_ERROR(
+            "simpler_prepare_run: descriptor selects slot=%u bank=%u outside [0, %zu)", descriptor->pipeline_slot,
+            descriptor->arena_bank, granted_sets
+        );
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (reinterpret_cast<uintptr_t>(runtime) % alignof(SimNativeRunContext) != 0) {
+        LOG_ERROR("simpler_prepare_run: runtime storage does not satisfy get_runtime_alignment()");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    WseHostRunner *runner = static_cast<WseHostRunner *>(ctx);
+    if (!runner->has_callable(callable_id)) {
+        LOG_ERROR("simpler_prepare_run: callable_id=%d not registered", callable_id);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (!runner->can_accept_run()) {
+        LOG_ERROR("simpler_prepare_run: runner is poisoned by an uncertain partial launch");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    uint64_t magic = 0;
+    std::memcpy(&magic, runtime, sizeof(magic));
+    if (magic == SimNativeRunContext::kMagic) {
+        LOG_ERROR("simpler_prepare_run: runtime already contains a prepared run; finalize it before reuse");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (magic != 0 && magic != kNativeRunPrepareReleasedMagic) {
+        LOG_ERROR("simpler_prepare_run: runtime storage was not zero-initialized before its first use");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+
+    // Placement construction starts with an empty tag even after a failed
+    // preparation whose release result has not been consumed by a raw caller.
+    if (magic == kNativeRunPrepareReleasedMagic) std::memset(runtime, 0, kNativeRunPrepareReleaseBytes);
+
+    std::optional<HostDependencyCaptureScope> capture_scope;
+    SimNativeRunContext *state = nullptr;
+    const uint64_t trace_hid = static_cast<uint64_t>(callable_id);
+    const uint64_t trace_inv = STRACE_ALLOC_INV();
+    const long long trace_start_ns = STRACE_NOW_NS();
+    try {
+        capture_scope.emplace(config->enable_dep_gen != 0);
+        state = new (runtime) SimNativeRunContext(runner, *config, trace_hid, *descriptor, &g_host_api_ops);
+        if (!runner->try_acquire_native_run(state, state->identity(), &state->launch_permit)) {
+            LOG_ERROR("simpler_prepare_run: another native run is active on this device context");
+            destroy_native_run_context(state);
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        state->runner_claimed = true;
+        state->trace_inv = trace_inv;
+        state->trace_start_ns = trace_start_ns;
+        if (config->enable_chip_swimlane >= 3) state->clock_log_offset = host_clock_alignment_log_offset();
+        STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
+
+        // Refuse before bind or diagnostic allocation, but only after this
+        // attempt owns a validated carrier. Successful cleanup supplies the
+        // exact-epoch release proof the worker needs to keep its lane usable.
+        if (config->enable_dump_args != 0 && args_dump_capture_supported_impl() == 0) {
+            LOG_ERROR(
+                "simpler_prepare_run: this runtime has no per-task argument capture, so the requested argument dump "
+                "(enable_dump_args=%d) is unavailable rather than empty; nothing was prepared",
+                config->enable_dump_args
+            );
+            return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_UNSUPPORTED);
+        }
+
+        int rc = runner->attach_current_thread(runner->device_id());
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
+
+        rc = runner->prepare_launch_shape(*state->runtime, state->config);
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
+
+        runner->apply_call_config(state->config);
+        // This run's host-phase state, before its bind records into it.
+        runner->begin_host_phase_run(state->descriptor.pipeline_slot, DfxRunConfig::from(state->config));
+
+        {
+            STRACE("chip.run.bind");
+            rc = runner->bind_callable_to_runtime(
+                *state->runtime, callable_id, &state->host_api, args, state->config.runtime_env.ring_task_window,
+                state->config.runtime_env.ring_heap, state->config.runtime_env.ring_dep_pool
+            );
+        }
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
+        // The bind prepared this run's device image into staging the slot owns;
+        // this publishes it, before anything else touches the device arena. Two
+        // calls rather than one because the write is orderable on its own: the
+        // bytes are ready when the bind returns, and shipping them is this
+        // caller's decision.
+        {
+            STRACE("chip.run.publish_image");
+            rc = publish_run_image_impl(state->runtime.get(), &state->host_api);
+        }
+        if (rc != 0) {
+            LOG_ERROR("simpler_prepare_run: publishing this run's image failed: %d (%s)", rc, state->trace_attrs);
+            return cleanup_failed_prepare(state, rc);
+        }
+        emit_host_dep_gen_graph(runner, state->config, state->descriptor.run_epoch, state->trace_attrs);
+        // This run's own input bytes, into the buffers its bind just named.
+        {
+            STRACE("chip.run.stage_inputs");
+            rc = copy_in_run_inputs_impl(state->runtime.get(), &state->host_api);
+        }
+        if (rc != 0) {
+            LOG_ERROR("simpler_prepare_run: staging this run's inputs failed: %d (%s)", rc, state->trace_attrs);
+            return cleanup_failed_prepare(state, rc);
+        }
+        {
+            STRACE("chip.run.prepare_execution");
+            rc = runner->prepare_execution(
+                *state->runtime, state->config, state->descriptor.pipeline_slot, state->identity(),
+                &state->prepared_execution
+            );
+        }
+        if (rc != 0) return cleanup_failed_prepare(state, rc);
+        // The run's own identity, by value, from the descriptor it was prepared
+        // with: `prepare_execution` receives only a `NativeRunIdentity`, which
+        // carries no `run_id`, so an artifact could not otherwise name the
+        // submission that produced it.
+        state->prepared_execution->artifact_identity = state->artifact_identity();
+        return 0;
+    } catch (...) {
+        if (state != nullptr) return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_INTERNAL);
+        publish_released_preparation(runtime, descriptor->run_epoch);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
+    SimNativeRunContext *state = native_run_context(ctx, runtime, "simpler_launch_run");
+    if (state == nullptr || state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared)
+        return PTO_RUNTIME_ERR_INTERNAL;
+    if (!state->runner_claimed || !state->runner->native_run_owned_by(state)) return PTO_RUNTIME_ERR_INTERNAL;
+    state->launch_not_started_proven = true;
+
+    state->runner_trace_start_ns = STRACE_NOW_NS();
+    int rc = PTO_RUNTIME_ERR_INTERNAL;
+    // Captured where it is known: the transaction's own report of how far
+    // it got is what distinguishes a refusal that submitted nothing from
+    // one that may have reached the device, and `launch` does not outlive
+    // the block below.
+    LaunchProgress progress = LaunchProgress::NotStarted;
+    try {
+        rc = state->runner->attach_current_thread(state->runner->device_id());
+        if (rc == 0) {
+            state->launch_not_started_proven = false;
+            WseHostRunner::LaunchOutcome launch =
+                state->runner->launch_execution(std::move(state->prepared_execution), std::move(state->launch_permit));
+            state->launch_not_started_proven = launch.progress == LaunchProgress::NotStarted;
+            rc = launch.rc;
+            progress = launch.progress;
+            state->prepared_execution = std::move(launch.prepared);
+            state->active_execution = std::move(launch.active);
+            if (launch.progress == LaunchProgress::Complete && !state->publish_acceptance(launch.receipt))
+                rc = PTO_RUNTIME_ERR_INTERNAL;
+        }
+    } catch (...) {
+        rc = PTO_RUNTIME_ERR_INTERNAL;
+    }
+    // A capacity refusal is the one non-zero result that is not this run's
+    // outcome: the transaction proved it submitted nothing and handed the
+    // prepared execution back, so the carrier stays exactly as the caller
+    // prepared it and the next launch of this identity is a real launch.
+    // Latching `Complete` here, as every other non-zero result does, is what
+    // would make the approved wait-and-resume unreachable — the retry would be
+    // refused for its phase. `Partial` is excluded: a submission that may have
+    // reached the device is not retryable whatever code it carried.
+    //
+    // Unlike the onboard entry, this runner holds its execution claim from
+    // prepare through finalize, so the claim is *kept* rather than given back
+    // and only the permit — consumed by value above — is re-issued against it.
+    if (rc == SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL && progress == LaunchProgress::NotStarted &&
+        state->active_execution == nullptr && state->prepared_execution != nullptr &&
+        state->runner->reissue_launch_permit(state, state->identity(), &state->launch_permit)) {
+        // No completion code and no runner-wall span: this run neither
+        // completed nor ran, and publishing either would put a finished run's
+        // evidence on the timeline of one that has not started.
+        state->phase.store(NativeRunPhase::Prepared, std::memory_order_release);
+        return rc;
+    }
+    if (rc != 0) {
+        state->completion_rc = rc;
+        if (state->active_execution != nullptr) {
+            state->phase.store(NativeRunPhase::Running, std::memory_order_release);
+        } else {
+            state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
+            emit_native_run_runner_wall(state);
+        }
+        return rc;
+    }
+    state->completion_rc = 0;
+    state->phase.store(NativeRunPhase::Running, std::memory_order_release);
+    return 0;
+}
+
+int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
+    try {
+        SimNativeRunContext *state = native_run_context(ctx, runtime, "simpler_poll_run");
+        if (state == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+        NativeRunPhase phase = state->phase.load(std::memory_order_acquire);
+        if (phase == NativeRunPhase::Prepared) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+        if (state->execution_retired || (phase == NativeRunPhase::Complete && state->active_execution == nullptr)) {
+            return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+        }
+        if (state->active_execution == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+        if (!state->physical_complete) {
+            const int rc = state->runner->poll_execution(*state->active_execution);
+            if (rc != SIMPLER_NATIVE_RUN_POLL_COMPLETE) return rc;
+        }
+        return simpler_wait_run_completion(ctx, runtime) == 0 ? SIMPLER_NATIVE_RUN_POLL_COMPLETE :
+                                                                SIMPLER_NATIVE_RUN_POLL_ERROR;
+    } catch (...) {
+        return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    }
+}
+
+int simpler_wait_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime) {
+    try {
+        SimNativeRunContext *state = native_run_context(ctx, runtime, "simpler_wait_run_completion");
+        if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+        if (state->execution_retired) return 0;
+        if (state->phase.load(std::memory_order_acquire) == NativeRunPhase::Prepared)
+            return PTO_RUNTIME_ERR_INVALID_STATE;
+        const int attach_rc = state->runner->attach_current_thread(state->runner->device_id());
+        if (attach_rc != 0) return attach_rc;
+        if (state->active_execution == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+        if (!state->physical_complete) {
+            const DrainOutcome drain = state->runner->drain_execution(*state->active_execution);
+            if (state->completion_rc == 0) state->completion_rc = drain.combined();
+            if (!drain.physical_complete) return drain.device_rc != 0 ? drain.device_rc : PTO_RUNTIME_ERR_INTERNAL;
+            // The backend consumes its active run during drain. Preserve that proof
+            // before allocating the host result owner, so retirement can retry.
+            state->physical_complete = true;
+        }
+        try {
+            state->runner->retain_run_result(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
+        } catch (const std::bad_alloc &) {
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        // Fallible diagnostics precede staging ownership transfer.
+        // A retry keeps the returned physical proof and retained result, but
+        // must still own the original slot staging and execution claim.
+        STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
+        emit_native_run_runner_wall(state);
+        emit_device_phase_markers(state->runner);
+        state->clock_alignment_log_required =
+            state->runner->host_clock_alignment_log_required(state->descriptor.pipeline_slot);
+        const bool pending_outputs =
+            state->runtime != nullptr && std::any_of(
+                                             state->runtime->tensor_leases().begin(),
+                                             state->runtime->tensor_leases().end(), [](const TensorLease &lease) {
+                                                 return lease.dev_ptr != nullptr && lease.host_ptr != nullptr &&
+                                                        lease.size != 0 && lease.needs_copy_back;
+                                             }
+                                         );
+        if (pending_outputs) {
+            size_t bytes = 0;
+            state->runner->get_retained_temp_buffer(
+                state->descriptor.pipeline_slot, &state->retired_host_staging, &bytes
+            );
+            state->runner->set_retained_temp_buffer(state->descriptor.pipeline_slot, nullptr, 0);
+        } else if (state->runtime != nullptr) {
+            const int release_rc = release_run_bindings_impl(state->runtime.get(), &state->host_api);
+            if (release_rc != 0) return release_rc;
+            state->active_execution->prepared->runtime = nullptr;
+            state->runtime.reset();
+        }
+        if (state->runner_claimed) {
+            state->runner->release_native_run(state);
+            state->runner_claimed = false;
+        }
+        state->execution_retired = true;
+        state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
+        return 0;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
+    SimNativeRunContext *state = native_run_context(ctx, runtime, "simpler_wait_run");
+    if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    NativeRunPhase phase = state->phase.load(std::memory_order_acquire);
+    if (phase == NativeRunPhase::Prepared) return PTO_RUNTIME_ERR_INTERNAL;
+    if (phase == NativeRunPhase::Complete) return state->completion_rc;
+    if (state->physical_complete) {
+        state->result_observed = true;
+        return state->completion_rc;
+    }
+    // Bind the calling thread to this runner's simulated device before the
+    // drain, so sim's lifecycle entry points carry the same contract as
+    // onboard's. attach_current_thread() is idempotent for a thread already
+    // bound to this device.
+    int attach_rc = PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        attach_rc = state->runner->attach_current_thread(state->runner->device_id());
+    } catch (...) {
+        attach_rc = PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (attach_rc != 0) {
+        // No drain has occurred: the carrier and execution claim remain retryable.
+        LOG_ERROR("simpler_wait_run: attach_current_thread failed: %d (%s)", attach_rc, state->trace_attrs);
+        return SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+    }
+    DrainOutcome drain{};
+    try {
+        if (state->active_execution != nullptr) {
+            drain = state->runner->drain_execution(*state->active_execution);
+        }
+    } catch (...) {
+        drain = DrainOutcome{};
+        LOG_ERROR("simpler_wait_run: drain threw (%s)", state->trace_attrs);
+    }
+    // Sim records no device lifecycle facts, so the run takes the composed
+    // result: a device error first, and a diagnostics ownership failure still
+    // reaching the caller behind it.
+    if (state->completion_rc == 0) state->completion_rc = drain.combined();
+    state->result_observed = true;
+    state->physical_complete = drain.physical_complete;
+    if (state->physical_complete) state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
+    emit_native_run_runner_wall(state);
+    return state->completion_rc;
+}
+
+static int finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, bool deliver_outputs) try {
+    SimNativeRunContext *state = native_run_context(ctx, runtime, "simpler_finalize_run");
+    if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    NativeRunPhase phase = state->phase.load(std::memory_order_acquire);
+    const uint64_t trace_inv = state->trace_inv;
+    const uint64_t trace_hid = state->trace_hid;
+    const long long trace_start_ns = state->trace_start_ns;
+    const uint64_t clock_log_offset = state->clock_log_offset;
+    const uint64_t run_epoch = state->descriptor.run_epoch;
+    const bool no_submission = state->launch_not_started_proven;
+    const std::string output_prefix = state->config.output_prefix;
+
+    STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
+
+    int execution_rc = state->completion_rc;
+    // The launch owner covers both submitted and potentially submitted work:
+    // a backend exception is Partial and keeps its ActiveExecution. Only an
+    // explicit NotStarted result hands back PreparedExecution for rollback.
+    // Every active owner owes a drain; an error or absent receipt does not
+    // establish that the device saw no submission.
+    const bool launched = state->active_execution != nullptr;
+    // Bind the calling thread to this runner's simulated device before the
+    // drain and the validation below. attach_current_thread() is idempotent
+    // for a thread already bound to this device.
+    int attach_rc = PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        attach_rc = state->runner->attach_current_thread(state->runner->device_id());
+    } catch (...) {
+        attach_rc = PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (attach_rc != 0) {
+        LOG_ERROR("simpler_finalize_run: attach_current_thread failed: %d (%s)", attach_rc, state->trace_attrs);
+        // The canonical carrier tag keeps the caller's resources retained for
+        // retry. Neither drain nor binding release is proved by attach failure.
+        return attach_rc;
+    }
+    if (phase == NativeRunPhase::Running && launched && !state->physical_complete) {
+        DrainOutcome drain{};
+        drain.device_rc = attach_rc;
+        if (attach_rc == 0) {
+            drain.device_rc = PTO_RUNTIME_ERR_INTERNAL;
+            try {
+                drain = state->runner->drain_execution(*state->active_execution);
+            } catch (...) {
+                drain = DrainOutcome{};
+                LOG_ERROR("simpler_finalize_run: drain_execution threw (%s)", state->trace_attrs);
+            }
+        }
+        if (execution_rc == 0) execution_rc = drain.combined();
+        state->completion_rc = execution_rc;
+        state->physical_complete = state->physical_complete || drain.physical_complete;
+        if (state->physical_complete) state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
+    }
+    if (launched && !state->physical_complete) {
+        return execution_rc != 0 ? execution_rc : PTO_RUNTIME_ERR_INTERNAL;
+    }
+    emit_native_run_runner_wall(state);
+
+    int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        if (attach_rc == 0) {
+            {
+                STRACE("chip.run.validate");
+                const DeviceRunTerminal terminal =
+                    state->runner->device_run_terminal(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
+                if (execution_rc != 0)
+                    state->host_api.set_observed_run_status(
+                        terminal.state == DeviceRunTerminalState::Failed ? terminal.code : 0
+                    );
+                validation_rc =
+                    (deliver_outputs || execution_rc != 0) && (state->runtime != nullptr || execution_rc != 0) ?
+                        copy_back_run_outputs_impl(
+                            state->runtime.get(), &state->host_api, launched ? execution_rc : PTO_RUNTIME_ERR_INTERNAL,
+                            launched ? 1 : 0
+                        ) :
+                        0;
+                // This run is the only user of its bindings, so they end here,
+                // after output delivery or its refusal has ended that reader.
+                const int release_rc =
+                    state->runtime != nullptr ? release_run_bindings_impl(state->runtime.get(), &state->host_api) : 0;
+                if (validation_rc == 0) validation_rc = release_rc;
+            }
+            if (launched && execution_rc == 0 && !state->execution_retired) emit_device_phase_markers(state->runner);
+        } else {
+            validation_rc = attach_rc;
+        }
+    } catch (...) {
+        validation_rc = PTO_RUNTIME_ERR_INTERNAL;
+    }
+
+    if (state->prepared_execution != nullptr) {
+        state->runner->abandon_prepared_execution(*state->prepared_execution);
+    }
+
+    const bool export_clock_log =
+        launched && execution_rc == 0 && validation_rc == 0 &&
+        (state->execution_retired ? state->clock_alignment_log_required :
+                                    state->runner->host_clock_alignment_log_required(state->descriptor.pipeline_slot));
+    if (state->runner_claimed) {
+        state->runner->release_native_run(state);
+        state->runner_claimed = false;
+    }
+    if (state->retired_host_staging != nullptr) state->runner->free_tensor(state->retired_host_staging);
+    state->runner->release_run_result(state->descriptor.run_epoch);
+    destroy_native_run_context(state);
+    emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns);
+    if (export_clock_log && !export_host_clock_alignment_log(output_prefix, trace_inv, clock_log_offset)) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (validation_rc != 0) return validation_rc;
+    if (no_submission && !launched) publish_released_preparation(state, run_epoch);
+    return launched ? execution_rc : 0;
+} catch (...) {
+    return PTO_RUNTIME_ERR_INTERNAL;
+}
+
+int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs) {
+    if (deliver_outputs != 0 && deliver_outputs != 1) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    return finalize_native_run(ctx, runtime, deliver_outputs != 0);
+}
+
+int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
+    return simpler_finalize_run_with_delivery(ctx, runtime, 1);
+}
+
+int simpler_run(
+    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
+    const NativeRunDescriptor *descriptor
+) {
+    int rc = simpler_prepare_run(ctx, runtime, callable_id, args, config, descriptor);
+    if (rc != 0) return rc;
+    rc = simpler_launch_run(ctx, runtime);
+    if (rc == 0) rc = simpler_wait_run(ctx, runtime);
+    int finalize_rc = simpler_finalize_run(ctx, runtime);
+    return finalize_rc != 0 ? finalize_rc : rc;
+}
+
+// Sim prepares under the exclusive execution claim: `simpler_prepare_run` takes
+// `try_acquire_native_run` before it binds, and rejects a second run with
+// "another native run is active on this device context". There is also no
+// `try_reserve_native_run` on this base for a successor to hold — reservation
+// exists only onboard. So depth-2 pipelining is unreachable here rather than
+// switched off, and every overlap-dependent path in the shared runner base is
+// dead code when built for sim.
+int supports_concurrent_native_prepare_ctx(DeviceContextHandle) { return 0; }
+
+// Same reason, one step further on: with no second launched run reachable here,
+// there is never a predecessor to order anything behind. The entry exists so the
+// ABI stays uniform across platforms rather than resolving per backend.
+int supports_joined_native_launch_ctx(DeviceContextHandle) { return 0; }
+
+// Simulation orders nothing behind anything, so the diagnostic variant
+// answers the same refusal its non-diagnostic sibling does.
+int supports_joined_diagnostic_launch_ctx(DeviceContextHandle, RuntimeHandle, RuntimeHandle) { return 0; }
+
+int simpler_launch_run_joined(DeviceContextHandle, RuntimeHandle, RuntimeHandle) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+
+int simpler_validate_execution_context(DeviceContextHandle ctx) {
+    return ctx != nullptr ? 0 : PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+}
+
+int simpler_validate_caller_stream(DeviceContextHandle, void *) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+
+int simpler_retain_run_resources(DeviceContextHandle, RuntimeHandle, void *, RuntimeHandle *out_reference) {
+    if (out_reference == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    *out_reference = nullptr;
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
+int simpler_release_run_resources(DeviceContextHandle, RuntimeHandle) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+
+int simpler_launch_run_on_stream(DeviceContextHandle, RuntimeHandle, void *, RuntimeHandle) {
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
+uint64_t get_arena_bank_gm_heap_base_ctx(DeviceContextHandle ctx, uint32_t bank_id) {
+    if (ctx == NULL) return 0;
+    return static_cast<WseHostRunner *>(ctx)->arena_bank_gm_heap_base(bank_id);
+}
+
+uint64_t get_retained_temp_addr_ctx(DeviceContextHandle ctx, uint32_t slot_id) {
+    if (ctx == NULL) return 0;
+    return guarded_runner_call<&WseHostRunner::retained_temp_addr>(ctx, 0, slot_id);
+}
+
+int simpler_unregister_callable(DeviceContextHandle ctx, int32_t callable_id) {
+    if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        WseHostRunner *runner = static_cast<WseHostRunner *>(ctx);
+        std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
+        if (runner->native_run_active()) {
+            LOG_ERROR(
+                "simpler_unregister_callable: native run must be finalized before mutating the callable registry"
+            );
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        return runner->unregister_callable(callable_id);
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+size_t get_host_dlopen_count(DeviceContextHandle ctx) {
+    if (ctx == NULL) return 0;
+    return guarded_runner_call<&WseHostRunner::host_dlopen_count>(ctx, 0);
+}
+
+uint32_t get_last_scheduler_runtime_mode(DeviceContextHandle ctx) {
+    if (ctx == NULL) return 0;
+    return guarded_runner_call<&WseHostRunner::last_scheduler_runtime_mode>(ctx, 0);
+}
+
+size_t get_scheduler_mode_publish_count(DeviceContextHandle ctx) {
+    if (ctx == NULL) return 0;
+    return guarded_runner_call<&WseHostRunner::scheduler_mode_publish_count>(ctx, 0);
+}
+
+size_t get_aicpu_dlopen_count(DeviceContextHandle ctx) {
+    if (ctx == NULL) return 0;
+    return guarded_runner_call<&WseHostRunner::aicpu_dlopen_count>(ctx, 0);
+}
+
+size_t get_run_stream_set_create_count(DeviceContextHandle ctx) {
+    // Simulation has no ACL streams, so it owns no run stream sets.
+    (void)ctx;
+    return 0;
+}
+
+size_t committed_device_memory_ctx(DeviceContextHandle ctx) {
+    if (ctx == NULL) return 0;
+    return guarded_runner_call<&WseHostRunner::committed_device_memory>(ctx, 0);
+}
+
+int simpler_set_retain_runs_ctx(DeviceContextHandle ctx, int32_t enabled) {
+    if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        static_cast<WseHostRunner *>(ctx)->set_retain_runs(enabled != 0);
+        return 0;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int simpler_set_dfx_session_ctx(DeviceContextHandle ctx, int32_t enabled) {
+    return simpler_set_retain_runs_ctx(ctx, enabled);
+}
+
+int simpler_set_retained_epoch_limit_ctx(DeviceContextHandle ctx, int32_t limit) {
+    // Exported so the symbol resolves uniformly across runtime modules, and
+    // refusing so a simulated backend keeps the shipped capacity: nothing here
+    // orders a diagnostic successor behind a predecessor, so a third retained
+    // run would reserve storage no run reaches.
+    (void)ctx;
+    (void)limit;
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
+int simpler_set_run_resource_grant_ctx(DeviceContextHandle ctx, uint32_t granted) {
+    if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    if (granted == 0) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    try {
+        return static_cast<WseHostRunner *>(ctx)->set_run_resource_grant(static_cast<size_t>(granted)) ?
+                   0 :
+                   PTO_RUNTIME_ERR_UNSUPPORTED;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+uint64_t simpler_diagnostic_credit_generation_ctx(DeviceContextHandle ctx) {
+    if (ctx == NULL) return 0;
+    try {
+        return static_cast<WseHostRunner *>(ctx)->credit_generation();
+    } catch (...) {
+        // A generation of 0 is "no progress information", which the caller
+        // reads as "re-ask next round" — never as progress.
+        return 0;
+    }
+}
+
+int simpler_wait_diagnostic_credit_ctx(DeviceContextHandle ctx, uint64_t seen, int32_t timeout_ms) {
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<WseHostRunner *>(ctx)->wait_for_credit(seen, timeout_ms);
+    } catch (...) {
+        // Indistinguishable from cancellation on purpose: both mean "stop
+        // waiting on this context", and the caller's next attempt is what
+        // decides the run.
+        return -1;
+    }
+}
+
+void simpler_cancel_diagnostic_credit_waits_ctx(DeviceContextHandle ctx) {
+    if (ctx == NULL) return;
+    try {
+        static_cast<WseHostRunner *>(ctx)->cancel_credit_waits();
+    } catch (...) {
+        // Nothing to report to: this is called on teardown paths whose own
+        // outcome is already decided, and the waiters it would have woken are
+        // going away regardless.
+    }
+}
+
+int simpler_flush_diagnostics_ctx(DeviceContextHandle ctx, int32_t timeout_ms, char *error, size_t error_capacity) {
+    if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        std::string reason;
+        const int budget = timeout_ms > 0 ? timeout_ms : 30000;
+        const int rc = static_cast<WseHostRunner *>(ctx)->flush_diagnostics(budget, &reason);
+        if (rc != 0 && error != NULL && error_capacity > 0) {
+            std::snprintf(error, error_capacity, "%s", reason.c_str());
+        }
+        return rc;
+    } catch (const std::exception &e) {
+        if (error != NULL && error_capacity > 0) std::snprintf(error, error_capacity, "%s", e.what());
+        return PTO_RUNTIME_ERR_INTERNAL;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int device_memory_info_ctx(DeviceContextHandle ctx, DeviceMemoryInfo *info) {
+    if (ctx == NULL || info == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
+/* ===========================================================================
+ * Kernel-mode lifecycle
+ *
+ * Simulation never supports kernel mode: it has no real streams for a caller
+ * to lend. supported() is 0 and init refuses after the shared structural
+ * validation, so no context here ever latches kernel mode and
+ * prepare/launch reject with INVALID_STATE. Argument validation is shared
+ * with every other component through kernel_entry_validation.h, so an
+ * argument this stub accepts is one the onboard path accepts too.
+ * =========================================================================== */
+
+int simpler_kernel_mode_supported(DeviceContextHandle) { return 0; }
+
+int simpler_kernel_mode_init(
+    DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
+    const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
+    const CallConfig *config, uint64_t context_generation
+) {
+    const int rc = validate_kernel_init_args(
+        ctx, device_id, aicpu_binary, aicpu_size, aicore_binary, aicore_size, dispatcher_binary, dispatcher_size,
+        config, context_generation
+    );
+    if (rc != 0) return rc;
+    try {
+        PipelineContract contract{};
+        const int contract_rc = build_kernel_pipeline_contract_impl(config, &contract);
+        if (contract_rc != 0 && contract_rc != PTO_RUNTIME_ERR_UNSUPPORTED) return contract_rc;
+        if (contract_rc == 0 &&
+            (!is_valid_pipeline_contract(&contract, SIMPLER_MODE_KERNEL) || !has_serviceable_arena_topology(contract) ||
+             !has_serviceable_stream_topology(contract, false))) {
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    LOG_ERROR("simpler_kernel_mode_init: kernel mode is not supported by the simulator");
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
+int simpler_kernel_mode_prepare_callable(
+    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size
+) {
+    const int rc = validate_kernel_prepare_callable_args(ctx, callable_id, callable, callable_size);
+    if (rc != 0) return rc;
+    LOG_ERROR("simpler_kernel_mode_prepare_callable: no live kernel context on this device context");
+    return PTO_RUNTIME_ERR_INVALID_STATE;
+}
+
+int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream) {
+    const int rc = validate_kernel_launch_args(ctx, callable_id, args, caller_stream);
+    if (rc != 0) return rc;
+    LOG_ERROR("simpler_kernel_mode_launch: no live kernel context on this device context");
+    return PTO_RUNTIME_ERR_INVALID_STATE;
+}
+
+}  // extern "C"

@@ -67,7 +67,7 @@ class _PreparedCallableMixin:
         chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
         golden_args = test_args.clone()
         self.compute_golden(golden_args, params)
-        self._chip_worker(worker)._run_slot(slot, chip_args, config=config)
+        self._chip_worker(worker).run(slot, chip_args, config=config)
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
 
@@ -140,8 +140,8 @@ class TestPreparedCallable(_PreparedCallableMixin, SceneTestCase):
         chip_worker = self._chip_worker(worker)
 
         # 1) prepare two private slots with the SAME callable.
-        chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
-        chip_worker._register_callable_at_slot(_SLOT_SECONDARY, callable_obj)
+        chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
+        chip_worker.register_callable(_SLOT_SECONDARY, callable_obj)
 
         # 2) run primary slot twice (second run proves dedup/cache hit)
         for _ in range(2):
@@ -150,7 +150,7 @@ class TestPreparedCallable(_PreparedCallableMixin, SceneTestCase):
             golden_args = test_args.clone()
             self.compute_golden(golden_args, params)
 
-            chip_worker._run_slot(_SLOT_PRIMARY, chip_args, config=config)
+            chip_worker.run(_SLOT_PRIMARY, chip_args, config=config)
             _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
         # 3) run secondary slot — different slot, same SO, must also work.
@@ -159,12 +159,12 @@ class TestPreparedCallable(_PreparedCallableMixin, SceneTestCase):
         golden_args = test_args.clone()
         self.compute_golden(golden_args, params)
 
-        chip_worker._run_slot(_SLOT_SECONDARY, chip_args, config=config)
+        chip_worker.run(_SLOT_SECONDARY, chip_args, config=config)
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
         # 4) unregister both — should not raise.
-        chip_worker._unregister_slot(_SLOT_PRIMARY)
-        chip_worker._unregister_slot(_SLOT_SECONDARY)
+        chip_worker.unregister_callable(_SLOT_PRIMARY)
+        chip_worker.unregister_callable(_SLOT_SECONDARY)
 
     # ------------------------------------------------------------------
     # aicpu_dlopen_count assertions.
@@ -191,7 +191,7 @@ class TestPreparedCallable(_PreparedCallableMixin, SceneTestCase):
         prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
             prepared = True
             assert st_worker.aicpu_dlopen_count - baseline == 1
             for _ in range(5):
@@ -203,7 +203,7 @@ class TestPreparedCallable(_PreparedCallableMixin, SceneTestCase):
             )
         finally:
             if prepared:
-                chip_worker._unregister_slot(_SLOT_PRIMARY)
+                chip_worker.unregister_callable(_SLOT_PRIMARY)
 
     def test_dlopen_count_two_slots_alternating(self, st_platform, st_worker):
         """Case B: two prepares prewarm two slots; alternating runs add none."""
@@ -213,10 +213,10 @@ class TestPreparedCallable(_PreparedCallableMixin, SceneTestCase):
         secondary_prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
             primary_prepared = True
             assert st_worker.aicpu_dlopen_count - baseline == 1
-            chip_worker._register_callable_at_slot(_SLOT_SECONDARY, callable_obj)
+            chip_worker.register_callable(_SLOT_SECONDARY, callable_obj)
             secondary_prepared = True
             assert st_worker.aicpu_dlopen_count - baseline == 2
             for _ in range(5):
@@ -229,9 +229,9 @@ class TestPreparedCallable(_PreparedCallableMixin, SceneTestCase):
             )
         finally:
             if secondary_prepared:
-                chip_worker._unregister_slot(_SLOT_SECONDARY)
+                chip_worker.unregister_callable(_SLOT_SECONDARY)
             if primary_prepared:
-                chip_worker._unregister_slot(_SLOT_PRIMARY)
+                chip_worker.unregister_callable(_SLOT_PRIMARY)
 
     def test_dlopen_count_double_prepare_raises(self, st_platform, st_worker):
         """Case C: prepare(primary) + prepare(primary) -> second call raises RuntimeError."""
@@ -239,13 +239,13 @@ class TestPreparedCallable(_PreparedCallableMixin, SceneTestCase):
         prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
             prepared = True
             with pytest.raises(RuntimeError):
-                chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+                chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
         finally:
             if prepared:
-                chip_worker._unregister_slot(_SLOT_PRIMARY)
+                chip_worker.unregister_callable(_SLOT_PRIMARY)
 
     def test_dedup_shared_so_independent_unregister(self, st_platform, st_worker):
         """Case E: two slots on the same ChipCallable share one device orch SO buffer.
@@ -261,23 +261,23 @@ class TestPreparedCallable(_PreparedCallableMixin, SceneTestCase):
         secondary_prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
             primary_prepared = True
-            chip_worker._register_callable_at_slot(_SLOT_SECONDARY, callable_obj)
+            chip_worker.register_callable(_SLOT_SECONDARY, callable_obj)
             secondary_prepared = True
             # Sanity: both slots work before any unregister.
             self._run_one(st_worker, _SLOT_PRIMARY, config, case)
             self._run_one(st_worker, _SLOT_SECONDARY, config, case)
             # Drop primary; secondary's run must still succeed because the
             # dedup refcount is still > 0.
-            chip_worker._unregister_slot(_SLOT_PRIMARY)
+            chip_worker.unregister_callable(_SLOT_PRIMARY)
             primary_prepared = False
             self._run_one(st_worker, _SLOT_SECONDARY, config, case)
         finally:
             if secondary_prepared:
-                chip_worker._unregister_slot(_SLOT_SECONDARY)
+                chip_worker.unregister_callable(_SLOT_SECONDARY)
             if primary_prepared:
-                chip_worker._unregister_slot(_SLOT_PRIMARY)
+                chip_worker.unregister_callable(_SLOT_PRIMARY)
 
     def test_dlopen_count_unregister_re_prepare(self, st_platform, st_worker):
         """Case D: prepare+unregister+prepare prewarms twice -> delta == 2.
@@ -292,18 +292,18 @@ class TestPreparedCallable(_PreparedCallableMixin, SceneTestCase):
         prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
             prepared = True
             assert st_worker.aicpu_dlopen_count - baseline == 1
             self._run_one(st_worker, _SLOT_PRIMARY, config, case)
             assert st_worker.aicpu_dlopen_count - baseline == 1
-            chip_worker._unregister_slot(_SLOT_PRIMARY)
+            chip_worker.unregister_callable(_SLOT_PRIMARY)
             prepared = False
             after_unreg = st_worker.aicpu_dlopen_count
             assert after_unreg - baseline == 1, (
                 f"unregister must NOT decrement the dlopen counter; baseline={baseline}, after_unreg={after_unreg}"
             )
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
             prepared = True
             assert st_worker.aicpu_dlopen_count - baseline == 2
             self._run_one(st_worker, _SLOT_PRIMARY, config, case)
@@ -313,7 +313,7 @@ class TestPreparedCallable(_PreparedCallableMixin, SceneTestCase):
             )
         finally:
             if prepared:
-                chip_worker._unregister_slot(_SLOT_PRIMARY)
+                chip_worker.unregister_callable(_SLOT_PRIMARY)
 
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
@@ -364,14 +364,14 @@ class TestPreparedCallableRegistrationFailure(_PreparedCallableMixin, SceneTestC
         chip_worker = self._chip_worker(st_worker)
 
         with pytest.raises(RuntimeError):
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, bad_callable)
+            chip_worker.register_callable(_SLOT_PRIMARY, bad_callable)
         assert st_worker.aicpu_dlopen_count == baseline
 
         with pytest.raises(RuntimeError):
             self._run_one(st_worker, _SLOT_PRIMARY, config, case)
         assert st_worker.aicpu_dlopen_count == baseline
 
-        chip_worker._unregister_slot(_SLOT_PRIMARY)
+        chip_worker.unregister_callable(_SLOT_PRIMARY)
 
 
 if __name__ == "__main__":

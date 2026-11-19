@@ -32,12 +32,13 @@
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "common/chip_swimlane_profiling.h"
 #include "host/chip_swimlane_collector.h"
+#include "profiler_test_allocator.h"
 
 using Verdict = ChipSwimlaneCollector::RunTerminalVerdict;
 
 namespace {
 
-void *consistency_test_alloc(size_t size) { return std::calloc(1, size); }
+void *consistency_test_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int consistency_test_free(void *ptr) {
     std::free(ptr);
@@ -65,7 +66,7 @@ void arm_run(ChipSwimlaneCollector &collector, int num_aicore, uint32_t slot, ui
     set_platform_chip_swimlane_run_terminal_bank(
         reinterpret_cast<uint64_t>(collector.arm_run_terminal_bank(slot, epoch))
     );
-    chip_swimlane_aicpu_init(num_aicore);
+    chip_swimlane_aicpu_init(num_aicore, ChipSwimlaneLevel::SCHEDULE_TIMING);
 }
 
 // The production order at teardown: reconcile captures the live side, then the

@@ -27,14 +27,18 @@ docs/dfx/chip-swimlane-profiling.md §3.5.
 
 import argparse
 import bisect
+import gzip
 import importlib.util
+import io
 import json
 import math
 import os
 import re
+import stat
 import sys
 import tempfile
 import traceback
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,7 +52,8 @@ from simpler_setup.tools._runtime_dispatch import (
     normalize_task_id_int,
     resolve_runtime,
 )
-from simpler_setup.tools.strace_timing import host_process_lanes, parse_spans, span_family
+from simpler_setup.tools.percounter import scheduler_view as percounter_scheduler_view
+from simpler_setup.tools.strace_timing import host_process_lanes, parse_span_records, parse_spans, span_family
 
 
 def _func_id_to_letter(func_id):
@@ -198,8 +203,215 @@ class _StoredClockAlignment:
         )
 
 
+def _is_recorded_window(raw):
+    collection = (raw.get("metadata") or {}).get("collection")
+    return isinstance(collection, dict) and collection.get("recorded_window") is True
+
+
+def _decode_recorded_window(raw):  # noqa: PLR0912, PLR0915
+    """Keep received intervals without inventing a replay identity or task join."""
+    level = int(raw.get("chip_swimlane_level"))
+    if level not in (1, 2, 3, 4):
+        raise ValueError(f"Unsupported chip_swimlane_level: {level} (expected 1, 2, 3, or 4)")
+    metadata = raw.get("metadata") or {}
+    frequency = metadata.get("clock_freq_hz")
+    if type(frequency) is not int or frequency <= 0:
+        raise ValueError("recorded window needs a positive clock_freq_hz")
+    for name in ("aicpu_lifecycle_records", "aicore_execution_identities", "aicore_protocol", "percounter_task_events"):
+        if raw.get(name):
+            raise ValueError(f"recorded window has no replay-local provenance for {name}")
+    device, host = [], []
+
+    def rows(value, population):
+        if not isinstance(value, list):
+            raise ValueError(f"{population} must be an array")
+        return value
+
+    def append(destination, population, index, lane, start, end, fields, stream_index=None):
+        if type(start) is not int or type(end) is not int or not 0 <= start <= end:
+            raise ValueError(f"invalid {population} interval {index}")
+        if type(lane) is not int or lane < 0:
+            raise ValueError(f"invalid {population} lane {lane!r}")
+        destination.append(
+            {
+                "population": population,
+                "record_index": index,
+                "stream_index": stream_index,
+                "lane": lane,
+                "start_raw": start,
+                "end_raw": end,
+                "fields": fields,
+            }
+        )
+
+    for index, row in enumerate(rows(raw.get("aicore_tasks", []), "aicore_tasks")):
+        if not isinstance(row, list) or len(row) != 7:
+            raise ValueError("recorded aicore_tasks must contain seven-column arrays")
+        core, token, reg, start, end, receive, epoch = row
+        if type(receive) is not int or not 0 <= receive < start:
+            raise ValueError(f"invalid aicore_tasks receive_to_start_cycles at {index}")
+        append(
+            device,
+            "aicore_tasks",
+            index,
+            core,
+            start,
+            end,
+            {
+                "core_id": core,
+                "task_id": token,
+                "reg_task_id": reg,
+                "receive_to_start_cycles": receive,
+                "run_epoch": epoch,
+            },
+        )
+    scheduler = raw.get("scheduler_tasks")
+    if scheduler is not None:
+        if not isinstance(scheduler, dict) or scheduler.get("producer") not in ("aicpu", "aicore"):
+            raise ValueError("scheduler_tasks needs an aicpu/aicore producer")
+        for index, row in enumerate(rows(scheduler.get("records"), "scheduler_tasks.records")):
+            if not isinstance(row, list) or len(row) != 5:
+                raise ValueError("recorded scheduler_tasks.records must contain five-column arrays")
+            core, reg, start, end, epoch = row
+            append(
+                device,
+                "scheduler_tasks",
+                index,
+                core,
+                start,
+                end,
+                {
+                    "core_id": core,
+                    "reg_task_id": reg,
+                    "run_epoch": epoch,
+                    "producer": scheduler["producer"],
+                },
+            )
+    section = raw.get("scheduler_records")
+    if section is not None:
+        if not isinstance(section, dict):
+            raise ValueError("scheduler_records must be an object")
+        for stream_index, stream in enumerate(rows(section.get("streams"), "scheduler_records.streams")):
+            if not isinstance(stream, dict):
+                raise ValueError("scheduler stream must be an object")
+            records = rows(stream.get("records"), "scheduler stream records")
+            stream_fields = {key: value for key, value in stream.items() if key not in ("records", "metrics")}
+            metrics = {}
+            for metric in rows(stream.get("metrics", []), "scheduler stream metrics"):
+                if not isinstance(metric, dict):
+                    raise ValueError("scheduler metric must be an object")
+                index = metric.get("record_index")
+                if type(index) is not int or not 0 <= index < len(records) or index in metrics:
+                    raise ValueError("scheduler metric needs one valid record_index")
+                metrics[index] = {key: value for key, value in metric.items() if key != "record_index"}
+            for index, record in enumerate(records):
+                record_fields = {
+                    "start_cycles",
+                    "end_cycles",
+                    "run_epoch",
+                    "loop_iter",
+                    "kind",
+                    "tasks_processed",
+                    "task_id",
+                }
+                if not isinstance(record, dict) or set(record) != record_fields:
+                    raise ValueError(f"scheduler record must contain exactly {sorted(record_fields)}")
+                metric = metrics.get(index, {})
+                if record.keys() & metric.keys() or stream_fields.keys() & (record.keys() | metric.keys()):
+                    raise ValueError("scheduler metrics and stream metadata must not replace record fields")
+                append(
+                    device,
+                    "scheduler_records",
+                    index,
+                    stream.get("scheduler_id"),
+                    record.get("start_cycles"),
+                    record.get("end_cycles"),
+                    {**stream_fields, **record, **metric},
+                    stream_index,
+                )
+    for population, destination, start_key, end_key in (
+        ("aicpu_orchestrator_phases", device, "start_cycles", "end_cycles"),
+        ("host_orchestrator_phases", host, "start_host_ns", "end_host_ns"),
+    ):
+        for lane, records in enumerate(rows(raw.get(population, []), population)):
+            for index, record in enumerate(rows(records, population)):
+                if not isinstance(record, dict):
+                    raise ValueError(f"{population} record must be an object")
+                append(
+                    destination, population, index, lane, record.get(start_key), record.get(end_key), dict(record), lane
+                )
+    for index, record in enumerate(rows(raw.get("host_device_uploads", []), "host_device_uploads")):
+        if not isinstance(record, dict):
+            raise ValueError("host_device_uploads record must be an object")
+        append(
+            host, "host_device_uploads", index, 0, record.get("start_host_ns"), record.get("end_host_ns"), dict(record)
+        )
+    return {
+        "chip_swimlane_level": level,
+        "runtime": resolve_runtime(metadata.get("runtime")),
+        "tasks": device,
+        "host_preparation": host,
+        "timeline_metadata": {
+            "recorded_window": True,
+            "clock_domain": "device_syscnt_cycles",
+            "clock_freq_hz": frequency,
+            "device_origin_cycles": min((row["start_raw"] for row in device), default=0),
+            "host_origin_ns": min((row["start_raw"] for row in host), default=0),
+            "cross_domain_latency_available": False,
+            "clock_alignment": {"status": "unavailable", "reason": "recorded window has no replay-local Host anchors"},
+            "collection": metadata.get("collection"),
+        },
+    }
+
+
+def _recorded_trace(tasks, output_path, runtime_name, timeline_metadata):
+    metadata = dict(timeline_metadata)
+    domain = metadata.get("clock_domain")
+    if domain not in ("device_syscnt_cycles", "host_monotonic_ns"):
+        raise ValueError("recorded window needs one explicit trace clock domain")
+    host = domain == "host_monotonic_ns"
+    origin = metadata["host_origin_ns"] if host else metadata["device_origin_cycles"]
+    scale = 0.001 if host else 1_000_000 / metadata["clock_freq_hz"]
+    populations = {row["population"] for row in tasks}
+    if any(population.startswith("host_") != host for population in populations):
+        raise ValueError("recorded Host and Device intervals need separate trace files")
+    lanes = {name: index + 1 for index, name in enumerate(sorted(populations))}
+    events = [
+        {"ph": "M", "cat": "__metadata", "name": "process_name", "pid": pid, "args": {"name": f"{name} [{domain}]"}}
+        for name, pid in lanes.items()
+    ]
+    for row in tasks:
+        events.append(
+            {
+                "ph": "X",
+                "cat": "event",
+                "name": row["population"],
+                "pid": lanes[row["population"]],
+                "tid": row["lane"],
+                "ts": (row["start_raw"] - origin) * scale,
+                "dur": (row["end_raw"] - row["start_raw"]) * scale,
+                "args": {
+                    **row["fields"],
+                    "clock_domain": domain,
+                    "population": row["population"],
+                    "stream_index": row["stream_index"],
+                    "record_index": row["record_index"],
+                    "start_raw": row["start_raw"],
+                    "end_raw": row["end_raw"],
+                },
+            }
+        )
+    metadata["runtime"] = resolve_runtime(runtime_name)
+    trace = {"traceEvents": events, "metadata": metadata}
+    if output_path is not None:
+        _atomic_json(Path(output_path), trace)
+    return trace
+
+
 def _read_clock_alignment(raw):
     """Validate saved anchors, bounds, and the capture counter frequency."""
+    if _is_recorded_window(raw):
+        return None
     metadata = raw.get("metadata") or {}
     record = metadata.get("clock_alignment")
     if record is None:
@@ -443,6 +655,10 @@ def _prepare_capture_clock_alignment(path, host_logs=None):
     """
     path = Path(path)
     raw = json.loads(path.read_text())
+    if _is_recorded_window(raw):
+        if host_logs is not None:
+            raise ValueError("recorded windows cannot use single-invocation Host placement")
+        return raw, None
     if not _is_host_orchestrated_capture(raw):
         return raw, None
     try:
@@ -454,10 +670,11 @@ def _prepare_capture_clock_alignment(path, host_logs=None):
 
     placement = None
     try:
+        companions = _companion_directory(path)
         logs = (
             [Path(log) for log in host_logs]
             if host_logs is not None
-            else (sorted(path.parent.glob("host_clock_alignment.*.log")) or sorted(path.parent.glob("host.*.log")))
+            else (sorted(companions.glob("host_clock_alignment.*.log")) or sorted(companions.glob("host.*.log")))
         )
         if not logs:
             raise ValueError("no Host log available")
@@ -465,7 +682,7 @@ def _prepare_capture_clock_alignment(path, host_logs=None):
         for log in logs:
             with log.open() as input_file:
                 spans.extend(parse_spans(input_file))
-        sidecar_path = path.parent / "dispatch_identity.json"
+        sidecar_path = companions / "dispatch_identity.json"
         sidecar = json.loads(sidecar_path.read_text()) if sidecar_path.is_file() else None
         windows = _matching_capture_host_windows(raw, spans, sidecar)
         if len(windows) != 1:
@@ -580,6 +797,10 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
     Raises:
         ValueError: If the JSON is malformed.
     """
+    if _is_recorded_window(data):
+        if placement is not None or timeline_origin_ns is not None:
+            raise ValueError("recorded windows cannot use single-invocation Host placement")
+        return _decode_recorded_window(data)
     level = int(data.get("chip_swimlane_level"))
     if level not in [1, 2, 3, 4]:
         raise ValueError(f"Unsupported chip_swimlane_level: {level} (expected 1, 2, 3, or 4)")
@@ -686,6 +907,8 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
                         "worker_id",
                         "core_type",
                         "physical_core_id",
+                        "cluster_index",
+                        "cluster_lane",
                         "capture",
                     )
                 }
@@ -718,6 +941,11 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
         metadata.get("runtime"),
         source=f"{source}: metadata.runtime" if source else "metadata.runtime",
     )
+    percounter_events_raw = None
+    if "percounter_task_events" in data:
+        if runtime_name != "percounter" or level < 2 or scheduler_task_producer != "aicore":
+            raise ValueError("percounter_task_events requires an AICore-produced Percounter L2 or higher capture")
+        percounter_events_raw = percounter_scheduler_view.parse_capture(data["percounter_task_events"])
     decode_task_id_fields = get(runtime_name).task_id_fields
 
     def task_id_fields(task_token, core_id, run_epoch):
@@ -874,6 +1102,10 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
     for _, _, d, f, _epoch in scheduler_task_rows:
         _track(int(d))
         _track(int(f))
+    if percounter_events_raw is not None:
+        for record in percounter_events_raw["records"]:
+            _track(record["cycles"])
+            _track(record.get("kernel_start_cycles", 0))
     for thread_records in sched_phases_raw:
         for pr in thread_records:
             _track(int(pr.get("start_cycles", 0)))
@@ -918,14 +1150,12 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
         if host_origin_ns <= 0:
             raise ValueError(f"invalid shared timeline origin: {host_origin_ns}")
 
-    cycles_to_us_factor = 1_000_000.0 / float(clock_freq_hz)
-
     def _to_us(cycles):
         if cycles <= 0:
             return 0.0
         if placement is not None:
             return (placement.map_cycles_to_host_ns(cycles) - host_origin_ns) / 1000.0
-        relative_device_us = (cycles - base_time_cycles) * cycles_to_us_factor
+        relative_device_us = (cycles - base_time_cycles) * 1_000_000 / clock_freq_hz
         if host_mode:
             # Fail-soft diagnostic layout: preserve both clock domains and only
             # encode the known happens-before relation. The physical gap at
@@ -962,6 +1192,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
             tasks.append(
                 {
                     "task_id": task_token,
+                    "reg_task_id": reg_task_id,
                     "func_id": -1,
                     "core_id": core_id,
                     "core_type": _core_type(core_id),
@@ -979,7 +1210,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
             )
     elif aicore_rows and level == 1:
         for row in aicore_rows:
-            core_id, task_token, _reg_task_id, start_cycles, end_cycles, r2s_cycles, run_epoch = row
+            core_id, task_token, reg_task_id, start_cycles, end_cycles, r2s_cycles, run_epoch = row
             r2s_cycles = int(r2s_cycles)
             run_epoch = int(run_epoch)
             core_id = int(core_id)
@@ -991,6 +1222,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
             tasks.append(
                 {
                     "task_id": task_token,
+                    "reg_task_id": int(reg_task_id),
                     "func_id": -1,
                     "core_id": core_id,
                     "core_type": _core_type(core_id),
@@ -1006,6 +1238,19 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
             )
     elif aicore_rows:
         raise ValueError(f"level {level} requires Scheduler task timing records")
+
+    if "aicore_execution_identities" in data:
+        from simpler_setup.tools.hbg.execution_identity import attach_execution_identities  # noqa: PLC0415
+
+        attach_execution_identities(data["aicore_execution_identities"], tasks, runtime_name)
+
+    protocol_audit = None
+    if "aicore_protocol" in data:
+        from simpler_setup.tools.hbg.native_causality import audit_native_protocol  # noqa: PLC0415
+
+        if runtime_name != "host_build_graph" or level != 4 or scheduler_task_producer != "aicore":
+            raise ValueError("native protocol requires an AICore-produced HBG L4 capture")
+        protocol_audit = audit_native_protocol(data["aicore_protocol"], tasks)
 
     # Sorting by task_id alone would interleave two runs' executions of the same
     # task. Epoch leads so each run's tasks stay contiguous.
@@ -1110,6 +1355,25 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
     out["runtime"] = runtime_name
     if scheduler_task_producer is not None:
         out["scheduler_task_producer"] = scheduler_task_producer
+    if scheduler_records and runtime_name in ("host_build_graph", "percounter"):
+        from importlib import import_module  # noqa: PLC0415
+
+        analyze_streams = import_module(f"{get(runtime_name).__name__}.scalar_profile").analyze_streams
+
+        profiles = analyze_streams(
+            sched_phases_raw,
+            scheduler_stream_metadata,
+            data.get("aicore_tasks", []),
+            data.get("aicore_execution_identities"),
+        )
+        for profile in profiles:
+            profile["clock_freq_hz"] = clock_freq_hz
+            for key in ("rows", "exclusive"):
+                for row in profile[key]:
+                    row["start_time_us"] = _to_us(row["start_cycles"])
+                    row["end_time_us"] = _to_us(row["end_cycles"])
+        if profiles:
+            out["scalar_profiles"] = profiles
     if scheduler_records:
         out["scheduler_records"] = scheduler_records
         out["scheduler_streams"] = scheduler_stream_metadata
@@ -1118,6 +1382,8 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
         out["orchestrator_source"] = "aicpu"
     if aicpu_lifecycle_records:
         out["aicpu_lifecycle_records"] = aicpu_lifecycle_records
+    if percounter_events_raw is not None:
+        out["percounter_task_events"] = percounter_scheduler_view.decode_capture(percounter_events_raw, _to_us)
     if host_device_uploads:
         out["host_device_uploads"] = host_device_uploads
     if host_mode:
@@ -1170,6 +1436,10 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
             out["timeline_metadata"]["host_clock_domain_id"] = str(host_clock_domain_id)
     if core_to_thread:
         out["core_to_thread"] = core_to_thread
+    if protocol_audit is not None:
+        out["native_protocol"] = data["aicore_protocol"]
+        out["protocol_audit"] = protocol_audit
+        out.setdefault("timeline_metadata", {})["hbg_protocol_audit"] = protocol_audit
     return out
 
 
@@ -1357,6 +1627,87 @@ def _with_run_epoch(args, row):
     return args
 
 
+def _with_execution_identity(args, row):
+    _with_run_epoch(args, row)
+    if "block_idx" in row:
+        for field in (
+            "reg_task_id",
+            "block_idx",
+            "block_num",
+            "subtask_slot",
+            "pending_slot",
+            "order_key",
+            "group_seq",
+            "group_kind",
+            "cluster_index",
+            "cluster_lane",
+            "executed",
+        ):
+            args[field] = row[field]
+    return args
+
+
+def _order_hbg_cluster_lanes(events, tasks, core_to_tid, scheduler_streams):
+    """Use captured 1C2V membership for every view; retain IDs and flow endpoints."""
+    observed = defaultdict(set)
+
+    def observe(worker, row):
+        cluster, lane = row.get("cluster_index"), row.get("cluster_lane")
+        if type(worker) is int and type(cluster) is int and type(lane) is int and cluster >= 0 and 0 <= lane < 3:
+            observed[worker].add((cluster, lane))
+
+    for task in tasks:
+        observe(task["core_id"], task)
+    for stream in scheduler_streams or []:
+        if stream.get("producer") == "aicore":
+            observe(stream.get("worker_id"), stream)
+    # A legacy multi-run capture can move a worker between clusters. Such a
+    # worker has no single truthful cluster label for the whole view.
+    positions = {worker: next(iter(values)) for worker, values in observed.items() if len(values) == 1}
+    if not positions:
+        return
+    lane_workers = {}
+    for worker, tid in core_to_tid.items():
+        lane_workers[(4, tid)] = worker
+        lane_workers[(3, tid)] = worker
+        lane_workers[(3, tid + 1)] = worker
+    for index, stream in enumerate(scheduler_streams or []):
+        if stream.get("producer") == "aicore" and type(stream.get("worker_id")) is int:
+            lane_workers[(2, 30000 + index * 10)] = stream["worker_id"]
+    workers = sorted(set(lane_workers.values()), key=lambda w: (w not in positions, positions.get(w, (w, 0)), w))
+    order = {worker: index for index, worker in enumerate(workers)}
+    desired, present = {}, set()
+    for event in events:
+        if event.get("ph") != "M":
+            continue
+        key = (event.get("pid"), event.get("tid"))
+        worker = lane_workers.get(key)
+        if worker is None:
+            continue
+        sort_index = order[worker] * 10 + (key[1] - core_to_tid[worker] if key[0] == 3 else 0)
+        if event["name"] == "thread_name":
+            if worker in positions:
+                cluster, lane = positions[worker]
+                role = ("C", "V0", "V1")[lane]
+                event["args"]["name"] = f"Cluster {cluster:02d} / {role} / {event['args']['name']}"
+            desired[key] = sort_index
+        elif event["name"] == "thread_sort_index":
+            event["args"]["sort_index"] = sort_index
+            present.add(key)
+    for (pid, tid), index in desired.items():
+        if (pid, tid) not in present:
+            events.append(
+                {
+                    "ph": "M",
+                    "cat": "__metadata",
+                    "name": "thread_sort_index",
+                    "pid": pid,
+                    "tid": tid,
+                    "args": {"sort_index": index},
+                }
+            )
+
+
 # An absent (thread, run) bucket: no phases, and therefore no starts.
 _NO_COMPLETES: tuple = ((), ())
 
@@ -1414,15 +1765,14 @@ def _select_complete_for_finish(indexed_phases, finish_us):
 
 
 def _execution_key(row):
-    """Identity of one execution instance: ``(run_epoch, task_id, core_id)``.
+    """Identity of one dispatch: ``(run_epoch, task_id, core_id, reg_task_id)``.
 
-    Task ids and core ids both repeat across runs, so an index keyed on that
-    pair alone is overwritten by whichever run is emitted last, and every
-    earlier run's flow then binds to a slice belonging to the later one. The
-    static graph in deps.json is run-independent and stays keyed by bare
-    task_id; this key is only for per-execution indexes.
+    Multi-block tasks can execute repeatedly on one core within the same run.
+    The dispatch id distinguishes those executions; the static dependency graph
+    still uses the original task_id. Older normalized rows without a dispatch
+    id retain their run/task/core identity.
     """
-    return (row["run_epoch"], row["task_id"], row["core_id"])
+    return (row["run_epoch"], row["task_id"], row["core_id"], row.get("reg_task_id"))
 
 
 def _flow_anchor_rows(task_id, task_map, spmd_task_ids, slice_start, aicpu_worker_anchor_map=None):
@@ -2018,6 +2368,10 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     emit_overhead=False,
     host_device_uploads=None,
     aicpu_lifecycle_records=None,
+    scalar_profiles=None,
+    scheduler_task_producer=None,
+    chip_swimlane_level=None,
+    percounter_task_events=None,
 ):
     """Generate Chrome Trace Event Format JSON from task data.
 
@@ -2035,14 +2389,20 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         orchestrator_phases: Optional list of per-task orchestrator phase records (chip_swimlane_level >= 4)
         core_to_thread: Optional list mapping core_id (index) to scheduler thread index (-1 = unassigned)
         aicpu_lifecycle_records: Optional A5 HBG AICPU control-plane lifecycle records
+        scheduler_task_producer: Per-task timing producer declared by the capture
+        chip_swimlane_level: Profiling level declared by the capture
 
     Generates processes in the trace:
         - pid=5 "Graph Execution": one end-to-end envelope per Graph task
         - pid=1 "Host/AICPU Orchestrator": orchestrator phase bars (chip_swimlane_level >= 4)
         - pid=2 "AICPU/AICore Scheduler": scheduler record bars (chip_swimlane_level >= 3)
-        - pid=3 "Scheduler View": dispatch_time_us to finish_time_us
+        - pid=3 "Scheduler View": dispatch→finish, or task/block milestones for Percounter L2–L4
         - pid=4 "Worker View": per-subtask kernel execution on physical cores
     """
+    if (timeline_metadata or {}).get("recorded_window"):
+        if deps_edges is not None or emit_overhead:
+            raise ValueError("recorded windows cannot derive dependency flows or invocation overhead")
+        return _recorded_trace(tasks, output_path, runtime_name, timeline_metadata)
     if verbose:
         print("Generating Chrome Trace JSON...")
         print(f"  Tasks: {len(tasks)}")
@@ -2196,8 +2556,23 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     has_scheduler_task_data = any(
         task.get("dispatch_time_us", 0) >= 0 and task.get("finish_time_us", 0) > 0 for task in tasks
     )
+    worker_scheduler_details = (
+        runtime_name in ("host_build_graph", "percounter")
+        and scheduler_task_producer == "aicore"
+        and chip_swimlane_level in (3, 4)
+    )
+    show_scheduler_view = has_scheduler_task_data and not worker_scheduler_details and runtime_name != "percounter"
 
-    if has_scheduler_task_data:
+    if percounter_task_events is not None:
+        events.extend(
+            percounter_scheduler_view.trace_events(
+                percounter_task_events,
+                pid=3,
+                task_name=lambda task_id: _marker_event_name(task_id, task_display(task_id)),
+            )
+        )
+
+    if show_scheduler_view:
         events.append(
             {"args": {"name": "Scheduler View"}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": 3}
         )
@@ -2305,10 +2680,20 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         fanin_ids = fanin_map.get(task["task_id"], [])
         fanout_str = f"{len(fanout_ids)}: [" + ", ".join(task_display(x) for x in fanout_ids) + "]"
         fanin_str = f"{len(fanin_ids)}: [" + ", ".join(task_display(x) for x in fanin_ids) + "]"
+        timing_details = {}
+        if worker_scheduler_details and _scheduler_slice_start_us(task) != float("inf"):
+            timing_details = {
+                "dispatch-time-us": task["dispatch_time_us"],
+                "receive-time-us": ts,
+                "kernel-start-time-us": task["start_time_us"],
+                "kernel-end-time-us": task["end_time_us"],
+                "finish-time-us": task["finish_time_us"],
+                "scheduler-duration-us": task["finish_time_us"] - task["dispatch_time_us"],
+            }
 
         events.append(
             {
-                "args": _with_run_epoch(
+                "args": _with_execution_identity(
                     {
                         "event-hint": f"Task:{tdisp}, FuncId:{func_id}, CoreId:{task['core_id']}",
                         "fanout-hint": fanout_str,
@@ -2317,6 +2702,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                         "kernel-duration-us": task["duration_us"],
                         "local_setup_us": local_setup_us,
                         "taskId": task["task_id"],
+                        **timing_details,
                     },
                     task,
                 ),
@@ -2338,7 +2724,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     # Scheduler View duration events (dispatch_time to finish_time)
     # Assign overlapping tasks on the same core to different tids so Perfetto
     # renders each bar on its own row (Perfetto requires strict nesting on a tid).
-    if has_scheduler_task_data:
+    if show_scheduler_view:
         # Build per-core sorted task lists and assign sub-lanes.
         # Each core gets a base tid from core_to_tid; overlapping tasks get base+1.
         _core_scheduler_tasks: dict[int, list] = defaultdict(list)
@@ -2420,7 +2806,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
 
             events.append(
                 {
-                    "args": _with_run_epoch(
+                    "args": _with_execution_identity(
                         {
                             "event-hint": f"Task:{tdisp}, FuncId:{func_id}, CoreId:{task['core_id']}",
                             "dispatch-time-us": dispatch_us,
@@ -2518,6 +2904,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         assigned_thread_indices = {
             assigned for assigned in (core_to_thread or []) if isinstance(assigned, int) and assigned >= 0
         }
+        detailed_schedulers = {profile["scheduler_id"] for profile in (scalar_profiles or [])}
         for thread_idx, thread_records in enumerate(scheduler_phases):
             tid = sched_lane_tid(thread_idx, 0)
             resolve_tid = sched_lane_tid(thread_idx, 1)
@@ -2531,6 +2918,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             stream = scheduler_streams[thread_idx] if scheduler_streams and thread_idx < len(scheduler_streams) else {}
             is_aicore_scheduler = stream.get("producer") == "aicore"
             scheduler_id = stream.get("scheduler_id", thread_idx)
+            if is_aicore_scheduler and scheduler_id in detailed_schedulers:
+                continue
             worker_id = stream.get("worker_id")
             lane_name = f"Sched_{scheduler_id}"
             if is_aicore_scheduler:
@@ -2703,30 +3092,31 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     }
                 )
 
-        # Name the shared-queue pseudo-thread + give it a sort index that
-        # places it after the 3 scheduler threads but still inside the
-        # AICPU Scheduler process row, so the user reads top-to-bottom:
-        # Sched_0 / Sched_1 / Sched_2 / Shared queue (global).
-        events.append(
-            {
-                "args": {"name": "shared_ready_queue (global)"},
-                "cat": "__metadata",
-                "name": "thread_name",
-                "ph": "M",
-                "pid": 2,
-                "tid": 3999,
-            }
-        )
-        events.append(
-            {
-                "args": {"sort_index": 100},
-                "cat": "__metadata",
-                "name": "thread_sort_index",
-                "ph": "M",
-                "pid": 2,
-                "tid": 3999,
-            }
-        )
+        if producers != {"aicore"}:
+            # Name the shared-queue pseudo-thread + give it a sort index that
+            # places it after the 3 scheduler threads but still inside the
+            # AICPU Scheduler process row, so the user reads top-to-bottom:
+            # Sched_0 / Sched_1 / Sched_2 / Shared queue (global).
+            events.append(
+                {
+                    "args": {"name": "shared_ready_queue (global)"},
+                    "cat": "__metadata",
+                    "name": "thread_name",
+                    "ph": "M",
+                    "pid": 2,
+                    "tid": 3999,
+                }
+            )
+            events.append(
+                {
+                    "args": {"sort_index": 100},
+                    "cat": "__metadata",
+                    "name": "thread_sort_index",
+                    "ph": "M",
+                    "pid": 2,
+                    "tid": 3999,
+                }
+            )
 
     # Host-to-device transfer lane. These are bind segments, not orchestrator
     # operations, and they are the ones a device timeline can say something about:
@@ -2755,6 +3145,15 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     "args": {"bytes": upload.get("detail", 0)},
                 }
             )
+
+    if scalar_profiles:
+        from importlib import import_module  # noqa: PLC0415
+
+        trace_events = import_module(f"{runtime.__name__}.scalar_profile").trace_events
+
+        events.extend(
+            trace_events(scalar_profiles, pid=2, tid_base=30000, display=task_display, streams=scheduler_streams)
+        )
 
     # AICPU Orchestrator lane (chip_swimlane_level >= 4)
     #
@@ -2977,7 +3376,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             print(f"  Happens-before violations: {hb_violation_count} edge(s) flagged as 'hb_violation'")
 
     # Scheduler View dependency mirror (Scheduler timestamps).
-    if has_scheduler_task_data:
+    if show_scheduler_view:
         for run_task_map, pred_id, succ_ids in (
             (_m, _p, _s) for _m in task_maps_by_run.values() for _p, _s in edges_by_pred.items()
         ):
@@ -3093,7 +3492,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 if r.get("finish_time_us") is not None and r["finish_time_us"] >= 0 and r.get("end_time_us") is not None
             ]
             worker_anchors = _worker_flow_anchor_rows(tid, run_task_map, spmd_task_ids)
-            scheduler_anchors = _scheduler_flow_anchor_rows(tid, run_task_map, spmd_task_ids)
+            scheduler_anchors = (
+                _scheduler_flow_anchor_rows(tid, run_task_map, spmd_task_ids) if show_scheduler_view else []
+            )
             if not valid_finishes or not worker_anchors:
                 continue
             last_finish_us, last_end_us, last_cid = max(valid_finishes, key=lambda x: x[0])
@@ -3133,7 +3534,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             for anchor in task_worker_anchors[task_key]:
                 # Worker View (pid=4): anchor on the kernel slice (end_time_us).
                 src_tid = core_to_tid[anchor["core_id"]]
-                src_event_id = task_to_event_id.get((run_epoch, tid, anchor["core_id"]))
+                src_event_id = task_to_event_id.get(_execution_key(anchor))
                 events.append(
                     {
                         "cat": "flow",
@@ -3167,10 +3568,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 anchor_finish_us = anchor.get("finish_time_us")
                 if anchor_finish_us is None or anchor_finish_us <= 0:
                     continue
-                sched_src_tid = task_to_scheduler_tid.get(
-                    (run_epoch, tid, anchor["core_id"]), core_to_tid[anchor["core_id"]]
-                )
-                sched_src_event_id = task_to_scheduler_event_id.get((run_epoch, tid, anchor["core_id"]))
+                sched_src_tid = task_to_scheduler_tid.get(_execution_key(anchor), core_to_tid[anchor["core_id"]])
+                sched_src_event_id = task_to_scheduler_event_id.get(_execution_key(anchor))
                 events.append(
                     {
                         "cat": "flow",
@@ -3378,6 +3777,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 flow_id += 1
 
                 # Flow: scheduler DISPATCH → Scheduler View task start
+                if not show_scheduler_view:
+                    continue
                 scheduler_event_id = task_to_scheduler_event_id.get(_execution_key(task))
                 events.append(
                     {
@@ -3490,17 +3891,27 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         if verbose:
             print(f"  Overhead Analysis: {sum(1 for e in oh if e.get('ph') == 'C')} counter points (8 tracks)")
 
+    if runtime_name in ("host_build_graph", "percounter"):
+        _order_hbg_cluster_lanes(events, tasks, core_to_tid, scheduler_streams)
+
     trace: dict[str, object] = {"traceEvents": events}
     metadata = dict(timeline_metadata) if timeline_metadata else {}
     # Downstream tools (critical_path) re-format task ids from this trace alone, so it
     # has to name the runtime whose TaskId layout its labels and ids follow. Always set:
     # resolve_runtime above already refused a caller that named none.
     metadata["runtime"] = resolve_runtime(runtime_name)
+    if scalar_profiles:
+        metadata["scalar_function_capture"] = {
+            "minimum_cycles": sorted({p.get("function_min_cycles", 0) for p in scalar_profiles}),
+            "short_intervals_omitted": sum(p.get("short_function_intervals_omitted", 0) for p in scalar_profiles),
+            "memory_operations": (
+                "disabled" if runtime_name == "percounter" and chip_swimlane_level == 3 else "per_call"
+            ),
+        }
     if metadata:
         trace["metadata"] = metadata
     if output_path is not None:
-        with open(output_path, "w") as f:
-            json.dump(trace, f, indent=2)
+        _atomic_json(Path(output_path), trace)
 
     if verbose and output_path is not None:
         print(f"JSON written to: {output_path}")
@@ -3557,20 +3968,24 @@ Examples:
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     parser.add_argument(
         "--dispatch",
-        help="Local capture directory to merge for directory input, for example d0",
+        help="Local capture directory to merge for directory input, for example d0. A directory holding both a "
+        "chip_swimlane_records.json and a retained swimlane-*/ artifact offers two separate units; name one of "
+        "them with d0:fixed or d0:retained",
     )
     parser.add_argument(
         "--dispatch-id",
-        help="Parent dispatch identity to merge for directory input, formatted as RUN_ID:TASK_SLOT",
+        help="Parent dispatch identity to merge for directory input, formatted as RUN_ID:TASK_SLOT, optionally "
+        "suffixed with :fixed or :retained",
     )
     parser.add_argument(
         "--host-log",
         action="append",
         help="Host [STRACE] log holding the chip.run.runner_run windows the captures are placed in "
         "(repeatable). Single-file input prefers sibling host_clock_alignment.*.log over host.*.log. "
-        "Directory input reads both at the root and rank*/d*/host_clock_alignment.*.log. "
+        "Directory input follows derived Host log paths in dispatch_identity.json, then legacy logs. "
         "A single capture with no matching logs remains unaligned; valid saved alignment needs no logs.",
     )
+    parser.add_argument("--publish-derived-host-logs", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--rank-pid",
         action="append",
@@ -3655,9 +4070,17 @@ def _print_verbose_data_info(data, verbose):
         print(f"  Core-to-thread mapping: {len(core_to_thread)} cores")
 
 
-def _find_sibling_name_map(input_path):
-    """Return the unique sibling ``name_map*.json``, if one exists."""
-    candidates = sorted(path for path in Path(input_path).parent.glob("name_map*.json") if path.is_file())
+def _find_sibling_name_map(input_path, companion_dir=None):
+    """Return the unique ``name_map*.json`` beside one capture, if one exists.
+
+    ``companion_dir`` is the directory this capture's companions were already
+    verified to live in. Without one it is resolved here, because a retained
+    artifact's own directory holds records files and nothing else — its name
+    map, deps and sidecar sit in the capture directory above it, and reaching
+    them unverified would hand this run another run's map.
+    """
+    directory = Path(companion_dir) if companion_dir is not None else _companion_directory(input_path)
+    candidates = sorted(path for path in Path(directory).glob("name_map*.json") if path.is_file())
     if len(candidates) == 1:
         return candidates[0]
     if len(candidates) > 1:
@@ -3711,6 +4134,194 @@ def _load_func_names(args, input_path):
 _RANK_DIR_PATTERN = re.compile(r"rank([0-9]+)")
 _DISPATCH_DIR_PATTERN = re.compile(r"d[0-9]+")
 _DISPATCH_ID_PATTERN = re.compile(r"([0-9]+):([0-9]+)")
+_CAPTURE_FORM_SUFFIX = re.compile(r"(.+):(fixed|retained)")
+# A retained run's artifact: one file per run inside a directory the collector
+# reserved under that run's own output prefix. `chip_swimlane_records.json` is
+# the one-file-per-boundary name the non-retained path still writes, and the two
+# are read by different rules — see `_capture_units`.
+_RETAINED_DIR_PATTERN = re.compile(r"swimlane-[0-9]+")
+_RETAINED_FILE_PATTERN = re.compile(r"records_e[0-9]+\.json")
+_FIXED_RECORDS_NAME = "chip_swimlane_records.json"
+# The two forms a capture directory can offer, in the order a listing shows
+# them. They are separate conversion units and are never merged.
+_CAPTURE_FORMS = ("fixed", "retained")
+_NONCE_PATTERN = re.compile(r"[0-9a-f]{16}")
+# The widest value a `uint32_t` Rank can hold. The in-tree producer states
+# absence through the all-zero nonce rather than this, so Rank 0 is a real
+# Rank; a value here can only be a corrupt or foreign artifact's.
+_ABSENT_CHIP_RANK = 2**32 - 1
+
+
+def _dispatch_key(nonce, chip_rank, run_id, endpoint_dispatch_id):
+    """The four-field key, or None when any component states nothing.
+
+    Each component is checked for the value its producer writes when it has
+    none, not only for its Python type: an all-zero nonce, a zero parent run or
+    endpoint dispatch, and the absent-Rank sentinel each mean "nothing stated",
+    and a key carrying one of them would match every other run that stated as
+    little.
+    """
+    if not isinstance(nonce, str) or not _NONCE_PATTERN.fullmatch(nonce) or set(nonce) == {"0"}:
+        return None
+    for value in (chip_rank, run_id, endpoint_dispatch_id):
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+    if run_id <= 0 or endpoint_dispatch_id <= 0 or not 0 <= chip_rank < _ABSENT_CHIP_RANK:
+        return None
+    return (nonce, chip_rank, run_id, endpoint_dispatch_id)
+
+
+def _artifact_dispatch_key(records_path):
+    """The submission a retained artifact names, or None when it names none.
+
+    None covers four cases a caller must not confuse with a mismatch: an
+    artifact written before the field existed, one whose producer stated no
+    identity, one whose `dispatch` object is not a usable object, and one whose
+    key carries an absent component. Invalid final JSON is reported and treated
+    as naming nothing, because a crash can leave a partial file under a final
+    name.
+    """
+    try:
+        raw = json.loads(Path(records_path).read_text())
+    except (OSError, ValueError) as error:
+        print(f"Warning: ignoring unreadable capture {records_path}: {error}", file=sys.stderr)
+        return None
+    if not isinstance(raw, dict):
+        return None
+    dispatch = raw.get("metadata", {}).get("collection", {}).get("dispatch")
+    if not isinstance(dispatch, dict) or dispatch.get("status") != "identified":
+        return None
+    return _dispatch_key(
+        dispatch.get("owner_instance_id"),
+        dispatch.get("chip_rank"),
+        dispatch.get("run_id"),
+        dispatch.get("endpoint_dispatch_id"),
+    )
+
+
+def _sidecar_dispatch_key(identity):
+    """The key one capture's sidecar names, or None when it names none."""
+    if identity is None:
+        return None
+    return _dispatch_key(
+        identity.get("owner_instance_id"),
+        identity.get("chip_rank"),
+        identity.get("run_id"),
+        identity.get("endpoint_dispatch_id"),
+    )
+
+
+def _retained_artifacts(capture_dir):
+    """Every retained artifact under one capture directory, by final name only.
+
+    A temporary a crash left behind is skipped rather than read: publication is
+    a `link` onto the final name, so only that name is a complete artifact.
+    """
+    found = []
+    for directory in sorted(Path(capture_dir).glob("swimlane-*")):
+        if not directory.is_dir() or not _RETAINED_DIR_PATTERN.fullmatch(directory.name):
+            continue
+        for path in sorted(directory.glob("records_e*.json")):
+            if path.is_file() and _RETAINED_FILE_PATTERN.fullmatch(path.name):
+                found.append(path)
+    return found
+
+
+def _retained_capture_for_sidecar(capture_dir, identity):
+    """The one retained artifact in `capture_dir` that this sidecar names.
+
+    Returns None when nothing matches, and reports rather than guesses when more
+    than one does. Matching is on the whole key — nonce, Rank, parent run and
+    endpoint dispatch — never on a filename, a directory index or an epoch
+    order, because every one of those repeats across incarnations.
+    """
+    wanted = _sidecar_dispatch_key(identity)
+    if wanted is None:
+        return None
+    matches = [path for path in _retained_artifacts(capture_dir) if _artifact_dispatch_key(path) == wanted]
+    if len(matches) > 1:
+        print(
+            f"Warning: {capture_dir} holds {len(matches)} retained captures claiming one dispatch identity; "
+            "none is paired",
+            file=sys.stderr,
+        )
+        return None
+    return matches[0] if matches else None
+
+
+def _capture_units(capture_dir, identity):
+    """Every conversion unit one capture directory offers, keyed by form.
+
+    The two forms are separate units and are never merged. `fixed` is
+    `chip_swimlane_records.json`, the one-per-boundary file the non-retained
+    path and every historical capture write, paired by directory adjacency with
+    or without a sidecar. `retained` is the one artifact below `swimlane-<k>/`
+    that this directory's sidecar names, by the whole key. A directory holding
+    both offers both.
+    """
+    units = {}
+    fixed = Path(capture_dir) / _FIXED_RECORDS_NAME
+    if fixed.is_file():
+        units["fixed"] = fixed
+    retained = _retained_capture_for_sidecar(capture_dir, identity)
+    if retained is not None:
+        units["retained"] = retained
+    return units
+
+
+def _capture_records_paths(capture_dir):
+    """Every records file one capture directory offers, in form order.
+
+    A sidecar this reader cannot parse withholds the retained form and is
+    reported; the fixed name does not depend on it and still answers.
+    """
+    try:
+        identity = _load_dispatch_identity(capture_dir)
+    except ValueError as error:
+        print(f"Warning: {error}", file=sys.stderr)
+        identity = None
+    units = _capture_units(capture_dir, identity)
+    return [units[form] for form in _CAPTURE_FORMS if form in units]
+
+
+def _capture_form_of(records_path):
+    """Which of the two rules a records file is read under."""
+    return "retained" if _RETAINED_DIR_PATTERN.fullmatch(Path(records_path).parent.name) else "fixed"
+
+
+def _capture_directory_of(records_path):
+    """The `dN` directory a records file belongs to, under either rule."""
+    path = Path(records_path)
+    return path.parent.parent if _capture_form_of(path) == "retained" else path.parent
+
+
+def _companion_directory(records_path):
+    """The directory holding one capture's sidecar, Host log, deps and name map.
+
+    For a fixed-name capture that is its own directory. For a retained artifact
+    it is the capture directory one level up — but only once that directory's
+    sidecar is confirmed to name this very artifact. An unverified step would
+    hand a run the companions of whichever run reserved the directory first,
+    which is a wrong answer rather than a missing one.
+    """
+    path = Path(records_path)
+    if _capture_form_of(path) == "fixed":
+        return path.parent
+    capture_dir = path.parent.parent
+    identity = None
+    try:
+        identity = _load_dispatch_identity(capture_dir)
+    except ValueError as error:
+        print(f"Warning: ignoring dispatch identity beside {path}: {error}", file=sys.stderr)
+    if identity is not None and _retained_capture_for_sidecar(capture_dir, identity) == path:
+        return capture_dir
+    print(
+        f"Warning: {path} is not paired with a dispatch identity; its companions are not used",
+        file=sys.stderr,
+    )
+    return path.parent
+
+
 _RANK_PID_STRIDE = 100
 # Perfetto orders process groups by pid, so the pid *is* the layout: the two
 # clock domains read as two blocks only if every Host-domain pid sorts below
@@ -3828,6 +4439,22 @@ def _validate_parent_dispatch_group(discovered, expected_key):
             f"incomplete parent dispatch {expected_key[0]}:{expected_key[1]}: "
             f"expected group indexes 0..{group_size - 1}, found {sorted(group_indexes)}"
         )
+    # Every Rank of one submission is served by one parent Worker, so one
+    # incarnation nonce. Legacy grouping is unchanged — a fixed-name capture is
+    # paired by directory adjacency and never carried a nonce — but two
+    # retained incarnations that happen to agree on (run_id, task_slot) are
+    # different submissions and must not be merged into one trace.
+    nonces = {
+        identity.get("owner_instance_id")
+        for _, records_path, identity in discovered
+        if _capture_form_of(records_path) == "retained"
+    }
+    if len(nonces) > 1:
+        raise ValueError(
+            f"parent dispatch {expected_key[0]}:{expected_key[1]} draws retained captures from "
+            f"{len(nonces)} owner incarnations {sorted(str(nonce) for nonce in nonces)}; "
+            "one submission has one owner"
+        )
     return {
         "dispatch_pairing": "parent_dispatch_identity",
         "dispatch_identity": {
@@ -3839,48 +4466,175 @@ def _validate_parent_dispatch_group(discovered, expected_key):
     }
 
 
-def _discover_l3_parent_dispatch_inputs(rank_dirs, dispatch_identity):
-    match = _DISPATCH_ID_PATTERN.fullmatch(dispatch_identity)
+def _split_capture_form(selector):
+    """Split an optional ``:fixed`` / ``:retained`` suffix off a selector.
+
+    One directory can hold both forms, and they are separate conversion units
+    that are never merged, so a selector that would otherwise name two says
+    which it means. A selector without the suffix keeps its original meaning.
+    """
+    match = _CAPTURE_FORM_SUFFIX.fullmatch(selector or "")
     if match is None:
-        raise ValueError("--dispatch-id must use RUN_ID:TASK_SLOT (for example, 17:5)")
+        return selector, None
+    return match.group(1), match.group(2)
+
+
+def _select_capture_unit(units, capture_dir, form):
+    """The one unit a selector names, or None when the directory offers none."""
+    if form is not None:
+        return units.get(form)
+    if len(units) > 1:
+        offered = ", ".join(f"{capture_dir.name}:{name}" for name in sorted(units))
+        raise ValueError(
+            f"{capture_dir} holds both capture forms, which are separate conversion units and are never "
+            f"merged; name one of {offered}"
+        )
+    return next(iter(units.values()), None)
+
+
+def _require_common_capture_form(captures, selector):
+    """Refuse a selection that spans both capture forms.
+
+    Each Rank resolves its own unit, so a selector with no form suffix can land
+    on a fixed capture for one Rank and a retained one for another even though
+    no single directory offers two. The forms are read by different rules and
+    are never merged into one trace, so a selection that spans them is refused
+    rather than spliced, and the refusal names the suffix that resolves it.
+    """
+    forms = sorted({_capture_form_of(records_path) for _, records_path, _ in captures})
+    if len(forms) > 1:
+        named = ", ".join(f"{selector}:{form}" for form in forms)
+        raise ValueError(
+            f"{selector} selects both capture forms across Ranks, which are separate conversion units and are "
+            f"never merged; name one of {named}"
+        )
+
+
+def _rank_dispatch_dirs(rank_dir, *, strict):
+    """Each ``dN`` below one Rank, in capture order.
+
+    ``strict`` refuses a directory whose name is not ``dN``; whole-root
+    traversal uses it, because an unrecognised name there means the layout is
+    not the one being read. A selector-driven lookup does not, because it names
+    the directory it wants.
+    """
+    for capture_dir in sorted(
+        (path for path in Path(rank_dir).glob("d*") if path.is_dir()),
+        key=lambda path: int(path.name.removeprefix("d"))
+        if _DISPATCH_DIR_PATTERN.fullmatch(path.name)
+        else sys.maxsize,
+    ):
+        if not _DISPATCH_DIR_PATTERN.fullmatch(capture_dir.name):
+            if strict:
+                raise ValueError(f"invalid capture directory name: {capture_dir} (expected dN)")
+            continue
+        yield capture_dir
+
+
+def _ambiguous_sidecar_keys(rank_dirs):
+    """Dispatch keys more than one capture directory below this root claims.
+
+    A retained artifact is found by its whole key, so a key two directories
+    claim identifies neither of them. Reported here and withheld from retained
+    pairing everywhere below this root — which only a traversal can see, since
+    a single directory cannot know what another one claims. The fixed-name
+    captures in those directories are unaffected: their pairing has always been
+    directory adjacency.
+    """
+    claimants = defaultdict(list)
+    for _, rank_dir in rank_dirs:
+        for capture_dir in _rank_dispatch_dirs(rank_dir, strict=False):
+            try:
+                key = _sidecar_dispatch_key(_load_dispatch_identity(capture_dir))
+            except ValueError:
+                continue
+            if key is not None:
+                claimants[key].append(capture_dir)
+    ambiguous = set()
+    for key, directories in sorted(claimants.items()):
+        if len(directories) > 1:
+            named = ", ".join(str(path) for path in sorted(directories))
+            print(
+                f"Warning: dispatch identity {':'.join(str(part) for part in key)} is claimed by {named}; "
+                "no retained capture below them is paired",
+                file=sys.stderr,
+            )
+            ambiguous.add(key)
+    return ambiguous
+
+
+def _pairable_identity(identity, ambiguous):
+    """The sidecar a retained artifact may be matched against, or None.
+
+    A key two directories claim pairs nothing, so the identity is withheld from
+    retained matching while every other use of it — grouping, `host_pid`,
+    the parent key — stays exactly as it was.
+    """
+    return None if _sidecar_dispatch_key(identity) in ambiguous else identity
+
+
+def _discover_l3_parent_dispatch_inputs(rank_dirs, dispatch_identity):
+    selector, form = _split_capture_form(dispatch_identity)
+    match = _DISPATCH_ID_PATTERN.fullmatch(selector or "")
+    if match is None:
+        raise ValueError(
+            "--dispatch-id must use RUN_ID:TASK_SLOT (for example, 17:5), optionally suffixed with :fixed or :retained"
+        )
     expected_key = (int(match.group(1)), int(match.group(2)))
+    ambiguous = _ambiguous_sidecar_keys(rank_dirs)
     discovered = []
     for rank, rank_dir in rank_dirs:
-        for capture_dir in sorted(
-            (path for path in rank_dir.glob("d*") if path.is_dir()),
-            key=lambda path: int(path.name.removeprefix("d"))
-            if _DISPATCH_DIR_PATTERN.fullmatch(path.name)
-            else sys.maxsize,
-        ):
-            if not (capture_dir / "chip_swimlane_records.json").is_file():
-                continue
+        for capture_dir in _rank_dispatch_dirs(rank_dir, strict=False):
             identity = _load_dispatch_identity(capture_dir)
-            if identity is None:
+            if identity is None or (identity["run_id"], identity["task_slot"]) != expected_key:
                 continue
-            if (identity["run_id"], identity["task_slot"]) == expected_key:
-                discovered.append((rank, capture_dir / "chip_swimlane_records.json", identity))
+            units = _capture_units(capture_dir, _pairable_identity(identity, ambiguous))
+            records_path = _select_capture_unit(units, capture_dir, form)
+            if records_path is None:
+                continue
+            discovered.append((rank, records_path, identity))
+    _require_common_capture_form(discovered, f"{expected_key[0]}:{expected_key[1]}")
     pairing = _validate_parent_dispatch_group(discovered, expected_key)
     return [(rank, records_path) for rank, records_path, _ in sorted(discovered)], pairing
 
 
 def _discover_l3_local_capture_inputs(rank_dirs, dispatch):
-    if not _DISPATCH_DIR_PATTERN.fullmatch(dispatch or ""):
-        raise ValueError("--dispatch must name dN (for example, --dispatch d0)")
+    dispatch_name, form = _split_capture_form(dispatch)
+    if not _DISPATCH_DIR_PATTERN.fullmatch(dispatch_name or ""):
+        raise ValueError(
+            "--dispatch must name dN, optionally suffixed with :fixed or :retained (for example, --dispatch d0)"
+        )
 
     # One list of (rank, records_path, identity) triples rather than two parallel
     # lists: the identity belongs to the capture it was read from, and a pairing
     # that depends on two lists staying index-aligned is the failure this
     # function exists to prevent.
+    ambiguous = _ambiguous_sidecar_keys(rank_dirs)
     captures = []
     for rank, rank_dir in rank_dirs:
-        records_path = rank_dir / dispatch / "chip_swimlane_records.json"
-        if not records_path.is_file():
-            raise ValueError(f"rank{rank} is missing {dispatch}/chip_swimlane_records.json")
-        captures.append((rank, records_path, _load_dispatch_identity(records_path.parent)))
+        capture_dir = rank_dir / dispatch_name
+        identity = _load_dispatch_identity(capture_dir)
+        units = _capture_units(capture_dir, _pairable_identity(identity, ambiguous))
+        records_path = _select_capture_unit(units, capture_dir, form)
+        if records_path is None:
+            raise ValueError(
+                f"rank{rank} has no capture for {dispatch_name}: neither {dispatch_name}/{_FIXED_RECORDS_NAME} nor a "
+                f"retained capture under {dispatch_name}/swimlane-*/ that its dispatch identity names"
+            )
+        # The identity belongs to the capture directory, never to the records
+        # file's own parent: a retained artifact lives one level below it and
+        # the sidecar stays up here.
+        captures.append((rank, records_path, identity))
+
+    # Before any identity question: the individual-submission path below asks
+    # none, so a mixed-form selection would otherwise reach the merge there.
+    _require_common_capture_form(captures, dispatch_name)
 
     present_count = sum(identity is not None for _, _, identity in captures)
     if present_count not in (0, len(captures)):
-        raise ValueError(f"{dispatch} has dispatch identity metadata for only {present_count}/{len(captures)} Ranks")
+        raise ValueError(
+            f"{dispatch_name} has dispatch identity metadata for only {present_count}/{len(captures)} Ranks"
+        )
     pairing = {"dispatch_pairing": "local_capture_index"}
     if present_count:
         group_keys = {(identity["run_id"], identity["task_slot"]) for _, _, identity in captures}
@@ -3888,7 +4642,8 @@ def _discover_l3_local_capture_inputs(rank_dirs, dispatch):
         if has_group:
             if len(group_keys) != 1:
                 raise ValueError(
-                    f"{dispatch} refers to different parent dispatches across Ranks; use --dispatch-id RUN_ID:TASK_SLOT"
+                    f"{dispatch_name} refers to different parent dispatches across Ranks; "
+                    "use --dispatch-id RUN_ID:TASK_SLOT"
                 )
             pairing = _validate_parent_dispatch_group(captures, next(iter(group_keys)))
         else:
@@ -3911,44 +4666,55 @@ def discover_l3_conversion_targets(root):
     Public because the SceneTest postprocessor needs the same units this
     module's directory mode would pick, one CLI invocation per unit.
 
+    A capture directory holding both forms yields two units, never one merged
+    target, and each carries the selector that names it again plus the exact
+    files it selected.
+
     Raises ValueError only when nothing below ``root`` can be paired safely. A
     remainder that cannot be paired by dN downgrades to a stderr warning while
     the parent-identity targets are still returned.
     """
+    rank_dirs = _l3_rank_dirs(root)
+    ambiguous = _ambiguous_sidecar_keys(rank_dirs)
     captures_by_rank = {}
     parent_groups = defaultdict(list)
-    for rank, rank_dir in _l3_rank_dirs(root):
+    forms_by_dispatch = defaultdict(set)
+    for rank, rank_dir in rank_dirs:
         captures = []
-        for capture_dir in sorted(
-            (path for path in rank_dir.glob("d*") if path.is_dir()),
-            key=lambda path: int(path.name.removeprefix("d"))
-            if _DISPATCH_DIR_PATTERN.fullmatch(path.name)
-            else sys.maxsize,
-        ):
-            if not _DISPATCH_DIR_PATTERN.fullmatch(capture_dir.name):
-                raise ValueError(f"invalid capture directory name: {capture_dir} (expected dN)")
-            records_path = capture_dir / "chip_swimlane_records.json"
-            if not records_path.is_file():
-                continue
+        for capture_dir in _rank_dispatch_dirs(rank_dir, strict=True):
             identity = _load_dispatch_identity(capture_dir)
-            capture = (rank, records_path, identity)
-            captures.append(capture)
-            if identity is not None and identity["group_size"] > 1:
-                parent_groups[(identity["run_id"], identity["task_slot"])].append(capture)
+            units = _capture_units(capture_dir, _pairable_identity(identity, ambiguous))
+            for form, records_path in sorted(units.items()):
+                capture = (rank, records_path, identity)
+                captures.append((capture_dir, form, capture))
+                forms_by_dispatch[capture_dir.name].add(form)
+                if identity is not None and identity["group_size"] > 1:
+                    parent_groups[(identity["run_id"], identity["task_slot"], form)].append(capture)
         captures_by_rank[rank] = captures
+
+    group_forms = defaultdict(set)
+    for run_id, task_slot, form in parent_groups:
+        group_forms[(run_id, task_slot)].add(form)
 
     targets = []
     semantically_paired_paths = set()
-    for parent_key, captures in sorted(parent_groups.items()):
-        pairing = _validate_parent_dispatch_group(captures, parent_key)
+    for (run_id, task_slot, form), captures in sorted(parent_groups.items()):
+        pairing = _validate_parent_dispatch_group(captures, (run_id, task_slot))
         paths = [records_path for _, records_path, _ in sorted(captures)]
         semantically_paired_paths.update(paths)
+        qualified = len(group_forms[(run_id, task_slot)]) > 1
         targets.append(
             {
                 "dispatch": None,
-                "dispatch_id": f"{parent_key[0]}:{parent_key[1]}",
-                "output_stem": f"l3_swimlane_run{parent_key[0]}_task{parent_key[1]}",
-                "capture_dirs": [path.parent for path in paths],
+                "dispatch_id": f"{run_id}:{task_slot}:{form}" if qualified else f"{run_id}:{task_slot}",
+                "output_stem": f"l3_swimlane_run{run_id}_task{task_slot}" + (f"_{form}" if qualified else ""),
+                "capture_dirs": [_capture_directory_of(path) for path in paths],
+                # The exact files this target selected, in the same order as
+                # `capture_dirs`. A consumer whose merge failed converts these
+                # one by one; re-deriving them from the directories would offer
+                # the other form too and could resurrect a unit this traversal
+                # rejected.
+                "records_paths": paths,
                 "pairing": pairing,
             }
         )
@@ -3959,8 +4725,12 @@ def discover_l3_conversion_targets(root):
             (
                 rank,
                 {
-                    records_path.parent.name: records_path.parent
-                    for _, records_path, _ in captures
+                    # Keyed by the capture directory and the form, never by the
+                    # records file's own parent: a retained artifact's parent is
+                    # `swimlane-<k>`, which carries no dN and repeats across
+                    # dispatch directories.
+                    (capture_dir.name, form): (capture_dir, records_path)
+                    for capture_dir, form, (_, records_path, _) in captures
                     if records_path not in semantically_paired_paths
                 },
             )
@@ -3972,19 +4742,24 @@ def discover_l3_conversion_targets(root):
             # target is paired by (run_id, task_slot) and is unaffected by what
             # the leftover dN sets look like, so dropping those too would
             # discard exactly the pairings this identity exists to make.
-            detail = ", ".join(f"rank{rank}={sorted(captures)}" for rank, captures in fallback_sets)
+            detail = ", ".join(
+                f"rank{rank}={sorted(f'{name}:{form}' for name, form in captures)}" for rank, captures in fallback_sets
+            )
             message = f"refusing to pair asymmetric local capture indexes under {root}: {detail}"
             if not targets:
                 raise ValueError(message)
             print(f"Warning: {message}", file=sys.stderr)
             return targets
-        for dispatch in sorted(expected, key=lambda name: int(name.removeprefix("d"))):
+        for dispatch_name, form in sorted(expected, key=lambda unit: (int(unit[0].removeprefix("d")), unit[1])):
+            qualified = len(forms_by_dispatch[dispatch_name]) > 1
+            selected = [captures[(dispatch_name, form)] for _, captures in fallback_sets]
             targets.append(
                 {
-                    "dispatch": dispatch,
+                    "dispatch": f"{dispatch_name}:{form}" if qualified else dispatch_name,
                     "dispatch_id": None,
-                    "output_stem": f"l3_swimlane_{dispatch}",
-                    "capture_dirs": [captures[dispatch] for _, captures in fallback_sets],
+                    "output_stem": f"l3_swimlane_{dispatch_name}" + (f"_{form}" if qualified else ""),
+                    "capture_dirs": [capture_dir for capture_dir, _ in selected],
+                    "records_paths": [records_path for _, records_path in selected],
                     "pairing": {"dispatch_pairing": "local_capture_index"},
                 }
             )
@@ -4011,11 +4786,20 @@ def _rank_clock_domain(rank, records_path, raw):
     return str(clock_domain)
 
 
-def _discover_host_logs(root, explicit):
-    """The `[STRACE]` logs that hold the outer windows for these captures.
+def _derived_host_log_path(capture_dir, relative):
+    if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+        raise ValueError(f"invalid derived Host log path in {capture_dir / 'dispatch_identity.json'}")
+    path = (capture_dir / relative).resolve()
+    if not path.is_relative_to(Path(capture_dir).parent.parent.resolve()) or not path.is_file():
+        raise ValueError(f"derived Host log is missing or escapes its L3 output: {path}")
+    return path
 
-    Persistent ``host.<pid>.log`` files live at the case/level output root;
-    ``host_clock_alignment.<pid>.log`` holds capture-local timing spans.
+
+def _discover_host_logs(root, explicit, capture_dirs=()) -> tuple[list[Path], str]:
+    """Return the `[STRACE]` logs and their source kind for these captures.
+
+    Derived logs live with the L3 capture; legacy
+    ``host_clock_alignment.<pid>.log`` files hold capture-local timing spans.
     See ``docs/dfx/host-trace.md``.
     """
     if explicit:
@@ -4023,7 +4807,26 @@ def _discover_host_logs(root, explicit):
         missing = [str(path) for path in paths if not path.is_file()]
         if missing:
             raise ValueError(f"--host-log names a file that does not exist: {', '.join(missing)}")
-        return paths
+        return paths, "explicit"
+    identities = [_load_dispatch_identity(directory) for directory in capture_dirs]
+    derived = [identity.get("host_trace") if identity else None for identity in identities]
+    if derived and all(derived):
+        if any(identity is not None and "host_trace_publication_id" in identity for identity in identities):
+            publications = [identity.get("host_trace_publication_id") if identity else None for identity in identities]
+            if (
+                any(
+                    not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{32}", value) is None for value in publications
+                )
+                or len(set(publications)) != 1
+            ):
+                raise ValueError("derived Host logs belong to different publications across Ranks")
+        paths = {_derived_host_log_path(directory, relative) for directory, relative in zip(capture_dirs, derived)}
+        for directory, identity in zip(capture_dirs, identities):
+            if identity and identity.get("parent_host_trace"):
+                paths.add(_derived_host_log_path(directory, identity["parent_host_trace"]))
+        return sorted(paths), "derived"
+    if any(derived):
+        raise ValueError("only some Ranks have derived Host logs; cross-Rank placement needs every Rank")
     paths = sorted(
         {
             *Path(root).glob("host_clock_alignment.*.log"),
@@ -4038,7 +4841,229 @@ def _discover_host_logs(root, explicit):
             f"{containment.RUNNER_SPAN} window that contains it. Pass --host-log, or re-run with a Host log "
             f"threshold of TIMING or finer."
         )
-    return paths
+    return paths, "legacy"
+
+
+def _span_key(span):
+    return (span.pid, span.tid, span.inv, span.hid, span.depth, span.name, span.ts, span.dur, span.attrs)
+
+
+def _atomic_text(path, lines):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=f".{path.name}.", delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            output.writelines(lines)
+            output.flush()
+            os.fsync(output.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _scalar_display_lanes(events):
+    """Deduplicate run identity without sampling or changing any interval."""
+    lanes = {}
+    for event in events:
+        if event.get("ph") != "X" or event.get("cat") != "aicore_scalar":
+            continue
+        key = event["pid"], event["tid"]
+        lane = lanes.setdefault(key, {"epochs": set(), "complete": set()})
+        args = event.get("args", {})
+        if "run_epoch" in args:
+            lane["epochs"].add(args["run_epoch"])
+        if "capture_complete" in args:
+            lane["complete"].add(args["capture_complete"])
+    return lanes
+
+
+def _scalar_display_event(event, lanes):
+    """Project a Scalar display row; authoritative integer fields stay in raw."""
+    if event.get("ph") != "X" or event.get("cat") != "aicore_scalar":
+        return event
+    compact = {key: event[key] for key in ("ph", "name", "pid", "tid", "ts", "dur")}
+    args = event.get("args", {})
+    calls = args.get("scalar_calls", 1)
+    if calls != 1:
+        compact["name"] += f" [calls={calls}]"
+    # Names carry the function/operation, completion boundary, task and calls.
+    # Nesting is given by the unchanged intervals. Integer clock evidence lives
+    # in the source capture rather than being copied into every display event.
+    omitted = {
+        "kind",
+        "start_cycles",
+        "end_cycles",
+        "loop_iter",
+        "tasks_processed",
+        "task_id",
+        "scalar_calls",
+        "scalar_depth",
+        "raw_scalar_depth",
+        "scalar_schema",
+    }
+    lane = lanes[event["pid"], event["tid"]]
+    if len(lane["epochs"]) == 1:
+        omitted.add("run_epoch")
+    if len(lane["complete"]) == 1:
+        omitted.add("capture_complete")
+    retained = {key: value for key, value in args.items() if key not in omitted}
+    if retained:
+        compact["args"] = retained
+    return compact
+
+
+def _dump_trace_json(output, data):
+    """Stream compact events without building a second merged event list."""
+    events = data.get("traceEvents") if isinstance(data, dict) else None
+    if not isinstance(events, list):
+        json.dump(data, output, ensure_ascii=False, separators=(",", ":"))
+        return
+    lanes = _scalar_display_lanes(events)
+    metadata = dict(data.get("metadata", {}))
+    if lanes:
+        metadata["scalar_detail_display"] = {
+            "format": "compact-v1",
+            "authoritative_format": "chip_swimlane_records",
+            "all_events_retained": True,
+            "lanes": [
+                {
+                    "pid": pid,
+                    "tid": tid,
+                    "run_epochs": sorted(lane["epochs"]),
+                    "capture_complete_values": sorted(lane["complete"]),
+                }
+                for (pid, tid), lane in lanes.items()
+            ],
+        }
+    output.write('{"traceEvents":[\n')
+    for index, event in enumerate(events):
+        if index:
+            output.write(",\n")
+        json.dump(_scalar_display_event(event, lanes), output, ensure_ascii=False, separators=(",", ":"))
+    output.write("\n]")
+    for key, value in data.items():
+        if key in ("traceEvents", "metadata"):
+            continue
+        output.write(",")
+        json.dump(key, output)
+        output.write(":")
+        json.dump(value, output, ensure_ascii=False, separators=(",", ":"))
+    if "metadata" in data or lanes:
+        output.write(',"metadata":')
+        json.dump(metadata, output, ensure_ascii=False, separators=(",", ":"))
+    output.write("}\n")
+
+
+def _atomic_json(path, data):
+    """Write the merged trace completely before replacing its previous file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        if path.suffix == ".gz":
+            with temporary.open("xb") as raw:
+                with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
+                    with io.TextIOWrapper(compressed, encoding="utf-8") as output:
+                        _dump_trace_json(output, data)
+                raw.flush()
+                os.fsync(raw.fileno())
+        else:
+            with temporary.open("x", encoding="utf-8") as output:
+                _dump_trace_json(output, data)
+                output.flush()
+                os.fsync(output.fileno())
+        if path.is_file():
+            os.chmod(temporary, stat.S_IMODE(path.stat().st_mode))
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _stage_text(path, lines):
+    """Write a complete replacement beside its destination without publishing it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=f".{path.name}.", delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            output.writelines(lines)
+            output.flush()
+            os.fsync(output.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    return temporary
+
+
+def _publish_identity_updates(companion_dirs, updated_sidecars, original_sidecars):
+    """Stage all Rank identities, then restore committed ones if a replace fails."""
+    staged = {}
+    committed = []
+    try:
+        for rank, directory in companion_dirs.items():
+            staged[rank] = _stage_text(directory / "dispatch_identity.json", [updated_sidecars[rank]])
+        for rank, directory in companion_dirs.items():
+            os.replace(staged[rank], directory / "dispatch_identity.json")
+            committed.append(rank)
+    except BaseException:
+        for rank in reversed(committed):
+            _atomic_text(companion_dirs[rank] / "dispatch_identity.json", [original_sidecars[rank]])
+        raise
+    finally:
+        for temporary in staged.values():
+            temporary.unlink(missing_ok=True)
+
+
+def _publish_derived_host_logs(
+    root, output_path, source_paths, companion_dirs, placements, dispatcher_spans
+) -> list[Path]:
+    """Publish only the spans selected for this merge, then link them from each Rank."""
+    if any(not (directory / "dispatch_identity.json").is_file() for directory in companion_dirs.values()):
+        raise ValueError("derived Host logs require a dispatch_identity.json for every Rank")
+    by_invocation = {(placement.host.pid, placement.host.inv): [] for placement in placements.values()}
+    parent_keys = {_span_key(span) for span in dispatcher_spans}
+    parent_records = []
+    for source in source_paths:
+        with source.open(errors="replace") as log:
+            for span, record in parse_span_records(log):
+                record += "\n"
+                if (span.pid, span.inv) in by_invocation:
+                    by_invocation[(span.pid, span.inv)].append(record)
+                if _span_key(span) in parent_keys:
+                    parent_records.append(record)
+    publication_id = uuid.uuid4().hex
+    parent_path = root / f"host_trace_{output_path.stem}_{publication_id}.log" if parent_records else None
+    rank_paths = {}
+    for rank, placement in placements.items():
+        key = placement.host.pid, placement.host.inv
+        records = by_invocation[key]
+        if not records:
+            raise ValueError(f"no [STRACE] records for paired Rank {rank} invocation {key}")
+        rank_paths[rank] = companion_dirs[rank] / f"host_trace_{key[0]}_{key[1]}_{publication_id}.log"
+    original_sidecars = {}
+    updated_sidecars = {}
+    for rank, directory in companion_dirs.items():
+        sidecar_path = directory / "dispatch_identity.json"
+        original_sidecars[rank] = sidecar_path.read_text()
+        identity = _load_dispatch_identity(directory)
+        if not isinstance(identity, dict):
+            raise ValueError(f"invalid dispatch identity: {sidecar_path}")
+        identity["host_trace"] = os.path.relpath(rank_paths[rank], directory)
+        identity["host_trace_publication_id"] = publication_id
+        if parent_path:
+            identity["parent_host_trace"] = os.path.relpath(parent_path, directory)
+        else:
+            identity.pop("parent_host_trace", None)
+        updated_sidecars[rank] = json.dumps(identity, indent=2) + "\n"
+    for rank, path in rank_paths.items():
+        placement = placements[rank]
+        _atomic_text(path, by_invocation[(placement.host.pid, placement.host.inv)])
+    if parent_path:
+        _atomic_text(parent_path, parent_records)
+    _publish_identity_updates(companion_dirs, updated_sidecars, original_sidecars)
+    return sorted([*rank_paths.values(), *([parent_path] if parent_path else [])])
 
 
 def _parse_rank_pid_pins(values):
@@ -4121,17 +5146,27 @@ def _host_block_lane(rank, lane_index, label):
     ]
 
 
-def _dispatcher_spans(spans, chip_pids, window_ns):
+def _span_dispatch_fields(span):
+    fields = {}
+    for item in span.attrs.split():
+        name, separator, value = item.partition("=")
+        if separator and name in ("run_id", "task_slot") and value.isdecimal():
+            fields[name] = int(value)
+    return fields
+
+
+def _dispatcher_spans(spans, chip_pids, window_ns, dispatch_key=None):
     """The dispatching processes' spans that belong to the merged dispatch.
 
-    Their logs cover the whole run while the merge covers one dispatch, so the
-    Ranks' own span on the Host axis selects what to keep — in two passes,
-    because the level above the chip emits spans of two different scopes.
+    Their logs cover the whole run while the merge covers one dispatch. A
+    parent identity selects its latest preceding submit and that submission's
+    spans by run and task slot, including dispatch calls that finished before a
+    ChipWorker began. Old captures without that identity use the Rank window.
 
-    A span with an invocation is kept or dropped with its whole invocation:
-    `node.submit` runs to completion before the Rank it dispatched to starts,
-    so an overlap test applied span by span would draw the dispatch and drop
-    what led to it.
+    In the fallback, a span with an invocation is kept or dropped with its
+    whole invocation. With a parent identity, task-slot spans are selected
+    exactly and run-scoped spans of that invocation accompany them. The
+    identity names the immediate L3 parent; it cannot identify an L4 task.
 
     ``inv=0`` says the span belongs to a thread rather than to one run —
     `node.scheduler_loop` is emitted that way (`Scheduler::…`, run id 0), so
@@ -4150,26 +5185,79 @@ def _dispatcher_spans(spans, chip_pids, window_ns):
     def overlaps(span, lo, hi):
         return span.ts < hi and span.ts + span.dur > lo
 
-    concurrent = {(span.pid, span.inv) for span in host_spans if span.inv and overlaps(span, window_lo, window_hi)}
-    selected = [span for span in host_spans if span.inv and (span.pid, span.inv) in concurrent]
+    selected = []
+    if dispatch_key is not None:
+        run_id, task_slot = dispatch_key
+        matched = [
+            span
+            for span in host_spans
+            if span.name.startswith("node.")
+            and _span_dispatch_fields(span).get("run_id") == run_id
+            and _span_dispatch_fields(span).get("task_slot") == task_slot
+        ]
+        if len({span.pid for span in matched if span.name in ("node.submit", "node.dispatch")}) > 1:
+            return []
+        if matched:
+            anchors = [span for span in matched if span.name == "node.submit" and span.ts <= window_lo]
+            if not anchors:
+                anchors = [span for span in matched if span.name == "node.dispatch" and span.ts <= window_lo]
+            if anchors:
+                anchor = max(anchors, key=lambda span: span.ts)
+                next_anchor = min(
+                    (
+                        span.ts
+                        for span in matched
+                        if span.pid == anchor.pid and span.name == anchor.name and span.ts > anchor.ts
+                    ),
+                    default=float("inf"),
+                )
+                selected = [
+                    span
+                    for span in host_spans
+                    if span.pid == anchor.pid
+                    and span.inv == anchor.inv
+                    and anchor.ts <= span.ts < next_anchor
+                    and _span_dispatch_fields(span).get("run_id") == run_id
+                    and _span_dispatch_fields(span).get("task_slot") in (None, task_slot)
+                ]
+                selected += [
+                    span
+                    for span in host_spans
+                    if span.pid == anchor.pid
+                    and span.inv == anchor.inv
+                    and span.name == "node.graph_build"
+                    and span.ts < anchor.ts <= span.ts + span.dur
+                    and _span_dispatch_fields(span).get("run_id") == run_id
+                ]
+    if dispatch_key is None:
+        concurrent = {(span.pid, span.inv) for span in host_spans if span.inv and overlaps(span, window_lo, window_hi)}
+        selected = [span for span in host_spans if span.inv and (span.pid, span.inv) in concurrent]
+    elif not selected:
+        return []
 
+    selected_ids = {id(span) for span in selected}
+    selected = [span for span in host_spans if id(span) in selected_ids]
     story_lo = min([window_lo] + [span.ts for span in selected])
     story_hi = max([window_hi] + [span.ts + span.dur for span in selected])
-    selected += [span for span in host_spans if not span.inv and overlaps(span, story_lo, story_hi)]
+    selected_pids = {span.pid for span in selected}
+    selected += [
+        span
+        for span in host_spans
+        if not span.inv
+        and id(span) not in selected_ids
+        and (dispatch_key is None or span.pid in selected_pids)
+        and overlaps(span, story_lo, story_hi)
+    ]
     return selected
 
 
 def _dispatcher_block_events(spans, global_origin_ns):
     """The processes that dispatched to these Ranks, drawn above them.
 
-    Each process writes its `host.<pid>.log` at the root of the level
-    namespace it owns, so a direct L3 run supplies the scheduler's own `node.*`
-    spans — and an L4's `network1.*` above them — from the persistent logs.
-    Under a parent-assigned `nodeN` namespace the levels above it write one
-    directory up, outside the root this merge reads, so only that namespace's
-    own levels reach here. They are Host CLOCK_MONOTONIC and same-host
-    cross-process comparable, so they go straight onto the axis: no
-    containment, no slack. Containment is only ever needed for the device
+    The live Host session supplies the L3 scheduler's `node.*` spans. Derived
+    logs retain the selected records for offline conversion. They are Host
+    CLOCK_MONOTONIC and same-host cross-process comparable, so they go straight
+    onto the axis: no containment, no slack. Containment is only needed for the device
     clock, which is why nothing in this block carries a bound.
     """
     processes = host_process_lanes(spans)
@@ -4345,16 +5433,23 @@ def _placement_bound_events(rank, placement, global_origin_ns):
     return events
 
 
-def _load_rank_local_artifacts(records_path):
-    name_map_path = _find_sibling_name_map(records_path)
+def _load_rank_local_artifacts(records_path, companion_dir):
+    """One Rank's sidecar, name map and dependency files.
+
+    ``companion_dir`` is where this capture's companions were verified to live.
+    A retained artifact's own directory holds records files only, so resolving
+    these from the file's parent would silently drop the sidecar, the
+    dependency edges and the name map.
+    """
+    name_map_path = _find_sibling_name_map(records_path, companion_dir)
     if name_map_path is None:
         func_names, orchestrator_name = {}, None
     else:
         func_names, orchestrator_name = load_func_names_json(name_map_path)
 
-    deps_path = records_path.parent / "deps.json"
+    deps_path = Path(companion_dir) / "deps.json"
     return {
-        "dispatch_identity": _load_dispatch_identity(records_path.parent),
+        "dispatch_identity": _load_dispatch_identity(companion_dir),
         "func_names": func_names,
         "orchestrator_name": orchestrator_name,
         "deps_path": deps_path,
@@ -4407,19 +5502,27 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
 
     rank_inputs, pairing_metadata = _discover_l3_rank_inputs(root, args.dispatch, args.dispatch_id)
     raw_inputs = {}
+    companion_dirs = {}
     rank_identities = {}
     rank_host_pids = {}
     clock_domains = set()
     for rank, records_path in rank_inputs:
         with records_path.open() as f:
             raw_inputs[rank] = json.load(f)
+        if _is_recorded_window(raw_inputs[rank]):
+            raise ValueError("recorded windows cannot be merged into a single-invocation Host timeline")
+        # Resolved once per Rank and reused for every companion read below. For
+        # a fixed-name capture this is the file's own directory; for a retained
+        # artifact it is the capture directory one level up, and only after
+        # that directory's sidecar is confirmed to name this very artifact.
+        companion_dirs[rank] = _companion_directory(records_path)
         # The sidecar names both halves of the pairing: `host_pid` is the
         # ChipWorker child that served this capture, and the dispatch key is
         # which of that child's invocations it was. The Host log's root
         # `chip.run` span names the second, and its filename the first, so the
         # two artifacts pair exactly instead of by how well their device
         # windows happen to fit.
-        sidecar = _load_dispatch_identity(records_path.parent)
+        sidecar = _load_dispatch_identity(companion_dirs[rank])
         identity = containment.capture_identity(sidecar)
         if identity is not None:
             rank_identities[rank] = identity
@@ -4436,7 +5539,7 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
             "cross-host splice is not implemented."
         )
 
-    host_logs = _discover_host_logs(root, args.host_log)
+    host_logs, host_log_kind = _discover_host_logs(root, args.host_log, list(companion_dirs.values()))
     placements, host_pairing, host_spans = _place_rank_captures(
         host_logs, raw_inputs, rank_identities, rank_host_pids, _parse_rank_pid_pins(args.rank_pid)
     )
@@ -4464,7 +5567,23 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
         [int(placement.host.end_ns) for placement in placements.values()] + [s.ts + s.dur for s in rank_spans]
     )
     chip_pids = {placement.host.pid for placement in placements.values()}
-    dispatcher_spans = _dispatcher_spans(host_spans, chip_pids, (window_lo, window_hi))
+    parent_identity = pairing_metadata.get("dispatch_identity")
+    dispatch_key = None
+    if isinstance(parent_identity, dict):
+        run_id = parent_identity.get("run_id")
+        task_slot = parent_identity.get("task_slot")
+        if isinstance(run_id, int) and isinstance(task_slot, int):
+            dispatch_key = (run_id, task_slot)
+    dispatcher_spans = _dispatcher_spans(host_spans, chip_pids, (window_lo, window_hi), dispatch_key)
+    parent_dispatch_status = "unknown"
+    if pairing_metadata.get("dispatch_pairing") == "parent_dispatch_identity":
+        parent_found = dispatch_key is not None and any(
+            span.name in ("node.submit", "node.dispatch")
+            and (_span_dispatch_fields(span).get("run_id"), _span_dispatch_fields(span).get("task_slot"))
+            == dispatch_key
+            for span in dispatcher_spans
+        )
+        parent_dispatch_status = "present" if parent_found else "missing"
     global_origin_ns = min([window_lo] + [span.ts for span in dispatcher_spans])
     all_events = _dispatcher_block_events(dispatcher_spans, global_origin_ns)
     rank_metadata = []
@@ -4482,7 +5601,7 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
             except (OSError, ValueError) as error:
                 print(f"Warning: could not save clock alignment: {error}", file=sys.stderr)
         data = _decode_perf_data(raw, timeline_origin_ns=global_origin_ns, placement=placement)
-        artifacts = _load_rank_local_artifacts(records_path)
+        artifacts = _load_rank_local_artifacts(records_path, companion_dirs[rank])
         dispatch_identity = artifacts["dispatch_identity"]
         trace = generate_chrome_trace_json(
             data["tasks"],
@@ -4491,7 +5610,10 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
             args.verbose,
             orchestrator_name=artifacts["orchestrator_name"],
             scheduler_phases=data.get("scheduler_records"),
+            scalar_profiles=data.get("scalar_profiles"),
             scheduler_streams=data.get("scheduler_streams"),
+            scheduler_task_producer=data.get("scheduler_task_producer"),
+            chip_swimlane_level=data["chip_swimlane_level"],
             orchestrator_phases=data.get("aicpu_orchestrator_phases"),
             orchestrator_source=data.get("orchestrator_source"),
             runtime_name=data.get("runtime"),
@@ -4499,6 +5621,7 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
             core_to_thread=data.get("core_to_thread"),
             host_device_uploads=data.get("host_device_uploads"),
             aicpu_lifecycle_records=data.get("aicpu_lifecycle_records"),
+            percounter_task_events=data.get("percounter_task_events"),
             deps_edges=artifacts["deps_edges"],
             deps_kernel_map=artifacts["deps_kernel_map"],
             deps_block_map=artifacts["deps_block_map"],
@@ -4524,7 +5647,7 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
         rank_metadata.append(
             {
                 "rank": rank,
-                "input": str(records_path),
+                "input": os.path.relpath(records_path, _resolve_output_path(args, Path(root)).parent),
                 "trace_status": timeline["trace_status"],
                 "source_timeline_origin_ns": timeline["source_timeline_origin_ns"],
                 "placement": placement.metadata(),
@@ -4544,31 +5667,74 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
             "carries one TaskId layout, so these captures cannot be spliced together."
         )
 
-    metadata = {
-        "layout": "containment_spliced_multi_rank",
-        "runtime": resolve_runtime(next(iter(rank_runtimes)) if rank_runtimes else None),
-        "dispatch": args.dispatch,
-        "dispatch_id": args.dispatch_id,
-        "host_clock_domain_id": next(iter(clock_domains)) if clock_domains else None,
-        "host_logs": [str(path) for path in host_logs],
-        "global_origin_ns": global_origin_ns,
-        # The processes that dispatched to these Ranks, drawn on the Host clock
-        # directly — no containment, so no slack applies to their lanes.
-        "dispatcher_pids": sorted({span.pid for span in dispatcher_spans}),
-        "rank_count": len(rank_metadata),
-        **pairing_metadata,
-        "trace_status": "partial" if any(rank["trace_status"] != "complete" for rank in rank_metadata) else "complete",
-        "ranks": rank_metadata,
-        # Worst case for an interval read between two Ranks: each end carries
-        # its own Rank's slack, so the two largest bound any pair. null means
-        # fewer than two Ranks were placed, never that the comparison is exact.
-        "cross_rank_uncertainty_ns": containment.cross_uncertainty_ns(placements.values()),
-    }
     output_path = _resolve_output_path(args, Path(root))
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w") as f:
-        json.dump({"traceEvents": all_events, "metadata": metadata}, f, indent=2)
+    original_sidecars = None
+    if args.publish_derived_host_logs and args.host_log:
+        original_sidecars = {
+            rank: (directory / "dispatch_identity.json").read_text() for rank, directory in companion_dirs.items()
+        }
+        host_logs = _publish_derived_host_logs(
+            Path(root), output_path, host_logs, companion_dirs, placements, dispatcher_spans
+        )
+        host_log_kind = "derived"
+    try:
+        if original_sidecars is not None:
+            for item in rank_metadata:
+                item["dispatch_identity"] = _load_dispatch_identity(companion_dirs[item["rank"]])
+        metadata = {
+            "layout": "containment_spliced_multi_rank",
+            "runtime": resolve_runtime(next(iter(rank_runtimes)) if rank_runtimes else None),
+            "dispatch": args.dispatch,
+            "dispatch_id": args.dispatch_id,
+            "host_clock_domain_id": next(iter(clock_domains)) if clock_domains else None,
+            "host_logs": [
+                os.path.relpath(path, output_path.parent) if host_log_kind == "derived" else str(path)
+                for path in host_logs
+            ],
+            "global_origin_ns": global_origin_ns,
+            # The processes that dispatched to these Ranks, drawn on the Host clock
+            # directly — no containment, so no slack applies to their lanes.
+            "dispatcher_pids": sorted({span.pid for span in dispatcher_spans}),
+            "parent_dispatch_status": parent_dispatch_status,
+            "rank_count": len(rank_metadata),
+            **pairing_metadata,
+            "trace_status": "partial"
+            if any(rank["trace_status"] != "complete" for rank in rank_metadata)
+            else "complete",
+            "ranks": rank_metadata,
+            # Worst case for an interval read between two Ranks: each end carries
+            # its own Rank's slack, so the two largest bound any pair. null means
+            # fewer than two Ranks were placed, never that the comparison is exact.
+            "cross_rank_uncertainty_ns": containment.cross_uncertainty_ns(placements.values()),
+        }
+        _atomic_json(output_path, {"traceEvents": all_events, "metadata": metadata})
+    except BaseException:
+        if original_sidecars is not None:
+            _publish_identity_updates(companion_dirs, original_sidecars, original_sidecars)
+        raise
     return output_path, rank_metadata
+
+
+def _convert_recorded_window(data, input_path, output_path):
+    """Publish separate traces while leaving the original observations untouched."""
+    timeline = dict(data["timeline_metadata"])
+    companion = output_path.with_name(f"{output_path.stem}.host-preparation.{uuid.uuid4().hex}.json")
+    destinations = [output_path, companion] if data["host_preparation"] else [output_path]
+    for destination in destinations:
+        if destination.resolve() == input_path.resolve() or (destination.exists() and destination.samefile(input_path)):
+            raise ValueError("recorded trace output must not replace its raw input")
+    if data["host_preparation"]:
+        timeline["host_preparation_file"] = companion.name
+        host_timeline = {**timeline, "clock_domain": "host_monotonic_ns", "preparation_only": True}
+        _recorded_trace(data["host_preparation"], companion, data["runtime"], host_timeline)
+    try:
+        _recorded_trace(data["tasks"], output_path, data["runtime"], timeline)
+    except BaseException:
+        if data["host_preparation"]:
+            companion.unlink(missing_ok=True)
+        raise
+    print(f"Recorded-window observations: {output_path} (no replay identity or Host alignment)")
+    return 0
 
 
 def main():
@@ -4609,6 +5775,10 @@ def main():
             print(f"Reading performance data from: {input_path}")
         raw, placement = _prepare_capture_clock_alignment(input_path, args.host_log)
         data = _decode_perf_data(raw, placement=placement)
+        if (data.get("timeline_metadata") or {}).get("recorded_window"):
+            if args.overhead or args.deps_json:
+                raise ValueError("recorded windows cannot derive dependency flows or invocation overhead")
+            return _convert_recorded_window(data, input_path, _resolve_output_path(args, input_path))
         _print_verbose_data_info(data, args.verbose)
 
         func_names, orchestrator_name = _load_func_names(args, input_path)
@@ -4642,7 +5812,10 @@ def main():
             args.verbose,
             orchestrator_name=orchestrator_name,
             scheduler_phases=data.get("scheduler_records"),
+            scalar_profiles=data.get("scalar_profiles"),
             scheduler_streams=data.get("scheduler_streams"),
+            scheduler_task_producer=data.get("scheduler_task_producer"),
+            chip_swimlane_level=data["chip_swimlane_level"],
             orchestrator_phases=data.get("aicpu_orchestrator_phases"),
             orchestrator_source=data.get("orchestrator_source"),
             runtime_name=data.get("runtime"),
@@ -4650,6 +5823,7 @@ def main():
             core_to_thread=data.get("core_to_thread"),
             host_device_uploads=data.get("host_device_uploads"),
             aicpu_lifecycle_records=data.get("aicpu_lifecycle_records"),
+            percounter_task_events=data.get("percounter_task_events"),
             deps_edges=deps_edges,
             deps_kernel_map=deps_kernel_map,
             deps_block_map=deps_block_map,

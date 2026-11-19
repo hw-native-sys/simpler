@@ -1,0 +1,291 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+#pragma once
+#include <gtest/gtest.h>
+#include <algorithm>
+#include <cstring>
+#include <filesystem>
+#include <future>
+#include <functional>
+#include <stdexcept>
+#include <utility>
+#include <limits>
+#include <memory>
+#include <vector>
+#include "device_runner_base.h"
+#include "native_run_context.h"
+#include "runtime_c_api.h"
+#include "task_args.h"
+#include "transport.h"
+#include "utils/retained_temp_bump.h"
+
+namespace native_admission_test {
+// The real prepare path needs runtime-specific orchestration entry points and
+// arena-bank selection. These helpers configure its inputs; tests assert the
+// resulting behavior directly in their own source files.
+void *primary_entry_points();
+void *alternate_entry_points();
+uint32_t arena_bank(uint32_t slot);
+
+using native_admission_transport::control;
+using Fact = WorkspaceManager::RunFact;
+constexpr size_t kUnit = 1024;
+inline int callbacks = 0;
+inline bool refuse_after_callback = false;
+inline std::function<void()> callback_hook;
+extern thread_local bool refuse_next_host_allocation;
+
+enum class AdmissionMode { Automatic, FixedGrant };
+
+class Runner : public DeviceRunnerBase {
+public:
+    explicit Runner(bool managed_workspace = true, AdmissionMode mode = AdmissionMode::Automatic) {
+        device_id_ = 0;
+        timeout_configuration_rc_ = 0;
+        max_block_dim_ = block_dim_ = 1;
+        if (managed_workspace) EXPECT_EQ(install_staged_workspace(), 0);
+        EXPECT_TRUE(set_run_resource_grant(6));
+        if (mode == AdmissionMode::Automatic) enable_automatic_admission();
+        CallableState callable;
+        callable.hash = 1;
+        callable.chip_buffer_hash = 1;
+        callable.signature = {ArgDirection::IN};
+        callable.host_orch_func_ptr = primary_entry_points();
+        callables_[1] = std::move(callable);
+        chip_callable_buffers_[1] = ChipCallableBuffer{};
+    }
+    int prepare_result(uint32_t slot = 0, uint64_t epoch = 1) {
+        KernelArgsHelper args;
+        submission_storage_[slot]->retain_replay_evidence = true;
+        // This low-level evidence fixture explicitly requests the native record.
+        DfxRunConfig dfx;
+        dfx.scope_stats_enabled = true;
+        return ensure_device_run_result_region(NativeRunIdentity{epoch, epoch, epoch, slot}, args, dfx);
+    }
+    int warm_capture_result_caches() {
+        // Fake context initialization omits real Kernel init's optional warm-up.
+        // Requested-capture tests still need actual initialized result backing.
+        DfxRunConfig dfx;
+        dfx.scope_stats_enabled = true;
+        for (uint32_t slot = 0; slot < submission_storage_.size(); ++slot) {
+            const uint64_t epoch = std::numeric_limits<uint64_t>::max() - slot;
+            KernelArgsHelper args;
+            const int rc = ensure_device_run_result_region(NativeRunIdentity{epoch, epoch, epoch, slot}, args, dfx);
+            if (rc != 0) return rc;
+            release_device_run_result(slot, epoch, true);
+        }
+        return 0;
+    }
+    PreparedSubmissionStorage &result_storage(uint32_t slot = 0) { return *submission_storage_[slot]; }
+    int close_result(uint32_t slot = 0) { return release_submission_storage(*submission_storage_[slot], false); }
+    void use_other_entry() { callables_[1].host_orch_func_ptr = alternate_entry_points(); }
+    void allocate_callable() {
+        void *allocation = mem_alloc_.alloc(64);
+        ASSERT_NE(allocation, nullptr);
+        chip_callable_buffers_[1] = ChipCallableBuffer{reinterpret_cast<uint64_t>(allocation), 64, 1};
+    }
+    int callable_refcount() const { return chip_callable_buffers_.at(1).refcount; }
+    void note_device_suspicion() { device_health_.note_own_device_fault(1); }
+    ~Runner() override { EXPECT_EQ(finalize(), 0); }
+    bool can_accept_run() const override { return !admission_poisoned; }
+    void mark_device_unusable(int rc) override {
+        admission_poisoned = true;
+        quarantine_rc = rc;
+        ++quarantine_calls;
+        if (quarantine_throws) throw std::runtime_error("quarantine bookkeeping failed");
+    }
+    void recover_device_or_mark_unusable(int rc) override {
+        ++recovery_calls;
+        recovery_rc = rc;
+        admission_poisoned = true;
+        if (recovery_throws) throw std::runtime_error("recovery failed");
+    }
+    bool ready_to_join_launch() const override { return true; }
+    int fill_persistent_arch_fields(KernelArgs *, uint64_t) override { return 0; }
+    int acquire_scheduler_notifications(
+        uint32_t, SchedulerNotificationPurpose, size_t count, SchedulerDoneNotifications *out
+    ) override {
+        if (out == nullptr) return -1;
+        // The CPU transport has no notification SRAM; exercise the GM fallback.
+        *out = {std::vector<uint64_t>(count, 0), std::vector<uint64_t>(count, 0), {}};
+        return 0;
+    }
+    int prepare_execution_streams(PreparedExecution &prepared, std::shared_ptr<const void> *lease) override {
+        if (execution_mode_latch().is_kernel()) return DeviceRunnerBase::prepare_execution_streams(prepared, lease);
+        // This fixture replaces device submission; its stream identities are
+        // borrowed test tokens, with no RTS resource to destroy.
+        static int streams[2];
+        prepared.streams = {&streams[0], &streams[1]};
+        lease->reset();
+        return 0;
+    }
+
+    int prepare_execution(
+        Runtime &runtime, const CallConfig &config, uint32_t slot, const NativeRunIdentity &identity,
+        std::unique_ptr<PreparedExecution> *out
+    ) override {
+        *out = std::make_unique<PreparedExecution>(identity, runtime, config, slot);
+        return 0;
+    }
+    int launch_refusal_rc{0};
+    bool partial_launch{false};
+    bool launch_throws{false};
+    bool launch_throws_after_submission{false};
+    bool forbid_post_submit_allocation{false};
+    bool admission_poisoned{false};
+    bool recovery_throws{false};
+    int recovery_calls{0};
+    int recovery_rc{0};
+    int launch_calls{0};
+    int drain_calls{0};
+    int quarantine_calls{0};
+    int quarantine_rc{0};
+    bool quarantine_throws{false};
+    bool drain_throws{false};
+    DrainOutcome drain_result = DrainOutcome::device_complete(0);
+    LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override {
+        ++launch_calls;
+        if (launch_throws) throw std::runtime_error("unknown launch progress");
+        if (launch_refusal_rc != 0 && !partial_launch) {
+            return LaunchTransactionResult{launch_refusal_rc, LaunchProgress::NotStarted, LaunchReceipt{}};
+        }
+        auto transaction = exact_launch_transaction(
+            prepared.identity, std::move(permit),
+            [&](LaunchProgressSink &sink) {
+                sink.mark_submitted();
+                return partial_launch ? launch_refusal_rc : 0;
+            },
+            [](LaunchProgressSink &sink) {
+                sink.mark_submitted();
+                return 0;
+            }
+        );
+        if (launch_throws_after_submission) throw std::bad_alloc();
+        if (forbid_post_submit_allocation) refuse_next_host_allocation = true;
+        return transaction;
+    }
+    void abandon_prepared_execution(PreparedExecution &) noexcept override {}
+    int poll_execution(const ActiveExecution &) override { return SIMPLER_NATIVE_RUN_POLL_NOT_READY; }
+    DrainOutcome drain_execution(ActiveExecution &active) override {
+        ++drain_calls;
+        if (drain_throws) throw std::runtime_error("completion not observed");
+        if (drain_result.device_rc == 0 && active.prepared) {
+            const int rc = discharge_boundary_waits(*active.prepared, true);
+            if (rc != 0) return DrainOutcome::device_error(rc);
+        }
+        return drain_result;
+    }
+    int finalize_impl() override { return finalize_common(); }
+    AutoAdmissionState::SlotPlan plan(uint32_t slot) const { return auto_admission_.plan(slot); }
+    size_t charged() const { return workspace_.reserved_bytes(); }
+    bool holds_epoch(uint64_t epoch) const { return workspace_.holds_references(epoch); }
+    bool arena_referenced(uint32_t bank, size_t region) const {
+        void *backing = arena_region_backing(bank, region);
+        return backing != nullptr && workspace_.block_state(backing) == WorkspaceManager::BlockState::Referenced;
+    }
+    const simpler::dfx::HostPhaseRecordStore &phases(uint32_t slot) const { return host_phase_runs_[slot].records; }
+    size_t reservations() const {
+        size_t n = 0;
+        for (const auto &r : native_run_reservations_)
+            n += r.owner != nullptr;
+        return n;
+    }
+    void retire(uint32_t slot, uint64_t epoch) {
+        for (auto fact :
+             {Fact::DrainAttempted, Fact::DrainProvedComplete, Fact::CopybackReturned, Fact::BindingsReleased,
+              Fact::ContextDestroyed})
+            note_workspace_run_fact(NativeRunIdentity{epoch, epoch, epoch, slot}, fact);
+    }
+    void stop_serving() { workspace_.enter_closed(); }
+};
+
+struct Attempt {
+    explicit Attempt(Runner &r, uint32_t slot, uint64_t epoch, size_t payload = 16) :
+        runner(r),
+        bytes(payload, 0x71) {
+        storage = ::operator new(get_runtime_size(), std::align_val_t(get_runtime_alignment()));
+        std::memset(storage, 0, get_runtime_size());
+        descriptor.run_epoch = epoch;
+        descriptor.generation = epoch;
+        descriptor.dispatch_id = epoch;
+        descriptor.pipeline_slot = slot;
+        descriptor.arena_bank = arena_bank(slot);
+        config.aicpu_thread_num = 2;
+        for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
+            config.runtime_env.ring_task_window[i] = 4;
+            config.runtime_env.ring_heap[i] = 1024;
+            config.runtime_env.ring_dep_pool[i] = 4;
+        }
+        ChipTensor tensor;
+        uint32_t shape[] = {static_cast<uint32_t>(bytes.size())};
+        tensor.init_external(bytes.data(), bytes.size(), shape, 1, DataType::UINT8, AddressSpace::HOST);
+        args.add_tensor(tensor);
+    }
+    ~Attempt() {
+        uint64_t magic = 0;
+        std::memcpy(&magic, storage, sizeof(magic));
+        if (magic) EXPECT_EQ(simpler_finalize_run(&runner, storage), 0);
+        ::operator delete(storage, std::align_val_t(get_runtime_alignment()));
+    }
+    int prepare() { return simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor); }
+    bool consume_release() { return consume_released_preparation(storage, get_runtime_size(), descriptor.run_epoch); }
+    bool empty() const {
+        uint64_t magic;
+        std::memcpy(&magic, storage, sizeof(magic));
+        return magic == 0;
+    }
+    Runner &runner;
+    void *storage;
+    std::vector<uint8_t> bytes;
+    ChipStorageTaskArgs args;
+    CallConfig config{};
+    NativeRunDescriptor descriptor{};
+};
+
+std::unique_ptr<Runner> make_fenced_completion_runner();
+
+class NativeAdmissionTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        ASSERT_EQ(control().bytes, 0u);
+        control() = {};
+        callbacks = 0;
+        refuse_after_callback = false;
+        callback_hook = {};
+        refuse_next_host_allocation = false;
+    }
+    void TearDown() override {
+        EXPECT_EQ(control().bytes, 0u);
+        if (!diagnostic_path.empty()) std::filesystem::remove_all(diagnostic_path);
+    }
+    void diagnostics(Attempt &attempt) {
+        const std::string path =
+            std::string("native-admission-") + ::testing::UnitTest::GetInstance()->current_test_info()->name();
+        ASSERT_TRUE(std::filesystem::create_directory(path));
+        diagnostic_path = path;
+        attempt.config.enable_dep_gen = 1;
+        attempt.config.enable_chip_swimlane = static_cast<int>(ChipSwimlaneLevel::ORCH_PHASES);
+        std::strncpy(attempt.config.output_prefix, diagnostic_path.c_str(), sizeof(attempt.config.output_prefix) - 1);
+    }
+    std::string diagnostic_path;
+    static int staging(Runner &r, uint32_t slot, uint64_t epoch, size_t bytes) {
+        DeviceRunnerBase::PrepareWorkspaceScope plan(slot, epoch);
+        void *ptr = nullptr;
+        size_t capacity = 0;
+        return r.acquire_retained_temp(slot, bytes, &ptr, &capacity);
+    }
+    static void launched(Runner &r, uint32_t slot, uint64_t epoch) {
+        r.note_run_resources_proven(slot, epoch);
+        r.note_workspace_run_fact(NativeRunIdentity{epoch, epoch, epoch, slot}, Fact::Launched);
+    }
+};
+
+}  // namespace native_admission_test

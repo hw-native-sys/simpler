@@ -22,17 +22,24 @@
 #include <cerrno>
 #include <csignal>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <exception>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
-#include "remote_endpoint.h"
 #include "ring.h"
+#include "worker_manager.h"
+
+#define private public
+#include "remote_endpoint.h"
+#undef private
 
 namespace {
 
@@ -390,9 +397,14 @@ public:
     remote_l3::ControlName last_control_name{remote_l3::ControlName::PREPARE_CALLABLE};
     remote_l3::RemoteRegistryTarget last_target_registry{remote_l3::RemoteRegistryTarget::REMOTE_TASK_DISPATCHER};
     CallableKind last_callable_kind{CallableKind::PYTHON_IMPORT};
+    int shutdown_calls{0};
 
-    void submit_frame(const std::vector<uint8_t> &frame) override { last_frame = frame; }
+    void submit_frame(const std::vector<uint8_t> &frame) override {
+        if (shutdown_calls != 0) throw std::runtime_error("FakeRemoteTransport: submit after shutdown");
+        last_frame = frame;
+    }
     void submit_progress_frame(const std::vector<uint8_t> &frame) override { submit_frame(frame); }
+    void shutdown() override { ++shutdown_calls; }
 
     bool poll_progress_reply(remote_l3::FrameType frame_type, uint64_t sequence, std::vector<uint8_t> &reply) override {
         if (progress_polls_before_ready > 0) {
@@ -556,6 +568,19 @@ TEST(RemoteEndpoint, ProgressStopReleasesWaitingControl) {
     ring.shutdown();
 }
 
+TEST(RemoteEndpoint, IdleProgressStopDefersTransportShutdownUntilLifecycleFrame) {
+    auto *transport = new FakeRemoteTransport();
+    RemoteL3Endpoint endpoint(3, 99, "fake", std::unique_ptr<RemoteL3Transport>(transport));
+
+    endpoint.request_progress_stop();
+    EXPECT_EQ(transport->shutdown_calls, 0);
+
+    endpoint.shutdown_child();
+    ASSERT_FALSE(transport->last_frame.empty());
+    EXPECT_EQ(remote_l3::decode_frame(transport->last_frame).header.frame_type, remote_l3::FrameType::SHUTDOWN);
+    EXPECT_EQ(transport->shutdown_calls, 1);
+}
+
 TEST(RemoteEndpoint, RemoteTaskErrorMapsToTaskFailure) {
     Ring ring;
     ring.init(1ULL << 20);
@@ -702,6 +727,38 @@ TEST(RemoteSocketTransport, ClosedPeerWriteDoesNotRaiseSigpipe) {
     EXPECT_TRUE(saw_error) << "peer RST did not land before the write";
     EXPECT_EQ(g_sigpipe_count, 0);
     transport.shutdown();
+}
+
+TEST(RemoteEndpoint, IdleSocketProgressStopPreservesLifecycleShutdown) {
+    uint16_t port = 0;
+    int listener = make_loopback_listener(port);
+    ScopedServerThread server;
+    std::vector<uint8_t> received(remote_l3::FRAME_HEADER_BYTES);
+    size_t received_bytes = 0;
+    server.thread() = std::thread([&] {
+        int fd = accept_until_stop(listener, server.stop_flag());
+        if (fd >= 0) {
+            timeval timeout{2, 0};
+            (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            while (received_bytes < received.size()) {
+                ssize_t n = ::recv(fd, received.data() + received_bytes, received.size() - received_bytes, 0);
+                if (n <= 0) break;
+                received_bytes += static_cast<size_t>(n);
+            }
+            ::close(fd);
+        }
+        ::close(listener);
+    });
+    auto transport = std::make_unique<RemoteL3SocketTransport>("127.0.0.1", port, "127.0.0.1", 1, 1.0, 1.0);
+    RemoteL3Endpoint endpoint(0, 1, "socket", std::move(transport));
+    endpoint.request_progress_stop();
+    endpoint.shutdown_child();
+    server.stop_and_join();
+    ASSERT_EQ(received_bytes, remote_l3::FRAME_HEADER_BYTES);
+    auto frame = remote_l3::decode_frame(received);
+    EXPECT_EQ(frame.header.frame_type, remote_l3::FrameType::SHUTDOWN);
+    EXPECT_EQ(frame.header.worker_id, 0);
+    EXPECT_EQ(frame.header.session_id, 1U);
 }
 
 // Every socket test below starts a server thread and then constructs a
@@ -1071,6 +1128,63 @@ TEST(MpiGroupMailboxChannel, GroupArrivalTimeoutFailsTaskWithoutKillingGroup) {
     rank1.join();
     EXPECT_EQ(reply0, std::vector<uint8_t>({0xB0}));
     EXPECT_EQ(reply1, std::vector<uint8_t>({0xB1}));
+}
+
+TEST(MpiGroupMailboxChannel, CompletedReplyWinsAfterTimedWaitReacquiresMutex) {
+    using namespace mpi_group_mailbox;
+    using namespace std::chrono_literals;
+    auto mailbox = ready_mpi_mailbox(2);
+    MpiGroupMailboxChannel channel(mailbox.data(), mailbox.size(), 2, -1, 0.5);
+    auto reply = std::async(std::launch::async, [&] {
+        return channel.exchange_group_task({0x10}, 0, 9, 2);
+    });
+    const auto ready_deadline = std::chrono::steady_clock::now() + 2s;
+    while (true) {
+        std::lock_guard<std::mutex> lock(channel.group_mu_);
+        if (channel.group_arrived_ == 1) break;
+        ASSERT_LT(std::chrono::steady_clock::now(), ready_deadline);
+    }
+    ASSERT_EQ(reply.wait_for(5ms), std::future_status::timeout);
+    {
+        std::lock_guard<std::mutex> lock(channel.group_mu_);
+        // A completed leader has moved the frames and departed before its peer reacquires this mutex.
+        auto dispatched_frames = std::move(channel.group_frames_);
+        EXPECT_EQ(dispatched_frames.size(), 2u);
+        channel.group_frames_.clear();
+        channel.group_replies_ = {{0xB0}, {0xB1}};
+        channel.group_done_ = true;
+        channel.group_leader_running_ = false;
+        channel.group_departed_ = 1;
+        std::this_thread::sleep_for(600ms);
+    }
+    EXPECT_EQ(reply.get(), std::vector<uint8_t>({0xB0}));
+    EXPECT_FALSE(channel.group_active_);
+    EXPECT_FALSE(channel.terminal());
+}
+
+TEST(MpiGroupMailboxChannel, RetiredPriorBatchWinsAfterTimedWaitReacquiresMutex) {
+    using namespace mpi_group_mailbox;
+    using namespace std::chrono_literals;
+    auto mailbox = ready_mpi_mailbox(1);
+    MpiGroupMailboxChannel channel(mailbox.data(), mailbox.size(), 1, -1, 0.5);
+    channel.group_active_ = true;
+    channel.group_task_slot_ = 9;
+    auto reply = std::async(std::launch::async, [&] {
+        return channel.exchange_group_task({0x10}, 0, 10, 1);
+    });
+    ASSERT_EQ(reply.wait_for(5ms), std::future_status::timeout);
+    {
+        std::lock_guard<std::mutex> lock(channel.group_mu_);
+        channel.group_active_ = false;
+        std::this_thread::sleep_for(600ms);
+    }
+    const auto request_deadline = std::chrono::steady_clock::now() + 2s;
+    while (mailbox_state(mailbox, OFF_REQUEST_STATE) != static_cast<int32_t>(RequestState::REQUEST_READY) &&
+           reply.wait_for(0ms) != std::future_status::ready && std::chrono::steady_clock::now() < request_deadline) {}
+    if (mailbox_state(mailbox, OFF_REQUEST_STATE) == static_cast<int32_t>(RequestState::REQUEST_READY))
+        respond_with_payloads(mailbox, {{0xB0}});
+    EXPECT_EQ(reply.get(), std::vector<uint8_t>({0xB0}));
+    EXPECT_FALSE(channel.terminal());
 }
 
 TEST(MpiGroupMailboxTransport, GroupProgressSubmitAndPollRoundTrip) {

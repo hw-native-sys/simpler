@@ -354,7 +354,7 @@ class TestOneWayShutdown:
         """A shutdown requested while a control command is in flight must still
         end the child, even though the CONTROL_DONE it publishes overwrites the
         SHUTDOWN state word."""
-        mailbox = SharedMemory(create=True, size=worker_mod.MAILBOX_SIZE)
+        mailbox = SharedMemory(create=True, size=worker_mod.mailbox_size(worker_mod._DEFAULT_PIPELINE_DEPTH_REQUEST))
         gate = SharedMemory(create=True, size=8)
         mailbox_buf = mailbox.buf
         gate_buf = gate.buf

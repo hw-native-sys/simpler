@@ -7,11 +7,11 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 import fcntl
+import hashlib
 import json
 import logging
 import os
 import shutil
-import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,20 +44,63 @@ def platform_embeds_pto_isa(platform: str) -> bool:
     return arch in {"a2a3", "a5"}
 
 
-def _get_git_head(repo_root: Path) -> str:
-    """Return the current git HEAD commit hash, or empty string if unavailable."""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(repo_root),
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        return result.stdout.strip() if result.returncode == 0 else ""
-    except Exception:  # noqa: BLE001
+def _runtime_source_inputs(repo_root: Path) -> dict:
+    """Snapshot build inputs independently of Git history and file mtimes."""
+    if not (repo_root / "src").is_dir():
+        return {}
+    files = []
+    for directory in (repo_root / "src", repo_root / "cmake"):
+        for base, directories, names in os.walk(directory):
+            directories[:] = sorted(d for d in directories if d not in {"build", "__pycache__", ".git"})
+            for name in names:
+                path = Path(base) / name
+                if name != "compile_commands.json" and path.suffix not in {".md", ".pyc", ".pyo"}:
+                    files.append(path)
+    for name in (
+        "runtime_builder.py",
+        "runtime_compiler.py",
+        "toolchain.py",
+        "platform_info.py",
+        "environment.py",
+        "pto_isa.py",
+    ):
+        path = repo_root / "simpler_setup" / name
+        if path.is_file():
+            files.append(path)
+    return {
+        str(path.relative_to(repo_root)): {
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "mtime_ns": path.stat().st_mtime_ns,
+        }
+        for path in sorted(files)
+    }
+
+
+def _runtime_source_stamp(repo_root: Path) -> str:
+    inputs = _runtime_source_inputs(repo_root)
+    if not inputs:
         return ""
+    digest = hashlib.sha256()
+    for name, entry in inputs.items():
+        digest.update(name.encode() + b"\0")
+        digest.update(bytes.fromhex(entry["sha256"]))
+    return digest.hexdigest()
+
+
+def _runtime_compiler_inputs(compiler) -> dict:
+    """Tool replacements invalidate even custom compiler commands at the same path."""
+    result = {}
+    for name in ("host", "aicpu", "aicore"):
+        target = getattr(compiler, name + "_target", None)
+        toolchain = getattr(target, "toolchain", None)
+        for field in ("cxx_path", "linker_path"):
+            path = getattr(toolchain, field, None)
+            if isinstance(path, str) and Path(path).is_file():
+                result[f"@toolchain/{name}/{field}"] = {
+                    "sha256": hashlib.sha256(path.encode() + Path(path).read_bytes()).hexdigest(),
+                    "mtime_ns": 0,
+                }
+    return result
 
 
 def _normalize_overlay_env(name: str) -> Optional[str]:
@@ -74,20 +117,12 @@ def _normalize_overlay_env(name: str) -> Optional[str]:
 
 
 def _a5_async_workspace_overlay_defines() -> dict[str, str]:
-    """Explicit a5 host backend selection for the two cached overlay options.
+    """Forward the optional RDMA provider selection, clearing stale cached ON values.
 
-    `SIMPLER_ENABLE_PTO_URMA_WORKSPACE` and `SIMPLER_ENABLE_PTO_RDMA_WORKSPACE`
-    are the host CMakeLists' only cached options, so each is forwarded with an
-    explicit ON/OFF: a value left in the CMake cache by an earlier build cannot
-    otherwise survive a reconfigure (build once with RDMA=ON, then unset it, and
-    the cached option stays ON). `SIMPLER_ENABLE_PTO_SDMA_WORKSPACE` is not
-    forwarded — it is an internal marker the CMakeLists derives from these two,
-    and a `-D` value for it is overwritten unconditionally.
+    A5 SDMA and URMA providers are always compiled. Compilation creates no
+    resources; communication domains select their engines at allocation time.
     """
-    return {
-        "SIMPLER_ENABLE_PTO_URMA_WORKSPACE": _normalize_overlay_env("SIMPLER_ENABLE_PTO_URMA_WORKSPACE") or "OFF",
-        "SIMPLER_ENABLE_PTO_RDMA_WORKSPACE": _normalize_overlay_env("SIMPLER_ENABLE_PTO_RDMA_WORKSPACE") or "OFF",
-    }
+    return {"SIMPLER_ENABLE_PTO_RDMA_WORKSPACE": _normalize_overlay_env("SIMPLER_ENABLE_PTO_RDMA_WORKSPACE") or "OFF"}
 
 
 def _abbrev_stamp(stamp: str) -> str:
@@ -106,40 +141,72 @@ def _abbrev_stamp(stamp: str) -> str:
     return runtime[:12]
 
 
-def _invalidate_cache_if_stale(target_cache_dir: Path, current_stamp: str) -> None:
-    """Clear target_cache_dir if it was built from a different source stamp.
+def _invalidate_cache_if_stale(target_cache_dir: Path, current_stamp: str, *, inputs: Optional[dict] = None) -> None:
+    """Preserve CMake incrementality; clean when timestamps cannot prove freshness.
 
-    git does not update file mtimes on checkout, so cmake's incremental build
-    cannot detect that source files changed. Comparing the stamp stored at last
-    build time against the current one is a reliable signal that sources may
-    have changed and a clean rebuild is needed. The stamp is the runtime repo
-    HEAD, extended with the pto-isa commit for builds that embed pto-isa
-    headers (see RuntimeBuilder._build_cache_stamp).
-
-    When the current stamp can't be determined (no git, transient failure),
-    fall through to a clean rebuild — a fresh compile is cheap relative to
-    the risk of linking against stale objects.
+    Changed inputs newer than every object are handled by normal CMake depfiles.
+    Backdated/removed inputs, tool replacements, pin changes, and missing identity
+    require a clean build. The stored input map is tied to its source stamp.
     """
-    if not current_stamp:
-        if target_cache_dir.is_dir():
-            logger.info("build stamp unavailable, clearing cmake cache: %s", target_cache_dir)
-            shutil.rmtree(target_cache_dir)
-        target_cache_dir.mkdir(parents=True, exist_ok=True)
-        return
     commit_file = target_cache_dir / _GIT_COMMIT_FILE
-    if commit_file.is_file():
-        cached_stamp = commit_file.read_text().strip()
-        if cached_stamp == current_stamp:
-            return
+    inputs_file = target_cache_dir / ".runtime_inputs.json"
+    cached_stamp = commit_file.read_text().strip() if commit_file.is_file() else ""
+    try:
+        previous = json.loads(inputs_file.read_text()) if inputs_file.is_file() else {}
+    except (ValueError, OSError):
+        previous = {}
+    if not isinstance(previous, dict):
+        previous = {}
+    raw_files = previous.get("files")
+    valid_inputs = isinstance(raw_files, dict) and all(
+        isinstance(entry, dict) and isinstance(entry.get("sha256"), str) and isinstance(entry.get("mtime_ns"), int)
+        for entry in raw_files.values()
+    )
+    old_inputs = raw_files if isinstance(raw_files, dict) else {}
+    trusted = inputs is not None and previous.get("stamp") == cached_stamp and valid_inputs
+    changed = []
+    if trusted and inputs is not None:
+        changed = [
+            name
+            for name in old_inputs.keys() | inputs.keys()
+            if old_inputs.get(name, {}).get("sha256") != inputs.get(name, {}).get("sha256")
+        ]
+    clean = (
+        not current_stamp
+        or cached_stamp != current_stamp
+        or (trusted and bool(changed))
+        or (inputs is not None and not trusted)
+    )
+    if clean and current_stamp and cached_stamp and trusted and inputs is not None:
+        same_pin = cached_stamp.partition(":pto-isa=")[2] == current_stamp.partition(":pto-isa=")[2]
+        newest_object = max(
+            (
+                p.stat().st_mtime_ns
+                for p in target_cache_dir.rglob("*")
+                if p.is_file() and p.suffix in {".o", ".so", ".a"}
+            ),
+            default=0,
+        )
+        cmake_can_detect = all(
+            name in inputs and not name.startswith("@toolchain/") and inputs[name]["mtime_ns"] > newest_object
+            for name in changed
+        )
+        if same_pin and cmake_can_detect:
+            clean = False
+    if clean and target_cache_dir.is_dir():
         logger.info(
-            "build stamp changed (%s → %s), clearing cmake cache: %s",
+            "Runtime cache requires clean rebuild (%s -> %s): %s",
             _abbrev_stamp(cached_stamp),
             _abbrev_stamp(current_stamp),
             target_cache_dir,
         )
         shutil.rmtree(target_cache_dir)
     target_cache_dir.mkdir(parents=True, exist_ok=True)
+    if not current_stamp:
+        return
     commit_file.write_text(current_stamp + "\n")
+    if inputs is not None:
+        inputs_file.write_text(json.dumps({"stamp": current_stamp, "files": inputs}, sort_keys=True) + "\n")
 
 
 @dataclass
@@ -160,7 +227,7 @@ class RuntimeBinaries:
     """
 
     host_path: Path
-    aicpu_path: Path
+    aicpu_path: Optional[Path]
     aicore_path: Path
     sim_context_path: Optional[Path] = None
     dispatcher_path: Optional[Path] = None
@@ -230,13 +297,17 @@ class RuntimeBuilder:
         cfg = build_config[target]
         include_dirs = [str((config_dir / p).resolve()) for p in cfg["include_dirs"]]
         source_dirs = [str((config_dir / p).resolve()) for p in cfg["source_dirs"]]
+        if self._arch == "a5" and config_dir.name == "tensormap_and_ringbuffer":
+            from .pto_isa import ensure_pto_isa_root  # noqa: PLC0415
+
+            include_dirs.append(str(Path(ensure_pto_isa_root()) / "include"))
         return include_dirs, source_dirs
 
     def _requires_pto_isa_metadata_validation(self) -> bool:
         """Return True when this runtime embeds PTO-ISA headers into host code.
 
         Driven by :func:`platform_embeds_pto_isa`: a2a3 and a5 onboard always
-        embed one async workspace backend; simulation platforms do not.
+        embed async workspace backends; simulation platforms do not.
         """
         return platform_embeds_pto_isa(self.platform)
 
@@ -245,32 +316,26 @@ class RuntimeBuilder:
 
         When host code embeds pto-isa headers (a2a3 or a5 onboard), a pto-isa
         bump must invalidate that build's
-        cmake cache even when the runtime repo HEAD is unchanged (issue #1139:
+        cmake cache even when the runtime source content is unchanged (issue #1139:
         a stale host_runtime.so compiled against the old headers otherwise
-        survives a reinstall). For every other arch/variant the pto-isa
-        revision does not affect the compiled objects, so return "" and leave
-        the stamp keyed on the runtime HEAD.
+        survives a reinstall). A5 simulation includes ISA workspace types too,
+        so its cache stamp includes the pin. Other simulation builds return ""
+        and leave the
+        stamp keyed on the runtime source content.
 
         ``pto_isa.pin`` is the single source of truth. If the pin is missing or
         invalid, let ``read_pto_isa_pin`` raise so an embedding onboard build
         cannot silently proceed with unknown PTO-ISA headers.
         """
-        if not self._requires_pto_isa_metadata_validation():
+        if not self._requires_pto_isa_metadata_validation() and self.platform not in {"a5sim", "wsesim"}:
             return ""
         from .pto_isa import read_pto_isa_pin  # noqa: PLC0415
 
         return read_pto_isa_pin()
 
     def _build_cache_stamp(self, pto_isa_commit: Optional[str] = None) -> str:
-        """Stamp identifying the sources this build was compiled from.
-
-        Combines the runtime repo HEAD with the pto-isa commit for a2a3 and a5
-        onboard builds so the cmake cache is invalidated whenever either
-        changes. An empty runtime HEAD is preserved verbatim so the
-        ``_invalidate_cache_if_stale`` 'unavailable → clean rebuild' path still
-        fires rather than being masked by a present pto-isa commit.
-        """
-        runtime_commit = _get_git_head(PROJECT_ROOT)
+        """Identify runtime source contents and the pinned PTO-ISA headers."""
+        runtime_commit = _runtime_source_stamp(PROJECT_ROOT)
         if not runtime_commit:
             return ""
         if pto_isa_commit is None:
@@ -299,6 +364,8 @@ class RuntimeBuilder:
         missing = []
         for target in TARGETS:
             target_obj = getattr(compiler, f"{target}_target")
+            if target == "aicpu" and target_obj is None:
+                continue
             binary = output_dir / target_obj.get_binary_name()
             paths[target] = binary
             if not binary.is_file():
@@ -333,7 +400,7 @@ class RuntimeBuilder:
 
         return RuntimeBinaries(
             host_path=paths["host"],
-            aicpu_path=paths["aicpu"],
+            aicpu_path=paths.get("aicpu"),
             aicore_path=paths["aicore"],
             sim_context_path=sim_context_path,
             dispatcher_path=dispatcher_path,
@@ -396,6 +463,7 @@ class RuntimeBuilder:
 
         build_pto_isa_commit = self._resolve_build_pto_isa_commit()
         cache_stamp = self._build_cache_stamp(build_pto_isa_commit)
+        cache_inputs = {**_runtime_source_inputs(PROJECT_ROOT), **_runtime_compiler_inputs(compiler)}
         # Every build gets a fully specified configuration, so a value from an earlier
         # profiling build cannot survive in the CMake cache as a default. Merged rather
         # than substituted: cmake/profiling_config.cmake defaults only the variables
@@ -443,7 +511,7 @@ class RuntimeBuilder:
             lock_path = cache_dir / f".{target}.lock"
             with open(lock_path, "w") as lock_fd:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                _invalidate_cache_if_stale(cache_dir / target, cache_stamp)
+                _invalidate_cache_if_stale(cache_dir / target, cache_stamp, inputs=cache_inputs)
                 return compiler.compile(  # type: ignore[return-value]
                     target,
                     include_dirs,
@@ -459,12 +527,12 @@ class RuntimeBuilder:
 
         with ThreadPoolExecutor(max_workers=4) as executor:
             fut_host = executor.submit(_compile_target, "host")
-            fut_aicpu = executor.submit(_compile_target, "aicpu")
+            fut_aicpu = executor.submit(_compile_target, "aicpu") if compiler.aicpu_target is not None else None
             fut_aicore = executor.submit(_compile_target, "aicore")
             fut_sim_ctx = executor.submit(self.ensure_sim_context, build=build_shared) if variant == "sim" else None
 
             host_path = fut_host.result()
-            aicpu_path = fut_aicpu.result()
+            aicpu_path = fut_aicpu.result() if fut_aicpu is not None else None
             aicore_path = fut_aicore.result()
             sim_context_path = fut_sim_ctx.result() if fut_sim_ctx else None
 
@@ -590,6 +658,8 @@ class RuntimeBuilder:
         arch, variant = self._arch, self._variant
         entries = []
         for target in TARGETS:
+            if target == "aicpu" and self._runtime_compiler.aicpu_target is None:
+                continue
             cc = self._CACHE_DIR / arch / variant / runtime_name / target / "compile_commands.json"
             if cc.exists():
                 try:

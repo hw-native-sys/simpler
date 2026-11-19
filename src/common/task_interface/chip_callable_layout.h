@@ -12,7 +12,7 @@
  * Platform-agnostic ChipCallable layout / content-hash / function-table helpers
  * used by DeviceRunner::upload_chip_callable_buffer on every platform variant.
  *
- * The byte-size math (mirroring make_callable<>()'s layout), the FNV-1a dedup
+ * The byte-size math (mirroring make_chip_callable()'s layout), the FNV-1a dedup
  * hash, and the derivation of the callable's two func_id-indexed tables are
  * identical on onboard and sim. Only the H2D mechanism diverges: onboard
  * rtMemcpy's the scratch into device GM after rewriting each child's
@@ -32,17 +32,17 @@
 
 struct ChipCallableLayout {
     size_t header_size;          // offsetof(ChipCallable, storage_)
-    size_t total_size;           // header_size + storage_used (matches make_callable())
-    uint64_t content_hash;       // FNV-1a 64 over [callable, total_size)
+    size_t total_size;           // header_size + storage_used
+    uint64_t content_hash;       // FNV-1a 64 over the normalized callable image
     uint64_t aicore_image_hash;  // FNV-1a 64 over func ids and child binaries
 };
 
 /**
  * Compute byte-size and content hash for a ChipCallable buffer.
  *
- * `storage_used` is max(binary_size, child_offset[i] + CoreCallable header +
- * child binary_size) over all children — same arithmetic make_callable<>()
- * uses when emitting the host buffer.
+ * `storage_used` is the maximum of the parent binary size, each child offset
+ * plus its binary data offset and binary size, and the CCU package end if present.
+ * The caller must validate the complete image against its actual buffer size first.
  */
 inline ChipCallableLayout compute_chip_callable_layout(const ChipCallable *callable) {
     constexpr size_t kHeaderSize = offsetof(ChipCallable, storage_);
@@ -63,8 +63,27 @@ inline ChipCallableLayout compute_chip_callable_layout(const ChipCallable *calla
         size_t end = static_cast<size_t>(callable->child_offset(i)) + child_total;
         if (end > storage_used) storage_used = end;
     }
+    if (callable->ccu_modules_size_ != 0) {
+        const size_t ccu_end =
+            static_cast<size_t>(callable->ccu_modules_offset_) + static_cast<size_t>(callable->ccu_modules_size_);
+        if (ccu_end > storage_used) storage_used = ccu_end;
+    }
     const size_t total_size = kHeaderSize + storage_used;
-    const uint64_t hash = simpler::common::utils::fnv1a_64(reinterpret_cast<const uint8_t *>(callable), total_size);
+    // Identity must agree before upload, after deserialization, and in the
+    // retained registration. Hash normalized metadata without mutating input.
+    const auto *bytes = reinterpret_cast<const uint8_t *>(callable);
+    uint64_t hash = simpler::common::utils::fnv1a_64(bytes, 0);
+    size_t cursor = 0;
+    for (int32_t i = 0; i < child_count; ++i) {
+        const size_t offset = kHeaderSize + callable->child_offset(i) + offsetof(CoreCallable, async_capability_);
+        if (offset < cursor || offset > total_size || sizeof(CoreAsyncCapability) > total_size - offset)
+            throw std::invalid_argument("invalid CoreCallable capability range");
+        const auto capability = normalize_core_async_capability(callable->child(i).async_capability());
+        hash = simpler::common::utils::fnv1a_64_append(hash, bytes + cursor, offset - cursor);
+        hash = simpler::common::utils::fnv1a_64_append(hash, &capability, sizeof(capability));
+        cursor = offset + sizeof(capability);
+    }
+    hash = simpler::common::utils::fnv1a_64_append(hash, bytes + cursor, total_size - cursor);
     return ChipCallableLayout{kHeaderSize, total_size, hash, aicore_image_hash};
 }
 

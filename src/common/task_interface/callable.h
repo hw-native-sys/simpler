@@ -31,19 +31,25 @@
  *
  * Type aliases:
  *   CoreCallable = Callable<void, CORE_MAX_TENSOR_ARGS, 0>       — leaf kernel binary
- *   ChipCallable = Callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024> — orchestration + child kernels
+ *   ChipCallable = Callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, CHIP_MAX_CHILDREN> — orchestration + child kernels
  */
 
 #pragma once
 
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
 
 #include "arg_direction.h"
+#include "callable_limits.h"
+#include "ccu_module_package.h"
+#include "core_async_capability.h"
+
+inline constexpr uint32_t CHIP_CALLABLE_WIRE_VERSION = 1U;
 
 // signature contains sig_count validated entries.
 inline int32_t count_scalar_args(const ArgDirection *signature, int32_t sig_count) {
@@ -71,6 +77,7 @@ struct Callable<void, MaxSig, 0> {
     int32_t sig_count_;
     uint32_t binary_size_;
     uint64_t resolved_addr_;
+    CoreAsyncCapability async_capability_;
     char storage_[];
 
     ArgDirection sig(int32_t i) const {
@@ -81,6 +88,7 @@ struct Callable<void, MaxSig, 0> {
     uint32_t binary_size() const { return binary_size_; }
     uint64_t resolved_addr() const { return resolved_addr_; }
     void set_resolved_addr(uint64_t addr) { resolved_addr_ = addr; }
+    CoreAsyncCapability async_capability() const { return async_capability_; }
 
     // Binary data is placed at the next CALLABLE_ALIGN boundary after the fixed fields.
     // storage_ sits between the fixed fields and the aligned binary; binary_data()
@@ -96,8 +104,10 @@ private:
     Callable() = default;
 
     template <int MS>
-    friend std::vector<uint8_t>
-    make_callable(const ArgDirection *sig, int32_t sig_count, const void *binary, uint32_t binary_size);
+    friend std::vector<uint8_t> make_callable(
+        const ArgDirection *sig, int32_t sig_count, const void *binary, uint32_t binary_size,
+        const CoreAsyncCapability &capability
+    );
 };
 
 // ============================================================================
@@ -108,6 +118,8 @@ static constexpr int CALLABLE_FUNC_NAME_MAX = 64;
 
 template <typename Child, int MaxSig, int MaxChildren>
 struct Callable {
+    static constexpr int MAX_CHILDREN = MaxChildren;
+
     ArgDirection signature_[MaxSig];
     int32_t sig_count_;
     uint32_t binary_size_;
@@ -118,6 +130,9 @@ struct Callable {
     int32_t child_count_;
     char config_name_[CALLABLE_FUNC_NAME_MAX];
     uint32_t config_name_len_;
+    uint32_t wire_version_;
+    uint32_t ccu_modules_offset_;
+    uint32_t ccu_modules_size_;
     // Children live in storage_ at CALLABLE_ALIGN-aligned offsets, but the
     // all-uint32 header above can leave offsetof(storage_) at 4-mod-8, which
     // would place an 8-byte-aligned Child (CoreCallable has a uint64) on a
@@ -139,6 +154,10 @@ struct Callable {
     uint32_t func_name_len() const { return func_name_len_; }
     const char *config_name() const { return config_name_; }
     uint32_t config_name_len() const { return config_name_len_; }
+    std::vector<std::vector<uint8_t>> ccu_modules() const {
+        return unpack_ccu_modules(storage_ + ccu_modules_offset_, ccu_modules_size_);
+    }
+    uint32_t ccu_module_count() const { return ::ccu_module_count(storage_ + ccu_modules_offset_, ccu_modules_size_); }
     int32_t scalar_count() const {
         if (sig_count_ < 0 || sig_count_ > MaxSig) {
             throw std::invalid_argument(
@@ -179,7 +198,7 @@ private:
 // ============================================================================
 
 using CoreCallable = Callable<void, CORE_MAX_TENSOR_ARGS, 0>;
-using ChipCallable = Callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>;
+using ChipCallable = Callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, CHIP_MAX_CHILDREN>;
 
 // storage_ holds CoreCallable children at CALLABLE_ALIGN-aligned offsets; the
 // child kernel binary's device address is offsetof(storage_) + child_offset +
@@ -197,10 +216,8 @@ static_assert(
 );
 
 // Callable bytes are shipped through L3/L4 IPC and the on-disk kernel cache,
-// so the header layout is wire ABI. The constants below encode
-// CHIP_MAX_TENSOR_ARGS = 256, CORE_MAX_TENSOR_ARGS = 32,
-// CALLABLE_FUNC_NAME_MAX = 64, and MaxChildren = 1024; a deliberate capacity
-// change updates them in the same commit.
+// so the header layout is wire ABI. These explicit size and offset assertions
+// pin the layout independently of the capacity constants.
 static_assert(
     std::is_trivially_copyable_v<ChipCallable> && std::is_standard_layout_v<ChipCallable>,
     "ChipCallable wire ABI: must stay memcpy-able POD"
@@ -215,20 +232,26 @@ static_assert(offsetof(ChipCallable, binary_size_) == 1028, "ChipCallable wire A
 static_assert(offsetof(ChipCallable, func_name_) == 1032, "ChipCallable wire ABI: func_name offset changed");
 static_assert(offsetof(ChipCallable, func_name_len_) == 1096, "ChipCallable wire ABI: func_name_len offset changed");
 static_assert(offsetof(ChipCallable, child_func_ids_) == 1100, "ChipCallable wire ABI: child_func_ids offset changed");
-static_assert(offsetof(ChipCallable, child_offsets_) == 5196, "ChipCallable wire ABI: child_offsets offset changed");
-static_assert(offsetof(ChipCallable, child_count_) == 9292, "ChipCallable wire ABI: child_count offset changed");
-static_assert(offsetof(ChipCallable, config_name_) == 9296, "ChipCallable wire ABI: config_name offset changed");
+static_assert(offsetof(ChipCallable, child_offsets_) == 9292, "ChipCallable wire ABI: child_offsets offset changed");
+static_assert(offsetof(ChipCallable, child_count_) == 17484, "ChipCallable wire ABI: child_count offset changed");
+static_assert(offsetof(ChipCallable, config_name_) == 17488, "ChipCallable wire ABI: config_name offset changed");
 static_assert(
-    offsetof(ChipCallable, config_name_len_) == 9360, "ChipCallable wire ABI: config_name_len offset changed"
+    offsetof(ChipCallable, config_name_len_) == 17552, "ChipCallable wire ABI: config_name_len offset changed"
 );
-static_assert(offsetof(ChipCallable, storage_) == 9376, "ChipCallable wire ABI: storage offset changed");
-static_assert(sizeof(ChipCallable) == 9376, "ChipCallable wire ABI: header size changed");
+static_assert(offsetof(ChipCallable, wire_version_) == 17556, "ChipCallable wire ABI: version offset changed");
+static_assert(offsetof(ChipCallable, ccu_modules_offset_) == 17560, "ChipCallable wire ABI: CCU module offset changed");
+static_assert(offsetof(ChipCallable, ccu_modules_size_) == 17564, "ChipCallable wire ABI: CCU module size changed");
+static_assert(offsetof(ChipCallable, storage_) == 17568, "ChipCallable wire ABI: storage offset changed");
+static_assert(sizeof(ChipCallable) == 17568, "ChipCallable wire ABI: header size changed");
 static_assert(offsetof(CoreCallable, signature_) == 0, "CoreCallable wire ABI: signature offset changed");
 static_assert(offsetof(CoreCallable, sig_count_) == 128, "CoreCallable wire ABI: sig_count offset changed");
 static_assert(offsetof(CoreCallable, binary_size_) == 132, "CoreCallable wire ABI: binary_size offset changed");
 static_assert(offsetof(CoreCallable, resolved_addr_) == 136, "CoreCallable wire ABI: resolved_addr offset changed");
-static_assert(offsetof(CoreCallable, storage_) == 144, "CoreCallable wire ABI: storage offset changed");
-static_assert(sizeof(CoreCallable) == 144, "CoreCallable wire ABI: header size changed");
+static_assert(
+    offsetof(CoreCallable, async_capability_) == 144, "CoreCallable wire ABI: async capability offset changed"
+);
+static_assert(offsetof(CoreCallable, storage_) == 152, "CoreCallable wire ABI: storage offset changed");
+static_assert(sizeof(CoreCallable) == 152, "CoreCallable wire ABI: header size changed");
 static_assert(CoreCallable::binary_data_offset() == 192, "CoreCallable wire ABI: binary data offset changed");
 
 // ============================================================================
@@ -236,8 +259,11 @@ static_assert(CoreCallable::binary_data_offset() == 192, "CoreCallable wire ABI:
 // ============================================================================
 
 template <int MaxSig>
-std::vector<uint8_t>
-make_callable(const ArgDirection *sig, int32_t sig_count, const void *binary, uint32_t binary_size) {
+std::vector<uint8_t> make_callable(
+    const ArgDirection *sig, int32_t sig_count, const void *binary, uint32_t binary_size,
+    const CoreAsyncCapability &capability
+) {
+    const auto normalized_capability = normalize_core_async_capability(capability);
     if (sig_count > MaxSig) {
         throw std::invalid_argument(
             "make_callable: requested tensor count " + std::to_string(sig_count) + " exceeds supported tensor count " +
@@ -259,9 +285,18 @@ make_callable(const ArgDirection *sig, int32_t sig_count, const void *binary, ui
     obj->sig_count_ = sig_count;
     obj->binary_size_ = binary_size;
     obj->resolved_addr_ = 0;
+    obj->async_capability_ = normalized_capability;
     if (binary_size > 0) std::memcpy(buf.data() + aligned_header, binary, binary_size);
 
     return buf;
+}
+
+// Legacy callers do not declare async capability. Reserve the full deferred
+// contract rather than infer that their kernel is synchronous.
+template <int MaxSig>
+std::vector<uint8_t>
+make_callable(const ArgDirection *sig, int32_t sig_count, const void *binary, uint32_t binary_size) {
+    return make_callable<MaxSig>(sig, sig_count, binary, binary_size, CoreAsyncCapability{});
 }
 
 // ============================================================================
@@ -305,6 +340,7 @@ std::vector<uint8_t> make_callable(
         obj->signature_[i] = sig[i];
     obj->sig_count_ = sig_count;
     obj->binary_size_ = binary_size;
+    obj->wire_version_ = CHIP_CALLABLE_WIRE_VERSION;
 
     // Store func_name (null-terminated, truncated to CALLABLE_FUNC_NAME_MAX-1)
     std::memset(obj->func_name_, 0, CALLABLE_FUNC_NAME_MAX);
@@ -340,4 +376,93 @@ std::vector<uint8_t> make_callable(
     obj->child_count_ = child_count;
 
     return buf;
+}
+
+inline void normalize_chip_callable_buffer(void *raw, size_t size);
+
+inline std::vector<uint8_t> make_chip_callable(
+    const ArgDirection *sig, int32_t sig_count, const char *func_name, const void *binary, uint32_t binary_size,
+    const int32_t *child_func_ids, const std::vector<uint8_t> *child_buffers, int32_t child_count,
+    const char *config_name, const std::vector<std::vector<uint8_t>> &ccu_modules = {}
+) {
+    auto buffer = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, ChipCallable::MAX_CHILDREN>(
+        sig, sig_count, func_name, binary, binary_size, child_func_ids, child_buffers, child_count, config_name
+    );
+    const auto package = pack_ccu_modules(ccu_modules);
+    if (!package.empty()) {
+        const size_t offset = buffer.size() - offsetof(ChipCallable, storage_);
+        if (offset > std::numeric_limits<uint32_t>::max() ||
+            package.size() > std::numeric_limits<uint32_t>::max() - offset)
+            throw std::invalid_argument("make_chip_callable: storage exceeds wire size limit");
+        buffer.insert(buffer.end(), package.begin(), package.end());
+        auto *callable = reinterpret_cast<ChipCallable *>(buffer.data());
+        callable->ccu_modules_offset_ = static_cast<uint32_t>(offset);
+        callable->ccu_modules_size_ = static_cast<uint32_t>(package.size());
+    }
+    normalize_chip_callable_buffer(buffer.data(), buffer.size());
+    return buffer;
+}
+
+inline void validate_chip_callable_buffer(const void *raw, size_t size) {
+    constexpr size_t header_size = offsetof(ChipCallable, storage_);
+    if (raw == nullptr || size < header_size) throw std::invalid_argument("ChipCallable header is truncated");
+    const auto *callable = static_cast<const ChipCallable *>(raw);
+    if (callable->wire_version_ != CHIP_CALLABLE_WIRE_VERSION)
+        throw std::invalid_argument("unsupported ChipCallable wire version; rebuild the artifact");
+    const size_t storage_size = size - header_size;
+    if (callable->sig_count_ < 0 || callable->sig_count_ > CHIP_MAX_TENSOR_ARGS)
+        throw std::invalid_argument(
+            "ChipCallable signature count " + std::to_string(callable->sig_count_) +
+            " is outside the supported range [0, " + std::to_string(CHIP_MAX_TENSOR_ARGS) + "]"
+        );
+    if (callable->child_count_ < 0 || callable->child_count_ > ChipCallable::MAX_CHILDREN ||
+        callable->binary_size_ > storage_size || callable->func_name_len_ >= CALLABLE_FUNC_NAME_MAX ||
+        callable->config_name_len_ >= CALLABLE_FUNC_NAME_MAX ||
+        callable->func_name_[callable->func_name_len_] != '\0' ||
+        callable->config_name_[callable->config_name_len_] != '\0')
+        throw std::invalid_argument("invalid ChipCallable header fields");
+    const auto validate_signature = [](const ArgDirection *signature, int32_t count) {
+        for (int32_t i = 0; i < count; ++i) {
+            const auto direction = static_cast<int32_t>(signature[i]);
+            if (direction < static_cast<int32_t>(ArgDirection::SCALAR) ||
+                direction > static_cast<int32_t>(ArgDirection::INOUT))
+                throw std::invalid_argument("invalid callable signature direction");
+        }
+    };
+    validate_signature(callable->signature_, callable->sig_count_);
+    size_t end = callable->binary_size_;
+    for (int32_t i = 0; i < callable->child_count_; ++i) {
+        const size_t offset = callable->child_offsets_[i];
+        if (offset % CALLABLE_ALIGN != 0 || offset < end || offset > storage_size ||
+            CoreCallable::binary_data_offset() > storage_size - offset)
+            throw std::invalid_argument("invalid ChipCallable child range");
+        const auto &child = callable->child(i);
+        if (child.sig_count_ < 0 || child.sig_count_ > CORE_MAX_TENSOR_ARGS ||
+            child.binary_size_ > storage_size - offset - CoreCallable::binary_data_offset())
+            throw std::invalid_argument("invalid CoreCallable header fields");
+        validate_signature(child.signature_, child.sig_count_);
+        (void)normalize_core_async_capability(child.async_capability());
+        end = offset + CoreCallable::binary_data_offset() + child.binary_size_;
+    }
+    if (callable->ccu_modules_size_ != 0) {
+        if (callable->ccu_modules_offset_ != end || callable->ccu_modules_offset_ > storage_size ||
+            callable->ccu_modules_size_ != storage_size - callable->ccu_modules_offset_)
+            throw std::invalid_argument("invalid ChipCallable CCU module range");
+        callable->ccu_module_count();
+        end = callable->ccu_modules_offset_ + static_cast<size_t>(callable->ccu_modules_size_);
+    } else if (callable->ccu_modules_offset_ != 0) {
+        throw std::invalid_argument("empty ChipCallable CCU module table has nonzero offset");
+    }
+    if (end != storage_size) throw std::invalid_argument("ChipCallable has trailing bytes");
+}
+
+// Only call on owned storage. Validate the entire image before writing any
+// child, so malformed input never leaves a partially normalized artifact.
+inline void normalize_chip_callable_buffer(void *raw, size_t size) {
+    validate_chip_callable_buffer(raw, size);
+    auto *callable = static_cast<ChipCallable *>(raw);
+    for (int32_t i = 0; i < callable->child_count(); ++i) {
+        auto &child = const_cast<CoreCallable &>(callable->child(i));
+        child.async_capability_ = normalize_core_async_capability(child.async_capability());
+    }
 }

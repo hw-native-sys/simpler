@@ -1,5 +1,14 @@
 # A5 HBG SSBUF completion-generation mismatch
 
+This page records the historical SSBUF mailbox investigation and its results.
+The current resident scheduler retires each own slot directly after the kernel
+return boundary. It has no own-slot generation, remote MIX mailbox, or SSBUF
+completion token. GM MIX uses admission, GM mailboxes, and per-core own slots.
+The local alignment findings below remain relevant to CCEC code generation;
+the historical mailbox layout and timing numbers are not the current protocol.
+See the [current execution walkthrough](../zh-cn/a5-hbg-aicore-walkthrough/02-ready-execution.md)
+and [completion contract](../zh-cn/a5-hbg-aicore-walkthrough/03-cooperative-completion.md).
+
 ## Failure signature and scope
 
 The initial SSBUF mailbox implementation failed on A5 at
@@ -41,7 +50,7 @@ this compiled implementation and a working source-level workaround. They do
 not identify a specific faulty compiler pass, prove that every over-aligned
 local object is broken, or establish an eight-argument hardware limit.
 
-## Implementation contract
+## Implementation contract at the time of the investigation
 
 - `SchedulerExecutorTaskTrace` is a naturally aligned 48-byte payload. Its
   local copies do not impose cache-line alignment on `SchedulerLocalState`.
@@ -98,7 +107,7 @@ local object is broken, or establish an eight-argument hardware limit.
   computes dispatch-to-kernel latency without an Executor-side GM timestamp read.
   The JSON schema and the 1 KiB reservation are unchanged.
 
-## Regression coverage
+## Historical regression coverage
 
 The final implementation passed ten hardware rounds with golden checking
 for each of the three target cases. The single-core-DAG scene suite also
@@ -132,7 +141,7 @@ Run the architecture precheck before taking the `task-submit` allocation;
 execute these commands inside that allocation with the worktree's venv
 activated. See [Testing](../testing.md) for rebuild requirements.
 
-## Performance cross-check
+## Historical performance cross-check
 
 Both orders ran on device 3, inside exclusive `task-submit` allocations:
 100 rounds per case and revision, chip-swimlane disabled, golden checking

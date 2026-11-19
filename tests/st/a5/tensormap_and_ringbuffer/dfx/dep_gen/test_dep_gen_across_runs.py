@@ -158,12 +158,14 @@ class TestDepGenAcrossRuns(SceneTestCase):
         {
             "name": "vector",
             "platforms": ["a5sim", "a5"],
+            "manual": ["a5sim"],
             "config": {"device_count": 1, "num_sub_workers": 0},
             "params": {"graph": "vector"},
         },
         {
             "name": "barrier",
             "platforms": ["a5sim", "a5"],
+            "manual": ["a5sim"],
             "config": {"device_count": 1, "num_sub_workers": 0, "aicpu_thread_num": 2},
             "params": {"graph": "barrier"},
         },

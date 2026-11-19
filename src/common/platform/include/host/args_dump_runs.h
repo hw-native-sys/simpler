@@ -59,6 +59,7 @@ enum class Verdict {
     Abandoned,       // torn down before this run was published
     CounterExhausted,
     NameUnavailable,
+    RecordedAggregate,  // raw records published; aggregate device counts are unavailable
 };
 
 inline const char *verdict_name(Verdict v) {
@@ -81,12 +82,16 @@ inline const char *verdict_name(Verdict v) {
         return "counter_exhausted";
     case Verdict::NameUnavailable:
         return "name_unavailable";
+    case Verdict::RecordedAggregate:
+        return "aggregate_counts_unknown";
     }
     return "unknown";
 }
 
 /** True when this verdict lets `flush_diagnostics` report success. */
-inline bool verdict_succeeds(Verdict v) { return v == Verdict::Published || v == Verdict::PublishedEmpty; }
+inline bool verdict_succeeds(Verdict v) {
+    return v == Verdict::Published || v == Verdict::PublishedEmpty || v == Verdict::RecordedAggregate;
+}
 
 /**
  * True when this verdict still publishes a manifest.
@@ -97,7 +102,7 @@ inline bool verdict_succeeds(Verdict v) { return v == Verdict::Published || v ==
  */
 inline bool verdict_publishes(Verdict v) {
     return v == Verdict::Published || v == Verdict::PublishedEmpty || v == Verdict::PublishedShort ||
-           v == Verdict::CountsUnknown;
+           v == Verdict::CountsUnknown || v == Verdict::RecordedAggregate;
 }
 
 /**
@@ -169,6 +174,23 @@ struct RecordProofs {
     uint64_t recovered_records{0};
     uint64_t unknown_lanes{0};
     uint64_t already_delivered_lanes{0};
+
+    // --- Per-run producer accounting, when a terminal bank supplies it -------
+    //
+    // Payload acknowledgement and metadata completeness are different
+    // obligations, so the payload count above does not stand in for either of
+    // these. `device_published_records` is what the producers committed, held
+    // here rather than compared at close: the receipt count is only final after
+    // the cut proves processing, so the comparison belongs to `classify` and a
+    // deficit observed mid-receive is not this run's loss.
+    uint64_t device_published_records{0};
+    // Records a producer still held when it closed. Any is a loss, and it is a
+    // known one — the producer reported it rather than leaving it to be read
+    // out of a buffer a successor now owns.
+    uint64_t unsettled_records{0};
+    // A producer's own sticky error for this run. The counts still balance, so
+    // this is a partial result rather than an unknown one.
+    bool fatal_latched{false};
 };
 
 /** The finite per-queue transport cut's outcome, in the order it is proved. */
@@ -205,6 +227,16 @@ classify(const CutProofs &cut, const RecordProofs &rec, const HostLoss &loss, ui
     if (loss.discarded_args > 0 || loss.discarded_metadata_records > 0 || rec.dropped_records > 0) {
         return Verdict::PublishedShort;
     }
+    // A producer's own fatal, and records it still held, are this run's losses
+    // even when every count balances. Reported here rather than folded into
+    // `dropped_records`, which is what the producers refused or lost in
+    // transport — a different fact with a different remedy.
+    if (rec.fatal_latched || rec.unsettled_records > 0) return Verdict::PublishedShort;
+    // Metadata the producers committed and the host never took delivery of.
+    // Compared here, where the receipt count is final: the cut has proved
+    // processing by now, so a shortfall is a loss rather than a receive still
+    // in flight.
+    if (rec.device_published_records > collected_records) return Verdict::PublishedShort;
     if (collected_records == 0) return Verdict::PublishedEmpty;
     return Verdict::Published;
 }
@@ -257,7 +289,8 @@ public:
         return counts_[static_cast<size_t>(Verdict::Published)] +
                counts_[static_cast<size_t>(Verdict::PublishedEmpty)] +
                counts_[static_cast<size_t>(Verdict::PublishedShort)] +
-               counts_[static_cast<size_t>(Verdict::CountsUnknown)];
+               counts_[static_cast<size_t>(Verdict::CountsUnknown)] +
+               counts_[static_cast<size_t>(Verdict::RecordedAggregate)];
     }
 
     /** One bounded line for a flush or close failure. Never empty on error. */
@@ -266,11 +299,13 @@ public:
         char buf[kErrorMsgBytes * 3];
         int n = std::snprintf(
             buf, sizeof(buf),
-            "published=%llu empty=%llu short=%llu counts_unknown=%llu write_failed=%llu quarantined=%llu "
+            "published=%llu empty=%llu recorded_aggregate=%llu short=%llu counts_unknown=%llu write_failed=%llu "
+            "quarantined=%llu "
             "abandoned=%llu counter_exhausted=%llu name_unavailable=%llu",
-            count_of(Verdict::Published), count_of(Verdict::PublishedEmpty), count_of(Verdict::PublishedShort),
-            count_of(Verdict::CountsUnknown), count_of(Verdict::WriteFailed), count_of(Verdict::Quarantined),
-            count_of(Verdict::Abandoned), count_of(Verdict::CounterExhausted), count_of(Verdict::NameUnavailable)
+            count_of(Verdict::Published), count_of(Verdict::PublishedEmpty), count_of(Verdict::RecordedAggregate),
+            count_of(Verdict::PublishedShort), count_of(Verdict::CountsUnknown), count_of(Verdict::WriteFailed),
+            count_of(Verdict::Quarantined), count_of(Verdict::Abandoned), count_of(Verdict::CounterExhausted),
+            count_of(Verdict::NameUnavailable)
         );
         if (n < 0) return {};
         size_t used = static_cast<size_t>(n) < sizeof(buf) ? static_cast<size_t>(n) : sizeof(buf) - 1;
@@ -303,6 +338,7 @@ public:
     /** Every per-verdict count, read as one consistent set under the lock. */
     struct Counts {
         uint64_t published{0};
+        uint64_t recorded_aggregate{0};
         uint64_t published_empty{0};
         uint64_t published_short{0};
         uint64_t counts_unknown{0};
@@ -318,6 +354,7 @@ public:
         std::lock_guard<std::mutex> lk(mu_);
         Counts c;
         c.published = count_of(Verdict::Published);
+        c.recorded_aggregate = count_of(Verdict::RecordedAggregate);
         c.published_empty = count_of(Verdict::PublishedEmpty);
         c.published_short = count_of(Verdict::PublishedShort);
         c.counts_unknown = count_of(Verdict::CountsUnknown);
@@ -332,7 +369,7 @@ public:
     }
 
 private:
-    static constexpr size_t kVerdictCount = static_cast<size_t>(Verdict::NameUnavailable) + 1;
+    static constexpr size_t kVerdictCount = static_cast<size_t>(Verdict::RecordedAggregate) + 1;
 
     unsigned long long count_of(Verdict v) const {
         return static_cast<unsigned long long>(counts_[static_cast<size_t>(v)]);

@@ -11,27 +11,20 @@
 /**
  * Memory Allocator Implementation (Simulation)
  *
- * Uses standard malloc/free to simulate device memory operations.
+ * Uses aligned host allocation/free to simulate device memory operations.
  */
 
 #include "host/memory_allocator.h"
 
 #include <cstdlib>
 #include "common/unified_log.h"
+#include "host/aligned_allocation.h"
 
 MemoryAllocator::~MemoryAllocator() { finalize(); }
 
-void *MemoryAllocator::alloc(size_t size) {
-    void *ptr = std::malloc(size);
-    if (ptr == nullptr) {
-        LOG_ERROR("malloc failed (size=%zu)", size);
-        return nullptr;
-    }
-
-    std::scoped_lock<std::mutex> lk(mu_);
-    ptr_size_map_[ptr] = size;
-    committed_bytes_ += size;
-    return ptr;
+void *MemoryAllocator::alloc(size_t size, int *status) {
+    auto reservation = begin_reservation();
+    return reservation.commit_alloc(size, status);
 }
 
 int MemoryAllocator::free(void *ptr) {
@@ -45,6 +38,7 @@ int MemoryAllocator::free(void *ptr) {
         return 0;
     }
 
+    if (adopted_.count(ptr)) return release_adopted_locked(ptr);
     committed_bytes_ -= it->second;
     std::free(ptr);
     ptr_size_map_.erase(it);
@@ -53,6 +47,7 @@ int MemoryAllocator::free(void *ptr) {
 
 int MemoryAllocator::finalize() {
     std::scoped_lock<std::mutex> lk(mu_);
+    if (int rc = sweep_adopted_locked()) return rc;
     for (const auto &kv : ptr_size_map_) {
         std::free(kv.first);
     }
@@ -61,12 +56,13 @@ int MemoryAllocator::finalize() {
     return 0;
 }
 
-void *MemoryAllocator::Reservation::commit_alloc(size_t size) {
+void *MemoryAllocator::Reservation::commit_alloc(size_t size, int *status) {
+    if (status != nullptr) *status = -1;
     if (!valid()) {
         LOG_ERROR("commit_alloc without a valid reservation (size=%zu)", size);
         return nullptr;
     }
-    void *ptr = std::malloc(size);
+    void *ptr = simpler::platform::aligned_host_alloc(size);
     if (ptr == nullptr) {
         LOG_ERROR("malloc failed (size=%zu)", size);
         return nullptr;
@@ -77,11 +73,13 @@ void *MemoryAllocator::Reservation::commit_alloc(size_t size) {
     node_.mapped() = size;
     owner_->ptr_size_map_.insert(std::move(node_));
     owner_->committed_bytes_ += size;
+    if (status != nullptr) *status = 0;
     return ptr;
 }
 
 int MemoryAllocator::finalize_except(SweepClassifyFn classify, SweepRecordFn record, void *ctx) {
     std::scoped_lock<std::mutex> lk(mu_);
+    if (int rc = sweep_adopted_locked(classify, record, ctx)) return rc;
     for (const auto &kv : ptr_size_map_) {
         const SweepAction acted = classify == nullptr ? SweepAction::FreeIt : classify(kv.first, kv.second, ctx);
         if (acted == SweepAction::KeepIt) {

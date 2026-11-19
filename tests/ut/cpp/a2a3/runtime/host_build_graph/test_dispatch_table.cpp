@@ -53,7 +53,7 @@ const uint64_t kTableBSparse[] = {0, 0, 0, 0, 0, 0, 0, kCallableBChild0};
 TEST(DispatchTable, StartsEmpty) {
     Runtime runtime;
     EXPECT_EQ(runtime.callable_table_len(), 0u);
-    for (int func_id = 0; func_id < RUNTIME_MAX_FUNC_ID; func_id++) {
+    for (int func_id = 0; func_id < CHIP_MAX_FUNC_ID; func_id++) {
         ASSERT_EQ(runtime.get_function_bin_addr(func_id), 0u) << "func_id=" << func_id;
     }
 }
@@ -106,7 +106,7 @@ TEST(DispatchTable, AnUndefinedFuncIdResolvesToZero) {
 
     runtime.set_callable_tables(kTableBSparse, kTableBDev, 0, 8);
 
-    for (int func_id = 0; func_id < RUNTIME_MAX_FUNC_ID; func_id++) {
+    for (int func_id = 0; func_id < CHIP_MAX_FUNC_ID; func_id++) {
         if (func_id == 7) continue;
         ASSERT_EQ(runtime.get_function_bin_addr(func_id), 0u) << "func_id=" << func_id;
     }
@@ -119,7 +119,7 @@ TEST(DispatchTable, OutOfRangeFuncIdsResolveToZero) {
 
     EXPECT_EQ(runtime.get_function_bin_addr(-1), 0u);
     EXPECT_EQ(runtime.get_function_bin_addr(2), 0u);
-    EXPECT_EQ(runtime.get_function_bin_addr(RUNTIME_MAX_FUNC_ID), 0u);
+    EXPECT_EQ(runtime.get_function_bin_addr(CHIP_MAX_FUNC_ID), 0u);
 }
 
 // An empty table is not a reference: a callable with no children must leave the

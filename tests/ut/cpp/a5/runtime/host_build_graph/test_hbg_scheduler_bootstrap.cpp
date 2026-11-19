@@ -31,13 +31,6 @@ constexpr uint64_t kStateBase = 0x7f0000000000ULL;
 constexpr uint64_t kWorkerContextsOffset = 4096;
 constexpr uint64_t kContextBase = kStateBase + kWorkerContextsOffset;
 
-// What the AICore computes for its own block_idx, spelled out rather than routed
-// through the helper, so a change to the helper cannot make this agree with
-// itself.
-uint64_t expected_context_address(uint64_t base, int32_t worker_index) {
-    return base + static_cast<uint64_t>(worker_index) * sizeof(SchedulerWorkerContext);
-}
-
 class SchedulerBootstrapFields : public ::testing::Test {
 protected:
     void SetUp() override { runtime.set_worker_count(8); }
@@ -55,32 +48,9 @@ TEST_F(SchedulerBootstrapFields, AFreshRuntimePublishesNoSelection) {
     EXPECT_EQ(runtime.dev.scheduler_bootstrap.runtime_mode, 0u);
     EXPECT_EQ(runtime.dev.scheduler_bootstrap.worker_context_base, 0u);
     EXPECT_FALSE(aicore_scheduler_runtime_enabled(&runtime));
-    EXPECT_FALSE(aicore_scheduler_explicit_legacy_enabled(&runtime));
     EXPECT_EQ(aicore_scheduler_bootstrap_context(&runtime), nullptr);
 }
 
-// Each selection replaces the previous one whole. A legacy run that kept the
-// previous resident base would hand the AICPU an address into an allocation the
-// same selection released.
-TEST_F(SchedulerBootstrapFields, LegacySelectionClearsTheResidentBase) {
-    select_resident();
-    ASSERT_TRUE(aicore_scheduler_runtime_enabled(&runtime));
-
-    runtime.publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH, 0);
-    EXPECT_FALSE(aicore_scheduler_runtime_enabled(&runtime));
-    EXPECT_TRUE(aicore_scheduler_explicit_legacy_enabled(&runtime));
-    EXPECT_EQ(runtime.dev.scheduler_bootstrap.worker_context_base, 0u);
-    EXPECT_EQ(aicore_scheduler_bootstrap_context(&runtime), nullptr);
-
-    runtime.publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE, 0);
-    EXPECT_FALSE(aicore_scheduler_runtime_enabled(&runtime));
-    EXPECT_TRUE(aicore_scheduler_explicit_legacy_enabled(&runtime));
-    EXPECT_EQ(runtime.dev.scheduler_bootstrap.worker_context_base, 0u);
-}
-
-// Release is not a legacy selection: it publishes no mode at all, so a run that
-// reached the device without selecting one is rejected rather than falling back
-// silently.
 TEST_F(SchedulerBootstrapFields, ReleaseLeavesNoModeAndNoBase) {
     select_resident();
     runtime.publish_scheduler_bootstrap(0, 0);
@@ -88,14 +58,13 @@ TEST_F(SchedulerBootstrapFields, ReleaseLeavesNoModeAndNoBase) {
     EXPECT_EQ(runtime.dev.scheduler_bootstrap.runtime_mode, 0u);
     EXPECT_EQ(runtime.dev.scheduler_bootstrap.worker_context_base, 0u);
     EXPECT_FALSE(aicore_scheduler_runtime_enabled(&runtime));
-    EXPECT_FALSE(aicore_scheduler_explicit_legacy_enabled(&runtime));
 }
 
-TEST_F(SchedulerBootstrapFields, ResidentSelectionSurvivesALegacyRunBetweenTwoResidentOnes) {
+TEST_F(SchedulerBootstrapFields, ResidentSelectionAfterReleaseUsesTheCurrentBase) {
     select_resident();
     EXPECT_EQ(aicore_scheduler_bootstrap_context(&runtime), reinterpret_cast<SchedulerWorkerContext *>(kContextBase));
 
-    runtime.publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH, 0);
+    runtime.publish_scheduler_bootstrap(0, 0);
     ASSERT_EQ(aicore_scheduler_bootstrap_context(&runtime), nullptr);
 
     // A second bind allocates its own state, so the base moves. Nothing of the
@@ -121,14 +90,30 @@ TEST_F(SchedulerBootstrapFields, RepeatedResidentSelectionRepublishesTheCurrentB
 // and it must not produce a context pointer.
 TEST_F(SchedulerBootstrapFields, AResidentModeWithoutABaseYieldsNoContext) {
     runtime.publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, 0);
-    EXPECT_TRUE(aicore_scheduler_runtime_enabled(&runtime));
+    EXPECT_FALSE(aicore_scheduler_runtime_enabled(&runtime));
     EXPECT_EQ(aicore_scheduler_bootstrap_context(&runtime), nullptr);
 }
 
 // A base with no resident mode is the mirror case: the AICPU must not follow it
 // just because it is non-zero.
 TEST_F(SchedulerBootstrapFields, ABaseWithoutAResidentModeYieldsNoContext) {
-    runtime.publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH, kContextBase);
+    runtime.publish_scheduler_bootstrap(UINT32_MAX, kContextBase);
+    EXPECT_EQ(aicore_scheduler_bootstrap_context(&runtime), nullptr);
+}
+
+TEST_F(SchedulerBootstrapFields, InvalidBaseExtentNeverNamesAContext) {
+    for (uint64_t base : {UINT64_C(1), kContextBase + 1, UINT64_MAX - UINT64_C(63)}) {
+        SCOPED_TRACE(base);
+        runtime.publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, base);
+        EXPECT_FALSE(aicore_scheduler_runtime_enabled(&runtime));
+        EXPECT_EQ(aicore_scheduler_bootstrap_context(&runtime), nullptr);
+    }
+}
+
+TEST_F(SchedulerBootstrapFields, AnOversizedWorkerArrayNeverNamesAContext) {
+    select_resident();
+    runtime.set_worker_count(SCHEDULER_WORKER_CAPACITY + 1);
+    EXPECT_FALSE(aicore_scheduler_runtime_enabled(&runtime));
     EXPECT_EQ(aicore_scheduler_bootstrap_context(&runtime), nullptr);
 }
 
@@ -137,64 +122,6 @@ TEST_F(SchedulerBootstrapFields, NoSelectionIsHonouredWithNoActiveWorkers) {
     runtime.set_worker_count(0);
     EXPECT_FALSE(aicore_scheduler_runtime_enabled(&runtime));
     EXPECT_EQ(aicore_scheduler_bootstrap_context(&runtime), nullptr);
-}
-
-// Worker 0's context is the base itself, and each further worker is one stride
-// on. This is the identity the AICore's derivation and the AICPU's
-// republication both rest on.
-TEST_F(SchedulerBootstrapFields, EachWorkerDerivesItsOwnContextFromTheOneBase) {
-    select_resident();
-    const uint64_t base = runtime.dev.scheduler_bootstrap.worker_context_base;
-
-    EXPECT_EQ(scheduler_worker_context_address(base, 0), base);
-    EXPECT_EQ(
-        reinterpret_cast<uint64_t>(aicore_scheduler_bootstrap_context(&runtime)),
-        scheduler_worker_context_address(base, 0)
-    );
-
-    for (int32_t worker = 0; worker < runtime.get_worker_count(); ++worker) {
-        EXPECT_EQ(scheduler_worker_context_address(base, worker), expected_context_address(base, worker))
-            << "worker " << worker;
-    }
-    EXPECT_EQ(scheduler_worker_context_address(base, 1) - base, sizeof(SchedulerWorkerContext));
-}
-
-// The AICPU republishes each worker's context address onto that worker's
-// handshake at hand-off, from its own read of the bootstrap context's layout.
-// Both routes must name the same context, or the pre-READY and post-READY views
-// would be of different workers.
-TEST_F(SchedulerBootstrapFields, TheAicpuRepublicationAgreesWithTheDerivedAddress) {
-    select_resident();
-    const uint64_t base = runtime.dev.scheduler_bootstrap.worker_context_base;
-
-    for (int32_t worker = 0; worker < runtime.get_worker_count(); ++worker) {
-        const uint64_t aicpu_published =
-            kStateBase + kWorkerContextsOffset + static_cast<uint64_t>(worker) * sizeof(SchedulerWorkerContext);
-        EXPECT_EQ(scheduler_worker_context_address(base, worker), aicpu_published) << "worker " << worker;
-    }
-}
-
-// The AICore's pre-READY view comes from the bootstrap fields and its own block
-// index; the post-READY view comes from the handshake the AICPU wrote. They are
-// separately sourced, so writing one does not move the other — which is what
-// lets the second read see the AICPU's topology-dependent fill rather than the
-// startup view again.
-TEST_F(SchedulerBootstrapFields, ThePreReadyViewIsNotSourcedFromTheHandshake) {
-    select_resident();
-    const uint64_t base = runtime.dev.scheduler_bootstrap.worker_context_base;
-    const int32_t worker = 3;
-
-    const uint64_t pre_ready = scheduler_worker_context_address(base, worker);
-
-    // Stand in for the AICPU's hand-off: the handshake gets an address, and the
-    // ready word flips. Neither touches the bootstrap fields.
-    runtime.dev.workers[worker].task = pre_ready;
-    runtime.dev.workers[worker].aicpu_ready = SCHEDULER_RUNTIME_MODE_RESIDENT_READY;
-
-    EXPECT_EQ(scheduler_worker_context_address(runtime.dev.scheduler_bootstrap.worker_context_base, worker), pre_ready)
-        << "the hand-off moved the pre-READY derivation";
-    EXPECT_EQ(runtime.dev.scheduler_bootstrap.runtime_mode, SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING)
-        << "the hand-off overwrote the host's selection";
 }
 
 // A worker's handshake line and the bootstrap line are distinct storage, so an

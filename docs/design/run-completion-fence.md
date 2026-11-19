@@ -1,8 +1,53 @@
 # Run completion fences
 
+A5 Scalar-side publication follows the [shared hardware and scheduling premises](../zh-cn/design/a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles), including explicit DSB at dependent ld/st and atomic boundaries. A future STARS task notification is not a replacement for the run-completion and resource-retirement proofs defined here; mapped SPR storage alone cannot supply a general event lifetime.
+
 How an onboard run's completion is established, who owns the resources that
-establish it, and what a future change that queues two runs at once may rely
-on.
+establish it, and what runs queued on the same streams may rely on.
+
+## Initial publication of the run-result region
+
+Each live call retains its original result allocation through observation,
+independently of its reusable execution slot. `RunResultStorage` keeps the call's
+read state and a lease on `PreparedSubmissionStorage`; late observers never
+read the successor's result address. Sequential finalized calls can reuse the
+idle backing, while overlapping observations or model references require a
+new submission allocation before preparation writes it.
+
+Program execution retains its structured result record. Kernel execution
+requests that record when any diagnostic in its own `CallConfig` is enabled;
+DFX-off eager and captured Kernel calls have no private record. Their existing
+nonzero run epoch still identifies the invocation and Core reports. A zero
+result address means no private publication, independently of that identity.
+Required terminal handoff, signed callback errors and explicit RTS observation
+remain part of execution without a private record.
+
+Kernel context initialization reserves mandatory execution resources before
+warming the initial granted result caches. Only an allocation returning the
+explicit out-of-memory status with no address may leave an optional cache
+missing; other allocation and initialization-copy errors still fail init.
+A requested capture preparation requires initialized backing and refuses before
+publication when it is unavailable. Program and requested eager preparation
+retain strict lazy initialization. No request silently falls back to no record.
+
+For a requested record, cold preparation initializes
+`NativeInvocationResultStorage` once, including its result prefix and private
+replay-evidence tail. Device entry invalidates the current publication before
+every execution. This does not add a host reset task to the captured sequence
+or erase evidence on replay. A failed cold copy retains the original allocation
+for checked cleanup.
+
+Kernel result allocation failures retain the platform's original status.
+Program preserves its existing INTERNAL allocation-failure result and lazy
+record allocation. Initialization-copy and checked-free failures retain their
+original status in both modes; a failed allocation's nonnull output remains
+owned but unusable until checked free succeeds.
+
+Execution progress and normal successful observation perform no private-result
+D2H. An SDK error can request the original call's optional structured detail;
+that detail cannot override the SDK verdict. Only requested result backing admitted for recording
+requires the separate replay-evidence read at external-use cleanup. That read
+never becomes an eager progress or ordinary result-observation prerequisite.
 
 ## The question a stream cannot answer
 
@@ -21,19 +66,357 @@ whole pipeline drained.
 
 So a run gets a boundary of its own.
 
-## The boundary
+## Direct L2 execution completion and result delivery
 
-Each stream records an event immediately after its own kernel:
+A direct L2 call can physically retire and return its execution slot before
+result observation. Its native carrier, original streams, Program IO and error
+attribution remain owned until explicit wait/finalize or owner close.
+`RunHandle.done()` caches that call's execution completion or terminal error;
+it does not observe SDK success or deliver Program outputs. A later explicit
+wait can still observe subsequent work queued on the same streams.
+
+The pipeline depth therefore bounds concurrent *execution*, not the worker's
+host footprint: a retired call leaves the depth while keeping its carrier and
+staging, so the retained set grows with the number of results a caller has not
+taken. That is not a leak — each one is a result its handle still entitles the
+caller to — and it is deliberately uncapped, because capping it would reinstate
+the wait-before-refill coupling this separation exists to remove. Program
+staging pressure reclaims through the typed resource-wait path, which delivers
+an older completed call to free its backing; a caller-owned-IO workload reaches
+no such pressure, so `ChipWorker.unobserved_completed_run_count` and its
+`..._high_water` peak are what make the retained set visible before it becomes
+a footprint surprise. Both count what this worker has *recorded* as complete —
+a call whose device work has finished stays uncounted until a poll or wait
+records it — so they are a lower bound, not a device measurement.
+
+Hierarchical L3 endpoints publish physical completion separately from semantic
+terminal results. Each member's physical END returns its endpoint lane credit;
+whole-run admission returns only after submission is closed and every task/group
+member has ended. The child retains the original entry, native carrier and IO
+until strong observation and finalization publish DONE or FAILED. TensorMap outputs and task consumption
+remain result-terminal, as does public L3 `RunHandle.done`.
+
+Explicit wait requests observation, including when the request precedes task
+publication. Eligible installed activations reach the child before it enters a
+blocking observer. Idle or entry-pressure delivery and close also finish retained
+results; physical progress never requires a whole-stream observation merely to
+admit a successor. One-resource-set and staged execution use the same child loop.
+
+A still-unobserved call that the lane already rejects does not publish Program
+HOST outputs during finalization. The internal finalization operation receives
+that delivery decision before copyback, while retaining the call's actual native
+observation and mandatory cleanup. An earlier lane error does not turn a later
+native zero into a fabricated SDK error. A result already confirmed and delivered
+stays cached; caller DEVICE writes cannot be rolled back by this host decision.
+
+The strong observer and Program copyback remain the native call's existing
+wait/finalize path. Kernel calls gain no implicit tensor transfers. Physical
+completion does not replace strong error observation or Program output delivery.
+A host wait deadline and the configured RTS stream-synchronization budget are
+separate limits; this host protocol does not change either timeout budget.
+
+## Stream binding
+
+`PreparedExecution::streams` records the actual AICPU/AICore handles at launch,
+under the execution claim and before Runtime publication. Publication, kernel
+submission, boundary records, completion fallbacks and queued-wait discharge use
+that binding. The handles borrow their lifetime from the existing owner: A2/A3's
+`RunStreamPair` retains active execution owners and separate references to the
+original Core stream for live observers. Stale code can replace the current Core
+stream after physical retirement while an old observer keeps its handle alive.
+A5 retains its bootstrap streams for owned execution and its kernel-context
+streams for borrowed execution until runner teardown. Preparing a successor does not select
+or replace a stream.
+
+On an execution failure, an owned Program context keeps its bounded device drain
+and reset policy. A borrowed kernel context is poisoned without a device-wide
+drain or reset; the caller owns device recovery. The native eager entry
+`simpler_launch_run_on_stream` binds a borrowed caller stream to an already
+prepared run. Public `Worker.init(borrowed_context_generation=...)` and
+`Worker.submit(..., caller_stream=...)` use this same native path. Kernel capture uses the same launch entry with explicitly retained preparation
+resources; Program remains eager-only. The [capture execution contract](native-capture-common-contract.md)
+specifies preparation purpose, recording behavior and support limits.
+
+## Borrowed caller ordering
+
+The caller orders its own device input writes before the native launch and may
+queue output consumers immediately after that launch returns successfully.
+`simpler_launch_run_on_stream(ctx, run, caller, predecessor)` uses the existing
+prepare/launch/poll/wait/finalize transaction; `predecessor` is null for ordinary
+launch, or names the same joined-launch predecessor as `simpler_launch_run_joined`.
+The caller must serialize submissions and keep its stream, external buffers and
+native run storage alive through explicit wait or close. Launch returns an
+enqueue result; wait/finalize report the native drain outcome, with the status
+scope described below.
+
+Successful caller-stream synchronization observes device execution; it does not
+tear down Simpler's host resources. Native finalization or `Worker.close()` is
+still required, with the borrowed context and stream alive through cleanup.
+`Worker.close()` owns accepted handles, including dropped or unwaited handles;
+callers need not wait each handle separately. Host bookkeeping and cleanup
+failures use the finalization return code or close exception. SDK synchronization
+cannot certify that later host cleanup succeeded, and no asynchronous callback
+or private success verdict is substituted for those lifecycle results.
 
 ```text
-AICore stream: kernel(N) -> record core_done(N)
-AICPU  stream: kernel(N) -> record cpu_done(N)
+caller/AICPU: prior work -> metadata/descriptor H2D -> record Fork -> kernel -> wait CoreDone -> record CpuDone -> record Tail -> later work
+AICore:                                            wait Fork -> kernel -> record CoreDone
 ```
 
-Stream order is what makes this a proof: nothing else enters the stream between
-the kernel and its record, so the event cannot complete before the kernel it
-follows has exited. A run is device-complete when **both** of its recorded
-boundaries complete.
+An explicit caller is the actual AICPU execution stream, not a third stream
+joined to a hidden AICPU queue. `Fork` precedes the AICPU kernel: that kernel can
+wait for AICore's handshake, so putting the fork after it would deadlock.
+`CpuDone` follows both the AICPU kernel and the wait for `CoreDone`; caller
+ordering requires this whole-operator join even without cross-run early enqueue.
+A controlled AICPU failure is therefore on the caller stream itself. Completion
+events and nonblocking queries are not error verdicts; the caller observes the
+RTS execution error through stream synchronization.
+
+Ordinary physical progress and slot refill use only own boundary and
+queued-wait-consumption proofs. They perform no private-result D2H, whole-stream
+synchronize, semantic result observation, or Program tensor copyback. The
+execution-only `wait_run_completion` follows the same result-observation boundary.
+When retained resource capacity is exhausted, blocking lane progress can instead
+observe and finalize an older completed call, including its required Program
+copyback, to release that call's host staging. The pipeline grant bounds active
+execution, not caller-owned unresolved observations: memory grows with outstanding
+handles until wait/finalize/close, and prelaunch carrier allocation can refuse.
+Explicit native wait/finalize observes
+the original bound streams once and caches its result. That observation is
+stream-wide: later caller work can affect its latency or returned RTS error.
+There is no isolated per-run error attribution promise. Boundary or `Tail`
+success proves covered last use and does not replace this error observer.
+
+Explicit observation uses the original run's bound streams for TMR and HBG,
+including A5 resident HBG. Normal explicit success performs no private-result
+D2H; diagnostic records cannot replace the SDK verdict. This completion and
+observation implementation still needs fixed-source hardware qualification.
+Earlier caller-error qualification does not qualify a different source version
+or mode. None of this opens capture/replay or proves arbitrary Core faults use
+the same status channel.
+
+`RunCallerOrder` owns two reusable events for this alias: `Fork` and `Tail`,
+allocated lazily per occupied slot. There is no caller-to-CPU Start edge and no
+CPU-to-caller self wait. Poll queries `Tail`, and drain proves that tail consumed
+before retirement. The helper still supports a distinct caller, whose queued
+exit wait holds the AICPU boundary reference until its tail completes. No caller
+stream is owned, destroyed, reset or assigned a new failure policy by this helper.
+
+Ordinary program launch without a caller retains its owned stream pair. A
+publication or an earlier cross-run dependency uses the same CPU-to-Core fork;
+a cached descriptor with no caller and no preceding dependency queues neither
+a copy nor a fork. Timing marks do not substitute for these ordering edges.
+
+An attempted record or wait may be enqueued even when its API reports an error.
+The launch transaction is therefore `Partial` from the first dependency,
+caller-edge or asynchronous publication attempt, with its resources retained.
+If no tail was recorded, bounded synchronization of each distinct bound stream
+is the failure-path fallback. A cross-run CPU wait lacking its proof event is
+conservatively retained even if its predecessor's pair synchronizes: the table
+cannot prove that pair includes the actual waiting CPU stream. Failed proof
+keeps references quarantined; borrowed execution never resets or synchronizes
+the whole device. Launch failure does not establish the exit dependency, so
+callers cannot consume output merely because launch returned an error.
+
+The entry validates the current borrowed RTS context. Active capture is accepted
+only for Kernel mode with a retained run prepared explicitly for capture,
+diagnostics disabled and no predecessor argument. The default eager preparation
+cannot be upgraded to capture. `NativeRunDescriptor.prepare_purpose` selects the
+preparation contract; capture preparation rejects writable HOST/NONE parameters
+before orchestration, while read-only Host controls determine fixed graph/task
+snapshots. Program capture is refused before changing recording,
+caller or claim state. Preparation and callable registration take place outside
+capture. The common eager launch
+publishes its Runtime descriptor asynchronously on the actual AICPU stream;
+its entry fork orders the AICore reader behind that copy. The slot retains a
+pinned immutable source through run retirement. A copy attempt marks Partial
+before entering RTS, so enqueue failure cannot acquire a no-submission receipt.
+The two kernel boundaries consume an ordinary publication fork; unproven partial
+work requires bounded private-stream discharge or quarantine. Bulk HBG arena
+publication and DFX writes retain their own synchronization. The compatibility
+`simpler_kernel_mode_launch` stub and capability bit remain closed; public Worker
+eager uses the shared native lane. Native completion events and their caller
+references remain distinct from a captured-graph lifetime contract. Explicit
+`simpler_retain_run_resources` / `simpler_release_run_resources` obligations hold
+prepared backing across Host run finalization, and external release requires the
+caller to have ended model and in-flight uses. Completion releases execution
+capacity; it does not discharge that external obligation or deliver Program IO.
+
+A direct L2 Python `Worker` owns the native `_ChipWorker` itself. Its callable
+handles, argument imports, source uses and close journal belong to `Worker`;
+there is no intervening public Python `ChipWorker` registry or lifecycle lock.
+The public compatibility `ChipWorker` is the only route that retains its own
+wrapper lifecycle; the forked chip-child path holds the native binding directly,
+as direct L2 does. Every route initializes the native runtime through the same
+internal binary-path/logging adapter and executes through the existing native
+run lane. `Worker`'s operation lease and owner-thread close checks remain the
+direct L2 lifecycle authority.
+
+The direct `ChipWorker::submit_chip_run` / internal `_submit_chip_run_direct`
+entry accepts an optional caller stream. The lane validates it before admitting
+or preparing any new run. A successful return guarantees actual enqueue, not
+merely a prepared handle: it tries the existing joined-launch route, and drains
+a predecessor before launch if that route declines or the configured launch
+depth is one. Launch errors are thrown before returning instead of being deferred
+to the handle. Without a caller stream, the existing prepared-successor behavior
+is unchanged.
+
+The stream is recorded on that run, including a declined join's ordinary-launch
+fallback. Poll/wait/finalize and argument borrows remain the lane's existing
+lifecycle. Caller ordering covers device work; Program host output copy-back
+still requires run completion/finalization. The public `Worker.submit` exposes
+this argument on direct L2 and supports borrowed RTS initialization.
+
+`ChipWorker::init` / internal `_ChipWorker.init` can select a borrowed,
+already-current RTS context with `borrowed_context_generation`. The value must
+be nonzero; omission selects owned-device initialization. Both routes load the
+same runtime and create the same native storage and lane. Borrowed initialization
+rejects SDMA/simulator options. Both onboard ownership policies manage internal
+workspace and accept the same optional byte budget. Its config is the native
+admission input; each submission still supplies its own config. Generation is retained in the native environment
+binding; public Worker forwards it on the direct L2 onboard route.
+
+ChipWorker retains a host-only environment identity from native context creation
+through successful teardown: process, non-repeating incarnation, nonzero logical
+context generation, device and owned/borrowed policy. Borrowed generation is
+supplied by the caller; owned generation belongs to its native incarnation.
+Failed rollback/teardown preserves the identity and runtime binding for cleanup.
+Native context validation rejects a foreign process before entering the runtime.
+The run lane also retains its immutable creating process, independently of the
+worker pointer or environment lifetime. Inherited run handles and lane operations
+reject before taking the lane mutex, including cached status queries: a parent
+thread may have held that mutex at fork. Non-throwing stop/detach cleanup in the
+child leaves the inherited lane untouched; worker destruction retains its native
+storage and library without locking the lane or invoking device cleanup. This
+is a refusal contract, not permission to execute inherited device work.
+Buffer sources capture this identity and compare it on wrapping, descriptor
+validation and attachment; it is independent of run, lease and Buffer generations.
+The identity associates the source with the runner that validates the adopted
+RTS context; it neither detects an external reset nor proves pointer ownership.
+
+Before lane progress or native phase mutation, current-context validation rejects
+a mismatched RTS context with `ExecutionContextRefused`, a `std::runtime_error`
+subclass translated to the Python `RuntimeError` subclass of the same name.
+The classification reaches `RunHandle.wait`/`result` without a separate Python
+preflight callback; refusal preserves waiter retry and run references. Restoration
+permits retry with the existing run handle. Other native wait errors remain
+terminal; the C ABI validation status codes are unchanged.
+Python operation leases check the same native context outside the lifecycle lock
+before the operation body. This includes L2 submission, registry and memory/IO
+operations and automatically covers new leased APIs. The source-only
+`device_location` query explicitly opts out; its lifecycle lease still pins the
+tree. Direct native allocation/free/copies, device-memory queries and diagnostic
+flush enforce their own backend-entry boundary. Close checks before
+claiming CLOSED or a teardown attempt; a rejected claim preserves the prior
+lifecycle. An accepted close failure keeps CLOSED and retryable cleanup debt.
+Native register/unregister and the legacy Python registry enforce their own
+pre-mutation boundary through the same validator.
+A failed borrowed initialization explicitly closes before destroying the runner;
+if close fails, it retains the context, library and storage for `finalize`, and
+refuses reinitialization. Successful rollback leaves an uninitialized worker that
+can retry. Successful `finalize` is terminal. If the worker itself is destroyed
+without completing close, it detaches surviving handles with an error and retains
+native storage, lane snapshots, context and runtime library for the process
+lifetime. It cannot prove safe reclamation at that point.
+
+Public direct L2 `Worker` consumes this native lane for owned and borrowed
+eager calls. Captured-graph ownership remains a separate requirement.
+
+A failed preparation is a distinct terminal outcome. Only a rollback that
+released its bindings, execution preparation and saved resource plan publishes
+its host-slot release marker with the attempt's run_epoch. ChipWorker consumes
+that exact epoch and reports `RunPreparationRefused`. The lane releases that
+run's caller borrow, and Python releases that invocation's source reservation.
+Unknown or stale release state retains borrows and poisons lane admission;
+carrier destruction alone is not release evidence. Resource-wait flow control
+keeps its existing live plan and is not a terminal release verdict.
+
+A launch setup failure uses the same release verdict only after an explicit
+`NotStarted` result and successful finalize. The platform clears this proof
+before calling the launch backend: a backend exception cannot infer it from a
+missing ActiveExecution. The lane preserves the original launch error while
+retiring this invocation's references and allowing a valid retry. Partial,
+ambiguous and failed-cleanup paths do not produce this verdict.
+
+The common onboard and simulator `launch_execution` entry owns the prepared
+state and allocates its `ActiveExecution` record before invoking the backend.
+The backend receives a reference and cannot consume that owner. An explicit
+`NotStarted` result returns the prepared state for rollback; a partial result
+or escaping backend exception returns an active owner without acceptance.
+The hand-off after submission only moves existing owners and allocates no
+memory. Query, wait and finalize receive that owner; the existing drain and
+failure-isolation rules decide retirement. Partial results and backend
+exceptions close runner admission through the same policy, after the owner
+is installed. A failing recovery policy cannot discard the owner or replace
+the launch rc. An exception or missing receipt is never a no-submission proof.
+
+## Callable registration and execution mode identity
+
+The native registration and execution-mode contracts apply to both owned and
+borrowed runners; the caller-ordering details for borrowed submissions are in
+the preceding section.
+
+Native `ChipWorker::register_callable(image, size)` (Python
+`_ChipWorker.register_callable(callable)`) returns a runtime-assigned ID on an
+initialized PROGRAM or KERNEL worker. Both modes use the optional
+`simpler_register_callable_v2` symbol; a KERNEL context uses the kernel
+preparation path internally. Explicit-ID `register_callable(id, callable)`
+remains available and shares the registry; an ID that is already registered is
+rejected with INVALID_ARGUMENT. A runtime without the optional entry can still
+initialize and serve its existing APIs; requesting auto-ID registration raises
+an explicit unsupported-entry error. Neither overload initializes the worker.
+The public Python `ChipWorker` wrapper retains its existing CallableHandle API.
+
+Automatic and explicit registration share one ID namespace, one image-buffer
+cache and one 64-slot table (`MAX_REGISTERED_CALLABLE_IDS`, mirrored by the
+AICPU executor's `orch_so_table_`); the slot number is the ID. Equal images
+receive distinct IDs, with upload sharing governed by that cache. Capacity is a
+slot count, not a memory budget: with all 64 slots occupied, registration fails
+until an ID is unregistered. Failure leaves the output ID at -1 and preserves
+the runtime's existing cleanup ownership; exhaustion returns INVALID_STATE.
+IDs can be reused after explicit unregistration, so callers retire all users
+first and discard stale IDs. The registration and unregistration entry points
+serialize internally on the context, so an auto-ID scan and its claim cannot
+race an explicit-ID claim of the same slot; finalize takes the same lock, so
+teardown cannot clear the registry under a registration. Runs, initialization
+and destroy still rely on the caller contract. The old C symbol's signature and
+kernel-mode capability bit remain unchanged. Adapters must explicitly select
+v2; an integration-branch binary expecting a different signature under the old
+symbol cannot be loaded as if it were compatible.
+
+Execution mode is latched per native device-context handle, not per process or
+submission. This handle identifies the C++ runner; it is not the borrowed
+ACL/RTS current-context handle. `ExecutionModeLatch::latched_mode()` returns an
+optional identity snapshot: empty means unclaimed, not PROGRAM. Identity,
+initialization phase and resource retirement are separate facts. The latch mutex
+serializes identity claims only; callers serialize native init/finalize/destroy
+against operations using that handle. Concurrent claims cannot choose different
+identities, but this does not make concurrent runner initialization supported.
+A successful mode claim is never undone by finalize or a later initialization
+failure. The same handle cannot switch between PROGRAM and
+KERNEL; a finalized PROGRAM handle can initialize as PROGRAM again only when
+its cleanup proof permits it. This C ABI permission does not apply to
+`ChipWorker`, which rejects reinitialization after finalize. Borrowed submissions
+use the shared native run machinery, so sharing prepare/launch functions is not
+a mode violation.
+
+## The boundary
+
+Each stream records a boundary after its own kernel. The AICPU sequence has two
+forms, depending on whether it queues its own AICore join:
+
+```text
+AICore: kernel(N) -> record core_done(N)
+AICPU without Core join: kernel(N) -> record cpu_done(N)
+AICPU with Core join: kernel(N) -> wait core_done(N) -> [WholeOperatorEnd timing mark] -> record cpu_done(N)
+```
+
+Stream order makes each record a proof: the event cannot complete before the
+kernel ahead of it exits. An intervening dependency wait or optional timing mark
+does not weaken that ordering. Caller exit ordering requires the Core join;
+when this join is queued, `cpu_done` covers both kernels and can serve as the
+joined successor's whole-operator dependency. A run is device-complete when
+**both** of its recorded boundaries complete.
 
 Three things that are *not* proofs, each of which is a way to get this wrong:
 
@@ -49,7 +432,7 @@ Three things that are *not* proofs, each of which is a way to get this wrong:
 The host must not wait for the AICore boundary before submitting the AICPU
 kernel, for the same handshake reason: the AICore kernel may be spinning for a
 kernel that has not been submitted yet. The two submissions stay back to back,
-AICore first (see the launch-order note in each arch's `launch_execution`), and
+AICore first (see the launch-order note in each arch's `launch_execution_impl`), and
 only the boundaries are waited on.
 
 ## Completion is not the verdict — a measured constraint
@@ -81,15 +464,52 @@ That splits the drain path in two, and the split is deliberate:
 - **the device's verdict** — `sync_stream_pair`, because no other call produces
   one.
 
-The verdict read is why the drain path can still touch the whole pair. It is
-not a hidden completion dependency — completion is already settled before it
-runs. **On a normal success it no longer runs at all**: when both boundaries
-complete, the run's own record transfer reports nothing and that record says
-`Ok`, `wait_run_fence` returns on that evidence alone. Every other shape still
-reaches `sync_stream_pair`, and on those shapes a change that queues a
-successor makes it wait for the successor's kernels to answer a question about
-the predecessor's. That cost is bounded by the stream-sync timeout and is
-disclosed rather than solved.
+Explicit wait/result touches the whole bound pair under the stream contract.
+Its normal path performs no private-result read, including resident HBG. On an
+RTS error it may read the call's retained record for error detail; HBG uses that
+record's signed scalar instead of a shared scheduler header that a successor may
+have reset. Diagnostic codes and failed diagnostic transfers do not replace the
+stream observer's verdict. Program outputs still require their own successful
+D2H after the strong observer. A5 resident target qualification remains a
+separate delivery requirement; CPU return-path tests do not establish RTS
+propagation on hardware.
+
+Physical retirement is separate: poll queries own completion and actual wait
+consumption, and the internal `simpler_wait_run_completion` blocks on those
+same events under the existing timeout when admission needs physical capacity.
+Neither operation synchronizes the whole streams or consumes a semantic result.
+An event/observer error without independent stop proof retains unknown debt.
+
+A live call keeps its opaque carrier and original stream handles through explicit
+observation. Kernel and input-only calls release their large host Runtime and
+bindings after physical last use. Calls with pending host outputs retain their
+Runtime leases and original `HostStaging` backing until copyback; execution
+`ExecScratch` references end after device and diagnostic readers stop. Detaching
+the slot's staging alias frees no memory. The next call obtains backing through
+the same workspace allocator and budget. Live-call facts remain until their IO
+and bindings end; they are not an automatic result cache or a new depth quota.
+Ordinary finalized carriers and idle result allocations remain reusable.
+
+For direct L2 calls, `RunHandle.done` reports own execution completion or an
+already cached terminal failure. A known true value stays true while a later
+explicit observer waits, so it does not promise an immediately nonblocking
+`wait`. It neither delivers Program outputs nor proves physical
+reclamation is safe on a failed/abandoned host future. Program host-readable
+publication follows explicit observation and successful required tensor copyback.
+Hierarchical L3 `done` remains result-terminal rather than this L2 physical-progress query.
+The hierarchical Program child calls `ChipRun._raise_if_failed()` before sending
+its completion message; that result-delivery step can synchronize streams. It is
+separate from native physical progress and is not a Kernel progression gate.
+Borrowed streams remain live through explicit wait or close.
+
+Exceptional close keeps unknown owners until the owned Program reset and all
+post-reset probes confirm generation end. Collector writers and host readers are
+joined before reset without a new final device-queue drain; already handed host
+entries can finish their copy/publication tails while joining. Failed confirmation
+keeps the context and backing. Confirmed close abandons unresolved carrier bytes
+and code without reentering their C++ destructors or issuing per-resource calls
+on reset-invalid handles. Its zero return reports environment teardown, while
+retained handles preserve their original error. Borrowed execution never resets.
 
 The candidate that does not require a synchronize is
 `aclrtSetExceptionInfoCallback` — the driver invokes it when a device exception
@@ -164,50 +584,25 @@ And the stream identities it retires are held with finite capacity, so a
 sufficiently long generation reports attribution as undecided rather than
 claiming a notice is not its own.
 
-### What this leaves open
+### Remaining scope
 
-Run-scoped completion is delivered, and so is a run-scoped *normal* drain: a
-run whose boundaries completed, whose record transfer reported nothing and
-whose own record says `Ok` no longer waits on the pair. Issue #2267 stays open
-for the shapes that still do. Concretely, what remains owed:
+Completion proof and stream-wide semantic observation have separate owners.
+The device-fault notification channel continues to refuse future admission on a
+matched notice; it is not a substitute for explicit stream observation or a
+run-specific error identity. Unknown physical completion retains its backing
+and wait references. A5 resident status qualification, isolated attribution of
+later stream faults, and capture/replay lifetime ownership remain separate work.
 
-- ~~an error channel that reports a device exception without a stream
-  synchronize~~ — **delivered**, recorded per device generation, and refusing
-  future admission on a matched notice. It does **not** make removing the
-  normal-path synchronize safe: the rows that keep synchronizing include the
-  ordinary successful run that produces no notice at all, so this channel is a
-  fallback for uncovered work rather than a replacement for the verdict read;
-- every supported execution variant now has a terminal publication path. a5's
-  `host_build_graph` legacy executor was the last without one, and it now folds
-  and publishes on the same wire, epoch, selector and publisher as the other
-  three. A publication path is not a record per run: a run that failed in init,
-  one whose participants did not all claim the audited path, and an unmarked
-  fallback the wrapper rejects publish **nothing and stay undecided — but only
-  when no error is attributable to them**. `run_terminal_select` reports a
-  header or participant failure on those paths too; what the missing claim and
-  the unmarked mode withhold is the *success*, never the diagnosis. That is what
-  keeps "no record" from reading as success. **Authority is now partial**: the
-  fenced drain acts on the record to conclude a normal success, and every other
-  shape still answers from the stream synchronize, with
-  `report_terminal_disagreement` covering those shapes by logging rather than
-  overriding;
-- a decision on how a *successor's* fault is attributed, since a stream carries
-  its error stickily and a predecessor's drain that falls back to the
-  synchronize would otherwise report it.
-
-`poll_execution` needs none of this. It reports completion from the boundaries
-and additionally reads the streams' *sticky* error state, which is exactly what
-the whole-pair query it replaced reported — so a poll that used to surface a
-stream left in error still does, and a poll that never detected a device
-exception (measured above: `rtStreamQuery` returns `0`) still does not.
+`poll_execution` establishes physical last use from own boundaries. It does not
+cache semantic success from event or nonblocking-query success. Explicit
+wait/result can therefore surface an error even after a completed poll.
 
 ### Measured: the verdict read does wait, and the record read does not
 
-The paragraph above predicts that keeping the verdict read would make a
-predecessor's drain wait for its successor. That is now measured rather than
-argued, on a2a3, both runtimes — by `tests/st/run_retention`, which reaches a
-state production admission refuses (a predecessor complete and read but not
-finalized, while its successor executes on the same streams) through the fixture
+The earlier record-authority implementation measured that a stream verdict
+read can wait for a successor. Those retained measurements are on a2a3, both runtimes — by `tests/st/run_retention`, which reaches a
+controlled state (a predecessor complete and read but not finalized, while
+its successor executes on the same streams) through the fixture
 in `src/common/platform/onboard/host/run_retention_probe.h`.
 
 Two arms over one sequence, differing only in whether `sync_stream_pair` runs
@@ -255,10 +650,9 @@ So:
 
 The rule combining the two channels into one outcome is
 `decide_run_execution` (`host/run_outcome_decision.h`), which is pure and covered
-without a device. It is now what the fenced drain acts on for a normal success.
-These numbers are what that path was expected to save; they were taken on the
-fixture, not on the production drain, and nothing here measures the production
-change.
+without a device. The historical record-authority path used it for normal
+success. The measurements above describe that fixture; they do not measure the
+current completion/stream-observation separation.
 
 ## Ownership: the run owns the facts, the runner owns the handles
 
@@ -330,40 +724,37 @@ then fails admission, and `finalize()` takes its force-reset teardown, which is
 the only thing that actually invalidates the device's references. Nothing is
 freed on an unproven path and nothing is re-executed.
 
-## The cross-run join a later change will use
+## The cross-run dependency and its proof
 
-Opening admission to two launched runs needs the successor ordered after the
-predecessor. With per-run boundaries that is two queued waits, crossed:
+A successor waits on its actual CPU stream for the predecessor's whole-operator
+boundary before publication or any shared-state reuse. That boundary already
+covers both predecessor kernels. The successor's publication fork then carries
+this ordering to its Core stream:
 
 ```text
-successor AICore stream waits predecessor cpu_done
-successor AICPU  stream waits predecessor core_done
+predecessor CPU: kernel -> wait own CoreDone -> record WholeDone
+successor CPU:  wait WholeDone -> record proof -> publication -> Fork -> kernel
+successor Core:                                               wait Fork -> kernel
 ```
 
-Crossed rather than parallel, because each stream already orders itself: the
-AICore edge puts `cpu_done` before the successor's AICore kernel, the stream's
-own order puts `core_done` before `cpu_done`'s peer, and together the two edges
-put **both** predecessor kernels ahead of **either** successor kernel. A
-predecessor record must already be submitted before a successor wait on it is
-queued, and no wait may point back at a successor, or the pair deadlocks.
+This applies with the same caller, different callers, and either mixture of
+caller and no-caller submissions. It does not rely on a hidden CPU FIFO shared
+by the two runs. The proof event immediately follows the queued wait, so the
+predecessor can retire without waiting for successor computation. It is a
+storage last-use dependency, not a check of the predecessor's semantic result.
 
-`RunCompletionFence` carries the reference protocol this needs today, with no
-production caller — inserting the waits and admitting a second launched run
-belong to the change that opens admission. The normal success path no longer
-synchronizes, but the fallback shapes still do, so that change also owes a
-decision on what a fallback synchronize means once a successor is queued
-behind the run it is draining.
+1. Reserve a boundary reference before queueing its wait.
+2. Queue the wait on the predecessor's already recorded whole boundary.
+3. Commit the reference once the wait is attempted, including an API error that
+   does not prove refusal. A reservation may be revoked only before submission.
+4. Release the reference exactly once, after its own CPU proof event is observed.
+   An unproved CPU cross-run wait survives generic predecessor-pair quiescence;
+   without actual stream provenance that fallback cannot establish consumption.
+   Unknown completion retains the reference and refuses unsafe reuse/release.
 
-1. `reserve_wait_reference(identity, boundary, waiter)` before queueing the
-   wait. Reserving first is what makes the failure path decidable.
-2. Queue the stream wait on `boundary_event(identity, boundary)`.
-3. `commit_wait_reference` on success, `revoke_wait_reference` on failure.
-4. `release_wait_reference(ref, proven_waiter)` exactly once, and only once a
-   completion proof covers the successor stream `waiter` — the stream that
-   actually holds the wait. Since the join crosses the streams, a proof about
-   the *other* stream leaves the wait uncovered, and the call rejects it.
-   `release_wait_reference_on_quiescence` is the alternative for a verified
-   reset or quarantine, which invalidates every reference at once.
+A verified device reset can invalidate device references. Terminal quarantine
+instead retains backing with unknown use and stops admission. Neither makes an
+ordinary event or successful pair sync a cross-run retirement proof.
 
 A reference *is* a count, and there is exactly one way to get a count wrong:
 decrement one that is not yours. Every rule below closes one route to that.
@@ -418,3 +809,38 @@ instant the submission is accepted, and the transaction grades a later failure
 
 Simulation records no events: its submit callbacks take the sink and ignore it,
 and its grading is unchanged.
+
+## Borrowed TMR eager invocation ownership
+
+Borrowed TMR eager calls use the existing native-run lane, caller ordering and
+completion fence. Their launch package carries a 40-byte invocation header,
+the device Runtime address and nonzero run epoch, followed by DEVICE Tensor
+descriptors and scalar values. The callable occupancy generation is allocated
+by the runner's registry and recorded independently by AICPU registration.
+ID reuse gets a new generation.
+
+The Host packet is a snapshot of the prepared Runtime image. It survives until
+RTS copies the launch package. AICPU checks framing, registered counts and
+generation, the run binding and Tensor geometry before materializing argument
+storage owned by the executor. Orchestration borrows that storage through the
+same completion and teardown path as a program call; cleanup drops the
+orchestration view before clearing the storage.
+
+The first descriptor publication still initializes its complete handshake
+prefix. Program descriptor and launch-envelope routes retain their behavior;
+kernel packets require permitted launch transport and cannot silently fall back
+to unvalidated descriptor values. Default eager preparation cannot be recorded;
+capture-purpose preparation uses the same native launch with a matching retained
+reference. Per-run ownership alone is insufficient for graph lifetime; the
+[external resource contract](native-hbg-prepared-lifetime.md) covers that obligation.
+
+### Native terminal publication contract
+
+Native completion distinguishes a published private record, a valid unrequested
+record, and invalid producer state. `NotRequested` does not gate normal success;
+`InvalidState` converts success to INTERNAL but never replaces a known functional
+error. Optional diagnostic payload is not required to report that error. The
+actual publisher rejects malformed bindings or records; it does not return an
+RTS DMA failure status. A missing required runtime terminal remains an unknown
+functional outcome, distinct from missing private detail. Physical retirement
+and strong caller-stream observation retain their separate contracts above.

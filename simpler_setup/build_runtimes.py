@@ -23,8 +23,10 @@ import argparse
 import logging
 import os
 import shutil
+import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import cache
 from pathlib import Path
 from typing import Optional
 
@@ -36,7 +38,12 @@ _project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root))
 sys.path.insert(0, str(_project_root / "python"))
 
-from simpler_setup.platform_info import PROJECT_ROOT, discover_runtimes, parse_platform  # noqa: E402
+from simpler_setup.platform_info import (  # noqa: E402
+    PROJECT_ROOT,
+    discover_runtimes,
+    parse_platform,
+    runtime_builds_by_default,
+)
 from simpler_setup.runtime_builder import RuntimeBuilder, platform_embeds_pto_isa  # noqa: E402
 from simpler_setup.sanitizers import SANITIZER_PRESETS, resolve, validate  # noqa: E402
 
@@ -65,22 +72,64 @@ def _profiling_config(values: dict[str, Optional[int]]) -> Optional[dict[str, st
     return {name: str(value) for name, value in config.items()}
 
 
+@cache
+def a5_urma_toolchain_available(ascend_home: str) -> bool:
+    """Check SDK declarations required by the pinned, unconditional A5 URMA provider."""
+    compiler = shutil.which("g++")
+    if not compiler or not ascend_home:
+        return False
+    source = """
+#include <hccl/hccl_res.h>
+void probe() {
+    HcclChannelConfig config{};
+    (void)config;
+    (void)HCCL_CHANNEL_CONFIG_SHARED_QUEUE_TAG_MAX_LEN;
+    (void)HCCL_CHANNEL_CONFIG_TYPE_IS_SHARED_QUEUE;
+    (void)HCCL_CHANNEL_CONFIG_TYPE_SHARED_QUEUE_TAG;
+    (void)&HcclChannelConfigCreate;
+    (void)&HcclChannelConfigSetInt;
+    (void)&HcclChannelConfigSetStr;
+    (void)&HcclChannelAcquireWithConfig;
+    (void)&HcclChannelConfigDestroy;
+}
+"""
+    try:
+        result = subprocess.run(
+            [
+                compiler,
+                "-std=c++17",
+                "-fsyntax-only",
+                "-x",
+                "c++",
+                "-",
+                f"-I{ascend_home}/include",
+                f"-I{ascend_home}/pkg_inc/base",
+            ],
+            input=source,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def detect_buildable_platforms() -> list:
     """Detect which platforms can be built with available toolchains.
 
     Returns:
         List of platform strings, e.g. ["a2a3sim", "a5sim"] when only gcc is available,
-        or all four when the onboard cross-compiler is also present.
+        or onboard variants whose compiler and SDK prerequisites are available.
     """
     platforms = []
 
     # Sim platforms: only need gcc/g++
     if shutil.which("gcc") and shutil.which("g++"):
-        platforms.extend(["a2a3sim", "a5sim"])
+        platforms.extend(["a2a3sim", "a5sim", "wsesim"])
 
     # Onboard platforms: need ccec + cross-compiler from ASCEND_HOME_PATH.
-    # a2a3 and a5 share toolchain prerequisites but build separate artifacts
-    # with architecture-specific AICore targets (dav-c220 and dav-c310).
     has_ccec = shutil.which("ccec") is not None
 
     ascend_home = os.environ.get("ASCEND_HOME_PATH", "")
@@ -93,12 +142,73 @@ def detect_buildable_platforms() -> list:
     return platforms
 
 
+def requested_runtimes(explicit: Optional[list] = None) -> list[str]:
+    """The runtimes a caller named, from the argument or SIMPLER_BUILD_RUNTIMES.
+
+    Empty means "whatever builds by default". Naming a runtime builds it even
+    when its build_config.py opts out of the default set.
+    """
+    if explicit:
+        return [name for name in explicit if name]
+    return [name for name in os.environ.get("SIMPLER_BUILD_RUNTIMES", "").replace(",", " ").split() if name]
+
+
+def select_runtimes(arch: str, discovered: list[str], only: Optional[list] = None) -> tuple[list[str], list[str]]:
+    """Split this arch's discovered runtimes into the ones to build and the rest.
+
+    A name the caller asked for is built whatever its build_config says. A name
+    this arch does not carry is simply not among its runtimes: an arch-exclusive
+    runtime is a legal thing to ask for while building several platforms, and
+    rejecting it here would end the build at whichever arch came first. Whether
+    the name exists anywhere is `reject_unknown_runtimes`, once, over the set of
+    platforms actually requested.
+    """
+    named = requested_runtimes(only)
+    if named:
+        return [name for name in discovered if name in named], []
+    keep = [name for name in discovered if runtime_builds_by_default(arch, name)]
+    return keep, [name for name in discovered if name not in keep]
+
+
+def reject_unknown_runtimes(platforms: list, only: Optional[list] = None) -> None:
+    """Fail on a requested runtime no requested platform's arch carries.
+
+    A typo would otherwise read as a runtime that needs no work, and the build
+    would succeed having produced nothing the caller asked for.
+    """
+    named = requested_runtimes(only)
+    if not named:
+        return
+    arches = sorted({parse_platform(p)[0] for p in platforms})
+    carried = {name for arch in arches for name in discover_runtimes(arch)}
+    unknown = sorted(name for name in named if name not in carried)
+    if unknown:
+        raise ValueError(
+            f"No runtime goes by: {', '.join(unknown)} under any of the requested arches [{', '.join(arches)}]"
+        )
+
+
+def _platform_runtimes(platform: str, arch: str, only: Optional[list]) -> list[str]:
+    """The runtimes to build for one platform, naming the ones left out."""
+    discovered = discover_runtimes(arch)
+    if not discovered:
+        logger.warning(f"  {platform}: no runtimes found, skipping")
+        return []
+    selected, skipped = select_runtimes(arch, discovered, only)
+    if skipped:
+        logger.info(f"  {platform}: not built by default, name it to build it: {', '.join(skipped)}")
+    if not selected:
+        logger.warning(f"  {platform}: no runtime left to build, skipping")
+    return selected
+
+
 def build_all(
     lib_dir: Path,
     cache_dir: Path,
     platforms: Optional[list] = None,
     sanitizer: str = "none",
     profiling_config: Optional[dict[str, str]] = None,
+    only: Optional[list] = None,
 ) -> None:
     """Build all runtime variants for the given platforms.
 
@@ -111,6 +221,9 @@ def build_all(
             BuildTarget.gen_cmake_args.
         profiling_config: Complete profiling macro configuration for sim
             runtime targets. None keeps the source defaults.
+        only: Runtime names to build, overriding each one's BUILD_BY_DEFAULT.
+            None or empty falls back to SIMPLER_BUILD_RUNTIMES, then to the
+            default set.
     """
     # Override default paths to respect CLI args
     RuntimeBuilder._LIB_DIR = lib_dir
@@ -129,20 +242,27 @@ def build_all(
     if platforms is None:
         platforms = detect_buildable_platforms()
 
+    if "a5" in platforms and not a5_urma_toolchain_available(os.environ.get("ASCEND_HOME_PATH", "")):
+        raise RuntimeError(
+            "A5 onboard build requires CANN HCCL channel-config APIs "
+            "(including HcclChannelAcquireWithConfig) for the URMA provider. "
+            "Set ASCEND_HOME_PATH to a compatible SDK and rebuild. "
+            "To build only A2/A3 or simulation, explicitly select those build targets."
+        )
+
     if not platforms:
         logger.warning("No buildable platforms detected (missing gcc/g++?)")
         return
 
     logger.info(f"Building for platforms: {', '.join(platforms)}")
+    # Once, against every arch this build will visit: a name one of them lacks
+    # is ordinary, a name none of them carries is a typo.
+    reject_unknown_runtimes(platforms, only)
     pto_isa_root_for_metadata: Optional[str] = None
     pto_isa_runtime_keys: list[str] = []
 
-    # Onboard hosts that embed pto-isa headers (a2a3 always; a5 when an async
-    # workspace overlay is opted in) hard-depend on the pinned managed
-    # checkout + CANN aclnn syms. Resolve once for metadata recording;
-    # RuntimeBuilder passes the path to CMake as -DPTO_ISA_ROOT= (#1403) —
-    # do not export it via os.environ. Skipped when no embedding platform is
-    # being built (sim-only, or a5 with overlays OFF). See issue #1351.
+    # Onboard hosts embed the pinned ISA headers. Resolve once for metadata;
+    # RuntimeBuilder passes the path to CMake as -DPTO_ISA_ROOT=.
     if any(platform_embeds_pto_isa(p) for p in platforms):
         from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
 
@@ -165,10 +285,8 @@ def build_all(
     tasks: list[tuple[str, str]] = []
     for platform in platforms:
         arch, variant = parse_platform(platform)
-        runtimes = discover_runtimes(arch)
-
+        runtimes = _platform_runtimes(platform, arch, only)
         if not runtimes:
-            logger.warning(f"  {platform}: no runtimes found, skipping")
             continue
 
         for runtime_name in runtimes:
@@ -207,9 +325,9 @@ def build_all(
 
         # No device-side deployment step here. The dispatcher SO is uploaded
         # into the main aicpu_scheduler at runtime, on the first
-        # DeviceRunner::ensure_binaries_loaded call, via
-        # LoadAicpuOp::BootstrapDispatcher (see src/common/host/load_aicpu_op.cpp
-        # and src/common/aicpu_dispatcher/aicpu_dispatcher.h for architecture).
+        # DeviceRunnerBase::ensure_aicpu_runtime_registered call, via
+        # LoadAicpuOp::BootstrapDispatcher (see src/common/aicpu_loader/host/load_aicpu_op.cpp
+        # and src/common/aicpu_loader/device/aicpu_dispatcher.h for architecture).
 
     if pto_isa_root_for_metadata is not None:
         from simpler_setup.pto_isa import write_pto_isa_build_metadata  # noqa: PLC0415
@@ -242,6 +360,17 @@ def main():
         help="List buildable platforms and exit",
     )
     parser.add_argument(
+        "--runtime",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Build only this runtime, repeatable. Overrides BUILD_BY_DEFAULT, "
+            "so it is how a runtime that stays out of the default set gets "
+            "built. Also readable as SIMPLER_BUILD_RUNTIMES."
+        ),
+    )
+    parser.add_argument(
         "--sanitizer",
         default="none",
         help=(
@@ -268,7 +397,9 @@ def main():
             for p in platforms:
                 arch, variant = parse_platform(p)
                 runtimes = discover_runtimes(arch)
-                print(f"  {p}: {', '.join(runtimes) or '(no runtimes)'}")
+                opt_in = [name for name in runtimes if not runtime_builds_by_default(arch, name)]
+                shown = [f"{name} (names it to build)" if name in opt_in else name for name in runtimes]
+                print(f"  {p}: {', '.join(shown) or '(no runtimes)'}")
         else:
             print("No buildable platforms detected")
         return
@@ -278,6 +409,7 @@ def main():
         cache_dir=args.cache_dir,
         platforms=args.platforms,
         sanitizer=args.sanitizer,
+        only=args.runtime,
         profiling_config=_profiling_config(
             {
                 "SIMPLER_DFX": args.profiling_dfx,

@@ -147,8 +147,11 @@ static __aicore__ void softmax_prepare_n_impl(
         }
         pipe_barrier(PIPE_V);
 
-        // Prefetch next sij into alternate buffer (overlaps with V pipe scalar ops)
+        // The alternate buffer may still be read by an earlier vector
+        // reduction. Release V's reads before MTE2 overwrites that UB storage.
         if (i + 1 < n_blocks) {
+            set_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
+            wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID1);
             GlobalDataMxN sijGlobal_next(sij_base + (i + 1) * M * N);
             if (i % 2 == 0) {
                 TLOAD(sijTile_B, sijGlobal_next);

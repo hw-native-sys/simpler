@@ -28,9 +28,15 @@
  * Serviceability and runtime-specific resource sets are checked separately.
  *
  * Rejects a contract whose ABI version is not the one compiled in, that
- * declares more resources than fit, that asks for a pipeline depth outside
- * the supported range, or whose resources carry an unspecified or out-of-range kind, an
- * out-of-range class, or a byte count incompatible with the mode and resource class.
+ * declares more resources than fit, that declares no pipeline depth at all, or
+ * whose resources carry an unspecified or out-of-range kind, an out-of-range
+ * class, or a byte count incompatible with the mode and resource class.
+ *
+ * There is no fixed ABI ceiling on `pipeline_depth`: it is what a runtime says
+ * it can support. The Worker chooses the context's grant, and owners size their
+ * per-run tables and native run storage to that grant during initialization.
+ * This count bounds admitted run resources; it is not a byte budget for device
+ * workspace, which has its own allocator and optional accounting limit.
  *
  * The unspecified-kind rule is what catches a `resource_count` larger than the
  * entries a runtime actually filled in: the trailing entries are still zeroed,
@@ -41,8 +47,7 @@
 inline bool is_valid_pipeline_contract(const PipelineContract *contract, uint32_t mode) {
     if ((mode != SIMPLER_MODE_PROGRAM && mode != SIMPLER_MODE_KERNEL) || contract == nullptr ||
         contract->abi_version != PTO_PIPELINE_CONTRACT_ABI_VERSION ||
-        contract->resource_count > PTO_PIPELINE_MAX_RESOURCES || contract->pipeline_depth == 0 ||
-        contract->pipeline_depth > PTO_PIPELINE_MAX_DEPTH) {
+        contract->resource_count > PTO_PIPELINE_MAX_RESOURCES || contract->pipeline_depth == 0) {
         return false;
     }
     for (uint32_t i = 0; i < contract->resource_count; ++i) {
@@ -122,8 +127,8 @@ inline bool has_serviceable_arena_topology(const PipelineContract &contract) {
     return true;
 }
 
-// Each execution role is supplied exactly once.
-inline bool has_serviceable_stream_topology(const PipelineContract &contract) {
+// Each required execution role is supplied exactly once; an absent AICPU has no handle.
+inline bool has_serviceable_stream_topology(const PipelineContract &contract, bool requires_aicpu = true) {
     if (contract.resource_count > PTO_PIPELINE_MAX_RESOURCES) return false;
     constexpr uint32_t STREAM_KINDS[] = {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_AICORE_STREAM};
     for (uint32_t kind : STREAM_KINDS) {
@@ -134,7 +139,8 @@ inline bool has_serviceable_stream_topology(const PipelineContract &contract) {
             if (resource.resource_class != PTO_PIPELINE_EXEC_HANDLE) return false;
             ++count;
         }
-        if (count != 1) return false;
+        const uint32_t required_count = kind == PTO_PIPELINE_AICPU_STREAM && !requires_aicpu ? 0 : 1;
+        if (count != required_count) return false;
     }
     return true;
 }

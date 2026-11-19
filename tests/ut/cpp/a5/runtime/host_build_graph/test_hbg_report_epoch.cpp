@@ -78,6 +78,33 @@ TEST(HandshakeReportEpoch, AZeroedLineIsNotAReport) {
     EXPECT_FALSE(aicore_report_accepted(&handshake, 0));
 }
 
+TEST(HandshakeReportEpoch, WorkWindowUsesChipEndpointsRatherThanCoreDurationSum) {
+    Handshake reports[3]{};
+    reports[0].work_start_cycle = 100;
+    reports[0].work_end_cycle = 250;
+    reports[1].work_start_cycle = 140;
+    reports[1].work_end_cycle = 400;
+    reports[2].work_start_cycle = 120;
+    reports[2].work_end_cycle = 220;
+    AicoreWorkWindow window{};
+    ASSERT_TRUE(aicore_reduce_work_window(reports, 3, window));
+    EXPECT_EQ(window.start_cycle, 100u);
+    EXPECT_EQ(window.end_cycle, 400u);
+
+    reports[1].work_end_cycle = 0;
+    EXPECT_FALSE(aicore_reduce_work_window(reports, 3, window));
+    EXPECT_EQ(window.start_cycle, 0u);
+    EXPECT_EQ(window.end_cycle, 0u);
+}
+
+TEST(HandshakeReportEpoch, WorkWindowDoesNotSurvivePhaseBufferReuse) {
+    DevicePhaseBufferStorage<2> buffer{};
+    buffer.header.aicore_work = {100, 400};
+    reset_device_phase_buffer(&buffer, 2);
+    EXPECT_EQ(buffer.header.aicore_work.start_cycle, 0u);
+    EXPECT_EQ(buffer.header.aicore_work.end_cycle, 0u);
+}
+
 TEST(HandshakeReportEpoch, APriorRunsReportIsRejected) {
     const Handshake stale = left_by_previous_resident_run();
     EXPECT_TRUE(aicore_report_accepted(&stale, kRunN)) << "its own run must still accept it";
@@ -245,4 +272,51 @@ TEST(HandshakeReportEpoch, TheWholeReportFitsOneCacheLine) {
     EXPECT_LE(offsetof(Handshake, report_epoch) + sizeof(Handshake::report_epoch), 64u);
 }
 
+TEST(HandshakeReportEpoch, SerialReplayNeedsANewReportEvenWithTheSameEpoch) {
+    for (bool cpu_first : {false, true}) {
+        Handshake handshake = left_by_previous_resident_run();
+        for (int replay = 0; replay < 3; ++replay) {
+            aicore_invalidate_retired_report(&handshake);
+            EXPECT_EQ(handshake.aicpu_ready, 0u);
+            EXPECT_EQ(handshake.report_epoch, kRunN);
+            EXPECT_EQ(handshake.physical_core_id, kPhysicalCoreId);
+            EXPECT_EQ(handshake.task, kStaleContext);
+            if (cpu_first) EXPECT_FALSE(aicore_report_accepted(&handshake, kRunN));
+            publish_native_report(&handshake, kRunN);
+            EXPECT_TRUE(aicore_report_accepted(&handshake, kRunN));
+            EXPECT_EQ(handshake.aicpu_ready, SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING);
+            handshake.aicpu_ready = SCHEDULER_RUNTIME_MODE_RESIDENT_READY;
+            handshake.task = kStaleContext;
+        }
+    }
+}
+
+TEST(HandshakeReportEpoch, RetirementInvalidatesUnstampedReportsWithoutErasingHistory) {
+    Handshake handshake = left_by_previous_resident_run();
+    aicore_invalidate_retired_report(&handshake);
+    EXPECT_FALSE(aicore_report_accepted(&handshake, 0));
+    EXPECT_FALSE(aicore_report_accepted(&handshake, kRunN));
+    EXPECT_EQ(handshake.report_epoch, kRunN);
+    handshake.aicore_done = kBlockIdx + 1;
+    EXPECT_TRUE(aicore_report_accepted(&handshake, 0));
+    EXPECT_EQ(handshake.aicpu_ready, 0u);
+}
+
 }  // namespace
+
+TEST(HandshakeReportEpoch, KernelWindowExcludesIdleCoresButRejectsIncompleteEndpoints) {
+    Handshake reports[3]{};
+    reports[0].work_start_cycle = 100;
+    reports[0].work_end_cycle = 200;
+    reports[2].work_start_cycle = 150;
+    reports[2].work_end_cycle = 300;
+    AicoreWorkWindow window{};
+    ASSERT_TRUE(aicore_reduce_work_window(reports, 3, window, true));
+    EXPECT_EQ(window.start_cycle, 100u);
+    EXPECT_EQ(window.end_cycle, 300u);
+    EXPECT_FALSE(aicore_reduce_work_window(reports, 3, window));
+    reports[1].work_end_cycle = 250;
+    EXPECT_FALSE(aicore_reduce_work_window(reports, 3, window, true));
+    Handshake idle[2]{};
+    EXPECT_FALSE(aicore_reduce_work_window(idle, 2, window, true));
+}

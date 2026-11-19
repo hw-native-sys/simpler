@@ -32,7 +32,7 @@ shared object, opens it with `dlopen(RTLD_LOCAL)`, and resolves:
 
 - `aicpu_orchestration_config`;
 - `aicpu_orchestration_entry`; and
-- `framework_bind_runtime`.
+- `framework_bind_orch_context`.
 
 The resolved handle and entry points belong to the registered callable and stay
 alive across prepared runs. Unregister/context teardown closes the handle and
@@ -52,6 +52,33 @@ For each run, the host:
 5. finalizes task counts and records the prepared metadata sources in Runtime's host-only pending publication;
 6. returns from bind, then synchronously publishes Definitions, any resident
    scheduler state, and finally the shared-memory image with the copied zone.
+
+The exclusive pipeline slot retains only `OrchestrationScratch`: TensorMap
+arrays and the fan-in epoch array. Each bind owns a fresh `OrchestratorState`,
+borrows those arrays, and returns them after Graph recorder teardown on every
+exit. Fatal state, counters, mirror/heap pointers and Graph bindings belong to
+that run. A bind also holds a local owning reference. `ChipWorker::finalize()`
+drains native runs, finalizes and destroys the runner, and only then closes
+`host_runtime.so`, which owns the scratch deleter and shared-pointer control-block
+code. A failed device finalization retains both the runner and module for retry.
+Callable and executor libraries closed inside runner finalization are separate
+modules. `HostApiOps` is host-only: all providers and consumers must use the same
+table definition and be built together. Null fallback covers omitted callbacks
+in that definition, not shorter tables from older binaries.
+
+TensorMap resets bucket heads, every retained task head and allocation cursors without
+reconstructing unused entries. Bucket and entry-pool storage is reused while
+its own size matches; task-head and fan-in storage grow only. Changing the
+active task capacity does not reconstruct the unchanged entry pool. A failed
+TensorMap resize preserves the prior layout and contents; a successful init
+empties the map. With default capacities the arrays retain approximately
+8.72 MiB per used slot until finalization. Pool-size changes can temporarily
+hold old and replacement arrays. No new lock or device allocation is involved.
+
+Ready-queue populations are accumulated when a task slot receives its final
+classification. Ordinary tasks, hidden allocation tasks and outer Graph tasks
+participate; Graph definition populations are still combined at bind. Output
+layout entries are initialized and read only at `OUTPUT` argument positions.
 
 `publish_run_image_impl` is the single metadata consumer. Definition and compact
 image sources are retained by the exclusive pipeline slot; A5 scheduler source
@@ -182,12 +209,12 @@ a boundary from which region happens to be reserved first —
 orchestrator, so nothing on the device reads its state: not the `fanin_seen_epoch`
 table, not the scope arrays, not the TensorMap (~9.3 MB between them). It is
 therefore a plain host object that owns those arrays — `OrchestratorState::init`
-allocates them — and `RuntimeContext` reaches it through a pointer that `bind` drops
-before the copied zone is uploaded, so no host address crosses the boundary. A
-`static_assert` keeps `RuntimeContext` trivially copyable, which is what forbids
-putting an owning member back inside it. The one orchestrator value the device-side
-scheduler reads, the count of tasks completed inline during orchestration, is a
-scalar `rt_orchestration_done` publishes into the runtime header.
+allocates them — and the host-side `OrchContext` is what reaches it, through a
+pointer `RuntimeContext` does not carry, so no host address can cross the boundary
+in the first place. A `static_assert` keeps `RuntimeContext` trivially copyable,
+which is what forbids putting an owning member back inside it. The one orchestrator
+value the device-side scheduler reads, the count of tasks completed inline during
+orchestration, is a scalar `rt_orchestration_done` publishes into the runtime header.
 
 **Why the scheduler state is device-written.** `SchedulerState` holds no
 per-run content: `sm_header` and the task-header pointer derive from a pooled SM base,
@@ -407,14 +434,11 @@ could strand the drain protocol, so the active path relies on that invariant.
 
 ## 8. Scalar Access During Construction
 
-`get_tensor_data` and `set_tensor_data` operate on registered host views of
-external tensors, and only on tensors that no submitted task produces. A producer
-— named either by the tensor's `owner_task_id` or by an overlapping TensorMap
-entry — fails the call with `INVALID_ARGS`, because the device scheduler starts
-only after orchestration returns and nothing it produces exists yet. A runtime
-allocation is rejected by the same rule; its graph-heap buffer has no host view
-either. See [SCALAR_DATA_ACCESS.md](SCALAR_DATA_ACCESS.md) for the supported
-contract.
+`get_tensor_data` and `set_tensor_data` operate only on explicit `HOST/NONE`
+arguments with registered bounds and compatible directions. Device arguments
+and graph-heap allocations are refused; there is no implicit mapping or device
+copy fallback. See [SCALAR_DATA_ACCESS.md](SCALAR_DATA_ACCESS.md) and the shared
+[HBG host data access contract](../../../../../docs/hbg-host-data-access.md).
 
 ## 9. Errors and Diagnostics
 
@@ -444,3 +468,54 @@ pytest examples tests/st --platform a5sim --runtime host_build_graph
 
 Pure scheduler/core-tracker and lifecycle primitives also have C++ unit tests
 under `tests/ut/cpp`.
+
+## Residual MIX lane priority
+
+The AICPU scheduler preserves physical lanes needed by residual MIX work. A queued MIX captures
+its AIC/AIV0/AIV1 mask when published; pure work can use the other lanes. Masks 3 and 5 leave one
+vector lane available, mask 6 leaves AIC available, and mask 7 reserves all three. The shape-agnostic
+early sync-start queue counts only its MIX entries; a pure entry has no MIX demand.
+
+Priority prefixes are ready-sync, ready-sync plus regular-ready, and then both normal sources plus
+early sync-start and regular-early. Early demand never protects lanes against normal-ready work.
+Each pure bucket, refill and block-range claim refreshes the applicable prefix and retains demand
+already observed during that attempt. The normal tiers share that observation; the next attempt
+starts fresh. Any nonzero pending-drain state reserves all lanes. These are scheduling snapshots,
+not an atomic reservation across scheduler threads.
+
+CoreTracker filters physical offsets before preparing pure IDLE or PENDING work. A pure vector
+block's logical AIV0 subtask may execute on either physical vector lane. A shape-only peer-idle hint
+does not suppress local PENDING work when only one physical vector lane is eligible. PMU keeps
+IDLE placement and disables PENDING and early staging. Normal admission and early sync-start
+cohort ownership remain independent of lane-demand accounting.
+
+A pure ready sync-start cohort uses one filtered bucket for its complete fit and claim. If it cannot
+fit while MIX protects any lane of its shape, it is requeued rather than entering a global drain
+that would bypass the lane filter. An exact fit uses the spare lanes. With no intersecting demand,
+the existing global-drain path remains available. A failed normal requeue reports
+`SIMPLER_ERROR_READY_QUEUE_OVERFLOW` and stops the dispatch pass.
+
+The shared `TaggedPtr` and `LaneDemandCounter` headers serve all four scheduler
+backends. The counter packs three 21-bit population counts into one atomic word.
+For these priority-prefix queues, a successful MIX batch claim adds its aggregate
+demand once before publishing the first cell. Batch pops capture all original
+handles and TaskIds, subtract one aggregate, then free the cells. A failed push
+claim, plain queue operation, or empty demand performs no counter RMW. The batch
+aggregate conservatively protects the claimed group; it is not a per-cell
+publication timestamp. A5 TMR uses the same types with its reservation-before-claim
+admission policy and corresponding in-flight capacity budget.
+
+Partial requeues retain the original tag. Early candidates retain their TaskId
+snapshot, including local sync-start cancellation. Normal entries retain the
+invalid-TaskId convention in both profiling and ordinary paths. Plain entries
+have an empty tag and no lane accounting. Queue cells remain 24 bytes; headers
+remain 192 bytes with enqueue/dequeue positions at offsets 64/128. Initialization
+resets demand; retained-position reuse does not. Failed normal requeue latches
+the error code and first reporting thread, and records all reporters in the
+error bitmap before stopping the pass.
+
+Host and AICPU components must come from matching runtime builds. Unchanged
+layout sizes do not make tagged entries compatible with a scheduler that treats
+every cell as an untagged pointer. The MIX/pure scene test checks numerical
+correctness; it does not assert temporal overlap. Production-scheduler unit
+tests check lane eligibility and placement.

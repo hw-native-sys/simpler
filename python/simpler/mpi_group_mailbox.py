@@ -209,6 +209,12 @@ class MpiGroupMailbox:
         self._address = _buffer_address(self._buffer)
         self._validate_header()
 
+    def fileno(self) -> int:
+        """Borrow the backing descriptor while this mailbox is open."""
+        if self._closed:
+            raise ValueError("MPI group mailbox is closed")
+        return self._shm._fd  # noqa: SLF001 -- POSIX SharedMemory backing
+
     @classmethod
     def create(cls, *, world_size: int) -> MpiGroupMailbox:
         if int(world_size) <= 0:

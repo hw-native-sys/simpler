@@ -7,6 +7,13 @@ see [hierarchical-level-runtime.md](hierarchical-level-runtime.md). For how task
 data (Callable / TaskArgs / CallConfig) flows through all levels, see
 [task-flow.md](task-flow.md).
 
+For A5 resident scheduling, the
+[A5 hardware and scheduling premises](zh-cn/design/a5-hbg-graph-task/build-execute-separation.md#a5-hardware-principles)
+govern memory-operation choice, 128 B atomic isolation and explicit DSB at
+dependency boundaries. STARS event/notify is a future Wait backend, not an
+existing task-claim mechanism; current register handshakes do not imply a
+generic SPR event pool. Other chip generations retain their own contracts.
+
 ## Three-Program Model
 
 The simpler runtime consists of **three separate programs** that communicate through well-defined APIs:
@@ -148,6 +155,12 @@ finalize_device(ctx);
 destroy_device_context(ctx);
 free(runtime);
 ```
+
+The `prepare -> launch -> wait -> finalize` split is the host head and tail
+around a CANN stream submission, not a second device queue. The stream orders
+the device operations; the run pipeline owns the host preparation and the
+per-run resources those operations read. See
+[Run Pipeline and the KernelLaunch Stream](run-pipeline.md) for the boundary.
 
 ### Layer 3: Python API (`python/bindings/task_interface.cpp` via nanobind)
 

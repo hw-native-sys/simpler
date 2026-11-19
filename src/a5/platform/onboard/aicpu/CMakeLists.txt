@@ -34,9 +34,9 @@ endif()
 # Build complete source list from CUSTOM_SOURCE_DIRS and core sources.
 # Sources come from three buckets:
 #   1. `${CMAKE_CURRENT_SOURCE_DIR}/*.cpp` — onboard-aicpu sources that are
-#      still arch-specific (a5-only files like kernel.cpp).
+#      still arch-specific (kernel.cpp, cache_ops.cpp, inner_platform_regs.cpp).
 #   2. `common/platform/onboard/aicpu/*.cpp` — onboard-aicpu sources shared
-#      by both arches (cache_ops, device_log, device_time, device_malloc,
+#      by both arches (device_log, device_time, device_malloc,
 #      orch_so_file, platform_aicpu_affinity).
 #   3. arch-shared (between onboard and sim) sources under `../../shared/aicpu/`
 #      and `common/platform/shared/aicpu/` (unified log, scope_stats, args_dump).
@@ -62,6 +62,9 @@ list(LENGTH AICPU_KERNEL_SOURCES NUM_AICPU_KERNEL_SOURCES)
 message(STATUS "AICpu kernel: ${NUM_AICPU_KERNEL_SOURCES} source files")
 message(VERBOSE "AICpu kernel sources: ${AICPU_KERNEL_SOURCES}")
 add_library(aicpu_kernel SHARED ${AICPU_KERNEL_SOURCES})
+# CANN can retain the preceding runtime image after its Worker closes.
+# Each successor image must call its own executor/configuration functions.
+target_link_options(aicpu_kernel PRIVATE -Wl,-Bsymbolic-functions)
 include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
 simpler_configure_profiling(aicpu_kernel)
 
@@ -112,6 +115,7 @@ set_target_properties(aicpu_kernel PROPERTIES OUTPUT_NAME aicpu_kernel)
 # Direction 1: stable single dispatcher + runtime AICPU kernel uploaded at runtime.
 set(AICPU_DISPATCHER_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/aicpu_loader/device/aicpu_dispatcher.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cache_ops.cpp"
 )
 add_library(aicpu_dispatcher SHARED ${AICPU_DISPATCHER_SOURCES})
 simpler_configure_profiling(aicpu_dispatcher)
@@ -129,11 +133,13 @@ target_compile_options(aicpu_dispatcher
 
 target_include_directories(aicpu_dispatcher
     PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/include
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CUSTOM_INCLUDE_DIRS}
-        # src/common is needed so `#include "utils/elf_build_id.h"` resolves
+        # src/common resolves utils/elf_build_id.h and aicpu_loader/bootstrap_protocol.h
         # (matches a2a3 sibling; same Build-ID fingerprint protocol).
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../../common
+        ${ASCEND_HOME_PATH}/pkg_inc
         ${ASCEND_HOME_PATH}/include
 )
 

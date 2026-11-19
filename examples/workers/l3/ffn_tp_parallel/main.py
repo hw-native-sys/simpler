@@ -166,7 +166,7 @@ def run(
     nranks = len(device_ids)
     # scratch = mailbox(nranks * M*N floats) + signal tail (nranks int32).
     scratch_count = nranks * M * N
-    scratch_nbytes = scratch_count * DTYPE_NBYTES + nranks * 4
+    scratch_nbytes = -(-(scratch_count * DTYPE_NBYTES + nranks * 4) // 64) * 64
     window_size = max(scratch_nbytes, 4 * 1024)
 
     print(f"[ffn_tp_parallel] platform={platform} devices={device_ids} nranks={nranks} M={M} K={K} N={N}")

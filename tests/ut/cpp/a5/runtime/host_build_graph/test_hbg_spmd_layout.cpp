@@ -1,0 +1,850 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include "hbg_scheduler_test_support.h"
+#include "scheduler/scheduler_memory.h"
+
+namespace {
+
+SchedulerSpmdRequirements
+requirements(uint64_t workers, uint64_t cooperative, uint64_t mix, uint64_t sync_mix = UINT64_MAX) {
+    return {workers, workers / 3, cooperative, mix, sync_mix == UINT64_MAX ? mix : sync_mix};
+}
+
+constexpr LaneMask kAicAiv0{/*aic=*/true, /*aiv0=*/true, /*aiv1=*/false};
+constexpr LaneMask kAicAiv1{/*aic=*/true, /*aiv0=*/false, /*aiv1=*/true};
+
+void set_metadata(
+    void *base, const AicoreSchedulerLayout &layout, uint64_t task, uint16_t blocks, LaneMask mask,
+    uint8_t extra_flags = 0
+) {
+    auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(base, layout.task_metadata_offset);
+    auto &entry = metadata[task];
+    entry.logical_block_num = blocks;
+    entry.active_mask = mask;
+    entry.flags = SCHEDULER_TASK_EXECUTABLE | extra_flags;
+    if (blocks > 1) entry.flags |= SCHEDULER_TASK_SPMD;
+    if (mask.is_mix()) entry.flags |= SCHEDULER_TASK_MIX;
+    entry.timing_slot = -1;
+    for (uint8_t lane = 0; lane < 3; ++lane)
+        entry.kernel_ids[lane] = mask.has(static_cast<SubtaskSlot>(lane)) ? 1 : UINT16_MAX;
+}
+
+void expect_no_protocol_storage(const AicoreSchedulerLayout &layout) {
+    EXPECT_EQ(layout.protocol_layout_offset, 0u);
+    EXPECT_EQ(layout.protocol.floor_count, 0u);
+}
+
+void expect_summary_configuration(void *base, const AicoreSchedulerLayout &layout, uint64_t epoch) {
+    const auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, layout.graph_summary_offset);
+    EXPECT_EQ(summary->mix_task_count, layout.spmd.mix_task_count);
+    EXPECT_EQ(summary->sync_mix_task_count, layout.spmd.sync_mix_task_count);
+    EXPECT_EQ(summary->cooperative_task_count, layout.spmd.cooperative_task_count);
+    EXPECT_EQ(summary->worker_count, layout.spmd.worker_count);
+    EXPECT_EQ(summary->cluster_count, layout.spmd.cluster_count);
+    EXPECT_EQ(summary->run_epoch, epoch);
+    EXPECT_EQ(summary->prepared_layout_offset, layout.prepared_layout_offset);
+    EXPECT_EQ(summary->bootstrap_clusters_offset, layout.bootstrap_clusters_offset);
+}
+
+void expect_empty_protocol(void *base, const AicoreSchedulerLayout &layout) {
+    expect_summary_configuration(base, layout, 0);
+    const auto *controls = scheduler_state_at<SchedulerTaskControl>(base, layout.task_controls_offset);
+    for (uint64_t task = 0; task < layout.task_count; ++task) {
+        SCOPED_TRACE(task);
+        EXPECT_EQ(controls[task].next_block, 0u);
+        EXPECT_EQ(controls[task].completion_state, scheduler_completion_initial_state(1));
+        EXPECT_TRUE(scheduler_completion_valid(controls[task].completion_state));
+        EXPECT_EQ(controls[task].claim_seal, 0u);
+        for (const auto &sector : controls[task].claim_sectors)
+            EXPECT_EQ(sector.next, 0u);
+    }
+}
+
+TEST(HbgSpmdLayout, PreservesCompactMetadataAndAtomicLineBoundaries) {
+    EXPECT_EQ(sizeof(SchedulerTaskMetadata), 16u);
+    EXPECT_EQ(alignof(SchedulerTaskMetadata), 8u);
+    EXPECT_EQ(offsetof(SchedulerTaskMetadata, timing_slot), 12u);
+    EXPECT_EQ(offsetof(SchedulerTaskMetadata, logical_block_num), 14u);
+    EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskMetadata::timing_slot), int16_t>));
+    EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskMetadata::logical_block_num), uint16_t>));
+    EXPECT_EQ(sizeof(SchedulerTaskControl), 896u);
+    EXPECT_EQ(offsetof(SchedulerTaskControl, claim_sectors), 384u);
+    EXPECT_EQ(sizeof(SchedulerClaimSector), 128u);
+    EXPECT_EQ(alignof(SchedulerClaimSector), 128u);
+    EXPECT_EQ(alignof(SchedulerTaskControl), 128u);
+    EXPECT_EQ(offsetof(SchedulerTaskControl, next_block), 0u);
+    EXPECT_EQ(offsetof(SchedulerTaskControl, completion_state), 128u);
+    EXPECT_EQ(offsetof(SchedulerTaskControl, claim_seal), 256u);
+    EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskControl::next_block), volatile uint64_t>));
+    EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskControl::completion_state), volatile uint64_t>));
+}
+
+TEST(HbgSpmdLayout, SyncMixTaskCountDoesNotAddGmMailboxStorage) {
+    for (uint64_t clusters : {2u, 3u, 8u, 32u}) {
+        SCOPED_TRACE(clusters);
+        AicoreSchedulerLayout one_mix{};
+        AicoreSchedulerLayout three_mix{};
+        ASSERT_TRUE(scheduler_plan_layout(9, &one_mix, false, 10, requirements(clusters * 3, 3, 1)));
+        ASSERT_TRUE(scheduler_plan_layout(9, &three_mix, false, 10, requirements(clusters * 3, 3, 3)));
+        EXPECT_EQ(one_mix.total_size, three_mix.total_size);
+    }
+}
+
+TEST(HbgSpmdLayout, ConcurrentBlockCountersUseSeparateCacheLines) {
+    constexpr size_t cursor = offsetof(SchedulerTaskControl, next_block);
+    constexpr size_t completed = offsetof(SchedulerTaskControl, completion_state);
+    EXPECT_NE(completed / 128, cursor / 128);
+    EXPECT_NE(cursor / 128, offsetof(SchedulerTaskControl, claim_seal) / 128);
+    EXPECT_NE(completed / 128, offsetof(SchedulerTaskControl, claim_seal) / 128);
+    EXPECT_EQ(sizeof(SchedulerTaskControl) % 128, 0u);
+}
+
+TEST(HbgSpmdLayout, CounterUpdatesLeaveOtherTaskAndMetadataBytesUntouched) {
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(3, &layout));
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    ASSERT_NE(storage.base(), nullptr);
+    auto *controls = scheduler_state_at<SchedulerTaskControl>(storage.base(), layout.task_controls_offset);
+    std::array<uint8_t, 3 * sizeof(SchedulerTaskControl)> expected{};
+    std::memcpy(expected.data(), controls, expected.size());
+    for (uint64_t task = 0; task < 3; ++task) {
+        const uint64_t cursor = (UINT64_C(1) << 32) + task;
+        const uint64_t completed = (UINT64_C(1) << 33) + task;
+        EXPECT_EQ(scheduler_gm_compare_exchange(controls[task].next_block, UINT64_C(0), cursor), 0u);
+        EXPECT_EQ(
+            scheduler_gm_fetch_add(controls[task].completion_state, completed), scheduler_completion_initial_state(1)
+        );
+        const uint64_t completion_word = scheduler_completion_initial_state(1) + completed;
+        const size_t row = task * sizeof(SchedulerTaskControl);
+        std::memcpy(expected.data() + row + offsetof(SchedulerTaskControl, next_block), &cursor, sizeof(cursor));
+        std::memcpy(
+            expected.data() + row + offsetof(SchedulerTaskControl, completion_state), &completion_word,
+            sizeof(completion_word)
+        );
+        EXPECT_EQ(std::memcmp(expected.data(), controls, expected.size()), 0);
+    }
+}
+
+TEST(HbgSpmdLayout, KeepsBootstrapAndFrozenGraphHeadersAligned) {
+    EXPECT_EQ(sizeof(SchedulerBootstrapCluster), 128u);
+    EXPECT_EQ(alignof(SchedulerBootstrapCluster), 128u);
+    EXPECT_EQ(sizeof(SchedulerGraphSummary), 128u);
+}
+
+TEST(HbgSpmdLayout, ZeroRequirementsPreserveDefaultAllocation) {
+    SchedulerSpmdRequirements spmd;
+    EXPECT_EQ(spmd.worker_count, 0u);
+    EXPECT_EQ(spmd.cluster_count, 0u);
+    EXPECT_EQ(spmd.cooperative_task_count, 0u);
+    EXPECT_EQ(spmd.mix_task_count, 0u);
+    AicoreSchedulerLayout implicit{};
+    AicoreSchedulerLayout explicit_zero{};
+    ASSERT_TRUE(scheduler_plan_layout(5, &implicit));
+    ASSERT_TRUE(scheduler_plan_layout(5, &explicit_zero, false, 0, spmd));
+    EXPECT_EQ(std::memcmp(&implicit, &explicit_zero, sizeof(implicit)), 0);
+    expect_no_protocol_storage(implicit);
+    scheduler_test::SchedulerStateBuffer storage(implicit);
+    ASSERT_NE(storage.base(), nullptr);
+    expect_empty_protocol(storage.base(), implicit);
+}
+
+class HbgSpmdWorkerLayout : public ::testing::TestWithParam<uint64_t> {};
+
+TEST_P(HbgSpmdWorkerLayout, OrdinaryGraphHasNoProtocolAllocation) {
+    AicoreSchedulerLayout ordinary{};
+    AicoreSchedulerLayout default_layout{};
+    ASSERT_TRUE(scheduler_plan_layout(5, &ordinary, false, 0, requirements(GetParam(), 0, 0)));
+    ASSERT_TRUE(scheduler_plan_layout(5, &default_layout));
+    expect_no_protocol_storage(ordinary);
+    EXPECT_EQ(ordinary.total_size - default_layout.total_size, (GetParam() / 3) * sizeof(SchedulerBootstrapCluster));
+    scheduler_test::SchedulerStateBuffer storage(ordinary);
+    ASSERT_NE(storage.base(), nullptr);
+    expect_empty_protocol(storage.base(), ordinary);
+    AicoreSchedulerLayout ordinary_mix{};
+    ASSERT_TRUE(scheduler_plan_layout(5, &ordinary_mix, false, 0, requirements(GetParam(), 0, 2, 0)));
+    expect_no_protocol_storage(ordinary_mix);
+    EXPECT_EQ(ordinary_mix.total_size, ordinary.total_size);
+}
+
+TEST_P(HbgSpmdWorkerLayout, SyncUsesTheSameControlLayoutAsOrdinaryExecution) {
+    AicoreSchedulerLayout ordinary{};
+    AicoreSchedulerLayout sync{};
+    ASSERT_TRUE(scheduler_plan_layout(9, &ordinary, false, 0, requirements(GetParam(), 0, 0)));
+    ASSERT_TRUE(scheduler_plan_layout(9, &sync, false, 0, requirements(GetParam(), 3, 0)));
+    EXPECT_EQ(ordinary.task_controls_offset, sync.task_controls_offset);
+    EXPECT_EQ(ordinary.total_size, sync.total_size);
+}
+
+TEST_P(HbgSpmdWorkerLayout, MixRegionsAreAlignedDisjointAndSizedToActualTopology) {
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(9, &layout, false, 0, requirements(GetParam(), 3, 2)));
+    EXPECT_EQ(layout.spmd.worker_count, GetParam());
+    EXPECT_EQ(layout.spmd.cluster_count, GetParam() / 3);
+    std::vector<std::pair<uint64_t, uint64_t>> regions{
+        {layout.graph_summary_offset, sizeof(SchedulerGraphSummary)},
+        {layout.bootstrap_clusters_offset, layout.spmd.cluster_count * sizeof(SchedulerBootstrapCluster)},
+        {layout.task_metadata_offset, layout.task_count * sizeof(SchedulerTaskMetadata)},
+        {layout.task_controls_offset, layout.task_count * sizeof(SchedulerTaskControl)},
+    };
+    std::sort(regions.begin(), regions.end());
+    for (size_t index = 0; index < regions.size(); ++index) {
+        SCOPED_TRACE(index);
+        EXPECT_LE(regions[index].first + regions[index].second, layout.total_size);
+        if (index + 1 < regions.size())
+            EXPECT_LE(regions[index].first + regions[index].second, regions[index + 1].first);
+    }
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    ASSERT_NE(storage.base(), nullptr);
+    expect_empty_protocol(storage.base(), layout);
+}
+
+TEST_P(HbgSpmdWorkerLayout, SecondInitializationErasesEveryDirtyProtocolByte) {
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(7, &layout, true, 31, requirements(GetParam(), 4, 2)));
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    ASSERT_NE(storage.base(), nullptr);
+    constexpr uint64_t device_base = UINT64_C(0x400000000);
+    ASSERT_TRUE(scheduler_init_data_from_layout(storage.base(), layout, device_base));
+    std::vector<uint8_t> expected(static_cast<size_t>(layout.total_size));
+    std::memcpy(expected.data(), storage.base(), expected.size());
+    std::memset(storage.base(), 0xa5, expected.size());
+    ASSERT_TRUE(scheduler_init_data_from_layout(storage.base(), layout, device_base));
+    EXPECT_EQ(std::memcmp(expected.data(), storage.base(), expected.size()), 0);
+    expect_empty_protocol(storage.base(), layout);
+}
+
+INSTANTIATE_TEST_SUITE_P(ActualTopology, HbgSpmdWorkerLayout, ::testing::Values(3u, 63u, 66u, 96u, 108u));
+
+TEST(HbgSpmdLayout, RetainedAllocationRebindsLargeSmallLargeWithoutTouchingInactiveTail) {
+    AicoreSchedulerLayout first_large{};
+    AicoreSchedulerLayout large{};
+    AicoreSchedulerLayout small{};
+    ASSERT_TRUE(scheduler_plan_layout(9, &first_large, true, 26, requirements(108, 4, 2)));
+    ASSERT_TRUE(scheduler_plan_layout(9, &large, true, 54, requirements(108, 4, 2)));
+    ASSERT_TRUE(scheduler_plan_layout(2, &small, false, 3, requirements(3, 1, 0)));
+    ASSERT_GT(large.total_size, small.total_size);
+    scheduler_test::SchedulerStateBuffer retained(large);
+    scheduler_test::SchedulerStateBuffer fresh_small(small);
+    scheduler_test::SchedulerStateBuffer fresh_large(large);
+    ASSERT_NE(retained.base(), nullptr);
+    ASSERT_NE(fresh_small.base(), nullptr);
+    ASSERT_NE(fresh_large.base(), nullptr);
+    constexpr uint64_t device_base = UINT64_C(0x400000000);
+    const auto fill_large_metadata = [](void *base, const AicoreSchedulerLayout &layout, uint16_t blocks,
+                                        LaneMask pure_mask) {
+        for (uint64_t task = 0; task < layout.task_count; ++task)
+            set_metadata(base, layout, task, 1, LaneMask::aic());
+        set_metadata(base, layout, 1, blocks, pure_mask, SCHEDULER_TASK_SYNC_START);
+        set_metadata(base, layout, 3, blocks, kAicAiv0, SCHEDULER_TASK_SYNC_START);
+        set_metadata(base, layout, 5, blocks, LaneMask::aiv0(), SCHEDULER_TASK_SYNC_START);
+        set_metadata(base, layout, 8, blocks, LaneMask::all(), SCHEDULER_TASK_SYNC_START);
+    };
+    ASSERT_TRUE(scheduler_init_data_from_layout(retained.base(), first_large, device_base));
+    fill_large_metadata(retained.base(), first_large, 3, LaneMask::aic());
+    ASSERT_TRUE(scheduler_init_spmd_task_records(retained.base(), first_large, 117));
+    auto *retained_bytes = static_cast<uint8_t *>(retained.base());
+    retained_bytes[small.total_size] = 0xa5;
+    retained_bytes[large.total_size - 1] = 0x5a;
+    const std::vector<uint8_t> inactive_tail(retained_bytes + small.total_size, retained_bytes + large.total_size);
+
+    ASSERT_TRUE(scheduler_init_data_from_layout(retained.base(), small, device_base));
+    ASSERT_TRUE(scheduler_init_data_from_layout(fresh_small.base(), small, device_base));
+    EXPECT_EQ(std::memcmp(retained.base(), fresh_small.base(), static_cast<size_t>(small.total_size)), 0);
+    expect_empty_protocol(retained.base(), small);
+    for (void *base : {retained.base(), fresh_small.base()}) {
+        set_metadata(base, small, 0, 2, LaneMask::aiv0(), SCHEDULER_TASK_SYNC_START);
+        set_metadata(base, small, 1, 1, LaneMask::aic());
+        ASSERT_TRUE(scheduler_init_spmd_task_records(base, small, 232));
+    }
+    EXPECT_EQ(std::memcmp(retained.base(), fresh_small.base(), static_cast<size_t>(small.total_size)), 0);
+    EXPECT_EQ(std::memcmp(retained_bytes + small.total_size, inactive_tail.data(), inactive_tail.size()), 0);
+    expect_summary_configuration(retained.base(), small, 232);
+    const auto *small_controls = scheduler_state_at<SchedulerTaskControl>(retained.base(), small.task_controls_offset);
+    EXPECT_EQ(scheduler_completion_total(small_controls[0].completion_state), 2u);
+    EXPECT_EQ(scheduler_completion_total(small_controls[1].completion_state), 1u);
+
+    ASSERT_TRUE(scheduler_init_data_from_layout(retained.base(), large, device_base));
+    ASSERT_TRUE(scheduler_init_data_from_layout(fresh_large.base(), large, device_base));
+    EXPECT_EQ(std::memcmp(retained.base(), fresh_large.base(), static_cast<size_t>(large.total_size)), 0);
+    expect_empty_protocol(retained.base(), large);
+    for (void *base : {retained.base(), fresh_large.base()}) {
+        fill_large_metadata(base, large, 7, LaneMask::aiv1());
+        ASSERT_TRUE(scheduler_init_spmd_task_records(base, large, 349));
+    }
+    EXPECT_EQ(std::memcmp(retained.base(), fresh_large.base(), static_cast<size_t>(large.total_size)), 0);
+    expect_summary_configuration(retained.base(), large, 349);
+    const auto *large_controls = scheduler_state_at<SchedulerTaskControl>(retained.base(), large.task_controls_offset);
+    EXPECT_EQ(scheduler_completion_total(large_controls[0].completion_state), 1u);
+    EXPECT_EQ(scheduler_completion_total(large_controls[1].completion_state), 7u);
+}
+
+class HbgSpmdInvalidRequirements : public ::testing::TestWithParam<SchedulerSpmdRequirements> {};
+
+TEST_P(HbgSpmdInvalidRequirements, RejectsWithoutChangingOutput) {
+    AicoreSchedulerLayout layout{};
+    std::memset(&layout, 0xa5, sizeof(layout));
+    std::array<uint8_t, sizeof(layout)> before{};
+    std::memcpy(before.data(), &layout, sizeof(layout));
+    EXPECT_FALSE(scheduler_plan_layout(5, &layout, false, 0, GetParam()));
+    EXPECT_EQ(std::memcmp(before.data(), &layout, sizeof(layout)), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    InvalidTopologyAndCounts, HbgSpmdInvalidRequirements,
+    ::testing::Values(
+        SchedulerSpmdRequirements{0, 0, 1, 0}, SchedulerSpmdRequirements{0, 1, 0, 0},
+        SchedulerSpmdRequirements{1, 0, 0, 0}, SchedulerSpmdRequirements{2, 0, 0, 0},
+        SchedulerSpmdRequirements{3, 0, 0, 0}, SchedulerSpmdRequirements{3, 2, 0, 0},
+        SchedulerSpmdRequirements{64, 21, 1, 0}, SchedulerSpmdRequirements{109, 36, 1, 0},
+        SchedulerSpmdRequirements{111, 37, 1, 0}, SchedulerSpmdRequirements{108, 35, 1, 0},
+        SchedulerSpmdRequirements{108, 36, 6, 0}, SchedulerSpmdRequirements{108, 36, 1, 2, 2},
+        SchedulerSpmdRequirements{108, 36, 0, 1, 1}, SchedulerSpmdRequirements{UINT64_MAX, UINT64_MAX, 1, 0},
+        SchedulerSpmdRequirements{108, 36, UINT64_MAX, 0}, SchedulerSpmdRequirements{108, 36, 5, UINT64_MAX}
+    )
+);
+
+TEST(HbgSpmdLayout, RejectsExistingCountAndTraceOverflowWithoutChangingOutput) {
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(1, &layout, false, 0, requirements(3, 1, 1)));
+    std::array<uint8_t, sizeof(layout)> before{};
+    std::memcpy(before.data(), &layout, sizeof(layout));
+    for (const auto &counts : std::vector<std::array<uint64_t, 2>>{
+             {static_cast<uint64_t>(INT32_MAX) + 1, 0},
+             {UINT64_MAX, 0},
+             {1, UINT64_MAX},
+             {1, UINT64_MAX / sizeof(SchedulerTaskTrace) + 1},
+         }) {
+        SCOPED_TRACE(counts[0]);
+        SCOPED_TRACE(counts[1]);
+        EXPECT_FALSE(scheduler_plan_layout(counts[0], &layout, false, counts[1], requirements(3, 1, 1)));
+        EXPECT_EQ(std::memcmp(before.data(), &layout, sizeof(layout)), 0);
+    }
+    EXPECT_FALSE(scheduler_plan_layout(1, nullptr, false, 0, requirements(3, 1, 1)));
+}
+
+TEST(HbgSpmdLayout, EmptyGraphWithKnownTopologyHasNoProtocolStorage) {
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(0, &layout, false, 0, requirements(108, 0, 0)));
+    expect_no_protocol_storage(layout);
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    ASSERT_NE(storage.base(), nullptr);
+    ASSERT_TRUE(scheduler_init_spmd_task_records(storage.base(), layout, UINT64_MAX));
+    expect_summary_configuration(storage.base(), layout, UINT64_MAX);
+}
+
+TEST(HbgSpmdLayout, DeviceRelocationKeepsAllProtocolReferencesAsOffsets) {
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(3, &layout, true, 10, requirements(66, 2, 1), true));
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    ASSERT_NE(storage.base(), nullptr);
+    for (uint64_t device_base : {UINT64_C(0x400000000), UINT64_C(0x800000000)}) {
+        SCOPED_TRACE(device_base);
+        ASSERT_TRUE(scheduler_init_data_from_layout(storage.base(), layout, device_base));
+        set_metadata(storage.base(), layout, 0, 3, LaneMask::aic(), SCHEDULER_TASK_SYNC_START);
+        set_metadata(storage.base(), layout, 1, 2, LaneMask::all(), SCHEDULER_TASK_SYNC_START);
+        set_metadata(storage.base(), layout, 2, 1, LaneMask::aiv0());
+        ASSERT_TRUE(scheduler_init_spmd_task_records(storage.base(), layout, 9));
+        expect_summary_configuration(storage.base(), layout, 9);
+        const auto *summary = scheduler_state_at<SchedulerGraphSummary>(storage.base(), layout.graph_summary_offset);
+        ASSERT_NE(layout.protocol_layout_offset, 0u);
+        ASSERT_EQ(summary->protocol_layout_offset, layout.protocol_layout_offset);
+        const auto *header =
+            scheduler_state_at<SchedulerProtocolLayout>(storage.base(), summary->protocol_layout_offset);
+        ASSERT_NE(layout.protocol.floors_offset, 0u);
+        EXPECT_EQ(header->floors_offset, layout.protocol.floors_offset);
+    }
+}
+
+TEST(HbgSpmdTaskRecords, InitializesCompletionCreditForEachPhysicalLaneAndBlock) {
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(8, &layout, false, 62, requirements(96, 2, 2, 1)));
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    ASSERT_NE(storage.base(), nullptr);
+    set_metadata(storage.base(), layout, 0, 1, LaneMask::aic());
+    set_metadata(storage.base(), layout, 1, 5, LaneMask::aic(), 0);
+    set_metadata(storage.base(), layout, 2, 1, LaneMask::both_aiv());
+    set_metadata(storage.base(), layout, 3, 2, LaneMask::aiv0(), SCHEDULER_TASK_SYNC_START);
+    set_metadata(storage.base(), layout, 4, 17, LaneMask::all(), SCHEDULER_TASK_SYNC_START);
+    set_metadata(storage.base(), layout, 5, 0, LaneMask::none(), SCHEDULER_TASK_INLINE);
+    set_metadata(storage.base(), layout, 7, 1, LaneMask::aiv1());
+    constexpr uint64_t epoch = 123;
+    ASSERT_TRUE(scheduler_init_spmd_task_records(storage.base(), layout, epoch));
+    expect_summary_configuration(storage.base(), layout, epoch);
+    const auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(storage.base(), layout.task_metadata_offset);
+    const auto *controls = scheduler_state_at<SchedulerTaskControl>(storage.base(), layout.task_controls_offset);
+    for (uint64_t task = 0; task < layout.task_count; ++task) {
+        const auto &meta = metadata[task];
+        const uint32_t expected = scheduler_task_is_executable(meta.flags) && !scheduler_task_is_inline(meta.flags) ?
+                                      meta.logical_block_num * meta.active_mask.count() :
+                                      1;
+        EXPECT_EQ(controls[task].completion_state, scheduler_completion_initial_state(expected));
+        EXPECT_EQ(controls[task].claim_seal, 0u);
+    }
+}
+
+TEST(HbgSpmdTaskRecords, EpochIsSuppliedExactlyToHostRecordsWithoutIncrement) {
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(1, &layout, false, 2, requirements(6, 1, 0)));
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    ASSERT_NE(storage.base(), nullptr);
+    for (uint64_t epoch : {UINT64_C(0), UINT64_C(1), UINT64_MAX - 1, UINT64_MAX}) {
+        SCOPED_TRACE(epoch);
+        ASSERT_TRUE(
+            scheduler_init_data_from_layout(storage.base(), layout, reinterpret_cast<uint64_t>(storage.base()))
+        );
+        set_metadata(storage.base(), layout, 0, 2, LaneMask::aic(), SCHEDULER_TASK_SYNC_START);
+        ASSERT_TRUE(scheduler_init_spmd_task_records(storage.base(), layout, epoch));
+        expect_summary_configuration(storage.base(), layout, epoch);
+    }
+}
+
+struct InvalidTaskShape {
+    uint16_t blocks;
+    LaneMask mask;
+    uint8_t flags;
+};
+
+class HbgSpmdInvalidTaskShape : public ::testing::TestWithParam<InvalidTaskShape> {};
+
+// A lane byte with bits outside the three lanes cannot be built through
+// LaneMask, but the metadata this validates is read back from device memory,
+// where a corrupted image can still carry one.
+TEST(HbgSpmdInvalidLaneByte, RejectsALaneByteWithBitsOutsideTheThreeLanes) {
+    for (uint8_t corrupt : {uint8_t{8}, uint8_t{UINT8_MAX}}) {
+        SCOPED_TRACE(static_cast<uint32_t>(corrupt));
+        AicoreSchedulerLayout layout{};
+        ASSERT_TRUE(scheduler_plan_layout(2, &layout, false, 0, requirements(108, 2, 0)));
+        scheduler_test::SchedulerStateBuffer storage(layout);
+        ASSERT_NE(storage.base(), nullptr);
+        set_metadata(storage.base(), layout, 0, 2, LaneMask::aic());
+        set_metadata(storage.base(), layout, 1, 2, LaneMask::aic());
+        auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(storage.base(), layout.task_metadata_offset);
+        metadata[1].flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD;
+        std::memcpy(&metadata[1].active_mask, &corrupt, sizeof(corrupt));
+        std::vector<uint8_t> before(static_cast<size_t>(layout.total_size));
+        std::memcpy(before.data(), storage.base(), before.size());
+        EXPECT_FALSE(scheduler_init_spmd_task_records(storage.base(), layout, 99));
+        EXPECT_EQ(std::memcmp(before.data(), storage.base(), before.size()), 0);
+    }
+}
+
+TEST_P(HbgSpmdInvalidTaskShape, RejectsBeforePublishingAnyRecordOrEpoch) {
+    AicoreSchedulerLayout layout{};
+    const uint64_t declared_mix = (GetParam().flags & SCHEDULER_TASK_MIX) != 0 ? 1 : 0;
+    ASSERT_TRUE(scheduler_plan_layout(2, &layout, false, 0, requirements(108, 2, declared_mix)));
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    ASSERT_NE(storage.base(), nullptr);
+    set_metadata(storage.base(), layout, 0, 2, LaneMask::aic());
+    set_metadata(storage.base(), layout, 1, GetParam().blocks, GetParam().mask);
+    auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(storage.base(), layout.task_metadata_offset);
+    metadata[1].flags = GetParam().flags;
+    std::vector<uint8_t> before(static_cast<size_t>(layout.total_size));
+    std::memcpy(before.data(), storage.base(), before.size());
+    EXPECT_FALSE(scheduler_init_spmd_task_records(storage.base(), layout, 99));
+    EXPECT_EQ(std::memcmp(before.data(), storage.base(), before.size()), 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    ShapeAndFlags, HbgSpmdInvalidTaskShape,
+    ::testing::Values(
+        InvalidTaskShape{0, kAicAiv0, SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_MIX},
+        InvalidTaskShape{2, LaneMask::none(), SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD},
+        InvalidTaskShape{2, kAicAiv0, SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD},
+        InvalidTaskShape{2, LaneMask::aic(), SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD | SCHEDULER_TASK_MIX},
+        InvalidTaskShape{2, kAicAiv0, SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_MIX},
+        InvalidTaskShape{1, kAicAiv0, SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD | SCHEDULER_TASK_MIX},
+        InvalidTaskShape{1, LaneMask::aic(), SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SYNC_START},
+        InvalidTaskShape{1, kAicAiv0, SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_MIX | SCHEDULER_TASK_SYNC_START},
+        InvalidTaskShape{
+            2, LaneMask::aic(), SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD | SCHEDULER_TASK_HAS_PREDICATE
+        },
+        InvalidTaskShape{
+            2, kAicAiv0,
+            SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD | SCHEDULER_TASK_MIX | SCHEDULER_TASK_HAS_PREDICATE
+        },
+        InvalidTaskShape{1, kAicAiv0, SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_MIX | SCHEDULER_TASK_HAS_PREDICATE},
+        InvalidTaskShape{16384, kAicAiv0, SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD | SCHEDULER_TASK_MIX},
+        InvalidTaskShape{10923, LaneMask::all(), SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD | SCHEDULER_TASK_MIX},
+        InvalidTaskShape{UINT16_MAX, kAicAiv0, SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD | SCHEDULER_TASK_MIX}
+    )
+);
+
+TEST(HbgSpmdTaskRecords, CooperativeAndMixCountMismatchDoesNotPartiallyInitialize) {
+    for (const auto &spmd : {
+             requirements(3, 1, 0),
+             requirements(3, 1, 1),
+             requirements(3, 2, 0),
+             requirements(3, 2, 2),
+             requirements(3, 3, 1),
+         }) {
+        SCOPED_TRACE(spmd.cooperative_task_count);
+        SCOPED_TRACE(spmd.mix_task_count);
+        AicoreSchedulerLayout layout{};
+        ASSERT_TRUE(scheduler_plan_layout(3, &layout, false, 0, spmd));
+        scheduler_test::SchedulerStateBuffer storage(layout);
+        ASSERT_NE(storage.base(), nullptr);
+        set_metadata(storage.base(), layout, 0, 2, LaneMask::aic());
+        set_metadata(storage.base(), layout, 1, 1, kAicAiv0);
+        set_metadata(storage.base(), layout, 2, 1, LaneMask::aiv0());
+        std::vector<uint8_t> before(static_cast<size_t>(layout.total_size));
+        std::memcpy(before.data(), storage.base(), before.size());
+        EXPECT_FALSE(scheduler_init_spmd_task_records(storage.base(), layout, 55));
+        EXPECT_EQ(std::memcmp(before.data(), storage.base(), before.size()), 0);
+    }
+}
+
+TEST(HbgSpmdTaskRecords, RejectsSyncMetadataWhenDeclaredCooperativeCountIsZero) {
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(1, &layout, false, 0, requirements(3, 0, 0)));
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    ASSERT_NE(storage.base(), nullptr);
+    set_metadata(storage.base(), layout, 0, 2, LaneMask::aic(), SCHEDULER_TASK_SYNC_START);
+    EXPECT_FALSE(scheduler_init_spmd_task_records(storage.base(), layout, 1));
+    expect_summary_configuration(storage.base(), layout, 0);
+}
+
+TEST(HbgSpmdTaskRecords, InitializesOrdinaryPredicateAndSkippedEntries) {
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(4, &layout, false, 2, requirements(3, 0, 0)));
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    ASSERT_NE(storage.base(), nullptr);
+    set_metadata(storage.base(), layout, 0, 1, LaneMask::aic(), SCHEDULER_TASK_HAS_PREDICATE);
+    set_metadata(storage.base(), layout, 1, 1, LaneMask::aiv0(), SCHEDULER_TASK_HAS_PREDICATE);
+    set_metadata(storage.base(), layout, 2, 0, LaneMask::none(), SCHEDULER_TASK_INLINE);
+    ASSERT_TRUE(scheduler_init_spmd_task_records(storage.base(), layout, 37));
+    expect_summary_configuration(storage.base(), layout, 37);
+    expect_no_protocol_storage(layout);
+}
+
+TEST(HbgSpmdTaskRecords, RejectsNullStorage) {
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(1, &layout, false, 0, requirements(3, 1, 0)));
+    EXPECT_FALSE(scheduler_init_spmd_task_records(nullptr, layout, 1));
+}
+
+TEST(HbgSpmdTaskRecords, RejectsUnalignedStorageWithoutChangingState) {
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(1, &layout, false, 0, requirements(3, 1, 0)));
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    ASSERT_NE(storage.base(), nullptr);
+    set_metadata(storage.base(), layout, 0, 2, LaneMask::aic());
+    std::vector<uint8_t> before(static_cast<size_t>(layout.total_size));
+    std::memcpy(before.data(), storage.base(), before.size());
+    for (uint64_t displacement : {1u, 8u, 64u, 127u}) {
+        SCOPED_TRACE(displacement);
+        EXPECT_FALSE(
+            scheduler_init_spmd_task_records(static_cast<uint8_t *>(storage.base()) + displacement, layout, 1)
+        );
+        EXPECT_EQ(std::memcmp(before.data(), storage.base(), before.size()), 0);
+    }
+}
+
+TEST(HbgSpmdTaskRecords, RejectsTimingSlotsOutsideTaskAttrsRangeWithoutPartialPublication) {
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(2, &layout, false, 0, requirements(3, 2, 0)));
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    ASSERT_NE(storage.base(), nullptr);
+    set_metadata(storage.base(), layout, 0, 2, LaneMask::aic());
+    set_metadata(storage.base(), layout, 1, 2, LaneMask::aic());
+    auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(storage.base(), layout.task_metadata_offset);
+    for (int16_t timing_slot : {-2, INT16_MIN, 16, INT16_MAX}) {
+        SCOPED_TRACE(timing_slot);
+        metadata[1].timing_slot = timing_slot;
+        std::vector<uint8_t> before(static_cast<size_t>(layout.total_size));
+        std::memcpy(before.data(), storage.base(), before.size());
+        EXPECT_FALSE(scheduler_init_spmd_task_records(storage.base(), layout, 5));
+        EXPECT_EQ(std::memcmp(before.data(), storage.base(), before.size()), 0);
+    }
+}
+
+TEST(HbgSpmdTaskRecords, AcceptsMaximumRepresentablePureAndMixSubtaskCounts) {
+    AicoreSchedulerLayout layout{};
+    constexpr uint64_t execution_count = 3 * uint64_t{INT16_MAX} + 4 * uint64_t{32766};
+    ASSERT_TRUE(scheduler_plan_layout(7, &layout, false, execution_count, requirements(108, 0, 4, 0)));
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    ASSERT_NE(storage.base(), nullptr);
+    uint64_t task = 0;
+    for (LaneMask mask : {LaneMask::aic(), LaneMask::aiv0(), LaneMask::aiv1()})
+        set_metadata(storage.base(), layout, task++, INT16_MAX, mask);
+    for (LaneMask mask : {kAicAiv0, kAicAiv1, LaneMask::both_aiv()})
+        set_metadata(storage.base(), layout, task++, 16383, mask);
+    set_metadata(storage.base(), layout, task, 10922, LaneMask::all());
+    ASSERT_TRUE(scheduler_init_spmd_task_records(storage.base(), layout, 11));
+    expect_no_protocol_storage(layout);
+    for (task = 0; task < layout.task_count; ++task) {
+        SCOPED_TRACE(task);
+        const auto *plans = scheduler_state_at<SchedulerExecutionPlan>(storage.base(), layout.prepared.plans_offset);
+        EXPECT_EQ(plans[task].block_num, task < 3 ? INT16_MAX : (task < 6 ? 16383 : 10922));
+    }
+}
+
+TEST(HbgSpmdTaskRecords, DispatchMetadataAlwaysCopiesLogicalBlockCountAndTimingSlot) {
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(1, &layout, false, 0, requirements(3, 1, 0)));
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    ASSERT_NE(storage.base(), nullptr);
+    set_metadata(storage.base(), layout, 0, INT16_MAX, LaneMask::aic());
+    auto *source = scheduler_state_at<SchedulerTaskMetadata>(storage.base(), layout.task_metadata_offset);
+    source->trace_index_base = UINT32_MAX;
+    SchedulerLocalState local{};
+    local.config.task_metadata_offset = layout.task_metadata_offset;
+    for (int16_t timing_slot : {-1, 0, 15}) {
+        source->timing_slot = timing_slot;
+        for (uint64_t profiling : {0u, 1u, 3u}) {
+            SCOPED_TRACE(timing_slot);
+            SCOPED_TRACE(profiling);
+            const auto loaded = scheduler_load_dispatch_metadata(storage.base(), &local, 0, profiling);
+            EXPECT_EQ(loaded.logical_block_num, INT16_MAX);
+            EXPECT_EQ(loaded.timing_slot, timing_slot);
+            EXPECT_EQ(loaded.active_mask, source->active_mask);
+            EXPECT_EQ(loaded.flags, source->flags);
+            EXPECT_EQ(loaded.trace_index_base, profiling == 0 ? 0u : UINT32_MAX);
+        }
+    }
+}
+
+struct SubtaskCountCase {
+    uint64_t blocks;
+    uint32_t active;
+    uint32_t expected;
+};
+
+class HbgSpmdValidSubtaskCount : public ::testing::TestWithParam<SubtaskCountCase> {};
+
+TEST_P(HbgSpmdValidSubtaskCount, AcceptsRepresentablePositiveProduct) {
+    uint32_t result = UINT32_MAX;
+    ASSERT_TRUE(scheduler_subtask_count_checked(GetParam().blocks, GetParam().active, &result));
+    EXPECT_EQ(result, GetParam().expected);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    NarrowWireBoundary, HbgSpmdValidSubtaskCount,
+    ::testing::Values(
+        SubtaskCountCase{1, 1, 1}, SubtaskCountCase{1, 2, 2}, SubtaskCountCase{1, 3, 3},
+        SubtaskCountCase{INT16_MAX, 1, INT16_MAX}, SubtaskCountCase{16383, 2, 32766}, SubtaskCountCase{10922, 3, 32766},
+        SubtaskCountCase{108, 3, 324}
+    )
+);
+
+class HbgSpmdInvalidSubtaskCount : public ::testing::TestWithParam<SubtaskCountCase> {};
+
+TEST_P(HbgSpmdInvalidSubtaskCount, FailurePreservesOutput) {
+    uint32_t result = UINT32_C(0xa5a5a5a5);
+    EXPECT_FALSE(scheduler_subtask_count_checked(GetParam().blocks, GetParam().active, &result));
+    EXPECT_EQ(result, UINT32_C(0xa5a5a5a5));
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    ZeroInvalidWidthAndOverflow, HbgSpmdInvalidSubtaskCount,
+    ::testing::Values(
+        SubtaskCountCase{0, 1, 0}, SubtaskCountCase{0, 3, 0}, SubtaskCountCase{1, 0, 0}, SubtaskCountCase{1, 4, 0},
+        SubtaskCountCase{1, UINT32_MAX, 0}, SubtaskCountCase{32768, 1, 0}, SubtaskCountCase{16384, 2, 0},
+        SubtaskCountCase{10923, 3, 0}, SubtaskCountCase{UINT64_MAX, 1, 0}, SubtaskCountCase{UINT64_MAX, 3, 0},
+        SubtaskCountCase{UINT64_MAX / 3 + 1, 3, 0}
+    )
+);
+
+struct TraceCountCase {
+    uint64_t prefix;
+    uint64_t added;
+    uint64_t expected;
+};
+
+class HbgSpmdValidTraceCount : public ::testing::TestWithParam<TraceCountCase> {};
+
+TEST_P(HbgSpmdValidTraceCount, AllowsLastAddressableTraceIncludingCapacityEndpoint) {
+    uint64_t result = UINT64_MAX;
+    ASSERT_TRUE(scheduler_trace_count_checked(GetParam().prefix, GetParam().added, &result));
+    EXPECT_EQ(result, GetParam().expected);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Uint32IndexBoundary, HbgSpmdValidTraceCount,
+    ::testing::Values(
+        TraceCountCase{0, 1, 1}, TraceCountCase{0, UINT32_MAX, UINT32_MAX},
+        TraceCountCase{0, UINT64_C(1) << 32, UINT64_C(1) << 32}, TraceCountCase{UINT32_MAX, 1, UINT64_C(1) << 32},
+        TraceCountCase{UINT32_MAX - 1, 2, UINT64_C(1) << 32}, TraceCountCase{UINT32_MAX - 1, 1, UINT32_MAX},
+        TraceCountCase{17, 32766, 32783}
+    )
+);
+
+class HbgSpmdInvalidTraceCount : public ::testing::TestWithParam<TraceCountCase> {};
+
+TEST_P(HbgSpmdInvalidTraceCount, FailurePreservesOutput) {
+    uint64_t result = UINT64_C(0xa5a5a5a5a5a5a5a5);
+    EXPECT_FALSE(scheduler_trace_count_checked(GetParam().prefix, GetParam().added, &result));
+    EXPECT_EQ(result, UINT64_C(0xa5a5a5a5a5a5a5a5));
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    ZeroAddInvalidPrefixAndOverflow, HbgSpmdInvalidTraceCount,
+    ::testing::Values(
+        TraceCountCase{0, 0, 0}, TraceCountCase{UINT32_MAX, 0, 0}, TraceCountCase{UINT32_MAX, 2, 0},
+        TraceCountCase{UINT64_C(1) << 32, 1, 0}, TraceCountCase{UINT64_MAX, 1, 0},
+        TraceCountCase{0, (UINT64_C(1) << 32) + 1, 0}, TraceCountCase{0, UINT64_MAX, 0},
+        TraceCountCase{1, UINT64_MAX, 0}
+    )
+);
+
+TEST(HbgSpmdCheckedCounts, RejectsNullOutputPointers) {
+    EXPECT_FALSE(scheduler_subtask_count_checked(1, 1, nullptr));
+    EXPECT_FALSE(scheduler_trace_count_checked(0, 1, nullptr));
+}
+
+class HbgProtocolTraceLayout : public ::testing::TestWithParam<uint64_t> {};
+
+TEST_P(HbgProtocolTraceLayout, ReservesIndexedRecordsRatherThanPerWorkerCopiesOfTheBlockHistory) {
+    AicoreSchedulerLayout plain{};
+    AicoreSchedulerLayout full{};
+    const auto spmd = requirements(GetParam(), 2, 1);
+    ASSERT_TRUE(scheduler_plan_layout(3, &plain, true, 7, spmd));
+    ASSERT_TRUE(scheduler_plan_layout(3, &full, true, 7, spmd, true));
+    EXPECT_EQ(plain.protocol_layout_offset, 0u);
+    EXPECT_EQ(plain.protocol.magic, 0u);
+    EXPECT_EQ(full.protocol_layout_offset, plain.total_size);
+    const auto &p = full.protocol;
+    EXPECT_EQ(p.magic, SCHEDULER_PROTOCOL_MAGIC);
+    EXPECT_EQ(p.task_count, 3u);
+    EXPECT_EQ(p.worker_count, GetParam());
+    EXPECT_EQ(p.cooperative_task_count, 2u);
+    EXPECT_EQ(p.member_count, 2 * GetParam());
+    EXPECT_EQ(p.trace_count, 7u);
+    EXPECT_EQ(p.floor_count, (spmd.mix_task_count + 1) * spmd.cluster_count);
+    constexpr uint64_t worker_alignment = alignof(SchedulerProtocolWorkerTrace);
+    const uint64_t observation_bytes =
+        (3 * sizeof(SchedulerProtocolCounterObservation) + worker_alignment - 1) / worker_alignment * worker_alignment;
+    const uint64_t expected = sizeof(SchedulerProtocolLayout) + 3 * sizeof(SchedulerProtocolTaskTrace) +
+                              2 * GetParam() * sizeof(SchedulerProtocolMemberTrace) +
+                              p.floor_count * sizeof(SchedulerProtocolFloorTrace) +
+                              7 * sizeof(SchedulerProtocolBlockTrace) + 7 * sizeof(SchedulerProtocolExecutionTrace) +
+                              7 * sizeof(SchedulerProtocolConditionContribution) + observation_bytes +
+                              GetParam() * sizeof(SchedulerProtocolWorkerTrace);
+    EXPECT_EQ(full.total_size - plain.total_size, expected);
+    EXPECT_EQ(p.storage_end_offset, full.total_size);
+    std::vector<std::pair<uint64_t, uint64_t>> regions{
+        {full.protocol_layout_offset, sizeof(SchedulerProtocolLayout)},
+        {p.tasks_offset, p.task_count * sizeof(SchedulerProtocolTaskTrace)},
+        {p.members_offset, p.member_count * sizeof(SchedulerProtocolMemberTrace)},
+        {p.floors_offset, p.floor_count * sizeof(SchedulerProtocolFloorTrace)},
+        {p.blocks_offset, p.trace_count * sizeof(SchedulerProtocolBlockTrace)},
+        {p.executions_offset, p.trace_count * sizeof(SchedulerProtocolExecutionTrace)},
+        {p.condition_contributions_offset, p.trace_count * sizeof(SchedulerProtocolConditionContribution)},
+        {p.counter_observations_offset, p.task_count * sizeof(SchedulerProtocolCounterObservation)},
+        {p.workers_offset, p.worker_count * sizeof(SchedulerProtocolWorkerTrace)},
+    };
+    std::sort(regions.begin(), regions.end());
+    for (size_t index = 0; index < regions.size(); ++index) {
+        EXPECT_EQ(regions[index].first % 64, 0u);
+        EXPECT_LE(regions[index].first + regions[index].second, full.total_size);
+        if (index + 1 < regions.size())
+            EXPECT_LE(regions[index].first + regions[index].second, regions[index + 1].first);
+    }
+    scheduler_test::SchedulerStateBuffer storage(full);
+    const auto *summary = scheduler_state_at<SchedulerGraphSummary>(storage.base(), full.graph_summary_offset);
+    EXPECT_EQ(summary->protocol_layout_offset, full.protocol_layout_offset);
+    const auto *wire = scheduler_state_at<SchedulerProtocolLayout>(storage.base(), full.protocol_layout_offset);
+    EXPECT_EQ(std::memcmp(wire, &p, sizeof(p)), 0);
+    const auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(storage.base(), p.workers_offset);
+    for (uint64_t worker = 0; worker < p.worker_count; ++worker) {
+        EXPECT_EQ(workers[worker].worker_index, worker);
+        EXPECT_EQ(workers[worker].next_sequence, 0u);
+        EXPECT_EQ(workers[worker].finished, 0u);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(ActualWorkers, HbgProtocolTraceLayout, ::testing::Values(3u, 63u, 66u, 96u, 108u));
+
+TEST(HbgProtocolTrace, CompactRunAndTraceLayoutSeparatesConcurrentWriters) {
+    EXPECT_EQ(sizeof(SchedulerGraphSummary), 128u);
+    EXPECT_EQ(sizeof(SchedulerRunControl), 384u + SCHEDULER_WORKER_CAPACITY * 64);
+    EXPECT_EQ(sizeof(SchedulerTaskTrace), 256u);
+    EXPECT_EQ(offsetof(SchedulerGraphSummary, protocol_layout_offset), 48u);
+    EXPECT_EQ(offsetof(SchedulerProtocolTaskTrace, completion), 0u);
+    EXPECT_EQ(offsetof(SchedulerProtocolBlockTrace, lanes), 320u);
+    EXPECT_EQ(sizeof(SchedulerProtocolLaneTrace), 192u);
+}
+
+TEST(HbgProtocolTrace, RetainedResetErasesAllEvidenceAndBindsTheLiteralNewEpoch) {
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(3, &layout, false, 7, requirements(6, 2, 1), true));
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    const auto init = [&](uint64_t epoch) {
+        EXPECT_TRUE(scheduler_init_data_from_layout(storage.base(), layout, UINT64_C(0x400000000)));
+        set_metadata(storage.base(), layout, 0, 2, LaneMask::aic(), SCHEDULER_TASK_SYNC_START);
+        set_metadata(storage.base(), layout, 1, 2, kAicAiv0, SCHEDULER_TASK_SYNC_START);
+        set_metadata(storage.base(), layout, 2, 1, LaneMask::aiv0());
+        EXPECT_TRUE(scheduler_init_spmd_task_records(storage.base(), layout, epoch));
+    };
+    for (uint64_t epoch : {UINT64_C(0), UINT64_MAX}) {
+        init(epoch);
+        std::vector<uint8_t> expected(static_cast<size_t>(layout.total_size));
+        std::memcpy(expected.data(), storage.base(), expected.size());
+        std::memset(storage.base(), 0xa5, expected.size());
+        init(epoch);
+        EXPECT_EQ(std::memcmp(storage.base(), expected.data(), expected.size()), 0);
+        const auto *p = scheduler_state_at<SchedulerProtocolLayout>(storage.base(), layout.protocol_layout_offset);
+        EXPECT_EQ(p->run_epoch, epoch);
+        const auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(storage.base(), p->workers_offset);
+        for (uint64_t worker = 0; worker < 6; ++worker) {
+            EXPECT_EQ(workers[worker].run_epoch, epoch);
+            EXPECT_EQ(workers[worker].next_sequence, 0u);
+            EXPECT_EQ(workers[worker].error_flags, 0u);
+            EXPECT_EQ(workers[worker].finished, 0u);
+        }
+    }
+}
+
+TEST(HbgProtocolTrace, AdditionalTraceStorageOverflowPreservesTheCallersLayout) {
+    constexpr uint64_t plain_execution_bytes = sizeof(SchedulerTaskTrace) + sizeof(SchedulerPreparedControl) +
+                                               sizeof(SchedulerExecutionBinding) + sizeof(SchedulerPreparedCall);
+    const uint64_t records = UINT64_MAX / (plain_execution_bytes + sizeof(SchedulerProtocolBlockTrace));
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(1, &layout, false, records, requirements(3, 1, 0)));
+    const auto previous = layout;
+    EXPECT_FALSE(scheduler_plan_layout(1, &layout, false, records, requirements(3, 1, 0), true));
+    EXPECT_EQ(std::memcmp(&layout, &previous, sizeof(layout)), 0);
+}
+
+TEST(HbgProtocolTrace, DisabledRunDoesNotExposeOrClearAFormerLargerProtocolRegion) {
+    AicoreSchedulerLayout full{}, plain{};
+    ASSERT_TRUE(scheduler_plan_layout(3, &full, false, 7, requirements(6, 2, 1), true));
+    ASSERT_TRUE(scheduler_plan_layout(3, &plain, false, 7, requirements(6, 2, 1)));
+    scheduler_test::SchedulerStateBuffer storage(full);
+    auto *bytes = static_cast<uint8_t *>(storage.base());
+    std::memset(bytes + plain.total_size, 0xa5, static_cast<size_t>(full.total_size - plain.total_size));
+    ASSERT_TRUE(scheduler_init_data_from_layout(storage.base(), plain, UINT64_C(0x400000000)));
+    const auto *summary = scheduler_state_at<SchedulerGraphSummary>(storage.base(), plain.graph_summary_offset);
+    EXPECT_EQ(summary->protocol_layout_offset, 0u);
+    EXPECT_EQ(bytes[plain.total_size], 0xa5);
+    EXPECT_EQ(bytes[full.total_size - 1], 0xa5);
+}
+
+TEST(HbgProtocolTrace, RequiresAnActualTopologyEvenForOrdinaryOnlyGraphs) {
+    AicoreSchedulerLayout layout{};
+    EXPECT_FALSE(scheduler_plan_layout(1, &layout, false, 1, {}, true));
+    ASSERT_TRUE(scheduler_plan_layout(1, &layout, false, 1, requirements(3, 0, 0), true));
+    EXPECT_EQ(layout.protocol.member_count, 0u);
+    EXPECT_EQ(layout.protocol.worker_count, 3u);
+}
+
+}  // namespace

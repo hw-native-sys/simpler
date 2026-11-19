@@ -103,7 +103,7 @@ def _default_install_entry(platform: str, runtime: str, device_id: int, result_q
         worker = Worker(level=2, device_id=device_id, platform=platform, runtime=runtime)
         worker.init()
         assert worker._chip_worker is not None
-        status, report = worker._chip_worker._impl.workspace_report()
+        status, report = worker._chip_worker.workspace_report()
         result["status"] = status
         result["budget_enforced"] = None if report is None else int(report["budget_enforced"])
         result["limit_bytes"] = None if report is None else int(report["limit_bytes"])

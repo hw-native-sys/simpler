@@ -20,16 +20,6 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"
 : "${ASCEND_HOME_PATH:?ASCEND_HOME_PATH must be set}"
 
-# a2a3-only at runtime. This tool asks the HAL for the AIC_CTRL register window,
-# and halMemCtl exists only under src/a2a3/ in this repo -- a5's platform_config.h
-# names no AIC_CTRL at all. On a5 the call returns rc=65534 and a null base, so
-# every probe has nothing to address. The build is covered on both arches; exit 77
-# marks a skip the runner counts and names, rather than a pass.
-if [ "${SIMPLER_SMOKE_ARCH:-a2a3}" != "a2a3" ]; then
-    echo "skipping: needs the AIC_CTRL window via halMemCtl, which is a2a3-only" >&2
-    exit 77
-fi
-
 # Path is per-arch, so the caller supplies it: build_cann_examples.sh --run
 # derives it from the ccec target, and a by-hand run points it at the arch being
 # exercised. Defaulting to one arch here would send an a5 run at a2a3's build.

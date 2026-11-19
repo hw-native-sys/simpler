@@ -57,14 +57,17 @@ def metrics(actual, expected):
     }
 
 
-def validate_kv(worker, devices, fixture, expected, steps):
+def validate_kv(worker, devices, fixture, expected, steps, *, prefix_cache=None):
     shape = (fixture.num_pages, PAGE, HEADS, HEAD_DIM)
     nbytes = math.prod(shape) * 2
     staging = worker.create_buffer(nbytes)
     rows = []
+    prefix_cache = {} if prefix_cache is None else prefix_cache
     try:
         for layer in range(LAYERS):
-            prefix = load_file(str(fixture.root / f"layer_{layer:02d}.safetensors"))
+            prefix = prefix_cache.get(layer)
+            if prefix is None:
+                prefix = prefix_cache[layer] = load_file(str(fixture.root / f"layer_{layer:02d}.safetensors"))
             for name, kind in (("k_cache", "key"), ("v_cache", "value")):
                 worker.copy_from(staging, devices[name], src_offset=layer * nbytes)
                 physical = _view(staging, shape, torch.bfloat16)
@@ -95,7 +98,21 @@ def validate_kv(worker, devices, fixture, expected, steps):
     return rows
 
 
-def allocate_resident(worker, devices, hosts, fixture, model):
+def load_kv_reference(root, reference_digest):
+    manifest = json.loads((root / "manifest.json").read_text())
+    path = root / "appended.safetensors"
+    if manifest["reference_sums_sha256"] != reference_digest:
+        raise ValueError("Appended KV reference identity mismatch")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 << 20), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != manifest["appended_sha256"]:
+        raise ValueError("Appended KV reference checksum mismatch")
+    return load_file(str(path))
+
+
+def allocate_resident(worker, devices, hosts, fixture, model, *, shared_devices=None, layer_cache=None, host_staged=()):
     def upload(name, tensor):
         device = worker.alloc_child_tensor(0, tuple(tensor.shape), torch_dtype_to_datatype(tensor.dtype).value)
         devices[name] = device
@@ -105,17 +122,26 @@ def allocate_resident(worker, devices, hosts, fixture, model):
         finally:
             staging.close()
 
-    for name, value in iter_kernel_weights(model):
-        upload(name, value)
-        print("uploaded " + name, flush=True)
-    del value
-    for name, value in zip(("rope_cos", "rope_sin"), rope_tables(model)):
-        upload(name, value)
+    if shared_devices is None:
+        for name, value in iter_kernel_weights(model):
+            upload(name, value)
+            print("uploaded " + name, flush=True)
+        del value
+        for name, value in zip(("rope_cos", "rope_sin"), rope_tables(model)):
+            upload(name, value)
+    else:
+        devices.update(shared_devices)
     kv_shape = (LAYERS * fixture.num_pages * HEADS * PAGE, HEAD_DIM)
     for name in ("k_cache", "v_cache"):
         devices[name] = worker.alloc_child_tensor(0, kv_shape, torch_dtype_to_datatype(torch.bfloat16).value)
     for layer in range(LAYERS):
-        for kind, physical in fixture.layer(layer):
+        if layer_cache is None:
+            values = fixture.layer(layer)
+        else:
+            if layer not in layer_cache:
+                layer_cache[layer] = tuple(fixture.layer(layer))
+            values = layer_cache[layer]
+        for kind, physical in values:
             staging = _host_buffer(worker, physical)
             try:
                 worker.copy_to(
@@ -136,8 +162,9 @@ def allocate_resident(worker, devices, hosts, fixture, model):
         ("next_hidden", (BATCH, HIDDEN), torch.bfloat16),
     ):
         hosts[name] = _host_buffer(worker, torch.zeros(shape, dtype=dtype))
-        devices[name] = worker.alloc_child_tensor(0, shape, torch_dtype_to_datatype(dtype).value)
-        worker.copy_to(devices[name], hosts[name])
+        if name not in host_staged:
+            devices[name] = worker.alloc_child_tensor(0, shape, torch_dtype_to_datatype(dtype).value)
+            worker.copy_to(devices[name], hosts[name])
 
 
 def main():  # noqa: PLR0912, PLR0915 -- execution and finalization share one report
@@ -213,14 +240,7 @@ def main():  # noqa: PLR0912, PLR0915 -- execution and finalization share one re
     }
     kv_reference = None
     if args.kv_reference is not None:
-        kv_manifest = json.loads((args.kv_reference / "manifest.json").read_text())
-        kv_path = args.kv_reference / "appended.safetensors"
-        if (
-            kv_manifest["reference_sums_sha256"] != report["reference_sums_sha256"]
-            or hashlib.sha256(kv_path.read_bytes()).hexdigest() != kv_manifest["appended_sha256"]
-        ):
-            raise ValueError("Appended KV reference identity mismatch")
-        kv_reference = load_file(str(kv_path))
+        kv_reference = load_kv_reference(args.kv_reference, report["reference_sums_sha256"])
     worker = Worker(
         level=3,
         platform="a2a3",

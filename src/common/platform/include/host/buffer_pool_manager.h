@@ -130,6 +130,8 @@ struct MemoryOps {
     std::function<int(void *dev_ptr)> free_;
     std::function<int(void *dev_dst, const void *host_src, size_t size)> copy_to_device;
     std::function<int(void *host_dst, const void *dev_src, size_t size)> copy_from_device;
+    int (*unregister_)(void *, int) = nullptr;
+    bool registration_requires_unregister = false;
 };
 
 /**
@@ -150,6 +152,20 @@ struct ProfilerModuleMaxCollectorThreads {
 template <typename Module>
 struct ProfilerModuleMaxCollectorThreads<Module, std::void_t<decltype(Module::kMaxCollectorThreads)>> {
     static constexpr int value = Module::kMaxCollectorThreads;
+};
+
+// How many transport cuts a module may have armed at once. Two unless the
+// module says otherwise, because a cut is held from one run's close until its
+// writer reaches a terminal verdict, so the count has to match however many
+// runs that module keeps open.
+template <typename Module, typename = void>
+struct ProfilerModuleMaxCutSlots {
+    static constexpr size_t value = 2;
+};
+
+template <typename Module>
+struct ProfilerModuleMaxCutSlots<Module, std::void_t<decltype(Module::kMaxCutSlots)>> {
+    static constexpr size_t value = Module::kMaxCutSlots;
 };
 
 template <typename Module, typename = void>
@@ -349,6 +365,12 @@ public:
         device_id_ = device_id;
     }
 
+    void publish_shared_memory(void *shared_mem_dev, void *shared_mem_host, size_t shm_size) noexcept {
+        shared_mem_dev_ = shared_mem_dev;
+        shared_mem_host_ = shared_mem_host;
+        shm_size_ = shm_size;
+    }
+
     /**
      * Forget the memory context without freeing buffers or clearing mappings.
      * Call only after worker threads have stopped and resource cleanup is done;
@@ -443,13 +465,12 @@ public:
     void clear_mappings() {
         std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
         for (auto &kv : dev_to_host_) {
-            if (kv.second != nullptr && malloc_shadows_.erase(kv.second) > 0) {
-                std::free(kv.second);
+            if (kv.second.host_ptr != nullptr && malloc_shadows_.erase(kv.second.host_ptr) > 0) {
+                std::free(kv.second.host_ptr);
             }
         }
         dev_to_host_.clear();
         block_ranges_.clear();
-        released_allocations_.clear();
         malloc_shadows_.clear();
         reset_paired_accounting_locked();
     }
@@ -484,27 +505,22 @@ public:
         for (auto &shard : ready_shards_) {
             shard.queue.clear();
         }
-        std::unordered_set<void *> release_ptrs;
-        std::vector<void *> release_order;
-        for (const auto &kv : dev_to_host_) {
-            if (kv.first != nullptr) {
-                if (void *release_ptr = allocation_base_for_locked(kv.first); release_ptr != nullptr) {
-                    if (release_ptrs.insert(release_ptr).second) {
-                        release_order.push_back(release_ptr);
-                    }
-                }
+        for (auto &kv : dev_to_host_) {
+            void *p = allocation_base_for_locked(kv.first);
+            auto it = dev_to_host_.find(p);
+            if (it == dev_to_host_.end() || it->second.released) continue;
+            it->second.released = true;
+            if constexpr (std::is_invocable_v<ReleaseFn, void *, bool>) {
+                release_fn(p, it->second.registered);
+            } else {
+                release_fn(p);
             }
-        }
-        std::sort(release_order.begin(), release_order.end(), std::less<void *>{});
-        for (void *p : release_order) {
-            release_fn(p);
         }
         for (void *host_ptr : malloc_shadows_) {
             std::free(host_ptr);
         }
         dev_to_host_.clear();
         block_ranges_.clear();
-        released_allocations_.clear();
         malloc_shadows_.clear();
         reset_paired_accounting_locked();
     }
@@ -957,31 +973,42 @@ public:
             *host_ptr_out = nullptr;
             return nullptr;
         }
-        void *host_ptr = nullptr;
-        int rc = ops_.reg(dev_ptr, size, device_id_, &host_ptr);
-        if (rc != 0 || host_ptr == nullptr) {
-            LOG_ERROR("BufferPoolManager: register failed: %d", rc);
-            // Best-effort dev free; no shadow was registered yet. Its status is
-            // reported, because a caller that pre-charged for these bytes may
-            // only give them back if they are actually gone. A context with no
-            // free callback cannot release them at all.
-            const int free_rc = ops_.free_ ? ops_.free_(dev_ptr) : -1;
-            if (free_rc != 0) {
-                note_release_failed(dev_ptr, free_rc);
-                if (release_proved_out != nullptr) *release_proved_out = false;
-            }
-            *host_ptr_out = nullptr;
-            return nullptr;
+        try {
+            register_device_allocation(dev_ptr);
+        } catch (...) {
+            const int rc = ops_.free_ ? ops_.free_(dev_ptr) : PTO_RUNTIME_ERR_INTERNAL;
+            if (rc != 0) note_release_failed(dev_ptr, rc);
+            if (release_proved_out != nullptr) *release_proved_out = rc == 0;
+            throw;
         }
-        *host_ptr_out = host_ptr;
-        {
-            std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
-            dev_to_host_[dev_ptr] = host_ptr;
-            block_ranges_.push_back(
-                BlockRange{
-                    reinterpret_cast<uintptr_t>(dev_ptr), reinterpret_cast<uintptr_t>(dev_ptr) + size, dev_ptr, host_ptr
-                }
-            );
+        auto rollback = [&] {
+            const int rc = release_allocation(dev_ptr, ops_.unregister_, ops_.free_);
+            if (release_proved_out != nullptr) *release_proved_out = rc == 0;
+            forget_allocation(dev_ptr);
+        };
+        try {
+            void *host_ptr = nullptr;
+            const int rc = ops_.reg(dev_ptr, size, device_id_, &host_ptr);
+            if (rc == 0 && ops_.registration_requires_unregister) mark_registered(dev_ptr);
+            if (rc != 0 || host_ptr == nullptr) {
+                rollback();
+                *host_ptr_out = nullptr;
+                return nullptr;
+            }
+            publish_host_view(dev_ptr, host_ptr, ops_.registration_requires_unregister);
+            {
+                std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
+                block_ranges_.push_back(
+                    BlockRange{
+                        reinterpret_cast<uintptr_t>(dev_ptr), reinterpret_cast<uintptr_t>(dev_ptr) + size, dev_ptr,
+                        host_ptr
+                    }
+                );
+            }
+            *host_ptr_out = host_ptr;
+        } catch (...) {
+            rollback();
+            throw;
         }
         return dev_ptr;
     }
@@ -993,39 +1020,9 @@ public:
      */
     void free_buffer(void *dev_ptr) {
         if (dev_ptr == nullptr) return;
-        void *release_ptr = nullptr;
-        if (!claim_release_pointer(dev_ptr, &release_ptr)) return;
-
-        void *host_ptr = nullptr;
-        bool free_host_shadow = false;
-        {
-            std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
-            auto it = dev_to_host_.find(release_ptr);
-            host_ptr = (it != dev_to_host_.end()) ? it->second : nullptr;
-            if (it != dev_to_host_.end()) {
-                dev_to_host_.erase(it);
-            }
-            block_ranges_.erase(
-                std::remove_if(
-                    block_ranges_.begin(), block_ranges_.end(),
-                    [release_ptr](const BlockRange &range) {
-                        return range.dev_base == release_ptr;
-                    }
-                ),
-                block_ranges_.end()
-            );
-            free_host_shadow = (host_ptr != nullptr && malloc_shadows_.erase(host_ptr) > 0);
-        }
-        if (ops_.free_) {
-            ops_.free_(release_ptr);
-        }
-        {
-            std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
-            released_allocations_.erase(release_ptr);
-        }
-        if (free_host_shadow) {
-            std::free(host_ptr);
-        }
+        void *base = release_pointer_for(dev_ptr);
+        (void)release_allocation(dev_ptr, ops_.unregister_, ops_.free_);
+        forget_allocation(base);
     }
 
     /**
@@ -1038,7 +1035,8 @@ public:
         std::shared_lock<std::shared_mutex> lock(mapping_mutex_);
         const auto &exact_mappings = dev_to_host_;
         auto it = exact_mappings.find(dev_ptr);
-        if (it != exact_mappings.end()) return it->second;
+        if (it != exact_mappings.end())
+            return it->second.view == ResourceView::HOST_VISIBLE ? it->second.host_ptr : nullptr;
         if (void *host_ptr = resolve_host_ptr_from_range(dev_ptr); host_ptr != nullptr) {
             return host_ptr;
         }
@@ -1051,9 +1049,76 @@ public:
      * initialize() when it pre-allocates buffers and wants the mgmt thread
      * to be able to resolve them later.
      */
-    void register_mapping(void *dev_ptr, void *host_ptr) {
+    void register_mapping(void *dev_ptr, void *host_ptr, bool registered = false) {
         std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
-        dev_to_host_[dev_ptr] = host_ptr;
+        dev_to_host_[dev_ptr] = Resource{host_ptr, ResourceView::HOST_VISIBLE, registered, false};
+    }
+
+    void register_device_allocation(void *dev_ptr) {
+        std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
+        dev_to_host_[dev_ptr] = Resource{nullptr, ResourceView::DEVICE_ONLY, false, false};
+    }
+
+    void publish_host_view(void *dev_ptr, void *host_ptr, bool registered) {
+        std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
+        auto &resource = dev_to_host_.at(dev_ptr);
+        resource.host_ptr = host_ptr;
+        resource.view = ResourceView::HOST_VISIBLE;
+        resource.registered = registered;
+    }
+
+    void mark_registered(void *dev_ptr) {
+        std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
+        dev_to_host_.at(dev_ptr).registered = true;
+    }
+
+    bool has_registered_resources() const {
+        std::shared_lock<std::shared_mutex> lock(mapping_mutex_);
+        return std::any_of(dev_to_host_.begin(), dev_to_host_.end(), [](const auto &kv) {
+            return kv.second.registered && !kv.second.released;
+        });
+    }
+
+    int release_resource(
+        void *p, bool registered, int (*unregister_fn)(void *, int), const std::function<int(void *)> &free_fn,
+        int device_id = -1
+    ) {
+        if (registered) {
+            const int rc = unregister_fn != nullptr ? unregister_fn(p, device_id >= 0 ? device_id : device_id_) :
+                                                      PTO_RUNTIME_ERR_INTERNAL;
+            if (rc != 0) {
+                note_release_failed(p, rc);
+                return rc;
+            }
+        }
+        const int rc = free_fn ? free_fn(p) : PTO_RUNTIME_ERR_INTERNAL;
+        if (rc != 0) note_release_failed(p, rc);
+        return rc;
+    }
+
+    int release_allocation(void *p, int (*unregister_fn)(void *, int), const std::function<int(void *)> &free_fn) {
+        void *base = nullptr;
+        bool registered = false;
+        if (!claim_release_pointer(p, &base, &registered)) return 0;
+        return release_resource(base, registered, unregister_fn, free_fn);
+    }
+
+    void forget_allocation(void *p) {
+        std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
+        auto it = dev_to_host_.find(p);
+        if (it != dev_to_host_.end()) {
+            if (void *host = it->second.host_ptr; host != nullptr && malloc_shadows_.erase(host) > 0) std::free(host);
+            dev_to_host_.erase(it);
+        }
+        block_ranges_.erase(
+            std::remove_if(
+                block_ranges_.begin(), block_ranges_.end(),
+                [p](const auto &range) {
+                    return range.dev_base == p;
+                }
+            ),
+            block_ranges_.end()
+        );
     }
 
     /**
@@ -1191,7 +1256,7 @@ public:
      * Claim an allocation for release. Multiple carved sub-buffers can point
      * into the same registered block; only the first claim returns true.
      */
-    bool claim_release_pointer(void *dev_ptr, void **release_ptr_out) {
+    bool claim_release_pointer(void *dev_ptr, void **release_ptr_out, bool *registered_out = nullptr) {
         if (release_ptr_out == nullptr) return false;
         std::unique_lock<std::shared_mutex> lock(mapping_mutex_);
         void *release_ptr = tracked_allocation_base_for_locked(dev_ptr);
@@ -1199,10 +1264,13 @@ public:
             *release_ptr_out = nullptr;
             return false;
         }
-        if (!released_allocations_.insert(release_ptr).second) {
+        auto &resource = dev_to_host_.at(release_ptr);
+        if (resource.released) {
             *release_ptr_out = release_ptr;
             return false;
         }
+        resource.released = true;
+        if (registered_out != nullptr) *registered_out = resource.registered;
         *release_ptr_out = release_ptr;
         return true;
     }
@@ -1328,9 +1396,15 @@ private:
     mutable std::shared_mutex mapping_mutex_;
 
     // dev → host exact mappings plus block ranges for carved buffers.
-    std::unordered_map<void *, void *> dev_to_host_;
+    enum class ResourceView { HOST_VISIBLE, DEVICE_ONLY };
+    struct Resource {
+        void *host_ptr;
+        ResourceView view;
+        bool registered;
+        bool released;
+    };
+    std::unordered_map<void *, Resource> dev_to_host_;
     std::vector<BlockRange> block_ranges_;
-    std::unordered_set<void *> released_allocations_;
 
     // Host shadows the framework itself malloc'd (via
     // `default_host_shadow_register` or `ProfilerBase::alloc_paired_buffer`'s

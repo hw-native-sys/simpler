@@ -20,20 +20,29 @@
 
 #include "aicpu/args_dump_aicpu.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
 #include "aicpu/device_run_result_base_aicpu.h"
+#include "aicpu/diagnostic_run_terminal_aicpu.h"
 #include "aicpu/profiler_device_engine.h"
+#include "callable_limits.h"
+#include "common/diagnostic_run_terminal.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
+
+static_assert(CHIP_MAX_FUNC_ID <= UINT16_MAX, "function IDs must not collide with the args-dump unknown sentinel");
 
 // Cached pointers for hot-path access (set during init)
 static uint64_t g_platform_dump_base = 0;
 static DumpDataHeader *s_dump_header = nullptr;
 static DumpBufferState *s_dump_states[PLATFORM_MAX_AICPU_THREADS] = {};
 static DumpMetaBuffer *s_current_dump_buf[PLATFORM_MAX_AICPU_THREADS] = {};
+
+static DumpArgReservation *s_open_records[PLATFORM_MAX_AICPU_THREADS] = {};
+static bool s_unsettled_record[PLATFORM_MAX_AICPU_THREADS] = {};
 
 static bool s_logged_ready_queue_full[PLATFORM_MAX_AICPU_THREADS] = {};
 static bool s_logged_no_free_meta_buffer[PLATFORM_MAX_AICPU_THREADS] = {};
@@ -42,24 +51,104 @@ static uint32_t s_records_written[PLATFORM_MAX_AICPU_THREADS] = {};
 static uint32_t s_buffers_switched[PLATFORM_MAX_AICPU_THREADS] = {};
 static uint32_t s_buffers_flushed[PLATFORM_MAX_AICPU_THREADS] = {};
 
-static inline void account_dropped_records(DumpBufferState *state, uint32_t dropped_records) {
-    if (state == nullptr || dropped_records == 0) {
+// This run's accounting, per producer thread. Held here rather than in the
+// shared DumpBufferState because the two counters that do live there —
+// published_payload_count and completed_payload_count — are lifetime cursors
+// that drive arena reuse and must never be reset; a per-run figure derived by
+// differencing them would be a second meaning for the same field. Reset with
+// the counters above at each run's device init.
+static uint32_t s_records_dropped[PLATFORM_MAX_AICPU_THREADS] = {};
+// The share of the above that never reached a buffer. A record refused before
+// the write is one this producer took responsibility for and never wrote; one
+// lost after the write is already counted among the records it wrote. `total`
+// is written + refused for exactly that reason — adding every drop instead
+// would count the second kind twice and make a lossy run fail conservation.
+static uint32_t s_records_refused[PLATFORM_MAX_AICPU_THREADS] = {};
+static uint32_t s_records_published[PLATFORM_MAX_AICPU_THREADS] = {};
+static uint32_t s_buffers_published[PLATFORM_MAX_AICPU_THREADS] = {};
+static uint32_t s_payloads_published[PLATFORM_MAX_AICPU_THREADS] = {};
+static uint64_t s_payload_bytes_published[PLATFORM_MAX_AICPU_THREADS] = {};
+
+// Where this run's producer accounting is published, and which bank of it is
+// this run's. Zero means the host mapped none, which is the default path.
+/**
+ * This run's terminal bank — the address of its first producer entry — pushed
+ * at kernel entry from the launching run's KernelArgs. 0 means the host
+ * resolved none, which is every run with this collector's retention off, and
+ * is what keeps the device off an address nobody mapped.
+ */
+static uint64_t s_run_terminal_bank = 0;
+
+static inline void saturating_add_u32(uint32_t &counter, uint32_t by) {
+    counter = diagnostic_terminal_add_u32(counter, by);
+}
+
+static inline void account_dropped_records(int thread_idx, DumpBufferState *state, uint32_t dropped_records) {
+    if (dropped_records == 0) {
         return;
     }
-    uint32_t prev = state->dropped_record_count;
-    uint32_t next = prev + dropped_records;
-    state->dropped_record_count = (next < prev) ? UINT32_MAX : next;
+    if (thread_idx >= 0 && thread_idx < PLATFORM_MAX_AICPU_THREADS) {
+        saturating_add_u32(s_records_dropped[thread_idx], dropped_records);
+    }
+    if (state == nullptr) {
+        return;
+    }
+    state->dropped_record_count = diagnostic_terminal_add_u32(state->dropped_record_count, dropped_records);
+    state->run_dropped_record_count = diagnostic_terminal_add_u32(state->run_dropped_record_count, dropped_records);
+}
+
+// A record refused before anything was written for it: counted among this
+// run's drops, and separately as one the producer never wrote.
+static inline void account_refused_record(int thread_idx, DumpBufferState *state) {
+    if (thread_idx >= 0 && thread_idx < PLATFORM_MAX_AICPU_THREADS) {
+        saturating_add_u32(s_records_refused[thread_idx], 1);
+    }
+    account_dropped_records(thread_idx, state, 1);
 }
 
 static constexpr uint64_t kDumpQueueBackpressureWaitCycles = PLATFORM_DFX_BACKPRESSURE_TIMEOUT_CYCLES;
 
 static bool g_enable_dump_args = false;
-// Dump level latched from the header in dump_args_init(). The selective
+// Dump level latched from this invocation in dump_args_init(). The selective
 // (PARTIAL) and metadata-first (HYBRID) modes are derived from it rather
 // than tracked as separate flags — mirrors g_chip_swimlane_level.
 static DumpArgsLevel g_dump_args_level = DumpArgsLevel::OFF;
 
 extern "C" void set_platform_dump_base(uint64_t dump_data_base) { g_platform_dump_base = dump_data_base; }
+
+void set_platform_dump_args_run_terminal(uint64_t bank) { s_run_terminal_bank = bank; }
+
+void dump_args_close_run(int thread_idx) {
+    if (thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS) {
+        return;
+    }
+    if (dump_arg_has_open_record(thread_idx) || s_unsettled_record[thread_idx]) return;
+    uint32_t live_at_close = 0;
+    const DumpMetaBuffer *held = s_current_dump_buf[thread_idx];
+    if (held != nullptr) {
+        live_at_close = held->count;
+    }
+
+    DiagnosticRunTerminalCounts counts{};
+    // Every record this producer took responsibility for, in the unit
+    // `published_records` and `live_at_close` are in: the ones it wrote plus
+    // the ones it refused before writing. A record written and then lost with
+    // its buffer is already among the written ones, so adding every drop here
+    // would count it twice.
+    counts.total = diagnostic_terminal_add_u32(s_records_written[thread_idx], s_records_refused[thread_idx]);
+    counts.dropped = s_records_dropped[thread_idx];
+    counts.published_records = s_records_published[thread_idx];
+    counts.published_buffers = s_buffers_published[thread_idx];
+    counts.live_at_close = live_at_close;
+    counts.published_payloads = s_payloads_published[thread_idx];
+    counts.published_payload_bytes = s_payload_bytes_published[thread_idx];
+    // No device-side fatal latch exists for this collector; a counter that
+    // reached its sentinel is reported as saturation by the figures themselves.
+
+    simpler::dfx::terminal::publish(
+        s_run_terminal_bank, PLATFORM_MAX_AICPU_THREADS, thread_idx, get_platform_run_result_epoch(), counts
+    );
+}
 
 extern "C" uint64_t get_platform_dump_base() { return g_platform_dump_base; }
 
@@ -305,12 +394,7 @@ bool should_dump_arg_at_stage(ArgsDumpRole role, ArgsDumpStage stage) {
     return false;
 }
 
-bool should_dump_task(ArgsDumpArgMask arg_mask) {
-    if (!is_dump_args_selective_mode()) {
-        return true;
-    }
-    return arg_mask != ARGS_DUMP_ARG_MASK_NONE;
-}
+bool should_dump_task(ArgsDumpArgMask arg_mask) { return dump_args_task_selected(g_dump_args_level, arg_mask); }
 
 bool should_dump_arg(ArgsDumpArgMask arg_mask, int32_t arg_index) {
     if (!is_dump_args_selective_mode()) {
@@ -367,6 +451,7 @@ struct DumpDeviceModule {
         DumpBufferState *state = s_dump_states[ctx.thread_idx];
         auto *buffer = reinterpret_cast<DumpMetaBuffer *>(buffer_ptr);
         uint64_t payload_count = 0;
+        uint64_t payload_bytes = 0;
         uint32_t record_count = buffer->count;
         if (record_count > PLATFORM_DUMP_RECORDS_PER_BUFFER) {
             record_count = PLATFORM_DUMP_RECORDS_PER_BUFFER;
@@ -375,16 +460,27 @@ struct DumpDeviceModule {
             const ArgsDumpRecord &record = buffer->records[i];
             if (record.kind == static_cast<uint8_t>(ArgsDumpKind::TENSOR) && record.payload_size > 0) {
                 payload_count++;
+                payload_bytes += record.payload_size;
             }
         }
         state->published_payload_count += payload_count;
+        // This run's share of the same commit. The cursor above is a lifetime
+        // one the arena's reuse depends on; these are the figures that balance
+        // against the host's receipts for this identity alone.
+        saturating_add_u32(s_records_published[ctx.thread_idx], record_count);
+        saturating_add_u32(s_buffers_published[ctx.thread_idx], 1);
+        saturating_add_u32(s_payloads_published[ctx.thread_idx], static_cast<uint32_t>(payload_count));
+        s_payload_bytes_published[ctx.thread_idx] =
+            diagnostic_terminal_add_u64(s_payload_bytes_published[ctx.thread_idx], payload_bytes);
         wmb();
         ctx.header->queues[ctx.thread_idx][tail].thread_index = static_cast<uint32_t>(ctx.thread_idx);
         ctx.header->queues[ctx.thread_idx][tail].buffer_ptr = buffer_ptr;
         ctx.header->queues[ctx.thread_idx][tail].buffer_seq = buffer_seq;
     }
 
-    static void account_dropped(Context, State *state, uint32_t count) { account_dropped_records(state, count); }
+    static void account_dropped(Context ctx, State *state, uint32_t count) {
+        account_dropped_records(ctx.thread_idx, state, count);
+    }
     static void on_pop_success(Context ctx, State *state, Buffer *buffer) {
         buffer->run_epoch = get_platform_run_result_epoch();
         buffer->local_seq = state->current_buf_seq;
@@ -520,14 +616,6 @@ struct CircularArenaWriter {
     }
 };
 
-static inline uint64_t get_dump_arg_num_elements(const ArgsDumpInfo &info) {
-    uint64_t elements = 1;
-    for (uint32_t d = 0; d < info.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
-        elements *= info.shapes[d];
-    }
-    return elements;
-}
-
 // PyTorch-style contiguous: strides[d] == prod(shapes[d+1..]) for all d.
 static inline bool dump_arg_is_contiguous(const ArgsDumpInfo &info) {
     if (info.ndims == 0) return true;
@@ -539,68 +627,10 @@ static inline bool dump_arg_is_contiguous(const ArgsDumpInfo &info) {
     return true;
 }
 
-static inline void write_dump_arg_contiguous_prefix(
-    CircularArenaWriter *writer, const ArgsDumpInfo &info, uint64_t elem_sz, uint64_t copy_bytes
-) {
-    const char *src = reinterpret_cast<const char *>(info.buffer_addr) + info.start_offset * elem_sz;
-    writer->write(src, copy_bytes);
-}
-
-// Recursive per-dim gather: at dim d we step shapes[d] times with element step
-// strides[d]. Inner-most dim writes `shapes[d]` contiguous elements (only valid
-// when strides[innermost] == 1 — non-unit innermost stride degrades to per-element).
-static void gather_dump_arg_dim(
-    CircularArenaWriter *writer, const ArgsDumpInfo &info, uint64_t elem_sz, uint32_t dim, uint64_t base_element_index,
-    uint64_t *remaining_bytes
-) {
-    if (*remaining_bytes == 0 || dim >= PLATFORM_DUMP_MAX_DIMS) {
-        return;
+void dump_args_init(int num_dump_threads, DumpArgsLevel level) {
+    for (int t = 0; t < PLATFORM_MAX_AICPU_THREADS; ++t) {
+        if (dump_arg_has_open_record(t)) return;
     }
-    if (dim + 1 >= info.ndims) {
-        // Innermost dim: if strides[dim] == 1 the row is contiguous in memory and
-        // a single memcpy works. Otherwise emit element-by-element.
-        const uint32_t s = info.strides[dim];
-        if (s == 1) {
-            const char *src = reinterpret_cast<const char *>(info.buffer_addr) + base_element_index * elem_sz;
-            uint64_t row_bytes =
-                static_cast<uint64_t>(info.shapes[dim]) * elem_sz;  // promote first to avoid uint32 overflow
-            uint64_t bytes_to_copy = (row_bytes < *remaining_bytes) ? row_bytes : *remaining_bytes;
-            writer->write(src, bytes_to_copy);
-            *remaining_bytes -= bytes_to_copy;
-        } else {
-            for (uint32_t i = 0; i < info.shapes[dim] && *remaining_bytes >= elem_sz; i++) {
-                uint64_t pos = base_element_index + static_cast<uint64_t>(i) * static_cast<uint64_t>(s);
-                const char *src = reinterpret_cast<const char *>(info.buffer_addr) + pos * elem_sz;
-                writer->write(src, elem_sz);
-                *remaining_bytes -= elem_sz;
-            }
-        }
-        return;
-    }
-
-    const int32_t s = info.strides[dim];
-    for (uint32_t i = 0; i < info.shapes[dim] && *remaining_bytes > 0; i++) {
-        uint64_t next_base = base_element_index + static_cast<uint64_t>(i) * static_cast<uint64_t>(s);
-        gather_dump_arg_dim(writer, info, elem_sz, dim + 1, next_base, remaining_bytes);
-    }
-}
-
-static inline void write_dump_arg_logical_prefix(
-    CircularArenaWriter *writer, const ArgsDumpInfo &info, uint64_t elem_sz, uint64_t copy_bytes
-) {
-    if (copy_bytes == 0) {
-        return;
-    }
-    if (dump_arg_is_contiguous(info)) {
-        write_dump_arg_contiguous_prefix(writer, info, elem_sz, copy_bytes);
-        return;
-    }
-    // Walk the view origin first; per-dim recursion adds (i * strides[d]) for each axis.
-    uint64_t remaining_bytes = copy_bytes;
-    gather_dump_arg_dim(writer, info, elem_sz, 0, info.start_offset, &remaining_bytes);
-}
-
-void dump_args_init(int num_dump_threads) {
     void *dump_base = reinterpret_cast<void *>(get_platform_dump_base());
     if (dump_base == nullptr) {
         LOG_ERROR("platform dump base is NULL, cannot initialize args dump");
@@ -613,18 +643,24 @@ void dump_args_init(int num_dump_threads) {
 
     s_dump_header = get_dump_header(dump_base);
 
-    // Latch dump level from the host-written header before any task is dumped.
+    // The descriptor selection is stable for this invocation before dispatch.
     // PARTIAL → selective (only Arg::dump()-marked args); FULL → every task;
     // HYBRID → every task's metadata; payload is copied only for
     // arguments selected through the same per-task mask as PARTIAL.
-    g_dump_args_level = static_cast<DumpArgsLevel>(s_dump_header->dump_args_level);
+    g_dump_args_level = level;
 
     LOG_INFO("Initializing args dump for %d threads", num_dump_threads);
 
     // Pop initial metadata buffer from free_queue for each thread
     for (int t = 0; t < num_dump_threads; t++) {
+        s_unsettled_record[t] = false;
         DumpBufferState *state = get_dump_buffer_state(dump_base, t);
         s_dump_states[t] = state;
+        // Transport cursors span invocations; ordinary host credits start at
+        // this boundary, while retained collectors acknowledge lifetime totals.
+        state->run_published_payload_base = state->published_payload_count;
+        state->run_dropped_record_count = 0;
+        wmb();
 
         // Keep the buffer this thread already holds, or pop the first one.
         //
@@ -659,6 +695,9 @@ void dump_args_init(int num_dump_threads) {
             s_current_dump_buf[t] = nullptr;
             state->current_buf_ptr = 0;
         }
+        wmb();
+        state->run_epoch = get_platform_run_result_epoch();
+        wmb();
     }
 
     memset(s_logged_ready_queue_full, 0, sizeof(s_logged_ready_queue_full));
@@ -666,123 +705,250 @@ void dump_args_init(int num_dump_threads) {
     memset(s_records_written, 0, sizeof(s_records_written));
     memset(s_buffers_switched, 0, sizeof(s_buffers_switched));
     memset(s_buffers_flushed, 0, sizeof(s_buffers_flushed));
+    memset(s_records_dropped, 0, sizeof(s_records_dropped));
+    memset(s_records_refused, 0, sizeof(s_records_refused));
+    memset(s_records_published, 0, sizeof(s_records_published));
+    memset(s_buffers_published, 0, sizeof(s_buffers_published));
+    memset(s_payloads_published, 0, sizeof(s_payloads_published));
+    memset(s_payload_bytes_published, 0, sizeof(s_payload_bytes_published));
+    for (int t = 0; t < num_dump_threads; t++) {
+        // Exactly the lanes this run brought up, because exactly those close.
+        // A claim on a lane the run never starts is never settled, and a
+        // participant that never settles is the run reporting its own
+        // accounting unknown — so claiming the whole dimensioned array would
+        // make every run with fewer lanes than the platform maximum unknown.
+        simpler::dfx::terminal::begin_run(
+            s_run_terminal_bank, PLATFORM_MAX_AICPU_THREADS, t, get_platform_run_result_epoch()
+        );
+    }
+}
+
+bool dump_arg_has_open_record(int thread_idx) {
+    return thread_idx >= 0 && thread_idx < PLATFORM_MAX_AICPU_THREADS && s_open_records[thread_idx] != nullptr;
+}
+
+static bool owns_reservation(const DumpArgReservation *reservation) {
+    return reservation != nullptr && reservation->open() && reservation->lane < PLATFORM_MAX_AICPU_THREADS &&
+           s_open_records[reservation->lane] == reservation;
+}
+
+DumpArgFlushResult dump_args_try_flush(int thread_idx) {
+    if (s_dump_header == nullptr || thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS ||
+        s_dump_states[thread_idx] == nullptr)
+        return DumpArgFlushResult::Invalid;
+    if (dump_arg_has_open_record(thread_idx)) return DumpArgFlushResult::WouldBlock;
+    auto *state = s_dump_states[thread_idx];
+    auto *buffer = s_current_dump_buf[thread_idx];
+    if (buffer == nullptr || buffer->count == 0) return DumpArgFlushResult::Complete;
+    const uint32_t tail = s_dump_header->queue_tails[thread_idx];
+    const uint32_t next = (tail + 1) % PLATFORM_DUMP_READYQUEUE_SIZE;
+    if (next == s_dump_header->queue_heads[thread_idx]) return DumpArgFlushResult::WouldBlock;
+    rmb();
+    DumpDeviceModule::write_ready_entry(
+        dump_context(thread_idx), tail, reinterpret_cast<uint64_t>(buffer), state->current_buf_seq
+    );
+    wmb();
+    s_dump_header->queue_tails[thread_idx] = next;
+    s_current_dump_buf[thread_idx] = nullptr;
+    state->current_buf_ptr = 0;
+    ++state->current_buf_seq;
+    ++s_buffers_switched[thread_idx];
+    wmb();
+    return DumpArgFlushResult::Complete;
+}
+
+static bool try_arena_capacity(int lane, DumpBufferState *state, uint64_t bytes, uint64_t *offset) {
+    *offset = state->arena_write_offset;
+    if (bytes == 0) return true;
+    const uint64_t physical = state->arena_write_offset % state->arena_size;
+    if (bytes <= state->arena_size - physical && (physical != 0 || state->arena_write_offset == 0)) return true;
+    if (dump_args_try_flush(lane) != DumpArgFlushResult::Complete) return false;
+    if (state->completed_payload_count < state->published_payload_count) return false;
+    rmb();
+    if (physical != 0) {
+        const uint64_t padding = state->arena_size - physical;
+        if (state->arena_write_offset > UINT64_MAX - padding) return false;
+        *offset += padding;
+    }
+    return true;
+}
+
+static DumpArgBeginResult
+begin_dump_record(int thread_idx, const ArgsDumpInfo &info, DumpArgReservation *reservation, bool blocking) {
+    if (s_dump_header == nullptr || thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS ||
+        reservation == nullptr)
+        return DumpArgBeginResult::Refused;
+    if (dump_arg_has_open_record(thread_idx) || reservation->open()) return DumpArgBeginResult::WouldBlock;
+    auto *state = s_dump_states[thread_idx];
+    if (state == nullptr || g_dump_args_level == DumpArgsLevel::OFF) return DumpArgBeginResult::Refused;
+    auto refuse = [&] {
+        account_refused_record(thread_idx, state);
+        return DumpArgBeginResult::Refused;
+    };
+    if (info.ndims > PLATFORM_DUMP_MAX_DIMS || info.func_count < 0 || info.func_count > ARGS_DUMP_MAX_FUNC_IDS)
+        return refuse();
+    const bool scalar = info.kind == static_cast<uint8_t>(ArgsDumpKind::SCALAR);
+    const uint64_t element_bytes = get_element_size(static_cast<DataType>(info.dtype));
+    uint64_t elements = 1;
+    for (uint32_t dimension = 0; dimension < info.ndims; ++dimension) {
+        if (info.shapes[dimension] != 0 && elements > UINT64_MAX / info.shapes[dimension]) return refuse();
+        elements *= info.shapes[dimension];
+    }
+    if (element_bytes == 0 || elements > UINT64_MAX / element_bytes) return refuse();
+    uint64_t bytes = elements * element_bytes;
+    bool truncated = false;
+    if (scalar || (g_dump_args_level == DumpArgsLevel::HYBRID && info.capture_payload == 0)) bytes = 0;
+    else if (bytes > state->arena_size) {
+        bytes = state->arena_size / 2;
+        truncated = true;
+    }
+    if (bytes != 0 && (info.buffer_addr == 0 || state->arena_base == 0 || state->arena_size == 0)) return refuse();
+    if (bytes != 0) {
+        uint64_t last_element = info.start_offset;
+        for (uint32_t dimension = 0; dimension < info.ndims; ++dimension) {
+            const uint64_t extent = static_cast<uint64_t>(info.shapes[dimension] - 1) * info.strides[dimension];
+            if (last_element > UINT64_MAX - extent) return refuse();
+            last_element += extent;
+        }
+        if (last_element > (UINT64_MAX - element_bytes) / element_bytes ||
+            info.buffer_addr > UINT64_MAX - (last_element + 1) * element_bytes)
+            return refuse();
+    }
+    const uint64_t rollback = state->arena_write_offset;
+    uint64_t offset = rollback;
+    auto *buffer = s_current_dump_buf[thread_idx];
+    if (blocking) {
+        if (buffer == nullptr) buffer = try_pop_dump_meta_buffer(thread_idx, state, state->current_buf_seq);
+        if (buffer == nullptr) return refuse();
+        if (buffer->count >= PLATFORM_DUMP_RECORDS_PER_BUFFER) {
+            if (switch_dump_meta_buffer(thread_idx) != 0) return refuse();
+        }
+        if (!ensure_dump_arena_capacity(thread_idx, state, bytes)) return refuse();
+        offset = state->arena_write_offset;
+    } else {
+        if (buffer != nullptr && buffer->count >= PLATFORM_DUMP_RECORDS_PER_BUFFER &&
+            dump_args_try_flush(thread_idx) != DumpArgFlushResult::Complete)
+            return DumpArgBeginResult::WouldBlock;
+        if (!try_arena_capacity(thread_idx, state, bytes, &offset)) return DumpArgBeginResult::WouldBlock;
+    }
+    buffer = s_current_dump_buf[thread_idx];
+    if (buffer == nullptr) {
+        buffer = blocking ? try_pop_dump_meta_buffer(thread_idx, state, state->current_buf_seq) :
+                            DumpEngine::try_pop_free(dump_context(thread_idx), state, state->current_buf_seq);
+    }
+    if (buffer == nullptr) return blocking ? refuse() : DumpArgBeginResult::WouldBlock;
+    if (offset > UINT64_MAX - bytes) return refuse();
+    *reservation = {};
+    reservation->info = info;
+    reservation->lane = thread_idx;
+    reservation->rollback_offset = rollback;
+    reservation->arena_offset = offset;
+    reservation->copy_bytes = bytes;
+    reservation->element_bytes = element_bytes;
+    reservation->contiguous = dump_arg_is_contiguous(info);
+    reservation->truncated = truncated;
+    state->arena_write_offset = offset + bytes;
+    s_open_records[thread_idx] = reservation;
+    return DumpArgBeginResult::Ready;
+}
+
+DumpArgBeginResult dump_arg_try_begin(int thread_idx, const ArgsDumpInfo &info, DumpArgReservation *reservation) {
+    return begin_dump_record(thread_idx, info, reservation, false);
+}
+
+DumpArgCopyResult dump_arg_copy_chunk(DumpArgReservation *reservation, uint64_t max_bytes) {
+    if (!owns_reservation(reservation) || max_bytes == 0) return DumpArgCopyResult::Invalid;
+    auto &record = *reservation;
+    auto *state = s_dump_states[record.lane];
+    uint64_t remaining = std::min(max_bytes, record.copy_bytes - record.copied);
+    CircularArenaWriter writer{
+        reinterpret_cast<char *>(state->arena_base), state->arena_size, record.arena_offset, record.copied
+    };
+    while (remaining != 0) {
+        uint64_t element = record.copied / record.element_bytes;
+        const uint64_t byte_in_element = record.copied % record.element_bytes;
+        uint64_t source_element = record.info.start_offset;
+        uint64_t count = remaining;
+        if (record.contiguous) source_element += element;
+        else {
+            for (int32_t dimension = record.info.ndims - 1; dimension >= 0; --dimension) {
+                const uint64_t coordinate = element % record.info.shapes[dimension];
+                element /= record.info.shapes[dimension];
+                source_element += coordinate * record.info.strides[dimension];
+            }
+            count = std::min(remaining, record.element_bytes - byte_in_element);
+        }
+        const auto *source = reinterpret_cast<const unsigned char *>(record.info.buffer_addr) +
+                             source_element * record.element_bytes + byte_in_element;
+        cache_invalidate_range(source, count);
+        rmb();
+        writer.write(source, count);
+        record.copied += count;
+        remaining -= count;
+    }
+    return record.copied == record.copy_bytes ? DumpArgCopyResult::Complete : DumpArgCopyResult::InProgress;
+}
+
+bool dump_arg_commit(DumpArgReservation *reservation) {
+    if (!owns_reservation(reservation) || reservation->copied != reservation->copy_bytes) return false;
+    const auto &info = reservation->info;
+    const int lane = reservation->lane;
+    auto *buffer = s_current_dump_buf[lane];
+    if (buffer == nullptr || buffer->count >= PLATFORM_DUMP_RECORDS_PER_BUFFER) return false;
+    auto *record = &buffer->records[buffer->count];
+    record->task_id = info.task_id;
+    record->arg_index = info.arg_index;
+    record->is_contiguous = reservation->contiguous ? 1 : 0;
+    record->role = static_cast<uint8_t>(info.role);
+    record->stage = static_cast<uint8_t>(info.stage);
+    record->ndims = info.ndims;
+    record->dtype = info.dtype;
+    record->truncated = reservation->truncated ? 1 : 0;
+    record->payload_offset = reservation->arena_offset;
+    record->payload_size = reservation->copy_bytes;
+    record->scalar_value = info.kind == static_cast<uint8_t>(ArgsDumpKind::SCALAR) ? info.scalar_value : 0;
+    record->kind = info.kind;
+    record->flags = info.flags;
+    record->func_count = static_cast<uint8_t>(info.func_count);
+    for (int32_t i = 0; i < info.func_count; ++i)
+        record->func_ids[i] = static_cast<uint16_t>(info.func_ids[i]);
+    record->start_offset = info.start_offset;
+    for (uint32_t i = 0; i < info.ndims; ++i) {
+        record->shapes[i] = info.shapes[i];
+        record->strides[i] = info.strides[i];
+    }
+    wmb();
+    ++buffer->count;
+    wmb();
+    saturating_add_u32(s_records_written[lane], 1);
+    s_open_records[lane] = nullptr;
+    reservation->lane = -1;
+    return true;
+}
+
+bool dump_arg_abandon(DumpArgReservation *reservation) {
+    if (!owns_reservation(reservation)) return false;
+    const int lane = reservation->lane;
+    auto *state = s_dump_states[lane];
+    state->arena_write_offset = reservation->rollback_offset;
+    account_refused_record(lane, state);
+    s_unsettled_record[lane] = true;
+    s_open_records[lane] = nullptr;
+    reservation->lane = -1;
+    return true;
 }
 
 int dump_arg_record(int thread_idx, const ArgsDumpInfo &info) {
-    if (s_dump_header == nullptr) {
-        return -1;
-    }
-    if (thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS) {
-        return -1;
-    }
-
-    DumpBufferState *state = s_dump_states[thread_idx];
-    DumpMetaBuffer *buf = s_current_dump_buf[thread_idx];
-    if (buf == nullptr) {
-        buf = try_pop_dump_meta_buffer(thread_idx, state, state != nullptr ? state->current_buf_seq : 0);
-        if (buf == nullptr) {
-            account_dropped_records(state, 1);
-            return -1;
-        }
-    }
-
-    // Switch metadata buffer if full
-    if (buf->count >= PLATFORM_DUMP_RECORDS_PER_BUFFER) {
-        if (switch_dump_meta_buffer(thread_idx) != 0) {
-            return -1;  // No free buffer
-        }
-        buf = s_current_dump_buf[thread_idx];
-        if (buf == nullptr) {
-            buf = try_pop_dump_meta_buffer(thread_idx, state, state != nullptr ? state->current_buf_seq : 0);
-            if (buf == nullptr) {
-                account_dropped_records(state, 1);
-                return -1;
-            }
-        }
-    }
-
-    // Reserve space in arena
-    // Compute actual tensor data size from shape (not buffer.size which may include padding)
-    ArgsDumpKind kind = static_cast<ArgsDumpKind>(info.kind);
-    uint64_t actual_elements = get_dump_arg_num_elements(info);
-    uint64_t elem_sz = get_element_size(static_cast<DataType>(info.dtype));
-    uint64_t bytes = actual_elements * elem_sz;
-    uint64_t copy_bytes = bytes;
-    bool truncated = false;
-    bool is_contiguous = dump_arg_is_contiguous(info);
-    bool is_scalar = kind == ArgsDumpKind::SCALAR;
-    bool capture_payload = info.capture_payload != 0;
-
-    if (is_scalar || (g_dump_args_level == DumpArgsLevel::HYBRID && !capture_payload)) {
-        copy_bytes = 0;
-    } else if (bytes > state->arena_size) {
-        // ChipTensor larger than entire arena — copy a partial sample
-        copy_bytes = state->arena_size / 2;
-        truncated = true;
-    }
-
-    if (!ensure_dump_arena_capacity(thread_idx, state, copy_bytes)) {
-        account_dropped_records(state, 1);
-        return -1;
-    }
-    buf = s_current_dump_buf[thread_idx];
-    if (buf == nullptr) {
-        buf = try_pop_dump_meta_buffer(thread_idx, state, state->current_buf_seq);
-        if (buf == nullptr) {
-            account_dropped_records(state, 1);
-            return -1;
-        }
-    }
-
-    uint64_t offset = state->arena_write_offset;
-    state->arena_write_offset = offset + copy_bytes;
-
-    // Copy tensor data into arena (circular wraparound)
-    char *arena = reinterpret_cast<char *>(state->arena_base);
-    uint64_t arena_sz = state->arena_size;
-    CircularArenaWriter writer = {arena, arena_sz, offset, 0};
-    if (!is_scalar && copy_bytes > 0) {
-        write_dump_arg_logical_prefix(&writer, info, elem_sz, copy_bytes);
-    }
-    wmb();
-
-    // Append metadata record
-    uint32_t idx = buf->count;
-    ArgsDumpRecord *rec = &buf->records[idx];
-    rec->task_id = info.task_id;
-    rec->arg_index = info.arg_index;
-    rec->is_contiguous = is_contiguous ? 1 : 0;
-    rec->role = static_cast<uint8_t>(info.role);
-    rec->stage = static_cast<uint8_t>(info.stage);
-    rec->ndims = info.ndims;
-    rec->dtype = info.dtype;
-    rec->truncated = truncated ? 1 : 0;
-    rec->payload_offset = offset;
-    rec->payload_size = copy_bytes;
-    rec->scalar_value = is_scalar ? info.scalar_value : 0;
-    rec->kind = info.kind;
-    rec->flags = info.flags;
-    // kernel_id is bounded by RUNTIME_MAX_FUNC_ID (1024), far below the 0xFFFF
-    // "unknown" sentinel, so this narrowing is lossless and never collides.
-    // func_ids carries the task's active-subtask set (its mix membership).
-    rec->func_count = static_cast<uint8_t>(info.func_count);
-    for (int32_t i = 0; i < info.func_count && i < ARGS_DUMP_MAX_FUNC_IDS; i++) {
-        rec->func_ids[i] = static_cast<uint16_t>(info.func_ids[i]);  // -1 -> 0xFFFF (unknown)
-    }
-    rec->start_offset = info.start_offset;
-    for (int d = 0; d < info.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
-        rec->shapes[d] = info.shapes[d];
-        rec->strides[d] = info.strides[d];
-    }
-    buf->count = idx + 1;
-    wmb();
-
-    s_records_written[thread_idx]++;
-
-    return 0;
+    DumpArgReservation reservation;
+    if (begin_dump_record(thread_idx, info, &reservation, true) != DumpArgBeginResult::Ready) return -1;
+    if (dump_arg_copy_chunk(&reservation, UINT64_MAX) == DumpArgCopyResult::Complete && dump_arg_commit(&reservation))
+        return 0;
+    (void)dump_arg_abandon(&reservation);
+    return -1;
 }
 
 void dump_args_flush(int thread_idx) {
+    if (dump_arg_has_open_record(thread_idx)) return;
     if (s_dump_header == nullptr) {
         return;
     }
@@ -811,14 +977,14 @@ void dump_args_flush(int thread_idx) {
             // it, so nothing returns it to the free queue. Retaining it lets the
             // next run's init reuse it in place, which is the only return
             // available to AICPU.
-            account_dropped_records(state, buf->count);
+            account_dropped_records(thread_idx, state, buf->count);
             buf->count = 0;
             wmb();
         }
     }
 
     s_buffers_flushed[thread_idx]++;
-    uint32_t dropped = s_dump_states[thread_idx] ? s_dump_states[thread_idx]->dropped_record_count : 0;
+    uint32_t dropped = s_dump_states[thread_idx] ? s_dump_states[thread_idx]->run_dropped_record_count : 0;
     LOG_INFO(
         "Thread %d: dump_args_flush (records=%u, buf_switches=%u, flushes=%u, dropped=%u)", thread_idx,
         s_records_written[thread_idx], s_buffers_switched[thread_idx], s_buffers_flushed[thread_idx], dropped

@@ -92,6 +92,16 @@ void KernelExecutionState::poison(int runtime_error) {
     if (last_runtime_error_ == 0) last_runtime_error_ = runtime_error;
 }
 
+int KernelExecutionState::begin_close() {
+    std::scoped_lock lock(mutex_);
+    if (phase_ == KernelContextPhase::New || phase_ == KernelContextPhase::Closed) return 0;
+    if (phase_ == KernelContextPhase::Initializing) return PTO_RUNTIME_ERR_INVALID_STATE;
+    const int rc = validate_current_context_locked();
+    if (rc != 0) return rc;
+    phase_ = KernelContextPhase::Closing;
+    return 0;
+}
+
 int KernelExecutionState::close() {
     std::scoped_lock lock(mutex_);
     switch (phase_) {

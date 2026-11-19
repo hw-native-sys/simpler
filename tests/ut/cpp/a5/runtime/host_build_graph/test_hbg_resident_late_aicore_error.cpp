@@ -18,7 +18,7 @@
 // can still land.
 //
 // These cases call `AicpuExecutor::snapshot_run_terminal` and
-// `AicpuExecutor::publish_run_terminal` **themselves**, on a real executor, and
+// `AicpuExecutor::handoff_run_terminal` **themselves**, on a real executor, and
 // read the record out of a host region. So they cover the call site, not only
 // the rule it calls: reverting the finalizer to a bare header read fails the
 // first case.
@@ -30,11 +30,13 @@
 // production call sits inside the completion gate's finalizer — the
 // all-participant boundary — is reviewed statically and is not what these cases
 // establish.
+#include "common/native_invocation_evidence.h"
 #include "aicpu_executor.cpp"  // NOLINT(bugprone-suspicious-include): drives the executor in its own TU
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <string>
 
 namespace {
 
@@ -53,10 +55,10 @@ protected:
         );
         executor.aicpu_thread_num_ = 1;
         executor.normal_path_claims_.store(1);
-        set_platform_run_result(reinterpret_cast<uint64_t>(&region), kEpoch);
+        ASSERT_EQ(aicpu_begin_native_invocation(1, reinterpret_cast<uint64_t>(&result_storage), kEpoch), 0);
     }
 
-    std::atomic<int32_t> &header() { return header_storage.sched_error_code; }
+    std::atomic<int32_t> &header() { return header_storage.error_code; }
 
     /** What the AICore's exit-wait watchdog does after the supervisor stopped looking. */
     bool exit_wait_watchdog_fires() {
@@ -66,16 +68,18 @@ protected:
     }
 
     /** The finalizer, then the cleanup owner's commit — both the executor's own. */
-    DeviceRunTerminal finalize_and_publish() {
-        executor.snapshot_run_terminal(&runtime);
-        executor.publish_run_terminal();
+    DeviceRunTerminal finalize_and_publish(bool cores_retired = true) {
+        executor.snapshot_run_terminal(&runtime, cores_retired);
+        executor.handoff_run_terminal();
+        aicpu_finish_native_invocation(0, 0);
         return device_run_result_terminal(region, kEpoch);
     }
 
-    SharedMemoryHeader header_storage{};
+    TaskImageStatus header_storage{};
     SchedulerWorkerContext context{};
     SchedulerRunControl run_control{};
-    DeviceRunResultRegion region{};
+    NativeInvocationResultStorage result_storage{};
+    DeviceRunResultRegion &region{result_storage.result};
     Runtime runtime{};
     AicpuExecutor executor{};
 };
@@ -134,11 +138,49 @@ TEST_F(ResidentFinalizer, AParticipantFailureIsNotReplacedBySettling) {
 TEST_F(ResidentFinalizer, AnUnclaimedAuditedPathPublishesNothing) {
     executor.normal_path_claims_.store(0);
 
-    executor.snapshot_run_terminal(&runtime);
-    executor.publish_run_terminal();
+    executor.snapshot_run_terminal(&runtime, /*cores_retired=*/true);
+    executor.handoff_run_terminal();
+    aicpu_finish_native_invocation(0, 0);
 
     EXPECT_EQ(region.published, 0u) << "no record to publish";
     EXPECT_EQ(device_run_result_terminal(region, kEpoch).state, DeviceRunTerminalState::Undecided);
+}
+
+// A run whose cores did not prove they stopped did not finish the audited path,
+// whatever every participant returned. The record is still published — the host
+// reading no verdict at all is worse than reading a failure — but it cannot be
+// the success a proved run gets.
+TEST_F(ResidentFinalizer, AnUnprovedStopCannotPublishTheSuccessItsParticipantsClaimed) {
+    const DeviceRunTerminal terminal = finalize_and_publish(/*cores_retired=*/false);
+
+    EXPECT_NE(terminal.state, DeviceRunTerminalState::Succeeded)
+        << "a run that could not prove its cores stopped published a success";
+    EXPECT_EQ(header().load(), SIMPLER_ERROR_NONE) << "no write on a clean path";
+}
+
+TEST_F(ResidentFinalizer, LateDiagnosticIdentityIsLoggedByTheActualFinalizer) {
+    ASSERT_TRUE(exit_wait_watchdog_fires());
+    run_control.error_task_ref = 5;
+    run_control.error_run_epoch = 0;
+    run_control.error_order_key = 2;
+    run_control.error_block_idx = 9;
+    run_control.error_group_seq = 7;
+    run_control.error_worker_index = 4;
+    run_control.error_cluster_lane = 1;
+    run_control.error_identity_fields = 63;
+    testing::internal::CaptureStderr();
+    const DeviceRunTerminal terminal = finalize_and_publish();
+    const auto output = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(terminal.state, DeviceRunTerminalState::Failed);
+    EXPECT_NE(output.find("phase=terminal"), std::string::npos);
+    EXPECT_NE(output.find("task=5"), std::string::npos);
+    EXPECT_NE(output.find("epoch=0"), std::string::npos);
+    EXPECT_NE(output.find("order=2"), std::string::npos);
+    EXPECT_NE(output.find("block=9"), std::string::npos);
+    EXPECT_NE(output.find("group_seq=7"), std::string::npos);
+    EXPECT_NE(output.find("worker=4"), std::string::npos);
+    EXPECT_NE(output.find("lane=1"), std::string::npos);
+    EXPECT_NE(output.find("identity_fields=0x3f"), std::string::npos);
 }
 
 }  // namespace

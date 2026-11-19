@@ -35,7 +35,7 @@
 #include <cstring>
 #include <set>
 
-#include "host_build_graph/task_allocator.h"
+#include "host_build_graph/host/task_allocator.h"
 
 class HbgTaskAllocatorTest : public ::testing::Test {
 protected:

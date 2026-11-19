@@ -1,0 +1,124 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#pragma once
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include <type_traits>
+
+#include "host_build_graph/task_id.h"
+#include "host_build_graph/types.h"
+
+struct GraphScopeResult {
+    // The submission failed: no shell was published and no recording opened. Every path
+    // that sets it latches a fatal first, so a caller needs no handling of its own --
+    // every later orchestration call short-circuits to a no-op.
+    bool has_error{false};
+    bool recording{false};
+    TaskId task_id{TaskId::invalid()};
+    // The recording this call opened, non-null exactly when `recording` is set.
+    // The recording thread hands it back to graph_prepare so binding needs no
+    // lookup: several Definitions record at once, and finding one by key would
+    // mean traversing the in-flight map under its mutex on a path whose whole
+    // purpose is to not contend with the submitting thread.
+    void *recording_handle{nullptr};
+    // The formal parameters the recorded body must read: the entry's own deep copy, not
+    // the caller's arguments, which are only lent for the duration of the submit call.
+    // Set exactly when `recording` is, and valid until graph_commit drains the entry --
+    // which is after every job that could read it has finished.
+    //
+    // Const because the boundary is written once, by the submitting thread in graph_begin,
+    // and only read after that -- by the recorder, and by later same-key submissions
+    // comparing against it. Nothing may write it once it is handed out here.
+    //
+    // The body must read these and not the caller's arguments even on the synchronous
+    // fallback path: recording resolves a task slot's origin against this object's slot
+    // array, so an origin from any other object falls outside it and the parameter is
+    // recorded as static.
+    const GraphTaskArgs *params{nullptr};
+};
+
+using GraphSubmitResult = GraphScopeResult;
+
+constexpr uint64_t graph_hash_byte(uint64_t h, uint8_t b) { return (h ^ static_cast<uint64_t>(b)) * 1099511628211ULL; }
+
+// FNV-1a, mixing eight bytes per multiply instead of one. The only thing hashed
+// with it is a Graph's `graph_key` — a graph id, a config-value count and the
+// config values themselves, a few bytes per call.
+//
+// Streaming: callers chain several calls (see rt_graph_make_key below) and the word
+// split makes the result depend on where they split, so two different chainings of
+// the same bytes disagree. That is harmless here because a key is only ever produced
+// by this one call sequence and never compared against a differently-split digest.
+// The value is recomputed on both sides of every run and is never persisted, so it
+// carries no cross-version contract.
+inline uint64_t graph_hash_bytes(uint64_t h, const void *data, size_t bytes) {
+    const auto *p = static_cast<const uint8_t *>(data);
+    size_t i = 0;
+    for (; i + sizeof(uint64_t) <= bytes; i += sizeof(uint64_t)) {
+        uint64_t word = 0;
+        __builtin_memcpy(&word, p + i, sizeof(word));
+        h = (h ^ word) * 1099511628211ULL;
+    }
+    for (; i < bytes; ++i) {
+        h = graph_hash_byte(h, p[i]);
+    }
+    return h;
+}
+
+constexpr uint64_t graph_const_hash_impl(const char *s, uint64_t h) {
+    return (*s == '\0') ? h : graph_const_hash_impl(s + 1, graph_hash_byte(h, static_cast<uint8_t>(*s)));
+}
+
+// Compile-time FNV-1a of a name, for the rt_submit_graph overload that takes an
+// explicit identity instead of deriving one from the Graph function's address.
+//
+// The Definition cache belongs to one orchestration run and uses graph_key directly.
+// The explicit form drops the Graph function pointer from that identity, so two
+// distinct Graph functions given one key share a single recorded Definition.
+//
+// That is the same sentence as its hazard, and the hazard is silent. Two functions
+// that are not the same Graph, given one key within one orchestration callable,
+// replay whichever recorded first. A key must be unique per distinct Graph function
+// in a callable.
+//
+// A caller that emits one C++ function per Graph wants rt_submit_graph(function,
+// args) instead: the function's address is already the identity, which is why every
+// call site in this repository uses that overload.
+constexpr uint64_t GRAPH_KEY(const char *s) { return graph_const_hash_impl(s, 1469598103934665603ULL); }
+
+// Whether a boundary can open a Graph at all: it carries no error, and it fits the fixed
+// boundary.
+//
+// A boundary of no tensors is one of them — the shape a Config-driven Graph has, where the body
+// reaches its buffers through handles its Config carries. Admitting it here is only half of that:
+// `graph_layout_definition` decides whether the recording may be published, and it carries the
+// same absence of a lower bound. The two have to agree, because a boundary admitted here and
+// refused there records a whole body and then fails at `graph_end` instead of at the submission
+// that named it.
+inline bool rt_graph_args_cacheable(const GraphTaskArgs &args) {
+    if (args.has_error() || args.tensor_count() > GRAPH_MAX_TENSOR_ARGS) {
+        return false;
+    }
+    return true;
+}
+
+// A Graph's key: its identity mixed with the hash of its construction parameters.
+//
+// One path, whatever the Graph was submitted with. A Graph that takes no construction
+// parameters passes a DefaultConfig, whose hash is zero, so there is no second key
+// arithmetic to keep in step with this one.
+inline uint64_t rt_graph_make_key(uint64_t graph_id, uint64_t config_hash) {
+    uint64_t hash = graph_hash_bytes(1469598103934665603ULL, &graph_id, sizeof(graph_id));
+    return graph_hash_bytes(hash, &config_hash, sizeof(config_hash));
+}

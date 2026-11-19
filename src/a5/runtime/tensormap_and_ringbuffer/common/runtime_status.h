@@ -36,14 +36,16 @@
 #define SIMPLER_ERROR_REQUIRE_SYNC_START_INVALID 7
 #define SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT 8
 #define SIMPLER_ERROR_EXPLICIT_ORCH_FATAL 9
-#define SIMPLER_ERROR_SCOPE_TASKS_OVERFLOW 10  // scope_tasks buffer saturated (all rings full)
-#define SIMPLER_ERROR_TENSORMAP_OVERFLOW 11    // tensormap entry pool wedged (last_task_alive not advancing)
+#define SIMPLER_ERROR_SCOPE_TASKS_OVERFLOW 10      // scope_tasks buffer saturated (all rings full)
+#define SIMPLER_ERROR_TENSORMAP_OVERFLOW 11        // tensormap entry pool wedged (last_task_alive not advancing)
+#define SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED 12  // Not raised here; the number stays reserved across runtimes
 
 // Scheduler errors (100+): detected in scheduler threads
 #define SIMPLER_ERROR_SCHEDULER_TIMEOUT 100
 #define SIMPLER_ERROR_ASYNC_COMPLETION_INVALID 101
 #define SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW 102
 #define SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED 103
+#define SIMPLER_ERROR_READY_QUEUE_OVERFLOW 104
 
 // Sub-classification of a SIMPLER_ERROR_SCHEDULER_TIMEOUT (code 100). The top-level
 // sched_error_code stays 100 for backward compatibility; this detail value tells
@@ -51,18 +53,21 @@
 // per-incident device-log dive becomes a glance at the host failure line.
 #define SIMPLER_STALL_DETAIL_NONE 0             // not a timeout / no sub-class recorded
 #define SIMPLER_STALL_DETAIL_RUNNING_STALLED 1  // S1: a task is on a core but never completes (AICore hang)
-#define SIMPLER_STALL_DETAIL_READY_IDLE 3       // S3: all cores idle, a fanin-satisfied task exists, nothing dispatched
+#define SIMPLER_STALL_DETAIL_READY_IDLE 3       // S3: all cores idle, a dispatch-ready task exists
 #define SIMPLER_STALL_DETAIL_DEP_DEADLOCK 4     // S4: only WAIT tasks remain, fanin never resolves (dep cycle/wiring)
 #define SIMPLER_STALL_DETAIL_ORCH_STARVATION 5  // S5: submitted tasks done, orchestrator not done, scheduler idle
+#define SIMPLER_STALL_DETAIL_ASYNC_WAIT 6       // S6: AICore work finished, deferred completion pending
 #define SIMPLER_STALL_DETAIL_UNKNOWN 99         // premise/bookkeeping invariant violated (accounting/corruption)
 
-// Pure stall-priority decision: RUNNING > READY > WAIT > (orch-not-done) > unknown.
+// Pure stall-priority decision: RUNNING > READY > ASYNC_WAIT > WAIT > (orch-not-done) > unknown.
 // Reduces the multi-state snapshot to one dominant sub-class. Kept free-standing
 // (no scheduler state) so it is unit-testable and identical on host and device.
-static inline int32_t
-classify_stall_detail(int32_t cnt_running, int32_t cnt_ready, int32_t cnt_waiting, int32_t orch_done) {
+static inline int32_t classify_stall_detail(
+    int32_t cnt_running, int32_t cnt_ready, int32_t cnt_waiting, int32_t cnt_async_wait, int32_t orch_done
+) {
     if (cnt_running > 0) return SIMPLER_STALL_DETAIL_RUNNING_STALLED;
     if (cnt_ready > 0) return SIMPLER_STALL_DETAIL_READY_IDLE;
+    if (cnt_async_wait > 0) return SIMPLER_STALL_DETAIL_ASYNC_WAIT;
     if (cnt_waiting > 0) return SIMPLER_STALL_DETAIL_DEP_DEADLOCK;
     if (!orch_done) return SIMPLER_STALL_DETAIL_ORCH_STARVATION;
     return SIMPLER_STALL_DETAIL_UNKNOWN;
@@ -79,6 +84,8 @@ static inline const char *stall_detail_name(int32_t detail) {
         return "S4:dependency-deadlock";
     case SIMPLER_STALL_DETAIL_ORCH_STARVATION:
         return "S5:orchestrator-starvation";
+    case SIMPLER_STALL_DETAIL_ASYNC_WAIT:
+        return "S6:async-completion-wait";
     case SIMPLER_STALL_DETAIL_UNKNOWN:
         return "unknown:accounting/corruption";
     case SIMPLER_STALL_DETAIL_NONE:

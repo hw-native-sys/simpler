@@ -10,14 +10,14 @@
  */
 #pragma once
 
-#include <atomic>
+#include "common/lane_mask.h"
+
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
-#include "assert_compat.h"
-#include "common/core_type.h"
 #include "common/platform_config.h"
-#include "dispatch_payload.h"
+#include "kernel_args.h"
 #include "scheduler_layout.h"
 
 #ifndef __gm__
@@ -28,615 +28,40 @@
 #define __aicore__
 #endif
 
-#if !defined(__CCE_AICORE__)
-#include "host_build_graph/runtime_types.h"
-#if __has_include("spin_hint.h")
-#include "spin_hint.h"
-#endif
-
-// =============================================================================
-// Profiling macros (compile-time gated)
-// =============================================================================
-
-#if SIMPLER_DFX
-#include "aicpu/device_time.h"
-// Accumulated nanoseconds per sub-step
-#define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
-#define CYCLE_COUNT_LAP(acc)       \
-    do {                           \
-        _t1 = get_sys_cnt_aicpu(); \
-        acc += (_t1 - _t0);        \
-        _t0 = _t1;                 \
-    } while (0)
-#else
-#define CYCLE_COUNT_START()
-#define CYCLE_COUNT_LAP(acc)
-#endif
-
-// =============================================================================
-// Scheduler constants
-// =============================================================================
-
-constexpr int32_t MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
-
-// Periodic cadence (in idle iterations) for emitting the per-thread STALL
-// diagnostic while no progress is being made. Purely an observability knob,
-// independent of the wall-clock timeout below: small enough to fire a few times
-// before the budget expires, large enough not to flood device_log.
-constexpr int32_t STALL_LOG_INTERVAL = 480000;
-constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;  // Check for a latched scheduler error every N idle iters
-
-// Wall-clock budget for declaring "no progress = scheduler timeout". Replaces
-// the per-thread iteration-count cap that once lived here as MAX_IDLE_ITERATIONS
-// for the fatal-latch decision; STALL_LOG_INTERVAL above keeps the per-thread
-// diagnostic cadence.
-//
-// Using wall-clock here is load-bearing for distributed runs: with per-thread
-// iteration counts, a pure-idle thread spinning ~115 ns/iter hits the cap in
-// ~92 ms while a sibling thread polling a RUNNING task takes ~200 ms for the
-// same iteration count. The fast spinner racing ahead and latching fatal
-// kills the slower-but-correct poller mid-poll — see the distributed
-// startup-skew scenario in issue #897.
-//
-// The budget is platform-defined (PLATFORM_SCHEDULER_TIMEOUT_MS in
-// platform_config.h), one value across every platform variant. Onboard keeps it
-// below the STARS op-execute and host stream-sync budgets so the AICPU can flush
-// diagnostics before the host-visible timeout chain fires. Sim has no STARS or
-// ACL stream-sync timeout, but runs the same no-progress watchdog.
+// AICPU supervision and Host run-control initialization share the platform budget.
 constexpr int32_t SCHEDULER_TIMEOUT_MS = PLATFORM_SCHEDULER_TIMEOUT_MS;
 constexpr uint64_t SCHEDULER_TIMEOUT_CYCLES =
     static_cast<uint64_t>(SCHEDULER_TIMEOUT_MS) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
-constexpr int32_t STALL_DUMP_READY_MAX = 8;
-constexpr int32_t STALL_DUMP_WAIT_MAX = 4;
-constexpr int32_t STALL_DUMP_CORE_MAX = 8;
-
-// Which report a stall dump belongs to, and therefore what log level its lines
-// take. A periodic round fires every STALL_LOG_INTERVAL idle iterations on a run
-// that may still be making progress elsewhere, so it stays at INFO and is read by
-// raising the device log level. A shutdown snapshot fires once, on the run the
-// scheduler is about to kill, and carries the only record of what was still
-// pending — so it takes the level of the SHUTDOWN_SNAPSHOT line that announces it,
-// which the default device log level keeps.
-enum class StallDumpReport : int32_t { Periodic, Shutdown };
-constexpr int32_t PROGRESS_VERBOSE_THRESHOLD = 10;  // log every completion for the first N tasks
-constexpr int32_t PROGRESS_LOG_INTERVAL = 250;      // log every N completions after threshold
-
-// =============================================================================
-// Control flow signal from cold-path helpers back to the main dispatch loop.
-// =============================================================================
-
-enum class LoopAction : int8_t {
-    NONE,        // cold path did not trigger; proceed normally
-    BREAK_LOOP,  // equivalent to 'break' from the while(true) loop
-};
-
-// =============================================================================
-// Per-core state: one cache line per core to eliminate false sharing
-// and co-locate all hot-path fields for minimal cache misses.
-// Dual-slot layout: running (currently executing) + pending (pre-loaded, awaiting hardware pickup).
-// =============================================================================
-
-struct alignas(64) CoreExecState {
-    // --- Hot fields (completion + dispatch, every iteration) ---
-    uint64_t reg_addr;                      // offset  0: register base address (set once in handshake)
-    ChipTaskSlotState *running_slot_state;  // offset  8: slot state for running task (nullptr = empty)
-    ChipTaskSlotState *pending_slot_state;  // offset 16: slot state for pending task (nullptr = empty)
-    int32_t running_reg_task_id;            // offset 24: register task ID (AICPU_TASK_INVALID = idle)
-    int32_t pending_reg_task_id;            // offset 28: pending register task ID (AICPU_TASK_INVALID = none)
-    uint32_t dispatch_seq;                  // offset 32: monotonic dispatch counter
-    SubtaskSlot running_subslot;            // offset 36: which subtask slot is running
-    SubtaskSlot pending_subslot;            // offset 37: which subtask slot is pending
-    uint8_t pad0_[2];                       // offset 38: alignment padding
-    // Precomputed COND register pointer; resolved once in handshake so the
-    // hot completion poll does a single volatile load instead of recomputing
-    // reg_base + reg_offset(COND) on every iteration.
-    volatile uint32_t *cond_ptr;  // offset 40: precomputed pointer to COND register
-#if SIMPLER_DFX
-    // --- Profiling fields (dispatch path, compile-time gated) ---
-    uint64_t running_dispatch_timestamp;  // offset 48: AICPU dispatch timestamp for running task
-    uint64_t pending_dispatch_timestamp;  // offset 56: AICPU dispatch timestamp for pending task
-#else
-    // --- Cold fields (init/diagnostics only, never in hot path) ---
-    int32_t worker_id;          // offset 48: index in runtime.workers[]
-    uint32_t physical_core_id;  // offset 52: hardware physical core ID
-    CoreType core_type;         // offset 56: AIC or AIV (enum class : int32_t)
-    uint8_t pad2_[4];           // offset 60: pad to 64 bytes
-#endif
-};
-static_assert(sizeof(CoreExecState) == 64, "CoreExecState must occupy exactly one cache line");
-
-// =============================================================================
-// CoreTracker: cluster-based bitmask tracker for idle/running core state.
-//
-// core_states_ encodes per-cluster core idle/running in 3 bits per cluster:
-//   bit i*3   = AIC of cluster i   (1 = idle, 0 = running)
-//   bit i*3+1 = AIV0 of cluster i
-//   bit i*3+2 = AIV1 of cluster i
-// Max 21 clusters per tracker (63 bits in uint64_t).
-// =============================================================================
-
-class alignas(64) CoreTracker {
-public:
-    // The ceiling is the platform's cluster count, not the width of the backing
-    // word: a run takes the whole device, and aicpu_thread_num can leave a single
-    // scheduler thread owning all of it.
-    static constexpr int32_t MAX_CLUSTERS = PLATFORM_MAX_BLOCKDIM;
-    static constexpr int32_t MAX_CORE_PER_THREAD = MAX_CLUSTERS * PLATFORM_CORES_PER_BLOCKDIM;
-
-public:
-    CoreTracker() = default;
-
-    class BitStates {
-    public:
-        // 3 state bits per cluster, so the backing word must hold
-        // MAX_CLUSTERS * 3 bits. 128 covers both arches (a2a3 72, a5 108) with
-        // room; a single uint64_t held only 21 clusters, fewer than either
-        // device has.
-        using Storage = unsigned __int128;
-
-        BitStates() = default;
-
-        explicit BitStates(Storage states) :
-            states_(states) {}
-        void init() { states_ = 0; }
-
-        // A mask with exactly `offset` set. The shift lives here so a caller
-        // cannot silently narrow it by writing `1ULL << offset`, which is
-        // undefined once offset reaches 64.
-        static BitStates bit(int32_t offset) { return BitStates(static_cast<Storage>(1) << offset); }
-
-        BitStates operator~() const { return BitStates(~states_); }
-        BitStates operator&(const BitStates &other) const { return BitStates(states_ & other.states_); }
-        BitStates operator|(const BitStates &other) const { return BitStates(states_ | other.states_); }
-        BitStates operator^(const BitStates &other) const { return BitStates(states_ ^ other.states_); }
-        BitStates operator>>(int32_t offset) const { return BitStates(states_ >> offset); }
-        BitStates operator<<(int32_t offset) const { return BitStates(states_ << offset); }
-        void operator&=(const BitStates &other) { states_ &= other.states_; }
-        void operator|=(const BitStates &other) { states_ |= other.states_; }
-        void operator^=(const BitStates &other) { states_ ^= other.states_; }
-
-        bool has_value() const { return states_ > 0; }
-        int32_t count() const {
-            return __builtin_popcountll(static_cast<uint64_t>(states_)) +
-                   __builtin_popcountll(static_cast<uint64_t>(states_ >> 64));
-        }
-        void clear_bit(int32_t offset) { states_ &= ~(static_cast<Storage>(1) << offset); }
-
-        // Extract the lowest set bit from mask, clear it, and return its position.
-        // Returns -1 if mask is empty.
-        int32_t pop_first() {
-            if (states_ == 0) return -1;
-            const uint64_t low = static_cast<uint64_t>(states_);
-            const int32_t pos =
-                (low != 0) ? __builtin_ctzll(low) : 64 + __builtin_ctzll(static_cast<uint64_t>(states_ >> 64));
-            states_ &= states_ - 1;
-            return pos;
-        }
-
-    private:
-        Storage states_{0};
-    };
-
-public:
-    static_assert(MAX_CORE_PER_THREAD <= 128, "CoreTracker state bits must fit BitStates::Storage");
-
-    void init(int32_t cluster_count) {
-        always_assert(
-            cluster_count >= 0 && cluster_count <= MAX_CLUSTERS && "cluster_count outside CoreTracker capacity"
-        );
-        cluster_count_ = cluster_count;
-        aic_mask_.init();
-        aiv_mask_.init();
-        pending_occupied_.init();
-        for (int32_t i = 0; i < cluster_count; i++) {
-            aic_mask_ |= BitStates::bit(i * 3);
-            aiv_mask_ |= (BitStates::bit(i * 3 + 1) | BitStates::bit(i * 3 + 2));
-        }
-        core_states_ = aic_mask_ | aiv_mask_;
-    }
-
-    void set_cluster(int32_t cluster_idx, int32_t aic_wid, int32_t aiv0_wid, int32_t aiv1_wid) {
-        always_assert(cluster_idx >= 0 && cluster_idx < MAX_CLUSTERS && "cluster_idx outside CoreTracker capacity");
-        core_id_map_[cluster_idx * 3] = aic_wid;
-        core_id_map_[cluster_idx * 3 + 1] = aiv0_wid;
-        core_id_map_[cluster_idx * 3 + 2] = aiv1_wid;
-    }
-
-    int32_t get_cluster_count() const { return cluster_count_; }
-
-    // --- Running core queries ---
-
-    template <CoreType CT>
-    bool has_running_cores() const {
-        if constexpr (CT == CoreType::AIC) {
-            return ((~core_states_) & aic_mask_).has_value();
-        } else {
-            return ((~core_states_) & aiv_mask_).has_value();
-        }
-    }
-
-    bool has_any_running_cores() const { return ((~core_states_) & (aic_mask_ | aiv_mask_)).has_value(); }
-
-    // True if any core on this thread still has a free slot to stage onto — an
-    // idle core (running slot) or a running core with a free pending slot. A
-    // core is unavailable only when running AND its pending slot is occupied;
-    // idle cores keep pending_occupied_ clear by invariant, so
-    // ~pending_occupied_ over all cores is exactly "has a free slot". Purely
-    // local (no shared/atomic access) — used to skip early dispatch, and its
-    // shared-queue pop, when this thread has no capacity at all.
-    // BitStates of every core on this thread with a free slot to stage onto: a
-    // core is unavailable only when running AND its pending slot is occupied.
-    // Idle cores keep pending_occupied_ clear by invariant, so ~pending_occupied_
-    // over aic|aiv is exactly "has a free slot". Spans AIC+AIV, so its .count() is
-    // an upper bound on the early-dispatch drain's per-shape pop (never exceeds the
-    // thread's total free cores), and .has_value() is the has_any_free_slot()
-    // predicate that gates the Phase-4b early-dispatch pass. Purely local (no
-    // shared/atomic access).
-    BitStates get_free_slot_states() const { return (~pending_occupied_) & (aic_mask_ | aiv_mask_); }
-
-    bool has_any_free_slot() const { return get_free_slot_states().has_value(); }
-
-    template <CoreType CT>
-    int32_t get_running_count() const {
-        if constexpr (CT == CoreType::AIC) {
-            return ((~core_states_) & aic_mask_).count();
-        } else {
-            return ((~core_states_) & aiv_mask_).count();
-        }
-    }
-
-    // Return an opaque bitmask for iterating running cores of a given type.
-    // Use pop_first() to extract core bit offsets one at a time.
-    template <CoreType CT>
-    BitStates get_running_cores() const {
-        if constexpr (CT == CoreType::AIC) {
-            return (~core_states_) & aic_mask_;
-        } else {
-            return (~core_states_) & aiv_mask_;
-        }
-    }
-
-    BitStates get_all_running_cores() const { return (~core_states_) & (aic_mask_ | aiv_mask_); }
-    BitStates get_cluster_offset_states() const { return aic_mask_; }
-
-    // --- Cluster matching ---
-
-    BitStates get_valid_cluster_offset_states(ResourceShape shape) const {
-        switch (shape) {
-        case ResourceShape::AIC:
-            return core_states_ & aic_mask_;
-        case ResourceShape::AIV:
-            return ((core_states_ >> 1) | (core_states_ >> 2)) & aic_mask_;
-        case ResourceShape::MIX:
-            return (core_states_ >> 1) & (core_states_ >> 2) & core_states_ & aic_mask_;
-        case ResourceShape::DUMMY:
-            // DUMMY tasks never reach the core-tracker dispatch path; they are
-            // completed inline by resolve_and_dispatch via dummy_ready_queue.
-            return {};
-        }
-        return {};
-    }
-
-    int32_t get_aic_core_id(int32_t cluster_offset) const { return core_id_map_[cluster_offset]; }
-    int32_t get_aiv0_core_id(int32_t cluster_offset) const { return core_id_map_[cluster_offset + 1]; }
-    int32_t get_aiv1_core_id(int32_t cluster_offset) const { return core_id_map_[cluster_offset + 2]; }
-
-    int32_t get_aic_core_offset(int32_t cluster_offset) const { return cluster_offset; }
-    int32_t get_aiv0_core_offset(int32_t cluster_offset) const { return cluster_offset + 1; }
-    int32_t get_aiv1_core_offset(int32_t cluster_offset) const { return cluster_offset + 2; }
-
-    bool is_aic_core_idle(int32_t cluster_offset) const {
-        return ((core_states_ >> cluster_offset) & BitStates::bit(0)).has_value();
-    }
-    bool is_aiv0_core_idle(int32_t cluster_offset) const {
-        return ((core_states_ >> (cluster_offset + 1)) & BitStates::bit(0)).has_value();
-    }
-    bool is_aiv1_core_idle(int32_t cluster_offset) const {
-        return ((core_states_ >> (cluster_offset + 2)) & BitStates::bit(0)).has_value();
-    }
-
-    // --- State mutation ---
-
-    // Toggle bit at the given bit offset (running <-> idle)
-    void change_core_state(int32_t bit_offset) { core_states_ ^= BitStates::bit(bit_offset); }
-
-    // --- Pending-occupied tracking ---
-    // Tracks whether a core's pending payload slot is occupied (awaiting hardware ACK).
-    // SET on dispatch (both running-first and pending), CLEAR on idle or pending_freed.
-
-    void set_pending_occupied(int32_t bit_offset) { pending_occupied_ |= BitStates::bit(bit_offset); }
-    void clear_pending_occupied(int32_t bit_offset) {
-        pending_occupied_ ^= (pending_occupied_ & BitStates::bit(bit_offset));
-    }
-
-    // --- Two-phase dispatch queries ---
-
-    // Idle dispatch: returns bit offsets of idle cores for the given shape.
-    // For AIC: 1 bit per cluster (core offset == cluster offset).
-    // For AIV: 1 bit per AIV core (2 bits per cluster at aiv_mask_ positions).
-    // Only AIC needs pending_occupied filtering: by invariant, idle cores (core_states_ bit=1)
-    // always have pending_occupied=0, so AIV/MIX need no extra filtering.
-    // Skipping the AIC-centric filter also fixes a latent bug where a running+pending AIC core
-    // would incorrectly block AIV idle dispatch on the same cluster.
-    BitStates get_idle_core_offset_states(ResourceShape shape) const {
-        if (shape == ResourceShape::AIC) {
-            return get_valid_cluster_offset_states(shape) & ~(pending_occupied_ & aic_mask_);
-        }
-        if (shape == ResourceShape::AIV) {
-            return core_states_ & aiv_mask_;
-        }
-        return get_valid_cluster_offset_states(shape);  // MIX: cluster-level
-    }
-
-    // Pending dispatch: returns bit offsets of cores eligible for pending-slot dispatch.
-    // AIC: 1 bit per cluster (aic_mask_ positions). AIV: 1 bit per AIV core (aiv_mask_ positions).
-    // Runtime MIX dispatch uses classify_mix_cluster() so the decision follows the task's active_mask.
-    enum class MixPlacement : uint8_t { RUNNING, PENDING, REJECT };
-
-    // Placement for the cores named by active_mask, ignoring cores this task does
-    // not use. All used cores idle -> RUNNING placement (each to its running slot).
-    // Otherwise -> PENDING placement: at dispatch each used core is filled per its
-    // own state -- an idle core takes its running slot (and is marked running, so
-    // the completion poller, which scans only running cores, tracks its FIN), an
-    // already-running core takes its pending slot and executes after its in-flight
-    // task. REJECT only when a used core's pending slot is already occupied (no free
-    // slot) or the mask is empty.
-    MixPlacement classify_mix_cluster(int32_t cluster_offset, uint8_t core_mask) const {
-        BitStates used;
-        if (core_mask & SUBTASK_MASK_AIC) {
-            used |= BitStates::bit(cluster_offset);
-        }
-        if (core_mask & SUBTASK_MASK_AIV0) {
-            used |= BitStates::bit(cluster_offset + 1);
-        }
-        if (core_mask & SUBTASK_MASK_AIV1) {
-            used |= BitStates::bit(cluster_offset + 2);
-        }
-        if (!used.has_value() || (pending_occupied_ & used).has_value()) {
-            return MixPlacement::REJECT;
-        }
-
-        BitStates idle = core_states_ & used;
-        if (idle.count() == used.count()) {
-            return MixPlacement::RUNNING;
-        }
-        return MixPlacement::PENDING;
-    }
-
-    BitStates get_mix_cluster_offset_states(uint8_t core_mask, MixPlacement placement) const {
-        BitStates result;
-        BitStates candidates = get_cluster_offset_states();
-        while (candidates.has_value()) {
-            int32_t cluster_offset = candidates.pop_first();
-            if (classify_mix_cluster(cluster_offset, core_mask) == placement) {
-                result |= BitStates::bit(cluster_offset);
-            }
-        }
-        return result;
-    }
-
-    // --- Gated MIX split placement ---
-    // A gated MIX block can place each of its cores INDEPENDENTLY (idle core -> gated
-    // running slot; busy core with a free pending slot -> gated pending slot), because
-    // every core waits on the doorbell and nothing executes until the rendezvous rings.
-    // This is unsafe for immediate (non-gated) dispatch — hence separate from
-    // classify_mix_cluster, which forces a single placement for the whole cluster.
-
-    // Cores of `cluster_offset` named by core_mask.
-    BitStates mix_used_cores(int32_t cluster_offset, uint8_t core_mask) const {
-        BitStates used;
-        if (core_mask & SUBTASK_MASK_AIC) used |= BitStates::bit(cluster_offset);
-        if (core_mask & SUBTASK_MASK_AIV0) used |= BitStates::bit(cluster_offset + 1);
-        if (core_mask & SUBTASK_MASK_AIV1) used |= BitStates::bit(cluster_offset + 2);
-        return used;
-    }
-
-    // Every used core has SOME free slot: a core lacks one only when it is running AND
-    // its pending slot is occupied (both slots taken).
-    bool mix_cluster_all_slots(int32_t cluster_offset, uint8_t core_mask) const {
-        BitStates used = mix_used_cores(cluster_offset, core_mask);
-        if (!used.has_value()) return false;
-        BitStates no_slot = (~core_states_) & pending_occupied_;  // running AND pending taken
-        return !(used & no_slot).has_value();
-    }
-
-    // Used cores that are idle -> will take a running slot (rendezvous seed count).
-    int32_t mix_cluster_idle_core_count(int32_t cluster_offset, uint8_t core_mask) const {
-        return (mix_used_cores(cluster_offset, core_mask) & core_states_).count();
-    }
-
-    // Clusters where every used core has a free slot (gated MIX split gate/iteration).
-    BitStates get_mix_split_cluster_offset_states(uint8_t core_mask) const {
-        BitStates result;
-        BitStates candidates = get_cluster_offset_states();
-        while (candidates.has_value()) {
-            int32_t off = candidates.pop_first();
-            if (mix_cluster_all_slots(off, core_mask)) {
-                result |= BitStates::bit(off);
-            }
-        }
-        return result;
-    }
-
-    int32_t count_mix_split_clusters(uint8_t core_mask) const {
-        return get_mix_split_cluster_offset_states(core_mask).count();
-    }
-
-    BitStates get_mix_running_cluster_offset_states(uint8_t core_mask) const {
-        return get_mix_cluster_offset_states(core_mask, MixPlacement::RUNNING);
-    }
-
-    int32_t count_mix_running_clusters(uint8_t core_mask) const {
-        return get_mix_running_cluster_offset_states(core_mask).count();
-    }
-
-    // Number of whole logical blocks this tracker can accept for sync_start
-    // staging. AIC/AIV count cores; MIX counts clusters because one logical MIX
-    // block may occupy multiple cores in the same cluster. Gated early staging
-    // includes pending slots, while ready staging is restricted to idle slots.
-    int32_t count_available_blocks(ResourceShape shape, uint8_t core_mask, bool include_pending) const {
-        if (shape == ResourceShape::MIX) {
-            return include_pending ? count_mix_split_clusters(core_mask) : count_mix_running_clusters(core_mask);
-        }
-        if (shape == ResourceShape::DUMMY) return 0;
-
-        int32_t available = get_idle_core_offset_states(shape).count();
-        if (include_pending) {
-            available += get_pending_core_offset_states(shape).count();
-        }
-        return available;
-    }
-
-    BitStates get_pending_core_offset_states(ResourceShape shape) const {
-        if (shape == ResourceShape::MIX) {
-            // Shape-level query kept conservative for legacy callers/tests.
-            // The real MIX dispatch path applies active_mask in classify_mix_cluster().
-            // Any core without a pending payload can accept a dispatch (idle or running).
-            BitStates available = ~pending_occupied_;
-            BitStates mix_available =
-                (available & aic_mask_) & ((available >> 1) & aic_mask_) & ((available >> 2) & aic_mask_);
-            // Pending MIX can only reuse a fully-running cluster. Partially-running clusters
-            // could split one MIX block across immediate and pending placement.
-            BitStates running = ~core_states_;
-            BitStates cluster_all_running =
-                (running & aic_mask_) & ((running >> 1) & aic_mask_) & ((running >> 2) & aic_mask_);
-            return mix_available & cluster_all_running;
-        }
-        if (shape == ResourceShape::AIC) {
-            return (~core_states_) & aic_mask_ & ~(pending_occupied_ & aic_mask_);
-        }
-        // AIV
-        return (~core_states_) & aiv_mask_ & ~pending_occupied_;
-    }
-
-    // --- Two-phase dispatch unified query ---
-
-    enum class DispatchPhase : uint8_t { IDLE, PENDING };
-
-    BitStates get_dispatchable_cores(ResourceShape shape, DispatchPhase phase) const {
-        return (phase == DispatchPhase::IDLE) ? get_idle_core_offset_states(shape) :
-                                                get_pending_core_offset_states(shape);
-    }
-
-    // --- Bit offset <-> worker_id mapping ---
-
-    int32_t get_core_id_by_offset(int32_t offset) const { return core_id_map_[offset]; }
-
-    const int32_t *core_ids() const { return core_id_map_; }
-    int32_t core_num() const { return cluster_count_ * 3; }
-
-private:
-    int32_t cluster_count_{0};
-    BitStates aic_mask_;
-    BitStates aiv_mask_;
-    BitStates core_states_;
-    BitStates pending_occupied_;
-    int32_t core_id_map_[MAX_CORE_PER_THREAD];  // bit position -> worker id
-};
-
-// =============================================================================
-// SlotTransition: pure event signals from a single register poll.
-// true = event occurred, false = no-op (maintain current state).
-// =============================================================================
-
-struct SlotTransition {
-    bool running_done = false;   // running task completed
-    bool pending_done = false;   // pending task completed
-    bool running_freed = false;  // running slot data should be released
-    bool pending_freed = false;  // pending_occupied can be cleared
-    bool matched = false;        // some case was hit (otherwise skip apply)
-};
-
-// =============================================================================
-// Profiling counters (compile-time gated)
-// =============================================================================
-
-#if SIMPLER_DFX
-struct alignas(64) SchedChipSwimlaneCounters {
-    bool chip_swimlane_enabled{false};
-    uint64_t sched_start_ts{0};
-    uint64_t sched_complete_cycle{0};
-    uint64_t sched_dispatch_cycle{0};
-    uint64_t sched_idle_cycle{0};
-    uint64_t sched_loop_count{0};
-    uint32_t phase_complete_count{0};
-    // Sub-block retires that did NOT finish a slot (SPMD blocks of a multi-block
-    // task retiring one at a time). Counted separately so the Complete-phase
-    // emit can fire on poll iterations that only retired sub-blocks — otherwise
-    // the serial-harvest tail of an SPMD slot is invisible (no slot completes
-    // until the last block, leaving the scheduler lane blank for that window).
-    uint32_t phase_subretire_count{0};
-    uint32_t phase_dispatch_count{0};
-    // Per-emit delta is (current - *_at_last_emit). Accumulated only when
-    // chip_swimlane_level_ >= SCHED_PHASES.
-    uint64_t pop_hit{0};
-    uint64_t pop_miss{0};
-    uint64_t pop_hit_at_last_emit{0};
-    uint64_t pop_miss_at_last_emit{0};
-#if SIMPLER_SCHED_PROFILING
-    uint64_t complete_probe_count{0};
-    uint64_t complete_hit_count{0};
-    uint64_t sched_complete_perf_cycle{0};
-    uint64_t sched_dispatch_pop_cycle{0};
-    uint64_t sched_dispatch_setup_cycle{0};
-#endif
-    void reset() { *this = SchedChipSwimlaneCounters{}; }
-};
-#endif
-
-// =============================================================================
-// sync_start drain coordination
-// =============================================================================
-
-// When sync_start_pending != 0, all scheduler threads skip dispatch
-// (only process completions) until the fixed coordinator finishes launching all blocks.
-struct alignas(64) SyncStartDrainState {
-    std::atomic<int32_t> sync_start_pending{0};              // 0=normal; -1=initializing; >0=active (value=block_num)
-    std::atomic<ChipTaskSlotState *> pending_task{nullptr};  // held task (not re-queued)
-    std::atomic<uint64_t> drain_attempt{0};                  // incremented whenever an ack round is reset
-    // Parallel staging: after the coordinator confirms global availability it sets
-    // stage_go, releasing every thread to stage its OWN cores concurrently (vs the old
-    // single-thread serial fill). Each thread ORs its bit into stage_done_mask when it
-    // finishes and accumulates its running-slot cores into running_staged; the coordinator
-    // thread waits for all bits, seeds the rendezvous, and reopens the gate.
-    std::atomic<int32_t> drain_stage_go{0};          // 0=hold; 1=coordinator released parallel staging
-    std::atomic<uint32_t> drain_stage_done_mask{0};  // bit per thread; all-set = all threads done staging
-    std::atomic<int32_t> drain_running_staged{0};    // sum of running-slot cores staged (rendezvous seed)
-    int32_t _pad[7];
-};
-static_assert(sizeof(SyncStartDrainState) == 64);
-static_assert(offsetof(SyncStartDrainState, pending_task) == 8);
-static_assert(offsetof(SyncStartDrainState, drain_attempt) == 16);
-static_assert(offsetof(SyncStartDrainState, drain_stage_go) == 24);
-
-constexpr uint64_t SYNC_START_DRAIN_ACK_SUBTREE_READY = uint64_t{1} << 63;
-constexpr uint64_t SYNC_START_DRAIN_ATTEMPT_MASK = ~SYNC_START_DRAIN_ACK_SUBTREE_READY;
-
-inline uint64_t sync_start_drain_next_attempt(uint64_t attempt) {
-    uint64_t next = (attempt + 1) & SYNC_START_DRAIN_ATTEMPT_MASK;
-    return next == 0 ? 1 : next;
-}
-
-inline uint64_t sync_start_drain_ack_subtree_token(uint64_t attempt) {
-    return attempt | SYNC_START_DRAIN_ACK_SUBTREE_READY;
-}
-
-#endif
 
 // =============================================================================
 // Resident AICore scheduler wire contracts
 //
 // These types are shared by Host, AICPU lifecycle, and AICore workers.
 // =============================================================================
-inline constexpr uint64_t SCHEDULER_STATE_ALIGNMENT = 128;
+// Wire subregions use 64B alignment; the allocation base must also satisfy
+// the shared GM types' alignment, computed below.
+inline constexpr uint64_t SCHEDULER_STATE_ALIGNMENT = 64;
+// CANN's SIMT GM-atomic model uses 128B sectors within a 512B L2 line.
+// AIC/AIV scalar atomicAdd/ld_dev probes support this separation for layout;
+// it is not a scalar ordering guarantee. See the data-layout contract.
+inline constexpr uint64_t SCHEDULER_GM_ATOMIC_SECTOR_BYTES = 128;
 inline constexpr uint64_t SCHEDULER_WORKER_CAPACITY = 108;
-inline constexpr uint32_t SCHEDULER_PENDING_SLOT_COUNT = 2;
-inline constexpr uint32_t SCHEDULER_CORE_TYPE_COUNT = 2;
-inline constexpr uint32_t SCHEDULER_READY_QUEUE_COUNT = 3;
-inline constexpr uint32_t SCHEDULER_MIX_QUEUE = 2;
+inline constexpr uint32_t SCHEDULER_EXECUTION_TOKEN_COUNT = 1;
+inline constexpr uint32_t SCHEDULER_CLUSTER_MIX_EXECUTION = SCHEDULER_EXECUTION_TOKEN_COUNT;
+inline constexpr uint32_t SCHEDULER_LOCAL_EXECUTION_COUNT = SCHEDULER_CLUSTER_MIX_EXECUTION + 1;
+// MIX keeps the same trace identity in both window-depth builds.
+inline constexpr uint32_t SCHEDULER_TRACE_SELF_CAPACITY = 4;
+static_assert(SCHEDULER_EXECUTION_TOKEN_COUNT <= SCHEDULER_TRACE_SELF_CAPACITY);
+inline __aicore__ uint16_t scheduler_trace_source_index(uint32_t index) {
+    return static_cast<uint16_t>(
+        index < SCHEDULER_EXECUTION_TOKEN_COUNT ?
+            index :
+            SCHEDULER_TRACE_SELF_CAPACITY + index - SCHEDULER_EXECUTION_TOKEN_COUNT
+    );
+}
+enum class SchedulerExecutionEngine : uint32_t { AIC = 0, AIV = 1 };
+inline constexpr uint32_t SCHEDULER_EXECUTION_ENGINE_COUNT = 2;
 inline constexpr uint32_t SCHEDULER_CLUSTER_CAPACITY = SCHEDULER_WORKER_CAPACITY / 3;
-inline constexpr uint32_t SCHEDULER_CAPACITY = SCHEDULER_CLUSTER_CAPACITY;
-inline constexpr uint32_t SCHEDULER_GANG_COHORT_COUNT = 2;
 inline constexpr uint32_t SCHEDULER_ACTIVITY_CAPACITY = 1024;
 inline constexpr uint64_t SCHEDULER_PROFILING_TASK_TIMING_LEVEL = 1;
 inline constexpr uint64_t SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL = 2;
@@ -657,14 +82,9 @@ inline __aicore__ bool scheduler_phase_timing_enabled(uint64_t level) {
 inline constexpr bool scheduler_activity_record_count_valid(uint32_t committed) noexcept {
     return committed <= SCHEDULER_ACTIVITY_CAPACITY;
 }
-inline constexpr uint32_t SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD = 7;
-inline constexpr uint32_t SCHEDULER_READY_DIRECTORY_SHARD_COUNT =
-    (SCHEDULER_CAPACITY + SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD - 1) / SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD;
-inline constexpr int64_t SCHEDULER_TASK_ID_INVALID = -1;
-inline constexpr int64_t SCHEDULER_WAKE_LIST_OPEN = -1;
-inline constexpr int64_t SCHEDULER_WAKE_LIST_CLOSED = -2;
-inline constexpr int64_t SCHEDULER_INBOX_EMPTY = -1;
-inline constexpr uint64_t SCHEDULER_READY_PENDING_EMPTY = UINT64_MAX;
+// A task ref is the index of an expanded top-level, child or control node.
+// Public TaskId identity is recovered through the graph view.
+inline constexpr int64_t SCHEDULER_TASK_REF_INVALID = -1;
 
 enum class SchedulerTaskState : int64_t {
     BLOCKED = 0,
@@ -672,42 +92,92 @@ enum class SchedulerTaskState : int64_t {
 };
 
 enum class SchedulerReadySource : uint8_t {
-    LOCAL = 0,
-    STOLEN = 1,
-    DIRECT_RESOLVE = 2,
-};
-
-enum class SchedulerPublicationMode : uint8_t {
-    DISPATCH = 0,
-    REFILL = 1,
+    CATALOG = 0,
+    COOPERATIVE = 3,
 };
 
 struct SchedulerIdleRecord {
     uint64_t start_time;
     uint64_t end_time;
     uint32_t loop_iter;
-    uint32_t reserved;
 };
 static_assert(sizeof(SchedulerIdleRecord) == 24, "Scheduler idle record layout changed");
+
+inline constexpr uint32_t SCHEDULER_SCALAR_RECORD_CAPACITY = 262144;
+
+struct SchedulerScalarRecord {
+    uint64_t start_time;
+    uint64_t end_time;
+    int64_t task_ref;
+    uint32_t kind;
+    uint32_t count;
+};
+static_assert(sizeof(SchedulerScalarRecord) == 32);
+
+// Compact rows keep an absolute 64-bit start and a 32-bit duration. Rows with
+// a task, a non-unit count or a long duration use a second slot without loss.
+inline constexpr uint32_t SCHEDULER_SCALAR_STORAGE_EXTENDED = UINT32_C(0x8000);
+struct alignas(16) SchedulerScalarStorageSlot {
+    uint64_t time;
+    uint32_t kind;
+    uint32_t value;
+};
+static_assert(sizeof(SchedulerScalarStorageSlot) == 16);
+
+inline __aicore__ bool scheduler_decode_scalar_storage(
+    const SchedulerScalarStorageSlot *slots, uint32_t size, uint32_t &cursor, SchedulerScalarRecord &record
+) {
+    if (cursor >= size) return false;
+    const auto &head = slots[cursor++];
+    record.start_time = head.time;
+    record.kind = head.kind & ~SCHEDULER_SCALAR_STORAGE_EXTENDED;
+    if ((head.kind & SCHEDULER_SCALAR_STORAGE_EXTENDED) != 0) {
+        if (cursor >= size) return false;
+        const auto &tail = slots[cursor++];
+        record.end_time = tail.time;
+        record.task_ref = static_cast<int64_t>(uint64_t{tail.kind} | (uint64_t{tail.value} << 32));
+        record.count = head.value;
+    } else {
+        if (head.time > UINT64_MAX - head.value) return false;
+        record.end_time = head.time + head.value;
+        record.task_ref = -1;
+        record.count = 1;
+    }
+    return record.end_time >= record.start_time;
+}
 
 struct alignas(64) SchedulerActivityBuffer {
     volatile uint32_t committed;
     volatile uint32_t dropped;
-    uint32_t reserved[2];
     SchedulerIdleRecord records[SCHEDULER_ACTIVITY_CAPACITY];
+    alignas(64) uint32_t scalar_committed;
+    uint32_t scalar_dropped;
+    uint64_t scalar_write_cycles;
+    uint64_t scalar_poll_loops;
+    uint64_t scalar_records_offset;
+    uint64_t scalar_short_intervals;
+    uint64_t scalar_function_min_cycles;
+    uint32_t scalar_storage_slots;
 };
 static_assert(sizeof(SchedulerActivityBuffer) % 64 == 0, "scheduler activity buffer must be cache aligned");
+static_assert(
+    offsetof(SchedulerActivityBuffer, scalar_storage_slots) + sizeof(uint32_t) <=
+        offsetof(SchedulerActivityBuffer, scalar_committed) + 64,
+    "Scalar metadata must fit its existing cache line"
+);
 
 enum class SchedulerDispatchSlotState : uint8_t {
     EMPTY = 0,
     FREE = 1,
     FILLING = 2,
     READY = 3,
+    EXECUTING = 4,
 };
 
 enum SchedulerTaskMetadataFlags : uint8_t {
     SCHEDULER_TASK_EXECUTABLE = 1U << 0,
-    SCHEDULER_TASK_HAS_FANIN = 1U << 1,
+    // Host proved an actual fanin ancestor may publish deferred data.
+    SCHEDULER_TASK_ASYNC_INPUT = 1U << 1,
     SCHEDULER_TASK_MIX = 1U << 2,
     SCHEDULER_TASK_SPMD = 1U << 3,
     SCHEDULER_TASK_SYNC_START = 1U << 4,
@@ -716,15 +186,15 @@ enum SchedulerTaskMetadataFlags : uint8_t {
 };
 
 #if !defined(__CCE_AICORE__)
+#include "host_build_graph/submit_types.h"
 // Derive the compact AICore metadata from the established HBG scheduling
-// types. This is a host-only projection: ActiveMask and TaskAttrs remain the
+// types. This is a host-only projection: LaneMask and TaskAttrs remain the
 // source of truth, while SchedulerTaskMetadata stays a 16-byte GM read model.
 inline uint8_t scheduler_task_metadata_flags_from_submit_state(
-    ActiveMask active_mask, TaskAttrs task_attrs, int32_t logical_block_num, bool has_fanin, bool inline_task
+    LaneMask active_mask, TaskAttrs task_attrs, int32_t logical_block_num, bool inline_task
 ) {
     uint8_t flags = SCHEDULER_TASK_EXECUTABLE;
-    const uint32_t active_subtasks = static_cast<uint32_t>(__builtin_popcount(active_mask.core_mask()));
-    if (has_fanin) flags |= SCHEDULER_TASK_HAS_FANIN;
+    const uint32_t active_subtasks = static_cast<uint32_t>(active_mask.count());
     if (active_subtasks > 1) flags |= SCHEDULER_TASK_MIX;
     if (logical_block_num > 1) flags |= SCHEDULER_TASK_SPMD;
     if (task_attrs.requires_sync_start()) flags |= SCHEDULER_TASK_SYNC_START;
@@ -736,31 +206,120 @@ inline uint8_t scheduler_task_metadata_flags_from_submit_state(
 
 constexpr int32_t SCHEDULER_TASK_TIMING_SLOT_COUNT = 16;
 
-struct alignas(16) SchedulerTaskMetadata {
+// Immutable task view of a shared monotonic CntNotify ADD chain. Strict DAG
+// ancestors precede descendants; count >= threshold stays true for this run.
+// Zero ADD address selects the established GM completion protocol.
+struct SchedulerTaskCompletionCounter {
+    uint64_t read_address;
+    uint64_t add_address;
+    uint32_t threshold;
+    uint32_t limit;
+};
+static_assert(sizeof(SchedulerTaskCompletionCounter) == 24);
+static_assert(
+    std::is_trivially_copyable_v<SchedulerTaskCompletionCounter> &&
+    std::is_standard_layout_v<SchedulerTaskCompletionCounter>
+);
+
+// GM records have a 16-byte stride. Stack copies use scalar alignment: their
+// callers pass local objects across outlined boundaries without realigning SP.
+struct alignas(8) SchedulerTaskMetadata {
     uint16_t kernel_ids[3];
-    uint8_t active_mask;
+    LaneMask active_mask;
     uint8_t flags;
     uint32_t trace_index_base;
-    int32_t timing_slot;
+    int16_t timing_slot;
+    uint16_t logical_block_num;
 };
 
-inline __aicore__ uint32_t scheduler_task_trace_index(uint32_t trace_index_base, uint8_t active_mask, uint8_t subtask) {
-    return trace_index_base + static_cast<uint32_t>(__builtin_popcount(active_mask & ((1U << subtask) - 1)));
+inline __aicore__ bool
+scheduler_subtask_count_checked(uint64_t logical_block_num, uint32_t active_subtasks, uint32_t *out) {
+    if (out == nullptr || logical_block_num == 0 || active_subtasks == 0 || active_subtasks > 3 ||
+        logical_block_num > static_cast<uint64_t>(INT16_MAX) / active_subtasks)
+        return false;
+    *out = static_cast<uint32_t>(logical_block_num * active_subtasks);
+    return true;
 }
-inline __aicore__ uint32_t scheduler_task_ready_queue(uint8_t flags, uint8_t active_mask) {
-    return (flags & SCHEDULER_TASK_MIX) != 0 ? SCHEDULER_MIX_QUEUE : ((active_mask & 1U) != 0 ? 0U : 1U);
+
+inline __aicore__ bool scheduler_trace_count_checked(uint64_t prefix, uint64_t added, uint64_t *out) {
+    constexpr uint64_t capacity = static_cast<uint64_t>(UINT32_MAX) + 1;
+    if (out == nullptr || added == 0 || prefix > UINT32_MAX || added > capacity - prefix) return false;
+    *out = prefix + added;
+    return true;
+}
+
+inline __aicore__ LaneMask scheduler_task_lanes(const SchedulerTaskMetadata &metadata) { return metadata.active_mask; }
+
+// A lane set held in device memory. An AICore reaches those structs through
+// `__gm__` references, which LaneMask's own members do not accept, so the byte
+// moves through a local. The GM access is the one the caller needed anyway;
+// `scheduler_task_lanes` pays the same copy on the dispatch path.
+inline __aicore__ LaneMask scheduler_lane_mask_load(const LaneMask &lanes) { return lanes; }
+inline __aicore__ void scheduler_lane_mask_store(LaneMask &field, LaneMask lanes) { field = lanes; }
+
+#if defined(__CCE_AICORE__)
+inline __aicore__ LaneMask scheduler_lane_mask_load(const __gm__ LaneMask &lanes) {
+    LaneMask local;
+    __builtin_memcpy(&local, &lanes, sizeof(local));
+    return local;
+}
+
+inline __aicore__ void scheduler_lane_mask_store(__gm__ LaneMask &field, LaneMask lanes) {
+    __builtin_memcpy(&field, &lanes, sizeof(lanes));
+}
+
+inline __aicore__ LaneMask scheduler_task_lanes(const __gm__ SchedulerTaskMetadata &metadata) {
+    LaneMask lanes;
+    // The one-byte POD copy transfers the field from GM into a local value.
+    __builtin_memcpy(&lanes, &metadata.active_mask, sizeof(lanes));
+    return lanes;
+}
+#endif
+
+// Trace and PMU cells are ordered by task, then by block, then by active
+// subtask, so a task owns `logical_block_num * active_mask.count()` of them
+// starting at its `trace_index_base`.
+inline constexpr uint8_t SCHEDULER_TASK_SUBTASK_SLOTS = 3;
+
+inline __aicore__ uint32_t scheduler_task_trace_index(
+    uint32_t trace_index_base, LaneMask active_mask, SubtaskSlot subtask, uint32_t block_idx = 0
+) {
+    const uint64_t offset =
+        static_cast<uint64_t>(block_idx) * active_mask.count() + static_cast<uint64_t>(active_mask.rank_of(subtask));
+    return static_cast<uint32_t>(static_cast<uint64_t>(trace_index_base) + offset);
+}
+// MIX has one claimant per cluster; a pure single-vector block may be
+// claimed by either vector. Compute and FIN always use the original mask.
+inline __aicore__ LaneMask scheduler_task_claim_lanes(uint8_t flags, LaneMask active_mask) {
+    return (flags & SCHEDULER_TASK_MIX) != 0 ? LaneMask::aiv0() : active_mask.lane_demand();
+}
+
+inline __aicore__ uint32_t scheduler_task_execution_engine(uint8_t flags, LaneMask active_mask) {
+    return static_cast<uint32_t>(
+        (flags & SCHEDULER_TASK_MIX) == 0 && active_mask.has_aic() ? SchedulerExecutionEngine::AIC :
+                                                                     SchedulerExecutionEngine::AIV
+    );
 }
 
 inline __aicore__ bool scheduler_task_is_executable(uint8_t flags) { return (flags & SCHEDULER_TASK_EXECUTABLE) != 0; }
 
-inline __aicore__ bool scheduler_task_has_fanin(uint8_t flags) { return (flags & SCHEDULER_TASK_HAS_FANIN) != 0; }
-
 inline __aicore__ bool scheduler_task_is_mix(uint8_t flags) { return (flags & SCHEDULER_TASK_MIX) != 0; }
+
+// The coordinator is a resource participant even for a Vector-only Mix.
+inline __aicore__ LaneMask scheduler_mix_resource_mask(LaneMask active_mask) {
+    return active_mask.merged_with(LaneMask::aic());
+}
 
 inline __aicore__ bool scheduler_task_is_spmd(uint8_t flags) { return (flags & SCHEDULER_TASK_SPMD) != 0; }
 
 inline __aicore__ bool scheduler_task_requires_sync_start(uint8_t flags) {
     return (flags & SCHEDULER_TASK_SYNC_START) != 0;
+}
+
+// A lone AIV subtask can run on either of a cluster's two V lanes, so it has
+// two claimable positions there; every other shape is pinned to one.
+inline __aicore__ uint64_t scheduler_block_claim_positions(LaneMask active_mask, uint64_t clusters) {
+    return clusters * (active_mask.to_shape() == ResourceShape::AIV ? 2 : 1);
 }
 
 inline __aicore__ bool scheduler_task_is_inline(uint8_t flags) { return (flags & SCHEDULER_TASK_INLINE) != 0; }
@@ -769,145 +328,147 @@ inline __aicore__ bool scheduler_task_has_predicate(uint8_t flags) {
     return (flags & SCHEDULER_TASK_HAS_PREDICATE) != 0;
 }
 
-inline __aicore__ bool scheduler_task_is_gang(uint8_t flags) {
-    return (flags & (SCHEDULER_TASK_SYNC_START | SCHEDULER_TASK_SPMD)) != 0;
+// Classification uses immutable flags; payload preparation still validates shape.
+inline __aicore__ bool scheduler_task_requires_admission(uint8_t flags) {
+    return (flags & (SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_INLINE)) == SCHEDULER_TASK_EXECUTABLE &&
+           (flags & SCHEDULER_TASK_SYNC_START) != 0;
 }
 
-inline __aicore__ uint32_t scheduler_task_priority_bit(uint8_t flags) {
-    if (scheduler_task_requires_sync_start(flags)) return 1U;
-    if (scheduler_task_is_mix(flags)) return 2U;
-    if (scheduler_task_is_spmd(flags)) return 4U;
-    return 0;
+inline __aicore__ bool scheduler_task_requires_admission(const SchedulerTaskMetadata &metadata) {
+    return scheduler_task_requires_admission(metadata.flags);
 }
 
-struct alignas(128) SchedulerTaskControl {
-    // Cross-core state publication and wake-list RMWs share the first line.
-    volatile int64_t state;
-    volatile int64_t wake_list_head;
-    uint8_t atomic_line_padding[48];
+inline __aicore__ bool scheduler_task_uses_distributed_blocks(uint8_t flags, uint32_t blocks) {
+    return scheduler_task_is_executable(flags) && !scheduler_task_is_inline(flags) && !scheduler_task_is_mix(flags) &&
+           blocks > 1 && !scheduler_task_requires_admission(flags);
+}
 
-    // next_waiter links the task only while it belongs to a dependency wake
-    // list or Ready inbox; its value is unspecified in all other states.
-    int64_t next_waiter;
-    int32_t next_fanin_index;
-    int32_t waiting_producer;
-    uint64_t completion_resolve_start_cycles;
-    uint64_t completion_resolve_end_cycles;
-    uint64_t reserved_ready_publish;
-    uint64_t scheduler_worker_id;
-    uint64_t completion_resolve_loop_iter;
-    uint8_t scheduler_line_padding[8];
+inline __aicore__ bool scheduler_task_uses_distributed_blocks(const SchedulerTaskMetadata &metadata) {
+    return scheduler_task_uses_distributed_blocks(metadata.flags, metadata.logical_block_num);
+}
+
+// The immutable total distinguishes a live completed gate from uninitialized
+// storage. Remaining computation and async debt are the only readiness source.
+inline constexpr uint64_t SCHEDULER_COMPLETION_RETURN_UNIT = (UINT64_C(1) << 32) + 1;
+inline constexpr uint64_t SCHEDULER_COMPLETION_LIVE_MASK = (UINT64_C(1) << 48) - 1;
+inline constexpr uint32_t SCHEDULER_COMPLETION_TOTAL_MAX = INT16_MAX;
+
+inline __aicore__ constexpr uint64_t scheduler_completion_encode(uint32_t total, uint32_t remaining, uint32_t debt) {
+    return (static_cast<uint64_t>(total) << 48) | (static_cast<uint64_t>(remaining) << 32) | debt;
+}
+inline __aicore__ constexpr uint64_t scheduler_completion_total(uint64_t state) { return state >> 48; }
+inline __aicore__ constexpr uint64_t scheduler_completion_remaining(uint64_t state) {
+    return (state >> 32) & UINT16_MAX;
+}
+inline __aicore__ constexpr uint64_t scheduler_completion_debt(uint64_t state) { return state & UINT32_MAX; }
+inline __aicore__ constexpr bool scheduler_completion_valid(uint64_t state) {
+    const uint64_t total = scheduler_completion_total(state);
+    const uint64_t remaining = scheduler_completion_remaining(state);
+    const uint64_t debt = scheduler_completion_debt(state);
+    return total != 0 && total <= SCHEDULER_COMPLETION_TOTAL_MAX && remaining <= total && debt >= remaining &&
+           debt <= remaining + total;
+}
+inline __aicore__ constexpr bool scheduler_completion_done(uint64_t state) {
+    return scheduler_completion_valid(state) && (state & SCHEDULER_COMPLETION_LIVE_MASK) == 0;
+}
+inline __aicore__ constexpr uint64_t scheduler_completion_count(uint64_t state) {
+    return scheduler_completion_total(state) - scheduler_completion_remaining(state);
+}
+inline __aicore__ constexpr uint64_t scheduler_completion_initial_state(uint32_t total) {
+    return scheduler_completion_encode(total, total, total);
+}
+inline __aicore__ constexpr uint64_t scheduler_completion_completed_state(uint32_t total) {
+    return scheduler_completion_encode(total, 0, 0);
+}
+inline __aicore__ constexpr int64_t scheduler_completion_task_state(uint64_t state) {
+    return !scheduler_completion_valid(state) ? -1 :
+           scheduler_completion_done(state)   ? static_cast<int64_t>(SchedulerTaskState::DONE) :
+                                                static_cast<int64_t>(SchedulerTaskState::BLOCKED);
+}
+
+// A zero compute count proves physical returns independently of async debt.
+// Raw execution state remains available to distinguish this proof from a store.
+inline __aicore__ bool scheduler_prepared_retirement_inferred(
+    uint64_t state, const __gm__ SchedulerPreparedLayout &prepared, uint64_t index,
+    const __gm__ SchedulerPreparedCall &call, const __gm__ SchedulerExecutionPlan &plan, uint64_t completion
+) {
+    const uint32_t owner = scheduler_prepared_owner(state);
+    return owner < SCHEDULER_WORKER_CAPACITY &&
+           state == (scheduler_prepared_state(SchedulerPreparedPhase::CLAIMED, owner) |
+                     (state & SCHEDULER_PREPARED_TICKET_OWNED)) &&
+           index < prepared.execution_count && call.run_epoch == prepared.run_epoch && call.execution_index == index &&
+           call.task_ref >= 0 && static_cast<uint64_t>(call.task_ref) < prepared.task_count &&
+           plan.active_lane_count == 1 && __builtin_popcount(plan.active_mask_bits) == 1 && call.subtask_slot < 3 &&
+           (plan.active_mask_bits & (1U << call.subtask_slot)) != 0 && plan.execution_count == plan.block_num &&
+           plan.execution_begin <= index && index - plan.execution_begin == call.block_idx &&
+           call.block_idx < plan.block_num && scheduler_completion_valid(completion) &&
+           scheduler_completion_total(completion) == plan.execution_count &&
+           scheduler_completion_remaining(completion) == 0;
+}
+
+inline constexpr uint32_t SCHEDULER_CLAIM_SECTOR_COUNT = 4;
+struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerClaimSector {
+    volatile uint64_t next;
+};
+static_assert(sizeof(SchedulerClaimSector) == SCHEDULER_GM_ATOMIC_SECTOR_BYTES);
+
+struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerTaskControl {
+    // Cooperative tasks count valid claims. Ordinary tasks count the blocks
+    // covered by exhausted claim sectors; only the final value closes supply.
+    alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t next_block;
+    // Bits [0,32) hold total debt D, [32,48) remaining contributions C and
+    // [48,64) the immutable validated total N. Only C=D=0 is logically done.
+    alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t completion_state;
+
+    // The last valid claim publishes the block count to certify that supply is closed.
+    // Its isolated region has no concurrent RMW or cached writeback.
+    alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) volatile uint64_t claim_seal;
+
+    // Ordinary block ownership is distributed over independent L2 sectors.
+    // Excess reservations stay monotonic and never return a valid block.
+    SchedulerClaimSector claim_sectors[SCHEDULER_CLAIM_SECTOR_COUNT];
 };
 
-struct alignas(128) SchedulerReadyInbox {
-    volatile int64_t head;
-    uint8_t atomic_line_padding[120];
-};
+inline constexpr uint64_t SCHEDULER_BOOTSTRAP_CLUSTER_INIT = 1;
+inline constexpr uint64_t SCHEDULER_BOOTSTRAP_AIC_DONE = 2;
+inline constexpr uint64_t SCHEDULER_BOOTSTRAP_AIV1_DONE = 4;
+inline constexpr uint64_t SCHEDULER_BOOTSTRAP_CLUSTER_DONE = 7;
 
-enum class SchedulerGangCohortState : uint64_t {
-    FREE = 0,
-    DRAINING = 1,
-    STAGING = 2,
-    RELEASING = 3,
-    DISPATCHING = 4,
-    EXECUTING = 5,
-    RETIRING = 6,
-};
-
-struct alignas(128) SchedulerGangCoordinator {
-    volatile uint64_t ready_priority_bits;
-    uint8_t priority_line_padding[56];
-
-    volatile uint64_t active_dispatch_cohort;
-    uint64_t next_generation;
-    uint64_t scan_cursor;
-    uint64_t gang_task_count;
-    uint64_t scheduler_count;
-    uint64_t cohort_count;
-    uint64_t mix_task_count;
-    uint64_t owner_reserved;
-
-    uint64_t admitted_count;
-    uint64_t sync_drain_count;
-    uint64_t mix_dispatch_count;
-    uint64_t spmd_dispatch_count;
-    uint64_t capacity_reject_count;
-    uint64_t reserved[3];
-};
-
-struct alignas(128) SchedulerGangCohort {
+// Host initializes this line before launch; workers access it only atomically.
+struct alignas(SCHEDULER_GM_ATOMIC_SECTOR_BYTES) SchedulerBootstrapCluster {
     volatile uint64_t state;
-    int64_t task_id;
-    uint64_t generation;
-    uint64_t priority_bit;
-    uint64_t active_mask;
-    uint64_t logical_block_num;
-    uint64_t participant_count;
-    uint64_t local_stride;
-    uint64_t admitted_cycles;
-    uint64_t drain_complete_cycles;
-    uint64_t stage_complete_cycles;
-    uint64_t dispatch_complete_cycles;
-    uint64_t completion_cycles;
-    uint64_t reserved[3];
+};
+static_assert(sizeof(SchedulerBootstrapCluster) == SCHEDULER_GM_ATOMIC_SECTOR_BYTES);
+static_assert(alignof(SchedulerBootstrapCluster) == SCHEDULER_GM_ATOMIC_SECTOR_BYTES);
+static_assert(
+    std::is_standard_layout_v<SchedulerBootstrapCluster> && std::is_trivially_copyable_v<SchedulerBootstrapCluster>
+);
+
+enum class SchedulerTopologyLayout : uint64_t { GENERAL = 0, COMPACT_LAUNCH = 1 };
+
+// Facts frozen by READY: the host supplies graph facts, and AICPU discovery
+// validates the topology. Workers only read this region during the run.
+struct alignas(64) SchedulerGraphSummary {
+    uint64_t mix_task_count;
+    uint64_t sync_mix_task_count;
+    uint64_t cooperative_task_count;
+    uint64_t worker_count;
+    uint64_t cluster_count;
+    uint64_t run_epoch;
+    uint64_t protocol_layout_offset;
+    SchedulerTopologyLayout topology_layout;
+    uint64_t task_catalog_offset;
+    uint64_t async_layout_offset;
+    uint64_t prepared_layout_offset;
+    uint64_t bootstrap_clusters_offset;
 };
 
-// One Scheduler owns one participant cell. The second line contains generation
-// tokens observed only by its parent in the binary Scheduler tree.
-struct alignas(128) SchedulerGangParticipant {
-    volatile uint64_t config_generation;
-    int64_t task_id;
-    uint32_t active_mask;
-    uint32_t logical_block_num;
-    uint32_t local_expected_subtasks;
-    uint32_t local_published_subtasks;
-    uint32_t local_completed_subtasks;
-    uint32_t block_stride;
-    uint32_t next_block[2];
-    uint32_t participant_count;
-    uint32_t forwarded_state;
-    uint64_t forwarded_generation;
-
-    volatile uint64_t drain_local_token;
-    volatile uint64_t drain_subtree_token;
-    volatile uint64_t stage_local_token;
-    volatile uint64_t stage_subtree_token;
-    volatile uint64_t dispatch_local_token;
-    volatile uint64_t dispatch_subtree_token;
-    volatile uint64_t completion_local_token;
-    volatile uint64_t completion_subtree_token;
-};
-
-// Each Scheduler polls its own command line. Scheduler0 seeds the root and every
-// parent forwards transitions to two children, avoiding a globally contended
-// cohort line and bounding sync-start release skew by the tree depth.
-struct alignas(128) SchedulerGangCommand {
-    volatile uint64_t generation[SCHEDULER_GANG_COHORT_COUNT];
-    volatile uint64_t state[SCHEDULER_GANG_COHORT_COUNT];
-    uint8_t padding[96];
-};
-
-struct alignas(64) SchedulerReadyDirectoryShard {
-    volatile uint64_t bits;
-    uint8_t cache_line_padding[64 - sizeof(uint64_t)];
-};
-
-struct alignas(128) SchedulerReadyDirectory {
-    SchedulerReadyDirectoryShard core_types[SCHEDULER_READY_QUEUE_COUNT][SCHEDULER_READY_DIRECTORY_SHARD_COUNT];
-    volatile uint64_t bootstrap_ready_types[SCHEDULER_WORKER_CAPACITY];
-};
-
-// The Executor publishes this per-slot payload before the Completion Inbox
-// generation. Neither side writes the final per-task trace concurrently.
-// Local copies have natural alignment; SchedulerSsbufLane supplies the
-// 64-byte alignment and stride of shared trace storage.
+// The executing core stages one own-slot trace and consolidates it into the
+// task's final trace during retirement, before the slot can execute again.
 struct SchedulerExecutorTaskTrace {
     uint64_t kernel_start_cycles;
     uint64_t kernel_end_cycles;
-    uint64_t ready_scan_start_cycles;
     uint64_t ready_observe_cycles;
-    uint64_t completion_id;
-    uint64_t completion_inbox_index;
 };
 
 // Stable device-side localization for the first scheduler failure. These values
@@ -915,34 +476,14 @@ struct SchedulerExecutorTaskTrace {
 enum class SchedulerErrorSite : uint64_t {
     UNKNOWN = 0,
     ROUTE_INVALID_STATE = 2,
-    READY_POP_INVALID_HEAD = 40,
-    READY_POP_INVALID_LINK = 41,
     DISPATCH_INVALID_SHAPE = 44,
-    DISPATCH_INVALID_CALLABLE = 45,
     DISPATCH_MATERIALIZE_FAILED = 46,
-    DISPATCH_INVALID_PREDICATE = 47,
     EXECUTOR_INVALID_DISPATCH_SLOT = 50,
-    BOOTSTRAP_WAKE_INVALID_HEAD = 60,
     COMPLETION_TASK_NOT_DONE = 61,
-    COMPLETION_WAKE_ALREADY_CLOSED = 62,
-    COMPLETION_INVALID_WAITER = 63,
-    COMPLETION_WAITER_NOT_EXECUTABLE = 64,
-    COMPLETION_READY_APPEND_FAILED = 65,
-    COMPLETION_READY_PUBLISH_FAILED = 66,
-    COMPLETION_INVALID_SHAPE = 67,
-    COMPLETION_RESOLVE_FAILED = 68,
-    COMPLETION_REFILL_CLAIM_FAILED = 69,
-    COMPLETION_REFILL_DISPATCH_FAILED = 70,
-    COMPLETION_GENERATION_MISMATCH = 74,
-    DEFERRED_RESERVATION_INVALID_OWNER = 75,
-    DEFERRED_RESERVATION_INVALID_STATE = 76,
-    DEFERRED_PUBLISH_INVALID_RESERVATION = 77,
-    NORMAL_DISPATCH_INVALID_TOPOLOGY = 78,
+    COMPLETION_SLOT_BINDING_INVALID = 74,
     EXECUTOR_PREFERRED_SLOT_INVALID = 79,
-    READY_INBOX_REFRESH_FAILED = 80,
     BOOTSTRAP_FAILED = 90,
     CONTEXT_READY_TIMEOUT = 91,
-    BOOTSTRAP_SCAN_TIMEOUT = 92,
     BOOTSTRAP_COMPLETE_TIMEOUT = 93,
     REGISTER_RELEASE_TIMEOUT = 94,
     EXECUTION_PROGRESS_TIMEOUT = 95,
@@ -950,57 +491,89 @@ enum class SchedulerErrorSite : uint64_t {
     AICPU_HANDSHAKE_TIMEOUT = 100,
     AICPU_INIT_BARRIER_TIMEOUT = 101,
     AICPU_SHUTDOWN_BARRIER_TIMEOUT = 102,
+    ADMISSION_INVALID_TOPOLOGY = 112,
+    ADMISSION_INVALID_FRONTIER = 116,
+    BLOCK_CURSOR_INVALID = 117,
+    BLOCK_COMPLETION_INVALID = 118,
+    ORDERED_CANDIDATE_INVALID = 119,
+    GROUP_INVALID_STATE = 120,
+    GROUP_INVALID_DESCRIPTOR = 121,
+    GROUP_SEQUENCE_OVERFLOW = 122,
+    GROUP_ACK_INVALID = 123,
+    GROUP_CLOSE_INVALID = 124,
+    ORDERED_EXIT_IN_FLIGHT = 125,
+    ORDERED_EXIT_TIMEOUT = 126,
+    GRAPH_BIND_NODE = 130,
+    GRAPH_BIND_INSTANCE = 132,
+    ASYNC_CONTEXT_INVALID = 140,
+    ASYNC_SEAL_FAILED = 141,
+    ASYNC_CHECK_FAILED = 142,
+    ASYNC_FINISH_FAILED = 143,
+    ARGS_DUMP_BOUNDARY_TIMEOUT = 150,
+    ARGS_DUMP_REFUSED = 151,
+    ARGS_DUMP_ABORT_TIMEOUT = 152,
+    BOOTSTRAP_CLUSTER_INIT_TIMEOUT = 153,
+    BOOTSTRAP_CLUSTER_PEER_TIMEOUT = 154,
+    BOOTSTRAP_CLUSTER_INVALID_STATE = 155,
 };
 
-struct alignas(128) SchedulerRunControl {
-    uint64_t aic_task_count;
-    uint64_t aiv_task_count;
+enum SchedulerErrorIdentityField : uint32_t {
+    SCHEDULER_ERROR_HAS_EPOCH = 1U << 0,
+    SCHEDULER_ERROR_HAS_ORDER = 1U << 1,
+    SCHEDULER_ERROR_HAS_BLOCK = 1U << 2,
+    SCHEDULER_ERROR_HAS_GROUP = 1U << 3,
+    SCHEDULER_ERROR_HAS_WORKER = 1U << 4,
+    SCHEDULER_ERROR_HAS_LANE = 1U << 5,
+};
+
+struct alignas(64) SchedulerErrorSignal {
+    volatile uint64_t status;
+};
+static_assert(sizeof(SchedulerErrorSignal) == 64);
+
+struct alignas(64) SchedulerRunControl {
     uint64_t active_worker_count;
     uint64_t expected_task_count;
     uint64_t inline_completed_count;
-    uint64_t aic_active_worker_count;
-    uint64_t aiv_active_worker_count;
     uint64_t aic_worker_demand;
-    volatile uint64_t dispatch_payloads_offset;
-    uint64_t task_metadata_offset;
-    uint64_t ready_inboxes_offset;
-    uint64_t ready_directory_offset;
     uint64_t aiv_worker_demand;
-    uint64_t gang_coordinator_offset;
-    uint64_t gang_cohorts_offset;
-    uint64_t scheduler_count;
-
-    volatile uint64_t executed_task_count;
-    volatile uint64_t resolved_task_count;
-    volatile uint64_t bootstrap_arrived_count;
-    volatile uint64_t bootstrap_complete;
-    uint64_t completion_wait_start_cycles;
-    uint64_t bootstrap_complete_cycles;
-    uint64_t all_tasks_resolved_cycles;
-    uint64_t shutdown_ready_cycles;
-    uint64_t completion_poll_count;
-    uint64_t completion_poll_cycles;
-    uint64_t error_poll_count;
-    volatile uint64_t bootstrap_scan_arrived_count;
-    volatile uint64_t bootstrap_scan_complete;
+    uint64_t graph_summary_offset;
     volatile uint64_t scheduler_timeout_cycles;
     volatile uint64_t chip_swimlane_level;
     volatile uint64_t sampled_task_timing_enabled;
+    // One owned 32-bit CntNotify for this invocation. Zero addresses select
+    // immediate per-task GM reporting; neither address changes after READY.
+    uint64_t run_completed_read_address;
+    uint64_t run_completed_add_address;
 
-    volatile uint64_t error_claimed;
-    volatile uint64_t scheduler_error;
-    volatile uint64_t error_task_id;
+    alignas(64) volatile uint64_t resolved_task_count;
+    volatile uint64_t bootstrap_arrived_count;
+    volatile uint64_t bootstrap_complete;
+
+    alignas(64) volatile uint64_t error_claimed;
+    volatile uint64_t error_task_ref;
     volatile uint64_t error_core_id;
     volatile uint64_t error_core_type;
     volatile uint64_t error_graph_task_count;
     volatile uint64_t error_storage_address;
-    volatile uint64_t error_reserved_address;
     volatile uint64_t error_task_window_last_index;
     volatile uint64_t error_site;
-    uint64_t error_reserved[6];
+    volatile uint64_t error_run_epoch;
+    volatile uint64_t error_order_key;
+    volatile uint64_t error_block_idx;
+    volatile uint64_t error_group_seq;
+    volatile uint64_t error_worker_index;
+    volatile uint32_t error_cluster_lane;
+    volatile uint32_t error_identity_fields;
+    // Only the elected error writer publishes this word. Its line has no
+    // atomic RMW or cached AICore store, including readers that add zero.
+    alignas(64) volatile uint64_t scheduler_error;
+    // The first error writer publishes each reader's line before the canonical
+    // status above. A worker polls only its own line during steady execution.
+    alignas(64) SchedulerErrorSignal worker_errors[SCHEDULER_WORKER_CAPACITY];
 };
 
-struct alignas(128) AicpuThreadLifecycleTrace {
+struct alignas(64) AicpuThreadLifecycleTrace {
     uint64_t aicpu_thread_id;
     uint64_t handshake_start_cycles;
     uint64_t handshake_complete_cycles;
@@ -1016,222 +589,162 @@ struct alignas(128) AicpuThreadLifecycleTrace {
     uint64_t exit_signal_end_cycles;
     uint64_t exit_wait_start_cycles;
     uint64_t exit_wait_end_cycles;
-    uint64_t reserved;
 };
 
-struct alignas(128) SchedulerWorkerContext {
-    volatile int32_t core_type;
+struct alignas(64) SchedulerWorkerContext {
+    // READY publishes the configuration prefix used by peer routing.
+    int32_t core_type;
     int32_t physical_core_id;
-    volatile int32_t type_rank;
-    uint32_t worker_reserved;
-    volatile uint64_t run_control_offset;
-    volatile uint64_t task_controls_offset;
-    // Base of this run's ChipTaskStorage array. One address: a task's descriptor
-    // and payload are members of one entry, so AICore strides by the storage.
-    volatile uint64_t graph_storage_address;
-    // Held so the wire layout survived the collapse from two addresses to one.
-    // Whoever wires this context up must write 0 here and reject a non-zero read,
-    // or a later field can be reintroduced over a value someone else is using.
-    volatile uint64_t graph_reserved_address;
-    volatile uint64_t scheduler_state_base_address;
-    volatile uint64_t dispatch_payload_offset;
-    volatile uint64_t trace_cells_offset;
-    volatile uint64_t task_window_last_index;
-    volatile uint64_t graph_task_count;
-    volatile uint64_t worker_index;
-    volatile uint64_t scheduler_ssbuf_reserved0;
-    volatile uint64_t scheduler_ssbuf_reserved1;
-    volatile uint64_t aicpu_lifecycle_traces_offset;
+    int32_t type_rank;
+    uint64_t run_control_offset;
+    uint64_t task_controls_offset;
+    uint64_t scheduler_state_base_address;
+    uint64_t prepared_layout_offset;
+    uint64_t worker_index;
+    uint64_t worker_contexts_offset;
 
-    alignas(128) volatile uint64_t task_metadata_offset;
-    volatile uint64_t ready_inboxes_offset;
-    volatile uint64_t ready_directory_offset;
-    volatile uint64_t activity_buffers_offset;
-    volatile uint64_t worker_contexts_offset;
-    volatile uint64_t scheduler_ssbuf_reserved2;
-    // The active callable's registration-owned kernel-entry table: an absolute
-    // device address, not a scheduler-state offset, because the table lives in
-    // that callable's registration block and outlives every run bound to it.
-    // `callable_addresses_count` is the table's own length, and the only
-    // bound available here: the scheduler state reserves no callable array.
-    volatile uint64_t callable_addresses_address;
-    volatile uint64_t runtime_worker_count;
-    volatile uint64_t bootstrap_done;
-    uint64_t bootstrap_scan_end_cycles;
-    uint64_t target_bootstrap_start_cycles;
-    uint64_t target_bootstrap_end_cycles;
-    uint64_t bootstrap_target_aic_cycles;
-    uint64_t bootstrap_target_aiv_cycles;
-    volatile uint64_t callable_addresses_count;
-    uint64_t bootstrap_timing_reserved;
+    // The complete graph view shares one line, including its storage extent.
+    uint64_t graph_storage_address;
+    uint64_t graph_task_count;
+    uint64_t task_window_last_index;
+    volatile uint64_t native_header_offset;
+    volatile uint64_t scheduler_state_bytes;
+    volatile uint64_t original_task_count;
+    uint64_t graph_summary_offset;
 
-    volatile uint64_t gang_coordinator_offset;
-    volatile uint64_t gang_cohorts_offset;
-    volatile uint64_t gang_participants_offset;
-    volatile uint64_t gang_commands_offset;
-    volatile uint64_t scheduler_count;
-    volatile uint64_t cluster_count;
-    volatile uint64_t cluster_index;
-    volatile uint64_t scheduler_index;
-    volatile uint64_t scheduler_worker_id;
-    volatile uint64_t is_scheduler;
-    volatile uint64_t cluster_worker_ids[3];
-    uint64_t topology_reserved[3];
+    uint64_t task_metadata_offset;
+    uint64_t runtime_worker_count;
 
-    alignas(128) uint64_t bootstrap_task_count;
-    uint64_t ready_enqueue_count;
-    uint64_t ready_batch_count;
-    uint64_t ready_pop_count;
-    uint64_t ready_steal_count;
-    uint64_t ready_cas_retry_count;
-    uint64_t ready_contention_giveup_count;
-    uint64_t ready_stats_reserved[3];
-    uint64_t executed_task_count;
-    uint64_t task_state_poll_count;
-    uint64_t fanin_state_load_count;
-    uint64_t wake_register_count;
-    uint64_t idle_iteration_count;
-    uint64_t backoff_cycles;
+    uint64_t cluster_count;
+    uint64_t cluster_index;
+    uint64_t cluster_worker_ids[3];
+    uint64_t aicpu_lifecycle_traces_offset;
 
-    uint64_t wake_cas_retry_count;
-    uint64_t wake_closed_retry_count;
-    uint64_t wake_migrate_count;
-    uint64_t wake_close_count;
-    uint64_t completion_enqueue_count;
-    uint64_t completion_resolve_count;
-    uint64_t trace_aicore_entry_cycles;
-    uint64_t trace_handshake_publish_cycles;
-    uint64_t trace_register_release_cycles;
-    uint64_t trace_descriptor_cache_observed_cycles;
-    uint64_t completion_stats_reserved[2];
-    uint64_t reserved_ready_to_kernel_cycles;
-    uint64_t reserved_ready_to_kernel_max_cycles;
-    uint64_t payload_cycles;
-    uint64_t kernel_cycles;
+    uint64_t trace_cells_offset;
+    uint64_t activity_buffers_offset;
+    uint64_t pmu_cells_offset;
+    uint64_t args_dump_address;
+    uint64_t done_notifications_offset;
+    uint64_t completion_counters_offset;
 
-    uint64_t completion_enqueue_cycles;
+    // Only this worker writes its bootstrap diagnostic line.
+    alignas(64) uint64_t bootstrap_task_count;
     uint64_t bootstrap_start_cycles;
-    uint64_t bootstrap_end_reserved;
-    uint64_t drain_start_cycles;
-    uint64_t drain_end_cycles;
-    uint64_t exit_wait_start_cycles;
-    uint64_t exit_observed_cycles;
-    uint64_t final_stats_publish_start_cycles;
-    uint64_t final_stats_publish_end_cycles;
-    uint64_t exit_ack_publish_cycles;
-    uint64_t bootstrap_slot_fill_aic_cycles;
-    uint64_t bootstrap_slot_fill_aiv_cycles;
-    uint64_t termination_reserved[4];
-
-    // Preserve the shared wire layout after retiring the unconsumed
-    // Scheduler-tail profiling payload.
-    uint64_t scheduler_tail_reserved[32];
+    uint64_t target_bootstrap_end_cycles;
 };
 
-struct alignas(128) SchedulerTaskTrace {
+enum SchedulerExecutionIdentityFlags : uint32_t {
+    SCHEDULER_TRACE_IDENTITY_CAPTURED = 1U << 0,
+    SCHEDULER_TRACE_EXECUTED = 1U << 1,
+    SCHEDULER_TRACE_ORDERED = 1U << 2,
+    SCHEDULER_TRACE_GROUP = 1U << 3,
+    SCHEDULER_TRACE_CLUSTER_GROUP = 1U << 4,
+};
+
+struct alignas(64) SchedulerTaskTrace {
     // Dispatch publishes this line before READY; completion publishes valid.
     volatile uint64_t valid;
-    uint64_t ready_source;
     uint64_t worker_id;
-    uint64_t task_id;
-    uint64_t state_probe_scheduler_worker_id;
+    uint64_t task_ref;
     uint64_t state_probe_start_cycles;
     uint64_t state_probe_end_cycles;
-    uint64_t publication_mode;
 
-    uint64_t kernel_start_cycles;
+    // This core owns execution timing through slot retirement.
+    alignas(64) uint64_t kernel_start_cycles;
     uint64_t kernel_end_cycles;
-    uint64_t ready_scan_start_cycles;
     uint64_t ready_observe_cycles;
-    uint64_t completion_id;
-    uint64_t completion_inbox_index;
 
-    alignas(64) uint64_t ready_transition_cycles;
-    uint64_t fanin_timing_reserved[4];
-    uint64_t aicore_entry_cycles;
-    uint64_t handshake_publish_cycles;
-    uint64_t register_release_cycles;
-
-    // The dispatching Scheduler owns this cache line through completion.
-    uint64_t dispatch_start_cycles;
+    alignas(64) uint64_t dispatch_start_cycles;
     uint64_t dispatch_end_cycles;
-    uint64_t dispatch_scheduler_worker_id;
     uint64_t dispatch_loop_iter;
     uint64_t complete_start_cycles;
     uint64_t complete_end_cycles;
-    uint64_t complete_scheduler_worker_id;
     uint64_t complete_loop_iter;
-    uint64_t refill_scheduler_worker_id;
-    uint64_t refill_start_cycles;
-    uint64_t refill_end_cycles;
-    uint64_t refill_task_id;
-    uint64_t refill_loop_iter;
-    uint64_t completion_reserved[3];
 
-    // The completion Scheduler consolidates the Executor's staged timing here.
-    uint64_t descriptor_cache_observed_cycles;
-    uint64_t executor_reserved[3];
+    alignas(64) uint64_t execution_run_epoch;
+    uint64_t execution_order_key;
+    uint64_t execution_group_seq;
+    uint32_t execution_block_idx;
+    uint32_t execution_block_num;
+    uint32_t execution_subtask_slot;
+    uint32_t execution_pending_slot;
+    uint32_t execution_identity_flags;
+    uint32_t execution_cluster_index;
+    uint32_t execution_cluster_lane;
 };
 
+/**
+ * One executed subtask's PMU snapshot, staged by the AICore that ran it.
+ *
+ * One cell per (task, subtask slot), written once by the core that executed it
+ * and read once by the AICPU after every core has
+ * retired. `published` carries the task id plus one and is written last, so a
+ * zero cell is a subtask this run never executed rather than one whose counters
+ * read zero.
+ */
+struct alignas(64) SchedulerTaskPmuCell {
+    uint64_t total_cycles;
+    uint32_t counters[PMU_COUNTER_COUNT_A5];
+    uint32_t worker_id;
+    volatile uint32_t published;
+};
+
+static_assert(sizeof(SchedulerTaskPmuCell) == 64, "one PMU cell per cache line");
+
 static_assert(sizeof(SchedulerTaskMetadata) == 16, "task metadata layout changed");
-static_assert(alignof(SchedulerTaskMetadata) == 16, "task metadata alignment changed");
-static_assert(sizeof(SchedulerTaskControl) == 128, "task control layout changed");
-static_assert(alignof(SchedulerTaskControl) == 128, "task control alignment changed");
-static_assert(offsetof(SchedulerTaskControl, next_waiter) == 64, "waiter metadata needs its own line");
-static_assert(sizeof(SchedulerReadyInbox) == 128, "ready inbox layout changed");
-static_assert(alignof(SchedulerReadyInbox) == 128, "ready inbox alignment changed");
-static_assert(sizeof(SchedulerGangCoordinator) == 256, "gang coordinator layout changed");
-static_assert(alignof(SchedulerGangCoordinator) == 128, "gang coordinator alignment changed");
+static_assert(offsetof(SchedulerTaskMetadata, active_mask) == 6);
+static_assert(std::is_trivially_copyable_v<SchedulerTaskMetadata> && std::is_standard_layout_v<SchedulerTaskMetadata>);
+static_assert(alignof(SchedulerTaskMetadata) == 8, "metadata copies require scalar-aligned call frames");
+static_assert(offsetof(SchedulerTaskMetadata, timing_slot) == 12, "timing tag offset changed");
+static_assert(offsetof(SchedulerTaskMetadata, logical_block_num) == 14, "block count must occupy the metadata tail");
+// Allocation alignment follows the shared GM types, not DCache maintenance.
+inline constexpr uint64_t SCHEDULER_STATE_BASE_ALIGNMENT = alignof(SchedulerTaskControl);
+
+static_assert(sizeof(SchedulerTaskControl) == 896, "task control layout changed");
+static_assert(alignof(SchedulerTaskControl) == SCHEDULER_GM_ATOMIC_SECTOR_BYTES, "task control alignment changed");
+static_assert(offsetof(SchedulerTaskControl, next_block) == 0, "block cursor requires an isolated atomic line");
 static_assert(
-    offsetof(SchedulerGangCoordinator, active_dispatch_cohort) == 64,
-    "owner-only gang state must not share the priority line"
+    offsetof(SchedulerTaskControl, completion_state) == 128, "completion counter requires an isolated atomic line"
 );
-static_assert(sizeof(SchedulerGangCohort) == 128, "gang cohort layout changed");
-static_assert(alignof(SchedulerGangCohort) == 128, "gang cohort alignment changed");
-static_assert(sizeof(SchedulerGangParticipant) == 128, "gang participant layout changed");
-static_assert(alignof(SchedulerGangParticipant) == 128, "gang participant alignment changed");
-static_assert(sizeof(SchedulerGangCommand) == 128, "gang command layout changed");
-static_assert(alignof(SchedulerGangCommand) == 128, "gang command alignment changed");
-static_assert(sizeof(SchedulerReadyDirectoryShard) == 64, "ready directory shard must occupy one cache line");
-static_assert(alignof(SchedulerReadyDirectoryShard) == 64, "ready directory shard alignment changed");
-static_assert(SCHEDULER_CAPACITY <= SCHEDULER_WORKER_CAPACITY, "scheduler capacity exceeds worker storage");
-static_assert(
-    SCHEDULER_READY_DIRECTORY_SHARD_COUNT * SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD >= SCHEDULER_CAPACITY,
-    "ready directory does not cover every scheduler"
-);
-static_assert(
-    offsetof(SchedulerReadyDirectory, bootstrap_ready_types) ==
-        SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_READY_DIRECTORY_SHARD_COUNT * 64,
-    "bootstrap flags must follow the ready directory shards"
-);
-static_assert(
-    offsetof(SchedulerReadyDirectory, bootstrap_ready_types) % 64 == 0,
-    "bootstrap flags must begin on a cache-line boundary"
-);
-static_assert(
-    sizeof(SchedulerReadyDirectory) == ((offsetof(SchedulerReadyDirectory, bootstrap_ready_types) +
-                                         SCHEDULER_WORKER_CAPACITY * sizeof(uint64_t) + 127) /
-                                        128 * 128),
-    "ready directory layout changed"
-);
-static_assert(sizeof(SchedulerExecutorTaskTrace) == 48, "executor trace payload layout changed");
+static_assert(offsetof(SchedulerTaskControl, claim_seal) == 256, "claim seal requires an isolated signal region");
+static_assert(offsetof(SchedulerTaskControl, claim_sectors) == 384, "claim sectors must remain isolated");
+static_assert(sizeof(SchedulerGraphSummary) == 128, "graph summary layout changed");
+static_assert(offsetof(SchedulerGraphSummary, async_layout_offset) == 72);
+static_assert(offsetof(SchedulerGraphSummary, prepared_layout_offset) == 80);
+static_assert(offsetof(SchedulerGraphSummary, bootstrap_clusters_offset) == 88);
+static_assert(alignof(SchedulerGraphSummary) == 64, "graph summary alignment changed");
+static_assert(sizeof(SchedulerExecutorTaskTrace) == 24, "executor trace payload layout changed");
 static_assert(alignof(SchedulerExecutorTaskTrace) == alignof(uint64_t), "executor trace must have natural alignment");
-static_assert(offsetof(SchedulerExecutorTaskTrace, completion_inbox_index) == 40, "executor trace layout changed");
-static_assert(sizeof(SchedulerRunControl) == 384, "run control layout changed");
-static_assert(alignof(SchedulerRunControl) == 128, "run control alignment changed");
-static_assert(offsetof(SchedulerRunControl, executed_task_count) == 128, "lifecycle atomics need their own line");
-static_assert(offsetof(SchedulerRunControl, error_claimed) == 256, "error state needs its own line");
-static_assert(offsetof(SchedulerRunControl, error_site) == 328, "error site ABI changed");
+static_assert(offsetof(SchedulerExecutorTaskTrace, ready_observe_cycles) == 16, "executor trace layout changed");
+static_assert(sizeof(SchedulerRunControl) == 384 + SCHEDULER_WORKER_CAPACITY * 64, "run control layout changed");
+static_assert(alignof(SchedulerRunControl) == 64, "run control alignment changed");
+static_assert(offsetof(SchedulerRunControl, resolved_task_count) == 128, "lifecycle atomics need their own line");
+static_assert(offsetof(SchedulerRunControl, error_claimed) == 192, "error state needs its own line");
+static_assert(offsetof(SchedulerRunControl, error_site) == 248, "error site ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_run_epoch) == 256, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_order_key) == 264, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_block_idx) == 272, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_group_seq) == 280, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_worker_index) == 288, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_cluster_lane) == 296, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_identity_fields) == 300, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, scheduler_error) == 320, "error publication needs its own line");
+static_assert(offsetof(SchedulerRunControl, worker_errors) == 384, "worker error signals need disjoint lines");
 static_assert(sizeof(AicpuThreadLifecycleTrace) == 128, "AICPU lifecycle trace layout changed");
-static_assert(sizeof(SchedulerWorkerContext) == 1024, "worker context layout changed");
-static_assert(alignof(SchedulerWorkerContext) == 128, "worker context alignment changed");
-static_assert(offsetof(SchedulerWorkerContext, task_metadata_offset) == 128, "runtime offsets changed");
-static_assert(offsetof(SchedulerWorkerContext, gang_coordinator_offset) == 256, "topology offsets changed");
-static_assert(offsetof(SchedulerWorkerContext, bootstrap_task_count) == 384, "worker stats offset changed");
-static_assert(offsetof(SchedulerWorkerContext, wake_cas_retry_count) == 512, "wake stats offset changed");
-static_assert(offsetof(SchedulerWorkerContext, completion_enqueue_cycles) == 640, "termination stats offset changed");
-static_assert(offsetof(SchedulerWorkerContext, scheduler_tail_reserved) == 768, "worker reserved tail offset changed");
-static_assert(sizeof(SchedulerTaskTrace) == 384, "task trace layout changed");
+static_assert(sizeof(SchedulerWorkerContext) == 320, "worker context layout changed");
+static_assert(alignof(SchedulerWorkerContext) == 64, "worker context alignment changed");
+static_assert(offsetof(SchedulerWorkerContext, worker_contexts_offset) == 56, "peer routing must share the first line");
+static_assert(offsetof(SchedulerWorkerContext, graph_storage_address) == 64, "graph view must share one line");
+static_assert(offsetof(SchedulerWorkerContext, graph_summary_offset) == 112, "graph view exceeds its line");
+static_assert(offsetof(SchedulerWorkerContext, task_metadata_offset) == 120, "dispatch configuration line changed");
+static_assert(offsetof(SchedulerWorkerContext, cluster_count) == 136, "topology configuration offset changed");
+static_assert(offsetof(SchedulerWorkerContext, trace_cells_offset) == 184, "diagnostic offsets changed");
+static_assert(offsetof(SchedulerWorkerContext, args_dump_address) == 208, "argument capture address changed");
+static_assert(offsetof(SchedulerWorkerContext, prepared_layout_offset) == 40, "prepared execution address changed");
+static_assert(offsetof(SchedulerWorkerContext, bootstrap_task_count) == 256, "worker diagnostics need an owned line");
+static_assert(sizeof(SchedulerTaskTrace) == 256, "task trace layout changed");
+static_assert(offsetof(SchedulerTaskTrace, execution_run_epoch) == 192, "execution identity offset changed");
+static_assert(offsetof(SchedulerTaskTrace, execution_cluster_lane) == 240, "execution identity exceeds trace tail");
 static_assert(
     offsetof(SchedulerTaskTrace, dispatch_start_cycles) % 64 == 0,
     "Scheduler-owned dispatch and completion fields must begin on a cache-line boundary"
@@ -1240,26 +753,10 @@ static_assert(
     offsetof(SchedulerTaskTrace, complete_loop_iter) / 64 == offsetof(SchedulerTaskTrace, dispatch_start_cycles) / 64,
     "dispatch and completion fields must share their Scheduler-owned cache line"
 );
-static_assert(
-    offsetof(SchedulerTaskTrace, refill_scheduler_worker_id) % 64 == 0,
-    "Scheduler-owned refill fields must begin on a cache-line boundary"
-);
-static_assert(
-    offsetof(SchedulerTaskTrace, descriptor_cache_observed_cycles) % 64 == 0,
-    "consolidated descriptor timing must begin on a cache-line boundary"
-);
 
 template <typename T>
 inline __aicore__ __gm__ T *scheduler_state_at(__gm__ void *base, uint64_t offset) {
     return reinterpret_cast<__gm__ T *>(reinterpret_cast<__gm__ uint8_t *>(base) + offset);
-}
-
-// Worker i's context, from the base worker 0 sits at — the address the host
-// publishes in DeviceRuntimeLaunchDesc::scheduler_bootstrap. The AICore derives
-// its own pre-READY context with this and the AICPU republishes the same address
-// onto each handshake at hand-off, so the stride has one definition.
-inline __aicore__ uint64_t scheduler_worker_context_address(uint64_t worker_context_base, int32_t worker_index) {
-    return worker_context_base + static_cast<uint64_t>(worker_index) * sizeof(SchedulerWorkerContext);
 }
 
 #if !defined(__CCE_AICORE__)
@@ -1271,18 +768,10 @@ static_assert(
 );
 static_assert(std::is_standard_layout_v<SchedulerTaskMetadata> && std::is_trivially_copyable_v<SchedulerTaskMetadata>);
 static_assert(std::is_standard_layout_v<SchedulerTaskControl> && std::is_trivially_copyable_v<SchedulerTaskControl>);
-static_assert(std::is_standard_layout_v<SchedulerReadyInbox> && std::is_trivially_copyable_v<SchedulerReadyInbox>);
 static_assert(
-    std::is_standard_layout_v<SchedulerGangCoordinator> && std::is_trivially_copyable_v<SchedulerGangCoordinator>
+    std::is_standard_layout_v<SchedulerSpmdRequirements> && std::is_trivially_copyable_v<SchedulerSpmdRequirements>
 );
-static_assert(std::is_standard_layout_v<SchedulerGangCohort> && std::is_trivially_copyable_v<SchedulerGangCohort>);
-static_assert(
-    std::is_standard_layout_v<SchedulerGangParticipant> && std::is_trivially_copyable_v<SchedulerGangParticipant>
-);
-static_assert(std::is_standard_layout_v<SchedulerGangCommand> && std::is_trivially_copyable_v<SchedulerGangCommand>);
-static_assert(
-    std::is_standard_layout_v<SchedulerReadyDirectory> && std::is_trivially_copyable_v<SchedulerReadyDirectory>
-);
+static_assert(std::is_standard_layout_v<SchedulerGraphSummary> && std::is_trivially_copyable_v<SchedulerGraphSummary>);
 static_assert(std::is_standard_layout_v<SchedulerRunControl> && std::is_trivially_copyable_v<SchedulerRunControl>);
 static_assert(
     std::is_standard_layout_v<AicpuThreadLifecycleTrace> && std::is_trivially_copyable_v<AicpuThreadLifecycleTrace>
@@ -1323,15 +812,94 @@ inline bool scheduler_layout_reserve(uint64_t *cursor, uint64_t size, uint64_t a
     return true;
 }
 
+inline bool scheduler_spmd_requirements_valid(const SchedulerSpmdRequirements &spmd, uint64_t task_count) {
+    if (spmd.cooperative_task_count > task_count || spmd.cooperative_task_count > INT32_MAX ||
+        spmd.mix_task_count > task_count || spmd.sync_mix_task_count > spmd.cooperative_task_count ||
+        spmd.sync_mix_task_count > spmd.mix_task_count ||
+        spmd.mix_task_count - spmd.sync_mix_task_count > task_count - spmd.cooperative_task_count)
+        return false;
+    if (spmd.worker_count == 0)
+        return spmd.cluster_count == 0 && spmd.cooperative_task_count == 0 && spmd.mix_task_count == 0;
+    return spmd.worker_count <= SCHEDULER_WORKER_CAPACITY && spmd.worker_count % PLATFORM_CORES_PER_BLOCKDIM == 0 &&
+           spmd.cluster_count == spmd.worker_count / PLATFORM_CORES_PER_BLOCKDIM;
+}
+
+inline bool scheduler_plan_protocol_storage(uint64_t *cursor, AicoreSchedulerLayout *layout, uint64_t trace_count) {
+    if (cursor == nullptr || layout == nullptr) return false;
+    if (layout->spmd.worker_count == 0) return false;
+    auto &protocol = layout->protocol;
+    protocol.magic = SCHEDULER_PROTOCOL_MAGIC;
+    protocol.task_count = layout->task_count;
+    protocol.worker_count = layout->spmd.worker_count;
+    protocol.trace_count = trace_count;
+    const auto &spmd = layout->spmd;
+    protocol.cooperative_task_count = spmd.cooperative_task_count + (spmd.mix_task_count - spmd.sync_mix_task_count);
+    if (!scheduler_layout_checked_mul(protocol.cooperative_task_count, protocol.worker_count, &protocol.member_count))
+        return false;
+    if (spmd.mix_task_count != 0 &&
+        !scheduler_layout_checked_mul(spmd.mix_task_count + 1, spmd.cluster_count, &protocol.floor_count))
+        return false;
+    uint64_t bytes = 0;
+#define SCHEDULER_PROTOCOL_RESERVE(count, type, field)              \
+    (scheduler_layout_checked_mul((count), sizeof(type), &bytes) && \
+     scheduler_layout_reserve(cursor, bytes, alignof(type), &(field)))
+    const bool valid =
+        SCHEDULER_PROTOCOL_RESERVE(1, SchedulerProtocolLayout, layout->protocol_layout_offset) &&
+        SCHEDULER_PROTOCOL_RESERVE(protocol.task_count, SchedulerProtocolTaskTrace, protocol.tasks_offset) &&
+        SCHEDULER_PROTOCOL_RESERVE(protocol.member_count, SchedulerProtocolMemberTrace, protocol.members_offset) &&
+        SCHEDULER_PROTOCOL_RESERVE(protocol.floor_count, SchedulerProtocolFloorTrace, protocol.floors_offset) &&
+        SCHEDULER_PROTOCOL_RESERVE(protocol.trace_count, SchedulerProtocolBlockTrace, protocol.blocks_offset) &&
+        SCHEDULER_PROTOCOL_RESERVE(protocol.trace_count, SchedulerProtocolExecutionTrace, protocol.executions_offset) &&
+        SCHEDULER_PROTOCOL_RESERVE(
+            protocol.trace_count, SchedulerProtocolConditionContribution, protocol.condition_contributions_offset
+        ) &&
+        SCHEDULER_PROTOCOL_RESERVE(
+            protocol.task_count, SchedulerProtocolCounterObservation, protocol.counter_observations_offset
+        ) &&
+        SCHEDULER_PROTOCOL_RESERVE(protocol.worker_count, SchedulerProtocolWorkerTrace, protocol.workers_offset);
+#undef SCHEDULER_PROTOCOL_RESERVE
+    if (valid) protocol.storage_end_offset = *cursor;
+    return valid;
+}
+
+inline bool scheduler_plan_prepared_storage(uint64_t *cursor, AicoreSchedulerLayout *layout, uint64_t execution_count) {
+    if (cursor == nullptr || layout == nullptr) return false;
+    if (execution_count == 0) return true;
+    auto &prepared = layout->prepared;
+    prepared.task_count = layout->task_count;
+    prepared.execution_count = execution_count;
+    prepared.task_controls_offset = layout->task_controls_offset;
+    uint64_t bytes = 0;
+#define SCHEDULER_PREPARED_RESERVE(count, type, field)              \
+    (scheduler_layout_checked_mul((count), sizeof(type), &bytes) && \
+     scheduler_layout_reserve(cursor, bytes, alignof(type), &(field)))
+    const bool valid =
+        SCHEDULER_PREPARED_RESERVE(1, SchedulerPreparedLayout, layout->prepared_layout_offset) &&
+        SCHEDULER_PREPARED_RESERVE(layout->task_count, SchedulerExecutionPlan, prepared.plans_offset) &&
+        SCHEDULER_PREPARED_RESERVE(execution_count, SchedulerPreparedControl, prepared.controls_offset) &&
+        SCHEDULER_PREPARED_RESERVE(execution_count, SchedulerExecutionBinding, prepared.bindings_offset) &&
+        SCHEDULER_PREPARED_RESERVE(execution_count, SchedulerPreparedCall, prepared.calls_offset);
+#undef SCHEDULER_PREPARED_RESERVE
+    return valid;
+}
+
 inline bool scheduler_plan_layout(
-    uint64_t task_count, uint64_t aic_task_count, uint64_t aiv_task_count, AicoreSchedulerLayout *layout,
-    bool enable_activity_profiling = false, uint64_t trace_count = 0
+    uint64_t task_count, AicoreSchedulerLayout *layout, bool enable_activity_profiling = false,
+    uint64_t trace_count = 0, const SchedulerSpmdRequirements &spmd = {}, bool enable_protocol_profiling = false,
+    bool enable_pmu = false, uint64_t native_readonly_end_offset = 0
 ) {
-    if (layout == nullptr || aic_task_count > task_count || aiv_task_count > task_count) return false;
+    // Expanded node references and scan cursors fit the validated task-count bound.
+    if (layout == nullptr || task_count > static_cast<uint64_t>(INT32_MAX) ||
+        !scheduler_spmd_requirements_valid(spmd, task_count))
+        return false;
+    if (native_readonly_end_offset != 0 &&
+        (native_readonly_end_offset < sizeof(SchedulerRunControl) ||
+         native_readonly_end_offset % SCHEDULER_STATE_ALIGNMENT != 0 || spmd.worker_count == 0))
+        return false;
     AicoreSchedulerLayout next{};
     next.task_count = task_count;
-    next.aic_task_count = aic_task_count;
-    next.aiv_task_count = aiv_task_count;
+    next.spmd = spmd;
+    next.native_readonly_end_offset = native_readonly_end_offset;
     uint64_t cursor = 0;
     uint64_t bytes = 0;
 #define SCHEDULER_RESERVE_ARRAY(count, type, field)                 \
@@ -1339,33 +907,32 @@ inline bool scheduler_plan_layout(
      scheduler_layout_reserve(&cursor, bytes, alignof(type), &next.field))
     if (!scheduler_layout_reserve(
             &cursor, sizeof(SchedulerRunControl), alignof(SchedulerRunControl), &next.run_control_offset
-        ) ||
-        !SCHEDULER_RESERVE_ARRAY(
+        ))
+        return false;
+    if (native_readonly_end_offset != 0) {
+        cursor = native_readonly_end_offset;
+    }
+    if (!SCHEDULER_RESERVE_ARRAY(
             PLATFORM_MAX_AICPU_THREADS, AicpuThreadLifecycleTrace, aicpu_lifecycle_traces_offset
         ) ||
         !SCHEDULER_RESERVE_ARRAY(SCHEDULER_WORKER_CAPACITY, SchedulerWorkerContext, worker_contexts_offset) ||
-        !SCHEDULER_RESERVE_ARRAY(
-            SCHEDULER_WORKER_CAPACITY * SCHEDULER_PENDING_SLOT_COUNT, DispatchPayload, dispatch_payloads_offset
-        ) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskMetadata, task_metadata_offset) ||
+        !SCHEDULER_RESERVE_ARRAY(task_count, uint64_t, done_notifications_offset) ||
+        !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskCompletionCounter, completion_counters_offset) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskControl, task_controls_offset) ||
-        !SCHEDULER_RESERVE_ARRAY(
-            SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_WORKER_CAPACITY, SchedulerReadyInbox, ready_inboxes_offset
-        ) ||
         !scheduler_layout_reserve(
-            &cursor, sizeof(SchedulerReadyDirectory), alignof(SchedulerReadyDirectory), &next.ready_directory_offset
+            &cursor, sizeof(SchedulerGraphSummary), alignof(SchedulerGraphSummary), &next.graph_summary_offset
         ) ||
-        !scheduler_layout_reserve(
-            &cursor, sizeof(SchedulerGangCoordinator), alignof(SchedulerGangCoordinator), &next.gang_coordinator_offset
-        ) ||
-        !SCHEDULER_RESERVE_ARRAY(SCHEDULER_GANG_COHORT_COUNT, SchedulerGangCohort, gang_cohorts_offset) ||
-        !SCHEDULER_RESERVE_ARRAY(
-            SCHEDULER_GANG_COHORT_COUNT * SCHEDULER_CLUSTER_CAPACITY, SchedulerGangParticipant, gang_participants_offset
-        ) ||
-        !SCHEDULER_RESERVE_ARRAY(SCHEDULER_CLUSTER_CAPACITY, SchedulerGangCommand, gang_commands_offset) ||
+        !SCHEDULER_RESERVE_ARRAY(spmd.cluster_count, SchedulerBootstrapCluster, bootstrap_clusters_offset) ||
         !SCHEDULER_RESERVE_ARRAY(trace_count == 0 ? task_count : trace_count, SchedulerTaskTrace, trace_cells_offset) ||
+        (enable_pmu && !SCHEDULER_RESERVE_ARRAY(
+                           trace_count == 0 ? task_count : trace_count, SchedulerTaskPmuCell, pmu_cells_offset
+                       )) ||
         (enable_activity_profiling &&
-         !SCHEDULER_RESERVE_ARRAY(SCHEDULER_CLUSTER_CAPACITY, SchedulerActivityBuffer, activity_buffers_offset)) ||
+         !SCHEDULER_RESERVE_ARRAY(SCHEDULER_WORKER_CAPACITY, SchedulerActivityBuffer, activity_buffers_offset)) ||
+        !scheduler_plan_prepared_storage(&cursor, &next, trace_count) ||
+        (enable_protocol_profiling &&
+         !scheduler_plan_protocol_storage(&cursor, &next, trace_count == 0 ? task_count : trace_count)) ||
         !scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) {
 #undef SCHEDULER_RESERVE_ARRAY
         return false;
@@ -1375,41 +942,182 @@ inline bool scheduler_plan_layout(
     return true;
 }
 
-inline bool scheduler_init_data_from_layout(void *base, const AicoreSchedulerLayout &layout) {
-    if (base == nullptr || (reinterpret_cast<uintptr_t>(base) & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0) return false;
-    __builtin_memset(base, 0, static_cast<size_t>(layout.total_size));
+// Record payload is a write-only device tail. Only its metadata belongs to the
+// initialized/uploaded prefix, including when async storage precedes this tail.
+inline bool scheduler_plan_scalar_storage(AicoreSchedulerLayout *layout) {
+    if (layout == nullptr) return false;
+    if (layout->activity_buffers_offset == 0) return true;
+    return scheduler_layout_reserve(
+        &layout->total_size,
+        uint64_t{SCHEDULER_WORKER_CAPACITY} * SCHEDULER_SCALAR_RECORD_CAPACITY * sizeof(SchedulerScalarRecord),
+        SCHEDULER_STATE_ALIGNMENT, &layout->scalar_records_offset
+    );
+}
+
+inline bool scheduler_init_data_from_layout(
+    void *base, const AicoreSchedulerLayout &layout, uint64_t device_base_address, uint64_t initialized_bytes = 0
+) {
+    const uint64_t prefix_end = layout.scalar_records_offset == 0 ? layout.total_size : layout.scalar_records_offset;
+    if (initialized_bytes == 0) initialized_bytes = prefix_end;
+    if (base == nullptr || (reinterpret_cast<uintptr_t>(base) & (SCHEDULER_STATE_BASE_ALIGNMENT - 1)) != 0 ||
+        device_base_address == 0 || (device_base_address & (SCHEDULER_STATE_BASE_ALIGNMENT - 1)) != 0 ||
+        layout.total_size > UINT64_MAX - device_base_address || initialized_bytes > prefix_end ||
+        (layout.async_layout_offset == 0 ? initialized_bytes != prefix_end :
+                                           initialized_bytes < layout.async_layout_offset))
+        return false;
+    if (layout.prepared_layout_offset != 0 &&
+        ((reinterpret_cast<uintptr_t>(base) | device_base_address) & (SCHEDULER_PREPARED_ALIGNMENT - 1)) != 0)
+        return false;
+    __builtin_memset(base, 0, static_cast<size_t>(initialized_bytes));
+    if (layout.scalar_records_offset != 0) {
+        auto *buffers = scheduler_state_at<SchedulerActivityBuffer>(base, layout.activity_buffers_offset);
+        for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
+            buffers[worker].scalar_records_offset =
+                layout.scalar_records_offset +
+                worker * SCHEDULER_SCALAR_RECORD_CAPACITY * sizeof(SchedulerScalarRecord);
+        }
+    }
+    if (layout.protocol_layout_offset != 0) {
+        *scheduler_state_at<SchedulerProtocolLayout>(base, layout.protocol_layout_offset) = layout.protocol;
+        auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(base, layout.protocol.workers_offset);
+        for (uint64_t worker = 0; worker < layout.protocol.worker_count; ++worker)
+            workers[worker].worker_index = worker;
+    }
+    auto *run = scheduler_state_at<SchedulerRunControl>(base, layout.run_control_offset);
+    run->error_run_epoch = UINT64_MAX;
+    run->error_order_key = UINT64_MAX;
+    run->error_block_idx = UINT64_MAX;
+    run->error_group_seq = UINT64_MAX;
+    run->error_worker_index = UINT64_MAX;
+    run->error_cluster_lane = UINT32_MAX;
     auto *controls = scheduler_state_at<SchedulerTaskControl>(base, layout.task_controls_offset);
     for (uint64_t i = 0; i < layout.task_count; ++i) {
-        controls[i].state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
-        controls[i].wake_list_head = SCHEDULER_WAKE_LIST_OPEN;
-        controls[i].next_waiter = SCHEDULER_TASK_ID_INVALID;
-        controls[i].waiting_producer = static_cast<int32_t>(SCHEDULER_TASK_ID_INVALID);
+        controls[i].completion_state = scheduler_completion_initial_state(1);
     }
-    auto *ready = scheduler_state_at<SchedulerReadyInbox>(base, layout.ready_inboxes_offset);
-    for (uint64_t i = 0; i < SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_WORKER_CAPACITY; ++i)
-        ready[i].head = SCHEDULER_INBOX_EMPTY;
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(base, layout.worker_contexts_offset);
     for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
         contexts[worker].physical_core_id = -1;
         contexts[worker].cluster_index = UINT64_MAX;
-        contexts[worker].scheduler_index = UINT64_MAX;
-        contexts[worker].scheduler_worker_id = UINT64_MAX;
         contexts[worker].activity_buffers_offset = layout.activity_buffers_offset;
+        contexts[worker].prepared_layout_offset = layout.prepared_layout_offset;
         contexts[worker].cluster_worker_ids[0] = UINT64_MAX;
         contexts[worker].cluster_worker_ids[1] = UINT64_MAX;
         contexts[worker].cluster_worker_ids[2] = UINT64_MAX;
     }
-    auto *coordinator = scheduler_state_at<SchedulerGangCoordinator>(base, layout.gang_coordinator_offset);
-    coordinator->active_dispatch_cohort = UINT64_MAX;
-    coordinator->cohort_count = SCHEDULER_GANG_COHORT_COUNT;
-    auto *cohorts = scheduler_state_at<SchedulerGangCohort>(base, layout.gang_cohorts_offset);
-    for (uint32_t i = 0; i < SCHEDULER_GANG_COHORT_COUNT; ++i) {
-        cohorts[i].state = static_cast<uint64_t>(SchedulerGangCohortState::FREE);
-        cohorts[i].task_id = SCHEDULER_TASK_ID_INVALID;
+    auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, layout.graph_summary_offset);
+    summary->mix_task_count = layout.spmd.mix_task_count;
+    summary->sync_mix_task_count = layout.spmd.sync_mix_task_count;
+    summary->cooperative_task_count = layout.spmd.cooperative_task_count;
+    summary->worker_count = layout.spmd.worker_count;
+    summary->cluster_count = layout.spmd.cluster_count;
+    summary->bootstrap_clusters_offset = layout.bootstrap_clusters_offset;
+    auto *bootstrap = scheduler_state_at<SchedulerBootstrapCluster>(base, layout.bootstrap_clusters_offset);
+    for (uint64_t cluster = 0; cluster < layout.spmd.cluster_count; ++cluster)
+        bootstrap[cluster].state = layout.spmd.mix_task_count == 0 ? SCHEDULER_BOOTSTRAP_CLUSTER_INIT : 0;
+    summary->protocol_layout_offset = layout.protocol_layout_offset;
+    summary->async_layout_offset = layout.async_layout_offset;
+    summary->prepared_layout_offset = layout.prepared_layout_offset;
+    if (layout.prepared_layout_offset != 0)
+        *scheduler_state_at<SchedulerPreparedLayout>(base, layout.prepared_layout_offset) = layout.prepared;
+    return true;
+}
+
+inline bool
+scheduler_init_prepared_execution_records(void *base, const AicoreSchedulerLayout &layout, uint64_t run_epoch) {
+    const auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(base, layout.task_metadata_offset);
+    auto *plans = layout.prepared_layout_offset == 0 ?
+                      nullptr :
+                      scheduler_state_at<SchedulerExecutionPlan>(base, layout.prepared.plans_offset);
+    auto *bindings = layout.prepared_layout_offset == 0 ?
+                         nullptr :
+                         scheduler_state_at<SchedulerExecutionBinding>(base, layout.prepared.bindings_offset);
+    uint64_t next_execution = 0;
+    for (uint64_t task = 0; task < layout.task_count; ++task) {
+        if (plans != nullptr) plans[task].execution_begin = next_execution;
+        const auto &meta = metadata[task];
+        if (!scheduler_task_is_executable(meta.flags) || scheduler_task_is_inline(meta.flags)) continue;
+        const uint32_t lanes = static_cast<uint32_t>(meta.active_mask.count());
+        uint32_t count = 0;
+        uint64_t end = 0;
+        if (plans == nullptr || !scheduler_subtask_count_checked(meta.logical_block_num, lanes, &count) ||
+            !scheduler_layout_checked_add(next_execution, count, &end) || end > layout.prepared.execution_count)
+            return false;
+        plans[task] = {
+            next_execution, count, meta.logical_block_num, meta.active_mask.raw(), static_cast<uint8_t>(lanes)
+        };
+        for (uint32_t block = 0; block < meta.logical_block_num; ++block) {
+            for (uint32_t lane = 0; lane < SUBTASK_SLOT_COUNT; ++lane) {
+                if (!meta.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
+                auto &binding = bindings[next_execution++];
+                binding.local_context.block_idx = block;
+                binding.local_context.block_num = meta.logical_block_num;
+            }
+        }
     }
-    auto *participants = scheduler_state_at<SchedulerGangParticipant>(base, layout.gang_participants_offset);
-    for (uint32_t i = 0; i < SCHEDULER_GANG_COHORT_COUNT * SCHEDULER_CLUSTER_CAPACITY; ++i)
-        participants[i].task_id = SCHEDULER_TASK_ID_INVALID;
+    if (next_execution != layout.prepared.execution_count) return false;
+    if (layout.prepared_layout_offset != 0)
+        scheduler_state_at<SchedulerPreparedLayout>(base, layout.prepared_layout_offset)->run_epoch = run_epoch;
+    return true;
+}
+
+inline bool scheduler_init_spmd_task_records(void *base, const AicoreSchedulerLayout &layout, uint64_t run_epoch) {
+    if (base == nullptr || (reinterpret_cast<uintptr_t>(base) & (SCHEDULER_STATE_BASE_ALIGNMENT - 1)) != 0 ||
+        !scheduler_spmd_requirements_valid(layout.spmd, layout.task_count))
+        return false;
+    auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(base, layout.task_metadata_offset);
+    auto *controls = scheduler_state_at<SchedulerTaskControl>(base, layout.task_controls_offset);
+    uint64_t cooperative_count = 0;
+    uint64_t mix_count = 0;
+    uint64_t sync_mix_count = 0;
+    for (uint64_t task = 0; task < layout.task_count; ++task) {
+        const auto &meta = metadata[task];
+        if (!scheduler_task_is_executable(meta.flags) || scheduler_task_is_inline(meta.flags)) continue;
+        const uint32_t active_subtasks = static_cast<uint32_t>(meta.active_mask.count());
+        uint32_t expected_subtasks = 0;
+        if (!meta.active_mask.is_valid() ||
+            !scheduler_subtask_count_checked(meta.logical_block_num, active_subtasks, &expected_subtasks) ||
+            scheduler_task_is_mix(meta.flags) != (active_subtasks > 1) ||
+            scheduler_task_is_spmd(meta.flags) != (meta.logical_block_num > 1) ||
+            (scheduler_task_requires_sync_start(meta.flags) && meta.logical_block_num == 1) ||
+            (scheduler_task_has_predicate(meta.flags) && (meta.logical_block_num != 1 || active_subtasks != 1)) ||
+            meta.timing_slot < -1 || meta.timing_slot >= SCHEDULER_TASK_TIMING_SLOT_COUNT)
+            return false;
+        if (scheduler_task_requires_admission(meta)) {
+            const uint64_t positions = scheduler_block_claim_positions(meta.active_mask, layout.spmd.cluster_count);
+            if ((meta.flags & UINT8_C(128)) != 0 || scheduler_task_has_predicate(meta.flags) || positions == 0 ||
+                meta.logical_block_num > positions || controls[task].next_block != 0 ||
+                controls[task].claim_seal != 0 ||
+                controls[task].completion_state != scheduler_completion_initial_state(1))
+                return false;
+            ++cooperative_count;
+        }
+        if (scheduler_task_is_mix(meta.flags)) {
+            ++mix_count;
+            if (scheduler_task_requires_sync_start(meta.flags)) ++sync_mix_count;
+        }
+    }
+    if (cooperative_count != layout.spmd.cooperative_task_count || mix_count != layout.spmd.mix_task_count ||
+        sync_mix_count != layout.spmd.sync_mix_task_count)
+        return false;
+    if (!scheduler_init_prepared_execution_records(base, layout, run_epoch)) return false;
+
+    auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, layout.graph_summary_offset);
+    summary->run_epoch = run_epoch;
+    if (layout.protocol_layout_offset != 0) {
+        auto *protocol = scheduler_state_at<SchedulerProtocolLayout>(base, layout.protocol_layout_offset);
+        protocol->run_epoch = run_epoch;
+        auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(base, protocol->workers_offset);
+        for (uint64_t worker = 0; worker < protocol->worker_count; ++worker)
+            workers[worker].run_epoch = run_epoch;
+    }
+    for (uint64_t task = 0; task < layout.task_count; ++task) {
+        const auto &meta = metadata[task];
+        const uint32_t contributions =
+            scheduler_task_is_executable(meta.flags) && !scheduler_task_is_inline(meta.flags) ?
+                meta.logical_block_num * meta.active_mask.count() :
+                1;
+        controls[task].completion_state = scheduler_completion_initial_state(contributions);
+    }
     return true;
 }
 #endif

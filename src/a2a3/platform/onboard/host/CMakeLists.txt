@@ -34,20 +34,14 @@ else()
     message(FATAL_ERROR "MUST set CUSTOM_INCLUDE_DIRS to build Host runtime")
 endif()
 
-# SIMPLER_ENABLE_PTO_SDMA_WORKSPACE: marker for an outstanding architectural
-# issue. The SDMA workspace init in comm_hccl.cpp pulls in pto-isa
-# headers and CANN-9.0-only aclnn symbols (aclnnShmemSdmaStarsQuery*),
-# even though it is logically orthogonal to HCCL comm bootstrap and only
-# needed by the sdma_async_completion_demo. Until that coupling is
-# refactored away, the macro is forced ON: PTO_ISA_ROOT and CANN 9.0+ are
-# hard build/runtime preconditions for a2a3 onboard.
-set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ON)
+# The SDMA provider is compiled into every a2a3 onboard host runtime.
+# Its workspace manager requires PTO-ISA headers and CANN 9.0+ aclnn symbols.
 # Pin-resolved checkout path is passed by RuntimeBuilder as -DPTO_ISA_ROOT=
 # (#1403). Do not read $ENV{PTO_ISA_ROOT} — ambient exports are not the pin.
 if(NOT PTO_ISA_ROOT)
     message(FATAL_ERROR
         "a2a3 onboard host_runtime requires -DPTO_ISA_ROOT=<pin-resolved path> "
-        "(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE is forced ON; needs pto-isa headers + CANN 9.0+)")
+        "(needs pto-isa headers + CANN 9.0+)")
 endif()
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${PTO_ISA_ROOT}/include")
 
@@ -58,6 +52,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/aicpu_topology_probe.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/aicpu_affinity_select.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/device_runner.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/context_preparation.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/memory_allocator.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/profiling_copy.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/runtime_c_api.cpp"
@@ -66,10 +61,12 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/chip_swimlane_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/host_phase_records.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/kernel_execution_state.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/run_resource_growth.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/args_dump_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/args_dump_retained_runs.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/scope_stats_retained_runs.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/comm_hccl.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/host_ddr_mapping.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/pmu_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/dep_gen_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/dep_gen_retained_runs.cpp"
@@ -87,6 +84,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/kernel_persistent_args.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_phase_capture.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/device_fault_monitor_binding.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/aicore_pmu_lease.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/device_runner_base.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/run_retention_probe.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/onboard/host/c_api_shared.cpp"
@@ -134,10 +132,6 @@ target_compile_definitions(host_runtime PRIVATE
     SIMPLER_RUNTIME_NAME="${SIMPLER_RUNTIME_NAME}"
 )
 
-if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
-    target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1)
-endif()
-
 set(SIMPLER_PTO_ISA_BUILD_COMMIT "" CACHE STRING
     "PTO-ISA commit used for host_runtime cache key")
 
@@ -147,11 +141,7 @@ set(SIMPLER_PTO_ISA_BUILD_COMMIT "" CACHE STRING
 # mtimes — untouched, so a plain reinstall serves a stale object from ccache.
 # This define perturbs the ccache key so a pto-isa bump forces a real recompile.
 # It is intentionally unused in code (cache-bust only). See issue #1139.
-# RuntimeBuilder passes the current pto_isa.pin for a2a3 onboard, regardless
-# of SIMPLER_ENABLE_PTO_SDMA_WORKSPACE. If that workspace is ever turned off,
-# a pto-isa bump still forces a rebuild of a target that no longer embeds
-# pto-isa. That over-invalidation only costs a rebuild and never serves stale
-# objects, so erring wide is intentional (see _resolve_build_pto_isa_commit).
+# RuntimeBuilder passes the current pto_isa.pin for every a2a3 onboard build.
 if(NOT "${SIMPLER_PTO_ISA_BUILD_COMMIT}" STREQUAL "")
     target_compile_definitions(host_runtime PRIVATE
         SIMPLER_PTO_ISA_BUILD_COMMIT="${SIMPLER_PTO_ISA_BUILD_COMMIT}")
@@ -179,9 +169,7 @@ target_include_directories(host_runtime
         ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/driver
 )
 
-if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
-    target_link_directories(host_runtime PRIVATE ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64)
-endif()
+target_link_directories(host_runtime PRIVATE ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64)
 
 # CANN 9.x exposes the working non-V2 HCCL entry points through libhcomm.
 # Link it explicitly so comm_hccl.cpp can follow the same initialization path
@@ -216,11 +204,10 @@ target_link_libraries(host_runtime
         -Wl,--no-as-needed ${HCCL_LINK_TARGETS} -Wl,--as-needed
         dl
         pthread
+        rt
 )
 
-if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
-    target_link_libraries(host_runtime PRIVATE nnopbase)
-endif()
+target_link_libraries(host_runtime PRIVATE nnopbase)
 
 target_link_directories(host_runtime
     PRIVATE

@@ -339,11 +339,11 @@ def run(  # noqa: PLR0915 -- one linear two-phase scenario; splitting it would s
         worker.run(compute_phase, args=None, config=CallConfig())
         if domain_handle is None:
             raise RuntimeError("the Global CommDomain was not allocated")
-        domain = domain_handle
         observed_compute: list[tuple[float, ...]] = []
         observed_communication: list[tuple[float, ...]] = []
 
         def communication_phase(orch, _args, cfg):
+            domain = orch.get_domain("compute-then-tload-mixed-l3")
             for rank in range(len(RANK_LABELS)):
                 raw = orch.copy_from_global_domain(domain, rank, COUNT * FLOAT_NBYTES, buffer="input")
                 observed_compute.append(_unpack_floats(raw))
@@ -356,6 +356,7 @@ def run(  # noqa: PLR0915 -- one linear two-phase scenario; splitting it would s
         worker.run(communication_phase, args=None, config=CallConfig())
 
         def verify_phase(orch, _args, _cfg):
+            domain = orch.get_domain("compute-then-tload-mixed-l3")
             try:
                 for rank in range(len(RANK_LABELS)):
                     raw = orch.copy_from_global_domain(domain, rank, COUNT * FLOAT_NBYTES, buffer="result")

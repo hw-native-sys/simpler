@@ -21,8 +21,10 @@
 #include "aicpu/scope_stats_collector_aicpu.h"
 #include <cstring>
 
-#include "aicpu/profiler_device_engine.h"
 #include "aicpu/device_run_result_base_aicpu.h"
+#include "aicpu/diagnostic_run_terminal_aicpu.h"
+#include "aicpu/profiler_device_engine.h"
+#include "common/diagnostic_run_terminal.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/scope_stats.h"
@@ -39,6 +41,17 @@ static bool scope_stats_enabled = false;
 static ScopeStatsDataHeader *s_scope_stats_header = nullptr;
 static ScopeStatsBufferState *s_scope_stats_state = nullptr;
 static int s_orch_thread_idx = -1;  // set via scope_stats_aicpu_set_orch_thread_idx
+
+// Where this run's producer accounting is published, and which bank of it is
+// this run's. Zero means the host mapped none, which is the default path: the
+// producer then keeps its counters and publishes nothing, exactly as before.
+/**
+ * This run's terminal bank — the address of its first producer entry — pushed
+ * at kernel entry from the launching run's KernelArgs. 0 means the host
+ * resolved none, which is every run with this collector's retention off, and
+ * is what keeps the device off an address nobody mapped.
+ */
+static uint64_t s_run_terminal_bank = 0;
 
 // Cumulative heap-ring wrap counts per ring, indexed by SCOPE_STATS_HEAP_SIDE_*.
 // Fed by the runtime via scope_stats_note_heap_wrap at each wrap; used to unroll
@@ -142,6 +155,15 @@ struct ScopeStatsDeviceModule {
 
     static void account_dropped(Context, State *state, uint32_t count) {
         saturating_add(state->dropped_record_count, count);
+    }
+    // Reported once per successful commit, with the count read before the
+    // ready-queue tail advanced. What the producer handed over is not derivable
+    // from total and dropped: a buffer can be committed and still be lost to the
+    // host afterwards, which only the difference against the host's receipt
+    // count shows.
+    static void on_publish_committed(Context, State *state, uint32_t committed) {
+        saturating_add(state->published_record_count, committed);
+        saturating_add(state->published_buffer_count, 1);
     }
     // Stamp the acquiring run's identity onto the buffer. This is the only
     // point that writes it: the engine calls the hook after advancing
@@ -276,8 +298,63 @@ extern "C" void set_platform_scope_stats_base(uint64_t scope_stats_data_base) {
 
 void scope_stats_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx = thread_idx; }
 
+extern "C" void set_platform_scope_stats_run_terminal(uint64_t bank) { s_run_terminal_bank = bank; }
+
+extern "C" void scope_stats_aicpu_begin_run() {
+    if (!scope_stats_enabled || s_scope_stats_state == nullptr) return;
+    // Both collection modes reset at the producer boundary, after the previous
+    // operator has stopped. Host admission never writes this accounting state.
+    s_scope_stats_state->total_record_count = 0;
+    s_scope_stats_state->dropped_record_count = 0;
+    s_scope_stats_state->published_record_count = 0;
+    s_scope_stats_state->published_buffer_count = 0;
+
+    // A buffer the producer still holds across a run boundary is this run's to
+    // reuse: AICPU is the free queue's consumer and never its producer, so
+    // releasing the pointer would strand the buffer instead of returning it.
+    // Re-stamping it here is what makes the records it then collects this run's,
+    // and the predecessor already accounted for whatever it held.
+    if (s_scope_stats_state->current_buf_ptr != 0) {
+        auto *held = reinterpret_cast<ScopeStatsBuffer *>(s_scope_stats_state->current_buf_ptr);
+        held->count = 0;
+        held->run_epoch = get_platform_run_result_epoch();
+        held->local_seq = s_scope_stats_state->current_buf_seq;
+    }
+    wmb();
+    s_scope_stats_state->run_epoch = get_platform_run_result_epoch();
+    wmb();
+
+    simpler::dfx::terminal::begin_run(
+        s_run_terminal_bank, SCOPE_STATS_TERMINAL_PRODUCERS, SCOPE_STATS_TERMINAL_PRODUCER,
+        get_platform_run_result_epoch()
+    );
+}
+
+extern "C" void scope_stats_aicpu_close_run() {
+    if (!scope_stats_enabled || s_scope_stats_state == nullptr) return;
+
+    uint32_t live_at_close = 0;
+    const uint64_t held_ptr = s_scope_stats_state->current_buf_ptr;
+    if (held_ptr != 0) {
+        live_at_close = reinterpret_cast<const ScopeStatsBuffer *>(held_ptr)->count;
+    }
+
+    DiagnosticRunTerminalCounts counts{};
+    counts.total = s_scope_stats_state->total_record_count;
+    counts.dropped = s_scope_stats_state->dropped_record_count;
+    counts.published_records = s_scope_stats_state->published_record_count;
+    counts.published_buffers = s_scope_stats_state->published_buffer_count;
+    counts.live_at_close = live_at_close;
+    counts.fatal_latched = s_scope_stats_header != nullptr ? s_scope_stats_header->fatal_latched : 0;
+
+    simpler::dfx::terminal::publish(
+        s_run_terminal_bank, SCOPE_STATS_TERMINAL_PRODUCERS, SCOPE_STATS_TERMINAL_PRODUCER,
+        get_platform_run_result_epoch(), counts
+    );
+}
+
 void scope_stats_aicpu_flush_buffers() {
-    if (s_scope_stats_state == nullptr) {
+    if (!scope_stats_enabled || s_scope_stats_state == nullptr) {
         return;
     }
     rmb();
@@ -291,15 +368,24 @@ void scope_stats_aicpu_flush_buffers() {
     }
 
     uint32_t seq = s_scope_stats_state->current_buf_seq;
+    const uint32_t committed = buf->count;
     int rc = enqueue_ready_buffer(buf_ptr, seq);
     if (rc == 0) {
-        LOG_INFO("scope_stats: flushed buffer with %u records", buf->count);
+        LOG_INFO("scope_stats: flushed buffer with %u records", committed);
+        saturating_add(s_scope_stats_state->published_record_count, committed);
+        saturating_add(s_scope_stats_state->published_buffer_count, 1);
+        // The host owns the buffer from the moment the ready-queue tail
+        // advances, and returns it through the free queue it alone produces
+        // into, so the producer drops its pointer here.
+        s_scope_stats_state->current_buf_ptr = 0;
     } else {
-        LOG_ERROR("scope_stats: flush failed (ready_queue full), %u records dropped", buf->count);
-        saturating_add(s_scope_stats_state->dropped_record_count, buf->count);
+        LOG_ERROR("scope_stats: flush failed (ready_queue full), %u records dropped", committed);
+        saturating_add(s_scope_stats_state->dropped_record_count, committed);
         buf->count = 0;
+        // The pointer stays: an unsuccessful enqueue handed nothing over, and
+        // only this producer can give the buffer back — by reusing it, which the
+        // next run's init re-stamps it for.
     }
-    s_scope_stats_state->current_buf_ptr = 0;
     wmb();
 }
 

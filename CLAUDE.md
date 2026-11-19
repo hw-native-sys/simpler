@@ -37,3 +37,30 @@ clang-format -i <file>
 3. Create new subdirectories under your assigned directory as needed
 4. When in doubt, ask the user before making changes to other areas
 5. **Avoid including private information in documentation or code** such as usernames, absolute paths with usernames, or other personally identifiable information. Use relative paths or generic placeholders instead
+
+## Substantial task delivery
+
+Use [.claude/skills/develop-task/SKILL.md](.claude/skills/develop-task/SKILL.md)
+for goal/design alignment, internal task dependencies, parallel agents and
+reviewed delivery. Small changes can use the focused skills directly.
+
+## GitHub work by role
+
+Use [maintainer](.claude/skills/maintainer/SKILL.md) to maintain a selected repository,
+Issue, track or personal work scope, optionally filtering PR target branches.
+It keeps an on-demand action table and brings concrete decisions to the user.
+Developers and committers can use it too; scope does not grant extra authority.
+It routes to the focused workflows below. Ongoing monitoring requires a verified
+wake mechanism; a requested single inspection does not start one.
+
+- Maintainer: [process-issue](.claude/skills/process-issue/SKILL.md) for Issue
+  triage, ownership and closure; [process-pr](.claude/skills/process-pr/SKILL.md)
+  for review routing, merge readiness and authorized merge/Issue follow-through.
+- Assignee: [fix-issue](.claude/skills/fix-issue/SKILL.md), which selects direct
+  repair or `develop-task` according to the work's complexity.
+- PR author: [github-pr](.claude/skills/github-pr/SKILL.md) to publish and
+  [fix-pr](.claude/skills/fix-pr/SKILL.md) for feedback and CI repairs.
+- Reviewer: [review-pr](.claude/skills/review-pr/SKILL.md) for technical review.
+
+Issues carry an accountable assignee; PRs carry their author and requested reviewers.
+These workflows share GitHub records, not a second task queue.

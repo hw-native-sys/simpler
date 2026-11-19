@@ -15,9 +15,10 @@
  * Compiled into the same _task_interface extension module as task_interface.cpp.
  * Call bind_worker(m) from the NB_MODULE definition in task_interface.cpp.
  *
- * Python callers register sub-workers via `add_next_level_worker(mailbox_ptr)`
- * / `add_sub_worker(mailbox_ptr)`. Each mailbox addresses a MAILBOX_SIZE-byte
- * MAP_SHARED region; the real worker (a `ChipWorker` for NEXT_LEVEL, a Python
+ * Python callers register sub-workers via `add_next_level_worker(mailbox_ptr, mailbox_bytes)`
+ * / `add_sub_worker(mailbox_ptr, mailbox_bytes)`. Each registration carries the byte extent of
+ * the MAP_SHARED region it names, which is checked against the grant's
+ * `mailbox_size(granted_sets)`; the real worker (a `ChipWorker` for NEXT_LEVEL, a Python
  * callable for SUB) lives in a forked Python child consuming the mailbox via
  * `_chip_process_loop` / `_sub_worker_loop`.
  */
@@ -25,16 +26,20 @@
 #pragma once
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <cstddef>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
 #include "ring.h"
+#include "mpi_direct_transport.h"
 #include "mpi_group_mailbox.h"
 #include "orchestrator.h"
 #include "types.h"
@@ -234,7 +239,107 @@ inline void mailbox_store_i32(uint64_t addr, int32_t v) {
 #endif
 }
 
+// The 64-bit pair, for the generation words the two sides exchange: an entry's
+// own generation and the request-frame generation the child echoes back. Same
+// memory order as the 32-bit pair above, for the same reason — the echo is what
+// releases the frame, and the parent's acquire-load of it must not be reordered
+// ahead of the copy it reports.
+inline uint64_t mailbox_load_u64(uint64_t addr) {
+    volatile uint64_t *ptr = reinterpret_cast<volatile uint64_t *>(addr);
+    uint64_t v;
+#if defined(__aarch64__)
+    __asm__ volatile("ldar %0, [%1]" : "=r"(v) : "r"(ptr) : "memory");
+#elif defined(__x86_64__)
+    v = *ptr;
+    __asm__ volatile("" ::: "memory");
+#else
+    __atomic_load(ptr, &v, __ATOMIC_ACQUIRE);
+#endif
+    return v;
+}
+
+inline void mailbox_store_u64(uint64_t addr, uint64_t v) {
+    volatile uint64_t *ptr = reinterpret_cast<volatile uint64_t *>(addr);
+#if defined(__aarch64__)
+    __asm__ volatile("stlr %0, [%1]" : : "r"(v), "r"(ptr) : "memory");
+#elif defined(__x86_64__)
+    __asm__ volatile("" ::: "memory");
+    *ptr = v;
+#else
+    __atomic_store(ptr, &v, __ATOMIC_RELEASE);
+#endif
+}
+
 inline void bind_worker(nb::module_ &m) {
+    m.attr("_REMOTE_FRAME_HEADER_BYTES") = remote_l3::FRAME_HEADER_BYTES;
+    m.attr("_REMOTE_MAX_FRAME_PAYLOAD_BYTES") = remote_l3::MAX_FRAME_PAYLOAD_BYTES;
+    nb::enum_<MpiDirectTag>(m, "_MpiDirectTag")
+        .value("COMMAND_REQUEST", MpiDirectTag::COMMAND_REQUEST)
+        .value("COMMAND_REPLY", MpiDirectTag::COMMAND_REPLY)
+        .value("HEALTH", MpiDirectTag::HEALTH)
+        .value("LIFECYCLE", MpiDirectTag::LIFECYCLE);
+
+    nb::class_<MpiDirectTransportHub>(m, "_MpiDirectTransportHub")
+        .def(nb::init<size_t>(), nb::arg("max_pending_frame_bytes"))
+        .def(
+            "register_route", &MpiDirectTransportHub::register_route, nb::arg("worker_id"), nb::arg("mpi_rank"),
+            nb::arg("session_id"), nb::arg("comm_profile")
+        )
+        .def(
+            "poll_outbound",
+            [](MpiDirectTransportHub &self, double timeout_s) -> nb::object {
+                std::optional<MpiDirectOutboundFrame> result;
+                {
+                    nb::gil_scoped_release release;
+                    result = self.poll_outbound(timeout_s);
+                }
+                if (!result.has_value()) return nb::none();
+                const auto &frame = result->frame;
+                return nb::make_tuple(
+                    result->ticket, result->target_rank, result->tag,
+                    nb::bytes(reinterpret_cast<const char *>(frame.data()), frame.size())
+                );
+            },
+            nb::arg("timeout_s") = 0.0
+        )
+        .def(
+            "complete_outbound", &MpiDirectTransportHub::complete_outbound, nb::arg("ticket"),
+            nb::call_guard<nb::gil_scoped_release>()
+        )
+        .def(
+            "deliver",
+            [](MpiDirectTransportHub &self, int32_t source_rank, int32_t raw_tag, nb::bytes frame) {
+                if (raw_tag < static_cast<int32_t>(MpiDirectTag::COMMAND_REQUEST) ||
+                    raw_tag > static_cast<int32_t>(MpiDirectTag::LIFECYCLE)) {
+                    throw std::invalid_argument("MPI direct tag is outside the fixed transport lanes");
+                }
+                const auto *begin = reinterpret_cast<const uint8_t *>(frame.c_str());
+                std::vector<uint8_t> native_frame(begin, begin + frame.size());
+                {
+                    nb::gil_scoped_release release;
+                    self.deliver(source_rank, static_cast<MpiDirectTag>(raw_tag), native_frame);
+                }
+            },
+            nb::arg("source_rank"), nb::arg("tag"), nb::arg("frame")
+        )
+        .def("fail", &MpiDirectTransportHub::fail, nb::arg("message"))
+        .def(
+            "check_health", &MpiDirectTransportHub::check_health, nb::arg("timeout_s"),
+            nb::call_guard<nb::gil_scoped_release>()
+        )
+        .def("close", &MpiDirectTransportHub::close)
+        .def(
+            "session_snapshot",
+            [](const MpiDirectTransportHub &self) {
+                auto snapshot = self.session_snapshot();
+                return nb::make_tuple(snapshot.closed, snapshot.terminal_error, snapshot.unavailable_workers);
+            }
+        )
+        .def_prop_ro("pending_frame_bytes", &MpiDirectTransportHub::pending_frame_bytes)
+        .def_prop_ro("terminal", &MpiDirectTransportHub::terminal)
+        .def_prop_ro("all_routes_shutdown", &MpiDirectTransportHub::all_routes_shutdown)
+        .def_prop_ro("terminal_error", &MpiDirectTransportHub::terminal_error);
+
     // --- WorkerType ---
     nb::enum_<WorkerType>(m, "WorkerType").value("NEXT_LEVEL", WorkerType::NEXT_LEVEL).value("SUB", WorkerType::SUB);
 
@@ -366,7 +471,21 @@ inline void bind_worker(nb::module_ &m) {
             "Managed HeapRing intermediate (MAP_SHARED, visible to forked children) registered under the "
             "identity's canonical hash; returns its heap VA. The caller wraps the VA as a FORK_SHM "
             "Buffer carrying `identity` so a ref dependency-wires to this slot (the alloc->Tensor "
-            "bridge). Backs Worker.alloc_shared_tensor / Orchestrator.alloc (Python)."
+            "bridge)."
+        )
+        .def(
+            "_alloc_shared_buffer",
+            [](Orchestrator &self, const std::vector<uint32_t> &shape, DataType dtype,
+               const CanonicalIdentity &identity) {
+                uint64_t bytes = get_element_size(dtype);
+                for (const auto dimension : shape)
+                    bytes = tensor_mul_sat(bytes, dimension);
+                if (bytes == UINT64_MAX) throw std::invalid_argument("shared buffer size overflows uint64");
+                const uint64_t address = self.alloc(shape, dtype, identity);
+                if (bytes == 0) return nb::make_tuple(address, nb::none());
+                return nb::make_tuple(address, self.describe_shared_buffer(address, bytes, identity));
+            },
+            nb::arg("shape"), nb::arg("dtype"), nb::arg("identity")
         )
         .def(
             "scope_begin", &Orchestrator::scope_begin, "Open a nested scope. Max nesting depth = MAX_SCOPE_DEPTH (64)."
@@ -417,6 +536,18 @@ inline void bind_worker(nb::module_ &m) {
     // (simpler.worker.Worker) wraps this C++ class.
     nb::class_<Worker>(m, "_Worker")
         .def(
+            nb::init<int32_t, uint64_t, const std::vector<int> &>(), nb::arg("level"), nb::arg("heap_ring_size"),
+            nb::arg("heap_fds")
+        )
+        .def("_shared_heap_fds", &Worker::shared_heap_fds)
+        .def(
+            "_map_mailbox",
+            [](Worker &self, int fd, size_t bytes) {
+                return reinterpret_cast<uint64_t>(self.map_mailbox(fd, bytes));
+            },
+            nb::arg("fd"), nb::arg("bytes"), "Own a shared mailbox mapping until native Worker destruction."
+        )
+        .def(
             nb::init<int32_t, uint64_t>(), nb::arg("level"), nb::arg("heap_ring_size") = DEFAULT_HEAP_RING_SIZE,
             "Create a Worker for the given hierarchy level (3=L3, 4=L4, …). "
             "`heap_ring_size` selects the per-ring MAP_SHARED heap mmap'd in the ctor "
@@ -425,30 +556,34 @@ inline void bind_worker(nb::module_ &m) {
 
         .def(
             "add_next_level_worker",
-            [](Worker &self, uint64_t mailbox_ptr, int child_pid, uint32_t task_frame_count) {
+            [](Worker &self, uint64_t mailbox_ptr, uint64_t mailbox_bytes, int child_pid, uint32_t granted_sets) {
                 self.add_worker(
-                    WorkerType::NEXT_LEVEL, reinterpret_cast<void *>(mailbox_ptr), child_pid, task_frame_count
+                    WorkerType::NEXT_LEVEL, reinterpret_cast<void *>(mailbox_ptr), static_cast<size_t>(mailbox_bytes),
+                    child_pid, granted_sets
                 );
             },
-            nb::arg("mailbox_ptr"), nb::arg("child_pid") = -1, nb::arg("task_frame_count") = 1,
-            "Add a NEXT_LEVEL sub-worker. `mailbox_ptr` is the address of a "
-            "MAILBOX_SIZE-byte MAP_SHARED region; the child process loop is "
-            "Python-managed (fork + _chip_process_loop). `child_pid` is that "
+            nb::arg("mailbox_ptr"), nb::arg("mailbox_bytes"), nb::arg("child_pid") = -1, nb::arg("granted_sets") = 1,
+            "Add a NEXT_LEVEL sub-worker. `mailbox_ptr` is the address of a MAP_SHARED region and "
+            "`mailbox_bytes` is how much of it the caller mapped, which must cover "
+            "`mailbox_size(granted_sets)`; the child process loop is "
+            "Python-managed (child bootstrap + _chip_process_loop). `child_pid` is that "
             "forked child, used to detect an exit before mailbox completion."
         )
         .def(
             "add_next_level_worker_at",
-            [](Worker &self, int32_t worker_id, uint64_t mailbox_ptr, int child_pid, uint32_t task_frame_count) {
+            [](Worker &self, int32_t worker_id, uint64_t mailbox_ptr, uint64_t mailbox_bytes, int child_pid,
+               uint32_t granted_sets) {
                 self.add_next_level_worker(
-                    worker_id, reinterpret_cast<void *>(mailbox_ptr), child_pid, task_frame_count
+                    worker_id, reinterpret_cast<void *>(mailbox_ptr), static_cast<size_t>(mailbox_bytes), child_pid,
+                    granted_sets
                 );
             },
-            nb::arg("worker_id"), nb::arg("mailbox_ptr"), nb::arg("child_pid") = -1, nb::arg("task_frame_count") = 1,
-            "Add a NEXT_LEVEL sub-worker with an explicit worker id."
+            nb::arg("worker_id"), nb::arg("mailbox_ptr"), nb::arg("mailbox_bytes"), nb::arg("child_pid") = -1,
+            nb::arg("granted_sets") = 1, "Add a NEXT_LEVEL sub-worker with an explicit worker id."
         )
         .def(
             "configure_pipeline_depth", &Worker::configure_pipeline_depth, nb::arg("depth"),
-            nb::arg("pending_depth") = 0, nb::arg("launch_depth") = 1,
+            nb::arg("pending_depth") = 0, nb::arg("launch_depth") = 1, nb::arg("initial_admission_depth") = 0,
             "Set run admission depth from the minimum direct-chip runtime capability before init. "
             "`pending_depth` bounds non-terminal logical runs instead, and 0 derives it from `depth`. "
             "`launch_depth` bounds how many runs may have their device work launched at once; 1 keeps a "
@@ -456,12 +591,16 @@ inline void bind_worker(nb::module_ &m) {
         )
         .def(
             "add_sub_worker",
-            [](Worker &self, uint64_t mailbox_ptr, int child_pid) {
-                self.add_worker(WorkerType::SUB, reinterpret_cast<void *>(mailbox_ptr), child_pid);
+            [](Worker &self, uint64_t mailbox_ptr, uint64_t mailbox_bytes, int child_pid) {
+                self.add_worker(
+                    WorkerType::SUB, reinterpret_cast<void *>(mailbox_ptr), static_cast<size_t>(mailbox_bytes),
+                    child_pid
+                );
             },
-            nb::arg("mailbox_ptr"), nb::arg("child_pid") = -1,
-            "Add a SUB sub-worker. `mailbox_ptr` is the address of a "
-            "MAILBOX_SIZE-byte MAP_SHARED region; the child process loop is "
+            nb::arg("mailbox_ptr"), nb::arg("mailbox_bytes"), nb::arg("child_pid") = -1,
+            "Add a SUB sub-worker. `mailbox_ptr` is the address of a MAP_SHARED region and "
+            "`mailbox_bytes` is how much of it the caller mapped, which must cover `mailbox_size(1)`; "
+            "the child process loop is "
             "Python-managed (fork + _sub_worker_loop). `child_pid` is that "
             "forked child, used to detect an exit before mailbox completion."
         )
@@ -533,13 +672,23 @@ inline void bind_worker(nb::module_ &m) {
             nb::arg("mpirun_pid"), nb::arg("runtime_timeout_s") = 30.0,
             "Register one shared-memory MPI group endpoint for each worker id."
         )
+        .def(
+            "add_remote_l3_mpi",
+            [](Worker &self, int32_t worker_id, uint64_t session_id, const std::string &transport_name,
+               const std::shared_ptr<MpiDirectTransportHub> &hub, double attach_timeout_s, double runtime_timeout_s) {
+                nb::gil_scoped_release release;
+                self.add_remote_l3_mpi(worker_id, session_id, transport_name, hub, attach_timeout_s, runtime_timeout_s);
+            },
+            nb::arg("worker_id"), nb::arg("session_id"), nb::arg("transport_name"), nb::arg("hub"),
+            nb::arg("attach_timeout_s") = 30.0, nb::arg("runtime_timeout_s") = 30.0,
+            "Register a directed MPI-backed REMOTE_L3 endpoint after HELLO READY."
+        )
 
-        // Release the GIL while starting the Scheduler thread so another Python
-        // thread can run during it — e.g. a concurrent close() observing
-        // INITIALIZING and failing fast. init/close remain same-thread-only
-        // (enforced by Worker.close()).
+        // Python lifecycle admission and init-owner affinity are enforced by
+        // Worker before native init/close. Both release the GIL: close may wait
+        // for outbound credit supplied by a Python transport progress thread.
         .def("init", &Worker::init, nb::call_guard<nb::gil_scoped_release>(), "Start the Scheduler thread.")
-        .def("close", &Worker::close, "Stop the Scheduler thread.")
+        .def("close", &Worker::close, nb::call_guard<nb::gil_scoped_release>(), "Stop the Scheduler thread.")
 
         .def(
             "get_orchestrator", &Worker::get_orchestrator, nb::rv_policy::reference_internal,
@@ -851,22 +1000,27 @@ inline void bind_worker(nb::module_ &m) {
             "into the mailbox. Returns per-child ControlResult entries."
         )
         .def(
+            "check_control_payloads_retired", &Worker::check_control_payloads_retired,
+            nb::call_guard<nb::gil_scoped_release>()
+        )
+        .def(
             "control_payload",
             [](Worker &self, WorkerType worker_type, int worker_id, uint64_t sub_cmd, nb::object payload,
-               nb::object timeout_s) {
+               nb::object timeout_s, bool retiring) {
                 std::string payload_bytes = buffer_to_string(payload, "payload");
                 double timeout_val = timeout_s.is_none() ? -1.0 : nb::cast<double>(timeout_s);
                 std::vector<uint8_t> result;
                 {
                     nb::gil_scoped_release release;
                     result = self.control_payload(
-                        worker_type, worker_id, sub_cmd, payload_bytes.data(), payload_bytes.size(), timeout_val
+                        worker_type, worker_id, sub_cmd, payload_bytes.data(), payload_bytes.size(), timeout_val,
+                        retiring
                     );
                 }
                 return nb::bytes(reinterpret_cast<const char *>(result.data()), result.size());
             },
             nb::arg("worker_type"), nb::arg("worker_id"), nb::arg("sub_cmd"), nb::arg("payload"),
-            nb::arg("timeout_s") = nb::none(),
+            nb::arg("timeout_s") = nb::none(), nb::arg("retiring") = false,
             "Drive one local worker control with a mutable staged payload and return its final bytes."
         )
         .def(
@@ -889,7 +1043,73 @@ inline void bind_worker(nb::module_ &m) {
         );
 
     m.attr("DEFAULT_HEAP_RING_SIZE") = static_cast<uint64_t>(DEFAULT_HEAP_RING_SIZE);
-    m.attr("MAILBOX_SIZE") = static_cast<int>(MAILBOX_SIZE);
+    m.attr("MAILBOX_SIZE") = static_cast<uint64_t>(MAILBOX_SIZE);
+    m.attr("MAILBOX_REQUEST_FRAMES") = static_cast<uint64_t>(MAILBOX_REQUEST_FRAMES);
+    // Every run-state entry field's real offset, taken with offsetof rather than
+    // recomputed. The Python child reads and writes these words in the parent's
+    // address space, so a field it places differently is a silently misdirected
+    // store in a live process — not something any compiler can catch.
+    nb::dict entry_offsets;
+    entry_offsets["state"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, state));
+    entry_offsets["error"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, error));
+    entry_offsets["accepted"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, accepted));
+    entry_offsets["preparation_disposition"] =
+        static_cast<uint64_t>(offsetof(MailboxRunEntry, preparation_disposition));
+    entry_offsets["entry_generation"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, entry_generation));
+    entry_offsets["frame_consumed_generation"] =
+        static_cast<uint64_t>(offsetof(MailboxRunEntry, frame_consumed_generation));
+    entry_offsets["run_epoch"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, run_epoch));
+    entry_offsets["protocol"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, protocol));
+    entry_offsets["run_id"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, run_id));
+    entry_offsets["slot_id"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, slot_id));
+    entry_offsets["generation"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, generation));
+    entry_offsets["dispatch_id"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, dispatch_id));
+    entry_offsets["task_slot"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, task_slot));
+    entry_offsets["group_index"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, group_index));
+    entry_offsets["group_size"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, group_size));
+    entry_offsets["error_text"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, error_text));
+    entry_offsets["admissible_run_resource_sets"] =
+        static_cast<uint64_t>(offsetof(MailboxRunEntry, admissible_run_resource_sets));
+    entry_offsets["observation_requested"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, observation_requested));
+    m.attr("MAILBOX_RUN_ENTRY_OFFSETS") = entry_offsets;
+    nb::dict frame_offsets;
+    frame_offsets["entry_index"] = static_cast<int64_t>(MAILBOX_OFF_FRAME_ENTRY_INDEX);
+    frame_offsets["entry_generation"] = static_cast<int64_t>(MAILBOX_OFF_FRAME_ENTRY_GENERATION);
+    frame_offsets["frame_generation"] = static_cast<int64_t>(MAILBOX_OFF_FRAME_GENERATION);
+    m.attr("MAILBOX_REQUEST_FRAME_OFFSETS") = frame_offsets;
+    m.attr("MAILBOX_RUN_ENTRY_STRIDE") = static_cast<uint64_t>(MAILBOX_RUN_ENTRY_STRIDE);
+    m.attr("MAILBOX_RUN_ENTRY_TABLE_OFFSET") = static_cast<uint64_t>(MAILBOX_RUN_ENTRY_TABLE_OFFSET);
+    m.def(
+        "mailbox_run_entry_count",
+        [](uint64_t granted_sets) {
+            return static_cast<uint64_t>(mailbox_run_entry_count(granted_sets));
+        },
+        nb::arg("granted_sets"),
+        "Run-state entries one endpoint holds for this grant: one per run it may hold, plus the "
+        "hand-offs in flight."
+    );
+    m.def(
+        "mailbox_size",
+        [](uint64_t granted_sets) {
+            // `size_t` throughout, and bounded here by the same cap the
+            // registration applies, read from the same place — so the facade
+            // cannot size a region for a grant the registration will refuse.
+            const uint64_t bytes = static_cast<uint64_t>(mailbox_size_for_grant(granted_sets));
+            if (bytes == 0) {
+                throw std::invalid_argument(
+                    "mailbox_size: a run-resource grant of " + std::to_string(granted_sets) +
+                    " is outside the admitted range [1, " + std::to_string(MAILBOX_MAX_GRANTED_SETS) + "]"
+                );
+            }
+            return bytes;
+        },
+        nb::arg("granted_sets"),
+        "Bytes one endpoint's mailbox occupies for this grant: one control frame, the request "
+        "frames, and one run-state entry per run it may hold plus the hand-offs in flight. The "
+        "facade that creates the shared-memory region sizes it through this, so both ends derive "
+        "the size from the same place. A grant outside the admitted range is refused rather than "
+        "sized."
+    );
     m.attr("MAILBOX_FRAME_SIZE") = static_cast<int>(MAILBOX_FRAME_SIZE);
     m.attr("MAILBOX_OFF_ERROR_MSG") = static_cast<int>(MAILBOX_OFF_ERROR_MSG);
     m.attr("MAILBOX_ERROR_MSG_SIZE") = static_cast<int>(MAILBOX_ERROR_MSG_SIZE);
@@ -911,6 +1131,7 @@ inline void bind_worker(nb::module_ &m) {
     mailbox_states["INIT_FAILED"] = static_cast<int32_t>(MailboxState::INIT_FAILED);
     mailbox_states["FRAME_STAGED"] = static_cast<int32_t>(MailboxState::FRAME_STAGED);
     mailbox_states["TASK_LAUNCHED"] = static_cast<int32_t>(MailboxState::TASK_LAUNCHED);
+    mailbox_states["TASK_ENDED"] = static_cast<int32_t>(MailboxState::TASK_ENDED);
     mailbox_states["TASK_FAILED"] = static_cast<int32_t>(MailboxState::TASK_FAILED);
     mailbox_states["ACTIVATE"] = static_cast<int32_t>(MailboxState::ACTIVATE);
     mailbox_states["PREPARE_READY"] = static_cast<int32_t>(MailboxState::PREPARE_READY);
@@ -920,7 +1141,6 @@ inline void bind_worker(nb::module_ &m) {
     mailbox_dispositions["VALIDATED_ONLY"] = static_cast<int32_t>(MailboxPreparationDisposition::VALIDATED_ONLY);
     mailbox_dispositions["NATIVE_PREPARED"] = static_cast<int32_t>(MailboxPreparationDisposition::NATIVE_PREPARED);
     m.attr("MAILBOX_PREPARATION_DISPOSITION_VALUES") = mailbox_dispositions;
-    m.attr("PTO_PIPELINE_MAX_DEPTH") = static_cast<uint32_t>(PTO_PIPELINE_MAX_DEPTH);
     // The teardown record's placement and size, so the Python producer and
     // consumer cannot drift from the C++ trailer layout.
     m.attr("MAILBOX_OFF_TEARDOWN_REPORT") = static_cast<int>(MAILBOX_OFF_TEARDOWN_REPORT);
@@ -947,6 +1167,20 @@ inline void bind_worker(nb::module_ &m) {
             mailbox_store_i32(addr, value);
         },
         nb::arg("addr"), nb::arg("value"), "Release-store a 32-bit mailbox word at `addr`."
+    );
+    m.def(
+        "_mailbox_load_u64",
+        [](uint64_t addr) -> uint64_t {
+            return mailbox_load_u64(addr);
+        },
+        nb::arg("addr"), "Acquire-load a 64-bit mailbox word at `addr`."
+    );
+    m.def(
+        "_mailbox_store_u64",
+        [](uint64_t addr, uint64_t value) {
+            mailbox_store_u64(addr, value);
+        },
+        nb::arg("addr"), nb::arg("value"), "Release-store a 64-bit mailbox word at `addr`."
     );
     m.def(
         "_mailbox_wait_i32",

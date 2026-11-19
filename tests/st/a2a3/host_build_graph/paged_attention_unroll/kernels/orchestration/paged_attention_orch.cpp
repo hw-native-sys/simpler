@@ -81,37 +81,54 @@ static ProfCounters g_prof;
 /**
  * Submit the QK -> softmax -> PV -> update task chain for one (batch, q-tile) unit.
  *
- * All context is passed positionally through a transport `Arg` (built by the
- * caller, never submitted — only its slots are read back here). Every tensor
- * slot is a materialized simpler::hbg::Tensor; the Arg carries no TensorCreateInfo (the
- * scope's create-infos are rebuilt locally from the q_tile/head_dim scalars):
- *   tensors: 0 query, 1 key_cache, 2 value_cache, 3 block_table (inputs),
- *            4 out (output buffer the update task writes — add_output(simpler::hbg::Tensor))
- *   scalars: 0 b_idx, 1 q_idx, 2 q_head_num, 3 q_tile, 4 head_dim,
- *            5 block_size, 6 block_num, 7 scale_value, 8 bn_this_batch,
- *            9 cur_seq, 10 data_type
- * Adding/removing a slot here must be mirrored at the caller's build site.
+ * All context is passed through a QTileScope the caller fills. Every tensor member is a
+ * materialized simpler::hbg::Tensor; the scope's create-infos are rebuilt locally from
+ * q_tile/head_dim rather than carried.
  *
  * Must run inside a SIMPLER_SCOPE: the alloc'd / submitted tensors it references
  * do not outlive that scope.
  */
-static void process_qtile_scope(const CoreTaskArgs &ctx) {
-    const simpler::hbg::Tensor &query = ctx.tensor(0).ref();
-    const simpler::hbg::Tensor &key_cache = ctx.tensor(1).ref();
-    const simpler::hbg::Tensor &value_cache = ctx.tensor(2).ref();
-    const simpler::hbg::Tensor &block_table = ctx.tensor(3).ref();
-    const simpler::hbg::Tensor &out = ctx.tensor(4).ref();
-    uint64_t b_idx = ctx.scalar<uint64_t>(0);
-    uint64_t q_idx = ctx.scalar<uint64_t>(1);
-    uint64_t q_head_num = ctx.scalar<uint64_t>(2);
-    uint64_t q_tile = ctx.scalar<uint64_t>(3);
-    uint64_t head_dim = ctx.scalar<uint64_t>(4);
-    uint64_t block_size = ctx.scalar<uint64_t>(5);
-    uint64_t block_num = ctx.scalar<uint64_t>(6);
-    uint64_t scale_value = ctx.scalar<uint64_t>(7);
-    uint64_t bn_this_batch = ctx.scalar<uint64_t>(8);
-    uint64_t cur_seq = ctx.scalar<uint64_t>(9);
-    DataType data_type = ctx.scalar<DataType>(10);
+
+// One q-tile's context, packed by the loop below and read back here. A plain struct rather
+// than an Arg: an Arg is what a task is submitted with, and this one never is -- it only
+// ever carries values across a function call, which is what a struct is for. Its tensor
+// members are borrowed and must outlive the scope the helper runs in.
+struct QTileScope {
+    const simpler::hbg::Tensor *query{nullptr};
+    const simpler::hbg::Tensor *key_cache{nullptr};
+    const simpler::hbg::Tensor *value_cache{nullptr};
+    const simpler::hbg::Tensor *block_table{nullptr};
+    const simpler::hbg::Tensor *out{nullptr};
+    uint64_t b_idx{0};
+    uint64_t q_idx{0};
+    uint64_t q_head_num{0};
+    uint64_t q_tile{0};
+    uint64_t head_dim{0};
+    uint64_t block_size{0};
+    uint64_t block_num{0};
+    uint64_t scale_value{0};
+    uint64_t bn_this_batch{0};
+    uint64_t cur_seq{0};
+    DataType data_type{};
+};
+
+static void process_qtile_scope(const QTileScope &ctx) {
+    const simpler::hbg::Tensor &query = *ctx.query;
+    const simpler::hbg::Tensor &key_cache = *ctx.key_cache;
+    const simpler::hbg::Tensor &value_cache = *ctx.value_cache;
+    const simpler::hbg::Tensor &block_table = *ctx.block_table;
+    const simpler::hbg::Tensor &out = *ctx.out;
+    uint64_t b_idx = ctx.b_idx;
+    uint64_t q_idx = ctx.q_idx;
+    uint64_t q_head_num = ctx.q_head_num;
+    uint64_t q_tile = ctx.q_tile;
+    uint64_t head_dim = ctx.head_dim;
+    uint64_t block_size = ctx.block_size;
+    uint64_t block_num = ctx.block_num;
+    uint64_t scale_value = ctx.scale_value;
+    uint64_t bn_this_batch = ctx.bn_this_batch;
+    uint64_t cur_seq = ctx.cur_seq;
+    DataType data_type = ctx.data_type;
 
     CYCLE_COUNT_START();
 
@@ -308,11 +325,22 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     CYCLE_COUNT_LAP(g_prof.ext_tensor);
 #endif
 
-    // Transport Arg reused across iterations — packs the scope's context for
-    // process_qtile_scope(); see that function for the positional slot layout.
-    // It carries only materialized ChipTensors (no TensorCreateInfo); the scope's
-    // create-infos are rebuilt inside the helper from the q_tile/head_dim scalars.
-    CoreTaskArgs ctx;
+    // Per-scope context reused across iterations; see process_qtile_scope for what it
+    // carries. The tensor members point at the caller's materialized ChipTensors, which
+    // outlive every scope this loop opens.
+    QTileScope ctx;
+    ctx.query = &query;
+    ctx.key_cache = &key_cache;
+    ctx.value_cache = &value_cache;
+    ctx.block_table = &block_table;
+    ctx.out = &out;
+    ctx.q_head_num = q_head_num;
+    ctx.q_tile = q_tile;
+    ctx.head_dim = head_dim;
+    ctx.block_size = block_size;
+    ctx.block_num = block_num;
+    ctx.scale_value = scale_value;
+    ctx.data_type = data_type;
 
     for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
         uint32_t cl_idx[1] = {static_cast<uint32_t>(b_idx)};
@@ -322,17 +350,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
             CYCLE_COUNT_LAP(g_prof.scope_and_loop);
 
-            ctx.reset();
-            ctx.add_input(query, key_cache, value_cache, block_table);
-            ctx.add_output(out);
-            // Static because process_qtile_scope reads every one of them back as a value.
-            // No slot here follows a parameter -- this Arg is never submitted, so an lvalue
-            // in the list is a plain host local rather than something a later invocation
-            // refreshes, which is what add_scalar would otherwise infer from it.
-            ctx.add_static_scalar(
-                b_idx, q_idx, q_head_num, q_tile, head_dim, block_size, block_num, scale_value, bn_this_batch, cur_seq,
-                static_cast<uint64_t>(data_type)
-            );
+            ctx.b_idx = b_idx;
+            ctx.q_idx = q_idx;
+            ctx.bn_this_batch = bn_this_batch;
+            ctx.cur_seq = cur_seq;
 
             SIMPLER_SCOPE() { process_qtile_scope(ctx); }
         }

@@ -53,6 +53,20 @@ def test_autoregressive_feedback_and_page_state():
     assert state.finished
 
 
+def test_identical_requests_keep_independent_adapter_state():
+    first = adapter.StandaloneDecodeAdapter(Fixture())
+    second = adapter.StandaloneDecodeAdapter(Fixture())
+    first_step = first.next_step()
+    second_step = second.next_step()
+    assert torch.equal(first_step.input_token_ids, second_step.input_token_ids)
+    first.complete_step(first_step.expected_output_token_ids)
+    assert first.next_step().index == 1
+    with pytest.raises(RuntimeError, match="previous decode step"):
+        second.next_step()
+    second.complete_step(second_step.expected_output_token_ids)
+    assert first.completed_steps == second.completed_steps == 1
+
+
 def test_step_cannot_be_reused_or_completed_before_submission():
     state = adapter.StandaloneDecodeAdapter(Fixture())
     with pytest.raises(RuntimeError, match="no decode step"):

@@ -275,7 +275,8 @@ __attribute__((visibility("default"))) int simpler_aicpu_run(void *args) {
     }
     auto *k = reinterpret_cast<KernelArgs *>(args);
     auto *d = reinterpret_cast<NotifPerfDeviceArgs *>(k->device_args);
-    if (d == nullptr || d->result_addr == 0 || d->handshake_addr == 0 || d->aic_ctrl_reg_base == 0) {
+    if (d == nullptr || d->result_addr == 0 || d->handshake_addr == 0 || d->reg_bases_addr == 0 ||
+        d->reg_core_count == 0 || d->cond_offset == 0) {
         DiagLog(kDlogLevelWarn, "device_args missing critical pointers");
         return 1;
     }
@@ -337,11 +338,8 @@ __attribute__((visibility("default"))) int simpler_aicpu_run(void *args) {
     result->core_id_raw = core_id_raw;
     result->core_id_used = core_id;
     result->core_id_from_producer = have_core_id ? 1u : 0u;
-    if (core_id >= kNotifPerfMaxCores) {
-        // An unmasked get_coreid() has been observed as 0x8010; indexing the
-        // AIC_CTRL window with it addresses outside the mapping and faults the
-        // AICPU op, which surfaces host-side as 507018 / aicpu exception.
-        DiagLog(kDlogLevelWarn, "reported core id out of range for the AIC_CTRL window");
+    if (core_id >= d->reg_core_count) {
+        DiagLog(kDlogLevelWarn, "reported core id out of range for the register table");
         hank->go = 0;
         CleanLine(const_cast<const void *>(static_cast<const volatile void *>(&hank->go)));
         result->magic = kNotifPerfResultMagic;
@@ -350,8 +348,16 @@ __attribute__((visibility("default"))) int simpler_aicpu_run(void *args) {
     }
 
     // Compute the COND MMIO address for the core the producer is running on.
-    uint64_t cond_va =
-        d->aic_ctrl_reg_base + static_cast<uint64_t>(core_id) * kNotifPerfCoreStride + kNotifPerfRegSprCondOffset;
+    const auto *reg_bases = reinterpret_cast<const uint64_t *>(d->reg_bases_addr);
+    if (reg_bases[core_id] == 0) {
+        DiagLog(kDlogLevelWarn, "reported core has no register mapping");
+        hank->go = 0;
+        CleanLine(const_cast<const void *>(static_cast<const volatile void *>(&hank->go)));
+        result->magic = kNotifPerfResultMagic;
+        result->consumer_rc = -2;
+        return 1;
+    }
+    uint64_t cond_va = reg_bases[core_id] + d->cond_offset;
     auto *cond_addr = reinterpret_cast<volatile uint32_t *>(cond_va);
     *cond_addr = 0;
 

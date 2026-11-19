@@ -34,21 +34,6 @@ inline bool kernel_binary_span_is_consistent(const void *binary, size_t size) {
     return (binary == nullptr) == (size == 0);
 }
 
-/* Kernel mode fixes an arena region's capacity at its first commit: a captured
-   graph retains the committed base address, so growing the region (which
-   reallocates) or releasing it invalidates an address the graph still names.
-   A shrink is permitted — it keeps both the base and the committed size.
-
-   A caller must evaluate this over every region it is about to touch before
-   mutating any of them. The arena commit sequence rolls back all regions on
-   failure, and that rollback releases the very bases this refusal exists to
-   preserve, so a refusal raised mid-sequence destroys what it is protecting. */
-inline bool kernel_arena_change_is_forbidden(bool committed, size_t cached_size, size_t requested_size) {
-    if (!committed) return false;
-    if (requested_size == 0) return cached_size != 0;
-    return requested_size > cached_size;
-}
-
 inline int validate_kernel_init_args(
     const void *ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
     size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size, const void *config,
@@ -82,9 +67,11 @@ inline int validate_kernel_callable_image(const void *callable_image, size_t cal
     if (callable_image == nullptr || callable_size < sizeof(ChipCallable)) {
         return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     }
+    if (reinterpret_cast<uintptr_t>(callable_image) % alignof(ChipCallable) != 0)
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     const auto *callable = static_cast<const ChipCallable *>(callable_image);
     if (callable->sig_count_ < 0 || callable->sig_count_ > CHIP_MAX_TENSOR_ARGS || callable->child_count_ < 0 ||
-        callable->child_count_ > 1024 || callable->func_name_len_ >= CALLABLE_FUNC_NAME_MAX ||
+        callable->child_count_ > ChipCallable::MAX_CHILDREN || callable->func_name_len_ >= CALLABLE_FUNC_NAME_MAX ||
         callable->config_name_len_ >= CALLABLE_FUNC_NAME_MAX ||
         callable->func_name_[callable->func_name_len_] != '\0' ||
         callable->config_name_[callable->config_name_len_] != '\0') {
@@ -113,7 +100,14 @@ inline int validate_kernel_callable_image(const void *callable_image, size_t cal
         if (child_binary > storage_size - offset - child_header) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
         used = offset + child_header + child_binary;
     }
-    return used == storage_size ? 0 : PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    // Use the same size-aware wire/package checks as Python deserialization,
+    // before registration computes the layout hash or uploads the image.
+    try {
+        validate_chip_callable_buffer(callable_image, callable_size);
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    }
+    return 0;
 }
 
 // Kernel callers own tensor placement. HOST/NONE remains available to a

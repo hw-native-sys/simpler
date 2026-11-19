@@ -36,13 +36,12 @@
  *
  * Current support matrix: the a2a3 onboard PTO-SDMA provider is compiled into
  * every a2a3 onboard host_runtime, so both runtimes there provision SDMA on
- * request — the gate is the platform, not the runtime. Only
- * tensormap_and_ringbuffer is exercised with it, so host-build-graph's path from
- * a provisioned address to a kernel's get_dma_workspace is unverified rather
- * than closed. URMA is reserved for the future a5 per-domain provider.
- * Simulation, a5, and builds without the a2a3 PTO-SDMA provider reject a request
- * for SDMA during Worker initialization, when the workspace would be
- * provisioned.
+ * request — the gate is the platform, not the runtime. Both schedulers copy the
+ * provisioned addresses into every core's GlobalContext for get_dma_workspace.
+ * The URMA slot is not provisioned by this Worker-level interface.
+ * A2/A3 simulation provisions inert scratch for the same address-injection contract;
+ * it creates no SDMA streams and does not model prefetch performance. A5 onboard and
+ * builds without the a2a3 PTO-SDMA provider reject Worker-level SDMA requests.
  */
 
 #ifndef PLATFORM_COMMON_DMA_WORKSPACE_H_
@@ -50,7 +49,7 @@
 
 enum DmaWorkspaceKind {
     DMA_WORKSPACE_SDMA = 0,  // PTO-ISA async-SDMA (a2a3): TPREFETCH_ASYNC / TGET_ASYNC / TPUT_ASYNC
-    DMA_WORKSPACE_URMA = 1,  // Reserved for the future a5 URMA async engine
+    DMA_WORKSPACE_URMA = 1,  // Reserved; not provisioned by the Worker-level provider
     DMA_WORKSPACE_KIND_COUNT = 2,
 };
 

@@ -21,8 +21,9 @@
  * is charged by allocated capacity rather than by size, and the export a writer
  * thread owns outright.
  *
- * Nothing here is constructed when retention is off, and with it off every
- * ScopeStats path behaves exactly as it does today.
+ * Ordinary closes also use DeviceSnapshot and Collection to distinguish a
+ * checked terminal from host-only partial evidence. Budgets and background
+ * export slots remain exclusive to retained collection.
  */
 
 #pragma once
@@ -31,11 +32,14 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <optional>
 #include <utility>
 #include <vector>
 
 #include "common/scope_stats.h"
 #include "host/chip_swimlane_runs.h"
+#include "host/diagnostic_run_credit.h"
+#include "host/scope_stats_capacity.h"
 #include "host/collected_record.h"
 
 namespace simpler::dfx::scope_stats_runs {
@@ -55,14 +59,11 @@ inline constexpr size_t kRecordsPerBlock = kRecordBlockBytes / sizeof(Record);
 static_assert(kRecordsPerBlock > 0, "a record block must hold at least one record");
 
 /**
- * The device-written values one artifact needs, copied out while the run still
- * holds its execution claim.
- *
- * Copied rather than referenced because the next run rewrites every one of
- * them: the orchestrator's capacity setters republish the caps at its own init,
- * and `begin_run()` zeroes both counters. `valid` is false until a *checked*
- * device read has filled the rest, so a failed copy can never leave a stale
- * field to be published as this run's.
+ * Values owned by one artifact. Retained runs take counters from their completed
+ * terminal bank and capacities from the immutable host binding admitted into
+ * their epoch slot. The default path copies both from the shared header while
+ * the run still holds its execution claim. `valid` requires checked terminal
+ * accounting; it is not permission to read the current shared header.
  */
 struct DeviceSnapshot {
     bool valid{false};
@@ -153,6 +154,7 @@ struct Collection {
     bool counts_unknown{false};
     uint64_t received{0};
     uint64_t retained{0};
+    bool recorded_window{false};
 };
 
 /**
@@ -163,6 +165,7 @@ struct Collection {
  */
 struct RunExport {
     uint64_t run_epoch{0};
+    std::optional<CapacityMetadata> aggregate_capacities;
     /** The export slot this run holds until its artifact is published. */
     size_t slot{0};
     std::string output_dir;
@@ -180,6 +183,28 @@ struct RunExport {
  * accounting still balances, and the fatal travels in the artifact's own
  * `fatal` field — so it settles a partial result that is still count-known.
  */
+/**
+ * Classify a run from its own producer accounting rather than the live header.
+ *
+ * The device side of the verdict is already settled by `reconcile_run`: every
+ * participant published, the figures conserve, and what the producers committed
+ * is matched against what the host took delivery of. What this adds is the one
+ * fact that reconciliation cannot see — whether host storage held everything it
+ * was offered — so a refused record downgrades a run the device reported clean.
+ */
+inline Collection classify_reconciled(const simpler::dfx::credit::RunReconciliation &settled, uint64_t retained) {
+    Collection out;
+    out.verdict = settled.verdict;
+    out.counts_unknown = settled.counts_unknown;
+    out.received = settled.received;
+    out.retained = retained;
+    if (out.counts_unknown) return out;
+    if (retained < settled.received && out.verdict == simpler::dfx::runs::Verdict::Published) {
+        out.verdict = simpler::dfx::runs::Verdict::PartialSafe;
+    }
+    return out;
+}
+
 inline Collection classify(const DeviceSnapshot &device, uint64_t received, uint64_t retained) {
     Collection out;
     out.received = received;

@@ -15,7 +15,7 @@
 
 namespace {
 
-constexpr uint64_t kDelayedAdd = 0;
+constexpr uint64_t kVectorAdd = 0;
 constexpr uint64_t kAddScalar = 1;
 constexpr int kChainLength = 512;
 
@@ -32,7 +32,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     const simpler::hbg::Tensor &a = args.tensor(0).ref();
     const simpler::hbg::Tensor &b = args.tensor(1).ref();
     const simpler::hbg::Tensor &out = args.tensor(2).ref();
-    const uint64_t spin_iters = args.scalar<uint64_t>(0);
+    const uint64_t kernel_control = args.scalar<uint64_t>(0);
     const uint32_t control_index[] = {0};
     const float host_control = get_tensor_data<float>(args.tensor(3).ref(), 1, control_index);
     uint32_t shape[1] = {a.shapes[0]};
@@ -42,8 +42,16 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     add_args.add_input(a);
     add_args.add_input(b);
     add_args.add_output(temporary);
-    add_args.add_scalar(spin_iters);
-    TaskOutputTensors add_outputs = rt_submit_aiv_task(kDelayedAdd, add_args);
+    add_args.add_scalar(kernel_control);
+    // The first two tasks mark their arguments for capture, and only those two.
+    // Selective capture is what keeps a 513-task chain's dump to a few payloads,
+    // and this pair is the one worth reading: the first task's inputs are the
+    // buffers the caller seeded, its output is the temporary the second task
+    // consumes, and every later step writes that same temporary again. So a
+    // reader can check an argument against the task that produced it rather
+    // than against whatever the buffer held when the run ended.
+    add_args.dump();
+    TaskOutputTensors add_outputs = rt_submit_aiv_task(kVectorAdd, add_args);
     simpler::hbg::Tensor current = add_outputs.get_ref(0);
 
     union {
@@ -61,6 +69,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         } else {
             step_args.add_output(temporary);
             step_args.add_scalar(scalar.u64);
+            if (i == 0) step_args.dump();
             TaskOutputTensors step_outputs = rt_submit_aiv_task(kAddScalar, step_args);
             current = step_outputs.get_ref(0);
         }

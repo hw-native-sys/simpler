@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "host_build_graph/host_tensor_access.h"
+#include "host_build_graph/host/host_tensor_access.h"
 
 #include <cstring>
 

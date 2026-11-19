@@ -26,7 +26,7 @@
  *
  *   2. Local per-dispatch context (changes each dispatch):
  *      - block_idx : which logical block the current worker is executing
- *      - block_num : total number of blocks in this task (= block_dim)
+ *      - block_num : total number of logical blocks in this task
  *      Written by build_payload() before each dispatch.
  *
  * Both categories are injected via two pointer slots appended at the tail
@@ -164,8 +164,7 @@ struct AsyncCtx {
  */
 struct LocalContext {
     int32_t block_idx;  // Logical block index within the task [0, block_num)
-    int32_t block_num;  // How many logical blocks this task requires.
-                        // Currently fixed to 1 (block_dim > 1 not yet implemented).
+    int32_t block_num;  // How many logical blocks this task requires (from LaunchSpec).
                         // NOT the same as RUNTIME_CONFIG.block_dim in kernel_config.py,
                         // which controls how many physical cores the runtime launches.
     AsyncCtx async_ctx;
@@ -244,7 +243,7 @@ static __aicore__ inline int32_t get_block_idx(__gm__ int64_t *args) {
 /**
  * Return how many logical blocks the current task requires.
  * All blocks of the same task see the same value.
- * Currently always returns 1 (block_dim>1 not yet implemented).
+ * Returns the logical block count requested by this task's LaunchSpec.
  *
  * Note: this is NOT the same as RUNTIME_CONFIG.block_dim in
  * kernel_config.py, which controls how many physical cores are launched.

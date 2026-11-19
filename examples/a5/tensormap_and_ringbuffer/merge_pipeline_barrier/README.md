@@ -75,6 +75,6 @@ pytest examples/a5/tensormap_and_ringbuffer/merge_pipeline_barrier --platform a5
 all `block_num` logical blocks must be co-resident — if a block is not running,
 the ones waiting on it never proceed. The A5 runtime can launch 36 logical
 blocks, while this task uses `block_num` 8 (set per task via
-`launch_spec.set_core_num` in `merge_orch.cpp`), so all blocks can be resident.
+`launch_spec.set_block_num` in `merge_orch.cpp`), so all blocks can be resident.
 
 Wrap in `task-submit` on a shared box.

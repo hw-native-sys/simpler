@@ -35,12 +35,13 @@
 #include "common/chip_swimlane_profiling.h"
 #include "host/chip_swimlane_collector.h"
 #include "profiling_copy_fault.h"
+#include "profiler_test_allocator.h"
 
 using Verdict = ChipSwimlaneCollector::RunTerminalVerdict;
 
 namespace {
 
-void *fault_test_alloc(size_t size) { return std::calloc(1, size); }
+void *fault_test_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int fault_test_free(void *ptr) {
     std::free(ptr);
@@ -71,7 +72,7 @@ void run_one_task(ChipSwimlaneCollector &collector, uint32_t slot, uint64_t epoc
     set_platform_chip_swimlane_run_terminal_bank(
         reinterpret_cast<uint64_t>(collector.arm_run_terminal_bank(slot, epoch))
     );
-    chip_swimlane_aicpu_init(/*worker_count=*/1);
+    chip_swimlane_aicpu_init(/*worker_count=*/1, ChipSwimlaneLevel::SCHEDULE_TIMING);
 
     ASSERT_EQ(chip_swimlane_aicpu_complete_task(/*core_id=*/0, 0, 1, 10, 20), 0);
     const int cores[] = {0};

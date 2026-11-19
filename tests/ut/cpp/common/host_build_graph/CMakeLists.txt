@@ -37,6 +37,11 @@ foreach(arch a2a3 a5)
     )
     target_include_directories(${arch}_hbg_objs PUBLIC ${_hbg_includes})
     target_link_libraries(${arch}_hbg_objs PUBLIC ${arch}_ut_support)
+    if(arch STREQUAL "a2a3")
+        add_library(a2a3_hbg_full_arena STATIC ${SIMPLER_SRC}/common/host_build_graph/full_arena/runtime_init.cpp)
+        target_include_directories(a2a3_hbg_full_arena PRIVATE ${_hbg_includes})
+        target_link_libraries(${arch}_hbg_objs PUBLIC a2a3_hbg_full_arena)
+    endif()
 
     add_library(${arch}_hbg_orch_objs OBJECT
         ${HBG_ORCH_SHARED_SOURCES}
@@ -58,19 +63,88 @@ macro(hbg_cases)
     simpler_ut_cases(hbg_case ${ARGV})
 endmacro()
 
+hbg_case(test_hbg_scope_mode.cpp)
+
+# Fault injection uses the ELF linker's pthread wrappers.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    hbg_case(test_hbg_host_phase_failure.cpp
+        SOURCES
+            ${HBG_HOST_DIR}/host_phase_trace.cpp
+            ${SIMPLER_SRC}/common/platform/shared/host/host_phase_records.cpp
+            ${SIMPLER_SRC}/common/log/host_log.cpp
+        LINK_OPTIONS -Wl,--wrap=pthread_key_create -Wl,--wrap=pthread_setspecific
+        TIMEOUT 30)
+else()
+    simpler_ut_exclude_case(test_hbg_host_phase_failure.cpp)
+endif()
+
+hbg_case(test_hbg_recorder_lifetime.cpp
+    SOURCES ${SIMPLER_SRC}/common/worker/runtime_module.cpp
+    INCLUDES ${SIMPLER_SRC}/common/worker
+    LINK ${CMAKE_DL_LIBS})
+foreach(arch a2a3 a5)
+    simpler_ut_includes(${arch} host_build_graph host recorder_includes)
+    add_library(${arch}_hbg_recorder_fixture SHARED
+        ${CMAKE_SOURCE_DIR}/common/support/hbg_recorder_fixture.cpp
+        ${HBG_HOST_DIR}/graph_recording.cpp
+        ${HBG_HOST_DIR}/graph_recorder_pool.cpp
+        ${HBG_HOST_DIR}/tensormap.cpp
+        ${CMAKE_SOURCE_DIR}/support/unified_log_stubs.cpp
+        ${CMAKE_SOURCE_DIR}/support/assert_stubs.cpp)
+    target_include_directories(${arch}_hbg_recorder_fixture PRIVATE ${recorder_includes})
+    target_compile_options(${arch}_hbg_recorder_fixture PRIVATE $<$<CXX_COMPILER_ID:GNU>:-fno-gnu-unique>)
+    target_link_libraries(${arch}_hbg_recorder_fixture PRIVATE pthread)
+    target_compile_definitions(${arch}_hbg_recorder_fixture PRIVATE SIMPLER_HBG_RECORDER_TEST_HOOKS=1)
+    add_library(${arch}_hbg_recorder_acquire_only SHARED
+        ${CMAKE_SOURCE_DIR}/common/support/hbg_recorder_fixture_acquire_only.cpp)
+    add_library(${arch}_hbg_recorder_failed_acquire SHARED
+        ${CMAKE_SOURCE_DIR}/common/support/hbg_recorder_fixture_failed_acquire.cpp)
+    target_compile_definitions(test_${arch}_hbg_recorder_lifetime PRIVATE
+        HBG_RECORDER_FIXTURE_PATH="$<TARGET_FILE:${arch}_hbg_recorder_fixture>"
+        HBG_RECORDER_ACQUIRE_ONLY_FIXTURE_PATH="$<TARGET_FILE:${arch}_hbg_recorder_acquire_only>"
+        HBG_RECORDER_FAILED_ACQUIRE_FIXTURE_PATH="$<TARGET_FILE:${arch}_hbg_recorder_failed_acquire>")
+    add_dependencies(test_${arch}_hbg_recorder_lifetime
+        ${arch}_hbg_recorder_fixture
+        ${arch}_hbg_recorder_acquire_only
+        ${arch}_hbg_recorder_failed_acquire)
+    set_tests_properties(test_${arch}_hbg_recorder_lifetime PROPERTIES TIMEOUT 30)
+endforeach()
+
+hbg_case(test_capture_prepare_lifetime.cpp LINK ${CMAKE_DL_LIBS})
+foreach(arch a2a3 a5)
+    simpler_ut_includes(${arch} host_build_graph host context_includes)
+    add_library(${arch}_context_fixture SHARED
+        ${CMAKE_SOURCE_DIR}/common/support/capture_prepare_fixture.cpp
+        ${HBG_HOST_DIR}/dep_gen_host_graph.cpp
+        ${CMAKE_SOURCE_DIR}/support/unified_log_stubs.cpp
+        ${CMAKE_SOURCE_DIR}/support/assert_stubs.cpp)
+    target_include_directories(${arch}_context_fixture PRIVATE ${context_includes})
+    target_compile_options(${arch}_context_fixture PRIVATE $<$<CXX_COMPILER_ID:GNU>:-fno-gnu-unique>)
+    target_link_libraries(${arch}_context_fixture PRIVATE pthread)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_options(${arch}_context_fixture PRIVATE
+            -Wl,--wrap=pthread_key_create -Wl,--wrap=pthread_key_delete -Wl,--wrap=pthread_setspecific)
+    endif()
+    target_compile_definitions(test_${arch}_hbg_capture_prepare_lifetime PRIVATE
+        CONTEXT_FIXTURE_PATH="$<TARGET_FILE:${arch}_context_fixture>")
+    add_dependencies(test_${arch}_hbg_capture_prepare_lifetime ${arch}_context_fixture)
+    set_tests_properties(test_${arch}_hbg_capture_prepare_lifetime PROPERTIES TIMEOUT 20)
+endforeach()
+
+
 # These drive the real orchestrator, so they link the orchestrator object
 # library. That is the whole of what they have beyond a plain case.
 hbg_cases(
-    test_hbg_async_wait_init.cpp
     test_hbg_graph_submit_failure.cpp
     test_hbg_graph_definition_arena.cpp
-    test_hbg_slot_claim.cpp
-    test_hbg_ed_qualification.cpp
     test_hbg_graph_ed_qualification.cpp
     test_hbg_graph_recording_bounds.cpp
-    # Calls the real ready_queue_init_data_from_layout. The sizing TU it needs
-    # comes with the orchestrator library, which globs host/.
-    test_hbg_ready_queue_seed.cpp
+    # Calls the real calculate_output_layout, which comes with the orchestrator
+    # library (globs host/).
+    test_hbg_output_layout.cpp
+    # Repeated real binds over retained scratch: reinit, a failed discharge, and
+    # the same calculate_output_layout reachable through the orchestrator library.
+    test_hbg_scratch_retention.cpp
     ORCH)
 
 hbg_case(test_hbg_graph_cache.cpp
@@ -101,6 +175,7 @@ hbg_case(test_hbg_bind_ledger.cpp
         ${HBG_HOST_DIR}/dep_gen_host_graph.cpp
         ${HBG_HOST_DIR}/graph_recorder_pool.cpp
         ${HBG_HOST_DIR}/host_phase_trace.cpp
+        ${SIMPLER_SRC}/common/platform/shared/host/host_phase_records.cpp
         ${HBG_HOST_DIR}/ready_queue_sizing.cpp
         ${HBG_HOST_DIR}/host_tensor_access.cpp
         ${SIMPLER_SRC}/common/platform/shared/host/platform_compile_info.cpp
@@ -108,6 +183,13 @@ hbg_case(test_hbg_bind_ledger.cpp
         # support/unified_log_stubs.cpp already defines unified_log_*; only
         # HostLogger is missing, so this takes host_log.cpp for that alone.
         ${SIMPLER_SRC}/common/log/host_log.cpp)
+
+if(TARGET test_a5_hbg_bind_ledger)
+    target_link_libraries(test_a5_hbg_bind_ledger PRIVATE ${CMAKE_DL_LIBS})
+    target_sources(test_a5_hbg_bind_ledger PRIVATE
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/native_graph_plan.cpp
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/async_completion_plan.cpp)
+endif()
 
 # Which maker states the caller device buffers a run produces. a2a3's does; a5's makes no such
 # statement, so the cases covering the declaration assert the opposite fact there rather than
@@ -117,20 +199,17 @@ if(TARGET test_a2a3_hbg_bind_ledger)
         PRIVATE SIMPLER_TEST_HBG_MAKER_DECLARES_CALLER_WRITES=1)
 endif()
 
-# The scheduler pair links its arch's scheduler TUs plus the AICPU collectors
-# the scheduler raises into. a2a3 reaches the sim register shim directly; a5
-# needs a stub for the completion path its scheduler does not provide here.
-hbg_case(test_hbg_scheduler_drain.cpp
+# A2A3 uses AICPU dispatch and its drain/stall protocol.
+hbg_case(test_hbg_scheduler_drain.cpp ARCHS a2a3
     SOURCES
         ${SIMPLER_SRC}/@arch@/runtime/host_build_graph/runtime/scheduler/scheduler_completion.cpp
         ${SIMPLER_SRC}/@arch@/platform/shared/aicpu/pmu_collector_aicpu.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/args_dump_aicpu.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
-    A2A3_SOURCES ${SIMPLER_SRC}/a2a3/platform/sim/aicpu/inner_platform_regs.cpp
-    A5_SOURCES   ${CMAKE_CURRENT_SOURCE_DIR}/support/scheduler_drain_a5_stubs.cpp)
+        ${SIMPLER_SRC}/a2a3/platform/sim/aicpu/inner_platform_regs.cpp)
 
-hbg_case(test_hbg_stall_dump_level.cpp
+hbg_case(test_hbg_stall_dump_level.cpp ARCHS a2a3
     SOURCES
         ${SIMPLER_SRC}/@arch@/runtime/host_build_graph/runtime/scheduler/scheduler_cold_path.cpp
         ${SIMPLER_SRC}/@arch@/runtime/host_build_graph/runtime/scheduler/scheduler_completion.cpp
@@ -141,12 +220,8 @@ hbg_case(test_hbg_stall_dump_level.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/args_dump_aicpu.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
-    A2A3_SOURCES
         ${CMAKE_CURRENT_SOURCE_DIR}/support/stall_dump_level_a2a3_stubs.cpp
-        ${SIMPLER_SRC}/a2a3/platform/sim/aicpu/inner_platform_regs.cpp
-    A5_SOURCES
-        ${CMAKE_CURRENT_SOURCE_DIR}/support/scheduler_drain_a5_stubs.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/support/stall_dump_level_a5_stubs.cpp)
+        ${SIMPLER_SRC}/a2a3/platform/sim/aicpu/inner_platform_regs.cpp)
 
 # The accumulator is header-only and arch-agnostic, and the test reaches it by
 # the host_build_graph/ prefix rather than by bare name, so src/common alone
@@ -166,7 +241,32 @@ hbg_case(test_native_run_acceptance.cpp
 hbg_case(test_hbg_tensor_access.cpp
     SOURCES ${HBG_HOST_DIR}/host_tensor_access.cpp)
 
+hbg_case(test_hbg_slot_claim.cpp ORCH
+    SOURCES ${SIMPLER_SRC}/common/host_build_graph/device/graph_execution.cpp)
+
+# These protocols belong to the active A2A3 AICPU executor.
+hbg_cases(
+    test_hbg_async_wait_init.cpp
+    test_hbg_ed_qualification.cpp
+    test_hbg_ready_queue_seed.cpp
+    test_hbg_mailbox_init.cpp
+    ARCHS a2a3 ORCH)
+
+hbg_cases(
+    test_hbg_aicpu_graph_activation.cpp
+    test_hbg_aicpu_graph_wake.cpp
+    test_hbg_aicpu_graph_scheduling.cpp
+    ARCHS a2a3 ORCH
+    SOURCES ${SIMPLER_SRC}/common/host_build_graph/device/graph_execution.cpp)
+
 # Everything else here is a case of this runtime with nothing beyond the
 # directory's own contract, built for both arches. Declaring one above takes it
 # out of this sweep, so the exceptions are the declarations themselves.
 simpler_ut_glob_cases(hbg_case)
+
+# Fault injection checks selector publication without leaving a borrowed pointer.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    foreach(arch IN ITEMS a2a3 a5)
+        target_link_options(test_${arch}_hbg_graph_recording_bounds PRIVATE -Wl,--wrap=pthread_setspecific)
+    endforeach()
+endif()

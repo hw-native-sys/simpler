@@ -43,7 +43,7 @@ def _trace(*args, **kwargs):
     clock placement and rank merging rather than anything a runtime decides. A test
     whose fixture carries runtime-specific data -- a task id in one layout, or a phase
     only one runtime emits (hbg: graph_prepare, resolve_standalone, and its AICore
-    scheduler's bootstrap / state_probe / worksteal / refill / idle; tmr: release,
+    scheduler's bootstrap / state_probe / idle; tmr: release,
     dummy_task, predicated_skip) -- must name its runtime explicitly instead, so
     the document it builds is one a real run could produce.
 
@@ -199,8 +199,22 @@ def _write_l3_host_log(root, rank, *, host_shift_ns, sched_window_ns):
 
 
 def _write_l3_rank(
-    root, rank, *, host_shift_ns, task_id, clock_domain="same-boot", dispatch="d0", sched_record_ns=None
+    root,
+    rank,
+    *,
+    host_shift_ns,
+    task_id,
+    clock_domain="same-boot",
+    dispatch="d0",
+    sched_record_ns=None,
+    successor_task_id=None,
 ):
+    """One Rank's capture, its Host log and its sibling name map.
+
+    ``successor_task_id`` adds a second task behind the first, for a case that
+    needs an edge between two tasks of the same run. Omitted by default, so a
+    case that is not about dependencies keeps the single-task capture.
+    """
     rank_dir = root / f"rank{rank}" / dispatch
     rank_dir.mkdir(parents=True)
     device_base = 100 + rank * 100_000
@@ -210,7 +224,7 @@ def _write_l3_rank(
     if sched_record_ns is None:
         sched_record_ns = 50 + rank * 100
     _write_l3_host_log(root, rank, host_shift_ns=host_shift_ns, sched_window_ns=sched_record_ns + 50)
-    records = (
+    capture = (
         Capture(runtime=HBG_RUNTIME, level=4, clock_freq_hz=1_000_000_000)
         # Host orchestration records below are produced by host_build_graph alone,
         # so this capture names that runtime: a tmr document carrying them could
@@ -235,9 +249,19 @@ def _write_l3_rank(
             start_ns=host_shift_ns + 1_500,
             end_ns=host_shift_ns + 1_800,
         )
-        .build()
     )
-    (rank_dir / "chip_swimlane_records.json").write_text(json.dumps(records))
+    if successor_task_id is not None:
+        # Behind the first task and still inside the Host log's device window,
+        # so adding it changes which spans exist, not where the Rank is placed.
+        capture = capture.task(
+            task_id=successor_task_id,
+            reg_task_id=2,
+            start=device_base + 1_300,
+            end=device_base + 1_400,
+            dispatch=device_base + 1_250,
+            finish=device_base + 1_450,
+        )
+    (rank_dir / "chip_swimlane_records.json").write_text(json.dumps(capture.build()))
     (rank_dir / "name_map.json").write_text(json.dumps({"callable_id_to_name": {"0": f"kernel_r{rank}"}}))
     return rank_dir
 
@@ -291,26 +315,40 @@ def _write_hbg_l3_rank(root, rank, *, host_shift_ns, task_id, clock_domain="same
     return capture_dir
 
 
-def _write_dispatch_identity(capture_dir, *, run_id, task_slot, group_index, group_size):
+def _write_dispatch_identity(capture_dir, *, run_id, task_slot, group_index, group_size, endpoint_dispatch_id=None):
     rank = int(capture_dir.parent.name.removeprefix("rank"))
     capture_index = int(capture_dir.name.removeprefix("d"))
-    (capture_dir / "dispatch_identity.json").write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "run_id": run_id,
-                "task_slot": task_slot,
-                "group_index": group_index,
-                "group_size": group_size,
-                "chip_rank": rank,
-                "local_capture_index": capture_index,
-                "endpoint_dispatch_id": capture_index + 1,
-                "pipeline_slot": 0,
-                "pipeline_generation": 1,
-                "callable_digest": "ab" * 32,
-            }
-        )
-    )
+    payload = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "task_slot": task_slot,
+        "group_index": group_index,
+        "group_size": group_size,
+        "chip_rank": rank,
+        "local_capture_index": capture_index,
+        "endpoint_dispatch_id": capture_index + 1 if endpoint_dispatch_id is None else endpoint_dispatch_id,
+        "pipeline_slot": 0,
+        "pipeline_generation": 1,
+        "callable_digest": "ab" * 32,
+    }
+    (capture_dir / "dispatch_identity.json").write_text(json.dumps(payload))
+
+
+def test_recorded_window_refuses_multi_rank_host_placement_without_source_changes(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    paths = [_write_l3_rank(root, rank, host_shift_ns=rank * 10_000, task_id=rank + 7) for rank in (0, 1)]
+    for path in paths:
+        records = path / "chip_swimlane_records.json"
+        raw = json.loads(records.read_text())
+        raw["metadata"]["collection"] = {"recorded_window": True, "counts_unknown": True}
+        records.write_text(json.dumps(raw))
+    before = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    output = tmp_path / "rejected.json"
+    args = sc._build_parser().parse_args([str(root), "--dispatch", "d0", "-o", str(output)])
+    with pytest.raises(ValueError, match="recorded windows cannot be merged"):
+        sc._generate_l3_trace(args, root)
+    assert not output.exists()
+    assert {path: path.read_bytes() for path in root.rglob("*") if path.is_file()} == before
 
 
 def test_l3_directory_merge_uses_common_host_origin_and_rank_namespaces(tmp_path):
@@ -366,6 +404,29 @@ def test_l3_directory_merge_uses_common_host_origin_and_rank_namespaces(tmp_path
     } == {6_000}
 
 
+def test_l3_legacy_device_boundary_marker_uses_host_timestamp(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    host_shift = 5_000_000_000_000
+    for rank in (0, 1):
+        _write_l3_rank(root, rank, host_shift_ns=host_shift + rank * 10_000, task_id=rank + 7)
+    source = root / "host.1000.log"
+    source.write_text(
+        source.read_text() + "[STRACE] v=1 pid=1000 tid=1000 inv=1 hid=abc depth=2 "
+        f"name=chip.run.runner_run.device_boundaries ts={host_shift + 5_000} dur=0 "
+        "clk=dev aic_start=123\n"
+    )
+    output = root / "l3.json"
+    args = sc._build_parser().parse_args([str(root), "--dispatch", "d0", "-o", str(output)])
+
+    sc._generate_l3_trace(args, root)
+
+    events = json.loads(output.read_text())["traceEvents"]
+    boundary = next(event for event in events if event.get("name") == "chip.run.runner_run.device_boundaries")
+    assert boundary["cat"] == "host"
+    assert boundary["ts"] == 4.0
+    assert max(event["ts"] for event in events if "ts" in event) < 100
+
+
 def test_l3_directory_merge_persists_hbg_alignment(tmp_path):
     root = tmp_path / "dfx_outputs"
     capture_dir = _write_hbg_l3_rank(root, 0, host_shift_ns=0, task_id=7)
@@ -414,8 +475,12 @@ def test_l3_directory_merge_uses_new_alignment_when_writeback_fails(tmp_path, mo
         rank_traces.append(trace)
         return trace
 
-    def fail_writeback(_source, _destination):
-        raise OSError("read-only capture")
+    original_replace = sc.os.replace
+
+    def fail_writeback(source, destination):
+        if destination == records_path:
+            raise OSError("read-only capture")
+        return original_replace(source, destination)
 
     monkeypatch.setattr(sc, "generate_chrome_trace_json", record_rank_trace)
     monkeypatch.setattr(sc.os, "replace", fail_writeback)
@@ -516,6 +581,363 @@ def test_l3_directory_merge_draws_the_host_log_beside_the_capture(tmp_path):
     assert min(event["ts"] for event in slices) == 0.0
 
 
+def test_l3_derived_host_logs_reopen_without_session_logs(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    captures = [_write_l3_rank(root, rank, host_shift_ns=rank * 10_000, task_id=rank + 7) for rank in (0, 1)]
+    for rank, capture in enumerate(captures):
+        _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=rank, group_size=2)
+    parent = root / "host.2000.log"
+    parent.write_text(
+        "[STRACE] v=1 pid=2000 tid=2000 inv=1 hid=abc depth=1 "
+        "name=node.graph_build ts=100 dur=1950 run_id=17\n"
+        "[STRACE] v=1 pid=2000 tid=2000 inv=1 hid=abc depth=1 "
+        "name=node.dispatch ts=400 dur=100 run_id=17 task_slot=5\n"
+        "[STRACE] v=1 pid=2000 tid=2000 inv=1 hid=abc depth=1 "
+        "name=node.dispatch ts=500 dur=100 run_id=17 task_slot=6\n"
+    )
+    (root / "host.3000.log").write_text(
+        "[STRACE] v=1 pid=3000 tid=3000 inv=2 hid=abc depth=1 "
+        "name=network1.submit ts=250 dur=150 run_id=99 task_slot=2\n"
+        "[STRACE] v=1 pid=3000 tid=3000 inv=2 hid=abc depth=1 "
+        "name=network1.dispatch ts=300 dur=400 run_id=99 task_slot=2\n"
+        "[STRACE] v=1 pid=3000 tid=3000 inv=2 hid=abc depth=1 "
+        "name=network1.complete ts=500 dur=1000 run_id=99 task_slot=2\n"
+        "[STRACE] v=1 pid=3000 tid=3000 inv=3 hid=abc depth=1 "
+        "name=network1.dispatch ts=800 dur=300 run_id=99 task_slot=222\n"
+        "[STRACE] v=1 pid=3000 tid=3000 inv=0 hid=abc depth=1 "
+        "name=network1.scheduler_loop ts=600 dur=500\n"
+    )
+    sources = sorted(root.glob("host.*.log"))
+    output = root / "l3_swimlane.json"
+    args = sc._build_parser().parse_args(
+        [
+            str(root),
+            "--dispatch-id",
+            "17:5",
+            "-o",
+            str(output),
+            "--publish-derived-host-logs",
+            *sum((["--host-log", str(p)] for p in sources), []),
+        ]
+    )
+    sc._generate_l3_trace(args, root)
+    original = json.loads(output.read_text())
+    assert all(not Path(path).is_absolute() for path in original["metadata"]["host_logs"])
+    assert any(event.get("name") == "node.dispatch" for event in original["traceEvents"])
+    assert any(event.get("name") == "node.graph_build" for event in original["traceEvents"])
+    assert original["metadata"]["dispatcher_pids"] == [2000]
+    assert not any(event.get("name", "").startswith("network1.") for event in original["traceEvents"])
+    assert not any(
+        event.get("name") == "node.dispatch" and event.get("args", {}).get("task_slot") == 6
+        for event in original["traceEvents"]
+    )
+    for capture in captures:
+        identity = json.loads((capture / "dispatch_identity.json").read_text())
+        assert (capture / identity["host_trace"]).is_file()
+        assert (capture / identity["parent_host_trace"]).is_file()
+    assert (
+        len(
+            {
+                json.loads((capture / "dispatch_identity.json").read_text())["host_trace_publication_id"]
+                for capture in captures
+            }
+        )
+        == 1
+    )
+    for source in sources:
+        source.unlink()
+    output.chmod(0o640)
+    offline = sc._build_parser().parse_args([str(root), "--dispatch-id", "17:5", "-o", str(output)])
+    sc._generate_l3_trace(offline, root)
+    reopened = json.loads(output.read_text())
+    assert output.stat().st_mode & 0o777 == 0o640
+    assert reopened["traceEvents"] == original["traceEvents"]
+    assert reopened["metadata"]["host_logs"] == original["metadata"]["host_logs"]
+
+    for capture in captures:
+        sidecar = capture / "dispatch_identity.json"
+        identity = json.loads(sidecar.read_text())
+        identity.pop("host_trace_publication_id")
+        sidecar.write_text(json.dumps(identity))
+    sc._generate_l3_trace(offline, root)
+    assert json.loads(output.read_text())["traceEvents"] == original["traceEvents"]
+
+    missing = captures[0] / json.loads((captures[0] / "dispatch_identity.json").read_text())["host_trace"]
+    missing.unlink()
+    with pytest.raises(ValueError, match="derived Host log is missing"):
+        sc._generate_l3_trace(offline, root)
+
+
+def _write_parent_dispatch_span(root, *, ts=400):
+    (root / "host.2000.log").write_text(
+        "[STRACE] v=1 pid=2000 tid=2000 inv=1 hid=abc depth=1 "
+        f"name=node.dispatch ts={ts} dur=100 run_id=17 task_slot=5\n"
+    )
+
+
+def _paired_l3_with_parent(root):
+    captures = [_write_l3_rank(root, rank, host_shift_ns=rank * 10_000, task_id=rank + 7) for rank in (0, 1)]
+    for rank, capture in enumerate(captures):
+        _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=rank, group_size=2)
+    _write_parent_dispatch_span(root)
+    sources = sorted(root.glob("host.*.log"))
+    output = root / "l3_swimlane.json"
+    args = sc._build_parser().parse_args(
+        [
+            str(root),
+            "--dispatch-id",
+            "17:5",
+            "-o",
+            str(output),
+            "--publish-derived-host-logs",
+            *sum((["--host-log", str(p)] for p in sources), []),
+        ]
+    )
+    return captures, sources, output, args
+
+
+def test_derived_logs_split_adjacent_records_by_invocation(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    captures, _sources, _output, args = _paired_l3_with_parent(root)
+    source = root / "host.1000.log"
+    first = "[STRACE] v=1 pid=1000 tid=1000 inv=1 hid=abc depth=1 name=chip.run.bind ts=2000 dur=10 "
+    other = "[STRACE] v=1 pid=1000 tid=1000 inv=2 hid=abc depth=1 name=chip.run.bind ts=3000 dur=10 "
+    source.write_text(source.read_text() + first + other + first + "\n")
+
+    sc._generate_l3_trace(args, root)
+
+    identity = json.loads((captures[0] / "dispatch_identity.json").read_text())
+    derived = (captures[0] / identity["host_trace"]).read_text()
+    assert "inv=2" not in derived
+    assert derived.count("name=chip.run.bind") == 2
+    assert derived.count("[STRACE]") == 5
+
+
+def test_derived_log_publication_rolls_back_all_rank_identities(tmp_path, monkeypatch):
+    root = tmp_path / "dfx_outputs"
+    captures, _sources, output, args = _paired_l3_with_parent(root)
+    before = [(capture / "dispatch_identity.json").read_text() for capture in captures]
+    original_replace = sc.os.replace
+    failure_path = captures[1] / "dispatch_identity.json"
+
+    def fail_second_sidecar(source, destination):
+        if destination == failure_path:
+            raise OSError("injected Rank 1 publication failure")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(sc.os, "replace", fail_second_sidecar)
+    with pytest.raises(OSError, match="injected Rank 1"):
+        sc._generate_l3_trace(args, root)
+    assert [(capture / "dispatch_identity.json").read_text() for capture in captures] == before
+    assert not output.exists()
+
+
+def test_failed_republication_keeps_the_previous_derived_logs(tmp_path, monkeypatch):
+    root = tmp_path / "dfx_outputs"
+    captures, sources, output, args = _paired_l3_with_parent(root)
+    sc._generate_l3_trace(args, root)
+    previous_trace = json.loads(output.read_text())
+    previous_identities = [(capture / "dispatch_identity.json").read_text() for capture in captures]
+    previous_log_paths = {
+        capture / json.loads(sidecar)[key]
+        for capture, sidecar in zip(captures, previous_identities)
+        for key in ("host_trace", "parent_host_trace")
+    }
+    previous_logs = {path: path.read_text() for path in previous_log_paths}
+
+    source = root / "host.1000.log"
+    source.write_text(
+        source.read_text() + "[STRACE] v=1 pid=1000 tid=1000 inv=1 hid=abc depth=2 name=chip.run.bind ts=2000 dur=10\n"
+    )
+    original_replace = sc.os.replace
+    failure_path = captures[1] / "dispatch_identity.json"
+
+    def fail_second_sidecar(staged, destination):
+        if destination == failure_path:
+            raise OSError("injected Rank 1 publication failure")
+        return original_replace(staged, destination)
+
+    monkeypatch.setattr(sc.os, "replace", fail_second_sidecar)
+    with pytest.raises(OSError, match="injected Rank 1"):
+        sc._generate_l3_trace(args, root)
+    assert [(capture / "dispatch_identity.json").read_text() for capture in captures] == previous_identities
+    assert {path: path.read_text() for path in previous_logs} == previous_logs
+    assert json.loads(output.read_text()) == previous_trace
+
+    for source in sources:
+        source.unlink()
+    offline = sc._build_parser().parse_args([str(root), "--dispatch-id", "17:5", "-o", str(output)])
+    sc._generate_l3_trace(offline, root)
+    assert json.loads(output.read_text())["traceEvents"] == previous_trace["traceEvents"]
+
+
+@pytest.mark.parametrize("failure_mode", ["directory", "replace"])
+def test_failed_trace_write_restores_previous_host_links(tmp_path, monkeypatch, failure_mode):
+    root = tmp_path / "dfx_outputs"
+    captures, sources, output, args = _paired_l3_with_parent(root)
+    sc._generate_l3_trace(args, root)
+    previous_trace = json.loads(output.read_text())
+    previous_identities = [(capture / "dispatch_identity.json").read_text() for capture in captures]
+
+    source = root / "host.1000.log"
+    source.write_text(
+        source.read_text() + "[STRACE] v=1 pid=1000 tid=1000 inv=1 hid=abc depth=2 name=chip.run.bind ts=2000 dur=10\n"
+    )
+    if failure_mode == "directory":
+        blocked_output = root / "blocked.json"
+        blocked_output.mkdir()
+        args.output = str(blocked_output)
+    else:
+        original_replace = sc.os.replace
+
+        def fail_trace_replace(staged, destination):
+            if destination == output:
+                raise OSError("injected trace replace failure")
+            return original_replace(staged, destination)
+
+        monkeypatch.setattr(sc.os, "replace", fail_trace_replace)
+    with pytest.raises(OSError):
+        sc._generate_l3_trace(args, root)
+
+    assert [(capture / "dispatch_identity.json").read_text() for capture in captures] == previous_identities
+    assert json.loads(output.read_text()) == previous_trace
+    for source in sources:
+        source.unlink()
+    offline_output = root / "reopened.json"
+    offline = sc._build_parser().parse_args([str(root), "--dispatch-id", "17:5", "-o", str(offline_output)])
+    sc._generate_l3_trace(offline, root)
+    assert json.loads(offline_output.read_text())["traceEvents"] == previous_trace["traceEvents"]
+
+
+def test_offline_merge_rejects_mixed_derived_log_publications(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    captures, sources, output, args = _paired_l3_with_parent(root)
+    sc._generate_l3_trace(args, root)
+    sidecar = captures[0] / "dispatch_identity.json"
+    identity = json.loads(sidecar.read_text())
+    identity["host_trace_publication_id"] = "0" * 32
+    sidecar.write_text(json.dumps(identity))
+    for source in sources:
+        source.unlink()
+
+    offline = sc._build_parser().parse_args([str(root), "--dispatch-id", "17:5", "-o", str(output)])
+    with pytest.raises(ValueError, match="different publications"):
+        sc._generate_l3_trace(offline, root)
+
+
+def test_ambiguous_parent_pids_leave_rank_timeline_without_parent_spans(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    _captures, _sources, output, args = _paired_l3_with_parent(root)
+    other_parent = root / "host.3000.log"
+    other_parent.write_text(
+        "[STRACE] v=1 pid=3000 tid=3000 inv=1 hid=abc depth=1 name=node.submit ts=500 dur=100 run_id=17 task_slot=5\n"
+    )
+    args.host_log.append(str(other_parent))
+
+    sc._generate_l3_trace(args, root)
+
+    trace = json.loads(output.read_text())
+    assert trace["metadata"]["parent_dispatch_status"] == "missing"
+    assert trace["metadata"]["dispatcher_pids"] == []
+    assert trace["metadata"]["rank_count"] == 2
+    assert not any(event.get("name", "").startswith("node.") for event in trace["traceEvents"])
+
+
+@pytest.mark.parametrize("session_available", [True, False])
+def test_parent_paired_l3_keeps_rank_merge_without_parent_log(tmp_path, session_available):
+    root = tmp_path / "dfx_outputs"
+    captures, _sources, output, args = _paired_l3_with_parent(root)
+    if session_available:
+        # Another dispatch overlaps the Rank windows but must not be drawn as
+        # the missing parent of this group.
+        (root / "host.2000.log").write_text(
+            "[STRACE] v=1 pid=2000 tid=2000 inv=1 hid=abc depth=1 "
+            "name=node.dispatch ts=1500 dur=20000 run_id=17 task_slot=6\n"
+        )
+        args.host_log = [str(source) for source in sorted(root.glob("host.*.log"))]
+    else:
+        (root / "host.2000.log").unlink()
+        # The automatic path has no --host-log and discovers only Rank-local
+        # alignment files after the session spool becomes unavailable.
+        for rank, capture in enumerate(captures):
+            (root / f"host.{1000 + rank}.log").rename(capture / f"host_clock_alignment.{1000 + rank}.log")
+        args.host_log = []
+
+    sc._generate_l3_trace(args, root)
+    for capture in captures:
+        identity = json.loads((capture / "dispatch_identity.json").read_text())
+        if session_available:
+            assert (capture / identity["host_trace"]).is_file()
+        else:
+            assert "host_trace" not in identity
+        assert "parent_host_trace" not in identity
+    trace = json.loads(output.read_text())
+    assert trace["metadata"]["parent_dispatch_status"] == "missing"
+    assert trace["metadata"]["rank_count"] == 2
+    assert trace["metadata"]["dispatcher_pids"] == []
+    if session_available:
+        for source in sorted(root.glob("host.*.log")):
+            source.unlink()
+        offline = sc._build_parser().parse_args([str(root), "--dispatch-id", "17:5", "-o", str(output)])
+        sc._generate_l3_trace(offline, root)
+        reopened = json.loads(output.read_text())
+        assert reopened["metadata"]["parent_dispatch_status"] == "missing"
+        assert reopened["traceEvents"] == trace["traceEvents"]
+
+
+def test_manual_host_log_merges_without_writing_derived_paths(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    captures, sources, output, args = _paired_l3_with_parent(root)
+    session = tmp_path / "session_logs"
+    session.mkdir()
+    external = [source.rename(session / source.name) for source in sources]
+    args.host_log = [str(path) for path in external]
+    args.publish_derived_host_logs = False
+
+    sc._generate_l3_trace(args, root)
+
+    metadata = json.loads(output.read_text())["metadata"]
+    assert metadata["parent_dispatch_status"] == "present"
+    assert metadata["host_logs"] == [str(path) for path in external]
+    for capture in captures:
+        assert "host_trace" not in json.loads((capture / "dispatch_identity.json").read_text())
+
+
+def test_manual_host_log_merges_legacy_captures_without_sidecars(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    for rank in (0, 1):
+        _write_l3_rank(root, rank, host_shift_ns=rank * 10_000, task_id=rank + 7)
+    sources = sorted(root.glob("host.*.log"))
+    output = root / "manual.json"
+    args = sc._build_parser().parse_args(
+        [str(root), "--dispatch", "d0", "-o", str(output), *sum((["--host-log", str(p)] for p in sources), [])]
+    )
+
+    sc._generate_l3_trace(args, root)
+
+    assert json.loads(output.read_text())["metadata"]["rank_count"] == 2
+
+
+def test_parent_dispatch_uses_the_latest_matching_submission_before_the_rank():
+    lines = [
+        f"[STRACE] v=1 pid=2000 tid=2000 inv=1 hid=abc depth=0 name={name} ts={start} dur=20 run_id=17 task_slot=5"
+        for name, start in (
+            ("node.submit", 100),
+            ("node.dispatch", 120),
+            ("node.complete", 300),
+            ("node.submit", 800),
+            ("node.dispatch", 820),
+            ("node.complete", 1600),
+        )
+    ]
+    selected = sc._dispatcher_spans(list(parse_spans(lines)), set(), (1000, 1500), (17, 5))
+    assert [(span.name, span.ts) for span in selected] == [
+        ("node.submit", 800),
+        ("node.dispatch", 820),
+        ("node.complete", 1600),
+    ]
+
+
 def test_l3_directory_merge_leaves_the_standalone_host_swimlane_alone(tmp_path):
     """The merge reads the same log; it does not change what the other tool writes."""
     root = tmp_path / "dfx_outputs"
@@ -573,6 +995,7 @@ def test_l3_directory_merge_keeps_scheduler_streams_and_lifecycle_records(tmp_pa
                 "register_release_end_cycles": device_base + 650,
             }
         ]
+        records["scheduler_tasks"]["producer"] = "aicore"
         records_path.write_text(json.dumps(records))
 
     output = tmp_path / "l3.json"
@@ -600,6 +1023,7 @@ def test_l3_directory_merge_keeps_scheduler_streams_and_lifecycle_records(tmp_pa
     }
     assert "rank0 / AICore Scheduler" in process_names
     assert "rank1 / AICore Scheduler" in process_names
+    assert not any(name.endswith(" / Scheduler View") for name in process_names)
     register_releases = [event for event in events if event.get("name") == "register_release"]
     assert {event["args"]["rank"] for event in register_releases} == {0, 1}
 
@@ -610,6 +1034,7 @@ def test_l3_parent_dispatch_identity_pairs_different_local_capture_indexes(tmp_p
     rank1 = _write_l3_rank(root, 1, host_shift_ns=10_000, task_id=8, dispatch="d1")
     _write_dispatch_identity(rank0, run_id=17, task_slot=5, group_index=0, group_size=2)
     _write_dispatch_identity(rank1, run_id=17, task_slot=5, group_index=1, group_size=2)
+    _write_parent_dispatch_span(root)
     output = tmp_path / "semantic.json"
     args = sc._build_parser().parse_args([str(root), "--dispatch-id", "17:5", "-o", str(output)])
 
@@ -1141,6 +1566,66 @@ def test_level_two_accepts_task_timing_from_either_scheduler_producer(tmp_path, 
     assert data["tasks"][0]["finish_time_us"] == pytest.approx(0.075)
 
 
+@pytest.mark.parametrize("producer", ["aicpu", "aicore"])
+@pytest.mark.parametrize("level", [2, 3, 4])
+def test_aicore_detail_keeps_task_boundaries_and_flows_on_worker_view(tmp_path, producer, level):
+    capture = Capture(runtime=HBG_RUNTIME, level=level, clock_freq_hz=1_000_000, scheduler_producer=producer)
+    for task_id, offset in [(7, 0), (8, 60)]:
+        capture.task(
+            task_id=task_id,
+            start=40 + offset,
+            end=70 + offset,
+            dispatch=20 + offset,
+            finish=75 + offset,
+            receive_to_start=5,
+        )
+        if level >= 3:
+            add_phase = capture.aicore_sched_phase if producer == "aicore" else capture.sched_phase
+            add_phase(phase="dispatch", start=18 + offset, end=22 + offset, task_id=task_id)
+            add_phase(phase="complete", start=75 + offset, end=78 + offset, task_id=task_id)
+    raw = tmp_path / "raw.json"
+    raw.write_text(json.dumps(capture.build()))
+    before = raw.read_bytes()
+    data = sc.read_perf_data(raw)
+    trace = _trace(
+        data["tasks"],
+        None,
+        runtime_name=HBG_RUNTIME,
+        scheduler_task_producer=data["scheduler_task_producer"],
+        chip_swimlane_level=data["chip_swimlane_level"],
+        scheduler_phases=data.get("scheduler_records"),
+        scheduler_streams=data.get("scheduler_streams"),
+        core_to_thread=[0],
+        deps_edges={7: [8]},
+    )
+    events = trace["traceEvents"]
+    hidden = producer == "aicore" and level >= 3
+    assert any(e.get("pid") == 3 for e in events) is not hidden
+    workers = [e for e in events if e.get("pid") == 4 and e.get("ph") == "X"]
+    assert len(workers) == 2
+    origin = 18 if level >= 3 else 20
+    for event, offset in zip(workers, (0, 60)):
+        assert event["ts"] == 35 + offset - origin
+        assert event["dur"] == 35
+        assert event["args"]["kernel-duration-us"] == 30
+        if hidden:
+            args = event["args"]
+            assert args["dispatch-time-us"] == 20 + offset - origin
+            assert args["receive-time-us"] == 35 + offset - origin
+            assert args["kernel-start-time-us"] == 40 + offset - origin
+            assert args["kernel-end-time-us"] == 70 + offset - origin
+            assert args["finish-time-us"] == 75 + offset - origin
+            assert args["scheduler-duration-us"] == 55
+    flows = [e for e in events if e.get("ph") in ("s", "f")]
+    for flow_id in {e["id"] for e in flows}:
+        assert sorted(e["ph"] for e in flows if e["id"] == flow_id) == ["f", "s"]
+    names = {e["name"] for e in flows}
+    assert "dependency" in names
+    if level >= 3:
+        assert {"dispatch", "complete"} <= names
+    assert raw.read_bytes() == before
+
+
 @pytest.mark.parametrize("dispatch_cycles,finish_cycles", [(125, 185), (115, 175)])
 def test_level_two_accepts_cross_producer_clock_skew(tmp_path, dispatch_cycles, finish_cycles):
     raw = tmp_path / "chip_swimlane_records.json"
@@ -1640,6 +2125,122 @@ def test_spmd_pred_routes_dependency_to_earliest_slice(tmp_path):
     assert sched_flow[1]["ts"] == tasks[4]["dispatch_time_us"]
 
 
+@pytest.mark.parametrize("runtime", [HBG_RUNTIME, TMR_RUNTIME])
+@pytest.mark.parametrize("level", [1, 2, 4])
+def test_perf_data_preserves_each_block_dispatch_identity(tmp_path, runtime, level):
+    capture = Capture(runtime=runtime, level=level)
+    for index, dispatch_id in enumerate((0, (1 << 32) - 1)):
+        arguments = {
+            "task_id": 7,
+            "core_id": 0,
+            "reg_task_id": dispatch_id,
+            "start": 100 + index * 100,
+            "end": 150 + index * 100,
+            "run_epoch": 9,
+        }
+        if level == 1:
+            capture.aicore_task(**arguments)
+        else:
+            capture.task(**arguments)
+    raw = tmp_path / "capture.json"
+    raw.write_text(json.dumps(capture.build()))
+
+    tasks = sc.read_perf_data(raw)["tasks"]
+
+    assert [task["reg_task_id"] for task in tasks] == [0, (1 << 32) - 1]
+    assert [task["task_id"] for task in tasks] == [7, 7]
+    assert [task["run_epoch"] for task in tasks] == [9, 9]
+    assert len({sc._execution_key(task) for task in tasks}) == 2
+
+
+@pytest.mark.parametrize("runtime", [HBG_RUNTIME, TMR_RUNTIME])
+@pytest.mark.parametrize("level", [1, 4])
+@pytest.mark.parametrize("reverse_blocks", [False, True])
+def test_multiblock_same_core_flows_bind_to_earliest_execution(tmp_path, runtime, level, reverse_blocks):
+    capture = Capture(runtime=runtime, level=level, clock_freq_hz=1_000_000)
+    for task_id, shift in ((7, 0), (8, 200)):
+        blocks = [(0, 90, 100, 140, 160), (1, 130, 170, 180, 190)]
+        for block, dispatch, start, end, finish in reversed(blocks) if reverse_blocks else blocks:
+            arguments = {
+                "task_id": task_id,
+                "reg_task_id": task_id * 2 + block,
+                "start": start + shift,
+                "end": end + shift,
+                "receive_to_start": 5,
+                "run_epoch": 11,
+            }
+            if level == 1:
+                capture.aicore_task(**arguments)
+            else:
+                capture.task(**arguments, dispatch=dispatch + shift, finish=finish + shift)
+    raw = tmp_path / "capture.json"
+    raw.write_text(json.dumps(capture.build()))
+    data = sc.read_perf_data(raw)
+    out = tmp_path / "trace.json"
+    _trace(
+        data["tasks"],
+        str(out),
+        deps_edges={7: [8]},
+        deps_block_map={7: 2, 8: 2},
+        runtime_name=runtime,
+    )
+    events = json.loads(out.read_text())["traceEvents"]
+
+    for pid in (4,) if level == 1 else (3, 4):
+        flows = [event for event in events if event.get("name") == "dependency" and event.get("pid") == pid]
+        assert len(flows) == 2
+        for task_id, phase in ((7, "s"), (8, "f")):
+            bars = [
+                event
+                for event in events
+                if event.get("ph") == "X" and event.get("pid") == pid and event.get("args", {}).get("taskId") == task_id
+            ]
+            assert len(bars) == 2
+            if pid == 3:
+                assert len({event["tid"] for event in bars}) == 2, "overlapping dispatches need separate lanes"
+            anchor = min(bars, key=lambda event: event["ts"])
+            flow = next(event for event in flows if event["ph"] == phase)
+            assert flow["bind_id"] == anchor["id"]
+            assert flow["tid"] == anchor["tid"]
+            assert flow["ts"] == anchor["ts"]
+
+
+def test_multiblock_same_core_complete_flow_binds_to_matching_execution(tmp_path):
+    raw = tmp_path / "capture.json"
+    raw.write_text(
+        json.dumps(
+            Capture(runtime=TMR_RUNTIME, level=4, clock_freq_hz=1_000_000)
+            .metadata(core_to_thread=[0])
+            .task(task_id=7, reg_task_id=0, start=100, end=140, dispatch=90, finish=160)
+            .task(task_id=7, reg_task_id=1, start=170, end=180, dispatch=130, finish=190)
+            .sched_phase(phase="complete", start=185, end=195)
+            .build()
+        )
+    )
+    data = sc.read_perf_data(raw)
+    out = tmp_path / "trace.json"
+    _trace(
+        data["tasks"],
+        str(out),
+        scheduler_phases=data["scheduler_records"],
+        core_to_thread=data["core_to_thread"],
+        deps_block_map={7: 2},
+        runtime_name=TMR_RUNTIME,
+    )
+    events = json.loads(out.read_text())["traceEvents"]
+    for pid in (3, 4):
+        bars = [event for event in events if event.get("ph") == "X" and event.get("pid") == pid]
+        anchor = min(bars, key=lambda event: event["ts"])
+        starts = [
+            event
+            for event in events
+            if event.get("name") == "complete" and event.get("ph") == "s" and event.get("pid") == pid
+        ]
+        assert len(starts) == 1
+        assert starts[0]["bind_id"] == anchor["id"]
+        assert starts[0]["tid"] == anchor["tid"]
+
+
 def test_spmd_succ_routes_dependency_to_earliest_slice(tmp_path):
     pred_id = 100
     succ_id = 200
@@ -1964,12 +2565,12 @@ def test_aicore_scheduler_uses_one_lane_and_display_names(tmp_path):
     out = tmp_path / "trace.json"
     scheduler_phases = [
         [
-            sched_record(phase="complete", start=1.0, end=4.0, tasks_processed=1, task_id=23),
-            sched_record(phase="resolve", start=2.0, end=3.0, tasks_processed=1, task_id=23),
+            sched_record(phase="complete", start=1.0, end=2.0, tasks_processed=1, task_id=23),
+            sched_record(phase="complete", start=2.0, end=3.0, tasks_processed=1, task_id=23),
             sched_record(phase="state_probe", start=4.0, end=5.0, tasks_processed=1, task_id=5),
             sched_record(phase="dispatch", start=5.0, end=6.0, tasks_processed=1, task_id=5),
-            sched_record(phase="worksteal", start=6.0, end=7.0, tasks_processed=1, task_id=7),
-            sched_record(phase="refill", start=7.0, end=8.0, tasks_processed=1, task_id=9),
+            sched_record(phase="dispatch", start=6.0, end=7.0, tasks_processed=1, task_id=7),
+            sched_record(phase="state_probe", start=7.0, end=8.0, tasks_processed=1, task_id=9),
         ]
     ]
     scheduler_streams = [
@@ -2005,11 +2606,11 @@ def test_aicore_scheduler_uses_one_lane_and_display_names(tmp_path):
     assert {event["tid"] for event in phases} == {30000}
     assert [event["name"] for event in phases] == [
         "Completion(t23)",
-        "Resolve(t23)",
+        "Completion(t23)",
         "StateProbe(t5)",
         "Dispatch(t5)",
-        "Worksteal(t7)",
-        "Refill(t9)",
+        "Dispatch(t7)",
+        "StateProbe(t9)",
     ]
     assert [event["args"]["task_id"] for event in phases] == [23, 23, 5, 5, 7, 9]
 
@@ -2220,6 +2821,8 @@ def test_l3_directory_merge_picks_the_captured_invocation_out_of_a_repeated_run(
         identity = json.loads(path.read_text())
         identity["endpoint_dispatch_id"] = 3
         path.write_text(json.dumps(identity))
+
+    _write_parent_dispatch_span(root, ts=5_000_000)
 
     args = sc._build_parser().parse_args([str(root), "--dispatch", "d0"])
     _, rank_metadata = sc._generate_l3_trace(args, root)
@@ -2543,3 +3146,468 @@ def test_a_trace_must_name_the_runtime_its_labels_follow(tmp_path):
 
     with pytest.raises(ValueError, match="metadata.runtime is missing"):
         sc.generate_chrome_trace_json([_task_row(_tmr(2, 100), 0)], str(out), core_to_thread=[0])
+
+
+# ---------------------------------------------------------------------------
+# Retained captures: one artifact per run, paired by its own dispatch identity
+# ---------------------------------------------------------------------------
+#
+# A retained collector publishes `records_e<epoch>.json` into a directory it
+# reserved under the run's own output prefix, so a capture directory holds its
+# dispatch identity and, one level down, the artifacts of the runs that named
+# that prefix. Those are paired by the identity each artifact publishes, never by
+# a filename or an epoch order — both repeat across incarnations. A capture that
+# still holds `chip_swimlane_records.json` keeps the older rule, which is
+# directory adjacency, with or without an identity object.
+
+
+_NONCE = "0f1e2d3c4b5a6978"
+# Rank 0's Worker View in a merged trace: the single-Rank view's pid 4, moved
+# one stride up by `_namespace_rank_trace`.
+_RANK0_WORKER_PID = sc._RANK_PID_STRIDE + 4
+
+
+def _worker_slice_names(events, pid):
+    """Each task's drawn name on one Worker View lane, keyed by its task id.
+
+    Only the per-task slices carry `taskId`; the lane also holds allocation
+    bars for dependency endpoints that produced no record, which this skips
+    rather than keys on.
+    """
+    return {
+        event["args"]["taskId"]: event["name"]
+        for event in events
+        if event.get("ph") == "X"
+        and event.get("cat") == "event"
+        and event.get("pid") == pid
+        and "taskId" in event.get("args", {})
+    }
+
+
+def _retain_capture(capture_dir, *, epoch, nonce=_NONCE, rank=None, run_id=17, dispatch_id=None, status="identified"):
+    """Move a capture's fixed-name records into a retained artifact.
+
+    Returns the artifact path. The record content is whatever the fixed-name
+    writer produced, so these cases differ from the Branch-A ones only in where
+    the file sits and what identity it publishes.
+    """
+    fixed = capture_dir / "chip_swimlane_records.json"
+    raw = json.loads(fixed.read_text())
+    if rank is None:
+        rank = int(capture_dir.parent.name.removeprefix("rank"))
+    if dispatch_id is None:
+        dispatch_id = int(capture_dir.name.removeprefix("d")) + 1
+    stated = status == "identified"
+    collection = raw["metadata"].setdefault("collection", {})
+    collection["run_epoch"] = epoch
+    collection["dispatch"] = {
+        "status": status,
+        "owner_instance_id": nonce if stated else None,
+        "chip_rank": rank if stated else None,
+        "capture_index": 0 if stated else None,
+        "run_id": run_id if stated else None,
+        "endpoint_dispatch_id": dispatch_id if stated else None,
+        "task_slot": 5 if stated else None,
+        "group_index": 0 if stated else None,
+        "group_size": 1 if stated else None,
+        "pipeline_slot": 0,
+        "pipeline_generation": 1,
+    }
+    retained = capture_dir / "swimlane-0"
+    retained.mkdir(parents=True, exist_ok=True)
+    artifact = retained / f"records_e{epoch}.json"
+    artifact.write_text(json.dumps(raw))
+    fixed.unlink()
+    return artifact
+
+
+def _identity_with_nonce(capture_dir, *, nonce=_NONCE, **kwargs):
+    """Write a sidecar carrying the owner nonce the artifact publishes."""
+    _write_dispatch_identity(capture_dir, **kwargs)
+    path = capture_dir / "dispatch_identity.json"
+    identity = json.loads(path.read_text())
+    identity["owner_instance_id"] = nonce
+    path.write_text(json.dumps(identity))
+
+
+def test_a_retained_capture_is_found_by_the_identity_it_publishes(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    artifact = _retain_capture(capture, epoch=4)
+
+    assert sc._capture_records_paths(capture) == [artifact]
+    # The companions stay in the capture directory, one level above the
+    # artifact, and are reachable because the identity was verified first.
+    assert sc._companion_directory(artifact) == capture
+    assert sc._capture_directory_of(artifact) == capture
+
+
+def test_a_retained_capture_whose_identity_disagrees_is_not_paired(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    # Another incarnation's nonce: the pid, the epoch and the directory are all
+    # identical, so only the nonce separates the two.
+    artifact = _retain_capture(capture, epoch=4, nonce="aaaaaaaaaaaaaaaa")
+
+    assert sc._capture_records_paths(capture) == []
+    # Unpaired, and its companions are refused rather than guessed at.
+    assert sc._companion_directory(artifact) == artifact.parent
+
+
+def test_a_retained_capture_stating_no_identity_is_never_matched(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    _retain_capture(capture, epoch=4, status="unidentified")
+
+    assert sc._capture_records_paths(capture) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        # Every spelling of "nothing stated" the producers can write. A key
+        # carrying one of these would match every other run that stated as
+        # little, so it must name nothing instead.
+        ("owner_instance_id", "0" * 16),
+        ("owner_instance_id", "not-hex-at-all!!"),
+        ("run_id", 0),
+        ("endpoint_dispatch_id", 0),
+        ("chip_rank", sc._ABSENT_CHIP_RANK),
+        ("chip_rank", True),
+    ),
+)
+def test_an_artifact_with_an_absent_key_component_is_not_paired(tmp_path, field, value):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    artifact = _retain_capture(capture, epoch=4)
+    raw = json.loads(artifact.read_text())
+    raw["metadata"]["collection"]["dispatch"][field] = value
+    artifact.write_text(json.dumps(raw))
+
+    assert sc._artifact_dispatch_key(artifact) is None
+    assert sc._capture_records_paths(capture) == []
+
+
+def test_a_retained_capture_with_no_sidecar_is_not_paired(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _retain_capture(capture, epoch=4)
+
+    assert sc._capture_records_paths(capture) == []
+
+
+def test_two_retained_captures_claiming_one_identity_pair_neither(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    first = _retain_capture(capture, epoch=4)
+    # A second file under the same key, which no correct producer writes: the
+    # reader reports it rather than taking whichever it globbed first.
+    (capture / "swimlane-0" / "records_e9.json").write_text(first.read_text())
+
+    assert sc._capture_records_paths(capture) == []
+
+
+def test_a_crash_temporary_is_not_read_as_a_retained_capture(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    artifact = _retain_capture(capture, epoch=4)
+    # Publication is a `link` onto the final name, so a `.tmp` is never an
+    # artifact — including one holding bytes that would otherwise parse.
+    (capture / "swimlane-0" / "records_e9.json.tmp").write_text(artifact.read_text())
+
+    assert sc._capture_records_paths(capture) == [artifact]
+
+
+def test_a_retained_capture_with_invalid_final_json_is_reported_not_paired(tmp_path, capsys):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    _retain_capture(capture, epoch=4)
+    (capture / "swimlane-0" / "records_e4.json").write_text("{ this is not json")
+
+    assert sc._capture_records_paths(capture) == []
+    assert "records_e4.json" in capsys.readouterr().err
+
+
+def test_a_fixed_name_capture_keeps_its_rule_with_no_identity_object(tmp_path):
+    """The non-retained path and every historical capture pair by adjacency."""
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+
+    assert sc._capture_records_paths(capture) == [capture / "chip_swimlane_records.json"]
+    assert sc._companion_directory(capture / "chip_swimlane_records.json") == capture
+    targets = sc.discover_l3_conversion_targets(root)
+    assert [target["dispatch"] for target in targets] == ["d0"]
+
+
+def test_a_mixed_capture_offers_both_forms_as_separate_units(tmp_path):
+    """Two shapes in one directory are two units, and are never merged."""
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    retained = _retain_capture(capture, epoch=4)
+    fixed = capture / "chip_swimlane_records.json"
+    fixed.write_text(retained.read_text())
+
+    assert sc._capture_records_paths(capture) == [fixed, retained]
+    targets = sc.discover_l3_conversion_targets(root)
+    assert [target["dispatch"] for target in targets] == ["d0:fixed", "d0:retained"]
+    assert [target["output_stem"] for target in targets] == ["l3_swimlane_d0_fixed", "l3_swimlane_d0_retained"]
+    # Each target names the exact file it selected, so a consumer whose merge
+    # failed converts that one rather than re-scanning the directory and
+    # finding the other form again.
+    assert [target["records_paths"] for target in targets] == [[fixed], [retained]]
+    assert [target["capture_dirs"] for target in targets] == [[capture], [capture]]
+    # Both selectors reach their own unit through the public directory mode.
+    for selector, expected in (("d0:fixed", fixed), ("d0:retained", retained)):
+        inputs, _ = sc._discover_l3_rank_inputs(root, selector)
+        assert inputs == [(0, expected)]
+
+
+def test_a_mixed_capture_refuses_an_unqualified_selector(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    retained = _retain_capture(capture, epoch=4)
+    (capture / "chip_swimlane_records.json").write_text(retained.read_text())
+
+    with pytest.raises(ValueError, match="d0:fixed, d0:retained"):
+        sc._discover_l3_rank_inputs(root, "d0")
+
+
+def test_a_selection_spanning_both_forms_across_ranks_is_refused(tmp_path):
+    """No single directory offers two forms here, so the per-directory check
+    cannot see this: rank0 kept its fixed file and rank1 retained its run, and
+    an unsuffixed selector would otherwise splice the two into one trace."""
+    root = tmp_path / "dfx_outputs"
+    rank0 = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7, dispatch="d0")
+    rank1 = _write_l3_rank(root, 1, host_shift_ns=10_000, task_id=8, dispatch="d0")
+    _identity_with_nonce(rank1, run_id=17, task_slot=5, group_index=0, group_size=1)
+    retained = _retain_capture(rank1, epoch=4, run_id=17)
+
+    with pytest.raises(ValueError, match="d0:fixed, d0:retained"):
+        sc._discover_l3_rank_inputs(root, "d0")
+    # Either suffix is a legal selection of one form, and each names the Rank
+    # that does not offer it rather than silently merging the other's.
+    with pytest.raises(ValueError, match="rank1 has no capture for d0"):
+        sc._discover_l3_rank_inputs(root, "d0:fixed")
+    with pytest.raises(ValueError, match="rank0 has no capture for d0"):
+        sc._discover_l3_rank_inputs(root, "d0:retained")
+    assert sc._capture_records_paths(rank0) == [rank0 / "chip_swimlane_records.json"]
+    assert sc._capture_records_paths(rank1) == [retained]
+
+
+def test_a_group_selection_spanning_both_forms_is_refused(tmp_path):
+    """The same split under one parent dispatch: group validation checks the
+    metadata and the owner, neither of which separates the two file forms."""
+    root = tmp_path / "dfx_outputs"
+    rank0 = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7, dispatch="d0")
+    rank1 = _write_l3_rank(root, 1, host_shift_ns=10_000, task_id=8, dispatch="d0")
+    _identity_with_nonce(rank0, run_id=17, task_slot=5, group_index=0, group_size=2)
+    _identity_with_nonce(rank1, run_id=17, task_slot=5, group_index=1, group_size=2)
+    _retain_capture(rank1, epoch=4, run_id=17)
+
+    with pytest.raises(ValueError, match="17:5:fixed, 17:5:retained"):
+        sc._discover_l3_rank_inputs(root, None, dispatch_identity="17:5")
+
+
+def test_retained_captures_are_discovered_across_dispatch_directories(tmp_path):
+    """One prefix per submission, so each run's artifact sits in its own dN."""
+    root = tmp_path / "dfx_outputs"
+    first = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7, dispatch="d0")
+    second = _write_l3_rank(root, 0, host_shift_ns=5_000, task_id=8, dispatch="d1")
+    _identity_with_nonce(first, run_id=17, task_slot=5, group_index=0, group_size=1)
+    _identity_with_nonce(second, run_id=18, task_slot=5, group_index=0, group_size=1)
+    _retain_capture(first, epoch=4, run_id=17)
+    _retain_capture(second, epoch=9, run_id=18)
+
+    targets = sc.discover_l3_conversion_targets(root)
+
+    assert [target["dispatch"] for target in targets] == ["d0", "d1"]
+    assert [Path(target["capture_dirs"][0]).name for target in targets] == ["d0", "d1"]
+    # Each selector resolves back to the artifact its own dN holds, which is
+    # what the SceneTest postprocessor re-invokes the CLI with.
+    for target, capture in ((targets[0], first), (targets[1], second)):
+        inputs, _ = sc._discover_l3_rank_inputs(root, target["dispatch"])
+        assert [path.parent.parent for _, path in inputs] == [capture]
+
+
+def test_a_retained_group_pairs_from_its_sidecars(tmp_path):
+    """Grouping stays sidecar-sourced: `task_slot` and `group_size` are
+    cross-checked by the artifact rather than read out of it."""
+    root = tmp_path / "dfx_outputs"
+    rank0 = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7, dispatch="d0")
+    rank1 = _write_l3_rank(root, 1, host_shift_ns=10_000, task_id=8, dispatch="d0")
+    _identity_with_nonce(rank0, run_id=17, task_slot=5, group_index=0, group_size=2)
+    _identity_with_nonce(rank1, run_id=17, task_slot=5, group_index=1, group_size=2)
+    _retain_capture(rank0, epoch=4, run_id=17)
+    _retain_capture(rank1, epoch=4, run_id=17)
+
+    inputs, pairing = sc._discover_l3_rank_inputs(root, None, dispatch_identity="17:5")
+
+    assert [rank for rank, _ in inputs] == [0, 1]
+    assert [path.parent.name for _, path in inputs] == ["swimlane-0", "swimlane-0"]
+    assert pairing["dispatch_pairing"] == "parent_dispatch_identity"
+    # The same group is found by traversal, with the capture directories the
+    # companions live in rather than the artifacts' own parents.
+    targets = sc.discover_l3_conversion_targets(root)
+    assert [target["dispatch_id"] for target in targets] == ["17:5"]
+    assert [Path(path).name for path in targets[0]["capture_dirs"]] == ["d0", "d0"]
+
+
+def test_a_retained_group_across_owner_incarnations_is_refused(tmp_path):
+    """Two Workers can agree on (run_id, task_slot); they are not one group."""
+    root = tmp_path / "dfx_outputs"
+    rank0 = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7, dispatch="d0")
+    rank1 = _write_l3_rank(root, 1, host_shift_ns=10_000, task_id=8, dispatch="d0")
+    _identity_with_nonce(rank0, run_id=17, task_slot=5, group_index=0, group_size=2)
+    _identity_with_nonce(rank1, nonce="aaaaaaaaaaaaaaaa", run_id=17, task_slot=5, group_index=1, group_size=2)
+    _retain_capture(rank0, epoch=4, run_id=17)
+    _retain_capture(rank1, epoch=4, run_id=17, nonce="aaaaaaaaaaaaaaaa")
+
+    with pytest.raises(ValueError, match="owner incarnations"):
+        sc._discover_l3_rank_inputs(root, None, dispatch_identity="17:5")
+
+
+def test_a_dispatch_key_two_directories_claim_pairs_neither(tmp_path, capsys):
+    """Only a traversal can see this: one directory cannot know what another
+    one claims, so the global check is where the ambiguity is caught."""
+    root = tmp_path / "dfx_outputs"
+    first = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7, dispatch="d0")
+    second = _write_l3_rank(root, 0, host_shift_ns=5_000, task_id=8, dispatch="d1")
+    # The same whole key under two dispatch directories, which no correct
+    # producer writes: `d1` is handed `d0`'s endpoint dispatch.
+    _identity_with_nonce(first, run_id=17, task_slot=5, group_index=0, group_size=1)
+    _identity_with_nonce(second, run_id=17, task_slot=5, group_index=0, group_size=1, endpoint_dispatch_id=1)
+    _retain_capture(first, epoch=4, run_id=17, dispatch_id=1)
+    _retain_capture(second, epoch=9, run_id=17, dispatch_id=1)
+
+    targets = sc.discover_l3_conversion_targets(root)
+
+    assert targets == []
+    assert "is claimed by" in capsys.readouterr().err
+
+
+def test_a_missing_capture_names_both_rules_it_failed(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    (capture / "chip_swimlane_records.json").unlink()
+
+    with pytest.raises(ValueError, match="neither d0/chip_swimlane_records.json nor a retained capture"):
+        sc._discover_l3_rank_inputs(root, "d0")
+
+
+def test_a_retained_capture_converts_with_the_companions_of_its_own_dispatch(tmp_path):
+    """The whole public conversion, not a lookup helper: a retained artifact's
+    sidecar, dependency file and name map all live one level above it, and are
+    read only after that directory's identity is confirmed to name it."""
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7, successor_task_id=8)
+    # This run's own dependency capture, in the capture directory beside the
+    # sidecar. It carries both halves the artifact cannot: the edge between the
+    # two tasks, and the kernel each one ran — without which the decoder leaves
+    # func_id at -1 and no name map can label anything.
+    (capture / "name_map.json").write_text(
+        json.dumps({"callable_id_to_name": {"0": "kernel_r0", "1": "kernel_r0_succ"}})
+    )
+    (capture / "deps.json").write_text(
+        json.dumps(
+            {
+                "edges": [{"pred": 7, "succ": 8}],
+                "tasks": [
+                    {"task_id": 7, "kernel_ids": [-1, 0, -1], "block_num": 1},
+                    {"task_id": 8, "kernel_ids": [-1, 1, -1], "block_num": 1},
+                ],
+            }
+        )
+    )
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    artifact = _retain_capture(capture, epoch=4)
+    output = tmp_path / "l3.json"
+    args = sc._build_parser().parse_args([str(root), "--dispatch", "d0", "-o", str(output)])
+
+    output_path, rank_metadata = sc._generate_l3_trace(args, root)
+
+    assert output_path == output
+    assert [item["rank"] for item in rank_metadata] == [0]
+    assert [item["input"] for item in rank_metadata] == [str(artifact.relative_to(output.parent))]
+    # The sidecar in dN, which the artifact's own directory does not hold.
+    assert rank_metadata[0]["dispatch_identity"]["run_id"] == 17
+    assert rank_metadata[0]["dispatch_identity"]["endpoint_dispatch_id"] == 1
+    trace = json.loads(output.read_text())
+    assert trace["metadata"]["dispatch_pairing"] == "local_capture_index"
+
+    events = trace["traceEvents"]
+    # Rank 0's Worker View, namespaced one stride above the Host block.
+    worker_pid = _RANK0_WORKER_PID
+    drawn = _worker_slice_names(events, worker_pid)
+    # The name map and the kernel map both came from dN: without the kernel
+    # map these read `task(...)`, and without the name map `func_0(...)`.
+    assert drawn[7].startswith("kernel_r0(")
+    assert drawn[8].startswith("kernel_r0_succ(")
+    # And the edge between them, from the same directory's deps.json.
+    flows = [
+        event
+        for event in events
+        if event.get("cat") == "flow" and event.get("name") == "dependency" and event.get("pid") == worker_pid
+    ]
+    starts = [event for event in flows if event.get("ph") == "s"]
+    assert len(starts) == 1
+    finishes = [event for event in flows if event.get("ph") == "f" and event["id"] == starts[0]["id"]]
+    assert len(finishes) == 1
+    # The arrow leaves the predecessor's slice and lands on the successor's.
+    assert starts[0]["ts"] < finishes[0]["ts"]
+
+
+def test_a_retained_capture_without_a_dependency_file_cannot_name_its_task(tmp_path):
+    """The negative control for the case above: the same capture with no
+    dependency file beside it leaves the decoder at func_id -1, so the name map
+    alone cannot label the task — which is what makes the assertions above
+    evidence that both companions were read."""
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    _retain_capture(capture, epoch=4)
+    output = tmp_path / "l3.json"
+    args = sc._build_parser().parse_args([str(root), "--dispatch", "d0", "-o", str(output)])
+
+    sc._generate_l3_trace(args, root)
+
+    trace = json.loads(output.read_text())
+    drawn = _worker_slice_names(trace["traceEvents"], _RANK0_WORKER_PID)
+    assert drawn[7].startswith("task(")
+
+
+def test_an_unpaired_retained_capture_converts_from_what_it_was_given(tmp_path, capsys):
+    """Explicit single-file conversion never reaches an unverified ancestor."""
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    artifact = _retain_capture(capture, epoch=4, nonce="aaaaaaaaaaaaaaaa")
+
+    args = sc._build_parser().parse_args([str(artifact)])
+    func_names, _ = sc._load_func_names(args, artifact)
+
+    assert func_names == {}
+    assert "is not paired with a dispatch identity" in capsys.readouterr().err
+
+
+def test_percounter_l1_keeps_graph_task_identity_and_setup_interval(tmp_path):
+    task = _task_row(_hbg_sub_task(7, 2), 0, start=11.0, end=20.0, receive=10.5, run_epoch=4)
+    output = tmp_path / "percounter.json"
+    sc.generate_chrome_trace_json([task], str(output), runtime_name="percounter")
+    events = json.loads(output.read_text())["traceEvents"]
+    worker = [e for e in events if e.get("ph") == "X" and e.get("pid") == 4]
+    assert len(worker) == 1
+    assert "g7t2" in worker[0]["name"]
+    assert worker[0]["dur"] == pytest.approx(9.5)
+    assert worker[0]["args"]["kernel-duration-us"] == pytest.approx(9.0)
+    assert worker[0]["args"]["local_setup_us"] == pytest.approx(0.5)
+    assert worker[0]["args"]["run_epoch"] == 4

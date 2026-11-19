@@ -57,20 +57,55 @@ endfunction()
 # src/common/<runtime> is load-bearing and not optional: the runtime-agnostic
 # platform and worker sources reach this runtime's runtime.h / types.h / task_id.h
 # by bare name, and resolve to the other runtime's copy when it is absent.
+#
+# Both the arch-local and the shared tree carry an "orchestration" directory, and
+# which one holds the runtime's orchestration API differs by runtime:
+# tensormap_and_ringbuffer keeps its copy per arch, host_build_graph shares one
+# under host/ because its orchestration runs on the host. All of them are on the
+# path, so an orchestration source resolves the API by bare name either way, and
+# an entry that matches nothing for a given runtime simply contributes nothing.
 function(simpler_ut_includes arch runtime tier out_var)
     set(_rt "${SIMPLER_SRC}/${arch}/runtime/${runtime}")
     if(NOT IS_DIRECTORY "${_rt}")
         message(FATAL_ERROR "No such runtime tree: ${_rt}")
     endif()
     set(_dirs "${_rt}/orchestration")
+    if(arch STREQUAL "a5" AND runtime STREQUAL "tensormap_and_ringbuffer")
+        get_property(_pto_root GLOBAL PROPERTY SIMPLER_UT_PTO_ISA_ROOT)
+        if(NOT _pto_root)
+            find_package(Python3 COMPONENTS Interpreter REQUIRED)
+            execute_process(
+                COMMAND "${Python3_EXECUTABLE}" -c
+                    "from simpler_setup.pto_isa import ensure_pto_isa_root; print(ensure_pto_isa_root())"
+                WORKING_DIRECTORY "${SIMPLER_REPO_ROOT}"
+                OUTPUT_VARIABLE _pto_root
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                RESULT_VARIABLE _pto_result)
+            if(NOT _pto_result EQUAL 0)
+                message(FATAL_ERROR "Failed to resolve pinned PTO-ISA headers")
+            endif()
+            set_property(GLOBAL PROPERTY SIMPLER_UT_PTO_ISA_ROOT "${_pto_root}")
+        endif()
+        list(APPEND _dirs "${_pto_root}/include")
+    endif()
+    # Host image packing is selected by the runtime's own include directory.
+    if(IS_DIRECTORY "${_rt}/host/image")
+        list(APPEND _dirs "${_rt}/host/image")
+    endif()
     # Only host_build_graph splits out a host/ directory.
     if(IS_DIRECTORY "${_rt}/host")
         list(APPEND _dirs "${_rt}/host")
     endif()
     list(APPEND _dirs "${_rt}/runtime" "${_rt}/common")
+    if(arch STREQUAL "a5")
+        list(APPEND _dirs "${SIMPLER_SRC}/a5/runtime")
+    endif()
 
     simpler_ut_common_includes("${arch}" "${tier}" _common)
-    list(APPEND _dirs ${_common} "${SIMPLER_SRC}/common/${runtime}")
+    list(APPEND _dirs ${_common} "${SIMPLER_SRC}/common/${runtime}"
+         "${SIMPLER_SRC}/common/${runtime}/orchestration"
+         "${SIMPLER_SRC}/common/${runtime}/host/orchestration"
+         "${SIMPLER_SRC}/common/${runtime}/host")
 
     set(${out_var} "${_dirs}" PARENT_SCOPE)
 endfunction()

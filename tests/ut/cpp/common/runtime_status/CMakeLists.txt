@@ -10,9 +10,8 @@
 # Tests for src/common/runtime_status/.
 #
 # The SIMPLER_ERROR_* codes the name table switches on live in a runtime's own
-# common/runtime_status.h. Only tensormap_and_ringbuffer has one, and its a2a3
-# and a5 copies are the same file byte for byte, so one build covers every
-# context this table is compiled in.
+# common/runtime_status.h. This target selects the A2/A3 tensormap_and_ringbuffer
+# header, including its kernel-validation codes.
 macro(runtime_status_case src)
     simpler_ut_plain_case(${src}
         INCLUDES

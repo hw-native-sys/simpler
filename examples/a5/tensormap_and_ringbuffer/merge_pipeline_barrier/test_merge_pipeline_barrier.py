@@ -58,7 +58,7 @@ class TestMergePipelineBarrier(SceneTestCase):
         {
             # Onboard only: the busy-wait barrier needs all block_num logical
             # blocks co-resident. A5 supports 36 logical blocks, while this task
-            # uses block_num=8 via launch_spec.set_core_num in merge_orch.cpp.
+            # uses block_num=8 via launch_spec.set_block_num in merge_orch.cpp.
             "name": "merge",
             "platforms": ["a5"],
             "params": {},

@@ -30,7 +30,7 @@ def group_reservation_orch_fn(orch, callables, task_args, config):
         name="reservation",
         workers=[0, 1, 2],
         window_size=4 * 1024,
-        buffers=[CommBufferSpec(name="state", dtype="int32", count=2, nbytes=8)],
+        buffers=[CommBufferSpec(name="state", dtype="int32", count=2, nbytes=64)],
     ) as handle:
 
         def make_args(worker_id, output_name, operation):

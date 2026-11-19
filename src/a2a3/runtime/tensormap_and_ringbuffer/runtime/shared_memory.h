@@ -38,6 +38,8 @@
 
 #pragma once
 
+#include <type_traits>
+
 #include <stddef.h>
 
 #include "utils/device_arena.h"
@@ -137,30 +139,31 @@ struct alignas(CHIP_ALIGN_SIZE) SharedMemoryHeader {
 
     // === ERROR REPORTING ===
 
-    // Orchestrator fatal error code (Orchestrator → Scheduler, AICPU → Host)
-    // Non-zero signals fatal error. Written by orchestrator, read by scheduler and host.
+    // Fatal channel polled by orchestration waits, scheduler and Host.
+    // Orchestrator reports its own errors; scheduler relays completion failures.
     std::atomic<int32_t> orch_error_code;
 
     // Scheduler error state (Scheduler → Host, independent of orchestrator)
     // Written by scheduler threads on timeout; read by orchestrator and host.
     std::atomic<uint32_t> sched_error_bitmap;  // Bit X set = thread X had error
-    std::atomic<int32_t> sched_error_code;     // Last scheduler error code (last-writer-wins)
-    std::atomic<int32_t> sched_error_thread;   // Thread index of last error writer
+    std::atomic<int32_t> sched_error_code;     // First scheduler error code
+    std::atomic<int32_t> sched_error_thread;   // Thread index of first error writer
 
     // Sub-classification + locators for a sched_error_code==100 timeout. Written
     // by the scheduler thread that wins the code latch; read by host so it can
     // distinguish device error TYPES (SIMPLER_STALL_DETAIL_*) without reading the
     // device log. The full stall snapshot stays in the device log / plog — only
     // this one class + a few locator ints cross the boundary.
-    std::atomic<int32_t> sched_stall_detail;       // SIMPLER_STALL_DETAIL_* (NONE when no timeout)
-    std::atomic<int32_t> sched_stall_completed;    // completed_tasks_ at timeout
-    std::atomic<int32_t> sched_stall_total;        // total_tasks_ at timeout
-    std::atomic<int32_t> sched_stall_cnt_running;  // tasks observed RUNNING (on a core)
-    std::atomic<int32_t> sched_stall_cnt_ready;    // tasks fanin-satisfied but not dispatched
-    std::atomic<int32_t> sched_stall_cnt_waiting;  // tasks still waiting on fanin
-    std::atomic<int32_t> sched_stall_orch_done;    // orchestrator_done flag at timeout (0/1)
-    std::atomic<TaskId> sched_stall_task_id;       // S1: stuck task_id (invalid() if N/A)
-    std::atomic<int32_t> sched_stall_core;         // S1: stuck core id (-1 if N/A)
+    std::atomic<int32_t> sched_stall_detail;          // SIMPLER_STALL_DETAIL_* (NONE when no timeout)
+    std::atomic<int32_t> sched_stall_completed;       // completed_tasks_ at timeout
+    std::atomic<int32_t> sched_stall_total;           // total_tasks_ at timeout
+    std::atomic<int32_t> sched_stall_cnt_running;     // tasks observed RUNNING (on a core)
+    std::atomic<int32_t> sched_stall_cnt_ready;       // tasks fanin-satisfied but not dispatched
+    std::atomic<int32_t> sched_stall_cnt_waiting;     // tasks still waiting on fanin
+    std::atomic<int32_t> sched_stall_orch_done;       // orchestrator_done flag at timeout (0/1)
+    std::atomic<TaskId> sched_stall_task_id;          // S1/S6: stuck task_id (invalid() if N/A)
+    std::atomic<int32_t> sched_stall_core;            // S1: stuck core id (-1 if N/A)
+    std::atomic<int32_t> sched_stall_cnt_async_wait;  // tasks whose FINs handed completion to the async consumer
 };
 
 static_assert(sizeof(SharedMemoryHeader) == 896, "SharedMemoryHeader layout drift");
@@ -191,6 +194,22 @@ static_assert(SHARED_MEMORY_ERROR_TAIL_BYTES == 112, "SharedMemoryHeader error t
 // =============================================================================
 // Shared Memory Handle
 // =============================================================================
+
+// Host-validated geometry for one immutable runtime image. Offsets are
+// relative to its SM base; backing addresses and sizing remain valid together.
+struct PreparedRingOffsets {
+    uint64_t descriptors;
+    uint64_t payloads;
+    uint64_t slot_states;
+};
+
+struct PreparedRunLayout {
+    PreparedRingOffsets rings[CHIP_MAX_RING_DEPTH];
+    uint64_t sm_bytes;
+    uint64_t heap_bytes;
+};
+static_assert(sizeof(PreparedRunLayout) == 24 * CHIP_MAX_RING_DEPTH + 16);
+static_assert(std::is_trivially_copyable_v<PreparedRunLayout> && std::is_standard_layout_v<PreparedRunLayout>);
 
 /**
  * Handle for shared memory lifecycle management (create/destroy).
@@ -226,6 +245,11 @@ struct SharedMemoryHandle {
     bool init_per_ring(
         void *sm_base, uint64_t sm_size, const uint64_t task_window_sizes[CHIP_MAX_RING_DEPTH],
         const uint64_t heap_sizes[CHIP_MAX_RING_DEPTH]
+    );
+
+    bool init_prepared(
+        void *sm_base, uint64_t sm_size, const uint64_t task_window_sizes[CHIP_MAX_RING_DEPTH],
+        const uint64_t heap_sizes[CHIP_MAX_RING_DEPTH], const PreparedRunLayout &prepared
     );
 
     void destroy();

@@ -1,7 +1,11 @@
 # Graph Execution
 
-Graph Execution is available only in the `host_build_graph` runtime. A Graph is
-a composite incore task: it occupies one task window slot and completes once,
+Graph recording and replay are shared by `host_build_graph` and A5 `percounter`.
+This page describes the common recording/cache contracts and the A2/A3 HBG
+`GraphExecution` materializer. Default A5 HBG uses Host-prepared Calls and compact
+native topology; WSE and percounter have their own execution contracts.
+
+A Graph is a composite incore task: it occupies one task window slot and completes once,
 like any other task of the run, but contains a recorded DAG of sub-tasks. It
 is a container in the same sense an SPMD task is — SPMD expands one slot into
 `logical_block_num` blocks, a Graph expands one slot into its recorded sub-tasks
@@ -15,12 +19,11 @@ recording's own address space instead of consuming task-window slots or heap.
 Later calls for the same in-flight identity submit more shells without waiting
 for recording, and a call for a *different* identity opens its own recording on
 its own thread rather than waiting. At orchestration completion, the caller joins
-every recording and fills each shell's heap range and the device address of the
-Definition object it replays.
+every recording, fills each shell's heap range and prepares the recorded Graph
+representation that its runtime consumes.
 Cached invocations submit the same one `GRAPH` task directly — a cache hit never
-waits on a recording. In both cases the device Scheduler expands the saved
-topology and dispatches the sub-tasks; the Host Orchestrator never submits
-them as tasks of the run itself.
+waits on a recording. Each runtime turns the saved topology into executable
+sub-tasks; the Host Orchestrator does not append them to the top-level task window.
 
 Boundary contracts are checked before an in-flight shell is accepted. Once a
 shell has entered the task/dependency sequence, an unsupported construct found
@@ -34,7 +37,29 @@ A Graph boundary uses `GraphTaskArgs`; a sub-task's arguments use
 `CoreTaskArgs`, the existing incore argument type:
 
 ```cpp
-void graph_function(const GraphTaskArgs &args, int variant) {
+// The values this Graph is built from. They are fixed for the run, so they belong
+// to the Graph's identity rather than to its boundary: hash() joins the cache key,
+// and operator== settles a key collision between two Configs.
+//
+// The constructor is not decoration. ConfigBase has a virtual destructor, so a
+// derived Config has a virtual function and is therefore not an aggregate --
+// `LayerConfig{4, false}` does not compile without one.
+struct LayerConfig : simpler::hbg::ConfigBase {
+    LayerConfig(int64_t blocks, bool transpose) :
+        cohort_blocks(blocks), transposed(transpose) {}
+
+    int64_t cohort_blocks;
+    bool transposed;
+
+    uint64_t hash() const {
+        return simpler::hbg::config_hash(cohort_blocks, transposed);
+    }
+    bool operator==(const LayerConfig &o) const {
+        return cohort_blocks == o.cohort_blocks && transposed == o.transposed;
+    }
+};
+
+void layer(const GraphTaskArgs &args, const LayerConfig &config) {
     const ChipTensor &input = args.tensor(0).ref();
     const ChipTensor &weight = args.tensor(1).ref();
     const ChipTensor &output = args.tensor(2).ref();
@@ -49,7 +74,7 @@ void graph_function(const GraphTaskArgs &args, int variant) {
     matmul_args.add_output(intermediate);
     matmul_args.add_scalar(args.scalar(0));  // forwarded boundary parameter
     TaskOutputTensors matmul = rt_submit_aic_task(
-        variant == 0 ? FUNC_MATMUL : FUNC_MATMUL_TRANSPOSED,
+        config.transposed ? FUNC_MATMUL_TRANSPOSED : FUNC_MATMUL,
         matmul_args
     );
 
@@ -60,15 +85,34 @@ void graph_function(const GraphTaskArgs &args, int variant) {
 }
 
 void submit_layer(const GraphTaskArgs &args) {
-    rt_submit_graph(&graph_function, args, /*variant=*/0);
+    rt_submit_graph(&layer, args, LayerConfig{/*cohort_blocks=*/4, /*transposed=*/false});
 }
 ```
 
-The function pointer is the default Graph identity. Trailing integral,
-`float`, `double`, and `bool` construction parameters are forwarded to the
-Graph function and hashed by value into the cache key. They are separate from
-execution scalars in `GraphTaskArgs`: changing a construction parameter selects a
-different Definition rather than patching an existing one.
+The function pointer is the default Graph identity. A Config derives from
+`simpler::hbg::ConfigBase` and declares `uint64_t hash() const` and
+`bool operator==(const ItsOwnType &) const`; neither is virtual, and omitting
+either is a compile error at the submission rather than a template expansion.
+A Graph that takes no construction parameters passes nothing, which is the same
+submission as passing `simpler::hbg::DefaultConfig{}`.
+
+A Config's hash selects a registry bucket. Within that bucket, the Graph id,
+Config type, and `operator==` identify a submission. Equal identities reuse one
+internal key; unequal identities receive different keys even when their hashes
+collide. Those keys select separate Definitions in both the host cache and the
+upload path. Keys live only for the bind and are reset with the Config registry.
+Configs equal under `operator==` must return the same hash. Build it with
+`simpler::hbg::config_hash`, passing every field `operator==`
+compares, in the same order, to keep collision buckets small.
+
+A Config must be copy-constructible and self-contained: the retained copy outlives
+the submit call, and the recording job that reads it runs on another thread, so a
+pointer or `string_view` into caller storage dangles.
+
+Construction parameters are separate from the execution scalars in
+`GraphTaskArgs`: changing a Config selects a different Definition rather than
+patching an existing one, while a boundary scalar is refreshed per invocation and
+patches nothing.
 
 An explicit identity is available for call sites that want to choose what counts
 as the same Graph, rather than letting the Graph function's address decide:
@@ -76,9 +120,9 @@ as the same Graph, rather than letting the Graph function's address decide:
 ```cpp
 rt_submit_graph(
     GRAPH_KEY("qwen_decoder_layer_v1"),
-    &graph_function,
+    &layer,
     args,
-    /*variant=*/0
+    LayerConfig{/*cohort_blocks=*/4, /*transposed=*/false}
 );
 ```
 
@@ -89,11 +133,19 @@ hazard is silent: an explicit `GRAPH_KEY` must be unique for every distinct Grap
 function in an orchestration callable, or one of them replays the other's
 recorded topology.
 
-What the explicit form does not give is a key that outlives the process. A Graph
-is looked up by `graph_full_key(callable_hash, graph_key)`, and `callable_hash`
-is the orchestration entry's own address, so no key is stable across runs — and
-none needs to be, since a Definition cache lives inside one orchestration run and
-is never persisted.
+An invocation may declare explicit predecessors with
+`GraphTaskArgs::set_dependencies`. They order that invocation's outer `GRAPH`
+shell, including its first recording and an in-flight or cached reuse. Their
+count and ids may change between invocations without changing the Definition.
+The recording's formal parameters contain no such predecessors; recorded tasks
+must still express their internal edges using their own local ids or boundary
+tensor provenance. An accepted submission returns a valid outer `task_id` on
+all three paths. That completion covers the whole body, never one internal task.
+
+The Definition cache belongs to one orchestration run and is never persisted.
+It uses `graph_key` directly for recording, reuse, upload matching, and Definition
+framing validation. Separate runs have independent caches, so orchestration
+callable identity is not part of the key.
 
 A caller that emits one C++ function per Graph wants
 `rt_submit_graph(function, args)` instead: the function's address is already the
@@ -113,83 +165,48 @@ parameter on every replay. A slot names the parameter it came from, not the
 `Arg` it was copied through, so provenance survives any number of intermediate
 copies.
 
-Reading a parameter as a value freezes it, and the type system says so: an
+A boundary scalar offers no value read at all, and the type system says so: an
 `InheritableScalar` has no conversion to a number, so `uint64_t v =
-args.scalar(i)` and `static_cast<int32_t>(args.scalar(i))` do not compile. A
-value read has to name the type it is reading — `args.scalar<T>(i)` — and what
-it produces is a plain `T`: the destination slot becomes static Definition data
-holding the recording invocation's number, and later cache hits replay that
-number. Forwarding never converts, which is what keeps a correct pass-through
-silent.
+args.scalar(i)` and `static_cast<int32_t>(args.scalar(i))` do not compile, and
+there is no `args.scalar<T>(i)` to reach for either.
 
-Because freezing is what a value read does, **a value read requires parameter
-`i` to be static.** A dynamic parameter names a value the caller may change, so
-a number taken out of one would be the recording invocation's, replayed for
-every invocation after it. There is no fallback from that either — the ordinary
-path runs the same body and reaches the same read — so `args.scalar<T>(i)`
-asserts on a dynamic parameter rather than warning, and the assertion's stack
-trace names the read. The check is a run-time one because a parameter's
-declaration is a run-time value and `i` is usually a loop variable.
+That is not a restriction on what a body may compute with — it is where the
+value comes from. **A Graph's fixed values live in its `Config`,** which the
+body receives alongside the boundary:
 
-A body therefore has two shapes available per parameter, and which one it needs
-is a statement about the value:
+```cpp
+void layer(const GraphTaskArgs &args, const LayerConfig &config) {
+    const int64_t cohort = config.cohort_blocks;   // fixed for the run
+    sub_task.add_scalar(args.scalar(0));           // refreshed per invocation
+}
+```
 
-| The body | Boundary side | Body side |
-| -------- | ------------- | --------- |
-| only passes the parameter on | `add_scalar(v)` — dynamic | `auto x = args.scalar(i);` then `add_scalar(x)` |
-| computes with the number | `add_static_scalar(v)` — static | `T x = args.scalar<T>(i);` |
+The split is what each half is for. A boundary parameter is refreshed out of
+the submitting invocation's own payload, so it is what a body *forwards*; a
+Config value is folded into the Graph key, so two different Configs record two
+Definitions and a body may read either one as an ordinary number. Taking a
+number out of a boundary parameter instead would freeze the recording
+invocation's value into the Definition and replay it for every invocation
+after — which is why that read does not exist.
 
-Holding a handle in a named local is safe, and is the whole of the first shape:
-a handle carries its own origin, so a slot it is forwarded into still names
-parameter `i` however many locals it passed through. That also means `auto` is
-the audit — `InheritableScalar` converts to nothing, so a use that is *not* a
-pure forward fails to compile.
-
-The second shape costs reuse whenever the value moves, and the cost is not paid
-once — see **Supported dynamic and static data** below. Prefer the first shape
-unless the body genuinely needs the number.
+Holding a handle in a named local is safe: a handle carries its own origin, so
+a slot it is forwarded into still names parameter `i` however many locals it
+passed through. `auto` is the audit — `InheritableScalar` converts to nothing,
+so a use that is *not* a pure forward fails to compile.
 
 Because the diagnostic is the absence of a conversion rather than a
 deprecation, it has no blind spot. A value read inside third-party template
 code — `EXPECT_EQ(args.scalar(i), v)` is the case that motivated this — fails
 there too, where a `[[deprecated]]` attribute would have been suppressed for
 being instantiated inside a system header. To inspect a slot's raw bits without
-reading it as a parameter — which a test may legitimately want on a dynamic one
-— use `pack_scalars()`, which hands out the slots rather than the parameters.
+reading it as a parameter — which a test may legitimately want — use
+`pack_scalars()`, which hands out the slots rather than the parameters.
 
-When a value read is what you meant, say so with `args.scalar<T>(i)`. It
-applies `to_u64`'s actual inverse, which `static_cast` is not — a float slot
-holds a bit pattern, so `static_cast<float>` of `1.0f`'s pattern yields
-`1065353216.0`. An enum has no other spelling at all:
-`static_cast<DataType>(args.scalar(i))` does not compile, because the handle
-converts to nothing and `static_cast` has no conversion to apply.
-
-`args.scalar<T>(i)` is also the *only* spelling that reads a parameter as a
-value. A handle offers no value read at all, so once a parameter has been
-passed on as one, forwarding is all that is left to do with it. That is not a
-restriction on what you can express — the `Arg` is where a read can be checked
-against the slot's declaration, and a handle carries no way to tell a dynamic
-parameter from a static one, because `scalar(i)` hands out a self-pointing
-origin either way.
-
-Freezing on purpose goes through that same read. `add_static_scalar` rejects an
-`InheritableScalar` at compile time: a handle names a parameter, so declaring
-the handle static would freeze whatever value that parameter holds right now
-without the body ever saying it read one. Say
-`task_args.add_static_scalar(args.scalar<uint64_t>(i))` instead — the read takes
-the value, `add_static_scalar` declares the destination slot static, and the
-slot is recorded as Definition data holding the value the enclosing parameter
-had at record time. Reach for a bare `args.scalar<T>(i)` when the body needs the
-number to compute with, and for this pair when a destination — typically a
-nested Graph's boundary — should hold that value. `T` is `uint64_t` here because
-a boundary slot is 8 bytes and the destination's body is what interprets them.
-
-A derived value freezes the same way, and needs the same explicit read — and so
-the same static declaration on the parameter it derives from:
-`args.scalar(i) + 1` does not compile, `args.scalar<uint64_t>(i) + 1` does and
-is frozen. Compute it before constructing the boundary and pass it as its own
-parameter, perform the transformation in a kernel, or use a construction
-parameter when the value changes the Graph's structure.
+A derived value needs the same treatment as a read: `args.scalar(i) + 1` does
+not compile, and there is no spelling that makes it. Compute it before
+constructing the boundary and pass it as its own parameter, perform the
+transformation in a kernel, or put it in the `Config` when it is fixed for the
+run.
 
 Boundary scalar slots are read-only: `scalar()` hands out the parameter, not a
 mutable reference, so a binding cannot be overwritten after it is forwarded.
@@ -197,7 +214,7 @@ mutable reference, so a binding cannot be overwritten after it is forwarded.
 **Only a parameter of the Graph's own boundary is refreshed on replay.** The
 Definition's scalar source refs index that boundary and nothing else, so a slot
 that inherits anything else — a slot of some other `GraphTaskArgs`, or one built
-inside the body — is static Definition data holding the value it resolved to at
+inside the body — is Definition data holding the value it resolved to at
 record time. The runtime does not reject that; which slot a body inherits from
 is the author's declaration, and this is the declared consequence. Two notes on
 why it cannot be diagnosed instead:
@@ -208,19 +225,22 @@ why it cannot be diagnosed instead:
 - Whether the outside slot's value changes between invocations is invisible
   here. If it does, the Definition keeps replaying the recorded one.
 
-## Supported dynamic and static data
+## Supported varying and fixed data
 
 - Boundary ChipTensor addresses may change for every invocation.
-- A **dynamic** boundary scalar's value may change for every invocation. A
-  **static** one may not: its value is part of the condition the Definition is
-  reused under, so a changed value takes the ordinary path rather than replaying
-  the old number. The warning names the parameter index and both values. Their
-  count is fixed by the recorded boundary contract, and so is each parameter's
-  declaration. Unused boundary scalars are allowed and do not create internal
+- A boundary scalar's value may change for every invocation — every one of them
+  is refreshed out of the submitting invocation's own payload, and none takes
+  part in the reuse condition. Their count is fixed by the recorded boundary
+  contract. Unused boundary scalars are allowed and do not create internal
   scalar patches.
-- A Graph boundary contains at least one ChipTensor.
-- Construction parameters are part of Graph identity and may control the
-  function's task count, kernel selection, or other structural choices.
+- A Graph boundary may contain no ChipTensor at all. A body that reaches its
+  buffers through handles its `Config` carries passes none, and such a boundary
+  records and publishes like any other. Every tensor such a body touches it
+  produces itself: a tensor the caller owns but did not pass as a parameter is
+  refused, whatever the boundary's count.
+- Construction parameters — the Graph's `Config` — are part of Graph identity
+  and may control the function's task count, kernel selection, or other
+  structural choices. Two Configs that differ record two Definitions.
 - Boundary ChipTensor shape, stride, dtype, size, direction, contiguity, and
   alias partition must match the first invocation.
 - A parameter's view origin (`start_offset`) may move between invocations, but
@@ -247,8 +267,8 @@ why it cannot be diagnosed instead:
   answerable from one address alone. None of them may be empty. And two
   parameters at one address must name one size — a parameter's recording-space
   window is reserved once per address and sized from the first parameter to
-  claim it, so its group has to agree on how wide that is. Either refusal sends
-  the invocation down the ordinary path.
+  claim it, so its group has to agree on how wide that is. Either refusal fails
+  the run.
 - Everything else about the body's shape is the author's declaration, not a
   checked property. A Graph key asserts that two invocations record the same
   topology: the same task count, the same kernel selection, the same edge set,
@@ -265,10 +285,10 @@ why it cannot be diagnosed instead:
   before the Graph, is refused by name: recording is abandoned and the bind fails
   rather than baking a Definition that would rebind that tensor to someone else's
   buffer. Pass it as a boundary parameter instead.
-- A recorded task may not depend on a task submitted before the Graph. The only
-  way to order a body behind one is to pass that task's output as a boundary
-  parameter, which the outer Graph task then depends on like any other argument.
-  An explicit dependency naming a task outside the Graph is refused by name.
+- A recorded task may not name a GLOBAL task submitted before the Graph in its
+  internal edges. Order the outer shell behind that producer through a boundary
+  tensor or an invocation-level explicit predecessor. An external task id read
+  directly inside the recorded body is still refused by name.
 - A recorded task may carry a dispatch predicate. Submit resolves a predicate
   into an absolute GM address, which no Definition can hold, so the Definition
   stores the operand tensor plus the element index within it, and materialize
@@ -277,28 +297,26 @@ why it cannot be diagnosed instead:
   task's own output; the predicate itself creates no dependency, exactly as on
   the ordinary path, so the caller still declares one on the operand's producer.
 
-Structural or alias mismatch logs a warning and executes the Graph function
-normally for that invocation. It never reuses heap offsets recorded for a
-different shape. Debug builds also assert at these unsupported boundaries so
-development catches a violated fixed-shape contract immediately; the ordinary
-path remains the defensive release-build behavior.
+Structural or alias mismatch latches `SIMPLER_ERROR_INVALID_ARGS` and names, in
+one log line, which parameter moved and in which field. The invocation publishes
+no shell and opens no recording, and no heap offset recorded for one shape is
+ever reused for another.
 
-**A mismatch is not retried, and for a published key it is permanent.** The
+**A mismatch fails the run; it is not a retry and not a fallback.** The
 Definition cache holds one record per Graph key and nothing evicts or replaces
-it, and the cache-hit path returns as soon as the match fails rather than
-falling through to recording. So every later invocation carrying the value that
-did not match repeats the same sequence: find the Definition, fail the match,
-warn, and run the body itself. The run stays correct — the ordinary path
-computes from the caller's own arguments — but the key has lost Definition reuse
-for the rest of the run.
+it, so a boundary that disagrees with its Definition disagrees with it for good.
+Reporting that is the point: the alternative is an invocation that computes the
+right answer while silently losing Definition reuse for the rest of the run,
+which is a performance cliff with no symptom.
 
-This is what bounds `add_static_scalar` on a boundary. Declaring a parameter
-static is safe whatever its value does, and that is the point of the
-declaration; it is only *free* while the value is genuinely fixed for the run.
-A parameter that varies per invocation and is merely frozen by habit will match
-on the recording invocation and miss on every one after it, which costs more
-than the body it was meant to skip. Forward such a parameter instead — a
-forwarded slot is refreshed on replay, so the Definition keeps being reused.
+This is what bounds a `Config`. A value that genuinely is fixed for the run
+costs nothing there: it is folded into the key once, and every invocation
+carrying it finds the same Definition. A value that varies per invocation puts
+a *new key* on every submission, so each one records its own Definition and the
+cache fills with single-use entries — which costs more than the bodies it was
+meant to skip. Pass such a value through the boundary instead; a boundary
+parameter is refreshed on replay, so one Definition keeps serving every
+invocation.
 
 ## Qwen decoder-layer example
 
@@ -320,7 +338,7 @@ void qwen_decoder_layer(const GraphTaskArgs &args) {
     CoreTaskArgs attention_args;
     attention_args.add_input(hidden, attention_weight);
     attention_args.add_output(attention_out);
-    attention_args.add_scalar(args.scalar(0));  // dynamic token position
+    attention_args.add_scalar(args.scalar(0));  // forwarded token position
     TaskOutputTensors attention =
         rt_submit_aic_task(FUNC_ATTENTION, attention_args);
 
@@ -364,7 +382,7 @@ recording, while layers two and three immediately submit outer task shells for
 the same in-flight identity. The first following non-Graph operation (or
 orchestration completion) joins recording and finalizes all three shells with
 the new Definition. Each invocation patches the current layer's
-`token_position`; it is a dynamic boundary scalar refreshed on every submission
+`token_position`; it is a boundary scalar refreshed on every submission
 and is not part of the Graph key.
 
 ## Definition
@@ -405,7 +423,7 @@ had. `graph_alias_partition` settles that grouping in one hashing pass over the
 addresses — argument order is the scan order, so each parameter's representative
 is simply the first parameter that reached its address. What the pass does *not*
 do is prove the distinct addresses name non-overlapping memory; that is a
-precondition the allocator supplies (see "Supported dynamic and static data").
+precondition the allocator supplies (see "Supported varying and fixed data").
 
 **Classification is by provenance, not by address range.** Each boundary tensor
 is stamped with `TaskId::Space::PARAM` and its parameter index, each recorded
@@ -438,11 +456,20 @@ until that private job has been installed in the recorder queue; it does not wai
 for the operating system to schedule the thread or for `graph_prepare` to bind
 the private recording state. The keyed in-flight entry and zero-heap outer shell
 already exist before the job is enqueued, so later same-identity submissions can
-safely proceed immediately. Threads remain parked on a condition variable for
-the lifetime of the loaded orchestration SO and are reused by later runs. Eight
-workers are created when the callable's orchestration SO is loaded, before any
-`host_orch` run; unloading the SO stops and joins them before their code is
-unmapped.
+safely proceed immediately. Threads remain parked on a condition variable in the
+runtime-owned pool and are reused across callables and runs. Callable registration
+prewarms eight workers before any `host_orch` run. Each worker owns its recording
+scratch as an ordinary object; a borrowed TLS pointer selects it while the worker
+runs, without registering a TLS destructor. Synchronous fallback recordings lease
+independent scratch from their GraphHostState and return it to a bounded cache on
+retirement. No scratch retains an entry's boundary after retirement.
+
+RuntimeModule acquires a host-service lease when loading an HBG runtime. Releasing
+the last safe owner closes pool admission, drains accepted jobs including closure
+destruction, joins workers and destroys scratch before dlclose. Releasing one of
+several owners does not stop their shared pool. A later owner can create a fresh
+pool if another loader reference kept the SO resident. Terminal abandonment retains
+both the module reference and its service lease.
 
 **Distinct identities record concurrently.** The recorder owns a fixed 16-slot
 job queue; each boundary lives on its own in-flight entry. The eight prewarmed
@@ -466,7 +493,7 @@ key, which the keyed in-flight map enforces.
 published Definition is immutable, so replaying it depends on no recording; the
 lookup order is what keeps an already-built Graph from waiting on an unrelated
 Definition. An identity that is neither published nor in flight opens its own
-recording rather than falling back to the ordinary path.
+recording rather than waiting on an unrelated one.
 
 The queue handoff hands `graph_prepare` the in-flight entry's own address,
 carried through `GraphScopeResult::recording_handle`. Prepare therefore neither
@@ -555,7 +582,7 @@ because only the host reads it: it is what a later invocation is matched against
 while materialize takes the boundary from the outer task's own payload.
 
 The header carries the object magic, the Graph key, and the image size. The
-framing check requires the magic, a size that admits a `GraphDefinition`, a
+framing check requires the magic, a size that admits a `Graph`, a
 `total_bytes` equal to the header's own, and a key equal to the header's before
 any section offset is read out of the image.
 
@@ -633,6 +660,22 @@ the end of orchestration, the Host copies one bind image containing the
 compacted shared-memory task window and argument pools, then launches the
 Scheduler. Slot task and payload references remain self-relative.
 
+### Default A5 HBG native execution
+
+The recorded `Graph` images and boundary binding inputs stay on Host. Host expands
+ENTER/child/EXIT refs, binds tensors, scalars and predicates, and constructs every
+block/lane Call before launch. The native scheduler image carries child plans,
+fanin rows/indices, sinks and per-instance argument bases; it contains no recorded
+Graph image, fanout/root tables, relocation records or scalar-inheritance table.
+Resident AIC/AIV workers claim prepared executions and observe completion gates;
+they do not localize `GraphExecution` or materialize child arguments.
+See the [A5 native layout and binding contract](../../../../docs/zh-cn/design/a5-hbg-graph-task/data-layout.md).
+WSE and percounter retain their supported executors; see
+[WSE Graph replay](../../../wse/docs/deployment.md#graph-recording-and-replay) and
+[percounter payload preparation](../../../a5/runtime/percounter/README.md).
+
+### A2/A3 HBG launch-package materialization
+
 The run's Definition objects are not uploaded separately and the runtime holds no
 device block for them: the bind packs every object of the run into one Definition
 **section** and appends it to the AICPU launch arguments, which RTS copies as
@@ -647,7 +690,7 @@ belongs to the thread that entered with it, and the completion gate is a
 last-one-out latch rather than a barrier, so no address in one thread's package
 may be shared with a peer. The one part of the image read on every dependency
 scan — the fanin CSR — is copied by value into the execution's own storage tail
-at localize, which is also why `GraphDefinition::execution_storage_bytes`
+at localize, which is also why `Graph::execution_storage_bytes`
 includes the CSR's rows and indices. In simulation there is no launch package:
 the runner publishes a run-owned host snapshot instead, and the source word on
 the run's descriptor says which carrier delivered the section.
@@ -681,18 +724,28 @@ placed behind that check could not free the cores such a drain waits on, which
 is the deadlock recorded as #2256. The completion path runs on the resolution
 thread, which never takes part in a drain.
 
-Lifecycle and external readiness share an atomic byte. Routing reads the
-external bit alone and uses `route_cursor` to claim each root exactly once;
-a Graph that never leaves `PREPARED` routes and retires the same.
+Each execution has three lifecycle phases, independent of external readiness:
 
-Every materialization slice stores its new `published_tasks` boundary and then
-performs an acquire-release `fetch_or(0)` on the state byte. External readiness
-sets its bit with an acquire-release RMW on that same byte before routing.
-Whichever RMW is later acquires the earlier publication: either the publisher
-sees readiness and routes, or the readiness caller sees the published range
-and routes. Two acquire loads of separate atomics do not provide this
-handshake; both callers could miss the other's update. The RMW is per published
-slice, not per sub-task, and does not change lifecycle transitions.
+| Phase | Contract |
+| ----- | -------- |
+| `SUBMITTED` | The body is not fully materialized. It may be queued or partially materialized, and published sub-tasks may already run and complete. |
+| `MATERIALIZED` | Every sub-task is materialized. External dependencies may still be pending, and tasks may be queued or running. |
+| `COMPLETED` | Every sub-task has completed; the shell releases its external consumers. |
+
+The phase and monotonic `external_ready` flag share one atomic control byte.
+Root routing requires external readiness and a root index below
+`published_tasks`; it does not wait for the `MATERIALIZED` phase.
+`route_cursor` assigns each published index to exactly one routing caller.
+Non-roots become ready through their internal producers' completion paths.
+
+Both events try routing: the completion path signals external readiness, and
+each materialization slice publishes its new range.
+
+`materialize_busy` serializes materialization slices. The task-storage base is
+initialized during localization and remains immutable; `published_tasks`
+bounds root access to constructed and registered entries. Progress counters
+distinguish queued, partially materialized, and partially completed work
+without additional lifecycle phases.
 
 Internal dependency readiness borrows the completion-state polling idea, but
 dependency wiring remains an Orchestrator responsibility:
@@ -728,7 +781,7 @@ different party:
   decide it. A qualified shell that its producers release early does not stage
   itself — it has nothing of its own to place — but stages the body's roots,
   each an ordinary AICore task. They ring on the ordinary route, when the
-  shell's producers complete and `push_ready_routed` calls `activate_graph_task`
+  shell's producers complete and `push_ready_routed` calls `signal_graph_external_ready`
   inline to open the external gate. A Graph as a *producer* is the direction not
   supported: a shell publishes no placement of its own for a consumer to bet on.
 - **A root's own verdict.** Materialization, not recording, decides it, and the
@@ -765,7 +818,7 @@ both mean the same thing they do at top level:
   shell's early release rather than on any publish of its own.
 - *the producer released*, i.e. `early_dispatch_state == DISPATCHED`. At top
   level that is the producer completing. For a body root it is the shell's
-  producers completing, which lets `activate_graph_task` open the external gate
+  producers completing, which lets `signal_graph_external_ready` open the external gate
   and `graph_route_ready_roots` route the root — both inline on the completion
   path, in the same `push_ready_routed` call that handles a top-level release.
 
@@ -813,24 +866,37 @@ error instead of leaving an already-submitted outer Graph unable to complete.
 
 ## Current unsupported cases
 
-Conditions detected before an outer shell is accepted use the ordinary path:
+Each condition below is detected before an outer shell is accepted. All of them
+latch a fatal and name themselves in one log line; none falls back to submitting
+the body as ordinary tasks. A Graph that cannot be opened is a failure, not a
+slower path:
 
-- an empty Graph boundary;
+- an empty Graph boundary, or one carrying more than `GRAPH_MAX_TENSOR_ARGS`
+  (128) Tensors or `GRAPH_MAX_SCALAR_ARGS` (64) scalars;
+- nested Graph submission;
 - variable ChipTensor shape, stride, dtype, size, direction, or contiguity;
 - a boundary whose alias partition changed, or whose members moved relative to
   each other within a partition;
 - a boundary naming an empty buffer, or naming one address at two buffer sizes;
 - runtime-allocated boundary outputs;
-- more than `GRAPH_MAX_TENSOR_ARGS` (128) boundary Tensors;
-- more than 16 Definitions;
-- insufficient task-window or known cache-hit heap capacity.
+- more than `GRAPH_MAX_DEFINITIONS` (16) distinct Definition keys, including
+  unpublished recordings; a published key retained in flight counts once;
+- insufficient task-window or known cache-hit heap capacity;
+- a boundary drawing more than the argument pools hold, or a Definition owning
+  more than `INT32_MAX` heap bytes;
+- a submission against a key whose recording failed.
+
+The first seven latch `SIMPLER_ERROR_INVALID_ARGS`, the next three
+`SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED`, and the last
+`SIMPLER_ERROR_EXPLICIT_ORCH_FATAL` — the recording thread latched its own
+failure where it happened, and this line connects it to the submission it takes
+down.
 
 The following constructs are discovered only while a thread records the
 first Definition. Because its outer shell is already in the task/dependency
 sequence, they assert in debug builds and fail the orchestration in release
 builds:
 
-- nested Graph recording;
 - an explicit dependency naming a task outside the Graph;
 - a ChipTensor that reached the body without coming through the boundary,
   including a dispatch predicate's operand tensor;

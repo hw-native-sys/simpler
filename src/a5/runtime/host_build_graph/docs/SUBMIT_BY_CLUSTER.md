@@ -24,23 +24,23 @@ same mixed-task contract.
 
 ## Task Representation
 
-The shared graph image separates stable task identity from scheduling state:
+Host orchestration initializes common `ChipTaskStorage` scratch records. Default
+A5 HBG publishes an 80-byte `TaskImageStorage` per top-level task: its descriptor
+contains the task ID and kernel IDs, and its payload contains argument counts,
+field-relative pool deltas and a predicate. It publishes no `ChipTaskSlotState`
+or task-state array. Resident metadata holds shape and block counts; resident
+control records hold progress and completion. A separate 64-byte image header
+holds the first-error atomic.
 
-- `TaskDescriptor` contains the task ID, kernel IDs, and packed-buffer
-  addresses.
-- `TaskPayload` contains the argument counts, predicate, and a delta naming
-  each of its tensor, scalar and position-independent fanin-id regions. The
-  arguments live in the pool segments, not in the payload.
-- `ChipTaskSlotState` contains the active mask, task attributes, logical block
-  count, subtask counters, completion state, and descriptor/payload bindings.
-
-This image is built on the host and copied to the device verbatim. It contains
-no fanout adjacency or dependency-pool pointers, and its descriptor/payload
-bindings are deltas from the slot state's own address rather than pointers.
+Host planning constructs Calls and Graph child arguments before launch. Device
+execution tokens select prepared Calls and block/lane geometry. The argument
+pools remain available to dependency/predicate access and output diagnostics.
+Percounter selects its own current image representation for AICPU Graph
+materialization; the default HBG reader only accepts its compact format.
 
 ## Resource Shapes
 
-`ActiveMask::to_shape()` maps a task to one of four shapes:
+`LaneMask::to_shape()` maps a task to one of four shapes:
 
 | Shape | Meaning |
 | ----- | ------- |
@@ -86,32 +86,44 @@ describes the rendezvous itself and what the cohort is scoped to.
 2. TensorMap and explicit dependencies append producer local IDs to the payload's
    fanin region.
 3. Submit publishes only the finished graph data; it does not push ready tasks.
-4. After H2D, device boot scans every submitted task exactly once.
-5. A task with every fanin complete is routed to its ready queue; otherwise it
-   registers on its latest-submitted unmet producer's wake list, minimising
-   transfers between wake lists and their CAS contention.
-6. Producer completion reclassifies wake-list consumers until they become ready.
-
-Completion flags are monotonic, so a task never needs periodic fanin polling.
+4. Host prepares immutable AIC/MIX and AIV catalogs, Calls, execution controls
+   and canonical completion gates. The unified graph view maps top-level fanins
+   through completion references and Graph child fanins through Definition-local
+   indices; roots depend on ENTER and EXIT depends on every sink.
+5. After bootstrap, workers scan their engine catalogs in bounded slices to
+   claim execution tokens. A token may wait for dependencies before occupying a
+   dispatch slot; it advances its fanin prefix only after observing each
+   producer's canonical DONE gate. Readiness requires both remaining computation
+   and async debt to be zero for every producer.
+6. Workers scan ENTER, EXIT and inline control nodes separately. After all fanins
+   are DONE, a unique completion CAS settles the node. Consumers observe this
+   gate directly; dependency resolution uses no dynamic ready inbox, fanout
+   decrement or per-successor notification.
 
 ## Dispatch and Completion
 
-- AIC and AIV tasks claim as many free cores as the current scheduler owns and
-  requeue remaining logical blocks for later waves.
-- MIX placement selects whole clusters whose used lanes can all accept the
-  task. High cluster offsets are represented by the runtime's 128-bit bitset.
-- `require_sync_start` uses local staging when possible and a generation-tagged
-  global drain when the cohort spans scheduler ownership domains.
-- Each completed lane increments `completed_subtasks`; the mixed task completes
-  exactly once when it reaches `block_num * popcount(active_mask)`.
+Resident workers prepare their own two slots and participate in cooperative
+admission when the task shape requires it. Pure AIC and MIX tasks share the
+immutable AIC catalog; pure AIV tasks use the AIV catalog. These catalogs have no
+enqueue operation or shared queue head. Ready execution tokens transfer into a
+worker's private slots; its local ready mask/head orders those slots. The
+[resident walkthrough](../../../../../docs/zh-cn/a5-hbg-aicore-walkthrough/README.md)
+describes membership, physical placement and the completion resolver.
+
+Every executed block/lane contributes once to the packed completion gate,
+decrementing remaining computation and compute debt together. Async groups keep
+additional debt until their unique FINISH. A valid gate with zero computation
+and debt proves DONE to dependent tokens and control scans. The unique last
+return or async join records logical completion. MIX cluster release retires
+resources; it is not another completion contribution.
 
 ## Executor Model
 
-The host loads and executes the orchestration shared object synchronously. The
-device has no orchestration thread: every launched AICPU thread participates in
-scheduling its assigned cores after the boot thread attaches the prebuilt graph.
-Cluster ownership is assigned during the AICore handshake and remains stable for
-the run.
+The host executes orchestration synchronously and publishes the complete graph.
+AICore owns dependency resolution, ready scheduling and kernel execution. AICPU
+owns discovery, topology/context publication, supervision and partitioned EXIT/ACK
+retirement. Invalid startup descriptors enter failure retirement without
+executing tasks or reading an unpublished scheduler backing.
 
 ## Capacity
 
@@ -130,6 +142,7 @@ pytest examples tests/st --platform a2a3sim --runtime host_build_graph
 pytest examples tests/st --platform a5sim --runtime host_build_graph
 ```
 
-The `host_build_graph_wide_dispatch` scene specifically covers wide AIV work,
-sync-start MIX placement, normal MIX placement, and bit offsets above 63 with
-`aicpu_thread_num=2`.
+The A5 HBG SPMD, sync-start capacity, MIX and empty-lifecycle scenes cover
+resident shape selection and retirement. The `spmd_shape_selection` scene checks
+that both ordinary and sync-start multi-block AIC tasks publish a fresh resident
+mode and produce the expected output.

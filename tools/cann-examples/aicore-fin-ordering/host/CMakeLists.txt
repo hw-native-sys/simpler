@@ -18,11 +18,17 @@ if(NOT DEFINED ENV{ASCEND_HOME_PATH})
 endif()
 set(ASCEND_HOME_PATH $ENV{ASCEND_HOME_PATH})
 
-include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/ascend_driver_path.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../../../cmake/ascend_driver_path.cmake")
+simpler_require_ascend_driver_library()
 
 add_executable(launch_fin_order launch.cpp)
+set(SIMPLER_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../..")
+include("${SIMPLER_REPO_ROOT}/cmake/host_log_sources.cmake")
+target_sources(launch_fin_order PRIVATE ${SIMPLER_HOST_LOG_SOURCES})
 
 target_include_directories(launch_fin_order PRIVATE
+    "${SIMPLER_REPO_ROOT}/src/common/platform/include"
+    "${SIMPLER_REPO_ROOT}/src/common/log/include"
     "${ASCEND_HOME_PATH}/include"
     "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/pkg_inc"
     "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/pkg_inc/runtime"
@@ -37,5 +43,5 @@ target_link_directories(launch_fin_order PRIVATE
     "${ASCEND_DRIVER_PATH}/lib64/driver"
 )
 
-# ascendcl for aclrt*, runtime for rt*/rts*, ascend_hal for halMemCtl.
-target_link_libraries(launch_fin_order PRIVATE ascendcl runtime ascend_hal dl)
+# ascendcl for aclrt*, runtime for rt*/rts*, ascend_hal for register mapping.
+target_link_libraries(launch_fin_order PRIVATE ascendcl runtime ascend_hal dl pthread)

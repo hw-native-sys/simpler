@@ -87,7 +87,7 @@ test, the diagnosis path is:
    "what cpu_ids did N threads land on" tool.
 6. If `aicpu-thread-spread` confirms CANN dispatch ⊊ OCCUPY, update
    `compute_allowed_cpus`
-   (in `src/a5/platform/onboard/host/aicpu_topology_probe.cpp`) to
+   (in `src/a5/platform/onboard/host/aicpu_affinity_select.cpp`) to
    pick `ALLOWED_CPUS` from the *reachable* set, not OCCUPY.
 
 ## When to reconsider

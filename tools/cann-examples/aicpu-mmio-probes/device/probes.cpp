@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 // probes.cpp — AICPU SO that runs MMIO micro-benchmarks against the chip's
-// AIC_CTRL window. AICore is NOT involved — every measurement is "what
+// AICore register mapping. AICore is not involved — every measurement is "what
 // happens when the AICPU CPU issues a load / store at this MMIO address".
 //
 // Subtests executed in order:
@@ -55,18 +55,17 @@ struct KernelArgs {
     void *device_args;
 };
 
-// Compute MMIO virtual address for a given (core_idx, sub_core=0, reg_offset).
-// Mirrors the indexing in src/{arch}/platform/onboard/host/host_regs.cpp.
-inline uint64_t RegAddr(uint64_t base, uint32_t core_idx, uint32_t reg_off) {
-    return base + core_idx * kProbeCoreStride + reg_off;
+// Each entry is an AICPU-visible AICore register base.
+inline uint64_t RegAddr(const uint64_t *bases, uint32_t core_idx, uint32_t reg_off) {
+    return bases[core_idx] + reg_off;
 }
 
 constexpr int kStrBurstN = 1000;
 constexpr int kLdrN = 10000;
 
 // --- Phase 4 STR DMB cost ---
-void RunPhase4(uint64_t base, MmioProbeResult *result) {
-    volatile uint32_t *dmb0 = reinterpret_cast<volatile uint32_t *>(RegAddr(base, 0, kProbeRegSprDmbOffset));
+void RunPhase4(const uint64_t *bases, uint32_t dmb_offset, MmioProbeResult *result) {
+    volatile uint32_t *dmb0 = reinterpret_cast<volatile uint32_t *>(RegAddr(bases, 0, dmb_offset));
 
     // Burst: N STRs, no intervening LDR. Bandwidth-limited (posted writes
     // pipeline; nR ordering does not block STR-to-STR).
@@ -92,9 +91,9 @@ void RunPhase4(uint64_t base, MmioProbeResult *result) {
 }
 
 // --- Phase 12-A + 12-B (single thread) ---
-void RunPhase12SingleThread(uint64_t base, uint32_t n_cores, MmioProbeResult *result) {
+void RunPhase12SingleThread(const uint64_t *bases, uint32_t cond_offset, uint32_t n_cores, MmioProbeResult *result) {
     // 12-A: same core LDR loop.
-    volatile uint32_t *cond0 = reinterpret_cast<volatile uint32_t *>(RegAddr(base, 0, kProbeRegSprCondOffset));
+    volatile uint32_t *cond0 = reinterpret_cast<volatile uint32_t *>(RegAddr(bases, 0, cond_offset));
     {
         volatile uint32_t sink = 0;
         uint64_t t0 = SysCntAicpu();
@@ -114,7 +113,7 @@ void RunPhase12SingleThread(uint64_t base, uint32_t n_cores, MmioProbeResult *re
         // Build COND ptr table for cores 0..n_cores-1.
         volatile uint32_t *conds[kProbeMaxCores];
         for (uint32_t i = 0; i < n_cores && i < kProbeMaxCores; i++) {
-            conds[i] = reinterpret_cast<volatile uint32_t *>(RegAddr(base, i, kProbeRegSprCondOffset));
+            conds[i] = reinterpret_cast<volatile uint32_t *>(RegAddr(bases, i, cond_offset));
         }
         uint32_t modulus = (n_cores > kProbeMaxCores) ? kProbeMaxCores : n_cores;
         volatile uint32_t sink = 0;
@@ -157,7 +156,7 @@ void *ReaderThreadFn(void *arg) {
     return nullptr;
 }
 
-void RunPhase12MultiThread(uint64_t base, uint32_t n_cores, MmioProbeResult *result) {
+void RunPhase12MultiThread(const uint64_t *bases, uint32_t cond_offset, uint32_t n_cores, MmioProbeResult *result) {
     if (n_cores < 1) {
         DiagLog(kDlogLevelWarn, "Phase 12-C skipped: no cores available");
         return;
@@ -169,7 +168,7 @@ void RunPhase12MultiThread(uint64_t base, uint32_t n_cores, MmioProbeResult *res
         ReaderArg args[kProbeMaxConcurrentReaders] = {};
         pthread_t tids[kProbeMaxConcurrentReaders] = {};
         for (uint32_t r = 0; r < M; r++) {
-            args[r].reg = reinterpret_cast<volatile uint32_t *>(RegAddr(base, r, kProbeRegSprCondOffset));
+            args[r].reg = reinterpret_cast<volatile uint32_t *>(RegAddr(bases, r, cond_offset));
             args[r].go = &go;
             args[r].result_ticks = 0;
             int rc = pthread_create(&tids[r], nullptr, ReaderThreadFn, &args[r]);
@@ -213,20 +212,21 @@ __attribute__((visibility("default"))) int simpler_aicpu_run(void *args) {
     }
     auto *k = reinterpret_cast<KernelArgs *>(args);
     auto *d = reinterpret_cast<MmioProbeDeviceArgs *>(k->device_args);
-    if (d == nullptr || d->result_addr == 0 || d->aic_ctrl_reg_base == 0) {
+    if (d == nullptr || d->result_addr == 0 || d->reg_bases_addr == 0 || d->n_aic_cores_available == 0 ||
+        d->cond_offset == 0 || d->dmb_offset == 0) {
         DiagLog(kDlogLevelWarn, "device_args missing critical pointers");
         return 1;
     }
     auto *result = reinterpret_cast<MmioProbeResult *>(d->result_addr);
     std::memset(result, 0, sizeof(*result));
 
-    uint64_t base = d->aic_ctrl_reg_base;
+    const auto *bases = reinterpret_cast<const uint64_t *>(d->reg_bases_addr);
     uint32_t n_cores = d->n_aic_cores_available;
     if (n_cores > kProbeMaxCores) n_cores = kProbeMaxCores;
 
-    RunPhase4(base, result);
-    RunPhase12SingleThread(base, n_cores, result);
-    RunPhase12MultiThread(base, n_cores, result);
+    RunPhase4(bases, d->dmb_offset, result);
+    RunPhase12SingleThread(bases, d->cond_offset, n_cores, result);
+    RunPhase12MultiThread(bases, d->cond_offset, n_cores, result);
 
     result->observed_pid = static_cast<uint64_t>(getpid());
     result->magic = kMmioProbeResultMagic;

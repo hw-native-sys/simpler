@@ -7,9 +7,12 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
+import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +30,7 @@ WORKFLOW_PATHS = (
     REPO_ROOT / ".github/workflows/_st-npu-a2a3.yml",
     REPO_ROOT / ".github/workflows/_st-sim-a2a3.yml",
     REPO_ROOT / ".github/workflows/_st-sim-a5.yml",
-    REPO_ROOT / ".github/workflows/ci-self-cpu.yml",
+    REPO_ROOT / ".github/workflows/_st-sim-wse.yml",
     REPO_ROOT / ".github/workflows/ci.yml",
     REPO_ROOT / ".github/workflows/daily.yml",
     REPO_ROOT / ".github/workflows/sanitizers.yml",
@@ -360,7 +363,7 @@ exec "$@"''',
     [
         ("_packaging.yml", "Install Linux C++ compiler tools"),
         ("_pre-commit.yml", "Install build and lint tools"),
-        ("_ut-no-hardware.yml", "Install GoogleTest"),
+        ("_ut-no-hardware.yml", "Install GoogleTest and AArch64 C++ compiler"),
     ],
 )
 def test_workflow_apt_sites_use_the_shared_action(workflow_name: str, step_name: str) -> None:
@@ -482,23 +485,32 @@ def test_a2a3_scene_workflow_has_no_legacy_sdma_mode() -> None:
     assert names.count("Run pytest scene tests (a2a3)") == 1
     assert names.count("SDMA pytest (a2a3)") == 1
     assert not any("legacy SDMA paths" in name for name in names)
-    for caller_name in ("ci.yml", "ci-self-cpu.yml", "daily.yml"):
+    for caller_name in ("ci.yml", "daily.yml"):
         assert "a2a3_sdma_mode" not in (REPO_ROOT / ".github/workflows" / caller_name).read_text()
 
 
-@pytest.mark.parametrize("workflow_name", ["_st-sim-a2a3.yml", "_st-sim-a5.yml"])
+@pytest.mark.parametrize("workflow_name", ["_st-sim-a2a3.yml", "_st-sim-a5.yml", "_st-sim-wse.yml"])
 def test_scene_tests_request_graphviz(workflow_name: str) -> None:
     step = _setup_step(REPO_ROOT / ".github/workflows" / workflow_name)
     assert step["with"]["install-graphviz"] == "true"
 
 
-@pytest.mark.parametrize("workflow_name", ["_st-sim-a2a3.yml", "_st-sim-a5.yml"])
-def test_self_cpu_scene_tests_preserve_the_preprovisioned_compiler_contract(tmp_path: Path, workflow_name: str) -> None:
+@pytest.mark.parametrize("workflow_name", ["_st-sim-a2a3.yml", "_st-sim-a5.yml", "_st-sim-wse.yml"])
+@pytest.mark.parametrize("has_gcc_15", [False, True])
+def test_self_cpu_scene_tests_preserve_the_preprovisioned_compiler_contract(
+    tmp_path: Path, workflow_name: str, has_gcc_15: bool
+) -> None:
     bin_dir = tmp_path / "preinstalled-bin"
     bin_dir.mkdir()
+    for command in ("bash", "mkdir", "ln"):
+        executable = shutil.which(command)
+        assert executable is not None
+        (bin_dir / command).symlink_to(executable)
     for command in ("ninja", "dot"):
         _write_command(bin_dir / command)
     _write_command(bin_dir / "g++", 'if [ "${1:-}" = -dumpversion ]; then echo 12.3.0; fi')
+    if has_gcc_15:
+        _write_command(bin_dir / "g++-15", 'if [ "${1:-}" = -dumpversion ]; then echo 15.2.0; fi')
 
     runner_temp = tmp_path / "runner-temp"
     runner_temp.mkdir()
@@ -508,7 +520,7 @@ def test_self_cpu_scene_tests_preserve_the_preprovisioned_compiler_contract(tmp_
     env.update(
         {
             "GITHUB_PATH": str(github_path),
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "PATH": str(bin_dir),
             "RUNNER_TEMP": str(runner_temp),
         }
     )
@@ -522,9 +534,202 @@ def test_self_cpu_scene_tests_preserve_the_preprovisioned_compiler_contract(tmp_
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert (runner_temp / "bin/g++-15").resolve() == bin_dir / "g++"
+    alias = runner_temp / "bin/g++-15"
+    if has_gcc_15:
+        assert not alias.exists()
+        assert not github_path.exists()
+    else:
+        assert alias.is_symlink()
+        assert alias.resolve() == bin_dir / "g++"
+        assert github_path.read_text().splitlines() == [str(runner_temp / "bin")]
 
 
 @pytest.mark.parametrize("path", (ACTION_PATH, APT_ACTION_PATH, *WORKFLOW_PATHS), ids=lambda path: path.name)
 def test_changed_action_and_workflows_are_valid_yaml(path: Path) -> None:
     _load_yaml(path)
+
+
+def _run_apt_refresh_scenario(
+    tmp_path: Path,
+    *,
+    mode: str = "source-file",
+    transient_updates: int = 0,
+    cached: bool = False,
+    failed_installs: int = 0,
+    install_attempts: int = 2,
+) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
+    """Execute the action with an APT boundary that models warning-only updates."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    source = tmp_path / "toolchain.sources"
+    source.write_text("Types: deb\nURIs: https://example.invalid/ppa\nSuites: noble\nComponents: main\n")
+    fake = r"""
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+
+root = Path(os.environ["APT_TEST_ROOT"])
+program = Path(sys.argv[0]).name
+args = sys.argv[1:]
+with (root / "calls.jsonl").open("a") as log:
+    log.write(json.dumps([program, *args]) + "\n")
+
+def reject():
+    (root / "unexpected-call").write_text(repr([program, *args]))
+    sys.exit(99)
+
+def forward(command):
+    target = root / "bin" / command[0]
+    os.execv(str(target), [str(target), *command[1:]])
+
+if program == "sudo":
+    if args and args[0] == "DEBIAN_FRONTEND=noninteractive":
+        args = args[1:]
+    if not args or args[0] not in ("timeout", "rm"):
+        reject()
+    forward(args)
+elif program == "timeout":
+    if len(args) < 3 or args[0] != "--kill-after=15s" or args[1] not in ("60s", "240s"):
+        reject()
+    if args[2] not in ("apt-get", "dpkg"):
+        reject()
+    forward(args[2:])
+elif program == "dpkg":
+    if args != ["--configure", "-a"]:
+        reject()
+elif program == "rm":
+    if args == ["-rf", "/var/lib/apt/lists/partial"]:
+        sys.exit(0)
+    if len(args) != 2 or args[0] != "-rf":
+        reject()
+    target = Path(args[1])
+    if target.parent != root or not target.name.startswith("apt-install-sources."):
+        reject()
+    shutil.rmtree(target)
+elif program == "install":
+    if len(args) != 4 or args[:2] != ["-m", "0644"] or Path(args[2]) != root / "toolchain.sources":
+        reject()
+    target = Path(args[3])
+    if target.parent.parent != root or not target.parent.name.startswith("apt-install-sources."):
+        reject()
+    shutil.copyfile(args[2], target)
+    target.chmod(0o644)
+elif program == "apt-get":
+    state_path = root / "state.json"
+    state = json.loads(state_path.read_text())
+    status = 0
+    if args[-1] == "update":
+        state["updates"] += 1
+        if state["updates"] <= int(os.environ["APT_TRANSIENT_UPDATES"]):
+            print("W: Failed to fetch InRelease 503 Service Unavailable", file=sys.stderr)
+            # APT's default persistent mode warns and succeeds on transient failures.
+            status = 100 if "APT::Update::Error-Mode=any" in args else 0
+        else:
+            state["fresh"] = True
+    elif "install" in args and args[-3:] == ["install", "-y", "gcc-15"]:
+        state["installs"] += 1
+        if state["installs"] <= int(os.environ["APT_FAILED_INSTALLS"]) or not (
+            state["fresh"] or os.environ["APT_CACHED"] == "1"
+        ):
+            print("E: Unable to locate package gcc-15", file=sys.stderr)
+            status = 100
+    else:
+        reject()
+    state_path.write_text(json.dumps(state))
+    sys.exit(status)
+else:
+    reject()
+"""
+    for program in ("sudo", "timeout", "apt-get", "dpkg", "rm", "install"):
+        command = bin_dir / program
+        command.write_text(f"#!{sys.executable}\n{fake}")
+        command.chmod(0o755)
+    (tmp_path / "state.json").write_text(json.dumps({"updates": 0, "installs": 0, "fresh": False}))
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "RUNNER_TEMP": str(tmp_path),
+        "APT_TEST_ROOT": str(tmp_path),
+        "APT_TRANSIENT_UPDATES": str(transient_updates),
+        "APT_CACHED": "1" if cached else "0",
+        "APT_FAILED_INSTALLS": str(failed_installs),
+        "SOURCE_FILE": str(source),
+        "REQUIRED_PACKAGES": "gcc-15",
+        "OPTIONAL_PACKAGES": "",
+        "UPDATE_MODE": mode,
+        "UPDATE_ATTEMPTS": "2",
+        "UPDATE_TIMEOUT_SECONDS": "60",
+        "INSTALL_ATTEMPTS": str(install_attempts),
+        "INSTALL_TIMEOUT_SECONDS": "240",
+    }
+    result = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", _apt_action_script()],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    assert not (tmp_path / "unexpected-call").exists(), result.stdout + result.stderr
+    calls = [json.loads(line) for line in (tmp_path / "calls.jsonl").read_text().splitlines()]
+    assert not list(tmp_path.glob("apt-install-sources.*"))
+    for call in calls:
+        if call[0] == "apt-get":
+            strict = "APT::Update::Error-Mode=any" in call
+            assert strict == (mode == "source-file" and call[-1] == "update")
+            if strict:
+                assert "Dir::Etc::SourceList=/dev/null" in call
+                assert "APT::Get::List-Cleanup=0" in call
+                assert any(arg.startswith(f"Dir::Etc::SourceParts={tmp_path}/apt-install-sources.") for arg in call)
+        elif call[0] == "timeout":
+            assert call[1] == "--kill-after=15s"
+            assert call[2] == ("240s" if "install" in call else "60s")
+    return result, calls
+
+
+def _assert_apt_refresh_calls(calls: list[list[str]], operations: list[str], recoveries: int) -> None:
+    actual = ["update" if call[-1] == "update" else "install" for call in calls if call[0] == "apt-get"]
+    assert actual == operations
+    assert calls.count(["dpkg", "--configure", "-a"]) == recoveries
+    assert calls.count(["rm", "-rf", "/var/lib/apt/lists/partial"]) == recoveries
+
+
+def test_apt_source_refresh_retries_transient_failure_before_install(tmp_path: Path) -> None:
+    result, calls = _run_apt_refresh_scenario(tmp_path, transient_updates=1)
+    assert result.returncode == 0, result.stdout + result.stderr
+    _assert_apt_refresh_calls(calls, ["update", "update", "install"], 1)
+
+
+def test_apt_source_refresh_exhaustion_still_allows_cached_install(tmp_path: Path) -> None:
+    result, calls = _run_apt_refresh_scenario(tmp_path, transient_updates=2, cached=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    _assert_apt_refresh_calls(calls, ["update", "update", "install"], 2)
+
+
+def test_apt_source_refresh_exhaustion_fails_when_required_package_unavailable(tmp_path: Path) -> None:
+    result, calls = _run_apt_refresh_scenario(tmp_path, transient_updates=2)
+    assert result.returncode != 0
+    assert "::error::apt could not install gcc-15" in result.stdout
+    _assert_apt_refresh_calls(calls, ["update", "update", "install", "install"], 4)
+
+
+def test_apt_source_refresh_success_stops_after_first_attempt(tmp_path: Path) -> None:
+    result, calls = _run_apt_refresh_scenario(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    _assert_apt_refresh_calls(calls, ["update", "install"], 0)
+
+
+def test_apt_system_refresh_preserves_transient_warning_behavior(tmp_path: Path) -> None:
+    result, calls = _run_apt_refresh_scenario(tmp_path, mode="system", transient_updates=2, cached=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    _assert_apt_refresh_calls(calls, ["update", "install"], 0)
+
+
+def test_apt_cached_install_fallback_keeps_system_update_non_strict(tmp_path: Path) -> None:
+    result, calls = _run_apt_refresh_scenario(
+        tmp_path, mode="none", transient_updates=1, cached=True, failed_installs=1, install_attempts=1
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    _assert_apt_refresh_calls(calls, ["install", "update", "install"], 1)

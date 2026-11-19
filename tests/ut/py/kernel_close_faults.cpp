@@ -22,6 +22,9 @@ int failure_kind = 0;
 int attempts = 0;
 bool pending = false;
 int failures_to_skip = 0;
+void *failed_destroy_handle = nullptr;
+int failed_destroy_attempts = 0;
+int failed_destroy_successes = 0;
 SimplerHostLogState test_log_state{};
 bool guard_acl = false;
 std::array<int, 8> forbidden_calls{};
@@ -29,7 +32,21 @@ int forced_current_device = -2;
 int (*real_get_device)(int *) = nullptr;
 int (*real_set_device)(int) = nullptr;
 int (*real_set_op_timeout)(uint64_t, uint64_t *) = nullptr;
+int (*real_capture_info)(void *, void *, void **) = nullptr;
+void *capture_fault_stream = nullptr;
+int capture_queries_until_fault = 0;
+int capture_query_faults = 0;
 int (*real_memcpy)(void *, uint64_t, const void *, uint64_t, int) = nullptr;
+int (*real_memcpy_async)(void *, uint64_t, const void *, uint64_t, int, void *) = nullptr;
+int (*real_malloc_host)(void **, uint64_t, uint16_t) = nullptr;
+int (*real_free_host)(void *) = nullptr;
+using CoreLaunch = int (*)(void *, uint64_t, uint32_t, void *, void *, void *, void *);
+CoreLaunch real_core_launch = nullptr;
+void *latest_pinned = nullptr;
+void *watched_source = nullptr;
+bool reject_descriptor_copy = false;
+bool descriptor_rejected = false;
+int descriptor_failures = 0, watched_source_frees = 0, core_launch_calls = 0, descriptor_guard_hits = 0;
 bool fail_next_copy = false;
 int copies = 0;
 bool fake_device_drain = false;
@@ -58,20 +75,30 @@ int forbidden(size_t index) {
 }
 
 int destroy(const char *symbol, void *handle, int kind) {
+    const bool retrying_handle =
+        kind == failure_kind && failed_destroy_handle != nullptr && handle == failed_destroy_handle;
+    if (retrying_handle) ++failed_destroy_attempts;
     if (failure_kind == kind) {
         ++attempts;
         if (pending && attempts > failures_to_skip) {
             pending = false;
+            failed_destroy_handle = handle;
+            failed_destroy_attempts = 1;
+            failed_destroy_successes = 0;
             return -4321;
         }
     }
     auto real_destroy = reinterpret_cast<int (*)(void *)>(dlsym(RTLD_NEXT, symbol));
-    return real_destroy(handle);
+    const int rc = real_destroy(handle);
+    if (retrying_handle && rc == 0) ++failed_destroy_successes;
+    return rc;
 }
 }  // namespace
 
 extern "C" void arm_destroy_failure(int kind) {
     failure_kind = kind;
+    failed_destroy_handle = nullptr;
+    failed_destroy_attempts = failed_destroy_successes = 0;
     attempts = 0;
     pending = true;
     failures_to_skip = 0;
@@ -79,17 +106,22 @@ extern "C" void arm_destroy_failure(int kind) {
 
 extern "C" void arm_destroy_failure_after(int kind, int skip) {
     failure_kind = kind;
+    failed_destroy_handle = nullptr;
+    failed_destroy_attempts = failed_destroy_successes = 0;
     attempts = 0;
     pending = true;
     failures_to_skip = skip;
 }
 
 extern "C" int destroy_attempts() { return attempts; }
+extern "C" int failed_destroy_retry_attempts() { return failed_destroy_attempts; }
+extern "C" int failed_destroy_retry_successes() { return failed_destroy_successes; }
 
 extern "C" void arm_acl_guard() {
     forbidden_calls.fill(0);
     guard_acl = true;
 }
+extern "C" void disarm_acl_guard() { guard_acl = false; }
 extern "C" int acl_call_count(int index) { return forbidden_calls.at(index); }
 extern "C" void arm_fatal_drain() {
     fake_device_drain = true;
@@ -121,6 +153,23 @@ extern "C" int aclrtGetDevice(int *device) {
     }
     return real_get_device != nullptr ? real_get_device(device) : -4323;
 }
+extern "C" void arm_capture_query_failure(void *stream, int query) {
+    capture_fault_stream = stream;
+    capture_queries_until_fault = query;
+    capture_query_faults = 0;
+}
+extern "C" int capture_query_failure_hits() { return capture_query_faults; }
+extern "C" int aclmdlRICaptureGetInfo(void *stream, void *status, void **model) {
+    if (stream == capture_fault_stream && capture_queries_until_fault > 0 && --capture_queries_until_fault == 0) {
+        ++capture_query_faults;
+        return -4321;
+    }
+    auto query = real_capture_info != nullptr ?
+                     real_capture_info :
+                     reinterpret_cast<decltype(real_capture_info)>(dlsym(RTLD_NEXT, "aclmdlRICaptureGetInfo"));
+    return query != nullptr ? query(stream, status, model) : -4323;
+}
+
 extern "C" void arm_copy_failure() { fail_next_copy = true; }
 extern "C" int copy_call_count() { return copies; }
 extern "C" int rtMemcpy(void *dst, uint64_t dst_bytes, const void *src, uint64_t src_bytes, int kind) {
@@ -130,6 +179,48 @@ extern "C" int rtMemcpy(void *dst, uint64_t dst_bytes, const void *src, uint64_t
         return -4321;
     }
     return real_memcpy != nullptr ? real_memcpy(dst, dst_bytes, src, src_bytes, kind) : -4323;
+}
+extern "C" int arm_descriptor_copy_failure() {
+    watched_source = latest_pinned;
+    reject_descriptor_copy = true;
+    descriptor_rejected = false;
+    descriptor_failures = watched_source_frees = descriptor_guard_hits = 0;
+    return watched_source == nullptr ? -1 : 0;
+}
+extern "C" int descriptor_copy_failures() { return descriptor_failures; }
+extern "C" int descriptor_source_frees() { return watched_source_frees; }
+extern "C" int descriptor_kernel_guard_hits() { return descriptor_guard_hits; }
+extern "C" int core_launch_call_count() { return core_launch_calls; }
+extern "C" int rtMallocHost(void **out, uint64_t size, uint16_t module_id) {
+    if (real_malloc_host == nullptr) return -4323;
+    const int rc = real_malloc_host(out, size, module_id);
+    if (rc == 0) latest_pinned = *out;
+    return rc;
+}
+extern "C" int rtFreeHost(void *ptr) {
+    if (ptr == watched_source) ++watched_source_frees;
+    return real_free_host == nullptr ? -4323 : real_free_host(ptr);
+}
+extern "C" int rtMemcpyAsync(void *dst, uint64_t cap, const void *src, uint64_t bytes, int kind, void *stream) {
+    if (reject_descriptor_copy && src == watched_source) {
+        reject_descriptor_copy = false;
+        descriptor_rejected = true;
+        ++descriptor_failures;
+        return -4321;
+    }
+    return real_memcpy_async == nullptr ? -4323 : real_memcpy_async(dst, cap, src, bytes, kind, stream);
+}
+extern "C" int rtKernelLaunchWithHandleV2(
+    void *handle, uint64_t entry, uint32_t blocks, void *args, void *sm, void *stream, void *config
+) {
+    ++core_launch_calls;
+    // A regression that ignores the rejected publication cannot execute a
+    // kernel against its uninitialized descriptor in this fault test.
+    if (reject_descriptor_copy || descriptor_rejected) {
+        ++descriptor_guard_hits;
+        return -4326;
+    }
+    return real_core_launch == nullptr ? -4323 : real_core_launch(handle, entry, blocks, args, sm, stream, config);
 }
 extern "C" void arm_reset_failures(int count) {
     reset_failures_left = count;
@@ -144,12 +235,23 @@ bool reset_should_fail() {
     --reset_failures_left;
     return true;
 }
+// Count the owner's request once even when ACL delegates to the RT entry.
+thread_local unsigned reset_depth = 0;
+int reset_device(const char *symbol, int device) {
+    const bool outermost = reset_depth++ == 0;
+    if (outermost && reset_should_fail()) {
+        --reset_depth;
+        return -4321;
+    }
+    const int rc = reinterpret_cast<int (*)(int)>(dlsym(RTLD_NEXT, symbol))(device);
+    --reset_depth;
+    return rc;
+}
 }  // namespace
 
 extern "C" int aclrtResetDevice(int device) {
     if (guard_acl) return forbidden(2);
-    if (reset_should_fail()) return -4321;
-    return reinterpret_cast<int (*)(int)>(dlsym(RTLD_NEXT, "aclrtResetDevice"))(device);
+    return reset_device("aclrtResetDevice", device);
 }
 extern "C" int aclrtResetDeviceForce(int device) {
     if (guard_acl) return forbidden(3);
@@ -161,8 +263,7 @@ extern "C" int aclFinalize() {
 }
 extern "C" int rtDeviceReset(int device) {
     if (guard_acl) return forbidden(5);
-    if (reset_should_fail()) return -4321;
-    return reinterpret_cast<int (*)(int)>(dlsym(RTLD_NEXT, "rtDeviceReset"))(device);
+    return reset_device("rtDeviceReset", device);
 }
 extern "C" int aclrtSynchronizeDeviceWithTimeout(int32_t timeout) {
     if (fake_device_drain) {
@@ -173,14 +274,26 @@ extern "C" int aclrtSynchronizeDeviceWithTimeout(int32_t timeout) {
 }
 
 // The ctypes loader has no ChipWorker to bind a process-owned logger sink.
-extern "C" int bind_test_log(void *runtime) {
+extern "C" int bind_test_rts(void *runtime) {
     // ACL is a dependency of the RTLD_LOCAL component and need not be in the
     // preload shim's RTLD_NEXT lookup scope.
     real_get_device = reinterpret_cast<int (*)(int *)>(dlsym(runtime, "aclrtGetDevice"));
+    real_capture_info = reinterpret_cast<decltype(real_capture_info)>(dlsym(runtime, "aclmdlRICaptureGetInfo"));
     real_set_device = reinterpret_cast<int (*)(int)>(dlsym(runtime, "rtSetDevice"));
     real_set_op_timeout = reinterpret_cast<int (*)(uint64_t, uint64_t *)>(dlsym(runtime, "aclrtSetOpExecuteTimeOutV2"));
     real_memcpy = reinterpret_cast<int (*)(void *, uint64_t, const void *, uint64_t, int)>(dlsym(runtime, "rtMemcpy"));
-    if (!real_get_device || !real_set_device || !real_set_op_timeout || !real_memcpy) return -1;
+    real_memcpy_async = reinterpret_cast<decltype(real_memcpy_async)>(dlsym(runtime, "rtMemcpyAsync"));
+    real_malloc_host = reinterpret_cast<decltype(real_malloc_host)>(dlsym(runtime, "rtMallocHost"));
+    real_free_host = reinterpret_cast<decltype(real_free_host)>(dlsym(runtime, "rtFreeHost"));
+    real_core_launch = reinterpret_cast<CoreLaunch>(dlsym(runtime, "rtKernelLaunchWithHandleV2"));
+    if (!real_get_device || !real_set_device || !real_set_op_timeout || !real_memcpy || !real_memcpy_async ||
+        !real_malloc_host || !real_free_host || !real_core_launch)
+        return -1;
+    return 0;
+}
+
+extern "C" int bind_test_log(void *runtime) {
+    if (bind_test_rts(runtime) != 0) return -1;
     test_log_state.threshold = 40;
     test_log_state.sink_owner_pid = getpid();
     test_log_state.sink_process_pid = getpid();

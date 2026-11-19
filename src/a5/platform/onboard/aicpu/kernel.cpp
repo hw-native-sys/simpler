@@ -8,7 +8,10 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#include <cstdio>
+#include "aicpu/native_invocation_entry.h"
+#include "aicpu/abort_aicore_startup.h"
+#include "aicpu_loader/finalize_args.h"
+#include "common/memory_barrier.h"
 
 #include <driver/ascend_hal_base.h>
 
@@ -71,7 +74,32 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_query_topolo
  * @param arg Pointer to the front-less KernelArgs payload (runtime_args @ 0)
  * @return 0 on success, non-zero on error
  */
-extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *arg) {
+static void bind_platform_task(KernelArgs *k_args) {
+    // Per-device invariants (log config, orch device id) were latched once by
+    // simpler_aicpu_init at worker init. Profiling enable bits live on
+    // KernelArgs::enable_profiling_flag now (no longer mirrored into
+    // Handshake), so decode the umbrella bitmask once and hand it to the
+    // existing platform-state setters.
+    set_platform_regs(k_args->regs);
+    set_platform_dump_base(k_args->dump_data_base);
+    set_platform_dump_args_run_terminal(k_args->args_dump_run_terminal_bank);
+    set_dump_args_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS));
+    set_platform_chip_swimlane_base(k_args->chip_swimlane_data_base);
+    set_platform_chip_swimlane_run_terminal_bank(k_args->chip_swimlane_run_terminal_bank);
+    set_platform_chip_swimlane_aicore_rotation_table(k_args->chip_swimlane_aicore_rotation_table);
+    set_chip_swimlane_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE));
+    set_platform_pmu_base(k_args->pmu_data_base);
+    set_platform_pmu_run_terminal(k_args->pmu_run_terminal_bank);
+    set_pmu_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_PMU));
+    set_platform_dep_gen_base(k_args->dep_gen_data_base);
+    set_platform_dep_gen_run_terminal(k_args->dep_gen_run_terminal_bank);
+    set_dep_gen_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN));
+    set_scope_stats_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS));
+    set_platform_scope_stats_base(k_args->scope_stats_data_base);
+    set_platform_scope_stats_run_terminal(k_args->scope_stats_run_terminal_bank);
+}
+
+static int execute_platform_task(void *arg) {
     // Log severity was snapshot once by simpler_aicpu_init at worker init; the
     // resident SO keeps it across launches, so exec does not re-snapshot.
     if (arg == nullptr) {
@@ -87,66 +115,12 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
         return -1;
     }
 
-    // Per-device invariants (log config, orch device id) were latched once by
-    // simpler_aicpu_init at worker init. Profiling enable bits live on
-    // KernelArgs::enable_profiling_flag now (no longer mirrored into
-    // Handshake), so decode the umbrella bitmask once and hand it to the
-    // existing platform-state setters.
-    set_platform_regs(k_args->regs);
-    set_platform_dump_base(k_args->dump_data_base);
-    set_dump_args_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS));
-    set_platform_chip_swimlane_base(k_args->chip_swimlane_data_base);
-    set_platform_chip_swimlane_run_terminal_bank(k_args->chip_swimlane_run_terminal_bank);
-    set_platform_chip_swimlane_aicore_rotation_table(k_args->chip_swimlane_aicore_rotation_table);
-    set_chip_swimlane_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE));
-    set_platform_pmu_base(k_args->pmu_data_base);
-    set_pmu_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_PMU));
-    set_platform_dep_gen_base(k_args->dep_gen_data_base);
-    set_dep_gen_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN));
-    set_scope_stats_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS));
-    set_platform_scope_stats_base(k_args->scope_stats_data_base);
-
-    // Filter-style affinity gate (a5). Host probed the topology, computed
-    // ALLOWED_CPUS, and wrote it into runtime->aicpu_allowed_cpus[]. The
-    // gate barriers exactly runtime->aicpu_launch_count threads (= the
-    // count CANN was told to launch, which equals popcount(OCCUPY) — see
-    // src/a5/platform/onboard/host/device_runner.cpp), keeps those whose
-    // sched_getcpu() ∈ allowed_cpus, and exposes the deterministic
-    // exec_idx via platform_aicpu_affinity_thread_idx() — the executor
-    // reads it to assign sched/orch role.
-    //
-    // If the host probe didn't populate the gate inputs (allowed_count or
-    // launch_count is 0) the gate would unconditionally drop every thread
-    // and we'd silently return success without ever calling aicpu_execute.
-    // That's a host-side bug; fail loud so it surfaces instead of
-    // producing nothing at runtime.
-    if (runtime->get_aicpu_allowed_cpu_count() <= 0 || runtime->get_aicpu_launch_count() <= 0) {
-        LOG_ERROR(
-            "AICPU affinity inputs missing: allowed_cpu_count=%d launch_count=%d (host probe must run before exec)",
-            runtime->get_aicpu_allowed_cpu_count(), runtime->get_aicpu_launch_count()
-        );
-        return -1;
-    }
-    if (!platform_aicpu_affinity_gate_filter(
-            runtime->get_aicpu_allowed_cpus(), runtime->get_aicpu_allowed_cpu_count(), runtime->get_aicpu_launch_count()
-        )) {
-        return 0;
-    }
-
     // Publish the phase-buffer base so the finer preamble/so_load/graph_build/
     // post_orch + orch/sched phases stamped inside aicpu_execute / the scheduler
     // resolve their per-thread slot via platform_aicpu_affinity_thread_idx()
     // (no C++ thread_local — see docs/dynamic-linking.md). Idempotent across the
     // concurrent exec threads (same base). Run-wall is stamped here.
     set_platform_phase_base(k_args->device_wall_data_base);
-    // Publish this run's result region and the epoch its device side stamps
-    // into it, for the same reason as the phase base: AICPU receives KernelArgs
-    // as a CANN-private copy, so the runtime reaches these through the resident
-    // SO globals rather than the struct. Every concurrent exec thread stores the
-    // same pair here, which is why that storage is atomic. Both zero when the
-    // host allocated no region, which every publisher treats as "nothing to
-    // publish into".
-    set_platform_run_result(k_args->run_result_data_base, k_args->run_result_epoch);
     // This thread's own view of the launch package, published under its gate
     // survivor index so no other thread writes the slot and no other thread's
     // arguments are borrowed. Base and offset stay separate: the runtime forms
@@ -170,6 +144,34 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // Run-wall end is stamped by run_wall's destructor (covers the early return
     // above too); host reduces max(end) - min(start) → ns.
     return rc;
+}
+
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *arg) {
+    if (arg == nullptr) return -1;
+    auto *args = static_cast<KernelArgs *>(arg);
+    auto *runtime = args->runtime_args;
+    if (runtime == nullptr) return -1;
+    bind_platform_task(args);
+    NativeInvocationEntry invocation{
+        runtime->get_aicpu_launch_count(), args->run_result_data_base,  args->run_result_epoch,
+        aicpu_begin_native_invocation,     aicpu_reset_execution_entry, aicpu_finish_native_invocation
+    };
+    const auto entry = platform_aicpu_entry_gate_filter(
+        runtime->get_aicpu_allowed_cpus(), runtime->get_aicpu_allowed_cpu_count(), invocation.callbacks,
+        invocation.initializer()
+    );
+    return invocation.complete(
+        entry,
+        [arg] {
+            return execute_platform_task(arg);
+        },
+        [runtime, args] {
+            (void)abort_aicore_startup(runtime, args->regs, args->run_result_epoch);
+        },
+        [] {
+            return platform_aicpu_affinity_bind_thread(nullptr);
+        }
+    );
 }
 
 /**
@@ -201,5 +203,18 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_init(void *a
         set_dma_workspace_addr(k, init_args->dma_workspace_addr[k]);
     }
 
+    return 0;
+}
+
+// Each executor owns only its backend's persistent resources. The host calls
+// this after supported eager runs retire, before unloading RTS registration.
+extern "C" int32_t aicpu_release_callables();
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_finalize(void *arg) {
+    auto *args = static_cast<AicpuFinalizeArgs *>(arg);
+    if (args == nullptr || args->result_addr == 0) return -1;
+    auto *result = reinterpret_cast<AicpuFinalizeResult *>(args->result_addr);
+    result->status = aicpu_release_callables();
+    result->completed = 1;
+    wmb();
     return 0;
 }

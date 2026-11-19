@@ -90,12 +90,18 @@ Three things a name comparison cannot see, all of which the checks above caught:
 ### Why it regressed between #1897 and #1929
 
 Over that range `graph_begin` held **one recording slot for the whole
-orchestration**. A Graph whose `full_key` differed from the in-flight recording's
-got the default `GraphScopeResult` back — `execute_block=true, recording=false` —
+orchestration**. A Graph whose cache key (then named `full_key`) differed from
+the in-flight recording's got the default `GraphScopeResult` back —
+`execute_block=true, recording=false` —
 and `rt_submit_graph_impl` ran its body on the ordinary path, with no warning and
 no retry, even though the `rt_graph_commit()` on that same branch then waited for
 the recorder to go idle. So k distinct Definitions submitted back to back got
 roughly every other one recorded.
+
+> Historical. The `execute_block` field and the ordinary-path fallback it selected
+> are both gone: a Graph that cannot be opened now latches a fatal naming the
+> reason, and `GraphScopeResult` carries `has_error` instead. The silent
+> degradation described here is the behaviour that change removed.
 
 That is exactly what block decomposition produces: where the pair form submits
 one key per iteration and never contends, the four-block form submits four

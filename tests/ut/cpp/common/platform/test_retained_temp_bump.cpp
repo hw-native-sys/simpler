@@ -32,6 +32,7 @@ namespace {
 struct FakeSlot {
     void *addr = nullptr;
     size_t size = 0;
+    int acquire_count = 0;
     int malloc_count = 0;
     int free_count = 0;
     bool malloc_fails = false;
@@ -90,6 +91,7 @@ void fake_set_retained_temp_buffer(void * /*runner_ctx*/, uint32_t /*pipeline_sl
 int fake_acquire_retained_temp(
     void *runner_ctx, uint32_t pipeline_slot, size_t bytes, void **addr_out, size_t *size_out
 ) {
+    ++g_slot->acquire_count;
     fake_get_retained_temp_buffer(runner_ctx, pipeline_slot, addr_out, size_out);
     if (bytes == 0 || bytes <= *size_out) return 0;
     if (*addr_out != nullptr) fake_device_free(runner_ctx, *addr_out);
@@ -190,6 +192,7 @@ TEST_F(RetainedTempBumpTest, ARunThatFitsReusesTheRetainedBufferWithNoAllocation
     EXPECT_EQ(slot_.free_count, 0);
     EXPECT_EQ(slot_.addr, raw);
     EXPECT_EQ(slot_.size, 4 * kAlign + kAlign - 1);
+    EXPECT_EQ(slot_.acquire_count, 2) << "warm storage must be referenced for each attempt";
     // ...and the cursor restarts, so the second run's first slice is the same
     // aligned base the first run got.
     EXPECT_EQ(second.acquire(kAlign), base);

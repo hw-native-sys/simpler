@@ -21,25 +21,36 @@
 #include "common/chip_swimlane_extension.h"
 #include "common/chip_swimlane_profiling.h"
 #include "common/memory_barrier.h"
+#include "aicpu/cache_maintenance.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "host/chip_swimlane_collector.h"
 #include "support/test_task_id.h"
+#include "profiler_test_allocator.h"
+#include "runtime_c_api.h"
 
 TEST(ChipSwimlaneCollectorTest, BeginRunReleasesRuntimeExtensionSlots) {
     ChipSwimlaneCollector collector;
 
+    // Non-retained: one run reaches the device at a time, so the resident slot
+    // is the run's and `begin_run` is what releases it. The epoch is carried
+    // for the addressed path and is not what selects storage here.
     collector.begin_run("first", ChipSwimlaneLevel::TASK_TIMING);
-    ASSERT_TRUE(collector.set_json_extension(ChipSwimlaneExtensionSection::AicoreTasks, "[]"));
-    EXPECT_FALSE(collector.set_json_extension(ChipSwimlaneExtensionSection::AicoreTasks, "[]"));
+    ASSERT_TRUE(collector.set_json_extension(/*run_epoch=*/1, ChipSwimlaneExtensionSection::AicoreTasks, "[]", 2));
+    EXPECT_FALSE(collector.set_json_extension(/*run_epoch=*/1, ChipSwimlaneExtensionSection::AicoreTasks, "[]", 2));
 
     collector.begin_run("second", ChipSwimlaneLevel::TASK_TIMING);
-    EXPECT_TRUE(collector.set_json_extension(ChipSwimlaneExtensionSection::AicoreTasks, "[]"));
+    EXPECT_TRUE(collector.set_json_extension(/*run_epoch=*/2, ChipSwimlaneExtensionSection::AicoreTasks, "[]", 2));
 }
 
 namespace {
 
-void *swimlane_test_alloc(size_t size) { return std::calloc(1, size); }
+struct DeviceCountSnapshot {
+    volatile uint32_t *cached_count{nullptr};
+    uint32_t committed{0};
+} device_count_snapshot;
+
+void *swimlane_test_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int swimlane_test_free(void *ptr) {
     std::free(ptr);
@@ -47,6 +58,19 @@ int swimlane_test_free(void *ptr) {
 }
 
 }  // namespace
+
+namespace aicpu_cache_maintenance {
+
+void invalidate_range_impl(const void *address, size_t size) {
+    auto &snapshot = device_count_snapshot;
+    if (snapshot.cached_count == nullptr || address != snapshot.cached_count || size < sizeof(uint32_t)) return;
+    *snapshot.cached_count = snapshot.committed;
+    snapshot.cached_count = nullptr;
+}
+
+void flush_range_impl(const void *, size_t) {}
+
+}  // namespace aicpu_cache_maintenance
 
 // Identity reaches the host copy, and stays with it once the device buffer is
 // handed back and re-stamped by a later run. Both halves are production code:
@@ -134,7 +158,7 @@ TEST(ChipSwimlaneCollectorTest, InitStampsTheFirstBufferOfAShortRun) {
     set_chip_swimlane_enabled(true);
     set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(shm));
     set_platform_chip_swimlane_aicore_rotation_table(0);
-    chip_swimlane_aicpu_init(/*worker_count=*/1);
+    chip_swimlane_aicpu_init(/*worker_count=*/1, ChipSwimlaneLevel::SCHEDULE_TIMING);
 
     // One record, far short of a rotation boundary.
     ASSERT_EQ(
@@ -236,8 +260,7 @@ void run_once(void *shm, uint64_t epoch, ChipSwimlaneLevel level, int dispatches
     set_chip_swimlane_enabled(true);
     set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(shm));
     set_platform_chip_swimlane_aicore_rotation_table(0);
-    get_chip_swimlane_header(shm)->chip_swimlane_level = static_cast<uint32_t>(level);
-    chip_swimlane_aicpu_init(/*worker_count=*/1);
+    chip_swimlane_aicpu_init(/*worker_count=*/1, level);
     for (int i = 0; i < dispatches; i++) {
         chip_swimlane_aicpu_on_aicore_dispatch(/*core_id=*/0, /*thread_idx=*/0, static_cast<uint32_t>(i + 1));
     }
@@ -294,6 +317,148 @@ TEST(ChipSwimlaneBufferReturnTest, IdleCoreDoesNotConsumeABufferPerRun) {
             << "run " << epoch << " released an AICore buffer it never handed to the host";
     }
 
+    collector.finalize(nullptr, swimlane_test_free);
+}
+
+TEST(ChipSwimlaneBufferReturnTest, SelfScheduledCorePublishesItsTail) {
+    ChipSwimlaneCollector collector;
+    ASSERT_EQ(
+        collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, swimlane_test_alloc, nullptr, swimlane_test_free),
+        0
+    );
+    void *shm = collector.get_chip_swimlane_setup_device_ptr();
+    collector.begin_run("self-scheduled", ChipSwimlaneLevel::TASK_TIMING);
+    set_platform_run_result(0, 12);
+    set_chip_swimlane_enabled(true);
+    set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(shm));
+    set_platform_chip_swimlane_aicore_rotation_table(0);
+    chip_swimlane_aicpu_init(1, ChipSwimlaneLevel::TASK_TIMING);
+    chip_swimlane_aicpu_use_self_scheduled_cores();
+    auto *pool = get_aicore_buffer_state(shm, 0);
+    auto *buffer = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(pool->head.current_buf_ptr);
+    ASSERT_NE(buffer, nullptr);
+    buffer->records[0].start_time = 100;
+    buffer->records[0].end_time = 200;
+    buffer->records[0].task_token = simpler::ut::test_task_id(9);
+    buffer->records[0].reg_task_id = 1;
+    // The CPU keeps its initialized zeros until invalidation exposes the
+    // self-scheduling core's final counters from device memory.
+    device_count_snapshot = {&buffer->count, 1};
+    const int cores[] = {0};
+    chip_swimlane_aicpu_flush(0, cores, 1);
+    device_count_snapshot = {};
+    EXPECT_EQ(pool->head.total_record_count, 1U);
+    EXPECT_EQ(pool->head.published_record_count, 1U);
+    EXPECT_EQ(pool->head.dropped_record_count, 0U);
+    auto *header = get_chip_swimlane_header(shm);
+    ASSERT_EQ(header->queue_tails[0], 1U);
+    EXPECT_EQ(header->queues[0][0].kind, ChipSwimlaneBufferKind::AicoreTask);
+    EXPECT_EQ(buffer->count, 1U);
+    EXPECT_EQ(buffer->run_epoch, 12U);
+    collector.finalize(nullptr, swimlane_test_free);
+}
+
+TEST(ChipSwimlaneBufferReturnTest, SelfScheduledCoreRotatesAndReusesHostReturnedBuffers) {
+    ChipSwimlaneCollector collector;
+    ASSERT_EQ(
+        collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, swimlane_test_alloc, nullptr, swimlane_test_free),
+        0
+    );
+    collector.begin_run("self-scheduled-rotation", ChipSwimlaneLevel::TASK_TIMING);
+    void *shm = collector.get_chip_swimlane_setup_device_ptr();
+    set_platform_run_result(0, 13);
+    set_chip_swimlane_enabled(true);
+    set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(shm));
+    set_platform_chip_swimlane_aicore_rotation_table(0);
+    chip_swimlane_aicpu_init(1, ChipSwimlaneLevel::TASK_TIMING);
+    chip_swimlane_aicpu_use_self_scheduled_cores();
+    auto *pool = get_aicore_buffer_state(shm, 0);
+    auto *header = get_chip_swimlane_header(shm);
+    uint32_t written = 0;
+    auto write_records = [&](uint32_t count) {
+        auto *buffer = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(pool->head.current_buf_ptr);
+        ASSERT_NE(buffer, nullptr);
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t id = ++written;
+            buffer->records[i].start_time = id * 100;
+            buffer->records[i].end_time = id * 100 + 50;
+            buffer->records[i].task_token = simpler::ut::test_task_id(9);
+            buffer->records[i].reg_task_id = id;
+        }
+        device_count_snapshot = {&buffer->count, count};
+    };
+    auto collect_and_return = [&] {
+        while (header->queue_heads[0] != header->queue_tails[0]) {
+            const auto entry = header->queues[0][header->queue_heads[0]];
+            ASSERT_EQ(entry.kind, ChipSwimlaneBufferKind::AicoreTask);
+            ReadyBufferInfo info{};
+            info.type = ProfBufferType::AICORE_TASK;
+            info.index = 0;
+            info.dev_buffer_ptr = reinterpret_cast<void *>(entry.buffer_ptr);
+            info.host_buffer_ptr = reinterpret_cast<void *>(entry.buffer_ptr);
+            info.buffer_seq = entry.buffer_seq;
+            collector.on_buffer_collected(info, 0);
+            header->queue_heads[0] = (header->queue_heads[0] + 1) % PLATFORM_PROF_READYQUEUE_SIZE;
+            host_push_free_queue(pool->free_queue, entry.buffer_ptr);
+        }
+    };
+    // More rotations than the initially seeded pool can satisfy without reuse.
+    constexpr uint32_t batches = PLATFORM_AICORE_BUFFERS_PER_CORE + 3;
+    for (uint32_t batch = 0; batch < batches; ++batch) {
+        write_records(PLATFORM_AICORE_BUFFER_SIZE);
+        chip_swimlane_aicpu_poll_self_scheduled_cores(0, 1, 1);
+        EXPECT_EQ(pool->head.current_buf_seq, batch + 1);
+        EXPECT_EQ(pool->head.live_record_count, 0U);
+        collect_and_return();
+    }
+    write_records(7);
+    const int cores[] = {0};
+    chip_swimlane_aicpu_flush(0, cores, 1);
+    collect_and_return();
+    device_count_snapshot = {};
+    EXPECT_EQ(pool->head.total_record_count, batches * PLATFORM_AICORE_BUFFER_SIZE + 7U);
+    EXPECT_EQ(pool->head.published_record_count, written);
+    EXPECT_EQ(pool->head.dropped_record_count, 0U);
+    const auto records = collector.collected_aicore_records_for_test();
+    ASSERT_EQ(records[0].size(), written);
+    for (uint32_t i = 0; i < written; ++i) {
+        EXPECT_EQ(records[0][i].record.reg_task_id, i + 1);
+        EXPECT_EQ(records[0][i].run_epoch, 13U);
+    }
+    collector.finalize(nullptr, swimlane_test_free);
+}
+
+TEST(ChipSwimlaneBufferReturnTest, SelfScheduledPollingKeepsEachRetirementPartition) {
+    ChipSwimlaneCollector collector;
+    ASSERT_EQ(
+        collector.initialize(2, 2, 0, ChipSwimlaneLevel::TASK_TIMING, swimlane_test_alloc, nullptr, swimlane_test_free),
+        0
+    );
+    collector.begin_run("self-scheduled-partitions", ChipSwimlaneLevel::TASK_TIMING);
+    void *shm = collector.get_chip_swimlane_setup_device_ptr();
+    set_platform_run_result(0, 14);
+    set_chip_swimlane_enabled(true);
+    set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(shm));
+    set_platform_chip_swimlane_aicore_rotation_table(0);
+    chip_swimlane_aicpu_init(2, ChipSwimlaneLevel::TASK_TIMING);
+    chip_swimlane_aicpu_use_self_scheduled_cores();
+    for (int core = 0; core < 2; ++core) {
+        auto *pool = get_aicore_buffer_state(shm, core);
+        auto *buffer = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(pool->head.current_buf_ptr);
+        ASSERT_NE(buffer, nullptr);
+        buffer->count = PLATFORM_AICORE_BUFFER_SIZE;
+    }
+    auto *header = get_chip_swimlane_header(shm);
+    chip_swimlane_aicpu_poll_self_scheduled_cores(0, 2, 2);
+    EXPECT_EQ(get_aicore_buffer_state(shm, 0)->head.current_buf_seq, 1U);
+    EXPECT_EQ(get_aicore_buffer_state(shm, 1)->head.current_buf_seq, 0U);
+    ASSERT_EQ(header->queue_tails[0], 1U);
+    EXPECT_EQ(header->queue_tails[1], 0U);
+    EXPECT_EQ(header->queues[0][0].core_index, 0U);
+    chip_swimlane_aicpu_poll_self_scheduled_cores(1, 2, 2);
+    EXPECT_EQ(get_aicore_buffer_state(shm, 1)->head.current_buf_seq, 1U);
+    ASSERT_EQ(header->queue_tails[1], 1U);
+    EXPECT_EQ(header->queues[1][0].core_index, 1U);
     collector.finalize(nullptr, swimlane_test_free);
 }
 
@@ -362,8 +527,7 @@ TEST(ChipSwimlaneBufferReturnTest, AFailedEnqueueChargesDroppedOnceAndKeepsTheBu
     set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(shm));
     set_platform_chip_swimlane_aicore_rotation_table(0);
     auto *header = get_chip_swimlane_header(shm);
-    header->chip_swimlane_level = static_cast<uint32_t>(ChipSwimlaneLevel::SCHEDULE_TIMING);
-    chip_swimlane_aicpu_init(/*worker_count=*/1);
+    chip_swimlane_aicpu_init(/*worker_count=*/1, ChipSwimlaneLevel::SCHEDULE_TIMING);
 
     auto *pool = get_perf_buffer_state(shm, 0);
     const uint64_t held = pool->head.current_buf_ptr;
@@ -393,8 +557,7 @@ TEST(ChipSwimlaneBufferReturnTest, AFailedEnqueueChargesDroppedOnceAndKeepsTheBu
     // and re-stamps it rather than drawing a replacement.
     collector.begin_run("full-next", ChipSwimlaneLevel::SCHEDULE_TIMING);
     set_platform_run_result(/*region_base=*/0, /*run_epoch=*/6);
-    header->chip_swimlane_level = static_cast<uint32_t>(ChipSwimlaneLevel::SCHEDULE_TIMING);
-    chip_swimlane_aicpu_init(/*worker_count=*/1);
+    chip_swimlane_aicpu_init(/*worker_count=*/1, ChipSwimlaneLevel::SCHEDULE_TIMING);
     EXPECT_EQ(pool->head.current_buf_ptr, held) << "init drew a replacement instead of reusing the retained buffer";
     const auto *reused = reinterpret_cast<const ChipSwimlaneAicpuTaskBuffer *>(held);
     EXPECT_EQ(reused->count, 0u);
@@ -428,8 +591,7 @@ TEST(ChipSwimlaneBufferReturnTest, AFailedAicoreEnqueueChargesDroppedOnceAndKeep
     set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(shm));
     set_platform_chip_swimlane_aicore_rotation_table(0);
     auto *header = get_chip_swimlane_header(shm);
-    header->chip_swimlane_level = static_cast<uint32_t>(ChipSwimlaneLevel::TASK_TIMING);
-    chip_swimlane_aicpu_init(/*worker_count=*/1);
+    chip_swimlane_aicpu_init(/*worker_count=*/1, ChipSwimlaneLevel::TASK_TIMING);
 
     auto *ac_state = get_aicore_buffer_state(shm, 0);
     const uint64_t held = ac_state->head.current_buf_ptr;
@@ -454,8 +616,7 @@ TEST(ChipSwimlaneBufferReturnTest, AFailedAicoreEnqueueChargesDroppedOnceAndKeep
     // Reusable in place, re-stamped and re-zeroed by the next run's init.
     collector.begin_run("aicore-full-next", ChipSwimlaneLevel::TASK_TIMING);
     set_platform_run_result(/*region_base=*/0, /*run_epoch=*/12);
-    header->chip_swimlane_level = static_cast<uint32_t>(ChipSwimlaneLevel::TASK_TIMING);
-    chip_swimlane_aicpu_init(/*worker_count=*/1);
+    chip_swimlane_aicpu_init(/*worker_count=*/1, ChipSwimlaneLevel::TASK_TIMING);
     EXPECT_EQ(ac_state->head.current_buf_ptr, held)
         << "init drew a replacement instead of reusing the retained AICore buffer";
     const auto *reused = reinterpret_cast<const ChipSwimlaneAicoreTaskBuffer *>(held);
@@ -586,8 +747,7 @@ TEST(ChipSwimlaneBufferReturnTest, APublishedAicoreBufferIsReturnedByTheHostAndR
         set_chip_swimlane_enabled(true);
         set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(shm));
         set_platform_chip_swimlane_aicore_rotation_table(0);
-        header->chip_swimlane_level = static_cast<uint32_t>(ChipSwimlaneLevel::TASK_TIMING);
-        chip_swimlane_aicpu_init(/*worker_count=*/1);
+        chip_swimlane_aicpu_init(/*worker_count=*/1, ChipSwimlaneLevel::TASK_TIMING);
 
         const uint64_t held = ac_state->head.current_buf_ptr;
         ASSERT_NE(held, 0u) << "run " << epoch << " acquired no AICore buffer";
@@ -684,8 +844,7 @@ protected:
     // does is the thing under test.
     void device_run(uint64_t epoch, int dispatches) {
         set_platform_run_result(/*region_base=*/0, epoch);
-        get_chip_swimlane_header(shm_)->chip_swimlane_level = static_cast<uint32_t>(ChipSwimlaneLevel::TASK_TIMING);
-        chip_swimlane_aicpu_init(/*worker_count=*/1);
+        chip_swimlane_aicpu_init(/*worker_count=*/1, ChipSwimlaneLevel::TASK_TIMING);
         for (int i = 0; i < dispatches; i++) {
             chip_swimlane_aicpu_on_aicore_dispatch(/*core_id=*/0, /*thread_idx=*/0, static_cast<uint32_t>(i + 1));
         }
@@ -723,7 +882,7 @@ protected:
 //
 // The old form was `total_record_count - current_buf_seq * BUFFER_SIZE`. It
 // needed both operands to be reset together every run, and they were reset by
-// two different writers: the host cleared `total` in `publish_run_config`, and
+// two different writers: the host cleared `total` at admission, and
 // the producer's `init` reset `seq` to 0. Two writers for one invariant is what
 // made the derivation fragile — skip the host half and `total` carries the
 // earlier run's dispatches while `seq` restarts at 0, so the derivation reports
@@ -804,8 +963,7 @@ TEST_F(ChipSwimlaneAccountingTest, DispatchesWithNoBufferAreDroppedNotCarriedInt
 
     collector_.begin_run("starved", ChipSwimlaneLevel::TASK_TIMING);
     set_platform_run_result(/*region_base=*/0, /*run_epoch=*/61);
-    get_chip_swimlane_header(shm_)->chip_swimlane_level = static_cast<uint32_t>(ChipSwimlaneLevel::TASK_TIMING);
-    chip_swimlane_aicpu_init(/*worker_count=*/1);
+    chip_swimlane_aicpu_init(/*worker_count=*/1, ChipSwimlaneLevel::TASK_TIMING);
     ASSERT_EQ(ac_state->head.current_buf_ptr, 0u) << "init found a buffer; the starvation setup did not take";
 
     // A full batch of dispatches with nowhere to land.
@@ -855,8 +1013,7 @@ TEST_F(ChipSwimlaneAccountingTest, ARotatedBufferReachesTheHostOnlyOnItsGatingAc
 
     collector_.begin_run("ack-gate", ChipSwimlaneLevel::TASK_TIMING);
     set_platform_run_result(/*region_base=*/0, /*run_epoch=*/71);
-    get_chip_swimlane_header(shm_)->chip_swimlane_level = static_cast<uint32_t>(ChipSwimlaneLevel::TASK_TIMING);
-    chip_swimlane_aicpu_init(/*worker_count=*/1);
+    chip_swimlane_aicpu_init(/*worker_count=*/1, ChipSwimlaneLevel::TASK_TIMING);
 
     const uint64_t rotated = ac_state->head.current_buf_ptr;
     ASSERT_NE(rotated, 0u) << "init found no buffer";
@@ -1016,8 +1173,7 @@ protected:
     // is the implicit boundary this format has to stop depending on.
     void device_run(uint64_t epoch, int dispatches, uint64_t time_base) {
         set_platform_run_result(/*region_base=*/0, epoch);
-        get_chip_swimlane_header(shm_)->chip_swimlane_level = static_cast<uint32_t>(ChipSwimlaneLevel::SCHEDULE_TIMING);
-        chip_swimlane_aicpu_init(/*worker_count=*/1);
+        chip_swimlane_aicpu_init(/*worker_count=*/1, ChipSwimlaneLevel::SCHEDULE_TIMING);
         auto *ac_state = get_aicore_buffer_state(shm_, 0);
         auto *buf = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(ac_state->head.current_buf_ptr);
         ASSERT_NE(buf, nullptr) << "init found no AICore buffer for run " << epoch;
@@ -1058,6 +1214,9 @@ TEST_F(ChipSwimlaneExportIdentityTest, ExportsTwoRunsDistinctly) {
     ASSERT_EQ(collector_.export_swimlane_json(), 0);
     const std::string json = read_whole_file(dir_ + "/chip_swimlane_records.json");
     ASSERT_FALSE(json.empty()) << "the exporter wrote no file";
+
+    EXPECT_NE(json.find("\"producer\": \"aicpu\""), std::string::npos)
+        << "a transport without native scheduler identity must retain its AICPU producer";
 
     // Three AICore rows and three scheduler rows per run, each ending in its epoch.
     EXPECT_EQ(count_occurrences(json, ", 7]"), 6u) << "run 7 lost rows or lost its identity";
@@ -1107,15 +1266,42 @@ TEST_F(ChipSwimlaneExportIdentityTest, EveryAicoreRowIsSevenColumnsEndingInItsEp
     EXPECT_EQ(count_occurrences(section, ", 11]"), 2u) << "a row carries an epoch other than its run's";
 }
 
+TEST_F(ChipSwimlaneExportIdentityTest, NativeSnapshotSelectsSchedulerProducerOnlyForItsRuntime) {
+    collector_.begin_run(dir_, ChipSwimlaneLevel::SCHEDULE_TIMING);
+    device_run(/*epoch=*/7, /*dispatches=*/2, /*time_base=*/1000);
+    const std::string identity = R"({"schema":"hbg-execution-identity","producer":"aicore","records":[]})";
+    ASSERT_TRUE(collector_.set_json_extension(
+        7, ChipSwimlaneExtensionSection::AicoreExecutionIdentities, identity.c_str(), identity.size()
+    ));
+    ASSERT_EQ(collector_.export_swimlane_json(), 0);
+    const std::string json = read_whole_file(dir_ + "/chip_swimlane_records.json");
+    const auto scheduler = json.find("\"scheduler_tasks\":");
+    ASSERT_NE(scheduler, std::string::npos);
+    const auto section = json.substr(scheduler, json.find("\"records\":", scheduler) - scheduler);
+    const auto expected = std::string(SIMPLER_RUNTIME_NAME) == "host_build_graph" ? "aicore" : "aicpu";
+    EXPECT_NE(section.find(std::string("\"producer\": \"") + expected + "\""), std::string::npos);
+    EXPECT_EQ(count_occurrences(json, ", 7]"), 4u) << "source selection must keep both joined task streams";
+}
+
+TEST_F(ChipSwimlaneExportIdentityTest, NativeIdentityDoesNotAuthorizeAmbiguousTaskSources) {
+    collector_.begin_run(dir_, ChipSwimlaneLevel::SCHEDULE_TIMING);
+    device_run(/*epoch=*/7, /*dispatches=*/2, /*time_base=*/1000);
+    const std::string identity = R"({"schema":"hbg-execution-identity","producer":"aicore","records":[]})";
+    ASSERT_TRUE(collector_.set_json_extension(
+        7, ChipSwimlaneExtensionSection::AicoreExecutionIdentities, identity.c_str(), identity.size()
+    ));
+    ASSERT_TRUE(collector_.set_json_extension(7, ChipSwimlaneExtensionSection::AicoreTasks, "[]", 2));
+    EXPECT_EQ(collector_.export_swimlane_json(), PTO_RUNTIME_ERR_INTERNAL);
+}
+
 // ---------------------------------------------------------------------------
 // Level escalation across runs
 // ---------------------------------------------------------------------------
 //
 // initialize() decides whether a device orch-phase pool exists from the level of
 // the run that first builds the pools, and early-returns on every later call
-// while the region is held. begin_run() then publishes an arbitrary per-run level
-// to the header the device obeys. A run that escalates the level past ORCH_PHASES
-// must not end up asking the device for phases the pool cannot hold.
+// while the region is held. The next invocation may request a higher level. A run that escalates the level past
+// ORCH_PHASES must not end up asking the device for phases the pool cannot hold.
 
 namespace {
 
@@ -1177,7 +1363,7 @@ TEST(ChipSwimlaneLevelEscalationTest, EscalatingTheLevelAfterInitKeepsTheOrchPoo
     );
     collector.begin_run("escalated", ChipSwimlaneLevel::ORCH_PHASES);
 
-    EXPECT_EQ(published_level(collector), static_cast<uint32_t>(ChipSwimlaneLevel::ORCH_PHASES));
+    EXPECT_EQ(published_level(collector), static_cast<uint32_t>(ChipSwimlaneLevel::SCHEDULE_TIMING));
     EXPECT_GT(orch_pool_depth(collector), 0u);
 
     collector.finalize(nullptr, swimlane_test_free);

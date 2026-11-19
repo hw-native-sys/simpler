@@ -43,6 +43,101 @@ The constants live in
 treat them as private to the runtime and always go through the
 accessor functions defined in that header.
 
+### Reporting invalid kernel data (A2/A3 TMR)
+
+After the usual kernel prelude (for example `<pto/pto-inst.hpp>`), ordinary
+AIC and AIV kernels can include `kernel_error_api.h` and report
+invalid data before using it to calculate an address or publishing an output:
+
+```cpp
+if (index < 0 || index >= vocab_size) {
+    auto ctx = get_async_ctx(args);
+    report_kernel_error(ctx, KernelErrorCode::INDEX_OUT_OF_RANGE);
+    return;
+}
+```
+
+The codes are `INVALID_OUTPUT` (105), `INDEX_OUT_OF_RANGE` (106), and
+`NON_FINITE_VALUE` (107). Call the API through the current
+`get_async_ctx(args)` result, then return from `kernel_entry` immediately.
+The boolean result says whether this call published the error; false means an
+error was already present or the context or code was invalid. Do not continue
+with the invalid data in either case.
+
+The API stores only the error code in the existing per-block completion slab
+and flushes it before the executor publishes FIN. Normal kernels perform no
+error-code write or flush. The scheduler reuses its existing slab check,
+retains the first code, and stops before releasing consumer dependencies.
+It logs task/function/block/core identity from its existing scheduling state.
+No error-detail record or shared-header expansion is required.
+
+Before scheduler diagnostics, the error path publishes to the existing
+orchestration fatal channel, stopping tensor waits and allocation backpressure.
+The first publication to that channel selects the Host primary error; an
+already-present orchestration error stays primary. A previously observed
+scheduler failure is preserved too. Concurrent scheduler diagnostics may carry
+a different code, without changing the primary. Later cleanup errors preserve
+that code. Host reports failure through the existing nonzero runtime/RTS
+path, which can surface as an AICPU exception. This API does not introduce a
+typed Python exception or certify worker reuse after failure. Diagnostics work
+with DFX disabled. Argument values and ranges are not transported by this API.
+
+The final AICPU entry must return a nonzero status for a failed computation,
+even after all cores and asynchronous requests have retired. Publishing a
+private run result does not replace the stream failure. This applies to both
+Program and Kernel execution: an eager caller stream or captured model must
+observe the failure without depending on a Program Host observer. A failed
+stream is not a physical-completion or device-health proof; its resources and
+Worker remain isolated until the platform can establish safe retirement and
+recovery. Failed Program outputs are not delivered to the caller.
+
+Local A2/A3 TMR also supports partial SPMD failure, gated dispatch and
+cooperatively cancellable MIX lanes. A lane that can wait for a failed partner
+must poll at bounded work boundaries and return when cancellation is requested:
+
+```cpp
+#include "kernel_cancellation_api.h"
+// ctx is the current get_async_ctx(args) result.
+while (!partner_ready()) {
+    if (kernel_cancel_requested(ctx)) return;
+}
+```
+
+The query reads this core's dispatch register; on cancellation it publishes
+registered completion conditions before returning true. It cannot interrupt a
+hardware blocking wait or an arbitrary non-cooperative kernel. Never enter such
+a wait if a partner can report a validation failure instead of signalling it.
+The executor's existing gated wait already honors shutdown.
+
+Register asynchronous requests through the existing deferred-completion API
+before reporting failure. After all scheduler participants have joined and
+all cores have acknowledged the existing exit protocol, the finalizer polls
+the wait list, mailbox and remaining per-core slabs. It does not complete tasks
+or release their consumers. A mailbox producer stopped by cancellation retains
+its unforwarded suffix in its slab, so requests retain exactly one drain owner.
+A timeout or invalid request leaves drain incomplete and preserves the primary
+failure. This is error-path bookkeeping, not a new Host recovery protocol:
+existing failed-run isolation remains in force, and no worker reuse is enabled.
+The retirement diagnostic distinguishes core failure from async drain failure.
+SDMA tracking errors 101/102 also enter this cleanup path. Valid registered
+records are drained even when their slab carries either error. Invalid records
+and pending requests remain owned. Because a submission or registration failure
+can omit a request identity, draining the known records alone does not certify
+complete retirement: cleanup reports registration failure 103 and `complete=0`.
+Cleanup checks both orchestration and scheduler error channels, even when an
+earlier orchestration error outranks scheduler error 101/102. The selected
+primary error remains unchanged, including the final nonzero AICPU return and
+caller-stream or captured-model failure; no Host-only success path is used.
+On hardware, an SDMA-provisioned Worker can surface RTS 507018 and refuse
+safe result copy-back even after AICPU reports a completed drain. The original
+code and drain result remain in device logs; this contract does not promise
+Host code recovery or reuse through that platform failure path.
+
+SDMA and registered counters are covered locally; cross-rank cancellation,
+HBG and A5 require their own protocols. Checks belong before the unsafe
+operation and must respect the operator's valid shape, masking, and index
+semantics. The runtime does not insert checks into existing kernels.
+
 ---
 
 ## 2. SPMD execution context
@@ -97,13 +192,15 @@ that the runtime launches:
 | Symbol | Meaning |
 | ------ | ------- |
 | `rt_available_cluster_count()` | Number of physical AICore blocks this run launches — the whole device; there is no per-call knob. |
-| `get_block_num(args)` | Logical block count the kernel partitions work across. Currently always 1; multi-logical-block (`block_num > 1`) is not yet implemented. |
+| `get_block_num(args)` | Logical block count requested by this task's `LaunchSpec`; the scheduler assigns each block its own `block_idx`. |
 
-When the device reports 24 clusters and your kernel sees
-`get_block_num(args) == 1`, that is by design — every physical block
-runs the same kernel and the kernel partitions work however it likes
-using `get_block_idx()` against whatever it expects. Don't conflate
-the two.
+When the device reports 24 clusters and a task requests one logical block,
+that task does not execute once on every physical cluster. Multiple logical
+blocks can be dispatched in batches as compatible cores become available.
+`require_sync_start` requests admission of one task's fitting cohort; it does
+not reserve resources for another task or a remote producer. See the
+[TMR task dependency and progress constraints](aicore-kernel-programming/task-progress.md)
+before adding waits between logical blocks or tasks.
 
 ### Each block must write to its own cache line
 

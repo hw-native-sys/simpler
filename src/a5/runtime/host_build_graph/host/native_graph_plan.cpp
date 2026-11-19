@@ -1,0 +1,608 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include "native_graph_plan.h"
+
+#include <algorithm>
+#include <cstring>
+#include <limits>
+#include <utility>
+
+#include "host_build_graph/constants.h"
+#include "host_build_graph/host/graph_argument_layout.h"
+#include "host_build_graph/types.h"
+#include "scheduler/scheduler_graph.h"
+#include "task_interface/callable_limits.h"
+
+namespace {
+bool fail(std::string *error, const char *message) {
+    if (error != nullptr) *error = message;
+    return false;
+}
+
+struct Region {
+    uint32_t begin;
+    uint64_t end;
+};
+
+template <typename T>
+bool section(const Graph &def, uint32_t offset, int32_t count, std::vector<Region> &regions) {
+    if (count < 0) return false;
+    if (count == 0) return offset == 0;
+    if (offset < sizeof(Graph) || offset % alignof(T) != 0 || offset > def.total_bytes ||
+        static_cast<uint64_t>(count) > (def.total_bytes - offset) / sizeof(T))
+        return false;
+    regions.push_back({offset, offset + static_cast<uint64_t>(count) * sizeof(T)});
+    return true;
+}
+
+template <typename T>
+T element(const std::byte *image, uint32_t offset, uint32_t index) {
+    T value;
+    std::memcpy(&value, image + offset + static_cast<size_t>(index) * sizeof(T), sizeof(T));
+    return value;
+}
+
+bool tensor_record_valid(const simpler::hbg::TensorData &tensor, const Graph &def, int32_t consumer) {
+    const TaskId owner = tensor.owner_task_id;
+    if (tensor.ndims == 0 || tensor.ndims > MAX_TENSOR_DIMS ||
+        (tensor.address_space != AddressSpace::HOST && tensor.address_space != AddressSpace::DEVICE))
+        return false;
+    if (owner.space() == TaskId::Space::PARAM) {
+        return owner.local_id() >= 0 && owner.local_id() < def.boundary_tensor_count &&
+               owner == TaskId::make_param(owner.local_id()) && tensor.buffer.addr == 0;
+    }
+    return owner.space() == TaskId::Space::SUB_TASK && owner.local_id() >= 0 && owner.local_id() <= consumer &&
+           tensor.buffer.addr <= def.required_heap && tensor.buffer.size <= def.required_heap - tensor.buffer.addr;
+}
+}  // namespace
+
+static bool native_graph_definition_impl(
+    const void *image, size_t bytes, uint64_t graph_key, NativeGraphPlan *out, std::string *error
+) {
+    if (image == nullptr || bytes < sizeof(Graph) || bytes > UINT32_MAX)
+        return fail(error, "invalid Definition extent");
+    NativeGraphPlan next;
+    std::memcpy(&next.definition, image, sizeof(Graph));
+    const auto &def = next.definition;
+    if (def.total_bytes != bytes || def.graph_key != graph_key || def.task_count <= 0 ||
+        def.task_count > SUB_TASK_MAX_NUM || def.edge_count < 0 ||
+        def.edge_count > def.task_count * (def.task_count - 1) / 2 || def.root_count <= 0 ||
+        def.root_count > def.task_count || def.boundary_tensor_count < 0 ||
+        def.boundary_tensor_count > GRAPH_MAX_TENSOR_ARGS || def.boundary_scalar_count < 0 ||
+        def.boundary_scalar_count > GRAPH_MAX_SCALAR_ARGS || def.tensor_arg_count < 0 ||
+        def.tensor_arg_count > def.task_count * MAX_TENSOR_ARGS || def.scalar_arg_count < 0 ||
+        def.scalar_arg_count > def.task_count * MAX_SCALAR_ARGS || def.predicate_count < 0 ||
+        def.predicate_count > def.task_count)
+        return fail(error, "invalid Definition header counts");
+    std::vector<Region> regions;
+    if (!section<int32_t>(def, def.off_fanout_offsets, def.task_count + 1, regions) ||
+        !section<uint16_t>(def, def.off_fanout_indices, def.edge_count, regions) ||
+        !section<int32_t>(def, def.off_fanin_offsets, def.task_count + 1, regions) ||
+        !section<uint16_t>(def, def.off_fanin_indices, def.edge_count, regions) ||
+        !section<uint16_t>(def, def.off_root_indices, def.root_count, regions) ||
+        !section<uint64_t>(def, def.off_sub_task_offsets, def.task_count, regions) ||
+        !section<SubTaskDefinition>(def, def.off_sub_tasks, def.task_count, regions) ||
+        !section<simpler::hbg::TensorData>(def, def.off_tensors, def.tensor_arg_count, regions) ||
+        !section<uint64_t>(def, def.off_scalars, def.scalar_arg_count, regions) ||
+        !section<GraphScalarInheritance>(def, def.off_scalar_inheritance, def.scalar_arg_count, regions) ||
+        !section<GraphPredicate>(def, def.off_predicates, def.predicate_count, regions))
+        return fail(error, "invalid Definition section extent or alignment");
+    std::sort(regions.begin(), regions.end(), [](const auto &a, const auto &b) {
+        return a.begin < b.begin;
+    });
+    for (size_t i = 1; i < regions.size(); ++i)
+        if (regions[i].begin < regions[i - 1].end) return fail(error, "overlapping Definition sections");
+    const auto *source = static_cast<const std::byte *>(image);
+    const auto in = [&](int32_t i) {
+        return element<int32_t>(source, def.off_fanin_offsets, i);
+    };
+    const auto out_row = [&](int32_t i) {
+        return element<int32_t>(source, def.off_fanout_offsets, i);
+    };
+    if (in(0) != 0 || out_row(0) != 0 || in(def.task_count) != def.edge_count ||
+        out_row(def.task_count) != def.edge_count)
+        return fail(error, "invalid CSR endpoints");
+    // A transpose built from fanin is compared with each fanout row using stamps.
+    // This detects duplicates and asymmetric edge sets in O(nodes + edges).
+    std::vector<std::vector<uint16_t>> transpose(static_cast<size_t>(def.task_count));
+    std::vector<int32_t> seen(static_cast<size_t>(def.task_count), -1);
+    std::vector<uint16_t> roots;
+    for (int32_t consumer = 0; consumer < def.task_count; ++consumer) {
+        const auto begin = in(consumer), end = in(consumer + 1);
+        if (begin < 0 || begin > end || end > def.edge_count) return fail(error, "invalid fanin CSR row");
+        if (begin == end) roots.push_back(static_cast<uint16_t>(consumer));
+        for (int32_t j = begin; j < end; ++j) {
+            const auto producer = element<uint16_t>(source, def.off_fanin_indices, j);
+            if (producer >= consumer || seen[producer] == consumer)
+                return fail(error, "duplicate or nonpreceding fanin");
+            seen[producer] = consumer;
+            transpose[producer].push_back(static_cast<uint16_t>(consumer));
+        }
+    }
+    if (roots.size() != static_cast<size_t>(def.root_count)) return fail(error, "incomplete root set");
+    std::fill(seen.begin(), seen.end(), -1);
+    for (int32_t i = 0; i < def.root_count; ++i) {
+        const auto root = element<uint16_t>(source, def.off_root_indices, i);
+        if (root >= def.task_count || in(root) != in(root + 1) || seen[root] != -1)
+            return fail(error, "invalid or duplicate root");
+        seen[root] = 0;
+    }
+    std::fill(seen.begin(), seen.end(), -1);
+    for (int32_t producer = 0; producer < def.task_count; ++producer) {
+        const auto begin = out_row(producer), end = out_row(producer + 1);
+        if (begin < 0 || begin > end || end > def.edge_count ||
+            static_cast<size_t>(end - begin) != transpose[producer].size())
+            return fail(error, "inconsistent fanout CSR row");
+        if (out != nullptr && begin == end) next.sinks.push_back(static_cast<uint16_t>(producer));
+        for (auto consumer : transpose[producer])
+            seen[consumer] = producer;
+        for (int32_t j = begin; j < end; ++j) {
+            const auto consumer = element<uint16_t>(source, def.off_fanout_indices, j);
+            if (consumer <= producer || consumer >= def.task_count || seen[consumer] != producer)
+                return fail(error, "duplicate or asymmetric fanout");
+            seen[consumer] = -1;
+        }
+    }
+
+    if (out != nullptr) next.children.resize(static_cast<size_t>(def.task_count));
+    uint64_t required_heap = 0;
+    int32_t tensor_cursor = 0;
+    int32_t scalar_cursor = 0;
+    for (int32_t i = 0; i < def.task_count; ++i) {
+        const auto task = element<SubTaskDefinition>(source, def.off_sub_tasks, i);
+        const TaskAttrs attrs(task.task_attrs);
+        const auto mask = task.active_mask;
+        const auto active = static_cast<uint32_t>(mask.count());
+        if (!mask.is_valid() || task.reserved != 0 ||
+            (task.ed_flags &
+             ~(simpler::hbg::recorded_dispatch::candidate | simpler::hbg::recorded_dispatch::tracked)) != 0 ||
+            task.logical_block_num <= 0 || task.tensor_count < 0 || task.tensor_count > MAX_TENSOR_ARGS ||
+            task.scalar_count < 0 || task.scalar_count > MAX_SCALAR_ARGS || task.tensor_offset < 0 ||
+            task.tensor_offset > def.tensor_arg_count ||
+            task.tensor_count > def.tensor_arg_count - task.tensor_offset || task.scalar_offset < 0 ||
+            task.scalar_offset > def.scalar_arg_count ||
+            task.scalar_count > def.scalar_arg_count - task.scalar_offset || task.total_output_size < 0 ||
+            task.total_required_subtasks != task.logical_block_num * active ||
+            attrs.has_predicate() != (task.predicate_slot != 0) || task.predicate_slot > def.predicate_count ||
+            (attrs.has_predicate() && (active != 1 || task.logical_block_num != 1)) ||
+            (attrs.requires_sync_start() && task.logical_block_num == 1) ||
+            (active == 0 && (task.logical_block_num != 1 || attrs.has_predicate() || attrs.requires_sync_start())) ||
+            ((task.ed_flags & simpler::hbg::recorded_dispatch::candidate) != 0 &&
+             (in(i) == in(i + 1) || attrs.has_predicate() || active == 0)))
+            return fail(error, "invalid child shape or argument span");
+        if (task.tensor_offset != tensor_cursor || task.scalar_offset != scalar_cursor)
+            return fail(error, "noncanonical child argument span");
+        tensor_cursor += task.tensor_count;
+        scalar_cursor += task.scalar_count;
+        const auto offset = element<uint64_t>(source, def.off_sub_task_offsets, i);
+        const uint64_t output_bytes = CHIP_ALIGN_UP(static_cast<uint64_t>(task.total_output_size), CHIP_ALIGN_SIZE);
+        if (offset != required_heap || required_heap > def.required_heap ||
+            output_bytes > def.required_heap - required_heap)
+            return fail(error, "invalid child heap extent");
+        required_heap += output_bytes;
+        SchedulerGraphChildPlan child{};
+        child.predicate_offset = SCHEDULER_NATIVE_NO_PREDICATE;
+        child.metadata.active_mask = mask;
+        child.metadata.flags =
+            active == 0 ? 0 :
+                          scheduler_task_metadata_flags_from_submit_state(mask, attrs, task.logical_block_num, false);
+        child.metadata.logical_block_num = static_cast<uint16_t>(task.logical_block_num);
+        child.metadata.timing_slot = static_cast<int16_t>(attrs.timing_slot());
+        for (int32_t slot = 0; slot < SUBTASK_SLOT_COUNT; ++slot) {
+            const bool enabled = mask.has(static_cast<SubtaskSlot>(slot));
+            if ((!enabled && task.kernel_id[slot] != INVALID_KERNEL_ID) ||
+                (enabled && (task.kernel_id[slot] < 0 || task.kernel_id[slot] >= CHIP_MAX_FUNC_ID)))
+                return fail(error, "invalid child callable");
+            child.metadata.kernel_ids[slot] = enabled ? static_cast<uint16_t>(task.kernel_id[slot]) : UINT16_MAX;
+        }
+        child.tensor_count = static_cast<uint32_t>(task.tensor_count);
+        child.scalar_count = static_cast<uint32_t>(task.scalar_count);
+        if (!graph_argument_layout_child(
+                task.tensor_count, task.scalar_count, attrs.has_predicate(), &next.args_bytes, &child.tensors_offset,
+                &child.scalars_offset, &child.predicate_offset
+            ))
+            return fail(error, "native argument layout overflow");
+        for (int32_t j = 0; j < task.tensor_count; ++j) {
+            const auto tensor = element<simpler::hbg::TensorData>(source, def.off_tensors, task.tensor_offset + j);
+            if (!tensor_record_valid(tensor, def, i)) return fail(error, "invalid tensor relocation");
+        }
+        for (int32_t j = 0; j < task.scalar_count; ++j) {
+            const auto ref =
+                element<GraphScalarInheritance>(source, def.off_scalar_inheritance, task.scalar_offset + j);
+            if (!ref.valid() || (ref.inherited() && ref.boundary_index() >= def.boundary_scalar_count))
+                return fail(error, "invalid inherited scalar index");
+        }
+        if (attrs.has_predicate()) {
+            const auto predicate = element<GraphPredicate>(source, def.off_predicates, task.predicate_slot - 1);
+            const auto owner = predicate.operand.owner_task_id;
+            const auto width = get_element_size(predicate.operand.dtype);
+            if (!tensor_record_valid(predicate.operand, def, i) ||
+                (owner.space() == TaskId::Space::SUB_TASK && owner.local_id() == i) || predicate.op < 1 ||
+                predicate.op > 6 || predicate.elem_size != width ||
+                (width != 1 && width != 2 && width != 4 && width != 8) ||
+                predicate.elem_offset >= predicate.operand.extent_elem_cache ||
+                std::any_of(std::begin(predicate.reserved), std::end(predicate.reserved), [](uint8_t v) {
+                    return v != 0;
+                }))
+                return fail(error, "invalid child predicate");
+        }
+        if (out != nullptr) next.children[i] = child;
+    }
+    if (tensor_cursor != def.tensor_arg_count || scalar_cursor != def.scalar_arg_count)
+        return fail(error, "incomplete child argument pool coverage");
+    if (required_heap != def.required_heap) return fail(error, "incomplete child heap coverage");
+    if (error != nullptr) error->clear();
+    if (out != nullptr) {
+        next.image.assign(source, source + bytes);
+        *out = std::move(next);
+    }
+    return true;
+}
+
+bool native_graph_plan_definition(
+    const void *image, size_t bytes, uint64_t graph_key, NativeGraphPlan *out, std::string *error
+) {
+    if (out == nullptr) return fail(error, "missing Definition plan output");
+    return native_graph_definition_impl(image, bytes, graph_key, out, error);
+}
+
+bool native_graph_validate_definition(const void *image, size_t bytes, uint64_t graph_key, std::string *error) {
+    return native_graph_definition_impl(image, bytes, graph_key, nullptr, error);
+}
+
+bool native_graph_plan_nodes(
+    const std::vector<uint32_t> &definition_indices, NativeGraphHostPlan *plan, std::string *error
+) {
+    if (plan == nullptr || definition_indices.size() > static_cast<size_t>(TaskId::GLOBAL_TASK_MAX_NUM))
+        return fail(error, "invalid top-level task count");
+    uint64_t nodes = definition_indices.size();
+    for (auto index : definition_indices) {
+        if (index == SCHEDULER_NATIVE_NO_INSTANCE) continue;
+        if (index >= plan->definitions.size()) return fail(error, "unknown Definition index");
+        const auto count = plan->definitions[index].definition.task_count;
+        if (count <= 0 || count > SUB_TASK_MAX_NUM ||
+            plan->definitions[index].children.size() != static_cast<size_t>(count) ||
+            nodes > INT32_MAX - static_cast<uint64_t>(count) - 1)
+            return fail(error, "expanded node count overflow");
+        nodes += count + 1;
+    }
+    std::vector<SchedulerNodeBinding> bindings;
+    std::vector<int64_t> completion_refs;
+    std::vector<SchedulerGraphInstance> instances;
+    bindings.reserve(static_cast<size_t>(nodes));
+    completion_refs.reserve(definition_indices.size());
+    for (uint32_t id = 0; id < definition_indices.size(); ++id) {
+        const auto index = definition_indices[id];
+        if (index == SCHEDULER_NATIVE_NO_INSTANCE) {
+            completion_refs.push_back(static_cast<int64_t>(bindings.size()));
+            bindings.push_back({id, SCHEDULER_NATIVE_NO_INSTANCE, SchedulerNodeKind::TOP_KERNEL});
+            continue;
+        }
+        const auto &definition = plan->definitions[index];
+        SchedulerGraphInstance instance{};
+        instance.definition_index = index;
+        instance.original_shell_id = id;
+        instance.enter_ref = static_cast<uint32_t>(bindings.size());
+        instance.child_begin = instance.enter_ref + 1;
+        instance.child_count = static_cast<uint32_t>(definition.definition.task_count);
+        instance.exit_ref = instance.child_begin + instance.child_count;
+        const auto invocation = static_cast<uint32_t>(instances.size());
+        bindings.push_back({id, invocation, SchedulerNodeKind::GRAPH_ENTER});
+        for (uint32_t child = 0; child < instance.child_count; ++child) {
+            const auto kind = definition.children[child].metadata.active_mask.is_empty() ?
+                                  SchedulerNodeKind::CONTROL_DUMMY :
+                                  SchedulerNodeKind::CHILD_KERNEL;
+            bindings.push_back({child, invocation, kind});
+        }
+        bindings.push_back({id, invocation, SchedulerNodeKind::GRAPH_EXIT});
+        completion_refs.push_back(instance.exit_ref);
+        instances.push_back(instance);
+    }
+    plan->bindings = std::move(bindings);
+    plan->completion_refs = std::move(completion_refs);
+    plan->instances = std::move(instances);
+    if (error != nullptr) error->clear();
+    return true;
+}
+
+bool native_graph_plan_readonly_image(
+    const NativeGraphHostPlan &plan, NativeGraphReadonlyImage *out, std::string *error
+) {
+    if (out == nullptr || plan.definitions.empty() || plan.instances.empty() || plan.bindings.empty() ||
+        plan.bindings.size() > INT32_MAX || plan.completion_refs.size() > TaskId::GLOBAL_TASK_MAX_NUM)
+        return fail(error, "invalid native image population");
+    NativeGraphReadonlyImage next;
+    SchedulerNativeGraphHeader header{};
+    header.magic = SCHEDULER_NATIVE_GRAPH_MAGIC;
+    header.node_count = plan.bindings.size();
+    header.original_task_count = plan.completion_refs.size();
+    header.definition_count = plan.definitions.size();
+    header.instance_count = plan.instances.size();
+    uint64_t cursor = sizeof(SchedulerRunControl);
+    auto reserve = [&](uint64_t count, uint64_t stride, uint64_t alignment, uint64_t *offset) {
+        uint64_t bytes = 0;
+        return scheduler_layout_checked_mul(count, stride, &bytes) &&
+               scheduler_layout_reserve(&cursor, bytes, alignment, offset);
+    };
+    if (!reserve(1, sizeof(header), alignof(SchedulerNativeGraphHeader), &next.header_offset) ||
+        !reserve(
+            header.node_count, sizeof(SchedulerNodeBinding), alignof(SchedulerNodeBinding), &header.bindings_offset
+        ) ||
+        !reserve(header.original_task_count, sizeof(int64_t), alignof(int64_t), &header.completion_refs_offset) ||
+        !reserve(
+            header.definition_count, sizeof(SchedulerGraphTemplate), alignof(SchedulerGraphTemplate),
+            &header.templates_offset
+        ) ||
+        !reserve(
+            header.instance_count, sizeof(SchedulerGraphInstance), alignof(SchedulerGraphInstance),
+            &header.instances_offset
+        ))
+        return fail(error, "native readonly image overflow");
+    std::vector<SchedulerGraphTemplate> templates(plan.definitions.size());
+    for (size_t i = 0; i < plan.definitions.size(); ++i) {
+        const auto &source = plan.definitions[i];
+        const auto &def = source.definition;
+        if (def.total_bytes != source.image.size() || def.task_count <= 0 || def.task_count > SUB_TASK_MAX_NUM ||
+            def.edge_count < 0 || def.edge_count > def.task_count * (def.task_count - 1) / 2 ||
+            source.children.size() != static_cast<size_t>(def.task_count) || source.sinks.empty() ||
+            source.sinks.size() > source.children.size() || source.args_bytes % 64 != 0)
+            return fail(error, "incomplete Definition plan");
+        auto &entry = templates[i];
+        entry.task_count = def.task_count;
+        entry.edge_count = def.edge_count;
+        entry.sink_count = source.sinks.size();
+        entry.args_bytes = source.args_bytes;
+        std::vector<Region> regions;
+        if (!section<int32_t>(def, def.off_fanin_offsets, def.task_count + 1, regions) ||
+            !section<uint16_t>(def, def.off_fanin_indices, def.edge_count, regions) ||
+            !reserve(
+                entry.task_count, sizeof(SchedulerGraphChildPlan), alignof(SchedulerGraphChildPlan),
+                &entry.child_plans_offset
+            ) ||
+            !reserve(entry.task_count + 1, sizeof(int32_t), alignof(int32_t), &entry.fanin_offsets_offset) ||
+            (entry.edge_count != 0 &&
+             !reserve(entry.edge_count, sizeof(uint16_t), alignof(uint16_t), &entry.fanin_indices_offset)) ||
+            !reserve(entry.sink_count, sizeof(uint16_t), alignof(uint16_t), &entry.sinks_offset))
+            return fail(error, "native topology image overflow");
+    }
+    if (!scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &header.readonly_end_offset) ||
+        header.readonly_end_offset > std::numeric_limits<size_t>::max())
+        return fail(error, "native readonly alignment overflow");
+    next.bytes.resize(static_cast<size_t>(header.readonly_end_offset));
+    const auto copy = [&](uint64_t offset, const auto &values) {
+        if (!values.empty()) std::memcpy(next.bytes.data() + offset, values.data(), values.size() * sizeof(values[0]));
+    };
+    std::memcpy(next.bytes.data() + next.header_offset, &header, sizeof(header));
+    copy(header.bindings_offset, plan.bindings);
+    copy(header.completion_refs_offset, plan.completion_refs);
+    copy(header.templates_offset, templates);
+    copy(header.instances_offset, plan.instances);
+    for (size_t i = 0; i < templates.size(); ++i) {
+        const auto &source = plan.definitions[i];
+        std::memcpy(
+            next.bytes.data() + templates[i].fanin_offsets_offset,
+            source.image.data() + source.definition.off_fanin_offsets, (templates[i].task_count + 1) * sizeof(int32_t)
+        );
+        if (templates[i].edge_count != 0)
+            std::memcpy(
+                next.bytes.data() + templates[i].fanin_indices_offset,
+                source.image.data() + source.definition.off_fanin_indices, templates[i].edge_count * sizeof(uint16_t)
+            );
+        copy(templates[i].child_plans_offset, plan.definitions[i].children);
+        copy(templates[i].sinks_offset, plan.definitions[i].sinks);
+    }
+    if (error != nullptr) error->clear();
+    *out = std::move(next);
+    return true;
+}
+
+namespace {
+template <typename T>
+inline const T *
+scheduler_definition_element(uint64_t base, uint64_t bytes, uint32_t offset, int32_t count, int32_t index) {
+    if (count <= 0 || index < 0 || index >= count || offset < sizeof(Graph) ||
+        !scheduler_native_region_valid(bytes, offset, static_cast<uint64_t>(count), sizeof(T), alignof(T)))
+        return nullptr;
+    return reinterpret_cast<const T *>(base + offset) + index;
+}
+
+struct SchedulerTensorBinding {
+    uint64_t address;
+    uint64_t bytes;
+    uint64_t origin;
+    AddressSpace address_space;
+};
+
+inline uint32_t scheduler_graph_element_size(DataType dtype) {
+    if (dtype == DataType::INT64 || dtype == DataType::UINT64) return 8;
+    if (dtype == DataType::FLOAT32 || dtype == DataType::INT32 || dtype == DataType::UINT32) return 4;
+    if (dtype == DataType::FLOAT16 || dtype == DataType::BFLOAT16 || dtype == DataType::INT16 ||
+        dtype == DataType::UINT16)
+        return 2;
+    if (dtype == DataType::INT8 || dtype == DataType::UINT8 || dtype == DataType::BOOL ||
+        dtype == DataType::FP8E4M3FN || dtype == DataType::FP8E8M0 || dtype == DataType::FP4E2M1 ||
+        dtype == DataType::FP8E5M2)
+        return 1;
+    return 0;
+}
+
+inline bool scheduler_graph_relocate_tensor(
+    const simpler::hbg::TensorData &record, const Graph &graph, uint32_t child_index,
+    const NativeGraphArguments &instance, SchedulerTensorBinding *out
+) {
+    const uint64_t owner = TaskId::to_uint64(record.owner_task_id);
+    const uint64_t space = owner >> TaskId::SPACE_SHIFT;
+    const uint32_t index = static_cast<uint32_t>(owner);
+    if (record.ndims == 0 || record.ndims > MAX_TENSOR_DIMS ||
+        (record.address_space != AddressSpace::HOST && record.address_space != AddressSpace::DEVICE))
+        return false;
+    out->address = record.buffer.addr;
+    out->bytes = record.buffer.size;
+    out->origin = record.start_offset;
+    out->address_space = record.address_space;
+    if (space == static_cast<uint64_t>(TaskId::Space::PARAM)) {
+        if (index >= instance.tensor_count ||
+            owner != ((static_cast<uint64_t>(TaskId::Space::PARAM) << TaskId::SPACE_SHIFT) | index) ||
+            record.buffer.addr != 0 || reinterpret_cast<uintptr_t>(instance.tensors) == 0 ||
+            reinterpret_cast<uintptr_t>(instance.tensors) % 64 != 0 ||
+            instance.tensor_count >
+                (UINT64_MAX - reinterpret_cast<uintptr_t>(instance.tensors)) / TASK_IMAGE_TENSOR_STRIDE)
+            return false;
+        const auto *boundary = reinterpret_cast<const simpler::hbg::TensorData *>(
+            reinterpret_cast<const uint8_t *>(instance.tensors) +
+            static_cast<uint64_t>(index) * TASK_IMAGE_TENSOR_STRIDE
+        );
+        if (out->origin > UINT64_MAX - boundary->start_offset ||
+            (boundary->address_space != AddressSpace::HOST && boundary->address_space != AddressSpace::DEVICE))
+            return false;
+        out->address = boundary->buffer.addr;
+        out->bytes = boundary->buffer.size;
+        out->origin += boundary->start_offset;
+        out->address_space = boundary->address_space;
+        const uint64_t element_bytes = scheduler_graph_element_size(record.dtype);
+        if (element_bytes == 0) return false;
+        const uint64_t capacity = out->bytes / element_bytes;
+        if (out->origin > capacity || record.extent_elem_cache > capacity - out->origin) return false;
+    } else if (space == static_cast<uint64_t>(TaskId::Space::SUB_TASK)) {
+        if (index > child_index || record.buffer.addr > graph.required_heap ||
+            record.buffer.size > graph.required_heap - record.buffer.addr ||
+            record.buffer.addr > UINT64_MAX - instance.heap_base)
+            return false;
+        out->address += instance.heap_base;
+    } else {
+        return false;
+    }
+    return out->bytes <= UINT64_MAX - out->address;
+}
+
+inline void scheduler_graph_store_tensor(
+    simpler::hbg::TensorData *dst, const simpler::hbg::TensorData &src, const SchedulerTensorBinding &bound
+) {
+    dst->buffer.addr = bound.address;
+    dst->buffer.size = bound.bytes;
+    TaskId::assign(dst->owner_task_id, src.owner_task_id);
+    dst->start_offset = bound.origin;
+    dst->version = src.version;
+    dst->ndims = src.ndims;
+    dst->dtype = src.dtype;
+    dst->manual_dep = src.manual_dep;
+    dst->is_contiguous = src.is_contiguous;
+    dst->address_space = bound.address_space;
+    for (uint32_t i = 0; i < MAX_TENSOR_DIMS; ++i) {
+        dst->shapes[i] = src.shapes[i];
+        dst->strides[i] = src.strides[i];
+    }
+    dst->extent_elem_cache = src.extent_elem_cache;
+}
+
+}  // namespace
+
+NativeGraphBindingError native_graph_bind_arguments(
+    const NativeGraphPlan &plan, uint32_t child_index, const NativeGraphArguments &instance, void *argument_image
+) {
+    const auto *definition = &plan.definition;
+    if (definition->task_count <= 0 || child_index >= static_cast<uint32_t>(definition->task_count) ||
+        plan.children.size() != static_cast<size_t>(definition->task_count) ||
+        plan.image.size() != definition->total_bytes || plan.image.size() < sizeof(Graph))
+        return NativeGraphBindingError::GRAPH;
+    const auto &graph = *definition;
+    const auto *child = &plan.children[child_index];
+    if (plan.args_bytes % 64 != 0 || !scheduler_native_child_arguments_valid(*child, plan.args_bytes))
+        return NativeGraphBindingError::GRAPH;
+    const uint64_t definition_base = reinterpret_cast<uintptr_t>(plan.image.data());
+    if (instance.tensor_count != static_cast<uint32_t>(definition->boundary_tensor_count) ||
+        instance.scalar_count != static_cast<uint32_t>(definition->boundary_scalar_count) ||
+        graph.required_heap > UINT64_MAX - instance.heap_base ||
+        instance.args_base != instance.heap_base + graph.required_heap || instance.args_base % 64 != 0 ||
+        (plan.args_bytes != 0 && (instance.args_base == 0 || argument_image == nullptr ||
+                                  reinterpret_cast<uintptr_t>(argument_image) % 64 != 0)) ||
+        plan.args_bytes > UINT64_MAX - instance.args_base)
+        return NativeGraphBindingError::INSTANCE;
+    auto *task = scheduler_definition_element<SubTaskDefinition>(
+        definition_base, plan.image.size(), definition->off_sub_tasks, definition->task_count, child_index
+    );
+    if (task == nullptr || task->tensor_count != static_cast<int32_t>(child->tensor_count) ||
+        task->scalar_count != static_cast<int32_t>(child->scalar_count) || task->tensor_offset < 0 ||
+        task->tensor_offset > definition->tensor_arg_count ||
+        task->tensor_count > definition->tensor_arg_count - task->tensor_offset || task->scalar_offset < 0 ||
+        task->scalar_offset > definition->scalar_arg_count ||
+        task->scalar_count > definition->scalar_arg_count - task->scalar_offset ||
+        (task->predicate_slot == 0) != (child->predicate_offset == SCHEDULER_NATIVE_NO_PREDICATE))
+        return NativeGraphBindingError::GRAPH;
+    for (uint32_t i = 0; i < child->tensor_count; ++i) {
+        auto *record = scheduler_definition_element<simpler::hbg::TensorData>(
+            definition_base, plan.image.size(), definition->off_tensors, definition->tensor_arg_count,
+            task->tensor_offset + i
+        );
+        SchedulerTensorBinding bound{};
+        if (record == nullptr || !scheduler_graph_relocate_tensor(*record, graph, child_index, instance, &bound))
+            return NativeGraphBindingError::TENSOR;
+        auto *dst = reinterpret_cast<simpler::hbg::TensorData *>(
+            reinterpret_cast<uintptr_t>(argument_image) + child->tensors_offset +
+            static_cast<uint64_t>(i) * TASK_IMAGE_TENSOR_STRIDE
+        );
+        scheduler_graph_store_tensor(dst, *record, bound);
+    }
+    for (uint32_t i = 0; i < child->scalar_count; ++i) {
+        auto *inheritance = scheduler_definition_element<GraphScalarInheritance>(
+            definition_base, plan.image.size(), definition->off_scalar_inheritance, definition->scalar_arg_count,
+            task->scalar_offset + i
+        );
+        auto *value = scheduler_definition_element<uint64_t>(
+            definition_base, plan.image.size(), definition->off_scalars, definition->scalar_arg_count,
+            task->scalar_offset + i
+        );
+        if (inheritance == nullptr || value == nullptr) return NativeGraphBindingError::SCALAR;
+        GraphScalarInheritance local{};
+        auto *src = reinterpret_cast<const uint8_t *>(inheritance);
+        auto *dst = reinterpret_cast<uint8_t *>(&local);
+        for (uint32_t j = 0; j < sizeof(local); ++j)
+            dst[j] = src[j];
+        if (!local.valid()) return NativeGraphBindingError::SCALAR;
+        if (local.inherited()) {
+            if (local.boundary_index() >= instance.scalar_count || reinterpret_cast<uintptr_t>(instance.scalars) == 0 ||
+                reinterpret_cast<uintptr_t>(instance.scalars) % alignof(uint64_t) != 0 ||
+                instance.scalar_count > (UINT64_MAX - reinterpret_cast<uintptr_t>(instance.scalars)) / sizeof(uint64_t))
+                return NativeGraphBindingError::SCALAR;
+            value = instance.scalars + local.boundary_index();
+        }
+        reinterpret_cast<uint64_t *>(reinterpret_cast<uintptr_t>(argument_image) + child->scalars_offset)[i] = *value;
+    }
+    if (task->predicate_slot != 0) {
+        auto *predicate = scheduler_definition_element<GraphPredicate>(
+            definition_base, plan.image.size(), definition->off_predicates, definition->predicate_count,
+            task->predicate_slot - 1
+        );
+        SchedulerTensorBinding bound{};
+        if (predicate == nullptr ||
+            !scheduler_graph_relocate_tensor(predicate->operand, graph, child_index, instance, &bound))
+            return NativeGraphBindingError::PREDICATE;
+        const uint64_t width = scheduler_graph_element_size(predicate->operand.dtype);
+        const uint64_t owner = TaskId::to_uint64(predicate->operand.owner_task_id);
+        if (width == 0 || width != predicate->elem_size || predicate->op < 1 || predicate->op > 6 ||
+            ((owner >> TaskId::SPACE_SHIFT) == static_cast<uint64_t>(TaskId::Space::SUB_TASK) &&
+             static_cast<uint32_t>(owner) == child_index) ||
+            predicate->elem_offset >= predicate->operand.extent_elem_cache ||
+            predicate->elem_offset > UINT64_MAX - bound.origin)
+            return NativeGraphBindingError::PREDICATE;
+        const uint64_t element = bound.origin + predicate->elem_offset;
+        if (bound.bytes < width || element > (bound.bytes - width) / width) return NativeGraphBindingError::PREDICATE;
+        auto *dst = reinterpret_cast<SchedulerDispatchPredicate *>(
+            reinterpret_cast<uintptr_t>(argument_image) + child->predicate_offset
+        );
+        dst->addr = bound.address + element * width;
+        dst->target = predicate->target;
+        dst->elem_size = predicate->elem_size;
+        dst->op = predicate->op;
+    }
+    return NativeGraphBindingError::NONE;
+}

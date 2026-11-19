@@ -47,7 +47,8 @@ target_sources(test_a2a3_hbg_scheduler_retirement PRIVATE
 set(RETIREMENT_SOURCES
     ${SIMPLER_SRC}/a2a3/platform/shared/aicpu/platform_regs.cpp
     ${SIMPLER_SRC}/a2a3/platform/sim/aicpu/inner_platform_regs.cpp
-    ${SIMPLER_SRC}/common/platform/sim/aicpu/device_time.cpp)
+    ${SIMPLER_SRC}/common/platform/sim/aicpu/device_time.cpp
+    ${SIMPLER_SRC}/common/platform/sim/aicpu/cache_ops.cpp)
 set(RETIREMENT_INCLUDES ${SIMPLER_SRC}/a2a3/platform/sim/aicore)
 
 hbg_case(test_aicore_retirement.cpp ARCHS a2a3 NO_OBJS TIMEOUT 20

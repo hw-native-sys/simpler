@@ -30,9 +30,8 @@
 /** The two device-facing steps the ladder needs, supplied by the runner. */
 struct QueuedWaitDischargeOps {
     /**
-     * A bounded synchronize over the pair of streams a wait could be sitting
-     * in. Covers the boundary and everything queued behind it, which is what an
-     * unproven queued wait needs.
+     * A bounded synchronize over the owner's bound pair. A CPU cross-run wait
+     * without its own proof may remain retained after this succeeds.
      */
     std::function<int()> synchronize;
     /**
@@ -54,8 +53,8 @@ struct QueuedWaitDischargeOps {
  *
  *   1. the table's own evidence — the run's completed boundaries for its own
  *      wait, the proof event recorded behind a cross-run wait for that one;
- *   2. a bounded whole-pair synchronize followed by a quiescence retirement,
- *      which is a failure-path cost only;
+ *   2. a bounded owner-pair synchronize followed by retirement of waits that
+ *      pair covers; an unproved CPU cross-run wait remains held;
  *   3. nothing. A wait may still name an event of this run, so the caller
  *      releases nothing against it: the reference stays retained and the runner
  *      is asked to stop admitting runs and quarantine what this one holds.

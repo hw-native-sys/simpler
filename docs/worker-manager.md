@@ -16,7 +16,7 @@ SUB) in its own address space.
 The remote L3 design keeps this local fork/shm path behind
 `LocalMailboxEndpoint` and reserves the same `WorkerEndpoint` boundary for a
 framed `RemoteL3Endpoint` for cross-host NEXT_LEVEL children. A remote endpoint
-is not another child loop that polls the `MAILBOX_SIZE`-byte mailbox; it uses the
+is not another child loop that polls a shared-memory mailbox; it uses the
 contracts in
 [remote-l3-worker-design.md](remote-l3-worker-design.md).
 The current code includes that `RemoteL3Endpoint` boundary, a socket-backed
@@ -36,15 +36,18 @@ For where dispatched tasks come from, see [scheduler.md](scheduler.md).
 ```cpp
 class WorkerManager {
 public:
-    // Registration (before init). `task_frame_count` selects capacity one or
-    // the two-frame endpoint that can stage one successor.
-    void add_next_level(void *mailbox, int child_pid = -1,
-                        uint32_t task_frame_count = 1);
+    // Registration (before init). `granted_sets` sizes the endpoint's run-state
+    // table; request frames have a separate fixed count. `mailbox_bytes` is the
+    // extent the caller mapped, checked against the grant before the entry is
+    // installed.
+    void add_next_level(void *mailbox, size_t mailbox_bytes,
+                        int child_pid = -1,
+                        uint32_t granted_sets = 1);
     void add_next_level_at(int32_t worker_id, void *mailbox,
-                           int child_pid = -1,
-                           uint32_t task_frame_count = 1);
+                           size_t mailbox_bytes, int child_pid = -1,
+                           uint32_t granted_sets = 1);
     void add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endpoint);
-    void add_sub(void *mailbox, int child_pid = -1);
+    void add_sub(void *mailbox, size_t mailbox_bytes, int child_pid = -1);
 
     // Lifecycle
     void start(Ring *ring, OnCompleteFn on_complete,
@@ -64,7 +67,7 @@ private:
         int32_t worker_id;
         void *mailbox;
         int child_pid;
-        uint32_t task_frame_count;
+        uint32_t granted_sets;
     };
     struct LocalSubEntry {
         void *mailbox;
@@ -180,41 +183,70 @@ SUB workers. `group_index` selects `task_args_list[i]`. There is no
 
 ## 3. Dispatch via shm mailbox
 
-Each `LocalMailboxEndpoint` drives a `MAILBOX_SIZE`-byte `MAP_SHARED` region.
-The Python facade forks one child per mailbox **before**
-`WorkerManager::start()` (so the parent has only the Python main thread when
-fork runs, avoiding the classical "fork in a multi-threaded process" hazard)
-and the child polls the mailbox for the lifetime of the worker.
+Each `LocalMailboxEndpoint` drives a `MAP_SHARED` region of at least
+`mailbox_size(granted_sets)` bytes, and every registration declares the extent
+it mapped so the grant is checked against the region that exists rather than the
+one it implies. The Python facade forks one child per mailbox
+**before** `WorkerManager::start()` (so the parent has only the Python main
+thread when fork runs, avoiding the classical "fork in a multi-threaded process"
+hazard) and the child polls the mailbox for the lifetime of the worker.
 
-The region currently consists of three equal `MAILBOX_FRAME_SIZE` frames:
+**Payload transport and execution lifetime are separate.** The region holds a
+control frame, a small fixed pool of 64 KiB *request frames*, and a table of
+small *run-state entries*:
 
-| Frame | Two-frame chip endpoint | Single-frame endpoint |
-| ----- | ----------------------- | --------------------- |
-| Base (0) | Startup and control state | Startup and control state |
-| Task 0 (1) | Pipeline lease slot 0 | The active task |
-| Task 1 (2) | Pipeline lease slot 1 | Unused |
+| Region | Count | Per item | What it bounds |
+| ------ | ----: | -------: | -------------- |
+| control frame | 1 | 64 KiB | startup and control commands |
+| request frames `F` | `MAILBOX_REQUEST_FRAMES` (2) | 64 KiB | concurrent **hand-off** |
+| run-state entries `E` | `M = granted + K` | ~360 B | concurrent **in-flight runs** |
 
-`task_frame_count` is an endpoint contract, not a count inferred from the
-allocation size. Each direct chip child decides its own count after `init` and
-publishes it with its granted depth; parent registration uses that published
-number, while whole-run admission uses the minimum depth across the chip set.
-The count crosses rather than being derived on both sides because only an
-initialized `ChipWorker` can answer the capability it depends on, and the parent
-must publish to exactly the frames its child polls.
+A request frame carries one submission's bytes — callable digest, config, lease,
+args blob — and nothing about the run's life. The child copies the blob out,
+echoes that frame's generation into the entry its header names, and the parent
+takes the frame back while the run it carried is still executing. A run-state
+entry carries the run itself: identity, state, run epoch, rc, inline error text,
+preparation disposition, and the acceptance word the *device* writes — which is
+why that word cannot live on the frame, since the frame is gone by then.
 
-The Python facade's rule has two branches. A direct A2/A3 onboard chip child
-whose published pipeline depth is at least two takes two frames — that endpoint
-stages a successor behind an active run at any launch depth. Every other route
-takes a second frame only where the child resolved that it may order one native
-submission behind another, which is its runtime's published joined-launch
-capability met with the requested launch depth and the granted set count: both
-A5 runtimes, `host_build_graph` and `tensormap_and_ringbuffer`, publish that
-capability at `launch_depth >= 2`. SUB, nested-Worker, simulation (whose backend
-answers that capability with a flat no), and every depth-one local endpoint use
-one task frame and do not advertise successor staging. A launched successor
-occupies a frame of its own, so a Worker's configured launch depth is bounded by
-the frames its endpoints negotiated as well as by the granted slot depth. Remote
-endpoints have capacity one and advance their framed transport incrementally.
+Only the entry table grows with the grant, so a context granted 1024 sets costs
+~590 KB rather than 64 MB. The facade sizes the region from this Worker's
+`pipeline_depth` request before the fork, which is an upper bound on any grant a
+child can then publish, and the endpoint is constructed with the count that child
+negotiated. **No launch is accepted without both an entry and a granted set.**
+
+### Who writes what
+
+| Field | Sole writer | Reader |
+| ----- | ----------- | ------ |
+| `E.identity{…}`, `E.entry_generation` | parent, on allocate and free | child, identity check |
+| `F.state` (`TASK_READY`) | parent | child, acquire |
+| `E.frame_consumed_generation` | **child**, once | parent — a **level** |
+| `E.state` `FRAME_STAGED → ACTIVATE` | **parent**, identity-checked CAS | child, acquire |
+| `E.state` later, `E.run_epoch`, `E.error`, `E.error_text` | **child**; rc and text, then the state — its **final** access | parent, acquire |
+| `E.accepted` | **device**, at the kernel-launch marker | parent and child |
+
+Both reclaim decisions are levels rather than pulses, so an observation a poll
+misses the next one sees. Every cross-side reference carries
+`E.entry_generation` — odd while occupied, bumped even at release — so a frame
+left over from a previous occupant of an entry is refused rather than acted on
+under the new identity.
+
+The Python child derives every entry field offset from the binding and checks
+each one against `offsetof` on the C++ struct at import: the child writes these
+words in the parent's address space, so a field it places differently is a store
+landing on another field in a live process, which no compiler can catch.
+
+`granted_sets` is the run-resource capacity contract, not a request-frame count.
+Each direct chip child publishes its resolved grant after `init`; the parent
+validates it against the mailbox allocation and registers that same grant. The
+mailbox has a fixed pool of `MAILBOX_REQUEST_FRAMES` payload frames, reusable as
+soon as the child copies a submission, and a separate run-state table with
+`granted_sets + MAILBOX_REQUEST_FRAMES` entries. Thus a frame hand-off can wait
+for a run-resource set without keeping a payload frame occupied for the run's
+lifetime. Whole-run admission is bounded by the minimum child grant and launch
+capability. Remote endpoints have capacity one and advance their framed
+transport incrementally.
 
 The capability is answered per device context, so a level-3 Worker configured at
 `launch_depth >= 2` passes that request to every one of its local device
@@ -222,28 +254,29 @@ children and each endpoint negotiates its own count. A nested Worker inherits
 nothing: its budgets come from its own configuration. Remote and mpirun
 manifests carry no launch depth, so those subtrees keep the default.
 
-### 3.1 Single-frame progress path
+### 3.1 Single-set progress path
 
 `LocalMailboxEndpoint::submit_progress` copies `CallConfig`,
 `PipelineSlotLease`, the 32-byte callable digest, and the length-prefixed
-`TaskArgs` blob into task frame 0 and publishes `TASK_READY`. The Scheduler
-keeps driving the owning endpoint lane and observes acceptance or completion
-through `poll_progress`; it does not wait inside one task call. A steady-clock
-liveness sample turns a child that exits before completion into
-`ENDPOINT_FAILURE`.
+`TaskArgs` blob into a free request frame and publishes `TASK_READY`. The
+Scheduler keeps driving the endpoint lane and observes acceptance or completion
+through `poll_progress`; it does not wait inside a task call. A steady-clock
+liveness sample turns a child that exits before completion into `ENDPOINT_FAILURE`.
 
-The child uses `_run_mailbox_loop`, polls the base control state and task frame
-0, resolves the digest to a private local slot, executes the task synchronously,
-writes its error tuple, and then publishes `TASK_DONE`. Capacity remains one;
-the separate frame prevents a control request from overwriting task state.
+The child uses `_run_mailbox_loop`, polls the base control state and request
+frames, resolves the digest to a private local slot, executes the task
+synchronously, writes its error tuple, and publishes `TASK_DONE`. Run admission
+remains one; the separate control frame prevents a control request from
+overwriting task state.
 
-### 3.2 Two-frame progress path
+### 3.2 Staged progress path
 
-A two-frame `LocalMailboxEndpoint` advertises `supports_frame_staging` and is
+A `LocalMailboxEndpoint` advertises `supports_frame_staging` and is
 driven through `submit_progress`, `activate_progress`, and `poll_progress`.
-The Scheduler thread is the only parent-side progress owner. The child also
-uses one `run_two_frame_loop`; it services the separate control base, stages
-both task frames, and owns the bounded active/prepared native lifecycles.
+The Scheduler thread is the only parent-side progress owner. The child uses
+`run_two_frame_loop`; it services the separate control frame, stages requests,
+and owns the bounded active/prepared native lifecycles. Request-frame capacity
+limits outstanding hand-offs; run-state capacity comes from the grant.
 
 The ordinary active dispatch and the staged successor use distinct initial
 states:
@@ -344,9 +377,19 @@ MAILBOX_OFF_ACCEPTED:             int32 sticky native-launch marker
 frame tail:                       fixed-size NUL-terminated error message
 ```
 
-The C++ `MAILBOX_FRAME_SIZE` and `MAILBOX_SIZE` constants are exported through
-the nanobind module. Python derives frame slicing and offsets from those
-bindings where possible. `MAILBOX_ARGS_CAPACITY` ends before the teardown
+The C++ `MAILBOX_FRAME_SIZE`, `MAILBOX_RUN_ENTRY_STRIDE` and
+`MAILBOX_RUN_ENTRY_TABLE_OFFSET` constants and the `mailbox_size(granted_sets)`
+and `mailbox_run_entry_count(granted_sets)` functions are exported through the
+nanobind module, so both ends derive the region's shape from one place.
+`mailbox_size` takes and returns `size_t` and refuses a grant outside the
+admitted range `[1, MAILBOX_MAX_GRANTED_SETS]`, whose upper end is a 1 TiB cap on
+the entry table. Larger grants are rejected by this conservative sizing policy;
+their computed size is still representable in a 64-bit `size_t`. Registration
+applies the same cap, so the facade cannot size a region for a grant the
+registration will reject.
+(`MAILBOX_SIZE` is still exported as the size a caller gets when it does not size
+the region itself, which in practice is a fixture standing in for the facade.)
+Python derives frame slicing and offsets from those bindings where possible. `MAILBOX_ARGS_CAPACITY` ends before the teardown
 record, shutdown word, protocol trailer, acceptance word, and error-message
 tail.
 
@@ -399,10 +442,14 @@ active native run and marks every
 active or staged task frame failed before leaving; the parent drains those
 terminal events, brings its in-flight count to zero, and joins the one progress
 thread. The Scheduler is joined only after worker threads can no longer invoke
-completion callbacks, and `WorkerManager::stop()` then clears the pools.
+completion callbacks. `WorkerManager::stop()` sends lifecycle shutdown to
+every child endpoint before clearing the pools. An idle remote transport stays
+open between progress stop and that shutdown send; an endpoint with a pending
+task cancels its transport immediately. Native `Worker.close()` releases the
+GIL so Python MPI progress can return outbound credit while close waits.
 
-A single-frame endpoint has no staged frame to cancel; its active task
-terminalizes before its dispatcher thread joins. The Python facade owns every
+A single-set endpoint has no staged run to cancel; its active task terminalizes
+before its dispatcher thread joins. The Python facade owns every
 child PID. After native worker teardown it broadcasts `SHUTDOWN` to all child
 base frames, reaps them under one shared deadline, and closes their shared-memory
 objects. C++ endpoint code may observe or reap an early child exit for liveness
@@ -435,6 +482,18 @@ remain serialized on the same ordered command lane, and an independent
 simulation health lane is monitored throughout. Python remote worker specs open
 a session through `simpler-remote-worker`; the endpoint is schedulable only
 after the session runner reports `HELLO READY`.
+
+The direct MPI path uses that same endpoint with `MpiDirectTransport`. A
+single launcher owns rank 0 (L4) and ranks 1..N (L3), without the daemon.
+`MpiDirectTransportHub` provides byte credit and frame routing, while a Python
+progress thread performs MPI calls. Its health check covers idle sessions;
+normal teardown sends `SHUTDOWN` and drains each rank's exact echo before
+closing the hub. Executors stop and join their heartbeat sender before sending
+that echo, so the controller consumes every preceding heartbeat before MPI
+finalization. Every rank in the launcher world must use the same runtime
+protocol revision. See the
+[direct MPI example](../examples/workers/l4/vector_add_mpi_direct_l3/README.md)
+for launcher ownership, failure handling, and polling costs.
 
 A control request issued while a remote task is in flight waits for that task
 to complete or for endpoint progress to stop. The command and task share one

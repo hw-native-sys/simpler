@@ -19,12 +19,16 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <cstdint>
 
 extern "C" {
 
 int unified_log_host_span_enabled() { return 0; }
 
 void unified_log_host_span(const struct SimplerHostSpan *) {}
+
+struct SimplerHostTraceState *unified_log_host_trace_state() { return nullptr; }
+uint64_t unified_log_host_trace_allocate_inv() { return 0; }
 
 void unified_log_error(const char *func, const char *fmt, ...) {
     va_list args;

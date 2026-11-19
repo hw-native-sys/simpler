@@ -11,6 +11,10 @@
 #include "aicpu/platform_aicpu_affinity.h"
 
 #include <atomic>
+#include <cerrno>
+#include <cstdio>
+#include <exception>
+#include "aicpu/affinity_thread_state.h"
 #include <cstdint>
 #ifdef __linux__
 #include <sched.h>
@@ -23,11 +27,29 @@
 // launch budget (14 logical user cpus on the 0x7ffe SKU) + a small over-launch
 // margin. a2a3 only ever launches 6 threads and never approaches this bound.
 
-// Per-thread exec/slot index set by the filter gate:
+// Module-owned classification slots published to each participant: the filter
+// gate assigns the per-thread exec/slot index.
 // -1 = dropped, otherwise this thread's index in allowed_cpus[].
-// Read via platform_aicpu_affinity_thread_idx(); used as the run-wall buffer
-// slot and the sched/orch role id.
-static thread_local int32_t tl_exec_idx = -1;
+// The per-thread binding record snapshots the slot value; invalidating the
+// record never writes the slot. Read via platform_aicpu_affinity_thread_idx();
+// used as the run-wall buffer slot and the sched/orch role id.
+namespace {
+simpler::AffinityTlsKey &affinity_tls_key() {
+    static simpler::AffinityTlsKey value;
+    return value;
+}
+simpler::AffinityBindingCohort binding_cohort;
+}  // namespace
+extern "C" __attribute__((visibility("default"))) int platform_aicpu_affinity_bind_thread(int32_t *cell) {
+    const int error = affinity_tls_key().bind(cell);
+    if (error == ENOSPC)
+        LOG_ERROR(
+            "AICPU affinity record pool exhausted: all %d records are checked out", simpler::kAffinityRecordPoolSize
+        );
+    else if (error != 0)
+        LOG_ERROR("AICPU affinity TLS binding failed: pthread error=%d cell=%p", error, static_cast<void *>(cell));
+    return error;
+}
 
 // =============================================================================
 // Filter-style gate (onboard).
@@ -53,32 +75,41 @@ static std::atomic<int32_t> s_filter_classify_ready{0};
 static std::atomic<int32_t> s_filter_cleanup{0};
 static int32_t s_filter_thread_cpu[MAX_GATE_THREADS];
 static int32_t s_filter_thread_exec_idx[MAX_GATE_THREADS];
+static int32_t s_filter_logical_counts[MAX_GATE_THREADS];
+static int32_t s_filter_entry_status{0};
 
-bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t allowed_count, int32_t total_launched) {
-    tl_exec_idx = -1;
+static bool filter_gate_impl(
+    const int32_t *allowed_cpus, int32_t allowed_count, int32_t total_launched, AicpuEntryInitializer initialize,
+    const AicpuEntryGateInitializer *native, AicpuEntryGateResult *result, int *error_out = nullptr
+) {
+    if (error_out) *error_out = 0;
+    // Rejection must not expose a previous execution identity. The binding
+    // record is thread-exclusive; the previously bound cell is left untouched.
+    affinity_tls_key().invalidate();
 
-    // Bound-check both inputs against the static slot buffers
-    // (s_filter_thread_cpu[MAX_GATE_THREADS] etc.) before any indexing.
-    // Without this, allowed_count or total_launched > MAX_GATE_THREADS
-    // would silently truncate the classification loop and let the
-    // diagnostic dump read past `allowed_cpus[]`.
-    if (allowed_cpus == nullptr || allowed_count <= 0 || allowed_count > MAX_GATE_THREADS || total_launched <= 0 ||
-        total_launched > MAX_GATE_THREADS) {
-        LOG_ERROR(
-            "AICPU filter gate: invalid config allowed_count=%d total_launched=%d (max=%d) — dropping all threads",
-            allowed_count, total_launched, MAX_GATE_THREADS
-        );
-        return false;
-    }
+    const bool valid = allowed_cpus != nullptr && allowed_count > 0 && allowed_count <= MAX_GATE_THREADS &&
+                       allowed_count <= total_launched;
+    const bool legacy_valid = allowed_cpus != nullptr && allowed_count > 0 && allowed_count <= MAX_GATE_THREADS &&
+                              (initialize == nullptr || allowed_count <= total_launched);
+    if (total_launched <= 0 || total_launched > MAX_GATE_THREADS || (native == nullptr && !legacy_valid)) return false;
 
     int32_t idx = s_filter_claim.fetch_add(1, std::memory_order_acq_rel);
-#if defined(__aarch64__) || defined(__x86_64__)
+    if (idx >= total_launched) {
+        LOG_ERROR("AICPU filter gate: excess participant idx=%d total=%d", idx, total_launched);
+        if (error_out) *error_out = EINVAL;
+        return false;
+    }
+    binding_cohort.record(platform_aicpu_affinity_bind_thread(nullptr));
+#ifdef __linux__
     int32_t cpu = sched_getcpu();
 #else
     int32_t cpu = -1;
 #endif
 
-    if (idx < MAX_GATE_THREADS) s_filter_thread_cpu[idx] = cpu;
+    if (idx < MAX_GATE_THREADS) {
+        s_filter_thread_cpu[idx] = cpu;
+        s_filter_logical_counts[idx] = valid ? allowed_count : -1;
+    }
 
     // Publish: release-ordered increment ensures the s_filter_thread_cpu[idx]
     // store above is visible to any thread that observes the new published
@@ -94,6 +125,15 @@ bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t al
         )) {
         for (int32_t i = 0; i < total_launched && i < MAX_GATE_THREADS; ++i)
             s_filter_thread_exec_idx[i] = -1;
+        s_filter_entry_status = 0;
+        if (native != nullptr) {
+            for (int32_t i = 0; i < total_launched; ++i) {
+                if (s_filter_logical_counts[i] <= 0 || s_filter_logical_counts[i] != allowed_count)
+                    s_filter_entry_status = -1;
+            }
+        }
+        // Suppress classification on rejection, including reads of an invalid table.
+        if (s_filter_entry_status != 0) allowed_count = 0;
 
         // For each reporting thread, see if its cpu is in allowed_cpus.
         // O(total_launched * allowed_count) — both ≤ ~16, fine.
@@ -147,22 +187,30 @@ bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t al
             LOG_INFO("AICPU filter gate:   allowed[%d] = cpu_id %d  role=%s", a, allowed_cpus[a], role);
         }
 
+        if (initialize != nullptr) initialize();
+        if (native != nullptr) {
+            const int32_t init_status = native->initialize(native->context);
+            if (init_status != 0) s_filter_entry_status = init_status;
+        }
         s_filter_classify_ready.store(1, std::memory_order_release);
     }
 
     while (s_filter_classify_ready.load(std::memory_order_acquire) == 0) {}
 
-    bool survive;
-    if (idx < total_launched && idx < MAX_GATE_THREADS) {
-        tl_exec_idx = s_filter_thread_exec_idx[idx];
-        survive = (tl_exec_idx >= 0);
-    } else {
-        tl_exec_idx = -1;
-        survive = false;
-    }
+    binding_cohort.record(platform_aicpu_affinity_bind_thread(&s_filter_thread_exec_idx[idx]));
+    bool survive = affinity_tls_key().value() >= 0 && (native == nullptr || s_filter_entry_status == 0);
+
+    // Every participant copies the error before the last participant resets it.
+    // Native initialization still runs on failure so every callback can retire.
+    const int error = binding_cohort.arrive_and_read(total_launched);
+    if (error_out) *error_out = error;
+    survive = survive && error == 0;
+    if (!survive) affinity_tls_key().invalidate();
+    if (result != nullptr) *result = {idx, error != 0 ? -1 : s_filter_entry_status, survive};
 
     // Reset gate state after the last thread has read its result.
     if (s_filter_cleanup.fetch_add(1, std::memory_order_acq_rel) + 1 == total_launched) {
+        binding_cohort.reset_after_readers();
         s_filter_claim.store(0, std::memory_order_release);
         s_filter_published.store(0, std::memory_order_release);
         s_filter_classify_init.store(0, std::memory_order_release);
@@ -171,14 +219,39 @@ bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t al
     }
 
     if (survive) {
-        const char *role = (tl_exec_idx == allowed_count - 1) ? "orch" : "sched";
-        LOG_INFO("AICPU filter gate: thread idx=%d cpu=%d exec_idx=%d ACTIVE(%s)", idx, cpu, tl_exec_idx, role);
+        const char *role = (platform_aicpu_affinity_thread_idx() == allowed_count - 1) ? "orch" : "sched";
+        LOG_INFO(
+            "AICPU filter gate: thread idx=%d cpu=%d exec_idx=%d ACTIVE(%s)", idx, cpu,
+            platform_aicpu_affinity_thread_idx(), role
+        );
     } else {
         LOG_INFO("AICPU filter gate: thread idx=%d cpu=%d DROPPED", idx, cpu);
     }
     return survive;
 }
 
-int32_t platform_aicpu_affinity_thread_idx() { return tl_exec_idx; }
+int32_t platform_aicpu_affinity_thread_idx() { return affinity_tls_key().value(); }
 
-void platform_aicpu_affinity_set_thread_idx(int32_t idx) { tl_exec_idx = idx; }
+void platform_aicpu_affinity_set_thread_idx(int32_t idx) {
+    if (!affinity_tls_key().publish(idx)) {
+        // Fatal diagnostics bypass the asynchronous logger so abort cannot lose them.
+        std::fprintf(stderr, "AICPU affinity: set_thread_idx(%d) requires a bound cell\n", idx);
+        std::terminate();
+    }
+}
+
+bool platform_aicpu_affinity_gate_filter(
+    const int32_t *allowed_cpus, int32_t allowed_count, int32_t total_launched, AicpuEntryInitializer initialize,
+    int *error_out
+) {
+    return filter_gate_impl(allowed_cpus, allowed_count, total_launched, initialize, nullptr, nullptr, error_out);
+}
+
+AicpuEntryGateResult platform_aicpu_entry_gate_filter(
+    const int32_t *allowed_cpus, int32_t allowed_count, int32_t total_launched, AicpuEntryGateInitializer initialize
+) {
+    AicpuEntryGateResult result;
+    if (initialize.initialize == nullptr) return result;
+    filter_gate_impl(allowed_cpus, allowed_count, total_launched, nullptr, &initialize, &result);
+    return result;
+}

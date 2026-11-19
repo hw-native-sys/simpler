@@ -73,14 +73,54 @@ chip_swimlane_aicore_reserve_task_record(__gm__ ChipSwimlaneActiveHead *head, Ch
     return &local->cached_buf->records[slot];
 }
 
+// A self-scheduling core cannot overwrite a full buffer until the common
+// AICPU collector has rotated it. The Host drain/refill path is unchanged.
+__aicore__ __attribute__((always_inline)) static inline __gm__ ChipSwimlaneAicoreTaskRecord *
+chip_swimlane_aicore_wait_task_record(__gm__ ChipSwimlaneActiveHead *head, ChipSwimlaneAicoreLocalState *local) {
+    // Self-scheduled buffers rotate only after this core publishes a full
+    // count. A partial buffer therefore remains owned by this core.
+    if (local->cached_buf != nullptr && local->slot_within_buf < PLATFORM_AICORE_BUFFER_SIZE) {
+        return &local->cached_buf->records[local->slot_within_buf++];
+    }
+    auto *available = chip_swimlane_aicore_reserve_task_record(head, local);
+    if (available != nullptr) return available;
+    const uint64_t start = get_sys_cnt_aicore();
+    do {
+        auto *record = chip_swimlane_aicore_reserve_task_record(head, local);
+        if (record != nullptr) return record;
+    } while (get_sys_cnt_aicore() - start < PLATFORM_DFX_BACKPRESSURE_TIMEOUT_CYCLES);
+    return nullptr;
+}
+
+// Only self-scheduling cores publish count. Dispatch-driven buffers keep
+// their existing AICPU-side accounting and ACK-gated rotation.
+__aicore__ __attribute__((always_inline)) static inline void
+chip_swimlane_aicore_publish_task_count(ChipSwimlaneAicoreLocalState *local) {
+    *reinterpret_cast<__gm__ volatile uint32_t *>(&local->cached_buf->count) = local->slot_within_buf;
+    dcci(&local->cached_buf->count, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dsb((mem_dsb_t)0);
+}
+
+// A full buffer's publication already permits Host ownership and recycling.
+// At lane exit only a still-owned partial buffer may be touched again.
+__aicore__ __attribute__((always_inline)) static inline void
+chip_swimlane_aicore_flush_task_count(ChipSwimlaneAicoreLocalState *local) {
+    if (local->cached_buf != nullptr && local->slot_within_buf > 0 &&
+        local->slot_within_buf < PLATFORM_AICORE_BUFFER_SIZE) {
+        chip_swimlane_aicore_publish_task_count(local);
+    }
+}
+
 /**
  * Commit one task's timestamps and identity to its pre-ACK reservation.
  *
  * `end_time` is captured immediately after execute_task and before FIN. The
  * commit itself runs after FIN and never reads the possibly-rotated head.
  */
+// Token deduction accepts both a freshly derived local identity and a GM handle.
+template <typename TaskToken>
 __aicore__ __attribute__((always_inline)) static inline void chip_swimlane_aicore_commit_task_record(
-    __gm__ ChipSwimlaneAicoreTaskRecord *record, const __gm__ TaskId &task_token, uint32_t reg_task_id,
+    __gm__ ChipSwimlaneAicoreTaskRecord *record, const TaskToken &task_token, uint32_t reg_task_id,
     uint64_t receive_time, uint64_t start_time, uint64_t end_time
 ) {
     if (record == nullptr) {

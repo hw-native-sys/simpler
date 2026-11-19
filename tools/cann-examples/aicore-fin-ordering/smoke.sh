@@ -20,17 +20,6 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"
 : "${ASCEND_HOME_PATH:?ASCEND_HOME_PATH must be set}"
 
-# a2a3-only at runtime. The COND register offset this tool polls is per-arch --
-# REG_SPR_COND_OFFSET is 0x4C8 on a2a3 and 0x5108 on a5
-# (src/{a2a3,a5}/platform/include/common/platform_config.h) -- and the handshake
-# header hardcodes the a2a3 value. The AICore halves compile for either arch, so
-# the build is covered on both; only the run is gated. Exit 77 marks a skip the
-# runner counts and names, rather than a pass.
-if [ "${SIMPLER_SMOKE_ARCH:-a2a3}" != "a2a3" ]; then
-    echo "skipping: hardcodes a2a3's COND offset (0x4C8); a5 uses 0x5108" >&2
-    exit 77
-fi
-
 # Path is per-arch, so the caller supplies it: build_cann_examples.sh --run
 # derives it from the ccec target, and a by-hand run points it at the arch being
 # exercised. Defaulting to one arch here would send an a5 run at a2a3's build.

@@ -26,8 +26,8 @@
 
 #include <cstdint>
 
-#include "host_build_graph/dep_gen_host_graph.h"
-#include "host_build_graph/host_phase_trace.h"
+#include "host_build_graph/host/dep_gen_host_graph.h"
+#include "host_build_graph/host/host_phase_trace.h"
 
 bool dep_gen_host_graph_enabled() { return false; }
 

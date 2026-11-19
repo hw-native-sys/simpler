@@ -16,8 +16,7 @@
  * kernel's storage offset into that child's device address. The upload + offset
  * arithmetic does not depend on the surrounding runtime, only on the
  * ChipCallable layout and the platform's upload entry point. Callers retain the
- * func_id range check because RUNTIME_MAX_FUNC_ID lives in each runtime's own
- * headers.
+ * func_id range check against the shared CHIP_MAX_FUNC_ID limit.
  */
 
 #pragma once
@@ -84,8 +83,7 @@ struct CallableArtifacts {
  * @param api        Context-bound platform host interface. Must not be null.
  * @param out        Cleared on entry; on success, populated with one
  *                   {func_id, device_addr} entry per child kernel. Caller is
- *                   responsible for validating func_id against its runtime's
- *                   RUNTIME_MAX_FUNC_ID.
+ *                   responsible for validating func_id against CHIP_MAX_FUNC_ID.
  * @return 0 on success, -1 on argument error or upload failure.
  */
 inline int upload_and_collect_child_addrs(

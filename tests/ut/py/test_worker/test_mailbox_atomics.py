@@ -242,6 +242,7 @@ class TestWireConstantAgreement:
             "INIT_FAILED": worker_mod._INIT_FAILED,
             "FRAME_STAGED": worker_mod._FRAME_STAGED,
             "TASK_LAUNCHED": worker_mod._TASK_LAUNCHED,
+            "TASK_ENDED": worker_mod._TASK_ENDED,
             "TASK_FAILED": worker_mod._TASK_FAILED,
             "ACTIVATE": worker_mod._ACTIVATE,
             "PREPARE_READY": worker_mod._PREPARE_READY,

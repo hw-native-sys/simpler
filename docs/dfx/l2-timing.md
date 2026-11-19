@@ -169,8 +169,8 @@ before and after a case declares child memory are therefore not comparable on th
 host/bind component; re-measure both arms with identical fixtures, hardware,
 round counts and validation settings.
 
-If the HBG orchestration reads or writes that argument, `bind.host_view_close`
-reports what the access cost. `devcopy=N` means no host mapping was available
-and each of the N accesses was a PCIe round trip — an arm that maps and an arm
-that copies are not comparable either, and the two can differ between hosts on
-the same arch (issue #1531).
+HBG host orchestration accesses separate explicit `HOST/NONE` controls.
+`bind.host_view_close` releases those registrations; it does not map device
+fixtures or issue scalar device-copy fallbacks. Historical `devcopy` attributes
+do not describe this path. See [HBG host data access](../hbg-host-data-access.md)
+and [scene-test device-memory fixtures](../testing/child-memory.md).

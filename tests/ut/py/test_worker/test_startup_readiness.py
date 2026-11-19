@@ -37,6 +37,7 @@ import time
 from functools import partial
 from multiprocessing import Event
 from multiprocessing.shared_memory import SharedMemory
+from types import SimpleNamespace
 from typing import Protocol
 
 import pytest
@@ -199,6 +200,35 @@ def _trivial_orch(orch, args, config):
 
 
 class TestNextLevelStartupFailure:
+    @pytest.mark.parametrize("already_reaped", [False, True])
+    @pytest.mark.parametrize("publish_failure", [False, True])
+    def test_init_failure_published_between_state_read_and_reap(self, monkeypatch, already_reaped, publish_failure):
+        """A failed child's final mailbox state is authoritative after exit."""
+        pid = 12345
+        parent = Worker(level=4, num_sub_workers=0)
+        buf = memoryview(bytearray(worker_mod.MAILBOX_FRAME_SIZE))
+        state_addr = worker_mod._buffer_field_addr(buf, worker_mod._OFF_STATE)
+
+        def exit_after_state_read(child_pid, options):
+            assert child_pid == pid
+            assert options == os.WNOHANG
+            assert worker_mod._mailbox_load_i32(state_addr) == worker_mod._IDLE
+            if publish_failure:
+                worker_mod._write_error(buf, 1, "injected sibling init failure")
+                worker_mod._mailbox_store_i32(state_addr, worker_mod._INIT_FAILED)
+            if already_reaped:
+                raise ChildProcessError
+            return pid, 256
+
+        monkeypatch.setattr(worker_mod.os, "waitpid", exit_after_state_read)
+        expected = "injected sibling init failure" if publish_failure else "exited during init before signalling ready"
+        try:
+            with pytest.raises(RuntimeError, match=expected):
+                Worker._await_children_ready(parent, [SimpleNamespace(buf=buf)], [pid], "next_level", float("inf"))
+            assert parent._startup_reaped_pids == {pid}
+        finally:
+            buf.release()
+
     def test_sigterm_during_setup_unwinds_before_child_exit(self, monkeypatch):
         """Cooperative cancellation lets setup release its resources before exit."""
         import simpler.worker as worker_mod  # noqa: PLC0415
@@ -316,9 +346,9 @@ class TestNextLevelStartupFailure:
         finally:
             w4.close()
 
-    def test_startup_deadline_fires_on_hung_child(self, monkeypatch):
+    @_hard_timeout(_TEST_WALL_BUDGET_S)
+    def test_startup_deadline_fires_on_hung_child(self):
         """A child that hangs in init trips the startup deadline, not an infinite spin."""
-        clock = _install_manual_worker_clock(monkeypatch)
         l3 = _l3_child()
         l3.init = _init_hangs  # noqa: SLF001
 
@@ -326,25 +356,19 @@ class TestNextLevelStartupFailure:
         w4.register(_trivial_orch)
         w4.add_worker(l3)
         try:
-            with _hard_timeout(_TEST_WALL_BUDGET_S):
-                with pytest.raises(RuntimeError, match="deadline"):
-                    w4.init()
-            assert clock.now > 1.5
+            started = time.monotonic()
+            with pytest.raises(RuntimeError, match="deadline"):
+                w4.init()
+            assert time.monotonic() - started >= 1.5
             assert w4._next_level_pids == []
         finally:
             w4.close()
 
     def test_failed_startup_reaps_children_no_leak(self, monkeypatch):
         """After a startup failure the forked children are killed and reaped."""
-        # Real clock, deliberately. This case asserts an OS-level fact about real
-        # forked pids -- that `os.waitpid` no longer knows them -- and
-        # `_abort_hierarchical` bounds its reap with a `_monotonic()` deadline it
-        # is allowed to give up on ("a survivor still alive at the deadline is
-        # left to the OS/init"). A manual clock advances that deadline in zero
-        # real time, so the budget can expire before a child has actually died
-        # and the rollback takes the give-up path while the assertion below still
-        # demands a reap. The sibling deadline tests may use one: logical elapsed
-        # time is their subject, and they assert bookkeeping rather than pids.
+        # Real forked children need real elapsed time to exit and become reapable.
+        # Startup failure tests use the real clock for both the startup deadline
+        # and the bounded process cleanup.
         l3 = _l3_child()
         l3.init = _init_hangs  # noqa: SLF001
 
@@ -594,6 +618,29 @@ class TestEagerInitContract:
         hw.close()
         assert hw._sub_pids == []
         assert hw._worker is None
+
+    @_hard_timeout(_TEST_WALL_BUDGET_S)
+    def test_repeated_start_preserves_ready_children_and_dispatch(self):
+        counter_shm, counter_buf = _make_shared_counter()
+        hw = Worker(level=3, num_sub_workers=1)
+        sub = hw.register(lambda args: _increment_counter(counter_buf))
+        try:
+            hw.init()
+            child_pids = tuple(hw._sub_pids)
+
+            def orch(o, a, c):
+                o.submit_sub(sub)
+
+            for expected_count in (1, 2):
+                hw._start_hierarchical()
+                assert tuple(hw._sub_pids) == child_pids
+                assert hw._hierarchical_started is True
+                hw.run(orch)
+                assert _read_counter(counter_buf) == expected_count
+        finally:
+            hw.close()
+            counter_shm.close()
+            counter_shm.unlink()
 
     @_hard_timeout(_TEST_WALL_BUDGET_S)
     def test_l4_l3_sub_subtree_ready_after_init_no_run(self):
@@ -918,7 +965,7 @@ class TestLevel2Lifecycle:
                 pass
 
             def get_binaries(self, *_a, **_k):
-                return object()
+                return SimpleNamespace(host_path="unused", aicpu_path="unused", aicore_path="unused")
 
         # Mock the device/runtime layer so this stays device-free (no sim
         # binaries required) — the regression is purely the lifecycle state.
@@ -992,7 +1039,7 @@ class TestLevel2Lifecycle:
         with _hard_timeout(_TEST_WALL_BUDGET_S):
             w.init()
             assert w._chip_worker is not None
-            impl = w._chip_worker._impl
+            impl = w._chip_worker
             w.run(callable_handle)
             w.submit(callable_handle).wait()
             # Both forms admit through the same lane entry point, so the direct
@@ -1011,7 +1058,7 @@ class TestLevel2Lifecycle:
         with _hard_timeout(_TEST_WALL_BUDGET_S):
             w.init()
             assert w._chip_worker is not None
-            impl = w._chip_worker._impl
+            impl = w._chip_worker
             w.submit(callable_handle)  # deliberately never waited
             assert not impl.lane_closed
             w.close()
@@ -1042,7 +1089,7 @@ class TestLevel2Lifecycle:
         with _hard_timeout(_TEST_WALL_BUDGET_S):
             w.init()
             assert w._chip_worker is not None
-            impl = w._chip_worker._impl
+            impl = w._chip_worker
             # The run itself fails, so waiting on the handle raises boom — the
             # lane's poison and the caller's error are the same failure, which
             # is what makes the close below a repeat rather than news.
@@ -1059,7 +1106,7 @@ class TestLevel2Lifecycle:
         with _hard_timeout(_TEST_WALL_BUDGET_S):
             w2.init()
             assert w2._chip_worker is not None
-            impl2 = w2._chip_worker._impl
+            impl2 = w2._chip_worker
             monkeypatch.setattr(impl2, "_close_chip_run_lane", _raiser(boom))
             w2.submit(handle2)
             assert w2._chip_runs
@@ -1232,13 +1279,13 @@ class TestLevel2Lifecycle:
                 super().__init__()
                 object.__setattr__(self, "_armed", True)
 
-            def publish(self, error, incomplete):
+            def publish(self, error, incomplete, *, cleanup_complete=False):
                 if self._armed:
                     object.__setattr__(self, "_armed", False)
                     entered.set()
                     assert release.wait(10.0)
                     raise interrupt
-                return super().publish(error, incomplete)
+                return super().publish(error, incomplete, cleanup_complete=cleanup_complete)
 
             @property
             def done(self):
@@ -1349,7 +1396,9 @@ class TestLevel2Lifecycle:
         clock = _ManualClock()
         monkeypatch.setattr(worker_mod, "_monotonic", clock.monotonic)
         w = Worker(level=3, num_sub_workers=0)
-        w._worker = types.SimpleNamespace(close=lambda: None)  # look "started" for the L3 branch
+        w._worker = types.SimpleNamespace(
+            close=lambda: None, check_control_payloads_retired=lambda: None
+        )  # look "started" for the L3 branch
 
         def consume_pre_child_budget(_self):
             clock.now += 0.6
@@ -1655,9 +1704,14 @@ class TestLevel2Lifecycle:
                 pass
 
             def get_binaries(self, *_a, **_k):
-                return object()
+                return SimpleNamespace(host_path="unused", aicpu_path="unused", aicore_path="unused")
 
-        monkeypatch.setattr(worker_mod, "ChipWorker", chip_cls)
+        monkeypatch.setattr(worker_mod, "_ChipWorker", chip_cls)
+        monkeypatch.setattr(
+            worker_mod,
+            "_initialize_chip_runtime",
+            lambda chip, device, bins, **options: chip.init(device, bins, **options),
+        )
         monkeypatch.setattr(rb_mod, "RuntimeBuilder", _FakeBuilder)
         return Worker(level=2, device_id=0, platform="a2a3sim", runtime="tensormap_and_ringbuffer")
 
@@ -1669,20 +1723,20 @@ class TestLevel2Lifecycle:
         release = threading.Event()
         build_count = {"n": 0}
 
-        class _PausingChip:
+        class _PausingChip(FakeWorkspaceAccounting):
             def __init__(self):
                 build_count["n"] += 1
                 # The owner's close() reads this chip's workspace accounting
                 # before it releases anything, so the double carries the same
                 # native handle the real one does. No budget is latched, which
                 # is the answer that lets a teardown proceed.
-                self._impl = FakeWorkspaceAccounting()
+                super().__init__()
 
             def init(self, *_a, **_k):
                 entered.set()
                 assert release.wait(10.0)
 
-            def _register_callable_at_slot(self, *_a, **_k):  # pragma: no cover
+            def register_callable(self, *_a, **_k):  # pragma: no cover
                 pass
 
             def finalize(self):
@@ -1744,19 +1798,19 @@ class TestLevel2Lifecycle:
         cancel_latched = threading.Event()
         finalized = {"n": 0}
 
-        class _PausingChip:
+        class _PausingChip(FakeWorkspaceAccounting):
             def __init__(self):
                 # close() reads this chip's workspace accounting before it
                 # releases anything, so the double carries the same native
                 # handle the real one does. No budget is latched here, which is
                 # the answer that lets a teardown proceed.
-                self._impl = FakeWorkspaceAccounting()
+                super().__init__()
 
             def init(self, *_a, **_k):
                 entered.set()
                 assert release.wait(10.0)
 
-            def _register_callable_at_slot(self, *_a, **_k):  # pragma: no cover
+            def register_callable(self, *_a, **_k):  # pragma: no cover
                 pass
 
             def finalize(self):
@@ -1821,11 +1875,11 @@ class TestChipStartupFailure:
                 l3.init()
 
     def test_chip_init_hang_trips_deadline(self, monkeypatch):
-        clock = _install_manual_worker_clock(monkeypatch)
         with fake_chip_l3(monkeypatch, script="hangs", init=False, startup_timeout_s=1.5) as l3:
+            started = time.monotonic()
             with pytest.raises(RuntimeError, match="deadline"):
                 l3.init()
-            assert clock.now > 1.5
+            assert time.monotonic() - started >= 1.5
 
 
 class TestEligibleTargetPrecheck:

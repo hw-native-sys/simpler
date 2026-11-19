@@ -52,14 +52,6 @@ static constexpr uint32_t PIJ_SLOT_SIZE = MAX_Q_TILE * MAX_BLOCK_SIZE * sizeof(u
 static constexpr uint32_t OI_SLOT_SIZE = MAX_Q_TILE * HEAD_DIM * sizeof(float);
 static constexpr uint32_t FIFO_DEPTH = 2;
 
-static inline void set_block_count(CoreTaskArgs &args, int16_t n) {
-#if defined(SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_TYPES_H_)
-    args.launch_spec.set_core_num(n);
-#else
-    args.launch_spec.set_block_num(n);
-#endif
-}
-
 extern "C" {
 
 __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
@@ -161,7 +153,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         args.add_scalar(static_cast<int64_t>(q_loop));
         args.add_scalar(total_logical_blocks);
         args.add_scalar(static_cast<int64_t>(q_tile));
-        set_block_count(args, SPMD_BLOCK_NUM);
+        args.launch_spec.set_block_num(SPMD_BLOCK_NUM);
 
         MixedKernels mk;
         mk.aic_kernel_id = FUNC_PA_AIC;

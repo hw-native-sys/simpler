@@ -77,6 +77,7 @@ public:
     void *predecessor_aicpu_stream() { return &pred_aicpu_marker_; }
     void *predecessor_aicore_stream() { return &pred_aicore_marker_; }
     void *successor_aicore_stream() { return &succ_aicore_marker_; }
+    void *successor_aicpu_stream() { return &succ_aicpu_marker_; }
 
 private:
     int create(void **out) {
@@ -157,6 +158,7 @@ private:
     char pred_aicpu_marker_{0};
     char pred_aicore_marker_{0};
     char succ_aicore_marker_{0};
+    char succ_aicpu_marker_{0};
 };
 
 /**
@@ -463,6 +465,49 @@ TEST_F(Fixture, AnUnjoinedRunClimbsNoRungAtAll) {
     // Nothing named this run's boundaries, so there is nothing to prove and the
     // ordinary path pays neither a synchronize nor a poison.
     EXPECT_EQ(discharge_queued_waits(waits_, kPredecessor, /*boundaries_complete=*/true, kTimeoutMs, steps.ops()), 0);
+    EXPECT_EQ(steps.synchronizes(), 0);
+    EXPECT_EQ(steps.poisons(), 0);
+}
+
+TEST_F(Fixture, PredecessorPairQuiescenceDoesNotCoverAnotherCallerCpuWait) {
+    void *boundary = nullptr;
+    ASSERT_EQ(
+        waits_.open(Shape::CrossRun, kSuccessor, kPredecessor, fence_, StreamRole::Aicpu, StreamRole::Aicpu, &boundary),
+        0
+    );
+    ASSERT_EQ(waits_.commit(Shape::CrossRun, kSuccessor), 0);
+    device_.fail_next_records(1);
+    EXPECT_EQ(waits_.record_proof(kSuccessor, device_.successor_aicpu_stream()), -202);
+    complete_predecessor_boundaries();
+    ASSERT_NE(device_.predecessor_aicpu_stream(), device_.successor_aicpu_stream());
+    const size_t retained_events = device_.live_events();
+    LadderSteps steps;
+    for (int retry = 0; retry != 2; ++retry) {
+        EXPECT_NE(discharge_queued_waits(waits_, kPredecessor, true, kTimeoutMs, steps.ops()), 0);
+        EXPECT_TRUE(waits_.holds_reference_to(kPredecessor));
+        EXPECT_NE(fence_.retire(kPredecessor), 0);
+        EXPECT_NE(fence_.release(), 0);
+        EXPECT_NE(waits_.release_events(), 0);
+        EXPECT_EQ(device_.live_events(), retained_events);
+    }
+    EXPECT_EQ(steps.synchronizes(), 2);
+    EXPECT_EQ(steps.poisons(), 2);
+}
+
+TEST_F(Fixture, AnotherCallerCpuWaitRetiresFromItsOwnProof) {
+    void *boundary = nullptr;
+    ASSERT_EQ(
+        waits_.open(Shape::CrossRun, kSuccessor, kPredecessor, fence_, StreamRole::Aicpu, StreamRole::Aicpu, &boundary),
+        0
+    );
+    ASSERT_EQ(waits_.commit(Shape::CrossRun, kSuccessor), 0);
+    ASSERT_EQ(waits_.record_proof(kSuccessor, device_.successor_aicpu_stream()), 0);
+    complete_predecessor_boundaries();
+    device_.complete_next(device_.successor_aicpu_stream(), 1);
+    LadderSteps steps;
+    EXPECT_EQ(discharge_queued_waits(waits_, kPredecessor, true, kTimeoutMs, steps.ops()), 0);
+    EXPECT_FALSE(waits_.holds_reference_to(kPredecessor));
+    EXPECT_EQ(fence_.retire(kPredecessor), 0);
     EXPECT_EQ(steps.synchronizes(), 0);
     EXPECT_EQ(steps.poisons(), 0);
 }

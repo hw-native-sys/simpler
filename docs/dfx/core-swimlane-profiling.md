@@ -69,6 +69,11 @@ captured args — zero hand-written shapes or scalars.
   idiom (e.g. a manual `prod.record()`) compiles only for the device.
   Tensor restoration is currently an a2a3-only capability; a5 metadata-only
   and zero-filled replays remain available.
+- **The case's runtime must capture arguments.** A5 `host_build_graph`
+  provides per-task argument capture for resident ordinary/native Graph runs.
+  Dump flags do not change execution-path selection. This support describes
+  ordinary runs, not retained Kernel capture/replay. See
+  [args-dump.md §3.1.1](args-dump.md#311-task-time-boundaries-on-a5-hbg).
 - **Two trace outputs** — a native Insight `trace.json` and an
   auto-generated Perfetto-friendly variant (sub-laned + atomic flags;
   see [§3.4](#34-viewing-insight-vs-perfetto)).

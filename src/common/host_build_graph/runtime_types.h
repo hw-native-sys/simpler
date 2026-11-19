@@ -146,6 +146,8 @@ inline constexpr uint64_t GRAPH_RECORD_BASE = PACKED_OUTPUT_ALIGN;
 // Per-queue arena reservation ceiling. Bind configures each queue to the next
 // power of two covering the tasks that can reach it and rejects a larger graph.
 inline constexpr uint64_t READY_QUEUE_CAPACITY_LIMIT = 32768;
+// Graph preparation keeps one extra rounded population of recycling headroom.
+inline constexpr uint64_t GRAPH_PREPARE_QUEUE_CAPACITY_LIMIT = 2 * READY_QUEUE_CAPACITY_LIMIT;
 
 // Cross-thread early-dispatch work queue (power of two)
 #define CHIP_EARLY_DISPATCH_QUEUE_SIZE 64
@@ -237,9 +239,11 @@ enum class TaskKind : uint8_t {
 };
 
 struct OutputLayout {
-    uint64_t offsets[MAX_TENSOR_ARGS] = {};
-    uint64_t buffer_sizes[MAX_TENSOR_ARGS] = {};
-    int32_t total_output_size = 0;
+    // Only OUTPUT positions are written and read. Avoid clearing two full
+    // arrays for every submission, including tasks without created outputs.
+    uint64_t offsets[MAX_TENSOR_ARGS];
+    uint64_t buffer_sizes[MAX_TENSOR_ARGS];
+    uint64_t total_output_size = 0;
 };
 
 // =============================================================================
@@ -309,9 +313,8 @@ static_assert(offsetof(TaskDescriptor, packed_buffer_base) == 24, "packed_buffer
  * by bulk tensor and scalar data. Fanin is always inline: it is hard-capped at
  * CHIP_MAX_FANIN and there is no spill pool.
  */
-// Host early-dispatch verdicts for ChipTaskSlotState::ed_flags (bitmask).
-inline constexpr uint8_t ED_FLAG_CANDIDATE = 1u << 0;
-inline constexpr uint8_t ED_FLAG_TRACKED = 1u << 1;
+inline constexpr uint8_t ED_FLAG_CANDIDATE = simpler::hbg::recorded_dispatch::candidate;
+inline constexpr uint8_t ED_FLAG_TRACKED = simpler::hbg::recorded_dispatch::tracked;
 
 // Publish-list drain batch bound: waiters one Phase 4b pass rescans before
 // the remainder goes back to the pending-drain queue, so one huge-fanout
@@ -523,17 +526,11 @@ struct TaskPayload {
         memcpy(dump_metadata.scalar_dtypes, args.scalar_dtypes(), args.scalar_count() * sizeof(uint8_t));
 #endif
 
-        // Early-dispatch metadata — the single init point for these
-        // fields. reset_for_reuse MUST NOT touch the payload (it runs at slot
-        // init and would pull this cold cache line across structures);
-        // prepare_task only allocates/binds. prefetch() warms this
-        // line (cache line 1) so these writes land in warm cache.
-        //
-        // early_dispatch_state / staged_core_mask are CONSUMER-side: a task
-        // whose own allow_early_resolve is false can still have them touched
-        // by the release path, independent of the consumer's own hint. So they
-        // MUST be zeroed here unconditionally. Publication and launch fields
-        // share this same per-submit lifetime and are reset here too.
+        reset_execution_state();
+    }
+
+    // Only execution progress: argument regions, predicate and dump metadata survive replay.
+    void reset_execution_state() {
         early_dispatch_state.store(EARLY_DISPATCH_NONE, std::memory_order_relaxed);
         for (int w = 0; w < EARLY_DISPATCH_CORE_MASK_WORDS; w++)
             staged_core_mask[w].store(0, std::memory_order_relaxed);
@@ -681,7 +678,7 @@ struct alignas(64) ChipTaskSlotState {
     uint16_t ed_publish_scan_cursor{0};
 
     // --- Set per-submit (depend on task inputs) ---
-    ActiveMask active_mask;  // Bitmask of active subtask slots (set once)
+    LaneMask active_mask;  // Bitmask of active subtask slots (set once)
     // Single per-task attributes byte (early-dispatch hint, sync_start,
     // has_predicate, selective timing tag). Lives on slot_state (not payload) so
     // fanin walks and the completion path read them off the already-hot producer
@@ -707,9 +704,9 @@ struct alignas(64) ChipTaskSlotState {
     //                      so its publication state must be recorded
     uint8_t ed_flags{0};
 
-    // Keeps the record at one cache line. Members run widest-first up to the
-    // byte block above, so their sizes sum to exactly the bytes this leaves.
-    uint8_t reserved[3];
+    ChipTaskState initial_task_state{CHIP_TASK_PENDING};  // Host-established state, immutable during execution
+    // Keeps the record at one cache line.
+    uint8_t reserved[2];
 
     int32_t claim_block_range(int32_t block_limit, int32_t max_count, int32_t &start) {
         int16_t current = next_block_idx.load(std::memory_order_relaxed);
@@ -732,15 +729,17 @@ struct alignas(64) ChipTaskSlotState {
 
     bool has_any_subtask_deferred() const { return any_subtask_deferred.load(std::memory_order_acquire); }
 
-    /**
-     * Reset dynamic scheduling fields to their pristine values. Called once per
-     * slot as the orchestrator claims it in prepare_task, and again as an
-     * sub-task's storage is materialized — whole-graph-resident hbg has no
-     * execution-time slot recycle. The task's completion state is not here; its
-     * owning array is cleared alongside this call.
-     * wake_list_head starts nullptr (open for registration), NOT SENTINEL.
-     */
-    void reset_for_reuse() {
+    // The task table owns logical completion; this is the all-FIN deferred phase.
+    bool has_finished_deferred_subtasks() const {
+        return total_required_subtasks > 0 &&
+               completed_subtasks.load(std::memory_order_acquire) == total_required_subtasks &&
+               has_any_subtask_deferred();
+    }
+
+    // Restore progress before any reader of this invocation, after prior device users have retired.
+    // Prepared task kind, ED qualification, shape and attributes remain unchanged.
+    // The owning table restores the separate completion byte; an open wake list starts null.
+    void reset_execution_state() {
         wake_list_head.store(nullptr, std::memory_order_relaxed);
         next_in_wake_list = nullptr;
         any_subtask_deferred.store(false, std::memory_order_relaxed);
@@ -748,19 +747,18 @@ struct alignas(64) ChipTaskSlotState {
         next_block_idx.store(0, std::memory_order_relaxed);
         sub_task_local_id = -1;
         graph_context = nullptr;
-        task_kind = TaskKind::KERNEL;
-        // ED_FLAG_TRACKED is only ever set by a consumer submitted AFTER this
-        // slot was claimed (producers precede consumers), so clearing at claim
-        // time cannot race a tracker.
-        ed_flags = 0;
         ed_publish_scan_cursor = 0;
         wake_scan_cursor = 0xFFFF;
         ed_publish_list_head.store(nullptr, std::memory_order_relaxed);
         next_in_ed_publish_list = nullptr;
-        // Note: active_mask and task_attrs are per-submit-constant fields
-        // rewritten in prepare_task on every reuse, so they are not reset here.
-        // Payload early-dispatch/fanin fields are (re)initialized in
-        // TaskPayload::init on every submit, before the slot is visible.
+    }
+
+    void reset_for_reuse() {
+        reset_execution_state();
+        task_kind = TaskKind::KERNEL;
+        ed_flags = 0;
+        initial_task_state = CHIP_TASK_PENDING;
+        // Shape and attributes are assigned by the submitter; payload has its own initializer.
     }
 
     // This task's other two records, defined below once ChipTaskStorage is complete.
@@ -773,12 +771,13 @@ struct alignas(64) ChipTaskSlotState {
 };
 
 static_assert(sizeof(ChipTaskSlotState) == 64);
+static_assert(offsetof(ChipTaskSlotState, active_mask) == 56);
 // Pins the widest-first order that leaves the record padding-free: every member
 // before `reserved` is naturally aligned where the one before it ends.
 static_assert(
     offsetof(ChipTaskSlotState, ed_publish_list_head) == 16, "the ED publish pair sits right after its wake-list twin"
 );
-static_assert(offsetof(ChipTaskSlotState, reserved) == 61, "ChipTaskSlotState grew interior padding");
+static_assert(offsetof(ChipTaskSlotState, initial_task_state) == 61, "ChipTaskSlotState grew interior padding");
 
 // =============================================================================
 // Per-Task Storage

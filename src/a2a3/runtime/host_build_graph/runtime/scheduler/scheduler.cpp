@@ -78,25 +78,25 @@ void SchedulerState::print_queues() {
     SchedulerState *sched = this;
     const char *shape_names[] = {"AIC", "AIV", "MIX"};
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
-        LOG_TIMING(
+        LOG_DEBUG(
             "QPROBE rq[%s] pushes=%llu maxocc=%llu cap=%llu", shape_names[i],
             (unsigned long long)sched->ready_queues[i].enqueue_pos.load(std::memory_order_relaxed),
             (unsigned long long)sched->ready_queues[i].max_occupancy.load(std::memory_order_relaxed),
             (unsigned long long)sched->ready_queues[i].capacity
         );
-        LOG_TIMING(
+        LOG_DEBUG(
             "QPROBE rsq[%s] pushes=%llu maxocc=%llu", shape_names[i],
             (unsigned long long)sched->ready_sync_queues[i].enqueue_pos.load(std::memory_order_relaxed),
             (unsigned long long)sched->ready_sync_queues[i].max_occupancy.load(std::memory_order_relaxed)
         );
-        LOG_TIMING(
+        LOG_DEBUG(
             "QPROBE edq[%s] pushes=%llu maxocc=%llu cap=%llu", shape_names[i],
             (unsigned long long)sched->early_dispatch_queues[i].enqueue_pos.load(std::memory_order_relaxed),
             (unsigned long long)sched->early_dispatch_queues[i].max_occupancy.load(std::memory_order_relaxed),
             (unsigned long long)sched->early_dispatch_queues[i].capacity
         );
     }
-    LOG_TIMING(
+    LOG_DEBUG(
         "QPROBE dummy pushes=%llu maxocc=%llu | graph_pq pushes=%llu maxocc=%llu | ess pushes=%llu maxocc=%llu",
         (unsigned long long)sched->dummy_ready_queue.enqueue_pos.load(std::memory_order_relaxed),
         (unsigned long long)sched->dummy_ready_queue.max_occupancy.load(std::memory_order_relaxed),
@@ -106,7 +106,7 @@ void SchedulerState::print_queues() {
         (unsigned long long)sched->early_sync_start_queue.max_occupancy.load(std::memory_order_relaxed)
     );
     const uint64_t pub_drops = sched->ed_publish_drain_drops.load(std::memory_order_relaxed);
-    LOG_TIMING(
+    LOG_DEBUG(
         "QPROBE ed_pubdrain pushes=%llu maxocc=%llu cap=%llu drops=%llu",
         (unsigned long long)sched->ed_publish_drain_queue.enqueue_pos.load(std::memory_order_relaxed),
         (unsigned long long)sched->ed_publish_drain_queue.max_occupancy.load(std::memory_order_relaxed),

@@ -24,7 +24,7 @@ namespace {
 
 TEST(TaskTimingSlots, RecordLayout) {
     EXPECT_EQ(NUM_TASK_TIMING_SLOTS, 16);
-    EXPECT_EQ(sizeof(DevicePhaseBufferHeader), 16u);
+    EXPECT_EQ(sizeof(DevicePhaseBufferHeader), 32u);
     EXPECT_EQ(sizeof(TaskTimingRecord), 16u);
     EXPECT_EQ(TASK_TIMING_SLOT_NONE, -1);
 }

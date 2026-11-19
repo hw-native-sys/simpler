@@ -14,7 +14,7 @@
 // The capture seams are driven, not imitated: `wait_and_retain_run_boundaries`
 // and `poll_and_retain_run_boundaries` are called against a real
 // `RunCompletionFence` with scripted event operations, and
-// `RunRecordReadLedgerT::read` against a scripted copy. Each seam performs the
+// `RunRecordReadLedger::read` against a scripted copy. Each seam performs the
 // observation and retains it in one call, so a case that reads the retained
 // answer has driven the production capture that produced it.
 //
@@ -166,8 +166,8 @@ private:
 // for a read that is not Ok, which the rule does not consult — it decides the
 // record channel from `record_read` alone unless that read is Ok.
 RunOutcomeEvidence evidence_for(
-    const RunBoundaryLedgerT<kSlots> &boundaries, const RunRecordReadLedgerT<kSlots> &reads,
-    const DeviceRunResultRegion &cached, const NativeRunIdentity &run
+    const RunBoundaryLedger &boundaries, const RunRecordReadLedger &reads, const DeviceRunResultRegion &cached,
+    const NativeRunIdentity &run
 ) {
     RunOutcomeEvidence evidence;
     evidence.boundaries = boundaries.observed(run);
@@ -183,7 +183,7 @@ RunOutcomeEvidence evidence_for(
 TEST(RunBoundaryCapture, AFencedDrainRetainsCompleteAndReportsTheWaitsRc) {
     ScriptedEvents events;
     RunCompletionFence fence(events.ops());
-    RunBoundaryLedgerT<kSlots> ledger;
+    RunBoundaryLedger ledger(kSlots);
     const NativeRunIdentity run = run_at(0, 11);
     fence_the_run(fence, run);
 
@@ -199,7 +199,7 @@ TEST(RunBoundaryCapture, AFailedBoundaryWaitIsRetainedAsErrorWithItsRcReturned) 
     ScriptedEvents events;
     events.wait_fails_with(kWaitFailure);
     RunCompletionFence fence(events.ops());
-    RunBoundaryLedgerT<kSlots> ledger;
+    RunBoundaryLedger ledger(kSlots);
     const NativeRunIdentity run = run_at(1, 21);
     fence_the_run(fence, run);
 
@@ -215,7 +215,7 @@ TEST(RunBoundaryCapture, AFailedBoundaryWaitIsRetainedAsErrorWithItsRcReturned) 
 TEST(RunBoundaryCapture, AnUnfencedRunIsRetainedWithoutAskingTheFenceToWait) {
     ScriptedEvents events;
     RunCompletionFence fence(events.ops());
-    RunBoundaryLedgerT<kSlots> ledger;
+    RunBoundaryLedger ledger(kSlots);
     const NativeRunIdentity run = run_at(2, 31);
     arm_without_boundaries(fence, run);
 
@@ -230,7 +230,7 @@ TEST(RunBoundaryCapture, AnUnfencedRunIsRetainedWithoutAskingTheFenceToWait) {
 TEST(RunBoundaryCapture, APollRetainsEachAnswerItGets) {
     ScriptedEvents events;
     RunCompletionFence fence(events.ops());
-    RunBoundaryLedgerT<kSlots> ledger;
+    RunBoundaryLedger ledger(kSlots);
     const NativeRunIdentity run = run_at(3, 41);
     fence_the_run(fence, run);
 
@@ -246,7 +246,7 @@ TEST(RunBoundaryCapture, APollRetainsEachAnswerItGets) {
 TEST(RunBoundaryCapture, AnUnfencedPollIsRetainedAsUnfenced) {
     ScriptedEvents events;
     RunCompletionFence fence(events.ops());
-    RunBoundaryLedgerT<kSlots> ledger;
+    RunBoundaryLedger ledger(kSlots);
     const NativeRunIdentity run = run_at(0, 51);
     arm_without_boundaries(fence, run);
 
@@ -259,7 +259,7 @@ TEST(RunBoundaryCapture, AnUnfencedPollIsRetainedAsUnfenced) {
 TEST(RunBoundaryCapture, ASuccessorOnTheSameSlotInheritsNothing) {
     ScriptedEvents events;
     RunCompletionFence fence(events.ops());
-    RunBoundaryLedgerT<kSlots> ledger;
+    RunBoundaryLedger ledger(kSlots);
     const NativeRunIdentity predecessor = run_at(1, 61);
     const NativeRunIdentity successor = run_at(1, 62);
 
@@ -283,8 +283,8 @@ TEST(RunBoundaryCapture, ASuccessorOnTheSameSlotInheritsNothing) {
 TEST(RunBoundaryRetirement, TheDrainsObservationOutlivesTheCleanupThatRetiresTheFence) {
     ScriptedEvents events;
     RunCompletionFence fence(events.ops());
-    RunBoundaryLedgerT<kSlots> boundaries;
-    RunRecordReadLedgerT<kSlots> reads;
+    RunBoundaryLedger boundaries(kSlots);
+    RunRecordReadLedger reads(kSlots);
     const NativeRunIdentity run = run_at(2, 71);
     const uint64_t epoch = run.run_epoch;
 
@@ -320,7 +320,7 @@ TEST(RunBoundaryRetirement, TheDrainsObservationOutlivesTheCleanupThatRetiresThe
 // An absent region is not a copy that failed: a run that never launched has no
 // region and lost no read.
 TEST(RunRecordReadCapture, ASlotWithNoRegionAttemptsNoCopy) {
-    RunRecordReadLedgerT<kSlots> reads;
+    RunRecordReadLedger reads(kSlots);
     DeviceRunResultRegion cached = published_success(9);
     ScriptedCopy copy(nullptr);
 
@@ -332,7 +332,7 @@ TEST(RunRecordReadCapture, ASlotWithNoRegionAttemptsNoCopy) {
 }
 
 TEST(RunRecordReadCapture, AFailedCopyIsRecordedAsAFailedRead) {
-    RunRecordReadLedgerT<kSlots> reads;
+    RunRecordReadLedger reads(kSlots);
     const DeviceRunResultRegion device_region = published_success(9);
     DeviceRunResultRegion cached{};
     ScriptedCopy copy(&device_region);
@@ -347,7 +347,7 @@ TEST(RunRecordReadCapture, AFailedCopyIsRecordedAsAFailedRead) {
 
 // The third state: the copy succeeded onto a region no run published into.
 TEST(RunRecordReadCapture, ASuccessfulCopyOfUnpublishedBytesIsStillAnOkRead) {
-    RunRecordReadLedgerT<kSlots> reads;
+    RunRecordReadLedger reads(kSlots);
     const DeviceRunResultRegion device_region{};
     DeviceRunResultRegion cached{};
 
@@ -359,12 +359,12 @@ TEST(RunRecordReadCapture, ASuccessfulCopyOfUnpublishedBytesIsStillAnOkRead) {
 }
 
 TEST(RunRecordReadCapture, ARunThatNeverReadIsNotAttempted) {
-    const RunRecordReadLedgerT<kSlots> reads;
+    const RunRecordReadLedger reads(kSlots);
     EXPECT_EQ(reads.state(0, 9), RunRecordRead::NotAttempted);
 }
 
 TEST(RunRecordReadCapture, AReadTakenForAnotherRunIsNotThisRunsRead) {
-    RunRecordReadLedgerT<kSlots> reads;
+    RunRecordReadLedger reads(kSlots);
     const DeviceRunResultRegion device_region = published_success(8);
     DeviceRunResultRegion cached{};
 
@@ -376,7 +376,7 @@ TEST(RunRecordReadCapture, AReadTakenForAnotherRunIsNotThisRunsRead) {
 }
 
 TEST(RunRecordReadCapture, ARunsSecondReadIsNotTaken) {
-    RunRecordReadLedgerT<kSlots> reads;
+    RunRecordReadLedger reads(kSlots);
     const DeviceRunResultRegion device_region = published_success(9);
     DeviceRunResultRegion cached{};
     ScriptedCopy copy(&device_region);
@@ -391,7 +391,7 @@ TEST(RunRecordReadCapture, ARunsSecondReadIsNotTaken) {
 }
 
 TEST(RunRecordReadCapture, ASlotPastCapacityIsIgnoredRatherThanRead) {
-    RunRecordReadLedgerT<kSlots> reads;
+    RunRecordReadLedger reads(kSlots);
     const DeviceRunResultRegion device_region = published_success(9);
     DeviceRunResultRegion cached{};
     ScriptedCopy copy(&device_region);
@@ -418,8 +418,8 @@ TEST(ShadowConsumerEvidence, AFailedRecordDecidesWhateverTheBoundariesObserved) 
     RunCompletionFence error_fence(error_events.ops());
     RunCompletionFence unfenced_fence(unfenced_events.ops());
 
-    RunBoundaryLedgerT<kSlots> boundaries;
-    RunRecordReadLedgerT<kSlots> reads;
+    RunBoundaryLedger boundaries(kSlots);
+    RunRecordReadLedger reads(kSlots);
     const NativeRunIdentity completed = run_at(0, 81);
     const NativeRunIdentity pending = run_at(1, 82);
     const NativeRunIdentity errored = run_at(2, 83);
@@ -459,8 +459,8 @@ TEST(ShadowConsumerEvidence, AFailedRecordDecidesWhateverTheBoundariesObserved) 
 TEST(ShadowConsumerEvidence, ThePossibleRecordSilencesGiveDifferentReasons) {
     ScriptedEvents events;
     RunCompletionFence fence(events.ops());
-    RunBoundaryLedgerT<kSlots> boundaries;
-    RunRecordReadLedgerT<kSlots> reads;
+    RunBoundaryLedger boundaries(kSlots);
+    RunRecordReadLedger reads(kSlots);
     const NativeRunIdentity run = run_at(0, 91);
     fence_the_run(fence, run);
     ASSERT_EQ(wait_and_retain_run_boundaries(fence, boundaries, run, kTimeoutMs).completion, Completion::Complete);
@@ -472,7 +472,7 @@ TEST(ShadowConsumerEvidence, ThePossibleRecordSilencesGiveDifferentReasons) {
     reads.read(run.pipeline_slot, run.run_epoch, cached, &device_region, failing_copy);
     const RunExecutionOutcome failed_read = decide_run_execution(evidence_for(boundaries, reads, cached, run));
 
-    RunRecordReadLedgerT<kSlots> no_region_reads;
+    RunRecordReadLedger no_region_reads(kSlots);
     DeviceRunResultRegion no_region_cached{};
     no_region_reads.read(run.pipeline_slot, run.run_epoch, no_region_cached, nullptr, ScriptedCopy(nullptr));
     const RunExecutionOutcome no_region =
@@ -489,8 +489,8 @@ TEST(ShadowConsumerEvidence, ThePossibleRecordSilencesGiveDifferentReasons) {
 // A run whose evidence was never observed reads Pending, not a verdict — the
 // shape a run that never launched leaves behind.
 TEST(ShadowConsumerEvidence, AnUnobservedRunIsPendingRatherThanDecided) {
-    const RunBoundaryLedgerT<kSlots> boundaries;
-    const RunRecordReadLedgerT<kSlots> reads;
+    const RunBoundaryLedger boundaries(kSlots);
+    const RunRecordReadLedger reads(kSlots);
     const DeviceRunResultRegion cached{};
 
     const RunExecutionOutcome outcome = decide_run_execution(evidence_for(boundaries, reads, cached, run_at(0, 101)));

@@ -39,6 +39,7 @@ from simpler.callable_identity import (
 )
 from simpler.comm_endpoints import HOST_CPU
 from simpler.orchestrator import Orchestrator
+from simpler.remote_l3_limits import MAX_FRAME_BYTES
 from simpler.remote_l3_protocol import (
     CallableKind,
     ChipCallableBlobLocation,
@@ -596,6 +597,11 @@ def test_remote_worker_id_stays_stable_when_local_worker_is_added_later(monkeypa
 
         # Eager init() forks the local L3 child and starts the C++ scheduler, so
         # the mock must satisfy the register/init/orchestrator surface.
+        def _map_mailbox(self, fd, extent):
+            shm = next(shm for shm in worker._next_level_shms if shm._fd == fd)
+            assert worker_mod._mailbox_extent(shm) == extent
+            return worker_mod._mailbox_addr(shm)
+
         def add_sub_worker(self, *args):
             pass
 
@@ -615,6 +621,9 @@ def test_remote_worker_id_stays_stable_when_local_worker_is_added_later(monkeypa
 
         def get_orchestrator(self):
             return None
+
+        def check_control_payloads_retired(self):
+            pass
 
         def close(self):
             self.closed = True
@@ -2483,6 +2492,9 @@ def test_partial_init_failure_cleans_open_remote_session(monkeypatch):
         def add_remote_l3_socket(self, *args):
             self.added.append(args)
 
+        def check_control_payloads_retired(self):
+            pass
+
         def close(self):
             self.closed = True
 
@@ -2531,6 +2543,9 @@ def test_partial_init_failure_closes_unregistered_open_remote_session(monkeypatc
 
         def add_remote_l3_socket(self, *args):
             raise RuntimeError("remote socket register failed")
+
+        def check_control_payloads_retired(self):
+            pass
 
         def close(self):
             self.closed = True
@@ -2797,6 +2812,9 @@ def test_worker_remote_memory_api_returns_opaque_handle_and_routes_controls():
         def remote_free(self, worker_id, buffer_id, generation):
             self.calls.append(("free", worker_id, buffer_id, generation))
 
+        def check_control_payloads_retired(self):
+            pass
+
         def close(self):
             self.calls.append(("close",))
 
@@ -2884,6 +2902,48 @@ def test_remote_register_commit_exception_aborts_prepared_and_marks_uncertain():
 
     assert fake.aborted == [worker_id]
     assert digest in worker._uncertain_hashids
+
+
+def test_initial_mpi_direct_register_rollback_aborts_only_uncommitted_workers():
+    class FailingCommitWorker:
+        def __init__(self):
+            self.aborted = []
+            self.unregistered = []
+
+        def remote_prepare_register(self, worker_id, *args):
+            return _FakeRemoteControlResult(worker_id)
+
+        def remote_commit_register(self, worker_id, *args):
+            return _FakeRemoteControlResult(worker_id, ok=worker_id == 0, error_message="commit failed")
+
+        def remote_abort_register(self, worker_id, *args):
+            self.aborted.append(worker_id)
+            return _FakeRemoteControlResult(worker_id)
+
+        def remote_unregister(self, worker_id, *args):
+            self.unregistered.append(worker_id)
+            return _FakeRemoteControlResult(worker_id)
+
+    worker = Worker(level=4, num_sub_workers=0)
+    hub = worker_mod._MpiDirectTransportHub(MAX_FRAME_BYTES)
+    topology = worker_mod.MpiDirectTopology.from_dict(
+        {
+            "executor_ranks": [
+                {"rank": worker_id + 1, "worker_id": worker_id, "host": "localhost", "platform": "a2a3sim"}
+                for worker_id in range(2)
+            ]
+        }
+    )
+    worker._configure_mpi_direct(topology, 1, hub)
+    worker.register(RemoteCallable(_REMOTE_NOOP_ORCH_TARGET), workers=[0, 1])
+    fake = FailingCommitWorker()
+    worker._worker = fake  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        worker._publish_initial_mpi_direct_callables()
+
+    assert fake.aborted == [1]
+    assert fake.unregistered == [0]
 
 
 def test_remote_unregister_exception_is_best_effort_and_marks_uncertain():

@@ -17,7 +17,7 @@
  * so multiple ChipWorkers can run concurrently without interference.
  *
  * All pto_sim_* functions operate on the context bound to the calling
- * thread's device_id (set via pto_cpu_sim_bind_device).
+ * thread's device_id (set via pto_cpu_sim_bind_device_checked or its legacy wrapper).
  *
  * Invariant: each simulated device_id has a single owner ChipWorker per
  * process. The owner calls acquire_device() inside DeviceRunner's
@@ -36,8 +36,20 @@
 extern "C" {
 #endif
 
-/** Bind the calling thread to a simulated device ID. */
+/**
+ * Bind a nonnegative device ID, or -1 to unbind. Returns 0 or a pthread error
+ * code (EINVAL for IDs below -1); failure leaves the previous binding intact.
+ * The key is owned by the process-resident sim context, not a runtime module.
+ */
+int pto_cpu_sim_bind_device_checked(int device_id);
+
+/** Legacy void ABI: aborts on failure rather than returning with a stale binding. */
 void pto_cpu_sim_bind_device(int device_id);
+
+// Bind the calling AICore thread's dispatch register for cooperative cancellation.
+// A null binding clears it; both operations return a pthread error on failure.
+int pto_cpu_sim_bind_cancel_register(volatile uint32_t *reg);
+bool pto_cpu_sim_cancel_requested(uint32_t exit_signal);
 
 /** Return the device ID bound to the calling thread, or -1 if unbound. */
 int pto_cpu_sim_get_bound_device(void);
@@ -51,6 +63,10 @@ void pto_cpu_sim_release_device(int device_id);
 /** Return the current thread's AIV lane (0 or 1). Resolved by pto-isa via function pointer injection. */
 uint32_t pto_sim_get_subblock_id(void);
 
+// The executor binds its current lane context; child kernels receive these callbacks by injection.
+int sim_context_bind_invocation_context(void *context);
+void *sim_context_get_invocation_context(void);
+
 /** Return per-device per-cluster per-dispatch pipe shared memory. Resolved by pto-isa via function pointer injection.
  */
 void *pto_sim_get_pipe_shared_state(uint64_t pipe_key, size_t size);
@@ -62,16 +78,16 @@ void *pto_sim_get_pipe_shared_state(uint64_t pipe_key, size_t size);
 #ifdef __cplusplus
 
 /**
- * Set the current thread's simulated subblock_id.
- * Called by aicore_execute_wrapper (via function pointer injection).
+ * Set the current thread's simulated subblock_id; return a pthread error on failure.
+ * Called by aicore_execute_wrapper_checked (via function pointer injection).
  */
-void sim_context_set_subblock_id(uint32_t subblock_id);
+int sim_context_set_subblock_id(uint32_t subblock_id);
 
 /**
- * Set the current thread's simulated cluster_id.
- * Called by aicore_execute_wrapper (via function pointer injection).
+ * Set the current thread's simulated cluster_id; return a pthread error on failure.
+ * Called by aicore_execute_wrapper_checked (via function pointer injection).
  */
-void sim_context_set_cluster_id(uint32_t cluster_id);
+int sim_context_set_cluster_id(uint32_t cluster_id);
 
 /** Clear pipe shared state for the current thread's device. */
 void clear_cpu_sim_shared_storage();

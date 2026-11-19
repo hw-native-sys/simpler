@@ -133,7 +133,7 @@ runs:
             return 0
           fi
           if [[ "$mode" == source-file ]]; then
-            update_command+=("${update_options[@]}")
+            update_command+=("${update_options[@]}" -o APT::Update::Error-Mode=any)
           fi
           for ((attempt = 1; attempt <= attempts; ++attempt)); do
             if sudo DEBIAN_FRONTEND=noninteractive timeout --kill-after=15s "${UPDATE_TIMEOUT_SECONDS}s" \

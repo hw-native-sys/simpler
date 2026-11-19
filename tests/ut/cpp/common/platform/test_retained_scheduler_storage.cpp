@@ -111,6 +111,40 @@ protected:
     void *host_out = nullptr;
 };
 
+TEST_F(RetainedSchedulerStorageTest, PreparedOwnerCanRetryFailedReleaseWithoutLosingSource) {
+    ASSERT_EQ(acquire(256), RetainedSchedulerStorage::Status::Ok);
+    void *source = host_out;
+    void *target = device_out;
+    std::memset(source, 0xa5, 256);
+    device.free_fails = true;
+    EXPECT_EQ(
+        storage.release_preserving_failure([this](void *p) {
+            return device.free(p);
+        }),
+        -7
+    );
+    EXPECT_EQ(storage.host_addr(), source);
+    EXPECT_EQ(storage.device_addr(), target);
+    EXPECT_EQ(static_cast<unsigned char *>(source)[255], 0xa5);
+    device.free_fails = false;
+    EXPECT_EQ(
+        storage.release_preserving_failure([this](void *p) {
+            return device.free(p);
+        }),
+        0
+    );
+    EXPECT_EQ(storage.device_addr(), nullptr);
+    EXPECT_EQ(storage.host_addr(), nullptr);
+    const int frees = device.frees;
+    EXPECT_EQ(
+        storage.release_preserving_failure([this](void *p) {
+            return device.free(p);
+        }),
+        0
+    );
+    EXPECT_EQ(device.frees, frees);
+}
+
 TEST_F(RetainedSchedulerStorageTest, AFirstAcquireAllocatesBothSidesAligned) {
     ASSERT_EQ(acquire(4096), RetainedSchedulerStorage::Status::Ok);
     EXPECT_EQ(device.allocs, 1);

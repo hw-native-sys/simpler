@@ -253,6 +253,19 @@ TEST(HostPhaseRecords, SubmitProjectionKeepsOnlyTaskSubmittingKinds) {
     }
 }
 
+TEST(HostPhaseRecords, ImageStagingDoesNotClaimADeviceUpload) {
+    HostPhaseRecordStore store;
+    auto *pool = store.arm(true);
+    ASSERT_NE(pool, nullptr);
+    record_n(pool, HostPhaseKind::BindImageStage, 1);
+    record_n(pool, HostPhaseKind::BindArenaH2d, 1);
+    store.finish(0, 9);
+    ASSERT_EQ(store.device_upload_records().size(), 1u);
+    EXPECT_EQ(store.device_upload_records()[0].kind, static_cast<uint32_t>(HostPhaseKind::BindArenaH2d));
+    EXPECT_STREQ(host_phase_kind_name(HostPhaseKind::BindImageStage), "image_stage");
+    EXPECT_FALSE(host_phase_kind_submits_task(HostPhaseKind::BindImageStage));
+}
+
 TEST(HostPhaseRecords, EveryKindHasItsOwnName) {
     for (uint32_t i = 0; i < kHostPhaseKindCount; ++i) {
         const char *name = host_phase_kind_name(static_cast<HostPhaseKind>(i));
@@ -296,3 +309,21 @@ TEST(HostPhaseRecords, APassIsWrittenAtMostOnceAndTheNextPassAppends) {
 }
 
 }  // namespace
+
+TEST(HostPhaseRecords, APrepareRetryAppendsAndKeepsTheDroppedLedger) {
+    HostPhaseRecordStore store;
+    auto *pool = store.arm(true);
+    ASSERT_NE(pool, nullptr);
+    record_n(pool, HostPhaseKind::OrchRecordSubTask, 3, 100);
+    pool->dropped.fetch_add(2);
+    store.finish(3, 9);
+    const auto generation = pool->generation.load();
+    ASSERT_EQ(store.resume(), pool);
+    EXPECT_NE(pool->generation.load(), generation);
+    record_n(pool, HostPhaseKind::BindArenaH2d, 1, 200);
+    store.finish(3, 10);
+    EXPECT_EQ(store.records().size(), 4u);
+    EXPECT_EQ(store.dropped_records(), 2u);
+    EXPECT_EQ(store.submitted_tasks(), 3u);
+    EXPECT_EQ(store.invocation_id(), 10u) << "the completing attempt owns the combined artifact";
+}

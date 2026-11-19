@@ -60,6 +60,7 @@ def _fake_orchestrator(w: Worker, monkeypatch: pytest.MonkeyPatch) -> Orchestrat
         return (b"d" * 32, "NEXT_LEVEL", "LOCAL_CHIP", (0,))
 
     monkeypatch.setattr(orch_mod, "_require_handle", _fake_require_handle)
+    monkeypatch.setattr(Worker, "_prepare_ccu_submission", lambda _self, _handle, _workers, args, **_kwargs: args)
     return Orchestrator(MagicMock(), w)
 
 
@@ -309,17 +310,21 @@ class _FakeChipImpl:
 
     def __init__(self):
         self.calls: list[tuple[int, object, object]] = []
+        self._execution_environment = None
 
     def _submit_chip_run_direct(self, callable_id, chip_args, cfg):
         self.calls.append((callable_id, chip_args, cfg))
         return SimpleNamespace(wait=lambda timeout: True)
+
+    def _validate_execution_context(self):
+        pass
 
 
 def _l2_with_registered_buffer(nbytes: int = 64):
     """An L2 Worker (its own chip, no fork needed) plus one buffer already registered in
     w._buffers, the way Worker.create_buffer() would leave it."""
     w = Worker(level=2)
-    w._chip_worker = SimpleNamespace(_impl=_FakeChipImpl())
+    w._chip_worker = _FakeChipImpl()
     buf = w._create_buffer_locked(nbytes)
     return w, buf
 
@@ -347,6 +352,27 @@ class TestL2TouchedIdentityTracking:
         assert run_id not in w._chip_runs
         assert run_id not in w._chip_run_touched_identities
 
+    @pytest.mark.parametrize("recovery_required", [False, True])
+    def test_failed_run_keeps_touched_identity_until_cleanup_proof(self, recovery_required):
+        w, buf = _l2_with_registered_buffer()
+        handle = w._submit_l2_locked(3, _buffer_args(buf), CallConfig())
+        run_id = handle._run_id
+        assert run_id is not None
+        native = w._chip_runs[run_id]
+        native._owner_recovery_required = recovery_required
+        native.lane_poisoned = False
+        w._finalize_run_handle(handle, run_id, RuntimeError("device execution failed"))
+        assert run_id not in w._chip_runs
+        if recovery_required:
+            assert w._chip_run_touched_identities[run_id] == {buf.identity}
+            with pytest.raises(RuntimeError, match="in-flight L2 run"):
+                w.release_buffer(buf)
+            assert not buf.closed
+        else:
+            assert run_id not in w._chip_run_touched_identities
+            w.release_buffer(buf)
+            assert buf.closed
+
     def test_publishes_touched_identities_before_dispatch_not_after(self):
         # _submit_l2_locked must publish _chip_run_touched_identities BEFORE calling
         # _submit_chip_run_direct, not after -- otherwise a release_buffer() landing in the
@@ -363,7 +389,7 @@ class TestL2TouchedIdentityTracking:
                 proceed.wait(timeout=5)
                 return super()._submit_chip_run_direct(callable_id, chip_args, cfg)
 
-        w._chip_worker = SimpleNamespace(_impl=_BlockingChipImpl())
+        w._chip_worker = _BlockingChipImpl()
 
         submit_thread = threading.Thread(target=lambda: w._submit_l2_locked(3, _buffer_args(buf), CallConfig()))
         submit_thread.start()

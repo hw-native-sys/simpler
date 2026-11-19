@@ -222,15 +222,17 @@ mirrors the PMU pattern — two independent channels (one binary, one int):
   (`SIMPLER_DFX_FLAG_CHIP_SWIMLANE`). Set by the host whenever level > 0; read
   by AICore (which only needs on/off to decide whether to write timing) and
   by AICPU kernel entry via `set_chip_swimlane_enabled(bool)`.
-- **Granular level (0–4)** — `ChipSwimlaneDataHeader::chip_swimlane_level`
-  (shared memory). Host writes it in `ChipSwimlaneCollector::initialize`; AICPU
-  promotes it from the header in `chip_swimlane_aicpu_init` and exposes it via
+- **Granular level (0–4)** — `Runtime::dev.chip_swimlane_level` in this
+  invocation's descriptor. Host preparation snapshots it; the AICPU launch
+  stream publishes it before execution. AICPU receives it explicitly in
+  `chip_swimlane_aicpu_init` and exposes it via
   `get_chip_swimlane_level()` (typed `ChipSwimlaneLevel`) for
   `>= SCHEDULE_TIMING / SCHED_PHASES / ORCH_PHASES` gates.
 
 On sim, the binary on/off travels via the dlsym'd `set_chip_swimlane_enabled`
-entry point; the granular level still goes through the shared-memory
-header just like on onboard.
+entry point; the granular level is read from the Runtime descriptor in place.
+The collector header records only the initial pool level; host admission does
+not republish a level or clear producer-owned queues.
 
 | Level | Collects |
 | ----- | -------- |
@@ -288,7 +290,7 @@ if (is_chip_swimlane_enabled()) { ... }
 
 // Scheduler per-task dispatch/finish timestamps (AICPU-produced in this runtime).
 // Granular checks below require chip_swimlane_aicpu_init to have already run
-// (so the level has been promoted from the shared-memory header).
+// (so the level has been latched from this invocation).
 if (get_chip_swimlane_level() >= ChipSwimlaneLevel::SCHEDULE_TIMING) { ... }
 
 // Scheduler main-loop phase records (SCHED_*)
@@ -299,8 +301,8 @@ if (get_chip_swimlane_level() >= ChipSwimlaneLevel::ORCH_PHASES) { ... }
 ```
 
 `ChipSwimlaneLevel` is defined in `common/chip_swimlane_profiling.h` with
-underlying type `uint32_t` (matches the `ChipSwimlaneDataHeader::chip_swimlane_level`
-shared-memory field and mirrors `PmuEventType : uint32_t`):
+underlying type `uint32_t` (matches the `Runtime::dev.chip_swimlane_level`
+descriptor field and mirrors `PmuEventType : uint32_t`):
 
 | Enumerator | Underlying value |
 | ---------- | ---------------- |

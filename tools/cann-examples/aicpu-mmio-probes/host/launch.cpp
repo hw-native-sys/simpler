@@ -11,11 +11,10 @@
 // launch.cpp — host driver for the AICPU-only MMIO probes.
 //
 // Same Path-A dispatcher bootstrap as tools/cann-examples/aicpu-kernel-launch
-// (dlopen libaicpu_extend_kernels.so, write our inner SO under
-// /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/, fingerprint + register
+// (dlopen libaicpu_extend_kernels.so, write our inner SO into the CANN
+// process directory, fingerprint + register
 // via rtsBinaryLoadFromFile, rtsLaunchCpuKernel). The only extra step is
-// halMemCtl(ADDR_MAP_TYPE_REG_AIC_CTRL) so the AICPU SO knows where the
-// register window starts.
+// the AICPU-visible AICore register bases used by the probe SO.
 //
 // Output: pretty-prints MmioProbeResult into a table that reproduces the
 // canonical Phase 4 + Phase 12 measurements from
@@ -39,6 +38,7 @@
 #include <vector>
 
 #include "../shared/probes_types.h"
+#include "../../cmake/aicore_reg_mapping.h"
 
 // ELF Build-ID fingerprint — same code as
 // aicpu-kernel-launch/host/launch_hello.cpp. Falls back to FNV-1a if the SO
@@ -193,26 +193,6 @@ struct DeviceContext {
     bool Valid() const { return device_id >= 0 && stream != nullptr; }
 };
 
-// halMemCtl(ADDR_MAP_TYPE_REG_AIC_CTRL) — same call as
-// src/{arch}/platform/onboard/host/host_regs.cpp. Returns 0 on failure.
-uint64_t QueryAicCtrlBase(int device_id) {
-    auto fn = (int (*)(int, void *, size_t, void *, size_t *))dlsym(nullptr, "halMemCtl");
-    if (fn == nullptr) {
-        std::fprintf(stderr, "halMemCtl not found in symbol table — link libascend_hal\n");
-        return 0;
-    }
-    AddrMapInPara in{};
-    in.devid = static_cast<unsigned int>(device_id);
-    in.addr_type = ADDR_MAP_TYPE_REG_AIC_CTRL;
-    AddrMapOutPara out{};
-    int rc = fn(0, &in, sizeof(in), &out, nullptr);
-    if (rc != 0) {
-        std::fprintf(stderr, "halMemCtl rc=%d\n", rc);
-        return 0;
-    }
-    return out.ptr;
-}
-
 constexpr size_t kDeviceArgsBytes = 160;
 constexpr size_t kBootstrapDispBin = 96;
 constexpr size_t kBootstrapDispLen = 104;
@@ -341,18 +321,32 @@ int main(int argc, char **argv) {
     }
     aclrtStream stream = dev.stream;
 
-    uint64_t aic_ctrl_base = QueryAicCtrlBase(device_id);
-    if (aic_ctrl_base == 0) {
-        std::fprintf(stderr, "halMemCtl(AIC_CTRL) returned 0\n");
+    cann_examples::AicoreRegMapping reg_mapping;
+    if (!reg_mapping.Init(static_cast<uint32_t>(device_id))) return 1;
+    if (n_aic_cores == 0) {
+        std::fprintf(stderr, "n_aic_cores must be positive\n");
         return 1;
     }
-    std::printf("[probes] aic_ctrl_base = 0x%016lx, n_aic_cores = %u\n", aic_ctrl_base, n_aic_cores);
+    if (n_aic_cores > kProbeMaxCores) n_aic_cores = kProbeMaxCores;
+    if (n_aic_cores > reg_mapping.Bases().size()) n_aic_cores = reg_mapping.Bases().size();
+    std::printf(
+        "[probes] aic_cores = %u, register_slots = %zu, probed_cores = %u\n", reg_mapping.AicCoreCount(),
+        reg_mapping.Bases().size(), n_aic_cores
+    );
 
-    DevBuf dev_dispatcher, dev_inner, dev_args, dev_result;
+    DevBuf dev_dispatcher, dev_inner, dev_args, dev_result, dev_reg_bases;
     ACL_CHECK(dev_dispatcher.Alloc(dispatcher_bytes.size()), "dispatcher GM");
     ACL_CHECK(dev_inner.Alloc(inner_bytes.size()), "inner GM");
     ACL_CHECK(dev_args.Alloc(kDeviceArgsBytes), "DeviceArgs GM");
     ACL_CHECK(dev_result.Alloc(sizeof(MmioProbeResult)), "Result GM");
+    const size_t reg_bases_bytes = reg_mapping.Bases().size() * sizeof(uint64_t);
+    ACL_CHECK(dev_reg_bases.Alloc(reg_bases_bytes), "register bases GM");
+    ACL_CHECK(
+        aclrtMemcpy(
+            dev_reg_bases.ptr, reg_bases_bytes, reg_mapping.Bases().data(), reg_bases_bytes, ACL_MEMCPY_HOST_TO_DEVICE
+        ),
+        "H2D register bases"
+    );
     ACL_CHECK(aclrtMemset(dev_result.ptr, sizeof(MmioProbeResult), 0, sizeof(MmioProbeResult)), "memset result");
 
     ACL_CHECK(
@@ -414,9 +408,7 @@ int main(int argc, char **argv) {
     char base[64];
     std::snprintf(base, sizeof(base), "simpler_inner_%016lx_%d.so", fp, device_id);
     std::string so_basename = base;
-    std::printf(
-        "[bootstrap] inner landed at /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/%s (fp=%016lx)\n", base, fp
-    );
+    std::printf("[bootstrap] inner SO uploaded to CANN process directory as %s (fp=%016lx)\n", base, fp);
 
     struct TempFile {
         std::string path;
@@ -461,8 +453,10 @@ int main(int argc, char **argv) {
     MmioProbeDeviceArgs run_args = {};
     run_args.result_addr = reinterpret_cast<uint64_t>(dev_result.ptr);
     run_args.input_token = ((uint64_t)getpid() << 32) ^ 0xC0DEDEC0AFAF1234ULL;
-    run_args.aic_ctrl_reg_base = aic_ctrl_base;
+    run_args.reg_bases_addr = reinterpret_cast<uint64_t>(dev_reg_bases.ptr);
     run_args.n_aic_cores_available = n_aic_cores;
+    run_args.cond_offset = reg_mapping.CondOffset();
+    run_args.dmb_offset = reg_mapping.DmbOffset();
     ACL_CHECK(
         aclrtMemcpy(dev_args.ptr, sizeof(run_args), &run_args, sizeof(run_args), ACL_MEMCPY_HOST_TO_DEVICE),
         "H2D DeviceArgs(run)"

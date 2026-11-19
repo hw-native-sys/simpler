@@ -55,7 +55,7 @@ Detection / isolation procedures referenced below live in
 
    Parallelism is auto-driven by `--device`: on hardware, one in-flight
    subprocess per device (`--max-parallel auto` = `len(--device)`); see
-   `docs/testing.md` for the full reuse hierarchy.
+   `docs/testing/parallel-execution.md` for the full reuse hierarchy.
 7. Report the results summary (pass/fail counts per task) across all applicable
    passes.
 8. If any tests fail, show the relevant error output and which device failed.

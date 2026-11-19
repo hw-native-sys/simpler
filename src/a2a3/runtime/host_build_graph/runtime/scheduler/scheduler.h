@@ -32,10 +32,15 @@
 
 #pragma once
 
+#include "host_build_graph/shared_arena_layout.h"
+
 #include <atomic>
+#include <cstddef>
 
 #include "graph_image_view.h"
 #include "common/memory_barrier.h"
+#include "common/tagged_ptr.h"
+#include "common/lane_demand_counter.h"
 #include "utils/device_arena.h"
 #include "aicpu/platform_regs.h"  // get_reg_ptr / RegId for the early-dispatch doorbell
 #include "async_wait.h"
@@ -69,9 +74,15 @@
 /**
  * Per-slot entry: sequence counter for ABA safety + task payload
  */
+using CapturedReadySlot = TaggedPtr<ChipTaskSlotState, LaneMask, SUBTASK_SLOT_COUNT>;
+static_assert(sizeof(CapturedReadySlot) == 8 && alignof(CapturedReadySlot) == 8);
+static_assert(std::is_trivially_default_constructible_v<CapturedReadySlot>);
+static_assert(READY_QUEUE_CAPACITY_LIMIT <= LaneDemandCounter::kMaxCount);
+static_assert(CHIP_EARLY_DISPATCH_QUEUE_SIZE <= LaneDemandCounter::kMaxCount);
+
 struct ChipReadyQueueSlot {
     std::atomic<int64_t> sequence;
-    ChipTaskSlotState *slot_state;
+    CapturedReadySlot slot_value;
     TaskId task_id_snapshot;
 };
 
@@ -86,10 +97,15 @@ struct ChipReadyQueueSlot {
  *   consumers only touch dequeue_pos
  */
 struct alignas(64) ChipReadyQueue {
+private:
+    enum class PayloadKind : uint8_t { Plain, Mix, AnyShape };
+
+public:
     ChipReadyQueueSlot *slots;
     uint64_t capacity;
-    uint64_t mask;        // capacity - 1
-    char _pad0[64 - 24];  // Pad to own cache line
+    uint64_t mask;  // capacity - 1
+    LaneDemandCounter mixed_lanes;
+    char _pad0[64 - 32];  // Pad to own cache line
 
     std::atomic<uint64_t> enqueue_pos;
     char _pad1[64 - sizeof(std::atomic<uint64_t>)];  // Own cache line
@@ -108,7 +124,7 @@ struct alignas(64) ChipReadyQueue {
     void seed_slots() {
         for (uint64_t i = 0; i < capacity; i++) {
             slots[i].sequence.store(static_cast<int64_t>(i), std::memory_order_relaxed);
-            slots[i].slot_state = nullptr;
+            slots[i].slot_value = CapturedReadySlot{};
         }
     }
 
@@ -129,13 +145,99 @@ struct alignas(64) ChipReadyQueue {
                                  )) {}
     }
 
-    // An untagged push carries the reserved sentinel: only the three queues that
-    // pop with a tag ever read this field, and all of them push with one, so an
-    // untagged entry's tag is never compared. The sentinel says so, where a zero
-    // would have been a legitimate handle.
-    bool push(ChipTaskSlotState *slot_state) { return push_tagged(slot_state, TaskId::invalid()); }
+    bool push(ChipTaskSlotState *slot) { return push_tagged(slot, TaskId::invalid()); }
+    bool push_tagged(ChipTaskSlotState *slot, TaskId id) {
+        return push_value<PayloadKind::Plain>(CapturedReadySlot(slot, LaneMask::none()), id);
+    }
+    bool push_mix(ChipTaskSlotState *slot, TaskId id = TaskId::invalid()) { return push_mix(capture_mix(slot), id); }
+    bool push_mix(CapturedReadySlot slot, TaskId id = TaskId::invalid()) {
+        return push_value<PayloadKind::Mix>(slot, id);
+    }
+    bool push_sync_start(ChipTaskSlotState *slot, TaskId id) { return push_sync_start(capture_mix(slot), id); }
+    bool push_sync_start(CapturedReadySlot slot, TaskId id) { return push_value<PayloadKind::AnyShape>(slot, id); }
+    bool push_plain_batch(const CapturedReadySlot *items, const TaskId *ids, int count) {
+        return push_values<PayloadKind::Plain>(items, ids, count);
+    }
+    bool push_mix_batch(const CapturedReadySlot *items, const TaskId *ids, int count) {
+        return push_values<PayloadKind::Mix>(items, ids, count);
+    }
+    ChipTaskSlotState *pop() { return pop_tagged(nullptr); }
+    ChipTaskSlotState *pop_tagged(TaskId *id) { return pop_value<PayloadKind::Plain>(id).ptr(); }
+    CapturedReadySlot pop_sync_start(TaskId *id) { return pop_value<PayloadKind::AnyShape>(id); }
+    int pop_batch(ChipTaskSlotState **out, int count) { return pop_batch_tagged(out, nullptr, count); }
+    int pop_batch_tagged(ChipTaskSlotState **out, TaskId *ids, int count) {
+        return pop_values<PayloadKind::Plain>(out, ids, count);
+    }
+    LaneMask mix_demand() const { return mixed_lanes.reserved(); }
 
-    bool push_tagged(ChipTaskSlotState *slot_state, TaskId task_id_snapshot) {
+    bool push_shaped(ChipTaskSlotState *slot, ResourceShape shape, TaskId id = TaskId::invalid()) {
+        return shape == ResourceShape::MIX ? push_mix(slot, id) : push_tagged(slot, id);
+    }
+    bool push_shaped(CapturedReadySlot slot, ResourceShape shape, TaskId id = TaskId::invalid()) {
+        return shape == ResourceShape::MIX ? push_mix(slot, id) : push_value<PayloadKind::Plain>(slot, id);
+    }
+    bool push_shaped_batch(const CapturedReadySlot *items, const TaskId *ids, int count, ResourceShape shape) {
+        return shape == ResourceShape::MIX ? push_mix_batch(items, ids, count) : push_plain_batch(items, ids, count);
+    }
+    template <typename Output>
+    int pop_shaped_batch(Output *out, TaskId *ids, int count, ResourceShape shape) {
+        return shape == ResourceShape::MIX ? pop_values<PayloadKind::Mix>(out, ids, count) :
+                                             pop_values<PayloadKind::Plain>(out, ids, count);
+    }
+
+#if SIMPLER_SCHED_PROFILING
+    template <typename Output>
+    int pop_shaped_batch(Output *out, TaskId *ids, int count, ResourceShape shape, uint64_t &atomics, uint64_t &wait) {
+        return shape == ResourceShape::MIX ? pop_values<PayloadKind::Mix>(out, ids, count, atomics, wait) :
+                                             pop_values<PayloadKind::Plain>(out, ids, count, atomics, wait);
+    }
+#endif
+#if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
+    bool push(ChipTaskSlotState *slot, uint64_t &atomics, uint64_t &wait) {
+        return push_value<PayloadKind::Plain>(
+            CapturedReadySlot(slot, LaneMask::none()), TaskId::invalid(), atomics, wait
+        );
+    }
+#endif
+#if SIMPLER_SCHED_PROFILING
+    ChipTaskSlotState *pop(uint64_t &atomics, uint64_t &wait) {
+        return pop_value<PayloadKind::Plain>(nullptr, atomics, wait).ptr();
+    }
+#endif
+
+private:
+    static void assign_output(ChipTaskSlotState *&out, CapturedReadySlot value) { out = value.ptr(); }
+    static void assign_output(CapturedReadySlot &out, CapturedReadySlot value) { out = value; }
+
+    static CapturedReadySlot capture_mix(ChipTaskSlotState *slot) {
+        const LaneMask lanes = slot->active_mask;
+        debug_assert(lanes.is_valid());
+        return {slot, lanes.is_mix() ? lanes : LaneMask::none()};
+    }
+
+    template <PayloadKind Kind>
+    bool add_lane_demand(CapturedReadySlot slot) {
+        if constexpr (Kind == PayloadKind::Plain) return false;
+        else {
+            if constexpr (Kind == PayloadKind::Mix) debug_assert(slot.tag().is_mix());
+            if (slot.tag().is_empty()) return false;
+            mixed_lanes.add(slot.tag());
+            return true;
+        }
+    }
+    template <PayloadKind Kind>
+    bool remove_lane_demand(CapturedReadySlot slot) {
+        if constexpr (Kind == PayloadKind::Plain) return false;
+        else {
+            if constexpr (Kind == PayloadKind::Mix) debug_assert(slot.tag().is_mix());
+            if (slot.tag().is_empty()) return false;
+            mixed_lanes.sub(slot.tag());
+            return true;
+        }
+    }
+
+    template <PayloadKind Kind>
+    bool push_value(CapturedReadySlot value, TaskId task_id_snapshot) {
         uint64_t pos;
         ChipReadyQueueSlot *slot;
         while (true) {
@@ -154,22 +256,16 @@ struct alignas(64) ChipReadyQueue {
             }
         }
 
-        slot->slot_state = slot_state;
+        slot->slot_value = value;
         slot->task_id_snapshot = task_id_snapshot;
+        add_lane_demand<Kind>(value);
         slot->sequence.store(static_cast<int64_t>(pos + 1), std::memory_order_release);
         note_occupancy(pos + 1);
         return true;
     }
 
-    // Batch push: reserve count slots with a single CAS after confirming
-    // every target slot is available under the usual Vyukov sequence check.
-    // Returns false without publishing anything when the queue cannot take all
-    // `count` items. A target slot holding an older generation means full and
-    // ends the call; a slot a peer has reserved but not yet published is
-    // transient and retries, so this only spins while a peer is mid-publish.
-    bool push_batch(ChipTaskSlotState **items, int count) { return push_batch_tagged(items, nullptr, count); }
-
-    bool push_batch_tagged(ChipTaskSlotState **items, const TaskId *task_id_snapshots, int count) {
+    template <PayloadKind Kind>
+    bool push_values(const CapturedReadySlot *items, const TaskId *task_id_snapshots, int count) {
         if (count == 0) return true;
         if (static_cast<uint64_t>(count) > capacity) return false;
 
@@ -199,9 +295,19 @@ struct alignas(64) ChipReadyQueue {
             }
         }
 
+        if constexpr (Kind != PayloadKind::Plain) {
+            LaneDemandCounter::Batch demand;
+            bool has_demand = false;
+            for (int i = 0; i < count; ++i) {
+                if constexpr (Kind == PayloadKind::Mix) debug_assert(items[i].tag().is_mix());
+                demand.add(items[i].tag());
+                has_demand |= !items[i].tag().is_empty();
+            }
+            if (has_demand) mixed_lanes.add(demand);
+        }
         for (int i = 0; i < count; i++) {
             ChipReadyQueueSlot *slot = &slots[(pos + i) & mask];
-            slot->slot_state = items[i];
+            slot->slot_value = items[i];
             slot->task_id_snapshot = task_id_snapshots == nullptr ? TaskId::invalid() : task_id_snapshots[i];
             slot->sequence.store(static_cast<int64_t>(pos + i + 1), std::memory_order_release);
         }
@@ -210,7 +316,8 @@ struct alignas(64) ChipReadyQueue {
     }
 
 #if SIMPLER_ORCH_PROFILING || SIMPLER_SCHED_PROFILING
-    bool push(ChipTaskSlotState *slot_state, uint64_t &atomic_count, uint64_t &wait_cycle) {
+    template <PayloadKind Kind>
+    bool push_value(CapturedReadySlot value, TaskId task_id_snapshot, uint64_t &atomic_count, uint64_t &wait_cycle) {
         uint64_t pos;
         ChipReadyQueueSlot *slot;
         uint64_t t0 = get_sys_cnt_aicpu();
@@ -243,20 +350,21 @@ struct alignas(64) ChipReadyQueue {
             wait_cycle += (get_sys_cnt_aicpu() - t0);
         }
 
-        slot->slot_state = slot_state;
+        slot->slot_value = value;
+        slot->task_id_snapshot = task_id_snapshot;
+        atomic_count += add_lane_demand<Kind>(value);
         slot->sequence.store(static_cast<int64_t>(pos + 1), std::memory_order_release);
         return true;
     }
 #endif
 
-    ChipTaskSlotState *pop() { return pop_tagged(nullptr); }
-
-    ChipTaskSlotState *pop_tagged(TaskId *task_id_snapshot) {
+    template <PayloadKind Kind>
+    CapturedReadySlot pop_value(TaskId *task_id_snapshot) {
         // Fast-path: skip slot load when queue is clearly empty
         uint64_t d = dequeue_pos.load(std::memory_order_relaxed);
         uint64_t e = enqueue_pos.load(std::memory_order_relaxed);
         if (d >= e) {
-            return nullptr;
+            return {};
         }
 
         uint64_t pos;
@@ -272,24 +380,26 @@ struct alignas(64) ChipReadyQueue {
                     ))
                     break;
             } else if (diff < 0) {
-                return nullptr;  // Queue empty
+                return {};  // Queue empty
             }
         }
 
-        ChipTaskSlotState *result = slot->slot_state;
+        CapturedReadySlot result = slot->slot_value;
         if (task_id_snapshot != nullptr) *task_id_snapshot = slot->task_id_snapshot;
+        remove_lane_demand<Kind>(result);
         slot->sequence.store(static_cast<int64_t>(pos + mask + 1), std::memory_order_release);
         return result;
     }
 
 #if SIMPLER_SCHED_PROFILING
-    ChipTaskSlotState *pop(uint64_t &atomic_count, uint64_t &wait_cycle) {
+    template <PayloadKind Kind>
+    CapturedReadySlot pop_value(TaskId *task_id_snapshot, uint64_t &atomic_count, uint64_t &wait_cycle) {
         // Fast-path: skip slot load when queue is clearly empty
         uint64_t d = dequeue_pos.load(std::memory_order_relaxed);
         uint64_t e = enqueue_pos.load(std::memory_order_relaxed);
         atomic_count += 2;  // dequeue_pos.load + enqueue_pos.load
         if (d >= e) {
-            return nullptr;
+            return {};
         }
 
         uint64_t pos;
@@ -314,7 +424,7 @@ struct alignas(64) ChipReadyQueue {
                 atomic_ops++;  // failed CAS
             } else if (diff < 0) {
                 atomic_count += atomic_ops;
-                return nullptr;  // Queue empty
+                return {};  // Queue empty
             } else {
                 contended = true;
             }
@@ -325,17 +435,16 @@ struct alignas(64) ChipReadyQueue {
             wait_cycle += (get_sys_cnt_aicpu() - t0);
         }
 
-        ChipTaskSlotState *result = slot->slot_state;
+        CapturedReadySlot result = slot->slot_value;
+        if (task_id_snapshot != nullptr) *task_id_snapshot = slot->task_id_snapshot;
+        atomic_count += remove_lane_demand<Kind>(result);
         slot->sequence.store(static_cast<int64_t>(pos + mask + 1), std::memory_order_release);
         return result;
     }
 #endif
 
-    // Batch pop: reserve a contiguous run of ready slots with a single CAS.
-    // Returns actual number of items popped (may be less than max_count).
-    int pop_batch(ChipTaskSlotState **out, int max_count) { return pop_batch_tagged(out, nullptr, max_count); }
-
-    int pop_batch_tagged(ChipTaskSlotState **out, TaskId *task_id_snapshots, int max_count) {
+    template <PayloadKind Kind, typename Output>
+    int pop_values(Output *out, TaskId *task_id_snapshots, int max_count) {
         uint64_t pos;
         int count;
         while (true) {
@@ -364,17 +473,40 @@ struct alignas(64) ChipReadyQueue {
             }
         }
 
+        LaneDemandCounter::Batch demand;
+        bool has_demand = false;
         for (int i = 0; i < count; i++) {
             ChipReadyQueueSlot *slot = &slots[(pos + i) & mask];
-            out[i] = slot->slot_state;
+            const CapturedReadySlot value = slot->slot_value;
+            assign_output(out[i], value);
             if (task_id_snapshots != nullptr) task_id_snapshots[i] = slot->task_id_snapshot;
-            slot->sequence.store(static_cast<int64_t>(pos + i + mask + 1), std::memory_order_release);
+            if constexpr (Kind != PayloadKind::Plain) {
+                if constexpr (Kind == PayloadKind::Mix) debug_assert(value.tag().is_mix());
+                demand.add(value.tag());
+                has_demand |= !value.tag().is_empty();
+            } else {
+                slot->sequence.store(static_cast<int64_t>(pos + i + mask + 1), std::memory_order_release);
+            }
+        }
+        // Claimed cells remain unavailable to producers until every original tag/TaskId
+        // is captured and the whole batch demand is subtracted. Plain has no demand.
+        if constexpr (Kind != PayloadKind::Plain) {
+            if (has_demand) {
+                mixed_lanes.sub(demand);
+            }
+            for (int i = 0; i < count; ++i) {
+                slots[(pos + i) & mask].sequence.store(
+                    static_cast<int64_t>(pos + i + mask + 1), std::memory_order_release
+                );
+            }
         }
         return count;
     }
 
 #if SIMPLER_SCHED_PROFILING
-    int pop_batch(ChipTaskSlotState **out, int max_count, uint64_t &atomic_count, uint64_t &wait_cycle) {
+    template <PayloadKind Kind, typename Output>
+    int
+    pop_values(Output *out, TaskId *task_id_snapshots, int max_count, uint64_t &atomic_count, uint64_t &wait_cycle) {
         uint64_t pos;
         int count;
         uint64_t t0 = get_sys_cnt_aicpu();
@@ -417,11 +549,35 @@ struct alignas(64) ChipReadyQueue {
             atomic_ops++;  // failed CAS
         }
 
+        LaneDemandCounter::Batch demand;
+        bool has_demand = false;
         for (int i = 0; i < count; i++) {
             ChipReadyQueueSlot *slot = &slots[(pos + i) & mask];
-            out[i] = slot->slot_state;
-            slot->sequence.store(static_cast<int64_t>(pos + i + mask + 1), std::memory_order_release);
-            atomic_ops++;  // sequence.store
+            const CapturedReadySlot value = slot->slot_value;
+            assign_output(out[i], value);
+            if (task_id_snapshots != nullptr) task_id_snapshots[i] = slot->task_id_snapshot;
+            if constexpr (Kind != PayloadKind::Plain) {
+                if constexpr (Kind == PayloadKind::Mix) debug_assert(value.tag().is_mix());
+                demand.add(value.tag());
+                has_demand |= !value.tag().is_empty();
+            } else {
+                slot->sequence.store(static_cast<int64_t>(pos + i + mask + 1), std::memory_order_release);
+                atomic_ops++;  // sequence.store
+            }
+        }
+        // Claimed cells remain unavailable to producers until every original tag/TaskId
+        // is captured and the whole batch demand is subtracted. Plain has no demand.
+        if constexpr (Kind != PayloadKind::Plain) {
+            if (has_demand) {
+                mixed_lanes.sub(demand);
+                atomic_ops++;  // one aggregate demand RMW
+            }
+            for (int i = 0; i < count; ++i) {
+                slots[(pos + i) & mask].sequence.store(
+                    static_cast<int64_t>(pos + i + mask + 1), std::memory_order_release
+                );
+                atomic_ops++;  // sequence.store
+            }
         }
         atomic_count += atomic_ops;
         if (contended) {
@@ -431,6 +587,9 @@ struct alignas(64) ChipReadyQueue {
     }
 #endif
 };
+static_assert(sizeof(ChipReadyQueueSlot) == 24);
+static_assert(sizeof(ChipReadyQueue) == 192 && alignof(ChipReadyQueue) == 64);
+static_assert(offsetof(ChipReadyQueue, enqueue_pos) == 64 && offsetof(ChipReadyQueue, dequeue_pos) == 128);
 
 // Cold-path ready queue operations (defined in scheduler.cpp). Declared
 // as non-member so ChipReadyQueue stays a POD-like struct with cache-line
@@ -449,13 +608,6 @@ void ready_queue_init_data_from_layout(ChipReadyQueue *queue, uint64_t capacity)
 void ready_queue_wire_arena_pointers(ChipReadyQueue *queue, DeviceArena &arena, size_t slots_off);
 void ready_queue_destroy(ChipReadyQueue *queue);
 
-struct ReadyQueueCapacities {
-    uint64_t ready[NUM_RESOURCE_SHAPES]{};
-    uint64_t ready_sync[NUM_RESOURCE_SHAPES]{};
-    uint64_t dummy{0};
-    uint64_t graph_prepare{0};
-};
-
 /**
  * Statistics returned by mixed-task completion processing
  */
@@ -471,16 +623,6 @@ struct CompletionStats {
  * the arena offsets of every sub-region the scheduler needs plus the
  * capacities used at layout time (init_from_layout reuses them).
  */
-struct SchedulerLayout {
-    size_t off_ready_queue_slots[NUM_RESOURCE_SHAPES];
-    size_t off_ready_sync_queue_slots[NUM_RESOURCE_SHAPES];
-    size_t off_dummy_ready_queue_slots;
-    size_t off_graph_prepare_queue_slots;
-    size_t off_early_dispatch_queue_slots[NUM_RESOURCE_SHAPES];
-    size_t off_early_sync_start_queue_slots;
-    size_t off_ed_publish_drain_queue_slots;
-    ReadyQueueCapacities capacities;
-};
 
 /**
  * Scheduler state structure
@@ -522,9 +664,8 @@ struct SchedulerState {
     // An outer Graph is control work, never an AICore task, and it occupies no
     // ready queue of its own: a shell's readiness is acted on inline by
     // push_ready_routed's GRAPH branch, on the completion path. External
-    // dependency readiness and bounded materialization progress independently and
-    // meet at the submission's single atomic activation gate; this queue carries
-    // the materialization half alone.
+    // dependency readiness and bounded materialization progress independently;
+    // this queue carries materialization alone.
     ChipReadyQueue graph_prepare_queue;
 
     alignas(64) AsyncWaitList async_wait_list;
@@ -590,7 +731,7 @@ struct SchedulerState {
         // pending, and a cohort in that drain waits on cores that only these
         // doorbells free.
         if (slot_state->task_kind == TaskKind::GRAPH) {
-            (void)activate_graph_task(*slot_state);
+            (void)signal_graph_external_ready(*slot_state);
             return;
         }
         ResourceShape shape = slot_state->active_mask.to_shape();
@@ -599,9 +740,9 @@ struct SchedulerState {
             (slot_state->task_attrs.has_predicate() && !slot_state->to_payload().predicate.pass())) {
             pushed = dummy_ready_queue.push(slot_state);
         } else if (slot_state->task_attrs.requires_sync_start()) {
-            pushed = ready_sync_queues[static_cast<int32_t>(shape)].push(slot_state);
+            pushed = ready_sync_queues[static_cast<int32_t>(shape)].push_shaped(slot_state, shape);
         } else {
-            pushed = ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+            pushed = ready_queues[static_cast<int32_t>(shape)].push_shaped(slot_state, shape);
         }
         // Every ready / sync / dummy task routes to exactly one queue. A false
         // push means that queue's peak concurrent occupancy exceeded its
@@ -844,7 +985,7 @@ struct SchedulerState {
     // AICore task — mask, blocks and all — so the shell stages those instead.
     // Each is gated exactly like any pre-staged task and rings when the ordinary
     // route reaches it: the shell's own producers complete, push_ready_routed
-    // takes the GRAPH branch, and activate_graph_task opens the external gate
+    // takes the GRAPH branch, and signal_graph_external_ready opens the external gate
     // graph_route_ready_roots reads — all on the completion path, in the same
     // call an ordinary candidate's release takes. So the data dependency the
     // shell stands for is still honoured. The shell's own completion is a later
@@ -892,9 +1033,9 @@ struct SchedulerState {
         // choose an all-or-nothing local stage or the global-drain fallback.
         const bool queued =
             consumer.task_attrs.requires_sync_start() ?
-                early_sync_start_queue.push_tagged(&consumer, task_id) :
-                early_dispatch_queues[static_cast<int32_t>(consumer.active_mask.to_shape())].push_tagged(
-                    &consumer, task_id
+                early_sync_start_queue.push_sync_start(&consumer, task_id) :
+                early_dispatch_queues[static_cast<int32_t>(consumer.active_mask.to_shape())].push_shaped(
+                    &consumer, consumer.active_mask.to_shape(), task_id
                 );
         if (!queued) {
             expected = EARLY_DISPATCH_STAGING;
@@ -1147,7 +1288,7 @@ struct SchedulerState {
         return (previous & EARLY_SYNC_DRAIN_OWNER) != 0;
     }
 
-    inline void cancel_early_sync_drain(ChipTaskSlotState &slot_state) {
+    inline void cancel_early_sync_drain(ChipTaskSlotState &slot_state, CapturedReadySlot captured, TaskId task_id) {
         uint8_t previous =
             slot_state.to_payload().early_sync_drain_state.exchange(EARLY_SYNC_DRAIN_NONE, std::memory_order_seq_cst);
         if ((previous & EARLY_SYNC_DRAIN_OWNER) == 0) return;
@@ -1156,7 +1297,7 @@ struct SchedulerState {
             return;
         }
         if (slot_state.to_payload().early_dispatch_state.load(std::memory_order_seq_cst) == EARLY_DISPATCH_STAGING) {
-            early_sync_start_queue.push_tagged(&slot_state, slot_state.to_descriptor().task_id);
+            early_sync_start_queue.push_sync_start(captured, task_id);
         }
     }
 
@@ -1203,16 +1344,20 @@ struct SchedulerState {
         return true;
     }
 
-    int get_ready_tasks_batch(ChipReadyQueue *queues, ResourceShape shape, ChipTaskSlotState **out, int max_count) {
-        return queues[static_cast<int32_t>(shape)].pop_batch(out, max_count);
+    template <typename Output>
+    int get_ready_tasks_batch(ChipReadyQueue *queues, ResourceShape shape, Output *out, int max_count) {
+        return queues[static_cast<int32_t>(shape)].pop_shaped_batch(out, nullptr, max_count, shape);
     }
 
 #if SIMPLER_SCHED_PROFILING
+    template <typename Output>
     int get_ready_tasks_batch(
-        ChipReadyQueue *queues, ResourceShape shape, ChipTaskSlotState **out, int max_count, uint64_t &atomic_count,
+        ChipReadyQueue *queues, ResourceShape shape, Output *out, int max_count, uint64_t &atomic_count,
         uint64_t &wait_cycle
     ) {
-        return queues[static_cast<int32_t>(shape)].pop_batch(out, max_count, atomic_count, wait_cycle);
+        return queues[static_cast<int32_t>(shape)].pop_shaped_batch(
+            out, nullptr, max_count, shape, atomic_count, wait_cycle
+        );
     }
 #endif
 
@@ -1311,7 +1456,7 @@ struct SchedulerState {
     // Push every materialized-and-published root that has not been routed yet,
     // once the outer Graph task's external dependencies are ready.
     // route_cursor makes this idempotent, so it composes across the per-slice
-    // calls during materialization and the final call at the activation meet;
+    // publication calls and the external-readiness notification;
     // each root reaches the ready queue exactly once. Non-roots are never pushed
     // here — they reach the ready queue through their producers' wake list.
     int32_t graph_route_ready_roots(GraphExecution &execution) {
@@ -1361,14 +1506,12 @@ struct SchedulerState {
                 }
             }
         }
-        if (graph_execution_publish_tasks(execution, last)) graph_route_ready_roots(execution);
-    }
-
-    int32_t activate_prepared_graph(GraphExecution &execution) {
-        if (!graph_execution_transition(execution, GraphExecutionState::PREPARED, GraphExecutionState::ACTIVE)) {
-            return 0;
+        execution.published_tasks.store(last, std::memory_order_release);
+        // The later RMW acquires the earlier one: either this publisher sees READY,
+        // or the readiness caller sees the new range before claiming roots.
+        if (execution.control.fetch_or(0, std::memory_order_acq_rel) & GRAPH_EXECUTION_EXTERNAL_READY) {
+            graph_route_ready_roots(execution);
         }
-        return graph_route_ready_roots(execution);
     }
 
     // `image` is the calling thread's own view of this run's Definition section;
@@ -1383,11 +1526,8 @@ struct SchedulerState {
         const int32_t before = execution->materialized_tasks;
         const GraphMaterializeResult result =
             graph_execution_materialize_slice(outer_slot, *execution, image, max_tasks, tasks_materialized);
-        if (result == GraphMaterializeResult::PENDING || result == GraphMaterializeResult::PREPARED) {
+        if (result == GraphMaterializeResult::PENDING || result == GraphMaterializeResult::MATERIALIZED) {
             graph_incremental_publish(*execution, before, execution->materialized_tasks);
-        }
-        if (result == GraphMaterializeResult::PREPARED && graph_execution_external_ready(*execution)) {
-            activate_prepared_graph(*execution);
         }
         return result;
     }
@@ -1396,22 +1536,16 @@ struct SchedulerState {
     // the shell's producers resolve, which is the same completion-path event that
     // releases an ordinary early-dispatch consumer.
     //
-    // Routing reads external_ready alone (graph_route_ready_roots), so it must not
-    // be gated on the PREPARED -> ACTIVE flip: a shell can resolve while its body is
-    // still MATERIALIZING, and complete_in_graph_task already admits an in-graph
-    // completion in that state. The flip is bookkeeping owned by whichever side finds
-    // the graph PREPARED first — this call, or prepare_graph_task's trailing
-    // activate_prepared_graph — and a graph that stays PREPARED routes and retires
-    // exactly the same.
+    // A published root can run while the graph is SUBMITTED. Lifecycle phase
+    // does not gate routing: only external readiness and the published range do.
     //
     // Every staged root is covered: staging claims roots below published_tasks at
     // claim time, published_tasks only grows, and route_cursor starts at 0, so the
     // range this routes is a superset of what was staged.
-    int32_t activate_graph_task(ChipTaskSlotState &outer_slot) {
+    int32_t signal_graph_external_ready(ChipTaskSlotState &outer_slot) {
         GraphExecution *execution = graph_execution_from_outer_slot(outer_slot);
         if (execution == nullptr) return 0;
         graph_execution_signal_external_ready(*execution);
-        (void)graph_execution_transition(*execution, GraphExecutionState::PREPARED, GraphExecutionState::ACTIVE);
         return graph_route_ready_roots(*execution);
     }
 
@@ -1447,16 +1581,13 @@ struct SchedulerState {
         // Membership is established by the branch above: graph_context names this task's
         // execution, and the shell case has already returned.
         GraphExecution *execution = static_cast<GraphExecution *>(slot_state.graph_context);
-        if (execution->definition_offset == 0 || execution->tasks == nullptr) {
+        if (execution->definition_offset == 0 || execution->task_storage == nullptr) {
             outcome.error_code = SIMPLER_ERROR_INVALID_ARGS;
             return outcome;
         }
-        // Incremental activation routes a sub-task before the graph reaches
-        // ACTIVE, so one can legitimately complete while the graph is still
-        // MATERIALIZING or PREPARED. Only SUBMITTED (execution not yet bound) and
-        // COMPLETED (execution already retired) are invalid states for such a completion.
-        const GraphExecutionState graph_state = graph_execution_state(*execution);
-        if (graph_state < GraphExecutionState::MATERIALIZING || graph_state > GraphExecutionState::ACTIVE) {
+        // A published sub-task can complete before the whole body is materialized.
+        const GraphExecutionPhase phase = graph_execution_phase(*execution);
+        if (phase != GraphExecutionPhase::SUBMITTED && phase != GraphExecutionPhase::MATERIALIZED) {
             outcome.error_code = SIMPLER_ERROR_INVALID_ARGS;
             return outcome;
         }
