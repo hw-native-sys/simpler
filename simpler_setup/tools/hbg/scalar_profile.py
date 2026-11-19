@@ -13,99 +13,132 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-SCALAR_FUNCTIONS = {
-    "scalar_completions": "scheduler_complete_own_slot",
-    "scalar_graph_control": "scheduler_service_controls",
-    "scalar_executor_scan": "run_ready_dispatch_loop: peek ready head",
-    "scalar_prepare": "run_ready_dispatch_loop: prepare execution",
-    "scalar_seal": "run_ready_dispatch_loop: seal execution",
-    "scalar_async_service": "scheduler_service_async_slice",
-    "scalar_execution_token_progress": "scheduler_progress_execution_tokens",
-    "scalar_execution_token_refill": "scheduler_refill_execution_tokens",
-    "scalar_execution_token_receive": "scheduler_execution_token_receive",
-    "scalar_advance_mix_floor": "scheduler_advance_mix_floor",
-    "scalar_self_order_ready": "scheduler_self_order_ready",
-    "scalar_mix_lane_order_ready": "scheduler_mix_lane_order_ready",
-    "scalar_cluster_owes_before": "scheduler_cluster_owes_before",
-    "scalar_cluster_mix_account": "scheduler_cluster_mix_account",
-    "scalar_cluster_mix_dependencies": "scheduler_cluster_mix_dependencies",
-    "scalar_cluster_mix_prepare_member": "scheduler_cluster_mix_prepare_member",
-    "scalar_cluster_mix_recycle": "scheduler_cluster_mix_recycle",
-    "scalar_execution_token_select": "scheduler_select_execution_token",
-    "scalar_fanin_observe": "scheduler_observe_fanin_prefix",
-    "scalar_fill_own_slots": "scheduler_fill_own_slots",
-    "scalar_cluster_mix_service": "scheduler_cluster_mix_service",
-    "scalar_cluster_mix_discover_task": "scheduler_cluster_mix_claim_head",
-    "scalar_cluster_mix_discover_next": "scheduler_cluster_mix_discover_next",
-    "scalar_cluster_mix_pending": "scheduler_cluster_mix_progress_pending",
-    "scalar_cluster_mix_observe": "scheduler_cluster_mix_observe",
-    "scalar_cluster_mix_enter": "scheduler_cluster_mix_can_enter",
-    "scalar_cluster_mix_release": "scheduler_cluster_mix_release",
-    "scalar_cluster_mix_drain": "scheduler_cluster_mix_drain",
-    "scalar_cluster_mix_all": "scheduler_cluster_mix_all",
-    "scalar_prepared_receive": "scheduler_receive_execution_token",
-    "scalar_prepared_acquire": "scheduler_acquire_execution_token",
-    "scalar_prepared_claim": "scheduler_claim_execution_token",
-    "scalar_counter_accounting": "scheduler_service_counter_accounting",
-    "scalar_prepared_return": "scheduler_return_prepared_execution",
-    "scalar_prepared_observe": "scheduler_observe_prepared_call",
-    "scalar_prepared_index": "scheduler_prepared_execution_index",
-    "scalar_prepared_validate": "scheduler_prepared_call_valid",
-    "scalar_group_reserve": "scheduler_reserve_group_execution",
-    "scalar_group_arm": "scheduler_arm_group_execution",
-    "scalar_group_acquire": "scheduler_acquire_group_lane",
-    "scalar_execution_continuation": "scheduler_try_execution_continuation",
-    "scalar_execution_token_fanin": "scheduler_execution_token_observe_fanin",
-    "scalar_task_issue_head": "scheduler_query_issue_head",
-    "scalar_task_issue_fanin": "scheduler_issue_fanin_ready",
-    "scalar_task_supply_closed": "scheduler_task_supply_closed",
-    "scalar_service_cooperative_slots": "scheduler_service_groups",
-    "scalar_ordinary_block_claim": "scheduler_claim_ordinary_block",
-    "scalar_task_completion_observe": "scheduler_observe_task_completion",
-    "scalar_cached_completion_observe": "scheduler_observe_cached_completion(source)",
-    "scalar_cached_completion_lookup": "scheduler_observe_cached_completion(base)",
-    "scalar_subtask_contribute": "scheduler_contribute_subtask",
-    "scalar_mix_group_contribute": "scheduler_contribute_mix_group",
-    "scalar_returns_contribute": "scheduler_contribute_returns",
-    "scalar_counter_condition_publish": "scheduler_counter_publish_condition",
-    "scalar_execution_identity_capture": "scheduler_capture_execution_identity",
-    "scalar_async_begin_prebound": "scheduler_async_begin_prebound_execution",
-    "scalar_async_seal_execution": "scheduler_async_seal_execution",
-    "scalar_async_close_computation": "scheduler_async_close_computation",
-    "scalar_cluster_mix_service_active": "scheduler_cluster_mix_service_active",
-    "scalar_graph_fanin_view": "scheduler_node_fanin_view",
-    "scalar_graph_payload_arguments": "scheduler_parse_task_payload_arguments",
-    "scalar_publish_idle": "publish_deferred_idle_activity",
-    "scalar_trace_before_execution": "stage_task_trace_before_execution",
-    "scalar_trace_before_completion": "stage_task_trace_before_completion",
-    "scalar_async_check": "scheduler_async_check_step",
-    "scalar_async_finish": "scheduler_async_complete_task",
-    "scalar_bootstrap": "bootstrap_ready_graph",
-    "scalar_bootstrap_init_wait": "bootstrap_ready_graph: cluster initialization wait",
-    "scalar_bootstrap_peer_wait": "bootstrap_ready_graph: cluster first-fill wait",
-    "scalar_bootstrap_topology": "scheduler_validate_resident_topology",
-    "scalar_launch_wait": "run_resident_scheduler: launch wait",
-    "scalar_exit_drain": "run_resident_scheduler: exit drain",
-    "scalar_cache_observe": "scheduler_observe_data_cache",
-    "scalar_cache_publish": "scheduler_publish_dispatch_slot: payload writeback",
-    "scalar_flush_completions": "scheduler_flush_completions",
-    "scalar_loop_control": "run_ready_dispatch_loop: exit/error checks",
-    "scalar_dispatch_metadata": "scheduler_load_dispatch_metadata",
-    "scalar_dispatch_publish": "scheduler_publish_dispatch_slot",
-    "scalar_trace_finish": "SchedulerScalarTrace::finish",
-    "scalar_trace_finish_clean": "SchedulerScalarTrace::finish: DCCI issue",
-    "scalar_trace_finish_barrier": "SchedulerScalarTrace::finish: DSB",
-    "scalar_atomic_cas": "atomicCAS: return ready",
-    "scalar_atomic_store_issue": "atomicExch: issue (unused result)",
-    "scalar_atomic_fetch_add": "atomicAdd: return ready",
-    "scalar_atomic_fetch_add_issue": "atomicAdd: issue (unused result)",
-    "scalar_dcci_out": "DCCI: SINGLE CACHELINE_OUT issue",
-    "scalar_dcci_single": "DCCI: SINGLE CACHELINE_ALL issue",
-    "scalar_dcci_entire": "DCCI: ENTIRE_DATA_CACHE issue",
-    "scalar_dsb_all": "DSB: ALL completion wait",
-    "scalar_dsb_ddr": "DSB: DDR completion wait",
-    "scalar_bypass_load": "ld_dev: return ready",
-    "scalar_bypass_store": "st_dev: issue",
+# Map each device record kind to its scheduler stage and device function.
+SCALAR_OPERATIONS = {
+    "scalar_task_issue_head": ("DISCOVER", "scheduler_find_issuable_task"),
+    "scalar_task_issue_fanin": ("DISCOVER", "scheduler_check_predecessor_supply"),
+    "scalar_task_supply_closed": ("DISCOVER", "scheduler_task_supply_closed"),
+    "scalar_cluster_mix_discover_task": ("CLAIM_BUILD", "scheduler_claim_for_build"),
+    "scalar_prepared_receive": ("BUILD", "scheduler_receive_payload"),
+    "scalar_prepared_observe": ("BUILD", "scheduler_observe_prepared_call"),
+    "scalar_prepared_validate": ("BUILD", "scheduler_prepared_call_valid"),
+    "scalar_build_payload": ("BUILD", "scheduler_build_payload"),
+    "scalar_publish_built": ("BUILD", "scheduler_publish_built"),
+    "scalar_cache_publish": ("BUILD", "scheduler_publish_dispatch_slot: payload writeback"),
+    "scalar_dispatch_metadata": ("BUILD", "scheduler_load_dispatch_metadata"),
+    "scalar_prepared_claim": ("CLAIM_EXECUTE", "scheduler_claim_for_execution"),
+    "scalar_execution_token_fanin": ("FANIN_WAIT", "scheduler_poll_fanin"),
+    "scalar_fanin_observe": ("FANIN_WAIT", "scheduler_observe_fanin_prefix"),
+    "scalar_cluster_mix_dependencies": ("FANIN_WAIT", "scheduler_poll_mix_fanin"),
+    "scalar_subtask_contribute": ("FANOUT_PUBLISH", "scheduler_publish_fanout"),
+    "scalar_mix_group_contribute": ("FANOUT_PUBLISH", "scheduler_publish_fanout"),
+    "scalar_returns_contribute": ("FANOUT_PUBLISH", "scheduler_contribute_returns"),
+    "scalar_counter_condition_publish": ("FANOUT_PUBLISH", "scheduler_counter_publish_condition"),
+    "scalar_async_finish": ("FANOUT_PUBLISH", "scheduler_async_complete_task"),
+    "scalar_can_enter_execution": ("ENTRY_PERMIT", "scheduler_check_entry_permit"),
+    "scalar_self_order_ready": ("ENTRY_PERMIT", "scheduler_self_order_ready"),
+    "scalar_mix_lane_order_ready": ("ENTRY_PERMIT", "scheduler_mix_lane_order_ready"),
+    "scalar_cluster_owes_before": ("ENTRY_PERMIT", "scheduler_cluster_owes_before"),
+    "scalar_cluster_mix_enter": ("ENTRY_PERMIT", "scheduler_cluster_mix_can_enter"),
+    "scalar_prepare": ("ENTRY_PREP", "prepare_kernel_entry"),
+    "scalar_cache_observe": ("ENTRY_PREP", "scheduler_observe_data_cache"),
+    "scalar_async_begin_prebound": ("ENTRY_PREP", "scheduler_async_begin_prebound_execution"),
+    "scalar_executor_scan": ("SELECT", "inspect_ready_slot"),
+    "scalar_execution_token_select": ("SELECT", "mark_owned_execution_ready"),
+    "scalar_select_owned_execution": ("SELECT", "scheduler_select_owned_execution"),
+    "scalar_advance_mix_floor": ("MIX_SYNC", "scheduler_advance_mix_floor"),
+    "scalar_cluster_mix_observe": ("MIX_SYNC", "scheduler_cluster_mix_observe"),
+    "scalar_cluster_mix_all": ("MIX_SYNC", "scheduler_cluster_mix_all"),
+    "scalar_prepared_return": ("RETIRE", "scheduler_return_prepared_execution"),
+    "scalar_retire_execution": ("RETIRE", "scheduler_retire_execution"),
+    "scalar_cluster_mix_release": ("RETIRE", "scheduler_release_mix_lane"),
+    "scalar_cluster_mix_recycle": ("RETIRE", "scheduler_cluster_mix_recycle"),
+    "scalar_seal": ("RETIRE", "seal_kernel_return"),
+    "scalar_async_seal_execution": ("RETIRE", "scheduler_async_seal_execution"),
+    "scalar_completions": ("COMPLETE", "scheduler_complete_lane_execution"),
+    "scalar_async_close_computation": ("COMPLETE", "scheduler_async_close_computation"),
+    "scalar_cluster_mix_account": ("COMPLETE", "scheduler_account_mix_returns"),
+    "scalar_flush_completions": ("COMPLETE", "scheduler_flush_completions"),
+    "scalar_graph_control": ("CONTROL", "scheduler_progress_graph_controls"),
+    "scalar_counter_accounting": ("CONTROL", "scheduler_account_completed_tasks"),
+    "scalar_loop_control": ("CONTROL", "check_exit_or_error"),
+    "scalar_async_service": ("CONTROL", "scheduler_service_async_slice"),
+    "scalar_async_check": ("CONTROL", "scheduler_async_check_step"),
+    "scalar_execution_token_progress": ("DISPATCH", "scheduler_progress_execution_tokens"),
+    "scalar_execution_token_refill": ("DISPATCH", "scheduler_refill_execution_tokens"),
+    "scalar_execution_token_receive": ("DISPATCH", "scheduler_bind_ticketed_execution"),
+    "scalar_fill_own_slots": ("DISPATCH", "scheduler_find_local_execution"),
+    "scalar_cluster_mix_service": ("DISPATCH", "scheduler_cluster_mix_service"),
+    "scalar_cluster_mix_discover_next": ("DISPATCH", "scheduler_cluster_mix_discover_next"),
+    "scalar_cluster_mix_pending": ("DISPATCH", "scheduler_progress_mix_publication"),
+    "scalar_cluster_mix_prepare_member": ("DISPATCH", "scheduler_prepare_mix_lane"),
+    "scalar_prepared_acquire": ("DISPATCH", "scheduler_claim_and_receive_payload"),
+    "scalar_group_acquire": ("DISPATCH", "scheduler_acquire_group_lane"),
+    "scalar_execution_continuation": ("DISPATCH", "scheduler_continue_same_task"),
+    "scalar_service_cooperative_slots": ("DISPATCH", "scheduler_progress_mix_groups"),
+    "scalar_cluster_mix_service_active": ("DISPATCH", "scheduler_cluster_mix_service_active"),
+    "scalar_dispatch_publish": ("DISPATCH", "scheduler_publish_dispatch_slot"),
+    "scalar_ordinary_block_claim": ("CLAIM", "scheduler_claim_ticket"),
+    "scalar_task_completion_observe": ("OBSERVE", "scheduler_observe_task_completion"),
+    "scalar_cached_completion_observe": ("OBSERVE", "scheduler_observe_cached_completion(source)"),
+    "scalar_cached_completion_lookup": ("OBSERVE", "scheduler_observe_cached_completion(base)"),
+    "scalar_graph_fanin_view": ("OBSERVE", "scheduler_node_fanin_view"),
+    "scalar_prepared_index": ("OBSERVE", "scheduler_prepared_execution_index"),
+    "scalar_execution_identity_capture": ("TRACE", "scheduler_capture_execution_identity"),
+    "scalar_graph_payload_arguments": ("TRACE", "scheduler_parse_task_payload_arguments"),
+    "scalar_publish_idle": ("TRACE", "publish_deferred_idle_activity"),
+    "scalar_trace_before_execution": ("TRACE", "stage_task_trace_before_execution"),
+    "scalar_trace_before_completion": ("TRACE", "stage_task_trace_before_completion"),
+    "scalar_trace_append": ("TRACE", "SchedulerScalarTrace::append"),
+    "scalar_end_iteration": ("TRACE", "SchedulerScalarTrace::end_iteration"),
+    "scalar_trace_finish": ("TRACE", "SchedulerScalarTrace::finish"),
+    "scalar_trace_finish_clean": ("TRACE", "SchedulerScalarTrace::finish: DCCI issue"),
+    "scalar_trace_finish_barrier": ("TRACE", "SchedulerScalarTrace::finish: DSB"),
+    "scalar_bootstrap": ("START", "bootstrap_ready_graph"),
+    "scalar_bootstrap_init_wait": ("START", "bootstrap_ready_graph: cluster initialization wait"),
+    "scalar_bootstrap_peer_wait": ("START", "bootstrap_ready_graph: cluster first-fill wait"),
+    "scalar_bootstrap_topology": ("START", "scheduler_validate_resident_topology"),
+    "scalar_launch_wait": ("START", "run_resident_scheduler: launch wait"),
+    "scalar_exit_drain": ("EXIT", "run_resident_scheduler: exit drain"),
+    "scalar_cluster_mix_drain": ("EXIT", "scheduler_cluster_mix_drain"),
+    "scalar_atomic_cas": ("MEM", "atomicCAS: return ready"),
+    "scalar_atomic_store_issue": ("MEM", "atomicExch: issue (unused result)"),
+    "scalar_atomic_fetch_add": ("MEM", "atomicAdd: return ready"),
+    "scalar_atomic_fetch_add_issue": ("MEM", "atomicAdd: issue (unused result)"),
+    "scalar_dcci_out": ("MEM", "DCCI: SINGLE CACHELINE_OUT issue"),
+    "scalar_dcci_single": ("MEM", "DCCI: SINGLE CACHELINE_ALL issue"),
+    "scalar_dcci_entire": ("MEM", "DCCI: ENTIRE_DATA_CACHE issue"),
+    "scalar_dsb_all": ("MEM", "DSB: ALL completion wait"),
+    "scalar_dsb_ddr": ("MEM", "DSB: DDR completion wait"),
+    "scalar_bypass_load": ("MEM", "ld_dev: return ready"),
+    "scalar_bypass_store": ("MEM", "st_dev: issue"),
+}
+
+SCALAR_FUNCTIONS = {kind: operation for kind, (_, operation) in SCALAR_OPERATIONS.items()}
+
+STAGE_COLORS = {
+    "DISCOVER": "thread_state_runnable",
+    "CLAIM_BUILD": "rail_load",
+    "BUILD": "rail_animation",
+    "CLAIM_EXECUTE": "rail_response",
+    "FANIN_WAIT": "thread_state_iowait",
+    "EXECUTE": "good",
+    "FANOUT_PUBLISH": "rail_idle",
+    "ENTRY_PERMIT": "thread_state_iowait",
+    "ENTRY_PREP": "thread_state_runnable",
+    "SELECT": "thread_state_runnable",
+    "MIX_SYNC": "thread_state_uninterruptible",
+    "RETIRE": "rail_idle",
+    "COMPLETE": "cq_build_passed",
+    "CONTROL": "thread_state_unknown",
+    "DISPATCH": "generic_work",
+    "CLAIM": "rail_response",
+    "OBSERVE": "generic_work",
+    "TRACE": "grey",
+    "START": "thread_state_runnable",
+    "EXIT": "grey",
+    "MEM": "generic_work",
+    "SKIP": "grey",
 }
 
 
@@ -177,6 +210,13 @@ def partition(records, kernels, *, nested_kernels=False):
     for node in positive:
         cursor = node["start_cycles"]
         kind = "scalar_unattributed" if node["kind"] == "scalar_window" else node["kind"]
+        if not nested_kernels:
+            # Propagate a stage only to direct callees at the recorded depth. A filtered frame may have its own stage.
+            parent_depth = node.get("raw_scalar_depth", node["scalar_depth"])
+            parent_stage = node.get("hbg_stage") or _business_stage(node["kind"])
+            for child in node["children"]:
+                if child.get("raw_scalar_depth", child["scalar_depth"]) == parent_depth + 1:
+                    child["hbg_stage"] = _business_stage(child["kind"], node["kind"], parent_stage)
         for child in [*node["children"], {"start_cycles": node["end_cycles"], "end_cycles": node["end_cycles"]}]:
             if child["start_cycles"] > cursor:
                 segments.append(
@@ -221,6 +261,7 @@ def analyze_streams(streams, metadata, task_rows, execution_identities=None, *, 
         kernels[(worker, epoch)].append(
             {
                 "task_id": task,
+                **({} if nested_kernels else {"reg_task_id": registration}),
                 "start_cycles": begin,
                 "end_cycles": end,
                 "run_epoch": epoch,
@@ -266,7 +307,25 @@ def analyze_streams(streams, metadata, task_rows, execution_identities=None, *, 
     return profiles
 
 
-def trace_events(profiles, *, pid, tid_base, display, streams=None, function_names=None):
+def _business_stage(kind, caller=None, caller_stage=None):
+    if kind == "scalar_window":
+        return None
+    if kind == "scalar_kernel":
+        return "EXECUTE"
+    if kind == "scalar_task_skip":
+        return "SKIP"
+    stage = SCALAR_OPERATIONS[kind][0]
+    if kind == "scalar_ordinary_block_claim":
+        if caller == "scalar_cluster_mix_discover_task":
+            return "CLAIM_BUILD"
+        if caller in ("scalar_execution_token_refill", "scalar_execution_continuation"):
+            return "CLAIM_EXECUTE"
+    if stage in ("MEM", "OBSERVE") and caller_stage not in (None, "DISPATCH", "MEM", "OBSERVE", "CLAIM"):
+        return caller_stage
+    return stage
+
+
+def trace_events(profiles, *, pid, tid_base, display, streams=None, function_names=None, kernel_labels=None):
     """Render one nested Scalar lane per core using the capture's core identity."""
     lanes = {
         stream.get("scheduler_id", index): (index, stream)
@@ -299,15 +358,23 @@ def trace_events(profiles, *, pid, tid_base, display, streams=None, function_nam
         )
         rows = sorted(profile["rows"], key=lambda r: (r["start_time_us"], -r["end_time_us"], r.get("scalar_depth", 0)))
         for row in rows:
-            kind = row["kind"]
+            kind: str = row["kind"]
             if kind == "scalar_window":
                 continue
-            name = (SCALAR_FUNCTIONS if function_names is None else function_names).get(
-                kind, kind.removeprefix("scalar_")
-            )
-            if row.get("task_id") is not None:
-                name += f"({display(row['task_id'])})"
+            names = SCALAR_FUNCTIONS if function_names is None else function_names
+            operation = names.get(kind, kind.removeprefix("scalar_"))
+            suffix = f"({display(row['task_id'])})" if row.get("task_id") is not None else ""
             args = {k: v for k, v in row.items() if k not in ("start_time_us", "end_time_us")}
+            name = operation + suffix
+            stage = args.get("hbg_stage")
+            if function_names is None:
+                stage = stage or _business_stage(kind)
+                args["hbg_stage"] = stage
+                name = operation.removeprefix("scheduler_") + suffix
+                if kernel_labels and kind in ("scalar_kernel", "scalar_task_skip"):
+                    key = (row["run_epoch"], worker, row.get("reg_task_id"))
+                    name = kernel_labels.get(key, name)
+                name = f"{stage} · {name}"
             args["capture_complete"] = profile["complete"]
             # Subtract integer counters before conversion, avoiding cancellation
             # and floating-point tails in the exported per-operation durations.
@@ -326,7 +393,9 @@ def trace_events(profiles, *, pid, tid_base, display, streams=None, function_nam
                     "ts": row["start_time_us"],
                     "dur": duration,
                     "args": args,
-                    "cname": "grey"
+                    "cname": STAGE_COLORS[stage]
+                    if stage is not None
+                    else "grey"
                     if kind == "scalar_unattributed"
                     else "good"
                     if kind == "scalar_kernel"

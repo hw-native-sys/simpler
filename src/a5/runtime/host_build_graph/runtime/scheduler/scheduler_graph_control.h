@@ -19,7 +19,7 @@ inline constexpr uint32_t SCHEDULER_CONTROL_NODE_BUDGET = 8;
 // Control and inline nodes have no runtime argument construction or kernel.
 // A ready node may publish an idempotent notification before the CAS that
 // assigns its unique canonical accounting responsibility.
-static inline __aicore__ bool scheduler_service_controls(
+static inline __aicore__ bool scheduler_progress_graph_controls(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint64_t profiling_level, bool *progress
 ) {

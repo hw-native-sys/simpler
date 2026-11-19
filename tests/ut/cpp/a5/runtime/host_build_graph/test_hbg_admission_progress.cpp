@@ -73,7 +73,7 @@ public:
     bool next(uint32_t worker, uint32_t *selected) {
         bool failed = false;
         for (uint32_t n = 0; n <= 2 * graph.graph().task_count + SCHEDULER_EXECUTION_TOKEN_COUNT; ++n) {
-            scheduler_fill_own_slots(graph.graph(), base(), locals[worker], run(), 0, &failed, selected);
+            scheduler_find_local_execution(graph.graph(), base(), locals[worker], run(), 0, &failed, selected);
             if (failed || *selected != UINT32_MAX) break;
         }
         return !failed;
@@ -81,9 +81,9 @@ public:
     bool finish(uint32_t worker, uint32_t selected) {
         bool allow = false;
         auto *local = locals[worker];
-        return scheduler_can_enter_execution(graph.graph(), base(), local, run(), selected, &allow) && allow &&
+        return scheduler_check_entry_permit(graph.graph(), base(), local, run(), selected, &allow) && allow &&
                hbg_test_begin_execution(local, selected) &&
-               scheduler_complete_own_slot(graph.graph(), base(), local, run(), selected, 0);
+               scheduler_complete_lane_execution(graph.graph(), base(), local, run(), selected, 0);
     }
     static SchedulerSpmdRequirements requirements(std::initializer_list<Task> tasks) {
         SchedulerSpmdRequirements req{6, 2};
@@ -155,16 +155,16 @@ TEST(HbgResourceOrder, PureCohortWaitsForBothPublicationFloorAndItsOwnEarlierLan
     };
     ASSERT_TRUE(allowed());
     EXPECT_FALSE(ready);
-    scheduler_cluster_store_field(&signal.rank, f.order(0).rank);
-    scheduler_cluster_store_field(&signal.active_mask, UINT32_C(7));
-    scheduler_cluster_store_release(&signal.armed_generation, UINT32_C(3));
+    scheduler_cluster_store_field(&signal.groups[0].rank, f.order(0).rank);
+    scheduler_cluster_store_field(&signal.groups[0].active_mask, UINT32_C(7));
+    scheduler_cluster_store_release(&signal.groups[0].armed_generation, UINT32_C(3));
     scheduler_cluster_store_release(&signal.mix_floor, required);
     ASSERT_TRUE(allowed());
     EXPECT_FALSE(ready);
-    scheduler_cluster_store_release(&signal.finished[2], UINT32_C(1));
+    scheduler_cluster_store_release(&signal.groups[0].finished[2], UINT32_C(1));
     ASSERT_TRUE(allowed());
     EXPECT_FALSE(ready);
-    scheduler_cluster_store_release(&signal.finished[2], UINT32_C(3));
+    scheduler_cluster_store_release(&signal.groups[0].finished[2], UINT32_C(3));
     ASSERT_TRUE(allowed());
     EXPECT_TRUE(ready);
 }

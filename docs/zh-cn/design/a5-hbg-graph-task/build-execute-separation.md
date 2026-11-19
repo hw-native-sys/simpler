@@ -111,7 +111,7 @@ pending 可以等待尚未发布的元数据、真实计算依赖、本组 MIX �
 
 一次选择只产生短期引用 `(来源, 原位置, 身份)`，运行中以 `(run_epoch, 实例 node_ref, block, lane)` 标识真实 execution，MIX 再带 cluster 和 generation。选择和 kernel 入口在同一次推进中完成。执行器按来源引用直接访问原记录。许可暂未满足时，原记录和 owner 保持有效，下个有界机会继续。predicate、业务输入获取、动态 context、错误检查和最终许可仍在各自有效边界执行。
 
-W 表示每核可持有的全局自取且未退休的 block 数。当前默认 **W=1**；比较窗口深度时使用同一执行路径。正在执行的自取 block 占其中一份，来自 MIX 的 block 使用自己的组记录。同一核同时只执行一个 kernel。AIV0 为 MIX 领取的是组责任，即使它也是计算成员，同一 block 也只走 MIX 来源一次。SSBUF 描述符、prepared Call/Binding、DFX 轨迹和异步 CHECK 记录各有自己的寿命，不计入 W。结构验证后只改变 **W** 做容量对照。本核持有 A 等待前驱 X 时，若独立的 B 已允许分发，深度至少为 2 时可提前领取 B。W=3 和 W=4 还分别能保留一份、两份已允许分发的 block。W=1 须等 A 退休才能自取 B。各深度均保持固定 owner。
+W 表示每核可持有的全局自取且未退休的 block 数。当前为 **W=2**；比较窗口深度时使用同一执行路径。正在执行的自取 block 占其中一份，来自 MIX 的 block 使用自己的组记录。同一核同时只执行一个 kernel。AIV0 为 MIX 领取的是组责任，即使它也是计算成员，同一 block 也只走 MIX 来源一次。SSBUF 描述符、prepared Call/Binding、DFX 轨迹和异步 CHECK 记录各有自己的寿命，不计入 W。结构验证后只改变 **W** 做容量对照。本核持有 A 等待前驱 X 时，若独立的 B 已允许分发，深度至少为 2 时可提前领取 B。W=3 和 W=4 还分别能保留一份、两份已允许分发的 block。W=1 须等 A 退休才能自取 B。各深度均保持固定 owner。
 
 ```text
 每核循环
@@ -248,7 +248,7 @@ percounter 的实现位于 `src/a5/runtime/percounter/host/region_plan.h::build_
 
 ### Device 沿拓扑目录任务分发，前项全体发完再推进
 
-`scheduler_query_issue_head` 使用本核目录游标及已关闭前缀。**依赖图给出偏序，Host 把它排成满足约束的确定顺序；Device 不临时重新选序。** 同类目录中，前项所有有效执行票发完或按协议合法终结，才能领取后项。跨引擎没有依赖的目录项可以各自推进；有依赖时还须确认另一类前驱已全部完成任务分发或合法终结。实际调用另外等待数据 DONE、Graph 激活及资源许可。
+`scheduler_find_issuable_task` 使用本核目录游标及已关闭前缀。**依赖图给出偏序，Host 把它排成满足约束的确定顺序；Device 不临时重新选序。** 同类目录中，前项所有有效执行票发完或按协议合法终结，才能领取后项。跨引擎没有依赖的目录项可以各自推进；有依赖时还须确认另一类前驱已全部完成任务分发或合法终结。实际调用另外等待数据 DONE、Graph 激活及资源许可。
 
 | 当前情况 | 处理 |
 | -------- | ---- |
@@ -321,9 +321,9 @@ A5 模拟器读取 Host 对象中的 `resolved_addr()`。A2/A3、TMR 和公共 R
 
 ### 自取窗口的深度与执行责任
 
-W 表示每个物理 worker 能同时持有的未退休自取 block 数。发布版本采用 W1，每核另有一个独立的 MIX 成员记录；执行中的 block 也占其来源位置。自取窗口深度只改变待运行工作的持有量，单核一次仍执行一个 kernel。
+W 表示每个物理 worker 能同时持有的未退休自取 block 数。当前采用 W2，每核另有两份独立的 MIX 成员记录，分别对应两个 SSBUF bank；执行中的 block 也占其来源位置。自取窗口深度只改变待运行工作的持有量，单核一次仍执行一个 kernel。
 
-2026-11-18 的同结构 W1–W4 对照每组同设备预热 1 次、测量 10 次，按轮换顺序运行。12 项 AICore L0 均值总和为 W1 18.068514 ms、W4 18.234993 ms，W1 低 0.91%。其中 11 个回放用例逐版通过数值校验，原生 MoE 的 72/72 只记录性能运行。单个 SWA 的 W1/W4 为 0.209540/0.213708 ms，原生 MoE 为 0.604940/0.604284 ms。W1 是这批负载下的默认选择；其他图的依赖宽度、MIX 比例和控制服务会改变最合适的深度。
+2026-11-18 的同结构 W1–W4 对照每组同设备预热 1 次、测量 10 次，按轮换顺序运行。12 项 AICore L0 均值总和为 W1 18.068514 ms、W4 18.234993 ms，W1 低 0.91%。其中 11 个回放用例逐版通过数值校验，原生 MoE 的 72/72 只记录性能运行。单个 SWA 的 W1/W4 为 0.209540/0.213708 ms，原生 MoE 为 0.604940/0.604284 ms。当时依据这批负载选择了 W1；其他图的依赖宽度、MIX 比例和控制服务会改变最合适的深度。
 
 以下名称是目标协议，不表示当前源码已有同名状态：
 
@@ -371,13 +371,13 @@ flowchart LR
 | ---- | ------------------ | --------------------------------- |
 | 有序供给、选择本地空位 | 头部进度、前驱供给、本核去重与控制门槛；关闭证明与任务分发竞争另计 | 否；已有可执行 token 不依赖新的补给 |
 | 初次分配具体 block | 单 block 从 `next_block` 取票；多 block 从分区计数器取票，分区最后一个有效领取者汇总容量 | 否，已持有记录可直接接续 |
-| 初次授予单元所有权 | 普通有效 FAA 票直接确定 owner；执行记录为本核诊断，不再追加 Claim CAS；cooperative 保留原子交权 | 否；应已持票并完成接收 |
+| 初次授予单元所有权 | 普通任务的有效 FAA 确定 owner。MIX 由代理领取组任务，SSBUF 有效代和参与掩码确定各成员的执行权 | 否；应已持票并完成接收 |
 | 读取固定 Call／接收 Binding | Call 复用本轮启动观察；Binding 两行 DCCI、尾 DSB 和私有元数据缓存 | 否；等待期间保留已完成的接收，不因等待重新竞争执行权 |
 | 检查依赖和最终许可 | 只推进未确认的 fanin 前缀；动态许可按实际合同观察 | 是；不能用旧观察替代新出现的条件 |
 | `WAIT_FANIN → INFLIGHT` | 唯一 owner 的私有状态转换，不新增领取 FAA/CAS 或本核 ready 队列原子 | 是；同一 helper 继续调用 |
 | kernel 返回及完成发布 | 保留执行权退休、N/C/D 贡献、输出发布和必要协作操作 | 是；不能把完成成本藏在 kernel 时间内 |
 
-普通单元首次有效分配由一条 FAA 授予不可撤销的 block/lane 票，后续接收不再独立竞争执行记录。票限定的执行记录标记 TICKET_OWNED，整个128B区域仅由该 owner 更新，使用普通 store、单行 DCCI、尾 DSB 发布 CLAIMED/RETURNED/FAILED 诊断；该区域没有其他 Device writer 或执行许可读者，不承担跨核交权。AICPU 错误快照保留原定向 invalidate，Host 在所有核退休后读取，仍保留原有 owner、phase 和完成推导。取消先核对 owner 和当前状态，失败不产生完成贡献；普通最后返回的 C 归零推导仍成立。MIX/cohort 的记录继续原 CAS/Exch 协议，两类访问不作用于同一执行记录；TaskControl 的任务分发、C/D/N、异步 lease/FINISH 及实际资源许可保持原子语义。不使用 st_dev，也不把“一个 writer”泛化为任意共享控制可取消原子。
+普通单元首次有效分配由一条 FAA 授予不可撤销的 block/lane 票，后续接收不再独立竞争执行记录。票限定的执行记录标记 TICKET_OWNED，整个128B区域仅由该 owner 更新，使用普通 store、单行 DCCI、尾 DSB 发布 CLAIMED/RETURNED/FAILED 诊断；该区域没有其他 Device writer 或执行许可读者，不承担跨核交权。AICPU 错误快照保留原定向 invalidate，Host 在所有核退休后读取，仍保留原有 owner、phase 和完成推导。取消先核对 owner 和当前状态，失败不产生完成贡献；普通最后返回的 C 归零推导仍成立。MIX 的代理分发与成员执行分别记录。AIV0 在每簇分别记录最近领取的组、两个 bank 各自最近发布的组及发布前取消的组。第三个组等待空位时，两个在途组仍可分别定位。SSBUF 的有效代发布后，各活跃成员独占自己的执行记录，以 bypass store 发布 CLAIMED、ENTERED 及 RETURNED，入口、FIN 和退出沿用现有屏障。未进入 kernel 的已接收成员可记 FAILED。发布前取消时各成员保持 BUILT。诊断记录只供观察，调度以有效组分发、稳定 SSBUF 代、参与掩码和最终许可为准。
 
 领取阶段沿用各 task 的分地址竞争。核可以复用本实例已确认的耗尽证明以减少探测；没有取到有效 block 不能推导本簇所有 MIX 已发布，也不能替代真实分发关闭。这样接续一个已持有单元时，无须再为它竞争一次。
 
@@ -535,7 +535,7 @@ predicate 仍在合法执行边界读取；false 分支按既有整任务/组语
 - 共享 RMW 控制按 **128B atomic-only 隔离**设计；64B 是 Scalar DCache 操作粒度。RMW 行内不混入 ordinary store 或 DCCI 数据。普通有效票独占的执行诊断区域属于 owner 数据，整条区域不再有 RMW 或跨核许可观察，独立使用 DCCI 发布；不能与 cooperative 控制记录混用。
 - Call 复用 Host 上传与启动清缓存建立的本轮只读可见性；初次 Claim 成功后，Binding 继续两行 DCCI、尾 DSB 与 compiler barrier。该接收可提前到 WAIT_FANIN，但不能据此省略前驱计算及 defer_wait 数据的执行前观察。
 - 每核 token 只由固定 owner 写，可使用 owner-private 存储；初次执行授权和共享完成仍使用原子协议。本核等待状态不作为跨核交权信号。
-- 执行器真实返回时，普通有效票的 PARTIAL 和失败记录按 owner 数据发布；MIX/cohort 的真实返回继续 atomicExch，组 reserve/arm/acquire 与对应取消保持 CAS。普通最后一次成功返回可复用贡献 FAA 的 C 归零证明，省略该单元的 RETURNED 发布；D>0 时 task 仍未逻辑完成。检查入口继续拒绝错误 owner、状态不符和已推导退休的旧句柄。完成贡献前的 DSB、失败返回在组 ACK 前的 DSB 均保留，执行责任退休不替代任务 C/D/N 完成计数。
+- 执行器真实返回时，普通有效票的 PARTIAL 和失败记录按 owner 数据发布；MIX 成员记录自己的物理返回，再按本代 SSBUF 协议向记账者报告 FIN。普通最后一次成功返回可复用贡献 FAA 的 C 归零证明，省略该单元的 RETURNED 发布；D>0 时 task 仍未逻辑完成。检查入口继续拒绝错误 owner、状态不符和已推导退休的旧句柄。完成贡献前的 DSB、失败返回在组 ACK 前的 DSB 均保留，执行责任退休不替代任务 C/D/N 完成计数。
 - 可写动态 Binding 延后到最终许可后由固定 executor 填写；准备者不能修改属于另一 executor 的可写上下文。等待期间保留参数与观察进度，必要的缓存可见性协议不因固定归属而省略。
 - 提前观察参数地址不等于提前观察业务 Tensor 内容。受前驱或 async 保护的数据仍在实际依赖满足后执行必要的数据观察。
 - 沿用启动路径的 DCache 清理合同，不引入每 task 全 cache DCI，不将 DCCI 误当按地址 invalidate-only；SSBUF 使用其专用 release/acquire 屏障。
@@ -581,7 +581,7 @@ predicate 仍在合法执行边界读取；false 分支按既有整任务/组语
 
 事件统一关联 run/node/block/lane/token/固定 owner，并能还原 Host 层号/rank、各核目录位置及跨引擎前驱供给进度；区分头部未发完、本核去重、initial ticket、Claim/acquire、WAIT_FANIN、最终许可、kernel、完成、MIX/cohort 和 async/control。显示本核原位置等待跨度，但不将等待当作持续 Scalar 工作。
 
-当前有序供给的三个阶段映射到 `scheduler_query_issue_head`、`scheduler_issue_fanin_ready`、`scheduler_task_supply_closed`。保留这些阶段的供给语义，Host 重排目录时同步其身份和等待原因；不得把等待完成任务分发显示为等待计算完成。atomic、ld_dev、DCCI/DSB 沿现有 primitive 记录展开，缓存命中不伪造共享查询事件，Host 导出和 Python 消费者一起更新。
+当前有序供给的三个阶段映射到 `scheduler_find_issuable_task`、`scheduler_check_predecessor_supply`、`scheduler_task_supply_closed`。保留这些阶段的供给语义，Host 重排目录时同步其身份和等待原因；不得把等待完成任务分发显示为等待计算完成。atomic、ld_dev、DCCI/DSB 沿现有 primitive 记录展开，缓存命中不伪造共享查询事件，Host 导出和 Python 消费者一起更新。
 
 另按 `(run, node_ref, block, lane, execution_index)` 关联三条原则的证据：静态 Call 发布、本核有效票、固定准备完成、等待对象/条件、最终许可及真实 kernel 开始。当前普通 token 的 `acquired_cycles` 在固定 Binding 准备之后取得，不能将其解释成单条 FAA/CAS 的完成时间。已有 DFX 缺少某个端点时注明不可判定，不用 ready 显示条的边界冒充事件；新增记录只在对应 profiling 模式中采集，不给 L0 添加追踪成本。
 

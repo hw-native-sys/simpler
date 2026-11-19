@@ -70,14 +70,32 @@ def test_long_function_names_and_primitives_survive_filtered_nesting():
         if event["ph"] == "X"
     ]
     assert [(event["name"], event["dur"]) for event in events] == [
-        ("scheduler_refill_execution_tokens(t7)", 8.0),
-        ("scheduler_execution_token_receive(t7)", 4.0),
-        ("scheduler_acquire_execution_token(t7)", 2.0),
-        ("DCCI: SINGLE CACHELINE_OUT issue", 0.1),
-        ("scheduler_self_order_ready(t7)", 2.0),
+        ("DISPATCH · refill_execution_tokens(t7)", 8.0),
+        ("DISPATCH · bind_ticketed_execution(t7)", 4.0),
+        ("DISPATCH · claim_and_receive_payload(t7)", 2.0),
+        ("MEM · DCCI: SINGLE CACHELINE_OUT issue", 0.1),
+        ("ENTRY_PERMIT · self_order_ready(t7)", 2.0),
     ]
     assert [event["args"]["scalar_depth"] for event in events] == [1, 2, 3, 4, 2]
     assert sum(profile["exclusive_cycles"].values()) == 10_000
+
+
+@pytest.mark.parametrize(
+    ("caller", "expected"),
+    [("scalar_cluster_mix_discover_task", "CLAIM_BUILD"), ("scalar_execution_token_refill", "CLAIM_EXECUTE")],
+)
+def test_ticket_and_primitive_inherit_only_direct_recorded_claim(caller, expected):
+    records = [
+        window() | {"function_min_cycles": 1},
+        record(caller, 12, 50, 1),
+        record("scalar_ordinary_block_claim", 15, 40, 2),
+        record("scalar_atomic_fetch_add", 20, 21, 3),
+        record("scalar_bypass_load", 25, 26, 4),
+    ]
+    rows = {row["kind"]: row for row in partition(records, [])["rows"]}
+    assert rows["scalar_ordinary_block_claim"]["hbg_stage"] == expected
+    assert rows["scalar_atomic_fetch_add"]["hbg_stage"] == expected
+    assert "hbg_stage" not in rows["scalar_bypass_load"]
 
 
 def test_nested_intervals_conserve_time_without_counting_parents_twice():
@@ -185,14 +203,48 @@ def test_common_converter_draws_one_typed_scalar_hierarchy(tmp_path, level):
     )
     detail = [e for e in events if e["ph"] == "X" and e["pid"] == 2]
     assert {e["tid"] for e in detail} == {30000}
-    assert all("cat" not in e and "args" not in e for e in detail)
+    assert all(e["name"].startswith(e["cat"] + " · ") and "cname" in e for e in detail)
+    (kernel,) = (e for e in detail if e["cat"] == "EXECUTE")
+    (worker,) = (e for e in events if e["ph"] == "X" and e["pid"] == 4)
+    assert kernel["name"] == f"EXECUTE · {worker['name']}"
+    assert kernel["args"]["reg_task_id"] == 7
     assert json.loads(output.read_text())["metadata"]["scalar_detail_display"]["all_events_retained"]
     by_name = {e["name"]: e for e in detail}
     assert "idle" not in by_name
-    parent, child = by_name["scheduler_fill_own_slots"], by_name["atomicCAS: return ready"]
+    parent, child = by_name["DISPATCH · find_local_execution"], by_name["MEM · atomicCAS: return ready"]
     assert parent["ts"] <= child["ts"] < child["ts"] + child["dur"] <= parent["ts"] + parent["dur"]
     assert "window" not in by_name
     assert data["scalar_profiles"][0]["window_cycles"] == 90
+
+
+def test_kernel_labels_follow_worker_registration_and_epoch():
+    windows = [window(), {**window(), "run_epoch": 2}]
+    metadata = [
+        {
+            "producer": "aicore",
+            "worker_id": 2,
+            "scheduler_id": 2,
+            "capture": {"committed": 2, "dropped": 0, "truncated": False},
+        },
+        {
+            "producer": "aicore",
+            "worker_id": 3,
+            "scheduler_id": 3,
+            "capture": {"committed": 1, "dropped": 0, "truncated": False},
+        },
+    ]
+    tasks = [[2, 7, 4, 40, 50, 0, 1], [2, 7, 4, 40, 50, 0, 2], [3, 7, 4, 40, 50, 0, 1]]
+    profiles = analyze_streams([windows, [window()]], metadata, tasks)
+    for profile in profiles:
+        for row in profile["rows"]:
+            row.update(start_time_us=row["start_cycles"], end_time_us=row["end_cycles"])
+    labels = {(1, 2, 4): "q_aic(t7) [b0]", (2, 2, 4): "q_aic(t7) [b1]", (1, 3, 4): "q_aiv(t7) [b0]"}
+    events = trace_events(profiles, pid=2, tid_base=30000, display=str, kernel_labels=labels)
+    assert [(e["tid"], e["args"]["run_epoch"], e["name"]) for e in events if e["ph"] == "X"] == [
+        (30020, 1, "EXECUTE · q_aic(t7) [b0]"),
+        (30020, 2, "EXECUTE · q_aic(t7) [b1]"),
+        (30030, 1, "EXECUTE · q_aiv(t7) [b0]"),
+    ]
 
 
 def test_predicated_skip_is_not_counted_as_kernel_execution():
@@ -212,22 +264,29 @@ def test_predicated_skip_is_not_counted_as_kernel_execution():
 @pytest.mark.parametrize(
     ("phase", "function"),
     [
-        ("scalar_advance_mix_floor", "scheduler_advance_mix_floor"),
-        ("scalar_self_order_ready", "scheduler_self_order_ready"),
-        ("scalar_mix_lane_order_ready", "scheduler_mix_lane_order_ready"),
-        ("scalar_execution_token_refill", "scheduler_refill_execution_tokens"),
-        ("scalar_prepared_acquire", "scheduler_acquire_execution_token"),
-        ("scalar_prepared_claim", "scheduler_claim_execution_token"),
-        ("scalar_counter_accounting", "scheduler_service_counter_accounting"),
-        ("scalar_cluster_mix_service", "scheduler_cluster_mix_service"),
-        ("scalar_group_acquire", "scheduler_acquire_group_lane"),
-        ("scalar_execution_continuation", "scheduler_try_execution_continuation"),
-        ("scalar_execution_token_fanin", "scheduler_execution_token_observe_fanin"),
-        ("scalar_dispatch_metadata", "scheduler_load_dispatch_metadata"),
-        ("scalar_dispatch_publish", "scheduler_publish_dispatch_slot"),
-        ("scalar_trace_finish", "SchedulerScalarTrace::finish"),
-        ("scalar_trace_finish_clean", "SchedulerScalarTrace::finish: DCCI issue"),
-        ("scalar_trace_finish_barrier", "SchedulerScalarTrace::finish: DSB"),
+        ("scalar_advance_mix_floor", "MIX_SYNC · advance_mix_floor"),
+        ("scalar_self_order_ready", "ENTRY_PERMIT · self_order_ready"),
+        ("scalar_mix_lane_order_ready", "ENTRY_PERMIT · mix_lane_order_ready"),
+        ("scalar_execution_token_refill", "DISPATCH · refill_execution_tokens"),
+        ("scalar_prepared_acquire", "DISPATCH · claim_and_receive_payload"),
+        ("scalar_prepared_claim", "CLAIM_EXECUTE · claim_for_execution"),
+        ("scalar_cluster_mix_discover_task", "CLAIM_BUILD · claim_for_build"),
+        ("scalar_build_payload", "BUILD · build_payload"),
+        ("scalar_publish_built", "BUILD · publish_built"),
+        ("scalar_select_owned_execution", "SELECT · select_owned_execution"),
+        ("scalar_can_enter_execution", "ENTRY_PERMIT · check_entry_permit"),
+        ("scalar_retire_execution", "RETIRE · retire_execution"),
+        ("scalar_subtask_contribute", "FANOUT_PUBLISH · publish_fanout"),
+        ("scalar_counter_accounting", "CONTROL · account_completed_tasks"),
+        ("scalar_cluster_mix_service", "DISPATCH · cluster_mix_service"),
+        ("scalar_group_acquire", "DISPATCH · acquire_group_lane"),
+        ("scalar_execution_continuation", "DISPATCH · continue_same_task"),
+        ("scalar_execution_token_fanin", "FANIN_WAIT · poll_fanin"),
+        ("scalar_dispatch_metadata", "BUILD · load_dispatch_metadata"),
+        ("scalar_dispatch_publish", "DISPATCH · publish_dispatch_slot"),
+        ("scalar_trace_finish", "TRACE · SchedulerScalarTrace::finish"),
+        ("scalar_trace_finish_barrier", "TRACE · SchedulerScalarTrace::finish: DSB"),
+        ("scalar_trace_finish_clean", "TRACE · SchedulerScalarTrace::finish: DCCI issue"),
     ],
 )
 def test_fill_detail_roundtrips_nested_function_names_and_task_identity(tmp_path, phase, function):
@@ -269,7 +328,7 @@ def test_fill_detail_roundtrips_nested_function_names_and_task_identity(tmp_path
         scalar_profiles=data["scalar_profiles"],
     )
     details = [e for e in json.loads(output.read_text())["traceEvents"] if e["ph"] == "X" and e["pid"] == 2]
-    parent = next(e for e in details if e["name"] == "scheduler_service_groups")
+    parent = next(e for e in details if e["name"] == "DISPATCH · progress_mix_groups")
     child = next(e for e in details if e["name"].startswith(function + "("))
     assert child["name"] == f"{function}(t7)"
     assert next(row for row in profile["rows"] if row["kind"] == phase)["task_id"] == 7

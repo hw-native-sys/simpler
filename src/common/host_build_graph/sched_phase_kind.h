@@ -141,8 +141,6 @@ enum class SchedPhaseKind : uint8_t {
     ScalarPreparedObserve = 124,
     ScalarPreparedIndex = 125,
     ScalarPreparedValidate = 126,
-    ScalarGroupReserve = 127,
-    ScalarGroupArm = 130,
     ScalarGroupAcquire = 131,
     ScalarExecutionContinuation = 133,
     ScalarExecutionTokenFanin = 134,
@@ -173,6 +171,13 @@ enum class SchedPhaseKind : uint8_t {
     ScalarPublishIdle = 171,
     ScalarTraceBeforeExecution = 172,
     ScalarTraceBeforeCompletion = 173,
+    ScalarCanEnterExecution = 179,
+    ScalarTraceAppend = 180,
+    ScalarEndIteration = 181,
+    ScalarBuildPayload = 182,
+    ScalarPublishBuilt = 183,
+    ScalarSelectOwnedExecution = 185,
+    ScalarRetireExecution = 186,
 };
 
 // This phase's name as a report spells it. Returns a string literal, so it is safe on
@@ -365,6 +370,20 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_publish_idle";
     case SchedPhaseKind::ScalarTraceBeforeExecution:
         return "scalar_trace_before_execution";
+    case SchedPhaseKind::ScalarCanEnterExecution:
+        return "scalar_can_enter_execution";
+    case SchedPhaseKind::ScalarTraceAppend:
+        return "scalar_trace_append";
+    case SchedPhaseKind::ScalarBuildPayload:
+        return "scalar_build_payload";
+    case SchedPhaseKind::ScalarPublishBuilt:
+        return "scalar_publish_built";
+    case SchedPhaseKind::ScalarSelectOwnedExecution:
+        return "scalar_select_owned_execution";
+    case SchedPhaseKind::ScalarRetireExecution:
+        return "scalar_retire_execution";
+    case SchedPhaseKind::ScalarEndIteration:
+        return "scalar_end_iteration";
     case SchedPhaseKind::ScalarTraceBeforeCompletion:
         return "scalar_trace_before_completion";
     case SchedPhaseKind::ScalarPreparedReturn:
@@ -375,10 +394,6 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_prepared_index";
     case SchedPhaseKind::ScalarPreparedValidate:
         return "scalar_prepared_validate";
-    case SchedPhaseKind::ScalarGroupReserve:
-        return "scalar_group_reserve";
-    case SchedPhaseKind::ScalarGroupArm:
-        return "scalar_group_arm";
     case SchedPhaseKind::ScalarGroupAcquire:
         return "scalar_group_acquire";
     case SchedPhaseKind::ScalarExecutionContinuation:

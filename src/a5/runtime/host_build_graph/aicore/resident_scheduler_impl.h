@@ -269,10 +269,9 @@ __aicore__ __attribute__((always_inline)) void local_backoff(uint32_t iterations
 
 __aicore__ __attribute__((always_inline)) void
 publish_worker_stats(__gm__ SchedulerWorkerContext *context, const SchedulerWorkerStats &stats) {
-    context->bootstrap_task_count = stats.bootstrap_task_count;
-    context->bootstrap_start_cycles = stats.bootstrap_start_cycles;
-    context->target_bootstrap_end_cycles = stats.target_bootstrap_end_cycles;
-    scheduler_publish_cache_line(&context->bootstrap_task_count);
+    scheduler_store_signal(context->bootstrap_task_count, stats.bootstrap_task_count);
+    scheduler_store_signal(context->bootstrap_start_cycles, stats.bootstrap_start_cycles);
+    scheduler_store_signal(context->target_bootstrap_end_cycles, stats.target_bootstrap_end_cycles);
 }
 
 // Keep the pre-kernel timestamps out of the indirect kernel call's live set.
@@ -370,12 +369,12 @@ __aicore__ bool bootstrap_ready_graph(
     bool fill_failed = false;
     if (graph.native_header_offset != 0) {
         bool progress = false;
-        if (!scheduler_service_controls(
+        if (!scheduler_progress_graph_controls(
                 graph, scheduler_state_base, scheduler, run_control, profiling_level, &progress
             ))
             return false;
     }
-    (void)scheduler_fill_own_slots<record_protocol>(
+    (void)scheduler_find_local_execution<record_protocol>(
         graph, scheduler_state_base, scheduler, run_control, profiling_level, &fill_failed
     );
     if (fill_failed) return false;
@@ -497,18 +496,20 @@ __aicore__ bool run_ready_dispatch_loop(
         controls_serviced = true;
         SchedulerScalarScope scalar_control(context, SchedPhaseKind::ScalarGraphControl);
         bool advanced = false;
-        if (!scheduler_service_controls(graph, scheduler_state_base, context, run_control, profiling_level, &advanced))
+        if (!scheduler_progress_graph_controls(
+                graph, scheduler_state_base, context, run_control, profiling_level, &advanced
+            ))
             return false;
         scalar_control.close();
         progress = progress || advanced;
         bool counter_advanced = false;
-        if (!scheduler_service_counter_accounting(graph, scheduler_state_base, context, run_control, &counter_advanced))
+        if (!scheduler_account_completed_tasks(graph, scheduler_state_base, context, run_control, &counter_advanced))
             return false;
         progress = progress || counter_advanced;
         return true;
     };
     enum class Boundary { Proceed, Exit, Error };
-    auto check_boundary = [&]() __aicore__ {
+    auto check_exit_or_error = [&]() __aicore__ {
         SchedulerScalarScope scalar_loop(context, SchedPhaseKind::ScalarLoopControl);
         if (static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) == AICORE_EXIT_SIGNAL) {
             if (phase_timing_enabled) {
@@ -528,7 +529,7 @@ __aicore__ bool run_ready_dispatch_loop(
 
         return Boundary::Proceed;
     };
-    Boundary boundary = check_boundary();
+    Boundary boundary = check_exit_or_error();
     while (boundary == Boundary::Proceed) {
         async_serviced = false;
         controls_serviced = false;
@@ -544,7 +545,7 @@ __aicore__ bool run_ready_dispatch_loop(
             if (!service_async(scheduler_progress) || !service_controls(scheduler_progress)) return false;
         }
         bool failed = false;
-        const bool advanced = scheduler_fill_own_slots<record_protocol>(
+        const bool advanced = scheduler_find_local_execution<record_protocol>(
             graph, scheduler_state_base, context, run_control, profiling_level, &failed, &selected
         );
         if (failed) return false;
@@ -567,19 +568,18 @@ __aicore__ bool run_ready_dispatch_loop(
                 );
                 return false;
             }
-            if (context->async != nullptr && context->async->business_returns >= 4 &&
-                !service_async(scheduler_progress))
-                return false;
+            const bool async_due = context->async != nullptr && context->async->business_returns >= 4;
+            if (async_due && !service_async(scheduler_progress)) return false;
             bool permit = false;
-            if (!scheduler_can_enter_execution<record_protocol>(
-                    graph, scheduler_state_base, context, run_control, selected, &permit
+            if (!scheduler_check_entry_permit<record_protocol>(
+                    graph, scheduler_state_base, context, run_control, selected, &permit, !async_due
                 ))
                 return false;
             if (!permit) {
                 // Keep the owner in place and serve the obligation blocking entry.
                 selected = UINT32_MAX;
                 if (!service_async(scheduler_progress) || !service_controls(scheduler_progress)) return false;
-                if (!scheduler_service_groups(
+                if (!scheduler_progress_mix_groups(
                         graph, scheduler_state_base, context, run_control, profiling_level, &scheduler_progress
                     ))
                     return false;
@@ -621,10 +621,12 @@ __aicore__ bool run_ready_dispatch_loop(
                 );
             // Async-protected business inputs require observation on the actual
             // consumer after dependencies settle, independently of the call package.
-            if (function_address != 0 && local_slot->may_observe_async_inputs && context->async != nullptr &&
-                scheduler_async_work_activated(context->async)) {
-                SchedulerScalarScope scalar_cache(context, SchedPhaseKind::ScalarCacheObserve, task_ref);
-                scheduler_observe_data_cache(binding);
+            if (function_address != 0 && local_slot->may_observe_async_inputs && context->async != nullptr) {
+                const uint8_t count = call->input_cache_spans;
+                if (count != SCHEDULER_INPUT_CACHE_SKIP && scheduler_async_work_activated(context->async)) {
+                    SchedulerScalarScope scalar_cache(context, SchedPhaseKind::ScalarCacheObserve, task_ref);
+                    scheduler_observe_input_cache(call, count);
+                }
             }
             uint32_t execution_group_index = pto2::resident::ASYNC_INVALID_INDEX;
             if (binding->global_context.async_group_index != pto2::resident::ASYNC_INVALID_INDEX) {
@@ -652,6 +654,10 @@ __aicore__ bool run_ready_dispatch_loop(
                 (void)scheduler_cancel_unstarted_slot<true>(scheduler_state_base, context, slot_index);
                 return false;
             }
+            if (local_slot->cluster_mix && function_address != 0)
+                scheduler_mark_mix_kernel_entered(
+                    scheduler_state_base, context->config.prepared, &local_slot->prepared
+                );
             scheduler_store_barrier();
             scalar_prepare.close();
             const bool first_kernel = function_address != 0 && !work_capture.started;
@@ -698,7 +704,7 @@ __aicore__ bool run_ready_dispatch_loop(
                         run_control, task_ref, scheduler_async_error_result(context->async), &graph, context,
                         SchedulerErrorSite::ASYNC_SEAL_FAILED, local_slot
                     );
-                    (void)scheduler_complete_own_slot<record_protocol, true, false>(
+                    (void)scheduler_complete_lane_execution<record_protocol, true, false>(
                         graph, scheduler_state_base, context, run_control, slot_index, profiling_level
                     );
                     return false;
@@ -712,7 +718,7 @@ __aicore__ bool run_ready_dispatch_loop(
                     run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
                     SchedulerErrorSite::ARGS_DUMP_REFUSED
                 );
-                (void)scheduler_complete_own_slot<record_protocol, true, false>(
+                (void)scheduler_complete_lane_execution<record_protocol, true, false>(
                     graph, scheduler_state_base, context, run_control, slot_index, profiling_level
                 );
                 return false;
@@ -734,7 +740,7 @@ __aicore__ bool run_ready_dispatch_loop(
                         run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
                         SchedulerErrorSite::ASYNC_SEAL_FAILED, local_slot
                     );
-                    (void)scheduler_complete_own_slot<record_protocol, true, false>(
+                    (void)scheduler_complete_lane_execution<record_protocol, true, false>(
                         graph, scheduler_state_base, context, run_control, slot_index, profiling_level
                     );
                     return false;
@@ -745,16 +751,16 @@ __aicore__ bool run_ready_dispatch_loop(
             SchedulerScalarScope scalar_completions(context, SchedPhaseKind::ScalarCompletions, task_ref);
             const bool completion_ok =
                 record_protocol && scheduler_protocol_enabled(context) ?
-                    scheduler_complete_own_slot<true, true>(
+                    scheduler_complete_lane_execution<true, true>(
                         graph, scheduler_state_base, context, run_control, slot_index, profiling_level
                     ) :
-                    scheduler_complete_own_slot<false, true>(
+                    scheduler_complete_lane_execution<false, true>(
                         graph, scheduler_state_base, context, run_control, slot_index, profiling_level
                     );
             scalar_completions.close();
             if (!completion_ok) return false;
             if (phase_timing_enabled) publish_deferred_idle_activity(scheduler_state_base, context, stats);
-            boundary = check_boundary();
+            boundary = check_exit_or_error();
             continue;
         }
 
@@ -762,7 +768,7 @@ __aicore__ bool run_ready_dispatch_loop(
         if (phase_timing_enabled) publish_deferred_idle_activity(scheduler_state_base, context, stats);
         if (scheduler_progress) {
             scalar_iteration.progress = true;
-            boundary = check_boundary();
+            boundary = check_exit_or_error();
             continue;
         }
         if (phase_timing_enabled) {
@@ -771,7 +777,7 @@ __aicore__ bool run_ready_dispatch_loop(
                 idle_active = true;
             }
         }
-        boundary = check_boundary();
+        boundary = check_exit_or_error();
     }
     return boundary != Boundary::Error;
 }
@@ -929,8 +935,7 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     while (stats.exit_observed_cycles == 0 &&
            static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) != AICORE_EXIT_SIGNAL) {
         if (scheduler_watchdog_expired(exit_wait_start, get_sys_cnt_aicore(), timeout_cycles)) {
-            const auto &group = scheduler_local_state.cluster_mix;
-            const int64_t task = group.phase == SchedulerGmMixPhase::IDLE ? SCHEDULER_TASK_REF_INVALID : group.task_ref;
+            const int64_t task = scheduler_unretired_mix_task(scheduler_local_state);
             scheduler_record_error(
                 run_control, task, SchedulerGraphResult::TIMEOUT, &graph, &scheduler_local_state,
                 SchedulerErrorSite::EXIT_WAIT_TIMEOUT

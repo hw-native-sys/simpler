@@ -41,6 +41,7 @@
 #include <memory>
 #include <new>
 #include <sstream>
+#include <string_view>
 
 #include "callable.h"
 #include "callable_protocol.h"
@@ -2420,6 +2421,7 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     std::vector<uint8_t> scratch(alloc_size);
     std::vector<uint64_t> object_table(table_len, 0);
     std::vector<CoreAsyncCapability> async_capabilities(table_len);
+    auto input_cache_proofs = chip_callable_input_cache_proofs(callable, table_len);
     for (int32_t index = 0; index < callable->child_count(); ++index) {
         async_capabilities[callable->child_func_id(index)] =
             normalize_core_async_capability(callable->child(index).async_capability());
@@ -2513,6 +2515,7 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
     auto inserted = chip_callable_buffers_.emplace(layout.content_hash, std::move(retained));
     inserted.first->second.object_table = std::move(object_table);
     inserted.first->second.async_capabilities = std::move(async_capabilities);
+    inserted.first->second.input_cache_proofs = std::move(input_cache_proofs);
     published = true;
     LOG_DEBUG(
         "Uploaded chip callable: chip_dev=0x%lx, size=%zu, child_count=%d, table_len=%u, hash=0x%lx", chip_dev,
@@ -3063,6 +3066,13 @@ bool DeviceRunnerBase::get_callable_async_capabilities(
     return true;
 }
 
+template <class RuntimeType>
+static void bind_runtime_input_cache_proofs(RuntimeType &runtime, const std::vector<CoreInputCacheProof> &proofs) {
+    if constexpr (std::string_view(SIMPLER_RUNTIME_NAME) == "host_build_graph") {
+        bind_registered_input_cache_proofs(runtime, proofs);
+    }
+}
+
 int DeviceRunnerBase::bind_callable_to_runtime(
     Runtime &runtime, int32_t callable_id, const HostApi *api, const void *orch_args, const uint64_t *ring_task_window,
     const uint64_t *ring_heap, const uint64_t *ring_dep_pool
@@ -3098,6 +3108,7 @@ int DeviceRunnerBase::bind_callable_to_runtime(
     // Tell the AICPU which orch_so_table_ slot this run dispatches. The orch SO
     // descriptor itself was delivered at register time via RegisterCallableArgs.
     runtime.set_active_callable_id(callable_id);
+    bind_runtime_input_cache_proofs(runtime, tables.input_cache_proofs);
 
     // Per-run binding (tensor args, GM heap, SM alloc). host_orch_func_ptr is
     // non-null only on the hbg path; signature is the cached ChipCallable

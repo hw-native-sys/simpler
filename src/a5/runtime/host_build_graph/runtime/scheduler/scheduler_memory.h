@@ -98,6 +98,21 @@ static inline __aicore__ void scheduler_observe_data_cache(__gm__ void *address)
 #endif
 }
 
+static inline __aicore__ void scheduler_observe_input_cache(__gm__ SchedulerPreparedCall *call, uint8_t count) {
+    if (count == SCHEDULER_INPUT_CACHE_FULL || count > SCHEDULER_INPUT_CACHE_SPANS) {
+        scheduler_observe_data_cache(call);
+        return;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint64_t last = call->input_cache_lines[i].last_line;
+        for (uint64_t line = call->input_cache_lines[i].first_line;; line += SCHEDULER_SCALAR_CACHE_LINE_BYTES) {
+            scheduler_invalidate_cache_line(reinterpret_cast<__gm__ void *>(line));
+            if (line == last) break;
+        }
+    }
+    scheduler_cache_barrier();
+}
+
 // A5 ld_dev bypasses the scalar DCache. A reliable snapshot grants no
 // exclusive ownership; mutations use the atomic wrappers below.
 // Ownership changes use the CAS/exchange/fetch wrappers below.

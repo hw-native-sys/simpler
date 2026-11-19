@@ -32,8 +32,9 @@ JOIN = ("run_epoch", "core_id", "reg_task_id")
 
 def valid_source_index(index, group_kind):
     if group_kind == 0:
+        # The trace reserves slots 0 through 3 for ordinary work and omits the runtime window depth.
         return 0 <= index < 4
-    return group_kind == 2 and index == 4
+    return group_kind == 2 and index in (4, 5)
 
 
 def _validate_record(record, *, legacy=False):
@@ -117,6 +118,7 @@ def attach_execution_identities(section, tasks, runtime):
             record["group_seq"],
             record["cluster_index"] if record["group_seq"] is not None else None,
             record["group_kind"],
+            record["pending_slot"] if not legacy and record["group_seq"] is not None else None,
         )
         if groups.setdefault(group_key, group) != group:
             raise ValueError("execution identity Mix block spans different groups")

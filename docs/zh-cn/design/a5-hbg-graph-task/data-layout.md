@@ -162,7 +162,7 @@ Host 在 orchestration 返回前取得自有 Graph 字节与索引，不能保�
 | SchedulerPreparedControl | 128 B | phase、固定 owner 与 TICKET_OWNED 状态；普通票由 owner 维护，协作转换使用 atomic |
 | SchedulerExecutionBinding | 128 B | 各占一行的 LocalContext/GlobalContext |
 
-args[48]/args[49] 指向本次 execution 的 Binding。每核可持有一个自取 block（W=1），另有一个 MIX 成员记录。
+args[48]/args[49] 指向本次 execution 的 Binding。每核可持有两个自取 block（W=2），另有两份 MIX 成员记录，分别对应两个 SSBUF bank。
 两种来源都由领取它的核从原记录执行，同一时刻每核只运行一个 kernel。
 
 统计 backing 必须分别计入 metadata/control、Call/control/Binding、native readonly、两类目录的 refs、每个 node 的排序行、

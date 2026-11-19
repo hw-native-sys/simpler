@@ -95,9 +95,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         (void)rt_submit_aiv_task(1, publisher);
         CoreTaskArgs tail;
         tail.add_no_dep(payload, payload, out);
-        tail.add_scalar(4, 0);
         tail.set_dependencies(&consumed, 1);
-        previous = rt_submit_aiv_task(1, tail).task_id();
+        previous = rt_submit_aiv_task(3, tail).task_id();
     }
 }
 }

@@ -9,24 +9,24 @@
 native child 从 template/instance 获取形状和参数地址。
 16 B SchedulerTaskMetadata 为每 expanded node 保存 flags、active mask、kernel IDs、block 数和 trace prefix。
 
-Host 按现有数据和 Graph 控制依赖，以 `(level, -b_level, node_ref)` 排序，再投影为 AIC/MIX 与 AIV 两个目录。
-每个 logical kernel node 出现一次，目录运行中只读；每类共享发行前沿只在当前任务全体有效票发完或合法终结后推进。
+Host 按现有数据和 Graph 控制依赖，以 `(level, -b_level, node_ref)` 排序，再投影为纯 AIC 目录和含 MIX 的 AIV 目录。
+每个 logical kernel node 出现一次，目录运行中只读；本核游标在确认当前任务供给关闭后推进。
 跨引擎后继领票前确认前驱供给已关闭；领票不等于依赖完成，执行仍等待真实 DONE。
 一次查询最多推进八项；本核已持有头部任务时不领该任务第二块，也不越过尚未关闭的头部。
 
 ## 从具体 Call 到 fanin 证明
 
-每个真实 block/lane 都有已发布 Call 和 Binding。普通任务通过 block ticket 和 Call control CAS
+每个真实 block/lane 都有已发布 Call 和 Binding。普通任务通过有效 block ticket
 取得一个具体执行 token，验证函数、任务、epoch、block/lane 和 generation。
-每核可持有四个 token；取得 Call 责任不等于取得 kernel 执行许可。
+每核可持有两份普通自取记录和两份按 bank 索引的 MIX 成员记录；取得 Call 责任不等于取得 kernel 执行许可。
 
 ```text
-查询共享发行头部并确认前驱供给
+查询本核目录游标并确认前驱供给
     -> 取得一个具体 execution 的 Claim
     -> 接收 immutable Call 和稳定 Binding
     -> WAIT_FANIN：按 producer 顺序确认 canonical DONE
     -> 记录正前缀，下次从第一个未证明的 producer 继续
-    -> 全部依赖满足后才转入本核 READY slot
+    -> 在原位置标记 READY，再按该位置执行
 ```
 
 completion_state 的 total/remaining_compute/debt 必须合法。
@@ -34,13 +34,13 @@ completion_state 的 total/remaining_compute/debt 必须合法。
 Graph 外部 fanin 经过 completion_refs，child-local index 加实例 child_begin；root 依赖 ENTER。
 不存在每条边 remaining decrement、wake-list 或 per-successor 通知。
 
-token 窗口被等待依赖的项占满时，保留四份责任及准备状态；原核在依赖满足后继续执行。
+自取窗口被等待依赖的项占满时，保留两份自取责任及准备状态；原核在依赖满足后继续执行。
 执行责任从首次有效领取到退休不转移，不再发布 PARKING/PARKED 或让其他核重领。
-等待期间继续服务独立 async/control 和已有协作责任，不增加第五份普通执行责任。
+等待期间继续服务独立 async/control 和已有协作责任，MIX 成员使用各自的 bank 记录。
 
 ## 本核 slot 与最终门禁
 
-每核两个 40 B dispatch slot，只由本核准备和执行。
+每份执行沿用取得责任时的自取或 MIX 成员位置，直到本核退休。
 slot 保存 task/block/lane、prepared handle、predicate 和缓存观察状态，Call args 不随 slot 复用被覆盖。
 local ready mask/head 对已准备 slot 维持本地 FIFO；直接执行路径可以跳过一次排队，不能跳过依赖或资源检查。
 

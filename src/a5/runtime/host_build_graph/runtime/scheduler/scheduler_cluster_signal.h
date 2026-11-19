@@ -28,20 +28,23 @@ inline constexpr uint32_t SCHEDULER_CLUSTER_REGION_BYTES = 1024;
 static_assert(SCHEDULER_CLUSTER_REGION_OFFSET + SCHEDULER_CLUSTER_REGION_BYTES == PLATFORM_SSBUF_SIZE);
 
 // AIV0 publishes the descriptor and the cluster's monotonic order boundary.
-struct SchedulerClusterSignal {
-    volatile uint64_t run_epoch;
+struct SchedulerClusterDescriptor {
     volatile int64_t task_ref;
-    volatile uint64_t anchor_state;
     volatile uint32_t rank;
     volatile uint32_t block_idx;
     volatile uint32_t active_mask;
     volatile uint32_t armed_generation;
-    volatile uint32_t mix_floor;
+    volatile uint32_t order_ready[PLATFORM_CORES_PER_BLOCKDIM];
     volatile uint32_t arrived[PLATFORM_CORES_PER_BLOCKDIM];
     volatile uint32_t finished[PLATFORM_CORES_PER_BLOCKDIM];
     volatile uint32_t dependencies_generation;
     volatile uint32_t accounted_generation;
     volatile uint32_t trace_generation;
+};
+struct SchedulerClusterSignal {
+    volatile uint64_t run_epoch;
+    volatile uint32_t mix_floor;
+    SchedulerClusterDescriptor groups[SCHEDULER_MIX_MEMBER_COUNT];
 };
 static_assert(sizeof(SchedulerClusterSignal) <= SCHEDULER_CLUSTER_REGION_BYTES);
 static_assert(alignof(SchedulerClusterSignal) <= 8 && std::is_standard_layout_v<SchedulerClusterSignal>);
@@ -103,18 +106,21 @@ scheduler_cluster_store_release(SCHEDULER_CLUSTER_SSBUF volatile uint32_t *field
 inline __aicore__ void
 scheduler_cluster_signal_clear(SCHEDULER_CLUSTER_SSBUF SchedulerClusterSignal *signal, uint64_t run_epoch) {
     scheduler_cluster_store_field(&signal->run_epoch, run_epoch);
-    scheduler_cluster_store_field(&signal->task_ref, SCHEDULER_TASK_REF_INVALID);
-    scheduler_cluster_store_field(&signal->anchor_state, UINT64_C(0));
-    scheduler_cluster_store_field(&signal->rank, UINT32_MAX);
-    scheduler_cluster_store_field(&signal->block_idx, UINT32_MAX);
-    scheduler_cluster_store_field(&signal->active_mask, UINT32_C(0));
     scheduler_cluster_store_field(&signal->mix_floor, UINT32_C(0));
-    scheduler_cluster_store_field(&signal->trace_generation, UINT32_C(0));
-    scheduler_cluster_store_field(&signal->dependencies_generation, UINT32_C(0));
-    scheduler_cluster_store_field(&signal->accounted_generation, UINT32_C(0));
-    for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-        scheduler_cluster_store_field(&signal->arrived[lane], UINT32_C(0));
-        scheduler_cluster_store_field(&signal->finished[lane], UINT32_C(0));
+    for (uint32_t bank = 0; bank < SCHEDULER_MIX_MEMBER_COUNT; ++bank) {
+        auto *descriptor = &signal->groups[bank];
+        scheduler_cluster_store_field(&descriptor->task_ref, SCHEDULER_TASK_REF_INVALID);
+        scheduler_cluster_store_field(&descriptor->rank, UINT32_MAX);
+        scheduler_cluster_store_field(&descriptor->block_idx, UINT32_MAX);
+        scheduler_cluster_store_field(&descriptor->active_mask, UINT32_C(0));
+        scheduler_cluster_store_field(&descriptor->trace_generation, UINT32_C(0));
+        scheduler_cluster_store_field(&descriptor->dependencies_generation, UINT32_C(0));
+        scheduler_cluster_store_field(&descriptor->accounted_generation, UINT32_C(0));
+        for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+            scheduler_cluster_store_field(&descriptor->order_ready[lane], UINT32_C(0));
+            scheduler_cluster_store_field(&descriptor->arrived[lane], UINT32_C(0));
+            scheduler_cluster_store_field(&descriptor->finished[lane], UINT32_C(0));
+        }
+        scheduler_cluster_store_release(&descriptor->armed_generation, UINT32_C(0));
     }
-    scheduler_cluster_store_release(&signal->armed_generation, UINT32_C(0));
 }

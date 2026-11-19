@@ -19,9 +19,17 @@
 
 inline constexpr uint64_t SCHEDULER_PREPARED_ALIGNMENT = 128;
 
-enum class SchedulerPreparedPhase : uint8_t { INVALID, BUILT, CLAIMED, RETURNED, FAILED, GROUP_RESERVED, GROUP_ARMED };
+enum class SchedulerPreparedPhase : uint8_t {
+    INVALID = 0,
+    BUILT = 1,
+    CLAIMED = 2,
+    RETURNED = 3,
+    FAILED = 4,
+    ENTERED = 5
+};
 
 inline constexpr uint64_t SCHEDULER_PREPARED_TICKET_OWNED = UINT64_C(1) << 25;
+inline constexpr uint64_t SCHEDULER_PREPARED_MIX_OWNED = UINT64_C(1) << 26;
 
 inline __aicore__ constexpr uint64_t
 scheduler_prepared_state(SchedulerPreparedPhase phase, uint32_t executor = UINT32_MAX) {
@@ -38,9 +46,16 @@ inline __aicore__ constexpr uint32_t scheduler_prepared_owner(uint64_t state) {
 
 inline __aicore__ constexpr uint32_t scheduler_prepared_execute_owner(uint64_t state) {
     const auto phase = scheduler_prepared_phase(state);
-    return phase == SchedulerPreparedPhase::CLAIMED || phase == SchedulerPreparedPhase::RETURNED ?
+    return phase == SchedulerPreparedPhase::CLAIMED || phase == SchedulerPreparedPhase::ENTERED ||
+                   phase == SchedulerPreparedPhase::RETURNED ?
                scheduler_prepared_owner(state) :
                UINT32_MAX;
+}
+
+inline __aicore__ constexpr bool scheduler_prepared_mix_kernel_entered(uint64_t state) {
+    const auto phase = scheduler_prepared_phase(state);
+    return (state & SCHEDULER_PREPARED_MIX_OWNED) != 0 &&
+           (phase == SchedulerPreparedPhase::ENTERED || phase == SchedulerPreparedPhase::RETURNED);
 }
 
 // Plans are indexed by the existing graph node ref, including non-executable nodes.
@@ -52,12 +67,20 @@ struct SchedulerExecutionPlan {
     uint8_t active_lane_count;
 };
 
-// Cooperative records use atomic ownership transitions. An irrevocable ordinary
-// ticket instead makes this whole region an owner-written diagnostic: no peer
-// reads it for entry or updates it, and Host observes it after run retirement.
-// The two access contracts never share an execution record within a run.
+// Each active MIX member writes its own claim, kernel entry and physical return.
+// The control is isolated from cached stores to the immutable Call and its binding.
 struct alignas(128) SchedulerPreparedControl {
     volatile uint64_t state;
+};
+
+inline constexpr uint8_t SCHEDULER_INPUT_CACHE_FULL = 0;
+inline constexpr uint8_t SCHEDULER_INPUT_CACHE_SKIP = UINT8_MAX;
+inline constexpr uint32_t SCHEDULER_INPUT_CACHE_SPANS = 3;
+inline constexpr uint64_t SCHEDULER_SCALAR_CACHE_LINE_BYTES = 64;
+
+struct SchedulerInputCacheSpan {
+    uint64_t first_line;
+    uint64_t last_line;  // Inclusive, including an unaligned final byte.
 };
 
 struct alignas(64) SchedulerPreparedCall {
@@ -68,7 +91,9 @@ struct alignas(64) SchedulerPreparedCall {
     uint32_t block_idx;
     uint16_t num_args;
     uint8_t subtask_slot;
+    uint8_t input_cache_spans;  // FULL, SKIP, or the number of bound spans below.
     alignas(64) uint64_t args[DISPATCH_MAX_ARGS];
+    SchedulerInputCacheSpan input_cache_lines[SCHEDULER_INPUT_CACHE_SPANS];
 };
 
 struct alignas(64) SchedulerExecutionBinding {

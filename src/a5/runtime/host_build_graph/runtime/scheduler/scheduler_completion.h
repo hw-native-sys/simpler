@@ -15,8 +15,8 @@
 
 #include "scheduler_cluster_mix.h"
 
-// Cancellation owns only an unstarted local handle. Armed groups retire at
-// the failed run's all-core fence before their storage can be reused.
+// Cancellation owns only an unstarted local handle. A published group retires
+// at the failed run's all-core fence before its storage can be reused.
 static inline __aicore__ bool
 scheduler_cancel_unstarted_handle(__gm__ void *base, SchedulerLocalState *local, SchedulerPreparedHandle *handle) {
     const auto *prepared = local->config.prepared;
@@ -24,9 +24,7 @@ scheduler_cancel_unstarted_handle(__gm__ void *base, SchedulerLocalState *local,
         scheduler_prepared_owner(handle->claimed_state) != local->worker_id())
         return false;
     const auto phase = scheduler_prepared_phase(handle->claimed_state);
-    if (phase != SchedulerPreparedPhase::CLAIMED && phase != SchedulerPreparedPhase::GROUP_RESERVED &&
-        phase != SchedulerPreparedPhase::FAILED)
-        return false;
+    if (phase != SchedulerPreparedPhase::CLAIMED && phase != SchedulerPreparedPhase::FAILED) return false;
     if (phase == SchedulerPreparedPhase::CLAIMED && scheduler_prepared_already_returned(base, prepared, *handle))
         return false;
     if (phase != SchedulerPreparedPhase::FAILED) {
@@ -82,11 +80,15 @@ static inline __aicore__ bool scheduler_cancel_unstarted_work(__gm__ void *base,
         if (!scheduler_cancel_unstarted_slot(base, local, index)) cancelled = false;
     auto &pending = local->cluster_pending;
     if (!scheduler_task_ref_is_null(pending.task_ref)) {
-        if (scheduler_cancel_unstarted_handle(base, local, &pending.anchor)) {
-            pending = {};
-        } else {
-            cancelled = false;
-        }
+        // No member was granted this group. Preserve its proxy identity without
+        // failing an unclaimed lane or contributing a return on its behalf.
+        scheduler_store_signal(
+            scheduler_worker_context_at(base, local, local->worker_id())->mix_proxy_cancelled,
+            scheduler_mix_proxy_state(
+                SchedulerMixProxyPhase::CANCELLED, static_cast<uint32_t>(pending.task_ref), pending.block_idx
+            )
+        );
+        pending = {};
     }
     return cancelled;
 }
@@ -95,7 +97,7 @@ static inline __aicore__ bool scheduler_cancel_unstarted_work(__gm__ void *base,
 // registration. Trace storage and slot resources remain owned until retirement
 // returns. Inactive MIX resource lanes have no executed slot to contribute.
 template <bool RecordProtocol = true>
-static inline __aicore__ SchedulerSubtaskFinishResult scheduler_contribute_subtask(
+static inline __aicore__ SchedulerSubtaskFinishResult scheduler_publish_fanout(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     const SchedulerLocalSlotState &completed, uint32_t pending_slot, uint64_t *completed_gate = nullptr
 ) {
@@ -147,7 +149,7 @@ static inline __aicore__ SchedulerSubtaskFinishResult scheduler_contribute_subta
 // PublishCompletion=false retires a real kernel return after sealing or another
 // post-return operation failed. It cannot grant task completion or a successor.
 template <bool RecordProtocol = true, bool FromExecutor = false, bool PublishCompletion = true>
-static inline __aicore__ bool scheduler_complete_own_slot(
+static inline __aicore__ bool scheduler_complete_lane_execution(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
     __gm__ SchedulerRunControl *run_control, uint32_t pending_slot, uint64_t profiling_level
 ) {
@@ -174,14 +176,21 @@ static inline __aicore__ bool scheduler_complete_own_slot(
         }
         const auto &metadata = *scheduler_task_metadata_at(scheduler_state_base, scheduler, task_ref);
         if (local_slot->cluster_mix) {
-            const auto &group = scheduler->cluster_mix;
+            if (pending_slot < SCHEDULER_CLUSTER_MIX_EXECUTION) {
+                scheduler_record_error(
+                    run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+                    SchedulerErrorSite::COMPLETION_SLOT_BINDING_INVALID, local_slot
+                );
+                return false;
+            }
+            const uint32_t bank = pending_slot - SCHEDULER_CLUSTER_MIX_EXECUTION;
+            const auto &group = scheduler->mix_groups[bank];
             const auto *signal = scheduler->cluster_signal;
             if (signal == nullptr || !scheduler_task_is_mix(metadata.flags) ||
                 group.phase != SchedulerGmMixPhase::RUNNING || group.task_ref != task_ref ||
-                pending_slot != SCHEDULER_CLUSTER_MIX_EXECUTION || group.block_idx != local_slot->block_idx ||
-                group.subtask_slot != local_slot->subtask_slot || group.active_mask != scheduler_task_lanes(metadata) ||
-                !scheduler_cluster_mix_armed(group.generation) ||
-                scheduler_cluster_load_acquire(&signal->armed_generation) != group.generation ||
+                group.block_idx != local_slot->block_idx || group.subtask_slot != local_slot->subtask_slot ||
+                group.active_mask != scheduler_task_lanes(metadata) || !scheduler_cluster_mix_armed(group.generation) ||
+                scheduler_cluster_load_acquire(&signal->groups[bank].armed_generation) != group.generation ||
                 scheduler_cluster_load_field(&signal->run_epoch) != scheduler->config.prepared->run_epoch) {
                 scheduler_record_error(
                     run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
@@ -223,7 +232,7 @@ static inline __aicore__ bool scheduler_complete_own_slot(
         }
         if constexpr (RecordProtocol)
             scheduler_protocol_execution_consumed(scheduler_state_base, scheduler, pending_slot, completed_slot);
-        contribution = scheduler_contribute_subtask<RecordProtocol>(
+        contribution = scheduler_publish_fanout<RecordProtocol>(
             graph, scheduler_state_base, scheduler, run_control, completed_slot, pending_slot, &completed_gate
         );
         retirement_inferred = contribution == SchedulerSubtaskFinishResult::TASK_LAST ||
@@ -259,7 +268,7 @@ static inline __aicore__ bool scheduler_complete_own_slot(
             completion_ok = scheduler_read_worker_error(run_control, scheduler->worker_id()) == 0;
         } else {
             if (!contribution_retires)
-                contribution = scheduler_contribute_subtask<RecordProtocol>(
+                contribution = scheduler_publish_fanout<RecordProtocol>(
                     graph, scheduler_state_base, scheduler, run_control, completed_slot, pending_slot, &completed_gate
                 );
             completion_ok = contribution != SchedulerSubtaskFinishResult::ERROR;
@@ -331,7 +340,7 @@ static inline __aicore__ bool scheduler_complete_own_slot(
     // Failed completion bypasses the contribution's visibility fence. Its real
     // return must still precede a resource-lane acknowledgement.
     if (!PublishCompletion || !completion_ok || completed_slot.cluster_mix) scheduler_cache_barrier();
-    if (completed_slot.cluster_mix && !scheduler_cluster_mix_release(
+    if (completed_slot.cluster_mix && !scheduler_release_mix_lane(
                                           graph, scheduler_state_base, scheduler, run_control, completed_slot,
                                           pending_slot, PublishCompletion && completion_ok
                                       ))

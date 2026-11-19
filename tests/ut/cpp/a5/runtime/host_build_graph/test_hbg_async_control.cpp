@@ -164,7 +164,7 @@ struct AsyncFixture {
         auto *state = local(worker);
         auto &slot = state->execution_at(0);
         ASSERT_EQ(scheduler_gm_fetch_add(task_control(slot.task_ref)->next_block, UINT64_C(1)), slot.block_idx);
-        ASSERT_TRUE(scheduler_acquire_execution_token(
+        ASSERT_TRUE(scheduler_claim_and_receive_payload(
             base(), state->config.prepared, worker, slot.task_ref, slot.block_idx, slot.subtask_slot, &slot.prepared
         ));
         ASSERT_TRUE(scheduler_close_ordinary_supply(
@@ -177,7 +177,7 @@ struct AsyncFixture {
         if (!storage.prepare_calls(graph.graph())) return false;
         for (uint64_t probe = 0; probe <= graph.graph().task_count; ++probe) {
             bool failed = false;
-            scheduler_fill_own_slots(graph.graph(), base(), local(), storage.run_control, 0, &failed, slot);
+            scheduler_find_local_execution(graph.graph(), base(), local(), storage.run_control, 0, &failed, slot);
             if (failed) return false;
             if (*slot != UINT32_MAX) return true;
         }
@@ -189,6 +189,18 @@ struct AsyncFixture {
         *task = local()->execution_at(slot).task_ref;
         if (selected != nullptr) *selected = slot;
         return true;
+    }
+    void run_single_block_producer() {
+        int64_t task = SCHEDULER_TASK_REF_INVALID;
+        uint32_t slot = UINT32_MAX;
+        ASSERT_TRUE(select_execution(&task, &slot));
+        ASSERT_EQ(task, 0);
+        local()->execution_at(slot).state = SchedulerDispatchSlotState::EXECUTING;
+        register_counter(start(), 0);
+        ASSERT_TRUE(scheduler_async_seal_execution(&workers[0], task, 0, 0, executions[0]));
+        ASSERT_TRUE((
+            scheduler_complete_lane_execution<false, true>(graph.graph(), base(), local(), storage.run_control, slot, 0)
+        ));
     }
     SchedulerTaskControl *task_control(int64_t ref) {
         return scheduler_state_at<SchedulerTaskControl>(base(), storage.layout.task_controls_offset) + ref;
@@ -248,7 +260,7 @@ struct AsyncFixture {
                 break;
             }
         }
-        return scheduler_contribute_subtask<false>(graph.graph(), base(), state, storage.run_control, slot, 0, gate);
+        return scheduler_publish_fanout<false>(graph.graph(), base(), state, storage.run_control, slot, 0, gate);
     }
     // close_computation is called by the last physical return. Drive that
     // precondition through the real counter operation, once per remaining unit.
@@ -406,9 +418,9 @@ TEST(HbgAsyncControl, CapableZeroConditionGroupStillPublishesItsReservedQAtPhysi
     slot.completion_credits = 2;  // Has a reserved group, but it sealed empty.
     f.bind_package();
 
-    ASSERT_TRUE(
-        (scheduler_complete_own_slot<false, true>(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0))
-    );
+    ASSERT_TRUE((scheduler_complete_lane_execution<false, true>(
+        f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0
+    )));
     EXPECT_EQ(count, 2u);
     EXPECT_EQ(scheduler_completion_counter_observe(counter[0]), 1);
     EXPECT_FALSE(f.check());
@@ -457,9 +469,9 @@ TEST(HbgAsyncControl, AddConditionsBeforeOrAfterPhysicalReturnNeedNoGlobalJoinOr
         f.bind_package();
 
         const auto returned = slot.prepared;
-        ASSERT_TRUE((
-            scheduler_complete_own_slot<false, true>(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0)
-        ));
+        ASSERT_TRUE((scheduler_complete_lane_execution<false, true>(
+            f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0
+        )));
         EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FREE);
         EXPECT_EQ(
             scheduler_prepared_phase(
@@ -491,7 +503,7 @@ TEST(HbgAsyncControl, AddConditionsBeforeOrAfterPhysicalReturnNeedNoGlobalJoinOr
         EXPECT_FALSE(f.done());
         bool progress = false;
         ASSERT_TRUE(
-            scheduler_service_counter_accounting(f.graph.graph(), f.base(), f.local(), f.storage.run_control, &progress)
+            scheduler_account_completed_tasks(f.graph.graph(), f.base(), f.local(), f.storage.run_control, &progress)
         );
         EXPECT_TRUE(progress);
         EXPECT_TRUE(f.done());
@@ -514,9 +526,9 @@ TEST(HbgAsyncControl, ReturnedExecutionReleasesSlotButCannotReleaseConsumerBefor
     f.bind_package();
 
     const auto returned_handle = slot.prepared;
-    ASSERT_TRUE(
-        (scheduler_complete_own_slot<false, true>(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0))
-    );
+    ASSERT_TRUE((scheduler_complete_lane_execution<false, true>(
+        f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0
+    )));
     EXPECT_TRUE(scheduler_prepared_already_returned(f.base(), f.local()->config.prepared, returned_handle));
     EXPECT_EQ(
         scheduler_prepared_phase(
@@ -587,7 +599,7 @@ TEST(HbgAsyncControl, ZeroConditionSingleExecutionPermitsItsPendingSuccessor) {
     slot.subtask_slot = 0;
     slot.state = SchedulerDispatchSlotState::EXECUTING;
     f.bind_package();
-    ASSERT_TRUE(scheduler_complete_own_slot(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0));
+    ASSERT_TRUE(scheduler_complete_lane_execution(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0));
     EXPECT_EQ(hbg_test_eligible_mask(f.local()), 0u);
     EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FREE);
     uint32_t direct_slot = UINT32_MAX;
@@ -622,9 +634,9 @@ TEST(HbgAsyncControl, LastSynchronousReturnHonorsAnEarlierPeersAsyncRegistration
         slot.subtask_slot = 1;
         slot.state = SchedulerDispatchSlotState::EXECUTING;
         f.bind_package(worker);
-        ASSERT_TRUE(
-            (scheduler_complete_own_slot<true, true>(f.graph.graph(), f.base(), local, f.storage.run_control, 0, 0))
-        );
+        ASSERT_TRUE((
+            scheduler_complete_lane_execution<true, true>(f.graph.graph(), f.base(), local, f.storage.run_control, 0, 0)
+        ));
         EXPECT_NE(
             scheduler_completion_task_state(f.task_control(0)->completion_state),
             static_cast<int64_t>(SchedulerTaskState::DONE)
@@ -824,10 +836,7 @@ TEST(HbgAsyncControl, BusinessReturnsBypassColdIdleDiscoveryDelay) {
 TEST(HbgAsyncControl, ContinuousBusinessReturnsServiceCheckAndFinishBeforeWorkRunsOut) {
     AsyncFixture f(2);
     f.graph.executable(1, 0, {0});
-    const auto writer = f.start();
-    f.register_counter(writer, 0);
-    ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
-    ASSERT_TRUE(f.close());
+    ASSERT_NO_FATAL_FAILURE(f.run_single_block_producer());
     constexpr uint32_t returns = 64;
     uint32_t completed = 0;
     for (; completed < returns; ++completed) {
@@ -1167,7 +1176,7 @@ TEST(HbgAsyncControl, TwoWaitersReleaseTheirOwnersWhileProducersAwaitInput) {
 
     const auto begin = [&](SchedulerLocalState *local, uint32_t slot) {
         bool permit = false;
-        return scheduler_can_enter_execution(f.graph.graph(), f.base(), local, f.storage.run_control, slot, &permit) &&
+        return scheduler_check_entry_permit(f.graph.graph(), f.base(), local, f.storage.run_control, slot, &permit) &&
                permit && hbg_test_begin_execution(local, slot);
     };
     // Two independently schedulable AIVs own the data-producing input blocks.
@@ -1176,7 +1185,7 @@ TEST(HbgAsyncControl, TwoWaitersReleaseTheirOwnersWhileProducersAwaitInput) {
         auto *peer = f.local(i + 1);
         bool failed = false;
         for (uint32_t visit = 0; visit < 6 && input_slots[i] == UINT32_MAX; ++visit)
-            scheduler_fill_own_slots(
+            scheduler_find_local_execution(
                 f.graph.graph(), f.base(), peer, f.storage.run_control, 0, &failed, &input_slots[i]
             );
         ASSERT_FALSE(failed);
@@ -1193,7 +1202,9 @@ TEST(HbgAsyncControl, TwoWaitersReleaseTheirOwnersWhileProducersAwaitInput) {
         ASSERT_TRUE(begin(f.local(), slot));
         f.register_counter(f.start(task), 1, i);
         ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], task, 0, 0, f.executions[0]));
-        ASSERT_TRUE(scheduler_complete_own_slot(f.graph.graph(), f.base(), f.local(), f.storage.run_control, slot, 0));
+        ASSERT_TRUE(
+            scheduler_complete_lane_execution(f.graph.graph(), f.base(), f.local(), f.storage.run_control, slot, 0)
+        );
         EXPECT_EQ(f.local()->execution_at(slot).state, SchedulerDispatchSlotState::FREE);
         EXPECT_EQ(scheduler_async_pending::pending(f.join(i).word), 1u);
     }
@@ -1209,9 +1220,9 @@ TEST(HbgAsyncControl, TwoWaitersReleaseTheirOwnersWhileProducersAwaitInput) {
 
     // The second AIV signals independently of the AIC waiting for the first AIV.
     __atomic_store_n(&f.signal[1], 1u, __ATOMIC_RELEASE);
-    ASSERT_TRUE(
-        scheduler_complete_own_slot(f.graph.graph(), f.base(), f.local(2), f.storage.run_control, input_slots[1], 0)
-    );
+    ASSERT_TRUE(scheduler_complete_lane_execution(
+        f.graph.graph(), f.base(), f.local(2), f.storage.run_control, input_slots[1], 0
+    ));
     for (uint32_t i = 0; i < 4; ++i)
         f.check();
     EXPECT_TRUE(scheduler_completion_done(f.task_control(first_wait + 1)->completion_state));
@@ -1219,9 +1230,9 @@ TEST(HbgAsyncControl, TwoWaitersReleaseTheirOwnersWhileProducersAwaitInput) {
     EXPECT_EQ(f.local()->execution_tokens[0].prepared.execution_index, fixed.execution_index);
     EXPECT_EQ(f.local()->execution_tokens[0].prepared.claimed_state, fixed.claimed_state);
 
-    ASSERT_TRUE(
-        scheduler_complete_own_slot(f.graph.graph(), f.base(), f.local(1), f.storage.run_control, input_slots[0], 0)
-    );
+    ASSERT_TRUE(scheduler_complete_lane_execution(
+        f.graph.graph(), f.base(), f.local(1), f.storage.run_control, input_slots[0], 0
+    ));
     std::set<int64_t> ran;
     for (uint32_t i = 0; i < 2; ++i) {
         int64_t task = -1;
@@ -1230,7 +1241,9 @@ TEST(HbgAsyncControl, TwoWaitersReleaseTheirOwnersWhileProducersAwaitInput) {
         ASSERT_TRUE(ran.insert(task).second);
         ASSERT_TRUE(begin(f.local(), slot));
         if (task == producers[0]) __atomic_store_n(&f.signal[0], 1u, __ATOMIC_RELEASE);
-        ASSERT_TRUE(scheduler_complete_own_slot(f.graph.graph(), f.base(), f.local(), f.storage.run_control, slot, 0));
+        ASSERT_TRUE(
+            scheduler_complete_lane_execution(f.graph.graph(), f.base(), f.local(), f.storage.run_control, slot, 0)
+        );
     }
     for (uint32_t i = 0; i < 4; ++i)
         f.check();
@@ -1261,7 +1274,9 @@ TEST(HbgAsyncControl, MoreWaitersThanWorkerSlotsLeavePublisherRunnableAndTermina
         slot.subtask_slot = 0;
         slot.state = SchedulerDispatchSlotState::EXECUTING;
         f.bind_package();
-        ASSERT_TRUE(scheduler_complete_own_slot(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0));
+        ASSERT_TRUE(
+            scheduler_complete_lane_execution(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, 0)
+        );
         EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FREE);
         EXPECT_EQ(
             scheduler_completion_task_state(f.task_control(task)->completion_state),
@@ -1296,7 +1311,7 @@ TEST(HbgAsyncControl, MoreWaitersThanWorkerSlotsLeavePublisherRunnableAndTermina
         __atomic_store_n(&f.signal[task], 1u, __ATOMIC_RELEASE);
     ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], publisher, 0, 0, writer));
     ASSERT_TRUE(
-        scheduler_complete_own_slot(f.graph.graph(), f.base(), f.local(), f.storage.run_control, slot_index, 0)
+        scheduler_complete_lane_execution(f.graph.graph(), f.base(), f.local(), f.storage.run_control, slot_index, 0)
     );
 
     for (uint32_t step = 0; step < waiter_count * worker_count; ++step) {
@@ -1343,10 +1358,7 @@ TEST(HbgAsyncControl, FinishPermitsAllSuccessorsAndCountsOnce) {
     for (uint32_t task = 1; task < 12; ++task) {
         f.graph.executable(task, 0, {0});
     }
-    const auto writer = f.start();
-    f.register_counter(writer, 0);
-    ASSERT_TRUE(scheduler_async_seal_execution(&f.workers[0], 0, 0, 0, f.executions[0]));
-    ASSERT_TRUE(f.close());
+    ASSERT_NO_FATAL_FAILURE(f.run_single_block_producer());
     EXPECT_TRUE(f.check(1));
     EXPECT_FALSE(f.check(0));
     EXPECT_FALSE(f.check(1));
@@ -1362,7 +1374,9 @@ TEST(HbgAsyncControl, FinishPermitsAllSuccessorsAndCountsOnce) {
         EXPECT_FALSE(seen[task]);
         seen[task] = true;
         f.local()->execution_at(slot).state = SchedulerDispatchSlotState::EXECUTING;
-        ASSERT_TRUE(scheduler_complete_own_slot(f.graph.graph(), f.base(), f.local(), f.storage.run_control, slot, 0));
+        ASSERT_TRUE(
+            scheduler_complete_lane_execution(f.graph.graph(), f.base(), f.local(), f.storage.run_control, slot, 0)
+        );
     }
     EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 12u);
     EXPECT_FALSE(f.check());

@@ -126,25 +126,29 @@ inline void log_aicore_scheduler_error_identity(SchedulerRunControl *run, const 
     );
 }
 
-// The enclosing error snapshot validates all image regions before this lookup.
-inline bool aicore_prepared_retirement_inferred(
-    uint64_t base, const SchedulerPreparedLayout &layout, uint64_t index, uint64_t state,
-    const SchedulerPreparedCall &call, uint64_t *completion = nullptr
-) {
-    if (scheduler_prepared_phase(state) != SchedulerPreparedPhase::CLAIMED || call.task_ref < 0 ||
-        static_cast<uint64_t>(call.task_ref) >= layout.task_count || index >= layout.execution_count)
-        return false;
-    const auto *plan = reinterpret_cast<const SchedulerExecutionPlan *>(base + layout.plans_offset) + call.task_ref;
-    const auto *task =
-        reinterpret_cast<const SchedulerTaskControl *>(base + layout.task_controls_offset) + call.task_ref;
-    cache_invalidate_range(plan, sizeof(*plan));
+// The enclosing error snapshot validates the task-control and plan regions.
+inline uint64_t aicore_prepared_completion_state(uint64_t base, const SchedulerPreparedLayout &layout, int64_t ref) {
+    if (ref < 0 || static_cast<uint64_t>(ref) >= layout.task_count) return 0;
+    const auto *task = reinterpret_cast<const SchedulerTaskControl *>(base + layout.task_controls_offset) + ref;
     cache_invalidate_range(
         reinterpret_cast<const uint8_t *>(task) + offsetof(SchedulerTaskControl, completion_state),
         sizeof(task->completion_state)
     );
-    const uint64_t gate = __atomic_load_n(&task->completion_state, __ATOMIC_ACQUIRE);
-    if (completion != nullptr) *completion = gate;
-    return scheduler_prepared_retirement_inferred(state, layout, index, call, *plan, gate);
+    return __atomic_load_n(&task->completion_state, __ATOMIC_ACQUIRE);
+}
+
+inline bool aicore_prepared_retirement_inferred(
+    uint64_t base, const SchedulerPreparedLayout &layout, uint64_t index, uint64_t state,
+    const SchedulerPreparedCall &call, uint64_t completion
+) {
+    if (scheduler_prepared_phase(state) != SchedulerPreparedPhase::CLAIMED ||
+        (state & SCHEDULER_PREPARED_MIX_OWNED) != 0 || call.task_ref < 0 ||
+        static_cast<uint64_t>(call.task_ref) >= layout.task_count || index >= layout.execution_count)
+        return false;
+    const auto *plan = reinterpret_cast<const SchedulerExecutionPlan *>(base + layout.plans_offset) + call.task_ref;
+    cache_invalidate_range(plan, sizeof(*plan));
+    rmb();
+    return scheduler_prepared_retirement_inferred(state, layout, index, call, *plan, completion);
 }
 
 inline void log_aicore_prepared_cell(uint64_t base, const SchedulerPreparedLayout &layout, uint64_t index) {
@@ -155,20 +159,24 @@ inline void log_aicore_prepared_cell(uint64_t base, const SchedulerPreparedLayou
     cache_invalidate_range(shared_call, sizeof(*shared_call));
     rmb();
     const auto call = *shared_call;
-    uint64_t completion = 0;
-    const bool inferred = aicore_prepared_retirement_inferred(base, layout, index, state, call, &completion);
+    const uint64_t completion = aicore_prepared_completion_state(base, layout, call.task_ref);
+    const bool inferred = aicore_prepared_retirement_inferred(base, layout, index, state, call, completion);
     const auto phase = inferred ? SchedulerPreparedPhase::RETURNED : scheduler_prepared_phase(state);
-    const uint32_t owner = scheduler_prepared_execute_owner(state);
-    const int64_t executor = owner == UINT32_MAX ? -1 : static_cast<int64_t>(owner);
+    const uint32_t owner = scheduler_prepared_owner(state);
+    const uint32_t executor = scheduler_prepared_execute_owner(state);
     const uint64_t binding = base + layout.bindings_offset + index * sizeof(SchedulerExecutionBinding);
     LOG_ERROR(
         "A5 HBG prepared cell: index=%" PRIu64 " state=0x%" PRIx64 " phase=%" PRIu64 " raw_phase=%" PRIu64
-        " return_inferred=%u completion=0x%" PRIx64 " source=host execute_owner=%" PRId64 " call_epoch=%" PRIu64
-        " call_index=%" PRIu64 " call_task=%" PRId64 " call_block=%" PRIu32
-        " call_lane=%u num_args=%u function=0x%" PRIx64,
+        " return_inferred=%u completion=0x%" PRIx64 " source=host owner=%" PRId64 " execute_owner=%" PRId64
+        " mix_owned=%u mix_kernel_entered=%u call_epoch=%" PRIu64 " call_index=%" PRIu64 " call_task=%" PRId64
+        " call_block=%" PRIu32 " call_lane=%u num_args=%u function=0x%" PRIx64,
         index, state, static_cast<uint64_t>(phase), state & UINT64_C(255), static_cast<unsigned>(inferred), completion,
-        executor, call.run_epoch, call.execution_index, call.task_ref, call.block_idx,
-        static_cast<unsigned>(call.subtask_slot), static_cast<unsigned>(call.num_args), call.function_bin_addr
+        owner == UINT32_MAX ? INT64_C(-1) : static_cast<int64_t>(owner),
+        executor == UINT32_MAX ? INT64_C(-1) : static_cast<int64_t>(executor),
+        static_cast<unsigned>((state & SCHEDULER_PREPARED_MIX_OWNED) != 0),
+        static_cast<unsigned>(scheduler_prepared_mix_kernel_entered(state)), call.run_epoch, call.execution_index,
+        call.task_ref, call.block_idx, static_cast<unsigned>(call.subtask_slot), static_cast<unsigned>(call.num_args),
+        call.function_bin_addr
     );
     LOG_ERROR(
         "A5 HBG prepared contexts: index=%" PRIu64 " local=0x%" PRIx64 " expected_local=0x%" PRIx64 " global=0x%" PRIx64
@@ -181,6 +189,46 @@ inline void log_aicore_prepared_cell(uint64_t base, const SchedulerPreparedLayou
             "A5 HBG prepared argument: index=%" PRIu64 " arg=%u value=0x%" PRIx64, index, static_cast<unsigned>(arg),
             call.args[arg]
         );
+}
+
+inline void log_aicore_mix_proxy(
+    uint64_t base, const SchedulerPreparedLayout &layout, uint64_t worker, const SchedulerWorkerContext &context,
+    int32_t bank, uint64_t snapshot
+) {
+    const uint32_t ref = scheduler_mix_proxy_task_ref(snapshot);
+    const uint32_t block = scheduler_mix_proxy_block_idx(snapshot);
+    LOG_ERROR(
+        "A5 HBG MIX proxy: epoch=%" PRIu64 " worker=%" PRIu64 " physical_core_id=%" PRId32 " cluster=%" PRIu64
+        " bank=%" PRId32 " task=%" PRIu32 " block=%" PRIu32 " phase=%s",
+        layout.run_epoch, worker, context.physical_core_id, context.cluster_index, bank, ref, block,
+        scheduler_mix_proxy_phase_name(scheduler_mix_proxy_phase(snapshot))
+    );
+    if (ref >= layout.task_count) return;
+    const auto *shared_plan = reinterpret_cast<const SchedulerExecutionPlan *>(base + layout.plans_offset) + ref;
+    cache_invalidate_range(shared_plan, sizeof(*shared_plan));
+    rmb();
+    const auto plan = *shared_plan;
+    if (block >= plan.block_num || plan.active_mask_bits > 7 || plan.active_lane_count < 2 ||
+        plan.active_lane_count != __builtin_popcount(plan.active_mask_bits) ||
+        plan.execution_count != static_cast<uint32_t>(plan.block_num) * plan.active_lane_count ||
+        plan.execution_begin > layout.execution_count ||
+        plan.execution_count > layout.execution_count - plan.execution_begin)
+        return;
+    const auto *controls = reinterpret_cast<const SchedulerPreparedControl *>(base + layout.controls_offset);
+    uint64_t index = plan.execution_begin + static_cast<uint64_t>(block) * plan.active_lane_count;
+    // Each raw state carries the fixed owner's worker ID and its observed phase.
+    uint64_t states[SUBTASK_SLOT_COUNT]{};
+    for (uint32_t lane = 0; lane < SUBTASK_SLOT_COUNT; ++lane) {
+        if ((plan.active_mask_bits & (1U << lane)) == 0) continue;
+        cache_invalidate_range(&controls[index], sizeof(controls[index]));
+        states[lane] = __atomic_load_n(&controls[index++].state, __ATOMIC_ACQUIRE);
+    }
+    LOG_ERROR(
+        "A5 HBG MIX members: task=%" PRIu32 " block=%" PRIu32 " active_mask=0x%x aic=0x%" PRIx64 " aiv0=0x%" PRIx64
+        " aiv1=0x%" PRIx64 " completion=0x%" PRIx64,
+        ref, block, static_cast<unsigned>(plan.active_mask_bits), states[0], states[1], states[2],
+        aicore_prepared_completion_state(base, layout, ref)
+    );
 }
 
 inline void log_aicore_prepared_error(const SchedulerWorkerContext *context, SchedulerRunControl *run) {
@@ -234,21 +282,44 @@ inline void log_aicore_prepared_error(const SchedulerWorkerContext *context, Sch
         LOG_ERROR("A5 HBG prepared snapshot: invalid execution storage range");
         return;
     }
+    const uint64_t workers = run->active_worker_count;
+    if (workers <= SCHEDULER_WORKER_CAPACITY &&
+        region_valid(
+            context->worker_contexts_offset, workers, sizeof(SchedulerWorkerContext), alignof(SchedulerWorkerContext)
+        )) {
+        const auto *contexts = reinterpret_cast<const SchedulerWorkerContext *>(base + context->worker_contexts_offset);
+        for (uint64_t worker = 0; worker < workers; ++worker) {
+            const auto &entry = contexts[worker];
+            cache_invalidate_range(
+                reinterpret_cast<const uint8_t *>(&entry) + offsetof(SchedulerWorkerContext, mix_proxy_acquired),
+                sizeof(SchedulerWorkerContext) - offsetof(SchedulerWorkerContext, mix_proxy_acquired)
+            );
+            scheduler_visit_mix_proxy_records(entry, [&](int32_t bank, uint64_t state) {
+                log_aicore_mix_proxy(base, layout, worker, entry, bank, state);
+            });
+        }
+    }
     if (run->error_task_ref >= layout.task_count || (run->error_identity_fields & SCHEDULER_ERROR_HAS_BLOCK) == 0) {
-        // A trapped kernel cannot publish its error identity. Report a bounded
-        // set of owned immutable calls when the supervisor detects the stall.
-        uint32_t reported = 0;
+        // Each phase has its own budget so cancelled peers cannot hide a trapped kernel.
+        uint32_t reported[static_cast<uint32_t>(SchedulerPreparedPhase::ENTERED) + 1]{};
         const auto *controls = reinterpret_cast<const SchedulerPreparedControl *>(base + layout.controls_offset);
-        for (uint64_t index = 0; index < layout.execution_count && reported < 8; ++index) {
+        for (uint64_t index = 0; index < layout.execution_count; ++index) {
             cache_invalidate_range(&controls[index], sizeof(controls[index]));
             const uint64_t state = __atomic_load_n(&controls[index].state, __ATOMIC_ACQUIRE);
-            if ((state & UINT64_C(255)) != static_cast<uint64_t>(SchedulerPreparedPhase::CLAIMED)) continue;
+            const auto phase = scheduler_prepared_phase(state);
+            if (phase < SchedulerPreparedPhase::CLAIMED || phase > SchedulerPreparedPhase::ENTERED ||
+                (phase == SchedulerPreparedPhase::RETURNED && (state & SCHEDULER_PREPARED_MIX_OWNED) == 0) ||
+                reported[static_cast<uint32_t>(phase)] >= 8)
+                continue;
             const auto *call = reinterpret_cast<const SchedulerPreparedCall *>(base + layout.calls_offset) + index;
             cache_invalidate_range(call, sizeof(*call));
             rmb();
-            if (aicore_prepared_retirement_inferred(base, layout, index, state, *call)) continue;
+            const uint64_t completion = aicore_prepared_completion_state(base, layout, call->task_ref);
+            if (aicore_prepared_retirement_inferred(base, layout, index, state, *call, completion) ||
+                (phase == SchedulerPreparedPhase::RETURNED && scheduler_completion_done(completion)))
+                continue;
             log_aicore_prepared_cell(base, layout, index);
-            ++reported;
+            ++reported[static_cast<uint32_t>(phase)];
         }
         return;
     }

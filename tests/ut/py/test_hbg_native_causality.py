@@ -437,10 +437,42 @@ def test_ordinary_slot_reuse_requires_prior_trace_retirement():
         audit_native_protocol(raw, identities)
 
 
-def test_ordinary_blocks_reuse_four_original_records_after_retirement():
+@pytest.mark.parametrize("window", (2, 3, 4))
+def test_ordinary_blocks_reuse_original_records_after_retirement(window):
     raw, identities = ProtocolBuilder([(1, 5, ())], clusters=1).run()
-    assert {row["pending_slot"] for row in raw["executions"]} == {0, 1, 2, 3}
+    if window > 2:
+        for row in raw["executions"] + identities:
+            row["pending_slot"] = row["block_idx"] % window
+    assert {row["pending_slot"] for row in raw["executions"]} == set(range(window))
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+
+
+@pytest.mark.parametrize("same_bank", (False, True))
+def test_mix_can_publish_other_bank_before_retirement(same_bank):
+    raw, identities = ProtocolBuilder([(7, 1, ()), (7, 1, ())], clusters=1).run()
+    earlier, later = [block["owner"] for block in raw["blocks"]]
+    for offset, field in enumerate(("completion_before", "completion_after"), 1):
+        earlier[field][0] = later["publish_after"][0] + offset
+    if same_bank:
+        for row in raw["executions"] + identities:
+            row["pending_slot"] = 4
+    resequence(raw)
+    if same_bank:
+        with pytest.raises(ValueError, match="MIX descriptor reused"):
+            audit_native_protocol(raw, identities)
+    else:
+        assert audit_native_protocol(raw, identities)["protocol_verified"]
+
+
+def test_other_bank_cannot_arrive_before_this_lane_accounts_for_its_previous_group():
+    raw, identities = ProtocolBuilder([(7, 1, ()), (7, 1, ())], clusters=1).run()
+    earlier = raw["blocks"][0]["owner"]
+    lane = next(row for row in raw["blocks"][1]["lanes"] if row["worker_index"] == earlier["completion_worker"])
+    for offset, field in enumerate(("completion_before", "completion_after"), 1):
+        earlier[field][0] = lane["arrive_before"][0] + offset
+    resequence(raw)
+    with pytest.raises(ValueError, match="MIX lane still owes"):
+        audit_native_protocol(raw, identities)
 
 
 def test_cross_core_successor_can_enter_before_producer_trace_publication():

@@ -261,6 +261,105 @@ TEST(CoreAsyncCapability, RejectsMalformedDeclaration) {
     EXPECT_THROW(validate_chip_callable_buffer(bytes.data(), bytes.size()), std::invalid_argument);
 }
 
+TEST(CoreInputCacheProof, PacksCompilerFooterWithoutChangingExecutableImage) {
+    // Five text bytes followed by the little-endian compiler footer, intentionally unaligned.
+    std::vector<uint8_t> artifact{0x2d, 0xaf, 0x13, 0x94, 0xd6, 'H',  'C', 'P', '1', 2, 1,  2, 2, 0x0e, 0xd2,
+                                  0x44, 0x41, 0x60, 0xc5, 0x85, 0x75, 1,   4,   8,   0, 16, 0, 0, 0};
+    artifact.resize(5 + 40, 0);
+    auto pack = [&](size_t bytes) {
+        const int id = 3;
+        auto child = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, artifact.data(), bytes);
+        return make_chip_callable(nullptr, 0, "orch", nullptr, 0, &id, &child, 1, "");
+    };
+    const auto original = pack(5);
+    const auto annotated = pack(artifact.size());
+    ASSERT_EQ(original.size(), annotated.size());
+    const auto &child = as_chip(annotated)->child(0);
+    ASSERT_EQ(child.binary_size(), 5u);
+    EXPECT_EQ(std::memcmp(child.binary_data(), artifact.data(), 5), 0);
+    EXPECT_EQ(as_chip(original)->child_offset(0), as_chip(annotated)->child_offset(0));
+    const auto raw_layout = compute_chip_callable_layout(as_chip(original));
+    const auto proof_layout = compute_chip_callable_layout(as_chip(annotated));
+    EXPECT_EQ(proof_layout.aicore_image_hash, raw_layout.aicore_image_hash);
+    EXPECT_NE(proof_layout.content_hash, raw_layout.content_hash);
+    const auto proofs = chip_callable_input_cache_proofs(as_chip(annotated), 4);
+    ASSERT_EQ(proofs.size(), 4u);
+    EXPECT_EQ(proofs[2].mode, CoreInputCacheMode::UNKNOWN);
+    EXPECT_EQ(proofs[3].mode, CoreInputCacheMode::SCALAR_RANGES);
+    EXPECT_EQ(proofs[3].min_tensor_count, 2u);
+    EXPECT_EQ(proofs[3].core_mask, CORE_INPUT_CACHE_AIV);
+    EXPECT_EQ(proofs[3].ranges[0].tensor_arg, 1u);
+    EXPECT_EQ(proofs[3].ranges[0].byte_length, 8u);
+    EXPECT_EQ(proofs[3].ranges[0].byte_offset, 16u);
+    EXPECT_EQ(proofs[3].ranges[0].start_offset_scale, 4u);
+    EXPECT_TRUE(chip_callable_input_cache_proofs(as_chip(original), 4).empty());
+
+    // An accidental marker at the end of an ordinary binary must never trim raw code.
+    artifact[0] ^= 1;
+    const auto unrecognized = pack(artifact.size());
+    const auto &raw = as_chip(unrecognized)->child(0);
+    ASSERT_EQ(raw.binary_size(), artifact.size());
+    EXPECT_EQ(std::memcmp(raw.binary_data(), artifact.data(), artifact.size()), 0);
+    EXPECT_TRUE(chip_callable_input_cache_proofs(as_chip(unrecognized), 4).empty());
+}
+
+TEST(CoreInputCacheProof, RejectsMalformedFieldsEvenWithMatchingDigest) {
+    const uint8_t code[] = {1, 2, 3};
+    const auto valid = [&](CoreInputCacheProof proof) {
+        proof.digest = core_input_cache_proof_digest(proof, code, sizeof(code));
+        return core_input_cache_proof_matches_text(proof, code, sizeof(code));
+    };
+    CoreInputCacheProof proof{};
+    proof.magic = CORE_INPUT_CACHE_PROOF_MAGIC;
+    proof.mode = CoreInputCacheMode::NO_CACHED_READS;
+    EXPECT_FALSE(valid(proof));
+    proof.core_mask = 4;
+    EXPECT_FALSE(valid(proof));
+    proof.core_mask = CORE_INPUT_CACHE_BOTH;
+    EXPECT_TRUE(valid(proof));
+    proof.min_tensor_count = CORE_MAX_TENSOR_ARGS + 1;
+    EXPECT_FALSE(valid(proof));
+    proof.min_tensor_count = 1;
+    proof.range_count = 1;
+    proof.ranges[0] = {0, 4, 1, 3};
+    EXPECT_FALSE(valid(proof));
+    proof.mode = CoreInputCacheMode::SCALAR_RANGES;
+    EXPECT_TRUE(valid(proof));
+    proof.ranges[0].tensor_arg = 1;
+    EXPECT_FALSE(valid(proof));
+    proof.ranges[0] = {0, 3, 1, 3};
+    EXPECT_FALSE(valid(proof));
+    proof.ranges[0] = {0, 4, 0, 3};
+    EXPECT_FALSE(valid(proof));
+    proof.ranges[0] = {0, 4, 1, 3};
+    proof.ranges[1].byte_length = 4;
+    EXPECT_FALSE(valid(proof));
+    proof.range_count = 4;
+    EXPECT_FALSE(valid(proof));
+}
+
+TEST(CoreInputCacheProof, RegistrationChecksCurrentCodeAndLastChildForEachFunction) {
+    auto buffer = make_chip_with_children({2, 4, 2});
+    auto *chip = reinterpret_cast<ChipCallable *>(buffer.data());
+    for (int i : {0, 1}) {
+        auto &child = const_cast<CoreCallable &>(chip->child(i));
+        CoreInputCacheProof proof{};
+        proof.magic = CORE_INPUT_CACHE_PROOF_MAGIC;
+        proof.mode = CoreInputCacheMode::NO_CACHED_READS;
+        proof.core_mask = CORE_INPUT_CACHE_AIC;
+        proof.digest = core_input_cache_proof_digest(proof, child.binary_data(), child.binary_size());
+        std::memcpy(child.storage_, &proof, sizeof(proof));
+    }
+    auto proofs = chip_callable_input_cache_proofs(chip, 5);
+    ASSERT_EQ(proofs.size(), 5u);
+    EXPECT_EQ(proofs[4].mode, CoreInputCacheMode::NO_CACHED_READS);
+    EXPECT_EQ(proofs[2].mode, CoreInputCacheMode::UNKNOWN);
+    auto *text = static_cast<uint8_t *>(const_cast<void *>(chip->child(1).binary_data()));
+    text[0] ^= 1;
+    proofs = chip_callable_input_cache_proofs(chip, 5);
+    EXPECT_EQ(proofs[4].mode, CoreInputCacheMode::UNKNOWN);
+}
+
 TEST(CoreAsyncCapability, UnknownIngressHasCanonicalIdentityWithoutChangingInput) {
     auto canonical = make_chip_with_children({0});
     auto *canonical_chip = reinterpret_cast<ChipCallable *>(canonical.data());
