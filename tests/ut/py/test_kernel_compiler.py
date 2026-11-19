@@ -169,6 +169,7 @@ def test_ascend_incore_include_search_runs_once_per_install(monkeypatch, tmp_pat
     [
         ("a2a3sim", "-DPTO_CPU_SIM_TARGET_A2A3", "-DPTO_CPU_SIM_TARGET_A5"),
         ("a5sim", "-DPTO_CPU_SIM_TARGET_A5", "-DPTO_CPU_SIM_TARGET_A2A3"),
+        ("wsesim", "-DPTO_CPU_SIM_TARGET_LINX", "-DPTO_CPU_SIM_TARGET_A5"),
     ],
 )
 def test_sim_target_flag_matches_platform_in_command_and_cache(

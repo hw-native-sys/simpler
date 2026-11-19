@@ -1,6 +1,6 @@
 {
   "baseline": "c1c234667d54f4aea1582249448b24f9a08753f6",
-  "semantics": "wse-fixed-sram-full-device-block-scheduling-with-temporary-fp32-operations",
+  "semantics": "wse-fixed-sram-full-device-block-scheduling-with-linx-cpu-tile-operations",
   "files": [
     {
       "source": "src/a5/platform/include/common/kernel_args.h",
@@ -35,7 +35,7 @@
     {
       "source": "src/a5/platform/sim/aicore/CMakeLists.txt",
       "destination": "src/wse/platform/sim/aicore/CMakeLists.txt",
-      "sha256": "e65a4aa0859a931df379284429556cc207aab096740b00e77380699cc1acce63"
+      "sha256": "56839111d571f1c86dbfc47c6ddff78ec2f401d576421146f66ff8e6933fa942"
     },
     {
       "source": "src/a5/platform/sim/host/CMakeLists.txt",
@@ -45,7 +45,7 @@
     {
       "source": "src/a5/platform/sim/host/device_runner.cpp",
       "destination": "src/wse/platform/sim/host/device_runner.cpp",
-      "sha256": "4f43901633ceee71fed1310520fdc713aba447f48b39097d0ad99f7f255a226b"
+      "sha256": "ec22eaa43fce0b7e4aa2b0bc9521813cdd1044cdab1e6db87aa9fdd68a554980"
     },
     {
       "source": "src/a5/platform/sim/host/device_runner.h",
@@ -60,7 +60,7 @@
     {
       "source": "src/a5/runtime/host_build_graph/build_config.py",
       "destination": "src/wse/runtime/host_build_graph/build_config.py",
-      "sha256": "ec90dc914bbe7165941d27681bdb554e2f84afc5683bf3f6269335b0912a8fc4"
+      "sha256": "3addec46fa2bd5be0fab229c25bd831ae40306715d789087a1242ba76e0f780a"
     },
     {
       "source": "src/a5/runtime/host_build_graph/common/intrinsic.h",
@@ -147,19 +147,19 @@
       "source": "tests/st/a5/host_build_graph/vector_example/kernels/aiv/kernel_add_scalar.cpp",
       "destination": "tests/st/wse/host_build_graph/vector_example/kernels/aiv/kernel_add_scalar.cpp",
       "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
-      "sha256": "25bda1ff1e9523f75bf468ac36f32487760f51506131ef84963bcbcd51261032"
+      "sha256": "1e29c160fab59a898042691a834d3b07b43db73e6f2a8cc1ab8feb445d7774ed"
     },
     {
       "source": "tests/st/a5/host_build_graph/vector_example/kernels/aiv/kernel_add.cpp",
       "destination": "tests/st/wse/host_build_graph/vector_example/kernels/aiv/kernel_add.cpp",
       "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
-      "sha256": "97210de242d4d771fc576ac0f4fa8ae9ef6e15739162688ca0a39d140830bc2b"
+      "sha256": "a04243b5fb4f4382fd60ed7fb0eca79bd84ce386bafecd9d82f6bf3a66c80507"
     },
     {
       "source": "tests/st/a5/host_build_graph/vector_example/kernels/aiv/kernel_mul.cpp",
       "destination": "tests/st/wse/host_build_graph/vector_example/kernels/aiv/kernel_mul.cpp",
       "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
-      "sha256": "1267d768188feb99ad6cfa05b70362e6f8a71173d27385a0ae6cb6e731b20ab3"
+      "sha256": "3601f068b436b0e564495d18babafc66f0cb07fa8f1e7c39ef8bbe5d7ee0ff01"
     },
     {
       "source": "tests/st/a5/host_build_graph/vector_example/test_vector_example.py",
@@ -171,12 +171,12 @@
       "source": "tests/st/a5/host_build_graph/predicated_dispatch/test_predicated_dispatch.py",
       "destination": "tests/st/wse/host_build_graph/direct_launch/test_predicate.py",
       "source_commit": "8a78542bda22d69d51cf88b5f95b5ba79de46e19",
-      "sha256": "54bfcfbb919155a6e6a0c3623c70883be05b0e0e675aa4fe8495017a3095b431"
+      "sha256": "afdc7eb1aca49d9b87a77181d1ee3c9e342cef643bcc5050822cc909e0ed4a32"
     }
   ],
   "derivation_baseline": "a3a951a1f9ef4dd898b254dc88f233b9cfac0b32",
   "scope": "Provenance of inherited files; this is not a build or runtime component manifest.",
-  "operation_backend": "wse-temporary-fp32",
+  "operation_backend": "pto-linx-cpu",
   "reused_sources": [
     {
       "source": "src/a5/platform/include/common/pmu_profiling.h",
@@ -205,22 +205,6 @@
     {
       "source": "src/common/host_build_graph/full_arena/aicore_completion_mailbox.h",
       "sha256": "ef6ed6ef50c43adcbc46318bda2604ccf4e9a813370d1b9d838e86e05efae151"
-    },
-    {
-      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/aic/kernel_write_gate.cpp",
-      "sha256": "3cb84e7cac466b6a73f7defe0718f077b16cebc52c5c381902e436266c1a8030"
-    },
-    {
-      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/aic/kernel_copy_first.cpp",
-      "sha256": "f9dc321482e73938ca0ace2f8f8f09004617f30986689f7200e778eca0504751"
-    },
-    {
-      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/aic/kernel_clobber.cpp",
-      "sha256": "f323ad50f897b0452c154ea260f167438cdab447ce4d3c3cbe5d4da0504ee3ea"
-    },
-    {
-      "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/aic/kernel_write_const.cpp",
-      "sha256": "74abaf7aaf19db0347be56e174df0ae2166178553aa2cba0a25f0bfa7bb8370b"
     },
     {
       "source": "tests/st/a5/host_build_graph/predicated_dispatch/kernels/orchestration/predicated_dispatch_orch.cpp",

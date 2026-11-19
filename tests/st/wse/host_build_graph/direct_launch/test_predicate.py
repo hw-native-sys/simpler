@@ -27,17 +27,18 @@ pytestmark = [pytest.mark.platforms(["wsesim"]), pytest.mark.runtime("host_build
 
 @lru_cache
 def build_predicate(platform):
-    here = Path(__file__).resolve().parents[3] / "a5/host_build_graph/predicated_dispatch"
+    here = Path(__file__).resolve().parent
+    fixture = here.parents[2] / "a5/host_build_graph/predicated_dispatch/kernels/orchestration"
     return build_callable(
         platform,
-        here,
-        "kernels/orchestration/predicated_dispatch_orch.cpp",
+        here / "kernels",
+        fixture / "predicated_dispatch_orch.cpp",
         [D.INOUT] * 3,
         [
-            ("kernels/aic/kernel_write_const.cpp", [D.INOUT]),
-            ("kernels/aic/kernel_copy_first.cpp", [D.IN, D.INOUT]),
-            ("kernels/aic/kernel_clobber.cpp", [D.INOUT]),
-            ("kernels/aic/kernel_write_gate.cpp", [D.INOUT]),
+            ("write_const.cpp", [D.INOUT]),
+            ("copy_first.cpp", [D.IN, D.INOUT]),
+            ("clobber.cpp", [D.INOUT]),
+            ("write_gate.cpp", [D.INOUT]),
         ],
     )
 

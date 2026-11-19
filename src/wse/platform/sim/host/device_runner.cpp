@@ -10,7 +10,6 @@
  */
 #include "device_runner.h"
 #include "common/dma_workspace.h"
-#include "cpu_sim_context.h"
 #include "host/raii_scope_guard.h"
 #include "host/sim_thread_start_gate.h"
 #include "host_log.h"
@@ -322,7 +321,6 @@ int DeviceRunner::finalize() {
 
     sram_.clear();
     host_graph_storage_.finalize();
-    clear_cpu_sim_shared_storage();
 
     device_id_ = -1;
     worker_count_ = 0;

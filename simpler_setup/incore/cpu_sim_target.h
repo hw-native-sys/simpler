@@ -13,15 +13,19 @@
 
 #include <pto/cpu/target_config.hpp>
 
+#if defined(PTO_CPU_SIM_TARGET_LINX)
+#include <wse/linx_kernel.h>
+static_assert(pto::CPU_SIM_TARGET == pto::CpuSimTarget::Linx, "WSE kernels require the Linx CPU simulator");
+#else
 static_assert(
     pto::CPU_SIM_TARGET == pto::CpuSimTarget::A2A3 || pto::CPU_SIM_TARGET == pto::CpuSimTarget::A5,
     "simpler CPU kernels require a supported fixed target family"
 );
+#endif
 
 // Every translation unit has the same fixed target; inline permits one export per linked image.
 extern "C" __attribute__((used, visibility("default"))) inline const char *simpler_cpu_sim_target() {
-#if defined(SIMPLER_CPU_SIM_TARGET_WSE)
-    static_assert(pto::CPU_SIM_TARGET == pto::CpuSimTarget::A5, "WSE compatibility kernels require A5 CPU semantics");
+#if defined(PTO_CPU_SIM_TARGET_LINX)
     return "wsesim";
 #else
     return pto::CPU_SIM_TARGET == pto::CpuSimTarget::A5 ? "a5sim" : "a2a3sim";

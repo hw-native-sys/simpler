@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Numerical, lifetime and rejection contracts for the temporary WSE backend."""
+"""WSE tensor bounds, Shared slot publication and Block lifetime on Linx."""
 
 import subprocess
 from pathlib import Path
@@ -14,256 +14,276 @@ from pathlib import Path
 import pytest
 
 from simpler_setup.kernel_compiler import KernelCompiler
+from simpler_setup.pto_isa import ensure_pto_isa_root
 
 _SOURCE = r"""
 #include <wse/tile_ops.h>
-#include <wse/block_lifecycle.h>
-#include <cassert>
+#include <array>
 #include <atomic>
-#include <cmath>
-#include <functional>
+#include <cassert>
+#include <latch>
 #include <limits>
 #include <thread>
-#include <vector>
 
-alignas(8) uint64_t block_epoch=1;
-wse::BlockOperationStorage storage[2][2];
-wse::BlockScope scope_for(int device, int core, uint64_t *epoch=&block_epoch, uint64_t expected=1) {
-    return {epoch,expected,nullptr,0,&storage[device][core],wse::BlockOperationStorage::get};
+struct Block {
+    uint64_t epoch = 1;
+    wse::SharedSlotTable slots{};
+    wse::BlockScope scope() { return {&epoch, epoch, nullptr, 0, &slots}; }
+};
+using Plane = pto::Tile<pto::Location::Vec, float, 4, 8, pto::BLayout::RowMajor, 2, 3>;
+using Slot = wse::SharedTileSlot<3, Plane>;
+auto memory(std::array<float, 6> &data) { return wse::tile_memory<2, 3>(data.data(), data.size()); }
+float read_last(Slot &slot, uint64_t generation) {
+    std::array<float, 6> elements{};
+    auto out = memory(elements);
+    auto tile = slot.read(generation);
+    TSTORE(out, tile);
+    return elements.back();
 }
-const wse::BlockScope scope=scope_for(0,0);
 
-void rejects(const std::function<void()> &call) {
-    bool caught=false;
-    try { call(); } catch (const std::exception &) { caught=true; }
+template <class Fn>
+void rejects(Fn call) {
+    bool caught = false;
+    try {
+        call();
+    } catch (const std::exception &) {
+        caught = true;
+    }
     assert(caught);
 }
-void numerical() {
-    float a[] = {1,2,3,77,4,5,6,88};
-    float b[] = {1,2,3,4,5,6};
-    float out[12]; for(auto &v:out) v=-111;
-    wse::Tile<2,3,wse::Layout::COLUMN_MAJOR> left;
-    wse::Tile<3,2> right;
-    wse::Tile<2,2,wse::Layout::COLUMN_MAJOR> product;
-    wse::TLOAD(left,{a,8,2,3,4,1});
-    wse::TLOAD(right,{b,6,3,2,2,1});
-    wse::TMATMUL(product,left,right);
-    wse::TMATMUL_ACC(product,product,left,right);
-    wse::TSTORE({out,12,2,2,6,2},product);
-    assert(out[0]==44 && out[2]==56 && out[6]==98 && out[8]==128);
-    for(int i:{1,3,4,5,7,9,10,11}) assert(out[i]==-111);
-    wse::Tile<2,2> x;
-    x.at(0,0)=-3; x.at(0,1)=4; x.at(1,0)=-0.0f; x.at(1,1)=std::numeric_limits<float>::quiet_NaN();
-    wse::TRELU(x,x);
-    assert(x.at(0,0)==0 && x.at(0,1)==4 && std::signbit(x.at(1,0)) && std::isnan(x.at(1,1)));
-    wse::Tile<2,2> m; m.at(0,0)=1;m.at(0,1)=2;m.at(1,0)=3;m.at(1,1)=4;
-    wse::TMATMUL(m,m,m);
-    assert(m.at(0,0)==7 && m.at(0,1)==10 && m.at(1,0)==15 && m.at(1,1)==22);
-}
-void fractional() {
-    wse::Tile<3,4,wse::Layout::COLUMN_MAJOR> a;
-    wse::Tile<4,5> b;
-    wse::Tile<3,5> result;
-    for(size_t r=0;r<3;++r)for(size_t k=0;k<4;++k)a.at(r,k)=(float(r*4+k)-5.0f)/7.0f;
-    for(size_t k=0;k<4;++k)for(size_t c=0;c<5;++c)b.at(k,c)=(float(k*5+c)-11.0f)/9.0f;
-    wse::TMATMUL(result,a,b);
-    wse::TMATMUL_ACC(result,result,a,b);
-    for(size_t r=0;r<3;++r)for(size_t c=0;c<5;++c) {
-        double expected=0;
-        for(size_t k=0;k<4;++k)expected+=2.0*double(a.at(r,k))*double(b.at(k,c));
-        assert(std::abs(double(result.at(r,c))-expected)<2e-5);
-    }
-}
+
 void ranges() {
-    float data[6]{}; wse::Tile<2,3> tile;
-    rejects([&]{wse::TLOAD(tile,{data,5,2,3,3,1});});
-    rejects([&]{wse::TSTORE({data,6,2,3,std::numeric_limits<size_t>::max(),1},tile);});
-    rejects([&]{wse::TLOAD(tile,{nullptr,6,2,3,3,1});});
-    rejects([&]{wse::TLOAD(tile,{data,6,1,3,3,1});});
-    rejects([&]{wse::TLOAD(tile,{data,6,2,3,0,1});});
-    for(float v:data) assert(v==0);
+    float data[] = {1, 2, 3, 77, 4, 5, 6};
+    std::array<float, 10> out;
+    out.fill(-1);
+    auto source = wse::tile_memory<2, 3, 4>(data, 7);
+    auto destination = wse::tile_memory<2, 3, 5>(out.data(), out.size(), 1);
+    Plane tile;
+    TLOAD(tile, source);
+    TSTORE(destination, tile);
+    assert((out == std::array<float, 10>{-1, 1, 2, 3, -1, -1, 4, 5, 6, -1}));
+    rejects([&] {
+        wse::tile_memory<2, 3>(data, 5);
+    });
+    rejects([&] {
+        wse::tile_memory<2, 3, 4>(data, 6);
+    });
+    rejects([&] {
+        wse::tile_memory<2, 3>(static_cast<float *>(nullptr), 6);
+    });
+    rejects([&] {
+        wse::tile_memory<2, 3>(data, 6, std::numeric_limits<size_t>::max());
+    });
+    rejects([&] {
+        wse::tile_memory<2, 3>(data, 6, 1);
+    });
 }
 void shared() {
-    std::vector<std::thread> threads;
-    std::array<std::array<float,4>,8> results{};
-    for(uint32_t core=0;core<2;++core) for(uint32_t pe=0;pe<4;++pe) threads.emplace_back([&,core,pe]{
-
-
-        wse::SharedTile<wse::Tile<2,3>> tile(pe, 0, 0, 15, scope_for(0,core));
-        for(uint64_t gen=1;gen<=4;++gen) {
-            if(pe==0) {
-                wse::Tile<2,3> value;
-                for(size_t r=0;r<2;++r) for(size_t c=0;c<3;++c) value.at(r,c)=core*100+gen*10+r*3+c;
-                tile.publish(gen,value);
+    auto launch = [](unsigned core) {
+        Block block;
+        pto::linx_cpu::runCore([&] {
+            Slot slot(core, 15, block.scope());
+            for (unsigned gen = 1; gen <= 4; ++gen) {
+                std::array<float, 6> value{};
+                value.back() = core * 100 + gen;
+                if (get_thread_idx() == core) slot.publish(gen, memory(value));
+                assert(read_last(slot, gen) == core * 100 + gen);
             }
-            auto value=tile.read(gen);
-            results[core*4+pe][gen-1]=value.at(1,2);
-        }
-    });
-    for(auto &thread:threads)thread.join();
-    for(int core=0;core<2;++core)for(int pe=0;pe<4;++pe)for(int gen=1;gen<=4;++gen)
-        assert(results[core*4+pe][gen-1]==core*100+gen*10+5);
-    for(auto &core:storage[0]) core.clear();
+        });
+    };
+    std::array<std::thread, 4> cores;
+    for (unsigned core = 0; core < 4; ++core)
+        cores[core] = std::thread(launch, core);
+    for (auto &thread : cores)
+        thread.join();
 }
 void overwrite_wait() {
-    using Shared=wse::SharedTile<wse::Tile<2,3>>;
-    std::atomic<uint32_t> waiting{0};
-    std::atomic<bool> finished{false};
-    auto notify=[](void *owner,wse::OperationEvent event,uint32_t,uint64_t generation) {
-        if(event==wse::OperationEvent::WAIT && generation==2) {
-            auto &flag=*static_cast<std::atomic<uint32_t>*>(owner);
-            flag.store(1,std::memory_order_release);flag.notify_one();
+    Block block;
+    std::atomic<bool> waiting{false};
+    auto trace = [](void *object, wse::OperationEvent event, uint32_t, uint64_t generation) {
+        if (event == wse::OperationEvent::WAIT && generation == 2 && get_thread_idx() == 0) {
+            auto &flag = *static_cast<std::atomic<bool> *>(object);
+            flag.store(true);
+            flag.notify_all();
         }
     };
-    std::thread producer([&] {
-
-
-        Shared slot(0,0,0,6,scope,{&waiting,notify});
-        wse::Tile<2,3> value;value.at(0,0)=11;slot.publish(1,value);
-        value.at(0,0)=22;slot.publish(2,value);
-        finished.store(true,std::memory_order_release);
+    pto::linx_cpu::runCore([&] {
+        Slot slot(0, 6, block.scope(), {&waiting, trace});
+        auto pe = get_thread_idx();
+        if (pe == 0) {
+            std::array<float, 6> values{};
+            values.back() = 11;
+            slot.publish(1, memory(values));
+            values.back() = 22;
+            slot.publish(2, memory(values));
+        } else if (pe < 3) {
+            waiting.wait(false);
+            assert(read_last(slot, 1) == 11);
+            assert(read_last(slot, 2) == 22);
+        }
     });
-    waiting.wait(0,std::memory_order_acquire);
-    Shared first(1,0,0,6,scope), last(2,0,0,6,scope);
-    assert(first.read(1).at(0,0)==11);
-    assert(!finished.load(std::memory_order_acquire));
-    assert(last.read(1).at(0,0)==11);
-    producer.join();
-    assert(finished.load(std::memory_order_acquire));
-    assert(first.read(2).at(0,0)==22 && last.read(2).at(0,0)==22);
+    Block next;
+    std::latch first_read(1);
+    pto::linx_cpu::runCore([&] {
+        Slot slot(0, 6, next.scope());
+        if (get_thread_idx() == 0) {
+            std::array<float, 6> value{};
+            slot.publish(1, memory(value));
+            first_read.wait();
+            rejects([&] { slot.publish(2, memory(value)); });
+        } else if (get_thread_idx() == 1) {
+            slot.read(1);
+            first_read.count_down();
+        }
+        // PE 2 exits without consuming generation 1.
+    });
 }
 void context_errors() {
-    using Shared=wse::SharedTile<wse::Tile<2,3>>;
-    rejects([&]{Shared s(0,0,0,1,{&block_epoch,1});});
-    rejects([&]{Shared s(4,0,0,1,scope);});
-    rejects([&]{Shared s(0,64,0,1,scope);});
-    rejects([&]{Shared s(0,0,4,1,scope);});
-    rejects([&]{Shared s(0,0,0,16,scope);});
-    Shared s(0,0,0,1,scope);wse::Tile<2,3> t;
-    rejects([&]{s.publish(2,t);});
-    rejects([&]{s.read(2);});
-    s.publish(1,t);
-    auto value=s.read(1);rejects([&]{s.read(1);});
-    rejects([&]{Shared mismatch(0,0,0,3,scope);});
-    rejects([&]{wse::SharedTile<wse::Tile<3,2>> mismatch(0,0,0,1,scope);});
-    Shared other(0,1,0,1,scope);other.publish(1,t);assert(other.read(1).at(0,0)==0);
-}
-void lifecycle() {
-    using Shared=wse::SharedTile<wse::Tile<2,3>>;
-    for(int repeat=0;repeat<2;++repeat) {
-        for(int device=0;device<2;++device) {
-
-
-
-            Shared slot(0,0,0,1,scope_for(device,0));
-            wse::Tile<2,3> value;value.at(0,0)=device+repeat*10;
-            slot.publish(1,value);
-        }
-        for(int device=0;device<2;++device) {
-
-            Shared slot(0,0,0,1,scope_for(device,0));
-            assert(slot.read(1).at(0,0)==device+repeat*10);
-            storage[device][0].clear();
-        }
-    }
-
-
+    Block block;
+    std::array<float, 6> values{};
+    rejects([&] {
+        Slot slot(0, 1, block.scope());
+    });
+    pto::linx_cpu::runCore(
+        [&] {
+            Slot slot(0, 1, block.scope());
+            rejects([&] {
+                Slot invalid(4, 1, block.scope());
+            });
+            rejects([&] {
+                Slot invalid(0, 0, block.scope());
+            });
+            rejects([&] {
+                Slot invalid(0, 2, block.scope());
+            });
+            rejects([&] {
+                Slot invalid(0, 1, {&block.epoch, block.epoch});
+            });
+            using Wrong = pto::Tile<pto::Location::Vec, float, 4, 8, pto::BLayout::RowMajor, 3, 2>;
+            rejects([&] {
+                wse::SharedTileSlot<3, Wrong> mismatch(0, 1, block.scope());
+            });
+            using Padded = pto::Tile<pto::Location::Vec, float, 4, 8, pto::BLayout::RowMajor, 2, 3,
+                                     pto::SLayout::NoneBox, 512, pto::PadValue::Zero>;
+            rejects([&] {
+                wse::SharedTileSlot<3, Padded> mismatch(0, 1, block.scope());
+            });
+            rejects([&] {
+                slot.publish(2, memory(values));
+            });
+            rejects([&] {
+                slot.read(1);
+            });
+            rejects([&] {
+                slot.read(2);
+            });
+            slot.publish(1, memory(values));
+            rejects([&] {
+                slot.publish(2, memory(values));
+            });
+            assert(read_last(slot, 1) == 0);
+            rejects([&] {
+                slot.read(1);
+            });
+        },
+        {1, {}}
+    );
+    block.slots = {};
+    pto::linx_cpu::runCore(
+        [&] {
+            Slot slot(0, 2, block.scope());
+            if (get_thread_idx() == 1) rejects([&] { slot.read(1); });
+        },
+        {2, {}}
+    );
 }
 void block_lifetime() {
-    uint64_t run_epoch=1, block_serial=1;
-    wse::BlockScope recorded{&block_serial,1,&run_epoch,1};
+    uint64_t run_epoch = 1, block_serial = 1;
+    wse::BlockScope recorded{&block_serial, 1, &run_epoch, 1};
     recorded.validate();
-    run_epoch=(uint64_t{1}<<32)+1;
-    rejects([&]{recorded.validate();});
-    uint64_t epochs[2]{1,1};
-    using Shared=wse::SharedTile<wse::Tile<2,3>>;
-    Shared old(0,0,0,1,scope_for(0,0,&epochs[0],1));
-    wse::Tile<2,3> value;value.at(0,0)=17;old.publish(1,value);
+    run_epoch = (uint64_t{1} << 32) + 1;
+    rejects([&] {
+        recorded.validate();
+    });
 
-    Shared other(0,0,0,1,scope_for(0,1,&epochs[1],1));
-    value.at(0,0)=23;other.publish(1,value);
-    __atomic_store_n(&epochs[0],0,__ATOMIC_RELEASE);
-    storage[0][0].clear();
-    rejects([&]{old.read(1);});
-    assert(other.read(1).at(0,0)==23);
-
-    __atomic_store_n(&epochs[0],2,__ATOMIC_RELEASE);
-    // Reusing the same slot may change its shape and starts at generation one.
-    wse::SharedTile<wse::Tile<3,2>> next(0,0,0,1,scope_for(0,0,&epochs[0],2));
-    wse::Tile<3,2> fresh;fresh.at(0,0)=41;next.publish(1,fresh);
-    assert(next.read(1).at(0,0)==41);
-    rejects([&]{old.publish(1,value);});
-    rejects([&]{Shared invalid(0,1,0,1,{&epochs[0],1});});
+    Block block;
+    for (int repeat = 1; repeat <= 2; ++repeat) {
+        pto::linx_cpu::runCore(
+            [&] {
+                Slot slot(0, 1, block.scope());
+                std::array<float, 6> value{};
+                value.back() = repeat;
+                slot.publish(1, memory(value));
+                assert(read_last(slot, 1) == repeat);
+                ++block.epoch;
+                rejects([&] { slot.publish(2, memory(value)); });
+            },
+            {1, {}}
+        );
+        block.slots = {};
+    }
 }
-int main(int argc,char **argv) {
-    assert(argc==2);
 
-
-
-    const std::string test=argv[1];
-    if(test=="numerical")numerical();
-    else if(test=="fractional")fractional();
-    else if(test=="ranges")ranges();
-    else if(test=="shared")shared();
-    else if(test=="context")context_errors();
-    else if(test=="overwrite")overwrite_wait();
-    else if(test=="lifecycle")lifecycle();
-    else if(test=="block")block_lifetime();
+int main(int argc, char **argv) {
+    assert(argc == 2);
+    const std::string test = argv[1];
+    if (test == "ranges") ranges();
+    else if (test == "shared") shared();
+    else if (test == "context") context_errors();
+    else if (test == "overwrite") overwrite_wait();
+    else if (test == "block") block_lifetime();
     else return 1;
-
 }
 """
 
 
 @pytest.fixture(scope="module")
-def operation_binary(tmp_path_factory):
+def compile_flags():
     root = Path(__file__).resolve().parents[3]
+    return [
+        KernelCompiler("wsesim").gxx15.cxx_path,
+        "-std=c++23",
+        "-O2",
+        "-pthread",
+        "-ffp-contract=off",
+        "-D__CPU_SIM",
+        "-DPTO_CPU_SIM_TARGET_LINX",
+        "-I" + str(Path(ensure_pto_isa_root()) / "include"),
+        "-I" + str(root / "src/wse/platform/include"),
+    ]
+
+
+@pytest.fixture(scope="module")
+def operation_binary(tmp_path_factory, compile_flags):
     directory = tmp_path_factory.mktemp("wse_operations")
     source = directory / "operations.cpp"
     source.write_text(_SOURCE)
     binary = directory / "operations"
-    compiler = KernelCompiler("wsesim")
-    subprocess.run(
-        [
-            compiler.gxx15.cxx_path,
-            "-std=c++23",
-            "-O2",
-            "-pthread",
-            "-I" + str(root / "src/wse/platform/include"),
-            str(source),
-            "-o",
-            str(binary),
-        ],
-        check=True,
-        timeout=90,
-    )
+    subprocess.run([*compile_flags, str(source), "-o", str(binary)], check=True, timeout=90)
     return binary
 
 
-@pytest.mark.parametrize(
-    "case", ["numerical", "fractional", "ranges", "shared", "context", "lifecycle", "overwrite", "block"]
-)
+@pytest.mark.parametrize("case", ["ranges", "shared", "context", "overwrite", "block"])
 def test_operation_contracts(operation_binary, case):
     subprocess.run([str(operation_binary), case], check=True, timeout=15)
 
 
-def test_unsupported_tile_shape_has_explicit_diagnostic(tmp_path):
-    root = Path(__file__).resolve().parents[3]
+@pytest.mark.parametrize(
+    ("fragment", "diagnostic"),
+    [
+        ("static_assert(sizeof(wse::SharedTileSlot<64, Weight>) > 0);", "Linx Shared slot must be S0..S63"),
+        (
+            "void small(wse::SharedTileSlot<0, Weight> &slot, float *one) {"
+            "slot.publish(1, wse::tile_memory<1, 1>(one, 1)); }",
+            "Linx Shared tile exceeds the source matrix dimensions",
+        ),
+    ],
+)
+def test_invalid_shared_operands_have_explicit_diagnostics(tmp_path, compile_flags, fragment, diagnostic):
     source = tmp_path / "unsupported.cpp"
-    source.write_text("#include <wse/tile_ops.h>\nwse::Tile<33,32> unsupported;\n")
-    compiler = KernelCompiler("wsesim")
+    source.write_text("#include <wse/tile_ops.h>\nusing Weight = pto::SharedMatrixRight<float, 32, 32>;\n" + fragment)
     result = subprocess.run(
-        [
-            compiler.gxx15.cxx_path,
-            "-std=c++23",
-            "-fsyntax-only",
-            "-I" + str(root / "src/wse/platform/include"),
-            str(source),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+        [*compile_flags, "-fsyntax-only", str(source)], check=False, capture_output=True, text=True, timeout=30
     )
     assert result.returncode != 0
-    assert "temporary WSE tiles require dimensions in [1,32]" in result.stderr
+    assert diagnostic in result.stderr

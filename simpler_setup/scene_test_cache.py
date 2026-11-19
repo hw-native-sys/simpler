@@ -26,7 +26,7 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
-from .compile_paths import compiler_visible_path
+from .compile_paths import CPU_SIM_FORCED_HEADERS, compiler_visible_path
 from .environment import PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
@@ -241,7 +241,15 @@ def compile_incore_artifact_key(
         from .elf_parser import ELF_TEXT_POLICY_VERSION  # noqa: PLC0415
 
         metadata = {**metadata, "text_extraction_policy": ELF_TEXT_POLICY_VERSION}
-    return _compile_source_key(metadata, [(source, include_dirs)], abi_token=None)
+    roots = tuple(Path(directory) for directory in include_dirs)
+    units = [(Path(source), roots)]
+    # A WSE kernel uses the Linx dispatch ABI even when its source includes no runtime headers.
+    if metadata.get("platform") == "wsesim":
+        for name in CPU_SIM_FORCED_HEADERS:
+            header = _resolve_include(name, False, Path(source), (PROJECT_ROOT, *roots))
+            if header is not None:
+                units.append((header, roots))
+    return _compile_source_key(metadata, units, abi_token=None)
 
 
 def _entry_paths(key: str) -> tuple[Path, Path, Path]:

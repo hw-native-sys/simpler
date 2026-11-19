@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+#include <pto/pto-inst.hpp>
 #include "intrinsic.h"
 #include "tensor.h"
 #include <stdexcept>
@@ -21,7 +22,8 @@ extern "C" void kernel_entry(int64_t *args) {
     record[2] = get_thread_idx(args);
     record[3] = get_thread_num(args);
     record[4] = get_core_id(args);
-    record[5] = get_pe_id(args);
+    pto::linx_cpu::syncCore();
+    record[5] = ::get_thread_idx();
     record[6] = token;
     record[7] = reinterpret_cast<uint64_t>(record);
 }

@@ -85,7 +85,7 @@ def prepare(worker, tensors):
 @pytest.mark.parametrize(
     "cores,blocks", [(40, 1), (40, 5), (40, 39), (40, 40), (40, 159), (0, 160), (40, 161), (0, 323)]
 )
-def test_temporary_operations_keep_independent_blocks(tmp_path, st_platform, cores, blocks):
+def test_linx_operations_keep_independent_blocks(tmp_path, st_platform, cores, blocks):
     worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=0)
     try:
         worker.init()

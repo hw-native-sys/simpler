@@ -9,8 +9,8 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #pragma once
-#include <wse/tile_ops.h>
-#include "intrinsic.h"
+#include "../../ffn_tiles.h"
+#include <algorithm>
 #include "sram_args.h"
 
 inline wse::SramView ffn_sram(int64_t *args, int index) {
@@ -19,22 +19,15 @@ inline wse::SramView ffn_sram(int64_t *args, int index) {
         throw std::invalid_argument("FFN requires live SRAM shards");
     return view;
 }
-inline wse::TensorView ffn_tile(int64_t *args, int index, size_t offset, bool transposed = false) {
-    auto view = ffn_sram(args, index);
-    if (offset > view.bytes / sizeof(float)) throw std::out_of_range("FFN shard offset");
-    return {
-        reinterpret_cast<float *>(view.address) + offset,
-        view.bytes / sizeof(float) - offset,
-        32,
-        32,
-        transposed ? 1u : 32u,
-        transposed ? 32u : 1u
-    };
+inline FfnMemory ffn_tile(const wse::SramView &view, size_t offset) {
+    return wse::tile_memory<32, 32>(reinterpret_cast<float *>(view.address), view.bytes / sizeof(float), offset);
 }
-inline void sram_ffn(int64_t *args, int stage) {
+
+template <int Stage>
+void sram_ffn(int64_t *args) {
     const auto block = get_block_idx(args);
     const size_t row = get_thread_idx(args);
-    const int tensors = stage == 1 ? 3 : 7;
+    const int tensors = Stage == 1 ? 3 : 7;
     const auto publisher = static_cast<uint32_t>(args[tensors]);
     const uint64_t generation = 1, instance = args[tensors + 1];
     const auto record_view = ffn_sram(args, tensors - 1);
@@ -42,7 +35,7 @@ inline void sram_ffn(int64_t *args, int stage) {
     if (record_offset + 20 > record_view.bytes / 8) throw std::out_of_range("FFN record extent");
     auto *record = reinterpret_cast<uint64_t *>(record_view.address) + record_offset;
     std::fill_n(record, 20, UINT64_MAX);
-    const int output_index = stage == 1 ? 1 : 5;
+    const int output_index = Stage == 1 ? 1 : 5;
     const auto output = ffn_sram(args, output_index);
     record[0] = get_core_id(args);
     record[1] = get_pe_id(args);
@@ -52,42 +45,35 @@ inline void sram_ffn(int64_t *args, int stage) {
     record[7] = generation;
     record[10] = block;
     record[11] = instance;
-    using Tile = wse::Tile<32, 32>;
-    Tile a, result;
-    if (stage == 1) {
+    auto destination = ffn_tile(output, row * 1024);
+    if constexpr (Stage == 1) {
         const auto input = ffn_sram(args, 0);
         record[4] = input.owner;
         record[5] = input.address + row * 4096;
-        wse::TLOAD(a, ffn_tile(args, 0, row * 1024));
-        wse::TRELU(result, a);
+        ffn_relu(ffn_tile(input, row * 1024), destination);
     } else {
         const auto weight = ffn_sram(args, 4);
         record[8] = weight.owner;
         record[9] = weight.address;
-        wse::SharedTile<Tile> weights(
-            get_pe_id(args), stage == 0 ? 0 : 1, publisher, 15, get_wse_block_scope(args), get_wse_operation_trace(args)
-        );
-        const size_t chunks = stage == 0 ? 1 : 4;
-        for (size_t k = 0; k < chunks; ++k) {
-            if (generation > UINT64_MAX - k) throw std::overflow_error("FFN generation overflow");
-            if (row == 0) {
-                Tile w;
-                wse::TLOAD(w, ffn_tile(args, 4, k * 1024, true));
-                weights.publish(generation + k, w);
-            }
-            const int input_index = stage == 0 ? row : k;
-            const size_t input_offset = stage == 0 ? 0 : row * 1024;
-            const auto input = ffn_sram(args, input_index);
+        constexpr size_t chunks = Stage == 0 ? 1 : 4;
+        auto input_shard = [&](size_t k) {
+            const int index = Stage == 0 ? row : k;
+            const size_t offset = Stage == 0 ? 0 : row * 1024;
+            const auto input = ffn_sram(args, index);
             if (k == 0) {
                 record[4] = input.owner;
-                record[5] = input.address + input_offset * 4;
+                record[5] = input.address + offset * sizeof(float);
             }
             record[12 + k * 2] = input.owner;
-            record[13 + k * 2] = input.address + input_offset * 4;
-            wse::TLOAD(a, ffn_tile(args, input_index, input_offset));
-            if (k == 0) wse::TMATMUL(result, a, weights, generation + k);
-            else wse::TMATMUL_ACC(result, result, a, weights, generation + k);
-        }
+            record[13 + k * 2] = input.address + offset * sizeof(float);
+            return ffn_tile(input, offset);
+        };
+        ffn_project<Stage == 0 ? 0 : 1>(
+            args, publisher, chunks, input_shard,
+            [&](size_t k) {
+                return ffn_tile(weight, k * 1024);
+            },
+            destination
+        );
     }
-    wse::TSTORE(ffn_tile(args, output_index, row * 1024), result);
 }

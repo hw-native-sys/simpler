@@ -172,17 +172,33 @@ def test_automatic_platform_discovery_uses_shared_host_compilers(monkeypatch, gc
     assert platforms == ["a2a3sim", "a5sim", "wsesim"]
 
 
+_LINX_KERNEL = r"""
+#include <pto/pto-inst.hpp>
+using namespace pto;
+
+extern "C" void kernel_entry(float *out) {
+    static_assert(CPU_SIM_TARGET == CpuSimTarget::Linx);
+    float values[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    Tile<Location::Vec, float, 1, 32, BLayout::RowMajor, 1, 8> input, result;
+    global_tensor<float, RowMajor<1, 8>> src(values), dst(out);
+    TLOAD(input, src);
+    TADDS(result, input, 3.0f);
+    TSTORE(dst, result);
+}
+"""
+
+
 @pytest.mark.parametrize("core_type", ["aic", "aiv"])
 def test_wse_target_keeps_peer_semantics_on_reused_thread(tmp_path, core_type):
     from tests.ut.py.test_cpu_sim_target import _KERNEL, _RUN  # noqa: PLC0415
 
     isa_root = ensure_pto_isa_root()
     source = tmp_path / "target.cpp"
-    source.write_text(_KERNEL)
     artifacts = {}
     tokens = {}
     for platform in ("a2a3sim", "a5sim", "wsesim"):
         compiler = KernelCompiler(platform)
+        source.write_text(_LINX_KERNEL if platform == "wsesim" else _KERNEL)
         role = "" if platform == "wsesim" else core_type
         binary = compiler.compile_incore(str(source), core_type=role, pto_isa_root=isa_root)
         path = tmp_path / f"{platform}.so"
@@ -191,7 +207,11 @@ def test_wse_target_keeps_peer_semantics_on_reused_thread(tmp_path, core_type):
         tokens[platform] = compiler.incore_compile_cache_token(role)
     assert len({json.dumps(token, sort_keys=True) for token in tokens.values()}) == 3
 
-    expected = {"a2a3sim": [1.0] * 8 + [2.0, 0.0], "a5sim": [0.0] * 8 + [5.0, 17.0], "wsesim": [0.0] * 8 + [5.0, 17.0]}
+    expected = {
+        "a2a3sim": [1.0] * 8 + [2.0, 0.0],
+        "a5sim": [0.0] * 8 + [5.0, 17.0],
+        "wsesim": list(range(3, 11)) + [0.0, 0.0],
+    }
     env = dict(os.environ)
     env.pop("PTO_CPU_SIM_ARCH", None)
     for order in (("a2a3sim", "a5sim", "wsesim"), ("wsesim", "a5sim", "a2a3sim")):

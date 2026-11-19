@@ -32,20 +32,20 @@ inline void shared_block_compute(int64_t *args, bool producer) {
     const auto pe = get_pe_id(args);
     if (!producer && pe == 0) return;
     ProbeTrace trace{get_wse_operation_trace(args), static_cast<uint32_t>(pe)};
-    wse::SharedTile<wse::Tile<2, 2>> shared(pe, 2, 0, 14, get_wse_block_scope(args), {&trace, probe_trace});
+    using Plane = pto::Tile<pto::Location::Vec, float, 4, 8, pto::BLayout::RowMajor, 2, 2>;
+    wse::SharedTileSlot<2, Plane> shared(0, 14, get_wse_block_scope(args), {&trace, probe_trace});
     if (producer) {
         auto gate = reinterpret_cast<void (*)(int)>(dlsym(RTLD_DEFAULT, "wse_shared_probe"));
         if (!gate) std::abort();
         gate(0);
-        wse::Tile<2, 2> value;
         auto *t = reinterpret_cast<Tensor *>(args[0]);
         auto *source = reinterpret_cast<float *>(t->buffer.addr) + t->start_offset;
-        wse::TLOAD(value, {source, 4, 2, 2, 2, 1});
-        shared.publish(1, value);
+        shared.publish(1, wse::tile_memory<2, 2>(source, 4));
     } else {
         auto value = shared.read(1);
         auto *t = reinterpret_cast<Tensor *>(args[1]);
         auto *out = reinterpret_cast<float *>(t->buffer.addr) + t->start_offset + get_thread_idx(args) * 4;
-        wse::TSTORE({out, 4, 2, 2, 2, 1}, value);
+        auto destination = wse::tile_memory<2, 2>(out, 4);
+        TSTORE(destination, value);
     }
 }

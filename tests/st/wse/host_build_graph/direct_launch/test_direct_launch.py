@@ -67,7 +67,7 @@ def test_mixed_entry_and_independent_blocks(tmp_path, blocks, st_platform):
         worker.init()
         handle = worker.register(build_mixed(st_platform))
         a = (torch.arange(1024, dtype=torch.float32).reshape(32, 32) % 7) - 3
-        b = torch.eye(32, dtype=torch.float32) * 2
+        b = (torch.arange(1024, dtype=torch.float32).reshape(32, 32) % 11) - 5
         tensors = [a, b, torch.full((blocks, 32, 32), -1.0), torch.full((blocks, 2), -1.0)]
         args = TaskArgs()
         for index, tensor in enumerate(tensors):

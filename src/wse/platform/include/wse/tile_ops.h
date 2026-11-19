@@ -9,18 +9,4 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #pragma once
-#include "wse/operation_trace.h"
 #include "../../sim/operations/tile_ops.h"
-
-namespace wse {
-inline constexpr const char *OPERATION_BACKEND = "wse-temporary-fp32";
-using temporary::Layout;
-using temporary::SharedTile;
-using temporary::TensorView;
-using temporary::Tile;
-using temporary::TLOAD;
-using temporary::TMATMUL;
-using temporary::TMATMUL_ACC;
-using temporary::TRELU;
-using temporary::TSTORE;
-}  // namespace wse

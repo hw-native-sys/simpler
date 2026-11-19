@@ -9,8 +9,33 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #pragma once
-#include "../../sim/operations/block_lifecycle.h"
+#include <exception>
+#include <memory>
+#include "wse/block_scope.h"
+#include "wse/linx_kernel_abi.h"
 
 namespace wse {
-using temporary::BlockOperationStorage;
+// A Core owns this state until every participating PE has returned from the Block.
+class BlockOperationStorage {
+public:
+    SharedSlotTable slots{};
+
+    void begin(const LinxKernel &kernel, uint32_t pe_mask) {
+        core_ = {kernel.create_core(pe_mask), kernel.destroy_core};
+        kernel_ = &kernel;
+    }
+    void invoke(uint32_t pe, int64_t *args) const { kernel_->invoke(core_.get(), pe, kernel_->entry, args); }
+    void cancel(const std::exception_ptr &error) const {
+        if (core_) kernel_->cancel(core_.get(), error);
+    }
+    void clear() {
+        core_.reset();
+        kernel_ = nullptr;
+        slots = {};
+    }
+
+private:
+    const LinxKernel *kernel_{nullptr};
+    std::unique_ptr<void, void (*)(void *)> core_{nullptr, nullptr};
+};
 }  // namespace wse

@@ -9,52 +9,38 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #pragma once
-#include <wse/tile_ops.h>
-#include "intrinsic.h"
+#include "../../ffn_tiles.h"
 #include "tensor.h"
 
-inline wse::TensorView
-ffn_view(int64_t *args, int index, size_t offset, size_t row_stride = 32, size_t col_stride = 1) {
+inline FfnMemory ffn_view(int64_t *args, int index, size_t offset) {
     const auto &t = *reinterpret_cast<Tensor *>(args[index]);
-    if (offset > t.numel()) throw std::out_of_range("FFN view offset");
-    return {reinterpret_cast<float *>(t.buffer.addr) + t.start_offset + offset,
-            t.numel() - offset,
-            32,
-            32,
-            row_stride,
-            col_stride};
+    return wse::tile_memory<32, 32>(reinterpret_cast<float *>(t.buffer.addr) + t.start_offset, t.numel(), offset);
 }
-inline void ffn_compute(int64_t *args, int stage) {
+
+template <int Stage>
+void ffn_compute(int64_t *args) {
     const auto block = get_block_idx(args);
     const size_t row = get_thread_idx(args), column = block;
     const size_t output_offset = column * 128 * 32 + row * 32 * 32;
-    using Tile = wse::Tile<32, 32>;
-    Tile a, result;
-    if (stage == 1) {
-        wse::TLOAD(a, ffn_view(args, 0, output_offset));
-        wse::TRELU(result, a);
-        wse::TSTORE(ffn_view(args, 1, output_offset), result);
-        return;
-    }
-    wse::SharedTile<Tile> weights(
-        get_pe_id(args), stage == 0 ? 0 : 1, 0, 15, get_wse_block_scope(args), get_wse_operation_trace(args)
-    );
-    const size_t chunks = stage == 0 ? 1 : 40;
-    for (size_t k = 0; k < chunks; ++k) {
-        if (row == 0) {
-            Tile weight;
-            wse::TLOAD(weight, ffn_view(args, 1, (column * chunks + k) * 1024, 1, 32));
-            weights.publish(k + 1, weight);
+    if constexpr (Stage == 1) {
+        ffn_relu(ffn_view(args, 0, output_offset), ffn_view(args, 1, output_offset));
+    } else {
+        constexpr size_t chunks = Stage == 0 ? 1 : 40;
+        ffn_project<Stage == 0 ? 0 : 1>(
+            args, 0, chunks,
+            [&](size_t k) {
+                return ffn_view(args, 0, row * 1024 + k * 128 * 32);
+            },
+            [&](size_t k) {
+                return ffn_view(args, 1, (column * chunks + k) * 1024);
+            },
+            ffn_view(args, 2, output_offset)
+        );
+        if constexpr (Stage == 0) {
+            auto *t = reinterpret_cast<Tensor *>(args[3]);
+            auto *ids = reinterpret_cast<float *>(t->buffer.addr) + t->start_offset;
+            ids[(row * 40 + block) * 2] = get_core_id(args);
+            ids[(row * 40 + block) * 2 + 1] = get_pe_id(args);
         }
-        wse::TLOAD(a, ffn_view(args, 0, row * 1024 + (stage == 0 ? 0 : k * 128 * 32)));
-        if (k == 0) wse::TMATMUL(result, a, weights, k + 1);
-        else wse::TMATMUL_ACC(result, result, a, weights, k + 1);
-    }
-    wse::TSTORE(ffn_view(args, 2, output_offset), result);
-    if (stage == 0) {
-        auto *t = reinterpret_cast<Tensor *>(args[3]);
-        auto *ids = reinterpret_cast<float *>(t->buffer.addr) + t->start_offset;
-        ids[(row * 40 + block) * 2] = get_core_id(args);
-        ids[(row * 40 + block) * 2 + 1] = get_pe_id(args);
     }
 }
