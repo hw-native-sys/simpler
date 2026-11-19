@@ -8,13 +8,11 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#include <pto/pto-inst.hpp>
-#include "tensor.h"
 #include "intrinsic.h"
+#include "scalar_tile.h"
+
 extern "C" void kernel_entry(int64_t *args) {
-    auto *tensor = reinterpret_cast<Tensor *>(args[0]);
-    auto *out = reinterpret_cast<float *>(tensor->buffer.addr) + tensor->start_offset;
     const int block = get_block_idx(args);
     for (int region = 0; region < 3; ++region)
-        out[(block * 3 + region) * 16] = float(block);
+        wse_test::write_scalar(args[0], static_cast<float>(block), (block * 3 + region) * 16);
 }

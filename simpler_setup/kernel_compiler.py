@@ -22,7 +22,7 @@ from typing import Optional, Union
 
 from simpler import env_manager
 
-from .compile_paths import compiler_visible_path
+from .compile_paths import CPU_SIM_FORCED_HEADERS, compiler_visible_path
 from .environment import PROJECT_ROOT
 from .pto_isa import ensure_pto_isa_root, read_pto_isa_pin
 from .toolchain import (
@@ -60,7 +60,7 @@ _ARTIFACT_LOGIC_MODULES = (
 _CPU_SIM_TARGET_FLAGS = {
     "a2a3sim": ("-DPTO_CPU_SIM_TARGET_A2A3",),
     "a5sim": ("-DPTO_CPU_SIM_TARGET_A5",),
-    "wsesim": ("-DPTO_CPU_SIM_TARGET_A5", "-DSIMPLER_CPU_SIM_TARGET_WSE"),
+    "wsesim": ("-DPTO_CPU_SIM_TARGET_LINX", "-ffp-contract=off", "-pthread"),
 }
 
 
@@ -226,7 +226,7 @@ class KernelCompiler:
             self.aarch64 = None
             self.host_gxx = GxxToolchain(prefer_g15=bool(self._sanitizers))
 
-        self.gxx15 = Gxx15Toolchain()
+        self.gxx15 = Gxx15Toolchain(reloadable=platform == "wsesim")
         self.ccu = CCUToolchain(self.host_gxx) if platform == "a5" else None
 
     def _sanitizer_flags(self, toolchain) -> list[str]:
@@ -246,15 +246,10 @@ class KernelCompiler:
             target_flags = _CPU_SIM_TARGET_FLAGS[self.platform]
         except KeyError as error:
             raise ValueError(f"Unsupported CPU simulator platform: {self.platform}") from error
-        return [
-            *self.gxx15.get_compile_flags(core_type=core_type),
-            *target_flags,
-            "-include",
-            "pto/cpu/target_config.hpp",
-            "-include",
-            "cpu_sim_target.h",
-            *self._sanitizer_flags(self.gxx15),
-        ]
+        flags = [*self.gxx15.get_compile_flags(core_type=core_type), *target_flags]
+        for header in CPU_SIM_FORCED_HEADERS:
+            flags.extend(("-include", header))
+        return flags + self._sanitizer_flags(self.gxx15)
 
     def get_platform_include_dirs(self) -> list[str]:
         """

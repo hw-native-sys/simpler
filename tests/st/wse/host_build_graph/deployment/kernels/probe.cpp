@@ -23,11 +23,13 @@ extern "C" void kernel_entry(int64_t *args) {
     const uint64_t index = stage * blocks + block;
     if ((index + 1) * 1024 * sizeof(float) > output.bytes || (index + 1) * 8 * sizeof(uint64_t) > records.bytes)
         throw std::out_of_range("deployment probe extent");
-    wse::Tile<32, 32> tile, result;
-    wse::TLOAD(tile, {reinterpret_cast<float *>(input.address), input.bytes / 4, 32, 32, 32, 1});
-    wse::TRELU(result, tile);
+    pto::VecTileM32<float, 32, 32> tile;
+    auto source = wse::tile_memory<32, 32>(reinterpret_cast<float *>(input.address), input.bytes / sizeof(float));
+    TLOAD(tile, source);
+    TRELU(tile, tile);
     auto *destination = reinterpret_cast<float *>(output.address) + index * 1024;
-    wse::TSTORE({destination, 1024, 32, 32, 32, 1}, result);
+    auto out = wse::tile_memory<32, 32>(destination, 1024);
+    TSTORE(out, tile);
     auto *log = reinterpret_cast<uint64_t *>(records.address) + index * 8;
     log[0] = block;
     log[1] = get_core_id(args);

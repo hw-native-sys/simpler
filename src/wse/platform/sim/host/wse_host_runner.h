@@ -776,7 +776,7 @@ protected:
 
     // Chip-callable buffer pool (sim path). Keyed by FNV-1a 64-bit content
     // hash. Each entry owns a host scratch holding the ChipCallable with each
-    // child's resolved_addr_ fixed up to the dlopen'd function pointer;
+    // child's resolved_addr_ pointing to its registered Linx kernel;
     // chip_dev == (uint64_t)host_scratch. The dlopen handles in
     // dlopen_handles are bulk-dlclose'd in finalize().
     struct ChipCallableBuffer {
@@ -785,13 +785,8 @@ protected:
         size_t total_size{0};
         int refcount{0};
         std::vector<void *> dlopen_handles;
-        // The callable's registration-owned function tables, dense over
-        // [0, table_len). Sim performs no upload, so the "device" addresses
-        // below are the vectors' own host addresses and the AICPU reads them in
-        // place. The object view holds the CoreCallable objects inside
-        // `host_scratch`; the entry view holds the host function pointers this
-        // registration's dlopen resolved, which is what a device consumer of
-        // resolved entries would dispatch through.
+        // Graph lookup maps a function ID to a CoreCallable inside host_scratch.
+        // PE dispatch uses the entry table of descriptors owned by the loaded kernel DSOs.
         std::vector<uint64_t> object_table;
         std::vector<uint64_t> entry_table;
         uint64_t object_table_dev{0};

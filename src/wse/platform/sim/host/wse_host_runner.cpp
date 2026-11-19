@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "wse_host_runner.h"
+#include "wse/linx_kernel_abi.h"
 
 #include <sys/stat.h>
 #include <stdlib.h>
@@ -1363,8 +1364,7 @@ uint64_t WseHostRunner::upload_chip_callable_buffer(const ChipCallable *callable
     });
     std::memcpy(scratch, callable, layout.total_size);
 
-    // Per-child dlopen + dlsym kernel_entry + register pto-sim hooks, then
-    // patch the child's resolved_addr_ to the function pointer.
+    // Each registration retains the kernel entry and its matching DSO-local Linx hooks.
     for (int32_t i = 0; i < callable->child_count(); ++i) {
         const uint32_t off = callable->child_offset(i);
         auto *child_in_scratch = reinterpret_cast<CoreCallable *>(scratch + layout.header_size + off);
@@ -1405,27 +1405,26 @@ uint64_t WseHostRunner::upload_chip_callable_buffer(const ChipCallable *callable
             return 0;
         }
 
-        void *func = dlsym(handle, "kernel_entry");
-        if (!func) {
+        auto entry = reinterpret_cast<wse::KernelEntry>(dlsym(handle, "kernel_entry"));
+        if (!entry) {
             LOG_ERROR("dlsym failed for child kernel #%d 'kernel_entry': %s", i, dlerror());
             return 0;
         }
 
-        auto register_hooks = reinterpret_cast<void (*)(void *, void *)>(dlsym(handle, "pto_sim_register_hooks"));
-        if (register_hooks != nullptr) {
-            register_hooks(
-                reinterpret_cast<void *>(pto_sim_get_subblock_id),
-                reinterpret_cast<void *>(pto_sim_get_pipe_shared_state)
-            );
+        auto bind = reinterpret_cast<wse::BindLinxKernel>(dlsym(handle, "simpler_wse_linx_kernel"));
+        const auto *kernel = bind ? bind(entry) : nullptr;
+        if (!kernel || kernel->entry != entry || !kernel->create_core || !kernel->destroy_core || !kernel->invoke ||
+            !kernel->cancel) {
+            LOG_ERROR("Child kernel #%d lacks a matching Linx CPU-SIM descriptor; rebuild for wsesim", i);
+            return 0;
         }
-
-        child_in_scratch->set_resolved_addr(reinterpret_cast<uint64_t>(func));
+        child_in_scratch->set_resolved_addr(reinterpret_cast<uint64_t>(kernel));
     }
 
     const uint64_t chip_dev = reinterpret_cast<uint64_t>(scratch);
 
     // Both tables describe the patched scratch: one contains CoreCallable objects,
-    // the other the resolved Host entry addresses.
+    // the other the registered Linx kernel descriptors.
     chip_callable_fill_tables(
         callable, layout, scratch, chip_dev, table_len, object_table.data(),
         want_entry_table ? entry_table.data() : nullptr

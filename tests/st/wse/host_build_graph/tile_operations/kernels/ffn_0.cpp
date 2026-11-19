@@ -9,4 +9,4 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "ffn_body.h"
-extern "C" void kernel_entry(int64_t *args) { ffn_compute(args, 0); }
+extern "C" void kernel_entry(int64_t *args) { ffn_compute<0>(args); }

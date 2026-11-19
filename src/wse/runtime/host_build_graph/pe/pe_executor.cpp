@@ -13,17 +13,16 @@
 #include "wse/block_lifecycle.h"
 #include <algorithm>
 #include <cstring>
+#include <exception>
 #include <new>
 #include <iostream>
 #include <string>
-#include "cpu_sim_context.h"
 #include "host_build_graph/submit_types.h"
 #include "scheduler/scheduler_graph_binding.h"
 
 #include <atomic>
 #include <cstdio>
 #include <condition_variable>
-#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <vector>
@@ -82,10 +81,11 @@ struct WseRun {
     wse::RunControl *control;
     std::mutex mutex;
     std::condition_variable changed;
+    std::exception_ptr failure;
     std::atomic<uint64_t> sequence{0};
     std::vector<std::vector<WseEvent>> events;
     std::vector<uint64_t> used;
-    std::vector<std::unique_ptr<wse::BlockOperationStorage>> block_storage;
+    std::vector<wse::BlockOperationStorage> block_storage;
     std::vector<WseMemorySection> sections;
 
     template <class T>
@@ -134,7 +134,6 @@ struct WseRun {
         const auto &work = head(core);
         const auto &task = plans()[work.task];
         if (!c.active && pe == 0 && dependencies_ready(task)) {
-            c.active = 1;
             c.started = c.finished = 0;
             c.execute = !task.has_predicate ||
                         DispatchPredicate{
@@ -142,9 +141,17 @@ struct WseRun {
                             static_cast<PredicateOp>(task.predicate.op)
                         }
                             .pass();
+            if (c.execute) {
+                const auto &kernel = *reinterpret_cast<const wse::LinxKernel *>(task.entry);
+                uint32_t pe_mask = 0;
+                for (uint32_t t = 0; t < work.thread_num; ++t)
+                    pe_mask |= 1u << work.thread_pes[t];
+                block_storage[core].begin(kernel, pe_mask);
+            }
             __atomic_store_n(&c.block_epoch, ++c.block_serial, __ATOMIC_RELEASE);
             record(worker, WseEventKind::BLOCK_BEGIN, work.task, work.block, work.thread_num);
             if (!c.execute) record(worker, WseEventKind::BLOCK_SKIPPED, work.task, work.block);
+            c.active = 1;
             changed.notify_all();
         }
         if (!c.active) return -1;
@@ -158,9 +165,8 @@ struct WseRun {
         uint32_t region_count, const wse::SramAllocation *allocations, uint32_t allocation_count
     ) :
         base(storage[0].base),
-        events(cores * WSE_PE_PER_CORE) {
-        for (uint32_t core = 0; core < cores; ++core)
-            block_storage.push_back(std::make_unique<wse::BlockOperationStorage>());
+        events(cores * WSE_PE_PER_CORE),
+        block_storage(cores) {
         const SchedulerGraphAccess graph(d->graph);
         if (!scheduler_graph_view_valid(graph)) throw std::invalid_argument("invalid WSE graph");
         const auto *source_plans = reinterpret_cast<const WseNodePlan *>(d->nodes_address);
@@ -349,6 +355,26 @@ struct WseRun {
         used = image.usage();
         sections = std::move(image.sections);
     }
+    ~WseRun() {
+        for (uint32_t core = 0; core < control->core_count; ++core)
+            __atomic_store_n(&local(core).block_epoch, uint64_t{0}, __ATOMIC_RELEASE);
+    }
+    template <class Predicate>
+    void wait(std::unique_lock<std::mutex> &lock, Predicate ready) {
+        changed.wait(lock, [&] {
+            return failure || ready();
+        });
+        if (failure) std::rethrow_exception(failure);
+    }
+    void fail(uint32_t worker, const char *reason) {
+        std::lock_guard lock(mutex);
+        if (failure) return;
+        failure = std::current_exception();
+        std::cerr << "WSE PE " << worker << " failed: " << reason << '\n';
+        for (const auto &block : block_storage)
+            block.cancel(failure);
+        changed.notify_all();
+    }
     void record(
         uint32_t worker, WseEventKind kind, uint64_t task = UINT64_MAX, uint32_t block = 0, uint64_t value = 0,
         uint32_t slot = 0, uint64_t generation = 0
@@ -359,7 +385,6 @@ struct WseRun {
         );
     }
     void bootstrap() {
-        clear_cpu_sim_shared_storage();
         for (uint32_t i = 0; i < control->task_count; ++i) {
             auto &task = plans()[i];
             task.remaining_blocks = task.blocks;
@@ -418,7 +443,7 @@ extern "C" const WseEvent *wse_run_events(const WseRun *run, uint32_t worker, ui
     return run->events[worker].data();
 }
 
-extern "C" int wse_execute_pe(WseRun *run, uint32_t worker) {
+static int execute_pe(WseRun *run, uint32_t worker) {
     const uint32_t core = worker / WSE_PE_PER_CORE;
     const uint32_t pe = worker % WSE_PE_PER_CORE;
     std::unique_lock lock(run->mutex);
@@ -431,7 +456,7 @@ extern "C" int wse_execute_pe(WseRun *run, uint32_t worker) {
         }
         run->changed.notify_all();
     }
-    run->changed.wait(lock, [&] {
+    run->wait(lock, [&] {
         return run->control->configured || run->control->init_error;
     });
     if (run->control->init_error) return run->control->init_error;
@@ -446,16 +471,14 @@ extern "C" int wse_execute_pe(WseRun *run, uint32_t worker) {
         run->record(worker, WseEventKind::CORE_INIT, UINT64_MAX, 0, local.expected_tasks);
         run->changed.notify_all();
     }
-    run->changed.wait(lock, [&] {
+    run->wait(lock, [&] {
         return local.initialized;
     });
-    sim_context_set_cluster_id(core);
-    sim_context_set_subblock_id(0);
     run->record(worker, WseEventKind::PE_READY);
     ++local.ready;
     run->changed.notify_all();
     if (worker == 0) {
-        run->changed.wait(lock, [&] {
+        run->wait(lock, [&] {
             for (uint32_t c = 0; c < run->control->core_count; ++c)
                 if (run->local(c).ready != WSE_PE_PER_CORE) return false;
             return true;
@@ -464,12 +487,12 @@ extern "C" int wse_execute_pe(WseRun *run, uint32_t worker) {
         run->control->go = true;
         run->changed.notify_all();
     }
-    run->changed.wait(lock, [&] {
+    run->wait(lock, [&] {
         return run->control->go;
     });
     while (true) {
         int thread = -1;
-        run->changed.wait(lock, [&] {
+        run->wait(lock, [&] {
             thread = run->ready_thread(worker);
             return thread >= 0 || run->completed_tasks() == local.expected_tasks;
         });
@@ -496,12 +519,8 @@ extern "C" int wse_execute_pe(WseRun *run, uint32_t worker) {
             context.thread_idx = thread;
             context.thread_num = work.thread_num;
             context.block_scope = {
-                &local.block_epoch,
-                block_epoch,
-                &run->control->epoch,
-                run->control->epoch,
-                run->block_storage[core].get(),
-                wse::BlockOperationStorage::get
+                &local.block_epoch, block_epoch, &run->control->epoch, run->control->epoch,
+                &run->block_storage[core].slots
             };
             GlobalContext global{};
             global.core_id = core;
@@ -512,15 +531,15 @@ extern "C" int wse_execute_pe(WseRun *run, uint32_t worker) {
             global.operation_trace = {&binding, operation_trace};
             args[SPMD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<int64_t>(&context);
             args[SPMD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<int64_t>(&global);
-            reinterpret_cast<void (*)(int64_t *)>(plan.entry)(args);
+            run->block_storage[core].invoke(pe, args);
         }
         run->record(worker, WseEventKind::THREAD_END, work.task, work.block, thread);
         lock.lock();
         local.finished |= 1u << thread;
         if (local.finished == (1u << work.thread_num) - 1) {
-            // Current CPU tile operations return only after their work drains.
+            // No PE retains a native invocation after the last Thread returns.
             __atomic_store_n(&local.block_epoch, uint64_t{0}, __ATOMIC_RELEASE);
-            run->block_storage[core]->clear();
+            run->block_storage[core].clear();
             run->record(worker, WseEventKind::BLOCK_END, work.task, work.block);
             local.active = 0;
             ++local.queue.head;
@@ -534,14 +553,14 @@ extern "C" int wse_execute_pe(WseRun *run, uint32_t worker) {
         run->control->stop = true;
         run->changed.notify_all();
     }
-    run->changed.wait(lock, [&] {
+    run->wait(lock, [&] {
         return run->control->stop;
     });
     run->record(worker, WseEventKind::QUIESCENT);
     ++local.quiet;
     run->changed.notify_all();
     if (pe == 0) {
-        run->changed.wait(lock, [&] {
+        run->wait(lock, [&] {
             return local.quiet == WSE_PE_PER_CORE;
         });
         local.retired = true;
@@ -549,7 +568,7 @@ extern "C" int wse_execute_pe(WseRun *run, uint32_t worker) {
         run->changed.notify_all();
     }
     if (worker == 0) {
-        run->changed.wait(lock, [&] {
+        run->wait(lock, [&] {
             for (uint32_t c = 0; c < run->control->core_count; ++c)
                 if (!run->local(c).retired) return false;
             return true;
@@ -559,4 +578,15 @@ extern "C" int wse_execute_pe(WseRun *run, uint32_t worker) {
         );
     }
     return 0;
+}
+
+extern "C" int wse_execute_pe(WseRun *run, uint32_t worker) {
+    try {
+        return execute_pe(run, worker);
+    } catch (const std::exception &error) {
+        run->fail(worker, error.what());
+    } catch (...) {
+        run->fail(worker, "unknown kernel exception");
+    }
+    return -1;
 }

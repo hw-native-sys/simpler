@@ -77,11 +77,14 @@ def admission_artifacts(tmp_path_factory):
         orch = path / "orch.cpp"
         orch.write_text('#include "orchestration_api.h"\nextern "C" void admission_orchestration() {}\n')
         (path / f"orch-{arch}.so").write_bytes(compiler.compile_orchestration("host_build_graph", str(orch)))
-    # A legacy artifact is valid ELF with a kernel entry but has no family declaration.
+    # Exercise a missing target, an unknown target, and the former WSE target without Linx dispatch.
     subprocess.run(["c++", "-shared", "-fPIC", str(source), "-o", str(path / "legacy.so")], check=True)
-    unknown = path / "unknown.cpp"
-    unknown.write_text('extern "C" const char *simpler_cpu_sim_target() { return "unknown"; }\n')
-    subprocess.run(["c++", "-shared", "-fPIC", str(source), str(unknown), "-o", str(path / "unknown.so")], check=True)
+    for name, family in (("unknown", "unknown"), ("old-wse", "wsesim")):
+        metadata = path / f"{name}.cpp"
+        metadata.write_text(f'extern "C" const char *simpler_cpu_sim_target() {{ return "{family}"; }}\n')
+        subprocess.run(
+            ["c++", "-shared", "-fPIC", str(source), str(metadata), "-o", str(path / f"{name}.so")], check=True
+        )
     for arch in ("wse", "a5"):
         missing = path / f"missing-{arch}.cpp"
         missing.write_text(f'extern "C" const char *simpler_cpu_sim_target() {{ return "{arch}sim"; }}\n')
@@ -111,22 +114,19 @@ def test_prebuilt_target_admission(arch, admission_artifacts):
             arch,
             str(path / f"orch-{arch}.so"),
             str(marker),
-            *(str(path / f"{kind}.so") for kind in (opposite, "legacy", "unknown", f"missing-{arch}", arch, arch)),
+            *(
+                str(path / f"{kind}.so")
+                for kind in (opposite, "legacy", "unknown", "old-wse", f"missing-{arch}", arch, arch)
+            ),
         ],
         capture_output=True,
         text=True,
         timeout=60,
         check=True,
     )
-    # Rejections precede hooks; a subsequent good image registers once and deduplicates.
-    assert json.loads(result.stdout.splitlines()[-1]) == [
-        [-1000, ""],
-        [-1000, ""],
-        [-1000, ""],
-        [-1000, ""],
-        [0, "called"],
-        [0, "called"],
-    ]
+    # Only Ascend kernels register the PTO pipe hooks.
+    marker = "called" if arch == "a5" else ""
+    assert json.loads(result.stdout.splitlines()[-1]) == [[-1000, ""]] * 5 + [[0, marker]] * 2
 
 
 @pytest.mark.device_count(1)

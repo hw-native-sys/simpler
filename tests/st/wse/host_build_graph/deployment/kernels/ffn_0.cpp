@@ -9,4 +9,4 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "sram_ffn.h"
-extern "C" void kernel_entry(int64_t *args) { sram_ffn(args, 0); }
+extern "C" void kernel_entry(int64_t *args) { sram_ffn<0>(args); }

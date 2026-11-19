@@ -35,8 +35,10 @@ uses `simpler_setup.environment.PROJECT_ROOT` to locate them.
 
 WSE kernel callers explicitly pass `core_type=""`; a homogeneous PE has no
 AIC/AIV compiler-role macro. The common compiler forwards this value unchanged.
-The shared CPU target header identifies these kernels as `wsesim`, while the
-pinned compatible PTO operations retain their existing A5 CPU semantics.
+The compiler selects the pinned PTO-ISA Linx CPU backend with
+`__CPU_SIM` and `PTO_CPU_SIM_TARGET_LINX` and disables floating-point
+contraction. The loader checks the `wsesim` target and the Linx dispatch
+interface when registering a kernel.
 Kernel caching uses the existing source-include closure and compiler-logic
 identity; unrelated WSE headers do not invalidate a kernel's cache entry.
 
@@ -77,16 +79,20 @@ cooperation, Graph replay and FFN computation.
 
 ## Operations and diagnostics
 
-The temporary operation backend lives in `platform/sim/operations`, with public
-WSE headers in `platform/include/wse`. It provides an FP32 Tile subset, scoped
-SharedTile cooperation, and monotonic counter operations. SharedTile storage
-belongs to one active Block; each slot owns its mutex and condition variable; completion invalidates its scopes before releasing
-the storage. Other Cores and later Blocks have independent storage.
+WSE kernels include `<pto/pto-inst.hpp>` for the native Linx TileOP API.
+Each executing Block gets a Linx CPU core context. Its workers bind the
+physical PE IDs and participant mask from the Block placement.
+The vector example uses Linx loads, arithmetic and stores. Both FFN examples
+load FP32 weights into a Linx `SharedMatrixRight` on the publishing PE.
+Each of the four PEs loads its own 32-row left operand, acquires the shared
+weight and calls `TMATMUL` or `TMATMUL_ACC`. The activation uses `TRELU`.
+See the [PTO-ISA Linx CPU backend](https://github.com/hw-native-sys/pto-isa/pull/424).
 
-The current PTO-ISA pin and A5 CPU instruction semantics remain in use for the
-compatible PTO kernels. The temporary WSE operations are not a complete native
-Linx backend. PTO-ISA #418 is an operation-level integration reference, not a
-replacement for WSE scheduling, SRAM ownership or Worker lifetime management.
+`wse::tile_memory` checks the extent of a row-major matrix view. The Block
+records which PEs have consumed each Shared slot and emits operation traces.
+The producer can reuse the slot after all declared consumers have read it.
+PTO-ISA owns the tile values, transfers and arithmetic.
+Monotonic SRAM counters, scheduling and graph replay are simpler runtime services.
 
 With `CallConfig.output_prefix`, WSE emits `wse_events.jsonl` and
 `wse_sram.json`. Dependency capture additionally emits `deps.json`.
@@ -110,8 +116,7 @@ Those source dependencies do not load an A5 runtime binary. Recorded source hash
 identify the reviewed revision, not a pin: normal include dependencies and the
 runtime source stamp invalidate caches when shared inputs change.
 
-WSE predicate scenes read unchanged A5 fixture sources; all WSE execution and
-assertions remain in WSE tests. Existing A3/A5 tests and CI selection are unchanged.
+WSE predicate scenes reuse the A5 fixture's orchestration and run Linx kernels.
 A5-only changes deliberately do not select the independent WSE scene job,
 including changes to reused sources. For changes to A5 product sources,
 `packaging-matrix` and `ut` build WSE through their default installation, covering
@@ -123,10 +128,10 @@ not select those product-build jobs.
 The WSE backend exports `requires_aicpu_executor()` with a zero result. A backend
 without this optional query retains the existing mandatory AICPU path.
 
-Shared platform integration is limited to registering `wsesim`, selecting its
-compiler inputs, and accepting a runtime without an AICPU binary. Other platform
-Worker paths, public data layouts, allocation error handling and cache-input
-scope remain unchanged.
+The simulator build keeps the Host and PE executors in C++17. Each compiled
+Linx kernel exports the callbacks that create its core context and bind the
+selected PE during invocation. The incore cache tracks those compiler-included
+headers along with the kernel source and the PTO-ISA pin.
 
 ## Limits
 

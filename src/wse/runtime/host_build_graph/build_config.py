@@ -7,7 +7,6 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # Host serializes an immutable graph; independent PEs initialize and execute it.
-# Tile operation state uses the existing CPU simulator context.
 SHARED = "../../../common/host_build_graph"
 
 BUILD_CONFIG = {

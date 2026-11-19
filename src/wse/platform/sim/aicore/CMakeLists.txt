@@ -73,7 +73,6 @@ target_compile_options(aicore_kernel
 )
 
 # Define __CPU_SIM for CPU simulation backend
-# This enables CPU stubs for PTO instructions (TLOAD, TSTORE, TADD, etc.)
 target_compile_definitions(aicore_kernel PRIVATE __CPU_SIM)
 
 # Include directories
@@ -84,7 +83,6 @@ target_include_directories(aicore_kernel
 
 
 target_link_libraries(aicore_kernel PRIVATE pthread)
-# CPU operation context is process-resident and loaded globally by ChipWorker.
 if(APPLE)
     target_link_options(aicore_kernel PRIVATE -undefined dynamic_lookup)
 endif()

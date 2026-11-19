@@ -9,8 +9,8 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "vector_kernel.h"
-extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
+extern "C" void kernel_entry(int64_t *args) {
     wse_test::binary(args, [](auto &result, auto &lhs, auto &rhs) {
-        pto::TADD(result, lhs, rhs);
+        TADD(result, lhs, rhs);
     });
 }

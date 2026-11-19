@@ -29,6 +29,22 @@ def test_sim_role_macros_follow_the_explicit_argument(platform, role, macro):
     assert set(token) == {"schema", "logic", "identity", "core_type", "flags", "linker", "pto_isa_commit"}
 
 
+def test_wse_cache_tracks_implicit_linx_dispatch_abi(tmp_path, monkeypatch):
+    monkeypatch.setattr(cache, "PROJECT_ROOT", tmp_path)
+    includes = tmp_path / "include"
+    includes.mkdir()
+    source = tmp_path / "kernel.cpp"
+    source.write_text('extern "C" void kernel_entry() {}')
+    abi = includes / "linx_abi.h"
+    (includes / "cpu_sim_target.h").write_text("// shadowed by the forced header in the compiler working directory\n")
+    (tmp_path / "cpu_sim_target.h").write_text("#include <linx_abi.h>\n")
+    metadata = {"platform": "wsesim", "compiler": KernelCompiler("wsesim").incore_compile_cache_token("")}
+    abi.write_text("struct Context { int pe; };")
+    first = cache.compile_incore_artifact_key(metadata, source, [includes])
+    abi.write_text("struct Context { int pe, mask; };")
+    assert cache.compile_incore_artifact_key(metadata, source, [includes]) != first
+
+
 @pytest.mark.parametrize("shared_source", [False, True])
 def test_only_included_wse_headers_invalidate_real_kernel_cache(tmp_path, monkeypatch, shared_source):
     compiler = KernelCompiler("wsesim")

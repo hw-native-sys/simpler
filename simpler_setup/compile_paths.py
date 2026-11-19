@@ -15,6 +15,8 @@ from pathlib import Path
 
 from .environment import PROJECT_ROOT
 
+CPU_SIM_FORCED_HEADERS = ("pto/cpu/target_config.hpp", "cpu_sim_target.h")
+
 
 def compiler_visible_path(path: str | Path) -> Path:
     """Return a stable path relative to the checkout, or an absolute external path."""

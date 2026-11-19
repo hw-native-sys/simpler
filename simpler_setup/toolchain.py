@@ -222,9 +222,10 @@ class Gxx15Toolchain(Toolchain):
 
     is_host = True
 
-    def __init__(self):
+    def __init__(self, *, reloadable: bool = False):
         super().__init__()
         self.cxx_path = "g++-15"
+        self._disable_gnu_unique = reloadable and _is_gcc(self.cxx_path)
 
     def get_compile_flags(self, core_type: str = "", **kwargs) -> list[str]:
         flags = [
@@ -239,6 +240,9 @@ class Gxx15Toolchain(Toolchain):
             "-DPTO_CPU_MAX_THREADS=1",
             "-DNDEBUG",
         ]
+        # GNU-unique inline variables would keep a Linx kernel and its PE state in the process after dlclose.
+        if self._disable_gnu_unique:
+            flags.append("-fno-gnu-unique")
         # g++ does not define __DAV_VEC__/__DAV_CUBE__ like ccec does,
         # so we must add them explicitly based on core_type.
         if core_type == "aiv":

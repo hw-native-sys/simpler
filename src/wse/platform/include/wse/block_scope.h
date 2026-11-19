@@ -10,17 +10,26 @@
  */
 #pragma once
 #include <cstdint>
-#include <cstddef>
+#include <array>
 #include <stdexcept>
 
 namespace wse {
+// Linx owns the tile payload. Each absolute Shared slot has one Block-local publication contract.
+struct SharedSlotState {
+    uint32_t producer{};
+    uint32_t consumers{};
+    const char *shape_name{};
+    uint32_t consumed{};
+    uint64_t generation{};
+};
+using SharedSlotTable = std::array<SharedSlotState, 64>;
+
 struct BlockScope {
     uint64_t *active_epoch;
     uint64_t epoch;
     const uint64_t *active_run_epoch{nullptr};
     uint64_t run_epoch{0};
-    void *storage_context{nullptr};
-    void *(*get_storage)(void *, uint32_t, size_t){nullptr};
+    SharedSlotTable *slots{nullptr};
     void validate() const {
         if (!active_epoch || !epoch || __atomic_load_n(active_epoch, __ATOMIC_ACQUIRE) != epoch ||
             (active_run_epoch && __atomic_load_n(active_run_epoch, __ATOMIC_ACQUIRE) != run_epoch))

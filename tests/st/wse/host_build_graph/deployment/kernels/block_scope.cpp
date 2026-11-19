@@ -26,6 +26,19 @@ void trace(void *opaque, wse::OperationEvent event, uint32_t slot, uint64_t gene
         hook(t.pe);
     }
 }
+template <int Rows, int Cols>
+using Plane = pto::Tile<pto::Location::Vec, float, 4, 8, pto::BLayout::RowMajor, Rows, Cols>;
+
+template <class Shape>
+float exchange_value(wse::SharedTileSlot<5, Shape> &slot, bool producer, float input) {
+    std::array<float, Shape::ValidRow * Shape::ValidCol> data{input};
+    auto memory = wse::tile_memory<Shape::ValidRow, Shape::ValidCol>(data.data(), data.size());
+    if (producer) slot.publish(1, memory);
+    data[0] = -1.f;
+    auto value = slot.read(1);
+    TSTORE(memory, value);
+    return data[0];
+}
 extern "C" void kernel_entry(int64_t *args) {
     const uint32_t b = get_block_idx(args), t = get_thread_idx(args), pe = get_pe_id(args);
     auto &tensor = *reinterpret_cast<Tensor *>(args[0]);
@@ -33,17 +46,14 @@ extern "C" void kernel_entry(int64_t *args) {
     Trace observer{get_wse_operation_trace(args), static_cast<uint32_t>(get_core_id(args)), pe};
     auto hook = reinterpret_cast<void (*)(int)>(dlsym(RTLD_DEFAULT, "wse_scope_probe"));
     if (!hook) throw std::runtime_error("missing scope probe");
-    static thread_local std::optional<wse::SharedTile<wse::Tile<2, 2>>> previous;
+    static thread_local std::optional<wse::SharedTileSlot<5, Plane<2, 2>>> previous;
     if (b < 2) {
-        wse::SharedTile<wse::Tile<2, 2>> shared(pe, 5, 0, 15, get_wse_block_scope(args), {&observer, trace});
+        wse::SharedTileSlot<5, Plane<2, 2>> shared(0, 15, get_wse_block_scope(args), {&observer, trace});
         if (t == 0) {
             if (b == 1) hook(0);
             else hook(5);
-            wse::Tile<2, 2> value;
-            value.at(0, 0) = 100 + b;
-            shared.publish(1, value);
         }
-        record[0] = shared.read(1).at(0, 0);
+        record[0] = exchange_value(shared, t == 0, 100 + b);
         previous = shared;
         record[1] = 0;
     } else {
@@ -54,13 +64,8 @@ extern "C" void kernel_entry(int64_t *args) {
             rejected = true;
         }
         if (!rejected) throw std::runtime_error("old Block SharedTile remained valid");
-        wse::SharedTile<wse::Tile<1, 4>> shared(pe, 5, 0, 15, get_wse_block_scope(args), {&observer, trace});
-        if (t == 0) {
-            wse::Tile<1, 4> value;
-            value.at(0, 0) = 102;
-            shared.publish(1, value);
-        }
-        record[0] = shared.read(1).at(0, 0);
+        wse::SharedTileSlot<5, Plane<1, 4>> shared(0, 15, get_wse_block_scope(args), {&observer, trace});
+        record[0] = exchange_value(shared, t == 0, 102);
         record[1] = 1;
         if (t == 0) hook(4);
     }
