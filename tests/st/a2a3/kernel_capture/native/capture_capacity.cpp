@@ -26,7 +26,9 @@ int main(int argc, char **argv) {
     const auto before_budget = fixture.report("before-refusal");
     const auto before = launch_counts();
     require(before.core > 0 && before.cpu > 0, "launch-observer-reached");
-    const int rc = fixture.prepare(fixture.models[0], workspace_budget * 2);
+    Model refused;
+    refused.output = fixture.models[0].output;
+    const int rc = fixture.prepare(refused, workspace_budget * 2);
     std::printf("workspace-refusal rc=%d accepted=%d\n", rc, fixture.accepted);
     require(
         rc == (fixture.tmr ? SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE : PTO_RUNTIME_ERR_INVALID_ARGUMENT),

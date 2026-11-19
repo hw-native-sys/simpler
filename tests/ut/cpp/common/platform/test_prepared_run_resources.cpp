@@ -59,18 +59,6 @@ TEST(PreparedRunUse, DeviceCompletionDoesNotProveQueuedWaitConsumption) {
     EXPECT_TRUE(use.obligations_ended());
 }
 
-TEST(PreparedRunUse, ExternalUseNeedsItsOwnEndProofEvenAfterAllLocalUseEnds) {
-    PreparedRunUse use(make_preparation());
-    ASSERT_TRUE(use.retain_external_use());
-    EXPECT_FALSE(use.retain_external_use());
-    use.note(WorkspaceManager::RunFact::NoDeviceSubmission);
-    end_host_use(use);
-    EXPECT_FALSE(use.obligations_ended());
-    use.note_external_use_ended();
-    EXPECT_TRUE(use.obligations_ended());
-    EXPECT_FALSE(use.retain_external_use());
-}
-
 TEST(PreparedRunUse, UnsubmittedRunNeedsNoDeviceWaitButLaunchedFactOverridesIt) {
     PreparedRunUse use(make_preparation());
     use.note(WorkspaceManager::RunFact::NoDeviceSubmission);
@@ -347,22 +335,6 @@ TEST(PreparedRunResources, RetiredUnmanagedRegionFreesExactlyOnce) {
     EXPECT_EQ(frees, 1);
     ASSERT_EQ(retired.reclaim(workspace), 0);
     EXPECT_EQ(frees, 1);
-}
-
-TEST(PreparedRunUse, ExternalCloseCannotReplaceInternalCompletionProof) {
-    PreparedRunUse use(make_preparation());
-    ASSERT_TRUE(use.retain_external_use());
-    use.note(WorkspaceManager::RunFact::Launched);
-    end_host_use(use);
-    EXPECT_TRUE(use.host_ended());
-    EXPECT_FALSE(use.internal_obligations_ended());
-    use.note_external_use_ended();
-    EXPECT_FALSE(use.obligations_ended());
-    use.note(WorkspaceManager::RunFact::DrainProvedComplete);
-    EXPECT_FALSE(use.internal_obligations_ended());
-    use.note_waits_consumed();
-    EXPECT_TRUE(use.internal_obligations_ended());
-    EXPECT_TRUE(use.obligations_ended());
 }
 
 TEST(PreparedRunResources, PublishedOwnerLifetimeIsIndependentOfInternalUseCopies) {

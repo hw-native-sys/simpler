@@ -79,7 +79,8 @@ int main(int argc, char **argv) {
     uint32_t shape[] = {16};
     ChipStorageTaskArgs args;
     args.add_tensor(make_tensor_external(input, shape, 1, DataType::INT32, AddressSpace::DEVICE, TensorTransfer::NONE));
-    args.add_tensor(make_tensor_external(output, shape, 1, DataType::INT32, AddressSpace::DEVICE, TensorTransfer::NONE)
+    args.add_tensor(
+        make_tensor_external(output, shape, 1, DataType::INT32, AddressSpace::DEVICE, TensorTransfer::NONE)
     );
     int32_t host_control = scenario == 6 ? 13 : 3;
     const uint32_t control_shape[]{1};
@@ -87,7 +88,6 @@ int main(int argc, char **argv) {
         make_tensor_external(&host_control, control_shape, 1, DataType::INT32, AddressSpace::HOST, TensorTransfer::NONE)
     );
     args.add_scalar(scenario);
-    const bool caller_owns_run = scenario == 14 || scenario == 15;
     const bool cancellation_scenario = scenario >= 7 && scenario <= 11;
     const int capture_count = cancellation_scenario ? 2 : 1;
     int total_replays = 0;
@@ -97,13 +97,10 @@ int main(int argc, char **argv) {
         NativeRunDescriptor descriptor{};
         descriptor.generation = cycle + 1;
         descriptor.run_epoch = cycle + 1;
-        if (!caller_owns_run) descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
         const size_t publishes_before = capture_test::prepare_snapshot(ctx, scenario);
-        check(simpler_prepare_run(ctx, run, 0, &args, &config, &descriptor), "prepare-once");
+        check(simpler_prepare_caller_run(ctx, run, 0, &args, &config, &descriptor), "prepare-once");
         capture_test::check_prepare(ctx, scenario, publishes_before);
         host_control = 93;  // Changing the source must not change the prepared task arguments.
-        RuntimeHandle reference = nullptr;
-        if (!caller_owns_run) check(simpler_retain_run_resources(ctx, run, caller, &reference), "retain-once");
         aclmdlRI model = nullptr;
         check(aclmdlRICaptureBegin(caller, ACL_MODEL_RI_CAPTURE_MODE_GLOBAL), "capture-begin");
         check(aclrtMemcpyAsync(input, bytes, host_input, bytes, ACL_MEMCPY_HOST_TO_DEVICE, caller), "capture-input");
@@ -119,7 +116,7 @@ int main(int argc, char **argv) {
         }
         const bool probe_publications = capture_test::needs_publications(scenario) || scenario == 14;
         if (probe_publications) capture_test::begin_capture_publication_probe();
-        const int launch_rc = simpler_launch_run_on_stream(ctx, run, caller, nullptr);
+        const int launch_rc = simpler_submit_run_on_stream(ctx, run, caller);
         const auto submission =
             probe_publications ? capture_test::finish_capture_publication_probe() : capture_test::CapturedSubmission{};
         if (partial_submission) {
@@ -140,7 +137,7 @@ int main(int argc, char **argv) {
         }
         capture_test::check_publications(scenario, submission);
         if (scenario == 4) {
-            const int rc = simpler_launch_run_on_stream(ctx, run, caller, nullptr);
+            const int rc = simpler_submit_run_on_stream(ctx, run, caller);
             std::printf("capture-duplicate-rejected rc=%d expected=%d\n", rc, PTO_RUNTIME_ERR_INVALID_STATE);
             require(rc == PTO_RUNTIME_ERR_INVALID_STATE, "reject-duplicate-capture-launch");
         }
@@ -178,12 +175,8 @@ int main(int argc, char **argv) {
             aclmdlRI recording_model = nullptr;
             check(aclmdlRICaptureGetInfo(caller, &status, &recording_model), "capture-info-before-cancel");
             require(status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE && recording_model != nullptr, "capture-still-active");
-            const int finalize_rc = simpler_finalize_run(ctx, run);
-            std::printf("finalize-capture rc=%d expected=%d\n", finalize_rc, launch_rc);
-            require(finalize_rc == launch_rc, "finalize-during-capture");
             require(
-                simpler_unregister_callable(ctx, 0) == PTO_RUNTIME_ERR_INVALID_STATE,
-                "external-reference-retains-callable"
+                simpler_unregister_callable(ctx, 0) == PTO_RUNTIME_ERR_INVALID_STATE, "original-run-retains-callable"
             );
         }
         const int end_rc = aclmdlRICaptureEnd(caller, &model);
@@ -212,7 +205,6 @@ int main(int argc, char **argv) {
         aclmdlRI ended_model = nullptr;
         check(aclmdlRICaptureGetInfo(caller, &ended_status, &ended_model), "capture-info-after-end");
         require(ended_status == ACL_MODEL_RI_CAPTURE_STATUS_NONE && ended_model == nullptr, "capture-ended");
-        if (!cancel_recording && !caller_owns_run) check(simpler_finalize_run(ctx, run), "finalize-host-run");
         int32_t observed[16];
         check(aclrtMemcpy(observed, bytes, output, bytes, ACL_MEMCPY_DEVICE_TO_HOST), "read-before-replay");
         require(std::memcmp(poison, observed, bytes) == 0, "capture-did-not-execute");
@@ -277,7 +269,6 @@ int main(int argc, char **argv) {
                 );
             std::printf("replay=%d verified=16\n", round + 1);
             if (scenario == 14 && round < 2) {
-                if (round == 0) check(simpler_wait_run_completion(ctx, run), "retire-first-replay");
                 // Keep the captured run and model alive. First reuse its workspace for
                 // a different scalar, then submit a larger graph before the last replay.
                 const bool same_size = round == 0;
@@ -323,8 +314,9 @@ int main(int argc, char **argv) {
             }
         }
         if (model != nullptr) check(aclmdlRIDestroy(model), "destroy-model");
-        if (caller_owns_run) check(simpler_finalize_run(ctx, run), "finalize-after-destroy");
-        else check(simpler_release_run_resources(ctx, reference), "release-after-destroy");
+        const int finalize_rc = simpler_finalize_run(ctx, run);
+        std::printf("finalize-after-last-use rc=%d expected=%d\n", finalize_rc, launch_rc);
+        require(finalize_rc == launch_rc, "finalize-after-destroy");
         if (cancel_recording) std::printf("cancelled-capture-cleaned cycle=%d\n", cycle);
     }
     if (dependency_event != nullptr) check(aclrtDestroyEvent(dependency_event), "destroy-failure-event");

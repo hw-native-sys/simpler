@@ -352,6 +352,7 @@ void ChipWorker::init(
         // nothing, and a null pointer is the refusal.
         register_callable_v2_fn_ = module->optional<SimplerRegisterCallableV2Fn>("simpler_register_callable_v2");
         run_fn_ = module->required<SimplerRunFn>("simpler_run");
+        prepare_caller_run_fn_ = module->optional<SimplerPrepareRunFn>("simpler_prepare_caller_run");
         prepare_run_fn_ = module->required<SimplerPrepareRunFn>("simpler_prepare_run");
         launch_run_fn_ = module->required<SimplerNativeRunFn>("simpler_launch_run");
         validate_execution_context_fn_ =
@@ -973,6 +974,7 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     register_callable_v2_fn_ = nullptr;
     run_fn_ = nullptr;
     prepare_run_fn_ = nullptr;
+    prepare_caller_run_fn_ = nullptr;
     launch_run_fn_ = nullptr;
     validate_execution_context_fn_ = nullptr;
     validate_caller_stream_fn_ = nullptr;
@@ -1187,18 +1189,18 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run(
     }
     return prepare_native_run_on_slot(
         callable_id, args, config, lease.slot_id, lease.generation, run_id, dispatch_id, accepted_state, accepted_value,
-        true, provenance
+        true, provenance, prepare_run_fn_
     );
 }
 
 ChipWorkerNativeRun ChipWorker::prepare_native_run_for_lane(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
     uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value,
-    bool pipeline_leased, NativeRunProvenance provenance
+    bool pipeline_leased, NativeRunProvenance provenance, SimplerPrepareRunFn prepare
 ) {
     return prepare_native_run_on_slot(
         callable_id, args, config, lease.slot_id, lease.generation, run_id, dispatch_id, accepted_state, accepted_value,
-        pipeline_leased, provenance
+        pipeline_leased, provenance, prepare
     );
 }
 
@@ -1305,7 +1307,7 @@ void ChipWorker::configure_launch_depth(unsigned depth) {
 ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, uint32_t slot_id,
     uint64_t generation, uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state,
-    int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance
+    int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance, SimplerPrepareRunFn prepare
 ) {
     validate_execution_process();
     require_comm_cleanup_confirmed();
@@ -1418,21 +1420,18 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
             const auto prepared = prepared_ccu_workspaces_.find(dispatch_id);
             if (prepared != prepared_ccu_workspaces_.end()) ccu_workspace = prepared->second;
         }
-        const NativeRunDescriptor descriptor{
-            slot_id,
-            region_banks_for_slot(slot_id).image,
-            run_id,
-            generation,
-            dispatch_id,
-            run_epoch,
-            accepted_state,
-            accepted_value,
-            launch_depth_ > 1 ? 1u : 0u,
-            provenance,
-            SIMPLER_PREPARE_EAGER,
-            ccu_workspace
-        };
-        rc = prepare_run_fn_(device_ctx_, run_storage, callable_id, args, &config, &descriptor);
+        const NativeRunDescriptor descriptor{slot_id,
+                                             region_banks_for_slot(slot_id).image,
+                                             run_id,
+                                             generation,
+                                             dispatch_id,
+                                             run_epoch,
+                                             accepted_state,
+                                             accepted_value,
+                                             launch_depth_ > 1 ? 1u : 0u,
+                                             provenance,
+                                             ccu_workspace};
+        rc = prepare(device_ctx_, run_storage, callable_id, args, &config, &descriptor);
     } catch (...) {
         drop_preparing_native_run(run_epoch);
         throw;
@@ -1507,7 +1506,8 @@ void ChipWorker::submit_caller_owned_run(
     int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, void *caller_stream, ChipRun &out
 ) {
     if (out.run_) throw std::logic_error("caller-owned submission requires an empty output handle");
-    if (!run_lane_ || !submit_run_on_stream_fn_ || !execution_environment_ || !execution_environment_->borrowed)
+    if (!run_lane_ || !prepare_caller_run_fn_ || !submit_run_on_stream_fn_ || !execution_environment_ ||
+        !execution_environment_->borrowed)
         throw UnsupportedRuntimeOperation("caller-owned submissions require a borrowed Kernel runtime");
     (void)run_lane_->submit(callable_id, args, config, nullptr, 0, caller_stream, &out, ChipRunOwner::Caller);
 }

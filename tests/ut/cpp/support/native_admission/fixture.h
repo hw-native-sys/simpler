@@ -80,6 +80,8 @@ public:
         return rc;
     }
     int warm_capture_result_caches() {
+        static int registered_binary;
+        aicore_bin_handle_ = &registered_binary;
         // Fake context initialization omits real Kernel init's optional warm-up.
         // Requested-capture tests still need actual initialized result backing.
         DfxRunConfig dfx;
@@ -271,12 +273,14 @@ struct Attempt {
     ~Attempt() {
         uint64_t magic = 0;
         std::memcpy(&magic, storage, sizeof(magic));
-        if (magic) EXPECT_EQ(simpler_finalize_run(&runner, storage), 0);
+        if (magic == kNativeRunPrepareReleasedMagic) EXPECT_TRUE(consume_release());
+        else if (magic != 0) EXPECT_EQ(simpler_finalize_run(&runner, storage), 0);
         ::operator delete(storage, std::align_val_t(get_runtime_alignment()));
     }
     int prepare() {
         runner.note_result_epoch(descriptor.pipeline_slot, descriptor.run_epoch);
-        return simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor);
+        auto prepare_run = caller_owned ? simpler_prepare_caller_run : simpler_prepare_run;
+        return prepare_run(&runner, storage, 1, &args, &config, &descriptor);
     }
     bool consume_release() { return consume_released_preparation(storage, get_runtime_size(), descriptor.run_epoch); }
     bool empty() const {
@@ -285,6 +289,7 @@ struct Attempt {
         return magic == 0;
     }
     Runner &runner;
+    bool caller_owned{false};
     void *storage;
     std::vector<uint8_t> bytes;
     ChipStorageTaskArgs args;

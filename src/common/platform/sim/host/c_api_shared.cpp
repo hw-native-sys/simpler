@@ -1082,9 +1082,6 @@ int simpler_prepare_run(
     });
     if (ctx == nullptr || runtime == nullptr || config == nullptr || descriptor == nullptr)
         return PTO_RUNTIME_ERR_INTERNAL;
-    if (descriptor->prepare_purpose != SIMPLER_PREPARE_EAGER)
-        return descriptor->prepare_purpose == SIMPLER_PREPARE_CAPTURE ? PTO_RUNTIME_ERR_UNSUPPORTED :
-                                                                        PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     // Against the grant this context was given, not a compile-time width: a set
     // exists because this context was granted it, so a slot past the grant names
     // no resource here rather than one that happens to be laid out.
@@ -1580,13 +1577,13 @@ int simpler_validate_execution_context(DeviceContextHandle ctx) {
 
 int simpler_validate_caller_stream(DeviceContextHandle, void *) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
 
-int simpler_retain_run_resources(DeviceContextHandle, RuntimeHandle, void *, RuntimeHandle *out_reference) {
-    if (out_reference == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    *out_reference = nullptr;
+int simpler_submit_run_on_stream(DeviceContextHandle, RuntimeHandle, void *) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+
+int simpler_prepare_caller_run(
+    DeviceContextHandle, RuntimeHandle, int32_t, const void *, const CallConfig *, const NativeRunDescriptor *
+) {
     return PTO_RUNTIME_ERR_UNSUPPORTED;
 }
-
-int simpler_release_run_resources(DeviceContextHandle, RuntimeHandle) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
 
 int simpler_launch_run_on_stream(DeviceContextHandle, RuntimeHandle, void *, RuntimeHandle) {
     return PTO_RUNTIME_ERR_UNSUPPORTED;

@@ -362,7 +362,8 @@ struct ChipRunLaneState {
     void prepare(const std::shared_ptr<ChipRunState> &run) {
         run->native_run = worker->prepare_native_run_for_lane(
             run->callable_id, &run->args, run->config, run->lease, run->run_id, run->dispatch_id, run->accepted_state,
-            run->accepted_value, run->pipeline_leased, run->provenance
+            run->accepted_value, run->pipeline_leased, run->provenance,
+            run->owner == ChipRunOwner::Caller ? worker->prepare_caller_run_fn_ : worker->prepare_run_fn_
         );
         run->phase = ChipRunState::Phase::PREPARED;
         run->disposition = ChipRunPreparationDisposition::NATIVE_PREPARED;

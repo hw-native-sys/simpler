@@ -203,7 +203,7 @@ public:
 
     // The prepared-resources object's lease on the retained staging block. It
     // is held for as long as any owner (the run use, a published owner, or an
-    // external reference) can reach this preparation; the block's owner uses
+    // caller-owned run) can reach this preparation; the block's owner uses
     // this explicit count, not a shared_ptr count, to decide growth and
     // retirement.
     void hold_temporary(std::shared_ptr<TemporaryStorage> storage) {
@@ -289,20 +289,10 @@ public:
         }
     }
     void note_waits_consumed() { waits_ended_ = true; }
-    bool can_retain_external_use() const { return !external_registered_ && !host_ended_; }
-    bool retain_external_use() {
-        if (!can_retain_external_use()) return false;
-        external_registered_ = true;
-        external_ended_ = false;
-        return true;
-    }
-    // Caller reports no future use and completion of all external in-flight use.
-    void note_external_use_ended() { external_ended_ = true; }
-    bool internal_obligations_ended() const {
+    bool obligations_ended() const {
         const bool unused = not_submitted_ && !launched_;
         return host_ended_ && copyback_ended_ && bindings_ended_ && (unused || (device_ended_ && waits_ended_));
     }
-    bool obligations_ended() const { return internal_obligations_ended() && external_ended_; }
     bool host_ended() const { return host_ended_; }
 
 private:
@@ -314,6 +304,4 @@ private:
     bool copyback_ended_{false};
     bool bindings_ended_{false};
     bool host_ended_{false};
-    bool external_registered_{false};
-    bool external_ended_{true};
 };

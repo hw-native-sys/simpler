@@ -20,7 +20,7 @@
 namespace simpler::capture_test {
 namespace {
 
-// These views borrow the original reference's retained publication source.
+// The original run owns this scheduler publication through the final replay.
 struct CapturedResidentState {
     const void *run_control = nullptr;
     char *metadata_source = nullptr;

@@ -1182,7 +1182,7 @@ nested TMR work from being counted twice.
 
 On A3, a native Kernel model can retain Swimlane records across cold capture and
 replay. Capture prepares the model without executing its kernels. Destroying the
-model and releasing its resources closes its collection window; flushing
+model and finalizing its original run closes its collection window; flushing
 diagnostics finishes writing `swimlane-*/records_e<epoch>.json`. Program execution
 remains eager-only.
 

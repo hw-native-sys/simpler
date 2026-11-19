@@ -220,15 +220,10 @@ keeps references quarantined; borrowed execution never resets or synchronizes
 the whole device. Launch failure does not establish the exit dependency, so
 callers cannot consume output merely because launch returned an error.
 
-The entry validates the current borrowed RTS context. Active capture is accepted
-only for Kernel mode with a retained run prepared explicitly for capture,
-diagnostics disabled and no predecessor argument. The default eager preparation
-cannot be upgraded to capture. `NativeRunDescriptor.prepare_purpose` selects the
-preparation contract; capture preparation rejects writable HOST/NONE parameters
-before orchestration, while read-only Host controls determine fixed graph/task
-snapshots. Program capture is refused before changing recording,
-caller or claim state. Preparation and callable registration take place outside
-capture. The common eager launch
+The entry validates the current borrowed RTS context. Caller-owned Kernel
+preparation checks read-only HOST controls before orchestration. The original
+run holds live resources until the last use on any execution stream. Program
+capture is refused before changing caller or claim state. The common eager launch
 publishes its Runtime descriptor asynchronously on the actual AICPU stream;
 its entry fork orders the AICore reader behind that copy. The slot retains a
 pinned immutable source through run retirement. A copy attempt marks Partial
@@ -238,11 +233,8 @@ work requires bounded private-stream discharge or quarantine. Bulk HBG arena
 publication and DFX writes retain their own synchronization. The compatibility
 `simpler_kernel_mode_launch` stub and capability bit remain closed; public Worker
 eager uses the shared native lane. Native completion events and their caller
-references remain distinct from a captured-graph lifetime contract. Explicit
-`simpler_retain_run_resources` / `simpler_release_run_resources` obligations hold
-prepared backing across Host run finalization, and external release requires the
-caller to have ended model and in-flight uses. Completion releases execution
-capacity; it does not discharge that external obligation or deliver Program IO.
+references remain distinct from a captured-graph lifetime contract. A successful caller-owned submission returns its slot immediately.
+The caller finalizes the original run after ending model and in-flight uses.
 
 A direct L2 Python `Worker` owns the native `_ChipWorker` itself. Its callable
 handles, argument imports, source uses and close journal belong to `Worker`;
@@ -831,10 +823,8 @@ orchestration view before clearing the storage.
 The first descriptor publication still initializes its complete handshake
 prefix. Program descriptor and launch-envelope routes retain their behavior;
 kernel packets require permitted launch transport and cannot silently fall back
-to unvalidated descriptor values. Default eager preparation cannot be recorded;
-capture-purpose preparation uses the same native launch with a matching retained
-reference. Per-run ownership alone is insufficient for graph lifetime; the
-[external resource contract](native-hbg-prepared-lifetime.md) covers that obligation.
+to unvalidated descriptor values. A caller-owned run keeps its bindings through model destruction
+under the [resource lifetime contract](native-hbg-prepared-lifetime.md).
 
 ### Native terminal publication contract
 

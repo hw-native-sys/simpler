@@ -120,7 +120,6 @@ std::vector<int> g_finalize_rc;
 std::vector<bool> g_finalize_no_submission;
 std::vector<uint64_t> g_epochs;
 std::vector<size_t> g_prepare_count;
-std::vector<uint32_t> g_prepare_purpose;
 std::vector<std::array<int32_t, 2>> g_host_controls;
 std::vector<uint64_t> g_control_scalars;
 std::multiset<uint64_t> g_span_borrows;
@@ -154,7 +153,6 @@ int prepare_run(
     g_epochs[descriptor->pipeline_slot] = descriptor->run_epoch;
     g_events.push_back("prepare" + std::to_string(descriptor->pipeline_slot));
     ++g_prepare_count[descriptor->pipeline_slot];
-    g_prepare_purpose[descriptor->pipeline_slot] = descriptor->prepare_purpose;
     const auto &args = *static_cast<const ChipStorageTaskArgs *>(arguments);
     if (args.tensor_count() != 0 && args.tensor(0).address_space == AddressSpace::HOST) {
         const auto &tensor = args.tensor(0);
@@ -246,7 +244,6 @@ void prime_worker(ChipWorker &worker, size_t depth = 2) {
     g_finalize_no_submission.assign(depth, {});
     g_epochs.assign(depth, {});
     g_prepare_count.assign(depth, {});
-    g_prepare_purpose.assign(depth, {});
     g_host_controls.assign(depth, {});
     g_control_scalars.assign(depth, {});
     g_span_borrows.clear();
@@ -276,6 +273,7 @@ void prime_worker(ChipWorker &worker, size_t depth = 2) {
     for (size_t slot = 0; slot < depth; ++slot)
         worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
     worker.prepare_run_fn_ = prepare_run;
+    worker.prepare_caller_run_fn_ = prepare_run;
     worker.launch_run_fn_ = launch_run;
     worker.poll_run_fn_ = poll_run;
     worker.wait_run_fn_ = wait_run;
@@ -1609,7 +1607,6 @@ TEST(ChipRunLaneTest, CallerOwnedRunLeavesItsSlotAvailableForEagerExecution) {
     prime_capture_worker(*worker);
     ChipRun model;
     worker->submit_caller_owned_run(1, device_args(), CallConfig{}, reinterpret_cast<void *>(1), model);
-    EXPECT_EQ(g_prepare_purpose[0], SIMPLER_PREPARE_EAGER);
     EXPECT_THROW(model.activate(), std::logic_error);
     EXPECT_THROW(model.abandon(), std::logic_error);
     const auto before = g_events;

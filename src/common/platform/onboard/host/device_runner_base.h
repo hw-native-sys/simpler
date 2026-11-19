@@ -282,13 +282,12 @@ public:
     bool owns_native_run_observation(const void *owner) const;
     bool
     retire_run_workspace(uint32_t slot, uint64_t run_epoch, bool retain_host_outputs, void **retired_unmanaged_staging);
-    bool native_runs_outstanding() const;
+    bool native_runs_outstanding(bool include_caller_owners = true) const;
     struct RunStreams;
     // Only fresh callable additions may ignore already-retired observer debt.
     bool fresh_callable_addition_allowed() const;
     void retain_framework_observation(const RunStreams &streams);
     int observe_framework_submissions(int *all_observed);
-    bool has_external_run_reference(const NativeRunIdentity &identity) const;
 
     /**
      * Whether a live reservation other than `owner`'s holds `arena_bank`.
@@ -1643,7 +1642,10 @@ public:
             stream_lifetime(std::move(other.stream_lifetime)),
             artifact_identity(other.artifact_identity),
             caller_stream(std::exchange(other.caller_stream, nullptr)),
-            external_submission(other.external_submission),
+            caller_owns_submission(other.caller_owns_submission),
+            diagnostic_window_open(std::exchange(other.diagnostic_window_open, false)),
+            closing_backing(std::move(other.closing_backing)),
+            closing_callable(std::move(other.closing_callable)),
             resources_owned(std::exchange(other.resources_owned, false)),
             aicore_retirement_attempted(std::exchange(other.aicore_retirement_attempted, false)),
             joinable_boundary(other.joinable_boundary),
@@ -1690,7 +1692,10 @@ public:
          */
         NativeRunArtifactIdentity artifact_identity{};
         rtStream_t caller_stream{nullptr};
-        bool external_submission{false};
+        bool caller_owns_submission{false};
+        bool diagnostic_window_open{false};
+        std::vector<WorkspaceManager::BackingIdentity> closing_backing;
+        std::shared_ptr<const PreparedRunResources::CallableUse> closing_callable;
         bool resources_owned{false};
         bool aicore_retirement_attempted{false};
         /**
@@ -1879,22 +1884,19 @@ public:
     int retain_prepared_run_resources(PreparedExecution &prepared, uint32_t arena_bank, int32_t callable_id = -1) {
         return retain_prepared_run_resources(prepared, RegionBanks{arena_bank, arena_bank, arena_bank}, callable_id);
     }
-    int retain_external_run_resources(
-        PreparedExecution &prepared, void *caller_stream, void **out_reference, NativeRunPreparePurpose purpose
-    );
-    int release_external_run_resources(void *reference);
-    int admit_external_submission(PreparedExecution &prepared);
+    int prepare_caller_diagnostics(PreparedExecution &prepared);
+    int reclaim_caller_backing(PreparedExecution &prepared);
+    int close_caller_diagnostics(PreparedExecution &prepared);
     int prepare_caller_submission(void *owner, PreparedExecution &prepared);
     void yield_caller_submission(void *owner, const NativeRunIdentity &identity);
     int finish_caller_submission(ActiveExecution &active);
     void release_caller_submission(void *owner) { caller_device_buffers_.release_reference(owner, false); }
-    bool capture_diagnostics_supported(const PreparedExecution &prepared) const;
-    virtual bool supports_scope_stats_capture() const { return false; }
-    virtual bool supports_pmu_capture() const { return false; }
-    virtual bool supports_swimlane_capture() const { return false; }
-    virtual bool supports_args_dump_capture() const { return false; }
+    bool caller_diagnostics_supported(const PreparedExecution &prepared) const;
+    virtual bool supports_caller_scope_stats() const { return false; }
+    virtual bool supports_caller_pmu() const { return false; }
+    virtual bool supports_caller_swimlane() const { return false; }
+    virtual bool supports_caller_args_dump() const { return false; }
     bool prepared_storage_in_use() const;
-    bool prepared_resources_block_fatal_reset() const;
     bool prepared_resources_can_abandon() const;
 
     /**
@@ -2988,6 +2990,7 @@ protected:
         Kind kind{Kind::RunOwner};
         const void *owner{nullptr};
         RunStreams streams{};
+        bool caller_owned{false};  // Payload, not part of the observation identity.
         bool operator==(const NativeRunObservation &other) const {
             return kind == other.kind && owner == other.owner && streams.aicpu == other.streams.aicpu &&
                    streams.aicore == other.streams.aicore;
@@ -3216,26 +3219,7 @@ protected:
     std::vector<PreparedUseRecord> prepared_uses_;
     // Registered published owners; internal use records never own this lifetime.
     std::vector<std::weak_ptr<const PreparedRunResources>> prepared_resource_owners_;
-    struct ExternalRunReference {
-        NativeRunIdentity identity;
-        std::shared_ptr<const PreparedRunResources> resources;
-        // Kept through a failed close even after backing moved to retirement.
-        std::shared_ptr<const PreparedRunResources::CallableUse> callable;
-        std::vector<WorkspaceManager::BackingIdentity> managed_backing;
-        void *caller_stream{nullptr};
-        bool external_submission{false};
-        bool scope_stats_window{false};
-        bool pmu_window{false};
-        bool swimlane_window{false};
-        bool args_dump_window{false};
-        bool release_requested{false};
-        bool closing{false};
-    };
-    std::unordered_map<void *, std::unique_ptr<ExternalRunReference>> external_run_references_;
-    // Serializes external close across RTS calls without holding the storage lock.
-    std::mutex external_reference_mutex_;
-
-    bool prepared_storage_has_external_references_locked() const;
+    bool has_live_prepared_owners_locked() const;
     void note_prepared_waits_consumed(const NativeRunIdentity &identity);
     int reclaim_prepared_storage();
     ArenaBank &arena_bank(uint32_t bank_id) { return *arena_banks_[bank_id]; }
@@ -3440,9 +3424,6 @@ protected:
         bool evidence_observed{false};
         // The run's own lease ends at finalize; each external retain adds one.
         // The pool region stays owned until both are gone.
-        size_t external_leases{0};
-        bool internal_released{false};
-        bool externally_retained{false};
         NativeInvocationEvidence::Snapshot observed_evidence{};
     };
     // Owned by the live call, independently of its reusable execution slot.
@@ -3536,7 +3517,5 @@ private:
     // Called under run_result_mu_; releases the pool region once every lease
     // has ended and the evidence has been read.
     int finish_result_release(RunResultStorage &storage);
-    void note_result_external_lease_started(const NativeRunIdentity &identity);
-    int note_result_external_lease_ended(const NativeRunIdentity &identity);
     ResultRegionSnapshot last_observed_result_region_;
 };

@@ -194,16 +194,8 @@ public:
         ContextDestroyed = 6,
     };
 
-    /**
-     * References one block can carry at once.
-     *
-     * A reference is dropped when its run retires or when its run's context is
-     * destroyed, and a set admits no new run until its previous one has been
-     * finalized, so the live references on one block cannot outnumber the
-     * granted run-resource sets. The two spare entries exist so that reaching
-     * the bound is a refusal rather than a truncation: a reference this manager
-     * cannot record is a reference it would silently stop protecting.
-     */
+    // Reserve the ordinary pipeline's reference slots up front. Shared blocks
+    // grow their host ledger when more original runs outlive slot reuse.
     size_t max_block_refs() const { return runs_.size() + 2; }
 
     /** The identity workspace requests made outside any run belong to. */
@@ -388,7 +380,9 @@ public:
         // storage whose free was attempted and failed would let a run write
         // where the platform may already have reclaimed.
         if (b == nullptr || b->quarantined || b->release_unconfirmed) return false;
-        return add_ref(*b, run_epoch, max_block_refs());
+        // Caller-owned runs keep a ledger row after their submission slot is reused.
+        // A shared allocation may have one such reader per outstanding run.
+        return add_ref(*b, run_epoch, max_block_refs() + observation_runs_.size());
     }
 
     /**
@@ -1096,7 +1090,13 @@ private:
             if (b.refs[i] == epoch) return true;
         }
         if (b.ref_count >= ref_capacity) return false;  // refuse, never truncate
-        if (b.refs.size() <= b.ref_count) b.refs.resize(ref_capacity, 0);
+        if (b.refs.size() <= b.ref_count) {
+            try {
+                b.refs.resize(static_cast<size_t>(b.ref_count) + 1);
+            } catch (const std::bad_alloc &) {
+                return false;
+            }
+        }
         b.refs[b.ref_count++] = epoch;
         if (!b.quarantined && !b.release_unconfirmed) b.state = BlockState::Referenced;
         return true;

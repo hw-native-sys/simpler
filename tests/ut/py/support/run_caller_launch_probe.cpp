@@ -2210,15 +2210,12 @@ static void check_capture_host_effect_refusal() {
     CallConfig config;
     config.aicpu_thread_num = 2;
     NativeRunDescriptor descriptor{0, 0, 1, 1, 1, 1};
-    descriptor.prepare_purpose = UINT32_MAX;
-    runner.install_host_effect(ArgDirection::INOUT);
-    assert(simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor) == PTO_RUNTIME_ERR_INVALID_ARGUMENT);
-    assert(value == 41 && host_effect_calls == 0);
-    descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
     for (auto direction : {ArgDirection::OUT, ArgDirection::INOUT}) {
         runner.install_host_effect(direction);
         const auto before = std::make_tuple(submits, syncs, copies, allocation_attempts);
-        assert(simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor) == PTO_RUNTIME_ERR_UNSUPPORTED);
+        assert(
+            simpler_prepare_caller_run(&runner, storage, 1, &args, &config, &descriptor) == PTO_RUNTIME_ERR_UNSUPPORTED
+        );
         assert(value == 41 && host_effect_calls == 0);
         assert(before == std::make_tuple(submits, syncs, copies, allocation_attempts));
         assert(!runner.native_runs_outstanding());
@@ -2226,13 +2223,12 @@ static void check_capture_host_effect_refusal() {
         std::memcpy(&magic, storage, sizeof(magic));
         assert(magic == 0);
     }
-    descriptor.prepare_purpose = SIMPLER_PREPARE_EAGER;
     assert(simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor) == 0);
     assert(value == 42 && host_effect_calls == 1);
     auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(storage);
     const auto original_caller = state->prepared_execution->caller_stream;
     capture = true;
-    assert(simpler_submit_run_on_stream(&runner, storage, caller) == PTO_RUNTIME_ERR_UNSUPPORTED);
+    assert(simpler_submit_run_on_stream(&runner, storage, caller) == PTO_RUNTIME_ERR_INVALID_STATE);
     assert(state->phase.load() == NativeRunPhase::Prepared && !state->runner_claimed);
     assert(state->prepared_execution->caller_stream == original_caller);
     assert(value == 42 && host_effect_calls == 1);
@@ -2252,11 +2248,8 @@ static void check_standalone_collector_close(const std::string &scenario) {
     completion_events_ready = false;
     fail_force_reset = scenario == "reset-failure";
     fail_reset_probe = scenario == "probe-failure";
-    const bool external_resources = scenario == "external-program" || scenario == "external-borrowed" ||
-                                    scenario == "held-program" || scenario == "held-borrowed";
-    const bool held_resources = scenario == "held-program" || scenario == "held-borrowed" || external_resources;
-    const bool borrowed = scenario == "borrowed" || scenario == "held-borrowed" || scenario == "unproven-borrowed" ||
-                          scenario == "external-borrowed";
+    const bool live_borrowed_readers = scenario == "held-borrowed";
+    const bool borrowed = scenario == "borrowed" || scenario == "held-borrowed" || scenario == "unproven-borrowed";
     const bool confirmed = !borrowed && !fail_force_reset && !fail_reset_probe;
     const bool retry_acl_close = scenario == "acl-finalize-retry";
     acl_init_refs = 0;
@@ -2270,7 +2263,6 @@ static void check_standalone_collector_close(const std::string &scenario) {
     reset_events.clear();
     auto *runner = new FatalCollectorProbeRunner;
     runner->initialize(borrowed);
-    if (external_resources) runner->install_submission_binary_stub();
     if (retry_acl_close) assert(runner->ensure_acl_ready(0) == 0);
     runner->initialize_scope_stats();
     void *storage = std::aligned_alloc(get_runtime_alignment(), get_runtime_size());
@@ -2297,8 +2289,6 @@ static void check_standalone_collector_close(const std::string &scenario) {
     sync_error = -739;
     std::weak_ptr<const PreparedRunResources> prepared_lifetime =
         static_cast<NativeRunContext<DeviceRunnerBase> *>(storage)->prepared_execution->prepared_resources;
-    std::shared_ptr<const PreparedRunResources> retained;
-    RuntimeHandle external_reference = nullptr;
     if (scenario.rfind("unused", 0) == 0) {
         sync_error = 0;
         assert(simpler_finalize_run(runner, storage) == 0);
@@ -2335,13 +2325,8 @@ static void check_standalone_collector_close(const std::string &scenario) {
         std::fprintf(stderr, "standalone collector unused: preparation retired without submission\n");
         return;
     }
-    if (held_resources) {
-        if (external_resources) {
-            assert(simpler_retain_run_resources(runner, storage, caller, &external_reference) == 0);
-        } else
-            retained =
-                static_cast<NativeRunContext<DeviceRunnerBase> *>(storage)->prepared_execution->prepared_resources;
-        assert((retained || external_reference) && runner->prepared_storage_in_use());
+    if (live_borrowed_readers) {
+        assert(runner->prepared_storage_in_use());
         runner->start_scope_readers();
         assert(runner->scope_readers_started());
         const auto allocations = live_allocations;
@@ -2366,32 +2351,19 @@ static void check_standalone_collector_close(const std::string &scenario) {
     const uint64_t before = runner->device_health().generation();
     const auto allocations_before_close = live_allocations;
     int rc = finalize_device(runner);
-    if (held_resources) {
-        assert(borrowed ? rc != 0 : rc == PTO_RUNTIME_ERR_INVALID_STATE);
-        assert(runner->scope_readers_started() == borrowed);
+    if (live_borrowed_readers) {
+        assert(rc != 0);
+        assert(runner->scope_readers_started());
         assert(force_resets == 0 && runner->device_health().generation() == before);
         assert(live_allocations == allocations_before_close && runner->prepared_storage_in_use());
         // Borrowed unknown-use close retains the live collector; its reads
         // may continue, but close must not submit, synchronize or reset.
-        const auto operations = std::make_tuple(submits, syncs, borrowed ? 0 : copies, stale_resource_calls);
+        const auto operations = std::make_tuple(submits, syncs, stale_resource_calls);
         assert(finalize_device(runner) == rc);
-        assert(operations == std::make_tuple(submits, syncs, borrowed ? 0 : copies, stale_resource_calls));
+        assert(operations == std::make_tuple(submits, syncs, stale_resource_calls));
         assert(force_resets == 0 && live_allocations == allocations_before_close);
-        retained.reset();
-        if (external_resources) {
-            const auto before_release = live_allocations;
-            const int releases_before = resource_release_calls;
-            assert(simpler_release_run_resources(runner, external_reference) == -739);
-            assert(live_allocations == before_release && resource_release_calls == releases_before);
-        }
-        assert(!runner->prepared_resources_block_fatal_reset());
-        assert(runner->prepared_storage_in_use());
-        rc = finalize_device(runner);
-        assert(runner->scope_readers_started() == borrowed);
-        std::fprintf(
-            stderr, "standalone collector %s: external close deferred; readers_%s\n", scenario.c_str(),
-            borrowed ? "retained" : "stopped"
-        );
+        assert(runner->prepared_storage_in_use() && runner->scope_readers_started());
+        std::fprintf(stderr, "standalone collector held-borrowed: readers retained\n");
     }
     if (!confirmed) assert(live_allocations == allocations_before_close);
     if (retry_acl_close) {
@@ -2588,171 +2560,6 @@ static void check_retained_temporary_storage(bool grow) {
     assert(submits == 0 && syncs == 0 && copies == 0);
 }
 
-static void check_external_resource_api(bool borrowed, bool grow = false) {
-    owned_close_active = !borrowed;
-    next_stream = next_event = submits = syncs = copies = 0;
-    fail_at = sync_error = 0;
-    capture = false;
-    const auto allocations_before = live_allocations;
-    FatalCollectorProbeRunner runner;
-    runner.initialize(borrowed);
-    runner.install_submission_binary_stub();
-    void *storage = std::aligned_alloc(get_runtime_alignment(), get_runtime_size());
-    assert(storage != nullptr);
-    std::memset(storage, 0, get_runtime_size());
-    std::vector<uint8_t> output(16, 0x71);
-    uint32_t shape[]{16};
-    ChipTensor tensor;
-    tensor.init_external(
-        output.data(), output.size(), shape, 1, DataType::UINT8, borrowed ? AddressSpace::DEVICE : AddressSpace::HOST
-    );
-    ChipStorageTaskArgs args;
-    args.add_tensor(tensor);
-    CallConfig config;
-    config.aicpu_thread_num = 2;
-    for (int ring = 0; ring != RUNTIME_ENV_RING_COUNT; ++ring) {
-        config.runtime_env.ring_task_window[ring] = 4;
-        config.runtime_env.ring_heap[ring] = 1024;
-        config.runtime_env.ring_dep_pool[ring] = 4;
-    }
-    NativeRunDescriptor descriptor{0, 0, 1, 1, 1, 1};
-    const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-    void *mapping = mmap(nullptr, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    assert(mapping != MAP_FAILED);
-    assert(mprotect(static_cast<char *>(mapping) + page, page, PROT_NONE) == 0);
-    auto *bounded_descriptor =
-        new (static_cast<char *>(mapping) + page - sizeof(NativeRunDescriptor)) NativeRunDescriptor(descriptor);
-    assert(simpler_prepare_run(&runner, storage, 1, &args, &config, bounded_descriptor) == 0);
-    assert(simpler_finalize_run(&runner, storage) == 0);
-    assert(munmap(mapping, 2 * page) == 0);
-    assert(simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor) == 0);
-    void *first_staging = nullptr;
-    size_t staging_bytes = 0;
-    runner.get_retained_temp_buffer(0, &first_staging, &staging_bytes);
-    std::vector<unsigned char> staging_snapshot;
-    if (!borrowed) {
-        assert(first_staging != nullptr && staging_bytes >= output.size());
-        auto *bytes = static_cast<unsigned char *>(first_staging);
-        staging_snapshot.assign(bytes, bytes + staging_bytes);
-    }
-    void *first_result = runner.result_address();
-    assert(borrowed ? first_result == nullptr : first_result != nullptr);
-    void *first_owned_backing = borrowed ? runner.shared_state_address() : first_result;
-    assert(first_owned_backing != nullptr);
-    const auto first_arena = runner.arena_bank_gm_heap_base(0);
-    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(storage);
-    std::weak_ptr<const PreparedRunResources> first_prepared = state->prepared_execution->prepared_resources;
-    RuntimeHandle first = nullptr, second = nullptr, refused = caller;
-    state->prepared_execution->dfx.scope_stats_enabled = true;
-    assert(simpler_retain_run_resources(&runner, storage, caller, &refused) == PTO_RUNTIME_ERR_UNSUPPORTED);
-    assert(refused == nullptr);
-    state->prepared_execution->dfx.scope_stats_enabled = false;
-    capture = true;
-    if (!borrowed) {
-        assert(simpler_retain_run_resources(&runner, storage, caller, &refused) == PTO_RUNTIME_ERR_UNSUPPORTED);
-        capture = false;
-    }
-    const int submits_before = submits;
-    const int copies_before = copies;
-    assert(simpler_retain_run_resources(&runner, storage, caller, &first) == 0);
-    capture = false;
-    assert(first != nullptr && submits == submits_before && copies == copies_before);
-    assert(simpler_retain_run_resources(&runner, storage, caller, &refused) == PTO_RUNTIME_ERR_INVALID_STATE);
-    assert(refused == nullptr);
-    const int copybacks_before = copyback_calls;
-    if (!borrowed) {
-        const int releases_before = resource_release_calls;
-        bind_thread_error = -785;
-        assert(simpler_finalize_run(&runner, storage) == -785);
-        assert(state->magic == NativeRunContext<DeviceRunnerBase>::kMagic);
-        assert(state->phase.load() == NativeRunPhase::Complete);
-        assert(runner.native_runs_outstanding());
-        assert(!first_prepared.expired());
-        assert(copyback_calls == copybacks_before && resource_release_calls == releases_before);
-        bind_thread_error = 0;
-        assert(simpler_unregister_callable(&runner, 1) != 0);
-    }
-    fail_bindings_release = true;
-    assert(simpler_finalize_run(&runner, storage) == -784);
-    assert(state->phase.load() == NativeRunPhase::Complete);
-    assert(runner.native_runs_outstanding());
-    assert(copyback_calls == copybacks_before + 1);
-    assert(simpler_finalize_run(&runner, storage) == 0);
-    assert(copyback_calls == copybacks_before + 1);
-    assert(!first_prepared.expired());
-    assert(simpler_unregister_callable(&runner, 1) == PTO_RUNTIME_ERR_INVALID_STATE);
-    runner.add_unrelated_callable();
-    assert(simpler_unregister_callable(&runner, 2) == 0);
-    assert(runner.finish_common() == PTO_RUNTIME_ERR_INVALID_STATE);
-    // A different valid runner cannot consume this reference. No dereference
-    // of an untrusted reference pointer is needed to reject it.
-    {
-        ProbeRunner other;
-        other.initialize();
-        assert(simpler_release_run_resources(&other, first) == PTO_RUNTIME_ERR_INVALID_ARGUMENT);
-        assert(other.finish_common() == 0);
-    }
-    if (grow) {
-        output.resize(staging_bytes * 2 + 256, 0x31);
-        shape[0] = static_cast<uint32_t>(output.size());
-        tensor.init_external(output.data(), output.size(), shape, 1, DataType::UINT8, AddressSpace::HOST);
-        args = ChipStorageTaskArgs{};
-        args.add_tensor(tensor);
-    }
-    descriptor.run_epoch = descriptor.dispatch_id = 2;
-    assert(simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor) == 0);
-    if (borrowed) {
-        assert(runner.result_address(descriptor.run_epoch) == nullptr);
-        assert(runner.shared_state_address() != first_owned_backing);
-    } else {
-        assert(runner.result_address(descriptor.run_epoch) != first_result);
-    }
-    if (!borrowed) {
-        void *second_staging = nullptr;
-        runner.get_retained_temp_buffer(0, &second_staging, nullptr);
-        assert(second_staging != first_staging);
-        assert(std::memcmp(first_staging, staging_snapshot.data(), staging_bytes) == 0);
-    }
-    if (first_arena != 0) assert(runner.arena_bank_gm_heap_base(0) != first_arena);
-    assert(simpler_retain_run_resources(&runner, storage, caller, &second) == 0);
-    assert(first != second);
-    assert(simpler_finalize_run(&runner, storage) == 0);
-    sync_error = -781;
-    assert(simpler_release_run_resources(&runner, first) == -781);
-    assert(!first_prepared.expired());
-    sync_error = 0;
-    failed_free = first_owned_backing;
-    assert(simpler_release_run_resources(&runner, first) != 0);
-    assert(live_allocations.count(first_owned_backing) == 1);
-    assert(runner.finish_common() == PTO_RUNTIME_ERR_INVALID_STATE);
-    assert(simpler_unregister_callable(&runner, 1) == PTO_RUNTIME_ERR_INVALID_STATE);
-    assert(simpler_release_run_resources(&runner, first) == 0);
-    assert(first_prepared.expired() && live_allocations.count(first_owned_backing) == 0);
-    assert(simpler_release_run_resources(&runner, first) == PTO_RUNTIME_ERR_INVALID_ARGUMENT);
-    assert(simpler_unregister_callable(&runner, 1) == PTO_RUNTIME_ERR_INVALID_STATE);
-    assert(simpler_release_run_resources(&runner, second) == 0);
-    assert(!runner.prepared_storage_in_use());
-    // Returning an external reference before original-run retirement ends only
-    // the external obligation. The original owner still protects its callable.
-    descriptor.run_epoch = descriptor.dispatch_id = 3;
-    assert(simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor) == 0);
-    RuntimeHandle early = nullptr;
-    assert(simpler_retain_run_resources(&runner, storage, caller, &early) == 0);
-    assert(simpler_release_run_resources(&runner, early) == 0);
-    assert(runner.unregister_callable(1) == PTO_RUNTIME_ERR_INVALID_STATE);
-    assert(simpler_retain_run_resources(&runner, storage, caller, &refused) == PTO_RUNTIME_ERR_INVALID_STATE);
-    assert(refused == nullptr);
-    assert(simpler_finalize_run(&runner, storage) == 0);
-    // The fixture has no uploaded callable image. Removing this fake
-    // registration proves its use lease was dropped after both releases.
-    assert(simpler_unregister_callable(&runner, 1) == 0);
-    assert((borrowed ? runner.finish_common() : finalize_device(&runner)) == 0);
-    std::free(storage);
-    assert(live_allocations == allocations_before);
-    owned_close_active = false;
-    std::fprintf(stderr, "external resources: public retain/finalize/reuse/release and retries passed\n");
-}
-
 static int check_capture_submission(bool borrowed, int fault) {
     owned_close_active = !borrowed;
     next_stream = next_event = submits = syncs = copies = 0;
@@ -2781,15 +2588,16 @@ static int check_capture_submission(bool borrowed, int fault) {
         config.runtime_env.ring_dep_pool[ring] = 4;
     }
     NativeRunDescriptor descriptor{0, 0, 1, 1, 1, 1};
-    descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
     if (!borrowed) {
         const auto before = std::make_tuple(submits, syncs, copies, allocation_attempts);
-        assert(simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor) == PTO_RUNTIME_ERR_UNSUPPORTED);
+        assert(
+            simpler_prepare_caller_run(&runner, storage, 1, &args, &config, &descriptor) == PTO_RUNTIME_ERR_UNSUPPORTED
+        );
         assert(before == std::make_tuple(submits, syncs, copies, allocation_attempts));
-        descriptor.prepare_purpose = SIMPLER_PREPARE_EAGER;
     }
     const auto prior_exchanges = capture_mode_exchanges;
-    assert(simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor) == 0);
+    const auto prepare = borrowed ? simpler_prepare_caller_run : simpler_prepare_run;
+    assert(prepare(&runner, storage, 1, &args, &config, &descriptor) == 0);
     assert(capture_mode_exchanges == prior_exchanges);
     assert(capture_mode == ACL_MODEL_RI_CAPTURE_MODE_GLOBAL);
     auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(storage);
@@ -2816,30 +2624,19 @@ static int check_capture_submission(bool borrowed, int fault) {
     if (capture_kernel_packet) {
         assert(state->prepared_execution->kernel_args.prepare_kernel_invocation({1, 1, 1, 0}) == 0);
     }
-    const int initial_submits = submits;
-    RuntimeHandle reference = nullptr;
-    assert(simpler_retain_run_resources(&runner, storage, caller, &reference) == 0);
     const auto retained = std::weak_ptr<const PreparedRunResources>(state->prepared_execution->prepared_resources);
-    const auto allocation_count = allocation_attempts;
-    const int sync_count = syncs, copyback_count = copyback_calls;
+    const int sync_count = syncs;
+    int copyback_count = copyback_calls;
     const int resets = force_resets + normal_reset_calls;
     capture = true;
-    state->prepared_execution->dfx.scope_stats_enabled = true;
-    assert(simpler_launch_run_on_stream(&runner, storage, caller, nullptr) == PTO_RUNTIME_ERR_UNSUPPORTED);
-    state->prepared_execution->dfx.scope_stats_enabled = false;
-    assert(simpler_launch_run_on_stream(&runner, storage, caller, storage) == PTO_RUNTIME_ERR_UNSUPPORTED);
-    assert(submits == initial_submits);
     trace.clear();
     stream_trace.clear();
     event_trace.clear();
     submits = 0;
     fail_at = fault;
-    const int rc = simpler_launch_run_on_stream(&runner, storage, caller, nullptr);
+    const int rc = simpler_submit_run_on_stream(&runner, storage, caller);
     assert(rc == (fault == 0 ? 0 : -777));
-    assert(syncs == sync_count && allocation_attempts == allocation_count);
-    assert(force_resets + normal_reset_calls == resets);
-    assert(simpler_poll_run(&runner, storage) == SIMPLER_NATIVE_RUN_POLL_ERROR);
-    assert(simpler_wait_run(&runner, storage) == PTO_RUNTIME_ERR_UNSUPPORTED);
+    assert(syncs == sync_count && force_resets + normal_reset_calls == resets);
     const int recorded_submits = submits;
     if (fault == 0) {
         const auto first_order = std::find_if(trace.begin(), trace.end(), [](const auto &entry) {
@@ -2850,54 +2647,40 @@ static int check_capture_submission(bool borrowed, int fault) {
             (std::vector<std::string>(first_order, trace.end()) ==
              std::vector<std::string>{"record", "wait", "core", "record", "cpu", "wait", "record", "record"})
         );
+        assert(simpler_poll_run(&runner, storage) == SIMPLER_NATIVE_RUN_POLL_ERROR);
+        assert(simpler_wait_run(&runner, storage) == PTO_RUNTIME_ERR_UNSUPPORTED);
     } else {
         assert(submits == fault);
     }
-    assert(simpler_launch_run_on_stream(&runner, storage, caller, nullptr) == PTO_RUNTIME_ERR_INVALID_STATE);
-    // Ending the Host run during capture must not synchronize or read outputs.
-    if (fault == 0) {
-        fail_bindings_release = true;
-        assert(simpler_finalize_run(&runner, storage) == -784);
-        assert(state->phase.load() == NativeRunPhase::Complete);
-        assert(syncs == sync_count && copyback_calls == copyback_count);
-    }
-    assert(simpler_finalize_run(&runner, storage) == rc);
-    assert(syncs == sync_count && copyback_calls == copyback_count);
     assert(!retained.expired());
     assert(simpler_unregister_callable(&runner, 1) == PTO_RUNTIME_ERR_INVALID_STATE);
-    // The RTS stub represents capture-end/model destruction and external join.
     capture = false;
     fail_at = 0;
     if (fault == 0) {
+        // Replayable backing survives slot reuse and failed finalization.
+        void *next = std::aligned_alloc(get_runtime_alignment(), get_runtime_size());
+        assert(next != nullptr);
+        std::memset(next, 0, get_runtime_size());
         descriptor.run_epoch = descriptor.dispatch_id = 2;
-        assert(simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor) == 0);
-        assert(simpler_finalize_run(&runner, storage) == 0);
-        assert(!retained.expired());
-    }
-    const auto retained_allocations = live_allocations;
-    const auto unchanged = std::make_tuple(resource_release_calls, submits, copies, device_drains);
-    sync_error_stream = caller;
-    for (const int error : {507046, 507011, 507018}) {
-        sync_error = error;
-        for (int retry = 0; retry < 2; ++retry) {
-            const int syncs_before = syncs;
-            assert(simpler_release_run_resources(&runner, reference) == error);
-            assert(syncs == syncs_before + 1 && observed_streams.back() == caller);
+        assert(simpler_prepare_run(&runner, next, 1, &args, &config, &descriptor) == 0);
+        assert(copyback_calls == copyback_count);
+        assert(simpler_finalize_run(&runner, next) == 0);
+        copyback_count = copyback_calls;
+        std::free(next);
+        sync_error_stream = caller;
+        for (const int error : {507046, 507011, 507018}) {
+            sync_error = error;
+            assert(simpler_finalize_run(&runner, storage) == error);
             assert(!retained.expired());
-            assert(live_allocations == retained_allocations);
-            assert(unchanged == std::make_tuple(resource_release_calls, submits, copies, device_drains));
             assert(simpler_unregister_callable(&runner, 1) == PTO_RUNTIME_ERR_INVALID_STATE);
         }
+        sync_error = 0;
+        sync_error_stream = nullptr;
     }
-    sync_error = 0;
-    sync_error_stream = nullptr;
-    assert(simpler_release_run_resources(&runner, reference) == 0);
+    assert(simpler_finalize_run(&runner, storage) == rc);
     assert(retained.expired());
-    const int releases_after_success = resource_release_calls;
-    const int syncs_after_success = syncs;
-    assert(simpler_release_run_resources(&runner, reference) == PTO_RUNTIME_ERR_INVALID_ARGUMENT);
-    assert(resource_release_calls == releases_after_success && syncs == syncs_after_success);
-    std::fprintf(stderr, "capture release: timeout/error retain, completion retry and duplicate rejection passed\n");
+    assert(copyback_calls == copyback_count);
+    std::fprintf(stderr, "caller-owned run: last-use finalization and retry passed\n");
     assert(simpler_unregister_callable(&runner, 1) == 0);
     assert((borrowed ? runner.finish_common() : finalize_device(&runner)) == 0);
     std::free(storage);
@@ -2938,7 +2721,7 @@ int main(int argc, char **argv) {
     }
     if (argc == 2) {
         const std::string scenario = argv[1];
-        if (scenario.rfind("held-", 0) == 0 || scenario.rfind("external-", 0) == 0 || scenario.rfind("unused", 0) == 0)
+        if (scenario.rfind("held-", 0) == 0 || scenario.rfind("unused", 0) == 0)
             check_standalone_collector_close(scenario);
         else check_owned_unknown_close(scenario);
         return 0;
@@ -2954,9 +2737,6 @@ int main(int argc, char **argv) {
     check_retained_submission_storage(true);
     check_retained_temporary_storage(false);
     check_retained_temporary_storage(true);
-    check_external_resource_api(true);
-    check_external_resource_api(false);
-    check_external_resource_api(false, true);
     check_submission_resource_binding();
     check_joined_callers(nullptr, nullptr, false, true);
     check_joined_callers(caller, &tokens[62], false, true);

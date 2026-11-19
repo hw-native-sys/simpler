@@ -645,7 +645,7 @@ TEST_F(NativeAdmissionTest, RetainedRunSharesDeviceWorkspaceAcrossSlots) {
     HbgImageCaptureRunner runner;
     ASSERT_EQ(runner.initialize_kernel(), 0);
     auto capture_args = [](Attempt &attempt) {
-        attempt.descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
+        attempt.caller_owned = true;
         attempt.args.tensor(0).address_space = AddressSpace::DEVICE;
         attempt.args.tensor(0).transfer = TensorTransfer::NONE;
     };
@@ -666,18 +666,15 @@ TEST_F(NativeAdmissionTest, RetainedRunSharesDeviceWorkspaceAcrossSlots) {
     };
     auto first = publication(captured);
     ASSERT_NE(first, nullptr);
-    RuntimeHandle reference = nullptr;
+
     auto cleanup = RAIIScopeGuard([&] {
         control().recording_active = false;
         (void)simpler_finalize_run(&runner, captured.storage);
-        if (reference != nullptr) (void)simpler_release_run_resources(&runner, reference);
     });
     int caller;
-    ASSERT_EQ(simpler_retain_run_resources(&runner, captured.storage, &caller, &reference), 0);
     control().recording_active = true;
-    ASSERT_EQ(simpler_launch_run_on_stream(&runner, captured.storage, &caller, nullptr), 0);
+    ASSERT_EQ(simpler_submit_run_on_stream(&runner, captured.storage, &caller), 0);
     control().recording_active = false;
-    ASSERT_EQ(simpler_finalize_run(&runner, captured.storage), 0);
     ASSERT_TRUE(runner.set_workspace_limit(runner.charged()));
     Attempt reuse(runner, 0, 10032);
     capture_args(reuse);
@@ -690,8 +687,7 @@ TEST_F(NativeAdmissionTest, RetainedRunSharesDeviceWorkspaceAcrossSlots) {
     EXPECT_EQ(first->device_target, second->device_target);
     EXPECT_NE(first->source, second->source);
     ASSERT_EQ(simpler_finalize_run(&runner, reuse.storage), 0);
-    ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
-    reference = nullptr;
+    ASSERT_EQ(simpler_finalize_run(&runner, captured.storage), 0);
 }
 
 TEST_F(NativeAdmissionTest, CallerOwnedOrdinaryRunsReuseOneSlotBeforeEitherFinalize) {
@@ -702,6 +698,7 @@ TEST_F(NativeAdmissionTest, CallerOwnedOrdinaryRunsReuseOneSlotBeforeEitherFinal
     int caller;
     size_t index = 0;
     for (Attempt *run : {&first, &second}) {
+        run->caller_owned = true;
         run->args.tensor(0).address_space = AddressSpace::DEVICE;
         run->args.tensor(0).transfer = TensorTransfer::NONE;
         ASSERT_NE(buffers[index], nullptr);
@@ -736,6 +733,7 @@ TEST_F(NativeAdmissionTest, CallerOwnedPartialSubmissionRetainsItsClaimUntilBoth
     HbgImageCaptureRunner runner;
     ASSERT_EQ(runner.initialize_kernel(), 0);
     Attempt run(runner, 0, 101812);
+    run.caller_owned = true;
     run.args.tensor(0).address_space = AddressSpace::DEVICE;
     run.args.tensor(0).transfer = TensorTransfer::NONE;
     ASSERT_EQ(run.prepare(), 0);
@@ -753,13 +751,13 @@ TEST_F(NativeAdmissionTest, CallerOwnedPartialSubmissionRetainsItsClaimUntilBoth
     EXPECT_EQ(runner.native_run_claim_count(), 0u);
 }
 
-TEST_F(NativeAdmissionTest, CapturedHbgImageUsesRtsSnapshotThroughOriginalRunRetirement) {
+TEST_F(NativeAdmissionTest, CapturedHbgImageUsesRtsSnapshotThroughRepeatedReplay) {
     HbgImageCaptureRunner runner;
     ASSERT_EQ(runner.initialize_kernel(), 0);
     runner.shared_resource = std::make_shared<int>(0);
     const std::weak_ptr<const void> shared_resource = runner.shared_resource;
     Attempt attempt(runner, 0, 9990);
-    attempt.descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
+    attempt.caller_owned = true;
     attempt.args.tensor(0).address_space = AddressSpace::DEVICE;
     attempt.args.tensor(0).transfer = TensorTransfer::NONE;
     auto reset_recording = RAIIScopeGuard([] {
@@ -780,17 +778,15 @@ TEST_F(NativeAdmissionTest, CapturedHbgImageUsesRtsSnapshotThroughOriginalRunRet
     void *const working_arena = publication->device_target;
     publication.reset();
     int caller;
-    RuntimeHandle reference = nullptr;
-    ASSERT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), 0);
+
     control().recording_active = true;
     auto cleanup = RAIIScopeGuard([&] {
         control().recording_active = false;
         (void)simpler_finalize_run(&runner, attempt.storage);
-        if (reference != nullptr) (void)simpler_release_run_resources(&runner, reference);
     });
     const std::weak_ptr<const PreparedRunResources> backing = state->prepared_execution->prepared_resources;
     control().defer_async_copies = true;
-    ASSERT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), 0);
+    ASSERT_EQ(simpler_submit_run_on_stream(&runner, attempt.storage, &caller), 0);
     EXPECT_FALSE(std::any_of(control().deferred_copies.begin(), control().deferred_copies.end(), [&](auto &copy) {
         return copy.destination == working_arena;
     })) << "RTS owns the H2D of the launch packet";
@@ -810,7 +806,6 @@ TEST_F(NativeAdmissionTest, CapturedHbgImageUsesRtsSnapshotThroughOriginalRunRet
     ASSERT_EQ(image.working_address, reinterpret_cast<uint64_t>(working_arena));
     ASSERT_EQ(image.bytes, expected.size());
     control().recording_active = false;
-    ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
     EXPECT_FALSE(backing.expired());
     EXPECT_FALSE(shared_resource.expired());
     for (const auto &copy : control().deferred_copies)
@@ -842,8 +837,8 @@ TEST_F(NativeAdmissionTest, CapturedHbgImageUsesRtsSnapshotThroughOriginalRunRet
         if (image.reference_count == 0)
             EXPECT_EQ(std::memcmp(working_arena, expected.data(), image.mutable_prefix_bytes), 0);
     }
-    ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
-    reference = nullptr;
+    ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+
     EXPECT_TRUE(backing.expired());
     EXPECT_TRUE(shared_resource.expired());
     cleanup.dismiss();
@@ -873,7 +868,7 @@ TEST_F(NativeAdmissionTest, CapturePreparationAcquiresHeapAndSchedulerStorage) {
     HbgImageCaptureRunner runner;
     ASSERT_EQ(runner.initialize_kernel(), 0);
     Attempt attempt(runner, 0, 7003);
-    attempt.descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
+    attempt.caller_owned = true;
     attempt.args.tensor(0).address_space = AddressSpace::DEVICE;
     attempt.args.tensor(0).transfer = TensorTransfer::NONE;
     ASSERT_EQ(attempt.prepare(), 0);
@@ -887,7 +882,7 @@ TEST_F(NativeAdmissionTest, RetainedCaptureHeapSurvivesEagerPrepareTrimAndFailed
     HbgImageCaptureRunner runner;
     ASSERT_EQ(runner.initialize_kernel(), 0);
     Attempt capture(runner, 0, 7010);
-    capture.descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
+    capture.caller_owned = true;
     capture.args.tensor(0).address_space = AddressSpace::DEVICE;
     capture.args.tensor(0).transfer = TensorTransfer::NONE;
     ASSERT_EQ(capture.prepare(), 0);
@@ -897,35 +892,28 @@ TEST_F(NativeAdmissionTest, RetainedCaptureHeapSurvivesEagerPrepareTrimAndFailed
     const std::array<unsigned char, 16> expected{0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a,
                                                  0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a, 0x5a};
     int caller;
-    RuntimeHandle reference = nullptr;
-    RuntimeHandle successor_reference = nullptr;
-    ASSERT_EQ(simpler_retain_run_resources(&runner, capture.storage, &caller, &reference), 0);
+
     auto cleanup = RAIIScopeGuard([&] {
         control().recording_active = false;
         control().stream_sync_rc = 0;
         (void)simpler_finalize_run(&runner, capture.storage);
-        if (reference) (void)simpler_release_run_resources(&runner, reference);
-        if (successor_reference) (void)simpler_release_run_resources(&runner, successor_reference);
     });
     control().recording_active = true;
-    ASSERT_EQ(simpler_launch_run_on_stream(&runner, capture.storage, &caller, nullptr), 0);
+    ASSERT_EQ(simpler_submit_run_on_stream(&runner, capture.storage, &caller), 0);
     control().recording_active = false;
-    ASSERT_EQ(simpler_finalize_run(&runner, capture.storage), 0);
     ASSERT_EQ(runner.heap_leases(), 1u);
     runner.trim_heap();
     EXPECT_EQ(runner.pooled_heap_base(), heap);
 
     Attempt successor(runner, 0, 7012);
-    successor.descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
+    successor.caller_owned = true;
     successor.args.tensor(0).address_space = AddressSpace::DEVICE;
     successor.args.tensor(0).transfer = TensorTransfer::NONE;
     ASSERT_EQ(successor.prepare(), 0);
     EXPECT_EQ(runner.prepared_heap_base(0, 7012), heap);
-    ASSERT_EQ(simpler_retain_run_resources(&runner, successor.storage, &caller, &successor_reference), 0);
     control().recording_active = true;
-    ASSERT_EQ(simpler_launch_run_on_stream(&runner, successor.storage, &caller, nullptr), 0);
+    ASSERT_EQ(simpler_submit_run_on_stream(&runner, successor.storage, &caller), 0);
     control().recording_active = false;
-    ASSERT_EQ(simpler_finalize_run(&runner, successor.storage), 0);
     EXPECT_EQ(runner.heap_leases(), 2u);
 
     Attempt eager(runner, 0, 7013);
@@ -941,18 +929,18 @@ TEST_F(NativeAdmissionTest, RetainedCaptureHeapSurvivesEagerPrepareTrimAndFailed
     EXPECT_EQ(runner.heap_leases(), 2u);
 
     control().stream_sync_rc = -4312;
-    EXPECT_EQ(simpler_release_run_resources(&runner, reference), -4312);
+    EXPECT_EQ(simpler_finalize_run(&runner, capture.storage), -4312);
     runner.trim_heap();
     EXPECT_EQ(runner.heap_leases(), 2u);
     EXPECT_EQ(runner.pooled_heap_base(), heap);
     control().stream_sync_rc = 0;
-    ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
-    reference = nullptr;
+    ASSERT_EQ(simpler_finalize_run(&runner, capture.storage), 0);
+
     EXPECT_EQ(runner.heap_leases(), 1u);
     runner.trim_heap();
     EXPECT_EQ(runner.pooled_heap_base(), heap);
-    ASSERT_EQ(simpler_release_run_resources(&runner, successor_reference), 0);
-    successor_reference = nullptr;
+    ASSERT_EQ(simpler_finalize_run(&runner, successor.storage), 0);
+
     EXPECT_EQ(runner.heap_leases(), 0u);
     runner.trim_heap();
     EXPECT_EQ(runner.heap_allocations(), 1u);
@@ -962,7 +950,7 @@ TEST_F(NativeAdmissionTest, RetainedRunSharesWritableDeviceStorageWithSameSlotSu
     HbgImageCaptureRunner runner;
     ASSERT_EQ(runner.initialize_kernel(), 0);
     Attempt capture(runner, 0, 7004);
-    capture.descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
+    capture.caller_owned = true;
     capture.args.tensor(0).address_space = AddressSpace::DEVICE;
     capture.args.tensor(0).transfer = TensorTransfer::NONE;
     auto reset_recording = RAIIScopeGuard([] {
@@ -975,16 +963,13 @@ TEST_F(NativeAdmissionTest, RetainedRunSharesWritableDeviceStorageWithSameSlotSu
     const void *const capture_target = capture_publication->device_target;
     const uint64_t capture_state_base = capture_state->runtime->dev.scheduler_bootstrap.worker_context_base;
     int caller;
-    RuntimeHandle reference = nullptr;
-    ASSERT_EQ(simpler_retain_run_resources(&runner, capture.storage, &caller, &reference), 0);
+
     auto release = RAIIScopeGuard([&] {
         control().recording_active = false;
-        (void)simpler_release_run_resources(&runner, reference);
     });
     control().recording_active = true;
-    ASSERT_EQ(simpler_launch_run_on_stream(&runner, capture.storage, &caller, nullptr), 0);
+    ASSERT_EQ(simpler_submit_run_on_stream(&runner, capture.storage, &caller), 0);
     control().recording_active = false;
-    ASSERT_EQ(simpler_finalize_run(&runner, capture.storage), 0);
 
     // Preparing the successor must leave the previous device contents intact.
     unsigned char sentinel = 0xa5;
@@ -1081,7 +1066,7 @@ TEST_F(NativeAdmissionTest, FailedCapturedHbgRtsSubmissionPreservesBackingThroug
     HbgImageCaptureRunner runner;
     ASSERT_EQ(runner.initialize_kernel(), 0);
     Attempt attempt(runner, 0, 9991);
-    attempt.descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
+    attempt.caller_owned = true;
     attempt.args.tensor(0).address_space = AddressSpace::DEVICE;
     attempt.args.tensor(0).transfer = TensorTransfer::NONE;
     ASSERT_EQ(attempt.prepare(), 0);
@@ -1090,33 +1075,30 @@ TEST_F(NativeAdmissionTest, FailedCapturedHbgRtsSubmissionPreservesBackingThroug
     ASSERT_NE(publication, nullptr);
     const std::weak_ptr<const PreparedRunResources> backing = state->prepared_execution->prepared_resources;
     int caller;
-    RuntimeHandle reference = nullptr;
-    ASSERT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), 0);
+
     auto cleanup = RAIIScopeGuard([&] {
         control().recording_active = false;
         control().stream_sync_rc = 0;
         (void)simpler_finalize_run(&runner, attempt.storage);
-        if (reference != nullptr) (void)simpler_release_run_resources(&runner, reference);
     });
     control().recording_active = true;
     control().defer_async_copies = true;
     control().aicpu_payload = [](void *, void *, size_t, const std::string &) {
         return -4288;
     };
-    EXPECT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), -4288);
+    EXPECT_EQ(simpler_submit_run_on_stream(&runner, attempt.storage, &caller), -4288);
     ASSERT_EQ(control().aicpu_argument_copies.size(), 1u);
     EXPECT_FALSE(std::any_of(control().deferred_copies.begin(), control().deferred_copies.end(), [&](auto &copy) {
         return copy.destination == publication->device_target;
     }));
     control().recording_active = false;
-    EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), -4288);
     EXPECT_FALSE(backing.expired());
     control().stream_sync_rc = -4290;
-    EXPECT_EQ(simpler_release_run_resources(&runner, reference), -4290);
+    EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), -4290);
     EXPECT_FALSE(backing.expired());
     control().stream_sync_rc = 0;
-    ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
-    reference = nullptr;
+    EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), -4288);
+
     EXPECT_TRUE(backing.expired());
     cleanup.dismiss();
 }

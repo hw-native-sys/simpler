@@ -757,6 +757,7 @@ private:
     using SimplerRegisterCallableV2Fn = decltype(&simpler_register_callable_v2);
     SimplerRegisterCallableV2Fn register_callable_v2_fn_ = nullptr;
     SimplerRunFn run_fn_ = nullptr;
+    SimplerPrepareRunFn prepare_caller_run_fn_ = nullptr;
     SimplerPrepareRunFn prepare_run_fn_ = nullptr;
     SimplerNativeRunFn launch_run_fn_ = nullptr;
     ValidateExecutionContextFn validate_execution_context_fn_ = nullptr;
@@ -989,12 +990,13 @@ private:
     ChipWorkerNativeRun prepare_native_run_on_slot(
         int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, uint32_t slot_id,
         uint64_t generation, uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state,
-        int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance
+        int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance,
+        SimplerPrepareRunFn prepare
     );
     ChipWorkerNativeRun prepare_native_run_for_lane(
         int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
         uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value,
-        bool pipeline_leased, NativeRunProvenance provenance
+        bool pipeline_leased, NativeRunProvenance provenance, SimplerPrepareRunFn prepare
     );
     void submit_native_run_to_caller(const ChipWorkerNativeRun &run, void *caller_stream);
     void wait_native_run_completion(const ChipWorkerNativeRun &run);

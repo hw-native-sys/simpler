@@ -107,10 +107,14 @@ int main(int argc, char **argv) {
     check(simpler_kernel_mode_prepare_callable(ctx, 0, callable.data(), callable.size()), "register-a");
     check(simpler_kernel_mode_prepare_callable(ctx, 1, callable.data(), callable.size()), "register-b");
     const size_t runtime_size = get_runtime_size(), alignment = get_runtime_alignment();
-    std::vector<uint8_t> storage(runtime_size + alignment);
-    auto run =
-        reinterpret_cast<void *>((reinterpret_cast<uintptr_t>(storage.data()) + alignment - 1) & ~(alignment - 1));
-    const auto original_run = run;
+    std::array<std::vector<uint8_t>, 3> storage;
+    std::array<RuntimeHandle, 3> runs{};
+    for (size_t i = 0; i < runs.size(); ++i) {
+        storage[i].resize(runtime_size + alignment);
+        runs[i] = reinterpret_cast<void *>(
+            (reinterpret_cast<uintptr_t>(storage[i].data()) + alignment - 1) & ~(alignment - 1)
+        );
+    }
     uint64_t identity = 0;
     auto prepare = [&](int callable_id, size_t tensor, int32_t increment, bool capture, int expected_rc = 0) {
         if (pmu || swimlane || args_dump) {
@@ -120,7 +124,7 @@ int main(int argc, char **argv) {
             const char *leaf = capture ? (callable_id == 0 ? "a" : "b") : "eager";
             std::snprintf(config.output_prefix, sizeof(config.output_prefix), "%s/%s", argv[6], leaf);
         }
-        std::memset(run, 0, runtime_size);
+        std::memset(runs[tensor], 0, runtime_size);
         uint32_t shape[]{elements};
         ChipStorageTaskArgs args;
         args.add_tensor(
@@ -129,22 +133,18 @@ int main(int argc, char **argv) {
         args.add_scalar(increment);
         NativeRunDescriptor descriptor{};
         descriptor.generation = descriptor.run_epoch = descriptor.dispatch_id = ++identity;
-        descriptor.prepare_purpose = capture ? SIMPLER_PREPARE_CAPTURE : SIMPLER_PREPARE_EAGER;
-        require(run == original_run && descriptor.pipeline_slot == 0, "same-carrier-and-slot");
-        const int rc = simpler_prepare_run(ctx, run, callable_id, &args, &config, &descriptor);
+        require(descriptor.pipeline_slot == 0, "same-pipeline-slot");
+        const auto prepare_run = capture ? simpler_prepare_caller_run : simpler_prepare_run;
+        const int rc = prepare_run(ctx, runs[tensor], callable_id, &args, &config, &descriptor);
         if (expected_rc != 0) require(rc == expected_rc, "expected-heap-capacity-refusal");
         else check(rc, "prepare");
     };
-    auto record = [&](RuntimeHandle &reference) {
-        check(simpler_retain_run_resources(ctx, run, caller, &reference), "retain");
-        require(reference != nullptr, "retained-reference");
+    auto record = [&](RuntimeHandle run) {
         aclmdlRI model = nullptr;
         check(aclmdlRICaptureBegin(caller, ACL_MODEL_RI_CAPTURE_MODE_GLOBAL), "capture-begin");
-        check(simpler_launch_run_on_stream(ctx, run, caller, nullptr), "capture-launch");
+        check(simpler_submit_run_on_stream(ctx, run, caller), "capture-launch");
         check(aclmdlRICaptureEnd(caller, &model), "capture-end");
         require(model != nullptr, "captured-model");
-        check(simpler_finalize_run(ctx, run), "finalize-original");
-        std::memset(run, 0xA5, runtime_size);
         return model;
     };
     auto replay = [&](aclmdlRI model, size_t tensor, int32_t increment, const char *stage) {
@@ -163,18 +163,17 @@ int main(int argc, char **argv) {
         );
         replay(model, tensor, increment + 7, stage);
     };
-    RuntimeHandle reference_a = nullptr, reference_b = nullptr;
     prepare(0, 0, args_dump ? -3 : 3, true);
     verify("a-prepared");
-    const auto model_a = record(reference_a);
+    const auto model_a = record(runs[0]);
     verify("a-recorded");
     require(simpler_unregister_callable(ctx, 0) == PTO_RUNTIME_ERR_INVALID_STATE, "a-retains-callable");
     require(finalize_device(ctx) == PTO_RUNTIME_ERR_INVALID_STATE, "a-retains-context");
     // The plain INOUT scenario grows the execution image before replaying A.
     prepare(1, 1, argc == 6 ? -5 : 5, true);
     verify("b-prepared");
-    const auto model_b = record(reference_b);
-    require(model_a != model_b && reference_a != reference_b, "independent-models-and-references");
+    const auto model_b = record(runs[1]);
+    require(model_a != model_b && runs[0] != runs[1], "independent-models-and-runs");
     verify("b-recorded");
     if (swimlane) {
         config.enable_chip_swimlane = 1;
@@ -193,11 +192,12 @@ int main(int argc, char **argv) {
         replay(model_b, 1, 5, "b3");
     }
     check(aclmdlRIDestroy(model_a), "destroy-a");
-    check(simpler_release_run_resources(ctx, reference_a), "release-a");
+    check(simpler_finalize_run(ctx, runs[0]), "release-a");
     check(simpler_unregister_callable(ctx, 0), "unregister-a");
     require(simpler_unregister_callable(ctx, 1) == PTO_RUNTIME_ERR_INVALID_STATE, "b-retains-callable");
     require(finalize_device(ctx) == PTO_RUNTIME_ERR_INVALID_STATE, "b-retains-context");
     auto run_eager = [&] {
+        const auto run = runs[2];
         check(simpler_kernel_mode_prepare_callable(ctx, 0, callable.data(), callable.size()), "register-eager");
         if (shared_heap) {
             prepare(0, 2, 17, false, PTO_RUNTIME_ERR_INVALID_ARGUMENT);
@@ -206,7 +206,7 @@ int main(int argc, char **argv) {
         const int increment = shared_heap ? 19 : 17;
         prepare(0, 2, increment, false);
         if (swimlane) {
-            // A's detached publication may still hold the second output credit.
+            // A's diagnostic publication may still hold the second output credit.
             // Only the clean capacity refusal preserves this same prepared run.
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
             while (true) {
@@ -245,7 +245,7 @@ int main(int argc, char **argv) {
         replay(model_b, 1, 5, "b-after-a-release");
     }
     check(aclmdlRIDestroy(model_b), "destroy-b");
-    check(simpler_release_run_resources(ctx, reference_b), "release-b");
+    check(simpler_finalize_run(ctx, runs[1]), "release-b");
     check(simpler_unregister_callable(ctx, 1), "unregister-b");
     if (!swimlane && !args_dump && !shared_heap) run_eager();
     if (pmu || swimlane || args_dump) {
@@ -267,6 +267,6 @@ int main(int argc, char **argv) {
         std::printf("argsdump_retained_models PASS models=2 replays=%d eager=1 elements=16\n", execute_models ? 6 : 0);
     else
         std::printf(
-            "hbg_retained_models PASS models=2 references=2 replays=%d eager=1 elements=16\n", execute_models ? 6 : 0
+            "hbg_retained_models PASS models=2 original_runs=2 replays=%d eager=1 elements=16\n", execute_models ? 6 : 0
         );
 }

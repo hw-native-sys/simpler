@@ -354,38 +354,6 @@ DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, 
 
     LaunchTransactionResult transaction;
     try {
-        if (!outcome.prepared->external_submission && outcome.prepared->dfx.diagnostics_any()) {
-            std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
-            for (auto &[key, reference] : external_run_references_) {
-                if (reference->identity != outcome.prepared->identity) continue;
-                if (reference->scope_stats_window) {
-                    scope_stats_collector_.abandon_run(reference->identity.run_epoch);
-                    reference->scope_stats_window = false;
-                }
-                if (reference->swimlane_window) {
-                    if (!chip_swimlane_collector_.abandon_run(reference->identity.run_epoch)) {
-                        outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
-                        return outcome;
-                    }
-                    reference->swimlane_window = false;
-                }
-                if (reference->args_dump_window) {
-                    if (!dump_collector_.abandon_run(reference->identity.run_epoch)) {
-                        outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
-                        return outcome;
-                    }
-                    reference->args_dump_window = false;
-                }
-                if (reference->pmu_window) {
-                    if (!pmu_collector_.abandon_run(reference->identity.run_epoch)) {
-                        outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
-                        return outcome;
-                    }
-                    pmu_lease_.release(reference->identity.run_epoch);
-                    reference->pmu_window = false;
-                }
-            }
-        }
         transaction = launch_execution_impl(*outcome.prepared, std::move(permit));
     } catch (...) {
         // Backend exceptions carry no proof that the device saw no submission.
@@ -396,7 +364,8 @@ DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, 
     outcome.progress = transaction.progress;
     outcome.receipt = std::move(transaction.receipt);
     if (transaction.progress == LaunchProgress::NotStarted) {
-        withdraw_unlaunched_collectors_for_run(outcome.prepared->dfx, outcome.prepared->identity.run_epoch);
+        if (!outcome.prepared->diagnostic_window_open)
+            withdraw_unlaunched_collectors_for_run(outcome.prepared->dfx, outcome.prepared->identity.run_epoch);
         bool caller_retired = false;
         try {
             caller_retired = submission_storage_[outcome.prepared->pipeline_slot]->caller_order->retire(
@@ -416,7 +385,7 @@ DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, 
         outcome.active = std::move(active);
     }
     const auto *execution = outcome.active ? outcome.active->prepared.get() : outcome.prepared.get();
-    if (outcome.poisoned() && (execution == nullptr || !execution->external_submission)) {
+    if (outcome.poisoned() && (execution == nullptr || !execution->caller_owns_submission)) {
         // Ownership and the launch result survive a failure in recovery itself.
         try {
             recover_device_or_mark_unusable(outcome.rc);
@@ -650,10 +619,7 @@ bool DeviceRunnerBase::retire_caller_buffer_carrier(const void *owner, const Nat
     if (reserved == native_run_reservations_.end()) return false;
     // Ordinary lane reservations leave slot borrows with their caller.
     if (!reserved->independent_preparation) return true;
-    std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-    for (const auto &[key, reference] : external_run_references_) {
-        if (reference->identity == identity) caller_device_buffers_.detach_reference(key);
-    }
+    caller_device_buffers_.detach_reference(owner);
     // The reservation still belongs to this exact call; a delayed close cannot erase a successor.
     caller_device_buffers_.release(static_cast<uint64_t>(identity.pipeline_slot) + 1, false);
     return true;
@@ -2041,8 +2007,6 @@ int DeviceRunnerBase::finalize() {
     if (external_buffer_borrows_live()) {
         return PTO_RUNTIME_ERR_INVALID_STATE;
     }
-    // External release may be synchronizing a stream; reset must not overlap it.
-    std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
     // Fatal teardown stops host readers even while their backing remains held.
     if (can_accept_run() && prepared_storage_in_use()) return PTO_RUNTIME_ERR_INVALID_STATE;
     if (device_id_ == -1) return finalize_unbound();
@@ -3323,9 +3287,6 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     if (abandon_device_resources) {
         if (!prepared_resources_can_abandon()) return PTO_RUNTIME_ERR_INVALID_STATE;
         std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-        for (const auto &[key, reference] : external_run_references_)
-            caller_device_buffers_.release_reference(key, true);
-        external_run_references_.clear();
         prepared_uses_.clear();
     } else if (prepared_storage_in_use()) {
         return PTO_RUNTIME_ERR_INVALID_STATE;
@@ -4022,7 +3983,6 @@ int DeviceRunnerBase::read_result_evidence(RunResultStorage &storage) {
 }
 
 int DeviceRunnerBase::finish_result_release(RunResultStorage &storage) {
-    if (storage.external_leases != 0) return 0;
     // The replay-evidence tail lives in this epoch's region, so it must be read
     // before the pool reuses or frees the allocation. A failed read keeps the
     // epoch and its region for the caller's retry.
@@ -4031,31 +3991,11 @@ int DeviceRunnerBase::finish_result_release(RunResultStorage &storage) {
     // A poisoned driver admits no per-resource free. The context retains the
     // region until its verified reset or terminal quarantine path.
     if (!can_accept_run()) return 0;
-    // A region an external reference owned is released outright; only an
-    // ordinary sequential result keeps the idle cache for its successor.
-    const int rc = reported_pool_.release(storage.lease, true, !storage.externally_retained);
+    // Cache ordinary sequential results. A diagnostic window finishes its own allocation.
+    const int rc = reported_pool_.release(storage.lease, true, !storage.retain_evidence);
     if (rc != 0) return rc;
     run_result_storage_.erase(storage.lease.run_epoch);
     return 0;
-}
-
-void DeviceRunnerBase::note_result_external_lease_started(const NativeRunIdentity &identity) {
-    std::lock_guard<std::mutex> lock(run_result_mu_);
-    auto it = run_result_storage_.find(identity.run_epoch);
-    if (it != run_result_storage_.end() && it->second.pipeline_slot == identity.pipeline_slot) {
-        ++it->second.external_leases;
-        it->second.externally_retained = true;
-    }
-}
-
-int DeviceRunnerBase::note_result_external_lease_ended(const NativeRunIdentity &identity) {
-    std::lock_guard<std::mutex> lock(run_result_mu_);
-    auto it = run_result_storage_.find(identity.run_epoch);
-    if (it == run_result_storage_.end() || it->second.pipeline_slot != identity.pipeline_slot) return 0;
-    RunResultStorage &storage = it->second;
-    if (storage.external_leases != 0) --storage.external_leases;
-    if (!storage.internal_released || storage.external_leases != 0) return 0;
-    return finish_result_release(storage);
 }
 
 int DeviceRunnerBase::release_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, bool last_use_proved) {
@@ -4064,7 +4004,6 @@ int DeviceRunnerBase::release_device_run_result(uint32_t pipeline_slot, uint64_t
     if (it == run_result_storage_.end() || it->second.pipeline_slot != pipeline_slot) return 0;
     if (!last_use_proved) return 0;
     RunResultStorage &storage = it->second;
-    storage.internal_released = true;
     return finish_result_release(storage);
 }
 
@@ -4254,23 +4193,22 @@ int DeviceRunnerBase::validate_caller_stream(rtStream_t caller) {
     return 0;
 }
 
-bool DeviceRunnerBase::capture_diagnostics_supported(const PreparedExecution &prepared) const {
+bool DeviceRunnerBase::caller_diagnostics_supported(const PreparedExecution &prepared) const {
     const auto &dfx = prepared.dfx;
     if (!dfx.diagnostics_any()) return true;
     if (dfx.dep_gen_enabled || dfx.output_prefix.empty()) return false;
     if (dfx.chip_swimlane_enabled())
-        return supports_swimlane_capture() && !dfx.dump_args_enabled() && !dfx.pmu_enabled && !dfx.scope_stats_enabled;
-    if (dfx.dump_args_enabled()) return supports_args_dump_capture() && !dfx.pmu_enabled && !dfx.scope_stats_enabled;
-    if (dfx.pmu_enabled) return supports_pmu_capture() && !dfx.scope_stats_enabled;
-    return supports_scope_stats_capture() && prepared.scope_stats_capacity.required &&
+        return supports_caller_swimlane() && !dfx.dump_args_enabled() && !dfx.pmu_enabled && !dfx.scope_stats_enabled;
+    if (dfx.dump_args_enabled()) return supports_caller_args_dump() && !dfx.pmu_enabled && !dfx.scope_stats_enabled;
+    if (dfx.pmu_enabled) return supports_caller_pmu() && !dfx.scope_stats_enabled;
+    return supports_caller_scope_stats() && prepared.scope_stats_capacity.required &&
            prepared.scope_stats_capacity.complete() && dfx.scope_stats_enabled;
 }
 
 int DeviceRunnerBase::prepare_caller_submission(void *owner, PreparedExecution &prepared) {
-    if (!execution_mode_latch().is_kernel() || prepared.dfx.diagnostics_any()) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    if (!execution_mode_latch().is_kernel() || (prepared.dfx.diagnostics_any() && !prepared.diagnostic_window_open))
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
     if (!prepared.prepared_resources || !prepared.streams.ready()) return PTO_RUNTIME_ERR_INVALID_STATE;
-    const int rc = prepare_submission_resources(prepared);
-    if (rc != 0) return rc;
     if (!caller_device_buffers_.retain_reference(owner, static_cast<uint64_t>(prepared.pipeline_slot) + 1))
         return PTO_RUNTIME_ERR_INVALID_STATE;
     try {
@@ -4282,9 +4220,10 @@ int DeviceRunnerBase::prepare_caller_submission(void *owner, PreparedExecution &
         caller_device_buffers_.release_reference(owner, false);
         throw;
     }
-    prepared.external_submission = true;
+    prepared.caller_owns_submission = true;
+    if (prepared.kernel_args.args.run_result_data_base != 0)
+        set_result_retain_evidence(prepared.identity.run_epoch, prepared.pipeline_slot);
     prepared.prepared_resources->submission_->args.published_prefix_bytes = 0;
-    prebuilt_runtime_arena_cache_.invalidate();
     return 0;
 }
 
@@ -4311,33 +4250,10 @@ int DeviceRunnerBase::finish_caller_submission(ActiveExecution &active) {
     return retire_rc;
 }
 
-int DeviceRunnerBase::admit_external_submission(PreparedExecution &prepared) {
-    if (!execution_mode_latch().is_kernel() || !capture_diagnostics_supported(prepared) ||
-        prepared.join.predecessor_owner != nullptr)
-        return PTO_RUNTIME_ERR_UNSUPPORTED;
-    std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
-    std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-    for (auto &[key, reference] : external_run_references_) {
-        if (!(reference->identity == prepared.identity)) continue;
-        if (reference->release_requested || reference->closing || reference->external_submission ||
-            reference->caller_stream != prepared.caller_stream || reference->resources != prepared.prepared_resources ||
-            !prepared.streams.ready())
-            return PTO_RUNTIME_ERR_INVALID_STATE;
-        reference->external_submission = true;
-        prepared.external_submission = true;
-        if (prepared.kernel_args.args.run_result_data_base != 0)
-            set_result_retain_evidence(prepared.identity.run_epoch, prepared.pipeline_slot);
-        // A retained block must publish even if eager left an identical prefix.
-        submission_storage_[prepared.pipeline_slot]->args.published_prefix_bytes = 0;
-        return 0;
-    }
-    return PTO_RUNTIME_ERR_INVALID_STATE;
-}
-
 int DeviceRunnerBase::queue_run_entry(PreparedExecution &prepared, LaunchProgressSink &sink) {
     return submission_storage_[prepared.pipeline_slot]->caller_order->fork(prepared.identity, sink, [&] {
         const int rc = publish_for_launch(
-            prepared.kernel_args, prepared.streams.aicpu, sink, prepared.external_submission,
+            prepared.kernel_args, prepared.streams.aicpu, sink, prepared.caller_owns_submission,
             execution_mode_latch().is_kernel()
         );
         if (rc == 0 && prepared.kernel_args.args.run_result_data_base != 0) {
@@ -4463,64 +4379,23 @@ int DeviceRunnerBase::retain_prepared_run_resources(
     return 0;
 }
 
-int DeviceRunnerBase::retain_external_run_resources(
-    PreparedExecution &prepared, void *caller_stream, void **out_reference, NativeRunPreparePurpose purpose
-) {
-    if (out_reference == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    *out_reference = nullptr;
-    if (caller_stream == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    if (!capture_diagnostics_supported(prepared) ||
-        (prepared.dfx.diagnostics_any() && !execution_mode_latch().is_kernel()))
-        return PTO_RUNTIME_ERR_UNSUPPORTED;
-    std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
-    int rc = validate_caller_stream(caller_stream);
+int DeviceRunnerBase::prepare_caller_diagnostics(PreparedExecution &prepared) {
+    if (!caller_diagnostics_supported(prepared)) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    int rc = prepare_submission_resources(prepared);
     if (rc != 0) return rc;
-    if (!can_accept_run() || (execution_mode_latch().is_kernel() && !kernel_exec_state_.accepts_dispatch()))
-        return PTO_RUNTIME_ERR_INVALID_STATE;
-    const auto &resources = prepared.prepared_resources;
-    if (!resources || !resources->callable_ || !resources->submission_ ||
-        resources->submission_ != submission_storage_[prepared.pipeline_slot] ||
-        resources->submission_->args.shared_state == nullptr ||
-        (resources->submission_->args.runtime_upload_bytes != 0 &&
-         resources->submission_->args.runtime_upload_source == nullptr))
-        return PTO_RUNTIME_ERR_INVALID_STATE;
-    // External -> native -> storage is the diagnostic admission lock order.
-    // Duplicate retention must be refused before pool allocation or replacement
-    // of an earlier successful artifact, including after that reference ended.
-    std::unique_lock<std::mutex> native_lock;
-    if (prepared.dfx.diagnostics_any()) {
-        native_lock = std::unique_lock<std::mutex>(native_run_mu_);
-        if (active_native_run_count_ != 0) return PTO_RUNTIME_ERR_INVALID_STATE;
-    }
-    {
-        std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-        const auto use = std::find_if(prepared_uses_.begin(), prepared_uses_.end(), [&](const auto &entry) {
-            return entry.identity == prepared.identity;
-        });
-        if (use == prepared_uses_.end() || !use->use.can_retain_external_use()) return PTO_RUNTIME_ERR_INVALID_STATE;
-    }
-    rc = prepare_submission_resources(prepared);
-    if (rc != 0) return rc;
-    auto reference = std::make_unique<ExternalRunReference>();
-    reference->identity = prepared.identity;
-    reference->resources = resources;
-    reference->callable = resources->callable_;
-    reference->managed_backing.reserve(resources->backing_.size() + 1);
-    for (const auto &backing : resources->backing_)
-        reference->managed_backing.emplace_back(backing);
-    if (resources->temporary_ && resources->temporary_->backing)
-        reference->managed_backing.emplace_back(resources->temporary_->backing);
-    reference->caller_stream = caller_stream;
+    // Another independent prepare may bind the same TMR arena before this run submits.
+    prebuilt_runtime_arena_cache_.invalidate();
+    if (!prepared.dfx.diagnostics_any()) return 0;
+    std::lock_guard<std::mutex> lock(native_run_mu_);
+    if (active_native_run_count_ != 0) return PTO_RUNTIME_ERR_INVALID_STATE;
     // The native claim remains excluded throughout pool construction/window admission.
-    if (prepared.dfx.diagnostics_any()) {
-        if (scope_stats_collector_.recorded_window_open(prepared.identity.run_epoch) ||
-            pmu_collector_.recorded_window_open(prepared.identity.run_epoch) ||
-            chip_swimlane_collector_.recorded_window_open(prepared.identity.run_epoch) ||
-            dump_collector_.recorded_window_open(prepared.identity.run_epoch))
-            return PTO_RUNTIME_ERR_INVALID_STATE;
-        rc = prepare_collector_storage(*prepared.runtime, prepared);
-        if (rc != 0) return rc;
-    }
+    if (scope_stats_collector_.recorded_window_open(prepared.identity.run_epoch) ||
+        pmu_collector_.recorded_window_open(prepared.identity.run_epoch) ||
+        chip_swimlane_collector_.recorded_window_open(prepared.identity.run_epoch) ||
+        dump_collector_.recorded_window_open(prepared.identity.run_epoch))
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    rc = prepare_collector_storage(*prepared.runtime, prepared);
+    if (rc != 0) return rc;
     bool dump_armed = false;
     bool pmu_armed = false;
     bool swimlane_armed = false;
@@ -4567,7 +4442,6 @@ int DeviceRunnerBase::retain_external_run_resources(
             return refusal == simpler::dfx::runs::AdmissionRefusal::Capacity ?
                        SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL :
                        PTO_RUNTIME_ERR_INTERNAL;
-        reference->swimlane_window = true;
         prepared.kernel_args.args.chip_swimlane_run_terminal_bank = 0;
     }
     if (prepared.dfx.dump_args_enabled()) {
@@ -4579,7 +4453,6 @@ int DeviceRunnerBase::retain_external_run_resources(
                 prepared.identity.run_epoch, prepared.dfx.output_prefix, prepared.dfx.dump_args_level
             ))
             return SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
-        reference->args_dump_window = true;
         prepared.kernel_args.args.args_dump_run_terminal_bank = 0;
     }
     if (prepared.dfx.pmu_enabled) {
@@ -4593,7 +4466,6 @@ int DeviceRunnerBase::retain_external_run_resources(
                 pmu_lease_.state_name()
             ))
             return SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
-        reference->pmu_window = true;
         prepared.kernel_args.args.pmu_run_terminal_bank = 0;
     }
     if (prepared.dfx.scope_stats_enabled) {
@@ -4604,136 +4476,49 @@ int DeviceRunnerBase::retain_external_run_resources(
                 prepared.identity.run_epoch, prepared.dfx.output_prefix, prepared.scope_stats_capacity
             ))
             return SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
-        reference->scope_stats_window = true;
         // Replay overwrites terminal counters; none can certify a window total.
         prepared.kernel_args.args.scope_stats_run_terminal_bank = 0;
     }
-    void *key = reference.get();
-    std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-    auto use = std::find_if(prepared_uses_.begin(), prepared_uses_.end(), [&](const auto &entry) {
-        return entry.identity == prepared.identity;
-    });
-    if (use == prepared_uses_.end()) return PTO_RUNTIME_ERR_INVALID_STATE;
-    // Allocate bookkeeping before changing obligations. A duplicate is refused
-    // even if the earlier reference was released before the original run ended.
-    external_run_references_.emplace(key, std::move(reference));
-    RAIIScopeGuard rollback_reference([&] {
-        if (published) return;
-        caller_device_buffers_.release_reference(key, false);
-        external_run_references_.erase(key);
-    });
-    if ((purpose == SIMPLER_PREPARE_CAPTURE &&
-         !caller_device_buffers_.retain_reference(key, static_cast<uint64_t>(prepared.pipeline_slot) + 1)) ||
-        !use->use.retain_external_use())
-        return PTO_RUNTIME_ERR_INVALID_STATE;
-    // A cached TMR image names this bank. Its next bind must take the normal
-    // arena acquisition path so retention can replace the backing before writes.
-    prebuilt_runtime_arena_cache_.invalidate();
-    prepared.caller_stream = caller_stream;
-    *out_reference = key;
     published = true;
-    note_result_external_lease_started(prepared.identity);
+    prepared.diagnostic_window_open = true;
     return 0;
 }
 
-int DeviceRunnerBase::release_external_run_resources(void *key) {
-    if (key == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
-    ExternalRunReference *reference = nullptr;
-    {
-        std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-        const auto found = external_run_references_.find(key);
-        if (found == external_run_references_.end()) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-        reference = found->second.get();
+int DeviceRunnerBase::reclaim_caller_backing(PreparedExecution &prepared) {
+    if (const auto &resources = prepared.prepared_resources) {
+        // Preserve allocation identities across a failed free, after dropping the live leases.
+        auto &backing = prepared.closing_backing;
+        backing.reserve(resources->backing_.size() + 1);
+        backing.assign(resources->backing_.begin(), resources->backing_.end());
+        if (resources->temporary_ && resources->temporary_->backing)
+            backing.emplace_back(resources->temporary_->backing);
+        prepared.closing_callable = resources->callable_;
+        prepared.prepared_resources.reset();
     }
-    const NativeRunIdentity identity = reference->identity;
-    int rc = validate_current_context();
-    if (rc != 0) return rc;
-    {
-        std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-        // Release promises no external reuse. A failed synchronization still
-        // retains backing, but must not prevent an owned fatal reset forever.
-        reference->release_requested = true;
+    const int rc = reclaim_prepared_storage();
+    return rc != 0 ? rc : workspace_.release_prepared_backing(prepared.closing_backing);
+}
+
+int DeviceRunnerBase::close_caller_diagnostics(PreparedExecution &prepared) {
+    if (!prepared.diagnostic_window_open) return 0;
+    std::lock_guard<std::mutex> lock(native_run_mu_);
+    for (size_t index = 0; index < active_native_run_count_; ++index) {
+        if (active_native_runs_[index].identity != prepared.identity) return PTO_RUNTIME_ERR_INVALID_STATE;
     }
-    rc = enter_run_thread();
-    if (rc != 0) return rc;
-    if (!reference->closing) {
-        rc = validate_caller_stream(reference->caller_stream);
-        if (rc != 0) return rc;
-        // This synchronization supplements the caller's external-use promise;
-        // it cannot establish destruction or completion on other replay streams.
-        rc = aclrtSynchronizeStreamWithTimeout(reference->caller_stream, timeout_config_.stream_sync_timeout_ms);
-        if (rc != 0) return rc;
-        if (reference->external_submission) {
-            auto &storage = *reference->resources->submission_;
-            rc = storage.caller_order->end_external_use(reference->identity);
-            if (rc == 0) rc = storage.caller_order->retire(reference->identity);
-            if (rc == 0) rc = storage.fence->retire(reference->identity);
-            if (rc != 0) return rc;
-        }
-        if (reference->scope_stats_window || reference->pmu_window || reference->swimlane_window ||
-            reference->args_dump_window) {
-            // Raw replay is caller-ordered. Its drained stream plus the external
-            // end promise stops producers; the lock excludes a new native run
-            // while the collector establishes its reader-quiescence boundary.
-            std::lock_guard<std::mutex> native_lock(native_run_mu_);
-            for (size_t index = 0; index < active_native_run_count_; ++index) {
-                if (!reference->external_submission || active_native_runs_[index].identity != reference->identity)
-                    return PTO_RUNTIME_ERR_INVALID_STATE;
-            }
-            if (reference->swimlane_window) {
-                if (!chip_swimlane_collector_.close_recorded_window(
-                        reference->identity.run_epoch, timeout_config_.stream_sync_timeout_ms
-                    ))
-                    return PTO_RUNTIME_ERR_INTERNAL;
-                reference->swimlane_window = false;
-            }
-            if (reference->scope_stats_window) {
-                rc = scope_stats_collector_.close_recorded_window(reference->identity.run_epoch);
-                if (rc != 0) return rc;
-                reference->scope_stats_window = false;
-            }
-            if (reference->args_dump_window) {
-                rc = dump_collector_.close_recorded_window(reference->identity.run_epoch);
-                if (rc != 0) return rc;
-                reference->args_dump_window = false;
-            }
-            if (reference->pmu_window) {
-                rc = pmu_collector_.close_recorded_window(reference->identity.run_epoch);
-                if (rc != 0) return rc;
-                pmu_lease_.release(reference->identity.run_epoch);
-                reference->pmu_window = false;
-            }
-        }
-        std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-        auto use = std::find_if(prepared_uses_.begin(), prepared_uses_.end(), [&](const auto &entry) {
-            return entry.identity == reference->identity;
-        });
-        if (use == prepared_uses_.end()) return PTO_RUNTIME_ERR_INVALID_STATE;
-        // External end never proves internal completion. An unfinished record
-        // keeps its own backing after this reference ends; confirmed Program
-        // reset may later discharge it, while a borrowed device stays isolated.
-        use->use.note_external_use_ended();
-        if (use->use.obligations_ended()) prepared_uses_.erase(use);
-        reference->closing = true;
-        reference->resources.reset();
+    const auto epoch = prepared.identity.run_epoch;
+    int rc = 0;
+    if (prepared.dfx.chip_swimlane_enabled())
+        rc = chip_swimlane_collector_.close_recorded_window(epoch, timeout_config_.stream_sync_timeout_ms) ?
+                 0 :
+                 PTO_RUNTIME_ERR_INTERNAL;
+    else if (prepared.dfx.scope_stats_enabled) rc = scope_stats_collector_.close_recorded_window(epoch);
+    else if (prepared.dfx.dump_args_enabled()) rc = dump_collector_.close_recorded_window(epoch);
+    else if (prepared.dfx.pmu_enabled) {
+        rc = pmu_collector_.close_recorded_window(epoch);
+        if (rc == 0) pmu_lease_.release(epoch);
     }
-    // The result release is retryable through this reference: a failed free
-    // returns before the reference is erased.
-    rc = note_result_external_lease_ended(identity);
-    if (rc != 0) return rc;
-    // Retired owners keep every failing address for retry. The closing token
-    // and callable lease keep the context/code alive until this succeeds.
-    rc = reclaim_prepared_storage();
-    if (rc != 0) return rc;
-    rc = workspace_.release_prepared_backing(reference->managed_backing);
-    if (rc != 0) return rc;
-    {
-        std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-        caller_device_buffers_.release_reference(key, false);
-        external_run_references_.erase(key);
-    }
-    return 0;
+    if (rc == 0) prepared.diagnostic_window_open = false;
+    return rc;
 }
 
 void DeviceRunnerBase::note_workspace_run_fact(const NativeRunIdentity &identity, WorkspaceManager::RunFact fact) {
@@ -4759,32 +4544,17 @@ void DeviceRunnerBase::note_prepared_waits_consumed(const NativeRunIdentity &ide
 
 bool DeviceRunnerBase::prepared_storage_in_use() const {
     std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-    return !prepared_uses_.empty() || prepared_storage_has_external_references_locked();
+    return !prepared_uses_.empty() || has_live_prepared_owners_locked();
 }
 
-bool DeviceRunnerBase::prepared_storage_has_external_references_locked() const {
-    // Closing external references remain registered until cleanup succeeds,
-    // even after their resource pointer has moved into retirement.
-    if (!external_run_references_.empty()) return true;
+bool DeviceRunnerBase::has_live_prepared_owners_locked() const {
     return std::any_of(prepared_resource_owners_.begin(), prepared_resource_owners_.end(), [](const auto &owner) {
         return !owner.expired();
     });
 }
 
-bool DeviceRunnerBase::prepared_resources_block_fatal_reset() const {
-    std::lock_guard<std::mutex> lock(prepared_storage_mutex_);
-    return execution_mode_latch_.latched_mode() == SIMPLER_MODE_PROGRAM &&
-           std::any_of(external_run_references_.begin(), external_run_references_.end(), [](const auto &entry) {
-               return !entry.second->release_requested;
-           });
-}
-
 bool DeviceRunnerBase::prepared_resources_can_abandon() const {
-    std::lock_guard<std::mutex> lock(prepared_storage_mutex_);
-    return execution_mode_latch_.latched_mode() == SIMPLER_MODE_PROGRAM && terminal_reset_confirmed() &&
-           std::all_of(external_run_references_.begin(), external_run_references_.end(), [](const auto &entry) {
-               return entry.second->release_requested;
-           });
+    return execution_mode_latch_.latched_mode() == SIMPLER_MODE_PROGRAM && terminal_reset_confirmed();
 }
 
 int DeviceRunnerBase::reclaim_prepared_storage() {
@@ -5152,7 +4922,7 @@ DeviceRunnerBase::note_joined_launch(const NativeRunJoin &join, const NativeRunI
 }
 
 int DeviceRunnerBase::open_own_boundary_wait(const PreparedExecution &prepared, void **core_done_out) {
-    if (prepared.external_submission) {
+    if (prepared.caller_owns_submission) {
         *core_done_out =
             run_fence(prepared.pipeline_slot).boundary_event(prepared.identity, RunCompletionFence::StreamRole::Aicore);
         return *core_done_out == nullptr ? PTO_RUNTIME_ERR_INVALID_STATE : 0;
@@ -6444,7 +6214,9 @@ bool DeviceRunnerBase::try_reserve_native_run(
 
     for (NativeRunReservation &reservation : native_run_reservations_) {
         if (reservation.owner == nullptr) {
-            native_run_observations_.insert(NativeRunObservation{NativeRunObservation::Kind::RunOwner, owner, {}});
+            native_run_observations_.insert(
+                NativeRunObservation{NativeRunObservation::Kind::RunOwner, owner, {}, independent_preparation}
+            );
             reservation = NativeRunReservation{
                 owner, pipeline_slot, arena_bank, allow_prepared_successor, independent_preparation
             };
@@ -6530,11 +6302,19 @@ bool DeviceRunnerBase::owns_native_run_observation(const void *owner) const {
            native_run_observations_.end();
 }
 
-bool DeviceRunnerBase::native_runs_outstanding() const {
+bool DeviceRunnerBase::native_runs_outstanding(bool include_caller_owners) const {
     std::lock_guard<std::mutex> lk(native_run_mu_);
-    if (!native_run_observations_.empty()) return true;
+    for (const auto &observation : native_run_observations_) {
+        if (include_caller_owners || !observation.caller_owned) return true;
+    }
     for (const NativeRunReservation &reservation : native_run_reservations_) {
-        if (reservation.owner != nullptr) return true;
+        if (reservation.owner == nullptr) continue;
+        // An independently prepared run already holds its own callable lease.
+        // A prepare still in progress must finish acquiring that lease first.
+        if (!include_caller_owners && reservation.independent_preparation &&
+            reservation.preparation_state == NativeRunPreparationState::Prepared)
+            continue;
+        return true;
     }
     return false;
 }
@@ -6545,6 +6325,7 @@ bool DeviceRunnerBase::fresh_callable_addition_allowed() const {
     {
         std::lock_guard<std::mutex> lock(native_run_mu_);
         for (const auto &row : native_run_observations_) {
+            if (row.caller_owned) continue;
             if (row.kind == NativeRunObservation::Kind::RunOwner) return false;
             bindings = true;
             // Registration may wait its own control task, never an old caller pair.
@@ -6557,13 +6338,6 @@ bool DeviceRunnerBase::fresh_callable_addition_allowed() const {
     if (!bindings) return true;
     return execution_mode_latch_.is_kernel() && kernel_exec_state_.accepts_dispatch() && accepts_new_run() &&
            !prepared_storage_in_use();
-}
-
-bool DeviceRunnerBase::has_external_run_reference(const NativeRunIdentity &identity) const {
-    std::lock_guard<std::mutex> lock(prepared_storage_mutex_);
-    return std::any_of(external_run_references_.begin(), external_run_references_.end(), [&](const auto &row) {
-        return row.second->identity == identity;
-    });
 }
 
 void DeviceRunnerBase::retain_framework_observation(const RunStreams &streams) {
