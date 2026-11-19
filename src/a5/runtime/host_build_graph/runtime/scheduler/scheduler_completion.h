@@ -13,22 +13,10 @@
 
 // AICore-resident completion and cancellation.
 
-#include "scheduler_gm_mix.h"
 #include "scheduler_cluster_mix.h"
 
-// Idle and the run epilogue flush pending counts; native runs also publish
-// bounded progress batches. Trace/error publication precedes the exit count.
-static inline __aicore__ void
-scheduler_flush_completions(__gm__ SchedulerRunControl *run_control, SchedulerLocalState *local) {
-    const uint64_t completed = local->pending_completed;
-    if (completed == 0) return;
-    scheduler_cache_barrier();
-    scheduler_gm_fetch_add_discard(run_control->resolved_task_count, completed);
-    local->pending_completed = 0;
-}
-
-// Cancellation owns only an unstarted local handle. Armed groups retire at
-// the failed run's all-core fence before their storage can be reused.
+// Cancellation owns only an unstarted local handle. A published group retires
+// at the failed run's all-core fence before its storage can be reused.
 static inline __aicore__ bool
 scheduler_cancel_unstarted_handle(__gm__ void *base, SchedulerLocalState *local, SchedulerPreparedHandle *handle) {
     const auto *prepared = local->config.prepared;
@@ -36,9 +24,7 @@ scheduler_cancel_unstarted_handle(__gm__ void *base, SchedulerLocalState *local,
         scheduler_prepared_owner(handle->claimed_state) != local->worker_id())
         return false;
     const auto phase = scheduler_prepared_phase(handle->claimed_state);
-    if (phase != SchedulerPreparedPhase::CLAIMED && phase != SchedulerPreparedPhase::GROUP_RESERVED &&
-        phase != SchedulerPreparedPhase::FAILED)
-        return false;
+    if (phase != SchedulerPreparedPhase::CLAIMED && phase != SchedulerPreparedPhase::FAILED) return false;
     if (phase == SchedulerPreparedPhase::CLAIMED && scheduler_prepared_already_returned(base, prepared, *handle))
         return false;
     if (phase != SchedulerPreparedPhase::FAILED) {
@@ -56,14 +42,12 @@ scheduler_cancel_unstarted_handle(__gm__ void *base, SchedulerLocalState *local,
 template <bool BeforeKernel = false>
 static inline __aicore__ bool
 scheduler_cancel_unstarted_slot(__gm__ void *base, SchedulerLocalState *local, uint32_t index) {
-    if (index >= SCHEDULER_PENDING_SLOT_COUNT) return false;
-    auto &slot = local->slots[index];
+    if (index >= SCHEDULER_LOCAL_EXECUTION_COUNT) return false;
+    auto &slot = local->execution_at(index);
     if (slot.state == SchedulerDispatchSlotState::FREE || slot.state == SchedulerDispatchSlotState::EMPTY) return true;
     if (!BeforeKernel && slot.state == SchedulerDispatchSlotState::EXECUTING) return false;
     if (!scheduler_cancel_unstarted_handle(base, local, &slot.prepared)) return false;
-    scheduler_initialize_free_slot(&slot);
-    local->local_ready_mask &= ~(UINT32_C(1) << index);
-    local->set_timing_slot(index, -1);
+    scheduler_retire_execution(local, index);
     return true;
 }
 
@@ -72,7 +56,8 @@ scheduler_cancel_unstarted_slot(__gm__ void *base, SchedulerLocalState *local, u
 static inline __aicore__ bool scheduler_cancel_unstarted_work(__gm__ void *base, SchedulerLocalState *local) {
     bool cancelled = true;
     for (auto &token : local->execution_tokens) {
-        if (token.phase == SchedulerExecutionTokenPhase::EMPTY) continue;
+        if (token.phase == SchedulerExecutionTokenPhase::EMPTY || token.state == SchedulerDispatchSlotState::EXECUTING)
+            continue;
         bool released = false;
         if (token.phase == SchedulerExecutionTokenPhase::TICKETED && token.prepared.claimed_state == 0 &&
             local->config.prepared != nullptr &&
@@ -91,16 +76,19 @@ static inline __aicore__ bool scheduler_cancel_unstarted_work(__gm__ void *base,
         if (released) token = {};
         else cancelled = false;
     }
-    for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index)
+    for (uint32_t index = 0; index < SCHEDULER_LOCAL_EXECUTION_COUNT; ++index)
         if (!scheduler_cancel_unstarted_slot(base, local, index)) cancelled = false;
     auto &pending = local->cluster_pending;
     if (!scheduler_task_ref_is_null(pending.task_ref)) {
-        if (scheduler_cancel_unstarted_handle(base, local, &pending.anchor)) {
-            if (!scheduler_cluster_mix_publish_preparation(local, LaneMask::none())) cancelled = false;
-            pending = {};
-        } else {
-            cancelled = false;
-        }
+        // No member was granted this group. Preserve its proxy identity without
+        // failing an unclaimed lane or contributing a return on its behalf.
+        scheduler_store_signal(
+            scheduler_worker_context_at(base, local, local->worker_id())->mix_proxy_cancelled,
+            scheduler_mix_proxy_state(
+                SchedulerMixProxyPhase::CANCELLED, static_cast<uint32_t>(pending.task_ref), pending.block_idx
+            )
+        );
+        pending = {};
     }
     return cancelled;
 }
@@ -109,20 +97,24 @@ static inline __aicore__ bool scheduler_cancel_unstarted_work(__gm__ void *base,
 // registration. Trace storage and slot resources remain owned until retirement
 // returns. Inactive MIX resource lanes have no executed slot to contribute.
 template <bool RecordProtocol = true>
-static inline __aicore__ SchedulerSubtaskFinishResult scheduler_contribute_subtask(
+static inline __aicore__ SchedulerSubtaskFinishResult scheduler_publish_fanout(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     const SchedulerLocalSlotState &completed, uint32_t pending_slot, uint64_t *completed_gate = nullptr
 ) {
+    SchedulerScalarScope scope(local, SchedPhaseKind::ScalarSubtaskContribute, completed.task_ref);
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) return SchedulerSubtaskFinishResult::ERROR;
     auto *control = scheduler_task_control_at(base, local, completed.task_ref);
-    const bool block_owner = scheduler_slot_uses_admission(local, completed) && !completed.gm_mix;
+    const bool block_owner = completed.sync_start && !completed.cluster_mix;
     const auto *counter =
         scheduler_completion_counter_at(base, local->config.completion_counters_offset, completed.task_ref);
     const uint32_t credits = counter == nullptr ? 0 : completed.completion_credits;
     if (counter != nullptr && (credits < 1 || credits > 2)) return SchedulerSubtaskFinishResult::ERROR;
     if constexpr (RecordProtocol) {
         scheduler_protocol_subtask_complete(base, local, completed, pending_slot, true, UINT64_MAX, credits);
-        if (block_owner) scheduler_protocol_block_complete(base, local, completed.block_idx, true, UINT64_MAX, credits);
+        if (block_owner)
+            scheduler_protocol_block_complete(
+                base, local, completed.task_ref, completed.block_idx, true, UINT64_MAX, credits
+            );
     }
     uint64_t previous = UINT64_MAX;
     auto result = SchedulerSubtaskFinishResult::PARTIAL;
@@ -132,7 +124,10 @@ static inline __aicore__ SchedulerSubtaskFinishResult scheduler_contribute_subta
     } else result = scheduler_contribute_returns(control, 1, &previous, completed_gate);
     if constexpr (RecordProtocol) {
         scheduler_protocol_subtask_complete(base, local, completed, pending_slot, false, previous, credits);
-        if (block_owner) scheduler_protocol_block_complete(base, local, completed.block_idx, false, previous, credits);
+        if (block_owner)
+            scheduler_protocol_block_complete(
+                base, local, completed.task_ref, completed.block_idx, false, previous, credits
+            );
     }
     if (result == SchedulerSubtaskFinishResult::ERROR) {
         scheduler_record_error(
@@ -154,22 +149,21 @@ static inline __aicore__ SchedulerSubtaskFinishResult scheduler_contribute_subta
 // PublishCompletion=false retires a real kernel return after sealing or another
 // post-return operation failed. It cannot grant task completion or a successor.
 template <bool RecordProtocol = true, bool FromExecutor = false, bool PublishCompletion = true>
-static inline __aicore__ bool scheduler_complete_own_slot(
+static inline __aicore__ bool scheduler_complete_lane_execution(
     const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
     __gm__ SchedulerRunControl *run_control, uint32_t pending_slot, uint64_t profiling_level
 ) {
     if constexpr (!FromExecutor) {
-        if (scheduler == nullptr || pending_slot >= SCHEDULER_PENDING_SLOT_COUNT ||
+        if (scheduler == nullptr || pending_slot >= SCHEDULER_LOCAL_EXECUTION_COUNT ||
             scheduler->config.self_lane >= PLATFORM_CORES_PER_BLOCKDIM)
             return false;
     }
     if constexpr (!FromExecutor)
         if (scheduler->worker_id() >= scheduler->config.runtime_worker_count) return false;
-    auto *local_slot = &scheduler->slots[pending_slot];
+    auto *local_slot = &scheduler->execution_at(pending_slot);
     const int64_t task_ref = local_slot->task_ref;
     if constexpr (!FromExecutor) {
-        if (local_slot->state != SchedulerDispatchSlotState::EXECUTING ||
-            (scheduler->local_ready_mask & (1U << pending_slot)) != 0) {
+        if (local_slot->state != SchedulerDispatchSlotState::EXECUTING) {
             scheduler_record_error(
                 run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
                 SchedulerErrorSite::COMPLETION_SLOT_BINDING_INVALID, local_slot
@@ -181,16 +175,22 @@ static inline __aicore__ bool scheduler_complete_own_slot(
             return false;
         }
         const auto &metadata = *scheduler_task_metadata_at(scheduler_state_base, scheduler, task_ref);
-        const bool admitted = scheduler_slot_uses_admission(scheduler, *local_slot);
         if (local_slot->cluster_mix) {
-            const auto &group = scheduler->cluster_mix;
+            if (pending_slot < SCHEDULER_CLUSTER_MIX_EXECUTION) {
+                scheduler_record_error(
+                    run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+                    SchedulerErrorSite::COMPLETION_SLOT_BINDING_INVALID, local_slot
+                );
+                return false;
+            }
+            const uint32_t bank = pending_slot - SCHEDULER_CLUSTER_MIX_EXECUTION;
+            const auto &group = scheduler->mix_groups[bank];
             const auto *signal = scheduler->cluster_signal;
-            if (signal == nullptr || local_slot->gm_mix || !scheduler_task_is_mix(metadata.flags) ||
-                scheduler_task_requires_sync_start(metadata.flags) || group.phase != SchedulerGmMixPhase::RUNNING ||
-                group.task_ref != task_ref || group.slot_index != pending_slot ||
+            if (signal == nullptr || !scheduler_task_is_mix(metadata.flags) ||
+                group.phase != SchedulerGmMixPhase::RUNNING || group.task_ref != task_ref ||
                 group.block_idx != local_slot->block_idx || group.subtask_slot != local_slot->subtask_slot ||
                 group.active_mask != scheduler_task_lanes(metadata) || !scheduler_cluster_mix_armed(group.generation) ||
-                scheduler_cluster_load_acquire(&signal->armed_generation) != group.generation ||
+                scheduler_cluster_load_acquire(&signal->groups[bank].armed_generation) != group.generation ||
                 scheduler_cluster_load_field(&signal->run_epoch) != scheduler->config.prepared->run_epoch) {
                 scheduler_record_error(
                     run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
@@ -202,12 +202,8 @@ static inline __aicore__ bool scheduler_complete_own_slot(
         if (local_slot->subtask_slot >= 3 || local_slot->block_idx >= metadata.logical_block_num ||
             !scheduler_task_lanes(metadata).has(static_cast<SubtaskSlot>(local_slot->subtask_slot)) ||
             scheduler_metadata_core_type_index(local_slot->subtask_slot) != scheduler->config.self_core_type ||
-            (admitted && scheduler->admission->current_task_ref != task_ref) ||
-            (local_slot->gm_mix && (!admitted || scheduler->admission->gm_mix.phase != SchedulerGmMixPhase::RUNNING ||
-                                    scheduler->admission->gm_mix.slot_index != pending_slot ||
-                                    scheduler->admission->gm_mix.block_idx != local_slot->block_idx ||
-                                    scheduler->admission->gm_mix.subtask_slot != local_slot->subtask_slot ||
-                                    scheduler->admission->gm_mix.group_seq == 0))) {
+            (!local_slot->cluster_mix &&
+             local_slot->sync_start != scheduler_task_requires_sync_start(metadata.flags))) {
             scheduler_record_error(
                 run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
                 SchedulerErrorSite::COMPLETION_SLOT_BINDING_INVALID, local_slot
@@ -215,10 +211,9 @@ static inline __aicore__ bool scheduler_complete_own_slot(
             return false;
         }
     }
-    const SchedulerLocalSlotState completed_slot = *local_slot;
+    const SchedulerLocalSlotState &completed_slot = *local_slot;
     const bool contribution_retires =
-        FromExecutor && PublishCompletion && completed_slot.execution_token && !completed_slot.cluster_mix &&
-        !completed_slot.gm_mix &&
+        FromExecutor && PublishCompletion && !completed_slot.cluster_mix &&
         scheduler_completion_counter_at(scheduler_state_base, scheduler->config.completion_counters_offset, task_ref) ==
             nullptr;
     auto contribution = SchedulerSubtaskFinishResult::PARTIAL;
@@ -237,7 +232,7 @@ static inline __aicore__ bool scheduler_complete_own_slot(
         }
         if constexpr (RecordProtocol)
             scheduler_protocol_execution_consumed(scheduler_state_base, scheduler, pending_slot, completed_slot);
-        contribution = scheduler_contribute_subtask<RecordProtocol>(
+        contribution = scheduler_publish_fanout<RecordProtocol>(
             graph, scheduler_state_base, scheduler, run_control, completed_slot, pending_slot, &completed_gate
         );
         retirement_inferred = contribution == SchedulerSubtaskFinishResult::TASK_LAST ||
@@ -262,29 +257,26 @@ static inline __aicore__ bool scheduler_complete_own_slot(
     const bool sampled_task_timing_enabled = scheduler->sampled_task_timing(pending_slot);
     const uint8_t completed_subtask_slot = local_slot->subtask_slot;
     const uint32_t completed_block_idx = local_slot->block_idx;
-    const bool gm_mix = local_slot->gm_mix;
     if constexpr (RecordProtocol)
         if (!contribution_retires)
             scheduler_protocol_execution_consumed(scheduler_state_base, scheduler, pending_slot, completed_slot);
-    scheduler_initialize_free_slot(local_slot);
-    scheduler->set_timing_slot(pending_slot, -1);
     const uint64_t completion_phase_end = phase_timing_enabled ? scheduler_cycles() : 0;
     bool completion_ok = true;
     scheduler->continuation_task_ref = SCHEDULER_TASK_REF_INVALID;
     if constexpr (PublishCompletion) {
-        if (completed_slot.cluster_mix || completed_slot.gm_mix) {
+        if (completed_slot.cluster_mix) {
             completion_ok = scheduler_read_worker_error(run_control, scheduler->worker_id()) == 0;
         } else {
             if (!contribution_retires)
-                contribution = scheduler_contribute_subtask<RecordProtocol>(
+                contribution = scheduler_publish_fanout<RecordProtocol>(
                     graph, scheduler_state_base, scheduler, run_control, completed_slot, pending_slot, &completed_gate
                 );
             completion_ok = contribution != SchedulerSubtaskFinishResult::ERROR;
-            if (completed_slot.execution_token && contribution == SchedulerSubtaskFinishResult::PARTIAL)
+            if (!completed_slot.sync_start && contribution == SchedulerSubtaskFinishResult::PARTIAL)
                 scheduler->continuation_task_ref = task_ref;
             if (contribution == SchedulerSubtaskFinishResult::TASK_LAST) {
                 scheduler_remember_task_proof(scheduler, task_ref, SchedulerTaskProof::DONE);
-                ++scheduler->pending_completed;
+                scheduler_report_task_completed(run_control);
             } else if (contribution == SchedulerSubtaskFinishResult::TASK_LAST_DEFERRED) {
                 const auto completion = scheduler_async_close_computation(scheduler->async, task_ref, completed_gate);
                 completion_ok =
@@ -301,9 +293,8 @@ static inline __aicore__ bool scheduler_complete_own_slot(
     }
     // This core is the sole writer. Rebinding the slot happens after all trace
     // reads below, so retirement can read the executor's record in place.
-    const SchedulerExecutorTaskTrace *executor_trace = chip_task_timing_enabled || sampled_task_timing_enabled ?
-                                                           &scheduler->profiling->executor_traces[pending_slot] :
-                                                           nullptr;
+    const SchedulerExecutorTaskTrace *executor_trace =
+        chip_task_timing_enabled || sampled_task_timing_enabled ? &scheduler->profiling->executor_trace : nullptr;
     __gm__ SchedulerTaskTrace *completed_trace = nullptr;
     if (chip_task_timing_enabled || sampled_task_timing_enabled) {
         __gm__ SchedulerTaskTrace *traces =
@@ -348,18 +339,17 @@ static inline __aicore__ bool scheduler_complete_own_slot(
     }
     // Failed completion bypasses the contribution's visibility fence. Its real
     // return must still precede a resource-lane acknowledgement.
-    if (!PublishCompletion || !completion_ok || completed_slot.cluster_mix || completed_slot.gm_mix)
-        scheduler_cache_barrier();
-    if (completed_slot.cluster_mix && !scheduler_cluster_mix_release(
+    if (!PublishCompletion || !completion_ok || completed_slot.cluster_mix) scheduler_cache_barrier();
+    if (completed_slot.cluster_mix && !scheduler_release_mix_lane(
                                           graph, scheduler_state_base, scheduler, run_control, completed_slot,
                                           pending_slot, PublishCompletion && completion_ok
                                       ))
         return false;
-    if (gm_mix && !scheduler_gm_mix_release_lane<RecordProtocol>(
-                      graph, scheduler_state_base, scheduler, run_control, completed_slot, pending_slot,
-                      PublishCompletion && completion_ok
-                  ))
-        return false;
-    if (!completion_ok) return false;
-    return true;
+    if constexpr (RecordProtocol) {
+        if (completion_ok && completed_slot.sync_start && !completed_slot.cluster_mix &&
+            scheduler_protocol_enabled(scheduler))
+            scheduler_protocol_member(scheduler_state_base, scheduler, task_ref, true);
+    }
+    scheduler_retire_execution(scheduler, pending_slot);
+    return completion_ok;
 }

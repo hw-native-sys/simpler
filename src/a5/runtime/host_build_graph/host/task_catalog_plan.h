@@ -26,6 +26,7 @@ struct SchedulerTaskCatalogPlan {
     uint64_t header_offset{0};
     uint64_t total_size{0};
     SchedulerTaskCatalogHeader header{};
+    std::vector<SchedulerTaskCatalogOrder> order_rows;
     std::vector<SchedulerTaskCatalogDescriptor> descriptors;
     std::vector<std::vector<int64_t>> catalogs;
     std::vector<int64_t> task_order;
@@ -96,34 +97,78 @@ inline bool scheduler_topological_task_order(
     return true;
 }
 
+// Maintain the last rank that could use each physical lane. AIV0's MIX
+// publication duty conflicts even when that lane is absent from the kernel.
+struct SchedulerCatalogOrderBuilder {
+    uint32_t previous_mix_floor[PLATFORM_CORES_PER_BLOCKDIM]{};
+    uint32_t previous_sync_floor[PLATFORM_CORES_PER_BLOCKDIM]{};
+    uint32_t previous_mix_ref{UINT32_MAX};
+    uint32_t cooperative_count{0};
+
+    void append(
+        uint32_t rank, uint32_t ref, const SchedulerTaskMetadata &task, std::vector<SchedulerTaskCatalogOrder> &rows,
+        uint32_t &first_mix_ref
+    ) {
+        auto &row = rows[ref];
+        row.rank = rank;
+        if (!scheduler_task_is_executable(task.flags) || scheduler_task_is_inline(task.flags)) return;
+        const bool mix = scheduler_task_is_mix(task.flags);
+        if (mix || scheduler_task_requires_sync_start(task.flags)) row.cooperative_index = cooperative_count++;
+        const auto lanes = scheduler_task_claim_lanes(task.flags, task.active_mask).merged_with(task.active_mask);
+        for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+            if (!lanes.has(static_cast<SubtaskSlot>(lane))) continue;
+            row.required_floor[lane] = mix ? previous_sync_floor[lane] : previous_mix_floor[lane];
+            if (mix) previous_mix_floor[lane] = rank + 1;
+            else if (scheduler_task_requires_sync_start(task.flags)) previous_sync_floor[lane] = rank + 1;
+        }
+        if (mix) {
+            if (previous_mix_ref == UINT32_MAX) first_mix_ref = ref;
+            else rows[previous_mix_ref].next_mix_ref = ref;
+            previous_mix_ref = ref;
+        }
+    }
+};
+
+// The ref-order form is for callers supplying an already ordered image.
+// Host binding passes the full order of all expanded nodes, including controls.
+inline bool scheduler_project_task_catalog(
+    const std::vector<SchedulerTaskMetadata> &metadata, const SchedulerTaskOrder *order, SchedulerTaskCatalogPlan *plan
+) {
+    const size_t count = metadata.size();
+    std::vector<std::vector<int64_t>> catalogs(SCHEDULER_EXECUTION_ENGINE_COUNT);
+    std::vector<SchedulerTaskCatalogOrder> rows(count);
+    SchedulerCatalogOrderBuilder builder;
+    uint32_t first_mix = UINT32_MAX;
+    for (uint32_t rank = 0; rank < count; ++rank) {
+        const int64_t ref = order == nullptr ? static_cast<int64_t>(rank) : order->task_order[rank];
+        if (ref < 0 || static_cast<uint64_t>(ref) >= count || (order != nullptr && order->task_ranks[ref] != rank))
+            return false;
+        const auto &task = metadata[ref];
+        builder.append(rank, static_cast<uint32_t>(ref), task, rows, first_mix);
+        if (!scheduler_task_is_executable(task.flags) || scheduler_task_is_inline(task.flags)) continue;
+        const auto type = scheduler_task_execution_engine(task.flags, task.active_mask);
+        catalogs[type].push_back(ref);
+    }
+    for (uint32_t engine = 0; engine < SCHEDULER_EXECUTION_ENGINE_COUNT; ++engine)
+        if (catalogs[engine].size() != plan->descriptors[engine].capacity) return false;
+    plan->header.first_mix_ref = first_mix;
+    plan->order_rows = std::move(rows);
+    plan->catalogs = std::move(catalogs);
+    return true;
+}
+
 inline bool scheduler_apply_task_order(
     SchedulerTaskOrder ordered, const std::vector<SchedulerTaskMetadata> &metadata, SchedulerTaskCatalogPlan *plan,
     std::string *error = nullptr
 ) {
-    const auto fail = [&](const std::string &message) {
-        if (error != nullptr) *error = message;
-        return false;
-    };
     const size_t count = metadata.size();
     if (plan == nullptr || ordered.task_order.size() != count || ordered.task_levels.size() != count ||
         ordered.task_bottom_levels.size() != count || ordered.task_ranks.size() != count ||
-        plan->descriptors.size() != SCHEDULER_EXECUTION_ENGINE_COUNT)
-        return fail("invalid projected task order");
-    std::vector<bool> seen(count, false);
-    std::vector<std::vector<int64_t>> catalogs(SCHEDULER_EXECUTION_ENGINE_COUNT);
-    for (const auto ref : ordered.task_order) {
-        if (ref < 0 || static_cast<uint64_t>(ref) >= count || seen[ref]) return fail("invalid projected task identity");
-        seen[ref] = true;
-        const auto &task = metadata[ref];
-        if (!scheduler_task_is_executable(task.flags) || scheduler_task_is_inline(task.flags)) continue;
-        const auto type = scheduler_task_execution_engine(task.flags, task.active_mask);
-        if (type >= SCHEDULER_EXECUTION_ENGINE_COUNT) return fail("invalid projected execution engine");
-        catalogs[type].push_back(ref);
+        plan->descriptors.size() != SCHEDULER_EXECUTION_ENGINE_COUNT ||
+        !scheduler_project_task_catalog(metadata, &ordered, plan)) {
+        if (error != nullptr) *error = "invalid projected task order";
+        return false;
     }
-    for (uint32_t engine = 0; engine < SCHEDULER_EXECUTION_ENGINE_COUNT; ++engine)
-        if (catalogs[engine].size() != plan->descriptors[engine].capacity)
-            return fail("projected catalog capacity mismatch");
-    plan->catalogs = std::move(catalogs);
     plan->task_order = std::move(ordered.task_order);
     plan->task_levels = std::move(ordered.task_levels);
     plan->task_bottom_levels = std::move(ordered.task_bottom_levels);
@@ -383,7 +428,7 @@ inline bool scheduler_prepare_ordinary_fanin(
     return true;
 }
 
-inline bool scheduler_plan_task_catalog(
+inline bool scheduler_size_task_catalog(
     const std::vector<SchedulerTaskMetadata> &metadata, uint32_t clusters, uint64_t start_offset,
     SchedulerTaskCatalogPlan *plan
 ) {
@@ -394,9 +439,7 @@ inline bool scheduler_plan_task_catalog(
     auto &header = next.header;
     header.task_count = metadata.size();
     next.descriptors.resize(SCHEDULER_EXECUTION_ENGINE_COUNT);
-    next.catalogs.resize(SCHEDULER_EXECUTION_ENGINE_COUNT);
-    for (uint64_t ref = 0; ref < metadata.size(); ++ref) {
-        const auto &task = metadata[ref];
+    for (const auto &task : metadata) {
         if (scheduler_task_is_inline(task.flags)) {
             constexpr uint8_t forbidden =
                 SCHEDULER_TASK_MIX | SCHEDULER_TASK_SPMD | SCHEDULER_TASK_SYNC_START | SCHEDULER_TASK_HAS_PREDICATE;
@@ -409,10 +452,11 @@ inline bool scheduler_plan_task_catalog(
             if (task.logical_block_num != 0) ++header.control_count;
             continue;
         }
+        if (!task.active_mask.is_valid() || task.active_mask.is_empty() ||
+            task.active_mask.is_mix() != scheduler_task_is_mix(task.flags))
+            return false;
         const uint32_t type = scheduler_task_execution_engine(task.flags, task.active_mask);
-        if (type >= SCHEDULER_EXECUTION_ENGINE_COUNT) return false;
         ++next.descriptors[type].capacity;
-        next.catalogs[type].push_back(static_cast<int64_t>(ref));
         ++header.entry_count;
     }
     uint64_t cursor = start_offset;
@@ -427,8 +471,25 @@ inline bool scheduler_plan_task_catalog(
                 &cursor, descriptor.capacity * sizeof(int64_t), SCHEDULER_STATE_ALIGNMENT, &descriptor.entries_offset
             ))
             return false;
-    if (!scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) return false;
+    if (!scheduler_layout_reserve(
+            &cursor, metadata.size() * sizeof(SchedulerTaskCatalogOrder), SCHEDULER_STATE_ALIGNMENT,
+            &header.order_offset
+        ) ||
+        !scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size))
+        return false;
     header.storage_end_offset = next.total_size;
+    *plan = std::move(next);
+    return true;
+}
+
+inline bool scheduler_plan_task_catalog(
+    const std::vector<SchedulerTaskMetadata> &metadata, uint32_t clusters, uint64_t start_offset,
+    SchedulerTaskCatalogPlan *plan
+) {
+    SchedulerTaskCatalogPlan next;
+    if (plan == nullptr || !scheduler_size_task_catalog(metadata, clusters, start_offset, &next) ||
+        !scheduler_project_task_catalog(metadata, nullptr, &next))
+        return false;
     *plan = std::move(next);
     return true;
 }
@@ -436,6 +497,8 @@ inline bool scheduler_plan_task_catalog(
 // The caller owns a quiescent allocation already zeroed through total_size.
 inline void scheduler_init_task_catalog(void *base, const SchedulerTaskCatalogPlan &plan) {
     *scheduler_state_at<SchedulerTaskCatalogHeader>(base, plan.header_offset) = plan.header;
+    auto *rows = scheduler_state_at<SchedulerTaskCatalogOrder>(base, plan.header.order_offset);
+    std::copy(plan.order_rows.begin(), plan.order_rows.end(), rows);
     auto *descriptors = scheduler_state_at<SchedulerTaskCatalogDescriptor>(base, plan.header.descriptors_offset);
     std::copy(plan.descriptors.begin(), plan.descriptors.end(), descriptors);
     for (uint32_t type = 0; type < plan.descriptors.size(); ++type) {

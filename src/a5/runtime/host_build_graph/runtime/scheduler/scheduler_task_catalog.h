@@ -20,7 +20,31 @@ struct alignas(64) SchedulerTaskCatalogHeader {
     uint64_t control_count{0};
     uint64_t storage_end_offset{0};
     uint64_t entry_count{0};
+    uint64_t order_offset{0};
+    uint32_t first_mix_ref{UINT32_MAX};
 };
+
+// Indexed by expanded node ref. A threshold is one past the last earlier
+// conflicting rank from the opposite source on this physical lane; zero
+// requires no check. Only MIX nodes participate in the forward link.
+struct SchedulerTaskCatalogOrder {
+    uint32_t rank{0};
+    uint32_t cooperative_index{UINT32_MAX};
+    uint32_t required_floor[PLATFORM_CORES_PER_BLOCKDIM]{};
+    uint32_t next_mix_ref{UINT32_MAX};
+};
+static_assert(sizeof(SchedulerTaskCatalogOrder) == 24);
+static_assert(
+    std::is_standard_layout_v<SchedulerTaskCatalogOrder> && std::is_trivially_copyable_v<SchedulerTaskCatalogOrder>
+);
+
+inline __aicore__ const __gm__ SchedulerTaskCatalogOrder &
+scheduler_task_catalog_order(__gm__ void *base, const __gm__ SchedulerTaskCatalogHeader &catalog, uint32_t ref) {
+    // Each core invalidates its entire DCache after READY, before its first
+    // catalog lookup. Host-published rows stay immutable for the entire run,
+    // including rows that span two cache lines.
+    return scheduler_state_at<SchedulerTaskCatalogOrder>(base, catalog.order_offset)[ref];
+}
 
 struct SchedulerTaskCatalogDescriptor {
     uint64_t entries_offset{0};
@@ -92,5 +116,8 @@ static inline __aicore__ bool scheduler_task_catalog_validate(
             return false;
         cursor = descriptor.entries_offset + descriptor.capacity * sizeof(int64_t);
     }
-    return entries == pool->entry_count;
+    return entries == pool->entry_count && (pool->first_mix_ref == UINT32_MAX || pool->first_mix_ref < task_count) &&
+           pool->order_offset >= cursor && pool->order_offset % SCHEDULER_STATE_ALIGNMENT == 0 &&
+           pool->order_offset <= pool->storage_end_offset &&
+           task_count <= (pool->storage_end_offset - pool->order_offset) / sizeof(SchedulerTaskCatalogOrder);
 }

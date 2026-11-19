@@ -47,16 +47,81 @@ bool publish(const ProfileOwner &owner, ChipSwimlaneExtensionSection section, co
     return owner.api->publish_chip_swimlane_extension(section, payload.data(), payload.size());
 }
 
+const char *task_event_name(PercounterTaskEventKind kind) {
+    switch (kind) {
+    case PercounterTaskEventKind::Claim:
+        return "claim";
+    case PercounterTaskEventKind::Ready:
+        return "ready";
+    case PercounterTaskEventKind::CompletionIssue:
+        return "completion_issue";
+    case PercounterTaskEventKind::DeferRegistered:
+        return "defer_registered";
+    case PercounterTaskEventKind::DeferredCompletionIssue:
+        return "deferred_completion_issue";
+    case PercounterTaskEventKind::KernelEnd:
+        return "kernel_end";
+    }
+    throw std::runtime_error("invalid percounter task event kind");
+}
+
 bool export_profile(const ProfileOwner &owner) {
     const auto &layout = owner.layout;
     const auto headers =
         read_records<PercounterProfileBuffer>(owner, layout.profile_buffers_offset, SCHEDULER_WORKER_CAPACITY);
-    std::ostringstream tasks, kernels, streams;
+    const bool capture_scalar = layout.profiling_level >= 3;
+    auto invocations =
+        read_records<PercounterGraphInvocation>(owner, layout.graph_invocations_offset, layout.graph_invocation_count);
+    std::sort(invocations.begin(), invocations.end(), [](const auto &a, const auto &b) {
+        return a.body_base < b.body_base;
+    });
+    std::ostringstream tasks, kernels, streams, task_events;
+    task_events << "{\"records\":[";
+    bool first_event = true;
+    uint64_t dropped_events = 0;
+    std::unordered_map<uint64_t, uint64_t> deferred_entries;
+    std::vector<std::pair<size_t, PercounterTaskEvent>> deferred_updates;
     kernels << "[";
     tasks << "{\"producer\":\"aicore\",\"records\":[";
     streams << "{\"streams\":[";
     bool first_task = true, first_stream = true;
     const auto epoch = owner.api->run_epoch();
+    const auto emit_task_event = [&](size_t worker, const PercounterTaskEvent &event) {
+        const auto &header = headers[worker];
+        const uint64_t id = percounter_order_task_id(event.entry);
+        const auto block = percounter_order_block_idx(event.entry);
+        const auto blocks = percounter_order_block_num(event.entry);
+        if (event.cycles == 0 || id >= layout.task_count || block >= blocks)
+            throw std::runtime_error("invalid percounter task event");
+        TaskId token = TaskId::make_global(static_cast<int32_t>(id));
+        if (id >= layout.table_task_count) {
+            auto invocation =
+                std::upper_bound(invocations.begin(), invocations.end(), id, [](uint64_t task, const auto &record) {
+                    return task < record.body_base;
+                });
+            if (invocation == invocations.begin()) throw std::runtime_error("percounter task event has no Graph");
+            --invocation;
+            token = TaskId::make_sub_task(invocation->shell_task_id, id - invocation->body_base);
+        }
+        if (!first_event) task_events << ',';
+        first_event = false;
+        task_events << "\n{\"kind\":\"" << task_event_name(event.kind) << "\",\"cycles\":" << event.cycles
+                    << ",\"run_epoch\":" << epoch << ",\"task_id\":" << TaskId::to_uint64(token)
+                    << ",\"block_index\":" << block << ",\"block_count\":" << blocks << ",\"worker_id\":" << worker
+                    << ",\"cluster_index\":" << header.cluster_index << ",\"cluster_lane\":" << header.cluster_lane;
+        if (event.kind == PercounterTaskEventKind::Claim) task_events << ",\"claim_start_cycles\":" << event.detail;
+        if (event.kind == PercounterTaskEventKind::KernelEnd)
+            task_events << ",\"kernel_start_cycles\":" << event.detail;
+        if (event.kind == PercounterTaskEventKind::CompletionIssue) {
+            const int64_t contribution = event.detail == UINT64_MAX ? -1 : static_cast<int64_t>(event.detail);
+            task_events << ",\"contribution\":" << contribution;
+        }
+        if (event.kind == PercounterTaskEventKind::DeferRegistered ||
+            event.kind == PercounterTaskEventKind::DeferredCompletionIssue)
+            task_events << ",\"deferred_group\":" << event.detail;
+        if (event.kind == PercounterTaskEventKind::DeferredCompletionIssue) task_events << ",\"contribution\":1";
+        task_events << '}';
+    };
     for (size_t worker = 0; worker < headers.size(); ++worker) {
         const auto &header = headers[worker];
         if (header.physical_core_id < 0) continue;
@@ -80,8 +145,27 @@ bool export_profile(const ProfileOwner &owner) {
                     << task.start << ',' << task.finish << ',' << task.start - task.dispatch << ',' << epoch << ']';
             tasks << '[' << worker << ',' << registration << ',' << task.dispatch << ',' << task.finish << ',' << epoch
                   << ']';
+            if (task.kernel_end < task.start || task.kernel_end > task.finish)
+                throw std::runtime_error("invalid percounter kernel return timestamp");
+            emit_task_event(worker, {task.kernel_end, task.entry, task.start, PercounterTaskEventKind::KernelEnd});
         }
-        if (layout.profiling_level < 3) continue;
+        const auto event_offset =
+            layout.event_records_offset + worker * layout.event_record_capacity * sizeof(PercounterTaskEvent);
+        if (header.event_records_offset != event_offset || header.event_capacity != layout.event_record_capacity ||
+            header.event_committed > header.event_capacity)
+            throw std::runtime_error("invalid percounter task event header");
+        dropped_events += header.event_dropped;
+        for (const auto &event : read_records<PercounterTaskEvent>(owner, event_offset, header.event_committed)) {
+            if (event.kind == PercounterTaskEventKind::DeferredCompletionIssue) {
+                deferred_updates.emplace_back(worker, event);
+                continue;
+            }
+            if (event.kind == PercounterTaskEventKind::DeferRegistered &&
+                !deferred_entries.emplace(event.detail, event.entry).second)
+                throw std::runtime_error("duplicate percounter deferred group");
+            emit_task_event(worker, event);
+        }
+        if (!capture_scalar) continue;
         if (header.scalar_records_offset != scalar_offset ||
             header.scalar_storage_words > PERCOUNTER_SCALAR_WORD_CAPACITY)
             throw std::runtime_error("invalid percounter scalar header");
@@ -142,9 +226,23 @@ bool export_profile(const ProfileOwner &owner) {
     tasks << "]}";
     kernels << "]";
     streams << "]}";
+    uint64_t unmatched_updates = 0;
+    for (auto &[worker, event] : deferred_updates) {
+        const auto match = deferred_entries.find(event.detail);
+        if (match == deferred_entries.end()) {
+            ++unmatched_updates;
+            continue;
+        }
+        event.entry = match->second;
+        emit_task_event(worker, event);
+    }
+    if (unmatched_updates != 0 && dropped_events == 0)
+        throw std::runtime_error("percounter deferred completion has no producer task");
+    task_events << "],\"dropped\":" << dropped_events << ",\"unmatched_deferred_updates\":" << unmatched_updates << '}';
     return publish(owner, ChipSwimlaneExtensionSection::AicoreTasks, kernels) &&
            publish(owner, ChipSwimlaneExtensionSection::SchedulerTasks, tasks) &&
-           (layout.profiling_level < 3 || publish(owner, ChipSwimlaneExtensionSection::SchedulerRecords, streams));
+           publish(owner, ChipSwimlaneExtensionSection::PercounterTaskEvents, task_events) &&
+           (!capture_scalar || publish(owner, ChipSwimlaneExtensionSection::SchedulerRecords, streams));
 }
 }  // namespace
 

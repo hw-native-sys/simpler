@@ -47,7 +47,10 @@ struct alignas(64) SchedulerAsyncGroupProgress {
 };
 
 struct alignas(64) SchedulerAsyncDirectoryWord {
+    // Only fallback halves mutate bits, through atomics. Addresses are written
+    // by Host before READY and never cached-written or DCCI-published in a run.
     volatile uint64_t bits;
+    uint64_t notification_addresses[2];
 };
 
 struct alignas(64) SchedulerAsyncActivity {

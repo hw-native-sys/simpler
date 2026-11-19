@@ -107,19 +107,24 @@ def _check_normalized_capture(path, mask):
     assert len(actual) == len(expected) and set(actual) == expected
     assert all(entry["block_num"] == 1 for entry in executions)
     assert len(raw["aicore_tasks"]) == len(expected) + 1  # The final kernel checks real fanin.
-    assert protocol["cooperative_task_count"] == protocol["sync_mix_task_count"] == 0
-    assert protocol["admission_log"] == []
-    assert protocol["mix_task_count"] == (2 if mixed else 0)
+    assert protocol["sync_mix_task_count"] == 0
+    assert protocol["members"] == []
+    assert protocol["cooperative_task_count"] == protocol["mix_task_count"] == (2 if mixed else 0)
     groups = [block for block in protocol["blocks"] if block["owner"]["task_ref"] in refs]
     if mixed:
-        resources = mask | 1
-        resource_lanes = {lane for lane in range(3) if resources & (1 << lane)}
+        resource_lanes = {lane for lane in range(3) if mask & (1 << lane)}
+        workers = {row["index"]: row for row in protocol["workers"]}
         assert len(groups) == 2
         assert {group["owner"]["task_ref"] for group in groups} == refs
         for group in groups:
             assert len(group["lanes"]) == len(resource_lanes)
             assert {lane["lane"] for lane in group["lanes"]} == resource_lanes
-            assert all(lane["resource_mask"] == resources for lane in group["lanes"])
+            owner = group["owner"]
+            cluster_workers = workers[owner["worker_index"]]["cluster_workers"]
+            assert owner["worker_index"] == cluster_workers[1]
+            accountant = 1 if 1 in resource_lanes else min(resource_lanes)
+            assert owner["completion_worker"] == cluster_workers[accountant]
+            assert all(lane["resource_mask"] == mask for lane in group["lanes"])
             assert all(lane["active_mask"] == mask for lane in group["lanes"])
     else:
         assert not groups

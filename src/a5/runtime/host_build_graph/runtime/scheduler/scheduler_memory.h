@@ -98,6 +98,21 @@ static inline __aicore__ void scheduler_observe_data_cache(__gm__ void *address)
 #endif
 }
 
+static inline __aicore__ void scheduler_observe_input_cache(__gm__ SchedulerPreparedCall *call, uint8_t count) {
+    if (count == SCHEDULER_INPUT_CACHE_FULL || count > SCHEDULER_INPUT_CACHE_SPANS) {
+        scheduler_observe_data_cache(call);
+        return;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint64_t last = call->input_cache_lines[i].last_line;
+        for (uint64_t line = call->input_cache_lines[i].first_line;; line += SCHEDULER_SCALAR_CACHE_LINE_BYTES) {
+            scheduler_invalidate_cache_line(reinterpret_cast<__gm__ void *>(line));
+            if (line == last) break;
+        }
+    }
+    scheduler_cache_barrier();
+}
+
 // A5 ld_dev bypasses the scalar DCache. A reliable snapshot grants no
 // exclusive ownership; mutations use the atomic wrappers below.
 // Ownership changes use the CAS/exchange/fetch wrappers below.
@@ -147,6 +162,31 @@ static inline __aicore__ void scheduler_notify_store(__gm__ volatile uint32_t &v
         __builtin_cce_st_dev(desired, const_cast<__gm__ uint32_t *>(&value), 0);
 #else
         __atomic_store_n(&value, desired, __ATOMIC_RELEASE);
+#endif
+    });
+}
+
+// The verified A5 32-byte slot exposes BIT_WR at SET + 16 and BIT_CLR at
+// SET + 24. Both aliases share the SET mapping; writes carry a 32-bit mask.
+// Publication barriers belong to the caller, independently of these atomics.
+static inline __aicore__ void scheduler_notify_set_bits(__gm__ volatile uint32_t &value, uint32_t mask) {
+    scheduler_scalar_memory_issue(SchedPhaseKind::ScalarBypassStore, 1, [&value, mask]() __aicore__ {
+#if defined(__CCE_AICORE__)
+        auto *address = const_cast<__gm__ uint32_t *>(&value) + 4;
+        __builtin_cce_st_dev(mask, address, 0);
+#else
+        (void)__atomic_fetch_or(&value, mask, __ATOMIC_RELEASE);
+#endif
+    });
+}
+
+static inline __aicore__ void scheduler_notify_clear_bits(__gm__ volatile uint32_t &value, uint32_t mask) {
+    scheduler_scalar_memory_issue(SchedPhaseKind::ScalarBypassStore, 1, [&value, mask]() __aicore__ {
+#if defined(__CCE_AICORE__)
+        auto *address = const_cast<__gm__ uint32_t *>(&value) + 6;
+        __builtin_cce_st_dev(mask, address, 0);
+#else
+        (void)__atomic_fetch_and(&value, ~mask, __ATOMIC_RELEASE);
 #endif
     });
 }

@@ -41,26 +41,30 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
-      - name: Set up framework environment
+      - name: Validate manual mode
+        env:
+          MANUAL_MODE: ${{ inputs.manual_mode }}
+        run: |
+          case "$MANUAL_MODE" in
+            exclude|include|only) ;;
+            *)
+              echo "::error::manual_mode must be exclude, include, or only"
+              exit 2
+              ;;
+          esac
+
+      - name: Set up environment
         id: framework
         uses: ./.github/actions/setup-framework
         with:
           platform: ${{ inputs.platform }}
 
-      - name: Run the declared framework environment exclusively
+      - name: Run framework scene tests
         env:
           CANN_ENV: ${{ steps.framework.outputs.cann_env }}
           MANUAL_MODE: ${{ inputs.manual_mode }}
           PLATFORM: ${{ inputs.platform }}
         run: |
-          case "$MANUAL_MODE" in
-            exclude|include|only) ;;
-            *) echo "::error::manual_mode must be exclude, include, or only"; exit 1 ;;
-          esac
-          case "$PLATFORM" in
-            a2a3|a5) ;;
-            *) echo "::error::platform must be a2a3 or a5"; exit 1 ;;
-          esac
           source "$CANN_ENV"
           mkdir -p outputs/framework-ci
           git rev-parse HEAD | tee outputs/framework-ci/source.txt
@@ -76,7 +80,7 @@ jobs:
               --basetemp outputs/framework-ci/pytest --junitxml outputs/framework-ci/results.xml"
           .venv-framework/bin/python -m simpler_setup.test_environments verify outputs/framework-ci/results.plan.json outputs/framework-ci/results.xml
 
-      - name: Verify and summarize torch_npu environment coverage
+      - name: Verify torch_npu environment coverage
         if: always()
         env:
           PLATFORM: ${{ inputs.platform }}
@@ -98,8 +102,8 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Retain framework identities and logs
-        if: always() && steps.diagnostics.outcome == 'success'
+      - name: Upload logs
+        if: (failure() || cancelled()) && steps.diagnostics.outcome == 'success'
         # The test result is already checked above; artifact service failures only lose diagnostics.
         continue-on-error: true
         uses: ./.ci-support/.github/actions/upload-diagnostics

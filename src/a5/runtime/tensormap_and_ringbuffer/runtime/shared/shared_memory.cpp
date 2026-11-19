@@ -167,6 +167,7 @@ void SharedMemoryHandle::init_header_per_ring(
     header->sched_stall_cnt_running.store(0, std::memory_order_relaxed);
     header->sched_stall_cnt_ready.store(0, std::memory_order_relaxed);
     header->sched_stall_cnt_waiting.store(0, std::memory_order_relaxed);
+    header->sched_stall_cnt_async_wait.store(0, std::memory_order_relaxed);
     header->sched_stall_orch_done.store(0, std::memory_order_relaxed);
     header->sched_stall_task_id.store(TaskId::invalid(), std::memory_order_relaxed);
     header->sched_stall_core.store(-1, std::memory_order_relaxed);

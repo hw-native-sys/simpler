@@ -13,6 +13,7 @@
 #include <cmath>
 #endif
 #include "compressor_publish.h"
+#include "rmsnorm.hpp"
 namespace {
 #if defined(__DAV_VEC__)
 __tf__ __aicore__ inline void normalize(
@@ -39,20 +40,7 @@ __tf__ __aicore__ inline void normalize(
         for (uint16_t row = 0; row < rows; ++row) {
             RegTensor<float> sum, value, square, inv, one;
             RegTensor<bfloat16_t> bf;
-            vdup(sum, 0.0f, full, MODE_ZEROING);
-            for (uint16_t chunk = 0; chunk < 8; ++chunk) {
-                vlds(bf, src, row * 512 + chunk * 64, UNPK_B16);
-                vcvt(value, bf, full, PART_EVEN);
-                vmul(square, value, value, full, MODE_ZEROING);
-                vadd(sum, sum, square, full, MODE_ZEROING);
-            }
-            vcadd(sum, sum, full, MODE_ZEROING);
-            vmuls(inv, sum, 1.0f / 512.0f, full, MODE_ZEROING);
-            vadds(inv, inv, 1.0e-6f, full, MODE_ZEROING);
-            vsqrt(inv, inv, full, MODE_ZEROING);
-            vdup(one, 1.0f, full, MODE_ZEROING);
-            vdiv(inv, one, inv, full, MODE_ZEROING);
-            vdup(inv, inv, full, POS_LOWEST, MODE_ZEROING);
+            recipe_rms::row_inverse<512>(inv, src, row * 512, full);
             for (uint16_t chunk = 0; chunk < 8; ++chunk) {
                 RegTensor<float> gain;
                 vlds(bf, src, row * 512 + chunk * 64, UNPK_B16);

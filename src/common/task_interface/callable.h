@@ -48,6 +48,7 @@
 #include "callable_limits.h"
 #include "ccu_module_package.h"
 #include "core_async_capability.h"
+#include "core_input_cache_proof.h"
 
 inline constexpr uint32_t CHIP_CALLABLE_WIRE_VERSION = 1U;
 
@@ -89,6 +90,11 @@ struct Callable<void, MaxSig, 0> {
     uint64_t resolved_addr() const { return resolved_addr_; }
     void set_resolved_addr(uint64_t addr) { resolved_addr_ = addr; }
     CoreAsyncCapability async_capability() const { return async_capability_; }
+    CoreInputCacheProof input_cache_proof() const {
+        CoreInputCacheProof proof{};
+        if constexpr (MaxSig == CORE_MAX_TENSOR_ARGS) std::memcpy(&proof, storage_, sizeof(proof));
+        return proof;
+    }
 
     // Binary data is placed at the next CALLABLE_ALIGN boundary after the fixed fields.
     // storage_ sits between the fixed fields and the aligned binary; binary_data()
@@ -253,6 +259,7 @@ static_assert(
 static_assert(offsetof(CoreCallable, storage_) == 152, "CoreCallable wire ABI: storage offset changed");
 static_assert(sizeof(CoreCallable) == 152, "CoreCallable wire ABI: header size changed");
 static_assert(CoreCallable::binary_data_offset() == 192, "CoreCallable wire ABI: binary data offset changed");
+static_assert(offsetof(CoreCallable, storage_) + sizeof(CoreInputCacheProof) == CoreCallable::binary_data_offset());
 
 // ============================================================================
 // Factory: make_callable for static leaf
@@ -273,6 +280,18 @@ std::vector<uint8_t> make_callable(
     if (sig_count > 0 && sig == nullptr)
         throw std::invalid_argument("make_callable: sig is required when sig_count > 0");
 
+    CoreInputCacheProof proof{};
+    if constexpr (MaxSig == CORE_MAX_TENSOR_ARGS) {
+        if (binary != nullptr && binary_size > sizeof(proof)) {
+            const uint32_t text_size = binary_size - sizeof(proof);
+            std::memcpy(&proof, static_cast<const uint8_t *>(binary) + text_size, sizeof(proof));
+            if (core_input_cache_proof_matches_text(proof, binary, text_size)) {
+                binary_size = text_size;
+            } else {
+                proof = {};
+            }
+        }
+    }
     using T = Callable<void, MaxSig, 0>;
     size_t aligned_header = T::binary_data_offset();
     size_t total_size = aligned_header + binary_size;
@@ -286,6 +305,7 @@ std::vector<uint8_t> make_callable(
     obj->binary_size_ = binary_size;
     obj->resolved_addr_ = 0;
     obj->async_capability_ = normalized_capability;
+    if constexpr (MaxSig == CORE_MAX_TENSOR_ARGS) std::memcpy(obj->storage_, &proof, sizeof(proof));
     if (binary_size > 0) std::memcpy(buf.data() + aligned_header, binary, binary_size);
 
     return buf;

@@ -53,26 +53,23 @@ uint32_t original_task_count。GraphView、native header、task catalog 和 prep
 | 类型 | 大小 | 所有权与用途 |
 | ---- | ---- | ------------ |
 | SchedulerTaskMetadata | 16 B | Host 只读形状、kernel、block 和 trace prefix |
-| SchedulerTaskControl | 640 B | 五个独立 128 B 原子区域：claim_tickets、next_block、completion_state、admission_state、claim_seal |
+| SchedulerTaskControl | 896 B | 分发进度、完成字、分发封闭标记，以及四个独立的 128 B 领取区域 |
 | DONE 地址表 | 8 B/node | Host 不可变映射；非零为 CntNotify 32-bit SET/read 地址，零为 GM 回退 |
 | SchedulerWorkerContext | 320 B | 前四个 64 B 行由 READY 发布；最后一行归本核诊断 |
 | SchedulerRunControl | 7296 B | 384 B 配置/生命周期/首错前缀及 108 个独占行的 worker 错误信号 |
 | SchedulerGraphSummary | 128 B | 本轮只读拓扑和各子区 offset |
 | SchedulerTaskTrace | 256 B | publication、kernel timing、dispatch/completion、execution identity 四行 |
 | SchedulerExecutorTaskTrace | 24 B | 核内 start/end/ready-observe 三个时间戳 |
-| SchedulerAdmissionRecord | 64 B | sync_start 任务的冻结 admission 事实 |
-| SchedulerAdmissionControl | 256 B | commit_lock 和 bypass commit_tail 分占 128 B 区域 |
-| SchedulerGroupMailbox | 384 B | group descriptor 及三个独立 lane ack |
+| SchedulerTaskCatalogOrder | 24 B/node | 展开实例的稳定 rank、三个 lane 各自的冲突边界、下一项 MIX 和协作索引 |
+| SchedulerClusterSignal | 80 B/cluster | AIV0 在 SSBUF 发布 MIX 描述符、generation 和单调边界，实际参与 lane 写到达和 FIN |
 
-Mailbox 的 descriptor 从 0 开始，lane ack 数组从 128 开始，二者位于独立原子 sector。
-AdmissionRecord 数组直接按当前类型的 64 B 大小寻址；layout、summary 和核内 admission
-状态不再各存一份行宽。summary 的 protocol/async/prepared layout offset 字段分别位于
-80/104/112；核内 `SchedulerAdmissionLocalState` 为 168 B。
-coordinator 写回 descriptor 并 barrier 后，通过参与 AIV 的 assigned_seq 发布；接收者不读取另一份全局发布计数。
-MIX 关闭复用 SSBUF 的单调 admission frontier，不按 task/cluster 分配 GM 关闭通知。
-Call.args 与 dump task 的只读参数行以 alignas(64) 对齐；没有显式 reserved 数据字段。
+AIV0 为本簇分发 MIX，并在本簇较早的描述符均可见后发布排序边界。实际参与者按
+generation 接收本组。一个实际计算成员汇总完成信用并发布本代已结清的证明，AIV0
+取得该证明后复用记录。纯核与 MIX 的执行身份直接指向各自的原始记录。
+Call.args 与 dump task 的只读参数行保持 64 B 对齐。
 
-TaskControl 的 atomic offset 依次为 0、128、256、384、512。
+TaskControl 中 `next_block`、`completion_state` 和 `claim_seal` 的偏移依次为
+0、128、256 B。四个领取计数的偏移为 384、512、640、768 B。
 completion_state 编码 total/remaining_compute/debt；具体有效性和 DONE 判据见
 [canonical completion gate](dependency-counters.md)。它不包含 wake-list、remaining fanin 或 resolver timing。
 
@@ -93,7 +90,7 @@ execution identity 从 192 开始。退休时先写回有效计时行并 barrier
 
 backing 基址满足 128 B 对齐。标量缓存维护仍按 64 B 行，不能从原子区域尺寸推导缓存指令粒度。
 
-以上大小描述现有 wire 布局，不表示每个动态字段都已经满足新的争用隔离目标。后续设计按 128B L2 侧粒度隔离独立 atomic 竞争单元，检查基址、数组 stride 和实际字段 offset；仅把结构体声明为 64B 对齐不够。TaskImageStatus、trace valid、async lease/join 及其他现有 64B 控制区应逐项区分冷路径、单写者数据和真实竞争热点，不把现有 ABI 尺寸当作通用隔离原则。变更布局时 Host 分配、Device 寻址、导出与读取方必须一起调整；本次文档修订未改变 wire ABI。
+以上大小描述现有 wire 布局，不表示每个动态字段都已经满足新的争用隔离目标。后续设计按 128B L2 侧粒度隔离独立 atomic 竞争单元，检查基址、数组 stride 和实际字段 offset；仅把结构体声明为 64B 对齐不够。TaskImageStatus、trace valid、async lease/join 及其他现有 64B 控制区应逐项区分冷路径、单写者数据和真实竞争热点，不把现有 ABI 尺寸当作通用隔离原则。变更布局时 Host 分配、Device 寻址、导出与读取方必须一起调整。
 
 只读 Call/参数区不因这一原则强制逐字段膨胀到 128B；128B 是独立竞争单元的隔离要求，64B 仍可用于普通数据的缓存维护。每 task 已有一个 128B next_block 区域也不代表该 task 内的并发 claim 已分散。st_dev 与 atomic 控制区均禁止被旧 cached 整行回写覆盖，通知发布和消费的真实时序边界显式 DSB。
 业务 kernel 不接收调度私有 slot 或 admission 对象的地址。
@@ -171,11 +168,11 @@ Host 在 orchestration 返回前取得自有 Graph 字节与索引，不能保�
 | SchedulerPreparedControl | 128 B | phase、固定 owner 与 TICKET_OWNED 状态；普通票由 owner 维护，协作转换使用 atomic |
 | SchedulerExecutionBinding | 128 B | 各占一行的 LocalContext/GlobalContext |
 
-args[48]/args[49] 指向本次 execution 的 Binding，两核内 slot 复用不覆盖这些参数。
-四个 token 与两个 slot 分别保有执行责任和临近派发状态，不能把两种容量当成同一个队列深度。
+args[48]/args[49] 指向本次 execution 的 Binding。每核可持有两个自取 block（W=2），另有两份 MIX 成员记录，分别对应两个 SSBUF bank。
+两种来源都由领取它的核从原记录执行，同一时刻每核只运行一个 kernel。
 
-统计 backing 必须分别计入 metadata/control、Call/control/Binding、native readonly、实际目录 refs、
-admission/group、async、args dump、trace/PMU/activity/Scalar 区及对齐空隙。
+统计 backing 必须分别计入 metadata/control、Call/control/Binding、native readonly、两类目录的 refs、每个 node 的排序行、
+启动会合记录、async、args dump、trace/PMU/activity/Scalar 区及对齐空隙。
 当前 layout 在 E 非零时按 E、否则按 N 规划并保留任务 trace，不能声称采集关闭就释放该区；PMU、protocol、activity 按请求另计。
 每个 trace 的 64 B 减少是布局事实，不是延迟收益证明。
 

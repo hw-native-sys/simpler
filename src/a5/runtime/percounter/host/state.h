@@ -300,6 +300,8 @@ inline StateSelection select_percounter_state(
         return true;
     };
     auto *counters = region_at<PercounterCounter>(host_base, layout.counters_offset);
+    region_at<PercounterControl>(host_base, layout.control_offset)->arguments_address =
+        device_image + device_segments.scalar_pool;
     for (size_t id = 0; id < task_count; ++id) {
         const auto &input = inputs[id];
         if (input.graph_invocation >= 0 || input.inline_completed || input.published_off_lane || input.active_mask == 0)
@@ -308,10 +310,10 @@ inline StateSelection select_percounter_state(
         if (payload.tensor_count < 0 || payload.scalar_count < 0) return StateSelection::FAILED;
         const uint32_t tensors = static_cast<uint32_t>(payload.tensor_count);
         const uint32_t scalars = static_cast<uint32_t>(payload.scalar_count);
-        uint64_t tensor_address = 0, scalar_address = 0;
-        if (!image_address(payload.tensor_data(), uint64_t{tensors} * TASK_IMAGE_TENSOR_STRIDE, tensor_address) ||
-            !image_address(payload.scalar_data(), uint64_t{scalars} * sizeof(uint64_t), scalar_address))
-            return StateSelection::FAILED;
+        uint64_t arguments_address = 0;
+        const void *arguments =
+            reinterpret_cast<const uint8_t *>(uploaded_sm) + device_segments.scalar_pool + id * sizeof(DispatchPayload);
+        if (!image_address(arguments, sizeof(DispatchPayload), arguments_address)) return StateSelection::FAILED;
         uint64_t functions[PLATFORM_CORES_PER_BLOCKDIM]{};
         for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane)
             if (input.active_mask & (1U << lane))
@@ -319,7 +321,7 @@ inline StateSelection select_percounter_state(
                     runtime->get_function_bin_addr(task_metadata[id].kernel_ids[lane]), address_space
                 );
         const auto prepared = percounter_prepare_argument_metadata(
-            counters[id], functions, input.active_mask, tensor_address, scalar_address, tensors, scalars
+            counters[id], functions, input.active_mask, arguments_address, tensors, scalars
         );
         if (prepared != SchedulerGraphResult::OK) {
             LOG_ERROR(
@@ -327,29 +329,6 @@ inline StateSelection select_percounter_state(
             );
             return StateSelection::FAILED;
         }
-    }
-
-    const uint64_t async_run_epoch = region_at<PercounterControl>(host_base, layout.control_offset)->async_run_epoch;
-    // Each slot points at its own contexts, so preparing another candidate
-    // cannot replace the block identity of a payload already held by the lane.
-    for (uint64_t slot = 0; slot < SCHEDULER_WORKER_CAPACITY * PERCOUNTER_PAYLOAD_SLOT_COUNT; ++slot) {
-        const uint64_t offset = layout.dispatch_payloads_offset + slot * sizeof(DispatchPayload);
-        auto *payload = region_at<DispatchPayload>(host_base, offset);
-        const uint64_t device_payload = device_base + offset;
-        payload->args[PAYLOAD_LOCAL_CONTEXT_INDEX] = device_payload + offsetof(DispatchPayload, local_context);
-        payload->args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = device_payload + offsetof(DispatchPayload, global_context);
-        payload->local_context.block_idx = 0;
-        payload->local_context.block_num = 1;
-        // Every prepared payload on a lane names that lane's registration scratch.
-        const uint64_t first_record = slot / PERCOUNTER_PAYLOAD_SLOT_COUNT;
-        payload->global_context.async_present = 1;
-        payload->global_context.async_image_address = device_base;
-        payload->global_context.async_image_bytes = layout.total_size;
-        payload->global_context.async_run_epoch = async_run_epoch;
-        payload->global_context.async_group_offset =
-            layout.async_groups_offset + first_record * sizeof(pto2::resident::AsyncGroupData);
-        payload->global_context.async_group_index = static_cast<uint32_t>(first_record);
-        payload->global_context.async_output_capture_refused = 0;
     }
 
     if (graph.section_bytes != 0) {

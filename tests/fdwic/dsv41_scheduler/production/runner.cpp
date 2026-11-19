@@ -9,6 +9,8 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <dlfcn.h>
+
 #include <algorithm>
 #include <chrono>
 #include <exception>
@@ -97,25 +99,53 @@ struct Buffer {
     std::vector<uint8_t> host;
 };
 
-void initialize(ChipWorker &worker, uint64_t address, size_t bytes, const std::vector<uint8_t> &value, bool repeat) {
+using DeviceMemset = int (*)(void *, size_t, int32_t, size_t);
+
+DeviceMemset find_device_memset(const fs::path &runtime) {
+    // ChipWorker owns the runtime and its dependencies for the lifetime of these transfers.
+    void *module = dlopen(runtime.c_str(), RTLD_NOLOAD | RTLD_NOW);
+    if (!module) throw std::runtime_error("Cannot inspect loaded runtime: " + runtime.string());
+    auto fill = reinterpret_cast<DeviceMemset>(dlsym(module, "aclrtMemset"));
+    dlclose(module);
+    return fill;
+}
+
+void initialize(
+    ChipWorker &worker, DeviceMemset fill, uint64_t address, size_t bytes, const std::vector<uint8_t> &value,
+    bool repeat
+) {
     if (value.empty() || (repeat ? bytes % value.size() != 0 : bytes != value.size())) {
         throw std::runtime_error("Initializer size does not match original tensor");
     }
-    std::vector<uint8_t> chunk(std::min(bytes, size_t{64} << 20));
-    if (repeat) {
-        if (value.size() == 1) {
-            std::fill(chunk.begin(), chunk.end(), value.front());
-        } else {
-            for (size_t i = 0; i < chunk.size(); ++i)
-                chunk[i] = value[i % value.size()];
-        }
+    constexpr size_t max_chunk = size_t{64} << 20;
+    if (!repeat) {
+        for (size_t offset = 0; offset < bytes; offset += max_chunk)
+            worker.copy_to(
+                address + offset, reinterpret_cast<uint64_t>(value.data() + offset), std::min(max_chunk, bytes - offset)
+            );
+        return;
+    }
+    if (bytes == 0) return;
+    if (fill && std::all_of(value.begin(), value.end(), [&](uint8_t b) {
+            return b == value.front();
+        })) {
+        const int rc = fill(reinterpret_cast<void *>(address), bytes, value.front(), bytes);
+        if (rc != 0) throw std::runtime_error("aclrtMemset failed with code " + std::to_string(rc));
+        return;
+    }
+    // A chunk ends on a pattern boundary so it can be reused for every transfer.
+    const size_t patterns = std::max(size_t{1}, std::min(bytes, max_chunk) / value.size());
+    std::vector<uint8_t> chunk(patterns * value.size());
+    std::copy(value.begin(), value.end(), chunk.begin());
+    for (size_t filled = value.size(); filled < chunk.size();) {
+        const size_t count = std::min(filled, chunk.size() - filled);
+        std::copy_n(chunk.data(), count, chunk.data() + filled);
+        filled += count;
     }
     for (size_t offset = 0; offset < bytes; offset += chunk.size()) {
-        const size_t count = std::min(chunk.size(), bytes - offset);
-        if (!repeat) {
-            std::copy_n(value.data() + offset, count, chunk.data());
-        }
-        worker.copy_to(address + offset, reinterpret_cast<uint64_t>(chunk.data()), count);
+        worker.copy_to(
+            address + offset, reinterpret_cast<uint64_t>(chunk.data()), std::min(chunk.size(), bytes - offset)
+        );
     }
 }
 
@@ -210,11 +240,10 @@ int run(int argc, char **argv) {
             if (!(manifest >> std::quoted(path))) throw std::runtime_error("Missing cached kernel path");
             const auto binary = read_binary(path);
             const auto capability = read_capability(manifest);
-            children.push_back(
-                make_callable<CORE_MAX_TENSOR_ARGS>(
-                    directions.data(), directions.size(), binary.data(), binary.size(), capability
-                )
+            auto child = make_callable<CORE_MAX_TENSOR_ARGS>(
+                directions.data(), directions.size(), binary.data(), binary.size(), capability
             );
+            children.push_back(std::move(child));
         }
         const auto orchestration = read_binary(argv[3]);
         const auto packed = make_chip_callable(
@@ -329,21 +358,26 @@ int run(int argc, char **argv) {
         config.runtime_env.ring_heap[i] = heaps[i];
         config.runtime_env.ring_dep_pool[i] = 131072;
     }
+    const auto host_runtime = libraries / runtime_name / "libhost_runtime.so";
     worker.init(
-        (libraries / runtime_name / "libhost_runtime.so").string(),
-        (libraries / runtime_name / "libaicpu_kernel.so").string(),
+        host_runtime.string(), (libraries / runtime_name / "libaicpu_kernel.so").string(),
         (libraries / runtime_name / "aicore_kernel.o").string(),
         (libraries / "../dispatcher/libsimpler_aicpu_dispatcher.so").string(), device, &config
     );
+    const auto fill = find_device_memset(host_runtime);
     uint64_t comm = 0, comm_context = 0, window = 0;
     if (window_bytes != 0) {
         comm = worker.comm_init(rank, ranks, argv[5]);
         comm_context = worker.comm_alloc_windows(comm, window_bytes);
         window = worker.comm_get_local_window_base(comm);
-        initialize(worker, window, window_bytes, {0}, true);
+        initialize(worker, fill, window, window_bytes, {0}, true);
     }
     auto callable = read_binary(bundle / "callable.bin");
     const int callable_id = worker.register_callable(callable.data(), callable.size());
+    const auto *registered = reinterpret_cast<const ChipCallable *>(callable.data());
+    auto writable = [&](size_t index) {
+        return registered->sig(index) == ArgDirection::OUT || registered->sig(index) == ArgDirection::INOUT;
+    };
     ChipStorageTaskArgs args{};
     std::vector<Buffer> buffers;
     const size_t tensor_count = read<size_t>(manifest);
@@ -369,7 +403,6 @@ int run(int argc, char **argv) {
             const bool repeat = read<std::string>(manifest) == "REPEAT";
             auto value = read_binary(bundle / read<std::string>(manifest));
             buffer.repeat = repeat;
-            buffer.initial = value;
             if (kind == "HOST") {
                 if (value.empty() || (repeat ? bytes % value.size() != 0 : bytes != value.size())) {
                     throw std::runtime_error("Host initializer size mismatch");
@@ -381,7 +414,8 @@ int run(int argc, char **argv) {
             } else if (kind == "DEVICE") {
                 buffer.owned = true;
                 buffer.address = worker.malloc(bytes);
-                initialize(worker, buffer.address, bytes, value, repeat);
+                initialize(worker, fill, buffer.address, bytes, value, repeat);
+                if (sliced && writable(i)) buffer.initial = std::move(value);
             } else {
                 throw std::runtime_error("Unknown tensor storage kind");
             }
@@ -411,17 +445,13 @@ int run(int argc, char **argv) {
         if (index >= buffers.size()) throw std::runtime_error("Invalid output index");
         checked.push_back(index);
     }
-    const auto *registered = reinterpret_cast<const ChipCallable *>(callable.data());
-    auto writable = [&](size_t index) {
-        return registered->sig(index) == ArgDirection::OUT || registered->sig(index) == ArgDirection::INOUT;
-    };
     auto reset_inputs = [&] {
         for (size_t i = 0; i < buffers.size(); ++i) {
             const auto &buffer = buffers[i];
             if (buffer.owned && writable(i))
-                initialize(worker, buffer.address, buffer.bytes, buffer.initial, buffer.repeat);
+                initialize(worker, fill, buffer.address, buffer.bytes, buffer.initial, buffer.repeat);
         }
-        if (window_bytes) initialize(worker, window, window_bytes, {0}, true);
+        if (window_bytes) initialize(worker, fill, window, window_bytes, {0}, true);
     };
     // Reference files contain raw bytes or one repeated byte; validation compares data directly.
     auto read_buffer = [&](const Buffer &buffer) {

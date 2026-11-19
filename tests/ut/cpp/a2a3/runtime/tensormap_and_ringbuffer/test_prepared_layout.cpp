@@ -115,6 +115,7 @@ protected:
         EXPECT_EQ(header->sched_stall_cnt_running.load(), 0);
         EXPECT_EQ(header->sched_stall_cnt_ready.load(), 0);
         EXPECT_EQ(header->sched_stall_cnt_waiting.load(), 0);
+        EXPECT_EQ(header->sched_stall_cnt_async_wait.load(), 0);
         EXPECT_EQ(header->sched_stall_orch_done.load(), 0);
         EXPECT_EQ(header->sched_stall_task_id.load(), TaskId::invalid());
         EXPECT_EQ(header->sched_stall_core.load(), -1);
@@ -178,20 +179,28 @@ protected:
 };
 
 TEST_F(PreparedRuntime, RestoresHeaderFromPreviousRun) {
-    check_header();
-    auto *h = rt->sm_handle->header;
-    h->orch_error_code.store(123);
-    h->sched_error_code.store(456);
-    h->sched_stall_completed.store(89);
-    h->orchestrator_done.store(1);
-    for (auto &ring : h->rings) {
-        ring.fc.current_task_index.store(67);
-        ring.fc.last_task_alive.store(41);
+    for (bool prepared : {false, true}) {
+        SCOPED_TRACE(prepared ? "prepared" : "generic");
+        check_header();
+        auto *h = rt->sm_handle->header;
+        h->orch_error_code.store(123);
+        h->sched_error_code.store(456);
+        h->sched_stall_completed.store(89);
+        h->sched_stall_cnt_async_wait.store(7);
+        h->orchestrator_done.store(1);
+        for (auto &ring : h->rings) {
+            ring.fc.current_task_index.store(67);
+            ring.fc.last_task_alive.store(41);
+        }
+        const bool ok =
+            prepared ?
+                rt->sm_handle->init_prepared(
+                    sm, layout.prepared.sm_bytes, key.task_window_sizes, key.heap_sizes, layout.prepared
+                ) :
+                rt->sm_handle->init_per_ring(sm, layout.prepared.sm_bytes, key.task_window_sizes, key.heap_sizes);
+        ASSERT_TRUE(ok);
+        check_header();
     }
-    ASSERT_TRUE(rt->sm_handle->init_prepared(
-        sm, layout.prepared.sm_bytes, key.task_window_sizes, key.heap_sizes, layout.prepared
-    ));
-    check_header();
 }
 
 TEST_F(PreparedRuntime, RejectsInvalidCapacityBeforeWritingHeader) {

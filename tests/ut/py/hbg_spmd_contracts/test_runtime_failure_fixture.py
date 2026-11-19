@@ -22,6 +22,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from simpler_setup.tools.hbg.native_causality import EXECUTABLE, MIX, SPMD, SYNC
+
 
 @pytest.fixture(scope="module")
 def native(request):
@@ -184,44 +186,102 @@ def test_resident_log_bind_failure_precedes_worker_creation(native, monkeypatch,
     assert events == ["compile", "bind"]
 
 
-def _capture():
+def _capture(mask=3, lane=0, blocks=2, *, clusters=1, sync_start=False, epoch=2):
+    # The host normalizes a single AIV1 kernel into the AIV0 task slot.
+    slot = 1 if mask == 4 else lane
+    effective_mask = 2 if mask == 4 else mask
+    kernels = [index if mask & (1 << index) else 65535 for index in range(3)]
+    if mask == 4:
+        kernels[1], kernels[2] = kernels[2], kernels[1]
+    active_lanes = bin(effective_mask).count("1")
+    flags = EXECUTABLE | (MIX if active_lanes > 1 else 0) | (SPMD if blocks > 1 else 0)
+    if sync_start:
+        flags |= SYNC
+    workers = []
+    for index in range(clusters):
+        peers = [index, clusters + 2 * index, clusters + 2 * index + 1]
+        workers.extend(
+            dict(
+                index=worker, worker_index=worker, cluster_index=index, cluster_workers=peers, finished=2, error_flags=0
+            )
+            for worker in peers
+        )
+    workers.sort(key=lambda worker: worker["index"])
+    cluster_index = clusters - 1
+    cluster = workers[cluster_index]["cluster_workers"]
+    group_seq = 1 if flags & MIX else 0
+    owners = []
+    if flags & (MIX | SYNC):
+        owners.append(
+            {
+                "owner": {
+                    "task_ref": 0,
+                    "block_idx": 0,
+                    "worker_index": cluster[1] if flags & MIX else cluster[slot],
+                    "cluster_index": cluster_index,
+                    "run_epoch": epoch,
+                    "group_seq": group_seq,
+                    "claim_before": [70, 1],
+                    "claim_after": [80, 2],
+                },
+            }
+        )
+    total = blocks * active_lanes
     return {
-        "metadata": {"clock_freq_hz": 1_000_000_000, "num_cores": 3},
+        "metadata": {"clock_freq_hz": 1_000_000_000, "num_cores": len(workers)},
         "aicore_protocol": {
             "schema": "hbg-native-protocol",
             "producer": "aicore",
             "scheduler_error": 10,
             "first_error": {"site": 95},
-            "worker_count": 3,
-            "active_worker_count": 3,
-            "cluster_count": 1,
-            "workers": [{"worker_index": worker, "finished": 2, "error_flags": 0} for worker in range(3)],
+            "run_epoch": epoch,
+            "worker_count": len(workers),
+            "active_worker_count": len(workers),
+            "cluster_count": clusters,
+            "workers": workers,
             "tasks": [
-                {"task_ref": 0, "active_mask": 3, "kernel_ids": [0, 1, 65535], "block_num": 2, "dependencies": []},
-                {"task_ref": 1, "active_mask": 2, "kernel_ids": [65535, 3, 65535], "block_num": 1, "dependencies": [0]},
+                dict(
+                    task_ref=0,
+                    flags=flags,
+                    active_mask=effective_mask,
+                    kernel_ids=kernels,
+                    block_num=blocks,
+                    dependencies=[],
+                ),
+                dict(
+                    task_ref=1,
+                    flags=EXECUTABLE,
+                    active_mask=2,
+                    kernel_ids=[65535, 3, 65535],
+                    block_num=1,
+                    dependencies=[0],
+                ),
             ],
+            "blocks": owners,
             "executions": [
                 {
                     "task_ref": 0,
                     "block_idx": 0,
-                    "subtask_slot": 0,
-                    "worker_index": 0,
-                    "entry": [100, 1],
-                    "returned": [2_500_000_100, 2],
-                    "visible": [2_500_000_101, 3],
+                    "subtask_slot": slot,
+                    "worker_index": cluster[slot],
+                    "cluster_index": cluster_index,
+                    "run_epoch": epoch,
+                    "group_seq": group_seq,
+                    "entry": [100, 3],
+                    "returned": [2_500_000_100, 4],
+                    "visible": [2_500_000_101, 5],
                 }
             ],
             "task_controls": [
                 {
                     "task_ref": 0,
                     "state": 0,
-                    "completed_subtasks": 3,
-                    "canonical_total": 4,
+                    "completed_subtasks": total - 1,
+                    "canonical_total": total,
                     "pending_compute": 1,
                     "completion_debt": 1,
-                    "next_block": 2,
-                    "claim_tickets": 0,
-                    "claim_seal": 0,
+                    "next_block": blocks,
+                    "claim_seal": blocks,
                 },
                 {
                     "task_ref": 1,
@@ -231,7 +291,6 @@ def _capture():
                     "pending_compute": 1,
                     "completion_debt": 1,
                     "next_block": 0,
-                    "claim_tickets": 0,
                     "claim_seal": 0,
                 },
             ],
@@ -250,7 +309,7 @@ def _capture():
                 "exit_signal_start_cycles": 2_000_000_101,
                 "exit_signal_end_cycles": 2_000_000_151,
                 "exit_wait_start_cycles": 2_000_000_201,
-                "exit_wait_end_cycles": 2_000_000_300,
+                "exit_wait_end_cycles": 2_500_000_200,
             },
         ],
     }
@@ -263,44 +322,12 @@ def test_both_real_timeout_writers_have_the_same_containment_requirements(native
     native._check_failed_capture(raw, 2, 3, 0)
 
 
-def _large_ticket_capture(mask, lane, blocks=257):
-    raw = _capture()
-    protocol = raw["aicore_protocol"]
-    slot = 1 if mask == 4 else lane
-    effective_mask = 2 if mask == 4 else mask
-    protocol["tasks"][0].update(
-        active_mask=effective_mask,
-        kernel_ids=[index if effective_mask & (1 << index) else 65535 for index in range(3)],
-        block_num=blocks,
-    )
-    protocol["executions"][0].update(subtask_slot=slot, worker_index=slot)
-    protocol["task_controls"][0].update(
-        next_block=blocks,
-        claim_tickets=0,
-        completed_subtasks=min(1, blocks - 1),
-        canonical_total=blocks * effective_mask.bit_count(),
-        pending_compute=blocks * effective_mask.bit_count() - min(1, blocks - 1),
-        completion_debt=blocks * effective_mask.bit_count() - min(1, blocks - 1),
-    )
-    # Either lifecycle partition may own the delayed lane.
-    for record in raw["aicpu_lifecycle_records"]:
-        record["exit_wait_end_cycles"] = 2_500_000_200
-    return raw
-
-
 @pytest.mark.parametrize("mask,lane", ((1, 0), (2, 1), (4, 2), (6, 1), (7, 0), (7, 1), (7, 2)))
 @pytest.mark.parametrize("blocks", (1, 2, 3))
-def test_small_fault_capture_requires_the_current_claim_policy(native, mask, lane, blocks):
-    raw = _large_ticket_capture(mask, lane, blocks)
-    protocol = raw["aicore_protocol"]
-    protocol.update(schema="hbg-native-protocol", cluster_count=2, worker_count=6, active_worker_count=6)
-    raw["metadata"]["num_cores"] = 6
-    protocol["workers"] = [{"worker_index": worker, "finished": 2, "error_flags": 0} for worker in range(6)]
-    for control in protocol["task_controls"]:
-        control["claim_seal"] = 0
-    protocol["task_controls"][0]["claim_tickets"] = 0
+def test_small_fault_capture_checks_sealed_supply(native, mask, lane, blocks):
+    raw = _capture(mask, lane, blocks, clusters=2)
     native._check_failed_capture(raw, blocks, mask, lane)
-    protocol["task_controls"][0]["claim_tickets"] = blocks
+    raw["aicore_protocol"]["task_controls"][0]["next_block"] = blocks - 1
     with pytest.raises(AssertionError):
         native._check_failed_capture(raw, blocks, mask, lane)
 
@@ -332,51 +359,151 @@ def test_two_wave_fault_cannot_silently_run_with_a_different_topology(native, ma
 
 
 @pytest.mark.parametrize("mask,lane", ((1, 0), (2, 1), (4, 2), (6, 1), (7, 0), (7, 1), (7, 2)))
-def test_fault_capture_keeps_current_two_wave_claim_policy(native, mask, lane):
-    positions = 2 if mask in (2, 4) else 1
-    blocks = positions * 2
-    raw = _large_ticket_capture(mask, lane, blocks)
-    protocol = raw["aicore_protocol"]
-    protocol["schema"] = "hbg-native-protocol"
-    for control in protocol["task_controls"]:
-        control["claim_seal"] = 0
-    protocol["task_controls"][0]["claim_tickets"] = 0
+def test_two_wave_capture_allows_pending_supply(native, mask, lane):
+    blocks = 4 if mask in (2, 4) else 2
+    raw = _capture(mask, lane, blocks)
+    control = raw["aicore_protocol"]["task_controls"][0]
+    control.update(next_block=blocks - 1, claim_seal=0)
     native._check_failed_capture(raw, blocks, mask, lane)
-    protocol["task_controls"][0]["claim_tickets"] = blocks
+    control["next_block"] = blocks + 1
     with pytest.raises(AssertionError):
         native._check_failed_capture(raw, blocks, mask, lane)
 
 
 @pytest.mark.parametrize("mask,lane", ((1, 0), (2, 1), (4, 2), (6, 1), (7, 0), (7, 1), (7, 2)))
-def test_large_failure_accepts_distributed_claims_without_sync_tickets(native, mask, lane):
-    raw = _large_ticket_capture(mask, lane)
-    native._check_failed_capture(raw, 257, mask, lane)
+def test_large_capture_accepts_bounded_supply(native, mask, lane):
+    native._check_failed_capture(_capture(mask, lane, 257), 257, mask, lane)
 
 
 @pytest.mark.parametrize("mask,lane", ((1, 0), (2, 1), (4, 2), (6, 1), (7, 0)))
-@pytest.mark.parametrize(
-    "corruption",
-    ("old_schema", "unexpected_ticket", "unbounded_tail", "claim_past_n", "forged_ticket", "consumer_ticket"),
-)
-def test_large_ticket_failure_rejects_inconsistent_claim_accounting(native, mask, lane, corruption):
-    raw = _large_ticket_capture(mask, lane)
+@pytest.mark.parametrize("corruption", ("schema", "negative_supply", "past_end", "partial_seal", "consumer_past_end"))
+def test_large_capture_rejects_inconsistent_supply(native, mask, lane, corruption):
+    raw = _capture(mask, lane, 257)
     protocol = raw["aicore_protocol"]
     root, consumer = protocol["task_controls"]
-    if corruption == "old_schema":
+    if corruption == "schema":
         protocol["schema"] = "wrong-protocol"
-    elif corruption == "unexpected_ticket":
-        root["claim_tickets"] = 1
-    elif corruption == "unbounded_tail":
-        positions = protocol["cluster_count"] * (2 if mask in (2, 4) else 1)
-        root["claim_tickets"] = 257 + positions + 1
-    elif corruption == "claim_past_n":
-        root.update(next_block=258, claim_tickets=258)
-    elif corruption == "forged_ticket":
-        root["claim_tickets"] = 256
+    elif corruption == "negative_supply":
+        root.update(claim_seal=0, next_block=-1)
+    elif corruption == "past_end":
+        root.update(claim_seal=0, next_block=258)
+    elif corruption == "partial_seal":
+        root.update(claim_seal=256, next_block=256)
     else:
-        consumer["claim_tickets"] = 1
+        consumer["next_block"] = 2
     with pytest.raises(AssertionError):
         native._check_failed_capture(raw, 257, mask, lane)
+
+
+@pytest.mark.parametrize("mask,lane,sync", ((2, 1, True), (3, 0, False), (6, 2, False), (7, 1, True)))
+@pytest.mark.parametrize(
+    "damage", ("missing", "unfinished", "duplicate", "past_end", "wrong_worker", "cluster", "epoch", "sequence")
+)
+def test_stalled_cooperative_block_requires_its_own_acquisition(native, mask, lane, sync, damage):
+    raw = _capture(mask, lane, clusters=2, sync_start=sync)
+    protocol = raw["aicore_protocol"]
+    native._check_failed_capture(raw, 2, mask, lane)
+    rows = protocol["blocks"]
+    owner = rows[0]["owner"]
+    if damage == "missing":
+        rows.clear()
+    elif damage == "unfinished":
+        owner["claim_after"] = [0, 0]
+    elif damage == "duplicate":
+        rows.append(copy.deepcopy(rows[0]))
+    elif damage == "past_end":
+        rows.append({"owner": {**owner, "block_idx": 2}})
+    elif damage == "wrong_worker":
+        owner["worker_index"] = 0
+    elif damage == "cluster":
+        owner["cluster_index"] = 0
+    elif damage == "epoch":
+        owner["run_epoch"] -= 1
+    else:
+        owner["claim_before"] = owner["claim_after"]
+    with pytest.raises(AssertionError):
+        native._check_failed_capture(raw, 2, mask, lane)
+
+
+@pytest.mark.parametrize(
+    "claim_generation,execution_generation,valid", ((1, 1, True), (3, 3, True), (2, 2, False), (3, 1, False))
+)
+def test_mix_timeout_requires_same_armed_generation(native, claim_generation, execution_generation, valid):
+    raw = _capture()
+    protocol = raw["aicore_protocol"]
+    protocol["blocks"][0]["owner"]["group_seq"] = claim_generation
+    protocol["executions"][0]["group_seq"] = execution_generation
+    if valid:
+        native._check_failed_capture(raw, 2, 3, 0)
+    else:
+        with pytest.raises(AssertionError):
+            native._check_failed_capture(raw, 2, 3, 0)
+
+
+def test_mix_claim_precedes_stalled_kernel_entry_across_workers(native):
+    raw = _capture()
+    protocol = raw["aicore_protocol"]
+    owner = protocol["blocks"][0]["owner"]
+    execution = protocol["executions"][0]
+    assert owner["worker_index"] != execution["worker_index"]
+    owner["claim_after"][1] = execution["entry"][1] + 10  # Worker-local sequence numbers are independent.
+    native._check_failed_capture(raw, 2, 3, 0)
+    owner["claim_after"][0] = execution["entry"][0] + 1
+    with pytest.raises(AssertionError):
+        native._check_failed_capture(raw, 2, 3, 0)
+
+
+def test_pure_sync_claim_precedes_stalled_kernel_entry(native):
+    pure = _capture(1, 0, clusters=2, sync_start=True)
+    protocol = pure["aicore_protocol"]
+    protocol["blocks"][0]["owner"]["claim_after"] = protocol["executions"][0]["entry"]
+    with pytest.raises(AssertionError):
+        native._check_failed_capture(pure, 2, 1, 0)
+
+
+def test_interrupted_acquisition_does_not_count_as_a_second_owner(native):
+    raw = _capture()
+    rows = raw["aicore_protocol"]["blocks"]
+    rows.extend([{"owner": None}, {"owner": {**rows[0]["owner"], "block_idx": 1, "claim_after": [0, 0]}}])
+    native._check_failed_capture(raw, 2, 3, 0)
+
+
+def test_ordinary_block_has_no_cooperative_owner_record(native):
+    raw = _capture(2, 1)
+    raw["aicore_protocol"]["blocks"] = _capture()["aicore_protocol"]["blocks"]
+    with pytest.raises(AssertionError):
+        native._check_failed_capture(raw, 2, 2, 1)
+
+
+@pytest.mark.parametrize("damage", ("enter_pending", "exit_done", "extra_resolved", "missing_exit"))
+def test_native_graph_fault_keeps_only_enter_resolved(native, damage):
+    raw = _capture(7, 2)
+    protocol = raw["aicore_protocol"]
+    root, consumer = protocol["tasks"]
+    root.update(task_ref=1, dependencies=[0])
+    consumer.update(task_ref=2, dependencies=[1])
+    protocol["executions"][0]["task_ref"] = protocol["blocks"][0]["owner"]["task_ref"] = 1
+    root_control, consumer_control = protocol["task_controls"]
+    root_control["task_ref"] = 1
+    # A dependent kernel can acquire supply while its dependency still prevents entry.
+    consumer_control.update(task_ref=2, next_block=1, claim_seal=1)
+    for ref, state, deps in ((0, 2, []), (3, 0, [2])):
+        task = dict(task_ref=ref, active_mask=0, flags=0, kernel_ids=[65535] * 3, block_num=1, dependencies=deps)
+        protocol["tasks"].insert(ref, task)
+        protocol["task_controls"].insert(ref, dict(task_ref=ref, state=state, claim_seal=0, next_block=0))
+    protocol["node_map"] = [dict(node_ref=ref, kind=kind) for ref, kind in enumerate((3, 1, 1, 4))]
+    protocol["resolved_task_count"] = 1
+    native._check_failed_capture(raw, 2, 7, 2)
+    if damage == "enter_pending":
+        protocol["task_controls"][0]["state"] = 0
+    elif damage == "exit_done":
+        protocol["task_controls"][3]["state"] = 2
+    elif damage == "extra_resolved":
+        protocol["resolved_task_count"] = 2
+    else:
+        protocol["node_map"].pop()
+    with pytest.raises(AssertionError):
+        native._check_failed_capture(raw, 2, 7, 2)
 
 
 def test_failed_capture_requires_explicit_cluster_topology(native):
@@ -384,6 +511,22 @@ def test_failed_capture_requires_explicit_cluster_topology(native):
     del raw["aicore_protocol"]["cluster_count"]
     with pytest.raises(KeyError, match="cluster_count"):
         native._check_failed_capture(raw, 2, 3, 0)
+
+
+@pytest.mark.parametrize("damage", ("cluster_count", "split_peers", "wrong_cluster"))
+def test_stalled_worker_requires_its_configured_cluster(native, damage):
+    raw = _capture(7, 0, clusters=2)
+    protocol = raw["aicore_protocol"]
+    worker = protocol["workers"][protocol["executions"][0]["worker_index"]]
+    if damage == "cluster_count":
+        protocol["cluster_count"] = 1
+    elif damage == "split_peers":
+        peer = worker["cluster_workers"][1]
+        protocol["workers"][peer]["cluster_workers"] = protocol["workers"][0]["cluster_workers"]
+    else:
+        protocol["executions"][0]["cluster_index"] = 0
+    with pytest.raises(AssertionError):
+        native._check_failed_capture(raw, 2, 7, 0)
 
 
 def test_nonreturning_probe_is_hardware_only_and_covers_each_executing_lane(native):
@@ -563,7 +706,7 @@ def _corrupt_shutdown(raw, corruption):
         protocol["task_controls"][0]["state"] = 2
     elif corruption == "completed_subtasks":
         task = protocol["tasks"][0]
-        protocol["task_controls"][0]["completed_subtasks"] = task["block_num"] * task["active_mask"].bit_count()
+        protocol["task_controls"][0]["completed_subtasks"] = task["block_num"] * bin(task["active_mask"]).count("1")
     elif corruption == "duplicate_control":
         protocol["task_controls"].append(copy.deepcopy(protocol["task_controls"][0]))
     elif corruption == "missing_control":
@@ -856,12 +999,8 @@ def _check_fault_buffer_policy(
         if validate_records:
             if owner.poisoned and damage == "missing":
                 raise FileNotFoundError("controlled missing owned capture")
-            raw = _large_ticket_capture(7, 0, 1)
+            raw = _capture(7, 0, 1, epoch=owner.scheduler_mode_publish_count)
             protocol = raw["aicore_protocol"]
-            protocol.update(schema="hbg-native-protocol", run_epoch=owner.scheduler_mode_publish_count)
-            for control in protocol["task_controls"]:
-                control["claim_tickets"] = 0
-                control["claim_seal"] = 0
             if not owner.poisoned or damage == "scheduler":
                 protocol["scheduler_error"] = 0
             if owner.poisoned:
@@ -1245,11 +1384,8 @@ def test_owned_proof_partial_free_does_not_retry_a_confirmed_free(native, monkey
 @pytest.mark.parametrize("task", (0, 1))
 @pytest.mark.parametrize("value", (None, False, True, -1, 1 << 32, (1 << 64) - 1))
 def test_current_kernel_timeout_does_not_hide_invalid_claim_seal(native, task, value):
-    raw = _large_ticket_capture(7, 0)
+    raw = _capture(7, 0, 257)
     protocol = raw["aicore_protocol"]
-    protocol["schema"] = "hbg-native-protocol"
-    for control in protocol["task_controls"]:
-        control.update(claim_seal=0)
     native._check_failed_capture(raw, 257, 7, 0)
     if value is None:
         del protocol["task_controls"][task]["claim_seal"]
@@ -1262,8 +1398,5 @@ def test_current_kernel_timeout_does_not_hide_invalid_claim_seal(native, task, v
 def test_current_nonreturning_capture_keeps_missing_returns(native):
     raw = _nonreturning_capture()
     protocol = raw["aicore_protocol"]
-    protocol.update(schema="hbg-native-protocol")
-    protocol["task_controls"][0]["claim_tickets"] = 0
-    for control in protocol["task_controls"]:
-        control.update(claim_seal=0)
+    protocol["task_controls"][0]["claim_seal"] = 0
     native._check_failed_capture(raw, 2, 3, 0, nonreturning=True)

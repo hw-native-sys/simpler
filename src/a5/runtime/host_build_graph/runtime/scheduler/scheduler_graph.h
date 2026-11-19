@@ -70,8 +70,9 @@ struct SchedulerMinimumWorkerDemand {
 
 inline constexpr SchedulerMinimumWorkerDemand scheduler_minimum_worker_demand(LaneMask active_mask) {
     const uint32_t vectors = (active_mask.has_aiv0() ? 1U : 0U) + (active_mask.has_aiv1() ? 1U : 0U);
-    // Ordinary blocks can execute in waves. A dual-AIV Mix still needs an AIC coordinator.
-    return {(active_mask.has_aic() || vectors > 1) ? 1U : 0U, vectors};
+    // Every resident cluster has an AIV0 publisher, including groups whose
+    // computation uses only AIC and AIV1. Count actual computing lanes here.
+    return {active_mask.has_aic() ? 1U : 0U, vectors};
 }
 
 inline constexpr bool scheduler_resident_worker_demand_checked(
@@ -82,13 +83,12 @@ inline constexpr bool scheduler_resident_worker_demand_checked(
         !scheduler_resident_task_shape_supported(static_cast<uint32_t>(active_mask.count()), blocks, sync_start))
         return false;
     auto required = scheduler_minimum_worker_demand(active_mask);
-    if (sync_start) {
-        const bool mix = active_mask.is_mix();
-        const bool aic_only = active_mask.is_aic();
-        required.aic = (mix || aic_only) ? blocks : 0;
-        required.aiv = mix ? blocks * required.aiv : (aic_only ? 0 : blocks);
-    }
     const uint64_t clusters = workers / PLATFORM_CORES_PER_BLOCKDIM;
+    if (sync_start) {
+        if (active_mask.is_mix() && blocks > clusters) return false;
+        required.aic *= blocks;
+        required.aiv *= blocks;
+    }
     if (required.aic > clusters || required.aiv > clusters * PLATFORM_AIV_CORES_PER_BLOCKDIM) return false;
     *demand = required;
     return true;

@@ -48,10 +48,6 @@ struct AicoreSchedulerLayout {
     SchedulerPreparedLayout prepared;
     uint64_t executable_subtask_count;
     SchedulerSpmdRequirements spmd;
-    uint64_t admission_control_offset;
-    uint64_t admission_records_offset;
-    uint64_t admission_log_offset;
-    uint64_t group_mailboxes_offset;
     uint64_t protocol_layout_offset;
     SchedulerProtocolLayout protocol;
 };

@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "scheduler_memory.h"
+#include "scheduler_task_catalog.h"
 
 #if defined(__CPU_SIM)
 #include "aicpu/device_time.h"
@@ -57,7 +57,11 @@ static inline __aicore__ bool scheduler_protocol_bind(__gm__ void *base, const L
         layout->task_count > static_cast<uint64_t>(INT32_MAX) || layout->worker_count == 0 ||
         layout->worker_count > SCHEDULER_WORKER_CAPACITY ||
         layout->worker_count != local->config.runtime_worker_count || local->worker_id() >= layout->worker_count ||
-        layout->cooperative_task_count != summary->cooperative_task_count ||
+        summary->sync_mix_task_count > summary->mix_task_count ||
+        layout->cooperative_task_count !=
+            summary->cooperative_task_count + (summary->mix_task_count - summary->sync_mix_task_count) ||
+        layout->floor_count !=
+            (summary->mix_task_count != 0 ? (summary->mix_task_count + 1) * summary->cluster_count : 0) ||
         layout->cooperative_task_count > layout->task_count ||
         layout->member_count != layout->cooperative_task_count * layout->worker_count ||
         layout->storage_end_offset > UINT64_MAX - reinterpret_cast<uintptr_t>(base))
@@ -69,6 +73,9 @@ static inline __aicore__ bool scheduler_protocol_bind(__gm__ void *base, const L
         ) ||
         !scheduler_protocol_check_region(
             layout->members_offset, layout->member_count, sizeof(SchedulerProtocolMemberTrace), limit, &end
+        ) ||
+        !scheduler_protocol_check_region(
+            layout->floors_offset, layout->floor_count, sizeof(SchedulerProtocolFloorTrace), limit, &end
         ) ||
         !scheduler_protocol_check_region(
             layout->blocks_offset, layout->trace_count, sizeof(SchedulerProtocolBlockTrace), limit, &end
@@ -94,6 +101,7 @@ static inline __aicore__ bool scheduler_protocol_bind(__gm__ void *base, const L
     if (worker->run_epoch != layout->run_epoch || worker->worker_index != local->worker_id() ||
         worker->next_sequence != 0 || worker->error_flags != 0 || worker->finished != 0)
         return false;
+    local->profiling->published_mix_count = 0;
     local->profiling->protocol_layout_offset = offset;
     return true;
 }
@@ -179,18 +187,17 @@ static inline __aicore__ void scheduler_protocol_observe_record(__gm__ T *record
 
 template <typename Local>
 static inline __aicore__ void scheduler_protocol_task_actor(
-    __gm__ void *base, const Local *local, int64_t task, uint64_t order, uint32_t flags, bool completion, bool before,
-    uint64_t cycles = UINT64_MAX
+    __gm__ void *base, const Local *local, int64_t task, uint32_t flags, bool before, uint64_t cycles = UINT64_MAX
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
-    if (task < 0 || static_cast<uint64_t>(task) >= layout->task_count ||
-        (order >= layout->cooperative_task_count && !(completion && order == UINT64_MAX))) {
+    if (task < 0 || static_cast<uint64_t>(task) >= layout->task_count || local->config.task_catalog_offset == 0) {
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
         return;
     }
-    auto *record = &scheduler_state_at<SchedulerProtocolTaskTrace>(base, layout->tasks_offset)[task];
-    auto *actor = completion ? &record->completion : &record->admission;
+    const auto &catalog = *scheduler_state_at<SchedulerTaskCatalogHeader>(base, local->config.task_catalog_offset);
+    const uint32_t order = scheduler_task_catalog_order(base, catalog, static_cast<uint32_t>(task)).rank;
+    auto *actor = &scheduler_state_at<SchedulerProtocolTaskTrace>(base, layout->tasks_offset)[task].completion;
     if (before) {
         scheduler_observe_cache_line(actor);
         if (!(cycles == UINT64_MAX ? scheduler_protocol_stamp(base, local, layout, &actor->before) :
@@ -244,7 +251,7 @@ static inline __aicore__ void scheduler_protocol_payload_publication(
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
-    if (slot_index >= SCHEDULER_PENDING_SLOT_COUNT) {
+    if (slot_index >= SCHEDULER_LOCAL_EXECUTION_COUNT) {
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
         return;
     }
@@ -252,20 +259,13 @@ static inline __aicore__ void scheduler_protocol_payload_publication(
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_AFTER_FINISH);
         return;
     }
-    const auto &slot = local->slots[slot_index];
+    const auto &slot = local->execution_at(slot_index);
     auto *record =
         scheduler_protocol_execution_at(base, local, layout, slot.task_ref, slot.block_idx, slot.subtask_slot);
     if (record == nullptr) return;
     if (before) {
         scheduler_protocol_observe_record(record);
-        if ((local->local_ready_mask & (1U << slot_index)) != 0 || record->permit.sequence != 0 ||
-            record->entry.sequence != 0 ||
-            (record->publication_count != 0 &&
-             (scheduler_slot_uses_admission(local, slot) || slot.cluster_mix ||
-              (record->flags & SCHEDULER_PROTOCOL_PAYLOAD_PUBLISHED) == 0 ||
-              record->worker_index != local->worker_id() || record->run_epoch != layout->run_epoch ||
-              record->task_ref != slot.task_ref || record->block_idx != slot.block_idx ||
-              record->subtask_slot != slot.subtask_slot))) {
+        if (record->permit.sequence != 0 || record->entry.sequence != 0 || record->publication_count != 0) {
             scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_DUPLICATE);
             return;
         }
@@ -281,12 +281,12 @@ static inline __aicore__ void scheduler_protocol_payload_publication(
         record->task_ref = slot.task_ref;
         record->block_idx = slot.block_idx;
         record->worker_index = static_cast<uint32_t>(local->worker_id());
-        record->pending_slot = static_cast<uint16_t>(slot_index);
+        record->pending_slot = scheduler_trace_source_index(slot_index);
         record->subtask_slot = slot.subtask_slot;
         record->ready_source = static_cast<uint32_t>(ready.source);
     } else {
         if (record->publication_count == 0 || record->worker_index != local->worker_id() ||
-            record->task_ref != slot.task_ref || record->pending_slot != slot_index ||
+            record->task_ref != slot.task_ref || record->pending_slot != scheduler_trace_source_index(slot_index) ||
             record->subtask_slot != slot.subtask_slot || record->block_idx != slot.block_idx ||
             record->run_epoch != layout->run_epoch) {
             scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
@@ -303,13 +303,6 @@ static inline __aicore__ void scheduler_protocol_payload_publication(
 }
 
 template <typename Local>
-static inline __aicore__ void scheduler_protocol_admission(
-    __gm__ void *base, const Local *local, int64_t task, uint64_t order, uint32_t flags, bool before
-) {
-    scheduler_protocol_task_actor(base, local, task, order, flags, false, before);
-}
-
-template <typename Local>
 static inline __aicore__ void
 scheduler_protocol_task_done(__gm__ void *base, const Local *local, int64_t task, bool before, bool deferred = false) {
     auto *layout = scheduler_protocol_layout_at(base, local);
@@ -318,99 +311,101 @@ scheduler_protocol_task_done(__gm__ void *base, const Local *local, int64_t task
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
         return;
     }
-    const auto *source = scheduler_state_at<SchedulerTaskMetadata>(base, local->config.task_metadata_offset) + task;
-    const uint8_t task_flags = source->flags;
-    uint64_t order = UINT64_MAX;
-    if (scheduler_task_requires_admission(task_flags)) {
-        if (deferred) {
-            // FINISH may run on a different core after the execution cohort
-            // closed. The admission publication retains the original order.
-            auto *admission =
-                &scheduler_state_at<SchedulerProtocolTaskTrace>(base, layout->tasks_offset)[task].admission;
-            scheduler_protocol_observe_record(admission);
-            if (admission->task_ref != task || admission->run_epoch != layout->run_epoch ||
-                admission->after.sequence == 0 || admission->order_key >= layout->cooperative_task_count) {
-                scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
-                return;
-            }
-            order = admission->order_key;
-        } else {
-            const auto *admission = local->admission;
-            if (admission == nullptr || admission->current_task_ref != task || admission->epoch != layout->run_epoch) {
-                scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
-                return;
-            }
-            order = admission->scan_cursor;
-        }
-    }
-    const uint32_t flags = task_flags | (deferred ? SCHEDULER_PROTOCOL_DEFERRED_FINISH : 0);
-    scheduler_protocol_task_actor(base, local, task, order, flags, true, before);
+    const auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(base, local->config.task_metadata_offset);
+    const uint32_t flags = metadata[task].flags | (deferred ? SCHEDULER_PROTOCOL_DEFERRED_FINISH : 0);
+    scheduler_protocol_task_actor(base, local, task, flags, before);
 }
 
-template <typename Local, typename Admission>
-static inline __aicore__ __gm__ SchedulerProtocolMemberTrace *scheduler_protocol_member_at(
-    __gm__ void *base, const Local *local, __gm__ const SchedulerProtocolLayout *layout, const Admission *admission
-) {
-    if (admission == nullptr || admission->epoch != layout->run_epoch ||
-        admission->scan_cursor >= layout->cooperative_task_count || admission->current_task_ref < 0 ||
-        static_cast<uint64_t>(admission->current_task_ref) >= layout->task_count) {
-        scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
-        return nullptr;
-    }
-    return scheduler_state_at<SchedulerProtocolMemberTrace>(base, layout->members_offset) +
-           admission->scan_cursor * layout->worker_count + local->worker_id();
-}
-
-template <typename Local, typename Admission>
+template <typename Local>
 static inline __aicore__ void
-scheduler_protocol_member_observed(__gm__ void *base, const Local *local, const Admission *admission, uint64_t tail) {
+scheduler_protocol_member(__gm__ void *base, const Local *local, int64_t task, bool retire) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
-    auto *member = scheduler_protocol_member_at(base, local, layout, admission);
-    if (member == nullptr) return;
-    scheduler_observe_cache_line(member);
-    scheduler_observe_cache_line(&member->closed_cursor);
-    if (!scheduler_protocol_stamp(base, local, layout, &member->observed)) return;
-    member->run_epoch = admission->epoch;
-    member->task_ref = admission->current_task_ref;
-    member->order_key = admission->scan_cursor;
-    member->worker_index = static_cast<uint32_t>(local->worker_id());
-    member->flags = admission->current_flags;
-    member->observed_tail = tail;
-    scheduler_writeback_cache_line(member);
-    scheduler_publish_cache_line(&member->closed_cursor);
-}
-
-template <typename Local, typename Admission>
-static inline __aicore__ void scheduler_protocol_member_closed(
-    __gm__ void *base, const Local *local, const Admission *admission, uint64_t cursor, uint64_t close_frontier,
-    uint64_t last_group_seq, bool used_claim_seal = false, bool from_claim = false
-) {
-    auto *layout = scheduler_protocol_layout_at(base, local);
-    if (layout == nullptr) return;
-    auto *member = scheduler_protocol_member_at(base, local, layout, admission);
-    if (member == nullptr) return;
-    if (member->observed.sequence == 0 || member->run_epoch != admission->epoch ||
-        member->task_ref != admission->current_task_ref || member->order_key != admission->scan_cursor ||
-        member->worker_index != local->worker_id()) {
+    if (task < 0 || static_cast<uint64_t>(task) >= layout->task_count || local->config.task_catalog_offset == 0) {
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
         return;
     }
-    if (!scheduler_protocol_stamp(base, local, layout, &member->closed)) return;
-    member->closed_cursor = cursor;
-    if (from_claim) member->flags |= SCHEDULER_PROTOCOL_MEMBER_FROM_CLAIM;
-    member->close_frontier = close_frontier;
-    member->last_group_seq = last_group_seq;
-    member->claim_seal_seen = used_claim_seal ? cursor : 0;
-    member->claim_cursor_seen = used_claim_seal ? cursor : 0;
-    member->pending_mask = 0;
-    for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
-        const auto &slot = local->slots[index];
-        if (slot.task_ref == admission->current_task_ref && slot.state != SchedulerDispatchSlotState::FREE)
-            member->pending_mask |= UINT64_C(1) << index;
+    const auto &catalog = *scheduler_state_at<SchedulerTaskCatalogHeader>(base, local->config.task_catalog_offset);
+    const auto &order = scheduler_task_catalog_order(base, catalog, static_cast<uint32_t>(task));
+    const uint32_t worker = static_cast<uint32_t>(local->worker_id());
+    if (order.cooperative_index >= layout->cooperative_task_count || worker >= layout->worker_count) {
+        scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
+        return;
     }
-    scheduler_writeback_cache_line(member);
-    scheduler_publish_cache_line(&member->closed_cursor);
+    const uint64_t index = static_cast<uint64_t>(order.cooperative_index) * layout->worker_count + worker;
+    auto *record = scheduler_state_at<SchedulerProtocolMemberTrace>(base, layout->members_offset) + index;
+    scheduler_observe_cache_line(record);
+    if (retire && (record->committed.sequence == 0 || record->run_epoch != layout->run_epoch ||
+                   record->task_ref != task || record->worker_index != worker || record->order_key != order.rank)) {
+        scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
+        return;
+    }
+    if (!scheduler_protocol_stamp(base, local, layout, retire ? &record->retired : &record->committed)) return;
+    record->run_epoch = layout->run_epoch;
+    record->task_ref = task;
+    record->order_key = order.rank;
+    record->worker_index = worker;
+    if (!retire) {
+        const uint32_t required = order.required_floor[local->config.self_lane];
+        const auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(base, local->config.task_metadata_offset);
+        const bool mix = scheduler_task_is_mix(metadata[task].flags);
+        record->observed_mix_floor = required != 0 && !mix ? local->observed_mix_floor : 0;
+        record->observed_self_floor = required != 0 && mix ? local->observed_self_floor : 0;
+    }
+    scheduler_publish_cache_line(record);
+}
+
+// A cluster has at most one publication for each excluded MIX; slot zero
+// of the per-cluster columns records the initial lower bound.
+template <typename Local>
+static inline __aicore__ void scheduler_protocol_mix_floor(
+    __gm__ void *base, const Local *local, uint32_t cluster, uint32_t prior_mix_ref, uint32_t floor, bool before
+) {
+    auto *layout = scheduler_protocol_layout_at(base, local);
+    if (layout == nullptr) return;
+    if (local->config.self_lane != 1 || cluster >= local->config.cluster_count ||
+        local->config.task_catalog_offset == 0 || local->config.shared_context == nullptr ||
+        local->config.shared_context->cluster_index != cluster || floor > layout->task_count ||
+        (prior_mix_ref != UINT32_MAX && prior_mix_ref >= layout->task_count)) {
+        scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
+        return;
+    }
+    const auto &catalog = *scheduler_state_at<SchedulerTaskCatalogHeader>(base, local->config.task_catalog_offset);
+    uint64_t row = 0;
+    uint32_t next = catalog.first_mix_ref;
+    if (prior_mix_ref != UINT32_MAX) {
+        const auto &prior = scheduler_task_catalog_order(base, catalog, prior_mix_ref);
+        if (prior.cooperative_index >= layout->cooperative_task_count || prior.rank >= floor) {
+            scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
+            return;
+        }
+        // Each coordinator excludes MIX tasks in catalog rank order. Pure sync
+        // tasks have member records but occupy no rows in this table.
+        row = static_cast<uint64_t>(local->profiling->published_mix_count) + 1;
+        next = prior.next_mix_ref;
+    }
+    const uint64_t index = row * local->config.cluster_count + cluster;
+    if (index >= layout->floor_count || (next != UINT32_MAX && next >= layout->task_count) ||
+        floor != (next == UINT32_MAX ? layout->task_count : scheduler_task_catalog_order(base, catalog, next).rank)) {
+        scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
+        return;
+    }
+    auto *record = scheduler_state_at<SchedulerProtocolFloorTrace>(base, layout->floors_offset) + index;
+    scheduler_observe_cache_line(record);
+    if (!before && (record->before.sequence == 0 || record->run_epoch != layout->run_epoch || record->floor != floor ||
+                    record->prior_mix_ref != prior_mix_ref || record->cluster_index != cluster ||
+                    record->worker_index != local->worker_id())) {
+        scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
+        return;
+    }
+    if (!scheduler_protocol_stamp(base, local, layout, before ? &record->before : &record->after)) return;
+    record->run_epoch = layout->run_epoch;
+    record->cluster_index = cluster;
+    record->worker_index = static_cast<uint32_t>(local->worker_id());
+    record->prior_mix_ref = prior_mix_ref;
+    record->floor = floor;
+    scheduler_publish_cache_line(record);
+    if (!before && prior_mix_ref != UINT32_MAX) ++local->profiling->published_mix_count;
 }
 
 template <typename Local>

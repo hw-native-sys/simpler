@@ -152,15 +152,16 @@ struct alignas(CHIP_ALIGN_SIZE) SharedMemoryHeader {
     // distinguish device error TYPES (SIMPLER_STALL_DETAIL_*) without reading the
     // device log. The full stall snapshot stays in the device log / plog — only
     // this one class + a few locator ints cross the boundary.
-    std::atomic<int32_t> sched_stall_detail;       // SIMPLER_STALL_DETAIL_* (NONE when no timeout)
-    std::atomic<int32_t> sched_stall_completed;    // completed_tasks_ at timeout
-    std::atomic<int32_t> sched_stall_total;        // total_tasks_ at timeout
-    std::atomic<int32_t> sched_stall_cnt_running;  // tasks observed RUNNING (on a core)
-    std::atomic<int32_t> sched_stall_cnt_ready;    // tasks fanin-satisfied but not dispatched
-    std::atomic<int32_t> sched_stall_cnt_waiting;  // tasks still waiting on fanin
-    std::atomic<int32_t> sched_stall_orch_done;    // orchestrator_done flag at timeout (0/1)
-    std::atomic<TaskId> sched_stall_task_id;       // S1: stuck task_id (invalid() if N/A)
-    std::atomic<int32_t> sched_stall_core;         // S1: stuck core id (-1 if N/A)
+    std::atomic<int32_t> sched_stall_detail;          // SIMPLER_STALL_DETAIL_* (NONE when no timeout)
+    std::atomic<int32_t> sched_stall_completed;       // completed_tasks_ at timeout
+    std::atomic<int32_t> sched_stall_total;           // total_tasks_ at timeout
+    std::atomic<int32_t> sched_stall_cnt_running;     // tasks observed RUNNING (on a core)
+    std::atomic<int32_t> sched_stall_cnt_ready;       // tasks fanin-satisfied but not dispatched
+    std::atomic<int32_t> sched_stall_cnt_waiting;     // tasks still waiting on fanin
+    std::atomic<int32_t> sched_stall_orch_done;       // orchestrator_done flag at timeout (0/1)
+    std::atomic<TaskId> sched_stall_task_id;          // S1/S6: stuck task_id (invalid() if N/A)
+    std::atomic<int32_t> sched_stall_core;            // S1: stuck core id (-1 if N/A)
+    std::atomic<int32_t> sched_stall_cnt_async_wait;  // tasks whose FINs handed completion to the async consumer
 };
 
 static_assert(sizeof(SharedMemoryHeader) == 896, "SharedMemoryHeader layout drift");

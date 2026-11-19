@@ -30,12 +30,6 @@ requirements(uint64_t workers, uint64_t cooperative, uint64_t mix, uint64_t sync
     return {workers, workers / 3, cooperative, mix, sync_mix == UINT64_MAX ? mix : sync_mix};
 }
 
-SchedulerAdmissionRecord *record_at(void *base, const AicoreSchedulerLayout &layout, uint64_t task) {
-    return scheduler_state_at<SchedulerAdmissionRecord>(
-        base, layout.admission_records_offset + task * sizeof(SchedulerAdmissionRecord)
-    );
-}
-
 constexpr LaneMask kAicAiv0{/*aic=*/true, /*aiv0=*/true, /*aiv1=*/false};
 constexpr LaneMask kAicAiv1{/*aic=*/true, /*aiv0=*/false, /*aiv1=*/true};
 
@@ -56,10 +50,8 @@ void set_metadata(
 }
 
 void expect_no_protocol_storage(const AicoreSchedulerLayout &layout) {
-    EXPECT_EQ(layout.admission_control_offset, 0u);
-    EXPECT_EQ(layout.admission_records_offset, 0u);
-    EXPECT_EQ(layout.admission_log_offset, 0u);
-    EXPECT_EQ(layout.group_mailboxes_offset, 0u);
+    EXPECT_EQ(layout.protocol_layout_offset, 0u);
+    EXPECT_EQ(layout.protocol.floor_count, 0u);
 }
 
 void expect_summary_configuration(void *base, const AicoreSchedulerLayout &layout, uint64_t epoch) {
@@ -69,10 +61,6 @@ void expect_summary_configuration(void *base, const AicoreSchedulerLayout &layou
     EXPECT_EQ(summary->cooperative_task_count, layout.spmd.cooperative_task_count);
     EXPECT_EQ(summary->worker_count, layout.spmd.worker_count);
     EXPECT_EQ(summary->cluster_count, layout.spmd.cluster_count);
-    EXPECT_EQ(summary->admission_records_offset, layout.admission_records_offset);
-    EXPECT_EQ(summary->admission_log_offset, layout.admission_log_offset);
-    EXPECT_EQ(summary->admission_control_offset, layout.admission_control_offset);
-    EXPECT_EQ(summary->group_mailboxes_offset, layout.group_mailboxes_offset);
     EXPECT_EQ(summary->run_epoch, epoch);
     EXPECT_EQ(summary->prepared_layout_offset, layout.prepared_layout_offset);
     EXPECT_EQ(summary->bootstrap_clusters_offset, layout.bootstrap_clusters_offset);
@@ -84,44 +72,11 @@ void expect_empty_protocol(void *base, const AicoreSchedulerLayout &layout) {
     for (uint64_t task = 0; task < layout.task_count; ++task) {
         SCOPED_TRACE(task);
         EXPECT_EQ(controls[task].next_block, 0u);
-        EXPECT_EQ(controls[task].claim_tickets, 0u);
         EXPECT_EQ(controls[task].completion_state, scheduler_completion_initial_state(1));
         EXPECT_TRUE(scheduler_completion_valid(controls[task].completion_state));
-        EXPECT_EQ(controls[task].admission_state, 0u);
-    }
-    if (layout.spmd.cooperative_task_count == 0) return;
-    const auto *control = scheduler_state_at<SchedulerAdmissionControl>(base, layout.admission_control_offset);
-    EXPECT_EQ(control->commit_lock, 0u);
-    EXPECT_EQ(control->commit_tail, 0u);
-    for (uint64_t task = 0; task < layout.task_count; ++task) {
-        SCOPED_TRACE(task);
-        const auto *record = record_at(base, layout, task);
-        EXPECT_EQ(record->task_ref, SCHEDULER_TASK_REF_INVALID);
-        EXPECT_EQ(record->run_epoch, 0u);
-        EXPECT_EQ(record->order_key, UINT64_MAX);
-        EXPECT_EQ(record->logical_block_num, 0u);
-        EXPECT_EQ(record->member_count, 0u);
-        EXPECT_EQ(record->active_mask, LaneMask::none());
-        EXPECT_EQ(record->flags, 0u);
-    }
-    const auto *log = scheduler_state_at<int64_t>(base, layout.admission_log_offset);
-    for (uint64_t index = 0; index < layout.spmd.cooperative_task_count; ++index)
-        EXPECT_EQ(log[index], SCHEDULER_TASK_REF_INVALID);
-    if (layout.spmd.sync_mix_task_count == 0) return;
-    const auto *mailboxes = scheduler_state_at<SchedulerGroupMailbox>(base, layout.group_mailboxes_offset);
-    for (uint64_t cluster = 0; cluster < layout.spmd.cluster_count; ++cluster) {
-        SCOPED_TRACE(cluster);
-        const auto &mailbox = mailboxes[cluster];
-        EXPECT_EQ(mailbox.descriptor.task_ref, SCHEDULER_TASK_REF_INVALID);
-        EXPECT_EQ(mailbox.descriptor.order_key, UINT64_MAX);
-        EXPECT_EQ(mailbox.descriptor.run_epoch, 0u);
-        EXPECT_EQ(mailbox.descriptor.group_seq, 0u);
-        EXPECT_EQ(mailbox.descriptor.block_idx, UINT32_MAX);
-        EXPECT_EQ(mailbox.descriptor.cluster_index, UINT32_MAX);
-        for (uint64_t lane = 0; lane < 3; ++lane) {
-            EXPECT_EQ(mailbox.lanes[lane].arrived_seq, 0u);
-            EXPECT_EQ(mailbox.lanes[lane].released_seq, 0u);
-        }
+        EXPECT_EQ(controls[task].claim_seal, 0u);
+        for (const auto &sector : controls[task].claim_sectors)
+            EXPECT_EQ(sector.next, 0u);
     }
 }
 
@@ -132,26 +87,25 @@ TEST(HbgSpmdLayout, PreservesCompactMetadataAndAtomicLineBoundaries) {
     EXPECT_EQ(offsetof(SchedulerTaskMetadata, logical_block_num), 14u);
     EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskMetadata::timing_slot), int16_t>));
     EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskMetadata::logical_block_num), uint16_t>));
-    EXPECT_EQ(sizeof(SchedulerTaskControl), 640u);
+    EXPECT_EQ(sizeof(SchedulerTaskControl), 896u);
+    EXPECT_EQ(offsetof(SchedulerTaskControl, claim_sectors), 384u);
+    EXPECT_EQ(sizeof(SchedulerClaimSector), 128u);
+    EXPECT_EQ(alignof(SchedulerClaimSector), 128u);
     EXPECT_EQ(alignof(SchedulerTaskControl), 128u);
-    EXPECT_EQ(offsetof(SchedulerTaskControl, claim_tickets), 0u);
-    EXPECT_EQ(offsetof(SchedulerTaskControl, next_block), 128u);
-    EXPECT_EQ(offsetof(SchedulerTaskControl, completion_state), 256u);
-    EXPECT_EQ(offsetof(SchedulerTaskControl, admission_state), 384u);
-    EXPECT_EQ(offsetof(SchedulerTaskControl, claim_seal), 512u);
+    EXPECT_EQ(offsetof(SchedulerTaskControl, next_block), 0u);
+    EXPECT_EQ(offsetof(SchedulerTaskControl, completion_state), 128u);
+    EXPECT_EQ(offsetof(SchedulerTaskControl, claim_seal), 256u);
     EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskControl::next_block), volatile uint64_t>));
     EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskControl::completion_state), volatile uint64_t>));
-    EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskControl::admission_state), volatile uint64_t>));
 }
 
-TEST(HbgSpmdLayout, SyncMixTasksSharePerClusterMailboxes) {
+TEST(HbgSpmdLayout, SyncMixTaskCountDoesNotAddGmMailboxStorage) {
     for (uint64_t clusters : {2u, 3u, 8u, 32u}) {
         SCOPED_TRACE(clusters);
         AicoreSchedulerLayout one_mix{};
         AicoreSchedulerLayout three_mix{};
         ASSERT_TRUE(scheduler_plan_layout(9, &one_mix, false, 10, requirements(clusters * 3, 3, 1)));
         ASSERT_TRUE(scheduler_plan_layout(9, &three_mix, false, 10, requirements(clusters * 3, 3, 3)));
-        EXPECT_EQ(one_mix.group_mailboxes_offset, three_mix.group_mailboxes_offset);
         EXPECT_EQ(one_mix.total_size, three_mix.total_size);
     }
 }
@@ -162,18 +116,7 @@ TEST(HbgSpmdLayout, ConcurrentBlockCountersUseSeparateCacheLines) {
     EXPECT_NE(completed / 128, cursor / 128);
     EXPECT_NE(cursor / 128, offsetof(SchedulerTaskControl, claim_seal) / 128);
     EXPECT_NE(completed / 128, offsetof(SchedulerTaskControl, claim_seal) / 128);
-    EXPECT_NE(completed / 128, offsetof(SchedulerTaskControl, admission_state) / 128);
     EXPECT_EQ(sizeof(SchedulerTaskControl) % 128, 0u);
-}
-
-TEST(HbgSpmdLayout, AdmissionPhaseOwnsAnIsolatedBypassPublicationRegion) {
-    constexpr size_t phase = offsetof(SchedulerTaskControl, admission_state);
-    EXPECT_EQ(phase % 64, 0u);
-    for (size_t atomic :
-         {offsetof(SchedulerTaskControl, claim_tickets), offsetof(SchedulerTaskControl, next_block),
-          offsetof(SchedulerTaskControl, completion_state), offsetof(SchedulerTaskControl, claim_seal)})
-        EXPECT_NE(phase / 64, atomic / 64);
-    EXPECT_LE(phase + 64, sizeof(SchedulerTaskControl));
 }
 
 TEST(HbgSpmdLayout, CounterUpdatesLeaveOtherTaskAndMetadataBytesUntouched) {
@@ -202,42 +145,10 @@ TEST(HbgSpmdLayout, CounterUpdatesLeaveOtherTaskAndMetadataBytesUntouched) {
     }
 }
 
-TEST(HbgSpmdLayout, AdmissionPublicationLeavesAllOtherTaskBytesUntouched) {
-    AicoreSchedulerLayout layout{};
-    ASSERT_TRUE(scheduler_plan_layout(3, &layout));
-    scheduler_test::SchedulerStateBuffer storage(layout);
-    auto *controls = scheduler_state_at<SchedulerTaskControl>(storage.base(), layout.task_controls_offset);
-    std::array<uint8_t, 3 * sizeof(SchedulerTaskControl)> expected{};
-    std::memcpy(expected.data(), controls, expected.size());
-    for (uint64_t task = 0; task < 3; ++task) {
-        const uint64_t phase = UINT64_MAX - task;
-        scheduler_publish_signal(controls[task].admission_state, phase);
-        EXPECT_EQ(scheduler_gm_query(controls[task].admission_state), phase);
-        const size_t row = task * sizeof(SchedulerTaskControl);
-        std::memcpy(expected.data() + row + offsetof(SchedulerTaskControl, admission_state), &phase, sizeof(phase));
-        EXPECT_EQ(std::memcmp(expected.data(), controls, expected.size()), 0);
-    }
-}
-
-TEST(HbgSpmdLayout, IsolatesAdmissionAndMailboxAtomicOwners) {
-    EXPECT_EQ(sizeof(SchedulerAdmissionRecord), 64u);
+TEST(HbgSpmdLayout, KeepsBootstrapAndFrozenGraphHeadersAligned) {
     EXPECT_EQ(sizeof(SchedulerBootstrapCluster), 128u);
     EXPECT_EQ(alignof(SchedulerBootstrapCluster), 128u);
-    EXPECT_EQ(sizeof(SchedulerAdmissionControl), 256u);
-    EXPECT_EQ(alignof(SchedulerAdmissionControl), 128u);
-    EXPECT_EQ(offsetof(SchedulerAdmissionControl, commit_lock), 0u);
-    EXPECT_EQ(offsetof(SchedulerAdmissionControl, commit_tail), 128u);
-    EXPECT_EQ(sizeof(SchedulerGroupDescriptor), 64u);
-    EXPECT_EQ(sizeof(SchedulerGroupLaneAck), 64u);
-    EXPECT_EQ(sizeof(SchedulerGroupMailbox), 384u);
-    EXPECT_EQ(alignof(SchedulerGroupMailbox), 128u);
-    EXPECT_EQ(offsetof(SchedulerGroupMailbox, descriptor), 0u);
-    EXPECT_EQ(offsetof(SchedulerGroupMailbox, lanes), 128u);
     EXPECT_EQ(sizeof(SchedulerGraphSummary), 128u);
-    EXPECT_TRUE((std::is_standard_layout_v<SchedulerAdmissionRecord>));
-    EXPECT_TRUE((std::is_trivially_copyable_v<SchedulerAdmissionRecord>));
-    EXPECT_TRUE((std::is_standard_layout_v<SchedulerGroupMailbox>));
-    EXPECT_TRUE((std::is_trivially_copyable_v<SchedulerGroupMailbox>));
 }
 
 TEST(HbgSpmdLayout, ZeroRequirementsPreserveDefaultAllocation) {
@@ -275,23 +186,13 @@ TEST_P(HbgSpmdWorkerLayout, OrdinaryGraphHasNoProtocolAllocation) {
     EXPECT_EQ(ordinary_mix.total_size, ordinary.total_size);
 }
 
-TEST_P(HbgSpmdWorkerLayout, PureSyncUsesOneRecordCacheLineWithoutMixStorage) {
-    AicoreSchedulerLayout layout{};
-    ASSERT_TRUE(scheduler_plan_layout(9, &layout, false, 0, requirements(GetParam(), 3, 0)));
-    EXPECT_EQ(layout.admission_records_offset % 64, 0u);
-    EXPECT_EQ(layout.admission_control_offset % 64, 0u);
-    EXPECT_NE(layout.admission_log_offset, 0u);
-    EXPECT_EQ(layout.group_mailboxes_offset, 0u);
-    scheduler_test::SchedulerStateBuffer storage(layout);
-    ASSERT_NE(storage.base(), nullptr);
-    expect_empty_protocol(storage.base(), layout);
-    for (uint64_t task = 0; task < layout.task_count; ++task) {
-        const auto *record = record_at(storage.base(), layout, task);
-        const uint64_t row = layout.admission_records_offset + task * sizeof(SchedulerAdmissionRecord);
-        EXPECT_EQ(row % 64, 0u);
-        EXPECT_EQ(reinterpret_cast<const std::byte *>(record) - static_cast<const std::byte *>(storage.base()), row);
-        EXPECT_EQ(sizeof(*record), 64u);
-    }
+TEST_P(HbgSpmdWorkerLayout, SyncUsesTheSameControlLayoutAsOrdinaryExecution) {
+    AicoreSchedulerLayout ordinary{};
+    AicoreSchedulerLayout sync{};
+    ASSERT_TRUE(scheduler_plan_layout(9, &ordinary, false, 0, requirements(GetParam(), 0, 0)));
+    ASSERT_TRUE(scheduler_plan_layout(9, &sync, false, 0, requirements(GetParam(), 3, 0)));
+    EXPECT_EQ(ordinary.task_controls_offset, sync.task_controls_offset);
+    EXPECT_EQ(ordinary.total_size, sync.total_size);
 }
 
 TEST_P(HbgSpmdWorkerLayout, MixRegionsAreAlignedDisjointAndSizedToActualTopology) {
@@ -299,12 +200,7 @@ TEST_P(HbgSpmdWorkerLayout, MixRegionsAreAlignedDisjointAndSizedToActualTopology
     ASSERT_TRUE(scheduler_plan_layout(9, &layout, false, 0, requirements(GetParam(), 3, 2)));
     EXPECT_EQ(layout.spmd.worker_count, GetParam());
     EXPECT_EQ(layout.spmd.cluster_count, GetParam() / 3);
-    EXPECT_EQ(layout.group_mailboxes_offset % 64, 0u);
     std::vector<std::pair<uint64_t, uint64_t>> regions{
-        {layout.admission_control_offset, sizeof(SchedulerAdmissionControl)},
-        {layout.admission_records_offset, layout.task_count * sizeof(SchedulerAdmissionRecord)},
-        {layout.admission_log_offset, layout.spmd.cooperative_task_count * sizeof(int64_t)},
-        {layout.group_mailboxes_offset, layout.spmd.cluster_count * sizeof(SchedulerGroupMailbox)},
         {layout.graph_summary_offset, sizeof(SchedulerGraphSummary)},
         {layout.bootstrap_clusters_offset, layout.spmd.cluster_count * sizeof(SchedulerBootstrapCluster)},
         {layout.task_metadata_offset, layout.task_count * sizeof(SchedulerTaskMetadata)},
@@ -347,7 +243,6 @@ TEST(HbgSpmdLayout, RetainedAllocationRebindsLargeSmallLargeWithoutTouchingInact
     ASSERT_TRUE(scheduler_plan_layout(9, &large, true, 54, requirements(108, 4, 2)));
     ASSERT_TRUE(scheduler_plan_layout(2, &small, false, 3, requirements(3, 1, 0)));
     ASSERT_GT(large.total_size, small.total_size);
-    ASSERT_GE(large.group_mailboxes_offset, small.total_size);
     scheduler_test::SchedulerStateBuffer retained(large);
     scheduler_test::SchedulerStateBuffer fresh_small(small);
     scheduler_test::SchedulerStateBuffer fresh_large(large);
@@ -367,16 +262,6 @@ TEST(HbgSpmdLayout, RetainedAllocationRebindsLargeSmallLargeWithoutTouchingInact
     ASSERT_TRUE(scheduler_init_data_from_layout(retained.base(), first_large, device_base));
     fill_large_metadata(retained.base(), first_large, 3, LaneMask::aic());
     ASSERT_TRUE(scheduler_init_spmd_task_records(retained.base(), first_large, 117));
-    auto *old_mailboxes = scheduler_state_at<SchedulerGroupMailbox>(retained.base(), large.group_mailboxes_offset);
-    for (uint64_t cluster = 0; cluster < large.spmd.cluster_count; ++cluster) {
-        old_mailboxes[cluster].descriptor.group_seq = cluster + 400;
-        old_mailboxes[cluster].descriptor.run_epoch = 117;
-        for (uint64_t lane = 0; lane < 3; ++lane) {
-            old_mailboxes[cluster].lanes[lane].arrived_seq = cluster + lane + 200;
-            old_mailboxes[cluster].lanes[lane].released_seq = cluster + lane + 100;
-        }
-    }
-
     auto *retained_bytes = static_cast<uint8_t *>(retained.base());
     retained_bytes[small.total_size] = 0xa5;
     retained_bytes[large.total_size - 1] = 0x5a;
@@ -394,9 +279,9 @@ TEST(HbgSpmdLayout, RetainedAllocationRebindsLargeSmallLargeWithoutTouchingInact
     EXPECT_EQ(std::memcmp(retained.base(), fresh_small.base(), static_cast<size_t>(small.total_size)), 0);
     EXPECT_EQ(std::memcmp(retained_bytes + small.total_size, inactive_tail.data(), inactive_tail.size()), 0);
     expect_summary_configuration(retained.base(), small, 232);
-    EXPECT_EQ(record_at(retained.base(), small, 0)->logical_block_num, 2u);
-    EXPECT_EQ(record_at(retained.base(), small, 0)->active_mask, LaneMask::aiv0());
-    EXPECT_EQ(record_at(retained.base(), small, 1)->task_ref, SCHEDULER_TASK_REF_INVALID);
+    const auto *small_controls = scheduler_state_at<SchedulerTaskControl>(retained.base(), small.task_controls_offset);
+    EXPECT_EQ(scheduler_completion_total(small_controls[0].completion_state), 2u);
+    EXPECT_EQ(scheduler_completion_total(small_controls[1].completion_state), 1u);
 
     ASSERT_TRUE(scheduler_init_data_from_layout(retained.base(), large, device_base));
     ASSERT_TRUE(scheduler_init_data_from_layout(fresh_large.base(), large, device_base));
@@ -408,10 +293,9 @@ TEST(HbgSpmdLayout, RetainedAllocationRebindsLargeSmallLargeWithoutTouchingInact
     }
     EXPECT_EQ(std::memcmp(retained.base(), fresh_large.base(), static_cast<size_t>(large.total_size)), 0);
     expect_summary_configuration(retained.base(), large, 349);
-    EXPECT_EQ(record_at(retained.base(), large, 0)->task_ref, SCHEDULER_TASK_REF_INVALID);
-    EXPECT_EQ(record_at(retained.base(), large, 1)->logical_block_num, 7u);
-    EXPECT_EQ(record_at(retained.base(), large, 1)->active_mask, LaneMask::aiv1());
-    EXPECT_EQ(record_at(retained.base(), large, 1)->run_epoch, 349u);
+    const auto *large_controls = scheduler_state_at<SchedulerTaskControl>(retained.base(), large.task_controls_offset);
+    EXPECT_EQ(scheduler_completion_total(large_controls[0].completion_state), 1u);
+    EXPECT_EQ(scheduler_completion_total(large_controls[1].completion_state), 7u);
 }
 
 class HbgSpmdInvalidRequirements : public ::testing::TestWithParam<SchedulerSpmdRequirements> {};
@@ -468,23 +352,9 @@ TEST(HbgSpmdLayout, EmptyGraphWithKnownTopologyHasNoProtocolStorage) {
     expect_summary_configuration(storage.base(), layout, UINT64_MAX);
 }
 
-TEST(HbgSpmdLayout, AdmissionLogScalesWithCooperativeTasksNotAllTasksOrWorkerCapacity) {
-    AicoreSchedulerLayout one_cooperative{};
-    AicoreSchedulerLayout seventeen_cooperative{};
-    ASSERT_TRUE(scheduler_plan_layout(65, &one_cooperative, false, 0, requirements(108, 1, 0)));
-    ASSERT_TRUE(scheduler_plan_layout(65, &seventeen_cooperative, false, 0, requirements(108, 17, 0)));
-    EXPECT_EQ(one_cooperative.admission_records_offset, seventeen_cooperative.admission_records_offset);
-    EXPECT_EQ(one_cooperative.admission_log_offset, seventeen_cooperative.admission_log_offset);
-    EXPECT_EQ(seventeen_cooperative.total_size - one_cooperative.total_size, 128u);
-    EXPECT_EQ(
-        one_cooperative.admission_log_offset - one_cooperative.admission_records_offset,
-        65 * sizeof(SchedulerAdmissionRecord)
-    );
-}
-
 TEST(HbgSpmdLayout, DeviceRelocationKeepsAllProtocolReferencesAsOffsets) {
     AicoreSchedulerLayout layout{};
-    ASSERT_TRUE(scheduler_plan_layout(3, &layout, false, 10, requirements(66, 2, 1)));
+    ASSERT_TRUE(scheduler_plan_layout(3, &layout, true, 10, requirements(66, 2, 1), true));
     scheduler_test::SchedulerStateBuffer storage(layout);
     ASSERT_NE(storage.base(), nullptr);
     for (uint64_t device_base : {UINT64_C(0x400000000), UINT64_C(0x800000000)}) {
@@ -495,10 +365,17 @@ TEST(HbgSpmdLayout, DeviceRelocationKeepsAllProtocolReferencesAsOffsets) {
         set_metadata(storage.base(), layout, 2, 1, LaneMask::aiv0());
         ASSERT_TRUE(scheduler_init_spmd_task_records(storage.base(), layout, 9));
         expect_summary_configuration(storage.base(), layout, 9);
+        const auto *summary = scheduler_state_at<SchedulerGraphSummary>(storage.base(), layout.graph_summary_offset);
+        ASSERT_NE(layout.protocol_layout_offset, 0u);
+        ASSERT_EQ(summary->protocol_layout_offset, layout.protocol_layout_offset);
+        const auto *header =
+            scheduler_state_at<SchedulerProtocolLayout>(storage.base(), summary->protocol_layout_offset);
+        ASSERT_NE(layout.protocol.floors_offset, 0u);
+        EXPECT_EQ(header->floors_offset, layout.protocol.floors_offset);
     }
 }
 
-TEST(HbgSpmdTaskRecords, InitializesOnlyCooperativeTasksAndPacksOneSealRowPerMixTask) {
+TEST(HbgSpmdTaskRecords, InitializesCompletionCreditForEachPhysicalLaneAndBlock) {
     AicoreSchedulerLayout layout{};
     ASSERT_TRUE(scheduler_plan_layout(8, &layout, false, 62, requirements(96, 2, 2, 1)));
     scheduler_test::SchedulerStateBuffer storage(layout);
@@ -514,26 +391,15 @@ TEST(HbgSpmdTaskRecords, InitializesOnlyCooperativeTasksAndPacksOneSealRowPerMix
     ASSERT_TRUE(scheduler_init_spmd_task_records(storage.base(), layout, epoch));
     expect_summary_configuration(storage.base(), layout, epoch);
     const auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(storage.base(), layout.task_metadata_offset);
-    for (uint64_t task : {3u, 4u}) {
-        SCOPED_TRACE(task);
-        const auto *record = record_at(storage.base(), layout, task);
-        EXPECT_EQ(record->task_ref, static_cast<int64_t>(task));
-        EXPECT_EQ(record->logical_block_num, metadata[task].logical_block_num);
-        EXPECT_EQ(record->active_mask, metadata[task].active_mask);
-        EXPECT_EQ(record->flags, metadata[task].flags);
-        EXPECT_EQ(record->run_epoch, epoch);
-        EXPECT_EQ(record->order_key, UINT64_MAX);
-        EXPECT_EQ(record->member_count, task == 3 ? 64u : 96u);
+    const auto *controls = scheduler_state_at<SchedulerTaskControl>(storage.base(), layout.task_controls_offset);
+    for (uint64_t task = 0; task < layout.task_count; ++task) {
+        const auto &meta = metadata[task];
+        const uint32_t expected = scheduler_task_is_executable(meta.flags) && !scheduler_task_is_inline(meta.flags) ?
+                                      meta.logical_block_num * meta.active_mask.count() :
+                                      1;
+        EXPECT_EQ(controls[task].completion_state, scheduler_completion_initial_state(expected));
+        EXPECT_EQ(controls[task].claim_seal, 0u);
     }
-    for (uint64_t task : {0u, 1u, 2u, 5u, 6u, 7u})
-        EXPECT_EQ(record_at(storage.base(), layout, task)->task_ref, SCHEDULER_TASK_REF_INVALID);
-    const auto *control =
-        scheduler_state_at<SchedulerAdmissionControl>(storage.base(), layout.admission_control_offset);
-    EXPECT_EQ(control->commit_lock, 0u);
-    EXPECT_EQ(control->commit_tail, 0u);
-    const auto *log = scheduler_state_at<int64_t>(storage.base(), layout.admission_log_offset);
-    for (uint64_t index = 0; index < layout.spmd.cooperative_task_count; ++index)
-        EXPECT_EQ(log[index], SCHEDULER_TASK_REF_INVALID);
 }
 
 TEST(HbgSpmdTaskRecords, EpochIsSuppliedExactlyToHostRecordsWithoutIncrement) {
@@ -549,8 +415,6 @@ TEST(HbgSpmdTaskRecords, EpochIsSuppliedExactlyToHostRecordsWithoutIncrement) {
         set_metadata(storage.base(), layout, 0, 2, LaneMask::aic(), SCHEDULER_TASK_SYNC_START);
         ASSERT_TRUE(scheduler_init_spmd_task_records(storage.base(), layout, epoch));
         expect_summary_configuration(storage.base(), layout, epoch);
-        EXPECT_EQ(record_at(storage.base(), layout, 0)->run_epoch, epoch);
-        EXPECT_EQ(record_at(storage.base(), layout, 0)->order_key, UINT64_MAX);
     }
 }
 
@@ -649,7 +513,7 @@ TEST(HbgSpmdTaskRecords, CooperativeAndMixCountMismatchDoesNotPartiallyInitializ
     }
 }
 
-TEST(HbgSpmdTaskRecords, MissingProtocolStorageRejectsCooperativeMetadata) {
+TEST(HbgSpmdTaskRecords, RejectsSyncMetadataWhenDeclaredCooperativeCountIsZero) {
     AicoreSchedulerLayout layout{};
     ASSERT_TRUE(scheduler_plan_layout(1, &layout, false, 0, requirements(3, 0, 0)));
     scheduler_test::SchedulerStateBuffer storage(layout);
@@ -659,7 +523,7 @@ TEST(HbgSpmdTaskRecords, MissingProtocolStorageRejectsCooperativeMetadata) {
     expect_summary_configuration(storage.base(), layout, 0);
 }
 
-TEST(HbgSpmdTaskRecords, OrdinaryPredicateAndSkippedEntriesNeedNoAdmissionStorage) {
+TEST(HbgSpmdTaskRecords, InitializesOrdinaryPredicateAndSkippedEntries) {
     AicoreSchedulerLayout layout{};
     ASSERT_TRUE(scheduler_plan_layout(4, &layout, false, 2, requirements(3, 0, 0)));
     scheduler_test::SchedulerStateBuffer storage(layout);
@@ -865,11 +729,13 @@ TEST_P(HbgProtocolTraceLayout, ReservesIndexedRecordsRatherThanPerWorkerCopiesOf
     EXPECT_EQ(p.cooperative_task_count, 2u);
     EXPECT_EQ(p.member_count, 2 * GetParam());
     EXPECT_EQ(p.trace_count, 7u);
+    EXPECT_EQ(p.floor_count, (spmd.mix_task_count + 1) * spmd.cluster_count);
     constexpr uint64_t worker_alignment = alignof(SchedulerProtocolWorkerTrace);
     const uint64_t observation_bytes =
         (3 * sizeof(SchedulerProtocolCounterObservation) + worker_alignment - 1) / worker_alignment * worker_alignment;
     const uint64_t expected = sizeof(SchedulerProtocolLayout) + 3 * sizeof(SchedulerProtocolTaskTrace) +
                               2 * GetParam() * sizeof(SchedulerProtocolMemberTrace) +
+                              p.floor_count * sizeof(SchedulerProtocolFloorTrace) +
                               7 * sizeof(SchedulerProtocolBlockTrace) + 7 * sizeof(SchedulerProtocolExecutionTrace) +
                               7 * sizeof(SchedulerProtocolConditionContribution) + observation_bytes +
                               GetParam() * sizeof(SchedulerProtocolWorkerTrace);
@@ -879,6 +745,7 @@ TEST_P(HbgProtocolTraceLayout, ReservesIndexedRecordsRatherThanPerWorkerCopiesOf
         {full.protocol_layout_offset, sizeof(SchedulerProtocolLayout)},
         {p.tasks_offset, p.task_count * sizeof(SchedulerProtocolTaskTrace)},
         {p.members_offset, p.member_count * sizeof(SchedulerProtocolMemberTrace)},
+        {p.floors_offset, p.floor_count * sizeof(SchedulerProtocolFloorTrace)},
         {p.blocks_offset, p.trace_count * sizeof(SchedulerProtocolBlockTrace)},
         {p.executions_offset, p.trace_count * sizeof(SchedulerProtocolExecutionTrace)},
         {p.condition_contributions_offset, p.trace_count * sizeof(SchedulerProtocolConditionContribution)},
@@ -911,10 +778,10 @@ TEST(HbgProtocolTrace, CompactRunAndTraceLayoutSeparatesConcurrentWriters) {
     EXPECT_EQ(sizeof(SchedulerGraphSummary), 128u);
     EXPECT_EQ(sizeof(SchedulerRunControl), 384u + SCHEDULER_WORKER_CAPACITY * 64);
     EXPECT_EQ(sizeof(SchedulerTaskTrace), 256u);
-    EXPECT_EQ(offsetof(SchedulerGraphSummary, protocol_layout_offset), 80u);
-    EXPECT_EQ(offsetof(SchedulerProtocolTaskTrace, completion), 64u);
+    EXPECT_EQ(offsetof(SchedulerGraphSummary, protocol_layout_offset), 48u);
+    EXPECT_EQ(offsetof(SchedulerProtocolTaskTrace, completion), 0u);
     EXPECT_EQ(offsetof(SchedulerProtocolBlockTrace, lanes), 320u);
-    EXPECT_EQ(sizeof(SchedulerProtocolLaneTrace), 256u);
+    EXPECT_EQ(sizeof(SchedulerProtocolLaneTrace), 192u);
 }
 
 TEST(HbgProtocolTrace, RetainedResetErasesAllEvidenceAndBindsTheLiteralNewEpoch) {

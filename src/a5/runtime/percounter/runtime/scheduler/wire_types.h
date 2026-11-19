@@ -34,6 +34,7 @@
 #include "common/lane_mask.h"
 #include "scheduler/scheduler_layout.h"
 #include "scheduler/ssbuf.h"
+#include "invocation_context.h"
 #include "scheduler/scheduler_types.h"
 
 // Continues the SCHEDULER_RUNTIME_MODE_* numbering scheduler_layout.h starts,
@@ -47,9 +48,7 @@ namespace simpler::percounter {
 inline constexpr uint32_t PERCOUNTER_CORE_TYPE_COUNT = 2;  // 0 = AIC, 1 = AIV
 
 inline constexpr uint32_t PERCOUNTER_PENDING_CAPACITY = 1;
-inline constexpr uint32_t PERCOUNTER_PAYLOAD_SLOT_COUNT = 1;
 static_assert(PERCOUNTER_PENDING_CAPACITY == 1 || PERCOUNTER_PENDING_CAPACITY == 2 || PERCOUNTER_PENDING_CAPACITY == 4);
-static_assert(PERCOUNTER_PAYLOAD_SLOT_COUNT == 1 || PERCOUNTER_PAYLOAD_SLOT_COUNT == 2);
 inline constexpr uint32_t PERCOUNTER_SLOT_MASK = (1U << PERCOUNTER_PENDING_CAPACITY) - 1;
 inline constexpr uint32_t PERCOUNTER_NO_SYNC = UINT32_MAX;
 
@@ -86,9 +85,16 @@ struct alignas(64) PercounterSsbufRegion {
     volatile uint32_t mix_floor_rank;
     volatile uint32_t publish_sequence;
     volatile uint32_t publication_closed;
-    uint8_t reserved[PERCOUNTER_SSBUF_REGION_SIZE - PERCOUNTER_PENDING_CAPACITY * sizeof(PercounterMixSignal) - 12];
+    uint8_t reserved
+        [PERCOUNTER_CONTEXT_SSBUF_OFFSET - PERCOUNTER_SSBUF_REGION_OFFSET -
+         PERCOUNTER_PENDING_CAPACITY * sizeof(PercounterMixSignal) - 12];
+    PercounterInvocationContextSlot contexts[PLATFORM_CORES_PER_BLOCKDIM];
+    uint8_t tail_reserved[64];
 };
 static_assert(sizeof(PercounterSsbufRegion) == PERCOUNTER_SSBUF_REGION_SIZE);
+static_assert(
+    offsetof(PercounterSsbufRegion, contexts) + PERCOUNTER_SSBUF_REGION_OFFSET == PERCOUNTER_CONTEXT_SSBUF_OFFSET
+);
 static_assert(std::is_trivially_copyable_v<PercounterSsbufRegion> && std::is_standard_layout_v<PercounterSsbufRegion>);
 
 inline __aicore__ PERCOUNTER_SSBUF PercounterSsbufRegion *percounter_ssbuf_region(uint64_t hardware_base) {
@@ -130,9 +136,8 @@ struct alignas(128) PercounterCounter {
     // Host prepares task-table arguments; AICPU prepares Graph body arguments.
     uint32_t argument_counts;
     uint64_t function_addresses[PLATFORM_CORES_PER_BLOCKDIM];
-    uint64_t tensors_address;
-    uint64_t scalars_address;
-    uint8_t reserved[40];
+    uint64_t arguments_address;
+    uint8_t reserved[48];
 };
 static_assert(sizeof(PercounterCounter) == 128, "a counter owns one GM sector");
 static_assert(std::is_trivially_copyable_v<PercounterCounter> && std::is_standard_layout_v<PercounterCounter>);
@@ -467,9 +472,9 @@ struct alignas(128) PercounterControl {
     uint64_t graph_storage_count;
     uint64_t callable_addresses_address;
     uint64_t callable_addresses_count;
-    uint64_t dispatch_payloads_offset;
-    // One deferred-completion record per lane and the entry slots behind it,
-    // indexed the way the payloads are and for the same reason. The condition
+    uint64_t arguments_address;
+    uint64_t image_bytes;
+    // One deferred-completion registration scratch per physical lane. The condition
     // cap is one record's, and the epoch is what tells a record of this run
     // from one the retained storage still held.
     uint64_t async_groups_offset;

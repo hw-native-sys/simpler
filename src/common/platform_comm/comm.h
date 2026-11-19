@@ -317,8 +317,11 @@ int comm_alloc_domain_windows(
  * name of at most 31 ASCII letters, digits, underscores or hyphens.
  * The native rank creates, registers and unlinks its local POSIX backing.
  * The caller supplies the name and may borrow a CPU mapping. Local device
- * mappings support MTE. A5 reaches peers through an optional domain-owned
- * URMA workspace. On A2/A3, the SDMA bit enables peer mappings for the
+ * mappings support MTE. On A5, a Host domain with an empty workspace mask imports and registers peer
+ * Host windows in the requesting process for synchronous MTE reads through
+ * windowsIn. A Host URMA domain leaves all windowsIn entries zero and supplies
+ * peer MR addresses through the workspace for asynchronous reads.
+ * On A2/A3, the SDMA bit enables peer mappings for the
  * Worker-owned SDMA workspace.
  * Abort and release use the same entry points as comm_alloc_domain_windows.
  * This symbol is optional on other backends.

@@ -1,12 +1,13 @@
 {
-  "origin": "hw-native-sys/pypto-lib dev/hbg@a6a9a2d49047ce67a85857c6b15f9604a7287714, unchanged full-forward kernels",
-  "model_commit": "a6a9a2d49047ce67a85857c6b15f9604a7287714",
-  "source_name": "l2_decode_fwd.cpp",
-  "source_sha256": "cc7f101fbb356f0e27a4375e6f4ff057deb136421d93312f13db2867f137ff96",
-  "source_bytes": 544664,
+  "origin": "hw-native-sys/pypto-lib dev/hbg decode_fwd",
+  "model_commit": "4cb74422616359b3f95c598b1f9cdd31cf4e4173",
+  "source_name": "_l2_decode_fwd.cpp",
+  "source_sha256": "3f89a0ca1e6acca74de0e6898eb3c524bab714666fbf3834fce7920003b4a16e",
+  "source_bytes": 576384,
   "host_tensor_indices": [
-    65,
-    66
+    63,
+    64
   ],
-  "native_graph_submissions": 0
+  "native_graph_submissions": 0,
+  "compiler_commit": "3db18db1286bdbb44266179e3aedae659174b711"
 }

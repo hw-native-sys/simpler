@@ -32,9 +32,13 @@ CHECK 每次取得一个 group，按条件游标观察尚未满足的条件。�
 
 ### 有界目录更新
 
-初始 compare 值可由可靠 ld_dev 获得，最终更新由 strong CAS 裁定；不为纯读取增加 atomic-add-zero。strong CAS 只改变目标位。置位前必须为零，清位前必须为一；状态不符直接返回协议错误，不改邻位。CAS 失败返回的当前值作为下一次 compare 值。
+Host 为每个目录字的两个 32 位半区分别选择后端。32 B 对齐的 SET 槽提供 BIT_WR 和 BIT_CLR 别名。唯一的首次封口者向 BIT_WR 写入单比特掩码置位，成功将 lease 转为 TERMINAL 的 CHECK owner 向 BIT_CLR 写入相同掩码清位。两种命令都不返回旧位值，写入资格由封口和 lease 转换保证。AICPU 在每轮 READY 前清零已映射的槽。
 
-对合法调用，其余 63 位各最多改变两次。当前实现保守保留最多128次 CAS，加一次初始 ld_dev，覆盖初次 compare 失配、其余位变化和最后成功；后续 compare 复用上次 CAS 返回值。超过此界限是协议损坏，不是可忽略的 RETRY；调用者锁存 run 错误、禁止进入新业务并保留资源。此上界不适用于会反复重用的普通 ready 位图，也不表示固定硬件耗时。
+映射缺失或 SET 地址未按 32 B 对齐时，Host 将该半区的通知地址写为零，选择 GM 位图。扫描时从映射槽读取相应半区，从 GM 字中掩取回退半区，再拼成当前目录字。两个半区可以使用不同后端。
+
+GM 回退的初始 compare 值由可靠 ld_dev 获得，最终更新由 strong CAS 裁定；不为纯读取增加 atomic-add-zero。strong CAS 只改变目标位。置位前必须为零，清位前必须为一；状态不符直接返回协议错误，不改邻位。CAS 失败返回的当前值作为下一次 compare 值。
+
+对 GM 位图的合法更新，其余 63 位各最多改变两次。当前实现保守保留最多128次 CAS，加一次初始 ld_dev，覆盖初次 compare 失配、其余位变化和最后成功；后续 compare 复用上次 CAS 返回值。超过此界限是协议损坏，不是可忽略的 RETRY；调用者锁存 run 错误、禁止进入新业务并保留资源。此上界不适用于会反复重用的普通 ready 位图，也不表示固定硬件耗时。
 
 该原语不能独立识别一位完整清除后的非法再次发布，调用者必须用 group 生命周期和 generation 维持一次性合同。禁止用算术补偿恢复重复更新。
 
@@ -44,7 +48,7 @@ CHECK 每次取得一个 group，按条件游标观察尚未满足的条件。�
 | -------- | ---------- | ---- |
 | task→group 映射、task 形状、header 数组基址与 token 边界 | Host 初始化并随 run 镜像发布，run 内保持只读 | run 入口完成全 DCache 获取后普通 cached 读取，不逐项重复失效 |
 | 封口身份、token | 执行核完成对应 cached 写回及实际屏障，再发布 RUNNABLE 和目录位 | 成功领取后按实际 cache 合同失效/观察，再消费数据 |
-| 已发布的 lease、join、目录、task 完成状态 | 唯一领取、交权和多写者合并使用 atomic；无 cached 整行写回，目标按 128B 隔离，相关依赖边界显式 DSB | 可靠 ld_dev 用于条件观察或 CAS compare 值；不能用读取授予独占权，也不追加 FAA(0)确认。最终状态转换仍由 RMW 裁定 |
+| 已发布的 lease、join、GM 回退目录位、GM 完成门 | 唯一领取、交权和多写者合并使用 atomic；无 cached 整行写回，目标按 128B 隔离，相关依赖边界显式 DSB | 可靠 ld_dev 用于条件观察或 CAS compare 值；不能用读取授予独占权，也不追加 FAA(0)确认。最终状态转换仍由 RMW 裁定 |
 | run 异步活动标记 | 现有布局为独占 64 B DCache 行，并非 128B 争用隔离的证明；Host 在 run 前置零，执行核在首次发布 CHECK 前以 bypass store 写一并完成 DDR 屏障 | bypass load；本核见一后可以一直缓存 true，run 内不清零 |
 | owner 可变进度 | 独占期间 cached 写入，对应行写回及屏障完成后交权 | 下一 owner CAS 成功后失效并观察进度行，完成读取屏障后读取 |
 | payload、外部完成记录 | 遵守相应 backend 的可见性合同 | 不能将运行时 atomic-add-zero 原语用于 DMA/peer 写入的外部地址 |
@@ -83,11 +87,11 @@ P 暂时为零不证明计算结束，其他尚未返回的成员仍可能登记
 
 ## 4. GM 内联 FINISH 与计数器完成
 
-GM join 的 close 或最终 settle RMW 选出唯一 `FINISH_OWNER`。调用者立即执行 `scheduler_async_complete_task`，以不可变任务几何和 join 结果构造预期 gate，再通过 CAS 将 `(N, 0, 1)` 转为 DONE。完成记录、任务 DONE 信号和本核 `pending_completed` 在这一固定尾部发布；不能把完成权入队、让出后重新领取或交给另一个 owner。
+GM join 的 close 或最终 settle RMW 选出唯一 `FINISH_OWNER`。调用者立即执行 `scheduler_async_complete_task`，以不可变任务几何和 join 结果构造预期 gate，再通过 CAS 将 `(N, 0, 1)` 转为 DONE。获权者在这一固定尾部发布完成记录和任务 DONE 信号，并立即向整轮进度上报一次完成；不能把完成权入队、让出后重新领取或交给另一个 owner。
 
 计数器路径由 Host 规划每个 task 的阈值及真实祖先之间的链复用。普通执行返回贡献物理 credit；MIX coordinator 收齐全部 release 后贡献物理 credits。可延迟完成的 lane 额外预留一个条件 credit：非空 group 在最后 CHECK 满足后贡献，空组在封口尾部贡献。普通空组允许在返回尾部连续提交两次单位 INC，MIX 则保留物理与条件贡献各自的边界。
 
-后继通过计数器阈值直接判断 readiness，后台唯一记账分区随后发布 canonical GM DONE 并结算 `pending_completed`。阈值就绪不依赖该后台记账核立即获得调度，也不代表 run 资源已经可以回收。没有可用计数器映射的任务继续使用 GM 完成门。
+后继通过计数器阈值直接判断 readiness，后台唯一记账分区随后发布 canonical GM DONE，并立即向整轮进度上报一次完成。阈值就绪不依赖该后台记账核立即获得调度，也不代表 run 资源已经可以回收。没有可用计数器映射的任务继续使用 GM 完成门。
 
 当前后继由 token/control 调度逻辑检查自己的 fanin；完成尾部不再遍历 CSR、摘取 wake-list、续接 resolver 或向 ready 队列推送后继。CHECK 保留可续接的条件观察；FINISH 不再是一类独立控制记录。
 
@@ -95,7 +99,9 @@ GM join 的 close 或最终 settle RMW 选出唯一 `FINISH_OWNER`。调用者�
 
 ready 只授予 admission 的资格，不证明实际消费者核已经获取 payload。ENTER/EXIT 和内联 FINISH 不执行消费者的本核获取；同步消费者同样遵守[消费者数据可见性](consumer-preparation.md)。依赖与 admission 判断继续由原调度规则执行，完成贡献不能直接强制消费者进入 kernel。
 
-CHECK 不计入业务 task 数。`pending_completed` 沿用持久核本地批量记账和 flush 机制，不能将局部记账等同于已发布的全局完成计数。逻辑 DONE、最终 trace 发布、MIX 资源退役和 run 存储回收分别满足各自的边界。
+每个逻辑 task 的唯一记账者在完成时立即上报一次。映射可用且设备任务数在 32 位范围内时，向本轮的 CntNotify 进度计数器写一次 INC(1)。其他情况直接对 GM 的 64 位 `resolved_task_count` 执行一次 FAA(+1)。Host 已完成的任务单独计入 `inline_completed_count`。CHECK 和仍有待满足条件的物理返回都不单独上报逻辑完成。
+
+AICPU 从本轮选定的进度计数器读取当前值，用于进度、超时和结束判定。达到目标后进入退出流程。全核退休得到确认后，AICPU 才将映射计数器的实测值写入 GM 诊断快照。GM 回退的进度已在原位更新。
 
 ## 5. 服务点、预算与进展
 
@@ -123,9 +129,9 @@ CHECK 不计入业务 task 数。`pending_completed` 沿用持久核本地批量
 | 领取 CAS | 2 |
 | 条件观察 | 8 |
 
-上述额度不包含可省略的“免费尾部”。领取前必须为本次可能发生的进度发布、交权、CHECK 目录终态更新，以及 GM join/内联 FINISH 或计数器条件贡献保留独立最坏预算；目录更新按每次最多 128 个原子操作计价。达到工作预算后不再开始新工作，只完成必要尾部。不同类型操作的实际耗时由[性能验证](validation.md)校准。
+上述额度不包含可省略的“免费尾部”。领取前必须为本次可能发生的进度发布、交权、CHECK 目录终态更新，以及 GM join/内联 FINISH 或计数器条件贡献保留独立最坏预算；已映射半区的目录更新为一次位命令，GM 回退半区按一次初始读取和最多 128 次 CAS 计价。达到工作预算后不再开始新工作，只完成必要尾部。不同类型操作的实际耗时由[性能验证](validation.md)校准。
 
-最后一个 CHECK 清除自己的目录位后，GM 路径可能通过 join settle 获得内联 FINISH 完成权，计数器路径则贡献条件 credit。这一尾部只有 CHECK 清位的一次目录更新，最多 128 次 CAS 加一次初始 ld_dev；不存在第二次 FINISH 目录发布。lease、join、DONE/计数器贡献、数据发布和屏障另行计价。普通条件观察额度为 8 不限制已预留的固定尾部；该数值是协议上界，不是常态耗时或已测性能。
+最后一个 CHECK 清除自己的目录位后，GM 路径可能通过 join settle 获得内联 FINISH 完成权，计数器路径则贡献条件 credit。这一尾部只有 CHECK 清位的一次目录更新：已映射半区执行一次 BIT_CLR，GM 半区执行一次初始 ld_dev 和最多 128 次 CAS；不存在第二次 FINISH 目录发布。lease、join、DONE/计数器贡献、数据发布和屏障另行计价。普通条件观察额度为 8 不限制已预留的固定尾部；该数值是协议上界，不是常态耗时或已测性能。
 
 若后续因具体读取缺口增加分段获取，须纳入同一工作预算和公平性证明，不能各追加一份隐藏 slice。等待 cohort 的核继续经过安全服务门，最终许可后不再插入服务。cohort start 及既有已预留 ready 批次按实际操作数保留固定尾部预算。
 

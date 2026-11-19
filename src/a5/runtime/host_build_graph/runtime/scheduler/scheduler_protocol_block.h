@@ -14,21 +14,18 @@
 #include "scheduler_ready.h"
 
 static inline __aicore__ __gm__ SchedulerProtocolBlockTrace *scheduler_protocol_block_at(
-    __gm__ void *base, const SchedulerLocalState *local, __gm__ const SchedulerProtocolLayout *layout, uint32_t block
+    __gm__ void *base, const SchedulerLocalState *local, __gm__ const SchedulerProtocolLayout *layout, int64_t task,
+    uint32_t block
 ) {
-    const auto *admission = local->admission;
-    if (admission == nullptr || admission->epoch != layout->run_epoch || admission->current_task_ref < 0 ||
-        static_cast<uint64_t>(admission->current_task_ref) >= layout->task_count ||
-        admission->scan_cursor >= layout->cooperative_task_count || block >= admission->current_block_num) {
+    if (task < 0 || static_cast<uint64_t>(task) >= layout->task_count || local->config.task_catalog_offset == 0) {
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
         return nullptr;
     }
-    const auto *metadata = scheduler_task_metadata_at(base, local, admission->current_task_ref);
+    const auto *metadata = scheduler_task_metadata_at(base, local, task);
     const LaneMask mask = scheduler_task_lanes(*metadata);
     const uint64_t index =
         static_cast<uint64_t>(metadata->trace_index_base) + static_cast<uint64_t>(block) * mask.count();
-    if (mask.is_empty() || !mask.is_valid() || mask != admission->current_active_mask ||
-        metadata->logical_block_num != admission->current_block_num || index >= layout->trace_count) {
+    if (mask.is_empty() || !mask.is_valid() || block >= metadata->logical_block_num || index >= layout->trace_count) {
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
         return nullptr;
     }
@@ -36,35 +33,35 @@ static inline __aicore__ __gm__ SchedulerProtocolBlockTrace *scheduler_protocol_
 }
 
 inline __aicore__ bool scheduler_protocol_owner_matches(
-    const SchedulerLocalState *local, __gm__ const SchedulerProtocolBlockOwner *owner, uint32_t block
+    const SchedulerLocalState *local, __gm__ const SchedulerProtocolBlockOwner *owner, uint64_t epoch, int64_t task,
+    uint32_t block
 ) {
-    const auto &admission = *local->admission;
-    return owner->claim_after.sequence != 0 && owner->run_epoch == admission.epoch &&
-           owner->task_ref == admission.current_task_ref && owner->order_key == admission.scan_cursor &&
+    return owner->claim_after.sequence != 0 && owner->run_epoch == epoch && owner->task_ref == task &&
            owner->block_idx == block && owner->worker_index == local->worker_id();
 }
 
 static inline __aicore__ void scheduler_protocol_block_claim(
-    __gm__ void *base, const SchedulerLocalState *local, uint32_t block, uint64_t before, uint64_t after,
+    __gm__ void *base, const SchedulerLocalState *local, int64_t task, uint32_t block, uint64_t before, uint64_t after,
     uint64_t confirmed_count = 0
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
-    auto *record = scheduler_protocol_block_at(base, local, layout, block);
+    auto *record = scheduler_protocol_block_at(base, local, layout, task, block);
     if (record == nullptr) return;
     auto *owner = &record->owner;
     scheduler_protocol_observe_record(owner);
     if (!scheduler_protocol_stamp_at(base, local, layout, &owner->claim_before, before)) return;
-    const auto &admission = *local->admission;
-    owner->run_epoch = admission.epoch;
-    owner->task_ref = admission.current_task_ref;
-    owner->order_key = admission.scan_cursor;
+    const auto &catalog = *scheduler_state_at<SchedulerTaskCatalogHeader>(base, local->config.task_catalog_offset);
+    const auto *metadata = scheduler_task_metadata_at(base, local, task);
+    owner->run_epoch = layout->run_epoch;
+    owner->task_ref = task;
+    owner->order_key = scheduler_task_catalog_order(base, catalog, static_cast<uint32_t>(task)).rank;
     owner->worker_index = static_cast<uint32_t>(local->worker_id());
     owner->block_idx = block;
     owner->cluster_index = static_cast<uint32_t>(local->config.shared_context->cluster_index);
-    owner->logical_block_num = admission.current_block_num;
-    scheduler_lane_mask_store(owner->active_mask, admission.current_active_mask);
-    owner->flags = admission.current_flags;
+    owner->logical_block_num = metadata->logical_block_num;
+    scheduler_lane_mask_store(owner->active_mask, scheduler_task_lanes(*metadata));
+    owner->flags = metadata->flags;
     owner->completion_ticket = UINT64_MAX;
     scheduler_protocol_stamp_at(base, local, layout, &owner->claim_after, after);
     scheduler_protocol_publish_record(owner);
@@ -73,161 +70,52 @@ static inline __aicore__ void scheduler_protocol_block_claim(
     claim->confirmed_count = confirmed_count;
     claim->worker_index = owner->worker_index;
     claim->block_idx = block;
-    claim->run_epoch = admission.epoch;
+    claim->run_epoch = layout->run_epoch;
     scheduler_protocol_publish_record(claim);
 }
 
 static inline __aicore__ void scheduler_protocol_claim_seal(
-    __gm__ void *base, const SchedulerLocalState *local, uint32_t block, bool before, uint64_t value
+    __gm__ void *base, const SchedulerLocalState *local, int64_t task, uint32_t block, bool before, uint64_t value
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
-    auto *record = scheduler_protocol_block_at(base, local, layout, block);
+    auto *record = scheduler_protocol_block_at(base, local, layout, task, block);
     if (record == nullptr) return;
     auto *claim = &record->claim;
-    if (!scheduler_protocol_owner_matches(local, &record->owner, block) ||
-        claim->confirmed_count != local->admission->current_block_num || value != claim->confirmed_count ||
-        (!before && claim->published_before.sequence == 0)) {
+    const auto *metadata = scheduler_task_metadata_at(base, local, task);
+    if (value != metadata->logical_block_num || value == 0 ||
+        (!before && (claim->published_before.sequence == 0 || claim->run_epoch != layout->run_epoch ||
+                     claim->worker_index != local->worker_id() || claim->block_idx != block))) {
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
         return;
     }
     if (!scheduler_protocol_stamp(base, local, layout, before ? &claim->published_before : &claim->published_after))
         return;
+    claim->run_epoch = layout->run_epoch;
+    claim->worker_index = static_cast<uint32_t>(local->worker_id());
+    claim->block_idx = block;
     claim->seal_value = value;
     scheduler_protocol_publish_record(claim);
 }
 
 static inline __aicore__ void scheduler_protocol_block_complete(
-    __gm__ void *base, const SchedulerLocalState *local, uint32_t block, bool before, uint64_t ticket,
+    __gm__ void *base, const SchedulerLocalState *local, int64_t task, uint32_t block, bool before, uint64_t ticket,
     uint32_t credits = 0
 ) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
-    auto *record = scheduler_protocol_block_at(base, local, layout, block);
+    auto *record = scheduler_protocol_block_at(base, local, layout, task, block);
     if (record == nullptr) return;
     auto *owner = &record->owner;
-    if (!scheduler_protocol_owner_matches(local, owner, block) || (!before && owner->completion_before.sequence == 0)) {
+    if (!scheduler_protocol_owner_matches(local, owner, layout->run_epoch, task, block) ||
+        (!before && owner->completion_before.sequence == 0)) {
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
         return;
     }
     if (!scheduler_protocol_stamp(base, local, layout, before ? &owner->completion_before : &owner->completion_after))
         return;
     if (!before) owner->completion_ticket = ticket;
+    owner->completion_worker = static_cast<uint32_t>(local->worker_id());
     owner->completion_credits = credits;
     scheduler_protocol_publish_record(owner);
-}
-
-static inline __aicore__ void
-scheduler_protocol_group_publish(__gm__ void *base, const SchedulerLocalState *local, bool before) {
-    auto *layout = scheduler_protocol_layout_at(base, local);
-    if (layout == nullptr) return;
-    const auto &group = local->admission->gm_mix;
-    auto *record = scheduler_protocol_block_at(base, local, layout, group.block_idx);
-    if (record == nullptr) return;
-    auto *owner = &record->owner;
-    if (!scheduler_protocol_owner_matches(local, owner, group.block_idx) || group.group_seq == 0 ||
-        (!before && (owner->publish_before.sequence == 0 || owner->group_seq != group.group_seq))) {
-        scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
-        return;
-    }
-    if (!scheduler_protocol_stamp(base, local, layout, before ? &owner->publish_before : &owner->publish_after)) return;
-    if (before) owner->group_seq = group.group_seq;
-    scheduler_protocol_publish_record(owner);
-}
-
-static inline __aicore__ void scheduler_protocol_group_descriptor(
-    __gm__ void *base, const SchedulerLocalState *local, __gm__ const SchedulerGroupDescriptor *descriptor
-) {
-    auto *layout = scheduler_protocol_layout_at(base, local);
-    if (layout == nullptr) return;
-    const auto &admission = *local->admission;
-    const auto &group = admission.gm_mix;
-    auto *record = scheduler_protocol_block_at(base, local, layout, group.block_idx);
-    if (record == nullptr) return;
-    if (local->config.self_lane >= 3 || descriptor->run_epoch != admission.epoch ||
-        descriptor->task_ref != admission.current_task_ref || descriptor->order_key != admission.scan_cursor ||
-        descriptor->group_seq != group.group_seq || descriptor->block_idx != group.block_idx) {
-        scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
-        return;
-    }
-    auto *lane = &record->lanes[local->config.self_lane];
-    scheduler_protocol_observe_record(lane);
-    if (!scheduler_protocol_stamp(base, local, layout, &lane->descriptor_ready)) return;
-    lane->run_epoch = descriptor->run_epoch;
-    lane->task_ref = descriptor->task_ref;
-    lane->order_key = descriptor->order_key;
-    lane->group_seq = descriptor->group_seq;
-    lane->worker_index = static_cast<uint32_t>(local->worker_id());
-    lane->block_idx = descriptor->block_idx;
-    lane->cluster_index = descriptor->cluster_index;
-    lane->lane = local->config.self_lane;
-    scheduler_lane_mask_store(lane->active_mask, admission.current_active_mask);
-    lane->flags = admission.current_flags;
-    lane->logical_block_num = admission.current_block_num;
-    scheduler_lane_mask_store(lane->resource_mask, admission.current_resource_mask);
-    for (uint32_t peer = 0; peer < 3; ++peer) {
-        lane->lane_subtasks[peer] =
-            admission.current_active_mask.has(static_cast<SubtaskSlot>(peer)) ? peer : UINT8_MAX;
-        lane->previous_lane_seq[peer] = descriptor->previous_lane_seq[peer];
-    }
-    scheduler_protocol_publish_record(lane);
-}
-
-inline __aicore__ bool
-scheduler_protocol_lane_matches(const SchedulerLocalState *local, __gm__ const SchedulerProtocolLaneTrace *lane) {
-    const auto &admission = *local->admission;
-    return lane->descriptor_ready.sequence != 0 && lane->run_epoch == admission.epoch &&
-           lane->task_ref == admission.current_task_ref && lane->order_key == admission.scan_cursor &&
-           lane->group_seq == admission.gm_mix.group_seq && lane->block_idx == admission.gm_mix.block_idx &&
-           lane->worker_index == local->worker_id() && lane->lane == local->config.self_lane;
-}
-
-static inline __aicore__ void
-scheduler_protocol_lane_publication(__gm__ void *base, const SchedulerLocalState *local, bool release, bool before) {
-    auto *layout = scheduler_protocol_layout_at(base, local);
-    if (layout == nullptr) return;
-    auto *record = scheduler_protocol_block_at(base, local, layout, local->admission->gm_mix.block_idx);
-    if (record == nullptr) return;
-    auto *lane = &record->lanes[local->config.self_lane];
-    if (!scheduler_protocol_lane_matches(local, lane) || (release && lane->arrivals_observed.sequence == 0) ||
-        (!before && (release ? lane->release_before.sequence : lane->arrive_before.sequence) == 0)) {
-        scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
-        return;
-    }
-    auto *stamp = release ? (before ? &lane->release_before : &lane->release_after) :
-                            (before ? &lane->arrive_before : &lane->arrive_after);
-    if (!scheduler_protocol_stamp(base, local, layout, stamp)) return;
-    scheduler_publish_cache_line(lane);
-}
-
-static inline __aicore__ void scheduler_protocol_group_acks(
-    __gm__ void *base, const SchedulerLocalState *local, bool releases, const uint64_t *observed
-) {
-    auto *layout = scheduler_protocol_layout_at(base, local);
-    if (layout == nullptr) return;
-    const auto &group = local->admission->gm_mix;
-    auto *record = scheduler_protocol_block_at(base, local, layout, group.block_idx);
-    if (record == nullptr) return;
-    auto *lane = &record->lanes[local->config.self_lane];
-    if ((releases && !scheduler_protocol_owner_matches(local, &record->owner, group.block_idx)) ||
-        (!releases && !scheduler_protocol_lane_matches(local, lane))) {
-        scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
-        return;
-    }
-    auto *stamp = releases ? &record->owner.releases_observed : &lane->arrivals_observed;
-    auto *values = releases ? record->owner.released_seq : lane->arrived_seq;
-    const LaneMask resources = local->admission->current_resource_mask;
-    for (uint32_t peer = 0; peer < 3; ++peer) {
-        const uint64_t expected = resources.has(static_cast<SubtaskSlot>(peer)) ? group.group_seq : 0;
-        if (observed[peer] != expected || (stamp->sequence != 0 && values[peer] != observed[peer])) {
-            scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
-            return;
-        }
-    }
-    if (stamp->sequence != 0) return;
-    if (!scheduler_protocol_stamp(base, local, layout, stamp)) return;
-    for (uint32_t peer = 0; peer < 3; ++peer)
-        values[peer] = observed[peer];
-    if (releases) scheduler_protocol_publish_record(&record->owner);
-    else scheduler_protocol_publish_record(lane);
 }

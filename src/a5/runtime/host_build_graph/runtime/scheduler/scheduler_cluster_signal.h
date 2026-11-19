@@ -27,32 +27,31 @@ inline constexpr uint32_t SCHEDULER_CLUSTER_REGION_OFFSET = 2 * 1024;
 inline constexpr uint32_t SCHEDULER_CLUSTER_REGION_BYTES = 1024;
 static_assert(SCHEDULER_CLUSTER_REGION_OFFSET + SCHEDULER_CLUSTER_REGION_BYTES == PLATFORM_SSBUF_SIZE);
 
-// The coordinator owns publication; each active lane owns its acknowledgement.
-// Preparation and formal resource arbitration use independent generations.
-struct SchedulerClusterSignal {
-    volatile uint64_t run_epoch;
-    volatile int64_t prepare_task_ref;
-    volatile uint32_t prepare_block;
-    volatile uint32_t prepare_mask;
-    volatile uint32_t prepare_generation;
-    volatile uint32_t prepared[PLATFORM_CORES_PER_BLOCKDIM];
-    volatile uint32_t sync_frontier[PLATFORM_CORES_PER_BLOCKDIM];
-    volatile uint32_t sync_hold[PLATFORM_CORES_PER_BLOCKDIM];
-    volatile uint32_t staged_mask;
-    volatile uint32_t armed_generation;
+// AIV0 publishes the descriptor and the cluster's monotonic order boundary.
+struct SchedulerClusterDescriptor {
     volatile int64_t task_ref;
-    volatile uint64_t anchor_state;
-    volatile uint32_t sync_tail;
+    volatile uint32_t rank;
     volatile uint32_t block_idx;
     volatile uint32_t active_mask;
+    volatile uint32_t armed_generation;
+    volatile uint32_t order_ready[PLATFORM_CORES_PER_BLOCKDIM];
     volatile uint32_t arrived[PLATFORM_CORES_PER_BLOCKDIM];
     volatile uint32_t finished[PLATFORM_CORES_PER_BLOCKDIM];
-    volatile uint64_t gm_arrival_seq;
+    volatile uint32_t dependencies_generation;
+    volatile uint32_t accounted_generation;
+    volatile uint32_t trace_generation;
+};
+struct SchedulerClusterSignal {
+    volatile uint64_t run_epoch;
+    volatile uint32_t mix_floor;
+    SchedulerClusterDescriptor groups[SCHEDULER_MIX_MEMBER_COUNT];
 };
 static_assert(sizeof(SchedulerClusterSignal) <= SCHEDULER_CLUSTER_REGION_BYTES);
-static_assert(sizeof(SchedulerClusterSignal) == 136 && offsetof(SchedulerClusterSignal, anchor_state) == 80);
-static_assert(alignof(SchedulerClusterSignal) <= 8);
-static_assert(std::is_standard_layout_v<SchedulerClusterSignal>);
+static_assert(alignof(SchedulerClusterSignal) <= 8 && std::is_standard_layout_v<SchedulerClusterSignal>);
+
+inline __aicore__ uint8_t scheduler_mix_accountant_lane(LaneMask active) {
+    return active.has_aiv0() ? static_cast<uint8_t>(SubtaskSlot::AIV0) : static_cast<uint8_t>(SubtaskSlot::AIC);
+}
 
 inline __aicore__ SCHEDULER_CLUSTER_SSBUF SchedulerClusterSignal *scheduler_cluster_signal_at(uint64_t hardware_base) {
     return reinterpret_cast<SCHEDULER_CLUSTER_SSBUF SchedulerClusterSignal *>(
@@ -103,50 +102,25 @@ scheduler_cluster_store_release(SCHEDULER_CLUSTER_SSBUF volatile uint32_t *field
     scheduler_cluster_store_field(field, value);
 }
 
-// Called only by the AIC before publishing this cluster's GM INIT bit.
+// The cluster bootstrap handshake makes these fields visible to every lane.
 inline __aicore__ void
 scheduler_cluster_signal_clear(SCHEDULER_CLUSTER_SSBUF SchedulerClusterSignal *signal, uint64_t run_epoch) {
     scheduler_cluster_store_field(&signal->run_epoch, run_epoch);
-    scheduler_cluster_store_field(&signal->gm_arrival_seq, UINT64_C(0));
-    scheduler_cluster_store_field(&signal->prepare_task_ref, INT64_C(-1));
-    scheduler_cluster_store_field(&signal->prepare_block, UINT32_C(0));
-    scheduler_cluster_store_field(&signal->prepare_mask, UINT32_C(0));
-    scheduler_cluster_store_field(&signal->staged_mask, UINT32_C(0));
-    scheduler_cluster_store_field(&signal->armed_generation, UINT32_C(0));
-    scheduler_cluster_store_field(&signal->task_ref, INT64_C(-1));
-    scheduler_cluster_store_field(&signal->anchor_state, UINT64_C(0));
-    scheduler_cluster_store_field(&signal->sync_tail, UINT32_C(0));
-    scheduler_cluster_store_field(&signal->block_idx, UINT32_C(0));
-    scheduler_cluster_store_field(&signal->active_mask, UINT32_C(0));
-    for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-        scheduler_cluster_store_field(&signal->prepared[lane], UINT32_C(0));
-        scheduler_cluster_store_field(&signal->sync_frontier[lane], UINT32_C(0));
-        scheduler_cluster_store_field(&signal->sync_hold[lane], UINT32_C(0));
-        scheduler_cluster_store_field(&signal->arrived[lane], UINT32_C(0));
-        scheduler_cluster_store_field(&signal->finished[lane], UINT32_C(0));
+    scheduler_cluster_store_field(&signal->mix_floor, UINT32_C(0));
+    for (uint32_t bank = 0; bank < SCHEDULER_MIX_MEMBER_COUNT; ++bank) {
+        auto *descriptor = &signal->groups[bank];
+        scheduler_cluster_store_field(&descriptor->task_ref, SCHEDULER_TASK_REF_INVALID);
+        scheduler_cluster_store_field(&descriptor->rank, UINT32_MAX);
+        scheduler_cluster_store_field(&descriptor->block_idx, UINT32_MAX);
+        scheduler_cluster_store_field(&descriptor->active_mask, UINT32_C(0));
+        scheduler_cluster_store_field(&descriptor->trace_generation, UINT32_C(0));
+        scheduler_cluster_store_field(&descriptor->dependencies_generation, UINT32_C(0));
+        scheduler_cluster_store_field(&descriptor->accounted_generation, UINT32_C(0));
+        for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+            scheduler_cluster_store_field(&descriptor->order_ready[lane], UINT32_C(0));
+            scheduler_cluster_store_field(&descriptor->arrived[lane], UINT32_C(0));
+            scheduler_cluster_store_field(&descriptor->finished[lane], UINT32_C(0));
+        }
+        scheduler_cluster_store_release(&descriptor->armed_generation, UINT32_C(0));
     }
-    scheduler_cluster_store_release(&signal->prepare_generation, UINT32_C(0));
-}
-
-// The store-to-load fence pairs with the coordinator's staged-mask fence.
-// A release store alone would leave both sides able to miss the conflict.
-inline __aicore__ void
-scheduler_cluster_hold_sync(SCHEDULER_CLUSTER_SSBUF SchedulerClusterSignal *signal, uint32_t lane, uint64_t sequence) {
-    if (signal == nullptr) return;
-    scheduler_cluster_store_field(&signal->sync_hold[lane], static_cast<uint32_t>(sequence + 1));
-    scheduler_cluster_barrier();
-}
-
-inline __aicore__ void scheduler_cluster_advance_sync(
-    SCHEDULER_CLUSTER_SSBUF SchedulerClusterSignal *signal, uint32_t lane, uint64_t frontier
-) {
-    if (signal == nullptr) return;
-    scheduler_cluster_store_field(&signal->sync_frontier[lane], static_cast<uint32_t>(frontier));
-    scheduler_cluster_barrier();
-    scheduler_cluster_store_field(&signal->sync_hold[lane], UINT32_C(0));
-}
-
-inline __aicore__ bool
-scheduler_cluster_names_lane(const SCHEDULER_CLUSTER_SSBUF SchedulerClusterSignal *signal, uint32_t lane) {
-    return signal != nullptr && (scheduler_cluster_load_acquire(&signal->staged_mask) & (UINT32_C(1) << lane)) != 0;
 }

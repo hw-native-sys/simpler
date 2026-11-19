@@ -23,8 +23,8 @@ A2A3/WSE 和 percounter 的活跃 materializer 仍使用各自当前合同，默
 | [数据布局与 Host 绑定](a5-hbg-graph-task/data-layout.md) | node/ref、80 B 顶层镜像、GM 所有权、256 B trace、实例参数与预算 |
 | [调度与发布协议](a5-hbg-graph-task/protocol.md) | 从设备入口、READY、bootstrap 到完成和清退 |
 | [Canonical completion gate](a5-hbg-graph-task/dependency-counters.md) | producer DONE、compute/async debt 和控制节点完成 |
-| [工作目录与 execution token](a5-hbg-graph-task/ready-queue-design.md) | 目录、四个 token、两个私有 slot、park/resume 与前进性 |
-| [Build/execute 合同](a5-hbg-graph-task/build-execute-separation.md) | Call/Claim、参数观察、MIX replacement、优化约束 |
+| [工作目录与 execution token](a5-hbg-graph-task/ready-queue-design.md) | 引擎目录、固定 owner、自取与 MIX 执行记录 |
+| [Build/execute 合同](a5-hbg-graph-task/build-execute-separation.md) | Call/Claim、参数观察、簇内 MIX、优化约束 |
 | [Resident 走读](../a5-hbg-aicore-walkthrough/README.md) | 跨 Host/AICPU/AICore 的执行说明 |
 | [实施与历史验证](a5-hbg-graph-task/implementation.md) | 分提交的验证证据，不替代当前提交验收 |
 | [历史性能与原型](a5-hbg-graph-task/qwen-performance.md) | 被测提交、反例和已撤回候选 |
@@ -49,13 +49,13 @@ flowchart LR
 
 ENTER 继承外部 fanin，root 增加 ENTER 依赖，child 内部引用保持 Graph 的语义。
 外部 consumer 对 shell 的引用映射到 EXIT；EXIT 等待全部 sink，包括不连通分量。
-控制节点不占 kernel slot，不具有业务 execution identity，也不增加 admission membership。
+控制节点不占 kernel slot，不具有业务 execution identity，也不承诺计算成员位置。
 Host 在 launch 前发布紧凑拓扑和已绑定参数；原始 `Graph`、边界绑定输入和重定位记录留在 Host。
 设备不动态添加节点或绑定 child 参数。
 
 每个实际 block/lane 的 immutable Call 引用稳定的 invocation Binding。
-普通 token 可以提前领取执行责任、等待 producer gate；依赖满足后才转入本核 slot 并通过最终执行许可。
-MIX 使用 cluster reservation，sync_start 使用全 run 的 cooperative admission 顺序。
+普通 token 可以提前领取执行责任、等待 producer gate；依赖满足后在原记录发布最终 payload，取得本核执行许可。
+MIX 由各簇 AIV0 代领，活动 lane 接收 SSBUF 描述符；冲突的 MIX 与 sync_start 按 Host rank、跨来源进度及实际成员责任保序。
 Graph 本身不建立新的资源顺序域，一个 cohort 也不扩大为整个 Graph。
 
 ## 不变量与资源成本
@@ -77,7 +77,7 @@ Graph 本身不建立新的资源顺序域，一个 cohort 也不扩大为整个
 Graph 完成时计算并缓存预算，提交和 bind 使用同一算法检查溢出与实例边界。
 公共 execution_storage_bytes 继续描述 A2A3/WSE/percounter 的活跃 GraphExecution，不能当作默认 native 参数预算。
 
-resident backing 仍需计入 640 B/node control，以及按真实执行数放大的 512 B Call、
+resident backing 仍需计入 1152 B/node 的 `SchedulerTaskControl`（九个 128 B 区，其中四个用于普通 block 领取），以及按真实执行数放大的 512 B Call、
 128 B Claim、128 B Binding、256 B trace 和实际启用的诊断/async 区域。
 缩小结构或删去重复计划不等于已证明延迟下降；性能必须用同输入、同设备、同 DFX 配置的对照衡量。
 

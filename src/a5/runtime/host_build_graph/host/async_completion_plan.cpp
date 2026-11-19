@@ -163,8 +163,11 @@ bool initialize_async_completion(void *image, uint64_t image_bytes, const AsyncC
         joins[index].word = 0;
     }
     auto *checks = scheduler_state_at<SchedulerAsyncDirectoryWord>(image, plan.layout.check_directory_offset);
-    for (uint64_t word = 0; word < (static_cast<uint64_t>(plan.layout.group_count) + 63) / 64; ++word)
+    for (uint64_t word = 0; word < (static_cast<uint64_t>(plan.layout.group_count) + 63) / 64; ++word) {
         checks[word].bits = 0;
+        checks[word].notification_addresses[0] = 0;
+        checks[word].notification_addresses[1] = 0;
+    }
     AsyncGroupData header{};
     header.run_epoch = plan.layout.run_epoch;
     header.sdma_guards_offset = plan.layout.sdma_guards_offset;

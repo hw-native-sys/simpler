@@ -52,59 +52,50 @@ protected:
             ASSERT_TRUE(fixture.claim_ordinary(1, held_worker));
             ASSERT_TRUE(fixture.progress_ordinary(held_worker));
             ASSERT_TRUE(fixture.begin(held_worker, &held));
-            EXPECT_EQ(
-                fixture.control(successor)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::UNCLAIMED)
-            );
-            EXPECT_EQ(fixture.locals[producer_lane]->slots[producer.slot].state, SchedulerDispatchSlotState::EXECUTING);
             ASSERT_EQ(held.task, 1);
         }
-        if (independent) {
-            bool progress = false;
-            // Task 1 is the shared issue head. Discovery cannot skip its
-            // unowned block to reserve task 2, even though task 2 is visible.
-            ASSERT_TRUE(scheduler_cluster_mix_discover_task(
-                fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 2, &progress
-            ));
-            EXPECT_TRUE(scheduler_task_ref_is_null(fixture.locals[0]->cluster_pending.task_ref));
-            EXPECT_EQ(fixture.control(2)->next_block, 0u);
-            ASSERT_TRUE(scheduler_cluster_mix_discover_task(
-                fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), 1, &progress
-            ));
-            EXPECT_TRUE(progress);
-            EXPECT_EQ(fixture.locals[0]->cluster_pending.task_ref, 1);
-        }
-        ASSERT_TRUE(fixture.complete(producer));
-        EXPECT_EQ(
-            scheduler_completion_task_state(fixture.control(0)->completion_state),
-            static_cast<int64_t>(SchedulerTaskState::DONE)
-        );
-        EXPECT_EQ(
-            fixture.control(successor)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::UNCLAIMED)
-        );
-        if (independent) {
-            EXPECT_EQ(fixture.locals[0]->cluster_pending.task_ref, 1);
-            EXPECT_EQ(fixture.control(1)->next_block, 1u);
-            EXPECT_EQ(fixture.control(2)->next_block, 0u);
-        }
-        if (scenario == HandoffScenario::TWO_SUCCESSORS)
-            EXPECT_EQ(fixture.control(2)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::UNCLAIMED));
-        EXPECT_EQ(fixture.storage.layout.admission_control_offset, 0u);
-        for (const auto *local : fixture.locals)
-            EXPECT_EQ(local->admission, nullptr);
-        if (busy) {
-            for (uint32_t worker = 0; worker < 3; ++worker)
-                ASSERT_TRUE(fixture.fill(worker)) << "worker=" << worker << " site=" << fixture.run()->error_site
-                                                  << " task=" << fixture.run()->error_task_ref;
+        // Service can distribute an independent MIX or a successor descriptor.
+        // Successor kernels must still wait for the producer's real return.
+        for (uint32_t pass = 0; pass < 4; ++pass) {
             for (uint32_t worker = 0; worker < 3; ++worker) {
+                if (worker == producer_lane || (busy && worker == held_worker)) continue;
+                ASSERT_TRUE(fixture.fill(worker));
+                const auto &mix = fixture.locals[worker]->execution_at(SCHEDULER_CLUSTER_MIX_EXECUTION);
+                if (independent && mix.task_ref == 1) continue;
+                EXPECT_NE(mix.state, SchedulerDispatchSlotState::READY);
                 GmExecution premature{};
-                EXPECT_FALSE(fixture.begin(worker, &premature));
+                ASSERT_FALSE(fixture.begin(worker, &premature));
             }
-            EXPECT_EQ(fixture.locals[held_worker]->slots[held.slot].state, SchedulerDispatchSlotState::EXECUTING);
-            EXPECT_EQ(scheduler_completion_count(fixture.control(successor)->completion_state), 0u);
-            ASSERT_TRUE(fixture.complete(held));
         }
+        EXPECT_FALSE(fixture.task_done(0));
+        EXPECT_EQ(scheduler_completion_count(fixture.control(successor)->completion_state), 0u);
         std::set<std::tuple<int64_t, uint32_t, uint8_t>> executions;
         std::vector<int64_t> first_entries;
+        if (independent && producer_lane == 0 && mask == LaneMask::both_aiv()) {
+            GmExecution independent_entry{};
+            ASSERT_TRUE(fixture.begin(1, &independent_entry));
+            ASSERT_EQ(independent_entry.task, 1);
+            ASSERT_FALSE(fixture.task_done(0));
+            executions.emplace(independent_entry.task, independent_entry.block, independent_entry.subtask);
+            first_entries.push_back(independent_entry.task);
+            ASSERT_TRUE(fixture.complete(independent_entry));
+        }
+        ASSERT_TRUE(fixture.complete(producer));
+        EXPECT_TRUE(fixture.task_done(0));
+        if (busy) {
+            for (uint32_t worker = 0; worker < 3; ++worker) {
+                if (worker == held_worker) continue;
+                ASSERT_TRUE(fixture.fill(worker));
+                if (mask.has(static_cast<SubtaskSlot>(held_worker))) {
+                    GmExecution premature{};
+                    EXPECT_FALSE(fixture.begin(worker, &premature));
+                }
+            }
+            EXPECT_EQ(
+                fixture.locals[held_worker]->execution_at(held.slot).state, SchedulerDispatchSlotState::EXECUTING
+            );
+            ASSERT_TRUE(fixture.complete(held));
+        }
         bool finished = false;
         for (uint32_t step = 0; step < 128 && !finished; ++step) {
             for (uint32_t worker = 0; worker < 3; ++worker) {
@@ -118,10 +109,7 @@ protected:
                     first_entries.push_back(execution.task);
                 ASSERT_TRUE(fixture.complete(execution));
             }
-            uint64_t completed = 0;
-            for (const auto *local : fixture.locals)
-                completed += local->pending_completed;
-            finished = completed == shapes.size();
+            finished = scheduler_test::resolved_count(fixture.run()) == shapes.size();
         }
         ASSERT_TRUE(finished);
         EXPECT_EQ(executions.size(), static_cast<size_t>(mask.count()) * (second_mix ? 2 : 1));
@@ -129,10 +117,6 @@ protected:
             second_mix ? std::vector<int64_t>{1, 2} : std::vector<int64_t>{successor};
         std::sort(first_entries.begin(), first_entries.end());
         EXPECT_EQ(first_entries, expected_tasks);
-        for (const int64_t task : expected_tasks)
-            EXPECT_EQ(
-                fixture.control(task)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::UNCLAIMED)
-            );
         for (uint32_t task = 0; task < shapes.size(); ++task)
             EXPECT_EQ(
                 scheduler_completion_task_state(fixture.control(task)->completion_state),
@@ -158,103 +142,25 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Combine(::testing::Values(0u, 1u, 2u), ::testing::ValuesIn(kMixMasks))
 );
 
-TEST(HbgDirectAdmissionRetry, SyncSuccessorsRemainDiscoverableBehindAnExistingPendingOwner) {
-    for (const auto child_mask : {LaneMask::aiv0(), LaneMask::both_aiv(), LaneMask::all()}) {
-        SCOPED_TRACE(lane_names(child_mask));
-        GmMixFixture fixture({{2, LaneMask::aic(), true}, {2, LaneMask::aic(), true}, {2, child_mask, true}}, false, 2);
-        fixture.graph.executable(2, child_mask.has_aic() ? 0 : 1, {0});
-        const std::vector<SchedulerTaskMetadata> metadata(
-            fixture.storage.metadata, fixture.storage.metadata + fixture.storage.layout.task_count
-        );
-        ASSERT_TRUE(scheduler_validate_dependencies(fixture.graph.graph(), metadata, {}));
+TEST(HbgDirectMixHandoffOrder, AllEarlierSyncBlocksCanRunBeforeAnIndependentLaterCohort) {
+    for (const auto successor : {LaneMask::aiv0(), LaneMask::both_aiv(), LaneMask::all()}) {
+        GmMixFixture fixture({{2, LaneMask::aic(), true}, {2, LaneMask::aic(), true}, {2, successor, true}});
+        fixture.graph.executable(2, successor.has_aic() ? 0 : 1, {0});
         ASSERT_TRUE(fixture.prepare_calls());
-        ASSERT_TRUE(fixture.admit(0));
-        ASSERT_TRUE(fixture.refresh_all());
-        std::array<GmExecution, 2> producers{};
-        std::array<bool, 2> entered{};
-        for (uint32_t step = 0; step < 16 && (!entered[0] || !entered[1]); ++step) {
-            for (uint32_t cluster = 0; cluster < 2; ++cluster) {
-                if (entered[cluster]) continue;
-                const uint32_t worker = cluster * 3;
-                bool failed = false;
-                scheduler_fill_ordered_slots<false>(
-                    fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), 0, &failed
-                );
-                ASSERT_FALSE(failed);
-                entered[cluster] = fixture.begin(worker, &producers[cluster]);
+        std::set<std::tuple<int64_t, uint32_t, uint8_t>> completed;
+        for (uint32_t pass = 0; pass < 64 && scheduler_test::resolved_count(fixture.run()) != 3; ++pass) {
+            for (uint32_t worker = 0; worker < fixture.locals.size(); ++worker) {
+                ASSERT_TRUE(fixture.fill(worker));
+                GmExecution unit{};
+                if (!fixture.begin(worker, &unit)) continue;
+                if (unit.task == 2) EXPECT_TRUE(fixture.task_done(0));
+                EXPECT_TRUE(completed.emplace(unit.task, unit.block, unit.subtask).second);
+                ASSERT_TRUE(fixture.complete(unit));
             }
         }
-        ASSERT_TRUE(entered[0] && entered[1]);
-        ASSERT_EQ(producers[0].task, 0);
-        ASSERT_EQ(producers[1].task, 0);
-        ASSERT_NE(producers[0].block, producers[1].block);
-        ASSERT_TRUE(fixture.claim_pending(1));
-        ASSERT_TRUE(fixture.complete(producers[0]));
-        ASSERT_TRUE(fixture.complete(producers[1]));
-        EXPECT_TRUE(fixture.task_done(0));
-        EXPECT_EQ(fixture.admissions[0].pending_task_ref, 1);
-        EXPECT_EQ(fixture.control(2)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED));
-        if (child_mask.is_mix()) {
-            EXPECT_FALSE(fixture.claim_pending(2));
-            EXPECT_EQ(fixture.admissions[0].pending_task_ref, 1);
-            EXPECT_EQ(fixture.control(2)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::INITIALIZED));
-        }
-        // A real producer return retires its physical slots before this owner
-        // closes the ordered obligation and publishes its already-held candidate.
-        std::array<bool, 6> closed{};
-        for (uint32_t step = 0; step < 16 && std::find(closed.begin(), closed.end(), false) != closed.end(); ++step)
-            for (uint32_t worker = 0; worker < 6; ++worker) {
-                if (closed[worker]) continue;
-                if (scheduler_task_ref_is_null(fixture.admissions[worker].current_task_ref)) {
-                    ASSERT_GE(fixture.admissions[worker].scan_cursor, 1u);
-                    closed[worker] = true;
-                    continue;
-                }
-                ASSERT_TRUE(
-                    scheduler_close_ordered_obligation<false>(
-                        fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), &closed[worker]
-                    )
-                );
-            }
-        ASSERT_EQ(std::find(closed.begin(), closed.end(), false), closed.end());
-        ASSERT_EQ(
-            scheduler_ordered_publish_pending(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run()),
-            SchedulerAdmissionResult::PROGRESS
-        );
-        ASSERT_TRUE(fixture.refresh_all());
-        // Publication alone does not close supply. Give both blocks of task 1
-        // physical owners before admitting the later same-engine successor.
-        entered.fill(false);
-        std::array<GmExecution, 2> independent{};
-        for (uint32_t step = 0; step < 16 && (!entered[0] || !entered[1]); ++step) {
-            for (uint32_t cluster = 0; cluster < 2; ++cluster) {
-                if (entered[cluster]) continue;
-                const uint32_t worker = cluster * 3;
-                bool failed = false;
-                scheduler_fill_ordered_slots<false>(
-                    fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), 0, &failed
-                );
-                ASSERT_FALSE(failed);
-                entered[cluster] = fixture.begin(worker, &independent[cluster]);
-            }
-        }
-        ASSERT_TRUE(entered[0] && entered[1]);
-        ASSERT_EQ(independent[0].task, 1);
-        ASSERT_EQ(independent[1].task, 1);
-        ASSERT_NE(independent[0].block, independent[1].block);
-        const uint32_t discovery_owner = child_mask.is_mix() ? 0 : 1;
-        ASSERT_TRUE(fixture.admit(2, discovery_owner));
-        EXPECT_EQ(fixture.control(2)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED));
-        auto *shared = scheduler_state_at<SchedulerAdmissionControl>(
-            fixture.base(), fixture.storage.layout.admission_control_offset
-        );
-        ASSERT_EQ(shared->commit_tail, 3u);
-        auto *log = scheduler_state_at<int64_t>(fixture.base(), fixture.storage.layout.admission_log_offset);
-        EXPECT_EQ(log[0], 0);
-        EXPECT_EQ(log[1], 1);
-        EXPECT_EQ(log[2], 2);
-        EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
+        EXPECT_EQ(completed.size(), 4u + 2u * successor.count());
+        EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 3u);
+        EXPECT_EQ(fixture.run()->scheduler_error, 0u);
     }
 }
-
 }  // namespace

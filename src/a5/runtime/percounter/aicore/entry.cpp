@@ -31,6 +31,9 @@
 template <CoreType Architecture>
 __aicore__ void percounter_execute_profiled(AicoreRuntimeView runtime, int block_idx);
 
+template <CoreType Architecture>
+__aicore__ void percounter_execute_task_profiled(AicoreRuntimeView runtime, int block_idx);
+
 __aicore__ __attribute__((weak)) void aicore_execute(AicoreRuntimeView runtime, int block_idx, CoreType core_type) {
     __gm__ Handshake *handshake =
         (__gm__ Handshake *)(&reinterpret_cast<__gm__ RuntimeSharedState *>(runtime.shared_state_addr)
@@ -39,5 +42,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(AicoreRuntimeView runtime, 
     if (runtime.chip_swimlane_level >= 3) {
         if (core_type == CoreType::AIC) percounter_execute_profiled<CoreType::AIC>(runtime, block_idx);
         else percounter_execute_profiled<CoreType::AIV>(runtime, block_idx);
+    } else if (runtime.chip_swimlane_level == 2) {
+        if (core_type == CoreType::AIC) percounter_execute_task_profiled<CoreType::AIC>(runtime, block_idx);
+        else percounter_execute_task_profiled<CoreType::AIV>(runtime, block_idx);
     } else simpler::percounter::percounter_aicore_execute(runtime, block_idx, core_type);
 }

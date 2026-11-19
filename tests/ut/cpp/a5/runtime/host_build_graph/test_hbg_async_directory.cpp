@@ -242,4 +242,45 @@ TEST(SchedulerAsyncDirectoryTest, ConcurrentOwnersPublishEveryBitAndClearOnlyThe
     }
 }
 
+TEST(HbgAsyncDirectory, NotificationHalvesPreserveBitBoundariesAndGmFallback) {
+    for (uint32_t mapped = 0; mapped < 4; ++mapped) {
+        SCOPED_TRACE(mapped);
+        SchedulerAsyncDirectoryWord word{};
+        alignas(32) uint32_t notifications[2]{};
+        for (uint32_t half = 0; half < 2; ++half)
+            if ((mapped & (1U << half)) != 0)
+                word.notification_addresses[half] = reinterpret_cast<uint64_t>(&notifications[half]);
+        for (uint32_t bit : {0U, 31U, 32U, 63U})
+            ASSERT_EQ(scheduler_async_directory_publish(word, bit), Result::SUCCESS);
+        EXPECT_EQ(scheduler_async_directory_query(word, 0, 64), UINT64_C(0x8000000180000001));
+        EXPECT_EQ(scheduler_async_directory_query(word, 32, 64), UINT64_C(0x8000000100000000));
+        ASSERT_EQ(scheduler_async_directory_clear(word, 31), Result::SUCCESS);
+        ASSERT_EQ(scheduler_async_directory_clear(word, 32), Result::SUCCESS);
+        EXPECT_EQ(scheduler_async_directory_query(word, 0, 64), UINT64_C(0x8000000000000001));
+        for (uint32_t half = 0; half < 2; ++half)
+            if ((mapped & (1U << half)) != 0) EXPECT_EQ((word.bits >> (half * 32)) & UINT64_C(0xffffffff), 0u);
+    }
+    SchedulerAsyncDirectoryWord tail{};
+    uint32_t notification = 1;
+    tail.notification_addresses[0] = reinterpret_cast<uint64_t>(&notification);
+    tail.notification_addresses[1] = UINT64_MAX;  // Absent tail half must never be read.
+    EXPECT_EQ(scheduler_async_directory_query(tail, 0, 1), 1u);
+}
+
+TEST(HbgAsyncDirectory, ConcurrentMappedSetAndClearPreserveOtherGroups) {
+    SchedulerAsyncDirectoryWord word{};
+    alignas(32) uint32_t notification = UINT32_C(0xffff);
+    word.notification_addresses[0] = reinterpret_cast<uint64_t>(&notification);
+    std::vector<std::thread> workers;
+    for (uint32_t lane = 0; lane < 16; ++lane)
+        workers.emplace_back([&, lane] {
+            EXPECT_EQ(scheduler_async_directory_clear(word, lane), Result::SUCCESS);
+            EXPECT_EQ(scheduler_async_directory_publish(word, lane + 16), Result::SUCCESS);
+        });
+    for (auto &worker : workers)
+        worker.join();
+    EXPECT_EQ(scheduler_async_directory_query(word, 0, 32), UINT64_C(0xffff0000));
+    EXPECT_EQ(word.bits, 0u);
+}
+
 }  // namespace

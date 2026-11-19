@@ -52,6 +52,7 @@ from simpler_setup.tools._runtime_dispatch import (
     normalize_task_id_int,
     resolve_runtime,
 )
+from simpler_setup.tools.percounter import scheduler_view as percounter_scheduler_view
 from simpler_setup.tools.strace_timing import host_process_lanes, parse_span_records, parse_spans, span_family
 
 
@@ -216,7 +217,7 @@ def _decode_recorded_window(raw):  # noqa: PLR0912, PLR0915
     frequency = metadata.get("clock_freq_hz")
     if type(frequency) is not int or frequency <= 0:
         raise ValueError("recorded window needs a positive clock_freq_hz")
-    for name in ("aicpu_lifecycle_records", "aicore_execution_identities", "aicore_protocol"):
+    for name in ("aicpu_lifecycle_records", "aicore_execution_identities", "aicore_protocol", "percounter_task_events"):
         if raw.get(name):
             raise ValueError(f"recorded window has no replay-local provenance for {name}")
     device, host = [], []
@@ -940,6 +941,11 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
         metadata.get("runtime"),
         source=f"{source}: metadata.runtime" if source else "metadata.runtime",
     )
+    percounter_events_raw = None
+    if "percounter_task_events" in data:
+        if runtime_name != "percounter" or level < 2 or scheduler_task_producer != "aicore":
+            raise ValueError("percounter_task_events requires an AICore-produced Percounter L2 or higher capture")
+        percounter_events_raw = percounter_scheduler_view.parse_capture(data["percounter_task_events"])
     decode_task_id_fields = get(runtime_name).task_id_fields
 
     def task_id_fields(task_token, core_id, run_epoch):
@@ -1096,6 +1102,11 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
     for _, _, d, f, _epoch in scheduler_task_rows:
         _track(int(d))
         _track(int(f))
+    if percounter_events_raw is not None:
+        for record in percounter_events_raw["records"]:
+            _track(record["cycles"])
+            _track(record.get("claim_start_cycles", 0))
+            _track(record.get("kernel_start_cycles", 0))
     for thread_records in sched_phases_raw:
         for pr in thread_records:
             _track(int(pr.get("start_cycles", 0)))
@@ -1372,6 +1383,8 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
         out["orchestrator_source"] = "aicpu"
     if aicpu_lifecycle_records:
         out["aicpu_lifecycle_records"] = aicpu_lifecycle_records
+    if percounter_events_raw is not None:
+        out["percounter_task_events"] = percounter_scheduler_view.decode_capture(percounter_events_raw, _to_us)
     if host_device_uploads:
         out["host_device_uploads"] = host_device_uploads
     if host_mode:
@@ -2359,6 +2372,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     scalar_profiles=None,
     scheduler_task_producer=None,
     chip_swimlane_level=None,
+    percounter_task_events=None,
 ):
     """Generate Chrome Trace Event Format JSON from task data.
 
@@ -2383,7 +2397,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         - pid=5 "Graph Execution": one end-to-end envelope per Graph task
         - pid=1 "Host/AICPU Orchestrator": orchestrator phase bars (chip_swimlane_level >= 4)
         - pid=2 "AICPU/AICore Scheduler": scheduler record bars (chip_swimlane_level >= 3)
-        - pid=3 "Scheduler View": dispatch_time_us to finish_time_us, except HBG AICore L3/L4
+        - pid=3 "Scheduler View": dispatch→finish, or task/block milestones for Percounter L2–L4
         - pid=4 "Worker View": per-subtask kernel execution on physical cores
     """
     if (timeline_metadata or {}).get("recorded_window"):
@@ -2548,7 +2562,19 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         and scheduler_task_producer == "aicore"
         and chip_swimlane_level in (3, 4)
     )
-    show_scheduler_view = has_scheduler_task_data and not worker_scheduler_details
+    show_scheduler_view = has_scheduler_task_data and not worker_scheduler_details and runtime_name != "percounter"
+
+    if percounter_task_events is not None:
+        events.extend(
+            percounter_scheduler_view.trace_events(
+                percounter_task_events,
+                pid=3,
+                task_name=lambda task_id: _marker_event_name(task_id, task_display(task_id)),
+                deps_edges=deps_edges if chip_swimlane_level == 2 else None,
+                deps_kernel_map=deps_kernel_map,
+                deps_block_map=deps_block_map,
+            )
+        )
 
     if show_scheduler_view:
         events.append(
@@ -2638,6 +2664,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             for succ in succs:
                 fanin_map[succ].append(pred)
 
+    hbg_kernel_labels = {}
     for task in tasks:
         tid = core_to_tid[task["core_id"]]
         local_setup_us = task.get("local_setup_us", 0.0) or 0.0
@@ -2650,6 +2677,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         func_id = task["func_id"]
         tdisp = task_display(task["task_id"])
         task_name = _task_display_name(func_id, func_id_to_name, tdisp, spmd=task["task_id"] in spmd_task_ids)
+
+        if scalar_profiles and runtime_name == "host_build_graph" and task.get("reg_task_id") is not None:
+            key = (task["run_epoch"], task["core_id"], task["reg_task_id"])
+            block = task.get("block_idx")
+            hbg_kernel_labels[key] = task_name if block is None else f"{task_name} [b{block}]"
 
         # fanout (consumers) / fanin (producers) hints from deps.json — the device
         # hot path no longer carries them. Each leads with the degree (count) so
@@ -3130,7 +3162,14 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         trace_events = import_module(f"{runtime.__name__}.scalar_profile").trace_events
 
         events.extend(
-            trace_events(scalar_profiles, pid=2, tid_base=30000, display=task_display, streams=scheduler_streams)
+            trace_events(
+                scalar_profiles,
+                pid=2,
+                tid_base=30000,
+                display=task_display,
+                streams=scheduler_streams,
+                kernel_labels=hbg_kernel_labels,
+            )
         )
 
     # AICPU Orchestrator lane (chip_swimlane_level >= 4)
@@ -3882,7 +3921,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         metadata["scalar_function_capture"] = {
             "minimum_cycles": sorted({p.get("function_min_cycles", 0) for p in scalar_profiles}),
             "short_intervals_omitted": sum(p.get("short_function_intervals_omitted", 0) for p in scalar_profiles),
-            "memory_operations": "per_call",
+            "memory_operations": (
+                "disabled" if runtime_name == "percounter" and chip_swimlane_level == 3 else "per_call"
+            ),
         }
     if metadata:
         trace["metadata"] = metadata
@@ -4863,6 +4904,9 @@ def _scalar_display_event(event, lanes):
         return event
     compact = {key: event[key] for key in ("ph", "name", "pid", "tid", "ts", "dur")}
     args = event.get("args", {})
+    if "hbg_stage" in args:
+        compact["cat"] = args["hbg_stage"]
+        compact["cname"] = event["cname"]
     calls = args.get("scalar_calls", 1)
     if calls != 1:
         compact["name"] += f" [calls={calls}]"
@@ -4870,6 +4914,7 @@ def _scalar_display_event(event, lanes):
     # Nesting is given by the unchanged intervals. Integer clock evidence lives
     # in the source capture rather than being copied into every display event.
     omitted = {
+        "hbg_stage",
         "kind",
         "start_cycles",
         "end_cycles",
@@ -5597,6 +5642,7 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
             core_to_thread=data.get("core_to_thread"),
             host_device_uploads=data.get("host_device_uploads"),
             aicpu_lifecycle_records=data.get("aicpu_lifecycle_records"),
+            percounter_task_events=data.get("percounter_task_events"),
             deps_edges=artifacts["deps_edges"],
             deps_kernel_map=artifacts["deps_kernel_map"],
             deps_block_map=artifacts["deps_block_map"],
@@ -5798,6 +5844,7 @@ def main():
             core_to_thread=data.get("core_to_thread"),
             host_device_uploads=data.get("host_device_uploads"),
             aicpu_lifecycle_records=data.get("aicpu_lifecycle_records"),
+            percounter_task_events=data.get("percounter_task_events"),
             deps_edges=deps_edges,
             deps_kernel_map=deps_kernel_map,
             deps_block_map=deps_block_map,

@@ -734,6 +734,13 @@ struct alignas(64) ChipTaskSlotState {
 
     bool has_any_subtask_deferred() const { return any_subtask_deferred.load(std::memory_order_acquire); }
 
+    // The task table owns logical completion; this is the all-FIN deferred phase.
+    bool has_finished_deferred_subtasks() const {
+        return total_required_subtasks > 0 &&
+               completed_subtasks.load(std::memory_order_acquire) == total_required_subtasks &&
+               has_any_subtask_deferred();
+    }
+
     // Restore progress before any reader of this invocation, after prior device users have retired.
     // Prepared task kind, ED qualification, shape and attributes remain unchanged.
     // The owning table restores the separate completion byte; an open wake list starts null.

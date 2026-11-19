@@ -105,3 +105,13 @@ def test_mix_lanes_contribute_parallel_work_not_serial_sum():
     deps = dag(2, [(0, 1)])
     deps["tasks"][0]["kernel_ids"] = [0, 1, 2]
     assert MODULE.ideal_lower_bound_ms(records, deps) == pytest.approx(0.00011)
+
+
+def test_early_resolve_hint_checks_observed_completion_through_dummy():
+    deps = {
+        "tasks": [{"task_id": "0", "early_dispatch": True}, {"task_id": "1"}, {"task_id": "2"}],
+        "edges": [{"pred": "0", "succ": "1"}, {"pred": "1", "succ": "2"}],
+    }
+    MODULE.check_observed_completion(deps, [[5, 0, 0, 2, 5], [6, 2, 0, 5, 8]])
+    with pytest.raises(ValueError, match="Early dependency release"):
+        MODULE.check_observed_completion(deps, [[5, 0, 0, 2, 5], [6, 2, 0, 4, 8]])

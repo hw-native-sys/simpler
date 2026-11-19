@@ -286,7 +286,7 @@ void SchedulerContext::log_owned_dispatch_records(int32_t thread_idx, StallDumpR
 void SchedulerContext::log_global_stall_diagnostics(
     int32_t trigger_thread_idx, int32_t idle_iterations, int32_t last_progress_count
 ) {
-    int32_t cnt_ready = 0, cnt_waiting = 0, cnt_running = 0, submitted_in_ring = 0;
+    int32_t cnt_ready = 0, cnt_waiting = 0, cnt_running = 0, cnt_async_wait = 0, submitted_in_ring = 0;
     for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
         SharedMemoryRingHeader &ring = *sched_->ring_sched_states[r].ring;
         int32_t ring_task_count = ring.fc.current_task_index.load(std::memory_order_relaxed);
@@ -338,6 +338,17 @@ void SchedulerContext::log_global_stall_diagnostics(
                 );
                 continue;
             }
+            if (slot_state.has_finished_deferred_subtasks()) {
+                cnt_async_wait++;
+                if (cnt_async_wait > STALL_DUMP_READY_MAX) continue;
+                LOG_WARN(
+                    "[STALL thread=%d idle_iterations=%d] TASK ring=%d task_id=0x%" PRIx64
+                    " state=ASYNC_WAIT fanin_refcount=%d/%d subtasks_done=%d/%d",
+                    trigger_thread_idx, idle_iterations, r, task_id, rc, fi,
+                    slot_state.completed_subtasks.load(std::memory_order_relaxed), slot_state.total_required_subtasks
+                );
+                continue;
+            }
             if (rc >= fi) {
                 cnt_ready++;
                 if (cnt_ready > STALL_DUMP_READY_MAX) continue;
@@ -361,9 +372,9 @@ void SchedulerContext::log_global_stall_diagnostics(
     int32_t c = completed_tasks_.load(std::memory_order_relaxed);
     LOG_WARN(
         "[STALL thread=%d idle_iterations=%d] SUMMARY completed=%d/%d last_progress_iteration=%d "
-        "scan_ready=%d scan_waiting=%d scan_running=%d",
+        "scan_ready=%d scan_waiting=%d scan_running=%d scan_async_wait=%d",
         trigger_thread_idx, idle_iterations, c, effective_total, last_progress_count, cnt_ready, cnt_waiting,
-        cnt_running
+        cnt_running, cnt_async_wait
     );
 }
 
@@ -444,7 +455,8 @@ SchedulerContext::StallClassification SchedulerContext::classify_stall_reason() 
     StallClassification cls{};
     cls.stuck_task_id = TaskId::invalid();
     cls.stuck_core = -1;
-    int32_t cnt_running = 0, cnt_ready = 0, cnt_waiting = 0;
+    int32_t cnt_running = 0, cnt_ready = 0, cnt_waiting = 0, cnt_async_wait = 0;
+    TaskId async_task_id = TaskId::invalid();
     for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
         SharedMemoryRingHeader &ring = *sched_->ring_sched_states[r].ring;
         int32_t ring_task_count = ring.fc.current_task_index.load(std::memory_order_relaxed);
@@ -477,6 +489,14 @@ SchedulerContext::StallClassification SchedulerContext::classify_stall_reason() 
                 cnt_running++;
                 continue;
             }
+            if (slot_state.has_finished_deferred_subtasks()) {
+                if (cnt_async_wait == 0) {
+                    TaskDescriptor *task_ptr = slot_state.task;
+                    async_task_id = task_ptr != nullptr ? task_ptr->task_id : TaskId::invalid();
+                }
+                cnt_async_wait++;
+                continue;
+            }
             int32_t rc = slot_state.fanin_refcount.load(std::memory_order_relaxed);
             int32_t fi = slot_state.fanin_count;
             if (rc >= fi) {
@@ -489,10 +509,12 @@ SchedulerContext::StallClassification SchedulerContext::classify_stall_reason() 
     cls.cnt_running = cnt_running;
     cls.cnt_ready = cnt_ready;
     cls.cnt_waiting = cnt_waiting;
+    cls.cnt_async_wait = cnt_async_wait;
     cls.completed = completed_tasks_.load(std::memory_order_relaxed);
     cls.total = total_tasks_;
     cls.orch_done = orchestrator_done_ ? 1 : 0;
-    cls.detail = classify_stall_detail(cnt_running, cnt_ready, cnt_waiting, cls.orch_done);
+    cls.detail = classify_stall_detail(cnt_running, cnt_ready, cnt_waiting, cnt_async_wait, cls.orch_done);
+    if (cls.detail == SIMPLER_STALL_DETAIL_ASYNC_WAIT) cls.stuck_task_id = async_task_id;
     return cls;
 }
 
@@ -507,10 +529,11 @@ int32_t SchedulerContext::handle_timeout_exit(
     StallClassification cls = classify_stall_reason();
     LOG_ERROR(
         "[STALL thread=%d idle_iterations=%d] TIMEOUT_EXIT after_idle_iterations=%d sub_class=%s "
-        "completed=%d/%d running=%d ready=%d waiting=%d orch_done=%d stuck_task_id=0x%" PRIx64 " stuck_core=%d",
+        "completed=%d/%d running=%d ready=%d waiting=%d async_wait=%d orch_done=%d stuck_task_id=0x%" PRIx64
+        " stuck_core=%d",
         thread_idx, idle_iterations, idle_iterations, stall_detail_name(cls.detail), cls.completed, cls.total,
-        cls.cnt_running, cls.cnt_ready, cls.cnt_waiting, cls.orch_done, TaskId::to_uint64(cls.stuck_task_id),
-        cls.stuck_core
+        cls.cnt_running, cls.cnt_ready, cls.cnt_waiting, cls.cnt_async_wait, cls.orch_done,
+        TaskId::to_uint64(cls.stuck_task_id), cls.stuck_core
     );
     // Only the thread that wins the code-100 latch publishes the detail/locators,
     // keeping the host-visible sub-class consistent with the latched code.
@@ -520,6 +543,7 @@ int32_t SchedulerContext::handle_timeout_exit(
         header->sched_stall_cnt_running.store(cls.cnt_running, std::memory_order_relaxed);
         header->sched_stall_cnt_ready.store(cls.cnt_ready, std::memory_order_relaxed);
         header->sched_stall_cnt_waiting.store(cls.cnt_waiting, std::memory_order_relaxed);
+        header->sched_stall_cnt_async_wait.store(cls.cnt_async_wait, std::memory_order_relaxed);
         header->sched_stall_orch_done.store(cls.orch_done, std::memory_order_relaxed);
         header->sched_stall_task_id.store(cls.stuck_task_id, std::memory_order_relaxed);
         header->sched_stall_core.store(cls.stuck_core, std::memory_order_relaxed);

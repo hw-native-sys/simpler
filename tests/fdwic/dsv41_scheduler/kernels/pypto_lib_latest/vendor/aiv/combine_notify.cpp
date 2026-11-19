@@ -19,6 +19,8 @@
 #include "tensor.h"
 
 
+#include "intrinsic.h"
+
 
 using namespace pto;
 
@@ -56,89 +58,87 @@ static __aicore__ inline void PTOAS__DCCI_SINGLE_CACHE_LINE(Ptr ptr) {
   dcci((__gm__ void*)ptr, cache_line_t::SINGLE_CACHE_LINE);
 }
 
-static __aicore__ void combine_notify(__gm__ int32_t* v1, int32_t v2, int64_t v3, __gm__ int64_t* v4) {
+static __aicore__ void combine_notify(__gm__ int32_t* v1, int32_t v2, int64_t v3, __gm__ int64_t* v4, int32_t v5, int32_t v6) {
   using T = float;
 
   #if defined(__DAV_VEC__)
   set_mask_norm();
   set_vector_mask(-1, -1);
-  const int64_t v5 = 8192;
+  const int64_t v7 = 8192;
   // pto: %c2_index
-  const int64_t v6 = 2;
+  const int64_t v8 = 2;
   // pto: %c64_index
-  const int64_t v7 = 64;
+  const int64_t v9 = 64;
   // pto: %c128_index
-  const int64_t v8 = 128;
+  const int64_t v10 = 128;
   // pto: %c1_index
-  const int64_t v9 = 1;
+  const int64_t v11 = 1;
   // pto: %c0_index
-  const int64_t v10 = 0;
+  const int64_t v12 = 0;
   // pto: %c4_i64
-  const int64_t v11 = 4;
-  for (int64_t v12 = v10; v12 < v6; v12 += v9) {
-    // pto: %0
+  const int64_t v13 = 4;
+  // pto: %peer_inline12947__ssa_v0
+  int64_t v14 = (int64_t) v5;
+  // pto: %0
+  int64_t v15 = (int64_t) v2;
+  // pto: %1
+  if (v14 != v15) {
+    // pto: %2
     ;
-    int64_t v13 = (int64_t) v2;
-    // pto: %1
+    int64_t v16 = (v4)[v12];
+    // pto: %3, %4, %5, %6
     ;
-    if (v12 != v13) {
-      // pto: %2
-      ;
-      int64_t v14 = (v4)[v10];
-      // pto: %3, %4, %5, %6
-      ;
-      int64_t v15 = (v4)[(int64_t) ((uint64_t) ((int64_t) (int32_t) v14) + (uint64_t) v6)];
-      // pto: %7, %8
-      ;
-      int64_t v16 = (v4)[(int64_t) ((uint64_t) v12 + (uint64_t) v6)];
-      // pto: %14
-      ;
-      const int64_t v17 = 1;
-      // pto: %14
-      ;
-      const int64_t v18 = 1;
-      // pto: %14
-      ;
-      int64_t v19 = v6 * v5;
-      // pto: %14
-      ;
-      pto::Shape<1, 1, -1, -1, -1> v20 = pto::Shape<1, 1, -1, -1, -1>(v17, v18, v6, v7, v8);
-      // pto: %14
-      ;
-      pto::Stride<-1, -1, -1, -1, -1> v21 = pto::Stride<-1, -1, -1, -1, -1>(v18 * v19, v19, v5, v8, v9);
-      // pto: %9, %10, %12, %14
-      ;
-      GlobalTensor<int32_t, pto::Shape<1, 1, -1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND> v22 = GlobalTensor<int32_t, pto::Shape<1, 1, -1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND>(v1 + (int64_t) ((uint64_t) v16 - (uint64_t) v15) / v11, v20, v21);
-      // pto: %15
-      ;
-      int64_t v23 = v13 < v10 ? v10 : v13;
-      // pto: %combine_arrived__ssa_v0_peer_pview
-      ;
-      __gm__ int32_t* v24 = PTOAS__GLOBAL_TENSOR_DATA(v22);
-      // pto: %combine_arrived__ssa_v0_peer_pview
-      ;
-      const int64_t v25 = 0;
-      // pto: %combine_arrived__ssa_v0_peer_pview
-      ;
-      const int64_t v26 = 8192;
-      // pto: %combine_arrived__ssa_v0_peer_pview
-      ;
-      pto::Shape<1, 1, 1, 1, 1> v27 = pto::Shape<1, 1, 1, 1, 1>();
-      // pto: %combine_arrived__ssa_v0_peer_pview
-      ;
-      pto::Stride<8192, 8192, 8192, 128, 1> v28 = pto::Stride<8192, 8192, 8192, 128, 1>();
-      // pto: %combine_arrived__ssa_v0_peer_pview
-      ;
-      GlobalTensor<int32_t, pto::Shape<1, 1, 1, 1, 1>, pto::Stride<8192, 8192, 8192, 128, 1>, pto::Layout::ND> v29 = GlobalTensor<int32_t, pto::Shape<1, 1, 1, 1, 1>, pto::Stride<8192, 8192, 8192, 128, 1>, pto::Layout::ND>(v24 + (v25 + v23 * v26), v27, v28);
-      // pto: %16
-      ;
-      int64_t v30 = (int64_t) ((uint64_t) v3 + (uint64_t) v9);
-      // pto: %17
-      ;
-      int32_t v31 = (int32_t) v30;
-      pto::comm::NotifyOp v32 = pto::comm::NotifyOp::Set;
-      pto::comm::TNOTIFY(v29, v31, v32);
-    };
+    int64_t v17 = (v4)[(int64_t) ((uint64_t) ((int64_t) (int32_t) v16) + (uint64_t) v8)];
+    // pto: %7, %8
+    ;
+    int64_t v18 = (v4)[(int64_t) ((uint64_t) v14 + (uint64_t) v8)];
+    // pto: %14
+    ;
+    const int64_t v19 = 1;
+    // pto: %14
+    ;
+    const int64_t v20 = 1;
+    // pto: %14
+    ;
+    int64_t v21 = v8 * v7;
+    // pto: %14
+    ;
+    pto::Shape<1, 1, -1, -1, -1> v22 = pto::Shape<1, 1, -1, -1, -1>(v19, v20, v8, v9, v10);
+    // pto: %14
+    ;
+    pto::Stride<-1, -1, -1, -1, -1> v23 = pto::Stride<-1, -1, -1, -1, -1>(v20 * v21, v21, v7, v10, v11);
+    // pto: %9, %10, %12, %14
+    ;
+    GlobalTensor<int32_t, pto::Shape<1, 1, -1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND> v24 = GlobalTensor<int32_t, pto::Shape<1, 1, -1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND>(v1 + (int64_t) ((uint64_t) v18 - (uint64_t) v17) / v13, v22, v23);
+    // pto: %15
+    ;
+    int64_t v25 = v15 < v12 ? v12 : v15;
+    // pto: %combine_arrived__ssa_v0_peer_pview
+    ;
+    __gm__ int32_t* v26 = PTOAS__GLOBAL_TENSOR_DATA(v24);
+    // pto: %combine_arrived__ssa_v0_peer_pview
+    ;
+    const int64_t v27 = 0;
+    // pto: %combine_arrived__ssa_v0_peer_pview
+    ;
+    const int64_t v28 = 8192;
+    // pto: %combine_arrived__ssa_v0_peer_pview
+    ;
+    pto::Shape<1, 1, 1, 1, 1> v29 = pto::Shape<1, 1, 1, 1, 1>();
+    // pto: %combine_arrived__ssa_v0_peer_pview
+    ;
+    pto::Stride<8192, 8192, 8192, 128, 1> v30 = pto::Stride<8192, 8192, 8192, 128, 1>();
+    // pto: %combine_arrived__ssa_v0_peer_pview
+    ;
+    GlobalTensor<int32_t, pto::Shape<1, 1, 1, 1, 1>, pto::Stride<8192, 8192, 8192, 128, 1>, pto::Layout::ND> v31 = GlobalTensor<int32_t, pto::Shape<1, 1, 1, 1, 1>, pto::Stride<8192, 8192, 8192, 128, 1>, pto::Layout::ND>(v26 + (v27 + v25 * v28), v29, v30);
+    // pto: %16
+    ;
+    int64_t v32 = (int64_t) ((uint64_t) v3 + (uint64_t) v11);
+    // pto: %17
+    ;
+    int32_t v33 = (int32_t) v32;
+    pto::comm::NotifyOp v34 = pto::comm::NotifyOp::Set;
+    pto::comm::TNOTIFY(v31, v33, v34);
   }
   #endif // __DAV_VEC__
 
@@ -158,6 +158,10 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     set_ctrl(sbitset0(get_ctrl(), pto::MAD_MODE_BIT));
 #endif
 
+    // Read logical SPMD block identity from runtime dispatch payload
+    int32_t __pypto_spmd_block_idx = get_block_idx(args);
+    int32_t __pypto_spmd_block_num = get_block_num(args);
+
     // Unpack tensor: combine_arrived__ssa_v0
     __gm__ Tensor* combine_arrived__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
     __gm__ int32_t* combine_arrived__ssa_v0 = reinterpret_cast<__gm__ int32_t*>(combine_arrived__ssa_v0_tensor->buffer.addr) + combine_arrived__ssa_v0_tensor->start_offset;
@@ -167,14 +171,14 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     rank__ssa_v0_conv.u64 = args[1];
     int32_t rank__ssa_v0 = rank__ssa_v0_conv.val;
 
-    // Unpack scalar: layer_inline5389__idx_v0
-    union { uint64_t u64; int64_t val; } layer_inline5389__idx_v0_conv;
-    layer_inline5389__idx_v0_conv.u64 = args[2];
-    int64_t layer_inline5389__idx_v0 = layer_inline5389__idx_v0_conv.val;
+    // Unpack scalar: layer_inline10568__idx_v0
+    union { uint64_t u64; int64_t val; } layer_inline10568__idx_v0_conv;
+    layer_inline10568__idx_v0_conv.u64 = args[2];
+    int64_t layer_inline10568__idx_v0 = layer_inline10568__idx_v0_conv.val;
 
     // Unpack CommContext: combine_arrived_ctx
     __gm__ int64_t* combine_arrived_ctx = reinterpret_cast<__gm__ int64_t*>(args[3]);
 
     // Forward to ptoas-generated function
-    combine_notify(combine_arrived__ssa_v0, rank__ssa_v0, layer_inline5389__idx_v0, combine_arrived_ctx);
+    combine_notify(combine_arrived__ssa_v0, rank__ssa_v0, layer_inline10568__idx_v0, combine_arrived_ctx, __pypto_spmd_block_idx, __pypto_spmd_block_num);
 }

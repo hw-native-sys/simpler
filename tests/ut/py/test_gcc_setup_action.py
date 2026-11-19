@@ -483,7 +483,7 @@ def test_a2a3_scene_workflow_has_no_legacy_sdma_mode() -> None:
 
     assert "a2a3_sdma_mode" not in workflow_path.read_text()
     assert names.count("Run pytest scene tests (a2a3)") == 1
-    assert names.count("SDMA pytest (a2a3)") == 1
+    assert names.count("Run SDMA tests (a2a3)") == 1
     assert not any("legacy SDMA paths" in name for name in names)
     for caller_name in ("ci.yml", "daily.yml"):
         assert "a2a3_sdma_mode" not in (REPO_ROOT / ".github/workflows" / caller_name).read_text()

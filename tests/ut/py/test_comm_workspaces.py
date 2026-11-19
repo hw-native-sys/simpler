@@ -55,7 +55,7 @@ def test_ccu_mode_requires_a_string(mode):
 
 
 @pytest.mark.parametrize(
-    "engines,mask", [((), 0), ([], 0), (["sdma"], 1), (["urma"], 2), (["urma", "sdma"], 3), (["rdma"], 4), (["ccu"], 8)]
+    "engines,mask", [((), 0), ([], 0), (["sdma"], 1), (["urma"], 2), (["ccu", "sdma"], 9), (["rdma"], 4), (["ccu"], 8)]
 )
 def test_domain_workspace_selection_is_part_of_configuration(engines, mask):
     config = DomainConfig.capture([0, 1], 4096, [], True, (), engines)
@@ -71,7 +71,18 @@ def test_domain_workspace_selection_is_part_of_configuration(engines, mask):
         assert not config.difference(synchronous)
 
 
-@pytest.mark.parametrize("engines", [["unknown"], ["sdma", "sdma"], ["rdma", "sdma"], ["rdma", "urma"]])
+@pytest.mark.parametrize(
+    "engines",
+    [
+        ["unknown"],
+        ["sdma", "sdma"],
+        ["rdma", "sdma"],
+        ["rdma", "urma"],
+        ["sdma", "urma"],
+        ["urma", "ccu"],
+        ["mte", "urma"],
+    ],
+)
 def test_invalid_workspace_requests_are_rejected_before_allocation(engines):
     with pytest.raises(ValueError):
         DomainConfig.capture([0], 4096, [], False, (), engines)
@@ -257,16 +268,37 @@ def test_basic_window_issues_no_explicit_access(host_resource_binary):
         "host_coexist",
         "host_register",
         "host_pointer",
+        "host_peer_register",
+        "host_peer_pointer",
         "host_workspace",
         "host_context",
         "host_collision",
         "host_invalid",
         "host_unregister",
+        "host_local_unregister",
         "host_unregister_abort",
         "host_unregister_destroy",
     ],
 )
 def test_host_domain_backing_and_native_failure_ownership(host_resource_binary, scenario):
+    subprocess.run([str(host_resource_binary), scenario], check=True, timeout=20)
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "host_mte",
+        "host_mte_missing",
+        "host_mte_rank",
+        "host_mte_size",
+        "host_mte_register",
+        "host_mte_pointer",
+        "host_mte_context",
+        "host_mte_throw",
+        "host_mte_unregister",
+    ],
+)
+def test_host_mte_peer_windows_and_failure_ownership(host_resource_binary, scenario):
     subprocess.run([str(host_resource_binary), scenario], check=True, timeout=20)
 
 
@@ -336,9 +368,9 @@ def test_device_urma_configuration_preserves_ordered_members(members):
     from simpler.worker import Worker  # noqa: PLC0415
 
     worker = Worker(level=3, platform="a5", runtime="tensormap_and_ringbuffer", device_ids=[1, 2, 3], num_sub_workers=0)
-    config = worker._domain_config(members, 4096, [], False, ("sdma", "urma"))
+    config = worker._domain_config(members, 4096, [], False, ("urma",))
     assert config.members == members
-    assert config.workspace_engines == ("sdma", "urma")
+    assert config.workspace_engines == ("urma",)
 
 
 def test_host_urma_configuration_keeps_dense_prefix_requirement():
@@ -365,7 +397,7 @@ def test_single_rank_urma_configuration_is_delegated_to_provider():
         (("sdma",), {"sdma": SdmaConfig()}),
         (("urma",), {"urma": UrmaConfig()}),
         (("rdma",), {"rdma": RdmaConfig()}),
-        (("urma", "sdma"), {"sdma": SdmaConfig(), "urma": UrmaConfig()}),
+        (("ccu", "sdma"), {"sdma": SdmaConfig(), "ccu": CcuConfig()}),
     ],
 )
 def test_default_engine_configurations_equal_legacy_names(names, configs):

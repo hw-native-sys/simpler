@@ -2008,9 +2008,9 @@ protected:
 
     // The one-entry function tables a registration would own: create_scheduler_state
     // refuses a task whose kernel id has no registered address.
-    void install_callable_tables(Runtime &rt) {
-        callable_ =
-            make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0, {1, CoreAsyncMode::SYNCHRONOUS, 0, 0, 0});
+    void
+    install_callable_tables(Runtime &rt, CoreAsyncCapability capability = {1, CoreAsyncMode::SYNCHRONOUS, 0, 0, 0}) {
+        callable_ = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0, capability);
         reinterpret_cast<CoreCallable *>(callable_.data())->set_resolved_addr(0x1000);
         object_table_[0] = reinterpret_cast<uint64_t>(callable_.data());
         entry_table_[0] = 0x1000;
@@ -3052,6 +3052,67 @@ TEST_F(HbgBindLedgerTest, MissingFinishCallbackRejectsBeforeOrchestration) {
     EXPECT_EQ(runtime.pending_publication().bytes, 0u);
 }
 
+TEST_F(HbgResidentSchedulerStorageTest, PartialNotificationPoolsKeepProgressChainsDoneAndCheckDisjoint) {
+    HostApiOps ops = fake_ops();
+    ops.acquire_scheduler_notifications = [](void *, uint32_t, SchedulerNotificationPurpose purpose, size_t count,
+                                             SchedulerDoneNotifications *out) {
+        *out = {std::vector<uint64_t>(count), std::vector<uint64_t>(count), {}};
+        if (purpose == SchedulerNotificationPurpose::COMPLETION_COUNTER && count == 3) {
+            // Two of three slots are available: progress and the first independent task.
+            out->addresses = {0x1000, 0x1020, 0};
+            out->add_addresses = {0x1008, 0x1028, 0};
+        } else if (purpose == SchedulerNotificationPurpose::TASK_STATE && count == 3) {
+            // DONE accepts a word-aligned SET address. Only the second CHECK half has bit aliases.
+            out->addresses = {0x2004, 0x2044, 0x2080};
+        } else {
+            return -1;
+        }
+        return 0;
+    };
+    api_ = HostApi(nullptr, 0, 0, 11, &ops);
+    Runtime rt;
+    init_runtime(rt);
+    auto cleanup = cleanup_runtime(rt);
+    install_callable_tables(rt, {1, CoreAsyncMode::DEFERRED, 1, 1, 0});
+    eps_ = {
+        [](const ChipTaskArgs &) {
+            MixedKernels kernels{};
+            kernels.aiv0_kernel_id = 0;
+            CoreTaskArgs args;
+            args.launch_spec.set_block_num(17);
+            for (int i = 0; i < 2; ++i)
+                ASSERT_TRUE(g_orch_runtime->orchestrator->submit_task(kernels, args).task_id().is_valid());
+        },
+        capture_orch_bind
+    };
+    ChipStorageTaskArgs args;
+    ASSERT_EQ(bind(rt, args, nullptr, 0), 0);
+    ASSERT_FALSE(rt.pending_publication().prerequisites.empty());
+    const auto &region = rt.pending_publication().prerequisites.front();
+    const auto *base = static_cast<const uint8_t *>(region.source);
+    const auto offset =
+        rt.dev.scheduler_bootstrap.worker_context_base - reinterpret_cast<uint64_t>(region.device_target);
+    const auto &ctx = *reinterpret_cast<const SchedulerWorkerContext *>(base + offset);
+    const auto &run = *reinterpret_cast<const SchedulerRunControl *>(base + ctx.run_control_offset);
+    EXPECT_EQ(run.run_completed_read_address, 0x1000u);
+    EXPECT_EQ(run.run_completed_add_address, 0x1008u);
+    const auto *chains =
+        reinterpret_cast<const SchedulerTaskCompletionCounter *>(base + ctx.completion_counters_offset);
+    EXPECT_EQ(chains[0].read_address, 0x1020u);
+    EXPECT_EQ(chains[0].add_address, 0x1028u);
+    EXPECT_EQ(chains[1].read_address, 0u);
+    const auto *done = reinterpret_cast<const uint64_t *>(base + ctx.done_notifications_offset);
+    EXPECT_EQ(done[0], 0u);
+    EXPECT_EQ(done[1], 0x2004u);
+    const auto &summary = *reinterpret_cast<const SchedulerGraphSummary *>(base + ctx.graph_summary_offset);
+    ASSERT_NE(summary.async_layout_offset, 0u);
+    const auto &layout = *reinterpret_cast<const SchedulerAsyncLayout *>(base + summary.async_layout_offset);
+    const auto *directory = reinterpret_cast<const SchedulerAsyncDirectoryWord *>(base + layout.check_directory_offset);
+    ASSERT_EQ(layout.group_count, 34u);
+    EXPECT_EQ(directory[0].notification_addresses[0], 0u);
+    EXPECT_EQ(directory[0].notification_addresses[1], 0x2080u);
+}
+
 TEST_F(HbgResidentSchedulerStorageTest, GraphHeapReservationContainsArgumentsWithoutAicpuTaskStorage) {
     Runtime runtime;
     init_runtime(runtime);
@@ -3278,4 +3339,41 @@ TEST(HbgAsyncCapabilityBinding, UsesOnlyTheActiveCallableAndClearsOnRebind) {
     EXPECT_EQ(runtime.get_function_async_capability(0).mode, CoreAsyncMode::SYNCHRONOUS);
     runtime.clear_callable_tables();
     EXPECT_THROW(runtime.get_function_async_capability(0), std::invalid_argument);
+}
+
+TEST(HbgInputCacheProofBinding, ReusedCallableAndFunctionIdsFollowOnlyTheirCurrentRegistration) {
+    Runtime runtime;
+    const uint64_t first_objects[] = {0, 0x1000};
+    const uint64_t second_objects[] = {0, 0x2000};
+    std::vector<CoreInputCacheProof> first(2), second(2);
+    first[1].mode = CoreInputCacheMode::NO_CACHED_READS;
+    second[1].mode = CoreInputCacheMode::SCALAR_RANGES;
+    runtime.set_active_callable_id(7);
+    runtime.set_callable_tables(first_objects, 0x3000, 0, 2);
+    EXPECT_EQ(runtime.get_function_input_cache_proof(1), nullptr);
+    bind_registered_input_cache_proofs(runtime, first);
+    EXPECT_EQ(runtime.get_function_input_cache_proof(1), &first[1]);
+    EXPECT_EQ(runtime.get_function_input_cache_proof(-1), nullptr);
+    EXPECT_EQ(runtime.get_function_input_cache_proof(0), nullptr);
+    EXPECT_EQ(runtime.get_function_input_cache_proof(2), nullptr);
+
+    runtime.clear_callable_tables();
+    EXPECT_EQ(runtime.get_function_input_cache_proof(1), nullptr);
+    runtime.set_callable_tables(second_objects, 0x4000, 0, 2);
+    runtime.set_active_callable_id(7);
+    EXPECT_EQ(runtime.get_function_input_cache_proof(1), nullptr);
+    bind_registered_input_cache_proofs(runtime, second);
+    EXPECT_EQ(runtime.get_function_input_cache_proof(1), &second[1]);
+
+    runtime.set_callable_tables(second_objects, 0x4000, 0, 2);
+    bind_registered_input_cache_proofs(runtime, {});
+    EXPECT_EQ(runtime.get_function_input_cache_proof(1), nullptr);
+    bind_registered_input_cache_proofs(runtime, second);
+    runtime.set_active_callable_id(8);
+    EXPECT_EQ(runtime.get_function_input_cache_proof(1), nullptr);
+    bind_registered_input_cache_proofs(runtime, second);
+    HostApiOps ops{};
+    HostApi missing(nullptr, 0, 0, 1, &ops);
+    EXPECT_FALSE(runtime.bind_callable_async_capabilities(missing));
+    EXPECT_EQ(runtime.get_function_input_cache_proof(1), nullptr);
 }

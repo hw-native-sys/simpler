@@ -21,6 +21,7 @@ enum class SchedulerSubtaskFinishResult : uint8_t { PARTIAL, TASK_LAST, TASK_LAS
 static inline __aicore__ SchedulerSubtaskFinishResult scheduler_contribute_returns(
     __gm__ SchedulerTaskControl *control, uint64_t credits, uint64_t *previous, uint64_t *completed_gate = nullptr
 ) {
+    SchedulerScalarScope scope(SchedPhaseKind::ScalarReturnsContribute);
     scheduler_cache_barrier();
     const uint64_t state =
         scheduler_gm_fetch_add(control->completion_state, UINT64_C(0) - credits * SCHEDULER_COMPLETION_RETURN_UNIT);
@@ -37,10 +38,11 @@ static inline __aicore__ SchedulerSubtaskFinishResult scheduler_contribute_retur
 // every computing lane certified a successful return. Its phase remains
 // RELEASED until this contribution is complete, then becomes IDLE exactly once.
 template <bool RecordProtocol = true>
-static inline __aicore__ bool scheduler_contribute_mix_group(
+static inline __aicore__ bool scheduler_publish_fanout(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     int64_t task_ref, uint32_t block_idx, LaneMask active
 ) {
+    SchedulerScalarScope scope(local, SchedPhaseKind::ScalarMixGroupContribute, task_ref);
     if (scheduler_read_worker_error(run, local->worker_id()) != 0) return false;
     __gm__ SchedulerProtocolBlockOwner *owner = nullptr;
     auto *layout = RecordProtocol ? scheduler_protocol_layout_at(base, local) : nullptr;
@@ -54,10 +56,13 @@ static inline __aicore__ bool scheduler_contribute_mix_group(
         owner = &scheduler_state_at<SchedulerProtocolBlockTrace>(base, layout->blocks_offset)[index].owner;
         scheduler_protocol_observe_record(owner);
         if (owner->completion_before.sequence != 0 || owner->task_ref != task_ref || owner->block_idx != block_idx ||
-            owner->worker_index != local->worker_id() || scheduler_lane_mask_load(owner->active_mask) != active) {
+            owner->worker_index != local->config.worker_ids[1] ||
+            local->config.self_lane != scheduler_mix_accountant_lane(active) ||
+            scheduler_lane_mask_load(owner->active_mask) != active) {
             scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
             return false;
         }
+        owner->completion_worker = static_cast<uint32_t>(local->worker_id());
         scheduler_protocol_stamp(base, local, layout, &owner->completion_before);
     }
     uint64_t previous = UINT64_MAX;
@@ -87,7 +92,7 @@ static inline __aicore__ bool scheduler_contribute_mix_group(
     if (result == SchedulerSubtaskFinishResult::TASK_LAST) {
         scheduler_publish_task_done(base, local, task_ref);
         scheduler_remember_task_proof(local, task_ref, SchedulerTaskProof::DONE);
-        ++local->pending_completed;
+        scheduler_report_task_completed(run);
         if (owner != nullptr) {
             auto *actor =
                 &scheduler_state_at<SchedulerProtocolTaskTrace>(base, layout->tasks_offset)[task_ref].completion;
@@ -126,7 +131,7 @@ static inline __aicore__ bool scheduler_contribute_mix_group(
 // Each worker owns a disjoint accounting partition, independent of execution
 // ownership. Counter thresholds release fanin directly; this background close
 // cannot hold a task, resource, or notification lease while its worker is busy.
-static inline __aicore__ bool scheduler_service_counter_accounting(
+static inline __aicore__ bool scheduler_account_completed_tasks(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     bool *progress
 ) {
@@ -162,27 +167,19 @@ static inline __aicore__ bool scheduler_service_counter_accounting(
         );
         return false;
     }
-    uint64_t order = UINT64_MAX;
-    auto *layout = scheduler_protocol_layout_at(base, local);
-    if (layout != nullptr && scheduler_task_requires_admission(metadata.flags)) {
-        auto *event = &scheduler_state_at<SchedulerProtocolTaskTrace>(base, layout->tasks_offset)[task].admission;
-        scheduler_protocol_observe_record(event);
-        if (event->task_ref != task || event->run_epoch != layout->run_epoch || event->after.sequence == 0) {
-            scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
-            return false;
-        }
-        order = event->order_key;
-    }
     const uint32_t flags = metadata.flags | SCHEDULER_PROTOCOL_COUNTER_ACCOUNTING;
-    scheduler_protocol_task_actor(base, local, task, order, flags, true, true);
+    scheduler_protocol_task_actor(base, local, task, flags, true);
     // No credit registration, return, or CHECK RMW touches the mapped task's
     // canonical word. This unique accountant is its only device writer.
     scheduler_store_signal(
         scheduler_task_control_at(base, local, task)->completion_state, scheduler_completion_completed_state(total)
     );
-    scheduler_protocol_task_actor(base, local, task, order, flags, true, false);
+    scheduler_protocol_task_actor(base, local, task, flags, false);
     scheduler_remember_task_proof(local, task, SchedulerTaskProof::DONE);
-    ++local->pending_completed;
+    // Successors consume the counter threshold, not this canonical mirror.
+    // EXIT cannot interrupt this call; the retirement barrier drains the mirror
+    // before AICPU reads final diagnostics, so reporting needs no extra DSB.
+    scheduler_report_task_completed(run);
     advance();
     return true;
 }

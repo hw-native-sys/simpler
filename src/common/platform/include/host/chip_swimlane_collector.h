@@ -528,6 +528,7 @@ public:
         output_prefix_ = output_prefix;
         chip_swimlane_level_ = chip_swimlane_level;
         json_extensions_.fill({});
+        reset_host_phase_records();
         // The previous run's live figures are not this run's; a comparison must
         // report unknown until this run's reconcile has produced its own.
         live_counters_ = LiveTaskCounters{};
@@ -2273,6 +2274,7 @@ private:
     );
     HandoffReport build_handoff_report(const RunTerminalSnapshot &snapshot, size_t slot);
     void reset_collector_shards();
+    void reset_host_phase_records();
     void merge_collector_shards();
 
     /**

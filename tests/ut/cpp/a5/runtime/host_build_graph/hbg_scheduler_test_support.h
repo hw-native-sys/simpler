@@ -139,6 +139,14 @@ using GraphBuffer = BasicGraphBuffer<8192>;
 // overrides that context rather than resizing this.
 inline constexpr uint64_t kFixtureCallableCount = 1024;
 
+// Read the same global progress fact as run completion; the GM word is only
+// authoritative when no CntNotify is mapped.
+inline uint64_t resolved_count(SchedulerRunControl *run) {
+    if (run->run_completed_read_address != 0)
+        return scheduler_notify_query(*reinterpret_cast<volatile uint32_t *>(run->run_completed_read_address));
+    return scheduler_gm_query(run->resolved_task_count);
+}
+
 struct FixtureStorage {
     explicit FixtureStorage(
         uint64_t task_count, uint64_t workers = 2, uint64_t traces_per_task = 1,
@@ -149,11 +157,6 @@ struct FixtureStorage {
         test_contexts(workers),
         test_graphs(workers),
         local_states(workers) {
-        for (auto &local : test_contexts)
-            for (auto &slot : local.slots)
-                scheduler_initialize_free_slot(&slot);
-        for (auto &slot : scheduler_local_state.slots)
-            scheduler_initialize_free_slot(&slot);
         EXPECT_TRUE(
             scheduler_plan_layout(task_count, &layout, false, task_count * traces_per_task, spmd, protocol_profiling)
         );
@@ -190,6 +193,7 @@ struct FixtureStorage {
             context.graph_summary_offset = layout.graph_summary_offset;
             context.graph_task_count = task_count;
             context.original_task_count = task_count;
+            context.scheduler_state_base_address = reinterpret_cast<uint64_t>(scheduler_state->base());
             context.scheduler_state_bytes = layout.total_size;
             context.runtime_worker_count = workers;
             context.worker_index = worker;
@@ -291,7 +295,7 @@ struct FixtureStorage {
         auto *controls = scheduler_state_at<SchedulerTaskControl>(scheduler_state->base(), layout.task_controls_offset);
         for (uint64_t task = 0; task < layout.task_count; ++task) {
             const auto &meta = metadata[task];
-            if (scheduler_task_requires_admission(meta)) continue;
+            if (scheduler_task_requires_sync_start(meta.flags)) continue;
             const uint32_t total = scheduler_task_is_executable(meta.flags) && !scheduler_task_is_inline(meta.flags) ?
                                        meta.logical_block_num * meta.active_mask.count() :
                                        1;
@@ -306,11 +310,15 @@ struct FixtureStorage {
         task_catalog_offset = plan.header_offset;
         scheduler_state_at<SchedulerGraphSummary>(scheduler_state->base(), layout.graph_summary_offset)
             ->task_catalog_offset = task_catalog_offset;
+        const auto bind_catalog = [&](SchedulerLocalState &local) {
+            local.config.task_catalog_offset = task_catalog_offset;
+            local.next_mix_ref = plan.header.first_mix_ref;
+        };
         for (auto &local : test_contexts)
-            local.config.task_catalog_offset = task_catalog_offset;
+            bind_catalog(local);
         for (auto &local : local_states)
-            local.config.task_catalog_offset = task_catalog_offset;
-        scheduler_local_state.config.task_catalog_offset = task_catalog_offset;
+            bind_catalog(local);
+        bind_catalog(scheduler_local_state);
     }
 
     // Dispatch tests configure synthetic wire contexts directly. Snapshot

@@ -28,8 +28,7 @@ class ProtocolBuilder:
         self.raw: dict[str, Any] = capture(epoch)
         self.clock = 0
         self.groups = [0] * clusters
-        self.cluster_groups = [0] * clusters
-        self.lane_groups = [[0, 0, 0] for _ in range(clusters)]
+        self.mix_floors = [0] * clusters
         self.identities: list[dict[str, Any]] = []
         self.deferred_tasks = set(deferred_tasks)
         raw = self.raw
@@ -43,8 +42,7 @@ class ProtocolBuilder:
             tasks=[],
             workers=[],
             task_controls=[],
-            admissions=[],
-            admission_log=[],
+            floor_publications=[],
             members=[],
             blocks=[],
             executions=[],
@@ -82,8 +80,6 @@ class ProtocolBuilder:
                     completion_debt=(blocks * bin(mask).count("1") if mask else 1) if mask is not None else 0,
                     next_block=0,
                     completed_subtasks=0,
-                    admission_state=0,
-                    claim_tickets=0,
                     claim_seal=0,
                     completion_backend=0,
                     async_mask=0,
@@ -94,7 +90,7 @@ class ProtocolBuilder:
             )
             raw["inline_completed_count" if mask is None else "resolved_task_count"] += 1
         raw["trace_count"] = prefix or len(shapes)
-        raw["cooperative_task_count"] = sum(bool(task["flags"] & 16) for task in raw["tasks"])
+        raw["cooperative_task_count"] = sum(bool(task["flags"] & (4 | 16)) for task in raw["tasks"])
         raw["mix_task_count"] = sum(bool(task["flags"] & 4) for task in raw["tasks"])
         raw["sync_mix_task_count"] = sum(bool(task["flags"] & 4 and task["flags"] & 16) for task in raw["tasks"])
         raw["member_count"] = raw["cooperative_task_count"] * raw["worker_count"]
@@ -114,29 +110,88 @@ class ProtocolBuilder:
                     cluster_workers=[worker // 3 * 3 + lane for lane in range(3)],
                 )
             )
-        if raw["cooperative_task_count"]:
-            stride = 64
-            for task in raw["tasks"]:
-                raw["admissions"].append(
-                    dict(
-                        index=task["task_ref"],
-                        run_epoch=0,
-                        task_ref=-1,
-                        order_key=MAX,
-                        block_num=0,
-                        member_count=0,
-                        active_mask=0,
-                        flags=0,
-                        record_offset=4096 + task["task_ref"] * stride,
-                    )
-                )
+        mix, sync, compact = [0] * 3, [0] * 3, 0
+        self.mix_refs = [t["task_ref"] for t in raw["tasks"] if t["flags"] & 4]
+        self.mix_rows = {ref: i + 1 for i, ref in enumerate(self.mix_refs)}
+        self.published_blocks = dict.fromkeys(self.mix_refs, 0)
+        raw["floor_count"] = (len(self.mix_refs) + 1) * clusters if self.mix_refs else 0
+        for t in raw["tasks"]:
+            ref, flags, mask = t["task_ref"], t["flags"], t["active_mask"]
+            order = ref
+            t.update(
+                schedule_rank=order,
+                topological_level=0,
+                bottom_level=0,
+                cooperative_index=compact if flags & (4 | 16) else (1 << 32) - 1,
+                required_floor=[0] * 3,
+            )
+            compact += int(bool(flags & (4 | 16)))
+            physical = mask | 2 if flags & 4 else (6 if mask in (2, 4) else mask)
+            if flags and not flags & 32:
+                for lane in range(3):
+                    if physical & (1 << lane):
+                        t["required_floor"][lane] = sync[lane] if flags & 4 else mix[lane]
+                        if flags & 4:
+                            mix[lane] = order + 1
+                        elif flags & 16:
+                            sync[lane] = order + 1
+        if self.mix_refs and self.mix_refs[0]:
+            self.publish_floors(None)
+
+    def publish_floors(self, prior):
+        row = 0 if prior is None else self.mix_rows[prior]
+        floor = self.mix_refs[row] if row < len(self.mix_refs) else len(self.raw["tasks"])
+        clusters = self.raw["cluster_count"]
+        for cluster in range(clusters):
+            rec = dict(
+                index=row * clusters + cluster,
+                run_epoch=self.raw["run_epoch"],
+                cluster_index=cluster,
+                worker_index=cluster * 3 + 1,
+                prior_mix_ref=(1 << 32) - 1 if prior is None else prior,
+                floor=floor,
+            )
+            self.stamp(rec, "before")
+            self.stamp(rec, "after")
+            self.raw["floor_publications"].append(rec)
+            self.mix_floors[cluster] = floor
+
+    def proof(self, task, worker):
+        spec = self.raw["tasks"][task]
+        needed = spec["required_floor"][worker % 3]
+        return dict(
+            observed_mix_floor=(self.mix_floors[worker // 3] if needed and not spec["flags"] & 4 else 0),
+            observed_self_floor=(task if needed and spec["flags"] & 4 else 0),
+        )
+
+    def commit_member(self, task, worker):
+        row = dict(
+            index=self.raw["tasks"][task]["cooperative_index"] * self.raw["worker_count"] + worker,
+            run_epoch=self.raw["run_epoch"],
+            task_ref=task,
+            order_key=self.raw["tasks"][task]["schedule_rank"],
+            worker_index=worker,
+            retired=[0, 0],
+            **self.proof(task, worker),
+        )
+        self.stamp(row, "committed")
+        self.raw["members"].append(row)
+
+    def retire_member(self, task, worker):
+        row = next(m for m in self.raw["members"] if m["task_ref"] == task and m["worker_index"] == worker)
+        self.stamp(row, "retired")
 
     def tick(self):
         self.clock += 10
         return self.clock
 
     def stamp(self, record, field):
-        worker = self.raw["workers"][record["worker_index"]]
+        worker_id = (
+            record["completion_worker"]
+            if "completion_worker" in record and field in ("completion_before", "completion_after", "releases_observed")
+            else record["worker_index"]
+        )
+        worker = self.raw["workers"][worker_id]
         worker["next_sequence"] += 1
         record[field] = [self.tick(), worker["next_sequence"]]
 
@@ -147,13 +202,13 @@ class ProtocolBuilder:
             task_ref=task,
             worker_index=worker,
             flags=spec["flags"],
-            order_key=self.raw["admission_log"].index(task) if spec["flags"] & 16 else MAX,
+            order_key=spec["schedule_rank"],
         )
 
     def actor(self, task, worker, name, *, contribution=None) -> dict[str, Any]:
         row: dict[str, Any] = next((r for r in self.raw["task_events"] if r["index"] == task), {})
         if not row:
-            row = dict(index=task, admission=None, completion=None)
+            row = dict(index=task, completion=None)
             self.raw["task_events"].append(row)
         record = self.common(task, worker)
         row[name] = record
@@ -171,7 +226,7 @@ class ProtocolBuilder:
     def members(self, task):
         spec = self.raw["tasks"][task]
         if spec["flags"] & 4:
-            return [w["index"] for w in self.raw["workers"] if (spec["active_mask"] | 1) & (1 << (w["index"] % 3))]
+            return [w["index"] for w in self.raw["workers"] if spec["active_mask"] & (1 << (w["index"] % 3))]
         eligible = [
             w["index"]
             for w in self.raw["workers"]
@@ -189,36 +244,6 @@ class ProtocolBuilder:
         self.raw["task_controls"][task].update(state=2, pending_compute=0, completion_debt=0)
         return record
 
-    def admit(self, task, worker=0, observe_members=True):
-        spec = self.raw["tasks"][task]
-        self.raw["admission_log"].append(task)
-        self.raw["commit_tail"] += 1
-        record = self.raw["admissions"][task]
-        record.update(self.common(task, worker))
-        record.pop("worker_index")
-        record.update(
-            block_num=spec["block_num"], active_mask=spec["active_mask"], member_count=len(self.members(task))
-        )
-        self.raw["task_controls"][task]["admission_state"] = 3
-        self.actor(task, worker, "admission")
-        for member in self.members(task):
-            row = dict(
-                self.common(task, member),
-                index=record["order_key"] * self.raw["worker_count"] + member,
-                observed=[0, 0],
-                closed=[0, 0],
-                observed_tail=self.raw["commit_tail"],
-                closed_cursor=0,
-                close_frontier=0,
-                last_group_seq=0,
-                pending_mask=0,
-                claim_seal_seen=0,
-                claim_cursor_seen=0,
-            )
-            self.raw["members"].append(row)
-            if observe_members:
-                self.stamp(row, "observed")
-
     def claim(self, task, block, worker) -> dict[str, Any]:
         spec = self.raw["tasks"][task]
         row: dict[str, Any] = dict(
@@ -231,12 +256,9 @@ class ProtocolBuilder:
             completion_ticket=MAX,
             completion_credits=0,
             released_seq=[0, 0, 0],
-            sync_tail=0,
-            sync_frontier=[0, 0, 0],
-            sync_hold=[0, 0, 0],
+            completion_worker=worker,
         )
         for name in (
-            "staged",
             "claim_before",
             "claim_after",
             "publish_before",
@@ -250,25 +272,23 @@ class ProtocolBuilder:
             index=spec["trace_base"] + block * bin(spec["active_mask"]).count("1"), owner=row, lanes=[]
         )
         self.raw["blocks"].append(result)
-        if spec["flags"] & 16:
-            self.stamp(row, "claim_before")
-            self.stamp(row, "claim_after")
+        self.stamp(row, "claim_before")
+        self.stamp(row, "claim_after")
+        if spec["flags"] & 16 and not spec["flags"] & 4:
+            self.commit_member(task, worker)
         control = self.raw["task_controls"][task]
         control["next_block"] += 1
-        positions = self.raw["cluster_count"] * (2 if spec["active_mask"] in (2, 4) else 1)
-        if spec["flags"] & 16 and 1 < spec["block_num"] < positions:
-            control["claim_tickets"] += 1
         certificate = dict(
             run_epoch=self.raw["run_epoch"],
             worker_index=worker,
             block_idx=block,
-            confirmed_count=control["next_block"],
+            confirmed_count=control["next_block"] if control["next_block"] == spec["block_num"] else 0,
             seal_value=0,
             published_before=[0, 0],
             published_after=[0, 0],
         )
-        result["claim"] = certificate if spec["flags"] & 16 else None
-        if spec["flags"] & 16 and control["next_block"] == spec["block_num"]:
+        result["claim"] = certificate
+        if control["next_block"] == spec["block_num"]:
             certificate["seal_value"] = spec["block_num"]
             self.stamp(certificate, "published_before")
             self.stamp(certificate, "published_after")
@@ -288,7 +308,7 @@ class ProtocolBuilder:
         control["completion_debt"] -= width
         self.stamp(owner, "completion_after")
         if control["pending_compute"] == 0:
-            self.complete_task(task, owner["worker_index"], contribution=owner)
+            self.complete_task(task, owner["completion_worker"], contribution=owner)
 
     def execute(self, task, block, slot, worker, *, owner=None, group=0, skip=False) -> dict[str, Any]:
         spec = self.raw["tasks"][task]
@@ -298,7 +318,7 @@ class ProtocolBuilder:
             control["next_block"] += 1
             if control["next_block"] == spec["block_num"]:
                 control["claim_seal"] = spec["block_num"]
-        pending = block % 2
+        pending = 4 + group // 2 % 2 if mixed else block % 2
         index = (
             spec["trace_base"]
             + block * bin(spec["active_mask"]).count("1")
@@ -310,7 +330,7 @@ class ProtocolBuilder:
             block_idx=block,
             pending_slot=pending,
             subtask_slot=slot,
-            ready_source=3 if cooperative or mixed else 0,
+            ready_source=3 if mixed else 0,
             group_seq=group,
             block_num=spec["block_num"],
             cluster_index=worker // 3,
@@ -318,15 +338,9 @@ class ProtocolBuilder:
             publication_count=1,
             publication_before_cycles=self.tick(),
             publication_after_cycles=self.tick(),
-            permit_tail=MAX if cooperative else self.raw["commit_tail"],
+            **self.proof(task, worker),
         )
-        row["flags"] = (
-            1
-            | (0 if skip else 2)
-            | 64
-            | (4 if cooperative else 16 if self.raw["cooperative_task_count"] else 32)
-            | (8 if mixed and cooperative else 128 if mixed else 0)
-        )
+        row["flags"] = 1 | (0 if skip else 2) | 64 | (4 if cooperative else 0) | (128 if mixed else 0)
         for name in ("permit", "entry", "returned", "visible", "completion_consumed", "trace_published"):
             row[name] = [0, 0]
         row["contribution_credits"] = 0
@@ -344,6 +358,8 @@ class ProtocolBuilder:
         else:
             self.contribute(row, owner)
         self.stamp(row, "trace_published")
+        if cooperative and not mixed:
+            self.retire_member(task, worker)
         self.identities.append(
             dict(
                 run_epoch=self.raw["run_epoch"],
@@ -354,9 +370,9 @@ class ProtocolBuilder:
                 block_num=spec["block_num"],
                 subtask_slot=slot,
                 pending_slot=pending,
-                order_key=row["order_key"] if cooperative else None,
+                order_key=row["order_key"],
                 group_seq=group or None,
-                group_kind=1 if mixed and cooperative else 2 if mixed else 0,
+                group_kind=2 if mixed else 0,
                 cluster_index=worker // 3,
                 cluster_lane=worker % 3,
                 executed=not skip,
@@ -385,24 +401,17 @@ class ProtocolBuilder:
 
     def mix_block(self, task, block, cluster, *, reserved=None) -> dict[str, Any]:
         workers = [cluster * 3 + lane for lane in range(3)]
-        result = self.claim(task, block, workers[0]) if reserved is None else reserved
+        result = self.claim(task, block, workers[1]) if reserved is None else reserved
         owner = result["owner"]
         ordered = bool(owner["flags"] & 16)
-        if ordered:
-            self.groups[cluster] += 1
-            group = self.groups[cluster]
-        else:
-            group = self.cluster_groups[cluster] * 2 + 1
-            self.cluster_groups[cluster] += 1
-            owner["sync_tail"] = self.raw["commit_tail"]
-            owner["sync_frontier"] = [self.raw["commit_tail"]] * 3
-            self.stamp(owner, "staged")
-            self.stamp(owner, "claim_before")
-            self.stamp(owner, "claim_after")
+        group = 2 * self.groups[cluster] + 1
+        self.groups[cluster] += 1
+        owner["completion_worker"] = workers[1] if owner["active_mask"] & 2 else workers[0]
         owner["group_seq"] = group
         self.stamp(owner, "publish_before")
         self.stamp(owner, "publish_after")
-        resources = owner["active_mask"] | 1
+        self.published_blocks[task] += 1
+        resources = owner["active_mask"]
         for lane, worker in enumerate(workers):
             if not resources & (1 << lane):
                 continue
@@ -416,10 +425,10 @@ class ProtocolBuilder:
                 block_num=owner["block_num"],
                 active_mask=owner["active_mask"],
                 resource_mask=resources,
+                observed_self_floor=self.proof(task, worker)["observed_self_floor"],
                 arrived_seq=[group if resources & (1 << peer) else 0 for peer in range(3)],
                 lane_subtasks=[i if owner["active_mask"] & (1 << i) else 255 for i in range(3)],
             )
-            row["previous_lane_seq"] = list(self.lane_groups[cluster]) if ordered else [0, 0, 0]
             for name in (
                 "descriptor_ready",
                 "arrive_before",
@@ -430,54 +439,25 @@ class ProtocolBuilder:
             ):
                 row[name] = [0, 0]
             result["lanes"].append(row)
-            for name in ("descriptor_ready", "arrive_before", "arrive_after"):
-                self.stamp(row, name)
+            self.stamp(row, "descriptor_ready")
+            if ordered:
+                self.commit_member(task, worker)
+            self.stamp(row, "arrive_before")
+            self.stamp(row, "arrive_after")
         for row in result["lanes"]:
             self.stamp(row, "arrivals_observed")
             if owner["active_mask"] & (1 << row["lane"]):
                 self.execute(task, block, row["lane"], row["worker_index"], group=group)
             self.stamp(row, "release_before")
             self.stamp(row, "release_after")
+            if ordered:
+                self.retire_member(task, row["worker_index"])
         owner["released_seq"] = [group if resources & (1 << peer) else 0 for peer in range(3)]
-        for lane in range(3):
-            if ordered and resources & (1 << lane):
-                self.lane_groups[cluster][lane] = group
         self.stamp(owner, "releases_observed")
         self.complete_block(result)
+        if self.published_blocks[task] == owner["block_num"]:
+            self.publish_floors(task)
         return result
-
-    def close(self, task, only_worker=None):
-        spec = self.raw["tasks"][task]
-        for row in self.raw["members"]:
-            if row["task_ref"] != task:
-                continue
-            worker = row["worker_index"]
-            if only_worker is not None and worker != only_worker:
-                continue
-            row["closed_cursor"] = self.raw["task_controls"][task]["next_block"]
-            if spec["flags"] & 4:
-                groups = [
-                    b["owner"]["group_seq"]
-                    for b in self.raw["blocks"]
-                    if b["owner"]["task_ref"] == task and b["owner"]["cluster_index"] == worker // 3
-                ]
-                row["last_group_seq"] = max(groups, default=0)
-                if worker % 3 == 0:
-                    row["close_frontier"] = row["order_key"] + 1
-                else:
-                    row["close_frontier"] = max(
-                        (
-                            member["order_key"] + 1
-                            for member in self.raw["members"]
-                            if member["worker_index"] == (worker // 3) * 3 and member["closed"][1]
-                        ),
-                        default=0,
-                    )
-                if worker % 3:
-                    row["closed_cursor"] = MAX
-            if not (spec["flags"] & 4 and worker % 3) and row["closed_cursor"] == spec["block_num"]:
-                row["claim_seal_seen"] = row["claim_cursor_seen"] = spec["block_num"]
-            self.stamp(row, "closed")
 
     def run(self, order=None):
         for task in range(len(self.raw["tasks"])) if order is None else order:
@@ -488,8 +468,6 @@ class ProtocolBuilder:
                 self.complete_task(task, 1)
                 continue
             if spec["flags"] & (4 | 16):
-                if spec["flags"] & 16:
-                    self.admit(task)
                 last = None
                 for block in range(spec["block_num"]):
                     if spec["flags"] & 4:
@@ -505,7 +483,6 @@ class ProtocolBuilder:
                             owner=last,
                         )
                 assert last is not None
-                self.close(task)
             else:
                 slot = spec["active_mask"].bit_length() - 1
                 eligible = self.members(task)

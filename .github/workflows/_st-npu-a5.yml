@@ -125,13 +125,13 @@ jobs:
             --env SIMPLER_ENABLE_PTO_RDMA_WORKSPACE \
             --run ".venv/bin/python -m pytest examples tests/st --platform a5 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout $SESSION_TIMEOUT_S --manual '$MANUAL_MODE' --environment-receipts --verify-feature-coverage --coverage-partition all --junitxml outputs/default-ci/main.xml"
 
-      - name: DFX smokes (a5)
+      - name: Run DFX smokes (a5)
         if: inputs.include_dfx_smokes
         uses: ./.github/actions/run-onboard-dfx-smokes
         with:
           platform: a5
 
-      - name: Verify and summarize default environment coverage
+      - name: Verify default environment coverage (a5)
         if: always()
         run: |
           .venv/bin/python -m simpler_setup.tools.feature_coverage_report \
@@ -150,22 +150,15 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Upload HBG argument-dump payloads
-        if: always() && inputs.include_dfx_smokes && steps.diagnostics.outcome == 'success'
-        continue-on-error: true
-        uses: ./.ci-support/.github/actions/upload-diagnostics
-        with:
-          name: a5-hbg-args-dump-${{ github.run_id }}-${{ github.run_attempt }}-${{ runner.arch }}
-          if-no-files-found: ignore
-          path: |
-            outputs/**/args_dump.json
-            outputs/**/args.bin
-
-      - name: Retain default environment plans and receipts
-        if: always() && steps.diagnostics.outcome == 'success'
+      - name: Upload logs
+        if: (failure() || cancelled()) && steps.diagnostics.outcome == 'success'
         continue-on-error: true
         uses: ./.ci-support/.github/actions/upload-diagnostics
         with:
           name: default-a5-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: outputs/default-ci
+          path: |
+            outputs/default-ci
+            outputs/**/args_dump.json
+            outputs/**/args.bin
           if-no-files-found: warn
+          retention-days: 7

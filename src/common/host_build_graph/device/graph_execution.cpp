@@ -21,14 +21,16 @@ namespace {
 
 GraphExecution *acquire_execution_storage(
     uintptr_t storage_addr, size_t storage_bytes, int32_t task_count, int32_t tensor_arg_count,
-    int32_t scalar_arg_count, int32_t edge_count
+    int32_t scalar_arg_count, int32_t edge_count, GraphArgumentStorage argument_storage
 ) {
     GraphExecutionStorageLayout layout{};
     // ChipTaskStorage, not GraphExecution: the sub-task array's alignment is the widest
     // the storage carries, and tasks_offset only rounds up relative to this base, so
     // an under-aligned base would leave every alignas(64) sub-task entry misaligned.
     if (storage_addr == 0 || storage_addr % alignof(ChipTaskStorage) != 0 ||
-        !graph_execution_storage_layout(task_count, tensor_arg_count, scalar_arg_count, edge_count, &layout) ||
+        !graph_execution_storage_layout(
+            task_count, tensor_arg_count, scalar_arg_count, edge_count, &layout, argument_storage
+        ) ||
         layout.total_bytes > storage_bytes) {
         return nullptr;
     }
@@ -38,7 +40,8 @@ GraphExecution *acquire_execution_storage(
     auto *base = reinterpret_cast<uint8_t *>(execution);
     execution->task_storage = reinterpret_cast<ChipTaskStorage *>(base + layout.tasks_offset);
     execution->task_tensor_pool = reinterpret_cast<simpler::hbg::Tensor *>(base + layout.tensors_offset);
-    execution->task_scalar_pool = reinterpret_cast<uint64_t *>(base + layout.scalars_offset);
+    execution->task_argument_pool = reinterpret_cast<uint64_t *>(base + layout.arguments_offset);
+    execution->argument_storage = argument_storage;
     // The execution's own fanin CSR. bind_graph_topology fills it out of the
     // reading thread's section and validates what it wrote; until then the rows
     // are the storage's zeroes and no scan runs, because the slot's
@@ -303,7 +306,9 @@ bool graph_predicate_resolve(
 
 }  // namespace
 
-GraphExecution *graph_execution_localize(ChipTaskSlotState &outer_slot, const GraphImageView &image) {
+GraphExecution *graph_execution_localize(
+    ChipTaskSlotState &outer_slot, const GraphImageView &image, GraphArgumentStorage argument_storage
+) {
     if (outer_slot.task_kind != TaskKind::GRAPH || outer_slot.to_descriptor().packed_buffer_base == nullptr ||
         outer_slot.to_descriptor().packed_buffer_end == nullptr) {
         return nullptr;
@@ -328,14 +333,28 @@ GraphExecution *graph_execution_localize(ChipTaskSlotState &outer_slot, const Gr
 
     const uintptr_t outer_base = reinterpret_cast<uintptr_t>(outer_slot.to_descriptor().packed_buffer_base);
     const uintptr_t outer_end = reinterpret_cast<uintptr_t>(outer_slot.to_descriptor().packed_buffer_end);
+    GraphExecutionStorageLayout recorded_layout{}, execution_layout{};
+    if (!graph_execution_storage_layout(
+            definition.task_count, definition.tensor_arg_count, definition.scalar_arg_count, definition.edge_count,
+            &recorded_layout
+        ) ||
+        recorded_layout.total_bytes > definition.execution_storage_bytes ||
+        !graph_execution_storage_layout(
+            definition.task_count, definition.tensor_arg_count, definition.scalar_arg_count, definition.edge_count,
+            &execution_layout, argument_storage
+        ))
+        return nullptr;
+    const size_t execution_bytes = argument_storage == GraphArgumentStorage::SCALARS ?
+                                       definition.execution_storage_bytes :
+                                       execution_layout.total_bytes;
     if (outer_end < outer_base || definition.required_heap > UINTPTR_MAX - outer_base ||
-        definition.execution_storage_bytes > outer_end - outer_base ||
-        definition.required_heap > outer_end - outer_base - definition.execution_storage_bytes) {
+        execution_bytes > outer_end - outer_base ||
+        definition.required_heap > outer_end - outer_base - execution_bytes) {
         return nullptr;
     }
     GraphExecution *execution = acquire_execution_storage(
-        outer_base + definition.required_heap, definition.execution_storage_bytes, definition.task_count,
-        definition.tensor_arg_count, definition.scalar_arg_count, definition.edge_count
+        outer_base + definition.required_heap, execution_bytes, definition.task_count, definition.tensor_arg_count,
+        definition.scalar_arg_count, definition.edge_count, argument_storage
     );
     if (execution == nullptr) return nullptr;
 
@@ -484,14 +503,14 @@ GraphMaterializeResult graph_execution_materialize_slice(
             execution.materialize_busy.store(0, std::memory_order_release);
             return GraphMaterializeResult::INVALID;
         }
-        // A task's arguments occupy the same span in this execution's pools as in the
-        // Definition's arg tables, so the region starts at the task's own offset. No
-        // fanin region: its dependencies come from the Definition's CSR, and
-        // reset_graph_payload below keeps fanin_count at 0.
-        payload.bind_regions(
-            execution.task_tensor_pool + source.tensor_offset, execution.task_scalar_pool + source.scalar_offset,
-            nullptr
-        );
+        // Scalar-only layouts use the Definition's scalar span. Kernel-vector
+        // layouts write Scalars directly after this task's Tensor pointers.
+        // Dependencies belong to the Definition CSR, not a payload fanin region.
+        uint64_t *kernel_arguments = execution.kernel_arguments(i);
+        uint64_t *scalar_destination = kernel_arguments == nullptr ?
+                                           execution.task_argument_pool + source.scalar_offset :
+                                           kernel_arguments + source.tensor_count;
+        payload.bind_regions(execution.task_tensor_pool + source.tensor_offset, scalar_destination, nullptr);
         simpler::hbg::Tensor *task_tensors = payload.tensor_data();
         for (int32_t j = 0; j < source.tensor_count; ++j) {
             const int32_t tensor_index = source.tensor_offset + j;
@@ -504,6 +523,7 @@ GraphMaterializeResult graph_execution_materialize_slice(
                 return GraphMaterializeResult::INVALID;
             }
             execution.consumed_tensor_args++;
+            if (kernel_arguments != nullptr) kernel_arguments[j] = reinterpret_cast<uint64_t>(&task_tensors[j]);
         }
         uint64_t *task_scalars = payload.scalar_data();
         for (int32_t j = 0; j < source.scalar_count; ++j) {

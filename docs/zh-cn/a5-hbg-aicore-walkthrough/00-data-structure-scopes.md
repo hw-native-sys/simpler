@@ -26,7 +26,7 @@ Graph child 也不另占一个顶层任务镜像条目。
 | 数据 | 作用范围 | 写者与读者 |
 | ---- | -------- | ---------- |
 | SchedulerTaskMetadata，16 B | 每 expanded node | Host 只读形状、kernel IDs、trace prefix |
-| SchedulerTaskControl，640 B | 每 expanded node | 核以 atomic 管 ticket、gate、claim seal、admission；无后继通知链 |
+| SchedulerTaskControl，1152 B | 每 expanded node | 核以 atomic 管 ticket、gate、claim seal、admission；无后继通知链 |
 | SchedulerExecutionPlan，16 B | 每 node | Host 声明该 node 的真实执行区间 |
 | SchedulerPreparedCall，512 B | 每 block×active-lane 执行 | Host 唯一写者，设备读取完整函数和 args |
 | SchedulerPreparedControl，128 B | 每真实执行 | 单原子 phase/固定 owner；控制 Call 责任 |

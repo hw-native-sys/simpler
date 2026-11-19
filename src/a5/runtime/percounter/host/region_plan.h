@@ -54,9 +54,8 @@ struct PercounterLayout {
     uint64_t sinks_offset;
     uint64_t counters_offset;
     uint64_t completion_sectors_offset;
-    uint64_t dispatch_payloads_offset;
-    // One deferred-completion record per lane and its entry slots, indexed the
-    // way the payloads are. Reserved for every graph, because whether a kernel
+    // One deferred-completion registration scratch per physical lane.
+    // Reserved for every graph, because whether a kernel
     // registers a condition is not visible at bind -- the record is what lets
     // the runtime see that one did. Placed past `upload_size`, so the bytes
     // cost no DMA and a lane writes its own record's header before its loop.
@@ -93,7 +92,9 @@ struct PercounterLayout {
     uint64_t task_records_offset;
     uint64_t task_record_stride;
     uint64_t scalar_records_offset;
+    uint64_t event_records_offset;
     uint32_t task_record_capacity;
+    uint32_t event_record_capacity;
     uint32_t profiling_level;
 };
 
@@ -204,6 +205,7 @@ inline bool plan_layout(
     PercounterLayout next{};
     next.profiling_level = profiling_level;
     next.task_record_capacity = static_cast<uint32_t>(std::min(block_total, uint64_t{65536}));
+    if (profiling_level >= 2) next.event_record_capacity = std::min(next.task_record_capacity * 8, 16384U);
     next.task_count = task_count;
     next.edge_count = edge_count;
     for (uint32_t t = 0; t < PERCOUNTER_CORE_TYPE_COUNT; ++t)
@@ -250,10 +252,6 @@ inline bool plan_layout(
         !PERCOUNTER_RESERVE(table_task_count, PercounterFanin, fanin_offset) ||
         !PERCOUNTER_RESERVE(edge_count, uint64_t, fanin_addr_offset) ||
         !PERCOUNTER_RESERVE(table_task_count, uint64_t, sinks_offset) ||
-        !PERCOUNTER_RESERVE(
-            static_cast<uint64_t>(SCHEDULER_WORKER_CAPACITY) * PERCOUNTER_PAYLOAD_SLOT_COUNT, DispatchPayload,
-            dispatch_payloads_offset
-        ) ||
         (profiling_level >= 2 &&
          !PERCOUNTER_RESERVE(SCHEDULER_WORKER_CAPACITY, PercounterProfileBuffer, profile_buffers_offset)) ||
         !PERCOUNTER_RESERVE(task_count, PercounterCounter, counters_offset) ||
@@ -287,6 +285,12 @@ inline bool plan_layout(
                                      sizeof(SchedulerScalarRecord), &bytes
                                  ) ||
                                  !scheduler_layout_reserve(&cursor, bytes, 64, &next.scalar_records_offset)))
+        return false;
+    if (profiling_level >= 2 &&
+        (!scheduler_layout_checked_mul(
+             uint64_t{SCHEDULER_WORKER_CAPACITY} * next.event_record_capacity, sizeof(PercounterTaskEvent), &bytes
+         ) ||
+         !scheduler_layout_reserve(&cursor, bytes, 64, &next.event_records_offset)))
         return false;
     if (!scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) return false;
     *layout = next;
@@ -528,8 +532,10 @@ inline bool build_tables(
         if (task.fanin_count < 0 || (task.fanin_count > 0 && task.fanin_ids == nullptr))
             return fail(BuildStatus::INVALID_ARGUMENT, static_cast<int64_t>(id), -1);
 
-        fanin[id].count = task.fanin_count;
-        fanin[id].begin = static_cast<int32_t>(edge_cursor);
+        const uint64_t row_begin = edge_cursor;
+        auto &row = fanin[id];
+        row.count = 0;
+        row.begin = static_cast<int32_t>(row_begin);
         for (int32_t e = 0; e < task.fanin_count; ++e) {
             if (edge_cursor >= layout.edge_count)
                 return fail(BuildStatus::EDGE_COUNT_MISMATCH, static_cast<int64_t>(id), e);
@@ -538,10 +544,16 @@ inline bool build_tables(
                 return fail(BuildStatus::PRODUCER_OUT_OF_RANGE, static_cast<int64_t>(id), e);
             if (static_cast<uint64_t>(producer) >= id)
                 return fail(BuildStatus::PRODUCER_NOT_BEFORE_CONSUMER, static_cast<int64_t>(id), e);
-            fanin_addr[edge_cursor] =
-                device_base + layout.counters_offset + static_cast<uint64_t>(producer) * sizeof(PercounterCounter);
             const auto &source = tasks[producer];
-            if (partitioned(source)) fanin_addr[edge_cursor] |= PERCOUNTER_COMPLETION_PARTITIONED;
+            // The device row contains only dependencies that can block at run time.
+            if (!source.inline_completed) {
+                auto &ref = fanin_addr[row_begin + row.count];
+                ref =
+                    device_base + layout.counters_offset + static_cast<uint64_t>(producer) * sizeof(PercounterCounter);
+                if (partitioned(source)) ref |= PERCOUNTER_COMPLETION_PARTITIONED;
+                ++row.count;
+            }
+            // Edge validation and sink discovery use the input DAG.
             consumed[static_cast<size_t>(producer)] = true;
             ++edge_cursor;
         }
@@ -812,6 +824,10 @@ inline bool build_tables(
         auto *buffers = region_at<PercounterProfileBuffer>(base, layout.profile_buffers_offset);
         for (uint32_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
             buffers[worker].task_capacity = layout.task_record_capacity;
+            buffers[worker].event_capacity = layout.event_record_capacity;
+            buffers[worker].event_records_offset = layout.event_records_offset + uint64_t{worker} *
+                                                                                     layout.event_record_capacity *
+                                                                                     sizeof(PercounterTaskEvent);
             buffers[worker].task_records_offset =
                 layout.task_records_offset + uint64_t{worker} * layout.task_record_stride;
             buffers[worker].scalar_records_offset =
@@ -846,7 +862,7 @@ inline bool build_tables(
     control->fanin_addr_offset = layout.fanin_addr_offset;
     control->counters_offset = layout.counters_offset;
     control->completion_sectors_offset = layout.completion_sectors_offset;
-    control->dispatch_payloads_offset = layout.dispatch_payloads_offset;
+    control->image_bytes = layout.total_size;
     control->async_groups_offset = layout.async_groups_offset;
     control->async_entries_offset = layout.async_entries_offset;
     control->async_capacity = PERCOUNTER_ASYNC_CAPACITY;

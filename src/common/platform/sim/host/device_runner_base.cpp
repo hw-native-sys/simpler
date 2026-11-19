@@ -1804,6 +1804,12 @@ uint64_t SimDeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *ca
             );
         }
 
+        auto install_context = reinterpret_cast<void (*)(int (*)(void *), void *(*)())>(
+            dlsym(handle, "simpler_sim_install_invocation_context_hooks")
+        );
+        if (install_context != nullptr)
+            install_context(sim_context_bind_invocation_context, sim_context_get_invocation_context);
+
         child_in_scratch->set_resolved_addr(reinterpret_cast<uint64_t>(func));
     }
 

@@ -834,7 +834,7 @@ TEST(SimDeviceBinding, SuccessfulLegacyBindingAndCheckedValidation) {
 
 #if defined(__linux__)
 TEST(SimIdentityDeathTest, PartialKeyFailureRollsBackAndRetriesWithoutTouchingOtherKeys) {
-    for (int position : {0, 1}) {
+    for (int position : {0, 1, 2}) {
         ASSERT_EXIT(
             {
                 auto budget = [] {
@@ -856,7 +856,7 @@ TEST(SimIdentityDeathTest, PartialKeyFailureRollsBackAndRetriesWithoutTouchingOt
                 if (budget() != before || pthread_getspecific(sentinel) != &value) _exit(3);
                 if (sim_context_set_subblock_id(1) != 0 || sim_context_set_cluster_id(7) != 0) _exit(4);
                 if (pto_sim_get_subblock_id() != 1) _exit(5);
-                if (budget() != before - 2 || pthread_getspecific(sentinel) != &value) _exit(6);
+                if (budget() != before - 3 || pthread_getspecific(sentinel) != &value) _exit(6);
                 pthread_key_delete(sentinel);
                 _exit(0);
             },
@@ -885,6 +885,30 @@ TEST(SimIdentity, FailedUpdatesPreserveIdentityAndAllowRetry) {
     pto_cpu_sim_release_device(971);
 }
 #endif
+
+TEST(SimInvocationContext, BindingIsThreadLocalAndFailedUpdatePreservesContext) {
+    int first = 1;
+    int second = 2;
+    ASSERT_EQ(sim_context_bind_invocation_context(&first), 0);
+    EXPECT_EQ(sim_context_get_invocation_context(), &first);
+    bool other_ok = false;
+    std::thread other([&]() {
+        other_ok = sim_context_get_invocation_context() == nullptr &&
+                   sim_context_bind_invocation_context(&second) == 0 &&
+                   sim_context_get_invocation_context() == &second &&
+                   sim_context_bind_invocation_context(nullptr) == 0 && sim_context_get_invocation_context() == nullptr;
+    });
+    other.join();
+    EXPECT_TRUE(other_ok);
+    EXPECT_EQ(sim_context_get_invocation_context(), &first);
+#if defined(__linux__)
+    reject_device_bind = true;
+    EXPECT_EQ(sim_context_bind_invocation_context(&second), ENOMEM);
+    EXPECT_EQ(sim_context_get_invocation_context(), &first);
+#endif
+    ASSERT_EQ(sim_context_bind_invocation_context(nullptr), 0);
+    EXPECT_EQ(sim_context_get_invocation_context(), nullptr);
+}
 
 TEST(SimCancellation, BindingIsThreadLocalAndClearedBeforeReuse) {
     constexpr uint32_t stop = 0x7ffffff0;

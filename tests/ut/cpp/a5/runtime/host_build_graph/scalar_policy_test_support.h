@@ -19,7 +19,7 @@ struct ScalarPolicyObservation {
     uint32_t records;
     uint32_t bypass_loads;
     uint32_t atomic_adds;
-    uint32_t ordered_polls;
+    uint32_t floor_checks;
 };
 
 ScalarPolicyObservation scalar_policy_plain();

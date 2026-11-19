@@ -27,8 +27,6 @@ def native_capture(*, deferred_tasks=(), child_mask=2):
         deferred_tasks=deferred_tasks,
     ).run()
     raw["schema"] = "hbg-native-protocol"
-    for control in raw["task_controls"]:
-        control.update(claim_tickets=0)
     raw["graph_source"] = dict(
         tasks=[
             dict(task_id=0, kind=0, graph_key=0, dependencies=[]),
@@ -227,12 +225,12 @@ def test_current_native_graph_rejects_independent_flag(flag):
 
 
 @pytest.mark.parametrize("mask", (3, 5, 6, 7))
-def test_native_graph_mix_child_preserves_stage_claim_and_enter_exit_causality(mask):
+def test_native_graph_mix_child_keeps_claim_publication_and_enter_exit_order(mask):
     raw, identities = native_capture(child_mask=mask)
     owner = raw["blocks"][0]["owner"]
     assert raw["schema"] == "hbg-native-protocol"
     assert owner["task_ref"] == 2
-    assert owner["staged"][0] < owner["claim_before"][0] < owner["claim_after"][0] < owner["publish_before"][0]
+    assert owner["claim_before"][0] < owner["claim_after"][0] < owner["publish_before"][0]
     result = audit_native_protocol(raw, identities)
     assert result["protocol_verified"] and result["device_logical_tasks"] == 6
     assert audit_graph_expansion(raw)[2]["local_child_id"] == 0

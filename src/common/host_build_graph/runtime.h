@@ -47,6 +47,7 @@
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
 #include "callable_limits.h"
 #include "core_async_capability.h"
+#include "core_input_cache_proof.h"
 #include "task_args.h"
 #include "aicore_teardown.h"
 #include "common/launch_entry_args.h"     // LaunchEntryArgsPlan
@@ -485,6 +486,7 @@ private:
         };
         RunImagePublication pending_publication_;
         std::shared_ptr<const RunImagePublication> prepared_publication_;
+        const CoreInputCacheProof *callable_input_cache_proofs_{nullptr};
     };
     HostOnlyState host_;
 
@@ -658,6 +660,8 @@ public:
     uint64_t get_function_bin_addr(int func_id) const;
     CoreAsyncCapability get_function_async_capability(int func_id) const;
     bool bind_callable_async_capabilities(const struct HostApi &api);
+    const CoreInputCacheProof *get_function_input_cache_proof(int func_id) const;
+    friend void bind_registered_input_cache_proofs(Runtime &runtime, const std::vector<CoreInputCacheProof> &proofs);
 
     /**
      * Bind this run to one registration-owned function-table pair.

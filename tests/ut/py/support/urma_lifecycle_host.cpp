@@ -85,6 +85,7 @@ enum class PeerFailure { NONE, IMPORT, RESERVE, MAP };
 PeerFailure peer_failure = PeerFailure::NONE;
 bool peer_reserve_pending = false;
 int peer_import_calls = 0;
+int peer_enable_calls = 0;
 int injected_peer_failures = 0;
 int explicit_access_calls = 0;
 std::unordered_set<aclrtDrvMemHandle> imported_handles;
@@ -122,9 +123,6 @@ aclError unmap_buffer(void *p) {
 extern "C" aclError aclrtHostRegisterV2(void *, uint64_t, uint32_t) { return ACL_ERROR_FAILURE; }
 extern "C" aclError aclrtHostGetDevicePointer(void *, void **, uint32_t) { return ACL_ERROR_FAILURE; }
 extern "C" aclError aclrtHostUnregister(void *) { return ACL_ERROR_FAILURE; }
-extern "C" aclError aclrtHostMemMapCapabilities(uint32_t, aclrtHacType, aclrtHostMemMapCapability *) {
-    return ACL_ERROR_FAILURE;
-}
 extern "C" aclError aclrtGetDevice(int32_t *id) {
     if (fail_get_device) return 1;
     *id = 0;
@@ -214,7 +212,10 @@ extern "C" aclError aclrtMemImportFromShareableHandle(uint64_t exported, int32_t
     peer_reserve_pending = true;
     return ACL_SUCCESS;
 }
-extern "C" aclError aclrtDeviceEnablePeerAccess(int32_t, uint32_t) { return ACL_SUCCESS; }
+extern "C" aclError aclrtDeviceEnablePeerAccess(int32_t, uint32_t) {
+    ++peer_enable_calls;
+    return ACL_SUCCESS;
+}
 extern "C" aclError aclrtDevicePeerAccessStatus(int32_t, int32_t, int32_t *status) {
     *status = 1;
     return ACL_SUCCESS;
@@ -328,7 +329,7 @@ static void test_overlapping_domains(CommHandle h, const std::vector<uint32_t> &
     const uint32_t urma = comm_workspace_bit(CommWorkspaceKind::URMA);
     auto allocate = [&](uint64_t id, const std::vector<uint32_t> &ranks, uint32_t rank) {
         const uint32_t peer = 1 - rank;
-        assert(domain_write_announce(h->rootinfo_path, id, peer, h->run_token, getpid(), ranks[peer], 42));
+        assert(domain_write_announce(h->rootinfo_path, id, peer, h->run_token, getpid(), ranks[peer], 0));
         for (const char *phase : {"p2p_ready", "release"}) {
             std::ofstream marker(
                 barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(id, phase), peer)
@@ -356,7 +357,8 @@ static void test_overlapping_domains(CommHandle h, const std::vector<uint32_t> &
         const uint32_t peer = 1 - rank;
         assert(ctx.rankId == rank && ctx.rankNum == ranks.size());
         assert(ctx.windowsIn[rank] == reinterpret_cast<uint64_t>(alloc.local_buf));
-        assert(ctx.windowsIn[peer] == reinterpret_cast<uint64_t>(alloc.peer_windows.at(0).address));
+        assert(ctx.windowsIn[peer] == 0 && alloc.peer_windows.empty());
+        assert(peer_import_calls == 0 && peer_enable_calls == 0 && last_exported == 0);
         const auto *info =
             reinterpret_cast<const pto::comm::urma::UrmaInfo *>(comm_workspace<CommWorkspaceKind::URMA>(ctx).addr);
         const auto *mr = reinterpret_cast<const pto::comm::urma::UrmaMemInfo *>(info->memPtr);
@@ -429,7 +431,8 @@ int main(int argc, char **argv) {
         return 0;
     }
     const uint64_t id = 1;
-    assert(domain_write_announce(h->rootinfo_path, id, 1, h->run_token, getpid(), 1, 42));
+    const bool mapped = peer_failure != PeerFailure::NONE || scenario == "late_import" || scenario == "mapped_success";
+    assert(domain_write_announce(h->rootinfo_path, id, 1, h->run_token, getpid(), 1, mapped ? 42 : 0));
     for (const char *phase : {"p2p_ready", "release"}) {
         if (scenario == "abort_unpublished" && std::strcmp(phase, "release") == 0) continue;
         std::ofstream marker(barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(id, phase), 1));
@@ -438,7 +441,51 @@ int main(int argc, char **argv) {
     const uint32_t ranks[] = {0, 1};
     uint64_t ctx = 0, base = 0;
     size_t size = 0;
-    const int rc = comm_alloc_domain_windows(h, id, ranks, 2, 0, 4096, 2, &ctx, &base, &size);
+    const uint32_t urma = comm_workspace_bit(CommWorkspaceKind::URMA);
+    if (scenario == "mixed_engines") {
+        for (auto other : {CommWorkspaceKind::SDMA, CommWorkspaceKind::RDMA, CommWorkspaceKind::CCU}) {
+            const auto mask = urma | comm_workspace_bit(other);
+            assert(
+                comm_alloc_domain_windows(h, id, ranks, 2, 0, 4096, mask, &ctx, &base, &size) ==
+                COMM_DOMAIN_WORKSPACE_UNSUPPORTED
+            );
+        }
+        assert(h->used_domain_ids.empty() && h->domain_allocations.empty() && mappings.empty());
+        delete h;
+        std::filesystem::remove_all(folder);
+        return 0;
+    }
+    const int rc = comm_alloc_domain_windows(h, id, ranks, 2, 0, 4096, mapped ? 0 : urma, &ctx, &base, &size);
+    if (mapped) {
+        assert(peer_import_calls == 1 && peer_enable_calls == 1);
+        if (scenario == "mapped_success") {
+            assert(rc == 0 && ctx != 0);
+            const auto &windows = reinterpret_cast<CommContext *>(ctx)->windowsIn;
+            assert(windows[0] == base && peer_mappings.count(reinterpret_cast<void *>(windows[1])) == 1);
+            assert(comm_release_domain_windows(h, id, 2, 0) == 0);
+        } else {
+            assert(rc == COMM_INITIALIZATION_ABORT_REQUIRED && ctx == 0);
+            aclrtDrvMemHandle late_import = nullptr;
+            if (scenario == "late_import") {
+                assert(last_exported != 0 && !exported_resources.at(last_exported).expired());
+                assert(aclrtMemImportFromShareableHandle(last_exported, 1, &late_import) == ACL_SUCCESS);
+                assert(physical_resources.at(late_import) == exported_resources.at(last_exported).lock());
+            } else {
+                assert(injected_peer_failures == 1);
+            }
+            assert(comm_abort_domain_windows(h, id, 2, 0) == 0);
+            if (late_import != nullptr) {
+                assert(physical_handles == 1 && !exported_resources.at(last_exported).expired());
+                assert(aclrtFreePhysical(late_import) == ACL_SUCCESS);
+                assert(exported_resources.at(last_exported).expired());
+            }
+        }
+        assert(imported_handles.empty() && peer_mappings.empty() && mappings.empty() && physical_handles == 0);
+        delete h;
+        std::filesystem::remove_all(folder);
+        return 0;
+    }
+    assert(peer_import_calls == 0 && peer_enable_calls == 0 && last_exported == 0);
     if (scenario == "abort_unpublished") {
         assert(rc == 0 && ctx != 0);
         assert(comm_abort_domain_windows(h, id, 2, 0) == 0);
@@ -494,7 +541,7 @@ int main(int argc, char **argv) {
             assert(destroy_calls == 0 && mappings.size() == saved && unsafe_frees == 0);
         } else {
             const uint64_t second_id = 2;
-            assert(domain_write_announce(h->rootinfo_path, second_id, 1, h->run_token, getpid(), 1, 42));
+            assert(domain_write_announce(h->rootinfo_path, second_id, 1, h->run_token, getpid(), 1, 0));
             for (const char *phase : {"p2p_ready", "release"}) {
                 std::ofstream marker(
                     barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(second_id, phase), 1)
@@ -532,24 +579,8 @@ int main(int argc, char **argv) {
     assert(h->domain_allocations.count(id) == 1);
     assert(destroy_calls == 0 && unsafe_frees == 0);
     assert(!mappings.empty() && !registrations.empty());
-    aclrtDrvMemHandle late_import = nullptr;
-    if (scenario == "late_import") {
-        assert(last_exported != 0 && !exported_resources.at(last_exported).expired());
-        assert(aclrtMemImportFromShareableHandle(last_exported, 1, &late_import) == ACL_SUCCESS);
-        assert(physical_resources.at(late_import) == exported_resources.at(last_exported).lock());
-    }
     const int abort_rc = comm_abort_domain_windows(h, id, 2, 0);
     assert(abort_rc == (fail_destroy ? COMM_RECLAMATION_UNCONFIRMED : 0));
-    if (late_import != nullptr) {
-        assert(physical_handles == 1 && imported_handles.count(late_import) == 1);
-        assert(!exported_resources.at(last_exported).expired());
-        assert(aclrtFreePhysical(late_import) == ACL_SUCCESS);
-        assert(exported_resources.at(last_exported).expired());
-    }
-    if (peer_failure != PeerFailure::NONE) {
-        assert(peer_import_calls == 1 && injected_peer_failures == 1);
-        assert(imported_handles.empty() && peer_mappings.empty());
-    }
     assert(registration_calls == 2);
     assert(channel_calls == (fail_registration == 2 ? 0 : 1));
     assert(unsafe_frees == 0);

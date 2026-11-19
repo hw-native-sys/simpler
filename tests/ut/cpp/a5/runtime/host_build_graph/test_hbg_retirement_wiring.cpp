@@ -150,41 +150,31 @@ public:
     }
 };
 
-/**
- * The smallest scheduler state `collect_run_pmu_records` can read: one
- * executable single-subtask task, its metadata, its PMU cell and the graph
- * storage its identity comes from. Laid out by hand because this target links
- * no runner to build one.
- */
+// One executable subtask with a PMU cell and a run control for retirement.
 struct MinimalSchedulerState {
-    static constexpr uint64_t kMetadataOffset = sizeof(SchedulerWorkerContext);
-    static constexpr uint64_t kCellsOffset = kMetadataOffset + 64;
-    static constexpr uint64_t kTotalSize = kCellsOffset + sizeof(SchedulerTaskPmuCell);
-
-    alignas(SchedulerWorkerContext) std::array<uint8_t, kTotalSize> state{};
+    SchedulerRunControl run{};
+    SchedulerWorkerContext context{};
+    SchedulerTaskMetadata metadata{};
+    SchedulerTaskPmuCell cell{};
     alignas(64) std::array<uint8_t, SCHEDULER_GRAPH_TASK_STORAGE_STRIDE> storage{};
-
-    SchedulerWorkerContext *context() { return reinterpret_cast<SchedulerWorkerContext *>(state.data()); }
-    SchedulerTaskMetadata *metadata() {
-        return reinterpret_cast<SchedulerTaskMetadata *>(state.data() + kMetadataOffset);
-    }
-    SchedulerTaskPmuCell *cell() { return reinterpret_cast<SchedulerTaskPmuCell *>(state.data() + kCellsOffset); }
 
     void publish(Runtime *runtime) {
         runtime->set_worker_count(1);
-        SchedulerWorkerContext *ctx = context();
-        ctx->scheduler_state_base_address = reinterpret_cast<uint64_t>(state.data());
-        ctx->task_metadata_offset = kMetadataOffset;
-        ctx->pmu_cells_offset = kCellsOffset;
-        ctx->graph_task_count = 1;
-        ctx->graph_storage_address = reinterpret_cast<uint64_t>(storage.data());
-        // One executable task of one block with subtask slot 0 active.
-        metadata()[0].flags = SCHEDULER_TASK_EXECUTABLE;
-        metadata()[0].active_mask = LaneMask::aic();
-        metadata()[0].logical_block_num = 1;
-        metadata()[0].trace_index_base = 0;
-        metadata()[0].kernel_ids[0] = 5;
-        runtime->publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_RESIDENT_READY, reinterpret_cast<uint64_t>(ctx));
+        context.scheduler_state_base_address = reinterpret_cast<uint64_t>(this);
+        context.scheduler_state_bytes = sizeof(*this);
+        context.run_control_offset = offsetof(MinimalSchedulerState, run);
+        context.task_metadata_offset = offsetof(MinimalSchedulerState, metadata);
+        context.pmu_cells_offset = offsetof(MinimalSchedulerState, cell);
+        context.graph_task_count = 1;
+        context.graph_storage_address = reinterpret_cast<uint64_t>(storage.data());
+        metadata.flags = SCHEDULER_TASK_EXECUTABLE;
+        metadata.active_mask = LaneMask::aic();
+        metadata.logical_block_num = 1;
+        metadata.trace_index_base = 0;
+        metadata.kernel_ids[0] = 5;
+        runtime->publish_scheduler_bootstrap(
+            SCHEDULER_RUNTIME_MODE_RESIDENT_READY, reinterpret_cast<uint64_t>(&context)
+        );
     }
 };
 
@@ -579,6 +569,22 @@ TEST_F(HbgRetirementWiring, AProvedRetirementWithNoOwnersEnabledSettles) {
     EXPECT_TRUE(lifecycle.settle_run_diagnostics(runtime.get(), /*graph_completed=*/true));
 }
 
+TEST_F(HbgRetirementWiring, SnapshotsMappedProgressOnlyAfterAllCoresRetire) {
+    auto runtime = std::make_unique<Runtime>();
+    MinimalSchedulerState state;
+    state.publish(runtime.get());
+    uint32_t progress = 1;
+    state.run.run_completed_read_address = reinterpret_cast<uint64_t>(&progress);
+    AicoreLifecycle lifecycle;
+    AicoreLifecycleTestPeer::seed(lifecycle, kAddrs);
+
+    EXPECT_FALSE(lifecycle.settle_run_diagnostics(runtime.get(), true));
+    EXPECT_EQ(state.run.resolved_task_count, 0u);
+    ASSERT_EQ(lifecycle.finish_shutdown_partition(0, runtime.get()), 0);
+    ASSERT_TRUE(lifecycle.settle_run_diagnostics(runtime.get(), true));
+    EXPECT_EQ(state.run.resolved_task_count, progress);
+}
+
 /**
  * A subtask the graph says executed and whose cell is absent is a lost
  * measurement, not a subtask that did not run.
@@ -606,8 +612,8 @@ TEST_F(HbgRetirementWiring, AStagedPmuCellCoversTheSubtaskTheGraphOwed) {
     scheduler_state.publish(runtime.get());
     // The core that executed task 0 published its cell: the identity stamp is
     // the task id plus one, which is what tells it from a cell never written.
-    scheduler_state.cell()->worker_id = 0;
-    scheduler_state.cell()->published = 1;
+    scheduler_state.cell.worker_id = 0;
+    scheduler_state.cell.published = 1;
     AicoreLifecycle lifecycle;
     AicoreLifecycleTestPeer::seed(lifecycle, kAddrs);
 
@@ -637,8 +643,8 @@ TEST_F(HbgRetirementWiring, ARunWithoutPmuInitializationCannotRestoreThePrevious
     auto runtime = std::make_unique<Runtime>();
     MinimalSchedulerState scheduler_state;
     scheduler_state.publish(runtime.get());
-    scheduler_state.cell()->worker_id = 0;
-    scheduler_state.cell()->published = 1;
+    scheduler_state.cell.worker_id = 0;
+    scheduler_state.cell.published = 1;
     AicoreLifecycle lifecycle;
     AicoreLifecycleTestPeer::seed(lifecycle, kAddrs);
     set_pmu_enabled(true);
@@ -691,8 +697,8 @@ TEST_F(HbgRetirementWiring, AProvedStopWithEveryOwedMeasurementSettles) {
     auto runtime = std::make_unique<Runtime>();
     MinimalSchedulerState scheduler_state;
     scheduler_state.publish(runtime.get());
-    scheduler_state.cell()->worker_id = 0;
-    scheduler_state.cell()->published = 1;
+    scheduler_state.cell.worker_id = 0;
+    scheduler_state.cell.published = 1;
     AicoreLifecycle lifecycle;
     AicoreLifecycleTestPeer::seed(lifecycle, kAddrs);
     AicoreLifecycleTestPeer::mark_pmu_initialized(lifecycle);
@@ -710,8 +716,8 @@ TEST_F(HbgRetirementWiring, AnIncompleteGraphSettlesNothingEvenWithItsStagedCell
     auto runtime = std::make_unique<Runtime>();
     MinimalSchedulerState scheduler_state;
     scheduler_state.publish(runtime.get());
-    scheduler_state.cell()->worker_id = 0;
-    scheduler_state.cell()->published = 1;
+    scheduler_state.cell.worker_id = 0;
+    scheduler_state.cell.published = 1;
     AicoreLifecycle lifecycle;
     AicoreLifecycleTestPeer::seed(lifecycle, kAddrs);
     AicoreLifecycleTestPeer::mark_pmu_initialized(lifecycle);
@@ -729,8 +735,8 @@ TEST_F(HbgRetirementWiring, AnUnprovedStopIsRefusedBeforeAnyCellIsRead) {
     auto runtime = std::make_unique<Runtime>();
     MinimalSchedulerState scheduler_state;
     scheduler_state.publish(runtime.get());
-    scheduler_state.cell()->worker_id = 0;
-    scheduler_state.cell()->published = 1;
+    scheduler_state.cell.worker_id = 0;
+    scheduler_state.cell.published = 1;
     AicoreLifecycle lifecycle;
     AicoreLifecycleTestPeer::seed(lifecycle, kAddrs);
     AicoreLifecycleTestPeer::mark_pmu_initialized(lifecycle);
@@ -773,6 +779,7 @@ TEST_F(HbgRetirementWiring, ArgumentAccountingWaitsForRetirementAndDoesNotCertif
 
 namespace {
 struct ResidentSwimlaneState {
+    SchedulerRunControl run{};
     SchedulerWorkerContext context{};
     SchedulerTaskMetadata metadata{};
     SchedulerTaskTrace trace{};
@@ -781,6 +788,7 @@ struct ResidentSwimlaneState {
         runtime.set_worker_count(3);
         context.scheduler_state_base_address = reinterpret_cast<uint64_t>(this);
         context.scheduler_state_bytes = sizeof(*this);
+        context.run_control_offset = offsetof(ResidentSwimlaneState, run);
         context.task_metadata_offset = offsetof(ResidentSwimlaneState, metadata);
         context.trace_cells_offset = offsetof(ResidentSwimlaneState, trace);
         context.graph_task_count = 1;

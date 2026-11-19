@@ -44,6 +44,16 @@
 #include "scheduler/scheduler_types.h"
 #include "scheduler/profiling_memory.h"
 
+static inline __aicore__ void percounter_memory_barrier() {
+    simpler::percounter::percounter_scalar_memory_issue(simpler::percounter::ProfilePhase::DsbAll, 1, []() __aicore__ {
+#if defined(__CCE_AICORE__)
+        dsb((mem_dsb_t)0);
+#else
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+#endif
+    });
+}
+
 /** Invalidate one line, then wait for it, so the next read sees publication. */
 static inline __aicore__ void percounter_observe_cache_line(__gm__ void *address) {
     simpler::percounter::percounter_scalar_memory_issue(
@@ -55,20 +65,14 @@ static inline __aicore__ void percounter_observe_cache_line(__gm__ void *address
 #endif
         }
     );
-    simpler::percounter::percounter_scalar_memory_issue(simpler::percounter::ProfilePhase::DsbAll, 1, []() __aicore__ {
-#if defined(__CCE_AICORE__)
-        dsb((mem_dsb_t)0);
-#else
-        __atomic_thread_fence(__ATOMIC_SEQ_CST);
-#endif
-    });
+    percounter_memory_barrier();
 }
 
 static inline __aicore__ void percounter_observe_cache_line(volatile __gm__ void *address) {
     percounter_observe_cache_line(const_cast<__gm__ void *>(address));
 }
 
-/** The same for the whole data cache, before reading a producer's output. */
+/** Invalidate the whole data cache at a run boundary. */
 static inline __aicore__ void percounter_observe_data_cache(__gm__ void *address) {
     simpler::percounter::percounter_scalar_memory_issue(
         simpler::percounter::ProfilePhase::DcciEntire, 1, [=]() __aicore__ {
@@ -79,13 +83,7 @@ static inline __aicore__ void percounter_observe_data_cache(__gm__ void *address
 #endif
         }
     );
-    simpler::percounter::percounter_scalar_memory_issue(simpler::percounter::ProfilePhase::DsbAll, 1, []() __aicore__ {
-#if defined(__CCE_AICORE__)
-        dsb((mem_dsb_t)0);
-#else
-        __atomic_thread_fence(__ATOMIC_SEQ_CST);
-#endif
-    });
+    percounter_memory_barrier();
 }
 
 /** A bypass load: cheap, and behind by at most one publication. */
@@ -254,40 +252,4 @@ static inline __aicore__ uint64_t percounter_gm_compare_exchange(
 #endif
         }
     );
-}
-
-/** Publish the control line, populated argument prefix and global context. */
-static inline __aicore__ void
-percounter_writeback_dispatch_payload(__gm__ DispatchPayload *payload, uint32_t argument_count) {
-    const uint64_t end = offsetof(DispatchPayload, args) + argument_count * sizeof(uint64_t);
-    for (uint64_t offset = 0; offset < end; offset += 64) {
-        simpler::percounter::percounter_scalar_memory_issue(
-            simpler::percounter::ProfilePhase::DcciOut, 1, [payload, offset]() __aicore__ {
-#if defined(__CCE_AICORE__)
-                dcci(reinterpret_cast<__gm__ uint8_t *>(payload) + offset, SINGLE_CACHE_LINE, CACHELINE_OUT);
-#else
-                (void)payload;
-                (void)offset;
-#endif
-            }
-        );
-    }
-    // Stable context pointers and the complete global context share the final line.
-    constexpr uint64_t context_line = offsetof(DispatchPayload, global_context) & ~uint64_t{63};
-    static_assert(offsetof(DispatchPayload, global_context) + sizeof(GlobalContext) <= context_line + 64);
-    static_assert(offsetof(DispatchPayload, args) + SPMD_LOCAL_CONTEXT_INDEX * sizeof(uint64_t) <= context_line);
-    simpler::percounter::percounter_scalar_memory_issue(
-        simpler::percounter::ProfilePhase::DcciOut, 1, [payload]() __aicore__ {
-#if defined(__CCE_AICORE__)
-            dcci(reinterpret_cast<__gm__ uint8_t *>(payload) + context_line, SINGLE_CACHE_LINE, CACHELINE_OUT);
-#else
-            (void)payload;
-#endif
-        }
-    );
-    simpler::percounter::percounter_scalar_memory_issue(simpler::percounter::ProfilePhase::DsbAll, 1, []() __aicore__ {
-#if defined(__CCE_AICORE__)
-        dsb((mem_dsb_t)0);
-#endif
-    });
 }

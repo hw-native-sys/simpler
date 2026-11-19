@@ -103,7 +103,7 @@ public:
     // cores, init profiling subsystems, read task counts, init payloads.
     int32_t post_handshake_init(Runtime *runtime);
 
-    // Reset all SchedulerContext-owned state to its post-construction defaults.
+    // Reset run coordination and bindings. Per-core state is initialized on entry.
     // Called by AicpuExecutor::deinit() during per-run teardown.
     void deinit();
 
@@ -563,15 +563,16 @@ private:
     // dominant SIMPLER_STALL_DETAIL_* sub-class plus a few locator fields, which
     // handle_timeout_exit propagates to host alongside the unchanged code 100.
     struct StallClassification {
-        int32_t detail;        // SIMPLER_STALL_DETAIL_*
-        int32_t cnt_running;   // tasks observed RUNNING (on a core)
-        int32_t cnt_ready;     // fanin-satisfied but not dispatched
-        int32_t cnt_waiting;   // still waiting on fanin
-        int32_t completed;     // completed_tasks_ snapshot
-        int32_t total;         // total_tasks_ snapshot
-        int32_t orch_done;     // orchestrator_done flag (0/1)
-        TaskId stuck_task_id;  // S1: first RUNNING task's id, invalid() if none
-        int32_t stuck_core;    // S1: core hosting it (-1 if none)
+        int32_t detail;          // SIMPLER_STALL_DETAIL_*
+        int32_t cnt_running;     // tasks observed RUNNING (on a core)
+        int32_t cnt_ready;       // fanin-satisfied but not dispatched
+        int32_t cnt_waiting;     // still waiting on fanin
+        int32_t cnt_async_wait;  // all AICore subtasks finished, deferred completion pending
+        int32_t completed;       // completed_tasks_ snapshot
+        int32_t total;           // total_tasks_ snapshot
+        int32_t orch_done;       // orchestrator_done flag (0/1)
+        TaskId stuck_task_id;    // S1/S6: first task in the dominant class, invalid() if none
+        int32_t stuck_core;      // S1: core hosting it (-1 if none)
     };
 
     // Scan the rings once (same ground truth as log_global_stall_diagnostics: a slot is

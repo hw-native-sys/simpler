@@ -19,7 +19,7 @@
 #include "aicpu/device_time.h"
 #endif
 
-static_assert(static_cast<uint32_t>(SchedPhaseKind::ScalarCounterAccounting) < SCHEDULER_SCALAR_STORAGE_EXTENDED);
+static_assert(static_cast<uint32_t>(SchedPhaseKind::ScalarRetireExecution) < SCHEDULER_SCALAR_STORAGE_EXTENDED);
 
 inline __aicore__ uint64_t scheduler_scalar_clock() {
 #if defined(__CCE_AICORE__)
@@ -45,6 +45,9 @@ inline __aicore__ void scheduler_scalar_raw_barrier() {
 // occupy consecutive 16-byte storage slots, sharing each 64-byte cache line.
 // No other core reads or writes this partition before finish publishes it.
 struct SchedulerScalarTrace {
+    // finish() publishes four terminal records, including the window used for exclusive-time accounting.
+    static_assert(SCHEDULER_SCALAR_RECORD_CAPACITY >= 4);
+    static constexpr uint32_t detail_capacity = SCHEDULER_SCALAR_RECORD_CAPACITY - 4;
     __gm__ SchedulerActivityBuffer *buffer{nullptr};
     __gm__ SchedulerScalarStorageSlot *records{nullptr};
     uint64_t window_start{0};
@@ -57,8 +60,9 @@ struct SchedulerScalarTrace {
     uint32_t dropped{0};
     uint32_t depth{0};
 
-    inline __aicore__ __attribute__((always_inline)) void write(const SchedulerScalarRecord &record) {
-        if (record.end_time < record.start_time || committed >= SCHEDULER_SCALAR_RECORD_CAPACITY ||
+    inline __aicore__ __attribute__((always_inline)) void
+    write(const SchedulerScalarRecord &record, uint32_t limit = detail_capacity) {
+        if (record.end_time < record.start_time || committed >= limit ||
             (record.kind & SCHEDULER_SCALAR_STORAGE_EXTENDED) != 0) {
             if (dropped != UINT32_MAX) ++dropped;
             return;
@@ -130,16 +134,47 @@ struct SchedulerScalarTrace {
     }
 
     inline __aicore__ void end_iteration(bool progress) {
-        if (buffer != nullptr && !progress) ++poll_loops;
+        if (buffer == nullptr) return;
+        const uint64_t begin = scheduler_scalar_clock();
+        if (!progress) ++poll_loops;
+        // EndIteration and its TraceAppend span are optional. Admit them together before the terminal reserve.
+        if (committed + 2 > detail_capacity) return;
+        const uint64_t end = scheduler_scalar_clock();
+        append_function(SchedPhaseKind::ScalarEndIteration, begin, end, -1, depth + 1);
     }
 
-    // Only semantic function spans are duration-filtered. Primitive memory
-    // operations, backoff and recorder intervals always use append directly.
+    // Keep the short calls between dispatches and the trace stages around a kernel return.
+    // At depth one the record submission follows the call as a separate sibling.
     inline __aicore__ __attribute__((noinline)) void append_function(
         SchedPhaseKind kind, uint64_t begin, uint64_t end, int64_t task_ref = -1, uint32_t record_depth = 0
     ) {
         if (buffer == nullptr) return;
-        if (end >= begin && end - begin < function_min_cycles) {
+        const bool direct_call =
+            record_depth == 1 &&
+            (kind == SchedPhaseKind::ScalarFillOwnSlots || kind == SchedPhaseKind::ScalarGraphControl ||
+             kind == SchedPhaseKind::ScalarCounterAccounting || kind == SchedPhaseKind::ScalarAsyncService ||
+             kind == SchedPhaseKind::ScalarCanEnterExecution || kind == SchedPhaseKind::ScalarPublishIdle ||
+             kind == SchedPhaseKind::ScalarLoopControl || kind == SchedPhaseKind::ScalarEndIteration ||
+             kind == SchedPhaseKind::ScalarCompletions);
+        if (direct_call) {
+            const uint64_t record_begin = scheduler_scalar_clock();
+            append(kind, begin, end, task_ref, record_depth);
+            const uint64_t record_end = scheduler_scalar_clock();
+            if (record_end > record_begin)
+                append(SchedPhaseKind::ScalarTraceAppend, record_begin, record_end, -1, record_depth);
+            return;
+        }
+        const bool trace_stage =
+            kind == SchedPhaseKind::ScalarTraceBeforeExecution || kind == SchedPhaseKind::ScalarTraceBeforeCompletion;
+        // Retain measured handoff and ordinary execution boundaries even below the usual L3 duration threshold.
+        const bool business_step =
+            kind == SchedPhaseKind::ScalarBuildPayload || kind == SchedPhaseKind::ScalarPublishBuilt ||
+            kind == SchedPhaseKind::ScalarPreparedClaim || kind == SchedPhaseKind::ScalarGroupAcquire ||
+            kind == SchedPhaseKind::ScalarSelectOwnedExecution || kind == SchedPhaseKind::ScalarRetireExecution ||
+            kind == SchedPhaseKind::ScalarClusterMixDiscoverTask || kind == SchedPhaseKind::ScalarExecutionTokenFanin ||
+            kind == SchedPhaseKind::ScalarClusterMixDependencies || kind == SchedPhaseKind::ScalarSubtaskContribute ||
+            kind == SchedPhaseKind::ScalarMixGroupContribute;
+        if (!business_step && !trace_stage && end >= begin && end - begin < function_min_cycles) {
             ++short_intervals;
             return;
         }
@@ -153,13 +188,23 @@ struct SchedulerScalarTrace {
         const uint64_t end = scheduler_scalar_clock();
         write_cycles += end - begin;
         const uint32_t first = storage_slots;
-        write({begin, end, -1, static_cast<uint32_t>(SchedPhaseKind::ScalarTraceFinish) | (1U << 16), 1});
+        write(
+            {begin, end, -1, static_cast<uint32_t>(SchedPhaseKind::ScalarTraceFinish) | (1U << 16), 1},
+            SCHEDULER_SCALAR_RECORD_CAPACITY
+        );
         write(
             {begin, clean_end, -1, static_cast<uint32_t>(SchedPhaseKind::ScalarTraceFinishClean) | (2U << 16),
-             (first + 3) / 4}
+             (first + 3) / 4},
+            SCHEDULER_SCALAR_RECORD_CAPACITY
         );
-        write({clean_end, end, -1, static_cast<uint32_t>(SchedPhaseKind::ScalarTraceFinishBarrier) | (2U << 16), 1});
-        write({window_start, end, -1, static_cast<uint32_t>(SchedPhaseKind::ScalarWindow), 1});
+        write(
+            {clean_end, end, -1, static_cast<uint32_t>(SchedPhaseKind::ScalarTraceFinishBarrier) | (2U << 16), 1},
+            SCHEDULER_SCALAR_RECORD_CAPACITY
+        );
+        write(
+            {window_start, end, -1, static_cast<uint32_t>(SchedPhaseKind::ScalarWindow), 1},
+            SCHEDULER_SCALAR_RECORD_CAPACITY
+        );
         // Publication of the terminal observer rows lies outside their window.
         clean_records(first);
         buffer->scalar_committed = committed;

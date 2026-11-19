@@ -90,7 +90,7 @@ static inline HcclResult hccl_comm_destroy(HcclComm c) { return HcclCommDestroy(
 
 // Per-domain dynamic allocation.  One of these per orch.allocate_domain call.
 // Owns either the local VMM window and peer VMM imports, or a POSIX Host
-// window with its local device registration. The allocation also owns its
+// window with local and peer device registrations. The allocation also owns its
 // device CommContext and optional communication resources. Only the
 // EnablePeerAccess routes are left to aclrtResetDevice at finalize: they are
 // process-global and per device-pair, so releasing them per allocation would
@@ -99,6 +99,11 @@ struct DomainPeerWindow {
     void *address = nullptr;
     aclrtDrvMemHandle handle = nullptr;
     bool mapped = false;
+};
+
+struct DomainHostPeerWindow {
+    void *host = nullptr;
+    bool registered = false;
 };
 
 struct CcuCallableRegistration {
@@ -125,6 +130,7 @@ struct DomainAllocation {
     // can cycle repeatedly within one comm handle before any device reset, so
     // these are released explicitly at domain teardown rather than left to reset.
     std::vector<DomainPeerWindow> peer_windows;
+    std::vector<DomainHostPeerWindow> host_peer_windows;
     bool local_mapped = false;
     void *host_buf = nullptr;
     std::string host_shm_name;
@@ -1061,6 +1067,17 @@ static bool close_domain_resources(DomainAllocation &alloc) {
         if (!release_domain_window(it->address, it->handle, it->mapped)) return false;
     }
     alloc.peer_windows.clear();
+    for (auto it = alloc.host_peer_windows.rbegin(); it != alloc.host_peer_windows.rend(); ++it) {
+        if (it->registered) {
+            if (aclrtHostUnregister(it->host) != ACL_SUCCESS) return false;
+            it->registered = false;
+        }
+        if (it->host != nullptr) {
+            if (munmap(it->host, alloc.mapping_size) != 0) return false;
+            it->host = nullptr;
+        }
+    }
+    alloc.host_peer_windows.clear();
     if (alloc.host_shm_owned) {
         if (alloc.host_registered) {
             if (aclrtHostUnregister(alloc.host_buf) != ACL_SUCCESS) return false;
@@ -1538,7 +1555,8 @@ static int domain_alloc_via_ipc(
     uint64_t win_size, uint32_t workspace_mask, DomainAllocation *out
 ) {
     const bool rdma_requested = (workspace_mask & comm_workspace_bit(CommWorkspaceKind::RDMA)) != 0;
-    out->peer_windows.reserve(rank_count - 1);
+    const bool urma_requested = (workspace_mask & comm_workspace_bit(CommWorkspaceKind::URMA)) != 0;
+    const bool map_peer_windows = !rdma_requested && !urma_requested;
     const std::string &rootinfo = h->rootinfo_path;
     const uint64_t run_token = h->run_token;
     const int subset_n = static_cast<int>(rank_count);
@@ -1551,9 +1569,8 @@ static int domain_alloc_via_ipc(
         return -1;
     }
 
-    // Own-window allocation.  The non-RDMA path uses the VMM shareable-handle
-    // dance (see alloc_windows_via_ipc for step-by-step rationale) so peers can
-    // import each other's VA.  The RDMA overlay instead aclrtMallocs a buffer
+    // Allocate local HBM through VMM and export its handle for domains that
+    // map peer windows. The RDMA overlay instead aclrtMallocs a buffer
     // in the low GM segment (0x1200...) that the HNS1825 NIC can DMA to — a VMM
     // window reserved with hint=0 lands at 0x1240...000000, which the NIC never
     // reaches (WQEs consumed, no CQE).  RDMA reaches peers via rkey+VA, so no
@@ -1605,12 +1622,16 @@ static int domain_alloc_via_ipc(
             return -1;
         }
         out->local_mapped = true;
-        aret = aclrtMemExportToShareableHandle(
-            handle, ACL_MEM_HANDLE_TYPE_NONE, ACL_RT_VMM_EXPORT_FLAG_DISABLE_PID_VALIDATION, &shareableHandle
-        );
-        if (aret != ACL_SUCCESS) {
-            LOG_ERROR("[comm rank %d] alloc_domain: ExportToShareableHandle -> %d", h->rank, static_cast<int>(aret));
-            return -1;
+        if (map_peer_windows) {
+            aret = aclrtMemExportToShareableHandle(
+                handle, ACL_MEM_HANDLE_TYPE_NONE, ACL_RT_VMM_EXPORT_FLAG_DISABLE_PID_VALIDATION, &shareableHandle
+            );
+            if (aret != ACL_SUCCESS) {
+                LOG_ERROR(
+                    "[comm rank %d] alloc_domain: ExportToShareableHandle -> %d", h->rank, static_cast<int>(aret)
+                );
+                return -1;
+            }
         }
     }
 
@@ -1699,11 +1720,7 @@ static int domain_alloc_via_ipc(
     // and per device-pair; once any allocation opens a pair, later ones simply
     // observe it. The enable is the operative call (resolves the peer physical
     // id via the HCCL adapter and opens the HCCS route).
-    //
-    // The RDMA overlay reaches peers over RoCE (HCOMM channel), not HCCS, so
-    // the HCCS peer-access enable/confirm dance is skipped there; the
-    // file_barrier below still synchronizes the announce exchange.
-    if (!rdma_requested) {
+    if (map_peer_windows) {
         for (int p = 0; p < subset_n; ++p) {
             if (p == my_dr) continue;
             aclError r = aclrtDeviceEnablePeerAccess(peers[p].device_id, 0);
@@ -1747,8 +1764,9 @@ static int domain_alloc_via_ipc(
         }
     }
 
-    // With DISABLE_PID_VALIDATION the import can proceed once peers have
-    // published their shareable handles (read above) and P2P is up.
+    // All ranks have read the peer announcements. For mapped windows, P2P is ready
+    // and DISABLE_PID_VALIDATION allows peer handle imports after this barrier.
+    // URMA domains synchronize here before initializing their workspace.
     if (!file_barrier(rootinfo, my_dr, subset_n, domain_barrier_tag(allocation_id, "p2p_ready"), run_token)) {
         return -1;
     }
@@ -1804,7 +1822,7 @@ static int domain_alloc_via_ipc(
             comm_workspace<CommWorkspaceKind::SDMA>(h->host_ctx).size
         );
     }
-    if ((workspace_mask & comm_workspace_bit(CommWorkspaceKind::URMA)) != 0) {
+    if (urma_requested) {
         const int urma_rc =
             init_urma_workspace(h, allocation_id, rank_ids, static_cast<uint32_t>(rank_count), domain_rank, *out);
         if (urma_rc != 0) return urma_rc;
@@ -1827,13 +1845,9 @@ static int domain_alloc_via_ipc(
     }
 #endif
     ctx.windowsIn[my_dr] = reinterpret_cast<uint64_t>(localBuf);
-    // Import each peer's shareable handle onto our device; see the symmetry
-    // note in alloc_windows_via_ipc (one win_size, shared chip granularity).
-    //
-    // The RDMA overlay reaches peers over RoCE via rkey+VA (PeerMrBaseAddr),
-    // and the RDMA kernels only ever read windowsIn[own], so no peer VA import
-    // is needed there — the loop below is skipped and peer_windows stays empty.
-    if (!rdma_requested) {
+    // URMA and RDMA locate remote buffers through their registered memory descriptors.
+    if (map_peer_windows) {
+        out->peer_windows.reserve(rank_count - 1);
         for (int p = 0; p < subset_n; ++p) {
             if (p == my_dr) continue;
             out->peer_windows.emplace_back();
@@ -2011,22 +2025,6 @@ extern "C" int comm_barrier(CommHandle h) {
     return 0;
 }
 
-static bool host_urma_explicitly_unsupported(CommHandle h) {
-    int32_t device = -1;
-    aclrtHostMemMapCapability capability = ACL_RT_HOST_MEM_MAP_NOT_SUPPORTED;
-    const aclError device_status = aclrtGetDevice(&device);
-    const aclError query_status = device_status == ACL_SUCCESS ?
-                                      aclrtHostMemMapCapabilities(device, ACL_RT_HAC_TYPE_UDMA, &capability) :
-                                      device_status;
-    if (query_status != ACL_SUCCESS) {
-        LOG_WARN("[comm rank %d] Host UDMA capability query failed: %d", h->rank, static_cast<int>(query_status));
-        return false;
-    }
-    if (capability != ACL_RT_HOST_MEM_MAP_NOT_SUPPORTED) return false;
-    LOG_ERROR("[comm rank %d] Device %d does not support UDMA access to registered Host memory", h->rank, device);
-    return true;
-}
-
 static int
 prepare_host_domain_window(CommHandle h, size_t window_size, const char *host_shm_name, DomainAllocation &alloc) {
     const long page_size = sysconf(_SC_PAGESIZE);
@@ -2070,16 +2068,100 @@ static void publish_host_prepare_failure(CommHandle h, const std::string &path) 
     }
 }
 
+static int import_host_peer_window(
+    CommHandle h, DomainAllocation &alloc, uint32_t peer, const std::string &name, uint64_t &device_base
+) {
+    const auto path = "/" + name;
+    const int fd = shm_open(path.c_str(), O_RDWR | O_CLOEXEC, 0);
+    if (fd < 0) {
+        LOG_ERROR("[comm rank %d] Host peer %u shm_open failed: errno=%d", h->rank, peer, errno);
+        return -1;
+    }
+    RAIIScopeGuard close_fd([fd] {
+        close(fd);
+    });
+    struct stat info{};
+    if (fstat(fd, &info) != 0 || info.st_size != static_cast<off_t>(alloc.mapping_size)) {
+        LOG_ERROR("[comm rank %d] Host peer %u backing size does not match the domain", h->rank, peer);
+        return -1;
+    }
+    alloc.host_peer_windows.emplace_back();
+    auto &window = alloc.host_peer_windows.back();
+    void *host = mmap(nullptr, alloc.mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (host == MAP_FAILED) {
+        LOG_ERROR("[comm rank %d] Host peer %u mmap failed: errno=%d", h->rank, peer, errno);
+        return -1;
+    }
+    window.host = host;
+    aclError status = aclrtHostRegisterV2(host, alloc.mapping_size, ACL_HOST_REG_MAPPED);
+    if (status != ACL_SUCCESS) {
+        LOG_ERROR("[comm rank %d] Host peer %u registration failed: %d", h->rank, peer, static_cast<int>(status));
+        return -1;
+    }
+    window.registered = true;
+    void *device = nullptr;
+    status = aclrtHostGetDevicePointer(host, &device, 0);
+    if (status != ACL_SUCCESS || device == nullptr) {
+        LOG_ERROR("[comm rank %d] Host peer %u device address failed: %d", h->rank, peer, static_cast<int>(status));
+        return -1;
+    }
+    device_base = reinterpret_cast<uint64_t>(device);
+    return 0;
+}
+
+static int map_host_peer_windows(
+    CommHandle h, uint64_t allocation_id, const char *local_name, DomainAllocation &alloc, CommContext &ctx,
+    const std::string &abort_path
+) {
+    if (alloc.nranks == 1) return 0;
+    alloc.host_peer_windows.reserve(alloc.nranks - 1);
+    const auto tag = domain_barrier_tag(allocation_id, "host_window");
+    const auto local_path = barrier_marker_path(h->rootinfo_path, h->run_token, tag, alloc.rank);
+    const auto payload = std::to_string(h->rank) + " " + std::to_string(alloc.mapping_size) + " " + local_name;
+    if (!file_marker_handshake::publish_marker(local_path, payload.c_str())) return -1;
+    const file_marker_handshake::WaitOptions options;
+    const auto deadline = std::chrono::steady_clock::now() + options.timeout;
+    for (int peer = 0; peer < alloc.nranks; ++peer) {
+        if (peer == alloc.rank) continue;
+        const auto path = barrier_marker_path(h->rootinfo_path, h->run_token, tag, peer);
+        const auto ready = file_marker_handshake::wait_for_path(
+            path, file_marker_handshake::Stage::ARRIVAL_WAIT, peer, deadline, options.poll_interval, abort_path
+        );
+        if (!ready.ok()) {
+            LOG_ERROR("[comm rank %d] Host peer %d window announcement failed", h->rank, peer);
+            return -1;
+        }
+        uint32_t base_rank = UINT32_MAX;
+        size_t size = 0;
+        std::string name;
+        std::ifstream announcement(path);
+        if (!(announcement >> base_rank >> size >> name) || base_rank != alloc.rank_ids[peer] ||
+            size != alloc.mapping_size || !comm_domain_onboard::valid_host_shm_name(name.c_str())) {
+            LOG_ERROR("[comm rank %d] Host peer %d window announcement is invalid", h->rank, peer);
+            return -1;
+        }
+        if (import_host_peer_window(h, alloc, peer, name, ctx.windowsIn[peer]) != 0) return -1;
+    }
+    if (!file_barrier(
+            h->rootinfo_path, alloc.rank, alloc.nranks, domain_barrier_tag(allocation_id, "host_mapped"), h->run_token,
+            120, abort_path
+        ))
+        return -1;
+    std::remove(local_path.c_str());
+    return 0;
+}
+
 static int domain_alloc_host(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
     size_t window_size, uint32_t workspace_mask, const char *host_shm_name, DomainAllocation &alloc
 ) {
+    const auto abort_path = host_prepare_failure_path(h, allocation_id);
+    RAIIScopeGuard failure([&] {
+        publish_host_prepare_failure(h, abort_path);
+    });
     const bool urma = (workspace_mask & comm_workspace_bit(CommWorkspaceKind::URMA)) != 0;
-    int rc = urma && host_urma_explicitly_unsupported(h) ?
-                 COMM_DOMAIN_WORKSPACE_UNSUPPORTED :
-                 prepare_host_domain_window(h, window_size, host_shm_name, alloc);
+    int rc = prepare_host_domain_window(h, window_size, host_shm_name, alloc);
     if (urma && rank_count > 1) {
-        const auto abort_path = host_prepare_failure_path(h, allocation_id);
         // Every rank must have a local window before any rank enters the HCCL collective.
         if (rc == 0 && !file_barrier(
                            h->rootinfo_path, domain_rank, rank_count, domain_barrier_tag(allocation_id, "host_ready"),
@@ -2095,18 +2177,22 @@ static int domain_alloc_host(
     ctx.rankId = domain_rank;
     ctx.rankNum = static_cast<uint32_t>(rank_count);
     ctx.winSize = alloc.mapping_size;
-    ctx.windowsIn[domain_rank] = reinterpret_cast<uint64_t>(alloc.local_buf);
     ctx.windowsOut[domain_rank] = reinterpret_cast<uint64_t>(alloc.local_buf);
-    // Remote MR addresses belong to the URMA workspace, not the local device address space.
     if (urma) {
+        // Remote MR addresses belong to the URMA workspace, not the local device address space.
         const int urma_rc = init_urma_workspace(h, allocation_id, rank_ids, rank_count, domain_rank, alloc);
         if (urma_rc != 0) return urma_rc;
         set_comm_workspace(
             ctx, CommWorkspaceKind::URMA, reinterpret_cast<uint64_t>(alloc.urma_workspace->GetWorkspaceAddr()),
             alloc.urma_workspace->GetWorkspaceSize()
         );
+    } else {
+        ctx.windowsIn[domain_rank] = reinterpret_cast<uint64_t>(alloc.local_buf);
+        if (map_host_peer_windows(h, allocation_id, host_shm_name, alloc, ctx, abort_path) != 0) return -1;
     }
-    return comm_domain_onboard::upload_context(ctx, alloc.device_ctx, h->rank, "Host domain") == ACL_SUCCESS ? 0 : -1;
+    if (comm_domain_onboard::upload_context(ctx, alloc.device_ctx, h->rank, "Host domain") != ACL_SUCCESS) return -1;
+    failure.dismiss();
+    return 0;
 }
 
 static int allocate_domain_windows(
@@ -2127,13 +2213,21 @@ static int allocate_domain_windows(
         );
         return -1;
     }
+    if (host_shm_name != nullptr && workspace_mask == 0) {
+        for (size_t rank = 0; rank < rank_count; ++rank) {
+            if (rank_ids[rank] >= static_cast<uint32_t>(h->nranks) ||
+                std::find(rank_ids, rank_ids + rank, rank_ids[rank]) != rank_ids + rank)
+                return -1;
+        }
+    }
+    const bool urma_requested = (workspace_mask & comm_workspace_bit(CommWorkspaceKind::URMA)) != 0;
     if ((workspace_mask & ~compiled_comm_workspaces()) != 0 ||
+        (urma_requested && workspace_mask != comm_workspace_bit(CommWorkspaceKind::URMA)) ||
         ((workspace_mask & comm_workspace_bit(CommWorkspaceKind::RDMA)) != 0 &&
          workspace_mask != comm_workspace_bit(CommWorkspaceKind::RDMA))) {
         LOG_ERROR("[comm rank %d] alloc_domain: unsupported workspace combination 0x%x", h->rank, workspace_mask);
         return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
     }
-    const bool urma_requested = (workspace_mask & comm_workspace_bit(CommWorkspaceKind::URMA)) != 0;
     if (urma_requested && !validate_urma_ranks(h, rank_ids, rank_count, host_shm_name != nullptr)) {
         return COMM_DOMAIN_URMA_CONFIG_INVALID;
     }

@@ -13,8 +13,8 @@ Sequence integrity proves lossless local event streams, not scheduler causality,
 execution coverage, membership, dependency ordering or Mix resource correctness.
 """
 
+CONTROL_NOTIFY_ACCOUNTING = 1 << 26
 COUNTER_ACCOUNTING = 1 << 27
-MEMBER_FROM_CLAIM = 1 << 28
 COMPLETION_FROM_GROUP = 1 << 29
 COMPLETION_FROM_CONTRIBUTION = 1 << 30
 COMPLETION_ALIAS_FLAGS = COMPLETION_FROM_GROUP | COMPLETION_FROM_CONTRIBUTION
@@ -24,11 +24,11 @@ ROOT_NUMBERS = frozenset(
     """
 run_epoch task_count worker_count trace_count member_count cooperative_task_count
 cluster_count mix_task_count sync_mix_task_count expected_task_count inline_completed_count resolved_task_count
-active_worker_count scheduler_error error_claimed commit_tail commit_lock
+active_worker_count scheduler_error error_claimed floor_count
 """.split()
 )
 ROOT_TABLES = frozenset(
-    "tasks workers admissions admission_log task_controls task_events members blocks executions "
+    "tasks workers task_controls task_events members floor_publications blocks executions "
     "condition_contributions completion_counters".split()
 )
 ERROR_NUMBERS = (
@@ -37,34 +37,33 @@ ERROR_NUMBERS = (
 
 # Scalar fields are unsigned wire integers unless listed in SIGNED_FIELDS.
 NUMBERS = {
-    "task": "task_ref flags active_mask block_num trace_base",
+    "task": (
+        "task_ref flags active_mask block_num trace_base schedule_rank topological_level bottom_level cooperative_index"
+    ),
     "worker": (
         "index worker_index context_worker_index run_epoch next_sequence "
         "error_flags finished core_id core_type cluster_index"
     ),
-    "admission": ("index run_epoch task_ref order_key block_num member_count active_mask flags record_offset"),
     "control": (
-        "task_ref state next_block completed_subtasks admission_state canonical_total pending_compute completion_debt "
+        "task_ref state next_block completed_subtasks canonical_total pending_compute completion_debt "
         "completion_backend counter_index counter_threshold counter_limit async_mask"
     ),
     "counter": "index value valid limit",
     "condition": "index run_epoch task_ref worker_index block_idx subtask_slot source credits",
     "claim": "run_epoch worker_index block_idx confirmed_count seal_value",
     "actor": "run_epoch task_ref order_key worker_index flags",
-    "member": (
-        "index run_epoch task_ref order_key observed_tail closed_cursor "
-        "close_frontier last_group_seq worker_index flags pending_mask"
-    ),
+    "member": "index run_epoch task_ref order_key worker_index observed_mix_floor observed_self_floor",
+    "floor": "index run_epoch cluster_index worker_index prior_mix_ref floor",
     "owner": (
         "run_epoch task_ref order_key group_seq completion_ticket worker_index "
-        "block_idx cluster_index block_num active_mask flags sync_tail completion_credits"
+        "block_idx cluster_index block_num active_mask flags completion_worker completion_credits"
     ),
     "lane": (
         "index run_epoch task_ref order_key group_seq worker_index block_idx "
-        "cluster_index lane active_mask flags block_num resource_mask"
+        "cluster_index lane active_mask flags block_num resource_mask observed_self_floor"
     ),
     "execution": (
-        "index run_epoch task_ref order_key permit_tail worker_index block_idx "
+        "index run_epoch task_ref order_key observed_mix_floor observed_self_floor worker_index block_idx "
         "pending_slot subtask_slot flags ready_source group_seq block_num cluster_index cluster_lane "
         "publication_before_cycles publication_after_cycles publication_count "
         "contribution_ticket contribution_worker contribution_credits"
@@ -74,10 +73,10 @@ STAMPS = {
     "claim": "published_before published_after",
     "actor": "before after",
     "condition": "before after",
-    "member": "observed closed",
+    "member": "committed retired",
+    "floor": "before after",
     "owner": (
-        "staged claim_before claim_after publish_before publish_after "
-        "completion_before completion_after releases_observed"
+        "claim_before claim_after publish_before publish_after completion_before completion_after releases_observed"
     ),
     "lane": "descriptor_ready arrive_before arrive_after arrivals_observed release_before release_after",
     "execution": (
@@ -85,9 +84,9 @@ STAMPS = {
     ),
 }
 ARRAYS = {
-    "task": {"kernel_ids": 3, "dependencies": None},
+    "task": {"kernel_ids": 3, "dependencies": None, "required_floor": 3},
     "worker": {"cluster_workers": 3},
-    "owner": {"released_seq": 3, "sync_frontier": 3, "sync_hold": 3},
+    "owner": {"released_seq": 3},
     "lane": {"arrived_seq": 3, "lane_subtasks": 3},
 }
 SIGNED_FIELDS = frozenset(("task_ref", "core_id", "core_type", "state"))
@@ -122,9 +121,6 @@ def _array(value, path, count=None, *, signed=False):
 
 def _record(record, kind, path, extra_numbers=(), extra_arrays=None):
     numbers = NUMBERS[kind].split() + list(extra_numbers)
-    order_fields = ("schedule_rank", "topological_level", "bottom_level")
-    if kind == "task" and isinstance(record, dict) and any(name in record for name in order_fields):
-        numbers += list(order_fields)
     stamps = STAMPS.get(kind, "").split()
     arrays = ARRAYS.get(kind, {}) | (extra_arrays or {})
     _object(record, {*numbers, *stamps, *arrays}, path)
@@ -173,26 +169,32 @@ def read_native_protocol(section):
         _number(section["first_error"][field], f"first_error.{field}")
     if section["member_count"] != section["worker_count"] * section["cooperative_task_count"]:
         _error("member region capacity disagrees with task/worker counts")
-    _array(section["admission_log"], "admission_log", section["cooperative_task_count"], signed=True)
+    # Older captures reserved a row for every cooperative task, including pure
+    # sync tasks. Current devices allocate rows only for the MIX catalog.
+    floor_counts = {
+        (count + 1) * section["cluster_count"] if section["mix_task_count"] else 0
+        for count in (section["mix_task_count"], section["cooperative_task_count"])
+    }
+    if section["floor_count"] not in floor_counts:
+        _error("floor publication capacity disagrees with cluster/task counts")
     for table, kind, count, key in (
         ("tasks", "task", section["task_count"], "task_ref"),
         ("workers", "worker", section["worker_count"], "index"),
         ("task_controls", "control", section["task_count"], "task_ref"),
-        ("admissions", "admission", section["task_count"] if section["cooperative_task_count"] else 0, "index"),
     ):
         _indices(section[table], count, table, key=key, dense=True)
         for row in section[table]:
-            extra = ("claim_tickets", "claim_seal") if kind == "control" else ()
+            extra = ("claim_seal",) if kind == "control" else ()
             _record(row, kind, f"{table}[{row[key]}]", extra)
     for table, kind, count in (
         ("members", "member", section["member_count"]),
+        ("floor_publications", "floor", section["floor_count"]),
         ("executions", "execution", section["trace_count"]),
         ("condition_contributions", "condition", section["trace_count"]),
     ):
         _indices(section[table], count, table)
         for row in section[table]:
-            extra = ("claim_seal_seen", "claim_cursor_seen") if kind == "member" else ()
-            _record(row, kind, f"{table}[{row['index']}]", extra)
+            _record(row, kind, f"{table}[{row['index']}]")
     counters = section["completion_counters"]
     if not isinstance(counters, list) or len(counters) > section["task_count"]:
         _error("invalid completion counter count")
@@ -277,10 +279,9 @@ def counter_chains(section):
 def _read_nested_events(section):
     _indices(section["task_events"], section["task_count"], "task_events")
     for row in section["task_events"]:
-        _object(row, {"index", "admission", "completion"}, "task_events row")
-        for name in ("admission", "completion"):
-            if row[name] is not None:
-                _record(row[name], "actor", f"task_events[{row['index']}].{name}")
+        _object(row, {"index", "completion"}, "task_events row")
+        if row["completion"] is not None:
+            _record(row["completion"], "actor", f"task_events[{row['index']}].completion")
     _indices(section["blocks"], section["trace_count"], "blocks")
     for row in section["blocks"]:
         fields = {"index", "owner", "lanes", "claim"}
@@ -291,15 +292,13 @@ def _read_nested_events(section):
             _record(row["owner"], "owner", f"blocks[{row['index']}].owner")
         _indices(row["lanes"], 3, "block lanes")
         for lane in row["lanes"]:
-            extra = {"previous_lane_seq": 3}
-            _record(lane, "lane", f"blocks[{row['index']}].lanes[{lane['index']}]", extra_arrays=extra)
+            _record(lane, "lane", f"blocks[{row['index']}].lanes[{lane['index']}]")
 
 
 def _event_records(section):
     for row in section["task_events"]:
-        for name in ("admission", "completion"):
-            if row[name] is not None:
-                yield row[name], "actor", f"task_events[{row['index']}].{name}"
+        if row["completion"] is not None:
+            yield row["completion"], "actor", f"task_events[{row['index']}].completion"
     for row in section["blocks"]:
         if row["claim"] is not None:
             yield row["claim"], "claim", f"blocks[{row['index']}].claim"
@@ -307,7 +306,12 @@ def _event_records(section):
             yield row["owner"], "owner", f"blocks[{row['index']}].owner"
         for lane in row["lanes"]:
             yield lane, "lane", f"blocks[{row['index']}].lanes[{lane['index']}]"
-    for table, kind in (("members", "member"), ("executions", "execution"), ("condition_contributions", "condition")):
+    for table, kind in (
+        ("members", "member"),
+        ("floor_publications", "floor"),
+        ("executions", "execution"),
+        ("condition_contributions", "condition"),
+    ):
         for row in section[table]:
             yield row, kind, f"{table}[{row['index']}]"
 
@@ -327,9 +331,7 @@ def _completion_aliases(section):
             groups.setdefault((owner["task_ref"], owner["completion_ticket"]), []).append(block)
     aliases = {}
     for event in section["task_events"]:
-        admission, done = event["admission"], event["completion"]
-        if admission is not None and admission["flags"] & COMPLETION_ALIAS_FLAGS:
-            _error("completion alias on admission")
+        done = event["completion"]
         if done is None or not done["flags"] & COMPLETION_ALIAS_FLAGS:
             continue
         ref = event["index"]
@@ -367,7 +369,7 @@ def _completion_aliases(section):
                 or source["flags"] != task["flags"]
                 or block["index"] != task["trace_base"] + source["block_idx"] * width
                 or source["run_epoch"] != done["run_epoch"]
-                or source["worker_index"] != done["worker_index"]
+                or source["completion_worker"] != done["worker_index"]
                 or source["order_key"] != done["order_key"]
                 or done["before"] != source["completion_before"]
                 or done["after"] != source["completion_after"]
@@ -403,6 +405,12 @@ def _completion_aliases(section):
     return aliases
 
 
+def stamp_worker(record, field):
+    if "completion_worker" in record and field in ("completion_before", "completion_after", "releases_observed"):
+        return record["completion_worker"]
+    return record["worker_index"]
+
+
 def audit_protocol_sequences(section):
     """Check producer terminal status and contiguous per-worker sequences, not full causality."""
     read_native_protocol(section)
@@ -428,8 +436,11 @@ def audit_protocol_sequences(section):
         if kind == "actor" and record["flags"] & COMPLETION_ALIAS_FLAGS:
             # The validated physical or group contribution supplies these events once.
             continue
-        stream = streams[worker]
         for name in STAMPS[kind].split():
+            worker = stamp_worker(record, name)
+            if worker not in workers:
+                _error(f"foreign event writer at {path}.{name}")
+            stream = streams[worker]
             cycles, sequence = record[name]
             if sequence == 0:
                 if cycles != 0:

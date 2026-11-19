@@ -554,3 +554,25 @@ percounter 本轮总和为 59.4348634 ms；保留版只在 7/16 项逐项更快�
 `audit.json`、`summary.json`、逐臂结果及原始记录；`refill-ready-first/`
 保存冻结源码/二进制、完整 IR 和 `rejected.patch`；`trace-audit.md/json`
 保存 L1/L3/L4 的时间轴归属与非重叠分解。不通过选择性删除样本保留候选。
+
+## Sync prepared ownership
+
+2026-11-17 在 `5ccae103b` 上，将非 MIX sync_start 已领取的 block 接入现有 `TicketOwned` prepared 路径。正常 block 省去一次 prepared CAS 和一次返回时 atomicExch，但增加现有单写者诊断路径的缓存写回与屏障。MIX、admission 最终许可及业务 kernel 均不改变。
+
+12组配对 AICore L0 总和为 **19.1581162 → 19.2729335 ms（+0.599314%）**，曾按冗余优先要求保留；2026-11-18 复核发现替代路径增加普通缓存读写、DCCI 与 DSB，按用户“只留第三项”要求撤回。每组1次预热、10次计时，自动分配相同卡/卡对，双卡在Device同步后计时并逐轮取较慢rank。11组replay数值通过，native MoE按既有口径只做运行和计时校验。713项已有及针对性CPU检查通过，A5编译90.03秒，IR检查16/16无发现。
+
+代码层面减少原子操作不等于整体提速；现已恢复修改前的纯 sync_start prepared 状态协议，普通 SPMD 原有路径不变。证据保存在 `artifacts/redundancy-four-20261117/sync-owner/`：`rejected.patch`、`l0/comparison.json`、`audit.json`、`verdict.json`。冻结源码和运行时位于 `artifacts/c2a-handoff-20261115/redundant-sync-owner/`。
+
+## Host static Binding fields
+
+2026-11-17 将普通与 MIX Call 的 `sub_block_id` 放到 Host 初始化，删除三处 Device 赋值及仅服务这些赋值的 Binding 写回；保留接收、MIX 到齐及异步边界屏障。候选在 `5ccae103b` 的生产代码基础上独立验证，没有叠加已撤回的 sync prepared-owner 修改。
+
+12组 AICore L0 总和 **19.2239725 → 19.3331095 ms（+0.567713%）**，曾按冗余优先要求保留；2026-11-18 按用户“只留第三项”要求撤回，恢复 Device lane 字段准备及其发布边界。11组replay数值通过，native MoE只做运行/计时；Graph共享定义的数值和L4协议校验通过，704项CPU检查通过，A5编译84.01秒、IR16/16无发现。每组1次预热、10次计时、自动分卡、双卡Device起跑门槛与逐轮rank最大值均经过原始日志审计。
+
+本次SWA L3中，若干task的接收scope缩短而执行入口准备scope增长，不能由DCCI减少推导总耗时下降，也不能据此直接认定具体缓存原因。证据：`artifacts/redundancy-four-20261117/host-binding/` 内的 `rejected.patch`、`l0/comparison.json`、`audit.json` 和 `l3/`；冻结源码/运行时在 `artifacts/c2a-handoff-20261115/redundant-host-binding/`。
+
+## Host-completed DONE notifications
+
+2026-11-18 尝试不为 Host 已完成节点申请逐节点 DONE 通知，新版 SWA 少申请12个资源。12组 AICore L0 总和为 **19.2034134 → 19.2926205 ms（+0.464538%）**。该候选已按用户要求撤回。
+
+没有 Device 写者不等于没有 Device 读者。删除通知地址并未传递静态完成证明，消费者仍可能从 SRAM 查询改走 GM completion_state 查询；Host 申请资源本身又在 AICore L0 范围外。后续若消除这类通知，应同时消除确证无须等待的观察，不能仅依赖 GM 回退。现有证据不能将总和变化全部归因于该机制。原始数据位于 `artifacts/redundancy-four-20261117/host-done-notify/`。

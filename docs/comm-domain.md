@@ -137,9 +137,10 @@ continues; child exit alone does not prove device reclamation.
 | `actual_window_size` | window size actually allocated |
 | `buffers` | `{buffer_name: Buffer}` for each `CommBufferSpec` (device `VMM_WINDOW`, owned by this chip) |
 
-For Device-source domains, `device_ctx` exposes the local and imported peer
-window bases. For Host-source domains, peer access follows the platform rules
-below. Use `buffers[name].tensor(shapes, dtype)` to pass a local slice to a task.
+For Device-source domains, `device_ctx` exposes the local window base. The
+default domain also exposes imported peer windows. On A5, URMA and RDMA domains
+leave peer window slots zero and provide peer MRs in their respective workspaces.
+For Host-source domains, peer access follows the platform rules below. Use `buffers[name].tensor(shapes, dtype)` to pass a local slice to a task.
 
 On both A5 and A2/A3, each owner reserves its POSIX backing before mapping and
 registering it. If tmpfs lacks space, domain creation fails and the existing
@@ -147,10 +148,12 @@ rollback releases the partial allocation.
 
 ### A5 Host-source windows
 
-L3 A5 `tensormap_and_ringbuffer` domains accept `memory_source=AddressSpace.HOST`.
+L3 A5 `tensormap_and_ringbuffer`, `host_build_graph`, and `percounter` domains
+accept `memory_source=AddressSpace.HOST` with `workspace_engines=()` for
+synchronous peer MTE reads on PR and DT.
 The default remains `AddressSpace.DEVICE`. Each participating L2 owns independent
 Host shared memory, maps it to its Device, and optionally registers an URMA
-workspace with `workspace_engines=("urma",)`. Other Host workspace engines and
+workspace with `workspace_engines=("urma",)` on TMR. Other Host workspace engines and
 L4 Host domains are rejected before allocation.
 
 The L3 creator accesses the rank's entire Host window through
@@ -158,8 +161,11 @@ The L3 creator accesses the rank's entire Host window through
 `domain.buffer_range(name)`. Its `.tensor(...)` already addresses the named
 slice through the owning Device's mapping. L2 owns allocation and unlink;
 L3 borrows the `SharedMemory` mapping until domain release. CPU access is explicit and
-requires ordering against Device tasks. Peer reads use the domain URMA workspace;
-only the local `windowsIn`/`windowsOut` entry is populated. Host and Device domains
+requires ordering against Device tasks. With an empty workspace list, each requester
+imports peer Host windows and registers its own Device mappings, indexed by
+domain member order in `windowsIn`. Only local `windowsOut` is populated.
+A Host-source URMA domain leaves every `windowsIn` entry zero, including the local rank.
+Kernels address asynchronous reads using the peer MR in the URMA workspace and the named buffer offset. Host and Device domains
 share the same retention, reuse checks, failure policy, and release fences.
 
 See [A5 Host-source domains](a5-host-comm-domain.md) for initialization, kernel
@@ -414,7 +420,7 @@ symmetric window is realized:
 
 | Aspect | Sim | HCCL (onboard) |
 | ------ | --- | -------------- |
-| Window memory | POSIX shm + `ftruncate`, mmap'd per rank | a2a3: Fabric V2 handle exchange (`ACL_MEM_SHARE_HANDLE_TYPE_FABRIC`), falling back to VMM + shareable-handle IPC where Fabric is unsupported. a5: VMM shareable handles only. Cross-card P2P via `aclrtDeviceEnablePeerAccess` on both |
+| Window memory | POSIX shm + `ftruncate`, mmap'd per rank | a2a3: Fabric V2 handle exchange (`ACL_MEM_SHARE_HANDLE_TYPE_FABRIC`), falling back to VMM + shareable-handle IPC where Fabric is unsupported. a5: VMM shareable handles for peer-mapped windows. Explicit P2P enablement applies to the a2a3 IPC fallback and the a5 peer-mapped Device path. Successful a2a3 Fabric V2 imports skip this step. A5 URMA and RDMA use peer MRs |
 | Subset barrier | shm-header atomic, `allocation_id`-scoped | file barriers, `allocation_id`-scoped |
 | Window init | window zeroed before the subset barrier (`memset`) | window zeroed before the handle is announced (`aclrtMemset`) |
 | Async-DMA workspace | opt-in per Worker (`enable_sdma`, provisions inert 16 KiB scratch without STARS streams) | a2a3: opt-in per Worker (`enable_sdma`); a5: domain-selected SDMA/URMA/RDMA; RDMA retains its optional build gate |
@@ -506,21 +512,20 @@ On a5, SDMA and URMA providers are always compiled. RDMA remains optional throug
 `SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON`, defaulting to OFF. Compilation alone creates
 no streams or domain resources. `allocate_domain` and `get_or_allocate_domain`
 create synchronous mapped-window communication by default, without initializing
-any asynchronous provider. `workspace_engines=("sdma", "urma")` or `("rdma",)`
+any asynchronous provider. `workspace_engines=("sdma",)`, `("urma",)`, or `("rdma",)`
 adds the requested asynchronous resources. An omitted parameter and an empty
 sequence have identical meaning and can reuse the same retained domain.
 The same parameter also accepts a mapping from engine names to immutable
 `SdmaConfig`, `UrmaConfig` or `RdmaConfig` objects, available from `simpler`:
 
 ```python
-from simpler import SdmaConfig, UrmaConfig
+from simpler import UrmaConfig
 
 handle = orch.allocate_domain(
     name="exchange",
     members=[0, 1],
     window_size=window_bytes,
     workspace_engines={
-        "sdma": SdmaConfig(),
         "urma": UrmaConfig(jetties_per_aiv=2),
     },
 )
@@ -555,7 +560,7 @@ args.add_scalar(handle.device_context(rank, workspace_engines=("urma",)))
 ```
 
 The required engines must have been selected when allocating that live domain.
-For a mixed task use `workspace_engines=("sdma", "urma")`. A missing or different
+A missing or different
 engine, a released domain, an unknown worker or a null context raises before
 submission. Scalar-only context use also retains the domain for the current run.
 The engine set records successful native initialization; it is not inferred from
@@ -793,16 +798,20 @@ The workspace coverage is split by platform and execution layer:
 
 | Platform / layer | Supported behavior | Coverage |
 | ---------------- | ------------------ | -------- |
-| A5 host | SDMA and URMA plus optional RDMA in one build; RDMA uses a separate domain | RDMA on/off builds, domain isolation, invalid URMA descriptors, initialization failure rollback and finalization in `tests/ut/py/test_comm_workspaces.py` |
-| A5 TMR | SDMA/URMA in one domain and one Worker | Ordered mixed DAG and same-kernel disjoint transfers in `urma_deferred_completion_demo` |
+| A5 host | SDMA and URMA plus optional RDMA in one build; URMA and RDMA each require a dedicated domain | RDMA on/off builds, domain isolation, invalid URMA descriptors, initialization failure rollback and finalization in `tests/ut/py/test_comm_workspaces.py` |
+| A5 TMR | URMA peer MR addressing | Two-rank transfer with a nonzero input offset in `urma_deferred_completion_demo` |
 | A5 completion scheduler | A task waits for every registered backend condition | Controlled SDMA-first / URMA-first completion and failure in `test_urma_completion_scheduler.cpp` |
 | A2/A3 | Worker-owned SDMA and optional peer mappings for L3 TMR Host domains | SDMA and prefetch examples, and `test_a3_host_source_domain.py` for Host MTE and peer SDMA |
 | Simulation | Communication windows and zero backend descriptors | Existing domain/window tests; explicit nonempty engine selections are rejected |
 
-The A5 mixed hardware examples use the full two-rank communicator. They do not
-qualify arbitrary URMA subset communicators or multiple producers sharing a
-peer queue. RDMA transfer examples exercise their own low-address domains;
-joint compilation alone does not qualify same-domain RDMA/SDMA/URMA requests.
+A5 URMA requires a dedicated domain. Its Device window exposes only the local
+HBM base in `windowsIn[rankId]`. Every peer slot is zero. URMA kernels add the
+local tensor's byte offset to the peer MR base from the URMA workspace.
+Cross-rank MTE and SDMA transfers require mapped peer windows in a separate
+domain. Domain allocation rejects any combination of URMA and another engine.
+When migrating a mixed SDMA/URMA kernel, order the transfers so that cross-card
+UBMEM access and URMA transfers never run concurrently within the same kernel,
+even when they use separate domain contexts and access different addresses.
 
 RDMA selection uses the HNS1825 backend. The RDMA integration only supports `orch.allocate_domain()`
 dynamic domains; it does not support `comm_derive_context()`, sim platforms,

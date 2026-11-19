@@ -140,7 +140,7 @@ TEST(AicoreSchedulerState, SyncDemandCountsDistinctCoresInTheDeclaredResourceSco
                 EXPECT_EQ(scheduler_resident_worker_demand_checked(mask, blocks, true, workers, &demand), valid);
                 if (valid) {
                     const bool mix = mask.is_mix();
-                    EXPECT_EQ(demand.aic, (mix || mask.is_aic()) ? blocks : 0u);
+                    EXPECT_EQ(demand.aic, mask.has_aic() ? blocks : 0u);
                     EXPECT_EQ(
                         demand.aiv, mix ? blocks * (static_cast<uint32_t>(mask.has_aiv0()) +
                                                     static_cast<uint32_t>(mask.has_aiv1())) :
@@ -178,7 +178,7 @@ TEST(AicoreSchedulerState, OrdinaryMixMasksCanExecuteMoreBlocksThanPhysicalClust
             SCOPED_TRACE(blocks);
             EXPECT_TRUE(scheduler_resident_task_shape_supported(active, blocks, false));
             const auto demand = scheduler_minimum_worker_demand(mask);
-            EXPECT_EQ(demand.aic, 1u);
+            EXPECT_EQ(demand.aic, mask.has_aic() ? 1u : 0u);
             EXPECT_EQ(demand.aiv, mask.has_both_aiv() ? 2u : 1u);
         }
     }
@@ -213,7 +213,7 @@ TEST(AicoreSchedulerState, OrdinaryDemandCountsOneExecutionPositionOrMixGroup) {
              DemandCase{LaneMask::aiv0(), 0, 1},
              DemandCase{LaneMask(/*aic=*/true, /*aiv0=*/true, /*aiv1=*/false), 1, 1},
              DemandCase{LaneMask(/*aic=*/true, /*aiv0=*/false, /*aiv1=*/true), 1, 1},
-             DemandCase{LaneMask::both_aiv(), 1, 2},
+             DemandCase{LaneMask::both_aiv(), 0, 2},
              DemandCase{LaneMask::all(), 1, 2},
          }) {
         SCOPED_TRACE(test.mask.count());
@@ -534,8 +534,8 @@ TEST(SchedulerState, PlansAndInitializesTaskCatalogAndCompletionState) {
     EXPECT_EQ(ready_plan.header_offset % SCHEDULER_STATE_ALIGNMENT, 0u);
     EXPECT_EQ(ready_plan.header.descriptors_offset % SCHEDULER_STATE_ALIGNMENT, 0u);
     ASSERT_EQ(ready_plan.descriptors.size(), 2u);
-    EXPECT_EQ(ready_plan.descriptors[0].capacity, 3u);
-    EXPECT_EQ(ready_plan.descriptors[1].capacity, 2u);
+    EXPECT_EQ(ready_plan.descriptors[0].capacity, 1u);
+    EXPECT_EQ(ready_plan.descriptors[1].capacity, 4u);
     layout.total_size = ready_plan.total_size;
 
     SchedulerStateBuffer storage(layout);
@@ -587,9 +587,9 @@ TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
 
     std::array<SchedulerTaskControl, 2> controls{};
     std::array<SchedulerWorkerContext, 2> contexts{};
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 640u);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 896u);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(&contexts[1]) - reinterpret_cast<uintptr_t>(&contexts[0]), 320u);
-    EXPECT_NE(offsetof(SchedulerTaskControl, next_block) / 128, offsetof(SchedulerTaskControl, claim_tickets) / 128);
+    EXPECT_NE(offsetof(SchedulerTaskControl, next_block) / 128, offsetof(SchedulerTaskControl, claim_sectors) / 128);
     EXPECT_NE(offsetof(SchedulerTaskControl, next_block) / 128, offsetof(SchedulerTaskControl, completion_state) / 128);
 
     EXPECT_EQ(
@@ -622,7 +622,7 @@ TEST(SchedulerMetadata, ProjectsExistingSubmitTypesWithoutChangingTheirSemantics
 }
 
 // AICore addresses a task's records by literal offsets, because its .o cannot see
-// the types. The reverse lookup in PlansAndInitializesReadyState only proves the
+// the types. The reverse lookup in PlansAndInitializesTaskCatalogAndCompletionState only proves the
 // constants carry the right values; it cannot catch a helper that strides by the
 // wrong one. That failure is invisible at task 0 — every candidate stride agrees
 // there — so this walks several tasks and checks both records of each against the

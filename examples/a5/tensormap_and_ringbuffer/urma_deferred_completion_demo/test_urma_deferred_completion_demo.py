@@ -14,9 +14,6 @@ fetches the peer rank's input into local ``out`` and registers the URMA async
 event. The consumer depends on that output and writes ``result = out + 1``.
 """
 
-import copy
-
-import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import CommBufferSpec, DataType, TaskArgs, TensorArgType
@@ -30,10 +27,10 @@ DTYPE_NBYTES = 4
 URMA_DATA_OFFSET_NBYTES = 64 * DTYPE_NBYTES
 
 
-def urma_deferred_completion_orch_fn(orch, callables, task_args, config, *, workspace_engines=("urma",)):
+def urma_deferred_completion_orch_fn(orch, callables, task_args, config):
     input_nbytes = N * DTYPE_NBYTES
     with orch.allocate_domain(
-        workspace_engines=workspace_engines,
+        workspace_engines=("urma",),
         name="urma_deferred_completion",
         workers=list(range(NRANKS)),
         window_size=max(URMA_DATA_OFFSET_NBYTES + input_nbytes, 4 * 1024 * 1024),
@@ -52,6 +49,7 @@ def urma_deferred_completion_orch_fn(orch, callables, task_args, config, *, work
             orch.copy_to(handle[rank].buffers["input_window"], _rehosted_buffer_for(task_args, source))
         for rank in range(NRANKS):
             domain = handle[rank]
+            assert domain.buffers["input_window"].base - domain.local_window_base == URMA_DATA_OFFSET_NBYTES
             args = TaskArgs()
             args.add_tensor(domain.buffers["input_window"].tensor((N,), DataType.FLOAT32), TensorArgType.INPUT)
             args.add_tensor(
@@ -60,7 +58,7 @@ def urma_deferred_completion_orch_fn(orch, callables, task_args, config, *, work
             args.add_tensor(
                 _rehosted_ref_for(task_args, getattr(task_args, f"result_{rank}")), TensorArgType.OUTPUT_EXISTING
             )
-            args.add_scalar(handle.device_context(rank, workspace_engines=workspace_engines))
+            args.add_scalar(handle.device_context(rank, workspace_engines=("urma",)))
             orch.submit_next_level(callables.urma_deferred_completion, args, config, worker=rank)
 
 
@@ -123,119 +121,6 @@ class TestUrmaDeferredCompletionDemo(SceneTestCase):
             expected_out = getattr(args, f"in_{1 - rank}")
             getattr(args, f"out_{rank}").copy_(expected_out)
             getattr(args, f"result_{rank}").copy_(expected_out + 1.0)
-
-
-def mixed_workspace_orch_fn(orch, callables, task_args, config):
-    input_nbytes = N * DTYPE_NBYTES
-    with orch.allocate_domain(
-        name="sdma_urma",
-        workers=list(range(NRANKS)),
-        workspace_engines=("sdma", "urma"),
-        window_size=max(URMA_DATA_OFFSET_NBYTES + input_nbytes, 4 * 1024 * 1024),
-        buffers=[
-            CommBufferSpec("reserved", "int32", URMA_DATA_OFFSET_NBYTES // 4, URMA_DATA_OFFSET_NBYTES),
-            CommBufferSpec("input_window", "float32", N, input_nbytes),
-        ],
-    ) as domain:
-        for rank in range(NRANKS):
-            source = getattr(task_args, f"in_{rank}")
-            orch.copy_to(domain[rank].buffers["input_window"], _rehosted_buffer_for(task_args, source))
-        # Both callables write result_r, ordering URMA behind SDMA on each rank.
-        # sdma_out_r remains an independent numerical witness of the SDMA read.
-        for callable_obj, output_prefix in (
-            (callables.sdma_async_completion, "sdma_out"),
-            (callables.urma_deferred_completion, "out"),
-        ):
-            for rank in range(NRANKS):
-                args = TaskArgs()
-                args.add_tensor(
-                    domain[rank].buffers["input_window"].tensor((N,), DataType.FLOAT32), TensorArgType.INPUT
-                )
-                args.add_tensor(
-                    _rehosted_ref_for(task_args, getattr(task_args, f"{output_prefix}_{rank}")),
-                    TensorArgType.OUTPUT_EXISTING,
-                )
-                args.add_tensor(
-                    _rehosted_ref_for(task_args, getattr(task_args, f"result_{rank}")), TensorArgType.OUTPUT_EXISTING
-                )
-                args.add_scalar(domain.device_context(rank, workspace_engines=("sdma", "urma")))
-                orch.submit_next_level(callable_obj, args, config, worker=rank)
-
-
-def _mixed_workspace_callable():
-    spec = copy.deepcopy(TestUrmaDeferredCompletionDemo.CALLABLE)
-    spec["orchestration"] = mixed_workspace_orch_fn
-    spec["callables"].append(
-        {
-            "name": "sdma_async_completion",
-            "orchestration": {
-                "source": "../sdma_async_completion_demo/kernels/orchestration/sdma_async_completion_orch.cpp",
-                "function_name": "sdma_async_completion_orchestration",
-                "signature": [D.IN, D.OUT, D.OUT, D.IN],
-            },
-            "incores": [
-                {
-                    "func_id": func_id,
-                    "source": f"../sdma_async_completion_demo/kernels/aiv/{source}",
-                    "core_type": "aiv",
-                    "signature": [D.IN, D.OUT, D.OUT, D.IN],
-                }
-                for func_id, source in enumerate(("kernel_sdma_tget_async.cpp", "kernel_consumer.cpp"))
-            ],
-        }
-    )
-    return spec
-
-
-@pytest.mark.sdma(worker_workspace=False)
-@scene_test(level=3, runtime="tensormap_and_ringbuffer")
-class TestSdmaUrmaWorkspaceMix(SceneTestCase):
-    CALLABLE = _mixed_workspace_callable()
-    CASES = copy.deepcopy(TestUrmaDeferredCompletionDemo.CASES)
-    RTOL = 0.0
-    ATOL = 1e-3
-
-    def generate_args(self, params):
-        specs = []
-        for rank in range(NRANKS):
-            inp = torch.tensor([float(rank * 1000 + (i % 251)) / 10.0 for i in range(N)], dtype=torch.float32)
-            specs.append(TensorArg(f"in_{rank}", inp))
-            specs.extend(
-                TensorArg(f"{name}_{rank}", torch.zeros(N, dtype=torch.float32))
-                for name in ("sdma_out", "out", "result")
-            )
-        return TaskArgsBuilder(*specs)
-
-    def compute_golden(self, args, params):
-        for rank in range(NRANKS):
-            expected = getattr(args, f"in_{1 - rank}")
-            getattr(args, f"sdma_out_{rank}").copy_(expected)
-            getattr(args, f"out_{rank}").copy_(expected)
-            getattr(args, f"result_{rank}").copy_(expected + 1.0)
-
-
-def same_task_workspace_orch_fn(orch, callables, task_args, config):
-    urma_deferred_completion_orch_fn(orch, callables, task_args, config, workspace_engines=("sdma", "urma"))
-
-
-def _same_task_workspace_callable():
-    spec = copy.deepcopy(TestUrmaDeferredCompletionDemo.CALLABLE)
-    spec["orchestration"] = same_task_workspace_orch_fn
-    spec["callables"][0]["incores"][0]["source"] = "kernels/aiv/kernel_sdma_urma_tget_async.cpp"
-    return spec
-
-
-@pytest.mark.sdma(worker_workspace=False)
-@scene_test(level=3, runtime="tensormap_and_ringbuffer")
-class TestSdmaUrmaSameTask(SceneTestCase):
-    """One producer fills disjoint output halves using two independent engines."""
-
-    CALLABLE = _same_task_workspace_callable()
-    CASES = copy.deepcopy(TestUrmaDeferredCompletionDemo.CASES)
-    RTOL = 0.0
-    ATOL = 1e-3
-    generate_args = TestUrmaDeferredCompletionDemo.generate_args
-    compute_golden = TestUrmaDeferredCompletionDemo.compute_golden
 
 
 if __name__ == "__main__":

@@ -69,6 +69,12 @@ inline SchedulerRunControl *aicore_scheduler_run_control(SchedulerWorkerContext 
                                    scheduler_state_at<SchedulerRunControl>(state_base, context->run_control_offset);
 }
 
+inline uint64_t aicore_scheduler_resolved_count(const SchedulerRunControl *run) {
+    return run->run_completed_read_address == 0 ?
+               run->resolved_task_count :
+               *reinterpret_cast<volatile uint32_t *>(run->run_completed_read_address);
+}
+
 inline SchedulerGraphView aicore_scheduler_graph_view(const SchedulerWorkerContext &context) {
     return {
         context.graph_storage_address,

@@ -26,7 +26,7 @@
 #include <vector>
 
 #include "hbg_scheduler_test_support.h"
-#include "scheduler/scheduler_gm_mix.h"
+#include "test_hbg_owned_execution.h"
 #include "scheduler/scheduler_dispatch.h"
 #include "scheduler/scheduler_protocol_execute.h"
 #include "scheduler/scheduler_args_dump.h"
@@ -93,7 +93,6 @@ struct GmMixFixture {
             protocol_profiling, extend_layout
         ),
         graph(shapes.size()),
-        admissions(clusters * 3),
         locals(clusters * 3),
         signals(clusters) {
         uint32_t trace = 0;
@@ -122,6 +121,7 @@ struct GmMixFixture {
                 metadata.kernel_ids[subtask] =
                     !shape.inline_task && shape.mask.has(static_cast<SubtaskSlot>(subtask)) ? 1 : UINT16_MAX;
         }
+        storage.callable_addresses[1] = reinterpret_cast<uint64_t>(&scheduler_test::protocol_noop_kernel);
         storage.prepare_catalog();
         EXPECT_TRUE(scheduler_init_spmd_task_records(base(), storage.layout, 47));
         storage.run_control->active_worker_count = clusters * 3;
@@ -137,8 +137,9 @@ struct GmMixFixture {
         for (uint32_t worker = 0; worker < locals.size(); ++worker) {
             locals[worker] = storage.local_context(&storage.contexts[worker]);
             if (storage.layout.spmd.mix_task_count != 0) locals[worker]->cluster_signal = &signals[worker / 3];
-            EXPECT_TRUE(scheduler_initialize_admission(base(), locals[worker], &admissions[worker]));
-            locals[worker]->admission = admissions[worker].capacity == 0 ? nullptr : &admissions[worker];
+            const auto &catalog = *scheduler_state_at<SchedulerTaskCatalogHeader>(base(), storage.task_catalog_offset);
+            locals[worker]->next_mix_ref = catalog.first_mix_ref;
+            if (protocol_profiling) EXPECT_TRUE(scheduler_protocol_bind(base(), locals[worker]));
         }
     }
 
@@ -147,29 +148,32 @@ struct GmMixFixture {
     SchedulerTaskControl *control(uint64_t task) const {
         return scheduler_state_at<SchedulerTaskControl>(base(), storage.layout.task_controls_offset) + task;
     }
-    SchedulerGroupMailbox *mailbox(uint32_t cluster) const {
-        return scheduler_state_at<SchedulerGroupMailbox>(base(), storage.layout.group_mailboxes_offset) + cluster;
-    }
-    volatile uint32_t &frontier(uint32_t cluster) { return signals[cluster].sync_frontier[0]; }
     SchedulerClusterSignal *signal(uint32_t cluster) { return &signals[cluster]; }
-    bool ordinary_arm(uint64_t task, uint32_t cluster, bool *armed) {
-        *armed = false;
-        auto *local = locals[cluster * 3];
-        const auto *pool = scheduler_state_at<SchedulerTaskCatalogHeader>(base(), local->config.task_catalog_offset);
-        const auto catalog = scheduler_task_catalog(base(), *pool, 0);
-        const auto *entry = std::find(catalog.refs, catalog.refs + catalog.count, static_cast<int64_t>(task));
-        if (entry == catalog.refs + catalog.count) return false;
-        const uint32_t previous = signal(cluster)->armed_generation;
+    bool ordinary_arm(uint64_t task, uint32_t cluster, bool *published) {
+        *published = false;
+        auto *proxy = locals[cluster * 3 + 1];
+        const auto task_ref = static_cast<int64_t>(task);
         bool progress = false;
-        if (!scheduler_cluster_mix_discover_next(graph.graph(), base(), local, run(), &progress) ||
-            !scheduler_cluster_mix_progress_pending(graph.graph(), base(), local, run(), &progress))
-            return false;
-        *armed = signal(cluster)->armed_generation != previous &&
-                 scheduler_cluster_mix_armed(signal(cluster)->armed_generation);
+        if (scheduler_task_ref_is_null(proxy->cluster_pending.task_ref)) {
+            int64_t ref = SCHEDULER_TASK_REF_INVALID;
+            if (!scheduler_issue_head(graph.graph(), base(), proxy, run(), &ref, &progress)) return false;
+            if (ref != task_ref) return true;
+            if (!scheduler_claim_for_build(graph.graph(), base(), proxy, run(), ref, &progress)) return false;
+        }
+        uint32_t previous = 0;
+        for (const auto &group : signals[cluster].groups)
+            previous = std::max(previous, static_cast<uint32_t>(group.armed_generation));
+        if (!scheduler_progress_mix_publication(graph.graph(), base(), proxy, run(), &progress)) return false;
+        for (const auto &group : signals[cluster].groups) {
+            const uint32_t generation = group.armed_generation;
+            if (scheduler_cluster_mix_armed(generation) && generation > previous && group.task_ref == task_ref)
+                *published = true;
+        }
         return true;
     }
     bool ordinary_service(uint32_t worker, bool *progress, uint64_t profiling = 0) {
-        return scheduler_cluster_mix_service(graph.graph(), base(), locals[worker], run(), profiling, progress);
+        *progress = false;
+        return scheduler_progress_mix_groups(graph.graph(), base(), locals[worker], run(), profiling, progress);
     }
     bool prepare_calls() { return storage.prepare_calls(graph.graph()); }
     bool claim_ordinary(uint64_t task, uint32_t worker) {
@@ -205,140 +209,58 @@ struct GmMixFixture {
         auto *local = locals[worker];
         uint32_t direct = UINT32_MAX;
         bool progress = false;
-        if (!scheduler_progress_execution_tokens(graph.graph(), base(), local, run(), 0, &direct, &progress))
-            return false;
-        if (direct != UINT32_MAX) scheduler_local_ready_publish(local, direct);
-        return true;
-    }
-    bool claim_pending(uint64_t task, uint32_t worker = 0) {
-        auto *local = locals[worker];
-        const auto *pool = scheduler_state_at<SchedulerTaskCatalogHeader>(base(), local->config.task_catalog_offset);
-        const auto catalog = scheduler_task_catalog(base(), *pool, local->config.self_core_type);
-        const auto *entry = std::find(catalog.refs, catalog.refs + catalog.count, static_cast<int64_t>(task));
-        if (entry == catalog.refs + catalog.count) return false;
-        for (uint64_t slice = 0; slice <= catalog.count + 2 * graph.graph().task_count; ++slice) {
-            const uint64_t head = local->issue_cursor;
-            const int64_t issue_task = local->issue_task_ref;
-            const uint32_t fanin = local->issue_next_fanin;
-            bool progress = false;
-            if (!scheduler_discover_cooperative_task(graph.graph(), base(), local, run(), &progress)) return false;
-            if (!scheduler_task_ref_is_null(admissions[worker].pending_task_ref))
-                return admissions[worker].pending_task_ref == static_cast<int64_t>(task);
-            if (local->issue_cursor == head && !(local->issue_next_fanin != 0 && (local->issue_task_ref != issue_task ||
-                                                                                  local->issue_next_fanin > fanin)))
-                return false;
-        }
-        return false;
-    }
-    bool admit(uint64_t task, uint32_t worker = 0) {
-        return claim_pending(task, worker) &&
-               scheduler_try_commit_admission(graph.graph(), base(), locals[worker], run(), &admissions[worker]) ==
-                   SchedulerAdmissionResult::PROGRESS;
-    }
-    bool refresh(uint32_t worker) {
-        return scheduler_refresh_local_obligation(graph.graph(), base(), locals[worker], run(), &admissions[worker]);
-    }
-    bool refresh_all() {
-        for (uint32_t worker = 0; worker < locals.size(); ++worker)
-            if (!refresh(worker)) return false;
-        return true;
-    }
-    bool participant(uint32_t worker, uint32_t task = 0) const {
-        return storage.metadata[task]
-            .active_mask.merged_with(LaneMask::aic())
-            .has(static_cast<SubtaskSlot>(worker % 3));
-    }
-    SchedulerBlockClaimResult claim(uint32_t cluster) {
-        return scheduler_gm_mix_claim(graph.graph(), base(), locals[cluster * 3], run());
-    }
-    bool publish(uint32_t cluster) {
-        return scheduler_gm_mix_publish(graph.graph(), base(), locals[cluster * 3], run());
-    }
-    bool observe(uint32_t worker, bool *progress) {
-        return scheduler_gm_mix_observe(graph.graph(), base(), locals[worker], run(), progress);
-    }
-    bool arrive(uint32_t worker, bool *progress) {
-        return scheduler_gm_mix_arrive(graph.graph(), base(), locals[worker], run(), progress);
-    }
-    bool prepare(uint32_t worker, bool *progress, uint64_t profiling = 0) {
-        return scheduler_gm_mix_prepare_lane(graph.graph(), base(), locals[worker], run(), profiling, progress);
-    }
-    bool rendezvous(uint32_t cluster, uint64_t profiling = 0) {
-        bool progress = false;
-        const LaneMask resources = admissions[cluster * 3].current_resource_mask;
-        for (uint32_t lane = 1; lane < 3; ++lane)
-            if (resources.has(static_cast<SubtaskSlot>(lane)) && !observe(cluster * 3 + lane, &progress)) return false;
-        for (uint32_t lane = 0; lane < 3; ++lane)
-            if (resources.has(static_cast<SubtaskSlot>(lane)) && !arrive(cluster * 3 + lane, &progress)) return false;
-        for (uint32_t lane = 0; lane < 3; ++lane)
-            if (resources.has(static_cast<SubtaskSlot>(lane)) && !prepare(cluster * 3 + lane, &progress, profiling))
-                return false;
-        return true;
-    }
-    SchedulerGmMixResult retire(uint32_t cluster) {
-        return scheduler_gm_mix_retire(graph.graph(), base(), locals[cluster * 3], run());
+        return scheduler_progress_execution_tokens(graph.graph(), base(), local, run(), 0, &direct, &progress);
     }
     bool task_done(uint64_t task) const {
         return scheduler_completion_done(scheduler_gm_query(control(task)->completion_state));
     }
-    bool close(uint32_t worker, bool *closed) {
-        return scheduler_gm_mix_close(graph.graph(), base(), locals[worker], run(), closed);
-    }
     template <bool RecordProtocol = true>
     bool fill(uint32_t worker) {
         bool failed = false;
-        scheduler_fill_own_slots<RecordProtocol>(graph.graph(), base(), locals[worker], run(), 0, &failed);
+        scheduler_find_local_execution<RecordProtocol>(graph.graph(), base(), locals[worker], run(), 0, &failed);
         return !failed;
     }
     bool service_cooperative(uint32_t worker) {
-        bool failed = false;
-        scheduler_service_cooperative_slots(graph.graph(), base(), locals[worker], run(), 0, &failed);
-        return !failed;
+        bool progress = false;
+        return ordinary_service(worker, &progress);
     }
     bool begin(uint32_t worker, GmExecution *execution) {
-        auto *local = locals[worker];
         uint32_t slot = UINT32_MAX;
-        if (!scheduler_local_ready_peek(local, &slot)) return false;
+        return hbg_test_find_eligible(locals[worker], &slot) && begin(worker, slot, execution);
+    }
+    bool begin(uint32_t worker, uint32_t slot, GmExecution *execution) {
+        auto *local = locals[worker];
+        if (slot >= SCHEDULER_LOCAL_EXECUTION_COUNT ||
+            local->execution_at(slot).state != SchedulerDispatchSlotState::READY)
+            return false;
         bool permit = false;
-        if (!scheduler_can_enter_dispatch_slot(graph.graph(), base(), local, run(), slot, &permit)) return false;
+        if (!scheduler_check_entry_permit(graph.graph(), base(), local, run(), slot, &permit)) return false;
         if (!permit) return false;
-        if (!scheduler_local_ready_execute(local, slot)) return false;
-        const auto index = local->slots[slot].prepared.execution_index;
+        if (!hbg_test_begin_execution(local, slot)) return false;
+        const auto index = local->execution_at(slot).prepared.execution_index;
         auto *call = scheduler_prepared_call_at(base(), local->config.prepared, index);
         auto *binding = scheduler_execution_binding_at(base(), local->config.prepared, index);
-        if (scheduler_protocol_enabled(local))
-            scheduler_execute_protocol_task(
-                base(), local, slot, call->function_bin_addr, call->args, binding->local_context
-            );
-        *execution = {
-            local->slots[slot].task_ref,
+        const auto address =
+            local->execution_at(slot).predicate == SchedulerPredicateState::FAIL ? 0 : call->function_bin_addr;
+        const GmExecution entry = {
+            local->execution_at(slot).task_ref,
             static_cast<uint32_t>(binding->local_context.block_idx),
             static_cast<uint32_t>(binding->local_context.block_num),
             worker,
             slot,
-            local->slots[slot].subtask_slot,
+            local->execution_at(slot).subtask_slot,
             static_cast<uint32_t>(binding->global_context.sub_block_id)
         };
+        scheduler_execute_protocol_task(base(), local, slot, address, call->args, binding->local_context);
+        *execution = entry;
         return true;
     }
     template <bool RecordProtocol = true>
     bool complete(const GmExecution &execution, uint64_t profiling = 0) {
         auto *local = locals[execution.worker];
-        return scheduler_complete_own_slot<RecordProtocol>(
+        return scheduler_complete_lane_execution<RecordProtocol>(
             graph.graph(), base(), local, run(), execution.slot, profiling
         );
-    }
-    bool finish_lanes(uint32_t cluster) {
-        const auto active = admissions[cluster * 3].current_active_mask;
-        const auto resources = admissions[cluster * 3].current_resource_mask;
-        for (uint32_t lane = 0; lane < 3; ++lane) {
-            if (!resources.has(static_cast<SubtaskSlot>(lane))) continue;
-            GmExecution execution{};
-            const bool executes = active.has(static_cast<SubtaskSlot>(lane));
-            const bool entered = begin(cluster * 3 + lane, &execution);
-            if (executes != entered || (entered && !complete(execution))) return false;
-        }
-        return true;
     }
     bool drain(uint32_t worker, bool *done) {
         return scheduler_drain_ordered_exit(graph.graph(), base(), locals[worker], run(), done);
@@ -346,7 +268,6 @@ struct GmMixFixture {
 
     scheduler_test::FixtureStorage storage;
     scheduler_test::GraphBuffer graph;
-    std::vector<SchedulerAdmissionLocalState> admissions;
     std::vector<SchedulerLocalState *> locals;
     std::vector<SchedulerClusterSignal> signals;
 };

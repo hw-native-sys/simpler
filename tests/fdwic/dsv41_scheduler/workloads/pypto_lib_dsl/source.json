@@ -26,19 +26,6 @@
       "variants": [
         "pypto_lib_dsl"
       ]
-    },
-    "layers_19_21": {
-      "tasks": 159,
-      "executions": 4168,
-      "edges": 280,
-      "first_source_task": "1315",
-      "last_source_task": "1520",
-      "task_table_sha256": "e31a55d1fd0a12834ec4f980cc0b5ed0f58e6414df454d7dbfc04b993fab5d12",
-      "edge_table_sha256": "e880ef810ea2c9deb23317529a84ff88a11fbb4d1c8b8394c8c312204753f856",
-      "incoming_edges": 285,
-      "variants": [
-        "pypto_lib_dsl"
-      ]
     }
   },
   "boundary": "Incoming values are produced by executing the real original prefix before measuring the case.",

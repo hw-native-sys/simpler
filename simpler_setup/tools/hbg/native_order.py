@@ -12,7 +12,7 @@
 from bisect import bisect_left, bisect_right
 from collections import defaultdict, deque
 
-from .native_protocol import STAMPS, _error, _event_records
+from .native_protocol import STAMPS, _error, _event_records, stamp_worker
 
 
 class CausalOrder:
@@ -23,7 +23,7 @@ class CausalOrder:
             for name in STAMPS[kind].split():
                 cycles, sequence = record[name]
                 if sequence:
-                    self.clocks[record["worker_index"]][sequence - 1] = cycles
+                    self.clocks[stamp_worker(record, name)][sequence - 1] = cycles
         for worker, cycles in self.clocks.items():
             self.edges[("event", worker, 0)]
             for sequence in range(1, len(cycles) + 1):

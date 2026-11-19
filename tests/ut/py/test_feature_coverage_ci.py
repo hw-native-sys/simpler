@@ -355,8 +355,8 @@ def test_framework_report_is_strict_and_empty_is_not_verified(tmp_path, empty):
     "platform,step_name,filename,partition,coverage_partition",
     [
         ("a2a3", "Run pytest scene tests (a2a3)", "main", "not sdma and not sdma_fault", "main"),
-        ("a2a3", "SDMA pytest (a2a3)", "sdma", "sdma and not sdma_fault", "sdma"),
-        ("a2a3", "SDMA fault recovery pytest (a2a3)", "sdma_fault", "sdma_fault", "sdma_fault"),
+        ("a2a3", "Run SDMA tests (a2a3)", "sdma", "sdma and not sdma_fault", "sdma"),
+        ("a2a3", "Run SDMA fault-recovery tests (a2a3)", "sdma_fault", "sdma_fault", "sdma_fault"),
         ("a5", "Run pytest scene tests (a5)", "main", None, "all"),
     ],
 )
