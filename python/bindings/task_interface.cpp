@@ -3409,6 +3409,33 @@ NB_MODULE(_task_interface, m) {
             "cascade IPC channel."
         )
 
+        .def(
+            "_with_input_cache_proofs",
+            [](const PyChipCallable &self, nb::callable annotate) {
+                std::optional<PyChipCallable> copy;
+                const auto &parent = self.get();
+                for (int32_t i = 0; i < parent.child_count(); ++i) {
+                    const auto &child = parent.child(i);
+                    const size_t size = child.binary_size();
+                    const void *text = child.binary_data();
+                    if (size == 0 || core_input_cache_proof_matches_text(child.input_cache_proof(), text, size))
+                        continue;
+                    const auto artifact = nb::cast<nb::bytes>(annotate(nb::bytes(text, size)));
+                    if (artifact.size() != size + sizeof(CoreInputCacheProof) ||
+                        std::memcmp(artifact.c_str(), text, size) != 0)
+                        continue;
+                    CoreInputCacheProof proof;
+                    std::memcpy(&proof, artifact.c_str() + size, sizeof(proof));
+                    if (!core_input_cache_proof_matches_text(proof, text, size)) continue;
+                    if (!copy) copy.emplace(self);
+                    const size_t offset =
+                        offsetof(ChipCallable, storage_) + parent.child_offset(i) + offsetof(CoreCallable, storage_);
+                    std::memcpy(copy->buffer_.data() + offset, &proof, sizeof(proof));
+                }
+                return copy;
+            }
+        )
+
         .def_prop_ro(
             "ccu_modules",
             [](const PyChipCallable &self) {

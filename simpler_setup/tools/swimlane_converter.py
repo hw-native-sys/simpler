@@ -2664,6 +2664,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             for succ in succs:
                 fanin_map[succ].append(pred)
 
+    hbg_kernel_labels = {}
     for task in tasks:
         tid = core_to_tid[task["core_id"]]
         local_setup_us = task.get("local_setup_us", 0.0) or 0.0
@@ -2676,6 +2677,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         func_id = task["func_id"]
         tdisp = task_display(task["task_id"])
         task_name = _task_display_name(func_id, func_id_to_name, tdisp, spmd=task["task_id"] in spmd_task_ids)
+
+        if scalar_profiles and runtime_name == "host_build_graph" and task.get("reg_task_id") is not None:
+            key = (task["run_epoch"], task["core_id"], task["reg_task_id"])
+            block = task.get("block_idx")
+            hbg_kernel_labels[key] = task_name if block is None else f"{task_name} [b{block}]"
 
         # fanout (consumers) / fanin (producers) hints from deps.json — the device
         # hot path no longer carries them. Each leads with the degree (count) so
@@ -3156,7 +3162,14 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         trace_events = import_module(f"{runtime.__name__}.scalar_profile").trace_events
 
         events.extend(
-            trace_events(scalar_profiles, pid=2, tid_base=30000, display=task_display, streams=scheduler_streams)
+            trace_events(
+                scalar_profiles,
+                pid=2,
+                tid_base=30000,
+                display=task_display,
+                streams=scheduler_streams,
+                kernel_labels=hbg_kernel_labels,
+            )
         )
 
     # AICPU Orchestrator lane (chip_swimlane_level >= 4)
@@ -4891,6 +4904,9 @@ def _scalar_display_event(event, lanes):
         return event
     compact = {key: event[key] for key in ("ph", "name", "pid", "tid", "ts", "dur")}
     args = event.get("args", {})
+    if "hbg_stage" in args:
+        compact["cat"] = args["hbg_stage"]
+        compact["cname"] = event["cname"]
     calls = args.get("scalar_calls", 1)
     if calls != 1:
         compact["name"] += f" [calls={calls}]"
@@ -4898,6 +4914,7 @@ def _scalar_display_event(event, lanes):
     # Nesting is given by the unchanged intervals. Integer clock evidence lives
     # in the source capture rather than being copied into every display event.
     omitted = {
+        "hbg_stage",
         "kind",
         "start_cycles",
         "end_cycles",

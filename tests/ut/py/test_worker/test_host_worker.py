@@ -8989,7 +8989,18 @@ class TestChipMainLoopDigestRegister:
         _mailbox_store_i32(state_addr, _SHUTDOWN)
 
     @staticmethod
-    def _spawn_loop(cw, buf, state_addr, registry=None, identity_table=None, identity_refs=None):
+    def _spawn_loop(
+        cw,
+        buf,
+        state_addr,
+        registry=None,
+        identity_table=None,
+        identity_refs=None,
+        *,
+        chip_platform="",
+        chip_runtime="",
+        fork_inherited=True,
+    ):
         from simpler.buffer import mint_owner_instance_id  # noqa: PLC0415
         from simpler.worker import _run_chip_main_loop  # noqa: PLC0415
 
@@ -9013,27 +9024,39 @@ class TestChipMainLoopDigestRegister:
                 mint_owner_instance_id(),
             ),
             kwargs={
-                "chip_platform": "",
-                "provider_region_store": _chip_loop_provider_region_store(chip_platform=""),
+                "chip_platform": chip_platform,
+                "chip_runtime": chip_runtime,
+                "fork_inherited": fork_inherited,
+                "provider_region_store": _chip_loop_provider_region_store(chip_platform=chip_platform),
             },
             daemon=True,
         )
         t.start()
         return t
 
-    def test_register_uses_payload_size_and_allocates_local_slot(self):
+    @pytest.mark.parametrize("fork_inherited", [True, False], ids=["fork", "exec"])
+    def test_register_uses_payload_size_and_allocates_local_slot(self, monkeypatch, fork_inherited):
         from unittest.mock import MagicMock  # noqa: PLC0415
 
-        cw = MagicMock()
-        cw.unregister_callable = MagicMock()
-        cw.register_callable_from_blob = MagicMock()
+        from simpler.task_interface import CoreCallable
 
-        callable_obj = _unique_chip_callable(7)
-        digest = _chip_digest(callable_obj)
+        from simpler_setup import a5_input_cache
+
+        cw = MagicMock()
+        code = bytes.fromhex("00f06140")
+        analyzer = MagicMock(return_value=code)
+        monkeypatch.setattr(a5_input_cache, "annotate_a5_hbg_text", analyzer)
+        monkeypatch.setattr(worker_mod, "_monotonic", lambda: 100.0)
+        monkeypatch.setenv("ASCEND_HOME_PATH", "mock-toolchain")
+        child = CoreCallable.build(signature=[], binary=code)
+        callable_obj = ChipCallable.build(signature=[], func_name="entry", binary=b"host", children=[(1, child)])
+        digest = _chip_digest(callable_obj, platform="a5", runtime="host_build_graph")
         payload_shm = _chip_payload_shm(callable_obj)
         shm, buf, state_addr = self._build_mailbox()
         try:
-            t = self._spawn_loop(cw, buf, state_addr)
+            t = self._spawn_loop(
+                cw, buf, state_addr, chip_platform="a5", chip_runtime="host_build_graph", fork_inherited=fork_inherited
+            )
             try:
                 self._send_ctrl_register(
                     buf,
@@ -9044,6 +9067,7 @@ class TestChipMainLoopDigestRegister:
                 )
                 err = self._wait_for_done_and_reset(buf, state_addr)
                 assert err == 0
+                analyzer.assert_called_once_with(code, deadline=100.25)
                 assert cw.unregister_callable.call_count == 0
                 cw.register_callable_from_blob.assert_called_once()
                 assert cw.register_callable_from_blob.call_args.args[0] == 0

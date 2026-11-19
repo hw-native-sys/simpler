@@ -38,7 +38,7 @@ static inline __aicore__ SchedulerSubtaskFinishResult scheduler_contribute_retur
 // every computing lane certified a successful return. Its phase remains
 // RELEASED until this contribution is complete, then becomes IDLE exactly once.
 template <bool RecordProtocol = true>
-static inline __aicore__ bool scheduler_contribute_mix_group(
+static inline __aicore__ bool scheduler_publish_fanout(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     int64_t task_ref, uint32_t block_idx, LaneMask active
 ) {
@@ -131,7 +131,7 @@ static inline __aicore__ bool scheduler_contribute_mix_group(
 // Each worker owns a disjoint accounting partition, independent of execution
 // ownership. Counter thresholds release fanin directly; this background close
 // cannot hold a task, resource, or notification lease while its worker is busy.
-static inline __aicore__ bool scheduler_service_counter_accounting(
+static inline __aicore__ bool scheduler_account_completed_tasks(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     bool *progress
 ) {

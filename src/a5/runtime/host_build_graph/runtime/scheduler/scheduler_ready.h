@@ -82,11 +82,10 @@ struct SchedulerReadyClaim {
     uint64_t state_probe_end_cycles{0};
 };
 
-enum class SchedulerGmMixPhase : uint8_t { IDLE, CLAIMED, PUBLISHED, ARRIVED, RUNNING, RELEASED };
+enum class SchedulerGmMixPhase : uint8_t { IDLE, CLAIMED, PUBLISHED, ARRIVED, RUNNING, RELEASED, ORDER_READY };
 
 struct SchedulerClusterMixLocalState {
     int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
-    uint64_t anchor_state{0};
     uint64_t prepare_start_cycles{0};
     SchedulerFaninView fanin{};
     SchedulerFaninWait wait{};
@@ -97,13 +96,13 @@ struct SchedulerClusterMixLocalState {
     LaneMask active_mask{};
     uint8_t subtask_slot{UINT8_MAX};
     SchedulerGmMixPhase phase{SchedulerGmMixPhase::IDLE};
+    bool requires_peer_order{false};
     bool dependencies_published{false};
     bool completion_submitted{false};
 };
 static_assert(alignof(SchedulerClusterMixLocalState) <= 8);
 
 struct SchedulerClusterMixPending {
-    SchedulerPreparedHandle anchor{};
     int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
     uint32_t rank{UINT32_MAX};
     uint32_t block_idx{0};
@@ -214,7 +213,8 @@ struct SchedulerLocalState {
     uint32_t published_mix_floor{0};
     uint32_t observed_mix_floor{0};
     uint32_t observed_self_floor{0};
-    SchedulerClusterMixLocalState cluster_mix{};
+    SchedulerClusterMixLocalState mix_groups[SCHEDULER_MIX_MEMBER_COUNT]{};
+    uint32_t last_mix_generation{0};
     SchedulerClusterMixPending cluster_pending{};
     SchedulerExecutionToken execution_tokens[SCHEDULER_EXECUTION_TOKEN_COUNT]{};
     uint64_t issue_cursor{0};
@@ -243,11 +243,11 @@ struct SchedulerLocalState {
     // Source identities remain stable from claim through return and tracing.
     inline __aicore__ SchedulerLocalSlotState &execution_at(uint32_t index) {
         if (index < SCHEDULER_EXECUTION_TOKEN_COUNT) return execution_tokens[index];
-        return mix_execution;
+        return mix_executions[index - SCHEDULER_CLUSTER_MIX_EXECUTION];
     }
     inline __aicore__ const SchedulerLocalSlotState &execution_at(uint32_t index) const {
         if (index < SCHEDULER_EXECUTION_TOKEN_COUNT) return execution_tokens[index];
-        return mix_execution;
+        return mix_executions[index - SCHEDULER_CLUSTER_MIX_EXECUTION];
     }
     inline __aicore__ uint64_t worker_id() const {
         return config.self_lane < PLATFORM_CORES_PER_BLOCKDIM ? config.worker_ids[config.self_lane] : UINT64_MAX;
@@ -263,7 +263,7 @@ struct SchedulerLocalState {
         return timing >= 0 && timing < SCHEDULER_TASK_TIMING_SLOT_COUNT;
     }
 
-    SchedulerLocalSlotState mix_execution{};
+    SchedulerLocalSlotState mix_executions[SCHEDULER_MIX_MEMBER_COUNT]{};
 };
 
 static_assert(SCHEDULER_WORKER_CAPACITY < UINT16_MAX, "worker IDs must fit the local config");
@@ -577,11 +577,12 @@ inline __aicore__ SchedulerErrorIdentity scheduler_error_identity(
         identity.order_key = slot->rank;
         identity.valid_fields |= SCHEDULER_ERROR_HAS_ORDER;
     }
-    if (local->cluster_mix.task_ref == task_ref && local->cluster_mix.phase != SchedulerGmMixPhase::IDLE) {
-        identity.order_key = local->cluster_mix.rank;
+    for (const auto &group : local->mix_groups) {
+        if (group.task_ref != task_ref || group.phase == SchedulerGmMixPhase::IDLE) continue;
+        identity.order_key = group.rank;
         identity.valid_fields |= SCHEDULER_ERROR_HAS_ORDER;
-        identity.block_idx = local->cluster_mix.block_idx;
-        identity.group_seq = local->cluster_mix.generation;
+        identity.block_idx = group.block_idx;
+        identity.group_seq = group.generation;
         identity.valid_fields |= SCHEDULER_ERROR_HAS_BLOCK | SCHEDULER_ERROR_HAS_GROUP;
     }
     if (slot != nullptr && !scheduler_task_ref_is_null(task_ref) && slot->task_ref == task_ref &&
@@ -648,8 +649,9 @@ static inline __aicore__ void scheduler_capture_execution_identity(
     trace->execution_order_key = scheduler_task_catalog_order(base, catalog, static_cast<uint32_t>(slot.task_ref)).rank;
     if (slot.sync_start) flags |= SCHEDULER_TRACE_ORDERED;
     if (slot.cluster_mix) {
-        trace->execution_order_key = local->cluster_mix.rank;
-        trace->execution_group_seq = local->cluster_mix.generation;
+        const auto &group = local->mix_groups[pending_slot - SCHEDULER_CLUSTER_MIX_EXECUTION];
+        trace->execution_order_key = group.rank;
+        trace->execution_group_seq = group.generation;
         flags |= SCHEDULER_TRACE_GROUP | SCHEDULER_TRACE_CLUSTER_GROUP;
     }
     trace->execution_block_idx = static_cast<uint32_t>(local_context.block_idx);
@@ -730,6 +732,7 @@ static inline __aicore__ bool scheduler_observe_fanin_prefix(
 }
 
 inline __aicore__ void scheduler_retire_execution(SchedulerLocalState *local, uint32_t index) {
+    SchedulerScalarScope retire(local, SchedPhaseKind::ScalarRetireExecution, local->execution_at(index).task_ref);
     if (index < SCHEDULER_EXECUTION_TOKEN_COUNT) local->execution_tokens[index] = {};
     else local->execution_at(index) = {};
     local->set_timing_slot(index, -1);
@@ -752,9 +755,17 @@ inline __aicore__ bool scheduler_execution_token_has_task(const SchedulerLocalSt
     return false;
 }
 
+inline __aicore__ int64_t scheduler_unretired_mix_task(const SchedulerLocalState &local) {
+    for (const auto &group : local.mix_groups)
+        if (group.phase != SchedulerGmMixPhase::IDLE) return group.task_ref;
+    return local.cluster_pending.task_ref;
+}
+
 inline __aicore__ uint32_t scheduler_cooperative_execution(const SchedulerLocalState *local) {
-    return local->mix_execution.state == SchedulerDispatchSlotState::READY ? SCHEDULER_CLUSTER_MIX_EXECUTION :
-                                                                             UINT32_MAX;
+    for (uint32_t bank = 0; bank < SCHEDULER_MIX_MEMBER_COUNT; ++bank)
+        if (local->mix_executions[bank].state == SchedulerDispatchSlotState::READY)
+            return SCHEDULER_CLUSTER_MIX_EXECUTION + bank;
+    return UINT32_MAX;
 }
 
 static inline __aicore__ SchedulerTaskMetadata scheduler_load_dispatch_metadata(

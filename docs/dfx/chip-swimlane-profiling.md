@@ -806,12 +806,10 @@ version 2 execution carries a scheduling rank. The converter also reads
 unversioned identity sections from earlier runs, including ordinary executions
 with a null rank. Full ranked L4 audits still require a rank for each execution.
 
-For MIX, the L4 `claim_before` and `claim_after` stamps bracket allocation of
-the logical block. AIV0 immediately reserves the prepared group anchor. It
-waits for the preceding generation to retire before arming that anchor. AIV0
-then publishes the descriptor and its new generation between `publish_before`
-and `publish_after`. Each participating lane records its own arrival. Its final
-payload publication follows its observation that all active lanes have arrived.
+For MIX, L4 block-owner Claim stamps record AIV0's actual group claim.
+Publication stamps bracket the subsequent SSBUF descriptor release. If both
+banks are occupied, these events can be separated by work on previous groups.
+Member arrival and FIN records carry the published generation.
 
 The `ready_claim`, `ready_steal` and `direct_refill` names were
 emitted by this scheduler between #2104 and #2178; no current scheduler emits

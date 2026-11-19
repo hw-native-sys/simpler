@@ -60,10 +60,6 @@ inline __aicore__ void run(__gm__ int64_t *args) {
             third[i] = first[i] + second[i];
         third[16] = 1;
         publish(third, 17);
-    } else if (action == 4) {
-        third[17] = 1;
-        third[18] = first[0] + second[8];
-        publish(third + 17, 2);
     }
 }
 }  // namespace visibility_case

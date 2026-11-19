@@ -20,21 +20,31 @@ scheduler_order_for(__gm__ void *base, const SchedulerLocalState *local, int64_t
     return scheduler_task_catalog_order(base, catalog, static_cast<uint32_t>(task));
 }
 
-inline __aicore__ bool scheduler_cluster_owes_before(const SchedulerLocalState *local, uint32_t rank) {
+inline __aicore__ bool scheduler_cluster_owes_before(
+    const SchedulerLocalState *local, uint32_t rank, uint32_t current_bank = SCHEDULER_MIX_MEMBER_COUNT
+) {
     SchedulerScalarScope function_scope(local, SchedPhaseKind::ScalarClusterOwesBefore);
     const auto *signal = local->cluster_signal;
     if (signal == nullptr) return false;
-    const uint32_t generation = scheduler_cluster_load_acquire(&signal->armed_generation);
-    if ((generation & 1U) == 0) return false;
-    const uint32_t previous = scheduler_cluster_load_field(&signal->rank);
-    const uint32_t bits = scheduler_cluster_load_field(&signal->active_mask);
-    const LaneMask mask{(bits & 1U) != 0, (bits & 2U) != 0, (bits & 4U) != 0};
-    const auto lane = local->config.self_lane;
-    if (scheduler_cluster_load_acquire(&signal->armed_generation) != generation) return true;
-    if (previous >= rank || !mask.has(static_cast<SubtaskSlot>(lane))) return false;
-    const auto *ack =
-        lane == scheduler_mix_accountant_lane(mask) ? &signal->accounted_generation : &signal->finished[lane];
-    return scheduler_cluster_load_acquire(ack) != generation;
+    for (uint32_t bank = 0; bank < SCHEDULER_MIX_MEMBER_COUNT; ++bank) {
+        if (bank == current_bank) continue;
+        const auto *descriptor = &signal->groups[bank];
+        const uint32_t generation = scheduler_cluster_load_acquire(&descriptor->armed_generation);
+        if ((generation & 1U) == 0) continue;
+        const uint32_t previous = scheduler_cluster_load_field(&descriptor->rank);
+        bool owes = previous < rank;
+        const auto *ack = &descriptor->accounted_generation;
+        if (current_bank == SCHEDULER_MIX_MEMBER_COUNT) {
+            const uint32_t bits = scheduler_cluster_load_field(&descriptor->active_mask);
+            const LaneMask mask{(bits & 1U) != 0, (bits & 2U) != 0, (bits & 4U) != 0};
+            const auto lane = local->config.self_lane;
+            owes = owes && mask.has(static_cast<SubtaskSlot>(lane));
+            if (lane != scheduler_mix_accountant_lane(mask)) ack = &descriptor->finished[lane];
+        }
+        if (scheduler_cluster_load_acquire(&descriptor->armed_generation) != generation) return true;
+        if (owes && scheduler_cluster_load_acquire(ack) != generation) return true;
+    }
+    return false;
 }
 
 inline __aicore__ bool scheduler_owns_earlier_sync(const SchedulerLocalState *local, uint32_t rank) {
@@ -52,9 +62,8 @@ static inline __aicore__ bool scheduler_self_order_ready(
     SchedulerScalarScope function_scope(local, SchedPhaseKind::ScalarSelfOrderReady);
     *ready = false;
     if (sync && scheduler_owns_earlier_sync(local, rank)) return true;
-    if (local->cluster_mix.phase == SchedulerGmMixPhase::ARRIVED ||
-        local->cluster_mix.phase == SchedulerGmMixPhase::RUNNING)
-        return true;
+    for (const auto &group : local->mix_groups)
+        if (group.phase == SchedulerGmMixPhase::ARRIVED || group.phase == SchedulerGmMixPhase::RUNNING) return true;
     if (required != 0) {
         if (local->cluster_signal == nullptr || required > rank)
             return scheduler_issue_fail(graph, local, run, SCHEDULER_TASK_REF_INVALID);
@@ -68,6 +77,16 @@ static inline __aicore__ bool scheduler_self_order_ready(
     return true;
 }
 
+// An earlier owned block can still be needed by a peer even when the catalog
+// requires no sync floor on this lane.
+inline __aicore__ bool scheduler_owned_token_blocks_mix_arrival(const SchedulerLocalState *local, uint32_t rank) {
+    for (const auto &token : local->execution_tokens)
+        if (token.state == SchedulerDispatchSlotState::EXECUTING ||
+            (token.state != SchedulerDispatchSlotState::FREE && token.rank < rank))
+            return true;
+    return false;
+}
+
 // The private catalog cursor cannot cross unissued work or an unresolved
 // Graph control predecessor. Already assigned pure cohorts remain in W.
 static inline __aicore__ bool scheduler_mix_lane_order_ready(
@@ -77,12 +96,7 @@ static inline __aicore__ bool scheduler_mix_lane_order_ready(
     SchedulerScalarScope function_scope(local, SchedPhaseKind::ScalarMixLaneOrderReady, ref);
     *ready = false;
     const auto &row = scheduler_order_for(base, local, ref);
-    // ARRIVED commits this lane to MIX. An earlier owned block can still be
-    // needed by a peer even when the catalog requires no sync floor here.
-    for (const auto &source : local->execution_tokens)
-        if (source.state == SchedulerDispatchSlotState::EXECUTING ||
-            (source.state != SchedulerDispatchSlotState::FREE && source.rank < row.rank))
-            return true;
+    if (scheduler_owned_token_blocks_mix_arrival(local, row.rank)) return true;
     const auto required = row.required_floor[local->config.self_lane];
     local->observed_self_floor = 0;
     if (required != 0) {

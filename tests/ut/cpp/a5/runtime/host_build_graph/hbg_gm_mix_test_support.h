@@ -158,18 +158,22 @@ struct GmMixFixture {
             int64_t ref = SCHEDULER_TASK_REF_INVALID;
             if (!scheduler_issue_head(graph.graph(), base(), proxy, run(), &ref, &progress)) return false;
             if (ref != task_ref) return true;
-            if (!scheduler_cluster_mix_claim_head(graph.graph(), base(), proxy, run(), ref, &progress)) return false;
+            if (!scheduler_claim_for_build(graph.graph(), base(), proxy, run(), ref, &progress)) return false;
         }
-        const uint32_t previous = signals[cluster].armed_generation;
-        if (!scheduler_cluster_mix_progress_pending(graph.graph(), base(), proxy, run(), &progress)) return false;
-        const uint32_t generation = signals[cluster].armed_generation;
-        *published =
-            scheduler_cluster_mix_armed(generation) && previous != generation && signals[cluster].task_ref == task_ref;
+        uint32_t previous = 0;
+        for (const auto &group : signals[cluster].groups)
+            previous = std::max(previous, static_cast<uint32_t>(group.armed_generation));
+        if (!scheduler_progress_mix_publication(graph.graph(), base(), proxy, run(), &progress)) return false;
+        for (const auto &group : signals[cluster].groups) {
+            const uint32_t generation = group.armed_generation;
+            if (scheduler_cluster_mix_armed(generation) && generation > previous && group.task_ref == task_ref)
+                *published = true;
+        }
         return true;
     }
     bool ordinary_service(uint32_t worker, bool *progress, uint64_t profiling = 0) {
         *progress = false;
-        return scheduler_service_groups(graph.graph(), base(), locals[worker], run(), profiling, progress);
+        return scheduler_progress_mix_groups(graph.graph(), base(), locals[worker], run(), profiling, progress);
     }
     bool prepare_calls() { return storage.prepare_calls(graph.graph()); }
     bool claim_ordinary(uint64_t task, uint32_t worker) {
@@ -213,7 +217,7 @@ struct GmMixFixture {
     template <bool RecordProtocol = true>
     bool fill(uint32_t worker) {
         bool failed = false;
-        scheduler_fill_own_slots<RecordProtocol>(graph.graph(), base(), locals[worker], run(), 0, &failed);
+        scheduler_find_local_execution<RecordProtocol>(graph.graph(), base(), locals[worker], run(), 0, &failed);
         return !failed;
     }
     bool service_cooperative(uint32_t worker) {
@@ -221,11 +225,16 @@ struct GmMixFixture {
         return ordinary_service(worker, &progress);
     }
     bool begin(uint32_t worker, GmExecution *execution) {
-        auto *local = locals[worker];
         uint32_t slot = UINT32_MAX;
-        if (!hbg_test_find_eligible(local, &slot)) return false;
+        return hbg_test_find_eligible(locals[worker], &slot) && begin(worker, slot, execution);
+    }
+    bool begin(uint32_t worker, uint32_t slot, GmExecution *execution) {
+        auto *local = locals[worker];
+        if (slot >= SCHEDULER_LOCAL_EXECUTION_COUNT ||
+            local->execution_at(slot).state != SchedulerDispatchSlotState::READY)
+            return false;
         bool permit = false;
-        if (!scheduler_can_enter_execution(graph.graph(), base(), local, run(), slot, &permit)) return false;
+        if (!scheduler_check_entry_permit(graph.graph(), base(), local, run(), slot, &permit)) return false;
         if (!permit) return false;
         if (!hbg_test_begin_execution(local, slot)) return false;
         const auto index = local->execution_at(slot).prepared.execution_index;
@@ -249,7 +258,7 @@ struct GmMixFixture {
     template <bool RecordProtocol = true>
     bool complete(const GmExecution &execution, uint64_t profiling = 0) {
         auto *local = locals[execution.worker];
-        return scheduler_complete_own_slot<RecordProtocol>(
+        return scheduler_complete_lane_execution<RecordProtocol>(
             graph.graph(), base(), local, run(), execution.slot, profiling
         );
     }

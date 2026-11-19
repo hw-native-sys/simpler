@@ -112,6 +112,25 @@ chip_callable_table_length(const ChipCallable *callable, uint32_t max_func_id, u
     return true;
 }
 
+// `length` is the validated domain from chip_callable_table_length. The last child for
+// a func_id supplies both the executable address and its proof. A naked binary or a
+// descriptor that no longer matches its text leaves the function unknown.
+inline std::vector<CoreInputCacheProof>
+chip_callable_input_cache_proofs(const ChipCallable *callable, uint32_t length) {
+    std::vector<CoreInputCacheProof> proofs;
+    for (int32_t i = 0; i < callable->child_count(); ++i) {
+        const auto &child = callable->child(i);
+        const auto proof = child.input_cache_proof();
+        const bool valid = core_input_cache_proof_matches_text(proof, child.binary_data(), child.binary_size());
+        if (proofs.empty()) {
+            if (!valid) continue;
+            proofs.resize(length);
+        }
+        proofs[callable->child_func_id(i)] = valid ? proof : CoreInputCacheProof{};
+    }
+    return proofs;
+}
+
 /**
  * Fill the two func_id-indexed views of `callable` from `scratch`, a byte copy
  * of it whose children's resolved_addr_ already hold the address the dispatch

@@ -64,6 +64,13 @@ def test_explicit_identity_survives_without_deriving_block_from_record_index(tmp
     assert all(r["order_key"] == 0 and r["group_seq"] is None and r["executed"] is True for r in rows)
 
 
+def test_l3_preserves_historical_ordinary_source_ids(tmp_path):
+    raw = capture(3)
+    for record in raw["aicore_execution_identities"]["records"]:
+        record["pending_slot"] += 2
+    assert [row["pending_slot"] for row in read(tmp_path, raw)] == [2, 3]
+
+
 def test_historical_capture_does_not_acquire_invented_identity(tmp_path):
     raw = capture()
     del raw["aicore_execution_identities"]
@@ -181,7 +188,8 @@ def test_same_task_worker_or_slot_cannot_carry_inconsistent_identity(tmp_path, f
 
 
 @pytest.mark.parametrize("mask", (3, 5, 6, 7))
-def test_each_mix_mask_keeps_fixed_lane_and_group_identity(tmp_path, mask):
+@pytest.mark.parametrize("bank", (4, 5))
+def test_each_mix_mask_keeps_fixed_lane_and_group_identity(tmp_path, mask, bank):
     builder = Capture(runtime="host_build_graph", core_types=("aic", "aiv", "aiv"), scheduler_producer="aicore")
     records = []
     for slot in range(3):
@@ -197,7 +205,7 @@ def test_each_mix_mask_keeps_fixed_lane_and_group_identity(tmp_path, mask):
                 block_idx=0,
                 block_num=1,
                 subtask_slot=slot,
-                pending_slot=4,
+                pending_slot=bank,
                 order_key=0,
                 group_seq=9,
                 group_kind=2,
@@ -212,7 +220,7 @@ def test_each_mix_mask_keeps_fixed_lane_and_group_identity(tmp_path, mask):
     )
     rows = read(tmp_path, raw)
     assert {r["subtask_slot"] for r in rows} == {slot for slot in range(3) if mask & (1 << slot)}
-    assert all(r["group_seq"] == 9 for r in rows)
+    assert all(r["group_seq"] == 9 and r["pending_slot"] == bank for r in rows)
     vector = next(r for r in records if r["subtask_slot"] != 0)
     vector["cluster_lane"] = 3 - vector["cluster_lane"]
     with pytest.raises(ValueError, match="identity"):
@@ -249,8 +257,7 @@ def test_null_identity_section_is_not_an_absent_historical_section(tmp_path):
         read(tmp_path, raw)
 
 
-@pytest.mark.parametrize("mutation", ("cluster", "sequence", "missing_one", "missing_all"))
-def test_same_mix_block_cannot_join_different_groups(tmp_path, mutation):
+def two_lane_mix_capture():
     raw = capture()
     records = raw["aicore_execution_identities"]["records"]
     for index, record in enumerate(records):
@@ -266,17 +273,28 @@ def test_same_mix_block_cannot_join_different_groups(tmp_path, mutation):
         )
         raw["aicore_tasks"][index][0] = index
         raw["scheduler_tasks"]["records"][index][0] = index
+    return raw
+
+
+@pytest.mark.parametrize("mutation", ("cluster", "sequence", "bank", "missing_one", "missing_all"))
+def test_same_mix_block_cannot_join_different_groups(tmp_path, mutation):
+    raw = two_lane_mix_capture()
+    records = raw["aicore_execution_identities"]["records"]
     read(tmp_path, raw)
     if mutation == "cluster":
         records[1]["cluster_index"] = 1
     elif mutation == "sequence":
         records[1]["group_seq"] = 9
+    elif mutation == "bank":
+        records[1]["pending_slot"] = 5
     elif mutation == "missing_one":
         records[1]["group_seq"] = None
     else:
         for record in records:
             record["group_seq"] = None
-    expected = "Mix block spans different groups" if mutation in ("cluster", "sequence") else "group source mismatch"
+    expected = (
+        "Mix block spans different groups" if mutation in ("cluster", "sequence", "bank") else "group source mismatch"
+    )
     with pytest.raises(ValueError, match=expected):
         read(tmp_path, raw)
 
@@ -291,22 +309,8 @@ def test_multiblock_self_execution_requires_a_stable_rank(tmp_path):
 
 @pytest.mark.parametrize("fault", (None, "source", "ordered", "generation"))
 def test_ordinary_cluster_identity_requires_its_explicit_source(tmp_path, fault):
-    raw = capture()
+    raw = two_lane_mix_capture()
     records = raw["aicore_execution_identities"]["records"]
-    for index, record in enumerate(records):
-        record.update(
-            core_id=index,
-            block_idx=0,
-            block_num=1,
-            subtask_slot=index,
-            cluster_lane=index,
-            order_key=0,
-            group_seq=7,
-            group_kind=2,
-            pending_slot=4,
-        )
-        raw["aicore_tasks"][index][0] = index
-        raw["scheduler_tasks"]["records"][index][0] = index
     if fault is None:
         assert all(row["group_kind"] == 2 and row["order_key"] == 0 for row in read(tmp_path, raw))
         return
@@ -318,6 +322,16 @@ def test_ordinary_cluster_identity_requires_its_explicit_source(tmp_path, fault)
         records[0]["group_seq"] = 8
     with pytest.raises(ValueError, match="identity"):
         read(tmp_path, raw)
+
+
+@pytest.mark.parametrize("kind,rank", ((1, 0), (2, None)))
+def test_unversioned_group_members_can_use_different_local_pending_slots(tmp_path, kind, rank):
+    raw = two_lane_mix_capture()
+    section = raw["aicore_execution_identities"]
+    del section["version"]
+    for slot, record in enumerate(section["records"]):
+        record.update(group_kind=kind, order_key=rank, pending_slot=slot)
+    assert [row["pending_slot"] for row in read(tmp_path, raw)] == [0, 1]
 
 
 @pytest.mark.parametrize("kind,rank,seq", ((0, None, None), (1, 0, 2), (2, None, 3)))

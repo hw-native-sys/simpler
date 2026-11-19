@@ -89,7 +89,10 @@ size_t Runtime::get_prebuilt_runtime_offset() const { return dev.prebuilt_runtim
 // The callable this runtime is stamped with. The orchestration .so and its entry
 // symbols stay in the platform's `CallableArtifacts`, because host_build_graph
 // resolves and runs them on the host.
-void Runtime::set_active_callable_id(int32_t callable_id) { host_.active_callable_id_ = callable_id; }
+void Runtime::set_active_callable_id(int32_t callable_id) {
+    if (host_.active_callable_id_ != callable_id) host_.callable_input_cache_proofs_ = nullptr;
+    host_.active_callable_id_ = callable_id;
+}
 
 int32_t Runtime::get_active_callable_id() const { return host_.active_callable_id_; }
 
@@ -110,11 +113,25 @@ CoreAsyncCapability Runtime::get_function_async_capability(int func_id) const {
     return capability;
 }
 
+void bind_registered_input_cache_proofs(Runtime &runtime, const std::vector<CoreInputCacheProof> &proofs) {
+    runtime.host_.callable_input_cache_proofs_ =
+        !proofs.empty() && proofs.size() == runtime.callable_table_len() ? proofs.data() : nullptr;
+}
+
+const CoreInputCacheProof *Runtime::get_function_input_cache_proof(int func_id) const {
+    if (host_.callable_input_cache_proofs_ == nullptr || get_function_bin_addr(func_id) == 0) return nullptr;
+    const auto &proof = host_.callable_input_cache_proofs_[func_id];
+    return proof.mode == CoreInputCacheMode::UNKNOWN ? nullptr : &proof;
+}
+
 bool Runtime::bind_callable_async_capabilities(const HostApi &api) {
     host_.callable_async_capabilities_ = nullptr;
     if (dev.callable_table_len_ == 0) return true;
     const auto capabilities = api.get_callable_async_capabilities(get_active_callable_id());
-    if (!capabilities || capabilities->data == nullptr || capabilities->count != dev.callable_table_len_) return false;
+    if (!capabilities || capabilities->data == nullptr || capabilities->count != dev.callable_table_len_) {
+        host_.callable_input_cache_proofs_ = nullptr;
+        return false;
+    }
     host_.callable_async_capabilities_ = capabilities->data;
     return true;
 }
@@ -128,6 +145,7 @@ void Runtime::set_callable_tables(
     }
     host_.callable_table_host_ = host_view;
     host_.callable_async_capabilities_ = nullptr;
+    host_.callable_input_cache_proofs_ = nullptr;
     host_.callable_entry_table_addr_ = entry_table_addr;
     dev.callable_table_addr_ = object_table_addr;
     dev.callable_table_len_ = len;
@@ -136,6 +154,7 @@ void Runtime::set_callable_tables(
 void Runtime::clear_callable_tables() {
     host_.callable_table_host_ = nullptr;
     host_.callable_async_capabilities_ = nullptr;
+    host_.callable_input_cache_proofs_ = nullptr;
     host_.callable_entry_table_addr_ = 0;
     dev.callable_table_addr_ = 0;
     dev.callable_table_len_ = 0;

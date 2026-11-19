@@ -110,7 +110,8 @@ static inline __aicore__ void scheduler_protocol_execution_permit(
     const uint32_t required = order.required_floor[local->config.self_lane];
     const uint32_t observed = mix ? self_floor : mix_floor;
     scheduler_protocol_observe_record(record);
-    if ((record->flags & SCHEDULER_PROTOCOL_PAYLOAD_PUBLISHED) == 0 ||
+    if ((mix && source_index < SCHEDULER_CLUSTER_MIX_EXECUTION) ||
+        (record->flags & SCHEDULER_PROTOCOL_PAYLOAD_PUBLISHED) == 0 ||
         !scheduler_protocol_execution_matches(local, record, slot, source_index) || observed < required ||
         (required == 0 && observed != 0) || (mix ? mix_floor : self_floor) != 0 || observed > layout->task_count) {
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
@@ -118,7 +119,7 @@ static inline __aicore__ void scheduler_protocol_execution_permit(
     }
     if (!scheduler_protocol_stamp(base, local, layout, &record->permit)) return;
     record->order_key = order.rank;
-    record->group_seq = mix ? local->cluster_mix.generation : 0;
+    record->group_seq = mix ? local->mix_groups[source_index - SCHEDULER_CLUSTER_MIX_EXECUTION].generation : 0;
     record->observed_mix_floor = mix_floor;
     record->observed_self_floor = self_floor;
     record->flags |= (scheduler_task_requires_sync_start(meta->flags) ? SCHEDULER_PROTOCOL_COOPERATIVE : 0) |

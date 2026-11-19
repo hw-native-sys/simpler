@@ -379,18 +379,17 @@ completion gate is the readiness proof for executable and control consumers.
 ## 6. Bootstrap and Dependencies
 
 Host validates cooperative task shapes and residency limits before publishing
-their epoch, member count and INITIALIZED admission state. After READY acquire,
+the epoch, participation masks and cooperative ranks. After READY acquire,
 each worker validates its context, graph view, epoch, prepared layout, immutable
 engine catalog and topology. No Graph child argument binding runs on the device:
 Host has already published those arguments and Calls.
 
 Each cluster has a run-initialized 128-byte atomic-only GM gate. When the graph
-uses MIX, its AIC clears the local signal and publishes INIT; AIV lanes confirm
-INIT before touching that signal. Without MIX, Host seeds INIT and the AIC does
-not overwrite it. Workers initialize two FREE local slots, service bounded
-control-node scans and prepare their first executions. Each AIV publishes its
-DONE bit once; after its own successful first fill, the AIC confirms both bits
-and contributes three workers to the global bootstrap count. The final cluster
+uses MIX, AIV0 clears its cluster's two SSBUF banks and publishes INIT. AIC
+and AIV1 confirm INIT before accessing the banks. Host seeds INIT for graphs
+without MIX. Each worker services bounded control-node scans and prepares its
+first execution. AIC and AIV1 then publish their respective DONE bits. Once
+AIV0 confirms both bits, it credits all three workers. The final cluster
 publishes `bootstrap_complete`; AICPU then opens the DMB launch gate. A failed
 lane contributes no success, and no kernel may enter before this gate opens.
 
@@ -398,7 +397,7 @@ ENTER, EXIT and inline control nodes use bounded scans rather than a ready inbox
 A worker reads each producer's canonical gate and advances only a positive fanin
 prefix. When every producer is DONE, a unique CAS changes the control node's
 completion gate from its initial state to its completed state. Only the winner
-adds a pending logical completion. There is no control-side fanout/remaining or
+reports the logical completion. There is no control-side fanout/remaining or
 wake-list notification path in this protocol.
 
 ## 7. Discovery, Dispatch and Completion
@@ -410,45 +409,48 @@ The Host builds a 16-byte `SchedulerExecutionPlan` for every node and one
 names its function, epoch, node, block, lane and complete argument vector.
 Tensor arguments are GM descriptor addresses; scalar arguments are value bits.
 `args[48]` and `args[49]` name the execution's 128-byte binding, containing its
-LocalContext and GlobalContext on separate cache lines. Calls and bindings have
-execution lifetime, independently of the worker's two private dispatch slots.
+LocalContext and GlobalContext on separate cache lines. The 50 argument words
+end at byte 464. Three 16-byte cache-line spans fill bytes 464–511, which
+were alignment padding. The Call stride remains 512 bytes. Calls and bindings have
+execution lifetime and remain valid through retirement of the owning slot.
 
-Each execution has a 128-byte atomic-control sector. Phase and fixed owner
-share one atomic state word. Fresh Calls start BUILT. A successful
-block ticket and BUILT-to-CLAIMED CAS grant one worker the execution token;
-Call acquisition observes and validates the immutable Call and binding. The
+Each execution has a 128-byte control record initialized to BUILT. Its state
+identifies the fixed owner and the execution phase. An ordinary block claim
+fixes the worker. For MIX, the proxy's block claim and stable SSBUF generation
+identify one worker per active lane. Each worker validates its Call and binding. The
 claim alone grants no permission to consume business input data.
 Call acquisition completes in the same bounded invocation; it has no pending-build
 result or separate binding-ready bit. Cooperative preparation requires an explicit
 lane and rejects predicates; ordinary execution tokens retain predicate evaluation.
 
 The Host orders tasks by Kahn generation, descending bottom level, then stable
-node identity. The AIC/MIX and AIV catalogs project that order into two shared
-issuance heads. A head advances after every block has an owner; cooperative
-work also requires its member claim seal. Cross-engine issuance predecessors
-must have supplied their blocks before the consumer can claim space. Data
-completion dependencies still gate execution independently of issuance order.
+node identity. The pure-AIC catalog and the AIV catalog (which includes MIX)
+project that order onto the two engines. Each worker advances its private
+cursor after confirming that the current task has supplied all its blocks.
+Cross-engine predecessors must also have closed their supply before a consumer
+can claim a block. The producer's completion gate separately controls when
+the consumer can execute. For a flat executable task without a predicate,
+the last valid block claim publishes `claim_seal == logical_block_num`.
+This seal proves all ordinary or MIX blocks have owners, so the supply check
+can advance the catalog without loading DONE. Native Graph nodes and
+predicated tasks still check logical completion, since they can finish without
+issuing every block. The consumer checks data dependencies before execution.
 
-A core has four execution-token positions and two 40-byte dispatch slots.
-Dispatch and protocol publication pass the existing core-local slot index directly;
-ownership remains in the prepared execution state.
-A token may remain WAIT_FANIN while caching a confirmed positive producer prefix.
-Its private phases are EMPTY, TICKETED and WAIT_FANIN; acquisition yields no
-intermediate phase to another scheduler iteration.
-It owns a concrete execution but occupies no business slot. Each core owns at
-most one ordinary block of the same task. A full token window retains all four
-responsibilities and revisits their dependencies; no other core can reclaim a
-blocked execution. Ownership remains fixed through return or explicit failure.
-An unmet deferred completion condition is separate from these tokens: the
-kernel returns and frees its dispatch slot while CHECK revisits the condition
-in the shared async directory.
+Each core has two ordinary self-claim slots and two MIX member slots, one per
+SSBUF bank. Each ordinary slot can hold one block, and a core can hold at most
+one ordinary block of the same task. A successful claim fixes the ordinary
+slot and owner. A MIX member accepts a descriptor into its bank's slot. Both
+kinds of slot retain their identity from preparation through physical return
+and retirement. A blocked slot caches its confirmed fanin prefix while the
+scheduler services other slots and asynchronous work.
 
-After fanin completes, a token transfers into a FREE slot as READY. Graph
-argument descriptors are observed, and predicates are evaluated under their
-supported single-block/lane shape. A false predicate skips the function while
-retaining normal execution-return obligations. A direct execution path or the
-local ready mask/head selects the next slot. The final shared admission,
-cluster/MIX and epoch checks remain required before READY becomes EXECUTING.
+Once fanin completes, the worker publishes the payload in the same slot.
+A false predicate skips the function and retains its return obligations.
+Direct dispatch passes the selected slot index to the executor. Queued
+dispatch selects a slot from the local ready set. Both paths check the
+applicable epoch and cooperative entry conditions before invoking the Call.
+When a kernel returns with an outstanding deferred condition, CHECK follows
+the condition in the shared async directory.
 
 ### 7.2 Business Execution and Cooperative Work
 
@@ -456,16 +458,23 @@ The executor calls the prepared function with `Call.args`. The kernel receives
 GM arguments and contexts, never a private slot or admission-state address.
 Before/after args-dump boundaries coordinate with AICPU's bounded dump service.
 Async input observation occurs on the actual consumer after dependencies settle.
+The Host aligns the proven access ranges to cache lines and merges overlaps.
+The consumer issues at most two single-line DCCI operations followed by one
+barrier. A larger footprint or an unproven access uses full-cache maintenance.
+A kernel proven to have no such accesses skips both operations.
 
-MIX and sync-start work use the ordered cooperative admission records and
-explicit physical membership. Group reservations bind each participant to its
-own prepared execution. Reservation, preparation, arm and final permission are
-separate ownership boundaries. A busy worker retains its existing obligation;
-background discovery cannot displace an admitted participant or manufacture a
-release. Cluster signaling and cache publication remain part of group ownership.
+AIV0 claims the MIX block and release-publishes its task, block, rank and lane
+mask in a cluster SSBUF bank. Each named worker accepts a stable generation
+once and prepares its own Call. Execution still requires fanin, ordering and
+the applicable sync-start permit. The bank can be reused after the accountant
+has observed every active member's matching FIN and acknowledged the generation.
+The proxy records its latest claim, the last group published to each bank,
+and an unpublished cancellation. The two bank identities survive a third claim. Each
+member records CLAIMED on receipt, ENTERED at the kernel boundary and RETURNED
+on physical return. Aborting an unpublished group leaves its members BUILT.
 
-After the kernel returns, its async registration is sealed. The execution's
-control moves from CLAIMED to RETURNED under its fixed-owner proof. The
+After the kernel returns, its async registration is sealed. A MIX member
+records its physical return even when post-call sealing fails. The
 real physical return contributes once to the task's canonical completion gate;
 inactive MIX resource lanes contribute no execution. Trace/group retirement
 finishes under its existing ownership before the slot is safely reused.

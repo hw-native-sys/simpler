@@ -847,11 +847,11 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         first_stream = false;
     }
     if (!first_stream) scheduler_json << "\n    ";
-    scheduler_json << "],\n    \"prepared_calls\":{\"schema\":\"hbg-prepared-calls\",\"run_epoch\":"
-                   << swimlane_run_epoch
-                   << ",\"source\":\"host\",\"columns\":[\"execution_index\",\"node_ref\",\"task_id\","
-                      "\"block_idx\",\"subtask_slot\",\"owner\",\"phase\","
-                      "\"raw_phase\",\"return_inferred\",\"completion_state\"],\"records\":[";
+    scheduler_json
+        << "],\n    \"prepared_calls\":{\"schema\":\"hbg-prepared-calls\",\"run_epoch\":" << swimlane_run_epoch
+        << ",\"source\":\"host\",\"columns\":[\"execution_index\",\"node_ref\",\"task_id\","
+           "\"block_idx\",\"subtask_slot\",\"owner\",\"phase\","
+           "\"raw_phase\",\"return_inferred\",\"completion_state\",\"mix_owned\",\"mix_kernel_entered\"],\"records\":[";
     const auto &prepared =
         owner.layout.prepared_layout_offset == 0 ?
             owner.layout.prepared :
@@ -864,7 +864,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
     for (uint64_t index = 0; index < prepared.execution_count; ++index) {
         const uint64_t state = prepared_controls[index].state;
         const auto raw_phase = scheduler_prepared_phase(state);
-        if (raw_phase < SchedulerPreparedPhase::BUILT || raw_phase > SchedulerPreparedPhase::GROUP_ARMED) continue;
+        if (raw_phase < SchedulerPreparedPhase::BUILT || raw_phase > SchedulerPreparedPhase::ENTERED) continue;
         const auto &call = calls[index];
         const uint32_t executor = scheduler_prepared_owner(state);
         if (call.execution_index != index || call.run_epoch != swimlane_run_epoch || call.task_ref < 0 ||
@@ -874,9 +874,8 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
             return false;
         }
         const uint64_t completion = task_controls[call.task_ref].completion_state;
-        const bool inferred = scheduler_prepared_retirement_inferred(
-            state, prepared, index, call, execution_plans[call.task_ref], completion
-        );
+        const auto &plan = execution_plans[call.task_ref];
+        const bool inferred = scheduler_prepared_retirement_inferred(state, prepared, index, call, plan, completion);
         const auto phase = inferred ? SchedulerPreparedPhase::RETURNED : raw_phase;
         if (!first_call) scheduler_json << ',';
         scheduler_json << '[' << index << ',' << call.task_ref << ',' << public_id(call.task_ref) << ','
@@ -884,8 +883,29 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         if (executor == UINT32_MAX) scheduler_json << "null";
         else scheduler_json << executor;
         scheduler_json << ',' << static_cast<unsigned>(phase) << ',' << static_cast<unsigned>(raw_phase) << ','
-                       << (inferred ? "true" : "false") << ',' << completion << ']';
+                       << (inferred ? "true" : "false") << ',' << completion << ','
+                       << ((state & SCHEDULER_PREPARED_MIX_OWNED) != 0 ? "true" : "false") << ',';
+        if (plan.active_lane_count > 1)
+            scheduler_json << (scheduler_prepared_mix_kernel_entered(state) ? "true" : "false");
+        else scheduler_json << "null";
+        scheduler_json << ']';
         first_call = false;
+    }
+    scheduler_json
+        << "]},\n    \"mix_proxies\":{\"run_epoch\":" << swimlane_run_epoch
+        << ",\"columns\":[\"worker\",\"physical_core_id\",\"cluster\",\"bank\",\"node_ref\",\"task_id\",\"block_idx\","
+           "\"phase\"],\"records\":[";
+    bool first_proxy = true;
+    for (uint64_t worker = 0; worker < active_workers; ++worker) {
+        const auto &context = contexts[worker];
+        scheduler_visit_mix_proxy_records(context, [&](int32_t bank, uint64_t state) {
+            const uint32_t ref = scheduler_mix_proxy_task_ref(state);
+            if (!first_proxy) scheduler_json << ',';
+            scheduler_json << '[' << worker << ',' << context.physical_core_id << ',' << context.cluster_index << ','
+                           << bank << ',' << ref << ',' << public_id(ref) << ',' << scheduler_mix_proxy_block_idx(state)
+                           << ",\"" << scheduler_mix_proxy_phase_name(scheduler_mix_proxy_phase(state)) << "\"]";
+            first_proxy = false;
+        });
     }
     scheduler_json << "]}\n  }";
     const std::string scheduler_payload = scheduler_json.str();
@@ -1331,6 +1351,7 @@ bool prepare_scheduler_calls(
     }
     const auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(host_base, layout.task_metadata_offset);
     uint64_t prepared_count = 0;
+    uint64_t skip_cache = 0, range_cache = 0, full_cache = 0;
     for (uint64_t ref = 0; ref < layout.task_count; ++ref) {
         const auto &meta = metadata[ref];
         if (!scheduler_task_is_executable(meta.flags) || scheduler_task_is_inline(meta.flags)) continue;
@@ -1341,6 +1362,7 @@ bool prepare_scheduler_calls(
                     runtime->get_function_bin_addr(meta.kernel_ids[lane]), address_space
                 );
         uint64_t tensors_address = 0;
+        const void *bound_tensors = nullptr;
         const uint64_t *scalars = nullptr;
         uint32_t tensor_count = 0, scalar_count = 0;
         const auto *binding = native_plan.instances.empty() ? nullptr : &native_plan.bindings[ref];
@@ -1349,7 +1371,10 @@ bool prepare_scheduler_calls(
             const auto &child = native_plan.definitions[instance.definition_index].children[binding->source_index];
             tensor_count = child.tensor_count;
             scalar_count = child.scalar_count;
-            if (tensor_count != 0) tensors_address = instance.args_base + child.tensors_offset;
+            if (tensor_count != 0) {
+                tensors_address = instance.args_base + child.tensors_offset;
+                bound_tensors = instance_arguments[binding->instance_index] + child.tensors_offset;
+            }
             if (scalar_count != 0)
                 scalars = reinterpret_cast<const uint64_t *>(
                     instance_arguments[binding->instance_index] + child.scalars_offset
@@ -1361,6 +1386,7 @@ bool prepare_scheduler_calls(
             if (payload.tensor_count < 0 || payload.scalar_count < 0) return false;
             tensor_count = static_cast<uint32_t>(payload.tensor_count);
             scalar_count = static_cast<uint32_t>(payload.scalar_count);
+            bound_tensors = payload.tensor_data();
             uint64_t scalars_address = 0;
             if (!image_address(
                     payload.tensor_data(), uint64_t{tensor_count} * TASK_IMAGE_TENSOR_STRIDE, tensors_address
@@ -1369,15 +1395,36 @@ bool prepare_scheduler_calls(
                 return false;
             scalars = payload.scalar_data();
         }
+        SchedulerHostInputCache input_cache[SUBTASK_SLOT_COUNT]{};
+        const bool may_read_async = (meta.flags & SCHEDULER_TASK_ASYNC_INPUT) != 0;
+        if (may_read_async) {
+            for (uint8_t lane = 0; lane < SUBTASK_SLOT_COUNT; ++lane) {
+                if (!meta.active_mask.has(static_cast<SubtaskSlot>(lane))) continue;
+                input_cache[lane] = scheduler_bind_input_cache(
+                    runtime->get_function_input_cache_proof(meta.kernel_ids[lane]), bound_tensors, tensor_count,
+                    static_cast<SubtaskSlot>(lane)
+                );
+                const uint8_t count = input_cache[lane].count;
+                if (count == SCHEDULER_INPUT_CACHE_SKIP) {
+                    skip_cache += meta.logical_block_num;
+                } else {
+                    (count == SCHEDULER_INPUT_CACHE_FULL ? full_cache : range_cache) += meta.logical_block_num;
+                }
+            }
+        }
         if (!scheduler_prepare_host_calls(
                 host_base, layout, device_base, static_cast<int64_t>(ref), functions, tensors_address, scalars,
-                tensor_count, scalar_count
+                tensor_count, scalar_count, may_read_async ? input_cache : nullptr
             )) {
             LOG_ERROR("A5 HBG: Host Call preparation failed node=%" PRIu64, ref);
             return false;
         }
         prepared_count += static_cast<uint64_t>(meta.logical_block_num) * meta.active_mask.count();
     }
+    LOG_TIMING(
+        "A5 HBG: async consumer cache plans skip=%" PRIu64 " range=%" PRIu64 " full=%" PRIu64, skip_cache, range_cache,
+        full_cache
+    );
     return prepared_count == layout.prepared.execution_count;
 }
 

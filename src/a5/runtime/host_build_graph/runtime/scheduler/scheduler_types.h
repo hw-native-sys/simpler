@@ -46,9 +46,11 @@ inline constexpr uint64_t SCHEDULER_STATE_ALIGNMENT = 64;
 // it is not a scalar ordering guarantee. See the data-layout contract.
 inline constexpr uint64_t SCHEDULER_GM_ATOMIC_SECTOR_BYTES = 128;
 inline constexpr uint64_t SCHEDULER_WORKER_CAPACITY = 108;
-inline constexpr uint32_t SCHEDULER_EXECUTION_TOKEN_COUNT = 1;
+inline constexpr uint32_t SCHEDULER_EXECUTION_TOKEN_COUNT = 2;
 inline constexpr uint32_t SCHEDULER_CLUSTER_MIX_EXECUTION = SCHEDULER_EXECUTION_TOKEN_COUNT;
-inline constexpr uint32_t SCHEDULER_LOCAL_EXECUTION_COUNT = SCHEDULER_CLUSTER_MIX_EXECUTION + 1;
+inline constexpr uint32_t SCHEDULER_MIX_MEMBER_COUNT = 2;
+inline constexpr uint32_t SCHEDULER_LOCAL_EXECUTION_COUNT =
+    SCHEDULER_CLUSTER_MIX_EXECUTION + SCHEDULER_MIX_MEMBER_COUNT;
 // MIX keeps the same trace identity in both window-depth builds.
 inline constexpr uint32_t SCHEDULER_TRACE_SELF_CAPACITY = 4;
 static_assert(SCHEDULER_EXECUTION_TOKEN_COUNT <= SCHEDULER_TRACE_SELF_CAPACITY);
@@ -338,15 +340,6 @@ inline __aicore__ bool scheduler_task_requires_admission(const SchedulerTaskMeta
     return scheduler_task_requires_admission(metadata.flags);
 }
 
-inline __aicore__ bool scheduler_task_uses_distributed_blocks(uint8_t flags, uint32_t blocks) {
-    return scheduler_task_is_executable(flags) && !scheduler_task_is_inline(flags) && !scheduler_task_is_mix(flags) &&
-           blocks > 1 && !scheduler_task_requires_admission(flags);
-}
-
-inline __aicore__ bool scheduler_task_uses_distributed_blocks(const SchedulerTaskMetadata &metadata) {
-    return scheduler_task_uses_distributed_blocks(metadata.flags, metadata.logical_block_num);
-}
-
 // The immutable total distinguishes a live completed gate from uninitialized
 // storage. Remaining computation and async debt are the only readiness source.
 inline constexpr uint64_t SCHEDULER_COMPLETION_RETURN_UNIT = (UINT64_C(1) << 32) + 1;
@@ -591,6 +584,38 @@ struct alignas(64) AicpuThreadLifecycleTrace {
     uint64_t exit_wait_end_cycles;
 };
 
+enum class SchedulerMixProxyPhase : uint8_t { IDLE = 0, PENDING = 1, PUBLISHED = 2, CANCELLED = 3 };
+
+// A valid MIX ticket names a 32-bit graph ref and a block within a 16-bit plan.
+inline __aicore__ constexpr uint64_t
+scheduler_mix_proxy_state(SchedulerMixProxyPhase phase, uint32_t task_ref, uint32_t block_idx) {
+    return phase == SchedulerMixProxyPhase::IDLE ?
+               0 :
+               (static_cast<uint64_t>(task_ref) << 32) | (static_cast<uint64_t>(block_idx) << 2) |
+                   static_cast<uint64_t>(phase);
+}
+
+inline __aicore__ constexpr SchedulerMixProxyPhase scheduler_mix_proxy_phase(uint64_t state) {
+    return static_cast<SchedulerMixProxyPhase>(state & 3);
+}
+
+inline __aicore__ constexpr uint32_t scheduler_mix_proxy_task_ref(uint64_t state) {
+    return static_cast<uint32_t>(state >> 32);
+}
+
+inline __aicore__ constexpr uint32_t scheduler_mix_proxy_block_idx(uint64_t state) {
+    return static_cast<uint32_t>(state) >> 2;
+}
+
+inline constexpr uint64_t
+scheduler_mix_proxy_snapshot(uint64_t acquired, uint64_t published0, uint64_t published1, uint64_t cancelled) {
+    if (acquired == 0) return 0;
+    const uint64_t identity = acquired & ~UINT64_C(3);
+    const uint64_t published = identity | static_cast<uint64_t>(SchedulerMixProxyPhase::PUBLISHED);
+    if (published == published0 || published == published1) return published;
+    return cancelled == (identity | static_cast<uint64_t>(SchedulerMixProxyPhase::CANCELLED)) ? cancelled : acquired;
+}
+
 struct alignas(64) SchedulerWorkerContext {
     // READY publishes the configuration prefix used by peer routing.
     int32_t core_type;
@@ -627,10 +652,13 @@ struct alignas(64) SchedulerWorkerContext {
     uint64_t done_notifications_offset;
     uint64_t completion_counters_offset;
 
-    // Only this worker writes its bootstrap diagnostic line.
+    // After READY only this worker writes this line, exclusively by bypass stores.
     alignas(64) uint64_t bootstrap_task_count;
     uint64_t bootstrap_start_cycles;
     uint64_t target_bootstrap_end_cycles;
+    volatile uint64_t mix_proxy_acquired;
+    volatile uint64_t mix_proxy_published[SCHEDULER_MIX_MEMBER_COUNT];
+    volatile uint64_t mix_proxy_cancelled;
 };
 
 enum SchedulerExecutionIdentityFlags : uint32_t {
@@ -761,6 +789,36 @@ inline __aicore__ __gm__ T *scheduler_state_at(__gm__ void *base, uint64_t offse
 
 #if !defined(__CCE_AICORE__)
 #include <type_traits>
+// A bank retains its last publication through FIN. A third, unassigned ticket
+// may coexist with both banks when the proxy is waiting for a bank to retire.
+template <typename Visitor>
+inline void scheduler_visit_mix_proxy_records(const SchedulerWorkerContext &context, Visitor visit) {
+    static_assert(SCHEDULER_MIX_MEMBER_COUNT == 2);
+    const uint64_t acquired = __atomic_load_n(&context.mix_proxy_acquired, __ATOMIC_ACQUIRE);
+    uint64_t published[SCHEDULER_MIX_MEMBER_COUNT];
+    for (uint32_t bank = 0; bank < SCHEDULER_MIX_MEMBER_COUNT; ++bank)
+        published[bank] = __atomic_load_n(&context.mix_proxy_published[bank], __ATOMIC_ACQUIRE);
+    const uint64_t cancelled = __atomic_load_n(&context.mix_proxy_cancelled, __ATOMIC_ACQUIRE);
+    for (uint32_t bank = 0; bank < SCHEDULER_MIX_MEMBER_COUNT; ++bank)
+        if (published[bank] != 0) visit(static_cast<int32_t>(bank), published[bank]);
+    const uint64_t latest = scheduler_mix_proxy_snapshot(acquired, published[0], published[1], cancelled);
+    const auto phase = scheduler_mix_proxy_phase(latest);
+    if (phase == SchedulerMixProxyPhase::PENDING || phase == SchedulerMixProxyPhase::CANCELLED) visit(-1, latest);
+}
+
+inline const char *scheduler_mix_proxy_phase_name(SchedulerMixProxyPhase phase) {
+    switch (phase) {
+    case SchedulerMixProxyPhase::PENDING:
+        return "pending";
+    case SchedulerMixProxyPhase::PUBLISHED:
+        return "published";
+    case SchedulerMixProxyPhase::CANCELLED:
+        return "cancelled";
+    default:
+        return "idle";
+    }
+}
+
 static_assert(std::is_standard_layout_v<AicoreSchedulerLayout> && std::is_trivially_copyable_v<AicoreSchedulerLayout>);
 static_assert(std::is_standard_layout_v<SchedulerIdleRecord> && std::is_trivially_copyable_v<SchedulerIdleRecord>);
 static_assert(

@@ -8,12 +8,46 @@
 # -----------------------------------------------------------------------------------------------------------
 """Async payload aliases and predicate-only inputs across ordinary and Graph tasks."""
 
+import json
+from importlib import import_module
+
 import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
 OUT_WORDS = 4224
+
+
+def _check_tail_cache_ranges(raw):
+    protocol = raw["aicore_protocol"]
+    # Scalar records carry the public task ID. Graph expansion adds ENTER/EXIT
+    # and child nodes, so even a top-level tail can have a different node ref.
+    public_ids = {node["node_ref"]: node["public_task_id"] for node in protocol.get("node_map", [])}
+    tails = {
+        public_ids[row["task_ref"]] if "node_map" in protocol else row["task_ref"]
+        for row in protocol["tasks"]
+        if row["kernel_ids"] == [65535, 3, 65535]
+    }
+    assert len(tails) == 2, "expected one AIV tail per instance"
+    observed = []
+    for stream in raw["scheduler_records"]["streams"]:
+        records = stream["records"]
+        for region in records:
+            if region["kind"] != "scalar_cache_observe" or region["task_id"] not in tails:
+                continue
+            assert stream["capture"]["dropped"] == 0 and not stream["capture"]["truncated"]
+            operations = [
+                event["kind"]
+                for event in records
+                if event["kind"].startswith("scalar_dcci_")
+                and region["start_cycles"] <= event["start_cycles"] <= event["end_cycles"] <= region["end_cycles"]
+            ]
+            # The reads at payload offsets 0 and 32 share a cache line. The
+            # stores at output offsets 68 and 72 touch a second, distinct line.
+            assert operations == ["scalar_dcci_single", "scalar_dcci_single"], operations
+            observed.append(region["task_id"])
+    assert sorted(observed) == sorted(tails), "both tails must execute targeted cache observation"
 
 
 @scene_test(level=2, runtime="host_build_graph")
@@ -40,6 +74,13 @@ class TestDeferWaitVisibility(SceneTestCase):
                 "signature": [D.INOUT] * 3 + [D.SCALAR] * 2,
             },
             {"func_id": 2, "source": "kernels/aiv/waiter.cpp", "core_type": "aiv", "signature": [D.IN]},
+            {
+                "func_id": 3,
+                "source": "kernels/aiv/tail.cpp",
+                "core_type": "aiv",
+                "signature": [D.IN, D.IN, D.OUT],
+                "async_capability": {"version": 1, "mode": "SYNCHRONOUS", "max_conditions": 0, "condition_types": 0},
+            },
         ],
     }
     CASES = [
@@ -52,6 +93,26 @@ class TestDeferWaitVisibility(SceneTestCase):
         for graph in (False, True)
         for target in (0, 1)
     ]
+
+    def test_run(self, st_platform, st_worker, request, monkeypatch):
+        if st_platform != "a5" or self._effective_enable_chip_swimlane(request) != 4:
+            return super().test_run(st_platform, st_worker, request)
+        scene = import_module("simpler_setup.scene_test")
+        build_prefix = scene.build_output_prefix
+        prefixes = []
+
+        def remember_prefix(label):
+            prefix = build_prefix(label)
+            prefixes.append(prefix)
+            return prefix
+
+        monkeypatch.setattr(scene, "build_output_prefix", remember_prefix)
+        super().test_run(st_platform, st_worker, request)
+        assert prefixes
+        for prefix in prefixes:
+            captures = list(prefix.rglob("chip_swimlane_records.json"))
+            assert len(captures) == 1, captures
+            _check_tail_cache_ranges(json.loads(captures[0].read_text()))
 
     def generate_args(self, params):
         return TaskArgsBuilder(

@@ -11,14 +11,82 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
+
+#include "core_input_cache_proof.h"
+#include "host_build_graph/tensor_data.h"
+
 #include "callable_entry.h"
 #include "scheduler/scheduler_async_layout.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
 
+struct SchedulerHostInputCache {
+    uint8_t count{SCHEDULER_INPUT_CACHE_FULL};
+    std::array<SchedulerInputCacheSpan, SCHEDULER_INPUT_CACHE_SPANS> spans{};
+};
+static_assert(std::extent_v<decltype(CoreInputCacheProof::ranges)> == SCHEDULER_INPUT_CACHE_SPANS);
+
+// Bind byte expressions from this lane's code to the current invocation's actual
+// tensor descriptors. All reads must resolve before any narrower plan is used.
+inline SchedulerHostInputCache scheduler_bind_input_cache(
+    const CoreInputCacheProof *proof, const void *tensors, uint32_t tensor_count, SubtaskSlot lane
+) {
+    const uint8_t core_mask = lane == SubtaskSlot::AIC ? CORE_INPUT_CACHE_AIC : CORE_INPUT_CACHE_AIV;
+    if (proof == nullptr || (proof->core_mask & core_mask) == 0 || proof->min_tensor_count > tensor_count) return {};
+    if (proof->mode == CoreInputCacheMode::NO_CACHED_READS) return {SCHEDULER_INPUT_CACHE_SKIP, {}};
+    if (proof->mode != CoreInputCacheMode::SCALAR_RANGES || proof->range_count == 0 ||
+        proof->range_count > SCHEDULER_INPUT_CACHE_SPANS || tensors == nullptr)
+        return {};
+
+    SchedulerHostInputCache plan{};
+    constexpr uint64_t line_mask = SCHEDULER_SCALAR_CACHE_LINE_BYTES - 1;
+    for (uint32_t i = 0; i < proof->range_count; ++i) {
+        const auto &read = proof->ranges[i];
+        if (read.tensor_arg >= tensor_count || read.byte_length == 0) return {};
+        const auto &tensor = *reinterpret_cast<const simpler::hbg::TensorData *>(
+            static_cast<const uint8_t *>(tensors) + read.tensor_arg * TASK_IMAGE_TENSOR_STRIDE
+        );
+        const uint64_t scale = read.start_offset_scale;
+        if (tensor.address_space != AddressSpace::DEVICE || tensor.buffer.addr == 0 ||
+            (scale != 0 && tensor.start_offset > (UINT64_MAX - read.byte_offset) / scale))
+            return {};
+        const uint64_t offset = tensor.start_offset * scale + read.byte_offset;
+        if (offset > tensor.buffer.size || read.byte_length > tensor.buffer.size - offset ||
+            tensor.buffer.size - 1 > UINT64_MAX - tensor.buffer.addr)
+            return {};
+        const uint64_t first = tensor.buffer.addr + offset;
+        const uint64_t last = first + (read.byte_length - 1);
+        plan.spans[i] = {first & ~line_mask, last & ~line_mask};
+    }
+    std::sort(plan.spans.begin(), plan.spans.begin() + proof->range_count, [](const auto &lhs, const auto &rhs) {
+        return lhs.first_line < rhs.first_line;
+    });
+    for (uint32_t i = 0; i < proof->range_count; ++i) {
+        const auto span = plan.spans[i];
+        if (plan.count != 0 && span.first_line <= plan.spans[plan.count - 1].last_line) {
+            auto &last = plan.spans[plan.count - 1].last_line;
+            last = std::max(last, span.last_line);
+        } else {
+            plan.spans[plan.count++] = span;
+        }
+    }
+    // Count the actual device operations after alignment and alias merging.
+    constexpr uint64_t max_targeted_lines = 2;
+    uint64_t lines = 0;
+    for (uint32_t i = 0; i < plan.count; ++i) {
+        const auto &span = plan.spans[i];
+        lines += 1 + (span.last_line - span.first_line) / SCHEDULER_SCALAR_CACHE_LINE_BYTES;
+    }
+    if (lines > max_targeted_lines) return {};
+    return plan;
+}
+
 inline bool scheduler_prepare_host_calls(
     void *base, const AicoreSchedulerLayout &layout, uint64_t device_base, int64_t task_ref, const uint64_t *functions,
-    uint64_t tensors_address, const uint64_t *scalars, uint32_t tensor_count, uint32_t scalar_count
+    uint64_t tensors_address, const uint64_t *scalars, uint32_t tensor_count, uint32_t scalar_count,
+    const SchedulerHostInputCache *input_cache = nullptr
 ) {
     if (base == nullptr || functions == nullptr || task_ref < 0 ||
         static_cast<uint64_t>(task_ref) >= layout.task_count || layout.prepared_layout_offset == 0 ||
@@ -86,6 +154,12 @@ inline bool scheduler_prepare_host_calls(
             call.block_idx = block;
             call.num_args = static_cast<uint16_t>(tensor_count + scalar_count);
             call.subtask_slot = lane;
+            if (input_cache != nullptr) {
+                const auto &plan = input_cache[lane];
+                call.input_cache_spans = plan.count;
+                if (plan.count != SCHEDULER_INPUT_CACHE_SKIP)
+                    std::copy_n(plan.spans.begin(), plan.count, call.input_cache_lines);
+            }
             for (uint32_t tensor = 0; tensor < tensor_count; ++tensor)
                 call.args[tensor] = tensors_address + uint64_t{tensor} * TASK_IMAGE_TENSOR_STRIDE;
             for (uint32_t scalar = 0; scalar < scalar_count; ++scalar)

@@ -17,8 +17,12 @@
 
 #include "host_build_graph/host/async_completion_plan.h"
 #include "host_build_graph/host/prepared_execution_plan.h"
+#include "host_build_graph/tensor.h"
 
 static_assert(sizeof(LocalContext) == 8);
+static_assert(offsetof(simpler::hbg::TensorData, buffer) + offsetof(PTOBufferHandle, addr) == 0);
+static_assert(offsetof(simpler::hbg::TensorData, start_offset) == 24);
+static_assert(SPMD_LOCAL_CONTEXT_INDEX == 48 && SPMD_GLOBAL_CONTEXT_INDEX == 49);
 
 namespace {
 
@@ -101,6 +105,103 @@ TEST_F(HbgPreparedBindings, MissingOrOverflowingObjectsCannotPublishCalls) {
     }
     const uint64_t aligned_max = UINT64_MAX & ~(uint64_t{alignof(CoreCallable)} - 1);
     EXPECT_EQ(scheduler_resolve_callable_entry(aligned_max, SchedulerCallableAddressSpace::DEVICE), 0u);
+}
+
+TEST_F(HbgPreparedBindings, ScalarReadsUseBoundViewsAndMergeAliasedCacheLines) {
+    std::array<simpler::hbg::Tensor, 2> tensors{};
+    for (auto &tensor : tensors) {
+        tensor.buffer.addr = kDeviceBase;
+        tensor.buffer.size = 256;
+        tensor.address_space = AddressSpace::DEVICE;
+    }
+    tensors[0].start_offset = 15;
+    tensors[1].start_offset = 16;
+    CoreInputCacheProof proof{};
+    constexpr auto lane = SubtaskSlot::AIV0;
+    proof.core_mask = CORE_INPUT_CACHE_AIV;
+    proof.mode = CoreInputCacheMode::SCALAR_RANGES;
+    proof.min_tensor_count = 2;
+    proof.range_count = 2;
+    proof.ranges[0] = {0, 4, 8, 0};
+    proof.ranges[1] = {1, 4, 4, 0};
+    auto plan = scheduler_bind_input_cache(&proof, tensors.data(), 2, lane);
+    ASSERT_EQ(plan.count, 1);
+    EXPECT_EQ(plan.spans[0].first_line, kDeviceBase);
+    EXPECT_EQ(plan.spans[0].last_line, kDeviceBase + 64);
+
+    tensors[1].buffer.size = 64;
+    EXPECT_EQ(scheduler_bind_input_cache(&proof, tensors.data(), 2, lane).count, SCHEDULER_INPUT_CACHE_FULL);
+    tensors[1].start_offset = UINT64_MAX;
+    EXPECT_EQ(scheduler_bind_input_cache(&proof, tensors.data(), 2, lane).count, SCHEDULER_INPUT_CACHE_FULL);
+    proof.mode = CoreInputCacheMode::NO_CACHED_READS;
+    proof.range_count = 0;
+    EXPECT_EQ(scheduler_bind_input_cache(&proof, tensors.data(), 1, lane).count, SCHEDULER_INPUT_CACHE_FULL);
+    EXPECT_EQ(scheduler_bind_input_cache(&proof, tensors.data(), 2, lane).count, SCHEDULER_INPUT_CACHE_SKIP);
+    EXPECT_EQ(
+        scheduler_bind_input_cache(&proof, tensors.data(), 2, SubtaskSlot::AIC).count, SCHEDULER_INPUT_CACHE_FULL
+    );
+    EXPECT_EQ(scheduler_bind_input_cache(nullptr, tensors.data(), 2, lane).count, SCHEDULER_INPUT_CACHE_FULL);
+}
+
+TEST_F(HbgPreparedBindings, InputCacheBudgetCountsBoundLinesAfterAlignmentAndMerging) {
+    simpler::hbg::Tensor tensor{};
+    tensor.buffer.addr = kDeviceBase;
+    tensor.buffer.size = UINT32_C(1) << 20;
+    tensor.address_space = AddressSpace::DEVICE;
+    CoreInputCacheProof proof{};
+    proof.core_mask = CORE_INPUT_CACHE_AIV;
+    proof.mode = CoreInputCacheMode::SCALAR_RANGES;
+    proof.min_tensor_count = 1;
+    proof.range_count = 1;
+    const auto bind = [&]() {
+        return scheduler_bind_input_cache(&proof, &tensor, 1, SubtaskSlot::AIV0);
+    };
+
+    proof.ranges[0] = {0, 1, 128, 0};
+    EXPECT_EQ(bind().count, 1);  // Two aligned lines in a single span.
+    tensor.start_offset = 1;
+    EXPECT_EQ(bind().count, SCHEDULER_INPUT_CACHE_FULL);  // Same bytes now touch three lines.
+    tensor.start_offset = 63;
+    proof.ranges[0].byte_length = UINT16_MAX;
+    EXPECT_EQ(bind().count, SCHEDULER_INPUT_CACHE_FULL);
+
+    tensor.start_offset = 0;
+    proof.range_count = 3;
+    proof.ranges[0] = {0, 1, 4, 0};
+    proof.ranges[1] = {0, 1, 4, 128};
+    proof.ranges[2] = {0, 1, 4, 132};
+    EXPECT_EQ(bind().count, 2);  // Two reads share the second line.
+    proof.ranges[2].byte_offset = 256;
+    EXPECT_EQ(bind().count, SCHEDULER_INPUT_CACHE_FULL);
+}
+
+TEST_F(HbgPreparedBindings, MissingInputPlanResetsReusedCallsToFull) {
+    auto *calls = scheduler_state_at<SchedulerPreparedCall>(base, layout.prepared.calls_offset);
+    calls[0].input_cache_spans = SCHEDULER_INPUT_CACHE_SKIP;
+    calls[1].input_cache_spans = 2;
+    ASSERT_TRUE(prepare(0));
+    EXPECT_EQ(calls[0].input_cache_spans, SCHEDULER_INPUT_CACHE_FULL);
+    EXPECT_EQ(calls[1].input_cache_spans, SCHEDULER_INPUT_CACHE_FULL);
+}
+
+TEST_F(HbgPreparedBindings, AllSkipMixKeepsFrozenTaskFlagsAndPublishesSkipForEveryExecution) {
+    auto &meta = scheduler_state_at<SchedulerTaskMetadata>(base, layout.task_metadata_offset)[1];
+    meta.flags |= SCHEDULER_TASK_ASYNC_INPUT;
+    const uint8_t frozen_flags = meta.flags;
+    CoreInputCacheProof proof{};
+    proof.mode = CoreInputCacheMode::NO_CACHED_READS;
+    proof.core_mask = CORE_INPUT_CACHE_BOTH;
+    SchedulerHostInputCache plans[SUBTASK_SLOT_COUNT]{};
+    for (const auto lane : {SubtaskSlot::AIC, SubtaskSlot::AIV1}) {
+        plans[static_cast<unsigned>(lane)] = scheduler_bind_input_cache(&proof, nullptr, 0, lane);
+    }
+    const uint64_t functions[]{0x1000, 0, 0x3000};
+    ASSERT_TRUE(scheduler_prepare_host_calls(base, layout, kDeviceBase, 1, functions, 0, nullptr, 0, 0, plans));
+    EXPECT_EQ(meta.flags, frozen_flags);
+    const auto *calls = scheduler_state_at<SchedulerPreparedCall>(base, layout.prepared.calls_offset);
+    for (uint32_t index = 3; index < 7; ++index) {
+        EXPECT_EQ(calls[index].input_cache_spans, SCHEDULER_INPUT_CACHE_SKIP);
+    }
 }
 
 TEST_F(HbgPreparedBindings, SparseAsyncLanesKeepExactExecutionIdentityWithoutRegisteringConditions) {

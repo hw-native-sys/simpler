@@ -111,7 +111,7 @@ struct ErrorFixture {
             locals[worker]->cluster_signal = &signal;
             locals[worker]->run_epoch = 61;
             locals[worker]->run_epoch_known = true;
-            auto &group = locals[worker]->cluster_mix;
+            auto &group = locals[worker]->mix_groups[0];
             group.task_ref = 0;
             group.rank = 0;
             group.active_mask = storage.metadata[0].active_mask;
@@ -254,7 +254,7 @@ TEST(HbgErrorIdentity, SharedContextFailureRetainsKnownWorkerAndLaneWithoutGuess
 TEST(HbgErrorIdentity, PreparationFailureNamesTheSelfBlockWithoutBorrowingTheOtherSource) {
     ErrorFixture fixture;
     auto *local = fixture.locals[1];
-    local->cluster_mix = {};
+    local->mix_groups[0] = {};
     auto &decoy = local->execution_at(SCHEDULER_CLUSTER_MIX_EXECUTION);
     decoy.task_ref = 1;
     decoy.block_idx = 3;
@@ -269,7 +269,7 @@ TEST(HbgErrorIdentity, PreparationFailureNamesTheSelfBlockWithoutBorrowingTheOth
     token.state = SchedulerDispatchSlotState::FILLING;
     token.phase = SchedulerExecutionTokenPhase::TICKETED;
     EXPECT_FALSE(
-        scheduler_execution_token_receive(fixture.graph.graph(), fixture.base(), local, fixture.run(), token, 0)
+        scheduler_bind_ticketed_execution(fixture.graph.graph(), fixture.base(), local, fixture.run(), token, 0)
     );
     EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED));
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, UINT64_MAX, 2, UINT64_MAX, 1, 1}));
@@ -283,7 +283,7 @@ TEST_P(HbgErrorGroupPhase, PreservesTheActiveMembersGroupIdentity) {
             if (!mask.has(static_cast<SubtaskSlot>(worker))) continue;
             if (GetParam() == SchedulerGmMixPhase::RELEASED && worker != scheduler_mix_accountant_lane(mask)) continue;
             ErrorFixture fixture(mask);
-            fixture.locals[worker]->cluster_mix.phase = GetParam();
+            fixture.locals[worker]->mix_groups[0].phase = GetParam();
             fixture.record(worker);
             EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, 0, 2, 7, worker, worker}));
         }
@@ -302,28 +302,28 @@ TEST(HbgErrorIdentity, InactiveCoordinatorObservesTheGenerationWithoutReportingM
     ErrorFixture fixture(LaneMask(true, false, true));
     ASSERT_TRUE(fixture.storage.prepare_calls(fixture.graph.graph()));
     auto *coordinator = fixture.locals[1];
-    coordinator->cluster_mix = {};
+    coordinator->mix_groups[0] = {};
     bool progress = false;
-    ASSERT_TRUE(scheduler_cluster_mix_claim_head(
-        fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), 0, &progress
-    ));
-    ASSERT_TRUE(progress);
-    ASSERT_TRUE(scheduler_cluster_mix_progress_pending(
-        fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), &progress
-    ));
-    ASSERT_TRUE(scheduler_cluster_mix_armed(fixture.signal.armed_generation));
     ASSERT_TRUE(
-        scheduler_cluster_mix_observe(fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), &progress)
+        scheduler_claim_for_build(fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), 0, &progress)
     );
-    ASSERT_EQ(coordinator->cluster_mix.generation, fixture.signal.armed_generation);
-    ASSERT_EQ(coordinator->cluster_mix.phase, SchedulerGmMixPhase::IDLE);
+    ASSERT_TRUE(progress);
+    ASSERT_TRUE(
+        scheduler_progress_mix_publication(fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), &progress)
+    );
+    ASSERT_TRUE(scheduler_cluster_mix_armed(fixture.signal.groups[0].armed_generation));
+    ASSERT_TRUE(
+        scheduler_cluster_mix_observe(fixture.graph.graph(), fixture.base(), coordinator, fixture.run(), &progress, 0)
+    );
+    ASSERT_EQ(coordinator->mix_groups[0].generation, fixture.signal.groups[0].armed_generation);
+    ASSERT_EQ(coordinator->mix_groups[0].phase, SchedulerGmMixPhase::IDLE);
     fixture.record(1, 0);
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, UINT64_MAX, UINT64_MAX, UINT64_MAX, 1, 1}));
 }
 
 TEST(HbgErrorIdentity, IdleGroupDoesNotAttributeThePreviousTasksBlockOrSequenceToTheNextTask) {
     ErrorFixture fixture;
-    auto &group = fixture.locals[1]->cluster_mix;
+    auto &group = fixture.locals[1]->mix_groups[0];
     group.phase = SchedulerGmMixPhase::IDLE;
     fixture.record(1, 1);
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, UINT64_MAX, UINT64_MAX, UINT64_MAX, 1, 1}));
@@ -332,12 +332,12 @@ TEST(HbgErrorIdentity, IdleGroupDoesNotAttributeThePreviousTasksBlockOrSequenceT
 TEST(HbgErrorIdentity, ExitDrainNamesOnlyACurrentGroupOrOutstandingFloor) {
     ErrorFixture fixture;
     auto *proxy = fixture.locals[1];
-    proxy->cluster_mix.phase = SchedulerGmMixPhase::IDLE;
+    proxy->mix_groups[0].phase = SchedulerGmMixPhase::IDLE;
     proxy->next_mix_ref = 1;
-    fixture.signal.task_ref = 0;
-    fixture.signal.armed_generation = 3;
+    fixture.signal.groups[0].task_ref = 0;
+    fixture.signal.groups[0].armed_generation = 3;
     EXPECT_EQ(scheduler_ordered_drain_task(proxy), 0);
-    fixture.signal.armed_generation = 4;
+    fixture.signal.groups[0].armed_generation = 4;
     EXPECT_EQ(scheduler_ordered_drain_task(proxy), 1);
     proxy->next_mix_ref = UINT32_MAX;
     EXPECT_EQ(scheduler_ordered_drain_task(proxy), SCHEDULER_TASK_REF_INVALID);
@@ -348,7 +348,7 @@ TEST(HbgErrorIdentity, UnboundRunDoesNotInventEpochRankOrGroupIdentity) {
     fixture.locals[1]->run_epoch = 0;
     fixture.locals[1]->config.prepared = nullptr;
     fixture.locals[1]->run_epoch_known = false;
-    fixture.locals[1]->cluster_mix = {};
+    fixture.locals[1]->mix_groups[0] = {};
     fixture.record();
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, 1, 1}));
 }
@@ -369,7 +369,7 @@ TEST(HbgErrorIdentity, ActualMixPreparationFailureRetainsTheClaimedBlock) {
     ErrorFixture fixture;
     ASSERT_TRUE(fixture.storage.prepare_calls(fixture.graph.graph()));
     auto *local = fixture.locals[1];
-    local->cluster_mix.phase = SchedulerGmMixPhase::PUBLISHED;
+    local->mix_groups[0].phase = SchedulerGmMixPhase::PUBLISHED;
     uint64_t execution_index = UINT64_MAX;
     ASSERT_TRUE(scheduler_prepared_execution_index(
         fixture.base(), fixture.locals[1]->config.prepared, 0, 2, 1, &execution_index
@@ -378,7 +378,7 @@ TEST(HbgErrorIdentity, ActualMixPreparationFailureRetainsTheClaimedBlock) {
         0;
     bool progress = false;
     EXPECT_FALSE(
-        scheduler_cluster_mix_prepare_member(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &progress)
+        scheduler_prepare_mix_lane(fixture.graph.graph(), fixture.base(), local, fixture.run(), 0, &progress, 0)
     );
     EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::GROUP_INVALID_STATE));
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, 0, 2, 7, 1, 1}));
@@ -428,14 +428,14 @@ TEST(HbgErrorIdentity, AicpuFirstWriterPublishesUnknownRatherThanStaleAicoreIden
 TEST(HbgErrorIdentity, MalformedSelfClaimRetainsItsBlockAndBoundEpoch) {
     ErrorFixture fixture;
     auto *local = fixture.locals[1];
-    local->cluster_mix = {};
+    local->mix_groups[0] = {};
     auto &token = local->execution_tokens[0];
     token.state = SchedulerDispatchSlotState::FILLING;
     token.task_ref = 0;
     token.subtask_slot = UINT8_MAX;
     token.phase = SchedulerExecutionTokenPhase::TICKETED;
     EXPECT_FALSE(
-        scheduler_execution_token_receive(fixture.graph.graph(), fixture.base(), local, fixture.run(), token, 0)
+        scheduler_bind_ticketed_execution(fixture.graph.graph(), fixture.base(), local, fixture.run(), token, 0)
     );
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, UINT64_MAX, 0, UINT64_MAX, 1, 1}));
     EXPECT_EQ(read_valid_fields(*fixture.run()), 53u);
@@ -444,7 +444,7 @@ TEST(HbgErrorIdentity, MalformedSelfClaimRetainsItsBlockAndBoundEpoch) {
 TEST(HbgErrorIdentity, NonExecutingCompletionNamesTheSlotWithoutGuessingFromTheOtherSlot) {
     ErrorFixture fixture;
     auto *local = fixture.locals[1];
-    fixture.locals[1]->cluster_mix = {};
+    fixture.locals[1]->mix_groups[0] = {};
     for (uint32_t slot = 0; slot < 2; ++slot) {
         local->execution_at(slot).task_ref = 0;
         local->execution_at(slot).rank = 0;
@@ -452,7 +452,7 @@ TEST(HbgErrorIdentity, NonExecutingCompletionNamesTheSlotWithoutGuessingFromTheO
 
         local->execution_at(slot).state = SchedulerDispatchSlotState::READY;
     }
-    EXPECT_FALSE(scheduler_complete_own_slot(fixture.graph.graph(), fixture.base(), local, fixture.run(), 1, 0));
+    EXPECT_FALSE(scheduler_complete_lane_execution(fixture.graph.graph(), fixture.base(), local, fixture.run(), 1, 0));
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, 0, 2, UINT64_MAX, 1, 1}));
     EXPECT_EQ(read_valid_fields(*fixture.run()), 55u);
     EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 0u);
@@ -461,7 +461,7 @@ TEST(HbgErrorIdentity, NonExecutingCompletionNamesTheSlotWithoutGuessingFromTheO
 TEST(HbgErrorIdentity, ExtraCompletionRetainsItsBlockAndDoesNotCountSuccess) {
     ErrorFixture fixture;
     auto *local = fixture.locals[1];
-    fixture.locals[1]->cluster_mix = {};
+    fixture.locals[1]->mix_groups[0] = {};
     fixture.storage.metadata[0].flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD;
     fixture.storage.metadata[0].active_mask = LaneMask::aiv0();
     auto &slot = local->execution_at(1);
@@ -473,7 +473,7 @@ TEST(HbgErrorIdentity, ExtraCompletionRetainsItsBlockAndDoesNotCountSuccess) {
         scheduler_state_at<SchedulerTaskControl>(fixture.base(), fixture.storage.layout.task_controls_offset);
     scheduler_gm_store(controls[0].completion_state, scheduler_completion_completed_state(4));
     EXPECT_EQ(
-        scheduler_contribute_subtask<false>(fixture.graph.graph(), fixture.base(), local, fixture.run(), slot, 1),
+        scheduler_publish_fanout<false>(fixture.graph.graph(), fixture.base(), local, fixture.run(), slot, 1),
         SchedulerSubtaskFinishResult::ERROR
     );
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, 0, 3, UINT64_MAX, 1, 1}));
@@ -484,7 +484,7 @@ TEST(HbgErrorIdentity, ExtraCompletionRetainsItsBlockAndDoesNotCountSuccess) {
 
 TEST(HbgErrorIdentity, RetiredGroupCannotMisattributeStaleBlockOrGeneration) {
     ErrorFixture fixture;
-    fixture.locals[1]->cluster_mix.phase = SchedulerGmMixPhase::IDLE;
+    fixture.locals[1]->mix_groups[0].phase = SchedulerGmMixPhase::IDLE;
     fixture.record();
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, UINT64_MAX, UINT64_MAX, UINT64_MAX, 1, 1}));
 }
@@ -520,10 +520,10 @@ TEST(HbgErrorIdentity, ASuccessStatusMustNotConsumeTheFirstErrorClaim) {
 TEST(HbgErrorIdentity, PublishedStatusAlwaysCarriesOneCoherentWinningIdentity) {
     for (uint32_t round = 0; round < 32; ++round) {
         ErrorFixture fixture(LaneMask::both_aiv());
-        fixture.locals[2]->cluster_mix.task_ref = 1;
-        fixture.locals[2]->cluster_mix.rank = 1;
-        fixture.locals[2]->cluster_mix.block_idx = 3;
-        fixture.locals[2]->cluster_mix.generation = 9;
+        fixture.locals[2]->mix_groups[0].task_ref = 1;
+        fixture.locals[2]->mix_groups[0].rank = 1;
+        fixture.locals[2]->mix_groups[0].block_idx = 3;
+        fixture.locals[2]->mix_groups[0].generation = 9;
         std::atomic<uint32_t> ready{0};
         std::atomic<bool> go{false};
         const auto publish = [&](uint32_t worker, int64_t task) {
