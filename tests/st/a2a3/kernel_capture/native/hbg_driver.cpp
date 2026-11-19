@@ -79,8 +79,7 @@ int main(int argc, char **argv) {
     uint32_t shape[] = {16};
     ChipStorageTaskArgs args;
     args.add_tensor(make_tensor_external(input, shape, 1, DataType::INT32, AddressSpace::DEVICE, TensorTransfer::NONE));
-    args.add_tensor(
-        make_tensor_external(output, shape, 1, DataType::INT32, AddressSpace::DEVICE, TensorTransfer::NONE)
+    args.add_tensor(make_tensor_external(output, shape, 1, DataType::INT32, AddressSpace::DEVICE, TensorTransfer::NONE)
     );
     int32_t host_control = scenario == 6 ? 13 : 3;
     const uint32_t control_shape[]{1};
@@ -88,6 +87,7 @@ int main(int argc, char **argv) {
         make_tensor_external(&host_control, control_shape, 1, DataType::INT32, AddressSpace::HOST, TensorTransfer::NONE)
     );
     args.add_scalar(scenario);
+    const bool caller_owns_run = scenario == 14 || scenario == 15;
     const bool cancellation_scenario = scenario >= 7 && scenario <= 11;
     const int capture_count = cancellation_scenario ? 2 : 1;
     int total_replays = 0;
@@ -97,13 +97,13 @@ int main(int argc, char **argv) {
         NativeRunDescriptor descriptor{};
         descriptor.generation = cycle + 1;
         descriptor.run_epoch = cycle + 1;
-        descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
+        if (!caller_owns_run) descriptor.prepare_purpose = SIMPLER_PREPARE_CAPTURE;
         const size_t publishes_before = capture_test::prepare_snapshot(ctx, scenario);
         check(simpler_prepare_run(ctx, run, 0, &args, &config, &descriptor), "prepare-once");
         capture_test::check_prepare(ctx, scenario, publishes_before);
         host_control = 93;  // Changing the source must not change the prepared task arguments.
         RuntimeHandle reference = nullptr;
-        check(simpler_retain_run_resources(ctx, run, caller, &reference), "retain-once");
+        if (!caller_owns_run) check(simpler_retain_run_resources(ctx, run, caller, &reference), "retain-once");
         aclmdlRI model = nullptr;
         check(aclmdlRICaptureBegin(caller, ACL_MODEL_RI_CAPTURE_MODE_GLOBAL), "capture-begin");
         check(aclrtMemcpyAsync(input, bytes, host_input, bytes, ACL_MEMCPY_HOST_TO_DEVICE, caller), "capture-input");
@@ -117,7 +117,7 @@ int main(int argc, char **argv) {
             check(aclrtRecordEvent(dependency_event, other_stream), "conflict-other-record");
             arm_capture_submit_fault(caller, dependency_event);
         }
-        const bool probe_publications = capture_test::needs_publications(scenario);
+        const bool probe_publications = capture_test::needs_publications(scenario) || scenario == 14;
         if (probe_publications) capture_test::begin_capture_publication_probe();
         const int launch_rc = simpler_launch_run_on_stream(ctx, run, caller, nullptr);
         const auto submission =
@@ -185,15 +185,6 @@ int main(int argc, char **argv) {
                 simpler_unregister_callable(ctx, 0) == PTO_RUNTIME_ERR_INVALID_STATE,
                 "external-reference-retains-callable"
             );
-            const int release_rc = simpler_release_run_resources(ctx, reference);
-            std::printf("release-during-capture rc=%d expected=%d\n", release_rc, PTO_RUNTIME_ERR_UNSUPPORTED);
-            require(release_rc == PTO_RUNTIME_ERR_UNSUPPORTED, "release-live-capture-rejected");
-            aclmdlRI still_recording = nullptr;
-            check(aclmdlRICaptureGetInfo(caller, &status, &still_recording), "capture-info-after-release-refusal");
-            require(
-                status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE && still_recording == recording_model,
-                "release-refusal-keeps-capture"
-            );
         }
         const int end_rc = aclmdlRICaptureEnd(caller, &model);
         if (failed_end) {
@@ -221,7 +212,7 @@ int main(int argc, char **argv) {
         aclmdlRI ended_model = nullptr;
         check(aclmdlRICaptureGetInfo(caller, &ended_status, &ended_model), "capture-info-after-end");
         require(ended_status == ACL_MODEL_RI_CAPTURE_STATUS_NONE && ended_model == nullptr, "capture-ended");
-        if (!cancel_recording) check(simpler_finalize_run(ctx, run), "finalize-host-run");
+        if (!cancel_recording && !caller_owns_run) check(simpler_finalize_run(ctx, run), "finalize-host-run");
         int32_t observed[16];
         check(aclrtMemcpy(observed, bytes, output, bytes, ACL_MEMCPY_DEVICE_TO_HOST), "read-before-replay");
         require(std::memcmp(poison, observed, bytes) == 0, "capture-did-not-execute");
@@ -267,7 +258,7 @@ int main(int argc, char **argv) {
                 std::printf("fault-replay=%d executed=16\n", fault_round + 1);
             }
         }
-        const int replays = (scenario == 3 || cancel_recording) ? 0 : 3;
+        const int replays = (scenario == 3 || scenario == 15 || cancel_recording) ? 0 : 3;
         total_replays += replays;
         for (int round = 0; round < replays; ++round) {
             host_control = 1000 + round;
@@ -285,9 +276,61 @@ int main(int argc, char **argv) {
                     "fresh-output"
                 );
             std::printf("replay=%d verified=16\n", round + 1);
+            if (scenario == 14 && round == 0) {
+                check(simpler_wait_run_completion(ctx, run), "retire-first-replay");
+                // Reuse the same slot while the caller still owns the original run and model.
+                std::vector<uint8_t> larger_storage(get_runtime_size() + get_runtime_alignment());
+                const auto aligned =
+                    (reinterpret_cast<uintptr_t>(larger_storage.data()) + get_runtime_alignment() - 1) &
+                    ~(get_runtime_alignment() - 1);
+                auto larger_run = reinterpret_cast<void *>(aligned);
+                ChipStorageTaskArgs larger_args;
+                for (int i = 0; i < args.tensor_count(); ++i)
+                    larger_args.add_tensor(args.tensor(i));
+                larger_args.add_scalar(16);
+                NativeRunDescriptor larger_descriptor{};
+                larger_descriptor.generation = larger_descriptor.run_epoch = 2;
+                check(
+                    simpler_prepare_run(ctx, larger_run, 0, &larger_args, &config, &larger_descriptor),
+                    "prepare-larger-run"
+                );
+                capture_test::begin_capture_publication_probe();
+                check(simpler_launch_run_on_stream(ctx, larger_run, caller, nullptr), "launch-larger-run");
+                const auto larger_submission = capture_test::finish_capture_publication_probe();
+                require(
+                    submission.cpu_launches.size() == 1 && larger_submission.cpu_launches.size() == 1 &&
+                        submission.cpu_launches.front().image_bytes > 0 &&
+                        larger_submission.cpu_launches.front().image_bytes >
+                            submission.cpu_launches.front().image_bytes,
+                    "larger-image"
+                );
+                // Only A5 has resident scheduler worker contexts in a separate metadata upload.
+                const auto scheduler_upload = [](const capture_test::CapturedSubmission &captured) {
+                    const auto contexts = captured.launches.at(0).worker_context_base;
+                    for (const auto &copy : captured.publications) {
+                        const auto target = reinterpret_cast<uintptr_t>(copy.destination);
+                        if (contexts >= target && contexts - target < copy.bytes) return copy;
+                    }
+                    return capture_test::CapturedPublication{};
+                };
+                if (submission.launches.at(0).worker_context_base != 0) {
+                    const auto first = scheduler_upload(submission);
+                    const auto second = scheduler_upload(larger_submission);
+                    require(
+                        first.source && second.source && first.source != second.source &&
+                            first.destination != second.destination,
+                        "independent-scheduler-storage"
+                    );
+                }
+                check(simpler_finalize_run(ctx, larger_run), "finalize-larger-run");
+                check(aclrtMemcpy(observed, bytes, output, bytes, ACL_MEMCPY_DEVICE_TO_HOST), "read-larger-output");
+                for (int i = 0; i < 16; ++i)
+                    require(observed[i] == i + 14, "larger-output");
+            }
         }
         if (model != nullptr) check(aclmdlRIDestroy(model), "destroy-model");
-        check(simpler_release_run_resources(ctx, reference), "release-after-destroy");
+        if (caller_owns_run) check(simpler_finalize_run(ctx, run), "finalize-after-destroy");
+        else check(simpler_release_run_resources(ctx, reference), "release-after-destroy");
         if (cancel_recording) std::printf("cancelled-capture-cleaned cycle=%d\n", cycle);
     }
     if (dependency_event != nullptr) check(aclrtDestroyEvent(dependency_event), "destroy-failure-event");

@@ -743,6 +743,7 @@ TEST_F(NativeAdmissionTest, CapturedHbgImageUsesRtsSnapshotThroughOriginalRunRet
     const auto image_address = reinterpret_cast<uintptr_t>(header.execution_image);
     ASSERT_GE(image_address, packet_begin);
     ASSERT_LE(image_address - packet_begin, packet.size());
+    EXPECT_EQ((image_address - packet_begin + sizeof(HbgExecutionImage)) % 64, 0u);
     ASSERT_GE(packet.size() - (image_address - packet_begin), sizeof(HbgExecutionImage) + expected.size());
     HbgExecutionImage image{};
     std::memcpy(&image, header.execution_image, sizeof(image));
@@ -754,15 +755,31 @@ TEST_F(NativeAdmissionTest, CapturedHbgImageUsesRtsSnapshotThroughOriginalRunRet
     EXPECT_FALSE(shared_resource.expired());
     for (const auto &copy : control().deferred_copies)
         std::memcpy(copy.destination, copy.source, copy.bytes);
+    // The transport stub records raw bytes in a vector. Replay from an aligned RTS allocation.
+    struct alignas(64) CacheLine { unsigned char data[64]; };
+    std::vector<CacheLine> replay_storage((packet.size() + 63) / 64);
+    std::memcpy(replay_storage.data(), packet.data(), packet.size());
+    const auto *image_packet = reinterpret_cast<const unsigned char *>(replay_storage.data()) +
+                               (image_address - packet_begin);
+    const auto *image_data = image_packet + sizeof(image);
+    ASSERT_LE(image.mutable_prefix_bytes, expected.size());
+    ASSERT_EQ(std::memcmp(image_data, expected.data(), expected.size()), 0);
     for (int replay = 0; replay < 2; ++replay) {
-        std::memset(working_arena, 0xa5, expected.size());
+        std::memset(working_arena, 0xa5, image.mutable_prefix_bytes);
         ASSERT_EQ(
             restore_hbg_execution_image(
-                header.execution_image, [](const void *, size_t) {}, [](const void *, size_t) {}
+                image_packet, [](const void *, size_t) {}, [](const void *, size_t) {}
             ),
             0
         );
-        EXPECT_EQ(std::memcmp(working_arena, expected.data(), expected.size()), 0);
+        for (uint64_t i = 0; i < image.reference_count; ++i) {
+            HbgImageReference ref{};
+            std::memcpy(&ref, image_data + image.bytes + i * sizeof(ref), sizeof(ref));
+            EXPECT_EQ(*reinterpret_cast<const uint64_t *>(ref.device_field_address),
+                      reinterpret_cast<uint64_t>(image_data + ref.image_offset));
+        }
+        if (image.reference_count == 0)
+            EXPECT_EQ(std::memcmp(working_arena, expected.data(), image.mutable_prefix_bytes), 0);
     }
     ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
     reference = nullptr;

@@ -993,6 +993,7 @@ private:
         int pending_rc{0};
         bool pending_rc_set{false};
         bool result_observed{false};
+        bool detached_submission_requested{false};
         bool permits_prepared_successor{false};
         NativeRunPreparePurpose prepare_purpose{SIMPLER_PREPARE_EAGER};
     };

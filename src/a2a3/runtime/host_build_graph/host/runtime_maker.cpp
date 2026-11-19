@@ -12,7 +12,7 @@
  * host_build_graph runtime maker (host orchestration).
  *
  * The HOST runs the orchestrator to completion, populates shared memory + the
- * prebuilt arena, and H2Ds the image; the device boots scheduler-only.
+ * prebuilt arena, and publishes the execution image. The device boots the scheduler.
  *
  * register_callable_impl:
  *   - dlopens the orchestration SO on the host and resolves its entry points,
@@ -439,11 +439,6 @@ static void release_run_tensor_leases(Runtime *runtime, const HostApi *api) {
 
 namespace {
 
-// host_build_graph is host-orchestration-first: the HOST dlopens the
-// orchestration .so and runs it to completion. Every cross-task reference the
-// shared memory and arena carry is an offset or an index from its own block, so
-// the image the device schedules is the bytes the host wrote — there is nothing
-// to fix up after the H2D copy.
 
 bool write_all_bytes(int fd, const uint8_t *data, size_t size) {
     size_t total = 0;
@@ -720,7 +715,12 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     const uint64_t image_bytes = plan.image_bytes;
     const int32_t total_tasks = plan.total_tasks;
     const auto &bind_usage = plan.bind_usage;
-    const uint64_t device_arena_bytes = layout.off_copied_end + image_bytes;
+    const auto segments = sm_layout::segment_offsets(sm_layout::image_extents(bind_usage));
+    const bool launch_image = api->launch_owns_execution_image();
+    // Onboard only the working task records and completion bytes live here.
+    // Their immutable fanin and argument pools stay in RTS launch storage.
+    const uint64_t working_sm_bytes = launch_image ? segments.fanin_pool : image_bytes;
+    const uint64_t device_arena_bytes = layout.off_copied_end + working_sm_bytes;
     const BindPhaseMark static_arena_phase = bind_phase_begin();
     runtime->dev.sm_image_bytes = image_bytes;
     if (const int rc = api->setup_static_arena(heap_bytes, /*gm_sm_size=*/0, device_arena_bytes); rc != 0) {
@@ -776,8 +776,8 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     always_assert(reinterpret_cast<uint64_t>(gm_heap) % DeviceArena::kDefaultBaseAlign == 0);
     const sm_layout::HeapRebase heap_rebase{reinterpret_cast<uint64_t>(gm_heap), heap_bytes};
 
-    // One host source for one copy: the copied zone and shared-memory image at
-    // exactly the offsets they occupy on the device.
+    // The publication contains the runtime header followed by the compact SM
+    // image. This layout keeps every argument delta relative to its own record.
     // Over-allocated and rounded up because every segment offset is
     // CHIP_ALIGN_SIZE-aligned and ChipTaskSlotState is alignas(64), which a byte
     // vector's data() is not.
@@ -815,6 +815,13 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
         arena_dev + layout.off_copied_begin, upload_base, upload_bytes, bind_usage.fanin_elems, bind_usage.tensor_elems,
         bind_usage.scalar_elems
     );
+    if (launch_image) {
+        const uint64_t storage_field = reinterpret_cast<uint64_t>(device_sm) + offsetof(SharedMemoryHeader, tasks) +
+                                       offsetof(SharedMemoryTaskHeader, initial_storage);
+        runtime->set_execution_image_binding(
+            copied_bytes + sizeof(SharedMemoryHeader), {{storage_field, copied_bytes + segments.storage}}
+        );
+    }
     return total_tasks;
 }
 
@@ -1646,7 +1653,10 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
     metadata.reserve(publication.prerequisites.size() + 1);
     for (const auto &region : publication.prerequisites)
         metadata.push_back({region.device_target, region.source, region.bytes});
-    metadata.push_back({publication.device_target, publication.source, publication.bytes, true});
+    metadata.push_back(
+        {publication.device_target, publication.source, publication.bytes, true, publication.mutable_prefix_bytes,
+         publication.image_references.data(), publication.image_references.size()}
+    );
     const BindPhaseMark staging_phase = bind_phase_begin();
     const int metadata_rc = api->stage_launch_metadata(metadata.data(), metadata.size());
     if (metadata_rc != 0) {

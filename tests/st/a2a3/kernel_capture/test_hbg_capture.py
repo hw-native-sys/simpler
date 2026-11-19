@@ -265,6 +265,16 @@ def _check_fault_recovery(scenario: int, platform: str, stdout: str, logs: Path)
     ],
 )
 def test_hbg_model_replays_after_host_finalize(hbg_capture_probe, request, scenario):
+    _check_model_lifecycle(hbg_capture_probe, request, scenario)
+
+
+@pytest.mark.platforms(["a2a3", "a5"])
+@pytest.mark.parametrize("scenario", [14, 15], ids=["larger-eager-run-between-replays", "zero-replays"])
+def test_hbg_model_with_caller_owned_run(hbg_capture_probe, request, scenario):
+    _check_model_lifecycle(hbg_capture_probe, request, scenario)
+
+
+def _check_model_lifecycle(hbg_capture_probe, request, scenario):
     _, binaries = hbg_capture_probe
     platform = request.config.getoption("--platform")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
@@ -288,8 +298,6 @@ def test_hbg_model_replays_after_host_finalize(hbg_capture_probe, request, scena
         assert "stage=reject-capture-predecessor rc=0" in result.stdout
     if 7 <= scenario <= 11:
         assert "stage=finalize-during-capture rc=0" in result.stdout
-        assert "stage=release-live-capture-rejected rc=0" in result.stdout
-        assert "stage=release-refusal-keeps-capture rc=0" in result.stdout
         assert "cancelled-capture-cleaned cycle=0" in result.stdout
         assert result.stdout.count("stage=capture-did-not-execute rc=0") == 2
         assert result.stdout.count("stage=destroy-model rc=0") == (1 if scenario >= 9 else 2)
@@ -313,7 +321,15 @@ def test_hbg_model_replays_after_host_finalize(hbg_capture_probe, request, scena
     if scenario in (12, 13):
         _check_fault_recovery(scenario, platform, result.stdout, logs)
     captures = 2 if 7 <= scenario <= 11 else 1
-    replays = 0 if scenario == 3 else (5 if scenario in (12, 13) else 3)
+    if scenario in (14, 15):
+        assert "stage=finalize-after-destroy rc=0" in result.stdout
+        assert "stage=retain-once" not in result.stdout
+    if scenario == 14:
+        assert "stage=larger-image rc=0" in result.stdout
+        if platform == "a5":
+            assert "stage=independent-scheduler-storage rc=0" in result.stdout
+        assert result.stdout.index("stage=finalize-larger-run rc=0") < result.stdout.index("replay=2 verified=16")
+    replays = 0 if scenario in (3, 15) else (5 if scenario in (12, 13) else 3)
     assert (
         f"hbg_capture PASS scenario={scenario} replays={replays} prepare={captures} launch={captures}" in result.stdout
     )
@@ -378,9 +394,12 @@ def test_hbg_retained_models_publish_swimlane_observations(tmp_path, request, re
     (tmp_path / "swimlane-native.log").write_text(result.stdout + result.stderr)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "stage=swimlane-flush rc=0" in result.stdout
+    eager = result.stdout.index("state=eager verified=48")
+    replay_after_eager = "state=b-after-a-release verified=48"
     if replay:
-        assert "state=heap-capacity-refused verified=48" in result.stdout
-    assert result.stdout.index("state=eager verified=48") < result.stdout.index("state=b-after-a-release verified=48")
+        assert eager < result.stdout.index(replay_after_eager)
+    else:
+        assert replay_after_eager not in result.stdout
     ordinary = json.loads((output / "eager/chip_swimlane_records.json").read_text())
     assert ordinary["aicore_tasks"] and not ordinary["metadata"].get("collection", {}).get("recorded_window")
     assert not (output / "unused").exists()

@@ -112,7 +112,8 @@ struct NativeRunContext {
     bool launch_not_started_proven{false};
     // A returned finalize may leave a Canonical carrier for cleanup retry.
     // The synchronous output reader is not repeated after it has returned.
-    bool recording{false};
+    bool detached_submission_requested{false};
+    bool external_submission{false};
     bool copyback_returned{false};
     bool failure_reported{false};
     int copyback_rc{0};

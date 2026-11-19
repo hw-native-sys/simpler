@@ -239,11 +239,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
     // Boot: the last AICPU thread (aicpu_thread_num_ - 1) performs the one-time
     // host-orch attach. host_build_graph's orchestrator already ran on the host,
-    // and every cross-task reference it wrote is an offset from its own block, so
-    // the SM/arena this thread sees need no address fixup. This thread attaches
-    // the prebuilt arena, points the SM
-    // handle's task-header pointers at the device SM WITHOUT resetting the
-    // host-populated data, hands the host-computed task count to the scheduler,
+    // and published the initial task records. This thread attaches the prebuilt
+    // arena, initializes the writable task table, hands the task count to the scheduler,
     // and releases the other threads. It then falls through and schedules its own
     // cores like every other thread — host_build_graph has no device-side
     // orchestrator, so there is no orch/sched split.
@@ -281,7 +278,14 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // region too small for it.
             const uint64_t live_slots =
                 sm_layout::live_slot_pitch(static_cast<uint64_t>(runtime->dev.host_total_tasks));
-            const uint64_t sm_size = runtime->dev.sm_image_bytes;
+            // The packet binds this field to the immutable task array. The
+            // synchronous transport leaves it null when packing the full image.
+            const auto *initial =
+                sm_ptr == nullptr ? nullptr : static_cast<SharedMemoryHeader *>(sm_ptr)->tasks.initial_storage;
+            const uint64_t sm_size =
+                initial == nullptr ?
+                    runtime->dev.sm_image_bytes :
+                    sm_layout::segment_offsets(sm_layout::image_extents({live_slots, 0, 0, 0})).fanin_pool;
             // sm_handle and the scheduler state are the device-only zone: their
             // bytes never travel, so they start as whatever the pooled arena last
             // held. Zeroing the handle first is what makes attach_populated's
@@ -289,7 +293,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // attach_populated.
             memset(rt->sm_handle, 0, sizeof(*rt->sm_handle));
             if (!rt->sm_handle->attach_populated(
-                    sm_ptr, sm_size, rt->prebuilt_layout.task_capacity, live_slots, runtime->dev.sm_image_bytes
+                    sm_ptr, sm_size, rt->prebuilt_layout.task_capacity, live_slots, sm_size
                 )) {
                 LOG_ERROR("Thread %d: host-orch: sm_handle->attach_populated failed", thread_idx);
                 rt = nullptr;
@@ -315,7 +319,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 // neither call.
                 // The attach view is valid; no classification or dispatch is released yet.
                 // Prepared arguments survive, while progress belongs to this invocation.
-                rt->sm_handle->header->reset_execution_state();
+                rt->sm_handle->header->reset_execution_state(initial);
                 rt->scheduler->seed_queue_slots();
                 rt->aicore_mailbox->init_empty();
             }

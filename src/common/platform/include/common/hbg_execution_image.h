@@ -14,11 +14,19 @@
 #include <cstdint>
 #include <type_traits>
 
-// The header and the image bytes that follow it live in RTS argument storage.
-// The destination is the aligned arena shared by the executing device roles.
+// Prepared by the runtime for a pointer field in mutable device storage.
+// image_offset is relative to the first image byte after HbgExecutionImage.
+struct HbgImageReference {
+    uint64_t device_field_address;
+    uint64_t image_offset;
+};
+
+// The snapshot and then reference_count HbgImageReference records follow this header.
 struct HbgExecutionImage {
     uint64_t working_address;
     uint64_t bytes;
+    uint64_t mutable_prefix_bytes;
+    uint64_t reference_count;
 };
 static_assert(std::is_trivially_copyable_v<HbgExecutionImage> && std::is_standard_layout_v<HbgExecutionImage>);
-static_assert(sizeof(HbgExecutionImage) == 16);
+static_assert(sizeof(HbgExecutionImage) == 32 && sizeof(HbgImageReference) == 16);

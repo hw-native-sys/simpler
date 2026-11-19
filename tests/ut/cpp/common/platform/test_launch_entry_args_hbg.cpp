@@ -151,8 +151,12 @@ TEST_F(LaunchEntryArgs, KernelExecutionImageTravelsInRtsStorageAndRestoresTheWor
 TEST_F(LaunchEntryArgs, ProgramDeliversDescriptorAndExecutionImageAlongsideGraphDefinition) {
     const std::array<unsigned char, 64> initial{0xfe, 0x11};
     alignas(64) std::array<unsigned char, initial.size()> working{};
-    const HostMetadataRegion image{working.data(), initial.data(), initial.size(), true};
+    uint64_t tensor_address = 0;
+    HbgImageReference ref{reinterpret_cast<uint64_t>(&tensor_address), 32};
+    const HostMetadataRegion image{working.data(), initial.data(), initial.size(), true, 16, &ref, 1};
     ASSERT_EQ(slot.staged_launch_metadata.prepare(&image, 1, true), 0);
+    ref.image_offset = 0;
+    working.fill(0x55);
     const std::array<unsigned char, 32> definition{0x42};
     runtime.publish_graph_section(GraphSectionSource::LaunchEnvelope, 0, definition.size());
     ASSERT_EQ(stage_graph_section(slot, definition.data(), definition.size()), 0);
@@ -175,7 +179,10 @@ TEST_F(LaunchEntryArgs, ProgramDeliversDescriptorAndExecutionImageAlongsideGraph
     ASSERT_EQ(restore_hbg_execution_image(
                   header.execution_image, [](const void *, size_t) {}, [](const void *, size_t) {}
               ), 0);
-    EXPECT_EQ(working, initial);
+    EXPECT_EQ(std::memcmp(working.data(), initial.data(), 16), 0);
+    EXPECT_EQ(working[16], 0x55);
+    EXPECT_GT(package.bytes, 4096u);
+    EXPECT_EQ(tensor_address, reinterpret_cast<uint64_t>(header.execution_image) + sizeof(HbgExecutionImage) + 32);
 }
 
 // HBG ignores the entry-route permit. After initialization, both permit values

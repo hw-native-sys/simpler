@@ -276,7 +276,7 @@ public:
         return init_runtime_args_with_metadata(runtime, (*out)->kernel_args, slot_persistent_args(slot));
     }
     LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override {
-        prepared.streams = {&cpu_stream_, &core_stream_};
+        prepared.streams = {prepared.caller_stream != nullptr ? prepared.caller_stream : &cpu_stream_, &core_stream_};
         const int rc = arm_run_fence(prepared);
         if (rc != 0) return {rc, LaunchProgress::NotStarted, {}};
         auto result = exact_launch_transaction(
@@ -290,7 +290,8 @@ public:
             [&](LaunchProgressSink &sink) {
                 if (aicpu_submission_error != 0) return aicpu_submission_error;
                 sink.mark_submitted();
-                return record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicpu);
+                const int rc = record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicpu);
+                return rc == 0 ? queue_caller_exit(prepared) : rc;
             }
         );
         DeviceRunResultRegion published{};
@@ -3647,8 +3648,8 @@ TEST_F(NativeAdmissionTest, CaptureScopeWindowSurvivesSourceAndFailedReleaseWith
     EXPECT_NE(simpler_retain_run_resources(&runner, attempt.storage, &caller, &duplicate), 0);
     EXPECT_EQ(duplicate, nullptr);
     EXPECT_TRUE(runner.window(9600)) << "a duplicate retain discarded the original receipt window";
-    ASSERT_EQ(runner.admit_recording(*state->prepared_execution), 0);
-    state->recording = true;
+    ASSERT_EQ(runner.admit_external_submission(*state->prepared_execution), 0);
+    state->external_submission = true;
     state->completion_rc = 0;
     ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
     EXPECT_TRUE(runner.window(9600));
@@ -3756,7 +3757,7 @@ TEST_F(NativeAdmissionTest, RetainedPreparationSuccessfullyCollectsItsEagerScope
             (void)simpler_release_run_resources(&runner, reference);
         });
         ASSERT_TRUE(runner.window(state->identity().run_epoch));
-        ASSERT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), 0);
+        ASSERT_EQ(simpler_launch_run(&runner, attempt.storage), 0);
         EXPECT_FALSE(runner.window(state->identity().run_epoch));
         EXPECT_EQ(runner.scope_submissions, 1);
         ASSERT_EQ(simpler_poll_run(&runner, attempt.storage), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
@@ -3803,7 +3804,7 @@ TEST_F(NativeAdmissionTest, RetainedPreparationSwitchingToEagerWithdrawsItsUnuse
     // The backend refuses before submission; withdrawal belongs to common eager
     // admission and does not depend on synthetic device-completion evidence.
     runner.refuse_eager = true;
-    ASSERT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), -887);
+    ASSERT_EQ(simpler_launch_run(&runner, attempt.storage), -887);
     EXPECT_FALSE(runner.window(9604));
     EXPECT_FALSE(runner.ordinary_retention());
     ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
@@ -3855,7 +3856,8 @@ TEST_F(NativeAdmissionTest, OptionalResultNativeRecordingKeepsFiveModelsWithoutP
     class CaptureRunner : public PmuCaptureRunner {
     public:
         LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override {
-            if (!prepared.recording) return FencedCompletionRunner::launch_execution_impl(prepared, std::move(permit));
+            if (!prepared.external_submission)
+                return FencedCompletionRunner::launch_execution_impl(prepared, std::move(permit));
             prepared.streams = borrowed_run_streams();
             prepared.streams.aicpu = prepared.caller_stream;
             const int rc = arm_run_fence(prepared);
@@ -3958,8 +3960,8 @@ TEST_F(NativeAdmissionTest, CapturePmuWindowLivesThroughSourceRetirementAndFaile
     EXPECT_EQ(control().pmu_stop_calls, 0u);
     EXPECT_NE(state->prepared_execution->kernel_args.args.pmu_data_base, 0u);
     EXPECT_EQ(state->prepared_execution->kernel_args.args.pmu_run_terminal_bank, 0u);
-    ASSERT_EQ(runner.admit_recording(*state->prepared_execution), 0);
-    state->recording = true;
+    ASSERT_EQ(runner.admit_external_submission(*state->prepared_execution), 0);
+    state->external_submission = true;
     state->completion_rc = 0;
     ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
     EXPECT_EQ(control().pmu_stop_calls, 0u) << "original retirement must not release model protection";
@@ -3991,7 +3993,7 @@ public:
     bool supported{true};
     bool retain_ordinary{false};
     LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override {
-        if (prepared.recording) return Runner::launch_execution_impl(prepared, std::move(permit));
+        if (prepared.external_submission) return Runner::launch_execution_impl(prepared, std::move(permit));
         return FencedCompletionRunner::launch_execution_impl(prepared, std::move(permit));
     }
     bool window(uint64_t epoch) const { return dump_collector_.recorded_window_open(epoch); }
@@ -4051,7 +4053,7 @@ TEST_F(NativeAdmissionTest, CaptureArgsDumpColdRetentionUsesTheCommonResourceRef
     control().recording_active = true;
     ASSERT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), 0);
     control().recording_active = false;
-    EXPECT_TRUE(state->recording);
+    EXPECT_TRUE(state->external_submission);
     EXPECT_TRUE(runner.window(9800));
     EXPECT_EQ(runner.arm_calls, 1);
     ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
@@ -4191,8 +4193,8 @@ TEST_F(NativeAdmissionTest, TwoPmuModelsShareOneLeaseUntilBothReferencesEnd) {
         EXPECT_EQ(attempt.prepare(), 0);
         EXPECT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, reference), 0);
         auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
-        EXPECT_EQ(runner.admit_recording(*state->prepared_execution), 0);
-        state->recording = true;
+        EXPECT_EQ(runner.admit_external_submission(*state->prepared_execution), 0);
+        state->external_submission = true;
         state->completion_rc = 0;
         EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
     };
@@ -4252,7 +4254,7 @@ TEST_F(NativeAdmissionTest, DuplicatePmuRetainAfterUnexecutedReleasePreservesPub
     EXPECT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
 }
 
-TEST_F(NativeAdmissionTest, CaptureRetentionAcceptsAnAlreadyActiveCallerWithoutChangingOrdinaryAdmission) {
+TEST_F(NativeAdmissionTest, KernelExternalSubmissionUsesCallerRetentionDuringCapture) {
     ArgsDumpCaptureRunner runner;
     ASSERT_EQ(initialize_capture_runner(runner), 0);
     Attempt attempt(runner, 0, 9980);
@@ -4268,12 +4270,12 @@ TEST_F(NativeAdmissionTest, CaptureRetentionAcceptsAnAlreadyActiveCallerWithoutC
     control().recording_active = true;
     ASSERT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), 0);
     ASSERT_NE(reference, nullptr);
-    EXPECT_EQ(simpler_validate_caller_stream(&runner, &caller), PTO_RUNTIME_ERR_UNSUPPORTED);
+    EXPECT_EQ(simpler_validate_caller_stream(&runner, &caller), 0);
     auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
-    EXPECT_FALSE(state->recording);
-    EXPECT_FALSE(state->prepared_execution->recording);
+    EXPECT_FALSE(state->external_submission);
+    EXPECT_FALSE(state->prepared_execution->external_submission);
     EXPECT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), 0);
-    EXPECT_TRUE(state->recording);
+    EXPECT_TRUE(state->external_submission);
     control().recording_active = false;
     ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
     ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
@@ -4281,7 +4283,7 @@ TEST_F(NativeAdmissionTest, CaptureRetentionAcceptsAnAlreadyActiveCallerWithoutC
     cleanup.dismiss();
 }
 
-TEST_F(NativeAdmissionTest, CaptureRetentionRefusesInvalidatedAndQueryFailureBeforePublishingBacking) {
+TEST_F(NativeAdmissionTest, KernelExternalSubmissionDoesNotQueryCaptureStatus) {
     ArgsDumpCaptureRunner runner;
     ASSERT_EQ(initialize_capture_runner(runner), 0);
     Attempt attempt(runner, 0, 9981);
@@ -4289,62 +4291,60 @@ TEST_F(NativeAdmissionTest, CaptureRetentionRefusesInvalidatedAndQueryFailureBef
     ASSERT_EQ(attempt.prepare(), 0);
     int caller;
     RuntimeHandle reference = nullptr;
+    auto cleanup = RAIIScopeGuard([&] {
+        (void)simpler_finalize_run(&runner, attempt.storage);
+        if (reference != nullptr) (void)simpler_release_run_resources(&runner, reference);
+    });
+
+    control().capture_info_rc = -4255;
+    ASSERT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), 0);
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), 0);
+    const auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+    EXPECT_TRUE(state->external_submission);
+    const auto sync_count = control().observed_streams.size();
+    ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+    EXPECT_EQ(control().observed_streams.size(), sync_count);
+    ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
+    cleanup.dismiss();
+}
+
+TEST_F(NativeAdmissionTest, KernelRunOwnsItsSubmissionWithoutAResourceReference) {
+    ArgsDumpCaptureRunner runner;
+    ASSERT_EQ(initialize_capture_runner(runner), 0);
+    int caller;
+    for (const auto purpose : {SIMPLER_PREPARE_EAGER, SIMPLER_PREPARE_CAPTURE}) {
+        Attempt attempt(runner, 0, 9983 + static_cast<uint64_t>(purpose));
+        use_capture_preparation(attempt);
+        attempt.descriptor.prepare_purpose = purpose;
+        ASSERT_EQ(attempt.prepare(), 0);
+        auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
+        const std::weak_ptr<const PreparedRunResources> resources = state->prepared_execution->prepared_resources;
+        control().capture_info_rc = -4255;
+        ASSERT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), 0);
+        EXPECT_FALSE(state->external_submission);
+        EXPECT_FALSE(resources.expired());
+        ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
+        EXPECT_TRUE(resources.expired());
+    }
+}
+
+TEST_F(NativeAdmissionTest, ProgramRetentionRefusesAnActiveCapture) {
+    ArgsDumpCaptureRunner runner;
+    Attempt attempt(runner, 0, 9982);
+    attempt.args.tensor(0).address_space = AddressSpace::DEVICE;
+    attempt.args.tensor(0).transfer = TensorTransfer::NONE;
+    ASSERT_EQ(attempt.prepare(), 0);
+    int caller;
+    RuntimeHandle reference = nullptr;
     const size_t allocations = control().allocations;
     const size_t events = control().event_create_calls;
-    control().recording_invalidated = true;
+    control().recording_active = true;
     EXPECT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), PTO_RUNTIME_ERR_UNSUPPORTED);
-    EXPECT_EQ(reference, nullptr);
-    control().recording_invalidated = false;
-    control().capture_info_rc = -4255;
-    EXPECT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), -4255);
     EXPECT_EQ(reference, nullptr);
     EXPECT_EQ(control().allocations, allocations);
     EXPECT_EQ(control().event_create_calls, events);
-    control().capture_info_rc = 0;
-    control().recording_active = true;
-    ASSERT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), 0);
-    auto cleanup = RAIIScopeGuard([&] {
-        control().recording_active = false;
-        control().recording_invalidated = false;
-        control().capture_info_rc = 0;
-        (void)simpler_finalize_run(&runner, attempt.storage);
-        (void)simpler_release_run_resources(&runner, reference);
-    });
-    control().recording_invalidated = true;
-    EXPECT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), PTO_RUNTIME_ERR_UNSUPPORTED);
-    control().recording_invalidated = false;
-    control().capture_info_rc = -4255;
-    EXPECT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), -4255);
-    EXPECT_EQ(runner.launch_calls, 0);
-    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
-    EXPECT_FALSE(state->recording);
-    control().capture_info_rc = 0;
-    EXPECT_EQ(simpler_launch_run_on_stream(&runner, attempt.storage, &caller, nullptr), 0);
-    EXPECT_TRUE(state->recording);
-}
-
-TEST_F(NativeAdmissionTest, ActiveRetentionStillRefusesKernelEagerAndProgramPreparations) {
-    for (bool kernel : {false, true}) {
-        ArgsDumpCaptureRunner runner;
-        if (kernel) ASSERT_EQ(initialize_capture_runner(runner), 0);
-        Attempt attempt(runner, 0, kernel ? 9983 : 9982);
-        attempt.args.tensor(0).address_space = AddressSpace::DEVICE;
-        attempt.args.tensor(0).transfer = TensorTransfer::NONE;
-        ASSERT_EQ(attempt.prepare(), 0);
-        int caller;
-        RuntimeHandle reference = nullptr;
-        const size_t allocations = control().allocations;
-        const size_t events = control().event_create_calls;
-        control().recording_active = true;
-        EXPECT_EQ(
-            simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), PTO_RUNTIME_ERR_UNSUPPORTED
-        );
-        EXPECT_EQ(reference, nullptr);
-        EXPECT_EQ(control().allocations, allocations);
-        EXPECT_EQ(control().event_create_calls, events);
-        control().recording_active = false;
-        ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
-    }
+    control().recording_active = false;
+    ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
 }
 
 class ColdKernelRunner : public PmuCaptureRunner {
@@ -4365,7 +4365,8 @@ public:
         return run_result_storage_.size();
     }
     LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override {
-        if (!prepared.recording) return FencedCompletionRunner::launch_execution_impl(prepared, std::move(permit));
+        if (!prepared.external_submission)
+            return FencedCompletionRunner::launch_execution_impl(prepared, std::move(permit));
         prepared.streams = borrowed_run_streams();
         prepared.streams.aicpu = prepared.caller_stream;
         const int rc = arm_run_fence(prepared);
@@ -5232,7 +5233,7 @@ TEST_F(NativeAdmissionTest, EagerRetirementOfCapturePreparationCannotEraseItsSuc
     ASSERT_EQ(first.prepare(), 0);
     ASSERT_TRUE(runner.declare_caller_buffer_writes(1, &sa, 1));
     ASSERT_EQ(simpler_retain_run_resources(&runner, first.storage, &caller, &ar), 0);
-    ASSERT_EQ(simpler_launch_run_on_stream(&runner, first.storage, &caller, nullptr), 0);
+    ASSERT_EQ(simpler_launch_run(&runner, first.storage), 0);
     ASSERT_EQ(simpler_poll_run(&runner, first.storage), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
     // Actual execution retirement released the reservation, before finalize.
     EXPECT_TRUE(runner.caller_buffer_written_by_other_run(1, sa.addr, sa.bytes));
@@ -5984,8 +5985,8 @@ TEST_F(NativeAdmissionTest, CaptureSwimlaneWindowUsesTheCommonExternalReference)
     EXPECT_NE(simpler_retain_run_resources(&runner, attempt.storage, &caller, &duplicate), 0);
     EXPECT_EQ(duplicate, nullptr);
     EXPECT_TRUE(runner.window(9800));
-    ASSERT_EQ(runner.admit_recording(*state->prepared_execution), 0);
-    state->recording = true;
+    ASSERT_EQ(runner.admit_external_submission(*state->prepared_execution), 0);
+    state->external_submission = true;
     state->completion_rc = 0;
     ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
     EXPECT_TRUE(runner.window(9800));
@@ -6026,8 +6027,8 @@ TEST_F(NativeAdmissionTest, SwimlaneReleaseRetriesPendingCutAfterEventRetirement
     RuntimeHandle reference = nullptr;
     ASSERT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, &reference), 0);
     auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
-    ASSERT_EQ(runner.admit_recording(*state->prepared_execution), 0);
-    state->recording = true;
+    ASSERT_EQ(runner.admit_external_submission(*state->prepared_execution), 0);
+    state->external_submission = true;
     state->completion_rc = 0;
     ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
     SwimlaneRecordGate gate;
@@ -6211,8 +6212,8 @@ TEST_F(NativeAdmissionTest, SeparateDiagnosticModelsKeepIndependentCommonReferen
         ASSERT_EQ(attempt.prepare(), 0);
         ASSERT_EQ(simpler_retain_run_resources(&runner, attempt.storage, &caller, reference), 0);
         auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
-        ASSERT_EQ(runner.admit_recording(*state->prepared_execution), 0);
-        state->recording = true;
+        ASSERT_EQ(runner.admit_external_submission(*state->prepared_execution), 0);
+        state->external_submission = true;
         state->completion_rc = 0;
         ASSERT_EQ(simpler_finalize_run(&runner, attempt.storage), 0);
     };

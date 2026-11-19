@@ -470,7 +470,8 @@ private:
  * An already-published run is an idempotent no-op.
  */
 int publish_for_launch(
-    KernelArgsHelper &kernel_args, rtStream_t aicpu_stream, LaunchProgressSink &sink, bool retained_recording = false
+    KernelArgsHelper &kernel_args, rtStream_t aicpu_stream, LaunchProgressSink &sink, bool retained_recording = false,
+    bool kernel_mode = false
 );
 
 enum class RuntimeWorkerInit { OnPublication, BeforeRecording, DuringRecording };

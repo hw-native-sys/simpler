@@ -13,18 +13,20 @@ orchestration. Prepared information survives each execution; mutable scheduling
 state is initialized at the device boundary that excludes its previous writers.
 There is no separate Host-submitted reset task or new AICore launch ABI.
 
-Kernel-mode preparation initializes a new descriptor's handshake region once.
-The initial slots are ready before recording. If a retained graph still owns a
-slot's old backing, preparation initializes only the new backing's worker
-reports and restores the caller's thread capture mode before graph submission.
-The recorded descriptor DMA carries the host-owned prefix and excludes worker
-reports so replay preserves the current AICore startup reports. Preparation
-requires successful initialization and restoration before it can publish.
+Onboard Program and Kernel deliver the runtime descriptor and initial image in
+the AICPU launch. RTS resolves the Host input addresses. The entry gate
+initializes the writable state before schedulers start consuming the image.
+Caller-stream ordering also applies to prerequisite copies such as the A5
+scheduler state. A recorded model can run repeatedly or be destroyed before
+its first execution.
 
-Recording a publication does not prove that its DMA has executed. Captured
-descriptor copies always remain in the graph and do not populate the eager
-prefix cache. Destroying an unexecuted model therefore cannot make a later
-eager call omit its required descriptor publication.
+The ordinary A5 scheduler reads task descriptions, tensor descriptors and
+nested graphs directly from RTS storage. The gate restores the 64-byte status
+prefix and binds typed scheduler pointer fields to their image offsets. On
+A2/A3, the gate restores the header and binds the initial task table. During
+attachment, AICPU initializes the writable slots and progress bytes from each
+used record. Tensor, scalar and fanin offsets resolve relative to their original
+read-only record. The A2/A3 working table grows with the number of live slots.
 
 | Region | Preserved information | Per-execution state |
 | ------ | --------------------- | ------------------- |

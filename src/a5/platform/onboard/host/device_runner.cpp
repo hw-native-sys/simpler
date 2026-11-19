@@ -581,11 +581,8 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
     if (prepared.caller_stream != nullptr) prepared.streams.aicpu = prepared.caller_stream;
     const auto &streams = prepared.streams;
 
-    if (prepared.caller_stream != nullptr) {
-        bool recording = false;
-        const int rc = validate_caller_stream(prepared.caller_stream, &recording);
-        if (rc == 0 && recording != prepared.recording)
-            return LaunchTransactionResult{PTO_RUNTIME_ERR_UNSUPPORTED, LaunchProgress::NotStarted, LaunchReceipt{}};
+    if (prepared.caller_stream != nullptr && !execution_mode_latch_.is_kernel()) {
+        const int rc = validate_caller_stream(prepared.caller_stream);
         if (rc != 0) {
             return LaunchTransactionResult{rc, LaunchProgress::NotStarted, LaunchReceipt{}};
         }
@@ -606,7 +603,7 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
             try {
                 activate_launch_shape(runtime);
                 if (int fence_rc = arm_run_fence(prepared); fence_rc != 0) return fence_rc;
-                if (!prepared.recording) {
+                if (!prepared.external_submission) {
                     if (int arm_rc = arm_collectors_for_run(runtime, prepared); arm_rc != 0) return arm_rc;
                     // This run's own core types, resolved from its own prepared
                     // runtime and handed to admission. The resident copy the
@@ -689,8 +686,9 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
                 return PTO_RUNTIME_ERR_INTERNAL;
             }
 
-            if (!prepared.recording) run_progress_.claim(prepared.identity);
-            if (!prepared.recording) (void)run_progress_.publish(prepared.identity, RunProgressState::Enqueuing);
+            if (!prepared.external_submission) run_progress_.claim(prepared.identity);
+            if (!prepared.external_submission)
+                (void)run_progress_.publish(prepared.identity, RunProgressState::Enqueuing);
 
             // The successor's CPU stream may differ from its predecessor's.
             if (prepared.join.predecessor_owner != nullptr) {
@@ -703,16 +701,17 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
             // released to begin this run's AICore work. A record is not a wait and no stream
             // waits on it, so a successor's marker cannot stand in for the production wait
             // above. A failed record does not fail the run; it makes the position unavailable.
-            if (!prepared.recording)
+            if (!prepared.external_submission)
                 (void)mark_run_boundary(RunBoundaryMarks::Position::AicoreStart, prepared.identity, streams.aicore);
 
             LOG_INFO("=== launch_aicore_kernel ===");
-            if (!prepared.recording) (void)run_progress_.publish(prepared.identity, RunProgressState::Submitted);
+            if (!prepared.external_submission)
+                (void)run_progress_.publish(prepared.identity, RunProgressState::Submitted);
             int launch_rc =
                 launch_aicore_kernel(streams.aicore, prepared.kernel_args.args, prepared.kernel_args.aicore_view());
             if (launch_rc != 0) {
                 LOG_ERROR("launch_aicore_kernel failed: %d", launch_rc);
-                if (!prepared.recording) recover_device_or_mark_unusable(launch_rc);
+                if (!prepared.external_submission) recover_device_or_mark_unusable(launch_rc);
                 return launch_rc;
             }
             sink.mark_submitted();
@@ -764,13 +763,14 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
                 // AICore kernel had returned, which is what makes the time a *whole-operator*
                 // end rather than an AICPU-kernel end. Recorded only on this path, because only
                 // here does the stream position carry that meaning.
-                if (!prepared.recording)
+                if (!prepared.external_submission)
                     (void)mark_run_boundary(
                         RunBoundaryMarks::Position::WholeOperatorEnd, prepared.identity, streams.aicpu
                     );
             }
             const int boundary_rc = record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicpu);
-            if (!prepared.recording && boundary_rc == 0 && whole_operator) note_whole_operator_boundary(prepared);
+            if (!prepared.external_submission && boundary_rc == 0 && whole_operator)
+                note_whole_operator_boundary(prepared);
             if (boundary_rc != 0) return boundary_rc;
             return queue_caller_exit(prepared);
         }
@@ -1034,7 +1034,7 @@ void DeviceRunner::abandon_prepared_execution(PreparedExecution &prepared) noexc
 }
 
 int DeviceRunner::queue_own_boundary_wait(PreparedExecution &prepared, rtStream_t aicpu_stream, void *core_done) {
-    if (prepared.recording) return aclrtStreamWaitEvent(static_cast<aclrtStream>(aicpu_stream), core_done);
+    if (prepared.external_submission) return aclrtStreamWaitEvent(static_cast<aclrtStream>(aicpu_stream), core_done);
     const aclError wait_rc = aclrtStreamWaitEvent(static_cast<aclrtStream>(aicpu_stream), core_done);
     // The API documents no guarantee that a failure means the wait was not
     // queued, so the reference is committed either way: a revoked reservation

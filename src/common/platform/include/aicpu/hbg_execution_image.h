@@ -21,11 +21,30 @@ int32_t restore_hbg_execution_image(const void *packet, Invalidate invalidate, F
     HbgExecutionImage image{};
     invalidate(packet, sizeof(image));
     std::memcpy(&image, packet, sizeof(image));
-    if (image.working_address == 0 || image.bytes == 0 || image.bytes > UINT32_MAX) return -1;
+    if (image.working_address == 0 || image.bytes == 0 || image.bytes > UINT32_MAX ||
+        image.mutable_prefix_bytes > image.bytes ||
+        image.reference_count > (UINT32_MAX - image.bytes) / sizeof(HbgImageReference))
+        return -1;
     const auto *source = static_cast<const unsigned char *>(packet) + sizeof(image);
     auto *target = reinterpret_cast<void *>(image.working_address);
-    invalidate(source, static_cast<size_t>(image.bytes));
-    std::memcpy(target, source, static_cast<size_t>(image.bytes));
-    flush(target, static_cast<size_t>(image.bytes));
+    // The scheduler passes aligned tensor descriptors to AICore callables.
+    if (image.reference_count != 0 && reinterpret_cast<uintptr_t>(source) % 64 != 0) return -1;
+    invalidate(source, image.bytes + image.reference_count * sizeof(HbgImageReference));
+    if (image.mutable_prefix_bytes != 0) {
+        std::memcpy(target, source, image.mutable_prefix_bytes);
+        flush(target, image.mutable_prefix_bytes);
+    }
+    const auto *references = source + image.bytes;
+    for (size_t i = 0; i < image.reference_count; ++i) {
+        HbgImageReference ref{};
+        std::memcpy(&ref, references + i * sizeof(ref), sizeof(ref));
+        if (ref.device_field_address == 0 || ref.device_field_address % alignof(uint64_t) != 0 ||
+            ref.image_offset >= image.bytes)
+            return -1;
+        auto *field = reinterpret_cast<uint64_t *>(ref.device_field_address);
+        invalidate(field, sizeof(*field));
+        *field = reinterpret_cast<uint64_t>(source + ref.image_offset);
+        flush(field, sizeof(*field));
+    }
     return 0;
 }

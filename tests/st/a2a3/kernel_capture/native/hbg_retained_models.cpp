@@ -170,7 +170,8 @@ int main(int argc, char **argv) {
     verify("a-recorded");
     require(simpler_unregister_callable(ctx, 0) == PTO_RUNTIME_ERR_INVALID_STATE, "a-retains-callable");
     require(finalize_device(ctx) == PTO_RUNTIME_ERR_INVALID_STATE, "a-retains-context");
-    prepare(1, 1, 5, true);
+    // The plain INOUT scenario grows the execution image before replaying A.
+    prepare(1, 1, argc == 6 ? -5 : 5, true);
     verify("b-prepared");
     const auto model_b = record(reference_b);
     require(model_a != model_b && reference_a != reference_b, "independent-models-and-references");

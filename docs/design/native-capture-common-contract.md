@@ -28,8 +28,8 @@ Use `simpler_prepare_run` outside capture with a `NativeRunDescriptor`:
 
 | `prepare_purpose` | Contract |
 | ----------------- | -------- |
-| `SIMPLER_PREPARE_EAGER` (zero) | Ordinary preparation; cannot be upgraded to recording at launch. |
-| `SIMPLER_PREPARE_CAPTURE` | Kernel capture preparation; rejects unsupported Host effects before orchestration. |
+| `SIMPLER_PREPARE_EAGER` (zero) | The original run owns the submission. Kernel callers can record a diagnostic-free run on their stream and keep the run alive through model destruction. |
+| `SIMPLER_PREPARE_CAPTURE` | Checks Host effects before Kernel orchestration. The caller can retain a separate owner to finalize the original run before replay. |
 
 All native callers must rebuild against the current `NativeRunDescriptor`
 layout. `simpler_prepare_run` and `simpler_run` use that same descriptor.
@@ -51,7 +51,16 @@ is separate from starting user tasks.
 
 ## Recording and replay
 
-The caller retains the preparation before `CaptureBegin`. The required order is:
+A diagnostic-free Kernel caller can keep its ordinary run alive for the model's lifetime. The same launch entry submits to an eager stream or a recording stream.
+
+```text
+prepare_run -> RTS CaptureBegin -> launch_run_on_stream -> RTS CaptureEnd
+  -> RTS model execute / synchronize (zero or more times)
+  -> destroy the model -> finalize_run
+```
+
+When the caller needs to finalize the original run before replay or collect a
+recorded diagnostic window, it acquires a separate reference before `CaptureBegin`.
 
 ```text
 prepare_run(CAPTURE) -> retain_run_resources
@@ -67,14 +76,16 @@ The exact native entry names are `simpler_prepare_run`,
 `simpler_finalize_run` (or `simpler_finalize_run_with_delivery`) and
 `simpler_release_run_resources`. Model operations belong to the caller's RTS API.
 
-Active recording requires Kernel mode, capture-purpose preparation, a matching
+The detached submission uses Kernel mode, capture-purpose preparation, a matching
 retained reference and caller stream, and no predecessor argument. Diagnostics
 allow ScopeStats alone on native A3 TMR, or one of PMU, ArgsDump and Swimlane
 on native A3 TMR/HBG.
 Each supported family reserves and arms its collection window during retention,
-before capture; other diagnostic families and combinations remain refused. Duplicate recording,
-invalidated capture and unsupported combinations are refused. A capture query or
-refusal does not prove that accepted device work has completed.
+before submission. Simpler selects the ownership path from the caller's
+preparation and retained reference. RTS decides whether to enqueue or record
+the tasks and reports stream errors. The same externally owned submission can
+be used on an eager stream. To observe an eager run with Simpler after retaining
+a preparation, call `simpler_launch_run` with the bound stream.
 
 Publication precedes the entry fork. The AICore stream waits for that fork;
 completion events follow the corresponding device kernels, and the caller's
@@ -92,7 +103,7 @@ A5 Graph argument publication into the heap is recorded and replayed before its
 consumers. Heap contents are invocation-local; persistent outputs remain in
 caller-owned tensors. No new model owner or implicit cross-stream ordering is added.
 
-For a recording, `simpler_poll_run` reports a poll error and both native wait
+For an externally owned submission, `simpler_poll_run` reports a poll error and both native wait
 entries return `UNSUPPORTED`; none reports execution completion. Finalization
 ends the original Host run without synchronizing recorded device execution or
 copying Program outputs. The retained reference remains responsible for future

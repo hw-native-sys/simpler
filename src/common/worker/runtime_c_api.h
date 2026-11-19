@@ -1147,9 +1147,10 @@ int simpler_run(
  * sequential call is permitted. This guard does not serialize different
  * threads, which remain subject to the context's native reservation rules.
  *
- * Capture callers set descriptor.prepare_purpose before preparation. HOST/NONE
- * controls must be IN: their prepare-time values determine fixed task arguments,
- * not values re-read by each replay. Eager preparation cannot later be recorded.
+ * Kernel callers may capture a diagnostic-free ordinary run and keep it alive
+ * through the last replay and model destruction. Set SIMPLER_PREPARE_CAPTURE to
+ * check that HOST/NONE controls are IN before host orchestration or to acquire
+ * a detached model resource reference. Replays use the prepared control values.
  */
 int simpler_prepare_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
@@ -1166,12 +1167,14 @@ int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx);
  * Launch a prepared run. Returns only after the platform has published its
  * real kernel-launch marker, or after execution terminates before that marker.
  * The acceptance sink captured by prepare is published at that marker; an
- * execution failure before the marker leaves it unchanged.
+ * execution failure before the marker leaves it unchanged. An eager Kernel
+ * run may also use this entry when resource retention has bound its stream.
  */
 int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 
 /**
- * Check the execution environment and reject capture before per-call preparation.
+ * Check the execution environment before per-call preparation. Program mode
+ * also rejects capture. Kernel mode leaves stream submission to RTS.
  * No run is admitted or published. A successful check does not reserve the stream;
  * the caller serializes capture changes and keeps it live through finalization.
  */
@@ -1186,23 +1189,20 @@ int simpler_validate_execution_context(DeviceContextHandle ctx);
 
 /**
  * Submit a prepared native run between the caller stream's preceding and
- * following work. For eager execution, the caller retains its stream and
- * external tensor storage through run finalization. For recording, the borrowed
- * execution environment, stream and device tensors remain valid through all
- * model/external uses and resource-reference release. Prepare runs outside
- * capture. An active capture requires a resource reference retained before
- * CaptureBegin and no predecessor. Supported diagnostics are ScopeStats alone
- * on A3 TMR, or one of PMU, ArgsDump and Swimlane on A3 TMR/HBG. The same task sequence is
- * recorded once; an invalidated capture is refused before publication.
- * `predecessor`, when non-null outside capture, has the joined-launch contract.
+ * following work. Kernel submission does not query RTS capture status.
+ * The caller keeps its stream, original run and external tensors alive through
+ * finalization, including all uses by a model recorded on the stream. A non-null predecessor
+ * follows the joined-launch contract.
  *
- * Both owned and borrowed contexts use the same native run. A borrowed context
- * requires this explicit stream entry. Poll/wait/finalize retain the run and
- * its event references through the caller's exit wait. A partial enqueue
- * failure in eager poisons the execution domain; it is not a rollback permission.
- * During recording, poll/wait do not report execution completion; finalize
- * ends only the Host run without synchronization or output copyback. RTS owns
- * failed/cancelled capture teardown. The external reference must survive it.
+ * To finalize the Host run before model use ends, prepare with SIMPLER_PREPARE_CAPTURE,
+ * retain the resources on this stream before launch and pass a null predecessor.
+ * Poll and wait are unavailable for this submission. Finalize releases the
+ * Host run without a device wait or output copyback. The caller keeps the
+ * borrowed context, streams, tensors and retained reference alive until
+ * all external execution has completed and any captured model is destroyed
+ * or the capture is cancelled. The caller then releases the reference.
+ * RTS handles enqueue and capture errors.
+ *
  * Host recording support does not qualify the runtime's device replay reset
  * protocol; repeated hardware replay still requires that implementation.
  */
@@ -1319,9 +1319,9 @@ int simpler_observe_framework_submissions(DeviceContextHandle ctx, int *all_obse
 
 /**
  * Retain preparation backing independently of the original Prepared run;
- * exactly one retention is allowed per run. Kernel capture-purpose preparations
- * allow an already ACTIVE caller stream, verified by its actual capture status.
- * Other preparations require a caller stream outside recording.
+ * exactly one retention is allowed per run. Kernel retention binds the caller
+ * stream without querying capture status. Program requires a stream outside
+ * recording.
  * The output is a resource reference, not an executable RuntimeHandle. The
  * caller still finalizes the original run. Success submits no user task and
  * does not advertise capture/replay support on this backend.

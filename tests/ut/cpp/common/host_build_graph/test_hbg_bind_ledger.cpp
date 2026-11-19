@@ -2941,6 +2941,7 @@ TEST_F(HbgBindLedgerTest, LaunchStagingOwnsPrerequisitesAndImageWithoutPrepareDe
         void *target;
         std::vector<uint8_t> bytes;
         bool execution_image;
+        size_t target_bytes;
     };
     struct Staging {
         std::vector<Captured> captured;
@@ -2948,6 +2949,8 @@ TEST_F(HbgBindLedgerTest, LaunchStagingOwnsPrerequisitesAndImageWithoutPrepareDe
         int rc{0};
     } staging;
     HostApiOps ops = fake_ops();
+    const bool a5 = std::strcmp(get_platform(), "a5sim") == 0;
+    ops.launch_owns_execution_image = a5;
     ops.stage_launch_metadata = [](void *ctx, uint32_t slot, const HostMetadataRegion *regions, size_t count) {
         EXPECT_EQ(slot, 0u);
         auto &state = *static_cast<Staging *>(ctx);
@@ -2956,16 +2959,17 @@ TEST_F(HbgBindLedgerTest, LaunchStagingOwnsPrerequisitesAndImageWithoutPrepareDe
         state.captured.clear();
         for (size_t i = 0; i < count; ++i) {
             const auto *source = static_cast<const uint8_t *>(regions[i].host_source);
+            const auto &region = regions[i];
+            const size_t target_bytes = std::min<uint64_t>(region.bytes, region.mutable_prefix_bytes);
             state.captured.push_back(
-                {regions[i].device_target, {source, source + regions[i].bytes}, regions[i].execution_image}
+                {region.device_target, {source, source + region.bytes}, region.execution_image, target_bytes}
             );
         }
         return 0;
     };
     api_ = HostApi(&staging, 0, 0, 1, &ops);
-    const bool a5 = std::strcmp(get_platform(), "a5sim") == 0;
-    for (TestOrchEntryFunc entry : {ordinary_orch_entry, recording_orch_entry, ordinary_orch_entry}) {
-        SCOPED_TRACE(entry == ordinary_orch_entry ? "resident" : "graph");
+    for (TestOrchEntryFunc entry : {ordinary_orch_entry, recording_orch_entry, empty_orch_entry, ordinary_orch_entry}) {
+        SCOPED_TRACE(entry == empty_orch_entry ? "empty" : entry == ordinary_orch_entry ? "resident" : "graph");
         eps_ = {entry, capture_orch_bind};
         ChipStorageTaskArgs args;
         ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
@@ -2975,14 +2979,34 @@ TEST_F(HbgBindLedgerTest, LaunchStagingOwnsPrerequisitesAndImageWithoutPrepareDe
         std::vector<Captured> expected;
         for (const auto &region : pending.prerequisites) {
             const auto *source = static_cast<const uint8_t *>(region.source);
-            expected.push_back({region.device_target, {source, source + region.bytes}, false});
+            expected.push_back({region.device_target, {source, source + region.bytes}, false, region.bytes});
             std::memset(region.device_target, 0xa5, region.bytes);
         }
         void *image_target = pending.device_target;
         const auto *image_source = static_cast<const uint8_t *>(pending.source);
         const std::vector<uint8_t> image(image_source, image_source + pending.bytes);
-        expected.push_back({image_target, image, true});
-        std::memset(image_target, 0xa5, pending.bytes);
+        const size_t target_bytes = std::min(pending.bytes, pending.mutable_prefix_bytes);
+        if (a5) {
+            EXPECT_EQ(target_bytes, 64u);
+            EXPECT_EQ(fake_.requested_arena_bytes, target_bytes);
+            ASSERT_LT(target_bytes, pending.bytes);
+            ASSERT_FALSE(pending.image_references.empty());
+            std::unordered_set<uint64_t> fields;
+            for (const auto &ref : pending.image_references) {
+                ASSERT_LT(ref.image_offset, pending.bytes);
+                ASSERT_TRUE(fields.insert(ref.device_field_address).second);
+                const auto &state = pending.prerequisites.front();
+                const auto base = reinterpret_cast<uintptr_t>(state.device_target);
+                ASSERT_GE(ref.device_field_address, base);
+                const auto offset = ref.device_field_address - base;
+                ASSERT_LE(offset + sizeof(uint64_t), state.bytes);
+                uint64_t original = 0;
+                std::memcpy(&original, static_cast<const uint8_t *>(state.source) + offset, sizeof(original));
+                EXPECT_EQ(original, reinterpret_cast<uintptr_t>(image_target) + ref.image_offset);
+            }
+        }
+        expected.push_back({image_target, image, true, target_bytes});
+        std::memset(image_target, 0xa5, target_bytes);
         const int copies = fake_.copy_count;
         const int calls = staging.calls;
         ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
@@ -2992,9 +3016,10 @@ TEST_F(HbgBindLedgerTest, LaunchStagingOwnsPrerequisitesAndImageWithoutPrepareDe
         for (size_t i = 0; i < expected.size(); ++i) {
             EXPECT_EQ(staging.captured[i].target, expected[i].target);
             EXPECT_EQ(staging.captured[i].bytes, expected[i].bytes);
+            EXPECT_EQ(staging.captured[i].target_bytes, expected[i].target_bytes);
             EXPECT_EQ(staging.captured[i].execution_image, expected[i].execution_image);
             const auto *target = static_cast<const uint8_t *>(expected[i].target);
-            EXPECT_TRUE(std::all_of(target, target + expected[i].bytes.size(), [](uint8_t b) {
+            EXPECT_TRUE(std::all_of(target, target + expected[i].target_bytes, [](uint8_t b) {
                 return b == 0xa5;
             }));
         }

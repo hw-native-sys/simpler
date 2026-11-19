@@ -354,7 +354,7 @@ DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, 
 
     LaunchTransactionResult transaction;
     try {
-        if (!outcome.prepared->recording && outcome.prepared->dfx.diagnostics_any()) {
+        if (!outcome.prepared->external_submission && outcome.prepared->dfx.diagnostics_any()) {
             std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
             for (auto &[key, reference] : external_run_references_) {
                 if (reference->identity != outcome.prepared->identity) continue;
@@ -416,7 +416,7 @@ DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, 
         outcome.active = std::move(active);
     }
     const auto *execution = outcome.active ? outcome.active->prepared.get() : outcome.prepared.get();
-    if (outcome.poisoned() && (execution == nullptr || !execution->recording)) {
+    if (outcome.poisoned() && (execution == nullptr || !execution->external_submission)) {
         // Ownership and the launch result survive a failure in recovery itself.
         try {
             recover_device_or_mark_unusable(outcome.rc);
@@ -4256,19 +4256,14 @@ static_assert(sizeof(aclmdlRICaptureStatus) == sizeof(uint32_t));
 static_assert(alignof(aclmdlRICaptureStatus) == alignof(uint32_t));
 static_assert(ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE == 1);
 
-int DeviceRunnerBase::validate_caller_stream(rtStream_t caller, bool *recording) {
-    if (recording != nullptr) *recording = false;
+int DeviceRunnerBase::validate_caller_stream(rtStream_t caller) {
     if (caller == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
     int rc = enter_run_thread();
-    if (rc != 0) return rc;
+    if (rc != 0 || execution_mode_latch().is_kernel()) return rc;
     aclmdlRICaptureStatus status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
     aclmdlRI model = nullptr;
     rc = aclmdlRICaptureGetInfo(caller, &status, &model);
     if (rc != 0) return rc;
-    if (status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE && recording != nullptr) {
-        *recording = true;
-        return 0;
-    }
     if (status != ACL_MODEL_RI_CAPTURE_STATUS_NONE) return PTO_RUNTIME_ERR_UNSUPPORTED;
     return 0;
 }
@@ -4285,7 +4280,7 @@ bool DeviceRunnerBase::capture_diagnostics_supported(const PreparedExecution &pr
            prepared.scope_stats_capacity.complete() && dfx.scope_stats_enabled;
 }
 
-int DeviceRunnerBase::admit_recording(PreparedExecution &prepared) {
+int DeviceRunnerBase::admit_external_submission(PreparedExecution &prepared) {
     if (!execution_mode_latch().is_kernel() || !capture_diagnostics_supported(prepared) ||
         prepared.join.predecessor_owner != nullptr)
         return PTO_RUNTIME_ERR_UNSUPPORTED;
@@ -4293,12 +4288,12 @@ int DeviceRunnerBase::admit_recording(PreparedExecution &prepared) {
     std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
     for (auto &[key, reference] : external_run_references_) {
         if (!(reference->identity == prepared.identity)) continue;
-        if (reference->release_requested || reference->closing || reference->recording ||
+        if (reference->release_requested || reference->closing || reference->external_submission ||
             reference->caller_stream != prepared.caller_stream || reference->resources != prepared.prepared_resources ||
             !prepared.streams.ready())
             return PTO_RUNTIME_ERR_INVALID_STATE;
-        reference->recording = true;
-        prepared.recording = true;
+        reference->external_submission = true;
+        prepared.external_submission = true;
         if (prepared.kernel_args.args.run_result_data_base != 0)
             set_result_retain_evidence(prepared.identity.run_epoch, prepared.pipeline_slot);
         // A retained block must publish even if eager left an identical prefix.
@@ -4310,7 +4305,10 @@ int DeviceRunnerBase::admit_recording(PreparedExecution &prepared) {
 
 int DeviceRunnerBase::queue_run_entry(PreparedExecution &prepared, LaunchProgressSink &sink) {
     return submission_storage_[prepared.pipeline_slot]->caller_order->fork(prepared.identity, sink, [&] {
-        const int rc = publish_for_launch(prepared.kernel_args, prepared.streams.aicpu, sink, prepared.recording);
+        const int rc = publish_for_launch(
+            prepared.kernel_args, prepared.streams.aicpu, sink, prepared.external_submission,
+            execution_mode_latch().is_kernel()
+        );
         if (rc == 0 && prepared.kernel_args.args.run_result_data_base != 0) {
             std::lock_guard<std::mutex> lock(run_result_mu_);
             run_result_storage_.at(prepared.identity.run_epoch).initialized = true;
@@ -4443,10 +4441,7 @@ int DeviceRunnerBase::retain_external_run_resources(
         (prepared.dfx.diagnostics_any() && !execution_mode_latch().is_kernel()))
         return PTO_RUNTIME_ERR_UNSUPPORTED;
     std::lock_guard<std::mutex> external_lock(external_reference_mutex_);
-    bool recording = false;
-    int rc = validate_caller_stream(
-        caller_stream, execution_mode_latch().is_kernel() && purpose == SIMPLER_PREPARE_CAPTURE ? &recording : nullptr
-    );
+    int rc = validate_caller_stream(caller_stream);
     if (rc != 0) return rc;
     if (!can_accept_run() || (execution_mode_latch().is_kernel() && !kernel_exec_state_.accepts_dispatch()))
         return PTO_RUNTIME_ERR_INVALID_STATE;
@@ -4637,9 +4632,9 @@ int DeviceRunnerBase::release_external_run_resources(void *key) {
         // it cannot establish destruction or completion on other replay streams.
         rc = aclrtSynchronizeStreamWithTimeout(reference->caller_stream, timeout_config_.stream_sync_timeout_ms);
         if (rc != 0) return rc;
-        if (reference->recording) {
+        if (reference->external_submission) {
             auto &storage = *reference->resources->submission_;
-            rc = storage.caller_order->end_recording(reference->identity);
+            rc = storage.caller_order->end_external_use(reference->identity);
             if (rc == 0) rc = storage.caller_order->retire(reference->identity);
             if (rc == 0) rc = storage.fence->retire(reference->identity);
             if (rc != 0) return rc;
@@ -4651,7 +4646,7 @@ int DeviceRunnerBase::release_external_run_resources(void *key) {
             // while the collector establishes its reader-quiescence boundary.
             std::lock_guard<std::mutex> native_lock(native_run_mu_);
             for (size_t index = 0; index < active_native_run_count_; ++index) {
-                if (!reference->recording || active_native_runs_[index].identity != reference->identity)
+                if (!reference->external_submission || active_native_runs_[index].identity != reference->identity)
                     return PTO_RUNTIME_ERR_INVALID_STATE;
             }
             if (reference->swimlane_window) {
@@ -5110,7 +5105,7 @@ DeviceRunnerBase::note_joined_launch(const NativeRunJoin &join, const NativeRunI
 }
 
 int DeviceRunnerBase::open_own_boundary_wait(const PreparedExecution &prepared, void **core_done_out) {
-    if (prepared.recording) {
+    if (prepared.external_submission) {
         *core_done_out =
             run_fence(prepared.pipeline_slot).boundary_event(prepared.identity, RunCompletionFence::StreamRole::Aicore);
         return *core_done_out == nullptr ? PTO_RUNTIME_ERR_INVALID_STATE : 0;

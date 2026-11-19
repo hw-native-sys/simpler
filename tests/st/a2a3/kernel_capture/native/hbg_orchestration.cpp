@@ -48,7 +48,9 @@ extern "C" void hbg_capture_orchestration(const ChipTaskArgs &args) {
         const auto increment = scenario == 6 ?
                                    static_cast<uint64_t>(get_tensor_data<int32_t>(args.tensor(2).ref(), 1, index)) :
                                    uint64_t{3};
-        chain(input, output, scenario == 1, increment);
+        const int chains = scenario == 16 ? 5 : 1;
+        for (int i = 0; i < chains; ++i)
+            chain(input, output, scenario == 1, increment + i);
         return;
     }
     GraphTaskArgs boundary;
@@ -63,10 +65,15 @@ extern "C" void hbg_capture_orchestration(const ChipTaskArgs &args) {
 }
 
 extern "C" void hbg_inout_orchestration(const ChipTaskArgs &args) {
-    CoreTaskArgs task;
-    task.add_inout(args.tensor(0).ref());
-    task.add_scalar(args.scalar<int32_t>(0));
-    rt_submit_aiv_task(0, task);
+    const int32_t increment = args.scalar<int32_t>(0);
+    // The retained-model test records B with five dependent increments.
+    const int32_t tasks = increment == -5 ? 5 : 1;
+    for (int32_t i = 0; i < tasks; ++i) {
+        CoreTaskArgs task;
+        task.add_inout(args.tensor(0).ref());
+        task.add_scalar(tasks == 1 ? increment : 1);
+        rt_submit_aiv_task(0, task);
+    }
 }
 
 extern "C" void hbg_shared_heap_orchestration(const ChipTaskArgs &args) {

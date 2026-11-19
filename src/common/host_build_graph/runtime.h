@@ -39,6 +39,7 @@
 #include <vector>
 
 #include "common/core_type.h"
+#include "common/hbg_execution_image.h"
 #include "common/runtime_shared_state.h"
 #include "common/device_phase.h"
 #include "common/host_phase_kind.h"
@@ -477,6 +478,8 @@ private:
             uint64_t fanin_elems;
             uint64_t tensor_elems;
             uint64_t scalar_elems;
+            uint64_t mutable_prefix_bytes{UINT64_MAX};
+            std::vector<HbgImageReference> image_references;
             std::vector<MetadataRegion> prerequisites;
             std::vector<std::shared_ptr<const void>> resources;
         };
@@ -509,6 +512,11 @@ public:
         pending.tensor_elems = tensor_elems;
         pending.scalar_elems = scalar_elems;
     }
+    void set_execution_image_binding(uint64_t mutable_prefix_bytes, std::vector<HbgImageReference> references) {
+        auto &publication = host_.pending_publication_;
+        publication.mutable_prefix_bytes = mutable_prefix_bytes;
+        publication.image_references = std::move(references);
+    }
     void add_pending_metadata(
         void *target, const void *source, size_t bytes, HostPhaseKind phase, std::string attributes,
         std::vector<uint8_t> storage = {}
@@ -531,6 +539,7 @@ public:
     // already belong to staged launch metadata; retain no duplicate sources.
     void retain_prepared_publication(RunImagePublication publication) {
         publication.prerequisites.clear();
+        std::vector<HbgImageReference>().swap(publication.image_references);
         host_.prepared_publication_ = std::make_shared<const RunImagePublication>(std::move(publication));
     }
     std::shared_ptr<const RunImagePublication> prepared_publication() const { return host_.prepared_publication_; }

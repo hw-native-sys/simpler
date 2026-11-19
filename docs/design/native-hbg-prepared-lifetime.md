@@ -16,8 +16,8 @@ A completed execution is not authorization to destroy a model's backing.
 | -------- | ---------------------- |
 | Caller context, stream and external tensors | Caller-owned; valid through all recorded and in-flight uses. |
 | Callable code and registration | Simpler retains the actual callable lease; referenced code cannot be unregistered. Unrelated callables remain independent. |
-| Kernel Runtime descriptor and initial HBG execution image | RTS copies the Host launch inputs into argument storage. Its model holds the snapshots for replay. Simpler can retire the Host image staging and launch packet with the original run. |
-| HBG writable execution arena | Simpler retains the arena named in the launch inputs. Kernel AICPU restores the RTS snapshot before each eager or replay execution. Program initializes the arena through explicit publication. |
+| Runtime descriptor and initial HBG execution image | Onboard Program and Kernel pass these as RTS Host inputs. RTS owns the snapshot for execution and retains it with a captured model for replay. |
+| HBG writable execution arena | The run owns the writable backing, or a retained resource reference can extend its lifetime. The ordinary A5 scheduler restores a 64-byte status prefix. A2/A3 restore the runtime and shared headers and initialize writable task slots from RTS records. |
 | Pinned sources for explicit copies | Simpler submission storage retains pinned sources for the lifetime of recorded copies and any in-flight DMA. |
 | Shared state and scheduler resources | Simpler retains the shared AICPU/AICore backing, each workspace lease, and scheduler notification and counter owners until the last use. Both device roles receive the same shared addresses. |
 | HBG GM heap | Preparation retains a fixed heap lease through its last use, including external model uses. |

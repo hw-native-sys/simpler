@@ -106,12 +106,13 @@ bool launch_entry_args_permitted(rtStream_t aicpu_stream) {
 }
 
 int publish_for_launch(
-    KernelArgsHelper &kernel_args, rtStream_t aicpu_stream, LaunchProgressSink &sink, bool retained_recording
+    KernelArgsHelper &kernel_args, rtStream_t aicpu_stream, LaunchProgressSink &sink, bool retained_recording,
+    bool kernel_mode
 ) {
     if (kernel_args.runtime_args_published()) return 0;
     // RTS delivery does not depend on the stream's capture status.
-    const bool permitted =
-        kernel_args.uses_rts_runtime_args() || retained_recording || launch_entry_args_permitted(aicpu_stream);
+    const bool permitted = kernel_mode || kernel_args.uses_rts_runtime_args() || retained_recording ||
+                           launch_entry_args_permitted(aicpu_stream);
     const int rc = kernel_args.publish_runtime_args(permitted, aicpu_stream, sink, retained_recording);
     if (rc != 0) {
         LOG_ERROR("publish_for_launch: launch metadata publication failed: %d", rc);
@@ -436,14 +437,29 @@ int KernelArgsHelper::publish_runtime_args(
         runtime_launch_image_.resize(runtime_launch_bytes_);
         if (!runtime_image_.read(0, runtime_launch_image_.data(), runtime_launch_image_.size()))
             return PTO_RUNTIME_ERR_INTERNAL;
-        const size_t image_offset = descriptor_offset + runtime_launch_bytes_;
+        size_t package_bytes = descriptor_offset + runtime_launch_bytes_;
+        size_t image_offset = 0;
         const HostMetadataRegion image = launch_metadata_.execution_image();
-        size_t package_bytes = image_offset;
         if (image.bytes != 0) {
-            if (sizeof(HbgExecutionImage) > UINT32_MAX - image_offset ||
-                image.bytes > UINT32_MAX - image_offset - sizeof(HbgExecutionImage))
+            // Host Input points at the header. The records following that header
+            // need cache-line alignment relative to the start of the RTS package.
+            constexpr size_t image_alignment = 64;
+            if (package_bytes > UINT32_MAX - sizeof(HbgExecutionImage) - (image_alignment - 1))
                 return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-            package_bytes += sizeof(HbgExecutionImage) + image.bytes;
+            const size_t data_offset =
+                (package_bytes + sizeof(HbgExecutionImage) + image_alignment - 1) & ~(image_alignment - 1);
+            if (image.bytes > UINT32_MAX - data_offset) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+            image_offset = data_offset - sizeof(HbgExecutionImage);
+            package_bytes = data_offset + image.bytes;
+            if (image.reference_count > (UINT32_MAX - package_bytes) / sizeof(HbgImageReference))
+                return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+            package_bytes += image.reference_count * sizeof(HbgImageReference);
+            // CANN StarsArgManager uses 8-byte slots in its per-stream pool
+            // for packets up to 4 KiB on ARM (1 KiB on x86). A direct image
+            // needs the cache-line-aligned device argument allocation.
+            constexpr size_t stream_pool_limit = 4096;
+            if (image.reference_count != 0)
+                package_bytes = std::max(package_bytes, stream_pool_limit + image_alignment);
         }
         slot_->launch_package.resize(package_bytes);
         std::memset(slot_->launch_package.data() + launch_payload_bytes_, 0, descriptor_offset - launch_payload_bytes_);
@@ -467,10 +483,18 @@ int KernelArgsHelper::publish_runtime_args(
             host_input_count_ = 2;
         }
         if (image.bytes != 0) {
-            const HbgExecutionImage binding{reinterpret_cast<uint64_t>(image.device_target), image.bytes};
+            const HbgExecutionImage binding{
+                reinterpret_cast<uint64_t>(image.device_target), image.bytes, image.mutable_prefix_bytes,
+                image.reference_count
+            };
             auto *section = slot_->launch_package.data() + image_offset;
             std::memcpy(section, &binding, sizeof(binding));
             std::memcpy(section + sizeof(binding), image.host_source, image.bytes);
+            if (image.reference_count != 0)
+                std::memcpy(
+                    section + sizeof(binding) + image.bytes, image.image_references,
+                    image.reference_count * sizeof(HbgImageReference)
+                );
             host_inputs_[host_input_count_++] = {
                 static_cast<uint32_t>(offsetof(KernelArgs, execution_image)), static_cast<uint32_t>(image_offset)
             };

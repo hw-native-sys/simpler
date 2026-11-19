@@ -1734,7 +1734,7 @@ TEST(ChipRunLaneTest, CapturePreparesTwoDistinctGrantedSetsWithoutLaunchingOrDra
     worker.finalize();
 }
 
-TEST(ChipRunLaneTest, CapturePreparedCarrierFinalizationDelegatesWithoutEagerWait) {
+TEST(ChipRunLaneTest, CapturePreparedCarrierWithoutDetachedReferenceWaitsOnFinalize) {
     ChipWorker worker;
     prime_worker(worker);
     worker.execution_environment_ = ChipWorker::ExecutionEnvironment{static_cast<uint64_t>(getpid()), 1, 1, 0, true};
@@ -1751,7 +1751,7 @@ TEST(ChipRunLaneTest, CapturePreparedCarrierFinalizationDelegatesWithoutEagerWai
     );
     ASSERT_EQ(worker.launch_native_run(run, reinterpret_cast<void *>(1)), ChipWorker::NativeLaunch::Launched);
     worker.finalize_native_run(run);
-    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "stream_launch0", "finalize0"}));
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "stream_launch0", "wait0", "finalize0"}));
     EXPECT_EQ(g_completion_wait_count, 0);
     worker.finalize();
 }

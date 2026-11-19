@@ -1879,6 +1879,9 @@ void ChipWorker::retain_native_run_resources_impl(
         if (failure != nullptr) std::rethrow_exception(failure);
         if (rc != 0 || resources->backing_->reference == nullptr)
             throw std::runtime_error("retain_native_run_resources failed with code " + std::to_string(rc));
+        std::lock_guard<std::mutex> lock(native_run_mu_);
+        auto &entry = *native_runs_.at(run.run_epoch);
+        entry.detached_submission_requested = entry.prepare_purpose == SIMPLER_PREPARE_CAPTURE;
     } catch (...) {
         // No lane lock may wait on the native operation held by this call.
         held = NativeRunOpLease{};
@@ -1897,16 +1900,12 @@ ChipWorker::NativeLaunch ChipWorker::launch_native_run(const ChipWorkerNativeRun
     NativeRunOpLease held;
     const NativeRunLease lease = acquire_native_run_op(run, NativeRunOp::Launch, &storage, nullptr, &held);
     if (lease != NativeRunLease::Acquired) throw_native_run_lease_error(run, lease, "launch_native_run");
-    bool capture_prepared;
+    bool detached_submission;
     {
         std::lock_guard<std::mutex> lock(native_run_mu_);
-        capture_prepared = native_runs_.at(run.run_epoch)->prepare_purpose == SIMPLER_PREPARE_CAPTURE;
+        detached_submission = caller_stream != nullptr && native_runs_.at(run.run_epoch)->detached_submission_requested;
     }
     validate_execution_context();
-    // The ordinary validator rejects ACTIVE streams. Capture intent delegates
-    // actual stream/recording classification to the common launch entry; it
-    // does not itself prove that this call will be recorded.
-    if (caller_stream != nullptr && !capture_prepared) validate_caller_stream(caller_stream);
 
     int rc = 0;
     std::exception_ptr failure;
@@ -1929,10 +1928,9 @@ ChipWorker::NativeLaunch ChipWorker::launch_native_run(const ChipWorkerNativeRun
         // A launch that failed may still have reached the device. The probe decides which, and
         // the answer is an execution fact: a completed one carries this launch's own error into
         // the record a later finalize reports, and an uncompleted one leaves the run preparable.
-        if (capture_prepared) {
-            // Capture intent may actually run eagerly outside recording. Keep
-            // the error without an eager probe; the common finalizer uses its
-            // actual recording/execution fact to prove safe retirement.
+        if (detached_submission) {
+            // The caller owns execution completion for this submission.
+            // Report the enqueue error without probing the stream.
             note_native_run_result(run.run_epoch, rc);
         } else {
             int poll_rc = 0;
@@ -2237,7 +2235,7 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
     int persisted_rc = 0;
     bool persisted = false;
     bool result_observed = false;
-    bool capture_prepared = false;
+    bool detached_submission_requested = false;
     try {
         std::lock_guard<std::mutex> lk(native_run_mu_);
         const auto it = native_runs_.find(run_epoch);
@@ -2246,13 +2244,13 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
         persisted_rc = it->second->pending_rc;
         persisted = it->second->pending_rc_set;
         result_observed = it->second->result_observed;
-        capture_prepared = it->second->prepare_purpose == SIMPLER_PREPARE_CAPTURE;
+        detached_submission_requested = it->second->detached_submission_requested;
     } catch (...) {
         outcome.captured = std::current_exception();
         clear_finalize_reservation_noexcept(run_epoch);
         return outcome;
     }
-    const bool needs_wait = !transfer && !capture_prepared && !result_observed &&
+    const bool needs_wait = !transfer && !detached_submission_requested && !result_observed &&
                             (phase == NativeRunPhase::LAUNCHED || phase == NativeRunPhase::REAPED) &&
                             wait_run_fn_ != nullptr;
 

@@ -19,6 +19,7 @@
 #include <utility>
 #include "runtime/mem.h"
 #include "common/kernel_args.h"
+#include "common/hbg_execution_image.h"
 #include "runtime/kernel.h"
 #include "runtime/rts/rts_kernel.h"
 
@@ -105,8 +106,19 @@ extern "C" rtError_t rtsLaunchCpuKernel(
         args->baseArgs.argsSize >= sizeof(KernelArgs)) {
         KernelArgs launch{};
         std::memcpy(&launch, args->baseArgs.args, sizeof(launch));
+        uint64_t image_bytes = 0;
+        for (uint16_t i = 0; i < args->baseArgs.hostInputInfoNum; ++i) {
+            const auto &input = args->baseArgs.hostInputInfoPtr[i];
+            if (input.addrOffset != offsetof(KernelArgs, execution_image) ||
+                input.dataOffset > args->baseArgs.argsSize ||
+                args->baseArgs.argsSize - input.dataOffset < sizeof(HbgExecutionImage))
+                continue;
+            HbgExecutionImage image{};
+            std::memcpy(&image, static_cast<const char *>(args->baseArgs.args) + input.dataOffset, sizeof(image));
+            image_bytes = image.bytes;
+        }
         captured_submission.cpu_launches.push_back(
-            {reinterpret_cast<uint64_t>(launch.runtime_args), launch.runtime_descriptor_bytes}
+            {reinterpret_cast<uint64_t>(launch.runtime_args), launch.runtime_descriptor_bytes, image_bytes}
         );
     }
     return rc;

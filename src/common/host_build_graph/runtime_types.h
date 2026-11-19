@@ -376,6 +376,9 @@ struct TaskPayload {
     simpler::hbg::SelfRelativePtr<simpler::hbg::Tensor> tensors;
     simpler::hbg::SelfRelativePtr<uint64_t> scalars;
     simpler::hbg::SelfRelativePtr<int32_t> fanin;
+    // On a launch-backed task, resolve all three deltas in the immutable RTS
+    // record that travels with the pools. Its distance from this slot is unbounded.
+    const TaskPayload *image_arguments{nullptr};
 
     // === Cache line 1 — early-dispatch metadata (AICPU-side only) ===
     // Ordered by descending alignment (8B mask, 4B fanin, then 2B/1B counters and
@@ -431,12 +434,13 @@ struct TaskPayload {
     // accessor: one inside a loop would re-resolve the delta on every iteration, and
     // a store through an unrelated pointer in the loop body is enough to stop the
     // compiler hoisting that load — build_payload's args[] writes are exactly that.
-    simpler::hbg::Tensor *tensor_data() { return tensors.get(); }
-    const simpler::hbg::Tensor *tensor_data() const { return tensors.get(); }
-    uint64_t *scalar_data() { return scalars.get(); }
-    const uint64_t *scalar_data() const { return scalars.get(); }
-    int32_t *fanin_data() { return fanin.get(); }
-    const int32_t *fanin_data() const { return fanin.get(); }
+    const TaskPayload &argument_source() const { return image_arguments == nullptr ? *this : *image_arguments; }
+    simpler::hbg::Tensor *tensor_data() { return argument_source().tensors.get(); }
+    const simpler::hbg::Tensor *tensor_data() const { return argument_source().tensors.get(); }
+    uint64_t *scalar_data() { return argument_source().scalars.get(); }
+    const uint64_t *scalar_data() const { return argument_source().scalars.get(); }
+    int32_t *fanin_data() { return argument_source().fanin.get(); }
+    const int32_t *fanin_data() const { return argument_source().fanin.get(); }
 
     /**
      * Point this payload's three argument regions at pool-resident storage. Must run
@@ -446,6 +450,7 @@ struct TaskPayload {
      * Definition's CSR, so the region does not exist and fanin_count stays 0.
      */
     void bind_regions(simpler::hbg::Tensor *tensor_region, uint64_t *scalar_region, int32_t *fanin_region) {
+        image_arguments = nullptr;
         tensors.set(tensor_region);
         scalars.set(scalar_region);
         fanin.set(fanin_region);
@@ -802,6 +807,24 @@ struct alignas(64) ChipTaskStorage {
     // array, so its size is the same for every task and the storage array strides by
     // this type.
     TaskPayload payload;
+    // Restore the submission fields needed by a writable scheduler slot.
+    // The argument pools and the deltas naming them stay together in RTS storage.
+    void bind_initial_task(const ChipTaskStorage &initial) {
+        task = initial.task;
+        slot.total_required_subtasks = initial.slot.total_required_subtasks;
+        slot.logical_block_num = initial.slot.logical_block_num;
+        slot.active_mask = initial.slot.active_mask;
+        slot.task_attrs = initial.slot.task_attrs;
+        slot.task_kind = initial.slot.task_kind;
+        slot.ed_flags = initial.slot.ed_flags;
+        slot.initial_task_state = initial.slot.initial_task_state;
+        payload.image_arguments = &initial.payload;
+        payload.tensor_count = initial.payload.tensor_count;
+        payload.scalar_count = initial.payload.scalar_count;
+        payload.fanin_count = initial.payload.fanin_count;
+        payload.predicate = initial.payload.predicate;
+        payload.dump_metadata = initial.payload.dump_metadata;
+    }
 };
 
 // offsetof is defined for a standard-layout type, which is what the accessors need.

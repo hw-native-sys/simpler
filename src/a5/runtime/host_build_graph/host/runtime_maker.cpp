@@ -466,8 +466,7 @@ constexpr const char *kSchedulerJsonTaskKey = "\"task_id\":";
 // to this run and remains valid after the orchestration mirror is reused.
 struct SchedulerStateOwner {
     void *state_base;
-    const void *native_graph;
-    size_t native_graph_bytes;
+    std::vector<uint64_t> public_task_ids;
     AicoreSchedulerLayout layout;
     const HostApi *api;
     std::vector<SchedulerProtocolTaskSpec> protocol_tasks;
@@ -542,34 +541,8 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
     }
 
     const auto *contexts = scheduler_state_at<SchedulerWorkerContext>(host_base, owner.layout.worker_contexts_offset);
-    std::vector<uint64_t> public_ids(owner.layout.task_count);
-    SchedulerGraphView diagnostic_graph = scheduler_ordinary_graph_view(
-        contexts[0].graph_storage_address, contexts[0].original_task_count, contexts[0].task_window_last_index
-    );
-    diagnostic_graph.task_count = owner.layout.task_count;
-    diagnostic_graph.native_header_offset = contexts[0].native_header_offset;
-    std::vector<std::byte> native_storage;
-    if (diagnostic_graph.native_header_offset != 0) {
-        if (owner.native_graph == nullptr || owner.native_graph_bytes == 0) return false;
-        native_storage.resize(owner.native_graph_bytes + SCHEDULER_STATE_ALIGNMENT - 1);
-        const auto address = (reinterpret_cast<uintptr_t>(native_storage.data()) + SCHEDULER_STATE_ALIGNMENT - 1) &
-                             ~(SCHEDULER_STATE_ALIGNMENT - 1);
-        if (api->copy_from_device(reinterpret_cast<void *>(address), owner.native_graph, owner.native_graph_bytes) !=
-            0) {
-            LOG_WARN("A5 HBG: failed to copy native graph for scheduler profiling");
-            return false;
-        }
-        diagnostic_graph.native_graph_address = address;
-        diagnostic_graph.native_graph_bytes = owner.native_graph_bytes;
-    }
-    for (uint64_t ref = 0; ref < owner.layout.task_count; ++ref) {
-        if (scheduler_node_identity(diagnostic_graph, ref, &public_ids[ref]) != SchedulerGraphResult::OK) {
-            LOG_WARN("A5 HBG: invalid public task identity in profiling snapshot");
-            return false;
-        }
-    }
     const auto public_id = [&](uint64_t ref) {
-        return ref < public_ids.size() ? public_ids[ref] : UINT64_MAX;
+        return ref < owner.public_task_ids.size() ? owner.public_task_ids[ref] : UINT64_MAX;
     };
     const auto *traces = scheduler_state_at<SchedulerTaskTrace>(host_base, owner.layout.trace_cells_offset);
     const auto *run_control = scheduler_state_at<SchedulerRunControl>(host_base, owner.layout.run_control_offset);
@@ -1271,9 +1244,26 @@ bool plan_scheduler_args_dump(
     return true;
 }
 
+// AICPU binds these scheduler fields after RTS has placed the immutable task
+// image. Only typed image references are recorded; scalar argument bits and
+// addresses into the caller's tensors or the graph heap retain their values.
+struct SchedulerImageReferences {
+    uintptr_t host_state;
+    uint64_t device_state;
+    uint64_t image_base;
+    bool enabled;
+    std::vector<HbgImageReference> fields;
+
+    void add(const uint64_t &field) {
+        if (enabled && field != 0)
+            fields.push_back({device_state + (reinterpret_cast<uintptr_t>(&field) - host_state), field - image_base});
+    }
+};
+
 bool prepare_scheduler_calls(
     Runtime *runtime, void *host_base, const AicoreSchedulerLayout &layout, uint64_t device_base,
-    const void *uploaded_sm, const sm_layout::SegmentOffsets &segments, const NativeGraphHostPlan &native_plan
+    const void *uploaded_sm, const sm_layout::SegmentOffsets &segments, const NativeGraphHostPlan &native_plan,
+    SchedulerImageReferences &references
 ) {
     if (layout.prepared_layout_offset == 0) return true;
     const char *platform = get_platform();
@@ -1378,6 +1368,16 @@ bool prepare_scheduler_calls(
             )) {
             LOG_ERROR("A5 HBG: Host Call preparation failed node=%" PRIu64, ref);
             return false;
+        }
+        if (references.enabled && tensor_count != 0 &&
+            (binding == nullptr || binding->kind == SchedulerNodeKind::TOP_KERNEL)) {
+            const auto &prepared =
+                *scheduler_state_at<SchedulerPreparedLayout>(host_base, layout.prepared_layout_offset);
+            const auto &plan = scheduler_state_at<SchedulerExecutionPlan>(host_base, prepared.plans_offset)[ref];
+            auto *calls = scheduler_state_at<SchedulerPreparedCall>(host_base, prepared.calls_offset);
+            for (uint64_t i = 0; i < plan.execution_count; ++i)
+                for (uint32_t t = 0; t < tensor_count; ++t)
+                    references.add(calls[plan.execution_begin + i].args[t]);
         }
         prepared_count += static_cast<uint64_t>(meta.logical_block_num) * meta.active_mask.count();
     }
@@ -1801,6 +1801,13 @@ bool create_scheduler_state(
         return false;
     }
     const uintptr_t aligned_address = reinterpret_cast<uintptr_t>(device_state);
+    SchedulerImageReferences references{
+        reinterpret_cast<uintptr_t>(host_base),
+        aligned_address,
+        reinterpret_cast<uint64_t>(runtime->get_gm_sm_ptr()),
+        task_image::native_graph_plan && api->launch_owns_execution_image(),
+        {}
+    };
 
     const uint64_t initialized_bytes =
         async_plan.layout_offset == 0 ?
@@ -1826,8 +1833,17 @@ bool create_scheduler_state(
                 static_cast<DumpArgsLevel>(runtime->dev.dump_args_level)
             ))
             return false;
-        for (const auto &task : dump_tasks)
+        for (const auto &task : dump_tasks) {
             if (!scheduler_args_dump_select_task(dump_image, task)) return false;
+            if (native_plan.instances.empty() ||
+                native_plan.bindings[task.task_ref].kind == SchedulerNodeKind::TOP_KERNEL) {
+                const auto *selected = scheduler_args_dump_task(dump_image, task.task_ref);
+                if (selected == nullptr) return false;
+                references.add(selected->tensors_address);
+                references.add(selected->scalars_address);
+                references.add(selected->argument_region_base);
+            }
+        }
     }
     if (native_graph) {
         auto *header =
@@ -2052,7 +2068,7 @@ bool create_scheduler_state(
         task_controls[task_ref].completion_state = scheduler_completion_completed_state(1);
     }
     if (!prepare_scheduler_calls(
-            runtime, host_base, layout, aligned_address, uploaded_sm, device_segments, native_plan
+            runtime, host_base, layout, aligned_address, uploaded_sm, device_segments, native_plan, references
         ))
         return false;
 
@@ -2097,6 +2113,8 @@ bool create_scheduler_state(
         context.native_header_offset = native_image.header_offset;
         context.native_graph_address = native_image.device_base;
         context.native_graph_bytes = native_image.bytes;
+        references.add(context.graph_storage_address);
+        references.add(context.native_graph_address);
         context.original_task_count = static_cast<uint64_t>(total_tasks);
         context.scheduler_state_bytes = layout.total_size;
         context.worker_index = static_cast<uint64_t>(i);
@@ -2117,6 +2135,14 @@ bool create_scheduler_state(
         }
     }
 
+    std::vector<uint64_t> public_task_ids;
+    if (runtime->dev.chip_swimlane_level != 0) {
+        public_task_ids.resize(node_count);
+        for (uint64_t ref = 0; ref < node_count; ++ref)
+            if (scheduler_node_identity(dependency_graph, ref, &public_task_ids[ref]) != SchedulerGraphResult::OK)
+                return false;
+    }
+    if (references.enabled) runtime->set_execution_image_binding(device_segments.storage, std::move(references.fields));
     runtime->publish_scheduler_bootstrap(
         SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, aligned_address + layout.worker_contexts_offset
     );
@@ -2126,9 +2152,8 @@ bool create_scheduler_state(
         scheduler_state_owners.emplace(
             runtime,
             SchedulerStateOwner{
-                reinterpret_cast<void *>(aligned_address), reinterpret_cast<const void *>(native_image.device_base),
-                static_cast<size_t>(native_image.bytes), layout, api, std::move(protocol_tasks),
-                std::move(protocol_source)
+                reinterpret_cast<void *>(aligned_address), std::move(public_task_ids), layout, api,
+                std::move(protocol_tasks), std::move(protocol_source)
             }
         );
     }
@@ -2165,7 +2190,12 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
             return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
         }
     }
-    const uint64_t device_arena_bytes = native_offset + native_image.bytes.size();
+    const uint64_t upload_bytes = native_offset + native_image.bytes.size();
+    const sm_layout::SegmentOffsets device_segments = task_image::segments(bind_usage);
+    // The ordinary A5 task image starts with TaskImageStatus. RTS owns the
+    // read-only records following it; the arena holds the writable status.
+    const bool direct_image = task_image::native_graph_plan && api->launch_owns_execution_image();
+    const uint64_t device_arena_bytes = direct_image ? device_segments.storage : upload_bytes;
     const BindPhaseMark static_arena_phase = bind_phase_begin();
     runtime->dev.sm_image_bytes = image_bytes;
     SharedMemoryHandle host_sm_handle;
@@ -2226,7 +2256,6 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
 
     // Task records and the read-only graph share one delivered image. Mutable
     // scheduler storage is allocated and initialized separately.
-    const uint64_t upload_bytes = device_arena_bytes;
     constexpr size_t image_alignment = std::max<uint64_t>(CHIP_ALIGN_SIZE, SCHEDULER_STATE_ALIGNMENT);
     static_assert(DeviceArena::kDefaultBaseAlign % image_alignment == 0);
     void *staging_addr = nullptr;
@@ -2251,7 +2280,6 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
         };
     }
 
-    const sm_layout::SegmentOffsets device_segments = task_image::segments(bind_usage);
     for (auto &instance : plan.native_graph.instances) {
         const auto &source = host_sm_handle.header->tasks.storage_at(instance.original_shell_id);
         const auto &definition = plan.native_graph.definitions[instance.definition_index].definition;
@@ -3004,7 +3032,10 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
     metadata.reserve(publication.prerequisites.size() + 1);
     for (const auto &region : publication.prerequisites)
         metadata.push_back({region.device_target, region.source, region.bytes});
-    metadata.push_back({publication.device_target, publication.source, publication.bytes, true});
+    metadata.push_back(
+        {publication.device_target, publication.source, publication.bytes, true, publication.mutable_prefix_bytes,
+         publication.image_references.data(), publication.image_references.size()}
+    );
     const BindPhaseMark staging_phase = bind_phase_begin();
     const int metadata_rc = api->stage_launch_metadata(metadata.data(), metadata.size());
     if (metadata_rc != 0) {

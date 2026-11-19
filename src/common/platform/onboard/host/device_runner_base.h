@@ -404,7 +404,7 @@ public:
     // device and RTS context without changing them. Also used for abandoning
     // an unlaunched run.
     int enter_run_thread();
-    int validate_caller_stream(rtStream_t caller, bool *recording = nullptr);
+    int validate_caller_stream(rtStream_t caller);
     // A borrowed environment must be current before resource mutation. An
     // owned environment has no caller binding to validate; enter_run_thread
     // performs its thread attachment before device work.
@@ -1658,7 +1658,7 @@ public:
             stream_lifetime(std::move(other.stream_lifetime)),
             artifact_identity(other.artifact_identity),
             caller_stream(std::exchange(other.caller_stream, nullptr)),
-            recording(other.recording),
+            external_submission(other.external_submission),
             resources_owned(std::exchange(other.resources_owned, false)),
             aicore_retirement_attempted(std::exchange(other.aicore_retirement_attempted, false)),
             joinable_boundary(other.joinable_boundary),
@@ -1705,7 +1705,7 @@ public:
          */
         NativeRunArtifactIdentity artifact_identity{};
         rtStream_t caller_stream{nullptr};
-        bool recording{false};
+        bool external_submission{false};
         bool resources_owned{false};
         bool aicore_retirement_attempted{false};
         /**
@@ -1898,7 +1898,7 @@ public:
         PreparedExecution &prepared, void *caller_stream, void **out_reference, NativeRunPreparePurpose purpose
     );
     int release_external_run_resources(void *reference);
-    int admit_recording(PreparedExecution &prepared);
+    int admit_external_submission(PreparedExecution &prepared);
     bool capture_diagnostics_supported(const PreparedExecution &prepared) const;
     virtual bool supports_scope_stats_capture() const { return false; }
     virtual bool supports_pmu_capture() const { return false; }
@@ -3243,7 +3243,7 @@ protected:
         std::shared_ptr<const PreparedRunResources::CallableUse> callable;
         std::vector<WorkspaceManager::BackingIdentity> managed_backing;
         void *caller_stream{nullptr};
-        bool recording{false};
+        bool external_submission{false};
         bool scope_stats_window{false};
         bool pmu_window{false};
         bool swimlane_window{false};

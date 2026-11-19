@@ -49,7 +49,17 @@ public:
             if (region.device_target == nullptr || region.host_source == nullptr || region.bytes == 0)
                 return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
             if (deliver_execution_image && region.execution_image) {
-                if (image_seen || region.bytes > UINT32_MAX) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+                if (image_seen || region.bytes > UINT32_MAX ||
+                    (region.mutable_prefix_bytes != UINT64_MAX && region.mutable_prefix_bytes > region.bytes) ||
+                    region.reference_count > (UINT32_MAX - region.bytes) / sizeof(HbgImageReference) ||
+                    (region.reference_count != 0 && region.image_references == nullptr))
+                    return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+                for (size_t j = 0; j < region.reference_count; ++j) {
+                    const auto &ref = region.image_references[j];
+                    if (ref.device_field_address == 0 || ref.device_field_address % alignof(uint64_t) != 0 ||
+                        ref.image_offset >= region.bytes)
+                        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+                }
                 image_seen = true;
                 continue;
             }
@@ -62,8 +72,15 @@ public:
         for (size_t i = 0; i < count; ++i) {
             const auto *source = static_cast<const std::byte *>(regions[i].host_source);
             Region region{regions[i].device_target, {source, source + regions[i].bytes}};
-            if (deliver_execution_image && regions[i].execution_image) image = std::move(region);
-            else captured.push_back(std::move(region));
+            if (deliver_execution_image && regions[i].execution_image) {
+                region.mutable_prefix_bytes =
+                    regions[i].mutable_prefix_bytes == UINT64_MAX ? regions[i].bytes : regions[i].mutable_prefix_bytes;
+                if (regions[i].reference_count != 0)
+                    region.references.assign(
+                        regions[i].image_references, regions[i].image_references + regions[i].reference_count
+                    );
+                image = std::move(region);
+            } else captured.push_back(std::move(region));
         }
         regions_ = std::move(captured);
         execution_image_ = std::move(image);
@@ -84,7 +101,15 @@ public:
     size_t size() const { return bytes_; }
     bool has_execution_image() const { return !execution_image_.bytes.empty(); }
     HostMetadataRegion execution_image() const {
-        return {execution_image_.target, execution_image_.bytes.data(), execution_image_.bytes.size(), true};
+        return {
+            execution_image_.target,
+            execution_image_.bytes.data(),
+            execution_image_.bytes.size(),
+            true,
+            execution_image_.mutable_prefix_bytes,
+            execution_image_.references.data(),
+            execution_image_.references.size()
+        };
     }
     void clear() {
         regions_.clear();
@@ -116,6 +141,8 @@ private:
     struct Region {
         void *target;
         std::vector<std::byte> bytes;
+        uint64_t mutable_prefix_bytes{0};
+        std::vector<HbgImageReference> references{};
     };
     std::vector<Region> regions_;
     Region execution_image_{};

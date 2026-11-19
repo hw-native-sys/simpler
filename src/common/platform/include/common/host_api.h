@@ -18,6 +18,7 @@
 
 #include "common/chip_swimlane_extension.h"
 #include "common/region_banks.h"
+#include "common/hbg_execution_image.h"
 #include "host/scheduler_notifications.h"
 
 struct CoreAsyncCapability;
@@ -34,8 +35,11 @@ struct HostMetadataRegion {
     void *device_target;
     const void *host_source;
     size_t bytes;
-    // In onboard Kernel mode RTS delivers this snapshot to AICPU.
+    // Onboard RTS delivers this snapshot to AICPU for Program and Kernel launches.
     bool execution_image{false};
+    uint64_t mutable_prefix_bytes{UINT64_MAX};
+    const HbgImageReference *image_references{nullptr};
+    size_t reference_count{0};
 };
 
 /**
@@ -312,6 +316,7 @@ struct HostApiOps {
     std::optional<HostCallableAsyncCapabilities> (*get_callable_async_capabilities)(
         void *runner_ctx, int32_t callable_id
     ) = nullptr;
+    bool launch_owns_execution_image{false};
 };
 
 /**
@@ -322,6 +327,8 @@ struct HostApiOps {
  */
 struct HostApi {
 public:
+    bool launch_owns_execution_image() const { return ops_->launch_owns_execution_image; }
+
     int stage_launch_metadata(const HostMetadataRegion *regions, size_t count) const {
         if (ops_->stage_launch_metadata != nullptr)
             return ops_->stage_launch_metadata(runner_ctx_, pipeline_slot_, regions, count);
