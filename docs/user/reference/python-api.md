@@ -127,6 +127,11 @@ descriptor. Each accepted call retains its use until completion or proven
 cancellation. Borrowed contexts and graph capture do not accept Host MAP. See
 [Buffer ABI](../../buffer-abi.md) for transfer defaults and release behavior.
 
+For local A3/A5 TMR L3 Workers, set MAP on the child task arguments inside the
+callback. Each consuming child prepares or reuses its own mapping of the
+Worker-owned Host Buffer. See the [L3 shared-table contract](../../design/a5-host-ddr.md#l3-shared-tables)
+for backing lifetime and release behavior.
+
 ### Execution
 
 | Method | Notes |

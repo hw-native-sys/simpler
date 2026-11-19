@@ -1228,8 +1228,11 @@ TEST(ChipRunLaneTest, UnboundedWaitBlocksInsteadOfPolling) {
 TEST(ChipRunLaneTest, FinalizeFailurePoisonsAdmissionAndCloseReportsIt) {
     ChipWorker worker;
     prime_worker(worker);
+    g_supports_successor = false;
     ChipRunLane lane(worker);
     ChipRun first = submit(lane, 101, 0);
+    ChipRun queued = submit(lane, 102, 1, false);
+    ASSERT_EQ(queued.preparation_disposition(), ChipRunPreparationDisposition::VALIDATED_ONLY);
     g_complete[0] = true;
     g_finalize_rc[0] = -7;
     EXPECT_TRUE(first.done());
@@ -1244,9 +1247,11 @@ TEST(ChipRunLaneTest, FinalizeFailurePoisonsAdmissionAndCloseReportsIt) {
 
     ChipStorageTaskArgs args{};
     EXPECT_THROW(
-        lane.submit(1, args, CallConfig{}, PipelineSlotLease{1, 0, 102}, 102, 102, nullptr, 0, true), std::runtime_error
+        lane.submit(1, args, CallConfig{}, PipelineSlotLease{1, 0, 103}, 103, 103, nullptr, 0, true),
+        RunPreparationRefused
     );
     EXPECT_THROW(lane.close(), std::runtime_error);
+    EXPECT_FALSE(queued.owner_recovery_required());
     worker.finalize();
 }
 

@@ -916,6 +916,7 @@ _CTRL_OP_NAMES[_CTRL_DEVICE_MEMORY_INFO] = "device_memory_info"
 # Distributed Host registration uses generic control_payload transport.
 _CTRL_HOST_DDR = 29
 _CTRL_OP_NAMES[_CTRL_HOST_DDR] = "host_ddr"
+_L3_HOST_MAP_PLATFORMS = ("a2a3", "a5")
 
 # Publish every diagnostic run this chip child has closed. 26 is the delegated
 # region control; 27 mirrors worker_manager.h::CTRL_DFX_FLUSH.
@@ -3572,7 +3573,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
     if (
         chip_count >= 1
         and chip_rank is not None
-        and chip_platform == "a5"
+        and chip_platform in _L3_HOST_MAP_PLATFORMS
         and chip_runtime == "tensormap_and_ringbuffer"
     ):
         import_registry.host_mappings = ChildHostMappings(
@@ -3850,7 +3851,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
             elif sub_cmd == _CTRL_HOST_DDR:
                 mappings = import_registry.host_mappings
                 if not isinstance(mappings, ChildHostMappings):
-                    raise RuntimeError("L3 MAP requires local A5 TMR chip workers")
+                    raise RuntimeError("L3 MAP requires local onboard TMR chip workers")
                 staged_shm, payload, payload_size = _open_ctrl_payload(buf, what="Host DDR")
                 try:
                     reply = mappings.handle(bytes(payload[:payload_size]))
@@ -4202,6 +4203,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- chip-child entry receives 
             except BaseException:
                 if staged.ccu_binding is not None:
                     staged.ccu_binding.abort()
+                if import_registry.host_mappings is not None and not staged.chip_run._owner_recovery_required:
+                    import_registry.host_mappings.release(staged.identity)
                 raise
             return True
 
@@ -14377,10 +14380,10 @@ class Worker:
     def _l3_host_mappings(self) -> ParentHostMappings:
         if (
             self.level != 3
-            or self._config.get("platform") != "a5"
+            or self._config.get("platform") not in _L3_HOST_MAP_PLATFORMS
             or self._config.get("runtime") != "tensormap_and_ringbuffer"
         ):
-            raise RuntimeError("L3 MAP requires local A5 onboard tensormap_and_ringbuffer children")
+            raise RuntimeError("L3 MAP requires local onboard A3 or A5 tensormap_and_ringbuffer children")
         members = tuple(range(len(self._config.get("device_ids", ()))))
         if not members:
             raise ValueError("L3 MAP requires local chip workers")
@@ -15459,7 +15462,7 @@ class Worker:
         has_map = any(host_args.transfer(i) == TensorTransfer.MAP for i in range(host_args.tensor_count()))
         supported = (
             self.level == 3
-            and self._config.get("platform") == "a5"
+            and self._config.get("platform") in _L3_HOST_MAP_PLATFORMS
             and self._config.get("runtime") == "tensormap_and_ringbuffer"
             and bool(self._config.get("device_ids", ()))
         )

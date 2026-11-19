@@ -1133,6 +1133,7 @@ TEST(ChipRunLaneCallerBuffersTest, AFailedBorrowLeavesNoQueuedRunBehind) {
     // error, so the caller sees what actually went wrong rather than a lane-shaped substitute.
     EXPECT_ANY_THROW(second.activate());
     EXPECT_FALSE(second.launched());
+    EXPECT_FALSE(second.owner_recovery_required());
     // A throw here acquired nothing and admitted nothing, so this run's identity never became
     // live in the table and there is nothing to discharge for it.
     EXPECT_EQ(g_borrowed, (std::vector<uint64_t>{1}));

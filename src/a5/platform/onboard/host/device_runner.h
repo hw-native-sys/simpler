@@ -175,6 +175,11 @@ public:
      * @return 0 on success, error code on failure.
      */
     int ensure_acl_ready(int device_id);
+
+    int ensure_host_mapping_acl();
+    rtContext_t host_mapping_context(int device) {
+        return device >= 0 && device_id() == device && !execution_mode_latch().is_kernel() ? owned_context_ : nullptr;
+    }
     /** Terminal Host last-use proof; keeps ACL mappings alive for explicit unregister. */
     int quiesce_host_uses();
 
@@ -232,6 +237,7 @@ private:
     // `configure_aicore_op_timeout`, and `validate_active_callable` are inherited
     // (protected) from `DeviceRunnerBase`.
 
+    int acquire_acl_init_reference();
     int capture_owned_context(int device_id);
     int finalize_unbound() override;
 
