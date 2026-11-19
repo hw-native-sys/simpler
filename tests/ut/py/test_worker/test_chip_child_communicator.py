@@ -290,7 +290,7 @@ def test_workspace_configuration_survives_child_control(monkeypatch, host_shm_na
         monkeypatch,
         [0x1234],
         [worker_mod._CTRL_COMM_INIT, worker_mod._CTRL_ALLOC_DOMAIN],
-        workspace_mask=3,
+        workspace_mask=2,
         urma_jetties=2,
         urma_sq_depth=512,
         ccu_mode=ccu_mode,
@@ -299,7 +299,7 @@ def test_workspace_configuration_survives_child_control(monkeypatch, host_shm_na
     assert responses == [(0, "")] * 2
     assert cw.comm_alloc_domain_windows.call_args.kwargs == {
         **({"host_shm_name": host_shm_name} if host_shm_name else {}),
-        "workspace_mask": 3,
+        "workspace_mask": 2,
         "urma_jetties_per_aiv": 2,
         "urma_sq_depth": 512,
         "ccu_mode": ccu_mode,

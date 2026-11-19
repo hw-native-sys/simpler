@@ -1555,7 +1555,8 @@ static int domain_alloc_via_ipc(
     uint64_t win_size, uint32_t workspace_mask, DomainAllocation *out
 ) {
     const bool rdma_requested = (workspace_mask & comm_workspace_bit(CommWorkspaceKind::RDMA)) != 0;
-    out->peer_windows.reserve(rank_count - 1);
+    const bool urma_requested = (workspace_mask & comm_workspace_bit(CommWorkspaceKind::URMA)) != 0;
+    const bool map_peer_windows = !rdma_requested && !urma_requested;
     const std::string &rootinfo = h->rootinfo_path;
     const uint64_t run_token = h->run_token;
     const int subset_n = static_cast<int>(rank_count);
@@ -1568,9 +1569,8 @@ static int domain_alloc_via_ipc(
         return -1;
     }
 
-    // Own-window allocation.  The non-RDMA path uses the VMM shareable-handle
-    // dance (see alloc_windows_via_ipc for step-by-step rationale) so peers can
-    // import each other's VA.  The RDMA overlay instead aclrtMallocs a buffer
+    // Allocate local HBM through VMM and export its handle for domains that
+    // map peer windows. The RDMA overlay instead aclrtMallocs a buffer
     // in the low GM segment (0x1200...) that the HNS1825 NIC can DMA to — a VMM
     // window reserved with hint=0 lands at 0x1240...000000, which the NIC never
     // reaches (WQEs consumed, no CQE).  RDMA reaches peers via rkey+VA, so no
@@ -1622,12 +1622,16 @@ static int domain_alloc_via_ipc(
             return -1;
         }
         out->local_mapped = true;
-        aret = aclrtMemExportToShareableHandle(
-            handle, ACL_MEM_HANDLE_TYPE_NONE, ACL_RT_VMM_EXPORT_FLAG_DISABLE_PID_VALIDATION, &shareableHandle
-        );
-        if (aret != ACL_SUCCESS) {
-            LOG_ERROR("[comm rank %d] alloc_domain: ExportToShareableHandle -> %d", h->rank, static_cast<int>(aret));
-            return -1;
+        if (map_peer_windows) {
+            aret = aclrtMemExportToShareableHandle(
+                handle, ACL_MEM_HANDLE_TYPE_NONE, ACL_RT_VMM_EXPORT_FLAG_DISABLE_PID_VALIDATION, &shareableHandle
+            );
+            if (aret != ACL_SUCCESS) {
+                LOG_ERROR(
+                    "[comm rank %d] alloc_domain: ExportToShareableHandle -> %d", h->rank, static_cast<int>(aret)
+                );
+                return -1;
+            }
         }
     }
 
@@ -1716,11 +1720,7 @@ static int domain_alloc_via_ipc(
     // and per device-pair; once any allocation opens a pair, later ones simply
     // observe it. The enable is the operative call (resolves the peer physical
     // id via the HCCL adapter and opens the HCCS route).
-    //
-    // The RDMA overlay reaches peers over RoCE (HCOMM channel), not HCCS, so
-    // the HCCS peer-access enable/confirm dance is skipped there; the
-    // file_barrier below still synchronizes the announce exchange.
-    if (!rdma_requested) {
+    if (map_peer_windows) {
         for (int p = 0; p < subset_n; ++p) {
             if (p == my_dr) continue;
             aclError r = aclrtDeviceEnablePeerAccess(peers[p].device_id, 0);
@@ -1764,8 +1764,9 @@ static int domain_alloc_via_ipc(
         }
     }
 
-    // With DISABLE_PID_VALIDATION the import can proceed once peers have
-    // published their shareable handles (read above) and P2P is up.
+    // All ranks have read the peer announcements. For mapped windows, P2P is ready
+    // and DISABLE_PID_VALIDATION allows peer handle imports after this barrier.
+    // URMA domains synchronize here before initializing their workspace.
     if (!file_barrier(rootinfo, my_dr, subset_n, domain_barrier_tag(allocation_id, "p2p_ready"), run_token)) {
         return -1;
     }
@@ -1821,7 +1822,7 @@ static int domain_alloc_via_ipc(
             comm_workspace<CommWorkspaceKind::SDMA>(h->host_ctx).size
         );
     }
-    if ((workspace_mask & comm_workspace_bit(CommWorkspaceKind::URMA)) != 0) {
+    if (urma_requested) {
         const int urma_rc =
             init_urma_workspace(h, allocation_id, rank_ids, static_cast<uint32_t>(rank_count), domain_rank, *out);
         if (urma_rc != 0) return urma_rc;
@@ -1844,13 +1845,9 @@ static int domain_alloc_via_ipc(
     }
 #endif
     ctx.windowsIn[my_dr] = reinterpret_cast<uint64_t>(localBuf);
-    // Import each peer's shareable handle onto our device; see the symmetry
-    // note in alloc_windows_via_ipc (one win_size, shared chip granularity).
-    //
-    // The RDMA overlay reaches peers over RoCE via rkey+VA (PeerMrBaseAddr),
-    // and the RDMA kernels only ever read windowsIn[own], so no peer VA import
-    // is needed there — the loop below is skipped and peer_windows stays empty.
-    if (!rdma_requested) {
+    // URMA and RDMA locate remote buffers through their registered memory descriptors.
+    if (map_peer_windows) {
+        out->peer_windows.reserve(rank_count - 1);
         for (int p = 0; p < subset_n; ++p) {
             if (p == my_dr) continue;
             out->peer_windows.emplace_back();
@@ -2223,13 +2220,14 @@ static int allocate_domain_windows(
                 return -1;
         }
     }
+    const bool urma_requested = (workspace_mask & comm_workspace_bit(CommWorkspaceKind::URMA)) != 0;
     if ((workspace_mask & ~compiled_comm_workspaces()) != 0 ||
+        (urma_requested && workspace_mask != comm_workspace_bit(CommWorkspaceKind::URMA)) ||
         ((workspace_mask & comm_workspace_bit(CommWorkspaceKind::RDMA)) != 0 &&
          workspace_mask != comm_workspace_bit(CommWorkspaceKind::RDMA))) {
         LOG_ERROR("[comm rank %d] alloc_domain: unsupported workspace combination 0x%x", h->rank, workspace_mask);
         return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
     }
-    const bool urma_requested = (workspace_mask & comm_workspace_bit(CommWorkspaceKind::URMA)) != 0;
     if (urma_requested && !validate_urma_ranks(h, rank_ids, rank_count, host_shm_name != nullptr)) {
         return COMM_DOMAIN_URMA_CONFIG_INVALID;
     }

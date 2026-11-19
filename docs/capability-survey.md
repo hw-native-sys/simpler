@@ -256,12 +256,10 @@ RDMA defaults OFF and can be enabled alongside both providers.
 `CommContext.workspaces` stores independent descriptors indexed by
 `CommWorkspaceKind::{SDMA, URMA, RDMA}`. Domains create synchronous mapped
 windows by default and initialize async providers only when explicitly requested
-through `workspace_engines`. SDMA and URMA can share a domain; RDMA currently
-requires its own domain and cannot be combined with either in one domain.
+through `workspace_engines`. URMA and RDMA each require a dedicated domain.
 The [URMA example](../examples/a5/tensormap_and_ringbuffer/urma_deferred_completion_demo/README.md)
-covers ordered mixed DAGs and same-kernel SDMA/URMA requests. The A5 onboard CI
-job runs these cases alongside SDMA using the default providers. RDMA remains
-optional and defaults to OFF.
+fetches peer data through the URMA workspace using a nonzero window offset.
+The A5 onboard CI job runs this case alongside the SDMA examples.
 
 **HCCL is bootstrap, not data movement.** The complete set of functions called
 is `HcclGetRootInfo`, `HcclCommInitRootInfo`, `HcclBarrier`, `HcclCommDestroy`.
