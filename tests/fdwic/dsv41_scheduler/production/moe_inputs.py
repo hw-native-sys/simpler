@@ -124,9 +124,18 @@ def _nearest_fp4_indices(values: torch.Tensor, *, round_to_even: bool = False) -
     table = FP4_VALUES[:8].to(values.device)
     magnitude = values.abs().unsqueeze(-1)
     if round_to_even:
-        order = torch.tensor([0, 2, 4, 6, 1, 3, 5, 7], device=values.device)
-        selected = (magnitude - table[order]).abs().argmin(dim=-1)
-        index = order[selected].to(torch.uint8)
+        if torch.any(magnitude > table[-1]):
+            order = torch.tensor([0, 2, 4, 6, 1, 3, 5, 7], device=values.device)
+            selected = (magnitude - table[order]).abs().argmin(dim=-1)
+            index = order[selected].to(torch.uint8)
+        else:
+            boundaries = (table[:-1] + table[1:]) * 0.5
+            absolute = magnitude.squeeze(-1)
+            index = torch.bucketize(absolute, boundaries, out_int32=True).clamp_max(7)
+            midpoint = boundaries[index.clamp_max(6)]
+            ties = (absolute == midpoint) & ((index & 1) != 0)
+            index = (index + ties).to(torch.uint8)
+            index.masked_fill_(~torch.isfinite(absolute), 0)
     else:
         boundaries = (table[:-1] + table[1:]) * 0.5
         absolute = magnitude.squeeze(-1)
@@ -187,23 +196,6 @@ def generate_mxfp8_weight_kn(out: int, inn: int, dequant_std: float, *, chan_cv:
     return data_kn, scale_e8m0
 
 
-def _pack_mxfp4_nibbles_kn_tiles(nibbles_kn: torch.Tensor, k_tile: int, n_tile: int) -> torch.Tensor:
-    """Pack a logical [K, N] nibble matrix into Cube lane rows."""
-    k, n = nibbles_kn.shape
-    if k % k_tile or n % n_tile or k_tile % 2 or n_tile % 2:
-        raise ValueError("MXFP4 tile dimensions must divide K/N and be even")
-    k_blocks = k // k_tile
-    n_blocks = n // n_tile
-    blocked = nibbles_kn.reshape(k_blocks, k_tile, n_blocks, n_tile)
-    blocked = blocked.permute(2, 0, 1, 3)
-    lanes = blocked.reshape(n_blocks, k_blocks, 2, k_tile // 2, n_tile)
-    low = lanes[..., 0::2] & 0x0F
-    high = lanes[..., 1::2] & 0x0F
-    packed = low | (high << 4)
-    lane_bytes = k_tile * n_tile // 4
-    return packed.contiguous().reshape(n_blocks * k_blocks * 2, lane_bytes)
-
-
 def pack_mxfp4_weight_tiles(packed_weight_fp4: torch.Tensor, k_tile: int, n_tile: int) -> torch.Tensor:
     """Reorder checkpoint [N, K/2] bytes into Cube FP4 tiles."""
     payload = packed_weight_fp4.contiguous().view(torch.uint8)
@@ -214,10 +206,15 @@ def pack_mxfp4_weight_tiles(packed_weight_fp4: torch.Tensor, k_tile: int, n_tile
     packed_cols = n_tile // 2
     result = torch.empty([matrices.shape[0], packed_rows, packed_cols], dtype=torch.uint8)
     for index, matrix in enumerate(matrices):
-        nibbles = torch.empty([n, k], dtype=torch.uint8)
-        nibbles[:, 0::2] = matrix & 0x0F
-        nibbles[:, 1::2] = matrix >> 4
-        result[index] = _pack_mxfp4_nibbles_kn_tiles(nibbles.t(), k_tile, n_tile).reshape(packed_rows, packed_cols)
+        if k % k_tile or n % n_tile or k_tile % 2 or n_tile % 2:
+            raise ValueError("MXFP4 tile dimensions must divide K/N and be even")
+        blocked = matrix.reshape(n // n_tile, n_tile, k // k_tile, k_tile // 2)
+        blocked = blocked.permute(0, 2, 3, 1)
+        even, odd = blocked[..., 0::2], blocked[..., 1::2]
+        low = (even & 0x0F) | ((odd & 0x0F) << 4)
+        high = (even >> 4) | (odd & 0xF0)
+        packed = torch.stack((low, high), dim=-2)
+        result[index] = packed.reshape(packed_rows, packed_cols)
     return result.reshape(*lead, packed_rows, packed_cols)
 
 

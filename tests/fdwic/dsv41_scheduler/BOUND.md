@@ -13,8 +13,11 @@ identities and the matching `plan-rank0.bin`. The plan supplies the actual
 sync flags; neither a task name nor its block count can substitute for them.
 
 `ideal_bound.read_case` audits execution coverage, the completion DAG,
-topology consistency, numerical validation and profiling level. Communication,
-deferred completion and early dependency release are excluded.
+topology consistency, numerical validation and profiling level. Communication
+and deferred completion use the separate two-rank model. For a producer marked
+`allow_early_resolve`, the single-device model accepts a round only when every
+observed successor starts after its predecessor finishes, including paths
+through zero-work tasks. The estimate conditions on that observed ordering.
 
 Each round models non-preemptive `(task, block, subtask)` intervals using their
 measured kernel durations, 32 AIC/64 AIV capacities, MIX subtasks sharing a

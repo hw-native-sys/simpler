@@ -26,6 +26,7 @@
 
 
 
+
 using namespace pto;
 
 
@@ -175,34 +176,31 @@ static __aicore__ inline void PTOAS__DCCI_SINGLE_CACHE_LINE(Ptr ptr) {
 }
 
 extern "C" __aicore__ void pypto_register_counter_completion(__gm__ int64_t*, __gm__ int32_t*, int64_t, int64_t);
-static __aicore__ void combine_wait(__gm__ int32_t* v1, int32_t v2, int64_t v3, __gm__ int64_t* v4, __gm__ int64_t* v5) {
+static __aicore__ void combine_wait(__gm__ int32_t* v1, int64_t v2, int32_t v3, int64_t v4, __gm__ int64_t* v5, __gm__ int64_t* v6) {
   using T = float;
 
   #if defined(__DAV_VEC__)
   set_mask_norm();
   set_vector_mask(-1, -1);
   // pto: %c2_index
-  const int64_t v6 = 2;
+  const int64_t v7 = 2;
   // pto: %c1_index
-  const int64_t v7 = 1;
+  const int64_t v8 = 1;
   // pto: %c0_index
-  const int64_t v8 = 0;
+  const int64_t v9 = 0;
   // pto: %c8192_index
-  const int64_t v9 = 8192;
+  const int64_t v10 = 8192;
   // pto: %cn1_index
-  const int64_t v10 = -1;
-  for (int64_t v11 = v8; v11 < v6; v11 += v7) {
-    // pto: %0, %1
+  const int64_t v11 = -1;
+  // pto: %0, %1
+  if (v2 != (int64_t) v3) {
+    // pto: %2, %3, %4, %5, %19
     ;
-    if (v11 != (int64_t) v2) {
-      // pto: %2, %3, %4, %5, %19
-      ;
-      int64_t v12 = v11 < v8 | v11 >= v6 ? v10 : (int64_t) ((uint64_t) v11 * (uint64_t) v9);
-      // pto: %21
-      ;
-      int64_t v13 = (int64_t) ((uint64_t) v3 + (uint64_t) v7);
-      pypto_register_counter_completion(v5, v1, v12, v13);
-    };
+    int64_t v12 = v2 < v9 | v2 >= v7 ? v11 : (int64_t) ((uint64_t) v2 * (uint64_t) v10);
+    // pto: %21
+    ;
+    int64_t v13 = (int64_t) ((uint64_t) v4 + (uint64_t) v8);
+    pypto_register_counter_completion(v6, v1, v12, v13);
   }
   #endif // __DAV_VEC__
 
@@ -226,19 +224,24 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ Tensor* combine_arrived__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
     __gm__ int32_t* combine_arrived__ssa_v0 = reinterpret_cast<__gm__ int32_t*>(combine_arrived__ssa_v0_tensor->buffer.addr) + combine_arrived__ssa_v0_tensor->start_offset;
 
+    // Unpack scalar: src_inline12949__idx_v0
+    union { uint64_t u64; int64_t val; } src_inline12949__idx_v0_conv;
+    src_inline12949__idx_v0_conv.u64 = args[1];
+    int64_t src_inline12949__idx_v0 = src_inline12949__idx_v0_conv.val;
+
     // Unpack scalar: rank__ssa_v0
     union { uint64_t u64; int32_t val; } rank__ssa_v0_conv;
-    rank__ssa_v0_conv.u64 = args[1];
+    rank__ssa_v0_conv.u64 = args[2];
     int32_t rank__ssa_v0 = rank__ssa_v0_conv.val;
 
-    // Unpack scalar: layer_inline5389__idx_v0
-    union { uint64_t u64; int64_t val; } layer_inline5389__idx_v0_conv;
-    layer_inline5389__idx_v0_conv.u64 = args[2];
-    int64_t layer_inline5389__idx_v0 = layer_inline5389__idx_v0_conv.val;
+    // Unpack scalar: layer_inline10568__idx_v0
+    union { uint64_t u64; int64_t val; } layer_inline10568__idx_v0_conv;
+    layer_inline10568__idx_v0_conv.u64 = args[3];
+    int64_t layer_inline10568__idx_v0 = layer_inline10568__idx_v0_conv.val;
 
     // Unpack CommContext: combine_arrived_ctx
-    __gm__ int64_t* combine_arrived_ctx = reinterpret_cast<__gm__ int64_t*>(args[3]);
+    __gm__ int64_t* combine_arrived_ctx = reinterpret_cast<__gm__ int64_t*>(args[4]);
 
     // Forward to ptoas-generated function
-    combine_wait(combine_arrived__ssa_v0, rank__ssa_v0, layer_inline5389__idx_v0, combine_arrived_ctx, args);
+    combine_wait(combine_arrived__ssa_v0, src_inline12949__idx_v0, rank__ssa_v0, layer_inline10568__idx_v0, combine_arrived_ctx, args);
 }

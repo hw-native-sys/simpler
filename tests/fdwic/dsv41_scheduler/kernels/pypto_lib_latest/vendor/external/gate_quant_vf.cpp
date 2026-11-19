@@ -15,7 +15,7 @@
 using namespace pto;
 namespace {
 constexpr int Rows = 16;
-constexpr int Columns = 1024;
+constexpr int Columns = 256;
 template <typename T, int R, int C>
 using Vec = Tile<TileType::Vec, T, R, C>;
 using Input = Vec<bfloat16_t, Rows, Columns>;
@@ -153,7 +153,7 @@ __aicore__ inline void run_tiles(__gm__ int64_t* args, int block) {
     TASSIGN(half_code, 52224); TASSIGN(short_code, 52480); TASSIGN(byte_code, 52736); TASSIGN(flat, 52736);
     TASSIGN(pack_scratch, 52864); TASSIGN(packed, 52992); TASSIGN(packed_flat, 52992);
     TASSIGN(quantized, 53248); TASSIGN(payload, 53248); TASSIGN(max_scratch, 57600);
-    for (int part = 0; part < 4; ++part) {
+    for (int part = 0; part < Columns / 256; ++part) {
         using Stride = pto::Stride<1, 1, 1, DYNAMIC, 1>;
         GlobalTensor<bfloat16_t, TileShape2D<bfloat16_t, Rows, 256>, Stride> input_gm(
             data<bfloat16_t>(args, 0) + first * width + column + part * 256,

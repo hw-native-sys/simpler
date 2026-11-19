@@ -20,6 +20,7 @@
 
 
 
+
 using namespace pto;
 
 
@@ -99,7 +100,7 @@ static __aicore__ void moe_signal_clear(__gm__ float* v1, __gm__ int32_t* v2, __
   pto::Stride<-1, -1, -1, -1, -1> v24 = pto::Stride<-1, -1, -1, -1, -1>(v21 * v22, v22, v13, v10, v7);
   // pto: %combine_arrived__ssa_v0_view
   GlobalTensor<int32_t, pto::Shape<1, 1, -1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND> v25 = GlobalTensor<int32_t, pto::Shape<1, 1, -1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND>(v3, v23, v24);
-  // pto: %anchor_inline7803__tile
+  // pto: %anchor_inline15499__tile
   float v26 = (v1)[v11];
   for (int64_t v27 = v11; v27 < v8; v27 += v7) {
     int64_t v28 = (int64_t) ((uint64_t) v27 * (uint64_t) v13);
@@ -181,9 +182,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // Unpack CommContext: combine_arrived_ctx
     __gm__ int64_t* combine_arrived_ctx = reinterpret_cast<__gm__ int64_t*>(args[4]);
 
-    // Extract dynamic dim: LOCAL_T_DYN
-    int64_t LOCAL_T_DYN = static_cast<int64_t>(encoder_hidden__ssa_v0_tensor->shapes[0]);
+    // Extract dynamic dim: T_DYN
+    int64_t T_DYN = static_cast<int64_t>(encoder_hidden__ssa_v0_tensor->shapes[0]);
 
     // Forward to ptoas-generated function
-    moe_signal_clear(encoder_hidden__ssa_v0, data_arrived__ssa_v0, combine_arrived__ssa_v0, data_arrived_ctx, combine_arrived_ctx, LOCAL_T_DYN);
+    moe_signal_clear(encoder_hidden__ssa_v0, data_arrived__ssa_v0, combine_arrived__ssa_v0, data_arrived_ctx, combine_arrived_ctx, T_DYN);
 }

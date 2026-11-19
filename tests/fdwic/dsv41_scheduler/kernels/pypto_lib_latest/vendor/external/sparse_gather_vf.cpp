@@ -554,6 +554,24 @@ __aicore__ inline void gather_rows(__gm__ uint8_t* cache, __gm__ const int32_t* 
         dcci(reinterpret_cast<__gm__ void*>(line), cache_line_t::SINGLE_CACHE_LINE);
     }
     dsb(DSB_DDR);
+    const int first_index = indices[0];
+    const int64_t index_step = static_cast<int64_t>(indices[1]) - first_index;
+    bool strided = first_index >= 0 && index_step > 0;
+    // Coalesce a fully valid arithmetic run into one 32-row transfer.
+    for (int row = 2; row < VEC_KEYS && strided; ++row) {
+        strided = indices[row] == (int64_t)first_index + (int64_t)row * index_step;
+    }
+    if (strided) {
+        Tile<TileType::Vec, uint8_t, VEC_KEYS, 544, BLayout::RowMajor, VEC_KEYS, row_bytes> rows;
+        TASSIGN(rows, raw_base);
+        using RowsStride = pto::Stride<1, 1, 1, DYNAMIC, 1>;
+        using RowsShape = Shape<1, 1, 1, VEC_KEYS, row_bytes>;
+        GlobalTensor<uint8_t, RowsShape, RowsStride> input(
+            cache + (int64_t)first_index * row_bytes, RowsShape(),
+            RowsStride(1, 1, 1, (int64_t)index_step * row_bytes, 1));
+        TLOAD(rows, input);
+        return;
+    }
     for (int row = 0; row < VEC_KEYS; row += 2) {
         const int a = indices[row];
         const int b = indices[row + 1];

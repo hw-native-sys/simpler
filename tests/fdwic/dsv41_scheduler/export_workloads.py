@@ -35,17 +35,19 @@ def export(capture, flavor, output):
         return [i for i, label in enumerate(labels) if name in label]
 
     if flavor == "pypto_lib_latest":
-        collapses, posts = positions("_hc_collapse"), positions("_hc_post")
-        # Native attention and MoE share HC kernels. The final head adds one
-        # collapse after the 40 attention/MoE pairs, without a matching post.
-        if len(collapses) != 81 or len(posts) != 80 or collapses[-1] <= posts[-1]:
-            raise ValueError("latest capture must contain 40 native attention/MoE pairs and the final head")
-        starts, ends, finishes = collapses[:-1:2], posts[::2], posts[1::2]
-        if any(
-            not start < end < collapses[2 * i + 1] < finish
-            for i, (start, end, finish) in enumerate(zip(starts, ends, finishes, strict=True))
+        starts = positions("hc_collapse_norm")
+        ends = positions("_o_proj_b_hc_post_aic")
+        moe_starts = positions("hc_collapse_norm_2")
+        finishes = positions("_hc_post")
+        if (
+            len(moe_starts) != 40
+            or not all(
+                start < end < moe_start < finish
+                for start, end, moe_start, finish in zip(starts, ends, moe_starts, finishes, strict=True)
+            )
+            or any(finish >= start for finish, start in zip(finishes[:-1], starts[1:], strict=True))
         ):
-            raise ValueError("native attention/MoE boundaries are interleaved unexpectedly")
+            raise ValueError("latest capture must contain 40 ordered attention/MoE pairs")
     else:
         start_name, attention_end, layer_end = (
             ("hc_collapse_norm", "hc_post", "hc_post_2")

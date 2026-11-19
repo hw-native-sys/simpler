@@ -18,6 +18,7 @@
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
 
+
 #include "intrinsic.h"
 
 
@@ -79,80 +80,80 @@ static __aicore__ void v41_rope_rows_1(__gm__ float* v1, __gm__ float* v2, __gm_
   const float v17 = 1.0f;
   // pto: %cst_7
   const float v18 = 0.0f;
-  // pto: %c2a_rope_cos_inline5377__ssa_v0_view
+  // pto: %c2a_rope_cos_inline10555__ssa_v0_view
   const int64_t v19 = 1;
-  // pto: %c2a_rope_cos_inline5377__ssa_v0_view
+  // pto: %c2a_rope_cos_inline10555__ssa_v0_view
   const int64_t v20 = 1;
-  // pto: %c2a_rope_cos_inline5377__ssa_v0_view
+  // pto: %c2a_rope_cos_inline10555__ssa_v0_view
   const int64_t v21 = 1;
-  // pto: %c2a_rope_cos_inline5377__ssa_v0_view
+  // pto: %c2a_rope_cos_inline10555__ssa_v0_view
   int64_t v22 = (int64_t) v7;
-  // pto: %c2a_rope_cos_inline5377__ssa_v0_view
+  // pto: %c2a_rope_cos_inline10555__ssa_v0_view
   int64_t v23 = v22 * v12;
-  // pto: %c2a_rope_cos_inline5377__ssa_v0_view
+  // pto: %c2a_rope_cos_inline10555__ssa_v0_view
   int64_t v24 = v21 * v23;
-  // pto: %c2a_rope_cos_inline5377__ssa_v0_view
+  // pto: %c2a_rope_cos_inline10555__ssa_v0_view
   pto::Shape<1, 1, 1, -1, -1> v25 = pto::Shape<1, 1, 1, -1, -1>(v19, v20, v21, v22, v12);
-  // pto: %c2a_rope_cos_inline5377__ssa_v0_view
+  // pto: %c2a_rope_cos_inline10555__ssa_v0_view
   pto::Stride<-1, -1, -1, -1, -1> v26 = pto::Stride<-1, -1, -1, -1, -1>(v20 * v24, v24, v23, v12, v13);
-  // pto: %c2a_rope_cos_inline5377__ssa_v0_view
+  // pto: %c2a_rope_cos_inline10555__ssa_v0_view
   GlobalTensor<float, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND> v27 = GlobalTensor<float, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND>(v1, v25, v26);
-  // pto: %c2a_rope_sin_inline5378__ssa_v0_view
+  // pto: %c2a_rope_sin_inline10556__ssa_v0_view
   const int64_t v28 = 1;
-  // pto: %c2a_rope_sin_inline5378__ssa_v0_view
+  // pto: %c2a_rope_sin_inline10556__ssa_v0_view
   const int64_t v29 = 1;
-  // pto: %c2a_rope_sin_inline5378__ssa_v0_view
+  // pto: %c2a_rope_sin_inline10556__ssa_v0_view
   const int64_t v30 = 1;
-  // pto: %c2a_rope_sin_inline5378__ssa_v0_view
+  // pto: %c2a_rope_sin_inline10556__ssa_v0_view
   int64_t v31 = (int64_t) v7;
-  // pto: %c2a_rope_sin_inline5378__ssa_v0_view
+  // pto: %c2a_rope_sin_inline10556__ssa_v0_view
   int64_t v32 = v31 * v12;
-  // pto: %c2a_rope_sin_inline5378__ssa_v0_view
+  // pto: %c2a_rope_sin_inline10556__ssa_v0_view
   int64_t v33 = v30 * v32;
-  // pto: %c2a_rope_sin_inline5378__ssa_v0_view
+  // pto: %c2a_rope_sin_inline10556__ssa_v0_view
   pto::Shape<1, 1, 1, -1, -1> v34 = pto::Shape<1, 1, 1, -1, -1>(v28, v29, v30, v31, v12);
-  // pto: %c2a_rope_sin_inline5378__ssa_v0_view
+  // pto: %c2a_rope_sin_inline10556__ssa_v0_view
   pto::Stride<-1, -1, -1, -1, -1> v35 = pto::Stride<-1, -1, -1, -1, -1>(v29 * v33, v33, v32, v12, v13);
-  // pto: %c2a_rope_sin_inline5378__ssa_v0_view
+  // pto: %c2a_rope_sin_inline10556__ssa_v0_view
   GlobalTensor<float, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND> v36 = GlobalTensor<float, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND>(v2, v34, v35);
-  // pto: %freqs_cos_inline5459__ssa_v0_view
+  // pto: %freqs_cos_inline10636__ssa_v0_view
   const int64_t v37 = 1;
-  // pto: %freqs_cos_inline5459__ssa_v0_view
+  // pto: %freqs_cos_inline10636__ssa_v0_view
   const int64_t v38 = 1;
-  // pto: %freqs_cos_inline5459__ssa_v0_view
+  // pto: %freqs_cos_inline10636__ssa_v0_view
   const int64_t v39 = 1;
-  // pto: %freqs_cos_inline5459__ssa_v0_view
+  // pto: %freqs_cos_inline10636__ssa_v0_view
   int64_t v40 = (int64_t) v8;
-  // pto: %freqs_cos_inline5459__ssa_v0_view
+  // pto: %freqs_cos_inline10636__ssa_v0_view
   int64_t v41 = v40 * v12;
-  // pto: %freqs_cos_inline5459__ssa_v0_view
+  // pto: %freqs_cos_inline10636__ssa_v0_view
   int64_t v42 = v39 * v41;
-  // pto: %freqs_cos_inline5459__ssa_v0_view
+  // pto: %freqs_cos_inline10636__ssa_v0_view
   pto::Shape<1, 1, 1, -1, -1> v43 = pto::Shape<1, 1, 1, -1, -1>(v37, v38, v39, v40, v12);
-  // pto: %freqs_cos_inline5459__ssa_v0_view
+  // pto: %freqs_cos_inline10636__ssa_v0_view
   pto::Stride<-1, -1, -1, -1, -1> v44 = pto::Stride<-1, -1, -1, -1, -1>(v38 * v42, v42, v41, v12, v13);
-  // pto: %freqs_cos_inline5459__ssa_v0_view
+  // pto: %freqs_cos_inline10636__ssa_v0_view
   GlobalTensor<float, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND> v45 = GlobalTensor<float, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND>(v4, v43, v44);
-  // pto: %freqs_sin_inline5460__ssa_v0_view
+  // pto: %freqs_sin_inline10637__ssa_v0_view
   const int64_t v46 = 1;
-  // pto: %freqs_sin_inline5460__ssa_v0_view
+  // pto: %freqs_sin_inline10637__ssa_v0_view
   const int64_t v47 = 1;
-  // pto: %freqs_sin_inline5460__ssa_v0_view
+  // pto: %freqs_sin_inline10637__ssa_v0_view
   const int64_t v48 = 1;
-  // pto: %freqs_sin_inline5460__ssa_v0_view
+  // pto: %freqs_sin_inline10637__ssa_v0_view
   int64_t v49 = (int64_t) v8;
-  // pto: %freqs_sin_inline5460__ssa_v0_view
+  // pto: %freqs_sin_inline10637__ssa_v0_view
   int64_t v50 = v49 * v12;
-  // pto: %freqs_sin_inline5460__ssa_v0_view
+  // pto: %freqs_sin_inline10637__ssa_v0_view
   int64_t v51 = v48 * v50;
-  // pto: %freqs_sin_inline5460__ssa_v0_view
+  // pto: %freqs_sin_inline10637__ssa_v0_view
   pto::Shape<1, 1, 1, -1, -1> v52 = pto::Shape<1, 1, 1, -1, -1>(v46, v47, v48, v49, v12);
-  // pto: %freqs_sin_inline5460__ssa_v0_view
+  // pto: %freqs_sin_inline10637__ssa_v0_view
   pto::Stride<-1, -1, -1, -1, -1> v53 = pto::Stride<-1, -1, -1, -1, -1>(v47 * v51, v51, v50, v12, v13);
-  // pto: %freqs_sin_inline5460__ssa_v0_view
+  // pto: %freqs_sin_inline10637__ssa_v0_view
   GlobalTensor<float, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND> v54 = GlobalTensor<float, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND>(v5, v52, v53);
-  // pto: %worker_inline5462__ssa_v0
-  // pto: %attention_count_inline5370__ssa_v0_idx
+  // pto: %worker_inline10639__ssa_v0
+  // pto: %attention_count_inline10549__ssa_v0_idx
   set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
   set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
   for (int64_t v55 = (int64_t) v9; v55 < ((int64_t) v6); v55 += v12) {
@@ -170,7 +171,7 @@ static __aicore__ void v41_rope_rows_1(__gm__ float* v1, __gm__ float* v2, __gm_
     int64_t v59 = v58 < v14 ? (int64_t) ((uint64_t) v58 + (uint64_t) v15) : v58;
     // pto: %5, %11, %12
     ;
-    // pto: %position_inline5464__phi_v3
+    // pto: %position_inline10641__phi_v3
     ;
     int64_t v60;
     if (v57 >= v14 & v59 == v14) {
@@ -199,22 +200,22 @@ static __aicore__ void v41_rope_rows_1(__gm__ float* v1, __gm__ float* v2, __gm_
       // pto: %15
       ;
       int64_t v65 = v64 ? v14 : v60;
-      // pto: %freqs_cos_inline5459__ssa_v0_pview
+      // pto: %freqs_cos_inline10636__ssa_v0_pview
       ;
       __gm__ float* v66 = PTOAS__GLOBAL_TENSOR_DATA(v45);
-      // pto: %freqs_cos_inline5459__ssa_v0_pview
+      // pto: %freqs_cos_inline10636__ssa_v0_pview
       ;
       const int64_t v67 = 0;
-      // pto: %freqs_cos_inline5459__ssa_v0_pview
+      // pto: %freqs_cos_inline10636__ssa_v0_pview
       ;
       const int64_t v68 = 32;
-      // pto: %freqs_cos_inline5459__ssa_v0_pview
+      // pto: %freqs_cos_inline10636__ssa_v0_pview
       ;
       pto::Shape<1, 1, 1, 1, 32> v69 = pto::Shape<1, 1, 1, 1, 32>();
-      // pto: %freqs_cos_inline5459__ssa_v0_pview
+      // pto: %freqs_cos_inline10636__ssa_v0_pview
       ;
       pto::Stride<32, 32, 32, 32, 1> v70 = pto::Stride<32, 32, 32, 32, 1>();
-      // pto: %freqs_cos_inline5459__ssa_v0_pview
+      // pto: %freqs_cos_inline10636__ssa_v0_pview
       ;
       GlobalTensor<float, pto::Shape<1, 1, 1, 1, 32>, pto::Stride<32, 32, 32, 32, 1>, pto::Layout::ND> v71 = GlobalTensor<float, pto::Shape<1, 1, 1, 1, 32>, pto::Stride<32, 32, 32, 32, 1>, pto::Layout::ND>(v66 + (v67 + v65 * v68), v69, v70);
       TLOAD(v62, v71);
@@ -222,22 +223,22 @@ static __aicore__ void v41_rope_rows_1(__gm__ float* v1, __gm__ float* v2, __gm_
       // pto: %16
       ;
       int64_t v72 = v55 < v14 ? v14 : v55;
-      // pto: %c2a_rope_cos_inline5377__iter_v1_pview
+      // pto: %c2a_rope_cos_inline10555__iter_v1_pview
       ;
       __gm__ float* v73 = PTOAS__GLOBAL_TENSOR_DATA(v27);
-      // pto: %c2a_rope_cos_inline5377__iter_v1_pview
+      // pto: %c2a_rope_cos_inline10555__iter_v1_pview
       ;
       const int64_t v74 = 0;
-      // pto: %c2a_rope_cos_inline5377__iter_v1_pview
+      // pto: %c2a_rope_cos_inline10555__iter_v1_pview
       ;
       const int64_t v75 = 32;
-      // pto: %c2a_rope_cos_inline5377__iter_v1_pview
+      // pto: %c2a_rope_cos_inline10555__iter_v1_pview
       ;
       pto::Shape<1, 1, 1, 1, 32> v76 = pto::Shape<1, 1, 1, 1, 32>();
-      // pto: %c2a_rope_cos_inline5377__iter_v1_pview
+      // pto: %c2a_rope_cos_inline10555__iter_v1_pview
       ;
       pto::Stride<32, 32, 32, 32, 1> v77 = pto::Stride<32, 32, 32, 32, 1>();
-      // pto: %c2a_rope_cos_inline5377__iter_v1_pview
+      // pto: %c2a_rope_cos_inline10555__iter_v1_pview
       ;
       GlobalTensor<float, pto::Shape<1, 1, 1, 1, 32>, pto::Stride<32, 32, 32, 32, 1>, pto::Layout::ND> v78 = GlobalTensor<float, pto::Shape<1, 1, 1, 1, 32>, pto::Stride<32, 32, 32, 32, 1>, pto::Layout::ND>(v73 + (v74 + v72 * v75), v76, v77);
       wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID0);
@@ -250,43 +251,43 @@ static __aicore__ void v41_rope_rows_1(__gm__ float* v1, __gm__ float* v2, __gm_
       ;
       uint64_t v80 = (uint64_t) v11;
       TASSIGN(v79, v80);
-      // pto: %freqs_sin_inline5460__ssa_v0_pview
+      // pto: %freqs_sin_inline10637__ssa_v0_pview
       ;
       __gm__ float* v81 = PTOAS__GLOBAL_TENSOR_DATA(v54);
-      // pto: %freqs_sin_inline5460__ssa_v0_pview
+      // pto: %freqs_sin_inline10637__ssa_v0_pview
       ;
       const int64_t v82 = 0;
-      // pto: %freqs_sin_inline5460__ssa_v0_pview
+      // pto: %freqs_sin_inline10637__ssa_v0_pview
       ;
       const int64_t v83 = 32;
-      // pto: %freqs_sin_inline5460__ssa_v0_pview
+      // pto: %freqs_sin_inline10637__ssa_v0_pview
       ;
       pto::Shape<1, 1, 1, 1, 32> v84 = pto::Shape<1, 1, 1, 1, 32>();
-      // pto: %freqs_sin_inline5460__ssa_v0_pview
+      // pto: %freqs_sin_inline10637__ssa_v0_pview
       ;
       pto::Stride<32, 32, 32, 32, 1> v85 = pto::Stride<32, 32, 32, 32, 1>();
-      // pto: %freqs_sin_inline5460__ssa_v0_pview
+      // pto: %freqs_sin_inline10637__ssa_v0_pview
       ;
       GlobalTensor<float, pto::Shape<1, 1, 1, 1, 32>, pto::Stride<32, 32, 32, 32, 1>, pto::Layout::ND> v86 = GlobalTensor<float, pto::Shape<1, 1, 1, 1, 32>, pto::Stride<32, 32, 32, 32, 1>, pto::Layout::ND>(v81 + (v82 + v65 * v83), v84, v85);
       wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID1);
       TLOAD(v79, v86);
       set_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID1);
-      // pto: %c2a_rope_sin_inline5378__iter_v1_pview
+      // pto: %c2a_rope_sin_inline10556__iter_v1_pview
       ;
       __gm__ float* v87 = PTOAS__GLOBAL_TENSOR_DATA(v36);
-      // pto: %c2a_rope_sin_inline5378__iter_v1_pview
+      // pto: %c2a_rope_sin_inline10556__iter_v1_pview
       ;
       const int64_t v88 = 0;
-      // pto: %c2a_rope_sin_inline5378__iter_v1_pview
+      // pto: %c2a_rope_sin_inline10556__iter_v1_pview
       ;
       const int64_t v89 = 32;
-      // pto: %c2a_rope_sin_inline5378__iter_v1_pview
+      // pto: %c2a_rope_sin_inline10556__iter_v1_pview
       ;
       pto::Shape<1, 1, 1, 1, 32> v90 = pto::Shape<1, 1, 1, 1, 32>();
-      // pto: %c2a_rope_sin_inline5378__iter_v1_pview
+      // pto: %c2a_rope_sin_inline10556__iter_v1_pview
       ;
       pto::Stride<32, 32, 32, 32, 1> v91 = pto::Stride<32, 32, 32, 32, 1>();
-      // pto: %c2a_rope_sin_inline5378__iter_v1_pview
+      // pto: %c2a_rope_sin_inline10556__iter_v1_pview
       ;
       GlobalTensor<float, pto::Shape<1, 1, 1, 1, 32>, pto::Stride<32, 32, 32, 32, 1>, pto::Layout::ND> v92 = GlobalTensor<float, pto::Shape<1, 1, 1, 1, 32>, pto::Stride<32, 32, 32, 32, 1>, pto::Layout::ND>(v87 + (v88 + v72 * v89), v90, v91);
       wait_flag(PIPE_MTE2, PIPE_MTE3, EVENT_ID1);
@@ -383,37 +384,37 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int32_t __pypto_spmd_block_idx = get_block_idx(args);
     int32_t __pypto_spmd_block_num = get_block_num(args);
 
-    // Unpack tensor: c2a_rope_cos_inline5377__ssa_v0
-    __gm__ Tensor* c2a_rope_cos_inline5377__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ float* c2a_rope_cos_inline5377__ssa_v0 = reinterpret_cast<__gm__ float*>(c2a_rope_cos_inline5377__ssa_v0_tensor->buffer.addr) + c2a_rope_cos_inline5377__ssa_v0_tensor->start_offset;
+    // Unpack tensor: c2a_rope_cos_inline10555__ssa_v0
+    __gm__ Tensor* c2a_rope_cos_inline10555__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
+    __gm__ float* c2a_rope_cos_inline10555__ssa_v0 = reinterpret_cast<__gm__ float*>(c2a_rope_cos_inline10555__ssa_v0_tensor->buffer.addr) + c2a_rope_cos_inline10555__ssa_v0_tensor->start_offset;
 
-    // Unpack tensor: c2a_rope_sin_inline5378__ssa_v0
-    __gm__ Tensor* c2a_rope_sin_inline5378__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ float* c2a_rope_sin_inline5378__ssa_v0 = reinterpret_cast<__gm__ float*>(c2a_rope_sin_inline5378__ssa_v0_tensor->buffer.addr) + c2a_rope_sin_inline5378__ssa_v0_tensor->start_offset;
+    // Unpack tensor: c2a_rope_sin_inline10556__ssa_v0
+    __gm__ Tensor* c2a_rope_sin_inline10556__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[1]);
+    __gm__ float* c2a_rope_sin_inline10556__ssa_v0 = reinterpret_cast<__gm__ float*>(c2a_rope_sin_inline10556__ssa_v0_tensor->buffer.addr) + c2a_rope_sin_inline10556__ssa_v0_tensor->start_offset;
 
     // Unpack tensor: position_ids__ssa_v0
     __gm__ Tensor* position_ids__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[2]);
     __gm__ int32_t* position_ids__ssa_v0 = reinterpret_cast<__gm__ int32_t*>(position_ids__ssa_v0_tensor->buffer.addr) + position_ids__ssa_v0_tensor->start_offset;
 
-    // Unpack tensor: freqs_cos_inline5459__ssa_v0
-    __gm__ Tensor* freqs_cos_inline5459__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[3]);
-    __gm__ float* freqs_cos_inline5459__ssa_v0 = reinterpret_cast<__gm__ float*>(freqs_cos_inline5459__ssa_v0_tensor->buffer.addr) + freqs_cos_inline5459__ssa_v0_tensor->start_offset;
+    // Unpack tensor: freqs_cos_inline10636__ssa_v0
+    __gm__ Tensor* freqs_cos_inline10636__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[3]);
+    __gm__ float* freqs_cos_inline10636__ssa_v0 = reinterpret_cast<__gm__ float*>(freqs_cos_inline10636__ssa_v0_tensor->buffer.addr) + freqs_cos_inline10636__ssa_v0_tensor->start_offset;
 
-    // Unpack tensor: freqs_sin_inline5460__ssa_v0
-    __gm__ Tensor* freqs_sin_inline5460__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[4]);
-    __gm__ float* freqs_sin_inline5460__ssa_v0 = reinterpret_cast<__gm__ float*>(freqs_sin_inline5460__ssa_v0_tensor->buffer.addr) + freqs_sin_inline5460__ssa_v0_tensor->start_offset;
+    // Unpack tensor: freqs_sin_inline10637__ssa_v0
+    __gm__ Tensor* freqs_sin_inline10637__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[4]);
+    __gm__ float* freqs_sin_inline10637__ssa_v0 = reinterpret_cast<__gm__ float*>(freqs_sin_inline10637__ssa_v0_tensor->buffer.addr) + freqs_sin_inline10637__ssa_v0_tensor->start_offset;
 
-    // Unpack scalar: attention_count_inline5370__ssa_v0
-    union { uint64_t u64; int32_t val; } attention_count_inline5370__ssa_v0_conv;
-    attention_count_inline5370__ssa_v0_conv.u64 = args[5];
-    int32_t attention_count_inline5370__ssa_v0 = attention_count_inline5370__ssa_v0_conv.val;
+    // Unpack scalar: attention_count_inline10549__ssa_v0
+    union { uint64_t u64; int32_t val; } attention_count_inline10549__ssa_v0_conv;
+    attention_count_inline10549__ssa_v0_conv.u64 = args[5];
+    int32_t attention_count_inline10549__ssa_v0 = attention_count_inline10549__ssa_v0_conv.val;
 
     // Extract dynamic dim: T_DYN
-    int64_t T_DYN = static_cast<int64_t>(c2a_rope_cos_inline5377__ssa_v0_tensor->shapes[0]);
+    int64_t T_DYN = static_cast<int64_t>(c2a_rope_cos_inline10555__ssa_v0_tensor->shapes[0]);
 
     // Extract dynamic dim: ROPE_ROWS_DYN
-    int64_t ROPE_ROWS_DYN = static_cast<int64_t>(freqs_cos_inline5459__ssa_v0_tensor->shapes[0]);
+    int64_t ROPE_ROWS_DYN = static_cast<int64_t>(freqs_cos_inline10636__ssa_v0_tensor->shapes[0]);
 
     // Forward to ptoas-generated function
-    v41_rope_rows_1(c2a_rope_cos_inline5377__ssa_v0, c2a_rope_sin_inline5378__ssa_v0, position_ids__ssa_v0, freqs_cos_inline5459__ssa_v0, freqs_sin_inline5460__ssa_v0, attention_count_inline5370__ssa_v0, T_DYN, ROPE_ROWS_DYN, __pypto_spmd_block_idx, __pypto_spmd_block_num);
+    v41_rope_rows_1(c2a_rope_cos_inline10555__ssa_v0, c2a_rope_sin_inline10556__ssa_v0, position_ids__ssa_v0, freqs_cos_inline10636__ssa_v0, freqs_sin_inline10637__ssa_v0, attention_count_inline10549__ssa_v0, T_DYN, ROPE_ROWS_DYN, __pypto_spmd_block_idx, __pypto_spmd_block_num);
 }

@@ -13,17 +13,16 @@ experiment, not checkpoint accuracy validation. Isolated Attention and Engram
 cases run rank 0 on **one device**. Only `moe`, `layers_19_21`, and the original
 full forward run on **two devices** with real communication and deferred waits.
 
-The matrix contains 12 configurations: one initial PyPTO-lib case, three
+The matrix contains 11 configurations: one initial PyPTO-lib case, two
 half-sync DSL cases, one capacity-bounded all-sync DSL case, and seven latest
 PyPTO-lib cases. The checked-in `workloads/<flavor>/source.json` manifests own
 this selection; both exporters and the run list use them.
 Measurement availability and the timing contract are maintained in [RESULTS.md](RESULTS.md).
-Routine refreshes measure HBG and percounter. For each supported case, record
-the AICPU TMR baseline once and carry that value forward in later reports.
+Refresh both HBG and percounter for every case.
 
-Retain scheduler optimizations only when the sum of all 12 case means improves,
+Retain scheduler optimizations only when the sum of all 11 case means improves,
 using AICore L0 wall with one warmup and ten measured rounds per case. Include
-the four communicating cases; each two-device round starts after a Device
+the three communicating cases; each two-device round starts after a Device
 rendezvous and contributes the maximum of the ranks' local durations. L1/L3
 are diagnostic and do not replace this acceptance metric.
 
@@ -64,10 +63,10 @@ inputs and cannot replace tensor parameters or initialization data.
 | c1a_reuse | - | - | - | yes | 1 |
 | moe | - | yes | - | yes | 2 |
 | engram | - | - | - | yes | 1 |
-| layers_19_21 | - | yes | - | yes | 2 |
+| layers_19_21 | - | - | - | yes | 1 |
 
-Initial PyPTO-lib and all-sync DSL retain C2A full. Half-sync DSL retains
-C2A full, MoE and layers 19–21; latest PyPTO-lib retains all seven selected cases.
+Initial PyPTO-lib covers C2A full. All-sync DSL covers C2A full. Half-sync DSL retains
+C2A full and MoE. Latest PyPTO-lib retains all seven selected cases.
 Latest SWA, reindex, reuse and Engram supply the remaining short-path,
 index-refresh, cache-consumer and oversized-block coverage. Standalone c2a_reuse
 and c1a_full are removed; layer20 remains inside layers_19_21. Full-forward
@@ -82,44 +81,34 @@ completion, MIX admission, and `defer_wait` use the unchanged production code.
 
 ## Latest native PyPTO-lib group
 
-`pypto_lib_latest` comes from the unchanged
-[`dev/hbg` full forward at `a6a9a2d49047`](https://github.com/hw-native-sys/pypto-lib/tree/a6a9a2d49047ce67a85857c6b15f9604a7287714/models/deepseek_v4_1_flash).
-The original `pypto_lib` identifier stays stable and is displayed as the initial
-PyPTO-lib implementation. The latest group keeps the seven selected regions above;
-it has its own kernels, tensor layouts, native task boundaries, dependencies,
-sync-start flags and deferred communication. Its captured HBG orchestration has
-no Graph submissions. No half/all synchronization policy is applied to it.
+The seven latest cases use the DeepSeek V4.1 Flash model at
+[PyPTO-lib `4cb7442261`](https://github.com/hw-native-sys/pypto-lib/tree/4cb74422616359b3f95c598b1f9cdd31cf4e4173/models/deepseek_v4_1_flash).
+Six are slices of the same 40-layer HBG capture. The seventh runs the upstream
+`l3_moe` entry. All use the model's original task boundaries and synchronization.
 
-Inputs retain 12 requests, six positions per request (0 through 5), 72 valid
-tokens per rank, 80 padded rows, EP2, 64 local experts, 40 weight banks, zero
-weights and the original deterministic routing bias. Comparing the per-rank
-input manifests, 67 common arguments have identical geometry, storage and
-initial values. Seven use the latest native contracts:
+The forward fixture uses EP2, 64 local experts per rank, 40 weight banks and 12
+requests of six positions each (72 valid tokens, padded to 80). CPU tensors
+`moe_num_tokens` and `attention_num_tokens` drive the generated Host orchestration.
+The full forward returns `dspark_target_hidden`. Each replay checks its writable
+buffers against the original prefix and slice on the same inputs.
 
-| Argument | Initial contract | Latest native contract |
-| -------- | ---------------- | ---------------------- |
-| `hc_attn_scale`, `hc_ffn_scale` | Host storage | Device storage; same FP32 values and shapes |
-| `window_cache_pool` | 512 FP8 bytes per cache entry | 544 packed UINT8 bytes including native metadata |
-| `compressed_cache_pool` | 256 UINT8 bytes per entry | 320 UINT8 bytes per entry |
-| `state_cache_pool` | Four state slots | Eight state slots |
-| `gate_weight` | FP32 | BF16; zero values retained |
-| `lm_head_weight` | `[129280, 5120]` | `[5120, 129280]`; outside the selected regions |
+Attention ends at the fused output projection and HC post. The layer-1 Engram
+slice contains quantization, projection and gating. The layers 19–21 slice
+includes the encoder-to-decoder transition. In each MoE communication phase,
+one block per destination handles publication and one wait task per source
+registers a counter condition when the source is remote.
 
-The added DSpark target-hidden output is retained by the full-forward signature;
-its producer tasks are outside layers 19–21. The layers 19–21 slice includes the
-native encoder-to-decoder transition preparation between layers 19 and 20.
-MoE now uses grouped routed-expert kernels with device-side counts and routes;
-its dispatch-data and combine waits preserve their deferred completion semantics. Logical
-regions align across groups, but changed fusion, arithmetic kernels and cache
-formats mean cross-group timing changes are not pure scheduler speedups.
-Compare the HBG/percounter columns within each row for the fixed workload.
+The build compiles the checked-in vector-function LLVM IR with Bisheng and
+links it with each matching AIV caller. The manifests reference plain `.ll`
+sources and share identical functions between forward and standalone MoE.
+The IR was lowered with the upstream compiler's pinned PTOAS 0.72.
 
 The native sources and compact input initializers are checked in under
 `kernels/pypto_lib_latest/` and `workloads/pypto_lib_latest/`. Build and prepare
 with `--flavor pypto_lib_latest` to regenerate the seven selected cases. To refresh
 topology tables from a full 40-layer capture, place its `deps.json` and matching
 `name_map.json` together and run `export_workloads.py CAPTURE --flavor pypto_lib_latest`.
-The exporter recognizes alternating native attention/MoE HC boundaries and
+The exporter recognizes the fused attention output and the following MoE boundary and
 checks all 40 pairs before refreshing only the selected replay regions. Native MoE remains a native descriptor.
 
 ## Native MoE Host controls
@@ -151,12 +140,12 @@ are not committed. See [whole-test execution timings](TEST_TIME.md).
 Native MoE uses the model's original numerical-golden inputs, including nonzero
 weights and count-dependent forced routing. Its refreshed performance row is a
 new workload baseline and must not be interpreted as a speedup or regression
-against the former frozen zero-weight slice. The other 11 active rows retain their data.
+against the former frozen zero-weight slice.
 Host controls execute during graph construction, outside Device wall time.
 The other replay cases preserve device execution for their captured controls;
 they do not test dynamic Host `get_tensor_data` reads.
 
-All 12 prepared cases run with the C++ `native-runner`, standard Python and
+All 11 prepared cases run with the C++ `native-runner`, standard Python and
 Simpler/CANN libraries. No PyPTO, PyPTO-lib checkout, Torch or Simpler Python
 bindings are needed during execution. Only initial native MoE input preparation
 requires CPU Torch; the numerical helpers and generated Host/kernel sources
@@ -173,70 +162,6 @@ then runs the original Host callable with the supplied HBG or percounter runtime
 The original 33 tensor arguments and 10 scalars are preserved. Each rank
 submits one native call per round; the former outer Python `l3_moe` ordering
 token is unnecessary with these serial per-rank submissions.
-
-## AICPU scheduling with TMR
-
-The 11 frozen replay cases also support `--runtime=tensormap_and_ringbuffer`:
-eight single-device cases and three two-device cases. Native latest MoE is
-excluded; its live Host control reads are not part of this adapter.
-
-Use `production/list_cases.py --runtime=tensormap_and_ringbuffer` to list
-exactly these 11 case paths. Prepare a separate TMR bundle from each existing replay bundle. The adapter
-resolves captured buffer aliases and opaque task identities into a dense plan,
-then submits the same views, dependencies, scopes, SPMD flags and scalar values
-on AICPU. This is a fixed-task replay, not a new capture of model Python control
-flow. Fixed Host boundary fixtures are copied to device memory for AICPU access.
-
-HBG and TMR have different Tensor layouts. Selected business kernels are
-compiled for the TMR ABI through the existing compiler cache; DSL entry glue
-uses the TMR Tensor type while its numerical body remains unchanged. Input
-files are linked locally when possible. No PyPTO/PyPTO-lib environment, Torch,
-model generation or weight regeneration is required.
-
-```bash
-# Build Host tools and a separate benchmark runtime before reserving devices.
-bash "$DSV41/build.sh" --host-only
-python3 "$DSV41/production/tmr_runtime.py" \
-  --output-dir "$DSV41/build/tmr-runtime" --pto-isa "$PWD/build/pto-isa"
-
-PYTHONPATH="$PWD/python:$PWD" python3 "$DSV41/production/tmr_prepare.py" \
-  "$DSV41/build/prepared/cases/pypto_lib_latest/swa" \
-  "$DSV41/build/tmr-cases/pypto_lib_latest/swa" \
-  --pto-isa "$DSV41/build/tmr-runtime/source/build/pto-isa"
-
-python3 "$DSV41/production/device_start_gate.py" \
-  --runtime-dir "$DSV41/build/tmr-runtime/runtime/a5/onboard" \
-  --output-dir "$DSV41/build/tmr-gate" \
-  --pto-isa "$DSV41/build/tmr-runtime/source/build/pto-isa"
-bash "$DSV41/run.sh" "$DSV41/build/tmr-cases/pypto_lib_latest/swa" \
-  "$DSV41/build/tmr-runtime/runtime/a5/onboard" "$DSV41/outputs/tmr/swa" \
-  0 1 10 --runtime=tensormap_and_ringbuffer
-```
-
-The normal runner allocates devices automatically when `TASK_DEVICE` is absent.
-For parallel execution, submit jobs with `task-submit --device auto --device-num N`
-and retain its returned IDs. Two-device cases require the same Device start gate
-as HBG/percounter: pass `build/tmr-gate/runtime/a5/onboard` for those cases.
-Single-device cases use the unwrapped `build/tmr-runtime/runtime/a5/onboard`.
-Replay numerical checks, one warmup and ten measured rounds remain enabled.
-
-The timing instrumentation exists only in the benchmark build. `tmr_runtime.py`
-copies the source tree into its new output directory, applies `tmr_timing.patch`
-there, and builds into that directory's `runtime/`. It checks out the pinned
-PTO-ISA revision in a separate local clone. Production `src/`, normal build
-outputs and the supplied PTO-ISA checkout are not modified. No production
-feature flag or timing branch is added. L0 tests verify the marker and component
-hashes before requesting devices; the Device-gate snapshot preserves that marker.
-
-This test-only TMR runtime records the first business-kernel entry and last return per Core, then
-publishes the reduced window after successful Core retirement and cache
-invalidation. Idle Cores contribute no timestamps; failed retirement publishes
-no valid window. The native measurement excludes AICPU startup/teardown but
-includes gaps from AICPU replay, graph construction, scheduling and communication.
-It is not a measurement of scheduling alone. This new endpoint collection's
-incremental overhead has not separately been certified below 1%; it is paid only
-by this explicitly built benchmark runtime. Ordinary TMR builds retain their
-original executor and have none of these added timing operations.
 
 ## Boundary preparation and validation
 
@@ -300,7 +225,7 @@ original files under `workloads/` remain source-capture references.
 
 Regenerate prepared bundles after updating the exporter. Existing bundles do
 not acquire this policy automatically. The standard preparation and run
-commands below produce 12 configurations by default. All-sync exports only C2A full;
+commands below produce 11 configurations by default. All-sync exports only C2A full;
 its MoE and layers 19–21 variants are outside the active matrix. Use `--sync-policy half`
 to prepare only the half-sync DSL variant, or `--sync-policy all-cap64` for
 only the all-sync DSL variant. Both PyPTO-lib groups retain their native flags.
@@ -309,7 +234,7 @@ The all-sync variant uses `record-tool --all-sync-start-cap64` and enables
 every capacity-eligible multi-block compute task in the selected slice.
 The limit is inclusive: 64 for AIV, 32 for AIC/MIX. In this fixture that
 enables all 27 SPMD tasks in its C2A full case, compared with 14 in the half-sync
-C2A full case. Across its three cases, the half-sync group enables 87 of 171 tasks.
+C2A full case.
 Both variants retain the original flavor in `case.json` and identify the
 selected variant separately, so source workload tables and the lower-bound
 analyzers continue to use the same task identities.
@@ -365,20 +290,13 @@ labels and cannot be reused as AICore-wall reference values. A refreshed table
 must identify the runtime revision and measurement boundary for each column.
 
 Use one table, with each case followed by initial PyPTO-lib, half-sync DSL,
-all-sync DSL, then latest PyPTO-lib. Keep only the current result set, average milliseconds with six
-decimal places, and the following fixed columns (see [RESULTS.md](RESULTS.md)):
-
-Use the exact six-column header shown in [RESULTS.md](RESULTS.md).
-
-The HBG column contains the selected HBG revision; always state its exact
-commit beside the table, independently of the fixed column label. The current
-published HBG values use `534c5656a`, and percounter uses `21d2e9a103d5`.
-Do not add a duplicate candidate column. When preserving an existing group while
-adding another, state which measurements were reused and which were refreshed. The percentage is `(min(HBG, percounter) / bound - 1) * 100`,
-computed before rounding and displayed with two decimal places. Missing
-bounds and communication cases use an em dash. Mark unclosed solver bounds
-and their percentages with a dagger; never substitute an incumbent as an
-exact lower bound. Do not publish raw samples or P99 columns in this table.
+all-sync DSL, then latest PyPTO-lib. Report average milliseconds with six decimal
+places using the six columns in [RESULTS.md](RESULTS.md). Identify the runtime
+revisions for each measurement batch and which rows were refreshed.
+Compute the percentage as `(min(HBG, percounter) / limit - 1) * 100`
+before rounding to two decimal places. In the final row, sum the unrounded case
+means for each runtime and the case limits. Apply the same formula to these totals. Use an em dash for unavailable values.
+Mark unclosed solver bounds and their percentages with a dagger.
 
 ## Included sources and data
 
@@ -393,15 +311,15 @@ kernels/
 workloads/<flavor>/
   source.json                       # Selected cuts or native descriptors
   <case>/{tasks,edges}.tsv            # Human-readable topology reference
-  vendor/orchestration.cpp.gz        # Exact original C++ full-forward orchestration
-  vendor/provenance.json             # Uncompressed source digest and origin
+  vendor/                           # Plain C++ host orchestration sources
+  vendor/provenance.json             # Source digest and origin
   inputs/{rank0,rank1}.txt            # Tensor layouts, initializers and scalar bindings
   inputs/vendor/data/               # Compact original input bytes, shared by digest
 production/                         # Native runner, capture/replay adapters, build helpers
 ```
 
 There are 131 kernel registrations for initial PyPTO-lib, 109 for PyPTO-lib-dsl,
-and 82 for latest PyPTO-lib.
+and 81 for the latest PyPTO-lib forward. The standalone latest MoE has 26 registrations.
 The original DSL forward is mixed: 83 registrations use 52 DSL-generated
 `entry.cpp` / `device_source.hpp` pairs under `vendor/external/`; the other 26
 use the original PTO-generated sources under `vendor/aic/` and `vendor/aiv/`
@@ -410,9 +328,9 @@ original registration category; these sources are now included locally.
 The DSL-generated kernels have not been replaced with PTO implementations.
 Shared sources are stored once; registrations retain their original function
 IDs, argument directions, and AIC/AIV targets. Generated source is kept verbatim
-under `vendor/`. The original Host source is losslessly compressed because the
-larger file exceeds this repository's individual-file size limit. It is
-expanded into `build/` before compilation and can be read with `gzip -dc`.
+under `vendor/`. The initial PyPTO-lib Host orchestration spans two source
+fragments, split at the transition to layers 20–39. The build concatenates
+them in manifest order to reproduce the original translation unit byte for byte.
 
 Every registration declares `async_capability` alongside its signature:
 `SYNCHRONOUS` registers no deferred completion; `DEFERRED` supplies a static
@@ -533,7 +451,7 @@ launcher never compiles while holding devices. Native MoE `--compile-only`
 remains available with an unwrapped runtime. Single-device Attention replay
 needs no gate.
 
-To run exactly the selected 12 scenarios, including when an older prepared directory contains extra cases:
+To run exactly the selected 11 scenarios, including when an older prepared directory contains extra cases:
 
 ```bash
 while IFS= read -r selected; do

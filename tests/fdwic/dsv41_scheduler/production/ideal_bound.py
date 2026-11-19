@@ -15,6 +15,7 @@ import json
 import re
 import statistics
 from collections import Counter, defaultdict, deque
+from graphlib import TopologicalSorter
 from pathlib import Path
 
 from simpler_setup.tools.hbg.execution_identity import attach_execution_identities
@@ -102,6 +103,29 @@ def complete_flat_dag(deps, mapping_path, original_ids, repetitions):
     }
 
 
+def check_observed_completion(deps, intervals):
+    """Check that the captured kernel envelope supports the completion-DAG model."""
+    if not any(task.get("early_dispatch") for task in deps["tasks"]):
+        return
+    spans = {}
+    for _, task, _, begin, end, *_ in intervals:
+        first, last = spans.get(task, (begin, end))
+        spans[task] = min(first, begin), max(last, end)
+    predecessors = {int(task["task_id"]): set() for task in deps["tasks"]}
+    for edge in deps["edges"]:
+        predecessors[int(edge["succ"])].add(int(edge["pred"]))
+    finished = {}
+    for task in TopologicalSorter(predecessors).static_order():
+        ready = max((finished[pred] for pred in predecessors[task]), default=0)
+        if task in spans:
+            begin, end = spans[task]
+            if begin < ready:
+                raise ValueError("Early dependency release is not modeled")
+            finished[task] = end
+        else:
+            finished[task] = ready
+
+
 def read_case(bundle, capture):
     metadata = json.loads((bundle / "case.json").read_text())
     result = json.loads((capture / "result.json").read_text())
@@ -138,8 +162,7 @@ def read_case(bundle, capture):
         deps = complete_flat_dag(
             json.loads((run / "deps.json").read_text()), run / "source-task-map.txt", source_ids, 1
         )
-        if any(task.get("early_dispatch", False) for task in deps["tasks"]):
-            raise ValueError("Early dependency release is not modeled")
+        check_observed_completion(deps, records["aicore_tasks"])
         nodes = {int(task["task_id"]): task for task in deps["tasks"]}
         signature = (
             sorted((tid, tuple(task["kernel_ids"]), task["block_num"]) for tid, task in nodes.items()),
