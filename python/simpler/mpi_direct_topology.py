@@ -49,10 +49,12 @@ class MpiDirectExecutorSpec:
     num_sub_workers: int
     comm_profile: str
     global_device_ranks: tuple[int, ...]
+    enable_sdma: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MpiDirectExecutorSpec:
         spec = cls(
+            enable_sdma=data.get("enable_sdma", False),
             rank=int(data["rank"]),
             worker_id=int(data["worker_id"]),
             host=str(data["host"]),
@@ -63,6 +65,8 @@ class MpiDirectExecutorSpec:
             comm_profile=str(data.get("comm_profile", "sim")),
             global_device_ranks=tuple(int(item) for item in data.get("global_device_ranks", ())),
         )
+        if type(spec.enable_sdma) is not bool:
+            raise ValueError("executor enable_sdma must be a boolean")
         if spec.rank <= 0:
             raise ValueError("executor rank must be positive; rank 0 is the controller")
         if spec.worker_id < 0:
