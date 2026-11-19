@@ -611,6 +611,12 @@ uint64_t SimDeviceRunnerBase::run_result_region_base(uint32_t pipeline_slot) {
     return reinterpret_cast<uint64_t>(&device_run_results_[pipeline_slot]);
 }
 
+int SimDeviceRunnerBase::request_peer_cancel(uint32_t pipeline_slot, uint64_t run_epoch) {
+    if (run_epoch == 0 || pipeline_slot >= device_run_results_.size()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    __atomic_store_n(&device_run_results_[pipeline_slot].peer_cancel_epoch, run_epoch, __ATOMIC_RELEASE);
+    return 0;
+}
+
 SimDeviceRunnerBase::LaunchOutcome
 SimDeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) noexcept {
     LaunchOutcome outcome;

@@ -260,6 +260,7 @@ public:
         const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &predecessor, void *caller_stream = nullptr
     );
     bool poll_native_run(const ChipWorkerNativeRun &run);
+    void bind_peer_cancel(const ChipWorkerNativeRun &run, const int32_t *request);
     void wait_native_run(const ChipWorkerNativeRun &run);
     void finalize_native_run(const ChipWorkerNativeRun &run);
 
@@ -786,6 +787,7 @@ private:
     CallerStreamLaunchFn launch_run_on_stream_fn_ = nullptr;
     SimplerJoinedLaunchFn launch_run_joined_fn_ = nullptr;
     SimplerNativeRunFn poll_run_fn_ = nullptr;
+    decltype(&simpler_bind_peer_cancel) peer_cancel_fn_ = nullptr;
     SimplerNativeRunFn wait_run_fn_ = nullptr;
     SimplerNativeRunFn wait_run_completion_fn_ = nullptr;
     SimplerFinalizeRunFn finalize_run_fn_ = nullptr;

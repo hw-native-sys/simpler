@@ -1255,6 +1255,11 @@ int simpler_launch_run_joined(DeviceContextHandle ctx, RuntimeHandle runtime, Ru
  */
 int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 
+/** Bind a parent-owned cancellation word before launch. The word must remain
+ * mapped until this native run is finalized; only its parent publishes 0 -> 1.
+ * Unsupported backends leave the run unchanged. */
+int simpler_bind_peer_cancel(DeviceContextHandle ctx, RuntimeHandle runtime, const int32_t *request);
+
 /**
  * Internal blocking physical progress under the runtime's existing timeout.
  * Zero proves own boundaries and queued-wait consumption, and retires execution

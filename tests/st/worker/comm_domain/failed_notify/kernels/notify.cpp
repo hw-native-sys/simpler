@@ -40,11 +40,29 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
 #endif
 #else
     if (comm->rankId == 0) {
+        if (mode == 3) {
+            while (true) {
+                pto2::detail::defer_flush_range(signals + kSignalWords, sizeof(uint32_t));
+                if (signals[kSignalWords] == 1) break;
+                if (kernel_cancel_requested(ctx)) return;
+            }
+            report_kernel_error(ctx, KernelErrorCode::INDEX_OUT_OF_RANGE);
+            return;
+        }
         save_expected_notification_counter(ctx, signals, 1);
         if (mode != 0) report_kernel_error(ctx, KernelErrorCode::INDEX_OUT_OF_RANGE);
         // The peer cannot signal before registration and the requested injection.
         send_notification(peer + kSignalWords, 1, pto::comm::NotifyOp::Set);
     } else {
+        if (mode == 3) {
+            send_notification(peer + kSignalWords, 1, pto::comm::NotifyOp::Set);
+            while (!kernel_cancel_requested(ctx)) {}
+#if defined(__CPU_SIM)
+            fprintf(stderr, "PEER_CANCEL_KERNEL_EXITED\n");
+            fflush(stderr);
+#endif
+            return;
+        }
         while (true) {
             pto2::detail::defer_flush_range(signals + kSignalWords, sizeof(uint32_t));
             if (signals[kSignalWords] == 1) break;

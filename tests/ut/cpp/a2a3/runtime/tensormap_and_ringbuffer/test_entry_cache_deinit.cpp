@@ -13,6 +13,7 @@
 #include <vector>
 #include <future>
 #include <memory>
+#include <thread>
 #include "host/raii_scope_guard.h"
 #include "aicpu/native_invocation_completion.h"
 
@@ -26,6 +27,7 @@ std::vector<std::pair<const void *, size_t>> invalidations;
 thread_local std::promise<void> *pending_poll = nullptr;
 thread_local std::shared_future<void> release_pending;
 NativeInvocationCompletion *native_completion = nullptr;
+NativeInvocationResultStorage *cancel_storage = nullptr;
 }  // namespace
 // A clock read in drain follows a real PENDING poll of a completion condition.
 uint64_t get_sys_cnt_aicpu() {
@@ -39,12 +41,33 @@ uint64_t get_sys_cnt_aicpu() {
 }
 uint64_t platform_aicore_exit_deadline() { return UINT64_MAX; }
 extern "C" uint64_t get_platform_run_result_epoch() { return 41; }
+extern "C" uint64_t get_platform_run_result_base() { return reinterpret_cast<uint64_t>(cancel_storage); }
+uint64_t read_reg(uint64_t, RegId) {
+    ADD_FAILURE() << "cancel selection must not read core registers";
+    return 0;
+}
+int32_t platform_retire_aicore_group(const AicoreExitTarget *, size_t, uint64_t, bool *) {
+    ADD_FAILURE() << "cancel selection must not retire a device core";
+    return -1;
+}
+void AsyncWaitList::log_diagnostics(AICoreCompletionMailbox *, const char *) {
+    ADD_FAILURE() << "cancel selection must not enter the device stall dump";
+}
 extern "C" bool aicpu_accept_runtime_terminal(RunTerminalSelection selection, const void *payload, size_t bytes) {
     return native_completion != nullptr && native_completion->accept_runtime_terminal(selection, payload, bytes);
 }
 
 class SchedulerContextTestPeer {
 public:
+    static void report_local_failure(SharedMemoryHeader &header) {
+        SchedulerContext::latch_scheduler_error(&header, 1, SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+    }
+    static LoopAction check_cancel(SchedulerContext &context, SharedMemoryHeader &header) {
+        context.completed_.store(false);
+        // Exercise fatal selection without requiring a device core in this test.
+        context.fatal_shutdown_started_.store(true);
+        return context.check_idle_fatal_error(0, &header, nullptr);
+    }
     static DeferredCompletionSlab &prepare(SchedulerContext &context, RuntimeContext &runtime, TaskId task) {
         context.rt_ = &runtime;
         context.sched_ = &runtime.scheduler;
@@ -78,6 +101,69 @@ namespace aicpu_cache_maintenance {
 void invalidate_range_impl(const void *address, size_t bytes) { invalidations.emplace_back(address, bytes); }
 void flush_range_impl(const void *, size_t) {}
 }  // namespace aicpu_cache_maintenance
+
+TEST(EntryCacheDeinit, PeerCancellationIgnoresOldEpochAndPreservesPriorError) {
+    NativeInvocationResultStorage storage;
+    cancel_storage = &storage;
+    auto unbind = RAIIScopeGuard([] {
+        cancel_storage = nullptr;
+    });
+    for (const uint64_t epoch : {0u, 40u, 41u}) {
+        for (const int prior_orch : {0, 9}) {
+            for (const int prior_sched : {0, 106}) {
+                auto executor = std::make_unique<AicpuExecutor>();
+                SharedMemoryHeader header;
+                header.orch_error_code.store(prior_orch);
+                header.sched_error_code.store(prior_sched);
+                storage.peer_cancel_epoch = epoch;
+                const auto action = SchedulerContextTestPeer::check_cancel(executor->sched_ctx_, header);
+                const bool requested = epoch == 41;
+                EXPECT_EQ(
+                    header.orch_error_code.load(),
+                    prior_orch != 0 ? prior_orch : (requested ? (prior_sched != 0 ? prior_sched : 108) : 0)
+                );
+                EXPECT_EQ(header.sched_error_code.load(), prior_sched != 0 ? prior_sched : (requested ? 108 : 0));
+                EXPECT_EQ(action, requested || prior_orch || prior_sched ? LoopAction::BREAK_LOOP : LoopAction::NONE);
+            }
+        }
+    }
+}
+
+TEST(EntryCacheDeinit, RacingPeerAndLocalFailureKeepTheWinningSchedulerCode) {
+    NativeInvocationResultStorage storage;
+    storage.peer_cancel_epoch = 41;
+    cancel_storage = &storage;
+    auto unbind = RAIIScopeGuard([] {
+        cancel_storage = nullptr;
+    });
+    auto executor = std::make_unique<AicpuExecutor>();
+    SharedMemoryHeader header;
+    std::atomic<int> round{0};
+    std::atomic<int> finished{0};
+    constexpr int rounds = 20000;
+    auto racer = [&](bool peer) {
+        for (int iteration = 1; iteration <= rounds; ++iteration) {
+            while (round.load(std::memory_order_acquire) < iteration) {}
+            if (peer) SchedulerContextTestPeer::check_cancel(executor->sched_ctx_, header);
+            else SchedulerContextTestPeer::report_local_failure(header);
+            finished.fetch_add(1, std::memory_order_release);
+        }
+    };
+    std::thread peer(racer, true);
+    std::thread local(racer, false);
+    int overwritten = 0;
+    for (int iteration = 1; iteration <= rounds; ++iteration) {
+        header.orch_error_code.store(0);
+        header.sched_error_code.store(0);
+        finished.store(0);
+        round.store(iteration, std::memory_order_release);
+        while (finished.load(std::memory_order_acquire) != 2) {}
+        if (header.orch_error_code.load() != header.sched_error_code.load()) ++overwritten;
+    }
+    peer.join();
+    local.join();
+    EXPECT_EQ(overwritten, 0);
+}
 
 TEST(EntryCacheDeinit, FailedSnapshotFallsBackToFullThroughExecutor) {
     Runtime runtime;

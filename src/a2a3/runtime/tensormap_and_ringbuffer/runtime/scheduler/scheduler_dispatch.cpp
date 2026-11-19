@@ -1058,9 +1058,14 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             static_cast<uint64_t>(scheduler_timeout_ms_override) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
     }
 
+    uint32_t fatal_check_countdown = FATAL_ERROR_CHECK_INTERVAL;
     while (true) {
         if (completed_.load(std::memory_order_acquire)) {
             break;
+        }
+        if (--fatal_check_countdown == 0) {
+            fatal_check_countdown = FATAL_ERROR_CHECK_INTERVAL;
+            if (check_idle_fatal_error(thread_idx, header, runtime) == LoopAction::BREAK_LOOP) break;
         }
         bool made_progress = false;
 #if SIMPLER_DFX
@@ -1473,11 +1478,6 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 stall_warning_reported = false;
             } else {
                 idle_iterations++;
-
-                if (idle_iterations % FATAL_ERROR_CHECK_INTERVAL == 0) {
-                    LoopAction action = check_idle_fatal_error(thread_idx, header, runtime);
-                    if (action == LoopAction::BREAK_LOOP) break;
-                }
 
                 uint64_t idle_elapsed = get_sys_cnt_aicpu() - last_progress_ts;
                 if (!stall_warning_reported && idle_elapsed >= scheduler_timeout_cycles / 2) {

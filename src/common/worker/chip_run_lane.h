@@ -45,6 +45,7 @@ public:
     bool wait_until(Deadline deadline);
     void activate();
     void abandon();
+    void bind_peer_cancel(const int32_t *request);
 
     bool launched() const;
     // Physical END awaiting result observation, distinct from cached TERMINAL.
