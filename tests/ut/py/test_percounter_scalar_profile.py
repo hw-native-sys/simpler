@@ -86,7 +86,7 @@ def test_scheduler_view_keeps_block_identity_and_deferred_publisher(tmp_path, le
                 **extra,
             }
             for block, kind, cycles, worker, cluster, lane, extra in [
-                (0, "claim", 10, 0, 0, 0, {}),
+                (0, "claim", 10, 0, 0, 0, {"claim_start_cycles": 6}),
                 (0, "ready", 30, 0, 0, 0, {}),
                 (0, "ready", 35, 2, 0, 1, {}),
                 (0, "kernel_end", 55, 0, 0, 0, {"kernel_start_cycles": 40}),
@@ -95,7 +95,7 @@ def test_scheduler_view_keeps_block_identity_and_deferred_publisher(tmp_path, le
                 (0, "completion_issue", 62, 0, 0, 0, {"contribution": -1}),
                 (0, "completion_issue", 65, 0, 0, 0, {"contribution": 2}),
                 (0, "deferred_completion_issue", 90, 1, 1, 0, {"contribution": 1, "deferred_group": 4}),
-                (1, "claim", 15, 0, 0, 0, {}),
+                (1, "claim", 15, 0, 0, 0, {"claim_start_cycles": 12}),
                 (1, "ready", 32, 0, 0, 0, {}),
                 (1, "completion_issue", 70, 3, 0, 2, {"contribution": 1}),
             ]
@@ -113,9 +113,11 @@ def test_scheduler_view_keeps_block_identity_and_deferred_publisher(tmp_path, le
         percounter_task_events=data["percounter_task_events"],
     )
     view = [e for e in trace["traceEvents"] if e["pid"] == 3]
+    cycle_us = 1e6 / raw["metadata"]["clock_freq_hz"]
     assert any(e["name"] == "process_name" and e["args"]["name"] == "Scheduler View" for e in view)
     block_0 = [e for e in view if e["ph"] == "i" and e["args"]["block_index"] == 0]
     assert [e["args"]["kind"] for e in block_0] == [
+        "claim_start",
         "claim",
         "ready",
         "ready",
@@ -127,12 +129,17 @@ def test_scheduler_view_keeps_block_identity_and_deferred_publisher(tmp_path, le
         "deferred_completion_issue",
     ]
     assert {e["tid"] for e in block_0} == {block_0[0]["tid"]}
-    assert block_0[2]["name"].startswith("Ready (V0)")
-    assert block_0[4]["name"].startswith("Kernel end (V0)")
-    assert block_0[6]["name"].startswith("Completion issued -1")
+    assert block_0[0]["ts"] == pytest.approx(0)
+    assert block_0[1]["ts"] == pytest.approx(4 * cycle_us)
+    acquisition = next(e for e in view if e["ph"] == "X" and e["name"].startswith("Claim start → claim"))
+    assert acquisition["tid"] == block_0[0]["tid"]
+    assert acquisition["dur"] == pytest.approx(4 * cycle_us)
+    assert block_0[3]["name"].startswith("Ready (V0)")
+    assert block_0[5]["name"].startswith("Kernel end (V0)")
+    assert block_0[7]["name"].startswith("Completion issued -1")
     assert block_0[-1]["args"]["worker_id"] == 1
     assert block_0[-1]["args"]["cluster_index"] == 1
-    assert block_0[-1]["ts"] == pytest.approx((90 - 10) * 1e6 / raw["metadata"]["clock_freq_hz"])
+    assert block_0[-1]["ts"] == pytest.approx((90 - 6) * cycle_us)
     block_1 = [e for e in view if e["ph"] == "i" and e["args"]["block_index"] == 1]
-    assert [e["args"]["kind"] for e in block_1] == ["claim", "ready", "completion_issue"]
+    assert [e["args"]["kind"] for e in block_1] == ["claim_start", "claim", "ready", "completion_issue"]
     assert block_1[0]["tid"] != block_0[0]["tid"]

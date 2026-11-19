@@ -109,6 +109,7 @@ bool export_profile(const ProfileOwner &owner) {
                     << ",\"run_epoch\":" << epoch << ",\"task_id\":" << TaskId::to_uint64(token)
                     << ",\"block_index\":" << block << ",\"block_count\":" << blocks << ",\"worker_id\":" << worker
                     << ",\"cluster_index\":" << header.cluster_index << ",\"cluster_lane\":" << header.cluster_lane;
+        if (event.kind == PercounterTaskEventKind::Claim) task_events << ",\"claim_start_cycles\":" << event.detail;
         if (event.kind == PercounterTaskEventKind::KernelEnd)
             task_events << ",\"kernel_start_cycles\":" << event.detail;
         if (event.kind == PercounterTaskEventKind::CompletionIssue) {
