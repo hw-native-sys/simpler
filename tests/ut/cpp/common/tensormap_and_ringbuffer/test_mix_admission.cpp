@@ -37,6 +37,16 @@ public:
         tracker.init(clusters);
         for (int i = 0; i < clusters; ++i)
             tracker.set_cluster(i, 3 * i, 3 * i + 1, 3 * i + 2);
+#if __has_include("scheduler/cluster_admission.h")
+        context.cores_total_num_ = 3 * clusters;
+        context.lane_pool_.initialize(0, clusters);
+        if (pending) {
+            auto held = context.acquire_local_lanes(
+                0, tracker.get_cluster_offset_states(), ResourceShape::MIX, LaneMask::all(), clusters
+            );
+            ASSERT_EQ(held.count(), clusters);
+        }
+#endif
         for (int i = 0; i < 3 * clusters; ++i) {
             auto &core = context.core_exec_states_[i];
             core = {};

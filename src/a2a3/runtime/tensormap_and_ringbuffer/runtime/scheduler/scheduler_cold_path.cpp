@@ -1287,6 +1287,7 @@ void SchedulerContext::assign_own_clusters(Runtime *runtime, int32_t tidx) {
             }
         }
     }
+    lane_pool_.initialize(tidx, tracker.get_cluster_count());
     publish_retirement_group(runtime, tidx);
 }
 
@@ -1358,6 +1359,9 @@ bool SchedulerContext::assign_cores_to_threads() {
 
         LOG_DEBUG("Thread %d: cluster %d (AIC=%d, AIV0=%d, AIV1=%d)", t, ci, aic_wid, aiv0_wid, aiv1_wid);
     }
+
+    for (int32_t t = 0; t < active_sched_threads_; t++)
+        lane_pool_.initialize(t, core_trackers_[t].get_cluster_count());
 
     for (int32_t t = 0; t < aicpu_thread_num_; t++) {
         LOG_DEBUG(
@@ -1638,6 +1642,19 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
 }
 
 void SchedulerContext::deinit() {
+    lane_pool_.reset();
+    ready_sync_.state.store(0, std::memory_order_relaxed);
+    ready_sync_.remaining.store(0, std::memory_order_relaxed);
+    ready_sync_.slot = nullptr;
+    ready_sync_.blocks = 0;
+    for (int t = 0; t < MAX_AICPU_THREADS; ++t) {
+        local_lanes_[t] = {};
+        for (auto &word : ready_sync_.protected_lanes[t])
+            word = 0;
+        ready_sync_.plans[t] = {};
+        ready_sync_.inbox[t].store(0, std::memory_order_relaxed);
+    }
+
     // Per-core state is initialized by pre_handshake_init before any next-run
     // consumer is released. All scheduler participants have retired before
     // this cleanup; no per-core state is consumed until that initialization.

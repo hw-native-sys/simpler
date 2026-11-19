@@ -149,6 +149,8 @@ public:
         BitStates() = default;
 
         void init() { states_ = 0; }
+        uint32_t low_word() const { return static_cast<uint32_t>(states_); }
+        static BitStates from_word(uint32_t bits) { return BitStates(bits); }
 
         // A mask with exactly `offset` set. The shift lives here so a caller
         // cannot silently narrow it by writing `1ULL << offset`, which is

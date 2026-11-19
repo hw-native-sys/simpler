@@ -564,7 +564,10 @@ struct alignas(64) ChipTaskSlotState {
     std::atomic<int16_t> next_block_idx{0};
 
     int32_t claim_block_range(int32_t block_limit, int32_t max_count, int32_t &start) {
-        int16_t current = next_block_idx.load(std::memory_order_relaxed);
+        return claim_block_range_from(block_limit, max_count, start, next_block_idx.load(std::memory_order_relaxed));
+    }
+
+    int32_t claim_block_range_from(int32_t block_limit, int32_t max_count, int32_t &start, int16_t current) {
         while (current < block_limit && max_count > 0) {
             int32_t count = block_limit - current;
             if (count > max_count) count = max_count;

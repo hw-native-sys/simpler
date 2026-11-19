@@ -15,6 +15,7 @@
 #include "common/chip_swimlane_profiling.h"
 #include "common/unified_log.h"
 #include "scheduler_types.h"
+#include "cluster_admission.h"
 
 #include "scheduler/scheduler.h"
 
@@ -312,6 +313,111 @@ private:
         bool force_gate
     );
 
+    enum class AdmissionMode : uint64_t { IDLE, BUILDING, WAIT_CAPACITY, COMMITTED, RETIRING, LEGACY };
+    static constexpr uint64_t ADMISSION_MODE_MASK = 7;
+    static AdmissionMode admission_mode(uint64_t state) {
+        return static_cast<AdmissionMode>(state & ADMISSION_MODE_MASK);
+    }
+    static uint64_t admission_with_mode(uint64_t state, AdmissionMode mode) {
+        return (state & ~ADMISSION_MODE_MASK) | static_cast<uint64_t>(mode);
+    }
+    using LanePool = ReadyLanePool<MAX_AICPU_THREADS, CoreTracker::MAX_CLUSTERS>;
+    using Bits = CoreTracker::BitStates;
+    struct ReadyPlan {
+        Bits cores;
+        uint32_t grant[LanePool::words]{};
+        int first = 0;
+        int count = 0;
+    };
+    struct alignas(64) LocalLanes {
+        uint32_t held[LanePool::words]{};
+        bool needs_idle_scan = false;
+        bool returned = false;
+        uint64_t wait_token = 0;
+        LaneMask wait_mask{};
+        int wait_blocks = 0;
+    };
+    struct alignas(64) ReadyRequest {
+        std::atomic<uint64_t> state{0};
+        std::atomic<int32_t> remaining{0};
+        ChipTaskSlotState *slot = nullptr;
+        int blocks = 0;
+        ReadyPlan plans[MAX_AICPU_THREADS]{};
+        uint32_t protected_lanes[MAX_AICPU_THREADS][LanePool::words]{};
+        std::atomic<uint64_t> inbox[MAX_AICPU_THREADS]{};
+    };
+    LanePool lane_pool_;
+    LocalLanes local_lanes_[MAX_AICPU_THREADS]{};
+    ReadyRequest ready_sync_;
+
+    int owner_clusters(int t) const {
+        return (cores_total_num_ / 3 + active_sched_threads_ - 1 - t) / active_sched_threads_;
+    }
+    template <bool mark_new_grants_for_scan = true>
+    Bits acquire_local_lanes(int owner, Bits candidates, ResourceShape shape, LaneMask lanes, int limit) {
+        Bits selected;
+        auto &local = local_lanes_[owner];
+        bool acquired = false;
+        bool &scan_on_grant = mark_new_grants_for_scan ? local.needs_idle_scan : acquired;
+        for (int w = 0; candidates.has_value() && limit > 0; ++w) {
+            uint32_t choices = candidates.low_word() & LanePool::valid_bits;
+            candidates = candidates >> LanePool::width;
+            if (!choices) continue;
+            uint32_t got =
+                lane_pool_.acquire_local(owner, w, choices, shape, lanes, limit, local.held[w], scan_on_grant);
+            selected |= Bits::from_word(got) << (w * LanePool::width);
+            limit -= __builtin_popcount(got);
+        }
+        return selected;
+    }
+    void release_idle_lanes(int owner) {
+        auto &local = local_lanes_[owner];
+        if (!local.needs_idle_scan) return;
+        local.needs_idle_scan = false;
+        auto &tracker = core_trackers_[owner];
+        auto idle = (tracker.get_idle_core_offset_states(ResourceShape::AIC) |
+                     tracker.get_idle_core_offset_states(ResourceShape::AIV)) &
+                    tracker.get_free_slot_states();
+        for (int w = 0; idle.has_value(); ++w) {
+            uint32_t give = local.held[w] & idle.low_word() & LanePool::valid_bits;
+            idle = idle >> LanePool::width;
+            if (!give) continue;
+            local.held[w] &= ~give;
+            lane_pool_.release(owner, w, give);
+            local.returned = true;
+        }
+    }
+    bool enough_ready_lanes(LaneMask mask, int blocks) const;
+    int collect_ready_positions(LaneMask lanes, int left, bool topology, bool preferred);
+    bool reserve_ready_plans();
+    int ready_sync_shape(int owner) const {
+        auto queued = [&](ResourceShape s) {
+            return sched_->ready_sync_queues[static_cast<int>(s)].size() > 0;
+        };
+        if (queued(ResourceShape::MIX)) return static_cast<int>(ResourceShape::MIX);
+        ResourceShape first = (owner & 1) ? ResourceShape::AIV : ResourceShape::AIC;
+        ResourceShape second = (owner & 1) ? ResourceShape::AIC : ResourceShape::AIV;
+        if (queued(first)) return static_cast<int>(first);
+        return queued(second) ? static_cast<int>(second) : -1;
+    }
+    bool begin_ss_admission(uint64_t &state) {
+        state = ready_sync_.state.load(std::memory_order_acquire);
+        if (admission_mode(state) != AdmissionMode::IDLE) return false;
+        uint64_t next = admission_with_mode(state + 8, AdmissionMode::BUILDING);
+        if (!ready_sync_.state.compare_exchange_strong(state, next, std::memory_order_acq_rel)) return false;
+        state = next;
+        return true;
+    }
+    void finish_ss_admission() {
+        uint64_t state = ready_sync_.state.load(std::memory_order_relaxed);
+        ready_sync_.state.store(admission_with_mode(state, AdmissionMode::IDLE), std::memory_order_release);
+    }
+    void admit_ready_sync(int32_t thread_idx);
+    bool consume_ready_sync_plan(int32_t thread_idx);
+    inline bool consume_ready_sync(int32_t thread_idx) {
+        return ready_sync_.inbox[thread_idx].load(std::memory_order_relaxed) != 0 &&
+               consume_ready_sync_plan(thread_idx);
+    }
     // Batched-dispatch primitives. prepare_* builds the payload and per-core
     // state; publish_* issues the MMIO register write. Callers must wmb()
     // between the prepare batch and the publish batch, then sample
@@ -388,6 +494,13 @@ private:
         int32_t thread_idx, int32_t core_offset, ChipTaskSlotState &slot_state, ResourceShape shape, bool to_pending,
         int32_t block_idx, PublishHandle *out_handles, bool force_gate = false
     );
+
+    inline __attribute__((always_inline)) int prepare_local_batch(
+        int32_t thread_idx, ChipTaskSlotState &slot, ResourceShape shape, bool pending,
+        CoreTracker::BitStates &selected, int32_t first, int32_t count, PublishHandle *handles
+    );
+    inline __attribute__((always_inline)) void
+    publish_local_batch(int32_t thread_idx, PublishHandle *handles, int count);
 
     bool requeue_ready_tasks(
         int32_t thread_idx, ChipReadyQueue &queue, const CapturedReadySlot *entries, int count, ResourceShape shape
@@ -475,7 +588,7 @@ private:
         bool &made_progress, ChipTaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
     );
 
-    bool enter_drain_mode(ChipTaskSlotState *slot_state, int32_t block_num);
+    bool enter_drain_mode(ChipTaskSlotState *slot_state, int32_t block_num, bool admission_owned = false);
     int32_t count_global_available(ResourceShape shape, LaneMask lanes, bool include_pending = false);
     struct SyncStartStageResult {
         int32_t staged_blocks{0};

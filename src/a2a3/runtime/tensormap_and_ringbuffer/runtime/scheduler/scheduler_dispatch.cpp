@@ -348,71 +348,32 @@ void SchedulerContext::dispatch_shape(
         int got = pop_ready_tasks_batch(disp_queues, shape, thread_idx, batch, want);
         if (got == 0) break;
 
-        // sync_start exclusion gate.
-        //
-        // When the popped batch contains a sync_start task we MUST publish each
-        // prior task with its own wmb so AICore receives them with time
-        // separation. The drain coordinator's `count_global_available()` check
-        // reads the per-thread CoreTracker, and although `prepare_block_for_dispatch`
-        // marks cores occupied synchronously, the head-start between successive
-        // tasks is what lets the surrounding completion loop catch up on FINs in
-        // the retry window when the sync_start task hits insufficient resources.
-        // Bursting all prior tasks at the end of the pop (cross-task batching)
-        // collapses that head-start and causes spmd_sync_start_stress to time
-        // out via 507018 on ~40% of runs — see
-        // docs/investigations/2026-06-cross-task-batched-publish.md.
-        //
-        // When the batch carries no sync_start task, no drain entry can happen
-        // in this pop, so we hoist `handles[]`, `wmb()`, and the publish loop
-        // out of the per-task body. One wmb amortizes across all tasks and one
-        // dispatch_ts is shared, which restores ~60 ns first-to-last AICore
-        // start span for single-block decode kernels (out_proj, q_proj, ...).
-        // Detection is a single mask check per task — cheap relative to even
-        // one register write.
-        bool any_sync_start = false;
-        for (int bi = 0; bi < got; bi++) {
-            if ((batch[bi].ptr())->task_attrs.requires_sync_start()) {
-                any_sync_start = true;
-                break;
-            }
-        }
-
         // handles[] is sized for the MIX worst case: total claims across the
         // pop bounded by `cores.count() ≤ MAX_CLUSTERS`, and each block
         // contributes ≤ 3 subtasks for MIX.
         PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
         int handle_count = 0;
         bool dispatched_any = false;
-        // Logical block ranges published by this pop. AIV can pop two entries per
-        // cluster, so this ledger has the same worst-case bound as handles[].
-        ChipTaskSlotState *published_list[CoreTracker::MAX_CLUSTERS * 3];
+        // The processed batch prefix holds published slots; the unprocessed tail
+        // retains its captured queue entries for requeue.
         int16_t published_counts[CoreTracker::MAX_CLUSTERS * 3];
         int published_n = 0;
 #if SIMPLER_SCHED_PROFILING
         uint64_t t_setup_start = get_sys_cnt_aicpu();
 #endif
 
-        // Flush prepared-but-unpublished handles. Required before
-        // `enter_drain_mode` so the drain coordinator sees cores as occupied,
-        // and at the per-task boundary when `any_sync_start` is true.
         auto flush_publish = [&]() {
             if (handle_count == 0) return;
-            wmb();
-            uint64_t dispatch_ts = 0;
-#if SIMPLER_DFX
-            if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
-                dispatch_ts = get_sys_cnt_aicpu();
-            }
-#endif
-            for (int i = 0; i < handle_count; i++) {
-                publish_subtask_to_core(handles[i], dispatch_ts, thread_idx);
-            }
+            publish_local_batch(thread_idx, handles, handle_count);
             handle_count = 0;
             made_progress = true;
         };
 
         for (int bi = 0; bi < got; bi++) {
             ChipTaskSlotState *slot_state = batch[bi].ptr();
+            int16_t cursor = slot_state->next_block_idx.load(std::memory_order_relaxed);
+            int blocks_left = slot_state->logical_block_num - cursor;
+            if (blocks_left <= 0) continue;
             if (!is_mix) {
                 cores &= tracker.get_dispatchable_cores(shape, phase, unreserved_mix_lanes(priority, observed));
                 if (!cores.has_value()) {
@@ -426,7 +387,7 @@ void SchedulerContext::dispatch_shape(
                     break;
                 }
             }
-            CoreTracker::BitStates selected_mix_clusters;
+            CoreTracker::BitStates selected;
 
             if (is_mix) {
                 auto candidates = cores;
@@ -435,10 +396,11 @@ void SchedulerContext::dispatch_shape(
                 while (candidates.has_value()) {
                     int32_t cluster_offset = candidates.pop_first();
                     if (tracker.classify_mix_cluster(cluster_offset, lanes) == wanted) {
-                        selected_mix_clusters |= CoreTracker::BitStates::bit(cluster_offset);
+                        selected |= CoreTracker::BitStates::bit(cluster_offset);
                     }
                 }
-                if (!selected_mix_clusters.has_value()) {
+                selected = acquire_local_lanes<false>(thread_idx, selected, shape, lanes, blocks_left);
+                if (!selected.has_value()) {
                     if (!requeue_ready_tasks(
                             thread_idx, disp_queues[static_cast<int32_t>(shape)], &batch[bi], 1, shape
                         )) {
@@ -449,57 +411,12 @@ void SchedulerContext::dispatch_shape(
                 }
             }
 
-            // (Early-dispatch pre-staged tasks never reach this ready-pop: they are
-            // released by their doorbell in release_fanin_and_check_ready the
-            // instant their last producer completes — see try_early_dispatch_release.)
-
-            if (slot_state->task_attrs.requires_sync_start()) {
-                if (is_pending) {
-                    if (!requeue_ready_tasks(
-                            thread_idx, disp_queues[static_cast<int32_t>(shape)], &batch[bi], 1, shape
-                        )) {
-                        stop_dispatch = true;
-                        return;
-                    }
-                    continue;
-                }
-                int32_t available = is_mix ? selected_mix_clusters.count() : cores.count();
-                if (available < slot_state->logical_block_num) {
-                    flush_publish();
-                    const bool reserved_shape =
-                        !is_mix &&
-                        (shape == ResourceShape::AIC ? observed.has_aic() : observed.has_aiv0() || observed.has_aiv1());
-                    if (reserved_shape) {
-                        if (!requeue_ready_tasks(
-                                thread_idx, disp_queues[static_cast<int32_t>(shape)], &batch[bi], 1, shape
-                            )) {
-                            stop_dispatch = true;
-                            return;
-                        }
-                        continue;
-                    }
-                    if (!enter_drain_mode(slot_state, slot_state->logical_block_num)) {
-                        if (!requeue_ready_tasks(
-                                thread_idx, disp_queues[static_cast<int32_t>(shape)], &batch[bi], 1, shape
-                            )) {
-                            stop_dispatch = true;
-                            return;
-                        }
-                    }
-                    for (int rem = bi + 1; rem < got; rem++) {
-                        if (!requeue_ready_tasks(
-                                thread_idx, disp_queues[static_cast<int32_t>(shape)], &batch[rem], 1, shape
-                            )) {
-                            stop_dispatch = true;
-                            return;
-                        }
-                    }
-                    stop_dispatch = true;
-                    break;
-                }
+            if (!is_mix) {
+                selected = acquire_local_lanes<false>(
+                    thread_idx, cores, shape, slot_state->active_mask, blocks_left + got - bi - 1
+                );
             }
-
-            if (!cores.has_value()) {
+            if (!selected.has_value()) {
                 flush_publish();
                 // Concurrent producers may occupy the vacated cells before this unconsumed tail returns to its queue.
                 // A full requeue terminates the run with READY_QUEUE_OVERFLOW.
@@ -519,47 +436,38 @@ void SchedulerContext::dispatch_shape(
             // this thread fills all its own cores. Only local `start + b` is
             // read after the push — `next_block_idx` may already be advanced
             // by another scheduler that popped the slot.
-            int32_t available = is_mix ? selected_mix_clusters.count() : cores.count();
+            int32_t available = selected.count();
             int32_t start = 0;
-            int32_t claim = slot_state->claim_block_range(slot_state->logical_block_num, available, start);
+            int32_t claim = slot_state->claim_block_range_from(slot_state->logical_block_num, available, start, cursor);
+            // Unused positions stay owned until the phase returns them to the shared pool.
+            if (claim < available) local_lanes_[thread_idx].needs_idle_scan = true;
             if (claim == 0) continue;
             dispatched_any = true;
             try_pushed = true;
 
-            published_list[published_n] = slot_state;
+            batch[published_n] = batch[bi];
             published_counts[published_n] = static_cast<int16_t>(claim);
             published_n++;
 
             if (start + claim < slot_state->logical_block_num) {
                 if (!requeue_ready_tasks(thread_idx, disp_queues[static_cast<int32_t>(shape)], &batch[bi], 1, shape)) {
+                    local_lanes_[thread_idx].needs_idle_scan = true;
                     stop_dispatch = true;
                     return;
                 }
             }
 
-            for (int32_t b = 0; b < claim; b++) {
-                auto core_offset = is_mix ? selected_mix_clusters.pop_first() : cores.pop_first();
-                if (is_mix) {
-                    cores.clear_bit(core_offset);
-                }
-                handle_count += prepare_block_for_dispatch(
-                    thread_idx, core_offset, *slot_state, shape, is_pending, start + b, &handles[handle_count]
-                );
-            }
-
-            // Sync_start exclusion: flush per task so prior tasks have head-
-            // start time before any sync_start drain check. Normal batches
-            // fall through and accumulate for one cross-task flush at the
-            // end of the pop.
-            if (any_sync_start) {
-                flush_publish();
-            }
+            auto before = selected;
+            handle_count += prepare_local_batch(
+                thread_idx, *slot_state, shape, is_pending, selected, start, claim, &handles[handle_count]
+            );
+            cores &= ~(before ^ selected);
         }
 
         flush_publish();
         for (int i = 0; i < published_n; i++) {
-            sched_->record_published_blocks(*published_list[i], published_counts[i]);
-            sched_->propagate_dispatch_fanin(*published_list[i]);
+            sched_->record_published_blocks(*batch[i].ptr(), published_counts[i]);
+            sched_->propagate_dispatch_fanin(*batch[i].ptr());
         }
 #if SIMPLER_SCHED_PROFILING
         chip_swimlane.sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
@@ -600,32 +508,202 @@ void SchedulerContext::run_staging_order(
     }
 }
 
+int SchedulerContext::prepare_local_batch(
+    int32_t thread_idx, ChipTaskSlotState &slot, ResourceShape shape, bool pending, CoreTracker::BitStates &selected,
+    int32_t first, int32_t count, PublishHandle *handles
+) {
+    int n = 0;
+    for (int b = 0; b < count; ++b) {
+        int offset = selected.pop_first();
+        n += prepare_block_for_dispatch(thread_idx, offset, slot, shape, pending, first + b, handles + n);
+    }
+    return n;
+}
+
+void SchedulerContext::publish_local_batch(int32_t thread_idx, PublishHandle *handles, int count) {
+    wmb();
+    uint64_t stamp = 0;
+#if SIMPLER_DFX
+    if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING) stamp = get_sys_cnt_aicpu();
+#endif
+    for (int i = 0; i < count; ++i)
+        publish_subtask_to_core(handles[i], stamp, thread_idx);
+}
+
+bool SchedulerContext::enough_ready_lanes(LaneMask mask, int blocks) const {
+    auto shape = mask.to_shape();
+    for (int t = 0; t < active_sched_threads_; ++t) {
+        int n = owner_clusters(t);
+        for (int w = 0; w * LanePool::per_word < n; ++w) {
+            blocks -=
+                __builtin_popcount(LanePool::positions(static_cast<uint32_t>(lane_pool_.snapshot(t, w)), shape, mask));
+            if (blocks <= 0) return true;
+        }
+    }
+    return false;
+}
+
+int SchedulerContext::collect_ready_positions(LaneMask lanes, int left, bool topology, bool preferred) {
+    const auto shape = lanes.to_shape();
+    for (int t = 0; t < active_sched_threads_ && left; ++t) {
+        int n = owner_clusters(t);
+        auto &p = ready_sync_.plans[t];
+        for (int w = 0; w * LanePool::per_word < n && left; ++w) {
+            uint32_t available = topology ? LanePool::topology(n, w) : static_cast<uint32_t>(lane_pool_.snapshot(t, w));
+            if (preferred) available &= ready_sync_.protected_lanes[t][w];
+            uint32_t choices = LanePool::positions(available & ~p.grant[w], shape, lanes);
+            uint32_t take = LanePool::first(choices, left);
+            int count = __builtin_popcount(take);
+            p.cores |= Bits::from_word(take) << (w * LanePool::width);
+            p.grant[w] |= LanePool::expand(take, shape, lanes);
+            p.count += count;
+            left -= count;
+        }
+    }
+    return left;
+}
+
+bool SchedulerContext::reserve_ready_plans() {
+    for (int t = 0; t < active_sched_threads_; ++t) {
+        auto &p = ready_sync_.plans[t];
+        for (int w = 0; w < LanePool::words; ++w) {
+            uint32_t wanted = p.grant[w];
+            if (!wanted) continue;
+            uint32_t got = lane_pool_.take_for_ss(t, w, wanted);
+            if (got == wanted) continue;
+            lane_pool_.release(t, w, got);
+            for (int prior = 0; prior <= t; ++prior) {
+                int end = prior == t ? w : LanePool::words;
+                for (int i = 0; i < end; ++i)
+                    lane_pool_.release(prior, i, ready_sync_.plans[prior].grant[i]);
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+void SchedulerContext::admit_ready_sync(int32_t thread_idx) {
+    auto &local = local_lanes_[thread_idx];
+    uint64_t state = ready_sync_.state.load(std::memory_order_acquire);
+    bool retry = admission_mode(state) == AdmissionMode::WAIT_CAPACITY;
+    if (retry) {
+        if (!local.returned && (local.wait_token != state || !enough_ready_lanes(local.wait_mask, local.wait_blocks)))
+            return;
+        local.returned = false;
+        uint64_t building = admission_with_mode(state, AdmissionMode::BUILDING);
+        if (!ready_sync_.state.compare_exchange_strong(state, building, std::memory_order_acq_rel)) return;
+        state = building;
+    } else {
+        if (admission_mode(state) != AdmissionMode::IDLE) return;
+        const int s = ready_sync_shape(thread_idx);
+        if (s < 0 || !begin_ss_admission(state)) return;
+        CapturedReadySlot captured;
+        if (!sched_->ready_sync_queues[s].pop_shaped_batch(&captured, nullptr, 1, static_cast<ResourceShape>(s))) {
+            finish_ss_admission();
+            return;
+        }
+        ready_sync_.slot = captured.ptr();
+        ready_sync_.blocks = captured.ptr()->logical_block_num;
+        always_assert(captured.ptr()->next_block_idx.load(std::memory_order_relaxed) == 0);
+    }
+
+    int count = ready_sync_.blocks;
+    auto lanes = ready_sync_.slot->active_mask;
+    for (int t = 0; t < active_sched_threads_; ++t)
+        ready_sync_.plans[t] = {};
+    int left = retry ? collect_ready_positions(lanes, count, false, true) : count;
+    if (left) left = collect_ready_positions(lanes, left, false, false);
+    if (left || !reserve_ready_plans()) {
+        uint64_t waiting = admission_with_mode(state, AdmissionMode::WAIT_CAPACITY);
+        if (!retry) {
+            if (left) {
+                int missing = collect_ready_positions(lanes, left, true, false);
+                always_assert(missing == 0);
+            }
+            for (int t = 0; t < active_sched_threads_; ++t) {
+                for (int w = 0; w < LanePool::words; ++w) {
+                    uint32_t protect = ready_sync_.plans[t].grant[w];
+                    ready_sync_.protected_lanes[t][w] = protect;
+                    lane_pool_.protect(t, w, protect);
+                }
+            }
+            local.wait_token = waiting;
+            local.wait_mask = lanes;
+            local.wait_blocks = count;
+        }
+        ready_sync_.state.store(waiting, std::memory_order_release);
+        return;
+    }
+
+    int start = 0;
+    int claimed = ready_sync_.slot->claim_block_range(count, count, start);
+    always_assert(claimed == count && start == 0);
+    int participants = 0;
+    uint64_t committed = admission_with_mode(state, AdmissionMode::COMMITTED);
+    for (int t = 0; t < active_sched_threads_; ++t) {
+        if (retry) {
+            for (int w = 0; w < LanePool::words; ++w) {
+                lane_pool_.unprotect(t, w, ready_sync_.protected_lanes[t][w]);
+                ready_sync_.protected_lanes[t][w] = 0;
+            }
+        }
+        auto &p = ready_sync_.plans[t];
+        p.first = start;
+        start += p.count;
+        if (p.count) {
+            ++participants;
+            ready_sync_.inbox[t].store(committed, std::memory_order_relaxed);
+        }
+    }
+    ready_sync_.remaining.store(participants, std::memory_order_relaxed);
+    ready_sync_.state.store(committed, std::memory_order_release);
+}
+
+bool SchedulerContext::consume_ready_sync_plan(int32_t thread_idx) {
+    uint64_t token = ready_sync_.inbox[thread_idx].load(std::memory_order_relaxed);
+    if (!token) return false;
+    uint64_t state = ready_sync_.state.load(std::memory_order_acquire);
+    if (admission_mode(state) != AdmissionMode::COMMITTED || token != state) return false;
+    ReadyPlan plan = ready_sync_.plans[thread_idx];
+    ChipTaskSlotState *slot = ready_sync_.slot;
+    auto &local = local_lanes_[thread_idx];
+    for (int w = 0; w < LanePool::words; ++w) {
+        always_assert((local.held[w] & plan.grant[w]) == 0);
+        local.held[w] |= plan.grant[w];
+    }
+    PublishHandle handles[CoreTracker::MAX_CLUSTERS * 3];
+    int n = prepare_local_batch(
+        thread_idx, *slot, slot->active_mask.to_shape(), false, plan.cores, plan.first, plan.count, handles
+    );
+    publish_local_batch(thread_idx, handles, n);
+    sched_->record_published_blocks(*slot, plan.count);
+    ready_sync_.inbox[thread_idx].store(0, std::memory_order_relaxed);
+    if (ready_sync_.remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        ready_sync_.state.store(admission_with_mode(state, AdmissionMode::RETIRING), std::memory_order_relaxed);
+        // This owner has not polled its published cores, so the slot is still live.
+        sched_->propagate_dispatch_fanin(*slot);
+        ready_sync_.slot = nullptr;
+        ready_sync_.state.store(admission_with_mode(state, AdmissionMode::IDLE), std::memory_order_release);
+    }
+    return true;
+}
+
 void SchedulerContext::dispatch_ready_tasks(
     int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
 ) {
-    // Normal ready dispatch (is_ready): dispatch_shape places each block on pickup and
-    // signals a stop by setting stop_dispatch when it enters a sync_start drain.
+    if (consume_ready_sync(thread_idx)) {
+        made_progress = true;
+        try_pushed = true;
+    }
+    admit_ready_sync(thread_idx);
+    if (consume_ready_sync(thread_idx)) {
+        made_progress = true;
+        try_pushed = true;
+    }
+    if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) return;
     bool stop_dispatch = false;
     LaneMask observed = LaneMask::none();
-
-    // Tier 0: ready sync_start cohorts take cores before any regular ready task
-    // (sync_start > MIX > C/V within the normal source). Same order and machinery,
-    // fed from ready_sync_queues; an oversized cohort arms the stop-the-world drain
-    // (stop_dispatch), which also short-circuits the regular tier below.
-    run_staging_order(
-        thread_idx, pmu_active,
-        [&](ResourceShape shape, CoreTracker::DispatchPhase phase) {
-            dispatch_shape(
-                thread_idx, sched_->ready_sync_queues, shape, phase, tracker, stop_dispatch, made_progress, try_pushed,
-                MixPriority::ReadySync, observed
-            );
-            return stop_dispatch;
-        },
-        [&] {
-            return unreserved_mix_lanes(MixPriority::ReadySync, observed);
-        }
-    );
-    if (stop_dispatch) return;
 
     // Tier 1: regular ready work.
     run_staging_order(
@@ -806,6 +884,9 @@ int32_t SchedulerContext::early_dispatch_shape(
         } else {
             bucket = tracker.get_dispatchable_cores(shape, phase, unreserved_mix_lanes(MixPriority::Early, observed));
         }
+        int16_t cursor = c->next_block_idx.load(std::memory_order_relaxed);
+        if (cursor >= c->logical_block_num) continue;
+        bucket = acquire_local_lanes(thread_idx, bucket, shape, c->active_mask, c->logical_block_num - cursor);
         int32_t freecores = bucket.has_value() ? bucket.count() : 0;
         if (freecores == 0) {  // no cores for this shape+phase — give this + the unprocessed rest back
             // A dropped candidate keeps its STAGING claim and is recovered by the
@@ -822,7 +903,7 @@ int32_t SchedulerContext::early_dispatch_shape(
             break;
         }
         int32_t start = 0;
-        int32_t claim = c->claim_block_range(c->logical_block_num, freecores, start);
+        int32_t claim = c->claim_block_range_from(c->logical_block_num, freecores, start, cursor);
         if (claim == 0) continue;  // nothing left to claim -> drop (no re-push)
         // Re-push for concurrent peers BEFORE the expensive staging.
         if (start + claim < c->logical_block_num) {
@@ -844,8 +925,7 @@ int32_t SchedulerContext::early_dispatch_shape(
 // Early-dispatch drain (idle pass) — the EARLY source's analog of dispatch_ready_tasks.
 // Both sources share run_staging_order for the shape order (MIX strict priority, IDLE
 // before PENDING, cross-thread idle gating: MIX-IDLE ▶ c/v-IDLE ▶ MIX-PEND ▶ c/v-PEND).
-// Each handles its sync_start cohort FIRST as Tier 0: an exact local fit stages on
-// one owner, while a capacity-short cohort falls back to the global drain.
+// Early sync-start stages locally when the whole cohort fits. Otherwise it enters drain.
 // Returns the number of blocks staged this pass (for the EarlyDispatch swimlane bar).
 int32_t SchedulerContext::try_early_dispatch(
     int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
@@ -861,6 +941,12 @@ int32_t SchedulerContext::try_early_dispatch(
     //     regular ready_queues) strictly precedes early — there is no real ready task
     //     to delay only when every normal queue is drained.
     if (pmu_active || !tracker.has_any_free_slot()) return 0;
+    if (sched_->early_sync_start_queue.size() == 0 &&
+        sched_->early_dispatch_queues[static_cast<int>(ResourceShape::MIX)].size() == 0 &&
+        sched_->early_dispatch_queues[static_cast<int>(ResourceShape::AIC)].size() == 0 &&
+        sched_->early_dispatch_queues[static_cast<int>(ResourceShape::AIV)].size() == 0)
+        return 0;
+    if (admission_mode(ready_sync_.state.load(std::memory_order_acquire)) != AdmissionMode::IDLE) return 0;
     for (int s = 0; s < NUM_RESOURCE_SHAPES; s++) {
         if (sched_->ready_sync_queues[s].size() > 0 || sched_->ready_queues[s].size() > 0) return 0;
     }
@@ -874,8 +960,12 @@ int32_t SchedulerContext::try_early_dispatch(
     // tracker when it can hold the entire cohort; only the capacity-short case arms the
     // stop-the-world drain. Both paths force-gate every block even if producer release races
     // STAGING -> DISPATCHED. A non-STAGING pop was already released and is dropped.
+    uint64_t early_admission_state = 0;
+    bool owns_admission = sched_->early_sync_start_queue.size() > 0 && begin_ss_admission(early_admission_state);
     TaskId sync_task_id_snapshot = TaskId::invalid();
-    if (CapturedReadySlot captured = sched_->early_sync_start_queue.pop_sync_start(&sync_task_id_snapshot);
+    if (CapturedReadySlot captured = owns_admission ?
+                                         sched_->early_sync_start_queue.pop_sync_start(&sync_task_id_snapshot) :
+                                         CapturedReadySlot{};
         !captured.is_null()) {
         ChipTaskSlotState *c = captured.ptr();
         bool current_sync_task = c->task->task_id == sync_task_id_snapshot && c->task_attrs.requires_sync_start();
@@ -901,13 +991,16 @@ int32_t SchedulerContext::try_early_dispatch(
                 sched_->retry_sync_start_rendezvous_after_staging(*c);
                 SchedulerState::finish_early_sync_drain(*c->payload);
                 total_staged += staged.staged_blocks;
-            } else if (enter_drain_mode(c, c->logical_block_num)) {
+            } else if (enter_drain_mode(c, c->logical_block_num, true)) {
                 SchedulerState::mark_early_sync_drain_armed(*c->payload);
             } else {
                 sched_->cancel_early_sync_drain(*c, captured, sync_task_id_snapshot);
             }
         }
     }
+
+    if (owns_admission && admission_mode(ready_sync_.state.load(std::memory_order_relaxed)) == AdmissionMode::BUILDING)
+        finish_ss_admission();
 
     // Regular early staging (NOT is_ready): same MIX/idle/pending order as normal dispatch,
     // via the shared skeleton. early_dispatch_shape stages a gated block range and never
@@ -1210,6 +1303,14 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         bool try_pushed = false;
 
+        release_idle_lanes(thread_idx);
+        if (admission_mode(ready_sync_.state.load(std::memory_order_acquire)) == AdmissionMode::WAIT_CAPACITY)
+            admit_ready_sync(thread_idx);
+        if (consume_ready_sync(thread_idx)) {
+            made_progress = true;
+            try_pushed = true;
+        }
+
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
 #if SIMPLER_DFX
@@ -1353,6 +1454,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         uint64_t dispatch_t0 = (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
 #endif
         dispatch_ready_tasks(thread_idx, tracker, pmu_active, made_progress, try_pushed);
+        release_idle_lanes(thread_idx);
 #if SIMPLER_DFX
         // Emit Dispatch IMMEDIATELY after dispatch_ready_tasks so its span
         // covers the actual publish work — not the trailing second-poll /
@@ -1394,6 +1496,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
         [[maybe_unused]] int32_t staged_count =
             try_early_dispatch(thread_idx, tracker, pmu_active, made_progress, try_pushed);
+        release_idle_lanes(thread_idx);
 #if SIMPLER_DFX
         // Emit an EarlyDispatch bar so a staging-dominated iteration is attributed
         // to early-dispatch rather than disappearing into a blank gap.

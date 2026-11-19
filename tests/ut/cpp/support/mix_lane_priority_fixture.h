@@ -83,6 +83,38 @@ using mix_lane_test::mask_of;
 using mix_lane_test::TestTask;
 
 class SchedulerContextTestPeer {
+    template <typename C>
+    static auto bind_cluster_admission(C &c, bool pending, int) -> decltype(c.lane_pool_.reset(), void()) {
+        c.cores_total_num_ = 3;
+        c.lane_pool_.reset();
+        c.local_lanes_[0] = {};
+        if (pending) c.local_lanes_[0].held[0] = 7;
+        else c.lane_pool_.initialize(0, 1);
+    }
+    template <typename C>
+    static void bind_cluster_admission(C &, bool, long) {}
+    template <typename C>
+    static auto hold_lane(C &c, int offset, int) -> decltype(c.lane_pool_.reset(), void()) {
+        auto shape = offset % 3 ? ResourceShape::AIV : ResourceShape::AIC;
+        c.acquire_local_lanes(0, CoreTracker::BitStates::bit(offset), shape, LaneMask::lanes_of(shape), 1);
+    }
+    template <typename C>
+    static void hold_lane(C &, int, long) {}
+    template <typename C>
+    static auto sync_vector(C &c, LaneMask &, int) -> decltype(c.lane_pool_.reset(), void()) {
+        if (c.sched_->ready_sync_queues[static_cast<int>(ResourceShape::MIX)].size()) return;
+        c.admit_ready_sync(0);
+        c.consume_ready_sync(0);
+    }
+    template <typename C>
+    static void sync_vector(C &c, LaneMask &observed, long) {
+        bool stop = false, progress = false, pushed = false;
+        c.dispatch_shape(
+            0, c.sched_->ready_sync_queues, ResourceShape::AIV, CoreTracker::DispatchPhase::IDLE, c.core_trackers_[0],
+            stop, progress, pushed, C::MixPriority::ReadySync, observed
+        );
+    }
+
 public:
     static void
     bind(SchedulerContext &c, SchedulerState &s, uint64_t *callables, uint64_t *regs, size_t words, bool pending) {
@@ -92,6 +124,7 @@ public:
         c.func_id_to_addr_count_ = 1;
         c.completed_.store(false);
         c.drain_state_.sync_start_pending.store(0);
+        bind_cluster_admission(c, pending, 0);
         auto &tracker = c.core_trackers_[0];
         tracker.init(1);
         tracker.set_cluster(0, 0, 1, 2);
@@ -115,13 +148,7 @@ public:
             );
         }
     }
-    static void sync_leaf(SchedulerContext &c, LaneMask &observed) {
-        bool stop = false, progress = false, pushed = false;
-        c.dispatch_shape(
-            0, c.sched_->ready_sync_queues, ResourceShape::AIV, CoreTracker::DispatchPhase::IDLE, c.core_trackers_[0],
-            stop, progress, pushed, SchedulerContext::MixPriority::ReadySync, observed
-        );
-    }
+    static void sync_leaf(SchedulerContext &c, LaneMask &observed) { sync_vector(c, observed, 0); }
     static void ready(SchedulerContext &c, bool pmu) {
         bool progress = false, pushed = false;
         c.dispatch_ready_tasks(0, c.core_trackers_[0], pmu, progress, pushed);
@@ -131,6 +158,7 @@ public:
     }
     static int drain_pending(SchedulerContext &c) { return c.drain_state_.sync_start_pending.load(); }
     static void block_lane(SchedulerContext &c, int lane, ChipTaskSlotState *blocker) {
+        hold_lane(c, lane, 0);
         c.core_trackers_[0].change_core_state(lane);
         c.core_trackers_[0].set_pending_occupied(lane);
         c.core_exec_states_[lane].running_slot_state = blocker;

@@ -7,98 +7,77 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Positive coverage for A2/A3 global sync-start drain phase records."""
+"""Scheduler phase accounting for ready and early cross-owner sync-start tasks on A2/A3."""
 
-from __future__ import annotations
-
+from collections import Counter
 from pathlib import Path
 
-import torch
-from simpler.task_interface import ArgDirection as D
-
-from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
+from simpler_setup import SceneTestCase, scene_test
 from simpler_setup.tools.swimlane_converter import read_perf_data
+from tests.st.a2a3.tensormap_and_ringbuffer.spmd_sync_start_aiv.test_spmd_sync_start_aiv import (
+    TestSpmdSyncStartAiv as _ReadyAiv,
+)
+from tests.st.a2a3.tensormap_and_ringbuffer.spmd_sync_start_early_dispatch.test_spmd_sync_start_early_dispatch import (
+    TestSpmdSyncStartEarlyDispatch as _EarlyMix,
+)
 
-FLOATS_PER_CACHE_LINE = 16
-NUM_TASKS = 4
-MAX_AIV = 48
-MAX_TOTAL_CL = MAX_AIV // 12 + MAX_AIV // 3 + MAX_AIV // 12 + MAX_AIV // 2
+DRAIN_PHASES = ("drain", "drain_prepare", "drain_publish")
+
+
+class _SchedulerPhases:
+    def _build_config(self, *args, **kwargs):
+        config = super()._build_config(*args, **kwargs)
+        self._phase_path = (
+            Path(config.output_prefix) / "chip_swimlane_records.json" if config.enable_chip_swimlane >= 3 else None
+        )
+        return config
+
+    def phase_work(self):
+        perf = read_perf_data(self._phase_path)
+        work = Counter()
+        for thread in perf["scheduler_records"]:
+            for record in thread:
+                work[record["phase"]] += record["tasks_processed"]
+        return work
 
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
-class TestSyncStartDrainPhases(SceneTestCase):
-    RTOL = 0
-    ATOL = 0
+class TestReadySyncStartDispatch(_SchedulerPhases, _ReadyAiv):
+    CASES = [{"name": "global_aiv", "platforms": ["a2a3sim", "a2a3"], "manual": True, "params": {}}]
 
-    CALLABLE = {
-        "orchestration": {
-            "source": "../../spmd_sync_start_aiv/kernels/orchestration/spmd_sync_start_aiv_orch.cpp",
-            "function_name": "aicpu_orchestration_entry",
-            "signature": [D.INOUT, D.INOUT],
-        },
-        "incores": [
-            {
-                "func_id": 0,
-                "name": "SPMD_WRITE_AIV",
-                "source": "../../spmd_multiblock_aiv/kernels/aiv/kernel_spmd_write.cpp",
-                "core_type": "aiv",
-                "signature": [D.INOUT],
-            },
-        ],
-    }
+    def compare_outputs(self, test_args, golden_args, output_names, params):
+        super().compare_outputs(test_args, golden_args, output_names, params)
+        if self._phase_path is None:
+            return
+        work = self.phase_work()
+        blocks = sum(int(width) for width in test_args.layout[::2])
+        assert work["dispatch"] == blocks, f"expected {blocks} AIV dispatches, got {work}; {self._phase_path}"
+        assert not any(phase in work for phase in DRAIN_PHASES), f"ready AIV entered drain: {work}; {self._phase_path}"
 
+
+@scene_test(level=2, runtime="tensormap_and_ringbuffer")
+class TestSyncStartDrainPhases(_SchedulerPhases, _EarlyMix):
     CASES = [
         {
-            "name": "global_aiv",
+            "name": "early_global_mix",
             "platforms": ["a2a3sim", "a2a3"],
             "manual": True,
+            "config": {"aicpu_thread_num": 4},
             "params": {},
         }
     ]
 
-    def generate_args(self, params):
-        return TaskArgsBuilder(
-            TensorArg("output", torch.zeros(MAX_TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)),
-            TensorArg("layout", torch.zeros(2 * NUM_TASKS, dtype=torch.int32)),
-        )
-
-    def compute_golden(self, args, params):
-        pass
-
-    def _build_config(self, config_dict, *args, **kwargs):
-        config = super()._build_config(config_dict, *args, **kwargs)
-        self._trace_perf_level = int(kwargs.get("enable_chip_swimlane", args[0] if args else 0))
-        output_prefix = kwargs.get("output_prefix", "")
-        self._trace_perf_path = Path(output_prefix) / "chip_swimlane_records.json" if output_prefix else None
-        return config
-
     def compare_outputs(self, test_args, golden_args, output_names, params):
-        layout = [int(value) for value in test_args.layout]
-        expected = torch.zeros(MAX_TOTAL_CL, dtype=torch.float32)
-        for task_idx in range(NUM_TASKS):
-            block_num, base_cl = layout[2 * task_idx], layout[2 * task_idx + 1]
-            assert block_num >= 1, f"task {task_idx} reported block_num {block_num}"
-            for block_idx in range(block_num):
-                expected[base_cl + block_idx] = float(block_idx)
-        actual = test_args.output.reshape(MAX_TOTAL_CL, FLOATS_PER_CACHE_LINE)[:, 0]
-        assert torch.equal(actual, expected), f"output disagrees with reported layout {layout}"
-
-        if getattr(self, "_trace_perf_level", 0) < 3:
+        super().compare_outputs(test_args, golden_args, output_names, params)
+        if self._phase_path is None:
             return
-        perf_path = self._trace_perf_path
-        assert perf_path is not None and perf_path.exists(), "chip swimlane scheduler capture is missing"
-        perf = read_perf_data(perf_path)
-        phase_records = [record for thread in perf.get("scheduler_records", []) for record in thread]
-        sync_start_blocks = layout[0] + layout[2] + layout[2 * (NUM_TASKS - 1)]
-        phase_work = {}
-        for phase in ("drain", "drain_prepare", "drain_publish"):
-            records = [record for record in phase_records if record.get("phase") == phase]
-            phase_work[phase] = sum(int(record.get("tasks_processed", 0)) for record in records)
-            assert 0 < phase_work[phase] <= sync_start_blocks, (
-                f"{phase} reported {phase_work[phase]} blocks/subtasks for {sync_start_blocks} sync-start blocks; "
-                f"artifact={perf_path}"
-            )
-        assert len(set(phase_work.values())) == 1, f"drain phase workloads disagree: {phase_work}; artifact={perf_path}"
+        work = self.phase_work()
+        blocks = int(test_args.layout[0])
+        # Drain counts logical blocks. Prepare and publish count one AIC and two AIVs per MIX block.
+        expected = (blocks, 3 * blocks, 3 * blocks)
+        assert tuple(work[phase] for phase in DRAIN_PHASES) == expected, (
+            f"expected {dict(zip(DRAIN_PHASES, expected, strict=True))}, got {work}; {self._phase_path}"
+        )
 
 
 if __name__ == "__main__":

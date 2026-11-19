@@ -40,6 +40,9 @@ public:
             tracker.init(1);
             tracker.set_cluster(0, owner * 3, owner * 3 + 1, owner * 3 + 2);
         }
+#if __has_include("scheduler/cluster_admission.h")
+        context.lane_pool_.initialize(0, context.core_trackers_[0].get_cluster_count());
+#endif
         for (int core = 0; core < 6; ++core) {
             auto &state = context.core_exec_states_[core];
             state = {};
