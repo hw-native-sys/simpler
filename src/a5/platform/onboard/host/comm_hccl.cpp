@@ -2028,22 +2028,6 @@ extern "C" int comm_barrier(CommHandle h) {
     return 0;
 }
 
-static bool host_urma_explicitly_unsupported(CommHandle h) {
-    int32_t device = -1;
-    aclrtHostMemMapCapability capability = ACL_RT_HOST_MEM_MAP_NOT_SUPPORTED;
-    const aclError device_status = aclrtGetDevice(&device);
-    const aclError query_status = device_status == ACL_SUCCESS ?
-                                      aclrtHostMemMapCapabilities(device, ACL_RT_HAC_TYPE_UDMA, &capability) :
-                                      device_status;
-    if (query_status != ACL_SUCCESS) {
-        LOG_WARN("[comm rank %d] Host UDMA capability query failed: %d", h->rank, static_cast<int>(query_status));
-        return false;
-    }
-    if (capability != ACL_RT_HOST_MEM_MAP_NOT_SUPPORTED) return false;
-    LOG_ERROR("[comm rank %d] Device %d does not support UDMA access to registered Host memory", h->rank, device);
-    return true;
-}
-
 static int
 prepare_host_domain_window(CommHandle h, size_t window_size, const char *host_shm_name, DomainAllocation &alloc) {
     const long page_size = sysconf(_SC_PAGESIZE);
@@ -2179,9 +2163,7 @@ static int domain_alloc_host(
         publish_host_prepare_failure(h, abort_path);
     });
     const bool urma = (workspace_mask & comm_workspace_bit(CommWorkspaceKind::URMA)) != 0;
-    int rc = urma && host_urma_explicitly_unsupported(h) ?
-                 COMM_DOMAIN_WORKSPACE_UNSUPPORTED :
-                 prepare_host_domain_window(h, window_size, host_shm_name, alloc);
+    int rc = prepare_host_domain_window(h, window_size, host_shm_name, alloc);
     if (urma && rank_count > 1) {
         // Every rank must have a local window before any rank enters the HCCL collective.
         if (rc == 0 && !file_barrier(

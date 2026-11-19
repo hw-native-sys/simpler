@@ -572,7 +572,8 @@ static void test_host_domain(const std::string &scenario) {
         return;
     }
     const bool configured = scenario == "host_urma_config";
-    unsupported_host_udma = scenario == "host_urma_unsupported";
+    unsupported_host_udma =
+        scenario == "host_urma_unsupported" || scenario == "host_register" || scenario == "host_workspace";
     const bool ready_publish_failed = scenario == "host_ready_publish_failed";
     if (ready_publish_failed) {
         const auto tag = domain_barrier_tag(1, "host_ready");
@@ -596,14 +597,13 @@ static void test_host_domain(const std::string &scenario) {
     }
     if (scenario == "host_register" || scenario == "host_pointer" || scenario == "host_peer_register" ||
         scenario == "host_peer_pointer" || scenario == "host_workspace" || scenario == "host_context" ||
-        scenario == "host_collision" || unsupported_host_udma || ready_publish_failed) {
-        if (unsupported_host_udma || ready_publish_failed) assert(live[1] == 0);
+        scenario == "host_collision" || ready_publish_failed) {
         if (ready_publish_failed) {
+            assert(live[1] == 0);
             assert(subcomm_creates == 0);
             const auto tag = domain_barrier_tag(1, "host_failed");
             assert(std::filesystem::exists(barrier_marker_path(h->rootinfo_path, h->run_token, tag, 0)));
         }
-        if (unsupported_host_udma) assert(registered_hosts.empty());
         if (peer_mte) assert(live[1] == 0);
         assert(rc == COMM_INITIALIZATION_ABORT_REQUIRED && ctx == 0 && base == 0);
         assert(h->domain_allocations.count(1) == 1);

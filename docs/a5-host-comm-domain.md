@@ -34,9 +34,13 @@ On the A5 PR PCIe CI machine, Host mapping and segment registration succeeded
 but Host-source URMA reported an ACK timeout; this remains an unresolved
 [hardware-specific failure](https://github.com/hw-native-sys/simpler/pull/2913#issuecomment-6681762026).
 Before entering the URMA collective, all ranks must prepare their local windows.
-A positive registration result or UDMA capability does not establish peer
-reachability. If CANN reports that UDMA cannot access registered Host memory,
-the Host-source URMA allocation fails before entering the collective.
+A positive registration result does not establish peer reachability. CANN's
+Host-mapping UDMA capability query can report `NOT_SUPPORTED` while HCCL URMA
+successfully transfers Host windows
+([#3126](https://github.com/hw-native-sys/simpler/issues/3126)), so domain allocation
+does not use that query or a SoC allowlist. It attempts Host registration and
+URMA initialization directly; their errors still fail allocation through the
+normal abort/rollback path. Transfer failures remain errors during execution.
 
 ## Create and retain a table
 
