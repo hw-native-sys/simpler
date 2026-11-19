@@ -18,8 +18,8 @@ Host 发布完整 fanin 视图；设备不会为每条边维护 remaining 或挂
 
 计数器只沿真实 DAG 祖先链共享，每任务的阈值固定且一轮内始终有效，不给独立任务增加依赖。
 显式同步 lane 只贡献 P；可能异步 lane 还需 Q，本次没有登记条件时也必须结清其 Q。
-普通返回可合并 P/Q，但实际仍逐次发送命令 1。MIX coordinator 收齐完整资源 release 后才聚合 P；
-条件封口者或最终 CHECK owner 发布 Q。每轮 READY 前清零链计数，资源由 retained publication 保留。
+普通空组可在返回时连续发送 P、Q 两条单位 INC。MIX 的每个活动成员成功返回时发送自己的 P；
+可能异步的 MIX 成员在空组封口时发送 Q，非空组由最终 CHECK owner 发送 Q。每轮 READY 前清零链计数，资源由 retained publication 保留。
 
 每个 expanded node 仍保留 `SchedulerTaskControl::completion_state`。它在 GM 路径裁定逻辑完成，
 在计数器路径保存归档结果：
@@ -66,10 +66,10 @@ EXIT 等待全部 sink 的逻辑 DONE，不能用记录顺序最后一个 child 
 任一 sink 的 async debt 未清，EXIT 就不能完成；Graph shell 的外部消费者因此继续等待。
 实际执行的 kernel、block/lane 返回与资源握手依然由各自 owner 退休。
 
-DONE 是依赖事实；`resolved_task_count` 是批量提交的 run 汇总，二者不可互换。
-MIX 的 P 贡献已要求本组资源 release 收齐，但观察到 DONE 仍不等于整个 run 的 EXIT/ACK 或 Host 清退完成。
+后继观察前驱的 DONE，AICPU 观察所有终点的 DONE。L4 从退休记录统计 `resolved_task_count`；若设备任务所用的任一计数器缺少有效退休快照，该值为 JSON `null`。
+CntNotify 路径的 P 可以先于整组 FIN 到齐。GM 路径由记账成员收齐本代活动成员的成功 FIN 后批量扣减物理贡献。清退还须确认 bank 退休及整个 run 的 EXIT/ACK。
 Host 必须取得本轮的清退证明后才能回收 backing。
 
 实现入口为 `scheduler_observe_task_completion`、`scheduler_execution_token_observe_fanin`、
-`scheduler_service_controls`、`scheduler_contribute_subtask` 和 async FINISH。
+`scheduler_service_controls`、`scheduler_contribute_returns` 和 GM 内联 FINISH。
 相关测试覆盖非法 gate、重复贡献、控制 CAS 唯一性、跨核依赖、async waiter 进展及 run 复用。

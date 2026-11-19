@@ -115,7 +115,7 @@ struct StartupFixture {
 
         auto *run = storage.run_control;
         run->active_worker_count = 9;
-        run->expected_task_count = 2;
+
         run->scheduler_timeout_cycles = PLATFORM_PROF_SYS_CNT_FREQ;
         for (uint32_t worker = 0; worker < 9; ++worker) {
             auto &context = storage.contexts[worker];
@@ -153,7 +153,7 @@ struct StartupFixture {
             if (worker % 3 == 1) scheduler_cluster_signal_clear(locals[i].cluster_signal, 59);
         }
         auto *run = storage.run_control;
-        for (uint32_t pass = 0; pass < 64 && scheduler_test::resolved_count(run) != 2; ++pass) {
+        for (uint32_t pass = 0; pass < 64 && storage.completed_gm_records() != 2; ++pass) {
             for (auto &local : locals) {
                 uint32_t id = UINT32_MAX;
                 bool failed = false;
@@ -177,7 +177,7 @@ struct StartupFixture {
                 ASSERT_TRUE(scheduler_complete_lane_execution(graph_view, base(), &local, run, id, 0));
             }
         }
-        ASSERT_EQ(scheduler_test::resolved_count(run), 2u);
+        ASSERT_EQ(storage.completed_gm_records(), 2u);
     }
 
     void run_late_worker(uint32_t worker = 4) {
@@ -407,7 +407,7 @@ TEST(HbgScalarObserverLifetime, BootstrapPreservesTheResidentBinding) {
         for (uint32_t lane = 0; lane < 3; ++lane)
             storage.contexts[worker].cluster_worker_ids[lane] = lane;
     auto *local = storage.local_context(&storage.contexts[1]);
-    storage.run_control->expected_task_count = 1;
+
     storage.run_control->scheduler_timeout_cycles = PLATFORM_PROF_SYS_CNT_FREQ;
     storage.test_graphs[1] = graph.graph();
     auto buffer = std::make_unique<SchedulerActivityBuffer>();
@@ -461,7 +461,6 @@ TEST(HbgScalarObserverLifetime, DispatchLoopRecordsMemoryPrimitives) {
         storage.contexts[0].cluster_worker_ids[lane] = lane;
     auto *local = storage.local_context(&storage.contexts[0]);
     auto *run = storage.run_control;
-    run->expected_task_count = 1;
 
     alignas(64) std::array<uint8_t, SIM_REG_TOTAL_SIZE> registers{};
     ScopedStartupRegisterObserver observer([] {});
@@ -554,7 +553,6 @@ TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCa
     if (!with_profiling) local->profiling = nullptr;
     ASSERT_TRUE(scheduler_protocol_bind(base, local));
     auto *run = storage.run_control;
-    run->expected_task_count = 1;
 
     alignas(64) std::array<uint8_t, SIM_REG_TOTAL_SIZE> registers{};
     startup_reg_base = registers.data();
@@ -562,7 +560,7 @@ TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCa
     identity_test_payload = scheduler_execution_binding_at(base, local->config.prepared, 0);
     write_reg(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
     ScopedStartupRegisterObserver stop_after_completion([&] {
-        if (scheduler_test::resolved_count(run) == run->expected_task_count)
+        if (storage.completed_gm_records() == storage.layout.task_count)
             write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
     });
     SchedulerWorkerStats stats{};
@@ -684,7 +682,7 @@ TEST_P(HbgIdleDispatchArrival, EmptyPollsObserveNewWorkAndTerminationWithoutSpur
     if (level == 0) local->profiling = nullptr;
     ASSERT_TRUE(scheduler_protocol_bind(base, local));
     auto *run = storage.run_control;
-    run->expected_task_count = 2;
+
     alignas(64) std::array<uint8_t, SIM_REG_TOTAL_SIZE> registers{};
     startup_reg_base = registers.data();
     startup_kernel_calls = 0;
@@ -757,14 +755,13 @@ TEST(HbgProtocolExecution, ConsumerDiscoveryKeepsTheCompletedGenerationSeparateF
     auto *local = storage.local_context(&storage.contexts[0]);
     ASSERT_TRUE(scheduler_protocol_bind(base, local));
     auto *run = storage.run_control;
-    run->expected_task_count = 2;
 
     alignas(64) std::array<uint8_t, SIM_REG_TOTAL_SIZE> registers{};
     startup_reg_base = registers.data();
     startup_kernel_calls = 0;
     write_reg(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
     ScopedStartupRegisterObserver stop_after_completion([&] {
-        if (scheduler_test::resolved_count(run) == run->expected_task_count)
+        if (storage.completed_gm_records() == storage.layout.task_count)
             write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
     });
     SchedulerWorkerStats stats{};

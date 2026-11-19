@@ -61,12 +61,12 @@ inline std::string scheduler_protocol_freeze_source(
                 unique.emplace(key, std::make_pair(offset, def));
             }
             row.number("graph_key", key);
-            uint32_t count = 0;
-            if (scheduler_node_fanin_count(original, task, &count) != SchedulerGraphResult::OK)
+            SchedulerFaninView fanin{};
+            if (scheduler_node_fanin_view(original, task, &fanin) != SchedulerGraphResult::OK)
                 throw std::invalid_argument("invalid original fanin row");
-            std::vector<int64_t> deps(count);
-            for (uint32_t edge = 0; edge < count; ++edge)
-                if (scheduler_node_fanin_ref(original, task, edge, &deps[edge]) != SchedulerGraphResult::OK)
+            std::vector<int64_t> deps(fanin.count);
+            for (uint32_t edge = 0; edge < fanin.count; ++edge)
+                if (scheduler_fanin_ref(fanin, task, edge, &deps[edge]) != SchedulerGraphResult::OK)
                     throw std::invalid_argument("invalid original dependency");
             row.numbers("dependencies", deps.data(), deps.size());
         }

@@ -215,10 +215,12 @@ TEST_F(HbgPreparedBindings, SparseAsyncLanesKeepExactExecutionIdentityWithoutReg
     const auto *bindings = scheduler_state_at<SchedulerExecutionBinding>(base, layout.prepared.bindings_offset);
     const std::array<uint32_t, 7> groups{0, 1, 2, UINT32_MAX, 3, UINT32_MAX, 4};
     const std::array<int32_t, 7> blocks{0, 1, 2, 0, 0, 1, 1};
+    const std::array<int32_t, 7> sub_blocks{0, 0, 0, 0, 1, 0, 1};
     for (uint32_t index = 0; index < groups.size(); ++index) {
         SCOPED_TRACE(index);
         const auto &binding = bindings[index];
         EXPECT_EQ(binding.local_context.block_idx, blocks[index]);
+        EXPECT_EQ(binding.global_context.sub_block_id, sub_blocks[index]);
         EXPECT_EQ(binding.local_context.block_num, index < 3 ? 3 : 2);
         EXPECT_EQ(binding.global_context.async_present, 0u);
         EXPECT_EQ(binding.global_context.async_group_index, groups[index]);

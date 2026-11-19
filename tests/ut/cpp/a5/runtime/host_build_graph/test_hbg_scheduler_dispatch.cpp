@@ -105,24 +105,15 @@ TEST(SchedulerTokenDispatch, AddChainReleasesSuccessorsBeforeAccountingAndKeepsO
         EXPECT_EQ(scheduler_completion_remaining(f.control(task)->completion_state), 2u);
         EXPECT_EQ(scheduler_observe_task_completion(first), SchedulerCompletionObservation::DONE);
     }
-    bool progress = false;
-    ASSERT_TRUE(
-        scheduler_account_completed_tasks(f.graph.graph(), f.base(), f.local(), f.storage.run_control, &progress)
-    );
-    EXPECT_TRUE(progress);
+    scheduler_snapshot_counter_completions(f.graph.graph(), f.base(), f.local(), f.storage.run_control);
     EXPECT_TRUE(scheduler_completion_done(f.control(0)->completion_state));
-    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
-    ASSERT_TRUE(
-        scheduler_account_completed_tasks(f.graph.graph(), f.base(), f.local(), f.storage.run_control, &progress)
-    );
-    EXPECT_FALSE(progress);
     EXPECT_EQ(value, 4u);
-    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
+    EXPECT_EQ(f.storage.completed_gm_records(), 1u);
     value = 5;
     EXPECT_EQ(scheduler_observe_task_completion(first), SchedulerCompletionObservation::INVALID);
 }
 
-TEST(SchedulerTokenDispatch, AddMixContributionCountsOnlyActiveLanesAtTheExistingReleaseBoundary) {
+TEST(SchedulerTokenDispatch, AddMixMembersContributeBeforeGroupRetirement) {
     DispatchFixture f(1, 4);
     auto &metadata = f.storage.metadata[0];
     metadata.logical_block_num = 2;
@@ -146,6 +137,21 @@ TEST(SchedulerTokenDispatch, AddMixContributionCountsOnlyActiveLanesAtTheExistin
                 ));
             EXPECT_EQ(value, block * credits_per_block + (async_lane ? 1 : 0));
             EXPECT_EQ(scheduler_completion_counter_observe(*counter), 0);
+            for (uint32_t lane : {1u, 2u}) {
+                SchedulerLocalSlotState member{};
+                member.task_ref = 0;
+                member.block_idx = block;
+                member.subtask_slot = static_cast<uint8_t>(lane);
+                member.cluster_mix = true;
+                member.completion_credits = 1 + static_cast<uint8_t>(async_lane && lane == 2);
+                EXPECT_EQ(
+                    scheduler_publish_fanout<false>(
+                        f.graph.graph(), f.base(), f.local(), f.storage.run_control, member, 0
+                    ),
+                    SchedulerSubtaskFinishResult::PARTIAL
+                );
+                EXPECT_EQ(value, block * credits_per_block + static_cast<uint32_t>(async_lane) + lane);
+            }
             ASSERT_TRUE(
                 scheduler_publish_fanout<false>(
                     f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, block, LaneMask::both_aiv()
@@ -231,44 +237,30 @@ TEST(SchedulerTokenDispatch, FreshReadyRefillSelectsOneExecutionWithoutAnotherSc
 }
 
 TEST(SchedulerTokenDispatch, ReturnReleasesItsSlotAndReportsCompletionExactlyOnce) {
-    for (bool mapped : {false, true}) {
-        SCOPED_TRACE(mapped);
-        DispatchFixture f;
-        uint32_t completed = 0;
-        if (mapped) {
-            f.storage.run_control->run_completed_read_address = reinterpret_cast<uint64_t>(&completed);
-            f.storage.run_control->run_completed_add_address = reinterpret_cast<uint64_t>(&completed);
-        }
-        ASSERT_TRUE(f.prepare());
-        uint32_t slot;
-        ASSERT_TRUE(f.take(slot));
-        EXPECT_EQ(hbg_test_eligible_mask(f.local()), 1u << slot);
-        const auto handle = f.local()->execution_at(slot).prepared;
-        f.local()->execution_at(slot).state = SchedulerDispatchSlotState::EXECUTING;
-        ASSERT_TRUE((scheduler_complete_lane_execution<true, true>(
-            f.graph.graph(), f.base(), f.local(), f.storage.run_control, slot, 0
-        )));
-        EXPECT_EQ(f.local()->execution_at(slot).state, SchedulerDispatchSlotState::FREE);
-        EXPECT_TRUE(scheduler_completion_done(f.control(0)->completion_state));
-        EXPECT_EQ(
-            scheduler_prepared_phase(
-                scheduler_prepared_control_at(f.base(), f.local()->config.prepared, handle.execution_index)->state
-            ),
-            SchedulerPreparedPhase::CLAIMED
-        );
-        EXPECT_TRUE(scheduler_prepared_already_returned(f.base(), f.local()->config.prepared, handle));
-        auto stale = handle;
-        EXPECT_FALSE(scheduler_return_prepared_execution(f.base(), f.local()->config.prepared, &stale));
-        EXPECT_FALSE(
-            scheduler_fail_prepared_execution(f.base(), f.local()->config.prepared, f.local()->worker_id(), &stale)
-        );
-        EXPECT_FALSE(scheduler_cancel_unstarted_handle(f.base(), f.local(), &stale));
-        EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
-        EXPECT_FALSE(
-            scheduler_complete_lane_execution(f.graph.graph(), f.base(), f.local(), f.storage.run_control, slot, 0)
-        );
-        EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
-    }
+    DispatchFixture f;
+    ASSERT_TRUE(f.prepare());
+    uint32_t slot;
+    ASSERT_TRUE(f.take(slot));
+    EXPECT_EQ(hbg_test_eligible_mask(f.local()), 1u << slot);
+    const auto handle = f.local()->execution_at(slot).prepared;
+    f.local()->execution_at(slot).state = SchedulerDispatchSlotState::EXECUTING;
+    ASSERT_TRUE(
+        (scheduler_complete_lane_execution<true>(f.graph.graph(), f.base(), f.local(), f.storage.run_control, slot, 0))
+    );
+    EXPECT_EQ(f.local()->execution_at(slot).state, SchedulerDispatchSlotState::FREE);
+    EXPECT_TRUE(scheduler_completion_done(f.control(0)->completion_state));
+    EXPECT_EQ(
+        scheduler_prepared_phase(
+            scheduler_prepared_control_at(f.base(), f.local()->config.prepared, handle.execution_index)->state
+        ),
+        SchedulerPreparedPhase::CLAIMED
+    );
+    EXPECT_TRUE(scheduler_prepared_already_returned(f.base(), f.local()->config.prepared, handle));
+    auto stale = handle;
+    EXPECT_FALSE(scheduler_cancel_unstarted_handle(f.base(), f.local(), &stale));
+    EXPECT_EQ(f.storage.completed_gm_records(), 1u);
+    EXPECT_FALSE(f.take(slot));
+    EXPECT_EQ(f.storage.completed_gm_records(), 1u);
 }
 
 TEST(SchedulerTokenDispatch, OnlyTheLastOrdinaryReturnUsesTheCanonicalRetirementProof) {
@@ -282,7 +274,7 @@ TEST(SchedulerTokenDispatch, OnlyTheLastOrdinaryReturnUsesTheCanonicalRetirement
         const auto handle = f.local()->execution_at(slot).prepared;
         EXPECT_EQ(f.local()->execution_at(slot).block_idx, block);
         f.local()->execution_at(slot).state = SchedulerDispatchSlotState::EXECUTING;
-        ASSERT_TRUE((scheduler_complete_lane_execution<false, true>(
+        ASSERT_TRUE((scheduler_complete_lane_execution<false>(
             f.graph.graph(), f.base(), f.local(), f.storage.run_control, slot, 0
         )));
         const auto raw =
@@ -295,10 +287,10 @@ TEST(SchedulerTokenDispatch, OnlyTheLastOrdinaryReturnUsesTheCanonicalRetirement
         EXPECT_EQ(scheduler_cached_task_proof(f.local(), 0) == SchedulerTaskProof::DONE, block == 1);
     }
     EXPECT_TRUE(scheduler_completion_done(f.control(0)->completion_state));
-    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
+    EXPECT_EQ(f.storage.completed_gm_records(), 1u);
 }
 
-TEST(SchedulerTokenDispatch, InvalidReturnPreservesPreviouslyCompletedWork) {
+TEST(SchedulerTokenDispatch, CancellingReadyWorkPreservesPreviouslyCompletedWork) {
     DispatchFixture f(2);
     ASSERT_TRUE(f.prepare());
     uint32_t slot;
@@ -306,14 +298,9 @@ TEST(SchedulerTokenDispatch, InvalidReturnPreservesPreviouslyCompletedWork) {
     ASSERT_TRUE(f.complete(slot));
     ASSERT_TRUE(f.take(slot));
     ASSERT_EQ(f.local()->execution_at(slot).state, SchedulerDispatchSlotState::READY);
-    EXPECT_FALSE(
-        scheduler_complete_lane_execution(f.graph.graph(), f.base(), f.local(), f.storage.run_control, slot, 0)
-    );
-    EXPECT_EQ(
-        f.storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::COMPLETION_SLOT_BINDING_INVALID)
-    );
-    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
-    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
+    ASSERT_TRUE(scheduler_cancel_unstarted_work(f.base(), f.local()));
+    EXPECT_FALSE(f.take(slot));
+    EXPECT_EQ(f.storage.completed_gm_records(), 1u);
     EXPECT_FALSE(scheduler_completion_done(f.control(1)->completion_state));
 }
 
@@ -325,7 +312,7 @@ TEST(SchedulerTokenDispatch, UnprofiledExecutionNeedsNoProfilingStorage) {
     ASSERT_TRUE(f.take(slot));
     ASSERT_TRUE(f.complete(slot));
     EXPECT_EQ(f.local()->profiling, nullptr);
-    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
+    EXPECT_EQ(f.storage.completed_gm_records(), 1u);
 }
 
 TEST(SchedulerTokenDispatch, ReusingTheSlotKeepsEachTraceBoundToItsExecution) {
@@ -436,9 +423,8 @@ TEST(SchedulerTokenDispatch, HostDoneAndConfirmedFaninPrefixDoNotReleaseTheRemai
     SchedulerPreparedHandle predecessor{};
     const uint64_t block = scheduler_gm_fetch_add(f.control(1)->next_block, UINT64_C(1));
     ASSERT_EQ(block, 0u);
-    ASSERT_TRUE(
-        scheduler_claim_and_receive_payload(f.base(), f.local()->config.prepared, 1, 1, block, 0, &predecessor)
-    );
+    ASSERT_TRUE(scheduler_claim_for_execution(f.base(), f.local()->config.prepared, 1, 1, block, 0, &predecessor));
+    ASSERT_TRUE(scheduler_receive_payload(f.base(), f.local()->config.prepared, 1, block, 0, &predecessor));
     ASSERT_EQ(scheduler_prepared_owner(predecessor.claimed_state), 1u);
     ASSERT_TRUE(scheduler_close_ordinary_supply(
         f.graph.graph(), f.base(), f.storage.local_context(&f.storage.contexts[1]), f.storage.run_control, 1, true, 1,
@@ -537,7 +523,7 @@ TEST(SchedulerTokenDispatch, InvalidFaninCannotGrantExecutionPermission) {
     ASSERT_TRUE(f.take(slot));
     ASSERT_EQ(f.local()->execution_at(slot).task_ref, 0);
     ASSERT_TRUE(f.complete(slot));
-    ASSERT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
+    ASSERT_EQ(f.storage.completed_gm_records(), 1u);
     bool progress = false;
     EXPECT_FALSE(
         scheduler_refill_execution_tokens(f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, &progress)
@@ -547,7 +533,7 @@ TEST(SchedulerTokenDispatch, InvalidFaninCannotGrantExecutionPermission) {
         f.graph.graph(), f.base(), f.local(), f.storage.run_control, 0, &slot, &progress
     ));
     EXPECT_EQ(slot, UINT32_MAX);
-    EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
+    EXPECT_EQ(f.storage.completed_gm_records(), 1u);
     EXPECT_EQ(f.control(1)->next_block, 0u);
     EXPECT_FALSE(scheduler_completion_done(f.control(1)->completion_state));
     EXPECT_NE(f.storage.run_control->scheduler_error, 0u);
@@ -567,14 +553,14 @@ TEST(SchedulerTokenDispatch, PredicateFailureSkipsAndMalformedPredicateStopsExec
         EXPECT_EQ(f.take(slot), !malformed);
         if (malformed) {
             EXPECT_EQ(slot, UINT32_MAX);
-            EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 0u);
+            EXPECT_EQ(f.storage.completed_gm_records(), 0u);
             EXPECT_NE(f.storage.run_control->scheduler_error, 0u);
         } else {
             ASSERT_NE(slot, UINT32_MAX);
             EXPECT_EQ(f.local()->execution_at(slot).predicate, SchedulerPredicateState::FAIL);
             ASSERT_TRUE(f.complete(slot));
             EXPECT_TRUE(scheduler_completion_done(f.control(0)->completion_state));
-            EXPECT_EQ(scheduler_test::resolved_count(f.storage.run_control), 1u);
+            EXPECT_EQ(f.storage.completed_gm_records(), 1u);
         }
     }
 }
@@ -835,7 +821,7 @@ TEST_P(SchedulerMix, InvalidPreparedCallPublishesNoPayloadOrCompletion) {
     ASSERT_EQ(prepared->execution_count, GetParam().count());
     for (uint64_t index = 0; index < prepared->execution_count; ++index)
         EXPECT_EQ(records[index].publication_count, 0u);
-    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 0u);
+    EXPECT_EQ(fixture.storage.completed_gm_records(), 0u);
     EXPECT_NE(fixture.run()->scheduler_error, 0u);
     EXPECT_EQ(scheduler_completion_count(fixture.control(0)->completion_state), 0u);
 }

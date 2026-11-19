@@ -22,8 +22,8 @@ DEFERRED_FINISH = 1 << 31
 
 ROOT_NUMBERS = frozenset(
     """
-run_epoch task_count worker_count trace_count member_count cooperative_task_count
-cluster_count mix_task_count sync_mix_task_count expected_task_count inline_completed_count resolved_task_count
+version run_epoch task_count worker_count trace_count member_count cooperative_task_count
+cluster_count mix_task_count sync_mix_task_count expected_task_count inline_completed_count
 active_worker_count scheduler_error error_claimed floor_count
 """.split()
 )
@@ -155,10 +155,17 @@ def read_native_protocol(section):
     """Validate the wire schema; preserve incomplete/error records for diagnosis."""
     if not isinstance(section, dict) or section.get("schema") != "hbg-native-protocol":
         _error("unsupported schema")
+    version = section.get("version")
+    if type(version) is not int or version != 2:
+        _error(f"unsupported protocol version {version!r}; this reader requires version 2")
     native = has_native_graph(section)
     root_numbers = ROOT_NUMBERS
     extra = {"node_map", "graph_source"} if native else set()
-    _object(section, root_numbers | ROOT_TABLES | {"schema", "producer", "first_error"} | extra, "root")
+    _object(
+        section,
+        root_numbers | ROOT_TABLES | {"schema", "producer", "first_error", "resolved_task_count"} | extra,
+        "root",
+    )
     if section["producer"] != "aicore":
         _error("unknown schema or producer")
     for field in root_numbers:
@@ -169,13 +176,8 @@ def read_native_protocol(section):
         _number(section["first_error"][field], f"first_error.{field}")
     if section["member_count"] != section["worker_count"] * section["cooperative_task_count"]:
         _error("member region capacity disagrees with task/worker counts")
-    # Older captures reserved a row for every cooperative task, including pure
-    # sync tasks. Current devices allocate rows only for the MIX catalog.
-    floor_counts = {
-        (count + 1) * section["cluster_count"] if section["mix_task_count"] else 0
-        for count in (section["mix_task_count"], section["cooperative_task_count"])
-    }
-    if section["floor_count"] not in floor_counts:
+    mix_tasks = section["mix_task_count"]
+    if section["floor_count"] != ((mix_tasks + 1) * section["cluster_count"] if mix_tasks else 0):
         _error("floor publication capacity disagrees with cluster/task counts")
     for table, kind, count, key in (
         ("tasks", "task", section["task_count"], "task_ref"),
@@ -195,6 +197,16 @@ def read_native_protocol(section):
         _indices(section[table], count, table)
         for row in section[table]:
             _record(row, kind, f"{table}[{row['index']}]")
+    _read_completion_counters(section)
+    _read_nested_events(section)
+    if native:
+        from .native_graph import read_graph_source  # noqa: PLC0415
+
+        read_graph_source(section)
+    return section
+
+
+def _read_completion_counters(section):
     counters = section["completion_counters"]
     if not isinstance(counters, list) or len(counters) > section["task_count"]:
         _error("invalid completion counter count")
@@ -202,12 +214,11 @@ def read_native_protocol(section):
     for counter in counters:
         _record(counter, "counter", f"completion_counters[{counter['index']}]")
     counter_chains(section)
-    _read_nested_events(section)
-    if native:
-        from .native_graph import read_graph_source  # noqa: PLC0415
-
-        read_graph_source(section)
-    return section
+    if any(counter["valid"] == 0 for counter in counters):
+        if section["resolved_task_count"] is not None:
+            _error("resolved_task_count must be null when a counter observation is missing")
+    else:
+        _number(section["resolved_task_count"], "resolved_task_count")
 
 
 def _counter_ancestor(tasks, task, ancestor):

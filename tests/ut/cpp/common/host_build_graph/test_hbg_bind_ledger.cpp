@@ -2997,15 +2997,15 @@ TEST_F(HbgBindLedgerTest, MissingFinishCallbackRejectsBeforeOrchestration) {
     EXPECT_EQ(runtime.pending_publication().bytes, 0u);
 }
 
-TEST_F(HbgResidentSchedulerStorageTest, PartialNotificationPoolsKeepProgressChainsDoneAndCheckDisjoint) {
+TEST_F(HbgResidentSchedulerStorageTest, IndependentAsyncSinksUseAvailableChainAndDoneSlots) {
     HostApiOps ops = fake_ops();
     ops.acquire_scheduler_notifications = [](void *, uint32_t, SchedulerNotificationPurpose purpose, size_t count,
                                              SchedulerDoneNotifications *out) {
         *out = {std::vector<uint64_t>(count), std::vector<uint64_t>(count), {}};
-        if (purpose == SchedulerNotificationPurpose::COMPLETION_COUNTER && count == 3) {
-            // Two of three slots are available: progress and the first independent task.
-            out->addresses = {0x1000, 0x1020, 0};
-            out->add_addresses = {0x1008, 0x1028, 0};
+        if (purpose == SchedulerNotificationPurpose::COMPLETION_COUNTER && count == 2) {
+            // One of the two independent tasks fits the INC pool.
+            out->addresses = {0x1000, 0};
+            out->add_addresses = {0x1008, 0};
         } else if (purpose == SchedulerNotificationPurpose::TASK_STATE && count == 3) {
             // DONE accepts a word-aligned SET address. Only the second CHECK half has bit aliases.
             out->addresses = {0x2004, 0x2044, 0x2080};
@@ -3039,12 +3039,15 @@ TEST_F(HbgResidentSchedulerStorageTest, PartialNotificationPoolsKeepProgressChai
         rt.dev.scheduler_bootstrap.worker_context_base - reinterpret_cast<uint64_t>(region.device_target);
     const auto &ctx = *reinterpret_cast<const SchedulerWorkerContext *>(base + offset);
     const auto &run = *reinterpret_cast<const SchedulerRunControl *>(base + ctx.run_control_offset);
-    EXPECT_EQ(run.run_completed_read_address, 0x1000u);
-    EXPECT_EQ(run.run_completed_add_address, 0x1008u);
+    ASSERT_EQ(run.sink_count, 2u);
+    const auto *sinks = reinterpret_cast<const uint32_t *>(base + run.sinks_offset);
+    EXPECT_EQ(sinks[0], 0u);
+    EXPECT_EQ(sinks[1], 1u);
     const auto *chains =
         reinterpret_cast<const SchedulerTaskCompletionCounter *>(base + ctx.completion_counters_offset);
-    EXPECT_EQ(chains[0].read_address, 0x1020u);
-    EXPECT_EQ(chains[0].add_address, 0x1028u);
+    EXPECT_EQ(chains[0].read_address, 0x1000u);
+    EXPECT_EQ(chains[0].add_address, 0x1008u);
+    EXPECT_EQ(chains[0].threshold, 34u);
     EXPECT_EQ(chains[1].read_address, 0u);
     const auto *done = reinterpret_cast<const uint64_t *>(base + ctx.done_notifications_offset);
     EXPECT_EQ(done[0], 0u);

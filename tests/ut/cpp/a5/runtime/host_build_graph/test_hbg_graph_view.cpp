@@ -27,23 +27,18 @@ TEST(AicoreGraphView, OrdinaryNodesKeepTheirOriginalDependencyReferences) {
     auto graph = buffer.graph();
     ASSERT_TRUE(scheduler_graph_view_valid(graph));
     EXPECT_EQ(graph.native_header_offset, 0u);
-    uint32_t count = UINT32_MAX;
-    ASSERT_EQ(scheduler_node_fanin_count(graph, 4, &count), SchedulerGraphResult::OK);
-    EXPECT_EQ(count, 3u);
     SchedulerFaninView fanin{};
     ASSERT_EQ(scheduler_node_fanin_view(graph, 4, &fanin), SchedulerGraphResult::OK);
-    ASSERT_EQ(fanin.count, count);
-    for (uint32_t index = 0; index < count; ++index) {
+    ASSERT_EQ(fanin.count, 3u);
+    for (uint32_t index = 0; index < fanin.count; ++index) {
         int64_t producer = -1;
-        ASSERT_EQ(scheduler_node_fanin_ref(graph, 4, index, &producer), SchedulerGraphResult::OK);
-        EXPECT_EQ(producer, buffer.payload(4).fanin_data()[index]);
         ASSERT_EQ(scheduler_fanin_ref(fanin, 4, index, &producer), SchedulerGraphResult::OK);
         EXPECT_EQ(producer, buffer.payload(4).fanin_data()[index]);
     }
     int64_t producer = -1;
-    EXPECT_EQ(scheduler_fanin_ref(fanin, 4, count, &producer), SchedulerGraphResult::INVALID_FANIN_ID);
-    ASSERT_EQ(scheduler_node_fanin_count(graph, 0, &count), SchedulerGraphResult::OK);
-    EXPECT_EQ(count, 0u);
+    EXPECT_EQ(scheduler_fanin_ref(fanin, 4, fanin.count, &producer), SchedulerGraphResult::INVALID_FANIN_ID);
+    ASSERT_EQ(scheduler_node_fanin_view(graph, 0, &fanin), SchedulerGraphResult::OK);
+    EXPECT_EQ(fanin.count, 0u);
 }
 
 TEST(AicoreGraphView, RejectsMalformedViewBeforeReadingStorage) {
@@ -62,23 +57,25 @@ TEST(AicoreGraphView, RejectsReferencesAndRowsOutsideTheOrdinaryGraph) {
     buffer.executable(0, 0);
     buffer.executable(1, 1, {0});
     const auto graph = buffer.graph();
-    uint32_t count = 0;
+    SchedulerFaninView fanin{};
     int64_t producer = -1;
-    EXPECT_EQ(scheduler_node_fanin_count(graph, -1, &count), SchedulerGraphResult::INVALID_TASK_COUNT);
-    EXPECT_EQ(scheduler_node_fanin_count(graph, 2, &count), SchedulerGraphResult::INVALID_TASK_COUNT);
-    EXPECT_EQ(scheduler_node_fanin_count(graph, 0, nullptr), SchedulerGraphResult::INVALID_ARGUMENTS);
-    EXPECT_EQ(scheduler_node_fanin_ref(graph, 1, 0, nullptr), SchedulerGraphResult::INVALID_ARGUMENTS);
-    EXPECT_EQ(scheduler_node_fanin_ref(graph, 1, 1, &producer), SchedulerGraphResult::INVALID_FANIN_ID);
-    EXPECT_EQ(scheduler_node_fanin_ref(graph, 1, UINT32_MAX, &producer), SchedulerGraphResult::INVALID_FANIN_ID);
+    EXPECT_EQ(scheduler_node_fanin_view(graph, -1, &fanin), SchedulerGraphResult::INVALID_TASK_COUNT);
+    EXPECT_EQ(scheduler_node_fanin_view(graph, 2, &fanin), SchedulerGraphResult::INVALID_TASK_COUNT);
+    EXPECT_EQ(scheduler_node_fanin_view(graph, 0, nullptr), SchedulerGraphResult::INVALID_ARGUMENTS);
+    ASSERT_EQ(scheduler_node_fanin_view(graph, 1, &fanin), SchedulerGraphResult::OK);
+    EXPECT_EQ(scheduler_fanin_ref(fanin, 1, 0, nullptr), SchedulerGraphResult::INVALID_ARGUMENTS);
+    EXPECT_EQ(scheduler_fanin_ref(fanin, 1, 1, &producer), SchedulerGraphResult::INVALID_FANIN_ID);
+    EXPECT_EQ(scheduler_fanin_ref(fanin, 1, UINT32_MAX, &producer), SchedulerGraphResult::INVALID_FANIN_ID);
     buffer.payload(1).fanin_count = -1;
-    EXPECT_EQ(scheduler_node_fanin_count(graph, 1, &count), SchedulerGraphResult::INVALID_FANIN_COUNT);
+    EXPECT_EQ(scheduler_node_fanin_view(graph, 1, &fanin), SchedulerGraphResult::INVALID_FANIN_COUNT);
     buffer.payload(1).fanin_count = 129;
-    EXPECT_EQ(scheduler_node_fanin_count(graph, 1, &count), SchedulerGraphResult::INVALID_FANIN_COUNT);
+    EXPECT_EQ(scheduler_node_fanin_view(graph, 1, &fanin), SchedulerGraphResult::INVALID_FANIN_COUNT);
     buffer.payload(1).fanin_count = 1;
     buffer.payload(1).fanin_data()[0] = 1;
-    EXPECT_EQ(scheduler_node_fanin_ref(graph, 1, 0, &producer), SchedulerGraphResult::INVALID_FANIN_ID);
+    ASSERT_EQ(scheduler_node_fanin_view(graph, 1, &fanin), SchedulerGraphResult::OK);
+    EXPECT_EQ(scheduler_fanin_ref(fanin, 1, 0, &producer), SchedulerGraphResult::INVALID_FANIN_ID);
     buffer.payload(1).fanin_data()[0] = -1;
-    EXPECT_EQ(scheduler_node_fanin_ref(graph, 1, 0, &producer), SchedulerGraphResult::INVALID_FANIN_ID);
+    EXPECT_EQ(scheduler_fanin_ref(fanin, 1, 0, &producer), SchedulerGraphResult::INVALID_FANIN_ID);
 }
 
 TEST(AicoreGraphView, HeaderOffsetCannotAuthorizeItsOwnRead) {

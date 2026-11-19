@@ -12,6 +12,7 @@
 #pragma once
 
 #include "runtime.h"
+#include "aicpu/cache_maintenance.h"
 #include "scheduler/scheduler_types.h"
 #include "scheduler/scheduler_graph.h"
 
@@ -69,10 +70,11 @@ inline SchedulerRunControl *aicore_scheduler_run_control(SchedulerWorkerContext 
                                    scheduler_state_at<SchedulerRunControl>(state_base, context->run_control_offset);
 }
 
-inline uint64_t aicore_scheduler_resolved_count(const SchedulerRunControl *run) {
-    return run->run_completed_read_address == 0 ?
-               run->resolved_task_count :
-               *reinterpret_cast<volatile uint32_t *>(run->run_completed_read_address);
+// Read published GM through the platform cache contract. CntNotify MMIO must
+// instead be read at its exact 32-bit width, without GM cache maintenance.
+inline uint64_t aicpu_observe_gm(const volatile uint64_t &word) {
+    cache_invalidate_range(const_cast<const uint64_t *>(&word), sizeof(word));
+    return __atomic_load_n(&word, __ATOMIC_ACQUIRE);
 }
 
 inline SchedulerGraphView aicore_scheduler_graph_view(const SchedulerWorkerContext &context) {

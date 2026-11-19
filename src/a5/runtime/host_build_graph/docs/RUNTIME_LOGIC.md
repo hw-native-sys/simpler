@@ -429,12 +429,22 @@ project that order onto the two engines. Each worker advances its private
 cursor after confirming that the current task has supplied all its blocks.
 Cross-engine predecessors must also have closed their supply before a consumer
 can claim a block. The producer's completion gate separately controls when
-the consumer can execute. For a flat executable task without a predicate,
+the consumer can execute. For a dynamically distributed flat executable task without a predicate,
 the last valid block claim publishes `claim_seal == logical_block_num`.
 This seal proves all ordinary or MIX blocks have owners, so the supply check
 can advance the catalog without loading DONE. Native Graph nodes and
 predicated tasks still check logical completion, since they can finish without
 issuing every block. The consumer checks data dependencies before execution.
+
+For an exact wave, Host marks the expanded task with `SCHEDULER_TASK_FIXED_OWNER`.
+A pure AIC block maps to its cluster index, and a pure AIV block maps to twice
+its cluster index plus its vector lane (0 or 1). A 1C1V or 1C2V block maps to
+its cluster, where AIV0 publishes the original active mask. This applies with
+either sync_start setting. Fixed assignment satisfies cross-engine supply as
+soon as the image is available. An owning core advances its own catalog only
+after binding its block or publishing its local MIX descriptor. The cluster
+floor, resource order, and actual fanin still guard execution. Per-task dynamic
+claim counters and the supply seal stay zero for these tasks.
 
 Each core has two ordinary self-claim slots and two MIX member slots, one per
 SSBUF bank. Each ordinary slot can hold one block, and a core can hold at most
@@ -466,7 +476,10 @@ A kernel proven to have no such accesses skips both operations.
 AIV0 claims the MIX block and release-publishes its task, block, rank and lane
 mask in a cluster SSBUF bank. Each named worker accepts a stable generation
 once and prepares its own Call. Execution still requires fanin, ordering and
-the applicable sync-start permit. The bank can be reused after the accountant
+the applicable sync-start permit. Each active member publishes ARRIVED for its
+generation. It waits for all active arrivals when a participating lane has an
+earlier conflicting pure sync-start cohort or the run has an async layout.
+Otherwise its own arrival suffices. The bank can be reused after the accountant
 has observed every active member's matching FIN and acknowledged the generation.
 The proxy records its latest claim, the last group published to each bank,
 and an unpublished cancellation. The two bank identities survive a third claim. Each
@@ -474,31 +487,36 @@ member records CLAIMED on receipt, ENTERED at the kernel boundary and RETURNED
 on physical return. Aborting an unpublished group leaves its members BUILT.
 
 After the kernel returns, its async registration is sealed. A MIX member
-records its physical return even when post-call sealing fails. The
-real physical return contributes once to the task's canonical completion gate;
-inactive MIX resource lanes contribute no execution. Trace/group retirement
-finishes under its existing ownership before the slot is safely reused.
+records the physical return even if sealing fails. On the CntNotify path each
+successful active member publishes its own physical credit P. An async-capable
+member also owes one condition credit Q, published at an empty seal or by the
+CHECK owner that settles its group. On the GM path the accountant waits for
+every active member's successful FIN and contributes the active lane count in
+one update. Both paths retire the bank only after the successful FIN check.
 
 ### 7.3 Canonical Completion and Retirement
 
-`completion_state` encodes immutable total in bits 63:48, remaining computation
-in bits 47:32 and debt in bits 31:0. Initial state for T physical executions is
-`(T,T,T)`. A real return atomically subtracts `(1 << 32) + 1`, reducing both
-remaining computation and compute debt. Async conditions retain additional debt
-until their join completes. DONE requires a valid total and zero computation
-and debt; a kernel return alone is insufficient.
+On the GM path, `completion_state` encodes the immutable total in bits 63:48,
+remaining computation in bits 47:32 and debt in bits 31:0. The initial state
+for T physical executions is `(T,T,T)`. A contribution of K physical returns
+subtracts `K * ((1 << 32) + 1)`. The first nonempty async group adds one marker
+to the debt. Once all physical returns and pending groups settle, the closing
+or final-settlement operation grants one FINISH owner, which publishes DONE
+inline by changing `(T,0,1)` to `(T,0,0)`. A counted task reaches DONE when
+its P and Q contributions reach its CntNotify threshold.
 
-Each unique logical-task accountant immediately contributes one INC to a
-run-owned CntNotify. AICPU reads that count for progress and completion;
-Host-completed nodes remain separately counted. There is no per-worker pending
-count, batching threshold, timer or flush. Unmapped runs use one GM FAA per
-task. The reporting helper adds no DSB: existing completion publication and
-unconditional worker-retirement barriers preserve their respective ordering.
-After every core retires, AICPU snapshots the actual count into the GM
-`resolved_task_count` diagnostic field. Successors observe producer completion
-directly. Async CHECK keeps its exclusive lease and only settled logical
-completion reports progress; physical return with pending conditions does not.
-Trace publication, group release and safe reuse retain their ownership rules.
+Host records the live nodes with no live consumer after control folding and
+Graph expansion. After bootstrap, AICPU observes each sink's existing ADD
+threshold, SET notification or GM completion state. A completed sink stays
+complete. All sinks must settle before EXIT, including any asynchronous debt.
+Independent terminal branches are checked separately. Host-only graphs have
+an empty sink list and still go through bootstrap and worker retirement.
+
+A long chain can progress while its sink stays pending. Only after the
+watchdog has seen no progress for half its budget does it sample intermediate
+state. Profiled retirement snapshots mapped counters for diagnostics. L4
+derives its resolved task count from the retired image and exports JSON `null`
+if a device task uses a counter without a valid retirement snapshot.
 
 On an error, a worker cancels only its provably owned unstarted handles to FAILED;
 it cannot invent a RETURNED Call, computation contribution or group-finished ACK.
