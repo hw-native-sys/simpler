@@ -2,9 +2,9 @@
 
 Each L2 owns a separate Host table. L3 initializes its named `table` slice through
 `Buffer.shm.buf` with the offset from `domain.buffer_range(name)` inside the
-domain's `initializer` callback. L3 passes the table offset (256 bytes) to each
-gather kernel. The kernel resolves the peer table through its URMA workspace
-and gathers into local HBM. A dependent consumer adds one to every gathered
+domain's `initializer` callback. The gather kernel subtracts the local window base from the table
+tensor address to recover the 256-byte offset. It adds that offset to the peer
+MR base and gathers into local HBM. A dependent consumer adds one to every gathered
 element after the asynchronous producer completes.
 
 The example keeps both a Host-source and a Device-source URMA domain alive. It

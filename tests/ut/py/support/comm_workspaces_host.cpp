@@ -625,13 +625,11 @@ static void test_host_domain(const std::string &scenario) {
     assert(physical_handles == (device_context != 0 ? 1 : 0));
     assert(peer_import_calls == 0);
     const auto *context = reinterpret_cast<const CommContext *>(ctx);
-    assert(context->windowsOut[0] == base);
+    assert(context->windowsIn[0] == base && context->windowsOut[0] == base);
     if (mask != 0) {
-        for (auto address : context->windowsIn)
-            assert(address == 0);
+        for (size_t peer = 1; peer < COMM_MAX_RANK_NUM; ++peer)
+            assert(context->windowsIn[peer] == 0);
         assert(registered_hosts.size() == 1);
-    } else {
-        assert(context->windowsIn[0] == base);
     }
     assert((context->windowsIn[1] != 0) == peer_mte && context->windowsOut[1] == 0);
     if (peer_mte) {

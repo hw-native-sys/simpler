@@ -37,14 +37,14 @@ def build_callable():
             "source": str(ROOT / "kernels/orchestration/gather.cpp"),
             "function_name": "host_comm_domain",
             "config_name": "host_comm_domain_config",
-            "signature": [D.IN, D.OUT, D.OUT, D.IN, D.IN, D.IN],
+            "signature": [D.IN, D.OUT, D.OUT, D.IN, D.IN],
         },
         "incores": [
             {
                 "func_id": 0,
                 "source": str(ROOT / "kernels/aiv/gather.cpp"),
                 "core_type": "aiv",
-                "signature": [D.IN, D.OUT, D.IN, D.IN],
+                "signature": [D.IN, D.OUT, D.IN],
             },
             {
                 "func_id": 1,
@@ -158,7 +158,6 @@ def run(devices=(0, 1), *, staged=False, aiv_blocks=1):
                             TensorArgType.OUTPUT_EXISTING,
                         )
                     args.add_scalar(domain.device_context(rank, workspace_engines=("urma",)))
-                    args.add_scalar(domain.buffer_range("table")[0])
                     args.add_scalar(aiv_blocks)
                     orch.submit_next_level(entry, args, config, worker=rank)
 
