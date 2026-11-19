@@ -43,14 +43,33 @@ extern "C" void hbg_capture_orchestration(const ChipTaskArgs &args) {
         rt_submit_aiv_task(0, task);
         return;
     }
+    if (scenario == 16) {
+        // Grow the image to ten tasks with a single writer of the external output.
+        // The successor of each intermediate must observe exactly one producer.
+        const uint32_t shape[]{16};
+        TensorCreateInfo intermediate(shape, 1, DataType::INT32);
+        auto current = input;
+        for (int i = 0; i < 9; ++i) {
+            CoreTaskArgs step;
+            step.add_input(current);
+            step.add_output(intermediate);
+            step.add_scalar(uint64_t{1});
+            auto values = rt_submit_aiv_task(0, step);
+            current = values.get_ref(0);
+        }
+        CoreTaskArgs last;
+        last.add_input(current);
+        last.add_output(output);
+        last.add_scalar(uint64_t{5});
+        rt_submit_aiv_task(0, last);
+        return;
+    }
     if (scenario != 2) {
         const uint32_t index[]{0};
         const auto increment = scenario == 6 ?
                                    static_cast<uint64_t>(get_tensor_data<int32_t>(args.tensor(2).ref(), 1, index)) :
                                    uint64_t{3};
-        const int chains = scenario == 16 ? 5 : 1;
-        for (int i = 0; i < chains; ++i)
-            chain(input, output, scenario == 1, increment + i);
+        chain(input, output, scenario == 1, increment);
         return;
     }
     GraphTaskArgs boundary;

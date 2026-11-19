@@ -30,3 +30,14 @@ struct HbgExecutionImage {
 };
 static_assert(std::is_trivially_copyable_v<HbgExecutionImage> && std::is_standard_layout_v<HbgExecutionImage>);
 static_assert(sizeof(HbgExecutionImage) == 32 && sizeof(HbgImageReference) == 16);
+
+inline constexpr uint64_t HBG_IMAGE_ALIGNMENT = 64;
+// Direct references require cache-line-aligned data. On ARM RTS pools copies up to
+// 4 KiB at 8-byte alignment; larger packets use a cache-line-aligned allocation.
+inline constexpr uint64_t HBG_DIRECT_IMAGE_MIN_PACKET_BYTES = 4096 + HBG_IMAGE_ALIGNMENT;
+
+// Keep the first image byte cache-line aligned relative to the RTS packet.
+inline constexpr uint64_t hbg_execution_image_offset(uint64_t descriptor_end) {
+    return ((descriptor_end + sizeof(HbgExecutionImage) + HBG_IMAGE_ALIGNMENT - 1) & ~(HBG_IMAGE_ALIGNMENT - 1)) -
+           sizeof(HbgExecutionImage);
+}

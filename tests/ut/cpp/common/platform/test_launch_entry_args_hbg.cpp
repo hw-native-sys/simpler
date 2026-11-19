@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstring>
 #include "aicpu/hbg_execution_image.h"
+#include "aicpu/runtime_launch_view.h"
 #include "launch_entry_args_fixture.h"
 
 using namespace launch_entry_args_test;
@@ -79,24 +80,27 @@ TEST_F(LaunchEntryArgs, AGraphSectionTravelsOnlyWhenBothSidesNameTheSameLength) 
     helper.release_run_view();
 }
 
-TEST_F(LaunchEntryArgs, KernelRuntimeRelocationKeepsGraphDefinitionInTheSamePackage) {
+TEST_F(LaunchEntryArgs, KernelRuntimeDescriptorFollowsGraphDefinitionInTheSamePackage) {
     std::array<unsigned char, 128> definition{};
     definition.fill(0x3b);
     runtime.publish_graph_section(GraphSectionSource::LaunchEnvelope, 0, definition.size());
     ASSERT_EQ(stage_graph_section(slot, definition.data(), definition.size()), 0);
     ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), 0);
     ASSERT_EQ(helper.publish_runtime_args(true, this, rts.sink, true), 0);
-    ASSERT_EQ(helper.host_input_count(), 1);
     auto copied = copy_launch();
     const auto header = copied.header();
     EXPECT_EQ(header.graph_section_bytes, definition.size());
     EXPECT_EQ(header.graph_section_source, static_cast<uint32_t>(GraphSectionSource::LaunchEnvelope));
     const auto *bytes = static_cast<const unsigned char *>(copied.data());
     EXPECT_EQ(std::memcmp(bytes + header.graph_section_offset, definition.data(), definition.size()), 0);
-    const auto *desc = reinterpret_cast<const DeviceRuntimeLaunchDesc *>(header.runtime_args);
+    RuntimeLaunchView view;
+    const auto *local = view.bind(*static_cast<const KernelArgs *>(copied.data()));
+    ASSERT_NE(local, nullptr);
+    EXPECT_EQ(view.execution_image(), nullptr);
+    const auto *desc = &local->dev;
     EXPECT_EQ(desc->graph_section_base, 0U);
     EXPECT_EQ(desc->graph_section_bytes, definition.size());
-    EXPECT_GE(helper.host_inputs()[0].dataOffset, header.graph_section_offset + header.graph_section_bytes);
+    EXPECT_GE(header.runtime_section.descriptor_offset, header.graph_section_offset + header.graph_section_bytes);
     EXPECT_EQ(desc->shared_state_addr, reinterpret_cast<uint64_t>(slot.shared_state));
     EXPECT_EQ(slot.runtime_args, nullptr);
     EXPECT_EQ(rts.copies, 0);
@@ -119,18 +123,13 @@ TEST_F(LaunchEntryArgs, KernelExecutionImageTravelsInRtsStorageAndRestoresTheWor
     EXPECT_EQ(capture.queries, 0);
     EXPECT_EQ(rts.copies, 0);
     EXPECT_EQ(slot.runtime_upload_source, nullptr);
-    ASSERT_EQ(helper.host_input_count(), 2);
 
     auto captured = copy_launch();
-    const auto header = captured.header();
-    ASSERT_NE(header.execution_image, nullptr);
-    uint64_t aicpu_shared_state = 0;
-    std::memcpy(
-        &aicpu_shared_state,
-        reinterpret_cast<const unsigned char *>(header.runtime_args) +
-            offsetof(DeviceRuntimeLaunchDesc, shared_state_addr),
-        sizeof(aicpu_shared_state)
-    );
+    RuntimeLaunchView view;
+    const auto *local = view.bind(*static_cast<const KernelArgs *>(captured.data()));
+    ASSERT_NE(local, nullptr);
+    ASSERT_NE(view.execution_image(), nullptr);
+    const auto aicpu_shared_state = local->dev.shared_state_addr;
     AicoreLaunchArgs core{};
     fill_shared_launch_args(core, helper.args, helper.aicore_view());
     ASSERT_NE(slot.shared_state, nullptr);
@@ -140,7 +139,8 @@ TEST_F(LaunchEntryArgs, KernelExecutionImageTravelsInRtsStorageAndRestoresTheWor
         working.fill(0xa5);
         ASSERT_EQ(
             restore_hbg_execution_image(
-                header.execution_image, [](const void *, size_t) {}, [](const void *, size_t) {}
+                view.execution_image(), view.execution_image_bytes(), [](const void *, size_t) {},
+                [](const void *, size_t) {}
             ),
             0
         );
@@ -161,28 +161,79 @@ TEST_F(LaunchEntryArgs, ProgramDeliversDescriptorAndExecutionImageAlongsideGraph
     runtime.publish_graph_section(GraphSectionSource::LaunchEnvelope, 0, definition.size());
     ASSERT_EQ(stage_graph_section(slot, definition.data(), definition.size()), 0);
     ASSERT_EQ(run_once(true), 0);
-    ASSERT_EQ(helper.host_input_count(), 2);
     EXPECT_EQ(slot.runtime_args, nullptr);
     EXPECT_EQ(slot.runtime_upload_source, nullptr);
     EXPECT_EQ(rts.copies, 0);
     auto package = copy_launch();
     const auto header = package.header();
-    ASSERT_NE(header.runtime_args, nullptr);
-    ASSERT_NE(header.execution_image, nullptr);
+    RuntimeLaunchView view;
+    ASSERT_NE(view.bind(*static_cast<const KernelArgs *>(package.data())), nullptr);
+    ASSERT_NE(view.execution_image(), nullptr);
     ASSERT_EQ(header.runtime_descriptor_bytes, RUNTIME_LAUNCH_DESCRIPTOR_BYTES);
     ASSERT_EQ(header.graph_section_bytes, definition.size());
     EXPECT_EQ(
-        std::memcmp(static_cast<const unsigned char *>(package.data()) + header.graph_section_offset,
-                    definition.data(), definition.size()),
+        std::memcmp(
+            static_cast<const unsigned char *>(package.data()) + header.graph_section_offset, definition.data(),
+            definition.size()
+        ),
         0
     );
-    ASSERT_EQ(restore_hbg_execution_image(
-                  header.execution_image, [](const void *, size_t) {}, [](const void *, size_t) {}
-              ), 0);
+    ASSERT_EQ(
+        restore_hbg_execution_image(
+            view.execution_image(), view.execution_image_bytes(), [](const void *, size_t) {},
+            [](const void *, size_t) {}
+        ),
+        0
+    );
     EXPECT_EQ(std::memcmp(working.data(), initial.data(), 16), 0);
     EXPECT_EQ(working[16], 0x55);
     EXPECT_GT(package.bytes, 4096u);
-    EXPECT_EQ(tensor_address, reinterpret_cast<uint64_t>(header.execution_image) + sizeof(HbgExecutionImage) + 32);
+    EXPECT_EQ(tensor_address, reinterpret_cast<uint64_t>(view.execution_image()) + sizeof(HbgExecutionImage) + 32);
+}
+
+TEST_F(LaunchEntryArgs, HbgPacketRejectsOverlappingAndTruncatedSectionsBeforeReplay) {
+    alignas(64) std::array<unsigned char, 64> working{};
+    std::array<unsigned char, 64> initial{};
+    uint64_t field = 0;
+    HbgImageReference ref{reinterpret_cast<uint64_t>(&field), 32};
+    const HostMetadataRegion region{working.data(), initial.data(), initial.size(), true, 16, &ref, 1};
+    ASSERT_EQ(slot.staged_launch_metadata.prepare(&region, 1, true), 0);
+    ASSERT_EQ(run_once(true), 0);
+    const auto published = copy_launch();
+    auto moved = published;
+    auto &header = *static_cast<KernelArgs *>(moved.data());
+    const auto valid = header;
+    RuntimeLaunchView view;
+    ASSERT_NE(view.bind(header), nullptr);
+    const auto *image = static_cast<const unsigned char *>(view.execution_image());
+    ASSERT_EQ(image, static_cast<const unsigned char *>(moved.data()) + valid.image_section.offset);
+    ASSERT_EQ(view.execution_image_bytes(), sizeof(HbgExecutionImage) + initial.size() + sizeof(ref));
+
+    header.runtime_section.descriptor_offset = 0;
+    EXPECT_EQ(view.bind(header), nullptr);
+    header = valid;
+    header.runtime_section.packet_bytes = valid.image_section.offset + valid.image_section.bytes - 1;
+    EXPECT_EQ(view.bind(header), nullptr);
+    header = valid;
+    header.image_section.offset = valid.runtime_section.descriptor_offset;
+    EXPECT_EQ(view.bind(header), nullptr);
+    header = valid;
+    header.image_section.bytes = UINT32_MAX;
+    EXPECT_EQ(view.bind(header), nullptr);
+    header = valid;
+    ASSERT_NE(view.bind(header), nullptr);
+    const auto coherent = [](const void *, size_t) {};
+    EXPECT_NE(restore_hbg_execution_image(image, sizeof(HbgExecutionImage) - 1, coherent, coherent), 0);
+    EXPECT_NE(restore_hbg_execution_image(image, view.execution_image_bytes() - 1, coherent, coherent), 0);
+    EXPECT_EQ(field, 0u);
+
+    // Move the same well-framed packet to an eight-byte-aligned RTS slot.
+    std::vector<RtsLaunchCopy::Block> small_pool((moved.bytes + 8 + 63) / 64);
+    auto *packet = reinterpret_cast<unsigned char *>(small_pool.data()) + 8;
+    std::memcpy(packet, moved.data(), moved.bytes);
+    const auto *unaligned_image = packet + valid.image_section.offset;
+    EXPECT_NE(restore_hbg_execution_image(unaligned_image, valid.image_section.bytes, coherent, coherent), 0);
+    EXPECT_EQ(field, 0u);
 }
 
 // HBG ignores the entry-route permit. After initialization, both permit values

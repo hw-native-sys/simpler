@@ -92,8 +92,8 @@ memory and runtime image have independent owners even when their bank number
 is the same; retaining one does not force replacement of the others.
 
 Resource class and delivery carrier are separate. Kernel-mode Runtime control
-descriptors travel in RTS-owned AICPU launch arguments, with explicit host-input
-relocation; their worker reports and teardown gates remain in separately owned
+descriptors travel in RTS-owned AICPU launch arguments, with packet-relative offsets
+and lengths; their worker reports and teardown gates remain in separately owned
 shared storage. AICore receives the shared address and bootstrap values as scalar
 arguments. The `RUNTIME_IMAGE` region names the execution arena/image, not that
 compact launch descriptor, so RTS descriptor delivery does not remove its bank

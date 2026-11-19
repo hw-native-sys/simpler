@@ -34,10 +34,69 @@ static std::vector<uint8_t> read(const char *path) {
     return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
 }
 
+static void check_program_packet(
+    int device, const std::vector<uint8_t> &callable, const std::vector<uint8_t> &cpu, const std::vector<uint8_t> &core,
+    const std::vector<uint8_t> &dispatcher
+) {
+    auto ctx = create_device_context();
+    require(ctx != nullptr, "program-context");
+    CallConfig config{};
+    config.aicpu_thread_num = 2;
+    check(
+        simpler_init(
+            ctx, device, cpu.data(), cpu.size(), core.data(), core.size(), dispatcher.data(), dispatcher.size(),
+            &config, 0, nullptr, 0
+        ),
+        "program-init"
+    );
+    check(simpler_register_callable(ctx, 0, callable.data()), "program-register");
+    std::vector<uint8_t> storage(get_runtime_size() + get_runtime_alignment());
+    const auto aligned =
+        (reinterpret_cast<uintptr_t>(storage.data()) + get_runtime_alignment() - 1) & ~(get_runtime_alignment() - 1);
+    int32_t input[16], output[16]{}, control = 3;
+    const uint32_t shape[]{16}, one[]{1};
+    for (int i = 0; i < 16; ++i)
+        input[i] = i;
+    ChipStorageTaskArgs args;
+    args.add_tensor(make_tensor_external(input, shape, 1, DataType::INT32, AddressSpace::HOST, TensorTransfer::H2D));
+    args.add_tensor(make_tensor_external(output, shape, 1, DataType::INT32, AddressSpace::HOST, TensorTransfer::H2D));
+    args.add_tensor(make_tensor_external(&control, one, 1, DataType::INT32, AddressSpace::HOST, TensorTransfer::H2D));
+    args.add_scalar(0);
+    NativeRunDescriptor descriptor{};
+    descriptor.run_epoch = descriptor.generation = 1;
+    auto run = reinterpret_cast<void *>(aligned);
+    check(simpler_prepare_run(ctx, run, 0, &args, &config, &descriptor), "program-prepare");
+    capture_test::begin_capture_publication_probe();
+    check(simpler_launch_run(ctx, run), "program-launch");
+    const auto record = capture_test::finish_capture_publication_probe();
+    check(simpler_wait_run(ctx, run), "program-wait");
+    check(simpler_finalize_run(ctx, run), "program-finalize-run");
+    std::printf("program-cpu-launches=%zu\n", record.cpu_launches.size());
+    for (const auto &launch : record.cpu_launches)
+        std::printf(
+            "program-cpu-packet inline=%d image_bytes=%llu refs=%llu\n", launch.inline_runtime,
+            static_cast<unsigned long long>(launch.image_bytes), static_cast<unsigned long long>(launch.references)
+        );
+    require(
+        record.cpu_launches.size() == 1 && record.cpu_launches.front().inline_runtime &&
+            record.cpu_launches.front().references != 0,
+        "program-inline-packet-with-references"
+    );
+    for (int i = 0; i < 16; ++i)
+        require(output[i] == i + 10, "program-output");
+    check(simpler_unregister_callable(ctx, 0), "program-unregister");
+    check(finalize_device(ctx), "program-finalize");
+    destroy_device_context(ctx);
+}
+
 int main(int argc, char **argv) {
     require(argc == 7, "usage: device scenario callable cpu core dispatcher");
     const int device = std::atoi(argv[1]), scenario = std::atoi(argv[2]);
     const auto callable = read(argv[3]), cpu = read(argv[4]), core = read(argv[5]), dispatcher = read(argv[6]);
+    if (scenario == 16) {
+        check_program_packet(device, callable, cpu, core, dispatcher);
+        return 0;
+    }
     check(aclInit(nullptr), "aclInit");
     check(aclrtSetDevice(device), "set-device");
     aclrtStream caller = nullptr;
@@ -114,7 +173,7 @@ int main(int argc, char **argv) {
             check(aclrtRecordEvent(dependency_event, other_stream), "conflict-other-record");
             arm_capture_submit_fault(caller, dependency_event);
         }
-        const bool probe_publications = capture_test::needs_publications(scenario) || scenario == 14;
+        const bool probe_publications = capture_test::needs_publications(scenario) || scenario == 14 || scenario == 0;
         if (probe_publications) capture_test::begin_capture_publication_probe();
         const int launch_rc = simpler_submit_run_on_stream(ctx, run, caller);
         const auto submission =
@@ -135,6 +194,12 @@ int main(int argc, char **argv) {
         } else {
             check(launch_rc, "capture-launch-once");
         }
+        if (probe_publications && !partial_submission)
+            require(
+                submission.cpu_launches.size() == 1 && submission.cpu_launches.front().inline_runtime &&
+                    submission.cpu_launches.front().references != 0,
+                "kernel-inline-packet-with-references"
+            );
         capture_test::check_publications(scenario, submission);
         if (scenario == 4) {
             const int rc = simpler_submit_run_on_stream(ctx, run, caller);
@@ -290,7 +355,7 @@ int main(int argc, char **argv) {
                 require(submission.cpu_launches.size() == 1 && eager_submission.cpu_launches.size() == 1, "cpu-launch");
                 const auto &original = submission.cpu_launches.front();
                 const auto &eager = eager_submission.cpu_launches.front();
-                require(original.image_bytes > 0, "original-image");
+                require(original.image_bytes > 0 && eager.inline_runtime && eager.references > 0, "original-image");
                 if (same_size) {
                     require(eager.image_bytes == original.image_bytes, "same-size-image");
                     require(
@@ -319,6 +384,7 @@ int main(int argc, char **argv) {
         require(finalize_rc == launch_rc, "finalize-after-destroy");
         if (cancel_recording) std::printf("cancelled-capture-cleaned cycle=%d\n", cycle);
     }
+    capture_test::release_boot_fault_source();
     if (dependency_event != nullptr) check(aclrtDestroyEvent(dependency_event), "destroy-failure-event");
     if (other_stream != nullptr) check(aclrtDestroyStream(other_stream), "destroy-failure-other-stream");
     check(finalize_device(ctx), "finalize-context");

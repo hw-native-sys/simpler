@@ -626,7 +626,7 @@ public:
                 auto &args = prepared.kernel_args;
                 const int launch_rc = launch_aicpu_payload(
                     prepared.streams.aicpu, args.launch_payload(), args.launch_payload_bytes(),
-                    host::KernelNames::RunName, 1, args.host_inputs(), args.host_input_count()
+                    host::KernelNames::RunName, 1
                 );
                 if (launch_rc != 0) return launch_rc;
                 sink.mark_submitted();
@@ -795,14 +795,14 @@ TEST_F(NativeAdmissionTest, CapturedHbgImageUsesRtsSnapshotThroughRepeatedReplay
     ASSERT_GE(packet.size(), sizeof(KernelArgs));
     KernelArgs header{};
     std::memcpy(&header, packet.data(), sizeof(header));
-    const auto packet_begin = reinterpret_cast<uintptr_t>(packet.data());
-    const auto image_address = reinterpret_cast<uintptr_t>(header.execution_image);
-    ASSERT_GE(image_address, packet_begin);
-    ASSERT_LE(image_address - packet_begin, packet.size());
-    EXPECT_EQ((image_address - packet_begin + sizeof(HbgExecutionImage)) % 64, 0u);
-    ASSERT_GE(packet.size() - (image_address - packet_begin), sizeof(HbgExecutionImage) + expected.size());
+    ASSERT_EQ(header.runtime_section.packet_bytes, packet.size());
+    const auto offset = header.image_section.offset;
+    ASSERT_LE(offset, packet.size());
+    ASSERT_LE(header.image_section.bytes, packet.size() - offset);
+    EXPECT_EQ((offset + sizeof(HbgExecutionImage)) % 64, 0u);
+    ASSERT_GE(header.image_section.bytes, sizeof(HbgExecutionImage) + expected.size());
     HbgExecutionImage image{};
-    std::memcpy(&image, header.execution_image, sizeof(image));
+    std::memcpy(&image, packet.data() + offset, sizeof(image));
     ASSERT_EQ(image.working_address, reinterpret_cast<uint64_t>(working_arena));
     ASSERT_EQ(image.bytes, expected.size());
     control().recording_active = false;
@@ -816,15 +816,17 @@ TEST_F(NativeAdmissionTest, CapturedHbgImageUsesRtsSnapshotThroughRepeatedReplay
     };
     std::vector<CacheLine> replay_storage((packet.size() + 63) / 64);
     std::memcpy(replay_storage.data(), packet.data(), packet.size());
-    const auto *image_packet =
-        reinterpret_cast<const unsigned char *>(replay_storage.data()) + (image_address - packet_begin);
+    const auto *image_packet = reinterpret_cast<const unsigned char *>(replay_storage.data()) + offset;
     const auto *image_data = image_packet + sizeof(image);
     ASSERT_LE(image.mutable_prefix_bytes, expected.size());
     ASSERT_EQ(std::memcmp(image_data, expected.data(), expected.size()), 0);
     for (int replay = 0; replay < 2; ++replay) {
         std::memset(working_arena, 0xa5, image.mutable_prefix_bytes);
         ASSERT_EQ(
-            restore_hbg_execution_image(image_packet, [](const void *, size_t) {}, [](const void *, size_t) {}), 0
+            restore_hbg_execution_image(
+                image_packet, header.image_section.bytes, [](const void *, size_t) {}, [](const void *, size_t) {}
+            ),
+            0
         );
         for (uint64_t i = 0; i < image.reference_count; ++i) {
             HbgImageReference ref{};
@@ -1030,13 +1032,16 @@ TEST_F(NativeAdmissionTest, HbgPrerequisitesAndRtsImageAreDeliveredFromOwnedSnap
         std::memcpy(copy.destination, copy.source, copy.bytes);
     EXPECT_EQ(first_target, expected_first);
     EXPECT_EQ(second_target, expected_second);
-    ASSERT_EQ(helper.host_input_count(), 2);
-    EXPECT_EQ(helper.host_inputs()[1].addrOffset, offsetof(KernelArgs, execution_image));
     const auto *packet = static_cast<const unsigned char *>(helper.launch_payload());
     ASSERT_NE(packet, nullptr);
-    const auto *image = packet + helper.host_inputs()[1].dataOffset;
+    const auto &section = helper.args.image_section;
+    ASSERT_LE(section.offset, helper.launch_payload_bytes());
+    ASSERT_LE(section.bytes, helper.launch_payload_bytes() - section.offset);
+    const auto *image = packet + section.offset;
     EXPECT_EQ(image_target, (std::array<uint8_t, 4>{}));
-    ASSERT_EQ(restore_hbg_execution_image(image, [](const void *, size_t) {}, [](const void *, size_t) {}), 0);
+    ASSERT_EQ(
+        restore_hbg_execution_image(image, section.bytes, [](const void *, size_t) {}, [](const void *, size_t) {}), 0
+    );
     EXPECT_EQ(image_target, expected_image);
 }
 

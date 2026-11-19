@@ -4115,7 +4115,7 @@ public:
                 auto &args = prepared.kernel_args;
                 const int launch_rc = launch_aicpu_payload(
                     prepared.streams.aicpu, args.launch_payload(), args.launch_payload_bytes(),
-                    host::KernelNames::RunName, 1, args.host_inputs(), args.host_input_count()
+                    host::KernelNames::RunName, 1
                 );
                 if (launch_rc != 0) return launch_rc;
                 sink.mark_submitted();

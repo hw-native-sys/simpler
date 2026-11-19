@@ -264,20 +264,11 @@ int LoadAicpuOp::BootstrapDispatcher(const void *, size_t, const void *, size_t,
 int LoadAicpuOp::Init(const std::vector<std::string> &) {
     return native_admission_transport::control().loader_start_rc;
 }
-int LoadAicpuOp::LaunchBuiltInOp(
-    rtStream_t stream, void *args, size_t bytes, int, const std::string &name, rtHostInputInfo_t *host_inputs,
-    uint16_t host_input_count
-) {
+int LoadAicpuOp::LaunchBuiltInOp(rtStream_t stream, void *args, size_t bytes, int, const std::string &name) {
     auto &c = native_admission_transport::control();
-    if (name == KernelNames::RunName || host_input_count != 0) {
-        if (args == nullptr || (host_input_count != 0 && host_inputs == nullptr)) return -1;
-        c.aicpu_argument_copies.emplace_back(bytes);
-        auto &copy = c.aicpu_argument_copies.back();
-        for (uint16_t i = 0; i < host_input_count; ++i) {
-            if (host_inputs[i].addrOffset + sizeof(uint64_t) > bytes || host_inputs[i].dataOffset >= bytes) return -1;
-            const uint64_t address = reinterpret_cast<uint64_t>(copy.data() + host_inputs[i].dataOffset);
-            std::memcpy(static_cast<unsigned char *>(args) + host_inputs[i].addrOffset, &address, sizeof(address));
-        }
+    if (name == KernelNames::RunName) {
+        if (args == nullptr) return -1;
+        auto &copy = c.aicpu_argument_copies.emplace_back(bytes);
         std::memcpy(copy.data(), args, bytes);
         args = copy.data();
     }

@@ -113,8 +113,8 @@ onboard Path A implementation:
    The per-task launch hands the front-less `KernelArgs` payload directly to
    `rtsLaunchCpuKernel()`. `argsSize` includes the header and any trailing
    invocation, graph-definition and runtime-descriptor sections. The AICPU entry
-   receives the packet base directly. TMR Kernel leaves `runtime_args` at offset 0
-   null and locates the descriptor inside the packet.
+   receives the packet base directly. Onboard HBG and TMR Kernel locate the
+   delivered descriptor by its packet-relative offset and byte length.
    Two sibling entries reuse the same launch mechanism with their own, smaller
    payloads instead of `KernelArgs`:
    - `simpler_aicpu_init` takes an `InitArgs` (device id + log config), launched
@@ -142,7 +142,7 @@ ABI passes only the front-less `KernelArgs` and carries no CANN launch front.
 The per-task launch buffer begins with these `KernelArgs` fields:
 
 ```text
-KernelArgs + 0:  runtime_args
+KernelArgs + 0:  borrowed runtime_args or inline image section (offset, bytes)
 KernelArgs + 8:  regs
 ```
 
@@ -170,9 +170,11 @@ address; the platform initializes its reports once before use and retains the
 allocation until all native or captured consumers have ended.
 
 Onboard HBG Program and Kernel execution append the compact Runtime descriptor
-to the AICPU launch package. RTS fills the header's Runtime pointer using
-`hostInputInfo`. TMR Program publishes a separately allocated descriptor on the
-AICPU stream.
+to the AICPU launch package after any Graph Definition. The header gives the
+descriptor offset and length and, when present, the execution image offset and
+length. The image length covers its header, snapshot and reference table.
+RTS copies the complete packet by `argsSize` with zero host-input relocations.
+TMR Program publishes a separately allocated descriptor on the AICPU stream.
 
 In TMR Kernel mode the host appends the KernelInvocation at byte 192 and the
 Runtime control descriptor after the invocation. The packet identifies the
@@ -192,9 +194,11 @@ shared runtime state or retained after its device entry returns.
 TMR KernelInvocation carries tensor descriptors and scalar values, not tensor
 storage. HBG Graph Definitions keep their per-reader launch-envelope view.
 In onboard HBG Program and Kernel modes, the packed initial execution image is
-another host-input section. The native AICPU entry initializes the aligned writable
-execution arena from the RTS-owned snapshot once before releasing the scheduling
-threads, including on every replay. AICore reads the execution arena. Simpler
+a separate section of the same packet. The native AICPU entry checks the
+section bounds, restores the mutable prefix to the working arena and binds
+the device fields to their offsets in the RTS snapshot before releasing the
+scheduling threads on each execution. When these references are present, the
+snapshot data starts at an actual 64-byte-aligned device address. Simpler
 retains this arena separately so it stays valid through device retirement and
 any retained model use. Simulation delivers the image through a synchronous copy.
 Caller input/output buffers remain caller-owned.
@@ -208,7 +212,7 @@ ordering and lifetime contract.
 RTS argument storage carries the descriptor and HBG image without a Simpler-owned
 pinned upload source for those bytes. HBG uses the same RTS route for Program,
 Kernel eager and capture. AICPU and AICore receive the address of the
-same Simpler-owned handshake allocation. The image requires a device-side copy
+same Simpler-owned handshake allocation. The mutable image prefix is copied on device
 into the writable execution arena. Shared scheduler storage and notification or
 counter handles stay with Simpler's prepared resource owner. Staged scheduler
 metadata still uses retained pinned sources and ordered publication. A submitted

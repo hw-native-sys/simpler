@@ -13,54 +13,75 @@
 
 #include <acl/acl.h>
 #include <cstring>
-#include "host_build_graph/runtime.h"
+#include <vector>
+#include "common/hbg_execution_image.h"
+#include "host_build_graph/runtime_core.h"
 
 namespace simpler::capture_test {
 namespace {
-thread_local void *arena_binding = nullptr;
-thread_local void *saved_arena = nullptr;
+thread_local void *prefix_source = nullptr;
+thread_local std::vector<unsigned char> original_prefix;
+constexpr size_t prefix_capacity = CHIP_ALIGN_UP(sizeof(RuntimeContext), CHIP_ALIGN_SIZE) + sizeof(SharedMemoryHeader);
+constexpr size_t capacity_offset =
+    offsetof(RuntimeContext, prebuilt_layout) + offsetof(RuntimeArenaLayout, task_capacity);
 }  // namespace
 
-size_t prepare_snapshot(DeviceContextHandle, int) { return 0; }
+size_t prepare_snapshot(DeviceContextHandle, int scenario) {
+    if (scenario == 13)
+        check(aclrtMalloc(&prefix_source, prefix_capacity, ACL_MEM_MALLOC_HUGE_FIRST), "allocate-boot-fault-source");
+    return 0;
+}
 void check_prepare(DeviceContextHandle, int, size_t) {}
-
 bool needs_publications(int scenario) { return scenario == 13; }
 
-void check_publications(int scenario, const CapturedSubmission &submission) {
-    if (!needs_publications(scenario)) return;
-    arena_binding = nullptr;
-    constexpr size_t offset = offsetof(DeviceRuntimeLaunchDesc, prebuilt_arena_base_);
-    for (const auto &launch : submission.cpu_launches) {
-        if (launch.runtime_args != 0 && launch.runtime_bytes >= offset + sizeof(void *)) {
-            arena_binding = reinterpret_cast<void *>(launch.runtime_args + offset);
-        }
-    }
-    require(arena_binding != nullptr, "observed-arena-binding");
+bool record_boot_fault_prefix(const unsigned char *section, void *stream) {
+    if (!prefix_source) return false;
+    HbgExecutionImage image{};
+    std::memcpy(&image, section, sizeof(image));
+    require(image.mutable_prefix_bytes == prefix_capacity, "observed-runtime-context-prefix");
+    original_prefix.assign(section + sizeof(image), section + sizeof(image) + image.mutable_prefix_bytes);
+    // Each normal replay restores task_capacity from the RTS snapshot. This fault
+    // fixture substitutes a controlled D2D source for precisely that mutable prefix;
+    // the same AICPU task continues to bind all immutable image references.
+    check(
+        aclrtMemcpyAsync(
+            reinterpret_cast<void *>(image.working_address), image.mutable_prefix_bytes, prefix_source,
+            image.mutable_prefix_bytes, ACL_MEMCPY_DEVICE_TO_DEVICE, stream
+        ),
+        "record-boot-fault-source"
+    );
+    return true;
+}
+
+void check_publications(int scenario, const CapturedSubmission &) {
+    if (scenario == 13) require(original_prefix.size() == prefix_capacity, "observed-boot-fault-source");
 }
 
 void inject_boot_failure() {
-    check(
-        aclrtMemcpy(&saved_arena, sizeof(saved_arena), arena_binding, sizeof(saved_arena), ACL_MEMCPY_DEVICE_TO_HOST),
-        "read-captured-arena-binding"
-    );
-    require(saved_arena != nullptr, "prepared-arena-exists");
-    void *missing_arena = nullptr;
+    uint64_t capacity = 0;
+    std::memcpy(&capacity, original_prefix.data() + capacity_offset, sizeof(capacity));
+    require(capacity != 0, "prepared-task-capacity");
+    auto fault_prefix = original_prefix;
+    std::memset(fault_prefix.data() + capacity_offset, 0, sizeof(capacity));
     check(
         aclrtMemcpy(
-            arena_binding, sizeof(missing_arena), &missing_arena, sizeof(missing_arena), ACL_MEMCPY_HOST_TO_DEVICE
+            prefix_source, prefix_capacity, fault_prefix.data(), fault_prefix.size(), ACL_MEMCPY_HOST_TO_DEVICE
         ),
-        "inject-captured-arena-binding"
+        "inject-task-capacity"
     );
 }
-
 void restore_boot_failure() {
     check(
-        aclrtMemcpy(arena_binding, sizeof(saved_arena), &saved_arena, sizeof(saved_arena), ACL_MEMCPY_HOST_TO_DEVICE),
-        "restore-captured-arena-binding"
+        aclrtMemcpy(
+            prefix_source, prefix_capacity, original_prefix.data(), original_prefix.size(), ACL_MEMCPY_HOST_TO_DEVICE
+        ),
+        "restore-injected-task-capacity"
     );
-    check(0, "restore-injected-arena-binding");
 }
-
+void release_boot_fault_source() {
+    if (prefix_source) check(aclrtFree(prefix_source), "free-boot-fault-source");
+    prefix_source = nullptr;
+}
 void check_boot_failure() {}
 void check_progress_timeout() {}
 

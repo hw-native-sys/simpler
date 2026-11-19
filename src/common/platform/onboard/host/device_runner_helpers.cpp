@@ -421,30 +421,25 @@ int KernelArgsHelper::publish_runtime_args(
         runtime_launch_image_.resize(runtime_launch_bytes_);
         if (!runtime_image_.read(0, runtime_launch_image_.data(), runtime_launch_image_.size()))
             return PTO_RUNTIME_ERR_INTERNAL;
-        size_t package_bytes = descriptor_offset + runtime_launch_bytes_;
+        const size_t descriptor_end = descriptor_offset + runtime_launch_bytes_;
+        size_t package_bytes = descriptor_end;
+        size_t image_section_bytes = 0;
         size_t image_offset = 0;
         const HostMetadataRegion image = launch_metadata_.execution_image();
         if (kernel_route && image.bytes != 0) return PTO_RUNTIME_ERR_INVALID_STATE;
         if (image.bytes != 0) {
-            // Host Input points at the header. The records following that header
-            // need cache-line alignment relative to the start of the RTS package.
-            constexpr size_t image_alignment = 64;
-            if (package_bytes > UINT32_MAX - sizeof(HbgExecutionImage) - (image_alignment - 1))
-                return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-            const size_t data_offset =
-                (package_bytes + sizeof(HbgExecutionImage) + image_alignment - 1) & ~(image_alignment - 1);
+            const uint64_t offset = hbg_execution_image_offset(descriptor_end);
+            if (offset > UINT32_MAX - sizeof(HbgExecutionImage)) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+            image_offset = static_cast<size_t>(offset);
+            const size_t data_offset = image_offset + sizeof(HbgExecutionImage);
             if (image.bytes > UINT32_MAX - data_offset) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-            image_offset = data_offset - sizeof(HbgExecutionImage);
             package_bytes = data_offset + image.bytes;
             if (image.reference_count > (UINT32_MAX - package_bytes) / sizeof(HbgImageReference))
                 return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
             package_bytes += image.reference_count * sizeof(HbgImageReference);
-            // CANN StarsArgManager uses 8-byte slots in its per-stream pool
-            // for packets up to 4 KiB on ARM (1 KiB on x86). A direct image
-            // needs the cache-line-aligned device argument allocation.
-            constexpr size_t stream_pool_limit = 4096;
+            image_section_bytes = package_bytes - image_offset;
             if (image.reference_count != 0)
-                package_bytes = std::max(package_bytes, stream_pool_limit + image_alignment);
+                package_bytes = std::max<size_t>(package_bytes, HBG_DIRECT_IMAGE_MIN_PACKET_BYTES);
         }
         slot_->launch_package.resize(package_bytes);
         std::memset(slot_->launch_package.data() + launch_payload_bytes_, 0, descriptor_offset - launch_payload_bytes_);
@@ -453,16 +448,8 @@ int KernelArgsHelper::publish_runtime_args(
         );
         launch_payload_ = slot_->launch_package.data();
         launch_payload_bytes_ = slot_->launch_package.size();
-        if (kernel_route) {
-            args.runtime_args = nullptr;
-            args.runtime_section = {static_cast<uint32_t>(descriptor_offset), static_cast<uint32_t>(package_bytes)};
-            host_input_count_ = 0;
-        } else {
-            host_inputs_[0] = {
-                static_cast<uint32_t>(offsetof(KernelArgs, runtime_args)), static_cast<uint32_t>(descriptor_offset)
-            };
-            host_input_count_ = 1;
-        }
+        args.runtime_section = {static_cast<uint32_t>(descriptor_offset), static_cast<uint32_t>(package_bytes)};
+        args.image_section = {static_cast<uint32_t>(image_offset), static_cast<uint32_t>(image_section_bytes)};
         if (image.bytes != 0) {
             const HbgExecutionImage binding{
                 reinterpret_cast<uint64_t>(image.device_target), image.bytes, image.mutable_prefix_bytes,
@@ -476,9 +463,8 @@ int KernelArgsHelper::publish_runtime_args(
                     section + sizeof(binding) + image.bytes, image.image_references,
                     image.reference_count * sizeof(HbgImageReference)
                 );
-            host_inputs_[host_input_count_++] = {
-                static_cast<uint32_t>(offsetof(KernelArgs, execution_image)), static_cast<uint32_t>(image_offset)
-            };
+            std::memset(slot_->launch_package.data() + descriptor_end, 0, image_offset - descriptor_end);
+            std::memset(section + image_section_bytes, 0, package_bytes - image_offset - image_section_bytes);
             execution_image_package_ = std::move(slot_->launch_package);
             launch_payload_ = execution_image_package_.data();
         }
@@ -495,7 +481,6 @@ int KernelArgsHelper::publish_runtime_args(
         if (rc != 0) {
             launch_payload_ = nullptr;
             launch_payload_bytes_ = 0;
-            host_input_count_ = 0;
             return rc;
         }
         runtime_args_state_ = RuntimeArgsState::Published;

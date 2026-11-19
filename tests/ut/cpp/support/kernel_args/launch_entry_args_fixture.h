@@ -66,16 +66,7 @@ protected:
         RtsLaunchCopy copy;
         copy.bytes = helper.launch_payload_bytes();
         copy.storage.resize((copy.bytes + 63) / 64);
-        auto *host = static_cast<unsigned char *>(helper.launch_payload());
-        auto *device = static_cast<unsigned char *>(copy.data());
-        for (uint16_t i = 0; i < helper.host_input_count(); ++i) {
-            const auto &relocation = helper.host_inputs()[i];
-            EXPECT_LE(relocation.addrOffset + sizeof(uint64_t), copy.bytes);
-            EXPECT_LT(relocation.dataOffset, copy.bytes);
-            const uint64_t address = reinterpret_cast<uint64_t>(device + relocation.dataOffset);
-            std::memcpy(host + relocation.addrOffset, &address, sizeof(address));
-        }
-        std::memcpy(device, host, copy.bytes);
+        std::memcpy(copy.data(), helper.launch_payload(), copy.bytes);
         return copy;
     }
 

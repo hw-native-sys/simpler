@@ -19,7 +19,8 @@
 #include <utility>
 #include "runtime/mem.h"
 #include "common/kernel_args.h"
-#include "common/hbg_execution_image.h"
+#include "capture_inline_packet.h"
+#include "capture_recovery.h"
 #include "runtime/kernel.h"
 #include "runtime/rts/rts_kernel.h"
 
@@ -101,26 +102,24 @@ extern "C" rtError_t rtsLaunchCpuKernel(
     static auto real = next_symbol<decltype(&rtsLaunchCpuKernel)>("rtsLaunchCpuKernel");
     note_submission();
     if (armed) ++result.cpu_calls;
-    const int rc = real(function, blocks, stream, config, args);
-    if (observe_publications && rc == 0 && args != nullptr && args->baseArgs.args != nullptr &&
-        args->baseArgs.argsSize >= sizeof(KernelArgs)) {
-        KernelArgs launch{};
-        std::memcpy(&launch, args->baseArgs.args, sizeof(launch));
-        HbgExecutionImage image{};
-        for (uint16_t i = 0; i < args->baseArgs.hostInputInfoNum; ++i) {
-            const auto &input = args->baseArgs.hostInputInfoPtr[i];
-            if (input.addrOffset != offsetof(KernelArgs, execution_image) ||
-                input.dataOffset > args->baseArgs.argsSize ||
-                args->baseArgs.argsSize - input.dataOffset < sizeof(HbgExecutionImage))
-                continue;
-            std::memcpy(&image, static_cast<const char *>(args->baseArgs.args) + input.dataOffset, sizeof(image));
-        }
+    if (observe_publications) {
+        const auto packet = capture_test::observe_inline_cpu_packet(args);
         captured_submission.cpu_launches.push_back(
-            {reinterpret_cast<uint64_t>(launch.runtime_args), launch.runtime_descriptor_bytes, image.bytes,
-             image.working_address}
+            {packet.valid, packet.image.bytes, packet.image.working_address, packet.image.reference_count}
         );
+        if (packet.valid && packet.image_section &&
+            capture_test::record_boot_fault_prefix(packet.image_section, stream)) {
+            const auto *start = static_cast<const unsigned char *>(args->baseArgs.args);
+            std::vector<unsigned char> copy(start, start + args->baseArgs.argsSize);
+            auto image = packet.image;
+            image.mutable_prefix_bytes = 0;
+            std::memcpy(copy.data() + (packet.image_section - start), &image, sizeof(image));
+            auto injected = *args;
+            injected.baseArgs.args = copy.data();
+            return real(function, blocks, stream, config, &injected);
+        }
     }
-    return rc;
+    return real(function, blocks, stream, config, args);
 }
 
 extern "C" aclError aclrtRecordEvent(aclrtEvent event, aclrtStream stream) {

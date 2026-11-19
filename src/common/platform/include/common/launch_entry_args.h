@@ -75,8 +75,14 @@ enum class GraphSectionSource : uint32_t {
  */
 inline constexpr size_t LAUNCH_ENVELOPE_HEADER_BYTES = 192;
 
-// KernelInvocation uses this slot instead of HBG's execution_image pointer.
-struct RuntimeDescriptorSection {
+// Byte ranges in the RTS-owned launch packet. Offsets are relative to KernelArgs.
+struct LaunchImageSection {
+    uint32_t offset;
+    uint32_t bytes;
+};
+static_assert(sizeof(LaunchImageSection) == 8);
+
+struct alignas(8) RuntimeDescriptorSection {
     uint32_t descriptor_offset;
     uint32_t packet_bytes;
 };

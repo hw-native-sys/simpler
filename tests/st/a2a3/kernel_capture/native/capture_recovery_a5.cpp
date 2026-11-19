@@ -153,6 +153,9 @@ void check_publications(int scenario, const CapturedSubmission &submission) {
     require(resident_state.run_control != nullptr, "observed-resident-publication");
 }
 
+void release_boot_fault_source() {}
+bool record_boot_fault_prefix(const unsigned char *, void *) { return false; }
+
 void inject_boot_failure() { set_captured_original_task_count(resident_state, 0); }
 
 void restore_boot_failure() {

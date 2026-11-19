@@ -14,7 +14,7 @@ state is initialized at the device boundary that excludes its previous writers.
 There is no separate Host-submitted reset task or new AICore launch ABI.
 
 Onboard Program and Kernel deliver the runtime descriptor and initial image in
-the AICPU launch. RTS resolves the Host input addresses. The entry gate
+the AICPU launch. AICPU resolves both sections from checked offsets in the RTS-delivered packet. The entry gate
 initializes the writable state before schedulers start consuming the image.
 Caller-stream ordering also applies to prerequisite copies such as the A5
 scheduler state. A recorded model can run repeatedly or be destroyed before

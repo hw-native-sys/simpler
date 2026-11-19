@@ -159,11 +159,11 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
         aicpu_begin_native_invocation,
         aicpu_reset_execution_entry,
         aicpu_finish_native_invocation,
-        args->entry_args_source == static_cast<uint32_t>(EntryArgsSource::KernelInvocation) ? nullptr :
-                                                                                              args->execution_image,
-        [](const void *image) {
-            return restore_hbg_execution_image(image, cache_invalidate_range, cache_flush_range);
-        }
+        runtime_view.execution_image(),
+        [](const void *image, size_t bytes) {
+            return restore_hbg_execution_image(image, bytes, cache_invalidate_range, cache_flush_range);
+        },
+        runtime_view.execution_image_bytes()
     };
     const auto entry = platform_aicpu_entry_gate_filter(
         runtime->get_aicpu_allowed_cpus(), runtime->get_aicpu_allowed_cpu_count(), invocation.callbacks,

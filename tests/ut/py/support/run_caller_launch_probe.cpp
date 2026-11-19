@@ -736,9 +736,7 @@ int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, const KernelArgs &
     if (observation_probe) observation_core_stream = stream;
     return step("core", stream);
 }
-int host::LoadAicpuOp::LaunchBuiltInOp(
-    rtStream_t stream, void *args, size_t bytes, int, const std::string &, rtHostInputInfo_t *, uint16_t
-) {
+int host::LoadAicpuOp::LaunchBuiltInOp(rtStream_t stream, void *args, size_t bytes, int, const std::string &) {
     if (capture && capture_kernel_packet) {
         assert(bytes >= sizeof(KernelArgs));
         const auto &header = *static_cast<const KernelArgs *>(args);
@@ -2139,6 +2137,7 @@ public:
         static EntryPoints empty_orchestration{[](const ChipTaskArgs &) {}, [](OrchContext *) {}, []() {}};
         CallableState callable;
         callable.hash = callable.chip_buffer_hash = 1;
+        callable.residency_generation = 1;
         callable.signature = {ArgDirection::INOUT};
         if (std::strcmp(SIMPLER_RUNTIME_NAME, "host_build_graph") == 0) {
             callable.host_orch_func_ptr = &empty_orchestration;
@@ -2185,7 +2184,7 @@ public:
         *out = std::make_unique<PreparedExecution>(identity, runtime, config, slot);
         (*out)->resources_owned = true;
         int rc = ensure_device_run_result_region(identity, (*out)->kernel_args, (*out)->dfx);
-        return rc == 0 ? (*out)->kernel_args.prepare_runtime_args(runtime, mem_alloc_, slot_persistent_args(slot)) : rc;
+        return rc == 0 ? init_runtime_args_with_metadata(runtime, (*out)->kernel_args, slot_persistent_args(slot)) : rc;
     }
 };
 
@@ -2621,9 +2620,6 @@ static int check_capture_submission(bool borrowed, int fault) {
     }
 
     capture_kernel_packet = borrowed && runtime_launch_entry_args_plan(*state->runtime).supported;
-    if (capture_kernel_packet) {
-        assert(state->prepared_execution->kernel_args.prepare_kernel_invocation({1, 1, 1, 0}) == 0);
-    }
     const auto retained = std::weak_ptr<const PreparedRunResources>(state->prepared_execution->prepared_resources);
     const int sync_count = syncs;
     int copyback_count = copyback_calls;

@@ -2190,11 +2190,10 @@ bool create_scheduler_state(
     {
         std::scoped_lock lock(scheduler_state_owners_mutex);
         scheduler_state_owners.emplace(
-            runtime,
-            SchedulerStateOwner{
-                reinterpret_cast<void *>(aligned_address), std::move(public_task_ids), layout, api,
-                std::move(protocol_tasks), std::move(protocol_source)
-            }
+            runtime, SchedulerStateOwner{
+                         reinterpret_cast<void *>(aligned_address), std::move(public_task_ids), layout, api,
+                         std::move(protocol_tasks), std::move(protocol_source)
+                     }
         );
     }
     runtime->add_pending_metadata(

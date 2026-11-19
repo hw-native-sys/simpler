@@ -17,7 +17,7 @@
  * the arch's own `device_runner.h` rather than being declared here.
  *
  * Current contents:
- *   - `KernelArgsHelper`: per-run launch snapshots, relocation metadata and
+ *   - `KernelArgsHelper`: per-run launch snapshots, packet section offsets and
  *     borrowed views of slot-owned shared device state.
  *
  * Future migrations:
@@ -273,8 +273,6 @@ struct KernelArgsHelper {
         runtime_launch_image_(std::move(other.runtime_launch_image_)),
         execution_image_package_(std::move(other.execution_image_package_)),
         aicore_view_(other.aicore_view_),
-        host_inputs_(other.host_inputs_),
-        host_input_count_(std::exchange(other.host_input_count_, 0)),
         launch_payload_(nullptr),
         launch_payload_bytes_(std::exchange(other.launch_payload_bytes_, 0)) {
         // The payload points either into the slot's staging or at this object's
@@ -360,9 +358,7 @@ struct KernelArgsHelper {
      */
     void *launch_payload();
     size_t launch_payload_bytes() const { return launch_payload_bytes_; }
-    rtHostInputInfo_t *host_inputs() { return host_input_count_ != 0 ? host_inputs_.data() : nullptr; }
     bool has_execution_image() const { return launch_metadata_.has_execution_image(); }
-    uint16_t host_input_count() const { return host_input_count_; }
     const AicoreRuntimeView &aicore_view() const { return aicore_view_; }
     const void *runtime_launch_data() const { return runtime_launch_image_.data(); }
     size_t runtime_launch_bytes() const { return runtime_launch_image_.size(); }
@@ -383,7 +379,7 @@ struct KernelArgsHelper {
         runtime_args_state_ = RuntimeArgsState::Empty;
         args.runtime_args = nullptr;
         args.runtime_descriptor_bytes = 0;
-        args.execution_image = nullptr;
+        args.runtime_section = {};
         args.entry_cache_maintenance = static_cast<uint32_t>(EntryCacheMaintenance::Full);
         slot_ = nullptr;
         plan_ = LaunchEntryArgsPlan{};
@@ -391,7 +387,6 @@ struct KernelArgsHelper {
         launch_owned_runtime_ = false;
         runtime_launch_bytes_ = 0;
         runtime_launch_image_.clear();
-        host_input_count_ = 0;
         launch_payload_ = nullptr;
         launch_payload_bytes_ = 0;
     }
@@ -446,8 +441,6 @@ private:
     // The retained submission slot is also used by models after that run ends.
     std::vector<std::byte> execution_image_package_;
     AicoreRuntimeView aicore_view_{};
-    std::array<rtHostInputInfo_t, 2> host_inputs_{};
-    uint16_t host_input_count_{0};
 
     void *launch_payload_{nullptr};
     size_t launch_payload_bytes_{0};

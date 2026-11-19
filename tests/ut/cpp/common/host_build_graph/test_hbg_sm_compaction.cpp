@@ -222,7 +222,12 @@ TEST(HbgSmCompaction, RestoresMixedTaskRecordsAndReadsArgumentPoolsFromTheLaunch
     const auto *initial = reinterpret_cast<const ChipTaskStorage *>(image + segments.storage);
     const auto coherent = [](const void *, size_t) {};
     for (int replay = 0; replay < 2; ++replay) {
-        ASSERT_EQ(restore_hbg_execution_image(packet_header, coherent, coherent), 0);
+        ASSERT_EQ(
+            restore_hbg_execution_image(
+                packet_header, sizeof(binding) + snapshot.bytes + sizeof(reference), coherent, coherent
+            ),
+            0
+        );
         ASSERT_EQ(header.tasks.initial_storage, initial);
         header.tasks.task_storage = reinterpret_cast<ChipTaskStorage *>(workspace.base() + segments.storage);
         header.tasks.task_states =

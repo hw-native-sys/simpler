@@ -237,9 +237,9 @@ def _check_fault_recovery(scenario: int, platform: str, stdout: str, logs: Path)
             assert stdout.count("stage=resident-bootstrap-failed rc=0") == 2
             assert "stage=restore-injected-graph-view rc=0" in stdout
         else:
-            assert "stage=restore-injected-arena-binding rc=0" in stdout
+            assert "stage=restore-injected-task-capacity rc=0" in stdout
             device_log = "\n".join(p.read_text(errors="replace") for p in logs.glob("debug/device-*/*.log"))
-            assert device_log.count("host-orch: prebuilt_arena_base is null") == 2, device_log
+            assert device_log.count("host-orch: sm_handle->attach_populated failed") == 2, device_log
     assert stdout.count("verified=16") == 3
     assert "stage=finalize-after-destroy rc=0" in stdout
 

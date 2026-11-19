@@ -251,7 +251,6 @@ TEST_F(LaunchEntryArgs, KernelDescriptorInRtsStorageBorrowsSharedState) {
     EXPECT_EQ(allocator.committed_bytes(), sizeof(RuntimeSharedState));
     ASSERT_EQ(publish(true), 0);
     EXPECT_EQ(rts.copies, 0);
-    EXPECT_EQ(helper.host_input_count(), runtime_launch_entry_args_plan(runtime).supported ? 0 : 1);
     auto copied = copy_launch();
     RuntimeLaunchView local;
     const auto *descriptor = local.bind(*static_cast<const KernelArgs *>(copied.data()));
@@ -310,7 +309,6 @@ TEST_F(LaunchEntryArgs, KernelSnapshotSurvivesHelperMove) {
     helper.release_run_view();
     EXPECT_FALSE(helper.launchable());
     ASSERT_TRUE(moved.runtime_args_published());
-    ASSERT_EQ(moved.host_input_count(), runtime_launch_entry_args_plan(runtime).supported ? 0 : 1);
     EXPECT_EQ(moved.runtime_launch_bytes(), runtime_device_launch_size(runtime));
     DeviceRuntimeLaunchDesc snapshot{};
     std::memcpy(&snapshot, moved.runtime_launch_data(), moved.runtime_launch_bytes());
@@ -322,34 +320,41 @@ TEST_F(LaunchEntryArgs, KernelSnapshotSurvivesHelperMove) {
 TEST_F(LaunchEntryArgs, MisalignedRtsDescriptorGetsAnAlignedPrivateViewWithoutRewritingItsSource) {
     runtime.set_worker_count(7);
     runtime.set_aicpu_thread_num(3);
-    constexpr size_t bytes = RUNTIME_LAUNCH_DESCRIPTOR_BYTES;
-    alignas(64) std::array<unsigned char, bytes + 64> packet{};
-    auto *source = packet.data() + 8;
+    ASSERT_EQ(prepare_kernel(), 0);
+    ASSERT_EQ(publish(true), 0);
+    const auto copy = copy_launch();
+    std::vector<RtsLaunchCopy::Block> storage((copy.bytes + 8 + 63) / 64);
+    auto *packet = reinterpret_cast<unsigned char *>(storage.data()) + 8;
+    std::memcpy(packet, copy.data(), copy.bytes);
+    const auto &header = *reinterpret_cast<const KernelArgs *>(packet);
+    const auto *source = packet + header.runtime_section.descriptor_offset;
     ASSERT_EQ(reinterpret_cast<uintptr_t>(source) % 64, 8U);
-    std::memcpy(source, &runtime.dev, bytes);
-    const auto original = packet;
     RuntimeLaunchView owner;
-    Runtime *view = owner.bind(reinterpret_cast<Runtime *>(source), bytes);
+    Runtime *view = owner.bind(header);
     ASSERT_NE(view, nullptr);
     EXPECT_NE(static_cast<void *>(view), source);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(view) % alignof(DeviceRuntimeLaunchDesc), 0U);
     EXPECT_EQ(view->get_worker_count(), 7);
     EXPECT_EQ(view->get_aicpu_thread_num(), 3);
-    EXPECT_EQ(view->dev.shared_state_addr, runtime.dev.shared_state_addr);
-    EXPECT_EQ(view->get_workers(), runtime.get_workers());
+    EXPECT_EQ(view->dev.shared_state_addr, reinterpret_cast<uint64_t>(slot.shared_state));
+    EXPECT_EQ(view->get_workers(), slot.shared_state->workers);
     view->set_worker_count(11);
-    EXPECT_EQ(packet, original);
+    EXPECT_EQ(std::memcmp(packet, copy.data(), copy.bytes), 0);
     EXPECT_EQ(runtime.get_worker_count(), 7);
 }
 
 TEST_F(LaunchEntryArgs, RuntimeViewRejectsInvalidSizesAndBorrowsProgramDescriptors) {
     RuntimeLaunchView owner;
-    EXPECT_EQ(owner.bind(nullptr, 0), nullptr);
-    EXPECT_EQ(owner.bind(nullptr, RUNTIME_LAUNCH_DESCRIPTOR_BYTES), nullptr);
-    EXPECT_EQ(owner.bind(&runtime, RUNTIME_LAUNCH_DESCRIPTOR_BYTES - 1), nullptr);
-    EXPECT_EQ(owner.bind(&runtime, RUNTIME_LAUNCH_DESCRIPTOR_BYTES + 1), nullptr);
-    EXPECT_EQ(owner.bind(&runtime, UINT32_MAX), nullptr);
-    EXPECT_EQ(owner.bind(&runtime, 0), &runtime);
+    KernelArgs header{};
+    EXPECT_EQ(owner.bind(header), nullptr);
+    header.runtime_args = &runtime;
+    for (uint32_t bytes :
+         {uint32_t(RUNTIME_LAUNCH_DESCRIPTOR_BYTES - 1), uint32_t(RUNTIME_LAUNCH_DESCRIPTOR_BYTES + 1), UINT32_MAX}) {
+        header.runtime_descriptor_bytes = bytes;
+        EXPECT_EQ(owner.bind(header), nullptr);
+    }
+    header.runtime_descriptor_bytes = 0;
+    EXPECT_EQ(owner.bind(header), &runtime);
     EXPECT_EQ(runtime.get_worker_count(), 0);
 }
 

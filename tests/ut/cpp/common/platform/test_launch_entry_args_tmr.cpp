@@ -62,14 +62,14 @@ TEST_F(LaunchEntryArgs, KernelPacketPreservesFirstInitializationAndUsesRunOwnedA
     EXPECT_EQ(rts.copies, 0);
     EXPECT_EQ(slot.runtime_args, nullptr);
     EXPECT_EQ(slot.runtime_upload_source, nullptr);
-    ASSERT_EQ(helper.host_input_count(), 0);
     auto copied = copy_launch();
     const auto &header = *static_cast<const KernelArgs *>(copied.data());
     EXPECT_EQ(header.run_result_data_base, 0u);
     EXPECT_EQ(header.run_result_epoch, 19u);
     EXPECT_EQ(header.entry_args_source, static_cast<uint32_t>(EntryArgsSource::KernelInvocation));
     EXPECT_EQ(header.entry_args_offset, 192U);
-    EXPECT_EQ(header.runtime_args, nullptr);
+    EXPECT_EQ(header.image_section.offset, 0u);
+    EXPECT_EQ(header.image_section.bytes, 0u);
     EXPECT_EQ(header.runtime_descriptor_bytes, 192U);
     EXPECT_EQ(header.runtime_section.packet_bytes, copied.bytes);
     EXPECT_EQ(header.runtime_section.descriptor_offset + header.runtime_descriptor_bytes, copied.bytes);
@@ -122,7 +122,6 @@ TEST_F(LaunchEntryArgs, KernelPacketBorrowsCallerTensorDataWithoutHostInputReloc
     ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), 0);
     ASSERT_EQ(helper.prepare_kernel_invocation(identity), 0);
     ASSERT_EQ(helper.publish_runtime_args(true, this, rts.sink, true), 0);
-    ASSERT_EQ(helper.host_input_count(), 0);
     auto copied = copy_launch();
     const auto &header = *static_cast<const KernelArgs *>(copied.data());
     const auto view = entry_view(header);

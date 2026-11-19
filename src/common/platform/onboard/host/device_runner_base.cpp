@@ -2377,7 +2377,9 @@ void DeviceRunnerBase::log_run_failure(const PreparedExecution &prepared, int rc
         "pipeline_slot=%u cid=%d chip_hash=0x%lx chip_dev=0x%lx runtime_args=%p",
         device_id_, static_cast<const void *>(this), rc, prepared.identity.run_epoch, prepared.identity.generation,
         prepared.identity.dispatch_id, prepared.pipeline_slot, cid, chip_hash, chip_dev,
-        static_cast<void *>(prepared.kernel_args.args.runtime_args)
+        prepared.kernel_args.args.runtime_descriptor_bytes == 0 ?
+            static_cast<void *>(prepared.kernel_args.args.runtime_args) :
+            nullptr
     );
 }
 
@@ -3278,16 +3280,13 @@ void DeviceRunnerBase::publish_host_phase_records_to_swimlane(uint32_t pipeline_
 // =============================================================================
 
 int DeviceRunnerBase::launch_aicpu_payload(
-    rtStream_t stream, void *args, size_t args_size, const char *kernel_name, int aicpu_num,
-    rtHostInputInfo_t *host_inputs, uint16_t host_input_count
+    rtStream_t stream, void *args, size_t args_size, const char *kernel_name, int aicpu_num
 ) {
     // For the run entry, kernel_name is host::KernelNames::RunName — the runtime
     // SO's actual exported symbol (simpler_aicpu_exec). LaunchBuiltInOp
     // dispatches via rtsLaunchCpuKernel on the cached rtFuncHandle resolved by
     // LoadAicpuOp::Init at first-time bootstrap.
-    return load_aicpu_op_.LaunchBuiltInOp(
-        stream, args, args_size, aicpu_num, kernel_name, host_inputs, host_input_count
-    );
+    return load_aicpu_op_.LaunchBuiltInOp(stream, args, args_size, aicpu_num, kernel_name);
 }
 
 int DeviceRunnerBase::finalize_common() { return finalize_common_impl(false); }

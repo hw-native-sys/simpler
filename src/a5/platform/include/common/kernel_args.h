@@ -86,8 +86,13 @@ extern "C" {
 struct KernelArgs {
     // Offset-locked front: the front-less launch protocol and the device
     // entries require runtime_args @ 0 and regs @ 8 (see static_asserts below).
-    __may_used_by_aicore__ Runtime *runtime_args{nullptr};  // Task runtime in device memory
-    uint64_t regs{0};                                       // Per-core register base address array (platform-specific)
+    union {
+        // External descriptor when runtime_descriptor_bytes is zero.
+        __may_used_by_aicore__ Runtime *runtime_args{nullptr};
+        // Inline packet's optional HBG image. Both fields are zero for TMR.
+        LaunchImageSection image_section;
+    };
+    uint64_t regs{0};  // Per-core register base address array (platform-specific)
     // Remaining 64-bit fields grouped before the 32-bit tail so the struct needs
     // no interior alignment padding. Order among these is free (device reads by
     // field name, not offset); only runtime_args/regs are offset-locked.
@@ -170,10 +175,7 @@ struct KernelArgs {
     // still classifies the entry as SIMT.
     uint32_t force_simt_anchor{0};
     uint32_t runtime_descriptor_bytes{0};
-    union {
-        const void *execution_image{nullptr};      // HBG snapshot relocated by RTS
-        RuntimeDescriptorSection runtime_section;  // TMR KernelInvocation, relative to the KernelArgs base
-    };
+    RuntimeDescriptorSection runtime_section{};
 };
 
 static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");
@@ -197,7 +199,7 @@ static_assert(
 static_assert(offsetof(KernelArgs, graph_section_offset) == 156, "KernelArgs::graph_section_offset offset drift");
 static_assert(offsetof(KernelArgs, entry_cache_maintenance) == 168, "entry cache policy offset drift");
 static_assert(offsetof(KernelArgs, force_simt_anchor) == 172, "SIMT anchor offset drift");
-static_assert(offsetof(KernelArgs, execution_image) == 184, "HBG execution image offset drift");
+static_assert(offsetof(KernelArgs, runtime_section) == 184, "runtime descriptor section offset drift");
 static_assert(sizeof(KernelArgs) == 192, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so

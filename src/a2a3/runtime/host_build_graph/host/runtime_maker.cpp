@@ -444,7 +444,6 @@ static void release_run_tensor_leases(Runtime *runtime, const HostApi *api) {
 
 namespace {
 
-
 bool write_all_bytes(int fd, const uint8_t *data, size_t size) {
     size_t total = 0;
     while (total < size) {

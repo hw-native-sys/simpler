@@ -172,11 +172,11 @@ public:
     void record(Model &model) {
         check(aclmdlRICaptureBegin(caller, ACL_MODEL_RI_CAPTURE_MODE_GLOBAL), "capture-begin");
         check(simpler_submit_run_on_stream(context, model.run, caller), "capture-submit");
-        if (tmr) require(last_launch_has_inline_tmr_runtime(), "inline-runtime-without-host-input");
+        require(last_launch_has_inline_runtime(), "inline-runtime-without-host-input");
         model.image_address = last_runtime_image_address();
         require(
             tmr ? last_rts_execution_image_bytes() == 0 : last_rts_execution_image_bytes() != 0,
-            "execution-image-hostinput"
+            "inline-execution-image"
         );
         check(aclmdlRICaptureEnd(caller, &model.model), "capture-end");
         require(model.model != nullptr, "model");

@@ -31,6 +31,8 @@ size_t prepare_snapshot(DeviceContextHandle context, int scenario);
 void check_prepare(DeviceContextHandle context, int scenario, size_t before);
 bool needs_publications(int scenario);
 void check_publications(int scenario, const CapturedSubmission &submission);
+void release_boot_fault_source();
+bool record_boot_fault_prefix(const unsigned char *image_section, void *stream);
 void inject_boot_failure();
 void restore_boot_failure();
 void check_boot_failure();

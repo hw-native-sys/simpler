@@ -18,7 +18,7 @@ struct LaunchCounts {
     bool operator==(const LaunchCounts &other) const { return core == other.core && cpu == other.cpu; }
 };
 LaunchCounts launch_counts();
-bool last_launch_has_inline_tmr_runtime();
+bool last_launch_has_inline_runtime();
 uint64_t last_runtime_image_address();
 uint64_t last_rts_execution_image_bytes();
 }  // namespace simpler::capture_test

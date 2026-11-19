@@ -16,19 +16,21 @@
 #include "common/hbg_execution_image.h"
 
 template <typename Invalidate, typename Flush>
-int32_t restore_hbg_execution_image(const void *packet, Invalidate invalidate, Flush flush) {
-    if (packet == nullptr) return 0;
+int32_t restore_hbg_execution_image(const void *packet, size_t packet_bytes, Invalidate invalidate, Flush flush) {
+    if (packet == nullptr) return packet_bytes == 0 ? 0 : -1;
+    if (packet_bytes < sizeof(HbgExecutionImage) || packet_bytes > UINT32_MAX) return -1;
     HbgExecutionImage image{};
     invalidate(packet, sizeof(image));
     std::memcpy(&image, packet, sizeof(image));
-    if (image.working_address == 0 || image.bytes == 0 || image.bytes > UINT32_MAX ||
+    if (image.working_address == 0 || image.bytes == 0 || image.bytes > packet_bytes - sizeof(image) ||
         image.mutable_prefix_bytes > image.bytes ||
-        image.reference_count > (UINT32_MAX - image.bytes) / sizeof(HbgImageReference))
+        image.reference_count > (packet_bytes - sizeof(image) - image.bytes) / sizeof(HbgImageReference) ||
+        sizeof(image) + image.bytes + image.reference_count * sizeof(HbgImageReference) != packet_bytes)
         return -1;
     const auto *source = static_cast<const unsigned char *>(packet) + sizeof(image);
     auto *target = reinterpret_cast<void *>(image.working_address);
     // The scheduler passes aligned tensor descriptors to AICore callables.
-    if (image.reference_count != 0 && reinterpret_cast<uintptr_t>(source) % 64 != 0) return -1;
+    if (image.reference_count != 0 && reinterpret_cast<uintptr_t>(source) % HBG_IMAGE_ALIGNMENT != 0) return -1;
     invalidate(source, image.bytes + image.reference_count * sizeof(HbgImageReference));
     if (image.mutable_prefix_bytes != 0) {
         std::memcpy(target, source, image.mutable_prefix_bytes);

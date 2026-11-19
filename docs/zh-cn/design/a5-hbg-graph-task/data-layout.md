@@ -103,9 +103,10 @@ bindings_offset、completion_refs_offset、templates_offset、instances_offset�
 Header 的大小由当前类型定义，不另存大小字段；没有 control inbox 区。
 
 只读区域按 header、binding、completion refs、template、instance、child plan、fanin CSR、sink 排列。
-Host 将该区域按 64 B 对齐追加到紧凑 task image，并随同一个执行镜像发布。Kernel
-由 RTS 交付 `hostInput`，AICPU 在发布 READY 前将镜像恢复到 Simpler 管理的设备 arena。
-Program 和 sim 通过镜像上传路径初始化同一布局。
+Host 将该区域按 64 B 对齐追加到紧凑 task image，并随同一个执行镜像发布。板端 HBG
+Program 和 Kernel 都由 RTS 按 `argsSize` 交付整包。AICPU 按包内偏移和长度定位镜像，
+在发布 READY 前恢复可写前缀，并将引用字段指向 RTS 镜像内的对应位置。
+sim 通过镜像上传路径初始化同一布局。
 AICPU 与 AICore 以 `SchedulerWorkerContext.native_graph_address` 和
 `native_graph_bytes`（偏移 232 B 和 240 B）访问同一个只读计划。RunControl、计数器、
 完成通知与 ready queues 使用另一块 Simpler 管理的可写调度区。

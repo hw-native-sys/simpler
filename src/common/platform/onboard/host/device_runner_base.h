@@ -2022,10 +2022,7 @@ public:
      * @param aicpu_num    Number of AICPU instances to launch
      * @return 0 on success, error code on failure
      */
-    int launch_aicpu_payload(
-        rtStream_t stream, void *args, size_t args_size, const char *kernel_name, int aicpu_num,
-        rtHostInputInfo_t *host_inputs = nullptr, uint16_t host_input_count = 0
-    );
+    int launch_aicpu_payload(rtStream_t stream, void *args, size_t args_size, const char *kernel_name, int aicpu_num);
 
     /**
      * Launch an AICore kernel using the binary registered during preparation.
