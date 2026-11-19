@@ -1005,8 +1005,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         bool made_progress = false;
 #if SIMPLER_DFX
         CYCLE_COUNT_START();
-        chip_swimlane.sched_loop_count++;
+#if SIMPLER_SCHED_PROFILING
         uint64_t _t0_phase = _t0;
+#else
+        uint64_t _t0_phase = (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
+#endif
+        chip_swimlane.sched_loop_count++;
         // Per-iter lazy shared-queue snapshot: first phase emit in this iter
         // pays the atomic-load cost, subsequent emits in the same iter reuse
         // the cached value. Reset here so we re-sample exactly once per iter
@@ -1019,7 +1023,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             if (action == LoopAction::BREAK_LOOP) break;
         }
 
-#if SIMPLER_DFX
+#if SIMPLER_SCHED_PROFILING
         CYCLE_COUNT_LAP(chip_swimlane.sched_idle_cycle);
 #endif
 
@@ -1055,18 +1059,26 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         // Close the Complete phase BEFORE the async-wait poll so async-engine
         // (SDMA/RoCE/URMA/CCU) wait time lands in its own AsyncPoll bar instead
         // of folding into the Complete span.
+#if SIMPLER_SCHED_PROFILING
         if (!try_completed) {
             CYCLE_COUNT_LAP(chip_swimlane.sched_idle_cycle);
         } else {
             CYCLE_COUNT_LAP(chip_swimlane.sched_complete_cycle);
-            if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES &&
-                (chip_swimlane.phase_complete_count > 0 || chip_swimlane.phase_subretire_count > 0)) {
+        }
+#endif
+        if (try_completed && chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
+#if SIMPLER_SCHED_PROFILING
+            uint64_t complete_t1 = _t1;
+#else
+            uint64_t complete_t1 = get_sys_cnt_aicpu();
+#endif
+            if (chip_swimlane.phase_complete_count > 0 || chip_swimlane.phase_subretire_count > 0) {
                 // Complete's release_fanin pushes newly-ready consumers into the
                 // shared ready_queues[], so the end depth differs from the start.
                 int16_t phase_end_shared[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];
                 capture_phase_end_fresh(phase_end_shared);
                 chip_swimlane_aicpu_record_sched_phase(
-                    thread_idx, SchedPhaseKind::Complete, _t0_phase, _t1, chip_swimlane.sched_loop_count,
+                    thread_idx, SchedPhaseKind::Complete, _t0_phase, complete_t1, chip_swimlane.sched_loop_count,
                     chip_swimlane.phase_complete_count + chip_swimlane.phase_subretire_count,
                     /*pop_hit=*/0, /*pop_miss=*/0, phase_start_shared, phase_end_shared
                 );
@@ -1078,7 +1090,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             // Advance past the completion check even when no Complete bar was
             // emitted (both counts 0). Otherwise its wall time folds into the
             // next bar (AsyncPoll, or Dispatch when the poll is skipped).
-            _t0_phase = _t1;
+            _t0_phase = complete_t1;
         }
 #endif
 
@@ -1118,6 +1130,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             // completed this iter.
             CYCLE_COUNT_LAP(chip_swimlane.sched_async_cycle);
             if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
+#if SIMPLER_SCHED_PROFILING
+                uint64_t async_t1 = _t1;
+#else
+                uint64_t async_t1 = get_sys_cnt_aicpu();
+#endif
                 // A completing poll runs on_task_complete, which pushes
                 // newly-ready consumers into the shared ready_queues[] — so the
                 // end depth then differs from the start; a zero-completion poll
@@ -1129,13 +1146,13 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                     capture_phase_end(phase_end_shared);
                 }
                 chip_swimlane_aicpu_record_sched_phase(
-                    thread_idx, SchedPhaseKind::AsyncPoll, _t0_phase, _t1, chip_swimlane.sched_loop_count,
+                    thread_idx, SchedPhaseKind::AsyncPoll, _t0_phase, async_t1, chip_swimlane.sched_loop_count,
                     static_cast<uint32_t>(poll_result.completed), /*pop_hit=*/0, /*pop_miss=*/0, phase_start_shared,
                     phase_end_shared
                 );
                 for (int s = 0; s < CHIP_SWIMLANE_NUM_QUEUE_SHAPES; s++)
                     phase_start_shared[s] = phase_end_shared[s];
-                _t0_phase = _t1;
+                _t0_phase = async_t1;
             }
 #endif
         }
@@ -1296,7 +1313,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
 #endif
 
-#if SIMPLER_DFX
+#if SIMPLER_SCHED_PROFILING
         if (!try_pushed) {
             CYCLE_COUNT_LAP(chip_swimlane.sched_idle_cycle);
         } else {
@@ -1412,7 +1429,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                 }
             }
             SPIN_WAIT_HINT();
-#if SIMPLER_DFX
+#if SIMPLER_SCHED_PROFILING
             CYCLE_COUNT_LAP(chip_swimlane.sched_idle_cycle);
             // Idle gaps are reconstructed at post-process time from scheduler
             // phase-record spacing.

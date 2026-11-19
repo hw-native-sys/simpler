@@ -20,6 +20,10 @@ endmacro()
 a5_tmr_case(test_ccu_completion.cpp NO_OBJS LINK a5_ut_support TIMEOUT 20
     SOURCES ${A5_RUNTIME_DIR}/shared/runtime.cpp)
 
+a5_tmr_case(test_scheduler_cycle_accounting.cpp
+    NO_OBJS
+    DEFINES SIMPLER_DFX=1 SIMPLER_SCHED_PROFILING=0)
+
 a5_tmr_case(test_ready_queue_profiling.cpp
     NO_OBJS
     SOURCES
