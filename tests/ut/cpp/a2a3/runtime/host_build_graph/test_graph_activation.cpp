@@ -284,7 +284,8 @@ TEST_F(GraphRootRoutingTest, ConcurrentFinalPublicationAndReadinessRouteEveryRoo
     expect_routed_range(0, 0);
     std::atomic<bool> start{false};
     std::thread publisher([&] {
-        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+        while (!start.load(std::memory_order_acquire))
+            std::this_thread::yield();
         graph_execution_set_phase(execution, GraphExecutionPhase::MATERIALIZED);
         sched.graph_incremental_publish(execution, 4, TASK_COUNT);
     });
