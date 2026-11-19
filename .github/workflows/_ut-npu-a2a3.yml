@@ -46,7 +46,7 @@ jobs:
           system-site-packages: "true"
           source-cann: "true"
 
-      - name: Build C++ hardware unit tests (a2a3)
+      - name: Build C++ unit tests (a2a3)
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
@@ -59,7 +59,7 @@ jobs:
       # cannot fail a healthy one. It exists so a hung test reports
       # `test_comm_lifecycle (Timeout)` in five minutes instead of consuming the
       # 45-minute job budget while holding this lane's exclusive device lock.
-      - name: Run Python and C++ hardware unit tests (a2a3)
+      - name: Run unit tests (a2a3)
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
@@ -79,7 +79,7 @@ jobs:
       # building on CANN 9.x (#2333) and aicpu-mmio-probes was failing to link,
       # both unnoticed. Adding a tool now needs no workflow edit, and a tool that
       # builds but cannot run is a failure rather than a silent pass.
-      - name: Build and smoke-run tools/cann-examples
+      - name: Build and smoke-run tools/cann-examples (a2a3)
         if: inputs.include_cann_examples
         run: |
           source /usr/local/Ascend/cann/set_env.sh

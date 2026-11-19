@@ -22,16 +22,8 @@ on:
         description: Exact base SHA for the admitted PR revision.
         required: false
         type: string
-      head_sha:
-        description: Exact head SHA for GitHub-hosted PR runs.
-        required: false
-        type: string
       runs_on:
         description: JSON-encoded runs-on value.
-        required: true
-        type: string
-      setup_variant:
-        description: github or self-cpu.
         required: true
         type: string
 
@@ -49,30 +41,12 @@ jobs:
           fetch-depth: 100
           persist-credentials: false
 
-      - name: Checkout Python setup action
-        if: inputs.setup_variant == 'github'
-        uses: actions/checkout@v5
-        with:
-          repository: ${{ github.repository }}
-          ref: ${{ github.workflow_sha }}
-          path: .ci-support
-          sparse-checkout: .github/actions/setup-python
-          fetch-depth: 1
-          persist-credentials: false
-
-      - name: Set up Python
-        if: inputs.setup_variant == 'github'
-        uses: ./.ci-support/.github/actions/setup-python
-        with:
-          python-version: "3.10"
-
       - name: Verify Python >= 3.10
         run: |
           python3 -c 'import sys; print(sys.version); sys.exit(0 if sys.version_info >= (3, 10) else "CI requires Python >= 3.10")'
 
       - name: Resolve base SHA
         id: base
-        if: inputs.setup_variant == 'self-cpu'
         env:
           BASE_REPOSITORY: ${{ inputs.base_repository || github.repository }}
           BASE_SHA: ${{ inputs.base_sha }}
@@ -107,8 +81,8 @@ jobs:
       - name: Select lint build target
         id: lint-build
         env:
-          BASE_SHA: ${{ inputs.setup_variant == 'self-cpu' && steps.base.outputs.base_sha || inputs.base_sha }}
-          HEAD_SHA: ${{ inputs.setup_variant == 'self-cpu' && (inputs.ref || github.sha) || inputs.head_sha }}
+          BASE_SHA: ${{ steps.base.outputs.base_sha }}
+          HEAD_SHA: ${{ inputs.ref || github.sha }}
         run: |
           needs_build=false
 
@@ -127,18 +101,15 @@ jobs:
       - name: Find missing build and lint tools
         id: apt-packages
         if: steps.lint-build.outputs.needs_build == 'true'
-        env:
-          SETUP_VARIANT: ${{ inputs.setup_variant }}
         run: |
-          if [[ "$SETUP_VARIANT" == self-cpu ]] && ! command -v apt-get >/dev/null 2>&1; then
-            exit 0
-          fi
+          # A runner without apt provisions these tools itself; verification
+          # still fails if one is missing.
+          command -v apt-get >/dev/null 2>&1 || exit 0
           missing_packages=()
           command -v cmake >/dev/null 2>&1 || missing_packages+=(cmake)
           command -v ninja >/dev/null 2>&1 || missing_packages+=(ninja-build)
           command -v g++ >/dev/null 2>&1 || missing_packages+=(g++)
-          if ! command -v clang-tidy >/dev/null 2>&1 &&
-             ! { [[ "$SETUP_VARIANT" == self-cpu ]] && command -v clang-tidy-18 >/dev/null 2>&1; }; then
+          if ! command -v clang-tidy >/dev/null 2>&1 && ! command -v clang-tidy-18 >/dev/null 2>&1; then
             missing_packages+=(clang-tidy)
           fi
           echo "required-packages=${missing_packages[*]}" >> "$GITHUB_OUTPUT"
@@ -151,7 +122,7 @@ jobs:
           install-timeout-seconds: "240"
 
       - name: Verify provisioned toolchain
-        if: inputs.setup_variant == 'self-cpu' && steps.lint-build.outputs.needs_build == 'true'
+        if: steps.lint-build.outputs.needs_build == 'true'
         run: |
           command -v cmake
           command -v ninja
@@ -169,34 +140,26 @@ jobs:
           PATH="$RUNNER_TEMP/bin:$PATH" command -v clang-tidy
           PATH="$RUNNER_TEMP/bin:$PATH" clang-tidy --version
 
-      - name: Cache pip packages
-        if: inputs.setup_variant == 'github' && steps.lint-build.outputs.needs_build == 'true'
-        uses: ./.github/actions/cache-pip
-
-      - name: Install package (for clang-tidy compile databases)
-        if: inputs.setup_variant == 'github' && steps.lint-build.outputs.needs_build == 'true'
-        run: pip install --config-settings="build.targets=build_package_sim" .
-
-      - name: venv + deps
-        if: inputs.setup_variant == 'self-cpu' && steps.lint-build.outputs.needs_build == 'true'
+      - name: Set up environment
+        if: steps.lint-build.outputs.needs_build == 'true'
         uses: ./.github/actions/setup-venv
         with:
           install-torch: "false"
+          system-site-packages: "true"
           packages: >-
             --config-settings=build.targets=build_package_sim .
 
       - name: Lint-only venv
-        if: inputs.setup_variant == 'self-cpu' && steps.lint-build.outputs.needs_build != 'true'
+        if: steps.lint-build.outputs.needs_build != 'true'
         run: python3 -m venv .venv
 
       - name: Use lint venv
-        if: inputs.setup_variant == 'self-cpu'
         run: echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Run pre-commit
         env:
-          BASE_SHA: ${{ inputs.setup_variant == 'self-cpu' && steps.base.outputs.base_sha || inputs.base_sha }}
-          HEAD_SHA: ${{ inputs.setup_variant == 'self-cpu' && (inputs.ref || github.sha) || inputs.head_sha }}
+          BASE_SHA: ${{ steps.base.outputs.base_sha }}
+          HEAD_SHA: ${{ inputs.ref || github.sha }}
         run: |
           python -m pip install --retries 5 --timeout 60 "pre-commit==4.5.1"
           python -m pre_commit run --show-diff-on-failure --color=always \

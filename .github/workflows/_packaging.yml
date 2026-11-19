@@ -95,10 +95,16 @@ jobs:
           optional-packages: ${{ steps.packaging-tools.outputs.optional-packages }}
           install-timeout-seconds: "240"
 
-      - name: Install build + runtime deps in venv
+      - name: Cache pip packages
+        if: inputs.setup_variant == 'github'
+        uses: ./.github/actions/cache-pip
+
+      - name: Set up environment
         uses: ./.github/actions/setup-venv
         with:
           packages: "scikit-build-core>=0.10.0 nanobind>=2.0.0,<3 cmake>=3.20 ninja>=1.11 pytest>=6.0"
+          install-torch: ${{ inputs.setup_variant == 'github' && 'true' || 'false' }}
+          system-site-packages: ${{ inputs.setup_variant == 'self-cpu' && 'true' || 'false' }}
 
       - name: Run packaging matrix
         run: |

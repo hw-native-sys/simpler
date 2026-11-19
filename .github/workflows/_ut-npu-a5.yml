@@ -46,7 +46,7 @@ jobs:
           system-site-packages: "true"
           source-cann: "true"
 
-      - name: Run Python hardware unit tests (a5)
+      - name: Run unit tests (a5)
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           source .venv/bin/activate
@@ -64,7 +64,7 @@ jobs:
       # building on CANN 9.x (#2333) and aicpu-mmio-probes was failing to link,
       # both unnoticed. Adding a tool now needs no workflow edit, and a tool that
       # builds but cannot run is a failure rather than a silent pass.
-      - name: Build and smoke-run tools/cann-examples
+      - name: Build and smoke-run tools/cann-examples (a5)
         if: inputs.include_cann_examples
         run: |
           source /usr/local/Ascend/cann/set_env.sh

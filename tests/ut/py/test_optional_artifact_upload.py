@@ -12,7 +12,6 @@ import os
 import subprocess
 from pathlib import Path
 
-import pytest
 import yaml
 
 _ROOT = Path(__file__).resolve().parents[3]
@@ -37,14 +36,28 @@ def test_optional_uploads_load_only_after_required_steps():
             assert "steps.diagnostics.outcome == 'success'" in upload["if"], workflow
 
 
-@pytest.mark.parametrize(
-    ("workflow", "action_name", "step_id"),
-    [
-        ("_st-npu-a5.yml", "upload-diagnostics", "diagnostics"),
-        ("_pre-commit.yml", "setup-python", None),
-    ],
-)
-def test_ci_helper_checkout_works_with_an_older_pr_head(tmp_path, workflow, action_name, step_id):
+def test_upload_action_excludes_build_products_and_keeps_capture_payloads():
+    action = _yaml(_ROOT / ".github/actions/upload-diagnostics/action.yml")
+    upload = next(step for step in action["runs"]["steps"] if "upload-artifact" in step.get("uses", ""))
+    paths = [line.strip() for line in upload["with"]["path"].splitlines() if line.strip()]
+    # The caller's list comes first; a later negation is what @actions/glob
+    # applies. Capture payloads contain the bytes from the failed execution.
+    assert paths[0] == "${{ inputs.path }}"
+    assert "!**/*.o" in paths
+    assert "!**/*.bin" not in paths
+
+
+def test_a5_upload_keeps_args_dump_manifests_and_payloads_together():
+    workflow = _yaml(_ROOT / ".github/workflows/_st-npu-a5.yml")
+    steps = workflow["jobs"]["run"]["steps"]
+    upload = next(step for step in steps if step.get("uses") == _ACTION)
+    paths = upload["with"]["path"].splitlines()
+    assert "outputs/**/args_dump.json" in paths
+    assert "outputs/**/args.bin" in paths
+
+
+def test_ci_helper_checkout_works_with_an_older_pr_head(tmp_path):
+    workflow, action_name, step_id = "_st-npu-a5.yml", "upload-diagnostics", "diagnostics"
     env = {
         **os.environ,
         "GIT_CONFIG_GLOBAL": os.devnull,
@@ -89,11 +102,7 @@ def test_ci_helper_checkout_works_with_an_older_pr_head(tmp_path, workflow, acti
     assert not (workspace / relative).exists()
     doc = _yaml(_ROOT / ".github/workflows" / workflow)
     steps = next(iter(doc["jobs"].values()))["steps"]
-    prepare = next(
-        step
-        for step in steps
-        if (step_id and step.get("id") == step_id) or step.get("name") == "Checkout Python setup action"
-    )
+    prepare = next(step for step in steps if step.get("id") == step_id)
     assert prepare["with"]["ref"] == "${{ github.workflow_sha }}"
     support = workspace / prepare["with"]["path"]
     support.mkdir()
