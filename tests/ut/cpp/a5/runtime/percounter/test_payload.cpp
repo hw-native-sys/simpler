@@ -132,6 +132,8 @@ struct Fixture {
             c.sync_arrivals = region_at<PercounterStartBarrier>(base, layout.sync_arrivals_offset);
             c.cluster_index = i / 3;
             c.cluster_lane = i % 3;
+            c.cluster_count = clusters;
+            c.aiv_per_cluster = 2;
             const int type = c.cluster_lane == 0 ? 0 : 1;
             c.order = region_at<uint64_t>(base, layout.orders_offset[type]);
             c.ssbuf = &signals[i / 3];
@@ -396,7 +398,14 @@ TEST(PercounterAcquire, PartialMixClaimsCoverEveryBlockOnceAcrossActualTopologie
                 }
                 for (uint32_t count : owners)
                     EXPECT_EQ(count, 1U);
-                EXPECT_EQ(f.claim_total(0), blocks);
+                // Tickets account for every block the ticket path allocates. A
+                // sync boundary sized to its owner count allocates by rank and
+                // draws none, and records no exhaustion either: there the mask
+                // could only say the highest ranks had claimed, which is not
+                // the same as the boundary being finished.
+                const bool statically_assigned = blocks == width;
+                EXPECT_EQ(f.claim_total(0), statically_assigned ? 0U : blocks);
+                EXPECT_EQ(percounter_claim_exhausted(percounter_claim_closed(f.cfg[1], 0)), !statically_assigned);
             }
         }
     }
@@ -414,16 +423,22 @@ TEST(PercounterAcquire, ClaimPartitionsCoverRaggedTasksAndCloseOnce) {
             for (uint32_t round = 0; round <= blocks; ++round) {
                 for (uint32_t owner = 0; owner < owners; ++owner) {
                     cfg.cluster_index = owner;
-                    const uint32_t block = percounter_claim_block(cfg, 0, blocks, segment);
+                    const uint32_t block = percounter_claim_block(cfg, 0, blocks);
                     if (block < blocks) {
                         EXPECT_EQ(++seen[block], 1U);
                         ++claimed;
                     }
+                    // Every lane skipping a closed boundary offers to publish
+                    // it; repeating that must still add exactly one bit.
+                    const uint64_t closed = percounter_claim_closed(cfg, 0);
+                    if (percounter_claim_exhausted(closed)) percounter_publish_segment(cfg, 0, closed, segment);
                 }
             }
             EXPECT_EQ(claimed, blocks);
-            EXPECT_TRUE(percounter_claim_exhausted(cfg, 0));
-            EXPECT_EQ(cfg.task_claims[0].closed_sectors, PERCOUNTER_CLAIM_SECTOR_COUNT);
+            EXPECT_TRUE(percounter_claim_exhausted(percounter_claim_closed(cfg, 0)));
+            EXPECT_EQ(
+                cfg.task_claims[0].closed_sectors, PERCOUNTER_CLAIM_SECTOR_MASK | PERCOUNTER_CLAIM_SUMMARY_PUBLISHED
+            );
             EXPECT_EQ(cfg.claim_summary[segment / 64].closed, initial_closed | (uint64_t{1} << (segment % 64)));
         }
     }
@@ -847,14 +862,201 @@ TEST(PercounterAcquire, ReusedSyncMixStillWaitsForEveryNewBlock) {
 TEST(PercounterAcquire, PartitionedStartWaitsForEveryUnevenBlockPartition) {
     for (uint32_t blocks : {1U, 2U, 3U, 4U, 17U, 24U, 32U}) {
         Fixture f({task(7, blocks < 2 ? 2 : blocks, true)}, 32);
+        const PercounterSyncNotify gm{0, 0};
         for (uint32_t block = 0; block + 1 < blocks; ++block)
-            percounter_start_arrive(f.cfg[0], 0, block);
+            percounter_start_arrive(f.cfg[0], gm, 0, block);
         for (uint32_t observer = 0; observer < 4; ++observer)
-            EXPECT_FALSE(percounter_start_ready(f.cfg[0], 0, blocks, observer));
-        percounter_start_arrive(f.cfg[0], 0, blocks - 1);
+            EXPECT_FALSE(percounter_start_ready(f.cfg[0], gm, 0, blocks, observer));
+        percounter_start_arrive(f.cfg[0], gm, 0, blocks - 1);
         for (uint32_t observer = 0; observer < 4; ++observer)
-            EXPECT_TRUE(percounter_start_ready(f.cfg[0], 0, blocks, observer));
+            EXPECT_TRUE(percounter_start_ready(f.cfg[0], gm, 0, blocks, observer));
     }
+}
+
+/**
+ * One counter carries the whole cohort, so its arrival total is the block count
+ * itself and every observer reads the same register. The GM sectors stay at
+ * zero, which is what proves the two representations do not both run.
+ */
+TEST(PercounterAcquire, NotifiedStartCountsTheWholeCohortInOneRegister) {
+    for (uint32_t blocks : {2U, 3U, 4U, 17U, 24U, 32U}) {
+        Fixture f({task(7, blocks, true)}, 32);
+        uint32_t counter = 0;
+        const auto address = reinterpret_cast<uint64_t>(&counter);
+        const PercounterSyncNotify notify{address, address};
+        for (uint32_t block = 0; block + 1 < blocks; ++block)
+            percounter_start_arrive(f.cfg[0], notify, 0, block);
+        for (uint32_t observer = 0; observer < 4; ++observer)
+            EXPECT_FALSE(percounter_start_ready(f.cfg[0], notify, 0, blocks, observer));
+        percounter_start_arrive(f.cfg[0], notify, 0, blocks - 1);
+        EXPECT_EQ(counter, blocks);
+        for (uint32_t observer = 0; observer < 4; ++observer)
+            EXPECT_TRUE(percounter_start_ready(f.cfg[0], notify, 0, blocks, observer));
+        for (const auto &sector : f.cfg[0].sync_arrivals[0].sectors)
+            EXPECT_EQ(sector.next, 0U);
+    }
+}
+
+/**
+ * Owner counts follow the reported topology, so the gate opens at exactly the
+ * width a part of that size can fill: one owner per cluster for AIC and MIX,
+ * one per AIV lane for ordinary vector work. A sync cohort is never wider --
+ * `percounter_sync_widths_fit` rejects that at the AICPU handshake -- so the
+ * equality selects the cohort that spans every owner rather than a width that
+ * happens to match the part.
+ */
+TEST(PercounterAcquire, StaticAssignmentOpensAtEachDomainsFullWidth) {
+    for (uint32_t clusters : {2U, 32U, 36U}) {
+        LaneConfig cfg{};
+        cfg.cluster_count = clusters;
+        cfg.aiv_per_cluster = 2;
+        const uint32_t cluster_wide = clusters;
+        const uint32_t lane_wide = clusters * 2;
+        EXPECT_TRUE(percounter_claim_is_static(cfg, 0, false, true, cluster_wide));
+        EXPECT_TRUE(percounter_claim_is_static(cfg, 1, true, true, cluster_wide));
+        EXPECT_TRUE(percounter_claim_is_static(cfg, 1, false, true, lane_wide));
+        // Filling one domain does not fill the other.
+        EXPECT_FALSE(percounter_claim_is_static(cfg, 1, false, true, cluster_wide));
+        EXPECT_FALSE(percounter_claim_is_static(cfg, 0, false, true, lane_wide));
+        // A narrower cohort keeps the ticket path, which is what places its
+        // blocks on whichever owners reach the boundary first.
+        for (uint32_t blocks : {1U, cluster_wide - 1, lane_wide - 1})
+            EXPECT_FALSE(percounter_claim_is_static(cfg, 1, false, true, blocks));
+        // Ordinary work draws tickets at every width.
+        EXPECT_FALSE(percounter_claim_is_static(cfg, 0, false, false, cluster_wide));
+        EXPECT_FALSE(percounter_claim_is_static(cfg, 1, false, false, lane_wide));
+    }
+}
+
+/**
+ * A full-width cohort's owners partition its blocks: every owner takes one,
+ * every block is taken once, and the sectors end closed. The four highest ranks
+ * carry the four sector bits and are distinct in their sector because four
+ * consecutive ranks are; a sector no block reaches is seeded closed by the
+ * Host, which has no owner to issue its bit.
+ */
+TEST(PercounterAcquire, FullWidthOwnersPartitionTheirCohortsBlocks) {
+    struct Domain {
+        uint32_t list;
+        bool mix;
+        uint32_t owners_per_cluster;
+    };
+    for (uint32_t clusters : {2U, 32U, 36U})
+        for (const Domain domain : {Domain{0, false, 1}, Domain{1, true, 1}, Domain{1, false, 2}}) {
+            const uint32_t blocks = clusters * domain.owners_per_cluster;
+            std::vector<PercounterTaskClaim> claims(1);
+            LaneConfig cfg{};
+            cfg.cluster_count = clusters;
+            cfg.aiv_per_cluster = 2;
+            cfg.task_claims = claims.data();
+            ASSERT_TRUE(percounter_claim_is_static(cfg, domain.list, domain.mix, true, blocks));
+            std::vector<uint32_t> taken(blocks, 0);
+            for (uint32_t cluster = 0; cluster < clusters; ++cluster)
+                for (uint32_t lane = 0; lane < domain.owners_per_cluster; ++lane) {
+                    cfg.cluster_index = static_cast<int32_t>(cluster);
+                    cfg.cluster_lane = static_cast<int32_t>(lane + 1);
+                    const uint32_t block = percounter_claim_static_block(cfg, domain.list, domain.mix, blocks);
+                    ASSERT_LT(block, blocks);
+                    ++taken[block];
+                }
+            for (uint32_t count : taken)
+                EXPECT_EQ(count, 1U);
+            // Assignment writes nothing. Exhaustion would claim the boundary was
+            // finished once its highest ranks had claimed, which is false while a
+            // lower rank still holds a reserved block, so no reader may ask it.
+            EXPECT_EQ(percounter_claim_closed(cfg, 0), 0U);
+            EXPECT_FALSE(percounter_claim_exhausted(percounter_claim_closed(cfg, 0)));
+        }
+}
+
+/**
+ * The publication floor is the rank of the oldest boundary this lane may still
+ * claim from, and peers act on it: a lane enters a younger cohort only above
+ * its own floor, and a MIX coordinator whose floor reaches the end publishes
+ * `publication_closed`. A boundary this lane still owes a block to must hold
+ * the floor down.
+ *
+ * Exhaustion cannot answer that on a statically assigned boundary: it is a
+ * statement about other owners, and this lane's block is reserved for it alone.
+ * The floor must ignore the mask there even when the mask is complete.
+ */
+TEST(PercounterAcquire, FloorHoldsAtAStaticBoundaryThisLaneStillOwes) {
+    constexpr uint32_t kClusters = 8;
+    Fixture f({task(1, kClusters, true)}, kClusters);
+    auto &cfg = f.cfg[0];
+    ASSERT_EQ(cfg.cluster_lane, 0);
+    ASSERT_EQ(cfg.cluster_index, 0);
+    const uint32_t segment = f.control->first_boundary_segment[0];
+    ASSERT_NE(segment, PERCOUNTER_NO_BOUNDARY);
+    ASSERT_TRUE(percounter_claim_is_static(cfg, 0, false, true, kClusters));
+    const uint32_t boundary_rank =
+        cfg.metadata[static_cast<uint32_t>(cfg.segments[segment].task_shape)].global_order_id;
+    EXPECT_EQ(percounter_source_floor(cfg, f.state[0].source, false), boundary_rank);
+
+    // Every other owner takes its reserved block. Assignment records no
+    // exhaustion, so force the mask complete by hand: the floor must still hold,
+    // because rank 0 has not scanned the boundary and block 0 is its alone.
+    LaneConfig owner = cfg;
+    for (uint32_t rank = 1; rank < kClusters; ++rank) {
+        owner.cluster_index = static_cast<int32_t>(rank);
+        EXPECT_EQ(percounter_claim_static_block(owner, 0, false, kClusters), rank);
+    }
+    EXPECT_EQ(percounter_claim_closed(cfg, segment), 0U);
+    cfg.task_claims[segment].closed_sectors = PERCOUNTER_CLAIM_SECTOR_MASK;
+    ASSERT_TRUE(percounter_claim_exhausted(percounter_claim_closed(cfg, segment)));
+
+    EXPECT_EQ(percounter_source_floor(cfg, f.state[0].source, false), boundary_rank);
+
+    // Claiming is what releases the floor, and the claim cursor passing the
+    // boundary is what records it -- a lane that owns no block there passes it
+    // the same way.
+    f.state[0].source.segment = segment + 1;
+    EXPECT_EQ(percounter_source_floor(cfg, f.state[0].source, false), UINT32_MAX);
+}
+
+TEST(PercounterPayload, NotifyTableCarriesOnlyTheMappedSetAddress) {
+    const std::vector<TaskInput> inputs{task(1, 2, true), task(1, 2, true), task(1, 2, true)};
+    const uint64_t counts[2]{inputs.size(), 0};
+    PercounterLayout layout{};
+    ASSERT_TRUE(plan_layout(inputs.size(), 6, 0, counts, &layout, 0, inputs.size(), inputs.size()));
+    std::vector<uint8_t> storage(layout.upload_size + 127);
+    const auto address = (reinterpret_cast<uintptr_t>(storage.data()) + 127) & ~uintptr_t{127};
+    auto *base = reinterpret_cast<void *>(address);
+    // The slot's ADD alias is a fixed displacement of its SET address, so an
+    // address the alias rule rejects is an unmapped cohort and is published as
+    // zero; the table never carries the alias itself.
+    const uint64_t first = UINT64_C(0x8000'0000);
+    const std::array<uint64_t, 3> sets{first, 0, first + 8};
+    ExternalAddresses external{};
+    external.sync_notify = sets.data();
+    external.sync_notify_count = sets.size();
+    ASSERT_TRUE(build_tables(inputs.data(), inputs.size(), layout, base, address, 2, external));
+    const auto *table = region_at<uint64_t>(base, layout.sync_notify_offset);
+    EXPECT_EQ(table[0], first);
+    EXPECT_EQ(table[1], 0U);
+    EXPECT_EQ(table[2], 0U);
+    for (uint64_t entry : {table[0], table[1], table[2]})
+        EXPECT_EQ(percounter_notify_add_address(entry), a5_cnt_notify_increment_address(entry));
+}
+
+TEST(PercounterAcquire, NotifySlotCostsOneLoadPerCohort) {
+    Fixture f({task(1, 2, true)});
+    auto &cfg = f.cfg[0];
+    std::array<uint64_t, 3> table{UINT64_C(0x8000'0000), 0, UINT64_C(0x8000'0040)};
+    cfg.sync_notify = table.data();
+    for (uint32_t cohort = 0; cohort < table.size(); ++cohort) {
+        const auto notify = percounter_sync_notify(cfg, &f.state[0], cohort);
+        EXPECT_EQ(notify.read_address, table[cohort]);
+        // An unmapped cohort keeps a zero pair, which is what selects the GM
+        // arrival sectors.
+        EXPECT_EQ(notify.add_address, table[cohort] == 0 ? 0 : table[cohort] + 8);
+        EXPECT_EQ(f.state[0].notify_sync, cohort);
+    }
+    // A repeated probe of the cached cohort reads nothing: clearing the table
+    // entry underneath it cannot change what it returns.
+    table[2] = 0;
+    EXPECT_EQ(percounter_sync_notify(cfg, &f.state[0], 2).add_address, UINT64_C(0x8000'0048));
+    EXPECT_EQ(percounter_sync_notify(cfg, &f.state[0], PERCOUNTER_NO_SYNC).add_address, 0U);
 }
 
 TEST(PercounterPayload, GraphInvocationsKeepDeviceArgumentsDistinctAcrossBlocks) {
@@ -1128,24 +1330,35 @@ TEST(PercounterAcquire, PublicationBoundariesKeepSeparateOrderedDomains) {
                     for (uint32_t part = 0; part < PERCOUNTER_CLAIM_SECTOR_COUNT; ++part)
                         claim.sectors[part].next =
                             ((shape >> 48) + PERCOUNTER_CLAIM_SECTOR_COUNT - 1 - part) / PERCOUNTER_CLAIM_SECTOR_COUNT;
-                    claim.closed_sectors = PERCOUNTER_CLAIM_SECTOR_COUNT;
+                    claim.closed_sectors = PERCOUNTER_CLAIM_SECTOR_MASK;
                     return;
                 }
             }
         }
         FAIL() << "missing boundary task " << task_id;
     };
+    // Exhaustion is a statement about every lane, and it releases a ticket
+    // boundary outright. A statically assigned boundary reserves this lane's
+    // own block, so only this lane's scan passing it releases the floor --
+    // two of the three domains here are full-width and take that rule.
+    const auto finish_scan = [&](uint32_t list) {
+        f.state[list == 0 ? 0 : 1].source.segment = f.control->segment_count[list];
+    };
     close_boundary(8);
     close_boundary(5);
     EXPECT_EQ(aic_floor(), 6U);
     EXPECT_EQ(mix_floor(), 4U);
     close_boundary(4);
+    EXPECT_EQ(aic_floor(), 6U);
+    finish_scan(0);
     EXPECT_EQ(aic_floor(), UINT32_MAX);
     close_boundary(3);
     EXPECT_EQ(aiv_floor(), 5U);
     close_boundary(2);
     EXPECT_EQ(mix_floor(), 7U);
     close_boundary(7);
+    EXPECT_EQ(mix_floor(), 7U);
+    finish_scan(1);
     EXPECT_EQ(mix_floor(), UINT32_MAX);
 }
 
@@ -1279,13 +1492,25 @@ TEST(PercounterAcquire, UnifiedVectorSlotsDoNotClaimLaterMixPastFullOrdinaryWind
 TEST(PercounterAcquire, OrdinarySpanDoesNotCloseFollowingMixBoundary) {
     Fixture f({task(2), task(7)});
     const uint32_t index = f.cfg[1].segment_begin[1];
+    const auto exhausted = [&] {
+        return percounter_claim_exhausted(percounter_claim_closed(f.cfg[1], index - 1));
+    };
+    const auto summary_bit = [&] {
+        return f.cfg[1].claim_summary[index / 64].closed & (uint64_t{1} << (index % 64));
+    };
     percounter_claim(f.cfg[2], &f.state[2]);
-    EXPECT_EQ(f.cfg[1].claim_summary[index / 64].closed & (uint64_t{1} << (index % 64)), 0U);
+    EXPECT_FALSE(exhausted());
+    EXPECT_EQ(summary_bit(), 0U);
     percounter_claim(f.cfg[1], &f.state[1]);
-    EXPECT_NE(f.cfg[1].claim_summary[index / 64].closed & (uint64_t{1} << (index % 64)), 0U);
+    // Drawing the boundary's last block exhausts it. The summary bit is a skip
+    // hint that a lane adds once it reaches the boundary and finds nothing to
+    // draw, so it trails the exhaustion it reports.
+    EXPECT_TRUE(exhausted());
+    EXPECT_EQ(summary_bit(), 0U);
     EXPECT_FALSE(f.completed(1));
     EXPECT_TRUE(f.calls.empty());
     f.drain();
+    EXPECT_NE(summary_bit(), 0U);
     EXPECT_EQ(f.calls.size(), 4U);
 }
 
@@ -1306,7 +1531,14 @@ TEST(PercounterAcquire, MissingClaimClosureHintsDoNotPreventProgress) {
 TEST(PercounterAcquire, SegmentClosurePublishesEachBitOnceAcrossSummaryWords) {
     std::vector<TaskInput> tasks(70, task(1, 2));
     Fixture f(tasks);
-    f.drain();
+    // A summary bit is a skip hint added by a lane that revisits an exhausted
+    // boundary, so the last boundary's bit trails the block that exhausted it.
+    f.drain_until(
+        [&f] {
+            return f.sinks_complete() && f.cfg[0].claim_summary[1].closed == 255U;
+        },
+        "every boundary's summary bit published"
+    );
     ASSERT_EQ(f.calls.size(), 140U);
     EXPECT_EQ(f.cfg[0].claim_summary[0].closed, UINT64_MAX);
     EXPECT_EQ(f.cfg[0].claim_summary[1].closed, 255U);
@@ -1511,7 +1743,9 @@ TEST(PercounterAcquire, ConcurrentSpmdClaimsRetainOneBlockPerTaskAndCore) {
         }
         for (const uint32_t count : owners)
             EXPECT_EQ(count, 1U);
-        EXPECT_EQ(f.claim_total(0), 32U);
+        // The 32-block sync task is sized to the 32 owners, so it is assigned by
+        // rank and draws no ticket; the 64-block one still draws one per owner.
+        EXPECT_EQ(f.claim_total(0), sync ? 0U : 32U);
         EXPECT_EQ(f.claim_total(1), PERCOUNTER_PENDING_CAPACITY > 1 ? 32U : 0U);
     }
 }
@@ -1540,6 +1774,8 @@ TEST(PercounterAcquire, PartialSyncLeavesOtherOwnersAbleToClaimOrdinarySpmd) {
         earlier += percounter_order_task_id(states[core].slots[0].entry) == 2;
     }
     EXPECT_EQ(earlier, 20U);
+    // The sync task is narrower than its 32 owners, so it keeps the ticket path
+    // and its eight blocks are drawn rather than assigned.
     EXPECT_EQ(f.claim_total(0), 8U);
     EXPECT_EQ(f.claim_total(1), 20U);
     for (const auto &sector : f.cfg[0].sync_arrivals[0].sectors)
@@ -1611,7 +1847,11 @@ TEST(PercounterAcquire, PendingOrdinaryDoesNotPreventNextSyncTaskClaim) {
     Fixture f({producer, pending, task(1, 2, true)});
     for (int lane : {0, 3, 0, 3})
         f.step(lane);
-    EXPECT_EQ(f.claim_total(1), 2U);
+    // Both owners claim the sync task, which is sized to them and therefore
+    // assigned by rank rather than by ticket. No ticket is drawn and no
+    // exhaustion is recorded; the calls below are what witness both claims.
+    EXPECT_EQ(f.claim_total(1), 0U);
+    EXPECT_FALSE(percounter_claim_exhausted(percounter_claim_closed(f.cfg[0], 1)));
     for (int pass = 0; pass < 4; ++pass)
         for (int lane : {0, 3})
             f.step(lane);

@@ -206,7 +206,35 @@ static_assert(
     std::is_trivially_copyable_v<PercounterStartBarrier> && std::is_standard_layout_v<PercounterStartBarrier>
 );
 
+/**
+ * A cohort's resolved CntNotify slot, or two zeros when it uses the GM arrival
+ * sectors. The uploaded table carries only the SET/read address; a lane pairs
+ * it with its ADD alias through `percounter_notify_add_address`, so the pair
+ * costs one load rather than two and no lane invents an offset of its own.
+ */
+struct PercounterSyncNotify {
+    uint64_t read_address;
+    uint64_t add_address;
+};
+
+/**
+ * The ADD command register of a mapped slot. A5 CntNotify owns a 32-byte
+ * register slot whose ADD alias sits 8 bytes above its SET/read base; the Host
+ * publishes an address only when that alias is valid, so every nonzero entry
+ * has one. This is the same rule `a5_cnt_notify_increment_address` applies on
+ * the Host, which is why the table need not carry the result.
+ */
+inline __aicore__ uint64_t percounter_notify_add_address(uint64_t read_address) {
+    return read_address == 0 ? 0 : read_address + 8;
+}
+
 inline constexpr uint32_t PERCOUNTER_CLAIM_SECTOR_COUNT = 4;
+// `closed_sectors` is a bitmask, not a count. Bits below the publication flag
+// are owned one apiece by the owner that drew their sector's last ticket, so
+// each is added once and never carries into its neighbour. The flag names the
+// single owner that published the boundary's summary bit.
+inline constexpr uint64_t PERCOUNTER_CLAIM_SECTOR_MASK = (uint64_t{1} << PERCOUNTER_CLAIM_SECTOR_COUNT) - 1;
+inline constexpr uint64_t PERCOUNTER_CLAIM_SUMMARY_PUBLISHED = uint64_t{1} << PERCOUNTER_CLAIM_SECTOR_COUNT;
 static_assert(
     PERCOUNTER_CLAIM_SECTOR_COUNT >= 2 && (PERCOUNTER_CLAIM_SECTOR_COUNT & (PERCOUNTER_CLAIM_SECTOR_COUNT - 1)) == 0
 );
@@ -450,6 +478,9 @@ struct alignas(128) PercounterControl {
     uint64_t claim_summary_offset;
     uint64_t sync_cohort_count;
     uint64_t sync_arrivals_offset;
+    // One CntNotify SET/read address per cohort, parallel to the arrival
+    // barriers; zero where that cohort uses the GM sectors.
+    uint64_t sync_notify_offset;
     uint64_t metadata_offset;
     uint64_t metadata_ready_offset;
     uint64_t segments_offset;

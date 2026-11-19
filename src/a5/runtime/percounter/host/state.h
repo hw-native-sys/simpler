@@ -262,11 +262,34 @@ inline StateSelection select_percounter_state(
     }
     const uint64_t device_base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(device_state));
 
+    // One counter per sync cohort. The pool is shared with the sibling runtime
+    // and across runs, so the lease has to outlive the device's use of it, and
+    // the AICPU clears every register it covers before publishing READY.
+    std::vector<uint64_t> sync_notify;
+    if (sync_cohort_count != 0) {
+        SchedulerDoneNotifications notifications{};
+        if (api->acquire_scheduler_notifications(
+                SchedulerNotificationPurpose::COMPLETION_COUNTER, static_cast<size_t>(sync_cohort_count), &notifications
+            ) == 0) {
+            sync_notify = std::move(notifications.addresses);
+            if (notifications.owner != nullptr) runtime->retain_pending_resource(std::move(notifications.owner));
+        }
+        uint64_t mapped = 0;
+        for (uint64_t address : sync_notify)
+            if (a5_cnt_notify_increment_address(address) != 0) ++mapped;
+        LOG_INFO(
+            "A5 percounter: %" PRIu64 "/%" PRIu64 " sync cohorts use CntNotify, the rest use GM arrival sectors",
+            mapped, sync_cohort_count
+        );
+    }
+
     ExternalAddresses external{};
     external.graph_storage = reinterpret_cast<uint64_t>(runtime->get_gm_sm_ptr()) + device_segments.storage;
     external.graph_storage_count = task_count;
     external.callable_table = runtime->callable_entry_table_addr();
     external.callable_count = static_cast<uint64_t>(runtime->callable_table_len());
+    external.sync_notify = sync_notify.empty() ? nullptr : sync_notify.data();
+    external.sync_notify_count = static_cast<uint64_t>(sync_notify.size());
     BuildResult build{};
     const GraphPlanInput graph_plan{
         graph.templates.data(), graph.templates.size(), graph.invocations.data(), graph.invocations.size()

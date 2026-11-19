@@ -58,6 +58,24 @@ inline PercounterControl *percounter_control(Runtime *runtime) {
 }
 
 /**
+ * Clear every CntNotify register this run holds. The pool is shared with the
+ * sibling runtime and reused across runs, so a cohort's register still carries
+ * its previous holder's count until this runs. No AICore can observe READY yet.
+ *
+ * A cohort whose entry is zero uses the GM arrival sectors, which the Host
+ * zeroes in the uploaded image instead.
+ */
+inline void percounter_reset_sync_notifications(PercounterControl *control) {
+    if (control->sync_notify_offset == 0 || control->sync_cohort_count == 0) return;
+    auto *notify = percounter_region<uint64_t>(control, control->sync_notify_offset);
+    cache_invalidate_range(notify, static_cast<size_t>(control->sync_cohort_count) * sizeof(uint64_t));
+    for (uint64_t cohort = 0; cohort < control->sync_cohort_count; ++cohort) {
+        if (notify[cohort] == 0) continue;
+        *reinterpret_cast<volatile uint32_t *>(notify[cohort]) = 0;
+    }
+}
+
+/**
  * Publish the discovered topology into the control block. Leader only, after
  * every thread has handshaken its slice.
  *
@@ -102,6 +120,7 @@ percounter_post_handshake_init(Runtime *runtime, const AicoreLifecycle &lifecycl
     control->scheduler_timeout_cycles = scheduler_timeout_cycles;
     cache_flush_range(control, sizeof(*control));
     percounter_graph_prepare_init(control);
+    percounter_reset_sync_notifications(control);
     wmb();
     LOG_INFO("A5 percounter: topology %d clusters x %d AIV", aic_count, PLATFORM_AIV_CORES_PER_BLOCKDIM);
     return 0;

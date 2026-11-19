@@ -46,15 +46,39 @@ execution duration to adapt its prefetch batch. MIX claims stay single.
 
 Each list ends with one tail segment. The task-counter index is the global
 segment index minus the list index. Each boundary task reserves four 128-byte
-claim sectors and a separate 128-byte closed-sector count. Sector `p` assigns
+claim sectors and a separate 128-byte closed-sector mask. Sector `p` assigns
 block `p + ticket * 4`. An owner starts at its cluster's sector and tries the
 remaining sectors cyclically when that sector is exhausted. The final valid
-ticket of each nonempty sector increments the closed count; empty sectors are
-included in its initial value. The unique final closure publishes the segment
-summary bit. This preserves unique block assignment even when block and owner
-counts are not divisible by four. Each sync task reserves four independent 128-byte
-arrival sectors, selected by logical block index modulo four. Every nonempty
-sector must reach its expected block count before the cohort can start.
+ticket of each nonempty sector adds that sector's bit without waiting for a
+returned value; the Host carries the bits of sectors the block count cannot
+reach. A boundary holding all four bits is exhausted. Its segment summary bit
+is added afterwards by a lane that reads the full mask while skipping the
+boundary, and a compare-exchange on a flag above the sector bits names that
+single publisher, so the add never carries into the neighbouring segment's
+position. This preserves unique block assignment even when block and owner
+counts are not divisible by four. A sync boundary whose block count equals its
+list's eligible owner count skips the ticket entirely: block `rank` belongs to
+the owner of rank `rank`, so no owner draws and none waits on another's draw.
+No owner touches the closed-sector mask there, so such a boundary never reports
+itself exhausted and carries no segment summary bit. A mask filled by block
+assignment would complete once the owners of the highest blocks had claimed,
+stating that the boundary was finished while it still held a block reserved for
+a lower rank that had yet to scan it. Its two readers answer that question
+directly instead: a lane skips the boundary on the static verdict itself, and
+the publication floor releases it when that lane's own claim cursor passes.
+Only a full-width sync boundary qualifies: binding a block to one owner
+gives up the ticket path's freedom to place it on whichever owner arrives first,
+which a cohort taking every owner has nothing to spend and a narrower one does.
+A sync task counts its arrivals in one STARS
+CntNotify register when the Host could map one for that cohort: a block writes
+the unit-increment command and an observer reads the register once, comparing it
+against the block count. SRAM carries no same-address serialization, so one
+counter costs a reader less than four partitions do. A cohort the Host could not
+map keeps four independent 128-byte GM arrival sectors, selected by logical block
+index modulo four, where every nonempty sector must reach its expected block
+count before the cohort can start. Either way an over-arrival is permanent, and
+the entry-commitment token, the per-slot entry flag and the refusal to re-claim
+an exhausted task are what keep each block arriving once.
 Ordinary AIC, ordinary AIV and MIX sync widths are checked against their actual
 eligible owner counts. Nonempty single-block intervals reserve one ticket
 sector each, bounded by the smaller of the ordinary single-block task count
@@ -77,16 +101,19 @@ index are read after a successful task claim. This preserves typed batch
 boundaries without repeatedly decoding full metadata for exhausted tasks.
 
 Claimed intervals also publish monotone closure bits, one 128-byte summary
-sector per 64 segments. Only the draw containing the final valid block or
-final tail-interval entry adds its bit; Host initializes empty-tail bits.
-Readers can skip a closed range with one word read. An unobserved bit only
-causes ordinary counter checks. A closure bit asserts allocation, not execution,
+sector per 64 segments. The draw containing a tail interval's final entry adds
+that segment's bit; a boundary's bit is added by the lane that wins its
+publication flag and therefore trails the draw that exhausted it. Host
+initializes empty-tail bits. Readers can skip a closed range with one word
+read. An unobserved bit only causes ordinary counter checks. A closure bit asserts allocation, not execution,
 dependency completion or SSBUF publication.
 
 When the lane already holds work, an unsuccessful atomic draw returns control
-to servicing those candidates before another draw. An empty lane can continue
-through exhausted intervals immediately. There is no timing budget or change
-to which task an empty position may acquire.
+to servicing those candidates before another draw, and advances its scan past
+that boundary: a draw fails only once every sector reports its tickets issued,
+which is exactly when every block of the boundary has an owner. An empty lane
+can continue through exhausted intervals immediately. There is no timing budget
+or change to which task an empty position may acquire.
 
 ## Shared record lifetime
 
@@ -112,7 +139,7 @@ The Host records the first and next relevant boundary for three startup domains:
 ordinary AIC sync, ordinary AIV sync and MIX. These indexes reside in the existing
 control and task-metadata storage; they are not task-acquisition lists. Each
 publication cursor caches its open boundary's block count, rank and successor.
-Repeated checks read only that task's closed-sector count. Once all blocks are claimed,
+Repeated checks read only that task's closed-sector mask. Once all blocks are claimed,
 the cursor follows the successor directly, independently of the fresh-task cursor
 and execution completion. Graph-body indexes are available before materialization.
 Each participant then publishes an irrevocable `enter_ready` token for the
@@ -120,9 +147,13 @@ current generation, identified locally by candidate, entry and generation.
 Pure ordinary ready work can still run while that commitment waits. For sync
 tasks, a block contributes one start arrival after its entry commitments; all
 blocks must arrive before any enters its kernel. For a MIX block, its lowest active
-lane observes the global arrival sectors and publishes start_ready with the
+lane observes the cohort's arrival count and publishes start_ready with the
 record generation. Other members consume that SSBUF notification. The local
-idle handshake still gates execution.
+idle handshake still gates execution. The uploaded table carries one address
+per cohort, the register's SET/read address; its ADD alias is a fixed
+displacement of that address, so a lane resolves the whole slot with one load,
+once per cohort it visits, and a repeated readiness probe reads no table at
+all.
 
 Once these entry conditions hold, each MIX participant finishes its current
 ordinary kernel and publishes `enter_idle` for the generation. This second
@@ -284,8 +315,13 @@ component; Graph-sink contributions also update the shell's separate counter.
 
 Claimed tasks remain in their fixed owned slots until physical retirement.
 A retired slot's counter index is acquisition bookkeeping, not an additional
-claimed block or a receiver task copy. Publication-floor cursors advance only
-when their relevant task counters close, independently of the new-task cursor.
+claimed block or a receiver task copy. A publication-floor cursor advances past
+a boundary only once this lane can no longer claim from it, which a ticket
+boundary proves by exhausting its sectors and a statically assigned one by this
+lane's new-task cursor having passed it — that cursor passes a boundary only
+after this lane has taken the block reserved for it, or established that it owns
+none there. Exhaustion is the weaker fact on a static boundary and is not
+available on it; the floor never uses the two interchangeably.
 An unready task is not evicted into a GM pending queue. A record for a kernel
 that has already returned holds only its deferred completion conditions; it is
 not another unstarted scheduling candidate.

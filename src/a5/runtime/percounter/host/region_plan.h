@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "dispatch_payload.h"
+#include "host/scheduler_notification_address.h"
 #include "resource_order.h"
 #include "scheduler/wire_types.h"
 #include "scheduler/profiling_types.h"
@@ -72,6 +73,7 @@ struct PercounterLayout {
     uint64_t ticket_interval_count;
     uint64_t sync_cohort_count;
     uint64_t sync_arrivals_offset;
+    uint64_t sync_notify_offset;
     uint64_t metadata_offset;
     uint64_t metadata_ready_offset;
     uint64_t segments_offset;
@@ -161,6 +163,11 @@ struct ExternalAddresses {
     uint64_t graph_storage_count = 0;
     uint64_t callable_table = 0;
     uint64_t callable_count = 0;
+    // One CntNotify SET/read address per sync cohort, in cohort order, or null
+    // to leave every cohort on the GM arrival sectors. A zero entry leaves that
+    // one cohort there, which is how an exhausted pool degrades.
+    const uint64_t *sync_notify = nullptr;
+    uint64_t sync_notify_count = 0;
 };
 
 /**
@@ -240,6 +247,7 @@ inline bool plan_layout(
             (boundary_task_count + PERCOUNTER_LIST_COUNT + 63) / 64, PercounterClaimSummary, claim_summary_offset
         ) ||
         !PERCOUNTER_RESERVE(sync_cohort_count, PercounterStartBarrier, sync_arrivals_offset) ||
+        !PERCOUNTER_RESERVE(sync_cohort_count, uint64_t, sync_notify_offset) ||
         !PERCOUNTER_RESERVE(task_count, PercounterTaskMetadata, metadata_offset) ||
         !PERCOUNTER_RESERVE(task_count, uint64_t, metadata_ready_offset) ||
         !PERCOUNTER_RESERVE(boundary_task_count + PERCOUNTER_LIST_COUNT, PercounterSegment, segments_offset) ||
@@ -850,6 +858,17 @@ inline bool build_tables(
     control->claim_summary_offset = layout.claim_summary_offset;
     control->sync_cohort_count = layout.sync_cohort_count;
     control->sync_arrivals_offset = layout.sync_arrivals_offset;
+    control->sync_notify_offset = layout.sync_notify_offset;
+    auto *sync_notify = region_at<uint64_t>(base, layout.sync_notify_offset);
+    for (uint64_t cohort = 0; cohort < layout.sync_cohort_count; ++cohort) {
+        const uint64_t set =
+            external.sync_notify != nullptr && cohort < external.sync_notify_count ? external.sync_notify[cohort] : 0;
+        // A slot whose SET address is not 32-byte aligned has no ADD alias, so
+        // that cohort keeps the GM arrival sectors, as does an unmapped one.
+        // Publishing only the addresses that pass leaves the device's own
+        // alias rule total over this table.
+        sync_notify[cohort] = a5_cnt_notify_increment_address(set) == 0 ? 0 : set;
+    }
     control->metadata_offset = layout.metadata_offset;
     control->metadata_ready_offset = layout.metadata_ready_offset;
     control->segments_offset = layout.segments_offset;
@@ -888,9 +907,14 @@ inline bool build_tables(
     for (uint64_t index = 0; index < layout.boundary_task_count; ++index) {
         const uint64_t segment = index + (index >= aic_boundaries ? 1 : 0);
         const uint32_t blocks = static_cast<uint32_t>(segments[segment].task_shape >> 48);
-        // The upload prefix was zeroed above, including every claim sector.
-        claims[index].closed_sectors =
-            blocks < PERCOUNTER_CLAIM_SECTOR_COUNT ? PERCOUNTER_CLAIM_SECTOR_COUNT - blocks : 0;
+        // The upload prefix was zeroed above, including every claim sector. An
+        // empty sector has no owner to publish its bit, so it starts published;
+        // the device decides emptiness by this same count.
+        uint64_t closed = 0;
+        for (uint32_t part = 0; part < PERCOUNTER_CLAIM_SECTOR_COUNT; ++part)
+            if ((blocks + PERCOUNTER_CLAIM_SECTOR_COUNT - 1 - part) / PERCOUNTER_CLAIM_SECTOR_COUNT == 0)
+                closed |= uint64_t{1} << part;
+        claims[index].closed_sectors = closed;
     }
     control->scheduler_timeout_cycles = SCHEDULER_TIMEOUT_CYCLES;
     control->graph_storage_address = external.graph_storage;
