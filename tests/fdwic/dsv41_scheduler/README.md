@@ -13,16 +13,14 @@ experiment, not checkpoint accuracy validation. Isolated Attention and Engram
 cases run rank 0 on **one device**. Only `moe`, `layers_19_21`, and the original
 full forward run on **two devices** with real communication and deferred waits.
 
-The matrix contains 11 configurations: one initial PyPTO-lib case, two
-half-sync DSL cases, one capacity-bounded all-sync DSL case, and seven latest
-PyPTO-lib cases. The checked-in `workloads/<flavor>/source.json` manifests own
-this selection; both exporters and the run list use them.
+The seven cases are selected by `workloads/pypto_lib_latest/source.json`.
+The build, export and run commands use this model by default.
 Measurement availability and the timing contract are maintained in [RESULTS.md](RESULTS.md).
 Refresh both HBG and percounter for every case.
 
-Retain scheduler optimizations only when the sum of all 11 case means improves,
+Retain scheduler optimizations only when the sum of all seven case means improves,
 using AICore L0 wall with one warmup and ten measured rounds per case. Include
-the three communicating cases; each two-device round starts after a Device
+both communicating cases; each two-device round starts after a Device
 rendezvous and contributes the maximum of the ranks' local durations. L1/L3
 are diagnostic and do not replace this acceptance metric.
 
@@ -51,32 +49,23 @@ correctness or update its performance results; run and record those explicitly.
 
 ## Cases
 
-Layer indices are zero-based. The three source task organizations are captured separately.
-The tables in `workloads/` identify the original cuts; they are not executable
-inputs and cannot replace tensor parameters or initialization data.
+| Case | Devices | Timed work |
+| ---- | ------: | ---------- |
+| swa | 1 | Layer 0 sliding-window attention |
+| c2a_full | 1 | Layer 2 full C2A attention |
+| c1a_reindex | 1 | Layer 24 C1A index refresh |
+| c1a_reuse | 1 | Layer 21 C1A index reuse |
+| moe | 2 | Standalone native MoE with Host token-count control |
+| engram | 1 | Layer 1 Engram quantization, projection and gating |
+| layers_19_21 | 2 | Layers 19 through 21, including the encoder-to-decoder transition |
 
-| Case | Initial PyPTO-lib | DSL half | DSL all-sync | Latest PyPTO-lib | Count |
-| ---- | ----------------- | -------- | ------------ | ---------------- | ----- |
-| swa | - | - | - | yes | 1 |
-| c2a_full | yes | yes | yes | yes | 4 |
-| c1a_reindex | - | - | - | yes | 1 |
-| c1a_reuse | - | - | - | yes | 1 |
-| moe | - | yes | - | yes | 2 |
-| engram | - | - | - | yes | 1 |
-| layers_19_21 | - | - | - | yes | 1 |
-
-Initial PyPTO-lib covers C2A full. All-sync DSL covers C2A full. Half-sync DSL retains
-C2A full and MoE. Latest PyPTO-lib retains all seven selected cases.
-Latest SWA, reindex, reuse and Engram supply the remaining short-path,
-index-refresh, cache-consumer and oversized-block coverage. Standalone c2a_reuse
-and c1a_full are removed; layer20 remains inside layers_19_21. Full-forward
-sources and kernels remain necessary for real prefixes and the multi-layer case.
+Layer indices are zero-based. The six slices use the original full-forward
+prefix to produce their boundary inputs.
 
 An execution is one `(task, block, subtask)` invocation. Original scalar values,
 tensor shapes, strides, offsets, aliasing, argument directions, explicit
 dependencies, scope modes, block counts, and sync-start flags are recorded at
-the production Host submission interface. DSL case export then applies the
-selected synchronization policy below; the full-forward capture remains original. Device dispatch, ready queues,
+the production Host submission interface and preserved during replay. Device dispatch, ready queues,
 completion, MIX admission, and `defer_wait` use the unchanged production code.
 
 ## Latest native PyPTO-lib group
@@ -118,7 +107,7 @@ The selected `pypto_lib_latest/moe` inherits
 original generated `dev/hbg` `l2_moe` C++ Host orchestration, including the actual
 `get_tensor_data<int32_t>(num_tokens)` Host read. Counts and routes produced by
 communication remain device-side reads in AICore tasks. Frozen latest-MoE plans
-are rejected. Initial PyPTO-lib and DSL MoE remain fixed-input replay stress cases.
+are rejected.
 
 The native MoE case measures `72/72` tokens with one warmup and ten measured
 rounds. This suite is for scheduler performance: native MoE skips numerical
@@ -145,7 +134,7 @@ Host controls execute during graph construction, outside Device wall time.
 The other replay cases preserve device execution for their captured controls;
 they do not test dynamic Host `get_tensor_data` reads.
 
-All 11 prepared cases run with the C++ `native-runner`, standard Python and
+All seven prepared cases run with the C++ `native-runner`, standard Python and
 Simpler/CANN libraries. No PyPTO, PyPTO-lib checkout, Torch or Simpler Python
 bindings are needed during execution. Only initial native MoE input preparation
 requires CPU Torch; the numerical helpers and generated Host/kernel sources
@@ -159,7 +148,7 @@ only this case; `--reuse-bundle PATH` copies a compatible standalone bundle.
 Old Python-runner bundles must be prepared again once. Runtime execution
 validates the callable digest, input sizes and live HOST `num_tokens` argument,
 then runs the original Host callable with the supplied HBG or percounter runtime.
-The original 33 tensor arguments and 10 scalars are preserved. Each rank
+Each rank
 submits one native call per round; the former outer Python `l3_moe` ordering
 token is unnecessary with these serial per-rank submissions.
 
@@ -196,54 +185,10 @@ kernel durations: compare L1 intervals with the source forward before using a
 case to draw whole-network conclusions. Prefix timing is never included in a
 case's scalar scheduling measurements.
 
-## DSL half-SPMD sync-start policy
-
-`production/prepare.py` applies this policy automatically when exporting the
-three `pypto_lib_dsl` cases; it also exports the all-sync variant. PyPTO-lib cases retain their original flags. There
-are four groups: `pypto_lib` (initial), `pypto_lib_dsl` (half),
-`pypto_lib_dsl_all_sync64` (all up to 64), and `pypto_lib_latest` (native latest).
-
-For each case and rank, count compute submissions with `block_num > 1` as SPMD
-(one logical task, including MIX). The target is `ceil(SPMD / 2)`. Preserve all
-existing sync-start flags, then enable only enough unsynchronized tasks to reach
-the target. If existing flags already exceed half, retain them all. Candidates
-are sampled deterministically across submission order, rather than selected at
-random. Reapplying the policy does not change the plan.
-
-New flags are limited to 32 blocks for AIC/MIX and 64 blocks for pure AIV,
-matching this A5 fixture's 32 AIC / 64 AIV capacity. Oversized tasks remain
-unchanged, including MoE `dispatch_push` and the three
-`dispatch_push` tasks in layers 19–21. If insufficient tasks fit the capacity,
-the report records the actual count below the target.
-
-Export invokes `record-tool --half-sync-start INPUT FIRST_TASK LAST_TASK OUTPUT`.
-Only sync-start fields within the selected case change; the prefix, suffix,
-block counts, kernels, arguments and dependencies retain their original bytes.
-Both rank plans are processed. `case.json` records the policy, before/after
-counts, capacity exclusions and selected source task IDs per rank. The
-original files under `workloads/` remain source-capture references.
-
-Regenerate prepared bundles after updating the exporter. Existing bundles do
-not acquire this policy automatically. The standard preparation and run
-commands below produce 11 configurations by default. All-sync exports only C2A full;
-its MoE and layers 19–21 variants are outside the active matrix. Use `--sync-policy half`
-to prepare only the half-sync DSL variant, or `--sync-policy all-cap64` for
-only the all-sync DSL variant. Both PyPTO-lib groups retain their native flags.
-
-The all-sync variant uses `record-tool --all-sync-start-cap64` and enables
-every capacity-eligible multi-block compute task in the selected slice.
-The limit is inclusive: 64 for AIV, 32 for AIC/MIX. In this fixture that
-enables all 27 SPMD tasks in its C2A full case, compared with 14 in the half-sync
-C2A full case.
-Both variants retain the original flavor in `case.json` and identify the
-selected variant separately, so source workload tables and the lower-bound
-analyzers continue to use the same task identities.
-
 ## Conditional ideal lower bound
 
 The performance table uses a resource-constrained model that preserves
-`sync_start` common admission as well as data dependencies. Half-sync and
-all-sync cases have separate L1 captures and separate bounds. The older
+`sync_start` common admission as well as data dependencies. Each case uses its own L1 capture. The older
 critical-path/work-volume relaxation is only a preliminary lower bound;
 it does not describe their different common-start constraints.
 
@@ -289,8 +234,7 @@ Historical Device-wall measurements in existing reports retain their original
 labels and cannot be reused as AICore-wall reference values. A refreshed table
 must identify the runtime revision and measurement boundary for each column.
 
-Use one table, with each case followed by initial PyPTO-lib, half-sync DSL,
-all-sync DSL, then latest PyPTO-lib. Report average milliseconds with six decimal
+Use one row per native case. Report average milliseconds with six decimal
 places using the six columns in [RESULTS.md](RESULTS.md). Identify the runtime
 revisions for each measurement batch and which rows were refreshed.
 Compute the percentage as `(min(HBG, percounter) / limit - 1) * 100`
@@ -304,10 +248,8 @@ Everything specific to this workload lives in this directory:
 
 ```text
 kernels/
-  pypto_lib/manifest.json            # Function IDs, signatures, core types, source hashes
-  pypto_lib/vendor/                  # Original generated kernels and projection headers
-  pypto_lib_dsl/manifest.json
-  pypto_lib_dsl/vendor/              # Original kernels, DSL entry.cpp and device_source.hpp
+  pypto_lib_latest/                  # Full-forward registrations and kernel sources
+  native_moe/                        # Standalone MoE registrations and kernel sources
 workloads/<flavor>/
   source.json                       # Selected cuts or native descriptors
   <case>/{tasks,edges}.tsv            # Human-readable topology reference
@@ -318,19 +260,9 @@ workloads/<flavor>/
 production/                         # Native runner, capture/replay adapters, build helpers
 ```
 
-There are 131 kernel registrations for initial PyPTO-lib, 109 for PyPTO-lib-dsl,
-and 81 for the latest PyPTO-lib forward. The standalone latest MoE has 26 registrations.
-The original DSL forward is mixed: 83 registrations use 52 DSL-generated
-`entry.cpp` / `device_source.hpp` pairs under `vendor/external/`; the other 26
-use the original PTO-generated sources under `vendor/aic/` and `vendor/aiv/`
-(for example, Engram and communication/wait kernels). `external` retains the
-original registration category; these sources are now included locally.
-The DSL-generated kernels have not been replaced with PTO implementations.
-Shared sources are stored once; registrations retain their original function
-IDs, argument directions, and AIC/AIV targets. Generated source is kept verbatim
-under `vendor/`. The initial PyPTO-lib Host orchestration spans two source
-fragments, split at the transition to layers 20–39. The build concatenates
-them in manifest order to reproduce the original translation unit byte for byte.
+The full forward registers 81 kernels and standalone MoE registers 26.
+Both preserve the original function IDs, argument directions and AIC/AIV
+targets. Their plain C++ Host entry points are under `workloads/*/vendor/`.
 
 Every registration declares `async_capability` alongside its signature:
 `SYNCHRONOUS` registers no deferred completion; `DEFERRED` supplies a static
@@ -375,13 +307,8 @@ standalone native MoE callable. Python only coordinates compilation/packing
 using `simpler_setup`; PyPTO-lib, PyPTO JIT, Torch and Simpler Python bindings
 are not needed to build these sources. Initial native MoE input preparation
 uses CPU Torch; all prepared cases execute without it.
-The generated DSL C++ uses CANN headers directly; the DSL Python package is
-not needed to rebuild it.
-
 Optional controls:
 
-- `--flavor pypto_lib`, `--flavor pypto_lib_dsl`, or `--flavor pypto_lib_latest` builds one organization.
-- `--flavor all` is the default; `--flavor both` selects the initial PyPTO-lib and DSL sources.
 - `--host-only` rebuilds just the native runner and Host adapters.
 - `--runtime percounter` builds model kernels against Percounter's Context ABI.
   Keep its build directory separate from the default HBG artifacts.
@@ -392,8 +319,7 @@ Optional controls:
 
 The default build directory is `$DSV41/build/portable`. Model compilation reuses
 Simpler's existing content-addressed cache, including local/PTO header and compiler
-identities. SDK headers use the toolchain/package identity for the DSL entries,
-following the existing compiler cache policy for SDK-provided headers. Build output includes `forward/<flavor>/build.json` with compiler
+identities. Build output includes `forward/pypto_lib_latest/build.json` with compiler
 flags and kernel registrations, plus `name_map.json` for the production trace converter.
 Capture console output if exact compiler commands are needed:
 
@@ -404,7 +330,7 @@ bash "$DSV41/build.sh" --pto-isa "$PWD/build/pto-isa" > "$DSV41/build/dsv41-buil
 
 ## Prepare and run
 
-Preparation executes each included original full forward once on two A5 devices
+Preparation executes the included original full forward once on two A5 devices
 and captures its Host submissions. It generates the selected replay bundles,
 materializes their local inputs, and prepares native MoE outside the device
 reservation. Build the test-only device-start wrapper **before preparation**,
@@ -431,7 +357,6 @@ bash "$DSV41/run.sh" \
   "$DSV41_RUNTIME" "$DSV41/outputs/repro/pypto_lib_latest/swa" all 1 3
 ```
 
-Pass the same `--flavor` selection to preparation when building only a subset.
 `--cann` and `--pto-isa` select the installed SDK and PTO headers. The builder
 uses that SDK's compiler to emit and decode the device bitcode. It also retains
 the runtime root's `pto_isa_build.json`, so normal runtime pin validation still
@@ -451,7 +376,7 @@ launcher never compiles while holding devices. Native MoE `--compile-only`
 remains available with an unwrapped runtime. Single-device Attention replay
 needs no gate.
 
-To run exactly the selected 11 scenarios, including when an older prepared directory contains extra cases:
+To run exactly the seven native scenarios, including when an older prepared directory contains extra cases:
 
 ```bash
 while IFS= read -r selected; do
@@ -505,7 +430,7 @@ is `--runtime=host_build_graph`. The runner loads that runtime's subdirectory
 under the supplied library root. HBG requires reported mode 1/2; percounter
 requires reported mode 5. The result also records the selected runtime. Do not
 mix runtime components across builds. The revision recorded in [RESULTS.md](RESULTS.md)
-passed all six multi-device MoE/layers variants with percounter. Validate the
+covers the two-device native MoE and layers 19–21 cases with percounter. Validate the
 selected revision rather than carrying an older unsupported label forward;
 failed or untested runs never supply successful timing values.
 
@@ -563,14 +488,12 @@ not promise identical absolute device addresses or cache state across launches.
 Audit the generated graphs and convert L1/L3 traces with the production tools:
 
 ```bash
-for flavor in pypto_lib pypto_lib_dsl pypto_lib_latest; do
-  PYTHONPATH=.:python python3 "$DSV41/analyze.py" \
-    "$DSV41/outputs/repro/$flavor" \
-    "$DSV41/build/prepared/cases/$flavor" \
-    "$DSV41/build/prepared/capture/$flavor" \
-    "$DSV41/build/portable/forward/$flavor/name_map.json" \
-    "$DSV41/outputs/repro/report-$flavor" --convert
-done
+PYTHONPATH=.:python python3 "$DSV41/analyze.py" \
+  "$DSV41/outputs/repro/pypto_lib_latest" \
+  "$DSV41/build/prepared/cases/pypto_lib_latest" \
+  "$DSV41/build/prepared/capture/pypto_lib_latest" \
+  "$DSV41/build/portable/forward/pypto_lib_latest/name_map.json" \
+  "$DSV41/outputs/repro/report-pypto_lib_latest" --convert
 ```
 
 The report checks physical `(task, block, subtask)` invocation sets, tensor
