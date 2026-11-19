@@ -30,6 +30,8 @@ __aicore__ inline void project_qa(__gm__ int64_t* args) {
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     if (args[6] == 256) {
         project_qa<256>(args);
+    } else if (args[6] == 128) {
+        project_qa<128>(args);
     } else {
         project_qa<80>(args);
     }

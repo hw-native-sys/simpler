@@ -18,6 +18,7 @@
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
 
+
 #include "intrinsic.h"
 
 
@@ -111,14 +112,14 @@ static __aicore__ void decode_dspark_target_hidden(__gm__ float* v1, __gm__ bflo
   pto::Stride<-1, -1, -1, -1, -1> v30 = pto::Stride<-1, -1, -1, -1, -1>(v24 * v28, v28, v27, v12, v11);
   // pto: %dspark_target_hidden__iter_v1_view
   GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND> v31 = GlobalTensor<bfloat16_t, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND>(v2, v29, v30);
-  // pto: %token_inline6774__ssa_v0
+  // pto: %token_inline13055__ssa_v0
   int64_t v32 = (int64_t) v6;
   // pto: %1, %2
   if (v32 < (int64_t) v3) {
-    // pto: %hc_row_inline6775__tile
+    // pto: %hc_row_inline13056__tile
     ;
     Tile<TileType::Vec, float, 4, 5120, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v33 = Tile<TileType::Vec, float, 4, 5120, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v9, v10);
-    // pto: %hc_row_inline6775__tile
+    // pto: %hc_row_inline13056__tile
     ;
     uint64_t v34 = (uint64_t) v8;
     TASSIGN(v33, v34);
@@ -161,18 +162,18 @@ static __aicore__ void decode_dspark_target_hidden(__gm__ float* v1, __gm__ bflo
     TASSIGN(v44, v45);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     TCOLSUM(v44, v42);
-    // pto: %hc_mean_inline6776__tile
+    // pto: %hc_mean_inline13057__tile
     ;
     Tile<TileType::Vec, float, 1, 5120, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v46 = Tile<TileType::Vec, float, 1, 5120, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v11, v10);
-    // pto: %hc_mean_inline6776__tile
+    // pto: %hc_mean_inline13057__tile
     ;
     uint64_t v47 = (uint64_t) v8;
     TASSIGN(v46, v47);
     TMULS(v46, v44, v14);
-    // pto: %target_bf16_inline6777__tile
+    // pto: %target_bf16_inline13058__tile
     ;
     Tile<TileType::Vec, bfloat16_t, 1, 5120, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v48 = Tile<TileType::Vec, bfloat16_t, 1, 5120, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v11, v10);
-    // pto: %target_bf16_inline6777__tile
+    // pto: %target_bf16_inline13058__tile
     ;
     uint64_t v49 = (uint64_t) v8;
     TASSIGN(v48, v49);
@@ -234,19 +235,19 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ Tensor* dspark_target_hidden__iter_v1_tensor = reinterpret_cast<__gm__ Tensor*>(args[1]);
     __gm__ bfloat16_t* dspark_target_hidden__iter_v1 = reinterpret_cast<__gm__ bfloat16_t*>(dspark_target_hidden__iter_v1_tensor->buffer.addr) + dspark_target_hidden__iter_v1_tensor->start_offset;
 
-    // Unpack scalar: local_moe_tokens_inline6714__ssa_v0
-    union { uint64_t u64; int32_t val; } local_moe_tokens_inline6714__ssa_v0_conv;
-    local_moe_tokens_inline6714__ssa_v0_conv.u64 = args[2];
-    int32_t local_moe_tokens_inline6714__ssa_v0 = local_moe_tokens_inline6714__ssa_v0_conv.val;
+    // Unpack scalar: local_moe_tokens_inline12990__ssa_v0
+    union { uint64_t u64; int32_t val; } local_moe_tokens_inline12990__ssa_v0_conv;
+    local_moe_tokens_inline12990__ssa_v0_conv.u64 = args[2];
+    int32_t local_moe_tokens_inline12990__ssa_v0 = local_moe_tokens_inline12990__ssa_v0_conv.val;
 
-    // Unpack scalar: target_column_inline6773__ssa_v0
-    union { uint64_t u64; int64_t val; } target_column_inline6773__ssa_v0_conv;
-    target_column_inline6773__ssa_v0_conv.u64 = args[3];
-    int64_t target_column_inline6773__ssa_v0 = target_column_inline6773__ssa_v0_conv.val;
+    // Unpack scalar: target_column_inline13054__ssa_v0
+    union { uint64_t u64; int64_t val; } target_column_inline13054__ssa_v0_conv;
+    target_column_inline13054__ssa_v0_conv.u64 = args[3];
+    int64_t target_column_inline13054__ssa_v0 = target_column_inline13054__ssa_v0_conv.val;
 
-    // Extract dynamic dim: LOCAL_T_DYN
-    int64_t LOCAL_T_DYN = static_cast<int64_t>(encoder_hidden__ssa_v0_tensor->shapes[0]);
+    // Extract dynamic dim: T_DYN
+    int64_t T_DYN = static_cast<int64_t>(encoder_hidden__ssa_v0_tensor->shapes[0]);
 
     // Forward to ptoas-generated function
-    decode_dspark_target_hidden(encoder_hidden__ssa_v0, dspark_target_hidden__iter_v1, local_moe_tokens_inline6714__ssa_v0, target_column_inline6773__ssa_v0, LOCAL_T_DYN, __pypto_spmd_block_idx, __pypto_spmd_block_num);
+    decode_dspark_target_hidden(encoder_hidden__ssa_v0, dspark_target_hidden__iter_v1, local_moe_tokens_inline12990__ssa_v0, target_column_inline13054__ssa_v0, T_DYN, __pypto_spmd_block_idx, __pypto_spmd_block_num);
 }

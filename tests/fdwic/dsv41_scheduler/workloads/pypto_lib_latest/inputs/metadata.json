@@ -298,25 +298,25 @@
         "index": 22,
         "name": "window_slots",
         "shape": [
-          72
+          80
         ],
         "kind": "DEVICE",
-        "bytes": 576,
+        "bytes": 640,
         "initializer_mode": "RAW",
-        "initializer_sha256": "539fea80c782d165cab51e6b52c4acdd1f32c9a999e30eac53e1a8f670248c70",
+        "initializer_sha256": "0c4fe39786710c8d4a710e385165becb6b620df61b19eda8a40547a0b57d65ee",
         "rank_slice": 0
       },
       {
         "index": 23,
         "name": "window_indices",
         "shape": [
-          72,
+          80,
           128
         ],
         "kind": "DEVICE",
-        "bytes": 36864,
+        "bytes": 40960,
         "initializer_mode": "RAW",
-        "initializer_sha256": "7c6cbcef9ac24956b196fe49d5135d1cb0ee7e90ba402e8c413e0f662f979784",
+        "initializer_sha256": "503978e44e856e20d5ae32d3d497de1da83643b7b6079bd3a72c318a81275084",
         "rank_slice": 0
       },
       {
@@ -338,13 +338,13 @@
         "index": 25,
         "name": "compressed_cache_pool",
         "shape": [
-          48,
-          128,
+          60,
+          64,
           1,
           320
         ],
         "kind": "DEVICE",
-        "bytes": 1966080,
+        "bytes": 1228800,
         "initializer_mode": "REPEAT",
         "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
         "rank_slice": 0
@@ -353,37 +353,37 @@
         "index": 26,
         "name": "token_to_req_indices",
         "shape": [
-          72
+          80
         ],
         "kind": "DEVICE",
-        "bytes": 288,
+        "bytes": 320,
         "initializer_mode": "RAW",
-        "initializer_sha256": "5819b90cbb81303c5ea61668fb123326f973c3f19c5c2bd1d42964633738ed6f",
+        "initializer_sha256": "85ec0d89ddb62c78d946130d01f3e2944665c4eeff01b5aa73699fa9cd5b5b11",
         "rank_slice": 0
       },
       {
         "index": 27,
         "name": "position_ids",
         "shape": [
-          72
+          80
         ],
         "kind": "DEVICE",
-        "bytes": 288,
+        "bytes": 320,
         "initializer_mode": "RAW",
-        "initializer_sha256": "ca59aaaa0f1e145768e7dba210fc007dee5740c5cac9b21202966b82dcbed0b0",
+        "initializer_sha256": "56f1a4dc9b47bc1ebb629551b7b3ec87b3b9998c597adddc9fb1719ff5340e73",
         "rank_slice": 0
       },
       {
         "index": 28,
         "name": "index_cache_pool",
         "shape": [
-          48,
-          128,
+          60,
+          64,
           1,
           64
         ],
         "kind": "DEVICE",
-        "bytes": 393216,
+        "bytes": 245760,
         "initializer_mode": "REPEAT",
         "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
         "rank_slice": 0
@@ -392,13 +392,13 @@
         "index": 29,
         "name": "index_cache_scale_pool",
         "shape": [
-          48,
-          128,
+          60,
+          64,
           1,
           4
         ],
         "kind": "DEVICE",
-        "bytes": 24576,
+        "bytes": 15360,
         "initializer_mode": "REPEAT",
         "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
         "rank_slice": 0
@@ -525,24 +525,24 @@
         "index": 39,
         "name": "c2a_compressed_slots",
         "shape": [
-          72
+          80
         ],
         "kind": "DEVICE",
-        "bytes": 576,
+        "bytes": 640,
         "initializer_mode": "RAW",
-        "initializer_sha256": "1e18c486b0a4f7bed94add57c336143bb9df449b1684d74e0c99784ef8686935",
+        "initializer_sha256": "5a42ac6eedcfbd9770e3f84ee6bbebbae108640fe0629f72190b3eed381deee0",
         "rank_slice": 0
       },
       {
         "index": 40,
         "name": "c1a_compressed_slots",
         "shape": [
-          72
+          80
         ],
         "kind": "DEVICE",
-        "bytes": 576,
+        "bytes": 640,
         "initializer_mode": "RAW",
-        "initializer_sha256": "539fea80c782d165cab51e6b52c4acdd1f32c9a999e30eac53e1a8f670248c70",
+        "initializer_sha256": "0c4fe39786710c8d4a710e385165becb6b620df61b19eda8a40547a0b57d65ee",
         "rank_slice": 0
       },
       {
@@ -772,24 +772,14 @@
         "name": "recv_x_buffer__ssa_v0",
         "shape": [
           10240,
-          5120
+          5280
         ],
         "kind": "COMM",
         "offset": 512
       },
       {
         "index": 59,
-        "name": "recv_scale_buffer__ssa_v0",
-        "shape": [
-          10240,
-          160
-        ],
-        "kind": "COMM",
-        "offset": 52429312
-      },
-      {
-        "index": 60,
-        "name": "recv_weights_buffer__ssa_v0",
+        "name": "recv_routes_buffer__ssa_v0",
         "shape": [
           10240,
           8
@@ -798,17 +788,7 @@
         "offset": 54067712
       },
       {
-        "index": 61,
-        "name": "recv_routes_buffer__ssa_v0",
-        "shape": [
-          10240,
-          8
-        ],
-        "kind": "COMM",
-        "offset": 54395392
-      },
-      {
-        "index": 62,
+        "index": 60,
         "name": "data_arrived_buffer__ssa_v0",
         "shape": [
           2,
@@ -816,20 +796,20 @@
           128
         ],
         "kind": "COMM",
-        "offset": 54723072
+        "offset": 54395392
       },
       {
-        "index": 63,
+        "index": 61,
         "name": "routed_output_buffer__ssa_v0",
         "shape": [
           480,
           5120
         ],
         "kind": "COMM",
-        "offset": 54788608
+        "offset": 54460928
       },
       {
-        "index": 64,
+        "index": 62,
         "name": "combine_arrived_buffer__ssa_v0",
         "shape": [
           2,
@@ -837,10 +817,10 @@
           128
         ],
         "kind": "COMM",
-        "offset": 59703808
+        "offset": 59376128
       },
       {
-        "index": 65,
+        "index": 63,
         "name": "moe_num_tokens",
         "shape": [
           2
@@ -852,7 +832,7 @@
         "rank_slice": null
       },
       {
-        "index": 66,
+        "index": 64,
         "name": "attention_num_tokens",
         "shape": [
           2
@@ -864,7 +844,7 @@
         "rank_slice": null
       },
       {
-        "index": 67,
+        "index": 65,
         "name": "wq_a_scale",
         "shape": [
           6400,
@@ -877,7 +857,7 @@
         "rank_slice": 0
       },
       {
-        "index": 68,
+        "index": 66,
         "name": "wq_b_scale",
         "shape": [
           1600,
@@ -890,7 +870,7 @@
         "rank_slice": 0
       },
       {
-        "index": 69,
+        "index": 67,
         "name": "wkv_scale",
         "shape": [
           6400,
@@ -903,7 +883,7 @@
         "rank_slice": 0
       },
       {
-        "index": 70,
+        "index": 68,
         "name": "wo_b_scale",
         "shape": [
           10240,
@@ -916,7 +896,7 @@
         "rank_slice": 0
       },
       {
-        "index": 71,
+        "index": 69,
         "name": "index_wq_b_scale",
         "shape": [
           320,
@@ -929,7 +909,7 @@
         "rank_slice": 0
       },
       {
-        "index": 72,
+        "index": 70,
         "name": "routed_w1_scale",
         "shape": [
           409600,
@@ -942,7 +922,7 @@
         "rank_slice": 0
       },
       {
-        "index": 73,
+        "index": 71,
         "name": "routed_w2_scale",
         "shape": [
           184320,
@@ -955,7 +935,7 @@
         "rank_slice": 0
       },
       {
-        "index": 74,
+        "index": 72,
         "name": "routed_w3_scale",
         "shape": [
           409600,
@@ -968,7 +948,7 @@
         "rank_slice": 0
       },
       {
-        "index": 75,
+        "index": 73,
         "name": "shared_w1_scale",
         "shape": [
           6400,
@@ -981,7 +961,7 @@
         "rank_slice": 0
       },
       {
-        "index": 76,
+        "index": 74,
         "name": "shared_w2_scale",
         "shape": [
           2880,
@@ -994,7 +974,7 @@
         "rank_slice": 0
       },
       {
-        "index": 77,
+        "index": 75,
         "name": "shared_w3_scale",
         "shape": [
           6400,
@@ -1005,109 +985,6 @@
         "initializer_mode": "REPEAT",
         "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
         "rank_slice": 0
-      },
-      {
-        "index": 78,
-        "name": "final_norm_weight",
-        "shape": [
-          5120
-        ],
-        "kind": "DEVICE",
-        "bytes": 10240,
-        "initializer_mode": "REPEAT",
-        "initializer_sha256": "b9c205bdac187f20bf876cea369cb6032ad1bf69043b31d716b36b8defbffdf2",
-        "rank_slice": 0
-      },
-      {
-        "index": 79,
-        "name": "lm_head_weight",
-        "shape": [
-          5120,
-          129280
-        ],
-        "kind": "DEVICE",
-        "bytes": 1323827200,
-        "initializer_mode": "REPEAT",
-        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
-        "rank_slice": 0
-      },
-      {
-        "index": 80,
-        "name": "logit_row_indices",
-        "shape": [
-          16
-        ],
-        "kind": "DEVICE",
-        "bytes": 64,
-        "initializer_mode": "RAW",
-        "initializer_sha256": "d5b258c06f68cf9accebb90500dc0857fb2da7e7657167fc01e20e3b4857420d",
-        "rank_slice": 0
-      },
-      {
-        "index": 81,
-        "name": "logits",
-        "shape": [
-          16,
-          129280
-        ],
-        "kind": "DEVICE",
-        "bytes": 8273920,
-        "initializer_mode": "REPEAT",
-        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
-        "rank_slice": 0
-      },
-      {
-        "index": 82,
-        "name": "sampled_ids",
-        "shape": [
-          16,
-          8
-        ],
-        "kind": "DEVICE",
-        "bytes": 512,
-        "initializer_mode": "REPEAT",
-        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
-        "rank_slice": 0
-      },
-      {
-        "index": 83,
-        "name": "head_hidden_buffer__ssa_v0",
-        "shape": [
-          16,
-          5120
-        ],
-        "kind": "COMM",
-        "offset": 59769344
-      },
-      {
-        "index": 84,
-        "name": "head_hidden_done_buffer__ssa_v0",
-        "shape": [
-          1,
-          1
-        ],
-        "kind": "COMM",
-        "offset": 59933184
-      },
-      {
-        "index": 85,
-        "name": "head_logits_buffer__ssa_v0",
-        "shape": [
-          16,
-          129280
-        ],
-        "kind": "COMM",
-        "offset": 59933248
-      },
-      {
-        "index": 86,
-        "name": "head_logits_done_buffer__ssa_v0",
-        "shape": [
-          1,
-          1
-        ],
-        "kind": "COMM",
-        "offset": 68207168
       }
     ]
   },
@@ -1410,25 +1287,25 @@
         "index": 22,
         "name": "window_slots",
         "shape": [
-          72
+          80
         ],
         "kind": "DEVICE",
-        "bytes": 576,
+        "bytes": 640,
         "initializer_mode": "RAW",
-        "initializer_sha256": "539fea80c782d165cab51e6b52c4acdd1f32c9a999e30eac53e1a8f670248c70",
+        "initializer_sha256": "0c4fe39786710c8d4a710e385165becb6b620df61b19eda8a40547a0b57d65ee",
         "rank_slice": 1
       },
       {
         "index": 23,
         "name": "window_indices",
         "shape": [
-          72,
+          80,
           128
         ],
         "kind": "DEVICE",
-        "bytes": 36864,
+        "bytes": 40960,
         "initializer_mode": "RAW",
-        "initializer_sha256": "7c6cbcef9ac24956b196fe49d5135d1cb0ee7e90ba402e8c413e0f662f979784",
+        "initializer_sha256": "503978e44e856e20d5ae32d3d497de1da83643b7b6079bd3a72c318a81275084",
         "rank_slice": 1
       },
       {
@@ -1450,13 +1327,13 @@
         "index": 25,
         "name": "compressed_cache_pool",
         "shape": [
-          48,
-          128,
+          60,
+          64,
           1,
           320
         ],
         "kind": "DEVICE",
-        "bytes": 1966080,
+        "bytes": 1228800,
         "initializer_mode": "REPEAT",
         "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
         "rank_slice": 1
@@ -1465,37 +1342,37 @@
         "index": 26,
         "name": "token_to_req_indices",
         "shape": [
-          72
+          80
         ],
         "kind": "DEVICE",
-        "bytes": 288,
+        "bytes": 320,
         "initializer_mode": "RAW",
-        "initializer_sha256": "5819b90cbb81303c5ea61668fb123326f973c3f19c5c2bd1d42964633738ed6f",
+        "initializer_sha256": "85ec0d89ddb62c78d946130d01f3e2944665c4eeff01b5aa73699fa9cd5b5b11",
         "rank_slice": 1
       },
       {
         "index": 27,
         "name": "position_ids",
         "shape": [
-          72
+          80
         ],
         "kind": "DEVICE",
-        "bytes": 288,
+        "bytes": 320,
         "initializer_mode": "RAW",
-        "initializer_sha256": "ca59aaaa0f1e145768e7dba210fc007dee5740c5cac9b21202966b82dcbed0b0",
+        "initializer_sha256": "56f1a4dc9b47bc1ebb629551b7b3ec87b3b9998c597adddc9fb1719ff5340e73",
         "rank_slice": 1
       },
       {
         "index": 28,
         "name": "index_cache_pool",
         "shape": [
-          48,
-          128,
+          60,
+          64,
           1,
           64
         ],
         "kind": "DEVICE",
-        "bytes": 393216,
+        "bytes": 245760,
         "initializer_mode": "REPEAT",
         "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
         "rank_slice": 1
@@ -1504,13 +1381,13 @@
         "index": 29,
         "name": "index_cache_scale_pool",
         "shape": [
-          48,
-          128,
+          60,
+          64,
           1,
           4
         ],
         "kind": "DEVICE",
-        "bytes": 24576,
+        "bytes": 15360,
         "initializer_mode": "REPEAT",
         "initializer_sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
         "rank_slice": 1
@@ -1637,24 +1514,24 @@
         "index": 39,
         "name": "c2a_compressed_slots",
         "shape": [
-          72
+          80
         ],
         "kind": "DEVICE",
-        "bytes": 576,
+        "bytes": 640,
         "initializer_mode": "RAW",
-        "initializer_sha256": "1e18c486b0a4f7bed94add57c336143bb9df449b1684d74e0c99784ef8686935",
+        "initializer_sha256": "5a42ac6eedcfbd9770e3f84ee6bbebbae108640fe0629f72190b3eed381deee0",
         "rank_slice": 1
       },
       {
         "index": 40,
         "name": "c1a_compressed_slots",
         "shape": [
-          72
+          80
         ],
         "kind": "DEVICE",
-        "bytes": 576,
+        "bytes": 640,
         "initializer_mode": "RAW",
-        "initializer_sha256": "539fea80c782d165cab51e6b52c4acdd1f32c9a999e30eac53e1a8f670248c70",
+        "initializer_sha256": "0c4fe39786710c8d4a710e385165becb6b620df61b19eda8a40547a0b57d65ee",
         "rank_slice": 1
       },
       {
@@ -1884,24 +1761,14 @@
         "name": "recv_x_buffer__ssa_v0",
         "shape": [
           10240,
-          5120
+          5280
         ],
         "kind": "COMM",
         "offset": 512
       },
       {
         "index": 59,
-        "name": "recv_scale_buffer__ssa_v0",
-        "shape": [
-          10240,
-          160
-        ],
-        "kind": "COMM",
-        "offset": 52429312
-      },
-      {
-        "index": 60,
-        "name": "recv_weights_buffer__ssa_v0",
+        "name": "recv_routes_buffer__ssa_v0",
         "shape": [
           10240,
           8
@@ -1910,17 +1777,7 @@
         "offset": 54067712
       },
       {
-        "index": 61,
-        "name": "recv_routes_buffer__ssa_v0",
-        "shape": [
-          10240,
-          8
-        ],
-        "kind": "COMM",
-        "offset": 54395392
-      },
-      {
-        "index": 62,
+        "index": 60,
         "name": "data_arrived_buffer__ssa_v0",
         "shape": [
           2,
@@ -1928,20 +1785,20 @@
           128
         ],
         "kind": "COMM",
-        "offset": 54723072
+        "offset": 54395392
       },
       {
-        "index": 63,
+        "index": 61,
         "name": "routed_output_buffer__ssa_v0",
         "shape": [
           480,
           5120
         ],
         "kind": "COMM",
-        "offset": 54788608
+        "offset": 54460928
       },
       {
-        "index": 64,
+        "index": 62,
         "name": "combine_arrived_buffer__ssa_v0",
         "shape": [
           2,
@@ -1949,10 +1806,10 @@
           128
         ],
         "kind": "COMM",
-        "offset": 59703808
+        "offset": 59376128
       },
       {
-        "index": 65,
+        "index": 63,
         "name": "moe_num_tokens",
         "shape": [
           2
@@ -1964,7 +1821,7 @@
         "rank_slice": null
       },
       {
-        "index": 66,
+        "index": 64,
         "name": "attention_num_tokens",
         "shape": [
           2
@@ -1976,7 +1833,7 @@
         "rank_slice": null
       },
       {
-        "index": 67,
+        "index": 65,
         "name": "wq_a_scale",
         "shape": [
           6400,
@@ -1989,7 +1846,7 @@
         "rank_slice": 1
       },
       {
-        "index": 68,
+        "index": 66,
         "name": "wq_b_scale",
         "shape": [
           1600,
@@ -2002,7 +1859,7 @@
         "rank_slice": 1
       },
       {
-        "index": 69,
+        "index": 67,
         "name": "wkv_scale",
         "shape": [
           6400,
@@ -2015,7 +1872,7 @@
         "rank_slice": 1
       },
       {
-        "index": 70,
+        "index": 68,
         "name": "wo_b_scale",
         "shape": [
           10240,
@@ -2028,7 +1885,7 @@
         "rank_slice": 1
       },
       {
-        "index": 71,
+        "index": 69,
         "name": "index_wq_b_scale",
         "shape": [
           320,
@@ -2041,7 +1898,7 @@
         "rank_slice": 1
       },
       {
-        "index": 72,
+        "index": 70,
         "name": "routed_w1_scale",
         "shape": [
           409600,
@@ -2054,7 +1911,7 @@
         "rank_slice": 1
       },
       {
-        "index": 73,
+        "index": 71,
         "name": "routed_w2_scale",
         "shape": [
           184320,
@@ -2067,7 +1924,7 @@
         "rank_slice": 1
       },
       {
-        "index": 74,
+        "index": 72,
         "name": "routed_w3_scale",
         "shape": [
           409600,
@@ -2080,7 +1937,7 @@
         "rank_slice": 1
       },
       {
-        "index": 75,
+        "index": 73,
         "name": "shared_w1_scale",
         "shape": [
           6400,
@@ -2093,7 +1950,7 @@
         "rank_slice": 1
       },
       {
-        "index": 76,
+        "index": 74,
         "name": "shared_w2_scale",
         "shape": [
           2880,
@@ -2106,7 +1963,7 @@
         "rank_slice": 1
       },
       {
-        "index": 77,
+        "index": 75,
         "name": "shared_w3_scale",
         "shape": [
           6400,
@@ -2117,109 +1974,6 @@
         "initializer_mode": "REPEAT",
         "initializer_sha256": "620bfdaa346b088fb49998d92f19a7eaf6bfc2fb0aee015753966da1028cb731",
         "rank_slice": 1
-      },
-      {
-        "index": 78,
-        "name": "final_norm_weight",
-        "shape": [
-          5120
-        ],
-        "kind": "DEVICE",
-        "bytes": 10240,
-        "initializer_mode": "REPEAT",
-        "initializer_sha256": "b9c205bdac187f20bf876cea369cb6032ad1bf69043b31d716b36b8defbffdf2",
-        "rank_slice": 1
-      },
-      {
-        "index": 79,
-        "name": "lm_head_weight",
-        "shape": [
-          5120,
-          129280
-        ],
-        "kind": "DEVICE",
-        "bytes": 1323827200,
-        "initializer_mode": "REPEAT",
-        "initializer_sha256": "96a296d224f285c67bee93c30f8a309157f0daa35dc5b87e410b78630a09cfc7",
-        "rank_slice": 1
-      },
-      {
-        "index": 80,
-        "name": "logit_row_indices",
-        "shape": [
-          16
-        ],
-        "kind": "DEVICE",
-        "bytes": 64,
-        "initializer_mode": "RAW",
-        "initializer_sha256": "d5b258c06f68cf9accebb90500dc0857fb2da7e7657167fc01e20e3b4857420d",
-        "rank_slice": 1
-      },
-      {
-        "index": 81,
-        "name": "logits",
-        "shape": [
-          16,
-          129280
-        ],
-        "kind": "DEVICE",
-        "bytes": 8273920,
-        "initializer_mode": "REPEAT",
-        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
-        "rank_slice": 1
-      },
-      {
-        "index": 82,
-        "name": "sampled_ids",
-        "shape": [
-          16,
-          8
-        ],
-        "kind": "DEVICE",
-        "bytes": 512,
-        "initializer_mode": "REPEAT",
-        "initializer_sha256": "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119",
-        "rank_slice": 1
-      },
-      {
-        "index": 83,
-        "name": "head_hidden_buffer__ssa_v0",
-        "shape": [
-          16,
-          5120
-        ],
-        "kind": "COMM",
-        "offset": 59769344
-      },
-      {
-        "index": 84,
-        "name": "head_hidden_done_buffer__ssa_v0",
-        "shape": [
-          1,
-          1
-        ],
-        "kind": "COMM",
-        "offset": 59933184
-      },
-      {
-        "index": 85,
-        "name": "head_logits_buffer__ssa_v0",
-        "shape": [
-          16,
-          129280
-        ],
-        "kind": "COMM",
-        "offset": 59933248
-      },
-      {
-        "index": 86,
-        "name": "head_logits_done_buffer__ssa_v0",
-        "shape": [
-          1,
-          1
-        ],
-        "kind": "COMM",
-        "offset": 68207168
       }
     ]
   }

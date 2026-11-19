@@ -6,7 +6,7 @@
 // INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 // See LICENSE in the root of the software repository for the full text of the License.
 // -----------------------------------------------------------------------------------------------------------
-// MXFP8 projections: four K256 L1 slots, two K128 L0 slots, and resident scales.
+// MXFP8 projections: K256 L1 slots, K64/K128 L0 slots, and resident scales.
 #pragma once
 
 #include <pto/pto-inst.hpp>
@@ -48,35 +48,41 @@ template <int MT = 80>
 __aicore__ inline int a_addr(int slot) { return (slot % 2) * 262144 + (slot / 2) * (MT * 256); }
 template <int NT, int MT = 80, int BUFFERS = 4>
 __aicore__ inline int b_addr(int slot) { return (slot % 2) * 262144 + (BUFFERS / 2) * MT * 256 + (slot / 2) * (256 * NT); }
-template <int K, int N, int NT = 256, int MT = 80>
+template <int K, int N, int NT = 256, int MT = 80, bool WeightNZ = true>
 __aicore__ inline void load_payload(__gm__ F* a, __gm__ F* b, int k, int n, int slot) {
     AM<MT> am;
     BM<NT> bm;
     TASSIGN(am, a_addr<MT>(slot));
     TASSIGN(bm, b_addr<NT, MT, L1Slots<K, NT, MT>>(slot));
     GM<F, MT, 256, MT, K, Layout::ND> ag(a + k);
-    GM<F, 256, NT, K, N, Layout::NZ> bg(b + n * K + k * 32);
-    TLOAD(am, ag);
-    TLOAD(bm, bg);
+    if constexpr (WeightNZ) {
+        GM<F, 256, NT, K, N, Layout::NZ> bg(b + n * K + k * 32);
+        TLOAD(am, ag);
+        TLOAD(bm, bg);
+    } else {
+        GM<F, 256, NT, K, N, Layout::ND> bg(b + k * N + n);
+        TLOAD(am, ag);
+        TLOAD(bm, bg);
+    }
     set_flag(PIPE_MTE2, PIPE_MTE1, static_cast<event_t>(slot));
 }
 
-template <int K, int INNER, int NT, int MT>
+template <int K, int INNER, int NT, int MT, int InnerK = 128>
 __aicore__ inline void compute(AM<MT>& am, BM<NT>& bm, AS<K, MT>& sa, BS<K, NT>& sb, AC<NT, MT>& acc, int k) {
     constexpr int slot = INNER % L0_BUFFERS;
     wait_flag(PIPE_M, PIPE_MTE1, static_cast<event_t>(slot));
-    TileLeft<F, MT, 128, MT, 128> a;
-    TileRight<F, 128, NT, 128, NT> b;
-    TileLeftScale<S, MT, 4, MT, 4> as;
-    TileRightScale<S, 4, NT, 4, NT> bs;
+    TileLeft<F, MT, InnerK, MT, InnerK> a;
+    TileRight<F, InnerK, NT, InnerK, NT> b;
+    TileLeftScale<S, MT, InnerK / 32, MT, InnerK / 32> as;
+    TileRightScale<S, InnerK / 32, NT, InnerK / 32, NT> bs;
     TASSIGN(a, slot * 32768);
     TASSIGN(b, slot * 32768);
     TASSIGN(as, GetScaleAddr(a.data()));
     TASSIGN(bs, GetScaleAddr(b.data()));
-    TEXTRACT(a, am, 0, INNER * 128);
-    TEXTRACT(b, bm, INNER * 128, 0);
-    TEXTRACT(as, sa, 0, k / 32 + INNER * 4);
-    TEXTRACT(bs, sb, k / 32 + INNER * 4, 0);
+    TEXTRACT(a, am, 0, INNER * InnerK);
+    TEXTRACT(b, bm, INNER * InnerK, 0);
+    TEXTRACT(as, sa, 0, k / 32 + INNER * (InnerK / 32));
+    TEXTRACT(bs, sb, k / 32 + INNER * (InnerK / 32), 0);
     set_flag(PIPE_MTE1, PIPE_M, static_cast<event_t>(slot));
     wait_flag(PIPE_MTE1, PIPE_M, static_cast<event_t>(slot));
     if (k == 0 && INNER == 0) {
@@ -87,15 +93,24 @@ __aicore__ inline void compute(AM<MT>& am, BM<NT>& bm, AS<K, MT>& sa, BS<K, NT>&
     set_flag(PIPE_M, PIPE_MTE1, static_cast<event_t>(slot));
 }
 
-template <int K, int N, int NT, int MT = 80, typename Emit>
+template <int K, int N, int NT, int MT = 80, typename Emit, bool WeightNZ = true, int InnerK = 128>
 __aicore__ inline void project_emit(
     __gm__ F* a, __gm__ F* b, __gm__ S* a_scale, __gm__ S* b_scale,
     int n, Emit& emit) {
+    static_assert(InnerK == 64 || InnerK == 128);
     AS<K, MT> sa;
     BS<K, NT> sb;
     AC<NT, MT> acc;
-    TASSIGN(sa, ((L1Slots<K, NT, MT> / 2) * (MT + NT) * 256));
-    TASSIGN(sb, ((L1Slots<K, NT, MT> / 2) * (MT + NT) * 256) + MT * (K / 32));
+    constexpr int payload_bytes = (L1Slots<K, NT, MT> / 2) * (MT + NT) * 256;
+    if constexpr (payload_bytes + (MT + NT) * (K / 32) > 262144) {
+        static_assert(payload_bytes + NT * (K / 32) <= 262144);
+        static_assert(payload_bytes + MT * (K / 32) <= 262144);
+        TASSIGN(sa, 262144 + payload_bytes);
+        TASSIGN(sb, payload_bytes);
+    } else {
+        TASSIGN(sa, payload_bytes);
+        TASSIGN(sb, payload_bytes + MT * (K / 32));
+    }
     TASSIGN(acc, 0);
     acc.SetValidRow(MT);
     GM<S, MT, K / 32, MT, K / 32, Layout::MX_A_ZZ> sag(a_scale);
@@ -108,7 +123,7 @@ __aicore__ inline void project_emit(
         set_flag(PIPE_M, PIPE_MTE1, static_cast<event_t>(s));
     }
     for (int s = 0; s < L1Slots<K, NT, MT>; ++s) {
-        load_payload<K, N, NT, MT>(a, b, s * 256, n, s);
+        load_payload<K, N, NT, MT, WeightNZ>(a, b, s * 256, n, s);
     }
     for (int i = 0; i < K / 256; ++i) {
         int slot = i % L1Slots<K, NT, MT>;
@@ -117,12 +132,16 @@ __aicore__ inline void project_emit(
         BM<NT> bm;
         TASSIGN(am, a_addr<MT>(slot));
         TASSIGN(bm, b_addr<NT, MT, L1Slots<K, NT, MT>>(slot));
-        compute<K, 0, NT, MT>(am, bm, sa, sb, acc, i * 256);
-        compute<K, 1, NT, MT>(am, bm, sa, sb, acc, i * 256);
+        compute<K, 0, NT, MT, InnerK>(am, bm, sa, sb, acc, i * 256);
+        compute<K, 1, NT, MT, InnerK>(am, bm, sa, sb, acc, i * 256);
+        if constexpr (InnerK == 64) {
+            compute<K, 2, NT, MT, InnerK>(am, bm, sa, sb, acc, i * 256);
+            compute<K, 3, NT, MT, InnerK>(am, bm, sa, sb, acc, i * 256);
+        }
         if (i + L1Slots<K, NT, MT> < K / 256) {
             set_flag(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(slot));
             wait_flag(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(slot));
-            load_payload<K, N, NT, MT>(a, b, (i + L1Slots<K, NT, MT>) * 256, n, slot);
+            load_payload<K, N, NT, MT, WeightNZ>(a, b, (i + L1Slots<K, NT, MT>) * 256, n, slot);
         }
     }
     for (int s = 0; s < L0_BUFFERS; ++s) {
@@ -149,12 +168,12 @@ struct StoreOutput {
     }
 };
 
-template <int K, int N, int NT = 256, int MT = 80>
+template <int K, int N, int NT = 256, int MT = 80, bool WeightNZ = true, int InnerK = 128>
 __aicore__ inline void project(
     __gm__ F* a, __gm__ F* b, __gm__ S* a_scale, __gm__ S* b_scale,
     __gm__ bfloat16_t* output, int rows, int output_width, int n) {
     StoreOutput<NT, MT> emit{output, rows, output_width, n};
-    project_emit<K, N, NT, MT>(a, b, a_scale, b_scale, n, emit);
+    project_emit<K, N, NT, MT, StoreOutput<NT, MT>, WeightNZ, InnerK>(a, b, a_scale, b_scale, n, emit);
 }
 
 }  // namespace mxfp8_projection

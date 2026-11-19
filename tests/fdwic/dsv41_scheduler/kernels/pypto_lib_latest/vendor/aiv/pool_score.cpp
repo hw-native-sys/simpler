@@ -18,6 +18,7 @@
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
 
+
 #include "intrinsic.h"
 
 
@@ -57,300 +58,302 @@ static __aicore__ inline void PTOAS__DCCI_SINGLE_CACHE_LINE(Ptr ptr) {
   dcci((__gm__ void*)ptr, cache_line_t::SINGLE_CACHE_LINE);
 }
 
-static __aicore__ void pool_score(__gm__ float* v1, __gm__ int32_t* v2, __gm__ float* v3, int64_t v4, int64_t v5, int64_t v6, int64_t v7, int64_t v8, int64_t v9, int64_t v10, int64_t v11, int64_t v12, int64_t v13, int32_t v14, int32_t v15) {
+static __aicore__ void pool_score(__gm__ float* v1, __gm__ int32_t* v2, __gm__ float* v3, int64_t v4, int64_t v5, int64_t v6, int64_t v7, int64_t v8, int64_t v9, int64_t v10, int64_t v11, int32_t v12, int32_t v13) {
   using T = float;
 
   #if defined(__DAV_VEC__)
   set_mask_norm();
   set_vector_mask(-1, -1);
   // pto: %c0_i64
-  const int64_t v16 = 0;
+  const int64_t v14 = 0;
   // pto: %c32768_i64
-  const int64_t v17 = 32768;
+  const int64_t v15 = 32768;
   // pto: %c65536_i64
-  const int64_t v18 = 65536;
+  const int64_t v16 = 65536;
   // pto: %c1_index
-  const int64_t v19 = 1;
+  const int64_t v17 = 1;
+  // pto: %c32_index
+  const int64_t v18 = 32;
   // pto: %c0_index
-  const int64_t v20 = 0;
+  const int64_t v19 = 0;
   // pto: %c1024_index
-  const int64_t v21 = 1024;
+  const int64_t v20 = 1024;
   // pto: %c8_index
-  const int64_t v22 = 8;
-  const int64_t v23 = 8192;
-  // pto: %cst_8
-  const float v24 = 1.00000002E+30f;
-  // pto: %scores_inline6818__ssa_v0_view
+  const int64_t v21 = 8;
+  const int64_t v22 = 8192;
+  // pto: %cst_9
+  const float v23 = 1.00000002E+30f;
+  // pto: %scores_inline13099__ssa_v0_view
+  const int64_t v24 = 1;
+  // pto: %scores_inline13099__ssa_v0_view
   const int64_t v25 = 1;
-  // pto: %scores_inline6818__ssa_v0_view
+  // pto: %scores_inline13099__ssa_v0_view
   const int64_t v26 = 1;
-  // pto: %scores_inline6818__ssa_v0_view
-  const int64_t v27 = 1;
-  // pto: %scores_inline6818__ssa_v0_view
+  // pto: %scores_inline13099__ssa_v0_view
+  int64_t v27 = (int64_t) v9;
+  // pto: %scores_inline13099__ssa_v0_view
   int64_t v28 = (int64_t) v10;
-  // pto: %scores_inline6818__ssa_v0_view
-  int64_t v29 = (int64_t) v11;
-  // pto: %scores_inline6818__ssa_v0_view
-  int64_t v30 = v28 * v29;
-  // pto: %scores_inline6818__ssa_v0_view
-  int64_t v31 = v27 * v30;
-  // pto: %scores_inline6818__ssa_v0_view
-  pto::Shape<1, 1, 1, -1, -1> v32 = pto::Shape<1, 1, 1, -1, -1>(v25, v26, v27, v28, (int64_t) v11);
-  // pto: %scores_inline6818__ssa_v0_view
-  pto::Stride<-1, -1, -1, -1, -1> v33 = pto::Stride<-1, -1, -1, -1, -1>(v26 * v31, v31, v30, v29, v19);
-  // pto: %scores_inline6818__ssa_v0_view
-  GlobalTensor<float, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND> v34 = GlobalTensor<float, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND>(v1, v32, v33);
-  // pto: %block_scores_inline7013__ssa_v0_view
+  // pto: %scores_inline13099__ssa_v0_view
+  int64_t v29 = v27 * v28;
+  // pto: %scores_inline13099__ssa_v0_view
+  int64_t v30 = v26 * v29;
+  // pto: %scores_inline13099__ssa_v0_view
+  pto::Shape<1, 1, 1, -1, -1> v31 = pto::Shape<1, 1, 1, -1, -1>(v24, v25, v26, v27, (int64_t) v10);
+  // pto: %scores_inline13099__ssa_v0_view
+  pto::Stride<-1, -1, -1, -1, -1> v32 = pto::Stride<-1, -1, -1, -1, -1>(v25 * v30, v30, v29, v28, v17);
+  // pto: %scores_inline13099__ssa_v0_view
+  GlobalTensor<float, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND> v33 = GlobalTensor<float, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND>(v1, v31, v32);
+  // pto: %block_scores_inline13813__ssa_v0_view
+  const int64_t v34 = 1;
+  // pto: %block_scores_inline13813__ssa_v0_view
   const int64_t v35 = 1;
-  // pto: %block_scores_inline7013__ssa_v0_view
+  // pto: %block_scores_inline13813__ssa_v0_view
   const int64_t v36 = 1;
-  // pto: %block_scores_inline7013__ssa_v0_view
-  const int64_t v37 = 1;
-  // pto: %block_scores_inline7013__ssa_v0_view
-  int64_t v38 = (int64_t) v12;
-  // pto: %block_scores_inline7013__ssa_v0_view
-  int64_t v39 = (int64_t) v13;
-  // pto: %block_scores_inline7013__ssa_v0_view
-  int64_t v40 = v38 * v39;
-  // pto: %block_scores_inline7013__ssa_v0_view
-  int64_t v41 = v37 * v40;
-  // pto: %block_scores_inline7013__ssa_v0_view
-  pto::Shape<1, 1, 1, -1, -1> v42 = pto::Shape<1, 1, 1, -1, -1>(v35, v36, v37, v38, (int64_t) v13);
-  // pto: %block_scores_inline7013__ssa_v0_view
-  pto::Stride<-1, -1, -1, -1, -1> v43 = pto::Stride<-1, -1, -1, -1, -1>(v36 * v41, v41, v40, v39, v19);
-  // pto: %block_scores_inline7013__ssa_v0_view
-  GlobalTensor<float, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND> v44 = GlobalTensor<float, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND>(v3, v42, v43);
-  // pto: %worker_inline7018__ssa_v0
+  // pto: %block_scores_inline13813__ssa_v0_view
+  int64_t v37 = (int64_t) v9;
+  // pto: %block_scores_inline13813__ssa_v0_view
+  int64_t v38 = (int64_t) v11;
+  // pto: %block_scores_inline13813__ssa_v0_view
+  int64_t v39 = v37 * v38;
+  // pto: %block_scores_inline13813__ssa_v0_view
+  int64_t v40 = v36 * v39;
+  // pto: %block_scores_inline13813__ssa_v0_view
+  pto::Shape<1, 1, 1, -1, -1> v41 = pto::Shape<1, 1, 1, -1, -1>(v34, v35, v36, v37, (int64_t) v11);
+  // pto: %block_scores_inline13813__ssa_v0_view
+  pto::Stride<-1, -1, -1, -1, -1> v42 = pto::Stride<-1, -1, -1, -1, -1>(v35 * v40, v40, v39, v38, v17);
+  // pto: %block_scores_inline13813__ssa_v0_view
+  GlobalTensor<float, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND> v43 = GlobalTensor<float, pto::Shape<1, 1, 1, -1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND>(v3, v41, v42);
+  // pto: %worker_inline13796__ssa_v1
   set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
   set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-  for (int64_t v45 = (int64_t) v14; v45 < v4; v45 += v5) {
+  for (int64_t v44 = (int64_t) v12; v44 < v4; v44 += v18) {
     // pto: %0
     ;
-    const int64_t v46 = 1;
+    const int64_t v45 = 1;
     // pto: %0
     ;
-    const int64_t v47 = 0;
+    const int64_t v46 = 0;
     // pto: %0
     ;
-    int64_t v48 = v45 / v6;
+    int64_t v47 = v44 / v5;
     // pto: %0
     ;
-    bool v49 = v45 < v47;
+    bool v48 = v44 < v46;
     // pto: %0
     ;
-    bool v50 = v6 < v47;
+    bool v49 = v5 < v46;
     // pto: %0
     ;
-    bool v51 = v49 == v50;
+    bool v50 = v48 == v49;
     // pto: %0
     ;
-    int64_t v52 = v45 % v6 != v47 && v49 != v50 ? v48 - v46 : v48;
+    int64_t v51 = v44 % v5 != v46 && v48 != v49 ? v47 - v45 : v47;
     // pto: %1
     ;
-    int64_t v53 = v45 % v6;
+    int64_t v52 = v44 % v5;
     // pto: %5, %2, %3, %4, %6, %7, %8
     ;
-    int64_t v54 = v53 != v20 & (v53 < v20 ^ v6 < v20) ? (int64_t) ((uint64_t) v53 + (uint64_t) v6) : v53;
+    int64_t v53 = v52 != v19 & (v52 < v19 ^ v5 < v19) ? (int64_t) ((uint64_t) v52 + (uint64_t) v5) : v52;
     // pto: %9
     ;
-    if (v52 < v7) {
+    if (v51 < v6) {
       // pto: %10
       ;
-      int64_t v55 = (int64_t) ((uint64_t) v54 * (uint64_t) v21);
-      int64_t v56 = (int64_t) ((uint64_t) v54 * (uint64_t) v23);
+      int64_t v54 = (int64_t) ((uint64_t) v53 * (uint64_t) v20);
+      int64_t v55 = (int64_t) ((uint64_t) v53 * (uint64_t) v22);
       // pto: %12
       ;
-      int64_t v57 = (int64_t) ((uint64_t) v8 - (uint64_t) v55);
+      int64_t v56 = (int64_t) ((uint64_t) v7 - (uint64_t) v54);
       // pto: %13
       ;
-      int64_t v58 = v57 < v21 ? v57 : v21;
+      int64_t v57 = v56 < v20 ? v56 : v20;
       // pto: %14
       ;
-      int64_t v59 = (int64_t) ((uint64_t) v9 - (uint64_t) v56);
+      int64_t v58 = (int64_t) ((uint64_t) v8 - (uint64_t) v55);
       // pto: %15
       ;
-      int64_t v60 = v59 < v23 ? v59 : v23;
-      // pto: %raw_inline7026__ssa_v0
+      int64_t v59 = v58 < v22 ? v58 : v22;
+      // pto: %raw_inline13824__ssa_v0
       ;
-      Tile<TileType::Vec, float, 1, 8192, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v61 = Tile<TileType::Vec, float, 1, 8192, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v19, v60);
-      // pto: %raw_inline7026__ssa_v0
+      Tile<TileType::Vec, float, 1, 8192, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v60 = Tile<TileType::Vec, float, 1, 8192, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v17, v59);
+      // pto: %raw_inline13824__ssa_v0
       ;
-      uint64_t v62 = (uint64_t) v16;
-      TASSIGN(v61, v62);
+      uint64_t v61 = (uint64_t) v14;
+      TASSIGN(v60, v61);
       // pto: %16
       ;
-      int64_t v63 = v52 < v20 ? v20 : v52;
+      int64_t v62 = v51 < v19 ? v19 : v51;
       // pto: %17
       ;
-      int64_t v64 = v56 < v20 ? v20 : v56;
-      // pto: %scores_inline6818__ssa_v0_pview
+      int64_t v63 = v55 < v19 ? v19 : v55;
+      // pto: %scores_inline13099__ssa_v0_pview
       ;
-      int64_t v65 = (int64_t) v11;
-      // pto: %scores_inline6818__ssa_v0_pview
+      int64_t v64 = (int64_t) v10;
+      // pto: %scores_inline13099__ssa_v0_pview
       ;
-      const int64_t v66 = 0;
-      // pto: %scores_inline6818__ssa_v0_pview
+      const int64_t v65 = 0;
+      // pto: %scores_inline13099__ssa_v0_pview
       ;
-      __gm__ float* v67 = PTOAS__GLOBAL_TENSOR_DATA(v34);
-      // pto: %scores_inline6818__ssa_v0_pview
+      __gm__ float* v66 = PTOAS__GLOBAL_TENSOR_DATA(v33);
+      // pto: %scores_inline13099__ssa_v0_pview
+      ;
+      const int64_t v67 = 1;
+      // pto: %scores_inline13099__ssa_v0_pview
       ;
       const int64_t v68 = 1;
-      // pto: %scores_inline6818__ssa_v0_pview
+      // pto: %scores_inline13099__ssa_v0_pview
       ;
       const int64_t v69 = 1;
-      // pto: %scores_inline6818__ssa_v0_pview
+      // pto: %scores_inline13099__ssa_v0_pview
       ;
-      const int64_t v70 = 1;
-      // pto: %scores_inline6818__ssa_v0_pview
+      int64_t v70 = v17 * v64;
+      // pto: %scores_inline13099__ssa_v0_pview
       ;
-      int64_t v71 = v19 * v65;
-      // pto: %scores_inline6818__ssa_v0_pview
+      int64_t v71 = v69 * v70;
+      // pto: %scores_inline13099__ssa_v0_pview
       ;
-      int64_t v72 = v70 * v71;
-      // pto: %scores_inline6818__ssa_v0_pview
+      pto::Shape<1, 1, 1, 1, -1> v72 = pto::Shape<1, 1, 1, 1, -1>(v67, v68, v69, v17, v59);
+      // pto: %scores_inline13099__ssa_v0_pview
       ;
-      pto::Shape<1, 1, 1, 1, -1> v73 = pto::Shape<1, 1, 1, 1, -1>(v68, v69, v70, v19, v60);
-      // pto: %scores_inline6818__ssa_v0_pview
+      pto::Stride<-1, -1, -1, -1, -1> v73 = pto::Stride<-1, -1, -1, -1, -1>(v68 * v71, v71, v70, v64, v17);
+      // pto: %scores_inline13099__ssa_v0_pview
       ;
-      pto::Stride<-1, -1, -1, -1, -1> v74 = pto::Stride<-1, -1, -1, -1, -1>(v69 * v72, v72, v71, v65, v19);
-      // pto: %scores_inline6818__ssa_v0_pview
-      ;
-      GlobalTensor<float, pto::Shape<1, 1, 1, 1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND> v75 = GlobalTensor<float, pto::Shape<1, 1, 1, 1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND>(v67 + (v66 + v63 * v65 + v64 * v19), v73, v74);
+      GlobalTensor<float, pto::Shape<1, 1, 1, 1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND> v74 = GlobalTensor<float, pto::Shape<1, 1, 1, 1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND>(v66 + (v65 + v62 * v64 + v63 * v17), v72, v73);
       wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-      TLOAD(v61, v75);
+      TLOAD(v60, v74);
       set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-      // pto: %padded_inline7027__ssa_v0
+      // pto: %padded_inline13825__ssa_v0
       ;
-      Tile<TileType::Vec, float, 1, 8192, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Min, CompactMode::Null> v76 = Tile<TileType::Vec, float, 1, 8192, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Min, CompactMode::Null>(v19, v23);
-      // pto: %padded_inline7027__ssa_v0
+      Tile<TileType::Vec, float, 1, 8192, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Min, CompactMode::Null> v75 = Tile<TileType::Vec, float, 1, 8192, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Min, CompactMode::Null>(v17, v22);
+      // pto: %padded_inline13825__ssa_v0
       ;
-      uint64_t v77 = (uint64_t) v16;
-      TASSIGN(v76, v77);
+      uint64_t v76 = (uint64_t) v14;
+      TASSIGN(v75, v76);
       wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-      TFILLPAD<pto::TFillPadMode::InPlace>(v76, v61);
-      // pto: %grouped_inline7028__ssa_v0
+      TFILLPAD<pto::TFillPadMode::InPlace>(v75, v60);
+      // pto: %grouped_inline13826__ssa_v0
       ;
-      Tile<TileType::Vec, float, 1024, 8, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Min, CompactMode::Null> v78 = Tile<TileType::Vec, float, 1024, 8, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Min, CompactMode::Null>(v21, v22);
-      // pto: %grouped_inline7028__ssa_v0
+      Tile<TileType::Vec, float, 1024, 8, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Min, CompactMode::Null> v77 = Tile<TileType::Vec, float, 1024, 8, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Min, CompactMode::Null>(v20, v21);
+      // pto: %grouped_inline13826__ssa_v0
       ;
-      uint64_t v79 = (uint64_t) v16;
-      TASSIGN(v78, v79);
-      // pto: %reduce_tmp_inline7029__ssa_v0
+      uint64_t v78 = (uint64_t) v14;
+      TASSIGN(v77, v78);
+      // pto: %reduce_tmp_inline13827__ssa_v0
       ;
-      Tile<TileType::Vec, float, 1024, 8, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v80 = Tile<TileType::Vec, float, 1024, 8, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v21, v22);
-      // pto: %reduce_tmp_inline7029__ssa_v0
+      Tile<TileType::Vec, float, 1024, 8, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v79 = Tile<TileType::Vec, float, 1024, 8, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v20, v21);
+      // pto: %reduce_tmp_inline13827__ssa_v0
       ;
-      uint64_t v81 = (uint64_t) v17;
-      TASSIGN(v80, v81);
-      // pto: %t__tmp_v128
+      uint64_t v80 = (uint64_t) v15;
+      TASSIGN(v79, v80);
+      // pto: %t__tmp_v166
       ;
-      Tile<TileType::Vec, float, 1024, 1, BLayout::ColMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v82 = Tile<TileType::Vec, float, 1024, 1, BLayout::ColMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v21, v19);
-      // pto: %t__tmp_v128
+      Tile<TileType::Vec, float, 1024, 1, BLayout::ColMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v81 = Tile<TileType::Vec, float, 1024, 1, BLayout::ColMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v20, v17);
+      // pto: %t__tmp_v166
       ;
-      uint64_t v83 = (uint64_t) v18;
-      TASSIGN(v82, v83);
+      uint64_t v82 = (uint64_t) v16;
+      TASSIGN(v81, v82);
       wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
-      TROWMAX(v82, v78, v80);
+      TROWMAX(v81, v77, v79);
       set_flag(PIPE_V, PIPE_S, EVENT_ID0);
       set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
       set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-      // pto: %maxima_inline7030__ssa_v0
+      // pto: %maxima_inline13828__ssa_v0
       ;
-      Tile<TileType::Vec, float, 1, 1024, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v84 = Tile<TileType::Vec, float, 1, 1024, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v19, v21);
-      // pto: %maxima_inline7030__ssa_v0
+      Tile<TileType::Vec, float, 1, 1024, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null> v83 = Tile<TileType::Vec, float, 1, 1024, BLayout::RowMajor, -1, -1, SLayout::NoneBox, 512, PadValue::Null, CompactMode::Null>(v17, v20);
+      // pto: %maxima_inline13828__ssa_v0
       ;
-      uint64_t v85 = (uint64_t) v18;
-      TASSIGN(v84, v85);
+      uint64_t v84 = (uint64_t) v16;
+      TASSIGN(v83, v84);
       // pto: %t__tile
       ;
-      int32_t v86 = (v2)[v52];
+      int32_t v85 = (v2)[v51];
       // pto: %18
       ;
-      int64_t v87 = (int64_t) v86;
+      int64_t v86 = (int64_t) v85;
       // pto: %19
       ;
-      int64_t v88 = v87 < v20 ? v20 : v87;
+      int64_t v87 = v86 < v19 ? v19 : v86;
       // pto: %20
       ;
-      int64_t v89 = v88 < v9 ? v88 : v9;
+      int64_t v88 = v87 < v8 ? v87 : v8;
       // pto: %21
       ;
       wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
-      if (v89 > v20) {
+      if (v88 > v19) {
         // pto: %22
         ;
-        int64_t v90 = (int64_t) ((uint64_t) v89 - (uint64_t) v19);
+        int64_t v89 = (int64_t) ((uint64_t) v88 - (uint64_t) v17);
         // pto: %23
         ;
-        const int64_t v91 = 1;
+        const int64_t v90 = 1;
         // pto: %23
         ;
-        const int64_t v92 = 0;
+        const int64_t v91 = 0;
         // pto: %23
         ;
-        int64_t v93 = v90 / v22;
+        int64_t v92 = v89 / v21;
         // pto: %23
         ;
-        bool v94 = v90 < v92;
+        bool v93 = v89 < v91;
         // pto: %23
         ;
-        bool v95 = v22 < v92;
+        bool v94 = v21 < v91;
         // pto: %23
         ;
-        bool v96 = v94 == v95;
+        bool v95 = v93 == v94;
         // pto: %23
         ;
-        int64_t v97 = v90 % v22 != v92 && v94 != v95 ? v93 - v91 : v93;
+        int64_t v96 = v89 % v21 != v91 && v93 != v94 ? v92 - v90 : v92;
         // pto: %24, %25, %26, %27
         ;
-        if (v55 <= v97 & v97 < (int64_t) ((uint64_t) v55 + (uint64_t) v58)) {
+        if (v54 <= v96 & v96 < (int64_t) ((uint64_t) v54 + (uint64_t) v57)) {
           // pto: %28
           ;
-          int64_t v98 = (int64_t) ((uint64_t) v97 - (uint64_t) v55);
-          v84.SetValue(v98, v24);
+          int64_t v97 = (int64_t) ((uint64_t) v96 - (uint64_t) v54);
+          v83.SetValue(v97, v23);
         };
       };
       set_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
-      v84.SetValidShape(v19, v58);
+      v83.SetValidShape(v17, v57);
       // pto: %30
       ;
-      int64_t v99 = v55 < v20 ? v20 : v55;
-      // pto: %block_scores_inline7013__ssa_v0_pview
+      int64_t v98 = v54 < v19 ? v19 : v54;
+      // pto: %block_scores_inline13813__ssa_v0_pview
       ;
-      int64_t v100 = (int64_t) v13;
-      // pto: %block_scores_inline7013__ssa_v0_pview
+      int64_t v99 = (int64_t) v11;
+      // pto: %block_scores_inline13813__ssa_v0_pview
       ;
-      const int64_t v101 = 0;
-      // pto: %block_scores_inline7013__ssa_v0_pview
+      const int64_t v100 = 0;
+      // pto: %block_scores_inline13813__ssa_v0_pview
       ;
-      __gm__ float* v102 = PTOAS__GLOBAL_TENSOR_DATA(v44);
-      // pto: %block_scores_inline7013__ssa_v0_pview
+      __gm__ float* v101 = PTOAS__GLOBAL_TENSOR_DATA(v43);
+      // pto: %block_scores_inline13813__ssa_v0_pview
+      ;
+      const int64_t v102 = 1;
+      // pto: %block_scores_inline13813__ssa_v0_pview
       ;
       const int64_t v103 = 1;
-      // pto: %block_scores_inline7013__ssa_v0_pview
+      // pto: %block_scores_inline13813__ssa_v0_pview
       ;
       const int64_t v104 = 1;
-      // pto: %block_scores_inline7013__ssa_v0_pview
+      // pto: %block_scores_inline13813__ssa_v0_pview
       ;
-      const int64_t v105 = 1;
-      // pto: %block_scores_inline7013__ssa_v0_pview
+      int64_t v105 = v17 * v99;
+      // pto: %block_scores_inline13813__ssa_v0_pview
       ;
-      int64_t v106 = v19 * v100;
-      // pto: %block_scores_inline7013__ssa_v0_pview
+      int64_t v106 = v104 * v105;
+      // pto: %block_scores_inline13813__ssa_v0_pview
       ;
-      int64_t v107 = v105 * v106;
-      // pto: %block_scores_inline7013__ssa_v0_pview
+      pto::Shape<1, 1, 1, 1, -1> v107 = pto::Shape<1, 1, 1, 1, -1>(v102, v103, v104, v17, v57);
+      // pto: %block_scores_inline13813__ssa_v0_pview
       ;
-      pto::Shape<1, 1, 1, 1, -1> v108 = pto::Shape<1, 1, 1, 1, -1>(v103, v104, v105, v19, v58);
-      // pto: %block_scores_inline7013__ssa_v0_pview
+      pto::Stride<-1, -1, -1, -1, -1> v108 = pto::Stride<-1, -1, -1, -1, -1>(v103 * v106, v106, v105, v99, v17);
+      // pto: %block_scores_inline13813__ssa_v0_pview
       ;
-      pto::Stride<-1, -1, -1, -1, -1> v109 = pto::Stride<-1, -1, -1, -1, -1>(v104 * v107, v107, v106, v100, v19);
-      // pto: %block_scores_inline7013__ssa_v0_pview
-      ;
-      GlobalTensor<float, pto::Shape<1, 1, 1, 1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND> v110 = GlobalTensor<float, pto::Shape<1, 1, 1, 1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND>(v102 + (v101 + v63 * v100 + v99 * v19), v108, v109);
+      GlobalTensor<float, pto::Shape<1, 1, 1, 1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND> v109 = GlobalTensor<float, pto::Shape<1, 1, 1, 1, -1>, pto::Stride<-1, -1, -1, -1, -1>, pto::Layout::ND>(v101 + (v100 + v62 * v99 + v98 * v17), v107, v108);
       wait_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
       wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-      TSTORE(v110, v84);
+      TSTORE(v109, v83);
       set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
     };
   }
@@ -378,60 +381,52 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int32_t __pypto_spmd_block_idx = get_block_idx(args);
     int32_t __pypto_spmd_block_num = get_block_num(args);
 
-    // Unpack tensor: scores_inline6818__ssa_v0
-    __gm__ Tensor* scores_inline6818__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ float* scores_inline6818__ssa_v0 = reinterpret_cast<__gm__ float*>(scores_inline6818__ssa_v0_tensor->buffer.addr) + scores_inline6818__ssa_v0_tensor->start_offset;
+    // Unpack tensor: scores_inline13099__ssa_v0
+    __gm__ Tensor* scores_inline13099__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
+    __gm__ float* scores_inline13099__ssa_v0 = reinterpret_cast<__gm__ float*>(scores_inline13099__ssa_v0_tensor->buffer.addr) + scores_inline13099__ssa_v0_tensor->start_offset;
 
-    // Unpack tensor: c1a_compressed_lens_inline6702__ssa_v0
-    __gm__ Tensor* c1a_compressed_lens_inline6702__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ int32_t* c1a_compressed_lens_inline6702__ssa_v0 = reinterpret_cast<__gm__ int32_t*>(c1a_compressed_lens_inline6702__ssa_v0_tensor->buffer.addr) + c1a_compressed_lens_inline6702__ssa_v0_tensor->start_offset;
+    // Unpack tensor: c1a_compressed_lens_inline12978__ssa_v0
+    __gm__ Tensor* c1a_compressed_lens_inline12978__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[1]);
+    __gm__ int32_t* c1a_compressed_lens_inline12978__ssa_v0 = reinterpret_cast<__gm__ int32_t*>(c1a_compressed_lens_inline12978__ssa_v0_tensor->buffer.addr) + c1a_compressed_lens_inline12978__ssa_v0_tensor->start_offset;
 
-    // Unpack tensor: block_scores_inline7013__ssa_v0
-    __gm__ Tensor* block_scores_inline7013__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[2]);
-    __gm__ float* block_scores_inline7013__ssa_v0 = reinterpret_cast<__gm__ float*>(block_scores_inline7013__ssa_v0_tensor->buffer.addr) + block_scores_inline7013__ssa_v0_tensor->start_offset;
+    // Unpack tensor: block_scores_inline13813__ssa_v0
+    __gm__ Tensor* block_scores_inline13813__ssa_v0_tensor = reinterpret_cast<__gm__ Tensor*>(args[2]);
+    __gm__ float* block_scores_inline13813__ssa_v0 = reinterpret_cast<__gm__ float*>(block_scores_inline13813__ssa_v0_tensor->buffer.addr) + block_scores_inline13813__ssa_v0_tensor->start_offset;
 
-    // Unpack scalar: score_work_items_inline7015__ssa_v0
-    union { uint64_t u64; int64_t val; } score_work_items_inline7015__ssa_v0_conv;
-    score_work_items_inline7015__ssa_v0_conv.u64 = args[3];
-    int64_t score_work_items_inline7015__ssa_v0 = score_work_items_inline7015__ssa_v0_conv.val;
+    // Unpack scalar: score_work_items_inline13815__ssa_v0
+    union { uint64_t u64; int64_t val; } score_work_items_inline13815__ssa_v0_conv;
+    score_work_items_inline13815__ssa_v0_conv.u64 = args[3];
+    int64_t score_work_items_inline13815__ssa_v0 = score_work_items_inline13815__ssa_v0_conv.val;
 
-    // Unpack scalar: score_workers_inline7016__ssa_v0
-    union { uint64_t u64; int64_t val; } score_workers_inline7016__ssa_v0_conv;
-    score_workers_inline7016__ssa_v0_conv.u64 = args[4];
-    int64_t score_workers_inline7016__ssa_v0 = score_workers_inline7016__ssa_v0_conv.val;
+    // Unpack scalar: score_tiles_inline13812__ssa_v0
+    union { uint64_t u64; int64_t val; } score_tiles_inline13812__ssa_v0_conv;
+    score_tiles_inline13812__ssa_v0_conv.u64 = args[4];
+    int64_t score_tiles_inline13812__ssa_v0 = score_tiles_inline13812__ssa_v0_conv.val;
 
-    // Unpack scalar: score_tiles_inline7012__ssa_v0
-    union { uint64_t u64; int64_t val; } score_tiles_inline7012__ssa_v0_conv;
-    score_tiles_inline7012__ssa_v0_conv.u64 = args[5];
-    int64_t score_tiles_inline7012__ssa_v0 = score_tiles_inline7012__ssa_v0_conv.val;
+    // Unpack scalar: active_tokens_inline13792__phi_v4
+    union { uint64_t u64; int64_t val; } active_tokens_inline13792__phi_v4_conv;
+    active_tokens_inline13792__phi_v4_conv.u64 = args[5];
+    int64_t active_tokens_inline13792__phi_v4 = active_tokens_inline13792__phi_v4_conv.val;
 
-    // Unpack scalar: active_tokens_inline6998__phi_v4
-    union { uint64_t u64; int64_t val; } active_tokens_inline6998__phi_v4_conv;
-    active_tokens_inline6998__phi_v4_conv.u64 = args[6];
-    int64_t active_tokens_inline6998__phi_v4 = active_tokens_inline6998__phi_v4_conv.val;
+    // Unpack scalar: block_count_inline13793__ssa_v0
+    union { uint64_t u64; int64_t val; } block_count_inline13793__ssa_v0_conv;
+    block_count_inline13793__ssa_v0_conv.u64 = args[6];
+    int64_t block_count_inline13793__ssa_v0 = block_count_inline13793__ssa_v0_conv.val;
 
-    // Unpack scalar: block_count_inline6999__ssa_v0
-    union { uint64_t u64; int64_t val; } block_count_inline6999__ssa_v0_conv;
-    block_count_inline6999__ssa_v0_conv.u64 = args[7];
-    int64_t block_count_inline6999__ssa_v0 = block_count_inline6999__ssa_v0_conv.val;
-
-    // Unpack scalar: positions_inline6996__ssa_v0
-    union { uint64_t u64; int64_t val; } positions_inline6996__ssa_v0_conv;
-    positions_inline6996__ssa_v0_conv.u64 = args[8];
-    int64_t positions_inline6996__ssa_v0 = positions_inline6996__ssa_v0_conv.val;
-
-    // Extract dynamic dim: LOCAL_T_DYN
-    int64_t LOCAL_T_DYN = static_cast<int64_t>(scores_inline6818__ssa_v0_tensor->shapes[0]);
-
-    // Extract dynamic dim: score_width_inline6813__ssa_v0
-    int64_t score_width_inline6813__ssa_v0 = static_cast<int64_t>(scores_inline6818__ssa_v0_tensor->shapes[1]);
+    // Unpack scalar: positions_inline13790__ssa_v0
+    union { uint64_t u64; int64_t val; } positions_inline13790__ssa_v0_conv;
+    positions_inline13790__ssa_v0_conv.u64 = args[7];
+    int64_t positions_inline13790__ssa_v0 = positions_inline13790__ssa_v0_conv.val;
 
     // Extract dynamic dim: T_DYN
-    int64_t T_DYN = static_cast<int64_t>(c1a_compressed_lens_inline6702__ssa_v0_tensor->shapes[0]);
+    int64_t T_DYN = static_cast<int64_t>(scores_inline13099__ssa_v0_tensor->shapes[0]);
 
-    // Extract dynamic dim: padded_block_count_inline7011__ssa_v0
-    int64_t padded_block_count_inline7011__ssa_v0 = static_cast<int64_t>(block_scores_inline7013__ssa_v0_tensor->shapes[1]);
+    // Extract dynamic dim: score_width_inline13094__ssa_v0
+    int64_t score_width_inline13094__ssa_v0 = static_cast<int64_t>(scores_inline13099__ssa_v0_tensor->shapes[1]);
+
+    // Extract dynamic dim: padded_block_count_inline13811__ssa_v0
+    int64_t padded_block_count_inline13811__ssa_v0 = static_cast<int64_t>(block_scores_inline13813__ssa_v0_tensor->shapes[1]);
 
     // Forward to ptoas-generated function
-    pool_score(scores_inline6818__ssa_v0, c1a_compressed_lens_inline6702__ssa_v0, block_scores_inline7013__ssa_v0, score_work_items_inline7015__ssa_v0, score_workers_inline7016__ssa_v0, score_tiles_inline7012__ssa_v0, active_tokens_inline6998__phi_v4, block_count_inline6999__ssa_v0, positions_inline6996__ssa_v0, LOCAL_T_DYN, score_width_inline6813__ssa_v0, T_DYN, padded_block_count_inline7011__ssa_v0, __pypto_spmd_block_idx, __pypto_spmd_block_num);
+    pool_score(scores_inline13099__ssa_v0, c1a_compressed_lens_inline12978__ssa_v0, block_scores_inline13813__ssa_v0, score_work_items_inline13815__ssa_v0, score_tiles_inline13812__ssa_v0, active_tokens_inline13792__phi_v4, block_count_inline13793__ssa_v0, positions_inline13790__ssa_v0, T_DYN, score_width_inline13094__ssa_v0, padded_block_count_inline13811__ssa_v0, __pypto_spmd_block_idx, __pypto_spmd_block_num);
 }
