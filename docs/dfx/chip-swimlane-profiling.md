@@ -136,9 +136,13 @@ backward-compatible with the old boolean behavior).
 | 3 | + scheduler phases (`scheduler_records`) | Does not enable orchestrator collection; an independently enabled HBG Host pool can still export Host records |
 | 4 | + orchestrator phases (Host for HBG, AICPU for TMR) | Full collection |
 
-A5 `percounter` adds a task/block Scheduler View at L2 with Claim, Ready, Kernel
-end and GM Completion issued markers. Worker View remains available. L3 adds
-nested AICore Scheduler function intervals, such as dependency checks, MIX
+A5 `percounter` adds a task/block Scheduler View at L2 with Claim start, Claim,
+Ready, Kernel end and GM Completion issued markers. With complete predecessor
+evidence in `deps.json` and the same capture's completion records, Ideal ready
+marks the estimated dependency boundary, even when it precedes the claim.
+If dependencies were ready at claim time, the wait span begins at Claim.
+Worker View remains available. L3 adds nested AICore Scheduler function
+intervals, such as dependency checks, MIX
 rendezvous and completion publication. L4 adds individual memory operations and
 Host phases and retains all instrumented function intervals. See the [percounter
 profiling contract](../../src/a5/runtime/percounter/README.md#chip-swimlanes-l1l4)

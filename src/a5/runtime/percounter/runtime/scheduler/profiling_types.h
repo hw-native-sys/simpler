@@ -146,7 +146,7 @@ enum class PercounterTaskEventKind : uint32_t {
 struct PercounterTaskEvent {
     uint64_t cycles;
     uint64_t entry;
-    uint64_t detail;  // Completion contribution or deferred group reference.
+    uint64_t detail;  // Interval start, completion contribution or deferred group reference.
     PercounterTaskEventKind kind;
 };
 

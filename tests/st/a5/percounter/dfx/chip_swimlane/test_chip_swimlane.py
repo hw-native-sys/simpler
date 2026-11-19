@@ -167,6 +167,7 @@ def test_profile_levels(st_platform, st_device_ids, tmp_path, levels):
                         claim, ready, kernel, completion = (
                             by_kind[k] for k in ("claim", "ready", "kernel_end", "completion_issue")
                         )
+                        assert 0 < claim["claim_start_cycles"] <= claim["cycles"]
                         assert claim["cycles"] <= ready["cycles"] <= kernel["kernel_start_cycles"]
                         assert kernel["kernel_start_cycles"] <= kernel["cycles"] <= completion["cycles"]
                         assert completion["contribution"] == 1
@@ -216,9 +217,8 @@ def test_profile_levels(st_platform, st_device_ids, tmp_path, levels):
                     )
                     events = json.loads(trace.read_text())["traceEvents"]
                     assert any(e.get("pid") == 2 and e.get("name") == "trace_finish" for e in events) == (level >= 3)
-                    assert any(
-                        e.get("pid") == 3 and e.get("ph") == "i" and e["args"]["kind"] == "claim" for e in events
-                    )
+                    milestones = Counter(e["args"]["kind"] for e in events if e.get("pid") == 3 and e.get("ph") == "i")
+                    assert milestones["claim_start"] == milestones["claim"] == blocks * TASKS
                 assert bool(raw.get("host_orchestrator_phases")) == (level == 4)
         finally:
             worker.free(buffer)

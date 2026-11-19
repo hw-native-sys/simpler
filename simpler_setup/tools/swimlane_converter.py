@@ -1105,6 +1105,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
     if percounter_events_raw is not None:
         for record in percounter_events_raw["records"]:
             _track(record["cycles"])
+            _track(record.get("claim_start_cycles", 0))
             _track(record.get("kernel_start_cycles", 0))
     for thread_records in sched_phases_raw:
         for pr in thread_records:
@@ -2569,6 +2570,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 percounter_task_events,
                 pid=3,
                 task_name=lambda task_id: _marker_event_name(task_id, task_display(task_id)),
+                deps_edges=deps_edges if chip_swimlane_level == 2 else None,
+                deps_kernel_map=deps_kernel_map,
+                deps_block_map=deps_block_map,
             )
         )
 
