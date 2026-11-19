@@ -24,13 +24,10 @@ int main(int argc, char **argv) {
             fixture.record(model);
         }
         const auto retained = fixture.report("nine-shared-models");
-        for (size_t i = 0; i < maximum_models; ++i) {
-            require(fixture.models[i].image_address != 0, "retained-image-observed");
-            for (size_t j = 0; j < i; ++j)
-                require(
-                    fixture.models[i].image_address != fixture.models[j].image_address, "retained-images-independent"
-                );
-        }
+        const auto workspace = fixture.models.front().image_address;
+        require(workspace != 0, "retained-image-observed");
+        for (const auto &model : fixture.models)
+            require(model.image_address == workspace, "retained-models-share-workspace");
         require(
             retained.reserved_bytes - before.reserved_bytes < 2 * fixture.config.runtime_env.ring_heap[0],
             "heap-does-not-scale-with-retained-models"

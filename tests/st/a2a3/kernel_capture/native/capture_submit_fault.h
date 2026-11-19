@@ -47,6 +47,7 @@ struct CapturedCpuLaunch {
     uint64_t runtime_args = 0;
     uint32_t runtime_bytes = 0;
     uint64_t image_bytes = 0;
+    uint64_t working_address = 0;
 };
 
 struct CapturedSubmission {

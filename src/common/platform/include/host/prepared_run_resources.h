@@ -180,14 +180,14 @@ public:
     static RetainedSchedulerStorage::Status acquire_scheduler(
         std::shared_ptr<RetainedSchedulerStorage> &cache,
         std::vector<std::shared_ptr<RetainedSchedulerStorage>> &retired, size_t bytes, size_t alignment,
-        Allocate allocate, Free free, void **device_out, void **host_out
+        Allocate allocate, Free free, void **device_out
     ) {
-        if (cache && cache.use_count() == 1)
-            return cache->acquire(bytes, alignment, allocate, free, device_out, host_out);
-        // Reserve bookkeeping before taking device ownership.
+        if (cache && (cache.use_count() == 1 || cache->covers_device(bytes, alignment)))
+            return cache->acquire_device(bytes, alignment, allocate, free, device_out);
+        // A launch can keep naming a smaller generation after a successor grows.
         if (cache) retired.reserve(retired.size() + 1);
         auto next = std::make_shared<RetainedSchedulerStorage>();
-        const auto status = next->acquire(bytes, alignment, allocate, free, device_out, host_out);
+        const auto status = next->acquire_device(bytes, alignment, allocate, free, device_out);
         if (status == RetainedSchedulerStorage::Status::Ok) {
             if (cache) retired.push_back(cache);
             cache = std::move(next);

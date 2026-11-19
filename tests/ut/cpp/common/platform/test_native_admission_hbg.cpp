@@ -280,7 +280,7 @@ TEST_F(NativeAdmissionTest, CallbackRejectsAnotherContextBeforeChangingItsRunSta
     EXPECT_TRUE(entered);
     EXPECT_EQ(callbacks, 1);
     EXPECT_NE(outer_runner.pooled_heap(1), nullptr);
-    EXPECT_TRUE(outer_runner.arena_referenced(1, 2));
+    EXPECT_TRUE(outer_runner.arena_referenced(outer.descriptor.arena_bank, 2));
     EXPECT_TRUE(outer_runner.holds_epoch(20));
     EXPECT_FALSE(outer_runner.holds_epoch(30));
     ASSERT_EQ(simpler_finalize_run(&outer_runner, outer.storage), 0);
@@ -314,7 +314,7 @@ TEST_F(NativeAdmissionTest, CallbackRejectsSameContextBeforeConstructingAnotherR
     ASSERT_EQ(outer.prepare(), 0);
     EXPECT_TRUE(entered);
     EXPECT_EQ(callbacks, 1);
-    EXPECT_TRUE(runner.arena_referenced(1, 2));
+    EXPECT_TRUE(runner.arena_referenced(outer.descriptor.arena_bank, 2));
 }
 
 TEST_F(NativeAdmissionTest, CallbackExceptionUnwindsOuterOwnershipAndAllowsTheNextPrepare) {
@@ -350,14 +350,13 @@ TEST_F(NativeAdmissionTest, ReservedPrepareExcludesAWarmConsumerBeforeTrimmingIt
     ASSERT_EQ(warmup.prepare(), 0);
     ASSERT_EQ(simpler_finalize_run(&runner, warmup.storage), 0);
     void *const idle_heap = runner.pooled_heap(2);
-    void *const idle_image = runner.arena_region_backing(2, 2);
+    void *const idle_image = runner.arena_region_backing(warmup.descriptor.arena_bank, 2);
     ASSERT_NE(idle_heap, nullptr);
     ASSERT_NE(idle_image, nullptr);
     Attempt outer(runner, 1, 20);
     Attempt warm_consumer(runner, 2, 30);
     bool entered = false;
-    size_t attempts_before_refusal = 0;
-    size_t successes_before_refusal = 0;
+    ASSERT_NE(runner.retained_temp_addr(2), 0u);
     callback_hook = [&] {
         entered = true;
         const auto allocations = control().allocations;
@@ -374,27 +373,22 @@ TEST_F(NativeAdmissionTest, ReservedPrepareExcludesAWarmConsumerBeforeTrimmingIt
         EXPECT_EQ(runner.charged(), charged);
         EXPECT_EQ(runner.reservations(), 1u);
         EXPECT_EQ(runner.pooled_heap(2), idle_heap);
-        EXPECT_EQ(runner.arena_region_backing(2, 2), idle_image);
+        EXPECT_EQ(runner.arena_region_backing(warmup.descriptor.arena_bank, 2), idle_image);
         if (rc == 0) EXPECT_EQ(simpler_finalize_run(&runner, warm_consumer.storage), 0);
-        attempts_before_refusal = control().allocations;
-        successes_before_refusal = control().successful_allocations;
-        control().fail_allocation = attempts_before_refusal + 1;
+        // Exercise pressure reclamation while the outer run reserves bank zero.
+        EXPECT_GT(runner.trim_idle_run_resources(outer.descriptor.pipeline_slot), 0u);
     };
     ASSERT_EQ(outer.prepare(), 0);
     EXPECT_TRUE(entered);
-    EXPECT_EQ(
-        control().allocations - attempts_before_refusal, control().successful_allocations - successes_before_refusal + 1
-    );
     EXPECT_EQ(runner.arena_region_backing(2, 0), nullptr);
-    EXPECT_EQ(runner.arena_region_backing(2, 2), nullptr);
+    EXPECT_EQ(runner.arena_region_backing(outer.descriptor.arena_bank, 2), idle_image);
     EXPECT_EQ(runner.retained_temp_addr(2), 0u);
-    EXPECT_TRUE(runner.arena_referenced(1, 2));
+    EXPECT_TRUE(runner.arena_referenced(outer.descriptor.arena_bank, 2));
     ASSERT_EQ(simpler_finalize_run(&runner, outer.storage), 0);
-    control().fail_allocation = 0;
     const auto allocations = control().allocations;
     ASSERT_EQ(warm_consumer.prepare(), 0);
     EXPECT_GT(control().allocations, allocations);
-    EXPECT_TRUE(runner.arena_referenced(2, 2));
+    EXPECT_TRUE(runner.arena_referenced(warm_consumer.descriptor.arena_bank, 2));
     EXPECT_TRUE(runner.holds_epoch(30));
 }
 
@@ -421,7 +415,7 @@ TEST_F(NativeAdmissionTest, AnotherThreadCanPrepareADifferentContextWhileTheCall
     ASSERT_EQ(outer.prepare(), 0);
     EXPECT_TRUE(entered);
     EXPECT_EQ(callbacks, 2);
-    EXPECT_TRUE(outer_runner.arena_referenced(1, 2));
+    EXPECT_TRUE(outer_runner.arena_referenced(outer.descriptor.arena_bank, 2));
     EXPECT_FALSE(other_runner.holds_epoch(30));
 }
 
@@ -647,7 +641,7 @@ public:
 };
 }  // namespace
 
-TEST_F(NativeAdmissionTest, CapturedSlotSharesHeapWithoutRetainingAnotherSlotsImage) {
+TEST_F(NativeAdmissionTest, RetainedRunSharesDeviceWorkspaceAcrossSlots) {
     HbgImageCaptureRunner runner;
     ASSERT_EQ(runner.initialize_kernel(), 0);
     auto capture_args = [](Attempt &attempt) {
@@ -667,7 +661,11 @@ TEST_F(NativeAdmissionTest, CapturedSlotSharesHeapWithoutRetainingAnotherSlotsIm
     capture_args(captured);
     ASSERT_EQ(captured.prepare(), 0);
     EXPECT_EQ(runner.prepared_heap_base(1, 10031), heap0);
-    void *image1 = runner.arena_region_backing(1, 2);
+    const auto publication = [](const Attempt &run) {
+        return static_cast<NativeRunContext<DeviceRunnerBase> *>(run.storage)->runtime->prepared_publication();
+    };
+    auto first = publication(captured);
+    ASSERT_NE(first, nullptr);
     RuntimeHandle reference = nullptr;
     auto cleanup = RAIIScopeGuard([&] {
         control().recording_active = false;
@@ -687,7 +685,10 @@ TEST_F(NativeAdmissionTest, CapturedSlotSharesHeapWithoutRetainingAnotherSlotsIm
     EXPECT_EQ(runner.prepared_heap_base(0, 10032), heap0);
     EXPECT_EQ(runner.arena_region_backing(0, 2), image0);
     EXPECT_EQ(runner.prepared_heap_base(1, 10031), heap0);
-    EXPECT_EQ(runner.arena_region_backing(1, 2), image1);
+    auto second = publication(reuse);
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(first->device_target, second->device_target);
+    EXPECT_NE(first->source, second->source);
     ASSERT_EQ(simpler_finalize_run(&runner, reuse.storage), 0);
     ASSERT_EQ(simpler_release_run_resources(&runner, reference), 0);
     reference = nullptr;
@@ -788,7 +789,27 @@ TEST_F(NativeAdmissionTest, CapturedHbgImageUsesRtsSnapshotThroughOriginalRunRet
     cleanup.dismiss();
 }
 
-TEST_F(NativeAdmissionTest, CapturePreparationSharesHeapAndKeepsSchedulerBackingIndependent) {
+TEST_F(NativeAdmissionTest, SchedulerScratchIsSharedAcrossSlotsAndIsolatesProfilingReadback) {
+    Runner runner;
+    DfxRunConfig profiled;
+    profiled.chip_swimlane_level = ChipSwimlaneLevel::SCHED_PHASES;
+    void *targets[4]{};
+    void *sources[4]{};
+    // Ordinary, profiled, profiled, ordinary. Keep all four preparations alive.
+    for (uint32_t slot = 0; slot < 4; ++slot) {
+        runner.begin_host_phase_run(slot, slot == 1 || slot == 2 ? profiled : DfxRunConfig{});
+        ASSERT_EQ(runner.acquire_scheduler_state_storage(slot, 256, 64, &targets[slot], &sources[slot]), 0);
+        std::memset(sources[slot], static_cast<int>(slot + 1), 256);
+    }
+    EXPECT_EQ(targets[0], targets[3]);
+    EXPECT_NE(targets[0], targets[1]);
+    EXPECT_NE(targets[0], targets[2]);
+    EXPECT_NE(targets[1], targets[2]);
+    for (uint32_t slot = 0; slot < 4; ++slot)
+        EXPECT_EQ(static_cast<unsigned char *>(sources[slot])[255], slot + 1);
+}
+
+TEST_F(NativeAdmissionTest, CapturePreparationAcquiresHeapAndSchedulerStorage) {
     HbgImageCaptureRunner runner;
     ASSERT_EQ(runner.initialize_kernel(), 0);
     Attempt attempt(runner, 0, 7003);
@@ -877,7 +898,7 @@ TEST_F(NativeAdmissionTest, RetainedCaptureHeapSurvivesEagerPrepareTrimAndFailed
     EXPECT_EQ(runner.heap_allocations(), 1u);
 }
 
-TEST_F(NativeAdmissionTest, RetainedCaptureBackingIsReplacedNotOverwrittenByASuccessor) {
+TEST_F(NativeAdmissionTest, RetainedRunSharesWritableDeviceStorageWithSameSlotSuccessor) {
     HbgImageCaptureRunner runner;
     ASSERT_EQ(runner.initialize_kernel(), 0);
     Attempt capture(runner, 0, 7004);
@@ -905,8 +926,9 @@ TEST_F(NativeAdmissionTest, RetainedCaptureBackingIsReplacedNotOverwrittenByASuc
     control().recording_active = false;
     ASSERT_EQ(simpler_finalize_run(&runner, capture.storage), 0);
 
-    // With the external reference still alive, the slot can prepare a
-    // successor. The retained backing must be replaced, never overwritten.
+    // Preparing the successor must leave the previous device contents intact.
+    unsigned char sentinel = 0xa5;
+    std::memcpy(capture_publication->device_target, &sentinel, sizeof(sentinel));
     Attempt successor(runner, 0, 7005);
     successor.args.tensor(0).address_space = AddressSpace::DEVICE;
     successor.args.tensor(0).transfer = TensorTransfer::NONE;
@@ -914,10 +936,10 @@ TEST_F(NativeAdmissionTest, RetainedCaptureBackingIsReplacedNotOverwrittenByASuc
     auto *successor_state = static_cast<NativeRunContext<DeviceRunnerBase> *>(successor.storage);
     const auto successor_publication = successor_state->runtime->prepared_publication();
     ASSERT_NE(successor_publication, nullptr);
-    EXPECT_NE(successor_publication->device_target, capture_target);
+    EXPECT_EQ(successor_publication->device_target, capture_target);
+    EXPECT_EQ(*static_cast<const unsigned char *>(capture_target), sentinel);
     if (std::strcmp(get_platform(), "a5sim") == 0)
-        EXPECT_NE(successor_state->runtime->dev.scheduler_bootstrap.worker_context_base, capture_state_base)
-            << "the retained scheduler storage is detached, not rewritten";
+        EXPECT_EQ(successor_state->runtime->dev.scheduler_bootstrap.worker_context_base, capture_state_base);
     ASSERT_EQ(simpler_finalize_run(&runner, successor.storage), 0);
 }
 

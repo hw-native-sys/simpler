@@ -192,9 +192,9 @@ typedef enum PipelineResourceClass {
        result is not overwritten by a successor. Declared here to reserve the
        value; no runtime declares it yet. */
     PTO_PIPELINE_REPORTED = 3,
-    /* Shared scratch owned by the platform's ScratchPool rather than by an
-       arena bank. Only the GM heap may use it: the pool serves the region
-       whose content device operators rewrite but the host never reads. */
+    /* Shared scratch sized by host orchestration. The platform leases the
+       GM heap from its heap pool and the writable runtime image from its
+       runtime arena. Launches sharing a backing must execute in order. */
     PTO_PIPELINE_POOLED_SCRATCH = 4,
 } PipelineResourceClass;
 

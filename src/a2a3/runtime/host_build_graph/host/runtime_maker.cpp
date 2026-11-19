@@ -106,8 +106,8 @@ static_assert(
 );
 
 extern "C" const PipelineContract *get_pipeline_contract(void) {
-    // The heap is pooled across ordered executions; the runtime image
-    // remains independently owned by each run. GM_SM has no separate region.
+    // Each launch supplies its initial image. Ordered executions share the
+    // device heap and the writable portion of the runtime arena.
     // pipeline_depth bounds supported resource sets without preallocating them.
     static const PipelineContract contract = {
         PTO_PIPELINE_CONTRACT_ABI_VERSION,
@@ -115,7 +115,7 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
         UINT32_MAX,
         {
             {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_POOLED_SCRATCH, 0},
-            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DELIVERED, 0},
+            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_POOLED_SCRATCH, 0},
             {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
             {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
         },
@@ -133,9 +133,15 @@ extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, Pip
 }
 
 extern "C" int concurrent_native_prepare_supported_impl(void) {
-    // HBG can materialize a complete graph into the lease-selected unpublished
-    // arena bank.
+    // Each prepare assembles its own host image.
     return 1;
+}
+
+extern "C" int
+prepared_run_config_compatible_impl(const HostApi *api, const uint64_t *, const uint64_t *, const uint64_t *) {
+    // Bind writes host staging. The device writes shared scratch only after
+    // launch ordering takes effect, and growth retains the previous backing.
+    return api != nullptr && api->launch_owns_execution_image();
 }
 
 extern "C" int teardown_report_supported_impl(void) {
@@ -146,8 +152,7 @@ extern "C" int teardown_report_supported_impl(void) {
 }
 
 extern "C" int joined_native_launch_supported_impl(void) {
-    // Per-run images remain independently owned. A queued device event wait
-    // orders executions that reuse the context heap scratch.
+    // A queued device event wait orders use of the shared heap and scheduler scratch.
     return 1;
 }
 
@@ -412,7 +417,7 @@ static int32_t read_runtime_status(const Runtime *runtime, const HostApi *api, S
     if (api == nullptr || host_header == nullptr) return 0;
     // The shared scheduler header can already belong to a successor.
     if (const auto observed = api->observed_run_status(); observed.has_value()) return *observed;
-    if (runtime == nullptr) return 0;
+    if (runtime == nullptr || api->launch_owns_execution_image()) return 0;
 
     void *device_sm = runtime->get_gm_sm_ptr();
     if (device_sm == nullptr) {
@@ -1669,9 +1674,7 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
         // the pool counters had to travel.
         const uint64_t image_bytes = runtime->dev.sm_image_bytes;
         const uint64_t copied_bytes = publication.bytes - image_bytes;
-        // The widest attribute string a segment formats: eight uint64 fields plus
-        // their labels. With the counters ahead of it in the recorded string, this
-        // is the tail a truncation eats first.
+        // Keep the workspace address visible even when the attribute buffer fills.
         char attrs[kBindAttrsCapacity];
         snprintf(
             attrs, sizeof(attrs),

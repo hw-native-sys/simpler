@@ -577,24 +577,9 @@ public:
         uint32_t pipeline_slot, const void *bytes, std::size_t length, uint32_t *source_out, uint64_t *base_out
     );
     /**
-     * Hand one pipeline slot its retained scheduler-state storage, both sides.
-     *
-     * `bytes` is what this run uses; the retained capacity may exceed it, and
-     * only the caller's own length is ever initialized, uploaded or read back.
-     * Both outputs are the aligned base, never the allocation it sits in.
-     * Neither block is cleared: the caller writes the whole range it uses
-     * before shipping it.
-     *
-     * Growth prepares the host side first — the side that can fail without
-     * touching the device — and keeps the previously handed-out device block
-     * when the device allocation fails, so a failed growth leaves the slot the
-     * storage its last successful bind published into. A device block whose
-     * release fails is retained in the slot's single failed-release record,
-     * which then refuses any further growth for that slot.
-     *
-     * Refused while the runner cannot accept a run: a quarantined device is one
-     * whose previous writer was never proven stopped, so its slot's storage is
-     * not handed back for overwriting.
+     * Prepare slot-local initialization bytes and select a device destination.
+     * Serialized launches share a capacity-fitting destination. Profiling reads
+     * its device image after execution and therefore uses a run-owned target.
      */
     int acquire_scheduler_state_storage(
         uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **device_out, void **host_out
@@ -980,7 +965,7 @@ public:
      */
     int setup_static_arena(
         uint32_t pipeline_slot, RegionBanks banks, bool pooled_heap, size_t gm_heap_size, size_t gm_sm_size,
-        size_t runtime_arena_size
+        size_t runtime_arena_size, bool shared_runtime_arena = false
     );
     int setup_static_arena(RegionBanks banks, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size) {
         return setup_static_arena(0, banks, false, gm_heap_size, gm_sm_size, runtime_arena_size);
@@ -2852,22 +2837,11 @@ protected:
 
     void release_graph_definition_staging();
 
-    /**
-     * Release every slot's retained scheduler-state storage.
-     *
-     * Returns the first failing free's code, having attempted every block —
-     * the live one and any failed-release record — so one failure cannot
-     * strand the rest. Each outcome is recorded before the slot's entry is
-     * cleared, and an address the allocator could not free stays in its
-     * tracking map with its bytes still committed, which is what hands that
-     * block to the allocator's own terminal sweep rather than dropping it.
-     * Clearing the entry afterwards is what makes a second close a no-op; it
-     * is not a claim that the bytes went back.
-     */
+    // After retired generations have drained, release the current shared block.
     int release_scheduler_state_storage();
 
     /**
-     * Drop every slot's retained scheduler-state storage without a device call.
+     * Forget active and retired scheduler backing after a confirmed reset.
      *
      * The fatal counterpart of release_scheduler_state_storage(): a force reset
      * has already invalidated the device generation these addresses belong to,
@@ -3170,11 +3144,13 @@ protected:
         std::vector<std::byte> bytes;
     };
     RunResourceSlots<RetainedGraphStaging> graph_definition_staging_;
-    // Scheduler-state storage, one retained pair per pipeline slot — see
-    // HostApi acquire_scheduler_state_storage and utils/retained_scheduler_storage.h,
-    // which holds the grow, alignment and failure rules. One pair per slot
-    // because a slot's runs are serialized while different slots' runs are not.
-    RunResourceSlots<std::shared_ptr<RetainedSchedulerStorage>> scheduler_state_storage_;
+    struct SchedulerBindStorage {
+        AlignedImageStorage host;
+        // Holds the chosen generation across bind until the prepared run takes it.
+        std::shared_ptr<RetainedSchedulerStorage> device;
+    };
+    RunResourceSlots<SchedulerBindStorage> scheduler_state_storage_;
+    std::shared_ptr<RetainedSchedulerStorage> shared_scheduler_state_;
     // Host mirror of the runtime shared memory, one retained buffer per pipeline
     // slot — see HostApi acquire_sm_mirror. A host-side orchestrator writes its
     // whole shared-memory image here and the bind ships the live prefix, so the
@@ -3285,7 +3261,7 @@ protected:
         RunResourceSlots<NativeRunClaim>::Storage active_native_runs;
         RunResourceSlots<std::shared_ptr<PreparedRunResources::TemporaryStorage>>::Storage temporary_storage;
         RunResourceSlots<RetainedGraphStaging>::Storage graph_definition_staging;
-        RunResourceSlots<std::shared_ptr<RetainedSchedulerStorage>>::Storage scheduler_state_storage;
+        RunResourceSlots<SchedulerBindStorage>::Storage scheduler_state_storage;
         RunResourceSlots<std::shared_ptr<void>>::Storage orchestration_scratch;
         RunResourceSlots<std::shared_ptr<void>>::Storage prepare_plans;
         RunResourceSlots<RetainedSmMirror>::Storage sm_mirrors;

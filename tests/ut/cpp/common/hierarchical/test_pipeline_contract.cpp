@@ -68,7 +68,7 @@ TEST(PipelineContract, RejectsAnotherAbiVersion) {
     EXPECT_FALSE(is_valid_pipeline_contract(&c));
 }
 
-TEST(PipelineContract, AcceptsAPooledHeapAndRejectsPooledNonHeapRegions) {
+TEST(PipelineContract, AcceptsPooledHeapAndRuntimeImage) {
     PipelineContract c = accepted_contract();
     c.resources[1] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_POOLED_SCRATCH, 0};
     ASSERT_TRUE(is_valid_pipeline_contract(&c));
@@ -77,7 +77,13 @@ TEST(PipelineContract, AcceptsAPooledHeapAndRejectsPooledNonHeapRegions) {
     const PipelineSlotLease second_slot{1, 0, 7};
     EXPECT_EQ(pipeline_resource_slot(c, c.resources[1], second_slot), 0u);
 
+    c.pipeline_depth = 3;
     c.resources[1].kind = PTO_PIPELINE_RUNTIME_IMAGE;
+    ASSERT_TRUE(is_valid_pipeline_contract(&c, SIMPLER_MODE_KERNEL));
+    EXPECT_TRUE(has_serviceable_arena_topology(c));
+    EXPECT_EQ(pipeline_resource_banks_for_slot(c, 2).image, 0u);
+
+    c.resources[1].kind = PTO_PIPELINE_GM_SM;
     EXPECT_FALSE(is_valid_pipeline_contract(&c));
     EXPECT_FALSE(has_serviceable_arena_topology(c));
 }

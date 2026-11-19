@@ -50,6 +50,6 @@ struct EntryPoints {
 
 void *primary_entry_points() { return &entry_points; }
 void *alternate_entry_points() { return &other_entry_points; }
-uint32_t arena_bank(uint32_t slot) { return slot; }
+uint32_t arena_bank(uint32_t slot) { return pipeline_resource_banks_for_slot(*get_pipeline_contract(), slot).image; }
 
 }  // namespace native_admission_test

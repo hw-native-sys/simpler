@@ -33,10 +33,11 @@ The resource contract classifies storage by its data flow and ownership:
 - `DELIVERED` regions carry this run's own content and need independent copies
   for in-flight runs, selected by the run's lease slot.
 - `SCRATCH` regions are initialized once and reused by serialized device work.
-- `POOLED_SCRATCH` is a GM heap leased from the platform's `ScratchPool`.
-  Ordered runs share one fixed-capacity allocation and base per context.
+- `POOLED_SCRATCH` is shared device workspace sized at bind time.
+  For the GM heap, ordered runs share one fixed-capacity allocation and base per context.
   Run retirement and memory pressure never release this allocation; context
   teardown releases it after retained models and in-flight uses have ended.
+  The HBG execution arena can grow when a graph needs more writable storage.
 - `REPORTED` storage holds device-written results for host observation. The
   result pool keys ownership by run epoch; no runtime contract declares this
   resource class yet.
@@ -50,20 +51,24 @@ and captured models sharing a context must execute in one caller-ordered domain;
 their publication and complete device execution must not overlap. Retained
 preparations retain the heap through all future and in-flight model uses.
 
-Onboard HBG Kernel prepare packs the initial execution image on the Host.
+During onboard HBG prepare, the Host packs the initial execution image for
+both Program and Kernel mode.
 RTS delivers the snapshot with the Kernel arguments. On each execution,
 including replay, AICPU restores the writable execution arena from this
-snapshot before scheduling. The arena stays independently retained, and
-prerequisite scheduler or graph-argument uploads remain ordered on the launch
-stream. The Host uses the same delivery path for eager and capture. AICPU and
-AICore refer to the same Simpler-owned shared state. Scheduler notification and
+snapshot before scheduling. Runs that fit the current writable arena use the
+same device address across pipeline slots. Growth preserves any old allocation
+referenced by a run or a model. Prerequisite scheduler and graph-argument
+uploads execute in order on the launch stream. Eager execution and capture
+use the same delivery path. AICPU and AICore refer to the same Simpler-owned
+shared state. Scheduler notification and
 counter owners stay with the prepared execution after the Host image staging
 ends.
 
-A5 appends the read-only Native Graph plan to the compact task image. Both
-schedulers read that plan from the restored Simpler arena using the address and
-length in their worker context. Run control, ready queues, completion counters,
-and notifications live in separately allocated writable scheduler storage.
+A5 appends the read-only Native Graph plan to the compact task image. On the
+ordinary resident path, the worker context points into the RTS copy of that plan.
+The scheduler also uses a writable device allocation for run control and ready
+queues. Ordered runs reuse that allocation while it fits. Runs whose scheduler
+state must be read back for profiling retain separate device storage.
 
 A2/A3 and A5 HBG use `CallConfig.runtime_env.ring_heap[0]` as the context heap capacity in
 bytes (a Python scalar broadcasts to all entries; HBG ignores entries 1–3).

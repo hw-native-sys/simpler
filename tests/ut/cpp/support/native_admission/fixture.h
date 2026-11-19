@@ -68,9 +68,7 @@ public:
         callables_[1] = std::move(callable);
         chip_callable_buffers_[1] = ChipCallableBuffer{};
     }
-    size_t scheduler_capacity(uint32_t slot) const {
-        return scheduler_state_storage_[slot] ? scheduler_state_storage_[slot]->device_capacity() : 0;
-    }
+    size_t scheduler_capacity(uint32_t slot) const { return run_resource_cost(slot).scheduler_bytes; }
     int prepare_result(uint32_t slot = 0, uint64_t epoch = 1) {
         KernelArgsHelper args;
         // This low-level evidence fixture explicitly requests the native record.

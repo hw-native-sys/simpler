@@ -528,8 +528,11 @@ static int setup_static_arena_wrapper(
         const PipelineResource *heap =
             contract != nullptr ? find_pipeline_resource(*contract, PTO_PIPELINE_GM_HEAP) : nullptr;
         const bool pooled_heap = heap != nullptr && heap->resource_class == PTO_PIPELINE_POOLED_SCRATCH;
+        const PipelineResource *image =
+            contract != nullptr ? find_pipeline_resource(*contract, PTO_PIPELINE_RUNTIME_IMAGE) : nullptr;
+        const bool shared_runtime_arena = image != nullptr && image->resource_class == PTO_PIPELINE_POOLED_SCRATCH;
         return runner->setup_static_arena(
-            pipeline_slot, banks, pooled_heap, gm_heap_size, gm_sm_size, runtime_arena_size
+            pipeline_slot, banks, pooled_heap, gm_heap_size, gm_sm_size, runtime_arena_size, shared_runtime_arena
         );
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1571,9 +1574,8 @@ static void quarantine_undrained_run(DeviceRunnerBase &runner, int rc) noexcept 
  */
 static const PipelineResource *declared_arena_resource(const PipelineContract *contract) {
     if (contract == nullptr) return nullptr;
-    // The pooled heap is not a per-run arena bank: its base comes from a
-    // ScratchPool lease, and two runs share it by design. The bank a run owns
-    // exclusively is the image (or shared memory, when the runtime has one).
+    // The pooled heap has its own lease. Check the bank selected for the
+    // remaining arena storage when the heap is supplied by that pool.
     const PipelineResource *arena = find_pipeline_resource(*contract, PTO_PIPELINE_GM_HEAP);
     if (arena != nullptr && arena->resource_class == PTO_PIPELINE_POOLED_SCRATCH) arena = nullptr;
     if (arena == nullptr) {

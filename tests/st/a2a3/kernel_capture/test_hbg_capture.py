@@ -325,10 +325,12 @@ def _check_model_lifecycle(hbg_capture_probe, request, scenario):
         assert "stage=finalize-after-destroy rc=0" in result.stdout
         assert "stage=retain-once" not in result.stdout
     if scenario == 14:
+        assert "stage=shared-runtime-workspace rc=0" in result.stdout
         assert "stage=larger-image rc=0" in result.stdout
         if platform == "a5":
-            assert "stage=independent-scheduler-storage rc=0" in result.stdout
-        assert result.stdout.index("stage=finalize-larger-run rc=0") < result.stdout.index("replay=2 verified=16")
+            assert "stage=shared-scheduler-workspace rc=0" in result.stdout
+        assert result.stdout.index("stage=shared-runtime-workspace rc=0") < result.stdout.index("replay=2 verified=16")
+        assert result.stdout.index("stage=larger-image rc=0") < result.stdout.index("replay=3 verified=16")
     replays = 0 if scenario in (3, 15) else (5 if scenario in (12, 13) else 3)
     assert (
         f"hbg_capture PASS scenario={scenario} replays={replays} prepare={captures} launch={captures}" in result.stdout

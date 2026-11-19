@@ -276,56 +276,50 @@ int main(int argc, char **argv) {
                     "fresh-output"
                 );
             std::printf("replay=%d verified=16\n", round + 1);
-            if (scenario == 14 && round == 0) {
-                check(simpler_wait_run_completion(ctx, run), "retire-first-replay");
-                // Reuse the same slot while the caller still owns the original run and model.
-                std::vector<uint8_t> larger_storage(get_runtime_size() + get_runtime_alignment());
-                const auto aligned =
-                    (reinterpret_cast<uintptr_t>(larger_storage.data()) + get_runtime_alignment() - 1) &
-                    ~(get_runtime_alignment() - 1);
-                auto larger_run = reinterpret_cast<void *>(aligned);
-                ChipStorageTaskArgs larger_args;
+            if (scenario == 14 && round < 2) {
+                if (round == 0) check(simpler_wait_run_completion(ctx, run), "retire-first-replay");
+                // Keep the captured run and model alive. First reuse its workspace for
+                // a different scalar, then submit a larger graph before the last replay.
+                const bool same_size = round == 0;
+                std::vector<uint8_t> eager_storage(get_runtime_size() + get_runtime_alignment());
+                const auto aligned = (reinterpret_cast<uintptr_t>(eager_storage.data()) + get_runtime_alignment() - 1) &
+                                     ~(get_runtime_alignment() - 1);
+                auto eager_run = reinterpret_cast<void *>(aligned);
+                ChipStorageTaskArgs eager_args;
                 for (int i = 0; i < args.tensor_count(); ++i)
-                    larger_args.add_tensor(args.tensor(i));
-                larger_args.add_scalar(16);
-                NativeRunDescriptor larger_descriptor{};
-                larger_descriptor.generation = larger_descriptor.run_epoch = 2;
-                check(
-                    simpler_prepare_run(ctx, larger_run, 0, &larger_args, &config, &larger_descriptor),
-                    "prepare-larger-run"
-                );
+                    eager_args.add_tensor(args.tensor(i));
+                host_control = 13;
+                eager_args.add_scalar(same_size ? 6 : 16);
+                NativeRunDescriptor eager_descriptor{};
+                eager_descriptor.generation = eager_descriptor.run_epoch = round + 2;
+                check(simpler_prepare_run(ctx, eager_run, 0, &eager_args, &config, &eager_descriptor), "prepare-eager");
                 capture_test::begin_capture_publication_probe();
-                check(simpler_launch_run_on_stream(ctx, larger_run, caller, nullptr), "launch-larger-run");
-                const auto larger_submission = capture_test::finish_capture_publication_probe();
-                require(
-                    submission.cpu_launches.size() == 1 && larger_submission.cpu_launches.size() == 1 &&
-                        submission.cpu_launches.front().image_bytes > 0 &&
-                        larger_submission.cpu_launches.front().image_bytes >
-                            submission.cpu_launches.front().image_bytes,
-                    "larger-image"
-                );
-                // Only A5 has resident scheduler worker contexts in a separate metadata upload.
-                const auto scheduler_upload = [](const capture_test::CapturedSubmission &captured) {
-                    const auto contexts = captured.launches.at(0).worker_context_base;
-                    for (const auto &copy : captured.publications) {
-                        const auto target = reinterpret_cast<uintptr_t>(copy.destination);
-                        if (contexts >= target && contexts - target < copy.bytes) return copy;
-                    }
-                    return capture_test::CapturedPublication{};
-                };
-                if (submission.launches.at(0).worker_context_base != 0) {
-                    const auto first = scheduler_upload(submission);
-                    const auto second = scheduler_upload(larger_submission);
+                check(simpler_launch_run_on_stream(ctx, eager_run, caller, nullptr), "launch-eager");
+                const auto eager_submission = capture_test::finish_capture_publication_probe();
+                require(submission.cpu_launches.size() == 1 && eager_submission.cpu_launches.size() == 1, "cpu-launch");
+                const auto &original = submission.cpu_launches.front();
+                const auto &eager = eager_submission.cpu_launches.front();
+                require(original.image_bytes > 0, "original-image");
+                if (same_size) {
+                    require(eager.image_bytes == original.image_bytes, "same-size-image");
                     require(
-                        first.source && second.source && first.source != second.source &&
-                            first.destination != second.destination,
-                        "independent-scheduler-storage"
+                        original.working_address && eager.working_address == original.working_address,
+                        "shared-runtime-workspace"
                     );
+                    // Resident A5 workers have a second writable region for their scheduler.
+                    const auto worker_base = submission.launches.at(0).worker_context_base;
+                    if (worker_base)
+                        require(
+                            eager_submission.launches.at(0).worker_context_base == worker_base,
+                            "shared-scheduler-workspace"
+                        );
+                } else {
+                    require(eager.image_bytes > original.image_bytes, "larger-image");
                 }
-                check(simpler_finalize_run(ctx, larger_run), "finalize-larger-run");
-                check(aclrtMemcpy(observed, bytes, output, bytes, ACL_MEMCPY_DEVICE_TO_HOST), "read-larger-output");
+                check(simpler_finalize_run(ctx, eager_run), "finalize-eager");
+                check(aclrtMemcpy(observed, bytes, output, bytes, ACL_MEMCPY_DEVICE_TO_HOST), "read-eager-output");
                 for (int i = 0; i < 16; ++i)
-                    require(observed[i] == i + 14, "larger-output");
+                    require(observed[i] == 100 * round + i + (same_size ? 20 : 14), "eager-output");
             }
         }
         if (model != nullptr) check(aclmdlRIDestroy(model), "destroy-model");

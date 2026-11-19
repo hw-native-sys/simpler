@@ -143,8 +143,8 @@ static_assert(
 static constexpr uint32_t kKernelPipelineDepth = 2;
 
 extern "C" const PipelineContract *get_pipeline_contract(void) {
-    // The heap is pooled across ordered executions; the runtime image
-    // remains independently owned by each run. GM_SM has no separate region.
+    // Each launch supplies its initial image. Ordered executions share the
+    // device heap and the writable portion of the runtime arena.
     // pipeline_depth bounds supported resource sets without preallocating them.
     static const PipelineContract contract = {
         PTO_PIPELINE_CONTRACT_ABI_VERSION,
@@ -152,7 +152,7 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
         UINT32_MAX,
         {
             {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_POOLED_SCRATCH, 0},
-            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_DELIVERED, 0},
+            {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_POOLED_SCRATCH, 0},
             {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
             {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},
         },
@@ -171,9 +171,15 @@ extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, Pip
 }
 
 extern "C" int concurrent_native_prepare_supported_impl(void) {
-    // HBG can materialize a complete graph into the lease-selected unpublished
-    // arena bank.
+    // Each prepare assembles its own host image.
     return 1;
+}
+
+extern "C" int
+prepared_run_config_compatible_impl(const HostApi *api, const uint64_t *, const uint64_t *, const uint64_t *) {
+    // Bind writes host staging. The device writes shared scratch only after
+    // launch ordering takes effect, and growth retains the previous backing.
+    return api != nullptr && api->launch_owns_execution_image();
 }
 
 extern "C" int set_run_ccu_workspace_impl(Runtime *runtime, uint64_t address) {
@@ -182,8 +188,7 @@ extern "C" int set_run_ccu_workspace_impl(Runtime *runtime, uint64_t address) {
 }
 
 extern "C" int joined_native_launch_supported_impl(void) {
-    // Per-run images remain independently owned. A queued device event wait
-    // orders executions that reuse the context heap scratch.
+    // A queued device event wait orders use of the shared heap and scheduler scratch.
     return 1;
 }
 
@@ -462,8 +467,7 @@ namespace {
 // name, so it is a wire contract and not a variable.
 constexpr const char *kSchedulerJsonTaskKey = "\"task_id\":";
 
-// The device storage belongs to the pipeline slot. The frozen Host graph belongs
-// to this run and remains valid after the orchestration mirror is reused.
+// Profiling retains a run-specific readback target and its frozen host graph.
 struct SchedulerStateOwner {
     void *state_base;
     std::vector<uint64_t> public_task_ids;
@@ -1161,11 +1165,8 @@ struct GraphHostStateBinding {
 // storage, and a selected run requires a context base. Both words are published
 // through publish_scheduler_bootstrap.
 //
-// The storage that base named belongs to the pipeline slot. What ends here is
-// this run's claim on it — the record, the bootstrap words and the handshake
-// words — and the slot's next run re-initializes and re-ships the whole range
-// before naming it again. Nothing is freed here; the slot cannot be re-entered
-// before this run has released its bindings, which is where this runs from.
+// Prepared resources retain the device target. Releasing the binding drops
+// the profiling lookup and the descriptor's references to that target.
 void release_scheduler_state(Runtime *runtime) {
     if (runtime == nullptr) return;
     scheduler_extension_release(runtime);
@@ -1783,7 +1784,7 @@ bool create_scheduler_state(
 
     if (layout.total_size > std::numeric_limits<uint64_t>::max() - (SCHEDULER_STATE_BASE_ALIGNMENT - 1)) return false;
     const uint64_t allocation_size = layout.total_size + SCHEDULER_STATE_BASE_ALIGNMENT - 1;
-    // The slot's retained pair, each side aligned with at least total_size
+    // The host staging and device target are aligned with at least total_size
     // behind it. Handed over uninitialized and never carrying anything between
     // runs: initialization publishes the current metadata prefix. Reserved
     // async storage remains hidden until its first runtime publication.
@@ -3044,11 +3045,7 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
     }
     {
         const uint64_t image_bytes = runtime->dev.sm_image_bytes;
-        // The widest attribute string a segment formats: eight uint64 fields plus
-        // their labels. With the counters ahead of it in the recorded string, this
-        // is the tail a truncation eats first. `dest` leads instead, because the
-        // range a run published into is what tells two runs' images apart, and it
-        // is the one field a truncated tail must not lose.
+        // Keep the workspace address visible even when the attribute buffer fills.
         char attrs[kBindAttrsCapacity];
         snprintf(
             attrs, sizeof(attrs),

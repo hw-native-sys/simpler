@@ -457,7 +457,7 @@ DeviceRunnerBase::RunResourceStaging DeviceRunnerBase::build_run_resources(size_
     for (auto &storage : staged.temporary_storage)
         storage = std::make_shared<PreparedRunResources::TemporaryStorage>();
     staged.graph_definition_staging = RunResourceSlots<RetainedGraphStaging>::build(granted);
-    staged.scheduler_state_storage = RunResourceSlots<std::shared_ptr<RetainedSchedulerStorage>>::build(granted);
+    staged.scheduler_state_storage = RunResourceSlots<SchedulerBindStorage>::build(granted);
     staged.orchestration_scratch = RunResourceSlots<std::shared_ptr<void>>::build(granted);
     staged.prepare_plans = RunResourceSlots<std::shared_ptr<void>>::build(granted);
     staged.sm_mirrors = RunResourceSlots<RetainedSmMirror>::build(granted);
@@ -1422,7 +1422,14 @@ int DeviceRunnerBase::acquire_scheduler_state_storage(
     }
 
     std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
-    auto &storage = scheduler_state_storage_[pipeline_slot];
+    auto &bind = scheduler_state_storage_[pipeline_slot];
+    void *host = nullptr;
+    if (device_out == nullptr || host_out == nullptr || bind.host.acquire(bytes, alignment, &host) != 0) return -1;
+    // Swimlane collection reads back this run's scheduler state after execution.
+    const bool reported = host_phase_runs_[pipeline_slot].chip_swimlane_level != ChipSwimlaneLevel::DISABLED;
+    std::shared_ptr<RetainedSchedulerStorage> reported_storage;
+    auto &storage = reported ? reported_storage : shared_scheduler_state_;
+    if (reported) retired_prepared_schedulers_.reserve(retired_prepared_schedulers_.size() + 1);
     const RetainedSchedulerStorage::Status status = PreparedRunResources::acquire_scheduler(
         storage, retired_prepared_schedulers_, bytes, alignment,
         [this](size_t raw_bytes) -> void * {
@@ -1435,19 +1442,16 @@ int DeviceRunnerBase::acquire_scheduler_state_storage(
         [this](void *ptr) {
             return mem_alloc_.free(ptr);
         },
-        device_out, host_out
+        device_out
     );
     if (status == RetainedSchedulerStorage::Status::Ok) {
-        // Not a failure of this acquire: the slot kept a block it could not
-        // release, the allocator still tracks and counts it, and the slot
-        // refuses to grow until its terminal release.
+        if (reported) retired_prepared_schedulers_.push_back(storage);
+        bind.device = storage;
+        *host_out = host;
+        // A failed free leaves the superseded block tracked until teardown.
         void *held = storage->held_after_failed_release();
         if (held != nullptr) {
-            LOG_WARN(
-                "scheduler-state storage: slot %u still holds device block %p from a failed release; the allocator "
-                "owns it and this slot refuses further growth",
-                pipeline_slot, held
-            );
+            LOG_WARN("scheduler-state storage: retained device block %p after failed release", held);
         }
         return 0;
     }
@@ -1459,39 +1463,15 @@ int DeviceRunnerBase::acquire_scheduler_state_storage(
 }
 
 int DeviceRunnerBase::release_scheduler_state_storage() {
-    int first_error = 0;
-    uint32_t slot = 0;
-    for (auto &entry : scheduler_state_storage_) {
-        if (!entry) {
-            ++slot;
-            continue;
-        }
-        if (entry.use_count() > 1) return PTO_RUNTIME_ERR_INVALID_STATE;
-        const int rc = entry->release([this, slot](void *ptr) {
-            const int free_rc = mem_alloc_.free(ptr);
-            if (free_rc != 0) {
-                // Recorded before the entry is cleared. The address stays in
-                // the allocator's tracking map with its bytes still committed,
-                // so reclamation is unknown rather than proven and the block
-                // reaches the allocator's own terminal sweep.
-                LOG_ERROR(
-                    "scheduler-state storage: release of slot %u device block %p failed: %d; it stays committed in "
-                    "the allocator for its terminal sweep",
-                    slot, ptr, free_rc
-                );
-            }
-            return free_rc;
-        });
-        if (rc != 0 && first_error == 0) first_error = rc;
-        ++slot;
-    }
-    return first_error;
+    if (!shared_scheduler_state_) return 0;
+    if (shared_scheduler_state_.use_count() != 1) return PTO_RUNTIME_ERR_INVALID_STATE;
+    return shared_scheduler_state_->release([this](void *ptr) {
+        return mem_alloc_.free(ptr);
+    });
 }
 
 void DeviceRunnerBase::abandon_scheduler_state_storage() {
-    for (auto &entry : scheduler_state_storage_) {
-        if (entry) entry->abandon();
-    }
+    if (shared_scheduler_state_) shared_scheduler_state_->abandon();
     for (auto &entry : retired_prepared_schedulers_)
         entry->abandon();
     retired_prepared_schedulers_.clear();
@@ -1632,7 +1612,7 @@ void DeviceRunnerBase::mark_prebuilt_runtime_arena_cached(
 
 int DeviceRunnerBase::setup_static_arena(
     uint32_t pipeline_slot, RegionBanks banks, bool pooled_heap, size_t gm_heap_size, size_t gm_sm_size,
-    size_t runtime_arena_size
+    size_t runtime_arena_size, bool shared_runtime_arena
 ) {
     for (uint32_t bank : {banks.heap, banks.sm, banks.image}) {
         if (bank >= arena_banks_.size()) {
@@ -1766,6 +1746,10 @@ int DeviceRunnerBase::setup_static_arena(
         for (size_t i = 0; i < 3; ++i) {
             auto &region = arena_bank(bank_for_region(banks, i)).region(i);
             if (region.use_count() <= 1) continue;
+            // Bind only builds the next launch's host image. A retained run
+            // can reuse the same write target until a larger layout is needed.
+            if (i == 2 && shared_runtime_arena && runtime_arena_size != 0 && runtime_arena_size <= region->cached_size)
+                continue;
             if (previous_regions.empty()) {
                 previous_regions.reserve(3);
                 retired_prepared_regions_.reserve(retired_prepared_regions_.size() + 3);
@@ -3347,6 +3331,9 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     } else if (prepared_storage_in_use()) {
         return PTO_RUNTIME_ERR_INVALID_STATE;
     }
+    // A failed bind may still hold its selected generation before publication.
+    for (auto &bind : scheduler_state_storage_)
+        bind = {};
     if (abandon_device_resources) {
         for (auto &bank : retired_prepared_regions_)
             bank.abandon_after_device_failure();
@@ -4382,7 +4369,8 @@ int DeviceRunnerBase::retain_prepared_run_resources(
     }
     cost.image_bytes = arena_banks_[banks.image]->runtime_pool->arena.total_size();
     cost.shared_memory_bytes = arena_banks_[banks.sm]->gm_sm->arena.total_size();
-    if (scheduler_state_storage_[slot]) cost.scheduler_bytes = scheduler_state_storage_[slot]->device_capacity();
+    auto &scheduler = scheduler_state_storage_[slot].device;
+    if (scheduler) cost.scheduler_bytes = scheduler->device_capacity();
     {
         std::lock_guard<std::mutex> result_lock(run_result_mu_);
         const auto result = run_result_storage_.find(prepared.identity.run_epoch);
@@ -4394,7 +4382,7 @@ int DeviceRunnerBase::retain_prepared_run_resources(
     });
     const bool image_in_launch = prepared.kernel_args.has_execution_image();
     auto resources = std::make_shared<PreparedRunResources>(
-        image_in_launch ? nullptr : run_image_stagings_[slot], scheduler_state_storage_[slot], std::move(selected),
+        image_in_launch ? nullptr : run_image_stagings_[slot], std::move(scheduler), std::move(selected),
         std::move(leases)
     );
     resources->take_heap_lease(heap_pool_, heap_lease);
@@ -4844,6 +4832,7 @@ int DeviceRunnerBase::prepare_run_storage(uint32_t slot, bool capture_preparatio
     {
         std::lock_guard<std::mutex> lock(prepared_storage_mutex_);
         if (slot >= submission_storage_.size()) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+        scheduler_state_storage_[slot].device.reset();
         auto &current = submission_storage_[slot];
         if (current.use_count() != 1) {
             auto next = make_submission_storage();

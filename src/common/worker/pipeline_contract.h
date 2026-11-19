@@ -58,7 +58,8 @@ inline bool is_valid_pipeline_contract(const PipelineContract *contract, uint32_
             resource.resource_class > PTO_PIPELINE_POOLED_SCRATCH) {
             return false;
         }
-        if (resource.resource_class == PTO_PIPELINE_POOLED_SCRATCH && resource.kind != PTO_PIPELINE_GM_HEAP) {
+        if (resource.resource_class == PTO_PIPELINE_POOLED_SCRATCH && resource.kind != PTO_PIPELINE_GM_HEAP &&
+            resource.kind != PTO_PIPELINE_RUNTIME_IMAGE) {
             return false;
         }
         // Images are sized by orchestration; pooled heap capacity is configured at bind time.
@@ -138,7 +139,7 @@ inline bool has_serviceable_arena_topology(const PipelineContract &contract) {
         if (declared > 1) return false;
         if (resource == nullptr) continue;
         if (resource->resource_class == PTO_PIPELINE_POOLED_SCRATCH) {
-            if (kind != PTO_PIPELINE_GM_HEAP) return false;
+            if (kind != PTO_PIPELINE_GM_HEAP && kind != PTO_PIPELINE_RUNTIME_IMAGE) return false;
             continue;
         }
         if (resource->resource_class != PTO_PIPELINE_DELIVERED && resource->resource_class != PTO_PIPELINE_SCRATCH) {

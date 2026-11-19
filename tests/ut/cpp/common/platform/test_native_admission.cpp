@@ -2817,6 +2817,7 @@ TEST_F(NativeAdmissionTest, ShippedArenaTopologiesAreServiceable) {
     const auto *heap = find_pipeline_resource(*program, PTO_PIPELINE_GM_HEAP);
     ASSERT_NE(heap, nullptr);
     EXPECT_EQ(heap->resource_class, hbg ? PTO_PIPELINE_POOLED_SCRATCH : PTO_PIPELINE_SCRATCH);
+    EXPECT_EQ(pipeline_resource_banks_for_slot(*program, 1).image, 0u);
     PipelineContract kernel{};
     ASSERT_EQ(build_kernel_pipeline_contract_impl(&attempt.config, &kernel), 0);
     EXPECT_TRUE(is_valid_pipeline_contract(&kernel, SIMPLER_MODE_KERNEL));
@@ -2826,6 +2827,7 @@ TEST_F(NativeAdmissionTest, ShippedArenaTopologiesAreServiceable) {
     heap = find_pipeline_resource(kernel, PTO_PIPELINE_GM_HEAP);
     ASSERT_NE(heap, nullptr);
     EXPECT_EQ(heap->resource_class, hbg ? PTO_PIPELINE_POOLED_SCRATCH : PTO_PIPELINE_SCRATCH);
+    EXPECT_EQ(pipeline_resource_banks_for_slot(kernel, 1).image, 0u);
 }
 
 TEST_F(NativeAdmissionTest, NativePrepareParksAndDestroysTheAttemptBeforeAnEarlyRetryAttachFailure) {

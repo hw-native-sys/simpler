@@ -117,7 +117,7 @@ TEST(PreparedRunResources, UnheldImageReusesCapacityAndInvalidRequestKeepsCache)
     EXPECT_EQ(cache, previous);
 }
 
-TEST(PreparedRunResources, SchedulerDetachProtectsBothSidesAndFailureKeepsOriginal) {
+TEST(PreparedRunResources, SchedulerSharesCapacityAndRetainsOldDeviceAddressOnlyAcrossGrowth) {
     std::shared_ptr<RetainedSchedulerStorage> cache;
     std::vector<std::shared_ptr<RetainedSchedulerStorage>> retired;
     bool fail_allocate = false;
@@ -128,38 +128,43 @@ TEST(PreparedRunResources, SchedulerDetachProtectsBothSidesAndFailureKeepsOrigin
         std::free(p);
         return 0;
     };
-    void *device = nullptr, *host = nullptr;
+    void *first = nullptr;
     ASSERT_EQ(
-        PreparedRunResources::acquire_scheduler(cache, retired, 256, 64, allocate, release, &device, &host),
+        PreparedRunResources::acquire_scheduler(cache, retired, 256, 64, allocate, release, &first),
         RetainedSchedulerStorage::Status::Ok
     );
-    auto original = cache;
     auto held =
         std::make_shared<PreparedRunResources>(nullptr, cache, nullptr, std::vector<WorkspaceManager::BackingLease>{});
-    std::memset(device, 0x5a, 256);
-    std::memset(host, 0xa5, 256);
-    void *next_device = nullptr, *next_host = nullptr;
+    std::memset(first, 0x5a, 256);
+
     fail_allocate = true;
-    EXPECT_EQ(
-        PreparedRunResources::acquire_scheduler(cache, retired, 256, 64, allocate, release, &next_device, &next_host),
-        RetainedSchedulerStorage::Status::DeviceUnavailable
-    );
-    EXPECT_EQ(cache, original);
-    EXPECT_TRUE(retired.empty());
-    fail_allocate = false;
+    void *second = nullptr;
     ASSERT_EQ(
-        PreparedRunResources::acquire_scheduler(cache, retired, 256, 64, allocate, release, &next_device, &next_host),
+        PreparedRunResources::acquire_scheduler(cache, retired, 128, 64, allocate, release, &second),
         RetainedSchedulerStorage::Status::Ok
     );
-    EXPECT_NE(device, next_device);
-    EXPECT_NE(host, next_host);
-    EXPECT_EQ(static_cast<unsigned char *>(device)[255], 0x5a);
-    EXPECT_EQ(static_cast<unsigned char *>(host)[255], 0xa5);
-    EXPECT_EQ(retired.size(), 1U);
+    EXPECT_EQ(first, second);
+    EXPECT_EQ(
+        PreparedRunResources::acquire_scheduler(cache, retired, 512, 64, allocate, release, &second),
+        RetainedSchedulerStorage::Status::DeviceUnavailable
+    );
+    EXPECT_EQ(second, nullptr);
+    EXPECT_EQ(cache->device_addr(), first);
+    EXPECT_TRUE(retired.empty());
+
+    fail_allocate = false;
+    ASSERT_EQ(
+        PreparedRunResources::acquire_scheduler(cache, retired, 512, 64, allocate, release, &second),
+        RetainedSchedulerStorage::Status::Ok
+    );
+    EXPECT_NE(first, second);
+    ASSERT_EQ(retired.size(), 1U);
+    EXPECT_EQ(retired.front()->device_addr(), first);
+    std::memset(second, 0xa5, 512);
+    EXPECT_EQ(static_cast<unsigned char *>(first)[255], 0x5a);
     held.reset();
-    original.reset();
-    ASSERT_EQ(retired[0].use_count(), 1);
-    EXPECT_EQ(retired[0]->release_preserving_failure(release), 0);
+    ASSERT_EQ(retired.front().use_count(), 1);
+    EXPECT_EQ(retired.front()->release_preserving_failure(release), 0);
     EXPECT_EQ(cache->release_preserving_failure(release), 0);
 }
 

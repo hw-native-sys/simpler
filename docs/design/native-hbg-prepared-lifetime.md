@@ -17,7 +17,7 @@ A completed execution is not authorization to destroy a model's backing.
 | Caller context, stream and external tensors | Caller-owned; valid through all recorded and in-flight uses. |
 | Callable code and registration | Simpler retains the actual callable lease; referenced code cannot be unregistered. Unrelated callables remain independent. |
 | Runtime descriptor and initial HBG execution image | Onboard Program and Kernel pass these as RTS Host inputs. RTS owns the snapshot for execution and retains it with a captured model for replay. |
-| HBG writable execution arena | The run owns the writable backing, or a retained resource reference can extend its lifetime. The ordinary A5 scheduler restores a 64-byte status prefix. A2/A3 restore the runtime and shared headers and initialize writable task slots from RTS records. |
+| HBG writable execution arena | Simpler shares the current allocation across ordered runs. Each prepared run retains the allocation named by its launch packet. The ordinary A5 scheduler restores a 64-byte status prefix. A2/A3 restore the runtime and shared headers and initialize writable task slots from RTS records. |
 | Pinned sources for explicit copies | Simpler submission storage retains pinned sources for the lifetime of recorded copies and any in-flight DMA. |
 | Shared state and scheduler resources | Simpler retains the shared AICPU/AICore backing, each workspace lease, and scheduler notification and counter owners until the last use. Both device roles receive the same shared addresses. |
 | HBG GM heap | Preparation retains a fixed heap lease through its last use, including external model uses. |
@@ -29,11 +29,12 @@ ended their readers. RTS launch snapshots and the Simpler-owned sources of
 recorded DMA carry their respective replay lifetimes. Borrowed device addresses
 in either carrier refer to separately retained backing.
 
-Slot and bank caches do not own permission to overwrite a retained version.
-Equal-capacity writes can require new storage. Image, scheduler, arena, temporary
-and submission storage detach from retained predecessors before reuse. Retired
-owners keep their raw addresses and failed-release records reachable; workspace
-accounting cannot recycle an address still held by a prepared owner.
+Host snapshots and pinned DMA sources retain their per-run contents. The writable
+HBG arena and ordinary A5 scheduler storage can serve multiple retained runs at
+the same address because each execution initializes them in stream order. When
+a graph outgrows the current allocation, previous runs keep their recorded
+addresses through their last use. A5 scheduler storage read back for profiling
+remains private to its run.
 
 HBG heap leases protect allocation lifetime, not historical scratch contents.
 Same-context ordered preparations share one fixed-capacity allocation even while

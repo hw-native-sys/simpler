@@ -77,7 +77,7 @@ def test_cumulative_workspace_release_readmits_same_request(tmp_path, request, r
         ) in stdout
         for stage in (
             "heap-does-not-scale-with-retained-models",
-            "retained-images-independent",
+            "retained-models-share-workspace",
             "same-pressure-readmitted",
             "workspace-reclaimed",
         ):
