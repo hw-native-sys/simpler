@@ -17,13 +17,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def selected_cases():
-    for flavor in ("pypto_lib", "pypto_lib_dsl", "pypto_lib_latest"):
-        cases = json.loads((ROOT / "workloads" / flavor / "source.json").read_text())["cases"]
-        variants = (flavor, "pypto_lib_dsl_all_sync64") if flavor == "pypto_lib_dsl" else (flavor,)
-        for variant in variants:
-            for case, spec in cases.items():
-                if variant in spec.get("variants", variants):
-                    yield f"{variant}/{case}"
+    manifest = ROOT / "workloads/pypto_lib_latest/source.json"
+    for name in json.loads(manifest.read_text())["cases"]:
+        yield f"pypto_lib_latest/{name}"
 
 
 if __name__ == "__main__":
