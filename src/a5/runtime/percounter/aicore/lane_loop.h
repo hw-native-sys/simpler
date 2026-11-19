@@ -96,6 +96,9 @@ struct LaneConfig {
     __gm__ PercounterTaskClaim *task_claims;
     __gm__ PercounterClaimSummary *claim_summary;
     __gm__ PercounterStartBarrier *sync_arrivals;
+    // Null when the Host provisioned no CntNotify for this run; an entry holds
+    // zero when its own cohort fell back to the GM arrival sectors.
+    __gm__ uint64_t *sync_notify;
     uint64_t task_count;
     uint64_t table_task_count;
     bool has_predicates;
@@ -106,6 +109,11 @@ struct LaneConfig {
 
     int32_t cluster_index;
     int32_t cluster_lane;
+    // Reported topology. A boundary whose block count equals its list's eligible
+    // owner count assigns blocks by owner rank and draws no ticket; both the
+    // count and the rank follow from these two words and this lane's position.
+    uint32_t cluster_count;
+    uint32_t aiv_per_cluster;
     uint64_t mix_task_count;
     __gm__ uint64_t *mix_signal_ready;
     PERCOUNTER_SSBUF PercounterSsbufRegion *ssbuf;
@@ -399,6 +407,9 @@ struct PercounterPublicationCursor {
     uint32_t block_count{0};
     uint32_t rank{UINT32_MAX};
     uint32_t next_segment{PERCOUNTER_NO_BOUNDARY};
+    // Which release condition this boundary answers to, read once with its
+    // shape and held for as long as the cursor rests on it.
+    bool statically_assigned{false};
 };
 
 struct PercounterSource {
@@ -431,6 +442,11 @@ struct PercounterLaneState {
     uint32_t published_floor{0};
     uint32_t observed_mix_floor{0};
     uint32_t required_mix_floor{0};
+    // The cohort whose CntNotify address is cached below. A readiness probe
+    // repeats until the cohort starts, so the address is read once per cohort
+    // this lane visits rather than once per probe.
+    uint32_t notify_sync{PERCOUNTER_NO_SYNC};
+    PercounterSyncNotify notify{0, 0};
     uint32_t seen_sequence{0};
     uint32_t shared_active{0};
     bool mix_closed{false};
@@ -1055,12 +1071,81 @@ inline __aicore__ void percounter_close_segment(const LaneConfig &cfg, uint32_t 
     percounter_gm_fetch_add_issue(cfg.claim_summary[index / 64].closed, uint64_t{1} << (index % 64));
 }
 
-inline __aicore__ bool percounter_claim_exhausted(const LaneConfig &cfg, uint32_t index) {
-    return percounter_gm_read(cfg.task_claims[index].closed_sectors) >= PERCOUNTER_CLAIM_SECTOR_COUNT;
+inline __aicore__ uint64_t percounter_claim_closed(const LaneConfig &cfg, uint32_t index) {
+    return percounter_gm_read(cfg.task_claims[index].closed_sectors);
 }
 
+// A boundary is exhausted once every sector carries its bit. The Host seeds the
+// bits of sectors a boundary is too narrow to reach, which have no owner to
+// issue them.
+inline __aicore__ bool percounter_claim_exhausted(uint64_t closed) {
+    return (closed & PERCOUNTER_CLAIM_SECTOR_MASK) == PERCOUNTER_CLAIM_SECTOR_MASK;
+}
+
+/**
+ * Add an exhausted boundary's summary bit under the publication flag, which
+ * names a single publisher. The summary word is a packed bitmask and GM has no
+ * atomic OR, so a second add would carry into the neighbouring boundary's
+ * position and mark a still-open boundary closed.
+ *
+ * `closed` is the word the caller has already read, so this costs one atomic
+ * and no load. Callers are lanes skipping the boundary, never one drawing a
+ * ticket from it; a boundary left unpublished costs a later scan only the
+ * loads this bit would have saved it.
+ */
+inline __aicore__ void
+percounter_publish_segment(const LaneConfig &cfg, uint32_t index, uint64_t closed, uint32_t segment) {
+    if ((closed & PERCOUNTER_CLAIM_SUMMARY_PUBLISHED) != 0) return;
+    auto *claim = cfg.task_claims + index;
+    if (percounter_gm_compare_exchange(claim->closed_sectors, closed, closed | PERCOUNTER_CLAIM_SUMMARY_PUBLISHED) !=
+        closed)
+        return;
+    percounter_close_segment(cfg, segment);
+}
+
+/**
+ * AIC work and MIX take one owner per cluster; ordinary vector work takes one
+ * per AIV lane. A sync boundary sized to that count assigns block `rank` to the
+ * owner of rank `rank`. Every owner reaches the same verdict from the same two
+ * words, so the ticket path and this one never share a boundary.
+ *
+ * Only a sync boundary qualifies, and only one exactly as wide as its domain.
+ * Binding a block to one owner gives up the ticket path's balancing -- a busy
+ * owner's block waits for that owner rather than moving to a free one. A
+ * full-width cohort has no such balancing to lose, since every owner takes a
+ * block; a narrower one does, and pays for it.
+ */
+inline __aicore__ bool
+percounter_claim_is_static(const LaneConfig &cfg, uint32_t list, bool mix, bool sync, uint32_t blocks) {
+    if (!sync) return false;
+    const uint32_t owners = (list == 0 || mix) ? cfg.cluster_count : cfg.cluster_count * cfg.aiv_per_cluster;
+    return owners != 0 && blocks == owners;
+}
+
+inline __aicore__ uint32_t percounter_owner_rank(const LaneConfig &cfg, uint32_t list, bool mix) {
+    if (list == 0 || mix) return static_cast<uint32_t>(cfg.cluster_index);
+    return static_cast<uint32_t>(cfg.cluster_index) * cfg.aiv_per_cluster + static_cast<uint32_t>(cfg.cluster_lane - 1);
+}
+
+/**
+ * Take this owner's statically assigned block without drawing a ticket. The
+ * boundary is exactly as wide as its domain, so block `rank` belongs to the
+ * owner of rank `rank` and no two owners name the same block.
+ *
+ * Nothing records exhaustion here, and `percounter_claim_exhausted` is
+ * therefore never true for such a boundary. A sector mask filled on this path
+ * would say only that the owners of the highest blocks have claimed, which is
+ * not the question either reader asks: a lane skips the boundary on the static
+ * verdict itself, and the publication floor releases it when this lane's own
+ * claim cursor passes.
+ */
 inline __aicore__ uint32_t
-percounter_claim_block(const LaneConfig &cfg, uint32_t index, uint32_t blocks, uint32_t segment) {
+percounter_claim_static_block(const LaneConfig &cfg, uint32_t list, bool mix, uint32_t blocks) {
+    const uint32_t rank = percounter_owner_rank(cfg, list, mix);
+    return rank < blocks ? rank : blocks;
+}
+
+inline __aicore__ uint32_t percounter_claim_block(const LaneConfig &cfg, uint32_t index, uint32_t blocks) {
     auto *claim = cfg.task_claims + index;
     const uint32_t first = cfg.cluster_index & (PERCOUNTER_CLAIM_SECTOR_COUNT - 1);
     for (uint32_t offset = 0; offset < PERCOUNTER_CLAIM_SECTOR_COUNT; ++offset) {
@@ -1069,10 +1154,10 @@ percounter_claim_block(const LaneConfig &cfg, uint32_t index, uint32_t blocks, u
         if (count == 0 || percounter_gm_read(claim->sectors[part].next) >= count) continue;
         const uint64_t ticket = percounter_gm_fetch_add(claim->sectors[part].next, uint64_t{1});
         if (ticket >= count) continue;
-        if (ticket + 1 == count) {
-            const uint64_t closed = percounter_gm_fetch_add(claim->closed_sectors, uint64_t{1});
-            if (closed + 1 == PERCOUNTER_CLAIM_SECTOR_COUNT) percounter_close_segment(cfg, segment);
-        }
+        // Only this owner draws the sector's last ticket, so the bit lands once
+        // and needs no returned value. Whether it completes the boundary is
+        // read off this path, by a lane that is already skipping the boundary.
+        if (ticket + 1 == count) percounter_gm_fetch_add_issue(claim->closed_sectors, uint64_t{1} << part);
         return part + static_cast<uint32_t>(ticket) * PERCOUNTER_CLAIM_SECTOR_COUNT;
     }
     return blocks;
@@ -1100,9 +1185,20 @@ inline __aicore__ void percounter_claim(const LaneConfig &cfg, PercounterLaneSta
         state->revisit &= ~(1U << slot);
         auto &previous = state->slots[slot];
         const auto metadata = previous.metadata;
-        if (percounter_claim_exhausted(cfg, previous.claim_index)) continue;
-        const uint32_t block =
-            percounter_claim_block(cfg, previous.claim_index, metadata.block_num, previous.claim_index + list);
+        // A statically assigned boundary gives this owner exactly one block, and
+        // its exhaustion mask completes before the lowest ranks have scanned, so
+        // neither the mask nor the summary bit may steer an owner here.
+        if (percounter_claim_is_static(
+                cfg, list, __builtin_popcount(metadata.active_mask) > 1, metadata.sync_index != PERCOUNTER_NO_SYNC,
+                metadata.block_num
+            ))
+            continue;
+        const uint64_t closed = percounter_claim_closed(cfg, previous.claim_index);
+        if (percounter_claim_exhausted(closed)) {
+            percounter_publish_segment(cfg, previous.claim_index, closed, previous.claim_index + list);
+            continue;
+        }
+        const uint32_t block = percounter_claim_block(cfg, previous.claim_index, metadata.block_num);
         if (block < metadata.block_num) {
             percounter_own_entry(
                 cfg, state, percounter_order_entry(percounter_order_task_id(previous.entry), block, metadata.block_num),
@@ -1138,7 +1234,21 @@ inline __aicore__ void percounter_claim(const LaneConfig &cfg, PercounterLaneSta
         const uint64_t shape = source.task_shape;
         const uint32_t blocks = static_cast<uint32_t>(shape >> 48);
         // A closed boundary counter also proves its preceding interval claimed.
-        if (shape != 0 && percounter_claim_exhausted(cfg, segment_index - list)) continue;
+        // A statically assigned boundary is exempt: its mask completes as soon as
+        // the highest ranks publish, which can precede a lower rank's scan, and
+        // that owner's block is reserved for it alone.
+        const bool statically_assigned =
+            shape != 0 && percounter_claim_is_static(
+                              cfg, list, __builtin_popcount(static_cast<uint32_t>(shape >> 32) & 7U) > 1,
+                              (shape & (uint64_t{8} << 32)) != 0, blocks
+                          );
+        if (shape != 0 && !statically_assigned) {
+            const uint64_t closed = percounter_claim_closed(cfg, segment_index - list);
+            if (percounter_claim_exhausted(closed)) {
+                percounter_publish_segment(cfg, segment_index - list, closed, segment_index);
+                continue;
+            }
+        }
         if (loaded_now) {
             const uint64_t bounds = percounter_gm_read_immutable_word(&cfg.segments[segment_index].begin);
             source.begin = static_cast<uint32_t>(bounds);
@@ -1175,7 +1285,8 @@ inline __aicore__ void percounter_claim(const LaneConfig &cfg, PercounterLaneSta
             const bool mix = __builtin_popcount(mask) > 1;
             if (!mix || cfg.cluster_lane == 1) {
                 const uint32_t claim_index = segment_index - list;
-                const uint32_t block = percounter_claim_block(cfg, claim_index, blocks, segment_index);
+                const uint32_t block = statically_assigned ? percounter_claim_static_block(cfg, list, mix, blocks) :
+                                                             percounter_claim_block(cfg, claim_index, blocks);
                 if (block < blocks) {
                     const uint32_t task = static_cast<uint32_t>(shape);
                     const uint32_t rank =
@@ -1203,7 +1314,21 @@ inline __aicore__ void percounter_claim(const LaneConfig &cfg, PercounterLaneSta
     }
 }
 
-// A claim is not visible to peers until its SSBUF record has been published.
+/**
+ * The rank of the oldest boundary this lane may still claim from, which bounds
+ * what it can still publish: a claim is not visible to peers until its SSBUF
+ * record has been published.
+ *
+ * A boundary releases the floor once this lane can no longer take a block from
+ * it, and the two claim paths prove that differently. An exhausted ticket
+ * boundary has no ticket left for anyone, so exhaustion releases it wherever
+ * this lane's scan has reached. A statically assigned boundary reserves this
+ * lane's block for it alone and its mask completes as soon as the ranks
+ * carrying the sector bits claim, which can precede a lower rank's scan -- so
+ * exhaustion proves nothing there, and only the claim cursor passing the
+ * boundary does. Passing it means this lane took its block or owns none, and
+ * the revisit path never returns to a static boundary.
+ */
 inline __aicore__ uint32_t percounter_source_floor(const LaneConfig &cfg, PercounterSource &source, bool mix_only) {
     const uint32_t list = cfg.cluster_lane == 0 ? 0 : 1;
     auto &cursor = mix_only ? source.mix_floor : source.cohort_floor;
@@ -1219,8 +1344,15 @@ inline __aicore__ uint32_t percounter_source_floor(const LaneConfig &cfg, Percou
             task = static_cast<uint32_t>(shape);
             cursor.next_segment =
                 static_cast<uint32_t>(percounter_gm_read_immutable_word(&cfg.metadata[task].sync_index) >> 32);
+            cursor.statically_assigned = percounter_claim_is_static(
+                cfg, list, __builtin_popcount(static_cast<uint32_t>(shape >> 32) & 7U) > 1,
+                (shape & (uint64_t{8} << 32)) != 0, blocks
+            );
         }
-        if (!percounter_claim_exhausted(cfg, index - list)) {
+        const bool released = cursor.statically_assigned ?
+                                  source.segment > index - cfg.segment_begin[list] :
+                                  percounter_claim_exhausted(percounter_claim_closed(cfg, index - list));
+        if (!released) {
             if (cursor.block_count == 0) {
                 cursor.block_count = blocks;
                 cursor.rank =
@@ -1279,13 +1411,43 @@ inline __aicore__ bool percounter_commit_live(const LaneConfig &cfg, const Perco
            percounter_ssbuf_load_acquire(&record->completed) != state.committed_generation;
 }
 
-inline __aicore__ void percounter_start_arrive(const LaneConfig &cfg, uint32_t sync, uint32_t block) {
+/**
+ * The cohort's notification slot. A readiness probe repeats until the cohort
+ * starts, so this resolves once per cohort the lane visits and the probe itself
+ * reads no table.
+ */
+inline __aicore__ PercounterSyncNotify
+percounter_sync_notify(const LaneConfig &cfg, PercounterLaneState *state, uint32_t sync) {
+    if (sync == PERCOUNTER_NO_SYNC || cfg.sync_notify == nullptr) return PercounterSyncNotify{0, 0};
+    if (state->notify_sync != sync) {
+        // The table carries the SET/read address alone; its ADD alias is a
+        // fixed displacement, so the slot costs one load rather than two.
+        const uint64_t read_address = percounter_gm_read_immutable_word(&cfg.sync_notify[sync]);
+        state->notify.read_address = read_address;
+        state->notify.add_address = percounter_notify_add_address(read_address);
+        state->notify_sync = sync;
+    }
+    return state->notify;
+}
+
+inline __aicore__ void
+percounter_start_arrive(const LaneConfig &cfg, const PercounterSyncNotify &notify, uint32_t sync, uint32_t block) {
+    if (notify.add_address != 0) {
+        percounter_notify_add(*reinterpret_cast<__gm__ volatile uint32_t *>(notify.add_address), 1);
+        return;
+    }
     percounter_gm_fetch_add_issue(
         cfg.sync_arrivals[sync].sectors[block & (PERCOUNTER_START_SECTOR_COUNT - 1)].next, uint64_t{1}
     );
 }
 
-inline __aicore__ bool percounter_start_ready(const LaneConfig &cfg, uint32_t sync, uint32_t blocks, uint32_t block) {
+inline __aicore__ bool percounter_start_ready(
+    const LaneConfig &cfg, const PercounterSyncNotify &notify, uint32_t sync, uint32_t blocks, uint32_t block
+) {
+    // One counter carries the whole cohort, so its arrival total is the block
+    // count itself rather than a per-partition expectation.
+    if (notify.read_address != 0)
+        return percounter_notify_query(*reinterpret_cast<__gm__ volatile uint32_t *>(notify.read_address)) == blocks;
     // Rotate probes to spread readers as well as arrival writers. Zero-sized
     // sectors are complete without a read; every nonempty sector must arrive.
     for (uint32_t offset = 0; offset < PERCOUNTER_START_SECTOR_COUNT; ++offset) {
@@ -1420,6 +1582,7 @@ inline __aicore__ bool percounter_step(const LaneConfig &cfg, PercounterLaneStat
             }
 
             const uint32_t sync_index = cohort.sync_index;
+            const PercounterSyncNotify sync_notify = percounter_sync_notify(cfg, state, sync_index);
             const uint32_t blocks = static_cast<uint32_t>(percounter_order_block_num(cohort.entry));
             state->committed = identity;
             state->committed_entry = cohort.entry;
@@ -1443,7 +1606,7 @@ inline __aicore__ bool percounter_step(const LaneConfig &cfg, PercounterLaneStat
                 if (cohort_go && sync_index != PERCOUNTER_NO_SYNC) {
                     if (static_cast<uint32_t>(cfg.cluster_lane) == static_cast<uint32_t>(__builtin_ctz(cohort.mask)) &&
                         percounter_ssbuf_load_acquire(&record->start_arrived) != cohort.generation) {
-                        percounter_start_arrive(cfg, sync_index, percounter_order_block_idx(cohort.entry));
+                        percounter_start_arrive(cfg, sync_notify, sync_index, percounter_order_block_idx(cohort.entry));
                         percounter_ssbuf_store_release(&record->start_arrived, cohort.generation);
                     }
                 }
@@ -1451,15 +1614,16 @@ inline __aicore__ bool percounter_step(const LaneConfig &cfg, PercounterLaneStat
                 auto &slot = state->slots[cohort.index];
                 if (!slot.entered) {
                     slot.entered = true;
-                    percounter_start_arrive(cfg, sync_index, percounter_order_block_idx(cohort.entry));
+                    percounter_start_arrive(cfg, sync_notify, sync_index, percounter_order_block_idx(cohort.entry));
                 }
                 cohort_go = true;
             }
             if (cohort_go && sync_index != PERCOUNTER_NO_SYNC) {
                 if (!cohort.shared ||
                     static_cast<uint32_t>(cfg.cluster_lane) == static_cast<uint32_t>(__builtin_ctz(cohort.mask))) {
-                    cohort_go =
-                        percounter_start_ready(cfg, sync_index, blocks, percounter_order_block_idx(cohort.entry));
+                    cohort_go = percounter_start_ready(
+                        cfg, sync_notify, sync_index, blocks, percounter_order_block_idx(cohort.entry)
+                    );
                     if (cohort_go && cohort.shared)
                         percounter_ssbuf_store_release(&record->start_ready, cohort.generation);
                 } else {
@@ -1654,6 +1818,8 @@ run_percounter_lane(__gm__ PercounterControl *control, int block_idx, CoreType c
     cfg.task_claims = scheduler_state_at<PercounterTaskClaim>(control, control->task_claims_offset);
     cfg.claim_summary = scheduler_state_at<PercounterClaimSummary>(control, control->claim_summary_offset);
     cfg.sync_arrivals = scheduler_state_at<PercounterStartBarrier>(control, control->sync_arrivals_offset);
+    cfg.sync_notify =
+        control->sync_notify_offset == 0 ? nullptr : scheduler_state_at<uint64_t>(control, control->sync_notify_offset);
     for (uint32_t i = 0; i < PERCOUNTER_LIST_COUNT; ++i) {
         cfg.segment_begin[i] = control->segment_begin[i];
         cfg.segment_count[i] = control->segment_count[i];
@@ -1683,6 +1849,8 @@ run_percounter_lane(__gm__ PercounterControl *control, int block_idx, CoreType c
     cfg.async_completion_capacity = control->async_completion_capacity;
     cfg.cluster_index = coordinate.cluster_index;
     cfg.cluster_lane = coordinate.cluster_lane;
+    cfg.cluster_count = static_cast<uint32_t>(cluster_count);
+    cfg.aiv_per_cluster = static_cast<uint32_t>(aiv_per_cluster);
 
     const uint64_t timeout_cycles = control->scheduler_timeout_cycles;
     // Order lane setup before claims; completion and claim seeds arrive in the Host image.
