@@ -11,6 +11,7 @@
 
 #include "capture_recovery.h"
 
+#include <acl/acl.h>
 #include <cstring>
 #include "host_build_graph/runtime.h"
 
@@ -29,28 +30,34 @@ void check_publications(int scenario, const CapturedSubmission &submission) {
     if (!needs_publications(scenario)) return;
     arena_binding = nullptr;
     constexpr size_t offset = offsetof(DeviceRuntimeLaunchDesc, prebuilt_arena_base_);
-    for (const auto &launch : submission.launches) {
-        for (size_t index = 0; index < launch.publication_count; ++index) {
-            const auto &publication = submission.publications[index];
-            if (reinterpret_cast<uintptr_t>(publication.destination) == launch.runtime_args &&
-                publication.bytes >= offset + sizeof(void *)) {
-                // The retained reference keeps RTS's pinned publication source alive.
-                arena_binding = static_cast<char *>(const_cast<void *>(publication.source)) + offset;
-            }
+    for (const auto &launch : submission.cpu_launches) {
+        if (launch.runtime_args != 0 && launch.runtime_bytes >= offset + sizeof(void *)) {
+            arena_binding = reinterpret_cast<void *>(launch.runtime_args + offset);
         }
     }
     require(arena_binding != nullptr, "observed-arena-binding");
 }
 
 void inject_boot_failure() {
-    std::memcpy(&saved_arena, arena_binding, sizeof(saved_arena));
+    check(
+        aclrtMemcpy(&saved_arena, sizeof(saved_arena), arena_binding, sizeof(saved_arena), ACL_MEMCPY_DEVICE_TO_HOST),
+        "read-captured-arena-binding"
+    );
     require(saved_arena != nullptr, "prepared-arena-exists");
     void *missing_arena = nullptr;
-    std::memcpy(arena_binding, &missing_arena, sizeof(missing_arena));
+    check(
+        aclrtMemcpy(
+            arena_binding, sizeof(missing_arena), &missing_arena, sizeof(missing_arena), ACL_MEMCPY_HOST_TO_DEVICE
+        ),
+        "inject-captured-arena-binding"
+    );
 }
 
 void restore_boot_failure() {
-    std::memcpy(arena_binding, &saved_arena, sizeof(saved_arena));
+    check(
+        aclrtMemcpy(arena_binding, sizeof(saved_arena), &saved_arena, sizeof(saved_arena), ACL_MEMCPY_HOST_TO_DEVICE),
+        "restore-captured-arena-binding"
+    );
     check(0, "restore-injected-arena-binding");
 }
 

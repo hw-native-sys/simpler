@@ -19,23 +19,10 @@
 #include "runtime.h"
 #include "runtime_c_api.h"
 
-// A host-owned snapshot of the uploaded prefix of the device descriptor for one
-// invocation. The destination is owned separately by the run's persistent slot
-// and is allocated to the full device extent, which is never shorter: a
-// descriptor may end in storage no host copy reaches — device-initialized, or
-// never host-initialized at all — and no bytes for that range are snapshotted
-// or copied. The caller supplies the length, because which prefix a publication
-// carries depends on whether its destination block has been initialized yet.
-// Publication is synchronous; consuming a snapshot neither frees nor resets the
-// destination.
-//
-// The snapshot is the only source a publication reads, so a caller may capture
-// it and publish later without re-reading the `Runtime` it came from — which by
-// then may hold a successor's values. What a caller may still change is
-// `patch`: a control word whose value is a property of the publication rather
-// than of the captured state, decided once the run knows which route it takes.
-// `publish` takes its own length so the same snapshot can serve either route,
-// and refuses one longer than what was captured.
+// A per-invocation descriptor snapshot. Publication reads only captured bytes;
+// its callback may enqueue DMA or construct an RTS launch package. Consuming
+// the snapshot does not release the destination or any external device address.
+// Bounds-checked patch/read operations preserve the chosen publication length.
 class RuntimeLaunchImage {
 public:
     RuntimeLaunchImage() = default;

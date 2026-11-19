@@ -134,11 +134,6 @@ WAIVERS: dict[tuple[str, str], str] = {
         "three priority-prefix backends; a5 TMR shares the counter types but "
         "uses its reservation-aware queue API, covered by test_ready_queue_profiling"
     ),
-    ("common/platform/test_kernel_persistent_args.cpp", "a5/tensormap_and_ringbuffer"): (
-        "the test asserts the uploaded Runtime prefix ends at teardown_gates; "
-        "a5's tensormap_and_ringbuffer Runtime has no such device-initialized "
-        "tail, so this boundary assertion has no counterpart there"
-    ),
     ("common/platform/test_chip_swimlane_run_export.cpp", "a5/host_build_graph"): (
         "the case compares against a golden captured on a2a3, carrying that "
         "capture's own clock_freq_hz and platform — both values the writer takes "

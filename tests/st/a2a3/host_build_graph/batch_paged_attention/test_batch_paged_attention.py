@@ -65,6 +65,8 @@ class TestBatchPagedAttentionHostBuildGraph(SceneTestCase):
         {
             "name": "Case1",
             "platforms": ["a2a3"],
+            # The host graph requires 339,771,392 bytes of fixed heap backing.
+            "config": {"runtime_env": {"ring_heap": 512 << 20}},
             "params": {
                 "batch": 256,
                 "num_heads": 16,

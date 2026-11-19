@@ -30,12 +30,16 @@ inline bool valid_entry_cache_route(const PlatformEntryArgs &view) {
 
 static_assert(offsetof(Runtime, dev) == 0);
 static_assert(entry_tensor_offset % 64 == 0);
-static_assert(offsetof(DeviceRuntimeLaunchDesc, workers) % 64 == 0);
+static_assert(offsetof(RuntimeSharedState, workers) % 64 == 0);
 static_assert(sizeof(Tensor) % 64 == 0);
 
 // Called after header classification and before descriptor entry values are consumed.
 template <typename Clean>
 bool freshen_entry_descriptor(Runtime &runtime, const PlatformEntryArgs &view, Clean clean) {
+    if (runtime.get_entry_args_source() == EntryArgsSource::KernelInvocation) {
+        return view.source == static_cast<uint32_t>(EntryArgsSource::KernelInvocation) &&
+               view.cache_maintenance == static_cast<uint32_t>(EntryCacheMaintenance::Full);
+    }
     if (!valid_entry_cache_maintenance(view.cache_maintenance)) return false;
     if (view.cache_maintenance == static_cast<uint32_t>(EntryCacheMaintenance::Live))
         return view.source == static_cast<uint32_t>(EntryArgsSource::LaunchEnvelope);
@@ -59,6 +63,9 @@ bool freshen_entry_descriptor(Runtime &runtime, const PlatformEntryArgs &view, C
 }
 
 inline size_t live_entry_cleanup_prefix(const Runtime &runtime, const PlatformEntryArgs &view, bool snapshot_ok) {
+    if (runtime.get_entry_args_source() == EntryArgsSource::KernelInvocation ||
+        view.source == static_cast<uint32_t>(EntryArgsSource::KernelInvocation))
+        return offsetof(DeviceRuntimeLaunchDesc, orch_args_storage_);
     if (!snapshot_ok || view.cache_maintenance != static_cast<uint32_t>(EntryCacheMaintenance::Live) ||
         view.source != static_cast<uint32_t>(EntryArgsSource::LaunchEnvelope) ||
         runtime.get_entry_args_source() != EntryArgsSource::LaunchEnvelope ||
@@ -67,15 +74,13 @@ inline size_t live_entry_cleanup_prefix(const Runtime &runtime, const PlatformEn
         view.tensor_count != runtime.get_entry_tensor_count() || view.scalar_count != runtime.get_entry_scalar_count())
         return sizeof(runtime.dev);
     const size_t prefix = entry_tensor_offset + static_cast<size_t>(view.tensor_count) * sizeof(Tensor);
-    return prefix < offsetof(DeviceRuntimeLaunchDesc, workers) ? prefix : sizeof(runtime.dev);
+    return prefix < sizeof(runtime.dev) ? prefix : sizeof(runtime.dev);
 }
 template <typename Clean>
 void clean_entry_runtime(Runtime &runtime, const PlatformEntryArgs &view, bool snapshot_ok, Clean clean) {
     const size_t prefix = live_entry_cleanup_prefix(runtime, view, snapshot_ok);
-    clean(&runtime, prefix);
-    if (prefix < offsetof(DeviceRuntimeLaunchDesc, workers)) {
-        constexpr size_t suffix = offsetof(DeviceRuntimeLaunchDesc, workers);
-        clean(reinterpret_cast<unsigned char *>(&runtime) + suffix, sizeof(runtime.dev) - suffix);
-    }
+    if (view.runtime_address == 0 || view.runtime_address == reinterpret_cast<uint64_t>(&runtime))
+        clean(&runtime, prefix);
+    clean(runtime.get_workers(), sizeof(RuntimeSharedState));
 }
 }  // namespace simpler::tmr

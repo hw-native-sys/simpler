@@ -371,15 +371,16 @@ host_phase_pool_finish(void *runner_ctx, uint32_t pipeline_slot, uint64_t submit
 }
 
 static int setup_static_arena_wrapper(
-    void *runner_ctx, uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
+    void *runner_ctx, uint32_t /*pipeline_slot*/, RegionBanks banks, size_t gm_heap_size, size_t gm_sm_size,
+    size_t runtime_arena_size
 ) {
     if (runner_ctx == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     return guarded_runner_call<&WseHostRunner::setup_static_arena>(
-        runner_ctx, PTO_RUNTIME_ERR_INTERNAL, arena_bank, gm_heap_size, gm_sm_size, runtime_arena_size
+        runner_ctx, PTO_RUNTIME_ERR_INTERNAL, banks, gm_heap_size, gm_sm_size, runtime_arena_size
     );
 }
 
-static void *acquire_pooled_gm_heap_wrapper(void *runner_ctx, uint32_t arena_bank) {
+static void *acquire_pooled_gm_heap_wrapper(void *runner_ctx, uint32_t /*pipeline_slot*/, uint32_t arena_bank) {
     if (runner_ctx == nullptr) return nullptr;
     return guarded_runner_call<&WseHostRunner::acquire_pooled_gm_heap>(runner_ctx, nullptr, arena_bank);
 }
@@ -1000,7 +1001,11 @@ int simpler_prepare_run(
     const long long trace_start_ns = STRACE_NOW_NS();
     try {
         capture_scope.emplace(config->enable_dep_gen != 0);
-        state = new (runtime) SimNativeRunContext(runner, *config, trace_hid, *descriptor, &g_host_api_ops);
+        const PipelineContract *contract = get_pipeline_contract();
+        const RegionBanks banks = contract != nullptr ?
+                                      pipeline_resource_banks_for_slot(*contract, descriptor->pipeline_slot) :
+                                      RegionBanks{};
+        state = new (runtime) SimNativeRunContext(runner, *config, trace_hid, *descriptor, &g_host_api_ops, banks);
         if (!runner->try_acquire_native_run(state, state->identity(), &state->launch_permit)) {
             LOG_ERROR("simpler_prepare_run: another native run is active on this device context");
             destroy_native_run_context(state);

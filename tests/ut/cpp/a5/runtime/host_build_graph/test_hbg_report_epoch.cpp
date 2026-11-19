@@ -227,9 +227,15 @@ TEST(HandshakeReportEpoch, ANativeLaunchProjectsThisRunsIdentity) {
     k_args.run_result_epoch = kRunNPlus1;
 
     AicoreLaunchArgs args{};
-    fill_shared_launch_args(args, k_args);
+    const AicoreRuntimeView runtime{0x1000, 0x2000, 3, 12, 4, 0};
+    fill_shared_launch_args(args, k_args, runtime);
     EXPECT_EQ(args.report_epoch, kRunNPlus1);
     EXPECT_EQ(args.enable_profiling_flag, k_args.enable_profiling_flag);
+    EXPECT_EQ(args.shared_state_addr, runtime.shared_state_addr);
+    EXPECT_EQ(args.worker_context_base, runtime.worker_context_base);
+    EXPECT_EQ(args.runtime_mode, runtime.runtime_mode);
+    EXPECT_EQ(args.worker_count, runtime.worker_count);
+    EXPECT_EQ(args.chip_swimlane_level, runtime.chip_swimlane_level);
 }
 
 // A kernel/persistent launch projects 0, which is what selects the protocol
@@ -239,7 +245,7 @@ TEST(HandshakeReportEpoch, AKernelLaunchProjectsZeroAndKeepsTheOldPredicate) {
     ASSERT_EQ(k_args.run_result_epoch, 0u) << "kernel mode leaves the epoch unset";
 
     AicoreLaunchArgs args{};
-    fill_shared_launch_args(args, k_args);
+    fill_shared_launch_args(args, k_args, AicoreRuntimeView{});
     ASSERT_EQ(args.report_epoch, 0u);
 
     // With that input a producer writes no stamp, and the consumer accepts on

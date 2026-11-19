@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 #include <cstddef>
 #include <cstring>
+#include <vector>
 #include "acl/acl.h"
 #include "device_runner_helpers.h"
 
@@ -21,8 +22,9 @@ constexpr unsigned char kDeviceMark = 0xa5;
 struct RtsState {
     int copy_rc = 0;
     int copies = 0;
+    int shared_initializations = 0;
     bool recording = false;
-    bool allow_sync_initialization = false;
+    bool allow_sync_initialization = true;
     LaunchProgressSink sink;
     uint64_t last_copy_bytes = 0;
     // Bytes to write before reporting `copy_rc`. Zero is the all-or-nothing
@@ -40,10 +42,51 @@ struct CaptureAnswer {
 };
 extern CaptureAnswer capture;
 
+struct RtsLaunchCopy {
+    struct alignas(64) Block {
+        unsigned char bytes[64];
+    };
+    std::vector<Block> storage;
+    size_t bytes = 0;
+    void *data() { return storage.data(); }
+    const void *data() const { return storage.data(); }
+    KernelArgs header() const {
+        KernelArgs value{};
+        std::memcpy(&value, data(), sizeof(value));
+        return value;
+    }
+};
+
 class LaunchEntryArgs : public ::testing::Test {
 protected:
     void SetUp() override { rts = {}; }
     void TearDown() override { EXPECT_EQ(release_slot_persistent_args(slot, allocator), 0); }
+
+    RtsLaunchCopy copy_launch() {
+        RtsLaunchCopy copy;
+        copy.bytes = helper.launch_payload_bytes();
+        copy.storage.resize((copy.bytes + 63) / 64);
+        auto *host = static_cast<unsigned char *>(helper.launch_payload());
+        auto *device = static_cast<unsigned char *>(copy.data());
+        for (uint16_t i = 0; i < helper.host_input_count(); ++i) {
+            const auto &relocation = helper.host_inputs()[i];
+            EXPECT_LE(relocation.addrOffset + sizeof(uint64_t), copy.bytes);
+            EXPECT_LT(relocation.dataOffset, copy.bytes);
+            const uint64_t address = reinterpret_cast<uint64_t>(device + relocation.dataOffset);
+            std::memcpy(host + relocation.addrOffset, &address, sizeof(address));
+        }
+        std::memcpy(device, host, copy.bytes);
+        return copy;
+    }
+
+    int prepare_kernel() {
+        runtime.set_active_callable_id(3);
+        helper.args.run_result_epoch = 19;
+        const int rc = helper.prepare_runtime_args(runtime, allocator, slot, true);
+        if (rc != 0) return rc;
+        const auto plan = runtime_launch_entry_args_plan(runtime);
+        return plan.supported ? helper.prepare_kernel_invocation({3, 7, plan.tensor_count, plan.scalar_count}) : 0;
+    }
 
     int prepare() { return helper.prepare_runtime_args(runtime, allocator, slot); }
     int publish(bool permitted) { return helper.publish_runtime_args(permitted, this, rts.sink); }

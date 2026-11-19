@@ -174,26 +174,6 @@ int kernel_args_init_ffts_base_addr(KernelArgsHelper &helper) {
 // DeviceRunner Implementation
 // =============================================================================
 
-int DeviceRunner::fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) {
-    if (args == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-
-    int rc = init_aicore_register_addresses(&args->regs, device_id, mem_alloc_, AicoreRegKind::Ctrl);
-    if (rc != 0) {
-        LOG_ERROR("fill_persistent_arch_fields: init_aicore_register_addresses(Ctrl) failed: %d", rc);
-        return rc;
-    }
-
-    uint32_t ffts_len = 0;
-    rc = rtGetC2cCtrlAddr(&args->ffts_base_addr, &ffts_len);
-    if (rc != 0) {
-        LOG_ERROR("fill_persistent_arch_fields: rtGetC2cCtrlAddr failed: %d", rc);
-        if (mem_alloc_.free(reinterpret_cast<void *>(args->regs)) == 0) args->regs = 0;
-        args->ffts_base_addr = 0;
-        return rc;
-    }
-    return 0;
-}
-
 int DeviceRunner::ensure_aicpu_topology() {
     if (!aicpu_topology_.empty()) return 0;
     std::vector<simpler::a2a3::AicpuLogicalCpu> topology;
@@ -927,7 +907,8 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
                 (void)mark_run_boundary(RunBoundaryMarks::Position::AicoreStart, prepared.identity, streams.aicore);
 
             LOG_INFO("=== launch_aicore_kernel ===");
-            int launch_rc = launch_aicore_kernel(streams.aicore, prepared.kernel_args.args);
+            int launch_rc =
+                launch_aicore_kernel(streams.aicore, prepared.kernel_args.args, prepared.kernel_args.aicore_view());
             if (launch_rc != 0) {
                 LOG_ERROR("launch_aicore_kernel failed: %d", launch_rc);
                 if (!prepared.recording) recover_device_or_mark_unusable(launch_rc);
@@ -944,7 +925,8 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             STRACE_HOST_SPAN_AT("chip.run.runner_run.aicpu_launch", STRACE_NOW_NS(), 0, 2);
             int launch_rc = launch_aicpu_payload(
                 streams.aicpu, prepared.kernel_args.launch_payload(), prepared.kernel_args.launch_payload_bytes(),
-                host::KernelNames::RunName, aicpu_launch_n
+                host::KernelNames::RunName, aicpu_launch_n, prepared.kernel_args.host_inputs(),
+                prepared.kernel_args.host_input_count()
             );
             if (launch_rc != 0) {
                 LOG_ERROR("launch_aicpu_payload (main) failed: %d", launch_rc);

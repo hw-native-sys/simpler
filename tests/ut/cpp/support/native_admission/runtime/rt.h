@@ -11,6 +11,10 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+struct rtHostInputInfo_t {
+    uint32_t addrOffset;
+    uint32_t dataOffset;
+};
 using rtStream_t = void *;
 using rtFuncHandle = void *;
 using rtError_t = int32_t;
@@ -29,6 +33,8 @@ struct rtDevBinary_t {
 struct rtArgsEx_t {
     void *args;
     uint32_t argsSize;
+    rtHostInputInfo_t *hostInputInfoPtr{};
+    uint16_t hostInputInfoNum{};
 };
 struct rtTaskCfgInfo_t {
     uint32_t schemMode;

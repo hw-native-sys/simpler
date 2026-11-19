@@ -664,7 +664,7 @@ int32_t SchedulerContext::retire_claimed_cores(Runtime *runtime, const int32_t *
     const int32_t rc = platform_retire_aicore_group(targets, count, deadline, released);
     for (size_t i = 0; i < count; ++i) {
         if (!released[i]) continue;
-        Handshake *report = &runtime->dev.workers[claimed_ids[i]];
+        Handshake *report = &runtime->get_workers()[claimed_ids[i]];
         aicore_invalidate_retired_report(report);
         cache_flush_range(report, sizeof(*report));
     }
@@ -706,7 +706,7 @@ int32_t SchedulerContext::retire_all_cores(Runtime *runtime) {
 // landed, so the shared aic_count_/aiv_count_ are written by one thread only.
 // =============================================================================
 void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32_t nthreads) {
-    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->dev.workers);
+    Handshake *all_handshakes = reinterpret_cast<Handshake *>(runtime->get_workers());
     // This run's identity, latched from KernelArgs at AICPU entry. Non-zero on a
     // native program launch, so only a report stamped with it is this run's;
     // zero on a kernel/persistent launch, which keeps the aicore_done predicate.

@@ -34,6 +34,8 @@
 
 #pragma once
 
+#include "common/runtime_shared_state.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
@@ -165,23 +167,17 @@ struct KernelArgs {
     // KERNEL_ENTRY). The host never sets it non-zero; its only purpose is to be
     // a runtime-valued condition the compiler cannot constant-fold, so the
     // never-executed SIMT launch in simt_anchor.h survives DCE and bisheng
-    // still classifies the entry as SIMT. It is the trailing field.
+    // still classifies the entry as SIMT.
     uint32_t force_simt_anchor{0};
+    uint32_t runtime_descriptor_bytes{0};
+    const void *execution_image{nullptr};  // HBG snapshot relocated by RTS
 };
 
 static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");
 static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
 
-// The swimlane bases are not offset-locked by any device contract — AICPU reads
-// them by field name from a CANN-private copy of the whole struct. These pin the
-// measured a5 layout so that appending, reordering, or widening a field is a
-// build failure rather than a silently different launch payload: `sizeof` is
-// what `launch_aicpu_payload` hands to `rtsLaunchCpuKernel` as `argsSize`, and
-// what `PersistentKernelArgs::prepare_once` allocates and copies H2D. The field
-// offsets differ from a2a3's: this struct has no `ffts_base_addr`, so its
-// seventeen 8-byte fields end at 136 rather than 144, and its 32-bit tail holds
-// ten uint32_t rather than nine. This fills 176 bytes exactly; a2a3 rounds
-// its 180 bytes of members to 184 bytes for 8-byte alignment.
+// These assertions pin the launch header ABI. Optional sections and the Kernel
+// runtime descriptor follow this header within the RTS-owned argument package.
 static_assert(offsetof(KernelArgs, chip_swimlane_data_base) == 24, "KernelArgs::chip_swimlane_data_base offset drift");
 static_assert(
     offsetof(KernelArgs, chip_swimlane_run_terminal_bank) == 32,
@@ -198,7 +194,8 @@ static_assert(
 static_assert(offsetof(KernelArgs, graph_section_offset) == 156, "KernelArgs::graph_section_offset offset drift");
 static_assert(offsetof(KernelArgs, entry_cache_maintenance) == 168, "entry cache policy offset drift");
 static_assert(offsetof(KernelArgs, force_simt_anchor) == 172, "SIMT anchor offset drift");
-static_assert(sizeof(KernelArgs) == 176, "KernelArgs launch-payload size drift");
+static_assert(offsetof(KernelArgs, execution_image) == 184, "HBG execution image offset drift");
+static_assert(sizeof(KernelArgs) == 192, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so
 // these values are the same in every translation unit that sees this header.
@@ -227,7 +224,7 @@ static_assert(
  * never-taken SIMT branch is emitted.
  */
 struct AicoreLaunchArgs {
-    uint64_t runtime_args;
+    uint64_t shared_state_addr;
     uint32_t enable_profiling_flag;
     uint32_t force_simt_anchor;
     uint64_t chip_swimlane_aicore_rotation_table;
@@ -241,9 +238,13 @@ struct AicoreLaunchArgs {
     // this run's report. Zero on a kernel/persistent launch, which keeps the
     // `aicore_done != 0` predicate.
     uint64_t report_epoch;
+    uint64_t worker_context_base;
+    uint32_t runtime_mode;
+    int32_t worker_count;
+    uint32_t chip_swimlane_level;
 };
 
-static_assert(sizeof(AicoreLaunchArgs) == 48, "AicoreLaunchArgs size drift");
+static_assert(sizeof(AicoreLaunchArgs) == 72, "AicoreLaunchArgs size drift");
 
 /**
  * Fill the `AicoreLaunchArgs` fields every architecture shares, from the
@@ -255,8 +256,13 @@ static_assert(sizeof(AicoreLaunchArgs) == 48, "AicoreLaunchArgs size drift");
  * launch supplies a non-zero epoch; a kernel/persistent launch leaves it 0,
  * which selects the protocol that predates the stamp.
  */
-inline void fill_shared_launch_args(AicoreLaunchArgs &args, const KernelArgs &k_args) {
-    args.runtime_args = reinterpret_cast<uint64_t>(k_args.runtime_args);
+inline void
+fill_shared_launch_args(AicoreLaunchArgs &args, const KernelArgs &k_args, const AicoreRuntimeView &runtime) {
+    args.shared_state_addr = runtime.shared_state_addr;
+    args.worker_context_base = runtime.worker_context_base;
+    args.runtime_mode = runtime.runtime_mode;
+    args.worker_count = runtime.worker_count;
+    args.chip_swimlane_level = runtime.chip_swimlane_level;
     args.enable_profiling_flag = k_args.enable_profiling_flag;
     args.report_epoch = k_args.run_result_epoch;
 }

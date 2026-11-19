@@ -26,7 +26,8 @@
 
 Runtime::Runtime() {
     // Initialize the device-copied descriptor (`dev`).
-    std::memset(dev.workers, 0, sizeof(dev.workers));
+    std::memset(host_shared_state_.workers, 0, sizeof(host_shared_state_.workers));
+    dev.shared_state_addr = reinterpret_cast<uint64_t>(&host_shared_state_);
     dev.scheduler_bootstrap.runtime_mode = 0;
     dev.scheduler_bootstrap.reserved_ = 0;
     dev.scheduler_bootstrap.worker_context_base = 0;
@@ -145,18 +146,10 @@ uint64_t Runtime::callable_entry_table_addr() const { return host_.callable_entr
 
 uint32_t Runtime::callable_table_len() const { return dev.callable_table_len_; }
 
-// A steady-state host_build_graph run uploads the device descriptor before the
-// handshake region: neither that region nor the gate tail carries a host value
-// the device consumes. On a2a3 the AICPU zeroes the active gates and executes
-// wmb() before publishing hs_setup_done_, with no register window open before
-// that, and a5 neither reads nor initializes them; the handshake words are
-// written by the AICore's report and the AICPU's reply.
+// HBG publishes its fixed descriptor; worker state is a separate allocation.
 size_t runtime_device_copy_size(const Runtime &) { return Runtime::device_image_bytes(); }
 
-// The first publication onto an allocation adds the handshake region, so it
-// starts from the ctor-zeroed host copy rather than from whatever rtMalloc
-// left. It stops before the gates, whose host storage `Runtime()` never
-// initializes.
+// Shared worker state is initialized independently of the descriptor.
 size_t runtime_device_initialized_prefix_size(const Runtime &) { return Runtime::device_initialized_prefix_bytes(); }
 
 size_t runtime_device_extent_size(const Runtime &) { return Runtime::device_extent_bytes(); }
@@ -166,3 +159,5 @@ size_t runtime_device_extent_size(const Runtime &) { return Runtime::device_exte
 LaunchEntryArgsPlan runtime_launch_entry_args_plan(const Runtime &) { return LaunchEntryArgsPlan{}; }
 
 uint32_t runtime_graph_section_bytes(const Runtime &rt) { return rt.get_graph_section_bytes(); }
+
+size_t runtime_device_launch_size(const Runtime &) { return RUNTIME_LAUNCH_DESCRIPTOR_BYTES; }

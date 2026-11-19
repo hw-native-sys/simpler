@@ -226,10 +226,20 @@ uint64_t SimDeviceRunnerBase::retained_temp_addr(uint32_t slot_id) const {
 }
 
 int SimDeviceRunnerBase::setup_static_arena(
-    uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
+    RegionBanks banks, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size, bool fixed_heap
 ) {
-    if (arena_bank >= arena_banks_.size()) return PTO_RUNTIME_ERR_INTERNAL;
-    ArenaBank &bank = this->arena_bank(arena_bank);
+    if (banks.heap >= arena_banks_.size() || banks.sm >= arena_banks_.size() || banks.image >= arena_banks_.size())
+        return PTO_RUNTIME_ERR_INTERNAL;
+    ArenaBank &heap_bank = this->arena_bank(banks.heap);
+    if (fixed_heap && heap_bank.cached_gm_heap_size != 0 && heap_bank.cached_gm_heap_size != gm_heap_size) {
+        LOG_ERROR(
+            "HBG heap capacity is fixed: requested=%zu configured=%zu bytes", gm_heap_size,
+            heap_bank.cached_gm_heap_size
+        );
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    }
+    ArenaBank &sm_bank = this->arena_bank(banks.sm);
+    ArenaBank &image_bank = this->arena_bank(banks.image);
     // Three independent device_malloc'd buffers: GM heap, shared memory, prebuilt
     // runtime arena. Split out from a single large allocation because the
     // combined size can exceed the device allocator's largest contiguous
@@ -263,20 +273,19 @@ int SimDeviceRunnerBase::setup_static_arena(
         cached_size = requested_size;
         return 0;
     };
-    // Failure of any region releases all peers — mirrors the onboard "rollback
-    // all on any failure" semantic (PR #922). Pooled pointers from a prior
-    // successful call stay valid; a failed resize attempt does not leave a
-    // partial layout behind.
-    bool ok = commit_region(bank.gm_heap, bank.cached_gm_heap_size, gm_heap_size) == 0;
-    ok = ok && commit_region(bank.gm_sm, bank.cached_gm_sm_size, gm_sm_size) == 0;
-    ok = ok && commit_region(bank.runtime_pool, bank.cached_runtime_arena_size, runtime_arena_size) == 0;
+    // The fixed context heap survives a failed image allocation. Its address
+    // must remain valid for already prepared runs; other regions follow their
+    // existing rollback path.
+    bool ok = commit_region(heap_bank.gm_heap, heap_bank.cached_gm_heap_size, gm_heap_size) == 0;
+    ok = ok && commit_region(sm_bank.gm_sm, sm_bank.cached_gm_sm_size, gm_sm_size) == 0;
+    ok = ok && commit_region(image_bank.runtime_pool, image_bank.cached_runtime_arena_size, runtime_arena_size) == 0;
     if (!ok) {
-        bank.gm_heap.release();
-        bank.gm_sm.release();
-        bank.runtime_pool.release();
-        bank.cached_gm_heap_size = 0;
-        bank.cached_gm_sm_size = 0;
-        bank.cached_runtime_arena_size = 0;
+        if (!fixed_heap) heap_bank.gm_heap.release();
+        sm_bank.gm_sm.release();
+        image_bank.runtime_pool.release();
+        if (!fixed_heap) heap_bank.cached_gm_heap_size = 0;
+        sm_bank.cached_gm_sm_size = 0;
+        image_bank.cached_runtime_arena_size = 0;
         prebuilt_runtime_arena_cache_valid_ = false;
         prebuilt_runtime_arena_cache_key_.clear();
         prebuilt_runtime_arena_cache_gm_heap_base_ = nullptr;

@@ -604,16 +604,15 @@ _N_CTX_SCALARS = 12
 # match pypto-lib's daily CI sizing for this network (16384 / 16384). The heap is
 # twice the compile-time default's 1 GiB: the MoE per-expert tile grid is static,
 # so tile scratch is allocated for all 32 experts of every MoE layer whatever the
-# routing turns out to be. host_build_graph commits its graph heap after
-# orchestration at the size the graph needs and warns on a set ring_heap, so it
-# takes none of these.
+# routing turns out to be. HBG reserves a fixed 2 GiB heap per context for the
+# complete graph; its task image and scheduler storage are separate allocations.
 _RUNTIME_ENV = {
     "tensormap_and_ringbuffer": {
         "ring_task_window": 16384,
         "ring_heap": 2 << 30,
         "ring_dep_pool": 16384,
     },
-    "host_build_graph": {},
+    "host_build_graph": {"ring_heap": 2 << 30},
 }
 
 
@@ -848,6 +847,8 @@ def run(  # noqa: PLR0913 -- one knob per CLI flag
     output_prefix = str(build_output_prefix(f"{CASE_LABEL}_{runtime}")) if diagnostics_on else ""
 
     print(f"[dsv4] devices={device_ids} rounds={rounds} skip_golden={skip_golden}", flush=True)
+    if runtime == "host_build_graph":
+        print(f"[dsv4] HBG heap capacity per context={_RUNTIME_ENV[runtime]['ring_heap']} bytes", flush=True)
     worker = Worker(
         level=3,
         device_ids=device_ids,

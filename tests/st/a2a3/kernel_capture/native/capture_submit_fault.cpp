@@ -85,7 +85,10 @@ extern "C" rtError_t rtKernelLaunchWithHandleV2(
         args->argsSize == sizeof(AicoreLaunchArgs)) {
         AicoreLaunchArgs launch{};
         std::memcpy(&launch, args->args, sizeof(launch));
-        captured_submission.launches.push_back({launch.runtime_args, captured_submission.publications.size()});
+        captured_submission.launches.push_back(
+            {launch.shared_state_addr, launch.worker_context_base, launch.runtime_mode, launch.worker_count,
+             captured_submission.publications.size()}
+        );
     }
     return rc;
 }
@@ -97,7 +100,16 @@ extern "C" rtError_t rtsLaunchCpuKernel(
     static auto real = next_symbol<decltype(&rtsLaunchCpuKernel)>("rtsLaunchCpuKernel");
     note_submission();
     if (armed) ++result.cpu_calls;
-    return real(function, blocks, stream, config, args);
+    const int rc = real(function, blocks, stream, config, args);
+    if (observe_publications && rc == 0 && args != nullptr && args->baseArgs.args != nullptr &&
+        args->baseArgs.argsSize >= sizeof(KernelArgs)) {
+        KernelArgs launch{};
+        std::memcpy(&launch, args->baseArgs.args, sizeof(launch));
+        captured_submission.cpu_launches.push_back(
+            {reinterpret_cast<uint64_t>(launch.runtime_args), launch.runtime_descriptor_bytes}
+        );
+    }
+    return rc;
 }
 
 extern "C" aclError aclrtRecordEvent(aclrtEvent event, aclrtStream stream) {

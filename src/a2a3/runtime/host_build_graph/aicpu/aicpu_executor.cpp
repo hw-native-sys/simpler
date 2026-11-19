@@ -30,6 +30,7 @@
 
 // Register-based communication
 #include "aicpu/platform_aicpu_affinity.h"
+#include "aicpu/platform_entry_args.h"
 #include "aicpu/platform_regs.h"
 #include "utils/thread_completion_gate.h"
 
@@ -484,7 +485,10 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     //    bypasses this cache. Invalidating now ensures next round reads from HBM.
     //    The length is the uploaded image, not sizeof(Runtime): the host-only
     //    tail past it was never copied, so no device line holds it.
-    cache_invalidate_range(runtime, sizeof(runtime->dev));
+    const auto view = get_platform_entry_args(platform_aicpu_affinity_thread_idx());
+    if (view.runtime_address == 0 || view.runtime_address == reinterpret_cast<uint64_t>(runtime))
+        cache_invalidate_range(runtime, sizeof(runtime->dev));
+    cache_invalidate_range(runtime->get_workers(), sizeof(RuntimeSharedState));
 
     // Reset all SchedulerContext-owned state in one place.
     sched_ctx_.deinit();

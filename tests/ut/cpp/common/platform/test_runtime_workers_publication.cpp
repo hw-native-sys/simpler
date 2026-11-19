@@ -8,16 +8,14 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-// Which prefix each publication carries, driven through the real onboard
-// helper and allocator with host-backed RTS storage. The question these cases
-// answer is per device allocation, not per slot: Program initializes handshake
-// storage in its first publication; replayable preparation initializes it
-// before recording and excludes it from every recorded publication.
+// Shared handshake initialization and descriptor publication have independent lifetimes.
+// CPU-backed RTS storage observes the production helper and allocator boundaries.
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #include "acl/acl.h"
 #include "device_runner_helpers.h"
@@ -59,7 +57,6 @@ protected:
     // reset in finalize() is what reclaims it.
     size_t expected_leaked_allocations = 0;
 
-    uint64_t initializing_bytes() const { return runtime_device_initialized_prefix_size(runtime); }
     uint64_t steady_bytes() const { return runtime_device_copy_size(runtime); }
 
     // One prepare+publish against the slot, returning the publish rc.
@@ -69,13 +66,22 @@ protected:
         return helper.publish_runtime_args(/*launch_route_permitted=*/false, this, rts.sink);
     }
 
+    int prepare_replayable() {
+        runtime.set_active_callable_id(3);
+        helper.args.run_result_epoch = 19;
+        const int rc = helper.prepare_runtime_args(runtime, allocator, slot, true);
+        if (rc != 0) return rc;
+        const auto plan = runtime_launch_entry_args_plan(runtime);
+        return plan.supported ? helper.prepare_kernel_invocation({3, 7, plan.tensor_count, plan.scalar_count}) : 0;
+    }
+
     // The block's handshake region, as the device would see it.
     const unsigned char *device_workers() const {
-        return reinterpret_cast<const unsigned char *>(slot.runtime_args) + offsetof(DeviceRuntimeLaunchDesc, workers);
+        return reinterpret_cast<const unsigned char *>(slot.shared_state->workers);
     }
     bool device_workers_all(unsigned char value) const {
         const unsigned char *bytes = device_workers();
-        for (size_t i = 0; i < sizeof(DeviceRuntimeLaunchDesc::workers); ++i) {
+        for (size_t i = 0; i < sizeof(RuntimeSharedState::workers); ++i) {
             if (bytes[i] != value) return false;
         }
         return true;
@@ -144,42 +150,42 @@ extern "C" aclError aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus *s
     return ACL_SUCCESS;
 }
 
-TEST_F(WorkersPublication, TheFirstPublicationOntoABlockCarriesTheHandshakeRegion) {
+TEST_F(WorkersPublication, PreparationInitializesSharedWorkersBeforeDescriptorPublication) {
     ASSERT_EQ(publish_once(), 0);
 
-    EXPECT_EQ(rts.copies, 1) << "one H2D, not two";
-    EXPECT_EQ(rts.last_copy_bytes, initializing_bytes());
+    EXPECT_EQ(rts.copies, 1);
+    EXPECT_EQ(rts.initializations, 1);
+    EXPECT_EQ(rts.last_copy_bytes, steady_bytes());
     EXPECT_TRUE(slot.workers_initialized);
     EXPECT_TRUE(device_workers_all(0u)) << "the block's handshake region still holds allocator bytes";
 }
 
-TEST_F(WorkersPublication, AReusedBlockPublishesOnlyTheShorterPrefix) {
+TEST_F(WorkersPublication, ReusedSharedWorkersAreNotReinitialized) {
     ASSERT_EQ(publish_once(), 0);
     helper.release_run_view();
 
     // Stand in for what the device wrote during the first run. A second
     // publication that carried this region would erase it.
-    std::memset(const_cast<unsigned char *>(device_workers()), 0x5a, sizeof(DeviceRuntimeLaunchDesc::workers));
+    std::memset(const_cast<unsigned char *>(device_workers()), 0x5a, sizeof(RuntimeSharedState::workers));
 
     ASSERT_EQ(publish_once(), 0);
     EXPECT_EQ(rts.copies, 2) << "still one H2D per publication";
     EXPECT_EQ(rts.last_copy_bytes, steady_bytes());
-    EXPECT_LT(rts.last_copy_bytes, initializing_bytes());
+    EXPECT_EQ(rts.initializations, 1);
     EXPECT_TRUE(device_workers_all(0x5a)) << "a steady-state run overwrote the device's own handshake words";
 }
 
-TEST_F(WorkersPublication, AFailedFirstPublicationLeavesTheBlockUninitialized) {
+TEST_F(WorkersPublication, FailedDescriptorPublicationPreservesInitializedSharedWorkers) {
     rts.copy_rc = -91;
     EXPECT_EQ(publish_once(), -91);
-    EXPECT_FALSE(slot.workers_initialized) << "a copy that failed cannot have defined the region";
-    EXPECT_NE(slot.runtime_args, nullptr) << "the block is retained for the retry";
-    EXPECT_EQ(rts.frees, 0);
-
-    rts.copy_rc = 0;
-    ASSERT_EQ(publish_once(), 0);
-    EXPECT_EQ(rts.last_copy_bytes, initializing_bytes()) << "the retry must initialize, not assume";
     EXPECT_TRUE(slot.workers_initialized);
     EXPECT_TRUE(device_workers_all(0u));
+    EXPECT_NE(slot.runtime_args, nullptr);
+    EXPECT_EQ(rts.frees, 0);
+    rts.copy_rc = 0;
+    ASSERT_EQ(publish_once(), 0);
+    EXPECT_EQ(rts.initializations, 1);
+    EXPECT_EQ(rts.last_copy_bytes, steady_bytes());
 }
 
 TEST_F(WorkersPublication, ANewAllocationDoesNotInheritInitialization) {
@@ -191,8 +197,8 @@ TEST_F(WorkersPublication, ANewAllocationDoesNotInheritInitialization) {
     EXPECT_FALSE(slot.workers_initialized) << "the verdict belonged to the freed block";
 
     ASSERT_EQ(publish_once(), 0);
-    EXPECT_EQ(rts.allocations, 2);
-    EXPECT_EQ(rts.last_copy_bytes, initializing_bytes()) << "a fresh block must be initialized again";
+    EXPECT_EQ(rts.allocations, 4);
+    EXPECT_EQ(rts.initializations, 2);
 }
 
 TEST_F(WorkersPublication, AnAbandonedSlotDoesNotInheritInitialization) {
@@ -204,7 +210,7 @@ TEST_F(WorkersPublication, AnAbandonedSlotDoesNotInheritInitialization) {
     void *abandoned_source = slot.runtime_upload_source;
     abandon_slot_persistent_args(slot);
     std::free(abandoned_source);
-    expected_leaked_allocations = 1;
+    expected_leaked_allocations = 2;
     EXPECT_EQ(slot.runtime_args, nullptr);
     EXPECT_EQ(slot.runtime_bytes, 0U);
     EXPECT_FALSE(slot.workers_initialized);
@@ -212,60 +218,53 @@ TEST_F(WorkersPublication, AnAbandonedSlotDoesNotInheritInitialization) {
 
     helper.release_run_view();
     ASSERT_EQ(publish_once(), 0);
-    EXPECT_EQ(rts.last_copy_bytes, initializing_bytes());
+    EXPECT_EQ(rts.last_copy_bytes, steady_bytes());
 }
 
-// The commit belongs to the publication, not to a caller that has to remember
-// to make it: preparing alone must not mark the block initialized.
-TEST_F(WorkersPublication, PreparingWithoutPublishingCommitsNothing) {
+TEST_F(WorkersPublication, PreparationInitializesSharedStateWithoutPublishingDescriptor) {
     ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
-    EXPECT_FALSE(slot.workers_initialized);
-    EXPECT_EQ(rts.copies, 0);
-    EXPECT_EQ(rts.initializations, 0);
-
-    helper.release_run_view();
-    EXPECT_FALSE(slot.workers_initialized);
-
-    ASSERT_EQ(publish_once(), 0);
-    EXPECT_EQ(rts.last_copy_bytes, initializing_bytes());
     EXPECT_TRUE(slot.workers_initialized);
+    EXPECT_EQ(rts.copies, 0);
+    EXPECT_EQ(rts.initializations, 1);
+    EXPECT_FALSE(helper.runtime_args_published());
+    helper.release_run_view();
+    ASSERT_EQ(publish_once(), 0);
+    EXPECT_EQ(rts.initializations, 1);
+    EXPECT_EQ(rts.last_copy_bytes, steady_bytes());
 }
 
 TEST_F(WorkersPublication, ReplayablePublicationCannotOverwriteDeviceReports) {
-    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), 0);
+    ASSERT_EQ(prepare_replayable(), 0);
     EXPECT_TRUE(slot.workers_initialized);
     EXPECT_EQ(rts.initializations, 1);
     EXPECT_EQ(rts.copies, 0);
     EXPECT_TRUE(device_workers_all(0u));
-    const auto *device = reinterpret_cast<const unsigned char *>(slot.runtime_args);
-    for (size_t i = 0; i < steady_bytes(); ++i)
-        ASSERT_EQ(device[i], kDeviceMark);
-    for (size_t i = initializing_bytes(); i < slot.runtime_bytes; ++i)
-        ASSERT_EQ(device[i], kDeviceMark);
-
-    ASSERT_EQ(helper.publish_runtime_args(false, this, rts.sink), 0);
-    EXPECT_EQ(rts.last_copy_bytes, steady_bytes());
-    std::memset(const_cast<unsigned char *>(device_workers()), 0x5a, sizeof(DeviceRuntimeLaunchDesc::workers));
-    // Replay the captured DMA after the device has published a later report.
-    std::memcpy(slot.runtime_args, slot.runtime_upload_source, rts.last_copy_bytes);
-    EXPECT_TRUE(device_workers_all(0x5a));
+    EXPECT_EQ(slot.runtime_args, nullptr);
+    EXPECT_EQ(slot.runtime_upload_source, nullptr);
+    ASSERT_EQ(helper.publish_runtime_args(true, this, rts.sink, true), 0);
+    EXPECT_EQ(rts.copies, 0);
+    std::memset(const_cast<unsigned char *>(device_workers()), 0x5a, sizeof(RuntimeSharedState::workers));
+    std::vector<unsigned char> recorded(helper.launch_payload_bytes());
+    std::memcpy(recorded.data(), helper.launch_payload(), recorded.size());
     helper.release_run_view();
-    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), 0);
+    ASSERT_EQ(prepare_replayable(), 0);
+    ASSERT_EQ(helper.publish_runtime_args(true, this, rts.sink, true), 0);
     EXPECT_EQ(rts.initializations, 1);
+    EXPECT_EQ(rts.copies, 0);
     EXPECT_TRUE(device_workers_all(0x5a));
 }
 
 TEST_F(WorkersPublication, FailedReplayInitializationIsRetriedOnTheRetainedAllocation) {
     rts.initialization_rc = -82;
-    EXPECT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), -82);
+    EXPECT_EQ(prepare_replayable(), -82);
     EXPECT_FALSE(slot.workers_initialized);
     EXPECT_EQ(rts.copies, 0);
     EXPECT_EQ(rts.initializations, 1);
-    auto *allocation = slot.runtime_args;
+    auto *allocation = slot.shared_state;
     ASSERT_NE(allocation, nullptr);
     rts.initialization_rc = 0;
-    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), 0);
-    EXPECT_EQ(slot.runtime_args, allocation);
+    ASSERT_EQ(prepare_replayable(), 0);
+    EXPECT_EQ(slot.shared_state, allocation);
     EXPECT_EQ(rts.allocations, 1);
     EXPECT_EQ(rts.initializations, 2);
     EXPECT_TRUE(device_workers_all(0u));
@@ -280,18 +279,14 @@ TEST_F(WorkersPublication, FreshCaptureBackingRestoresTheCallerModeBeforePublica
     EXPECT_EQ(rts.initializations, 1);
     EXPECT_EQ(rts.copies, 0);
     EXPECT_TRUE(device_workers_all(0u));
-    const auto *device = reinterpret_cast<const unsigned char *>(slot.runtime_args);
-    const size_t begin = offsetof(DeviceRuntimeLaunchDesc, workers);
-    const size_t end = begin + sizeof(DeviceRuntimeLaunchDesc::workers);
-    EXPECT_TRUE(std::all_of(device, device + begin, [](unsigned char byte) {
+    EXPECT_EQ(slot.runtime_args, nullptr);
+    const auto *gates = reinterpret_cast<const unsigned char *>(slot.shared_state->teardown_gates);
+    EXPECT_TRUE(std::all_of(gates, gates + sizeof(RuntimeSharedState::teardown_gates), [](unsigned char byte) {
         return byte == kDeviceMark;
     }));
-    EXPECT_TRUE(std::all_of(device + end, device + slot.runtime_bytes, [](unsigned char byte) {
-        return byte == kDeviceMark;
-    }));
-    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot, true), 0);
-    ASSERT_EQ(helper.publish_runtime_args(false, this, rts.sink, true), 0);
-    EXPECT_EQ(rts.last_copy_bytes, steady_bytes());
+    ASSERT_EQ(prepare_replayable(), 0);
+    ASSERT_EQ(helper.publish_runtime_args(true, this, rts.sink, true), 0);
+    EXPECT_EQ(rts.copies, 0);
     EXPECT_EQ(rts.exchange_calls, 2);
 }
 
@@ -299,7 +294,7 @@ TEST_F(WorkersPublication, CaptureInitializationDoesNotCommitWhenExchangeOrCopyF
     rts.recording = true;
     rts.fail_exchange = 1;
     EXPECT_EQ(reserve_slot_runtime_args(runtime, allocator, slot, 0, RuntimeWorkerInit::DuringRecording), -84);
-    auto *const allocation = slot.runtime_args;
+    auto *const allocation = slot.shared_state;
     ASSERT_NE(allocation, nullptr);
     EXPECT_EQ(rts.initializations, 0);
     EXPECT_FALSE(slot.workers_initialized);
@@ -319,7 +314,7 @@ TEST_F(WorkersPublication, CaptureInitializationDoesNotCommitWhenExchangeOrCopyF
     );
     EXPECT_EQ(restore_error, -84);
     EXPECT_FALSE(slot.workers_initialized);
-    EXPECT_EQ(slot.runtime_args, allocation);
+    EXPECT_EQ(slot.shared_state, allocation);
     EXPECT_EQ(rts.copies, 0);
 }
 

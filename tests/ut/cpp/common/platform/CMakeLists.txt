@@ -207,6 +207,10 @@ simpler_ut_platform_case(test_ccu_completion.cpp SINGLE BARE
 
 simpler_ut_platform_case(test_ccu_device_submission.cpp SINGLE BARE
     INCLUDES ${SIMPLER_SRC}/common)
+# ReportedPool lifecycle: host-only, with the sim allocator as its byte source.
+platform_single_case(test_reported_pool.cpp
+    SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/sim/host/memory_allocator.cpp ${HOST_LOG_TEST_SOURCES}
+    INCLUDES ${SIMPLER_LOG_DIR})
 
 # Each of these covers a header-only piece of the arch's platform surface and
 # needs nothing compiled in but the CANN platform stand-in.
@@ -356,23 +360,10 @@ platform_single_case(test_device_fault_cross_dso.cpp
 # initialized tail the host must not overwrite. Each arch reads that layout out
 # of its own kernel_args.h, so the pair is built per arch.
 #
-# ARCHS a2a3 on the tmr halves: a5's tensormap_and_ringbuffer Runtime has no
-# device-initialized tail at all — its header states extent equals copy size —
-# so it declares no teardown_gates and the boundary these cases pin does not
-# exist there. host_build_graph has the tail on both arches.
 set(KERNEL_ARGS_FIXTURES ${CMAKE_SOURCE_DIR}/support/kernel_args)
 set(KERNEL_ARGS_INCLUDES ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host ${SIMPLER_SRC}/common/worker)
 
-tmr_case(test_kernel_persistent_args.cpp ARCHS a2a3
-    SOURCES  ${KERNEL_PERSISTENT_ARGS_SRC}
-             ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
-             ${CMAKE_CURRENT_SOURCE_DIR}/test_kernel_persistent_args_tmr.cpp
-    INCLUDES ${KERNEL_ARGS_INCLUDES} ${KERNEL_ARGS_FIXTURES})
 
-hbg_case(test_kernel_persistent_args.cpp
-    SOURCES  ${KERNEL_PERSISTENT_ARGS_SRC} ${HBG_COMMON_SHARED_DIR}/runtime.cpp
-             ${CMAKE_CURRENT_SOURCE_DIR}/test_kernel_persistent_args_hbg.cpp
-    INCLUDES ${KERNEL_ARGS_INCLUDES} ${KERNEL_ARGS_FIXTURES})
 
 # Compile the actual onboard helper/allocator without an SDK. support/kernel_args
 # stands in for the CANN headers and must precede the gtest prefix, which on a
@@ -720,6 +711,19 @@ set(CAPACITY_REFUSAL_INCLUDES
     ${SIMPLER_LOG_DIR}
     ${SIMPLER_SRC}/common/worker)
 
+hbg_case(test_sim_region_banks.cpp
+    SOURCES ${CAPACITY_REFUSAL_SOURCES} ${HBG_COMMON_SHARED_DIR}/runtime.cpp
+    INCLUDES ${CAPACITY_REFUSAL_INCLUDES}
+    DEFINES SIMPLER_RUNTIME_NAME="host_build_graph"
+    LINK ${CMAKE_DL_LIBS})
+
+tmr_case(test_sim_region_banks.cpp
+    SOURCES ${CAPACITY_REFUSAL_SOURCES}
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
+    INCLUDES ${CAPACITY_REFUSAL_INCLUDES}
+    DEFINES SIMPLER_RUNTIME_NAME="tensormap_and_ringbuffer"
+    LINK ${CMAKE_DL_LIBS})
+
 hbg_case(test_diagnostic_capacity_refusal_phase.cpp
     SOURCES
         ${CAPACITY_REFUSAL_SOURCES}
@@ -1008,7 +1012,6 @@ set(NATIVE_ADMISSION_SOURCES
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/aicore_pmu_lease.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/c_api_shared.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/device_runner_helpers.cpp
-    ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/kernel_persistent_args.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/device_phase_capture.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/run_retention_probe.cpp
     ${SIMPLER_SRC}/@arch@/platform/onboard/host/memory_allocator.cpp
@@ -1128,6 +1131,7 @@ simpler_ut_cases(platform_single_case
     test_retained_temp_bump.cpp
     test_run_caller_order.cpp
     test_run_completion_fence.cpp
+    test_scratch_pool.cpp
     test_run_drain_decision.cpp
     test_run_drain_result_separation.cpp
     test_run_outcome_decision.cpp

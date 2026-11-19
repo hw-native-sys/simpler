@@ -63,6 +63,8 @@ struct Transport {
     int resolve_failure_at = -1;
     int resolve_calls = 0;
     int launches = 0;
+    std::vector<unsigned char> launch_payload;
+    std::vector<rtHostInputInfo_t> launch_relocations;
     ~Transport() {
         for (auto &binary : binaries)
             dlclose(binary->module);
@@ -166,7 +168,20 @@ extern "C" rtError_t
 rtsLaunchCpuKernel(rtFuncHandle function, uint32_t, rtStream_t, const rtKernelLaunchCfg_t *, rtCpuKernelArgs_t *args) {
     ++transport->launches;
     if (transport->launch_error != 0 && !transport->execute_on_launch_error) return transport->launch_error;
-    const int rc = reinterpret_cast<int (*)(void *)>(function)(args->baseArgs.args);
+    transport->launch_payload.resize(args->baseArgs.argsSize);
+    transport->launch_relocations.clear();
+    auto *source = static_cast<unsigned char *>(args->baseArgs.args);
+    for (uint16_t i = 0; i < args->baseArgs.hostInputInfoNum; ++i) {
+        const auto relocation = args->baseArgs.hostInputInfoPtr[i];
+        if (relocation.addrOffset + sizeof(uint64_t) > args->baseArgs.argsSize ||
+            relocation.dataOffset >= args->baseArgs.argsSize)
+            return -90;
+        transport->launch_relocations.push_back(relocation);
+        const uint64_t address = reinterpret_cast<uint64_t>(transport->launch_payload.data() + relocation.dataOffset);
+        std::memcpy(source + relocation.addrOffset, &address, sizeof(address));
+    }
+    std::memcpy(transport->launch_payload.data(), source, args->baseArgs.argsSize);
+    const int rc = reinterpret_cast<int (*)(void *)>(function)(transport->launch_payload.data());
     return transport->launch_error != 0 ? transport->launch_error : rc;
 }
 
@@ -434,5 +449,48 @@ TEST_F(LoadOwnership, EnqueueErrorAfterExecutingCleanupUsesOriginalAcknowledgeme
     ASSERT_EQ(Finalize(loader), 0);
     EXPECT_EQ(state.launches, launches);
     EXPECT_TRUE(state.allocations.empty());
+}
+
+TEST_F(LoadOwnership, HostInputMetadataReachesRtsWhileExternalStorageRemainsBorrowed) {
+    host::LoadAicpuOp loader;
+    ASSERT_EQ(Bootstrap(loader), 0);
+    ASSERT_EQ(Init(loader), 0);
+    uint64_t caller_value = 73;
+    struct Packet {
+        uint64_t inline_address;
+        uint64_t borrowed_address;
+        uint64_t inline_value;
+    } packet{0, reinterpret_cast<uint64_t>(&caller_value), 41};
+    rtHostInputInfo_t relocation{offsetof(Packet, inline_address), offsetof(Packet, inline_value)};
+    ASSERT_EQ(
+        loader.LaunchBuiltInOp(nullptr, &packet, sizeof(packet), 1, host::KernelNames::RunName, &relocation, 1), 0
+    );
+    ASSERT_EQ(state.launch_relocations.size(), 1U);
+    Packet received{};
+    std::memcpy(&received, state.launch_payload.data(), sizeof(received));
+    EXPECT_EQ(
+        received.inline_address,
+        reinterpret_cast<uint64_t>(state.launch_payload.data() + offsetof(Packet, inline_value))
+    );
+    EXPECT_EQ(*reinterpret_cast<const uint64_t *>(received.inline_address), 41U);
+    EXPECT_EQ(received.borrowed_address, reinterpret_cast<uint64_t>(&caller_value));
+    EXPECT_EQ(caller_value, 73U);
+    EXPECT_EQ(Finalize(loader), 0);
+    caller_value = 99;
+    EXPECT_EQ(caller_value, 99U);
+}
+
+TEST_F(LoadOwnership, InvalidHostInputCarrierFailsBeforeRtsSubmission) {
+    host::LoadAicpuOp loader;
+    ASSERT_EQ(Bootstrap(loader), 0);
+    ASSERT_EQ(Init(loader), 0);
+    uint64_t payload = 0;
+    const int launches = state.launches;
+    EXPECT_NE(loader.LaunchBuiltInOp(nullptr, &payload, sizeof(payload), 1, host::KernelNames::RunName, nullptr, 1), 0);
+    EXPECT_NE(
+        loader.LaunchBuiltInOp(nullptr, &payload, static_cast<size_t>(UINT32_MAX) + 1, 1, host::KernelNames::RunName), 0
+    );
+    EXPECT_EQ(state.launches, launches);
+    EXPECT_EQ(Finalize(loader), 0);
 }
 }  // namespace

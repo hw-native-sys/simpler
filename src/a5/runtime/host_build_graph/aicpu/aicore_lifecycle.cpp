@@ -110,7 +110,7 @@ void AicoreLifecycle::handshake_partition(Runtime *runtime, int32_t tidx, int32_
         handshake_failed_.store(true, std::memory_order_release);
         return;
     }
-    Handshake *handshakes = runtime->dev.workers;
+    Handshake *handshakes = runtime->get_workers();
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(tidx) * core_count_) / nthreads);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(tidx + 1) * core_count_) / nthreads);
     const uint32_t physical_core_count = platform_get_physical_cores_count();
@@ -375,7 +375,7 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
 void AicoreLifecycle::publish_context_partition(Runtime *runtime, int32_t thread_idx) {
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(thread_idx) * core_count_) / aicpu_thread_num_);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(thread_idx + 1) * core_count_) / aicpu_thread_num_);
-    Handshake *handshakes = runtime->dev.workers;
+    Handshake *handshakes = runtime->get_workers();
     SchedulerWorkerContext *bootstrap_context = aicore_scheduler_bootstrap_context(runtime);
     if (bootstrap_context == nullptr) return;
     AicpuThreadLifecycleTrace *trace = thread_lifecycle_trace(thread_idx);
@@ -510,7 +510,7 @@ int32_t AicoreLifecycle::finish_shutdown_partition(int32_t thread_idx, Runtime *
     }
     for (size_t i = 0; i < count; ++i) {
         if (released[i]) {
-            Handshake *report = &runtime->dev.workers[core_ids[i]];
+            Handshake *report = &runtime->get_workers()[core_ids[i]];
             cache_invalidate_range(report, sizeof(*report));
             rmb();
             // This line is already needed for retirement. Save its endpoints
@@ -571,11 +571,11 @@ void AicoreLifecycle::collect_run_swimlane_records(Runtime *runtime) {
         record.tasks_processed = 1;
         record.phase_data.task_id = task;
         record.participant_has_task = 1;
-        record.participant_kind = runtime->dev.workers[worker].core_type == CoreType::AIC ?
+        record.participant_kind = runtime->get_workers()[worker].core_type == CoreType::AIC ?
                                       SchedPhaseParticipantKind::Aic :
                                       SchedPhaseParticipantKind::Aiv;
         record.participant_worker_id = static_cast<uint32_t>(worker);
-        record.participant_physical_core_id = runtime->dev.workers[worker].physical_core_id;
+        record.participant_physical_core_id = runtime->get_workers()[worker].physical_core_id;
         chip_swimlane_aicpu_record_staged_phase(kDiagnosticDumpLane, record);
     };
     for (uint64_t task = 0; task < context->graph_task_count; ++task) {

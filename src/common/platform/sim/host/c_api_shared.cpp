@@ -418,18 +418,23 @@ host_phase_pool_finish(void *runner_ctx, uint32_t pipeline_slot, uint64_t submit
 }
 
 static int setup_static_arena_wrapper(
-    void *runner_ctx, uint32_t arena_bank, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
+    void *runner_ctx, uint32_t /*pipeline_slot*/, RegionBanks banks, size_t gm_heap_size, size_t gm_sm_size,
+    size_t runtime_arena_size
 ) {
     if (runner_ctx == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     try {
+        const PipelineContract *contract = get_pipeline_contract();
+        const PipelineResource *heap =
+            contract != nullptr ? find_pipeline_resource(*contract, PTO_PIPELINE_GM_HEAP) : nullptr;
+        const bool fixed_heap = heap != nullptr && heap->resource_class == PTO_PIPELINE_POOLED_SCRATCH;
         return static_cast<SimDeviceRunnerBase *>(runner_ctx)
-            ->setup_static_arena(arena_bank, gm_heap_size, gm_sm_size, runtime_arena_size);
+            ->setup_static_arena(banks, gm_heap_size, gm_sm_size, runtime_arena_size, fixed_heap);
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 }
 
-static void *acquire_pooled_gm_heap_wrapper(void *runner_ctx, uint32_t arena_bank) {
+static void *acquire_pooled_gm_heap_wrapper(void *runner_ctx, uint32_t /*pipeline_slot*/, uint32_t arena_bank) {
     if (runner_ctx == nullptr) return nullptr;
     try {
         return static_cast<SimDeviceRunnerBase *>(runner_ctx)->acquire_pooled_gm_heap(arena_bank);
@@ -1126,7 +1131,11 @@ int simpler_prepare_run(
     const long long trace_start_ns = STRACE_NOW_NS();
     try {
         capture_scope.emplace(config->enable_dep_gen != 0);
-        state = new (runtime) SimNativeRunContext(runner, *config, trace_hid, *descriptor, &g_host_api_ops);
+        const PipelineContract *contract = get_pipeline_contract();
+        const RegionBanks banks = contract != nullptr ?
+                                      pipeline_resource_banks_for_slot(*contract, descriptor->pipeline_slot) :
+                                      RegionBanks{};
+        state = new (runtime) SimNativeRunContext(runner, *config, trace_hid, *descriptor, &g_host_api_ops, banks);
         if (!runner->try_acquire_native_run(state, state->identity(), &state->launch_permit)) {
             LOG_ERROR("simpler_prepare_run: another native run is active on this device context");
             destroy_native_run_context(state);

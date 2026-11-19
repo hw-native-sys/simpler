@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include "common/region_banks.h"
+
 #include <array>
 #include <condition_variable>
 #include <cstddef>
@@ -911,7 +913,8 @@ private:
     std::map<std::tuple<uint64_t, uint64_t, uint64_t>, uint64_t> ccu_preparation_keys_;
     std::unordered_map<int32_t, CcuCallableArtifacts> callable_artifacts_;
 
-    uint32_t arena_bank_for_slot(uint32_t slot_id) const;
+    uint32_t resource_bank_for_slot(uint32_t kind, uint32_t slot_id) const;
+    RegionBanks region_banks_for_slot(uint32_t slot_id) const;
 
     enum class NativeRunPhase : uint8_t { EMPTY, PREPARING, PREPARED, LAUNCHED, REAPED, FINALIZING };
     class PreparedRunIncompatible : public std::runtime_error {

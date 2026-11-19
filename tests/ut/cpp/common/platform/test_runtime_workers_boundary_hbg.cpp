@@ -9,23 +9,11 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include <gtest/gtest.h>
-#include <cstddef>
 #include "runtime.h"
 
-namespace {
-constexpr size_t kWorkersBytes = sizeof(DeviceRuntimeLaunchDesc::workers);
-}
-
-// This runtime publishes a fixed steady prefix: it ends exactly where the
-// handshake region begins, for every run.
-TEST(RuntimeWorkersBoundary, TheSteadyStatePrefixStopsWhereTheHandshakeRegionBegins) {
+TEST(RuntimeWorkersBoundary, HbgLaunchCarriesTheCompleteDescriptor) {
     const Runtime runtime;
-    EXPECT_EQ(runtime_device_copy_size(runtime), offsetof(DeviceRuntimeLaunchDesc, workers));
-}
-
-// What the move is for, stated as the difference between the two prefixes.
-TEST(RuntimeWorkersBoundary, ASteadyStateRunNoLongerRepublishesTheHandshakeRegion) {
-    const Runtime runtime;
-    EXPECT_EQ(runtime_device_initialized_prefix_size(runtime) - runtime_device_copy_size(runtime), kWorkersBytes)
-        << "the two prefixes must differ by exactly the handshake region and nothing else";
+    EXPECT_EQ(runtime_device_launch_size(runtime), sizeof(DeviceRuntimeLaunchDesc));
+    EXPECT_EQ(runtime_device_copy_size(runtime), sizeof(DeviceRuntimeLaunchDesc));
+    EXPECT_EQ(runtime_device_initialized_prefix_size(runtime), sizeof(DeviceRuntimeLaunchDesc));
 }

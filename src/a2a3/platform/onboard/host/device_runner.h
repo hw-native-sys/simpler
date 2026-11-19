@@ -170,7 +170,6 @@ public:
      * address. The register table is allocated on `mem_alloc_`; the FFTS
      * address is a query result and owns nothing.
      */
-    int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) override;
 
     /**
      * Fill `InitArgs.l2_cache_offset` from the driver's per-device report.

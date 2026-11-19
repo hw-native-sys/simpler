@@ -21,7 +21,7 @@ inline __aicore__ uint64_t scheduler_cycles() {
 #if defined(__CPU_SIM)
     return sys_cnt_now_ticks();
 #elif defined(__CCE_AICORE__)
-    return get_sys_cnt_aicore();
+    return get_sys_cnt();
 #else
     return 0;
 #endif

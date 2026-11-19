@@ -98,16 +98,6 @@ extern "C" __attribute__((weak, visibility("hidden"))) bool publish_runtime_chip
 // DeviceRunner Implementation
 // =============================================================================
 
-int DeviceRunner::fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) {
-    if (args == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-
-    const int rc = init_aicore_register_addresses(&args->regs, device_id, mem_alloc_);
-    if (rc != 0) {
-        LOG_ERROR("fill_persistent_arch_fields: init_aicore_register_addresses failed: %d", rc);
-    }
-    return rc;
-}
-
 DeviceRunner::~DeviceRunner() { finalize(); }
 
 // `setup_static_arena`, `attach_current_thread`, `configure_aicore_op_timeout`,
@@ -718,7 +708,8 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
 
             LOG_INFO("=== launch_aicore_kernel ===");
             if (!prepared.recording) (void)run_progress_.publish(prepared.identity, RunProgressState::Submitted);
-            int launch_rc = launch_aicore_kernel(streams.aicore, prepared.kernel_args.args);
+            int launch_rc =
+                launch_aicore_kernel(streams.aicore, prepared.kernel_args.args, prepared.kernel_args.aicore_view());
             if (launch_rc != 0) {
                 LOG_ERROR("launch_aicore_kernel failed: %d", launch_rc);
                 if (!prepared.recording) recover_device_or_mark_unusable(launch_rc);
@@ -740,7 +731,8 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
             STRACE_HOST_SPAN_AT("chip.run.runner_run.aicpu_launch", STRACE_NOW_NS(), 0, 2);
             int launch_rc = launch_aicpu_payload(
                 streams.aicpu, prepared.kernel_args.launch_payload(), prepared.kernel_args.launch_payload_bytes(),
-                host::KernelNames::RunName, aicpu_launch_n
+                host::KernelNames::RunName, aicpu_launch_n, prepared.kernel_args.host_inputs(),
+                prepared.kernel_args.host_input_count()
             );
             if (launch_rc != 0) {
                 LOG_ERROR("launch_aicpu_payload (main) failed: %d", launch_rc);

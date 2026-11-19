@@ -661,6 +661,8 @@ struct alignas(64) SchedulerWorkerContext {
     uint64_t args_dump_address;
     uint64_t done_notifications_offset;
     uint64_t completion_counters_offset;
+    uint64_t native_graph_address;
+    uint64_t native_graph_bytes;
 
     // Only this worker writes its bootstrap diagnostic line.
     alignas(64) uint64_t bootstrap_task_count;
@@ -797,6 +799,8 @@ static_assert(offsetof(SchedulerWorkerContext, task_metadata_offset) == 120, "di
 static_assert(offsetof(SchedulerWorkerContext, cluster_count) == 136, "topology configuration offset changed");
 static_assert(offsetof(SchedulerWorkerContext, trace_cells_offset) == 184, "diagnostic offsets changed");
 static_assert(offsetof(SchedulerWorkerContext, args_dump_address) == 208, "argument capture address changed");
+static_assert(offsetof(SchedulerWorkerContext, native_graph_address) == 232);
+static_assert(offsetof(SchedulerWorkerContext, native_graph_bytes) == 240);
 static_assert(offsetof(SchedulerWorkerContext, prepared_layout_offset) == 40, "prepared execution address changed");
 static_assert(offsetof(SchedulerWorkerContext, bootstrap_task_count) == 256, "worker diagnostics need an owned line");
 static_assert(sizeof(SchedulerTaskTrace) == 256, "task trace layout changed");
@@ -968,20 +972,15 @@ inline bool scheduler_plan_prepared_storage(uint64_t *cursor, AicoreSchedulerLay
 inline bool scheduler_plan_layout(
     uint64_t task_count, AicoreSchedulerLayout *layout, bool enable_activity_profiling = false,
     uint64_t trace_count = 0, const SchedulerSpmdRequirements &spmd = {}, bool enable_protocol_profiling = false,
-    bool enable_pmu = false, uint64_t native_readonly_end_offset = 0
+    bool enable_pmu = false
 ) {
     // Expanded node references and scan cursors fit the validated task-count bound.
     if (layout == nullptr || task_count > static_cast<uint64_t>(INT32_MAX) ||
         !scheduler_spmd_requirements_valid(spmd, task_count))
         return false;
-    if (native_readonly_end_offset != 0 &&
-        (native_readonly_end_offset < sizeof(SchedulerRunControl) ||
-         native_readonly_end_offset % SCHEDULER_STATE_ALIGNMENT != 0 || spmd.worker_count == 0))
-        return false;
     AicoreSchedulerLayout next{};
     next.task_count = task_count;
     next.spmd = spmd;
-    next.native_readonly_end_offset = native_readonly_end_offset;
     uint64_t cursor = 0;
     uint64_t bytes = 0;
 #define SCHEDULER_RESERVE_ARRAY(count, type, field)                 \
@@ -991,9 +990,6 @@ inline bool scheduler_plan_layout(
             &cursor, sizeof(SchedulerRunControl), alignof(SchedulerRunControl), &next.run_control_offset
         ))
         return false;
-    if (native_readonly_end_offset != 0) {
-        cursor = native_readonly_end_offset;
-    }
     if (!SCHEDULER_RESERVE_ARRAY(
             PLATFORM_MAX_AICPU_THREADS, AicpuThreadLifecycleTrace, aicpu_lifecycle_traces_offset
         ) ||

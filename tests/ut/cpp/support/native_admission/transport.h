@@ -74,6 +74,7 @@ struct Control {
     uint64_t c2c_address{0x12340000};
     size_t c2c_calls{0};
     std::function<int(void *, void *, size_t, const std::string &)> aicpu_payload;
+    std::vector<std::vector<unsigned char>> aicpu_argument_copies;
     size_t binary_register_calls{0};
     size_t event_create_calls{0};
     size_t event_destroy_calls{0};

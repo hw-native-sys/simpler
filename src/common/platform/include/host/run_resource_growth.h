@@ -73,6 +73,9 @@ public:
     /** Withdraw the proof that a run's resources can be held in this set. */
     virtual void withdraw_run_resource_proof(uint32_t slot) = 0;
 
+    /** Withdraw idle shared scratch before a pressure retry; endpoints without pools have nothing to trim. */
+    virtual void trim_idle_scratch() {}
+
     /** Release every obsolete generation whose consumers are finished. */
     virtual int reclaim_obsolete() = 0;
 };

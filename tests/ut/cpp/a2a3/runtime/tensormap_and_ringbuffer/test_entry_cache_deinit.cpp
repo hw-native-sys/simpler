@@ -90,12 +90,9 @@ TEST(EntryCacheDeinit, FailedSnapshotFallsBackToFullThroughExecutor) {
             ASSERT_EQ(invalidations.size(), 2u);
             EXPECT_EQ(invalidations[0].first, &runtime);
             EXPECT_EQ(invalidations[0].second, simpler::tmr::entry_tensor_offset + 4 * sizeof(Tensor));
-            EXPECT_EQ(
-                invalidations[1].first,
-                reinterpret_cast<const char *>(&runtime) + offsetof(DeviceRuntimeLaunchDesc, workers)
-            );
+            EXPECT_EQ(invalidations[1].first, runtime.get_workers());
         } else {
-            ASSERT_EQ(invalidations.size(), 1u);
+            ASSERT_EQ(invalidations.size(), 2u);
             EXPECT_EQ(invalidations[0].first, &runtime);
             EXPECT_EQ(invalidations[0].second, sizeof(runtime.dev));
         }

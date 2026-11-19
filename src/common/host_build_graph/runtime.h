@@ -33,11 +33,13 @@
 #include <stdint.h>
 
 #include <cstddef>
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "common/core_type.h"
+#include "common/runtime_shared_state.h"
 #include "common/device_phase.h"
 #include "common/host_phase_kind.h"
 #include "common/platform_config.h"
@@ -259,45 +261,19 @@ static_assert(
  * execution control and device orchestration state.
  */
 /**
- * DeviceRuntimeLaunchDesc - the device-copied half of Runtime, named.
- *
- * This is the ONLY part of Runtime that reaches device memory: the host fills it,
- * `device_runner_helpers.cpp` allocates `sizeof(DeviceRuntimeLaunchDesc)` bytes
- * for it and rtMemcpy's a prefix from offset 0 of the Runtime image, and the
- * AICPU/AICore read these fields back. It is the first member of Runtime
- * (offsetof == 0), so the narrowed copy needs no offset arithmetic.
- *
- * Which prefix depends on the destination block: `runtime_device_copy_size`
- * for a steady-state run, which stops before `workers`, and
- * `runtime_device_initialized_prefix_size` for the first publication onto an
- * allocation, which adds `workers` and stops before `teardown_gates`.
- *
- * The boundary was already load-bearing as an offset — everything host-only
- * lives in `Runtime::HostOnlyState`, and the image ended where that member
- * began. Naming the other side makes the image a type rather than a distance:
- * its size is `sizeof`, not `offsetof` on a class that is not standard-layout,
- * and a field lands on the device because of where it is declared rather than
- * because of what it happens to precede. Same split, checked by construction.
- *
- * Keep it standard-layout and trivially copyable (the static_asserts below) so
- * the rtMemcpy is well-defined — Runtime itself is neither, because
- * HostOnlyState holds a std::vector. alignas(64) plus the whole-cache-line size
- * assertion keep cache_invalidate_range(runtime, sizeof(dev)) from rounding into
- * a neighbouring line.
- *
- * Membership here says a field is device-visible. It says nothing about
- * lifetime, and the fields inside do not share one: launch parameters the host
- * rewrites per run sit beside a dispatch table that is constant per callable and
- * beside a handshake region the device itself writes and the host must not
- * overwrite while a run is live. So this being one struct is not licence to
- * overwrite it early, to reset it as a unit, or to conclude that a run must
- * re-upload all of it. Splitting it further belongs to whoever establishes the
- * real read/write relationships, field by field.
+ * Host-published runtime fields. Shared worker state is addressed separately.
+ * Kernel invocations carry this descriptor in RTS-owned launch storage.
  */
+using RuntimeSharedState = RuntimeSharedStateStorage<Handshake, AicoreTeardownControl, RUNTIME_MAX_WORKER>;
+static_assert(std::is_trivially_copyable_v<RuntimeSharedState> && std::is_standard_layout_v<RuntimeSharedState>);
+static_assert(offsetof(RuntimeSharedState, workers) % 64 == 0);
+static_assert(offsetof(RuntimeSharedState, teardown_gates) % 64 == 0);
+
 struct alignas(64) DeviceRuntimeLaunchDesc {
     // Scheduler selection and the address its bootstrap starts from. Host-written
     // only; see SchedulerBootstrapInputs.
     SchedulerBootstrapInputs scheduler_bootstrap;
+    uint64_t shared_state_addr;  // Borrowed address of RuntimeSharedState.
 
     int worker_count;  // Number of active workers
 
@@ -377,39 +353,36 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // runtime_init_data_from_layout + wire on host).
     void *prebuilt_arena_base_;
     size_t prebuilt_runtime_offset_;
-
-    // Handshake buffers for AICPU-AICore communication, one 64-byte line per
-    // worker.
-    //
-    // Outside the per-run uploaded prefix: every field the device reads here is
-    // written on the device — the AICore publishes its report and the AICPU its
-    // reply — and no host value is consumed. `device_image_bytes()` ends where
-    // this array begins, so a steady-state run re-uploads none of it. The
-    // allocation still covers it, and the first publication onto a given
-    // allocation carries it once (`device_initialized_prefix_bytes()`), which is
-    // what gives a fresh block a defined starting value.
-    Handshake workers[RUNTIME_MAX_WORKER];
-
-    // Post-close return gates, one isolated cache line per worker. The
-    // AICPU stores here only after that worker's register window is closed;
-    // the AICore bypass-loads its own entry and returns once it reads RELEASE.
-    // Separate from workers[] because the AICore flushes its whole Handshake
-    // line, which would overwrite a gate sharing it.
-    //
-    // Last, and outside both the uploaded prefix and the initialized prefix: the
-    // AICPU resets the active controls in `pre_handshake_init` and
-    // executes `wmb()` before it publishes `hs_setup_done_`, and no register
-    // window opens before that publication, so the meaningful initial value is
-    // produced on the device ahead of every read of it. No host-supplied gate
-    // value is consumed on either arch, and the host storage here is never
-    // initialized — `Runtime()` does not touch it — so no host copy may reach
-    // this range. `device_initialized_prefix_bytes()` ends where this array
-    // begins; the allocation still covers it.
-    // Each 64-byte control is written only by AICPU and cleared before READY
-    // or EXIT. AICore bypass-loads the request and returns its nonce in COND;
-    // it never caches or writes the control.
-    AicoreTeardownControl teardown_gates[RUNTIME_MAX_WORKER];
 };
+
+inline constexpr size_t RUNTIME_LAUNCH_DESCRIPTOR_BYTES = sizeof(DeviceRuntimeLaunchDesc);
+
+inline AicoreRuntimeView runtime_aicore_view(const void *descriptor) {
+    AicoreRuntimeView view{};
+    const auto *bytes = static_cast<const unsigned char *>(descriptor);
+    std::memcpy(
+        &view.shared_state_addr, bytes + offsetof(DeviceRuntimeLaunchDesc, shared_state_addr),
+        sizeof(view.shared_state_addr)
+    );
+    std::memcpy(&view.worker_count, bytes + offsetof(DeviceRuntimeLaunchDesc, worker_count), sizeof(view.worker_count));
+    std::memcpy(
+        &view.chip_swimlane_level, bytes + offsetof(DeviceRuntimeLaunchDesc, chip_swimlane_level),
+        sizeof(view.chip_swimlane_level)
+    );
+    std::memcpy(
+        &view.worker_context_base,
+        bytes + offsetof(DeviceRuntimeLaunchDesc, scheduler_bootstrap) +
+            offsetof(SchedulerBootstrapInputs, worker_context_base),
+        sizeof(view.worker_context_base)
+    );
+    std::memcpy(
+        &view.runtime_mode,
+        bytes + offsetof(DeviceRuntimeLaunchDesc, scheduler_bootstrap) +
+            offsetof(SchedulerBootstrapInputs, runtime_mode),
+        sizeof(view.runtime_mode)
+    );
+    return view;
+}
 
 static_assert(
     std::is_standard_layout_v<DeviceRuntimeLaunchDesc>,
@@ -423,27 +396,6 @@ static_assert(
     sizeof(DeviceRuntimeLaunchDesc) % 64 == 0,
     "DeviceRuntimeLaunchDesc size must be a multiple of 64 so cache_invalidate_range(sizeof(dev)) "
     "stays cache-line aligned"
-);
-static_assert(
-    offsetof(DeviceRuntimeLaunchDesc, workers) % 64 == 0,
-    "workers must start on a cache line: each Handshake is one line the AICore writes back whole"
-);
-static_assert(
-    offsetof(DeviceRuntimeLaunchDesc, teardown_gates) % 64 == 0,
-    "teardown_gates must start on a cache line: the AICore flushes a whole Handshake line and a gate "
-    "sharing one would be overwritten"
-);
-static_assert(
-    offsetof(DeviceRuntimeLaunchDesc, workers) + sizeof(DeviceRuntimeLaunchDesc::workers) ==
-        offsetof(DeviceRuntimeLaunchDesc, teardown_gates),
-    "workers must be the last host-initialized member: the initialized prefix ends where it ends, and a "
-    "field placed between it and the gates would be uploaded once instead of every run"
-);
-static_assert(
-    offsetof(DeviceRuntimeLaunchDesc, teardown_gates) + sizeof(DeviceRuntimeLaunchDesc::teardown_gates) ==
-        sizeof(DeviceRuntimeLaunchDesc),
-    "teardown_gates must end the descriptor: a field appended behind it would sit outside the uploaded "
-    "prefix and never receive its host value"
 );
 
 // =============================================================================
@@ -461,6 +413,7 @@ class Runtime {
 public:
     // The device-copied half. First member, so the copy starts at offset 0.
     DeviceRuntimeLaunchDesc dev;
+    RuntimeSharedState host_shared_state_;
 
 private:
     // Everything the host keeps to itself. Outside `dev`, so it cannot travel:
@@ -501,7 +454,7 @@ private:
         // this run's worker count. This is host state with host readers only —
         // the DFX swimlane collector, the sim's per-core thread start, and the
         // a5 scheduler-context build all need the rule before any core has
-        // reported, and `dev.workers[i].core_type` cannot serve them: it is
+        // reported, and `get_workers()[i].core_type` cannot serve them: it is
         // outside the per-run uploaded prefix and the device overwrites it with
         // each core's own report.
         std::vector<CoreType> core_type_rule_;
@@ -533,39 +486,8 @@ private:
     HostOnlyState host_;
 
 public:
-    /**
-     * Bytes a steady-state run uploads: the device descriptor up to, but not
-     * including, `workers`. Neither the handshake region nor the gate tail
-     * carries a host value the device consumes, so a run that re-publishes only
-     * this prefix leaves both alone.
-     *
-     * Strictly smaller than `device_initialized_prefix_bytes()`.
-     */
     static size_t device_image_bytes();
-
-    /**
-     * Bytes the first publication onto a given device allocation uploads: the
-     * steady-state prefix plus `workers`, stopping where `teardown_gates`
-     * begins.
-     *
-     * `rtMalloc` returns whatever the device left in the block, so the handshake
-     * region needs one defined starting value per allocation; `Runtime()` zeroes
-     * `workers` and nothing writes it afterwards, so publishing this length is
-     * that initialization. The gates are excluded because their host storage is
-     * never initialized at all — copying them would push indeterminate bytes —
-     * and the device produces their value itself.
-     *
-     * Between `device_image_bytes()` and `device_extent_bytes()`.
-     */
     static size_t device_initialized_prefix_bytes();
-
-    /**
-     * Bytes of device memory the descriptor occupies, including the gate tail
-     * no host copy reaches. Every allocation that backs a device `Runtime`
-     * must use this: the AICPU and AICore address `dev.teardown_gates` inside
-     * it, so an allocation sized to a shorter prefix would place those reads
-     * past its end.
-     */
     static size_t device_extent_bytes();
 
     /**
@@ -612,12 +534,20 @@ public:
         host_.prepared_publication_ = std::make_shared<const RunImagePublication>(std::move(publication));
     }
     std::shared_ptr<const RunImagePublication> prepared_publication() const { return host_.prepared_publication_; }
+    std::vector<std::shared_ptr<const void>> prepared_shared_resources() const {
+        if (!host_.prepared_publication_) return {};
+        return host_.prepared_publication_->resources;
+    }
     void clear_prepared_publication() { host_.prepared_publication_.reset(); }
 
     /**
      * Constructor - zero-initialize all arrays
      */
     Runtime();
+    Runtime(const Runtime &) = delete;
+    Runtime &operator=(const Runtime &) = delete;
+    Runtime(Runtime &&) = delete;
+    Runtime &operator=(Runtime &&) = delete;
 
     simpler::dfx::scope_stats_runs::CapacityMetadata scope_stats_capacity() const { return {false, std::nullopt}; }
 
@@ -634,8 +564,10 @@ public:
     void set_worker_count(int n) { dev.worker_count = n; }
     int get_aicpu_thread_num() const { return dev.aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { dev.aicpu_thread_num = n; }
-    Handshake *get_workers() { return dev.workers; }
-    const Handshake *get_workers() const { return dev.workers; }
+    Handshake *get_workers() { return reinterpret_cast<RuntimeSharedState *>(dev.shared_state_addr)->workers; }
+    const Handshake *get_workers() const {
+        return reinterpret_cast<const RuntimeSharedState *>(dev.shared_state_addr)->workers;
+    }
 
     // The two bootstrap words move together, so every A5 selection path goes
     // through here: a resident base surviving a legacy selection would name an
@@ -645,7 +577,9 @@ public:
         dev.scheduler_bootstrap.runtime_mode = mode;
         dev.scheduler_bootstrap.worker_context_base = worker_context_base;
     }
-    AicoreTeardownControl *get_teardown_gates() { return dev.teardown_gates; }
+    AicoreTeardownControl *get_teardown_gates() {
+        return reinterpret_cast<RuntimeSharedState *>(dev.shared_state_addr)->teardown_gates;
+    }
     int32_t get_aicpu_allowed_cpu_count() const { return dev.aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { dev.aicpu_allowed_cpu_count = n; }
     int32_t get_aicpu_launch_count() const { return dev.aicpu_launch_count; }
@@ -755,7 +689,7 @@ public:
      * `worker_count` workers are AIC and the rest AIV.
      *
      * Set wherever `worker_count` is, and read by every host consumer of the
-     * rule. Callers must not read `dev.workers[i].core_type` for it — that word
+     * rule. Callers must not read `get_workers()[i].core_type` for it — that word
      * belongs to the core's own report.
      */
     void set_core_type_rule(int worker_count, int aic_count) {
@@ -787,52 +721,34 @@ public:
 #pragma GCC diagnostic ignored "-Winvalid-offsetof"
 #endif
 inline size_t Runtime::device_image_bytes() {
-    // The steady-state image is the descriptor without its handshake region or
-    // its gate tail. The two assertions are what keep that true of the object as
-    // well: `dev` first, and the host-only tail beginning no earlier than the
-    // descriptor ends. Between them a member cannot start travelling, or stop,
-    // because of where it was declared relative to something else.
+    // Only the descriptor crosses the launch boundary; host-owned state follows it.
     static_assert(offsetof(Runtime, dev) == 0, "DeviceRuntimeLaunchDesc must be the first member of Runtime");
     static_assert(
         offsetof(Runtime, host_) >= sizeof(DeviceRuntimeLaunchDesc),
         "the host-only tail must start at or after the end of the device image"
     );
-    return offsetof(DeviceRuntimeLaunchDesc, workers);
+    return sizeof(DeviceRuntimeLaunchDesc);
 }
 
-inline size_t Runtime::device_initialized_prefix_bytes() { return offsetof(DeviceRuntimeLaunchDesc, teardown_gates); }
+inline size_t Runtime::device_initialized_prefix_bytes() { return sizeof(DeviceRuntimeLaunchDesc); }
 
 inline size_t Runtime::device_extent_bytes() { return sizeof(DeviceRuntimeLaunchDesc); }
 #if defined(__GNUC__)
 #pragma GCC diagnostic pop
 #endif
 
-// The three device lengths of a Runtime image, defined per-runtime so the shared
-// device_runner_helpers.cpp / kernel_persistent_args.cpp paths stay
-// runtime-agnostic. They are ordered
-//   copy_size <= initialized_prefix_size <= extent_size
-// and each names a different question:
-//
-//   copy_size              what a steady-state run re-publishes
-//   initialized_prefix_size what the first publication onto an allocation
-//                          publishes, so the handshake region starts defined
-//   extent_size            what an allocation must reserve
-//
-// Bytes a steady-state run uploads: the descriptor before the handshake region.
+// Descriptor upload length; TMR bounds entry storage by the current tensor count.
 size_t runtime_device_copy_size(const Runtime &rt);
 
-// Bytes the first publication onto a device allocation uploads: through the end
-// of the handshake region, stopping before any host-uninitialized tail.
+// Fully initialized descriptor bytes. Shared worker state has a separate publication.
 size_t runtime_device_initialized_prefix_size(const Runtime &rt);
-
-// Bytes of device memory a Runtime image occupies, and the size every allocation
-// backing a device `Runtime` must use: the device addresses fields inside the
-// tail this exceeds the published prefixes by.
 size_t runtime_device_extent_size(const Runtime &rt);
 
-// This runtime has no launch route for entry arguments: they travel inside the
-// descriptor, which its host path publishes at prepare time. Present so the
-// shared host launch path needs no runtime-specific branch of its own.
+// Bytes carried in a Kernel invocation launch package.
+size_t runtime_device_launch_size(const Runtime &rt);
+
+// HBG keeps orchestration arguments on the host and carries Graph Definitions
+// in their own launch section; it has no TMR entry-argument route.
 LaunchEntryArgsPlan runtime_launch_entry_args_plan(const Runtime &rt);
 
 // How many bytes of Graph Definition section this run's descriptor names, or 0

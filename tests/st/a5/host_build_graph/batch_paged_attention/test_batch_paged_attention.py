@@ -9,6 +9,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Batch paged attention benchmark for the host-build-graph runtime."""
 
+import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import TensorTransfer
@@ -16,6 +17,12 @@ from simpler.task_interface import TensorTransfer
 from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 from simpler_setup.goldens.paged_attention import compute_golden as _pa_compute_golden
 from simpler_setup.goldens.paged_attention import generate_inputs as _pa_generate_inputs
+
+
+@pytest.fixture(scope="class")
+def st_worker(_isolated_l2_worker):
+    """Keep the 512 MiB heap in a context dedicated to this workload."""
+    return _isolated_l2_worker
 
 
 @scene_test(level=2, runtime="host_build_graph")
@@ -65,6 +72,8 @@ class TestBatchPagedAttentionHostBuildGraph(SceneTestCase):
         {
             "name": "Case1",
             "platforms": ["a5"],
+            # The host graph requires 339,771,392 bytes of fixed heap backing.
+            "config": {"runtime_env": {"ring_heap": 512 << 20}},
             "params": {
                 "batch": 256,
                 "num_heads": 16,
@@ -80,6 +89,7 @@ class TestBatchPagedAttentionHostBuildGraph(SceneTestCase):
             "name": "Case2",
             "platforms": ["a5"],
             "manual": True,
+            "config": {"runtime_env": {"ring_heap": 512 << 20}},
             "params": {
                 "batch": 64,
                 "num_heads": 64,

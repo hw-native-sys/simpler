@@ -29,6 +29,7 @@
 #include "acl/acl.h"
 #include "device_runner_helpers.h"
 #include "launch_entry_args_fixture.h"
+#include "aicpu/runtime_launch_view.h"
 
 namespace launch_entry_args_test {
 RtsState rts;
@@ -55,6 +56,7 @@ extern "C" rtError_t rtFreeHost(void *ptr) {
     return 0;
 }
 extern "C" rtError_t rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind) {
+    ++rts.shared_initializations;
     EXPECT_TRUE(rts.allow_sync_initialization) << "descriptor publication must be asynchronous";
     if (!rts.allow_sync_initialization) return -99;
     EXPECT_EQ(kind, RT_MEMCPY_HOST_TO_DEVICE);
@@ -117,7 +119,7 @@ TEST_F(LaunchEntryArgs, AFailedPublicationLeavesNothingLaunchable) {
     EXPECT_FALSE(helper.runtime_args_prepared());
     EXPECT_EQ(helper.launch_payload(), nullptr);
     EXPECT_EQ(helper.launch_payload_bytes(), 0U);
-    EXPECT_FALSE(slot.workers_initialized);
+    EXPECT_TRUE(slot.workers_initialized);
 
     // The consumed snapshot cannot be published again; only a fresh prepare can.
     EXPECT_NE(publish(true), 0);
@@ -125,8 +127,11 @@ TEST_F(LaunchEntryArgs, AFailedPublicationLeavesNothingLaunchable) {
 
     rts.copy_rc = 0;
     ASSERT_EQ(run_once(true), 0);
-    EXPECT_EQ(rts.last_copy_bytes, runtime_device_initialized_prefix_size(runtime))
-        << "the retry initializes, rather than assuming the failed copy landed";
+    EXPECT_EQ(
+        rts.last_copy_bytes, runtime_launch_entry_args_plan(runtime).supported ?
+                                 runtime_launch_entry_args_plan(runtime).descriptor_bytes_when_launched :
+                                 runtime_device_copy_size(runtime)
+    ) << "the descriptor is republished after the failure";
 }
 
 // A second publish of one snapshot is refused whether or not the first
@@ -192,7 +197,7 @@ TEST_F(LaunchEntryArgs, AFailedProductionPublishReturnsItsOwnErrorAndNoPayload) 
     EXPECT_FALSE(helper.runtime_args_published());
     EXPECT_EQ(helper.launch_payload(), nullptr);
     EXPECT_EQ(helper.launch_payload_bytes(), 0U);
-    EXPECT_FALSE(slot.workers_initialized);
+    EXPECT_TRUE(slot.workers_initialized);
     EXPECT_EQ(rts.copies, 1) << "one attempt, not a retry";
 }
 
@@ -232,4 +237,128 @@ TEST_F(LaunchEntryArgs, AStagedSectionNoDescriptorNamesIsNotPublished) {
     ASSERT_EQ(run_once(false), 0);
     EXPECT_EQ(helper.args.graph_section_bytes, 0U);
     EXPECT_EQ(helper.args.graph_section_source, static_cast<uint32_t>(GraphSectionSource::None));
+}
+
+TEST_F(LaunchEntryArgs, KernelDescriptorRelocatesIntoRtsStorageAndBorrowsSharedState) {
+    std::array<uint64_t, 4> borrowed{11, 22, 33, 44};
+    runtime.set_worker_count(7);
+    runtime.set_gm_sm_ptr(borrowed.data());
+    ASSERT_EQ(prepare_kernel(), 0);
+    ASSERT_NE(slot.shared_state, nullptr);
+    EXPECT_EQ(slot.runtime_args, nullptr);
+    EXPECT_EQ(slot.runtime_upload_source, nullptr);
+    EXPECT_EQ(allocator.get_allocation_count(), 1U);
+    EXPECT_EQ(allocator.committed_bytes(), sizeof(RuntimeSharedState));
+    ASSERT_EQ(publish(true), 0);
+    EXPECT_EQ(rts.copies, 0);
+    EXPECT_EQ(helper.host_input_count(), runtime_launch_entry_args_plan(runtime).supported ? 2 : 1);
+    auto copied = copy_launch();
+    const KernelArgs header = copied.header();
+    const auto *descriptor = reinterpret_cast<const DeviceRuntimeLaunchDesc *>(header.runtime_args);
+    const auto *begin = static_cast<const unsigned char *>(copied.data());
+    const auto *address = reinterpret_cast<const unsigned char *>(descriptor);
+    EXPECT_GE(address, begin);
+    EXPECT_LE(address + runtime_device_launch_size(runtime), begin + copied.bytes);
+    EXPECT_EQ(descriptor->worker_count, 7);
+    EXPECT_EQ(descriptor->shared_state_addr, reinterpret_cast<uint64_t>(slot.shared_state));
+    EXPECT_EQ(descriptor->gm_sm_ptr_, borrowed.data());
+    EXPECT_EQ(borrowed, (std::array<uint64_t, 4>{11, 22, 33, 44}));
+    EXPECT_EQ(allocator.get_allocation_count(), 1U);
+}
+
+TEST_F(LaunchEntryArgs, TwoRtsDescriptorCopiesKeepOneSharedStateWithoutOwningBorrowedBuffers) {
+    std::array<uint64_t, 2> borrowed{11, 22};
+    runtime.set_gm_sm_ptr(borrowed.data());
+    runtime.set_worker_count(3);
+    ASSERT_EQ(prepare_kernel(), 0);
+    ASSERT_EQ(helper.publish_runtime_args(true, this, rts.sink, true), 0);
+    auto recorded = copy_launch();
+    const auto *first = reinterpret_cast<const DeviceRuntimeLaunchDesc *>(recorded.header().runtime_args);
+    auto *shared = slot.shared_state;
+    shared->workers[0].report_epoch = 99;
+    helper.release_run_view();
+    runtime.set_worker_count(5);
+    ASSERT_EQ(prepare_kernel(), 0);
+    ASSERT_EQ(publish(true), 0);
+    auto eager = copy_launch();
+    const auto *second = reinterpret_cast<const DeviceRuntimeLaunchDesc *>(eager.header().runtime_args);
+    EXPECT_NE(first, second);
+    EXPECT_EQ(first->worker_count, 3);
+    EXPECT_EQ(second->worker_count, 5);
+    EXPECT_EQ(first->shared_state_addr, second->shared_state_addr);
+    EXPECT_EQ(shared->workers[0].report_epoch, 99U);
+    helper.release_run_view();
+    EXPECT_EQ(first->worker_count, 3);
+    EXPECT_EQ(second->gm_sm_ptr_, borrowed.data());
+    EXPECT_EQ(rts.copies, 0);
+    EXPECT_EQ(release_slot_persistent_args(slot, allocator), 0);
+    borrowed[0] = 77;
+    EXPECT_EQ(borrowed[0], 77U);
+    EXPECT_EQ(borrowed[1], 22U);
+}
+
+TEST_F(LaunchEntryArgs, KernelSnapshotAndRelocationsSurviveHelperMove) {
+    runtime.set_worker_count(7);
+    ASSERT_EQ(prepare_kernel(), 0);
+    ASSERT_EQ(publish(true), 0);
+    KernelArgsHelper moved(std::move(helper));
+    helper.release_run_view();
+    EXPECT_FALSE(helper.launchable());
+    ASSERT_TRUE(moved.runtime_args_published());
+    ASSERT_EQ(moved.host_input_count(), runtime_launch_entry_args_plan(runtime).supported ? 2 : 1);
+    EXPECT_EQ(moved.runtime_launch_bytes(), runtime_device_launch_size(runtime));
+    DeviceRuntimeLaunchDesc snapshot{};
+    std::memcpy(&snapshot, moved.runtime_launch_data(), moved.runtime_launch_bytes());
+    EXPECT_EQ(snapshot.worker_count, 7);
+    EXPECT_EQ(snapshot.shared_state_addr, reinterpret_cast<uint64_t>(slot.shared_state));
+    EXPECT_NE(moved.launch_payload(), nullptr);
+}
+
+TEST_F(LaunchEntryArgs, MisalignedRtsDescriptorGetsAnAlignedPrivateViewWithoutRewritingItsSource) {
+    runtime.set_worker_count(7);
+    runtime.set_aicpu_thread_num(3);
+    constexpr size_t bytes = RUNTIME_LAUNCH_DESCRIPTOR_BYTES;
+    alignas(64) std::array<unsigned char, bytes + 64> packet{};
+    auto *source = packet.data() + 8;
+    ASSERT_EQ(reinterpret_cast<uintptr_t>(source) % 64, 8U);
+    std::memcpy(source, &runtime.dev, bytes);
+    const auto original = packet;
+    RuntimeLaunchView owner;
+    Runtime *view = owner.bind(reinterpret_cast<Runtime *>(source), bytes);
+    ASSERT_NE(view, nullptr);
+    EXPECT_NE(static_cast<void *>(view), source);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(view) % alignof(DeviceRuntimeLaunchDesc), 0U);
+    EXPECT_EQ(view->get_worker_count(), 7);
+    EXPECT_EQ(view->get_aicpu_thread_num(), 3);
+    EXPECT_EQ(view->dev.shared_state_addr, runtime.dev.shared_state_addr);
+    EXPECT_EQ(view->get_workers(), runtime.get_workers());
+    view->set_worker_count(11);
+    EXPECT_EQ(packet, original);
+    EXPECT_EQ(runtime.get_worker_count(), 7);
+}
+
+TEST_F(LaunchEntryArgs, RuntimeViewRejectsInvalidSizesAndBorrowsProgramDescriptors) {
+    RuntimeLaunchView owner;
+    EXPECT_EQ(owner.bind(nullptr, 0), nullptr);
+    EXPECT_EQ(owner.bind(nullptr, RUNTIME_LAUNCH_DESCRIPTOR_BYTES), nullptr);
+    EXPECT_EQ(owner.bind(&runtime, RUNTIME_LAUNCH_DESCRIPTOR_BYTES - 1), nullptr);
+    EXPECT_EQ(owner.bind(&runtime, RUNTIME_LAUNCH_DESCRIPTOR_BYTES + 1), nullptr);
+    EXPECT_EQ(owner.bind(&runtime, UINT32_MAX), nullptr);
+    EXPECT_EQ(owner.bind(&runtime, 0), &runtime);
+    EXPECT_EQ(runtime.get_worker_count(), 0);
+}
+
+TEST_F(LaunchEntryArgs, KernelHeaderCarriesExactDescriptorLengthWhileProgramBorrowsItsAddress) {
+    ASSERT_EQ(prepare_kernel(), 0);
+    ASSERT_EQ(publish(true), 0);
+    auto copied = copy_launch();
+    EXPECT_EQ(copied.header().runtime_descriptor_bytes, RUNTIME_LAUNCH_DESCRIPTOR_BYTES);
+    helper.release_run_view();
+    ASSERT_EQ(release_slot_persistent_args(slot, allocator), 0);
+    ASSERT_EQ(prepare(), 0);
+    ASSERT_EQ(publish(false), 0);
+    KernelArgs program_header{};
+    std::memcpy(&program_header, helper.launch_payload(), sizeof(program_header));
+    EXPECT_EQ(program_header.runtime_descriptor_bytes, 0U);
+    EXPECT_EQ(program_header.runtime_args, slot.runtime_args);
 }

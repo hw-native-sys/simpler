@@ -20,6 +20,9 @@
 
 #include "host/host_graph_runs.h"
 
+struct PipelineContract;
+extern "C" __attribute__((weak)) const PipelineContract *get_pipeline_contract() { return nullptr; }
+
 // A recorder worker stands its recording storage up as it starts
 // (host/graph_recorder_pool.h). The real one is in orchestrator.cpp, which the
 // pool's own threading test does not link -- and does not need, since nothing

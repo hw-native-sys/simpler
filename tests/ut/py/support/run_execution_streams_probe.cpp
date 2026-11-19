@@ -119,6 +119,7 @@ static void check_execution_streams() {
     runner.set_owner_streams(&stream_tokens[6], &stream_tokens[7]);
     Runtime runtime;
     runtime.dev = {};
+    runtime.dev.shared_state_addr = reinterpret_cast<uint64_t>(&runtime.host_shared_state_);
     MemoryAllocator allocator;
     SlotPersistentArgs slot;
     NativeRunIdentity id{1, 1, 1, 0};
@@ -197,6 +198,7 @@ static void check_cleanup_wait_failure(SimplerExecutionMode mode, int failing_si
     assert(runner.execution_mode_latch().latch(mode) == 0);
     Runtime runtime;
     runtime.dev = {};
+    runtime.dev.shared_state_addr = reinterpret_cast<uint64_t>(&runtime.host_shared_state_);
     const NativeRunIdentity id{2, 1, 1, 0};
     DeviceRunnerBase::PreparedExecution prepared(id, runtime, CallConfig{}, 0);
     prepared.streams = {&stream_tokens[4], &stream_tokens[5]};

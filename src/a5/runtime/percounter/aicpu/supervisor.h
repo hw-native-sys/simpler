@@ -122,7 +122,7 @@ inline void percounter_publish_partition(
     const int32_t core_count = lifecycle.core_count();
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(thread_idx) * core_count) / thread_count);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(thread_idx + 1) * core_count) / thread_count);
-    Handshake *handshakes = runtime->dev.workers;
+    Handshake *handshakes = runtime->get_workers();
     for (int32_t i = lo; i < hi; ++i) {
         if (!lifecycle.core_reported(i)) continue;
         handshakes[i].aicpu_ready = SCHEDULER_RUNTIME_MODE_PERCOUNTER;

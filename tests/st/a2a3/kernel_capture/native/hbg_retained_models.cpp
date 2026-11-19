@@ -43,14 +43,15 @@ std::vector<uint8_t> read(const char *path) {
 
 int main(int argc, char **argv) {
     require(
-        argc == 6 || argc == 8 ||
+        argc == 6 || (argc == 7 && std::strcmp(argv[6], "heap") == 0) || argc == 8 ||
             (argc == 9 && (std::strcmp(argv[8], "swimlane") == 0 || std::strcmp(argv[8], "argsdump") == 0)),
         "usage: device callable cpu core dispatcher [diagnostic-output replay [swimlane|argsdump]]"
     );
     const bool pmu = argc == 8;
+    const bool shared_heap = argc == 7;
     const bool swimlane = argc == 9 && std::strcmp(argv[8], "swimlane") == 0;
     const bool args_dump = argc == 9 && std::strcmp(argv[8], "argsdump") == 0;
-    const bool execute_models = argc == 6 || std::atoi(argv[7]) != 0;
+    const bool execute_models = argc <= 7 || std::atoi(argv[7]) != 0;
     require(!args_dump || std::atoi(argv[7]) == 0 || std::atoi(argv[7]) == 3, "argsdump-replays");
     const int device = std::atoi(argv[1]);
     const auto callable = read(argv[2]), cpu = read(argv[3]), core = read(argv[4]), dispatcher = read(argv[5]);
@@ -95,6 +96,7 @@ int main(int argc, char **argv) {
     require(ctx != nullptr, "native-context");
     CallConfig config{};
     config.aicpu_thread_num = 2;
+    if (shared_heap) config.runtime_env.ring_heap[0] = 128 * 1024;
     check(
         simpler_kernel_mode_init(
             ctx, device, cpu.data(), cpu.size(), core.data(), core.size(), dispatcher.data(), dispatcher.size(),
@@ -110,7 +112,7 @@ int main(int argc, char **argv) {
         reinterpret_cast<void *>((reinterpret_cast<uintptr_t>(storage.data()) + alignment - 1) & ~(alignment - 1));
     const auto original_run = run;
     uint64_t identity = 0;
-    auto prepare = [&](int callable_id, size_t tensor, int32_t increment, bool capture) {
+    auto prepare = [&](int callable_id, size_t tensor, int32_t increment, bool capture, int expected_rc = 0) {
         if (pmu || swimlane || args_dump) {
             if (pmu) config.enable_pmu = capture ? (callable_id == 0 ? 2 : 4) : 7;
             if (swimlane) config.enable_chip_swimlane = 4;
@@ -129,7 +131,9 @@ int main(int argc, char **argv) {
         descriptor.generation = descriptor.run_epoch = descriptor.dispatch_id = ++identity;
         descriptor.prepare_purpose = capture ? SIMPLER_PREPARE_CAPTURE : SIMPLER_PREPARE_EAGER;
         require(run == original_run && descriptor.pipeline_slot == 0, "same-carrier-and-slot");
-        check(simpler_prepare_run(ctx, run, callable_id, &args, &config, &descriptor), "prepare");
+        const int rc = simpler_prepare_run(ctx, run, callable_id, &args, &config, &descriptor);
+        if (expected_rc != 0) require(rc == expected_rc, "expected-heap-capacity-refusal");
+        else check(rc, "prepare");
     };
     auto record = [&](RuntimeHandle &reference) {
         check(simpler_retain_run_resources(ctx, run, caller, &reference), "retain");
@@ -194,7 +198,12 @@ int main(int argc, char **argv) {
     require(finalize_device(ctx) == PTO_RUNTIME_ERR_INVALID_STATE, "b-retains-context");
     auto run_eager = [&] {
         check(simpler_kernel_mode_prepare_callable(ctx, 0, callable.data(), callable.size()), "register-eager");
-        prepare(0, 2, 17, false);
+        if (shared_heap) {
+            prepare(0, 2, 17, false, PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+            verify("heap-capacity-refused");
+        }
+        const int increment = shared_heap ? 19 : 17;
+        prepare(0, 2, increment, false);
         if (swimlane) {
             // A's detached publication may still hold the second output credit.
             // Only the clean capacity refusal preserves this same prepared run.
@@ -224,10 +233,10 @@ int main(int argc, char **argv) {
         check(aclrtSynchronizeStreamWithTimeout(caller, 10000), "eager-sync");
         check(simpler_finalize_run(ctx, run), "eager-finalize");
         for (auto &value : expected[2])
-            value += args_dump ? 24 : 17;
+            value += args_dump ? 24 : increment;
         verify("eager");
     };
-    if (swimlane || args_dump) run_eager();
+    if (swimlane || args_dump || shared_heap) run_eager();
     if (args_dump) {
         // B's final replay follows an eager call with a different frozen dump level.
         if (execute_models) replay_dump(model_b, 1, 5, 2, "argsdump-b-after-eager");
@@ -237,7 +246,7 @@ int main(int argc, char **argv) {
     check(aclmdlRIDestroy(model_b), "destroy-b");
     check(simpler_release_run_resources(ctx, reference_b), "release-b");
     check(simpler_unregister_callable(ctx, 1), "unregister-b");
-    if (!swimlane && !args_dump) run_eager();
+    if (!swimlane && !args_dump && !shared_heap) run_eager();
     if (pmu || swimlane || args_dump) {
         std::array<char, 4096> error{};
         const int flush_rc = simpler_flush_diagnostics_ctx(ctx, 60000, error.data(), error.size());

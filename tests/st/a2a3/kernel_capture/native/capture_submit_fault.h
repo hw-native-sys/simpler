@@ -36,13 +36,22 @@ struct CapturedPublication {
 };
 
 struct CapturedLaunch {
-    uint64_t runtime_args = 0;
+    uint64_t shared_state_addr = 0;
+    uint64_t worker_context_base = 0;
+    uint32_t runtime_mode = 0;
+    int32_t worker_count = 0;
     size_t publication_count = 0;
+};
+
+struct CapturedCpuLaunch {
+    uint64_t runtime_args = 0;
+    uint32_t runtime_bytes = 0;
 };
 
 struct CapturedSubmission {
     std::vector<CapturedPublication> publications;
     std::vector<CapturedLaunch> launches;
+    std::vector<CapturedCpuLaunch> cpu_launches;
 };
 
 void begin_capture_publication_probe();

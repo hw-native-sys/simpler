@@ -46,6 +46,7 @@ struct Model {
     RuntimeHandle reference = nullptr;
     void *output = nullptr;
     size_t offset = 0;
+    uint64_t image_address = 0;
 };
 class CaptureFixture {
 public:
@@ -74,6 +75,9 @@ public:
                 config.runtime_env.ring_heap[ring] = 1ULL << 20;
                 config.runtime_env.ring_dep_pool[ring] = 256;
             }
+        } else {
+            // The finite-budget fixture reserves one fixed heap below its total budget.
+            config.runtime_env.ring_heap[0] = 64ULL << 20;
         }
         const int device = std::atoi(argv[1]);
         check(aclInit(nullptr), "acl-init");
@@ -167,6 +171,11 @@ public:
         check(simpler_retain_run_resources(context, run, caller, &model.reference), "retain");
         check(aclmdlRICaptureBegin(caller, ACL_MODEL_RI_CAPTURE_MODE_GLOBAL), "capture-begin");
         check(simpler_launch_run_on_stream(context, run, caller, nullptr), "capture-submit");
+        model.image_address = last_runtime_image_address();
+        require(
+            tmr ? last_rts_execution_image_bytes() == 0 : last_rts_execution_image_bytes() != 0,
+            "execution-image-hostinput"
+        );
         check(aclmdlRICaptureEnd(caller, &model.model), "capture-end");
         require(model.model != nullptr, "model");
         check(simpler_finalize_run(context, run), "retire-host-carrier");

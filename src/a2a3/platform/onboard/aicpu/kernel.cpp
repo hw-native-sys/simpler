@@ -19,6 +19,9 @@
 #include "common/kernel_args.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_entry_args.h"
+#include "aicpu/runtime_launch_view.h"
+#include "aicpu/cache_maintenance.h"
+#include "aicpu/hbg_execution_image.h"
 #include "aicpu/aicpu_device_config.h"
 #include "aicpu/dep_gen_collector_aicpu.h"
 #include "aicpu/device_log.h"
@@ -82,7 +85,7 @@ static void bind_platform_task(KernelArgs *k_args) {
     set_platform_scope_stats_run_terminal(k_args->scope_stats_run_terminal_bank);
 }
 
-static int execute_platform_task(void *arg) {
+static int execute_platform_task(void *arg, Runtime *runtime) {
     // Log severity was snapshot once by simpler_aicpu_init at worker init; the
     // resident SO keeps it across launches, so exec does not re-snapshot.
     if (arg == nullptr) {
@@ -91,7 +94,6 @@ static int execute_platform_task(void *arg) {
     }
 
     KernelArgs *k_args = reinterpret_cast<KernelArgs *>(arg);
-    Runtime *runtime = k_args->runtime_args;
 
     if (runtime == nullptr) {
         LOG_ERROR("%s", "Invalid runtime_args: null pointer");
@@ -123,7 +125,8 @@ static int execute_platform_task(void *arg) {
         PlatformEntryArgs{
             arg, k_args->entry_args_offset, k_args->entry_tensor_count, k_args->entry_scalar_count,
             k_args->entry_args_source, k_args->graph_section_offset, k_args->graph_section_bytes,
-            k_args->graph_section_source, k_args->entry_cache_maintenance
+            k_args->graph_section_source, k_args->entry_cache_maintenance,
+            reinterpret_cast<uint64_t>(k_args->runtime_args)
         }
     );
     AicpuPhaseScope run_wall(AicpuPhase::RunWall);
@@ -142,12 +145,21 @@ static int execute_platform_task(void *arg) {
 extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *arg) {
     if (arg == nullptr) return -1;
     auto *args = static_cast<KernelArgs *>(arg);
-    auto *runtime = args->runtime_args;
+    RuntimeLaunchView runtime_view;
+    auto *runtime = runtime_view.bind(args->runtime_args, args->runtime_descriptor_bytes);
     if (runtime == nullptr) return -1;
     bind_platform_task(args);
     NativeInvocationEntry invocation{
-        runtime->get_aicpu_launch_count(), args->run_result_data_base,  args->run_result_epoch,
-        aicpu_begin_native_invocation,     aicpu_reset_execution_entry, aicpu_finish_native_invocation
+        runtime->get_aicpu_launch_count(),
+        args->run_result_data_base,
+        args->run_result_epoch,
+        aicpu_begin_native_invocation,
+        aicpu_reset_execution_entry,
+        aicpu_finish_native_invocation,
+        args->execution_image,
+        [](const void *image) {
+            return restore_hbg_execution_image(image, cache_invalidate_range, cache_flush_range);
+        }
     };
     const auto entry = platform_aicpu_entry_gate_filter(
         runtime->get_aicpu_allowed_cpus(), runtime->get_aicpu_allowed_cpu_count(), invocation.callbacks,
@@ -155,8 +167,8 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     );
     return invocation.complete(
         entry,
-        [arg] {
-            return execute_platform_task(arg);
+        [arg, runtime] {
+            return execute_platform_task(arg, runtime);
         },
         [runtime, args] {
             (void)abort_aicore_startup(runtime, args->regs, args->run_result_epoch);

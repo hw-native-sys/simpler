@@ -494,6 +494,10 @@ extern "C" rtError_t rtMemcpy(void *dst, uint64_t, const void *src, uint64_t byt
         ++stale_resource_calls;
         return -983;
     }
+    if (kind == RT_MEMCPY_HOST_TO_DEVICE && bytes == sizeof(RuntimeSharedState::workers)) {
+        std::memcpy(dst, src, bytes);
+        return 0;
+    }
     ++copies;
     if (fail_result_initialization && kind == RT_MEMCPY_HOST_TO_DEVICE &&
         bytes == sizeof(NativeInvocationResultStorage))
@@ -715,11 +719,13 @@ extern "C" aclError aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus *s
 // Kernel submission, recovery and scheduler-export leaves are test transports.
 // The production runner performs publication, arming, launch/drain decisions,
 // both callbacks, and every event/reference step.
-int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, const KernelArgs &) {
+int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, const KernelArgs &, const AicoreRuntimeView &) {
     if (observation_probe) observation_core_stream = stream;
     return step("core", stream);
 }
-int host::LoadAicpuOp::LaunchBuiltInOp(rtStream_t stream, void *args, size_t bytes, int, const std::string &) {
+int host::LoadAicpuOp::LaunchBuiltInOp(
+    rtStream_t stream, void *args, size_t bytes, int, const std::string &, rtHostInputInfo_t *, uint16_t
+) {
     if (capture && capture_kernel_packet) {
         assert(bytes >= sizeof(KernelArgs));
         const auto &header = *static_cast<const KernelArgs *>(args);
@@ -767,7 +773,19 @@ static DfxRunConfig requested_native_result() {
     dfx.scope_stats_enabled = true;
     return dfx;
 }
-class ProbeRunner : public DeviceRunner {
+class CpuTransportRunner : public DeviceRunner {
+public:
+    int acquire_scheduler_notifications(
+        uint32_t, SchedulerNotificationPurpose, size_t count, SchedulerDoneNotifications *out
+    ) override {
+        if (out == nullptr) return -1;
+        // This CPU transport has no notification SRAM; exercise the GM fallback.
+        *out = {std::vector<uint64_t>(count, 0), std::vector<uint64_t>(count, 0), {}};
+        return 0;
+    }
+};
+
+class ProbeRunner : public CpuTransportRunner {
 public:
     // Partial ownership is real; only the late-health case exercises recovery.
     void recover_device_or_mark_unusable(int rc) override {
@@ -837,7 +855,8 @@ public:
     size_t pending_prepared_uses() const { return prepared_uses_.size(); }
     using DeviceRunnerBase::ensure_device_run_result_region;
     using DeviceRunnerBase::ensure_device_wall_buffer;
-    bool result_initialized() const { return submission_storage_[0]->result_initialized; }
+    bool result_initialized(uint64_t epoch = 1) const { return result_region_snapshot(epoch, 0).initialized; }
+    void *result_region_ptr(uint64_t epoch = 1) const { return result_region_snapshot(epoch, 0).device_ptr; }
     void release_result(uint64_t epoch = 1) { release_device_run_result(0, epoch, true); }
     using DeviceRunnerBase::discharge_boundary_waits;
     using DeviceRunnerBase::slot_persistent_args;
@@ -872,6 +891,7 @@ public:
     void check_failed_event_close() {
         Runtime runtime;
         runtime.dev = {};
+        runtime.dev.shared_state_addr = reinterpret_cast<uint64_t>(&runtime.host_shared_state_);
         const NativeRunIdentity id{1, 1, 1, 0};
         PreparedExecution prepared(id, runtime, CallConfig{}, 0);
         prepared.caller_stream = caller;
@@ -909,6 +929,7 @@ static void check(int fault, bool capturing) {
     runner.initialize();
     Runtime runtime;
     runtime.dev = {};
+    runtime.dev.shared_state_addr = reinterpret_cast<uint64_t>(&runtime.host_shared_state_);
     MemoryAllocator allocator;
     SlotPersistentArgs slot;
     NativeRunIdentity id{1, 1, 1, 0};
@@ -970,6 +991,8 @@ check_joined_callers(void *first_caller, void *second_caller, bool fail_proof = 
     runner.initialize();
     Runtime first_runtime, second_runtime;
     first_runtime.dev = second_runtime.dev = {};
+    first_runtime.dev.shared_state_addr = reinterpret_cast<uint64_t>(&first_runtime.host_shared_state_);
+    second_runtime.dev.shared_state_addr = reinterpret_cast<uint64_t>(&second_runtime.host_shared_state_);
     MemoryAllocator allocator;
     SlotPersistentArgs first_slot, second_slot;
     uint64_t image_target = 0, image_source = 37;
@@ -1054,7 +1077,7 @@ check_joined_callers(void *first_caller, void *second_caller, bool fail_proof = 
 struct ChipTaskArgs;
 struct OrchContext;
 
-class OwnedCloseRunner : public DeviceRunner {
+class OwnedCloseRunner : public CpuTransportRunner {
 public:
     void initialize(bool borrowed) {
         if (borrowed) initialize_borrowed_context(*this);
@@ -1101,7 +1124,6 @@ public:
         );
         assert(scope_stats_collector_.get_scope_stats_shm_device_ptr() != nullptr);
     }
-    int fill_persistent_arch_fields(KernelArgs *, uint64_t) override { return 0; }
     int prepare_execution(
         Runtime &runtime, const CallConfig &config, uint32_t slot, const NativeRunIdentity &identity,
         std::unique_ptr<PreparedExecution> *out
@@ -1588,6 +1610,8 @@ static void check_original_core_observation(uint32_t mode, bool stream_fails, bo
     runner.check_late_health = true;
     Runtime first_runtime, second_runtime;
     first_runtime.dev = second_runtime.dev = {};
+    first_runtime.dev.shared_state_addr = reinterpret_cast<uint64_t>(&first_runtime.host_shared_state_);
+    second_runtime.dev.shared_state_addr = reinterpret_cast<uint64_t>(&second_runtime.host_shared_state_);
     const NativeRunIdentity first_id{1, 1, 1, 0}, second_id{2, 1, 2, 1};
     void *first_record = nullptr;
     auto launch = [&](Runtime &runtime, const NativeRunIdentity &identity) {
@@ -1634,6 +1658,7 @@ static void check_original_core_observation(uint32_t mode, bool stream_fails, bo
     if (stream_fails) {
         Runtime reused_runtime;
         reused_runtime.dev = {};
+        reused_runtime.dev.shared_state_addr = reinterpret_cast<uint64_t>(&reused_runtime.host_shared_state_);
         const NativeRunIdentity reused_id{3, 2, 3, first_id.pipeline_slot};
         auto reused = launch(reused_runtime, reused_id);
         assert(reused.rc == 0 && reused.active != nullptr);
@@ -1668,7 +1693,9 @@ static void check_original_core_observation(uint32_t mode, bool stream_fails, bo
         assert(second.active->prepared->kernel_args.args.runtime_args == successor_args);
         assert(live_allocations == successor_allocations);
         assert((observed_streams == std::vector<void *>{original.aicpu, original.aicore}));
-        assert(copies == reads_after_launch + 3);  // Two successor descriptors and error-only private read.
+        // TMR's reused slot already holds the identical launch-route prefix.
+        const int publications = runtime_launch_entry_args_plan(first_runtime).supported ? 1 : 2;
+        assert(copies == reads_after_launch + publications + 1);  // Successor publications and private read.
         const auto own_proof = current_proof_records();
         assert(std::any_of(own_proof.begin(), own_proof.end(), [](const auto &line) {
             const auto row = proof_fields(line);
@@ -1718,6 +1745,7 @@ static void check_metadata_publication(int fault, bool drain_fails = false) {
     runner.initialize();
     Runtime runtime;
     runtime.dev = {};
+    runtime.dev.shared_state_addr = reinterpret_cast<uint64_t>(&runtime.host_shared_state_);
     MemoryAllocator allocator;
     SlotPersistentArgs slot;
     uint64_t target = 0, source = 37;
@@ -1867,6 +1895,7 @@ static void check_result_publication(bool has_caller, int failure_step) {
     runner.initialize();
     Runtime runtime;
     runtime.dev = {};
+    runtime.dev.shared_state_addr = reinterpret_cast<uint64_t>(&runtime.host_shared_state_);
     const NativeRunIdentity id{1, 1, 1, 0};
     auto prepared = std::make_unique<DeviceRunnerBase::PreparedExecution>(id, runtime, CallConfig{}, 0);
     if (has_caller) prepared->caller_stream = caller;
@@ -1879,7 +1908,7 @@ static void check_result_publication(bool has_caller, int failure_step) {
     DeviceRunResultRegion forged{};
     forged.published = id.run_epoch;
     forged.verdict = static_cast<uint32_t>(DeviceRunVerdict::Ok);
-    std::memcpy(runner.submission()->device_result, &forged, sizeof(forged));
+    std::memcpy(runner.result_region_ptr(), &forged, sizeof(forged));
     const int failed_copies = copies;
     assert(runner.read_device_run_result(0, id.run_epoch) == 0);
     assert(copies == failed_copies);
@@ -1955,6 +1984,7 @@ static void check_timing_publication(int fault) {
     runner.initialize();
     Runtime runtime;
     runtime.dev = {};
+    runtime.dev.shared_state_addr = reinterpret_cast<uint64_t>(&runtime.host_shared_state_);
     const NativeRunIdentity id{1, 1, 1, 0};
     auto prepared = std::make_unique<DeviceRunnerBase::PreparedExecution>(id, runtime, CallConfig{}, 0);
     prepared->caller_stream = caller;
@@ -2063,14 +2093,15 @@ struct OrchContext;
 
 static uint8_t *host_effect_target;
 static int host_effect_calls;
-class FatalCollectorProbeRunner : public DeviceRunner {
+class FatalCollectorProbeRunner : public CpuTransportRunner {
 public:
     void install_submission_binary_stub() {
         aicore_bin_handle_ = &tokens[59];
         chip_callable_buffers_[1].refcount = 2;
     }
     void add_unrelated_callable() { callables_.emplace(2, CallableState{}); }
-    void *result_address() const { return submission_storage_[0]->device_result; }
+    void *result_address(uint64_t epoch = 1) const { return result_region_snapshot(epoch, 0).device_ptr; }
+    void *idle_result_address() const { return idle_result_device_ptr(); }
     void *runtime_address() const { return submission_storage_[0]->args.runtime_args; }
     int finish_common() { return finalize_common(); }
     void start_scope_readers() { scope_stats_collector_.start({}); }
@@ -2136,7 +2167,6 @@ public:
         );
         assert(scope_stats_collector_.get_scope_stats_shm_device_ptr() != nullptr);
     }
-    int fill_persistent_arch_fields(KernelArgs *, uint64_t) override { return 0; }
     int prepare_execution(
         Runtime &runtime, const CallConfig &config, uint32_t slot, const NativeRunIdentity &identity,
         std::unique_ptr<PreparedExecution> *out
@@ -2263,7 +2293,7 @@ static void check_standalone_collector_close(const std::string &scenario) {
         assert(!runner->prepared_storage_in_use());
         if (scenario == "unused-release-retry") {
             const int resets_before = normal_reset_calls;
-            void *failed_address = runner->result_address();
+            void *failed_address = runner->idle_result_address();
             failed_free = failed_address;
             assert(finalize_device(runner) != 0);
             assert(normal_reset_calls == resets_before && runner->device_id() == 0);
@@ -2427,6 +2457,7 @@ static void check_retained_submission_storage(bool grow) {
     runner.initialize();
     Runtime runtime;
     runtime.dev = {};
+    runtime.dev.shared_state_addr = reinterpret_cast<uint64_t>(&runtime.host_shared_state_);
     const NativeRunIdentity id{1, 1, 1, 0};
     auto prepared = std::make_unique<DeviceRunnerBase::PreparedExecution>(id, runtime, CallConfig{}, 0);
     assert(runner.prepare_run_storage(0) == 0);
@@ -2446,7 +2477,7 @@ static void check_retained_submission_storage(bool grow) {
         runner.note_workspace_run_fact(id, fact);
     void *old_source = old->args.runtime_upload_source;
     void *old_device = old->args.runtime_args;
-    void *old_result = old->device_result;
+    void *old_result = runner.result_region_ptr(1);
     const auto old_source_bytes = old->args.runtime_upload_bytes;
     std::weak_ptr<PreparedSubmissionStorage> old_weak = old;
     old.reset();
@@ -2465,7 +2496,7 @@ static void check_retained_submission_storage(bool grow) {
     assert(next_args.prepare_runtime_args(runtime, runner.allocator(), current->args) == 0);
     assert(current->args.runtime_upload_source != old_source);
     assert(current->args.runtime_args != old_device);
-    assert(current->device_result != old_result);
+    assert(next_args.args.run_result_data_base != reinterpret_cast<uint64_t>(old_result));
     for (size_t i = 0; i < old_source_bytes; ++i)
         assert(static_cast<unsigned char *>(old_source)[i] == 0x5a);
     assert(runner.reclaim_workspace_obsolete() == 0);
@@ -2481,14 +2512,15 @@ static void check_retained_submission_storage(bool grow) {
     failed_destroy_event = &tokens[16 + next_event - 1];
     assert(runner.reclaim_workspace_obsolete() == -778);
     assert(!old_weak.expired() && live_allocations.count(old_device) == 1);
-    // Both kinds of failed frees remain addressable until a later retry.
-    failed_free = old_result;
+    // The failed host free remains addressable until a later retry.
     failed_host_free = old_source;
     assert(runner.reclaim_workspace_obsolete() != 0);
-    assert(!old_weak.expired() && live_allocations.count(old_result) == 1);
+    // The failed host free retains the storage and its source for the retry;
+    // the device argument block is released before the host source is attempted.
+    assert(!old_weak.expired());
     assert(old_weak.lock()->args.runtime_upload_source == old_source);
     assert(runner.reclaim_workspace_obsolete() == 0);
-    assert(old_weak.expired() && live_allocations.count(old_result) == 0);
+    assert(old_weak.expired() && live_allocations.count(old_device) == 0);
     assert(submits == 0 && copies == 2 && syncs == 0);
     next_args.release_run_view();
     assert(runner.finish_common() == 0);
@@ -2502,6 +2534,7 @@ static void check_retained_temporary_storage(bool grow) {
     runner.initialize();
     Runtime runtime;
     runtime.dev = {};
+    runtime.dev.shared_state_addr = reinterpret_cast<uint64_t>(&runtime.host_shared_state_);
     const NativeRunIdentity id{1, 1, 1, 0};
     auto prepared = std::make_unique<DeviceRunnerBase::PreparedExecution>(id, runtime, CallConfig{}, 0);
     void *old = nullptr;
@@ -2650,10 +2683,10 @@ static void check_external_resource_api(bool borrowed, bool grow = false) {
     descriptor.run_epoch = descriptor.dispatch_id = 2;
     assert(simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor) == 0);
     if (borrowed) {
-        assert(runner.result_address() == nullptr);
+        assert(runner.result_address(descriptor.run_epoch) == nullptr);
         assert(runner.runtime_address() != first_owned_backing);
     } else {
-        assert(runner.result_address() != first_result);
+        assert(runner.result_address(descriptor.run_epoch) != first_result);
     }
     if (!borrowed) {
         void *second_staging = nullptr;

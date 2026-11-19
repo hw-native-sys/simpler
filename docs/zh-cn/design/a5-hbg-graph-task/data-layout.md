@@ -106,7 +106,13 @@ bindings_offset、completion_refs_offset、templates_offset、instances_offset�
 Header 的大小由当前类型定义，不另存大小字段；没有 control inbox 区。
 
 只读区域按 header、binding、completion refs、template、instance、child plan、fanin CSR、sink 排列。
-读取 header 前先以可信 scheduler_state_bytes 检查地址和长度，再核对 header.image_bytes；
+Host 将该区域按 64 B 对齐追加到紧凑 task image，并随同一个执行镜像发布。Kernel
+由 RTS 交付 `hostInput`，AICPU 在发布 READY 前将镜像恢复到 Simpler 管理的设备 arena。
+Program 和 sim 通过镜像上传路径初始化同一布局。
+AICPU 与 AICore 以 `SchedulerWorkerContext.native_graph_address` 和
+`native_graph_bytes`（偏移 232 B 和 240 B）访问同一个只读计划。RunControl、计数器、
+完成通知与 ready queues 使用另一块 Simpler 管理的可写调度区。
+读取 header 前先以可信 `native_graph_bytes` 检查地址和长度，再核对 `header.image_bytes`；
 不能只相信尚未验证 header 自报的大小。offset/count、对齐、非重叠、epoch 与展开数量均校验。
 原始录制 Graph 及其 fanout、root、参数重定位记录、scalar inheritance 不复制进 native GM 镜像。
 

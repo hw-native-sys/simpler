@@ -65,16 +65,13 @@ __aicore__ void dispatch_resident_timing(
 
 }  // namespace
 
-__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
+__aicore__ __attribute__((weak)) void aicore_execute(AicoreRuntimeView runtime, int block_idx, CoreType core_type) {
     // Block-local storage can outlive a launch that never unwound its stack.
     scheduler_scalar_bind(nullptr);
-    // The host's selection and its bootstrap address are on their own line, so
-    // observing the handshake line does not observe them. One observe covers the
-    // whole struct because it is exactly one 64-byte line.
-    __gm__ SchedulerBootstrapInputs *bootstrap = &runtime->dev.scheduler_bootstrap;
-    scheduler_observe_cache_line(bootstrap);
-    const uint32_t runtime_mode = bootstrap->runtime_mode;
-    __gm__ Handshake *handshake = (__gm__ Handshake *)(&runtime->dev.workers[block_idx]);
+    const uint32_t runtime_mode = runtime.runtime_mode;
+    __gm__ Handshake *handshake =
+        (__gm__ Handshake *)(&reinterpret_cast<__gm__ RuntimeSharedState *>(runtime.shared_state_addr)
+                                  ->workers[block_idx]);
     const uint32_t profiling_flag = get_aicore_profiling_flag();
     scheduler_observe_cache_line(handshake);
     const bool chip_swimlane_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
@@ -111,8 +108,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     dcci(handshake, SINGLE_CACHE_LINE, CACHELINE_OUT);
     dsb((mem_dsb_t)0);
 
-    const uint64_t context_base = bootstrap->worker_context_base;
-    const int32_t worker_count = runtime->dev.worker_count;
+    const uint64_t context_base = runtime.worker_context_base;
+    const int32_t worker_count = runtime.worker_count;
     const bool valid_bootstrap =
         (runtime_mode == SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING ||
          runtime_mode == SCHEDULER_RUNTIME_MODE_RESIDENT_READY) &&
@@ -123,7 +120,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         // Discovery and retirement use the report and teardown gate only;
         // an invalid bootstrap grants no access to scheduler backing.
         wait_for_aicpu_exit_signal();
-        acknowledge_aicore_cond_nonce_and_wait(&runtime->dev.teardown_gates[block_idx]);
+        acknowledge_aicore_cond_nonce_and_wait(
+            &reinterpret_cast<__gm__ RuntimeSharedState *>(runtime.shared_state_addr)->teardown_gates[block_idx]
+        );
         return;
     }
 
@@ -139,7 +138,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     if (startup_signal == AICORE_EXIT_SIGNAL) {
         // Failed initialization owns its error reporting. EXIT permits retirement,
         // but does not publish a writable scheduler context to this core.
-        acknowledge_aicore_cond_nonce_and_wait(&runtime->dev.teardown_gates[block_idx]);
+        acknowledge_aicore_cond_nonce_and_wait(
+            &reinterpret_cast<__gm__ RuntimeSharedState *>(runtime.shared_state_addr)->teardown_gates[block_idx]
+        );
         return;
     }
 
@@ -162,7 +163,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         );
         wait_for_aicpu_exit_signal();
         scheduler_store_barrier();
-        acknowledge_aicore_cond_nonce_and_wait(&runtime->dev.teardown_gates[block_idx]);
+        acknowledge_aicore_cond_nonce_and_wait(
+            &reinterpret_cast<__gm__ RuntimeSharedState *>(runtime.shared_state_addr)->teardown_gates[block_idx]
+        );
         return;
     }
     scheduler_observe_cache_line(&run_control->chip_swimlane_level);
@@ -215,5 +218,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     handshake->work_end_cycle = work_window.end_cycle;
     dcci(handshake, SINGLE_CACHE_LINE, CACHELINE_OUT);
     OUT_OF_ORDER_STORE_BARRIER();
-    acknowledge_aicore_cond_nonce_and_wait(&runtime->dev.teardown_gates[block_idx]);
+    acknowledge_aicore_cond_nonce_and_wait(
+        &reinterpret_cast<__gm__ RuntimeSharedState *>(runtime.shared_state_addr)->teardown_gates[block_idx]
+    );
 }

@@ -15,6 +15,13 @@ device can execute what the host built. It is deliberately not a numerics test.
 
 ## What differs from the TMR case
 
+The shared driver explicitly configures a 2 GiB HBG heap per device context
+through `CallConfig.runtime_env.ring_heap`. HBG uses entry 0 of this setting.
+The allocation has a fixed capacity and base; the task image and scheduler
+storage consume additional memory. A graph exceeding this capacity is rejected
+before device submission rather than growing the heap. This case-specific
+reservation does not change the runtime's 256 MiB default.
+
 `kernels/orchestration/decode_fwd_graph.cpp` — the file this case's `main.py`
 points at — is the TMR orchestration recast as a Graph, with **no
 runtime-specific rewrite left**:

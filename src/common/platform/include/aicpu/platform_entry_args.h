@@ -71,9 +71,10 @@ struct PlatformEntryArgs {
     uint32_t graph_bytes{0};
     uint32_t graph_source{static_cast<uint32_t>(GraphSectionSource::None)};
     uint32_t cache_maintenance{static_cast<uint32_t>(EntryCacheMaintenance::Full)};
+    uint64_t runtime_address{0};
 };
 static_assert(offsetof(PlatformEntryArgs, cache_maintenance) == 36);
-static_assert(sizeof(PlatformEntryArgs) == 40);
+static_assert(sizeof(PlatformEntryArgs) == 48);
 
 /**
  * Publish this thread's view, after the affinity gate has kept it.

@@ -111,8 +111,8 @@ onboard Path A implementation:
    `src/common/aicpu_loader/{host,device}`.
 2. **AICPU per-task launch ABI.**
    The per-task launch hands the front-less `KernelArgs` payload directly to
-   `rtsLaunchCpuKernel()` (`cpu_args.baseArgs.args = &kernel_args.args`,
-   `argsSize = sizeof(KernelArgs)`). There is no CANN launch front on this
+   `rtsLaunchCpuKernel()`. `argsSize` includes the header and any trailing
+   invocation, graph-definition and runtime-descriptor sections. There is no CANN launch front on this
    path — `runtime_args` sits at offset 0 and the AICPU entry reads it directly.
    Two sibling entries reuse the same launch mechanism with their own, smaller
    payloads instead of `KernelArgs`:
@@ -130,7 +130,8 @@ onboard Path A implementation:
    bases, and register tables. **AICPU** receives this payload by value, as the
    launch argument blob. **AICore** receives `AicoreLaunchArgs`, a projection of
    the same struct holding the subset its entry reads, also by value in its own
-   launch argument block. Neither side reads a device-resident copy. Per-device
+   launch argument block. Its runtime fields are a scalar projection: shared
+   handshake address, worker count and architecture-specific bootstrap values. Neither side reads a device-resident copy. Per-device
    invariants (device id, log config) are NOT on `KernelArgs` — they travel once
    via `InitArgs`.
 
@@ -160,75 +161,57 @@ working on a2a3 onboard across HBG and TRB, so the front was removed.
   per-task AICPU entry launches. Splitting those into separate loader objects
   would be a larger lifecycle refactor.
 
-In the common eager path, `KernelArgsHelper::prepare_runtime_args` reserves
-the slot-owned destination and pinned host source, then snapshots the published
-prefix of `DeviceRuntimeLaunchDesc`. Both runtimes defer the descriptor copy to
-the actual launch stream. HBG's large host-built execution image still uploads
-synchronously during preparation, so that upload can overlap its predecessor's
-execution. A5 HBG's resident scheduler state is separate launch metadata: the
-bind hands owned byte snapshots through `HostApi::stage_launch_metadata`, and
-the launch queues those writes before the descriptor. Graph Definitions travel
-in the launch envelope, not through this metadata batch. Simulation transports
-without a staging callback copy the metadata synchronously during preparation.
+### Runtime descriptors and shared state
 
-The pinned allocation is retained per prepared slot until finalize and grows
-only while that slot has no live predecessor. Its requested capacity is the
-largest `runtime_device_extent_size + sum(metadata region bytes)` served by
-that slot. The descriptor extent alone is 43,264 bytes for
-A2/A3 TMR, 47,872 for A5 TMR, 9,472 for A2/A3 HBG and 14,080 for A5 HBG in the
-current layouts. A5 HBG adds its run-specific resident scheduler layout; the
-other combinations currently stage no extra regions. Total requested pinned
-capacity is the sum of retained slot capacities; RTS page/allocation rounding
-can increase the physical reservation. These are host allocations, outside the
-device workspace budget. Growth first frees the retired source; a failed free
-retains ownership, and a failed replacement allocation can be retried without
-device submission.
+`DeviceRuntimeLaunchDesc` contains the invocation's delivered control values and
+borrowed device addresses. `RuntimeSharedState` contains the AICPU/AICore
+handshake reports and teardown gates. Both processors use the same shared-state
+address; the platform initializes its reports once before use and retains the
+allocation until all native or captured consumers have ended.
 
-`queue_run_entry` orders the optional caller dependency onto the AICPU stream,
-then invokes `publish_for_launch`. The helper copies the snapshot into the
-slot's pinned source and enqueues `rtMemcpyAsync` on that stream. Metadata
-regions use the source's suffix, disjoint from the descriptor prefix, and queue
-in dependency order before the descriptor. The entry fork records an event after
-all these copies and makes the AICore stream wait for it before
-launching its kernel. This also protects a cold allocation's first handshake
-initialization. An unchanged TMR launch-route prefix queues neither a copy nor,
-without a caller, an entry fork.
+Onboard HBG Program and Kernel execution append the compact Runtime descriptor
+to the AICPU launch package. TMR uses this delivery route in Kernel mode and
+publishes a separately allocated descriptor on the AICPU stream in Program mode.
+`hostInputInfo` relocates the header's Runtime address into RTS-owned argument storage. TMR also relocates the
+nested KernelInvocation binding to the same target. The original caller's Runtime
+is snapshotted during prepare, so later host mutation cannot change this launch.
 
-An unpublished descriptor rejects another preparation without changing its
-snapshot, destination or allocator. Explicit `release_run_view` discards the
-per-run view; it does not release the slot's source or destination. Native slot
-reservation prevents another run from overwriting the pinned source before the
-current run is retired. Move transfers the descriptor and metadata snapshots and publication status,
-leaving the source helper unable to publish or launch.
+AICore receives the shared-state address and required bootstrap values directly
+as scalar launch arguments. It never borrows a descriptor from an AICPU argument
+package. AICPU keeps a thread-local-lifetime aligned copy of its delivered
+control prefix: RTS argument pools can be only eight-byte aligned, while Runtime
+control access requires cache-line alignment. The original RTS descriptor address
+remains the KernelInvocation identity; copying the control view does not rewrite
+external addresses or change that identity. No per-thread view is published into
+shared runtime state or retained after its device entry returns.
 
-`runtime_args_published()` means the copy was accepted into stream order, or an
-identical prefix was already resident. It does not prove DMA completion. Both
-onboard launch entries admit Prepared or Published; actual kernel submission is
-after publication and the entry fork. Missing preparation is `NotStarted`.
-An attempted asynchronous copy marks the launch transaction before the RTS call:
-a failed enqueue, fork record or wait is `Partial` and retains its execution
-owner. A failed copy leaves the descriptor unpublished and withdraws its launch
-payload. The first metadata enqueue failure stops later metadata and descriptor writes.
-A repeated publish is rejected without another copy. A5 scheduler DFX export
-also requires successful publication, so a metadata failure cannot label a
-previous run's scheduler records as this run's diagnostics. An empty staging batch
-clears any abandoned unpublished batch, so a legacy run cannot inherit a prior
-resident scheduler publication.
+TMR KernelInvocation carries tensor descriptors and scalar values, not tensor
+storage. HBG Graph Definitions keep their per-reader launch-envelope view.
+In onboard HBG Program and Kernel modes, the packed initial execution image is
+another host-input section. The native AICPU entry initializes the aligned writable
+execution arena from the RTS-owned snapshot once before releasing the scheduling
+threads, including on every replay. AICore reads the execution arena. Simpler
+retains this arena separately so it stays valid through device retirement and
+any retained model use. Simulation delivers the image through a synchronous copy.
+Caller input/output buffers remain caller-owned.
 
-A normal run's two completion boundaries prove that its publication fork was
-consumed. A partial run without those boundaries requires the existing bounded
-stream discharge; failed proof quarantines its resources. Slot teardown releases
-the pinned source only on the normal retirement path and retains failed frees
-for retry. Fatal abandonment leaves the pinned source allocated for the rest of
-the process: freeing it while a DMA reader may still exist is a host-memory
-use-after-free. Caller streams remain caller-owned.
+Kernel eager and capture use the same argument layout. Capture retains the RTS
+task arguments and simpler's referenced shared allocations for future replays.
+External resource retention outlives the original preparation and all in-flight
+replays. Replay does not reread a modified host argument packet. Each graph keeps
+its own delivered values while its external references obey the existing caller
+ordering and lifetime contract.
 
-The prepare snapshot still costs a CPU copy per run; an actual upload adds a CPU
-copy into the reused pinned source. A5 scheduler metadata also costs an owned
-host snapshot per run. This removes the descriptor's and resident scheduler's
-blocking H2D
-and does not establish a throughput gain or capture/replay support. Bulk HBG
-image publication, DFX writes, graph ownership and replay remain separate work.
+RTS argument storage carries the descriptor and HBG image without a Simpler-owned
+pinned upload source for those bytes. HBG uses the same RTS route for Program,
+Kernel eager and capture. AICPU and AICore receive the address of the
+same Simpler-owned handshake allocation. The image requires a device-side copy
+into the writable execution arena. Shared scheduler storage and notification or
+counter handles stay with Simpler's prepared resource owner. Staged scheduler
+metadata still uses retained pinned sources and ordered publication. A submitted
+copy or kernel can survive a failing API call. Partial-launch cleanup retains
+those resources until physical completion or confirmed device reset. Normal
+shared-state release preserves failed-free ownership for retry.
 
 ## Method 3: Path B — `KERNEL_TYPE_AICPU_CUSTOM` (broken — #822)
 

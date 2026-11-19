@@ -56,9 +56,8 @@ struct NativeGraphReadonlyImage {
     uint64_t header_offset{0};
 };
 
-// Reserves the existing run-control prefix without writing its live contents.
-// Commit patches the header's allocation/epoch fields and the instances'
-// external addresses before publishing the entire scheduler backing.
+// Builds a self-contained graph image. Commit supplies the run epoch and the
+// final bindings and instance addresses before publishing it.
 bool native_graph_plan_readonly_image(
     const NativeGraphHostPlan &plan, NativeGraphReadonlyImage *out, std::string *error
 );

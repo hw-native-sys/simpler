@@ -33,30 +33,29 @@ TEST(EntryCacheMaintenance, TerminalSnapshotAndOwnMetadataGateEveryActualRange) 
         });
         return ranges;
     };
+    const size_t shared_at = reinterpret_cast<uintptr_t>(runtime.get_workers()) - reinterpret_cast<uintptr_t>(&runtime);
     for (uint32_t count :
          {0u, 1u, static_cast<uint32_t>(CHIP_MAX_TENSOR_ARGS - 1), static_cast<uint32_t>(CHIP_MAX_TENSOR_ARGS)}) {
         runtime.dev.entry_tensor_count_ = view.tensor_count = count;
         const auto ranges = run(true);
         if (count == CHIP_MAX_TENSOR_ARGS) {
-            EXPECT_EQ(ranges, (std::vector<Range>{{0, sizeof(runtime.dev)}}));
+            EXPECT_EQ(ranges, (std::vector<Range>{{0, sizeof(runtime.dev)}, {shared_at, sizeof(RuntimeSharedState)}}));
         } else {
             EXPECT_EQ(
                 ranges, (std::vector<Range>{
-                            {0, entry_tensor_offset + count * sizeof(Tensor)},
-                            {offsetof(DeviceRuntimeLaunchDesc, workers),
-                             sizeof(runtime.dev) - offsetof(DeviceRuntimeLaunchDesc, workers)}
+                            {0, entry_tensor_offset + count * sizeof(Tensor)}, {shared_at, sizeof(RuntimeSharedState)}
                         })
             );
         }
-        EXPECT_EQ(run(false), (std::vector<Range>{{0, sizeof(runtime.dev)}}));
+        EXPECT_EQ(run(false), (std::vector<Range>{{0, sizeof(runtime.dev)}, {shared_at, sizeof(RuntimeSharedState)}}));
     }
     ++view.tensor_count;
-    EXPECT_EQ(run(true), (std::vector<Range>{{0, sizeof(runtime.dev)}}));
+    EXPECT_EQ(run(true), (std::vector<Range>{{0, sizeof(runtime.dev)}, {shared_at, sizeof(RuntimeSharedState)}}));
     view.tensor_count = 0;
     runtime.dev.entry_tensor_count_ = 0;
     for (uint32_t policy : {0u, 1u, 99u}) {
         view.cache_maintenance = policy;
-        EXPECT_EQ(run(true), (std::vector<Range>{{0, sizeof(runtime.dev)}}));
+        EXPECT_EQ(run(true), (std::vector<Range>{{0, sizeof(runtime.dev)}, {shared_at, sizeof(RuntimeSharedState)}}));
     }
     RunTerminalPublisher publisher;
     EXPECT_FALSE(publisher.snapshot_is_ok());
@@ -64,6 +63,49 @@ TEST(EntryCacheMaintenance, TerminalSnapshotAndOwnMetadataGateEveryActualRange) 
     EXPECT_TRUE(publisher.snapshot_is_ok());
     publisher.take({}, nullptr, 0);
     EXPECT_FALSE(publisher.snapshot_is_ok());
+}
+
+TEST(EntryCacheMaintenance, KernelInvocationCleanupNeverTouchesAbsentEntryStorage) {
+    Runtime runtime;
+    RuntimeSharedState shared;
+    runtime.dev.shared_state_addr = reinterpret_cast<uint64_t>(&shared);
+    runtime.dev.entry_args_source_ = static_cast<uint32_t>(EntryArgsSource::KernelInvocation);
+    PlatformEntryArgs view{};
+    view.source = static_cast<uint32_t>(EntryArgsSource::KernelInvocation);
+    for (bool success : {false, true}) {
+        std::vector<std::pair<const void *, size_t>> ranges;
+        clean_entry_runtime(runtime, view, success, [&](const void *address, size_t bytes) {
+            ranges.emplace_back(address, bytes);
+        });
+        ASSERT_EQ(ranges.size(), 2u);
+        EXPECT_EQ(ranges[0].first, &runtime);
+        EXPECT_EQ(ranges[0].second, offsetof(DeviceRuntimeLaunchDesc, orch_args_storage_));
+        EXPECT_EQ(ranges[1].first, shared.workers);
+        EXPECT_EQ(ranges[1].second, sizeof(shared));
+    }
+    view.cache_maintenance = static_cast<uint32_t>(EntryCacheMaintenance::FullFreshen);
+    bool touched = false;
+    EXPECT_FALSE(freshen_entry_descriptor(runtime, view, [&](const void *, size_t) {
+        touched = true;
+    }));
+    EXPECT_FALSE(touched);
+}
+
+TEST(EntryCacheMaintenance, AlignedLocalLaunchSnapshotOnlyCleansSharedDeviceState) {
+    Runtime runtime;
+    runtime.dev.entry_args_source_ = static_cast<uint32_t>(EntryArgsSource::KernelInvocation);
+    PlatformEntryArgs view{};
+    view.source = static_cast<uint32_t>(EntryArgsSource::KernelInvocation);
+    view.runtime_address = reinterpret_cast<uint64_t>(&runtime) + 8;
+    for (bool success : {false, true}) {
+        std::vector<std::pair<const void *, size_t>> ranges;
+        clean_entry_runtime(runtime, view, success, [&](const void *address, size_t bytes) {
+            ranges.emplace_back(address, bytes);
+        });
+        ASSERT_EQ(ranges.size(), 1u);
+        EXPECT_EQ(ranges[0].first, runtime.get_workers());
+        EXPECT_EQ(ranges[0].second, sizeof(RuntimeSharedState));
+    }
 }
 
 TEST(EntryCacheMaintenance, DescriptorRefreshReadsCountsOnlyAfterFixedHeadAndBoundsActiveRange) {
