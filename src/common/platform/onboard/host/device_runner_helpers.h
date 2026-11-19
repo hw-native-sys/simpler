@@ -446,7 +446,7 @@ private:
     // The retained submission slot is also used by models after that run ends.
     std::vector<std::byte> execution_image_package_;
     AicoreRuntimeView aicore_view_{};
-    std::array<rtHostInputInfo_t, 3> host_inputs_{};
+    std::array<rtHostInputInfo_t, 2> host_inputs_{};
     uint16_t host_input_count_{0};
 
     void *launch_payload_{nullptr};

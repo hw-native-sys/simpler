@@ -490,8 +490,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     //    The length is the uploaded image, not sizeof(Runtime): the host-only
     //    tail past it was never copied, so no device line holds it.
     const auto view = get_platform_entry_args(platform_aicpu_affinity_thread_idx());
-    if (view.runtime_address == 0 || view.runtime_address == reinterpret_cast<uint64_t>(runtime))
-        cache_invalidate_range(runtime, sizeof(runtime->dev));
+    if (view.runtime_descriptor_bytes == 0) cache_invalidate_range(runtime, sizeof(runtime->dev));
     cache_invalidate_range(runtime->get_workers(), sizeof(RuntimeSharedState));
 
     // Reset all SchedulerContext-owned state in one place.

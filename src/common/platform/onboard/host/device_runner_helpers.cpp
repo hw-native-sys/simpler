@@ -249,7 +249,8 @@ bool KernelArgsHelper::build_launch_package() {
 }
 
 int KernelArgsHelper::prepare_kernel_invocation(const simpler::tmr::KernelCallableIdentity &identity) {
-    if (runtime_args_state_ != RuntimeArgsState::Prepared || !plan_.supported || slot_ == nullptr)
+    if (runtime_args_state_ != RuntimeArgsState::Prepared || !launch_owned_runtime_ || !plan_.supported ||
+        slot_ == nullptr)
         return PTO_RUNTIME_ERR_INVALID_STATE;
     if (!simpler::tmr::valid_kernel_identity(identity) || identity.tensor_count != plan_.tensor_count ||
         identity.scalar_count != plan_.scalar_count)
@@ -263,13 +264,13 @@ int KernelArgsHelper::prepare_kernel_invocation(const simpler::tmr::KernelCallab
     storage.scalar_count_ = static_cast<int32_t>(plan_.scalar_count);
     const size_t bytes = simpler::tmr::kernel_invocation_bytes(identity.tensor_count, identity.scalar_count);
     std::vector<std::byte> packet(bytes);
+    const size_t offset = simpler::tmr::kernel_runtime_descriptor_offset(
+        identity.tensor_count, identity.scalar_count, alignof(DeviceRuntimeLaunchDesc)
+    );
+    if (offset > UINT32_MAX || runtime_launch_bytes_ > UINT32_MAX - offset) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     if (!simpler::tmr::encode_kernel_invocation(
             storage, identity,
-            {reinterpret_cast<uint64_t>(
-                 launch_owned_runtime_ ? static_cast<void *>(slot_->shared_state) :
-                                         static_cast<void *>(args.runtime_args)
-             ),
-             args.run_result_epoch},
+            {static_cast<uint32_t>(offset), static_cast<uint32_t>(runtime_launch_bytes_), args.run_result_epoch},
             packet.data(), packet.size()
         ))
         return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
@@ -423,6 +424,7 @@ int KernelArgsHelper::publish_runtime_args(
         size_t package_bytes = descriptor_offset + runtime_launch_bytes_;
         size_t image_offset = 0;
         const HostMetadataRegion image = launch_metadata_.execution_image();
+        if (kernel_route && image.bytes != 0) return PTO_RUNTIME_ERR_INVALID_STATE;
         if (image.bytes != 0) {
             // Host Input points at the header. The records following that header
             // need cache-line alignment relative to the start of the RTS package.
@@ -451,19 +453,15 @@ int KernelArgsHelper::publish_runtime_args(
         );
         launch_payload_ = slot_->launch_package.data();
         launch_payload_bytes_ = slot_->launch_package.size();
-        host_inputs_[0] = {
-            static_cast<uint32_t>(offsetof(KernelArgs, runtime_args)), static_cast<uint32_t>(descriptor_offset)
-        };
-        host_input_count_ = 1;
         if (kernel_route) {
-            host_inputs_[1] = {
-                static_cast<uint32_t>(
-                    LAUNCH_ENVELOPE_HEADER_BYTES + sizeof(SimplerKernelInvocationHeader) +
-                    offsetof(simpler::tmr::EagerKernelBinding, runtime_address)
-                ),
-                static_cast<uint32_t>(descriptor_offset)
+            args.runtime_args = nullptr;
+            args.runtime_section = {static_cast<uint32_t>(descriptor_offset), static_cast<uint32_t>(package_bytes)};
+            host_input_count_ = 0;
+        } else {
+            host_inputs_[0] = {
+                static_cast<uint32_t>(offsetof(KernelArgs, runtime_args)), static_cast<uint32_t>(descriptor_offset)
             };
-            host_input_count_ = 2;
+            host_input_count_ = 1;
         }
         if (image.bytes != 0) {
             const HbgExecutionImage binding{

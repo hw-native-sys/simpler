@@ -239,7 +239,7 @@ TEST_F(LaunchEntryArgs, AStagedSectionNoDescriptorNamesIsNotPublished) {
     EXPECT_EQ(helper.args.graph_section_source, static_cast<uint32_t>(GraphSectionSource::None));
 }
 
-TEST_F(LaunchEntryArgs, KernelDescriptorRelocatesIntoRtsStorageAndBorrowsSharedState) {
+TEST_F(LaunchEntryArgs, KernelDescriptorInRtsStorageBorrowsSharedState) {
     std::array<uint64_t, 4> borrowed{11, 22, 33, 44};
     runtime.set_worker_count(7);
     runtime.set_gm_sm_ptr(borrowed.data());
@@ -251,17 +251,14 @@ TEST_F(LaunchEntryArgs, KernelDescriptorRelocatesIntoRtsStorageAndBorrowsSharedS
     EXPECT_EQ(allocator.committed_bytes(), sizeof(RuntimeSharedState));
     ASSERT_EQ(publish(true), 0);
     EXPECT_EQ(rts.copies, 0);
-    EXPECT_EQ(helper.host_input_count(), runtime_launch_entry_args_plan(runtime).supported ? 2 : 1);
+    EXPECT_EQ(helper.host_input_count(), runtime_launch_entry_args_plan(runtime).supported ? 0 : 1);
     auto copied = copy_launch();
-    const KernelArgs header = copied.header();
-    const auto *descriptor = reinterpret_cast<const DeviceRuntimeLaunchDesc *>(header.runtime_args);
-    const auto *begin = static_cast<const unsigned char *>(copied.data());
-    const auto *address = reinterpret_cast<const unsigned char *>(descriptor);
-    EXPECT_GE(address, begin);
-    EXPECT_LE(address + runtime_device_launch_size(runtime), begin + copied.bytes);
-    EXPECT_EQ(descriptor->worker_count, 7);
-    EXPECT_EQ(descriptor->shared_state_addr, reinterpret_cast<uint64_t>(slot.shared_state));
-    EXPECT_EQ(descriptor->gm_sm_ptr_, borrowed.data());
+    RuntimeLaunchView local;
+    const auto *descriptor = local.bind(*static_cast<const KernelArgs *>(copied.data()));
+    ASSERT_NE(descriptor, nullptr);
+    EXPECT_EQ(descriptor->dev.worker_count, 7);
+    EXPECT_EQ(descriptor->dev.shared_state_addr, reinterpret_cast<uint64_t>(slot.shared_state));
+    EXPECT_EQ(descriptor->dev.gm_sm_ptr_, borrowed.data());
     EXPECT_EQ(borrowed, (std::array<uint64_t, 4>{11, 22, 33, 44}));
     EXPECT_EQ(allocator.get_allocation_count(), 1U);
 }
@@ -273,7 +270,9 @@ TEST_F(LaunchEntryArgs, TwoRtsDescriptorCopiesKeepOneSharedStateWithoutOwningBor
     ASSERT_EQ(prepare_kernel(), 0);
     ASSERT_EQ(helper.publish_runtime_args(true, this, rts.sink, true), 0);
     auto recorded = copy_launch();
-    const auto *first = reinterpret_cast<const DeviceRuntimeLaunchDesc *>(recorded.header().runtime_args);
+    RuntimeLaunchView first_view;
+    const auto *first = first_view.bind(*static_cast<const KernelArgs *>(recorded.data()));
+    ASSERT_NE(first, nullptr);
     auto *shared = slot.shared_state;
     shared->workers[0].report_epoch = 99;
     helper.release_run_view();
@@ -281,15 +280,21 @@ TEST_F(LaunchEntryArgs, TwoRtsDescriptorCopiesKeepOneSharedStateWithoutOwningBor
     ASSERT_EQ(prepare_kernel(), 0);
     ASSERT_EQ(publish(true), 0);
     auto eager = copy_launch();
-    const auto *second = reinterpret_cast<const DeviceRuntimeLaunchDesc *>(eager.header().runtime_args);
-    EXPECT_NE(first, second);
-    EXPECT_EQ(first->worker_count, 3);
-    EXPECT_EQ(second->worker_count, 5);
-    EXPECT_EQ(first->shared_state_addr, second->shared_state_addr);
+    RuntimeLaunchView second_view;
+    const auto *second = second_view.bind(*static_cast<const KernelArgs *>(eager.data()));
+    ASSERT_NE(second, nullptr);
+    ASSERT_NE(recorded.data(), eager.data());
+    first = first_view.bind(*static_cast<const KernelArgs *>(recorded.data()));
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first->dev.worker_count, 3);
+    EXPECT_EQ(second->dev.worker_count, 5);
+    EXPECT_EQ(first->dev.shared_state_addr, second->dev.shared_state_addr);
     EXPECT_EQ(shared->workers[0].report_epoch, 99U);
     helper.release_run_view();
-    EXPECT_EQ(first->worker_count, 3);
-    EXPECT_EQ(second->gm_sm_ptr_, borrowed.data());
+    first = first_view.bind(*static_cast<const KernelArgs *>(recorded.data()));
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first->dev.worker_count, 3);
+    EXPECT_EQ(second->dev.gm_sm_ptr_, borrowed.data());
     EXPECT_EQ(rts.copies, 0);
     EXPECT_EQ(release_slot_persistent_args(slot, allocator), 0);
     borrowed[0] = 77;
@@ -297,7 +302,7 @@ TEST_F(LaunchEntryArgs, TwoRtsDescriptorCopiesKeepOneSharedStateWithoutOwningBor
     EXPECT_EQ(borrowed[1], 22U);
 }
 
-TEST_F(LaunchEntryArgs, KernelSnapshotAndRelocationsSurviveHelperMove) {
+TEST_F(LaunchEntryArgs, KernelSnapshotSurvivesHelperMove) {
     runtime.set_worker_count(7);
     ASSERT_EQ(prepare_kernel(), 0);
     ASSERT_EQ(publish(true), 0);
@@ -305,7 +310,7 @@ TEST_F(LaunchEntryArgs, KernelSnapshotAndRelocationsSurviveHelperMove) {
     helper.release_run_view();
     EXPECT_FALSE(helper.launchable());
     ASSERT_TRUE(moved.runtime_args_published());
-    ASSERT_EQ(moved.host_input_count(), runtime_launch_entry_args_plan(runtime).supported ? 2 : 1);
+    ASSERT_EQ(moved.host_input_count(), runtime_launch_entry_args_plan(runtime).supported ? 0 : 1);
     EXPECT_EQ(moved.runtime_launch_bytes(), runtime_device_launch_size(runtime));
     DeviceRuntimeLaunchDesc snapshot{};
     std::memcpy(&snapshot, moved.runtime_launch_data(), moved.runtime_launch_bytes());

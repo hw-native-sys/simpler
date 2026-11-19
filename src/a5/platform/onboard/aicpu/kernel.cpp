@@ -133,7 +133,10 @@ static int execute_platform_task(void *arg, Runtime *runtime) {
             arg, k_args->entry_args_offset, k_args->entry_tensor_count, k_args->entry_scalar_count,
             k_args->entry_args_source, k_args->graph_section_offset, k_args->graph_section_bytes,
             k_args->graph_section_source, k_args->entry_cache_maintenance,
-            reinterpret_cast<uint64_t>(k_args->runtime_args)
+            k_args->entry_args_source == static_cast<uint32_t>(EntryArgsSource::KernelInvocation) ?
+                k_args->runtime_section.descriptor_offset :
+                0u,
+            k_args->runtime_descriptor_bytes
         }
     );
     AicpuPhaseScope run_wall(AicpuPhase::RunWall);
@@ -153,7 +156,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     if (arg == nullptr) return -1;
     auto *args = static_cast<KernelArgs *>(arg);
     RuntimeLaunchView runtime_view;
-    auto *runtime = runtime_view.bind(args->runtime_args, args->runtime_descriptor_bytes);
+    auto *runtime = runtime_view.bind(*args);
     if (runtime == nullptr) return -1;
     bind_platform_task(args);
     NativeInvocationEntry invocation{
@@ -163,7 +166,8 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
         aicpu_begin_native_invocation,
         aicpu_reset_execution_entry,
         aicpu_finish_native_invocation,
-        args->execution_image,
+        args->entry_args_source == static_cast<uint32_t>(EntryArgsSource::KernelInvocation) ? nullptr :
+                                                                                              args->execution_image,
         [](const void *image) {
             return restore_hbg_execution_image(image, cache_invalidate_range, cache_flush_range);
         }

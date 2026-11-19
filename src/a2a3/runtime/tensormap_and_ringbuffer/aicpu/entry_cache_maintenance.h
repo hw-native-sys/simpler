@@ -79,8 +79,7 @@ inline size_t live_entry_cleanup_prefix(const Runtime &runtime, const PlatformEn
 template <typename Clean>
 void clean_entry_runtime(Runtime &runtime, const PlatformEntryArgs &view, bool snapshot_ok, Clean clean) {
     const size_t prefix = live_entry_cleanup_prefix(runtime, view, snapshot_ok);
-    if (view.runtime_address == 0 || view.runtime_address == reinterpret_cast<uint64_t>(&runtime))
-        clean(&runtime, prefix);
+    if (view.runtime_descriptor_bytes == 0) clean(&runtime, prefix);
     clean(runtime.get_workers(), sizeof(RuntimeSharedState));
 }
 }  // namespace simpler::tmr

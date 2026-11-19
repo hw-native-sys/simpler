@@ -170,7 +170,10 @@ struct KernelArgs {
     // still classifies the entry as SIMT.
     uint32_t force_simt_anchor{0};
     uint32_t runtime_descriptor_bytes{0};
-    const void *execution_image{nullptr};  // HBG snapshot relocated by RTS
+    union {
+        const void *execution_image{nullptr};      // HBG snapshot relocated by RTS
+        RuntimeDescriptorSection runtime_section;  // TMR KernelInvocation, relative to the KernelArgs base
+    };
 };
 
 static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");

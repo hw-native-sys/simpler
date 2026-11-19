@@ -96,7 +96,7 @@ TEST(EntryCacheMaintenance, AlignedLocalLaunchSnapshotOnlyCleansSharedDeviceStat
     runtime.dev.entry_args_source_ = static_cast<uint32_t>(EntryArgsSource::KernelInvocation);
     PlatformEntryArgs view{};
     view.source = static_cast<uint32_t>(EntryArgsSource::KernelInvocation);
-    view.runtime_address = reinterpret_cast<uint64_t>(&runtime) + 8;
+    view.runtime_descriptor_bytes = RUNTIME_LAUNCH_DESCRIPTOR_BYTES;
     for (bool success : {false, true}) {
         std::vector<std::pair<const void *, size_t>> ranges;
         clean_entry_runtime(runtime, view, success, [&](const void *address, size_t bytes) {

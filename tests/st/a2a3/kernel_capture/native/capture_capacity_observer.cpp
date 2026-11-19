@@ -22,6 +22,7 @@ namespace {
 thread_local simpler::capture_test::LaunchCounts counts;
 thread_local uint64_t runtime_image_address;
 thread_local uint64_t rts_execution_image_bytes;
+thread_local bool tmr_inline_runtime;
 template <typename F>
 F next(const char *name) {
     const auto symbol = reinterpret_cast<F>(dlsym(RTLD_NEXT, name));
@@ -31,6 +32,7 @@ F next(const char *name) {
 }  // namespace
 namespace simpler::capture_test {
 LaunchCounts launch_counts() { return counts; }
+bool last_launch_has_inline_tmr_runtime() { return tmr_inline_runtime; }
 uint64_t last_runtime_image_address() { return runtime_image_address; }
 uint64_t last_rts_execution_image_bytes() { return rts_execution_image_bytes; }
 }  // namespace simpler::capture_test
@@ -50,6 +52,19 @@ extern "C" rtError_t rtsLaunchCpuKernel(
     ++counts.cpu;
     runtime_image_address = 0;
     rts_execution_image_bytes = 0;
+    tmr_inline_runtime = false;
+    if (args != nullptr && args->baseArgs.args != nullptr && args->baseArgs.argsSize >= sizeof(KernelArgs) &&
+        args->baseArgs.hostInputInfoNum == 0 && args->baseArgs.hostInputInfoPtr == nullptr) {
+        KernelArgs header{};
+        std::memcpy(&header, args->baseArgs.args, sizeof(header));
+        if (header.entry_args_source == static_cast<uint32_t>(EntryArgsSource::KernelInvocation)) {
+            const auto bytes = args->baseArgs.argsSize;
+            tmr_inline_runtime = header.runtime_args == nullptr && header.runtime_section.packet_bytes == bytes &&
+                                 header.runtime_section.descriptor_offset <= bytes &&
+                                 header.runtime_descriptor_bytes == RUNTIME_LAUNCH_DESCRIPTOR_BYTES &&
+                                 bytes - header.runtime_section.descriptor_offset == header.runtime_descriptor_bytes;
+        }
+    }
     if (args != nullptr && args->baseArgs.args != nullptr && args->baseArgs.hostInputInfoPtr != nullptr) {
         for (uint16_t i = 0; i < args->baseArgs.hostInputInfoNum; ++i) {
             const auto &input = args->baseArgs.hostInputInfoPtr[i];

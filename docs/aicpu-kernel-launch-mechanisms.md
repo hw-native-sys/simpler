@@ -112,8 +112,9 @@ onboard Path A implementation:
 2. **AICPU per-task launch ABI.**
    The per-task launch hands the front-less `KernelArgs` payload directly to
    `rtsLaunchCpuKernel()`. `argsSize` includes the header and any trailing
-   invocation, graph-definition and runtime-descriptor sections. There is no CANN launch front on this
-   path — `runtime_args` sits at offset 0 and the AICPU entry reads it directly.
+   invocation, graph-definition and runtime-descriptor sections. The AICPU entry
+   receives the packet base directly. TMR Kernel leaves `runtime_args` at offset 0
+   null and locates the descriptor inside the packet.
    Two sibling entries reuse the same launch mechanism with their own, smaller
    payloads instead of `KernelArgs`:
    - `simpler_aicpu_init` takes an `InitArgs` (device id + log config), launched
@@ -126,8 +127,7 @@ onboard Path A implementation:
      is a no-op (host-side orchestration).
 3. **Shared per-task `KernelArgs` payload.**
    `src/{a2a3,a5}/platform/include/common/kernel_args.h` is front-less.
-   Runtime state is passed through `KernelArgs::runtime_args`, profiling buffer
-   bases, and register tables. **AICPU** receives this payload by value, as the
+   The header carries the Runtime location, profiling buffer bases and register tables. **AICPU** receives this payload by value, as the
    launch argument blob. **AICore** receives `AicoreLaunchArgs`, a projection of
    the same struct holding the subset its entry reads, also by value in its own
    launch argument block. Its runtime fields are a scalar projection: shared
@@ -139,7 +139,7 @@ Keep those channels distinct. The bootstrap ABI still uses the `DeviceArgs`
 name because the dispatcher really reads that structure. The platform per-task
 ABI passes only the front-less `KernelArgs` and carries no CANN launch front.
 
-The per-task launch buffer is exactly the front-less `KernelArgs`:
+The per-task launch buffer begins with these `KernelArgs` fields:
 
 ```text
 KernelArgs + 0:  runtime_args
@@ -170,19 +170,23 @@ address; the platform initializes its reports once before use and retains the
 allocation until all native or captured consumers have ended.
 
 Onboard HBG Program and Kernel execution append the compact Runtime descriptor
-to the AICPU launch package. TMR uses this delivery route in Kernel mode and
-publishes a separately allocated descriptor on the AICPU stream in Program mode.
-`hostInputInfo` relocates the header's Runtime address into RTS-owned argument storage. TMR also relocates the
-nested KernelInvocation binding to the same target. The original caller's Runtime
-is snapshotted during prepare, so later host mutation cannot change this launch.
+to the AICPU launch package. RTS fills the header's Runtime pointer using
+`hostInputInfo`. TMR Program publishes a separately allocated descriptor on the
+AICPU stream.
+
+In TMR Kernel mode the host appends the KernelInvocation at byte 192 and the
+Runtime control descriptor after the invocation. The packet identifies the
+descriptor by its byte offset from the packet base and its length. RTS copies
+the complete packet according to `argsSize`, with zero host-input relocations.
+The AICPU validates the layout before reading the descriptor. Host preparation
+snapshots the control values and invocation arguments for this launch.
 
 AICore receives the shared-state address and required bootstrap values directly
 as scalar launch arguments. It never borrows a descriptor from an AICPU argument
 package. AICPU keeps a thread-local-lifetime aligned copy of its delivered
 control prefix: RTS argument pools can be only eight-byte aligned, while Runtime
-control access requires cache-line alignment. The original RTS descriptor address
-remains the KernelInvocation identity; copying the control view does not rewrite
-external addresses or change that identity. No per-thread view is published into
+control access requires cache-line alignment. Copying the control view preserves
+its borrowed device addresses. No per-thread view is published into
 shared runtime state or retained after its device entry returns.
 
 TMR KernelInvocation carries tensor descriptors and scalar values, not tensor
@@ -197,8 +201,7 @@ Caller input/output buffers remain caller-owned.
 
 Kernel eager and capture use the same argument layout. Capture retains the RTS
 task arguments and simpler's referenced shared allocations for future replays.
-External resource retention outlives the original preparation and all in-flight
-replays. Replay does not reread a modified host argument packet. Each graph keeps
+The caller holds the original run until the model and its in-flight replays have finished. Replay does not reread a modified host argument packet. Each graph keeps
 its own delivered values while its external references obey the existing caller
 ordering and lifetime contract.
 

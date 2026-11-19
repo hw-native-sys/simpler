@@ -269,8 +269,8 @@ int LoadAicpuOp::LaunchBuiltInOp(
     uint16_t host_input_count
 ) {
     auto &c = native_admission_transport::control();
-    if (host_input_count != 0) {
-        if (host_inputs == nullptr || args == nullptr) return -1;
+    if (name == KernelNames::RunName || host_input_count != 0) {
+        if (args == nullptr || (host_input_count != 0 && host_inputs == nullptr)) return -1;
         c.aicpu_argument_copies.emplace_back(bytes);
         auto &copy = c.aicpu_argument_copies.back();
         for (uint16_t i = 0; i < host_input_count; ++i) {

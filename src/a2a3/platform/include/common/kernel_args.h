@@ -187,7 +187,10 @@ struct KernelArgs {
     uint32_t graph_section_source{static_cast<uint32_t>(GraphSectionSource::None)};
     uint32_t entry_cache_maintenance{static_cast<uint32_t>(EntryCacheMaintenance::Full)};
     uint32_t runtime_descriptor_bytes{0};
-    const void *execution_image{nullptr};  // HBG snapshot relocated by RTS
+    union {
+        const void *execution_image{nullptr};      // HBG snapshot relocated by RTS
+        RuntimeDescriptorSection runtime_section;  // TMR KernelInvocation, relative to the KernelArgs base
+    };
 };
 
 static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");
