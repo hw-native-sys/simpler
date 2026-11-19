@@ -204,9 +204,9 @@ class TestSchedulerPhases(SceneTestCase):
                 if not filtered:
                     required_kinds |= {
                         "scalar_execution_token_refill",
-                        "scalar_execution_token_receive",
+                        "scalar_prepared_receive",
                         "scalar_execution_token_fanin",
-                        "scalar_execution_token_select",
+                        "scalar_select_owned_execution",
                     }
                 assert required_kinds <= emitted_kinds, (
                     f"missing Scheduler kinds: {sorted(required_kinds - emitted_kinds)}"

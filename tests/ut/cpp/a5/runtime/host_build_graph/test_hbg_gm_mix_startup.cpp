@@ -29,8 +29,7 @@ struct SchedulerScalarCompilation<void> {
 #include <tuple>
 #include <utility>
 
-#include "hbg_scheduler_test_support.h"
-#include "test_hbg_owned_execution.h"
+#include "hbg_gm_mix_test_support.h"
 
 #include "hbg_gm_mix_test_support.h"
 
@@ -60,6 +59,12 @@ void count_kernel_entry(__gm__ int64_t *) { ++startup_kernel_calls; }
 
 void idle_ready_kernel(__gm__ int64_t *) {
     ++startup_kernel_calls;
+    write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
+}
+
+void capture_mix_entry(__gm__ int64_t *args) {
+    const auto *cell = reinterpret_cast<const SchedulerPreparedControl *>(args[0]);
+    *reinterpret_cast<uint64_t *>(args[1]) = cell->state;
     write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
 }
 
@@ -152,13 +157,13 @@ struct StartupFixture {
             for (auto &local : locals) {
                 uint32_t id = UINT32_MAX;
                 bool failed = false;
-                scheduler_fill_own_slots(
+                scheduler_find_local_execution(
                     graph_view, base(), &local, run, storage.layout.protocol_layout_offset ? 4 : 0, &failed, &id
                 );
                 ASSERT_FALSE(failed);
                 if (id == UINT32_MAX) continue;
                 bool permit = false;
-                ASSERT_TRUE(scheduler_can_enter_execution(graph_view, base(), &local, run, id, &permit));
+                ASSERT_TRUE(scheduler_check_entry_permit(graph_view, base(), &local, run, id, &permit));
                 if (!permit) continue;
                 ASSERT_TRUE(hbg_test_begin_execution(&local, id));
                 const auto index = local.execution_at(id).prepared.execution_index;
@@ -169,7 +174,7 @@ struct StartupFixture {
                         base(), &local, id, call->function_bin_addr, call->args, binding->local_context
                     );
                 else execute_task(call->function_bin_addr, call->args);
-                ASSERT_TRUE(scheduler_complete_own_slot(graph_view, base(), &local, run, id, 0));
+                ASSERT_TRUE(scheduler_complete_lane_execution(graph_view, base(), &local, run, id, 0));
             }
         }
         ASSERT_EQ(scheduler_test::resolved_count(run), 2u);
@@ -486,6 +491,45 @@ TEST(HbgScalarObserverLifetime, DispatchLoopRecordsMemoryPrimitives) {
 }
 
 class HbgExecutionIdentityEntry : public ::testing::TestWithParam<std::tuple<uint32_t, uint64_t, bool>> {};
+
+TEST(HbgExecutionIdentityEntryL0, MixKernelSeesItsEnteredStateBeforeASeparateMemberReturns) {
+    using namespace scheduler_test::gm_mix;
+    GmMixFixture f({{1, kAicAiv1}}, false, 1);
+    f.storage.callable_addresses[1] = reinterpret_cast<uint64_t>(&capture_mix_entry);
+    ASSERT_TRUE(f.prepare_calls());
+    auto *member = f.locals[0];
+    uint64_t index = UINT64_MAX;
+    ASSERT_TRUE(scheduler_prepared_execution_index(f.base(), member->config.prepared, 0, 0, 0, &index));
+    auto *cell = scheduler_prepared_control_at(f.base(), member->config.prepared, index);
+    auto *call = scheduler_prepared_call_at(f.base(), member->config.prepared, index);
+    uint64_t seen_in_kernel = 0;
+    call->num_args = 2;
+    call->args[0] = reinterpret_cast<uint64_t>(cell);
+    call->args[1] = reinterpret_cast<uint64_t>(&seen_in_kernel);
+
+    bool published = false;
+    ASSERT_TRUE(f.ordinary_arm(0, 0, &published));
+    ASSERT_TRUE(published);
+    for (uint32_t pass = 0; pass < 3; ++pass)
+        for (uint32_t lane : {0u, 2u})
+            ASSERT_TRUE(f.service_cooperative(lane));
+    ASSERT_EQ(member->execution_at(SCHEDULER_CLUSTER_MIX_EXECUTION).state, SchedulerDispatchSlotState::READY);
+    alignas(64) std::array<uint8_t, SIM_REG_TOTAL_SIZE> registers{};
+    ScopedStartupRegisterObserver observer([] {});
+    startup_reg_base = registers.data();
+    write_reg(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
+    SchedulerWorkerStats stats{};
+    ASSERT_TRUE((run_ready_dispatch_loop<false, false>(f.graph.graph(), f.base(), member, f.run(), &stats, 0)));
+    EXPECT_EQ(
+        seen_in_kernel, scheduler_prepared_state(SchedulerPreparedPhase::ENTERED, 0) | SCHEDULER_PREPARED_MIX_OWNED
+    );
+    EXPECT_EQ(
+        cell->state, scheduler_prepared_state(SchedulerPreparedPhase::RETURNED, 0) | SCHEDULER_PREPARED_MIX_OWNED
+    );
+    EXPECT_EQ(f.signal(0)->groups[0].finished[2], 0u);
+    EXPECT_FALSE(f.task_done(0));
+    EXPECT_EQ(scheduler_read_error(f.run()), 0u);
+}
 
 TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCanChangeIt) {
     const auto [worker, level, sampled] = GetParam();

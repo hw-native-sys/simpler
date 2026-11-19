@@ -136,9 +136,13 @@ backward-compatible with the old boolean behavior).
 | 3 | + scheduler phases (`scheduler_records`) | Does not enable orchestrator collection; an independently enabled HBG Host pool can still export Host records |
 | 4 | + orchestrator phases (Host for HBG, AICPU for TMR) | Full collection |
 
-A5 `percounter` adds a task/block Scheduler View at L2 with Claim, Ready, Kernel
-end and GM Completion issued markers. Worker View remains available. L3 adds
-nested AICore Scheduler function intervals, such as dependency checks, MIX
+A5 `percounter` adds a task/block Scheduler View at L2 with Claim start, Claim,
+Ready, Kernel end and GM Completion issued markers. With complete predecessor
+evidence in `deps.json` and the same capture's completion records, Ideal ready
+marks the estimated dependency boundary, even when it precedes the claim.
+If dependencies were ready at claim time, the wait span begins at Claim.
+Worker View remains available. L3 adds nested AICore Scheduler function
+intervals, such as dependency checks, MIX
 rendezvous and completion publication. L4 adds individual memory operations and
 Host phases and retains all instrumented function intervals. See the [percounter
 profiling contract](../../src/a5/runtime/percounter/README.md#chip-swimlanes-l1l4)
@@ -802,12 +806,10 @@ version 2 execution carries a scheduling rank. The converter also reads
 unversioned identity sections from earlier runs, including ordinary executions
 with a null rank. Full ranked L4 audits still require a rank for each execution.
 
-For MIX, the L4 `claim_before` and `claim_after` stamps bracket allocation of
-the logical block. AIV0 immediately reserves the prepared group anchor. It
-waits for the preceding generation to retire before arming that anchor. AIV0
-then publishes the descriptor and its new generation between `publish_before`
-and `publish_after`. Each participating lane records its own arrival. Its final
-payload publication follows its observation that all active lanes have arrived.
+For MIX, L4 block-owner Claim stamps record AIV0's actual group claim.
+Publication stamps bracket the subsequent SSBUF descriptor release. If both
+banks are occupied, these events can be separated by work on previous groups.
+Member arrival and FIN records carry the published generation.
 
 The `ready_claim`, `ready_steal` and `direct_refill` names were
 emitted by this scheduler between #2104 and #2178; no current scheduler emits

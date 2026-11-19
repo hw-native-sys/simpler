@@ -1304,10 +1304,10 @@ def test_checked_device_context_validates_live_domain_and_scalar_use(domain_work
 
     def allocate(orch, _args, _cfg):
         handle = orch.allocate_domain(**_request(members))
-        handle._config = replace(handle._config, workspace_engines=("sdma", "urma"))
+        handle._config = replace(handle._config, workspace_engines=("urma",))
         saved.append(handle)
         target = handle.workers[0]
-        assert handle.device_context(target, workspace_engines=("urma", "sdma")) == handle[target].device_ctx
+        assert handle.device_context(target, workspace_engines=("urma",)) == handle[target].device_ctx
         with pytest.raises(KeyError):
             handle.device_context(999, workspace_engines=("urma",))
         with pytest.raises(ValueError, match="distinct names"):

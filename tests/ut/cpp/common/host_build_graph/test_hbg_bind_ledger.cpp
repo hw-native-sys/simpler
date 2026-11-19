@@ -3283,3 +3283,40 @@ TEST(HbgAsyncCapabilityBinding, UsesOnlyTheActiveCallableAndClearsOnRebind) {
     runtime.clear_callable_tables();
     EXPECT_THROW(runtime.get_function_async_capability(0), std::invalid_argument);
 }
+
+TEST(HbgInputCacheProofBinding, ReusedCallableAndFunctionIdsFollowOnlyTheirCurrentRegistration) {
+    Runtime runtime;
+    const uint64_t first_objects[] = {0, 0x1000};
+    const uint64_t second_objects[] = {0, 0x2000};
+    std::vector<CoreInputCacheProof> first(2), second(2);
+    first[1].mode = CoreInputCacheMode::NO_CACHED_READS;
+    second[1].mode = CoreInputCacheMode::SCALAR_RANGES;
+    runtime.set_active_callable_id(7);
+    runtime.set_callable_tables(first_objects, 0x3000, 0, 2);
+    EXPECT_EQ(runtime.get_function_input_cache_proof(1), nullptr);
+    bind_registered_input_cache_proofs(runtime, first);
+    EXPECT_EQ(runtime.get_function_input_cache_proof(1), &first[1]);
+    EXPECT_EQ(runtime.get_function_input_cache_proof(-1), nullptr);
+    EXPECT_EQ(runtime.get_function_input_cache_proof(0), nullptr);
+    EXPECT_EQ(runtime.get_function_input_cache_proof(2), nullptr);
+
+    runtime.clear_callable_tables();
+    EXPECT_EQ(runtime.get_function_input_cache_proof(1), nullptr);
+    runtime.set_callable_tables(second_objects, 0x4000, 0, 2);
+    runtime.set_active_callable_id(7);
+    EXPECT_EQ(runtime.get_function_input_cache_proof(1), nullptr);
+    bind_registered_input_cache_proofs(runtime, second);
+    EXPECT_EQ(runtime.get_function_input_cache_proof(1), &second[1]);
+
+    runtime.set_callable_tables(second_objects, 0x4000, 0, 2);
+    bind_registered_input_cache_proofs(runtime, {});
+    EXPECT_EQ(runtime.get_function_input_cache_proof(1), nullptr);
+    bind_registered_input_cache_proofs(runtime, second);
+    runtime.set_active_callable_id(8);
+    EXPECT_EQ(runtime.get_function_input_cache_proof(1), nullptr);
+    bind_registered_input_cache_proofs(runtime, second);
+    HostApiOps ops{};
+    HostApi missing(nullptr, 0, 0, 1, &ops);
+    EXPECT_FALSE(runtime.bind_callable_async_capabilities(missing));
+    EXPECT_EQ(runtime.get_function_input_cache_proof(1), nullptr);
+}

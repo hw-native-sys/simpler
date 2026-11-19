@@ -109,12 +109,12 @@ struct InlineFixture {
     }
     bool service(uint32_t worker = 1) {
         bool progress = false;
-        return scheduler_service_controls(graph.graph(), base(), locals[worker], run(), 4, &progress);
+        return scheduler_progress_graph_controls(graph.graph(), base(), locals[worker], run(), 4, &progress);
     }
     bool fill(uint32_t worker = 1) {
         if (!service(worker)) return false;
         bool failed = false;
-        scheduler_fill_own_slots(graph.graph(), base(), locals[worker], run(), 4, &failed);
+        scheduler_find_local_execution(graph.graph(), base(), locals[worker], run(), 4, &failed);
         return !failed;
     }
     bool service_until_done(uint32_t task, uint32_t worker = 1) {
@@ -130,9 +130,9 @@ struct InlineFixture {
     bool complete(uint32_t worker, uint32_t slot) {
         auto *local = locals[worker];
         bool permit = false;
-        if (!scheduler_can_enter_execution(graph.graph(), base(), local, run(), slot, &permit) || !permit) return false;
+        if (!scheduler_check_entry_permit(graph.graph(), base(), local, run(), slot, &permit) || !permit) return false;
         if (!hbg_test_begin_execution(local, slot)) return false;
-        return scheduler_complete_own_slot(graph.graph(), base(), local, run(), slot, 4);
+        return scheduler_complete_lane_execution(graph.graph(), base(), local, run(), slot, 4);
     }
     void expect_no_dispatch(uint32_t worker) {
         EXPECT_EQ(hbg_test_eligible_mask(locals[worker]), 0u);
@@ -200,7 +200,7 @@ TEST(HbgInlineService, ProgressesWhileAnUnrelatedMixWaitsForAnotherLane) {
         scheduler_completion_task_state(scheduler_gm_query(fixture.control(0).completion_state)),
         static_cast<int64_t>(SchedulerTaskState::DONE)
     );
-    const auto &group = fixture.locals[1]->cluster_mix;
+    const auto &group = fixture.locals[1]->mix_groups[0];
     EXPECT_EQ(group.task_ref, 0);
     EXPECT_NE(group.phase, SchedulerGmMixPhase::IDLE);
     EXPECT_EQ(hbg_test_eligible_mask(fixture.locals[1]), 0u);

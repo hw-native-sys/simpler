@@ -96,9 +96,9 @@ def _capture(*, function_min_cycles=0, include_token_functions=True):
         capture.aicore_sched_phase(phase="complete", task_id=task_id, start=start + 6, end=start + 7)
         for phase, begin, end, depth in (
             ("scalar_execution_token_refill", 0, 1, 1),
-            ("scalar_execution_token_receive", 0, 1, 2),
+            ("scalar_prepared_receive", 0, 1, 2),
             ("scalar_execution_token_fanin", 1, 2, 1),
-            ("scalar_execution_token_select", 2, 3, 1),
+            ("scalar_select_owned_execution", 2, 3, 1),
         ):
             if not include_token_functions:
                 continue
@@ -119,6 +119,16 @@ def test_smoke_accepts_execution_token_acquisition_and_dispatch(validate_capture
 
 def test_smoke_accepts_duration_filtered_function_spans(validate_capture):
     validate_capture(_capture(function_min_cycles=2, include_token_functions=False))
+
+
+def test_mix_build_payload_cannot_replace_an_ordinary_prepared_receive(validate_capture):
+    raw = _capture()
+    for stream in raw["scheduler_records"]["streams"]:
+        for record in stream["records"]:
+            if record["kind"] == "scalar_prepared_receive":
+                record["kind"] = "scalar_build_payload"
+    with pytest.raises(AssertionError, match="scalar_prepared_receive"):
+        validate_capture(raw)
 
 
 def test_smoke_requires_function_spans_without_duration_filter(validate_capture):

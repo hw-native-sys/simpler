@@ -43,16 +43,11 @@ AICPU 发布实际 active_worker_count 与 watchdog budget；PMU 仅在本轮确
 
 本核重新观察 READY 的四行配置，校验 graph view v6、epoch、可信 extent、prepared Call 区、目录和 cluster peers。
 WorkerContext 最后一行归本核诊断；其字段不会与配置写者并发覆盖。
-普通/native Graph 使用相同 bootstrap barrier：
+普通和 native Graph 的首批工作都在 DMB 开启前准备。
 
-1. 用 worker_index/runtime_worker_count 划分 expanded node 区间。
-2. 初始化必须的 admission 记录；cluster coordinator 清本轮 signal。
-3. 原子增加 bootstrap_scan_arrived_count，最后一个核发布 bootstrap_scan_complete。
-4. 屏障后初始化两个 FREE slot，运行有界 control scan 并尝试准备首批工作。
-5. 原子增加 bootstrap_arrived_count，最后一个核发布 bootstrap_complete。
-
-Host 已生成所有 child 参数和 Call；bootstrap 不建立动态 wake-list、不填后继 ready 队列，也不在设备绑定参数。
-每个 worker 是否已准备到 kernel 不影响其必须到达 barrier 的责任。
+1. 图含 MIX 时，AIV0 清空本簇两个 SSBUF bank，发布 INIT。AIC 和 AIV1 确认 INIT 后访问 SSBUF。无 MIX 的图由 Host 预置 INIT。
+2. 每核按图类型服务控制节点，并尝试获取首份可执行工作。此时可以观察 Host 已绑定的 Call。
+3. AIC 和 AIV1 各自完成首轮准备后发布 DONE。AIV0 确认两个 DONE，为本簇的三个 worker 记数。最后一簇发布 bootstrap_complete。
 
 AICPU 等待 bootstrap_complete 或首错，随后按分区写唯一 DMB launch gate。
 等待期间仍服务 bounded args dump 请求。核在 gate 打开前可观察 Call、依赖和控制状态，但不能调用业务 kernel。

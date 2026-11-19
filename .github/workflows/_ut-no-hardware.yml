@@ -64,7 +64,34 @@ jobs:
           python3 -c 'import sys; print(sys.version); sys.exit(0 if sys.version_info >= (3, 10) else "CI requires Python >= 3.10")'
 
       - name: Set up C++ compiler
+        if: inputs.setup_variant == 'github'
         uses: ./.github/actions/setup-gcc-15
+
+      - name: Verify provisioned toolchain
+        if: inputs.setup_variant == 'self-cpu'
+        run: |
+          command -v ninja
+          command -v g++
+          command -v dot
+          if ! command -v g++-15 >/dev/null 2>&1; then
+            mkdir -p "$RUNNER_TEMP/bin"
+            ln -sf "$(command -v g++)" "$RUNNER_TEMP/bin/g++-15"
+            echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Cache pip packages
+        if: inputs.setup_variant == 'github'
+        uses: ./.github/actions/cache-pip
+
+      - name: Set up environment
+        uses: ./.github/actions/setup-venv
+        with:
+          build-packages: "scikit-build-core nanobind<3 cmake>=3.20"
+          # Worker integration tests exercise both a2a3sim and a5sim.
+          packages: "--no-build-isolation --config-settings=build.targets=build_package_sim -e .[test]"
+          # CPU-pool runners provision their own CPU torch wheel.
+          install-torch: ${{ inputs.setup_variant == 'github' && 'true' || 'false' }}
+          system-site-packages: ${{ inputs.setup_variant == 'self-cpu' && 'true' || 'false' }}
 
       - name: Install GoogleTest and AArch64 C++ compiler
         if: inputs.setup_variant == 'github' && runner.os == 'Linux'
@@ -84,54 +111,37 @@ jobs:
           command -v ccache >/dev/null 2>&1 || brew install ccache ||
             echo "::warning::brew could not install ccache; the C++ build will compile from scratch"
 
-      - name: Cache pip packages
-        if: inputs.setup_variant == 'github'
-        uses: ./.github/actions/cache-pip
-
       # Self-hosted runners keep one checkout and one home directory across
       # runs, so their ccache persists on disk and needs no upload.
       - name: Cache ccache objects
         if: inputs.setup_variant == 'github'
         uses: ./.github/actions/cache-ccache
 
-      - name: Install dependencies
-        if: inputs.setup_variant == 'github'
-        run: |
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install 'scikit-build-core>=0.10.0' 'nanobind>=2.0.0,<3' 'cmake>=3.20'
-          # Worker integration tests exercise both a2a3sim and a5sim.
-          pip install --no-build-isolation \
-            --config-settings=build.targets=build_package_sim -e '.[test]'
-
-      - name: venv + deps
-        if: inputs.setup_variant == 'self-cpu'
-        uses: ./.github/actions/setup-venv
-        with:
-          packages: ".[test]"
-
       - name: Install MPI for Linux unit tests
         if: inputs.setup_variant == 'github' && runner.os == 'Linux'
         run: |
           # Use matching MPI wheels: Ubuntu 24.04's MPICH package cannot
           # form a Hydra world (https://github.com/pmodels/mpich/issues/7064).
+          source .venv/bin/activate
           pip install --only-binary=:all: 'mpi4py==4.1.2' 'mpich==4.3.2'
           python -c "import mpi4py; mpi4py.rc.initialize=False; from mpi4py import MPI; vendor=MPI.get_vendor(); print(vendor); assert 'mpich' in vendor[0].lower()"
           mpirun -n 3 python -c "from mpi4py import MPI; comm=MPI.COMM_WORLD; print(comm.Get_rank(), comm.Get_size()); assert comm.Get_size()==3; assert comm.allreduce(1)==3"
 
-      - name: Run Python unit tests
+      - name: Run Python unit tests (sim)
         run: |
-          if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
-            source .venv/bin/activate
-            python -m pytest tests/ut -m "not requires_hardware" -q -n 32
-          else
-            pytest tests/ut -m "not requires_hardware" -q
-          fi
+          # mpirun lands in the venv during the MPI step; activation is what
+          # puts it on PATH for test_mpi_direct's launcher lookup.
+          source .venv/bin/activate
+          # The self-hosted pool has hundreds of threads; the 4-vCPU hosted
+          # runner Daily uses does not.
+          PARALLEL=()
+          if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then PARALLEL=(-n 32); fi
+          .venv/bin/python -m pytest tests/ut -m "not requires_hardware" -q -rs "${PARALLEL[@]}"
 
-      - name: Build and run C++ unit tests
+      - name: Build and run C++ unit tests (sim)
         run: |
-          if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
-            source .venv/bin/activate
-          fi
+          # cmake and ctest come from the venv; the runner supplies ninja.
+          source .venv/bin/activate
           # Real entry tests may skip in a standalone C++ build, but not in CI.
           test -f build/lib/libcpu_sim_context.so
           # default_build_runtimes is what a build that names no runtime leaves
@@ -170,11 +180,8 @@ jobs:
           fi
           ctest --test-dir tests/ut/cpp/build -LE requires_hardware -j32 --output-on-failure --timeout 300
 
-      - name: Check C++ unit-test axis coverage
+      - name: Verify C++ unit-test axis coverage (sim)
         run: |
-          if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
-            source .venv/bin/activate
-          fi
           # A case built once against one arch or one runtime passes exactly like
           # one that covers every configuration, so the gap is invisible to ctest.
           # This reads the build's compile lines instead. It needs the configured
@@ -189,31 +196,25 @@ jobs:
           # unit's include tree, which costs ~44 s on Linux and ~175 s on macOS,
           # so the second run is the more expensive one and establishes less.
           if [ "$RUNNER_OS" = "Linux" ]; then
-            python tests/lint/check_ut_cpp_axis.py --jobs 32
+            .venv/bin/python tests/lint/check_ut_cpp_axis.py --jobs 32
           else
             echo "Axis coverage is established by the Linux leg, whose build graph is a superset of this one; skipping."
           fi
 
-      - name: Check C++ unit-test stub linkage
+      - name: Verify C++ unit-test stub linkage (sim)
         run: |
-          if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
-            source .venv/bin/activate
-          fi
           # A stub the support archive lost to a weak fallback links fine and
           # then hangs, so ctest only catches it by timing out. This reads the
           # built binaries' symbol tables and names every target that took one.
           # Unlike the axis check this runs everywhere: which archive member
           # resolves a symbol, and whether a weak definition wins, is decided by
           # the platform's linker rather than by this repository.
-          python tests/lint/check_ut_cpp_stub_linkage.py
+          .venv/bin/python tests/lint/check_ut_cpp_stub_linkage.py
 
-      - name: Check swimlane exporter roundtrip
+      - name: Verify swimlane exporter roundtrip (sim)
         run: |
-          if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
-            source .venv/bin/activate
-          fi
           # The swimlane export→parse roundtrip needs the C++ exporter binary, so
           # it runs here rather than in the pyut sweep above (which precedes this
           # build and skips it). Asserting the parser against hand-written JSON
           # would not catch the exporter and the reader drifting apart.
-          python -m pytest tests/ut/py/test_swimlane_export_run_identity.py -v
+          .venv/bin/python -m pytest tests/ut/py/test_swimlane_export_run_identity.py -v

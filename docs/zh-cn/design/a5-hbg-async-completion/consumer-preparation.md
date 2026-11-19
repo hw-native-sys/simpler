@@ -12,23 +12,27 @@
 
 ## 2. 从现有图解析范围
 
-普通任务已有参数方向、buffer、offset、shape、stride 和依赖边。Graph 的 PARAM 可解析为当前调用参数，SUB_TASK 可解析为本实例 heap；不同 invocation 分开物化。需要缓存范围时，从这些表示与实际后端操作生成 run 内旁表，不扩展 TensorData、Graph Definition、Callable 或跨进程参数协议。
+HBG 从最终链接的 A5 可执行指令判断哪些业务地址会经过 Scalar DCache。上传时，分析器用当前 CANN 的 BiSheng `llvm-objdump` 解码原始指令字节。解析器核对编码、操作码和寻址方式；遇到新版工具改变输出格式或指令助记符时，该 kernel 回退到全量缓存维护。Host 在每次调用中核对 AIC/AIV 类型和参数布局，再用本次的 Tensor 描述符解析地址。Graph 子任务使用各自 invocation 绑定后的描述符。
 
-signal 地址不能独自描述 payload，控制依赖也不能凭空给出数据范围。优先使用已有 kernel 参数、SDMA descriptor、编译器通信操作信息和显式数据依赖。纯控制通知不需要虚构 payload。无法证明范围和读取路径的组合保持未支持，不能静默跳过获取。
-
-处理 view、别名及非连续区域时计算实际覆盖范围，避免把 allocation 全部当成待失效数据。cache line 扩展不能破坏其他任务的 dirty 数据。相同 allocation 不等于相同发布版本；同 run 覆写须受正确的数据依赖约束。
+证明可记录至多三段静态字节范围，每段包含 Tensor 参数序号、起点和长度。Host 检查地址运算和 buffer 边界，按 64 B 对齐并合并重叠的缓存行。合并后覆盖一行或两行时使用逐行 DCCI，超过两行时使用全 DCache DCCI。两行覆盖上板用例中实测的 payload 行和输出行。普通 Scalar 的部分写也可能与异步输入共用一行，因此同样计入范围。编译结果存在间接指针、未识别的指令、不可表示的范围或未确定的别名时，使用全量获取。
 
 ## 3. 必要获取的执行位置
 
-run 入口保留既有全 DCache 获取。首次非零 group 发布前置位单调活动标记；依赖该等待的消费者取得执行许可时，必须能通过 bypass load 观察到该标记。活动开始后，基础实现沿用既有全 DCache 观察原语，在依赖满足、最终执行许可确定后，由实际执行核获取输入，再写入本次执行的新异步上下文并调用 kernel。整个 run 从未登记条件时跳过这次额外获取。标记只能在 run 开始前清零，且发布者使用 bypass store 加设备屏障；可靠 ld_dev 可以观察协议已正确发布的状态，不再按原语类别一律否定 atomic writer；但任何 writer 都须在真实依赖边界显式 DSB，不能认为 atomic 自动提供相关顺序，也不能以读取代替领取责任的 RMW。这样同步消费者也能读取外部更新的 payload，不依赖完成条件由哪个核观察。该位置之前的调度记录写入必须已发布；不能用获取操作代替发布旧 dirty payload 的所有权处理。具体读取路径和维护成本仍按硬件用例及性能矩阵验证。
+首次发布非空等待组时设置本轮活动标记。依赖该等待的任务取得执行许可后，每个实际执行 lane 按自己的 kernel 处理业务输入。
 
-只对确实缺少获取保证的读取路径增加准备：依赖满足、参数地址物化后，在读取 predicate 或进入业务 kernel 前，在实际核完成缓存操作。predicate=false 仍需先保证 predicate operand 可见，但不执行业务 kernel。
+| 已确认的访问方式 | 消费核进入 kernel 前的操作 |
+| ---------------- | -------------------------- |
+| 业务输入全部走 MTE 或 bypass，且无须维护可能别名的 Scalar 写 | 跳过输入 DCCI 和配套的 DSB |
+| 普通 Scalar 访问的业务地址已绑定，覆盖一行或两行 | 每个涉及的本核 64 B 行发出一次 DCCI，全部操作之后执行一次 DSB |
+| 超过两行、证明缺失、核类型不匹配或地址无法确定 | 本核全 DCache DCCI，随后执行 DSB |
 
-长范围按实际缓存维护工作量分段。进度绑定当前核、task/block/subtask 与数据发布，不能把别核的准备结果当成可移交 lease。准备期间不等待外部条件、不占 async CHECK lease，并继续遵守调度预算。
+实际输入、通知计数和调度参数分别具有各自的发布顺序。旧写者在交权前发布 dirty 行。predicate 的读取仍在求值点单独获取其操作数。
 
-MIX/sync-start 若需要额外本核准备，必须覆盖全部实际参与成员；mask 6 中 inactive AIC coordinator 仍履行现有协调职责。最终 start 许可之后直接执行业务，不再插入会改变准备状态的工作。
+MIX/sync-start 的本核准备覆盖全部活动成员。mask 6 只包含 AIV0 和 AIV1，由 AIV0 在本簇发布描述符，两条 AIV lane 分别报告 FIN。最终 start 许可之后直接执行业务，不再插入会改变准备状态的工作。
 
 ## 4. 验收
+
+`defer_wait_visibility` 的 A5 L4 上板检查对两个尾核分别核对数值结果和两次单行 DCCI。更新 CANN 后，若数值仍然正确但工具链使证明失效，这项检查会报告定向维护的退化。
 
 - AIC/AIV 提交者、观察者和消费者不相同，消费者预先持有旧 cache。
 - 同步消费者、多 fanin、同 allocation 不同 view、Graph ENTER/EXIT 后的数据读取。

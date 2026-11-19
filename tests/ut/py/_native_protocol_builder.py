@@ -318,7 +318,7 @@ class ProtocolBuilder:
             control["next_block"] += 1
             if control["next_block"] == spec["block_num"]:
                 control["claim_seal"] = spec["block_num"]
-        pending = 4 if mixed else block % 4
+        pending = 4 + group // 2 % 2 if mixed else block % 2
         index = (
             spec["trace_base"]
             + block * bin(spec["active_mask"]).count("1")

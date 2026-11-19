@@ -41,7 +41,9 @@ ordinary onboard, and NPU unit-test bodies are split by architecture so each
 job renders only its own steps. The framework environment shares `_st-framework.yml`;
 callers supply matching `platform` and `runs_on` inputs. Shared step scaffolding
 that is safe to run after checkout lives in composite actions under `.github/actions/`
-(`apt-install`, `cache-pip`, `cache-ccache`, `setup-gcc-15`, `setup-python`, `setup-venv`, `upload-diagnostics`, and the three `network1-*` actions).
+(`apt-install`, `cache-ccache`, `cache-pip`, `run-onboard-dfx-smokes`,
+`setup-framework`, `setup-gcc-15`, `setup-python`, `setup-venv`,
+`upload-diagnostics`, and the three `network1-*` actions).
 Optional onboard, Network1, and framework diagnostic uploads use the local
 `upload-diagnostics` composite action. Its definition is fetched from the
 workflow's `github.workflow_sha` into `.ci-support` at retention time, so an
@@ -49,7 +51,16 @@ older tested PR head need not contain the action. The tested checkout stays
 at its admitted revision. Both helper checkout and upload retain
 `continue-on-error: true`; upload runs only when helper checkout succeeds.
 The runner loads the remote uploader when the final retention step runs,
-rather than during job initialization.
+rather than during job initialization. The action appends a fixed build-product
+exclusion list after the caller's paths —
+`objects/`, `CMakeFiles/`, `*.o`, `*.so`, `*.a`, `*.pyc`,
+`__pycache__/` and ninja state. An artifact therefore keeps logs, results,
+plans, capture manifests and their raw payloads, while excluding build products
+compiled in the test's working directory. Payload bytes belong to the captured
+execution and cannot be reconstructed from source; A5 args dumps retain both
+`args_dump.json` and `args.bin` for replay.
+`cache-pip` resolves its cache path with `python -m pip cache dir`, including
+the macOS `~/Library/Caches/pip` default and any pip cache-directory override.
 `setup-gcc-15` accepts a complete, pre-provisioned GCC 15 toolchain on any
 Linux runner; automatic installation of missing Linux tools is Ubuntu-only,
 while macOS installation uses Homebrew. `_packaging.yml` deliberately retains
@@ -109,10 +120,114 @@ Admin PR comment /run-a5
 | `st-onboard-a2a3` | a2a3 self-hosted | `pytest examples tests/st -m "not sdma and not sdma_fault" --platform a2a3 --exclude-level 4 --device ...`, then separate SDMA-demo and `sdma_fault` device tasks, then adaptive-parallel DFX feature smokes |
 | `st-framework-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
 | `ut-a5` | a5 self-hosted | Hardware Python UT: `device_count` cases use resource scheduling, RuntimeBuilder integration runs before the xdist fanout, and remaining cases use one worker per allocated device. Then CANN example smokes. |
-| `st-onboard-a5` | a5 self-hosted | Default SDMA+URMA / RDMA=OFF build and `pytest examples tests/st --platform a5 --exclude-level 4 --device ...`, including SDMA, the active URMA regressions and mixed SDMA/URMA cases, then adaptive-parallel DFX feature smokes |
+| `st-onboard-a5` | a5 self-hosted | Default SDMA+URMA / RDMA=OFF build and `pytest examples tests/st --platform a5 --exclude-level 4 --device ...`, including SDMA and the active URMA regressions, then adaptive-parallel DFX feature smokes |
 | `st-framework-a5` | a5 self-hosted | `pytest examples tests/st --platform a5 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
 | `st-network1-onboard-a2a3` (Daily only) | a pair of `a2a3pod` machines | `pytest examples tests/st --level 4 --platform a2a3 --device ... --max-parallel 1`, one L3 daemon on the peer |
 | `st-deepseek-onboard-a2a3` | a2a3 self-hosted | `pytest <the two deepseek_v4_flash_decode dirs> --platform a2a3 --manual only --device ...`, both 2-device cases concurrently, in parallel with `st-onboard-a2a3` |
+
+### Job phase contract
+
+Every reusable job body has the same three phases in the same order:
+**preparation → run → post-run**. Two templates cover every job, and
+`tests/ut/py/test_job_phases.py` reads the workflow files and fails when a
+job drifts from them — the step names below are the contract.
+
+CPU template (jobs whose runner is the CPU pool):
+
+```text
+Checkout target
+[Validate manual mode]
+[Checkout Python setup action → Set up Python]   (hosted variant)
+Verify Python >= 3.10
+Set up C++ compiler            (setup_variant: github)
+Verify provisioned toolchain   (setup_variant: self-cpu)
+Set up environment             (setup-venv)
+<run>
+```
+
+NPU template (jobs that hold a device):
+
+```text
+Checkout target
+[Validate manual mode]
+Set up environment             (setup-venv, or setup-framework)
+<run>
+[Checkout diagnostic upload action → Upload logs]
+```
+
+Read per job, the columns are the job `name:` values a caller shows in the
+checks list. `✓` runs on every invocation, `hosted` / `pool` select by
+`setup_variant`, `build` runs only when the diff needs a build and `lint` only
+when it does not, and `—` is absent. Rows keep the template order above except
+where the exception table below says otherwise.
+
+CPU jobs:
+
+| Step `name:` | ut | pre-commit | packaging | profiling-flags-smoke | st-sim-a2a3sim | st-sim-a5sim | st-sim-wsesim |
+| ------------ | -- | ---------- | --------- | --------------------- | -------------- | ------------ | ------------- |
+| `Checkout target` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `Validate manual mode` | — | — | — | — | ✓ | ✓ | ✓ |
+| `Checkout Python setup action` | hosted | — | hosted | — | hosted | hosted | hosted |
+| `Set up Python` | hosted | — | hosted | — | hosted | hosted | hosted |
+| `Verify Python >= 3.10` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `Set up C++ compiler` | hosted | — | hosted | — | hosted | hosted | hosted |
+| `Verify provisioned toolchain` | pool | build | — | ✓ | pool | pool | pool |
+| `Cache pip packages` | hosted | — | hosted | — | hosted | hosted | hosted |
+| `Set up environment` | ✓ | build | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `Lint-only venv`, `Use lint venv` | — | lint | — | — | — | — | — |
+
+NPU jobs:
+
+| Step `name:` | st-onboard-a2a3 | st-onboard-a5 | ut-a2a3 | ut-a5 | `st-framework-<platform>` | `st-network1-onboard-<platform>` | st-deepseek-onboard-a2a3 |
+| ------------ | --------------- | ------------- | ------- | ----- | ------------------------- | -------------------------------- | ------------------------ |
+| `Checkout target` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `Validate manual mode` | ✓ | ✓ | — | — | ✓ | — | — |
+| `Set up environment` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `Checkout diagnostic upload action` | ✓ | ✓ | — | — | ✓ | ✓ | — |
+| `Upload logs` | ✓ | ✓ | — | — | ✓ | ✓ | — |
+
+A bracketed step appears only where the workflow declares the input it
+consumes. The two templates line up where it matters: `Checkout target` is
+always first, `Set up environment` is the one step that installs the project
+itself, and everything the environment needs (compiler, apt packages) is
+installed before it. Only dependencies the run payload itself needs —
+GoogleTest, ccache, MPI in `_ut-no-hardware.yml` — follow it. CPU jobs have
+no post-run phase because their artifacts are reproducible on any developer
+box. Only a hardware run that did not pass uploads its logs: every such step is
+named `Upload logs`, and its `if:` requires `failure() || cancelled()` so a
+green run leaves no artifact behind, plus `steps.diagnostics.outcome` because
+the helper checkout is best-effort. Each job keeps one such step: a job with
+several outputs — the default run root, the A2/A3 HBG capture, the A5
+args-dump manifests and payloads — lists every path in that one upload.
+
+The run phase is the job's own content, but its step names are not. Each one
+starts with `Compile` (AICore kernel sources), `Build` (anything cmake builds),
+`Run` or `Verify`, and says what it acts on; a job pinned to one platform ends
+every such name with that platform in parentheses. Scene-test and unit-test
+jobs of the same platform therefore read alike — `Compile scene-test kernels
+(a2a3)` / `Run pytest scene tests (a2a3)` against `Build C++ unit tests (a2a3)`
+/ `Run unit tests (a2a3)`. A step that invokes pytest says so in its name.
+
+Exactly one step per job runs its suite. The scene suites are `Run pytest scene
+tests (<platform>)`; a job whose suite name is the point says so instead (`Run
+framework scene tests`, `Run network1 pytest scene tests`, `Run DeepSeek pytest
+smokes (a2a3)`), and a job whose suite is the unit-test runner is `Run unit
+tests (<platform>)` or `Run Python unit tests (sim)`.
+
+Two orderings are load-bearing rather than cosmetic: `Validate manual mode`
+runs before anything is installed, so a typo costs seconds instead of a
+provisioned environment, and the NPU post-run checkout/upload pair carries
+`continue-on-error` so artifact-service trouble cannot override a test
+result.
+
+| Workflow | Documented difference |
+| -------- | --------------------- |
+| `_pre-commit.yml` | A lint-only diff swaps `Set up environment` for `Lint-only venv` + `Use lint venv`, and preparation resolves the base SHA and lint build target first. It is CPU-pool only, so it has no Python setup, and it installs a compiler only when the image lacks one (`Find missing build and lint tools`) — `Verify provisioned toolchain` then asserts the result on both paths. Those names are pinned by `test_pre_commit_build_selection.py`. |
+| `_profiling-flags-smoke.yml` | CPU-pool only: no hosted variant, so no Python setup and no compiler install; `Verify provisioned toolchain` checks the image unconditionally before `Set up environment`. |
+| `_packaging.yml` | The apt compiler install sits between `Set up C++ compiler` and `Set up environment`: the matrix installs the project, which needs the compiler, so the venv must come after it. It has no `Verify provisioned toolchain` because its venv installs cmake and ninja itself, so the pool image carries no toolchain contract to check. |
+| `_st-framework.yml`, `_st-network1.yml` | Same preparation skeleton; the run phase is a job-specific protocol — one exclusive `task-submit` for framework, stage → run → teardown across two machines for network1. |
+| `_st-deepseek-a2a3.yml` | Takes no `manual_mode` input (its run is `--manual only` by construction), so it has no `Validate manual mode` step; and its suite is a standalone model test, which the feature-coverage policy does not cover, so it has neither `--environment-receipts` nor a `Verify ... environment coverage` step. No post-run phase: it retains no artifact. |
+| `_ut-npu-a2a3.yml`, `_ut-npu-a5.yml` | No post-run phase: they emit no retained artifacts. |
 
 ### Multi-machine network1 jobs
 
@@ -149,9 +264,10 @@ declaration; `network1` is the runner topology, not a pytest selection marker.
 Network1 logs go to `output/network1-ci-<run>-<attempt>/pytest/` while the job is running.
 Parent-side `ASCEND_PROCESS_LOG_PATH` is split per pytest nodeid by
 `st_network1_logs`; peer-side daemon/device logs are grouped for the pytest session.
-The directory is uploaded on a best-effort basis: artifact-service failures are
-ignored so they cannot override the `network1` test result. Preserve relevant
-diagnostics in the inline job log as well when investigating a failure.
+The directory is uploaded only when the job did not pass, and on a best-effort
+basis: artifact-service failures are ignored so they cannot override the
+`network1` test result. Preserve relevant diagnostics in the inline job log as
+well when investigating a failure.
 
 Both hosts require `task-submit`; configured device lists alone do not reserve cards.
 The peer daemon starts in its own device task. Once its port opens, the local
@@ -336,7 +452,7 @@ the default `--max-parallel auto` caps the in-flight subprocess count to
 quota, so this is the true core count, not a container limit.
 
 ```bash
-# Sim: --max-parallel auto resolves to 4 on a standard ubuntu-24.04 runner
+# Sim: --max-parallel auto resolves to 4 on a standard ubuntu-latest runner
 pytest examples tests/st --platform a2a3sim --device 0-15
 
 # Throttle further on a CPU-starved runner: 4 concurrent cases (each forking
@@ -387,8 +503,9 @@ For A2/A3 manual-only runs, the two SDMA steps are outside scope; Daily retains
 their existing default manual exclusion. An empty framework manual-only run is
 not successful qualification.
 
-Artifacts retain plans, parent/child receipts, retry manifests and summaries,
-including partial evidence on failure. Default artifact names include platform,
+A failed or cancelled run uploads its plans, parent/child receipts, retry
+manifests and summaries as partial evidence; a passing run uploads nothing.
+Default artifact names include platform,
 host architecture, run ID and attempt. Artifact upload failure does not override
 the test verdict. Sim, Network1, standalone model tests and DFX smokes keep their
 existing validation paths and are not covered by these new summaries.
@@ -495,14 +612,11 @@ The suite includes Kernel eager and native graph capture/replay declarations;
 actual qualification requires their source-bound passing execution receipts.
 
 Comment-trigger workflows are loaded from the default branch, whereas their local
-actions and identity scripts come from the checked-out PR. The existing
-`setup-framework-eager/action.yml` and `identity.py` paths therefore delegate to
-the canonical setup/identity implementation and preserve the caller's output path.
-They contain no independent dependency pins or execution suite. Remove these entry
-points only after the default-branch callers use the canonical paths and queued
-invocations of the older callers have drained. An older caller's passing result
-qualifies only its own verification contract; candidate coverage summaries require
-a caller that enables feature verification.
+actions and identity scripts come from the checked-out PR. The canonical
+`setup-framework/action.yml` and `identity.py` are therefore the only implementation:
+there is no second suite or dependency pin to keep in step. An older caller's passing
+result qualifies only its own verification contract; candidate coverage summaries
+require a caller that enables feature verification.
 
 When deploying this naming migration, administrators must inspect both branch
 protection and repository/organization rulesets for required check contexts. Replace
@@ -534,7 +648,11 @@ framework cases are automated, but a future manual case in this environment is
 discovered and included by Daily without another workflow edit.
 
 The dedicated environment uses `--system-site-packages` and installs local,
-pinned wheels for CPU Torch 2.7.1 and torch_npu 2.7.1.post4. The pins constrain
+pinned wheels for CPU Torch 2.7.1 and torch_npu 2.7.1.post4. CPU Torch comes
+from the NJU PyTorch CPU mirror; other framework setup packages use the Aliyun
+PyPI mirror. Pip uses the runner's existing download cache across jobs; a cache
+hit still queries the index before installing the cached wheel into the fresh
+venv. The pins constrain
 subsequent test/SDK installation too. The profile selects an already installed
 toolkit by its actual manifest. Selector and preflight share a minimum CANN
 version line of 9.0, comparing numeric major/minor values without an architecture
@@ -620,8 +738,8 @@ explicitly rather than accepting incomplete child results. The default
 environment retains its existing dispatcher and does not claim this strict
 JUnit aggregation. Logs contain the
 source/native build identities, runtime and framework module hashes, compiled
-bridge identity and consumer results; when artifact upload succeeds,
-`framework-<platform>-*` retains JUnit and per-case logs even on test failure.
+bridge identity and consumer results; when the run does not pass and artifact
+upload succeeds, `framework-<platform>-*` retains JUnit and per-case logs.
 Artifact upload is best-effort and does not override the verified test result.
 This qualifies the reference
 consumers' same-stream and cross-stream eager ordering, caller-owned lifetimes,
@@ -686,10 +804,17 @@ tested PR heads need not contain the wrapper. CI static analysis also targets
 Python 3.10. Daily retains separate GitHub-hosted Ubuntu/macOS coverage. The
 A5 comment gate/report and docs jobs also use GitHub-hosted runners.
 
-Provision Python 3.10 or newer, GCC 15, CMake, Ninja, GoogleTest, Graphviz, clang-tidy 18 and a matching CPU Torch wheel on each CPU runner. The distribution package names depend on the host OS. `setup-venv` installs a PyPI `ninja` into the venv on every lane, which shadows the dnf-provided `ninja-build` on `PATH` whenever the venv is active — deliberately, so CMake's generator selection is identical on CPU and GitHub-hosted runners. Same tool, different provenance; the dnf package stays in the contract for builds that run outside the venv. When the pre-commit selector requests clang-tidy preparation — for eligible C/C++, `.pre-commit-config.yaml`, or an unknown path — the job creates `g++-15` as a stand-in for the Ubuntu Toolchain PPA compiler. On the agents `g++` resolves to a conda GCC 15 prefix rather than `/usr/bin/g++`, so that diff's sim artifacts are built with GCC 15 and `compile_commands.json` names that prefix's `<triple>-g++`; `tests/lint/clang_tidy.py` drops the triple before replaying a command, without which clang-tidy adopts it as a target and resolves no C++ standard library at all. `ci.yml` lints with clang-tidy 18 and HCE 2.0 packages only LLVM 12, so an agent additionally provides 18 on `PATH` as `clang-tidy-18`, installed together with its clang builtin headers — a clang-tidy whose prefix carries no `lib/clang/<major>/include` resolves no resource dir and fails every `#include <stddef.h>`. The pre-commit job shadows the distro `clang-tidy` only on that build path; Python-only and other lint-only diffs do not build sim artifacts or create either compiler shim. On APT-based self-hosted CPU runners, the same bounded APT action used by the GitHub-hosted lane installs missing build/lint tools before verification; an existing `clang-tidy-18` satisfies the lint-tool requirement. Non-APT runners must provide the tools in advance, and verification still fails if any required tool is unavailable.
+Provision Python 3.10 or newer, GCC 15, CMake, Ninja, GoogleTest, Graphviz, clang-tidy 18 and a matching CPU Torch wheel on each CPU runner. The distribution package names depend on the host OS. `setup-venv` installs a PyPI `ninja` into the venv on every lane, which shadows the dnf-provided `ninja-build` on `PATH` whenever the venv is active — deliberately, so CMake's generator selection is identical on CPU and GitHub-hosted runners. Same tool, different provenance; the dnf package stays in the contract for builds that run outside the venv. When the pre-commit selector requests clang-tidy preparation — for eligible C/C++, `.pre-commit-config.yaml`, or an unknown path — the job creates `g++-15` as a stand-in for the Ubuntu Toolchain PPA compiler. On the agents `g++` resolves to a conda GCC 15 prefix rather than `/usr/bin/g++`, so that diff's sim artifacts are built with GCC 15 and `compile_commands.json` names that prefix's `<triple>-g++`; `tests/lint/clang_tidy.py` drops the triple before replaying a command, without which clang-tidy adopts it as a target and resolves no C++ standard library at all. `ci.yml` lints with clang-tidy 18 and HCE 2.0 packages only LLVM 12, so an agent additionally provides 18 on `PATH` as `clang-tidy-18`, installed together with its clang builtin headers — a clang-tidy whose prefix carries no `lib/clang/<major>/include` resolves no resource dir and fails every `#include <stddef.h>`. The pre-commit job shadows the distro `clang-tidy` only on that build path; Python-only and other lint-only diffs do not build sim artifacts or create either compiler shim. On APT-based self-hosted CPU runners, the same bounded APT action used by the other CPU jobs installs missing build/lint tools before verification; an existing `clang-tidy-18` satisfies the lint-tool requirement. Non-APT runners must provide the tools in advance, and verification still fails if any required tool is unavailable.
 
 Pip and compiler caches persist on these hosts; CPU jobs use their on-disk
 caches without uploading or downloading them through `actions/cache`.
+
+CPU-pool venvs are created with `--system-site-packages` and CI does not install
+torch there: the runner's interpreter, CPU torch wheel and `[test]` dependencies
+are what the job runs against, and `pip install .[test]` only fills in what is
+missing. The provisioned interpreter must therefore already satisfy the `test`
+extra (notably `torch>=2.3`). GitHub-hosted Daily legs still install torch from
+the CPU index, because those images carry none.
 
 ## Hardware Classification
 
@@ -697,7 +822,7 @@ Three hardware tiers, applied to all test categories. See [hardware classificati
 
 | Tier | CI Runner | Job examples |
 | ---- | --------- | ------------ |
-| No hardware | `[self-hosted, cpu]` (PR), `ubuntu-24.04` / `macos-latest` (Daily) | `ut`, `st-sim-*` |
+| No hardware | `[self-hosted, cpu]` (PR); `ubuntu-latest` / `macos-latest` for `st-sim-*`, `macos-latest` for `ut` (Daily) | `ut`, `st-sim-*` |
 | Platform-specific (a2a3) | `[self-hosted, a2a3]` | `ut-a2a3`, `st-onboard-a2a3` |
 | Platform-specific (a5) | `[self-hosted, a5]` | `ut-a5`, `st-onboard-a5` |
 

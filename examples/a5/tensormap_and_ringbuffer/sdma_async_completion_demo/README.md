@@ -78,5 +78,5 @@ Wrap the hardware run in `task-submit` on a shared box.
 
 ## Compare with
 
-- [`../urma_deferred_completion_demo/`](../urma_deferred_completion_demo/) — the same protocol over URMA. `kernel_consumer.cpp` is byte-identical; only the transfer kernel, its completion header, and the build flag differ. The URMA example also includes a mixed SDMA/URMA DAG that runs both in one build and one domain.
+- [`../urma_deferred_completion_demo/`](../urma_deferred_completion_demo/) — the same protocol over URMA. `kernel_consumer.cpp` is byte-identical. Both providers ship in the default A5 build. Orchestration selects the engine per domain through `workspace_engines`. SDMA reads from a mapped peer window, while URMA addresses the peer MR.
 - [`examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/`](../../../a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/) — the a2a3 port of this demo, which needs no overlay flag.

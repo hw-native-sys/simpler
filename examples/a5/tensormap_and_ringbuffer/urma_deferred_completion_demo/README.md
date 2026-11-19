@@ -24,39 +24,19 @@ directories. Only the transfer kernel and the orchestration change:
 | ---- | ---- | ---- |
 | Transfer kernel | `kernel_urma_tget_async.cpp` | `kernel_sdma_tget_async.cpp` |
 | Completion header | `backend/urma/urma_completion_kernel.h` | `backend/sdma/sdma_completion_kernel.h` |
-| Build selection | default A5 provider | default A5 provider |
+| Domain selection | `workspace_engines=("urma",)` | `workspace_engines=("sdma",)` |
+| Peer address | Peer MR base + input offset | Mapped peer window base + input offset |
 
-Read them side by side and the transport is the only variable — which is
-exactly what you want when deciding which one a workload should use.
+Both demos use the same producer-consumer protocol. The URMA demo places its
+input after a 256-byte prefix and leaves the peer window slot zero.
 
-## Independent workspaces
+## URMA window addressing
 
-SDMA and URMA providers are always compiled on A5. The host runtime can include
-optional RDMA alongside them; each domain explicitly selects its resources. This
-example requests `workspace_engines=("urma",)` and reads
-`comm_workspace<CommWorkspaceKind::URMA>(*ctx).addr`.
-
-`TestSdmaUrmaWorkspaceMix` requests both SDMA and URMA on one domain and runs
-both callables on the same Worker. A shared result output orders URMA after
-SDMA on each rank, and separate SDMA and URMA outputs validate both transfers.
-This does not assert unordered simultaneous submission on shared engine queues.
-
-`TestSdmaUrmaSameTask` uses one producer kernel to fetch the first half of its
-output through SDMA and the second half through URMA. Both requests register
-completion conditions in the same task. The consumer reads the entire output
-and adds one, so both transfers must finish before its dependency is released.
-The two ranks post the engines in opposite orders. This covers outstanding
-requests on independent engines; it does not cover multiple producers posting
-to one engine queue.
-
-## Host validation and testing
-
-These cases run on A5 TMR with two dies. Domain allocation requests the required
-engines and rejects failed initialization or invalid URMA workspace descriptors.
-Before passing the communication context to a task, orchestration calls
-`handle.device_context(rank, workspace_engines=("urma",))`; mixed tasks require
-both `("sdma", "urma")`. Missing engines and released domains raise on the host.
-The cases run in standard A5 onboard CI without a URMA environment selection.
+The example selects `workspace_engines=("urma",)` on its two-rank Device
+domain. Each rank's `windowsIn[rankId]` points to local HBM. The producer
+checks that the peer slot is zero before issuing the transfer. It computes the
+input offset from the local base and adds it to the peer MR base in the URMA
+workspace. The reserved 256-byte prefix exercises this offset on both ranks.
 
 ## Run
 

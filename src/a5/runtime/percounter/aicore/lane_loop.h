@@ -1014,7 +1014,7 @@ inline __aicore__ void percounter_service_records(
 
 inline __aicore__ void percounter_own_entry(
     const LaneConfig &cfg, PercounterLaneState *state, uint64_t entry, uint32_t slot, bool mix,
-    const PercounterTaskMetadata &metadata, uint32_t claim_index = UINT32_MAX
+    const PercounterTaskMetadata &metadata, uint64_t claim_start, uint32_t claim_index = UINT32_MAX
 ) {
     ProfileScope profile_scope(cfg.scalar, ProfilePhase::Publish);
     state->occupied |= 1U << slot;
@@ -1031,7 +1031,7 @@ inline __aicore__ void percounter_own_entry(
         owned.resolved = false;
         owned.ready = false;
         owned.entered = false;
-        percounter_record_task_event(cfg, PercounterTaskEventKind::Claim, entry, claimed);
+        percounter_record_task_event(cfg, PercounterTaskEventKind::Claim, entry, claimed, claim_start);
         return;
     }
     state->mix_owned |= 1U << slot;
@@ -1047,7 +1047,7 @@ inline __aicore__ void percounter_own_entry(
     percounter_ssbuf_store_field(&record->fanin_other, uint64_t{0});
     percounter_ssbuf_store_release(&record->generation, generation);
     percounter_ssbuf_store_release(&cfg.ssbuf->publish_sequence, state->sequence);
-    percounter_record_task_event(cfg, PercounterTaskEventKind::Claim, entry, claimed);
+    percounter_record_task_event(cfg, PercounterTaskEventKind::Claim, entry, claimed, claim_start);
 }
 
 // Each interval has one final draw; each boundary has one final sector closure.
@@ -1084,6 +1084,7 @@ inline __aicore__ void percounter_claim(const LaneConfig &cfg, PercounterLaneSta
     auto &source = state->source;
     uint32_t free = PERCOUNTER_SLOT_MASK & ~state->occupied;
     if (free == 0) return;
+    const uint64_t claim_start = percounter_task_event_clock(cfg);
     const bool service_pending = state->occupied != 0 || state->shared_active != 0;
     uint32_t revisit = state->revisit;
     while (revisit != 0) {
@@ -1105,7 +1106,7 @@ inline __aicore__ void percounter_claim(const LaneConfig &cfg, PercounterLaneSta
         if (block < metadata.block_num) {
             percounter_own_entry(
                 cfg, state, percounter_order_entry(percounter_order_task_id(previous.entry), block, metadata.block_num),
-                slot, __builtin_popcount(metadata.active_mask) > 1, metadata, previous.claim_index
+                slot, __builtin_popcount(metadata.active_mask) > 1, metadata, claim_start, previous.claim_index
             );
             return;
         }
@@ -1158,7 +1159,9 @@ inline __aicore__ void percounter_claim(const LaneConfig &cfg, PercounterLaneSta
                     const uint32_t slot = __builtin_ctz(free);
                     free &= ~(1U << slot);
                     const uint64_t entry = percounter_gm_read(cfg.order[source.begin + first + k]);
-                    percounter_own_entry(cfg, state, entry, slot, false, percounter_regular_metadata(cfg, entry));
+                    percounter_own_entry(
+                        cfg, state, entry, slot, false, percounter_regular_metadata(cfg, entry), claim_start
+                    );
                 }
                 return;
             }
@@ -1186,7 +1189,7 @@ inline __aicore__ void percounter_claim(const LaneConfig &cfg, PercounterLaneSta
                     };
                     percounter_own_entry(
                         cfg, state, percounter_order_entry(task, block, blocks), __builtin_ctz(free), mix, metadata,
-                        claim_index
+                        claim_start, claim_index
                     );
                     ++source.segment;
                     return;

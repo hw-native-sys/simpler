@@ -270,6 +270,26 @@ def test_compile_cache_survives_session_cache_clear(monkeypatch, tmp_path):
     assert second.child_count == first.child_count
 
 
+def test_a5_hbg_registered_scene_is_independent_of_decoder(monkeypatch, tmp_path):
+    from simpler_setup import a5_input_cache  # noqa: PLC0415
+
+    _configure_fake_compilation(monkeypatch, tmp_path)
+    spec, _ = _cacheable_spec(tmp_path)
+    monkeypatch.setattr("simpler_setup.elf_parser.extract_text_section", lambda binary: binary)
+    key = ("TestScene", "a5", "host_build_graph", "pin")
+    monkeypatch.setattr(
+        a5_input_cache, "annotate_a5_hbg_text", lambda *_: pytest.fail("registered artifact ran decoder")
+    )
+    first = compile_chip_callable_spec(spec, "a5", "host_build_graph", key)
+    clear_compile_cache()
+    monkeypatch.setenv("ASCEND_HOME_PATH", str(tmp_path / "new-sdk"))
+    second = compile_chip_callable_spec(spec, "a5", "host_build_graph", key)
+    from ctypes import string_at  # noqa: PLC0415
+
+    assert string_at(first.buffer_ptr(), first.buffer_size()) == string_at(second.buffer_ptr(), second.buffer_size())
+    assert _FakeKernelCompiler.orchestration_compiles == _FakeKernelCompiler.incore_compiles == 1
+
+
 def test_unknown_capability_uses_one_canonical_cache_identity(monkeypatch, tmp_path):
     _configure_fake_compilation(monkeypatch, tmp_path)
     spec, _header = _cacheable_spec(tmp_path)

@@ -309,7 +309,9 @@ actual worker, cluster and C/V0/V1 role.
 
 | Milestone | Device boundary |
 | --------- | --------------- |
+| Claim start | The claiming lane has space in its local slots and starts the scan and ticket acquisition that eventually owns the block. Blocks acquired in one batch share this timestamp. Passes that acquire nothing emit no marker. |
 | Claim | The claiming lane acquires the task/block in its local scheduler state. For MIX, the timestamp precedes publication of the entry to the participating lanes in SSBUF. |
+| Ideal ready | The converter estimates when the last predecessor issues its final completion contribution. It can precede Claim start. The converter leaves the Claim-to-Ready span intact when dependency or completion evidence is missing. |
 | Ready | A lane selects the task/block after its dependency, ordering and applicable MIX or sync-start gates. Each participating MIX lane records its own Ready. Argument prefetch can occur earlier. |
 | Kernel end | The executing lane returns from its kernel, before the output-store barrier. The marker also carries that lane's kernel start. Dependency-only and skipped entries have no kernel interval. |
 | Completion issued | The publisher issues the GM completion contribution. For MIX this includes the aggregate and any deferred-share deductions. Deferred settlement records its own publisher and may occur later. |

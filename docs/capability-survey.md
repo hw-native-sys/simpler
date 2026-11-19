@@ -224,7 +224,7 @@ values yield `SIMPLER_ERROR_ASYNC_COMPLETION_INVALID`.
 | Engine | a2a3 | a5 | Status |
 | ------ | ---- | -- | ------ |
 | COUNTER (default) | registered | registered | **Shipped** — `tests/st/worker/comm_domain/async_notify` runs onboard on both architectures. `tests/st/worker/comm_domain/deferred_notify` runs Per-PR on a2a3 onboard and a5sim, and in Daily on a2a3sim. Selection uses `CASES[*]["platforms"]` and `CASES[*]["manual"]`. |
-| SDMA | build macro forced ON; runtime opt-in | `option(... OFF)` | a2a3 **Shipped** (the "SDMA pytest (a2a3)" step in `ci.yml`); a5 not built |
+| SDMA | build macro forced ON; runtime opt-in | `option(... OFF)` | a2a3 **Shipped** (the "Run SDMA tests (a2a3)" step in `_st-npu-a2a3.yml`); a5 not built |
 | URMA | absent | full implementation | **Gated** — see below |
 | ROCE, CCU | enum only | enum only | **Name only** |
 
@@ -256,12 +256,10 @@ RDMA defaults OFF and can be enabled alongside both providers.
 `CommContext.workspaces` stores independent descriptors indexed by
 `CommWorkspaceKind::{SDMA, URMA, RDMA}`. Domains create synchronous mapped
 windows by default and initialize async providers only when explicitly requested
-through `workspace_engines`. SDMA and URMA can share a domain; RDMA currently
-requires its own domain and cannot be combined with either in one domain.
+through `workspace_engines`. URMA and RDMA each require a dedicated domain.
 The [URMA example](../examples/a5/tensormap_and_ringbuffer/urma_deferred_completion_demo/README.md)
-covers ordered mixed DAGs and same-kernel SDMA/URMA requests. The A5 onboard CI
-job runs these cases alongside SDMA using the default providers. RDMA remains
-optional and defaults to OFF.
+fetches peer data through the URMA workspace using a nonzero window offset.
+The A5 onboard CI job runs this case alongside the SDMA examples.
 
 **HCCL is bootstrap, not data movement.** The complete set of functions called
 is `HcclGetRootInfo`, `HcclCommInitRootInfo`, `HcclBarrier`, `HcclCommDestroy`.

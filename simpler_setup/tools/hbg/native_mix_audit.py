@@ -36,6 +36,7 @@ def _group(audit, block):
     values = [generation if lane in active else 0 for lane in range(3)]
     mapping = [lane if lane in active else 255 for lane in range(3)]
     require(owner["released_seq"] == values, "incomplete MIX FIN observation")
+    bank = audit.executions[block["index"]]["pending_slot"]
     arrivals = []
     for i, lane in lanes.items():
         audit.record_identity(lane, ref)
@@ -87,8 +88,10 @@ def _group(audit, block):
             audit.before(point(lane, "release_after"), point(member, "retired"), "member retired before publishing FIN")
         execution = audit.executions[block["index"] + active.index(i)]
         require(
-            execution["worker_index"] == peers[i] and execution["group_seq"] == generation,
-            "execution belongs to another MIX generation or lane",
+            execution["worker_index"] == peers[i]
+            and execution["group_seq"] == generation
+            and execution["pending_slot"] == bank,
+            "execution belongs to another MIX generation, slot or lane",
         )
         require(
             execution["observed_self_floor"] == lane["observed_self_floor"], "inconsistent MIX self-floor observation"
@@ -104,6 +107,7 @@ def _group(audit, block):
     for lane in lanes.values():
         for arrival in arrivals:
             audit.causal.add(arrival, point(lane, "arrivals_observed"))
+    return bank
 
 
 def audit_mix(audit):
@@ -111,18 +115,35 @@ def audit_mix(audit):
     for block in audit.blocks.values():
         owner = block["owner"]
         if audit.tasks[owner["task_ref"]]["flags"] & MIX:
-            _group(audit, block)
-            clusters[owner["cluster_index"]].append(owner)
+            bank = _group(audit, block)
+            clusters[owner["cluster_index"]].append((owner, bank, block["lanes"]))
     for groups in clusters.values():
-        groups.sort(key=lambda owner: owner["group_seq"])
-        require(
-            [g["group_seq"] for g in groups] == list(range(1, 2 * len(groups), 2)),
-            "missing or duplicated MIX generation",
-        )
-        for previous, current in zip(groups, groups[1:]):
-            require(previous["order_key"] <= current["order_key"], "decreasing MIX rank within a cluster")
-            audit.before(
-                point(previous, "completion_after"),
-                point(current, "publish_before"),
-                "MIX descriptor reused before the previous accountant retired it",
-            )
+        groups.sort(key=lambda group: group[0]["publish_before"][1])
+        by_bank = {}
+        by_task = {}
+        lane_retired = {}
+        for number, (owner, bank, lanes) in enumerate(groups):
+            require(owner["group_seq"] == 2 * number + 1, "missing or duplicated MIX generation")
+            if number:
+                require(
+                    groups[number - 1][0]["order_key"] <= owner["order_key"], "decreasing MIX rank within a cluster"
+                )
+            publication = point(owner, "publish_before")
+            completion = point(owner, "completion_after")
+            if bank in by_bank:
+                audit.before(
+                    by_bank[bank], publication, "MIX descriptor reused before the previous accountant retired it"
+                )
+            if owner["task_ref"] in by_task:
+                audit.before(by_task[owner["task_ref"]], publication, "MIX task still owns a block on this cluster")
+            by_bank[bank] = completion
+            by_task[owner["task_ref"]] = completion
+            for lane in lanes:
+                worker = lane["worker_index"]
+                if worker in lane_retired:
+                    audit.before(
+                        lane_retired[worker], point(lane, "arrive_before"), "MIX lane still owes an earlier group"
+                    )
+                lane_retired[worker] = (
+                    completion if worker == owner["completion_worker"] else point(lane, "release_after")
+                )

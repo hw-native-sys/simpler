@@ -23,6 +23,7 @@ from pathlib import Path
 
 from simpler.task_interface import CoreCallable
 
+from simpler_setup.a5_input_cache import annotate_a5_hbg_text
 from simpler_setup.compile_pool import compile_slot, compile_worker_budget
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
@@ -119,12 +120,19 @@ def build(flavor, output, tools, pto, jobs, runtime):
             raise ValueError("CoreCallable requires raw instructions, not an ELF image")
         target = output / f"kernel-{kernel['func_id']}.bin"
         target.write_bytes(binary)
+        registration_file = target
+        if runtime == "host_build_graph":
+            annotated = annotate_a5_hbg_text(binary, kernel["core_type"])
+            if annotated != binary:
+                registration_file = target.with_suffix(".hbg")
+                registration_file.write_bytes(annotated)
         print(f"{flavor}: {'compiled' if compiled else 'cached'} {kernel['func_id']} {kernel['name']}", flush=True)
         return {
             "func_id": kernel["func_id"],
             "name": kernel["name"],
             "core_type": kernel["core_type"],
             "file": target.name,
+            "registration_file": registration_file.name,
             "cache_key": key,
             "cache_hit": not compiled,
             "async_capability": capability,
@@ -154,7 +162,7 @@ def build(flavor, output, tools, pto, jobs, runtime):
         signature = kernel["signature"]
         rows.append(
             f"{kernel['func_id']} {len(signature)} {' '.join(map(str, signature))} "
-            + json.dumps(str(output / record["file"]))
+            + json.dumps(str(output / record["registration_file"]))
             + " "
             + " ".join(map(str, capability_words(kernel)))
         )

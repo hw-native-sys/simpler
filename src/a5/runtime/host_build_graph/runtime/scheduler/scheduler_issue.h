@@ -64,9 +64,11 @@ static inline __aicore__ bool scheduler_task_supply_closed(
     if (!scheduler_task_ref_valid(graph, ref)) return scheduler_issue_fail(graph, local, run, ref);
     bool executable = true;
     uint64_t blocks = 0;
+    uint8_t flags = 0;
     auto *control = binding != nullptr ? binding->control : scheduler_task_control_at(base, local, ref);
     if (binding != nullptr) {
         if (binding->task_ref != ref) return scheduler_issue_fail(graph, local, run, ref);
+        flags = binding->metadata.flags;
         blocks = binding->metadata.logical_block_num;
     } else {
         const auto &metadata = *scheduler_task_metadata_at(base, local, ref);
@@ -74,7 +76,8 @@ static inline __aicore__ bool scheduler_task_supply_closed(
             *closed = true;
             return true;
         }
-        executable = scheduler_task_is_executable(metadata.flags) && !scheduler_task_is_inline(metadata.flags);
+        flags = metadata.flags;
+        executable = scheduler_task_is_executable(flags) && !scheduler_task_is_inline(flags);
         blocks = metadata.logical_block_num;
     }
     if (scheduler_cached_task_proof(local, ref) != SchedulerTaskProof::NONE) {
@@ -82,13 +85,15 @@ static inline __aicore__ bool scheduler_task_supply_closed(
         return true;
     }
     if (executable && blocks == 0) return scheduler_issue_fail(graph, local, run, ref);
-    // Canonical DONE proves both closed supply and completed dependencies.
-    // Pending compute or async debt still requires the independent supply seal.
-    const auto completion = scheduler_observe_cached_completion(base, local, ref);
-    if (completion == SchedulerCompletionObservation::INVALID) return scheduler_issue_fail(graph, local, run, ref);
-    if (completion == SchedulerCompletionObservation::DONE) {
-        *closed = true;
-        return true;
+    // In flat graphs, the final valid claim seals supply for both ordinary and MIX tasks without predicates.
+    const bool always_seals = graph.native_header_offset == 0 && executable && !scheduler_task_has_predicate(flags);
+    if (!always_seals) {
+        const auto completion = scheduler_observe_cached_completion(base, local, ref);
+        if (completion == SchedulerCompletionObservation::INVALID) return scheduler_issue_fail(graph, local, run, ref);
+        if (completion == SchedulerCompletionObservation::DONE) {
+            *closed = true;
+            return true;
+        }
     }
     if (executable) {
         const uint64_t seal = scheduler_gm_query(control->claim_seal);
@@ -105,7 +110,7 @@ static inline __aicore__ bool scheduler_task_supply_closed(
 // Each sector contains block indices part + 4*k. Its final valid claimant
 // contributes that sector's capacity once; excess claims never roll back or
 // contribute. A total of N therefore proves all N blocks have fixed owners.
-static inline __aicore__ bool scheduler_claim_ordinary_block(
+static inline __aicore__ bool scheduler_claim_ticket(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     int64_t ref, uint32_t blocks, uint32_t *block, bool *closes_supply
 ) {
@@ -174,9 +179,7 @@ static inline __aicore__ bool scheduler_close_ordinary_supply(
 
 // Private ownership only: this chooses a recheck boundary, never grants entry.
 inline __aicore__ bool scheduler_issue_needs_execution_recheck(const SchedulerLocalState *local) {
-    if (local->cluster_mix.phase != SchedulerGmMixPhase::IDLE ||
-        !scheduler_task_ref_is_null(local->cluster_pending.task_ref))
-        return true;
+    if (!scheduler_task_ref_is_null(scheduler_unretired_mix_task(*local))) return true;
     for (const auto &token : local->execution_tokens)
         if (token.phase != SchedulerExecutionTokenPhase::EMPTY) return true;
     return false;
@@ -184,7 +187,7 @@ inline __aicore__ bool scheduler_issue_needs_execution_recheck(const SchedulerLo
 
 // Both engine catalogs are projections of the same validated topological order.
 // Cross-engine predecessors must also have owners before a consumer takes space.
-static inline __aicore__ bool scheduler_issue_fanin_ready(
+static inline __aicore__ bool scheduler_check_predecessor_supply(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     int64_t ref, bool *ready
 ) {
@@ -243,7 +246,7 @@ static inline __aicore__ bool scheduler_issue_fanin_ready(
     return true;
 }
 
-static inline __aicore__ bool scheduler_query_issue_head(
+static inline __aicore__ bool scheduler_find_issuable_task(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     int64_t *ref, bool *progress
 ) {
@@ -281,7 +284,7 @@ static inline __aicore__ bool scheduler_query_issue_head(
         const int64_t previous_task = local->issue_task_ref;
         const uint32_t previous_fanin = local->issue_next_fanin;
         bool ready = false;
-        if (!scheduler_issue_fanin_ready(graph, base, local, run, task_ref, &ready)) return false;
+        if (!scheduler_check_predecessor_supply(graph, base, local, run, task_ref, &ready)) return false;
         const uint32_t confirmed_before = local->issue_task_ref == previous_task ? previous_fanin : 0;
         *progress = *progress || local->issue_next_fanin > confirmed_before;
         if (ready) *ref = task_ref;
@@ -301,7 +304,7 @@ static inline __aicore__ bool scheduler_issue_head(
         *ref = snapshot->ref;
         return true;
     }
-    if (!scheduler_query_issue_head(graph, base, local, run, ref, progress)) return false;
+    if (!scheduler_find_issuable_task(graph, base, local, run, ref, progress)) return false;
     if (snapshot != nullptr) {
         snapshot->ref = *ref;
         snapshot->evaluated = true;

@@ -37,6 +37,13 @@ jobs:
       SIMPLER_STREAM_SYNC_TIMEOUT_MS: "6000"
 
     steps:
+      - name: Checkout target
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
       # Each network1 machine carries one .env describing itself and its peer, so
       # this job never has to work out which machine it landed on.
       - name: Load network1 machine config
@@ -97,7 +104,6 @@ jobs:
           set_default NETWORK1_REMOTE_STAGING_ROOT /data/workspace/ci-runner/network1-ci
           set_default NETWORK1_REMOTE_STAGING_TTL_DAYS 2
           set_default NETWORK1_DAEMON_WAIT_S 120
-          set_default NETWORK1_SMOKE_TIMEOUT_S 2400
           set_default NETWORK1_CANN_ENV /usr/local/Ascend/cann/set_env.sh
           set_default NETWORK1_REMOTE_CANN_ENV "$NETWORK1_CANN_ENV"
           set_default NETWORK1_HTTP_PROXY ""
@@ -160,7 +166,7 @@ jobs:
                      NETWORK1_REMOTE_USER NETWORK1_REMOTE_SSH_PORT \
                      NETWORK1_L3_DAEMON_PORT NETWORK1_L3_SESSION_TIMEOUT_S NETWORK1_L3_SESSION_LISTEN_HOST \
                      NETWORK1_REMOTE_STAGING_ROOT NETWORK1_REMOTE_STAGING_TTL_DAYS \
-                     NETWORK1_DAEMON_WAIT_S NETWORK1_SMOKE_TIMEOUT_S \
+                     NETWORK1_DAEMON_WAIT_S \
                      NETWORK1_CANN_ENV NETWORK1_REMOTE_CANN_ENV \
                      NETWORK1_HTTP_PROXY NETWORK1_HTTPS_PROXY NETWORK1_NO_PROXY \
                      NETWORK1_REMOTE_HTTP_PROXY NETWORK1_REMOTE_HTTPS_PROXY NETWORK1_REMOTE_NO_PROXY; do
@@ -169,13 +175,6 @@ jobs:
 
           echo "network1 machine=${NETWORK1_MACHINE} ip=${NETWORK1_LOCAL_IP:-unset} devices=${NETWORK1_LOCAL_DEVICES}"
           echo "network1 peer=${NETWORK1_REMOTE_MACHINE} host=${NETWORK1_REMOTE_HOST}:${NETWORK1_REMOTE_SSH_PORT} devices=${NETWORK1_REMOTE_DEVICES}"
-
-      - name: Checkout target
-        uses: actions/checkout@v5
-        with:
-          repository: ${{ inputs.repository || github.repository }}
-          ref: ${{ inputs.ref || github.ref }}
-          persist-credentials: false
 
       - name: Set up environment
         uses: ./.github/actions/setup-venv
@@ -197,7 +196,7 @@ jobs:
         with:
           platform: ${{ inputs.platform }}
 
-      - name: Run network1 pytest
+      - name: Run network1 pytest scene tests
         uses: ./.github/actions/network1-run-pytest
         with:
           pytest-args: >-
@@ -228,8 +227,8 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Upload network1 logs
-        if: always() && steps.diagnostics.outcome == 'success'
+      - name: Upload logs
+        if: (failure() || cancelled()) && steps.diagnostics.outcome == 'success'
         continue-on-error: true
         uses: ./.ci-support/.github/actions/upload-diagnostics
         with:

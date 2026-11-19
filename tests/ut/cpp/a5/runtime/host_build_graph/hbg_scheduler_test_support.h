@@ -193,6 +193,7 @@ struct FixtureStorage {
             context.graph_summary_offset = layout.graph_summary_offset;
             context.graph_task_count = task_count;
             context.original_task_count = task_count;
+            context.scheduler_state_base_address = reinterpret_cast<uint64_t>(scheduler_state->base());
             context.scheduler_state_bytes = layout.total_size;
             context.runtime_worker_count = workers;
             context.worker_index = worker;

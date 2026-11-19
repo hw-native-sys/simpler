@@ -412,7 +412,9 @@ TEST(HbgTaskCatalog, CrossEnginePredecessorRequiresIssuedSupplyRatherThanLogical
         const auto query = [&]() {
             int64_t ref = -1;
             bool progress = false;
-            EXPECT_TRUE(scheduler_query_issue_head(graph.graph(), base, worker, storage.run_control, &ref, &progress));
+            EXPECT_TRUE(
+                scheduler_find_issuable_task(graph.graph(), base, worker, storage.run_control, &ref, &progress)
+            );
             return ref;
         };
         EXPECT_EQ(query(), SCHEDULER_TASK_REF_INVALID);

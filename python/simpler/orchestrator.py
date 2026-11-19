@@ -594,7 +594,8 @@ class Orchestrator:
         On A5, workspace_engines accepts names from sdma/urma/rdma/ccu, or a mapping
         from those names to SdmaConfig/UrmaConfig/RdmaConfig/CcuConfig. Name sequences use
         default settings. Configuration is immutable for the domain's lifetime.
-        SDMA and URMA may share a domain. RDMA requires a separate domain with
+        URMA requires a dedicated domain. Peer access uses registered memory
+        through the URMA workspace. RDMA requires a separate domain with
         its own low-address window.
         ``memory_source=AddressSpace.HOST`` creates independent Host windows on
         onboard L3 A2/A3 and A5 TMR. Local device access uses MTE. For A5 peer

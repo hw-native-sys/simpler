@@ -813,14 +813,14 @@ TEST(HbgNativeGraphPlan, NativeCatalogOrderAllocatesEachSingleBlockOnce) {
             ASSERT_LT(selected, SCHEDULER_EXECUTION_TOKEN_COUNT);
             bool permitted = false;
             ASSERT_TRUE(
-                scheduler_can_enter_execution<false>(
+                scheduler_check_entry_permit<false>(
                     view.graph, view.backing.get(), &consumer, run, selected, &permitted
                 )
             );
             ASSERT_TRUE(permitted);
             consumer.execution_at(selected).state = SchedulerDispatchSlotState::EXECUTING;
             ASSERT_TRUE(
-                scheduler_complete_own_slot<false>(view.graph, view.backing.get(), &consumer, run, selected, 0)
+                scheduler_complete_lane_execution<false>(view.graph, view.backing.get(), &consumer, run, selected, 0)
             );
         }
         for (uint32_t slice = 0; slice <= catalog.count && !scheduler_execution_token_has_task(&consumer, expected);
@@ -891,7 +891,7 @@ TEST(HbgNativeGraphPlan, ConcurrentConsumersOwnAndCompleteEachNativeCallOnce) {
                 }
                 ++claims[slot.task_ref - 1];
                 slot.state = SchedulerDispatchSlotState::EXECUTING;
-                if (!scheduler_complete_own_slot<false>(view.graph, base, &local, run, slot_index, 0)) {
+                if (!scheduler_complete_lane_execution<false>(view.graph, base, &local, run, slot_index, 0)) {
                     ++failures;
                     break;
                 }
@@ -992,7 +992,9 @@ TEST(HbgNativeGraphPlan, HostInitializedDummyChainProgressesWithFullKernelSlots)
         EXPECT_EQ(initial_controls[instance.exit_ref].completion_state, scheduler_completion_initial_state(1));
     }
     bool progress = true;
-    ASSERT_TRUE(scheduler_service_controls(view.graph, view.backing.get(), &view.locals[0], view.run, 0, &progress));
+    ASSERT_TRUE(
+        scheduler_progress_graph_controls(view.graph, view.backing.get(), &view.locals[0], view.run, 0, &progress)
+    );
     EXPECT_TRUE(progress);
     EXPECT_GT(view.completed(), 0u);
     EXPECT_LE(view.completed(), SCHEDULER_CONTROL_NODE_BUDGET);
@@ -1000,7 +1002,9 @@ TEST(HbgNativeGraphPlan, HostInitializedDummyChainProgressesWithFullKernelSlots)
     for (uint32_t step = 0; step < 512 && view.completed() < view.graph.task_count; ++step) {
         for (auto &local : view.locals) {
             const auto before = view.completed();
-            ASSERT_TRUE(scheduler_service_controls(view.graph, view.backing.get(), &local, view.run, 0, &progress));
+            ASSERT_TRUE(
+                scheduler_progress_graph_controls(view.graph, view.backing.get(), &local, view.run, 0, &progress)
+            );
             EXPECT_LE(view.completed() - before, SCHEDULER_CONTROL_NODE_BUDGET);
         }
     }
@@ -1022,7 +1026,9 @@ TEST(HbgNativeGraphPlan, IndependentControlsRespectEachServiceBudget) {
     view.run->run_completed_add_address = reinterpret_cast<uint64_t>(&completed);
 
     bool progress = false;
-    ASSERT_TRUE(scheduler_service_controls(view.graph, view.backing.get(), &view.locals[0], view.run, 0, &progress));
+    ASSERT_TRUE(
+        scheduler_progress_graph_controls(view.graph, view.backing.get(), &view.locals[0], view.run, 0, &progress)
+    );
     EXPECT_TRUE(progress);
     EXPECT_GT(view.completed(), 0);
     EXPECT_LE(view.completed(), SCHEDULER_CONTROL_NODE_BUDGET);
@@ -1035,14 +1041,14 @@ TEST(HbgNativeGraphPlan, IndependentControlsRespectEachServiceBudget) {
     for (uint32_t worker = 0; worker < workers.size(); ++worker)
         workers[worker] = std::thread([&, worker] {
             bool advanced = false;
-            EXPECT_TRUE(
-                scheduler_service_controls(view.graph, view.backing.get(), &view.locals[worker], view.run, 0, &advanced)
-            );
+            EXPECT_TRUE(scheduler_progress_graph_controls(
+                view.graph, view.backing.get(), &view.locals[worker], view.run, 0, &advanced
+            ));
             EXPECT_TRUE(advanced);  // Every worker must actually contribute, not just observe the final sum.
             first_reports.fetch_add(1, std::memory_order_release);
             while (first_reports.load(std::memory_order_acquire) != workers.size()) {}
             for (uint32_t step = 0; step < 128 && view.completed() < view.graph.task_count; ++step)
-                ASSERT_TRUE(scheduler_service_controls(
+                ASSERT_TRUE(scheduler_progress_graph_controls(
                     view.graph, view.backing.get(), &view.locals[worker], view.run, 0, &advanced
                 ));
         });
@@ -1345,7 +1351,7 @@ struct NativeMixFixture : NativeViewFixture {
     }
     bool publish() {
         bool progress = false;
-        return scheduler_cluster_mix_progress_pending(graph, backing.get(), &locals[1], run, &progress);
+        return scheduler_progress_mix_publication(graph, backing.get(), &locals[1], run, &progress);
     }
 };
 }  // namespace
@@ -1360,20 +1366,20 @@ TEST(HbgNativeGraphPlan, HostArgumentsRemainBoundWhileMixWaitsForGraphEnterAndPa
     ASSERT_TRUE(view.discover());
     EXPECT_EQ(view.locals[1].cluster_pending.task_ref, SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(control->next_block, 0u);
-    EXPECT_EQ(view.signals[0].armed_generation, 0u);
+    EXPECT_EQ(view.signals[0].groups[0].armed_generation, 0u);
     complete_native_entry(view);
     view.bound.scalar = 999;
     ASSERT_TRUE(view.discover());
     ASSERT_EQ(view.locals[1].cluster_pending.task_ref, view.child());
     ASSERT_TRUE(view.publish());
-    ASSERT_EQ(view.signals[0].task_ref, view.child());
+    ASSERT_EQ(view.signals[0].groups[0].task_ref, view.child());
     const auto &plan = view.plan.definitions[0].children[0];
     const auto *scalars = reinterpret_cast<const uint64_t *>(view.bound.instance->args_base + plan.scalars_offset);
     for (uint32_t pass = 0; pass < 2; ++pass) {
         bool progress = false;
         ASSERT_TRUE(scheduler_cluster_mix_service(view.graph, base, &view.locals[1], view.run, 0, &progress));
         EXPECT_EQ(scalars[0], 71u);
-        EXPECT_NE(view.locals[1].cluster_mix.phase, SchedulerGmMixPhase::RUNNING);
+        EXPECT_NE(view.locals[1].mix_groups[0].phase, SchedulerGmMixPhase::RUNNING);
     }
 }
 
@@ -1386,7 +1392,7 @@ TEST(HbgNativeGraphPlan, HostBindingRejectsInvalidArgumentsBeforeDevicePublicati
     const auto *control = scheduler_task_control_at(view.backing.get(), &view.locals[1], view.child());
     EXPECT_EQ(control->next_block, 0u);
     EXPECT_EQ(control->claim_seal, 0u);
-    EXPECT_EQ(view.signals[0].armed_generation, 0u);
+    EXPECT_EQ(view.signals[0].groups[0].armed_generation, 0u);
 }
 
 TEST(HbgNativeGraphPlan, NativeMixDistributesOnlyTheActualChildLanes) {
@@ -1397,7 +1403,7 @@ TEST(HbgNativeGraphPlan, NativeMixDistributesOnlyTheActualChildLanes) {
         complete_native_entry(view);
         ASSERT_TRUE(view.discover());
         ASSERT_TRUE(view.publish());
-        ASSERT_EQ(view.signals[0].active_mask, mask.raw());
+        ASSERT_EQ(view.signals[0].groups[0].active_mask, mask.raw());
         for (uint32_t unit = 0; unit < 3; ++unit)
             for (uint32_t lane = 0; lane < 3; ++lane) {
                 bool progress = false;
@@ -1412,9 +1418,9 @@ TEST(HbgNativeGraphPlan, NativeMixDistributesOnlyTheActualChildLanes) {
             if (participates) {
                 EXPECT_EQ(owned.task_ref, view.child());
                 EXPECT_EQ(owned.subtask_slot, lane);
-                EXPECT_EQ(view.signals[0].arrived[lane], view.signals[0].armed_generation);
+                EXPECT_EQ(view.signals[0].groups[0].arrived[lane], view.signals[0].groups[0].armed_generation);
             } else {
-                EXPECT_EQ(view.signals[0].arrived[lane], 0u);
+                EXPECT_EQ(view.signals[0].groups[0].arrived[lane], 0u);
             }
         }
         EXPECT_EQ(view.run->scheduler_error, 0u);
