@@ -114,6 +114,8 @@ struct NativeRunContext {
     // The synchronous output reader is not repeated after it has returned.
     bool detached_submission_requested{false};
     bool external_submission{false};
+    bool caller_owns_submission{false};
+    bool caller_submission_args_supported{false};
     bool copyback_returned{false};
     bool failure_reported{false};
     int copyback_rc{0};

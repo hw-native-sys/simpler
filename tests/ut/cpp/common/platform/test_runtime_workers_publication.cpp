@@ -33,10 +33,6 @@ struct RtsState {
     int copies = 0;
     int initialization_rc = 0;
     int initializations = 0;
-    int exchange_calls = 0;
-    int fail_exchange = 0;
-    bool recording = false;
-    aclmdlRICaptureMode mode = ACL_MODEL_RI_CAPTURE_MODE_GLOBAL;
     LaunchProgressSink sink;
     int allocations = 0;
     int frees = 0;
@@ -121,7 +117,6 @@ extern "C" rtError_t rtMemcpy(void *dst, uint64_t capacity, const void *src, uin
     ++rts.initializations;
     EXPECT_EQ(kind, RT_MEMCPY_HOST_TO_DEVICE);
     EXPECT_EQ(capacity, bytes);
-    if (rts.recording && rts.mode != ACL_MODEL_RI_CAPTURE_MODE_RELAXED) return -83;
     if (rts.initialization_rc != 0) return rts.initialization_rc;
     std::memcpy(dst, src, bytes);
     return 0;
@@ -140,11 +135,6 @@ extern "C" rtError_t rtStreamQuery(rtStream_t) { return 0; }
 extern "C" const char *aclGetRecentErrMsg() { return nullptr; }
 // These cases drive the publication step with the launch route refused, so the
 // permit never consults a live stream; the query only has to link.
-extern "C" aclError aclmdlRICaptureThreadExchangeMode(aclmdlRICaptureMode *mode) {
-    if (++rts.exchange_calls == rts.fail_exchange) return -84;
-    std::swap(rts.mode, *mode);
-    return 0;
-}
 extern "C" aclError aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus *status, aclmdlRI *) {
     if (status != nullptr) *status = ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
     return ACL_SUCCESS;
@@ -268,54 +258,6 @@ TEST_F(WorkersPublication, FailedReplayInitializationIsRetriedOnTheRetainedAlloc
     EXPECT_EQ(rts.allocations, 1);
     EXPECT_EQ(rts.initializations, 2);
     EXPECT_TRUE(device_workers_all(0u));
-}
-
-TEST_F(WorkersPublication, FreshCaptureBackingRestoresTheCallerModeBeforePublication) {
-    rts.recording = true;
-    rts.mode = ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL;
-    ASSERT_EQ(reserve_slot_runtime_args(runtime, allocator, slot, 0, RuntimeWorkerInit::DuringRecording), 0);
-    EXPECT_EQ(rts.mode, ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
-    EXPECT_EQ(rts.exchange_calls, 2);
-    EXPECT_EQ(rts.initializations, 1);
-    EXPECT_EQ(rts.copies, 0);
-    EXPECT_TRUE(device_workers_all(0u));
-    EXPECT_EQ(slot.runtime_args, nullptr);
-    const auto *gates = reinterpret_cast<const unsigned char *>(slot.shared_state->teardown_gates);
-    EXPECT_TRUE(std::all_of(gates, gates + sizeof(RuntimeSharedState::teardown_gates), [](unsigned char byte) {
-        return byte == kDeviceMark;
-    }));
-    ASSERT_EQ(prepare_replayable(), 0);
-    ASSERT_EQ(helper.publish_runtime_args(true, this, rts.sink, true), 0);
-    EXPECT_EQ(rts.copies, 0);
-    EXPECT_EQ(rts.exchange_calls, 2);
-}
-
-TEST_F(WorkersPublication, CaptureInitializationDoesNotCommitWhenExchangeOrCopyFails) {
-    rts.recording = true;
-    rts.fail_exchange = 1;
-    EXPECT_EQ(reserve_slot_runtime_args(runtime, allocator, slot, 0, RuntimeWorkerInit::DuringRecording), -84);
-    auto *const allocation = slot.shared_state;
-    ASSERT_NE(allocation, nullptr);
-    EXPECT_EQ(rts.initializations, 0);
-    EXPECT_FALSE(slot.workers_initialized);
-    EXPECT_EQ(rts.mode, ACL_MODEL_RI_CAPTURE_MODE_GLOBAL);
-
-    rts.initialization_rc = -82;
-    EXPECT_EQ(reserve_slot_runtime_args(runtime, allocator, slot, 0, RuntimeWorkerInit::DuringRecording), -82);
-    EXPECT_EQ(rts.mode, ACL_MODEL_RI_CAPTURE_MODE_GLOBAL);
-    EXPECT_FALSE(slot.workers_initialized);
-    EXPECT_EQ(rts.exchange_calls, 3);
-
-    rts.initialization_rc = 0;
-    rts.fail_exchange = 5;
-    int restore_error = 0;
-    EXPECT_EQ(
-        reserve_slot_runtime_args(runtime, allocator, slot, 0, RuntimeWorkerInit::DuringRecording, &restore_error), -84
-    );
-    EXPECT_EQ(restore_error, -84);
-    EXPECT_FALSE(slot.workers_initialized);
-    EXPECT_EQ(slot.shared_state, allocation);
-    EXPECT_EQ(rts.copies, 0);
 }
 
 TEST_F(WorkersPublication, FailedDeviceFreeRetainsTrimHistoryUntilAllocationEnds) {

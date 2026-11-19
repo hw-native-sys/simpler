@@ -18,13 +18,13 @@ There is no separate capture executor or prepared-call cache.
 
 The native interfaces are declared in
 [`runtime_c_api.h`](../../src/common/worker/runtime_c_api.h).
-Capture is exposed through these native C interfaces; the Python Worker and
-ChipWorker interfaces continue to submit eager runs.
+The Python framework adapter also uses these interfaces. Its model ticket
+holds the original run and the caller's tensor owners until model destruction.
 The common API shape does not establish capture support for every backend.
 
 ## Preparation and eligibility
 
-Use `simpler_prepare_run` outside capture with a `NativeRunDescriptor`:
+The native caller supplies a `NativeRunDescriptor` to `simpler_prepare_run`.
 
 | `prepare_purpose` | Contract |
 | ----------------- | -------- |
@@ -50,6 +50,18 @@ must already supply a valid borrowed execution environment. Resource allocation
 is separate from starting user tasks.
 
 ## Recording and replay
+
+The framework queue registers a model-destroy callback before enqueueing its
+first native node. Further nodes in the same model can use that registration.
+The registration identifies the model and owns no native execution slot.
+When the queue invokes the node, the framework uses ordinary Kernel prepare
+and calls `simpler_submit_run_on_stream` on the caller stream. A successful submission returns the slot
+for another node and leaves the original run with the ticket. The recorded
+tasks can execute zero or more times. After the caller ends all model uses,
+checked cleanup finalizes the original run and releases its tensor owners.
+The destroy callback itself only records the notification. When a live run still owns the previous
+slot backing, prepare initializes the replacement worker reports once on a
+private stream. Replay preserves the worker reports written by the device.
 
 A diagnostic-free Kernel caller can keep its ordinary run alive for the model's lifetime. The same launch entry submits to an eager stream or a recording stream.
 

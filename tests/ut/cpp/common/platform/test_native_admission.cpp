@@ -2035,7 +2035,9 @@ TEST_F(NativeAdmissionTest, CaptureColdPreparationsKeepTheirOwnersAndExclusiveEx
     EXPECT_EQ(runner.reservations(), 2u);
     EXPECT_EQ(runner.native_run_claim_count(), 0u);
     EXPECT_EQ(control().d2h_calls, 0u);
-    EXPECT_TRUE(control().observed_streams.empty());
+    const auto control_stream = runner.kernel_execution_state().hidden_stream(KernelStreamKind::Aicpu);
+    for (void *stream : control().observed_streams)
+        EXPECT_EQ(stream, control_stream);
     for (size_t i = 0; i != backing.size(); ++i) {
         if (backing[i] != nullptr) EXPECT_EQ(std::memcmp(original[i].data(), backing[i], original[i].size()), 0);
     }
@@ -4353,9 +4355,7 @@ class ColdKernelRunner : public PmuCaptureRunner {
 public:
     int reserve_metadata(uint32_t slot, size_t bytes) {
         Runtime runtime;
-        return reserve_slot_runtime_args(
-            runtime, mem_alloc_, slot_persistent_args(slot), bytes, RuntimeWorkerInit::BeforeRecording
-        );
+        return reserve_slot_runtime_args(runtime, mem_alloc_, slot_persistent_args(slot), bytes, /*launch_owned=*/true);
     }
     ColdKernelRunner() {
         device_id_ = -1;
@@ -4673,7 +4673,7 @@ TEST_F(NativeAdmissionTest, FiveRecordedGenerationsKeepTheirRtsSnapshotsUntilEve
             (void)simpler_finalize_run(&runner, attempt.storage);
         });
         ASSERT_EQ(attempt.prepare(), 0) << index;
-        EXPECT_EQ(control().capture_mode_exchanges, index < 2 ? 0u : 2u * (index - 1)) << index;
+        EXPECT_EQ(control().capture_mode_exchanges, 0u) << index;
         const auto *state = static_cast<const NativeRunContext<DeviceRunnerBase> *>(attempt.storage);
         EXPECT_EQ(state->prepared_execution->kernel_args.args.run_result_data_base, 0u) << index;
         EXPECT_EQ(state->prepared_execution->kernel_args.args.run_result_epoch, attempt.descriptor.run_epoch);
@@ -4710,7 +4710,7 @@ TEST_F(NativeAdmissionTest, FiveRecordedGenerationsKeepTheirRtsSnapshotsUntilEve
     cleanup.dismiss();
 }
 
-TEST_F(NativeAdmissionTest, CaptureModeRestoreFailureRefusesAnAlreadyPreparedPeer) {
+TEST_F(NativeAdmissionTest, PrivateWorkerInitializationFailureLeavesThePreparedPeerUsable) {
     ColdKernelRunner runner;
     ASSERT_EQ(initialize_cold_kernel_runner(runner, 2), 0);
     ASSERT_EQ(runner.kernel_execution_state().mark_ready_enqueued(), 0);
@@ -4723,10 +4723,7 @@ TEST_F(NativeAdmissionTest, CaptureModeRestoreFailureRefusesAnAlreadyPreparedPee
     RuntimeHandle peer_reference = nullptr;
     auto cleanup = RAIIScopeGuard([&] {
         control().recording_active = false;
-        if (control().capture_mode_exchanges >= 2) {
-            auto mode = ACL_MODEL_RI_CAPTURE_MODE_GLOBAL;
-            (void)aclmdlRICaptureThreadExchangeMode(&mode);
-        }
+        control().stream_sync_rc = 0;
         (void)simpler_finalize_run(&runner, old.storage);
         (void)simpler_finalize_run(&runner, peer.storage);
         (void)simpler_finalize_run(&runner, replacement.storage);
@@ -4740,18 +4737,14 @@ TEST_F(NativeAdmissionTest, CaptureModeRestoreFailureRefusesAnAlreadyPreparedPee
     ASSERT_EQ(simpler_finalize_run(&runner, old.storage), 0);
     ASSERT_EQ(peer.prepare(), 0);
     ASSERT_EQ(simpler_retain_run_resources(&runner, peer.storage, &caller, &peer_reference), 0);
-    control().fail_capture_mode_exchange = control().capture_mode_exchanges + 2;
+    control().stream_sync_rc = -872;
     ASSERT_EQ(replacement.prepare(), -872);
     ASSERT_TRUE(replacement.consume_release());
-    ASSERT_EQ(runner.kernel_execution_state().phase(), KernelContextPhase::Poisoned);
-    const size_t publications = control().uploads.size();
-    EXPECT_EQ(simpler_launch_run_on_stream(&runner, peer.storage, &caller, nullptr), PTO_RUNTIME_ERR_INVALID_STATE);
-    EXPECT_EQ(control().uploads.size(), publications);
+    control().stream_sync_rc = 0;
+    EXPECT_EQ(control().capture_mode_exchanges, 0u);
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, peer.storage, &caller, nullptr), 0);
     control().recording_active = false;
-    auto mode = ACL_MODEL_RI_CAPTURE_MODE_GLOBAL;
-    ASSERT_EQ(aclmdlRICaptureThreadExchangeMode(&mode), 0);
     ASSERT_EQ(simpler_finalize_run(&runner, peer.storage), 0);
-    EXPECT_TRUE(peer.consume_release());
     ASSERT_EQ(simpler_release_run_resources(&runner, peer_reference), 0);
     peer_reference = nullptr;
     ASSERT_EQ(simpler_release_run_resources(&runner, old_reference), 0);

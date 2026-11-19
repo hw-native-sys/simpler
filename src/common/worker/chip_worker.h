@@ -58,30 +58,8 @@ struct ChipWorkerNativeRun {
 };
 
 class ChipWorker;
-class ChipRun;
 class NativeSubmissionState;
 class CallArgumentSnapshot;
-
-// A checked reference to the existing runtime's preparation backing, not an
-// executable run or a model owner. Its caller serializes release, after all
-// external uses stop and cancellation/model destruction is established.
-class ChipRunResources {
-public:
-    ~ChipRunResources() noexcept;
-    ChipRunResources(const ChipRunResources &) = delete;
-    ChipRunResources &operator=(const ChipRunResources &) = delete;
-
-    // Failure retains the reference and its native owner for a later retry.
-    void release();
-
-private:
-    friend class ChipWorker;
-    friend class NativeSubmissionState;
-    bool has_reference() const noexcept;
-    struct Backing;
-    explicit ChipRunResources(std::shared_ptr<ChipWorker> owner, const ChipRun *observation);
-    std::unique_ptr<Backing> backing_;
-};
 
 class ChipRun;
 class ChipRunLane;
@@ -228,8 +206,7 @@ public:
     ChipWorkerNativeRun prepare_native_run(
         int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
         uint64_t run_id = 0, uint64_t dispatch_id = 0, volatile int32_t *accepted_state = nullptr,
-        int32_t accepted_value = 0, NativeRunProvenance provenance = {},
-        NativeRunPreparePurpose purpose = SIMPLER_PREPARE_EAGER
+        int32_t accepted_value = 0, NativeRunProvenance provenance = {}
     );
     /**
      * What a launch attempt did, for the one outcome that is not a failure.
@@ -264,10 +241,6 @@ public:
     bool poll_native_run(const ChipWorkerNativeRun &run);
     void wait_native_run(const ChipWorkerNativeRun &run);
     void finalize_native_run(const ChipWorkerNativeRun &run);
-
-    // Acquire before emission from a Prepared run. The original carrier still
-    // owes finalize; this reference pins native backing beyond that boundary.
-    std::unique_ptr<ChipRunResources> retain_native_run_resources(const ChipWorkerNativeRun &run, void *caller_stream);
 
     /**
      * Run #2267's late-read retention fixture over a launched predecessor and a
@@ -337,8 +310,13 @@ public:
     ChipRun submit_chip_run(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
         volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0, void *caller_stream = nullptr,
-        NativeRunPreparePurpose purpose = SIMPLER_PREPARE_EAGER, ChipRun *prepared_out = nullptr,
-        bool framework_owned = false
+        ChipRun *prepared_out = nullptr, bool framework_owned = false
+    );
+    // Keep out and the stream through the last execution, including when
+    // submission fails after preparation. Then call out.finalize_after_last_use().
+    void submit_caller_owned_run(
+        int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, void *caller_stream,
+        ChipRun &out
     );
     // The owner retains this worker, callable, storage and stream through
     // consumption and safe retirement; preparation does not launch device work.
@@ -786,6 +764,8 @@ private:
     AclCaptureInfoFn acl_capture_info_fn_ = nullptr;
     AclModelDestroyRegisterFn acl_model_destroy_register_fn_ = nullptr;
     CallerStreamLaunchFn launch_run_on_stream_fn_ = nullptr;
+    using CallerStreamSubmitFn = decltype(&simpler_submit_run_on_stream);
+    CallerStreamSubmitFn submit_run_on_stream_fn_ = nullptr;
     SimplerJoinedLaunchFn launch_run_joined_fn_ = nullptr;
     SimplerNativeRunFn poll_run_fn_ = nullptr;
     SimplerNativeRunFn wait_run_fn_ = nullptr;
@@ -793,10 +773,6 @@ private:
     SimplerFinalizeRunFn finalize_run_fn_ = nullptr;
     SimplerNativeRunFn transfer_completed_run_fn_ = nullptr;
     ObserveFrameworkSubmissionsFn observe_framework_submissions_fn_ = nullptr;
-    using RetainRunResourcesFn = decltype(&simpler_retain_run_resources);
-    using ReleaseRunResourcesFn = decltype(&simpler_release_run_resources);
-    RetainRunResourcesFn retain_run_resources_fn_ = nullptr;
-    ReleaseRunResourcesFn release_run_resources_fn_ = nullptr;
     SimplerProbeRunRetentionFn probe_run_retention_fn_ = nullptr;
     GetTeardownReportFn get_teardown_report_fn_ = nullptr;
     // The first captured teardown observation, kept by value so it outlives
@@ -916,7 +892,7 @@ private:
     uint32_t resource_bank_for_slot(uint32_t kind, uint32_t slot_id) const;
     RegionBanks region_banks_for_slot(uint32_t slot_id) const;
 
-    enum class NativeRunPhase : uint8_t { EMPTY, PREPARING, PREPARED, LAUNCHED, REAPED, FINALIZING };
+    enum class NativeRunPhase : uint8_t { EMPTY, PREPARING, PREPARED, LAUNCHED, REAPED, CALLER_SUBMITTED, FINALIZING };
     class PreparedRunIncompatible : public std::runtime_error {
     public:
         using std::runtime_error::runtime_error;
@@ -993,9 +969,7 @@ private:
         int pending_rc{0};
         bool pending_rc_set{false};
         bool result_observed{false};
-        bool detached_submission_requested{false};
         bool permits_prepared_successor{false};
-        NativeRunPreparePurpose prepare_purpose{SIMPLER_PREPARE_EAGER};
     };
     /** What the storage tag says after a finalize that reached the C entry. */
     enum class RunStorageTag : uint8_t { Destroyed, Canonical, Noncanonical };
@@ -1008,22 +982,21 @@ private:
         Finalize,
         Probe,
         Predecessor,
-        ProbeSuccessor,
-        RetainResources
+        ProbeSuccessor
     };
     /** Why a lease was refused, or that the run had already completed. */
     enum class NativeRunLease : uint8_t { Acquired, AlreadyComplete, Absent, Stale, Reserved, Busy };
     ChipWorkerNativeRun prepare_native_run_on_slot(
         int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, uint32_t slot_id,
         uint64_t generation, uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state,
-        int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance,
-        NativeRunPreparePurpose purpose = SIMPLER_PREPARE_EAGER
+        int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance
     );
     ChipWorkerNativeRun prepare_native_run_for_lane(
         int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
         uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value,
-        bool pipeline_leased, NativeRunProvenance provenance, NativeRunPreparePurpose purpose = SIMPLER_PREPARE_EAGER
+        bool pipeline_leased, NativeRunProvenance provenance
     );
+    void submit_native_run_to_caller(const ChipWorkerNativeRun &run, void *caller_stream);
     void wait_native_run_completion(const ChipWorkerNativeRun &run);
     void cleanup_native_runs_noexcept() noexcept;
     std::exception_ptr stop_and_cleanup_native_runs();
@@ -1045,13 +1018,9 @@ private:
     void capture_teardown_report_noexcept() noexcept;
 
     friend struct ChipRunLaneState;
+    friend class ChipRunLane;
     friend class ChipRun;
     friend class NativeSubmissionState;
-    void retain_native_run_resources_impl(
-        const ChipWorkerNativeRun &run, void *caller_stream, const ChipRun *observation,
-        std::unique_ptr<ChipRunResources> &resources
-    );
-
     // One reusable idle carrier per slot, with opaque runtime size/alignment.
     // A live call moves its carrier into NativeRunEntry until finalize; slot
     // reuse can allocate another while an old observation remains live.
@@ -1064,10 +1033,6 @@ private:
      * correctness rests on every re-entry re-looking-up by epoch rather than on that.
      */
     std::unordered_map<uint64_t, std::unique_ptr<NativeRunEntry>> native_runs_;
-    // Includes a retain call in flight. Only checked release or a refused
-    // retain without an output reference can discharge this obligation.
-    size_t native_resource_references_{0};
-    friend class ChipRunResources;
     mutable std::mutex native_run_mu_;
     bool native_runs_closing_{false};
     /**

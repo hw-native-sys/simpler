@@ -290,6 +290,16 @@ int LoadAicpuOp::LaunchBuiltInOp(
 }
 }  // namespace host
 
+int initialize_private_workers(void *stream, void *workers, size_t bytes, int timeout_ms, bool &pending) {
+    if (!pending) {
+        std::memset(workers, 0, bytes);
+        pending = true;
+    }
+    const int rc = aclrtSynchronizeStreamWithTimeout(stream, timeout_ms);
+    if (rc == 0) pending = false;
+    return rc;
+}
+
 KernelContextOps make_onboard_kernel_context_ops() {
     return {
         nullptr,

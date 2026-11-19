@@ -573,6 +573,17 @@ public:
         return b->bytes;
     }
 
+    // Slot reuse can precede execution. Keep this run's facts addressable by epoch.
+    bool preserve_run_record(uint32_t slot, uint64_t epoch) {
+        std::scoped_lock lk(mu_);
+        if (!enabled_) return true;
+        if (slot >= runs_.size()) return false;
+        RunRecord record{};
+        if (runs_[slot].epoch == epoch) record = runs_[slot];
+        record.epoch = epoch;
+        return observation_runs_.emplace(epoch, record).second;
+    }
+
     /** End execution references while preserving the call's host IO reader. */
     bool retire_execution(uint32_t slot, uint64_t run_epoch) {
         std::scoped_lock lk(mu_);

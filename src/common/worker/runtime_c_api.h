@@ -1210,6 +1210,12 @@ int simpler_launch_run_on_stream(
     DeviceContextHandle ctx, RuntimeHandle runtime, void *caller_stream, RuntimeHandle predecessor
 );
 
+/** Submit a diagnostic-free Kernel run whose caller keeps the original handle and
+ * device inputs through its last use. Success releases its submission slot.
+ * Finalize after all uses end, including work on other streams. A failed
+ * submission still requires finalization. Writable host outputs are unsupported. */
+int simpler_submit_run_on_stream(DeviceContextHandle ctx, RuntimeHandle runtime, void *caller_stream);
+
 /**
  * Return nonzero when this context can order one prepared run's native
  * submission behind another run that is already executing.

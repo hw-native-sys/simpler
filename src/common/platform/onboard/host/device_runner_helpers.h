@@ -174,8 +174,9 @@ struct SlotPersistentArgs {
     Runtime *runtime_args{nullptr};  // Program descriptor; Kernel descriptors belong to RTS
     uint64_t runtime_bytes{0};       // committed length: the full device extent, not a published prefix
 
-    // Initialization belongs to this shared-state allocation and precedes recording.
+    // Initialization precedes use and never overwrites a live core report.
     bool workers_initialized{false};
+    bool worker_initialization_pending{false};
     EntryCacheQualification entry_cache_qualification;
     // Survives failed submissions and failed frees of this allocation.
     bool entry_cmo_may_have_trimmed{false};
@@ -474,8 +475,6 @@ int publish_for_launch(
     bool kernel_mode = false
 );
 
-enum class RuntimeWorkerInit { OnPublication, BeforeRecording, DuringRecording };
-
 /**
  * Reserve shared worker state and initialize its reports once. Program also
  * reserves a device descriptor; Kernel descriptors live in RTS launch arguments.
@@ -485,7 +484,7 @@ enum class RuntimeWorkerInit { OnPublication, BeforeRecording, DuringRecording }
  */
 int reserve_slot_runtime_args(
     const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot, uint64_t metadata_bytes,
-    RuntimeWorkerInit worker_init = RuntimeWorkerInit::OnPublication, int *capture_mode_restore_error = nullptr
+    bool launch_owned = false
 );
 
 /**

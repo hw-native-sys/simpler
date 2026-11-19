@@ -648,6 +648,8 @@ bool DeviceRunnerBase::retire_caller_buffer_carrier(const void *owner, const Nat
             return entry.owner == owner && entry.identity == identity && identity.run_epoch != 0;
         });
     if (reserved == native_run_reservations_.end()) return false;
+    // Ordinary lane reservations leave slot borrows with their caller.
+    if (!reserved->independent_preparation) return true;
     std::lock_guard<std::mutex> storage_lock(prepared_storage_mutex_);
     for (const auto &[key, reference] : external_run_references_) {
         if (reference->identity == identity) caller_device_buffers_.detach_reference(key);
@@ -2237,9 +2239,7 @@ int DeviceRunnerBase::init_kernel_context(int device_id) {
     // Reserve the slot capacity before recording. The first prepare initializes
     // its private worker state and owns any initialization failure.
     for (auto &storage : submission_storage_) {
-        rc = reserve_slot_runtime_args(
-            kernel_runtime_, mem_alloc_, storage->args, 0, RuntimeWorkerInit::BeforeRecording
-        );
+        rc = reserve_slot_runtime_args(kernel_runtime_, mem_alloc_, storage->args, 0, /*launch_owned=*/true);
         if (rc != 0) return rc;
     }
     return 0;
@@ -3148,7 +3148,7 @@ extern "C" int bind_callable_to_runtime_impl(
     const uint64_t *ring_dep_pool
 );
 
-int DeviceRunnerBase::validate_capture_prepare_args(int32_t callable_id, const void *args) const {
+int DeviceRunnerBase::validate_caller_submission_args(int32_t callable_id, const void *args) const {
     if (args == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     const auto found = callables_.find(callable_id);
     if (found == callables_.end()) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
@@ -3160,7 +3160,6 @@ int DeviceRunnerBase::validate_capture_prepare_args(int32_t callable_id, const v
         const auto &tensor = call.tensor(i);
         if (tensor.address_space == AddressSpace::HOST && tensor.transfer == TensorTransfer::NONE &&
             signature[i] != ArgDirection::IN) {
-            LOG_ERROR("capture preparation: HOST/NONE argument %d must be read-only", i);
             return PTO_RUNTIME_ERR_UNSUPPORTED;
         }
     }
@@ -4267,6 +4266,51 @@ bool DeviceRunnerBase::capture_diagnostics_supported(const PreparedExecution &pr
            prepared.scope_stats_capacity.complete() && dfx.scope_stats_enabled;
 }
 
+int DeviceRunnerBase::prepare_caller_submission(void *owner, PreparedExecution &prepared) {
+    if (!execution_mode_latch().is_kernel() || prepared.dfx.diagnostics_any()) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    if (!prepared.prepared_resources || !prepared.streams.ready()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    const int rc = prepare_submission_resources(prepared);
+    if (rc != 0) return rc;
+    if (!caller_device_buffers_.retain_reference(owner, static_cast<uint64_t>(prepared.pipeline_slot) + 1))
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    try {
+        if (!workspace_.preserve_run_record(prepared.pipeline_slot, prepared.identity.run_epoch)) {
+            caller_device_buffers_.release_reference(owner, false);
+            return PTO_RUNTIME_ERR_INVALID_STATE;
+        }
+    } catch (...) {
+        caller_device_buffers_.release_reference(owner, false);
+        throw;
+    }
+    prepared.external_submission = true;
+    prepared.prepared_resources->submission_->args.published_prefix_bytes = 0;
+    prebuilt_runtime_arena_cache_.invalidate();
+    return 0;
+}
+
+void DeviceRunnerBase::yield_caller_submission(void *owner, const NativeRunIdentity &identity) {
+    caller_device_buffers_.detach_reference(owner);
+    caller_device_buffers_.release(static_cast<uint64_t>(identity.pipeline_slot) + 1, false);
+    release_device_run_timing(identity.pipeline_slot);
+    release_native_run(owner);
+    release_native_run_reservation(owner);
+}
+
+int DeviceRunnerBase::finish_caller_submission(ActiveExecution &active) {
+    const auto &prepared = *active.prepared;
+    const int rc =
+        active.progress == LaunchProgress::Partial ?
+            sync_stream_pair(prepared.streams.aicpu, prepared.streams.aicore) :
+            aclrtSynchronizeStreamWithTimeout(prepared.caller_stream, timeout_config_.stream_sync_timeout_ms);
+    if (rc != 0) return rc;
+    auto &storage = *prepared.prepared_resources->submission_;
+    int retire_rc = storage.caller_order->end_external_use(prepared.identity);
+    if (retire_rc == 0) retire_rc = storage.caller_order->retire(prepared.identity);
+    if (retire_rc == 0) retire_rc = storage.fence->retire(prepared.identity);
+    if (retire_rc == 0) note_prepared_waits_consumed(prepared.identity);
+    return retire_rc;
+}
+
 int DeviceRunnerBase::admit_external_submission(PreparedExecution &prepared) {
     if (!execution_mode_latch().is_kernel() || !capture_diagnostics_supported(prepared) ||
         prepared.join.predecessor_owner != nullptr)
@@ -4825,9 +4869,7 @@ std::shared_ptr<PreparedSubmissionStorage> DeviceRunnerBase::make_submission_sto
     return storage;
 }
 
-int DeviceRunnerBase::prepare_run_storage(uint32_t slot, bool capture_preparation) {
-    // Called after slot reservation and context attachment, before any bind or
-    // prepare writes. Eager reuse keeps the cache when no old preparation owns it.
+int DeviceRunnerBase::prepare_run_storage(uint32_t slot) {
     std::shared_ptr<PreparedSubmissionStorage> backing;
     {
         std::lock_guard<std::mutex> lock(prepared_storage_mutex_);
@@ -4839,20 +4881,36 @@ int DeviceRunnerBase::prepare_run_storage(uint32_t slot, bool capture_preparatio
             retired_submission_storage_.push_back(current);
             current = std::move(next);
         }
-        if (!capture_preparation || current->args.workers_initialized) return 0;
         backing = current;
     }
-    // The exact slot reservation still excludes another writer after the lock
-    // is released. On failure the new backing stays owned for cleanup or retry.
-    int restore_error = 0;
-    const int rc = reserve_slot_runtime_args(
-        kernel_runtime_, mem_alloc_, backing->args, 0, RuntimeWorkerInit::DuringRecording, &restore_error
+    auto &args = backing->args;
+    if (!execution_mode_latch().is_kernel() || args.workers_initialized) return 0;
+    if (args.shared_state == nullptr) {
+        args.shared_state = static_cast<RuntimeSharedState *>(mem_alloc_.alloc(sizeof(RuntimeSharedState)));
+        if (args.shared_state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    // Initialize once on the registration stream. This allocation's first use
+    // can occur long after context initialization, while prior runs still own
+    // every preallocated generation. Runtime constructors zero the workers array
+    // on all backends. Its reports belong to the cores after initialization.
+    auto stream = kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu);
+    const int rc = initialize_private_workers(
+        stream, args.shared_state, sizeof(RuntimeSharedState::workers), timeout_config_.stream_sync_timeout_ms,
+        args.worker_initialization_pending
     );
-    if (restore_error != 0) kernel_execution_state().poison(restore_error);
+    if (rc == 0) args.workers_initialized = true;
     return rc;
 }
 
 int DeviceRunnerBase::release_submission_storage(PreparedSubmissionStorage &storage, bool abandon) {
+    if (!abandon && storage.args.worker_initialization_pending) {
+        const int rc = initialize_private_workers(
+            kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu), storage.args.shared_state,
+            sizeof(RuntimeSharedState::workers), timeout_config_.stream_sync_timeout_ms,
+            storage.args.worker_initialization_pending
+        );
+        if (rc != 0) return rc;
+    }
     if (abandon) {
         storage.caller_order->abandon();
         storage.fence->abandon();
@@ -6359,7 +6417,7 @@ size_t DeviceRunnerBase::native_run_claim_count() const {
 
 bool DeviceRunnerBase::try_reserve_native_run(
     const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, bool allow_prepared_successor,
-    bool capture_preparation, const NativeRunIdentity &identity
+    bool independent_preparation, const NativeRunIdentity &identity
 ) {
     if (owner == nullptr || pipeline_slot >= granted_run_resource_sets_ || arena_bank >= granted_run_resource_sets_) {
         return false;
@@ -6372,11 +6430,11 @@ bool DeviceRunnerBase::try_reserve_native_run(
             return false;
         }
         const bool holds_claim = native_run_claim_index(reservation.owner) < active_native_run_count_;
-        if (capture_preparation || reservation.capture_preparation) {
+        if (independent_preparation || reservation.independent_preparation) {
             // A completed node has retained its backing before another bind may
             // detach it. An unfinished prepare still owns shared arena/config
             // mutation until publication succeeds or cleanup removes its reservation.
-            if (!capture_preparation || !reservation.capture_preparation || holds_claim ||
+            if (!independent_preparation || !reservation.independent_preparation || holds_claim ||
                 reservation.preparation_state != NativeRunPreparationState::Prepared)
                 return false;
         } else if (!allow_prepared_successor || !reservation.permits_prepared_successor || !holds_claim) {
@@ -6387,8 +6445,9 @@ bool DeviceRunnerBase::try_reserve_native_run(
     for (NativeRunReservation &reservation : native_run_reservations_) {
         if (reservation.owner == nullptr) {
             native_run_observations_.insert(NativeRunObservation{NativeRunObservation::Kind::RunOwner, owner, {}});
-            reservation =
-                NativeRunReservation{owner, pipeline_slot, arena_bank, allow_prepared_successor, capture_preparation};
+            reservation = NativeRunReservation{
+                owner, pipeline_slot, arena_bank, allow_prepared_successor, independent_preparation
+            };
             reservation.identity = identity;
             reservation.identity.pipeline_slot = pipeline_slot;
             return true;

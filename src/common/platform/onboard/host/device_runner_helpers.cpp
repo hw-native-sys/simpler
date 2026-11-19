@@ -122,10 +122,8 @@ int publish_for_launch(
 
 int reserve_slot_runtime_args(
     const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot, uint64_t metadata_bytes,
-    RuntimeWorkerInit worker_init, int *capture_mode_restore_error
+    bool launch_owned
 ) {
-    if (capture_mode_restore_error != nullptr) *capture_mode_restore_error = 0;
-    const bool launch_owned = worker_init != RuntimeWorkerInit::OnPublication;
     const uint64_t runtime_extent = launch_owned ? 0 : runtime_device_extent_size(host_runtime);
     if (slot.runtime_args != nullptr && slot.runtime_bytes != runtime_extent) return PTO_RUNTIME_ERR_INVALID_STATE;
     if (slot.shared_state == nullptr) {
@@ -134,24 +132,11 @@ int reserve_slot_runtime_args(
         slot.workers_initialized = false;
     }
     if (!slot.workers_initialized) {
-        const bool recording = worker_init == RuntimeWorkerInit::DuringRecording;
-        aclmdlRICaptureMode previous_mode = ACL_MODEL_RI_CAPTURE_MODE_RELAXED;
-        if (recording) {
-            const int rc = aclmdlRICaptureThreadExchangeMode(&previous_mode);
-            if (rc != 0) return rc;
-        }
         // Only the host-initialized handshake region is copied; AICPU owns gate initialization.
         const int copy_rc = rtMemcpy(
             slot.shared_state, sizeof(RuntimeSharedState::workers), host_runtime.get_workers(),
             sizeof(RuntimeSharedState::workers), RT_MEMCPY_HOST_TO_DEVICE
         );
-        if (recording) {
-            const int restore_rc = aclmdlRICaptureThreadExchangeMode(&previous_mode);
-            if (restore_rc != 0) {
-                if (capture_mode_restore_error != nullptr) *capture_mode_restore_error = restore_rc;
-                return copy_rc != 0 ? copy_rc : restore_rc;
-            }
-        }
         if (copy_rc != 0) return copy_rc;
         slot.workers_initialized = true;
     }
@@ -201,10 +186,8 @@ int KernelArgsHelper::prepare_runtime_args(
 
     if (slot.runtime_args == nullptr) entry_cache_eligible_ = false;
     const bool launch_owned = kernel_mode || slot.staged_launch_metadata.has_execution_image();
-    const int reserve_rc = reserve_slot_runtime_args(
-        host_runtime, allocator, slot, slot.staged_launch_metadata.size(),
-        launch_owned ? RuntimeWorkerInit::BeforeRecording : RuntimeWorkerInit::OnPublication
-    );
+    const int reserve_rc =
+        reserve_slot_runtime_args(host_runtime, allocator, slot, slot.staged_launch_metadata.size(), launch_owned);
     if (reserve_rc != 0) return reserve_rc;
     const size_t publish_bytes = runtime_device_copy_size(host_runtime);
     runtime_image_.prepare(host_runtime, publish_bytes);

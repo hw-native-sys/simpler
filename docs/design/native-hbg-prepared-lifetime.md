@@ -45,6 +45,14 @@ Failed external release preserves the preparation and its heap lease for retry.
 Heap sharing does not apply to
 caller-owned persistent tensors, immutable images or retained diagnostic evidence.
 
+## Framework-owned runs
+
+A framework model ticket holds the submitted run directly. Prepare snapshots
+the execution image. The run owns the backing that the submission references
+while its pipeline slot can accept another run. A model destroy notification
+allows the framework to finalize each run after its last use. The same
+notification can serve multiple nodes in one model.
+
 ## Retaining a preparation
 
 Call the existing C interface before capture starts:

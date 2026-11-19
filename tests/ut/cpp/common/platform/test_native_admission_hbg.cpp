@@ -694,6 +694,65 @@ TEST_F(NativeAdmissionTest, RetainedRunSharesDeviceWorkspaceAcrossSlots) {
     reference = nullptr;
 }
 
+TEST_F(NativeAdmissionTest, CallerOwnedOrdinaryRunsReuseOneSlotBeforeEitherFinalize) {
+    HbgImageCaptureRunner runner;
+    ASSERT_EQ(runner.initialize_kernel(), 0);
+    Attempt first(runner, 0, 101810), second(runner, 0, 101811);
+    void *buffers[] = {runner.allocate_caller_buffer(64), runner.allocate_caller_buffer(64)};
+    int caller;
+    size_t index = 0;
+    for (Attempt *run : {&first, &second}) {
+        run->args.tensor(0).address_space = AddressSpace::DEVICE;
+        run->args.tensor(0).transfer = TensorTransfer::NONE;
+        ASSERT_NE(buffers[index], nullptr);
+        const CallerDeviceBuffers::Span span{reinterpret_cast<uint64_t>(buffers[index++]), 64};
+        ASSERT_TRUE(runner.borrow_caller_buffers(1, &span, 1));
+        ASSERT_EQ(run->prepare(), 0);
+        ASSERT_EQ(simpler_submit_run_on_stream(&runner, run->storage, &caller), 0);
+        EXPECT_EQ(runner.native_run_claim_count(), 0u);
+    }
+    auto *first_state = static_cast<NativeRunContext<DeviceRunnerBase> *>(first.storage);
+    auto *second_state = static_cast<NativeRunContext<DeviceRunnerBase> *>(second.storage);
+    std::weak_ptr<const PreparedRunResources> first_backing =
+        first_state->active_execution->prepared->prepared_resources;
+    std::weak_ptr<const PreparedRunResources> second_backing =
+        second_state->active_execution->prepared->prepared_resources;
+    control().stream_sync_rc = -4870;
+    EXPECT_EQ(simpler_finalize_run(&runner, first.storage), -4870);
+    EXPECT_FALSE(first_backing.expired());
+    EXPECT_EQ(runner.free_caller_buffer(buffers[0]), PTO_RUNTIME_ERR_INVALID_STATE);
+    control().stream_sync_rc = 0;
+    EXPECT_EQ(simpler_finalize_run(&runner, first.storage), 0);
+    EXPECT_TRUE(first_backing.expired());
+    EXPECT_EQ(runner.free_caller_buffer(buffers[0]), 0);
+    EXPECT_EQ(runner.free_caller_buffer(buffers[1]), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_FALSE(second_backing.expired());
+    EXPECT_EQ(simpler_finalize_run(&runner, second.storage), 0);
+    EXPECT_TRUE(second_backing.expired());
+    EXPECT_EQ(runner.free_caller_buffer(buffers[1]), 0);
+}
+
+TEST_F(NativeAdmissionTest, CallerOwnedPartialSubmissionRetainsItsClaimUntilBothStreamsDrain) {
+    HbgImageCaptureRunner runner;
+    ASSERT_EQ(runner.initialize_kernel(), 0);
+    Attempt run(runner, 0, 101812);
+    run.args.tensor(0).address_space = AddressSpace::DEVICE;
+    run.args.tensor(0).transfer = TensorTransfer::NONE;
+    ASSERT_EQ(run.prepare(), 0);
+    control().aicpu_payload = [](void *, void *, size_t, const std::string &) {
+        return -4871;
+    };
+    int caller;
+    EXPECT_EQ(simpler_submit_run_on_stream(&runner, run.storage, &caller), -4871);
+    EXPECT_EQ(runner.native_run_claim_count(), 1u);
+    control().stream_sync_rc = -4872;
+    EXPECT_EQ(simpler_finalize_run(&runner, run.storage), -4872);
+    EXPECT_EQ(runner.native_run_claim_count(), 1u);
+    control().stream_sync_rc = 0;
+    EXPECT_EQ(simpler_finalize_run(&runner, run.storage), -4871);
+    EXPECT_EQ(runner.native_run_claim_count(), 0u);
+}
+
 TEST_F(NativeAdmissionTest, CapturedHbgImageUsesRtsSnapshotThroughOriginalRunRetirement) {
     HbgImageCaptureRunner runner;
     ASSERT_EQ(runner.initialize_kernel(), 0);
@@ -757,27 +816,28 @@ TEST_F(NativeAdmissionTest, CapturedHbgImageUsesRtsSnapshotThroughOriginalRunRet
     for (const auto &copy : control().deferred_copies)
         std::memcpy(copy.destination, copy.source, copy.bytes);
     // The transport stub records raw bytes in a vector. Replay from an aligned RTS allocation.
-    struct alignas(64) CacheLine { unsigned char data[64]; };
+    struct alignas(64) CacheLine {
+        unsigned char data[64];
+    };
     std::vector<CacheLine> replay_storage((packet.size() + 63) / 64);
     std::memcpy(replay_storage.data(), packet.data(), packet.size());
-    const auto *image_packet = reinterpret_cast<const unsigned char *>(replay_storage.data()) +
-                               (image_address - packet_begin);
+    const auto *image_packet =
+        reinterpret_cast<const unsigned char *>(replay_storage.data()) + (image_address - packet_begin);
     const auto *image_data = image_packet + sizeof(image);
     ASSERT_LE(image.mutable_prefix_bytes, expected.size());
     ASSERT_EQ(std::memcmp(image_data, expected.data(), expected.size()), 0);
     for (int replay = 0; replay < 2; ++replay) {
         std::memset(working_arena, 0xa5, image.mutable_prefix_bytes);
         ASSERT_EQ(
-            restore_hbg_execution_image(
-                image_packet, [](const void *, size_t) {}, [](const void *, size_t) {}
-            ),
-            0
+            restore_hbg_execution_image(image_packet, [](const void *, size_t) {}, [](const void *, size_t) {}), 0
         );
         for (uint64_t i = 0; i < image.reference_count; ++i) {
             HbgImageReference ref{};
             std::memcpy(&ref, image_data + image.bytes + i * sizeof(ref), sizeof(ref));
-            EXPECT_EQ(*reinterpret_cast<const uint64_t *>(ref.device_field_address),
-                      reinterpret_cast<uint64_t>(image_data + ref.image_offset));
+            EXPECT_EQ(
+                *reinterpret_cast<const uint64_t *>(ref.device_field_address),
+                reinterpret_cast<uint64_t>(image_data + ref.image_offset)
+            );
         }
         if (image.reference_count == 0)
             EXPECT_EQ(std::memcmp(working_arena, expected.data(), image.mutable_prefix_bytes), 0);

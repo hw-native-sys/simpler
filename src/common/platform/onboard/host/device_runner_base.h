@@ -273,7 +273,7 @@ public:
      */
     bool try_reserve_native_run(
         const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, bool allow_prepared_successor,
-        bool capture_preparation = false, const NativeRunIdentity &identity = {}
+        bool independent_preparation = false, const NativeRunIdentity &identity = {}
     );
     /** Publish preparation only after its backing owner and resource plan are complete. */
     void mark_native_run_prepared(const void *owner);
@@ -1444,7 +1444,7 @@ public:
     void activate_launch_shape(const Runtime &runtime);
 
     // Pure preflight: capture cannot replay Host orchestration writes.
-    int validate_capture_prepare_args(int32_t callable_id, const void *args) const;
+    int validate_caller_submission_args(int32_t callable_id, const void *args) const;
 
     /**
      * Point a fresh Runtime at a previously-registered callable and complete
@@ -1874,7 +1874,7 @@ public:
         return prepared.streams.ready() ? 0 : PTO_RUNTIME_ERR_INVALID_STATE;
     }
     virtual int reclaim_execution_streams() { return 0; }
-    int prepare_run_storage(uint32_t pipeline_slot, bool capture_preparation = false);
+    int prepare_run_storage(uint32_t pipeline_slot);
     int retain_prepared_run_resources(PreparedExecution &prepared, RegionBanks banks, int32_t callable_id = -1);
     int retain_prepared_run_resources(PreparedExecution &prepared, uint32_t arena_bank, int32_t callable_id = -1) {
         return retain_prepared_run_resources(prepared, RegionBanks{arena_bank, arena_bank, arena_bank}, callable_id);
@@ -1884,6 +1884,10 @@ public:
     );
     int release_external_run_resources(void *reference);
     int admit_external_submission(PreparedExecution &prepared);
+    int prepare_caller_submission(void *owner, PreparedExecution &prepared);
+    void yield_caller_submission(void *owner, const NativeRunIdentity &identity);
+    int finish_caller_submission(ActiveExecution &active);
+    void release_caller_submission(void *owner) { caller_device_buffers_.release_reference(owner, false); }
     bool capture_diagnostics_supported(const PreparedExecution &prepared) const;
     virtual bool supports_scope_stats_capture() const { return false; }
     virtual bool supports_pmu_capture() const { return false; }
@@ -2973,7 +2977,7 @@ protected:
         uint32_t pipeline_slot{0};
         uint32_t arena_bank{0};
         bool permits_prepared_successor{false};
-        bool capture_preparation{false};
+        bool independent_preparation{false};
         NativeRunPreparationState preparation_state{NativeRunPreparationState::Preparing};
         NativeRunIdentity identity{};
     };
