@@ -2201,11 +2201,39 @@ int DeviceRunnerBase::init_kernel_context(int device_id) {
         rc = prepare_submission_slot_resources(static_cast<uint32_t>(slot));
         if (rc != 0) return rc;
     }
-    // Reserve the slot capacity before recording. The first prepare initializes
-    // its private worker state and owns any initialization failure.
+    // Reserve each slot and initialize its private workers before recording.
     for (auto &storage : submission_storage_) {
         rc = reserve_slot_runtime_args(kernel_runtime_, mem_alloc_, storage->args, 0, /*launch_owned=*/true);
         if (rc != 0) return rc;
+    }
+    return prepare_spare_submission_storage(control_stream);
+}
+
+int DeviceRunnerBase::prepare_spare_submission_storage(void *stream) {
+    // Two spare generations cover the first two replacements across all slots.
+    // Further retained models use the ordinary on-demand allocation path.
+    constexpr size_t spare_count = 2;
+    spare_submission_storage_.reserve(spare_count);
+    for (size_t i = 0; i < spare_count; ++i) {
+        auto storage = make_submission_storage();
+        auto &args = storage->args;
+        int alloc_rc = 0;
+        args.shared_state = static_cast<RuntimeSharedState *>(mem_alloc_.alloc(sizeof(RuntimeSharedState), &alloc_rc));
+        if (args.shared_state == nullptr) break;
+        spare_submission_storage_.push_back(std::move(storage));
+        if (alloc_rc != 0) return alloc_rc;
+        const int rc = aclrtMemsetAsync(
+            args.shared_state, sizeof(RuntimeSharedState::workers), 0, sizeof(RuntimeSharedState::workers), stream
+        );
+        if (rc != 0) return rc;
+        args.worker_initialization_pending = true;
+    }
+    if (spare_submission_storage_.empty()) return 0;
+    const int rc = aclrtSynchronizeStreamWithTimeout(stream, timeout_config_.stream_sync_timeout_ms);
+    if (rc != 0) return rc;
+    for (auto &storage : spare_submission_storage_) {
+        storage->args.worker_initialization_pending = false;
+        storage->args.workers_initialized = true;
     }
     return 0;
 }
@@ -3317,6 +3345,12 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     } else {
         const int retired_rc = reclaim_prepared_storage();
         if (retired_rc != 0) return retired_rc;
+    }
+    // A partially initialized spare may still have work on the control stream.
+    while (!spare_submission_storage_.empty()) {
+        const int rc = release_submission_storage(*spare_submission_storage_.back(), abandon_device_resources);
+        if (rc != 0) return rc;
+        spare_submission_storage_.pop_back();
     }
     if (!abandon_device_resources && execution_mode_latch().is_kernel()) {
         const int rc = kernel_exec_state_.begin_close();
@@ -4657,9 +4691,11 @@ int DeviceRunnerBase::prepare_run_storage(uint32_t slot) {
         scheduler_state_storage_[slot].device.reset();
         auto &current = submission_storage_[slot];
         if (current.use_count() != 1) {
-            auto next = make_submission_storage();
+            auto next =
+                spare_submission_storage_.empty() ? make_submission_storage() : spare_submission_storage_.back();
             retired_submission_storage_.push_back(current);
             current = std::move(next);
+            if (!spare_submission_storage_.empty()) spare_submission_storage_.pop_back();
         }
         backing = current;
     }
