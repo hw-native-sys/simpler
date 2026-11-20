@@ -18,9 +18,9 @@
 
 #pragma once
 
-#include "common/region_banks.h"
-
 #include <cstdint>
+
+#include "common/host_api.h"
 
 #include "runtime_c_api.h"
 #include "execution_mode.h"

@@ -11,8 +11,6 @@
 
 #pragma once
 
-#include "common/region_banks.h"
-
 #include <array>
 #include <condition_variable>
 #include <cstddef>
@@ -40,6 +38,8 @@
 #include "run_resource_arena.h"
 #include "runtime_c_api.h"
 #include "types.h"
+
+struct RegionBanks;
 
 template <class Run>
 class QueuedSubmission;

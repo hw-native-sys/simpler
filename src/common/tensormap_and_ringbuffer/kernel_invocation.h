@@ -16,7 +16,6 @@
 #include <limits>
 #include <type_traits>
 
-#include "common/kernel_invocation_wire.h"
 #include "task_interface/callable_protocol.h"
 #include "task_interface/kernel_invocation_header.h"
 #include "task_interface/task_args.h"

@@ -18,9 +18,21 @@
 #include <vector>
 
 #include "common/chip_swimlane_extension.h"
-#include "common/region_banks.h"
-#include "common/hbg_execution_image.h"
+#include "common/launch_entry_args.h"
 #include "host/scheduler_notifications.h"
+
+/**
+ * The arena bank selected for each pooled device region of one run.
+ *
+ * Each region is selected from its own declaration: a runtime may share its
+ * heap while still delivering a per-run image. A missing kind keeps zero,
+ * which is the only bank a context without that region can name.
+ */
+struct RegionBanks {
+    uint32_t heap;
+    uint32_t sm;
+    uint32_t image;
+};
 
 struct CoreAsyncCapability;
 
@@ -297,8 +309,9 @@ struct HostApiOps {
         void *runner_ctx, int32_t callable_id
     ) = nullptr;
     bool launch_owns_execution_image{false};
-    int (*stage_owned_references)(void *, uint32_t, const HostMetadataRegion *, size_t,
-                                  std::vector<HbgImageReference> *) = nullptr;
+    int (*stage_owned_references)(
+        void *, uint32_t, const HostMetadataRegion *, size_t, std::vector<HbgImageReference> *
+    ) = nullptr;
 };
 
 /**
@@ -323,8 +336,9 @@ public:
         return 0;
     }
 
-    int stage_metadata_with_references(const HostMetadataRegion *regions, size_t count,
-                                       std::vector<HbgImageReference> &owner) const {
+    int stage_metadata_with_references(
+        const HostMetadataRegion *regions, size_t count, std::vector<HbgImageReference> &owner
+    ) const {
         if (!owner.empty() && ops_->stage_owned_references)
             return ops_->stage_owned_references(runner_ctx_, pipeline_slot_, regions, count, &owner);
         return stage_launch_metadata(regions, count);

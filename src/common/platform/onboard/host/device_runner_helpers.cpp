@@ -24,7 +24,7 @@
 
 #include "acl/acl.h"
 #include "acl/error_codes/rt_error_codes.h"
-#include "common/hbg_execution_image.h"
+#include "common/launch_entry_args.h"
 #include "common/unified_log.h"
 #include "host/acl_error_log.h"
 
@@ -265,7 +265,7 @@ int KernelArgsHelper::prepare_kernel_invocation(const simpler::tmr::KernelCallab
     const size_t bytes = simpler::tmr::kernel_invocation_bytes(identity.tensor_count, identity.scalar_count);
     std::vector<std::byte> packet(bytes);
     const size_t offset = simpler::tmr::kernel_runtime_descriptor_offset(
-        identity.tensor_count, identity.scalar_count, alignof(DeviceRuntimeLaunchDesc)
+        LAUNCH_ENVELOPE_HEADER_BYTES, identity.tensor_count, identity.scalar_count, alignof(DeviceRuntimeLaunchDesc)
     );
     if (offset > UINT32_MAX || runtime_launch_bytes_ > UINT32_MAX - offset) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     if (!simpler::tmr::encode_kernel_invocation(

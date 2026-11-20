@@ -39,7 +39,6 @@
 #include <vector>
 
 #include "common/core_type.h"
-#include "common/hbg_execution_image.h"
 #include "common/runtime_shared_state.h"
 #include "common/device_phase.h"
 #include "common/host_phase_kind.h"

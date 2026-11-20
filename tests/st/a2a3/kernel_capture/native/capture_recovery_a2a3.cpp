@@ -14,7 +14,7 @@
 #include <acl/acl.h>
 #include <cstring>
 #include <vector>
-#include "common/hbg_execution_image.h"
+#include "common/launch_entry_args.h"
 #include "host_build_graph/runtime_core.h"
 
 namespace simpler::capture_test {

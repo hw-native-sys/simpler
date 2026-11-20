@@ -13,7 +13,7 @@
 
 #include <cstring>
 
-#include "common/hbg_execution_image.h"
+#include "common/launch_entry_args.h"
 
 template <typename Invalidate, typename Flush>
 int32_t restore_hbg_execution_image(const void *packet, size_t packet_bytes, Invalidate invalidate, Flush flush) {

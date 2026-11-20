@@ -15,9 +15,9 @@
 #include <cstring>
 
 #include "common/kernel_args.h"
-#include "common/hbg_execution_image.h"
+#include "common/launch_entry_args.h"
 #include "runtime.h"
-#include "common/kernel_invocation_wire.h"
+#include "task_interface/kernel_invocation_header.h"
 
 // RTS argument storage guarantees no Runtime cache-line alignment. Each AICPU
 // invocation keeps its descriptor view until its own device entry returns.
@@ -51,7 +51,7 @@ public:
             return nullptr;
 
         const size_t offset = simpler::tmr::kernel_runtime_descriptor_offset(
-            args.entry_tensor_count, args.entry_scalar_count, alignof(DeviceRuntimeLaunchDesc)
+            args.entry_args_offset, args.entry_tensor_count, args.entry_scalar_count, alignof(DeviceRuntimeLaunchDesc)
         );
         if (section.descriptor_offset != offset || section.packet_bytes < offset ||
             section.packet_bytes - offset != args.runtime_descriptor_bytes)

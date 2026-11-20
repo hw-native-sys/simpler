@@ -12,7 +12,7 @@
 #pragma once
 
 #include <cstring>
-#include "common/hbg_execution_image.h"
+#include "common/launch_entry_args.h"
 #include "common/kernel_args.h"
 #include "runtime.h"
 #include "runtime/rts/rts_kernel.h"
