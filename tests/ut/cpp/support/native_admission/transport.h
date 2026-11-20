@@ -93,6 +93,8 @@ struct Control {
     int registration_launch_rc{0};
     std::vector<int> registered_ids;
     std::vector<void *> registration_streams;
+    size_t async_memset_calls{0};
+    size_t fail_async_memset{0};
     int stream_sync_rc{0};
     std::function<void()> stream_sync_hook;
     std::vector<void *> observed_streams;

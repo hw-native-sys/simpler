@@ -217,6 +217,11 @@ int aclrtMemset(void *p, size_t capacity, int32_t value, size_t bytes) {
     std::memset(p, value, bytes);
     return 0;
 }
+int aclrtMemsetAsync(void *p, size_t capacity, int32_t value, size_t bytes, aclrtStream) {
+    auto &c = native_admission_transport::control();
+    if (++c.async_memset_calls == c.fail_async_memset) return -872;
+    return aclrtMemset(p, capacity, value, bytes);
+}
 int aclrtSetOpExecuteTimeOutV2(uint64_t wanted, uint64_t *actual) {
     auto &c = native_admission_transport::control();
     ++c.op_timeout_calls;

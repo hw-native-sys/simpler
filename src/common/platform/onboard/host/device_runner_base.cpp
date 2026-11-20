@@ -2206,10 +2206,10 @@ int DeviceRunnerBase::init_kernel_context(int device_id) {
         rc = reserve_slot_runtime_args(kernel_runtime_, mem_alloc_, storage->args, 0, /*launch_owned=*/true);
         if (rc != 0) return rc;
     }
-    return prepare_spare_submission_storage();
+    return prepare_spare_submission_storage(control_stream);
 }
 
-int DeviceRunnerBase::prepare_spare_submission_storage() {
+int DeviceRunnerBase::prepare_spare_submission_storage(void *control_stream) {
     // Two spare generations cover the first two replacements across all slots.
     // Further retained models use the ordinary on-demand allocation path.
     constexpr size_t spare_count = 2;
@@ -2223,9 +2223,24 @@ int DeviceRunnerBase::prepare_spare_submission_storage() {
         spare_submission_storage_.push_back(std::move(storage));
         if (alloc_rc != 0) return alloc_rc;
         constexpr size_t bytes = sizeof(RuntimeSharedState::workers);
-        const int rc = aclrtMemset(args.shared_state, bytes, 0, bytes);
+        if constexpr (PLATFORM_BATCH_SPARE_WORKER_CLEARS) {
+            const int rc = aclrtMemsetAsync(args.shared_state, bytes, 0, bytes, control_stream);
+            if (rc != 0) return rc;
+            args.worker_initialization_pending = true;
+        } else {
+            const int rc = aclrtMemset(args.shared_state, bytes, 0, bytes);
+            if (rc != 0) return rc;
+            args.workers_initialized = true;
+        }
+    }
+    if constexpr (PLATFORM_BATCH_SPARE_WORKER_CLEARS) {
+        if (spare_submission_storage_.empty()) return 0;
+        const int rc = aclrtSynchronizeStreamWithTimeout(control_stream, timeout_config_.stream_sync_timeout_ms);
         if (rc != 0) return rc;
-        args.workers_initialized = true;
+        for (auto &storage : spare_submission_storage_) {
+            storage->args.worker_initialization_pending = false;
+            storage->args.workers_initialized = true;
+        }
     }
     return 0;
 }

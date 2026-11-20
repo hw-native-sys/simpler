@@ -4464,6 +4464,24 @@ TEST_F(NativeAdmissionTest, PrivateWorkerInitializationFailureLeavesThePreparedP
     cleanup.dismiss();
 }
 
+TEST_F(NativeAdmissionTest, SpareWorkerBatchRetainsPendingStorageOnPartialFailure) {
+    ColdKernelRunner runner;
+    control().fail_async_memset = 2;
+    if constexpr (PLATFORM_BATCH_SPARE_WORKER_CLEARS) {
+        ASSERT_EQ(initialize_cold_kernel_runner(runner, 2), -872);
+        EXPECT_EQ(control().async_memset_calls, 2u);
+        control().stream_sync_rc = -873;
+        EXPECT_NE(runner.finalize(), 0);
+        EXPECT_GE(control().bytes, sizeof(RuntimeSharedState));
+        control().stream_sync_rc = 0;
+    } else {
+        ASSERT_EQ(initialize_cold_kernel_runner(runner, 2), 0);
+        EXPECT_EQ(control().async_memset_calls, 0u);
+    }
+    EXPECT_EQ(runner.finalize(), 0);
+    EXPECT_EQ(control().bytes, 0u);
+}
+
 TEST_F(NativeAdmissionTest, KernelInitConsumesOnlyMandatorySharedStateBytes) {
     size_t mandatory_bytes = 0;
     {

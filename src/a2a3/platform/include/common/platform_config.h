@@ -108,6 +108,9 @@ constexpr int32_t PLATFORM_SIM_TENSOR_DATA_WAIT_TIMEOUT_MS = 30000;
  */
 constexpr int PLATFORM_STREAM_SYNC_TIMEOUT_MS = 50000;  // 50s (> op-exec 45s)
 
+// Clear spare workers directly during context initialization to avoid a control-stream wait.
+constexpr bool PLATFORM_BATCH_SPARE_WORKER_CLEARS = false;
+
 // =============================================================================
 // Derived Platform Limits
 // =============================================================================
