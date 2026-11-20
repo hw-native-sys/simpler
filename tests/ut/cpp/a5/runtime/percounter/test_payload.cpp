@@ -3228,8 +3228,8 @@ TEST(PercounterPayload, ProfilingLevelsReserveOnlyTheirRecordTails) {
     EXPECT_NE(layouts[2].task_records_offset, 0);
     EXPECT_EQ(layouts[1].event_records_offset, 0);
     EXPECT_GT(layouts[2].event_records_offset, layouts[2].task_records_offset);
-    EXPECT_GT(layouts[2].event_record_capacity, 0);
-    EXPECT_EQ(layouts[2].event_record_capacity, layouts[3].event_record_capacity);
+    EXPECT_EQ(layouts[2].event_record_capacity, 16U * 12);
+    EXPECT_EQ(layouts[3].event_record_capacity, 16U * 8);
     EXPECT_EQ(layouts[2].scalar_records_offset, 0);
     EXPECT_EQ(layouts[3].upload_size, layouts[2].upload_size);
     EXPECT_EQ(layouts[3].total_size, layouts[4].total_size);

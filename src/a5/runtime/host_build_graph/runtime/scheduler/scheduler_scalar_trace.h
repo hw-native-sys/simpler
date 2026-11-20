@@ -29,10 +29,7 @@ public:
         trace_(scheduler_scalar_current()),
         kind_(kind),
         task_ref_(task_ref) {
-        if (trace_ != nullptr && trace_->buffer != nullptr) {
-            depth_ = ++trace_->depth;
-            begin_ = begin == 0 ? scheduler_cycles() : begin;
-        } else trace_ = nullptr;
+        open(begin);
     }
     template <typename Local>
     inline __aicore__ __attribute__((always_inline))
@@ -40,15 +37,17 @@ public:
         trace_(local != nullptr && local->profiling != nullptr ? &local->profiling->scalar : nullptr),
         kind_(kind),
         task_ref_(task_ref) {
-        if (trace_ != nullptr && trace_->buffer != nullptr) {
-            depth_ = ++trace_->depth;
-            begin_ = begin == 0 ? scheduler_cycles() : begin;
-        } else trace_ = nullptr;
+        open(begin);
     }
     inline __aicore__ ~SchedulerScalarScopeImpl() { close(); }
     inline __aicore__ void set_task_ref(int64_t task_ref) { task_ref_ = task_ref; }
     inline __aicore__ __attribute__((always_inline)) void close() {
         if (trace_ == nullptr) return;
+        if (depth_ == 0) {
+            trace_->omitted_depth = previous_omitted_depth_;
+            trace_ = nullptr;
+            return;
+        }
         const uint64_t end = scheduler_cycles();
         --trace_->depth;
         trace_->append_function(kind_, begin_, end, task_ref_, depth_);
@@ -58,11 +57,25 @@ public:
     SchedulerScalarScopeImpl &operator=(const SchedulerScalarScopeImpl &) = delete;
 
 private:
+    inline __aicore__ __attribute__((always_inline)) void open(uint64_t begin) {
+        if (trace_ == nullptr || trace_->buffer == nullptr) {
+            trace_ = nullptr;
+            return;
+        }
+        if (trace_->omit_scope(kind_)) {
+            previous_omitted_depth_ = trace_->omitted_depth;
+            trace_->omitted_depth = trace_->depth;
+            return;
+        }
+        depth_ = ++trace_->depth;
+        begin_ = begin == 0 ? scheduler_cycles() : begin;
+    }
     SchedulerScalarTrace *trace_;
     SchedPhaseKind kind_;
     int64_t task_ref_;
     uint64_t begin_{0};
     uint32_t depth_{0};
+    uint32_t previous_omitted_depth_{UINT32_MAX};
 };
 
 template <>

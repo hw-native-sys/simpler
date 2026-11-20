@@ -116,6 +116,8 @@ enum class SchedPhaseKind : uint8_t {
     ScalarDsbAll = 88,
     ScalarDsbDdr = 89,
     ScalarBypassLoad = 90,
+    ScalarGmLoad = 189,
+    ScalarCntNotifyLoad = 190,
     ScalarBypassStore = 91,
     ScalarTraceFinish = 92,
     ScalarTraceFinishClean = 93,
@@ -289,6 +291,10 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_dsb_ddr";
     case SchedPhaseKind::ScalarBypassLoad:
         return "scalar_bypass_load";
+    case SchedPhaseKind::ScalarGmLoad:
+        return "scalar_gm_load";
+    case SchedPhaseKind::ScalarCntNotifyLoad:
+        return "scalar_cnt_notify_load";
     case SchedPhaseKind::ScalarBypassStore:
         return "scalar_bypass_store";
     case SchedPhaseKind::ScalarTraceFinish:

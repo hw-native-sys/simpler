@@ -35,8 +35,9 @@ struct CatalogImage {
     std::vector<uint8_t> storage;
     void *base{nullptr};
 
-    explicit CatalogImage(const std::vector<SchedulerTaskMetadata> &metadata) {
-        if (!scheduler_plan_task_catalog(metadata, 2, 64, &plan)) throw std::logic_error("cannot plan test catalog");
+    explicit CatalogImage(const std::vector<SchedulerTaskMetadata> &metadata, uint32_t clusters = 2) {
+        if (!scheduler_plan_task_catalog(metadata, clusters, 64, &plan))
+            throw std::logic_error("cannot plan test catalog");
         storage.resize(plan.total_size + SCHEDULER_STATE_BASE_ALIGNMENT);
         base = reinterpret_cast<void *>(
             (reinterpret_cast<uintptr_t>(storage.data()) + SCHEDULER_STATE_BASE_ALIGNMENT - 1) &
@@ -46,7 +47,9 @@ struct CatalogImage {
     }
 
     bool valid() {
-        return scheduler_task_catalog_validate(base, plan.total_size, plan.header_offset, plan.header.task_count, 2);
+        return scheduler_task_catalog_validate(
+            base, plan.total_size, plan.header_offset, plan.header.task_count, plan.cluster_count
+        );
     }
 };
 
@@ -171,6 +174,139 @@ TEST(HbgTaskCatalog, TopologicalGenerationsExposeIndependentBranchesBeforeDeeper
     const auto &mixed = scheduler_task_catalog_order(image.base, image.plan.header, 4);
     EXPECT_EQ(mixed.rank, 7u);
     EXPECT_EQ(image.plan.header.first_mix_ref, 4u);
+}
+
+SchedulerTaskMetadata spmd(LaneMask lanes, uint16_t blocks, bool sync_start = false) {
+    auto task = physical(lanes, blocks);
+    task.flags |= SCHEDULER_TASK_SPMD;
+    if (sync_start) task.flags |= SCHEDULER_TASK_SYNC_START;
+    return task;
+}
+
+void expect_wave_order(
+    uint32_t clusters, const std::vector<SchedulerTaskMetadata> &tasks, const std::vector<std::vector<int64_t>> &fanin,
+    const std::vector<int64_t> &expected, bool native = false, bool deferred = false, uint64_t controls = 0
+) {
+    SchedulerDependencyPlan deps;
+    deps.fanin = fanin;
+    CatalogImage image(tasks, clusters);
+    std::string error;
+    const bool promote = scheduler_can_defer_side_tasks(native, deferred, controls, tasks);
+    ASSERT_TRUE(scheduler_order_task_catalog(deps, tasks, &image.plan, &error, promote)) << error;
+    EXPECT_EQ(image.plan.task_order, expected);
+    EXPECT_EQ(deps.fanin, fanin);
+    for (size_t ref = 0; ref < tasks.size(); ++ref)
+        for (const auto pred : fanin[ref])
+            EXPECT_LT(image.plan.task_ranks[pred], image.plan.task_ranks[ref]);
+    scheduler_init_task_catalog(image.base, image.plan);
+    EXPECT_TRUE(image.valid());
+}
+
+TEST(HbgTaskCatalog, ShortIndependentBranchYieldsOnlyToAnOverlappingWaveOnItsOwnEngine) {
+    const std::vector<std::vector<int64_t>> fanin{{}, {}, {1}, {2}};
+    const std::vector<int64_t> original{1, 0, 2, 3}, delayed{1, 2, 0, 3};
+    for (const auto lanes : {LaneMask::aic(), LaneMask::aiv0()}) {
+        SCOPED_TRACE(static_cast<int>(lanes.raw()));
+        const uint16_t capacity = lanes.has_aic() ? 8 : 16;
+        const uint16_t side = capacity / 2 - 1;
+        const uint16_t wave = capacity - side + 1;
+        const auto other = lanes.has_aic() ? LaneMask::aiv0() : LaneMask::aic();
+        std::vector<SchedulerTaskMetadata> tasks{
+            spmd(lanes, side), physical(LaneMask::all()), spmd(lanes, wave), physical(other)
+        };
+        expect_wave_order(8, tasks, fanin, delayed);
+        tasks[2] = spmd(lanes, wave - 1);  // Both fit at once.
+        expect_wave_order(8, tasks, fanin, original);
+        tasks[2] = spmd(lanes, capacity, true);
+        expect_wave_order(8, tasks, fanin, delayed);  // The wave may use sync_start.
+        tasks[0] = spmd(lanes, capacity / 2);
+        expect_wave_order(8, tasks, fanin, original);
+        tasks[0] = spmd(lanes, side, true);
+        expect_wave_order(8, tasks, fanin, original);
+        tasks[0] = physical(other);
+        expect_wave_order(8, tasks, fanin, original);
+        tasks[0] = physical(LaneMask::all());
+        expect_wave_order(8, tasks, fanin, original);
+    }
+}
+
+TEST(HbgTaskCatalog, MixedWaveCountsItsComputingLanesOnTheContendedEngine) {
+    // Eight clusters have eight AICs and sixteen AIVs. A six-block MIX with one AIV
+    // per block leaves ten vector cores available; with two per block it leaves four.
+    const auto root = physical(LaneMask::all());
+    const auto one_aiv = spmd(LaneMask(true, false, true), 6);
+    const auto two_aivs = spmd(LaneMask::all(), 6, true);
+    const std::vector<std::vector<int64_t>> fanin{{}, {}, {1}, {2}};
+    expect_wave_order(8, {spmd(LaneMask::aic(), 3), root, one_aiv, root}, fanin, {1, 2, 0, 3});
+    expect_wave_order(8, {spmd(LaneMask::aiv0(), 7), root, one_aiv, root}, fanin, {1, 0, 2, 3});
+    expect_wave_order(8, {spmd(LaneMask::aiv0(), 7), root, two_aivs, root}, fanin, {1, 2, 0, 3});
+    expect_wave_order(8, {spmd(LaneMask::aic(), 3), root, spmd(LaneMask::both_aiv(), 8), root}, fanin, {1, 0, 2, 3});
+    // Ten MIX blocks execute in waves across eight clusters. A single AIV per cluster
+    // leaves eight AIVs free, while a two-AIV MIX occupies all sixteen.
+    const auto side = spmd(LaneMask::aiv0(), 7);
+    expect_wave_order(8, {side, root, spmd(LaneMask(true, false, true), 10), root}, fanin, {1, 0, 2, 3});
+    expect_wave_order(8, {side, root, spmd(LaneMask::all(), 10), root}, fanin, {1, 2, 0, 3});
+    // A pure vector wave can use either AIV per cluster, so all ten blocks can be active.
+    expect_wave_order(8, {side, root, spmd(LaneMask::aiv0(), 10), root}, fanin, {1, 2, 0, 3});
+}
+
+TEST(HbgTaskCatalog, DualAivSpmdRemainsAWideTargetBetweenVectorBranches) {
+    const std::vector<SchedulerTaskMetadata> tasks{
+        spmd(LaneMask::aiv0(), 7), spmd(LaneMask::both_aiv(), 7), physical(LaneMask::aic()), spmd(LaneMask::aiv0(), 16),
+        physical(LaneMask::aic())
+    };
+    for (const auto &task : tasks)
+        ASSERT_EQ(
+            task.flags, scheduler_task_metadata_flags_from_submit_state(
+                            task.active_mask, TaskAttrs{}, task.logical_block_num, false
+                        )
+        );
+    // The seven-block dual-AIV task uses fourteen of the sixteen vector cores. It cannot be deferred.
+    expect_wave_order(8, tasks, {{}, {}, {}, {2}, {3}}, {2, 0, 1, 3, 4});
+    // Give that task a longer branch than task 0. Task 0 may move behind it, but cannot pass the next wave.
+    expect_wave_order(8, tasks, {{}, {2}, {}, {2}, {1, 3}}, {2, 1, 0, 3, 4});
+}
+
+TEST(HbgTaskCatalog, NarrowBranchCannotPassAnotherCooperativeTaskOrAnEquallyCriticalBranch) {
+    const auto lanes = LaneMask::aic();
+    const auto side = spmd(lanes, 3), wave = spmd(lanes, 6);
+    const auto root = physical(LaneMask::aiv0());
+    const std::vector<std::vector<int64_t>> fork{{}, {}, {}, {2}, {3}};
+    for (const auto barrier : {physical(LaneMask::all()), spmd(LaneMask::aiv0(), 2, true)})
+        expect_wave_order(8, {side, barrier, root, wave, root}, fork, {2, 0, 1, 3, 4});
+    // Both independent branches still have one edge remaining.
+    expect_wave_order(8, {side, root, wave, root, root}, {{}, {}, {1}, {2}, {0}}, {1, 0, 2, 4, 3});
+    // An eligible wave two generations away is outside the search.
+    expect_wave_order(8, {side, root, root, wave, root}, {{}, {}, {1}, {2}, {3}}, {1, 0, 2, 3, 4});
+    // The would-be delayed branch supplies a direct input to the wave.
+    expect_wave_order(8, {side, root, wave, root}, {{}, {}, {0, 1}, {2}}, {0, 1, 2, 3});
+}
+
+TEST(HbgTaskCatalog, NarrowBranchStopsAtTheNearestCompetingWave) {
+    const auto lanes = LaneMask::aic();
+    const auto root = physical(LaneMask::aiv0());
+    const auto side = spmd(lanes, 3), wave = spmd(lanes, 6);
+    const std::vector<std::vector<int64_t>> fork{{}, {}, {1}, {1}, {2}, {3}};
+    expect_wave_order(8, {side, root, wave, wave, root, root}, fork, {1, 2, 0, 3, 4, 5});
+    // Leave the side task available alongside the first wave if both fit.
+    expect_wave_order(8, {side, root, spmd(lanes, 4), wave, root, root}, fork, {1, 0, 2, 3, 4, 5});
+    // A single wave can displace only the closest of two equally eligible side branches.
+    expect_wave_order(8, {side, side, root, wave, root}, {{}, {}, {}, {2}, {3}}, {2, 0, 3, 1, 4});
+}
+
+TEST(HbgTaskCatalog, NativeDeferredAndLiveControlGraphsKeepTheGenerationalOrder) {
+    const auto lanes = LaneMask::aic();
+    std::vector<SchedulerTaskMetadata> tasks{
+        spmd(lanes, 3), physical(LaneMask::all()), spmd(lanes, 6), physical(lanes)
+    };
+    const std::vector<std::vector<int64_t>> fanin{{}, {}, {1}, {2}};
+    const std::vector<int64_t> original{1, 0, 2, 3};
+    expect_wave_order(8, tasks, fanin, {1, 2, 0, 3});
+    expect_wave_order(8, tasks, fanin, original, true);
+    expect_wave_order(8, tasks, fanin, original, false, true);
+    expect_wave_order(8, tasks, fanin, original, false, false, 1);
+    tasks.back().flags |= SCHEDULER_TASK_HAS_PREDICATE;
+    expect_wave_order(8, tasks, fanin, original);
 }
 
 TEST(HbgTaskCatalog, OrdinaryFaninConfirmsEarlierBranchWithoutChangingDependenciesOrIssueOrder) {

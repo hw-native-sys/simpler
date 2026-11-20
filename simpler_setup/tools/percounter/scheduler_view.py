@@ -21,6 +21,29 @@ _LABELS = {
 }
 
 
+_CHECKPOINTS = {"inputs_pending", "inputs_ready", "mix_publish", "entry_commit"}
+
+
+def _validate_l2_checkpoints(row):
+    if row["kind"] == "claim" and "slot" in row:
+        if (
+            type(row["slot"]) is not int
+            or row["slot"] < 0
+            or type(row.get("mix")) is not bool
+            or type(row.get("participant_mask")) is not int
+            or not 0 <= row["participant_mask"] <= 7
+        ):
+            raise ValueError("invalid percounter claim location")
+    if row["kind"] == "kernel_end" and ("dispatch_cycles" in row or "finish_cycles" in row):
+        dispatch, finish = row.get("dispatch_cycles"), row.get("finish_cycles")
+        if (
+            type(dispatch) is not int
+            or type(finish) is not int
+            or not 0 < dispatch <= row["kernel_start_cycles"] <= row["cycles"] <= finish
+        ):
+            raise ValueError("invalid percounter execution checkpoints")
+
+
 def parse_capture(section):
     if not isinstance(section, dict) or not isinstance(section.get("records"), list):
         raise ValueError("percounter_task_events must contain a records array")
@@ -37,7 +60,11 @@ def parse_capture(section):
 
 
 def _validate_task_event(row):
-    if not isinstance(row, dict) or not isinstance(row.get("kind"), str) or row["kind"] not in _LABELS:
+    if (
+        not isinstance(row, dict)
+        or not isinstance(row.get("kind"), str)
+        or (row["kind"] not in _LABELS and row["kind"] not in _CHECKPOINTS)
+    ):
         raise ValueError("invalid percounter task event kind")
     for field in (
         "cycles",
@@ -61,6 +88,7 @@ def _validate_task_event(row):
         start = row.get("kernel_start_cycles")
         if type(start) is not int or not 0 < start <= row["cycles"]:
             raise ValueError("invalid percounter kernel interval")
+    _validate_l2_checkpoints(row)
     if row["kind"] in ("completion_issue", "deferred_completion_issue"):
         contribution = row.get("contribution")
         if type(contribution) is not int or contribution != 1:
@@ -74,6 +102,11 @@ def decode_capture(section, to_us):
             {
                 **row,
                 "time_us": to_us(row["cycles"]),
+                **(
+                    {"dispatch_us": to_us(row["dispatch_cycles"]), "finish_us": to_us(row["finish_cycles"])}
+                    if "dispatch_cycles" in row
+                    else {}
+                ),
                 **({"claim_start_us": to_us(row["claim_start_cycles"])} if row["kind"] == "claim" else {}),
                 **({"kernel_start_us": to_us(row["kernel_start_cycles"])} if row["kind"] == "kernel_end" else {}),
             }
@@ -153,7 +186,7 @@ def _task_completion_issues(capture, blocks, deps_edges, deps_kernel_map, deps_b
     return issues
 
 
-def _milestones(rows, ideal_ready):
+def _milestones(rows, ideal_ready, include_kernel_execution):
     """Use recorded endpoints for every span, including in partial captures."""
     by_kind = defaultdict(list)
     for row in rows:
@@ -184,7 +217,8 @@ def _milestones(rows, ideal_ready):
         start, end = min(starts), by_kind["kernel_end"][-1]["time_us"]
         if by_kind["ready"]:
             spans.append(("Ready → kernel start", by_kind["ready"][0]["time_us"], start, "thread_state_iowait"))
-        spans.append(("Kernel execution", start, end, "good"))
+        if include_kernel_execution:
+            spans.append(("Kernel execution", start, end, "good"))
         if completion:
             spans.append(
                 (
@@ -280,10 +314,20 @@ def _execution_predecessors(deps_edges, folded_task_ids, inline_completed_task_i
     return predecessors
 
 
-def trace_events(capture, pid, task_name, *, deps_edges=None, deps_kernel_map=None, deps_block_map=None):
+def trace_events(
+    capture,
+    pid,
+    task_name,
+    *,
+    include_kernel_execution=True,
+    deps_edges=None,
+    deps_kernel_map=None,
+    deps_block_map=None,
+):
     blocks = defaultdict(list)
     for row in capture["records"]:
-        blocks[row["run_epoch"], row["task_id"], row["block_index"]].append(row)
+        if row["kind"] not in _CHECKPOINTS:
+            blocks[row["run_epoch"], row["task_id"], row["block_index"]].append(row)
 
     issues = _task_completion_issues(capture, blocks, deps_edges, deps_kernel_map, deps_block_map)
     predecessors = (
@@ -299,7 +343,7 @@ def trace_events(capture, pid, task_name, *, deps_edges=None, deps_kernel_map=No
         preds = predecessors.get(task_id, ())
         times = [ts for pred in preds if (ts := issues.get((epoch, pred))) is not None]
         ideal_ready = max(times) if times and len(times) == len(preds) else None
-        start, end, spans, ideal_ready = _milestones(rows, ideal_ready)
+        start, end, spans, ideal_ready = _milestones(rows, ideal_ready, include_kernel_execution)
         by_cluster[placement["cluster_index"]].append((start, end, epoch, task_id, block, spans, rows, ideal_ready))
 
     yield _meta(pid, "process_name", {"name": "Scheduler View"})
@@ -325,6 +369,10 @@ def trace_events(capture, pid, task_name, *, deps_edges=None, deps_kernel_map=No
             heappush(lanes, (end, tid))
             name = f"{task_name(task_id)} [block {block}/{rows[0]['block_count']}]"
             yield from _block_events(rows, pid, tid, name, spans, ideal_ready)
+    yield from capture_status(capture, pid)
+
+
+def capture_status(capture, pid):
     if capture["dropped"]:
         yield _meta(pid, "thread_name", {"name": "Capture status"}, 0)
         yield {

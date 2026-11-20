@@ -24,6 +24,7 @@
 namespace {
 thread_local std::function<void(void *)> receive_observer;
 thread_local std::function<void(void *)> writeback_observer;
+thread_local std::function<void()> writeback_barrier_observer;
 thread_local std::function<void(volatile uint64_t *)> prepared_cas_observer;
 thread_local const volatile void *query_target = nullptr;
 thread_local uint32_t query_count = 0;
@@ -82,12 +83,21 @@ void observe_binding_writeback(void *address) {
 
 void observe_binding_writeback(volatile void *address) { observe_binding_writeback(const_cast<void *>(address)); }
 
-class ScopedBindingWritebackObserver {
+void observe_writeback_barrier() {
+    scheduler_cache_barrier();
+    if (writeback_barrier_observer) writeback_barrier_observer();
+}
+
+class ScopedWritebackObserver {
 public:
-    explicit ScopedBindingWritebackObserver(std::function<void(void *)> observer) {
+    explicit ScopedWritebackObserver(std::function<void(void *)> observer, std::function<void()> barrier = {}) {
         writeback_observer = std::move(observer);
+        writeback_barrier_observer = std::move(barrier);
     }
-    ~ScopedBindingWritebackObserver() { writeback_observer = {}; }
+    ~ScopedWritebackObserver() {
+        writeback_observer = {};
+        writeback_barrier_observer = {};
+    }
 };
 
 void observe_receive_cache_line(void *address) {
@@ -114,6 +124,7 @@ public:
 #undef scheduler_gm_compare_exchange
 #undef scheduler_invalidate_cache_line
 
+#define scheduler_cache_barrier observe_writeback_barrier
 #define scheduler_writeback_cache_line observe_binding_writeback
 #define scheduler_gm_query observe_query
 #define scheduler_notify_query observe_notify_query
@@ -125,6 +136,7 @@ public:
 #include "scheduler/scheduler_prepared_execution.h"
 #include "test_hbg_owned_execution.h"
 #undef scheduler_writeback_cache_line
+#undef scheduler_cache_barrier
 #undef scheduler_gm_query
 #undef scheduler_notify_query
 
@@ -249,6 +261,66 @@ TEST(HbgExecutionOwnership, FreshTicketCannotBeConsumedTwiceAndBindingIsReceived
     EXPECT_FALSE(scheduler_claim_for_execution(fixture.base(), prepared, 3, 0, 0, 0, &duplicate));
     EXPECT_EQ(duplicate.claimed_state, 0u);
     EXPECT_EQ(scheduler_prepared_control_at(fixture.base(), prepared, 0)->state, claimed);
+}
+
+TEST(HbgExecutionOwnership, MixLaneReceivesBothWritableBindingLines) {
+    RefillFixture fixture(1, 2);
+    const LaneMask active{true, false, true};
+    fixture.graph.mixed(0, active);
+    auto &metadata = fixture.storage.metadata[0];
+    metadata.active_mask = active;
+    metadata.flags |= SCHEDULER_TASK_MIX;
+    metadata.kernel_ids[2] = 1;
+    ASSERT_NO_FATAL_FAILURE(fixture.initialize());
+    auto *prepared = fixture.local->config.prepared;
+    uint64_t index = UINT64_MAX;
+    ASSERT_TRUE(scheduler_prepared_execution_index(fixture.base(), prepared, 0, 0, 2, &index));
+    auto *binding = scheduler_execution_binding_at(fixture.base(), prepared, index);
+    std::vector<void *> received;
+    ScopedReceiveObserver receive([&](void *address) {
+        if (address == &binding->local_context || address == &binding->global_context) received.push_back(address);
+    });
+    SchedulerPreparedHandle handle{};
+    ASSERT_TRUE(scheduler_acquire_group_lane(fixture.base(), prepared, 2, 0, 0, 2, active.raw(), &handle));
+    EXPECT_EQ(handle.execution_index, index);
+    EXPECT_EQ(received, (std::vector<void *>{&binding->local_context, &binding->global_context}));
+}
+
+TEST(HbgExecutionOwnership, DispatchPublishesBothTraceLinesBeforeCompletionMarksValid) {
+    RefillFixture fixture(1);
+    ASSERT_NO_FATAL_FAILURE(fixture.initialize());
+    auto *trace = scheduler_state_at<SchedulerTaskTrace>(fixture.base(), fixture.storage.layout.trace_cells_offset);
+    uint32_t slot = UINT32_MAX;
+    bool task_line = false, dispatch_line = false, published_lines = false;
+    {
+        ScopedWritebackObserver writeback(
+            [&](void *address) {
+                if (address == trace) task_line = true;
+                if (address == &trace->dispatch_start_cycles) dispatch_line = true;
+            },
+            [&] {
+                if (task_line && dispatch_line && trace->valid == 0) published_lines = true;
+            }
+        );
+        bool failed = false;
+        scheduler_find_local_execution(
+            fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, 3, &failed, &slot
+        );
+        ASSERT_FALSE(failed);
+    }
+    ASSERT_TRUE(published_lines);
+    ASSERT_LT(slot, SCHEDULER_EXECUTION_TOKEN_COUNT);
+    EXPECT_EQ(trace->valid, 0u);
+    bool permit = false;
+    ASSERT_TRUE(scheduler_check_entry_permit(
+        fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, slot, &permit
+    ));
+    ASSERT_TRUE(permit);
+    ASSERT_TRUE(hbg_test_begin_execution(fixture.local, slot));
+    ASSERT_TRUE(scheduler_complete_lane_execution(
+        fixture.graph.graph(), fixture.base(), fixture.local, fixture.storage.run_control, slot, 3
+    ));
+    EXPECT_EQ(trace->valid, 1u);
 }
 
 TEST(HbgExecutionOwnership, InvalidCallFailsClosedAfterClaim) {
@@ -507,7 +579,7 @@ TEST(HbgExecutionRefill, WaitingTokenUsesTheHostBindingWhenAllPredecessorsComple
     auto *binding = scheduler_execution_binding_at(fixture.base(), fixture.local->config.prepared, index);
     uint32_t writebacks = 0;
     uint32_t local_writebacks = 0;
-    ScopedBindingWritebackObserver observer([&](void *address) {
+    ScopedWritebackObserver observer([&](void *address) {
         if (address == &binding->global_context) ++writebacks;
         if (address == &binding->local_context) ++local_writebacks;
     });

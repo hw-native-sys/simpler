@@ -16,6 +16,7 @@ import pytest
 from _capture_builder import Capture
 from _native_protocol_builder import ProtocolBuilder
 
+from simpler_setup.tools.hbg.schedule_timing import _lane_name
 from simpler_setup.tools.swimlane_converter import generate_chrome_trace_json, read_perf_data
 
 
@@ -62,6 +63,82 @@ def test_explicit_identity_survives_without_deriving_block_from_record_index(tmp
     rows = read(tmp_path, raw)
     assert [(r["block_idx"], r["subtask_slot"], r["block_num"]) for r in rows] == [(0, 1, 2), (1, 1, 2)]
     assert all(r["order_key"] == 0 and r["group_seq"] is None and r["executed"] is True for r in rows)
+
+
+def test_l2_lane_names_sort_ordinary_slots_then_each_proxy_with_its_mix_members():
+    # Perfetto's JSON process tracks are ordered by their lowercase display name.
+    ordinary = [(role, slot) for role in (0, 1, 2) for slot in (0, 1)]
+    mix = [(role, slot) for slot in (4, 5) for role in (3, 0, 1, 2)]
+    expected = [(cluster, role, slot) for cluster in (0, 1, 10) for role, slot in ordinary + mix]
+    assert sorted(reversed(expected), key=lambda track: _lane_name(track).lower()) == expected
+
+
+def test_l2_checkpoints_render_one_proxy_and_separate_member_slots(tmp_path):
+    raw = capture()
+    section = raw["aicore_execution_identities"]
+    section["version"] = 3
+    for lane, (record, kernel, scheduler) in enumerate(
+        zip(section["records"], raw["aicore_tasks"], raw["scheduler_tasks"]["records"])
+    ):
+        record.update(
+            core_id=lane,
+            block_idx=0,
+            block_num=1,
+            group_kind=2,
+            group_seq=1,
+            subtask_slot=lane,
+            cluster_lane=lane,
+            pending_slot=4,
+        )
+        kernel[0] = scheduler[0] = lane
+        kernel[5] = 2
+        scheduler[2] = kernel[3] - 4
+        start = kernel[3]
+        record["schedule_cycles"] = [start - 14, start - 10, start - 6, kernel[4] + 3]
+    section["records"][0]["pending_fanin"] = [2, 92]
+    section["records"][1]["schedule_cycles"] += [70, 75]
+    rows = read(tmp_path, raw)
+    output = tmp_path / "trace.json"
+    for row in rows:
+        row["func_id"] = row["cluster_lane"]
+    generate_chrome_trace_json(
+        rows,
+        str(output),
+        func_id_to_name={"0": "proj_aic", "1": "proj_aiv"},
+        runtime_name="host_build_graph",
+        scheduler_task_producer="aicore",
+        chip_swimlane_level=2,
+    )
+    events = json.loads(output.read_bytes())["traceEvents"]
+    schedule = [event for event in events if event.get("cat") == "HBG L2"]
+    labels = {e["id2"]["local"]: e["name"] for e in schedule if e["ph"] == "n"}
+    assert set(labels.values()) == {"C00 / MIX0/AIC", "C00 / MIX0/AIV0", "C00 / MIX0 (AIV0 proxy)"}
+    assert all("tid" not in e and e["pid"] == 3 for e in schedule)
+    starts = [e for e in schedule if e["ph"] == "b"]
+    (handoff,) = [e for e in starts if e["name"].startswith("SSBUF arm")]
+    assert set(handoff["args"]["member_observation_us_after_arm"]) == {"AIC", "AIV0"}
+    end = next(e for e in schedule[schedule.index(handoff) + 1 :] if e["id2"] == handoff["id2"])
+    assert end["ph"] == "e"
+    assert end["ts"] - handoff["ts"] == pytest.approx(
+        rows[1]["schedule_checkpoints"][0] - rows[1]["mix_proxy_timing"][1]
+    )
+    assert not any(e["name"].startswith(("EXECUTE", "Kernel execution")) for e in starts)
+    workers = [e for e in events if e["pid"] == 4 and e["ph"] == "X"]
+    assert len(workers) == 2
+    assert {e["name"] for e in workers} == {"EXECUTE · proj(t7)"}
+    assert {e["args"]["correlation_id"] for e in workers} == {"spmd/7"}
+    assert {e["args"]["kernel_slice_label"] for e in workers} == {"proj_aic(t7)", "proj_aiv(t7)"}
+    binds = [e for e in starts if e["name"].startswith("MIX member bind")]
+    assert {labels[e["id2"]["local"]] for e in binds} == {"C00 / MIX0/AIC", "C00 / MIX0/AIV0"}
+    (wait,) = [e for e in starts if e["name"].startswith("Predecessor pending")]
+    assert wait["args"]["first_pending_task_id"] == 2
+    assert [e["dur"] for e in events if e["pid"] == 4 and e["ph"] == "X"] == pytest.approx(
+        [r["duration_us"] for r in rows]
+    )
+
+    section["records"][0]["schedule_cycles"][1] = 1
+    with pytest.raises(ValueError, match="out-of-order"):
+        read(tmp_path, raw)
 
 
 def test_l3_preserves_historical_ordinary_source_ids(tmp_path):
@@ -356,7 +433,7 @@ def test_unversioned_capture_cannot_combine_legacy_rank_and_ranked_slots(tmp_pat
         read(tmp_path, raw)
 
 
-@pytest.mark.parametrize("version", (None, False, True, 2.0, 3))
+@pytest.mark.parametrize("version", (None, False, True, 2.0, 4))
 def test_explicit_identity_version_must_be_supported(tmp_path, version):
     raw = capture()
     raw["aicore_execution_identities"]["version"] = version
@@ -385,3 +462,134 @@ def test_ranked_protocol_rejects_unversioned_null_rank(tmp_path):
     records[0]["order_key"] = None
     with pytest.raises(ValueError, match="native protocol: execution identity group source mismatch"):
         read(tmp_path, raw)
+
+
+def test_native_l2_spmd_slice_preserves_execute_label_and_task_color():
+    from simpler_setup.tools.l2_pftrace import encode_l2_trace  # noqa: PLC0415
+
+    proto = pytest.importorskip("perfetto.protos.perfetto.trace.perfetto_trace_pb2")
+    name = "EXECUTE · proj_spmd(t7)"
+    events = [{"ph": "M", "pid": 4, "name": "process_name", "args": {"name": "Worker View"}}]
+    for tid, member in enumerate(("proj_aic", "proj_aiv")):
+        events.append({"ph": "M", "pid": 4, "tid": tid, "name": "thread_name", "args": {"name": member}})
+        events.append(
+            {
+                "ph": "X",
+                "pid": 4,
+                "tid": tid,
+                "cat": "event",
+                "name": name,
+                "ts": 1,
+                "dur": 2,
+                "args": {"correlation_id": "spmd/7", "kernel_slice_label": member},
+            }
+        )
+    trace = proto.Trace.FromString(encode_l2_trace(events))
+    begins = [p.track_event for p in trace.packet if p.track_event.type == proto.TrackEvent.TYPE_SLICE_BEGIN]
+    assert [(e.name, e.correlation_id_str) for e in begins] == [(name, "spmd/7")] * 2
+    assert {a.string_value for e in begins for a in e.debug_annotations if a.name == "kernel_slice_label"} == {
+        "proj_aic",
+        "proj_aiv",
+    }
+
+
+def _l2_dependency_document(tmp_path, *, overhead=False):
+    builder = Capture(
+        runtime="host_build_graph",
+        level=2,
+        clock_freq_hz=1_000_000,
+        core_types=("aic", "aiv"),
+        scheduler_producer="aicore",
+    )
+    for core in range(2):
+        offset = core * 40
+        builder.task(
+            task_id=10 + core,
+            core_id=core,
+            reg_task_id=core,
+            dispatch=90 + offset,
+            start=100 + offset,
+            end=120 + offset,
+            finish=125 + offset,
+        )
+    return generate_chrome_trace_json(
+        read(tmp_path, builder.build()),
+        None,
+        runtime_name="host_build_graph",
+        scheduler_task_producer="aicore",
+        chip_swimlane_level=2,
+        deps_edges={10: [11]},
+        emit_overhead=overhead,
+    )
+
+
+def test_native_l2_binds_each_rank_dependency_to_its_source_and_target(tmp_path):
+    from simpler_setup.tools.l2_pftrace import encode_l2_trace  # noqa: PLC0415
+    from simpler_setup.tools.swimlane_converter import _namespace_rank_trace  # noqa: PLC0415
+
+    proto = pytest.importorskip("perfetto.protos.perfetto.trace.perfetto_trace_pb2")
+    local = _l2_dependency_document(tmp_path)
+    events = [e for rank in range(2) for e in _namespace_rank_trace(copy.deepcopy(local), rank, 0)["traceEvents"]]
+    trace = proto.Trace.FromString(encode_l2_trace(events))
+    tracks = {p.track_descriptor.uuid: p.track_descriptor for p in trace.packet if p.HasField("track_descriptor")}
+    starts, finishes = {}, {}
+    for p in trace.packet:
+        event = p.track_event
+        if event.type != proto.TrackEvent.TYPE_SLICE_BEGIN:
+            continue
+        parent = tracks[tracks[event.track_uuid].parent_uuid].name
+        for endpoint, ids in ((starts, event.flow_ids), (finishes, event.terminating_flow_ids)):
+            for flow in ids:
+                assert flow not in endpoint
+                endpoint[flow] = (parent, event.name)
+    assert set(starts) == set(finishes)
+    assert {parent for parent, _ in starts.values()} == {
+        f"rank{rank} / {view}" for rank in range(2) for view in ("Worker View", "Scheduler View")
+    }
+    assert len(starts) == 4
+    for flow in starts:
+        assert starts[flow][0] == finishes[flow][0]
+        assert starts[flow][1] != finishes[flow][1]
+
+
+def test_native_l2_overhead_counter_tracks_roundtrip_alongside_slices(tmp_path, monkeypatch):
+    from simpler_setup.tools.l2_pftrace import main  # noqa: PLC0415
+
+    proto = pytest.importorskip("perfetto.protos.perfetto.trace.perfetto_trace_pb2")
+    events = _l2_dependency_document(tmp_path, overhead=True)["traceEvents"]
+    counters = [e for e in events if e["ph"] == "C"]
+    assert counters
+    source, output = tmp_path / "l2.json", tmp_path / "l2.pftrace"
+    source.write_text(json.dumps({"traceEvents": events}))
+    monkeypatch.setattr("sys.argv", ["l2_pftrace", str(source), str(output)])
+    main()
+    trace = proto.Trace.FromString(output.read_bytes())
+    tracks = {p.track_descriptor.uuid: p.track_descriptor for p in trace.packet if p.HasField("track_descriptor")}
+    expected = sorted((e["name"], round(e["ts"] * 1000), e["args"][e["name"]]) for e in counters)
+    samples = []
+    for p in trace.packet:
+        if p.track_event.type == proto.TrackEvent.TYPE_COUNTER:
+            track = tracks[p.track_event.track_uuid]
+            assert track.HasField("counter")
+            assert track.parent_uuid in tracks
+            samples.append((track.name, p.timestamp, p.track_event.counter_value))
+    assert sorted(samples) == expected
+    assert sum(p.track_event.type == proto.TrackEvent.TYPE_SLICE_BEGIN for p in trace.packet) == sum(
+        e["ph"] == "X" for e in events
+    )
+
+
+def test_native_l2_counter_arguments_keep_independent_numeric_series():
+    from simpler_setup.tools.l2_pftrace import encode_l2_trace  # noqa: PLC0415
+
+    proto = pytest.importorskip("perfetto.protos.perfetto.trace.perfetto_trace_pb2")
+    event = {"ph": "C", "cat": "queue", "name": "depth", "pid": 2, "tid": 3999}
+    events = [event | {"ts": 4, "args": {"AIC": 2, "AIV": 1.5}}, event | {"ts": 5, "args": {"AIC": 0}}]
+    trace = proto.Trace.FromString(encode_l2_trace(events))
+    tracks = {p.track_descriptor.uuid: p.track_descriptor.name for p in trace.packet if p.HasField("track_descriptor")}
+    samples = [
+        (tracks[p.track_event.track_uuid], p.timestamp, p.track_event.counter_value, p.track_event.double_counter_value)
+        for p in trace.packet
+        if p.track_event.type == proto.TrackEvent.TYPE_COUNTER
+    ]
+    assert sorted(samples) == [("depth.AIC", 4000, 2, 0.0), ("depth.AIC", 5000, 0, 0.0), ("depth.AIV", 4000, 0, 1.5)]

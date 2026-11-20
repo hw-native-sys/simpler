@@ -16,8 +16,9 @@
 
 enum class CoreAsyncMode : uint8_t { SYNCHRONOUS = 1, DEFERRED = 2 };
 
-// Internal registrations use only these two modes. Unknown external metadata
-// is normalized conservatively at ingress; SYNCHRONOUS proves no defer_wait.
+// A SYNCHRONOUS kernel completes on return and must make progress without waiting
+// for a signal from another rank. It may signal a peer. Cross-rank waits are
+// registered through defer_wait by DEFERRED kernels. Unknown metadata is normalized at ingress.
 struct CoreAsyncCapability {
     uint32_t version{0};
     CoreAsyncMode mode{};

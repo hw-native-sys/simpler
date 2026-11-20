@@ -219,7 +219,11 @@ inline bool plan_layout(
     PercounterLayout next{};
     next.profiling_level = profiling_level;
     next.task_record_capacity = static_cast<uint32_t>(std::min(block_total, uint64_t{65536}));
-    if (profiling_level >= 2) next.event_record_capacity = std::min(next.task_record_capacity * 8, 16384U);
+    if (profiling_level >= 2) {
+        // L2 adds at most four one-shot checkpoints per block on a lane.
+        const uint32_t events_per_block = profiling_level == 2 ? 12 : 8;
+        next.event_record_capacity = std::min(next.task_record_capacity, 2048U) * events_per_block;
+    }
     next.task_count = task_count;
     next.edge_count = edge_count;
     for (uint32_t t = 0; t < PERCOUNTER_CORE_TYPE_COUNT; ++t)

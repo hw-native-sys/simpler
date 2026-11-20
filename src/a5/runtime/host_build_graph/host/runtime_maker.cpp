@@ -611,7 +611,9 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
 
     const uint64_t swimlane_run_epoch = api->run_epoch();
     std::ostringstream identities_json;
-    identities_json << "{\"schema\":\"hbg-execution-identity\",\"version\":2,\"producer\":\"aicore\",\"records\":[";
+    const bool capture_l2 = level == static_cast<uint32_t>(ChipSwimlaneLevel::SCHEDULE_TIMING);
+    identities_json << "{\"schema\":\"hbg-execution-identity\",\"version\":" << (capture_l2 ? 3 : 2)
+                    << ",\"producer\":\"aicore\",\"records\":[";
     bool first_identity = true;
     for (uint64_t trace_index : emitted_traces) {
         const SchedulerTaskTrace &trace = traces[trace_index];
@@ -636,7 +638,19 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         if ((flags & SCHEDULER_TRACE_GROUP) != 0) identities_json << trace.execution_group_seq;
         else identities_json << "null";
         identities_json << ",\"group_kind\":" << ((flags & SCHEDULER_TRACE_CLUSTER_GROUP) != 0 ? 2 : 0)
-                        << ",\"executed\":" << ((flags & SCHEDULER_TRACE_EXECUTED) != 0 ? "true" : "false") << "}";
+                        << ",\"executed\":" << ((flags & SCHEDULER_TRACE_EXECUTED) != 0 ? "true" : "false");
+        if (capture_l2) {
+            identities_json << ",\"schedule_cycles\":[" << trace.state_probe_start_cycles << ","
+                            << trace.state_probe_end_cycles << "," << trace.dispatch_start_cycles << ","
+                            << trace.complete_end_cycles;
+            if (trace.l2_proxy_begin_cycles != 0)
+                identities_json << "," << trace.l2_proxy_begin_cycles << "," << trace.l2_proxy_arm_cycles;
+            identities_json << "]";
+            if (trace.l2_first_pending_cycles != 0)
+                identities_json << ",\"pending_fanin\":[" << public_id(trace.l2_first_predecessor) << ","
+                                << trace.l2_first_pending_cycles << "]";
+        }
+        identities_json << "}";
     }
     identities_json << "]}";
     const std::string identities_payload = identities_json.str();
@@ -839,7 +853,8 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
                                << ",\"scalar_storage_bytes\":"
                                << uint64_t{buffer.scalar_storage_slots} * sizeof(SchedulerScalarStorageSlot)
                                << ",\"scalar_logical_records\":" << buffer.scalar_committed
-                               << ",\"iterations_detailed\":true";
+                               << ",\"iterations_detailed\":"
+                               << (level >= static_cast<uint32_t>(ChipSwimlaneLevel::ORCH_PHASES) ? "true" : "false");
             }
             scheduler_json << "}";
         }
@@ -1910,11 +1925,16 @@ bool create_scheduler_state(
         dependency_graph.native_header_offset = native_image.header_offset;
     }
     std::string task_order_error;
+    const bool defer_side_tasks = scheduler_can_defer_side_tasks(
+        native_graph, async_plan.layout.group_count != 0, task_catalog_plan.header.control_count, task_metadata
+    );
     if ((!collect_fanin &&
          !scheduler_plan_dependencies(
              dependency_graph, task_metadata, inline_completed_task_refs, dependencies, &task_order_error
          )) ||
-        !scheduler_order_task_catalog(dependencies, task_metadata, &task_catalog_plan, &task_order_error)) {
+        !scheduler_order_task_catalog(
+            dependencies, task_metadata, &task_catalog_plan, &task_order_error, defer_side_tasks
+        )) {
         LOG_ERROR("A5 HBG: task ordering failed: %s", task_order_error.c_str());
         return false;
     }
