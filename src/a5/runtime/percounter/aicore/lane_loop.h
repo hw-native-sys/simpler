@@ -1105,21 +1105,15 @@ percounter_publish_segment(const LaneConfig &cfg, uint32_t index, uint64_t close
 
 /**
  * AIC work and MIX take one owner per cluster; ordinary vector work takes one
- * per AIV lane. A sync boundary sized to that count assigns block `rank` to the
- * owner of rank `rank`. Every owner reaches the same verdict from the same two
- * words, so the ticket path and this one never share a boundary.
- *
- * Only a sync boundary qualifies, and only one exactly as wide as its domain.
- * Binding a block to one owner gives up the ticket path's balancing -- a busy
- * owner's block waits for that owner rather than moving to a free one. A
- * full-width cohort has no such balancing to lose, since every owner takes a
- * block; a narrower one does, and pays for it.
+ * per AIV lane. A full-width assignment reserves one block for each owner.
+ * Synchronized tasks and full-width asynchronous MIX use this assignment.
+ * The task's sync flag independently controls the start barrier.
  */
 inline __aicore__ bool
 percounter_claim_is_static(const LaneConfig &cfg, uint32_t list, bool mix, bool sync, uint32_t blocks) {
-    if (!sync) return false;
+    if (blocks < 2 || (!sync && !mix)) return false;
     const uint32_t owners = (list == 0 || mix) ? cfg.cluster_count : cfg.cluster_count * cfg.aiv_per_cluster;
-    return owners != 0 && blocks == owners;
+    return blocks == owners;
 }
 
 inline __aicore__ uint32_t percounter_owner_rank(const LaneConfig &cfg, uint32_t list, bool mix) {
@@ -1185,9 +1179,7 @@ inline __aicore__ void percounter_claim(const LaneConfig &cfg, PercounterLaneSta
         state->revisit &= ~(1U << slot);
         auto &previous = state->slots[slot];
         const auto metadata = previous.metadata;
-        // A statically assigned boundary gives this owner exactly one block, and
-        // its exhaustion mask completes before the lowest ranks have scanned, so
-        // neither the mask nor the summary bit may steer an owner here.
+        // Each owner has exactly one block at a statically assigned boundary.
         if (percounter_claim_is_static(
                 cfg, list, __builtin_popcount(metadata.active_mask) > 1, metadata.sync_index != PERCOUNTER_NO_SYNC,
                 metadata.block_num
@@ -1226,17 +1218,18 @@ inline __aicore__ void percounter_claim(const LaneConfig &cfg, PercounterLaneSta
             source.segment += skip - 1;
             continue;
         }
+        // Bind publishes the schedule before READY. Each lane invalidates
+        // its data cache before consuming the schedule for this launch.
+        const auto &segment = cfg.segments[segment_index];
         const bool loaded_now = source.loaded_segment != scan;
         if (loaded_now) {
-            source.task_shape = percounter_gm_read(cfg.segments[segment_index].task_shape);
+            source.task_shape = segment.task_shape;
             source.loaded_segment = scan;
         }
         const uint64_t shape = source.task_shape;
         const uint32_t blocks = static_cast<uint32_t>(shape >> 48);
         // A closed boundary counter also proves its preceding interval claimed.
-        // A statically assigned boundary is exempt: its mask completes as soon as
-        // the highest ranks publish, which can precede a lower rank's scan, and
-        // that owner's block is reserved for it alone.
+        // A statically assigned boundary holds a separate block for each owner.
         const bool statically_assigned =
             shape != 0 && percounter_claim_is_static(
                               cfg, list, __builtin_popcount(static_cast<uint32_t>(shape >> 32) & 7U) > 1,
@@ -1250,12 +1243,10 @@ inline __aicore__ void percounter_claim(const LaneConfig &cfg, PercounterLaneSta
             }
         }
         if (loaded_now) {
-            const uint64_t bounds = percounter_gm_read_immutable_word(&cfg.segments[segment_index].begin);
-            source.begin = static_cast<uint32_t>(bounds);
-            source.end = static_cast<uint32_t>(bounds >> 32);
+            source.begin = segment.begin;
+            source.end = segment.end;
             source.interval_spent = source.begin == source.end;
-            if (!source.interval_spent)
-                source.ticket_begin = percounter_gm_read(cfg.segments[segment_index].ticket_begin);
+            if (!source.interval_spent) source.ticket_begin = segment.ticket_begin;
         }
         if (!source.interval_spent) {
             uint32_t count = static_cast<uint32_t>(__builtin_popcount(free));
@@ -1268,7 +1259,7 @@ inline __aicore__ void percounter_claim(const LaneConfig &cfg, PercounterLaneSta
                 for (uint32_t k = 0; k < count && first + k < size; ++k) {
                     const uint32_t slot = __builtin_ctz(free);
                     free &= ~(1U << slot);
-                    const uint64_t entry = percounter_gm_read(cfg.order[source.begin + first + k]);
+                    const uint64_t entry = cfg.order[source.begin + first + k];
                     percounter_own_entry(
                         cfg, state, entry, slot, false, percounter_regular_metadata(cfg, entry), claim_start
                     );
@@ -1289,12 +1280,9 @@ inline __aicore__ void percounter_claim(const LaneConfig &cfg, PercounterLaneSta
                                                              percounter_claim_block(cfg, claim_index, blocks);
                 if (block < blocks) {
                     const uint32_t task = static_cast<uint32_t>(shape);
-                    const uint32_t rank =
-                        static_cast<uint32_t>(percounter_gm_read_immutable_word(&cfg.metadata[task].global_order_id));
+                    const uint32_t rank = cfg.metadata[task].global_order_id;
                     const uint32_t sync =
-                        (shape & (uint64_t{8} << 32)) ?
-                            static_cast<uint32_t>(percounter_gm_read_immutable_word(&cfg.metadata[task].sync_index)) :
-                            PERCOUNTER_NO_SYNC;
+                        (shape & (uint64_t{8} << 32)) ? cfg.metadata[task].sync_index : PERCOUNTER_NO_SYNC;
                     const PercounterTaskMetadata metadata{
                         rank, static_cast<uint16_t>(mask), static_cast<uint16_t>(blocks), sync, PERCOUNTER_NO_BOUNDARY
                     };
@@ -1339,11 +1327,10 @@ inline __aicore__ uint32_t percounter_source_floor(const LaneConfig &cfg, Percou
         if (blocks == 0) {
             const uint64_t shape = source.loaded_segment == index - cfg.segment_begin[list] ?
                                        source.task_shape :
-                                       percounter_gm_read(cfg.segments[index].task_shape);
+                                       cfg.segments[index].task_shape;
             blocks = static_cast<uint32_t>(shape >> 48);
             task = static_cast<uint32_t>(shape);
-            cursor.next_segment =
-                static_cast<uint32_t>(percounter_gm_read_immutable_word(&cfg.metadata[task].sync_index) >> 32);
+            cursor.next_segment = cfg.metadata[task].next_boundary_segment;
             cursor.statically_assigned = percounter_claim_is_static(
                 cfg, list, __builtin_popcount(static_cast<uint32_t>(shape >> 32) & 7U) > 1,
                 (shape & (uint64_t{8} << 32)) != 0, blocks
@@ -1355,8 +1342,7 @@ inline __aicore__ uint32_t percounter_source_floor(const LaneConfig &cfg, Percou
         if (!released) {
             if (cursor.block_count == 0) {
                 cursor.block_count = blocks;
-                cursor.rank =
-                    static_cast<uint32_t>(percounter_gm_read_immutable_word(&cfg.metadata[task].global_order_id));
+                cursor.rank = cfg.metadata[task].global_order_id;
             }
             return cursor.rank;
         }
