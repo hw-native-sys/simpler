@@ -76,7 +76,6 @@ struct PercounterLayout {
     uint64_t claim_summary_offset;
     uint64_t ticket_interval_count;
     uint64_t sync_cohort_count;
-    uint64_t sync_arrivals_offset;
     uint64_t sync_notify_offset;
     uint64_t metadata_offset;
     uint64_t metadata_ready_offset;
@@ -167,14 +166,15 @@ struct ExternalAddresses {
     uint64_t graph_storage_count = 0;
     uint64_t callable_table = 0;
     uint64_t callable_count = 0;
-    // One CntNotify SET/read address per sync cohort, in cohort order, or null
-    // to leave every cohort on the GM arrival sectors. A zero entry leaves that
-    // one cohort there, which is how an exhausted pool degrades.
+    // One CntNotify SET/read address per sync cohort, in cohort order.
     const uint64_t *sync_notify = nullptr;
     uint64_t sync_notify_count = 0;
     const SchedulerCompletionCounterPlan *completion_plan = nullptr;
     const uint64_t *completion_notify = nullptr;
     uint64_t completion_notify_count = 0;
+    // One slot per Graph body task, in invocation and body order.
+    const uint64_t *body_completion_notify = nullptr;
+    uint64_t body_completion_notify_count = 0;
 };
 
 /**
@@ -250,7 +250,6 @@ inline bool plan_layout(
         !PERCOUNTER_RESERVE(
             (boundary_task_count + PERCOUNTER_LIST_COUNT + 63) / 64, PercounterClaimSummary, claim_summary_offset
         ) ||
-        !PERCOUNTER_RESERVE(sync_cohort_count, PercounterStartBarrier, sync_arrivals_offset) ||
         !PERCOUNTER_RESERVE(sync_cohort_count, uint64_t, sync_notify_offset) ||
         !PERCOUNTER_RESERVE(task_count, PercounterTaskMetadata, metadata_offset) ||
         !PERCOUNTER_RESERVE(task_count, uint64_t, metadata_ready_offset) ||
@@ -423,12 +422,9 @@ inline bool percounter_fold_dependency_tasks(
     return true;
 }
 
-inline bool percounter_completion_notify_eligible(const TaskInput &task) {
-    return task.block_num > 1 && !task.inline_completed && !task.published_off_lane && task.graph_invocation < 0;
-}
-
 inline bool plan_percounter_completion_counters(
-    const std::vector<TaskInput> &tasks, SchedulerCompletionCounterPlan *plan, std::string *error
+    const std::vector<TaskInput> &tasks, SchedulerCompletionCounterPlan *plan, std::string *error,
+    const GraphPlanInput &graph = {}
 ) {
     std::vector<int64_t> order(tasks.size());
     std::iota(order.begin(), order.end(), int64_t{0});
@@ -443,8 +439,16 @@ inline bool plan_percounter_completion_counters(
             return false;
         }
         if (task.fanin_count != 0) fanin[id].assign(task.fanin_ids, task.fanin_ids + task.fanin_count);
-        if (!percounter_completion_notify_eligible(task)) continue;
-        const int64_t contribution = static_cast<int64_t>(task.block_num) * task.subtask_count;
+        int64_t contribution = static_cast<int64_t>(task.block_num) * task.subtask_count;
+        if (task.graph_invocation >= 0) {
+            const auto invocation = static_cast<size_t>(task.graph_invocation);
+            if (invocation >= graph.invocation_count ||
+                graph.invocations[invocation].template_index >= graph.template_count) {
+                *error = "invalid Graph for completion counter";
+                return false;
+            }
+            contribution = graph.templates[graph.invocations[invocation].template_index].sink_subtask_total;
+        }
         if (contribution <= 0 || contribution > UINT32_MAX) {
             *error = "invalid completion credit count";
             return false;
@@ -537,6 +541,15 @@ inline bool build_tables(
         graph.invocation_count != layout.graph_invocation_count ||
         (graph.invocation_count != 0 && (graph.invocations == nullptr || graph.templates == nullptr)))
         return fail(BuildStatus::INVALID_ARGUMENT, -1, -1);
+    if (layout.sync_cohort_count != 0 &&
+        (external.sync_notify == nullptr || external.sync_notify_count != layout.sync_cohort_count))
+        return fail(BuildStatus::INVALID_ARGUMENT, -1, -1);
+    for (uint64_t i = 0; i < layout.sync_cohort_count; ++i)
+        if (a5_cnt_notify_increment_address(external.sync_notify[i]) == 0)
+            return fail(BuildStatus::INVALID_ARGUMENT, -1, -1);
+    if (external.body_completion_notify_count != layout.task_count - task_count ||
+        (external.body_completion_notify_count != 0 && external.body_completion_notify == nullptr))
+        return fail(BuildStatus::INVALID_ARGUMENT, -1, -1);
 
     std::memset(base, 0, static_cast<size_t>(layout.upload_size));
 
@@ -546,13 +559,19 @@ inline bool build_tables(
     auto *fanin = region_at<PercounterFanin>(base, layout.fanin_offset);
     auto *fanin_addr = region_at<uint64_t>(base, layout.fanin_addr_offset);
     auto *counters = region_at<PercounterCounter>(base, layout.counters_offset);
-    if (external.completion_plan != nullptr && external.completion_notify != nullptr) {
+    if (external.completion_plan != nullptr) {
         const auto &plan = *external.completion_plan;
+        if (external.completion_notify == nullptr || plan.chains.size() != external.completion_notify_count ||
+            plan.task_chains.size() != task_count || plan.thresholds.size() != task_count)
+            return fail(BuildStatus::INVALID_ARGUMENT, -1, -1);
         for (uint64_t id = 0; id < task_count; ++id) {
             const uint32_t chain = plan.task_chains[id];
-            if (chain >= external.completion_notify_count) continue;
+            if (tasks[id].inline_completed || tasks[id].published_off_lane) continue;
+            if (chain >= external.completion_notify_count || plan.thresholds[id] == 0)
+                return fail(BuildStatus::INVALID_ARGUMENT, static_cast<int64_t>(id), -1);
             const uint64_t set = external.completion_notify[chain];
-            if (a5_cnt_notify_increment_address(set) == 0) continue;
+            if (a5_cnt_notify_increment_address(set) == 0)
+                return fail(BuildStatus::INVALID_ARGUMENT, static_cast<int64_t>(id), -1);
             counters[id].completion_notify_address = set;
             counters[id].completion_notify_target = plan.thresholds[id];
         }
@@ -754,6 +773,11 @@ inline bool build_tables(
             for (size_t b = 0; b < tmpl.tasks.size(); ++b) {
                 metadata[body + b] = tmpl.tasks[b].metadata;
                 counters[body + b].value = percounter_counter_preset(tmpl.tasks[b].subtask_total);
+                const uint64_t set = external.body_completion_notify[body + b - task_count];
+                if (a5_cnt_notify_increment_address(set) == 0)
+                    return fail(BuildStatus::INVALID_ARGUMENT, static_cast<int64_t>(body + b), -1);
+                counters[body + b].completion_notify_address = set;
+                counters[body + b].completion_notify_target = tmpl.tasks[b].subtask_total;
                 metadata[body + b].global_order_id += global_rank;
                 if (metadata[body + b].sync_index != PERCOUNTER_NO_SYNC) metadata[body + b].sync_index = sync_index++;
             }
@@ -927,18 +951,10 @@ inline bool build_tables(
     control->task_claims_offset = layout.task_claims_offset;
     control->claim_summary_offset = layout.claim_summary_offset;
     control->sync_cohort_count = layout.sync_cohort_count;
-    control->sync_arrivals_offset = layout.sync_arrivals_offset;
     control->sync_notify_offset = layout.sync_notify_offset;
     auto *sync_notify = region_at<uint64_t>(base, layout.sync_notify_offset);
-    for (uint64_t cohort = 0; cohort < layout.sync_cohort_count; ++cohort) {
-        const uint64_t set =
-            external.sync_notify != nullptr && cohort < external.sync_notify_count ? external.sync_notify[cohort] : 0;
-        // A slot whose SET address is not 32-byte aligned has no ADD alias, so
-        // that cohort keeps the GM arrival sectors, as does an unmapped one.
-        // Publishing only the addresses that pass leaves the device's own
-        // alias rule total over this table.
-        sync_notify[cohort] = a5_cnt_notify_increment_address(set) == 0 ? 0 : set;
-    }
+    for (uint64_t cohort = 0; cohort < layout.sync_cohort_count; ++cohort)
+        sync_notify[cohort] = external.sync_notify[cohort];
     control->metadata_offset = layout.metadata_offset;
     control->metadata_ready_offset = layout.metadata_ready_offset;
     control->segments_offset = layout.segments_offset;

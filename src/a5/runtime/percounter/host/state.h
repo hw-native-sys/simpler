@@ -185,7 +185,6 @@ inline StateSelection select_percounter_state(
     uint64_t mix_task_count = 0;
     uint64_t boundary_task_count = 0;
     uint64_t sync_cohort_count = 0;
-    uint64_t completion_notify_count = 0;
     // Each GRAPH task places its body's blocks, and holds one of its own that
     // no list carries.
     uint64_t block_total = graph.body_blocks;
@@ -229,7 +228,6 @@ inline StateSelection select_percounter_state(
             const uint64_t entries = 1;
             if (input.block_num > 1 || input.is_mix) ++boundary_task_count;
             if (input.sync_start) ++sync_cohort_count;
-            if (percounter_completion_notify_eligible(input)) ++completion_notify_count;
             if (input.is_mix) mix_task_count += entries;
             order_count[input.is_mix ? 1 : input.core_type_index] += entries;
             block_total += static_cast<uint64_t>(input.block_num);
@@ -281,45 +279,40 @@ inline StateSelection select_percounter_state(
     }
     const uint64_t device_base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(device_state));
 
+    const GraphPlanInput graph_plan{
+        graph.templates.data(), graph.templates.size(), graph.invocations.data(), graph.invocations.size()
+    };
     SchedulerCompletionCounterPlan completion_plan;
-    if (completion_notify_count != 0) {
-        std::string error;
-        if (!plan_percounter_completion_counters(inputs, &completion_plan, &error)) {
-            LOG_ERROR("A5 percounter: completion counter plan failed: %s", error.c_str());
-            return StateSelection::FAILED;
-        }
+    std::string error;
+    if (!plan_percounter_completion_counters(inputs, &completion_plan, &error, graph_plan)) {
+        LOG_ERROR("A5 percounter: completion counter plan failed: %s", error.c_str());
+        return StateSelection::FAILED;
     }
-
-    // Keep sync cohorts first in the lease so allocation pressure does not
-    // displace their existing mappings. The AICPU clears both groups before READY.
+    const uint64_t top_level_chain_count = completion_plan.chains.size();
+    const uint64_t body_task_count = layout.task_count - task_count;
+    const uint64_t body_notify_begin = sync_cohort_count + top_level_chain_count;
+    const uint64_t notify_count = body_notify_begin + body_task_count;
+    // START, top-level DONE chains, and body DONE use disjoint slots.
     std::vector<uint64_t> notify_addresses;
-    const uint64_t notify_count = sync_cohort_count + completion_plan.chains.size();
     if (notify_count != 0) {
         SchedulerDoneNotifications notifications{};
-        if (api->acquire_scheduler_notifications(
-                SchedulerNotificationPurpose::COMPLETION_COUNTER, static_cast<size_t>(notify_count), &notifications
-            ) == 0) {
-            notify_addresses = std::move(notifications.addresses);
-            if (notifications.owner != nullptr) runtime->retain_pending_resource(std::move(notifications.owner));
+        const int rc = api->acquire_scheduler_notifications(
+            SchedulerNotificationPurpose::PERCOUNTER_COUNTER, static_cast<size_t>(notify_count), &notifications
+        );
+        if (rc != 0 || notifications.addresses.size() != notify_count ||
+            std::any_of(notifications.addresses.begin(), notifications.addresses.end(), [](uint64_t set) {
+                return a5_cnt_notify_increment_address(set) == 0;
+            })) {
+            LOG_ERROR(
+                "A5 percounter: incomplete SRAM START/DONE mapping for %" PRIu64 " slots (rc=%d)", notify_count, rc
+            );
+            return StateSelection::FAILED;
         }
-        const auto mapped = [&](size_t index) {
-            return index < notify_addresses.size() && a5_cnt_notify_increment_address(notify_addresses[index]) != 0;
-        };
-        uint64_t mapped_sync = 0;
-        for (size_t index = 0; index < sync_cohort_count; ++index)
-            mapped_sync += mapped(index);
-        size_t mapped_chains = 0;
-        for (size_t chain = 0; chain < completion_plan.chains.size(); ++chain)
-            mapped_chains += mapped(sync_cohort_count + chain);
-        const auto mapped_tasks =
-            std::count_if(completion_plan.task_chains.begin(), completion_plan.task_chains.end(), [&](uint32_t chain) {
-                return chain != UINT32_MAX && mapped(sync_cohort_count + chain);
-            });
+        notify_addresses = std::move(notifications.addresses);
+        if (notifications.owner != nullptr) runtime->retain_pending_resource(std::move(notifications.owner));
         LOG_TIMING(
-            "A5 percounter: completion counters planned_chains=%zu mapped_chains=%zu eligible_tasks=%" PRIu64
-            " mapped_tasks=%zu mapped_sync=%" PRIu64 " sync_cohorts=%" PRIu64,
-            completion_plan.chains.size(), mapped_chains, completion_notify_count, static_cast<size_t>(mapped_tasks),
-            mapped_sync, sync_cohort_count
+            "A5 percounter: SRAM slots START=%" PRIu64 " top-level DONE chains=%" PRIu64 " body DONE=%" PRIu64,
+            sync_cohort_count, top_level_chain_count, body_task_count
         );
     }
 
@@ -329,16 +322,15 @@ inline StateSelection select_percounter_state(
     external.callable_table = runtime->callable_entry_table_addr();
     external.callable_count = static_cast<uint64_t>(runtime->callable_table_len());
     external.sync_notify = notify_addresses.data();
-    external.sync_notify_count = std::min<uint64_t>(notify_addresses.size(), sync_cohort_count);
-    if (notify_addresses.size() > sync_cohort_count) {
+    external.sync_notify_count = sync_cohort_count;
+    if (top_level_chain_count != 0) {
         external.completion_plan = &completion_plan;
         external.completion_notify = notify_addresses.data() + sync_cohort_count;
-        external.completion_notify_count = notify_addresses.size() - sync_cohort_count;
+        external.completion_notify_count = top_level_chain_count;
     }
+    if (body_task_count != 0) external.body_completion_notify = notify_addresses.data() + body_notify_begin;
+    external.body_completion_notify_count = body_task_count;
     BuildResult build{};
-    const GraphPlanInput graph_plan{
-        graph.templates.data(), graph.templates.size(), graph.invocations.data(), graph.invocations.size()
-    };
     if (!build_tables(
             inputs.data(), task_count, layout, host_base, device_base,
             static_cast<uint32_t>(runtime->get_worker_count() / PLATFORM_CORES_PER_BLOCKDIM), external, &build,

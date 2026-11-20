@@ -61,18 +61,13 @@ inline PercounterControl *percounter_control(Runtime *runtime) {
  * Clear every CntNotify register this run holds. The pool is shared with the
  * sibling runtime and reused across runs, so a cohort's register still carries
  * its previous holder's count until this runs. No AICore can observe READY yet.
- *
- * A cohort whose entry is zero uses the GM arrival sectors, which the Host
- * zeroes in the uploaded image instead.
  */
 inline void percounter_reset_sync_notifications(PercounterControl *control) {
     if (control->sync_notify_offset == 0 || control->sync_cohort_count == 0) return;
     auto *notify = percounter_region<uint64_t>(control, control->sync_notify_offset);
     cache_invalidate_range(notify, static_cast<size_t>(control->sync_cohort_count) * sizeof(uint64_t));
-    for (uint64_t cohort = 0; cohort < control->sync_cohort_count; ++cohort) {
-        if (notify[cohort] == 0) continue;
+    for (uint64_t cohort = 0; cohort < control->sync_cohort_count; ++cohort)
         *reinterpret_cast<volatile uint32_t *>(notify[cohort]) = 0;
-    }
 }
 
 /**
@@ -122,8 +117,8 @@ percounter_post_handshake_init(Runtime *runtime, const AicoreLifecycle &lifecycl
     percounter_graph_prepare_init(control);
     percounter_reset_sync_notifications(control);
     auto *counters = scheduler_state_at<PercounterCounter>(control, control->counters_offset);
-    cache_invalidate_range(counters, control->table_task_count * sizeof(PercounterCounter));
-    for (uint64_t id = 0; id < control->table_task_count; ++id) {
+    cache_invalidate_range(counters, control->task_count * sizeof(PercounterCounter));
+    for (uint64_t id = 0; id < control->task_count; ++id) {
         const auto &counter = counters[id];
         if (percounter_completion_notify_head(counter, counter.value))
             *reinterpret_cast<volatile uint32_t *>(counter.completion_notify_address) = 0;

@@ -68,16 +68,10 @@ the publication floor releases it when that lane's own claim cursor passes.
 Only a full-width sync boundary qualifies: binding a block to one owner
 gives up the ticket path's freedom to place it on whichever owner arrives first,
 which a cohort taking every owner has nothing to spend and a narrower one does.
-A sync task counts its arrivals in one STARS
-CntNotify register when the Host could map one for that cohort: a block writes
-the unit-increment command and an observer reads the register once, comparing it
-against the block count. SRAM carries no same-address serialization, so one
-counter costs a reader less than four partitions do. A cohort the Host could not
-map keeps four independent 128-byte GM arrival sectors, selected by logical block
-index modulo four, where every nonempty sector must reach its expected block
-count before the cohort can start. Either way an over-arrival is permanent, and
-the entry-commitment token, the per-slot entry flag and the refusal to re-claim
-an exhausted task are what keep each block arriving once.
+A sync task counts arrivals in its STARS CntNotify START register. A block writes
+one increment and an observer waits for the block count. The entry-commitment
+token, per-slot flag and exhaustion check keep each block arriving once.
+Bind requires a mapped START slot for every sync cohort.
 Ordinary AIC, ordinary AIV and MIX sync widths are checked against their actual
 eligible owner counts. Nonempty single-block intervals reserve one ticket
 sector each, bounded by the smaller of the ordinary single-block task count
@@ -179,14 +173,15 @@ work. The same task ID can recur with a new generation for another SPMD block.
 Generation checks enclose shared descriptor reads, including nonparticipants
 that can race reuse. SSBUF has no atomics. Each token has one writer.
 
-The Host plans monotonic CntNotify chains for top-level multi-block tasks.
+The Host plans monotonic CntNotify DONE chains for all top-level tasks that
+complete on the lanes, including ordinary single-block tasks and Graph shells.
 A task can extend a chain whose last task is a strict DAG ancestor, as long as
 the accumulated credit count fits in 32 bits. Planning collapses ancestry
 through credit-free nodes with one relevant frontier and bounds indirect
 search to 256 fanin edges per candidate. It creates a separate chain when no
-reusable tip is found within that search. Tasks assigned to a mapped chain
-share one SRAM register and have cumulative thresholds. The AICPU resets each
-mapped chain once before READY. Each physical subtask
+reusable tip is found within that search. Tasks in a chain share one SRAM
+register and have cumulative thresholds. The AICPU resets each register once
+before READY. Each physical subtask
 increments it once after synchronous completion or after its deferred condition
 is satisfied. Each MIX lane publishes its own credit. The fanin observer caches the register address and target
 after the first probe, and tests one MMIO value against the expected subtask
@@ -194,11 +189,11 @@ count including the prefix of its chain. The AICPU uses the same threshold
 for top-level sinks. Later contributions preserve the completion proof for
 earlier tasks in the chain.
 
-Unmapped tasks and Graph body tasks publish into the GM counter in their
-task record. The Host presets it to `1 - total_subtasks`. Each physical
-subtask publishes one credit when its completion becomes final, and the
-consumer waits for a positive value. Graph shells receive the sum of their
-body sink subtask credits.
+The Host assigns each Graph body task a DONE slot and sets its target to the
+total subtask count. A body sink publishes one credit to its own slot and
+one to the shell when each subtask finishes, including deferred settlement.
+START slots, top-level DONE chains and body DONE slots are disjoint. Bind
+fails if the complete mapping is unavailable.
 
 The Host folds top-level dependency-only joins with at most one live
 consumer when the merged fanin fits the task limit. The consumer inherits
@@ -209,13 +204,13 @@ The logical task table remains available to dependency export.
 
 The Host omits predecessors already complete at bind from device fanin rows.
 The logical DAG still determines ordering and sink discovery. A task-table
-fanin entry points to a GM counter or tags a CntNotify descriptor. Graph body
-fanin entries carry local producer indices. Ordinary slots and the MIX
+fanin entry tags a CntNotify descriptor. Graph body fanin entries carry local
+producer indices and resolve to the corresponding body DONE descriptor. Ordinary slots and the MIX
 observer's SSBUF record retain the current producer and its SRAM threshold
 while waiting. Ready observations advance the producer cursor.
 
 The state allocation is aligned to 128 bytes. The uploaded image includes
-the primary completion counters and claim tickets. AICore invalidates its
+the completion descriptors and claim tickets. AICore invalidates its
 data cache after READY and before reading the uploaded image.
 The SSBUF record remains 128 bytes. Each boundary task uses 640 device bytes for
 claim state. Immutable control fields use ordinary loads after the lane's entry
@@ -266,7 +261,7 @@ until the run retires, including deferred completions.
 
 Static Graph order, shape and total-subtask completion seeds are available at
 bind. Graph body fanin references encode local producer indices. The Host
-presets each GM counter before upload. AICPU materialization binds each
+assigns each body DONE slot before upload. AICPU materialization binds each
 body task's descriptors and writes Tensor pointers and Scalars directly to its
 final vector, then publishes
 `metadata_ready` after writing back both. It does not wait for fanin. Lanes never

@@ -280,6 +280,28 @@ static int acquire_scheduler_state_storage(
     }
 }
 
+static int acquire_scheduler_notifications(
+    void *, uint32_t, SchedulerNotificationPurpose purpose, size_t count, SchedulerDoneNotifications *out
+) {
+    if (out == nullptr || purpose != SchedulerNotificationPurpose::PERCOUNTER_COUNTER) return -1;
+    // The AICore simulation treats SET as the stored value and ADD as its alias.
+    struct alignas(32) Counter {
+        uint32_t words[8]{};
+    };
+    try {
+        *out = {std::vector<uint64_t>(count, 0), std::vector<uint64_t>(count, 0), {}};
+        auto counters = std::make_shared<std::vector<Counter>>(count);
+        for (size_t i = 0; i < count; ++i) {
+            out->addresses[i] = reinterpret_cast<uint64_t>(&(*counters)[i].words[0]);
+            out->add_addresses[i] = reinterpret_cast<uint64_t>(&(*counters)[i].words[2]);
+        }
+        out->owner = std::move(counters);
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
 static void record_scheduler_runtime_mode(void *runner_ctx, uint32_t pipeline_slot, uint32_t mode) {
     (void)pipeline_slot;
     if (runner_ctx == nullptr) return;
@@ -582,6 +604,7 @@ static const HostApiOps g_host_api_ops = {
     .caller_device_span_written_by_other_run = caller_device_span_written_by_other_run,
     .get_orchestration_scratch = get_orchestration_scratch,
     .set_orchestration_scratch = set_orchestration_scratch,
+    .acquire_scheduler_notifications = acquire_scheduler_notifications,
     .get_callable_async_capabilities = get_callable_async_capabilities,
 };
 

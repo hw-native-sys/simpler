@@ -34,7 +34,10 @@ class NotificationPool final : public SchedulerNotificationStorage {
 public:
     NotificationPool(void *context, SchedulerNotificationPurpose purpose) :
         SchedulerNotificationStorage(context),
-        counter_(purpose == SchedulerNotificationPurpose::COMPLETION_COUNTER) {}
+        counter_(
+            purpose == SchedulerNotificationPurpose::COMPLETION_COUNTER ||
+            purpose == SchedulerNotificationPurpose::PERCOUNTER_COUNTER
+        ) {}
     size_t capacity() const override { return notifications_.size(); }
 
     SchedulerDoneNotifications prepare(size_t count) override {
@@ -47,10 +50,7 @@ public:
             const auto rc = aclrtCntNotifyCreate(&notification.handle, 0);
             if (rc == ACL_ERROR_RT_NO_NOTIFY_RESOURCE || rc == ACL_ERROR_RT_RESOURCE_ALLOC_FAIL) {
                 notifications_.pop_back();
-                LOG_WARN(
-                    "A5 HBG: CntNotify capacity exhausted at %zu/%zu; remaining nodes use GM", notifications_.size(),
-                    count
-                );
+                LOG_WARN("A5: CntNotify capacity exhausted at %zu/%zu", notifications_.size(), count);
                 break;
             }
             check(rc, "create");
@@ -74,9 +74,7 @@ public:
             }
         }
         if (unavailable_counters != 0)
-            LOG_WARN(
-                "A5 HBG: %zu CntNotify mappings have no aligned INC alias; use SET/GM completion", unavailable_counters
-            );
+            LOG_WARN("A5: %zu CntNotify mappings have no aligned INC alias", unavailable_counters);
         return result;
     }
 
