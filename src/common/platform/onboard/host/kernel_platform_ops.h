@@ -33,4 +33,6 @@
  */
 KernelContextOps make_onboard_kernel_context_ops();
 
-int initialize_private_workers(void *workers, size_t bytes);
+// Initialize a newly allocated worker report array on a private stream.
+// A failed drain leaves pending set so cleanup can retry before freeing it.
+int initialize_private_workers(void *stream, void *workers, size_t bytes, int timeout_ms, bool &pending);

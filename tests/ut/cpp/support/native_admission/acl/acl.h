@@ -52,7 +52,6 @@ int aclrtSynchronizeStream(aclrtStream);
 int aclrtSynchronizeStreamWithTimeout(aclrtStream, int32_t);
 int aclrtGetStreamResLimit(aclrtStream, int, uint32_t *);
 int aclrtMemset(void *, size_t, int32_t, size_t);
-int aclrtMemsetAsync(void *, size_t, int32_t, size_t, aclrtStream);
 int aclrtSetOpExecuteTimeOutV2(uint64_t, uint64_t *);
 int aclrtStreamGetId(aclrtStream, int32_t *);
 int aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus *, aclmdlRI *);

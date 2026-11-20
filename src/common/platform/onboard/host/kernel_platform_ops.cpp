@@ -107,22 +107,20 @@ KernelContextOps make_onboard_kernel_context_ops() {
     return ops;
 }
 
-int initialize_private_workers(void *workers, size_t bytes) {
-    int rc = aclrtMemset(workers, bytes, 0, bytes);
-    if (rc != ACL_ERROR_RT_CAPTURE_MODE_NOT_SUPPORT) return rc;
-
-    // A GLOBAL recording can prohibit synchronous calls even on another
-    // thread. The new generation is still private. Relax only a short-lived
-    // initializer thread so the caller keeps its capture policy.
+int initialize_private_workers(void *stream, void *workers, size_t bytes, int timeout_ms, bool &pending) {
     aclrtContext context = nullptr;
-    rc = aclrtGetCurrentContext(&context);
+    int rc = aclrtGetCurrentContext(&context);
     if (rc != ACL_SUCCESS) return rc;
     std::thread initializer([&] {
         rc = aclrtSetCurrentContext(context);
         if (rc != ACL_SUCCESS) return;
-        aclmdlRICaptureMode mode = ACL_MODEL_RI_CAPTURE_MODE_RELAXED;
-        rc = aclmdlRICaptureThreadExchangeMode(&mode);
-        if (rc == ACL_SUCCESS) rc = aclrtMemset(workers, bytes, 0, bytes);
+        if (!pending) {
+            rc = aclrtMemsetAsync(workers, bytes, 0, bytes, stream);
+            if (rc != ACL_SUCCESS) return;
+            pending = true;
+        }
+        rc = aclrtSynchronizeStreamWithTimeout(stream, timeout_ms);
+        if (rc == ACL_SUCCESS) pending = false;
     });
     initializer.join();
     return rc;

@@ -2206,10 +2206,10 @@ int DeviceRunnerBase::init_kernel_context(int device_id) {
         rc = reserve_slot_runtime_args(kernel_runtime_, mem_alloc_, storage->args, 0, /*launch_owned=*/true);
         if (rc != 0) return rc;
     }
-    return prepare_spare_submission_storage(control_stream);
+    return prepare_spare_submission_storage();
 }
 
-int DeviceRunnerBase::prepare_spare_submission_storage(void *stream) {
+int DeviceRunnerBase::prepare_spare_submission_storage() {
     // Two spare generations cover the first two replacements across all slots.
     // Further retained models use the ordinary on-demand allocation path.
     constexpr size_t spare_count = 2;
@@ -2222,18 +2222,10 @@ int DeviceRunnerBase::prepare_spare_submission_storage(void *stream) {
         if (args.shared_state == nullptr) break;
         spare_submission_storage_.push_back(std::move(storage));
         if (alloc_rc != 0) return alloc_rc;
-        const int rc = aclrtMemsetAsync(
-            args.shared_state, sizeof(RuntimeSharedState::workers), 0, sizeof(RuntimeSharedState::workers), stream
-        );
+        constexpr size_t bytes = sizeof(RuntimeSharedState::workers);
+        const int rc = aclrtMemset(args.shared_state, bytes, 0, bytes);
         if (rc != 0) return rc;
-        args.worker_initialization_pending = true;
-    }
-    if (spare_submission_storage_.empty()) return 0;
-    const int rc = aclrtSynchronizeStreamWithTimeout(stream, timeout_config_.stream_sync_timeout_ms);
-    if (rc != 0) return rc;
-    for (auto &storage : spare_submission_storage_) {
-        storage->args.worker_initialization_pending = false;
-        storage->args.workers_initialized = true;
+        args.workers_initialized = true;
     }
     return 0;
 }
@@ -4705,20 +4697,27 @@ int DeviceRunnerBase::prepare_run_storage(uint32_t slot) {
         args.shared_state = static_cast<RuntimeSharedState *>(mem_alloc_.alloc(sizeof(RuntimeSharedState)));
         if (args.shared_state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     }
-    // This generation is private until prepare succeeds. AICPU owns the gates.
-    constexpr size_t bytes = sizeof(RuntimeSharedState::workers);
-    const int rc = initialize_private_workers(args.shared_state, bytes);
+    // Initialize once on the registration stream. This allocation's first use
+    // can occur long after context initialization, while prior runs still own
+    // every preallocated generation. Runtime constructors zero the workers array
+    // on all backends. Its reports belong to the cores after initialization.
+    auto stream = kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu);
+    const int rc = initialize_private_workers(
+        stream, args.shared_state, sizeof(RuntimeSharedState::workers), timeout_config_.stream_sync_timeout_ms,
+        args.worker_initialization_pending
+    );
     if (rc == 0) args.workers_initialized = true;
     return rc;
 }
 
 int DeviceRunnerBase::release_submission_storage(PreparedSubmissionStorage &storage, bool abandon) {
     if (!abandon && storage.args.worker_initialization_pending) {
-        const int rc = aclrtSynchronizeStreamWithTimeout(
-            kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu), timeout_config_.stream_sync_timeout_ms
+        const int rc = initialize_private_workers(
+            kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu), storage.args.shared_state,
+            sizeof(RuntimeSharedState::workers), timeout_config_.stream_sync_timeout_ms,
+            storage.args.worker_initialization_pending
         );
         if (rc != 0) return rc;
-        storage.args.worker_initialization_pending = false;
     }
     if (abandon) {
         storage.caller_order->abandon();

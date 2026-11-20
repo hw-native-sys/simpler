@@ -4439,7 +4439,7 @@ TEST_F(NativeAdmissionTest, PrivateWorkerInitializationFailureLeavesThePreparedP
 
     auto cleanup = RAIIScopeGuard([&] {
         control().recording_active = false;
-        control().worker_memset_rc = 0;
+        control().stream_sync_rc = 0;
         (void)simpler_finalize_run(&runner, old.storage);
         (void)simpler_finalize_run(&runner, peer.storage);
         (void)simpler_finalize_run(&runner, replacement.storage);
@@ -4448,10 +4448,10 @@ TEST_F(NativeAdmissionTest, PrivateWorkerInitializationFailureLeavesThePreparedP
     ASSERT_EQ(old.prepare(), 0);
     ASSERT_EQ(simpler_submit_run_on_stream(&runner, old.storage, &caller), 0);
     ASSERT_EQ(peer.prepare(), 0);
-    control().worker_memset_rc = -872;
+    control().stream_sync_rc = -872;
     ASSERT_EQ(replacement.prepare(), -872);
     ASSERT_TRUE(replacement.consume_release());
-    control().worker_memset_rc = 0;
+    control().stream_sync_rc = 0;
     EXPECT_EQ(control().capture_mode_exchanges, 0u);
     ASSERT_EQ(simpler_submit_run_on_stream(&runner, peer.storage, &caller), 0);
     control().recording_active = false;

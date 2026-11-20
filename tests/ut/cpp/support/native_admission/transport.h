@@ -94,7 +94,6 @@ struct Control {
     std::vector<int> registered_ids;
     std::vector<void *> registration_streams;
     int stream_sync_rc{0};
-    int worker_memset_rc{0};
     std::function<void()> stream_sync_hook;
     std::vector<void *> observed_streams;
     bool events_complete{true};
