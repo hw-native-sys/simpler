@@ -136,6 +136,11 @@ backward-compatible with the old boolean behavior).
 | 3 | + scheduler phases (`scheduler_records`) | Does not enable orchestrator collection; an independently enabled HBG Host pool can still export Host records |
 | 4 | + orchestrator phases (Host for HBG, AICPU for TMR) | Full collection |
 
+HBG L1 groups Worker View lanes by core type, with AIC first and AIV second.
+Each type is numbered from zero using the complete captured core list, so idle
+cores keep their indices. A 32-AIC, 64-AIV capture shows active lanes from
+`AIC0`–`AIC31` followed by `AIV0`–`AIV63`. Task details retain the global worker ID.
+
 A5 `percounter` adds a task/block Scheduler View at L2 with Claim start, Claim,
 Ready, Kernel end and GM Completion issued markers. With complete predecessor
 evidence in `deps.json` and the same capture's completion records, Ideal ready
@@ -178,6 +183,16 @@ completion accounting, and descriptor reuse. The two order checks are
 `scheduler_self_order_ready` and `scheduler_mix_lane_order_ready`. The cluster
 publisher advances its boundary in `scheduler_advance_mix_floor`. Functions without a worker argument
 use the same core-local trace binding and preserve the caller's nesting depth.
+The A5 HBG L4 protocol section identifies its schema as `hbg-native-protocol`
+with integer `version: 2`. A counter record with `valid: 0, value: 0` means
+the retirement snapshot is missing. If a device task uses any such counter,
+`resolved_task_count` is JSON `null`. Otherwise the exporter counts the tasks
+proved DONE by their counter threshold or GM completion state. The successful-run
+causality audit requires a valid retirement snapshot for every mapped counter.
+The exporter reads `expected_task_count` from the workers’ graph contexts, checks
+that all workers agree and exports their common value. The audit compares it
+with the frozen task table.
+
 L3 function spans shorter than 1 us are omitted on device; L4 retains every
 instrumented function span, including short empty polls. Atomic, bypass, DCCI
 and DSB leaves are retained regardless of duration; recorder intervals are also
@@ -1361,24 +1376,21 @@ dependency / `hb_violation` flows connect via **anchor pairing** on
 the Worker View and Scheduler View task lanes — there is no dedicated
 `SPMD (block-level)` track.
 
-Each view independently selects one SPMD anchor for every
-`(func_id, task_id)` group. The Worker View chooses the earliest visible
-kernel slice: `receive_time_us` when present, including the valid value `0`,
-or `start_time_us` for archived records without a receive timestamp. The
-Scheduler View independently chooses the earliest visible AICPU slice by
+Worker View dependencies connect each producer anchor to every visible
+consumer bar, including every SPMD block and its participating MIX lanes.
+Each consumer bar also lists the logical predecessor IDs in `fanin-hint`.
+Worker View selects the earliest visible producer slice for each
+`(func_id, task_id)` by `receive_time_us` or `start_time_us` when receive
+time is unavailable. Scheduler View selects an anchor at both ends by
 `dispatch_time_us`. Equal start times are resolved by the smaller `core_id`.
-The two views can therefore select different physical subtask records. Within
-each view, dependency and `complete` arrows use that view's selected anchor.
 Dependency flows connect the visual starts of the selected source and
 destination bars. The source completion timestamp still determines whether
 the flow is named `dependency` or `hb_violation`; it does not become the flow
 start because a completion later than the destination bar start would create
 a reverse-time flow that Perfetto cannot display.
 
-The grouping includes both the function identity and the logical `task_id`
-(ring/local id), so MIX tasks that share a `task_id` across AIC/AIV functions
-keep separate anchors. The converter does not draw one arrow per subtask
-instance.
+The producer grouping uses the original function ID, so MIX tasks can have
+separate AIC and AIV producer anchors.
 
 **`complete` arrows.** Like the dependency mirror, the per-task
 `complete` flow (task → the pid=2 `complete` phase that observed its
@@ -1391,22 +1403,21 @@ changing completion attribution. The Scheduler View arrow is skipped when
 there is no visible AICPU bar.
 
 Non-SPMD tasks (including MIX multi-slot kernels with `block_num == 1`)
-keep every subtask row as an endpoint (N×N pairing unchanged).
-
-For each logical `(pred, succ)` edge from `deps.json`, the converter
-emits flows between the Cartesian product of pred/succ anchor rows
-(`|pred_anchors| × |succ_anchors|`), not a per-subtask crossbar.
+keep every subtask row as an endpoint.
 Kernel tasks anchor on AIC/AIV task rows; dummy and alloc DAG nodes
 anchor on the AICPU worker slices that represent those activities.
+If a predecessor has no visible row, it can still appear in `fanin-hint`.
 
 **SPMD lane labels.** Logical SPMD tasks append `_spmd` before the
 `(rXtY)` suffix unless the function name already contains `spmd`
 (case-insensitive), e.g. `v_proj_spmd(r2t10)` vs `SPMD_WRITE_AIV(r0t0)`.
+Display names ending in `_aic_spmd` or `_aiv_spmd` use the shared suffix
+`_spmd` for Perfetto's name-based coloring. Core lanes and function IDs
+remain available in the trace.
 
 Flow events carry `input_task_count` / `output_task_count` (SPMD
-`block_num`) to annotate fan degree. These arrows visualize **block-level**
-`deps.json` edges on representative subtasks — they do **not** imply
-runtime per-instance dependency resolution.
+`block_num`) to annotate fan degree. Each arrow visualizes a logical
+`deps.json` edge. The endpoint bars are display anchors for that edge.
 
 **What you do NOT need to script:**
 
@@ -1433,9 +1444,8 @@ What the swimlane shows:
   `dep_gen` run is available, `swimlane_converter` emits flow events
   so Perfetto draws arrows between predecessor and successor tasks
   — see [§3.5](#35-dependency-arrows-from-dep_gen). Without
-  `deps.json` the trace is correct but unarrowed. For SPMD tasks,
-  dependency arrows independently use each view's earliest visible slice per
-  `(func_id, task_id)` group as the anchor.
+  `deps.json` the trace has no dependency arrows. Worker View shows the
+  dependencies on every consumer slice.
 - **Scheduler-loop time decomposition.** Per-iteration AICPU
   phase records show how long the scheduler spent in recorded work phases;
   idle is recovered

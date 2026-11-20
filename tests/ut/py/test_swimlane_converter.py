@@ -99,6 +99,28 @@ def _task_row(
     }
 
 
+@pytest.mark.parametrize("recorded_window", [False, True])
+def test_hbg_l1_worker_order_counts_idle_cores(tmp_path, recorded_window):
+    capture = Capture(runtime=HBG_RUNTIME, level=1, core_types=["aiv", "aic", "aiv", "aic", "aiv"])
+    for worker in (4, 3, 0):
+        capture.aicore_task(task_id=worker, core_id=worker, start=10, end=20)
+    if recorded_window:
+        capture.metadata(collection={"recorded_window": True})
+    data = sc._decode_perf_data(capture.build())
+    trace = _trace(
+        data["tasks"],
+        tmp_path / "trace.json",
+        runtime_name=HBG_RUNTIME,
+        chip_swimlane_level=1,
+        timeline_metadata=data.get("timeline_metadata"),
+    )
+    names = {e["tid"]: e["args"]["name"] for e in trace["traceEvents"] if e["name"] == "thread_name"}
+    order = sorted(
+        (e["args"]["sort_index"], e["tid"]) for e in trace["traceEvents"] if e["name"] == "thread_sort_index"
+    )
+    assert [names[tid] for _, tid in order] == ["AIC1", "AIV0", "AIV2"]
+
+
 def _count_dependency_flow_starts(trace_path, *, pid, tid=None):
     with open(trace_path) as f:
         events = json.load(f)["traceEvents"]
@@ -2156,7 +2178,7 @@ def test_perf_data_preserves_each_block_dispatch_identity(tmp_path, runtime, lev
 @pytest.mark.parametrize("runtime", [HBG_RUNTIME, TMR_RUNTIME])
 @pytest.mark.parametrize("level", [1, 4])
 @pytest.mark.parametrize("reverse_blocks", [False, True])
-def test_multiblock_same_core_flows_bind_to_earliest_execution(tmp_path, runtime, level, reverse_blocks):
+def test_multiblock_same_core_flows_bind_to_each_worker_execution(tmp_path, runtime, level, reverse_blocks):
     capture = Capture(runtime=runtime, level=level, clock_freq_hz=1_000_000)
     for task_id, shift in ((7, 0), (8, 200)):
         blocks = [(0, 90, 100, 140, 160), (1, 130, 170, 180, 190)]
@@ -2188,7 +2210,7 @@ def test_multiblock_same_core_flows_bind_to_earliest_execution(tmp_path, runtime
 
     for pid in (4,) if level == 1 else (3, 4):
         flows = [event for event in events if event.get("name") == "dependency" and event.get("pid") == pid]
-        assert len(flows) == 2
+        assert len(flows) == (4 if pid == 4 else 2)
         for task_id, phase in ((7, "s"), (8, "f")):
             bars = [
                 event
@@ -2198,11 +2220,10 @@ def test_multiblock_same_core_flows_bind_to_earliest_execution(tmp_path, runtime
             assert len(bars) == 2
             if pid == 3:
                 assert len({event["tid"] for event in bars}) == 2, "overlapping dispatches need separate lanes"
-            anchor = min(bars, key=lambda event: event["ts"])
-            flow = next(event for event in flows if event["ph"] == phase)
-            assert flow["bind_id"] == anchor["id"]
-            assert flow["tid"] == anchor["tid"]
-            assert flow["ts"] == anchor["ts"]
+            anchors = bars if pid == 4 and phase == "f" else [min(bars, key=lambda event: event["ts"])]
+            assert {(e["bind_id"], e["tid"], e["ts"]) for e in flows if e["ph"] == phase} == {
+                (e["id"], e["tid"], e["ts"]) for e in anchors
+            }
 
 
 def test_multiblock_same_core_complete_flow_binds_to_matching_execution(tmp_path):
@@ -2241,7 +2262,7 @@ def test_multiblock_same_core_complete_flow_binds_to_matching_execution(tmp_path
         assert starts[0]["tid"] == anchor["tid"]
 
 
-def test_spmd_succ_routes_dependency_to_earliest_slice(tmp_path):
+def test_spmd_succ_routes_dependency_to_each_worker_slice(tmp_path):
     pred_id = 100
     succ_id = 200
     tasks = [
@@ -2253,8 +2274,9 @@ def test_spmd_succ_routes_dependency_to_earliest_slice(tmp_path):
     deps_block_map = {pred_id: 1, succ_id: 2}
 
     out = _generate_trace(tasks, deps_edges, deps_block_map, tmp_path)
-    assert _count_dependency_flow_starts(out, pid=4) == 1
+    assert _count_dependency_flow_starts(out, pid=4) == 2
     assert _count_dependency_flow_starts(out, pid=3) == 1
+    assert _worker_flow_finish_tids(out) == {_core_tid(26), _core_tid(33)}
     worker_flow = _first_worker_dependency_flow(out)
     scheduler_flow = _first_scheduler_dependency_flow(out)
     assert worker_flow[0]["output_task_count"] == 1
@@ -2284,7 +2306,7 @@ def test_hb_violation_flows_render_between_bar_starts(tmp_path):
     assert [event["ts"] for event in scheduler_flow] == [10.0, 15.0]
 
 
-def test_spmd_to_spmd_one_edge_on_earliest_slice(tmp_path):
+def test_spmd_to_spmd_one_producer_anchor_feeds_all_worker_slices(tmp_path):
     pred_id = 100
     succ_id = 200
     tasks = [_task_row(pred_id, core_id, dispatch=10.0 + core_id) for core_id in range(4)]
@@ -2293,7 +2315,9 @@ def test_spmd_to_spmd_one_edge_on_earliest_slice(tmp_path):
     deps_block_map = {pred_id: 4, succ_id: 4}
 
     out = _generate_trace(tasks, deps_edges, deps_block_map, tmp_path)
-    assert _count_dependency_flow_starts(out, pid=4) == 1
+    assert _count_dependency_flow_starts(out, pid=4, tid=_core_tid(0)) == 4
+    assert _count_dependency_flow_starts(out, pid=4) == 4
+    assert _count_dependency_flow_starts(out, pid=3) == 1
     assert not _has_spmd_block_level_track(out)
     flow = _first_worker_dependency_flow(out)
     assert flow[0]["output_task_count"] == 4
@@ -2315,12 +2339,12 @@ def test_spmd_mix_to_mix_uses_anchor_cartesian_product(tmp_path):
     deps_block_map = {pred_id: 3, succ_id: 3}
 
     out = _generate_trace(tasks, deps_edges, deps_block_map, tmp_path)
-    assert _count_dependency_flow_starts(out, pid=4) == 4
+    assert _count_dependency_flow_starts(out, pid=4) == 6
     finish_tids = _worker_flow_finish_tids(out)
-    assert finish_tids == {_core_tid(4), _core_tid(5)}
+    assert finish_tids == {_core_tid(4), _core_tid(5), _core_tid(7)}
 
 
-def test_spmd_aiv_only_pred_connects_to_mix_spmd_succ_both_anchors(tmp_path):
+def test_spmd_aiv_only_pred_connects_to_all_mix_spmd_succ_slices(tmp_path):
     pred_id = 100
     succ_id = 200
     tasks = [
@@ -2334,8 +2358,8 @@ def test_spmd_aiv_only_pred_connects_to_mix_spmd_succ_both_anchors(tmp_path):
     deps_block_map = {pred_id: 16, succ_id: 24}
 
     out = _generate_trace(tasks, deps_edges, deps_block_map, tmp_path)
-    assert _count_dependency_flow_starts(out, pid=4) == 2
-    assert _worker_flow_finish_tids(out) == {_core_tid(0), _core_tid(24)}
+    assert _count_dependency_flow_starts(out, pid=4) == 3
+    assert _worker_flow_finish_tids(out) == {_core_tid(0), _core_tid(24), _core_tid(27)}
 
 
 def test_mix_keeps_worker_view_dependency_flows(tmp_path):
@@ -2408,14 +2432,18 @@ def test_identify_spmd_task_ids_respects_authoritative_block_num_one():
 
 
 def test_spmd_task_display_name_suffix():
-    assert sc._task_display_name(16, {"16": "fa_fused_aic"}, "r2t18", spmd=True) == "fa_fused_aic_spmd(r2t18)"
-    assert sc._task_display_name(16, {"16": "fa_fused_aic"}, "r2t18", spmd=False) == "fa_fused_aic(r2t18)"
+    names = {"16": "fa_fused_aic", "17": "fa_fused_aiv", "18": "fa_fused_aic_spmd", "19": "fa_fused_aiv_spmd"}
+    assert {sc._task_display_name(func_id, names, "r2t18", spmd=True) for func_id in range(16, 20)} == {
+        "fa_fused_spmd(r2t18)"
+    }
+    assert sc._task_display_name(16, names, "r2t18") == "fa_fused_aic(r2t18)"
+    assert sc._task_display_name(18, names, "r2t18") == sc._task_display_name(19, names, "r2t18")
     assert sc._task_display_name(-1, {}, "r2t18", spmd=True) == "task_spmd(r2t18)"
     assert sc._task_display_name(0, {"0": "spmd_write_aiv"}, "t0", spmd=True) == "spmd_write_aiv(t0)"
     assert sc._task_display_name(0, {"0": "SPMDKernel"}, "t0", spmd=True) == "SPMDKernel(t0)"
 
 
-def test_spmd_cross_type_single_anchor_pair(tmp_path):
+def test_spmd_cross_type_dependency_reaches_each_worker_slice(tmp_path):
     pred_id = 100
     succ_id = 200
     tasks = [_task_row(pred_id, core_id, "aic", dispatch=10.0 + core_id) for core_id in range(1, 9, 3)]
@@ -2424,7 +2452,8 @@ def test_spmd_cross_type_single_anchor_pair(tmp_path):
     deps_block_map = {pred_id: 8, succ_id: 16}
 
     out = _generate_trace(tasks, deps_edges, deps_block_map, tmp_path)
-    assert _count_dependency_flow_starts(out, pid=4) == 1
+    assert _count_dependency_flow_starts(out, pid=4) == 8
+    assert _worker_flow_finish_tids(out) == {_core_tid(core) for core in range(24, 40, 2)}
 
 
 def _complete_flows(trace_path):

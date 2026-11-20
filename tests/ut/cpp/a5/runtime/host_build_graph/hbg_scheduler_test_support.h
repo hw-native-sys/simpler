@@ -30,6 +30,27 @@
 #include "runtime_types.h"
 #include "task_image_types.h"
 
+// Low-level catalog tests may supply duplicate edges. Compose their decoding and ordering steps here.
+inline bool scheduler_order_task_catalog(
+    const SchedulerGraphAccess &graph, const std::vector<SchedulerTaskMetadata> &metadata,
+    const std::vector<int64_t> &completed, SchedulerTaskCatalogPlan *catalog, std::string *error = nullptr,
+    SchedulerDependencyPlan *dependencies = nullptr, const SchedulerOrdinaryFaninPool *pool = nullptr
+) {
+    SchedulerDependencyPlan temporary;
+    auto &rows = dependencies == nullptr ? temporary : *dependencies;
+    if (pool != nullptr) {
+        for (size_t i = 0; i < metadata.size(); ++i) {
+            if (std::find(completed.begin(), completed.end(), i) != completed.end()) continue;
+            SchedulerFaninView row;
+            if (scheduler_node_fanin_view(graph, i, &row) != SchedulerGraphResult::OK ||
+                !pool->contains(row.global_refs, row.count))
+                return false;
+        }
+    }
+    return scheduler_plan_dependencies(graph, metadata, completed, rows, error) &&
+           scheduler_order_task_catalog(rows, metadata, catalog, error);
+}
+
 namespace scheduler_test {
 
 inline void protocol_noop_kernel(__gm__ int64_t *) {}
@@ -139,15 +160,21 @@ using GraphBuffer = BasicGraphBuffer<8192>;
 // overrides that context rather than resizing this.
 inline constexpr uint64_t kFixtureCallableCount = 1024;
 
-// Read the same global progress fact as run completion; the GM word is only
-// authoritative when no CntNotify is mapped.
-inline uint64_t resolved_count(SchedulerRunControl *run) {
-    if (run->run_completed_read_address != 0)
-        return scheduler_notify_query(*reinterpret_cast<volatile uint32_t *>(run->run_completed_read_address));
-    return scheduler_gm_query(run->resolved_task_count);
+// Test diagnostics can inspect each GM record without changing production progress.
+inline uint64_t completed_gm_records(const SchedulerTaskControl *controls, uint64_t size) {
+    uint64_t count = 0;
+    for (uint64_t task = 0; task < size; ++task)
+        count += scheduler_completion_done(__atomic_load_n(&controls[task].completion_state, __ATOMIC_ACQUIRE));
+    return count;
 }
 
 struct FixtureStorage {
+    uint64_t completed_gm_records() const {
+        const auto *controls =
+            scheduler_state_at<SchedulerTaskControl>(scheduler_state->base(), layout.task_controls_offset);
+        return scheduler_test::completed_gm_records(controls, layout.task_count);
+    }
+
     explicit FixtureStorage(
         uint64_t task_count, uint64_t workers = 2, uint64_t traces_per_task = 1,
         const SchedulerSpmdRequirements &spmd = {}, bool protocol_profiling = false,
@@ -312,6 +339,8 @@ struct FixtureStorage {
             ->task_catalog_offset = task_catalog_offset;
         const auto bind_catalog = [&](SchedulerLocalState &local) {
             local.config.task_catalog_offset = task_catalog_offset;
+            local.config.engine_catalog =
+                scheduler_task_catalog(scheduler_state->base(), plan.header, local.config.self_core_type);
             local.next_mix_ref = plan.header.first_mix_ref;
         };
         for (auto &local : test_contexts)
@@ -347,12 +376,18 @@ struct FixtureStorage {
         config.runtime_worker_count = context->runtime_worker_count;
         config.self_lane = 0;
         config.self_core_type = context->core_type == static_cast<int32_t>(CoreType::AIC) ? 0U : 1U;
+        if (task_catalog_offset != 0) {
+            const auto &pool =
+                *scheduler_state_at<SchedulerTaskCatalogHeader>(scheduler_state->base(), task_catalog_offset);
+            config.engine_catalog = scheduler_task_catalog(scheduler_state->base(), pool, config.self_core_type);
+        }
         for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
             config.worker_ids[lane] = context->cluster_worker_ids[lane];
             if (context->cluster_worker_ids[lane] == context->worker_index) config.self_lane = lane;
         }
         config.worker_ids[config.self_lane] = context->worker_index;
         config.cluster_count = static_cast<uint16_t>(context->cluster_count);
+        config.cluster_index = static_cast<uint8_t>(context->cluster_index);
         return local;
     }
     std::vector<SchedulerLocalProfilingState> test_profiles;

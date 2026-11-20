@@ -5,7 +5,7 @@ live in Host DDR. Each L2 owns a separate Host allocation. The L3 CPU can fill
 those allocations directly. With `workspace_engines=()`, each requesting Device maps the local
 and peer Host windows for synchronous MTE reads. Selecting
 `workspace_engines=("urma",)` registers the table for asynchronous URMA reads
-and leaves every `windowsIn` slot zero, including the local rank. Host UBMEM
+and publishes the local Host DDR device mapping in `windowsIn[rankId]`. Peer slots stay zero. Host UBMEM
 access (including local Host DDR) and URMA cannot run concurrently, even on
 different addresses.
 The Host does not become an additional rank, and the table needs no matching
@@ -146,7 +146,7 @@ and context lookup.
 ```text
 L2-owned Host DDR
   +-- L3 CPU mapping -> Buffer.shm.buf
-  +-- MTE domain -> local Device mapping -> windowsIn[rankId]
+  +-- MTE or URMA domain -> local Device mapping -> windowsIn[rankId]
   +-- MTE domain -> peer process mapping -> requesting Device registration -> peer MTE read
   +-- URMA domain -> registration -> per-domain workspace -> peer MR address
 ```
@@ -160,11 +160,12 @@ dependencies then allow consumers to read the result; no deferred completion is
 used and the AIV remains occupied during the transfer. Only the local
 `windowsOut` entry is published; peer Host writeback is not supported.
 
-For an URMA domain, pass the byte offset returned by
-`domain.buffer_range("table")[0]` from L3 to the kernel as a scalar. Resolve
-the source through the peer MR in the URMA workspace.
+For a URMA domain, compute the byte offset from the local table tensor address,
+including its view offset. This address calculation does not read Host DDR.
+Use the offset to locate the source in the peer MR.
 
 ```cpp
+const uint64_t offset = reinterpret_cast<uint64_t>(local_table) - ctx->windowsIn[ctx->rankId];
 auto *workspace = reinterpret_cast<__gm__ uint8_t *>(
     comm_workspace<CommWorkspaceKind::URMA>(*ctx).addr);
 auto *peer_source = pto2::urma_backend::peer_mr_ptr<float>(workspace, peer, offset);

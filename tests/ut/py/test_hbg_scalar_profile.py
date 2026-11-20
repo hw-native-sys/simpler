@@ -55,8 +55,8 @@ def test_long_function_names_and_primitives_survive_filtered_nesting():
         window() | {"start_cycles": 100, "end_cycles": 10_100, "function_min_cycles": 1000},
         record("scalar_execution_token_refill", 200, 8200, 1, task_id=7),
         record("scalar_execution_token_receive", 1000, 5000, 2, task_id=7),
-        record("scalar_prepared_acquire", 2000, 4000, 3, task_id=7),
-        record("scalar_dcci_out", 2500, 2600, 4),
+        record("scalar_prepared_receive", 2000, 4000, 3, task_id=7),
+        record("scalar_dcci_single", 2500, 2600, 4),
         record("scalar_self_order_ready", 6000, 8000, 2, task_id=7),
     ]
     profile = partition(rows, [])
@@ -72,8 +72,8 @@ def test_long_function_names_and_primitives_survive_filtered_nesting():
     assert [(event["name"], event["dur"]) for event in events] == [
         ("DISPATCH · refill_execution_tokens(t7)", 8.0),
         ("DISPATCH · bind_ticketed_execution(t7)", 4.0),
-        ("DISPATCH · claim_and_receive_payload(t7)", 2.0),
-        ("MEM · DCCI: SINGLE CACHELINE_OUT issue", 0.1),
+        ("BUILD · receive_payload(t7)", 2.0),
+        ("BUILD · DCCI: SINGLE CACHELINE_ALL issue", 0.1),
         ("ENTRY_PERMIT · self_order_ready(t7)", 2.0),
     ]
     assert [event["args"]["scalar_depth"] for event in events] == [1, 2, 3, 4, 2]
@@ -268,7 +268,7 @@ def test_predicated_skip_is_not_counted_as_kernel_execution():
         ("scalar_self_order_ready", "ENTRY_PERMIT · self_order_ready"),
         ("scalar_mix_lane_order_ready", "ENTRY_PERMIT · mix_lane_order_ready"),
         ("scalar_execution_token_refill", "DISPATCH · refill_execution_tokens"),
-        ("scalar_prepared_acquire", "DISPATCH · claim_and_receive_payload"),
+        ("scalar_prepared_receive", "BUILD · receive_payload"),
         ("scalar_prepared_claim", "CLAIM_EXECUTE · claim_for_execution"),
         ("scalar_cluster_mix_discover_task", "CLAIM_BUILD · claim_for_build"),
         ("scalar_build_payload", "BUILD · build_payload"),
@@ -277,7 +277,7 @@ def test_predicated_skip_is_not_counted_as_kernel_execution():
         ("scalar_can_enter_execution", "ENTRY_PERMIT · check_entry_permit"),
         ("scalar_retire_execution", "RETIRE · retire_execution"),
         ("scalar_subtask_contribute", "FANOUT_PUBLISH · publish_fanout"),
-        ("scalar_counter_accounting", "CONTROL · account_completed_tasks"),
+        ("scalar_counter_accounting", "CONTROL · snapshot_counter_completions"),
         ("scalar_cluster_mix_service", "DISPATCH · cluster_mix_service"),
         ("scalar_group_acquire", "DISPATCH · acquire_group_lane"),
         ("scalar_execution_continuation", "DISPATCH · continue_same_task"),

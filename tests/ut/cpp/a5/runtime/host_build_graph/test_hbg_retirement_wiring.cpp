@@ -569,22 +569,6 @@ TEST_F(HbgRetirementWiring, AProvedRetirementWithNoOwnersEnabledSettles) {
     EXPECT_TRUE(lifecycle.settle_run_diagnostics(runtime.get(), /*graph_completed=*/true));
 }
 
-TEST_F(HbgRetirementWiring, SnapshotsMappedProgressOnlyAfterAllCoresRetire) {
-    auto runtime = std::make_unique<Runtime>();
-    MinimalSchedulerState state;
-    state.publish(runtime.get());
-    uint32_t progress = 1;
-    state.run.run_completed_read_address = reinterpret_cast<uint64_t>(&progress);
-    AicoreLifecycle lifecycle;
-    AicoreLifecycleTestPeer::seed(lifecycle, kAddrs);
-
-    EXPECT_FALSE(lifecycle.settle_run_diagnostics(runtime.get(), true));
-    EXPECT_EQ(state.run.resolved_task_count, 0u);
-    ASSERT_EQ(lifecycle.finish_shutdown_partition(0, runtime.get()), 0);
-    ASSERT_TRUE(lifecycle.settle_run_diagnostics(runtime.get(), true));
-    EXPECT_EQ(state.run.resolved_task_count, progress);
-}
-
 /**
  * A subtask the graph says executed and whose cell is absent is a lost
  * measurement, not a subtask that did not run.

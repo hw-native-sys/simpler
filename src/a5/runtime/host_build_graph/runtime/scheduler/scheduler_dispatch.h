@@ -79,6 +79,32 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_find_local_exe
     progress = progress || advanced;
     if (*failed || *out != UINT32_MAX) return progress;
 
+    // Always advance owned members and tickets. Exhausting the catalog only stops new claims.
+    const auto &catalog = local->config.engine_catalog;
+    if (local->config.prepared != nullptr && local->issue_cursor == catalog.count) return progress;
+
+    // A completed ordinary block proves fanin for another block in the same run.
+    // A continuation still has to be the current ordered head and win a real ticket.
+    // Give discovery of a new MIX group an opportunity after three successful continuations.
+    constexpr uint32_t kMaxConsecutiveContinuations = 3;
+    const int64_t previous = local->continuation_task_ref;
+    if (!scheduler_task_ref_is_null(previous) && local->continuation_streak < kMaxConsecutiveContinuations &&
+        previous == local->issue_task_ref && previous == local->issue_binding.task_ref &&
+        local->issue_fanin_confirmed && !local->issue_ticket_exhausted) {
+        if (local->issue_cursor < catalog.count && catalog.refs[local->issue_cursor] == previous) {
+            SchedulerIssueSnapshot continuation{previous, true};
+            *failed = !scheduler_refill_execution_tokens(
+                graph, base, local, run, profiling_level, &advanced, &continuation, out
+            );
+            progress = progress || advanced;
+            if (*failed) return progress;
+            if (advanced) {
+                ++local->continuation_streak;
+                return progress;
+            }
+        }
+    }
+    local->continuation_streak = 0;
     SchedulerIssueSnapshot head{};
     if (local->is_mix_coordinator() && local->cluster_signal != nullptr) {
         if (!scheduler_cluster_mix_discover_next(graph, base, local, run, &advanced, &head)) {

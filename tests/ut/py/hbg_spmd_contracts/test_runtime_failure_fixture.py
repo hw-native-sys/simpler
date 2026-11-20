@@ -295,6 +295,7 @@ def _capture(mask=3, lane=0, blocks=2, *, clusters=1, sync_start=False, epoch=2)
                 },
             ],
             "resolved_task_count": 0,
+            "completion_counters": [],
         },
         "aicpu_lifecycle_records": [
             {
@@ -473,6 +474,19 @@ def test_ordinary_block_has_no_cooperative_owner_record(native):
     raw["aicore_protocol"]["blocks"] = _capture()["aicore_protocol"]["blocks"]
     with pytest.raises(AssertionError):
         native._check_failed_capture(raw, 2, 2, 1)
+
+
+def test_failed_capture_distinguishes_missing_counter_snapshot_from_pending(native):
+    raw = _capture()
+    protocol = raw["aicore_protocol"]
+    control = protocol["task_controls"][0]
+    control.update(completion_backend=1, counter_index=0, counter_threshold=4, counter_limit=4)
+    protocol["completion_counters"] = [dict(index=0, value=0, valid=0, limit=4)]
+    protocol["resolved_task_count"] = None
+    native._check_failed_capture(raw, 2, 3, 0)
+    protocol["resolved_task_count"] = 0
+    with pytest.raises(AssertionError):
+        native._check_failed_capture(raw, 2, 3, 0)
 
 
 @pytest.mark.parametrize("damage", ("enter_pending", "exit_done", "extra_resolved", "missing_exit"))

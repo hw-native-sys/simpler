@@ -9,7 +9,8 @@
 """Exercise onboard execution state against the built host runtime, with RTS stubs.
 
 The hardware marker selects CI jobs that build the onboard libraries and have
-CANN headers. The probe does not initialize or execute on a device.
+CANN headers. The probe stubs device operations; SDK library loading may query the driver, so
+execution stays inside the hardware job's device allocation.
 """
 
 from __future__ import annotations

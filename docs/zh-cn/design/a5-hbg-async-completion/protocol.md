@@ -71,27 +71,27 @@ GM 路径的 canonical completion gate 仅额外保存一个 `has_async` 门闩�
 
 每次转换只使用一次 unsigned GM fetch-add，并根据它返回的旧值判断结果。错误状态使用既有 run 首错 latch；非法位、溢出、下溢或重复 close 不作算术补偿，也不能获得完成权。唯一执行及 lease 身份防止重复贡献，计数校验不能替代身份验证。
 
-GM 计算汇合使用统一的物理子任务计数，总数为 block 数乘 active lane 数。普通/SPMD 执行在返回并封口后贡献一次 `completed_subtasks`；MIX coordinator 收齐全部资源 release 后，按 active lane 数批量贡献，计算 lane 不重复贡献。最后贡献者依据同次 RMW 中的单个异步门闩决定是否关闭 computation。普通执行的贡献可以先于执行 trace 发布；MIX 仍遵守各 lane 的 trace → release → coordinator 汇聚顺序。释放 slot 的业务绑定前保存稳定身份，不能从已清空的 slot 反查。
+GM 计算汇合使用统一的物理子任务计数，总数为 block 数乘 active lane 数。普通/SPMD 执行在返回并封口后贡献一次 `completed_subtasks`；MIX 的记账成员确认本代所有活动 lane 的成功 FIN 后，按 active lane 数批量贡献，计算 lane 不重复贡献。最后贡献者依据同次 RMW 中的单个异步门闩决定是否关闭 computation。普通执行的贡献可以先于执行 trace 发布；GM MIX 的顺序为各活动 lane 发布 trace、发送 FIN，再由记账成员汇聚贡献。释放 slot 的业务绑定前保存稳定身份，不能从已清空的 slot 反查。
 
 P 暂时为零不证明计算结束，其他尚未返回的成员仍可能登记。仅在 GM 路径，设置 closed 或递减最后 P 的原子返回值授予 `FINISH_OWNER`。获权者立即调用 `scheduler_async_complete_task`，在同一尾部完成 canonical DONE 发布，不创建 FINISH lease、目录、resolver 游标或可让出的服务记录。普通读取不能授予此完成权。
 
-所有成员均零登记时，GM 路径不创建 CHECK 工作，最后物理贡献沿用同步完成。门闩为一时依据 join 的 close/settle 结果内联完成或继续等待；不能根据先返回成员的零登记或暂时 P=0 推断整个任务同步。计数器路径即使零登记，也必须结算预留的条件 credit。全局逻辑完成计数可以早于最终 trace 写出；MIX 的物理汇聚仍须等待完整资源 release。存储回收必须等待全部 trace、资源义务和 EXIT 握手完成。
+所有成员均零登记时，GM 路径不创建 CHECK 工作，最后物理贡献沿用同步完成。门闩为一时依据 join 的 close/settle 结果内联完成或继续等待；不能根据先返回成员的零登记或暂时 P=0 推断整个任务同步。计数器路径即使零登记，也必须结算预留的条件 credit。任务逻辑完成可以早于最终 trace 写出；MIX 的物理汇聚仍须等待完整资源 release。存储回收必须等待全部 trace、资源义务和 EXIT 握手完成。
 
 ### 不同任务形状
 
 - **普通/SPMD：** GM 非零条件组登记并结算自己的 pending 责任；计数器路径分别结算物理和条件 credit。每个实际执行参与计算汇合；分波执行不要求同时驻留。
-- **MIX：** lane 的条件可以早于或晚于其他 lane 返回。条件 group 完成不代替物理子任务完成或 coordinator 的资源退役，也不长期占用 MIX mailbox 或 cohort。inactive AIC 仍须发布资源 release；正常 EXIT drain 可补齐已到达的 inactive coordinator，不能执行尚未返回的业务 kernel。
+- **MIX：** 各 lane 的条件可以早于或晚于其他 lane 返回。每个活动 lane 发布自己的 FIN，记账成员收齐本代全部成功 FIN 后退役 SSBUF bank。尚未满足的条件由 CHECK 继续服务。
 - **sync-start：** 启动许可继续约束原计算 cohort。条件未满足不会长期占用已返回执行的资源；已取得执行许可的核不得夹入 CHECK 服务；GM 内联 FINISH 只发生在合法完成尾部。若特定读取路径确需额外本核获取，按[消费者可见性](consumer-preparation.md)在最终许可前完成，不将其作为所有任务的固定阶段。
 - **predicate skip：** 合法 skip 走 runtime 封口和执行资源释放尾部；业务 kernel 未调用时不创建 CHECK pending 责任；计数器路径仍结算规划内的物理及条件 credit。
 - **Graph：** 每个实例的 child 使用独立 group/join。child 的 TaskDone 通过原 body→EXIT 依赖推进，ENTER/EXIT 本身不分配执行 group。未激活 child 仍保留责任；不能把未执行当成取消。
 
 ## 4. GM 内联 FINISH 与计数器完成
 
-GM join 的 close 或最终 settle RMW 选出唯一 `FINISH_OWNER`。调用者立即执行 `scheduler_async_complete_task`，以不可变任务几何和 join 结果构造预期 gate，再通过 CAS 将 `(N, 0, 1)` 转为 DONE。获权者在这一固定尾部发布完成记录和任务 DONE 信号，并立即向整轮进度上报一次完成；不能把完成权入队、让出后重新领取或交给另一个 owner。
+GM join 的 close 或最终 settle RMW 选出唯一 `FINISH_OWNER`。调用者立即执行 `scheduler_async_complete_task`，以不可变任务几何和 join 结果构造预期 gate，再通过 CAS 将 `(N, 0, 1)` 转为 DONE。获权者在这一固定尾部发布完成记录和任务 DONE 信号；不能把完成权入队、让出后重新领取或交给另一个 owner。
 
-计数器路径由 Host 规划每个 task 的阈值及真实祖先之间的链复用。普通执行返回贡献物理 credit；MIX coordinator 收齐全部 release 后贡献物理 credits。可延迟完成的 lane 额外预留一个条件 credit：非空 group 在最后 CHECK 满足后贡献，空组在封口尾部贡献。普通空组允许在返回尾部连续提交两次单位 INC，MIX 则保留物理与条件贡献各自的边界。
+计数器路径由 Host 规划每个 task 的阈值和真实祖先之间的链复用。普通执行和 MIX 的每个成功活动成员在返回路径各贡献一个物理 P。可能异步的 lane 另有条件 Q：空组由本核结清，普通返回可连续发送 P、Q 两条单位 INC，MIX 在空组封口时发送 Q；非空组由最终 CHECK owner 发送 Q。
 
-后继通过计数器阈值直接判断 readiness，后台唯一记账分区随后发布 canonical GM DONE，并立即向整轮进度上报一次完成。阈值就绪不依赖该后台记账核立即获得调度，也不代表 run 资源已经可以回收。没有可用计数器映射的任务继续使用 GM 完成门。
+后继和终点观察者直接判断计数器阈值。L3/L4 采集时由各核在退出阶段记录已达到阈值的任务。存储回收仍须等待全核退休。没有可用计数器映射的任务继续使用 GM 完成门。
 
 当前后继由 token/control 调度逻辑检查自己的 fanin；完成尾部不再遍历 CSR、摘取 wake-list、续接 resolver 或向 ready 队列推送后继。CHECK 保留可续接的条件观察；FINISH 不再是一类独立控制记录。
 
@@ -99,9 +99,9 @@ GM join 的 close 或最终 settle RMW 选出唯一 `FINISH_OWNER`。调用者�
 
 ready 只授予 admission 的资格，不证明实际消费者核已经获取 payload。ENTER/EXIT 和内联 FINISH 不执行消费者的本核获取；同步消费者同样遵守[消费者数据可见性](consumer-preparation.md)。依赖与 admission 判断继续由原调度规则执行，完成贡献不能直接强制消费者进入 kernel。
 
-每个逻辑 task 的唯一记账者在完成时立即上报一次。映射可用且设备任务数在 32 位范围内时，向本轮的 CntNotify 进度计数器写一次 INC(1)。其他情况直接对 GM 的 64 位 `resolved_task_count` 执行一次 FAA(+1)。Host 已完成的任务单独计入 `inline_completed_count`。CHECK 和仍有待满足条件的物理返回都不单独上报逻辑完成。
+AICPU 观察终点的逻辑完成状态。采用计数链时，终点必须达到包含物理返回与条件完成信用的阈值。采用 GM 或 SET 时，终点必须发布 DONE。仅有 kernel 返回而异步条件未满足时，终点仍然等待。
 
-AICPU 从本轮选定的进度计数器读取当前值，用于进度、超时和结束判定。达到目标后进入退出流程。全核退休得到确认后，AICPU 才将映射计数器的实测值写入 GM 诊断快照。GM 回退的进度已在原位更新。
+所有终点完成后进入 EXIT 流程，资源保留至全核退休。L4 导出时由最终状态统计已完成的设备任务。
 
 ## 5. 服务点、预算与进展
 
@@ -137,7 +137,7 @@ AICPU 从本轮选定的进度计数器读取当前值，用于进度、超时�
 
 每核使用 CHECK 游标；有扫描资格的循环最多领取一条记录，普通条件观察额度为 8。有业务可执行时，累计最多 4 次执行返回后在最终 admission 之前服务；没有可执行 slot 或仍有 ready 发布积压时，每轮经过一次服务门。最后一个不满 64 位的目录字扫描结束后，游标回到 bit 0；不能对总记录数取模后跳过前面的低位。
 
-返回核封口时保留自己的 dirty 发布区，直接检查并写回 count/token；失效该区会丢弃刚登记的条件。其他核取得 lease 后再观察已发布的区和进度。普通/SPMD 的物理完成贡献晚于本次执行封口登记，不要求其他 lane 的资源 release 或最终 trace 已发布。MIX 的物理完成由 coordinator 在收齐全部资源 release 后聚合贡献；每核的 trace 发布仍先于自己的 slot 复用、MIX release 和 EXIT ACK，coordinator 随后退役资源。
+返回核封口时先写回本次登记的 count/token，领取 CHECK 的核再观察已发布的条件和进度。CntNotify 路径由成功返回的各个 MIX 成员独立发布 P。GM 路径由记账成员收齐本代全部活动成员的成功 FIN 后，按 active lane 数一次扣减物理贡献。两种路径都要完成本核 trace 发布并确认整组成功 FIN，才能重用 bank。
 
 CAS 失败立即返回正常服务，不等待某个 owner，不 sleep，也不给某记录设置固定重试时间。持续 PENDING、扫描与碰撞不刷新进展 watchdog；真实登记完成、条件推进、执行释放和后继发布才属于协议进展。
 

@@ -12,7 +12,7 @@
 | kernel context 与登记 helper | 保留地址式登记接口，写入本执行的稳定记录，检查容量与首错 |
 | 执行返回与 completion/MIX 收尾 | 封口登记，贡献物理子任务完成，分别汇合计算与实际 pending 条件并收尾执行资源 |
 | CHECK | 任意参与核领取条件记录，每次有界检查，保存进度并交回执行机会 |
-| FINISH 与 resolver | 唯一发布 TaskDone，分段路由后继，排空发布后贡献 resolved_task_count |
+| 异步完成 | GM join 的唯一 owner 内联发布 DONE；CntNotify 路径由最终 CHECK owner 发布非空组的条件贡献 Q |
 | 已有 run/domain owner | 保持 heap、staging、导入 backing、通信 context/window/workspace 至实际退休 |
 | 后端与消费者获取 | 验证实际 SDMA 提交、条件读取和消费者缓存路径，局部修补具体缺口 |
 
@@ -26,27 +26,21 @@ Host 临时计划按逻辑 task 保存设备任务描述、条件区起点、每
 2. 返回路径发布稳定 group，释放 slot 及局部 block/MIX 义务；逻辑任务仍未完成。
 3. 后提交的同类核 publisher 获得执行机会并更新 signal。
 4. CHECK 有界地观察到条件满足，与计算返回义务汇合。
-5. FINISH 发布唯一逻辑完成并放行消费者；消费者实际读取通知对应的数据。
+5. GM 路径的 join owner 内联发布 DONE，或 CntNotify 路径的最终 CHECK owner 发布 Q，使计数达到任务阈值。消费者在依赖完成后读取数据。
 
 首要测试取实际同类执行资源数 C，分别提交 C−1/C/C+1 个 waiter，然后提交 publisher。publisher 不依赖 waiter；消费者依赖 waiter。必须证明 publisher 可运行、未通知时消费者未执行、通知后消费者结果正确。仅有编译、同步回归或 mock 条件测试不算闭环完成。
 
 ## 3. 服务与完成顺序
 
-整个 run 尚未发布异步工作时跳过空目录扫描和额外消费者获取；尚未激活的空闲核每 16 个服务机会探测一次，业务返回、本核错误及消费者获取不受此空闲预算延迟。活动开始后，普通业务与控制工作共享服务额度：最多 4 次业务返回后服务一次 CHECK/FINISH；空闲和准入受阻时仍提供控制服务。CHECK/FINISH 轮转，每次最多领取一个记录，基础工作预算为 8。PENDING 或失败 CAS 不计为真实进展，不延长 watchdog。
+本轮未发布异步工作时，空闲核每 16 个服务机会探测一次活动标志。活动开始后，累计 4 次业务返回触发异步服务；空闲或准入受阻时也检查服务门。CHECK 从第一个活动服务片段开始，之后每两个片段获得一次机会，每次最多领取一个记录、检查 8 个条件。单纯的 PENDING 或 CAS 碰撞不会刷新 watchdog。
 
-物理执行返回与逻辑任务完成独立。SPMD 和 MIX 的每个实际执行 lane 在返回并封口登记后贡献一次物理子任务完成；零登记及合法 skip 也必须封口。只有非零 group 增加 pending；全部物理执行已封口后才可关闭 computation，最后一次合法原子汇合授予 FINISH 激活权。trace 发布和 MIX 资源退役按各自顺序收尾，并在 EXIT ACK 或存储复用前完成。
+每个实际执行在返回时先封口登记。CntNotify 路径上，普通/SPMD 和 MIX 的每个成功成员各贡献一个物理 P。可能异步的 lane 还需一个条件 Q：空组在封口或返回尾部结清，非空组由最终 CHECK owner 结清。MIX 记账成员收齐本代活动成员的成功 FIN 后退役 bank。
 
-全部成员均零登记的普通、SPMD、MIX task 沿用既有同步完成和本核后继路径，不发布独立 FINISH 工作。完成计数总数为 block 数乘 active lane 数；最后一次物理贡献同时取得累计的保守异步票，只有票为零才跳过 join 检查。贡献与解依赖可以先于 trace 发布和 MIX 资源 release；不能根据先返回成员的零登记或暂时 pending=0 推断整个任务同步。
-
-零登记执行不初始化任何 CHECK/FINISH 后缀状态；首次非零发布必须初始化其全部进度和 lease，目录零位保护未初始化存储。
+GM 完成门的物理总数是 block 数乘 active lane 数。普通/SPMD 的物理贡献发生在本核返回时；MIX 由记账成员收齐本代成功 FIN 后按 active lane 数一次贡献。只有非空条件组增加 join 的 pending，首个非空组还为任务设置一个异步门闩。最后一笔物理贡献在没有门闩时直接完成任务，有门闩时关闭计算端。关闭计算端和最后一个条件组结清中，完成汇合的那次原子操作授予唯一的 `FINISH_OWNER`。
 
 最终准入和消费者本核获取之后，执行核只解析一次 task/block/lane 到条件组的映射；绑定保存在本次 kernel 调用的局部变量中，返回时直接复用。返回仍核对 EXECUTING 状态、run 与组身份、任务及 block/lane、记录边界、开放预留和重复封口，不依赖 kernel 可改写的上下文来恢复绑定。seal 和启用的参数抓取完成后经过返回门禁，才直接退休本核 slot。
 
-无活动记录的服务片段不领取任何责任，由 resident 主循环继续观察全局错误；本核登记错误和活跃片段不能被此路径跳过。resolver 在片段入口、后继选择及队列发布边界检查全局错误，局部游标转换不重复读取；失败时仍保留已取得但未排空的责任，不贡献成功完成计数。
-
-普通完成、FINISH 与 Graph 控制节点共用一个 resolver 主体。普通完成使用调用内游标与大预算，直接处理到底，保留单 fanin 快路、同类核 direct refill 及 MIX 前缀发布；不会转为独立 FINISH 工作。FINISH 和 Graph 控制服务使用保存游标与小预算，跨核移交不携带栈上 direct candidate。已收集的 ready 前缀必须在后续长 fanin 扫描可能让出之前发布，避免可运行后继被扫描过程扣留。
-
-FINISH 保存完整 resolver 游标及最多 8 项发布批次，跨核恢复不重放已发生的队列发布。终态记录和目录清理完成后，才贡献 run 完成计数；正常退出不能越过尚未收尾的异步记录。
+GM 的 `FINISH_OWNER` 在取得所有权的调用中通过 CAS 将 `(T, 0, 1)` 转为 `(T, 0, 0)` 并发布 DONE。后继各自检查 fanin，AICPU 观察 Host 规划的所有终点。CHECK 的条件检查游标只用于尚未完成的条件组，失败进入本轮首错和清退流程。
 
 ## 4. 完整覆盖顺序
 
@@ -65,6 +59,6 @@ FINISH 保存完整 resolver 游标及最多 8 项发布批次，跨核恢复不
 
 设计、实现与验收保持一致。开发记录和原始日志独立存放，文档不携带过程复述。阶段完成后及时提交、总结并继续后续工作；清理已有历史时按用户要求合并提交，之后按可验证单元组织。
 
-复用已有 DFX 输出和协议观测入口。必要事件关联 run/task/block/lane、登记封口、实际执行释放、条件满足、逻辑完成及 resolve 排空；不在热路径逐次打印 PENDING，也不为了观测扩展用户可见接口。
+复用已有 DFX 输出和协议观测入口。必要事件关联 run/task/block/lane、登记封口、实际执行释放、条件满足、逻辑完成及资源退休；不在热路径逐次打印 PENDING，也不为了观测扩展用户可见接口。
 
-FINISH 的 TaskDone actor 在既有 `flags` 字段中设置 bit 31，表示延迟完成。cooperative task 的 order 从已发布的 admission 记录读取，不依赖完成核仍持有原 cohort。校验器仅对带此标记的完成事件允许跨核 actor，并检查全部物理子任务贡献、封口登记先于 computation close 以及后继依赖；执行 trace 和 MIX release 的收尾由资源退休与 EXIT 顺序约束；admission、inline 和 Graph control 不能使用该标记。该诊断不替代外部完成条件和 payload 可见性的功能验证。
+GM 内联 FINISH 的 TaskDone actor 在既有 `flags` 字段中设置 bit 31，表示延迟完成。cooperative task 的 order 从已发布的 admission 记录读取，不依赖完成核仍持有原 cohort。校验器仅对带此标记的完成事件允许跨核 actor，并检查全部物理子任务贡献、封口登记先于 computation close 以及后继依赖；执行 trace 和 MIX release 的收尾由资源退休与 EXIT 顺序约束；admission、inline 和 Graph control 不能使用该标记。该诊断不替代外部完成条件和 payload 可见性的功能验证。

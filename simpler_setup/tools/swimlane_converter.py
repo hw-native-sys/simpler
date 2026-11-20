@@ -20,8 +20,8 @@ Usage:
     python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/chip_swimlane_records.json -k kernel_config.py
     python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/chip_swimlane_records.json -v
 
-SPMD (block_num>1): dependency flows use the earliest visible task slice
-per (func_id, task_id) independently in each view; see
+SPMD (block_num>1): Worker View fans dependency flows out to every consumer
+slice. Scheduler View uses the earliest slice per (func_id, task_id). See
 docs/dfx/chip-swimlane-profiling.md §3.5.
 """
 
@@ -41,6 +41,7 @@ import traceback
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
+from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -84,24 +85,23 @@ def _task_display_name(func_id, func_id_to_name, tdisp, *, spmd=False):
       - otherwise: ``func_<letter>(<task-id>)`` (resolved id, but no name map entry).
 
     The caller supplies the runtime-specific task-id label. SPMD logical tasks
-    append ``_spmd`` before that suffix unless the name already contains ``spmd``
-    (case-insensitive), e.g. ``fa_fused_aic_spmd(r2t18)``.
+    append ``_spmd`` unless the name already contains ``spmd``. The display
+    suffixes ``_aic_spmd`` and ``_aiv_spmd`` share the same ``_spmd`` label.
     """
     try:
         resolved = int(func_id) >= 0
     except (TypeError, ValueError):
         resolved = False
     if not resolved:
-        label = f"task({tdisp})"
+        name = "task"
     elif func_id_to_name and str(func_id) in func_id_to_name:
-        label = f"{func_id_to_name[str(func_id)]}({tdisp})"
+        name = func_id_to_name[str(func_id)]
     else:
-        label = f"func_{_func_id_to_letter(func_id)}({tdisp})"
-    if spmd and "(" in label:
-        base, rest = label.split("(", 1)
-        if "spmd" not in base.lower():
-            return f"{base}_spmd({rest}"
-    return label
+        name = f"func_{_func_id_to_letter(func_id)}"
+    if spmd and "spmd" not in name.lower():
+        name += "_spmd"
+    name = re.sub(r"_(?:aic|aiv)_spmd$", "_spmd", name, flags=re.IGNORECASE)
+    return f"{name}({tdisp})"
 
 
 def _scheduler_task_key(row):
@@ -208,6 +208,16 @@ def _is_recorded_window(raw):
     return isinstance(collection, dict) and collection.get("recorded_window") is True
 
 
+def _hbg_l1_worker_lanes(core_types):
+    """Map captured worker IDs to type-local names and numeric display order, counting idle cores."""
+    lanes = {}
+    for kind in ("aic", "aiv"):
+        workers = (worker for worker, core_type in enumerate(core_types) if core_type == kind)
+        for ordinal, worker in enumerate(workers):
+            lanes[worker] = (f"{kind.upper()}{ordinal}", len(lanes))
+    return lanes
+
+
 def _decode_recorded_window(raw):  # noqa: PLR0912, PLR0915
     """Keep received intervals without inventing a replay identity or task join."""
     level = int(raw.get("chip_swimlane_level"))
@@ -244,6 +254,10 @@ def _decode_recorded_window(raw):  # noqa: PLR0912, PLR0915
             }
         )
 
+    runtime = resolve_runtime(metadata.get("runtime"))
+    worker_lanes = (
+        _hbg_l1_worker_lanes(metadata.get("core_types") or []) if runtime == "host_build_graph" and level == 1 else {}
+    )
     for index, row in enumerate(rows(raw.get("aicore_tasks", []), "aicore_tasks")):
         if not isinstance(row, list) or len(row) != 7:
             raise ValueError("recorded aicore_tasks must contain seven-column arrays")
@@ -265,6 +279,8 @@ def _decode_recorded_window(raw):  # noqa: PLR0912, PLR0915
                 "run_epoch": epoch,
             },
         )
+        if core in worker_lanes:
+            device[-1]["worker_lane"] = worker_lanes[core]
     scheduler = raw.get("scheduler_tasks")
     if scheduler is not None:
         if not isinstance(scheduler, dict) or scheduler.get("producer") not in ("aicpu", "aicore"):
@@ -348,7 +364,7 @@ def _decode_recorded_window(raw):  # noqa: PLR0912, PLR0915
         )
     return {
         "chip_swimlane_level": level,
-        "runtime": resolve_runtime(metadata.get("runtime")),
+        "runtime": runtime,
         "tasks": device,
         "host_preparation": host,
         "timeline_metadata": {
@@ -380,6 +396,11 @@ def _recorded_trace(tasks, output_path, runtime_name, timeline_metadata):
         {"ph": "M", "cat": "__metadata", "name": "process_name", "pid": pid, "args": {"name": f"{name} [{domain}]"}}
         for name, pid in lanes.items()
     ]
+    worker_lanes = {row["lane"]: row["worker_lane"] for row in tasks if "worker_lane" in row}
+    for worker, (name, order) in worker_lanes.items():
+        track = {"ph": "M", "cat": "__metadata", "pid": lanes["aicore_tasks"], "tid": worker}
+        events.append({**track, "name": "thread_name", "args": {"name": name}})
+        events.append({**track, "name": "thread_sort_index", "args": {"sort_index": order}})
     for row in tasks:
         events.append(
             {
@@ -1239,6 +1260,11 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
             )
     elif aicore_rows:
         raise ValueError(f"level {level} requires Scheduler task timing records")
+
+    if runtime_name == "host_build_graph" and level == 1:
+        lanes = _hbg_l1_worker_lanes(core_types)
+        for task in tasks:
+            task["worker_lane"] = lanes.get(task["core_id"])
 
     if "aicore_execution_identities" in data:
         from simpler_setup.tools.hbg.execution_identity import attach_execution_identities  # noqa: PLC0415
@@ -2411,16 +2437,16 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             print(f"  Function names: {len(func_id_to_name)} entries")
 
     # Step 1: Build core_to_tid mapping (using only core_id, not core_type)
-    unique_cores = set()
+    worker_rows = {}
     for task in tasks:
-        unique_cores.add(task["core_id"])
+        worker_rows.setdefault(task["core_id"], task)
 
     core_to_tid = {}
-    for core_id in sorted(unique_cores):
+    for core_id in sorted(worker_rows):
         core_to_tid[core_id] = 10000 + core_id * 10
 
     if verbose:
-        print(f"  Unique cores: {len(unique_cores)}")
+        print(f"  Unique cores: {len(worker_rows)}")
 
     # The runtime whose DFX vocabulary this whole trace follows -- its TaskId layout,
     # its phase names and colours, the lanes it draws. Resolved once, from the runtime
@@ -2584,21 +2610,16 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             {"args": {"sort_index": 3}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 3}
         )
 
-    # Metadata events: Thread names (one per core)
+    hbg_l1 = runtime_name == "host_build_graph" and chip_swimlane_level == 1
     for core_id, tid in core_to_tid.items():
-        # Find first task with this core_id to get core_type
-        core_type = None
-        for task in tasks:
-            if task["core_id"] == core_id:
-                core_type = task["core_type"]
-                break
-
-        # core_type is now a string ("aic" or "aiv")
-        core_type_str = (core_type or "unknown").upper()
-        thread_name = f"{core_type_str}_{core_id}"
-        events.append(
-            {"args": {"name": thread_name}, "cat": "__metadata", "name": "thread_name", "ph": "M", "pid": 4, "tid": tid}
-        )
+        task = worker_rows[core_id]
+        track = {"ph": "M", "cat": "__metadata", "pid": 4, "tid": tid}
+        if hbg_l1 and task.get("worker_lane") is not None:
+            name, order = task["worker_lane"]
+            events.append({**track, "name": "thread_sort_index", "args": {"sort_index": order}})
+        else:
+            name = f"{(task['core_type'] or 'unknown').upper()}_{core_id}"
+        events.append({**track, "name": "thread_name", "args": {"name": name}})
 
     # Duration events (Complete events "X")
     # Build task_id -> event_id mapping for flow events
@@ -3311,9 +3332,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     # Flow events (Flow events "s" and "f" for dependencies). Edges come from
     # deps.json (dep_gen replay); without one we emit no flow events at all,
     # since the device hot path no longer carries fanout (PR #863).
-    # SPMD logical tasks anchor Worker View dependency arrows on the earliest
-    # visible kernel slice per (func_id, task_id). Dummy/alloc DAG nodes have no
-    # kernel row, so their arrows anchor on the AICPU worker slice emitted above.
+    # One producer anchor per SPMD function feeds every visible consumer slice.
+    # Dummy and alloc nodes use their AICPU worker slices as endpoints.
     # The runs to walk come from the union of both identity sources: a run can
     # contribute only AICPU phases (dummy / alloc nodes and no AICore kernel
     # row at all), and iterating the task map alone would skip it entirely.
@@ -3326,11 +3346,13 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     ):
         run_task_map = task_maps_by_run.get(run_epoch) or {}
         run_anchor_map = aicpu_anchor_maps_by_run.get(run_epoch) or {}
-        if pred_id not in run_task_map and pred_id not in run_anchor_map:
+        pred_rows = _worker_flow_anchor_rows(pred_id, run_task_map, spmd_task_ids, run_anchor_map)
+        if not pred_rows:
             continue
 
         for succ_id in succ_ids:
-            if succ_id not in run_task_map and succ_id not in run_anchor_map:
+            succ_rows = run_task_map.get(succ_id) or run_anchor_map.get(succ_id)
+            if not succ_rows:
                 if verbose:
                     print(
                         f"Warning: Task {task_display(pred_id)} (raw {pred_id}) "
@@ -3338,20 +3360,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     )
                 continue
 
-            row_pairs = _flow_row_pairs(
-                pred_id,
-                succ_id,
-                run_task_map,
-                spmd_task_ids,
-                _worker_flow_anchor_rows,
-                run_anchor_map,
-            )
-            if not row_pairs:
-                continue
-
             output_task_count = _dependency_task_fan_count(pred_id, spmd_task_ids, run_task_map, deps_block_map)
             input_task_count = _dependency_task_fan_count(succ_id, spmd_task_ids, run_task_map, deps_block_map)
-            for pred_row, succ_row in row_pairs:
+            for pred_row, succ_row in product(pred_rows, succ_rows):
                 src_bar_start_us = _task_slice_start_us(pred_row)
                 src_end_us = pred_row["end_time_us"]
                 dst_ts_start = _task_slice_start_us(succ_row)
@@ -3385,7 +3396,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             if spmd_task_ids:
                 print(
                     f"  SPMD tasks: {len(spmd_task_ids)} logical task(s); "
-                    "dependency arrows independently anchor on each view's earliest visible slice per function"
+                    "Worker View shows dependencies on every consumer slice"
                 )
         else:
             print("  Flow events: 0 (no deps.json — re-run dep_gen and pass --deps-json to add arrows)")
@@ -3908,7 +3919,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         if verbose:
             print(f"  Overhead Analysis: {sum(1 for e in oh if e.get('ph') == 'C')} counter points (8 tracks)")
 
-    if runtime_name in ("host_build_graph", "percounter"):
+    if runtime_name in ("host_build_graph", "percounter") and not hbg_l1:
         _order_hbg_cluster_lanes(events, tasks, core_to_tid, scheduler_streams)
 
     trace: dict[str, object] = {"traceEvents": events}

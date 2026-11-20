@@ -188,9 +188,7 @@ static inline __aicore__ void scheduler_mark_mix_kernel_entered(
     );
 }
 
-// FromExecutor owns the physically returned Call. The FIN or exit fence
-// drains its publication, including when async sealing fails after return.
-template <bool FromExecutor = false>
+// The executor owns the returned call. FIN or the exit fence publishes its return state.
 inline __aicore__ bool scheduler_return_prepared_execution(
     __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, SchedulerPreparedHandle *handle
 ) {
@@ -200,22 +198,15 @@ inline __aicore__ bool scheduler_return_prepared_execution(
     if (scheduler_prepared_phase(handle->claimed_state) !=
         (mix_owned ? SchedulerPreparedPhase::ENTERED : SchedulerPreparedPhase::CLAIMED))
         return false;
-    if constexpr (!FromExecutor)
-        if (scheduler_prepared_already_returned(base, prepared, *handle)) return false;
     auto *control = scheduler_prepared_control_at(base, prepared, handle->execution_index);
     const uint64_t returned =
         (handle->claimed_state & ~UINT64_C(255)) | static_cast<uint64_t>(SchedulerPreparedPhase::RETURNED);
     if (mix_owned) {
-        if constexpr (!FromExecutor)
-            if (scheduler_gm_query(control->state) != handle->claimed_state) return false;
         scheduler_store_signal(control->state, returned);
     } else if ((handle->claimed_state & SCHEDULER_PREPARED_TICKET_OWNED) != 0) {
         if (!scheduler_transition_prepared_state(control, handle->claimed_state, returned)) return false;
-    } else if constexpr (FromExecutor) {
-        scheduler_gm_store(control->state, returned);
     } else {
-        if (scheduler_gm_compare_exchange(control->state, handle->claimed_state, returned) != handle->claimed_state)
-            return false;
+        scheduler_gm_store(control->state, returned);
     }
     *handle = {};
     return true;
@@ -257,7 +248,6 @@ static inline __aicore__ bool scheduler_receive_payload(
 
 // Fresh tickets identify one immutable Call; its fixed owner must receive the
 // payload before using the claimed handle for execution.
-template <bool TicketOwned = false>
 static inline __aicore__ bool scheduler_claim_for_execution(
     __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, uint32_t worker_id, int64_t task_ref,
     uint32_t block, uint8_t lane, SchedulerPreparedHandle *handle
@@ -268,12 +258,10 @@ static inline __aicore__ bool scheduler_claim_for_execution(
         !scheduler_prepared_execution_index(base, prepared, task_ref, block, lane, &index) ||
         (handle->execution_index != UINT64_MAX && handle->execution_index != index))
         return false;
-    if constexpr (TicketOwned) {
-        const auto &plan = scheduler_state_at<SchedulerExecutionPlan>(base, prepared->plans_offset)[task_ref];
-        if (plan.active_lane_count != 1 ||
-            (handle->claimed_state != 0 && (handle->claimed_state & SCHEDULER_PREPARED_TICKET_OWNED) == 0))
-            return false;
-    }
+    if (const auto &plan = scheduler_state_at<SchedulerExecutionPlan>(base, prepared->plans_offset)[task_ref];
+        plan.active_lane_count != 1 ||
+        (handle->claimed_state != 0 && (handle->claimed_state & SCHEDULER_PREPARED_TICKET_OWNED) == 0))
+        return false;
     if (handle->claimed_state != 0)
         return scheduler_execution_token_handle_valid(
             base, prepared, worker_id, handle, SchedulerPreparedPhase::CLAIMED
@@ -281,38 +269,10 @@ static inline __aicore__ bool scheduler_claim_for_execution(
     handle->execution_index = index;
     auto *control = scheduler_prepared_control_at(base, prepared, index);
     const uint64_t initial = scheduler_prepared_state(SchedulerPreparedPhase::BUILT);
-    const uint64_t claimed = scheduler_prepared_state(SchedulerPreparedPhase::CLAIMED, worker_id) |
-                             (TicketOwned ? SCHEDULER_PREPARED_TICKET_OWNED : 0);
+    const uint64_t claimed =
+        scheduler_prepared_state(SchedulerPreparedPhase::CLAIMED, worker_id) | SCHEDULER_PREPARED_TICKET_OWNED;
     if (!scheduler_transition_prepared_state(control, initial, claimed)) return false;
     handle->claimed_state = claimed;
-    return true;
-}
-
-// Cached handles belong to this caller's completed receipt; fresh claims must
-// receive the immutable Call and Binding before returning READY.
-static inline __aicore__ bool scheduler_claim_and_receive_payload(
-    __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, uint32_t worker_id, int64_t task_ref,
-    uint32_t block, uint8_t lane, SchedulerPreparedHandle *handle
-) {
-    SchedulerScalarScope scalar_scope(SchedPhaseKind::ScalarPreparedAcquire, task_ref);
-    const bool received = handle != nullptr && handle->claimed_state != 0;
-    const auto result = scheduler_claim_for_execution(base, prepared, worker_id, task_ref, block, lane, handle);
-    if (!result || received) return result;
-    return scheduler_receive_payload(base, prepared, task_ref, block, lane, handle);
-}
-
-static inline __aicore__ bool scheduler_fail_prepared_execution(
-    __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, uint32_t worker_id,
-    SchedulerPreparedHandle *handle
-) {
-    if (!scheduler_execution_token_handle_valid(base, prepared, worker_id, handle, SchedulerPreparedPhase::CLAIMED))
-        return false;
-    if (scheduler_prepared_already_returned(base, prepared, *handle)) return false;
-    auto *control = scheduler_prepared_control_at(base, prepared, handle->execution_index);
-    const uint64_t failed =
-        (handle->claimed_state & ~UINT64_C(255)) | static_cast<uint64_t>(SchedulerPreparedPhase::FAILED);
-    if (!scheduler_transition_prepared_state(control, handle->claimed_state, failed)) return false;
-    *handle = {};
     return true;
 }
 

@@ -245,10 +245,9 @@ static inline __aicore__ __gm__ SchedulerProtocolExecutionTrace *scheduler_proto
     return scheduler_state_at<SchedulerProtocolExecutionTrace>(base, layout->executions_offset) + index;
 }
 
-template <typename Local, typename Ready>
-static inline __aicore__ void scheduler_protocol_payload_publication(
-    __gm__ void *base, Local *local, uint32_t slot_index, const Ready &ready, bool before
-) {
+template <typename Local>
+static inline __aicore__ void
+scheduler_protocol_payload_publication(__gm__ void *base, Local *local, uint32_t slot_index, bool before) {
     auto *layout = scheduler_protocol_layout_at(base, local);
     if (layout == nullptr) return;
     if (slot_index >= SCHEDULER_LOCAL_EXECUTION_COUNT) {
@@ -283,7 +282,10 @@ static inline __aicore__ void scheduler_protocol_payload_publication(
         record->worker_index = static_cast<uint32_t>(local->worker_id());
         record->pending_slot = scheduler_trace_source_index(slot_index);
         record->subtask_slot = slot.subtask_slot;
-        record->ready_source = static_cast<uint32_t>(ready.source);
+        record->ready_source = static_cast<uint32_t>(
+            slot_index < SCHEDULER_EXECUTION_TOKEN_COUNT ? SchedulerReadySource::CATALOG :
+                                                           SchedulerReadySource::COOPERATIVE
+        );
     } else {
         if (record->publication_count == 0 || record->worker_index != local->worker_id() ||
             record->task_ref != slot.task_ref || record->pending_slot != scheduler_trace_source_index(slot_index) ||

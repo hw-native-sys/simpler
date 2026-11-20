@@ -23,6 +23,7 @@
 #include "aicore_scheduler_error.h"
 #include "aicore_scheduler_state.h"
 #include "scheduler_ready_watchdog.h"
+#include "scheduler_sink_observer.h"
 #include "aicpu/aicpu_device_config.h"
 #include "aicpu/cache_maintenance.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
@@ -162,43 +163,85 @@ static void log_unfinished_tasks(Runtime *runtime) {
     SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
     if (context == nullptr) return;
     void *scheduler_state_base = aicore_scheduler_state_base(context);
-    if (scheduler_state_base == nullptr) return;
-    auto *controls = scheduler_state_at<SchedulerTaskControl>(scheduler_state_base, context->task_controls_offset);
-    auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(scheduler_state_base, context->task_metadata_offset);
     const uint64_t count = context->graph_task_count;
+    const uint64_t bytes = context->scheduler_state_bytes;
+    const auto address = reinterpret_cast<uintptr_t>(scheduler_state_base);
+    auto fits = [&](uint64_t offset, uint64_t stride, uint64_t alignment) {
+        return offset != 0 && offset <= bytes && (address + offset) % alignment == 0 &&
+               count <= (bytes - offset) / stride;
+    };
+    if (!scheduler_state_base || bytes > UINTPTR_MAX - address ||
+        !fits(context->task_controls_offset, sizeof(SchedulerTaskControl), alignof(SchedulerTaskControl)) ||
+        !fits(context->task_metadata_offset, sizeof(SchedulerTaskMetadata), alignof(SchedulerTaskMetadata)) ||
+        (context->completion_counters_offset != 0 &&
+         !fits(
+             context->completion_counters_offset, sizeof(SchedulerTaskCompletionCounter),
+             alignof(SchedulerTaskCompletionCounter)
+         )) ||
+        (context->done_notifications_offset != 0 &&
+         !fits(context->done_notifications_offset, sizeof(uint64_t), alignof(uint64_t)))) {
+        LOG_ERROR("A5 HBG: unfinished-task snapshot unavailable for invalid table ranges");
+        return;
+    }
+    const auto *controls =
+        scheduler_state_at<SchedulerTaskControl>(scheduler_state_base, context->task_controls_offset);
+    const auto *metadata =
+        scheduler_state_at<SchedulerTaskMetadata>(scheduler_state_base, context->task_metadata_offset);
+    const auto *counters = context->completion_counters_offset == 0 ?
+                               nullptr :
+                               scheduler_state_at<SchedulerTaskCompletionCounter>(
+                                   scheduler_state_base, context->completion_counters_offset
+                               );
+    const auto *notifications =
+        context->done_notifications_offset == 0 ?
+            nullptr :
+            scheduler_state_at<uint64_t>(scheduler_state_base, context->done_notifications_offset);
     const auto graph = aicore_scheduler_graph_view(*context);
     struct TaskSnapshot {
         uint64_t task;
         uint64_t completion;
         uint64_t next_block;
+        uint64_t source_value;
+        bool done;
+    };
+    auto snapshot_task = [&](uint64_t task) {
+        const uint64_t completion = aicpu_observe_gm(controls[task].completion_state);
+        TaskSnapshot snapshot{
+            task, completion, aicpu_observe_gm(controls[task].next_block), completion,
+            scheduler_completion_done(completion)
+        };
+        if (counters != nullptr && counters[task].add_address != 0) {
+            const auto &counter = counters[task];
+            snapshot.source_value = counter.read_address == 0 ?
+                                        UINT64_MAX :
+                                        *reinterpret_cast<const volatile uint32_t *>(counter.read_address);
+            snapshot.done = counter.read_address != 0 && counter.threshold != 0 && counter.threshold <= counter.limit &&
+                            scheduler_classify_completion_counter(
+                                static_cast<uint32_t>(snapshot.source_value), counter.threshold, counter.limit
+                            ) == 1;
+        } else if (notifications != nullptr && notifications[task] != 0) {
+            snapshot.source_value = *reinterpret_cast<const volatile uint32_t *>(notifications[task]);
+            snapshot.done = snapshot.source_value == 1;
+        }
+        return snapshot;
     };
     TaskSnapshot snapshots[64];
     uint64_t snapshot_count = 0;
     for (uint64_t task = 0; task < count && snapshot_count < 64; ++task) {
         if (graph.native_header_offset == 0 && !scheduler_task_is_executable(metadata[task].flags)) continue;
-        cache_invalidate_range(&controls[task], sizeof(controls[task]));
-        rmb();
-        const uint64_t completion = controls[task].completion_state;
-        if (scheduler_completion_done(completion)) continue;
-        if (context->completion_counters_offset != 0) {
-            const auto &counter = scheduler_state_at<SchedulerTaskCompletionCounter>(
-                scheduler_state_base, context->completion_counters_offset
-            )[task];
-            if (counter.add_address != 0) {
-                const uint32_t observed = *reinterpret_cast<volatile uint32_t *>(counter.read_address);
-                LOG_ERROR(
-                    "A5 HBG ADD task=%" PRIu64 " count=%u target=%u limit=%u logical_ready=%u canonical_done=%u", task,
-                    observed, counter.threshold, counter.limit,
-                    static_cast<uint32_t>(observed >= counter.threshold && observed <= counter.limit),
-                    static_cast<uint32_t>(scheduler_completion_done(completion))
-                );
-            }
+        const TaskSnapshot snapshot = snapshot_task(task);
+        if (snapshot.done) continue;
+        if (counters != nullptr && counters[task].add_address != 0) {
+            LOG_ERROR(
+                "A5 HBG ADD task=%" PRIu64 " count=%" PRIu64 " target=%u limit=%u", task, snapshot.source_value,
+                counters[task].threshold, counters[task].limit
+            );
         }
         if (graph.native_header_offset != 0) {
             const auto identity = aicore_scheduler_public_identity(graph, task);
             LOG_ERROR("A5 HBG native node=%" PRIu64 " public_id=%" PRIu64, task, TaskId::to_uint64(identity));
         }
-        const TaskSnapshot snapshot{task, completion, controls[task].next_block};
+        const uint64_t completion = snapshot.completion;
         snapshots[snapshot_count++] = snapshot;
         LOG_ERROR(
             "A5 HBG AICore scheduler: unfinished task=%" PRIu64 " total=%" PRIu64 " remaining=%" PRIu64 " debt=%" PRIu64
@@ -213,15 +256,16 @@ static void log_unfinished_tasks(Runtime *runtime) {
     for (uint64_t index = 0; index < snapshot_count; ++index) {
         const auto &before = snapshots[index];
         const uint64_t task = before.task;
-        cache_invalidate_range(&controls[task], sizeof(controls[task]));
-        rmb();
-        const TaskSnapshot after{task, controls[task].completion_state, controls[task].next_block};
-        if (after.completion == before.completion && after.next_block == before.next_block) continue;
+        const TaskSnapshot after = snapshot_task(task);
+        if (after.source_value == before.source_value && after.completion == before.completion &&
+            after.next_block == before.next_block)
+            continue;
         ++moved;
         LOG_ERROR(
-            "A5 HBG AICore scheduler: task=%" PRIu64 " moved: completion %" PRIu64 "->%" PRIu64 " next_block %" PRIu64
-            "->%" PRIu64,
-            task, before.completion, after.completion, before.next_block, after.next_block
+            "A5 HBG AICore scheduler: task=%" PRIu64 " moved: source %" PRIu64 "->%" PRIu64 " completion %" PRIu64
+            "->%" PRIu64 " next_block %" PRIu64 "->%" PRIu64,
+            task, before.source_value, after.source_value, before.completion, after.completion, before.next_block,
+            after.next_block
         );
     }
     LOG_ERROR(
@@ -242,6 +286,7 @@ static void record_resident_timeout(Runtime *runtime, SchedulerErrorSite error_s
     }
     if (runtime != nullptr && runtime->get_gm_sm_ptr() != nullptr) {
         auto *error_code = task_image_error_code(runtime->get_gm_sm_ptr());
+        (void)settle_aicore_runtime_status(aicore_scheduler_run_control(context), error_code);
         (void)latch_aicore_scheduler_runtime_error(error_code, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT));
     }
     LOG_ERROR("A5 HBG AICore Scheduler timeout site=%" PRIu64, static_cast<uint64_t>(error_site));
@@ -583,12 +628,6 @@ int32_t AicpuExecutor::finish_failed_init(Runtime *runtime, int32_t shutdown_rc)
     return init_rc;
 }
 
-/**
- * Shutdown AICore - Send exit signal via registers to all AICore kernels
- */
-// The resident scheduler's supervision wait: poll the
-// run control until every task is accounted for, then latch what the cores
-// reported into the shared header.
 __attribute__((weak)) bool AicpuExecutor::schedules_on_aicore(const Runtime *runtime) const {
     return aicore_scheduler_runtime_enabled(runtime);
 }
@@ -612,95 +651,59 @@ void AicpuExecutor::service_args_dump(int32_t thread_idx) {
 }
 
 __attribute__((weak)) int32_t AicpuExecutor::supervise(Runtime *runtime, int32_t thread_idx) {
-    int32_t supervisor_rc = 0;
-    SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
-    if (context == nullptr || runtime->dev.host_total_tasks < 0) {
+    auto *context = aicore_scheduler_bootstrap_context(runtime);
+    auto *run = aicore_scheduler_run_control(context);
+    if (run == nullptr || runtime->dev.host_total_tasks < 0) {
         LOG_ERROR("A5 HBG AICore scheduler requires an initialized graph");
-        supervisor_rc = -1;
-    } else {
-        auto *run_control = aicore_scheduler_run_control(context);
-        if (run_control == nullptr) {
-            LOG_ERROR("A5 HBG AICore scheduler is missing run control");
-            supervisor_rc = -1;
-        } else {
-            if (run_control->inline_completed_count > run_control->expected_task_count) {
-                LOG_ERROR("A5 HBG: inline completion count exceeds expected tasks");
-                return -1;
-            }
-            const uint64_t executable_task_count =
-                run_control->expected_task_count - run_control->inline_completed_count;
-            uint32_t error_poll_count = 0;
-            uint64_t last_progress_cycles = ready_watchdog_.last_progress();
-            uint64_t last_resolved_task_count = aicore_scheduler_resolved_count(run_control);
-            bool bootstrap_was_complete = run_control->bootstrap_complete != 0;
-            const uint64_t timeout_cycles = resident_scheduler_timeout_cycles();
-            while (true) {
-                service_args_dump(thread_idx);
-                const bool bootstrap_complete = run_control->bootstrap_complete != 0;
-                const uint64_t resolved_task_count = aicore_scheduler_resolved_count(run_control);
-                if (resolved_task_count > executable_task_count) {
-                    LOG_ERROR(
-                        "A5 HBG: progress count exceeds expected tasks: resolved=%" PRIu64 " expected=%" PRIu64,
-                        resolved_task_count, executable_task_count
-                    );
-                    supervisor_rc = -1;
-                    break;
-                }
-                const bool tasks_resolved = resolved_task_count == executable_task_count;
-                const uint64_t now = get_sys_cnt_aicpu();
-                if (args_dump_services_ != nullptr) {
-                    const uint64_t copy_progress = ready_watchdog_.last_progress();
-                    if (copy_progress > last_progress_cycles) last_progress_cycles = copy_progress;
-                }
-                if (resolved_task_count != last_resolved_task_count || bootstrap_complete != bootstrap_was_complete) {
-                    last_resolved_task_count = resolved_task_count;
-                    bootstrap_was_complete = bootstrap_complete;
-                    last_progress_cycles = now;
-                    ready_watchdog_.record_progress(now);
-                }
-                if (bootstrap_complete && tasks_resolved) {
-                    break;
-                }
-                if (++error_poll_count == 64) {
-                    error_poll_count = 0;
-                    if (run_control->scheduler_error != 0) break;
-                }
-                if (scheduler_watchdog_expired(last_progress_cycles, now, timeout_cycles)) {
-                    record_resident_timeout(runtime, SchedulerErrorSite::EXECUTION_PROGRESS_TIMEOUT);
-                    break;
-                }
-                SPIN_WAIT_HINT();
-            }
-            const uint64_t scheduler_error = run_control->scheduler_error;
-            if (scheduler_error != 0) {
-                // Error details are published before the error marker.
-                rmb();
-                LOG_ERROR(
-                    "A5 HBG AICore scheduler: graph execution failed at task=%" PRIu64 " status=%" PRIu64
-                    " core=%" PRIu64 " type=%" PRIu64 " graph_tasks=%" PRIu64 " storage=0x%" PRIx64
-                    " window_last_index=0x%" PRIx64 " site=%" PRIu64 " resolved=%" PRIu64 " expected=%" PRIu64
-                    " inline=%" PRIu64,
-                    run_control->error_task_ref, scheduler_error, run_control->error_core_id,
-                    run_control->error_core_type, run_control->error_graph_task_count,
-                    run_control->error_storage_address, run_control->error_task_window_last_index,
-                    run_control->error_site, aicore_scheduler_resolved_count(run_control),
-                    run_control->expected_task_count, run_control->inline_completed_count
-                );
-                supervisor_rc = publish_aicore_scheduler_runtime_error(runtime, "execution");
-                if (supervisor_rc == 0) supervisor_rc = -1;
-            }
-            const uint64_t resolved_task_count = aicore_scheduler_resolved_count(run_control);
-            if (supervisor_rc == 0 &&
-                resolved_task_count + run_control->inline_completed_count != run_control->expected_task_count) {
-                LOG_ERROR(
-                    "A5 HBG AICore scheduler: count mismatch expected=%" PRIu64 " resolved=%" PRIu64 " inline=%" PRIu64,
-                    run_control->expected_task_count, resolved_task_count, run_control->inline_completed_count
-                );
-                supervisor_rc = -1;
-            }
-        }
+        return -1;
     }
-    return supervisor_rc;
+
+    // init() has waited for bootstrap_complete, including empty graphs, and
+    // released the execution gate after resetting this run's MMIO registers.
+    AicpuSinkObserver sinks;
+    int status = sinks.initialize(*context, *run) ? 0 : -1;
+    const uint64_t timeout = resident_scheduler_timeout_cycles();
+    AicpuSinkWatchdog watchdog;
+    uint32_t error_polls = 0;
+    while (status == 0) {
+        service_args_dump(thread_idx);
+        const uint64_t previous = sinks.resolved();
+        status = sinks.poll();
+        if (status != 0) break;
+        if (++error_polls == 64) {
+            error_polls = 0;
+            if (aicpu_observe_gm(run->scheduler_error) != 0) break;
+        }
+        const uint64_t now = get_sys_cnt_aicpu();
+        if (sinks.resolved() != previous) ready_watchdog_.record_progress(now);
+        if (watchdog.stalled(ready_watchdog_, now, timeout, [&] {
+                return sinks.fingerprint(*context);
+            })) {
+            LOG_ERROR(
+                "A5 HBG: no graph progress, completed sinks=%" PRIu64 "/%" PRIu64, sinks.resolved(), run->sink_count
+            );
+            record_resident_timeout(runtime, SchedulerErrorSite::EXECUTION_PROGRESS_TIMEOUT);
+            const int32_t error = publish_aicore_scheduler_runtime_error(runtime, "execution");
+            return error != 0 ? error : -SIMPLER_ERROR_SCHEDULER_TIMEOUT;
+        }
+        SPIN_WAIT_HINT();
+    }
+
+    if (status < 0) {
+        LOG_ERROR("A5 HBG: invalid completion source at sink=%" PRIu64 "/%" PRIu64, sinks.resolved(), run->sink_count);
+        (void)record_aicore_scheduler_runtime_error(
+            run, SchedulerGraphResult::INVALID_ARGUMENTS, SchedulerErrorSite::BLOCK_COMPLETION_INVALID
+        );
+    }
+    // Order the final error sample after the last GM or MMIO sink proof.
+    // snapshot_run_terminal() samples again after every core retires.
+    rmb();
+    if (aicpu_observe_gm(run->scheduler_error) != 0) {
+        LOG_ERROR("A5 HBG: graph failed, completed sinks=%" PRIu64 "/%" PRIu64, sinks.resolved(), run->sink_count);
+        const int32_t error = publish_aicore_scheduler_runtime_error(runtime, "execution");
+        return error != 0 ? error : -SIMPLER_ERROR_INVALID_ARGS;
+    }
+    return status == 1 ? 0 : -SIMPLER_ERROR_INVALID_ARGS;
 }
 
 __attribute__((weak)) int32_t AicpuExecutor::settle_run_error(Runtime *runtime) {

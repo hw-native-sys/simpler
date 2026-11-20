@@ -502,10 +502,6 @@ __aicore__ bool run_ready_dispatch_loop(
             return false;
         scalar_control.close();
         progress = progress || advanced;
-        bool counter_advanced = false;
-        if (!scheduler_account_completed_tasks(graph, scheduler_state_base, context, run_control, &counter_advanced))
-            return false;
-        progress = progress || counter_advanced;
         return true;
     };
     enum class Boundary { Proceed, Exit, Error };
@@ -704,7 +700,7 @@ __aicore__ bool run_ready_dispatch_loop(
                         run_control, task_ref, scheduler_async_error_result(context->async), &graph, context,
                         SchedulerErrorSite::ASYNC_SEAL_FAILED, local_slot
                     );
-                    (void)scheduler_complete_lane_execution<record_protocol, true, false>(
+                    (void)scheduler_complete_lane_execution<record_protocol, false>(
                         graph, scheduler_state_base, context, run_control, slot_index, profiling_level
                     );
                     return false;
@@ -718,7 +714,7 @@ __aicore__ bool run_ready_dispatch_loop(
                     run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
                     SchedulerErrorSite::ARGS_DUMP_REFUSED
                 );
-                (void)scheduler_complete_lane_execution<record_protocol, true, false>(
+                (void)scheduler_complete_lane_execution<record_protocol, false>(
                     graph, scheduler_state_base, context, run_control, slot_index, profiling_level
                 );
                 return false;
@@ -740,7 +736,7 @@ __aicore__ bool run_ready_dispatch_loop(
                         run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
                         SchedulerErrorSite::ASYNC_SEAL_FAILED, local_slot
                     );
-                    (void)scheduler_complete_lane_execution<record_protocol, true, false>(
+                    (void)scheduler_complete_lane_execution<record_protocol, false>(
                         graph, scheduler_state_base, context, run_control, slot_index, profiling_level
                     );
                     return false;
@@ -751,10 +747,10 @@ __aicore__ bool run_ready_dispatch_loop(
             SchedulerScalarScope scalar_completions(context, SchedPhaseKind::ScalarCompletions, task_ref);
             const bool completion_ok =
                 record_protocol && scheduler_protocol_enabled(context) ?
-                    scheduler_complete_lane_execution<true, true>(
+                    scheduler_complete_lane_execution<true>(
                         graph, scheduler_state_base, context, run_control, slot_index, profiling_level
                     ) :
-                    scheduler_complete_lane_execution<false, true>(
+                    scheduler_complete_lane_execution<false>(
                         graph, scheduler_state_base, context, run_control, slot_index, profiling_level
                     );
             scalar_completions.close();
@@ -983,6 +979,10 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
             }
             SPIN_WAIT_HINT();
         }
+    }
+    if constexpr (WithProfiling) {
+        if (config_valid && (phase_timing_enabled || scheduler_protocol_enabled(&scheduler_local_state)))
+            scheduler_snapshot_counter_completions(graph, scheduler_state_base, &scheduler_local_state, run_control);
     }
     if (phase_timing_enabled) publish_worker_stats(context, stats);
     if constexpr (record_protocol) {

@@ -2,8 +2,8 @@
 
 The table uses a conditional model of each case, independently of the runtime
 being compared. It preserves `sync_start` as an admission constraint, even
-when scheduler execution costs zero. Half-sync and all-sync have separate
-L1 captures, durations, models and results.
+when scheduler execution costs zero. Each native case uses its own
+L1 capture and recorded launch constraints.
 
 ## Inputs and model
 
@@ -48,7 +48,7 @@ Capture the selected variant through the automatically allocating launcher:
 
 ```bash
 export DSV41=tests/fdwic/dsv41_scheduler
-bundle="$PREPARED/cases/pypto_lib_dsl_all_sync64/c2a_full"
+bundle="$PREPARED/cases/pypto_lib_latest/c2a_full"
 capture="$RUN_DIR/l1/c2a_full-all"
 bash "$DSV41/run.sh" "$bundle" "$DSV41_RUNTIME" "$capture" 1 1 10
 PYTHONPATH=.:python python "$DSV41/production/sync_bound.py" \
@@ -75,11 +75,10 @@ the missing proof with a runtime measurement.
 
 Measured durations include intra-kernel waits and depend on cache behavior,
 concurrency and L1 instrumentation. This is neither an absolute hardware limit
-nor necessarily a strict bound on another L0 run. Differences between half-sync
-and all-sync include both their constraints and separately measured durations.
+nor necessarily a strict bound on another L0 run.
 
 Follow the [fixed table contract](README.md#performance-presentation-contract).
-Communication rows have no bound or percentage. The best measured time is the
+The two dual-device rows use the communication model described in [RESULTS.md](RESULTS.md). The best measured time is the
 smaller HBG/percounter value actually displayed in the row.
 
 The model follows the official [OR-Tools scheduling guide](https://developers.google.com/optimization/scheduling/job_shop)

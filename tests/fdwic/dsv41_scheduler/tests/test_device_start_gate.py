@@ -108,21 +108,23 @@ def test_prepare_rejects_unwrapped_runtime_before_creating_output(tmp_path, gate
     runtime = snapshot(tmp_path / "wrapper", gate)
     (tmp_path / "wrapper/manifest.json").unlink()
     output = tmp_path / "prepared"
-    monkeypatch.setattr(sys, "argv", ["prepare.py", str(runtime), str(output), "--flavor", "pypto_lib"])
+    monkeypatch.setattr(sys, "argv", ["prepare.py", str(runtime), str(output), "--flavor", "pypto_lib_latest"])
     with pytest.raises(SystemExit) as error:
         prepare.main()
     assert error.value.code == 2
     assert not output.exists()
 
 
-def test_prepare_passes_valid_snapshot_to_capture(tmp_path, gate, monkeypatch):
+@pytest.mark.parametrize("selection", [[], ["--flavor", "all"], ["--flavor", "pypto_lib_latest"]])
+def test_prepare_passes_valid_snapshot_to_capture(tmp_path, gate, monkeypatch, selection):
     prepare = importlib.import_module("prepare")
     runtime = snapshot(tmp_path / "wrapper", gate)
     output = tmp_path / "prepared"
     calls = []
-    monkeypatch.setattr(sys, "argv", ["prepare.py", str(runtime), str(output), "--flavor", "pypto_lib"])
+    monkeypatch.setattr(sys, "argv", ["prepare.py", str(runtime), str(output), *selection])
     monkeypatch.setattr(prepare.subprocess, "run", lambda command, **kwargs: calls.append(command))
     monkeypatch.setattr(prepare, "export", lambda *args: [])
     prepare.main()
     assert len(calls) == 1 and calls[0][3] == str(runtime)
+    assert Path(calls[0][2]).name == "pypto_lib_latest"
     assert json.loads((output / "runtime.json").read_text())["path"] == str(runtime)

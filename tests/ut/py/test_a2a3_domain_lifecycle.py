@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from simpler_setup.pto_isa import ensure_pto_isa_root
+
 ROOT = Path(__file__).resolve().parents[3]
 
 # The fixture compiles the A2/A3 production host path against the CANN headers.
@@ -37,6 +39,7 @@ def a2a3_lifecycle_binary(tmp_path_factory):
     )
     includes = [
         build,
+        Path(ensure_pto_isa_root()) / "include",
         cann / "include",
         cann / "pkg_inc/base",
         ROOT / "src/common",
@@ -52,6 +55,7 @@ def a2a3_lifecycle_binary(tmp_path_factory):
             "c++",
             "-std=c++17",
             "-UNDEBUG",
+            "-DPTO_NPU_ARCH_A2A3",
             "-ffunction-sections",
             "-fdata-sections",
             "-Wl,--gc-sections",

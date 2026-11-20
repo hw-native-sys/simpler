@@ -32,7 +32,6 @@ from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.scene_test_cache import compile_incore_artifact_key, get_or_compile_incore
 
 ROOT = Path(__file__).resolve().parents[1]
-FLAVORS = ("pypto_lib", "pypto_lib_dsl", "pypto_lib_latest")
 
 
 MODES = {"SYNCHRONOUS": 1, "DEFERRED": 2}
@@ -168,7 +167,6 @@ def build(flavor, output, tools, pto, jobs, runtime):
     compiler = KernelCompiler("a5")
     common_includes = compiler.get_orchestration_include_dirs(runtime)
     sdk = Path(os.environ["ASCEND_HOME_PATH"])
-    # Generated DSL C++ includes impl/c_api/... relative to the ASC SDK root.
     asc_roots = [str(path) for path in (sdk / "asc", sdk / "ascendc") if path.is_dir()]
     sdk_versions = {
         name: (sdk / name).read_text()
@@ -188,20 +186,12 @@ def build(flavor, output, tools, pto, jobs, runtime):
         capability = capability_declaration(kernel)
         source = sources / kernel["source"]
         extra = common_includes + [str(sources / item) for item in kernel["include_dirs"]]
-        dsl_entry = flavor == "pypto_lib_dsl" and "/external/" in kernel["source"]
-        cache_extra = list(extra)
-        if dsl_entry:
-            extra += asc_roots
         includes = [
             str(pto / "include"),
             str(pto / "include/pto"),
             *compiler.get_incore_include_dirs(),
-            # Match the normal scene-test policy for SDK headers: CANN's
-            # legacy header symlinks contain ../ spellings which the lexical
-            # include scanner cannot normalize. Compiler/SDK identity covers
-            # those; source, PTO, Simpler and local headers remain in closure.
-            *([] if dsl_entry else compiler.get_ascend_incore_include_dirs()),
-            *cache_extra,
+            *compiler.get_ascend_incore_include_dirs(),
+            *extra,
         ]
         metadata = {
             "platform": "a5",
@@ -209,9 +199,6 @@ def build(flavor, output, tools, pto, jobs, runtime):
             "host_machine": platform.machine(),
             "compiler": compiler_tokens[kernel["core_type"]],
         }
-        if dsl_entry:
-            metadata["sdk_include_roots"] = compiler.get_ascend_incore_include_dirs() + asc_roots
-            metadata["sdk_versions"] = sdk_versions
         helpers = [sources / path for path in kernel.get("vf_llvm", [])]
         if helpers:
             if kernel["core_type"] != "aiv":
@@ -269,8 +256,7 @@ def build(flavor, output, tools, pto, jobs, runtime):
         records = list(pool.map(compile_kernel, manifest["kernels"]))
 
     source = output / "orchestration.cpp"
-    parts = manifest.get("orchestration_parts", ["orchestration.cpp"])
-    source.write_bytes(b"".join((workload / "vendor" / part).read_bytes() for part in parts))
+    shutil.copyfile(workload / "vendor/orchestration.cpp", source)
     includes, support = compiler.get_orchestration_cache_inputs(runtime)
     host_token = compiler.compile_cache_token(runtime, [])
     # Cache the Host ELF as bytes without importing Simpler's Python bindings.
@@ -349,7 +335,7 @@ def build(flavor, output, tools, pto, jobs, runtime):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--flavor", choices=[*FLAVORS, "both", "all"], default="all")
+    parser.add_argument("--flavor", choices=("pypto_lib_latest", "all"), default="pypto_lib_latest")
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build/portable")
     parser.add_argument("--pto-isa", type=Path, default=ROOT.parents[2] / "build/pto-isa")
     parser.add_argument("--jobs", type=int, default=4)
@@ -358,25 +344,12 @@ def main():
     if args.jobs < 1 or not (args.pto_isa / "include/pto").is_dir():
         parser.error("--jobs must be positive and --pto-isa must contain include/pto")
     logging.basicConfig(level=logging.DEBUG)
-    flavors = FLAVORS if args.flavor == "all" else FLAVORS[:2] if args.flavor == "both" else [args.flavor]
-    for flavor in flavors:
-        build(
-            flavor,
-            args.build_dir.resolve() / "forward" / flavor,
-            args.build_dir.resolve() / "host",
-            args.pto_isa.resolve(),
-            args.jobs,
-            args.runtime,
-        )
-        if flavor == "pypto_lib_latest":
-            build(
-                "native_moe",
-                args.build_dir.resolve() / "native-moe",
-                args.build_dir.resolve() / "host",
-                args.pto_isa.resolve(),
-                args.jobs,
-                args.runtime,
-            )
+    build_dir = args.build_dir.resolve()
+    for flavor, target in (
+        ("pypto_lib_latest", build_dir / "forward/pypto_lib_latest"),
+        ("native_moe", build_dir / "native-moe"),
+    ):
+        build(flavor, target, build_dir / "host", args.pto_isa.resolve(), args.jobs, args.runtime)
 
 
 if __name__ == "__main__":

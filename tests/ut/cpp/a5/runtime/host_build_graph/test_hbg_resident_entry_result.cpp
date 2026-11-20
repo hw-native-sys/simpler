@@ -40,6 +40,8 @@ struct SchedulerImage {
     SchedulerGraphSummary summary{};
     std::array<AicpuThreadLifecycleTrace, kParticipants> traces{};
     SchedulerTaskMetadata metadata{};
+    SchedulerTaskControl task{};
+    uint32_t sink{};
 };
 
 struct RegisterTransport {
@@ -186,6 +188,8 @@ protected:
             context.aicpu_lifecycle_traces_offset = offsetof(SchedulerImage, traces);
             context.task_metadata_offset = offsetof(SchedulerImage, metadata);
             context.graph_task_count = 1;
+            context.scheduler_state_bytes = sizeof(SchedulerImage);
+            context.task_controls_offset = offsetof(SchedulerImage, task);
             auto &report = runtime->get_workers()[i];
             report.physical_core_id = i;
             report.core_type = i == 0 ? CoreType::AIC : CoreType::AIV;
@@ -193,8 +197,9 @@ protected:
             report.report_epoch = kEpoch;
         }
         image->control.bootstrap_complete = 1;
-        image->control.expected_task_count = 1;
-        image->control.resolved_task_count = 1;
+        image->control.sink_count = 1;
+        image->control.sinks_offset = offsetof(SchedulerImage, sink);
+        image->task.completion_state = scheduler_completion_completed_state(3);
         image->control.aic_worker_demand = 1;
         image->control.aiv_worker_demand = 2;
         image->summary.worker_count = kParticipants;
@@ -324,24 +329,29 @@ TEST_F(ResidentEntryResult, BothResidentModesReturnSuccessThroughTheMixedTopolog
     }
 }
 
-TEST_F(ResidentEntryResult, EmptyAndHostCompletedGraphsRequireNoDeviceProgressCredits) {
+TEST_F(ResidentEntryResult, EmptyAndHostCompletedGraphsRetireWithoutSinks) {
     for (uint64_t host_tasks : {0u, 1u}) {
         SCOPED_TRACE(host_tasks);
         configure(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING);
         runtime->dev.host_total_tasks = host_tasks;
         for (auto &context : image->contexts)
             context.graph_task_count = host_tasks;
-        image->control.expected_task_count = host_tasks;
         image->control.inline_completed_count = host_tasks;
-        image->control.resolved_task_count = 0;
-        uint32_t stale_progress = 7;
-        image->control.run_completed_read_address = reinterpret_cast<uint64_t>(&stale_progress);
-        image->control.run_completed_add_address = reinterpret_cast<uint64_t>(&stale_progress);
+        image->control.sink_count = 0;
         EXPECT_EQ(execute(), (std::array<int32_t, kParticipants>{0, 0, 0}));
-        EXPECT_EQ(stale_progress, 0u);
-        EXPECT_EQ(image->control.resolved_task_count, 0u);
         EXPECT_EQ(device_run_result_terminal(result, kEpoch).state, DeviceRunTerminalState::Succeeded);
     }
+}
+
+TEST_F(ResidentEntryResult, AnInvalidSinkFailsTheRunAndEveryCoreRetires) {
+    image->sink = 1;  // Only task 0 exists.
+    const auto statuses = execute();
+    for (const int32_t status : statuses)
+        EXPECT_EQ(status, -SIMPLER_ERROR_INVALID_ARGS);
+    EXPECT_EQ(header.error_code.load(), SIMPLER_ERROR_INVALID_ARGS);
+    EXPECT_EQ(image->control.error_site, static_cast<uint64_t>(SchedulerErrorSite::BLOCK_COMPLETION_INVALID));
+    EXPECT_EQ(device_run_result_terminal(result, kEpoch).state, DeviceRunTerminalState::Failed);
+    expect_normal_lifecycle();
 }
 
 TEST_F(ResidentEntryResult, TheActualLastEntryReturnsAnErrorClaimedAfterItsPeersReturned) {

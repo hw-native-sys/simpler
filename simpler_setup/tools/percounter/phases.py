@@ -25,7 +25,7 @@ PHASES_BY_PRODUCER = {
             "scalar_percounter_service_records",
             "scalar_percounter_entry",
             "scalar_percounter_idle",
-            "scalar_percounter_complete_mix",
+            "scalar_percounter_release_mix_publication",
             "scalar_percounter_async_tick",
             "scalar_run_percounter_lane",
             "scalar_percounter_async_seal",

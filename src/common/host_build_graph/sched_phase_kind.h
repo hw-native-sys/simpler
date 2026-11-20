@@ -136,7 +136,6 @@ enum class SchedPhaseKind : uint8_t {
     ScalarClusterMixDrain = 114,
     ScalarClusterMixAll = 117,
     ScalarPreparedReceive = 118,
-    ScalarPreparedAcquire = 119,
     ScalarPreparedReturn = 123,
     ScalarPreparedObserve = 124,
     ScalarPreparedIndex = 125,
@@ -330,8 +329,6 @@ constexpr const char *sched_phase_kind_name(SchedPhaseKind kind) {
         return "scalar_cluster_mix_all";
     case SchedPhaseKind::ScalarPreparedReceive:
         return "scalar_prepared_receive";
-    case SchedPhaseKind::ScalarPreparedAcquire:
-        return "scalar_prepared_acquire";
     case SchedPhaseKind::ScalarPreparedClaim:
         return "scalar_prepared_claim";
     case SchedPhaseKind::ScalarCounterAccounting:

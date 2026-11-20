@@ -11,8 +11,9 @@
 /**
  * Materializing Graph bodies for percounter's lanes.
  *
- * The Host provides body ids, ordered entries, static task shapes and completion
- * seeds before launch. AICore uses those seeds to initialize completion state.
+ * The Host provides body ids, ordered entries and static task shapes before
+ * launch. The upload image also contains the body completion counter presets.
+ * AICPU preserves those counters during materialization and AICore adds credits.
  * AICPU threads that do not supervise localize each invocation and materialize
  * its descriptors and argument spans in slices, independently of fanin.
  * Each task's metadata_ready publication follows its descriptor and argument
@@ -167,8 +168,7 @@ inline bool percounter_prepare_invocation(
         for (int32_t i = materialized; i < end; ++i) {
             percounter_flush_body_task(execution->task_at(i));
             PercounterCounter &counter = counters[body_base + static_cast<uint64_t>(i)];
-            // Completion seeds are immutable during materialization; AICore
-            // initializes partitioned components before claims begin.
+            // Preserve the Host's uploaded completion preset for AICore credits.
             counter.storage_address = invocation->storage_address;
             counter.body_index = static_cast<uint32_t>(i);
             counter.flags = body[i].flags;

@@ -19,12 +19,8 @@ import pytest
 
 pytestmark = pytest.mark.manual
 SUITE = Path(__file__).resolve().parents[1]
-SELECTED = {
-    "pypto_lib": {"c2a_full"},
-    "pypto_lib_dsl": {"c2a_full", "moe"},
-    "pypto_lib_latest": {"swa", "c2a_full", "c1a_reindex", "c1a_reuse", "moe", "engram", "layers_19_21"},
-}
-VARIANTS = {**SELECTED, "pypto_lib_dsl_all_sync64": {"c2a_full"}}
+FLAVOR = "pypto_lib_latest"
+CASES = {"swa", "c2a_full", "c1a_reindex", "c1a_reuse", "moe", "engram", "layers_19_21"}
 SPEC = importlib.util.spec_from_file_location("selected_workloads", SUITE / "export_workloads.py")
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
@@ -32,19 +28,14 @@ SPEC.loader.exec_module(MODULE)
 
 
 def test_manifests_and_tables_contain_only_selected_cases():
-    total = 0
-    for flavor, selected in SELECTED.items():
-        folder = SUITE / "workloads" / flavor
-        cases = json.loads((folder / "source.json").read_text())["cases"]
-        assert set(cases) == selected
-        replay = {name for name, case in cases.items() if case.get("execution") != "native_moe_host_control"}
-        assert {p.parent.name for p in folder.glob("*/tasks.tsv")} == replay
-        variants = (flavor, "pypto_lib_dsl_all_sync64") if flavor == "pypto_lib_dsl" else (flavor,)
-        for variant in variants:
-            selected_variant = {name for name, spec in cases.items() if variant in spec.get("variants", variants)}
-            assert selected_variant == VARIANTS[variant]
-            total += len(selected_variant)
-    assert total == 11
+    workloads = SUITE / "workloads"
+    assert {p.parent.name for p in workloads.glob("*/source.json")} == {FLAVOR, "native_moe"}
+    assert {p.parent.name for p in (SUITE / "kernels").glob("*/manifest.json")} == {FLAVOR, "native_moe"}
+    folder = workloads / FLAVOR
+    cases = json.loads((folder / "source.json").read_text())["cases"]
+    assert set(cases) == CASES
+    assert cases["moe"]["execution"] == "native_moe_host_control"
+    assert {p.parent.name for p in folder.glob("*/tasks.tsv")} == CASES - {"moe"}
 
 
 def test_performance_table_matches_selected_variants():
@@ -62,23 +53,14 @@ def test_performance_table_matches_selected_variants():
         assert all(re.fullmatch(r"[0-9]+\.[0-9]{6}", value) for value in row[2:4])
         assert re.fullmatch(r"[0-9]+\.[0-9]{6}†?", row[4])
         assert re.fullmatch(r"-?[0-9]+\.[0-9]{2}%†?", row[5])
-    actual = [(row[0], row[1]) for row in rows]
-    labels = [label for case, label in actual if case == "c2a_full"]
-    assert len(set(labels)) == 4
-    sources = ("pypto_lib", "pypto_lib_dsl", "pypto_lib_dsl_all_sync64", "pypto_lib_latest")
-    expected = {(case, label) for label, flavor in zip(labels, sources, strict=True) for case in VARIANTS[flavor]}
-    assert set(actual) == expected
-    assert len(actual) == 11
+    assert len(rows) == len(CASES)
+    assert {row[0] for row in rows} == CASES
+    assert len({row[1] for row in rows}) == 1
 
 
-@pytest.mark.parametrize("flavor", SELECTED)
-def test_topology_refresh_cannot_restore_removed_cases(tmp_path, flavor):
-    if flavor == "pypto_lib_latest":
-        pattern = ["hc_collapse_norm", "_o_proj_b_hc_post_aic", "hc_collapse_norm_2", "_hc_post"]
-    elif flavor == "pypto_lib":
-        pattern = ["hc_collapse_norm", "hc_post", "moe", "hc_post_2"]
-    else:
-        pattern = ["collapse_norm_grid", "expand_grid__2", "moe", "expand_grid"]
+def test_topology_refresh_cannot_restore_removed_cases(tmp_path):
+    flavor = FLAVOR
+    pattern = ["hc_collapse_norm", "_o_proj_b_hc_post_aic", "hc_collapse_norm_2", "_hc_post"]
     names = list(dict.fromkeys([*pattern, "engram_quant"]))
     sequence = []
     for layer in range(40):
@@ -104,11 +86,9 @@ def test_topology_refresh_cannot_restore_removed_cases(tmp_path, flavor):
     output = tmp_path / "exported"
     MODULE.export(capture, flavor, output)
     produced = json.loads((output / flavor / "source.json").read_text())["cases"]
-    assert set(produced) == SELECTED[flavor]
+    assert set(produced) == CASES
     replay = {name for name, case in produced.items() if case.get("execution") != "native_moe_host_control"}
     assert {p.name for p in (output / flavor).iterdir() if p.is_dir()} == replay
-    if flavor == "pypto_lib_dsl":
-        assert produced["moe"]["variants"] == ["pypto_lib_dsl"]
 
 
 @pytest.mark.parametrize("args", [[], ["--runtime=host_build_graph"], ["--runtime=percounter"]])
@@ -116,6 +96,6 @@ def test_run_list_excludes_removed_cached_bundles(args):
     listed = subprocess.check_output(
         [sys.executable, str(SUITE / "production/list_cases.py"), *args], text=True
     ).splitlines()
-    expected = {f"{variant}/{case}" for variant, cases in VARIANTS.items() for case in cases}
+    expected = {f"{FLAVOR}/{case}" for case in CASES}
     assert set(listed) == expected
-    assert len(listed) == 11
+    assert len(listed) == len(CASES)

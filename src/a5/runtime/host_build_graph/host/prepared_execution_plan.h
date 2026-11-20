@@ -167,7 +167,11 @@ inline bool scheduler_prepare_host_calls(
             const uint64_t binding = device_base + prepared.bindings_offset + index * sizeof(SchedulerExecutionBinding);
             call.args[SPMD_LOCAL_CONTEXT_INDEX] = binding + offsetof(SchedulerExecutionBinding, local_context);
             call.args[SPMD_GLOBAL_CONTEXT_INDEX] = binding + offsetof(SchedulerExecutionBinding, global_context);
+            auto &local = bindings[index].local_context;
+            local.block_idx = block;
+            local.block_num = plan.block_num;
             auto &global = bindings[index].global_context;
+            global.sub_block_id = lane == static_cast<uint8_t>(SubtaskSlot::AIV1) ? 1 : 0;
             // Synchronous bindings never call begin/seal. Clear every async
             // field here, including after a previous run used a deferred group.
             global.async_present = 0;

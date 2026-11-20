@@ -179,7 +179,7 @@ TEST_P(HbgClusterMixMultiWave, EveryReturnPrecedesExactlyOneSuccessor) {
             ASSERT_TRUE(fixture.drain(worker, &done));
         EXPECT_TRUE(done);
     }
-    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 2u);
+    EXPECT_EQ(fixture.storage.completed_gm_records(), 2u);
     EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
 }
 
@@ -245,7 +245,7 @@ TEST_P(HbgClusterMixShapes, RealOwnDispatchAndCompletionKeepEveryLogicalBlockAnd
     EXPECT_TRUE(std::all_of(done.begin(), done.end(), [](bool value) {
         return value;
     }));
-    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 1u);
+    EXPECT_EQ(fixture.storage.completed_gm_records(), 1u);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.run()->scheduler_error, UINT64_C(0)), 0u);
 }
 
@@ -261,7 +261,7 @@ TEST(HbgClusterMixFloor, InterleavedPureSyncTasksConsumeNoFloorRows) {
     );
     ASSERT_TRUE(fixture.prepare_calls());
     ASSERT_EQ(fixture.storage.layout.protocol.floor_count, 6u);
-    for (uint32_t pass = 0; pass < 64 && scheduler_test::resolved_count(fixture.run()) != 4; ++pass) {
+    for (uint32_t pass = 0; pass < 64 && fixture.storage.completed_gm_records() != 4; ++pass) {
         for (uint32_t worker = 0; worker < 6; ++worker) {
             ASSERT_TRUE(fixture.fill(worker));
             GmExecution entry{};
@@ -269,7 +269,7 @@ TEST(HbgClusterMixFloor, InterleavedPureSyncTasksConsumeNoFloorRows) {
             ASSERT_TRUE(fixture.complete(entry));
         }
     }
-    ASSERT_EQ(scheduler_test::resolved_count(fixture.run()), 4u);
+    ASSERT_EQ(fixture.storage.completed_gm_records(), 4u);
     const auto *floors =
         scheduler_state_at<SchedulerProtocolFloorTrace>(fixture.base(), fixture.storage.layout.protocol.floors_offset);
     const std::array<uint32_t, 3> prior{UINT32_MAX, 1, 3};
@@ -508,7 +508,7 @@ TEST(HbgClusterMixArgsDump, LastSnapshotHoldsExistingCompletionAcrossThreeWaves)
         EXPECT_EQ(scheduler_cluster_mix_armed(fixture.signal(0)->groups[0].armed_generation), block == 2);
         EXPECT_FALSE(fixture.task_done(0));
         EXPECT_EQ(fixture.control(1)->next_block, 0u);
-        EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 0u);
+        EXPECT_EQ(fixture.storage.completed_gm_records(), 0u);
     }
     EXPECT_EQ(visible, (std::array<uint32_t, 9>{1, 2, 3, 4, 5, 6, 7, 8, 9}));
     EXPECT_EQ(scheduler_completion_count(fixture.control(0)->completion_state), 6u);
@@ -523,7 +523,7 @@ TEST(HbgClusterMixArgsDump, LastSnapshotHoldsExistingCompletionAcrossThreeWaves)
     EXPECT_FALSE(scheduler_cluster_mix_armed(fixture.signal(0)->groups[0].armed_generation));
     ASSERT_TRUE(fixture.task_done(0));
     EXPECT_TRUE(fixture.task_done(0));
-    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), 1u);
+    EXPECT_EQ(fixture.storage.completed_gm_records(), 1u);
     EXPECT_EQ(scheduler_completion_count(fixture.control(0)->completion_state), 9u);
     uint32_t successor_entries = 0;
     for (uint32_t step = 0; step < 8; ++step) {
@@ -566,7 +566,7 @@ TEST(HbgClusterGroupReturn, RejectsEarlyAndDuplicateReleaseAndRunErrors) {
             EXPECT_EQ(fixture.signals[0].groups[0].finished[lane], 0u);
             EXPECT_FALSE(fixture.task_done(0));
             EXPECT_NE(fixture.run()->scheduler_error, 0u);
-            ASSERT_TRUE((scheduler_complete_lane_execution<false, true, false>(
+            ASSERT_TRUE((scheduler_complete_lane_execution<false, false>(
                 fixture.graph.graph(), fixture.base(), local, fixture.run(), execution.slot, 0
             )));
             EXPECT_EQ(
@@ -647,7 +647,7 @@ TEST(HbgClusterGroupOwnership, FullSelfWindowDoesNotConsumeTheEarlierMixSource) 
         ASSERT_TRUE(fixture.complete(owned));
     }
     EXPECT_EQ(scheduler_execution_token_count(member), 0u);
-    EXPECT_EQ(scheduler_test::resolved_count(fixture.run()), shapes.size());
+    EXPECT_EQ(fixture.storage.completed_gm_records(), shapes.size());
 }
 
 TEST(HbgClusterDescriptor, RejectsMalformedGroupIdentityOrUnsupportedPredicate) {

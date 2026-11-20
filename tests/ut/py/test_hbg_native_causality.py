@@ -195,20 +195,15 @@ def test_mix_reads_share_the_nonmember_seal_prefix():
         audit.causal.validate()
 
 
-def test_floor_rows_remain_readable_in_dense_and_older_sparse_layouts():
+def test_current_format_requires_dense_mix_floor_layout():
     raw, ids = ProtocolBuilder([(1, 2, ()), (3, 1, ()), (2, 2, ()), (5, 1, ())], sync_tasks=(0, 2)).run()
     clusters = raw["cluster_count"]
     assert raw["floor_count"] == (raw["mix_task_count"] + 1) * clusters
     assert {r["index"] for r in raw["floor_publications"]} == set(range(raw["floor_count"]))
     assert audit_native_protocol(raw, ids)["protocol_verified"]
     raw["floor_count"] = (raw["cooperative_task_count"] + 1) * clusters
-    with pytest.raises(ValueError, match="misbound MIX floor"):
+    with pytest.raises(ValueError, match="floor publication capacity"):
         audit_native_protocol(raw, ids)
-    for event in raw["floor_publications"]:
-        prior = event["prior_mix_ref"]
-        row = 0 if prior == (1 << 32) - 1 else 1 + raw["tasks"][prior]["cooperative_index"]
-        event["index"] = row * clusters + event["cluster_index"]
-    assert audit_native_protocol(raw, ids)["protocol_verified"]
 
 
 def test_ordinary_mix_arrival_cannot_rely_on_a_later_permit_proof():
@@ -623,6 +618,20 @@ def test_real_converter_preserves_native_audit_in_perfetto_metadata(tmp_path):
     assert trace["metadata"]["hbg_protocol_audit"] == parsed["protocol_audit"]
 
 
+@pytest.mark.parametrize("version", (None, 1, 3))
+def test_converter_rejects_unknown_or_unversioned_mix_protocol(tmp_path, version):
+    raw = wire_capture()
+    protocol = raw["aicore_protocol"]
+    if version is None:
+        del protocol["version"]
+    else:
+        protocol["version"] = version
+    path = tmp_path / "capture.json"
+    path.write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="unsupported protocol version"):
+        read_perf_data(path)
+
+
 def test_capture_without_protocol_has_no_native_proof(tmp_path):
     raw = wire_capture()
     del raw["aicore_protocol"]
@@ -744,7 +753,17 @@ def test_pure_ordinary_grids_have_no_cooperative_membership(blocks):
         audit_native_protocol(raw, identities)
 
 
-@pytest.mark.parametrize("flag", (128,))
+@pytest.mark.parametrize("mask,blocks", [(1, 2), (2, 4), (4, 4), (3, 2), (5, 2), (7, 2)])
+@pytest.mark.parametrize("sync", [True, False])
+def test_fixed_wave_audits_each_owner_without_a_dynamic_seal(mask, blocks, sync):
+    raw, identities = ProtocolBuilder([(mask, blocks, ())], fixed_tasks=(0,), sync_tasks=(0,) if sync else ()).run()
+    assert audit_native_protocol(raw, identities)["protocol_verified"]
+    raw["task_controls"][0]["next_block"] = blocks
+    with pytest.raises(ValueError, match="terminal block counters mismatch"):
+        audit_native_protocol(raw, identities)
+
+
+@pytest.mark.parametrize("flag", (256,))
 def test_current_cooperative_capture_rejects_independent_flag(flag):
     raw, identities = ProtocolBuilder([(1, 2, ())]).run()
     raw.update(schema="hbg-native-protocol")
@@ -976,6 +995,8 @@ def _counter_capture(*, mask=1, separate=False, successor=False, sync=False, asy
     if successor:
         shapes.append((1, 1, (0,)))
     builder = ProtocolBuilder(shapes, sync_tasks=(0,) if sync else ())
+    for task, control in zip(builder.raw["tasks"], builder.raw["task_controls"]):
+        control["async_mask"] = task["active_mask"] if async_mask is None else task["active_mask"] & async_mask
     raw, identities = builder.run()
     threshold = 0
     assert len(raw["tasks"]) == len(raw["task_controls"]) == len(raw["task_events"])
@@ -996,18 +1017,22 @@ def _counter_capture(*, mask=1, separate=False, successor=False, sync=False, asy
         may_defer = bool(raw["task_controls"][owner["task_ref"]]["async_mask"])
         owner.update(
             completion_ticket=(1 << 64) - 1,
-            completion_credits=bin(owner["active_mask"]).count("1")
-            if mixed
-            else (1 if separate or not may_defer else 2),
+            completion_credits=0 if mixed else (1 if separate or not may_defer else 2),
         )
     for execution in raw["executions"]:
         task = raw["tasks"][execution["task_ref"]]
         mixed = bool(task["flags"] & MIX)
         may_defer = bool(raw["task_controls"][execution["task_ref"]]["async_mask"] & (1 << execution["subtask_slot"]))
-        if not mixed:
+        if mixed:
+            consumed = execution["completion_consumed"][0]
             execution.update(
-                contribution_ticket=(1 << 64) - 1, contribution_credits=1 if separate or not may_defer else 2
+                contribution_before=[consumed + 3, 1],
+                contribution_after=[consumed + 4, 1],
+                contribution_worker=execution["worker_index"],
             )
+        execution.update(
+            contribution_ticket=(1 << 64) - 1, contribution_credits=1 if mixed or separate or not may_defer else 2
+        )
         if may_defer and (mixed or separate):
             when = execution["completion_consumed"][0] + 1
             raw["condition_contributions"].append(
@@ -1026,6 +1051,25 @@ def _counter_capture(*, mask=1, separate=False, successor=False, sync=False, asy
             )
     resequence(raw)
     return raw, identities
+
+
+@pytest.mark.parametrize("counter_backed", (False, True), ids=("full-mask-arrivals", "group-credits"))
+def test_saved_mix_accounting_has_an_explicit_format_boundary(counter_backed):
+    if counter_backed:
+        raw, identities = _counter_capture(mask=6, async_mask=0)
+        for row in raw["executions"]:
+            row.update(contribution_before=[0, 0], contribution_after=[0, 0], contribution_credits=0)
+        for block in raw["blocks"]:
+            block["owner"]["completion_credits"] = 2
+    else:
+        raw, identities = ProtocolBuilder([(6, 1, ())], sync_tasks=(0,)).run()
+        for block in raw["blocks"]:
+            generation = block["owner"]["group_seq"]
+            for lane in block["lanes"]:
+                lane["arrived_seq"] = [0, generation, generation]
+    del raw["version"]
+    with pytest.raises(ValueError, match="unsupported protocol version"):
+        audit_native_protocol(raw, identities)
 
 
 @pytest.mark.parametrize(
@@ -1061,6 +1105,30 @@ def test_counter_sync_lanes_need_only_physical_credits(mask, async_mask):
     assert audit_native_protocol(raw, identities)["protocol_verified"]
     raw["task_controls"][0]["async_mask"] ^= 1
     with pytest.raises(ValueError, match="counter thresholds"):
+        audit_native_protocol(raw, identities)
+
+
+def test_causal_audit_checks_worker_task_boundary_against_frozen_tasks():
+    raw, identities = _counter_capture(successor=True)
+    raw["expected_task_count"] += 1
+    assert read_native_protocol(raw) == raw
+    with pytest.raises(ValueError, match="worker graph task count disagrees with frozen tasks"):
+        audit_native_protocol(raw, identities)
+
+
+def test_causal_audit_distinguishes_missing_snapshot_from_incomplete_retirement():
+    raw, identities = _counter_capture(successor=True)
+    counter = raw["completion_counters"][0]
+    counter.update(valid=0, value=0)
+    raw["resolved_task_count"] = None
+    assert read_native_protocol(raw) == raw
+    with pytest.raises(ValueError, match="without a retirement counter snapshot"):
+        audit_native_protocol(raw, identities)
+
+    counter.update(valid=1)
+    raw["resolved_task_count"] = 0
+    assert read_native_protocol(raw) == raw
+    with pytest.raises(ValueError, match="logical completion count mismatch"):
         audit_native_protocol(raw, identities)
 
 
