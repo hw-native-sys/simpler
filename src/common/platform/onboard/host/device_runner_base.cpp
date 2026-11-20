@@ -4705,27 +4705,20 @@ int DeviceRunnerBase::prepare_run_storage(uint32_t slot) {
         args.shared_state = static_cast<RuntimeSharedState *>(mem_alloc_.alloc(sizeof(RuntimeSharedState)));
         if (args.shared_state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     }
-    // Initialize once on the registration stream. This allocation's first use
-    // can occur long after context initialization, while prior runs still own
-    // every preallocated generation. Runtime constructors zero the workers array
-    // on all backends. Its reports belong to the cores after initialization.
-    auto stream = kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu);
-    const int rc = initialize_private_workers(
-        stream, args.shared_state, sizeof(RuntimeSharedState::workers), timeout_config_.stream_sync_timeout_ms,
-        args.worker_initialization_pending
-    );
+    // This generation is private until prepare succeeds. AICPU owns the gates.
+    constexpr size_t bytes = sizeof(RuntimeSharedState::workers);
+    const int rc = initialize_private_workers(args.shared_state, bytes);
     if (rc == 0) args.workers_initialized = true;
     return rc;
 }
 
 int DeviceRunnerBase::release_submission_storage(PreparedSubmissionStorage &storage, bool abandon) {
     if (!abandon && storage.args.worker_initialization_pending) {
-        const int rc = initialize_private_workers(
-            kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu), storage.args.shared_state,
-            sizeof(RuntimeSharedState::workers), timeout_config_.stream_sync_timeout_ms,
-            storage.args.worker_initialization_pending
+        const int rc = aclrtSynchronizeStreamWithTimeout(
+            kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu), timeout_config_.stream_sync_timeout_ms
         );
         if (rc != 0) return rc;
+        storage.args.worker_initialization_pending = false;
     }
     if (abandon) {
         storage.caller_order->abandon();

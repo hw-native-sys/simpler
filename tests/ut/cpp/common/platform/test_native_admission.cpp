@@ -4425,7 +4425,11 @@ TEST_F(NativeAdmissionTest, FiveLiveCallerRunsKeepDistinctRtsSnapshotsUntilFinal
 
 TEST_F(NativeAdmissionTest, PrivateWorkerInitializationFailureLeavesThePreparedPeerUsable) {
     ColdKernelRunner runner;
+    // Limit initialization to the mandatory generations to exercise expansion.
+    const auto limit = control().ceiling;
+    control().ceiling = 2 * sizeof(RuntimeSharedState);
     ASSERT_EQ(initialize_cold_kernel_runner(runner, 2), 0);
+    control().ceiling = limit;
     ASSERT_EQ(runner.kernel_execution_state().mark_ready_enqueued(), 0);
     Attempt old(runner, 1, 10130), peer(runner, 0, 10131), replacement(runner, 1, 10132);
     use_caller_preparation(old);
@@ -4435,7 +4439,7 @@ TEST_F(NativeAdmissionTest, PrivateWorkerInitializationFailureLeavesThePreparedP
 
     auto cleanup = RAIIScopeGuard([&] {
         control().recording_active = false;
-        control().stream_sync_rc = 0;
+        control().worker_memset_rc = 0;
         (void)simpler_finalize_run(&runner, old.storage);
         (void)simpler_finalize_run(&runner, peer.storage);
         (void)simpler_finalize_run(&runner, replacement.storage);
@@ -4444,10 +4448,10 @@ TEST_F(NativeAdmissionTest, PrivateWorkerInitializationFailureLeavesThePreparedP
     ASSERT_EQ(old.prepare(), 0);
     ASSERT_EQ(simpler_submit_run_on_stream(&runner, old.storage, &caller), 0);
     ASSERT_EQ(peer.prepare(), 0);
-    control().stream_sync_rc = -872;
+    control().worker_memset_rc = -872;
     ASSERT_EQ(replacement.prepare(), -872);
     ASSERT_TRUE(replacement.consume_release());
-    control().stream_sync_rc = 0;
+    control().worker_memset_rc = 0;
     EXPECT_EQ(control().capture_mode_exchanges, 0u);
     ASSERT_EQ(simpler_submit_run_on_stream(&runner, peer.storage, &caller), 0);
     control().recording_active = false;

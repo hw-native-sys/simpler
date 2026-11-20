@@ -208,6 +208,9 @@ int aclrtEventGetTimestamp(aclrtEvent, uint64_t *out) {
 int aclrtStreamWaitEvent(aclrtStream, aclrtEvent) { return 0; }
 int aclrtSynchronizeStream(aclrtStream stream) { return rtStreamSynchronize(stream); }
 int aclrtSynchronizeStreamWithTimeout(aclrtStream stream, int32_t) { return rtStreamSynchronize(stream); }
+int aclrtMemsetAsync(void *p, size_t capacity, int32_t value, size_t bytes, aclrtStream) {
+    return aclrtMemset(p, capacity, value, bytes);
+}
 int aclrtGetStreamResLimit(aclrtStream, int, uint32_t *out) {
     *out = 1;
     return 0;
@@ -281,14 +284,9 @@ int LoadAicpuOp::LaunchBuiltInOp(rtStream_t stream, void *args, size_t bytes, in
 }
 }  // namespace host
 
-int initialize_private_workers(void *stream, void *workers, size_t bytes, int timeout_ms, bool &pending) {
-    if (!pending) {
-        std::memset(workers, 0, bytes);
-        pending = true;
-    }
-    const int rc = aclrtSynchronizeStreamWithTimeout(stream, timeout_ms);
-    if (rc == 0) pending = false;
-    return rc;
+int initialize_private_workers(void *workers, size_t bytes) {
+    const int rc = native_admission_transport::control().worker_memset_rc;
+    return rc != 0 ? rc : aclrtMemset(workers, bytes, 0, bytes);
 }
 
 KernelContextOps make_onboard_kernel_context_ops() {
