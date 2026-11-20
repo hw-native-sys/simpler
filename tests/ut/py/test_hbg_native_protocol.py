@@ -19,6 +19,7 @@ from simpler_setup.tools.hbg.native_protocol import audit_protocol_sequences, re
 def capture(epoch=0):
     return {
         "schema": "hbg-native-protocol",
+        "version": 2,
         "producer": "aicore",
         "run_epoch": epoch,
         "task_count": 1,
@@ -142,8 +143,18 @@ def test_counter_reader_preserves_unknown_observation_and_rejects_wrapped_values
         completion_backend=1, counter_index=0, counter_threshold=2, counter_limit=2, async_mask=1
     )
     raw["completion_counters"] = [dict(index=0, value=0, valid=0, limit=2)]
+    raw["resolved_task_count"] = None
     raw["condition_contributions"] = []
     assert read_native_protocol(raw) == raw
+    raw["resolved_task_count"] = 0
+    with pytest.raises(ValueError, match="resolved_task_count must be null"):
+        read_native_protocol(raw)
+    raw["completion_counters"][0].update(value=1, valid=1)
+    assert read_native_protocol(raw)["resolved_task_count"] == 0
+    raw["resolved_task_count"] = None
+    with pytest.raises(ValueError, match="invalid integer at resolved_task_count"):
+        read_native_protocol(raw)
+    raw["resolved_task_count"] = 0
     raw["completion_counters"][0].update(value=3, valid=1)
     with pytest.raises(ValueError, match="counter"):
         read_native_protocol(raw)

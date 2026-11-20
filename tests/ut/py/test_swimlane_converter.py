@@ -99,6 +99,28 @@ def _task_row(
     }
 
 
+@pytest.mark.parametrize("recorded_window", [False, True])
+def test_hbg_l1_worker_order_counts_idle_cores(tmp_path, recorded_window):
+    capture = Capture(runtime=HBG_RUNTIME, level=1, core_types=["aiv", "aic", "aiv", "aic", "aiv"])
+    for worker in (4, 3, 0):
+        capture.aicore_task(task_id=worker, core_id=worker, start=10, end=20)
+    if recorded_window:
+        capture.metadata(collection={"recorded_window": True})
+    data = sc._decode_perf_data(capture.build())
+    trace = _trace(
+        data["tasks"],
+        tmp_path / "trace.json",
+        runtime_name=HBG_RUNTIME,
+        chip_swimlane_level=1,
+        timeline_metadata=data.get("timeline_metadata"),
+    )
+    names = {e["tid"]: e["args"]["name"] for e in trace["traceEvents"] if e["name"] == "thread_name"}
+    order = sorted(
+        (e["args"]["sort_index"], e["tid"]) for e in trace["traceEvents"] if e["name"] == "thread_sort_index"
+    )
+    assert [names[tid] for _, tid in order] == ["AIC1", "AIV0", "AIV2"]
+
+
 def _count_dependency_flow_starts(trace_path, *, pid, tid=None):
     with open(trace_path) as f:
         events = json.load(f)["traceEvents"]

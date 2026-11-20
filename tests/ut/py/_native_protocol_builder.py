@@ -24,6 +24,7 @@ class ProtocolBuilder:
         epoch=0,
         sync_tasks=(),
         deferred_tasks=(),
+        fixed_tasks=(),
     ):
         self.raw: dict[str, Any] = capture(epoch)
         self.clock = 0
@@ -58,6 +59,8 @@ class ProtocolBuilder:
                 flags |= (4 if bin(mask).count("1") > 1 else 0) | (8 if blocks > 1 else 0)
             if ref in sync_tasks:
                 flags |= 16
+            if ref in fixed_tasks:
+                flags |= 128
             raw["tasks"].append(
                 dict(
                     task_ref=ref,
@@ -277,7 +280,8 @@ class ProtocolBuilder:
         if spec["flags"] & 16 and not spec["flags"] & 4:
             self.commit_member(task, worker)
         control = self.raw["task_controls"][task]
-        control["next_block"] += 1
+        if not spec["flags"] & 128:
+            control["next_block"] += 1
         certificate = dict(
             run_epoch=self.raw["run_epoch"],
             worker_index=worker,
@@ -313,7 +317,7 @@ class ProtocolBuilder:
     def execute(self, task, block, slot, worker, *, owner=None, group=0, skip=False) -> dict[str, Any]:
         spec = self.raw["tasks"][task]
         mixed, cooperative = bool(spec["flags"] & 4), bool(spec["flags"] & 16)
-        if not mixed and not cooperative:
+        if not mixed and not cooperative and not spec["flags"] & 128:
             control = self.raw["task_controls"][task]
             control["next_block"] += 1
             if control["next_block"] == spec["block_num"]:
@@ -412,6 +416,10 @@ class ProtocolBuilder:
         self.stamp(owner, "publish_after")
         self.published_blocks[task] += 1
         resources = owner["active_mask"]
+        floors = self.raw["tasks"][task]["required_floor"]
+        all_arrivals = any(c["async_mask"] for c in self.raw["task_controls"]) or any(
+            floors[i] for i in range(3) if resources & (1 << i)
+        )
         for lane, worker in enumerate(workers):
             if not resources & (1 << lane):
                 continue
@@ -426,7 +434,9 @@ class ProtocolBuilder:
                 active_mask=owner["active_mask"],
                 resource_mask=resources,
                 observed_self_floor=self.proof(task, worker)["observed_self_floor"],
-                arrived_seq=[group if resources & (1 << peer) else 0 for peer in range(3)],
+                arrived_seq=[
+                    group if resources & (1 << peer) and (peer == lane or all_arrivals) else 0 for peer in range(3)
+                ],
                 lane_subtasks=[i if owner["active_mask"] & (1 << i) else 255 for i in range(3)],
             )
             for name in (

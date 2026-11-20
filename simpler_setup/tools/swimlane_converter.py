@@ -208,6 +208,16 @@ def _is_recorded_window(raw):
     return isinstance(collection, dict) and collection.get("recorded_window") is True
 
 
+def _hbg_l1_worker_lanes(core_types):
+    """Map captured worker IDs to type-local names and numeric display order, counting idle cores."""
+    lanes = {}
+    for kind in ("aic", "aiv"):
+        workers = (worker for worker, core_type in enumerate(core_types) if core_type == kind)
+        for ordinal, worker in enumerate(workers):
+            lanes[worker] = (f"{kind.upper()}{ordinal}", len(lanes))
+    return lanes
+
+
 def _decode_recorded_window(raw):  # noqa: PLR0912, PLR0915
     """Keep received intervals without inventing a replay identity or task join."""
     level = int(raw.get("chip_swimlane_level"))
@@ -244,6 +254,10 @@ def _decode_recorded_window(raw):  # noqa: PLR0912, PLR0915
             }
         )
 
+    runtime = resolve_runtime(metadata.get("runtime"))
+    worker_lanes = (
+        _hbg_l1_worker_lanes(metadata.get("core_types") or []) if runtime == "host_build_graph" and level == 1 else {}
+    )
     for index, row in enumerate(rows(raw.get("aicore_tasks", []), "aicore_tasks")):
         if not isinstance(row, list) or len(row) != 7:
             raise ValueError("recorded aicore_tasks must contain seven-column arrays")
@@ -265,6 +279,8 @@ def _decode_recorded_window(raw):  # noqa: PLR0912, PLR0915
                 "run_epoch": epoch,
             },
         )
+        if core in worker_lanes:
+            device[-1]["worker_lane"] = worker_lanes[core]
     scheduler = raw.get("scheduler_tasks")
     if scheduler is not None:
         if not isinstance(scheduler, dict) or scheduler.get("producer") not in ("aicpu", "aicore"):
@@ -348,7 +364,7 @@ def _decode_recorded_window(raw):  # noqa: PLR0912, PLR0915
         )
     return {
         "chip_swimlane_level": level,
-        "runtime": resolve_runtime(metadata.get("runtime")),
+        "runtime": runtime,
         "tasks": device,
         "host_preparation": host,
         "timeline_metadata": {
@@ -380,6 +396,11 @@ def _recorded_trace(tasks, output_path, runtime_name, timeline_metadata):
         {"ph": "M", "cat": "__metadata", "name": "process_name", "pid": pid, "args": {"name": f"{name} [{domain}]"}}
         for name, pid in lanes.items()
     ]
+    worker_lanes = {row["lane"]: row["worker_lane"] for row in tasks if "worker_lane" in row}
+    for worker, (name, order) in worker_lanes.items():
+        track = {"ph": "M", "cat": "__metadata", "pid": lanes["aicore_tasks"], "tid": worker}
+        events.append({**track, "name": "thread_name", "args": {"name": name}})
+        events.append({**track, "name": "thread_sort_index", "args": {"sort_index": order}})
     for row in tasks:
         events.append(
             {
@@ -1239,6 +1260,11 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
             )
     elif aicore_rows:
         raise ValueError(f"level {level} requires Scheduler task timing records")
+
+    if runtime_name == "host_build_graph" and level == 1:
+        lanes = _hbg_l1_worker_lanes(core_types)
+        for task in tasks:
+            task["worker_lane"] = lanes.get(task["core_id"])
 
     if "aicore_execution_identities" in data:
         from simpler_setup.tools.hbg.execution_identity import attach_execution_identities  # noqa: PLC0415
@@ -2411,16 +2437,16 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             print(f"  Function names: {len(func_id_to_name)} entries")
 
     # Step 1: Build core_to_tid mapping (using only core_id, not core_type)
-    unique_cores = set()
+    worker_rows = {}
     for task in tasks:
-        unique_cores.add(task["core_id"])
+        worker_rows.setdefault(task["core_id"], task)
 
     core_to_tid = {}
-    for core_id in sorted(unique_cores):
+    for core_id in sorted(worker_rows):
         core_to_tid[core_id] = 10000 + core_id * 10
 
     if verbose:
-        print(f"  Unique cores: {len(unique_cores)}")
+        print(f"  Unique cores: {len(worker_rows)}")
 
     # The runtime whose DFX vocabulary this whole trace follows -- its TaskId layout,
     # its phase names and colours, the lanes it draws. Resolved once, from the runtime
@@ -2584,21 +2610,16 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             {"args": {"sort_index": 3}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 3}
         )
 
-    # Metadata events: Thread names (one per core)
+    hbg_l1 = runtime_name == "host_build_graph" and chip_swimlane_level == 1
     for core_id, tid in core_to_tid.items():
-        # Find first task with this core_id to get core_type
-        core_type = None
-        for task in tasks:
-            if task["core_id"] == core_id:
-                core_type = task["core_type"]
-                break
-
-        # core_type is now a string ("aic" or "aiv")
-        core_type_str = (core_type or "unknown").upper()
-        thread_name = f"{core_type_str}_{core_id}"
-        events.append(
-            {"args": {"name": thread_name}, "cat": "__metadata", "name": "thread_name", "ph": "M", "pid": 4, "tid": tid}
-        )
+        task = worker_rows[core_id]
+        track = {"ph": "M", "cat": "__metadata", "pid": 4, "tid": tid}
+        if hbg_l1 and task.get("worker_lane") is not None:
+            name, order = task["worker_lane"]
+            events.append({**track, "name": "thread_sort_index", "args": {"sort_index": order}})
+        else:
+            name = f"{(task['core_type'] or 'unknown').upper()}_{core_id}"
+        events.append({**track, "name": "thread_name", "args": {"name": name}})
 
     # Duration events (Complete events "X")
     # Build task_id -> event_id mapping for flow events
@@ -3908,7 +3929,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
         if verbose:
             print(f"  Overhead Analysis: {sum(1 for e in oh if e.get('ph') == 'C')} counter points (8 tracks)")
 
-    if runtime_name in ("host_build_graph", "percounter"):
+    if runtime_name in ("host_build_graph", "percounter") and not hbg_l1:
         _order_hbg_cluster_lanes(events, tasks, core_to_tid, scheduler_streams)
 
     trace: dict[str, object] = {"traceEvents": events}

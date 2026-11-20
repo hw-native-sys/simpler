@@ -259,4 +259,6 @@ DSV41_RUNNER="$FROZEN_RUNNER" bash tests/fdwic/dsv41_scheduler/production/run.sh
 
 - 修改：`scheduler_initialize_local_config`、`scheduler_ready_queue_holder`、`scheduler_ready_pool_push_batch`、`scheduler_ready_batch_push`、`scheduler_ready_pop_from_queue`、`scheduler_ready_pool_claim`、`scheduler_ready_pool_may_have_work`、`scheduler_claim_ready_for_slot`、`scheduler_resolve_completion`、`scheduler_complete_inline_task`。
 - 删除：`scheduler_owner_queue_activate`、`scheduler_owner_queue_deactivate`、`scheduler_ready_inbox_at`、`scheduler_ready_queue_owner_count`、`scheduler_ready_directory_at`、`scheduler_ready_directory_set`、`scheduler_ready_directory_clear`、`scheduler_refresh_ready_inbox_type`、`scheduler_refresh_ready_inbox`、`scheduler_ready_push_target`、`scheduler_ready_pop_from_inbox`、`scheduler_load_ready_directory_shard`、`scheduler_steal_ready_from_shard`、`scheduler_ready_directory_nonempty`、`scheduler_plan_mix_placement`。
-- 状态清理：`SchedulerReadyStats`、`SchedulerReadyClaim`、`SchedulerLocalConfig`、`SchedulerLocalState`、`SchedulerCompletionDirect`；`scheduler_ready_batch_push_queue` 更新控制 FIFO 的说明，未重写其算法。
+- 状态清理：`SchedulerReadyStats`、`SchedulerLocalConfig`、`SchedulerLocalState`、`SchedulerCompletionDirect`；`scheduler_ready_batch_push_queue` 更新控制 FIFO 的说明，未重写其算法。
+
+当前 A5 HBG 的 READY 发布直接读取持有者的任务身份，普通执行来自 `SchedulerExecutionToken`，MIX 成员来自 `SchedulerClusterMixLocalState`。

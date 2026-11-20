@@ -73,8 +73,8 @@ static inline __aicore__ bool scheduler_progress_graph_controls(
         }
         scheduler_cache_barrier();
         if (notification != nullptr) scheduler_notify_done(*notification);
-        // No yield or error-return separates publication from this accounting
-        // attempt. A losing CAS means another publisher already owns the count.
+        // Publish the canonical GM state in the same step as the notification.
+        // Only the winning CAS records the control-node completion actor.
         const uint64_t before = record ? scheduler_protocol_cycles(local) : 0;
         const uint64_t previous = scheduler_gm_compare_exchange(
             control->completion_state, scheduler_completion_initial_state(1), scheduler_completion_completed_state(1)
@@ -97,7 +97,6 @@ static inline __aicore__ bool scheduler_progress_graph_controls(
             scheduler_protocol_task_actor(base, local, ref, flags, false, after);
         }
         scheduler_remember_task_proof(local, ref, SchedulerTaskProof::DONE);
-        scheduler_report_task_completed(run);
         *progress = true;
     }
     return true;

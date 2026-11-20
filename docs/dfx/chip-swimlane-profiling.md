@@ -136,6 +136,11 @@ backward-compatible with the old boolean behavior).
 | 3 | + scheduler phases (`scheduler_records`) | Does not enable orchestrator collection; an independently enabled HBG Host pool can still export Host records |
 | 4 | + orchestrator phases (Host for HBG, AICPU for TMR) | Full collection |
 
+HBG L1 groups Worker View lanes by core type, with AIC first and AIV second.
+Each type is numbered from zero using the complete captured core list, so idle
+cores keep their indices. A 32-AIC, 64-AIV capture shows active lanes from
+`AIC0`–`AIC31` followed by `AIV0`–`AIV63`. Task details retain the global worker ID.
+
 A5 `percounter` adds a task/block Scheduler View at L2 with Claim start, Claim,
 Ready, Kernel end and GM Completion issued markers. With complete predecessor
 evidence in `deps.json` and the same capture's completion records, Ideal ready
@@ -178,6 +183,16 @@ completion accounting, and descriptor reuse. The two order checks are
 `scheduler_self_order_ready` and `scheduler_mix_lane_order_ready`. The cluster
 publisher advances its boundary in `scheduler_advance_mix_floor`. Functions without a worker argument
 use the same core-local trace binding and preserve the caller's nesting depth.
+The A5 HBG L4 protocol section identifies its schema as `hbg-native-protocol`
+with integer `version: 2`. A counter record with `valid: 0, value: 0` means
+the retirement snapshot is missing. If a device task uses any such counter,
+`resolved_task_count` is JSON `null`. Otherwise the exporter counts the tasks
+proved DONE by their counter threshold or GM completion state. The successful-run
+causality audit requires a valid retirement snapshot for every mapped counter.
+The exporter reads `expected_task_count` from the workers’ graph contexts, checks
+that all workers agree and exports their common value. The audit compares it
+with the frozen task table.
+
 L3 function spans shorter than 1 us are omitted on device; L4 retains every
 instrumented function span, including short empty polls. Atomic, bypass, DCCI
 and DSB leaves are retained regardless of duration; recorder intervals are also

@@ -63,7 +63,7 @@ predicate 在支持的单 block/lane 形状下按依赖顺序求值；false 跳�
 
 ## MIX 与 sync_start
 
-每簇 AIV0 代领 MIX，发布本代 SSBUF 描述符与单调排序边界。活动 lane 收到对应的任务和 block 后准备自己的 Call，确认前驱逻辑完成并服从较早的冲突责任后发布 ARRIVED。活动成员到齐才发布最终 payload 并运行。返回后各活动 lane 发布 FIN；实际记账成员收齐本代成功 FIN，才提交组的物理信用。失败进入错误清退。
+每簇 AIV0 代领 MIX 并发布本代 SSBUF 描述符。活动 lane 确认 fanin 与较早冲突责任后发布自己的 ARRIVED。若任一活动 lane 有更早纯核 sync-start 的排序门槛，或本次运行有异步等待布局，成员须等本代所有活动 lane 的 ARRIVED 到齐；其余组在本核发布 ARRIVED 后即可发布 payload。CntNotify 路径由每个成功成员在自己的返回路径发布一个 P。记账成员收齐本代全部活动成员的成功 FIN 后退役 bank；在 GM 路径，它也在此时聚合整组物理贡献。失败进入错误清退。
 
 `sync_start` 的每个 block 使用不同执行位置。不可撤销的承诺检查 Host 生成的每 lane 排序阈值和未退休的冲突责任；较早返回的成员可先服务独立工作。实际依赖仍等 TaskDone，描述符复用仍等前代退休。
 
@@ -72,15 +72,15 @@ predicate 在支持的单 block/lane 形状下按依赖顺序求值；false 跳�
 真实执行返回后 seal async registration，并按固定 owner 退休执行责任。
 普通 TICKET_OWNED 记录由 owner 按数据发布合同维护；最后成功返回可复用同次完成贡献证明退休，
 不要求额外的 RETURNED 原子。MIX/cohort 仍按其协作状态与 ACK 合同发布返回。
-compute return 同时减少 canonical gate 的 computation 和 compute debt；async FINISH 清除额外 debt。
-合法零 gate 向消费者证明 DONE；resolved run 汇总可以稍后批量提交。
+GM 完成门在物理贡献时同时扣减 computation 和 compute debt，内联 FINISH 清除最后一个异步门闩。
+后继读取 CntNotify 阈值、独占 SET 通知或 GM 零门判断 DONE。AICPU 在所有终点完成后开始清退。
 trace 和 MIX/group retirement 仍由拥有者完成后，slot 才可复用。
 
 每执行的任务 trace 为 256 B：publication、kernel timing、dispatch/completion、execution identity 四行。
 核内 staged trace 为三个时间戳、共 24 B。没有 completion inbox ID、旧 refill 或未写入的 resolver timing 行。
 有效计时行写回并完成 barrier 后才原子发布 valid；atomic valid 所在行不能被后续 cached 整行回写。
 
-L4 因果诊断统一采用 `hbg-native-protocol`，不按版本号分流。native Graph 额外携带独立的 graph source/node map；
+L4 因果诊断使用 `schema: "hbg-native-protocol"` 和整数 `version: 2`。native Graph 额外携带独立的 graph source/node map；
 共同记录 worker 身份、真实贡献、Call publication、最终 permit 和 trace retirement。
 ready_source 只接受目录发现 0 和 cooperative/group 3，不接受已无生产者的 direct-resolve/refill 事实。
 解析器只接受当前格式；历史 JSON 不能用默认值伪装成一份当前协议证明。

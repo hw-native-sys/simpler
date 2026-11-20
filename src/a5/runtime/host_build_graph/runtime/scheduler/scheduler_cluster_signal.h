@@ -37,7 +37,6 @@ struct SchedulerClusterDescriptor {
     volatile uint32_t order_ready[PLATFORM_CORES_PER_BLOCKDIM];
     volatile uint32_t arrived[PLATFORM_CORES_PER_BLOCKDIM];
     volatile uint32_t finished[PLATFORM_CORES_PER_BLOCKDIM];
-    volatile uint32_t dependencies_generation;
     volatile uint32_t accounted_generation;
     volatile uint32_t trace_generation;
 };
@@ -114,7 +113,6 @@ scheduler_cluster_signal_clear(SCHEDULER_CLUSTER_SSBUF SchedulerClusterSignal *s
         scheduler_cluster_store_field(&descriptor->block_idx, UINT32_MAX);
         scheduler_cluster_store_field(&descriptor->active_mask, UINT32_C(0));
         scheduler_cluster_store_field(&descriptor->trace_generation, UINT32_C(0));
-        scheduler_cluster_store_field(&descriptor->dependencies_generation, UINT32_C(0));
         scheduler_cluster_store_field(&descriptor->accounted_generation, UINT32_C(0));
         for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
             scheduler_cluster_store_field(&descriptor->order_ready[lane], UINT32_C(0));

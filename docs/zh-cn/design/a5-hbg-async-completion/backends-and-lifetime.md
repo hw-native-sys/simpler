@@ -43,7 +43,7 @@ defer_wait 不会使提交队列满、上述提交争用、SyncAll 或 kernel �
 | DMA 目标 | 最后写入和相关消费者读取完成 |
 | signal、完成记录 | 检查者及 backend/peer 都不再访问 |
 
-延迟 TaskDone、后继解析和 resolved_task_count 会自然延长既有 run 持有时间；kernel 返回或单 task 完成不会单独释放 HBG heap。不能把 scalar context 当成无人保活，也不能用一份新身份快照代替实际引用。
+延迟 TaskDone、后继解析和终点完成 会自然延长既有 run 持有时间；kernel 返回或单 task 完成不会单独释放 HBG heap。不能把 scalar context 当成无人保活，也不能用一份新身份快照代替实际引用。
 
 `owner_task_id` 表示依赖/生产来源，可用于现有记录索引，不等于 allocator 或通信 owner。Graph 的 PARAM、SUB_TASK 和 view 几何已经提供绑定线索；需要消费范围时从现有表示解析运行内旁表，不修改 TensorData 或 Graph 格式。
 
