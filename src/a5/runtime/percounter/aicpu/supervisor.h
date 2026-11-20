@@ -121,6 +121,13 @@ percounter_post_handshake_init(Runtime *runtime, const AicoreLifecycle &lifecycl
     cache_flush_range(control, sizeof(*control));
     percounter_graph_prepare_init(control);
     percounter_reset_sync_notifications(control);
+    auto *counters = scheduler_state_at<PercounterCounter>(control, control->counters_offset);
+    cache_invalidate_range(counters, control->table_task_count * sizeof(PercounterCounter));
+    for (uint64_t id = 0; id < control->table_task_count; ++id) {
+        const auto &counter = counters[id];
+        if (percounter_completion_notify_head(counter, counter.value))
+            *reinterpret_cast<volatile uint32_t *>(counter.completion_notify_address) = 0;
+    }
     wmb();
     LOG_INFO("A5 percounter: topology %d clusters x %d AIV", aic_count, PLATFORM_AIV_CORES_PER_BLOCKDIM);
     return 0;
@@ -153,54 +160,28 @@ inline void percounter_publish_partition(
 /** What an AICPU thread other than the supervisor does while the lanes run. */
 inline void percounter_assist(Runtime *runtime) { percounter_prepare_graphs(runtime, percounter_control(runtime)); }
 
-/**
- * True when every completion component this reference names reads positive.
- *
- * The reference is `(task << 1) | partitioned`, the encoding a Graph body's
- * fanin carries. A partitioned producer publishes into
- * PERCOUNTER_COMPLETION_SECTOR_COUNT device-only sectors, so it is complete
- * only once all of them are.
- */
-inline bool percounter_reference_published(
-    const PercounterCounter *counters, const PercounterCompletionSector *sectors, uint64_t reference
-) {
-    const uint64_t task = reference >> 1;
-    if ((reference & PERCOUNTER_COMPLETION_PARTITIONED) == 0) {
-        const uint64_t *value = &counters[task].value;
-        cache_invalidate_range(value, sizeof(*value));
-        return percounter_counter_published(__atomic_load_n(value, __ATOMIC_ACQUIRE));
+inline bool percounter_task_published(const PercounterCounter &counter) {
+    cache_invalidate_range(&counter, sizeof(counter));
+    if (counter.completion_notify_address != 0) {
+        const auto *notify = reinterpret_cast<const volatile uint32_t *>(counter.completion_notify_address);
+        return *notify >= counter.completion_notify_target;
     }
-    const PercounterCompletionSector *group = sectors + task * PERCOUNTER_COMPLETION_SECTOR_COUNT;
-    for (uint32_t i = 0; i < PERCOUNTER_COMPLETION_SECTOR_COUNT; ++i) {
-        cache_invalidate_range(&group[i].value, sizeof(group[i].value));
-        if (!percounter_counter_published(__atomic_load_n(&group[i].value, __ATOMIC_ACQUIRE))) return false;
-    }
-    return true;
+    return percounter_counter_published(__atomic_load_n(&counter.value, __ATOMIC_ACQUIRE));
 }
 
-/**
- * A fingerprint of every completion component in the graph, for the watchdog.
- *
- * A sink stays unchanged for as long as the chain behind it takes, so from the
- * sinks alone a long run and a stalled one look the same. This reads the whole
- * component state instead. It mixes each value with its position rather than
- * summing: a MIX deducts its share while another component gains one, and a
- * sum would cancel the two into a false stall.
- *
- * The scan is whole-graph and only the stall path runs it.
- */
-inline uint64_t percounter_progress_fingerprint(
-    const PercounterControl *control, const PercounterCounter *counters, const PercounterCompletionSector *sectors
-) {
+/** Hash the GM counters and read each SRAM chain once when the watchdog checks for progress. */
+inline uint64_t percounter_progress_fingerprint(const PercounterControl *control, const PercounterCounter *counters) {
     const uint64_t tasks = control->task_count;
-    const uint64_t components = tasks * PERCOUNTER_COMPLETION_SECTOR_COUNT;
     cache_invalidate_range(counters, static_cast<size_t>(tasks) * sizeof(PercounterCounter));
-    cache_invalidate_range(sectors, static_cast<size_t>(components) * sizeof(PercounterCompletionSector));
     uint64_t hash = 0xcbf29ce484222325ULL;
-    for (uint64_t i = 0; i < tasks; ++i)
-        hash = (hash ^ __atomic_load_n(&counters[i].value, __ATOMIC_RELAXED)) * 0x100000001b3ULL;
-    for (uint64_t i = 0; i < components; ++i)
-        hash = (hash ^ __atomic_load_n(&sectors[i].value, __ATOMIC_RELAXED)) * 0x100000001b3ULL;
+    for (uint64_t i = 0; i < tasks; ++i) {
+        const auto &counter = counters[i];
+        const uint64_t preset = __atomic_load_n(&counter.value, __ATOMIC_RELAXED);
+        const uint64_t value = percounter_completion_notify_head(counter, preset) ?
+                                   *reinterpret_cast<const volatile uint32_t *>(counter.completion_notify_address) :
+                                   preset;
+        hash = (hash ^ value) * 0x100000001b3ULL;
+    }
     return hash;
 }
 
@@ -265,10 +246,7 @@ percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_th
     // the previous run left at the same address.
     cache_invalidate_range(sinks, static_cast<size_t>(sink_count) * sizeof(uint64_t));
     const auto *counters = scheduler_state_at<PercounterCounter>(control, control->counters_offset);
-    const auto *sectors = scheduler_state_at<PercounterCompletionSector>(control, control->completion_sectors_offset);
-    // Sinks before this were observed published. A sink that reads published
-    // can dip back while a deferred share is withdrawn, but its registration
-    // precedes the dip, so the outstanding check below holds the exit.
+    // Published sink counters stay satisfied for the rest of the run.
     uint64_t resolved = 0;
     uint64_t last_progress = ~uint64_t{0};
     uint64_t last_progress_cycles = get_sys_cnt_aicpu();
@@ -285,9 +263,9 @@ percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_th
     uint64_t registered = 0;
     uint64_t settled = 0;
     while (true) {
-        // Every completion component arrives preset in this run's uploaded
-        // image, so a positive read belongs to this run and not the last.
-        while (resolved < sink_count && percounter_reference_published(counters, sectors, sinks[resolved]))
+        // The upload presets GM counters. AICPU resets mapped CntNotify
+        // registers before READY so each sink observes this run's credits.
+        while (resolved < sink_count && percounter_task_published(counters[sinks[resolved]]))
             ++resolved;
         const bool sinks_done = resolved >= sink_count;
         // The final sink publication follows every registration allocation.
@@ -327,7 +305,7 @@ percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_th
             if (error != 0) break;
         }
         if (scheduler_watchdog_expired(last_progress_cycles, now, scan_cycles)) {
-            const uint64_t current = percounter_progress_fingerprint(control, counters, sectors);
+            const uint64_t current = percounter_progress_fingerprint(control, counters);
             if (!scanned || current != fingerprint) {
                 // Some component moved, so the graph is running and only the
                 // sinks and the deferred counts were still.

@@ -27,37 +27,44 @@ def parse_capture(section):
     for field in ("dropped", "unmatched_deferred_updates"):
         if type(section.get(field)) is not int or section[field] < 0:
             raise ValueError(f"invalid percounter_task_events.{field}")
+    for field in ("folded_task_ids", "inline_completed_task_ids"):
+        ids = section.get(field)
+        if not isinstance(ids, list) or any(type(task_id) is not int or task_id < 0 for task_id in ids):
+            raise ValueError(f"invalid percounter_task_events.{field}")
     for row in section["records"]:
-        if not isinstance(row, dict) or not isinstance(row.get("kind"), str) or row["kind"] not in _LABELS:
-            raise ValueError("invalid percounter task event kind")
-        for field in (
-            "cycles",
-            "run_epoch",
-            "task_id",
-            "worker_id",
-            "cluster_index",
-            "cluster_lane",
-            "block_index",
-            "block_count",
-        ):
-            if type(row.get(field)) is not int or row[field] < 0:
-                raise ValueError(f"invalid percounter task event {field}")
-        if not 0 <= row["block_index"] < row["block_count"] or row["cluster_lane"] >= 3 or row["cycles"] == 0:
-            raise ValueError("invalid percounter task event coordinates or timestamp")
-        if row["kind"] == "claim":
-            start = row.get("claim_start_cycles")
-            if type(start) is not int or not 0 < start <= row["cycles"]:
-                raise ValueError("invalid percounter claim interval")
-        if row["kind"] == "kernel_end":
-            start = row.get("kernel_start_cycles")
-            if type(start) is not int or not 0 < start <= row["cycles"]:
-                raise ValueError("invalid percounter kernel interval")
-        if (
-            row["kind"] in ("completion_issue", "deferred_completion_issue")
-            and type(row.get("contribution")) is not int
-        ):
-            raise ValueError("invalid percounter completion contribution")
+        _validate_task_event(row)
     return section
+
+
+def _validate_task_event(row):
+    if not isinstance(row, dict) or not isinstance(row.get("kind"), str) or row["kind"] not in _LABELS:
+        raise ValueError("invalid percounter task event kind")
+    for field in (
+        "cycles",
+        "run_epoch",
+        "task_id",
+        "worker_id",
+        "cluster_index",
+        "cluster_lane",
+        "block_index",
+        "block_count",
+    ):
+        if type(row.get(field)) is not int or row[field] < 0:
+            raise ValueError(f"invalid percounter task event {field}")
+    if not 0 <= row["block_index"] < row["block_count"] or row["cluster_lane"] >= 3 or row["cycles"] == 0:
+        raise ValueError("invalid percounter task event coordinates or timestamp")
+    if row["kind"] == "claim":
+        start = row.get("claim_start_cycles")
+        if type(start) is not int or not 0 < start <= row["cycles"]:
+            raise ValueError("invalid percounter claim interval")
+    if row["kind"] == "kernel_end":
+        start = row.get("kernel_start_cycles")
+        if type(start) is not int or not 0 < start <= row["cycles"]:
+            raise ValueError("invalid percounter kernel interval")
+    if row["kind"] in ("completion_issue", "deferred_completion_issue"):
+        contribution = row.get("contribution")
+        if type(contribution) is not int or contribution != 1:
+            raise ValueError("invalid percounter completion contribution")
 
 
 def decode_capture(section, to_us):
@@ -87,13 +94,13 @@ def _meta(pid, name, args, tid=None):
 
 
 def _block_completion_issue(rows, shares):
-    """Return the last required positive issue for a fully recorded block."""
-    ordinary = []
+    """Return the last required lane credit for a fully recorded block."""
+    immediate = []
     registered = set()
     settled = {}
     for row in rows:
         if row["kind"] == "completion_issue":
-            ordinary.append((row["contribution"], row["time_us"]))
+            immediate.append(row["time_us"])
         elif row["kind"] in ("defer_registered", "deferred_completion_issue"):
             group = row.get("deferred_group")
             if type(group) is not int or group <= 0:
@@ -103,21 +110,13 @@ def _block_completion_issue(rows, shares):
                     return None
                 registered.add(group)
             else:
-                if group in settled or row["contribution"] != 1:
+                if group in settled:
                     return None
                 settled[group] = row["time_us"]
 
-    if registered != settled.keys() or len(registered) > shares:
+    if registered != settled.keys() or len(immediate) + len(settled) != shares:
         return None
-    # MIX withdraws one share per defer, then issues one aggregate per block.
-    # Single-lane defer withholds the contribution until settlement.
-    if shares > 1:
-        expected = [-1] * len(registered) + [shares]
-    else:
-        expected = [] if registered else [1]
-    if sorted(delta for delta, _ in ordinary) != expected:
-        return None
-    return max([ts for delta, ts in ordinary if delta > 0] + list(settled.values()))
+    return max([*immediate, *settled.values()])
 
 
 def _task_completion_issues(capture, blocks, deps_edges, deps_kernel_map, deps_block_map):
@@ -161,9 +160,7 @@ def _milestones(rows, ideal_ready):
         by_kind[row["kind"]].append(row)
     ticks = [row["time_us"] for row in rows]
     starts = [row["kernel_start_us"] for row in by_kind["kernel_end"]]
-    completion = [
-        row for row in by_kind["completion_issue"] + by_kind["deferred_completion_issue"] if row["contribution"] > 0
-    ]
+    completion = by_kind["completion_issue"] + by_kind["deferred_completion_issue"]
     spans = []
     claim = by_kind["claim"][0] if by_kind["claim"] else None
     if claim:
@@ -257,17 +254,43 @@ def _block_events(rows, pid, tid, name, spans, ideal_ready):
         }
 
 
+def _execution_predecessors(deps_edges, folded_task_ids, inline_completed_task_ids):
+    predecessors = defaultdict(set)
+    completed = set(inline_completed_task_ids)
+    for pred, successors in deps_edges.items():
+        if pred in completed:
+            continue
+        for succ in successors:
+            predecessors[succ].add(pred)
+
+    folded = set(folded_task_ids)
+    for task_id, parents in predecessors.items():
+        if task_id in folded:
+            continue
+        pending = parents & folded
+        seen = set(pending)
+        while pending:
+            for pred in predecessors.get(pending.pop(), ()):
+                if pred not in folded:
+                    parents.add(pred)
+                elif pred not in seen:
+                    pending.add(pred)
+                    seen.add(pred)
+        parents.difference_update(folded)
+    return predecessors
+
+
 def trace_events(capture, pid, task_name, *, deps_edges=None, deps_kernel_map=None, deps_block_map=None):
     blocks = defaultdict(list)
     for row in capture["records"]:
         blocks[row["run_epoch"], row["task_id"], row["block_index"]].append(row)
 
     issues = _task_completion_issues(capture, blocks, deps_edges, deps_kernel_map, deps_block_map)
-    predecessors = defaultdict(set)
-    if issues:
-        for pred, successors in (deps_edges or {}).items():
-            for succ in successors:
-                predecessors[succ].add(pred)
+    predecessors = (
+        _execution_predecessors(deps_edges, capture["folded_task_ids"], capture["inline_completed_task_ids"])
+        if issues
+        else {}
+    )
 
     by_cluster = defaultdict(list)
     for (epoch, task_id, block), rows in blocks.items():

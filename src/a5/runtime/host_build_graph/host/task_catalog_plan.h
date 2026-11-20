@@ -13,14 +13,13 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <deque>
-#include <set>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "scheduler/scheduler_task_catalog.h"
 #include "dependency_plan.h"
+#include "host/control_folding.h"
 
 struct SchedulerTaskCatalogPlan {
     uint64_t header_offset{0};
@@ -202,74 +201,35 @@ inline bool scheduler_order_task_catalog(
 }
 
 // The original topology fixes issue order. Fold pure controls with at most one consumer within the fan-in limit.
-inline std::vector<uint32_t> scheduler_fold_ordinary_controls(
+inline std::vector<int64_t> scheduler_fold_ordinary_controls(
     std::vector<std::vector<int64_t>> &fanin, const std::vector<bool> &host_done,
     const std::vector<SchedulerTaskMetadata> &metadata, uint64_t capacity
 ) {
-    enum class State : uint8_t { INACTIVE, IDLE, QUEUED };
-    std::vector<State> controls(fanin.size(), State::INACTIVE);
-    std::deque<uint32_t> pending;
-    const auto enqueue = [&](uint32_t ref) {
-        if (controls[ref] == State::IDLE) {
-            controls[ref] = State::QUEUED;
-            pending.push_back(ref);
-        }
-    };
-    for (uint32_t ref = 0; ref < fanin.size(); ++ref) {
-        if (!host_done[ref] && scheduler_task_is_inline(metadata[ref].flags)) {
-            controls[ref] = State::IDLE;
-            enqueue(ref);
-        }
+    std::vector<bool> active(fanin.size()), controls(fanin.size());
+    bool has_live_control = false;
+    for (size_t ref = 0; ref < fanin.size(); ++ref) {
+        active[ref] = !host_done[ref];
+        controls[ref] = active[ref] && scheduler_task_is_inline(metadata[ref].flags);
+        has_live_control |= controls[ref];
     }
-    if (pending.empty()) return {};
+    if (!has_live_control) return {};
+
     uint64_t edges = 0;
-    std::vector<std::set<uint32_t>> consumers(fanin.size());
-    for (uint32_t ref = 0; ref < fanin.size(); ++ref) {
-        edges += fanin[ref].size();
-        for (const auto parent : fanin[ref])
-            consumers[parent].insert(ref);
-    }
-    // Aliased rows can represent more edges than the pool holds. Save the original rows for rollback in that case.
-    std::vector<std::vector<int64_t>> original;
-    if (edges > capacity) original = fanin;
-    std::vector<uint32_t> folded;
-    while (!pending.empty()) {
-        const auto ref = pending.front();
-        pending.pop_front();
-        controls[ref] = State::IDLE;
-        if (consumers[ref].size() > 1) continue;
-        const auto consumer = consumers[ref].empty() ? UINT32_MAX : *consumers[ref].begin();
-        auto affected = fanin[ref];
-        if (consumer != UINT32_MAX) {
-            auto &row = fanin[consumer];
-            auto merged = fanin[ref];
-            for (const auto parent : row)
-                if (parent != ref) merged.push_back(parent);
-            std::sort(merged.begin(), merged.end());
-            merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
-            if (merged.size() > SCHEDULER_GRAPH_MAX_FANIN) continue;
-            affected.insert(affected.end(), row.begin(), row.end());
-            for (const auto parent : row)
-                consumers[parent].erase(consumer);
-            edges = edges - row.size() + merged.size();
-            row = std::move(merged);
-            for (const auto parent : row)
-                consumers[parent].insert(consumer);
-            enqueue(consumer);
-        }
-        for (const auto parent : fanin[ref])
-            consumers[parent].erase(ref);
-        edges -= fanin[ref].size();
-        fanin[ref].clear();
-        controls[ref] = State::INACTIVE;
-        folded.push_back(ref);
-        for (const auto parent : affected)
-            enqueue(parent);
-    }
-    if (!folded.empty() && edges > capacity) {
-        fanin = std::move(original);
-        folded.clear();
-    }
+    for (const auto &row : fanin)
+        edges += row.size();
+    if (edges <= capacity)
+        return scheduler_fold_control_fanin(fanin, std::move(active), controls, SCHEDULER_GRAPH_MAX_FANIN);
+
+    // Aliased rows can represent more logical edges than the pool holds.
+    // Fold a copy when separate rows could exceed the pool capacity.
+    auto packed = fanin;
+    auto folded = scheduler_fold_control_fanin(packed, std::move(active), controls, SCHEDULER_GRAPH_MAX_FANIN);
+    if (folded.empty()) return {};
+    edges = 0;
+    for (const auto &row : packed)
+        edges += row.size();
+    if (edges > capacity) return {};
+    fanin = std::move(packed);
     return folded;
 }
 
