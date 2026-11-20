@@ -28,8 +28,8 @@ and `sync_start` SPMD use the same acquisition rule: a physical owner holds at
 most one unretired block of that task. A free slot selects the earliest eligible
 task this owner does not already hold. It can skip a held task even while other
 blocks remain unclaimed. The new-task cursor moves forward monotonically;
-each owned slot retains its task-counter index. On physical retirement the
-slot checks that counter before accepting later work, and claims another
+each owned slot retains its task-counter index. On physical retirement a ticketed
+slot checks that counter before accepting later work and claims another
 block there if any remain. Multiple retired slots are revisited in rank order. Different tasks can occupy the other slots without waiting
 for earlier dependencies or execution. MIX claims come only from AIV0, so its
 one-held-block rule applies per cluster. A sync task has no valid blocks left
@@ -56,19 +56,19 @@ is added afterwards by a lane that reads the full mask while skipping the
 boundary, and a compare-exchange on a flag above the sector bits names that
 single publisher, so the add never carries into the neighbouring segment's
 position. This preserves unique block assignment even when block and owner
-counts are not divisible by four. A sync boundary whose block count equals its
-list's eligible owner count skips the ticket entirely: block `rank` belongs to
-the owner of rank `rank`, so no owner draws and none waits on another's draw.
-No owner touches the closed-sector mask there, so such a boundary never reports
-itself exhausted and carries no segment summary bit. A mask filled by block
-assignment would complete once the owners of the highest blocks had claimed,
-stating that the boundary was finished while it still held a block reserved for
-a lower rank that had yet to scan it. Its two readers answer that question
-directly instead: a lane skips the boundary on the static verdict itself, and
-the publication floor releases it when that lane's own claim cursor passes.
-Only a full-width sync boundary qualifies: binding a block to one owner
-gives up the ticket path's freedom to place it on whichever owner arrives first,
-which a cohort taking every owner has nothing to spend and a narrower one does.
+counts are not divisible by four.
+
+A multi-block task whose block count matches its eligible owner count is
+full-width. Full-width sync tasks and full-width asynchronous MIX tasks
+assign block `rank` directly to the owner of rank `rank`. Each MIX owner
+is a cluster. All other tasks draw tickets. The task's `sync_start` flag
+controls the entry barrier independently of block assignment.
+
+A statically assigned boundary has one reserved block per owner. Its
+publication floor advances when the local claim cursor passes that
+boundary. A completed block of a statically assigned task is skipped
+during revisit. Static assignment limits each owner to one claim for the task and
+makes each reserved block depend on its owner's availability.
 A sync task counts its arrivals in one STARS
 CntNotify register when the Host could map one for that cohort: a block writes
 the unit-increment command and an observer reads the register once, comparing it
@@ -96,9 +96,11 @@ progress, valid kernels and eventual completion of external deferred conditions.
 Each segment carries a 64-bit task shape (task ID, block count, active mask and
 sync flag). A closed boundary counter proves its preceding ordinary interval
 fully claimed, so skipping that segment needs only the shape and counter reads.
-Interval bounds and tickets are read only for an open segment; rank and sync
-index are read after a successful task claim. This preserves typed batch
-boundaries without repeatedly decoding full metadata for exhausted tasks.
+Interval bounds and the ticket index are read for an open segment. Rank
+and sync index are read after a successful task claim. Each lane can cache
+the Host-published segment fields, order entries and publication-boundary
+metadata after its startup D-cache invalidation. Claim counters and the
+closure summary use GM bypass loads.
 
 Claimed intervals also publish monotone closure bits, one 128-byte summary
 sector per 64 segments. The draw containing a tail interval's final entry adds
@@ -139,9 +141,10 @@ The Host records the first and next relevant boundary for three startup domains:
 ordinary AIC sync, ordinary AIV sync and MIX. These indexes reside in the existing
 control and task-metadata storage; they are not task-acquisition lists. Each
 publication cursor caches its open boundary's block count, rank and successor.
-Repeated checks read only that task's closed-sector mask. Once all blocks are claimed,
-the cursor follows the successor directly, independently of the fresh-task cursor
-and execution completion. Graph-body indexes are available before materialization.
+For a ticket boundary, repeated checks read its closed-sector mask and
+advance after all blocks are claimed. For a static boundary, the fresh-task
+cursor must pass the reserved block before the publication cursor follows the
+successor. Graph-body indexes are available before materialization.
 Each participant then publishes an irrevocable `enter_ready` token for the
 current generation, identified locally by candidate, entry and generation.
 Pure ordinary ready work can still run while that commitment waits. For sync

@@ -900,10 +900,8 @@ TEST(PercounterAcquire, NotifiedStartCountsTheWholeCohortInOneRegister) {
 /**
  * Owner counts follow the reported topology, so the gate opens at exactly the
  * width a part of that size can fill: one owner per cluster for AIC and MIX,
- * one per AIV lane for ordinary vector work. A sync cohort is never wider --
- * `percounter_sync_widths_fit` rejects that at the AICPU handshake -- so the
- * equality selects the cohort that spans every owner rather than a width that
- * happens to match the part.
+ * one per AIV lane for ordinary vector work. Full-width MIX assignments
+ * apply with or without a synchronized start.
  */
 TEST(PercounterAcquire, StaticAssignmentOpensAtEachDomainsFullWidth) {
     for (uint32_t clusters : {2U, 32U, 36U}) {
@@ -922,9 +920,10 @@ TEST(PercounterAcquire, StaticAssignmentOpensAtEachDomainsFullWidth) {
         // blocks on whichever owners reach the boundary first.
         for (uint32_t blocks : {1U, cluster_wide - 1, lane_wide - 1})
             EXPECT_FALSE(percounter_claim_is_static(cfg, 1, false, true, blocks));
-        // Ordinary work draws tickets at every width.
         EXPECT_FALSE(percounter_claim_is_static(cfg, 0, false, false, cluster_wide));
+        EXPECT_TRUE(percounter_claim_is_static(cfg, 1, true, false, cluster_wide));
         EXPECT_FALSE(percounter_claim_is_static(cfg, 1, false, false, lane_wide));
+        EXPECT_FALSE(percounter_claim_is_static(cfg, 1, false, false, cluster_wide));
     }
 }
 
@@ -1339,8 +1338,7 @@ TEST(PercounterAcquire, PublicationBoundariesKeepSeparateOrderedDomains) {
     };
     // Exhaustion is a statement about every lane, and it releases a ticket
     // boundary outright. A statically assigned boundary reserves this lane's
-    // own block, so only this lane's scan passing it releases the floor --
-    // two of the three domains here are full-width and take that rule.
+    // own block, so this lane's scan must pass it before the floor advances.
     const auto finish_scan = [&](uint32_t list) {
         f.state[list == 0 ? 0 : 1].source.segment = f.control->segment_count[list];
     };
@@ -1355,6 +1353,9 @@ TEST(PercounterAcquire, PublicationBoundariesKeepSeparateOrderedDomains) {
     close_boundary(3);
     EXPECT_EQ(aiv_floor(), 5U);
     close_boundary(2);
+    EXPECT_EQ(mix_floor(), 4U);
+    const auto first_mix = f.control->first_boundary_segment[2];
+    f.state[1].source.segment = first_mix - f.control->segment_begin[1] + 1;
     EXPECT_EQ(mix_floor(), 7U);
     close_boundary(7);
     EXPECT_EQ(mix_floor(), 7U);
@@ -1653,7 +1654,7 @@ TEST(PercounterAcquire, NonparticipantSnapshotsRemainExcludedDuringConcurrentReu
 }
 
 TEST(PercounterAcquire, OldGenerationTokensCannotAdmitReusedRecord) {
-    Fixture f({task(7, PERCOUNTER_PENDING_CAPACITY + 1)});
+    Fixture f({task(7, PERCOUNTER_PENDING_CAPACITY + 1)}, 1);
     for (uint32_t i = 0; i < PERCOUNTER_PENDING_CAPACITY + 1; ++i)
         f.step(1);
     f.step(0);
@@ -1686,7 +1687,7 @@ TEST(PercounterAcquire, OldGenerationTokensCannotAdmitReusedRecord) {
 }
 
 TEST(PercounterAcquire, FinishedPeerRejectsReusedRecordBeforeItsPublicationSequence) {
-    Fixture f({task(7, PERCOUNTER_PENDING_CAPACITY + 1)});
+    Fixture f({task(7, PERCOUNTER_PENDING_CAPACITY + 1)}, 1);
     for (uint32_t i = 0; i <= PERCOUNTER_PENDING_CAPACITY; ++i)
         f.step(1);
     for (int lane : {0, 1, 2, 0, 1, 0, 2, 0, 1})
