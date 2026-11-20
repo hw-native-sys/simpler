@@ -18,6 +18,7 @@
  */
 
 #include "orchestrator.h"
+#include "scheduler/twait_admission.h"
 
 #include <assert.h>
 #include <inttypes.h>
@@ -890,6 +891,15 @@ void OrchestratorState::end_scope() {
     }
 
     if (orch->scheduler && count > 0) {
+        for (auto &declaration : orch->twait_declarations) {
+            if (declaration.waiter.run != orch->twait_run_generation) continue;
+            for (int32_t index = begin; index < orch->scope_tasks_size; ++index) {
+                if (orch->scope_tasks[index]->task->task_id == declaration.task) {
+                    declaration = twait::RetainedDeclaration{};
+                    break;
+                }
+            }
+        }
         orch->scheduler->on_scope_end(&orch->scope_tasks[begin], count);
     }
 
@@ -1014,6 +1024,12 @@ static TaskOutputTensors submit_task_common(
 ) {
     CYCLE_COUNT_START();
     TaskOutputTensors result;
+    if (args.captures_wait_proof() && orch->twait_proofs.count >= twait::max_proof_nodes) {
+        orch->twait_last_error = "WAIT proof storage full";
+        orch->report_fatal(SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "TWAIT %s", orch->twait_last_error);
+        return result;
+    }
+    if (args.has_blocking_wait() && !twait::preflight(*orch, args)) return result;
     OutputLayout layout = calculate_output_layout(args);
     PreparedTask prepared;
     if (!prepare_task(orch, args, layout.total_output_size, active_mask, task_attrs, &prepared)) {
@@ -1163,6 +1179,30 @@ static TaskOutputTensors submit_task_common(
     // reflected in every downstream count. Publication of R[t] happens inside,
     // so every slot that can later be read as a producer carries its own
     // bitmap.
+    if (args.captures_wait_proof()) {
+        auto &store = orch->twait_proofs;
+        auto &node = store.nodes[store.count];
+        node = twait::ProofNode{};
+        node.run = orch->twait_run_generation;
+        node.task = task_id;
+        node.generation = prepared.seq;
+        const bool completion_ordered = active_mask.is_empty() ||
+                                        !all_claimed_fanin_allow_early_resolve(fanin_builder) ||
+                                        all_claimed_fanin_completed(fanin_builder);
+        fanin_builder.for_each([&](ChipTaskSlotState *producer, DepFlags flags) {
+            if (!completion_ordered || !dep_has_wait(flags)) return;
+            uint8_t producer_ring;
+            int32_t producer_slot;
+            if (!slot_index_of(orch, producer, producer_ring, producer_slot)) return;
+            const auto generation = orch->wait_reach[producer_ring][producer_slot].seq;
+            const auto parent = store.find(node.run, producer->task->task_id, generation);
+            if (parent < 0) return;
+            node.ancestors[parent / 64] |= 1ull << (parent % 64);
+            for (uint32_t word = 0; word < twait::proof_words; ++word)
+                node.ancestors[word] |= store.nodes[parent].ancestors[word];
+        });
+        ++store.count;
+    }
     reduce_wait_edges(orch, &fanin_builder, ring_id, prepared.alloc_result.slot, prepared.seq);
     int32_t inline_count = std::min(fanin_builder.count, CHIP_FANIN_INLINE_CAP);
     // fanin_actual_count is the TOTAL edge count (for_each iteration and
@@ -1229,6 +1269,8 @@ static TaskOutputTensors submit_task_common(
 #endif
 
     CYCLE_COUNT_LAP(g_orch_args_cycle);
+
+    if (args.has_blocking_wait()) twait::retain(*orch, args, task_id, prepared.seq);
 
     // === STEP 6: wire on the orchestrator side and publish readiness ===
     // Zero-fanin tasks and tasks whose claimed producers are already completed
