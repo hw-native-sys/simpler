@@ -79,8 +79,9 @@ static void check_program_packet(
         );
     require(
         record.cpu_launches.size() == 1 && record.cpu_launches.front().inline_runtime &&
-            record.cpu_launches.front().references != 0,
-        "program-inline-packet-with-references"
+            record.cpu_launches.front().image_bytes > 0 &&
+            record.cpu_launches.front().references == 0,
+        "program-inline-packet-with-zero-references"
     );
     for (int i = 0; i < 16; ++i)
         require(output[i] == i + 10, "program-output");
@@ -197,8 +198,8 @@ int main(int argc, char **argv) {
         if (probe_publications && !partial_submission)
             require(
                 submission.cpu_launches.size() == 1 && submission.cpu_launches.front().inline_runtime &&
-                    submission.cpu_launches.front().references != 0,
-                "kernel-inline-packet-with-references"
+                    submission.cpu_launches.front().image_bytes > 0 && submission.cpu_launches.front().references == 0,
+                "kernel-inline-packet-with-zero-references"
             );
         capture_test::check_publications(scenario, submission);
         if (scenario == 4) {
@@ -355,7 +356,7 @@ int main(int argc, char **argv) {
                 require(submission.cpu_launches.size() == 1 && eager_submission.cpu_launches.size() == 1, "cpu-launch");
                 const auto &original = submission.cpu_launches.front();
                 const auto &eager = eager_submission.cpu_launches.front();
-                require(original.image_bytes > 0 && eager.inline_runtime && eager.references > 0, "original-image");
+                require(original.image_bytes > 0 && eager.inline_runtime && eager.references == 0, "original-image");
                 if (same_size) {
                     require(eager.image_bytes == original.image_bytes, "same-size-image");
                     require(

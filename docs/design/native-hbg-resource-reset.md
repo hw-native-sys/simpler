@@ -20,13 +20,9 @@ Caller-stream ordering also applies to prerequisite copies such as the A5
 scheduler state. A recorded model can run repeatedly or be destroyed before
 its first execution.
 
-The ordinary A5 scheduler reads task descriptions, tensor descriptors and
-nested graphs directly from RTS storage. The gate restores the 64-byte status
-prefix and binds typed scheduler pointer fields to their image offsets. On
-A2/A3, the gate restores the header and binds the initial task table. During
-attachment, AICPU initializes the writable slots and progress bytes from each
-used record. Tensor, scalar and fanin offsets resolve relative to their original
-read-only record. The A2/A3 working table grows with the number of live slots.
+The AICPU entry restores the complete prepared HBG image from the RTS packet to the shared writable arena.
+Scheduler pointers use addresses in that arena, and the packet carries zero image references.
+Each replay starts from the snapshot recorded for that launch.
 
 | Region | Preserved information | Per-execution state |
 | ------ | --------------------- | ------------------- |
@@ -37,7 +33,7 @@ read-only record. The A2/A3 working table grows with the number of live slots.
 | Handshake | Core identity/report payload for observation | Report-valid and READY markers after acknowledged retirement |
 | Native result storage | Allocation and retained fault evidence | Current result publication and callback aggregation |
 
-Only used task entries are restored. Inline-completed tasks retain their
+The restored image contains the used task entries. Inline-completed tasks retain their
 prepared completed initial state instead of being treated as pending device
 work. Weights and caller-owned persistent tensor contents are not workspace to
 clear. Address/scalar changes and Host-control changes are preparation changes,

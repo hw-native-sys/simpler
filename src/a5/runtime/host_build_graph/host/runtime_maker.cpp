@@ -1260,26 +1260,9 @@ bool plan_scheduler_args_dump(
     return true;
 }
 
-// AICPU binds these scheduler fields after RTS has placed the immutable task
-// image. Only typed image references are recorded; scalar argument bits and
-// addresses into the caller's tensors or the graph heap retain their values.
-struct SchedulerImageReferences {
-    uintptr_t host_state;
-    uint64_t device_state;
-    uint64_t image_base;
-    bool enabled;
-    std::vector<HbgImageReference> fields;
-
-    void add(const uint64_t &field) {
-        if (enabled && field != 0)
-            fields.push_back({device_state + (reinterpret_cast<uintptr_t>(&field) - host_state), field - image_base});
-    }
-};
-
 bool prepare_scheduler_calls(
     Runtime *runtime, void *host_base, const AicoreSchedulerLayout &layout, uint64_t device_base,
-    const void *uploaded_sm, const sm_layout::SegmentOffsets &segments, const NativeGraphHostPlan &native_plan,
-    SchedulerImageReferences &references
+    const void *uploaded_sm, const sm_layout::SegmentOffsets &segments, const NativeGraphHostPlan &native_plan
 ) {
     if (layout.prepared_layout_offset == 0) return true;
     const char *platform = get_platform();
@@ -1407,16 +1390,6 @@ bool prepare_scheduler_calls(
             )) {
             LOG_ERROR("A5 HBG: Host Call preparation failed node=%" PRIu64, ref);
             return false;
-        }
-        if (references.enabled && tensor_count != 0 &&
-            (binding == nullptr || binding->kind == SchedulerNodeKind::TOP_KERNEL)) {
-            const auto &prepared =
-                *scheduler_state_at<SchedulerPreparedLayout>(host_base, layout.prepared_layout_offset);
-            const auto &plan = scheduler_state_at<SchedulerExecutionPlan>(host_base, prepared.plans_offset)[ref];
-            auto *calls = scheduler_state_at<SchedulerPreparedCall>(host_base, prepared.calls_offset);
-            for (uint64_t i = 0; i < plan.execution_count; ++i)
-                for (uint32_t t = 0; t < tensor_count; ++t)
-                    references.add(calls[plan.execution_begin + i].args[t]);
         }
         prepared_count += static_cast<uint64_t>(meta.logical_block_num) * meta.active_mask.count();
     }
@@ -1845,14 +1818,6 @@ bool create_scheduler_state(
         return false;
     }
     const uintptr_t aligned_address = reinterpret_cast<uintptr_t>(device_state);
-    SchedulerImageReferences references{
-        reinterpret_cast<uintptr_t>(host_base),
-        aligned_address,
-        reinterpret_cast<uint64_t>(runtime->get_gm_sm_ptr()),
-        task_image::native_graph_plan && api->launch_owns_execution_image(),
-        {}
-    };
-
     const uint64_t initialized_bytes =
         async_plan.layout_offset == 0 ?
             (layout.scalar_records_offset == 0 ? layout.total_size : layout.scalar_records_offset) :
@@ -1883,9 +1848,6 @@ bool create_scheduler_state(
                 native_plan.bindings[task.task_ref].kind == SchedulerNodeKind::TOP_KERNEL) {
                 const auto *selected = scheduler_args_dump_task(dump_image, task.task_ref);
                 if (selected == nullptr) return false;
-                references.add(selected->tensors_address);
-                references.add(selected->scalars_address);
-                references.add(selected->argument_region_base);
             }
         }
     }
@@ -2114,7 +2076,7 @@ bool create_scheduler_state(
         task_controls[task_ref].completion_state = scheduler_completion_completed_state(1);
     }
     if (!prepare_scheduler_calls(
-            runtime, host_base, layout, aligned_address, uploaded_sm, device_segments, native_plan, references
+            runtime, host_base, layout, aligned_address, uploaded_sm, device_segments, native_plan
         ))
         return false;
 
@@ -2168,8 +2130,6 @@ bool create_scheduler_state(
         context.native_header_offset = native_image.header_offset;
         context.native_graph_address = native_image.device_base;
         context.native_graph_bytes = native_image.bytes;
-        references.add(context.graph_storage_address);
-        references.add(context.native_graph_address);
         context.original_task_count = static_cast<uint64_t>(total_tasks);
         context.scheduler_state_bytes = layout.total_size;
         context.worker_index = static_cast<uint64_t>(i);
@@ -2182,7 +2142,6 @@ bool create_scheduler_state(
             if (scheduler_node_identity(dependency_graph, ref, &public_task_ids[ref]) != SchedulerGraphResult::OK)
                 return false;
     }
-    if (references.enabled) runtime->set_execution_image_binding(device_segments.storage, std::move(references.fields));
     runtime->publish_scheduler_bootstrap(
         SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, aligned_address + layout.worker_contexts_offset
     );
@@ -2232,22 +2191,18 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     const uint64_t upload_bytes = native_offset + native_image.bytes.size();
     const sm_layout::SegmentOffsets device_segments =
         task_image::layout(static_cast<const char *>(host_sm), task_capacity, bind_usage);
-    // The ordinary A5 task image starts with TaskImageStatus. RTS owns the
-    // read-only records following it; the arena holds the writable status.
-    const bool direct_image = task_image::native_graph_plan && api->launch_owns_execution_image();
-    const uint64_t device_arena_bytes = direct_image ? device_segments.storage : upload_bytes;
     const BindPhaseMark static_arena_phase = bind_phase_begin();
     runtime->dev.sm_image_bytes = image_bytes;
     SharedMemoryHandle host_sm_handle;
     // The populated host mirror retains its reservation pitch across commit retries.
     if (!host_sm_handle.attach_populated(host_sm, plan.sm_size, task_capacity, task_capacity, plan.sm_size))
         return PTO_RUNTIME_ERR_INTERNAL;
-    if (const int rc = api->setup_static_arena(heap_bytes, /*gm_sm_size=*/0, device_arena_bytes); rc != 0) {
+    if (const int rc = api->setup_static_arena(heap_bytes, /*gm_sm_size=*/0, upload_bytes); rc != 0) {
         return rc;
     }
     {
         char attrs[kBindAttrsCapacity];
-        snprintf(attrs, sizeof(attrs), "heap=%" PRIu64 " arena=%" PRIu64, heap_bytes, device_arena_bytes);
+        snprintf(attrs, sizeof(attrs), "heap=%" PRIu64 " arena=%" PRIu64, heap_bytes, upload_bytes);
         record_bind_phase(HostPhaseKind::BindStaticArena, static_arena_phase, attrs);
     }
 

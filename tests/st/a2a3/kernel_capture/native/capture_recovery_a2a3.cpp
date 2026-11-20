@@ -21,7 +21,8 @@ namespace simpler::capture_test {
 namespace {
 thread_local void *prefix_source = nullptr;
 thread_local std::vector<unsigned char> original_prefix;
-constexpr size_t prefix_capacity = CHIP_ALIGN_UP(sizeof(RuntimeContext), CHIP_ALIGN_SIZE) + sizeof(SharedMemoryHeader);
+constexpr size_t header_capacity = CHIP_ALIGN_UP(sizeof(RuntimeContext), CHIP_ALIGN_SIZE) + sizeof(SharedMemoryHeader);
+constexpr size_t prefix_capacity = 1 << 20;
 constexpr size_t capacity_offset =
     offsetof(RuntimeContext, prebuilt_layout) + offsetof(RuntimeArenaLayout, task_capacity);
 }  // namespace
@@ -38,11 +39,9 @@ bool record_boot_fault_prefix(const unsigned char *section, void *stream) {
     if (!prefix_source) return false;
     HbgExecutionImage image{};
     std::memcpy(&image, section, sizeof(image));
-    require(image.mutable_prefix_bytes == prefix_capacity, "observed-runtime-context-prefix");
+    require(image.reference_count == 0 && image.mutable_prefix_bytes == image.bytes && image.bytes >= header_capacity && image.bytes <= prefix_capacity, "observed-runtime-context-prefix");
+    // Replay the complete snapshot from the controlled source so only task_capacity changes during injection.
     original_prefix.assign(section + sizeof(image), section + sizeof(image) + image.mutable_prefix_bytes);
-    // Each normal replay restores task_capacity from the RTS snapshot. This fault
-    // fixture substitutes a controlled D2D source for precisely that mutable prefix;
-    // the same AICPU task continues to bind all immutable image references.
     check(
         aclrtMemcpyAsync(
             reinterpret_cast<void *>(image.working_address), image.mutable_prefix_bytes, prefix_source,
@@ -54,7 +53,7 @@ bool record_boot_fault_prefix(const unsigned char *section, void *stream) {
 }
 
 void check_publications(int scenario, const CapturedSubmission &) {
-    if (scenario == 13) require(original_prefix.size() == prefix_capacity, "observed-boot-fault-source");
+    if (scenario == 13) require(original_prefix.size() >= header_capacity && original_prefix.size() <= prefix_capacity, "observed-boot-fault-source");
 }
 
 void inject_boot_failure() {

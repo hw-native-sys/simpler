@@ -2986,25 +2986,9 @@ TEST_F(HbgBindLedgerTest, LaunchStagingOwnsPrerequisitesAndImageWithoutPrepareDe
         const auto *image_source = static_cast<const uint8_t *>(pending.source);
         const std::vector<uint8_t> image(image_source, image_source + pending.bytes);
         const size_t target_bytes = std::min(pending.bytes, pending.mutable_prefix_bytes);
-        if (a5) {
-            EXPECT_EQ(target_bytes, 64u);
-            EXPECT_EQ(fake_.requested_arena_bytes, target_bytes);
-            ASSERT_LT(target_bytes, pending.bytes);
-            ASSERT_FALSE(pending.image_references.empty());
-            std::unordered_set<uint64_t> fields;
-            for (const auto &ref : pending.image_references) {
-                ASSERT_LT(ref.image_offset, pending.bytes);
-                ASSERT_TRUE(fields.insert(ref.device_field_address).second);
-                const auto &state = pending.prerequisites.front();
-                const auto base = reinterpret_cast<uintptr_t>(state.device_target);
-                ASSERT_GE(ref.device_field_address, base);
-                const auto offset = ref.device_field_address - base;
-                ASSERT_LE(offset + sizeof(uint64_t), state.bytes);
-                uint64_t original = 0;
-                std::memcpy(&original, static_cast<const uint8_t *>(state.source) + offset, sizeof(original));
-                EXPECT_EQ(original, reinterpret_cast<uintptr_t>(image_target) + ref.image_offset);
-            }
-        }
+        ASSERT_EQ(target_bytes, pending.bytes);
+        EXPECT_TRUE(pending.image_references.empty());
+        if (a5) EXPECT_EQ(fake_.requested_arena_bytes, target_bytes);
         expected.push_back({image_target, image, true, target_bytes});
         std::memset(image_target, 0xa5, target_bytes);
         const int copies = fake_.copy_count;

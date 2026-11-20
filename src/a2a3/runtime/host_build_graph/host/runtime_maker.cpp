@@ -719,12 +719,7 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     const uint64_t image_bytes = plan.image_bytes;
     const int32_t total_tasks = plan.total_tasks;
     const auto &bind_usage = plan.bind_usage;
-    const auto segments = sm_layout::segment_offsets(sm_layout::image_extents(bind_usage));
-    const bool launch_image = api->launch_owns_execution_image();
-    // Onboard only the working task records and completion bytes live here.
-    // Their immutable fanin and argument pools stay in RTS launch storage.
-    const uint64_t working_sm_bytes = launch_image ? segments.fanin_pool : image_bytes;
-    const uint64_t device_arena_bytes = layout.off_copied_end + working_sm_bytes;
+    const uint64_t device_arena_bytes = layout.off_copied_end + image_bytes;
     const BindPhaseMark static_arena_phase = bind_phase_begin();
     runtime->dev.sm_image_bytes = image_bytes;
     if (const int rc = api->setup_static_arena(heap_bytes, /*gm_sm_size=*/0, device_arena_bytes); rc != 0) {
@@ -819,13 +814,6 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
         arena_dev + layout.off_copied_begin, upload_base, upload_bytes, bind_usage.fanin_elems, bind_usage.tensor_elems,
         bind_usage.scalar_elems
     );
-    if (launch_image) {
-        const uint64_t storage_field = reinterpret_cast<uint64_t>(device_sm) + offsetof(SharedMemoryHeader, tasks) +
-                                       offsetof(SharedMemoryTaskHeader, initial_storage);
-        runtime->set_execution_image_binding(
-            copied_bytes + sizeof(SharedMemoryHeader), {{storage_field, copied_bytes + segments.storage}}
-        );
-    }
     return total_tasks;
 }
 

@@ -26,5 +26,5 @@ def test_hbg_program_inline_packet(request, tmp_path):
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     result = _run_capture_probe([binaries[0], device, "16", *binaries[1:]], tmp_path, dict(os.environ))
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "stage=program-inline-packet-with-references rc=0" in result.stdout
+    assert "stage=program-inline-packet-with-zero-references rc=0" in result.stdout
     assert result.stdout.count("stage=program-output rc=0") == 16
