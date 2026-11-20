@@ -121,6 +121,47 @@ inline bool preflight(OrchestratorState &orch, const CoreTaskArgs &args) {
     if (error == nullptr) return true;
     orch.twait_last_error = error;
     orch.twait_last_witness = Witness{};
+    const auto *snapshot = args.blocking_wait().snapshot;
+    if (snapshot != nullptr) {
+        auto witness = diagnose(*snapshot);
+        const auto waiter =
+            TaskId::make(orch.current_ring_id(), orch.rings[orch.current_ring_id()].task_allocator.task_head());
+        for (uint32_t index = 0; index < witness.count; ++index) {
+            const auto &hop = witness.hops[index];
+            bool associated_producer = false;
+            const auto &declaration = args.blocking_wait();
+            if (declaration.count <= max_producers) {
+                for (uint32_t producer_index = 0; producer_index < declaration.count; ++producer_index) {
+                    const auto &producer = declaration.producers[producer_index];
+                    associated_producer |= hop.producer.run == declaration.run && hop.producer.rank == producer.rank &&
+                                           hop.producer.task == TaskId::to_uint64(producer.task) &&
+                                           hop.producer.generation == producer.generation &&
+                                           hop.producer.block < producer.blocks;
+                }
+            }
+            if (associated_producer && hop.waiter.run == orch.twait_run_generation &&
+                hop.waiter.rank == orch.twait_rank && hop.waiter.generation == orch.submit_seq &&
+                hop.waiter.task == TaskId::to_uint64(waiter) && hop.event.run == orch.twait_run_generation &&
+                hop.event.rank == orch.twait_rank && hop.event.event == args.blocking_wait().event &&
+                hop.event.epoch == args.blocking_wait().epoch &&
+                hop.event.condition == args.blocking_wait().condition) {
+                orch.twait_last_witness = witness;
+                orch.report_fatal(
+                    SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
+                    "TWAIT %s waiter=%llu:%u:%llu:%llu event=%llu:%llu producer=%llu:%u:%llu:%llu "
+                    "core_slot=%u:%u:%u:%u:%llu",
+                    error, static_cast<unsigned long long>(hop.waiter.run), hop.waiter.rank,
+                    static_cast<unsigned long long>(hop.waiter.generation),
+                    static_cast<unsigned long long>(hop.waiter.task), static_cast<unsigned long long>(hop.event.event),
+                    static_cast<unsigned long long>(hop.event.epoch), static_cast<unsigned long long>(hop.producer.run),
+                    hop.producer.rank, static_cast<unsigned long long>(hop.producer.generation),
+                    static_cast<unsigned long long>(hop.producer.task), hop.core_slot.rank, hop.core_slot.lane,
+                    hop.core_slot.core, hop.core_slot.token, static_cast<unsigned long long>(hop.core_slot.generation)
+                );
+                return false;
+            }
+        }
+    }
     orch.report_fatal(SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "TWAIT %s", error);
     return false;
 }

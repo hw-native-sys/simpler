@@ -147,3 +147,5 @@ struct Declaration {
 Witness diagnose(const Snapshot &snapshot);
 
 }  // namespace twait
+
+#include "twait_model.h"
