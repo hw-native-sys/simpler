@@ -20,8 +20,8 @@ Usage:
     python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/chip_swimlane_records.json -k kernel_config.py
     python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/chip_swimlane_records.json -v
 
-SPMD (block_num>1): dependency flows use the earliest visible task slice
-per (func_id, task_id) independently in each view; see
+SPMD (block_num>1): Worker View fans dependency flows out to every consumer
+slice. Scheduler View uses the earliest slice per (func_id, task_id). See
 docs/dfx/chip-swimlane-profiling.md §3.5.
 """
 
@@ -41,6 +41,7 @@ import traceback
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
+from itertools import product
 from pathlib import Path
 from typing import Any
 
@@ -84,24 +85,23 @@ def _task_display_name(func_id, func_id_to_name, tdisp, *, spmd=False):
       - otherwise: ``func_<letter>(<task-id>)`` (resolved id, but no name map entry).
 
     The caller supplies the runtime-specific task-id label. SPMD logical tasks
-    append ``_spmd`` before that suffix unless the name already contains ``spmd``
-    (case-insensitive), e.g. ``fa_fused_aic_spmd(r2t18)``.
+    append ``_spmd`` unless the name already contains ``spmd``. The display
+    suffixes ``_aic_spmd`` and ``_aiv_spmd`` share the same ``_spmd`` label.
     """
     try:
         resolved = int(func_id) >= 0
     except (TypeError, ValueError):
         resolved = False
     if not resolved:
-        label = f"task({tdisp})"
+        name = "task"
     elif func_id_to_name and str(func_id) in func_id_to_name:
-        label = f"{func_id_to_name[str(func_id)]}({tdisp})"
+        name = func_id_to_name[str(func_id)]
     else:
-        label = f"func_{_func_id_to_letter(func_id)}({tdisp})"
-    if spmd and "(" in label:
-        base, rest = label.split("(", 1)
-        if "spmd" not in base.lower():
-            return f"{base}_spmd({rest}"
-    return label
+        name = f"func_{_func_id_to_letter(func_id)}"
+    if spmd and "spmd" not in name.lower():
+        name += "_spmd"
+    name = re.sub(r"_(?:aic|aiv)_spmd$", "_spmd", name, flags=re.IGNORECASE)
+    return f"{name}({tdisp})"
 
 
 def _scheduler_task_key(row):
@@ -3332,9 +3332,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     # Flow events (Flow events "s" and "f" for dependencies). Edges come from
     # deps.json (dep_gen replay); without one we emit no flow events at all,
     # since the device hot path no longer carries fanout (PR #863).
-    # SPMD logical tasks anchor Worker View dependency arrows on the earliest
-    # visible kernel slice per (func_id, task_id). Dummy/alloc DAG nodes have no
-    # kernel row, so their arrows anchor on the AICPU worker slice emitted above.
+    # One producer anchor per SPMD function feeds every visible consumer slice.
+    # Dummy and alloc nodes use their AICPU worker slices as endpoints.
     # The runs to walk come from the union of both identity sources: a run can
     # contribute only AICPU phases (dummy / alloc nodes and no AICore kernel
     # row at all), and iterating the task map alone would skip it entirely.
@@ -3347,11 +3346,13 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     ):
         run_task_map = task_maps_by_run.get(run_epoch) or {}
         run_anchor_map = aicpu_anchor_maps_by_run.get(run_epoch) or {}
-        if pred_id not in run_task_map and pred_id not in run_anchor_map:
+        pred_rows = _worker_flow_anchor_rows(pred_id, run_task_map, spmd_task_ids, run_anchor_map)
+        if not pred_rows:
             continue
 
         for succ_id in succ_ids:
-            if succ_id not in run_task_map and succ_id not in run_anchor_map:
+            succ_rows = run_task_map.get(succ_id) or run_anchor_map.get(succ_id)
+            if not succ_rows:
                 if verbose:
                     print(
                         f"Warning: Task {task_display(pred_id)} (raw {pred_id}) "
@@ -3359,20 +3360,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                     )
                 continue
 
-            row_pairs = _flow_row_pairs(
-                pred_id,
-                succ_id,
-                run_task_map,
-                spmd_task_ids,
-                _worker_flow_anchor_rows,
-                run_anchor_map,
-            )
-            if not row_pairs:
-                continue
-
             output_task_count = _dependency_task_fan_count(pred_id, spmd_task_ids, run_task_map, deps_block_map)
             input_task_count = _dependency_task_fan_count(succ_id, spmd_task_ids, run_task_map, deps_block_map)
-            for pred_row, succ_row in row_pairs:
+            for pred_row, succ_row in product(pred_rows, succ_rows):
                 src_bar_start_us = _task_slice_start_us(pred_row)
                 src_end_us = pred_row["end_time_us"]
                 dst_ts_start = _task_slice_start_us(succ_row)
@@ -3406,7 +3396,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             if spmd_task_ids:
                 print(
                     f"  SPMD tasks: {len(spmd_task_ids)} logical task(s); "
-                    "dependency arrows independently anchor on each view's earliest visible slice per function"
+                    "Worker View shows dependencies on every consumer slice"
                 )
         else:
             print("  Flow events: 0 (no deps.json — re-run dep_gen and pass --deps-json to add arrows)")
