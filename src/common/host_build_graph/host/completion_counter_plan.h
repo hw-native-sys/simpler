@@ -48,29 +48,38 @@ inline bool scheduler_plan_completion_counters(
     std::vector<bool> seen(count, false);
     std::vector<size_t> ranks(count, 0);
     std::vector<size_t> visited(count, count);
+    // A credit-free branch with one relevant frontier can forward it directly.
+    std::vector<int64_t> frontier(count, -1);
+    constexpr size_t kMaxIndirectFaninEdges = 256;
     for (size_t rank = 0; rank < count; ++rank) {
         const int64_t task = order[rank];
         if (task < 0 || static_cast<uint64_t>(task) >= count || seen[task])
             return fail("invalid completion counter task order");
+        int64_t inherited = -1;
         for (const int64_t predecessor : fanin[task]) {
             if (predecessor < 0 || static_cast<uint64_t>(predecessor) >= count || !seen[predecessor])
                 return fail("completion counter predecessor does not precede its consumer");
+            const int64_t source = frontier[predecessor];
+            if (source >= 0) inherited = inherited < 0 || inherited == source ? source : task;
         }
         seen[task] = true;
         ranks[task] = rank;
         const uint32_t contribution = credits[task];
+        frontier[task] = contribution == 0 ? inherited : task;
         if (contribution == 0) continue;
         uint32_t selected = UINT32_MAX;
         // Every predecessor has lower rank. Descending traversal therefore
         // finds the latest reusable chain tip before any older candidate.
         std::priority_queue<size_t> pending;
         const auto enqueue = [&](int64_t predecessor) {
-            if (visited[predecessor] == rank) return;
-            visited[predecessor] = rank;
-            pending.push(ranks[predecessor]);
+            const int64_t source = frontier[predecessor];
+            if (source < 0 || visited[source] == rank) return;
+            visited[source] = rank;
+            pending.push(ranks[source]);
         };
         for (const int64_t predecessor : fanin[task])
             enqueue(predecessor);
+        size_t remaining_edges = kMaxIndirectFaninEdges;
         while (!pending.empty()) {
             const int64_t ancestor = order[pending.top()];
             pending.pop();
@@ -80,7 +89,12 @@ inline bool scheduler_plan_completion_counters(
                 selected = index;
                 break;
             }
-            for (const int64_t predecessor : fanin[ancestor])
+            // Each task inspects its direct fanin. Deeper search has a fixed
+            // budget even when many consumers share the same exhausted branch.
+            const auto &parents = fanin[ancestor];
+            if (parents.size() > remaining_edges) continue;
+            remaining_edges -= parents.size();
+            for (const int64_t predecessor : parents)
                 enqueue(predecessor);
         }
         if (selected == UINT32_MAX) {

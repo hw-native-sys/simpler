@@ -18,7 +18,7 @@ the Host and adds no fields or bytes to the uploaded region.
 `PERCOUNTER_PENDING_CAPACITY` defines X. Each lane owns X fixed positions.
 AIV0 can claim either ordinary AIV or MIX into any free position, using one
 occupancy bitmap. MIX position j owns SSBUF record j. AIC and AIV1 query these
-records directly without receiver task copies; AIV1 skips MIX entries in the
+records directly until they latch their own launch; AIV1 skips MIX entries in the
 vector list without consuming their tickets. All records and publication words
 fit inside the cluster's last 1 KiB of SSBUF. X=1 is supported; an occupied
 coordinator then has no spare position to claim another task.
@@ -36,13 +36,12 @@ one-held-block rule applies per cluster. A sync task has no valid blocks left
 after retirement: launch requires every block's entry commitment.
 
 Intervals between task boundaries contain only ordinary single-block tasks.
-Each nonempty interval uses one ordered fetch-add counter; a batch takes at
-most the available positions and never crosses a MIX or SPMD boundary. A batch
-is equivalent to consecutive single claims in that interval. The next boundary
-opens when the interval is fully claimed, independently of execution or
-retirement. Overshooting adds stay within their task or interval counter and
-cannot consume a different kind. Only single-block ordinary work measures
-execution duration to adapt its prefetch batch. MIX claims stay single.
+Each nonempty interval uses one ordered fetch-add counter. Each claim takes
+one position, leaving the other positions available to other lanes even
+when the claimant has multiple free slots. The next boundary opens when the
+interval is fully claimed, independently of execution or retirement.
+Overshooting adds stay within their task or interval counter and cannot
+consume a different kind.
 
 Each list ends with one tail segment. The task-counter index is the global
 segment index minus the list index. Each boundary task reserves four 128-byte
@@ -97,7 +96,7 @@ Each segment carries a 64-bit task shape (task ID, block count, active mask and
 sync flag). A closed boundary counter proves its preceding ordinary interval
 fully claimed, so skipping that segment needs only the shape and counter reads.
 Interval bounds and tickets are read only for an open segment; rank and sync
-index are read after a successful task claim. This preserves typed batch
+index are read after a successful task claim. This preserves interval
 boundaries without repeatedly decoding full metadata for exhausted tasks.
 
 Claimed intervals also publish monotone closure bits, one 128-byte summary
@@ -164,48 +163,60 @@ another core can publish it during an ordinary kernel. Waiting for all entry
 conditions before reserving the cores preserves ordinary work needed by earlier
 cohorts. The idle handshake is cluster-local and adds no GM start-arrival atomic.
 
-Each participant publishes FIN only after its kernel and payload use end.
-When AIV0 participates, the publishing AIV0 acquires every member's FIN,
-aggregates task and optional Graph shell completion, and retires the record.
-It checks immediately after its own FIN and before the next claim pass, so
-retirement frees the source position before that pass selects another task.
-No completion notification between two scheduler owners is needed on this path.
+Each participant stores its entry, function address, generation and active
+mask in lane-local state before it release-publishes `enter_idle`. Its kernel
+then uses that snapshot. A waiting participant can start after all idle tokens
+match or after the shared descriptor is released. Release proves every
+participant has latched that generation, even if its kernel has yet to start.
 
-For a MIX without AIV0, the lowest numbered executing member aggregates and
-publishes the completed generation. This preserves completion independently of
-unrelated AIV0 work; AIV0 subsequently reclaims the source position.
-Every ready, entry, finish and aggregate token is compared to its generation.
+AIV0 releases the publication and its claim slot on return from its own MIX
+kernel. When AIV0 coordinates without executing, it releases the publication
+once every active lane has latched the launch. The next claim may publish a new
+generation while peers execute their previous snapshots. A peer returning to
+the scheduler ignores an already latched generation and can claim ordinary
+work. The same task ID can recur with a new generation for another SPMD block.
+
 Generation checks enclose shared descriptor reads, including nonparticipants
-that can race reuse. SSBUF has no atomics; each token has one writer.
+that can race reuse. SSBUF has no atomics. Each token has one writer.
 
-Multi-block task completion has four components, partitioned by block index
-modulo four. Each starts at `1 - component_subtasks`; the task is complete only
-when every component is positive as a signed value. Components occupy dedicated
-128-byte sectors in a device-only array indexed by task id and component index.
-Single-block, off-lane and inline-completed tasks, and
-Graph shells, have one component. MIX publishes once per block with its actual
-subtask count. Completion publication updates the task, not its successors.
+The Host plans monotonic CntNotify chains for top-level multi-block tasks.
+A task can extend a chain whose last task is a strict DAG ancestor, as long as
+the accumulated credit count fits in 32 bits. Planning collapses ancestry
+through credit-free nodes with one relevant frontier and bounds indirect
+search to 256 fanin edges per candidate. It creates a separate chain when no
+reusable tip is found within that search. Tasks assigned to a mapped chain
+share one SRAM register and have cumulative thresholds. The AICPU resets each
+mapped chain once before READY. Each physical subtask
+increments it once after synchronous completion or after its deferred condition
+is satisfied. Each MIX lane publishes its own credit. The fanin observer caches the register address and target
+after the first probe, and tests one MMIO value against the expected subtask
+count including the prefix of its chain. The AICPU uses the same threshold
+for top-level sinks. Later contributions preserve the completion proof for
+earlier tasks in the chain.
+
+Unmapped tasks and Graph body tasks publish into the GM counter in their
+task record. The Host presets it to `1 - total_subtasks`. Each physical
+subtask publishes one credit when its completion becomes final, and the
+consumer waits for a positive value. Graph shells receive the sum of their
+body sink subtask credits.
+
+The Host folds top-level dependency-only joins with at most one live
+consumer when the merged fanin fits the task limit. The consumer inherits
+the join's predecessors. For a terminal join, its remaining predecessors
+retain their completion obligations through the sink check. Shared joins
+and Graph body joins retain their own counters and scheduling positions.
+The logical task table remains available to dependency export.
 
 The Host omits predecessors already complete at bind from device fanin rows.
-The logical DAG still determines ordering and sink discovery.
-Fanin references tag partitioned producers in bit zero. Ordinary owned slots
-retain their producer cursor, current component address and remaining-component
-state; MIX retains the same state in its observer-owned SSBUF record. The
-observer's physical lane selects a starting component, then advances cyclically
-after each positive observation. Completed components are not polled again.
-After all components are positive, the producer cursor advances. Failed polls
-do not reload the immutable producer reference. The aligned group address and
-remaining count share one 64-bit word. Record reuse clears this state before
-publication. Successful observations remain valid throughout the run, so the
-components do not require an atomic snapshot.
+The logical DAG still determines ordering and sink discovery. A task-table
+fanin entry points to a GM counter or tags a CntNotify descriptor. Graph body
+fanin entries carry local producer indices. Ordinary slots and the MIX
+observer's SSBUF record retain the current producer and its SRAM threshold
+while waiting. Ready observations advance the producer cursor.
 
-GM sectors are 128 bytes; scalar DCache maintenance retains 64-byte granularity.
-The state allocation itself is aligned to 128 bytes, including in simulation.
-The completion array uses `task_count * 128 * 4` device bytes. Host initializes
-it from each task's total-subtask seed and block count, initializes claim tickets
-and closure counts, and includes both arrays in each run's uploaded image.
-AICore observes READY and invalidates its data cache before using that image;
-lane entry does not rewrite completion or claim state.
+The state allocation is aligned to 128 bytes. The uploaded image includes
+the primary completion counters and claim tickets. AICore invalidates its
+data cache after READY and before reading the uploaded image.
 The SSBUF record remains 128 bytes. Each boundary task uses 640 device bytes for
 claim state. Immutable control fields use ordinary loads after the lane's entry
 cache invalidation; mutable progress and dependency fields retain bypass or atomic
@@ -219,8 +230,8 @@ discovery. Startup clears it before publishing readiness.
 Lanes publish task completion only; they keep no whole-graph progress count and
 reach no completion verdict of their own. A lane can end its scheduler loop when
 its local list is exhausted, all owned positions and retirement revisits are
-empty, its MIX domain is closed (or the run has no MIX), and it has no deferred
-completion record — that is a statement about the lane, not about the run. It
+empty, its MIX domain is closed (or the run has no MIX), and it has no pending
+MIX launch or deferred completion record — that is a statement about the lane, not about the run. It
 then enters the register EXIT wait. Active lanes poll EXIT and the shared error
 word at the existing observation interval; they do not reread the run-wide
 completion and async counts or maintain another progress watchdog.
@@ -254,8 +265,8 @@ than a kernel and can exceed kernel argument limits. Vectors remain resident
 until the run retires, including deferred completions.
 
 Static Graph order, shape and total-subtask completion seeds are available at
-bind. Graph body fanin references encode `(producer_index << 1) | partitioned`.
-Host initializes the completion components before upload. AICPU materialization binds each
+bind. Graph body fanin references encode local producer indices. The Host
+presets each GM counter before upload. AICPU materialization binds each
 body task's descriptors and writes Tensor pointers and Scalars directly to its
 final vector, then publishes
 `metadata_ready` after writing back both. It does not wait for fanin. Lanes never
@@ -290,7 +301,7 @@ Predicate evaluation retains its own cache-line maintenance.
 Successful ordinary fanin is cached by task identity across blocks.
 After sixteen idle passes, repeated failed fanin probes run once every four
 passes. Newly resolved tasks probe immediately; shared publication, cohort entry,
-FIN, claims and deferred completion remain serviced on every pass. Dependency-only
+claims and deferred completion remain serviced on each scheduling pass. Dependency-only
 blocks without predicates publish completion after fanin without a kernel call;
 a barrier orders the observed fanin before completion publication.
 
@@ -307,14 +318,13 @@ hold. Independent records can settle out of registration order. A lane cannot
 stop polling while it owns an unsettled record. Global run completion still
 requires all physical blocks and all registered conditions to have completed.
 
-A deferring MIX participant subtracts its share before FINISHED; the aggregator
-still publishes the block's full share once. The deferred record restores that
-share when its conditions hold, so SSBUF reuse does not imply early task or
-Graph-shell completion. Subtraction, aggregation and restoration use the same
-component; Graph-sink contributions also update the shell's separate counter.
+Each MIX participant contributes completion when its own subtask finishes.
+A deferring participant's persistent record contributes once when the
+condition holds. Graph-sink
+contributions also update the shell's counter.
 
-Claimed tasks remain in their fixed owned slots until physical retirement.
-A retired slot's counter index is acquisition bookkeeping, not an additional
+An ordinary slot is held through its lane's physical return. A MIX publication
+slot follows the launch handoff described above. A released slot's counter index is acquisition bookkeeping, not an additional
 claimed block or a receiver task copy. A publication-floor cursor advances past
 a boundary only once this lane can no longer claim from it, which a ticket
 boundary proves by exhausting its sectors and a statically assigned one by this
@@ -345,16 +355,21 @@ actual worker, cluster and C/V0/V1 role.
 
 | Milestone | Device boundary |
 | --------- | --------------- |
-| Claim start | The claiming lane has space in its local slots and starts the scan and ticket acquisition that eventually owns the block. Blocks acquired in one batch share this timestamp. Passes that acquire nothing emit no marker. |
+| Claim start | The claiming lane has space in its local slots and starts the scan and ticket acquisition that eventually owns the block. Passes that acquire nothing emit no marker. |
 | Claim | The claiming lane acquires the task/block in its local scheduler state. For MIX, the timestamp precedes publication of the entry to the participating lanes in SSBUF. |
 | Ideal ready | The converter estimates when the last predecessor issues its final completion contribution. It can precede Claim start. The converter leaves the Claim-to-Ready span intact when dependency or completion evidence is missing. |
 | Ready | A lane selects the task/block after its dependency, ordering and applicable MIX or sync-start gates. Each participating MIX lane records its own Ready. Argument prefetch can occur earlier. |
 | Kernel end | The executing lane returns from its kernel, before the output-store barrier. The marker also carries that lane's kernel start. Dependency-only and skipped entries have no kernel interval. |
-| Completion issued | The publisher issues the GM completion contribution. For MIX this includes the aggregate and any deferred-share deductions. Deferred settlement records its own publisher and may occur later. |
+| Completion issued | A lane issues its final completion credit to GM or CntNotify. Deferred settlement records its own publisher. |
 
-Completion markers describe individual GM updates. A task's total completion may
+Completion markers describe individual lane credits. A task's total completion may
 include contributions from several blocks. A consumer observes completion when
 its own dependency checks succeed.
+
+The task-event capture lists Host-completed task IDs and the dependency-only
+controls folded during binding. The converter removes Host-completed
+predecessors and expands folded controls in the captured dependency graph
+to recover the producer credits the consumer actually waits on.
 
 Each active worker has its own **AICore Scheduler** lane, grouped by cluster
 and C/V0/V1 role. Function names are percounter's own; task IDs retain the HBG

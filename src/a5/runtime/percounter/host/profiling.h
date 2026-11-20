@@ -13,5 +13,8 @@
 class Runtime;
 struct HostApi;
 namespace simpler::percounter {
-void retain_profile_state(Runtime *runtime, const HostApi *api, void *device, const PercounterLayout &layout);
+void retain_profile_state(
+    Runtime *runtime, const HostApi *api, void *device, const PercounterLayout &layout,
+    const std::vector<int64_t> &folded_task_indices, const std::vector<int64_t> &inline_completed_task_indices
+);
 }
