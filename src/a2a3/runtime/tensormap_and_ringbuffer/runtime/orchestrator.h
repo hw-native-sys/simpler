@@ -83,6 +83,12 @@ struct OrchestratorState {
     // Global submission sequence. Assigned once per prepared task across all
     // rings; unsigned subtraction preserves recent distances across uint64 wrap.
     uint64_t submit_seq{0};
+    uint64_t twait_run_generation{1};
+    uint32_t twait_rank{0};
+    const char *twait_last_error{nullptr};
+    twait::Witness twait_last_witness{};
+    twait::RetainedDeclaration twait_declarations[twait::max_records]{};
+    twait::ProofStore twait_proofs{};
 
     // === TENSOR MAP (Private) ===
     ChipTensorMap tensor_map;  // Producer lookup
