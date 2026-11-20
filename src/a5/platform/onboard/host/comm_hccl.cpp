@@ -2177,7 +2177,7 @@ static int domain_alloc_host(
     ctx.rankId = domain_rank;
     ctx.rankNum = static_cast<uint32_t>(rank_count);
     ctx.winSize = alloc.mapping_size;
-    ctx.windowsOut[domain_rank] = reinterpret_cast<uint64_t>(alloc.local_buf);
+    ctx.windowsIn[domain_rank] = ctx.windowsOut[domain_rank] = reinterpret_cast<uint64_t>(alloc.local_buf);
     if (urma) {
         // Remote MR addresses belong to the URMA workspace, not the local device address space.
         const int urma_rc = init_urma_workspace(h, allocation_id, rank_ids, rank_count, domain_rank, alloc);
@@ -2187,7 +2187,6 @@ static int domain_alloc_host(
             alloc.urma_workspace->GetWorkspaceSize()
         );
     } else {
-        ctx.windowsIn[domain_rank] = reinterpret_cast<uint64_t>(alloc.local_buf);
         if (map_host_peer_windows(h, allocation_id, host_shm_name, alloc, ctx, abort_path) != 0) return -1;
     }
     if (comm_domain_onboard::upload_context(ctx, alloc.device_ctx, h->rank, "Host domain") != ACL_SUCCESS) return -1;
