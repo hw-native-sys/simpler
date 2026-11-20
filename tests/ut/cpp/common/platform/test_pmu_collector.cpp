@@ -37,6 +37,69 @@ int test_free(void *ptr) {
 
 }  // namespace
 
+#if defined(SIMPLER_TEST_PMU_ARCH_A5)
+namespace {
+
+class PmuRetainedPoolTest : public ::testing::Test {
+protected:
+    PmuCollector collector_;
+    std::filesystem::path root_;
+    bool admitted_ = false;
+
+    void SetUp() override {
+        root_ =
+            std::filesystem::temp_directory_path() / ("pmu_pool_" + std::to_string(::getpid()) + "_" +
+                                                      ::testing::UnitTest::GetInstance()->current_test_info()->name());
+        ASSERT_TRUE(std::filesystem::create_directories(root_));
+        collector_.configure_retained_runs(true);
+        ASSERT_EQ(collector_.init(4, 2, test_alloc, nullptr, test_free, 0), 0);
+    }
+
+    void TearDown() override {
+        if (admitted_) collector_.abandon_run(1);
+        collector_.finish_retained_runs();
+        collector_.stop();
+        collector_.finalize(nullptr, test_free);
+        std::filesystem::remove_all(root_);
+    }
+};
+
+TEST_F(PmuRetainedPoolTest, AccountsForInitialDeviceBuffersAndHostShadows) {
+    // Four cores, two buffers each, with a separate host shadow for each buffer.
+    EXPECT_EQ(collector_.manager().paired_initial(0), 16 * sizeof(PmuBuffer));
+    EXPECT_EQ(collector_.manager().paired_charged(0), 16 * sizeof(PmuBuffer));
+}
+
+TEST_F(PmuRetainedPoolTest, RetainedAdmissionLeavesBoundedRefillHeadroomAfterStartup) {
+    collector_.start([](std::function<void()> function) {
+        return std::thread(std::move(function));
+    });
+    const size_t startup_bytes = collector_.manager().paired_charged(0);
+    admitted_ = collector_.run_begin(1, (root_ / "pmu.csv").string(), PmuEventType::PIPE_UTILIZATION);
+    ASSERT_TRUE(admitted_);
+
+    // Every recycled lane is already warm. With no device producer, the worker
+    // threads consume no buffers and allocate nothing during this bounded refill.
+    auto &manager = collector_.manager();
+    const size_t buffers = manager.allocate_recycled_batch(0, sizeof(PmuBuffer), 4, 0);
+    EXPECT_EQ(buffers, 4u) << "retaining the first run must leave room to replenish a dry lane";
+
+    size_t allocated = buffers;
+    const size_t batch_bytes = 8 * sizeof(PmuBuffer);
+    for (size_t i = 0; i <= startup_bytes / batch_bytes; ++i) {
+        const size_t next = manager.allocate_recycled_batch(0, sizeof(PmuBuffer), 4, 0);
+        if (next == 0) break;
+        allocated += next;
+    }
+    EXPECT_GT(allocated, 0u);
+    EXPECT_LE(manager.paired_charged(0), startup_bytes * 2);
+    EXPECT_EQ(manager.allocate_recycled_batch(0, sizeof(PmuBuffer), 4, 0), 0u)
+        << "replenishment must remain bounded after retained admission";
+}
+
+}  // namespace
+#endif
+
 TEST(PmuCollectorTest, PreservesShardFilesWhenFinalCsvCannotBeOpened) {
     const std::filesystem::path test_dir =
         std::filesystem::temp_directory_path() / ("pmu_collector_failure_test_" + std::to_string(::getpid()));
