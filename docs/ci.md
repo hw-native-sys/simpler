@@ -761,9 +761,10 @@ A repo maintainer or admin can comment exactly `/run-a5` on an open PR targeting
 ignored. `ci-a5-comment.yml` checks the commenter's current `admin` permission
 or `maintain` role (returned as `role_name`, with `permission: write`)
 with `getCollaboratorPermissionLevel` before resolving the PR's head repository
-and base SHA, then pinning their GitHub-generated merge commit in the upstream
+and the current base branch SHA, then pinning their GitHub-generated merge commit in the upstream
 repository, including fork PRs. The gate verifies that the
-merge commit has exactly the observed base and head as its two parents. Pending
+merge commit has exactly the current base branch and observed head as its two parents.
+The base SHA comes from the branch API because PR base metadata can lag behind the branch. Pending
 or stale snapshots are re-read for up to 60 seconds; a persistent mismatch or
 conflict fails the gate before any suite is scheduled. The gate summary records all three
 SHAs. Testing the merge includes current main's CI interfaces even for a PR whose

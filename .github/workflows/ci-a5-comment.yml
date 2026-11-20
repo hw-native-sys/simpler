@@ -55,7 +55,7 @@ jobs:
             const MERGEABILITY_RETRY_MS = 5000;
             const MERGEABILITY_ATTEMPTS = 12;
             const repository = `${context.repo.owner}/${context.repo.repo}`;
-            let pr, mergeSha;
+            let pr, mergeSha, baseSha;
             for (let attempt = 0; attempt <= MERGEABILITY_ATTEMPTS; attempt += 1) {
               ({ data: pr } = await github.rest.pulls.get({
                 ...context.repo, pull_number: context.payload.issue.number,
@@ -75,9 +75,11 @@ jobs:
               mergeSha = pr.merge_commit_sha;
               let reason = 'PR merge snapshot unavailable or conflicting; update the PR and issue a new command';
               if (pr.mergeable === true && /^[0-9a-f]{40}$/i.test(mergeSha || '')) {
+                const { data: base } = await github.rest.repos.getBranch({ ...context.repo, branch: pr.base.ref });
+                baseSha = base.commit.sha;
                 const { data: commit } = await github.rest.repos.getCommit({ ...context.repo, ref: mergeSha });
                 if (commit.sha === mergeSha && commit.parents.length === 2 &&
-                    commit.parents[0].sha === pr.base.sha && commit.parents[1].sha === pr.head.sha) break;
+                    commit.parents[0].sha === baseSha && commit.parents[1].sha === pr.head.sha) break;
                 reason = 'PR merge snapshot is stale; issue a new command after GitHub refreshes it';
               }
               if (attempt === MERGEABILITY_ATTEMPTS) {
@@ -88,11 +90,11 @@ jobs:
               await new Promise(resolve => setTimeout(resolve, MERGEABILITY_RETRY_MS));
             }
             core.setOutput('head_sha', pr.head.sha);
-            core.setOutput('base_sha', pr.base.sha);
+            core.setOutput('base_sha', baseSha);
             core.setOutput('repository', `${context.repo.owner}/${context.repo.repo}`);
             core.setOutput('ref', mergeSha);
             core.setOutput('pr_number', String(pr.number));
-            core.summary.addRaw(`Tested merge: ${mergeSha}\n\nPR head: ${pr.head.sha}\n\nBase: ${pr.base.sha}\n`);
+            core.summary.addRaw(`Tested merge: ${mergeSha}\n\nPR head: ${pr.head.sha}\n\nBase: ${baseSha}\n`);
             await core.summary.write();
             core.setOutput('ready', 'true');
 

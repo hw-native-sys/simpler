@@ -39,11 +39,18 @@ const core = {
 };
 let pullIndex = 0;
 let commitIndex = 0;
+let baseIndex = 0;
 const github = {rest: {
   repos: {getCollaboratorPermissionLevel: async args => {
     state.calls.push({api: 'permission', args});
     if (input.permissionError) throw new Error('permission unavailable');
     return {data: {permission: input.permission, role_name: input.roleName}};
+  }, getBranch: async args => {
+    state.calls.push({api: 'base', args});
+    const sequence = input.baseSequence || [input.baseSha];
+    const sha = sequence[Math.min(baseIndex, sequence.length - 1)];
+    baseIndex += 1;
+    return {data: {commit: {sha}}};
   }, getCommit: async args => {
     state.calls.push({api: 'commit', args});
     const sequence = input.commitSequence || [input.commit];
@@ -79,6 +86,7 @@ def _workflow(name="ci-a5-comment"):
 def _fixture():
     return {
         "permission": "admin",
+        "baseSha": _BASE,
         "context": {
             "repo": {"owner": "upstream", "repo": "project"},
             "serverUrl": "https://github.example",
@@ -202,6 +210,7 @@ def test_admin_command_resolves_fork_and_full_head_sha(body):
     assert result["calls"] == [
         {"api": "permission", "args": {"owner": "upstream", "repo": "project", "username": "maintainer"}},
         {"api": "pull", "args": {"owner": "upstream", "repo": "project", "pull_number": 42}},
+        {"api": "base", "args": {"owner": "upstream", "repo": "project", "branch": "main"}},
         {"api": "commit", "args": {"owner": "upstream", "repo": "project", "ref": _MERGE}},
     ]
 
@@ -237,6 +246,35 @@ def test_comment_lanes_pin_matching_merge_parents(mutation):
         assert result["outputs"]["repository"] == "upstream/project"
         assert _SHA in result["summary"] and _BASE in result["summary"] and _MERGE in result["summary"]
         assert set(result["outputs"]) == set(_workflow()["jobs"]["gate-and-resolve"]["outputs"])
+
+
+@pytest.mark.parametrize("reported_base", ["a" * 40, _BASE])
+def test_admission_uses_current_base_branch_instead_of_cached_pr_metadata(reported_base):
+    fixture = _fixture()
+    fixture["pr"]["base"]["sha"] = reported_base
+    result = _execute("gate-and-resolve", fixture)
+    assert result["failures"] == []
+    assert "error" not in result
+    assert result["outputs"]["base_sha"] == _BASE
+    assert result["outputs"]["ref"] == _MERGE
+
+
+def test_merge_against_old_main_is_rejected_even_when_pr_metadata_matches_it():
+    fixture = _fixture()
+    fixture["baseSha"] = "a" * 40
+    result = _execute("gate-and-resolve", fixture)
+    assert result["outputs"] == {"ready": "false"}
+    assert result["failures"]
+
+
+def test_base_branch_is_refreshed_on_each_merge_snapshot_retry():
+    fixture = _fixture()
+    fixture["baseSequence"] = ["a" * 40, _BASE]
+    result = _execute("gate-and-resolve", fixture)
+    assert result["failures"] == []
+    assert result["outputs"]["ready"] == "true"
+    assert result["outputs"]["base_sha"] == _BASE
+    assert len([call for call in result["calls"] if call["api"] == "base"]) == 2
 
 
 def test_pending_mergeability_is_retried_before_admission():
