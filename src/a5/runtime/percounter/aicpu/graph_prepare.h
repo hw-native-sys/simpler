@@ -168,7 +168,7 @@ inline bool percounter_prepare_invocation(
         for (int32_t i = materialized; i < end; ++i) {
             percounter_flush_body_task(execution->task_at(i));
             PercounterCounter &counter = counters[body_base + static_cast<uint64_t>(i)];
-            // Preserve the Host's uploaded completion preset for AICore credits.
+            // Keep the Host's DONE descriptor and completion preset.
             counter.storage_address = invocation->storage_address;
             counter.body_index = static_cast<uint32_t>(i);
             counter.flags = body[i].flags;

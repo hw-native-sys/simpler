@@ -51,6 +51,10 @@ TaskInput task(uint32_t mask, int blocks = 1, bool sync = false) {
     return result;
 }
 
+struct alignas(32) TestNotify {
+    uint32_t value{0};
+};
+
 struct Fixture {
     std::vector<TaskInput> inputs;
     std::vector<std::vector<int32_t>> folded_rows;
@@ -68,6 +72,7 @@ struct Fixture {
     std::array<pto2::resident::AsyncGroupData, 6> async_groups{};
     std::array<std::array<DeferredCompletionEntry, PERCOUNTER_ASYNC_CAPACITY>, 6> async_entries{};
     std::array<PercounterAsyncCompletion, 128> async_completions{};
+    std::vector<TestNotify> starts;
     std::vector<std::array<int64_t, 3>> calls;
     int running_lane{-1};
 
@@ -108,9 +113,16 @@ struct Fixture {
         EXPECT_TRUE(plan_layout(inputs.size(), blocks, edges, counts, &layout, mix, spmd, sync));
         region.resize(layout.total_size + 128);
         auto *base = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(region.data()) + 127) & ~uintptr_t{127});
-        EXPECT_TRUE(build_tables(
-            inputs.data(), inputs.size(), layout, base, reinterpret_cast<uint64_t>(base), clusters, external
-        ));
+        starts.resize(sync);
+        std::vector<uint64_t> start_addresses;
+        for (auto &start : starts)
+            start_addresses.push_back(reinterpret_cast<uint64_t>(&start.value));
+        auto bound = external;
+        bound.sync_notify = start_addresses.data();
+        bound.sync_notify_count = start_addresses.size();
+        EXPECT_TRUE(
+            build_tables(inputs.data(), inputs.size(), layout, base, reinterpret_cast<uint64_t>(base), clusters, bound)
+        );
         control = reinterpret_cast<PercounterControl *>(base);
         counters = region_at<PercounterCounter>(base, layout.counters_offset);
         for (size_t i = 0; i < inputs.size(); ++i)
@@ -136,7 +148,7 @@ struct Fixture {
             c.segments = region_at<PercounterSegment>(base, layout.segments_offset);
             c.task_claims = region_at<PercounterTaskClaim>(base, layout.task_claims_offset);
             c.claim_summary = region_at<PercounterClaimSummary>(base, layout.claim_summary_offset);
-            c.sync_arrivals = region_at<PercounterStartBarrier>(base, layout.sync_arrivals_offset);
+            c.sync_notify = region_at<uint64_t>(base, layout.sync_notify_offset);
             c.cluster_index = i / 3;
             c.cluster_lane = i % 3;
             c.cluster_count = clusters;
@@ -820,7 +832,7 @@ TEST(PercounterAcquire, CntNotifyDoesNotReleaseFaninBeforeTheDeferredSubtask) {
         EXPECT_FALSE(f.completed(1)) << mask;
         peer_signal = 1;
         f.drain();
-        f.expect_completed(0);
+        EXPECT_TRUE(f.completed(0));
         f.expect_completed(1);
         EXPECT_EQ(f.calls.size(), expected + 1) << mask;
         EXPECT_EQ(f.control->async_registered, 1U);
@@ -828,9 +840,11 @@ TEST(PercounterAcquire, CntNotifyDoesNotReleaseFaninBeforeTheDeferredSubtask) {
     }
 }
 
-TEST(PercounterAcquire, SharedCntNotifyRetainsEarlierCompletionAndUnmappedTasksUseGm) {
-    alignas(32) uint32_t completion = 0;
+TEST(PercounterAcquire, SharedCntNotifyRetainsEarlierCompletionWithIndependentChains) {
+    TestNotify completions[2];
+    auto &completion = completions[0].value;
     const uint64_t address = reinterpret_cast<uint64_t>(&completion);
+    const uint64_t addresses[]{address, reinterpret_cast<uint64_t>(&completions[1].value)};
     const int32_t first = 0;
     const int32_t predecessors[]{0, 1};
     auto successor = task(2, 3);
@@ -848,14 +862,14 @@ TEST(PercounterAcquire, SharedCntNotifyRetainsEarlierCompletionAndUnmappedTasksU
     ASSERT_NE(plan.task_chains[0], plan.task_chains[2]);
     ExternalAddresses external{};
     external.completion_plan = &plan;
-    external.completion_notify = &address;
-    external.completion_notify_count = 1;
+    external.completion_notify = addresses;
+    external.completion_notify_count = 2;
     Fixture f(inputs, 2, external);
     EXPECT_EQ(f.counters[0].completion_notify_address, address);
     EXPECT_EQ(f.counters[1].completion_notify_address, address);
     EXPECT_EQ(f.counters[0].completion_notify_target, 2U);
     EXPECT_EQ(f.counters[1].completion_notify_target, 5U);
-    EXPECT_EQ(f.counters[2].completion_notify_address, 0U);
+    EXPECT_EQ(f.counters[2].completion_notify_address, addresses[plan.task_chains[2]]);
     EXPECT_TRUE(percounter_completion_notify_head(f.counters[0], f.counters[0].value));
     EXPECT_FALSE(percounter_completion_notify_head(f.counters[1], f.counters[1].value));
 
@@ -868,7 +882,7 @@ TEST(PercounterAcquire, SharedCntNotifyRetainsEarlierCompletionAndUnmappedTasksU
     completion = 0;
 
     f.drain();
-    EXPECT_EQ(completion, 5U);
+    EXPECT_EQ(completion, 6U);
     EXPECT_TRUE(f.completed(0));
     EXPECT_TRUE(f.completed(1));
     f.expect_completed(2);
@@ -905,6 +919,11 @@ TEST(PercounterAcquire, GraphBodyFaninWaitsForBothBlocksAfterMetadataPublication
     consumer.fanin_ids = &producer;
     consumer.fanin_count = 1;
     Fixture f({shell, task(1, 2), consumer});
+    TestNotify done[3];
+    for (size_t i = 0; i < 3; ++i) {
+        f.counters[i].completion_notify_address = reinterpret_cast<uint64_t>(&done[i].value);
+        f.counters[i].completion_notify_target = i == 1 ? 2 : 1;
+    }
     f.counters[0].value = percounter_counter_preset(1);
     for (auto &cfg : f.cfg) {
         cfg.table_task_count = 1;
@@ -920,6 +939,17 @@ TEST(PercounterAcquire, GraphBodyFaninWaitsForBothBlocksAfterMetadataPublication
     f.counters[2].fanin_count = 1;
     f.counters[2].fanin_offset = f.layout.fanin_addr_offset;
     f.cfg[0].fanin_addresses[0] = 0;  // First producer in the Graph body.
+    int32_t peer_signal = 0;
+    execute = [&](int64_t *args) {
+        f.calls.push_back({args[0], get_block_idx(args), f.running_lane});
+        if (args[0] == 2) {
+            auto &entry = f.async_entries[f.running_lane][0];
+            entry = {
+                reinterpret_cast<uint64_t>(&peer_signal), 0, 1, COMPLETION_ENGINE_SDMA, COMPLETION_TYPE_COUNTER, 0
+            };
+            f.async_groups[f.running_lane].count = 1;
+        }
+    };
     percounter_claim(f.cfg[0], &f.state[0]);
     percounter_claim(f.cfg[3], &f.state[3]);
     f.step(0);
@@ -929,13 +959,17 @@ TEST(PercounterAcquire, GraphBodyFaninWaitsForBothBlocksAfterMetadataPublication
     EXPECT_EQ(f.claim_total(0), 2U);
     f.cfg[0].metadata_ready[1] = f.cfg[0].metadata_ready[2] = 1;
     f.step(0);
-    EXPECT_EQ(f.counters[1].value, 0U);
+    EXPECT_EQ(done[1].value, 1U);
     f.step(1);
     EXPECT_EQ(f.calls.size(), 1U);
     f.step(3);
     f.step(1);
     ASSERT_EQ(f.calls.size(), 3U);
     EXPECT_EQ(f.calls.back()[0], 2);
+    EXPECT_FALSE(f.completed(0));
+    EXPECT_FALSE(f.completed(2));
+    peer_signal = 1;
+    f.step(1);
     f.expect_completed(0);
     f.expect_completed(1);
     f.expect_completed(2);
@@ -965,41 +999,16 @@ TEST(PercounterAcquire, ReusedSyncMixStillWaitsForEveryNewBlock) {
     f.expect_completed(1);
 }
 
-TEST(PercounterAcquire, PartitionedStartWaitsForEveryUnevenBlockPartition) {
-    for (uint32_t blocks : {1U, 2U, 3U, 4U, 17U, 24U, 32U}) {
-        Fixture f({task(7, blocks < 2 ? 2 : blocks, true)}, 32);
-        const PercounterSyncNotify gm{0, 0};
-        for (uint32_t block = 0; block + 1 < blocks; ++block)
-            percounter_start_arrive(f.cfg[0], gm, 0, block);
-        for (uint32_t observer = 0; observer < 4; ++observer)
-            EXPECT_FALSE(percounter_start_ready(f.cfg[0], gm, 0, blocks, observer));
-        percounter_start_arrive(f.cfg[0], gm, 0, blocks - 1);
-        for (uint32_t observer = 0; observer < 4; ++observer)
-            EXPECT_TRUE(percounter_start_ready(f.cfg[0], gm, 0, blocks, observer));
-    }
-}
-
-/**
- * One counter carries the whole cohort, so its arrival total is the block count
- * itself and every observer reads the same register. The GM sectors stay at
- * zero, which is what proves the two representations do not both run.
- */
 TEST(PercounterAcquire, NotifiedStartCountsTheWholeCohortInOneRegister) {
     for (uint32_t blocks : {2U, 3U, 4U, 17U, 24U, 32U}) {
         Fixture f({task(7, blocks, true)}, 32);
-        uint32_t counter = 0;
-        const auto address = reinterpret_cast<uint64_t>(&counter);
-        const PercounterSyncNotify notify{address, address};
+        const auto notify = percounter_sync_notify(f.cfg[0], &f.state[0], 0);
         for (uint32_t block = 0; block + 1 < blocks; ++block)
-            percounter_start_arrive(f.cfg[0], notify, 0, block);
-        for (uint32_t observer = 0; observer < 4; ++observer)
-            EXPECT_FALSE(percounter_start_ready(f.cfg[0], notify, 0, blocks, observer));
-        percounter_start_arrive(f.cfg[0], notify, 0, blocks - 1);
-        EXPECT_EQ(counter, blocks);
-        for (uint32_t observer = 0; observer < 4; ++observer)
-            EXPECT_TRUE(percounter_start_ready(f.cfg[0], notify, 0, blocks, observer));
-        for (const auto &sector : f.cfg[0].sync_arrivals[0].sectors)
-            EXPECT_EQ(sector.next, 0U);
+            percounter_start_arrive(notify);
+        EXPECT_FALSE(percounter_start_ready(notify, blocks));
+        percounter_start_arrive(notify);
+        EXPECT_EQ(f.starts[0].value, blocks);
+        EXPECT_TRUE(percounter_start_ready(notify, blocks));
     }
 }
 
@@ -1128,34 +1137,29 @@ TEST(PercounterPayload, NotifyTableCarriesOnlyTheMappedSetAddress) {
     std::vector<uint8_t> storage(layout.upload_size + 127);
     const auto address = (reinterpret_cast<uintptr_t>(storage.data()) + 127) & ~uintptr_t{127};
     auto *base = reinterpret_cast<void *>(address);
-    // The slot's ADD alias is a fixed displacement of its SET address, so an
-    // address the alias rule rejects is an unmapped cohort and is published as
-    // zero; the table never carries the alias itself.
     const uint64_t first = UINT64_C(0x8000'0000);
-    const std::array<uint64_t, 3> sets{first, 0, first + 8};
+    std::array<uint64_t, 3> sets{first, 0, first + 8};
     ExternalAddresses external{};
     external.sync_notify = sets.data();
     external.sync_notify_count = sets.size();
+    EXPECT_FALSE(build_tables(inputs.data(), inputs.size(), layout, base, address, 2, external));
+    sets = {first, first + 32, first + 64};
     ASSERT_TRUE(build_tables(inputs.data(), inputs.size(), layout, base, address, 2, external));
     const auto *table = region_at<uint64_t>(base, layout.sync_notify_offset);
-    EXPECT_EQ(table[0], first);
-    EXPECT_EQ(table[1], 0U);
-    EXPECT_EQ(table[2], 0U);
-    for (uint64_t entry : {table[0], table[1], table[2]})
+    EXPECT_TRUE(std::equal(sets.begin(), sets.end(), table));
+    for (uint64_t entry : sets)
         EXPECT_EQ(percounter_notify_add_address(entry), a5_cnt_notify_increment_address(entry));
 }
 
 TEST(PercounterAcquire, NotifySlotCostsOneLoadPerCohort) {
     Fixture f({task(1, 2, true)});
     auto &cfg = f.cfg[0];
-    std::array<uint64_t, 3> table{UINT64_C(0x8000'0000), 0, UINT64_C(0x8000'0040)};
+    std::array<uint64_t, 3> table{UINT64_C(0x8000'0000), UINT64_C(0x8000'0020), UINT64_C(0x8000'0040)};
     cfg.sync_notify = table.data();
     for (uint32_t cohort = 0; cohort < table.size(); ++cohort) {
         const auto notify = percounter_sync_notify(cfg, &f.state[0], cohort);
         EXPECT_EQ(notify.read_address, table[cohort]);
-        // An unmapped cohort keeps a zero pair, which is what selects the GM
-        // arrival sectors.
-        EXPECT_EQ(notify.add_address, table[cohort] == 0 ? 0 : table[cohort] + 8);
+        EXPECT_EQ(notify.add_address, table[cohort] + 8);
         EXPECT_EQ(f.state[0].notify_sync, cohort);
     }
     // A repeated probe of the cached cohort reads nothing: clearing the table
@@ -1217,11 +1221,7 @@ TEST(PercounterAcquire, SyncClaimsAndStartArrivalsArePerTaskAndPerPhysicalLane) 
     for (int id = 0; id < 3; ++id) {
         std::array<int, 6> per_lane{};
         const auto meta = f.cfg[0].metadata[id];
-        for (uint32_t part = 0; part < PERCOUNTER_START_SECTOR_COUNT; ++part)
-            EXPECT_EQ(
-                f.cfg[0].sync_arrivals[meta.sync_index].sectors[part].next,
-                (meta.block_num + PERCOUNTER_START_SECTOR_COUNT - 1 - part) / PERCOUNTER_START_SECTOR_COUNT
-            );
+        EXPECT_EQ(f.starts[meta.sync_index].value, meta.block_num);
         for (const auto &call : f.calls)
             if (call[0] == id) ++per_lane[call[2]];
         for (int count : per_lane)
@@ -1487,7 +1487,18 @@ TEST(PercounterAcquire, GraphBodyRanksAndSyncBoundariesExistBeforeMaterializatio
     ASSERT_TRUE(plan_layout(3, 6, 1, counts, &layout, 1, 1, 1, graph_layout));
     std::vector<uint8_t> backing(layout.total_size + 127);
     auto *bytes = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(backing.data()) + 127) & ~uintptr_t{127});
-    ASSERT_TRUE(build_tables(inputs.data(), inputs.size(), layout, bytes, 0, 2, {}, nullptr, graph));
+    TestNotify start;
+    const uint64_t start_address = reinterpret_cast<uint64_t>(&start.value);
+    ExternalAddresses external{};
+    external.sync_notify = &start_address;
+    external.sync_notify_count = 1;
+    TestNotify body_done[2];
+    const uint64_t body_addresses[]{
+        reinterpret_cast<uint64_t>(&body_done[0].value), reinterpret_cast<uint64_t>(&body_done[1].value)
+    };
+    external.body_completion_notify = body_addresses;
+    external.body_completion_notify_count = 2;
+    ASSERT_TRUE(build_tables(inputs.data(), inputs.size(), layout, bytes, 0, 2, external, nullptr, graph));
     const auto *metadata = region_at<PercounterTaskMetadata>(bytes, layout.metadata_offset);
     EXPECT_EQ(metadata[3].global_order_id, 0U);
     EXPECT_EQ(metadata[4].global_order_id, 1U);
@@ -1526,10 +1537,28 @@ TEST(PercounterAcquire, HostSeedsGraphCompletionBeforeAnyBodyClaim) {
     ASSERT_TRUE(plan_layout(1, blocks + 1, 0, counts, &layout, 0, 1, 0, graph_layout));
     std::vector<uint8_t> bytes(layout.total_size + 128, 0xa5);
     auto *base = reinterpret_cast<uint8_t *>((reinterpret_cast<uintptr_t>(bytes.data()) + 127) & ~uintptr_t{127});
-    ASSERT_TRUE(build_tables(&shell, 1, layout, base, reinterpret_cast<uint64_t>(base), 2, {}, nullptr, graph));
+    SchedulerCompletionCounterPlan plan;
+    std::string error;
+    ASSERT_TRUE(plan_percounter_completion_counters({shell}, &plan, &error, graph)) << error;
+    TestNotify done[3];
+    const uint64_t addresses[]{
+        reinterpret_cast<uint64_t>(&done[0].value), reinterpret_cast<uint64_t>(&done[1].value),
+        reinterpret_cast<uint64_t>(&done[2].value)
+    };
+    ExternalAddresses external{};
+    external.completion_plan = &plan;
+    external.completion_notify = addresses;
+    external.completion_notify_count = 1;
+    external.body_completion_notify = addresses + 1;
+    external.body_completion_notify_count = 2;
+    ASSERT_TRUE(build_tables(&shell, 1, layout, base, reinterpret_cast<uint64_t>(base), 2, external, nullptr, graph));
     const auto *counters = region_at<PercounterCounter>(base, layout.counters_offset);
     const auto *claims = region_at<PercounterTaskClaim>(base, layout.task_claims_offset);
     EXPECT_EQ(counters[1].value, percounter_counter_preset(blocks));
+    EXPECT_EQ(counters[0].completion_notify_address, addresses[0]);
+    EXPECT_EQ(counters[0].completion_notify_target, 1U);
+    EXPECT_EQ(counters[1].completion_notify_target, blocks);
+    EXPECT_EQ(counters[2].completion_notify_target, 1U);
     EXPECT_EQ(layout.upload_size, layout.task_claims_offset + sizeof(PercounterTaskClaim));
     EXPECT_LT(layout.task_claims_offset, layout.upload_size);
     EXPECT_EQ(counters[1].arguments_address, 0U);
@@ -1865,8 +1894,7 @@ TEST(PercounterAcquire, PartialSyncLeavesOtherOwnersAbleToClaimOrdinarySpmd) {
     // and its eight blocks are drawn rather than assigned.
     EXPECT_EQ(f.claim_total(0), 8U);
     EXPECT_EQ(f.claim_total(1), 20U);
-    for (const auto &sector : f.cfg[0].sync_arrivals[0].sectors)
-        EXPECT_EQ(sector.next, 0U);
+    EXPECT_EQ(f.starts[0].value, 0U);
 }
 
 TEST(PercounterAcquire, HeldSpmdBlocksLeaveItsRemainingBlocksForOtherLanes) {

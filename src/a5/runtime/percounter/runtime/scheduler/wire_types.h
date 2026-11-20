@@ -199,19 +199,9 @@ struct alignas(128) PercounterTicket {
 static_assert(sizeof(PercounterTicket) == 128, "a ticket owns one GM sector");
 static_assert(std::is_trivially_copyable_v<PercounterTicket> && std::is_standard_layout_v<PercounterTicket>);
 
-// Arrival counts use the logical block index, independent of its claiming core.
-inline constexpr uint32_t PERCOUNTER_START_SECTOR_COUNT = 4;
-struct alignas(128) PercounterStartBarrier {
-    PercounterTicket sectors[PERCOUNTER_START_SECTOR_COUNT];
-};
-static_assert(sizeof(PercounterStartBarrier) == 128 * PERCOUNTER_START_SECTOR_COUNT);
-static_assert(
-    std::is_trivially_copyable_v<PercounterStartBarrier> && std::is_standard_layout_v<PercounterStartBarrier>
-);
-
 /**
- * A cohort's resolved CntNotify slot, or two zeros when it uses the GM arrival
- * sectors. The uploaded table carries only the SET/read address; a lane pairs
+ * A cohort's resolved CntNotify slot. The uploaded table carries the SET/read
+ * address; a lane pairs
  * it with its ADD alias through `percounter_notify_add_address`, so the pair
  * costs one load rather than two and no lane invents an offset of its own.
  */
@@ -466,9 +456,7 @@ struct alignas(128) PercounterControl {
     uint64_t task_claims_offset;
     uint64_t claim_summary_offset;
     uint64_t sync_cohort_count;
-    uint64_t sync_arrivals_offset;
-    // One CntNotify SET/read address per cohort, parallel to the arrival
-    // barriers; zero where that cohort uses the GM sectors.
+    // One CntNotify SET/read address per cohort.
     uint64_t sync_notify_offset;
     uint64_t metadata_offset;
     uint64_t metadata_ready_offset;

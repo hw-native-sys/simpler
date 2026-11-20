@@ -94,9 +94,6 @@ struct LaneConfig {
     __gm__ PercounterSegment *segments;
     __gm__ PercounterTaskClaim *task_claims;
     __gm__ PercounterClaimSummary *claim_summary;
-    __gm__ PercounterStartBarrier *sync_arrivals;
-    // Null when the Host provisioned no CntNotify for this run; an entry holds
-    // zero when its own cohort fell back to the GM arrival sectors.
     __gm__ uint64_t *sync_notify;
     uint64_t task_count;
     uint64_t table_task_count;
@@ -349,10 +346,16 @@ percounter_resolve_dispatch(const LaneConfig &cfg, int64_t id, uint32_t mask, Pe
     return true;
 }
 
+inline __aicore__ uint64_t percounter_body_producer(const LaneConfig &cfg, uint64_t id) {
+    const auto *counter = &cfg.counters[id];
+    const uint64_t address = reinterpret_cast<uint64_t>(counter);
+    return counter->completion_notify_address != 0 ? address | PERCOUNTER_COMPLETION_NOTIFY : address;
+}
+
 inline __aicore__ uint64_t percounter_producer(const LaneConfig &cfg, const PercounterTask &task, int32_t i) {
     const uint64_t value = percounter_gm_read(task.fanin[i]);
     if (!task.body_fanin) return value;
-    return reinterpret_cast<uint64_t>(&cfg.counters[static_cast<uint64_t>(task.body_base) + value].value);
+    return percounter_body_producer(cfg, static_cast<uint64_t>(task.body_base) + value);
 }
 
 inline __aicore__ uint64_t percounter_completion_address(const LaneConfig &cfg, int64_t task_id) {
@@ -388,7 +391,7 @@ inline __aicore__ void percounter_publish_completion(
     ProfileScope profile_scope(cfg.scalar, ProfilePhase::Complete);
     percounter_issue_completion(completion_address, count);
     const uint64_t issued = percounter_task_event_clock(cfg);
-    if (task.sink) percounter_gm_fetch_add_issue(cfg.counters[task.shell].value, count);
+    if (task.sink) percounter_issue_completion(percounter_completion_address(cfg, task.shell), count);
     percounter_record_task_event(cfg, PercounterTaskEventKind::CompletionIssue, entry, issued, count);
 }
 
@@ -598,7 +601,7 @@ inline __aicore__ bool percounter_async_tick(const LaneConfig &cfg, PercounterLa
             dsb((mem_dsb_t)0);
             percounter_issue_completion(held->completion_address, uint64_t{1});
             const uint64_t issued = percounter_task_event_clock(cfg);
-            if (held->sink) percounter_gm_fetch_add_issue(cfg.counters[held->shell].value, uint64_t{1});
+            if (held->sink) percounter_issue_completion(percounter_completion_address(cfg, held->shell), 1);
             dsb((mem_dsb_t)0);  // Task/shell completion precedes global settlement.
             percounter_gm_fetch_add_issue(cfg.control->async_settled, uint64_t{1});
             percounter_record_task_event(cfg, PercounterTaskEventKind::DeferredCompletionIssue, 0, issued, current);
@@ -959,7 +962,7 @@ inline __aicore__ void percounter_service_records(
                             producer = percounter_gm_read(fanin[cursor]);
                             if (body) {
                                 const uint64_t body_base = percounter_ssbuf_load_field(&record->fanin_body_base);
-                                producer = reinterpret_cast<uint64_t>(&cfg.counters[body_base + producer].value);
+                                producer = percounter_body_producer(cfg, body_base + producer);
                             }
                         }
                         if (!percounter_probe_completion(producer, &pending, &target)) break;
@@ -1373,32 +1376,17 @@ percounter_sync_notify(const LaneConfig &cfg, PercounterLaneState *state, uint32
     return state->notify;
 }
 
-inline __aicore__ void
-percounter_start_arrive(const LaneConfig &cfg, const PercounterSyncNotify &notify, uint32_t sync, uint32_t block) {
-    if (notify.add_address != 0) {
-        percounter_notify_add(*reinterpret_cast<__gm__ volatile uint32_t *>(notify.add_address), 1);
-        return;
-    }
-    percounter_gm_fetch_add_issue(
-        cfg.sync_arrivals[sync].sectors[block & (PERCOUNTER_START_SECTOR_COUNT - 1)].next, uint64_t{1}
-    );
+inline __aicore__ void percounter_start_arrive(const PercounterSyncNotify &notify) {
+#if defined(__CCE_AICORE__)
+    const uint64_t add = notify.add_address;
+#else
+    const uint64_t add = notify.read_address;
+#endif
+    percounter_notify_add(*reinterpret_cast<__gm__ volatile uint32_t *>(add), 1);
 }
 
-inline __aicore__ bool percounter_start_ready(
-    const LaneConfig &cfg, const PercounterSyncNotify &notify, uint32_t sync, uint32_t blocks, uint32_t block
-) {
-    // One counter carries the whole cohort, so its arrival total is the block
-    // count itself rather than a per-partition expectation.
-    if (notify.read_address != 0)
-        return percounter_notify_query(*reinterpret_cast<__gm__ volatile uint32_t *>(notify.read_address)) == blocks;
-    // Rotate probes to spread readers as well as arrival writers. Zero-sized
-    // sectors are complete without a read; every nonempty sector must arrive.
-    for (uint32_t offset = 0; offset < PERCOUNTER_START_SECTOR_COUNT; ++offset) {
-        const uint32_t part = (block + offset) & (PERCOUNTER_START_SECTOR_COUNT - 1);
-        const uint32_t expected = (blocks + PERCOUNTER_START_SECTOR_COUNT - 1 - part) / PERCOUNTER_START_SECTOR_COUNT;
-        if (expected != 0 && percounter_gm_read(cfg.sync_arrivals[sync].sectors[part].next) != expected) return false;
-    }
-    return true;
+inline __aicore__ bool percounter_start_ready(const PercounterSyncNotify &notify, uint32_t blocks) {
+    return percounter_notify_query(*reinterpret_cast<__gm__ volatile uint32_t *>(notify.read_address)) == blocks;
 }
 
 inline __aicore__ bool percounter_mix_launch_ready(const LaneConfig &cfg, const PercounterCandidate &c) {
@@ -1601,7 +1589,7 @@ inline __aicore__ bool percounter_select_ready(
             if (cohort_go && sync_index != PERCOUNTER_NO_SYNC) {
                 if (static_cast<uint32_t>(cfg.cluster_lane) == static_cast<uint32_t>(__builtin_ctz(cohort.mask)) &&
                     percounter_ssbuf_load_acquire(&record->start_arrived) != cohort.generation) {
-                    percounter_start_arrive(cfg, sync_notify, sync_index, percounter_order_block_idx(cohort.entry));
+                    percounter_start_arrive(sync_notify);
                     percounter_ssbuf_store_release(&record->start_arrived, cohort.generation);
                 }
             }
@@ -1609,20 +1597,17 @@ inline __aicore__ bool percounter_select_ready(
             auto &slot = state->slots[cohort.index];
             if (!slot.entered) {
                 slot.entered = true;
-                percounter_start_arrive(cfg, sync_notify, sync_index, percounter_order_block_idx(cohort.entry));
+                if (sync_index != PERCOUNTER_NO_SYNC) percounter_start_arrive(sync_notify);
             }
             cohort_go = true;
         }
         if (cohort_go && sync_index != PERCOUNTER_NO_SYNC) {
             if (!cohort.shared ||
                 static_cast<uint32_t>(cfg.cluster_lane) == static_cast<uint32_t>(__builtin_ctz(cohort.mask))) {
-                cohort_go = percounter_start_ready(
-                    cfg, sync_notify, sync_index, blocks, percounter_order_block_idx(cohort.entry)
-                );
+                cohort_go = percounter_start_ready(sync_notify, blocks);
                 if (cohort_go && cohort.shared) percounter_ssbuf_store_release(&record->start_ready, cohort.generation);
             } else {
-                // One GM observer per block; other participants consume its
-                // generation-tagged publication through the local SRAM.
+                // One CntNotify observer per block. Peers consume its SSBUF publication.
                 cohort_go = percounter_ssbuf_load_acquire(&record->start_ready) == cohort.generation;
             }
         }
@@ -1759,7 +1744,6 @@ run_percounter_lane(__gm__ PercounterControl *control, int block_idx, CoreType c
     cfg.segments = scheduler_state_at<PercounterSegment>(control, control->segments_offset);
     cfg.task_claims = scheduler_state_at<PercounterTaskClaim>(control, control->task_claims_offset);
     cfg.claim_summary = scheduler_state_at<PercounterClaimSummary>(control, control->claim_summary_offset);
-    cfg.sync_arrivals = scheduler_state_at<PercounterStartBarrier>(control, control->sync_arrivals_offset);
     cfg.sync_notify =
         control->sync_notify_offset == 0 ? nullptr : scheduler_state_at<uint64_t>(control, control->sync_notify_offset);
     for (uint32_t i = 0; i < PERCOUNTER_LIST_COUNT; ++i) {
