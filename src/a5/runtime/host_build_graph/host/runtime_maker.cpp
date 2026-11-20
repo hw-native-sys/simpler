@@ -3079,7 +3079,7 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
          publication.image_references.data(), publication.image_references.size()}
     );
     const BindPhaseMark staging_phase = bind_phase_begin();
-    const int metadata_rc = api->stage_launch_metadata(metadata.data(), metadata.size());
+    const int metadata_rc = api->stage_metadata_with_references(metadata.data(), metadata.size(), publication.image_references);
     if (metadata_rc != 0) {
         LOG_ERROR("host-orch: launch metadata staging failed: %d", metadata_rc);
         return metadata_rc;

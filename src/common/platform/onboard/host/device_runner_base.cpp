@@ -1346,9 +1346,9 @@ int DeviceRunnerBase::acquire_graph_staging(
     return 0;
 }
 
-int DeviceRunnerBase::stage_launch_metadata(uint32_t pipeline_slot, const HostMetadataRegion *regions, size_t count) {
+int DeviceRunnerBase::stage_launch_metadata(uint32_t pipeline_slot, const HostMetadataRegion *regions, size_t count, std::vector<HbgImageReference> *owner) {
     if (pipeline_slot >= submission_storage_.size()) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    return submission_storage_[pipeline_slot]->args.staged_launch_metadata.prepare(regions, count, true);
+    return submission_storage_[pipeline_slot]->args.staged_launch_metadata.prepare(regions, count, true, owner);
 }
 
 int DeviceRunnerBase::publish_graph_section(

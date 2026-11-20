@@ -40,7 +40,8 @@ public:
         return *this;
     }
 
-    int prepare(const HostMetadataRegion *regions, size_t count, bool deliver_execution_image = false) {
+    int prepare(const HostMetadataRegion *regions, size_t count, bool deliver_execution_image = false,
+                std::vector<HbgImageReference> *owner = nullptr) {
         if (count != 0 && regions == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
         size_t total = 0;
         bool image_seen = false;
@@ -60,12 +61,15 @@ public:
                         ref.image_offset >= region.bytes)
                         return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
                 }
+                if (owner && (owner->data() != region.image_references || owner->size() != region.reference_count))
+                    return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
                 image_seen = true;
                 continue;
             }
             if (region.bytes > std::numeric_limits<size_t>::max() - total) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
             total += region.bytes;
         }
+        if (owner && !image_seen) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
         std::vector<Region> captured;
         captured.reserve(count);
         Region image{};
@@ -75,13 +79,14 @@ public:
             if (deliver_execution_image && regions[i].execution_image) {
                 region.mutable_prefix_bytes =
                     regions[i].mutable_prefix_bytes == UINT64_MAX ? regions[i].bytes : regions[i].mutable_prefix_bytes;
-                if (regions[i].reference_count != 0)
+                if (regions[i].reference_count != 0 && !owner)
                     region.references.assign(
                         regions[i].image_references, regions[i].image_references + regions[i].reference_count
                     );
                 image = std::move(region);
             } else captured.push_back(std::move(region));
         }
+        if (owner) image.references = std::move(*owner);
         regions_ = std::move(captured);
         execution_image_ = std::move(image);
         bytes_ = total;

@@ -671,6 +671,14 @@ stage_launch_metadata(void *runner_ctx, uint32_t pipeline_slot, const HostMetada
     }
 }
 
+static int stage_owned_references(void *ctx, uint32_t slot, const HostMetadataRegion *regions, size_t count,
+                                  std::vector<HbgImageReference> *owner) {
+    if (!ctx) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->stage_launch_metadata(slot, regions, count, owner);
+    } catch (...) { return PTO_RUNTIME_ERR_INTERNAL; }
+}
+
 static const HostApiOps g_host_api_ops = {
     .device_malloc = device_malloc,
     .device_free = device_free,
@@ -713,6 +721,7 @@ static const HostApiOps g_host_api_ops = {
     .acquire_scheduler_notifications = acquire_scheduler_notifications,
     .get_callable_async_capabilities = get_callable_async_capabilities,
     .launch_owns_execution_image = true,
+    .stage_owned_references = stage_owned_references,
 };
 
 /* ===========================================================================

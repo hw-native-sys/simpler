@@ -15,6 +15,7 @@
 #include <memory>
 #include <optional>
 #include <utility>
+#include <vector>
 
 #include "common/chip_swimlane_extension.h"
 #include "common/region_banks.h"
@@ -296,6 +297,8 @@ struct HostApiOps {
         void *runner_ctx, int32_t callable_id
     ) = nullptr;
     bool launch_owns_execution_image{false};
+    int (*stage_owned_references)(void *, uint32_t, const HostMetadataRegion *, size_t,
+                                  std::vector<HbgImageReference> *) = nullptr;
 };
 
 /**
@@ -318,6 +321,13 @@ public:
             if (rc != 0) return rc;
         }
         return 0;
+    }
+
+    int stage_metadata_with_references(const HostMetadataRegion *regions, size_t count,
+                                       std::vector<HbgImageReference> &owner) const {
+        if (!owner.empty() && ops_->stage_owned_references)
+            return ops_->stage_owned_references(runner_ctx_, pipeline_slot_, regions, count, &owner);
+        return stage_launch_metadata(regions, count);
     }
 
     struct DiagnosticConfig {
