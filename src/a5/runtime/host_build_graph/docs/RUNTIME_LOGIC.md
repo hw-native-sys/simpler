@@ -481,8 +481,9 @@ irrevocable supply seals, so a fanned-out wave of waiting consumers cannot
 deny producers their owners; a candidate that cannot claim keeps its normal
 issuance through the same catalog, with no legacy fallback; and a run-level
 failure cancels only provably owned unstarted handles to FAILED without
-manufacturing a return, after which a re-initialized epoch rejects the drained
-run's stale handles and signals.
+manufacturing a return. A prepared handle carries no run generation, so the
+guard against a stale caller is the failed run's all-core retirement fence,
+which completes before a later run may re-initialize the reused storage.
 
 The support matrix for pre-dispatch covers ordinary single-block and SPMD
 AIC/AIV tasks, including sync-start cohorts, predicates evaluated only after
