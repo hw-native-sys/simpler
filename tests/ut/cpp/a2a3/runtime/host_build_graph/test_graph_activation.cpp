@@ -25,6 +25,7 @@
 #include <atomic>
 #include <cstring>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include "utils/device_arena.h"
@@ -276,4 +277,21 @@ TEST_F(GraphRootRoutingTest, MaterializedFirstWaitsForExternalReady) {
     expect_routed_range(0, TASK_COUNT);
     EXPECT_EQ(sched.signal_graph_external_ready(shell), 0);
     expect_routed_range(0, 0);
+}
+
+TEST_F(GraphRootRoutingTest, ConcurrentFinalPublicationAndReadinessRouteEveryRootOnce) {
+    sched.graph_incremental_publish(execution, 0, 4);
+    expect_routed_range(0, 0);
+    std::atomic<bool> start{false};
+    std::thread publisher([&] {
+        while (!start.load(std::memory_order_acquire))
+            std::this_thread::yield();
+        graph_execution_set_phase(execution, GraphExecutionPhase::MATERIALIZED);
+        sched.graph_incremental_publish(execution, 4, TASK_COUNT);
+    });
+    start.store(true, std::memory_order_release);
+    sched.signal_graph_external_ready(shell);
+    publisher.join();
+    EXPECT_EQ(execution.route_cursor.load(), TASK_COUNT);
+    expect_routed_range(0, TASK_COUNT);
 }
