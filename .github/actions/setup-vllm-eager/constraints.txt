@@ -1,0 +1,16 @@
+# vLLM-Ascend 0.20.2rc1 fixed-shape eager contract (issue #2715).
+#
+# Source identities: vllm v0.20.2 (bc150f50) and vllm-ascend v0.20.2rc1
+# (367b8e62). The vLLM source install uses VLLM_TARGET_DEVICE=empty with
+# VLLM_VERSION_OVERRIDE=0.20.2; vllm-ascend uses
+# SETUPTOOLS_SCM_PRETEND_VERSION=0.20.2rc1 so the distribution versions match
+# the adapter's exact checks.
+#
+# Canonical torch 2.10.0 wheel on the CPU index carries the +cpu local tag.
+# triton-ascend 3.2.1 is installed from the Huawei Ascend mirror, not PyPI.
+torch==2.10.0+cpu
+torch-npu==2.10.0
+vllm==0.20.2
+vllm-ascend==0.20.2rc1
+triton-ascend==3.2.1
+numpy==1.26.4

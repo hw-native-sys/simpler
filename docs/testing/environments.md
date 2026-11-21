@@ -94,6 +94,16 @@ Adding a test to an existing environment requires no workflow edit. A new
 environment requires an explicit registry entry and reviewed installation/runner
 strategy; profiles do not install arbitrary dependencies or infer new CI runners.
 
+`vllm_torch_npu` is the direct environment for the fixed-shape Qwen3-14B vLLM
+integration. It pins vLLM 0.20.2, vLLM-Ascend 0.20.2rc1, Torch-NPU 2.10.0,
+Triton-Ascend 3.2.1 and CPU Torch 2.10.0+cpu, and requires NNAL/ATB 9.0.0 at
+runtime. The native vLLM baseline and the Simpler decode smoke are marked
+`manual`; they run in Daily and are excluded from ordinary PR sweeps. The smoke
+runs the 16-request cohort and the single-active request through the same
+adapter contract, each with two generated tokens, and reconciles the reported
+Simpler decode steps with the returned token counts. It
+does not replace the 128-token numerical-equivalence gate owned by #2429.
+
 ## Hardware Classification
 
 The `--platform` flag is the single source of truth for hardware availability. No separate `-m` flags are needed.
