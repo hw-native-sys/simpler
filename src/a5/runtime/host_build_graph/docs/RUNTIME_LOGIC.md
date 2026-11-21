@@ -372,8 +372,9 @@ TensorMap maps tensor regions to producer task IDs. For every task:
 4. Each producer tracks its highest consumer local ID for completion metadata.
 
 The compact task payload stores original top-level fanins. Native Graph access
-maps them through `completion_refs`; child fanins use Definition-local indices,
-and roots depend on ENTER. EXIT depends on every sink. The canonical producer
+maps them through `completion_refs`. Each shared Definition child plan holds
+the start and count of its fanin indices. A MIX member resolves its instance
+once and uses that same node to receive its argument ranges. Roots depend on ENTER. EXIT depends on every sink. The canonical producer
 completion gate is the readiness proof for executable and control consumers.
 
 ## 6. Bootstrap and Dependencies
@@ -385,8 +386,8 @@ engine catalog and topology. No Graph child argument binding runs on the device:
 Host has already published those arguments and Calls.
 
 Each cluster has a run-initialized 128-byte atomic-only GM gate. When the graph
-uses MIX, AIV0 clears its cluster's two SSBUF banks and publishes INIT. AIC
-and AIV1 confirm INIT before accessing the banks. Host seeds INIT for graphs
+uses MIX, AIV0 clears its cluster's SSBUF bank and publishes INIT. AIC
+and AIV1 confirm INIT before accessing the bank. Host seeds INIT for graphs
 without MIX. Each worker services bounded control-node scans and prepares its
 first execution. AIC and AIV1 then publish their respective DONE bits. Once
 AIV0 confirms both bits, it credits all three workers. The final cluster
@@ -488,19 +489,24 @@ after binding its block or publishing its local MIX descriptor. The cluster
 floor, resource order, and actual fanin still guard execution. Per-task dynamic
 claim counters and the supply seal stay zero for these tasks.
 
-Each core has two ordinary self-claim slots and two MIX member slots, one per
-SSBUF bank. Each ordinary slot can hold one block, and a core can hold at most
-one ordinary block of the same task. A successful claim fixes the ordinary
-slot and owner. A MIX member accepts a descriptor into its bank's slot. Both
-kinds of slot retain their identity from preparation through physical return
-and retirement. A blocked slot caches its confirmed fanin prefix while the
-scheduler services other slots and asynchronous work.
+Each core has one ordinary self-claim slot and one MIX member slot. An
+ordinary claim fixes the slot and owner for one block. A MIX member accepts
+the descriptor from its cluster's SSBUF bank into its MIX slot. Both slots
+retain their identity from preparation through physical return and retirement.
+Each slot retains its fanin cursor and the current pending predecessor’s
+reference and completion source while the scheduler services other work.
+On retry, the worker checks for completion again. It clears the binding
+when the cursor advances or the slot is reused. The end of the fanin list
+indicates that all predecessors are ready.
 
 Once fanin completes, the worker publishes the payload in the same slot.
 A false predicate skips the function and retains its return obligations.
 Direct dispatch passes the selected slot index to the executor. Queued
 dispatch selects a slot from the local ready set. Both paths check the
-applicable epoch and cooperative entry conditions before invoking the Call.
+applicable epoch and cooperative entry conditions before invoking the Call. At MIX pickup the expected
+epoch comes from the validated run-local snapshot. Immediate picks reuse the
+worker's READY check; the generation acquire and owner check still gate entry.
+L2 profiling saves the trace index at READY for identity capture and retirement.
 When a kernel returns with an outstanding deferred condition, CHECK follows
 the condition in the shared async directory.
 
@@ -518,21 +524,46 @@ A kernel proven to have no such accesses skips both operations.
 AIV0 claims the MIX block and release-publishes its task, block, rank and lane
 mask in a cluster SSBUF bank. Each named worker accepts a stable generation
 once and prepares its own Call. Execution still requires fanin, ordering and
-the applicable sync-start permit. Each active member publishes ARRIVED for its
-generation. It waits for all active arrivals when a participating lane has an
-earlier conflicting pure sync-start cohort or the run has an async layout.
-Otherwise its own arrival suffices. The bank can be reused after the accountant
-has observed every active member's matching FIN and acknowledged the generation.
-The proxy records its latest claim, the last group published to each bank,
-and an unpublished cancellation. The two bank identities survive a third claim. Each
-member records CLAIMED on receipt, ENTERED at the kernel boundary and RETURNED
-on physical return. Aborting an unpublished group leaves its members BUILT.
+the applicable sync-start permit. When a participating lane has an earlier
+conflicting pure sync-start cohort, every member publishes ARRIVED and waits
+for all active arrivals for this generation. Otherwise each member can enter
+after its local arrival. Deferred dependencies gate consumers at fan-in, and the
+scheduler loop services outstanding async conditions. Each returning member publishes its generation-tagged FIN. When AIV0 needs
+the bank again, or drains the run, it checks FIN for every named member.
+Protocol capture additionally records an accountant receipt.
+The proxy records its latest claim, the last group published to the bank,
+and an unpublished cancellation. The published identity survives a subsequent
+claim waiting for the bank. Each member keeps CLAIMED and ENTERED in its own
+handle and publishes RETURNED in GM on physical return. BUILT can describe a
+member waiting on dependencies or executing its kernel. The Host exports null
+for entry and ownership until the MIX member publishes its return. Pre-entry failure
+and cancellation leave the MIX cell BUILT. Run errors carry the failing operation. Aborting an unpublished
+group leaves its members BUILT.
+
+The final MIX entry permit reads the SSBUF generation with an acquire barrier.
+A synchronous member can enter the kernel directly after that acquire when
+task timing, PMU and argument capture are off. A prebound async group or
+possible consumption of an async input keeps the pre-call DDR barrier.
 
 After the kernel returns, its async registration is sealed. A MIX member
 records the physical return even if sealing fails. On the CntNotify path each
 successful active member publishes its own physical credit P. An async-capable
 member also owes one condition credit Q, published at an empty seal or by the
-CHECK owner that settles its group. On the GM path the accountant waits for
+registering worker when its conditions hold. Each worker retains its current
+group, pending mask and condition cursor locally. Additional groups use
+per-group GM storage in FIFO order. Each pass checks at most eight conditions
+from one group and rotates outstanding groups. The worker may run independent
+kernels between checks. If the sole pending group has one COUNTER, its first
+unsatisfied check retains the validated address and threshold on the worker.
+Each pending retry samples that address once. A satisfied sample goes through
+the worker error check and descriptor validation before issuing the condition
+credit. Enqueuing another group or advancing the head invalidates the cached
+address. The resident loop continues its periodic error check between iterations.
+Consumers still consult the run-wide activation flag.
+
+A5 Host requires all requested CntNotify
+slots to be mapped and 32-byte aligned before publishing the image. A missing
+slot or invalid mapping fails preparation. On CPU/sim the GM accountant waits for
 every active member's successful FIN and contributes the active lane count in
 one update. Both paths retire the bank only after the successful FIN check.
 

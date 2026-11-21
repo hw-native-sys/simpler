@@ -384,7 +384,7 @@ inline std::string scheduler_export_protocol(
     {
         JsonObject root(out);
         root.string("schema", "hbg-native-protocol");
-        root.number("version", 2);
+        root.number("version", 3);
         if (!graph_source.empty()) {
             root.field("graph_source") << graph_source;
             root.field("node_map") << '[';

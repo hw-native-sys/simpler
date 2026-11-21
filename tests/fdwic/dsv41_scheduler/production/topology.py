@@ -9,14 +9,17 @@
 # -----------------------------------------------------------------------------------------------------------
 """Validate the case topology before reserving any devices."""
 
+import argparse
 import json
 import sys
 from pathlib import Path
 
 
-def device_count(bundle, materialize=False):
+def device_count(bundle, materialize=False, runtime=None):
     case_path = bundle / "case.json"
     case = json.loads(case_path.read_text()) if case_path.exists() else {}
+    if case.get("execution") == "full_wave_mix_chain" and runtime is not None and case.get("runtime") != runtime:
+        raise ValueError(f"Prepare the full-wave MIX bundle for {runtime}; the block-index ABI is runtime-specific")
     if case.get("execution") == "native_moe_host_control":
         if case.get("case") != "moe" or case.get("device_count") != 2:
             raise ValueError("Native MoE requires a two-device case descriptor")
@@ -50,7 +53,12 @@ def device_count(bundle, materialize=False):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("bundle", type=Path)
+    parser.add_argument("--materialize", action="store_true")
+    parser.add_argument("--runtime")
+    args = parser.parse_args()
     try:
-        print(device_count(Path(sys.argv[1]), len(sys.argv) > 2 and sys.argv[2] == "--materialize"))
+        print(device_count(args.bundle, args.materialize, args.runtime))
     except (ValueError, OSError, IndexError) as error:
         sys.exit(str(error))

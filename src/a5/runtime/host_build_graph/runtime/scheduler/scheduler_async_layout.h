@@ -12,8 +12,11 @@
 #pragma once
 
 #include "async_completion_types.h"
-#include "scheduler_async_state.h"
+#include "scheduler_async_pending.h"
 #include "scheduler_types.h"
+
+using SchedulerAsyncTaskJoin = scheduler_async_pending::Join;
+inline constexpr uint32_t SCHEDULER_ASYNC_JOIN_COUNT_MAX = scheduler_async_pending::COUNT_MAX;
 
 struct alignas(64) SchedulerAsyncLayout {
     uint64_t run_epoch;
@@ -21,10 +24,8 @@ struct alignas(64) SchedulerAsyncLayout {
     uint64_t task_map_offset;
     uint64_t task_data_offset;
     uint64_t groups_offset;
-    uint64_t group_leases_offset;
     uint64_t group_progress_offset;
     uint64_t joins_offset;
-    uint64_t check_directory_offset;
     uint32_t task_count;
     uint32_t async_task_count;
     uint32_t group_count;
@@ -43,14 +44,7 @@ struct SchedulerAsyncTaskData {
 struct alignas(64) SchedulerAsyncGroupProgress {
     uint64_t pending_mask;
     uint32_t condition_cursor;
-    uint32_t acquire_cursor;
-};
-
-struct alignas(64) SchedulerAsyncDirectoryWord {
-    // Only fallback halves mutate bits, through atomics. Addresses are written
-    // by Host before READY and never cached-written or DCCI-published in a run.
-    volatile uint64_t bits;
-    uint64_t notification_addresses[2];
+    uint32_t next_group;
 };
 
 struct alignas(64) SchedulerAsyncActivity {
@@ -58,8 +52,8 @@ struct alignas(64) SchedulerAsyncActivity {
 };
 
 static_assert(sizeof(SchedulerAsyncLayout) == 128 && alignof(SchedulerAsyncLayout) == 64);
-static_assert(offsetof(SchedulerAsyncLayout, task_count) == 72);
-static_assert(offsetof(SchedulerAsyncLayout, activity_offset) == 96);
+static_assert(offsetof(SchedulerAsyncLayout, task_count) == 56);
+static_assert(offsetof(SchedulerAsyncLayout, activity_offset) == 80);
 static_assert(sizeof(SchedulerAsyncActivity) == 64 && alignof(SchedulerAsyncActivity) == 64);
 static_assert(
     std::is_standard_layout_v<SchedulerAsyncActivity> && std::is_trivially_copyable_v<SchedulerAsyncActivity>
@@ -73,7 +67,6 @@ static_assert(sizeof(SchedulerAsyncGroupProgress) == 64 && alignof(SchedulerAsyn
 static_assert(
     std::is_standard_layout_v<SchedulerAsyncGroupProgress> && std::is_trivially_copyable_v<SchedulerAsyncGroupProgress>
 );
-static_assert(sizeof(SchedulerAsyncDirectoryWord) == 64 && alignof(SchedulerAsyncDirectoryWord) == 64);
 
 // The Host-built task map and masks are immutable throughout this run.
 // Used during startup/diagnostic planning, never to poll execution readiness.

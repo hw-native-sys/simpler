@@ -15,10 +15,38 @@
 #include "scheduler_execution_tokens.h"
 #include "scheduler_cluster_mix.h"
 
+// The returning coordinator can bind its fixed ordinary head or publish the next MIX.
+// An existing MIX reservation keeps publication priority.
+static inline __aicore__ bool scheduler_continue_coordinator_head(
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    uint64_t profiling_level
+) {
+    bool progress = false;
+    if (scheduler_task_ref_is_null(local->cluster_pending.task_ref)) {
+        const auto &catalog = local->config.engine_catalog;
+        if (local->issue_cursor >= catalog.count || scheduler_has_execution_tokens(local)) return true;
+        const int64_t ref = catalog.refs[local->issue_cursor];
+        if (!scheduler_task_ref_valid(graph, ref)) return scheduler_issue_fail(graph, local, run, ref);
+        const auto flags = scheduler_task_metadata_at(base, local, ref)->flags;
+        if (!scheduler_task_has_fixed_owners(flags)) return true;
+        bool ready = false;
+        if (!scheduler_check_predecessor_supply(graph, base, local, run, ref, &ready)) return false;
+        if (!ready) return true;
+        if (scheduler_task_uses_execution_tokens(flags)) {
+            SchedulerIssueSnapshot head{ref, true};
+            return scheduler_refill_execution_tokens(graph, base, local, run, profiling_level, &progress, &head);
+        }
+        if (!scheduler_task_is_mix(flags)) return true;
+        if (!scheduler_claim_for_build(graph, base, local, run, ref, &progress)) return false;
+        if (!progress) return true;
+    }
+    return scheduler_progress_mix_publication(graph, base, local, run, &progress);
+}
+
 template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_check_entry_permit(
     const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    uint32_t index, bool *permit, bool self_order_checked = false
+    uint32_t index, bool *permit, bool selection_checked = false
 ) {
     SchedulerScalarScope scope(local, SchedPhaseKind::ScalarCanEnterExecution);
     *permit = false;
@@ -26,8 +54,8 @@ static inline __aicore__ bool scheduler_check_entry_permit(
     const auto &owner = local->execution_at(index);
     scope.set_task_ref(owner.task_ref);
     if (owner.cluster_mix) {
-        if (!scheduler_cluster_mix_can_enter(graph, local, run, index, permit)) return false;
-    } else if (self_order_checked) {
+        if (!scheduler_cluster_mix_can_enter(graph, local, run, index, permit, selection_checked)) return false;
+    } else if (selection_checked) {
         // Selection acquired the applicable MIX floor and discharged earlier obligations on this lane.
         *permit = true;
     } else if (!scheduler_self_order_ready(

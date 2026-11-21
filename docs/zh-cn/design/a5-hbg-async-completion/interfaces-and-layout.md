@@ -38,9 +38,9 @@ A5 HBG 的公开登记函数只使用当前 dispatch 的稳定 resident group。
 
 Host 已拥有展开后的普通任务和 Graph child 元数据，按 task/block/active lane 生成稳定索引。`AsyncTaskPlanInput` 只保存这些调度信息及内部容量，不携带额外资源身份。Host 每个逻辑 task 保存一个 40 B 的 `AsyncTaskHostPlan`，包含设备任务描述、三个 lane 的容量、条件区起点及每 block 的条件区步长；初始化时展开 block/lane，并复用一个 header 临时对象填充最终镜像，不为每个物理执行保存临时规划项或完整对齐 header 副本。输入 task ref 递增时不建立重复检查哈希表，其他顺序仍完整检查重复。Graph Definition、TensorData、task 参数和 callable 格式保持不变。
 
-基础实现为每个可执行物理执行预留既有上限 `MAX_COMPLETIONS_PER_TASK`，支持没有额外声明的现有 kernel。没有登记条件的执行封口后直接释放资源，不创建 CHECK 责任。预留容量与每轮初始化、上传范围分开：Host/Device backing 保留完整容量，但 `initialized_bytes` 只覆盖原调度状态及异步元数据、join、目录、SDMA guard、连续 header。token、CHECK lease 与进度位于后缀，首次实际发布前由唯一写者初始化。Host 使用既有 pending metadata 路径上传此前缀，不清零或上传未使用后缀。空间、bind 和 H2D 成本分别计量，不将减少上传宣称为省掉全部预留内存。
+Host 按每个物理执行声明的条件上界预留空间。非空组由登记核轮询。零条件组直接释放执行资源。初始化前缀覆盖 task 映射、join、活动标记、SDMA guard 和组头。组条目及排队时使用的进度行位于预留后缀，在使用时由该执行的登记核写入。
 
-`SchedulerAsyncLayout` 为 128 B，保存 task→group 映射、连续 header 基址 `groups_offset`、lease、CHECK 进度、task join、CHECK 目录及 run 活动标记的位置。offset 96 保存 activity_offset；标记独占 64 B 行，禁止与 cached 数据共用回写行。FINISH owner 由 join RMW 当次选出并直接完成任务，不另设 FINISH lease 或目录；CHECK 目录扫描游标位于 control state。这里的 64 B 是原布局的 DCache 维护粒度，不能作为新的 L2 侧争用隔离依据。后续 lease/join、独立目录竞争字及 SDMA guard 按 128 B 竞争单元隔离；发布数据和 owner 私有进度按真实 writer/reader 边界布局，不把每个只读字段都扩成一行。
+`SchedulerAsyncLayout` 为 128 B，包含 task 映射、组头、溢出队列存储、task join 和 SDMA guard 的偏移。偏移 80 的 `activity_offset` 指向独占 64 B 行的全局活动标记，消费者据此执行异步输入的可见性检查。当前组及其 pending 位图和游标保存在本核。
 
 SDMA 提交互斥字在 Host 初始化为零，只在运行中使用原子操作；SDK 的 session/postId/SQ 状态仍使用原 workspace。原 64 B stride 下，32 个 cluster 对应 2048 B；128 B 隔离目标下同样数量对应 4096 B。该尺寸变化尚未实现，落地时同步修改 Host 规划、Device 寻址和边界检查；按实际 cluster 数分配，不能按逻辑 block 数重复分配，也不扩大公共通信 context。
 
@@ -50,6 +50,6 @@ run bootstrap 校验整个连续 header 数组；执行入口根据 task/block/l
 
 ## 5. 身份与生命周期边界
 
-run epoch、group index 和 lease generation 用于防止调度记录串用、重复完成与交权错误。这些内部状态不替代外部资源的生命周期。
+run epoch 和 group index 标识本轮物理执行。条件组由登记核结算一次，执行槽释放后仍使用该稳定身份。外部资源的生命周期由各后端负责。
 
 外部资源 generation 即使存在，也只能识别过期引用，不能阻止旧 DMA 写入复用地址。必须由已有 allocator、run、Buffer 或 domain 的实际持有及退休机制保证不提前释放/复用；不为表达这一责任而扩展 Tensor 或 Graph 格式。

@@ -107,6 +107,7 @@ def _task_display_name(func_id, func_id_to_name, tdisp, *, spmd=False):
 
 def _group_l2_spmd_kernels(events, spmd_ids, task_display):
     """Chrome JSON track colors follow the slice name. Native TrackEvents use correlation_id."""
+
     slices = defaultdict(list)
     for event in events:
         if event["pid"] != 4 or event["ph"] != "X" or "kernel-duration-us" not in event["args"]:
@@ -115,14 +116,17 @@ def _group_l2_spmd_kernels(events, spmd_ids, task_display):
         if task_id in spmd_ids:
             slices[task_id].append(event)
         else:
-            event["name"] = f"EXECUTE · {event['name']}"
+            task_label = task_display(task_id)
+            stem = event["name"].removesuffix(f"({task_label})")
+            event["name"] = f"{task_label}-{stem}"
 
     for task_id, members in slices.items():
-        suffix = f"({task_display(task_id)})"
+        task_label = task_display(task_id)
+        suffix = f"({task_label})"
         stems = {event["name"].removesuffix(suffix) for event in members}
         if len(stems) > 1:
             stems = {re.sub(r"_(?:aic|aiv[01]?)(?=_spmd$|$)", "", stem) for stem in stems}
-        label = "EXECUTE · " + " / ".join(sorted(stems)) + suffix
+        label = f"{task_label}-" + " / ".join(sorted(stems))
         for event in members:
             event["args"] = {**event["args"], "kernel_slice_label": event["name"], "correlation_id": f"spmd/{task_id}"}
             event["name"] = label
@@ -1513,7 +1517,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
     return out
 
 
-def load_deps_json(deps_path):
+def load_deps_json(deps_path, *, sources_by_consumer=None):
     """Load a dep_gen replay output (``deps.json``).
 
     deps.json is the sole source of truth for the task graph in this tool:
@@ -1541,10 +1545,7 @@ def load_deps_json(deps_path):
     if not isinstance(edges, list):
         print(f"Warning: {deps_path} has no 'edges' array", file=sys.stderr)
         return None
-    # The converter only needs flow-event endpoints (not the per-edge tensor
-    # annotations). Project annotated edges down to a (pred, succ) set and
-    # dedup so multiple annotated edges sharing the same pair (distinct arg
-    # / source / overlap) collapse to a single flow event.
+    # One logical edge per task pair, with all recorded sources for the L2 details.
     by_pred: dict[int, list[int]] = defaultdict(list)
     seen: set[tuple[int, int]] = set()
     for edge in edges:
@@ -1555,6 +1556,8 @@ def load_deps_json(deps_path):
         if pred is None or succ is None:
             continue
         key = (pred, succ)
+        if sources_by_consumer is not None and isinstance(edge.get("source"), str):
+            sources_by_consumer.setdefault(succ, {}).setdefault(pred, set()).add(edge["source"])
         if key in seen:
             continue
         seen.add(key)
@@ -1905,6 +1908,40 @@ def _flow_row_pairs(pred_id, succ_id, task_map, spmd_task_ids, anchor_rows, aicp
     if not pred_rows or not succ_rows:
         return []
     return [(pred_row, succ_row) for pred_row in pred_rows for succ_row in succ_rows]
+
+
+def _worker_dependencies(edges, fanin, kernel_ids, visible, display):
+    """Project DAG paths through kernel-less controls onto this run's visible dependency endpoints."""
+    controls = {ref for ref, kernels in kernel_ids.items() if kernels == [-1, -1, -1] and ref not in visible}
+    extra = defaultdict(set)
+    hints = {}
+    sources = {}
+    for consumer in visible:
+        parents = fanin.get(consumer, ())
+        notes = []
+        for control in parents:
+            if control not in controls:
+                continue
+            if control not in sources:
+                pending = [control]
+                visited = {control}
+                producers = set()
+                while pending:
+                    for pred in fanin.get(pending.pop(), ()):
+                        if pred in visible:
+                            producers.add(pred)
+                        elif pred in controls and pred not in visited:
+                            visited.add(pred)
+                            pending.append(pred)
+                sources[control] = sorted(producers)
+            if sources[control]:
+                notes.append(f"{display(control)} ← {', '.join(display(ref) for ref in sources[control])}")
+                for pred in sources[control]:
+                    if pred not in parents and pred != consumer:
+                        extra[pred].add(consumer)
+        if notes:
+            hints[consumer] = "; ".join(notes)
+    return {**edges, **{pred: [*edges.get(pred, ()), *sorted(children)] for pred, children in extra.items()}}, hints
 
 
 def _dependency_task_fan_count(task_id, spmd_task_ids, task_map, deps_block_map=None):
@@ -2466,6 +2503,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     chip_swimlane_level=None,
     percounter_task_events=None,
     percounter_block_view=False,
+    sources_by_consumer=None,
 ):
     """Generate Chrome Trace Event Format JSON from task data.
 
@@ -2709,12 +2747,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     task_to_event_id: dict[tuple, int] = {}
     task_to_scheduler_event_id: dict[tuple, int] = {}
     task_to_scheduler_tid: dict[tuple, int] = {}
-    # Dummy / predicated-skip / alloc DAG nodes have no AICore kernel row, so
-    # their dependency arrows anchor on the AICPU worker slice instead. Kept per
-    # run for the same reason the task map is: these task ids repeat every run,
-    # and a map spanning runs hands a producer from one run to a consumer in
-    # another.
-    aicpu_anchor_maps_by_run: dict[object, dict[int, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    # Non-kernel endpoints, including recorded Percounter control completions.
+    # Task ids repeat on successive runs.
+    worker_marker_anchors_by_run: dict[object, dict[int, list[dict]]] = defaultdict(lambda: defaultdict(list))
     event_id = 0
 
     def _next_event_id():
@@ -2768,6 +2803,85 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             for succ in succs:
                 fanin_map[succ].append(pred)
 
+    l2_dependencies = chip_swimlane_level == 2 and runtime_name in ("host_build_graph", "percounter")
+    source_hints = (
+        {
+            consumer: ", ".join(f"{task_display(pred)} ({', '.join(sorted(kinds))})" for pred, kinds in sources.items())
+            for consumer, sources in (sources_by_consumer or {}).items()
+        }
+        if l2_dependencies
+        else {}
+    )
+    if pc_l2_events is not None and deps_kernel_map and deps_edges:
+        # A control has no worker kernel, but its final counter issue is a measured flow endpoint.
+        marker_track = {"pid": 4, "tid": AICPU_TID_BASE - 1}
+        for row in percounter_scheduler_view.control_completions(
+            pc_l2_events, deps_kernel_map, deps_block_map
+        ):
+            ref, epoch, ts = row["task_id"], row["run_epoch"], row["time_us"]
+            if ref in task_maps_by_run.get(epoch, {}):
+                continue
+            marker_id = _next_event_id()
+            events.append(
+                {
+                    **marker_track,
+                    "ph": "i",
+                    "s": "t",
+                    "cat": "Percounter L2 control",
+                    "ts": ts,
+                    "id": marker_id,
+                    "name": f"Control completion · {task_display(ref)}",
+                    "args": {
+                        "task_id": ref,
+                        "run_epoch": epoch,
+                        "worker_id": row["worker_id"],
+                        "cluster_index": row["cluster_index"],
+                        "cluster_lane": row["cluster_lane"],
+                        "evidence": row["kind"],
+                        "fanin-hint": ", ".join(map(task_display, fanin_map.get(ref, ()))),
+                        "fanout-hint": ", ".join(map(task_display, deps_edges.get(ref, ()))),
+                        **({"fanin-sources": source_hints[ref]} if ref in source_hints else {}),
+                    },
+                }
+            )
+            worker_marker_anchors_by_run[epoch][ref].append(
+                {
+                    "task_id": ref,
+                    "run_epoch": epoch,
+                    "trace_tid": marker_track["tid"],
+                    "event_id": marker_id,
+                    "start_time_us": ts,
+                    "end_time_us": ts,
+                }
+            )
+        if worker_marker_anchors_by_run:
+            events.append({**marker_track, "ph": "M", "name": "thread_name", "args": {"name": "Control completions"}})
+
+    worker_edges_by_run = {}
+    control_hints_by_run = {}
+    if l2_dependencies and deps_edges and deps_kernel_map:
+        for epoch in task_maps_by_run.keys() | worker_marker_anchors_by_run.keys():
+            visible = task_maps_by_run.get(epoch, {}).keys() | worker_marker_anchors_by_run.get(epoch, {}).keys()
+            worker_edges_by_run[epoch], control_hints_by_run[epoch] = _worker_dependencies(
+                deps_edges, fanin_map, deps_kernel_map, visible, task_display
+            )
+
+        # Show the graph inputs beside the measured wait as well as on the kernel.
+        for event in events:
+            if event.get("cat") not in ("Percounter L2", "HBG L2", "percounter_task_timing"):
+                continue
+            if event.get("ph") not in ("b", "X") or not event["name"].startswith(
+                ("Bound", "Predecessor pending", "Claim →", "Ideal ready →")
+            ):
+                continue
+            args = event["args"]
+            ref = args["task_id"]
+            if ref in source_hints:
+                args["fanin-sources"] = source_hints[ref]
+            via = control_hints_by_run.get(args["run_epoch"], {}).get(ref)
+            if via:
+                args["kernel-fanin-via-control"] = via
+
     hbg_kernel_labels = {}
     for task in tasks:
         tid = core_to_tid[task["core_id"]]
@@ -2805,6 +2919,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 "scheduler-duration-us": task["finish_time_us"] - task["dispatch_time_us"],
             }
 
+        control_hint = control_hints_by_run.get(task.get("run_epoch"), {}).get(task["task_id"])
+        if control_hint:
+            timing_details["kernel-fanin-via-control"] = control_hint
+        if task["task_id"] in source_hints:
+            timing_details["fanin-sources"] = source_hints[task["task_id"]]
         events.append(
             {
                 "args": _with_execution_identity(
@@ -3088,7 +3207,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             )
             events.extend(marker_events)
             for run_epoch, task_id, row in marker_anchors:
-                aicpu_anchor_maps_by_run[run_epoch][task_id].append(row)
+                worker_marker_anchors_by_run[run_epoch][task_id].append(row)
 
             for record in thread_records:
                 raw_phase = record.get("phase", "unknown")
@@ -3399,7 +3518,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                                 "dur": max(dur, 0.02),
                             }
                         )
-                        aicpu_anchor_maps_by_run[record.get("run_epoch")][task_id].append(
+                        worker_marker_anchors_by_run[record.get("run_epoch")][task_id].append(
                             {
                                 "task_id": task_id,
                                 "run_epoch": record.get("run_epoch"),
@@ -3416,19 +3535,19 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
     # deps.json (dep_gen replay); without one we emit no flow events at all,
     # since the device hot path no longer carries fanout (PR #863).
     # One producer anchor per SPMD function feeds every visible consumer slice.
-    # Dummy and alloc nodes use their AICPU worker slices as endpoints.
+    # L2 projects through unmeasured controls and anchors recorded completions on their markers.
     # The runs to walk come from the union of both identity sources: a run can
     # contribute only AICPU phases (dummy / alloc nodes and no AICore kernel
     # row at all), and iterating the task map alone would skip it entirely.
     dependency_run_keys = sorted(
-        set(task_maps_by_run) | set(aicpu_anchor_maps_by_run),
+        set(task_maps_by_run) | set(worker_marker_anchors_by_run),
         key=lambda epoch: (epoch is not None, epoch or 0),
     ) or [None]
     for run_epoch, pred_id, succ_ids in (
-        (_e, _p, _s) for _e in dependency_run_keys for _p, _s in edges_by_pred.items()
+        (_e, _p, _s) for _e in dependency_run_keys for _p, _s in worker_edges_by_run.get(_e, edges_by_pred).items()
     ):
         run_task_map = task_maps_by_run.get(run_epoch) or {}
-        run_anchor_map = aicpu_anchor_maps_by_run.get(run_epoch) or {}
+        run_anchor_map = worker_marker_anchors_by_run.get(run_epoch) or {}
         pred_rows = _worker_flow_anchor_rows(pred_id, run_task_map, spmd_task_ids, run_anchor_map)
         if not pred_rows:
             continue
@@ -5578,12 +5697,14 @@ def _load_rank_local_artifacts(records_path, companion_dir):
         func_names, orchestrator_name = load_func_names_json(name_map_path)
 
     deps_path = Path(companion_dir) / "deps.json"
+    sources_by_consumer = {}
     return {
         "dispatch_identity": _load_dispatch_identity(companion_dir),
         "func_names": func_names,
         "orchestrator_name": orchestrator_name,
         "deps_path": deps_path,
-        "deps_edges": load_deps_json(deps_path),
+        "deps_edges": load_deps_json(deps_path, sources_by_consumer=sources_by_consumer),
+        "sources_by_consumer": sources_by_consumer,
         "deps_kernel_map": load_deps_kernel_map(deps_path),
         "deps_block_map": load_deps_block_map(deps_path),
     }
@@ -5753,6 +5874,7 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
             aicpu_lifecycle_records=data.get("aicpu_lifecycle_records"),
             percounter_task_events=data.get("percounter_task_events"),
             deps_edges=artifacts["deps_edges"],
+            sources_by_consumer=artifacts["sources_by_consumer"],
             deps_kernel_map=artifacts["deps_kernel_map"],
             deps_block_map=artifacts["deps_block_map"],
             percounter_block_view=args.percounter_block_view,
@@ -5917,7 +6039,8 @@ def main():
         output_path = _resolve_output_path(args, input_path)
 
         deps_path = Path(args.deps_json) if args.deps_json else Path(input_path).parent / "deps.json"
-        deps_edges = load_deps_json(deps_path)
+        sources_by_consumer = {}
+        deps_edges = load_deps_json(deps_path, sources_by_consumer=sources_by_consumer)
         # Load the per-task kernel_ids map separately so the trace generator
         # can resolve func_id=-1 records (TASK_TIMING / level=1) back to
         # the real kernel name. Optional — pre-schema deps.json without
@@ -5956,6 +6079,7 @@ def main():
             aicpu_lifecycle_records=data.get("aicpu_lifecycle_records"),
             percounter_task_events=data.get("percounter_task_events"),
             deps_edges=deps_edges,
+            sources_by_consumer=sources_by_consumer,
             deps_kernel_map=deps_kernel_map,
             deps_block_map=deps_block_map,
             percounter_block_view=args.percounter_block_view,

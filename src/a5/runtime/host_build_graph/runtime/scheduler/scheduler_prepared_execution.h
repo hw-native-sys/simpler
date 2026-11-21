@@ -95,12 +95,6 @@ scheduler_prepared_call_at(__gm__ void *base, __gm__ const SchedulerPreparedLayo
 // Its fixed writer owns the entire isolated line through return or cancellation.
 static inline __aicore__ bool
 scheduler_transition_prepared_state(__gm__ SchedulerPreparedControl *control, uint64_t expected, uint64_t desired) {
-    // Checked failure paths can receive a stale copy of a local handle.
-    if ((expected & SCHEDULER_PREPARED_MIX_OWNED) != 0) {
-        if (scheduler_gm_query(control->state) != expected) return false;
-        scheduler_store_signal(control->state, desired);
-        return true;
-    }
     if (((expected | desired) & SCHEDULER_PREPARED_TICKET_OWNED) != 0) {
         if (control->state != expected) return false;
         control->state = desired;
@@ -174,16 +168,10 @@ static inline __aicore__ bool scheduler_prepared_already_returned(
     );
 }
 
-// This member already holds the unique SSBUF grant. The executor's existing
-// pre-call store barrier publishes entry even when the business kernel hangs.
-static inline __aicore__ void scheduler_mark_mix_kernel_entered(
-    __gm__ void *base, __gm__ const SchedulerPreparedLayout *prepared, SchedulerPreparedHandle *handle
-) {
-    handle->claimed_state =
-        (handle->claimed_state & ~UINT64_C(255)) | static_cast<uint64_t>(SchedulerPreparedPhase::ENTERED);
-    scheduler_store_signal(
-        scheduler_prepared_control_at(base, prepared, handle->execution_index)->state, handle->claimed_state
-    );
+// Only this member uses ENTERED to distinguish execution from pre-entry cancellation.
+static inline __aicore__ void scheduler_mark_mix_kernel_entered(SchedulerPreparedHandle &handle) {
+    handle.claimed_state =
+        (handle.claimed_state & ~UINT64_C(255)) | static_cast<uint64_t>(SchedulerPreparedPhase::ENTERED);
 }
 
 // The executor owns the returned call. FIN or the exit fence publishes its return state.
@@ -237,10 +225,13 @@ static inline __aicore__ bool scheduler_receive_payload(
     scheduler_cache_barrier();
     asm volatile("" ::: "memory");
     if (!scheduler_prepared_call_valid(call, binding, prepared->run_epoch, index, task_ref, block, lane)) {
-        auto *control = scheduler_prepared_control_at(base, prepared, handle->execution_index);
         const uint64_t failed =
             (handle->claimed_state & ~UINT64_C(255)) | static_cast<uint64_t>(SchedulerPreparedPhase::FAILED);
-        if (scheduler_transition_prepared_state(control, handle->claimed_state, failed)) handle->claimed_state = failed;
+        if ((handle->claimed_state & SCHEDULER_PREPARED_MIX_OWNED) != 0 ||
+            scheduler_transition_prepared_state(
+                scheduler_prepared_control_at(base, prepared, index), handle->claimed_state, failed
+            ))
+            handle->claimed_state = failed;
         return false;
     }
     return true;
@@ -290,6 +281,5 @@ static inline __aicore__ bool scheduler_acquire_group_lane(
         scheduler_prepared_state(SchedulerPreparedPhase::CLAIMED, worker) | SCHEDULER_PREPARED_MIX_OWNED;
     handle->execution_index = index;
     handle->claimed_state = claimed;
-    scheduler_store_signal(scheduler_prepared_control_at(base, prepared, index)->state, claimed);
     return scheduler_receive_payload(base, prepared, task_ref, block, lane, handle);
 }

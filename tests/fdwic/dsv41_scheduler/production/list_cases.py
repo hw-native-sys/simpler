@@ -16,14 +16,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def selected_cases():
-    manifest = ROOT / "workloads/pypto_lib_latest/source.json"
-    for name in json.loads(manifest.read_text())["cases"]:
-        yield f"pypto_lib_latest/{name}"
+SYNTHETIC_CASE = "synthetic/full_wave_mix_chain"
+
+
+def selected_cases(flavor="all"):
+    if flavor in ("all", "pypto_lib_latest"):
+        manifest = ROOT / "workloads/pypto_lib_latest/source.json"
+        for name in json.loads(manifest.read_text())["cases"]:
+            yield f"pypto_lib_latest/{name}"
+    if flavor in ("all", "synthetic"):
+        yield SYNTHETIC_CASE
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime", choices=("host_build_graph", "percounter"), default="host_build_graph")
-    parser.parse_args()
-    print("\n".join(selected_cases()))
+    parser.add_argument("--flavor", choices=("all", "pypto_lib_latest", "synthetic"), default="all")
+    print("\n".join(selected_cases(parser.parse_args().flavor)))

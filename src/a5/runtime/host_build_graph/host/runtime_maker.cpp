@@ -34,6 +34,7 @@
  *     outlives the run and is freed once at Worker finalization.
  */
 
+#include "host/scheduler_notification_address.h"
 #include "host/scheduler_notifications.h"
 
 #include <dlfcn.h>
@@ -879,7 +880,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
     for (uint64_t index = 0; index < prepared.execution_count; ++index) {
         const uint64_t state = prepared_controls[index].state;
         const auto raw_phase = scheduler_prepared_phase(state);
-        if (raw_phase < SchedulerPreparedPhase::BUILT || raw_phase > SchedulerPreparedPhase::ENTERED) continue;
+        if (raw_phase < SchedulerPreparedPhase::BUILT || raw_phase > SchedulerPreparedPhase::FAILED) continue;
         const auto &call = calls[index];
         const uint32_t executor = scheduler_prepared_owner(state);
         if (call.execution_index != index || call.run_epoch != swimlane_run_epoch || call.task_ref < 0 ||
@@ -898,11 +899,11 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         if (executor == UINT32_MAX) scheduler_json << "null";
         else scheduler_json << executor;
         scheduler_json << ',' << static_cast<unsigned>(phase) << ',' << static_cast<unsigned>(raw_phase) << ','
-                       << (inferred ? "true" : "false") << ',' << completion << ','
-                       << ((state & SCHEDULER_PREPARED_MIX_OWNED) != 0 ? "true" : "false") << ',';
-        if (plan.active_lane_count > 1)
-            scheduler_json << (scheduler_prepared_mix_kernel_entered(state) ? "true" : "false");
-        else scheduler_json << "null";
+                       << (inferred ? "true" : "false") << ',' << completion << ',';
+        if (plan.active_lane_count > 1 && raw_phase == SchedulerPreparedPhase::BUILT)
+            scheduler_json << "null,";
+        else scheduler_json << ((state & SCHEDULER_PREPARED_MIX_OWNED) != 0 ? "true," : "false,");
+        scheduler_json << (scheduler_prepared_mix_returned(state) ? "true" : "null");
         scheduler_json << ']';
         first_call = false;
     }
@@ -1947,6 +1948,8 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG: ordinary fanin preparation failed: %s", task_order_error.c_str());
         return false;
     }
+    if (!native_graph)
+        scheduler_elide_proven_mix_floors(dependencies, task_metadata, possible_async_lanes, task_catalog_plan);
     std::vector<uint32_t> counter_credits(node_count, 0);
     for (uint64_t ref = 0; ref < node_count; ++ref) {
         const auto &metadata = task_metadata[ref];
@@ -1979,18 +1982,33 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG: completion counter plan failed: %s", task_order_error.c_str());
         return false;
     }
+    const bool onboard = std::strcmp(get_platform(), "a5") == 0;
+    auto acquire_notifications = [&](SchedulerNotificationPurpose purpose, size_t count,
+                                     SchedulerDoneNotifications &out) {
+        try {
+            if (api->acquire_scheduler_notifications(purpose, count, &out) != 0 || out.addresses.size() != count ||
+                out.add_addresses.size() != count)
+                throw std::runtime_error("incomplete CntNotify allocation");
+            if (onboard) {
+                for (size_t i = 0; i < count; ++i) {
+                    const uint64_t increment = a5_cnt_notify_increment_address(out.addresses[i]);
+                    if (increment == 0 || (purpose == SchedulerNotificationPurpose::COMPLETION_COUNTER &&
+                                           out.add_addresses[i] != increment))
+                        throw std::runtime_error("missing or invalid CntNotify slot at index " + std::to_string(i));
+                }
+            }
+        } catch (const std::exception &error) {
+            LOG_ERROR("A5 HBG: cannot prepare %zu scheduler notifications: %s", count, error.what());
+            return false;
+        }
+        if (out.owner != nullptr) runtime->retain_pending_resource(std::move(out.owner));
+        return true;
+    };
     SchedulerDoneNotifications counter_notifications;
-    try {
-        if (api->acquire_scheduler_notifications(
-                SchedulerNotificationPurpose::COMPLETION_COUNTER, counter_plan.chains.size(), &counter_notifications
-            ) != 0)
-            throw std::runtime_error("cannot acquire retained completion counters");
-    } catch (const std::exception &error) {
-        LOG_ERROR("A5 HBG: cannot prepare completion counters: %s", error.what());
+    if (!acquire_notifications(
+            SchedulerNotificationPurpose::COMPLETION_COUNTER, counter_plan.chains.size(), counter_notifications
+        ))
         return false;
-    }
-    if (counter_notifications.owner != nullptr)
-        runtime->retain_pending_resource(std::move(counter_notifications.owner));
     auto *counter_descriptors =
         scheduler_state_at<SchedulerTaskCompletionCounter>(host_base, layout.completion_counters_offset);
     std::vector<uint64_t> legacy_done_refs;
@@ -2008,20 +2026,9 @@ bool create_scheduler_state(
             legacy_done_refs.push_back(ref);
         }
     }
-    // Ordinary DONE slots precede the two 32-bit CHECK halves per directory word in the SET pool.
-    const size_t check_base = legacy_done_refs.size();
-    const size_t check_halves = (static_cast<size_t>(async_plan.layout.group_count) + 31) / 32;
     SchedulerDoneNotifications notifications;
-    try {
-        if (api->acquire_scheduler_notifications(
-                SchedulerNotificationPurpose::TASK_STATE, check_base + check_halves, &notifications
-            ) != 0)
-            throw std::runtime_error("cannot acquire retained task notifications");
-    } catch (const std::exception &error) {
-        LOG_ERROR("A5 HBG: cannot prepare DONE notifications: %s", error.what());
+    if (!acquire_notifications(SchedulerNotificationPurpose::TASK_STATE, legacy_done_refs.size(), notifications))
         return false;
-    }
-    if (notifications.owner != nullptr) runtime->retain_pending_resource(std::move(notifications.owner));
     auto *notification_addresses = scheduler_state_at<uint64_t>(host_base, layout.done_notifications_offset);
     for (size_t index = 0; index < legacy_done_refs.size(); ++index)
         notification_addresses[legacy_done_refs[index]] = notifications.addresses[index];
@@ -2030,7 +2037,8 @@ bool create_scheduler_state(
             return credits != 0;
         });
     const size_t mapped_counter_chains = std::count_if(
-        counter_notifications.add_addresses.begin(), counter_notifications.add_addresses.end(), [](uint64_t address) {
+        counter_notifications.add_addresses.begin(), counter_notifications.add_addresses.end(),
+        [](uint64_t address) {
             return address != 0;
         }
     );
@@ -2040,23 +2048,6 @@ bool create_scheduler_state(
         counter_plan.chains.size(), mapped_counter_chains, eligible_counter_tasks, mapped_counter_tasks,
         legacy_done_refs.size(), inline_completed_task_refs.size()
     );
-
-    if (check_halves != 0) {
-        auto *directory =
-            scheduler_state_at<SchedulerAsyncDirectoryWord>(host_base, async_plan.layout.check_directory_offset);
-        size_t mapped = 0;
-        for (size_t half = 0; half < check_halves; ++half) {
-            const uint64_t address = notifications.addresses[check_base + half];
-            // BIT_WR and BIT_CLR are aliases of a 32-byte SET slot. Zero selects GM for this half.
-            const uint64_t slot = (address & UINT64_C(0x1f)) == 0 ? address : 0;
-            directory[half / 2].notification_addresses[half % 2] = slot;
-            mapped += slot != 0;
-        }
-        LOG_TIMING(
-            "A5 HBG: CHECK directory groups=%u mapped_halves=%zu gm_halves=%zu", async_plan.layout.group_count, mapped,
-            check_halves - mapped
-        );
-    }
 
     if (protocol_profiling) {
         try {

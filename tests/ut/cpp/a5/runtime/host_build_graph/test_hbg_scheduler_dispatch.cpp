@@ -186,21 +186,21 @@ TEST(SchedulerTokenDispatch, CntNotifyCompletionReleasesAllReadersWithoutConsumi
 }
 
 TEST(SchedulerTokenDispatch, CntNotifyWaitKeepsItsAddressAndDoesNotConfirmCanonicalGmState) {
-    DispatchFixture f(2);
-    f.graph.executable(1, 0, {0});
+    DispatchFixture f(3);
+    f.graph.executable(2, 0, {0, 1});
     ASSERT_TRUE(f.prepare());
-    uint32_t notification = 0;
+    uint32_t notification = 0, next_notification = 0;
     auto *addresses = scheduler_state_at<uint64_t>(f.base(), f.storage.layout.done_notifications_offset);
     addresses[0] = reinterpret_cast<uint64_t>(&notification);
+    addresses[1] = reinterpret_cast<uint64_t>(&next_notification);
     SchedulerFaninView fanin{};
-    ASSERT_EQ(scheduler_node_fanin_view(f.graph.graph(), 1, &fanin), SchedulerGraphResult::OK);
+    ASSERT_EQ(scheduler_node_fanin_view(f.graph.graph(), 2, &fanin), SchedulerGraphResult::OK);
     SchedulerFaninWait wait{};
     uint32_t next = 0;
-    bool ready = false;
     ASSERT_TRUE(scheduler_observe_fanin_prefix(
-        f.graph.graph(), f.base(), f.local(), f.storage.run_control, 1, fanin, next, &ready, &wait
+        f.graph.graph(), f.base(), f.local(), f.storage.run_control, 2, fanin, next, &wait
     ));
-    EXPECT_FALSE(ready);
+    EXPECT_LT(next, fanin.count);
     EXPECT_EQ(wait.source.notification, &notification);
     // Poison unrelated proof storage after binding: the saved SRAM source
     // alone authorizes this wait, and the address table is not read twice.
@@ -208,10 +208,18 @@ TEST(SchedulerTokenDispatch, CntNotifyWaitKeepsItsAddressAndDoesNotConfirmCanoni
     f.control(0)->completion_state = 0;
     scheduler_notify_done(notification);
     ASSERT_TRUE(scheduler_observe_fanin_prefix(
-        f.graph.graph(), f.base(), f.local(), f.storage.run_control, 1, fanin, next, &ready, &wait
+        f.graph.graph(), f.base(), f.local(), f.storage.run_control, 2, fanin, next, &wait
     ));
-    EXPECT_TRUE(ready);
     EXPECT_EQ(next, 1u);
+    EXPECT_EQ(wait.predecessor, 1);
+    EXPECT_EQ(wait.source.notification, &next_notification);
+    addresses[1] = 0;
+    scheduler_notify_done(next_notification);
+    ASSERT_TRUE(scheduler_observe_fanin_prefix(
+        f.graph.graph(), f.base(), f.local(), f.storage.run_control, 2, fanin, next, &wait
+    ));
+    EXPECT_EQ(next, fanin.count);
+    EXPECT_EQ(wait.predecessor, SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(f.storage.run_control->scheduler_error, 0u);
 }
 

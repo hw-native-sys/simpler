@@ -39,7 +39,7 @@ GlobalContext 已包含本轮 async image base、extent、epoch、group offset/i
 它不再按 task/block/lane 在设备重新映射或构造一份 async Context。
 
 每次执行 seal 自己的 registration；非空条件保留一份额外 debt。
-CHECK 有界检查 COUNTER/SDMA 等条件，FINISH 用唯一 lease 结清其注册责任。
+登记核有界轮询本核的 COUNTER/SDMA 等条件，条件全部满足后结清该组的完成责任。
 只有 compute 和 async debt 都归零，producer gate 才向消费者证明 DONE。
 consumer 在依赖满足后执行实际业务输入的观察，不能从已接收 immutable Call 推导数据可读。
 

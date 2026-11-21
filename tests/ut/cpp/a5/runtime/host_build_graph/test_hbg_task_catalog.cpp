@@ -183,6 +183,30 @@ SchedulerTaskMetadata spmd(LaneMask lanes, uint16_t blocks, bool sync_start = fa
     return task;
 }
 
+TEST(HbgTaskCatalog, ElidesMixHandshakeOnlyForACompletedOrdinaryPrefix) {
+    const std::vector<SchedulerTaskMetadata> tasks{
+        spmd(LaneMask::aic(), 2, true), physical(LaneMask::aic()), physical(LaneMask::all())
+    };
+    const auto mix_floor = [&](bool dependent, bool asynchronous, bool predicated) {
+        auto metadata = tasks;
+        if (predicated) metadata[1].flags |= SCHEDULER_TASK_HAS_PREDICATE;
+        SchedulerDependencyPlan deps;
+        deps.fanin = {{}, dependent ? std::vector<int64_t>{0} : std::vector<int64_t>{}, {1}};
+        deps.host_done.resize(metadata.size());
+        std::vector<LaneMask> async_lanes(metadata.size());
+        if (asynchronous) async_lanes[1] = LaneMask::aic();
+        CatalogImage image(metadata);
+        EXPECT_TRUE(scheduler_order_task_catalog(deps, metadata, &image.plan));
+        EXPECT_NE(image.plan.order_rows[2].required_floor[0], 0u);
+        scheduler_elide_proven_mix_floors(deps, metadata, async_lanes, image.plan);
+        return image.plan.order_rows[2].required_floor[0];
+    };
+    EXPECT_EQ(mix_floor(true, false, false), 0u);
+    EXPECT_NE(mix_floor(false, false, false), 0u);
+    EXPECT_NE(mix_floor(true, true, false), 0u);
+    EXPECT_NE(mix_floor(true, false, true), 0u);
+}
+
 void expect_wave_order(
     uint32_t clusters, const std::vector<SchedulerTaskMetadata> &tasks, const std::vector<std::vector<int64_t>> &fanin,
     const std::vector<int64_t> &expected, bool native = false, bool deferred = false, uint64_t controls = 0
@@ -392,17 +416,14 @@ TEST(HbgTaskCatalog, FoldingSingleConsumerControlsPreservesRealCompletionDebt) {
     SchedulerFaninView fanin{};
     ASSERT_EQ(scheduler_node_fanin_view(graph.graph(), 4, &fanin), SchedulerGraphResult::OK);
     uint32_t prefix = 0;
-    bool ready = false;
     ASSERT_TRUE(
-        scheduler_observe_fanin_prefix(graph.graph(), base, local, storage.run_control, 4, fanin, prefix, &ready)
+        scheduler_observe_fanin_prefix(graph.graph(), base, local, storage.run_control, 4, fanin, prefix)
     );
-    EXPECT_FALSE(ready);
     EXPECT_EQ(prefix, 0u);
     scheduler_task_control_at(base, local, 0)->completion_state = scheduler_completion_completed_state(1);
     ASSERT_TRUE(
-        scheduler_observe_fanin_prefix(graph.graph(), base, local, storage.run_control, 4, fanin, prefix, &ready)
+        scheduler_observe_fanin_prefix(graph.graph(), base, local, storage.run_control, 4, fanin, prefix)
     );
-    EXPECT_TRUE(ready);
     EXPECT_EQ(prefix, 2u);
 }
 

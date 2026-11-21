@@ -17,6 +17,13 @@
 #include "scheduler_types.h"
 #include "scheduler_scalar_record.h"
 
+// Onboard Host validates the counter and notification mappings before publishing the image.
+#if defined(__CCE_AICORE__)
+inline constexpr bool SCHEDULER_REQUIRES_CNT_NOTIFY = true;
+#else
+inline constexpr bool SCHEDULER_REQUIRES_CNT_NOTIFY = false;
+#endif
+
 // Capture ordinary operands and address values by value at observer calls.
 // GM words retain reference captures so their accesses stay inside the timed
 // primitive, while caller temporaries do not escape through the callback.

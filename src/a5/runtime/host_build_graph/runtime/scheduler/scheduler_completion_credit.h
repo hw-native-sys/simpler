@@ -43,6 +43,7 @@ static inline __aicore__ bool scheduler_publish_fanout(
     int64_t task_ref, uint32_t block_idx, LaneMask active
 ) {
     const bool counted =
+        SCHEDULER_REQUIRES_CNT_NOTIFY ||
         scheduler_completion_counter_at(base, local->config.completion_counters_offset, task_ref) != nullptr;
     auto *layout = RecordProtocol ? scheduler_protocol_layout_at(base, local) : nullptr;
     // Each counted lane publishes P on return. The group owner records only bank retirement.

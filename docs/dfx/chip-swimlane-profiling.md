@@ -151,11 +151,12 @@ shows the measured kernel interval. If the scheduler actually observes a pending
 predecessor, a separate interval starts at that observation and identifies the
 predecessor in its details. A deferred task can complete logically later.
 
-In both HBG and Percounter L2, Worker View displays kernel execution. Each
-`EXECUTE ·` slice uses the logical SPMD task color and retains the original
-member label in its details. It spans kernel entry to kernel return. Percounter
-retains executor pickup and the completion fence on its scheduling track.
-The scheduling lane resumes at kernel return.
+At L2, Worker View labels HBG and Percounter execution slices as
+`<task-id>-<kernel>` (for example, `t7-proj_spmd`).
+Both views use the logical SPMD task color and retain the original member
+label in the slice details. Each execution slice spans kernel entry to kernel return. Percounter records
+executor pickup and the completion fence on its scheduling track. The scheduling
+lane resumes at kernel return.
 The resulting gap on that lane can overlap a running kernel on Worker View.
 
 To export a native Perfetto file from the converted L2 JSON, install
@@ -888,8 +889,8 @@ unversioned identity sections from earlier runs, including ordinary executions
 with a null rank. Full ranked L4 audits still require a rank for each execution.
 
 For MIX, L4 block-owner Claim stamps record AIV0's actual group claim.
-Publication stamps bracket the subsequent SSBUF descriptor release. If both
-banks are occupied, these events can be separated by work on previous groups.
+Publication stamps bracket the subsequent SSBUF descriptor release. If the bank
+is occupied, work on the previous group can separate these events.
 Member arrival and FIN records carry the published generation.
 
 The `ready_claim`, `ready_steal` and `direct_refill` names were

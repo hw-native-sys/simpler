@@ -361,6 +361,7 @@ struct FixtureStorage {
             layout.prepared_layout_offset == 0 ?
                 nullptr :
                 scheduler_state_at<SchedulerPreparedLayout>(scheduler_state->base(), layout.prepared_layout_offset);
+        if (config.prepared != nullptr) local->run_epoch = config.prepared->run_epoch;
         auto &graph = test_graphs[context - contexts];
         if (graph.task_count != context->graph_task_count) graph.task_count = context->graph_task_count;
         config.graph = &graph;
