@@ -270,12 +270,12 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // Separate from workers[] because the AICore flushes its whole Handshake
     // line, which would overwrite a gate sharing it.
     //
-    // Last, and outside the uploaded prefix: the AICPU resets each active request/release line
-    // in `pre_handshake_init` and executes `wmb()` before it publishes
-    // `hs_setup_done_`, and no register window opens before that publication. So
-    // the meaningful initial value is produced on the device ahead of every read
-    // of it, and no host-supplied gate value is consumed. The allocation still
-    // covers this array.
+    // The uploaded prefix excludes this array. Before publishing `hs_setup_done_`, the
+    // leader either resets the active controls itself or joins the scheduler that owns the
+    // reset. The writer executes `wmb()` before completion. Handshakers open register
+    // windows only after a successful reset, and a failed join leaves the windows closed.
+    // AICore consumes the device-produced value only. The allocation covers the whole
+    // array.
     // Each 64-byte control is written only by AICPU and cleared before READY
     // or EXIT. AICore bypass-loads the request and returns its nonce in COND.
     AicoreTeardownControl teardown_gates[RUNTIME_MAX_WORKER];
