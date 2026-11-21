@@ -43,6 +43,64 @@ def allocate_layer_caches(*, pages, device):
     )
 
 
+def load_prefill_kv(caches, layers, block_table):  # noqa: PLR0912 -- ordered validation must precede every write
+    """Import one logical B,H,S,D prefix into caller-owned layer/BSND pages."""
+    if len(caches) != 2 or any(cache.ndim != 5 for cache in caches):
+        raise ValueError("prefill requires two layer/BSND cache tensors")
+    if len(layers) != LAYERS or any(len(pair) != 2 for pair in layers):
+        raise ValueError("prefill must supply K and V for every layer")
+    shape = layers[0][0].shape
+    if len(shape) != 4 or shape[:2] != (1, HEADS) or shape[3] != HEAD_DIM or not 0 < shape[2] < MAX_DECODE_LEN:
+        raise ValueError("prefill must use the single-request B,H,S,D geometry")
+    length, pages = shape[2], caches[0].shape[1]
+    for cache in caches:
+        if cache.shape != (LAYERS, pages, PAGE, HEADS, HEAD_DIM) or cache.dtype != torch.bfloat16:
+            raise ValueError("KV backing must use BF16 layer/BSND storage")
+        if not cache.is_contiguous() or cache.device != caches[0].device:
+            raise ValueError("KV backing must be contiguous and on one device")
+    key, value = caches
+    key_start, value_start = key.data_ptr(), value.data_ptr()
+    nbytes = key.numel() * key.element_size()
+    if key_start < value_start + nbytes and value_start < key_start + nbytes:
+        raise ValueError("K/V cache byte ranges must not overlap")
+    if block_table.ndim != 2 or block_table.shape[0] != 1 or block_table.dtype not in (torch.int32, torch.int64):
+        raise ValueError("prefill block table must describe one request with integer pages")
+    table = block_table[0].tolist()
+    count = (length + PAGE - 1) // PAGE
+    reserved = [page for page in table if page >= 0]
+    if len(table) < count or len(table) > BLOCKS_PER_ROW or any(page < 0 for page in table[:count]):
+        raise ValueError("prefill block table does not cover the prefix within callable capacity")
+    if len(set(reserved)) != len(reserved) or any(page >= pages or page < -1 for page in table):
+        raise ValueError("prefill pages must be unique and within the backing capacity")
+    for pair in layers:
+        for value in pair:
+            if value.shape != shape or value.dtype != torch.bfloat16 or not bool(torch.isfinite(value).all()):
+                raise ValueError("all prefill layers must have matching finite BF16 geometry")
+    target_ranges = tuple(
+        (cache.data_ptr(), cache.data_ptr() + cache.numel() * cache.element_size()) for cache in caches
+    )
+    for pair in layers:
+        for source in pair:
+            if source.device != caches[0].device:
+                continue
+            storage_start = source.untyped_storage().data_ptr()
+            item_size = source.element_size()
+            first = source.storage_offset()
+            last = first
+            for size, stride in zip(source.shape, source.stride()):
+                extent = (size - 1) * stride
+                first, last = min(first, first + extent), max(last, last + extent)
+            source_range = (storage_start + first * item_size, storage_start + (last + 1) * item_size)
+            if any(source_range[0] < end and start < source_range[1] for start, end in target_ranges):
+                raise ValueError("prefill source KV range overlaps the target cache")
+    indices = torch.tensor(table[:count], dtype=torch.int64, device=caches[0].device)
+    physical = torch.zeros((count * PAGE, HEADS, HEAD_DIM), dtype=torch.bfloat16, device=caches[0].device)
+    for layer, pair in enumerate(layers):
+        for cache, value in zip(caches, pair):
+            physical[:length].copy_(value[0].permute(1, 0, 2))
+            cache[layer].index_copy_(0, indices, physical.view(count, PAGE, HEADS, HEAD_DIM))
+
+
 class TorchDecode:
     def __init__(self, *, artifact: Path, packed, caches, device):
         from callable_bridge import inspect_artifact  # noqa: PLC0415
