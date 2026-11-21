@@ -982,7 +982,7 @@ def _refuse(where: str, code: RegionAccessReasonCode, message: str) -> ValueErro
     return ValueError(f"{where}: [{code.value}] {message}")
 
 
-def _resolve_body_as_va(desc: BufferDescriptor) -> tuple[int, SharedMemory | None]:
+def _resolve_body_as_va(desc: BufferDescriptor) -> tuple[int, None]:
     """The body is the base pointer (u64 LE), already valid in this process — no mapping.
 
     FORK_SHM / FORK_COW: a host VA inherited across the fork, so the child already holds the same
@@ -1017,11 +1017,11 @@ def _shared_mapping_key(desc: BufferDescriptor) -> tuple[bytes, int, int]:
     )
 
 
-def _resolve_host_shm_map(desc: BufferDescriptor) -> tuple[int, SharedMemory | None]:
-    """Map the named POSIX shm object into this process."""
+def _resolve_host_shm_map(desc: BufferDescriptor) -> tuple[int, SharedMemoryAttachment]:
+    """Borrow the named mapping. Only its creator owns unlink and crash cleanup."""
     name = desc.body.decode("utf-8")
     try:
-        shm = SharedMemory(name=name)
+        shm = SharedMemoryAttachment.from_name(name)
     except FileNotFoundError as exc:
         # The owner unlinks on release, so a missing name is the expected shape of "this identity
         # was released", not a corrupt descriptor. Naming both the identity and that reading
@@ -1039,13 +1039,11 @@ def _resolve_host_shm_map(desc: BufferDescriptor) -> tuple[int, SharedMemory | N
         raise ValueError(
             f"ImportRegistry: shm object {name!r} is {shm.size} bytes, short of the {desc.nbytes} its descriptor claims"
         )
-    return _shm_base_addr(shm), shm
+    return shm.address, shm
 
 
 # One resolver per mechanism, so a mechanism shared by several backends is carried out once.
-_RESOLVERS: dict[
-    AdapterProfile, Callable[[BufferDescriptor], tuple[int, SharedMemory | SharedMemoryAttachment | None]]
-] = {
+_RESOLVERS: dict[AdapterProfile, Callable[[BufferDescriptor], tuple[int, SharedMemoryAttachment | None]]] = {
     AdapterProfile.FORK_INHERITED_VA: _resolve_body_as_va,
     AdapterProfile.DEVICE_LOCAL: _resolve_body_as_va,
     AdapterProfile.HOST_SHM_MAP: _resolve_host_shm_map,
@@ -1066,7 +1064,7 @@ class ImportedBuffer:
     base: int
     nbytes: int
     address_space: AddressSpace = AddressSpace.HOST
-    shm: SharedMemory | SharedMemoryAttachment | None = None
+    shm: SharedMemoryAttachment | None = None
     # The descriptor this mapping was created from. Identity alone does not pin a backing: it says
     # WHICH allocation, not how big it is or how to reach it, so a second descriptor carrying the
     # same identity and a different nbytes / access / backend / body describes something the first

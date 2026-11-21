@@ -24,6 +24,7 @@ import sys
 import textwrap
 import threading
 from dataclasses import replace
+from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
 from unittest.mock import patch
 
@@ -277,6 +278,19 @@ def test_create_export_import_resolve_zero_copy():
             assert bytes(consumer_buf[:4]) == b"\xde\xad\xbe\xef"
     finally:
         reg.close()
+        buffer.close()
+
+
+def test_import_does_not_register_the_owners_name_for_cleanup():
+    buffer = create_host_shared_buffer(nbytes=64, owner_instance_id=mint_owner_instance_id(), buffer_id=1)
+    registry = ImportRegistry(ImportContext(deployment=HOST_CPU))
+    try:
+        with patch.object(resource_tracker, "register", wraps=resource_tracker.register) as register:
+            registry.materialize(buffer.to_descriptor())
+            registry.close()
+        register.assert_not_called()
+    finally:
+        registry.close()
         buffer.close()
 
 

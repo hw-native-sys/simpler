@@ -19,7 +19,8 @@ import os
 class SharedMemoryAttachment:
     """A local mapping without resource-tracker registration or unlink ownership."""
 
-    def __init__(self, fd: int):
+    def __init__(self, fd: int, *, name: str | None = None):
+        self.name = name
         self.size = os.fstat(fd).st_size
         self._mmap: mmap.mmap | None = mmap.mmap(fd, self.size)
         self._buffer: memoryview | None = memoryview(self._mmap)
@@ -29,7 +30,7 @@ class SharedMemoryAttachment:
     def from_name(cls, name: str) -> SharedMemoryAttachment:
         fd = _posixshmem.shm_open("/" + name.lstrip("/"), os.O_RDWR, mode=0o600)
         try:
-            return cls(fd)
+            return cls(fd, name=name)
         finally:
             os.close(fd)
 
