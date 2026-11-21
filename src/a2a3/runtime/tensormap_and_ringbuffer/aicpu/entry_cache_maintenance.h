@@ -61,8 +61,7 @@ bool freshen_entry_descriptor(Runtime &runtime, const PlatformEntryArgs &view, C
 inline size_t live_entry_cleanup_prefix(const Runtime &runtime, const PlatformEntryArgs &view, bool snapshot_ok) {
     if (!snapshot_ok || view.cache_maintenance != static_cast<uint32_t>(EntryCacheMaintenance::Live) ||
         view.source != static_cast<uint32_t>(EntryArgsSource::LaunchEnvelope) ||
-        runtime.get_entry_args_source() != EntryArgsSource::LaunchEnvelope ||
-        view.offset != LAUNCH_ENVELOPE_HEADER_BYTES || view.args_base == nullptr ||
+        runtime.get_entry_args_source() != EntryArgsSource::LaunchEnvelope || view.entry_data == nullptr ||
         view.tensor_count > CHIP_MAX_TENSOR_ARGS || view.scalar_count > CHIP_MAX_SCALAR_ARGS ||
         view.tensor_count != runtime.get_entry_tensor_count() || view.scalar_count != runtime.get_entry_scalar_count())
         return sizeof(runtime.dev);

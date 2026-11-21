@@ -549,7 +549,8 @@ int LoadAicpuOp::Init(const std::vector<std::string> &extra_symbols) {
 }
 
 int LoadAicpuOp::AicpuKernelLaunch(
-    rtFuncHandle func_handle, rtStream_t stream, void *args, size_t args_size, int aicpu_num
+    rtFuncHandle func_handle, rtStream_t stream, void *args, size_t args_size, int aicpu_num,
+    rtHostInputInfo_t *host_inputs, uint16_t host_input_count
 ) {
     if (args == nullptr || args_size == 0) {
         LOG_ERROR("AicpuKernelLaunch: invalid arguments (args is null or args_size is 0)");
@@ -558,6 +559,8 @@ int LoadAicpuOp::AicpuKernelLaunch(
     rtCpuKernelArgs_t cpu_args = {};
     cpu_args.baseArgs.args = args;
     cpu_args.baseArgs.argsSize = args_size;
+    cpu_args.baseArgs.hostInputInfoPtr = host_inputs;
+    cpu_args.baseArgs.hostInputInfoNum = host_input_count;
 
     rtKernelLaunchCfg_t kernelLaunchCfg = {nullptr, 0U};
     auto launchKernelAttr = std::make_unique<rtLaunchKernelAttr_t>();
@@ -573,14 +576,15 @@ int LoadAicpuOp::AicpuKernelLaunch(
 }
 
 int LoadAicpuOp::LaunchBuiltInOp(
-    rtStream_t stream, void *args, size_t args_size, int aicpu_num, const std::string &func_name
+    rtStream_t stream, void *args, size_t args_size, int aicpu_num, const std::string &func_name,
+    rtHostInputInfo_t *host_inputs, uint16_t host_input_count
 ) {
     auto it = func_handles_.find(func_name);
     if (it == func_handles_.end()) {
         LOG_ERROR("Function not found: %s", func_name.c_str());
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    return AicpuKernelLaunch(it->second, stream, args, args_size, aicpu_num);
+    return AicpuKernelLaunch(it->second, stream, args, args_size, aicpu_num, host_inputs, host_input_count);
 }
 
 }  // namespace host

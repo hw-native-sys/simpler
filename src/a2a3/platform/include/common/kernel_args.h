@@ -159,17 +159,13 @@ struct KernelArgs {
     uint64_t pmu_run_terminal_bank{0};
     uint64_t dep_gen_run_terminal_bank{0};
     uint64_t scope_stats_run_terminal_bank{0};
+    // RTS hostInputInfo relocates this pointer into its device argument block.
+    // Descriptor/HBG runs leave it zero; the pointed bytes are owned by RTS.
+    const void *entry_args_data{nullptr};
     // 32-bit tail.
     uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_args|chip_swimlane|pmu|dep_gen|scope_stats
 
-    // How this run's entry arguments reached the AICPU, restated from the
-    // descriptor so the device can reject a pair that disagrees.
-    // `entry_args_offset` is where the entry region starts inside this launch
-    // package, `LAUNCH_ENVELOPE_HEADER_BYTES` when the launch route carries the
-    // values and 0 when it does not. The region itself is raw bytes appended
-    // after this header — tensor descriptors then scalars — and is not part of
-    // this struct: `argsSize` is what tells RTS how far past it to copy.
-    uint32_t entry_args_offset{0};
+    // Counts and source accompany the RTS-relocated entry_args_data pointer.
     uint32_t entry_tensor_count{0};
     uint32_t entry_scalar_count{0};
     uint32_t entry_args_source{static_cast<uint32_t>(EntryArgsSource::Descriptor)};
@@ -209,9 +205,9 @@ static_assert(
 );
 // Where the 32-bit tail's Graph triple begins. `sizeof` alone cannot see a
 // reorder inside that tail, because every member of it is the same width: the
-// eighteen 8-byte fields end at 144; the Graph triple starts at 164.
-static_assert(offsetof(KernelArgs, graph_section_offset) == 164, "KernelArgs::graph_section_offset offset drift");
-static_assert(offsetof(KernelArgs, entry_cache_maintenance) == 176, "entry cache policy offset drift");
+// nineteen 8-byte fields end at 152; the Graph triple starts at 168.
+static_assert(offsetof(KernelArgs, graph_section_offset) == 168, "KernelArgs::graph_section_offset offset drift");
+static_assert(offsetof(KernelArgs, entry_cache_maintenance) == 180, "entry cache policy offset drift");
 static_assert(sizeof(KernelArgs) == 184, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so

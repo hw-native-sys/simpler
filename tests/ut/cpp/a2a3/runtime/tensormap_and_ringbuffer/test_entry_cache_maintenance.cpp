@@ -20,9 +20,7 @@ using Range = std::pair<size_t, size_t>;
 TEST(EntryCacheMaintenance, TerminalSnapshotAndOwnMetadataGateEveryActualRange) {
     Runtime runtime;
     runtime.dev.entry_args_source_ = static_cast<uint32_t>(EntryArgsSource::LaunchEnvelope);
-    PlatformEntryArgs view{
-        &runtime, LAUNCH_ENVELOPE_HEADER_BYTES, 0, 0, static_cast<uint32_t>(EntryArgsSource::LaunchEnvelope)
-    };
+    PlatformEntryArgs view{&runtime, &runtime, 0, 0, static_cast<uint32_t>(EntryArgsSource::LaunchEnvelope)};
     view.cache_maintenance = static_cast<uint32_t>(EntryCacheMaintenance::Live);
     auto run = [&](bool ok) {
         std::vector<Range> ranges;

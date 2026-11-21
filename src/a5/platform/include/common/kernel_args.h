@@ -134,16 +134,12 @@ struct KernelArgs {
     uint64_t pmu_run_terminal_bank{0};
     uint64_t dep_gen_run_terminal_bank{0};
     uint64_t scope_stats_run_terminal_bank{0};
+    // RTS hostInputInfo relocates this pointer into its device argument block.
+    // Descriptor/HBG runs leave it zero; the pointed bytes are owned by RTS.
+    const void *entry_args_data{nullptr};
     // 32-bit tail: no interior padding, and no field here is offset-locked.
     uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_args|chip_swimlane|pmu|dep_gen|scope_stats
-    // How this run's entry arguments reached the AICPU, restated from the
-    // descriptor so the device can reject a pair that disagrees.
-    // `entry_args_offset` is where the entry region starts inside this launch
-    // package, `LAUNCH_ENVELOPE_HEADER_BYTES` when the launch route carries the
-    // values and 0 when it does not. The region itself is raw bytes appended
-    // after this header — tensor descriptors then scalars — and is not part of
-    // this struct: `argsSize` is what tells RTS how far past it to copy.
-    uint32_t entry_args_offset{0};
+    // Counts and source accompany the RTS-relocated entry_args_data pointer.
     uint32_t entry_tensor_count{0};
     uint32_t entry_scalar_count{0};
     uint32_t entry_args_source{static_cast<uint32_t>(EntryArgsSource::Descriptor)};
@@ -179,9 +175,8 @@ static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
 // what `launch_aicpu_payload` hands to `rtsLaunchCpuKernel` as `argsSize`, and
 // what `PersistentKernelArgs::prepare_once` allocates and copies H2D. The field
 // offsets differ from a2a3's: this struct has no `ffts_base_addr`, so its
-// seventeen 8-byte fields end at 136 rather than 144, and its 32-bit tail holds
-// ten uint32_t rather than nine. This fills 176 bytes exactly; a2a3 rounds
-// its 180 bytes of members to 184 bytes for 8-byte alignment.
+// eighteen 8-byte fields end at 144 rather than 152, and its 32-bit tail holds
+// nine uint32_t rather than eight. Both headers occupy 184 bytes after alignment.
 static_assert(offsetof(KernelArgs, chip_swimlane_data_base) == 24, "KernelArgs::chip_swimlane_data_base offset drift");
 static_assert(
     offsetof(KernelArgs, chip_swimlane_run_terminal_bank) == 32,
@@ -195,10 +190,10 @@ static_assert(
 );
 // `sizeof` cannot detect reordering within the 32-bit tail. These offsets
 // independently lock the Graph triple, cache policy and trailing SIMT anchor.
-static_assert(offsetof(KernelArgs, graph_section_offset) == 156, "KernelArgs::graph_section_offset offset drift");
-static_assert(offsetof(KernelArgs, entry_cache_maintenance) == 168, "entry cache policy offset drift");
-static_assert(offsetof(KernelArgs, force_simt_anchor) == 172, "SIMT anchor offset drift");
-static_assert(sizeof(KernelArgs) == 176, "KernelArgs launch-payload size drift");
+static_assert(offsetof(KernelArgs, graph_section_offset) == 160, "KernelArgs::graph_section_offset offset drift");
+static_assert(offsetof(KernelArgs, entry_cache_maintenance) == 172, "entry cache policy offset drift");
+static_assert(offsetof(KernelArgs, force_simt_anchor) == 176, "SIMT anchor offset drift");
+static_assert(sizeof(KernelArgs) == 184, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so
 // these values are the same in every translation unit that sees this header.

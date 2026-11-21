@@ -264,7 +264,9 @@ int LoadAicpuOp::BootstrapDispatcher(const void *, size_t, const void *, size_t,
 int LoadAicpuOp::Init(const std::vector<std::string> &) {
     return native_admission_transport::control().loader_start_rc;
 }
-int LoadAicpuOp::LaunchBuiltInOp(rtStream_t stream, void *args, size_t bytes, int, const std::string &name) {
+int LoadAicpuOp::LaunchBuiltInOp(
+    rtStream_t stream, void *args, size_t bytes, int, const std::string &name, rtHostInputInfo_t *, uint16_t
+) {
     auto &c = native_admission_transport::control();
     if (c.aicpu_payload) return c.aicpu_payload(stream, args, bytes, name);
     if (name != KernelNames::RegisterCallableName) return c.loader_start_rc;

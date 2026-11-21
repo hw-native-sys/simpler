@@ -820,6 +820,21 @@ by the runner's registry and recorded independently by AICPU registration.
 ID reuse gets a new generation.
 
 The Host packet is a snapshot of the prepared Runtime image. It survives until
+TMR submits its entry data through RTS `hostInputInfo`: `addrOffset` names
+`KernelArgs::entry_args_data`, and `dataOffset` names the payload in the launch
+package. Both the ordinary entry payload and the KernelInvocation packet use
+this pointer. RTS copies the complete `argsSize` block and relocates the pointer
+into that device allocation; AICPU no longer reconstructs the TMR payload address
+from its local KernelArgs base. A zero-argument ordinary payload reserves one byte
+so the relocation target remains inside the allocation.
+
+This changes input transport only. Callable identity, epoch and argument-count
+validation, descriptor-route initialization, capture admission and retained runtime
+resources keep their existing contracts. Tensor buffer addresses inside the input
+are still caller-owned device addresses; hostInput does not recursively relocate
+them or transfer ownership of those buffers. HBG retains its Graph Definition
+offset protocol.
+
 RTS copies the launch package. AICPU checks framing, registered counts and
 generation, the run binding and Tensor geometry before materializing argument
 storage owned by the executor. Orchestration borrows that storage through the

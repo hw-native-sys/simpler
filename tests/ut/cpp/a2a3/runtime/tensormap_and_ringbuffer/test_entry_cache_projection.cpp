@@ -34,7 +34,7 @@ TEST(EntryCacheProjection, ActualKernelEntryPreservesEveryPolicy) {
     KernelArgs args{};
     args.runtime_args = &runtime;
     args.entry_args_source = static_cast<uint32_t>(EntryArgsSource::LaunchEnvelope);
-    args.entry_args_offset = LAUNCH_ENVELOPE_HEADER_BYTES;
+    args.entry_args_data = &runtime;
     args.entry_tensor_count = 4;
     args.entry_scalar_count = 2;
     for (auto policy : {EntryCacheMaintenance::Full, EntryCacheMaintenance::FullFreshen, EntryCacheMaintenance::Live}) {
@@ -46,7 +46,7 @@ TEST(EntryCacheProjection, ActualKernelEntryPreservesEveryPolicy) {
         EXPECT_EQ(resets, resets_before + 1);
         EXPECT_EQ(received.args_base, &args);
         EXPECT_EQ(received.cache_maintenance, args.entry_cache_maintenance);
-        EXPECT_EQ(received.offset, args.entry_args_offset);
+        EXPECT_EQ(received.entry_data, args.entry_args_data);
         EXPECT_EQ(received.tensor_count, 4u);
         EXPECT_EQ(received.scalar_count, 2u);
     }
