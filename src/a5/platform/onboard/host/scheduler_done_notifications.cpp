@@ -34,7 +34,7 @@ class NotificationPool final : public SchedulerNotificationStorage {
 public:
     NotificationPool(void *context, SchedulerNotificationPurpose purpose) :
         SchedulerNotificationStorage(context),
-        counter_(purpose == SchedulerNotificationPurpose::COMPLETION_COUNTER) {}
+        purpose_(purpose) {}
     size_t capacity() const override { return notifications_.size(); }
 
     SchedulerDoneNotifications prepare(size_t count) override {
@@ -45,38 +45,28 @@ public:
             notifications_.emplace_back();
             auto &notification = notifications_.back();
             const auto rc = aclrtCntNotifyCreate(&notification.handle, 0);
-            if (rc == ACL_ERROR_RT_NO_NOTIFY_RESOURCE || rc == ACL_ERROR_RT_RESOURCE_ALLOC_FAIL) {
+            if (purpose_ == SchedulerNotificationPurpose::PERCOUNTER_SYNC_COHORT &&
+                (rc == ACL_ERROR_RT_NO_NOTIFY_RESOURCE || rc == ACL_ERROR_RT_RESOURCE_ALLOC_FAIL)) {
                 notifications_.pop_back();
-                LOG_WARN(
-                    "A5 HBG: CntNotify capacity exhausted at %zu/%zu; remaining nodes use GM", notifications_.size(),
-                    count
-                );
+                LOG_WARN("A5 percounter: CntNotify capacity exhausted at %zu/%zu", notifications_.size(), count);
                 break;
             }
             check(rc, "create");
             check(aclrtCntNotifyGetId(notification.handle, &notification.mapping.resId), "get id");
             map(notification.mapping, notification.address, notification.mapped);
-            if (counter_) {
-                // A5 CntNotify owns a 32-byte register slot. Its ADD register
-                // is offset 8 from the mapped SET/read base and shares the SET
-                // mapping and handle lifetime; it has no independent unmap.
-                notification.add_address = a5_cnt_notify_increment_address(notification.address);
-            }
+            const uint64_t increment = a5_cnt_notify_increment_address(notification.address);
+            if (increment == 0 && purpose_ != SchedulerNotificationPurpose::PERCOUNTER_SYNC_COHORT)
+                throw std::runtime_error("CntNotify SET address is not 32-byte aligned");
+            if (purpose_ == SchedulerNotificationPurpose::COMPLETION_COUNTER ||
+                purpose_ == SchedulerNotificationPurpose::PERCOUNTER_SYNC_COHORT)
+                notification.add_address = increment;
         }
-        size_t unavailable_counters = 0;
         for (size_t index = 0; index < count && index < notifications_.size(); ++index) {
             auto &notification = notifications_[index];
             if (!notification.mapped) throw std::runtime_error("CntNotify pool has an incomplete mapping");
             result.addresses[index] = notification.address;
-            if (counter_) {
-                result.add_addresses[index] = notification.add_address;
-                if (notification.add_address == 0) ++unavailable_counters;
-            }
+            result.add_addresses[index] = notification.add_address;
         }
-        if (unavailable_counters != 0)
-            LOG_WARN(
-                "A5 HBG: %zu CntNotify mappings have no aligned INC alias; use SET/GM completion", unavailable_counters
-            );
         return result;
     }
 
@@ -127,7 +117,7 @@ private:
     // Explicit close owns SDK calls. A reset or a rejected close cannot cause
     // a member destructor to operate on a dead or still-borrowed context.
     std::vector<Notification> notifications_;
-    const bool counter_;
+    const SchedulerNotificationPurpose purpose_;
 };
 }  // namespace
 

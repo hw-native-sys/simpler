@@ -126,6 +126,34 @@ def check_observed_completion(deps, intervals):
             finished[task] = ready
 
 
+def validate_full_wave_dag(deps, stages):
+    expected = {stage["task_id"]: (stage["block_num"], stage["kernel_ids"]) for stage in stages}
+    actual = {int(task["task_id"]): (task["block_num"], task["kernel_ids"]) for task in deps["tasks"]}
+    order = [stage["task_id"] for stage in stages]
+    edges = {(int(edge["pred"]), int(edge["succ"])) for edge in deps["edges"]}
+    if actual != expected or len(deps["tasks"]) != len(stages) or edges != set(zip(order, order[1:])):
+        raise ValueError("Unexpected full-wave MIX chain geometry or dependencies")
+
+
+def source_task_ids(metadata):
+    if metadata.get("execution") == "full_wave_mix_chain":
+        return {stage["task_id"] for stage in metadata["source"]["stages"]}
+    suite = Path(__file__).resolve().parents[1]
+    workload = suite / "workloads" / metadata["flavor"] / metadata["case"] / "tasks.tsv"
+    rows = [line.split() for line in workload.read_text().splitlines() if line and not line.startswith("#")]
+    if any(int(row[-1]) for row in rows):
+        raise ValueError("Deferred completion cannot be inferred from kernel end")
+    return {int(row[0]) for row in rows}
+
+
+def case_dag(metadata, folder, source_ids):
+    deps = json.loads((folder / "deps.json").read_text())
+    if metadata.get("execution") == "full_wave_mix_chain":
+        validate_full_wave_dag(deps, metadata["source"]["stages"])
+        return deps
+    return complete_flat_dag(deps, folder / "source-task-map.txt", source_ids, 1)
+
+
 def read_case(bundle, capture):
     metadata = json.loads((bundle / "case.json").read_text())
     result = json.loads((capture / "result.json").read_text())
@@ -133,12 +161,7 @@ def read_case(bundle, capture):
         raise ValueError("Communication cases are excluded")
     if not result["passed"] or not result["snapshot_inputs"] or result["runtime"] != "host_build_graph":
         raise ValueError("A validated isolated HBG capture is required")
-    suite = Path(__file__).resolve().parents[1]
-    workload = suite / "workloads" / metadata["flavor"] / metadata["case"] / "tasks.tsv"
-    rows = [line.split() for line in workload.read_text().splitlines() if line and not line.startswith("#")]
-    if any(int(row[-1]) for row in rows):
-        raise ValueError("Deferred completion cannot be inferred from kernel end")
-    source_ids = {int(row[0]) for row in rows}
+    source_ids = source_task_ids(metadata)
     warmup, rounds = result["warmup"], result["rounds"]
     if warmup < 1 or rounds < 1:
         raise ValueError("Warmup and measured rounds are required")
@@ -159,9 +182,7 @@ def read_case(bundle, capture):
         kinds = records["metadata"]["core_types"]
         if Counter(kinds) != {"aic": 32, "aiv": 64}:
             raise ValueError("Expected this fixture's 32 AIC / 64 AIV capacity")
-        deps = complete_flat_dag(
-            json.loads((run / "deps.json").read_text()), run / "source-task-map.txt", source_ids, 1
-        )
+        deps = case_dag(metadata, run, source_ids)
         check_observed_completion(deps, records["aicore_tasks"])
         nodes = {int(task["task_id"]): task for task in deps["tasks"]}
         signature = (
@@ -210,7 +231,9 @@ def read_case(bundle, capture):
         "warmup": warmup,
         "rounds": rounds,
         "callable_sha256": hashlib.sha256((bundle / "callable.bin").read_bytes()).hexdigest(),
-        "plan_sha256": hashlib.sha256((bundle / "plan-rank0.bin").read_bytes()).hexdigest(),
+        "plan_sha256": None
+        if metadata.get("execution") == "full_wave_mix_chain"
+        else hashlib.sha256((bundle / "plan-rank0.bin").read_bytes()).hexdigest(),
         "mean_lower_bound_ms": statistics.mean(s["lower_bound_ms"] for s in samples),
         "samples": samples,
     }

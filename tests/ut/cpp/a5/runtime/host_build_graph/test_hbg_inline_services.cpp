@@ -246,7 +246,7 @@ TEST(HbgInlineService, TwoBlocksThenDummyReleaseTheSuccessorExactlyOnce) {
     ASSERT_EQ(fixture.locals[1]->execution_at(0).task_ref, 0);
     const auto first = fixture.locals[1]->execution_at(0).block_idx;
     ASSERT_LT(first, 2u);
-    ASSERT_EQ(fixture.locals[1]->execution_at(1).state, SchedulerDispatchSlotState::FREE);
+    ASSERT_EQ(scheduler_execution_token_count(fixture.locals[1]), 1u);
     ASSERT_TRUE(fixture.complete(1, 0));
     EXPECT_EQ(fixture.storage.completed_gm_records(), 0u);
     EXPECT_NE(

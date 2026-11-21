@@ -48,10 +48,7 @@ static inline __aicore__ void scheduler_graph_arguments_cache(
 }
 
 static inline __aicore__ SchedulerGraphBindingError
-scheduler_observe_graph_arguments(const SchedulerGraphAccess &graph, int64_t ref) {
-    if (graph.native_header_offset == 0) return SchedulerGraphBindingError::NONE;
-    SchedulerNativeNode node{};
-    if (!scheduler_native_node_checked(graph, ref, &node)) return SchedulerGraphBindingError::NODE;
+scheduler_observe_graph_arguments(const SchedulerGraphAccess &graph, const SchedulerNativeNode &node) {
     if (node.binding->kind == SchedulerNodeKind::TOP_KERNEL) return SchedulerGraphBindingError::NONE;
     auto *child = scheduler_native_child_plan_checked(graph, node);
     if (node.binding->kind != SchedulerNodeKind::CHILD_KERNEL || child == nullptr ||
@@ -60,4 +57,12 @@ scheduler_observe_graph_arguments(const SchedulerGraphAccess &graph, int64_t ref
         return SchedulerGraphBindingError::INSTANCE;
     scheduler_graph_arguments_cache(*node.instance, *child);
     return SchedulerGraphBindingError::NONE;
+}
+
+static inline __aicore__ SchedulerGraphBindingError
+scheduler_observe_graph_arguments(const SchedulerGraphAccess &graph, int64_t ref) {
+    if (graph.native_header_offset == 0) return SchedulerGraphBindingError::NONE;
+    SchedulerNativeNode node{};
+    if (!scheduler_native_node_checked(graph, ref, &node)) return SchedulerGraphBindingError::NODE;
+    return scheduler_observe_graph_arguments(graph, node);
 }

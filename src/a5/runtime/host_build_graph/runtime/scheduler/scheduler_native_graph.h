@@ -56,7 +56,6 @@ struct alignas(64) SchedulerNativeGraphHeader {
 
 struct alignas(64) SchedulerGraphTemplate {
     uint64_t child_plans_offset;
-    uint64_t fanin_offsets_offset;
     uint64_t fanin_indices_offset;
     uint64_t sinks_offset;
     uint64_t task_count;
@@ -72,6 +71,8 @@ struct SchedulerGraphChildPlan {
     uint64_t predicate_offset;
     uint32_t tensor_count;
     uint32_t scalar_count;
+    uint32_t fanin_begin;
+    uint32_t fanin_count;
 };
 
 struct SchedulerGraphInstance {
@@ -95,11 +96,11 @@ static_assert(
     std::is_standard_layout_v<SchedulerNativeGraphHeader> && std::is_trivially_copyable_v<SchedulerNativeGraphHeader>
 );
 static_assert(sizeof(SchedulerGraphTemplate) == 64);
-static_assert(offsetof(SchedulerGraphTemplate, args_bytes) == 56);
+static_assert(offsetof(SchedulerGraphTemplate, args_bytes) == 48);
 static_assert(
     std::is_standard_layout_v<SchedulerGraphTemplate> && std::is_trivially_copyable_v<SchedulerGraphTemplate>
 );
-static_assert(sizeof(SchedulerGraphChildPlan) == 48);
+static_assert(sizeof(SchedulerGraphChildPlan) == 56);
 static_assert(offsetof(SchedulerGraphChildPlan, tensors_offset) == 16);
 static_assert(
     std::is_standard_layout_v<SchedulerGraphChildPlan> && std::is_trivially_copyable_v<SchedulerGraphChildPlan>

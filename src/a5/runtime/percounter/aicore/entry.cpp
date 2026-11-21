@@ -42,10 +42,10 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     percounter_observe_cache_line(bootstrap);
     __gm__ Handshake *handshake = (__gm__ Handshake *)(&runtime->dev.workers[block_idx]);
     percounter_observe_cache_line(handshake);
-    if (runtime->dev.chip_swimlane_level >= 3) {
+    if (__builtin_expect(runtime->dev.chip_swimlane_level >= 3, false)) {
         if (core_type == CoreType::AIC) percounter_execute_profiled<CoreType::AIC>(runtime, block_idx);
         else percounter_execute_profiled<CoreType::AIV>(runtime, block_idx);
-    } else if (runtime->dev.chip_swimlane_level == 2) {
+    } else if (__builtin_expect(runtime->dev.chip_swimlane_level == 2, false)) {
         if (core_type == CoreType::AIC) percounter_execute_task_profiled<CoreType::AIC>(runtime, block_idx);
         else percounter_execute_task_profiled<CoreType::AIV>(runtime, block_idx);
     } else simpler::percounter::percounter_aicore_execute(runtime, block_idx, core_type);

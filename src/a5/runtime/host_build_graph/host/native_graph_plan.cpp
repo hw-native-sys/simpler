@@ -191,6 +191,8 @@ static bool native_graph_definition_impl(
         required_heap += output_bytes;
         SchedulerGraphChildPlan child{};
         child.predicate_offset = SCHEDULER_NATIVE_NO_PREDICATE;
+        child.fanin_begin = static_cast<uint32_t>(in(i));
+        child.fanin_count = static_cast<uint32_t>(in(i + 1) - in(i));
         child.metadata.active_mask = mask;
         child.metadata.flags =
             active == 0 ? 0 :
@@ -368,7 +370,6 @@ bool native_graph_plan_readonly_image(
                 entry.task_count, sizeof(SchedulerGraphChildPlan), alignof(SchedulerGraphChildPlan),
                 &entry.child_plans_offset
             ) ||
-            !reserve(entry.task_count + 1, sizeof(int32_t), alignof(int32_t), &entry.fanin_offsets_offset) ||
             (entry.edge_count != 0 &&
              !reserve(entry.edge_count, sizeof(uint16_t), alignof(uint16_t), &entry.fanin_indices_offset)) ||
             !reserve(entry.sink_count, sizeof(uint16_t), alignof(uint16_t), &entry.sinks_offset))
@@ -388,10 +389,6 @@ bool native_graph_plan_readonly_image(
     copy(header.instances_offset, plan.instances);
     for (size_t i = 0; i < templates.size(); ++i) {
         const auto &source = plan.definitions[i];
-        std::memcpy(
-            next.bytes.data() + templates[i].fanin_offsets_offset,
-            source.image.data() + source.definition.off_fanin_offsets, (templates[i].task_count + 1) * sizeof(int32_t)
-        );
         if (templates[i].edge_count != 0)
             std::memcpy(
                 next.bytes.data() + templates[i].fanin_indices_offset,

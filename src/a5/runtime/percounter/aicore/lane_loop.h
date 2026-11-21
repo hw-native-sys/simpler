@@ -136,7 +136,7 @@ inline __aicore__ void percounter_flush_stream_records(ChipSwimlaneAicoreLocalSt
 }
 
 inline __aicore__ void percounter_commit_task_timing(const LaneConfig &cfg) {
-    if (!cfg.pending_task_valid) return;
+    if (__builtin_expect(!cfg.pending_task_valid, true)) return;
     if (cfg.profile_buffer != nullptr) {
         const uint32_t index = *cfg.profile_task_count;
         if (index < cfg.profile_buffer->task_capacity) {
@@ -646,7 +646,7 @@ inline __aicore__ bool percounter_run_task(
     *deferred = false;
     ProfileScope profile_scope(cfg.scalar, ProfilePhase::Run);
     const bool timing_enabled = cfg.profile != nullptr || cfg.profile_buffer != nullptr;
-    const uint64_t receive_time = timing_enabled ? get_sys_cnt_aicore() : 0;
+    const uint64_t receive_time = __builtin_expect(timing_enabled, false) ? get_sys_cnt_aicore() : 0;
     auto *arguments = reinterpret_cast<__gm__ DispatchPayload *>(task.arguments_address);
     {
         ProfileScope context_scope(cfg.scalar, ProfilePhase::BindContext);
@@ -673,7 +673,7 @@ inline __aicore__ bool percounter_run_task(
     }
 
     __gm__ ChipSwimlaneAicoreTaskRecord *record = nullptr;
-    if (cfg.profile != nullptr) {
+    if (__builtin_expect(cfg.profile != nullptr, false)) {
         record = chip_swimlane_aicore_wait_task_record(cfg.profile_head, cfg.profile);
         if (record == nullptr) {
             percounter_fail(cfg, SchedulerGraphResult::TIMEOUT);
@@ -698,7 +698,7 @@ inline __aicore__ bool percounter_run_task(
     }
     const uint64_t end_time = get_sys_cnt_aicore();
     cfg.work_window.end_cycle = end_time;
-    if (timing_enabled) {
+    if (__builtin_expect(timing_enabled, false)) {
         if constexpr (task_profile_compiled) {
             cfg.pending_task.kernel_end = kernel_end;
             cfg.pending_task.entry = entry;
@@ -1862,7 +1862,7 @@ run_percounter_lane(__gm__ PercounterControl *control, int block_idx, CoreType c
     uint32_t task_count = 0;
     uint32_t task_dropped = 0;
     const uint64_t level = control->profiling_level;
-    if (level >= 2) {
+    if (__builtin_expect(level >= 2, false)) {
         cfg.profile_buffer =
             scheduler_state_at<PercounterProfileBuffer>(control, control->profile_buffers_offset) + block_idx;
         cfg.task_records = scheduler_state_at<PercounterTaskTiming>(control, cfg.profile_buffer->task_records_offset);
@@ -1957,7 +1957,8 @@ run_percounter_lane(__gm__ PercounterControl *control, int block_idx, CoreType c
     }
 
     ChipSwimlaneAicoreLocalState profile{};
-    if (level == 1 && SIMPLER_GET_DFX_FLAG(get_aicore_profiling_flag(), SIMPLER_DFX_FLAG_CHIP_SWIMLANE)) {
+    if (__builtin_expect(level == 1, false) &&
+        SIMPLER_GET_DFX_FLAG(get_aicore_profiling_flag(), SIMPLER_DFX_FLAG_CHIP_SWIMLANE)) {
         cfg.profile_head = get_chip_swimlane_aicore_head();
         if (cfg.profile_head != nullptr) cfg.profile = &profile;
     }
@@ -1966,8 +1967,8 @@ run_percounter_lane(__gm__ PercounterControl *control, int block_idx, CoreType c
     else if (cfg.cluster_lane == 1) percounter_lane_loop<1>(cfg);
     else percounter_lane_loop<2>(cfg);
     percounter_commit_task_timing(cfg);
-    if (cfg.profile != nullptr) percounter_flush_stream_records(&profile);
-    if (cfg.profile_buffer != nullptr) {
+    if (__builtin_expect(cfg.profile != nullptr, false)) percounter_flush_stream_records(&profile);
+    if (__builtin_expect(cfg.profile_buffer != nullptr, false)) {
         cfg.profile_buffer->task_committed = task_count;
         cfg.profile_buffer->task_dropped = task_dropped;
         auto *records = reinterpret_cast<__gm__ uint8_t *>(cfg.task_records);

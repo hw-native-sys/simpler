@@ -19,7 +19,7 @@ from simpler_setup.tools.hbg.native_protocol import audit_protocol_sequences, re
 def capture(epoch=0):
     return {
         "schema": "hbg-native-protocol",
-        "version": 2,
+        "version": 3,
         "producer": "aicore",
         "run_epoch": epoch,
         "task_count": 1,

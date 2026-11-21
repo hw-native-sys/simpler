@@ -481,15 +481,13 @@ TEST(HbgOrderedScalarDetail, CompletionWriterReusesItsOwnDoneProofForDependencie
         trace.records = records.get();
         trace.window_start = scheduler_cycles();
         uint32_t prefix = 0;
-        bool ready = false;
         {
             SchedulerScalarBinding binding;
             binding.attach(&trace);
             ASSERT_TRUE(scheduler_observe_fanin_prefix(
-                fixture.graph.graph(), fixture.base(), local, fixture.run(), 1, fanin, prefix, &ready
+                fixture.graph.graph(), fixture.base(), local, fixture.run(), 1, fanin, prefix
             ));
         }
-        EXPECT_TRUE(ready);
         EXPECT_EQ(prefix, 1u);
         trace.finish(scheduler_cycles());
         const auto rows = scalar_rows(trace);
@@ -516,7 +514,7 @@ TEST_P(HbgOrderedFirstReady, FirstBlockIsExecutableWithoutClaimingOrPublishingAS
     EXPECT_EQ(fixture.control(0)->next_block, 0u);
     EXPECT_EQ(fixture.control(0)->claim_sectors[worker & 3].next, 1u);
     EXPECT_EQ(hbg_test_eligible_mask(fixture.locals[worker]), 1u);
-    EXPECT_EQ(fixture.locals[worker]->execution_at(1).state, SchedulerDispatchSlotState::FREE);
+    EXPECT_EQ(scheduler_execution_token_count(fixture.locals[worker]), 1u);
     const auto *blocks =
         scheduler_state_at<SchedulerProtocolBlockTrace>(fixture.base(), fixture.storage.layout.protocol.blocks_offset);
     const auto *events = scheduler_state_at<SchedulerProtocolExecutionTrace>(

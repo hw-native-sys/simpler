@@ -121,6 +121,77 @@ def test_hbg_l1_worker_order_counts_idle_cores(tmp_path, recorded_window):
     assert [names[tid] for _, tid in order] == ["AIC1", "AIV0", "AIV2"]
 
 
+@pytest.mark.parametrize("runtime", [HBG_RUNTIME, "percounter"])
+def test_l2_worker_flows_through_unmeasured_dependency_only_tasks(tmp_path, runtime):
+    # The second run has no timing for producer 16. Task 28 is a creator with no kernel row.
+    rows = [_task_row(16, 0), _task_row(26, 1), _task_row(26, 1, run_epoch=1)]
+    for epoch in (0, 1):
+        rows.append(_task_row(29, 2, dispatch=30, receive=31, start=32, end=40, run_epoch=epoch))
+    trace = _trace(
+        rows,
+        tmp_path / "controls.json",
+        runtime_name=runtime,
+        chip_swimlane_level=2,
+        deps_edges={16: [25, 29], 25: [27], 26: [27], 27: [29], 28: [29]},
+        deps_kernel_map={25: [-1, -1, -1], 27: [-1, -1, -1]},
+    )
+    workers = {e["id"]: e["args"] for e in trace["traceEvents"] if e["ph"] == "X" and e["pid"] == 4}
+    starts = {e["id"]: workers[e["bind_id"]] for e in trace["traceEvents"] if e["ph"] == "s" and e["pid"] == 4}
+    pairs = []
+    for event in trace["traceEvents"]:
+        if event["ph"] == "f" and event["pid"] == 4:
+            source, target = starts[event["id"]], workers[event["bind_id"]]
+            assert source["run_epoch"] == target["run_epoch"]
+            pairs.append((target["run_epoch"], source["taskId"], target["taskId"]))
+    assert sorted(pairs) == [(0, 16, 29), (0, 26, 29), (1, 26, 29)]
+    hints = [args for args in workers.values() if args["taskId"] == 29]
+    assert [args["kernel-fanin-via-control"] for args in hints] == ["t27 ← t16, t26", "t27 ← t26"]
+    assert all(args["fanin-hint"] == "3: [t16, t27, t28]" for args in hints)
+
+
+@pytest.mark.parametrize("dropped,expected", [(0, [(16, 27), (27, 29)]), (1, [(16, 29)])])
+def test_percounter_control_completion_flow(tmp_path, dropped, expected):
+    issue = dict(
+        kind="completion_issue",
+        time_us=23,
+        cycles=23,
+        contribution=1,
+        task_id=27,
+        run_epoch=0,
+        block_index=0,
+        block_count=1,
+        worker_id=1,
+        cluster_index=0,
+        cluster_lane=1,
+    )
+    trace = _trace(
+        [_task_row(16, 0), _task_row(29, 1, dispatch=30, receive=31, start=32, end=40)],
+        tmp_path / "control.json",
+        runtime_name="percounter",
+        chip_swimlane_level=2,
+        percounter_task_events={
+            "records": [issue],
+            "dropped": dropped,
+            "unmatched_deferred_updates": 0,
+            "folded_task_ids": [],
+            "inline_completed_task_ids": [],
+        },
+        deps_edges={16: [27], 27: [29], 28: [29]},
+        deps_kernel_map={27: [-1, -1, -1]},
+        deps_block_map={27: 1},
+        sources_by_consumer={29: {27: {"explicit"}, 28: {"creator"}}},
+    )
+    events = [e for e in trace["traceEvents"] if e["pid"] == 4]
+    bars = {e["id"]: e["args"]["taskId"] for e in events if e["ph"] == "X"}
+    for marker in (e for e in events if e["ph"] == "i"):
+        assert (marker["ts"], marker["args"]["evidence"]) == (23, "completion_issue")
+        bars[marker["id"]] = marker["args"]["task_id"]
+    starts = {e["id"]: bars[e["bind_id"]] for e in events if e["ph"] == "s"}
+    assert sorted((starts[e["id"]], bars[e["bind_id"]]) for e in events if e["ph"] == "f") == expected
+    consumer = next(e for e in events if e["ph"] == "X" and e["args"]["taskId"] == 29)
+    assert consumer["args"]["fanin-sources"] == "t27 (explicit), t28 (creator)"
+
+
 def _count_dependency_flow_starts(trace_path, *, pid, tid=None):
     with open(trace_path) as f:
         events = json.load(f)["traceEvents"]
@@ -2429,6 +2500,20 @@ def test_identify_spmd_task_ids_respects_authoritative_block_num_one():
     # These rows are one capture with no identity, which is its own run domain.
     spmd_ids = sc._identify_spmd_task_ids({None: task_map}, deps_block_map)
     assert spmd_ids == {2}
+
+
+def test_percounter_l2_worker_labels_put_task_id_first():
+    tasks = [_task_row(2, 1), _task_row(7, 0, "aic", func_id=1), _task_row(7, 2, func_id=2)]
+    trace = _trace(
+        tasks,
+        None,
+        runtime_name="percounter",
+        chip_swimlane_level=2,
+        func_id_to_name={"0": "add", "1": "proj_aic", "2": "proj_aiv"},
+        deps_block_map={2: 1, 7: 2},
+    )
+    workers = [e for e in trace["traceEvents"] if e["pid"] == 4 and e["ph"] == "X"]
+    assert sorted(event["name"] for event in workers) == ["t2-add", "t7-proj_spmd", "t7-proj_spmd"]
 
 
 def test_spmd_task_display_name_suffix():

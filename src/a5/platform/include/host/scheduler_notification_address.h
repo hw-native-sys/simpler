@@ -13,7 +13,7 @@
 #include <cstdint>
 
 // Only a complete aligned SET slot has the verified A5 INC alias.
-// Zero leaves completion on the SET/GM fallback path.
+// A zero result identifies a mapping without a usable INC register.
 inline constexpr uint64_t a5_cnt_notify_increment_address(uint64_t set_address) {
     return set_address != 0 && (set_address & UINT64_C(0x1f)) == 0 ? set_address + UINT64_C(0x08) : 0;
 }

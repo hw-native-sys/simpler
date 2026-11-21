@@ -52,10 +52,9 @@ inline __aicore__ constexpr uint32_t scheduler_prepared_execute_owner(uint64_t s
                UINT32_MAX;
 }
 
-inline __aicore__ constexpr bool scheduler_prepared_mix_kernel_entered(uint64_t state) {
-    const auto phase = scheduler_prepared_phase(state);
+inline __aicore__ constexpr bool scheduler_prepared_mix_returned(uint64_t state) {
     return (state & SCHEDULER_PREPARED_MIX_OWNED) != 0 &&
-           (phase == SchedulerPreparedPhase::ENTERED || phase == SchedulerPreparedPhase::RETURNED);
+           scheduler_prepared_phase(state) == SchedulerPreparedPhase::RETURNED;
 }
 
 // Plans are indexed by the existing graph node ref, including non-executable nodes.
@@ -67,7 +66,7 @@ struct SchedulerExecutionPlan {
     uint8_t active_lane_count;
 };
 
-// Each active MIX member writes its own claim, kernel entry and physical return.
+// A MIX member keeps receipt and entry local and publishes physical return.
 // The control is isolated from cached stores to the immutable Call and its binding.
 struct alignas(128) SchedulerPreparedControl {
     volatile uint64_t state;

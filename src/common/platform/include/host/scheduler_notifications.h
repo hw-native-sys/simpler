@@ -15,7 +15,7 @@
 #include <memory>
 #include <vector>
 
-enum class SchedulerNotificationPurpose : uint32_t { TASK_STATE, MIX_ACK, COMPLETION_COUNTER };
+enum class SchedulerNotificationPurpose : uint32_t { TASK_STATE, MIX_ACK, COMPLETION_COUNTER, PERCOUNTER_SYNC_COHORT };
 
 struct SchedulerDoneNotifications {
     std::vector<uint64_t> addresses;

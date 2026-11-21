@@ -12,6 +12,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -216,6 +217,46 @@ inline bool scheduler_order_task_catalog(
                 return false;
             }
     return scheduler_apply_task_order(std::move(ordered), metadata, plan, error);
+}
+
+// A member observes every data predecessor's logical completion before it applies its MIX floor.
+// Track only contiguous prefixes of ordinary work. A larger rank on an independent branch cannot
+// certify an earlier task. An uncertain edge or task contributes no completion proof.
+inline void scheduler_elide_proven_mix_floors(
+    const SchedulerDependencyPlan &deps, const std::vector<SchedulerTaskMetadata> &metadata,
+    const std::vector<LaneMask> &possible_async_lanes, SchedulerTaskCatalogPlan &catalog
+) {
+    using LaneFloors = std::array<uint32_t, PLATFORM_CORES_PER_BLOCKDIM>;
+    std::vector<LaneFloors> completed_prefix(metadata.size());
+    LaneFloors last_ordinary{};
+    for (const int64_t ref : catalog.task_order) {
+        const auto &task = metadata[ref];
+        if (deps.host_done[ref] || !scheduler_task_is_executable(task.flags) || scheduler_task_is_inline(task.flags))
+            continue;
+        auto &proof = completed_prefix[ref];
+        const bool known = !scheduler_task_has_predicate(task.flags) && possible_async_lanes[ref].is_empty();
+        if (known)
+            for (const int64_t pred : deps.fanin[ref])
+                for (size_t lane = 0; lane < proof.size(); ++lane)
+                    proof[lane] = std::max(proof[lane], completed_prefix[pred][lane]);
+
+        auto &row = catalog.order_rows[ref];
+        const auto lanes = scheduler_task_claim_lanes(task.flags, task.active_mask).merged_with(task.active_mask);
+        if (scheduler_task_is_mix(task.flags)) {
+            // Keep the full peer protocol if even one participating lane can owe earlier work.
+            bool all_clear = known;
+            for (size_t lane = 0; lane < proof.size(); ++lane)
+                if (lanes.has(static_cast<SubtaskSlot>(lane)) && proof[lane] < last_ordinary[lane])
+                    all_clear = false;
+            if (all_clear) std::fill_n(row.required_floor, proof.size(), 0u);
+        } else {
+            for (size_t lane = 0; lane < proof.size(); ++lane) {
+                if (!lanes.has(static_cast<SubtaskSlot>(lane))) continue;
+                if (known && proof[lane] >= last_ordinary[lane]) proof[lane] = row.rank + 1;
+                last_ordinary[lane] = row.rank + 1;
+            }
+        }
+    }
 }
 
 // The original topology fixes issue order. Fold pure controls with at most one consumer within the fan-in limit.

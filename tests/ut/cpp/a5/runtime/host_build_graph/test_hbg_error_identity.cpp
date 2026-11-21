@@ -441,21 +441,24 @@ TEST(HbgErrorIdentity, MalformedSelfClaimRetainsItsBlockAndBoundEpoch) {
     EXPECT_EQ(read_valid_fields(*fixture.run()), 53u);
 }
 
-TEST(HbgErrorIdentity, InvalidTicketNamesTheSlotWithoutGuessingFromTheOtherSlot) {
+TEST(HbgErrorIdentity, InvalidTicketNamesTheSelfBlockWhileMixHasAnotherBlock) {
     ErrorFixture fixture;
     auto *local = fixture.locals[1];
-    fixture.locals[1]->mix_groups[0] = {};
-    for (uint32_t index = 0; index < 2; ++index) {
-        auto &token = local->execution_tokens[index];
-        token.task_ref = 0;
-        token.rank = 0;
-        token.block_idx = index + 1;
-        token.phase = SchedulerExecutionTokenPhase::TICKETED;
-        token.state = SchedulerDispatchSlotState::FILLING;
-    }
-    EXPECT_FALSE(scheduler_bind_ticketed_execution(
-        fixture.graph.graph(), fixture.base(), local, fixture.run(), local->execution_tokens[1], 0
-    ));
+    local->mix_groups[0] = {};
+    auto &decoy = local->execution_at(SCHEDULER_CLUSTER_MIX_EXECUTION);
+    decoy.task_ref = 0;
+    decoy.rank = 0;
+    decoy.block_idx = 1;
+    decoy.state = SchedulerDispatchSlotState::FILLING;
+    auto &token = local->execution_tokens[0];
+    token.task_ref = 0;
+    token.rank = 0;
+    token.block_idx = 2;
+    token.phase = SchedulerExecutionTokenPhase::TICKETED;
+    token.state = SchedulerDispatchSlotState::FILLING;
+    EXPECT_FALSE(
+        scheduler_bind_ticketed_execution(fixture.graph.graph(), fixture.base(), local, fixture.run(), token, 0)
+    );
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, 0, 2, UINT64_MAX, 1, 1}));
     EXPECT_EQ(read_valid_fields(*fixture.run()), 55u);
     EXPECT_EQ(fixture.storage.completed_gm_records(), 0u);
@@ -467,7 +470,7 @@ TEST(HbgErrorIdentity, ExtraCompletionRetainsItsBlockAndDoesNotCountSuccess) {
     fixture.locals[1]->mix_groups[0] = {};
     fixture.storage.metadata[0].flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD;
     fixture.storage.metadata[0].active_mask = LaneMask::aiv0();
-    auto &slot = local->execution_at(1);
+    auto &slot = local->execution_at(0);
     slot.task_ref = 0;
     slot.rank = 0;
     slot.block_idx = 3;
@@ -476,7 +479,7 @@ TEST(HbgErrorIdentity, ExtraCompletionRetainsItsBlockAndDoesNotCountSuccess) {
         scheduler_state_at<SchedulerTaskControl>(fixture.base(), fixture.storage.layout.task_controls_offset);
     scheduler_gm_store(controls[0].completion_state, scheduler_completion_completed_state(4));
     EXPECT_EQ(
-        scheduler_publish_fanout<false>(fixture.graph.graph(), fixture.base(), local, fixture.run(), slot, 1),
+        scheduler_publish_fanout<false>(fixture.graph.graph(), fixture.base(), local, fixture.run(), slot, 0),
         SchedulerSubtaskFinishResult::ERROR
     );
     EXPECT_EQ(read_identity(*fixture.run()), (Identity{61, 0, 3, UINT64_MAX, 1, 1}));

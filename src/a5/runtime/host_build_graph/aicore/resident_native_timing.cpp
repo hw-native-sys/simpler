@@ -21,6 +21,12 @@ __aicore__ void run_timing(
     uint64_t profiling_level, uint64_t aicore_entry_cycles, AicoreWorkWindow *work_window
 ) {
     static_assert(!kSchedulerScalarInstrumentation);
+    if (profiling_level == SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL) {
+        run_resident_scheduler<true, WithNativeGraph, true>(
+            context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles, work_window
+        );
+        return;
+    }
     run_resident_scheduler<true, WithNativeGraph>(
         context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles, work_window
     );

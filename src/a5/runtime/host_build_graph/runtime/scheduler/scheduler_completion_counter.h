@@ -22,6 +22,17 @@ scheduler_completion_counter_at(__gm__ void *base, uint64_t offset, int64_t task
     return counter->add_address == 0 ? nullptr : counter;
 }
 
+inline __aicore__ const __gm__ SchedulerTaskCompletionCounter *
+scheduler_execution_counter_at(__gm__ void *base, uint64_t offset, int64_t task) {
+    if constexpr (SCHEDULER_REQUIRES_CNT_NOTIFY)
+        return scheduler_state_at<SchedulerTaskCompletionCounter>(base, offset) + task;
+    return scheduler_completion_counter_at(base, offset, task);
+}
+
+inline __aicore__ bool scheduler_execution_uses_counter(const __gm__ SchedulerTaskCompletionCounter *counter) {
+    return SCHEDULER_REQUIRES_CNT_NOTIFY || counter != nullptr;
+}
+
 inline __aicore__ int scheduler_completion_counter_observe(const __gm__ SchedulerTaskCompletionCounter &counter) {
     const uint32_t value = scheduler_notify_query(*reinterpret_cast<__gm__ volatile uint32_t *>(counter.read_address));
     return scheduler_classify_completion_counter(value, counter.threshold, counter.limit);
