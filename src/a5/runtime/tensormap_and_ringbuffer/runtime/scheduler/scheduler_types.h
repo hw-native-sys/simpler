@@ -23,9 +23,9 @@
 // Profiling macros (compile-time gated)
 // =============================================================================
 
-#if SIMPLER_DFX
+#if SIMPLER_SCHED_PROFILING
 #include "aicpu/device_time.h"
-// Accumulated nanoseconds per sub-step
+// Accumulated raw counter ticks per sub-step
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
 #define CYCLE_COUNT_LAP(acc)       \
     do {                           \

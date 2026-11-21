@@ -264,18 +264,7 @@ struct FaninBuilder {
         }
     }
 
-    bool mark_seen(uint8_t prod_ring, int32_t prod_slot) {
-        if (prod_ring >= CHIP_MAX_RING_DEPTH || prod_slot < 0) {
-            return false;
-        }
-        uint32_t *seen = orch->fanin_seen_epoch[prod_ring];
-        uint32_t slot = static_cast<uint32_t>(prod_slot);
-        if (seen[slot] == seen_epoch) {
-            return true;
-        }
-        seen[slot] = seen_epoch;
-        return false;
-    }
+    bool already_pinned(uint8_t ring, int32_t slot) const { return orch->fanin_seen_epoch[ring][slot] == seen_epoch; }
 
     // Append a new edge (caller has already claimed the producer's fanout pin).
     void push_edge(FaninSpillEntry &entry, ChipTaskSlotState *prod_state, DepFlags kind) {
@@ -297,7 +286,7 @@ struct FaninBuilder {
                 return;
             }
         }
-        // mark_seen reported this producer already owns an edge this submission,
+        // This submission already holds a pin for this producer,
         // so it must be present. A miss means the seen-set and the builder
         // disagree — a logic error, not a runtime condition.
         always_assert(false && "or_flags_into_existing: deduped producer missing from the fanin builder");
@@ -328,6 +317,16 @@ static bool append_fanin_or_fail(
     OrchestratorState *orch, uint8_t prod_ring, int32_t prod_slot, ChipTaskSlotState *prod_state,
     TaskId producer_task_id, FaninBuilder *fanin_builder, uint8_t ring_id, DepFlags kind
 ) {
+    // The first claim pins this generation until wiring. Repeated discoveries
+    // can merge flags without reacquiring the producer's lock. A stale task ID
+    // can map to this same ring slot, so still compare the pinned generation.
+    if (fanin_builder->already_pinned(prod_ring, prod_slot)) {
+        if (prod_state->task->task_id == producer_task_id) {
+            fanin_builder->or_flags_into_existing(prod_state, kind);
+        }
+        return true;
+    }
+
     // Decide-and-claim under the producer's fanout_lock. Two conditions make this
     // resolved slot a non-dependency, and both must be checked together with the
     // fanout_count++ so the producer cannot slip from live to consumed/reused in
@@ -349,21 +348,12 @@ static bool append_fanin_or_fail(
     // against the consume. fanout_count is lock-protected per the
     // ChipTaskSlotState contract.
     //
-    // Dedup (mark_seen) happens HERE, gated on a live producer — NOT before the
-    // gone check. mark_seen keys only on (ring, slot); a stale owner that resolves
-    // to a reused slot must not record it as seen, or a later dependency on the
-    // live generation in the same submission would hit mark_seen and be skipped
-    // without claiming it (dropped edge). A duplicate live producer claims no new
-    // pin and adds no new edge; its flags are OR-accumulated into the existing
-    // edge so the stronger of several discovery reasons (creator vs modifier vs
-    // explicit) always wins, independent of the order they are reached in.
     prod_state->lock_fanout();
     bool gone = prod_state->task == nullptr || prod_state->task->task_id.local_id() != producer_task_id.local_id() ||
                 prod_state->task_state.load(std::memory_order_acquire) == CHIP_TASK_CONSUMED;
-    bool already_seen = !gone && fanin_builder->mark_seen(prod_ring, prod_slot);
-    bool claim = !gone && !already_seen;
     int32_t fanout_now = -1;
-    if (claim) {
+    if (!gone) {
+        orch->fanin_seen_epoch[prod_ring][prod_slot] = fanin_builder->seen_epoch;
         // Low bits hold the consumer count; bit31 is the scope ref. The consumer
         // count must never carry into bit31 (would corrupt the scope-release
         // flag) — true for any sane fanout (<< 2^31).
@@ -377,7 +367,7 @@ static bool append_fanin_or_fail(
     prod_state->unlock_fanout();
 #if SIMPLER_ORCH_PROFILING
     // lock + unlock always; one fanout_count store when we actually claim.
-    g_orch_args_atomic_count += claim ? 3 : 2;
+    g_orch_args_atomic_count += gone ? 2 : 3;
 #endif
     // Dense-fanout diagnostic, emitted outside fanout_lock (no logging under
     // the spinlock). The monotonic fanout_count++ crosses THRESHOLD+1 exactly
@@ -392,12 +382,6 @@ static bool append_fanin_or_fail(
     if (gone) {
         return true;
     }
-    // Duplicate live producer: fold the flags into the edge already recorded.
-    if (already_seen) {
-        fanin_builder->or_flags_into_existing(prod_state, kind);
-        return true;
-    }
-
     if (fanin_builder->count < CHIP_FANIN_INLINE_CAP) {
         fanin_builder->push_edge(fanin_builder->inline_slots[fanin_builder->count], prod_state, kind);
         return true;
@@ -512,7 +496,8 @@ static void reduce_wait_edges(OrchestratorState *orch, FaninBuilder *b, uint8_t 
     // drop an edge nothing covers.
     always_assert((via & 1ull) == 0 && "via bit 0 set: distance-1 producers are not reducible");
     publish_wait_reach(orch, ring, slot, direct | via);
-    if (via == 0) return;
+    // Only direct WAIT edges also reachable through another producer can change.
+    if ((direct & via) == 0) return;
     b->for_each_entry([&](FaninSpillEntry &entry) {
         DepFlags f = entry.flags();
         if (!dep_has_wait(f)) return;
