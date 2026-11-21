@@ -156,8 +156,8 @@ def read_native_protocol(section):
     if not isinstance(section, dict) or section.get("schema") != "hbg-native-protocol":
         _error("unsupported schema")
     version = section.get("version")
-    if type(version) is not int or version != 2:
-        _error(f"unsupported protocol version {version!r}; this reader requires version 2")
+    if type(version) is not int or version != 3:
+        _error(f"unsupported protocol version {version!r}; this reader requires version 3")
     native = has_native_graph(section)
     root_numbers = ROOT_NUMBERS
     extra = {"node_map", "graph_source"} if native else set()

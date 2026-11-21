@@ -417,9 +417,7 @@ class ProtocolBuilder:
         self.published_blocks[task] += 1
         resources = owner["active_mask"]
         floors = self.raw["tasks"][task]["required_floor"]
-        all_arrivals = any(c["async_mask"] for c in self.raw["task_controls"]) or any(
-            floors[i] for i in range(3) if resources & (1 << i)
-        )
+        all_arrivals = any(floors[i] for i in range(3) if resources & (1 << i))
         for lane, worker in enumerate(workers):
             if not resources & (1 << lane):
                 continue

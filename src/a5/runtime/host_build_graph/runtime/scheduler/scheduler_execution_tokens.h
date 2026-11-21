@@ -74,9 +74,13 @@ static inline __aicore__ bool scheduler_poll_fanin(
 ) {
     SchedulerScalarScope scope(local, SchedPhaseKind::ScalarExecutionTokenFanin, token.task_ref);
     const uint32_t previous = token.next_fanin;
-    bool ready = false;
+    static_assert(SCHEDULER_MIX_MEMBER_COUNT == 1);
+    const auto &member = local->mix_groups[0];
+    const bool owed =
+        member.state == SchedulerDispatchSlotState::FILLING || member.state == SchedulerDispatchSlotState::READY;
+    const int64_t owed_mix = owed ? member.task_ref : SCHEDULER_TASK_REF_INVALID;
     if (!scheduler_observe_fanin_prefix(
-            graph, base, local, run, token.task_ref, token.fanin, token.next_fanin, &ready, &token.wait
+            graph, base, local, run, token.task_ref, token.fanin, token.next_fanin, &token.wait, owed_mix
         ))
         return false;
     *progress = *progress || token.next_fanin != previous;
@@ -197,6 +201,20 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_refill_executi
     // Valid tickets are irrevocable; excess rollbacks cannot reopen supply.
     // Exhaustion suppresses local claims but does not publish the supply seal.
     const bool fixed = scheduler_task_has_fixed_owners(metadata.flags);
+    // A fixed consumer already has its block by identity. If its last dependency is our
+    // pending MIX member, binding it here would delay observing the member's own inputs.
+    static_assert(SCHEDULER_MIX_MEMBER_COUNT == 1 && SCHEDULER_EXECUTION_TOKEN_COUNT == 1);
+    auto &member = local->mix_groups[0];
+    if (fixed && member.phase == SchedulerGmMixPhase::PUBLISHED && fanin.count != 0) {
+        int64_t predecessor = SCHEDULER_TASK_REF_INVALID;
+        const auto status = scheduler_fanin_ref(fanin, task_ref, fanin.count - 1, &predecessor);
+        if (status != SchedulerGraphResult::OK)
+            return scheduler_issue_fail(graph, local, run, task_ref, status, SchedulerErrorSite::ROUTE_INVALID_STATE);
+        if (predecessor == member.task_ref) {
+            member.fixed_consumer_waits = true;
+            return true;
+        }
+    }
     if (!fixed && scheduler_gm_query(control->next_block) >= blocks) {
         scheduler_invalidate_issue_snapshot(snapshot);
         if (local->issue_task_ref == task_ref) local->issue_ticket_exhausted = true;
@@ -218,7 +236,7 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_refill_executi
         if (!permit) return true;
     }
     const bool trace_claim = sync && scheduler_protocol_enabled(local);
-    const uint64_t before = trace_claim ? scheduler_protocol_cycles(local) : 0;
+    const uint64_t before = __builtin_expect(trace_claim, false) ? scheduler_protocol_cycles(local) : 0;
     const uint64_t acquire_start =
         profiling_level == SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL ? scheduler_cycles() : discovery_start;
     uint32_t block = blocks;
@@ -237,7 +255,7 @@ static inline __aicore__ __attribute__((noinline)) bool scheduler_refill_executi
     }
     if (sync) {
         local->last_sync_self_ref = task_ref;
-        if (trace_claim) {
+        if (__builtin_expect(trace_claim, false)) {
             scheduler_protocol_block_claim(
                 base, local, task_ref, block, before, scheduler_protocol_cycles(local), closes_supply ? blocks : 0
             );

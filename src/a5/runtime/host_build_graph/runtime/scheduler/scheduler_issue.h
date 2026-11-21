@@ -49,6 +49,7 @@ static inline __aicore__ bool scheduler_bind_issue_entry(
     binding.metadata = metadata;
     binding.control = scheduler_task_control_at(base, local, ref);
     binding.fanin_bound = false;
+    binding.last_open_seal_ticks = 0;
     binding.task_ref = ref;
     return true;
 }
@@ -96,6 +97,12 @@ static inline __aicore__ bool scheduler_task_supply_closed(
         }
     }
     if (executable) {
+        // Delay polling an unchanged open seal. The claim operation still decides ownership.
+        auto &head = local->issue_binding;
+        const bool retry = local->previous_round_idle && head.task_ref == ref;
+        constexpr uint64_t kSealRetryTicks = 500;
+        if (retry && head.last_open_seal_ticks != 0 && scheduler_cycles() - head.last_open_seal_ticks < kSealRetryTicks)
+            return true;
         const uint64_t seal = scheduler_gm_query(control->claim_seal);
         if (seal != 0 && seal != blocks) return scheduler_issue_fail(graph, local, run, ref);
         if (seal == blocks) {
@@ -103,6 +110,7 @@ static inline __aicore__ bool scheduler_task_supply_closed(
             *closed = true;
             return true;
         }
+        if (retry) head.last_open_seal_ticks = scheduler_cycles();
     }
     return true;
 }
@@ -163,10 +171,10 @@ static inline __aicore__ bool scheduler_close_ordinary_supply(
     const bool cooperative =
         trace && (scheduler_task_is_mix(scheduler_task_metadata_at(base, local, ref)->flags) ||
                   scheduler_task_requires_sync_start(scheduler_task_metadata_at(base, local, ref)->flags));
-    if (cooperative) scheduler_protocol_claim_seal(base, local, ref, block, true, blocks);
+    if (__builtin_expect(cooperative, false)) scheduler_protocol_claim_seal(base, local, ref, block, true, blocks);
     scheduler_cache_barrier();
     scheduler_store_signal(control->claim_seal, static_cast<uint64_t>(blocks));
-    if (cooperative) scheduler_protocol_claim_seal(base, local, ref, block, false, blocks);
+    if (__builtin_expect(cooperative, false)) scheduler_protocol_claim_seal(base, local, ref, block, false, blocks);
     const auto &catalog = local->config.engine_catalog;
     if (!scheduler_task_catalog_valid(catalog)) return scheduler_issue_fail(graph, local, run, ref);
     scheduler_remember_task_proof(local, ref, SchedulerTaskProof::SUPPLY_CLOSED);

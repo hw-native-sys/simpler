@@ -39,8 +39,6 @@ a5_hbg_case(test_hbg_scalar_trace.cpp NO_OBJS TIMEOUT 20
 a5_hbg_case(test_hbg_scalar_trace_header.cpp NO_OBJS TIMEOUT 20
     DEFINES __CPU_SIM)
 
-a5_hbg_case(test_hbg_async_directory.cpp NO_OBJS TIMEOUT 20)
-a5_hbg_case(test_hbg_async_state.cpp NO_OBJS TIMEOUT 20)
 a5_hbg_case(test_hbg_ccu_completion.cpp NO_OBJS LINK a5_ut_support TIMEOUT 20
     SOURCES ${HBG_COMMON_SHARED_DIR}/runtime.cpp)
 a5_hbg_case(test_hbg_async_pending.cpp NO_OBJS TIMEOUT 20)

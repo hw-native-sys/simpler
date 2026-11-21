@@ -148,7 +148,7 @@ struct StartupFixture {
             const uint32_t worker = i < 3 ? i : i + 3;
             if (storage.layout.protocol_layout_offset != 0) locals[i].profiling = &profiles[i];
             ASSERT_TRUE(scheduler_initialize_local_config(base(), &storage.contexts[worker], &graph_view, &locals[i]));
-            ASSERT_TRUE(scheduler_protocol_bind(base(), &locals[i]));
+            ASSERT_TRUE(scheduler_initialize_order(base(), &locals[i]));
             locals[i].cluster_signal =
                 scheduler_cluster_signal_at(reinterpret_cast<uint64_t>(cluster_storage[worker / 3].data()));
             if (worker % 3 == 1) scheduler_cluster_signal_clear(locals[i].cluster_signal, 59);
@@ -492,7 +492,7 @@ TEST(HbgScalarObserverLifetime, DispatchLoopRecordsMemoryPrimitives) {
 
 class HbgExecutionIdentityEntry : public ::testing::TestWithParam<std::tuple<uint32_t, uint64_t, bool>> {};
 
-TEST(HbgExecutionIdentityEntryL0, MixKernelSeesItsEnteredStateBeforeASeparateMemberReturns) {
+TEST(HbgExecutionIdentityEntryL0, MixMemberPublishesOnlyItsPhysicalReturn) {
     using namespace scheduler_test::gm_mix;
     for (const bool sampled : {false, true}) {
         for (const bool async_input : {false, true}) {
@@ -514,10 +514,13 @@ TEST(HbgExecutionIdentityEntryL0, MixKernelSeesItsEnteredStateBeforeASeparateMem
             image.layout.activity_offset =
                 reinterpret_cast<uintptr_t>(&image.activity) - reinterpret_cast<uintptr_t>(&image);
             image.activity.activated = 1;
-            SchedulerAsyncLocalState async{};
-            async.layout = &image.layout;
-            async.base = reinterpret_cast<uint8_t *>(&image);
-            member->async = &async;
+            std::array<SchedulerAsyncLocalState, PLATFORM_CORES_PER_BLOCKDIM> lane_async{};
+            for (uint32_t lane = 0; lane < lane_async.size(); ++lane) {
+                lane_async[lane].layout = &image.layout;
+                lane_async[lane].base = reinterpret_cast<uint8_t *>(&image);
+                f.locals[lane]->async = &lane_async[lane];
+            }
+            const auto &async = lane_async[0];
             uint64_t index = UINT64_MAX;
             ASSERT_TRUE(scheduler_prepared_execution_index(f.base(), member->config.prepared, 0, 0, 0, &index));
             auto *cell = scheduler_prepared_control_at(f.base(), member->config.prepared, index);
@@ -567,10 +570,7 @@ TEST(HbgExecutionIdentityEntryL0, MixKernelSeesItsEnteredStateBeforeASeparateMem
                 EXPECT_EQ(trace->kernel_start_cycles, 0u);
                 EXPECT_EQ(trace->kernel_end_cycles, 0u);
             }
-            EXPECT_EQ(
-                seen_in_kernel,
-                scheduler_prepared_state(SchedulerPreparedPhase::ENTERED, 0) | SCHEDULER_PREPARED_MIX_OWNED
-            );
+            EXPECT_EQ(seen_in_kernel, scheduler_prepared_state(SchedulerPreparedPhase::BUILT));
             EXPECT_EQ(
                 cell->state,
                 scheduler_prepared_state(SchedulerPreparedPhase::RETURNED, 0) | SCHEDULER_PREPARED_MIX_OWNED

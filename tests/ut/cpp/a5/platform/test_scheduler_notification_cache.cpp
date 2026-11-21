@@ -11,6 +11,7 @@
 #include "host/scheduler_notification_cache.h"
 #include "host/scheduler_notification_address.h"
 #include <gtest/gtest.h>
+#include <stdexcept>
 
 namespace {
 struct Counters {
@@ -26,16 +27,19 @@ public:
     FakePool(void *context, SchedulerNotificationPurpose purpose, Counters &counts) :
         SchedulerNotificationStorage(context),
         counts_(counts),
-        counter_(purpose == SchedulerNotificationPurpose::COMPLETION_COUNTER) {
+        purpose_(purpose) {
         ++counts_.created;
     }
     size_t capacity() const override { return capacity_; }
     SchedulerDoneNotifications prepare(size_t count) override {
         ++counts_.prepared;
+        if (count > counts_.capacity_limit && scheduler_notification_is_required(purpose_))
+            throw std::runtime_error("CntNotify exhausted");
         capacity_ = std::min(std::max(capacity_, count), counts_.capacity_limit);
         SchedulerDoneNotifications result{std::vector<uint64_t>(count, 0), std::vector<uint64_t>(count, 0), {}};
         std::fill_n(result.addresses.begin(), std::min(capacity_, count), 32);
-        if (counter_) std::fill_n(result.add_addresses.begin(), std::min(capacity_, count), 40);
+        if (scheduler_notification_uses_counter(purpose_))
+            std::fill_n(result.add_addresses.begin(), std::min(capacity_, count), 40);
         return result;
     }
     int release() override {
@@ -46,7 +50,7 @@ public:
 
 private:
     Counters &counts_;
-    const bool counter_;
+    const SchedulerNotificationPurpose purpose_;
     size_t capacity_{0};
 };
 struct Fixture {
@@ -156,6 +160,30 @@ TEST(SchedulerNotificationCache, CounterAliasesArePurposeSpecific) {
     EXPECT_EQ(counter.add_addresses[0], 40u);
     counter = {};
     EXPECT_EQ(f.cache.release(), 0);
+}
+
+TEST(SchedulerNotificationCache, FailedHbgAllocationRetiresThePartialPoolAndCanBeRetried) {
+    for (auto purpose :
+         {SchedulerNotificationPurpose::HBG_REQUIRED_TASK_STATE,
+          SchedulerNotificationPurpose::HBG_REQUIRED_COMPLETION_COUNTER}) {
+        SCOPED_TRACE(static_cast<uint32_t>(purpose));
+        Fixture f;
+        f.counts.capacity_limit = 2;
+        SchedulerDoneNotifications lease;
+        EXPECT_THROW(f.acquire(lease, 4, purpose), std::runtime_error);
+        EXPECT_EQ(lease.owner, nullptr);
+        EXPECT_TRUE(lease.addresses.empty());
+        f.counts.capacity_limit = 4;
+        ASSERT_EQ(f.acquire(lease, 4, purpose), 0);
+        EXPECT_EQ(f.counts.released, 1);
+        EXPECT_EQ(f.counts.created, 2);
+        EXPECT_EQ(lease.addresses.back(), 32u);
+        EXPECT_EQ(
+            lease.add_addresses.back(), purpose == SchedulerNotificationPurpose::HBG_REQUIRED_TASK_STATE ? 0u : 40u
+        );
+        lease = {};
+        EXPECT_EQ(f.cache.release(), 0);
+    }
 }
 
 TEST(SchedulerNotificationCache, CapacityFallbackKeepsWholeCounterPairsAndLease) {

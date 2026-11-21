@@ -14,7 +14,7 @@ from collections import defaultdict
 from .native_causality import MAX, MIX, SYNC, point, require
 
 
-def _group(audit, block, has_async):
+def _group(audit, block):
     owner = block["owner"]
     ref, cluster, proxy, generation = (owner[k] for k in ("task_ref", "cluster_index", "worker_index", "group_seq"))
     mask = owner["active_mask"]
@@ -37,7 +37,7 @@ def _group(audit, block, has_async):
     mapping = [lane if lane in active else 255 for lane in range(3)]
     require(owner["released_seq"] == values, "incomplete MIX FIN observation")
     bank = audit.executions[block["index"]]["pending_slot"]
-    all_arrivals = has_async or any(audit.tasks[ref]["required_floor"][i] for i in active)
+    all_arrivals = any(audit.tasks[ref]["required_floor"][i] for i in active)
     arrivals = {}
     for i, lane in lanes.items():
         audit.record_identity(lane, ref)
@@ -114,11 +114,10 @@ def _group(audit, block, has_async):
 
 def audit_mix(audit):
     clusters = defaultdict(list)
-    has_async = any(control["async_mask"] for control in audit.controls.values())
     for block in audit.blocks.values():
         owner = block["owner"]
         if audit.tasks[owner["task_ref"]]["flags"] & MIX:
-            bank = _group(audit, block, has_async)
+            bank = _group(audit, block)
             clusters[owner["cluster_index"]].append((owner, bank, block["lanes"]))
     for groups in clusters.values():
         groups.sort(key=lambda group: group[0]["publish_before"][1])

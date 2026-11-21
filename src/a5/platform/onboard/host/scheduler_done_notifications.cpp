@@ -34,7 +34,8 @@ class NotificationPool final : public SchedulerNotificationStorage {
 public:
     NotificationPool(void *context, SchedulerNotificationPurpose purpose) :
         SchedulerNotificationStorage(context),
-        counter_(purpose == SchedulerNotificationPurpose::COMPLETION_COUNTER) {}
+        counter_(scheduler_notification_uses_counter(purpose)),
+        required_(scheduler_notification_is_required(purpose)) {}
     size_t capacity() const override { return notifications_.size(); }
 
     SchedulerDoneNotifications prepare(size_t count) override {
@@ -45,7 +46,7 @@ public:
             notifications_.emplace_back();
             auto &notification = notifications_.back();
             const auto rc = aclrtCntNotifyCreate(&notification.handle, 0);
-            if (rc == ACL_ERROR_RT_NO_NOTIFY_RESOURCE || rc == ACL_ERROR_RT_RESOURCE_ALLOC_FAIL) {
+            if (!required_ && (rc == ACL_ERROR_RT_NO_NOTIFY_RESOURCE || rc == ACL_ERROR_RT_RESOURCE_ALLOC_FAIL)) {
                 notifications_.pop_back();
                 LOG_WARN(
                     "A5 HBG: CntNotify capacity exhausted at %zu/%zu; remaining nodes use GM", notifications_.size(),
@@ -56,6 +57,8 @@ public:
             check(rc, "create");
             check(aclrtCntNotifyGetId(notification.handle, &notification.mapping.resId), "get id");
             map(notification.mapping, notification.address, notification.mapped);
+            if (required_ && a5_cnt_notify_increment_address(notification.address) == 0)
+                throw std::runtime_error("HBG requires an aligned CntNotify SET slot");
             if (counter_) {
                 // A5 CntNotify owns a 32-byte register slot. Its ADD register
                 // is offset 8 from the mapped SET/read base and shares the SET
@@ -128,6 +131,7 @@ private:
     // a member destructor to operate on a dead or still-borrowed context.
     std::vector<Notification> notifications_;
     const bool counter_;
+    const bool required_;
 };
 }  // namespace
 

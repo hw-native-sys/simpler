@@ -38,7 +38,10 @@ inline bool hbg_test_begin_execution(SchedulerLocalState *local, uint32_t index)
     owner.state = SchedulerDispatchSlotState::EXECUTING;
     if (owner.cluster_mix) {
         auto *base = reinterpret_cast<void *>(local->config.shared_context->scheduler_state_base_address);
-        scheduler_mark_mix_kernel_entered(base, local->config.prepared, &owner.prepared);
+        auto *cell = scheduler_protocol_enabled(local) ?
+                         scheduler_prepared_control_at(base, local->config.prepared, owner.prepared.execution_index) :
+                         nullptr;
+        scheduler_mark_mix_kernel_entered(owner.prepared, cell);
     }
     return true;
 }

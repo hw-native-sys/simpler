@@ -152,9 +152,9 @@ def _block_completion_issue(rows, shares):
     return max([*immediate, *settled.values()])
 
 
-def _task_completion_issues(capture, blocks, deps_edges, deps_kernel_map, deps_block_map):
+def _task_completion_issues(capture, blocks, producers, deps_kernel_map, deps_block_map):
     if (
-        not deps_edges
+        not producers
         or not deps_kernel_map
         or not deps_block_map
         or capture["dropped"]
@@ -164,7 +164,7 @@ def _task_completion_issues(capture, blocks, deps_edges, deps_kernel_map, deps_b
 
     by_task = defaultdict(dict)
     for (epoch, task_id, block), rows in blocks.items():
-        if task_id in deps_edges:
+        if task_id in producers:
             by_task[epoch, task_id][block] = rows
 
     issues = {}
@@ -184,6 +184,27 @@ def _task_completion_issues(capture, blocks, deps_edges, deps_kernel_map, deps_b
         if len(times) == len(task_blocks):
             issues[key] = max(times)
     return issues
+
+
+def control_completions(capture, kernel_ids, block_counts):
+    """Yield the recorded issue which satisfied each dependency-only task's last block."""
+    controls = {ref for ref, kids in kernel_ids.items() if kids == [-1, -1, -1]}
+    if not controls:
+        return
+    blocks = defaultdict(list)
+    for row in capture["records"]:
+        if row["task_id"] in controls:
+            blocks[row["run_epoch"], row["task_id"], row["block_index"]].append(row)
+    issues = _task_completion_issues(capture, blocks, controls, kernel_ids, block_counts)
+    for (epoch, task, _), rows in blocks.items():
+        for row in rows:
+            if (
+                row["kind"] in ("completion_issue", "deferred_completion_issue")
+                and row["contribution"] > 0
+                and issues.get((epoch, task)) == row["time_us"]
+            ):
+                del issues[epoch, task]
+                yield row
 
 
 def _milestones(rows, ideal_ready, include_kernel_execution):
